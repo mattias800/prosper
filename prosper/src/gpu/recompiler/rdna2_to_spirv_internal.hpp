@@ -253,6 +253,7 @@ enum : uint32_t {
     Cap_Sampled1D=43, Cap_Image1D=44,   // Dim=1D needs Sampled1D; a 1D STORAGE image (read/write) also needs Image1D
     Cap_StorageImageMultisample=27,      // MS=1 storage image (read/write a multisampled image)
     Cap_ImageMSArray=48,                 // MS=1 AND Arrayed=1 image (2D_MSAA_ARRAY)
+    Cap_StorageImageExtendedFormats=49,  // typed formats outside the core R32/RGBA32 set
     Cap_StorageImageReadWithoutFormat=55, Cap_StorageImageWriteWithoutFormat=56,  // for Format=Unknown storage images
     Cap_ImageGatherExtended=25,          // dynamic (non-const) Offset image operand on OpImageGather
     Cap_ImageQuery=50,                   // OpImageQuerySizeLod (the sample_*_o texel->UV offset fold)
@@ -260,6 +261,9 @@ enum : uint32_t {
     Img_Sampled_Storage=2,   // OpTypeImage "Sampled" operand: 2 = used WITHOUT a sampler (read/write storage image)
     ImgFmt_Unknown=0,        // OpTypeImage "Image Format": Unknown (runtime view format; needs the caps above)
     ImgFmt_R32ui=kSpirvImageFormatR32ui, // exact uint32 storage image format required by image atomics
+    ImgFmt_Rgba8ui=kSpirvImageFormatRgba8ui, // exact four-byte RGBA unsigned storage image
+    ImgFmt_R16ui=kSpirvImageFormatR16ui, // exact halfword-width unsigned storage image
+    ImgFmt_R8ui=kSpirvImageFormatR8ui,   // exact byte-width unsigned storage image
     ImgOp_Bias=1, ImgOp_Lod=2, ImgOp_Grad=4, ImgOp_Sample=0x40,   // ImageOperands bits.
     SC_Workgroup=4, Scope_Device=1, Scope_Workgroup=2, Scope_Subgroup=3,
     MemSem_UniformAcquire=0x42, MemSem_UniformRelease=0x44,
@@ -2079,7 +2083,9 @@ struct SpirvCompute {
     std::unordered_map<uint32_t, bool> stg_img_float;      // binding -> float (rather than uint) texels
     std::unordered_map<uint32_t, uint32_t> stg_img_format; // binding -> SPIR-V Image Format
     std::unordered_map<uint32_t, bool> stg_img_packed_r11; // binding -> R11G11B10 packed in R32ui
-    bool declared_read_wo_fmt = false, declared_write_wo_fmt = false, declared_sampled1d = false, declared_ms = false, declared_msarray = false;
+    bool declared_read_wo_fmt = false, declared_write_wo_fmt = false,
+         declared_storage_extended = false, declared_sampled1d = false,
+         declared_ms = false, declared_msarray = false;
     static uint32_t stg_key(uint32_t dim, bool arrayed, bool ms, bool float_texel,
                             uint32_t image_format) {
         return dim | (arrayed ? 0x100u : 0u) | (ms ? 0x200u : 0u) |
@@ -2098,6 +2104,12 @@ struct SpirvCompute {
         }
         if (ms && !declared_ms) { put(caps, Op_Capability, {Cap_StorageImageMultisample}); declared_ms = true; }
         if (ms && arrayed && !declared_msarray) { put(caps, Op_Capability, {Cap_ImageMSArray}); declared_msarray = true; }
+        if ((image_format == ImgFmt_R8ui || image_format == ImgFmt_R16ui ||
+             image_format == ImgFmt_Rgba8ui) &&
+            !declared_storage_extended) {
+            put(caps, Op_Capability, {Cap_StorageImageExtendedFormats});
+            declared_storage_extended = true;
+        }
         uint32_t key = stg_key(dim, arrayed, ms, float_texel, image_format);
         if (!stg_img_type.count(key)) {
             uint32_t ti = id();
@@ -2199,8 +2211,22 @@ struct SpirvCompute {
             put(code, Op_CompositeConstruct,
                 {t_v4f, texel, bcf(vals[0]), bcf(vals[1]), bcf(vals[2]), bcf(vals[3])});
         else
+        {
+            // Vulkan's narrow integer storage conversion may saturate a u32 value that does not fit
+            // the target, while the guest image-store contract discards the high bits. Make that
+            // conversion explicit so typed R8ui/R16ui stay identical to the raw CPU pack fallback
+            // for arbitrary shader values, not only values loaded from another narrow surface.
+            const uint32_t width_mask =
+                (stg_img_format[binding] == ImgFmt_R8ui ||
+                 stg_img_format[binding] == ImgFmt_Rgba8ui) ? 0xffu
+                : stg_img_format[binding] == ImgFmt_R16ui ? 0xffffu : 0u;
+            uint32_t narrowed[4] = {vals[0], vals[1], vals[2], vals[3]};
+            if (width_mask)
+                for (uint32_t c = 0; c < 4; ++c)
+                    narrowed[c] = ibin(Op_BitwiseAnd, vals[c], uconst(width_mask));
             put(code, Op_CompositeConstruct,
-                {t_v4u(), texel, vals[0], vals[1], vals[2], vals[3]});
+                {t_v4u(), texel, narrowed[0], narrowed[1], narrowed[2], narrowed[3]});
+        }
         if (!predicated) { put(code, Op_ImageWrite, {img, coord, texel}); return; }
         uint32_t then = id(), merge = id();
         put(code, Op_SelectionMerge, {merge, 0});

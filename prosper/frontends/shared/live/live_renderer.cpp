@@ -628,6 +628,9 @@ struct TextureDecodeKey {
     bool reflected_image_arrayed = false;
     bool reflected_image_multisampled = false;
     bool reflected_image_writable = false;
+    // Renderer-owned layers that are newer than the guest/compute backing participate in the
+    // decoded identity. This is zero for ordinary textures.
+    uint64_t renderer_overlay_version = 0;
     bool operator==(const TextureDecodeKey&) const = default;
 };
 
@@ -658,6 +661,7 @@ struct TextureDecodeKeyHash {
         mix(key.reflected_image_arrayed);
         mix(key.reflected_image_multisampled);
         mix(key.reflected_image_writable);
+        mix(key.renderer_overlay_version);
         return hash;
     }
 };
@@ -1919,6 +1923,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 uint64_t tex_rtt_n = 0, tex_compute_n = 0, tex_local_n = 0;
                 uint64_t tex_persist_hit_n = 0, tex_persist_reuse_n = 0, tex_persist_miss_n = 0;
                 uint64_t tex_other_n = 0;
+                double tex_other_slowest_ms = 0;
+                uint64_t tex_other_addr = 0, tex_other_source_bytes = 0;
+                uint32_t tex_other_width = 0, tex_other_height = 0, tex_other_depth = 0;
+                uint32_t tex_other_format = 0, tex_other_components = 0;
+                uint32_t tex_other_tile_mode = 0, tex_other_img_dim = 0, tex_other_class = 0;
+                bool tex_other_compute_candidate = false;
+                bool tex_other_persistent_candidate = false;
+                bool tex_other_compressed = false, tex_other_depth_compare = false;
+                bool tex_other_host_backed = false;
                 // Exhaustive partition of build_resources_ms, the frontend materialiser (#2215).
                 // It had two named leaves -- texture_ms and buffer_ms, both from INSIDE build_R --
                 // covering 10.2 of 48.95 ms on a Blue Prince gameplay submit, with no assertion
@@ -1941,6 +1954,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 // continues before reaching the build contributes to neither and lands in the
                 // residual, which is correct -- and visible, rather than folded into a leaf.
                 double pass_pre_ms = 0, pass_post_ms = 0;
+                double post_stats_ms = 0, post_slot0_ms = 0, post_mrt_ms = 0,
+                       post_rest_ms = 0;
                 // pre+post measured 0.23 ms of a 43.85 ms pass_control, so the cost is NOT the
                 // per-group work either side of the measured pair. head/tail bound the two regions
                 // outside the group loop. `tail` subtracts the build_resources+backend the tail
@@ -1999,7 +2014,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             static thread_local std::vector<RttTimingRecord> pending_rtt_timing;
             const bool perf_capture_timing =
                 prosper::perf::interactive_performance_capture().detailed_timing_active();
-            const bool timing_log_enabled = getenv("PROSPER_RENDER_TIMING") != nullptr;
+            const bool timing_capture_only =
+                getenv("PROSPER_RENDER_TIMING_CAPTURE_ONLY") != nullptr;
+            const bool timing_log_enabled = getenv("PROSPER_RENDER_TIMING") != nullptr &&
+                (!timing_capture_only || perf_capture_timing);
             const prosper::frontend::PerformanceTimingMode timing_mode =
                 prosper::frontend::performance_timing_mode(timing_log_enabled,
                                                             perf_capture_timing);
@@ -2013,7 +2031,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             // WITHOUT changing that -- which is why it is the better fix here than caching.
             const char* const render_timing_env = getenv("PROSPER_RENDER_TIMING");
             const bool render_timing_detail =
-                render_timing_env && strcmp(render_timing_env, "detail") == 0;
+                ((render_timing_env && strcmp(render_timing_env, "detail") == 0 &&
+                  (!timing_capture_only || perf_capture_timing)) ||
+                 (perf_capture_timing &&
+                  getenv("PROSPER_RENDER_TIMING_DETAIL_CAPTURE") != nullptr));
             // render_runner.h cannot depend on the app capture singleton: it is also compiled into
             // standalone Vulkan tests. This thread-local scope activates its backend clocks only
             // inside this production callback and restores the prior state on every return path.
@@ -2093,7 +2114,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 //                               the payloads are genuinely distinct; the fix is not
                 //                               dedup at all but not staging through a mapped copy
                 //   refs >> memo_hits        -> repeat references within one call are being missed
-                if (timing_enabled) {
+                if (timing_mode.log) {
                     // CUMULATIVE, not a per-call snapshot. The first draft printed one call's
                     // numbers at diag_should_print's ordinals (first 64, then powers of two) --
                     // which is a UNIFORM sample of a heavily skewed distribution, so it could not
@@ -2584,6 +2605,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         ? RenderClock::now() : RenderClock::time_point{};
                     bool resource_rtt_hit = false;
                     bool resource_compute_image_hit = false;
+                    bool resource_compute_image_candidate = false;
+                    bool resource_compute_depth_hybrid = false;
+                    uint64_t resource_compute_producer_order = 0;
+                    uint32_t resource_compute_depth_overlay_mask = 0;
                     bool resource_local_reuse = false;
                     bool resource_persistent_hit = false;
                     bool resource_persistent_submit_reuse = false;
@@ -2752,7 +2777,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             ? prosper::gpu::tiled_msaa_surface_bytes(
                                   tw, th, r.tile_mode, 4u, r.sample_count)
                             : 0u;
-                        const TextureDecodeKey decode_key{
+                        TextureDecodeKey decode_key{
                             r.gpu_addr, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(r.host_data)),
                             r.host_data_size, r.size, msaa_tiled_source_span,
                             static_cast<uint32_t>(r.cls),
@@ -3035,8 +3060,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             return v > 0 ? static_cast<uint32_t>(v) : 1u;
                         }();
                         // Deferred RTT readback (#1284): a GPU-resident target consumed in a way the
-                        // direct GPU bind below cannot serve (extent mismatch, feedback into its own
-                        // pass, storage image) materializes its CPU copy here on demand. The producer
+                        // GPU bind below cannot serve (extent mismatch or storage image) materializes
+                        // its CPU copy here on demand. Exact 2D attachment feedback is served by the
+                        // backend's prior-version GPU snapshot rather than by a synchronous readback.
+                        // The producer
                         // ran in an earlier batch — same-batch CPU consumers force the eager readback
                         // at defer time — so the queue-ordered copy reads current pixels.
                         if (live_rtt != g_rtt.end() && live_gpu_targets && r.img_dim != 2u &&
@@ -3058,7 +3085,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 prosper::test::find_persistent_color_target(
                                     sampled_source_addr, surface.w, surface.h,
                                     surface.format) != nullptr,
-                                mrt_format_defined);
+                                mrt_format_defined,
+                                /*feedback_copy_supported=*/true);
                             const VkFormat surface_format =
                                 prosper::test::backend_color_format(surface.format);
                             const uint32_t surface_bpp =
@@ -3136,7 +3164,6 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             prosper::frontend::rtt_sampled_extent_compatible(
                                 tw, th, live_rtt->second.w, live_rtt->second.h, render_scale,
                                 normalized_sampling) &&
-                            !draw_binds_color_target(draw, sampled_source_addr, tw, th) &&
                             prosper::test::find_persistent_color_target(
                                 sampled_source_addr, live_rtt->second.w, live_rtt->second.h,
                                 live_rtt->second.format) != nullptr;
@@ -3211,6 +3238,31 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         }
                         const bool is_cube = r.img_dim == 3u;   // CUBE: six faces stacked vertically (#273)
                         const bool is_volume = r.img_dim == 2u;
+                        // GTA V retains each shadow-cube face as a renderer-owned D32 image, then
+                        // samples the cube through a UNORM16 descriptor. Guest memory is not the
+                        // authority for these pixels. Select the complete six-face generation now
+                        // and include it in the decode identity; unchanged cubes can then reuse the
+                        // already quantized vertical stack without six synchronous depth readbacks.
+                        prosper::test::PersistentDsCubeSelection retained_depth_cube;
+                        bool retained_depth_cube_cache_candidate = false;
+                        if (is_cube && r.depth == 6u &&
+                            r.format == prosper::gpu::DataFormat::Unorm16 &&
+                            r.num_components == 1u && r.cls == RC::Texture && !r.host_data &&
+                            !has_live_rtt && !has_ds_live && !fr.is_storage_image &&
+                            prosper::test::is_retained_ds_plane(r.gpu_addr)) {
+                            if (r.layer_stride_bytes)
+                                prosper::test::note_ds_layer_stride(
+                                    r.gpu_addr, tw, th, r.layer_stride_bytes);
+                            retained_depth_cube =
+                                prosper::test::select_persistent_ds_cube_depth(
+                                    r.gpu_addr, tw, th);
+                            retained_depth_cube_cache_candidate =
+                                retained_depth_cube.present_mask == 0x3fu &&
+                                retained_depth_cube.overlay_version != 0;
+                            if (retained_depth_cube_cache_candidate)
+                                decode_key.renderer_overlay_version =
+                                    retained_depth_cube.overlay_version;
+                        }
                         const uint32_t persistent_pitch = PROSPER_ENV_VALUE("PROSPER_PITCH")
                             ? static_cast<uint32_t>(atoi(getenv("PROSPER_PITCH"))) : 0;
                         const uint32_t persistent_bc_block_bytes =
@@ -3245,6 +3297,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         const bool persistent_fp32_texture =
                             r.format == prosper::gpu::DataFormat::Float32 &&
                             (r.num_components == 1 || r.num_components == 2 || r.num_components == 4);
+                        // Exact single-channel integer compute outputs may be consumed immediately
+                        // by graphics. Their guest bytes and native Vulkan texels have the same
+                        // width, so the existing submit journal can authorize a device-local image
+                        // lease instead of a writeback -> detile -> upload round trip.
+                        const bool persistent_uint8_texture =
+                            r.format == prosper::gpu::DataFormat::Uint8 &&
+                            r.num_components == 1;
+                        const bool persistent_uint32_texture =
+                            r.format == prosper::gpu::DataFormat::Uint32 &&
+                            r.num_components == 1;
                         // Packed 32-bit sampled formats are also pure decode inputs.  Keeping their
                         // decoded pixels is especially important for full-resolution HDR intermediates:
                         // unpacking R11G11B10F scalar-by-scalar on every callback otherwise dominates an
@@ -3275,13 +3337,22 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         const bool persistent_format_supported =
                             persistent_unorm8_texture || persistent_fp16_texture ||
                             persistent_unorm16_texture || persistent_fp32_texture ||
+                            persistent_uint8_texture || persistent_uint32_texture ||
                             persistent_packed32_texture ||
                             (persistent_bc_block_bytes != 0 && !is_volume);
+                        // GTA V's five shadow cubes are ordinary tiled Z16 allocations. The fallback
+                        // decoder below reads all six faces from one exact descriptor footprint, so
+                        // unlike the broad non-BC cube class that regressed Plucky Squire this one
+                        // narrow shape can use exact-byte validation safely.
+                        const bool exact_unorm16_cube = is_cube && r.depth == 6u &&
+                            persistent_unorm16_texture && r.num_components == 1u &&
+                            !r.compression_enabled;
                         const bool persistent_sampled_texture = texture_decode_cache_candidate(
                             has_live_rtt_authority, has_ds_live, r.host_data != nullptr, r.img_dim,
                             r.cls == RC::Texture, persistent_format_supported,
-                            persistent_bc_block_bytes != 0);
-                        resource_persistent_candidate = persistent_sampled_texture;
+                            persistent_bc_block_bytes != 0, exact_unorm16_cube);
+                        resource_persistent_candidate = persistent_sampled_texture ||
+                            retained_depth_cube_cache_candidate;
                         const bool persistent_source_is_tiled =
                             persistent_sampled_texture && !PROSPER_ENV_VALUE("PROSPER_NODETILE") &&
                             prosper::gpu::tile_mode_is_tiled(r.tile_mode);
@@ -3463,11 +3534,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                              (!PROSPER_ENV_VALUE("PROSPER_DETILE") || atoi(PROSPER_ENV_VALUE("PROSPER_DETILE")) == 0));
                         const size_t persistent_base_source_size = [&] {
                             if (!persistent_sampled_texture) return size_t{0};
+                            if (is_cube)
+                                return layered_cube_source_size(
+                                    persistent_bc_block_bytes != 0 || exact_unorm16_cube,
+                                    sampled_source_addr,
+                                    prosper::gpu::gpu_capture_resource_footprint(r));
                             if (persistent_bc_block_bytes) {
-                                if (is_cube)
-                                    return block_compressed_cube_source_size(
-                                        true, sampled_source_addr,
-                                        prosper::gpu::gpu_capture_resource_footprint(r));
                                 const uint32_t bw = (tw + 3) / 4;
                                 const uint32_t bh = (th + 3) / 4;
                                 return persistent_source_is_tiled
@@ -3488,7 +3560,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     : static_cast<size_t>(tw) * th *
                                           (is_volume ? r.depth : 1u) * 4u;
                             // fp32 sources are 4 B/component, fp16/unorm16 are 2, and unorm8 is 1.
-                            const uint32_t source_component_bytes = persistent_fp32_texture ? 4u
+                            const uint32_t source_component_bytes =
+                                (persistent_fp32_texture || persistent_uint32_texture) ? 4u
                                 : ((persistent_fp16_texture || persistent_unorm16_texture) ? 2u : 1u);
                             const uint32_t source_bpt = r.num_components * source_component_bytes;
                             if (persistent_source_is_tiled)
@@ -3542,33 +3615,38 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         resource_texture_source_bytes = persistent_source_size;
                         // A successful typed-storage compute dispatch may still own this exact
                         // sampled image on the shared Vulkan device. Prefer that image only for the
-                        // two native formats the graphics backend preserves today. The compute cache
+                        // exact native formats the graphics backend preserves today. The compute cache
                         // independently requires the complete descriptor key plus a current-submit
                         // journal or page-watch proof; a miss falls through to the existing exact
                         // guest-byte decode/cache path.
                         prosper::frontend::LiveComputeImageImport compute_image_import;
-                        VkFormat compute_image_format = VK_FORMAT_UNDEFINED;
-                        if (r.format == prosper::gpu::DataFormat::Float16 &&
-                            r.num_components == 4)
-                            compute_image_format = VK_FORMAT_R16G16B16A16_SFLOAT;
-                        else if (r.format == prosper::gpu::DataFormat::Float10_11_11 &&
-                                 r.num_components == 3)
-                            compute_image_format = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+                        const VkFormat compute_image_format = static_cast<VkFormat>(
+                            prosper::frontend::live_compute_graphics_import_native_format(
+                                r.format, r.num_components));
+                        // A cube decoder's ordinary source span covers one face, while its retained
+                        // Uint16 2D-array producer is keyed by all six. Keep that exception beside
+                        // the importer; ordinary decoded formats continue to use the exact span the
+                        // persistent cache validates.
+                        const uint64_t compute_image_guest_bytes =
+                            prosper::frontend::live_compute_graphics_import_guest_bytes(
+                                r, persistent_source_size);
                         const bool compute_image_shape =
                             (r.img_dim == 1u && r.depth == 1u) ||
-                            (r.img_dim == 2u && r.depth != 0u);
+                            (r.img_dim == 2u && r.depth != 0u) ||
+                            (r.img_dim == 3u && r.depth == 6u);
                         const bool compute_image_candidate =
                             !PROSPER_ENV_VALUE("PROSPER_NO_DIRECT_COMPUTE_IMAGE_BIND") &&
                             !has_live_rtt && !has_ds_live && r.cls == RC::Texture &&
                             compute_image_shape && !r.in_mip_tail &&
                             r.declared_mip_levels == 1u && !r.srgb &&
                             !r.depth_compare && !r.host_data &&
-                            persistent_source_size &&
+                            compute_image_guest_bytes &&
                             (!r.compression_enabled || persistent_dcc_uncompressed) &&
                             compute_image_format != VK_FORMAT_UNDEFINED;
+                        resource_compute_image_candidate = compute_image_candidate;
                         if (compute_image_candidate &&
                             prosper::frontend::import_live_compute_storage_image(
-                                r, persistent_source_size, compute_image_import)) {
+                                r, compute_image_guest_bytes, compute_image_import)) {
                             const prosper::test::RenderVkCtx& render_context =
                                 prosper::test::render_vk_ctx();
                             resource_compute_image_hit = compute_image_import.valid() &&
@@ -3581,19 +3659,51 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     static_cast<void*>(render_context.dev);
                             if (!resource_compute_image_hit) compute_image_import = {};
                         }
+                        if (resource_compute_image_hit &&
+                            compute_image_import.vertical_stack_layers == 6u) {
+                            // The compute image is the exact five-face copy result. A later graphics
+                            // span can render the remaining face into a retained D32 attachment at
+                            // the same guest cube address. Merge only attachment writes ordered
+                            // after this producer; older retained faces are precisely what compute
+                            // replaced and must not win merely because they still reside in cache.
+                            if (r.layer_stride_bytes)
+                                prosper::test::note_ds_layer_stride(
+                                    r.gpu_addr, tw, th, r.layer_stride_bytes);
+                            const auto overlay =
+                                prosper::test::select_persistent_ds_cube_depth_after(
+                                    r.gpu_addr, tw, th,
+                                    compute_image_import.producer_command_order);
+                            if (overlay.present_mask) {
+                                resource_compute_depth_hybrid = true;
+                                resource_compute_producer_order =
+                                    compute_image_import.producer_command_order;
+                                resource_compute_depth_overlay_mask = overlay.present_mask;
+                                decode_key.renderer_overlay_version = overlay.overlay_version;
+                                compute_image_import = {}; // release the lease; CPU builds the hybrid
+                                resource_compute_image_hit = false;
+                            }
+                        }
                         auto copy_persistent_source = [&](uint8_t* dst, size_t bytes) {
                             return persistent_dcc_fast_clear
                                 ? copy_dcc_metadata(dst, bytes)
                                 : copy_resource(dst, sampled_source_addr, bytes);
                         };
-                        const bool persistent_cache_eligible =
+                        const bool guest_persistent_cache_eligible =
                             persistent_texture_decode_cache_eligible(
-                                persistent_sampled_texture, resource_compute_image_hit,
+                                persistent_sampled_texture,
+                                resource_compute_image_hit || resource_compute_depth_hybrid,
                                 fr.is_storage_image,
                                 PROSPER_ENV_VALUE("PROSPER_NO_TEXTURE_DECODE_CACHE") != nullptr,
                                 !r.compression_enabled || persistent_dcc_uncompressed ||
                                     persistent_dcc_fast_clear,
                                 persistent_decode_limit, persistent_source_size);
+                        const bool retained_depth_cube_cache_eligible =
+                            retained_depth_cube_cache_candidate &&
+                            !PROSPER_ENV_VALUE("PROSPER_NO_TEXTURE_DECODE_CACHE") &&
+                            persistent_decode_limit != 0;
+                        const bool persistent_cache_eligible =
+                            guest_persistent_cache_eligible ||
+                            retained_depth_cube_cache_eligible;
                         // Range a submit-scoped identity entry may be re-proved against across a span
                         // boundary (#1691). It is exactly the range the persistent decode cache
                         // validates for this identity — the same bytes `validate_exact()` compares and
@@ -3602,8 +3712,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // (captured replay backing, storage images, unsupported DCC states, cache
                         // disabled) have no such established range, so they keep the pre-#1691
                         // span-local lifetime instead of being retained against an unverified extent.
-                        const uint64_t cross_span_source_size =
-                            persistent_cache_eligible ? persistent_source_size : 0u;
+                        const uint64_t cross_span_source_size = persistent_cache_eligible
+                            ? persistent_source_size : 0u;
                         static const bool cross_submit_watch_enabled =
                             !PROSPER_ENV_VALUE("PROSPER_NO_CROSS_SUBMIT_TEXTURE_WRITE_WATCH");
                         // Page-protection watches have a fixed setup/query cost and may need to
@@ -3657,11 +3767,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // PERMISSIVE verdict, and if the two same-span tests ever drift apart
                             // the placeholder would silently authorise reuse. Unknown fails closed
                             // at identical cost.
-                            const prosper::gpu::GuestGpuWriteQuery journal_query = same_span
-                                ? prosper::gpu::GuestGpuWriteQuery::Unknown
-                                : prosper::gpu::guest_gpu_writes_since(
-                                      reused->second.snapshot, reused->second.source_addr,
-                                      reused->second.source_size);
+                            prosper::gpu::GuestGpuWriteQuery journal_query =
+                                prosper::gpu::GuestGpuWriteQuery::Unknown;
+                            if (!same_span) {
+                                journal_query = prosper::gpu::guest_gpu_writes_since(
+                                    reused->second.snapshot, reused->second.source_addr,
+                                    reused->second.source_size);
+                            }
                             if (!submit_local_texture_decode_reusable(
                                     reused->second.span, decode_span_ordinal,
                                     reused->second.source_addr, reused->second.source_size,
@@ -3824,8 +3936,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                             prosper::host::GuestWriteWatch::create(
                                                 persistent_source_addr, persistent_source_size);
                                 }
-                                bool content_matches = false;
-                                if (submit_unchanged || watch_unchanged) {
+                                bool content_matches = retained_depth_cube_cache_eligible;
+                                if (retained_depth_cube_cache_eligible) {
+                                    // The key carries the newest selected retained-depth write.
+                                    // Finding this entry is the exact renderer-authority proof;
+                                    // there are intentionally no guest bytes to compare.
+                                    resource_texture_exact_validation = false;
+                                } else if (submit_unchanged || watch_unchanged) {
                                     const bool audit = submit_unchanged
                                         ? audit_submit_reuse : audit_cross_submit_watch;
                                     content_matches = audit ? validate_exact() : true;
@@ -4065,9 +4182,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             fr.borrowed_compute_image_layout = compute_image_import.layout;
                             fr.borrowed_compute_image_lease =
                                 std::move(compute_image_import.lease);
+                            fr.borrowed_compute_vertical_stack_layers =
+                                compute_image_import.vertical_stack_layers;
                             fr.tw = compute_image_import.width;
-                            fr.th = compute_image_import.height;
-                            fr.td = compute_image_import.depth;
+                            fr.th = compute_image_import.height *
+                                std::max(compute_image_import.vertical_stack_layers, 1u);
+                            fr.td = compute_image_import.vertical_stack_layers
+                                ? 1u : compute_image_import.depth;
                             fr.img_dim = r.img_dim;
                             fr.texture_format = compute_image_format;
                         } else if (has_ds_live) {
@@ -4166,9 +4287,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                                    fr.persistent_texture_id,
                                                    fr.persistent_texture_version,
                                                    decode_span_ordinal,
-                                                   prosper::gpu::guest_gpu_write_snapshot(),
-                                                   persistent_source_addr,
-                                                   cross_span_source_size, SIZE_MAX, nullptr,
+                                    prosper::gpu::guest_gpu_write_snapshot(),
+                                    persistent_source_addr,
+                                    cross_span_source_size, SIZE_MAX, nullptr,
                                                    fr.texture_format,
                                                    fr.storage_image_contract_valid});
                             if (timing_enabled) pending_timing.texture_reuses++;
@@ -4451,7 +4572,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         bool f16_done = false, f32_done = false;
                         // RTT (#167): if this texture's base is a color target we rendered into, inject those
                         // pixels (nearest-scaled to tw x th) instead of reading empty guest memory.
-                        bool rtt_hit = false;
+                        // Direct compute imports already own the complete sampled image. Mark the
+                        // CPU materializer complete as well; otherwise it performs a discarded
+                        // guest decode (and, for a cube, synchronous retained-depth readbacks)
+                        // before the backend binds the borrowed image.
+                        bool rtt_hit = resource_compute_image_hit;
                         // Why a sampled resource never consulted the renderer-owned RTT cache. Without
                         // this, a draw that reads a target prosper rendered but takes the guest-decode
                         // path instead is invisible in the log: no "sample tex" line is emitted at all,
@@ -4865,7 +4990,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         // faithful, the precision is not the guest's, and a shadow compare is
                         // precision-sensitive. Recorded rather than hidden.
                         bool cube_depth_bridged = false;
-                        if (is_cube && !rtt_hit && !fr.is_storage_image && r.depth == 6u &&
+                        if (is_cube && !rtt_hit && !resource_compute_depth_hybrid &&
+                            !fr.is_storage_image && r.depth == 6u &&
                             prosper::test::is_retained_ds_plane(r.gpu_addr)) {
                             std::array<std::vector<float>, 6> faces;
                             uint32_t slices_found = 0;
@@ -4876,10 +5002,19 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             if (r.layer_stride_bytes)
                                 prosper::test::note_ds_layer_stride(r.gpu_addr, tw, th,
                                                                     r.layer_stride_bytes);
-                            uint32_t present_mask = 0, known_mask = 0;
-                            const bool complete = prosper::test::read_persistent_ds_cube_depth(
-                                r.gpu_addr, tw, th, faces, slices_found, cube_error,
-                                &present_mask, &known_mask);
+                            uint32_t present_mask = retained_depth_cube.present_mask;
+                            uint32_t known_mask = retained_depth_cube.known_mask;
+                            for (uint32_t face = 0; face < 6u; ++face)
+                                slices_found += (present_mask >> face) & 1u;
+                            // Selection above is metadata-only. Do not synchronously read back four
+                            // or five resident faces merely to discover that the sixth is absent and
+                            // discard every byte into the guest fallback. Only a complete selection
+                            // can enter this all-renderer bridge; the compute/DS hybrid is handled by
+                            // its independently ordered path below.
+                            const bool complete = retained_depth_cube_cache_candidate &&
+                                prosper::test::read_persistent_ds_cube_depth(
+                                    r.gpu_addr, tw, th, faces, slices_found, cube_error,
+                                    &present_mask, &known_mask);
                             // Residency DISTRIBUTION, not a first-sight snapshot. "1 of 6 faces"
                             // seen once is consistent with three different worlds: the guest
                             // amortises faces across frames, prosper's invalidation evicts them
@@ -5084,6 +5219,65 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 }
                             }
                             cube_done = true;
+                            if (resource_compute_depth_hybrid && !decoded_reuse) {
+                                std::array<std::vector<float>, 6> overlay_faces;
+                                uint32_t overlay_mask = 0, known_mask = 0;
+                                std::string overlay_error;
+                                const bool overlay_ok =
+                                    prosper::test::read_persistent_ds_cube_depth_after(
+                                        r.gpu_addr, tw, th,
+                                        resource_compute_producer_order,
+                                        overlay_faces, overlay_mask, known_mask,
+                                        overlay_error);
+                                if (overlay_ok && overlay_mask ==
+                                        resource_compute_depth_overlay_mask) {
+                                    for (uint32_t face = 0; face < 6u; ++face) {
+                                        if (!(overlay_mask & (1u << face))) continue;
+                                        const std::vector<float>& src = overlay_faces[face];
+                                        uint8_t* dst = texture_pixels.data() +
+                                            static_cast<size_t>(face) * tw * th * 4u;
+                                        for (size_t i = 0;
+                                             i < static_cast<size_t>(tw) * th && i < src.size();
+                                             ++i) {
+                                            const float d = std::clamp(src[i], 0.0f, 1.0f);
+                                            const uint8_t q = static_cast<uint8_t>(
+                                                d * 255.0f + 0.5f);
+                                            dst[i * 4 + 0] = q;
+                                            dst[i * 4 + 1] = q;
+                                            dst[i * 4 + 2] = q;
+                                            dst[i * 4 + 3] = 0xffu;
+                                        }
+                                    }
+                                    static std::mutex hybrid_log_mutex;
+                                    static std::map<uint64_t, uint64_t> hybrid_counts;
+                                    std::lock_guard lock(hybrid_log_mutex);
+                                    const uint64_t n = ++hybrid_counts[r.gpu_addr];
+                                    if ((n & (n - 1)) == 0)
+                                        std::fprintf(
+                                            stderr,
+                                            "[cube-depth] compute/DS hybrid addr=0x%llx "
+                                            "producer-order=%llu overlay=0x%02x known=0x%02x "
+                                            "(x%llu)\n",
+                                            (unsigned long long)r.gpu_addr,
+                                            (unsigned long long)
+                                                resource_compute_producer_order,
+                                            overlay_mask, known_mask,
+                                            (unsigned long long)n);
+                                } else {
+                                    static uint64_t hybrid_failures = 0;
+                                    if (((++hybrid_failures) & (hybrid_failures - 1)) == 0)
+                                        std::fprintf(
+                                            stderr,
+                                            "[cube-depth] compute/DS hybrid FAILED "
+                                            "addr=0x%llx expected=0x%02x got=0x%02x "
+                                            "known=0x%02x error=%s (x%llu)\n",
+                                            (unsigned long long)r.gpu_addr,
+                                            resource_compute_depth_overlay_mask,
+                                            overlay_mask, known_mask,
+                                            overlay_error.c_str(),
+                                            (unsigned long long)hybrid_failures);
+                                }
+                            }
                         }
                         // Block-compressed (BC1/2/3): read the (possibly tiled) compressed blocks, block-
                         // detile, and decode to RGBA8 in-place. The blocks are the tiled element (BC3 =
@@ -5685,7 +5879,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             fr.declared_mip_levels = r.declared_mip_levels;
                         if (persistent_cache_eligible) {
                             size_t source_prefix_size = linear_source_prefix_size;
-                            if (!persistent_source_matches_pixels) {
+                            if (!persistent_source_matches_pixels && persistent_source_size) {
                                 persistent_validation_scratch.resize(persistent_source_size);
                                 source_prefix_size = copy_persistent_source(
                                     persistent_validation_scratch.data(),
@@ -6213,12 +6407,39 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             // nothing above claimed, and a signed remainder of ms -- and they
                             // disagree only if the classification is wrong.
                             if (resource_rtt_hit)                      { pending_timing.tex_rtt_ms += elapsed;           ++pending_timing.tex_rtt_n; }
-                            else if (resource_compute_image_hit)       { pending_timing.tex_compute_ms += elapsed;       ++pending_timing.tex_compute_n; }
+                            else if (resource_compute_image_hit ||
+                                     resource_compute_depth_hybrid)    { pending_timing.tex_compute_ms += elapsed;       ++pending_timing.tex_compute_n; }
                             else if (resource_persistent_submit_reuse) { pending_timing.tex_persist_reuse_ms += elapsed; ++pending_timing.tex_persist_reuse_n; }
                             else if (resource_persistent_hit)          { pending_timing.tex_persist_hit_ms += elapsed;   ++pending_timing.tex_persist_hit_n; }
                             else if (resource_persistent_miss)         { pending_timing.tex_persist_miss_ms += elapsed;  ++pending_timing.tex_persist_miss_n; }
                             else if (resource_local_reuse)             { pending_timing.tex_local_ms += elapsed;         ++pending_timing.tex_local_n; }
-                            else                                       { ++pending_timing.tex_other_n; }
+                            else {
+                                ++pending_timing.tex_other_n;
+                                if (elapsed > pending_timing.tex_other_slowest_ms) {
+                                    pending_timing.tex_other_slowest_ms = elapsed;
+                                    pending_timing.tex_other_addr = r.gpu_addr;
+                                    pending_timing.tex_other_source_bytes =
+                                        resource_persistent_source_size;
+                                    pending_timing.tex_other_width = r.width;
+                                    pending_timing.tex_other_height = r.height;
+                                    pending_timing.tex_other_depth = r.depth;
+                                    pending_timing.tex_other_format =
+                                        static_cast<uint32_t>(r.format);
+                                    pending_timing.tex_other_components = r.num_components;
+                                    pending_timing.tex_other_tile_mode = r.tile_mode;
+                                    pending_timing.tex_other_img_dim = r.img_dim;
+                                    pending_timing.tex_other_class =
+                                        static_cast<uint32_t>(r.cls);
+                                    pending_timing.tex_other_compute_candidate =
+                                        resource_compute_image_candidate;
+                                    pending_timing.tex_other_persistent_candidate =
+                                        resource_persistent_candidate;
+                                    pending_timing.tex_other_compressed =
+                                        r.compression_enabled;
+                                    pending_timing.tex_other_depth_compare = r.depth_compare;
+                                    pending_timing.tex_other_host_backed = r.host_data != nullptr;
+                                }
+                            }
                             pending_timing.textures++;
                             pending_timing.texture_bytes += static_cast<uint64_t>(fr.tw) * fr.th * fr.td *
                                 fr.sample_count *
@@ -6235,15 +6456,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 static_cast<uint64_t>(g_this_submit) >= detail_min_submit) {
                                 static uint64_t detail_lines = 0;
                                 if ((elapsed >= 0.5 || resource_persistent_invalidation ||
-                                     resource_compute_image_hit) &&
+                                     resource_compute_image_hit ||
+                                     resource_compute_depth_hybrid) &&
                                     detail_lines++ < 250) {
                                     const char* cache_state = resource_rtt_hit ? "rtt" :
+                                        (resource_compute_depth_hybrid ? "compute-depth-hybrid" :
                                         (resource_compute_image_hit ? "compute-image" :
                                         (resource_local_reuse ? "local" :
                                         (resource_persistent_submit_reuse ? "persistent-submit" :
                                         (resource_persistent_hit ? "persistent-hit" :
                                         (resource_persistent_invalidation ? "persistent-invalid" :
-                                        (resource_persistent_miss ? "persistent-miss" : "uncached"))))));
+                                        (resource_persistent_miss ? "persistent-miss" : "uncached")))))));
                                     auto submit_query_name = [](int query) {
                                         switch (query) {
                                             case static_cast<int>(
@@ -6276,7 +6499,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                             "[render-timing] texture addr=0x%llx %ux%ux%u out=%ux%ux%u "
                                             "dim=%u fmt=%u comps=%u tile=%u class=%u storage=%d "
                                             "host=%d live=%d depth-live=%d candidate=%d source=%zu "
-                                            "compressed=%d "
+                                            "compressed=%d depth-compare=%d compute-candidate=%d "
                                             "cache=%s id=%llu validate=%s %.2fms/%zuB/%zuB "
                                             "submit=%s watch=%s active=%d disabled=%d only=%d stable=%u "
                                             "total=%.2f ms\n",
@@ -6290,7 +6513,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                             static_cast<int>(resource_has_ds_live),
                                             static_cast<int>(resource_persistent_candidate),
                                             resource_persistent_source_size,
-                                            static_cast<int>(r.compression_enabled), cache_state,
+                                            static_cast<int>(r.compression_enabled),
+                                            static_cast<int>(r.depth_compare),
+                                            static_cast<int>(resource_compute_image_candidate),
+                                            cache_state,
                                             (unsigned long long)fr.persistent_texture_id,
                                             resource_texture_exact_validation ? "exact" : "skip",
                                             resource_texture_validation_ms,
@@ -6552,6 +6778,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     bd.vs_identity = refvs ? 0 : it.vs_identity;
                     bd.fs_identity = fs_ov ? 0 : it.fs_identity;
                     bd.draw_index = it.draw_index;
+                    bd.command_order = it.command_order;
                     bd.vcount = refvs ? 3u : it.vertex_count;
                     bd.instance_count = it.instance_count;
                     bd.vertex_offset = refvs ? 0 : it.vertex_offset;
@@ -7435,6 +7662,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         bool sampled_exact = false;
                         bool feedback = false;
                         bool cpu_needed = false;
+                        uint32_t storage_references = 0;
+                        uint32_t dimension_mismatches = 0;
+                        uint32_t extent_mismatches = 0;
+                        uint32_t feedback_references = 0;
                     };
                     // A later pass in THIS batch that reads the target's CPU bytes cannot be served
                     // lazily: the producing commands are still unsubmitted when it binds, so a
@@ -7477,10 +7708,49 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         result.sampled_exact = true;
                                         result.feedback |= same_pass_target;
                                     }
+                                    // Exact 2D color feedback is GPU-bindable: the backend copies
+                                    // the prior attachment version to a distinct sampled image before
+                                    // the render pass. Storage, dimension, and extent mismatches still
+                                    // require the CPU representation.
                                     const bool direct_bindable =
                                         resource.cls == RC::Texture && resource.img_dim == 1u &&
-                                        sampled_extent_compatible && !same_pass_target;
-                                    if (!direct_bindable) result.cpu_needed = true;
+                                        sampled_extent_compatible;
+                                    if (!direct_bindable) {
+                                        result.cpu_needed = true;
+                                        result.storage_references +=
+                                            resource.cls == RC::StorageImage;
+                                        result.dimension_mismatches += resource.img_dim != 1u;
+                                        result.extent_mismatches += !sampled_extent_compatible;
+                                        result.feedback_references += same_pass_target;
+                                        static const uint64_t diagnose_min_submit = [] {
+                                            const char* text = PROSPER_ENV_VALUE(
+                                                "PROSPER_READBACK_WHY_MIN_SUBMIT");
+                                            return text ? std::strtoull(text, nullptr, 0) : 0ull;
+                                        }();
+                                        static std::atomic<uint64_t> diagnose_lines{0};
+                                        if (PROSPER_ENV_ON("PROSPER_READBACK_WHY") &&
+                                            static_cast<uint64_t>(g_this_submit) >=
+                                                diagnose_min_submit &&
+                                            diagnose_lines.fetch_add(
+                                                1, std::memory_order_relaxed) < 64) {
+                                            fprintf(stderr,
+                                                    "[readback-consumer] submit=%d target=0x%llx "
+                                                    "producer-pass=%zu consumer-draw=%zu "
+                                                    "class=%s dim=%u extent=%ux%u target-extent=%ux%u "
+                                                    "storage=%u dimension=%u extent-mismatch=%u "
+                                                    "feedback=%u\n",
+                                                    g_this_submit,
+                                                    (unsigned long long)target_base, pass_i - 1,
+                                                    later,
+                                                    resource.cls == RC::StorageImage
+                                                        ? "storage" : "texture",
+                                                    resource.img_dim, rw, rh, gw, gh,
+                                                    resource.cls == RC::StorageImage ? 1u : 0u,
+                                                    resource.img_dim != 1u ? 1u : 0u,
+                                                    !sampled_extent_compatible ? 1u : 0u,
+                                                    same_pass_target ? 1u : 0u);
+                                        }
+                                    }
                                 }
                             };
                             inspect(items[later].vrt.get());
@@ -7491,6 +7761,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     const LaterTargetConsumers consumers0 = inspect_later_consumers(base);
                     const LaterTargetConsumers consumers1 = use_color1
                         ? inspect_later_consumers(base1) : LaterTargetConsumers{};
+                    std::array<LaterTargetConsumers, prosper::gpu::kColorTargetCount>
+                        consumers_slots{};
+                    for (uint32_t slot = 2; slot < mrt_count; ++slot)
+                        consumers_slots[slot] = inspect_later_consumers(pass_bases[slot]);
                     const bool sampled_exact_later = consumers0.sampled_exact;
                     const bool feedback_later = consumers0.feedback;
                     const bool cpu_needed_same_batch = consumers0.cpu_needed;
@@ -7518,6 +7792,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     const bool defer_readback1 = live_gpu_targets && vo_n > 0 && use_color1 &&
                         base1 && base1 != base && !phase.authoritative_readback &&
                         base1 != front_va && rtt_defer_ok1;
+                    std::array<bool, prosper::gpu::kColorTargetCount> defer_readback_slots{};
+                    for (uint32_t slot = 2; slot < mrt_count; ++slot) {
+                        const LaterTargetConsumers& consumers = consumers_slots[slot];
+                        const bool rtt_defer_ok_slot = defer_rtt_readback
+                            ? !consumers.cpu_needed
+                            : (consumers.sampled_exact && !consumers.feedback);
+                        const uint64_t slot_base = pass_bases[slot];
+                        defer_readback_slots[slot] = live_gpu_targets && vo_n > 0 &&
+                            slot_base && !phase.authoritative_readback &&
+                            slot_base != front_va && rtt_defer_ok_slot;
+                    }
                     // PROSPER_READBACK_WHY (#1284): classify WHY each non-deferred pass takes the
                     // synchronous CPU readback (75-79 ms/window on Blue Prince's Day One frame).
                     // The dominant reason selects the next optimization; behavior unchanged.
@@ -7529,6 +7814,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             enum { kNoLive, kNoVo, kNoBase, kAuth, kVoFinal, kFront,
                                    kSameBatchCpu, kNotSampledExact, kFeedback, kBuckets };
                             static std::atomic<uint64_t> counts[kBuckets], bytes[kBuckets];
+                            static std::atomic<uint64_t> same_batch_storage{0};
+                            static std::atomic<uint64_t> same_batch_dimension{0};
+                            static std::atomic<uint64_t> same_batch_extent{0};
+                            static std::atomic<uint64_t> same_batch_feedback{0};
                             static std::atomic<uint64_t> c_total{0};
                             int bucket = kNotSampledExact;
                             if (!live_gpu_targets) bucket = kNoLive;
@@ -7540,6 +7829,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             else if (cpu_needed_same_batch) bucket = kSameBatchCpu;
                             else if (sampled_exact_later && feedback_later) bucket = kFeedback;
                             ++counts[bucket];
+                            if (bucket == kSameBatchCpu) {
+                                same_batch_storage += consumers0.storage_references;
+                                same_batch_dimension += consumers0.dimension_mismatches;
+                                same_batch_extent += consumers0.extent_mismatches;
+                                same_batch_feedback += consumers0.feedback_references;
+                            }
                             // #2398: bill bytes only when colour pixels are ACTUALLY requested.
                             // #2283 narrowed the readback to `want_color_readback` (the same
                             // any_of over pass_bases used at the call below) and this accounting
@@ -7572,7 +7867,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     fprintf(stderr, " %s=%llu/%lluMB", names[i],
                                             (unsigned long long)counts[i].load(),
                                             (unsigned long long)(bytes[i].load() >> 20));
-                                fprintf(stderr, "\n");
+                                fprintf(stderr,
+                                        " same_batch_reasons=storage:%llu,dimension:%llu,"
+                                        "extent:%llu,feedback:%llu\n",
+                                        (unsigned long long)same_batch_storage.load(),
+                                        (unsigned long long)same_batch_dimension.load(),
+                                        (unsigned long long)same_batch_extent.load(),
+                                        (unsigned long long)same_batch_feedback.load());
                             }
                         }
                     }
@@ -7621,6 +7922,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     for (uint32_t slot = 2; slot < mrt_count; ++slot) {
                         backend_target.persistent_id_slots[slot] = pass_bases[slot];
                         backend_target.load_existing_slots[slot] = seed_target(pass_bases[slot]);
+                        backend_target.readback_slots[slot] = !defer_readback_slots[slot];
                     }
                     auto backend_draws = build_bds(render_pass);
                     const auto build_done = timing_enabled
@@ -7707,6 +8009,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         pending_timing.color_target_cached_bytes = color_target_call.cached_bytes;
                         pending_timing.color_target_cached_entries = color_target_call.cached_entries;
                     }
+                    const auto post_stats_done = timing_enabled
+                        ? RenderClock::now() : RenderClock::time_point{};
                     static const std::string dump_spec =
                         PROSPER_ENV_VALUE("PROSPER_DUMP_PASS")
                             ? PROSPER_ENV_VALUE("PROSPER_DUMP_PASS") : "";
@@ -7773,6 +8077,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         surface.has_uniform_color = false;
                         surface.dcc_metadata_dirty = false;
                     }
+                    const auto post_slot0_done = timing_enabled
+                        ? RenderClock::now() : RenderClock::time_point{};
                     for (uint32_t slot = 1; slot < mrt_count; ++slot) {
                         auto& pixels = mrt_outputs.colors[slot];
                         if (!pass_bases[slot]) continue;  // transient attachment for a sparse export hole
@@ -7847,6 +8153,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         else
                             surface.rgba.reset();
                     }
+                    const auto post_mrt_done = timing_enabled
+                        ? RenderClock::now() : RenderClock::time_point{};
                     const std::vector<uint8_t>& rendered_pixels = *pass_pixels;
                     // Both dims parse to 0 when PROSPER_RESOURCE_HASH_DIM is UNSET, so an extent
                     // comparison alone made every 0x0 pass satisfy the filter and switch the
@@ -8281,9 +8589,19 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     // the paths that reached the render, which are exactly the paths `pre` counted,
                     // so the two spans cover the same population and their sum is comparable to
                     // pass_groups.
-                    if (timing_enabled)
+                    if (timing_enabled) {
+                        const auto post_done = RenderClock::now();
                         pending_timing.pass_post_ms += std::chrono::duration<double, std::milli>(
-                            RenderClock::now() - backend_done).count();
+                            post_done - backend_done).count();
+                        pending_timing.post_stats_ms += std::chrono::duration<double, std::milli>(
+                            post_stats_done - backend_done).count();
+                        pending_timing.post_slot0_ms += std::chrono::duration<double, std::milli>(
+                            post_slot0_done - post_stats_done).count();
+                        pending_timing.post_mrt_ms += std::chrono::duration<double, std::milli>(
+                            post_mrt_done - post_slot0_done).count();
+                        pending_timing.post_rest_ms += std::chrono::duration<double, std::milli>(
+                            post_done - post_mrt_done).count();
+                    }
                 }
                 // Everything after the group loop: present selection, scanout resolution, the final
                 // render, RTT publication. The tail performs its own build_resources+backend, and
@@ -8821,19 +9139,85 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     record.texture_bytes = pending_timing.texture_bytes;
                     record.buffer_bytes = pending_timing.buffer_bytes;
                     record.total_ms = pending_timing.total_ms;
+                    record.prelude_ms = pending_timing.prelude_ms;
+                    record.pass_ms = pending_timing.pass_ms;
                     record.build_resources_ms = pending_timing.build_resources_ms;
                     record.backend_ms = pending_timing.backend_ms;
                     record.output_copy_ms = pending_timing.output_copy_ms;
+                    record.pass_head_ms = pending_timing.pass_head_ms;
+                    record.pass_loop_ms = pending_timing.pass_loop_ms;
+                    record.pass_pre_ms = pending_timing.pass_pre_ms;
+                    record.pass_post_ms = pending_timing.pass_post_ms;
+                    record.post_stats_ms = pending_timing.post_stats_ms;
+                    record.post_slot0_ms = pending_timing.post_slot0_ms;
+                    record.post_mrt_ms = pending_timing.post_mrt_ms;
+                    record.post_rest_ms = pending_timing.post_rest_ms;
+                    record.pass_tail_ms = pending_timing.pass_tail_ms;
+                    record.resolve_stall_ms = pending_timing.resolve_stall_ms;
+                    record.resolve_read_ms = pending_timing.resolve_read_ms;
+                    record.resolve_copy_stall_ms = pending_timing.resolve_copy_stall_ms;
+                    record.resolve_copy_ms = pending_timing.resolve_copy_ms;
+                    record.resolve_count = pending_timing.resolve_n;
+                    record.resolve_read_count = pending_timing.resolve_read_n;
+                    record.resolve_bytes = pending_timing.resolve_bytes;
                     record.gpu_wait_ms = pending_timing.backend_gpu_wait_ms;
                     record.gpu_timestamp_samples =
                         pending_timing.backend_gpu_timestamp_samples;
                     record.gpu_device_ms = pending_timing.backend_gpu_device_ms;
                     record.readback_ms = pending_timing.backend_readback_ms;
+                    record.backend_target_ms = pending_timing.backend_target_ms;
+                    record.backend_draw_setup_ms = pending_timing.backend_draw_setup_ms;
+                    record.backend_record_upload_ms = pending_timing.backend_record_upload_ms;
+                    record.backend_cleanup_ms = pending_timing.backend_cleanup_ms;
+                    record.backend_setup_shader_ms = pending_timing.backend_setup_shader_ms;
+                    record.backend_setup_fixed_ms = pending_timing.backend_setup_fixed_ms;
                     record.setup_resources_ms = pending_timing.backend_setup_resources_ms;
+                    record.backend_setup_pipeline_ms =
+                        pending_timing.backend_setup_pipeline_ms;
+                    record.backend_pipeline_refs = pending_timing.backend_pipeline_refs;
+                    record.backend_pipeline_hits = pending_timing.backend_pipeline_hits;
+                    record.backend_pipeline_misses = pending_timing.backend_pipeline_misses;
+                    record.backend_pipeline_bypasses = pending_timing.backend_pipeline_bypasses;
+                    record.backend_pipeline_entries = pending_timing.backend_pipeline_entries;
+                    record.backend_pipeline_evictions = pending_timing.backend_pipeline_evictions;
                     // Frontend and backend, kept apart by name. These two are build_resources' own
                     // texture/buffer time and are NOT parts of setup_resources_ms above.
                     record.frontend_texture_ms = pending_timing.texture_ms;
                     record.frontend_buffer_ms = pending_timing.buffer_ms;
+                    record.frontend_tex_rtt_ms = pending_timing.tex_rtt_ms;
+                    record.frontend_tex_compute_ms = pending_timing.tex_compute_ms;
+                    record.frontend_tex_local_ms = pending_timing.tex_local_ms;
+                    record.frontend_tex_persist_hit_ms = pending_timing.tex_persist_hit_ms;
+                    record.frontend_tex_persist_reuse_ms = pending_timing.tex_persist_reuse_ms;
+                    record.frontend_tex_persist_miss_ms = pending_timing.tex_persist_miss_ms;
+                    record.frontend_tex_other_slowest_ms =
+                        pending_timing.tex_other_slowest_ms;
+                    record.frontend_tex_other_addr = pending_timing.tex_other_addr;
+                    record.frontend_tex_other_source_bytes =
+                        pending_timing.tex_other_source_bytes;
+                    record.frontend_tex_other_width = pending_timing.tex_other_width;
+                    record.frontend_tex_other_height = pending_timing.tex_other_height;
+                    record.frontend_tex_other_depth = pending_timing.tex_other_depth;
+                    record.frontend_tex_other_format = pending_timing.tex_other_format;
+                    record.frontend_tex_other_components = pending_timing.tex_other_components;
+                    record.frontend_tex_other_tile_mode = pending_timing.tex_other_tile_mode;
+                    record.frontend_tex_other_img_dim = pending_timing.tex_other_img_dim;
+                    record.frontend_tex_other_class = pending_timing.tex_other_class;
+                    record.frontend_tex_other_compute_candidate =
+                        pending_timing.tex_other_compute_candidate;
+                    record.frontend_tex_other_persistent_candidate =
+                        pending_timing.tex_other_persistent_candidate;
+                    record.frontend_tex_other_compressed =
+                        pending_timing.tex_other_compressed;
+                    record.frontend_tex_other_depth_compare =
+                        pending_timing.tex_other_depth_compare;
+                    record.frontend_tex_other_host_backed =
+                        pending_timing.tex_other_host_backed;
+                    record.frontend_build_draw_ms = pending_timing.build_r_ms;
+                    record.frontend_validate_ms = pending_timing.build_validate_ms;
+                    record.frontend_poison_ms = pending_timing.build_poison_ms;
+                    record.frontend_indices_ms = pending_timing.build_indices_ms;
+                    record.frontend_reflect_ms = pending_timing.build_reflect_ms;
                     // These four DO decompose setup_resources_ms, so an offline report can attribute
                     // the largest bucket in the capture instead of leaving a plausible residue.
                     record.res_texture_ms = pending_timing.backend_res_texture_ms;

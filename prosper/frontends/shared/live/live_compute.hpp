@@ -44,6 +44,26 @@ constexpr bool compute_image_cache_default_eligible(
     return bytes >= compute_image_cache_default_minimum_bytes(image_class);
 }
 
+// Large portable-CFG modules are intentionally explicit: one guest instruction can become several
+// SPIR-V operations plus dispatcher state. Keep the 32K-word classification independently testable,
+// but optimize these modules by default. Disabling driver optimization reduced cold compile latency
+// on NVIDIA at the cost of turning GTA V's repeated 1440p dispatches from roughly 1.7 ms into 47-50
+// ms. PROSPER_COMPUTE_FAST_COMPILE_LARGE remains the diagnostic opt-out for investigations where
+// bounded first-use latency matters more than steady-state execution.
+constexpr bool compute_pipeline_is_large(size_t spirv_words) {
+    return spirv_words >= 32u * 1024u;
+}
+
+// Vulkan pipeline-cache blobs are driver-owned, but their fixed version-one prefix identifies the
+// exact vendor, device, and pipelineCacheUUID that may consume them. Validate that prefix ourselves
+// before passing persistent bytes to vkCreatePipelineCache: a stale driver cache is then a clean
+// miss rather than a startup failure. The UUID is passed as bytes to keep Vulkan types out of this
+// shared policy header and its unit tests.
+bool compute_pipeline_cache_blob_compatible(
+    const uint8_t* blob, size_t blob_bytes,
+    uint32_t vendor_id, uint32_t device_id,
+    const uint8_t* pipeline_cache_uuid, size_t uuid_bytes);
+
 // A sampled descriptor needs guest validation/conversion only when neither renderer authority path
 // supplied its pixels. Depth images can be imported from the persistent Vulkan DS cache even though
 // they deliberately have no color-RTT identity; that import must not fall through and snapshot stale
@@ -208,6 +228,15 @@ bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& it
 // shared interface does not expose Vulkan types.
 struct LiveComputeImageImport {
     uint32_t width = 0, height = 0, depth = 0;
+    // Non-zero when `image` is a 2D-array result that a graphics cube descriptor must consume
+    // through prosper's established vertical-face-stack lowering. The renderer copies each source
+    // layer into one `width x (height * vertical_stack_layers)` sampled image on the GPU. Ordinary
+    // direct imports keep this zero.
+    uint32_t vertical_stack_layers = 0;
+    // Global PM4 command ordinal of the storage dispatch that produced this image. A graphics
+    // consumer can use it to merge a later renderer-owned attachment write without replacing the
+    // other layers with stale guest memory.
+    uint64_t producer_command_order = 0;
     uint32_t native_format = 0; // opaque VkFormat
     uint32_t layout = 0;        // opaque VkImageLayout; currently GENERAL
     void* image = nullptr;      // borrowed VkImage
@@ -221,6 +250,21 @@ struct LiveComputeImageImport {
 bool import_live_compute_storage_image(const prosper::gpu::ShaderResource& sampled_resource,
                                        uint64_t guest_bytes,
                                        LiveComputeImageImport& import);
+
+// Exact Vulkan format a graphics sampled descriptor must request when attempting to lease a
+// retained typed-storage result. Kept on the compute side so the publisher/importer and renderer
+// cannot grow independent format allowlists. The integer is an opaque VkFormat just like
+// LiveComputeImageImport::native_format; zero means the current graphics path must use guest bytes.
+uint32_t live_compute_graphics_import_native_format(
+    prosper::gpu::DataFormat format, uint32_t components);
+
+// Exact guest-byte identity used to look up a retained storage image from a graphics sampled
+// descriptor. Ordinary decoded textures already know their source span. A six-face R16 cube is
+// different: the ordinary decoder reports one face, while the compute producer owns the complete
+// 2D-array allocation. Returning the full descriptor footprint here keeps both cache keys equal.
+uint64_t live_compute_graphics_import_guest_bytes(
+    const prosper::gpu::ShaderResource& sampled_resource,
+    uint64_t decoded_source_bytes);
 
 // Monotonic diagnostic count of writable-buffer results whose exact GPU comparison avoided a host
 // mapping/scan. Exposed so the production-backend test can prove that optimization path executes.
@@ -297,5 +341,10 @@ void register_live_compute();
 // Publish the stable timing selector's final seen/matched verdict. Idempotent with the ordinary
 // destructor fallback; prosper-app calls this before its deliberate _Exit teardown path.
 void report_live_compute_timing_selector_summary();
+
+// Persist the driver pipeline cache without tearing the compute context down. prosper-app cannot
+// run C++/Vulkan destructors while its guest thread is detached, so its deliberate _Exit path calls
+// this explicitly after requesting the guest stop.
+void flush_live_compute_pipeline_cache();
 
 } // namespace prosper::frontend

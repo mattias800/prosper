@@ -151,15 +151,21 @@ bool mrt_draw_binds_target(const prosper::gpu::DrawItem& draw, uint64_t addr,
 // and the resource degrades to guest bytes. So a feedback collision has to be seen by BOTH, and it
 // used to be seen by neither above slot 1.
 
-// May the retained GPU image serve this sample directly?
+// May the retained GPU image serve this sample without materializing guest/CPU bytes? An ordinary
+// non-feedback sample borrows the target directly. When `feedback_copy_supported` is true, an exact
+// attachment collision is also admitted because the backend snapshots the prior attachment version
+// into a distinct sampled image before beginning the render pass. The default preserves the
+// conservative contract for callers that do not implement that GPU copy.
 template <typename FormatDefined>
 bool mrt_direct_serves(const prosper::gpu::DrawItem& draw, uint64_t sampled,
                        uint32_t sampled_width, uint32_t sampled_height,
                        bool is_storage_image, uint32_t img_dim, bool extent_compatible,
-                       bool has_persistent_target, FormatDefined format_defined) {
+                       bool has_persistent_target, FormatDefined format_defined,
+                       bool feedback_copy_supported = false) {
+    const bool feedback = mrt_draw_binds_target_view(
+        draw, sampled, sampled_width, sampled_height, format_defined);
     return !is_storage_image && img_dim == 1u && extent_compatible && has_persistent_target &&
-           !mrt_draw_binds_target_view(draw, sampled, sampled_width, sampled_height,
-                                       format_defined);
+           (!feedback || feedback_copy_supported);
 }
 
 // May the uniform-colour fast path serve this sample? `preconditions` folds the caller's own

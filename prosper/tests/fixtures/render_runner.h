@@ -207,6 +207,10 @@ struct FrameResource {
     void* borrowed_compute_image = nullptr;
     void* borrowed_compute_device = nullptr;
     uint32_t borrowed_compute_image_layout = 0;
+    // A 2D-array compute result cannot be bound directly to the vertically-stacked 2D image expected
+    // by the cube lowering. Non-zero asks the backend to copy these source layers into consecutive
+    // vertical regions of a sampled image without visiting host/guest memory.
+    uint32_t borrowed_compute_vertical_stack_layers = 0;
     std::shared_ptr<void> borrowed_compute_image_lease;
     const uint32_t* buffer_words_data() const {
         return dwords_view && dwords_view_count
@@ -324,6 +328,10 @@ inline VkFormat backend_color_format(VkFormat format) {
         return format;
     if (format == VK_FORMAT_R8_UNORM)
         return VK_FORMAT_R8_UNORM;
+    if (format == VK_FORMAT_R8_UINT)
+        return VK_FORMAT_R8_UINT;
+    if (format == VK_FORMAT_R8G8B8A8_UINT)
+        return VK_FORMAT_R8G8B8A8_UINT;
     if (format == VK_FORMAT_R8G8_UNORM)
         return VK_FORMAT_R8G8_UNORM;
     if (format == VK_FORMAT_R32_UINT)
@@ -366,7 +374,7 @@ inline uint32_t backend_color_bytes_per_pixel(VkFormat format) {
     if (format == VK_FORMAT_R16G16B16A16_SFLOAT) return 8u;
     if (format == VK_FORMAT_R16G16_SFLOAT) return 4u;
     if (format == VK_FORMAT_R16_SFLOAT) return 2u;
-    if (format == VK_FORMAT_R8_UNORM) return 1u;
+    if (format == VK_FORMAT_R8_UNORM || format == VK_FORMAT_R8_UINT) return 1u;
     if (format == VK_FORMAT_R8G8_UNORM) return 2u;
     return 4u;
 }
@@ -374,6 +382,8 @@ inline uint32_t backend_color_bytes_per_pixel(VkFormat format) {
 inline prosper::gpu::SpirvImageNumericClass backend_image_numeric_class(VkFormat format) {
     using NumericClass = prosper::gpu::SpirvImageNumericClass;
     switch (backend_color_format(format)) {
+        case VK_FORMAT_R8_UINT:
+        case VK_FORMAT_R8G8B8A8_UINT:
         case VK_FORMAT_R32_UINT:
         case VK_FORMAT_R32G32B32A32_UINT:
             return NumericClass::Uint;
@@ -462,6 +472,9 @@ struct BackendDraw {
     // Stable semantic draw ID from DrawItem::draw_index. Diagnostics must not use this backend
     // vector's pass-local offset: target/compute splitting can make that offset differ per pass.
     uint64_t draw_index = UINT64_MAX;
+    // Global PM4 ordinal. Unlike draw_index this is comparable with interleaved compute operations
+    // and therefore identifies which retained attachment layer is newer than a compute image.
+    uint64_t command_order = 0;
     const prosper::gpu::ResolvedPipelineState* ps = nullptr;   // null -> triangle-list, write RGBA, no depth
     std::vector<FrameResource> R;                              // set-tagged resources (empty -> no descriptors)
     uint32_t vcount = 3;
@@ -1270,6 +1283,14 @@ inline const RenderVkCtx& render_vk_ctx() {
             add_native_storage_format(
                 prosper::gpu::DataFormat::Float10_11_11, 3,
                 VK_FORMAT_B10G11R11_UFLOAT_PACK32);
+            add_native_storage_format(
+                prosper::gpu::DataFormat::Uint32, 1, VK_FORMAT_R32_UINT);
+            add_native_storage_format(
+                prosper::gpu::DataFormat::Uint8, 1, VK_FORMAT_R8_UINT);
+            add_native_storage_format(
+                prosper::gpu::DataFormat::Uint8, 4, VK_FORMAT_R8G8B8A8_UINT);
+            add_native_storage_format(
+                prosper::gpu::DataFormat::Uint16, 1, VK_FORMAT_R16_UINT);
             // Present unification (#1270): advertise present adoption only when the instance is
             // surface-capable AND the device enabled VK_KHR_swapchain AND a present queue was resolved.
             shared.present_capable = r.present_surface_capable && r.present_swapchain_capable &&
@@ -2747,6 +2768,7 @@ struct PersistentDsImage {
     bool depth_valid = false;
     bool stencil_valid = false;
     uint64_t last_depth_write = 0;   // sampled-bridge recency (#1275)
+    uint64_t last_depth_command_order = 0;
 };
 
 inline uint64_t& persistent_ds_write_generation() {
@@ -2786,9 +2808,12 @@ constexpr bool stencil_clear_effective(bool clear_enabled, bool stencil_enabled,
 }
 
 inline void note_persistent_ds_depth_write(PersistentDsImage& image, bool use_depth,
-                                           bool depth_may_be_written) {
-    if (use_depth && depth_may_be_written)
+                                           bool depth_may_be_written,
+                                           uint64_t command_order = 0) {
+    if (use_depth && depth_may_be_written) {
         image.last_depth_write = ++persistent_ds_write_generation();
+        image.last_depth_command_order = command_order;
+    }
 }
 
 inline PersistentDsKey persistent_ds_key_for(const prosper::gpu::ResolvedPipelineState& ps,
@@ -3781,6 +3806,42 @@ inline bool read_persistent_ds_depth(PersistentDsImage& image, uint32_t width, u
     return true;
 }
 
+// Metadata-only selection for a retained depth cube. `overlay_version` is the newest selected
+// depth-write generation, so a CPU-decoded six-face stack can be cached against renderer authority
+// without consulting stale guest bytes. Any new face write advances that generation; an invalid or
+// missing face makes the selection incomplete and therefore ineligible for that cache.
+struct PersistentDsCubeSelection {
+    std::array<PersistentDsImage*, 6> faces{};
+    uint32_t present_mask = 0;
+    uint32_t known_mask = 0;
+    uint64_t overlay_version = 0;
+};
+
+inline PersistentDsCubeSelection select_persistent_ds_cube_depth(
+    uint64_t base, uint32_t width, uint32_t height) {
+    PersistentDsCubeSelection selected;
+    std::array<uint64_t, 6> recency{};
+    if (!base || !width || !height) return selected;
+    for (auto& [key, image] : persistent_ds_cache()) {
+        if (key.w != width || key.h != height ||
+            (key.dr != base && key.dw != base) || key.slice >= 6u)
+            continue;
+        selected.known_mask |= 1u << key.slice;
+        if (!image.depth_valid || !image.layout_initialized || !image.image)
+            continue;
+        if (!selected.faces[key.slice] || image.last_depth_write > recency[key.slice]) {
+            selected.faces[key.slice] = &image;
+            recency[key.slice] = image.last_depth_write;
+            selected.present_mask |= 1u << key.slice;
+        }
+    }
+    for (uint32_t slice = 0; slice < 6u; ++slice)
+        if (selected.faces[slice])
+            selected.overlay_version = std::max(
+                selected.overlay_version, selected.faces[slice]->last_depth_write);
+    return selected;
+}
+
 // All six faces of a depth cube whose faces are retained separately, or false when any is missing.
 // `slices_found` reports how many were present, so a partial cube is a stated fact rather than a
 // silent half-result.
@@ -3791,34 +3852,65 @@ inline bool read_persistent_ds_cube_depth(uint64_t base, uint32_t width, uint32_
                                           uint32_t* known_mask = nullptr) {
     error.clear();
     slices_found = 0;
-    if (present_mask) *present_mask = 0;
-    // Slices the cache holds an ENTRY for, whether or not its depth is currently valid. The
-    // difference between the two masks separates "prosper never rendered this face" from "it was
-    // rendered and then invalidated", which are different defects with different fixes.
-    if (known_mask) {
-        *known_mask = 0;
-        for (const auto& [key, image] : persistent_ds_cache()) {
-            (void)image;
-            if (key.w != width || key.h != height) continue;
-            if (key.dr != base && key.dw != base) continue;
-            if (key.slice < 6u) *known_mask |= 1u << key.slice;
-        }
-    }
+    const PersistentDsCubeSelection selected =
+        select_persistent_ds_cube_depth(base, width, height);
+    if (present_mask) *present_mask = selected.present_mask;
+    if (known_mask) *known_mask = selected.known_mask;
     for (uint32_t slice = 0; slice < 6u; ++slice) {
-        PersistentDsImage* found = nullptr;
-        for (auto& [key, image] : persistent_ds_cache()) {
-            if (key.slice != slice || key.w != width || key.h != height) continue;
-            if (key.dr != base && key.dw != base) continue;
-            if (!image.depth_valid || !image.layout_initialized || !image.image) continue;
-            found = &image;
-            break;
-        }
+        PersistentDsImage* found = selected.faces[slice];
         if (!found) continue;
         if (!read_persistent_ds_depth(*found, width, height, faces[slice], error)) return false;
-        if (present_mask) *present_mask |= 1u << slice;
         ++slices_found;
     }
     return slices_found == 6u;
+}
+
+// Retained depth faces produced after a compute image. GTA V builds each shadow cube by copying
+// five unchanged R16 layers in compute and then rendering the sixth face into a D32 attachment.
+// Comparing the global PM4 ordinals makes that split explicit: only the renderer-newer face may
+// replace the exact compute result. `last_depth_write` breaks ties between re-keyed cache entries;
+// it is deliberately not compared with a command ordinal because those counters have different
+// domains.
+inline PersistentDsCubeSelection select_persistent_ds_cube_depth_after(
+    uint64_t base, uint32_t width, uint32_t height, uint64_t producer_command_order) {
+    PersistentDsCubeSelection selected;
+    std::array<uint64_t, 6> recency{};
+    if (!base || !producer_command_order) return selected;
+    for (auto& [key, image] : persistent_ds_cache()) {
+        if (key.w != width || key.h != height ||
+            (key.dr != base && key.dw != base) || key.slice >= 6u)
+            continue;
+        selected.known_mask |= 1u << key.slice;
+        if (!image.depth_valid || !image.layout_initialized || !image.image ||
+            image.last_depth_command_order <= producer_command_order)
+            continue;
+        if (!selected.faces[key.slice] || image.last_depth_write > recency[key.slice]) {
+            selected.faces[key.slice] = &image;
+            recency[key.slice] = image.last_depth_write;
+            selected.present_mask |= 1u << key.slice;
+            selected.overlay_version = std::max(
+                selected.overlay_version, image.last_depth_write);
+        }
+    }
+    return selected;
+}
+
+inline bool read_persistent_ds_cube_depth_after(
+    uint64_t base, uint32_t width, uint32_t height, uint64_t producer_command_order,
+    std::array<std::vector<float>, 6>& faces, uint32_t& present_mask,
+    uint32_t& known_mask, std::string& error) {
+    error.clear();
+    const PersistentDsCubeSelection selected = select_persistent_ds_cube_depth_after(
+        base, width, height, producer_command_order);
+    present_mask = selected.present_mask;
+    known_mask = selected.known_mask;
+    for (uint32_t slice = 0; slice < 6u; ++slice) {
+        if (!(present_mask & (1u << slice))) continue;
+        if (!read_persistent_ds_depth(*selected.faces[slice], width, height,
+                                      faces[slice], error))
+            return false;
+    }
+    return true;
 }
 
 inline bool snapshot_persistent_ds_images(std::vector<prosper::gpu::GpuCaptureDsSeed>& seeds,
@@ -4376,15 +4468,19 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     bool depth_was_valid = false, stencil_was_valid = false;
     bool depth_used_meaningfully = false;
     bool depth_may_be_written = false;
+    uint64_t depth_write_command_order = 0;
     bool stencil_may_be_written = false;
     for (const auto& d : draws) {
         if (!d.ps) continue;
         depth_used_meaningfully |= effective_depth_clear(d.ps) || d.ps->depth_write_enable ||
             (d.ps->depth_test_enable && d.ps->depth_compare_op != VK_COMPARE_OP_ALWAYS &&
                                         d.ps->depth_compare_op != VK_COMPARE_OP_NEVER);
-        depth_may_be_written |= persistent_ds_pass_may_write_depth(
+        const bool draw_may_write_depth = persistent_ds_pass_may_write_depth(
             d.ps->depth_clear_enable, d.ps->depth_test_enable, d.ps->depth_write_enable,
             d.ps->depth_compare_op);
+        depth_may_be_written |= draw_may_write_depth;
+        if (draw_may_write_depth)
+            depth_write_command_order = std::max(depth_write_command_order, d.command_order);
         stencil_may_be_written |= stencil_clear_effective(
             d.ps->stencil_clear_enable, d.ps->stencil_enable,
             d.ps->stencil_write_mask[0], d.ps->stencil_write_mask[1]);
@@ -5038,7 +5134,14 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         // rather than merely slows (#2253). Mirrors SharedBufferUpload::arena on the storage path.
         VkDeviceSize ioffset = 0;
         bool iarena = false;
+        VkViewport viewport{};
         VkRect2D scissor{};
+        float line_width = 1.0f;
+        float depth_bias_constant = 0.0f;
+        float depth_bias_clamp = 0.0f;
+        float depth_bias_slope = 0.0f;
+        VkStencilOpState stencil_front{};
+        VkStencilOpState stencil_back{};
         uint32_t n_sets = 1, vcount = 3, icount = 0, instance_count = 1;
         int32_t vertex_offset = 0;
         bool use_desc = false, ok = false, pipeline_cached = false;
@@ -5097,6 +5200,11 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         bool uniform_clear = false;
         VkClearColorValue uniform_color{};
         bool borrowed_target = false;
+        // Color-attachment feedback cannot borrow the attachment image itself. Snapshot its
+        // pre-pass contents into this upload's distinct sampled image with a queue-ordered GPU copy.
+        bool feedback_snapshot = false;
+        VkImage feedback_source = VK_NULL_HANDLE;
+        VkImageLayout feedback_source_layout = VK_IMAGE_LAYOUT_UNDEFINED;
         // Independent one-level renderer targets copied into this upload's mip levels. Sources
         // retain their persistent-cache layout after the copy; a zero image is generated from the
         // preceding destination level.
@@ -5104,6 +5212,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         std::array<VkImage, 16> target_mip_images{};
         std::array<VkImageLayout, 16> target_mip_layouts{};
         bool borrowed_compute = false;
+        bool stacked_compute = false;
+        VkImage stacked_compute_source = VK_NULL_HANDLE;
+        uint32_t stacked_compute_layers = 0;
         VkImageLayout borrowed_compute_layout = VK_IMAGE_LAYOUT_UNDEFINED;
         std::shared_ptr<void> borrowed_compute_lease;
         // Sampled depth bridge (#1275): image borrowed from the persistent DS cache. The view uses
@@ -5302,15 +5413,24 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         return bits;
     };
     std::vector<DV> dv(draws.size());
-    std::vector<std::vector<FrameResource>> effective_resources(draws.size());
+    // Most draws use the frontend's immutable resource vector verbatim. Copying every FrameResource
+    // here copied owned buffer payloads, callbacks and shared owners for thousands of draws before
+    // the backend could even consult its upload caches. Only a shader that needs prosper's synthetic
+    // GDS binding requires an augmented vector; all ordinary draws borrow the caller-owned vector for
+    // this synchronous backend call.
+    std::vector<std::vector<FrameResource>> augmented_resources(draws.size());
+    std::vector<const std::vector<FrameResource>*> effective_resources(draws.size());
     for (size_t i = 0; i < draws.size(); ++i) {
-        effective_resources[i] = draws[i].R;
         if (fragment_uses_internal_gds_memoized(draws[i].fs_identity, draws[i].fs_words())) {
+            augmented_resources[i] = draws[i].R;
             FrameResource gds;
             gds.set = 1;
             gds.binding = 0;
             gds.is_internal_gds = true;
-            effective_resources[i].push_back(std::move(gds));
+            augmented_resources[i].push_back(std::move(gds));
+            effective_resources[i] = &augmented_resources[i];
+        } else {
+            effective_resources[i] = &draws[i].R;
         }
     }
     std::vector<SharedTextureUpload> texture_uploads;
@@ -5407,7 +5527,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     uint64_t storage_buffers = 0;
     uint64_t sampled_images = 0;
     uint64_t storage_images = 0;
-    for (const auto& resources : effective_resources) {
+    for (const auto* resource_ptr : effective_resources) {
+        const auto& resources = *resource_ptr;
         if (resources.empty()) continue;
         uint32_t set_count = 1;
         for (const FrameResource& resource : resources) {
@@ -5822,11 +5943,25 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         VkViewport vp{0, 0, (float)W, (float)H, 0, 1}; VkRect2D sc{{0, 0}, {W, H}};
         if (ps && ps->has_viewport)
             vp = {ps->viewport_x, ps->viewport_y, ps->viewport_w, ps->viewport_h, ps->min_depth, ps->max_depth};
+        v.viewport = vp;
         VkPipelineViewportStateCreateInfo vpst{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
         vpst.viewportCount = 1; vpst.pViewports = &vp; vpst.scissorCount = 1; vpst.pScissors = &sc;
-        const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_SCISSOR};
+        // Viewports are draw state, not a shader/render-pass compatibility axis. Baking the camera's
+        // sub-pixel viewport into every pipeline key made GTA V create 20-30 nominally new graphics
+        // pipelines on every 1440p gameplay frame. Vulkan 1.0 makes viewport dynamic in core; record
+        // the resolved per-draw value beside the already-dynamic scissor.
+        const VkDynamicState dynamic_states[] = {
+            VK_DYNAMIC_STATE_VIEWPORT,
+            VK_DYNAMIC_STATE_SCISSOR,
+            VK_DYNAMIC_STATE_LINE_WIDTH,
+            VK_DYNAMIC_STATE_DEPTH_BIAS,
+            VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
+            VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+            VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+        };
         VkPipelineDynamicStateCreateInfo dynamic_state{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-        dynamic_state.dynamicStateCount = 1; dynamic_state.pDynamicStates = dynamic_states;
+        dynamic_state.dynamicStateCount = static_cast<uint32_t>(std::size(dynamic_states));
+        dynamic_state.pDynamicStates = dynamic_states;
         VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
         rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
         // Honor the guest's PA_SU_SC_MODE_CNTL cull/front-face/polygon mode (#456). Resolve encodes these
@@ -5850,6 +5985,10 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             rs.depthBiasSlopeFactor    = ps->depth_bias_slope;
             rs.depthBiasClamp = render_vk_ctx().depth_bias_clamp_enabled ? ps->depth_bias_clamp : 0.0f;
         }
+        v.line_width = rs.lineWidth;
+        v.depth_bias_constant = rs.depthBiasConstantFactor;
+        v.depth_bias_clamp = rs.depthBiasClamp;
+        v.depth_bias_slope = rs.depthBiasSlopeFactor;
         VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
         ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
         const auto fixed_viewport_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
@@ -5982,12 +6121,14 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         ps->stencil_fail_op[1], ps->stencil_pass_op[1], ps->stencil_depth_fail_op[1],
                         dss.front.reference, dss.back.reference, (unsigned)ps->cull_mode, (int)ps->depth_test_enable);
         }
+        v.stencil_front = dss.front;
+        v.stencil_back = dss.back;
         // Descriptor resources for this draw (two-set: VS=set0, PS=set1 — same layout as the single path).
         const auto fixed_dss_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
         if (timing_enabled) res_fixed_depth_stencil_ms += setup_elapsed_ms(fixed_blend_ready, fixed_dss_ready);
         const auto setup_fixed_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
         if (timing_enabled) setup_fixed_ms += setup_elapsed_ms(setup_shaders_ready, setup_fixed_ready);
-        const auto& R = effective_resources[di];
+        const auto& R = *effective_resources[di];
         v.use_desc = !R.empty();
         for (auto& r : R) v.n_sets = std::max(v.n_sets, r.set + 1);
         std::vector<VkDescriptorSetLayout> dsls(v.n_sets, VK_NULL_HANDLE);
@@ -6364,8 +6505,16 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             r.borrowed_compute_image_layout !=
                                 static_cast<uint32_t>(VK_IMAGE_LAYOUT_UNDEFINED) &&
                             r.borrowed_compute_image_lease) {
-                            upload.image = static_cast<VkImage>(r.borrowed_compute_image);
-                            upload.borrowed_compute = true;
+                            if (r.borrowed_compute_vertical_stack_layers) {
+                                upload.stacked_compute = true;
+                                upload.stacked_compute_source =
+                                    static_cast<VkImage>(r.borrowed_compute_image);
+                                upload.stacked_compute_layers =
+                                    r.borrowed_compute_vertical_stack_layers;
+                            } else {
+                                upload.image = static_cast<VkImage>(r.borrowed_compute_image);
+                                upload.borrowed_compute = true;
+                            }
                             upload.borrowed_compute_layout = static_cast<VkImageLayout>(
                                 r.borrowed_compute_image_layout);
                             upload.borrowed_compute_lease = r.borrowed_compute_image_lease;
@@ -6378,15 +6527,34 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                         }
                         if (!upload.borrowed_compute && !r.is_storage_image &&
                             !upload.assembled_target_mips && persistent_color_targets_enabled &&
-                            !target_feedback &&
                             r.persistent_render_target_id && r.img_dim == 1) {
                             if (auto* target = find_persistent_color_target(
                                     r.persistent_render_target_id, r.tw, r.th,
                                     backend_color_format(r.texture_format))) {
                                 target->last_use = color_target_generation;
-                                upload.image = target->image;
-                                upload.image_bytes = target->bytes;
-                                upload.borrowed_target = true;
+                                if (target_feedback) {
+                                    upload.feedback_snapshot = true;
+                                    upload.feedback_source = target->image;
+                                    upload.feedback_source_layout = target->layout;
+                                    // Earlier barriers in this command buffer move a retained
+                                    // attachment that will LOAD to COLOR_ATTACHMENT_OPTIMAL. Record
+                                    // the layout the copy actually sees, not the cache's pre-call
+                                    // resting layout.
+                                    if ((target == cached_color && load_cached_color) ||
+                                        (target == cached_color1 && load_cached_color1)) {
+                                        upload.feedback_source_layout =
+                                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                                    } else {
+                                        for (uint32_t slot = 2; slot < color_count; ++slot)
+                                            if (target == cached_extra[slot] && load_extra[slot])
+                                                upload.feedback_source_layout =
+                                                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                                    }
+                                } else {
+                                    upload.image = target->image;
+                                    upload.image_bytes = target->bytes;
+                                    upload.borrowed_target = true;
+                                }
                                 ++color_target_stats.sampled_hits;
                             }
                         }
@@ -6412,8 +6580,9 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                     sampled_ds.aspect == VK_IMAGE_ASPECT_STENCIL_BIT;
                             }
                         }
-                        upload.persistent_id =
-                            r.is_storage_image || upload.borrowed_ds ? 0 : r.persistent_texture_id;
+                        upload.persistent_id = r.is_storage_image || upload.borrowed_ds ||
+                                upload.feedback_snapshot
+                            ? 0 : r.persistent_texture_id;
                         upload.persistent_version = r.persistent_texture_version;
                         const PersistentTextureKey persistent_key{
                             r.persistent_texture_id, r.tw, r.th, r.td, r.img_dim,
@@ -6525,7 +6694,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                                 upload.uniform_clear = true;
                                 std::copy(r.uniform_color.begin(), r.uniform_color.end(),
                                           upload.uniform_color.float32);
-                            } else if (!upload.assembled_target_mips) {
+                            } else if (!upload.feedback_snapshot &&
+                                       !upload.assembled_target_mips && !upload.stacked_compute) {
                                 const VkDeviceSize tbytes =
                                     static_cast<VkDeviceSize>(r.tw) * r.th * r.td *
                                     r.sample_count *
@@ -6993,7 +7163,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 memcpy(&word, &value, sizeof word);
                 append(word);
             };
-            append(10); // key schema version (descriptor arity, #2471; MRT formats, #1390)
+            append(12); // dynamic viewport/bias/stencil values; descriptor arity #2471; MRT formats #1390
             append(W); append(H); append(color_count);
             for (uint32_t slot = 0; slot < color_count; ++slot)
                 append(static_cast<uint32_t>(color_formats[slot]));
@@ -7053,11 +7223,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 }
             }
             append(ia.topology); append(ia.primitiveRestartEnable);
-            append_float(vp.x); append_float(vp.y); append_float(vp.width); append_float(vp.height);
-            append_float(vp.minDepth); append_float(vp.maxDepth);
-            append(rs.polygonMode); append(rs.cullMode); append(rs.frontFace); append_float(rs.lineWidth);
-            append(rs.depthBiasEnable); append_float(rs.depthBiasConstantFactor);
-            append_float(rs.depthBiasSlopeFactor); append_float(rs.depthBiasClamp);
+            append(rs.polygonMode); append(rs.cullMode); append(rs.frontFace);
+            append(rs.depthBiasEnable);
             append(cb.logicOpEnable); append(cb.logicOp);
             for (uint32_t attachment = 0; attachment < color_count; ++attachment) {
                 append(cba[attachment].blendEnable); append(cba[attachment].srcColorBlendFactor);
@@ -7071,8 +7238,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 append(dss.depthBoundsTestEnable); append(dss.stencilTestEnable);
                 auto append_stencil = [&](const VkStencilOpState& stencil) {
                     append(stencil.failOp); append(stencil.passOp); append(stencil.depthFailOp);
-                    append(stencil.compareOp); append(stencil.compareMask); append(stencil.writeMask);
-                    append(stencil.reference);
+                    append(stencil.compareOp);
                 };
                 append_stencil(dss.front); append_stencil(dss.back);
                 append_float(dss.minDepthBounds); append_float(dss.maxDepthBounds);
@@ -7193,7 +7359,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     texture_stats.persistent_hits = persistent_texture_hits;
     texture_stats.persistent_misses = persistent_texture_misses;
     for (const auto& upload : texture_uploads) {
-        if (!upload.staging && !upload.uniform_clear && !upload.assembled_target_mips)
+        if (!upload.staging && !upload.uniform_clear && !upload.assembled_target_mips &&
+            !upload.feedback_snapshot)
             continue;
         ++texture_stats.unique_uploads;
         texture_stats.upload_bytes += static_cast<uint64_t>(upload.key.width) * upload.key.height *
@@ -7470,7 +7637,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // Upload each distinct texture once. Draw descriptors may use separate views/samplers over the
     // same image, preserving per-binding swizzle and sampler state without duplicating pixel storage.
     for (const auto& upload : texture_uploads) {
-        if (!upload.staging && !upload.uniform_clear && !upload.assembled_target_mips)
+        if (!upload.staging && !upload.uniform_clear && !upload.assembled_target_mips &&
+            !upload.stacked_compute && !upload.feedback_snapshot)
             continue;  // exact-validated persistent image already has shader-read layout
         VkImageMemoryBarrier b0{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         b0.oldLayout = upload.persistent_refresh
@@ -7487,7 +7655,97 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 ? (VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT)
                 : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b0);
-        if (upload.uniform_clear) {
+        if (upload.feedback_snapshot) {
+            VkImageMemoryBarrier source_to_copy{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            source_to_copy.oldLayout = upload.feedback_source_layout;
+            source_to_copy.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            source_to_copy.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                                           VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                           VK_ACCESS_SHADER_READ_BIT |
+                                           VK_ACCESS_TRANSFER_READ_BIT |
+                                           VK_ACCESS_TRANSFER_WRITE_BIT;
+            source_to_copy.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            source_to_copy.srcQueueFamilyIndex = source_to_copy.dstQueueFamilyIndex =
+                VK_QUEUE_FAMILY_IGNORED;
+            source_to_copy.image = upload.feedback_source;
+            source_to_copy.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdPipelineBarrier(
+                cmd,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                    VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                0, nullptr, 0, nullptr, 1, &source_to_copy);
+            VkImageCopy copy{};
+            copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            copy.extent = {upload.key.width, upload.key.height, 1};
+            vkCmdCopyImage(
+                cmd, upload.feedback_source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                upload.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+            VkImageMemoryBarrier source_restore{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            source_restore.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            source_restore.newLayout = upload.feedback_source_layout;
+            source_restore.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            source_restore.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                                           VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                           VK_ACCESS_SHADER_READ_BIT;
+            source_restore.srcQueueFamilyIndex = source_restore.dstQueueFamilyIndex =
+                VK_QUEUE_FAMILY_IGNORED;
+            source_restore.image = upload.feedback_source;
+            source_restore.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdPipelineBarrier(
+                cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                    VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                0, 0, nullptr, 0, nullptr, 1, &source_restore);
+        } else if (upload.stacked_compute) {
+            VkImageMemoryBarrier source_to_copy{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            source_to_copy.oldLayout = upload.borrowed_compute_layout;
+            source_to_copy.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            source_to_copy.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                                           VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+            source_to_copy.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            source_to_copy.srcQueueFamilyIndex = source_to_copy.dstQueueFamilyIndex =
+                VK_QUEUE_FAMILY_IGNORED;
+            source_to_copy.image = upload.stacked_compute_source;
+            source_to_copy.subresourceRange = {
+                VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, upload.stacked_compute_layers};
+            vkCmdPipelineBarrier(
+                cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &source_to_copy);
+            const uint32_t face_height = upload.stacked_compute_layers
+                ? upload.key.height / upload.stacked_compute_layers : 0u;
+            std::vector<VkImageCopy> regions(upload.stacked_compute_layers);
+            for (uint32_t layer = 0; layer < upload.stacked_compute_layers; ++layer) {
+                VkImageCopy& copy = regions[layer];
+                copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1};
+                copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                copy.dstOffset = {0, static_cast<int32_t>(layer * face_height), 0};
+                copy.extent = {upload.key.width, face_height, 1};
+            }
+            vkCmdCopyImage(
+                cmd, upload.stacked_compute_source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                upload.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                static_cast<uint32_t>(regions.size()), regions.data());
+            VkImageMemoryBarrier source_restore{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            source_restore.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            source_restore.newLayout = upload.borrowed_compute_layout;
+            source_restore.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            source_restore.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                                           VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+            source_restore.srcQueueFamilyIndex = source_restore.dstQueueFamilyIndex =
+                VK_QUEUE_FAMILY_IGNORED;
+            source_restore.image = upload.stacked_compute_source;
+            source_restore.subresourceRange = {
+                VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, upload.stacked_compute_layers};
+            vkCmdPipelineBarrier(
+                cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, 0, nullptr, 0, nullptr, 1, &source_restore);
+        } else if (upload.uniform_clear) {
             const VkImageSubresourceRange range{
                 VK_IMAGE_ASPECT_COLOR_BIT, 0, upload.key.mip_levels,
                 0, upload.key.sample_count};
@@ -7572,6 +7830,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         // Each source level transitions DST->SRC before feeding the next; the final barrier below
         // then flips the whole chain to shader-read. RGBA8 linear-blit support is mandatory Vulkan.
         for (uint32_t l = 1; !upload.uniform_clear && !upload.assembled_target_mips &&
+             !upload.stacked_compute && !upload.feedback_snapshot &&
              l < upload.key.mip_levels; l++) {
             VkImageMemoryBarrier bs{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
             bs.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -7599,6 +7858,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                            VK_FILTER_LINEAR);
         }
         if (!upload.uniform_clear && !upload.assembled_target_mips &&
+            !upload.stacked_compute && !upload.feedback_snapshot &&
             upload.key.mip_levels > 1) {
             // Levels 0..N-2 sit in TRANSFER_SRC after feeding the cascade; return them to
             // TRANSFER_DST so the single final-layout barrier below covers the whole chain.
@@ -7879,7 +8139,23 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                             ds_ctx.occlusion_precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
         }
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v.pipe);
+        vkCmdSetViewport(cmd, 0, 1, &v.viewport);
         vkCmdSetScissor(cmd, 0, 1, &v.scissor);
+        vkCmdSetLineWidth(cmd, v.line_width);
+        vkCmdSetDepthBias(cmd, v.depth_bias_constant, v.depth_bias_clamp,
+                          v.depth_bias_slope);
+        vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_FRONT_BIT,
+                                   v.stencil_front.compareMask);
+        vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_BACK_BIT,
+                                   v.stencil_back.compareMask);
+        vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_FRONT_BIT,
+                                 v.stencil_front.writeMask);
+        vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_BACK_BIT,
+                                 v.stencil_back.writeMask);
+        vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_BIT,
+                                 v.stencil_front.reference);
+        vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_BACK_BIT,
+                                 v.stencil_back.reference);
         if (v.use_desc) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v.layout, 0, v.n_sets, v.dsets.data(), 0, nullptr);
         const bool geom_here = geom_active && di == geom_item;
         if (geom_here) {
@@ -8288,7 +8564,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
         // Sampled depth bridge (#1275): recency for find_persistent_ds_sampled — two valid
         // entries can share a plane address (a surface re-keyed D32 -> D32S8 keeps its old
         // entry), and the most recently written one is the live truth.
-        note_persistent_ds_depth_write(*cached_ds, use_depth, depth_may_be_written);
+        note_persistent_ds_depth_write(*cached_ds, use_depth, depth_may_be_written,
+                                       depth_write_command_order);
     }
     if (cached_color) {
         active_submission.add_failure_cleanup([cached_color]() {

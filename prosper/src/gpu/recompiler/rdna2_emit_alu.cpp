@@ -7063,6 +7063,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const bool native_2d_storage =
                     shader_resource_uses_native_2d_storage_image(
                         *res, dim == Dim_2D, arrayed, ms);
+                const bool native_uint_2d_storage =
+                    shader_resource_uses_native_uint_2d_storage_image(
+                        *res, dim == Dim_2D, arrayed, ms);
                 const bool ordinary_3d = in.mimg_dim == SQ_DIM_3D && res->img_dim == 2 &&
                                          res->depth && !arrayed && !ms &&
                                          !res->depth_compare;
@@ -7082,9 +7085,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     native_float_storage_image_supported(
                         res->format, components, res->srgb,
                         (b.native_storage_format_support & native_support_bit) != 0);
-                // Existing load/store-only uint images retain the raw uvec4/Format=Unknown contract
-                // used by the compute backend. The atomic's exact R32_UINT gate above is the only path
-                // that opts into a typed R32ui image.
+                const bool native_uint = !packed_r11 && native_uint_2d_storage && !is_atomic &&
+                    native_uint_storage_image_supported(
+                        res->format, components, res->srgb,
+                        (b.native_storage_format_support & native_support_bit) != 0);
                 const bool compute_atomic_buffer = is_atomic && b.is_compute;
                 if (compute_atomic_buffer) {
                     if (!b.declare_compute_atomic_image_buffer(res->binding)) {
@@ -7093,9 +7097,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     }
                 } else {
                     const bool native_r32ui = is_atomic;
+                    const uint32_t native_uint_format = res->format == DataFormat::Uint32
+                        ? ImgFmt_R32ui : res->format == DataFormat::Uint16
+                            ? ImgFmt_R16ui : components == 4
+                                ? ImgFmt_Rgba8ui : ImgFmt_R8ui;
                     b.declare_storage_image(res->binding, dim, arrayed, ms, native_float,
                                             (native_r32ui || packed_r11)
-                                                ? ImgFmt_R32ui : ImgFmt_Unknown,
+                                                ? ImgFmt_R32ui
+                                                : native_uint ? native_uint_format : ImgFmt_Unknown,
                                             packed_r11);
                 }
                 // Coordinate VGPR per axis. Non-NSA (len==2): consecutive from VADDR (src[0]). NSA (len>2):

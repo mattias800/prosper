@@ -527,6 +527,13 @@ int main() {
     CHECK(!native_float_storage_image_supported(DataFormat::Unorm8, 4, true, true) &&
               !native_float_storage_image_supported(DataFormat::Float16, 3, false, true),
           "device support cannot override semantic native-storage exclusions");
+    CHECK(native_uint_storage_image_supported(DataFormat::Uint32, 1, false, true) &&
+              native_uint_storage_image_supported(DataFormat::Uint16, 1, false, true) &&
+              native_uint_storage_image_supported(DataFormat::Uint8, 1, false, true) &&
+              native_uint_storage_image_supported(DataFormat::Uint8, 4, false, true) &&
+              !native_uint_storage_image_supported(DataFormat::Uint16, 4, false, true) &&
+              !native_uint_storage_image_supported(DataFormat::Uint8, 1, true, true),
+          "native unsigned storage accepts exact scalar and RGBA8 linear formats");
     const uint32_t r8_storage =
         native_storage_format_support_bit(DataFormat::Unorm8, 1);
     const uint32_t rg8_storage =
@@ -535,11 +542,26 @@ int main() {
         native_storage_format_support_bit(DataFormat::Float10_11_11, 3);
     const uint32_t fp16_3d_storage =
         native_storage_3d_format_support_bit(DataFormat::Float16, 4);
+    const uint32_t r32ui_storage =
+        native_storage_format_support_bit(DataFormat::Uint32, 1);
+    const uint32_t r8ui_storage =
+        native_storage_format_support_bit(DataFormat::Uint8, 1);
+    const uint32_t r16ui_storage =
+        native_storage_format_support_bit(DataFormat::Uint16, 1);
+    const uint32_t rgba8ui_storage =
+        native_storage_format_support_bit(DataFormat::Uint8, 4);
     CHECK(r8_storage && rg8_storage && packed_storage && fp16_3d_storage &&
+              r32ui_storage && r16ui_storage && r8ui_storage && rgba8ui_storage &&
               r8_storage != rg8_storage &&
               rg8_storage != packed_storage &&
+              r32ui_storage != r16ui_storage && r16ui_storage != r8ui_storage &&
+              r8ui_storage != rgba8ui_storage &&
               !(fp16_3d_storage & ((1u << 10) - 1u)) &&
               !(fp16_3d_storage & ~kNativeStorageFormatSupportMask) &&
+              !(r32ui_storage & ~kNativeStorageFormatSupportMask) &&
+              !(r16ui_storage & ~kNativeStorageFormatSupportMask) &&
+              !(rgba8ui_storage & ~kNativeStorageFormatSupportMask) &&
+              native_storage_3d_format_support_bit(DataFormat::Uint32, 1) == 0 &&
               native_storage_format_support_bit(DataFormat::Float16, 3) == 0,
           "native storage capability bits distinguish exact typed VkFormat and dimension candidates");
 
