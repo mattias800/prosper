@@ -147,7 +147,8 @@ bool texture_source_snapshot_can_follow_watch(bool source_matches_pixels,
 // written; it does not enable them. PROSPER_NO_FRAME_DUMPS remains a final kill switch even when a
 // caller explicitly requests dumps.
 void register_live_renderer(const std::string& frame_dir = ".",
-                            bool dump_bmps = kFrameDumpsByDefault);
+                            bool dump_bmps = kFrameDumpsByDefault,
+                            const std::string& title_id = {});
 
 // #2215: which OS thread is currently inside a live submit-render callback, or 0.
 //
