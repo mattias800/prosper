@@ -130,6 +130,18 @@ bool storage_image_materialize_raw_uvec4(
     uint32_t mip_tail_x, uint32_t mip_tail_y,
     uint32_t* channels, size_t channel_dwords);
 
+// Reverse the portable raw-uvec4 materialization after a writable Vulkan storage image has
+// completed. `channels` contains four 32-bit values per texel; the helper restores the descriptor's
+// compact guest format and then its linear, tiled-surface, mip-tail, or tiled-volume layout. The
+// destination must cover the complete footprint returned by storage_image_raw_uvec4_source_bytes.
+bool storage_image_writeback_raw_uvec4(
+    const uint32_t* channels, size_t channel_dwords,
+    prosper::gpu::DataFormat format, uint32_t components,
+    uint32_t width, uint32_t height, uint32_t depth, uint32_t tile_mode,
+    bool in_mip_tail, uint32_t mip_tail_bytes,
+    uint32_t mip_tail_x, uint32_t mip_tail_y,
+    uint8_t* destination, size_t destination_bytes);
+
 // A typed Vulkan storage image already exposes the guest format as exact row-major bytes. For a
 // tiled guest surface the tiler can therefore read the mapped staging image directly, unless a
 // poison-proving dispatch still needs a mutable linear copy to restore untouched texels.

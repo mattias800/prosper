@@ -3520,6 +3520,24 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             return true;
         }
         case Rdna2Format::VOPC: {                                     // v_cmp_* -> VCC; v_cmpx_* also -> EXEC
+            const auto scalar_data_operand = [&](const Operand& source) {
+                switch (source.kind) {
+                    case OperandKind::InlineInt:
+                    case OperandKind::InlineFloat:
+                    case OperandKind::Literal:
+                        return true;
+                    case OperandKind::SGPR:
+                        return rs.sreg.contains(source.value) ||
+                            rs.sreg_input.contains(source.value);
+                    case OperandKind::Special:
+                        if (source.value == 125) return true; // SGPR_NULL
+                        if (source.value == 253) return rs.scc != 0;
+                        return source.value >= 106 && source.value <= 124 &&
+                            rs.sreg.contains(source.value);
+                    default:
+                        return false;
+                }
+            };
             const uint32_t ra = val(in.src[0]), rc = val(in.src[1]);  // raw bits (f16 compares re-derive)
             uint32_t a = ra, c = rc;
             uint32_t op = in.opcode;
@@ -3529,6 +3547,25 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             const bool integer64_compare =
                 (eff >= 0xA1u && eff <= 0xA6u) ||
                 (eff >= 0xE1u && eff <= 0xE6u);
+            auto scalar_integer64_operand = [&](const Operand& source) {
+                if (!scalar_data_operand(source)) return false;
+                if (source.kind == OperandKind::SGPR ||
+                    (source.kind == OperandKind::Special && source.value >= 106 &&
+                     source.value <= 123)) {
+                    Operand high = source;
+                    ++high.value;
+                    return scalar_data_operand(high);
+                }
+                // Inline integers sign-extend, while literals and SGPR_NULL zero-extend.  Each
+                // implied high half is a compile-time scalar.  Inline floats are rejected later
+                // by integer64_halves and therefore cannot publish a proof from this path.
+                return source.kind != OperandKind::InlineFloat;
+            };
+            const bool compare_wave_uniform = !is_cmpx && !rs.exec_narrowed &&
+                (integer64_compare
+                    ? scalar_integer64_operand(in.src[0]) &&
+                      scalar_integer64_operand(in.src[1])
+                    : scalar_data_operand(in.src[0]) && scalar_data_operand(in.src[1]));
             // Integer compares have no ABS/NEG source semantics. A malformed e64 packet carrying
             // those bits must not be lowered as an unmodified integer operation.
             if (integer64_compare &&
@@ -3804,6 +3841,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         // so a following s_mov_b32 save sees the fresh predicate rather than stale
                         // dispatcher-loaded scalar data.
                         vcc = masked;
+                        rs.vcc_wave_uniform = compare_wave_uniform ? masked : 0;
                         if (b.wave_size == 32) {
                             rs.sreg.erase(106);
                             rs.sreg_srt.erase(106);
@@ -6893,6 +6931,60 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             const bool uint_texture = res->format == DataFormat::Uint8 ||
                                       res->format == DataFormat::Uint16 ||
                                       res->format == DataFormat::Uint32;
+            // D16 packs two floating-point result components into each VDATA dword. The image
+            // helpers expose normalized/float resources as ordinary f32 bits, so the back-half
+            // must explicitly convert and pack those values rather than writing one f32 per VGPR.
+            // Likewise an IMAGE_STORE D16 consumes consecutive packed halves, not four full-width
+            // VGPRs. GTA V's FSR1 RCAS pass depends on both halves of this contract: its dmask-f
+            // R11G11B10F load writes v[12:13], and its dmask-f RGBA8 stores read v[14:15].
+            // Integer D16 conversion has a distinct bit/integer contract and remains fail-visible.
+            const bool d16_float_resource =
+                res->format == DataFormat::Float32 || res->format == DataFormat::Float16 ||
+                res->format == DataFormat::Unorm16 || res->format == DataFormat::Snorm16 ||
+                res->format == DataFormat::Unorm8 || res->format == DataFormat::Snorm8 ||
+                res->format == DataFormat::Float10_11_11 ||
+                res->format == DataFormat::Unorm2_10_10_10 ||
+                res->format == DataFormat::Snorm2_10_10_10;
+            auto write_mimg_results = [&](const uint32_t out[4]) -> bool {
+                const int vd = in.dst.value;
+                if (!in.mimg_d16) {
+                    int written = 0;
+                    for (uint32_t component = 0; component < 4; ++component) {
+                        if (!(in.mimg_dmask & (1u << component))) continue;
+                        const uint32_t old = vreg_old(b, rs, vd + written);
+                        rs.vreg[vd + written] = out[component];
+                        predicate_write(b, rs, vd + written, old);
+                        ++written;
+                    }
+                    return true;
+                }
+                if (!d16_float_resource) return false;
+
+                uint32_t packed = b.uconst(0);
+                int component_index = 0;
+                int word_index = 0;
+                auto write_packed = [&](uint32_t value) {
+                    const uint32_t old = vreg_old(b, rs, vd + word_index);
+                    rs.vreg[vd + word_index] = value;
+                    predicate_write(b, rs, vd + word_index, old);
+                    ++word_index;
+                };
+                for (uint32_t component = 0; component < 4; ++component) {
+                    if (!(in.mimg_dmask & (1u << component))) continue;
+                    const uint32_t half = b.pack_half_lo(out[component]);
+                    if ((component_index & 1) == 0) {
+                        packed = half;
+                    } else {
+                        packed = b.ibin(
+                            Op_BitwiseOr, packed,
+                            b.ibin(Op_ShiftLeftLogical, half, b.uconst(16)));
+                        write_packed(packed);
+                    }
+                    ++component_index;
+                }
+                if (component_index & 1) write_packed(packed); // odd dmask: high half is zero.
+                return true;
+            };
 
             // --- Storage-image path: image_load (0x00), image_store[_mip] (0x08/0x09), and R32_UINT
             if (res->cls == ResourceClass::StorageImage) {
@@ -6962,7 +7054,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // every frame. The INSTRUCTION half stays here, because only this site sees it.
                 if (is_atomic &&
                     ((in.mimg_dim != SQ_DIM_2D && !atomic_2d_array) || ms || in.len_dwords < 2 ||
-                     in.mimg_unorm || in.mimg_dmask != 1u ||
+                     in.mimg_unorm || in.mimg_d16 || in.mimg_dmask != 1u ||
                      arrayed != (res->img_dim == SQ_DIM_2D_ARRAY) ||
                      !shader_resource_supports_atomic_image_buffer(*res))) {
                     ok = false;
@@ -7021,18 +7113,20 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 uint32_t sample = ms ? vread(coord_vgpr(ncoord)) : 0;   // MSAA sample index = coord after the spatial ones
                 if (is_ld) {
                     uint32_t out[4]; b.image_read(res->binding, dim, arrayed, ncoord, coords, out, ms, sample);
-                    int vd = in.dst.value, w = 0;   // dmask -> consecutive VDATA VGPRs (LSB=R first)
-                    for (uint32_t c = 0; c < 4; c++) if (in.mimg_dmask & (1u << c)) {
-                        uint32_t old = vreg_old(b, rs, vd + w); rs.vreg[vd + w] = out[c];
-                        predicate_write(b, rs, vd + w, old); w++;
-                    }
+                    if (!write_mimg_results(out)) { ok = false; return true; }
                 } else if (is_st) {
                     // image_store: gather the VDATA VGPRs selected by dmask into an RGBA texel (channels
                     // absent from dmask store as 0). Under a narrowed EXEC (e.g. a grid-tail bounds check),
                     // the write is EXEC-predicated so inactive lanes don't write out-of-range texels.
                     uint32_t vals[4] = { b.uconst(0), b.uconst(0), b.uconst(0), b.uconst(0) };
                     int vd = in.dst.value, w = 0;
-                    for (uint32_t c = 0; c < 4; c++) if (in.mimg_dmask & (1u << c)) { vals[c] = vread(vd + w); w++; }
+                    if (in.mimg_d16 && !d16_float_resource) { ok = false; return true; }
+                    for (uint32_t c = 0; c < 4; c++) if (in.mimg_dmask & (1u << c)) {
+                        vals[c] = in.mimg_d16
+                            ? b.unpack_half(vread(vd + w / 2), static_cast<uint32_t>(w & 1))
+                            : vread(vd + w);
+                        ++w;
+                    }
                     b.image_write(res->binding, dim, arrayed, ncoord, coords, vals, rs.exec_narrowed, rs.exec);
                 } else {
                     // IMAGE_ATOMIC_SWAP/ADD reads its operand from VDATA. GLC=1 overwrites that VGPR
@@ -7276,6 +7370,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // coords (normalized float for sample, integer texel for load). Non-NSA: consecutive from VADDR.
             // NSA (len>2): coord0 = VADDR, coord k>=1 = byte (k-1) of the extra address dwords words[2..3].
             const bool nsa = in.len_dwords > 2;
+            // GTA V's FSR1 RCAS packet uses ordinary 2D IMAGE_LOAD with A16: unsigned x/y
+            // texel coordinates occupy the low/high 16-bit halves of ONE VADDR VGPR (LLVM prints
+            // `image_load ..., v0, ... a16 d16`, not `v[0:1]`). Sample-family A16 carries fp16
+            // addresses, and NSA/array/MSAA have different operand shapes; retain only the exact
+            // integer-load contract until those forms have independent evidence.
+            if (in.mimg_a16 &&
+                (in.opcode != 0x00 || in.mimg_dim != SQ_DIM_2D ||
+                 res->img_dim != SQ_DIM_2D || nsa)) {
+                ok = false;
+                return true;
+            }
             int va = in.src[0].value;
             auto cvg = [&](uint32_t k) -> int { if (!nsa || k == 0) return va + (nsa ? 0 : (int)k);
                 uint32_t j = k - 1; return (int)((in.words[2 + j / 4] >> (8 * (j % 4))) & 0xFFu); };
@@ -7412,7 +7517,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 } else { ok = false; return true; }
             } else if (is_gather_lz || is_gather_lz_o) {
                 // gather4 dmask selects ONE channel (must be a single bit); the result is always the
-                // four texels of that channel -> 4 consecutive VDATA VGPRs, gather order preserved.
+                // four texels of that channel, with gather order preserved. D16 changes only the
+                // physical VDATA layout: the four fp16 results occupy two consecutive VGPRs. GTA V's
+                // FSR1 EASU shaders consume those packed halves with VOP3P; writing four f32 VGPRs
+                // clobbers the following temporaries and turns an otherwise intact scene into bands.
                 uint32_t dm = in.mimg_dmask;
                 if (dm != 1u && dm != 2u && dm != 4u && dm != 8u) { ok = false; return true; }
                 uint32_t comp = dm == 1u ? 0u : dm == 2u ? 1u : dm == 4u ? 2u : 3u;
@@ -7431,10 +7539,20 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         normalized_spatial(vread(cvg(0)), res->width),
                         normalized_spatial(vread(cvg(1)), res->height), comp, out);
                 int vd = in.dst.value;
-                for (uint32_t c = 0; c < 4; c++) {
-                    uint32_t old = vreg_old(b, rs, vd + (int)c);
-                    rs.vreg[vd + (int)c] = out[c];
-                    predicate_write(b, rs, vd + (int)c, old);
+                if (in.mimg_d16) {
+                    if (!d16_float_resource) { ok = false; return true; }
+                    for (uint32_t word = 0; word < 2; ++word) {
+                        const uint32_t old = vreg_old(b, rs, vd + static_cast<int>(word));
+                        rs.vreg[vd + static_cast<int>(word)] =
+                            b.pack_half2x16(out[word * 2], out[word * 2 + 1]);
+                        predicate_write(b, rs, vd + static_cast<int>(word), old);
+                    }
+                } else {
+                    for (uint32_t c = 0; c < 4; c++) {
+                        uint32_t old = vreg_old(b, rs, vd + static_cast<int>(c));
+                        rs.vreg[vd + static_cast<int>(c)] = out[c];
+                        predicate_write(b, rs, vd + static_cast<int>(c), old);
+                    }
                 }
                 return true;
             } else {
@@ -7480,7 +7598,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         normalized_spatial(vread(cvg(2)), res->width),
                         normalized_spatial(vread(cvg(3)), res->height), out);
                 } else {
-                    uint32_t cu = vread(cvg(0)), cv = vread(cvg(1));
+                    uint32_t cu, cv;
+                    if (in.mimg_a16) {
+                        const uint32_t packed = vread(cvg(0));
+                        cu = b.bfe_u(packed, b.uconst(0), b.uconst(16));
+                        cv = b.bfe_u(packed, b.uconst(16), b.uconst(16));
+                    } else {
+                        cu = vread(cvg(0));
+                        cv = vread(cvg(1));
+                    }
                     if (!is_load) {
                         cu = normalized_spatial(cu, res->width);
                         cv = normalized_spatial(cv, res->height);
@@ -7494,14 +7620,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     else                   b.image_fetch_2d (res->binding, cu, cv, out);
                 }
             }
-            // dmask selects which result components are written to consecutive VDATA VGPRs (LSB=R first).
-            int vd = in.dst.value, w = 0;
-            for (uint32_t c = 0; c < 4; c++) if (in.mimg_dmask & (1u << c)) {
-                uint32_t old = vreg_old(b, rs, vd + w);
-                rs.vreg[vd + w] = out[c];
-                predicate_write(b, rs, vd + w, old);
-                w++;
-            }
+            // D16 changes the VDATA layout, not the logical image result: selected components are
+            // still in dmask order, but two binary16 values share each consecutive VGPR.
+            if (!write_mimg_results(out)) { ok = false; return true; }
             return true;
         }
         case Rdna2Format::DS: {

@@ -745,6 +745,21 @@ int main() {
               fixed_phys, 0x4000) == 0 && fixed_alias,
           "map ordinary alias for incompatible fixed view");
     if (fixed_mapped && fixed_alias) {
+        // GTA V submits an identical fixed BatchMap MAP_DIRECT twice without unmapping it. Linux
+        // accepts the second mmap(MAP_FIXED) as replacement semantics; Windows must not turn the
+        // live MapViewOfFile3 collision into ENOMEM.
+        alignas(8) uint8_t duplicate_direct[0x20]{};
+        *(uint64_t*)(duplicate_direct + 0x00) = fixed_va;
+        *(uint64_t*)(duplicate_direct + 0x08) = fixed_phys;
+        *(uint64_t*)(duplicate_direct + 0x10) = fixed_len;
+        duplicate_direct[0x18] = 0x2;
+        *(int32_t*)(duplicate_direct + 0x1c) = 0; // MAP_DIRECT
+        int32_t duplicate_done = -1;
+        CHECK(batch((uint64_t)(uintptr_t)duplicate_direct, 1,
+                    (uint64_t)(uintptr_t)&duplicate_done, 0, 0, 0) == 0 &&
+                  duplicate_done == 1,
+              "identical fixed BatchMap direct remap is idempotent");
+
         *(volatile uint64_t*)(uintptr_t)(fixed_va + 0x0100) = 0x1111222233334444ull;
         *(volatile uint64_t*)(uintptr_t)(fixed_va + 0x4100) = 0x5555666677778888ull;
         *(volatile uint64_t*)(uintptr_t)(fixed_va + 0xc100) = 0x9999aaaabbbbccccull;

@@ -370,6 +370,17 @@ int main() {
           !direct_sampled_rtt_compatible(DataFormat::Unorm16, 2,
                                          LiveTargetPixelFormat::Rgba8Unorm, true),
           "float RGBA16-UNORM sampled values may reuse RGBA8 without widening texels");
+    CHECK(direct_sampled_rtt_compatible(DataFormat::Unorm8, 1,
+                                        LiveTargetPixelFormat::R8Unorm, true) &&
+          direct_sampled_rtt_compatible(DataFormat::Unorm8, 2,
+                                        LiveTargetPixelFormat::Rg8Unorm, true) &&
+          direct_sampled_rtt_compatible(DataFormat::Uint32, 1,
+                                        LiveTargetPixelFormat::R32Uint, false) &&
+          direct_sampled_rtt_compatible(DataFormat::Float32, 1,
+                                        LiveTargetPixelFormat::R32Float, true) &&
+          !direct_sampled_rtt_compatible(DataFormat::Float32, 1,
+                                         LiveTargetPixelFormat::R32Uint, true),
+          "single-channel live RTT imports require an exact Vulkan sampled type");
     // A renderer-owned target is stored canonically as RGBA8 or RGBA16F, while a later compute
     // descriptor can alias it as packed R11G11B10. Reconstruct the descriptor-visible words rather
     // than sampling stale guest backing or dropping the dispatch.
@@ -628,6 +639,80 @@ int main() {
                         spirv_descriptor_kind_name(issue.actual));
     }
     CHECK(report.ok(), "real compute descriptor interface validates");
+
+    // --- a partial workgroup that also uses a barrier -------------------------------------------
+    //
+    // The kernel above already ends in a partial workgroup (130 records launched as 3x64), and the
+    // divergent entry guard is what keeps its padded lanes from writing. Add one s_barrier and that
+    // guard becomes illegal: the padded invocations would skip the body, and with it the barrier
+    // their peers block on. Twelve of GTA V's compute dispatches were dropped for exactly this
+    // (`reason=partial-workgroup-barrier threads=1143x1x1 local=64x1x1`).
+    //
+    // The correct lowering already existed -- split the stream at its barriers, compile each
+    // barrier-free phase through the dispatcher's per-lane ACTIVE bit, and emit each barrier from
+    // the outer shell where every invocation reaches it. It was gated behind `branch_count > 2`,
+    // which excluded precisely the programs that satisfy its soundness proof most easily.
+    {
+        auto count_opcode = [](const std::vector<uint32_t>& words, uint16_t opcode) {
+            size_t count = 0;
+            for (size_t at = 5; at < words.size();) {
+                const uint32_t length = words[at] >> 16;
+                if (length == 0) break;
+                count += static_cast<uint16_t>(words[at]) == opcode;
+                at += length;
+            }
+            return count;
+        };
+        constexpr uint16_t kOpSwitch = 251, kOpControlBarrier = 224;
+        // SOPP opcode 0x0a (SoppOpcode::Barrier) at the SOPP encoding base 0xbf800000.
+        constexpr uint32_t kSBarrier = 0xbf8a0000u;
+        std::vector<uint32_t> barrier_code(code, code + std::size(code));
+        // Ahead of the store, so the guest memory effect sits on the far side of the barrier and the
+        // program genuinely splits into two non-empty phases.
+        barrier_code.insert(barrier_code.end() - 3, kSBarrier);
+
+        const std::vector<uint32_t> barrier_spirv =
+            recompile_compute(barrier_code.data(), barrier_code.size(), &rt, config);
+        CHECK(!barrier_spirv.empty(),
+              "a partial workgroup that uses a barrier recompiles instead of being rejected");
+        // Guards against a vacuous pass: were the barrier dropped in translation, the module would
+        // compile for the wrong reason and every assertion below would still hold.
+        // Measured: 5 barriers for one guest s_barrier. One is the guest's, emitted by the phase
+        // shell at function scope; the other four are the two dispatchers' own synchronized common
+        // phases. Those are uniform by construction -- a padded invocation stays inside the
+        // dispatcher loop and reaches them, and only its switch selector differs -- which is the
+        // same property that makes ACTIVE=false safe in the first place. So the count is not the
+        // interesting number here; that it is non-zero rules out the barrier having been dropped.
+        CHECK(count_opcode(barrier_spirv, kOpControlBarrier) > 0,
+              "the recompiled module really does contain the barrier under test");
+        // THE discriminator, and the reason this is asserted by structure rather than by exit code.
+        // Two lowerings both produce a module that compiles and contains a barrier:
+        //   sound -- split at the barrier, one dispatcher per phase, barrier between them at
+        //            function scope, reached by every invocation: TWO OpSwitch.
+        //   unsound -- one dispatcher over the whole stream with the barrier inside a switch case,
+        //            reached only by invocations whose ACTIVE bit is set: ONE OpSwitch, and a
+        //            latent deadlock that no exit code, and no spirv-val run, would report.
+        // Counting them is what tells those two apart.
+        CHECK(count_opcode(barrier_spirv, kOpSwitch) == 2,
+              "the barrier splits the program into two dispatched phases rather than sitting inside "
+              "one switch case, where only active invocations would reach it");
+
+        const std::vector<uint32_t> guarded_spirv =
+            recompile_compute(code, std::size(code), &rt, config);
+        CHECK(!guarded_spirv.empty() && count_opcode(guarded_spirv, kOpControlBarrier) == 0 &&
+                  count_opcode(guarded_spirv, kOpSwitch) == 0,
+              "the same program without the barrier still takes the cheap entry guard, so the fix "
+              "did not route every partial workgroup through a dispatcher");
+
+        // A complete workgroup has no padded lane to suppress, so a barrier costs it nothing and
+        // this was never the rejected case -- the arm that keeps the claim about WHY it was rejected
+        // honest, rather than merely about the barrier being present.
+        ComputeShaderConfig exact_config = config;
+        exact_config.threads_x = 192;
+        CHECK(!recompile_compute(barrier_code.data(), barrier_code.size(), &rt,
+                                 exact_config).empty(),
+              "a barrier in a workgroup with no partial tail was never the rejected case");
+    }
 
     ComputeItem item;
     item.spirv = spirv;

@@ -103,6 +103,20 @@ bool has_glsl_ext_inst(const std::vector<uint32_t>& spv, uint32_t instruction) {
     return false;
 }
 
+uint32_t glsl_ext_inst_count(const std::vector<uint32_t>& spv, uint32_t instruction) {
+    constexpr uint32_t OpExtInst = 12;
+    uint32_t count = 0;
+    if (spv.size() < 5) return count;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t op = spv[i] & 0xffffu, wc = spv[i] >> 16u;
+        if (!wc || i + wc > spv.size()) return 0;
+        // OpExtInst operands: result type, result, instruction set, instruction, operands...
+        count += op == OpExtInst && wc >= 6 && spv[i + 4] == instruction;
+        i += wc;
+    }
+    return count;
+}
+
 uint32_t opcode_count(const std::vector<uint32_t>& spv, uint32_t opcode) {
     uint32_t count = 0;
     if (spv.size() < 5) return count;
@@ -1806,7 +1820,7 @@ int main() {
         0xbf880002u,              // s_cbranch_execz +2  (routes through the fragment wave vote)
         0xbe8503f2u, 0x7e020205u,
         0x7e000280u, 0x7e040280u, 0x7e0602f2u,
-        0xf800000fu, 0x03020100u,
+        0xf800180fu, 0x03020100u,
         0xbf810000u,
     };
     const auto execz_vote_spv =
@@ -1821,6 +1835,44 @@ int main() {
         }
         printf("  [ok]   a vote-only fragment module does not claim a ballot\n");
     }
+
+    // GTA V's intro compositor compares a scalar-buffer value held in VCC_LO against zero, then
+    // branches on VCCZ before an optional texture sample.  The comparison is identical in every
+    // lane, so voting it with OpGroupNonUniformAny is an identity and must not force the guest's
+    // Wave64 width on a 32-wide host.  The mutation control below builds a genuinely divergent
+    // VGPR comparison by hand; it must retain the vote and its exact-width contract.
+    const uint32_t uniform_vccz_fragment[] = {
+        0xbeea03f2u,              // s_mov_b32 vcc_lo, 1.0 (ordinary scalar-data lifetime)
+        0x7c0900f9u, 0x8686006au, // v_cmp_lg_f32 vcc, vcc_lo, 0 (GTA V compositor packet)
+        0xbf860002u,              // s_cbranch_vccz +2
+        0xbe8503f2u,              // optional arm: scalar value feeding a lane-local result
+        0x7e020205u,
+        0x7e000280u, 0x7e040280u, 0x7e0602f2u,
+        0xf800180fu, 0x03020100u,
+        0xbf810000u,
+    };
+    if (!fragment_vcc_branch_is_wave_uniform_for_test(
+            uniform_vccz_fragment, std::size(uniform_vccz_fragment), 3)) {
+        printf("  [FAIL] scalar-uniform VCC producer was not certified at its VCCZ branch\n");
+        return 1;
+    }
+    printf("  [ok]   scalar-uniform VCC producer is certified at its VCCZ branch\n");
+
+    const uint32_t divergent_vccz_fragment[] = {
+        0x7c020300u,              // v_cmp_lt_f32 vcc, v0, v1 (unproven lane-local inputs)
+        0xbf860002u,              // s_cbranch_vccz +2
+        0xbe8503f2u,
+        0x7e020205u,
+        0x7e000280u, 0x7e040280u, 0x7e0602f2u,
+        0xf800180fu, 0x03020100u,
+        0xbf810000u,
+    };
+    if (fragment_vcc_branch_is_wave_uniform_for_test(
+            divergent_vccz_fragment, std::size(divergent_vccz_fragment), 1)) {
+        printf("  [FAIL] unproven lane-local VCC producer was certified wave-uniform\n");
+        return 1;
+    }
+    printf("  [ok]   unproven lane-local VCC producer retains its wave-vote requirement\n");
 
     // Astro Bot's Wave32 graphics shaders save/copy/restore active-lane masks through the low
     // halves of EXEC and VCC.  These are the B32 equivalents of the B64 mask moves already modeled
@@ -4973,6 +5025,81 @@ int main() {
         return 1;
     }
     printf("  [ok]   compute-shell image_sample lowers to OpImageSampleExplicitLod (LOD 0)\n");
+
+    // GTA V's FSR1 RCAS pass combines both compact MIMG controls on its scene input: A16 packs
+    // integer x/y into one address VGPR, while D16 packs the four floating-point result components
+    // into two VDATA VGPRs. The old lowering ignored both flags, sampled y from an unrelated VGPR,
+    // and overwrote two registers beyond VDATA; the matching D16 stores then consumed four full
+    // VGPRs and produced the title's exact red/green/black 8x8 checker.
+    const uint32_t gta_rcas_a16_d16_load[] = {
+        0xf0000f08u, 0xc0000c00u,            // IMAGE_LOAD v[12:13], v0, s[0:7] xyzw 2D A16 D16
+        0xbf810000u,
+    };
+    ShaderResourceTable rcas_load_rt;
+    { ShaderResource texture{}; texture.cls = ResourceClass::Texture;
+      texture.format = DataFormat::Float10_11_11; texture.num_components = 3;
+      texture.binding = 4; texture.fetch_pc = 0; texture.sgpr_base = 0; texture.img_dim = 1;
+      texture.width = 2; texture.height = 2; texture.size = 16;
+      rcas_load_rt.resources.push_back(texture); }
+    const std::vector<uint32_t> rcas_load_spv = recompile_valu(
+        gta_rcas_a16_d16_load, std::size(gta_rcas_a16_d16_load), 64, 0, &rcas_load_rt);
+    if (rcas_load_spv.empty() || !has_opcode(rcas_load_spv, 95u) ||
+        opcode_count(rcas_load_spv, 203u) < 2u || !has_glsl_ext_inst(rcas_load_spv, 58u)) {
+        printf("  [FAIL] GTA RCAS A16/D16 load did not unpack x/y and pack fp16 VDATA\n");
+        return 1;
+    }
+
+    const uint32_t gta_rcas_d16_store[] = {
+        0x7e080300u,                         // v4 = x from the compute shell
+        0x7e0a0280u,                         // v5 = y = 0
+        0xf0200f08u, 0x80020004u,            // IMAGE_STORE v[0:1], v[4:5], s[8:15] xyzw 2D D16
+        0xbf810000u,
+    };
+    ShaderResourceTable rcas_store_rt;
+    { ShaderResource image{}; image.cls = ResourceClass::StorageImage;
+      image.format = DataFormat::Unorm8; image.num_components = 4;
+      image.binding = 4; image.fetch_pc = 2; image.sgpr_base = 8; image.img_dim = 1;
+      image.width = 2; image.height = 2; image.size = 16;
+      rcas_store_rt.resources.push_back(image); }
+    const std::vector<uint32_t> rcas_store_spv = recompile_valu(
+        gta_rcas_d16_store, std::size(gta_rcas_d16_store), 64, 0, &rcas_store_rt);
+    ShaderResourceTable integer_d16_rt = rcas_load_rt;
+    integer_d16_rt.resources[0].format = DataFormat::Uint8;
+    if (rcas_store_spv.empty() || !has_opcode(rcas_store_spv, 99u) ||
+        !has_glsl_ext_inst(rcas_store_spv, 62u) ||
+        !recompile_valu(gta_rcas_a16_d16_load, std::size(gta_rcas_a16_d16_load),
+                        64, 0, &integer_d16_rt).empty()) {
+        printf("  [FAIL] GTA RCAS D16 store did not unpack fp16 VDATA or admitted integer D16\n");
+        return 1;
+    }
+    printf("  [ok]   GTA RCAS A16/D16 load/store preserves packed address and VDATA contracts\n");
+
+    // The preceding ordinary-load coverage does not exercise gather's distinct result shape: its
+    // single-bit dmask selects a source channel, but all four gathered texels are returned. This is
+    // an exact GTA V FSR1 EASU packet. Under D16 those four fp16 values must occupy two VDATA VGPRs,
+    // rather than the four full-width registers used by the non-D16 gather path.
+    const uint32_t gta_easu_d16_gather[] = {
+        0xf11c010au, 0x80401420u, 0x00000032u, // IMAGE_GATHER4_LZ v[20:21], [v32,v50], D16 NSA
+        0xbf810000u,
+    };
+    ShaderResourceTable easu_gather_rt;
+    { ShaderResource texture{}; texture.cls = ResourceClass::Texture;
+      texture.format = DataFormat::Unorm8; texture.num_components = 4;
+      texture.binding = 4; texture.fetch_pc = 0; texture.sgpr_base = 0; texture.img_dim = 1;
+      texture.width = 2; texture.height = 2; texture.size = 16;
+      easu_gather_rt.resources.push_back(texture); }
+    const std::vector<uint32_t> easu_gather_spv = recompile_valu(
+        gta_easu_d16_gather, std::size(gta_easu_d16_gather), 64, 0, &easu_gather_rt);
+    ShaderResourceTable integer_easu_gather_rt = easu_gather_rt;
+    integer_easu_gather_rt.resources[0].format = DataFormat::Uint8;
+    if (easu_gather_spv.empty() || !has_opcode(easu_gather_spv, 96u) ||
+        glsl_ext_inst_count(easu_gather_spv, 58u) != 2u ||
+        !recompile_valu(gta_easu_d16_gather, std::size(gta_easu_d16_gather),
+                        64, 0, &integer_easu_gather_rt).empty()) {
+        printf("  [FAIL] GTA EASU D16 gather did not pack four fp16 texels into two VDATA VGPRs\n");
+        return 1;
+    }
+    printf("  [ok]   GTA EASU D16 gather preserves its two-VGPR packed result contract\n");
 
     // GTA V gameplay's exact single-level IMAGE_LOAD_MIP / IMAGE_STORE_MIP subset. The resource
     // marker is the independent materialization proof; removing it, changing the descriptor to DCC,

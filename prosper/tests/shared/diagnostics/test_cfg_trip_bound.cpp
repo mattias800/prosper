@@ -118,6 +118,51 @@ int main() {
           "v_cmpx narrows EXEC and s_cbranch_execz exits only when every lane has dropped out "
           "(lane i walks exactly i steps)");
 
+    // The isolated loop normally takes the compact structurizer, while the same loop in GTA's
+    // barrier-separated phase is deliberately sent through the portable CFG dispatcher. Exercise
+    // the exact instruction stream through that production lowering too: the SAVEEXEC packet at
+    // pc2, V_CMPX, EXECZ vote, back edge and EXEC restore must retain the same per-lane result.
+    const std::vector<uint32_t> forced_dispatcher =
+        recompile_valu(kExecWalk, kWords, 2, 2, nullptr, 0,
+                       kDefaultComputePgmRsrc1, true);
+    CHECK(!forced_dispatcher.empty(),
+          "the exact EXEC-walk loop recompiles through the forced portable CFG dispatcher");
+    const std::vector<float> dispatcher_walked =
+        prosper::test::run_compute(forced_dispatcher, input, kLanes, kLanes);
+    uint32_t dispatcher_wrong = 0;
+    for (uint32_t lane = 0;
+         lane < kLanes && dispatcher_walked.size() == kLanes; ++lane)
+        if (std::fabs(dispatcher_walked[lane] - static_cast<float>(lane)) > 0.5f)
+            ++dispatcher_wrong;
+    CHECK(dispatcher_walked.size() == kLanes && dispatcher_wrong == 0,
+          "the portable dispatcher preserves GTA's saveexec/cmpx/execz loop semantics");
+
+    // GTA's failing launch is 2,063 threads in 256-wide workgroups. The final workgroup therefore
+    // has 15 real lanes and 241 padded synchronization participants, which is the condition that
+    // forces the portable dispatcher in production. A complete-workgroup test cannot validate that
+    // ACTIVE/EXEC boundary. Keep every real lane's chain short and distinct enough to detect a
+    // workgroup-wide collapse while reproducing the exact 9-group geometry.
+    constexpr uint32_t kPartialThreads = 2063;
+    constexpr uint32_t kPartialLocal = 256;
+    std::vector<float> partial_input(kPartialThreads * 2, 0.0f);
+    for (uint32_t lane = 0; lane < kPartialThreads; ++lane)
+        partial_input[lane * 2 + 1] = static_cast<float>(lane % 12u);
+    const std::vector<uint32_t> partial_dispatcher = recompile_valu(
+        kExecWalk, kWords, 2, 2, nullptr, 0, kDefaultComputePgmRsrc1, true,
+        kPartialLocal, kPartialThreads);
+    CHECK(!partial_dispatcher.empty(),
+          "the exact EXEC walk recompiles for GTA's partial 2063x256 launch");
+    const std::vector<float> partial_walked = prosper::test::run_compute(
+        partial_dispatcher, partial_input, kPartialThreads, kPartialThreads,
+        {}, {}, nullptr, kPartialLocal);
+    uint32_t partial_wrong = 0;
+    for (uint32_t lane = 0;
+         lane < kPartialThreads && partial_walked.size() == kPartialThreads; ++lane)
+        if (std::fabs(partial_walked[lane] - static_cast<float>(lane % 12u)) > 0.5f)
+            ++partial_wrong;
+    CHECK(partial_walked.size() == kPartialThreads && partial_wrong == 0,
+          "the portable dispatcher preserves the EXEC walk in GTA's partial final workgroup");
+
     // --- the diagnostic ------------------------------------------------------------------------
     // Disarmed, the emitter must be inert: not "close enough", byte-identical. This is the property
     // that lets the bound exist in shipped code at all.

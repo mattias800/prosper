@@ -9657,7 +9657,28 @@ DispatchArgumentResolution resolve_indirect_dispatch_arguments(
     }
     uint32_t args[3] = {};
     std::memcpy(args, reinterpret_cast<const void*>(source.indirect_args_addr), sizeof(args));
+    const auto log_resolution = [&](const char* outcome, const ComputeLaunchDimensions* launch) {
+        if (!std::getenv("PROSPER_INDIRECTLOG")) return;
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) >= 256) return;
+        const uint64_t code_addr = source.state
+            ? compute_dispatch_code_addr(*source.state, source) : 0;
+        std::fprintf(stderr,
+                     "[agc-indirect-resolve] outcome=%s args=0x%llx code=0x%llx "
+                     "dims=%ux%ux%u groups=%ux%ux%u\n",
+                     outcome,
+                     static_cast<unsigned long long>(source.indirect_args_addr),
+                     static_cast<unsigned long long>(code_addr),
+                     args[0], args[1], args[2],
+                     launch ? launch->groups_x : 0u,
+                     launch ? launch->groups_y : 0u,
+                     launch ? launch->groups_z : 0u);
+    };
     if (!args[0] || !args[1] || !args[2]) {
+        // Log at ordered realization, after every preceding compute fence and writeback. The
+        // command-processor's similarly named packet trace runs while the stream is still being
+        // folded and can therefore show the producer's previous-frame contents instead.
+        log_resolution("zero-argument", nullptr);
         census.zero_args.fetch_add(1, std::memory_order_relaxed);
         return DispatchArgumentResolution::Noop;
     }
@@ -9667,6 +9688,7 @@ DispatchArgumentResolution resolve_indirect_dispatch_arguments(
     resolved.indirect = false;
     const ComputeLaunchDimensions launch = resolve_compute_launch(resolved);
     if (!launch.groups_x || !launch.groups_y || !launch.groups_z) {
+        log_resolution("zero-groups", &launch);
         static std::atomic<int> warned{0};
         if (warned.fetch_add(1) < 24)
             std::fprintf(stderr,
@@ -9677,19 +9699,7 @@ DispatchArgumentResolution resolve_indirect_dispatch_arguments(
         census.zero_groups.fetch_add(1, std::memory_order_relaxed);
         return DispatchArgumentResolution::Noop;
     }
-    if (std::getenv("PROSPER_INDIRECTLOG")) {
-        static std::atomic<int> logged{0};
-        const uint64_t code_addr = source.state
-            ? compute_dispatch_code_addr(*source.state, source) : 0;
-        if (logged.fetch_add(1) < 256)
-            std::fprintf(stderr,
-                         "[agc-indirect] dispatch args=0x%llx code=0x%llx "
-                         "dims=%ux%ux%u groups=%ux%ux%u\n",
-                         static_cast<unsigned long long>(source.indirect_args_addr),
-                         static_cast<unsigned long long>(code_addr),
-                         args[0], args[1], args[2], launch.groups_x, launch.groups_y,
-                         launch.groups_z);
-    }
+    log_resolution("ready", &launch);
     census.ready.fetch_add(1, std::memory_order_relaxed);
     return DispatchArgumentResolution::Ready;
 }

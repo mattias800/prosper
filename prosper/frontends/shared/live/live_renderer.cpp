@@ -416,6 +416,10 @@ bool capture_color_format(VkFormat format, prosper::gpu::GpuCaptureColorFormat& 
         captured = prosper::gpu::GpuCaptureColorFormat::R8Unorm;
     else if (format == VK_FORMAT_R32_UINT)
         captured = prosper::gpu::GpuCaptureColorFormat::R32Uint;
+    else if (format == VK_FORMAT_R32_SFLOAT)
+        captured = prosper::gpu::GpuCaptureColorFormat::R32Float;
+    else if (format == VK_FORMAT_R8G8_UNORM)
+        captured = prosper::gpu::GpuCaptureColorFormat::Rg8Unorm;
     else
         return false;
     return true;
@@ -430,6 +434,10 @@ VkFormat replay_color_format(prosper::gpu::GpuCaptureColorFormat format) {
         return VK_FORMAT_R8_UNORM;
     if (format == prosper::gpu::GpuCaptureColorFormat::R32Uint)
         return VK_FORMAT_R32_UINT;
+    if (format == prosper::gpu::GpuCaptureColorFormat::R32Float)
+        return VK_FORMAT_R32_SFLOAT;
+    if (format == prosper::gpu::GpuCaptureColorFormat::Rg8Unorm)
+        return VK_FORMAT_R8G8_UNORM;
     return VK_FORMAT_R8G8B8A8_UNORM;
 }
 
@@ -3108,7 +3116,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                       r.format, r.num_components ? r.num_components : 1u)
                                 : 0u;
                         const bool portable_storage_shape =
-                            !writable_storage_image && !r.compression_enabled &&
+                            !r.compression_enabled &&
                             !reflected_binding->image_arrayed &&
                             !reflected_binding->image_multisampled &&
                             ((reflected_binding->image_dim == 1u && r.img_dim == 1u) ||
@@ -4713,7 +4721,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                 ? copy_resource(
                                       source.data(), sampled_source_addr, source_bytes)
                                 : 0u;
-                            decoded = decoded && got == source_bytes &&
+                            const bool materialized = decoded && got == source_bytes &&
                                 storage_image_materialize_raw_uvec4(
                                     source.data(), got, r.format,
                                     r.num_components ? r.num_components : 1u,
@@ -4722,7 +4730,20 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     r.mip_tail_x, r.mip_tail_y,
                                 reinterpret_cast<uint32_t*>(texture_pixels.data()),
                                 texture_pixels.size() / sizeof(uint32_t));
+                            decoded = decoded && materialized;
                             if (!decoded) {
+                                static std::set<std::tuple<uint32_t, uint32_t, uint32_t>> reported;
+                                if (reported.emplace(fr.set, fr.binding,
+                                                     static_cast<uint32_t>(r.format)).second)
+                                    std::fprintf(stderr,
+                                        "[render] storage-image materialize failed: set=%u binding=%u "
+                                        "source=%zu got=%zu output=%zu fmt=%u comps=%u "
+                                        "extent=%ux%ux%u tile=%u tail=%u contract=%u\n",
+                                        fr.set, fr.binding, source_bytes, got,
+                                        texture_pixels.size(), static_cast<unsigned>(r.format),
+                                        r.num_components, tw, th, materialize_depth,
+                                        materialize_tile_mode, r.in_mip_tail ? 1u : 0u,
+                                        fr.storage_image_contract_valid ? 1u : 0u);
                                 fr.storage_image_contract_valid = false;
                                 std::fill(texture_pixels.begin(), texture_pixels.end(), 0);
                             }
@@ -5466,6 +5487,88 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                         // overlapping submit-local decode and let the next pass rebuild it
                                         // from the now-current guest bytes.
                                         if (guest_addr) {
+                                            for (auto it = decoded_textures.begin();
+                                                 it != decoded_textures.end();) {
+                                                const uint64_t cached_addr = it->first.gpu_addr;
+                                                const uint64_t cached_bytes = std::max<uint64_t>(
+                                                    std::max<uint64_t>(it->first.size,
+                                                                       it->first.source_span_bytes),
+                                                    1u);
+                                                const bool overlaps = cached_addr <= guest_addr
+                                                    ? guest_addr - cached_addr < cached_bytes
+                                                    : cached_addr - guest_addr < guest_bytes;
+                                                if (overlaps) {
+                                                    if (it->second.texstore_slot <
+                                                        texstore_pinned.size())
+                                                        texstore_pinned[
+                                                            it->second.texstore_slot] = false;
+                                                    it = decoded_textures.erase(it);
+                                                } else {
+                                                    ++it;
+                                                }
+                                            }
+                                        }
+                                    };
+                            }
+                        }
+                        if (portable_raw_uvec4_storage && writable_storage_image &&
+                            fr.storage_image_contract_valid) {
+                            const bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) &&
+                                !PROSPER_ENV_VALUE("PROSPER_NODETILE");
+                            const uint32_t writeback_tile_mode = tiled ? r.tile_mode : 0u;
+                            const uint32_t writeback_depth = is_volume ? r.depth : 1u;
+                            const uint32_t components =
+                                r.num_components ? r.num_components : 1u;
+                            const size_t guest_bytes = storage_image_raw_uvec4_source_bytes(
+                                r.format, components, tw, th, writeback_depth,
+                                writeback_tile_mode, r.in_mip_tail, r.mip_tail_bytes);
+                            const size_t texels = static_cast<size_t>(tw) * th * writeback_depth;
+                            const size_t expanded_bytes = texels <= SIZE_MAX / 16u
+                                ? texels * 16u : 0u;
+                            const bool backing_fits = guest_bytes && expanded_bytes &&
+                                (!r.host_data || guest_bytes <= r.host_data_size);
+                            if (!backing_fits) {
+                                fr.storage_image_contract_valid = false;
+                            } else {
+                                const uint64_t guest_addr = r.gpu_addr;
+                                uint8_t* const replay_data = r.host_data;
+                                const auto format = r.format;
+                                const bool in_mip_tail = r.in_mip_tail;
+                                const uint32_t mip_tail_bytes = r.mip_tail_bytes;
+                                const uint32_t mip_tail_x = r.mip_tail_x;
+                                const uint32_t mip_tail_y = r.mip_tail_y;
+                                fr.storage_image_writeback =
+                                    [guest_addr, replay_data, guest_bytes, expanded_bytes,
+                                     format, components, tw, th, writeback_depth,
+                                     writeback_tile_mode, in_mip_tail, mip_tail_bytes,
+                                     mip_tail_x, mip_tail_y](const uint8_t* pixels, size_t bytes) {
+                                        if (!pixels || bytes != expanded_bytes) return;
+                                        uint8_t* destination = replay_data;
+                                        if (!destination) {
+                                            if (guest_bytes > UINT32_MAX ||
+                                                !prosper::gpu::guest_writable(
+                                                    guest_addr,
+                                                    static_cast<uint32_t>(guest_bytes)))
+                                                return;
+                                            prosper::host::guest_write_watch_notify_host_write(
+                                                guest_addr, guest_bytes);
+                                            destination = reinterpret_cast<uint8_t*>(
+                                                static_cast<uintptr_t>(guest_addr));
+                                        }
+                                        if (!storage_image_writeback_raw_uvec4(
+                                                reinterpret_cast<const uint32_t*>(pixels),
+                                                bytes / sizeof(uint32_t), format, components,
+                                                tw, th, writeback_depth, writeback_tile_mode,
+                                                in_mip_tail, mip_tail_bytes,
+                                                mip_tail_x, mip_tail_y,
+                                                destination, guest_bytes))
+                                            return;
+                                        if (guest_addr) {
+                                            prosper::gpu::set_guest_gpu_write_origin(
+                                                "renderer-writeback(portable-uvec4)");
+                                            prosper::gpu::notify_guest_gpu_write(
+                                                guest_addr, guest_bytes);
+                                            prosper::gpu::set_guest_gpu_write_origin(nullptr);
                                             for (auto it = decoded_textures.begin();
                                                  it != decoded_textures.end();) {
                                                 const uint64_t cached_addr = it->first.gpu_addr;
