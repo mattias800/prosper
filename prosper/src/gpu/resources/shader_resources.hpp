@@ -465,6 +465,39 @@ struct ShaderResource {
     uint32_t scalar_buffer_dword_count = 0;
 };
 
+// Decode the exact SQ_IMG_SAMP state consumed by one MIMG instruction. Metadata describes a
+// texture's usual paired sampler, but shaders may load or patch a different S# before the sample.
+// In that case instruction-time descriptor folding is authoritative.
+inline void apply_sampler_descriptor(ShaderResource& resource, const uint32_t sampler[4]) {
+    resource.mag_filter  = ((sampler[2] >> 20) & 0x3u) ? 1u : 0u;
+    resource.min_filter  = ((sampler[2] >> 22) & 0x3u) ? 1u : 0u;
+    resource.mip_filter  = ((sampler[2] >> 26) & 0x3u) ? 1u : 0u;
+    resource.addr_uvw[0] = (sampler[0] >> 0) & 0x7u;
+    resource.addr_uvw[1] = (sampler[0] >> 3) & 0x7u;
+    resource.addr_uvw[2] = (sampler[0] >> 6) & 0x7u;
+    resource.max_aniso_ratio    = (sampler[0] >> 9)  & 0x7u;
+    resource.depth_compare_func = (sampler[0] >> 12) & 0x7u;
+    resource.unnormalized       = (sampler[0] >> 15) & 0x1u;
+    resource.min_lod            = static_cast<float>(sampler[1] & 0xFFFu) / 256.0f;
+    resource.max_lod            = static_cast<float>((sampler[1] >> 12) & 0xFFFu) / 256.0f;
+    int32_t bias14              = static_cast<int32_t>(sampler[2] & 0x3FFFu);
+    if (bias14 & 0x2000) bias14 -= 0x4000;
+    resource.lod_bias           = static_cast<float>(bias14) / 256.0f;
+    resource.border_color_type  = (sampler[3] >> 30) & 0x3u;
+}
+
+// Attach one exact MIMG use to an otherwise identical metadata resource. The use may carry a live
+// S# that differs from the metadata slot's paired sampler; retaining the old normalized sampler
+// while publishing the new fetch PC creates a self-contradictory resource record.
+inline bool attach_image_use(ShaderResource& resource, uint32_t use_pc,
+                             const uint32_t* sampler) {
+    if (resource.fetch_pc != 0xFFFFFFFFu && resource.fetch_pc != use_pc) return false;
+    resource.fetch_pc = use_pc;
+    if (resource.cls == ResourceClass::Texture && sampler)
+        apply_sampler_descriptor(resource, sampler);
+    return true;
+}
+
 inline bool is_gta5_selected_sbuffer_marker_candidate(const ShaderResource& resource) {
     return resource.selected_sbuffer_soffset != UINT32_MAX;
 }

@@ -7236,8 +7236,13 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                                 r0.mip_tail_y == view.mip_tail_y &&
                                 r0.layer_stride_bytes == view.layer_stride &&
                                 r0.layer_mip_offset_bytes == view.layer_mip_offset) {
-                                if (r0.fetch_pc == 0xFFFFFFFFu) { r0.fetch_pc = u.use_pc; mapped = true; break; }
-                                if (r0.fetch_pc == u.use_pc)    { mapped = true; break; }
+                                if (attach_image_use(
+                                        r0, u.use_pc,
+                                        wanted == ResourceClass::Texture && u.has_samp
+                                            ? u.s4.data() : nullptr)) {
+                                    mapped = true;
+                                    break;
+                                }
                             }
                         if (mapped) continue;
                     }
@@ -7287,22 +7292,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     if (wanted == ResourceClass::Texture && u.has_samp) {
                         // Paired S# (same SQ_IMG_SAMP decode as the sharp path). Storage operations do
                         // not consume a sampler even when their SSAMP bits alias known user SGPRs.
-                        const uint32_t* sm = u.s4.data();
-                        r.mag_filter  = ((sm[2] >> 20) & 0x3u) ? 1u : 0u;
-                        r.min_filter  = ((sm[2] >> 22) & 0x3u) ? 1u : 0u;
-                        r.mip_filter  = ((sm[2] >> 26) & 0x3u) ? 1u : 0u;
-                        r.addr_uvw[0] = (sm[0] >> 0) & 0x7u;
-                        r.addr_uvw[1] = (sm[0] >> 3) & 0x7u;
-                        r.addr_uvw[2] = (sm[0] >> 6) & 0x7u;
-                        r.max_aniso_ratio    = (sm[0] >> 9)  & 0x7u;
-                        r.depth_compare_func = (sm[0] >> 12) & 0x7u;
-                        r.unnormalized       = (sm[0] >> 15) & 0x1u;
-                        r.min_lod            = (float)( sm[1]        & 0xFFFu) / 256.0f;
-                        r.max_lod            = (float)((sm[1] >> 12) & 0xFFFu) / 256.0f;
-                        int32_t bias14       = (int32_t)(sm[2] & 0x3FFFu);
-                        if (bias14 & 0x2000) bias14 -= 0x4000;
-                        r.lod_bias           = (float)bias14 / 256.0f;
-                        r.border_color_type  = (sm[3] >> 30) & 0x3u;
+                        apply_sampler_descriptor(r, u.s4.data());
                     }
                     if (log) fprintf(stderr, "[srt] %s %s key=0x%x %ux%u fmt=%u base=0x%llx tile=%u samp=%d\n",
                                      is_ps ? "PS" : "VS",
@@ -7778,8 +7768,13 @@ std::vector<ComputeItem> realize_compute_dispatches(
                                 r0.mip_tail_y == view.mip_tail_y &&
                                 r0.layer_stride_bytes == view.layer_stride &&
                                 r0.layer_mip_offset_bytes == view.layer_mip_offset) {
-                                if (r0.fetch_pc == 0xFFFFFFFFu) { r0.fetch_pc = u.use_pc; mapped = true; break; }
-                                if (r0.fetch_pc == u.use_pc)    { mapped = true; break; }
+                                if (attach_image_use(
+                                        r0, u.use_pc,
+                                        wanted == ResourceClass::Texture && u.has_samp
+                                            ? u.s4.data() : nullptr)) {
+                                    mapped = true;
+                                    break;
+                                }
                             }
                         if (mapped) continue;
                     }
@@ -7838,22 +7833,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     r.srt_offset = clash ? 0xFFFFFFFFu : u.key;
                     r.fetch_pc = u.use_pc;               // per-use pc provenance (the image op)
                     if (u.has_samp) {
-                        const uint32_t* sm = u.s4.data();
-                        r.mag_filter  = ((sm[2] >> 20) & 0x3u) ? 1u : 0u;
-                        r.min_filter  = ((sm[2] >> 22) & 0x3u) ? 1u : 0u;
-                        r.mip_filter  = ((sm[2] >> 26) & 0x3u) ? 1u : 0u;
-                        r.addr_uvw[0] = (sm[0] >> 0) & 0x7u;
-                        r.addr_uvw[1] = (sm[0] >> 3) & 0x7u;
-                        r.addr_uvw[2] = (sm[0] >> 6) & 0x7u;
-                        r.max_aniso_ratio    = (sm[0] >> 9) & 0x7u;
-                        r.depth_compare_func = (sm[0] >> 12) & 0x7u;
-                        r.unnormalized       = (sm[0] >> 15) & 0x1u;
-                        r.min_lod            = static_cast<float>(sm[1] & 0xFFFu) / 256.0f;
-                        r.max_lod            = static_cast<float>((sm[1] >> 12) & 0xFFFu) / 256.0f;
-                        int32_t bias14        = static_cast<int32_t>(sm[2] & 0x3FFFu);
-                        if (bias14 & 0x2000) bias14 -= 0x4000;
-                        r.lod_bias           = static_cast<float>(bias14) / 256.0f;
-                        r.border_color_type  = (sm[3] >> 30) & 0x3u;
+                        apply_sampler_descriptor(r, u.s4.data());
                     }
                     table->resources.push_back(r);
                 }

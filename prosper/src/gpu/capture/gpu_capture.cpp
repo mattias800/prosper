@@ -1172,6 +1172,8 @@ bool validate_rtt_seed(const GpuCaptureRttSeed& seed, std::string& error) {
         case GpuCaptureColorFormat::R32Float: bytes_per_pixel = 4; break;
         case GpuCaptureColorFormat::Rg8Unorm: bytes_per_pixel = 2; break;
         case GpuCaptureColorFormat::Rgba32Float: bytes_per_pixel = 16; break;
+        case GpuCaptureColorFormat::Rg16Float: bytes_per_pixel = 4; break;
+        case GpuCaptureColorFormat::R16Float: bytes_per_pixel = 2; break;
         default: error = "RTT seed has an unsupported color format"; return false;
     }
     const uint64_t pixels = checked_mul(seed.width, seed.height);

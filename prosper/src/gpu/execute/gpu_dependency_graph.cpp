@@ -225,6 +225,10 @@ bool gpu_dependency_rtt_seed_matches(const GpuDependencyAccess& access,
             return access.format == DataFormat::Unorm8 && access.num_components == 2;
         case GpuCaptureColorFormat::Rgba32Float:
             return access.format == DataFormat::Float32 && access.num_components == 4;
+        case GpuCaptureColorFormat::Rg16Float:
+            return access.format == DataFormat::Float16 && access.num_components == 2;
+        case GpuCaptureColorFormat::R16Float:
+            return access.format == DataFormat::Float16 && access.num_components == 1;
     }
     return false;
 }

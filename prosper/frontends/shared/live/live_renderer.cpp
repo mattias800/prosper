@@ -100,6 +100,9 @@ struct RttSurf {
     std::array<float, 4> uniform_color{};
     uint32_t w = 0, h = 0;
     VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+    // Raw guest CB_COLOR format before backend_color_format() canonicalizes the Vulkan attachment.
+    // Consumers need this to compose their T# DST_SEL with the host image's component order.
+    VkFormat guest_format = VK_FORMAT_UNDEFINED;
     bool gpu_valid = false;
     // A color target can be cleared by a compute write to its DCC metadata rather than by a
     // color-plane write. Remember the sampled descriptor's metadata range so that write can
@@ -424,6 +427,10 @@ bool capture_color_format(VkFormat format, prosper::gpu::GpuCaptureColorFormat& 
         captured = prosper::gpu::GpuCaptureColorFormat::Rg8Unorm;
     else if (format == VK_FORMAT_R32G32B32A32_SFLOAT)
         captured = prosper::gpu::GpuCaptureColorFormat::Rgba32Float;
+    else if (format == VK_FORMAT_R16G16_SFLOAT)
+        captured = prosper::gpu::GpuCaptureColorFormat::Rg16Float;
+    else if (format == VK_FORMAT_R16_SFLOAT)
+        captured = prosper::gpu::GpuCaptureColorFormat::R16Float;
     else
         return false;
     return true;
@@ -444,6 +451,10 @@ VkFormat replay_color_format(prosper::gpu::GpuCaptureColorFormat format) {
         return VK_FORMAT_R8G8_UNORM;
     if (format == prosper::gpu::GpuCaptureColorFormat::Rgba32Float)
         return VK_FORMAT_R32G32B32A32_SFLOAT;
+    if (format == prosper::gpu::GpuCaptureColorFormat::Rg16Float)
+        return VK_FORMAT_R16G16_SFLOAT;
+    if (format == prosper::gpu::GpuCaptureColorFormat::R16Float)
+        return VK_FORMAT_R16_SFLOAT;
     return VK_FORMAT_R8G8B8A8_UNORM;
 }
 
@@ -488,6 +499,36 @@ std::vector<uint8_t> inspection_rgba8(const std::vector<uint8_t>& pixels,
             rgba[texel * 4 + 0] = pixels[texel * 2 + 0];
             rgba[texel * 4 + 1] = pixels[texel * 2 + 1];
             rgba[texel * 4 + 2] = 0;
+            rgba[texel * 4 + 3] = 255;
+        }
+        return rgba;
+    }
+    if (format == VK_FORMAT_R16G16_SFLOAT && pixels.size() == texels * 4) {
+        std::vector<uint8_t> rgba(texels * 4);
+        for (size_t texel = 0; texel < texels; ++texel) {
+            for (uint32_t channel = 0; channel < 2; ++channel) {
+                uint16_t half = 0;
+                std::memcpy(&half, pixels.data() + texel * 4 + channel * 2, sizeof(half));
+                const float value = prosper::gpu::half_to_float(half);
+                rgba[texel * 4 + channel] = !std::isfinite(value) || value <= 0.0f ? 0
+                    : value >= 1.0f ? 255 : static_cast<uint8_t>(value * 255.0f + 0.5f);
+            }
+            rgba[texel * 4 + 2] = 0;
+            rgba[texel * 4 + 3] = 255;
+        }
+        return rgba;
+    }
+    if (format == VK_FORMAT_R16_SFLOAT && pixels.size() == texels * 2) {
+        std::vector<uint8_t> rgba(texels * 4);
+        for (size_t texel = 0; texel < texels; ++texel) {
+            uint16_t half = 0;
+            std::memcpy(&half, pixels.data() + texel * 2, sizeof(half));
+            const float value = prosper::gpu::half_to_float(half);
+            const uint8_t visible = !std::isfinite(value) || value <= 0.0f ? 0
+                : value >= 1.0f ? 255 : static_cast<uint8_t>(value * 255.0f + 0.5f);
+            rgba[texel * 4 + 0] = visible;
+            rgba[texel * 4 + 1] = visible;
+            rgba[texel * 4 + 2] = visible;
             rgba[texel * 4 + 3] = 255;
         }
         return rgba;
@@ -1474,6 +1515,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             published.w = write.width;
             published.h = write.height;
             published.format = format;
+            published.guest_format = format;
             published.gpu_valid = true;
         });
     prosper::gpu::set_live_target_byte_range_reader(
@@ -1543,6 +1585,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             RttSurf& surface = g_rtt[seed.guest_addr];
             surface.w = seed.width; surface.h = seed.height;
             surface.format = format;
+            // Capture seeds contain canonical backend pixels. Older capture versions do not carry
+            // the producing CB_COLOR order, so retain the exact format they do name.
+            surface.guest_format = format;
             surface.rgba = std::make_shared<const std::vector<uint8_t>>(seed.rgba);
             surface.has_uniform_color = false;
             surface.gpu_valid = false;
@@ -5959,8 +6004,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                                     };
                             }
                         }
-                        // Carry the decoded S# sampler state (filter/wrap/mip) so the pipeline samples the
-                        // way the game asked instead of a fixed LINEAR/clamp sampler (#<sampler-fix>).
+                        // Carry the decoded S# sampler state (filter/wrap/mip) so the pipeline samples
+                        // the way the game asked instead of using fixed LINEAR/clamp state.
                         fr.mag_filter = r.mag_filter; fr.min_filter = r.min_filter; fr.mip_filter = r.mip_filter;
                         // Draw/binding-scoped sampler A/B. This shares TESTTEX's selectors but leaves
                         // the sampled pixels intact, isolating descriptor filtering from texture content.
@@ -5998,6 +6043,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                             fr.swizzle[0]=4; fr.swizzle[1]=5; fr.swizzle[2]=6; fr.swizzle[3]=7;
                         }
                         else { for (int k=0;k<4;k++) fr.swizzle[k] = r.swizzle[k]; }
+                        if (resource_rtt_hit && live_rtt != g_rtt.end())
+                            fr.render_target_guest_format = live_rtt->second.guest_format;
                         // PROSPER_ALPHA1: force the sampled alpha to constant 1 (opaque). Diagnostic for a
                         // black scene whose textures decode to real RGB but composite to nothing — if the
                         // level appears with this, the alpha channel (decode or DST_SEL swizzle) is the bug (#300).
@@ -7672,6 +7719,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         surface.w = gw;
                         surface.h = gh;
                         surface.format = pass_format;
+                        surface.guest_format = pass.empty()
+                            ? pass_format
+                            : static_cast<VkFormat>(
+                                  prosper::frontend::mrt_raw_format(*pass.front(), 0));
                         surface.has_uniform_color = false;
                         surface.dcc_metadata_dirty = false;
                         surface.gpu_valid = prosper::test::find_persistent_color_target(
@@ -7714,6 +7765,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         surface.w = gw;
                         surface.h = gh;
                         surface.format = pass_format;
+                        surface.guest_format = pass.empty()
+                            ? pass_format
+                            : static_cast<VkFormat>(
+                                  prosper::frontend::mrt_raw_format(*pass.front(), 0));
                         surface.gpu_valid = false;
                         surface.has_uniform_color = false;
                         surface.dcc_metadata_dirty = false;
@@ -7772,6 +7827,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         surface.w = gw;
                         surface.h = gh;
                         surface.format = pass_formats[slot];
+                        surface.guest_format = pass.empty()
+                            ? pass_formats[slot]
+                            : static_cast<VkFormat>(
+                                  prosper::frontend::mrt_raw_format(*pass.front(), slot));
                         surface.has_uniform_color = false;
                         surface.dcc_metadata_dirty = false;
                         // Any slot with a retained target is GPU-valid, not only slot 1. The
@@ -8447,6 +8506,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                         RttSurf& s = g_rtt[tgt];
                         s.rgba = selected_pixels; s.w = w; s.h = h;
                         s.format = VK_FORMAT_R8G8B8A8_UNORM; s.gpu_valid = false;
+                        s.guest_format = items.empty()
+                            ? VK_FORMAT_R8G8B8A8_UNORM
+                            : static_cast<VkFormat>(
+                                  prosper::frontend::mrt_raw_format(items.front(), 0));
                         s.has_uniform_color = false;
                         s.dcc_metadata_dirty = false;
                         prosper::test::invalidate_persistent_color_target(tgt);

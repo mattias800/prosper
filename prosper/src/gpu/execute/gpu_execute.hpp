@@ -1067,6 +1067,8 @@ enum class LiveTargetPixelFormat : uint8_t {
     R32Float,
     Rg8Unorm,
     Rgba32Float,
+    Rg16Float,
+    R16Float,
 };
 struct LiveTargetSnapshot {
     uint32_t width = 0, height = 0;
