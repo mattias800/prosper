@@ -243,7 +243,9 @@ bool direct_sampled_rtt_compatible(prosper::gpu::DataFormat format, uint32_t com
         (components == 1 && format == DataFormat::Uint32 &&
          target_format == LiveTargetPixelFormat::R32Uint) ||
         (components == 1 && format == DataFormat::Float32 &&
-         target_format == LiveTargetPixelFormat::R32Float);
+         target_format == LiveTargetPixelFormat::R32Float) ||
+        (components == 4 && format == DataFormat::Float32 &&
+         target_format == LiveTargetPixelFormat::Rgba32Float);
     // The renderer's RGBA8 fallback already stores the numeric UNORM value. Expanding each byte to
     // uint16 as byte*257 and reading R16_UNORM produces exactly byte/255 again. Vulkan performs
     // that UNORM-to-float conversion for normalized sampling and integer-coordinate OpImageFetch,
@@ -253,6 +255,20 @@ bool direct_sampled_rtt_compatible(prosper::gpu::DataFormat format, uint32_t com
         format == DataFormat::Unorm16 &&
         target_format == LiveTargetPixelFormat::Rgba8Unorm;
     return exact || equivalent_unorm_values;
+}
+
+bool sampled_rtt_snapshot_byte_compatible(
+    prosper::gpu::DataFormat format, uint32_t components,
+    prosper::gpu::LiveTargetPixelFormat target_format) {
+    using prosper::gpu::DataFormat;
+    using prosper::gpu::LiveTargetPixelFormat;
+    return (components == 1 &&
+            (format == DataFormat::Float32 || format == DataFormat::Uint32) &&
+            (target_format == LiveTargetPixelFormat::R32Float ||
+             target_format == LiveTargetPixelFormat::R32Uint)) ||
+        (components == 4 &&
+         (format == DataFormat::Float32 || format == DataFormat::Uint32) &&
+         target_format == LiveTargetPixelFormat::Rgba32Float);
 }
 
 namespace {
@@ -5882,7 +5898,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                          (r->format == DataFormat::Uint32 ||
                           r->format == DataFormat::Float32) && nc == 1) ||
                         (live_target.format == LiveTargetPixelFormat::R32Float &&
-                         r->format == DataFormat::Float32 && nc == 1);
+                         r->format == DataFormat::Float32 && nc == 1) ||
+                        (live_target.format == LiveTargetPixelFormat::Rgba32Float &&
+                         r->format == DataFormat::Float32 && nc == 4);
                     if (!compatible) {
                         // The same allocation can carry another target view before this compute
                         // operation (Astro Bot uses R8G8 and RGBA16F views at one base). A snapshot
@@ -6773,15 +6791,16 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     const bool source_rg8 = source_layout == LiveTargetSourceLayout::Unorm8x2;
                     const bool source_r32 = source_layout == LiveTargetSourceLayout::Uint32x1;
                     const bool source_f32 = source_layout == LiveTargetSourceLayout::Float32x1;
+                    const bool source_f32x4 = source_layout == LiveTargetSourceLayout::Float32x4;
                     const bool exact_narrow_layout =
                         (source_r8 &&
                          (r8 || (sampled_uint8_native && sampled_components == 1))) ||
                         (source_rg8 &&
                          (sampled_unorm8x2 ||
                           (sampled_uint8_native && sampled_components == 2))) ||
-                        (source_r32 && sampled_components == 1 &&
-                         (sampled_float32_native || sampled_uint32_native)) ||
-                        (source_f32 && sampled_components == 1 && sampled_float32_native);
+                        ((source_r32 || source_f32 || source_f32x4) &&
+                         sampled_rtt_snapshot_byte_compatible(
+                             r->format, sampled_components, live_target.format));
                     // This is not redundant: the packed-view check above is written as
                     // `format == R11G11B10Float && <incompatible view>`, which for any NEW format
                     // is false and therefore RETAINS ownership. That predicate fails OPEN, so this

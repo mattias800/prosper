@@ -92,6 +92,81 @@ int main() {
     CHECK(ok && rgb[0] > 0xC0 && rgb[2] < 0x40,
           "declared_mip_levels=1 (the default) keeps the historical single-level clamp-to-0 behavior");
 
+    // CB_COLOR exposes one persistent Vulkan image per mip view. Build two deliberately different
+    // renderer-owned levels (red level 0, green level 1), then sample them through one FrameResource
+    // mip chain. Green at LOD 1 cannot come from the red base-level image and therefore proves the
+    // backend copied the independent target instead of direct-binding mip 0. Leave level 2 absent;
+    // black there proves the backend does not invent output for a producer that never ran.
+    const uint8_t red_texels[4 * 4 * 4] = {
+        255,0,0,255, 255,0,0,255, 255,0,0,255, 255,0,0,255,
+        255,0,0,255, 255,0,0,255, 255,0,0,255, 255,0,0,255,
+        255,0,0,255, 255,0,0,255, 255,0,0,255, 255,0,0,255,
+        255,0,0,255, 255,0,0,255, 255,0,0,255, 255,0,0,255,
+    };
+    const uint8_t green_texels[2 * 2 * 4] = {
+        0,255,0,255, 0,255,0,255, 0,255,0,255, 0,255,0,255,
+    };
+    auto make_lod_fragment = [&](uint32_t lod_bits) {
+        std::vector<uint32_t> ps(
+            ps_template, ps_template + sizeof(ps_template) / sizeof(ps_template[0]));
+        ps[1] = U; ps[3] = U; ps[5] = lod_bits;
+        return recompile_fragment(ps.data(), ps.size(), &rt);
+    };
+    const std::vector<uint32_t> lod0_frag = make_lod_fragment(LOD0);
+    auto publish_target = [&](uint64_t id, const uint8_t* source,
+                              uint32_t width, uint32_t height) {
+        prosper::test::FrameResource resource;
+        resource.binding = 4; resource.set = 1;
+        resource.tex_rgba = source; resource.tw = width; resource.th = height;
+        resource.mip_filter = 0;
+        prosper::test::BackendDraw draw;
+        draw.vs = vert; draw.fs = lod0_frag; draw.R = {resource}; draw.vcount = 3;
+        prosper::test::BackendColorTarget target;
+        target.persistent_id = id;
+        target.load_existing = false;
+        target.readback = false;
+        prosper::test::render_draws_rgba(
+            {draw}, width, height, nullptr, nullptr, false, &target,
+            nullptr, nullptr, nullptr, nullptr, true, nullptr, false);
+    };
+    constexpr uint64_t MIP_TARGET0 = 0x1272001000ull;
+    constexpr uint64_t MIP_TARGET1 = 0x1272002000ull;
+    publish_target(MIP_TARGET0, red_texels, 4u, 4u);
+    publish_target(MIP_TARGET1, green_texels, 2u, 2u);
+    CHECK(prosper::test::find_persistent_color_target(
+              MIP_TARGET0, 4u, 4u, VK_FORMAT_R8G8B8A8_UNORM) &&
+              prosper::test::find_persistent_color_target(
+                  MIP_TARGET1, 2u, 2u, VK_FORMAT_R8G8B8A8_UNORM),
+          "independent CB_COLOR mip views remain renderer-owned and sampleable");
+    auto render_assembled_lod = [&](uint32_t lod_bits, uint8_t out_rgb[3]) {
+        prosper::test::FrameResource resource;
+        resource.binding = 4; resource.set = 1;
+        resource.tw = resource.th = 4u;
+        resource.declared_mip_levels = 3u;
+        resource.persistent_render_target_id = MIP_TARGET0;
+        resource.persistent_render_target_mip_ids[0] = MIP_TARGET0;
+        resource.persistent_render_target_mip_ids[1] = MIP_TARGET1;
+        resource.persistent_render_target_mip_count = 3u;
+        resource.mip_filter = 0;
+        resource.max_lod = 8.0f;
+        prosper::test::BackendDraw draw;
+        draw.vs = vert; draw.fs = make_lod_fragment(lod_bits);
+        draw.R = {resource}; draw.vcount = 3;
+        const std::vector<uint8_t> px =
+            prosper::test::render_draws_rgba({draw}, W, H);
+        if (px.size() != static_cast<size_t>(W) * H * 4u) return false;
+        const uint8_t* center =
+            &px[(static_cast<size_t>(H / 2) * W + W / 2) * 4u];
+        out_rgb[0] = center[0]; out_rgb[1] = center[1]; out_rgb[2] = center[2];
+        return true;
+    };
+    ok = render_assembled_lod(0x3f800000u /*1.0f*/, rgb);
+    CHECK(ok && rgb[1] > 0xC0 && rgb[0] < 0x40 && rgb[2] < 0x40,
+          "assembled renderer mip chain samples the independent green level 1");
+    ok = render_assembled_lod(LOD2, rgb);
+    CHECK(ok && rgb[0] < 0x20 && rgb[1] < 0x20 && rgb[2] < 0x20,
+          "missing final renderer mip remains black instead of fabricating guest output");
+
     // IMAGE_SAMPLE_D supplies [Ds/Dx, Dt/Dx, Ds/Dy, Dt/Dy, u, v]. Unit normalized-coordinate
     // gradients over a 4x4 texture select LOD 2, while the literal UV has zero implicit quad
     // derivatives and selects LOD 0. Purple therefore proves that the explicit Grad operands survive.

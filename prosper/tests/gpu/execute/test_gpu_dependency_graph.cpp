@@ -68,6 +68,7 @@ int main() {
     ComputeItem compute;
     compute.dispatch_index = 2;
     compute.command_order = 20;
+    compute.launch.groups_x = compute.launch.groups_y = compute.launch.groups_z = 1;
     compute.resources = std::make_shared<ShaderResourceTable>();
     compute.resources->resources.push_back(resource(0x3000, 0x80, 2, ResourceClass::ConstantBuffer));
 
@@ -134,6 +135,8 @@ int main() {
     ComputeItem scalar_compute;
     scalar_compute.dispatch_index = 636;
     scalar_compute.command_order = 636;
+    scalar_compute.launch.groups_x = scalar_compute.launch.groups_y =
+        scalar_compute.launch.groups_z = 1;
     scalar_compute.resources = std::make_shared<ShaderResourceTable>(
         build_shader_resources(scalar_header, scalar_sgprs, 32));
     GpuReplayFrame scalar_replay;
@@ -186,6 +189,8 @@ int main() {
     ComputeItem reflected_compute;
     reflected_compute.dispatch_index = 637;
     reflected_compute.command_order = 637;
+    reflected_compute.launch.groups_x = reflected_compute.launch.groups_y =
+        reflected_compute.launch.groups_z = 1;
     reflected_compute.spirv = storage_image_copy_spirv();
     reflected_compute.resources = std::make_shared<ShaderResourceTable>();
     ShaderResource reflected_src = resource(0x7000, 4, 5, ResourceClass::StorageImage);
@@ -229,6 +234,31 @@ int main() {
                                                wrong_format) &&
               !gpu_dependency_rtt_seed_matches(srgb_access, exact_seed),
           "address-only RTT matches cannot hide extent, format, or sRGB reinterpretation");
+
+    ComputeItem zero_compute = reflected_compute;
+    zero_compute.dispatch_index = 639;
+    zero_compute.command_order = 639;
+    zero_compute.launch.groups_x = 0;
+    DrawItem zero_consumer;
+    zero_consumer.draw_index = 640;
+    zero_consumer.command_order = 640;
+    zero_consumer.prt = std::make_shared<ShaderResourceTable>();
+    zero_consumer.prt->resources = {reflected_dst};
+    GpuReplayFrame zero_replay;
+    zero_replay.computes = {zero_compute};
+    zero_replay.items = {zero_consumer};
+    zero_replay.operations = {
+        {SubmitOperationKind::Dispatch, 639, 639, true},
+        {SubmitOperationKind::Draw, 640, 640, true},
+    };
+    GpuDependencyGraph zero_graph;
+    CHECK(build_gpu_dependency_graph(zero_replay, zero_graph, error) &&
+              zero_graph.nodes.size() == 2 && zero_graph.nodes[0].realized &&
+              zero_graph.edges.empty() && zero_graph.external_leaves.size() == 1 &&
+              zero_graph.external_leaves[0].access.addr == reflected_dst.gpu_addr &&
+              zero_graph.external_leaves[0].consumer_operations.size() == 1 &&
+              zero_graph.external_leaves[0].consumer_operations[0] == 1,
+          "a zero-workgroup dispatch remains a semantic node but cannot consume or produce data");
 
     GpuReplayFrame image_overlap_replay;
     DrawItem image_writer;

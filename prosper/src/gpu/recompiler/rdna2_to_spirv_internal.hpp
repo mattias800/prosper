@@ -3969,10 +3969,15 @@ struct SpirvCompute {
 
     // Descriptor-free geometry pass-through used when a fragment program asks for AMD's explicit
     // P0/P10/P20 vertex parameters on a Vulkan device without a barycentric/vertex-parameter
-    // extension. Input assembly has already decomposed lists/strips/fans into triangles here.
+    // extension. Input assembly has already decomposed lists/strips/fans into triangles here. A
+    // three-vertex PS5 RectList whose attributes come from a vertex buffer also comes through this
+    // stage: GFX10 synthesizes its fourth corner after vertex shading, while Vulkan has no RectList
+    // topology. The missing post-VS position and every consumed varying are the affine fourth
+    // corner P1 + P2 - P0; emitting P0,P1,P2,P3 as a strip preserves the hardware rectangle.
     std::vector<uint32_t> build_interpolation_geometry(
-            const FragmentInterpolationLayout& layout, bool capture_geometry_position) {
-        if (!layout.requires_geometry || !layout.valid) return {};
+            const FragmentInterpolationLayout& layout, bool capture_geometry_position,
+            bool synthesize_rect = false) {
+        if ((!layout.requires_geometry && !synthesize_rect) || !layout.valid) return {};
 
         t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_i32 = id(); t_bool = id();
         t_v4f = id();
@@ -3990,7 +3995,8 @@ struct SpirvCompute {
         for (uint32_t attr = 0; attr < 32; ++attr) {
             if (!(layout.attribute_mask & (1u << attr))) continue;
             attribute_inputs[attr] = id();
-            if (layout.smooth_mask & (1u << attr)) attribute_outputs[attr] = id();
+            if ((layout.smooth_mask & (1u << attr)) || synthesize_rect)
+                attribute_outputs[attr] = id();
             for (uint32_t selector = 0; selector < 3; ++selector)
                 if (layout.parameter_locations[attr][selector] !=
                     FragmentInterpolationLayout::kUnusedLocation)
@@ -4009,7 +4015,7 @@ struct SpirvCompute {
         exec_model = Exec_Geometry;
         put(exec, Op_ExecutionMode, {f_main, EM_Triangles});
         put(exec, Op_ExecutionMode, {f_main, EM_OutputTriangleStrip});
-        put(exec, Op_ExecutionMode, {f_main, EM_OutputVertices, 3});
+        put(exec, Op_ExecutionMode, {f_main, EM_OutputVertices, synthesize_rect ? 4u : 3u});
         if (capture_geometry_position) put(exec, Op_ExecutionMode, {f_main, EM_Xfb});
 
         put(deco, Op_MemberDecorate, {t_input_per_vertex, 0, Dec_BuiltIn, BI_Position});
@@ -4094,6 +4100,7 @@ struct SpirvCompute {
             }
         }
         std::array<std::array<uint32_t, 3>, 32> parameters{};
+        std::array<uint32_t, 32> rect_attribute_values{};
         for (uint32_t attr = 0; attr < 32; ++attr) {
             if (!attribute_inputs[attr]) continue;
             parameters[attr][2] = attribute_values[attr][0];
@@ -4108,13 +4115,35 @@ struct SpirvCompute {
                 put(code, Op_FSub, {t_v4f, parameters[attr][1],
                                     attribute_values[attr][2], attribute_values[attr][0]});
             }
+            if (synthesize_rect) {
+                const uint32_t sum = id();
+                put(code, Op_FAdd, {t_v4f, sum,
+                                    attribute_values[attr][1], attribute_values[attr][2]});
+                rect_attribute_values[attr] = id();
+                put(code, Op_FSub, {t_v4f, rect_attribute_values[attr],
+                                    sum, attribute_values[attr][0]});
+            }
         }
 
+        std::array<uint32_t, 3> positions{};
         for (uint32_t vertex = 0; vertex < 3; ++vertex) {
-            uint32_t input_pointer = id();
+            const uint32_t input_pointer = id();
             put(code, Op_AccessChain,
                 {ptr_in_v4f, input_pointer, input_position, uconst(vertex), uconst(0)});
-            uint32_t position = id(); put(code, Op_Load, {t_v4f, position, input_pointer});
+            positions[vertex] = id();
+            put(code, Op_Load, {t_v4f, positions[vertex], input_pointer});
+        }
+        uint32_t rect_position = 0;
+        if (synthesize_rect) {
+            const uint32_t sum = id();
+            put(code, Op_FAdd, {t_v4f, sum, positions[1], positions[2]});
+            rect_position = id();
+            put(code, Op_FSub, {t_v4f, rect_position, sum, positions[0]});
+        }
+
+        const uint32_t output_vertices = synthesize_rect ? 4u : 3u;
+        for (uint32_t vertex = 0; vertex < output_vertices; ++vertex) {
+            const uint32_t position = vertex < 3 ? positions[vertex] : rect_position;
             uint32_t output_pointer = id();
             put(code, Op_AccessChain,
                 {ptr_out_v4f, output_pointer, output_position, uconst(0)});
@@ -4123,14 +4152,15 @@ struct SpirvCompute {
             for (uint32_t attr = 0; attr < 32; ++attr) {
                 if (attribute_outputs[attr])
                     put(code, Op_Store,
-                        {attribute_outputs[attr], attribute_values[attr][vertex]});
+                        {attribute_outputs[attr], vertex < 3
+                            ? attribute_values[attr][vertex] : rect_attribute_values[attr]});
                 for (uint32_t selector = 0; selector < 3; ++selector)
                     if (parameter_outputs[attr][selector])
                         put(code, Op_Store,
                             {parameter_outputs[attr][selector], parameters[attr][selector]});
             }
-            const float i = vertex == 1 ? 1.0f : 0.0f;
-            const float j = vertex == 2 ? 1.0f : 0.0f;
+            const float i = vertex == 1 || vertex == 3 ? 1.0f : 0.0f;
+            const float j = vertex == 2 || vertex == 3 ? 1.0f : 0.0f;
             const uint32_t barycentric = id();
             putv(code, Op_CompositeConstruct,
                  {t_v4f, barycentric, fconstf(i), fconstf(j), fconstf(1.0f), fconstf(1.0f)});

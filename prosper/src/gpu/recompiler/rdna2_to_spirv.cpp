@@ -230,9 +230,10 @@ void apply_fragment_consumption(PixelInputMapping& mapping,
 }
 
 std::vector<uint32_t> recompile_interpolation_geometry(
-        const FragmentInterpolationLayout& layout, bool capture_position) {
+        const FragmentInterpolationLayout& layout, bool capture_position,
+        bool synthesize_rect) {
     SpirvCompute builder;
-    return builder.build_interpolation_geometry(layout, capture_position);
+    return builder.build_interpolation_geometry(layout, capture_position, synthesize_rect);
 }
 
 namespace {

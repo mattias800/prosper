@@ -5724,8 +5724,7 @@ bool shader_resource_allows_zero_mip_specialization(
     const DecodedImageView& view) {
     return use.proven_zero_mip && descriptor.sample_count == 1u &&
         descriptor.base_level == 0u && descriptor.last_level == 0u &&
-        descriptor.max_mip == 0u && !view.in_mip_tail &&
-        !descriptor.compression_enabled;
+        descriptor.max_mip == 0u && !view.in_mip_tail;
 }
 
 std::vector<SrtUse> add_compute_buffer_resources(ShaderResourceTable& table,
@@ -7758,8 +7757,10 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     const uint32_t img_dim = image_type_to_dim(d.type);
                     // This is deliberately narrower than "the backend currently uploads one mip".
                     // The instruction proof belongs to this exact use, and the descriptor must also
-                    // declare one uncompressed base level. In particular, do not reinterpret a DCC
-                    // allocation as raw texels merely because IMAGE_*_MIP selected level zero.
+                    // declare one base level. Compression is deliberately not part of this marker:
+                    // it proves only that discarding the mip operand is exact. The live backend must
+                    // independently acquire authoritative pixels from a renderer image, an
+                    // all-uncompressed metadata plane, or a supported DCC decode before execution.
                     const bool proven_zero_mip =
                         shader_resource_allows_zero_mip_specialization(u, d, view);
                     {

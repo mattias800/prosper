@@ -77,4 +77,15 @@ constexpr bool mrt_extent_conflicts(uint32_t slot_w, uint32_t slot_h,
     return slot_w != pass_w || slot_h != pass_h;
 }
 
+// The view-aware form used when both the sampled resource and the pass attachment have measured
+// extents. Packed mip tails may reuse one guest base for multiple independently rendered Vulkan
+// images; an address match with conflicting known extents is therefore not feedback. Unknown
+// extents retain the conservative address-only answer.
+constexpr bool mrt_target_view_feedback(const uint64_t* bases, const bool* active, uint32_t count,
+                                        uint64_t sampled, uint32_t sampled_w, uint32_t sampled_h,
+                                        uint32_t attachment_w, uint32_t attachment_h) {
+    if (mrt_extent_conflicts(sampled_w, sampled_h, attachment_w, attachment_h)) return false;
+    return mrt_target_feedback(bases, active, count, sampled);
+}
+
 } // namespace prosper::frontend

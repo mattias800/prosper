@@ -139,6 +139,11 @@ int main() {
                   prosper::test::backend_color_bytes_per_pixel(
                       VK_FORMAT_R32G32B32A32_UINT) == 16,
               "portable raw-uvec4 storage images retain all four dword channels");
+        CHECK(prosper::test::backend_color_format(VK_FORMAT_R32G32B32A32_SFLOAT) ==
+                  VK_FORMAT_R32G32B32A32_SFLOAT &&
+                  prosper::test::backend_color_bytes_per_pixel(
+                      VK_FORMAT_R32G32B32A32_SFLOAT) == 16,
+              "RGBA32F color targets retain all four float channels");
     }
 
     // A uniform DCC clear reaches the sampled image without a full CPU-sized pixel allocation or
@@ -412,6 +417,22 @@ int main() {
         CHECK(!gpu_resident.empty() && gpu_resident == cpu_roundtrip &&
                   sampled_stats.sampled_hits == 1,
               "GPU-resident target sampling matches CPU readback+upload byte-for-byte");
+
+        // A packed mip tail may use the same guest ID for two independently rendered extents. The
+        // 32x16 destination is not feedback against the retained 64x32 source: declining the borrow
+        // on address alone leaves this resource with neither GPU pixels nor a CPU fallback and
+        // samples transparent black.
+        prosper::test::BackendColorTarget same_id_smaller_target{
+            target_id, false, true};
+        const std::vector<uint8_t> same_id_different_extent =
+            prosper::test::render_draws_rgba(
+                {gpu_sample}, W / 2u, H / 2u, nullptr, nullptr, false,
+                &same_id_smaller_target);
+        const auto same_id_stats = prosper::test::backend_color_target_stats();
+        CHECK(!same_id_different_extent.empty() &&
+                  center_red(same_id_different_extent) == center_red(cpu_roundtrip) &&
+                  same_id_stats.sampled_hits == 1,
+              "same-address different-extent target borrows the retained source view");
 
         // Exercise the generic compute-image borrow carried by FrameResource. Reuse this exact
         // backend-owned image as a convenient fixture, but address it only through the opaque
