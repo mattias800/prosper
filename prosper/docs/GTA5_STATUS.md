@@ -13,6 +13,29 @@ presses for a reason).
 Historical design note for the descriptor work: `docs/FLAT_LOAD_DESIGN.md`. Do not start from it; the
 descriptor-array lift it describes is complete.
 
+## The Windows Performance route does not require a compute skip (2026-08-26)
+
+The routed native-4K Performance-mode scene now completes with
+`PROSPER_COMPUTE_SKIP_PROGRAM` unset. On the current Windows/NVIDIA branch, the fixed
+`scripts/gta5/reach-story-mode-static.pad` route captured 25/25 samples over 500 seconds, exited
+normally with the guest still running, and recorded zero `VK_ERROR_DEVICE_LOST` or live-compute
+disable events. The final bank frame retains the world, character and water-cooler materials, radar,
+tutorial text and reflections. `PROSPER_WAVE64_APPROX` was also unset.
+
+The retained selector was not rescuing this route. In the immediately preceding control with
+`PROSPER_COMPUTE_SKIP_PROGRAM=0x413dc6700`, the parser announced the selector but emitted zero
+`[compute-decline] ... reason=skipped-by-selector` records. A matched non-fast-path dispatch always
+reports that decline, and `0x413dc6700` cannot match the sole CPU fast path's one-buffer fill shape.
+An exact `PROSPER_COMPUTELOG_CODE=0x413dc6700` trace also recorded zero matching executions throughout
+the 500-second no-skip route, including 160 seconds in the bank scene. The old address therefore did
+not reach the selector on this route. Removing the environment variable changes no executed work.
+
+This does not retract the historical Linux/RADV evidence below: that older route did execute the
+program and could lose the device while consuming a cyclic traversal table. It establishes the
+narrower current fact that carrying its address into the patched Windows Performance route was an
+inert launch requirement, not a workaround. Keep `PROSPER_COMPUTE_SKIP_PROGRAM` as a generic
+diagnostic selector, but do not set it for the accepted GTA V route.
+
 ## The F9 bundle works now, and the gameplay frame is dissectable offline (2026-08-19)
 
 `make_capture_manifest()` copied a `GpuCaptureFile` field by field and omitted `format_version`, so
