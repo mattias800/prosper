@@ -100,6 +100,30 @@ initializers to construct valid GPU objects (correctness-first — no plausible-
 - Graphics libs are sparsely documented; most NIDs don't resolve to names — reverse-engineer from
   call args (`PROSPER_GFXLOG`) and `build-linux/tools/pltm` (maps a module GOT offset → NID).
 
+## ✔ USER-DATA PROBE (2026-07-04): zero-varying fault pair still has PS resource bindings
+
+Follow-up to PR #14's fork between "legitimate zero-varying pipeline, bad resident flag" and
+"`[+0xc0]` is fed by shader resource bindings." `PROSPER_PIPETRACE` now logs Kyty's
+`ShaderUserData` resource-binding table: direct resource offsets, `eud_size_dw`/`srt_size_dw`, and
+the four sharp-resource arrays (`sharp[0]` texture, `sharp[2]` sampler, `sharp[3]` storage buffer).
+
+One traced WSL2 boot of the faulting pair showed:
+
+```
+CreateInterpolantMapping gs=...c0620 ps=...c0dd0 -> mapping 0 interpolants
+  gs user_data: direct_count=11 sharp_counts={0,0,0,0}
+  ps user_data: direct_count=11 sharp_counts={0,0,0,1}
+    sharp[3] storage: slot0={off=0000,size=1}
+```
+
+So the semantics conclusion still holds: this is a genuine zero-varying pair. But the pixel shader is
+not resource-empty: it has one storage-buffer sharp binding. That makes hypothesis (2) the better next
+thread: the pipeline reflection table `[pipeline+0xc0]` is likely populated from shader resource
+bindings/user-data as well as, or instead of, interpolants for this path. The next probe should catch
+the Unity builder that folds `ShaderUserData` into `[pipeline+0xc0]/[+0xe0]` and compare the expected
+storage binding against the records seen by predicate `eboot+0xd58710`. Chasing `[obj+0x1a0]` first is
+lower signal until the resource-binding reflection path is ruled out.
+
 ## ✔ SEMANTICS PROBE (2026-07-04): metadata is surfaced CORRECTLY — the "mis-relocation" bet is rejected
 
 Agent-2's fastest-to-confirm bet was that our shader I/O semantics are empty/mis-relocated, making the
