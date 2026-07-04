@@ -13,6 +13,7 @@
 #ifndef _WIN32
 #include <unistd.h>
 #else
+#include <direct.h>
 #include <io.h>
 #endif
 
@@ -35,6 +36,78 @@ namespace {
         if (filelog()) fprintf(stderr, "[file] open '%s' -> '%s'\n", guest, h.c_str());
         return h;
     }
+
+    struct HostStat {
+        uint32_t dev = 0, ino = 0, mode = 0, nlink = 0, uid = 0, gid = 0, rdev = 0;
+        int64_t atime_sec = 0, atime_nsec = 0;
+        int64_t mtime_sec = 0, mtime_nsec = 0;
+        int64_t ctime_sec = 0, ctime_nsec = 0;
+        int64_t size = 0, blocks = 0;
+        uint32_t blksize = 0;
+    };
+
+    int64_t blocks_512_for_size(int64_t size) {
+        return size > 0 ? (size + 511) / 512 : 0;
+    }
+
+    void write_sce_stat(const HostStat& s, uint8_t* out) {
+        memset(out, 0, 0x78);
+        *(uint32_t*)(out + 0x00) = s.dev;
+        *(uint32_t*)(out + 0x04) = s.ino;
+        *(uint16_t*)(out + 0x08) = (uint16_t)s.mode;    // type+perm bits match Linux/MinGW
+        *(uint16_t*)(out + 0x0a) = (uint16_t)s.nlink;
+        *(uint32_t*)(out + 0x0c) = s.uid;
+        *(uint32_t*)(out + 0x10) = s.gid;
+        *(uint32_t*)(out + 0x14) = s.rdev;
+        *(int64_t*)(out + 0x18)  = s.atime_sec; *(int64_t*)(out + 0x20) = s.atime_nsec;
+        *(int64_t*)(out + 0x28)  = s.mtime_sec; *(int64_t*)(out + 0x30) = s.mtime_nsec;
+        *(int64_t*)(out + 0x38)  = s.ctime_sec; *(int64_t*)(out + 0x40) = s.ctime_nsec;
+        *(int64_t*)(out + 0x48)  = s.size;
+        *(int64_t*)(out + 0x50)  = s.blocks;
+        *(uint32_t*)(out + 0x58) = s.blksize;
+    }
+
+#ifndef _WIN32
+    HostStat from_host_stat(const struct stat& s) {
+        HostStat h;
+        h.dev = (uint32_t)s.st_dev; h.ino = (uint32_t)s.st_ino; h.mode = (uint32_t)s.st_mode;
+        h.nlink = (uint32_t)s.st_nlink; h.uid = (uint32_t)s.st_uid; h.gid = (uint32_t)s.st_gid;
+        h.rdev = (uint32_t)s.st_rdev;
+        h.atime_sec = s.st_atim.tv_sec; h.atime_nsec = s.st_atim.tv_nsec;
+        h.mtime_sec = s.st_mtim.tv_sec; h.mtime_nsec = s.st_mtim.tv_nsec;
+        h.ctime_sec = s.st_ctim.tv_sec; h.ctime_nsec = s.st_ctim.tv_nsec;
+        h.size = (int64_t)s.st_size; h.blocks = (int64_t)s.st_blocks; h.blksize = (uint32_t)s.st_blksize;
+        return h;
+    }
+#else
+    HostStat from_host_stat(const struct stat& s) {
+        HostStat h;
+        h.dev = (uint32_t)s.st_dev; h.ino = (uint32_t)s.st_ino; h.mode = (uint32_t)s.st_mode;
+        h.nlink = (uint32_t)s.st_nlink; h.uid = (uint32_t)s.st_uid; h.gid = (uint32_t)s.st_gid;
+        h.rdev = (uint32_t)s.st_rdev;
+        h.atime_sec = (int64_t)s.st_atime;
+        h.mtime_sec = (int64_t)s.st_mtime;
+        h.ctime_sec = (int64_t)s.st_ctime;
+        h.size = (int64_t)s.st_size;
+        h.blocks = blocks_512_for_size(h.size);
+        h.blksize = 4096;
+        return h;
+    }
+
+    HostStat from_host_stat(const struct _stat64& s) {
+        HostStat h;
+        h.dev = (uint32_t)s.st_dev; h.ino = (uint32_t)s.st_ino; h.mode = (uint32_t)s.st_mode;
+        h.nlink = (uint32_t)s.st_nlink; h.uid = (uint32_t)s.st_uid; h.gid = (uint32_t)s.st_gid;
+        h.rdev = (uint32_t)s.st_rdev;
+        h.atime_sec = (int64_t)s.st_atime;
+        h.mtime_sec = (int64_t)s.st_mtime;
+        h.ctime_sec = (int64_t)s.st_ctime;
+        h.size = (int64_t)s.st_size;
+        h.blocks = blocks_512_for_size(h.size);
+        h.blksize = 4096;
+        return h;
+    }
+#endif
 }
 
 void set_app0_root(const std::string& root) { g_app0 = root; }
@@ -47,21 +120,13 @@ void set_app0_root(const std::string& root) { g_app0 = root; }
 // Exposed (not file-local) so tests can guard the layout — writing the wrong size/offsets here
 // once smashed a guest stack canary (st_size must land at 0x48, st_mode at 0x08, total 0x78).
 void to_sce_stat(const struct stat& s, uint8_t* out) {
-        memset(out, 0, 0x78);
-        *(uint32_t*)(out + 0x00) = (uint32_t)s.st_dev;
-        *(uint32_t*)(out + 0x04) = (uint32_t)s.st_ino;
-        *(uint16_t*)(out + 0x08) = (uint16_t)s.st_mode;    // type+perm bits match Linux
-        *(uint16_t*)(out + 0x0a) = (uint16_t)s.st_nlink;
-        *(uint32_t*)(out + 0x0c) = (uint32_t)s.st_uid;
-        *(uint32_t*)(out + 0x10) = (uint32_t)s.st_gid;
-        *(uint32_t*)(out + 0x14) = (uint32_t)s.st_rdev;
-        *(int64_t*)(out + 0x18)  = s.st_atim.tv_sec; *(int64_t*)(out + 0x20) = s.st_atim.tv_nsec;
-        *(int64_t*)(out + 0x28)  = s.st_mtim.tv_sec; *(int64_t*)(out + 0x30) = s.st_mtim.tv_nsec;
-        *(int64_t*)(out + 0x38)  = s.st_ctim.tv_sec; *(int64_t*)(out + 0x40) = s.st_ctim.tv_nsec;
-        *(int64_t*)(out + 0x48)  = s.st_size;
-        *(int64_t*)(out + 0x50)  = s.st_blocks;
-        *(uint32_t*)(out + 0x58) = (uint32_t)s.st_blksize;
+    write_sce_stat(from_host_stat(s), out);
 }
+#ifdef _WIN32
+void to_sce_stat64(const struct _stat64& s, uint8_t* out) {
+    write_sce_stat(from_host_stat(s), out);
+}
+#endif
 
 // --- stdio FILE* ---
 HLE(f_fopen)   { std::string h = translate(CS(a0)); return (uint64_t)(uintptr_t)fopen(h.c_str(), CS(a1)); }
@@ -91,8 +156,13 @@ HLE(f_pwrite) { return (uint64_t)(int64_t)::pwrite((int)a0, P(a1), (size_t)a2, (
 HLE(f_pread)  { return (uint64_t)-1; }
 HLE(f_pwrite) { return (uint64_t)-1; }
 #endif
+#ifndef _WIN32
 HLE(f_stat)  { std::string h = translate(CS(a0)); struct stat st; int r = ::stat(h.c_str(), &st); if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
 HLE(f_fstat) { struct stat st; int r = ::fstat((int)a0, &st); if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
+#else
+HLE(f_stat)  { std::string h = translate(CS(a0)); struct _stat64 st; int r = ::_stat64(h.c_str(), &st); if (r == 0 && a1) to_sce_stat64(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
+HLE(f_fstat) { struct _stat64 st; int r = ::_fstat64((int)a0, &st); if (r == 0 && a1) to_sce_stat64(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
+#endif
 HLE(f_access){ std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::access(h.c_str(), (int)a1); }
 HLE(f_mkdir) { std::string h = translate(CS(a0));   // sceKernelMkdir(path, mode)
 #ifdef _WIN32
