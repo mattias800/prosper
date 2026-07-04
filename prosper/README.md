@@ -11,20 +11,32 @@ lives in `../PPSA24651-app0`. Its SELF segments are unencrypted, which is what
 makes this project possible without console keys.
 
 ## Status
-- ✅ **M0 — Recon & tooling.** Format cracked, full HLE work-list extracted. See
-  [`docs/FINDINGS.md`](docs/FINDINGS.md).
-- ⏳ **M1 — Loader** (next).
+- ✅ **M0 — Recon & tooling.** Format cracked, full HLE work-list extracted.
+- ✅ **M1 — Loader.** SELF/ELF → relocatable image → multi-module link → NID import binding.
+- ✅ **M2/M3 — HLE + boot.** libkernel/libc (memory, threads, futex, time, file I/O, locale);
+  IL2CPP GC + thread pool; boots **through** IL2CPP into Unity's GfxDevice bring-up.
+- 🚧 **M4/M5 — Graphics (AGC → Vulkan), active.** AGC command frontend complete (CreateShader +
+  SubmitDcb, zero unimplemented `libSceAgc` calls); PM4 decode → command processor → render state →
+  vk_translate; **RDNA2→SPIR-V recompiler** (~45 opcodes, vertex+fragment verified on Vulkan).
+  Current fault is the AGC→Vulkan **resource-backing boundary** — next is the real GPU resource
+  layer. See [`docs/GRAPHICS.md`](docs/GRAPHICS.md).
 
-See [`docs/ROADMAP.md`](docs/ROADMAP.md) for milestones and
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design.
+See [`docs/ROADMAP.md`](docs/ROADMAP.md) for milestones, [`docs/GRAPHICS.md`](docs/GRAPHICS.md) for
+the graphics frontier, and [`docs/VERIFICATION.md`](docs/VERIFICATION.md) for the agentic-first
+(programmatic, no-manual-eyeballing) verification strategy.
 
 ## Layout
 ```
 prosper/
-  docs/            architecture, roadmap, findings
-  tools/
-    self_dump/     SELF/ELF inspector — NID import extractor  (built, working)
-  src/             (loader / hle / kernel / gpu / io — coming, per roadmap)
+  docs/            architecture, roadmap, findings, graphics, verification
+  src/self/        SELF/ELF parsing → relocatable module image
+  src/loader/      multi-module linker + global export table
+  src/hle/         HLE of Sony libraries (libc, libkernel, AGC/graphics), NID hashing
+  src/host/        host execution: image mapping, stubs, fault handling (Linux)
+  src/gpu/         AGC→Vulkan: PM4 decode, command processor, render state,
+                   vk_translate, RDNA2→SPIR-V recompiler
+  tools/           self_dump, boot_trace, shader_histo, imgdump
+  tests/           unit + boot + Vulkan-execution tests (ctest)
   CMakeLists.txt
 ```
 

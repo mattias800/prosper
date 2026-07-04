@@ -18,7 +18,7 @@ prosper is therefore shaped like Wine, not like an emulator: the hard work is
   `futex`, …),
 - **ABI translation** where the guest's FreeBSD/SysV conventions differ from the host, and
 - **Graphics translation** (the eventual end goal): PS5 **AGC** → Vulkan, including an RDNA2 shader
-  recompiler. This is the largest remaining piece and is intentionally *not* the current focus.
+  recompiler. This is the largest remaining piece and is now the **active frontier** (see Status).
 
 Because the PS5 and Steam Deck / AMD Linux machines share the same RDNA2 GPU family, Linux is the
 natural primary target and the long-term dream is running on that hardware.
@@ -28,20 +28,36 @@ natural primary target and the long-term dream is running on that hardware.
 The current bring-up target is a real Unity/IL2CPP title. Starting from its (user-supplied,
 **unencrypted-segment**) module set, prosper today:
 
+**Boot & runtime (host-side OS/ABI/HLE):**
 - ✅ Parses `SELF`/`ELF`, builds a relocatable image, resolves Sony **NID**-hashed imports.
 - ✅ Links the game's modules together with a global export table + per-import HLE stubs.
 - ✅ Runs the Sony CRT, C++ global constructors, and `il2cpp` startup.
 - ✅ Implements enough `libkernel`/`libc` for real memory management (virtual + direct memory),
   threads (pthreads, TLS, mutexes/conds, event flags, semaphores, `sync_on_address` futex),
   time, file I/O (with `/app0` path translation), and locale/ctype.
-- ✅ Loads the game's C# metadata and **spins up the full IL2CPP GC + worker thread pool.**
-- 🚧 **Currently blocked on a threading deadlock during `il2cpp_init`** — precisely diagnosed to a
-  counting semaphore that never gets posted while the whole thread pool is parked. This is being
-  fixed *correctly* (no forced wakeups / fakes).
-- ⬜ Graphics (VideoOut window, AGC→Vulkan, shader recompiler) — future work.
+- ✅ Loads the game's C# metadata, spins up the full IL2CPP GC + worker thread pool, and boots
+  **through** IL2CPP init into Unity's `GfxDevice` bring-up (it loads *unity default resources*).
 
-Development is **agentic-first**: correctness is verified programmatically (unit tests, structured
-logs, purpose-built debug tooling like `boot_trace` and `PROSPER_SYNCLOG`) rather than by hand.
+**Graphics (AGC → Vulkan) — the active frontier:**
+- ✅ **AGC command frontend complete:** `sceAgcCreateShader` (relocates the embedded RDNA2 shader
+  ELFs, registers all 36 game shaders) and `sceAgcDriverSubmitDcb`. The boot now clears the entire
+  AGC path with **zero unimplemented `libSceAgc` calls remaining**.
+- ✅ **PM4 command-buffer pipeline:** the game's *real* submitted command buffer is decoded
+  (`Dcb` → PM4 packets) and folded into a GPU register-state, driving draw/render-state extraction
+  → `vk_translate` → Vulkan.
+- ✅ **RDNA2 → SPIR-V shader recompiler** (not a CPU emulator for the GPU either — we recompile
+  the ISA). Covers ~45 opcodes prioritized against a histogram of the game's *own* shaders
+  (`shader_histo`), across scalar/vector/float/int/bitwise/convert/compare/select/bitfield. Both
+  **vertex and fragment** shaders recompiled from real RDNA2 render verified frames offscreen.
+- 🚧 **Current fault: the AGC→Vulkan resource-backing boundary** (`eboot+0xba6e08`). Unity created
+  a GPU resource but its backing (`+0x140`) was never built, because the AGC resource path returns
+  handles without real Vulkan objects. Next: the real GPU resource layer (textures/buffers/render
+  targets). Diagnosed precisely; *not* papered over with a fake object.
+
+Development is **agentic-first**: correctness is verified programmatically — 21 self-checking tests
+under `ctest` (including a headless Vulkan/llvmpipe harness that runs recompiled shaders and asserts
+numeric/pixel results), structured logs, and purpose-built tooling (`boot_trace`, `shader_histo`,
+`PROSPER_PEEK`) — rather than by hand.
 
 ## Legal / ethical
 
@@ -71,11 +87,13 @@ A static-linked Windows (mingw) build works for the host-agnostic parts as well.
 prosper/
   src/self/       SELF/ELF parsing → relocatable module image
   src/loader/     multi-module linker + global export table
-  src/hle/        HLE of Sony libraries (libc, libkernel, services), NID hashing
+  src/hle/        HLE of Sony libraries (libc, libkernel, AGC/graphics, services), NID hashing
   src/host/       host execution: image mapping, stubs, fault handling (Linux)
-  tools/          debug tooling (boot_trace, self_dump, …)
-  tests/          unit + boot tests (run under ctest)
-  docs/           ROADMAP.md, FINDINGS.md
+  src/gpu/        AGC→Vulkan: PM4 decode, command processor, render state,
+                  vk_translate, and the RDNA2→SPIR-V shader recompiler
+  tools/          debug tooling (boot_trace, self_dump, shader_histo, imgdump, …)
+  tests/          unit + boot + Vulkan-execution tests (run under ctest)
+  docs/           ROADMAP.md, FINDINGS.md, GRAPHICS.md, VERIFICATION.md
 ```
 
 ## License
