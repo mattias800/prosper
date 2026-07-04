@@ -84,11 +84,53 @@ HLE(g_agc_ctx_init) {   // a0 = context pointer (device+0x48)
     return 0;
 }
 
-// --- libSceVideoOut (display / frame presentation). Headless: accept opens/flips and simulate
-// flip completion so the game's render loop advances (submit -> wait completion -> submit next).
+// --- libSceVideoOut (display / frame presentation). ------------------------------------------
+// Models a single connected 1080p60 display. Query functions return real, self-consistent values
+// (not zeroed stubs) so the game's display setup — resolution query, output configuration, buffer
+// registration — sees a normal main-bus HDMI output. Struct layouts are the Orbis/Gen5 VideoOut
+// ABI (cross-checked vs Kyty Graphics/VideoOut.cpp + shadPS4 videoout/video_out.h). Frame
+// presentation is still simulated (no swapchain yet); the swapchain lands behind these once a real
+// window/surface exists. All output-struct writes are size-exact — over-writing smashes the guest's
+// stack canary (cf. the historical f_fstat bug).
 namespace {
-    int g_vo_handle = 0;
-    uint64_t g_flip_count = 0;   // incremented per SubmitFlip so GetFlipStatus shows progress
+    int      g_vo_handle = 0;
+    uint64_t g_flip_count = 0;    // incremented per SubmitFlip so GetFlipStatus shows progress
+    uint64_t g_vblank_count = 0;
+
+    // The one display we advertise. 1920x1080 @ 59.94Hz (refresh-rate enum 3), 16:9, ~50".
+    constexpr uint32_t kDispW = 1920, kDispH = 1080;
+    constexpr uint64_t kRefresh5994 = 3;   // SCE_VIDEO_OUT_REFRESH_RATE_59_94HZ
+
+    void vo_argtrace(const char* fn, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
+        if (getenv("PROSPER_GFXLOG"))
+            fprintf(stderr, "[vo] %s a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx\n", fn,
+                    (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
+                    (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)a5);
+    }
+
+    // Swapchain scaffolding: the set of display buffers the game registers via RegisterBuffers2.
+    // These GPU addresses are the framebuffers the game flips between (triple-buffered here). The
+    // back-half present path turns each into a swapchain image; SubmitFlip picks by buffer index.
+    // Recorded now so that surface is ready even before real presentation exists.
+    struct DisplayConfig {
+        uint32_t width = 0, height = 0;
+        uint64_t pixel_format = 0;
+        uint32_t tiling_mode = 0;
+        int      buffer_num = 0;
+        uint64_t buffer_addr[16] = {0};   // guest GPU-VA of each registered framebuffer
+        bool     configured = false;
+    };
+    DisplayConfig g_display;
+    struct VideoOutBuffers { const void* data; const void* metadata; const void* reserved[2]; };
+}
+
+// Exposed for the back-half present path + tests: the registered display surface.
+extern "C" int      prosper_vo_buffer_count()   { return g_display.buffer_num; }
+extern "C" uint32_t prosper_vo_display_width()  { return g_display.width; }
+extern "C" uint32_t prosper_vo_display_height() { return g_display.height; }
+extern "C" uint64_t prosper_vo_display_format() { return g_display.pixel_format; }
+extern "C" uint64_t prosper_vo_buffer_addr(int i) {
+    return (i >= 0 && i < g_display.buffer_num) ? g_display.buffer_addr[i] : 0;
 }
 HLE(g_vo_open)        { gfx_tick(); return (uint64_t)(int64_t)(++g_vo_handle + 0x1000); }  // positive handle
 HLE(g_vo_close)       { return 0; }
@@ -102,7 +144,83 @@ HLE(g_vo_flipstatus)  { // (handle, SceVideoOutFlipStatus* status): report our s
               *(int32_t*) (s + 0x38) = 0; }                   // currentBuffer
     return 0;
 }
-HLE(g_vo_resstatus)   { if (a1) memset((void*)(uintptr_t)a1, 0, 0x20); return 0; }  // SceVideoOutResolutionStatus ~0x20
+// SceVideoOutResolutionStatus (0x20 bytes, Kyty VideoOutResolutionStatus): report a real 1080p60
+// panel instead of the previous all-zero (which advertised a 0x0 display).
+HLE(g_vo_resstatus)   {
+    if (a1) { uint8_t* s = (uint8_t*)(uintptr_t)a1; memset(s, 0, 0x20);
+              *(uint32_t*)(s + 0x00) = kDispW;   *(uint32_t*)(s + 0x04) = kDispH;   // full w/h
+              *(uint32_t*)(s + 0x08) = kDispW;   *(uint32_t*)(s + 0x0c) = kDispH;   // pane w/h
+              *(uint64_t*)(s + 0x10) = kRefresh5994;
+              *(float*)   (s + 0x18) = 50.0f; }                                     // screen size (inch)
+    return 0;
+}
+
+// sceVideoOutGetVblankStatus (SceVideoOutVblankStatus, 0x28 bytes): advancing vblank counter so any
+// vsync wait/poll sees progress.
+HLE(g_vo_vblankstatus) {
+    if (a1) { uint8_t* s = (uint8_t*)(uintptr_t)a1; memset(s, 0, 0x28);
+              *(uint64_t*)(s + 0x00) = ++g_vblank_count; }   // count
+    return 0;
+}
+// sceVideoOutGetDeviceCapabilityInfo (SceVideoOutDeviceCapabilityInfo: single u64 capability).
+// Advertise a plain SDR display (no HDR/BT2020) — capability 0.
+HLE(g_vo_devcap) { if (a1) *(uint64_t*)(uintptr_t)a1 = 0; return 0; }
+
+// sceVideoOutIsOutputSupported (Nv8c-Kb+DUM): (port_type, mode/feature) -> bool. A standard main-bus
+// output supports the queried mode → 1.
+HLE(g_vo_is_output_supported) { vo_argtrace("IsOutputSupported", a0,a1,a2,a3,a4,a5); return 1; }
+
+// sceVideoOutSetBufferAttribute2 (PjS5uASwcV8): fill the caller's VideoOutBufferAttribute2 (0x50
+// bytes, Kyty layout) from (attr, pixel_format, tiling_mode, width, height, option, [dcc_control,
+// dcc_cb_clear on stack]). Mirrors Kyty's setter. Size-exact write.
+HLE(g_vo_set_buffer_attribute2) {  // a0=attr* a1=pixel_format a2=tiling a3=width a4=height a5=option
+    vo_argtrace("SetBufferAttribute2", a0,a1,a2,a3,a4,a5);
+    if (!a0) return 0;
+    uint8_t* p = (uint8_t*)(uintptr_t)a0; memset(p, 0, 0x50);
+    *(uint32_t*)(p + 0x04) = (uint32_t)a2;   // tiling_mode
+    *(uint32_t*)(p + 0x08) = 0;              // aspect_ratio (16:9)
+    *(uint32_t*)(p + 0x0c) = (uint32_t)a3;   // width
+    *(uint32_t*)(p + 0x10) = (uint32_t)a4;   // height
+    *(uint64_t*)(p + 0x18) = a5;             // option
+    *(uint64_t*)(p + 0x20) = a1;             // pixel_format
+    return 0;
+}
+
+// sceVideoOutRegisterBuffers2 (rKBUtgRrtbk): (handle, set_index, buffer_index_start, buffers,
+// buffer_num, attribute, [category, option on stack]). Validate ranges like Kyty and accept. The
+// buffers' GPU backing becomes swapchain images once the swapchain exists; for now, registration
+// succeeds so the game proceeds to flips.
+HLE(g_vo_register_buffers2) {  // a0=handle a1=set_index a2=buffer_index_start a3=buffers a4=buffer_num a5=attribute
+    vo_argtrace("RegisterBuffers2", a0,a1,a2,a3,a4,a5);
+    int start = (int)a2, num = (int)a4;
+    if (!a3 || !a5) return (uint64_t)(int64_t)-1;
+    if (start < 0 || start > 15 || num < 1 || num > 16 || start + num > 16) return (uint64_t)(int64_t)-1;
+    // Record the display surface (swapchain scaffolding). attribute is the 0x50-byte
+    // VideoOutBufferAttribute2 we fill in SetBufferAttribute2: width@0x0c, height@0x10, format@0x20.
+    const uint8_t* attr = (const uint8_t*)(uintptr_t)a5;
+    g_display.width        = *(const uint32_t*)(attr + 0x0c);
+    g_display.height       = *(const uint32_t*)(attr + 0x10);
+    g_display.pixel_format = *(const uint64_t*)(attr + 0x20);
+    g_display.tiling_mode  = *(const uint32_t*)(attr + 0x04);
+    const auto* bufs = (const VideoOutBuffers*)(uintptr_t)a3;
+    g_display.buffer_num = num;
+    for (int i = 0; i < num && start + i < 16; i++)
+        g_display.buffer_addr[start + i] = (uint64_t)(uintptr_t)bufs[i].data;
+    g_display.configured = true;
+    if (getenv("PROSPER_GFXLOG"))
+        fprintf(stderr, "[vo] display surface: %ux%u fmt=0x%llx %d buffers registered\n",
+                g_display.width, g_display.height, (unsigned long long)g_display.pixel_format, num);
+    return 0;
+}
+
+// sceVideoOutConfigureOutput (w0hLuNarQxY): set the output mode (resolution/refresh/format). We only
+// advertise one mode (1080p60), so accept the configuration.
+HLE(g_vo_configure_output) { vo_argtrace("ConfigureOutput", a0,a1,a2,a3,a4,a5); return 0; }
+
+// sceVideoOutGetOutputStatus (utPrVdxio-8): (handle, status*). PASS 1 — trace only, do NOT write the
+// output struct until its exact size is confirmed from a real call (over-writing smashes the guest
+// stack canary). Filled in once the arg/size is captured.
+HLE(g_vo_get_output_status) { vo_argtrace("GetOutputStatus", a0,a1,a2,a3,a4,a5); return 0; }
 
 // Diagnostic tracer for the (undocumented) libSceAgc / libSceAgcDriver calls: logs the NID, the guest
 // callsite, and all six args (gated on PROSPER_GFXLOG). Behaviour is identical to the unimplemented
@@ -192,7 +310,16 @@ void register_graphics_hle() {
     R("sceVideoOutSetFlipRate", g_vo_close);    R("sceVideoOutAddFlipEvent", g_vo_close);
     R("sceVideoOutGetFlipStatus", g_vo_flipstatus);
     R("sceVideoOutGetResolutionStatus", g_vo_resstatus);
+    R("sceVideoOutGetVblankStatus", g_vo_vblankstatus);
+    R("sceVideoOutGetDeviceCapabilityInfo", g_vo_devcap);
     R("sceVideoOutRegisterBuffers", g_vo_close);R("sceVideoOutSetBufferAttribute", g_vo_close);
+    // PS5 "2"/query variants — the 5 previously-unimplemented VideoOut NIDs (resolved via shadPS4
+    // aerolib + Kyty VideoOut.cpp). Registered by raw NID (PS5-specific, not in our name DB).
+    RN("Nv8c-Kb+DUM", g_vo_is_output_supported);   // sceVideoOutIsOutputSupported
+    RN("PjS5uASwcV8", g_vo_set_buffer_attribute2);  // sceVideoOutSetBufferAttribute2
+    RN("rKBUtgRrtbk", g_vo_register_buffers2);       // sceVideoOutRegisterBuffers2
+    RN("utPrVdxio-8", g_vo_get_output_status);        // sceVideoOutGetOutputStatus
+    RN("w0hLuNarQxY", g_vo_configure_output);          // sceVideoOutConfigureOutput
     #undef R
     #undef RN
 }

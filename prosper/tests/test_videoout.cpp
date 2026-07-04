@@ -1,0 +1,89 @@
+// test_videoout — guards the libSceVideoOut HLE (hle_graphics.cpp): the query/config functions must
+// return real, self-consistent 1080p60 values (not zeroed stubs), and the display-buffer registration
+// (swapchain scaffolding) must record the surface the game set up. Drives the functions through the
+// NID registry exactly as the guest does, then asserts the reported display + recorded buffers.
+#include "../src/hle/dispatch.hpp"
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+
+using namespace prosper;
+
+extern "C" int      prosper_vo_buffer_count();
+extern "C" uint32_t prosper_vo_display_width();
+extern "C" uint32_t prosper_vo_display_height();
+extern "C" uint64_t prosper_vo_display_format();
+extern "C" uint64_t prosper_vo_buffer_addr(int i);
+
+static int fails = 0;
+#define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
+                         else       { printf("  [ok]   %s\n", m); } } while (0)
+
+int main() {
+    printf("== test_videoout ==\n");
+    register_builtin_hle();
+
+    auto res    = Hle::lookup(nid_hash("sceVideoOutGetResolutionStatus"));
+    auto vbl    = Hle::lookup(nid_hash("sceVideoOutGetVblankStatus"));
+    auto cap    = Hle::lookup(nid_hash("sceVideoOutGetDeviceCapabilityInfo"));
+    auto issup  = Hle::lookup("Nv8c-Kb+DUM");   // IsOutputSupported
+    auto setba2 = Hle::lookup("PjS5uASwcV8");   // SetBufferAttribute2
+    auto regb2  = Hle::lookup("rKBUtgRrtbk");   // RegisterBuffers2
+    auto cfg    = Hle::lookup("w0hLuNarQxY");   // ConfigureOutput
+    CHECK(res && vbl && cap && issup && setba2 && regb2 && cfg, "VideoOut functions registered");
+    if (!(res && vbl && cap && issup && setba2 && regb2 && cfg)) { printf("== FAIL ==\n"); return 1; }
+
+    // Resolution: real 1080p @ 59.94Hz (refresh enum 3), not zeroed.
+    uint8_t rs[0x20]; memset(rs, 0xEE, sizeof rs);
+    res(0x1001, (uint64_t)(uintptr_t)rs, 0, 0, 0, 0);
+    CHECK(*(uint32_t*)(rs + 0x00) == 1920 && *(uint32_t*)(rs + 0x04) == 1080, "resolution 1920x1080 (full)");
+    CHECK(*(uint32_t*)(rs + 0x08) == 1920 && *(uint32_t*)(rs + 0x0c) == 1080, "resolution 1920x1080 (pane)");
+    CHECK(*(uint64_t*)(rs + 0x10) == 3, "refresh rate = 59.94Hz (enum 3)");
+
+    // Vblank counter advances across calls.
+    uint8_t vb[0x28];
+    vbl(0x1001, (uint64_t)(uintptr_t)vb, 0, 0, 0, 0); uint64_t c0 = *(uint64_t*)vb;
+    vbl(0x1001, (uint64_t)(uintptr_t)vb, 0, 0, 0, 0); uint64_t c1 = *(uint64_t*)vb;
+    CHECK(c1 == c0 + 1, "vblank counter advances");
+
+    // Device capability: plain SDR display (capability 0).
+    uint64_t dc = 0xDEAD;
+    cap(0x1001, (uint64_t)(uintptr_t)&dc, 0, 0, 0, 0);
+    CHECK(dc == 0, "device capability = 0 (SDR)");
+
+    // IsOutputSupported → supported.
+    CHECK(issup(0x1001, 0xd000000a, 0, 0, 0, 0) == 1, "IsOutputSupported returns 1");
+
+    // SetBufferAttribute2 fills the 0x50 attribute struct from (fmt, tiling, w, h, option).
+    uint8_t attr[0x50]; memset(attr, 0xEE, sizeof attr);
+    uint64_t fmt = 0x8000000000000000ull;   // the PS5 format the game requests (A8R8G8B8 sRGB)
+    setba2((uint64_t)(uintptr_t)attr, fmt, 0 /*tiling*/, 1920, 1080, 0 /*option*/);
+    CHECK(*(uint32_t*)(attr + 0x0c) == 1920 && *(uint32_t*)(attr + 0x10) == 1080, "attribute width/height set");
+    CHECK(*(uint64_t*)(attr + 0x20) == fmt, "attribute pixel_format set");
+    CHECK(*(uint32_t*)(attr + 0x04) == 0, "attribute tiling_mode set");
+
+    // ConfigureOutput accepts the (single advertised) mode.
+    CHECK(cfg(0x1001, 1, 0, 0, 0, 0) == 0, "ConfigureOutput accepted");
+
+    // RegisterBuffers2: triple-buffered surface. buffers = array of VideoOutBuffers {data, ...}.
+    struct VOB { const void* data; const void* metadata; const void* reserved[2]; };
+    uint8_t fb0[16], fb1[16], fb2[16];
+    VOB buffers[3] = { {fb0,0,{0,0}}, {fb1,0,{0,0}}, {fb2,0,{0,0}} };
+    uint64_t rc = regb2(0x1001, 0 /*set*/, 0 /*start*/, (uint64_t)(uintptr_t)buffers, 3, (uint64_t)(uintptr_t)attr);
+    CHECK(rc == 0, "RegisterBuffers2 accepted 3 buffers");
+
+    // Swapchain scaffolding recorded the surface.
+    CHECK(prosper_vo_buffer_count() == 3, "registry recorded 3 display buffers");
+    CHECK(prosper_vo_display_width() == 1920 && prosper_vo_display_height() == 1080, "registry recorded 1080p surface");
+    CHECK(prosper_vo_display_format() == fmt, "registry recorded the pixel format");
+    CHECK(prosper_vo_buffer_addr(0) == (uint64_t)(uintptr_t)fb0 &&
+          prosper_vo_buffer_addr(2) == (uint64_t)(uintptr_t)fb2, "registry recorded each framebuffer address");
+
+    // Range validation: out-of-range buffer counts are rejected.
+    CHECK(regb2(0x1001, 0, 0, (uint64_t)(uintptr_t)buffers, 99, (uint64_t)(uintptr_t)attr) != 0,
+          "RegisterBuffers2 rejects an out-of-range buffer_num");
+
+    if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
+    printf("== PASS ==\n");
+    return 0;
+}
