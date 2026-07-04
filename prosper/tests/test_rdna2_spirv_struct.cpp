@@ -96,6 +96,26 @@ int main() {
     }
     printf("  [ok]   signed kernel SPIR-V declares signed i32 with a nonzero id\n");
 
+    // v_cmpx_* narrows EXEC. Compute has a predicated store for that, but graphics-stage exporters
+    // do not yet model EXEC-masked export/discard, so fragment/vertex recompilation must reject it.
+    const uint32_t cmpx_fragment[] = {
+        0x7DA80300u, 0xF800180Fu, 0x03020100u, 0xBF810000u,
+    };
+    if (!recompile_fragment(cmpx_fragment, sizeof(cmpx_fragment) / sizeof(cmpx_fragment[0])).empty()) {
+        printf("  [FAIL] fragment cmpx shader was accepted without EXEC-masked export support\n");
+        return 1;
+    }
+    printf("  [ok]   fragment cmpx shader is rejected until EXEC-masked export is modeled\n");
+
+    const uint32_t cmpx_vertex[] = {
+        0x7DA80300u, 0xF80008CFu, 0x03020100u, 0xBF810000u,
+    };
+    if (!recompile_vertex(cmpx_vertex, sizeof(cmpx_vertex) / sizeof(cmpx_vertex[0])).empty()) {
+        printf("  [FAIL] vertex cmpx shader was accepted without EXEC-masked export support\n");
+        return 1;
+    }
+    printf("  [ok]   vertex cmpx shader is rejected until EXEC-masked export is modeled\n");
+
     printf("== PASS ==\n");
     return 0;
 }
