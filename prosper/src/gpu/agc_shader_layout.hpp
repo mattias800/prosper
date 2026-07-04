@@ -65,9 +65,9 @@ void buffer_format(uint32_t dfmt, uint32_t nfmt, DataFormat* out_fmt, uint32_t* 
 // offset_dw (Kyty ShaderParseUsage2 reads them from the user_sgpr block, not the header). Descriptor
 // gpu_addr is a 1:1-mapped guest pointer the pipeline binds directly.
 //
-// NOTE (flagged for agent 1): the doc's signature was `build_shader_resources(const Shader&)`, but the
-// descriptor bytes are in the user-data SGPRs, so the block is required. Currently fills constant
-// buffers (sharp[3]) — stage 1; vertex buffers (direct type 8/10) are the next stage.
+// Signature takes the user-data SGPR block because the V# descriptor bytes live there (confirmed with
+// agent 1). Fills constant buffers (sharp[3], INDIRECT srt_offset provenance) + vertex buffers
+// (direct usage types 8/10, DIRECT sgpr_base provenance). Textures/samplers follow.
 ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                                            const uint32_t* user_sgprs, uint32_t num_user_sgprs);
 
