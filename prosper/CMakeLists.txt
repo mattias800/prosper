@@ -34,17 +34,27 @@ endif()
 enable_testing()
 # Path to the (gitignored) local game dump; override with -DGAME_DUMP=...
 set(GAME_DUMP "${CMAKE_SOURCE_DIR}/../PPSA24651-app0" CACHE PATH "Local PS5 game dump root")
+set(HAVE_GAME_DUMP OFF)
+if(EXISTS "${GAME_DUMP}/eboot.bin")
+  set(HAVE_GAME_DUMP ON)
+else()
+  message(STATUS "Game dump not found at ${GAME_DUMP} — skipping dump-backed tests")
+endif()
 
 if(TARGET prosper_core)
   add_executable(test_module tests/test_module.cpp)
   target_link_libraries(test_module PRIVATE prosper_core)
-  add_test(NAME module_loads_eboot
-           COMMAND test_module "${GAME_DUMP}/eboot.bin")
+  if(HAVE_GAME_DUMP)
+    add_test(NAME module_loads_eboot
+             COMMAND test_module "${GAME_DUMP}/eboot.bin")
+  endif()
 
   add_executable(test_nid tests/test_nid.cpp)
   target_link_libraries(test_nid PRIVATE prosper_core)
-  add_test(NAME nid_hash_matches_imports
-           COMMAND test_nid "${GAME_DUMP}/eboot.bin")
+  if(HAVE_GAME_DUMP)
+    add_test(NAME nid_hash_matches_imports
+             COMMAND test_nid "${GAME_DUMP}/eboot.bin")
+  endif()
 
   add_executable(test_hle_registered tests/test_hle_registered.cpp)
   target_link_libraries(test_hle_registered PRIVATE prosper_core)
@@ -113,13 +123,17 @@ if(TARGET prosper_core)
 
     add_executable(test_trap_linux tests/test_trap_linux.cpp)
     target_link_libraries(test_trap_linux PRIVATE prosper_core)
-    add_test(NAME trap_identifies_imports
-             COMMAND test_trap_linux "${GAME_DUMP}")
+    if(HAVE_GAME_DUMP)
+      add_test(NAME trap_identifies_imports
+               COMMAND test_trap_linux "${GAME_DUMP}")
+    endif()
 
     add_executable(test_boot_linux tests/test_boot_linux.cpp)
     target_link_libraries(test_boot_linux PRIVATE prosper_core)
-    add_test(NAME boot_reaches_first_syscall
-             COMMAND test_boot_linux "${GAME_DUMP}")
+    if(HAVE_GAME_DUMP)
+      add_test(NAME boot_reaches_first_syscall
+               COMMAND test_boot_linux "${GAME_DUMP}")
+    endif()
 
     # Regression test for the real setjmp/longjmp impl (x86-64 asm; used by the GC's root scan).
     add_executable(test_setjmp tests/test_setjmp.cpp)
