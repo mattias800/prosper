@@ -130,6 +130,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_shader_resources PRIVATE prosper_core)
   add_test(NAME shader_resource_contract COMMAND test_shader_resources)
 
+  # Front-half resource-table builder + V# descriptor decode (agc_shader_layout.cpp): shader user_data
+  # + user-data SGPRs -> ShaderResourceTable (constant buffers, stage 1). Pure/cross-platform.
+  add_executable(test_build_shader_resources tests/test_build_shader_resources.cpp)
+  target_link_libraries(test_build_shader_resources PRIVATE prosper_core)
+  add_test(NAME build_shader_resources COMMAND test_build_shader_resources)
+
   # M2+: real memory mapping, trap, boot, and the boot-trace debug tool (Linux only).
   if(UNIX AND NOT APPLE)
     add_executable(boot_trace tools/boot_trace/boot_trace.cpp)
