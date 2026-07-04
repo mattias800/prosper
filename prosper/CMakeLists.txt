@@ -114,6 +114,12 @@ if(TARGET prosper_core)
     target_link_libraries(test_agc_dcb PRIVATE prosper_core)
     add_test(NAME agc_dcb_pm4 COMMAND test_agc_dcb)
 
+    # End-to-end AGC submit: build a Dcb via the HLE fns -> sceAgcDriverSubmitDcb -> CommandProcessor
+    # folds it into a GpuState. Locks in the "first real command buffer executes" milestone.
+    add_executable(test_agc_submit tests/test_agc_submit.cpp)
+    target_link_libraries(test_agc_submit PRIVATE prosper_core)
+    add_test(NAME agc_submit_to_gpustate COMMAND test_agc_submit)
+
     # Graphics-phase foundation + agentic-first verification harness: headless offscreen Vulkan
     # (render/clear -> readback -> pixel/CRC assert). Only built if Vulkan dev files are present.
     find_package(Vulkan QUIET)
