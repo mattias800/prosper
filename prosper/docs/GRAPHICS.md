@@ -146,6 +146,28 @@ or `[+0xc0]` is populated from **resource bindings** (textures/samplers/cbuffers
 `[+0xe0]` contents directly (the reflection records) and check the shader `user_data`/resource tables,
 not the semantics. `PROSPER_PIPETRACE` retained (semantic + raw-header logging).
 
+## ✔ SKIP PROBE (2026-07-04): the null companion is systemic, not a single gap → STOP hunting per-object writers
+
+Env-gated diagnostic `PROSPER_SKIP_NULL_COMPANION` (exec_image_linux.cpp; default off): at the reader
+`eboot+0xba6e08`, log the object's state and redirect RIP to the reader's own skip label
+`eboot+0xba6e40` (where its type/flag branches already land), continuing as if the companion weren't
+needed. A probe to reveal the *shape* past the fault — NOT a fix (companions are still not real).
+
+Result of one run: **4 bounded skips** (distinct objects, all `[+0x140]=0`; resident-flag low byte
+`[+0x1a0]&0xff == 0` on every one — none processed), then the boot advances **past `0xba6e08` to a
+NEW null-object deref at `eboot+0x95c823`** (`mov (%r14),%rdi; mov (%rdi),%rax` with `[r14]`→null).
+
+**Interpretation (per the agreed decision tree): systemic, not a narrow gap.** It is NOT an infinite
+cascade of the same deref (bounded at the collection size = 4), and it does NOT reach a frame — it
+lands on the *next* null GfxDevice object. So the pipeline-residency subsystem simply never ran: every
+pipeline lacks a companion and the resident flag, and past that lies another null object of the same
+"placeholder is zeroed" kind. **Chasing per-object `[+0x140]` writers is unproductive — skipping one
+only reveals the next null.** The productive direction is systemic: drive Unity's deferred
+processing/residency pass (the "deferred to a submit/flip/frame boundary we never pump" theme — no
+`SubmitFlip` fires before the fault), which ties into the swapchain scaffolding (`prosper_vo_*`) and
+the back-half pipeline realization. Next: find what triggers the residency pass and whether pumping
+submit/flip fires it, rather than reconstructing per-object writers.
+
 ## 🔎 THE [+0x140] WRITER CHAIN (2026-07-04) — host-side RE, found the constructor + gate, root is a pipeline-reflection predicate
 
 Agent-2 (correctly) reassigned this to the front-half: the companion is built pre-submit, upstream of
