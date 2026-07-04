@@ -255,5 +255,44 @@ void register_kernel_mem_hle() {
 } // namespace prosper
 
 #else
-namespace prosper { void register_kernel_mem_hle() {} }
+#include <atomic>
+#include <climits>
+#include <condition_variable>
+#include <cstdint>
+#include <mutex>
+
+namespace prosper {
+
+#define HLE(name) static uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
+                                       uint64_t a3, uint64_t a4, uint64_t a5)
+
+namespace {
+std::mutex g_sync_mx;
+std::condition_variable g_sync_cv;
+}
+
+HLE(k_wait_on_address) {
+    if (!a0) return 0;
+    auto& raw = *(uint32_t*)(uintptr_t)a0;
+    std::atomic_ref<uint32_t> addr(raw);
+    uint32_t expected = (uint32_t)a1;
+    std::unique_lock<std::mutex> lk(g_sync_mx);
+    while (addr.load(std::memory_order_acquire) == expected) g_sync_cv.wait(lk);
+    return 0;
+}
+
+HLE(k_wake_by_address) {
+    std::lock_guard<std::mutex> lk(g_sync_mx);
+    int n = a1 ? (int)a1 : INT_MAX;
+    if (n == 1) g_sync_cv.notify_one();
+    else        g_sync_cv.notify_all();
+    return 0;
+}
+
+void register_kernel_mem_hle() {
+    Hle::register_fn("Hc4CaR6JBL0", (HleFn)k_wait_on_address, "sceKernelWaitOnAddress?");
+    Hle::register_fn("q2y-wDIVWZA", (HleFn)k_wake_by_address, "sceKernelWakeByAddress?");
+}
+
+} // namespace prosper
 #endif

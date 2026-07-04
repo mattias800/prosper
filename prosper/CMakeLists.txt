@@ -50,6 +50,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_hle_registered PRIVATE prosper_core)
   add_test(NAME hle_functions_registered COMMAND test_hle_registered)
 
+  add_executable(test_sync_on_address tests/test_sync_on_address.cpp)
+  target_link_libraries(test_sync_on_address PRIVATE prosper_core)
+  add_test(NAME sync_on_address COMMAND test_sync_on_address)
+
   add_executable(test_agc_shader tests/test_agc_shader.cpp)
   target_link_libraries(test_agc_shader PRIVATE prosper_core)
   add_test(NAME agc_shader_create COMMAND test_agc_shader)
