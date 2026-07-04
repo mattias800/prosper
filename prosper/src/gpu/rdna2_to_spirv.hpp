@@ -30,4 +30,15 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords);
 // to a POS target write vec4(src0..3) to gl_Position. Returns {} if unsupported / no position export.
 std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords);
 
+// How much of a shader the recompiler currently covers (per-instruction), without requiring the
+// stream to be a complete vertex/fragment. `alu` = instructions emit_alu handles (VALU/scalar/
+// control-flow); `exports` = EXP (handled by the stage recompilers); `unsupported` = not yet handled
+// (memory ops / unknown), with the first such (format, opcode) recorded. A data-driven coverage metric.
+struct RecompileCoverage {
+    uint32_t total = 0, alu = 0, exports = 0, unsupported = 0;
+    int      first_bad_fmt = -1;   // Rdna2Format of the first unsupported instruction (-1 if none)
+    uint32_t first_bad_op  = 0;
+};
+RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords);
+
 } // namespace prosper::gpu

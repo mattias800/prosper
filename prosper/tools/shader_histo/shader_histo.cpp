@@ -10,6 +10,7 @@
 // Optional 2nd arg: write the largest shader's .shader_text to a file (for offline disassembly).
 #include "../../src/self/module.hpp"
 #include "../../src/gpu/rdna2_decode.hpp"
+#include "../../src/gpu/rdna2_to_spirv.hpp"
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -27,6 +28,9 @@ int main(int argc, char** argv) {
 
     std::map<std::pair<int, uint32_t>, uint32_t> histo;
     int shaders = 0; size_t total = 0, unknown = 0, maxsz = 0;
+    // Recompiler coverage aggregates (data-driven: how much of the REAL shaders we can translate now).
+    size_t cov_total = 0, cov_alu = 0, cov_exp = 0, cov_unsup = 0; int shaders_full = 0;
+    std::map<std::pair<int, uint32_t>, uint32_t> blockers;   // first-unsupported (fmt,op) -> shader count
     for (size_t i = 0; i + 64 < f.size(); i++) {
         if (!(f[i] == 0x7f && f[i+1] == 'E' && f[i+2] == 'L' && f[i+3] == 'F')) continue;
         auto inside = [&](uint64_t off, uint64_t len) {
@@ -59,6 +63,11 @@ int main(int argc, char** argv) {
             shaders++;
             for (auto& in : ins) { histo[{(int)in.fmt, in.opcode}]++; total++;
                                    if (in.fmt == Rdna2Format::Unknown) unknown++; }
+            // Per-shader recompiler coverage.
+            RecompileCoverage cov = recompile_coverage(code, sz/4);
+            cov_total += cov.total; cov_alu += cov.alu; cov_exp += cov.exports; cov_unsup += cov.unsupported;
+            if (cov.unsupported == 0) shaders_full++;
+            else blockers[{cov.first_bad_fmt, cov.first_bad_op}]++;
         }
     }
     printf("shaders=%d  total_insts=%zu  distinct(fmt,op)=%zu  unknown=%zu\n", shaders, total, histo.size(), unknown);
@@ -66,5 +75,15 @@ int main(int argc, char** argv) {
     const char* fn[] = {"SOP2","SOP1","SOPK","SOPC","SOPP","SMEM","VOP2","VOP1","VOPC","VOP3",
                         "VINTRP","DS","MUBUF","MTBUF","MIMG","FLAT","EXP","UNK"};
     for (auto& [k, c] : histo) printf("  %-6s op=0x%-4x x%u\n", fn[k.first], k.second, c);
+
+    // --- Recompiler coverage report (how much of the real shaders we can translate today) ---
+    double pct = cov_total ? 100.0 * (double)(cov_alu + cov_exp) / (double)cov_total : 0.0;
+    printf("\n== recompiler coverage ==\n");
+    printf("  instructions: alu=%zu + exports=%zu of %zu handled (%.1f%%), unsupported=%zu\n",
+           cov_alu, cov_exp, cov_total, pct, cov_unsup);
+    printf("  shaders fully covered: %d / %d\n", shaders_full, shaders);
+    printf("  top blockers (first unsupported inst per shader):\n");
+    for (auto& [k, c] : blockers)
+        printf("    %-6s op=0x%-4x blocks %u shader(s)\n", k.first < 0 ? "?" : fn[k.first], k.second, c);
     return 0;
 }

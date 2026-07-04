@@ -93,6 +93,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_pipeline_state PRIVATE prosper_core)
   add_test(NAME pipeline_state_resolve COMMAND test_pipeline_state)
 
+  # Recompiler coverage metric (pure): per-instruction support report used by shader_histo.
+  add_executable(test_recompile_coverage tests/test_recompile_coverage.cpp)
+  target_link_libraries(test_recompile_coverage PRIVATE prosper_core)
+  add_test(NAME recompile_coverage COMMAND test_recompile_coverage)
+
   # RDNA2 shader instruction-stream walker (first stage of the RDNA2->SPIR-V recompiler).
   add_executable(test_rdna2_decode tests/test_rdna2_decode.cpp)
   target_link_libraries(test_rdna2_decode PRIVATE prosper_core)

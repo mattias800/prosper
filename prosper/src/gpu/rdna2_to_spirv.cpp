@@ -513,13 +513,20 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // unconditional s_branch skips a block outright — neither is correct under linear
             // predication, so reject (fail loudly) rather than mis-execute.
             switch (in.opcode) {
-                case 0x00: break;                                  // s_nop — no-op
+                // Hints / sync with no effect in our synchronous SSA model — safe no-ops.
+                case 0x00:   // s_nop
+                case 0x0c:   // s_waitcnt        (no async memory latency to wait on)
+                case 0x20:   // s_inst_prefetch  (I-cache hint)
+                case 0x21:   // s_clause         (memory-clause scheduling hint)
+                case 0x22:   // s_wait_idle
+                case 0x7d:   // s_waitcnt_vscnt
+                    break;
                 case 0x04: case 0x05:                              // s_cbranch_scc0 / scc1
                 case 0x06: case 0x07:                              // s_cbranch_vccz / vccnz
                 case 0x08: case 0x09:                              // s_cbranch_execz / execnz
                     if (in.simm16 < 0) ok = false;                 // backward = loop -> unsupported
                     break;                                          // forward = no-op (predication covers it)
-                default: ok = false;                               // s_branch / s_setreg / etc. -> reject
+                default: ok = false;   // s_branch / s_sendmsg / s_barrier / s_setreg / etc. -> reject
             }
             return true;
         }
@@ -550,6 +557,30 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
     if (!rs.exec_narrowed) b.store_output(outbits);
     else                   b.store_output_pred(outbits, rs.exec);
     return b.finish();
+}
+
+RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
+    std::vector<Rdna2Inst> ins;
+    rdna2_walk(code, dwords, ins);
+
+    // A scratch builder/state so emit_alu can run; its emitted code is discarded — we only want `ok`.
+    SpirvCompute b; b.begin(1);
+    RegState rs; rs.vcc = b.bfalse(); rs.exec = b.btrue();
+
+    RecompileCoverage cov;
+    for (const auto& in : ins) {
+        if (in.is_end) break;
+        cov.total++;
+        if (in.fmt == Rdna2Format::EXP) { cov.exports++; continue; }   // handled by the stage recompilers
+        bool ok = true;
+        bool handled = emit_alu(b, rs, in, ok, /*allow_exec_update*/true) && ok;
+        if (handled) { cov.alu++; }
+        else {
+            cov.unsupported++;
+            if (cov.first_bad_fmt < 0) { cov.first_bad_fmt = (int)in.fmt; cov.first_bad_op = in.opcode; }
+        }
+    }
+    return cov;
 }
 
 std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords) {
