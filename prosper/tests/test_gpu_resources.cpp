@@ -45,6 +45,15 @@ int main() {
     CHECK(resource_get(h_vb + 100) == nullptr && !resource_valid(h_vb + 100),
           "an out-of-range handle is invalid (no silent aliasing)");
 
+    // Pipeline object: the GPU companion of a Unity GfxDevice pipeline (the null [obj+0x140]).
+    // gpu_addr/size point at the register-context blob; the back-half realizes it as a VkPipeline.
+    ResourceDesc pso{};
+    pso.kind = ResourceKind::Pipeline; pso.gpu_addr = 0xB0000000ull; pso.size = 512;
+    ResourceHandle h_pso = resource_create(pso);
+    const ResourceDesc* g_pso = resource_get(h_pso);
+    CHECK(g_pso && g_pso->kind == ResourceKind::Pipeline && g_pso->gpu_addr == 0xB0000000ull,
+          "pipeline-object descriptor round-trips (ShaderProgram/Pipeline kinds)");
+
     const ResourceDesc* pinned_rt = resource_get(h_rt);
     for (int i = 0; i < 4096; i++) {
         ResourceDesc tmp{};

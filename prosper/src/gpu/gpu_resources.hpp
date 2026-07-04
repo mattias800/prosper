@@ -19,10 +19,16 @@
 namespace prosper::gpu {
 
 enum class ResourceKind : uint32_t {
-    Buffer       = 0,   // vertex / index / constant buffer
-    Texture2D    = 1,   // sampled image
-    RenderTarget = 2,   // color attachment
-    DepthTarget  = 3,   // depth/stencil attachment
+    Buffer        = 0,   // vertex / index / constant buffer
+    Texture2D     = 1,   // sampled image
+    RenderTarget  = 2,   // color attachment
+    DepthTarget   = 3,   // depth/stencil attachment
+    // The GPU-resident companion of a Unity GfxDevice pipeline object (the null [obj+0x140] at
+    // eboot+0xba6e08). It carries the shader-register context (from CreateShader/CreatePrimState),
+    // and the back-half realizes it as a VkPipeline via render_state -> vk_translate. `gpu_addr`/
+    // `size` point at the register-context blob; format/width/height are unused for these.
+    ShaderProgram = 4,   // a single compiled shader stage's GPU object
+    Pipeline      = 5,   // a full pipeline-state object (register context -> VkPipeline)
 };
 
 // An AGC resource can serve several roles at once; usage is a bitmask.
