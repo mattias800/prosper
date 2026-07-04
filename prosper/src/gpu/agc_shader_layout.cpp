@@ -85,8 +85,31 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
         }
     }
 
-    // (Next stage) vertex buffers via direct_resource_offset type 8/10 — the V# is reached through a
-    // pointer in the SGPR block; deferred until stage 2 is wired with the recompiler.
+    // Vertex buffers (stage 2): Sony "direct" resources — the driver places the V# straight in the
+    // user-data SGPRs (contract's DIRECT provenance). Kyty ShaderParseUsage2 usage types: 8 = vertex
+    // buffer, 10 = vertex attrib; direct_resource_offset is indexed by usage type and the value is the
+    // SGPR index where that V# sits (0xffff = absent). We emit a VertexBuffer keyed by sgpr_base so
+    // the recompiler resolves each buffer_load_format_*'s SRSRC directly (no in-shader s_load).
+    if (const uint16_t* dro = ud->direct_resource_offset) {
+        for (uint16_t type = 0; type < ud->direct_resource_count; type++) {
+            if (type != 8 && type != 10) continue;              // vertex buffer / vertex attrib
+            uint32_t reg = dro[type];
+            if (reg == 0xffff) continue;
+            if ((uint64_t)reg + 4 > num_user_sgprs) continue;   // V# (4 dwords) must fit in the block
+            DecodedBufferDescriptor d = decode_buffer_descriptor(&user_sgprs[reg]);
+            ShaderResource r;
+            r.cls            = ResourceClass::VertexBuffer;
+            r.format         = d.format;          // Float32 for this game (dfmt {4,11,13,14}, nfmt 7)
+            r.num_components  = d.num_components;
+            r.binding        = binding++;
+            r.gpu_addr       = d.base;
+            r.size           = d.size_bytes;
+            r.stride         = d.stride;
+            r.sgpr_base      = reg;               // DIRECT provenance key (SRSRC SGPR index)
+            r.srt_offset     = 0xFFFFFFFFu;       // not s_loaded
+            table.resources.push_back(r);
+        }
+    }
     return table;
 }
 

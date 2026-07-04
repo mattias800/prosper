@@ -78,6 +78,25 @@ int main() {
     ShaderResourceTable t2 = build_shader_resources(shdr, sgprs, 32);
     CHECK(t2.resources.size() == 1, "empty sharp slot (0x7fff) skipped");
 
+    // --- vertex buffers: direct resource usage type 8 (V# inline in the user-data SGPRs) ------------
+    // A 16-entry direct_resource_offset table; type 8 (vertex buffer) points at a V# at SGPR dword 20.
+    uint16_t dro[16]; for (auto& x : dro) x = 0xffff;
+    make_vsharp(&sgprs[20], 0xC0000000ull, 12, 90, /*dfmt*/13, /*nfmt*/7);  // 32_32_32 FLOAT, stride 12
+    dro[8] = 20;                                                            // vertex buffer V# at sgpr 20
+    ud.direct_resource_offset = dro;
+    ud.direct_resource_count  = 16;
+    cbuf_sharps[1].bits = (uint16_t)(12 & 0x7fff);   // restore cbuf1 so we test cbuf + vbuf together
+
+    ShaderResourceTable t3 = build_shader_resources(shdr, sgprs, 32);
+    const ShaderResource* vb = t3.by_sgpr_base(20);
+    CHECK(vb != nullptr, "vertex buffer resolvable by sgpr_base (DIRECT provenance)");
+    CHECK(vb && vb->cls == ResourceClass::VertexBuffer, "type-8 direct resource -> VertexBuffer");
+    CHECK(vb && vb->format == DataFormat::Float32 && vb->num_components == 3, "vbuf format Float32 x3");
+    CHECK(vb && vb->gpu_addr == 0xC0000000ull && vb->stride == 12 && vb->size == 90 * 12, "vbuf base/stride/size");
+    CHECK(vb && vb->srt_offset == 0xFFFFFFFFu, "DIRECT vbuf leaves srt_offset unset");
+    CHECK(t3.by_srt_offset(4 * 4) != nullptr, "constant buffers still present alongside vertex buffers");
+    CHECK(t3.by_sgpr_base(99) == nullptr, "unknown sgpr_base -> null");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
