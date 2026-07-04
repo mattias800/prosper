@@ -100,7 +100,48 @@ initializers to construct valid GPU objects (correctness-first — no plausible-
 - Graphics libs are sparsely documented; most NIDs don't resolve to names — reverse-engineer from
   call args (`PROSPER_GFXLOG`) and `build-linux/tools/pltm` (maps a module GOT offset → NID).
 
-## THE BOOT BLOCKER (precisely located, 2026-07): `+kSrjIVxKFE` = AGC context init
+## ✅ THE BOOT BLOCKER — RESOLVED (2026-07-04): the "source" is the Shader; CreateShader was the gap
+
+**Resolution (supersedes the "SDK-gated / parked" conclusion below).** The null register-source
+global `[eboot+0x2048c60]` was never libSceAgc-private state: it is **field +0x10 of a 0x28-byte
+shader-registry slot at `0x2048c50`** — one of ~30 slots for Unity's built-in shaders, registered
+at graphics init by `eboot+0x14bc002..` → `eboot+0x14e74c0(slot, shader_elf, flag)`. That function
+parses a **shader ELF embedded in eboot rodata** (`e_machine=0xe0` EM_AMDGPU; sections
+`.shader_header` / `.shader_text`) and calls `sceAgcCreateShader(&slot->shader, header, code)`
+(NID `f3dg2CSgRKY`, via the arg-validating wrapper `eboot+0x3ae120`). Our stub returned 0 without
+writing `*dst`, so every slot's shader stayed null. The earlier static-scan conclusion "no eboot
+code writes the global" was the classic computed-addressing blind spot (same failure mode as the
+RGCTX hunt): the writer stores through `slot+0x10`, never through the literal address.
+
+The **register source object IS the Shader**: `SetSource` (eboot+0x3af400) reads `[src+0x08]`
+(user_data), `[src+0x28]` (specials), `[src+0x5a]` (type) — exactly the SDK Shader layout (Kyty
+Shader.h:974). The "classify table" ships inside each shader blob; nothing is fabricated.
+
+**Implemented in `hle_agc.cpp` (all real semantics, layout-verified via Kyty + the eboot disasm):**
+- `f3dg2CSgRKY` **sceAgcCreateShader** — relocates the header's self-relative pointers in place,
+  binds the code pointer, patches the leading `SPI/COMPUTE_PGM_LO/HI` sh-register pair (all five
+  stage pairs, beyond Kyty's ES/PS-only), guards double-relocation, writes `*dst`, and registers
+  the shader in a host-side registry (`prosper_agc_shader_count()`) for the AGC→Vulkan pipeline.
+- `V++UgBtQhn0` **sceAgcGetDataPacketPayloadAddress** — called from *inside* eboot's static AGC
+  code (register-bank prepare, `eboot+0x3af040`): the returned payload becomes the register bank
+  `[sub+0x10]`/`[sub+0x18]`. The banks live in the game's own Dcb data packets.
+- `n2fD4A+pb+g` **sceAgcCbSetShRegisterRangeDirect** — IT_SET_SH_REG range packet (+ the marker
+  NOP the real library emits).
+- `D9sr1xGUriE` **sceAgcCreatePrimState**, `HV4j+E0MBHE` **sceAgcCreateInterpolantMapping** —
+  pipeline registers derived from the bound shaders' specials/semantics (generalized semantic
+  matching instead of Kyty's hard-asserted identity layout).
+
+**Result:** all 36 built-in shaders register (`PROSPER_GFXLOG` shows `pgm_patched=1` on each), the
+whole `CreateWorkload` register-context chain (`0x3b5ea6` → `0x3b1562` → `0x3b1533` → `0x3afcff`)
+completes, and **no unimplemented libSceAgc call remains in the boot**. The boot now faults much
+later at `eboot+0xba6e08` (addr=0x8, non-AGC backtrace via `0xd3xxxx`/`0x15fxxxx`) — the next,
+separate frontier. Note: the game passes AGC interface version **13** (Kyty's Gen5 games used 8) —
+layouts verified against this title, not assumed from Kyty.
+
+Tooling added: `build-linux/imgdump <module> <out.img>` dumps a module's flat image for offline
+`objdump -D -b binary -m i386:x86-64` disassembly (how the registry writer was found).
+
+## (Historical) THE BOOT BLOCKER (located 2026-07): `+kSrjIVxKFE` = AGC context init
 
 The boot faults at `eboot+0x3b5ea6` inside a GPU register-setting routine. Full chain, traced under gdb:
 

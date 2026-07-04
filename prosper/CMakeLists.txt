@@ -80,6 +80,9 @@ if(TARGET prosper_core)
     add_executable(boot_trace tools/boot_trace/boot_trace.cpp)
     target_link_libraries(boot_trace PRIVATE prosper_core)
 
+    add_executable(imgdump tools/imgdump/imgdump.cpp)
+    target_link_libraries(imgdump PRIVATE prosper_core)
+
     add_executable(test_trap_linux tests/test_trap_linux.cpp)
     target_link_libraries(test_trap_linux PRIVATE prosper_core)
     add_test(NAME trap_identifies_imports
