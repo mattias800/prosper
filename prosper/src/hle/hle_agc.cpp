@@ -219,6 +219,42 @@ static void pipetrace(const char* fn, uint64_t a0, uint64_t a1, uint64_t a2, uin
                 (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)a5);
 }
 
+static void pipetrace_shader_user_data(const char* tag, const AgcShader* h) {
+    if (!getenv("PROSPER_PIPETRACE")) return;
+    if (!h) { fprintf(stderr, "  [ud] %s shader=(null)\n", tag); return; }
+    const AgcShaderUserData* ud = h->user_data;
+    if (!ud) { fprintf(stderr, "  [ud] %s shader=%p user_data=(null)\n", tag, (const void*)h); return; }
+
+    fprintf(stderr,
+            "  [ud] %s shader=%p user_data=%p eud=%u srt=%u direct_count=%u sharp_counts={%u,%u,%u,%u}\n",
+            tag, (const void*)h, (const void*)ud, ud->eud_size_dw, ud->srt_size_dw,
+            ud->direct_resource_count, ud->sharp_resource_count[0], ud->sharp_resource_count[1],
+            ud->sharp_resource_count[2], ud->sharp_resource_count[3]);
+
+    if (ud->direct_resource_offset && ud->direct_resource_count && ud->direct_resource_count <= 64) {
+        fprintf(stderr, "    direct offsets:");
+        for (uint16_t i = 0; i < ud->direct_resource_count && i < 16; i++)
+            fprintf(stderr, " type%u=%04x", i, ud->direct_resource_offset[i]);
+        if (ud->direct_resource_count > 16) fprintf(stderr, " ...");
+        fprintf(stderr, "\n");
+    }
+
+    for (int imm = 0; imm < 4; imm++) {
+        const uint16_t count = ud->sharp_resource_count[imm];
+        auto* raw = (const uint16_t*)ud->sharp_resource_offset[imm];
+        if (!raw || count == 0 || count > 64) continue;
+        const char* kind = (imm == 0) ? "texture" : (imm == 2) ? "sampler" :
+                           (imm == 3) ? "storage" : "sharp1";
+        fprintf(stderr, "    sharp[%d] %s:", imm, kind);
+        for (uint16_t slot = 0; slot < count && slot < 16; slot++) {
+            uint16_t v = raw[slot];
+            fprintf(stderr, " slot%u={off=%04x,size=%u}", slot, (unsigned)(v & 0x7fffu), (unsigned)(v >> 15));
+        }
+        if (count > 16) fprintf(stderr, " ...");
+        fprintf(stderr, "\n");
+    }
+}
+
 HLE(agc_create_shader) {  // (Shader** dst, void* header, const void* code)
     pipetrace("CreateShader", a0, a1, a2, a3, a4, a5);
     auto** dst   = (AgcShader**)(uintptr_t)a0;
@@ -297,6 +333,7 @@ HLE(agc_create_shader) {  // (Shader** dst, void* header, const void* code)
         for (int i = 0x50; i < 0x60; i++) fprintf(stderr, " %02x", hb[i]);
         fprintf(stderr, "\n");
     }
+    pipetrace_shader_user_data("CreateShader", h);
 
     agc_shaders().push_back(h);
     *dst = h;               // <- the write our old stub omitted; populates the shader-registry slots
@@ -412,6 +449,8 @@ HLE(agc_create_interpolant_mapping) {  // (ShaderRegister regs[32], const Shader
         fprintf(stderr, "  [interp] gs.num_out=%u ps=%p ps.num_in=%u -> mapping %u interpolants\n",
                 (uint32_t)gs->num_output_semantics, (void*)ps,
                 ps ? ps->num_input_semantics : 0u, n);
+    pipetrace_shader_user_data("CreateInterpolant.gs", gs);
+    pipetrace_shader_user_data("CreateInterpolant.ps", ps);
     for (uint32_t i = 0; i < 32; i++) {
         regs[i].offset = SPI_PS_INPUT_CNTL_0 + i;
         uint32_t value = 0;
