@@ -64,6 +64,26 @@ int main() {
         CHECK(b > 128 && r < 128, "zero mask: center pixel stays blue clear (write mask honored)");
     }
 
+    // Blend honored: additive blend (src=One, dst=One, Add) of the red triangle over the blue clear
+    // must produce magenta at the center. The blend fields come from resolve_pipeline_state (RenderState
+    // blend enums -> Vk blend enums), so this proves the resolved blend state drives real output.
+    RenderState rsb;
+    rsb.prim_type      = 4;       // triangle list
+    rsb.cb_target_mask = 0xF;     // write RGBA
+    rsb.blend_enable   = true;
+    rsb.color_src_blend = 0x01;   // One  -> VK ONE (1)
+    rsb.color_dst_blend = 0x01;   // One  -> VK ONE (1)
+    rsb.color_comb_fcn  = 0;      // Add  -> VK_BLEND_OP_ADD (0)
+    ResolvedPipelineState blend = resolve_pipeline_state(rsb);
+    CHECK(blend.blend_enable && blend.src_color_blend_factor == 1 && blend.dst_color_blend_factor == 1 &&
+          blend.color_blend_op == 0, "resolved additive blend state (One/One/Add)");
+    std::vector<uint8_t> imgb = render_triangle_rgba(vert, frag, W, H, &blend);
+    if (imgb.size() == (size_t)W*H*4) {
+        uint8_t r = imgb[center], g = imgb[center+1], b = imgb[center+2];
+        printf("  center (additive)    = (%u,%u,%u)\n", r, g, b);
+        CHECK(r > 128 && g < 128 && b > 128, "additive blend: red over blue -> magenta (blend state honored)");
+    } else { CHECK(false, "additive blend render produced a frame"); }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
