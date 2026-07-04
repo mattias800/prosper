@@ -96,6 +96,8 @@ namespace {
     int      g_vo_handle = 0;
     uint64_t g_flip_count = 0;    // incremented per SubmitFlip so GetFlipStatus shows progress
     uint64_t g_vblank_count = 0;
+    int32_t  g_current_buffer = 0;
+    int64_t  g_last_flip_arg = 0;
 
     // The one display we advertise. 1920x1080 @ 59.94Hz (refresh-rate enum 3), 16:9, ~50".
     constexpr uint32_t kDispW = 1920, kDispH = 1080;
@@ -134,14 +136,19 @@ extern "C" uint64_t prosper_vo_buffer_addr(int i) {
 }
 HLE(g_vo_open)        { gfx_tick(); return (uint64_t)(int64_t)(++g_vo_handle + 0x1000); }  // positive handle
 HLE(g_vo_close)       { return 0; }
-HLE(g_vo_submitflip)  { g_flip_count++; return 0; }                            // accept the flip
+HLE(g_vo_submitflip)  {
+    g_flip_count++;
+    g_current_buffer = (int32_t)a1;
+    g_last_flip_arg = (int64_t)a3;
+    return 0;
+}
 HLE(g_vo_flippending) { return 0; }                                            // never pending -> can submit next
 HLE(g_vo_flipstatus)  { // (handle, SceVideoOutFlipStatus* status): report our simulated flip count.
     // SceVideoOutFlipStatus is exactly 0x40 bytes — writing more smashes the caller's stack canary!
     if (a1) { uint8_t* s = (uint8_t*)(uintptr_t)a1; memset(s, 0, 0x40);
               *(uint64_t*)(s + 0x00) = g_flip_count;          // count
-              *(int64_t*) (s + 0x18) = (int64_t)g_flip_count; // flipArg
-              *(int32_t*) (s + 0x38) = 0; }                   // currentBuffer
+              *(int64_t*) (s + 0x18) = g_last_flip_arg;       // flipArg
+              *(int32_t*) (s + 0x38) = g_current_buffer; }    // currentBuffer
     return 0;
 }
 // SceVideoOutResolutionStatus (0x20 bytes, Kyty VideoOutResolutionStatus): report a real 1080p60

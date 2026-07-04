@@ -30,8 +30,10 @@ int main() {
     auto setba2 = Hle::lookup("PjS5uASwcV8");   // SetBufferAttribute2
     auto regb2  = Hle::lookup("rKBUtgRrtbk");   // RegisterBuffers2
     auto cfg    = Hle::lookup("w0hLuNarQxY");   // ConfigureOutput
-    CHECK(res && vbl && cap && issup && setba2 && regb2 && cfg, "VideoOut functions registered");
-    if (!(res && vbl && cap && issup && setba2 && regb2 && cfg)) { printf("== FAIL ==\n"); return 1; }
+    auto flip   = Hle::lookup(nid_hash("sceVideoOutSubmitFlip"));
+    auto fstat  = Hle::lookup(nid_hash("sceVideoOutGetFlipStatus"));
+    CHECK(res && vbl && cap && issup && setba2 && regb2 && cfg && flip && fstat, "VideoOut functions registered");
+    if (!(res && vbl && cap && issup && setba2 && regb2 && cfg && flip && fstat)) { printf("== FAIL ==\n"); return 1; }
 
     // Resolution: real 1080p @ 59.94Hz (refresh enum 3), not zeroed.
     uint8_t rs[0x20]; memset(rs, 0xEE, sizeof rs);
@@ -78,6 +80,14 @@ int main() {
     CHECK(prosper_vo_display_format() == fmt, "registry recorded the pixel format");
     CHECK(prosper_vo_buffer_addr(0) == (uint64_t)(uintptr_t)fb0 &&
           prosper_vo_buffer_addr(2) == (uint64_t)(uintptr_t)fb2, "registry recorded each framebuffer address");
+
+    uint8_t fs[0x40]; memset(fs, 0xEE, sizeof fs);
+    CHECK(flip(0x1001, 2 /*buffer*/, 0 /*mode*/, 0x12345678 /*flipArg*/, 0, 0) == 0,
+          "SubmitFlip accepted buffer 2");
+    fstat(0x1001, (uint64_t)(uintptr_t)fs, 0, 0, 0, 0);
+    CHECK(*(uint64_t*)(fs + 0x00) == 1, "flip status count increments");
+    CHECK(*(int64_t*) (fs + 0x18) == 0x12345678, "flip status reports the submitted flipArg");
+    CHECK(*(int32_t*) (fs + 0x38) == 2, "flip status reports the submitted currentBuffer");
 
     // Range validation: out-of-range buffer counts are rejected.
     CHECK(regb2(0x1001, 0, 0, (uint64_t)(uintptr_t)buffers, 99, (uint64_t)(uintptr_t)attr) != 0,
