@@ -209,7 +209,18 @@ template <class T> inline void agc_fix_ptr(T*& m) {
 // Exposed for tests: how many shaders the guest successfully registered.
 extern "C" size_t prosper_agc_shader_count() { return agc_shaders().size(); }
 
+// Bounded RE probe (PROSPER_PIPETRACE): log the raw pointer args of the shader/pipeline construction
+// calls, so their argument/return pointers can be diffed against a later fault object (e.g. the
+// eboot+0xba6e08 pipeline object's [+0x140] companion). Purely observational.
+static void pipetrace(const char* fn, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
+    if (getenv("PROSPER_PIPETRACE"))
+        fprintf(stderr, "[pipe] %s a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx\n", fn,
+                (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
+                (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)a5);
+}
+
 HLE(agc_create_shader) {  // (Shader** dst, void* header, const void* code)
+    pipetrace("CreateShader", a0, a1, a2, a3, a4, a5);
     auto** dst   = (AgcShader**)(uintptr_t)a0;
     auto*  h     = (AgcShader*)(uintptr_t)a1;
     auto*  code  = (const void*)(uintptr_t)a2;
@@ -339,6 +350,7 @@ HLE(agc_cb_set_sh_register_range_direct) {  // (buf, offset, values, num_values)
 // geometry shader's "specials" block. Kyty hard-asserts hs==null and exact register offsets; we
 // copy the specials through and log deviations instead (tessellation would arrive via hs).
 HLE(agc_create_prim_state) {  // (cx_regs, uc_regs, hs, gs, prim_type)
+    pipetrace("CreatePrimState", a0, a1, a2, a3, a4, a5);
     auto* cx = (AgcShaderRegister*)(uintptr_t)a0;
     auto* uc = (AgcShaderRegister*)(uintptr_t)a1;
     auto* gs = (const AgcShader*)(uintptr_t)a3;
@@ -362,6 +374,7 @@ HLE(agc_create_prim_state) {  // (cx_regs, uc_regs, hs, gs, prim_type)
 // identity mapping (slot i) when there is nothing to match — which reproduces Kyty's behaviour on
 // the layouts Kyty supports.
 HLE(agc_create_interpolant_mapping) {  // (ShaderRegister regs[32], const Shader* gs, const Shader* ps)
+    pipetrace("CreateInterpolantMapping", a0, a1, a2, a3, a4, a5);
     auto* regs = (AgcShaderRegister*)(uintptr_t)a0;
     auto* gs   = (const AgcShader*)(uintptr_t)a1;
     auto* ps   = (const AgcShader*)(uintptr_t)a2;
