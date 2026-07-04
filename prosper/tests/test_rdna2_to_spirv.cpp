@@ -360,6 +360,28 @@ int main() {
     CHECK(act17>0 && msk17>0, "kernel 17 exercises both active and masked lanes");
     CHECK(got17.size()==N && bad17==0, "recompiled kernel 17 (per-write predication + EXEC restore) correct");
 
+    // Kernel 18: the REAL if-then idiom with a forward branch. v3=7; vcc=(u0>u1);
+    // s_and_saveexec_b64 s[0:1],vcc (save exec, exec=vcc); s_cbranch_execz skip (forward -> no-op);
+    // v_add v3=u0+u1 (predicated); skip: s_mov_b64 exec,s[0:1] (restore); cvt+store. Same result as
+    // k17 but driven by s_and_saveexec + a real s_cbranch_execz (proving forward branches no-op).
+    const uint32_t code18[] = {
+        0x7e000f00u, 0x7e020f01u, 0x7e060287u, 0x7d880300u, 0xbe80246au, 0xbf880001u,
+        0x4a060300u, 0xbefe0400u, 0x7e060d03u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv18 = recompile_valu(code18, sizeof(code18)/sizeof(code18[0]), 2, /*out_vgpr*/3);
+    CHECK(!spv18.empty(), "recompiled kernel 18 (s_and_saveexec + s_cbranch_execz if-then) -> SPIR-V");
+    std::vector<float> in18(N * 2), exp18(N);
+    for (uint32_t i = 0; i < N; i++) {
+        uint32_t u0 = i % 17, u1 = i % 13;
+        in18[i*2+0]=(float)u0; in18[i*2+1]=(float)u1;
+        exp18[i] = (u0 > u1) ? (float)(u0 + u1) : 7.0f;
+    }
+    std::vector<float> got18 = prosper::test::run_compute(spv18, in18, N, N);
+    uint32_t bad18 = 0, act18 = 0;
+    for (uint32_t i=0;i<N&&got18.size()==N;i++){ if (std::fabs(got18[i]-exp18[i])>1e-3f) bad18++; if((i%17)>(i%13)) act18++; }
+    printf("  kernel18 mismatches=%u (active=%u, out[1]=%g exp=%g)\n", bad18, act18, got18.size()==N?got18[1]:-1, exp18[1]);
+    CHECK(got18.size()==N && bad18==0, "recompiled kernel 18 (real saveexec+cbranch_execz if-then) correct");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

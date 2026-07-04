@@ -506,6 +506,23 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             if (ok) predicate_write(b, rs, in.dst.value, old_d);
             return true;
         }
+        case Rdna2Format::SOPP: {
+            // Control flow. With EXEC per-write predication, a FORWARD conditional branch (the common
+            // "skip the block if no lane is active" optimization) is semantically a no-op: executing
+            // the block predicated by EXEC yields the same result. A BACKWARD branch is a loop and an
+            // unconditional s_branch skips a block outright — neither is correct under linear
+            // predication, so reject (fail loudly) rather than mis-execute.
+            switch (in.opcode) {
+                case 0x00: break;                                  // s_nop — no-op
+                case 0x04: case 0x05:                              // s_cbranch_scc0 / scc1
+                case 0x06: case 0x07:                              // s_cbranch_vccz / vccnz
+                case 0x08: case 0x09:                              // s_cbranch_execz / execnz
+                    if (in.simm16 < 0) ok = false;                 // backward = loop -> unsupported
+                    break;                                          // forward = no-op (predication covers it)
+                default: ok = false;                               // s_branch / s_setreg / etc. -> reject
+            }
+            return true;
+        }
         default: return false;   // not a VALU format
     }
 }
