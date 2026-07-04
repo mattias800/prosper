@@ -124,6 +124,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_gpu_resources PRIVATE prosper_core)
   add_test(NAME gpu_resource_registry COMMAND test_gpu_resources)
 
+  # Resource-binding contract (shader_resources.hpp): format sizing + the provenance/binding lookups
+  # the recompiler and pipeline share. Pure/cross-platform. See docs/RESOURCE_BINDING.md.
+  add_executable(test_shader_resources tests/test_shader_resources.cpp)
+  target_link_libraries(test_shader_resources PRIVATE prosper_core)
+  add_test(NAME shader_resource_contract COMMAND test_shader_resources)
+
   # M2+: real memory mapping, trap, boot, and the boot-trace debug tool (Linux only).
   if(UNIX AND NOT APPLE)
     add_executable(boot_trace tools/boot_trace/boot_trace.cpp)

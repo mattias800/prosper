@@ -1,0 +1,75 @@
+// shader_resources.hpp — the resource-binding CONTRACT between the front-half (which knows the game's
+// real GPU resources) and the recompiler back-half (which must translate the shader's memory ops
+// correctly). This is the seam that unblocks the format-dependent memory instructions:
+//   * s_buffer_load_*   — uniforms / constant buffers (multi-buffer, beyond the single-cbuf model)
+//   * buffer_load_format_* (MUBUF) — vertex attribute fetch (needs the attribute's data format)
+//   * image_sample / image_load (MIMG) — texture reads (needs texture format + sampler)
+//
+// Why a contract: to translate `buffer_load_format_xyzw` the recompiler must know the attribute's
+// DATA FORMAT (float32 vs unorm8 vs …) to emit the right conversion — and that format lives in the
+// V#/T# descriptor the game builds, which the FRONT-HALF can read from the shader's user_data / SRT
+// and the game's bound resources. So the recompiler is *parameterized* by a ShaderResourceTable the
+// front-half fills. See docs/RESOURCE_BINDING.md for the model, the descriptor-provenance mechanism,
+// and the staged implementation plan.
+#pragma once
+#include <cstdint>
+#include <vector>
+
+namespace prosper::gpu {
+
+// Element data format, decoded from a V#/T# descriptor's DFMT (data format) + NFMT (number format).
+// Determines the conversion a format load / texture sample must emit. `Float32` is the common case
+// for positions and most attributes — and for our raw-32-bit-VGPR model it is a *no-op reinterpret*,
+// so float32 format loads reduce to raw dword loads. The rest require real conversion.
+enum class DataFormat : uint32_t {
+    Unknown = 0,
+    Float32, Uint32, Sint32,
+    Float16, Unorm16, Snorm16, Uint16, Sint16,
+    Unorm8,  Snorm8,  Uint8,  Sint8,
+    // 10/11-bit packed and block-compressed formats are added as the target needs them.
+};
+
+// How many bytes one component of `format` occupies (0 for Unknown).
+uint32_t data_format_bytes(DataFormat f);
+
+enum class ResourceClass : uint32_t {
+    ConstantBuffer,  // read by s_buffer_load_* (scalar, uniform across the wave)
+    VertexBuffer,    // read by buffer_load_format_* (per-lane attribute fetch)
+    Texture,         // read by image_sample / image_load
+    Sampler,         // paired with a Texture for image_sample
+};
+
+// One resource a shader accesses. FILLED BY THE FRONT-HALF from the game's real descriptors (the
+// V#/T#/S# words in the shader's user_data / SRT, resolved against the game's bound resources and
+// guest memory). CONSUMED BY THE RECOMPILER: it uses `format`/`num_components` to emit correct
+// conversions and records `binding`; and BY THE PIPELINE: it binds `size` bytes at `gpu_addr`
+// (unified guest memory) to descriptor-set 0, `binding`.
+struct ShaderResource {
+    ResourceClass cls           = ResourceClass::ConstantBuffer;
+    DataFormat    format        = DataFormat::Float32;   // for format loads / textures
+    uint32_t      num_components = 1;                    // 1..4
+    uint32_t      binding       = 0;                     // Vulkan descriptor-set-0 binding
+
+    uint64_t      gpu_addr      = 0;                     // base of the backing bytes in guest memory
+    uint32_t      size          = 0;                     // byte size of the backing region
+    uint32_t      stride        = 0;                     // element stride (vertex/structured buffers)
+
+    // Descriptor identity — how the recompiler maps a memory op back to this resource. The shader
+    // loads the descriptor from a fixed byte offset within its user_data / SRT; that offset is the
+    // key (see RESOURCE_BINDING.md "descriptor provenance"). 0xFFFFFFFF = not descriptor-keyed.
+    uint32_t      srt_offset    = 0xFFFFFFFFu;
+};
+
+// The set of resources a shader uses. The front-half builds it from the shader's user_data; the
+// recompiler consults it while translating memory ops and the pipeline binds from it. Pure data.
+struct ShaderResourceTable {
+    std::vector<ShaderResource> resources;
+
+    // Resolve the resource whose descriptor originates at `srt_offset` (the recompiler's provenance
+    // lookup); nullptr if none. Deterministic; first match wins.
+    const ShaderResource* by_srt_offset(uint32_t srt_offset) const;
+    // Resolve by assigned Vulkan binding (the pipeline's lookup); nullptr if none.
+    const ShaderResource* by_binding(uint32_t binding) const;
+};
+
+} // namespace prosper::gpu
