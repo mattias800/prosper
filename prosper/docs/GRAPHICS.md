@@ -100,6 +100,28 @@ initializers to construct valid GPU objects (correctness-first — no plausible-
 - Graphics libs are sparsely documented; most NIDs don't resolve to names — reverse-engineer from
   call args (`PROSPER_GFXLOG`) and `build-linux/tools/pltm` (maps a module GOT offset → NID).
 
+## ✔ BOUNDED TRACE ANSWER (2026-07-04): the pipeline object is Unity-INTERNAL — no HLE hook exists
+
+Back-half asked one bounded question: does the fault object `r15` (or its `[+0x18]`/`[+0x40]`
+packed-register sub-object) ever appear as an arg / return / write of any AGC call we implement
+(`CreateShader`, `CreatePrimState`, `CreateInterpolantMapping`, or the register-context builders)?
+
+**Answer: NO.** Logged every construction call's pointer args (`PROSPER_PIPETRACE`) and diffed against
+the fault object in the same run (`r15=0x7d622562c300`, sub-object `0x7d62256120f0`):
+- `CreateShader` (×36+): header/code blobs live in `0x7d6252dc…`; `*dst` writes into the eboot BSS
+  shader registry (`0x402048…`) or a stack slot — never `r15`'s heap region.
+- `CreatePrimState` / `CreateInterpolantMapping`: write register `{offset,value}` pairs into **stack
+  scratch** (`a0/a1 = 0x7d6255dfb…`); shaders are `0x7d6252dc…`.
+- The only `0x7d6225…`-region pointers logged are the AGC context (`…5cb378`) and register-context
+  builder args — none in `r15`'s (`…62c300`) or the sub-object's (`…6120f0`) region.
+
+So the register *content* originates from our calls (Unity harvests it into stack scratch), but the
+**pipeline object and its `[+0x140]` GPU companion are constructed by Unity's own resource manager** —
+there is no game→AGC call that takes/returns/writes them, hence no front-half HLE hook. Per the
+back-half's decision tree, pipeline residency will be intercepted at the GpuState/register-context
+stage in the back-half; the front-half is off the hook for this object. `PROSPER_PIPETRACE` (logs the
+raw pointer args of the shader/pipeline construction calls) is retained for future seams.
+
 ## ⚠ RE UPDATE (2026-07-04): the 0xba6e08 object is a Unity PIPELINE object, and NO resource-creation call feeds [+0x140]
 
 Investigating the resource-layer integration (gpu_resources.hpp contract) turned up evidence that
