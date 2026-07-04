@@ -396,6 +396,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
               const ShaderResourceTable* rt = nullptr) {
     auto& vreg = rs.vreg; uint32_t& vcc = rs.vcc;
     auto val = [&](const Operand& o) { return operand_bits(b, rs, in, o); };
+    // SDWA/DPP forms carry a sub-dword select or cross-lane control word we don't model. The decoder
+    // flags them (and gets their length right); reject here rather than compute with a wrong operand.
+    if (in.has_modifier) { ok = false; return true; }
     switch (in.fmt) {
         case Rdna2Format::SOP1: {
             // 64-bit per-lane MASK ops (EXEC / VCC / saved masks). In our per-invocation model a wave

@@ -100,6 +100,26 @@ int main() {
     Rdna2Inst mb = rdna2_decode_one(mubuf, 2);
     CHECK(mb.fmt == Rdna2Format::MUBUF && mb.opcode == 0xeu && isV(mb.dst, 4) && isV(mb.src[0], 2) &&
           isS(mb.src[1], 8) && ((mb.literal >> 12) & 1u), "buffer_load_dwordx4 MUBUF op/VDATA/VADDR/SRSRC/offen");
+    // VOP SDWA/DPP forms carry a mandatory 2nd (control) dword — the decoder must count it (miss it and
+    // the whole downstream stream mis-aligns) and flag has_modifier so the recompiler rejects it.
+    // Encodings from llvm-mc gfx1030: SDWA src0=0xf9, DPP16 src0=0xfa, DPP8 src0=0xe9.
+    const uint32_t sdwa[] = { 0x340008f9u, 0x00861682u };    // v_lshlrev_b32_sdwa v0, 2, v4 ...
+    Rdna2Inst sd = rdna2_decode_one(sdwa, 2);
+    CHECK(sd.fmt == Rdna2Format::VOP2 && sd.len_dwords == 2 && sd.has_modifier,
+          "VOP2 SDWA form is 2 dwords and flagged has_modifier");
+    const uint32_t dpp16[] = { 0x4a0e0cfau, 0xff011106u };   // v_add_nc_u32_dpp v7, v6, v6 row_shr:1
+    Rdna2Inst dp = rdna2_decode_one(dpp16, 2);
+    CHECK(dp.fmt == Rdna2Format::VOP2 && dp.len_dwords == 2 && dp.has_modifier,
+          "VOP2 DPP16 form is 2 dwords and flagged has_modifier");
+    const uint32_t dpp8[] = { 0x4a0e0ce9u, 0xfac68806u };    // v_add_nc_u32_dpp v7, v6, v6 dpp8:[...]
+    Rdna2Inst d8 = rdna2_decode_one(dpp8, 2);
+    CHECK(d8.fmt == Rdna2Format::VOP2 && d8.len_dwords == 2 && d8.has_modifier,
+          "VOP2 DPP8 form is 2 dwords and flagged has_modifier");
+    const uint32_t fmaak[] = { 0x5a000501u, 0xd4a0e43au };   // v_fmaak_f32 v0, v1, v2, K (mandatory literal)
+    Rdna2Inst fk = rdna2_decode_one(fmaak, 2);
+    CHECK(fk.fmt == Rdna2Format::VOP2 && fk.len_dwords == 2 && fk.has_literal && !fk.has_modifier &&
+          fk.literal == 0xd4a0e43au, "VOP2 v_fmaak_f32 carries its mandatory 32-bit literal");
+
     // inline-constant field decode: SGPR106 special, field 129 -> +1, 193 -> -1, 242 -> 1.0f
     CHECK(decode_src_field(0).kind == OperandKind::SGPR && decode_src_field(0).value == 0, "field 0 -> SGPR0");
     CHECK(decode_src_field(257).kind == OperandKind::VGPR && decode_src_field(257).value == 1, "field 257 -> VGPR1");

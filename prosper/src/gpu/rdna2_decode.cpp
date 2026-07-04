@@ -130,9 +130,26 @@ Rdna2Inst rdna2_decode_one(const uint32_t* code, size_t max_dwords) {
 
     if ((w & 0x80000000u) == 0u) {
         // Vector ALU group (bit31 == 0): VOP1 (0x7E prefix), VOPC (0x7C prefix), else VOP2.
-        if ((w & 0xFE000000u) == 0x7E000000u)      one_plus_lit(Rdna2Format::VOP1, vop_has_literal(w));
-        else if ((w & 0xFE000000u) == 0x7C000000u) one_plus_lit(Rdna2Format::VOPC, vop_has_literal(w));
-        else                                       one_plus_lit(Rdna2Format::VOP2, vop_has_literal(w));
+        Rdna2Format vf = ((w & 0xFE000000u) == 0x7E000000u) ? Rdna2Format::VOP1
+                       : ((w & 0xFE000000u) == 0x7C000000u) ? Rdna2Format::VOPC
+                                                            : Rdna2Format::VOP2;
+        // A VOP src0 field selects an extra dword in four ways: 0xFF = trailing 32-bit literal;
+        // 0xF9 = SDWA, 0xFA = DPP16, 0xE9/0xEA = DPP8 = a control word. All make the instruction 2
+        // dwords — miss one and the extra dword is mis-decoded as a phantom instruction, derailing the
+        // rest of the stream. The SDWA/DPP forms use sub-dword select / cross-lane semantics we don't
+        // model, so they are flagged has_modifier and later rejected (vs. silently miscomputed).
+        const uint32_t src0 = w & 0x1FFu;
+        const bool modifier = (src0 == 0xF9u || src0 == 0xFAu || src0 == 0xE9u || src0 == 0xEAu);
+        if (modifier) {
+            i.fmt = vf; i.has_modifier = true;
+            i.len_dwords = (max_dwords >= 2) ? 2 : 1;
+            if (max_dwords >= 2) i.words[1] = code[1];
+        } else {
+            // v_fmamk_f32 (0x2C) / v_fmaak_f32 (0x2D) also embed a mandatory 32-bit literal K.
+            bool lit = (src0 == 0xFFu);
+            if (vf == Rdna2Format::VOP2) { uint32_t op = (w >> 25) & 0x3Fu; if (op == 0x2Cu || op == 0x2Du) lit = true; }
+            one_plus_lit(vf, lit);
+        }
     } else if ((w & 0xC0000000u) == 0x80000000u) {
         // Scalar group (bits[31:30] == 10). Carve out SOPP/SOPC/SOP1/SOPK before the SOP2 default.
         if      ((w & 0xFF800000u) == 0xBF800000u) { i.fmt = Rdna2Format::SOPP; i.len_dwords = 1;

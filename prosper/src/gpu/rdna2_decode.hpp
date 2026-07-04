@@ -50,6 +50,9 @@ struct Rdna2Inst {
     bool        has_literal = false;
     uint32_t    literal = 0;       // the inline 32-bit constant, if has_literal
     bool        is_end = false;    // S_ENDPGM
+    bool        has_modifier = false;  // VOP SDWA/DPP form (2nd dword is a control word, not a literal);
+                                       // decoded for correct length, but the recompiler rejects it
+                                       // (sub-dword select / cross-lane semantics are not modeled)
 
     // Decoded operands (filled for the ALU formats: SOP1/2/K, VOP1/2/C, VOP3). `opcode` is the
     // format-local opcode; `dst` the destination; `src[0..n_src-1]` the sources. simm16 holds the
