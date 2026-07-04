@@ -100,6 +100,52 @@ initializers to construct valid GPU objects (correctness-first — no plausible-
 - Graphics libs are sparsely documented; most NIDs don't resolve to names — reverse-engineer from
   call args (`PROSPER_GFXLOG`) and `build-linux/tools/pltm` (maps a module GOT offset → NID).
 
+## 🔎 THE [+0x140] WRITER CHAIN (2026-07-04) — host-side RE, found the constructor + gate, root is a pipeline-reflection predicate
+
+Agent-2 (correctly) reassigned this to the front-half: the companion is built pre-submit, upstream of
+any GpuState. Traced the writer/constructor of the null `[obj+0x140]` and its gating condition:
+
+**The writer** — `eboot+0x15aef7d..0x15aef83`:
+```
+g = *[0x1ff28c8]                       ; factory/device singleton (global)
+[r13+0x140] = g->vtable[0x88](g, 0, payload)   ; create the GPU companion  <-- THE WRITER
+```
+The sibling just above (`+0x138`) is the same call with arg1=1 (`g->vtable[0x88](g,1,..)`) — so
+`+0x138`/`+0x140` are a pair of companions (two shader stages) created from the same factory.
+
+**The factory is fine (not the cause).** `[0x1ff28c8]` is a lazy Meyers singleton constructed locally
+at `eboot+0xc33769`: `operator new(...)` (call `0x809830`) + vtable `0x1d6b8f8` stored at `(obj)`,
+then `[0x1ff28c8]=obj`. **No AGC/gfx call gates it** — our heap works, so `g` is non-null at runtime.
+So `+0x140` is null NOT because the factory is missing.
+
+**The proximate gate** — the writer block is skipped unless an optional local is present:
+```
+0x15aef69:  mov -0x200(%rbp),%rcx ; test %rcx,%rcx ; je 0x15aef8a   (skip the +0x140 create)
+```
+`[rbp-0x200]` is the "present" flag of an optional{payload@-0x210, present@-0x200}, zero-initialized
+and filled only if a predicate passes:
+```
+0x15aee82:  call 0xd58710 ; test %eax,%eax ; je 0x15aef30   (skip filling the optional)
+```
+(The `+0x138` companion has the identical structure gated by `[rbp-0x1e0]` via the same predicate at
+`0x15aec7a`.)
+
+**The root predicate `eboot+0xd58710`** decides whether each companion is created. It reads
+`[pipeline+0xe0]` (if 0 → early-out) and iterates the record array at `[pipeline+0xc0]` (0x20-byte
+records, checking byte fields at `+0x02`/`+0x22`) — i.e. it scans the pipeline's **reflection/binding
+table** and returns non-zero when a matching entry exists. For our 3 resources the second call returns
+0 → the `+0x140` optional stays empty → the companion is never created → `+0x140` null → the
+`0xba6e08` reader faults.
+
+**So the true root is upstream of the writer: the pipeline's reflection collection at `[pipeline+0xc0]`
+is empty/short for these resources**, so `0xd58710` reports "no second-stage companion needed" and the
+writer legitimately skips it — but the *reader* at `0xba6e08` derefs it anyway. That `[+0xc0]`
+reflection table is populated from the shader register/semantic data that flows through
+`CreatePrimState`/`CreateInterpolantMapping` (which we implement into stack scratch, then Unity folds
+in). **Next probe (joint):** capture `[pipeline+0xc0]`/`[pipeline+0xe0]` for the faulting objects and
+compare against what our `CreateInterpolantMapping` produced — a short/empty interpolant set would
+explain the empty reflection table. This is the remaining thread to the true root cause.
+
 ## ✔ libSceVideoOut real 1080p60 + swapchain scaffolding (2026-07-04) — and the [+0x140] gate is NOT the display surface
 
 Implemented the 5 previously-unimplemented VideoOut NIDs with real, self-consistent values (resolved
