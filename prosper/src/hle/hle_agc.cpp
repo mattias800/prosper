@@ -10,6 +10,7 @@
 // Vulkan (see docs/AGC_IMPL_PLAN.md). Registered by raw NID (AGC lib is undocumented).
 #include "dispatch.hpp"
 #include "gpu/pm4_registers.hpp"
+#include "gpu/command_processor.hpp"
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -388,6 +389,35 @@ HLE(agc_create_interpolant_mapping) {  // (ShaderRegister regs[32], const Shader
     return 0;
 }
 
+// --- sceAgcDriverSubmitDcb (AgcDriver NID UglJIZjGssM) — the GPU submission point. -------------
+//
+// The game hands us a Packet {dcb_addr, dw_num} (Kyty Gen5Driver::Packet, Graphics.cpp:2168). We
+// replay the PM4 stream through the CommandProcessor into a persistent GpuState — register files +
+// draw list — which the AGC->Vulkan translation (render_state/vk_translate) consumes. No rendering
+// happens here yet; this is the semantic execution of the submit, observable via PROSPER_GFXLOG and
+// prosper_agc_submit_stats(). The Dcb address is a guest pointer, valid 1:1 in-process.
+namespace {
+gpu::GpuState& agc_gpu_state() { static gpu::GpuState st; return st; }
+uint64_t g_submit_count = 0;
+}
+
+extern "C" void prosper_agc_submit_stats(uint64_t* submits, uint64_t* draws) {
+    if (submits) *submits = g_submit_count;
+    if (draws)   *draws   = (uint64_t)agc_gpu_state().draws.size();
+}
+
+HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
+    struct Packet { uint32_t* addr; uint32_t dw_num; uint8_t pad[4]; };
+    const auto* p = (const Packet*)(uintptr_t)a0;
+    if (!p || !p->addr || !p->dw_num) return kAgcErrInvalidArg;
+    size_t applied = gpu::run_command_buffer(p->addr, p->dw_num, agc_gpu_state());
+    g_submit_count++;
+    if (getenv("PROSPER_GFXLOG"))
+        fprintf(stderr, "[agc] SubmitDcb #%llu: %u dwords -> %zu packets applied (draws so far: %zu)\n",
+                (unsigned long long)g_submit_count, p->dw_num, applied, agc_gpu_state().draws.size());
+    return 0;
+}
+
 // --- Indirect-register patch helpers: modify a packet returned by a Set*RegsIndirect call.
 // cmd = a0 (that returned pointer). Old stub returned 0 for Set*RegsIndirect -> these wrote to null. -
 HLE(agc_patch_set_address) {  // (cmd, regs): cmd[2..3] = regs vaddr
@@ -420,7 +450,10 @@ void register_agc_hle() {
     RN("VmW0Tdpy420", agc_dcb_wait_reg_mem);
     // Indirect-register patch helpers (SetAddress patches cmd[2..3]; AddRegisters patches cmd[1]).
     RN("vcmNN+AAXnY", agc_patch_set_address);   RN("d-6uF9sZDIU", agc_patch_add_registers);   // Cx
+    RN("Qrj4c+61z4A", agc_patch_set_address);   RN("z2duB-hHQSM", agc_patch_add_registers);   // Sh
     RN("6lNcCp+fxi4", agc_patch_set_address);   RN("vRoArM9zaIk", agc_patch_add_registers);   // Uc
+    RN("YUeqkyT7mEQ", agc_dcb_set_flip);        // sceAgcDcbSetFlip (Kyty LibGraphicsDriver.cpp:98)
+    RN("UglJIZjGssM", agc_driver_submit_dcb);   // sceAgcDriverSubmitDcb -> CommandProcessor replay
     #undef RN
 }
 
