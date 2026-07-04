@@ -66,6 +66,9 @@ namespace {
     uint64_t g_skip_rip    = 0x400ba6e08ull;   // reader companion deref (mov 0x8(%rsi),%rax; rsi=null)
     uint64_t g_skip_target = 0x400ba6e40ull;   // reader skip label (continues via [obj+0x520/0x530])
     volatile sig_atomic_t g_skip_count = 0;
+    bool     g_null_page = false;              // PROSPER_NULL_PAGE: back low null reads with zero page
+    volatile sig_atomic_t g_null_page_count = 0;
+    unsigned g_null_page_mask = 0;             // which of the 16 low pages [0,0x10000) are backed
     // PROSPER_PEEK dumps offsets off registers at fault time. Supports N specs separated by ';',
     // each "reg:off,off,..."; an offset may be prefixed '*' to chase one pointer level first
     // (e.g. "r15:*0x18+0x0" = read [[r15+0x18]+0x0]).
@@ -164,6 +167,34 @@ namespace {
                     write(2, b, n);
                 }
                 if (ok) { g_lazy_pages++; return; }  // re-execute against the now-mapped page
+            }
+        }
+        // NULL-CHAIN probe (PROSPER_NULL_PAGE, default off): back a low-address read fault with a
+        // read-only zero page so null-field *reads* return 0 and the chain of null derefs proceeds —
+        // revealing how far it cascades and where it truly stops. WRITE-to-null and CALL-through-null
+        // (execute at 0) still fault (page is read-only, non-exec), which bounds it. Distinct fault
+        // RIPs are logged (capped) so we see the cascade shape: bounded → narrow validation path;
+        // endless → the resource subsystem is systematically dead. Diagnostic, NOT a fix.
+        if (g_null_page && sig == SIGSEGV) {
+            uint64_t a = (uint64_t)si->si_addr;
+            auto* uc = (ucontext_t*)uctx;
+            uint64_t rip = (uint64_t)uc->uc_mcontext.gregs[REG_RIP];
+            // Only a DATA READ from low memory is backable. An instruction fetch at null (a==rip, i.e.
+            // a call/jmp through a null pointer) or a fault on an already-backed page (a null WRITE)
+            // must NOT be re-backed — those are the real chain endpoints; let them terminate + report.
+            unsigned pg = (unsigned)(a >> 12);
+            if (a < 0x10000ull && a != rip && pg < 16 && !(g_null_page_mask & (1u << pg))) {
+                void* page = (void*)(a & ~(uint64_t)0xfff);
+                if (mmap(page, 0x1000, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == page) {
+                    g_null_page_mask |= (1u << pg);
+                    g_null_page_count = g_null_page_count + 1;
+                    char b[128];
+                    int n = snprintf(b, sizeof b, "[nullpage] #%d addr=0x%llx rip=eboot+0x%llx\n",
+                                     (int)g_null_page_count, (unsigned long long)a,
+                                     (unsigned long long)(rip - 0x400000000ull));
+                    write(2, b, n);
+                    return;   // re-execute; the null read now sees zero
+                }
             }
         }
         // Null-companion skip probe (diagnostic; see g_skip_null_companion). Redirect the reader past
@@ -300,6 +331,7 @@ void install_trap_handler() {
     g_faultmem = getenv("PROSPER_FAULTMEM") != nullptr;   // read once (getenv is not signal-safe)
     g_faultlog = getenv("PROSPER_FAULTLOG") != nullptr;
     g_skip_null_companion = getenv("PROSPER_SKIP_NULL_COMPANION") != nullptr;
+    g_null_page = getenv("PROSPER_NULL_PAGE") != nullptr;
     if (const char* r = getenv("PROSPER_SKIP_RIP"))    g_skip_rip    = strtoull(r, nullptr, 0);
     if (const char* t = getenv("PROSPER_SKIP_TARGET")) g_skip_target = strtoull(t, nullptr, 0);
     if ((g_faultmem || g_skip_null_companion) && g_devnull_fd < 0)
