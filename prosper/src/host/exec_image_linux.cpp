@@ -75,7 +75,8 @@ namespace {
     // slot's page read-only and single-stepping (trap flag) over each write, logging writes that land
     // in the 8-byte slot with the writer's PC. Answers: does ANYTHING write it, and from where.
     bool     g_watch_companion = false;
-    uint64_t g_watch_addr = 0;                 // r15+0x140
+    uint64_t g_watch_off = 0x140;              // PROSPER_WATCH_OFF: which slot off r15 (0x140 companion, 0x1a0 gate)
+    uint64_t g_watch_addr = 0;                 // r15+g_watch_off
     uint64_t g_watch_page = 0;
     bool     g_watch_armed = false;
     bool     g_watch_stepping = false;
@@ -184,14 +185,36 @@ namespace {
             auto* uc = (ucontext_t*)uctx;
             if ((uint64_t)uc->uc_mcontext.gregs[REG_RIP] == g_skip_rip) {
                 uint64_t r15 = (uint64_t)uc->uc_mcontext.gregs[REG_R15];
-                g_watch_addr = r15 + 0x140;
+                g_watch_addr = r15 + g_watch_off;
                 g_watch_page = g_watch_addr & ~(uint64_t)0xfff;
                 if (mprotect((void*)g_watch_page, 0x1000, PROT_READ) == 0) {
                     g_watch_armed = true;
-                    char b[128];
-                    int n = snprintf(b, sizeof b, "[watch] armed on companion slot 0x%llx (obj r15=0x%llx) reader-tid=%ld\n",
-                                     (unsigned long long)g_watch_addr, (unsigned long long)r15, cur_tid());
+                    char b[192];
+                    int n = snprintf(b, sizeof b, "[watch] armed on slot [+0x%llx]=0x%llx (obj r15=0x%llx) reader-tid=%ld\n",
+                                     (unsigned long long)g_watch_off, (unsigned long long)g_watch_addr,
+                                     (unsigned long long)r15, cur_tid());
                     write(2, b, n);
+                    // Capture the type the reader tested (bt 0xc8220): O=[rsp+0x30], typ=[[O]+0x1e4c],
+                    // remapped=table[typ] at eboot+0x1ca3b80. We're past the type gate (deref reached),
+                    // so this shows WHICH type/remap value let these pipelines through.
+                    // Scan the reader's stack frame for the type-source object O (the one whose
+                    // [*O+0x1e4c] remaps INTO mask 0xc8220 — that's what let this deref through).
+                    uint64_t rsp = (uint64_t)uc->uc_mcontext.gregs[REG_RSP];
+                    for (uint64_t off = 0; off <= 0x100; off += 8) {
+                        uint64_t sa = rsp + off;
+                        if (!probe_readable(sa)) continue;
+                        uint64_t O = *(const uint64_t*)sa;
+                        if (!probe_readable(O) || !probe_readable(O + 0x1e4c)) continue;
+                        uint32_t typ = *(const uint32_t*)(*(const uint64_t*)O + 0x1e4c);
+                        uint64_t taddr = 0x401ca3b80ull + (uint64_t)typ * 4;
+                        if (!probe_readable(taddr)) continue;
+                        uint32_t remap = *(const uint32_t*)taddr;
+                        if (remap <= 0x13 && ((0xc8220u >> remap) & 1)) {   // matches the reader's gate
+                            n = snprintf(b, sizeof b, "[watch] type-source @rsp+0x%llx: raw=0x%x remapped=0x%x IN-MASK\n",
+                                         (unsigned long long)off, typ, remap);
+                            write(2, b, n);
+                        }
+                    }
                 }
                 // Skip this (null) read so the boot proceeds; the slot's page is now watched.
                 uc->uc_mcontext.gregs[REG_RIP] = (greg_t)g_skip_target;
@@ -408,9 +431,10 @@ void install_trap_handler() {
     g_skip_null_companion = getenv("PROSPER_SKIP_NULL_COMPANION") != nullptr;
     g_null_page = getenv("PROSPER_NULL_PAGE") != nullptr;
     g_watch_companion = getenv("PROSPER_WATCH_COMPANION") != nullptr;
+    if (const char* wo = getenv("PROSPER_WATCH_OFF")) g_watch_off = strtoull(wo, nullptr, 0);
     if (const char* r = getenv("PROSPER_SKIP_RIP"))    g_skip_rip    = strtoull(r, nullptr, 0);
     if (const char* t = getenv("PROSPER_SKIP_TARGET")) g_skip_target = strtoull(t, nullptr, 0);
-    if ((g_faultmem || g_skip_null_companion) && g_devnull_fd < 0)
+    if ((g_faultmem || g_skip_null_companion || g_watch_companion) && g_devnull_fd < 0)
         g_devnull_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
     // PROSPER_PEEK="r15:0x140,0x1a0;rbx:0x78,0x88;r15:*0x18+0x0" — N specs (';'), each reg:off[,off];
     // a '*pre+off' offset chases one pointer level ([[reg+pre]+off]). Parsed once (getenv unsafe at fault).
