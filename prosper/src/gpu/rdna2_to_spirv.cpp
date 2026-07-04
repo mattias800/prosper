@@ -407,6 +407,7 @@ struct RegState {
     std::unordered_map<int, uint32_t> sreg_srt;    // SGPR holding a descriptor -> its user_data/SRT byte offset
                                                    // (descriptor provenance: s_load_dwordx4 tags, s_buffer_load resolves)
     uint32_t vcc = 0;
+    uint32_t scc = 0;          // scalar condition code (bool); set by s_cmp_*/SCC-writing SOP2, read by s_cselect
     uint32_t exec = 0;         // per-lane execution mask (bool); v_cmpx narrows it, output store honors it
     bool exec_narrowed = false; // true once EXEC is narrowed below all-lanes-on (so VGPR writes predicate)
 };
@@ -530,20 +531,41 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
         }
         case Rdna2Format::SOP2: {
             uint32_t a = val(in.src[0]), c = val(in.src[1]); uint32_t& d = rs.sreg[in.dst.value];
+            auto scc_nz = [&](uint32_t v){ rs.scc = b.ucmp(Op_INotEqual, v, b.uconst(0)); };  // SCC = (result != 0)
             switch (in.opcode) {
-                case 0x00: d = b.ibin(Op_IAdd, a, c); break;         // s_add_u32
-                case 0x01: d = b.ibin(Op_ISub, a, c); break;         // s_sub_u32
-                case 0x0E: d = b.ibin(Op_BitwiseAnd, a, c); break;   // s_and_b32
-                case 0x10: d = b.ibin(Op_BitwiseOr,  a, c); break;   // s_or_b32
-                case 0x12: d = b.ibin(Op_BitwiseXor, a, c); break;   // s_xor_b32
+                case 0x00: d = b.ibin(Op_IAdd, a, c); rs.scc = b.ucmp(Op_ULessThan, d, a); break;  // s_add_u32 (SCC=carry)
+                case 0x01: d = b.ibin(Op_ISub, a, c); rs.scc = b.ucmp(Op_ULessThan, a, c); break;  // s_sub_u32 (SCC=borrow)
+                case 0x0A: d = b.sel(rs.scc, a, c); break;           // s_cselect_b32: SCC ? src0 : src1
+                case 0x0E: d = b.ibin(Op_BitwiseAnd, a, c); scc_nz(d); break;   // s_and_b32
+                case 0x10: d = b.ibin(Op_BitwiseOr,  a, c); scc_nz(d); break;   // s_or_b32
+                case 0x12: d = b.ibin(Op_BitwiseXor, a, c); scc_nz(d); break;   // s_xor_b32
                 case 0x1E: { uint32_t sh = b.ibin(Op_BitwiseAnd, c, b.uconst(31));   // s_lshl_b32
-                             d = b.ibin(Op_ShiftLeftLogical, a, sh); break; }        // dst = src0 << (src1 & 31)
-                case 0x26: d = b.ibin(Op_IMul, a, c); break;         // s_mul_i32 (low 32 bits)
+                             d = b.ibin(Op_ShiftLeftLogical, a, sh); scc_nz(d); break; }  // dst = src0 << (src1 & 31)
+                case 0x26: d = b.ibin(Op_IMul, a, c); break;         // s_mul_i32 (low 32 bits; no SCC)
                 case 0x27: {                                         // s_bfe_u32: offset=src1[4:0], width=src1[22:16]
                     uint32_t off = b.ibin(Op_BitwiseAnd, c, b.uconst(0x1f));
                     uint32_t width = b.ibin(Op_BitwiseAnd, b.ibin(Op_ShiftRightLogical, c, b.uconst(16)), b.uconst(0x7f));
-                    d = b.bfe_u(a, off, width); break;
+                    d = b.bfe_u(a, off, width); scc_nz(d); break;
                 }
+                default: ok = false;
+            }
+            return true;
+        }
+        case Rdna2Format::SOPC: {
+            // Scalar compare -> SCC (read by s_cselect / s_cbranch_scc). eq/lg are bitwise (sign-agnostic);
+            // the ordered compares are signed for i32 (0x02-0x05), unsigned for u32 (0x08-0x0b).
+            uint32_t a = val(in.src[0]), c = val(in.src[1]);
+            switch (in.opcode) {
+                case 0x00: case 0x06: rs.scc = b.ucmp(Op_IEqual, a, c); break;        // s_cmp_eq_i32/u32
+                case 0x01: case 0x07: rs.scc = b.ucmp(Op_INotEqual, a, c); break;     // s_cmp_lg_i32/u32
+                case 0x02: rs.scc = b.scmp(Op_SGreaterThan, a, c); break;             // s_cmp_gt_i32
+                case 0x03: rs.scc = b.scmp(Op_SGreaterThanEqual, a, c); break;        // s_cmp_ge_i32
+                case 0x04: rs.scc = b.scmp(Op_SLessThan, a, c); break;                // s_cmp_lt_i32
+                case 0x05: rs.scc = b.scmp(Op_SLessThanEqual, a, c); break;           // s_cmp_le_i32
+                case 0x08: rs.scc = b.ucmp(Op_UGreaterThan, a, c); break;             // s_cmp_gt_u32
+                case 0x09: rs.scc = b.ucmp(Op_UGreaterThanEqual, a, c); break;        // s_cmp_ge_u32
+                case 0x0A: rs.scc = b.ucmp(Op_ULessThan, a, c); break;                // s_cmp_lt_u32
+                case 0x0B: rs.scc = b.ucmp(Op_ULessThanEqual, a, c); break;           // s_cmp_le_u32
                 default: ok = false;
             }
             return true;
@@ -895,7 +917,7 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
 
     SpirvCompute b;
     b.begin(num_inputs ? num_inputs : 1);
-    RegState rs; rs.vcc = b.bfalse(); rs.exec = b.btrue();
+    RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
     auto safe_branches = safe_execz_branches(ins);
     for (uint32_t k = 0; k < num_inputs; k++) rs.vreg[(int)k] = b.load_input(k);
 
@@ -920,7 +942,7 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
 
     // A scratch builder/state so emit_alu can run; its emitted code is discarded — we only want `ok`.
     SpirvCompute b; b.begin(1);
-    RegState rs; rs.vcc = b.bfalse(); rs.exec = b.btrue();
+    RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
     auto safe_branches = safe_execz_branches(ins);
 
     RecompileCoverage cov;
@@ -945,7 +967,7 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords, co
 
     SpirvCompute b;
     b.begin_fragment(rt != nullptr);
-    RegState rs; rs.vcc = b.bfalse(); rs.exec = b.btrue();
+    RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
     auto safe_branches = safe_execz_branches(ins);
     bool exported = false;
 
@@ -975,7 +997,7 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords, cons
 
     SpirvCompute b;
     b.begin_vertex(rt != nullptr);
-    RegState rs; rs.vcc = b.bfalse(); rs.exec = b.btrue();
+    RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
     auto safe_branches = safe_execz_branches(ins);
     rs.vreg[0] = b.load_vertex_index();     // VS ABI: v0 = vertex index
     bool exported = false;
