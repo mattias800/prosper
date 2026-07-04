@@ -357,6 +357,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x1E: { uint32_t sh = b.ibin(Op_BitwiseAnd, c, b.uconst(31));   // s_lshl_b32
                              d = b.ibin(Op_ShiftLeftLogical, a, sh); break; }        // dst = src0 << (src1 & 31)
                 case 0x26: d = b.ibin(Op_IMul, a, c); break;         // s_mul_i32 (low 32 bits)
+                case 0x27: {                                         // s_bfe_u32: offset=src1[4:0], width=src1[22:16]
+                    uint32_t off = b.ibin(Op_BitwiseAnd, c, b.uconst(0x1f));
+                    uint32_t width = b.ibin(Op_BitwiseAnd, b.ibin(Op_ShiftRightLogical, c, b.uconst(16)), b.uconst(0x7f));
+                    d = b.bfe_u(a, off, width); break;
+                }
                 default: ok = false;
             }
             return true;
