@@ -220,6 +220,14 @@ if(TARGET prosper_core)
       add_executable(test_gpustate_render tests/test_gpustate_render.cpp)
       target_link_libraries(test_gpustate_render PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME gpustate_render COMMAND test_gpustate_render)
+
+      # Payoff demo: recompile the GAME'S OWN embedded shaders and render them on real Vulkan.
+      # Needs both Vulkan and the (gitignored) game dump, so it's gated on HAVE_GAME_DUMP.
+      if(HAVE_GAME_DUMP)
+        add_executable(test_real_shader_render tests/test_real_shader_render.cpp)
+        target_link_libraries(test_real_shader_render PRIVATE prosper_core Vulkan::Vulkan)
+        add_test(NAME real_shader_render COMMAND test_real_shader_render "${GAME_DUMP}/eboot.bin")
+      endif()
       message(STATUS "Vulkan found (${Vulkan_LIBRARY}) — offscreen graphics harness enabled")
     else()
       message(STATUS "Vulkan not found — skipping offscreen graphics harness")
