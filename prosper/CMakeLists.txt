@@ -169,6 +169,12 @@ if(TARGET prosper_core)
     target_link_libraries(test_videoout PRIVATE prosper_core)
     add_test(NAME videoout_queries COMMAND test_videoout)
 
+    # libSceVideoOut flip->present: SubmitFlip scans out the registered buffer; present_readback
+    # returns the presented frame's real pixels. The surface the renderer presents frames to.
+    add_executable(test_present tests/test_present.cpp)
+    target_link_libraries(test_present PRIVATE prosper_core)
+    add_test(NAME videoout_present COMMAND test_present)
+
     # Graphics-phase foundation + agentic-first verification harness: headless offscreen Vulkan
     # (render/clear -> readback -> pixel/CRC assert). Only built if Vulkan dev files are present.
     find_package(Vulkan QUIET)

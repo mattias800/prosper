@@ -12,6 +12,7 @@
 // Sony libs, so they're registered by raw NID with a note on the observed role.
 #include "dispatch.hpp"
 #include "nid.hpp"
+#include "gpu/videoout_present.hpp"
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
@@ -140,6 +141,7 @@ HLE(g_vo_submitflip)  {
     g_flip_count++;
     g_current_buffer = (int32_t)a1;
     g_last_flip_arg = (int64_t)a3;
+    gpu::present_flip((int)(int32_t)a1, (int64_t)a3);   // present the buffer (scanout front + count)
     return 0;
 }
 HLE(g_vo_flippending) { return 0; }                                            // never pending -> can submit next
