@@ -81,6 +81,16 @@ int main() {
     CHECK(prosper_vo_buffer_addr(0) == (uint64_t)(uintptr_t)fb0 &&
           prosper_vo_buffer_addr(2) == (uint64_t)(uintptr_t)fb2, "registry recorded each framebuffer address");
 
+    uint8_t fb1b[16], fb2b[16];
+    VOB offset_buffers[2] = { {fb1b,0,{0,0}}, {fb2b,0,{0,0}} };
+    rc = regb2(0x1001, 0, 1 /*start*/, (uint64_t)(uintptr_t)offset_buffers, 2, (uint64_t)(uintptr_t)attr);
+    CHECK(rc == 0, "RegisterBuffers2 accepted a non-zero buffer_index_start");
+    CHECK(prosper_vo_buffer_count() == 3, "registry exposes the highest registered buffer index");
+    CHECK(prosper_vo_buffer_addr(0) == (uint64_t)(uintptr_t)fb0 &&
+          prosper_vo_buffer_addr(1) == (uint64_t)(uintptr_t)fb1b &&
+          prosper_vo_buffer_addr(2) == (uint64_t)(uintptr_t)fb2b,
+          "registry records non-zero-start buffers at their absolute indices");
+
     uint8_t fs[0x40]; memset(fs, 0xEE, sizeof fs);
     CHECK(flip(0x1001, 2 /*buffer*/, 0 /*mode*/, 0x12345678 /*flipArg*/, 0, 0) == 0,
           "SubmitFlip accepted buffer 2");

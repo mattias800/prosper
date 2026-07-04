@@ -210,9 +210,9 @@ HLE(g_vo_register_buffers2) {  // a0=handle a1=set_index a2=buffer_index_start a
     g_display.pixel_format = *(const uint64_t*)(attr + 0x20);
     g_display.tiling_mode  = *(const uint32_t*)(attr + 0x04);
     const auto* bufs = (const VideoOutBuffers*)(uintptr_t)a3;
-    g_display.buffer_num = num;
     for (int i = 0; i < num && start + i < 16; i++)
         g_display.buffer_addr[start + i] = (uint64_t)(uintptr_t)bufs[i].data;
+    if (g_display.buffer_num < start + num) g_display.buffer_num = start + num;
     g_display.configured = true;
     if (getenv("PROSPER_GFXLOG"))
         fprintf(stderr, "[vo] display surface: %ux%u fmt=0x%llx %d buffers registered\n",
