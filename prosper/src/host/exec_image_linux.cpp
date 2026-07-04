@@ -241,7 +241,7 @@ namespace {
                                      (unsigned long long)uc->uc_mcontext.gregs[REG_RIP]);
                     write(2, b, n);
                 }
-                if (ok) { g_lazy_pages++; return; }  // re-execute against the now-mapped page
+                if (ok) { g_lazy_pages = g_lazy_pages + 1; return; }  // re-execute against the now-mapped page
             }
         }
         // NULL-CHAIN probe (PROSPER_NULL_PAGE, default off): back a low-address read fault with a
