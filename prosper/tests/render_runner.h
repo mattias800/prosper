@@ -52,6 +52,9 @@ inline std::vector<uint8_t> render_triangle_rgba(const std::vector<uint32_t>& ve
     qci.queueFamilyIndex = qfi; qci.queueCount = 1; qci.pQueuePriorities = &prio;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
+    // robustBufferAccess: out-of-range storage-buffer accesses are well-defined, so a predicated memory
+    // op run by an inactive lane (narrowed EXEC) can't fault.
+    VkPhysicalDeviceFeatures feats{}; feats.robustBufferAccess = VK_TRUE; dci.pEnabledFeatures = &feats;
     VkDevice dev = VK_NULL_HANDLE;
     if (vkCreateDevice(phys, &dci, nullptr, &dev) != VK_SUCCESS || !dev) { vkDestroyInstance(inst, nullptr); return out; }
     VkQueue queue; vkGetDeviceQueue(dev, qfi, 0, &queue);

@@ -15,7 +15,8 @@ namespace prosper::test {
 inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const std::vector<float>& input,
                                       uint32_t invocations = 0, uint32_t out_count = 0,
                                       const std::vector<uint32_t>& cbuf = {},
-                                      const std::vector<uint32_t>& cbuf1 = {}) {
+                                      const std::vector<uint32_t>& cbuf1 = {},
+                                      std::vector<uint32_t>* cbuf1_out = nullptr) {
     const uint32_t IN_N = (uint32_t)input.size();
     if (invocations == 0) invocations = IN_N;
     if (out_count == 0)   out_count = IN_N;
@@ -42,6 +43,9 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
     qci.queueFamilyIndex = qfi; qci.queueCount = 1; qci.pQueuePriorities = &prio;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
+    // robustBufferAccess: out-of-range storage-buffer reads/writes are well-defined (return 0 / no-op)
+    // rather than UB — so a predicated memory op executed by an inactive lane (narrowed EXEC) is safe.
+    VkPhysicalDeviceFeatures feats{}; feats.robustBufferAccess = VK_TRUE; dci.pEnabledFeatures = &feats;
     VkDevice dev = VK_NULL_HANDLE;
     if (vkCreateDevice(phys, &dci, nullptr, &dev) != VK_SUCCESS || !dev) { vkDestroyInstance(inst, nullptr); return out; }
     VkQueue queue; vkGetDeviceQueue(dev, qfi, 0, &queue);
@@ -150,6 +154,13 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
     void* op = nullptr; vkMapMemory(dev, outMem, 0, outBytes, 0, &op);
     for (uint32_t i = 0; i < out_count; i++) out[i] = ((float*)op)[i];
     vkUnmapMemory(dev, outMem);
+    // Optional: read back binding-3 (cbuf1) contents — for verifying MUBUF stores that target it.
+    if (cbuf1_out) {
+        cbuf1_out->resize(CB1_N);
+        void* rp = nullptr; vkMapMemory(dev, cbMem1, 0, cbBytes1, 0, &rp);
+        for (uint32_t i = 0; i < CB1_N; i++) (*cbuf1_out)[i] = ((uint32_t*)rp)[i];
+        vkUnmapMemory(dev, cbMem1);
+    }
 
     vkDestroyFence(dev, fence, nullptr); vkDestroyCommandPool(dev, pool, nullptr);
     vkDestroyPipeline(dev, pipe, nullptr); vkDestroyPipelineLayout(dev, layout, nullptr);

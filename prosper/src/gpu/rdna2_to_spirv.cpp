@@ -27,7 +27,7 @@ enum : uint32_t {
     Op_BitReverse=204,
     Op_TypeImage=25, Op_TypeSampledImage=27, Op_SampledImage=86,
     Op_ImageSampleImplicitLod=87, Op_ImageFetch=95, Op_Image=100,
-    Op_Label=248, Op_Return=253,
+    Op_SelectionMerge=247, Op_Label=248, Op_Branch=249, Op_BranchConditional=250, Op_Return=253,
 };
 // GLSL.std.450 extended-instruction numbers.
 enum : uint32_t { Glsl_Trunc=3, Glsl_Floor=8, Glsl_Ceil=9, Glsl_Fract=10, Glsl_Exp2=29, Glsl_Log2=30,
@@ -204,6 +204,24 @@ struct SpirvCompute {
         uint32_t buf = slot ? v_cbuf1 : v_cbuf;
         uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_sb_u32, p, buf, uconst(0), idx});
         uint32_t r = id(); put(code, Op_Load, {t_u32, r, p}); return r;
+    }
+    // Store one dword `value` to constant/vertex buffer `slot` at dword index `idx` (MUBUF store). When
+    // `predicated`, the store is wrapped in a selection merge on `pred` (the per-lane EXEC bool) so
+    // inactive lanes do not write — a real conditional store, not a select of a loaded old value.
+    void cbuf_store(uint32_t idx, uint32_t value, uint32_t slot, bool predicated, uint32_t pred) {
+        uint32_t buf = slot ? v_cbuf1 : v_cbuf;
+        if (!predicated) {
+            uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_sb_u32, p, buf, uconst(0), idx});
+            put(code, Op_Store, {p, value}); return;
+        }
+        uint32_t then = id(), merge = id();
+        put(code, Op_SelectionMerge, {merge, 0});
+        put(code, Op_BranchConditional, {pred, then, merge});
+        put(code, Op_Label, {then});
+        uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_sb_u32, p, buf, uconst(0), idx});
+        put(code, Op_Store, {p, value});
+        put(code, Op_Branch, {merge});
+        put(code, Op_Label, {merge});
     }
     // Declare the two scalar-memory constant/vertex buffers (bindings 2 & 3) that SMEM / buffer_load_
     // format_* read. Called by every shell (compute/vertex/fragment) so cbuf_load works in each.
@@ -783,7 +801,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // + inst-offset; index = addr>>2; N dwords -> VDATA..+N-1. Descriptor (SRSRC), idxen*stride,
             // and the format-converting buffer_load_format_* variants are deferred. Compute-only (cbuf).
             if (!allow_smem) { ok = false; return true; }
-            uint32_t n = 0; bool is_format = false;
+            uint32_t n = 0; bool is_format = false, is_store = false;
             switch (in.opcode) {
                 case 0xC: n = 1; break;                     // buffer_load_dword
                 case 0xD: n = 2; break;                     // buffer_load_dwordx2
@@ -792,7 +810,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x1: n = 2; is_format = true; break;   // buffer_load_format_xy
                 case 0x2: n = 3; is_format = true; break;   // buffer_load_format_xyz
                 case 0x3: n = 4; is_format = true; break;   // buffer_load_format_xyzw
-                default: ok = false; return true;           // stores / typed / packed formats not yet
+                case 0x1C: n = 1; is_store = true; break;   // buffer_store_dword
+                case 0x1D: n = 2; is_store = true; break;   // buffer_store_dwordx2
+                case 0x1E: n = 4; is_store = true; break;   // buffer_store_dwordx4
+                case 0x4: n = 1; is_format = true; is_store = true; break;   // buffer_store_format_x
+                case 0x5: n = 2; is_format = true; is_store = true; break;   // buffer_store_format_xy
+                case 0x6: n = 3; is_format = true; is_store = true; break;   // buffer_store_format_xyz
+                case 0x7: n = 4; is_format = true; is_store = true; break;   // buffer_store_format_xyzw
+                default: ok = false; return true;           // typed / atomics not yet
             }
             uint32_t offset = in.literal & 0xFFFu;
             bool offen = (in.literal >> 12) & 1u, idxen = (in.literal >> 13) & 1u;
@@ -839,6 +864,21 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             else if (offen)      addr = b.ibin(Op_IAdd, addr, val(in.src[0]));
             addr = b.ibin(Op_IAdd, addr, val(in.src[2]));              // SOFFSET
             uint32_t idx = b.ibin(Op_ShiftRightLogical, addr, b.uconst(2));
+            if (is_store) {
+                // Store the VDATA VGPRs (in.dst..+n-1) to the buffer. Only raw/Float32 (4-byte) stores
+                // are implemented; packed-format packing (unorm/snorm/f16) is deferred, not faked.
+                if (packed) { ok = false; return true; }
+                for (uint32_t k = 0; k < n; k++) {
+                    uint32_t kidx = k ? b.ibin(Op_IAdd, idx, b.uconst(k)) : idx;
+                    int s = in.dst.value + (int)k;
+                    auto it = rs.vreg.find(s);
+                    uint32_t val_bits = (it == rs.vreg.end()) ? b.uconst(0) : it->second;
+                    // Under a narrowed EXEC (e.g. after v_cmpx), inactive lanes must not write — emit a
+                    // real conditional store; when EXEC is full, store unconditionally.
+                    b.cbuf_store(kidx, val_bits, slot, rs.exec_narrowed, rs.exec);
+                }
+                return true;
+            }
             for (uint32_t k = 0; k < n; k++) {
                 int d = in.dst.value + (int)k;
                 uint32_t old = vreg_old(b, rs, d);

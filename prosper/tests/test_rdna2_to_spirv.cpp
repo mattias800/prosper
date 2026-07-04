@@ -558,6 +558,46 @@ int main() {
            bad28, got28t.size()==N?got28t[0]:-1, got28f.size()==N?got28f[0]:-1);
     CHECK(got28t.size()==N && got28f.size()==N && bad28==0, "recompiled kernel 28 (SCC compare -> cselect) correct");
 
+    // Kernel 29: MUBUF STORE. v2 = (uint)gid; v3 = 2*float(gid); buffer_store_format_x v3, v2, s[8:11]
+    // idxen -> binding-3 buffer[gid] = 2*gid. Reads back the stored buffer (cbuf1_out) and checks it.
+    const uint32_t code29[] = { 0x7e040f00u, 0x06060100u, 0xe0102000u, 0x80020302u, 0xbf810000u };
+    ShaderResourceTable rt29;
+    { ShaderResource vb{}; vb.cls = ResourceClass::VertexBuffer; vb.format = DataFormat::Float32;
+      vb.num_components = 1; vb.binding = 3; vb.stride = 4; vb.sgpr_base = 8; rt29.resources.push_back(vb); }
+    std::vector<uint32_t> spv29 = recompile_valu(code29, sizeof(code29)/sizeof(code29[0]), 1, 0, &rt29);
+    CHECK(!spv29.empty(), "recompiled kernel 29 (buffer_store_format_x) -> SPIR-V");
+    std::vector<float> in29(N); for (uint32_t i = 0; i < N; i++) in29[i] = (float)i;
+    std::vector<uint32_t> stored(N, 0), stored_out;
+    prosper::test::run_compute(spv29, in29, N, N, /*cbuf0*/{}, /*cbuf1=store target*/stored, &stored_out);
+    uint32_t bad29 = 0;
+    for (uint32_t i = 0; i < N && stored_out.size() == N; i++) {
+        float f; std::memcpy(&f, &stored_out[i], 4);
+        if (std::fabs(f - 2.0f*(float)i) > 1e-3f) bad29++;
+    }
+    { float f5 = 0; if (stored_out.size()==N) std::memcpy(&f5, &stored_out[5], 4);
+      printf("  kernel29 mismatches=%u (buf[5]=%g expect=10)\n", bad29, f5); }
+    CHECK(stored_out.size() == N && bad29 == 0, "recompiled kernel 29 (MUBUF store writes buffer[gid]=2*gid) correct");
+
+    // Kernel 30: EXEC-PREDICATED store. v_cmpx_lt_u32 narrows EXEC to lanes gid<4, then buffer_store_
+    // format_x. Only active lanes must write (conditional store via a selection merge); lanes gid>=4
+    // leave the buffer at its initial 0. Proves the predicated-store path (not just full-EXEC stores).
+    const uint32_t code30[] = {
+        0x7e040f00u, 0x06060100u, 0x7e0a0284u, 0x7da20b02u, 0xe0102000u, 0x80020302u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv30 = recompile_valu(code30, sizeof(code30)/sizeof(code30[0]), 1, 0, &rt29);
+    CHECK(!spv30.empty(), "recompiled kernel 30 (v_cmpx + predicated MUBUF store) -> SPIR-V");
+    std::vector<uint32_t> stored30(N, 0), stored30_out;
+    prosper::test::run_compute(spv30, in29, N, N, /*cbuf0*/{}, /*cbuf1*/stored30, &stored30_out);
+    uint32_t bad30 = 0;
+    for (uint32_t i = 0; i < N && stored30_out.size() == N; i++) {
+        float f; std::memcpy(&f, &stored30_out[i], 4);
+        float expect = (i < 4) ? 2.0f*(float)i : 0.0f;
+        if (std::fabs(f - expect) > 1e-3f) bad30++;
+    }
+    { float f2 = 0, f9 = 0; if (stored30_out.size()==N) { std::memcpy(&f2,&stored30_out[2],4); std::memcpy(&f9,&stored30_out[9],4); }
+      printf("  kernel30 mismatches=%u (buf[2]=%g expect=4, buf[9]=%g expect=0)\n", bad30, f2, f9); }
+    CHECK(stored30_out.size() == N && bad30 == 0, "recompiled kernel 30 (predicated store: only lanes gid<4 write) correct");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
