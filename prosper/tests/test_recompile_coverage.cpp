@@ -28,6 +28,15 @@ int main() {
     CHECK(b.total == 2 && b.alu == 1 && b.unsupported == 1 && b.first_bad_fmt >= 0 && b.first_bad_op == 0x02,
           "an unconditional s_branch is reported as the first unsupported instruction");
 
+    // A forward VCC branch is not covered by EXEC predication. Treating it as a no-op would execute
+    // the skipped block even when VCC says to branch, so the recompiler must reject it for now.
+    const uint32_t vcc_branch[] = { 0x7da80300u, 0xbf860001u, 0x4a060300u, 0xBF810000u };
+    RecompileCoverage c = recompile_coverage(vcc_branch, sizeof(vcc_branch)/sizeof(vcc_branch[0]));
+    CHECK(c.unsupported == 1 && c.first_bad_fmt >= 0 && c.first_bad_op == 0x06,
+          "a forward s_cbranch_vccz is rejected instead of linearized as a no-op");
+    CHECK(recompile_valu(vcc_branch, sizeof(vcc_branch)/sizeof(vcc_branch[0]), 2, 3).empty(),
+          "the production recompiler rejects the unsafe forward VCC branch");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

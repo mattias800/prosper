@@ -512,11 +512,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             return true;
         }
         case Rdna2Format::SOPP: {
-            // Control flow. With EXEC per-write predication, a FORWARD conditional branch (the common
-            // "skip the block if no lane is active" optimization) is semantically a no-op: executing
-            // the block predicated by EXEC yields the same result. A BACKWARD branch is a loop and an
-            // unconditional s_branch skips a block outright — neither is correct under linear
-            // predication, so reject (fail loudly) rather than mis-execute.
+            // Control flow. The only branch we can safely linearize today is the common forward
+            // s_cbranch_execz "skip the EXEC-predicated block if no lane is active" idiom. Branches
+            // on SCC/VCC (or EXECNZ) can skip code for reasons not represented by EXEC predication,
+            // so accepting them as no-ops would silently execute the wrong path.
             switch (in.opcode) {
                 // Hints / sync with no effect in our synchronous SSA model — safe no-ops.
                 case 0x00:   // s_nop
@@ -526,11 +525,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x22:   // s_wait_idle
                 case 0x7d:   // s_waitcnt_vscnt
                     break;
-                case 0x04: case 0x05:                              // s_cbranch_scc0 / scc1
-                case 0x06: case 0x07:                              // s_cbranch_vccz / vccnz
-                case 0x08: case 0x09:                              // s_cbranch_execz / execnz
+                case 0x08:                                          // s_cbranch_execz
                     if (in.simm16 < 0) ok = false;                 // backward = loop -> unsupported
                     break;                                          // forward = no-op (predication covers it)
+                case 0x04: case 0x05:                              // s_cbranch_scc0 / scc1
+                case 0x06: case 0x07:                              // s_cbranch_vccz / vccnz
+                case 0x09:                                         // s_cbranch_execnz
+                    ok = false;
+                    break;
                 default: ok = false;   // s_branch / s_sendmsg / s_barrier / s_setreg / etc. -> reject
             }
             return true;
