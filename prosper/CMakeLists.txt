@@ -233,6 +233,12 @@ if(TARGET prosper_core)
       target_link_libraries(test_recompiled_shaders PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME recompiled_shaders_render COMMAND test_recompiled_shaders)
 
+      # Vertex fetch: a VS that pulls positions from a bound vertex buffer via buffer_load_format,
+      # keyed by a ShaderResourceTable — real game vertex shaders work this way.
+      add_executable(test_vertex_fetch_render tests/test_vertex_fetch_render.cpp)
+      target_link_libraries(test_vertex_fetch_render PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME vertex_fetch_render COMMAND test_vertex_fetch_render)
+
       # Pipeline realization: build a VkPipeline whose fixed-function state comes from
       # resolve_pipeline_state(RenderState) and prove the resolved state drives rendering.
       add_executable(test_pipeline_render tests/test_pipeline_render.cpp)
