@@ -24,6 +24,7 @@ HLE(s_user_idlist)    { if (a0) { int32_t* p = (int32_t*)PW(a0); p[0] = 1; for (
 // stack-smash if a2 is large/garbage). snprintf writes only the string + NUL.
 HLE(s_user_name)      { if (a1) snprintf((char*)PW(a1), a2 ? (size_t)a2 : 17, "%s", "Player"); return 0; }
 HLE(s_user_int_out)   { if (a1) *(int32_t*)PW(a1) = 0; return 0; }           // accessibility getters -> 0
+HLE(s_user_age)       { if (a1) *(int32_t*)PW(a1) = 18; return 0; }          // GetAgeLevel -> adult (no restriction)
 HLE(s_ok)             { return 0; }
 
 // --- NP / online (single-player: report signed-out / unreachable, success) ---
@@ -57,6 +58,15 @@ void register_service_hle() {
     R("sceUserServiceGetAccessibilityVibration", s_user_int_out);
     R("sceUserServiceGetAccessibilityPressAndHoldDelay", s_user_int_out);
     R("sceUserServiceGetAccessibilityZoomEnabled", s_user_int_out);
+    // More (userId, int* out) getters the game queries at startup — same family: write a sane default
+    // (accessibility off = 0; age level = adult) so the caller reads a deterministic value instead of
+    // uninitialized stack. Registered by raw NID (guaranteed match; these names aren't in our NidDb).
+    Hle::register_fn("woNpu+45RLk", (HleFn)s_user_age,     "sceUserServiceGetAgeLevel");
+    Hle::register_fn("rnEhHqG-4xo", (HleFn)s_user_int_out, "sceUserServiceGetAccessibilityChatTranscription");
+    Hle::register_fn("O6IW1-Dwm-w", (HleFn)s_user_int_out, "sceUserServiceGetAccessibilityZoomFollowFocus");
+    Hle::register_fn("-3Y5GO+-i78", (HleFn)s_user_int_out, "sceUserServiceGetAccessibilityTriggerEffect");
+    // NOTE: sceUserServiceGetGamePresets (-sD02mFDBh4) intentionally left unimplemented — its output is
+    // a struct of unknown layout; writing a wrong-size default would risk a stack smash (cf. f_fstat).
     R("sceUserServiceInitialize", s_ok);
     R("sceUserServiceTerminate", s_ok);
     // NP

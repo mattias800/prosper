@@ -531,6 +531,21 @@ void register_kernel_hle() {
     R("sceKernelCreateSema", k_sema_create);    R("sceKernelDeleteSema", k_sema_delete);
     R("sceKernelWaitSema", k_sema_wait);        R("sceKernelSignalSema", k_sema_signal);
     R("sceKernelPollSema", k_sema_poll);
+    // Registration / hook / debug libkernel calls the app makes at startup that have no observable
+    // effect in our headless boot — returning OK without side effects is the correct behavior:
+    //  - SetThreadDtors / SetThreadAtexitCount / SetThreadAtexitReport: per-thread exit bookkeeping;
+    //    our guest threads never cleanly exit (process is torn down), so there's nothing to run.
+    //  - RtldSetApplicationHeapAPI: lets the app give the dynamic linker a custom malloc; unset -> the
+    //    linker uses its default heap, which is what we already run on.
+    //  - GetSanitizerNewReplaceExternal: reports whether a sanitizer replaced operator new; 0 = none.
+    //  - SetVirtualRangeName: debug label for a VA range; no runtime effect.
+    // Registered by raw NID (guaranteed match; names not in our NidDb).
+    Hle::register_fn("rNhWz+lvOMU", (HleFn)k_attr_noop, "sceKernelSetThreadDtors");
+    Hle::register_fn("pB-yGZ2nQ9o", (HleFn)k_attr_noop, "sceKernelSetThreadAtexitCount");
+    Hle::register_fn("WhCc1w3EhSI", (HleFn)k_attr_noop, "sceKernelSetThreadAtexitReport");
+    Hle::register_fn("p5EcQeEeJAE", (HleFn)k_attr_noop, "sceKernelRtldSetApplicationHeapAPI");
+    Hle::register_fn("bnZxYgAFeA0", (HleFn)k_attr_noop, "sceKernelGetSanitizerNewReplaceExternal");
+    Hle::register_fn("DGMG3JshrZU", (HleFn)k_attr_noop, "sceKernelSetVirtualRangeName");
     #undef R
     register_kernel_mem_hle();    // virtual/direct memory
     register_kernel_time_hle();   // time/clock + C11 threads + stubs
