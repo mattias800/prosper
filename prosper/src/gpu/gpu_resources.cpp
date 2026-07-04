@@ -6,15 +6,17 @@
 // layers the actual VkImage/VkBuffer creation on top in the next increment. Handles are opaque and
 // never recycled within a run, so a stale handle is detectably invalid rather than silently aliased.
 #include "gpu_resources.hpp"
+#include <deque>
 #include <mutex>
-#include <vector>
 
 namespace prosper::gpu {
 
 namespace {
     std::mutex g_mtx;
     // Slot 0 is reserved so handle 0 stays "invalid"; a handle is simply (index into g_res).
-    std::vector<ResourceDesc> g_res = { ResourceDesc{} };
+    // deque keeps existing descriptor addresses stable as new resources are appended; callers hold
+    // resource_get() pointers after the registry lock is released.
+    std::deque<ResourceDesc> g_res = { ResourceDesc{} };
 }
 
 ResourceHandle resource_create(const ResourceDesc& desc) {

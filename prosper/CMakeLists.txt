@@ -50,6 +50,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_hle_registered PRIVATE prosper_core)
   add_test(NAME hle_functions_registered COMMAND test_hle_registered)
 
+  add_executable(test_agc_shader tests/test_agc_shader.cpp)
+  target_link_libraries(test_agc_shader PRIVATE prosper_core)
+  add_test(NAME agc_shader_create COMMAND test_agc_shader)
+
   add_executable(test_stat tests/test_stat.cpp)
   target_link_libraries(test_stat PRIVATE prosper_core)
   add_test(NAME sce_stat_layout COMMAND test_stat)
@@ -74,6 +78,11 @@ if(TARGET prosper_core)
   add_executable(test_rdna2_decode tests/test_rdna2_decode.cpp)
   target_link_libraries(test_rdna2_decode PRIVATE prosper_core)
   add_test(NAME rdna2_decode_walk COMMAND test_rdna2_decode)
+
+  # Structural RDNA2->SPIR-V validation that does not require Vulkan runtime support.
+  add_executable(test_rdna2_spirv_struct tests/test_rdna2_spirv_struct.cpp)
+  target_link_libraries(test_rdna2_spirv_struct PRIVATE prosper_core)
+  add_test(NAME rdna2_spirv_struct COMMAND test_rdna2_spirv_struct)
 
   # shader_histo: data-driven recompiler-coverage report over the game's real embedded RDNA2 shaders.
   add_executable(shader_histo tools/shader_histo/shader_histo.cpp)

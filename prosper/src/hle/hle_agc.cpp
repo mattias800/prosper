@@ -215,6 +215,12 @@ HLE(agc_create_shader) {  // (Shader** dst, void* header, const void* code)
     auto*  code  = (const void*)(uintptr_t)a2;
     if (!dst || !h || !code) return kAgcErrInvalidArg;
 
+    if (h->file_header != 0x34333231u || h->version != 0x18u) {
+        fprintf(stderr, "[agc] CreateShader: unexpected header magic=0x%08x version=0x%x (want '1234'/0x18)\n",
+                h->file_header, h->version);
+        return kAgcErrInvalidArg;   // wrong layout model -- fail loudly rather than corrupt the blob
+    }
+
     if (agc_relocated().insert(h).second) {
         agc_fix_ptr(h->cx_registers);
         agc_fix_ptr(h->sh_registers);
@@ -228,12 +234,6 @@ HLE(agc_create_shader) {  // (Shader** dst, void* header, const void* code)
         }
     }
     h->code = code;
-
-    if (h->file_header != 0x34333231u || h->version != 0x18u) {
-        fprintf(stderr, "[agc] CreateShader: unexpected header magic=0x%08x version=0x%x (want '1234'/0x18)\n",
-                h->file_header, h->version);
-        return kAgcErrInvalidArg;   // wrong layout model — fail loudly rather than corrupt the blob
-    }
 
     // Patch the shader-program base into the leading SPI/COMPUTE PGM_LO/HI register pair. The blob
     // pre-seeds the pair's offsets, so match any known stage rather than gating on `type` (Kyty

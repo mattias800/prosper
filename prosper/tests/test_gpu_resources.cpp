@@ -45,6 +45,18 @@ int main() {
     CHECK(resource_get(h_vb + 100) == nullptr && !resource_valid(h_vb + 100),
           "an out-of-range handle is invalid (no silent aliasing)");
 
+    const ResourceDesc* pinned_rt = resource_get(h_rt);
+    for (int i = 0; i < 4096; i++) {
+        ResourceDesc tmp{};
+        tmp.kind = ResourceKind::Buffer;
+        tmp.gpu_addr = 0xE0000000ull + (uint64_t)i * 0x1000u;
+        tmp.size = 256;
+        tmp.usage = Usage_Storage;
+        resource_create(tmp);
+    }
+    CHECK(pinned_rt == resource_get(h_rt) && pinned_rt && pinned_rt->width == 1920,
+          "resource_get pointers remain stable as the registry grows");
+
     resource_reset();
     CHECK(resource_count() == 0 && !resource_valid(h_rt), "reset clears the registry");
 
