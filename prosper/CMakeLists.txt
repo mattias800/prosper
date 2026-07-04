@@ -158,6 +158,12 @@ if(TARGET prosper_core)
     target_link_libraries(test_agc_submit PRIVATE prosper_core)
     add_test(NAME agc_submit_to_gpustate COMMAND test_agc_submit)
 
+    # libSceVideoOut: query/config functions return real 1080p60 values + swapchain-scaffolding
+    # display-buffer registry records the game's registered framebuffers.
+    add_executable(test_videoout tests/test_videoout.cpp)
+    target_link_libraries(test_videoout PRIVATE prosper_core)
+    add_test(NAME videoout_queries COMMAND test_videoout)
+
     # Graphics-phase foundation + agentic-first verification harness: headless offscreen Vulkan
     # (render/clear -> readback -> pixel/CRC assert). Only built if Vulkan dev files are present.
     find_package(Vulkan QUIET)

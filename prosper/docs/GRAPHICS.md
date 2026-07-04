@@ -100,6 +100,31 @@ initializers to construct valid GPU objects (correctness-first — no plausible-
 - Graphics libs are sparsely documented; most NIDs don't resolve to names — reverse-engineer from
   call args (`PROSPER_GFXLOG`) and `build-linux/tools/pltm` (maps a module GOT offset → NID).
 
+## ✔ libSceVideoOut real 1080p60 + swapchain scaffolding (2026-07-04) — and the [+0x140] gate is NOT the display surface
+
+Implemented the 5 previously-unimplemented VideoOut NIDs with real, self-consistent values (resolved
+via shadPS4 aerolib + Kyty VideoOut.cpp): `Nv8c-Kb+DUM` sceVideoOutIsOutputSupported, `PjS5uASwcV8`
+sceVideoOutSetBufferAttribute2, `rKBUtgRrtbk` sceVideoOutRegisterBuffers2, `utPrVdxio-8`
+sceVideoOutGetOutputStatus, `w0hLuNarQxY` sceVideoOutConfigureOutput. Plus fixed GetResolutionStatus
+(was all-zero → now 1920×1080@59.94Hz) and added GetVblankStatus (advancing counter) +
+GetDeviceCapabilityInfo (SDR). All output-struct writes are size-exact.
+
+**Verified the game requests exactly what we advertise:** `SetBufferAttribute2` arrives with
+`width=0x780 (1920)`, `height=0x438 (1080)`, `pixel_format=0x8000000000000000` (PS5 A8R8G8B8 sRGB);
+`RegisterBuffers2` registers **3** framebuffers (triple-buffered). Recorded them in a display-buffer
+registry (swapchain scaffolding, `prosper_vo_buffer_count/_display_width/_height/_format/_buffer_addr`)
+that the back-half present path turns into swapchain images. test_videoout (27 tests total).
+
+**Hypothesis result (agent-2 asked): the display surface is NOT what gates the `[+0x140]` companion.**
+With all 5 VideoOut calls returning real 1080p60 values + buffers registered, the boot still faults at
+**the same `eboot+0xba6e08`** (unchanged). So VideoOut is eliminated as the suspect — Unity allocates
+the pipeline companion independent of display-surface availability. The residency interception belongs
+in the back-half (GpuState/register-context stage), as concluded below.
+
+Note: `GetOutputStatus` currently traces + returns success without writing its output struct — its
+exact layout/size is unconfirmed and the game tolerates a no-write return (boot reaches the same
+downstream fault). Left non-writing rather than risk a wrong-size write (stack-canary smash).
+
 ## ✔ BOUNDED TRACE ANSWER (2026-07-04): the pipeline object is Unity-INTERNAL — no HLE hook exists
 
 Back-half asked one bounded question: does the fault object `r15` (or its `[+0x18]`/`[+0x40]`
