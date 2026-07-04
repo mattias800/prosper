@@ -20,6 +20,15 @@ namespace prosper::gpu {
 // buffer and bumps the present counter. `flip_arg` is the guest's flip label (echoed in flip status).
 void present_flip(int buffer_index, int64_t flip_arg);
 
+// Receiving side of the present path: the back-half renderer hands its finished frame (w*h pixels,
+// 4 bytes/pixel) to the present layer. present_readback then returns THIS frame — the real rendered
+// pixels — instead of the raw guest display buffer, closing the loop shader → render →
+// present_write_frame → present_readback. Thread-safe (renderer writes, present reads).
+void present_write_frame(const void* pixels, uint32_t w, uint32_t h);
+
+// True once a rendered frame has been handed in (readback returns rendered pixels, not the guest buffer).
+bool present_has_frame();
+
 int      present_front_index();   // currently-presented buffer index (-1 before the first flip)
 uint64_t present_count();         // total flips presented
 uint32_t present_width();
