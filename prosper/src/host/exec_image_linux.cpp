@@ -55,6 +55,17 @@ namespace {
     bool g_faultmem = false;
     bool g_faultlog = false;
     int  g_devnull_fd = -1;
+    // DIAGNOSTIC (PROSPER_SKIP_NULL_COMPANION, default off): at the Unity GfxDevice pipeline reader
+    // eboot+0xba6e08 — which derefs a null GPU-companion pointer [obj+0x140] for pipelines that were
+    // never processed — log the object state and redirect RIP to the reader's own skip label
+    // (eboot+0xba6e40, where its type/flag-check branches already land) so processing continues as if
+    // the companion weren't needed. This is a *probe* to reveal whether the null companion is the sole
+    // blocker or one of a cascade — NOT a fix (the companions are still not real). eboot base is the
+    // fixed 0x400000000 in this project; overridable via PROSPER_SKIP_RIP / PROSPER_SKIP_TARGET.
+    bool     g_skip_null_companion = false;
+    uint64_t g_skip_rip    = 0x400ba6e08ull;   // reader companion deref (mov 0x8(%rsi),%rax; rsi=null)
+    uint64_t g_skip_target = 0x400ba6e40ull;   // reader skip label (continues via [obj+0x520/0x530])
+    volatile sig_atomic_t g_skip_count = 0;
     // PROSPER_PEEK dumps offsets off registers at fault time. Supports N specs separated by ';',
     // each "reg:off,off,..."; an offset may be prefixed '*' to chase one pointer level first
     // (e.g. "r15:*0x18+0x0" = read [[r15+0x18]+0x0]).
@@ -153,6 +164,28 @@ namespace {
                     write(2, b, n);
                 }
                 if (ok) { g_lazy_pages++; return; }  // re-execute against the now-mapped page
+            }
+        }
+        // Null-companion skip probe (diagnostic; see g_skip_null_companion). Redirect the reader past
+        // the null [obj+0x140] deref to its own skip label, logging each object's state.
+        if (g_skip_null_companion && sig == SIGSEGV) {
+            auto* uc = (ucontext_t*)uctx;
+            uint64_t rip = (uint64_t)uc->uc_mcontext.gregs[REG_RIP];
+            if (rip == g_skip_rip) {
+                uint64_t r15 = (uint64_t)uc->uc_mcontext.gregs[REG_R15];
+                g_skip_count = g_skip_count + 1;
+                auto rd = [](uint64_t a) -> unsigned long long {
+                    return probe_readable(a) ? (unsigned long long)*(const uint64_t*)a : 0xBADBADull;
+                };
+                char b[256];
+                int n = snprintf(b, sizeof b,
+                    "[skip] #%d r15=0x%llx [+0xc0]=0x%llx [+0xe0]=0x%llx [+0x138]=0x%llx [+0x140]=0x%llx "
+                    "[+0x1a0]=0x%llx -> skip to 0x%llx\n",
+                    (int)g_skip_count, (unsigned long long)r15, rd(r15+0xc0), rd(r15+0xe0),
+                    rd(r15+0x138), rd(r15+0x140), rd(r15+0x1a0), (unsigned long long)g_skip_target);
+                write(2, b, n);
+                uc->uc_mcontext.gregs[REG_RIP] = (greg_t)g_skip_target;
+                return;   // re-execute from the reader's skip label
             }
         }
         if (g_faultlog) {
@@ -266,7 +299,10 @@ void install_sigaltstack() {
 void install_trap_handler() {
     g_faultmem = getenv("PROSPER_FAULTMEM") != nullptr;   // read once (getenv is not signal-safe)
     g_faultlog = getenv("PROSPER_FAULTLOG") != nullptr;
-    if (g_faultmem && g_devnull_fd < 0)
+    g_skip_null_companion = getenv("PROSPER_SKIP_NULL_COMPANION") != nullptr;
+    if (const char* r = getenv("PROSPER_SKIP_RIP"))    g_skip_rip    = strtoull(r, nullptr, 0);
+    if (const char* t = getenv("PROSPER_SKIP_TARGET")) g_skip_target = strtoull(t, nullptr, 0);
+    if ((g_faultmem || g_skip_null_companion) && g_devnull_fd < 0)
         g_devnull_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
     // PROSPER_PEEK="r15:0x140,0x1a0;rbx:0x78,0x88;r15:*0x18+0x0" — N specs (';'), each reg:off[,off];
     // a '*pre+off' offset chases one pointer level ([[reg+pre]+off]). Parsed once (getenv unsafe at fault).
