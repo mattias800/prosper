@@ -38,6 +38,7 @@ enum : uint32_t {
     EM_OriginUpperLeft=7, EM_LocalSize=17,
     SC_Input=1, SC_UniformConstant=0, SC_Output=3, SC_StorageBuffer=12, FC_None=0,
     Dim_2D=1,   // SPIR-V Dim (2D image). (Note: coincides with the SQ_RSRC 2D dim value, but distinct.)
+    ImgOp_Lod=2,   // ImageOperands bit: an explicit LOD follows (for OpImageFetch on a sampled image).
     Dec_Block=2, Dec_ArrayStride=6, Dec_BuiltIn=11, Dec_Location=30, Dec_Binding=33,
     Dec_DescriptorSet=34, Dec_Offset=35,
     BI_Position=0, BI_GlobalInvocationId=28, BI_VertexIndex=42,
@@ -166,6 +167,20 @@ struct SpirvCompute {
         uint32_t si    = id(); put(code, Op_Load, {t_sampled_image, si, tex_var[binding]});
         uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
         uint32_t res   = id(); put(code, Op_ImageSampleImplicitLod, {t_v4f, res, si, coord});
+        for (uint32_t c = 0; c < 4; c++) {
+            uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, res, c}); out[c] = bcu(e);
+        }
+    }
+    // 2-component uint vector (integer texel coordinates for OpImageFetch).
+    uint32_t t_v2u_cache = 0;
+    uint32_t t_v2u() { if (!t_v2u_cache) { t_v2u_cache = id(); put(types, Op_TypeVector, {t_v2u_cache, t_u32, 2}); } return t_v2u_cache; }
+    // image_load 2D (image_load): texelFetch the image at the combined sampler's `binding` with INTEGER
+    // (x,y) coords (raw VGPR bits). OpImage strips the sampler; OpImageFetch at explicit LOD 0.
+    void image_fetch_2d(uint32_t binding, uint32_t x_bits, uint32_t y_bits, uint32_t out[4]) {
+        uint32_t si    = id(); put(code, Op_Load,  {t_sampled_image, si, tex_var[binding]});
+        uint32_t img   = id(); put(code, Op_Image, {t_image, img, si});
+        uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v2u(), coord, x_bits, y_bits});
+        uint32_t res   = id(); put(code, Op_ImageFetch, {t_v4f, res, img, coord, ImgOp_Lod, uconst(0)});
         for (uint32_t c = 0; c < 4; c++) {
             uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, res, c}); out[c] = bcu(e);
         }
@@ -792,7 +807,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // not mis-translated.
             if (!allow_smem || !rt) { ok = false; return true; }
             const uint32_t SQ_DIM_2D = 1u;
-            if (in.opcode != 0x20 || in.mimg_dim != SQ_DIM_2D || in.len_dwords != 2) { ok = false; return true; }
+            // image_sample = 0x20 (normalized float coords + sampler), image_load = 0x00 (integer texel
+            // fetch, no sampler). 2D, non-NSA only; other dims / NSA / LOD-gradient-compare deferred.
+            const bool is_sample = (in.opcode == 0x20), is_load = (in.opcode == 0x00);
+            if ((!is_sample && !is_load) || in.mimg_dim != SQ_DIM_2D || in.len_dwords != 2) { ok = false; return true; }
             // Resolve the T# via SRSRC (src[1]) provenance: s_load tag (indirect) else user-data SGPR.
             const ShaderResource* res = nullptr;
             { auto it = rs.sreg_srt.find(in.src[1].value);
@@ -800,10 +818,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
               if (!res) res = rt->by_sgpr_base(in.src[1].value); }
             if (!res || res->cls != ResourceClass::Texture) { ok = false; return true; }
             b.declare_texture(res->binding);
-            // 2D non-NSA: u = VGPR[VADDR], v = VGPR[VADDR+1] (image_sample = normalized float coords).
+            // coords: VGPR[VADDR], VGPR[VADDR+1] — normalized float for sample, integer texel for load.
             int va = in.src[0].value;
             auto vread = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
-            uint32_t out[4]; b.image_sample_2d(res->binding, vread(va), vread(va + 1), out);
+            uint32_t out[4];
+            if (is_sample) b.image_sample_2d(res->binding, vread(va), vread(va + 1), out);
+            else           b.image_fetch_2d (res->binding, vread(va), vread(va + 1), out);
             // dmask selects which result components are written to consecutive VDATA VGPRs (LSB=R first).
             int vd = in.dst.value, w = 0;
             for (uint32_t c = 0; c < 4; c++) if (in.mimg_dmask & (1u << c)) {

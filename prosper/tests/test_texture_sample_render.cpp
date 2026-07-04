@@ -81,6 +81,29 @@ int main() {
     printf("  (0.25,0.75) center=(%u,%u,%u)\n", ok2?rgb[0]:0, ok2?rgb[1]:0, ok2?rgb[2]:0);
     CHECK(ok2 && rgb[2] > 0x80 && rgb[0] < 0x40 && rgb[1] < 0x40, "sampling texel (0,1) yields BLUE (proves v routing)");
 
+    // image_load (integer texel fetch, no sampler): x,y = inline-int coords into v0,v1; image_load
+    // v[0:3], v[0:1], s[8:15]; exp mrt0. Coord (x,y) directly indexes the texel — no filtering.
+    const uint32_t il_template[] = {
+        0x7e000280u, 0x7e020280u, 0xf0000f08u, 0x00020000u, 0xf800000fu, 0x03020100u, 0xbf810000u,
+    };
+    auto fetch_center = [&](uint32_t x, uint32_t y, uint8_t o[3]) -> bool {
+        std::vector<uint32_t> ps(il_template, il_template + sizeof(il_template)/sizeof(il_template[0]));
+        ps[0] = 0x7e000200u | (128u + x);   // v_mov_b32 v0, x   (inline int)
+        ps[1] = 0x7e020200u | (128u + y);   // v_mov_b32 v1, y
+        std::vector<uint32_t> frag = recompile_fragment(ps.data(), ps.size(), &rt);
+        if (frag.empty() || frag[0] != 0x07230203u) return false;
+        std::vector<uint8_t> px = prosper::test::render_triangle_rgba(vert, frag, W, H, nullptr, nullptr, nullptr, &td);
+        if (px.size() != (size_t)W * H * 4) return false;
+        const uint8_t* c = &px[((size_t)(H/2) * W + W/2) * 4];
+        o[0]=c[0]; o[1]=c[1]; o[2]=c[2]; return true;
+    };
+    bool okL0 = fetch_center(0, 0, rgb);
+    printf("  image_load(0,0) center=(%u,%u,%u)\n", okL0?rgb[0]:0, okL0?rgb[1]:0, okL0?rgb[2]:0);
+    CHECK(okL0 && rgb[0] > 0x80 && rgb[1] < 0x40 && rgb[2] < 0x40, "image_load texel (0,0) yields RED");
+    bool okL1 = fetch_center(1, 1, rgb);
+    printf("  image_load(1,1) center=(%u,%u,%u)\n", okL1?rgb[0]:0, okL1?rgb[1]:0, okL1?rgb[2]:0);
+    CHECK(okL1 && rgb[0] > 0x80 && rgb[1] > 0x80 && rgb[2] > 0x80, "image_load texel (1,1) yields WHITE (proves integer coords)");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
