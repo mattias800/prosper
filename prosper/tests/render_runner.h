@@ -10,6 +10,10 @@
 
 namespace prosper::test {
 
+// A texture to bind for a recompiled shader's image_sample: `rgba` points to w*h*4 RGBA8 bytes,
+// bound as a COMBINED_IMAGE_SAMPLER (nearest filter, clamp) at descriptor-set 0, `binding`.
+struct TexDesc { uint32_t binding; uint32_t w; uint32_t h; const uint8_t* rgba; };
+
 // Returns W*H*4 RGBA bytes, or {} on any Vulkan failure (incl. a rejected SPIR-V module). When `ps`
 // is non-null, the pipeline's fixed-function state (topology, blend, color write mask) is taken from
 // the resolved RDNA2 render-state — this is how the back-half realizes a GpuState as a real VkPipeline.
@@ -19,12 +23,16 @@ namespace prosper::test {
 // recompiler — this is how a table-recompiled vertex shader fetches real vertex/constant data. Each is
 // the raw dword contents of the buffer to bind. When both are null, the pipeline layout is empty and
 // the color-only path above is taken unchanged.
+//
+// When `tex` is non-null, its RGBA8 texels are uploaded to a sampled VkImage and bound as a combined
+// image sampler at tex->binding — how a recompiled pixel shader's image_sample reaches a real texture.
 inline std::vector<uint8_t> render_triangle_rgba(const std::vector<uint32_t>& vert,
                                                  const std::vector<uint32_t>& frag,
                                                  uint32_t W, uint32_t H,
                                                  const prosper::gpu::ResolvedPipelineState* ps = nullptr,
                                                  const std::vector<uint32_t>* vbuf = nullptr,
-                                                 const std::vector<uint32_t>* cbuf = nullptr) {
+                                                 const std::vector<uint32_t>* cbuf = nullptr,
+                                                 const TexDesc* tex = nullptr) {
     std::vector<uint8_t> out;
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO}; app.apiVersion = VK_API_VERSION_1_1;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; ici.pApplicationInfo = &app;
@@ -153,9 +161,12 @@ inline std::vector<uint8_t> render_triangle_rgba(const std::vector<uint32_t>& ve
     // Optional resource descriptor set: constant buffer at binding 2, vertex buffer at binding 3, both
     // as storage buffers — the layout declare_cbufs() emits into a table-recompiled shader. Whichever
     // is null is bound as a 1-dword zero buffer so the (always-declared) binding is still satisfied.
-    const bool use_desc = (vbuf || cbuf);
+    const bool use_desc = (vbuf || cbuf || tex);
     VkDescriptorSetLayout dsl = VK_NULL_HANDLE; VkDescriptorPool dpool = VK_NULL_HANDLE; VkDescriptorSet dset = VK_NULL_HANDLE;
     VkBuffer sb[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE}; VkDeviceMemory sbmem[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    // Texture (combined image sampler) objects — created here, uploaded in the command buffer below.
+    VkImage timg = VK_NULL_HANDLE; VkDeviceMemory tmem = VK_NULL_HANDLE; VkImageView tview = VK_NULL_HANDLE;
+    VkSampler tsamp = VK_NULL_HANDLE; VkBuffer tstage = VK_NULL_HANDLE; VkDeviceMemory tstagemem = VK_NULL_HANDLE;
     if (use_desc) {
         auto mkstore = [&](const std::vector<uint32_t>* data, VkBuffer& buf, VkDeviceMemory& mem) {
             VkDeviceSize sz = (data && !data->empty()) ? (VkDeviceSize)data->size() * 4 : 4;
@@ -173,25 +184,65 @@ inline std::vector<uint8_t> render_triangle_rgba(const std::vector<uint32_t>& ve
         };
         mkstore(cbuf, sb[0], sbmem[0]);   // binding 2
         mkstore(vbuf, sb[1], sbmem[1]);   // binding 3
-        VkDescriptorSetLayoutBinding lb[2]{};
+
+        // Storage bindings 2 & 3 are always present (declare_cbufs emits them whenever rt != null); the
+        // texture, if any, adds one COMBINED_IMAGE_SAMPLER at tex->binding.
+        VkDescriptorSetLayoutBinding lb[3]{}; uint32_t nb = 2;
         lb[0].binding = 2; lb[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; lb[0].descriptorCount = 1;
         lb[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
         lb[1].binding = 3; lb[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; lb[1].descriptorCount = 1;
         lb[1].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        if (tex) {
+            lb[2].binding = tex->binding; lb[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            lb[2].descriptorCount = 1; lb[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT; nb = 3;
+
+            VkImageCreateInfo tci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            tci.imageType = VK_IMAGE_TYPE_2D; tci.format = VK_FORMAT_R8G8B8A8_UNORM; tci.extent = {tex->w, tex->h, 1};
+            tci.mipLevels = 1; tci.arrayLayers = 1; tci.samples = VK_SAMPLE_COUNT_1_BIT; tci.tiling = VK_IMAGE_TILING_OPTIMAL;
+            tci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            vkCreateImage(dev, &tci, nullptr, &timg);
+            VkMemoryRequirements tr; vkGetImageMemoryRequirements(dev, timg, &tr);
+            VkMemoryAllocateInfo tai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; tai.allocationSize = tr.size;
+            tai.memoryTypeIndex = pick(tr.memoryTypeBits, 0); vkAllocateMemory(dev, &tai, nullptr, &tmem);
+            vkBindImageMemory(dev, timg, tmem, 0);
+            VkImageViewCreateInfo tvci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            tvci.image = timg; tvci.viewType = VK_IMAGE_VIEW_TYPE_2D; tvci.format = VK_FORMAT_R8G8B8A8_UNORM;
+            tvci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}; vkCreateImageView(dev, &tvci, nullptr, &tview);
+            VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+            sci.magFilter = sci.minFilter = VK_FILTER_NEAREST; sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+            sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            vkCreateSampler(dev, &sci, nullptr, &tsamp);
+            // Staging buffer with the RGBA texels (uploaded into the image in the command buffer below).
+            VkDeviceSize tbytes = (VkDeviceSize)tex->w * tex->h * 4;
+            VkBufferCreateInfo stci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; stci.size = tbytes; stci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            vkCreateBuffer(dev, &stci, nullptr, &tstage);
+            VkMemoryRequirements sr; vkGetBufferMemoryRequirements(dev, tstage, &sr);
+            VkMemoryAllocateInfo sai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; sai.allocationSize = sr.size;
+            sai.memoryTypeIndex = pick(sr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            vkAllocateMemory(dev, &sai, nullptr, &tstagemem); vkBindBufferMemory(dev, tstage, tstagemem, 0);
+            void* sp = nullptr; vkMapMemory(dev, tstagemem, 0, tbytes, 0, &sp);
+            for (VkDeviceSize i = 0; i < tbytes; i++) ((uint8_t*)sp)[i] = tex->rgba[i];
+            vkUnmapMemory(dev, tstagemem);
+        }
         VkDescriptorSetLayoutCreateInfo dslci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        dslci.bindingCount = 2; dslci.pBindings = lb; vkCreateDescriptorSetLayout(dev, &dslci, nullptr, &dsl);
-        VkDescriptorPoolSize psz{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2};
+        dslci.bindingCount = nb; dslci.pBindings = lb; vkCreateDescriptorSetLayout(dev, &dslci, nullptr, &dsl);
+        VkDescriptorPoolSize psz[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1}};
         VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        dpci.maxSets = 1; dpci.poolSizeCount = 1; dpci.pPoolSizes = &psz; vkCreateDescriptorPool(dev, &dpci, nullptr, &dpool);
+        dpci.maxSets = 1; dpci.poolSizeCount = tex ? 2 : 1; dpci.pPoolSizes = psz; vkCreateDescriptorPool(dev, &dpci, nullptr, &dpool);
         VkDescriptorSetAllocateInfo dsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
         dsai.descriptorPool = dpool; dsai.descriptorSetCount = 1; dsai.pSetLayouts = &dsl; vkAllocateDescriptorSets(dev, &dsai, &dset);
         VkDescriptorBufferInfo dbi[2] = {{sb[0], 0, VK_WHOLE_SIZE}, {sb[1], 0, VK_WHOLE_SIZE}};
-        VkWriteDescriptorSet w[2]{};
+        VkDescriptorImageInfo dii{tsamp, tview, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkWriteDescriptorSet w[3]{};
         w[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; w[0].dstSet = dset; w[0].dstBinding = 2;
         w[0].descriptorCount = 1; w[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[0].pBufferInfo = &dbi[0];
         w[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; w[1].dstSet = dset; w[1].dstBinding = 3;
         w[1].descriptorCount = 1; w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[1].pBufferInfo = &dbi[1];
-        vkUpdateDescriptorSets(dev, 2, w, 0, nullptr);
+        if (tex) {
+            w[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; w[2].dstSet = dset; w[2].dstBinding = tex->binding;
+            w[2].descriptorCount = 1; w[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[2].pImageInfo = &dii;
+        }
+        vkUpdateDescriptorSets(dev, nb, w, 0, nullptr);
     }
     VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     if (use_desc) { plci.setLayoutCount = 1; plci.pSetLayouts = &dsl; }
@@ -219,6 +270,21 @@ inline std::vector<uint8_t> render_triangle_rgba(const std::vector<uint32_t>& ve
     VkCommandBuffer cmd; vkAllocateCommandBuffers(dev, &cbai, &cmd);
     VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &cbbi);
+    if (tex) {
+        // Upload the texels: UNDEFINED -> TRANSFER_DST, copy staging buffer, TRANSFER_DST -> SHADER_READ.
+        VkImageMemoryBarrier b0{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b0.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; b0.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b0.image = timg; b0.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        b0.srcAccessMask = 0; b0.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b0);
+        VkBufferImageCopy tc{}; tc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; tc.imageExtent = {tex->w, tex->h, 1};
+        vkCmdCopyBufferToImage(cmd, tstage, timg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &tc);
+        VkImageMemoryBarrier b1{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b1.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b1.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        b1.image = timg; b1.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        b1.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b1.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b1);
+    }
     VkClearValue clear[2]{}; clear[0].color = {{0.0f, 0.0f, 1.0f, 1.0f}};   // blue
     clear[1].depthStencil = {0.5f, 0};   // depth cleared to 0.5 (fragments at z=0.0 pass LESS, fail GREATER)
     VkRenderPassBeginInfo rpbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
@@ -250,6 +316,11 @@ inline std::vector<uint8_t> render_triangle_rgba(const std::vector<uint32_t>& ve
     if (use_desc) {
         vkDestroyDescriptorPool(dev, dpool, nullptr); vkDestroyDescriptorSetLayout(dev, dsl, nullptr);
         for (int i = 0; i < 2; i++) { vkDestroyBuffer(dev, sb[i], nullptr); vkFreeMemory(dev, sbmem[i], nullptr); }
+    }
+    if (tex) {
+        vkDestroySampler(dev, tsamp, nullptr); vkDestroyImageView(dev, tview, nullptr);
+        vkDestroyImage(dev, timg, nullptr); vkFreeMemory(dev, tmem, nullptr);
+        vkDestroyBuffer(dev, tstage, nullptr); vkFreeMemory(dev, tstagemem, nullptr);
     }
     vkDestroyDevice(dev, nullptr); vkDestroyInstance(inst, nullptr);
     return out;

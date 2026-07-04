@@ -25,6 +25,8 @@ enum : uint32_t {
     Op_ShiftRightLogical=194, Op_ShiftRightArithmetic=195, Op_ShiftLeftLogical=196, Op_BitwiseOr=197,
     Op_BitwiseXor=198, Op_BitwiseAnd=199, Op_Not=200, Op_BitFieldSExtract=202, Op_BitFieldUExtract=203,
     Op_BitReverse=204,
+    Op_TypeImage=25, Op_TypeSampledImage=27, Op_SampledImage=86,
+    Op_ImageSampleImplicitLod=87, Op_ImageFetch=95, Op_Image=100,
     Op_Label=248, Op_Return=253,
 };
 // GLSL.std.450 extended-instruction numbers.
@@ -34,7 +36,8 @@ enum : uint32_t { Glsl_Trunc=3, Glsl_Floor=8, Glsl_Ceil=9, Glsl_Fract=10, Glsl_E
 enum : uint32_t {
     Cap_Shader=1, Addr_Logical=0, Mem_GLSL450=1, Exec_Vertex=0, Exec_Fragment=4, Exec_GLCompute=5,
     EM_OriginUpperLeft=7, EM_LocalSize=17,
-    SC_Input=1, SC_Output=3, SC_StorageBuffer=12, FC_None=0,
+    SC_Input=1, SC_UniformConstant=0, SC_Output=3, SC_StorageBuffer=12, FC_None=0,
+    Dim_2D=1,   // SPIR-V Dim (2D image). (Note: coincides with the SQ_RSRC 2D dim value, but distinct.)
     Dec_Block=2, Dec_ArrayStride=6, Dec_BuiltIn=11, Dec_Location=30, Dec_Binding=33,
     Dec_DescriptorSet=34, Dec_Offset=35,
     BI_Position=0, BI_GlobalInvocationId=28, BI_VertexIndex=42,
@@ -136,6 +139,36 @@ struct SpirvCompute {
     uint32_t unpack_half(uint32_t dword, uint32_t which) {
         uint32_t vec = id(); putv(code, Op_ExtInst, {t_v2f(), vec, glsl, Glsl_UnpackHalf2x16, dword});
         uint32_t f = id(); put(code, Op_CompositeExtract, {t_f32, f, vec, which}); return bcu(f);
+    }
+
+    // Combined image+sampler support (MIMG image_sample). One float-2D OpTypeImage/OpTypeSampledImage
+    // is shared across textures; each texture is a COMBINED_IMAGE_SAMPLER UniformConstant at its binding.
+    uint32_t t_image = 0, t_sampled_image = 0;
+    std::unordered_map<uint32_t, uint32_t> tex_var;   // binding -> combined-sampler OpVariable id
+    // Declare (idempotently) a combined image+sampler at descriptor-set 0, `binding`. Requires t_f32.
+    void declare_texture(uint32_t binding) {
+        if (tex_var.count(binding)) return;
+        if (!t_image) {
+            t_image = id();   // sampled f32, Dim=2D, Depth=0, Arrayed=0, MS=0, Sampled=1, Format=Unknown
+            put(types, Op_TypeImage, {t_image, t_f32, Dim_2D, 0, 0, 0, 1, 0});
+            t_sampled_image = id();
+            put(types, Op_TypeSampledImage, {t_sampled_image, t_image});
+        }
+        uint32_t t_ptr = id(); put(types, Op_TypePointer, {t_ptr, SC_UniformConstant, t_sampled_image});
+        uint32_t v = id();     put(types, Op_Variable,    {t_ptr, v, SC_UniformConstant});
+        put(deco, Op_Decorate, {v, Dec_DescriptorSet, 0});
+        put(deco, Op_Decorate, {v, Dec_Binding, binding});
+        tex_var[binding] = v;
+    }
+    // image_sample 2D: sample the combined sampler at `binding` with (u,v) float-BITS coords; fills
+    // out[0..3] with the RGBA result components as raw VGPR bits. Fragment stage (implicit LOD).
+    void image_sample_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t out[4]) {
+        uint32_t si    = id(); put(code, Op_Load, {t_sampled_image, si, tex_var[binding]});
+        uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
+        uint32_t res   = id(); put(code, Op_ImageSampleImplicitLod, {t_v4f, res, si, coord});
+        for (uint32_t c = 0; c < 4; c++) {
+            uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, res, c}); out[c] = bcu(e);
+        }
     }
 
     // buffer element pointer: base[ gid.x*stride + k ]
@@ -662,9 +695,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (res && res->binding >= 3) slot = 1; } }
             for (uint32_t k = 0; k < n; k++)
                 rs.sreg[in.dst.value + (int)k] = b.cbuf_load(b.uconst(base_idx + k), slot);
-            // A 4-dword scalar load is a V# descriptor fetch — tag its dest SGPRs with the SRT offset
-            // so a later s_buffer_load using them resolves to the right resource (provenance).
-            if (rt && in.opcode == 0x2)
+            // A wide scalar load is a descriptor fetch — tag its dest SGPRs with the SRT offset so a
+            // later buffer/image op using them resolves to the right resource (provenance). x4 = V#/S#
+            // (buffers, samplers), x8 = T# (textures, 8 dwords).
+            if (rt && (in.opcode == 0x2 || in.opcode == 0x3))
                 for (uint32_t k = 0; k < n; k++) rs.sreg_srt[in.dst.value + (int)k] = in.literal;
             return true;
         }
@@ -748,6 +782,35 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 rs.vreg[d] = value;
                 predicate_write(b, rs, d, old);
+            }
+            return true;
+        }
+        case Rdna2Format::MIMG: {
+            // Texture read. Needs the resource table for the binding + a graphics shell for t_v4f, so
+            // gated on allow_smem (fragment/vertex) + rt. Minimal correct slice: image_sample (0x20),
+            // 2D, non-NSA (len==2). image_load / other dims / NSA / LOD variants are rejected (deferred),
+            // not mis-translated.
+            if (!allow_smem || !rt) { ok = false; return true; }
+            const uint32_t SQ_DIM_2D = 1u;
+            if (in.opcode != 0x20 || in.mimg_dim != SQ_DIM_2D || in.len_dwords != 2) { ok = false; return true; }
+            // Resolve the T# via SRSRC (src[1]) provenance: s_load tag (indirect) else user-data SGPR.
+            const ShaderResource* res = nullptr;
+            { auto it = rs.sreg_srt.find(in.src[1].value);
+              if (it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second);
+              if (!res) res = rt->by_sgpr_base(in.src[1].value); }
+            if (!res || res->cls != ResourceClass::Texture) { ok = false; return true; }
+            b.declare_texture(res->binding);
+            // 2D non-NSA: u = VGPR[VADDR], v = VGPR[VADDR+1] (image_sample = normalized float coords).
+            int va = in.src[0].value;
+            auto vread = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
+            uint32_t out[4]; b.image_sample_2d(res->binding, vread(va), vread(va + 1), out);
+            // dmask selects which result components are written to consecutive VDATA VGPRs (LSB=R first).
+            int vd = in.dst.value, w = 0;
+            for (uint32_t c = 0; c < 4; c++) if (in.mimg_dmask & (1u << c)) {
+                uint32_t old = vreg_old(b, rs, vd + w);
+                rs.vreg[vd + w] = out[c];
+                predicate_write(b, rs, vd + w, old);
+                w++;
             }
             return true;
         }

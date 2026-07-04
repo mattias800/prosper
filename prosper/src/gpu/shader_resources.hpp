@@ -64,6 +64,16 @@ struct ShaderResource {
     //     resolves a memory op by matching its SRSRC/SBASE SGPR to this index (no in-shader load).
     uint32_t      srt_offset    = 0xFFFFFFFFu;
     uint32_t      sgpr_base     = 0xFFFFFFFFu;
+
+    // Texture-only (cls == Texture). img_dim mirrors the MIMG dim field (1D=0, 2D=1, 3D=2, ...).
+    // width/height are for image_load/texelFetch + unnormalized addressing (unused by normalized
+    // image_sample). sampler_sgpr_base = the paired sampler's S# base SGPR (SSAMP); with a Vulkan
+    // COMBINED_IMAGE_SAMPLER the sampler is baked into the same `binding`, so this is provenance for a
+    // future image/sampler split.
+    uint32_t      img_dim           = 1;
+    uint32_t      width             = 0;
+    uint32_t      height            = 0;
+    uint32_t      sampler_sgpr_base = 0xFFFFFFFFu;
 };
 
 // The set of resources a shader uses. The front-half builds it from the shader's user_data; the

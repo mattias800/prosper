@@ -239,6 +239,11 @@ if(TARGET prosper_core)
       target_link_libraries(test_vertex_fetch_render PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME vertex_fetch_render COMMAND test_vertex_fetch_render)
 
+      # Texture sampling: a recompiled pixel shader does MIMG image_sample against a bound 2x2 texture.
+      add_executable(test_texture_sample_render tests/test_texture_sample_render.cpp)
+      target_link_libraries(test_texture_sample_render PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME texture_sample_render COMMAND test_texture_sample_render)
+
       # Pipeline realization: build a VkPipeline whose fixed-function state comes from
       # resolve_pipeline_state(RenderState) and prove the resolved state drives rendering.
       add_executable(test_pipeline_render tests/test_pipeline_render.cpp)

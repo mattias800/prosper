@@ -106,7 +106,22 @@ void decode_operands(Rdna2Inst& i) {
             i.literal = (w & 0xFFFu) | (((w >> 12) & 1u) << 12) | (((w >> 13) & 1u) << 13);
             i.n_src = 3; break;
         }
-        default: break;   // MUBUF/MTBUF/MIMG/DS/FLAT/VINTRP: operands not decoded at this stage
+        case Rdna2Format::MIMG: {
+            // Image op. opcode[24:18]; dmask[11:8]; unorm[12]; dim[5:3]. dword1: VADDR base[7:0];
+            // VDATA base[15:8]; SRSRC (T# base SGPR, ×4)[20:16]; SSAMP (S# base SGPR, ×4)[25:21].
+            // image_sample = opcode 0x20, image_load = 0x00. (Bit layout verified via llvm-mc gfx1030.)
+            const uint32_t d1 = i.words[1];
+            i.opcode     = (w >> 18) & 0x7Fu;
+            i.mimg_dmask = (w >> 8)  & 0xFu;
+            i.mimg_unorm = (w >> 12) & 0x1u;
+            i.mimg_dim   = (w >> 3)  & 0x7u;
+            i.dst    = vgpr(d1 >> 8);                         // VDATA (dest base)
+            i.src[0] = vgpr(d1 & 0xFFu);                      // VADDR (coord base VGPR)
+            i.src[1] = sgpr(((d1 >> 16) & 0x1Fu) << 2);       // SRSRC (T# base, 8 SGPRs)
+            i.src[2] = sgpr(((d1 >> 21) & 0x1Fu) << 2);       // SSAMP (S# base, 4 SGPRs)
+            i.n_src  = 3; break;
+        }
+        default: break;   // MTBUF/DS/FLAT/VINTRP: operands not decoded at this stage
     }
 }
 }  // namespace

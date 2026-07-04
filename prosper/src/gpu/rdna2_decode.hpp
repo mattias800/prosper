@@ -67,6 +67,13 @@ struct Rdna2Inst {
     // per-component enable mask. The 4 exported VGPRs are in src[0..3].
     uint32_t exp_target = 0;
     uint32_t exp_en = 0;
+
+    // MIMG-only: destination component mask (dmask), image dimensionality (SQ_RSRC_IMG dim: 1D=0,
+    // 2D=1, 3D=2, Cube=3, 1D_ARRAY=4, 2D_ARRAY=5, ...), and the unnormalized-coordinate flag. VDATA is
+    // in `dst`, VADDR in src[0], SRSRC (T# base SGPR) in src[1], SSAMP (S# base SGPR) in src[2].
+    uint32_t mimg_dmask = 0;
+    uint32_t mimg_dim   = 0;
+    bool     mimg_unorm = false;
 };
 
 // Decode the single instruction at code[0..]; `max_dwords` bounds the read. On a truncated/unknown
