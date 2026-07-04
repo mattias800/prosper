@@ -11,8 +11,8 @@ enum : uint32_t {
     Op_ExtInstImport=11, Op_ExtInst=12, Op_MemoryModel=14, Op_EntryPoint=15, Op_ExecutionMode=16,
     Op_Capability=17, Op_TypeVoid=19, Op_TypeBool=20, Op_TypeInt=21, Op_TypeFloat=22, Op_TypeVector=23,
     Op_TypeRuntimeArray=29, Op_TypeStruct=30, Op_TypePointer=32, Op_TypeFunction=33,
-    Op_ConstantFalse=42, Op_Constant=43, Op_Function=54, Op_FunctionEnd=56, Op_Variable=59,
-    Op_Select=169, Op_FOrdEqual=180, Op_FOrdNotEqual=182, Op_FOrdLessThan=184, Op_FOrdGreaterThan=186,
+    Op_ConstantTrue=41, Op_ConstantFalse=42, Op_Constant=43, Op_Function=54, Op_FunctionEnd=56, Op_Variable=59,
+    Op_LogicalAnd=167, Op_Select=169, Op_FOrdEqual=180, Op_FOrdNotEqual=182, Op_FOrdLessThan=184, Op_FOrdGreaterThan=186,
     Op_FOrdLessThanEqual=188, Op_FOrdGreaterThanEqual=190,
     Op_Load=61, Op_Store=62, Op_AccessChain=65, Op_Decorate=71, Op_MemberDecorate=72,
     Op_ConvertFToU=109, Op_ConvertFToS=110, Op_ConvertSToF=111, Op_ConvertUToF=112, Op_Bitcast=124,
@@ -133,6 +133,18 @@ struct SpirvCompute {
         uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_sb_f32, p, v_out, uconst(0), gidx});
         put(code, Op_Store, {p, bcf(bits)});
     }
+    // EXEC-predicated store: lanes with exec=false keep the output slot's prior value. Modeled with
+    // OpSelect (no control flow needed) — load old, pick new-vs-old by the per-lane exec bool, store.
+    // Correct for the straight-line "conditional write / discard" pattern (v_cmpx narrows EXEC).
+    void     store_output_pred(uint32_t bits, uint32_t exec_bool) {
+        uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_sb_f32, p, v_out, uconst(0), gidx});
+        uint32_t old = id(); put(code, Op_Load, {t_f32, old, p});
+        uint32_t sel = id(); put(code, Op_Select, {t_f32, sel, exec_bool, bcf(bits), old});
+        put(code, Op_Store, {p, sel});
+    }
+    uint32_t btrue() { uint32_t r = id(); put(types, Op_ConstantTrue, {t_bool, r}); return r; }
+    // Logical AND of two bools (EXEC narrowing).
+    uint32_t land(uint32_t a, uint32_t b_) { uint32_t r = id(); put(code, Op_LogicalAnd, {t_bool, r, a, b_}); return r; }
 
     void begin(uint32_t input_stride) {
         stride = input_stride;
@@ -258,6 +270,7 @@ struct SpirvCompute {
 struct RegState {
     std::unordered_map<int, uint32_t> vreg, sreg;
     uint32_t vcc = 0;
+    uint32_t exec = 0;   // per-lane execution mask (bool); v_cmpx narrows it, output store honors it
 };
 
 // Resolve an operand to its raw 32-bit value (bits). Float ops bitcast these to float.
@@ -356,29 +369,37 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok) {
             }
             return true;
         }
-        case Rdna2Format::VOPC: {                                     // v_cmp_* -> VCC (bool)
+        case Rdna2Format::VOPC: {                                     // v_cmp_* -> VCC; v_cmpx_* also -> EXEC
             uint32_t a = val(in.src[0]), c = val(in.src[1]);
-            switch (in.opcode) {
-                case 0x01: vcc = b.fcmp(Op_FOrdLessThan, a, c); break;         // v_cmp_lt_f32
-                case 0x02: vcc = b.fcmp(Op_FOrdEqual, a, c); break;            // v_cmp_eq_f32
-                case 0x03: vcc = b.fcmp(Op_FOrdLessThanEqual, a, c); break;    // v_cmp_le_f32
-                case 0x04: vcc = b.fcmp(Op_FOrdGreaterThan, a, c); break;      // v_cmp_gt_f32
-                case 0x05: vcc = b.fcmp(Op_FOrdNotEqual, a, c); break;         // v_cmp_lg_f32
-                case 0x06: vcc = b.fcmp(Op_FOrdGreaterThanEqual, a, c); break; // v_cmp_ge_f32
-                case 0x81: vcc = b.scmp(Op_SLessThan, a, c); break;            // v_cmp_lt_i32
-                case 0x82: vcc = b.ucmp(Op_IEqual, a, c); break;               // v_cmp_eq_i32
-                case 0x83: vcc = b.scmp(Op_SLessThanEqual, a, c); break;       // v_cmp_le_i32
-                case 0x84: vcc = b.scmp(Op_SGreaterThan, a, c); break;         // v_cmp_gt_i32
-                case 0x85: vcc = b.ucmp(Op_INotEqual, a, c); break;            // v_cmp_ne_i32 (sign-agnostic)
-                case 0x86: vcc = b.scmp(Op_SGreaterThanEqual, a, c); break;    // v_cmp_ge_i32
-                case 0xC1: vcc = b.ucmp(Op_ULessThan, a, c); break;            // v_cmp_lt_u32
-                case 0xC2: vcc = b.ucmp(Op_IEqual, a, c); break;               // v_cmp_eq_u32
-                case 0xC3: vcc = b.ucmp(Op_ULessThanEqual, a, c); break;       // v_cmp_le_u32
-                case 0xC4: vcc = b.ucmp(Op_UGreaterThan, a, c); break;         // v_cmp_gt_u32
-                case 0xC5: vcc = b.ucmp(Op_INotEqual, a, c); break;            // v_cmp_ne_u32
-                case 0xC6: vcc = b.ucmp(Op_UGreaterThanEqual, a, c); break;    // v_cmp_ge_u32
+            // v_cmpx_* shares each type's compare set at base+0x10 (f32 0x10-0x1f, i32 0x90-0x9f,
+            // u32 0xd0-0xdf); it writes EXEC in addition to VCC. Map to the base compare, then narrow.
+            uint32_t op = in.opcode;
+            bool is_cmpx = (op >= 0x10 && op <= 0x1f) || (op >= 0x90 && op <= 0x9f) ||
+                           (op >= 0xd0 && op <= 0xdf);
+            uint32_t eff = is_cmpx ? op - 0x10 : op;
+            uint32_t cmp = 0;
+            switch (eff) {
+                case 0x01: cmp = b.fcmp(Op_FOrdLessThan, a, c); break;         // v_cmp_lt_f32
+                case 0x02: cmp = b.fcmp(Op_FOrdEqual, a, c); break;            // v_cmp_eq_f32
+                case 0x03: cmp = b.fcmp(Op_FOrdLessThanEqual, a, c); break;    // v_cmp_le_f32
+                case 0x04: cmp = b.fcmp(Op_FOrdGreaterThan, a, c); break;      // v_cmp_gt_f32
+                case 0x05: cmp = b.fcmp(Op_FOrdNotEqual, a, c); break;         // v_cmp_lg_f32
+                case 0x06: cmp = b.fcmp(Op_FOrdGreaterThanEqual, a, c); break; // v_cmp_ge_f32
+                case 0x81: cmp = b.scmp(Op_SLessThan, a, c); break;            // v_cmp_lt_i32
+                case 0x82: cmp = b.ucmp(Op_IEqual, a, c); break;               // v_cmp_eq_i32
+                case 0x83: cmp = b.scmp(Op_SLessThanEqual, a, c); break;       // v_cmp_le_i32
+                case 0x84: cmp = b.scmp(Op_SGreaterThan, a, c); break;         // v_cmp_gt_i32
+                case 0x85: cmp = b.ucmp(Op_INotEqual, a, c); break;            // v_cmp_ne_i32 (sign-agnostic)
+                case 0x86: cmp = b.scmp(Op_SGreaterThanEqual, a, c); break;    // v_cmp_ge_i32
+                case 0xC1: cmp = b.ucmp(Op_ULessThan, a, c); break;            // v_cmp_lt_u32
+                case 0xC2: cmp = b.ucmp(Op_IEqual, a, c); break;               // v_cmp_eq_u32
+                case 0xC3: cmp = b.ucmp(Op_ULessThanEqual, a, c); break;       // v_cmp_le_u32
+                case 0xC4: cmp = b.ucmp(Op_UGreaterThan, a, c); break;         // v_cmp_gt_u32
+                case 0xC5: cmp = b.ucmp(Op_INotEqual, a, c); break;            // v_cmp_ne_u32
+                case 0xC6: cmp = b.ucmp(Op_UGreaterThanEqual, a, c); break;    // v_cmp_ge_u32
                 default: ok = false;
             }
+            if (ok) { vcc = cmp; if (is_cmpx) rs.exec = b.land(rs.exec, cmp); }
             return true;
         }
         case Rdna2Format::VOP3:
@@ -443,7 +464,8 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
 
     SpirvCompute b;
     b.begin(num_inputs ? num_inputs : 1);
-    RegState rs; rs.vcc = b.bfalse();
+    RegState rs; rs.vcc = b.bfalse(); rs.exec = b.btrue();
+    const uint32_t exec0 = rs.exec;   // sentinel: if unchanged, no v_cmpx narrowed EXEC
     for (uint32_t k = 0; k < num_inputs; k++) rs.vreg[(int)k] = b.load_input(k);
 
     for (const auto& in : ins) {
@@ -453,7 +475,10 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
     }
 
     auto it = rs.vreg.find((int)out_vgpr);
-    b.store_output(it == rs.vreg.end() ? b.uconst(0) : it->second);
+    uint32_t outbits = it == rs.vreg.end() ? b.uconst(0) : it->second;
+    // If a v_cmpx narrowed EXEC, masked-off lanes keep the output slot's prior value.
+    if (rs.exec == exec0) b.store_output(outbits);
+    else                  b.store_output_pred(outbits, rs.exec);
     return b.finish();
 }
 
@@ -463,7 +488,7 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords) {
 
     SpirvCompute b;
     b.begin_fragment();
-    RegState rs; rs.vcc = b.bfalse();
+    RegState rs; rs.vcc = b.bfalse(); rs.exec = b.btrue();
     bool exported = false;
 
     for (const auto& in : ins) {
@@ -489,7 +514,7 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords) {
 
     SpirvCompute b;
     b.begin_vertex();
-    RegState rs; rs.vcc = b.bfalse();
+    RegState rs; rs.vcc = b.bfalse(); rs.exec = b.btrue();
     rs.vreg[0] = b.load_vertex_index();     // VS ABI: v0 = vertex index
     bool exported = false;
 

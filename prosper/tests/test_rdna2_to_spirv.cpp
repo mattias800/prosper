@@ -315,6 +315,28 @@ int main() {
     printf("  kernel15 mismatches=%u (out[1]=0x%08x expect=0x%08x)\n", bad15, got15.size()==N?bits_of(got15[1]):0, exp15[1]);
     CHECK(got15.size()==N && bad15==0, "recompiled kernel 15 (v_bfrev_b32) reverses bits exactly");
 
+    // Kernel 16: v_cmpx_gt_u32 (0xd4) — EXEC/predication. exec = (u0 > u1); then out = (float)(u0+u1),
+    // but the store is EXEC-predicated: lanes with u0<=u1 don't write, so they keep the zero-inited slot.
+    const uint32_t code16[] = {
+        0x7e000f00u, 0x7e020f01u, 0x7da80300u, 0x4a040300u, 0x7e040d02u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv16 = recompile_valu(code16, sizeof(code16)/sizeof(code16[0]), 2, /*out_vgpr*/2);
+    CHECK(!spv16.empty(), "recompiled kernel 16 (v_cmpx_gt_u32 + predicated store) -> SPIR-V");
+    std::vector<float> in16(N * 2), exp16(N);
+    for (uint32_t i = 0; i < N; i++) {
+        uint32_t u0 = i % 17, u1 = i % 13;
+        in16[i*2+0]=(float)u0; in16[i*2+1]=(float)u1;
+        exp16[i] = (u0 > u1) ? (float)(u0 + u1) : 0.0f;   // masked lanes keep the zero-inited output
+    }
+    std::vector<float> got16 = prosper::test::run_compute(spv16, in16, N, N);
+    uint32_t bad16 = 0, active = 0, masked = 0;
+    for (uint32_t i=0;i<N&&got16.size()==N;i++) { if (std::fabs(got16[i]-exp16[i])>1e-3f) bad16++;
+        if ((i%17) > (i%13)) active++; else masked++; }
+    printf("  kernel16 mismatches=%u (active=%u masked=%u, out[1]=%g exp=%g)\n", bad16, active, masked,
+           got16.size()==N?got16[1]:-1, exp16[1]);
+    CHECK(active > 0 && masked > 0, "kernel 16 exercises BOTH active and masked lanes");
+    CHECK(got16.size()==N && bad16==0, "recompiled kernel 16 (EXEC-predicated store via v_cmpx) correct");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

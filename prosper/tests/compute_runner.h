@@ -68,6 +68,11 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
     void* p = nullptr; vkMapMemory(dev, inMem, 0, inBytes, 0, &p);
     for (uint32_t i = 0; i < IN_N; i++) ((float*)p)[i] = input[i];
     vkUnmapMemory(dev, inMem);
+    // Zero the output buffer so results are deterministic — in particular, EXEC-masked lanes (which
+    // do not store) must observe a defined prior value, not uninitialized memory.
+    void* zp = nullptr; vkMapMemory(dev, outMem, 0, outBytes, 0, &zp);
+    for (uint32_t i = 0; i < out_count; i++) ((float*)zp)[i] = 0.0f;
+    vkUnmapMemory(dev, outMem);
 
     VkDescriptorSetLayoutBinding binds[2]{};
     for (int i = 0; i < 2; i++) { binds[i].binding = i; binds[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
