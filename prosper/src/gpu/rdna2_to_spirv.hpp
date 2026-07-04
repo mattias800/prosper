@@ -17,10 +17,14 @@
 
 namespace prosper::gpu {
 
+struct ShaderResourceTable;   // resource-binding contract (shader_resources.hpp); optional to recompile_valu
+
 // Translate a straight-line float-VALU RDNA2 stream to a compute-shader SPIR-V module.
-// Returns {} if the stream contains an opcode/format this stage does not yet handle.
+// Returns {} if the stream contains an opcode/format this stage does not yet handle. An optional
+// ShaderResourceTable routes SMEM constant-buffer loads to distinct bindings via descriptor provenance.
 std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
-                                     uint32_t num_inputs, uint32_t out_vgpr);
+                                     uint32_t num_inputs, uint32_t out_vgpr,
+                                     const ShaderResourceTable* rt = nullptr);
 
 // Recompile a pixel/fragment shader to a fragment SPIR-V module: run the VALU, and on EXP to an MRT
 // target write vec4(src0..3) to the location-0 color output. Returns {} if unsupported / no export.

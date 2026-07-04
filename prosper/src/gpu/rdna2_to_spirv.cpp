@@ -1,6 +1,7 @@
 // rdna2_to_spirv.cpp — see rdna2_to_spirv.hpp. Internal SpirvCompute builder + the VALU translator.
 #include "rdna2_to_spirv.hpp"
 #include "rdna2_decode.hpp"
+#include "shader_resources.hpp"
 #include <cstring>
 #include <unordered_map>
 #include <unordered_set>
@@ -51,7 +52,7 @@ struct SpirvCompute {
     // fixed ids (set in begin()):
     uint32_t t_void=0, t_fn=0, t_f32=0, t_u32=0, t_i32=0, t_v3u=0, t_bool=0, t_ptr_sb_f32=0;
     uint32_t v_gid=0, v_in=0, v_out=0, gidx=0, f_main=0, glsl=0, bconst_false=0;
-    uint32_t v_cbuf=0, t_ptr_sb_u32=0;   // scalar-memory constant buffer (binding 2; declared by begin())
+    uint32_t v_cbuf=0, v_cbuf1=0, t_ptr_sb_u32=0;   // scalar-memory constant buffers (bindings 2 and 3)
 
     uint32_t id() { return next_id++; }
     static void put(std::vector<uint32_t>& s, uint32_t op, std::initializer_list<uint32_t> o) {
@@ -130,9 +131,11 @@ struct SpirvCompute {
     }
     // Load one float from the input buffer and return it as raw bits (VGPR value).
     uint32_t load_input(uint32_t k) { uint32_t p = elem_ptr(v_in, k); uint32_t r = id(); put(code, Op_Load, {t_f32, r, p}); return bcu(r); }
-    // Load one dword (raw bits) from the scalar-memory constant buffer at dword index `idx` (SMEM).
-    uint32_t cbuf_load(uint32_t idx) {
-        uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_sb_u32, p, v_cbuf, uconst(0), idx});
+    // Load one dword (raw bits) from constant-buffer `slot` (0 -> binding 2, 1 -> binding 3) at dword
+    // index `idx` (SMEM). Multiple bindings let descriptor provenance route loads to distinct buffers.
+    uint32_t cbuf_load(uint32_t idx, uint32_t slot = 0) {
+        uint32_t buf = slot ? v_cbuf1 : v_cbuf;
+        uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_sb_u32, p, buf, uconst(0), idx});
         uint32_t r = id(); put(code, Op_Load, {t_u32, r, p}); return r;
     }
     // Store a VGPR (bits) as one float per invocation: b[gid.x] (stride 1), independent of input stride.
@@ -161,7 +164,7 @@ struct SpirvCompute {
         uint32_t t_rta = id(), t_struct = id(), t_ptr_sb_struct = id();
         v_in = id(); v_out = id(); t_ptr_sb_f32 = id();
         uint32_t t_rta_u = id(), t_struct_u = id(), t_ptr_sb_struct_u = id();
-        v_cbuf = id(); t_ptr_sb_u32 = id();
+        v_cbuf = id(); v_cbuf1 = id(); t_ptr_sb_u32 = id();
         f_main = id(); uint32_t lbl = id(); glsl = id();
 
         put(caps, Op_Capability, {Cap_Shader});
@@ -179,6 +182,7 @@ struct SpirvCompute {
         put(deco, Op_MemberDecorate, {t_struct_u, 0, Dec_Offset, 0});
         put(deco, Op_Decorate, {t_struct_u, Dec_Block});
         put(deco, Op_Decorate, {v_cbuf, Dec_DescriptorSet, 0}); put(deco, Op_Decorate, {v_cbuf, Dec_Binding, 2});
+        put(deco, Op_Decorate, {v_cbuf1, Dec_DescriptorSet, 0}); put(deco, Op_Decorate, {v_cbuf1, Dec_Binding, 3});
         put(types, Op_TypeVoid, {t_void});
         put(types, Op_TypeFunction, {t_fn, t_void});
         put(types, Op_TypeFloat, {t_f32, 32});
@@ -200,6 +204,7 @@ struct SpirvCompute {
         put(types, Op_TypeStruct, {t_struct_u, t_rta_u});
         put(types, Op_TypePointer, {t_ptr_sb_struct_u, SC_StorageBuffer, t_struct_u});
         put(types, Op_Variable, {t_ptr_sb_struct_u, v_cbuf, SC_StorageBuffer});
+        put(types, Op_Variable, {t_ptr_sb_struct_u, v_cbuf1, SC_StorageBuffer});
         put(types, Op_TypePointer, {t_ptr_sb_u32, SC_StorageBuffer, t_u32});
         put(code, Op_Function, {t_void, f_main, FC_None, t_fn});
         put(code, Op_Label, {lbl});
@@ -291,6 +296,8 @@ struct SpirvCompute {
 struct RegState {
     std::unordered_map<int, uint32_t> vreg, sreg;
     std::unordered_map<int, uint32_t> sreg_bool;   // SGPR (pairs) holding a saved per-lane mask (bool id)
+    std::unordered_map<int, uint32_t> sreg_srt;    // SGPR holding a descriptor -> its user_data/SRT byte offset
+                                                   // (descriptor provenance: s_load_dwordx4 tags, s_buffer_load resolves)
     uint32_t vcc = 0;
     uint32_t exec = 0;         // per-lane execution mask (bool); v_cmpx narrows it, output store honors it
     bool exec_narrowed = false; // true once EXEC is narrowed below all-lanes-on (so VGPR writes predicate)
@@ -363,7 +370,8 @@ uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, const 
 // ALU format handled here; sets ok=false if it is an ALU op this stage doesn't support yet. Non-ALU
 // formats (EXP/memory/...) return false so the stage-specific caller can handle them.
 bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool allow_exec_update,
-              const std::unordered_set<uint32_t>* safe_execz = nullptr, bool allow_smem = false) {
+              const std::unordered_set<uint32_t>* safe_execz = nullptr, bool allow_smem = false,
+              const ShaderResourceTable* rt = nullptr) {
     auto& vreg = rs.vreg; uint32_t& vcc = rs.vcc;
     auto val = [&](const Operand& o) { return operand_bits(b, rs, in, o); };
     switch (in.fmt) {
@@ -615,8 +623,19 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 default: ok = false; return true;   // x8/x16 and others not yet
             }
             uint32_t base_idx = in.literal >> 2;    // immediate byte offset -> dword index
+            // Descriptor provenance: pick which bound constant buffer via the resource table. For
+            // s_buffer_load, SBASE (src[0]) is the V# — if a prior s_load_dwordx4 tagged it with the
+            // SRT offset it came from, resolve that to a ShaderResource and route to its binding.
+            uint32_t slot = 0;
+            if (rt) { auto it = rs.sreg_srt.find(in.src[0].value);
+                if (it != rs.sreg_srt.end()) { const ShaderResource* res = rt->by_srt_offset(it->second);
+                    if (res && res->binding >= 3) slot = 1; } }
             for (uint32_t k = 0; k < n; k++)
-                rs.sreg[in.dst.value + (int)k] = b.cbuf_load(b.uconst(base_idx + k));
+                rs.sreg[in.dst.value + (int)k] = b.cbuf_load(b.uconst(base_idx + k), slot);
+            // A 4-dword scalar load is a V# descriptor fetch — tag its dest SGPRs with the SRT offset
+            // so a later s_buffer_load using them resolves to the right resource (provenance).
+            if (rt && in.opcode == 0x2)
+                for (uint32_t k = 0; k < n; k++) rs.sreg_srt[in.dst.value + (int)k] = in.literal;
             return true;
         }
         case Rdna2Format::MUBUF: {
@@ -652,7 +671,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
 }
 
 std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
-                                     uint32_t num_inputs, uint32_t out_vgpr) {
+                                     uint32_t num_inputs, uint32_t out_vgpr,
+                                     const ShaderResourceTable* rt) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
 
@@ -665,7 +685,7 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
     for (const auto& in : ins) {
         if (in.is_end) break;
         bool ok = true;
-        if (!emit_alu(b, rs, in, ok, true, &safe_branches, /*allow_smem*/true) || !ok) return {};   // compute kernels are pure ALU
+        if (!emit_alu(b, rs, in, ok, true, &safe_branches, /*allow_smem*/true, rt) || !ok) return {};   // compute kernels are pure ALU
     }
 
     auto it = rs.vreg.find((int)out_vgpr);
