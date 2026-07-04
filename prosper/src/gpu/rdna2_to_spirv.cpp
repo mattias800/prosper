@@ -635,14 +635,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // Scalar memory load. Modeled as a load from a single bound constant buffer indexed by the
             // immediate byte offset (>>2 -> dword index); SBASE/descriptor base is folded into the
             // binding. N consecutive dwords -> SDATA..SDATA+N-1. Only the compute path binds the cbuf,
-            // so reject in graphics stages (allow_smem=false). Register-offset + x8/x16 not yet handled.
+            // so reject in graphics stages (allow_smem=false). Register-offset SMEM not yet handled.
             if (!allow_smem) { ok = false; return true; }
             uint32_t n = 0;
             switch (in.opcode) {
-                case 0x0: case 0x8: n = 1; break;   // s_load_dword     / s_buffer_load_dword
-                case 0x1: case 0x9: n = 2; break;   // s_load_dwordx2   / s_buffer_load_dwordx2
-                case 0x2: case 0xA: n = 4; break;   // s_load_dwordx4   / s_buffer_load_dwordx4
-                default: ok = false; return true;   // x8/x16 and others not yet
+                case 0x0: case 0x8: n = 1;  break;   // s_load_dword     / s_buffer_load_dword
+                case 0x1: case 0x9: n = 2;  break;   // s_load_dwordx2   / s_buffer_load_dwordx2
+                case 0x2: case 0xA: n = 4;  break;   // s_load_dwordx4   / s_buffer_load_dwordx4
+                case 0x3: case 0xB: n = 8;  break;   // s_load_dwordx8   / s_buffer_load_dwordx8
+                case 0x4: case 0xC: n = 16; break;   // s_load_dwordx16  / s_buffer_load_dwordx16
+                default: ok = false; return true;    // register-offset / stores / others not yet
             }
             uint32_t base_idx = in.literal >> 2;    // immediate byte offset -> dword index
             // Descriptor provenance: pick which bound constant buffer via the resource table. For
