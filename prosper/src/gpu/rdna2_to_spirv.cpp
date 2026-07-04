@@ -12,7 +12,7 @@ enum : uint32_t {
     Op_Capability=17, Op_TypeVoid=19, Op_TypeBool=20, Op_TypeInt=21, Op_TypeFloat=22, Op_TypeVector=23,
     Op_TypeRuntimeArray=29, Op_TypeStruct=30, Op_TypePointer=32, Op_TypeFunction=33,
     Op_ConstantTrue=41, Op_ConstantFalse=42, Op_Constant=43, Op_Function=54, Op_FunctionEnd=56, Op_Variable=59,
-    Op_LogicalAnd=167, Op_Select=169, Op_FOrdEqual=180, Op_FOrdNotEqual=182, Op_FOrdLessThan=184, Op_FOrdGreaterThan=186,
+    Op_LogicalOr=166, Op_LogicalAnd=167, Op_Select=169, Op_FOrdEqual=180, Op_FOrdNotEqual=182, Op_FOrdLessThan=184, Op_FOrdGreaterThan=186,
     Op_FOrdLessThanEqual=188, Op_FOrdGreaterThanEqual=190,
     Op_Load=61, Op_Store=62, Op_AccessChain=65, Op_Decorate=71, Op_MemberDecorate=72,
     Op_ConvertFToU=109, Op_ConvertFToS=110, Op_ConvertSToF=111, Op_ConvertUToF=112, Op_Bitcast=124,
@@ -143,8 +143,9 @@ struct SpirvCompute {
         put(code, Op_Store, {p, sel});
     }
     uint32_t btrue() { uint32_t r = id(); put(types, Op_ConstantTrue, {t_bool, r}); return r; }
-    // Logical AND of two bools (EXEC narrowing).
+    // Logical AND / OR of two bools (EXEC narrowing / saveexec).
     uint32_t land(uint32_t a, uint32_t b_) { uint32_t r = id(); put(code, Op_LogicalAnd, {t_bool, r, a, b_}); return r; }
+    uint32_t lor(uint32_t a, uint32_t b_)  { uint32_t r = id(); put(code, Op_LogicalOr,  {t_bool, r, a, b_}); return r; }
 
     void begin(uint32_t input_stride) {
         stride = input_stride;
@@ -269,9 +270,20 @@ struct SpirvCompute {
 // operands may reference either (SGPR is a valid ALU operand), so both are resolved by operand_bits.
 struct RegState {
     std::unordered_map<int, uint32_t> vreg, sreg;
+    std::unordered_map<int, uint32_t> sreg_bool;   // SGPR (pairs) holding a saved per-lane mask (bool id)
     uint32_t vcc = 0;
-    uint32_t exec = 0;   // per-lane execution mask (bool); v_cmpx narrows it, output store honors it
+    uint32_t exec = 0;         // per-lane execution mask (bool); v_cmpx narrows it, output store honors it
+    bool exec_narrowed = false; // true once EXEC is narrowed below all-lanes-on (so VGPR writes predicate)
 };
+
+// Predicate a just-computed VGPR write against EXEC: under a narrowed mask, inactive lanes keep their
+// prior value. A no-op when EXEC is full (the straight-line common case), so nothing is perturbed.
+inline void predicate_write(SpirvCompute& b, RegState& rs, int idx, uint32_t old_val) {
+    if (rs.exec_narrowed) rs.vreg[idx] = b.sel(rs.exec, rs.vreg[idx], old_val);
+}
+inline uint32_t vreg_old(SpirvCompute& b, RegState& rs, int idx) {
+    auto it = rs.vreg.find(idx); return it == rs.vreg.end() ? b.uconst(0) : it->second;
+}
 
 // Resolve an operand to its raw 32-bit value (bits). Float ops bitcast these to float.
 uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, const Operand& o) {
@@ -293,6 +305,39 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
     auto val = [&](const Operand& o) { return operand_bits(b, rs, in, o); };
     switch (in.fmt) {
         case Rdna2Format::SOP1: {
+            // 64-bit per-lane MASK ops (EXEC / VCC / saved masks). In our per-invocation model a wave
+            // mask is a single bool for this lane. EXEC=SGPR 126/127, VCC=106/107; a saved mask lives
+            // in sreg_bool. These implement divergent control flow (if/endif via saveexec + restore).
+            if (in.opcode == 0x04 || in.opcode == 0x24 || in.opcode == 0x25) {
+                auto is_exec = [](const Operand& o){ return o.value == 126 || o.value == 127; };
+                auto src_mask = [&](const Operand& o) -> uint32_t {
+                    if (o.value == 106 || o.value == 107) return rs.vcc;    // VCC
+                    if (o.value == 126 || o.value == 127) return rs.exec;   // EXEC
+                    if (o.kind == OperandKind::SGPR) { auto it = rs.sreg_bool.find(o.value);
+                        if (it != rs.sreg_bool.end()) return it->second; }
+                    if (o.kind == OperandKind::InlineInt) { if (o.value == -1) return b.btrue();
+                        if (o.value == 0) return b.bfalse(); }
+                    return 0;   // not a recognizable mask
+                };
+                if (in.opcode == 0x04) {                    // s_mov_b64
+                    if (is_exec(in.dst)) {                  // set/restore EXEC
+                        if (in.src[0].kind == OperandKind::InlineInt && in.src[0].value == -1) {
+                            rs.exec = b.btrue(); rs.exec_narrowed = false;   // exec = all lanes on
+                        } else { uint32_t m = src_mask(in.src[0]); if (!m) ok = false;
+                                 else { rs.exec = m; rs.exec_narrowed = true; } }
+                    } else {                                // s_mov_b64 sDST, <mask> : save a mask
+                        uint32_t m = src_mask(in.src[0]); if (!m) ok = false;
+                        else rs.sreg_bool[in.dst.value] = m;
+                    }
+                } else {                                    // s_and/or_saveexec_b64 sDST, src
+                    rs.sreg_bool[in.dst.value] = rs.exec;   // save current EXEC to the dest SGPR pair
+                    uint32_t m = src_mask(in.src[0]);
+                    if (!m) ok = false;
+                    else { rs.exec = (in.opcode == 0x24) ? b.land(rs.exec, m) : b.lor(rs.exec, m);
+                           rs.exec_narrowed = true; }
+                }
+                return true;
+            }
             uint32_t a = val(in.src[0]); uint32_t& d = rs.sreg[in.dst.value];
             switch (in.opcode) {
                 case 0x03: d = a; break;                    // s_mov_b32
@@ -317,7 +362,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             return true;
         }
         case Rdna2Format::VOP1: {
-            uint32_t a = val(in.src[0]); uint32_t& d = vreg[in.dst.value];
+            uint32_t a = val(in.src[0]); uint32_t old_d = vreg_old(b, rs, in.dst.value);
+            uint32_t& d = vreg[in.dst.value];
             switch (in.opcode) {
                 case 0x01: d = a; break;                              // v_mov_b32
                 case 0x05: d = b.cvt_i2f(a); break;                   // v_cvt_f32_i32
@@ -338,10 +384,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x38: d = b.iun(Op_BitReverse, a); break;        // v_bfrev_b32
                 default: ok = false;
             }
+            if (ok) predicate_write(b, rs, in.dst.value, old_d);
             return true;
         }
         case Rdna2Format::VOP2: {
-            uint32_t a = val(in.src[0]), c = val(in.src[1]); uint32_t& d = vreg[in.dst.value];
+            uint32_t a = val(in.src[0]), c = val(in.src[1]); uint32_t old_d = vreg_old(b, rs, in.dst.value);
+            uint32_t& d = vreg[in.dst.value];
             switch (in.opcode) {
                 case 0x01: d = b.sel(vcc, c, a); break;               // v_cndmask_b32: dst = vcc ? src1 : src0
                 case 0x03: d = b.fbin(Op_FAdd, a, c); break;          // v_add_f32
@@ -367,6 +415,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x2F: d = b.pack_half2x16(a, c); break;          // v_cvt_pkrtz_f16_f32 (e32 form)
                 default: ok = false;
             }
+            if (ok) predicate_write(b, rs, in.dst.value, old_d);
             return true;
         }
         case Rdna2Format::VOPC: {                                     // v_cmp_* -> VCC; v_cmpx_* also -> EXEC
@@ -400,10 +449,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0xC6: cmp = b.ucmp(Op_UGreaterThanEqual, a, c); break;    // v_cmp_ge_u32
                 default: ok = false;
             }
-            if (ok) { vcc = cmp; if (is_cmpx) rs.exec = b.land(rs.exec, cmp); }
+            if (ok) { vcc = cmp; if (is_cmpx) { rs.exec = b.land(rs.exec, cmp); rs.exec_narrowed = true; } }
             return true;
         }
-        case Rdna2Format::VOP3:
+        case Rdna2Format::VOP3: {
+            uint32_t old_d = vreg_old(b, rs, in.dst.value);
             if (in.opcode == 0x14B) {                                 // v_fma_f32 = src0*src1 + src2
                 uint32_t m = b.fbin(Op_FMul, val(in.src[0]), val(in.src[1]));
                 vreg[in.dst.value] = b.fbin(Op_FAdd, m, val(in.src[2]));
@@ -453,7 +503,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             } else if (in.opcode == 0x107) {                          // v_mul_legacy_f32 ~= s0*s1
                 vreg[in.dst.value] = b.fbin(Op_FMul, val(in.src[0]), val(in.src[1]));
             } else ok = false;
+            if (ok) predicate_write(b, rs, in.dst.value, old_d);
             return true;
+        }
         default: return false;   // not a VALU format
     }
 }
@@ -466,7 +518,6 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
     SpirvCompute b;
     b.begin(num_inputs ? num_inputs : 1);
     RegState rs; rs.vcc = b.bfalse(); rs.exec = b.btrue();
-    const uint32_t exec0 = rs.exec;   // sentinel: if unchanged, no v_cmpx narrowed EXEC
     for (uint32_t k = 0; k < num_inputs; k++) rs.vreg[(int)k] = b.load_input(k);
 
     for (const auto& in : ins) {
@@ -477,9 +528,10 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
 
     auto it = rs.vreg.find((int)out_vgpr);
     uint32_t outbits = it == rs.vreg.end() ? b.uconst(0) : it->second;
-    // If a v_cmpx narrowed EXEC, masked-off lanes keep the output slot's prior value.
-    if (rs.exec == exec0) b.store_output(outbits);
-    else                  b.store_output_pred(outbits, rs.exec);
+    // If EXEC is still narrowed (a v_cmpx with no restore), masked-off lanes keep the output slot's
+    // prior value; if it was restored to all-lanes-on, every lane stores.
+    if (!rs.exec_narrowed) b.store_output(outbits);
+    else                   b.store_output_pred(outbits, rs.exec);
     return b.finish();
 }
 

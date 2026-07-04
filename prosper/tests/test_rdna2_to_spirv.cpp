@@ -337,6 +337,29 @@ int main() {
     CHECK(active > 0 && masked > 0, "kernel 16 exercises BOTH active and masked lanes");
     CHECK(got16.size()==N && bad16==0, "recompiled kernel 16 (EXEC-predicated store via v_cmpx) correct");
 
+    // Kernel 17: EXEC per-write predication + restore. v3=7; v_cmpx_gt narrows EXEC to (u0>u1);
+    // v_add v3=u0+u1 (masked lanes must KEEP 7, proving per-write predication); s_mov_b64 exec,-1
+    // restores all lanes; cvt+store for everyone. Masked -> 7.0, active -> u0+u1.
+    const uint32_t code17[] = {
+        0x7e000f00u, 0x7e020f01u, 0x7e060287u, 0x7da80300u, 0x4a060300u, 0xbefe04c1u, 0x7e060d03u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv17 = recompile_valu(code17, sizeof(code17)/sizeof(code17[0]), 2, /*out_vgpr*/3);
+    CHECK(!spv17.empty(), "recompiled kernel 17 (EXEC predication + s_mov_b64 exec restore) -> SPIR-V");
+    std::vector<float> in17(N * 2), exp17(N);
+    for (uint32_t i = 0; i < N; i++) {
+        uint32_t u0 = i % 17, u1 = i % 13;
+        in17[i*2+0]=(float)u0; in17[i*2+1]=(float)u1;
+        exp17[i] = (u0 > u1) ? (float)(u0 + u1) : 7.0f;   // masked lanes keep the pre-cmpx v_mov value
+    }
+    std::vector<float> got17 = prosper::test::run_compute(spv17, in17, N, N);
+    uint32_t bad17 = 0, act17 = 0, msk17 = 0;
+    for (uint32_t i=0;i<N&&got17.size()==N;i++){ if (std::fabs(got17[i]-exp17[i])>1e-3f) bad17++;
+        if ((i%17)>(i%13)) act17++; else msk17++; }
+    printf("  kernel17 mismatches=%u (active=%u masked=%u, out[1]=%g exp=%g)\n", bad17, act17, msk17,
+           got17.size()==N?got17[1]:-1, exp17[1]);
+    CHECK(act17>0 && msk17>0, "kernel 17 exercises both active and masked lanes");
+    CHECK(got17.size()==N && bad17==0, "recompiled kernel 17 (per-write predication + EXEC restore) correct");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
