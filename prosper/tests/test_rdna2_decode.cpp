@@ -120,6 +120,15 @@ int main() {
     CHECK(fk.fmt == Rdna2Format::VOP2 && fk.len_dwords == 2 && fk.has_literal && !fk.has_modifier &&
           fk.literal == 0xd4a0e43au, "VOP2 v_fmaak_f32 carries its mandatory 32-bit literal");
 
+    // MIMG length: non-NSA image op is 2 dwords; NSA form adds dword0[2:1] extra address dwords.
+    // Encodings from llvm-mc gfx1030 (image_load 2D non-NSA; image_sample 2D NSA [v0,v1] = 1 extra).
+    const uint32_t mimg_reg[] = { 0xf0000f08u, 0x00000000u };
+    CHECK(rdna2_decode_one(mimg_reg, 2).fmt == Rdna2Format::MIMG && rdna2_decode_one(mimg_reg, 2).len_dwords == 2,
+          "non-NSA MIMG is 2 dwords");
+    const uint32_t mimg_nsa[] = { 0xf0800f0au, 0x00400000u, 0x00000001u };
+    CHECK(rdna2_decode_one(mimg_nsa, 3).fmt == Rdna2Format::MIMG && rdna2_decode_one(mimg_nsa, 3).len_dwords == 3,
+          "NSA MIMG with one extra address dword is 3 dwords");
+
     // inline-constant field decode: SGPR106 special, field 129 -> +1, 193 -> -1, 242 -> 1.0f
     CHECK(decode_src_field(0).kind == OperandKind::SGPR && decode_src_field(0).value == 0, "field 0 -> SGPR0");
     CHECK(decode_src_field(257).kind == OperandKind::VGPR && decode_src_field(257).value == 1, "field 257 -> VGPR1");

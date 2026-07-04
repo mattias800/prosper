@@ -166,7 +166,17 @@ Rdna2Inst rdna2_decode_one(const uint32_t* code, size_t max_dwords) {
             case 0x37: two_dword(Rdna2Format::FLAT);  break;
             case 0x38: two_dword(Rdna2Format::MUBUF); break;
             case 0x3a: two_dword(Rdna2Format::MTBUF); break;
-            case 0x3c: two_dword(Rdna2Format::MIMG);  break;
+            case 0x3c: {
+                // MIMG is 2 dwords, plus NSA (Non-Sequential Address) extra dwords holding the split
+                // address VGPRs. The NSA field (dword0[2:1], 0..3) gives the extra-dword count — miss
+                // it and every NSA image op mis-aligns the rest of the stream. (Verified against
+                // llvm-mc gfx1030: 2D non-NSA=2 dw, NSA 1-extra=3 dw, NSA 2-extra=4 dw.)
+                i.fmt = Rdna2Format::MIMG;
+                uint32_t extra = (w >> 1) & 0x3u;
+                i.len_dwords = 2 + extra;
+                if (max_dwords >= 2) i.words[1] = code[1];
+                break;
+            }
             case 0x3d: two_dword(Rdna2Format::SMEM);  break;
             case 0x3e: two_dword(Rdna2Format::EXP);   break;
             default:   i.fmt = Rdna2Format::Unknown;  i.len_dwords = 1; break;
