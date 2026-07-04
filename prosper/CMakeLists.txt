@@ -203,6 +203,12 @@ if(TARGET prosper_core)
       add_executable(test_recompiled_shaders tests/test_recompiled_shaders.cpp)
       target_link_libraries(test_recompiled_shaders PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME recompiled_shaders_render COMMAND test_recompiled_shaders)
+
+      # Pipeline realization: build a VkPipeline whose fixed-function state comes from
+      # resolve_pipeline_state(RenderState) and prove the resolved state drives rendering.
+      add_executable(test_pipeline_render tests/test_pipeline_render.cpp)
+      target_link_libraries(test_pipeline_render PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME pipeline_render COMMAND test_pipeline_render)
       message(STATUS "Vulkan found (${Vulkan_LIBRARY}) — offscreen graphics harness enabled")
     else()
       message(STATUS "Vulkan not found — skipping offscreen graphics harness")

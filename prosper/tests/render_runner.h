@@ -4,15 +4,19 @@
 // including test links Vulkan::Vulkan.
 #pragma once
 #include <vulkan/vulkan.h>
+#include "../src/gpu/render_state.hpp"
 #include <cstdint>
 #include <vector>
 
 namespace prosper::test {
 
-// Returns W*H*4 RGBA bytes, or {} on any Vulkan failure (incl. a rejected SPIR-V module).
+// Returns W*H*4 RGBA bytes, or {} on any Vulkan failure (incl. a rejected SPIR-V module). When `ps`
+// is non-null, the pipeline's fixed-function state (topology, blend, color write mask) is taken from
+// the resolved RDNA2 render-state — this is how the back-half realizes a GpuState as a real VkPipeline.
 inline std::vector<uint8_t> render_triangle_rgba(const std::vector<uint32_t>& vert,
                                                  const std::vector<uint32_t>& frag,
-                                                 uint32_t W, uint32_t H) {
+                                                 uint32_t W, uint32_t H,
+                                                 const prosper::gpu::ResolvedPipelineState* ps = nullptr) {
     std::vector<uint8_t> out;
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO}; app.apiVersion = VK_API_VERSION_1_1;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; ici.pApplicationInfo = &app;
@@ -82,7 +86,7 @@ inline std::vector<uint8_t> render_triangle_rgba(const std::vector<uint32_t>& ve
     st[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}; st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = fs; st[1].pName = "main";
     VkPipelineVertexInputStateCreateInfo vin{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    ia.topology = ps ? (VkPrimitiveTopology)ps->topology : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     VkViewport vp{0, 0, (float)W, (float)H, 0, 1}; VkRect2D sc{{0, 0}, {W, H}};
     VkPipelineViewportStateCreateInfo vpst{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
     vpst.viewportCount = 1; vpst.pViewports = &vp; vpst.scissorCount = 1; vpst.pScissors = &sc;
@@ -91,6 +95,16 @@ inline std::vector<uint8_t> render_triangle_rgba(const std::vector<uint32_t>& ve
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     VkPipelineColorBlendAttachmentState cba{}; cba.colorWriteMask = 0xF;
+    if (ps) {
+        cba.colorWriteMask = ps->color_write_mask;
+        cba.blendEnable    = ps->blend_enable ? VK_TRUE : VK_FALSE;
+        cba.srcColorBlendFactor = (VkBlendFactor)ps->src_color_blend_factor;
+        cba.dstColorBlendFactor = (VkBlendFactor)ps->dst_color_blend_factor;
+        cba.colorBlendOp        = (VkBlendOp)ps->color_blend_op;
+        cba.srcAlphaBlendFactor = (VkBlendFactor)ps->src_color_blend_factor;   // mirror color for alpha
+        cba.dstAlphaBlendFactor = (VkBlendFactor)ps->dst_color_blend_factor;
+        cba.alphaBlendOp        = (VkBlendOp)ps->color_blend_op;
+    }
     VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     cb.attachmentCount = 1; cb.pAttachments = &cba;
     VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
