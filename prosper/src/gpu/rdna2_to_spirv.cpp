@@ -288,7 +288,7 @@ uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, const 
 // Emit one ALU instruction (VOP1/2/C/3 or SOP1/2) into `b`, updating `rs`. Returns true if `in` is an
 // ALU format handled here; sets ok=false if it is an ALU op this stage doesn't support yet. Non-ALU
 // formats (EXP/memory/...) return false so the stage-specific caller can handle them.
-bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok) {
+bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool allow_exec_update) {
     auto& vreg = rs.vreg; uint32_t& vcc = rs.vcc;
     auto val = [&](const Operand& o) { return operand_bits(b, rs, in, o); };
     switch (in.fmt) {
@@ -376,6 +376,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok) {
             uint32_t op = in.opcode;
             bool is_cmpx = (op >= 0x10 && op <= 0x1f) || (op >= 0x90 && op <= 0x9f) ||
                            (op >= 0xd0 && op <= 0xdf);
+            if (is_cmpx && !allow_exec_update) { ok = false; return true; }
             uint32_t eff = is_cmpx ? op - 0x10 : op;
             uint32_t cmp = 0;
             switch (eff) {
@@ -471,7 +472,7 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
     for (const auto& in : ins) {
         if (in.is_end) break;
         bool ok = true;
-        if (!emit_alu(b, rs, in, ok) || !ok) return {};   // compute kernels are pure ALU
+        if (!emit_alu(b, rs, in, ok, true) || !ok) return {};   // compute kernels are pure ALU
     }
 
     auto it = rs.vreg.find((int)out_vgpr);
@@ -502,7 +503,9 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords) {
             continue;   // ignore NULL / additional exports for now
         }
         bool ok = true;
-        if (!emit_alu(b, rs, in, ok) || !ok) return {};
+        // Graphics-stage exports do not yet model EXEC-masked export/discard, so reject cmpx for now
+        // instead of accepting a shader that would export from inactive lanes.
+        if (!emit_alu(b, rs, in, ok, false) || !ok) return {};
     }
     if (!exported) return {};
     return b.finish();
@@ -529,7 +532,9 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords) {
             continue;   // ignore PARAM exports (varyings) for now
         }
         bool ok = true;
-        if (!emit_alu(b, rs, in, ok) || !ok) return {};
+        // Graphics-stage exports do not yet model EXEC-masked export/discard, so reject cmpx for now
+        // instead of accepting a shader that would export from inactive lanes.
+        if (!emit_alu(b, rs, in, ok, false) || !ok) return {};
     }
     if (!exported) return {};
     return b.finish();
