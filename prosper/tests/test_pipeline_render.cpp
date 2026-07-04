@@ -84,6 +84,31 @@ int main() {
         CHECK(r > 128 && g < 128 && b > 128, "additive blend: red over blue -> magenta (blend state honored)");
     } else { CHECK(false, "additive blend render produced a frame"); }
 
+    // Depth honored: the harness clears depth to 0.5 and the triangle's fragments are at z=0.0.
+    // ZFUNC=LESS (1): 0.0 < 0.5 -> passes -> red visible. ZFUNC=GREATER (4): 0.0 > 0.5 -> fails ->
+    // triangle rejected, center stays blue. Both compare ops come from resolve_pipeline_state.
+    RenderState rsz; rsz.prim_type = 4; rsz.cb_target_mask = 0xF;
+    rsz.z_enable = true; rsz.z_write_enable = true;
+    rsz.zfunc = 1;   // LESS
+    ResolvedPipelineState zpass = resolve_pipeline_state(rsz);
+    CHECK(zpass.depth_test_enable && zpass.depth_compare_op == 1, "resolved depth test LESS");
+    std::vector<uint8_t> imgzp = render_triangle_rgba(vert, frag, W, H, &zpass);
+    if (imgzp.size() == (size_t)W*H*4) {
+        uint8_t r = imgzp[center], b = imgzp[center+2];
+        printf("  center (z LESS)      = (%u,%u,%u)\n", r, imgzp[center+1], b);
+        CHECK(r > 128 && b < 128, "depth LESS: fragment z=0 < clear 0.5 passes -> red (depth honored)");
+    } else { CHECK(false, "depth LESS render produced a frame"); }
+
+    rsz.zfunc = 4;   // GREATER
+    ResolvedPipelineState zfail = resolve_pipeline_state(rsz);
+    CHECK(zfail.depth_compare_op == 4, "resolved depth test GREATER");
+    std::vector<uint8_t> imgzf = render_triangle_rgba(vert, frag, W, H, &zfail);
+    if (imgzf.size() == (size_t)W*H*4) {
+        uint8_t r = imgzf[center], b = imgzf[center+2];
+        printf("  center (z GREATER)   = (%u,%u,%u)\n", r, imgzf[center+1], b);
+        CHECK(b > 128 && r < 128, "depth GREATER: fragment z=0 > clear 0.5 fails -> stays blue (depth honored)");
+    } else { CHECK(false, "depth GREATER render produced a frame"); }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

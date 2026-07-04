@@ -45,6 +45,11 @@ inline std::vector<uint8_t> render_triangle_rgba(const std::vector<uint32_t>& ve
             if ((bits & (1u << i)) && (memp.memoryTypes[i].propertyFlags & want) == want) return i;
         return UINT32_MAX; };
     const VkFormat FMT = VK_FORMAT_R8G8B8A8_UNORM;
+    // Depth is opt-in: only when the resolved state enables the depth test. Every caller that passes
+    // no state (or depth disabled) takes the exact color-only path below — unchanged.
+    const bool use_depth = ps && ps->depth_test_enable;
+    const VkFormat DFMT = VK_FORMAT_D32_SFLOAT;
+    VkImage dimg = VK_NULL_HANDLE; VkDeviceMemory dmem = VK_NULL_HANDLE; VkImageView dview = VK_NULL_HANDLE;
 
     VkImageCreateInfo imgci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     imgci.imageType = VK_IMAGE_TYPE_2D; imgci.format = FMT; imgci.extent = {W, H, 1};
@@ -61,18 +66,42 @@ inline std::vector<uint8_t> render_triangle_rgba(const std::vector<uint32_t>& ve
     ivci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     VkImageView view; vkCreateImageView(dev, &ivci, nullptr, &view);
 
-    VkAttachmentDescription att{}; att.format = FMT; att.samples = VK_SAMPLE_COUNT_1_BIT;
-    att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    att.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED; att.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    if (use_depth) {
+        VkImageCreateInfo dci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        dci.imageType = VK_IMAGE_TYPE_2D; dci.format = DFMT; dci.extent = {W, H, 1};
+        dci.mipLevels = 1; dci.arrayLayers = 1; dci.samples = VK_SAMPLE_COUNT_1_BIT;
+        dci.tiling = VK_IMAGE_TILING_OPTIMAL; dci.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        vkCreateImage(dev, &dci, nullptr, &dimg);
+        VkMemoryRequirements dr; vkGetImageMemoryRequirements(dev, dimg, &dr);
+        VkMemoryAllocateInfo dai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        dai.allocationSize = dr.size; dai.memoryTypeIndex = pick(dr.memoryTypeBits, 0);
+        vkAllocateMemory(dev, &dai, nullptr, &dmem); vkBindImageMemory(dev, dimg, dmem, 0);
+        VkImageViewCreateInfo dvci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        dvci.image = dimg; dvci.viewType = VK_IMAGE_VIEW_TYPE_2D; dvci.format = DFMT;
+        dvci.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+        vkCreateImageView(dev, &dvci, nullptr, &dview);
+    }
+
+    VkAttachmentDescription att[2]{};
+    att[0].format = FMT; att[0].samples = VK_SAMPLE_COUNT_1_BIT;
+    att[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; att[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    att[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; att[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED; att[0].finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    att[1].format = DFMT; att[1].samples = VK_SAMPLE_COUNT_1_BIT;
+    att[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; att[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; att[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED; att[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     VkAttachmentReference ar{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkAttachmentReference dar{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
     VkSubpassDescription sub{}; sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     sub.colorAttachmentCount = 1; sub.pColorAttachments = &ar;
+    if (use_depth) sub.pDepthStencilAttachment = &dar;
     VkRenderPassCreateInfo rpci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
-    rpci.attachmentCount = 1; rpci.pAttachments = &att; rpci.subpassCount = 1; rpci.pSubpasses = &sub;
+    rpci.attachmentCount = use_depth ? 2 : 1; rpci.pAttachments = att; rpci.subpassCount = 1; rpci.pSubpasses = &sub;
     VkRenderPass rp; vkCreateRenderPass(dev, &rpci, nullptr, &rp);
+    VkImageView fbviews[2] = {view, dview};
     VkFramebufferCreateInfo fbci{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
-    fbci.renderPass = rp; fbci.attachmentCount = 1; fbci.pAttachments = &view; fbci.width = W; fbci.height = H; fbci.layers = 1;
+    fbci.renderPass = rp; fbci.attachmentCount = use_depth ? 2 : 1; fbci.pAttachments = fbviews; fbci.width = W; fbci.height = H; fbci.layers = 1;
     VkFramebuffer fb; vkCreateFramebuffer(dev, &fbci, nullptr, &fb);
 
     auto mkmod = [&](const std::vector<uint32_t>& c) -> VkShaderModule {
@@ -107,12 +136,19 @@ inline std::vector<uint8_t> render_triangle_rgba(const std::vector<uint32_t>& ve
     }
     VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     cb.attachmentCount = 1; cb.pAttachments = &cba;
+    VkPipelineDepthStencilStateCreateInfo dss{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    if (use_depth) {
+        dss.depthTestEnable  = VK_TRUE;
+        dss.depthWriteEnable = ps->depth_write_enable ? VK_TRUE : VK_FALSE;
+        dss.depthCompareOp   = (VkCompareOp)ps->depth_compare_op;
+    }
     VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     VkPipelineLayout layout; vkCreatePipelineLayout(dev, &plci, nullptr, &layout);
     VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     gp.stageCount = 2; gp.pStages = st; gp.pVertexInputState = &vin; gp.pInputAssemblyState = &ia;
     gp.pViewportState = &vpst; gp.pRasterizationState = &rs; gp.pMultisampleState = &ms;
     gp.pColorBlendState = &cb; gp.layout = layout; gp.renderPass = rp; gp.subpass = 0;
+    if (use_depth) gp.pDepthStencilState = &dss;
     VkPipeline pipe;
     if (vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gp, nullptr, &pipe) != VK_SUCCESS) return out;
 
@@ -131,9 +167,10 @@ inline std::vector<uint8_t> render_triangle_rgba(const std::vector<uint32_t>& ve
     VkCommandBuffer cmd; vkAllocateCommandBuffers(dev, &cbai, &cmd);
     VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &cbbi);
-    VkClearValue clear{}; clear.color = {{0.0f, 0.0f, 1.0f, 1.0f}};   // blue
+    VkClearValue clear[2]{}; clear[0].color = {{0.0f, 0.0f, 1.0f, 1.0f}};   // blue
+    clear[1].depthStencil = {0.5f, 0};   // depth cleared to 0.5 (fragments at z=0.0 pass LESS, fail GREATER)
     VkRenderPassBeginInfo rpbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-    rpbi.renderPass = rp; rpbi.framebuffer = fb; rpbi.renderArea = {{0, 0}, {W, H}}; rpbi.clearValueCount = 1; rpbi.pClearValues = &clear;
+    rpbi.renderPass = rp; rpbi.framebuffer = fb; rpbi.renderArea = {{0, 0}, {W, H}}; rpbi.clearValueCount = use_depth ? 2 : 1; rpbi.pClearValues = clear;
     vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     vkCmdDraw(cmd, 3, 1, 0, 0);
@@ -156,6 +193,7 @@ inline std::vector<uint8_t> render_triangle_rgba(const std::vector<uint32_t>& ve
     vkDestroyBuffer(dev, rb, nullptr); vkFreeMemory(dev, bmem, nullptr);
     vkDestroyFramebuffer(dev, fb, nullptr); vkDestroyRenderPass(dev, rp, nullptr); vkDestroyImageView(dev, view, nullptr);
     vkDestroyImage(dev, img, nullptr); vkFreeMemory(dev, imem, nullptr);
+    if (use_depth) { vkDestroyImageView(dev, dview, nullptr); vkDestroyImage(dev, dimg, nullptr); vkFreeMemory(dev, dmem, nullptr); }
     vkDestroyDevice(dev, nullptr); vkDestroyInstance(inst, nullptr);
     return out;
 }
