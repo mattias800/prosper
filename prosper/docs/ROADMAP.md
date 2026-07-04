@@ -24,6 +24,34 @@ presented, framebuffer CRC == golden" is. Each change adds the check that proves
 
 ---
 
+## Current status (2026-07-04) — at a glance
+
+*(The milestone log below is a historical, append-only record; this section is the current truth.)*
+
+- ✅ **M0–M3 done:** loader (SELF/ELF → relocatable image → multi-module link → NID binding), host
+  execution (mmap + import-trap dispatch), and enough libkernel/libc/services that the game boots
+  **through** IL2CPP init (GC + thread pool, stop-the-world suspension solved) into Unity's `GfxDevice`.
+- 🟢 **M4/M5 graphics — substantially built:**
+  - **AGC command frontend complete** — `sceAgcCreateShader` + `sceAgcDriverSubmitDcb`; zero
+    unimplemented `libSceAgc` calls in the boot; a real Dcb decodes → `GpuState` (test-locked).
+  - **AGC→Vulkan pipeline** — `pm4_decode → command_processor → render_state/resolve_pipeline_state
+    → vk_translate → real VkGraphicsPipeline`, with topology/blend/depth/write-mask pixel-verified,
+    plus the `gpu_resources` contract (Buffer/Texture/RT/Depth/ShaderProgram/Pipeline).
+  - **RDNA2→SPIR-V recompiler** — ~52 ALU ops + convert/compare/select/bitfield/pack + **divergent
+    control flow** (EXEC predication, `saveexec`/restore, forward `s_cbranch_execz`); **67%
+    instruction coverage** over the 41 real game shaders (`recompile_coverage`/`shader_histo`).
+    Remaining: `SMEM`/`MUBUF`/`MIMG` (need the resource-binding model) and loops (backward branches).
+  - **`GpuState → recompiled shaders → VkPipeline → frame`** spine proven end-to-end (pixel-verified).
+- 🚧 **Live boot blocker (root-caused, fix in progress):** Unity's GPU-resource **residency pass is
+  completion-event-driven** — it runs when the game drains a GPU-completion event from the AGC equeue.
+  Our headless equeue never delivers one, so pipeline objects stay unprocessed (null companion → later
+  deref fault). Fix = **deliver a real completion event on submit/flip** so the game's own pass runs
+  (not fabricate residency). When it fires, real draws flow into the spine above. See `docs/GRAPHICS.md`.
+- 🔁 **Multi-agent + CI:** developed by parallel agents (recompiler/back-half, AGC/host front-half,
+  infra/review) over a branch-protected `master`; GitHub Actions builds + `ctest` on Linux + Windows.
+
+---
+
 ### M0 — Recon & tooling ✅ (done)
 - [x] Identify format (unencrypted SELF, x86-64, FreeBSD ABI).
 - [x] `self_dump`: SELF/ELF parser, VA mapping, dynamic tags, NID import extraction.

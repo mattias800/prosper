@@ -52,7 +52,7 @@
   call and (initially) aborts — this is how we discover what the game needs, in order.
 - Implemented modules register real handlers.
 
-### 3. Kernel HLE (`src/kernel`)
+### 3. Kernel HLE (`src/hle`, with the host layer in `src/host`)
 Maps FreeBSD/libkernel semantics onto the host:
 - **Threads** → host threads (pthreads / Win32). Scheduling is cooperative-native.
 - **Memory** → `sceKernelMapNamedFlexibleMemory`/`sceKernelReserveVirtualRange`
@@ -73,7 +73,18 @@ Maps FreeBSD/libkernel semantics onto the host:
   intermediate). Recompile to **SPIR-V**. This is a self-contained sub-project
   (decoder → SSA IR → SPIR-V emitter), the biggest single effort in the whole layer.
 
-### 5. Peripherals (`src/io`)
+**Implementation status (built, all execution/pixel-verified):** the pipeline is
+`pm4_decode` → `command_processor` (fold a Dcb into a `GpuState`) → `render_state` /
+`resolve_pipeline_state` → `vk_translate` → a real `VkGraphicsPipeline`, plus a resource-layer
+contract (`gpu_resources`). The **RDNA2→SPIR-V recompiler** (`rdna2_decode` + `rdna2_to_spirv`)
+handles ~52 ALU ops + convert/compare/select/bitfield/pack and **divergent control flow** (EXEC
+per-lane predication, `saveexec`/restore, forward `s_cbranch_execz`), at ~67% instruction coverage
+over the game's real shaders (measured by `recompile_coverage`/`shader_histo`). Remaining: `SMEM`/
+`MUBUF`/`MIMG` memory ops (need the resource-binding model) and loops (backward branches). The live
+boot blocker is upstream — Unity's completion-event-driven residency pass never fires under our
+headless equeue (see `docs/GRAPHICS.md`).
+
+### 5. Peripherals (`src/io`, future — not yet a module)
 - `libScePad` → SDL_GameController (DualSense passthrough where possible).
 - `libSceAudioOut(2)` → SDL audio / miniaudio; `libSceAjm` → decode ATRAC9/AAC via
   ffmpeg or a dedicated ATRAC9 decoder.

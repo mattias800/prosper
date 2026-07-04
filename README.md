@@ -40,24 +40,31 @@ The current bring-up target is a real Unity/IL2CPP title. Starting from its (use
 
 **Graphics (AGC → Vulkan) — the active frontier:**
 - ✅ **AGC command frontend complete:** `sceAgcCreateShader` (relocates the embedded RDNA2 shader
-  ELFs, registers all 36 game shaders) and `sceAgcDriverSubmitDcb`. The boot now clears the entire
-  AGC path with **zero unimplemented `libSceAgc` calls remaining**.
-- ✅ **PM4 command-buffer pipeline:** the game's *real* submitted command buffer is decoded
-  (`Dcb` → PM4 packets) and folded into a GPU register-state, driving draw/render-state extraction
-  → `vk_translate` → Vulkan.
-- ✅ **RDNA2 → SPIR-V shader recompiler** (not a CPU emulator for the GPU either — we recompile
-  the ISA). Covers ~45 opcodes prioritized against a histogram of the game's *own* shaders
-  (`shader_histo`), across scalar/vector/float/int/bitwise/convert/compare/select/bitfield. Both
-  **vertex and fragment** shaders recompiled from real RDNA2 render verified frames offscreen.
-- 🚧 **Current fault: the AGC→Vulkan resource-backing boundary** (`eboot+0xba6e08`). Unity created
-  a GPU resource but its backing (`+0x140`) was never built, because the AGC resource path returns
-  handles without real Vulkan objects. Next: the real GPU resource layer (textures/buffers/render
-  targets). Diagnosed precisely; *not* papered over with a fake object.
+  ELFs, registers all 36 game shaders) and `sceAgcDriverSubmitDcb`. The boot clears the entire AGC
+  path with **zero unimplemented `libSceAgc` calls remaining**; a real submitted command buffer is
+  decoded (`Dcb` → PM4 packets) and folded into a GPU register-state (regression-locked by a test).
+- ✅ **RDNA2 → SPIR-V shader recompiler** (we recompile the GPU ISA, not emulate it). ~52 ALU ops
+  (scalar/vector/float/int/bitwise/convert/compare/select/bitfield/pack) **plus divergent control
+  flow** — EXEC-mask per-lane predication, `s_*saveexec`/`s_mov_b64 exec` save/restore, and forward
+  `s_cbranch_execz`-style branches (the real if-then idiom) — all proven by execution-differential
+  tests on real Vulkan. A coverage tool (`shader_histo`) reports **67% instruction coverage over the
+  game's 41 real embedded shaders**; the remaining wall is `SMEM` constant/descriptor loads (needs
+  the resource-binding model).
+- ✅ **GpuState → frame spine:** register-state → `render_state`/`vk_translate` →
+  `resolve_pipeline_state` → a real `VkGraphicsPipeline`, with topology/blend/depth/color-write-mask
+  all driven from the decoded registers and **verified by pixel readback**. Both recompiled vertex
+  and fragment shaders render offscreen.
+- 🚧 **Root cause of the current boot fault (found, fix in progress):** Unity's GPU-resource
+  *residency pass is completion-event-driven* — it runs when the game drains a GPU-completion event
+  from the AGC equeue. Our headless equeue never delivers one, so the pass never runs and pipeline
+  objects stay unprocessed (a null companion the engine later dereferences). The fix is to **deliver
+  a real completion event on submit/flip so the game's own pass runs** — *not* to fabricate residency.
+  Once it fires, real draws flow into the `GpuState → frame` spine above.
 
-Development is **agentic-first**: correctness is verified programmatically — 21 self-checking tests
+Development is **agentic-first**: correctness is verified programmatically — 31 self-checking tests
 under `ctest` (including a headless Vulkan/llvmpipe harness that runs recompiled shaders and asserts
-numeric/pixel results), structured logs, and purpose-built tooling (`boot_trace`, `shader_histo`,
-`PROSPER_PEEK`) — rather than by hand.
+numeric/pixel results), cross-platform CI (Linux + Windows/MinGW), structured logs, and purpose-built
+tooling (`boot_trace`, `shader_histo` coverage, `PROSPER_PEEK`/`PROSPER_PIPETRACE`) — never by hand.
 
 ## Legal / ethical
 

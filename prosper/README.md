@@ -17,9 +17,13 @@ makes this project possible without console keys.
   IL2CPP GC + thread pool; boots **through** IL2CPP into Unity's GfxDevice bring-up.
 - 🚧 **M4/M5 — Graphics (AGC → Vulkan), active.** AGC command frontend complete (CreateShader +
   SubmitDcb, zero unimplemented `libSceAgc` calls); PM4 decode → command processor → render state →
-  vk_translate; **RDNA2→SPIR-V recompiler** (~45 opcodes, vertex+fragment verified on Vulkan).
-  Current fault is the AGC→Vulkan **resource-backing boundary** — next is the real GPU resource
-  layer. See [`docs/GRAPHICS.md`](docs/GRAPHICS.md).
+  `resolve_pipeline_state` → a real `VkGraphicsPipeline` (topology/blend/depth/write-mask
+  pixel-verified). **RDNA2→SPIR-V recompiler**: ~52 ALU ops + **divergent control flow** (EXEC
+  predication, saveexec/restore, forward branches), **67% instruction coverage** over the 41 real
+  game shaders (`shader_histo`); the wall is `SMEM` (needs the resource-binding model). Boot root
+  cause found: the GPU-resource residency pass is **completion-event-driven** and our headless equeue
+  never fires it — fix in progress is delivering a real completion on submit/flip. See
+  [`docs/GRAPHICS.md`](docs/GRAPHICS.md).
 
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) for milestones, [`docs/GRAPHICS.md`](docs/GRAPHICS.md) for
 the graphics frontier, and [`docs/VERIFICATION.md`](docs/VERIFICATION.md) for the agentic-first
@@ -34,7 +38,7 @@ prosper/
   src/hle/         HLE of Sony libraries (libc, libkernel, AGC/graphics), NID hashing
   src/host/        host execution: image mapping, stubs, fault handling (Linux)
   src/gpu/         AGC→Vulkan: PM4 decode, command processor, render state,
-                   vk_translate, RDNA2→SPIR-V recompiler
+                   vk_translate, resource layer (gpu_resources), RDNA2→SPIR-V recompiler
   tools/           self_dump, boot_trace, shader_histo, imgdump
   tests/           unit + boot + Vulkan-execution tests (ctest)
   CMakeLists.txt
