@@ -13,7 +13,8 @@ namespace prosper::test {
 // threads are dispatched (default = input.size()); the output buffer holds `out_count` floats
 // (default = input.size()). Returns the output, or {} on any Vulkan failure (incl. rejected SPIR-V).
 inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const std::vector<float>& input,
-                                      uint32_t invocations = 0, uint32_t out_count = 0) {
+                                      uint32_t invocations = 0, uint32_t out_count = 0,
+                                      const std::vector<uint32_t>& cbuf = {}) {
     const uint32_t IN_N = (uint32_t)input.size();
     if (invocations == 0) invocations = IN_N;
     if (out_count == 0)   out_count = IN_N;
@@ -54,7 +55,7 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
     };
     const VkDeviceSize inBytes = (VkDeviceSize)IN_N * sizeof(float);
     const VkDeviceSize outBytes = (VkDeviceSize)out_count * sizeof(float);
-    VkBuffer inBuf, outBuf; VkDeviceMemory inMem, outMem;
+    VkBuffer inBuf, outBuf, cbBuf; VkDeviceMemory inMem, outMem, cbMem;
     auto makeBuf = [&](VkBuffer& b, VkDeviceMemory& m, VkDeviceSize sz) {
         VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         bci.size = sz; bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
@@ -64,36 +65,45 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
         ai.allocationSize = r.size; ai.memoryTypeIndex = hostMem(r.memoryTypeBits);
         vkAllocateMemory(dev, &ai, nullptr, &m); vkBindBufferMemory(dev, b, m, 0);
     };
-    makeBuf(inBuf, inMem, inBytes); makeBuf(outBuf, outMem, outBytes);
+    // Constant buffer (binding 2, always present since the shell declares it; >=1 dword). Holds the
+    // scalar memory an SMEM load reads. Shaders without SMEM never read it.
+    const uint32_t CB_N = cbuf.empty() ? 1u : (uint32_t)cbuf.size();
+    const VkDeviceSize cbBytes = (VkDeviceSize)CB_N * sizeof(uint32_t);
+    makeBuf(inBuf, inMem, inBytes); makeBuf(outBuf, outMem, outBytes); makeBuf(cbBuf, cbMem, cbBytes);
     void* p = nullptr; vkMapMemory(dev, inMem, 0, inBytes, 0, &p);
     for (uint32_t i = 0; i < IN_N; i++) ((float*)p)[i] = input[i];
     vkUnmapMemory(dev, inMem);
+    void* cp = nullptr; vkMapMemory(dev, cbMem, 0, cbBytes, 0, &cp);
+    for (uint32_t i = 0; i < CB_N; i++) ((uint32_t*)cp)[i] = (i < cbuf.size()) ? cbuf[i] : 0u;
+    vkUnmapMemory(dev, cbMem);
     // Zero the output buffer so results are deterministic — in particular, EXEC-masked lanes (which
     // do not store) must observe a defined prior value, not uninitialized memory.
     void* zp = nullptr; vkMapMemory(dev, outMem, 0, outBytes, 0, &zp);
     for (uint32_t i = 0; i < out_count; i++) ((float*)zp)[i] = 0.0f;
     vkUnmapMemory(dev, outMem);
 
-    VkDescriptorSetLayoutBinding binds[2]{};
-    for (int i = 0; i < 2; i++) { binds[i].binding = i; binds[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    VkDescriptorSetLayoutBinding binds[3]{};
+    for (int i = 0; i < 3; i++) { binds[i].binding = i; binds[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         binds[i].descriptorCount = 1; binds[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; }
     VkDescriptorSetLayoutCreateInfo dslci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dslci.bindingCount = 2; dslci.pBindings = binds;
+    dslci.bindingCount = 3; dslci.pBindings = binds;
     VkDescriptorSetLayout dsl; vkCreateDescriptorSetLayout(dev, &dslci, nullptr, &dsl);
-    VkDescriptorPoolSize psz{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2};
+    VkDescriptorPoolSize psz{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3};
     VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpci.maxSets = 1; dpci.poolSizeCount = 1; dpci.pPoolSizes = &psz;
     VkDescriptorPool dp; vkCreateDescriptorPool(dev, &dpci, nullptr, &dp);
     VkDescriptorSetAllocateInfo dsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     dsai.descriptorPool = dp; dsai.descriptorSetCount = 1; dsai.pSetLayouts = &dsl;
     VkDescriptorSet dset; vkAllocateDescriptorSets(dev, &dsai, &dset);
-    VkDescriptorBufferInfo bi0{inBuf, 0, VK_WHOLE_SIZE}, bi1{outBuf, 0, VK_WHOLE_SIZE};
-    VkWriteDescriptorSet w[2]{};
+    VkDescriptorBufferInfo bi0{inBuf, 0, VK_WHOLE_SIZE}, bi1{outBuf, 0, VK_WHOLE_SIZE}, bi2{cbBuf, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet w[3]{};
     w[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; w[0].dstSet = dset; w[0].dstBinding = 0;
     w[0].descriptorCount = 1; w[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[0].pBufferInfo = &bi0;
     w[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; w[1].dstSet = dset; w[1].dstBinding = 1;
     w[1].descriptorCount = 1; w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[1].pBufferInfo = &bi1;
-    vkUpdateDescriptorSets(dev, 2, w, 0, nullptr);
+    w[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; w[2].dstSet = dset; w[2].dstBinding = 2;
+    w[2].descriptorCount = 1; w[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[2].pBufferInfo = &bi2;
+    vkUpdateDescriptorSets(dev, 3, w, 0, nullptr);
 
     VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     smci.codeSize = spirv.size() * 4; smci.pCode = spirv.data();
@@ -137,6 +147,7 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
     vkDestroyDescriptorPool(dev, dp, nullptr); vkDestroyDescriptorSetLayout(dev, dsl, nullptr);
     vkDestroyBuffer(dev, inBuf, nullptr); vkFreeMemory(dev, inMem, nullptr);
     vkDestroyBuffer(dev, outBuf, nullptr); vkFreeMemory(dev, outMem, nullptr);
+    vkDestroyBuffer(dev, cbBuf, nullptr); vkFreeMemory(dev, cbMem, nullptr);
     vkDestroyDevice(dev, nullptr); vkDestroyInstance(inst, nullptr);
     return out;
 }
