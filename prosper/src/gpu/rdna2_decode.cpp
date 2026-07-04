@@ -84,7 +84,16 @@ void decode_operands(Rdna2Inst& i) {
             for (int k = 0; k < 4; k++) i.src[k] = vgpr((d1 >> (8 * k)) & 0xFFu);
             i.n_src = 4; break;
         }
-        default: break;   // memory / interp: operands not decoded at this stage
+        case Rdna2Format::SMEM:
+            // Scalar memory load. opcode[25:18]; SDATA (dest SGPR) [12:6]; SBASE (SGPR *pair*, field
+            // is the pair index so ×2) [5:0]; 21-bit immediate byte OFFSET in dword1[20:0] (stored in
+            // `literal`). Register-offset (SOFFSET) and buffer descriptors are not decoded yet.
+            i.opcode = (w >> 18) & 0xFFu;
+            i.dst    = sgpr(w >> 6);                 // SDATA
+            i.src[0] = sgpr((w & 0x3Fu) << 1);       // SBASE (pair base)
+            i.literal = i.words[1] & 0x1FFFFFu;       // immediate byte offset (not a trailing constant)
+            i.n_src = 1; break;
+        default: break;   // MUBUF/MTBUF/MIMG/DS/FLAT/VINTRP: operands not decoded at this stage
     }
 }
 }  // namespace
