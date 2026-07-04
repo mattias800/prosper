@@ -17,7 +17,9 @@ enum : uint32_t {
     Op_Load=61, Op_Store=62, Op_AccessChain=65, Op_Decorate=71, Op_MemberDecorate=72,
     Op_ConvertFToU=109, Op_ConvertFToS=110, Op_ConvertSToF=111, Op_ConvertUToF=112, Op_Bitcast=124,
     Op_CompositeConstruct=80, Op_CompositeExtract=81, Op_IAdd=128, Op_FAdd=129, Op_ISub=130, Op_FSub=131, Op_IMul=132, Op_FMul=133,
-    Op_FDiv=136, Op_IEqual=170, Op_UGreaterThan=172, Op_SGreaterThan=173, Op_ULessThan=176, Op_SLessThan=177,
+    Op_FDiv=136, Op_IEqual=170, Op_INotEqual=171, Op_UGreaterThan=172, Op_SGreaterThan=173,
+    Op_UGreaterThanEqual=174, Op_SGreaterThanEqual=175, Op_ULessThan=176, Op_SLessThan=177,
+    Op_ULessThanEqual=178, Op_SLessThanEqual=179,
     Op_ShiftRightLogical=194, Op_ShiftRightArithmetic=195, Op_ShiftLeftLogical=196, Op_BitwiseOr=197,
     Op_BitwiseXor=198, Op_BitwiseAnd=199, Op_Not=200, Op_BitFieldSExtract=202, Op_BitFieldUExtract=203,
     Op_Label=248, Op_Return=253,
@@ -353,9 +355,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok) {
                 case 0x06: vcc = b.fcmp(Op_FOrdGreaterThanEqual, a, c); break; // v_cmp_ge_f32
                 case 0x81: vcc = b.scmp(Op_SLessThan, a, c); break;            // v_cmp_lt_i32
                 case 0x82: vcc = b.ucmp(Op_IEqual, a, c); break;               // v_cmp_eq_i32
+                case 0x83: vcc = b.scmp(Op_SLessThanEqual, a, c); break;       // v_cmp_le_i32
                 case 0x84: vcc = b.scmp(Op_SGreaterThan, a, c); break;         // v_cmp_gt_i32
+                case 0x85: vcc = b.ucmp(Op_INotEqual, a, c); break;            // v_cmp_ne_i32 (sign-agnostic)
+                case 0x86: vcc = b.scmp(Op_SGreaterThanEqual, a, c); break;    // v_cmp_ge_i32
                 case 0xC1: vcc = b.ucmp(Op_ULessThan, a, c); break;            // v_cmp_lt_u32
+                case 0xC2: vcc = b.ucmp(Op_IEqual, a, c); break;               // v_cmp_eq_u32
+                case 0xC3: vcc = b.ucmp(Op_ULessThanEqual, a, c); break;       // v_cmp_le_u32
                 case 0xC4: vcc = b.ucmp(Op_UGreaterThan, a, c); break;         // v_cmp_gt_u32
+                case 0xC5: vcc = b.ucmp(Op_INotEqual, a, c); break;            // v_cmp_ne_u32
+                case 0xC6: vcc = b.ucmp(Op_UGreaterThanEqual, a, c); break;    // v_cmp_ge_u32
                 default: ok = false;
             }
             return true;
@@ -390,6 +399,23 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok) {
             } else if (in.opcode == 0x346) {                          // v_lshl_add_u32 = (s0<<(s1&31))+s2
                 uint32_t sh = b.ibin(Op_BitwiseAnd, val(in.src[1]), b.uconst(31));
                 vreg[in.dst.value] = b.ibin(Op_IAdd, b.ibin(Op_ShiftLeftLogical, val(in.src[0]), sh), val(in.src[2]));
+            } else if (in.opcode == 0x371) {                          // v_and_or_b32 = (s0&s1)|s2
+                uint32_t t = b.ibin(Op_BitwiseAnd, val(in.src[0]), val(in.src[1]));
+                vreg[in.dst.value] = b.ibin(Op_BitwiseOr, t, val(in.src[2]));
+            } else if (in.opcode == 0x372) {                          // v_or3_b32 = s0|s1|s2
+                uint32_t t = b.ibin(Op_BitwiseOr, val(in.src[0]), val(in.src[1]));
+                vreg[in.dst.value] = b.ibin(Op_BitwiseOr, t, val(in.src[2]));
+            } else if (in.opcode == 0x36F) {                          // v_lshl_or_b32 = (s0<<(s1&31))|s2
+                uint32_t sh = b.ibin(Op_BitwiseAnd, val(in.src[1]), b.uconst(31));
+                vreg[in.dst.value] = b.ibin(Op_BitwiseOr, b.ibin(Op_ShiftLeftLogical, val(in.src[0]), sh), val(in.src[2]));
+            } else if (in.opcode == 0x345) {                          // v_xad_u32 = (s0^s1)+s2
+                uint32_t t = b.ibin(Op_BitwiseXor, val(in.src[0]), val(in.src[1]));
+                vreg[in.dst.value] = b.ibin(Op_IAdd, t, val(in.src[2]));
+            } else if (in.opcode == 0x347) {                          // v_add_lshl_u32 = (s0+s1)<<(s2&31)
+                uint32_t sh = b.ibin(Op_BitwiseAnd, val(in.src[2]), b.uconst(31));
+                vreg[in.dst.value] = b.ibin(Op_ShiftLeftLogical, b.ibin(Op_IAdd, val(in.src[0]), val(in.src[1])), sh);
+            } else if (in.opcode == 0x12F) {                          // v_mul_legacy_f32 ~= s0*s1
+                vreg[in.dst.value] = b.fbin(Op_FMul, val(in.src[0]), val(in.src[1]));
             } else ok = false;
             return true;
         default: return false;   // not a VALU format
