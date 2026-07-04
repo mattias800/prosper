@@ -161,7 +161,23 @@ Rdna2Inst rdna2_decode_one(const uint32_t* code, size_t max_dwords) {
     } else {
         switch (w >> 26u) {
             case 0x32: i.fmt = Rdna2Format::VINTRP; i.len_dwords = 1; break;
-            case 0x34: case 0x35: two_dword(Rdna2Format::VOP3);  break;   // 0x34 old-gen, 0x35 RDNA2
+            case 0x34: case 0x35: {   // VOP3 (0x34 old-gen, 0x35 RDNA2)
+                // 2 dwords, plus a trailing 32-bit literal when any of the three 9-bit src operand
+                // fields in dword1 ([8:0], [17:9], [26:18]) is 0xFF (the literal marker) — e.g.
+                // v_med3/v_add3/v_fma with an immediate. A 0xFF src field unambiguously means literal
+                // (256..511 are VGPRs), so this is exact for both VOP3A and VOP3B. Miss it and the
+                // literal dword mis-decodes and derails the rest of the stream.
+                i.fmt = Rdna2Format::VOP3;
+                if (max_dwords >= 2) {
+                    i.words[1] = code[1];
+                    const uint32_t d1 = code[1];
+                    const bool lit = (d1 & 0x1FFu) == 0xFFu || ((d1 >> 9) & 0x1FFu) == 0xFFu ||
+                                     ((d1 >> 18) & 0x1FFu) == 0xFFu;
+                    if (lit && max_dwords >= 3) { i.has_literal = true; i.literal = code[2]; i.len_dwords = 3; }
+                    else i.len_dwords = 2;
+                } else i.len_dwords = 1;
+                break;
+            }
             case 0x36: two_dword(Rdna2Format::DS);    break;
             case 0x37: two_dword(Rdna2Format::FLAT);  break;
             case 0x38: two_dword(Rdna2Format::MUBUF); break;

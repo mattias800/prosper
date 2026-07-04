@@ -120,6 +120,17 @@ int main() {
     CHECK(fk.fmt == Rdna2Format::VOP2 && fk.len_dwords == 2 && fk.has_literal && !fk.has_modifier &&
           fk.literal == 0xd4a0e43au, "VOP2 v_fmaak_f32 carries its mandatory 32-bit literal");
 
+    // VOP3 length: 2 dwords, plus a trailing 32-bit literal when a src field is 0xFF. Encodings from
+    // llvm-mc gfx1030: v_med3_f32 v0,v1,v2,0x40490fdb (src2=literal) vs v_mad_u32_u24 (no literal).
+    const uint32_t vop3_lit[] = { 0xd5570000u, 0x03fe0501u, 0x40490fdbu };
+    Rdna2Inst v3l = rdna2_decode_one(vop3_lit, 3);
+    CHECK(v3l.fmt == Rdna2Format::VOP3 && v3l.len_dwords == 3 && v3l.has_literal && v3l.literal == 0x40490fdbu,
+          "VOP3 with a 0xFF src field carries its trailing 32-bit literal (3 dwords)");
+    const uint32_t vop3_nolit[] = { 0xd5430000u, 0x040e0501u };
+    Rdna2Inst v3n = rdna2_decode_one(vop3_nolit, 2);
+    CHECK(v3n.fmt == Rdna2Format::VOP3 && v3n.len_dwords == 2 && !v3n.has_literal,
+          "VOP3 without a literal src is 2 dwords");
+
     // MIMG length: non-NSA image op is 2 dwords; NSA form adds dword0[2:1] extra address dwords.
     // Encodings from llvm-mc gfx1030 (image_load 2D non-NSA; image_sample 2D NSA [v0,v1] = 1 extra).
     const uint32_t mimg_reg[] = { 0xf0000f08u, 0x00000000u };
