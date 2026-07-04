@@ -136,7 +136,7 @@ struct SpirvCompute {
 
     void begin(uint32_t input_stride) {
         stride = input_stride;
-        t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_v3u = id(); t_bool = id();
+        t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_i32 = id(); t_v3u = id(); t_bool = id();
         uint32_t t_ptr_in_v3u = id(); v_gid = id();
         uint32_t t_rta = id(), t_struct = id(), t_ptr_sb_struct = id();
         v_in = id(); v_out = id(); t_ptr_sb_f32 = id();
