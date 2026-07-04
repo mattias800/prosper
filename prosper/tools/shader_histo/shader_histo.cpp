@@ -68,6 +68,15 @@ int main(int argc, char** argv) {
             cov_total += cov.total; cov_alu += cov.alu; cov_exp += cov.exports; cov_unsup += cov.unsupported;
             if (cov.unsupported == 0) shaders_full++;
             else blockers[{cov.first_bad_fmt, cov.first_bad_op}]++;
+            // argv[3] = a directory: dump every shader's .shader_text to shader_<idx>.bin and print a
+            // per-shader row (idx, size, first-unsupported fmt/op) so a team can analyze each in parallel.
+            if (argc > 3) {
+                char p[1024]; snprintf(p, sizeof(p), "%s/shader_%03d.bin", argv[3], shaders - 1);
+                if (FILE* d = fopen(p, "wb")) { fwrite(code, 1, sz, d); fclose(d); }
+                printf("SHADER %03d dwords=%zu insts=%u alu=%u exp=%u unsup=%u firstbad_fmt=%d op=0x%x\n",
+                       shaders - 1, (size_t)(sz/4), cov.total, cov.alu, cov.exports, cov.unsupported,
+                       cov.unsupported ? cov.first_bad_fmt : -1, cov.unsupported ? cov.first_bad_op : 0u);
+            }
         }
     }
     printf("shaders=%d  total_insts=%zu  distinct(fmt,op)=%zu  unknown=%zu\n", shaders, total, histo.size(), unknown);
