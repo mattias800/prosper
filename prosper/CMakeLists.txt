@@ -75,6 +75,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_rdna2_decode PRIVATE prosper_core)
   add_test(NAME rdna2_decode_walk COMMAND test_rdna2_decode)
 
+  # shader_histo: data-driven recompiler-coverage report over the game's real embedded RDNA2 shaders.
+  add_executable(shader_histo tools/shader_histo/shader_histo.cpp)
+  target_link_libraries(shader_histo PRIVATE prosper_core)
+
   # M2+: real memory mapping, trap, boot, and the boot-trace debug tool (Linux only).
   if(UNIX AND NOT APPLE)
     add_executable(boot_trace tools/boot_trace/boot_trace.cpp)
