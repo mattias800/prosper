@@ -69,6 +69,17 @@ namespace {
     bool     g_null_page = false;              // PROSPER_NULL_PAGE: back low null reads with zero page
     volatile sig_atomic_t g_null_page_count = 0;
     unsigned g_null_page_mask = 0;             // which of the 16 low pages [0,0x10000) are backed
+    // PROSPER_WATCH_COMPANION: write-watchpoint on the companion slot [obj+0x140] that the reader
+    // eboot+0xba6e08 finds null. Armed on the first such read (r15 known); the slot is null there, so
+    // any real writer MUST run after — this catches all of them. Implemented by mprotect-ing the
+    // slot's page read-only and single-stepping (trap flag) over each write, logging writes that land
+    // in the 8-byte slot with the writer's PC. Answers: does ANYTHING write it, and from where.
+    bool     g_watch_companion = false;
+    uint64_t g_watch_addr = 0;                 // r15+0x140
+    uint64_t g_watch_page = 0;
+    bool     g_watch_armed = false;
+    bool     g_watch_stepping = false;
+    volatile sig_atomic_t g_watch_hits = 0;
     // PROSPER_PEEK dumps offsets off registers at fault time. Supports N specs separated by ';',
     // each "reg:off,off,..."; an offset may be prefixed '*' to chase one pointer level first
     // (e.g. "r15:*0x18+0x0" = read [[r15+0x18]+0x0]).
@@ -152,6 +163,70 @@ namespace {
     volatile sig_atomic_t g_lazy_pages = 0;                 // count (diagnostic)
 
     void fault_handler(int sig, siginfo_t* si, void* uctx) {
+        // Companion-slot write-watchpoint: SIGTRAP after single-stepping a write to the watched page —
+        // re-arm (re-protect read-only) and clear the trap flag so we keep watching.
+        if (sig == SIGTRAP && g_watch_stepping) {
+            auto* uc = (ucontext_t*)uctx;
+            uc->uc_mcontext.gregs[REG_EFL] &= ~0x100ll;   // clear TF
+            // Post-write: log the slot's new value + the object's type tag [r15+0] (0x2b if it's still
+            // the same live object; changed => the memory was freed and reused, so the write is churn).
+            unsigned long long slot = *(const uint64_t*)g_watch_addr;
+            unsigned long long tag  = *(const uint64_t*)(g_watch_addr - 0x140);
+            char b[128];
+            int n = snprintf(b, sizeof b, "[watch]   -> slot now=0x%llx  obj[+0]=0x%llx\n", slot, tag);
+            write(2, b, n);
+            mprotect((void*)g_watch_page, 0x1000, PROT_READ);
+            g_watch_stepping = false;
+            return;
+        }
+        // Arm the watchpoint on the first companion read (rip == the reader deref, slot still null).
+        if (g_watch_companion && sig == SIGSEGV && !g_watch_armed) {
+            auto* uc = (ucontext_t*)uctx;
+            if ((uint64_t)uc->uc_mcontext.gregs[REG_RIP] == g_skip_rip) {
+                uint64_t r15 = (uint64_t)uc->uc_mcontext.gregs[REG_R15];
+                g_watch_addr = r15 + 0x140;
+                g_watch_page = g_watch_addr & ~(uint64_t)0xfff;
+                if (mprotect((void*)g_watch_page, 0x1000, PROT_READ) == 0) {
+                    g_watch_armed = true;
+                    char b[128];
+                    int n = snprintf(b, sizeof b, "[watch] armed on companion slot 0x%llx (obj r15=0x%llx) reader-tid=%ld\n",
+                                     (unsigned long long)g_watch_addr, (unsigned long long)r15, cur_tid());
+                    write(2, b, n);
+                }
+                // Skip this (null) read so the boot proceeds; the slot's page is now watched.
+                uc->uc_mcontext.gregs[REG_RIP] = (greg_t)g_skip_target;
+                return;
+            }
+        }
+        // A write to the watched page (x86 page-fault error code bit 1 = write) while armed: log if it
+        // lands in the 8-byte companion slot, then single-step past it (unprotect + set TF).
+        if (g_watch_armed && sig == SIGSEGV && si->si_addr) {
+            uint64_t fa = (uint64_t)si->si_addr;
+            auto* uc = (ucontext_t*)uctx;
+            if ((fa & ~(uint64_t)0xfff) == g_watch_page && (uc->uc_mcontext.gregs[REG_ERR] & 2)) {
+                if (fa >= g_watch_addr && fa < g_watch_addr + 8) {
+                    g_watch_hits = g_watch_hits + 1;
+                    char b[160];
+                    int n = snprintf(b, sizeof b, "[watch] WRITE to companion slot 0x%llx from rip=0x%llx writer-tid=%ld (hit #%d)\n",
+                                     (unsigned long long)fa,
+                                     (unsigned long long)uc->uc_mcontext.gregs[REG_RIP], cur_tid(),
+                                     (int)g_watch_hits);
+                    write(2, b, n);
+                }
+                mprotect((void*)g_watch_page, 0x1000, PROT_READ | PROT_WRITE);
+                uc->uc_mcontext.gregs[REG_EFL] |= 0x100ll;   // set TF -> single-step the write
+                g_watch_stepping = true;
+                return;
+            }
+        }
+        // Repeated companion reads (later reader passes): skip them too so the boot keeps running.
+        if (g_watch_armed && sig == SIGSEGV) {
+            auto* uc = (ucontext_t*)uctx;
+            if ((uint64_t)uc->uc_mcontext.gregs[REG_RIP] == g_skip_rip) {
+                uc->uc_mcontext.gregs[REG_RIP] = (greg_t)g_skip_target;
+                return;
+            }
+        }
         // Lazy unified-memory backing: back an unmapped GPU-VA page on demand and retry.
         if (sig == SIGSEGV && si->si_addr) {
             uint64_t a = (uint64_t)si->si_addr;
@@ -332,6 +407,7 @@ void install_trap_handler() {
     g_faultlog = getenv("PROSPER_FAULTLOG") != nullptr;
     g_skip_null_companion = getenv("PROSPER_SKIP_NULL_COMPANION") != nullptr;
     g_null_page = getenv("PROSPER_NULL_PAGE") != nullptr;
+    g_watch_companion = getenv("PROSPER_WATCH_COMPANION") != nullptr;
     if (const char* r = getenv("PROSPER_SKIP_RIP"))    g_skip_rip    = strtoull(r, nullptr, 0);
     if (const char* t = getenv("PROSPER_SKIP_TARGET")) g_skip_target = strtoull(t, nullptr, 0);
     if ((g_faultmem || g_skip_null_companion) && g_devnull_fd < 0)
@@ -370,6 +446,7 @@ void install_trap_handler() {
     sigaction(SIGSEGV, &sa, nullptr);
     sigaction(SIGBUS,  &sa, nullptr);
     sigaction(SIGILL,  &sa, nullptr);
+    if (g_watch_companion) sigaction(SIGTRAP, &sa, nullptr);   // single-step for the write-watchpoint
 }
 
 uint64_t stub_addr(uint64_t idx) { return g_stub_base + idx * g_stub_size; }
