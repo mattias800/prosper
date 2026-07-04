@@ -138,6 +138,24 @@ struct SpirvCompute {
         uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_sb_u32, p, buf, uconst(0), idx});
         uint32_t r = id(); put(code, Op_Load, {t_u32, r, p}); return r;
     }
+    // Declare the two scalar-memory constant/vertex buffers (bindings 2 & 3) that SMEM / buffer_load_
+    // format_* read. Called by every shell (compute/vertex/fragment) so cbuf_load works in each.
+    // Requires t_u32 to already be declared. Unused by shaders without memory ops.
+    void declare_cbufs() {
+        uint32_t t_rta_u = id(), t_struct_u = id(), t_ptr_sb_struct_u = id();
+        v_cbuf = id(); v_cbuf1 = id(); t_ptr_sb_u32 = id();
+        put(deco, Op_Decorate, {t_rta_u, Dec_ArrayStride, 4});
+        put(deco, Op_MemberDecorate, {t_struct_u, 0, Dec_Offset, 0});
+        put(deco, Op_Decorate, {t_struct_u, Dec_Block});
+        put(deco, Op_Decorate, {v_cbuf,  Dec_DescriptorSet, 0}); put(deco, Op_Decorate, {v_cbuf,  Dec_Binding, 2});
+        put(deco, Op_Decorate, {v_cbuf1, Dec_DescriptorSet, 0}); put(deco, Op_Decorate, {v_cbuf1, Dec_Binding, 3});
+        put(types, Op_TypeRuntimeArray, {t_rta_u, t_u32});
+        put(types, Op_TypeStruct, {t_struct_u, t_rta_u});
+        put(types, Op_TypePointer, {t_ptr_sb_struct_u, SC_StorageBuffer, t_struct_u});
+        put(types, Op_Variable, {t_ptr_sb_struct_u, v_cbuf,  SC_StorageBuffer});
+        put(types, Op_Variable, {t_ptr_sb_struct_u, v_cbuf1, SC_StorageBuffer});
+        put(types, Op_TypePointer, {t_ptr_sb_u32, SC_StorageBuffer, t_u32});
+    }
     // Store a VGPR (bits) as one float per invocation: b[gid.x] (stride 1), independent of input stride.
     void     store_output(uint32_t bits) {
         uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_sb_f32, p, v_out, uconst(0), gidx});
@@ -163,8 +181,6 @@ struct SpirvCompute {
         uint32_t t_ptr_in_v3u = id(); v_gid = id();
         uint32_t t_rta = id(), t_struct = id(), t_ptr_sb_struct = id();
         v_in = id(); v_out = id(); t_ptr_sb_f32 = id();
-        uint32_t t_rta_u = id(), t_struct_u = id(), t_ptr_sb_struct_u = id();
-        v_cbuf = id(); v_cbuf1 = id(); t_ptr_sb_u32 = id();
         f_main = id(); uint32_t lbl = id(); glsl = id();
 
         put(caps, Op_Capability, {Cap_Shader});
@@ -178,11 +194,6 @@ struct SpirvCompute {
         put(deco, Op_Decorate, {t_struct, Dec_Block});
         put(deco, Op_Decorate, {v_in, Dec_DescriptorSet, 0});  put(deco, Op_Decorate, {v_in, Dec_Binding, 0});
         put(deco, Op_Decorate, {v_out, Dec_DescriptorSet, 0}); put(deco, Op_Decorate, {v_out, Dec_Binding, 1});
-        put(deco, Op_Decorate, {t_rta_u, Dec_ArrayStride, 4});
-        put(deco, Op_MemberDecorate, {t_struct_u, 0, Dec_Offset, 0});
-        put(deco, Op_Decorate, {t_struct_u, Dec_Block});
-        put(deco, Op_Decorate, {v_cbuf, Dec_DescriptorSet, 0}); put(deco, Op_Decorate, {v_cbuf, Dec_Binding, 2});
-        put(deco, Op_Decorate, {v_cbuf1, Dec_DescriptorSet, 0}); put(deco, Op_Decorate, {v_cbuf1, Dec_Binding, 3});
         put(types, Op_TypeVoid, {t_void});
         put(types, Op_TypeFunction, {t_fn, t_void});
         put(types, Op_TypeFloat, {t_f32, 32});
@@ -198,14 +209,7 @@ struct SpirvCompute {
         put(types, Op_Variable, {t_ptr_sb_struct, v_in, SC_StorageBuffer});
         put(types, Op_Variable, {t_ptr_sb_struct, v_out, SC_StorageBuffer});
         put(types, Op_TypePointer, {t_ptr_sb_f32, SC_StorageBuffer, t_f32});
-        // Scalar-memory constant buffer (binding 2): a runtime array of u32. Always declared; unused
-        // by shaders without SMEM. cbuf_load() reads a dword from it (s_load / s_buffer_load).
-        put(types, Op_TypeRuntimeArray, {t_rta_u, t_u32});
-        put(types, Op_TypeStruct, {t_struct_u, t_rta_u});
-        put(types, Op_TypePointer, {t_ptr_sb_struct_u, SC_StorageBuffer, t_struct_u});
-        put(types, Op_Variable, {t_ptr_sb_struct_u, v_cbuf, SC_StorageBuffer});
-        put(types, Op_Variable, {t_ptr_sb_struct_u, v_cbuf1, SC_StorageBuffer});
-        put(types, Op_TypePointer, {t_ptr_sb_u32, SC_StorageBuffer, t_u32});
+        declare_cbufs();   // scalar-memory constant/vertex buffers (bindings 2 & 3)
         put(code, Op_Function, {t_void, f_main, FC_None, t_fn});
         put(code, Op_Label, {lbl});
         uint32_t ld = id(); put(code, Op_Load, {t_v3u, ld, v_gid});
@@ -213,7 +217,7 @@ struct SpirvCompute {
     }
     // --- Fragment-shader shell: a location-0 vec4 color output; EXP MRT0 stores to it. ---
     uint32_t t_v4f = 0, v_color = 0;
-    void begin_fragment() {
+    void begin_fragment(bool with_cbufs = false) {
         t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_i32 = id(); t_bool = id();
         t_v4f = id(); uint32_t t_ptr_out = id(); v_color = id(); f_main = id(); uint32_t lbl = id(); glsl = id();
         put(caps, Op_Capability, {Cap_Shader});
@@ -231,6 +235,7 @@ struct SpirvCompute {
         put(types, Op_TypeVector, {t_v4f, t_f32, 4});
         put(types, Op_TypePointer, {t_ptr_out, SC_Output, t_v4f});
         put(types, Op_Variable, {t_ptr_out, v_color, SC_Output});
+        if (with_cbufs) declare_cbufs();   // only when the shader has memory ops (keeps no-op renders binding-free)
         put(code, Op_Function, {t_void, f_main, FC_None, t_fn});
         put(code, Op_Label, {lbl});
     }
@@ -242,7 +247,7 @@ struct SpirvCompute {
 
     // --- Vertex-shader shell: gl_VertexIndex input + gl_Position (member 0 of a gl_PerVertex Block). ---
     uint32_t v_vid = 0, v_pos = 0, t_ptr_out_v4f = 0;
-    void begin_vertex() {
+    void begin_vertex(bool with_cbufs = false) {
         t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_i32 = id(); t_bool = id();
         t_v4f = id();
         uint32_t t_ptr_in_i32 = id(); v_vid = id();
@@ -268,6 +273,7 @@ struct SpirvCompute {
         put(types, Op_TypePointer, {t_ptr_out_pv, SC_Output, t_pv});
         put(types, Op_Variable, {t_ptr_out_pv, v_pos, SC_Output});
         put(types, Op_TypePointer, {t_ptr_out_v4f, SC_Output, t_v4f});
+        if (with_cbufs) declare_cbufs();   // vertex fetch (buffer_load_format_*) reads these
         put(code, Op_Function, {t_void, f_main, FC_None, t_fn});
         put(code, Op_Label, {lbl});
     }
@@ -744,12 +750,12 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
     return cov;
 }
 
-std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords) {
+std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords, const ShaderResourceTable* rt) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
 
     SpirvCompute b;
-    b.begin_fragment();
+    b.begin_fragment(rt != nullptr);
     RegState rs; rs.vcc = b.bfalse(); rs.exec = b.btrue();
     auto safe_branches = safe_execz_branches(ins);
     bool exported = false;
@@ -766,19 +772,20 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords) {
         }
         bool ok = true;
         // Graphics-stage exports do not yet model EXEC-masked export/discard, so reject cmpx for now
-        // instead of accepting a shader that would export from inactive lanes.
-        if (!emit_alu(b, rs, in, ok, false, &safe_branches) || !ok) return {};
+        // instead of accepting a shader that would export from inactive lanes. Memory ops (SMEM/MUBUF)
+        // are allowed only when a resource table is supplied (so their bindings resolve).
+        if (!emit_alu(b, rs, in, ok, false, &safe_branches, /*allow_smem*/rt != nullptr, rt) || !ok) return {};
     }
     if (!exported) return {};
     return b.finish();
 }
 
-std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords) {
+std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords, const ShaderResourceTable* rt) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
 
     SpirvCompute b;
-    b.begin_vertex();
+    b.begin_vertex(rt != nullptr);
     RegState rs; rs.vcc = b.bfalse(); rs.exec = b.btrue();
     auto safe_branches = safe_execz_branches(ins);
     rs.vreg[0] = b.load_vertex_index();     // VS ABI: v0 = vertex index
@@ -795,9 +802,9 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords) {
             continue;   // ignore PARAM exports (varyings) for now
         }
         bool ok = true;
-        // Graphics-stage exports do not yet model EXEC-masked export/discard, so reject cmpx for now
-        // instead of accepting a shader that would export from inactive lanes.
-        if (!emit_alu(b, rs, in, ok, false, &safe_branches) || !ok) return {};
+        // cmpx rejected in graphics stages (no EXEC-masked export yet); SMEM/MUBUF allowed only with a
+        // resource table so vertex-fetch / constant bindings resolve.
+        if (!emit_alu(b, rs, in, ok, false, &safe_branches, /*allow_smem*/rt != nullptr, rt) || !ok) return {};
     }
     if (!exported) return {};
     return b.finish();

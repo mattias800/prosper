@@ -28,11 +28,15 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
 
 // Recompile a pixel/fragment shader to a fragment SPIR-V module: run the VALU, and on EXP to an MRT
 // target write vec4(src0..3) to the location-0 color output. Returns {} if unsupported / no export.
-std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords);
+// An optional ShaderResourceTable enables memory ops (SMEM/MUBUF) with resolved bindings.
+std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
+                                         const ShaderResourceTable* rt = nullptr);
 
 // Recompile a vertex shader to a vertex SPIR-V module: v0 = gl_VertexIndex, run the VALU, and on EXP
 // to a POS target write vec4(src0..3) to gl_Position. Returns {} if unsupported / no position export.
-std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords);
+// An optional ShaderResourceTable enables vertex fetch (buffer_load_format_*) + constant loads.
+std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
+                                       const ShaderResourceTable* rt = nullptr);
 
 // How much of a shader the recompiler currently covers (per-instruction), without requiring the
 // stream to be a complete vertex/fragment. `alu` = instructions emit_alu handles (VALU/scalar/

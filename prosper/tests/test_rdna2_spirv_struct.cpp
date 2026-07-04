@@ -1,5 +1,6 @@
 // test_rdna2_spirv_struct -- structural checks for RDNA2->SPIR-V output that do not require Vulkan.
 #include "../src/gpu/rdna2_to_spirv.hpp"
+#include "../src/gpu/shader_resources.hpp"
 #include <cstdint>
 #include <cstdio>
 #include <vector>
@@ -115,6 +116,32 @@ int main() {
         return 1;
     }
     printf("  [ok]   vertex cmpx shader is rejected until EXEC-masked export is modeled\n");
+
+    // Graphics-path resource binding: a vertex shader that fetches its position from a vertex buffer
+    //   v_mov v3, 0 ; v_mov v4, 1.0 ; buffer_load_format_xy v[1:2], v0, s[8:11] idxen ; exp pos0 v1..v4
+    // The format-load needs a V# descriptor's data format to translate, which lives in the resource
+    // table — so recompilation must FAIL without a table and SUCCEED (to valid SPIR-V) with one.
+    const uint32_t vs_fetch[] = {
+        0x7e060280u, 0x7e0802f2u, 0xe0042000u, 0x80020100u, 0xf80008cfu, 0x04030201u, 0xbf810000u,
+    };
+    const size_t vs_fetch_n = sizeof(vs_fetch) / sizeof(vs_fetch[0]);
+    if (!recompile_vertex(vs_fetch, vs_fetch_n, nullptr).empty()) {
+        printf("  [FAIL] vertex fetch was accepted without a resource table (format unknown)\n");
+        return 1;
+    }
+    printf("  [ok]   vertex fetch is rejected without a resource table\n");
+
+    ShaderResourceTable rt;
+    ShaderResource vb{};
+    vb.cls = ResourceClass::VertexBuffer; vb.format = DataFormat::Float32; vb.num_components = 2;
+    vb.binding = 3; vb.stride = 8; vb.sgpr_base = 8;   // V# placed directly in user-data s[8:11]
+    rt.resources.push_back(vb);
+    std::vector<uint32_t> vspv = recompile_vertex(vs_fetch, vs_fetch_n, &rt);
+    if (vspv.empty() || vspv[0] != 0x07230203u) {
+        printf("  [FAIL] vertex fetch did not recompile to valid SPIR-V with a resource table\n");
+        return 1;
+    }
+    printf("  [ok]   vertex fetch recompiles to valid SPIR-V with a resource table (binding 3)\n");
 
     printf("== PASS ==\n");
     return 0;
