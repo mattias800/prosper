@@ -75,17 +75,25 @@ lives front-half (it owns the descriptor bit layout); the recompiler only consum
 
 1. **Multi-buffer `s_buffer_load`** (generalize today's single-cbuf model). Provenance-track the V#
    SGPRs → `by_srt_offset` → per-resource binding. Test: two constant buffers, distinct contents.
+   **DONE** (kernel 22 — provenance routes two `s_buffer_load`s to bindings 2 & 3).
 2. **`buffer_load_format_*` — float32 fast path.** For `DataFormat::Float32` (positions, most
    attrs) a format load is a raw dword load — reuse the MUBUF path, keyed to a `VertexBuffer`
    resource. This is what unblocks the game's real vertex shaders (op 0x0/0x3 dominate). Test: a
-   float32 vertex fetch through the table.
+   float32 vertex fetch through the table. **DONE** (kernel 23 exec-diff; `vertex_fetch_render`
+   renders real buffer-sourced geometry through a bound VkPipeline).
 3. **`buffer_load_format_*` — packed conversions.** `Unorm8`/`Snorm16`/… : load dword → unpack →
-   normalize (SPIR-V `UnpackUnorm4x8` etc.). Test: unorm8×4 → 4 floats in [0,1].
+   normalize (bitfield-extract → convert → /255|/32767, SNORM clamped to ≥ −1.0; Float16 via
+   `UnpackHalf2x16`). Test: unorm8×4 → 4 floats in [0,1]. **DONE** — `unpack_norm`/`unpack_half`
+   cover Unorm8/Snorm8/Unorm16/Snorm16/Float16; kernels 24 (unorm8×4) & 25 (snorm16×2 + clamp)
+   verify the exact numbers. Integer sub-dword formats (Uint8/Sint8/…) are still rejected (no
+   integer-attribute path yet) rather than mis-normalized.
 4. **MIMG `image_sample`/`image_load`.** Bind a Vulkan sampled image + sampler from the T#/S#;
-   emit `OpImageSampleImplicitLod`. Test: sample a known 2×2 texture.
+   emit `OpImageSampleImplicitLod`. Test: sample a known 2×2 texture. *(Next — needs the front-half
+   to extract T#/S# descriptors; agent 2 does this when the recompiler reaches MIMG.)*
 
-Stage 2 is the high-value unlock (real VS recompile → real VS+PS frames from the game). Stages 1/2
-depend only on this contract + the front-half filling the table for constant/vertex buffers.
+Stage 2 was the high-value unlock (real VS recompile → real VS+PS frames from the game). Stages 1–3
+depend only on this contract + the front-half filling the table for constant/vertex buffers; stage 4
+adds textures.
 
 ## Front-half deliverable (agent 2's next piece)
 

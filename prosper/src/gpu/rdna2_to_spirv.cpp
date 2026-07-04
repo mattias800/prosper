@@ -30,7 +30,7 @@ enum : uint32_t {
 // GLSL.std.450 extended-instruction numbers.
 enum : uint32_t { Glsl_Trunc=3, Glsl_Floor=8, Glsl_Ceil=9, Glsl_Fract=10, Glsl_Exp2=29, Glsl_Log2=30,
                   Glsl_Sqrt=31, Glsl_InverseSqrt=32, Glsl_FMin=37, Glsl_UMin=38, Glsl_SMin=39, Glsl_FMax=40,
-                  Glsl_UMax=41, Glsl_SMax=42, Glsl_PackHalf2x16=58 };
+                  Glsl_UMax=41, Glsl_SMax=42, Glsl_PackHalf2x16=58, Glsl_UnpackHalf2x16=62 };
 enum : uint32_t {
     Cap_Shader=1, Addr_Logical=0, Mem_GLSL450=1, Exec_Vertex=0, Exec_Fragment=4, Exec_GLCompute=5,
     EM_OriginUpperLeft=7, EM_LocalSize=17,
@@ -120,6 +120,22 @@ struct SpirvCompute {
     uint32_t pack_half2x16(uint32_t a, uint32_t b) {
         uint32_t vec = id(); put(code, Op_CompositeConstruct, {t_v2f(), vec, bcf(a), bcf(b)});
         uint32_t r = id(); putv(code, Op_ExtInst, {t_u32, r, glsl, Glsl_PackHalf2x16, vec}); return r;
+    }
+    // Vertex-attribute unpacking (buffer_load_format_* with a packed data format). Each returns the
+    // component as raw float VGPR bits, matching how the hardware presents a format load to the shader.
+    //   unpack_norm: extract a `bits`-wide field at `bit_off` of `dword`, convert to float, divide by
+    //   `norm` (255/127/65535/32767) — the UNORM/SNORM normalization; SNORM is clamped to >= -1.0.
+    uint32_t unpack_norm(uint32_t dword, uint32_t bit_off, uint32_t bits, bool is_signed, float norm) {
+        uint32_t fbits_ = is_signed ? cvt_i2f(bfe_s(dword, uconst(bit_off), uconst(bits)))
+                                    : cvt_u2f(bfe_u(dword, uconst(bit_off), uconst(bits)));
+        uint32_t v = fbin(Op_FDiv, fbits_, bcu(fconstf(norm)));
+        if (is_signed) v = fext2(Glsl_FMax, v, bcu(fconstf(-1.0f)));
+        return v;
+    }
+    // unpack_half: extract one of the two f16 halves packed in `dword` (which=0 low, 1 high) -> float bits.
+    uint32_t unpack_half(uint32_t dword, uint32_t which) {
+        uint32_t vec = id(); putv(code, Op_ExtInst, {t_v2f(), vec, glsl, Glsl_UnpackHalf2x16, dword});
+        uint32_t f = id(); put(code, Op_CompositeExtract, {t_f32, f, vec, which}); return bcu(f);
     }
 
     // buffer element pointer: base[ gid.x*stride + k ]
@@ -664,32 +680,65 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             uint32_t offset = in.literal & 0xFFFu;
             bool offen = (in.literal >> 12) & 1u, idxen = (in.literal >> 13) & 1u;
             uint32_t slot = 0, stride = 0;
+            // Format of the fetched components. Untyped buffer_load_dword* is raw 32-bit (comp_bytes=4);
+            // buffer_load_format_* takes the format from the resolved V# descriptor.
+            DataFormat fmt = DataFormat::Uint32;   // untyped default: raw dwords
             if (is_format) {
                 // A format load reads a vertex/buffer attribute — it needs the V# descriptor for the
                 // binding, stride, and data format. Resolve SRSRC (src[1]) via provenance: an s_load
-                // tag (indirect) else the SGPR index (direct/user-data). Only the FLOAT32 fast path is
-                // implemented (a float32 component is a raw dword in our bit model); packed formats
-                // (unorm8/…) need conversion (stage 3), so reject them rather than approximate.
+                // tag (indirect) else the SGPR index (direct/user-data).
                 const ShaderResource* res = nullptr;
                 if (rt) { auto it = rs.sreg_srt.find(in.src[1].value);
                     if (it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second);
                     if (!res) res = rt->by_sgpr_base(in.src[1].value); }
-                if (!res || res->format != DataFormat::Float32) { ok = false; return true; }
+                if (!res) { ok = false; return true; }
                 slot = (res->binding >= 3) ? 1 : 0;
                 stride = res->stride;
+                fmt = res->format;
             }
-            // Byte address: idxen -> VADDR is an element index (×stride); offen -> VADDR is a byte
-            // offset; plus the inst offset and SOFFSET. index = addr>>2; N dwords -> VDATA..+N-1.
+            const uint32_t comp_bytes = data_format_bytes(fmt);
+            if (comp_bytes == 0) { ok = false; return true; }   // unknown / unsupported format
+            // Per-component decode. 4-byte formats (Float32/Uint32/Sint32) are a raw dword load — no
+            // conversion in our bit model. Sub-dword formats are unpacked: UNORM/SNORM normalize an
+            // integer field, Float16 unpacks a packed half. num_components components pack tightly.
+            const bool packed = comp_bytes < 4;
+            bool is_snorm = (fmt == DataFormat::Snorm8 || fmt == DataFormat::Snorm16);
+            bool is_half  = (fmt == DataFormat::Float16);
+            float norm = 0.0f;
+            switch (fmt) {
+                case DataFormat::Unorm8:  norm = 255.0f;   break;
+                case DataFormat::Snorm8:  norm = 127.0f;   break;
+                case DataFormat::Unorm16: norm = 65535.0f; break;
+                case DataFormat::Snorm16: norm = 32767.0f; break;
+                default: break;
+            }
+            // Integer sub-dword formats (Uint8/Sint8/Uint16/Sint16) aren't normalized floats and would
+            // need an integer-attribute path; reject rather than mis-normalize.
+            if (packed && !is_half && norm == 0.0f) { ok = false; return true; }
+            // Byte address of the element: idxen -> VADDR is an element index (×stride); offen -> VADDR
+            // is a byte offset; plus the inst offset and SOFFSET. dword index = addr>>2.
             uint32_t addr = b.uconst(offset);
             if (idxen && stride) addr = b.ibin(Op_IAdd, addr, b.ibin(Op_IMul, val(in.src[0]), b.uconst(stride)));
             else if (offen)      addr = b.ibin(Op_IAdd, addr, val(in.src[0]));
             addr = b.ibin(Op_IAdd, addr, val(in.src[2]));              // SOFFSET
             uint32_t idx = b.ibin(Op_ShiftRightLogical, addr, b.uconst(2));
             for (uint32_t k = 0; k < n; k++) {
-                uint32_t kidx = k ? b.ibin(Op_IAdd, idx, b.uconst(k)) : idx;
                 int d = in.dst.value + (int)k;
                 uint32_t old = vreg_old(b, rs, d);
-                rs.vreg[d] = b.cbuf_load(kidx, slot);
+                uint32_t value;
+                if (!packed) {
+                    uint32_t kidx = k ? b.ibin(Op_IAdd, idx, b.uconst(k)) : idx;
+                    value = b.cbuf_load(kidx, slot);                  // raw 32-bit component
+                } else {
+                    // Component k lives at byte k*comp_bytes within the element: pick its dword + field.
+                    uint32_t byte_off = k * comp_bytes;
+                    uint32_t drel = byte_off / 4, boff = (byte_off % 4) * 8;
+                    uint32_t did = drel ? b.ibin(Op_IAdd, idx, b.uconst(drel)) : idx;
+                    uint32_t dw  = b.cbuf_load(did, slot);
+                    value = is_half ? b.unpack_half(dw, boff ? 1u : 0u)
+                                    : b.unpack_norm(dw, boff, comp_bytes * 8, is_snorm, norm);
+                }
+                rs.vreg[d] = value;
                 predicate_write(b, rs, d, old);
             }
             return true;
