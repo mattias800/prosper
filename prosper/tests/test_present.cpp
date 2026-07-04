@@ -72,6 +72,26 @@ int main() {
     flip(0x1001, 99, 0, 0, 0, 0);
     CHECK(gpu::present_front_index() == 2, "out-of-range flip index does not corrupt the front buffer");
 
+    // Receiving side: the renderer hands a finished frame -> present_readback returns THOSE pixels
+    // (the real rendered frame), not the raw guest buffer. This is shader->render->present->readback.
+    CHECK(!gpu::present_has_frame(), "no rendered frame before the renderer hands one in");
+    std::vector<uint8_t> rendered(FB_BYTES);
+    for (size_t i = 0; i < FB_BYTES; i++) rendered[i] = (uint8_t)(i & 0xff);   // a distinctive gradient
+    gpu::present_write_frame(rendered.data(), W, H);
+    CHECK(gpu::present_has_frame(), "present_has_frame after write");
+    std::fill(out.begin(), out.end(), 0xEE);
+    size_t rb = gpu::present_readback(out.data(), out.size());
+    CHECK(rb == FB_BYTES, "readback returns the rendered frame size");
+    CHECK(memcmp(out.data(), rendered.data(), FB_BYTES) == 0, "readback returns the exact rendered pixels");
+    // The rendered frame wins over the raw guest buffer even across flips.
+    flip(0x1001, 0, 0, 0, 0, 0);
+    gpu::present_readback(out.data(), out.size());
+    CHECK(memcmp(out.data(), rendered.data(), FB_BYTES) == 0, "rendered frame takes precedence over the flipped guest buffer");
+
+    // After reset, readback falls back to the guest buffer again.
+    gpu::present_reset();
+    CHECK(!gpu::present_has_frame(), "reset clears the rendered frame");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
