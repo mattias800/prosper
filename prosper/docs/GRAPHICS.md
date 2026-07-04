@@ -100,6 +100,28 @@ initializers to construct valid GPU objects (correctness-first — no plausible-
 - Graphics libs are sparsely documented; most NIDs don't resolve to names — reverse-engineer from
   call args (`PROSPER_GFXLOG`) and `build-linux/tools/pltm` (maps a module GOT offset → NID).
 
+## ✔ SEMANTICS PROBE (2026-07-04): metadata is surfaced CORRECTLY — the "mis-relocation" bet is rejected
+
+Agent-2's fastest-to-confirm bet was that our shader I/O semantics are empty/mis-relocated, making the
+interpolant mapping short as a symptom. **Rejected, conclusively, via raw blob bytes** (PROSPER_PIPETRACE
+now logs semantic counts/arrays + the raw `0x50..0x5f` header region):
+
+- Shaders that HAVE varyings read correctly: `num_input_semantics=1` (`raw[0x50]=01 00 00 00`),
+  `num_output_semantics=1` (`raw[0x56]=01 00`), and `output_semantics[0].semantic=0x0f` (=15) — exactly
+  the value Kyty's VS→PS linkage expects. So our offsets (in u32@0x50, out u16@0x56, arrays@0x30/0x38)
+  and relocation are correct.
+- The **faulting pipelines** use `gs` (num_out=0, `raw[0x56]=00 00`) + `ps` (num_in=0) — genuinely
+  **zero-varying shaders** (position-only/blit). All 3 `CreateInterpolantMapping` calls therefore map 0
+  interpolants — a correct consequence, not a surfacing bug.
+
+**Conclusion:** the empty pipeline-reflection table `[pipeline+0xc0]` is NOT caused by missing/mangled
+semantics. Either these are legitimately 0-varying pipelines where the reader at `0xba6e08` should
+tolerate a null companion (and our divergence is that the "resident" flag `[obj+0x1a0]` never gets set),
+or `[+0xc0]` is populated from **resource bindings** (textures/samplers/cbuffers via the shader's
+`user_data` table) rather than interpolant semantics. Next probe target: capture `[pipeline+0xc0]`/
+`[+0xe0]` contents directly (the reflection records) and check the shader `user_data`/resource tables,
+not the semantics. `PROSPER_PIPETRACE` retained (semantic + raw-header logging).
+
 ## 🔎 THE [+0x140] WRITER CHAIN (2026-07-04) — host-side RE, found the constructor + gate, root is a pipeline-reflection predicate
 
 Agent-2 (correctly) reassigned this to the front-half: the companion is built pre-submit, upstream of
