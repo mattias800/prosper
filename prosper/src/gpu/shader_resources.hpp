@@ -54,10 +54,16 @@ struct ShaderResource {
     uint32_t      size          = 0;                     // byte size of the backing region
     uint32_t      stride        = 0;                     // element stride (vertex/structured buffers)
 
-    // Descriptor identity — how the recompiler maps a memory op back to this resource. The shader
-    // loads the descriptor from a fixed byte offset within its user_data / SRT; that offset is the
-    // key (see RESOURCE_BINDING.md "descriptor provenance"). 0xFFFFFFFF = not descriptor-keyed.
+    // Descriptor identity — how the recompiler maps a memory op back to this resource. There are two
+    // provenance modes (see RESOURCE_BINDING.md); a resource sets whichever matches how the shader
+    // gets its descriptor, leaving the other 0xFFFFFFFF:
+    //   * srt_offset — INDIRECT: the shader loads the V# with `s_load_dwordx4` from this byte offset
+    //     within its user_data/SRT. The recompiler tags the load's dest SGPRs and resolves by offset.
+    //   * sgpr_base  — DIRECT: the driver places the V# straight in the user-data SGPRs starting at
+    //     this SGPR index (Sony "direct" resources — e.g. vertex-buffer descriptors). The recompiler
+    //     resolves a memory op by matching its SRSRC/SBASE SGPR to this index (no in-shader load).
     uint32_t      srt_offset    = 0xFFFFFFFFu;
+    uint32_t      sgpr_base     = 0xFFFFFFFFu;
 };
 
 // The set of resources a shader uses. The front-half builds it from the shader's user_data; the
@@ -65,9 +71,12 @@ struct ShaderResource {
 struct ShaderResourceTable {
     std::vector<ShaderResource> resources;
 
-    // Resolve the resource whose descriptor originates at `srt_offset` (the recompiler's provenance
-    // lookup); nullptr if none. Deterministic; first match wins.
+    // Resolve the resource whose descriptor originates at `srt_offset` (indirect/`s_load` provenance);
+    // nullptr if none. Deterministic; first match wins.
     const ShaderResource* by_srt_offset(uint32_t srt_offset) const;
+    // Resolve the resource whose descriptor lives at SGPR `sgpr` (direct/user-data provenance);
+    // nullptr if none.
+    const ShaderResource* by_sgpr_base(uint32_t sgpr) const;
     // Resolve by assigned Vulkan binding (the pipeline's lookup); nullptr if none.
     const ShaderResource* by_binding(uint32_t binding) const;
 };

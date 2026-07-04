@@ -44,6 +44,21 @@ This is a small SGPR-provenance side-table in the recompiler (analogous to the e
 maps). It keys the abstract "resource N" to the concrete descriptor the front-half described. The
 front-half fills `ShaderResource::srt_offset` with the same offset so the two sides rendezvous.
 
+### Two provenance modes (INDIRECT vs DIRECT)
+
+Not every descriptor is loaded in-shader. Sony resources come in two flavours, and a `ShaderResource`
+sets whichever key matches (leaving the other `0xFFFFFFFF`):
+- **INDIRECT (`srt_offset`)** — the shader `s_load_dwordx4`s the V# from its user_data/SRT (above).
+  Constant buffers (`s_buffer_load`) are typically this. Recompiler tags the load, resolves by offset.
+- **DIRECT (`sgpr_base`)** — the driver places the V# *straight into the user-data SGPRs* at launch
+  (Sony "direct" resources). **Vertex-buffer descriptors are this** — there is no in-shader load to
+  tag. The recompiler resolves a memory op by matching its SRSRC/SBASE SGPR index to `sgpr_base`
+  (`by_sgpr_base`). The recompiler must know the shader's user-data→SGPR layout at entry; the
+  front-half provides `sgpr_base` = the SGPR the V# occupies.
+
+So the recompiler resolves a memory op's descriptor by: (1) an `s_load` provenance tag → `by_srt_offset`,
+else (2) the SRSRC/SBASE SGPR index → `by_sgpr_base`.
+
 `DataFormat` is decoded from the descriptor's `DFMT`/`NFMT` (e.g. `DFMT=32_32_32_32,NFMT=FLOAT` →
 `Float32`, `num_components=4`; `DFMT=8_8_8_8,NFMT=UNORM` → `Unorm8`, `num_components=4`). That decode
 lives front-half (it owns the descriptor bit layout); the recompiler only consumes `DataFormat`.

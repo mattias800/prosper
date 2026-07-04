@@ -43,6 +43,17 @@ int main() {
     CHECK(b3 && b3->gpu_addr == 0xD0000000ull && b3->size == 4096,
           "by_binding gives the pipeline the bytes to bind");
 
+    // DIRECT provenance: a vertex-buffer V# placed straight in user-data SGPRs (s[8:11]) — keyed by
+    // sgpr_base, not srt_offset (that's how vertex descriptors reach the shader; no in-shader s_load).
+    ShaderResource vb{}; vb.cls = ResourceClass::VertexBuffer; vb.format = DataFormat::Float32;
+    vb.num_components = 3; vb.binding = 4; vb.stride = 12; vb.sgpr_base = 8;   // srt_offset stays 0xFFFFFFFF
+    t.resources.push_back(vb);
+    const ShaderResource* v2 = t.by_sgpr_base(8);
+    CHECK(v2 && v2->cls == ResourceClass::VertexBuffer && v2->binding == 4 && v2->num_components == 3,
+          "by_sgpr_base resolves a direct (user-data) vertex descriptor");
+    CHECK(t.by_sgpr_base(0x99) == nullptr && t.by_sgpr_base(0xFFFFFFFFu) == nullptr,
+          "unknown / not-SGPR-keyed resolves to null");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

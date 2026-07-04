@@ -20,6 +20,12 @@ const ShaderResource* ShaderResourceTable::by_srt_offset(uint32_t srt_offset) co
     return nullptr;
 }
 
+const ShaderResource* ShaderResourceTable::by_sgpr_base(uint32_t sgpr) const {
+    if (sgpr == 0xFFFFFFFFu) return nullptr;
+    for (const auto& r : resources) if (r.sgpr_base == sgpr) return &r;
+    return nullptr;
+}
+
 const ShaderResource* ShaderResourceTable::by_binding(uint32_t binding) const {
     for (const auto& r : resources) if (r.binding == binding) return &r;
     return nullptr;
