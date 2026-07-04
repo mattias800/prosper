@@ -186,6 +186,31 @@ int main() {
     printf("  kernel9 mismatches=%u (out[5]=%g expect=%g)\n", bad9, got9.size()==N?got9[5]:-1, exp9[5]);
     CHECK(got9.size()==N && bad9==0, "recompiled kernel 9 (scalar s_mov/s_add/s_lshl) computes a0+30");
 
+    // Kernel 10: VOP3 3-operand ops. u2=mad24(u0,u1,u1); u3=add3(u0,u1,u2); u3=bfi(u0,u1,u3);
+    //            u3=bfe_u(u3, off=u0, cnt=u1); out=(float)u3.
+    const uint32_t code10[] = {
+        0x7E000F00u, 0x7E020F01u, 0xD5430002u, 0x04060300u, 0xD76D0003u, 0x040A0300u,
+        0xD54A0003u, 0x040E0300u, 0xD5480003u, 0x04060103u, 0x7E000D03u, 0xBF810000u,
+    };
+    std::vector<uint32_t> spv10 = recompile_valu(code10, sizeof(code10)/sizeof(code10[0]), 2, 0);
+    CHECK(!spv10.empty(), "recompiled kernel 10 (mad24/add3/bfi/bfe) -> SPIR-V");
+    std::vector<float> in10(N * 2), exp10(N);
+    for (uint32_t i = 0; i < N; i++) {
+        uint32_t u0 = i % 6, u1 = i % 9;
+        in10[i*2+0] = (float)u0; in10[i*2+1] = (float)u1;
+        uint32_t u2 = (u0 & 0xFFFFFFu) * (u1 & 0xFFFFFFu) + u1;
+        uint32_t u3 = u0 + u1 + u2;
+        u3 = (u0 & u1) | (~u0 & u3);
+        uint32_t off = u0 & 31, cnt = u1 & 31;
+        uint32_t mask = (cnt >= 32) ? 0xFFFFFFFFu : ((1u << cnt) - 1u);
+        u3 = (u3 >> off) & mask;
+        exp10[i] = (float)u3;
+    }
+    std::vector<float> got10 = prosper::test::run_compute(spv10, in10, N, N);
+    uint32_t bad10 = 0; for (uint32_t i=0;i<N&&got10.size()==N;i++) if (std::fabs(got10[i]-exp10[i])>1e-3f) bad10++;
+    printf("  kernel10 mismatches=%u (out[20]=%g expect=%g)\n", bad10, got10.size()==N?got10[20]:-1, exp10[20]);
+    CHECK(got10.size()==N && bad10==0, "recompiled kernel 10 (VOP3 mad24/add3/bfi/bfe) correct");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

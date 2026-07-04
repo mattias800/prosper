@@ -19,7 +19,8 @@ enum : uint32_t {
     Op_CompositeConstruct=80, Op_CompositeExtract=81, Op_IAdd=128, Op_FAdd=129, Op_ISub=130, Op_FSub=131, Op_IMul=132, Op_FMul=133,
     Op_FDiv=136, Op_IEqual=170, Op_UGreaterThan=172, Op_SGreaterThan=173, Op_ULessThan=176, Op_SLessThan=177,
     Op_ShiftRightLogical=194, Op_ShiftRightArithmetic=195, Op_ShiftLeftLogical=196, Op_BitwiseOr=197,
-    Op_BitwiseXor=198, Op_BitwiseAnd=199, Op_Not=200, Op_Label=248, Op_Return=253,
+    Op_BitwiseXor=198, Op_BitwiseAnd=199, Op_Not=200, Op_BitFieldSExtract=202, Op_BitFieldUExtract=203,
+    Op_Label=248, Op_Return=253,
 };
 // GLSL.std.450 extended-instruction numbers.
 enum : uint32_t { Glsl_Trunc=3, Glsl_Floor=8, Glsl_Ceil=9, Glsl_Fract=10, Glsl_Exp2=29, Glsl_Log2=30,
@@ -103,6 +104,9 @@ struct SpirvCompute {
     // Integer compares -> bool. scmp treats operands as signed, ucmp as unsigned.
     uint32_t scmp(uint32_t op, uint32_t a, uint32_t b) { uint32_t r = id(); put(code, op, {t_bool, r, bcs(a), bcs(b)}); return r; }
     uint32_t ucmp(uint32_t op, uint32_t a, uint32_t b) { uint32_t r = id(); put(code, op, {t_bool, r, a, b}); return r; }
+    // Bitfield extract (base, offset, count) -> bits. Unsigned and signed variants.
+    uint32_t bfe_u(uint32_t base, uint32_t off, uint32_t cnt) { uint32_t r = id(); put(code, Op_BitFieldUExtract, {t_u32, r, base, off, cnt}); return r; }
+    uint32_t bfe_s(uint32_t base, uint32_t off, uint32_t cnt) { uint32_t ri = id(); put(code, Op_BitFieldSExtract, {t_i32, ri, bcs(base), off, cnt}); return i2u(ri); }
 
     // buffer element pointer: base[ gid.x*stride + k ]
     uint32_t elem_ptr(uint32_t bufvar, uint32_t k) {
@@ -366,6 +370,26 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok) {
                 uint32_t s0 = val(in.src[0]), s1 = val(in.src[1]), s2 = val(in.src[2]);
                 uint32_t mn = b.fext2(Glsl_FMin, s0, s1), mx = b.fext2(Glsl_FMax, s0, s1);
                 vreg[in.dst.value] = b.fext2(Glsl_FMax, mn, b.fext2(Glsl_FMin, mx, s2));
+            } else if (in.opcode == 0x143) {                          // v_mad_u32_u24 = (s0&0xFFFFFF)*(s1&0xFFFFFF)+s2
+                uint32_t m24 = b.uconst(0xFFFFFF);
+                uint32_t p = b.ibin(Op_IMul, b.ibin(Op_BitwiseAnd, val(in.src[0]), m24),
+                                              b.ibin(Op_BitwiseAnd, val(in.src[1]), m24));
+                vreg[in.dst.value] = b.ibin(Op_IAdd, p, val(in.src[2]));
+            } else if (in.opcode == 0x148 || in.opcode == 0x149) {    // v_bfe_u32 / v_bfe_i32
+                uint32_t off = b.ibin(Op_BitwiseAnd, val(in.src[1]), b.uconst(31));
+                uint32_t cnt = b.ibin(Op_BitwiseAnd, val(in.src[2]), b.uconst(31));
+                vreg[in.dst.value] = (in.opcode == 0x148) ? b.bfe_u(val(in.src[0]), off, cnt)
+                                                          : b.bfe_s(val(in.src[0]), off, cnt);
+            } else if (in.opcode == 0x14A) {                          // v_bfi_b32 = (s0&s1)|(~s0&s2)
+                uint32_t s0 = val(in.src[0]);
+                uint32_t t1 = b.ibin(Op_BitwiseAnd, s0, val(in.src[1]));
+                uint32_t t2 = b.ibin(Op_BitwiseAnd, b.iun(Op_Not, s0), val(in.src[2]));
+                vreg[in.dst.value] = b.ibin(Op_BitwiseOr, t1, t2);
+            } else if (in.opcode == 0x36D) {                          // v_add3_u32 = s0+s1+s2
+                vreg[in.dst.value] = b.ibin(Op_IAdd, b.ibin(Op_IAdd, val(in.src[0]), val(in.src[1])), val(in.src[2]));
+            } else if (in.opcode == 0x346) {                          // v_lshl_add_u32 = (s0<<(s1&31))+s2
+                uint32_t sh = b.ibin(Op_BitwiseAnd, val(in.src[1]), b.uconst(31));
+                vreg[in.dst.value] = b.ibin(Op_IAdd, b.ibin(Op_ShiftLeftLogical, val(in.src[0]), sh), val(in.src[2]));
             } else ok = false;
             return true;
         default: return false;   // not a VALU format
