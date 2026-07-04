@@ -209,6 +209,12 @@ if(TARGET prosper_core)
       add_executable(test_pipeline_render tests/test_pipeline_render.cpp)
       target_link_libraries(test_pipeline_render PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME pipeline_render COMMAND test_pipeline_render)
+
+      # Full back-half spine: a GpuState -> recompile shaders from their PGM addresses -> resolve
+      # pipeline state -> rendered frame (the path a real submitted Dcb will drive).
+      add_executable(test_gpustate_render tests/test_gpustate_render.cpp)
+      target_link_libraries(test_gpustate_render PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME gpustate_render COMMAND test_gpustate_render)
       message(STATUS "Vulkan found (${Vulkan_LIBRARY}) — offscreen graphics harness enabled")
     else()
       message(STATUS "Vulkan not found — skipping offscreen graphics harness")
