@@ -121,6 +121,17 @@ void decode_operands(Rdna2Inst& i) {
             i.src[2] = sgpr(((d1 >> 21) & 0x1Fu) << 2);       // SSAMP (S# base, 4 SGPRs)
             i.n_src  = 3; break;
         }
+        case Rdna2Format::DS: {
+            // LDS/GDS op. opcode[25:18]; 16-bit byte offset[15:0]; dword1: ADDR[7:0], DATA0[15:8],
+            // DATA1[23:16], VDST[31:24]. (Verified via llvm-mc gfx1030: ds_write_b32=0x0d, ds_read_b32=0x36.)
+            const uint32_t d1 = i.words[1];
+            i.opcode  = (w >> 18) & 0xFFu;
+            i.literal = w & 0xFFFFu;                 // byte offset (offset0:offset1)
+            i.src[0]  = vgpr(d1 & 0xFFu);            // ADDR (byte offset into LDS)
+            i.src[1]  = vgpr((d1 >> 8) & 0xFFu);     // DATA0 (store source)
+            i.dst     = vgpr((d1 >> 24) & 0xFFu);    // VDST (load dest)
+            i.n_src = 2; break;
+        }
         case Rdna2Format::VINTRP: {
             // Pixel-shader interpolation. opcode[17:16] (p1=0,p2=1,mov=2); vdst[25:18]; attr[15:10];
             // chan[9:8]; vsrc[7:0]. (Bit layout verified via llvm-mc gfx1030.)

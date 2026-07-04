@@ -27,6 +27,7 @@ enum : uint32_t {
     Op_BitReverse=204,
     Op_TypeImage=25, Op_TypeSampledImage=27, Op_SampledImage=86,
     Op_ImageSampleImplicitLod=87, Op_ImageSampleExplicitLod=88, Op_ImageFetch=95, Op_Image=100,
+    Op_TypeArray=28, Op_ControlBarrier=224,
     Op_SelectionMerge=247, Op_Label=248, Op_Branch=249, Op_BranchConditional=250, Op_Return=253,
 };
 // GLSL.std.450 extended-instruction numbers.
@@ -39,6 +40,7 @@ enum : uint32_t {
     SC_Input=1, SC_UniformConstant=0, SC_Output=3, SC_StorageBuffer=12, FC_None=0,
     Dim_2D=1,   // SPIR-V Dim (2D image). (Note: coincides with the SQ_RSRC 2D dim value, but distinct.)
     ImgOp_Lod=2,   // ImageOperands bit: an explicit LOD follows (for OpImageFetch on a sampled image).
+    SC_Workgroup=4, Scope_Workgroup=2, MemSem_WGAcqRel=0x108,   // LDS: Workgroup storage + barrier scope/semantics
     Dec_Block=2, Dec_ArrayStride=6, Dec_BuiltIn=11, Dec_Location=30, Dec_Binding=33,
     Dec_DescriptorSet=34, Dec_Offset=35,
     BI_Position=0, BI_GlobalInvocationId=28, BI_VertexIndex=42,
@@ -58,6 +60,7 @@ struct SpirvCompute {
     uint32_t v_gid=0, v_in=0, v_out=0, gidx=0, f_main=0, glsl=0, bconst_false=0;
     uint32_t v_cbuf=0, v_cbuf1=0, t_ptr_sb_u32=0;   // scalar-memory constant buffers (bindings 2 and 3)
     bool     is_fragment=0;                          // true in the fragment shell (gates VINTRP interp)
+    bool     is_compute=0;                            // true in the compute shell (gates LDS / s_barrier)
     uint32_t exec_model=0;                           // deferred EntryPoint (emitted in finish() so lazily-
     std::vector<uint32_t> iface;                     // declared I/O varyings can join the interface list)
 
@@ -232,6 +235,40 @@ struct SpirvCompute {
         put(code, Op_Branch, {merge});
         put(code, Op_Label, {merge});
     }
+    // LDS (Local Data Share) — a workgroup-shared u32 array for compute ds_read/ds_write. Declared on
+    // first use. 4096 dwords (16 KB, the RDNA2 per-workgroup LDS size).
+    uint32_t lds_var = 0, t_ptr_wg_u32 = 0;
+    void declare_lds() {
+        if (lds_var) return;
+        uint32_t len = uconst(4096);
+        uint32_t t_arr = id();        put(types, Op_TypeArray, {t_arr, t_u32, len});
+        uint32_t t_ptr_wg_arr = id(); put(types, Op_TypePointer, {t_ptr_wg_arr, SC_Workgroup, t_arr});
+        lds_var = id();               put(types, Op_Variable, {t_ptr_wg_arr, lds_var, SC_Workgroup});
+        t_ptr_wg_u32 = id();          put(types, Op_TypePointer, {t_ptr_wg_u32, SC_Workgroup, t_u32});
+    }
+    uint32_t lds_load(uint32_t idx) {
+        uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_wg_u32, p, lds_var, idx});
+        uint32_t r = id(); put(code, Op_Load, {t_u32, r, p}); return r;
+    }
+    // Store to LDS[idx]; EXEC-predicated (conditional store) under a narrowed mask, like cbuf_store.
+    void lds_store(uint32_t idx, uint32_t value, bool predicated, uint32_t pred) {
+        if (!predicated) {
+            uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_wg_u32, p, lds_var, idx});
+            put(code, Op_Store, {p, value}); return;
+        }
+        uint32_t then = id(), merge = id();
+        put(code, Op_SelectionMerge, {merge, 0});
+        put(code, Op_BranchConditional, {pred, then, merge});
+        put(code, Op_Label, {then});
+        uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_wg_u32, p, lds_var, idx});
+        put(code, Op_Store, {p, value});
+        put(code, Op_Branch, {merge});
+        put(code, Op_Label, {merge});
+    }
+    // s_barrier: workgroup execution + memory barrier (OpControlBarrier).
+    void barrier() {
+        put(code, Op_ControlBarrier, {uconst(Scope_Workgroup), uconst(Scope_Workgroup), uconst(MemSem_WGAcqRel)});
+    }
     // Declare the two scalar-memory constant/vertex buffers (bindings 2 & 3) that SMEM / buffer_load_
     // format_* read. Called by every shell (compute/vertex/fragment) so cbuf_load works in each.
     // Requires t_u32 to already be declared. Unused by shaders without memory ops.
@@ -280,6 +317,7 @@ struct SpirvCompute {
         put(caps, Op_Capability, {Cap_Shader});
         { std::vector<uint32_t> o{glsl}; pstr(o, "GLSL.std.450"); putv(extimp, Op_ExtInstImport, o); }
         put(mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
+        is_compute = true;
         exec_model = Exec_GLCompute; iface = {v_gid};   // EntryPoint deferred to finish()
         put(exec, Op_ExecutionMode, {f_main, EM_LocalSize, 64, 1, 1});
         put(deco, Op_Decorate, {v_gid, Dec_BuiltIn, BI_GlobalInvocationId});
@@ -774,12 +812,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (in.simm16 < 0) ok = false;                 // backward = loop -> unsupported
                     else if (rs.exec_narrowed && (!safe_execz || !safe_execz->count(in.pc))) ok = false;
                     break;                                          // forward = no-op (predication covers it)
+                case 0x0a:                                          // s_barrier
+                    if (b.is_compute) b.barrier();                  // workgroup exec+memory barrier (LDS sync)
+                    else ok = false;                                // barrier only meaningful in compute
+                    break;
                 case 0x04: case 0x05:                              // s_cbranch_scc0 / scc1
                 case 0x06: case 0x07:                              // s_cbranch_vccz / vccnz
                 case 0x09:                                         // s_cbranch_execnz
                     ok = false;
                     break;
-                default: ok = false;   // s_branch / s_sendmsg / s_barrier / s_setreg / etc. -> reject
+                default: ok = false;   // s_branch / s_sendmsg / s_setreg / etc. -> reject
             }
             return true;
         }
@@ -956,6 +998,23 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rs.vreg[vd + w] = out[c];
                 predicate_write(b, rs, vd + w, old);
                 w++;
+            }
+            return true;
+        }
+        case Rdna2Format::DS: {
+            // LDS (workgroup shared memory), compute-only. ds_write_b32 (0x0d) / ds_read_b32 (0x36);
+            // GDS and wider widths deferred. Byte address = ADDR VGPR + inst offset; dword index = >>2.
+            if (!b.is_compute || (in.opcode != 0x0d && in.opcode != 0x36)) { ok = false; return true; }
+            b.declare_lds();
+            auto vread = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
+            uint32_t addr = b.ibin(Op_IAdd, vread(in.src[0].value), b.uconst(in.literal));
+            uint32_t idx  = b.ibin(Op_ShiftRightLogical, addr, b.uconst(2));
+            if (in.opcode == 0x0d) {                    // ds_write_b32: LDS[idx] = DATA0
+                b.lds_store(idx, vread(in.src[1].value), rs.exec_narrowed, rs.exec);
+            } else {                                    // ds_read_b32: VDST = LDS[idx]
+                uint32_t old = vreg_old(b, rs, in.dst.value);
+                rs.vreg[in.dst.value] = b.lds_load(idx);
+                predicate_write(b, rs, in.dst.value, old);
             }
             return true;
         }
