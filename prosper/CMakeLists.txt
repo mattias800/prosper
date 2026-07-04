@@ -244,6 +244,11 @@ if(TARGET prosper_core)
       target_link_libraries(test_texture_sample_render PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME texture_sample_render COMMAND test_texture_sample_render)
 
+      # Interpolation: a recompiled VS exports EXP PARAM0, a recompiled PS reads it via v_interp.
+      add_executable(test_interp_render tests/test_interp_render.cpp)
+      target_link_libraries(test_interp_render PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME interp_render COMMAND test_interp_render)
+
       # Pipeline realization: build a VkPipeline whose fixed-function state comes from
       # resolve_pipeline_state(RenderState) and prove the resolved state drives rendering.
       add_executable(test_pipeline_render tests/test_pipeline_render.cpp)

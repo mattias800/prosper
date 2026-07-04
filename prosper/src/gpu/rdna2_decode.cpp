@@ -121,7 +121,17 @@ void decode_operands(Rdna2Inst& i) {
             i.src[2] = sgpr(((d1 >> 21) & 0x1Fu) << 2);       // SSAMP (S# base, 4 SGPRs)
             i.n_src  = 3; break;
         }
-        default: break;   // MTBUF/DS/FLAT/VINTRP: operands not decoded at this stage
+        case Rdna2Format::VINTRP: {
+            // Pixel-shader interpolation. opcode[17:16] (p1=0,p2=1,mov=2); vdst[25:18]; attr[15:10];
+            // chan[9:8]; vsrc[7:0]. (Bit layout verified via llvm-mc gfx1030.)
+            i.opcode      = (w >> 16) & 0x3u;
+            i.dst         = vgpr((w >> 18) & 0xFFu);
+            i.vintrp_attr = (w >> 10) & 0x3Fu;
+            i.vintrp_chan = (w >> 8)  & 0x3u;
+            i.src[0]      = vgpr(w & 0xFFu);
+            i.n_src = 1; break;
+        }
+        default: break;   // MTBUF/DS/FLAT: operands not decoded at this stage
     }
 }
 }  // namespace

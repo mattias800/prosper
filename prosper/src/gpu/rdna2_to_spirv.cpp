@@ -57,6 +57,9 @@ struct SpirvCompute {
     uint32_t t_void=0, t_fn=0, t_f32=0, t_u32=0, t_i32=0, t_v3u=0, t_bool=0, t_ptr_sb_f32=0;
     uint32_t v_gid=0, v_in=0, v_out=0, gidx=0, f_main=0, glsl=0, bconst_false=0;
     uint32_t v_cbuf=0, v_cbuf1=0, t_ptr_sb_u32=0;   // scalar-memory constant buffers (bindings 2 and 3)
+    bool     is_fragment=0;                          // true in the fragment shell (gates VINTRP interp)
+    uint32_t exec_model=0;                           // deferred EntryPoint (emitted in finish() so lazily-
+    std::vector<uint32_t> iface;                     // declared I/O varyings can join the interface list)
 
     uint32_t id() { return next_id++; }
     static void put(std::vector<uint32_t>& s, uint32_t op, std::initializer_list<uint32_t> o) {
@@ -250,7 +253,7 @@ struct SpirvCompute {
         put(caps, Op_Capability, {Cap_Shader});
         { std::vector<uint32_t> o{glsl}; pstr(o, "GLSL.std.450"); putv(extimp, Op_ExtInstImport, o); }
         put(mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
-        { std::vector<uint32_t> o{Exec_GLCompute, f_main}; pstr(o, "main"); o.push_back(v_gid); putv(entry, Op_EntryPoint, o); }
+        exec_model = Exec_GLCompute; iface = {v_gid};   // EntryPoint deferred to finish()
         put(exec, Op_ExecutionMode, {f_main, EM_LocalSize, 64, 1, 1});
         put(deco, Op_Decorate, {v_gid, Dec_BuiltIn, BI_GlobalInvocationId});
         put(deco, Op_Decorate, {t_rta, Dec_ArrayStride, 4});
@@ -287,7 +290,8 @@ struct SpirvCompute {
         put(caps, Op_Capability, {Cap_Shader});
         { std::vector<uint32_t> o{glsl}; pstr(o, "GLSL.std.450"); putv(extimp, Op_ExtInstImport, o); }
         put(mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
-        { std::vector<uint32_t> o{Exec_Fragment, f_main}; pstr(o, "main"); o.push_back(v_color); putv(entry, Op_EntryPoint, o); }
+        is_fragment = true;
+        exec_model = Exec_Fragment; iface = {v_color};   // EntryPoint deferred to finish()
         put(exec, Op_ExecutionMode, {f_main, EM_OriginUpperLeft});
         put(deco, Op_Decorate, {v_color, Dec_Location, 0});
         put(types, Op_TypeVoid, {t_void});
@@ -320,7 +324,7 @@ struct SpirvCompute {
         put(caps, Op_Capability, {Cap_Shader});
         { std::vector<uint32_t> o{glsl}; pstr(o, "GLSL.std.450"); putv(extimp, Op_ExtInstImport, o); }
         put(mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
-        { std::vector<uint32_t> o{Exec_Vertex, f_main}; pstr(o, "main"); o.push_back(v_vid); o.push_back(v_pos); putv(entry, Op_EntryPoint, o); }
+        exec_model = Exec_Vertex; iface = {v_vid, v_pos};   // EntryPoint deferred to finish()
         put(deco, Op_Decorate, {v_vid, Dec_BuiltIn, BI_VertexIndex});
         put(deco, Op_MemberDecorate, {t_pv, 0, Dec_BuiltIn, BI_Position});   // gl_PerVertex.gl_Position
         put(deco, Op_Decorate, {t_pv, Dec_Block});
@@ -350,8 +354,42 @@ struct SpirvCompute {
         put(code, Op_Store, {p, v});
     }
 
+    // --- Interpolated I/O varyings: VS EXP PARAM_n (output) <-> FS v_interp attribute (input) ---
+    std::unordered_map<uint32_t, uint32_t> in_varying, out_varying;
+    uint32_t t_ptr_in_v4f = 0;
+    // FS: an Input vec4 at Location=attr, smooth-interpolated by the rasterizer (declared on first use).
+    uint32_t frag_input(uint32_t attr) {
+        auto it = in_varying.find(attr); if (it != in_varying.end()) return it->second;
+        if (!t_ptr_in_v4f) { t_ptr_in_v4f = id(); put(types, Op_TypePointer, {t_ptr_in_v4f, SC_Input, t_v4f}); }
+        uint32_t v = id(); put(types, Op_Variable, {t_ptr_in_v4f, v, SC_Input});
+        put(deco, Op_Decorate, {v, Dec_Location, attr});
+        in_varying[attr] = v; iface.push_back(v); return v;
+    }
+    // Read component `chan` (0..3) of interpolated attribute `attr` -> float bits (v_interp_p2 / mov).
+    uint32_t interp_read(uint32_t attr, uint32_t chan) {
+        uint32_t v = frag_input(attr);
+        uint32_t vec = id(); put(code, Op_Load, {t_v4f, vec, v});
+        uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, vec, chan}); return bcu(e);
+    }
+    // VS: an Output vec4 at Location=loc (EXP PARAM_loc); uses t_ptr_out_v4f from begin_vertex.
+    uint32_t vtx_output(uint32_t loc) {
+        auto it = out_varying.find(loc); if (it != out_varying.end()) return it->second;
+        uint32_t v = id(); put(types, Op_Variable, {t_ptr_out_v4f, v, SC_Output});
+        put(deco, Op_Decorate, {v, Dec_Location, loc});
+        out_varying[loc] = v; iface.push_back(v); return v;
+    }
+    void export_param(uint32_t loc, uint32_t x, uint32_t y, uint32_t z, uint32_t w) {
+        uint32_t v = vtx_output(loc);
+        uint32_t vec = id(); putv(code, Op_CompositeConstruct, {t_v4f, vec, bcf(x), bcf(y), bcf(z), bcf(w)});
+        put(code, Op_Store, {v, vec});
+    }
+
     std::vector<uint32_t> finish() {
         put(code, Op_Return, {}); put(code, Op_FunctionEnd, {});
+        // EntryPoint is emitted here (not in begin_*) so lazily-declared Input/Output varyings — added
+        // to `iface` as v_interp / EXP PARAM are encountered — appear in the interface list (SPIR-V 1.3).
+        { std::vector<uint32_t> o{exec_model, f_main}; pstr(o, "main");
+          for (uint32_t v : iface) o.push_back(v); putv(entry, Op_EntryPoint, o); }
         std::vector<uint32_t> m{0x07230203u, 0x00010300u, 0u, next_id, 0u};
         for (auto* s : {&caps, &extimp, &mem, &entry, &exec, &deco, &types, &code}) m.insert(m.end(), s->begin(), s->end());
         return m;
@@ -834,6 +872,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
             return true;
         }
+        case Rdna2Format::VINTRP: {
+            // Pixel-shader attribute interpolation. The rasterizer performs the interpolation; v_interp_p1
+            // (opcode 0) initializes and is a no-op here, while v_interp_p2 (1) and v_interp_mov (2)
+            // deliver the interpolated attribute component from the matching Input varying. Fragment-only.
+            if (!b.is_fragment) { ok = false; return true; }
+            if (in.opcode == 0) return true;   // p1: no-op (p2/mov produce the value)
+            uint32_t old = vreg_old(b, rs, in.dst.value);
+            rs.vreg[in.dst.value] = b.interp_read(in.vintrp_attr, in.vintrp_chan);
+            predicate_write(b, rs, in.dst.value, old);
+            return true;
+        }
         default: return false;   // not a VALU format
     }
 }
@@ -933,13 +982,16 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords, cons
 
     for (const auto& in : ins) {
         if (in.is_end) break;
-        if (in.fmt == Rdna2Format::EXP) {                    // EXP POS0..3 -> gl_Position
+        if (in.fmt == Rdna2Format::EXP) {                    // EXP POS0..3 -> gl_Position; PARAM -> varyings
             if (in.exp_target >= 12 && in.exp_target <= 15 && !exported) {
                 b.export_position(operand_bits(b, rs, in, in.src[0]), operand_bits(b, rs, in, in.src[1]),
                                   operand_bits(b, rs, in, in.src[2]), operand_bits(b, rs, in, in.src[3]));
                 exported = true;
+            } else if (in.exp_target >= 32) {                // PARAM0.. -> Output varying (location N)
+                b.export_param(in.exp_target - 32, operand_bits(b, rs, in, in.src[0]), operand_bits(b, rs, in, in.src[1]),
+                               operand_bits(b, rs, in, in.src[2]), operand_bits(b, rs, in, in.src[3]));
             }
-            continue;   // ignore PARAM exports (varyings) for now
+            continue;
         }
         bool ok = true;
         // cmpx rejected in graphics stages (no EXEC-masked export yet); SMEM/MUBUF allowed only with a

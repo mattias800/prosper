@@ -74,6 +74,11 @@ struct Rdna2Inst {
     uint32_t mimg_dmask = 0;
     uint32_t mimg_dim   = 0;
     bool     mimg_unorm = false;
+
+    // VINTRP-only: the interpolated attribute (parameter location) and its component channel (0..3).
+    // opcode = p1(0)/p2(1)/mov(2); dst = vdst; src[0] = vsrc (the i/j barycentric VGPR).
+    uint32_t vintrp_attr = 0;
+    uint32_t vintrp_chan = 0;
 };
 
 // Decode the single instruction at code[0..]; `max_dwords` bounds the read. On a truncated/unknown
