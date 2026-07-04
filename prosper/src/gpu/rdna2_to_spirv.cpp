@@ -22,12 +22,13 @@ enum : uint32_t {
     Op_ULessThanEqual=178, Op_SLessThanEqual=179,
     Op_ShiftRightLogical=194, Op_ShiftRightArithmetic=195, Op_ShiftLeftLogical=196, Op_BitwiseOr=197,
     Op_BitwiseXor=198, Op_BitwiseAnd=199, Op_Not=200, Op_BitFieldSExtract=202, Op_BitFieldUExtract=203,
+    Op_BitReverse=204,
     Op_Label=248, Op_Return=253,
 };
 // GLSL.std.450 extended-instruction numbers.
 enum : uint32_t { Glsl_Trunc=3, Glsl_Floor=8, Glsl_Ceil=9, Glsl_Fract=10, Glsl_Exp2=29, Glsl_Log2=30,
                   Glsl_Sqrt=31, Glsl_InverseSqrt=32, Glsl_FMin=37, Glsl_UMin=38, Glsl_SMin=39, Glsl_FMax=40,
-                  Glsl_UMax=41, Glsl_SMax=42 };
+                  Glsl_UMax=41, Glsl_SMax=42, Glsl_PackHalf2x16=58 };
 enum : uint32_t {
     Cap_Shader=1, Addr_Logical=0, Mem_GLSL450=1, Exec_Vertex=0, Exec_Fragment=4, Exec_GLCompute=5,
     EM_OriginUpperLeft=7, EM_LocalSize=17,
@@ -109,6 +110,14 @@ struct SpirvCompute {
     // Bitfield extract (base, offset, count) -> bits. Unsigned and signed variants.
     uint32_t bfe_u(uint32_t base, uint32_t off, uint32_t cnt) { uint32_t r = id(); put(code, Op_BitFieldUExtract, {t_u32, r, base, off, cnt}); return r; }
     uint32_t bfe_s(uint32_t base, uint32_t off, uint32_t cnt) { uint32_t ri = id(); put(code, Op_BitFieldSExtract, {t_i32, ri, bcs(base), off, cnt}); return i2u(ri); }
+    // Lazily declared 2-float vector type (types are emitted as a block before code, so on-demand is safe).
+    uint32_t t_v2f_cache = 0;
+    uint32_t t_v2f() { if (!t_v2f_cache) { t_v2f_cache = id(); put(types, Op_TypeVector, {t_v2f_cache, t_f32, 2}); } return t_v2f_cache; }
+    // v_cvt_pkrtz_f16_f32: pack src0->low f16, src1->high f16 of a 32-bit result (raw VGPR bits).
+    uint32_t pack_half2x16(uint32_t a, uint32_t b) {
+        uint32_t vec = id(); put(code, Op_CompositeConstruct, {t_v2f(), vec, bcf(a), bcf(b)});
+        uint32_t r = id(); putv(code, Op_ExtInst, {t_u32, r, glsl, Glsl_PackHalf2x16, vec}); return r;
+    }
 
     // buffer element pointer: base[ gid.x*stride + k ]
     uint32_t elem_ptr(uint32_t bufvar, uint32_t k) {
@@ -309,9 +318,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok) {
                 case 0x25: d = b.fext1(Glsl_Exp2, a); break;          // v_exp_f32 (2^x)
                 case 0x27: d = b.fext1(Glsl_Log2, a); break;          // v_log_f32 (log2)
                 case 0x2A: d = b.frcp(a); break;                      // v_rcp_f32
+                case 0x2B: d = b.frcp(a); break;                      // v_rcp_iflag_f32 (~= v_rcp_f32)
                 case 0x2E: d = b.fext1(Glsl_InverseSqrt, a); break;   // v_rsq_f32
                 case 0x33: d = b.fext1(Glsl_Sqrt, a); break;          // v_sqrt_f32
                 case 0x37: d = b.iun(Op_Not, a); break;               // v_not_b32
+                case 0x38: d = b.iun(Op_BitReverse, a); break;        // v_bfrev_b32
                 default: ok = false;
             }
             return true;
@@ -340,6 +351,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok) {
                 case 0x1D: d = b.ibin(Op_BitwiseXor, a, c); break;    // v_xor_b32
                 case 0x25: d = b.ibin(Op_IAdd, a, c); break;          // v_add_nc_u32
                 case 0x26: d = b.ibin(Op_ISub, a, c); break;          // v_sub_nc_u32
+                case 0x2F: d = b.pack_half2x16(a, c); break;          // v_cvt_pkrtz_f16_f32 (e32 form)
                 default: ok = false;
             }
             return true;
@@ -414,7 +426,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok) {
             } else if (in.opcode == 0x347) {                          // v_add_lshl_u32 = (s0+s1)<<(s2&31)
                 uint32_t sh = b.ibin(Op_BitwiseAnd, val(in.src[2]), b.uconst(31));
                 vreg[in.dst.value] = b.ibin(Op_ShiftLeftLogical, b.ibin(Op_IAdd, val(in.src[0]), val(in.src[1])), sh);
-            } else if (in.opcode == 0x12F) {                          // v_mul_legacy_f32 ~= s0*s1
+            } else if (in.opcode == 0x12F) {                          // v_cvt_pkrtz_f16_f32 = pack(s0->lo, s1->hi)
+                vreg[in.dst.value] = b.pack_half2x16(val(in.src[0]), val(in.src[1]));
+            } else if (in.opcode == 0x107) {                          // v_mul_legacy_f32 ~= s0*s1
                 vreg[in.dst.value] = b.fbin(Op_FMul, val(in.src[0]), val(in.src[1]));
             } else ok = false;
             return true;

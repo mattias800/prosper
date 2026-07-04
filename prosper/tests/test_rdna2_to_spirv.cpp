@@ -13,6 +13,8 @@
 #include "compute_runner.h"
 #include <cstdio>
 #include <cmath>
+#include <cstring>
+#include <cstdint>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -20,6 +22,18 @@ using namespace prosper::gpu;
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
                          else       { printf("  [ok]   %s\n", m); } } while (0)
+
+// IEEE float32 -> float16 for NORMAL, in-range, exactly-representable inputs (chosen in the tests so
+// round-toward-zero (pkrtz) and round-to-nearest (packHalf2x16) agree). Not a general converter.
+static uint16_t f32_to_f16_exact(float f) {
+    uint32_t x; std::memcpy(&x, &f, 4);
+    uint32_t sign = (x >> 16) & 0x8000u;
+    int32_t  e = (int32_t)((x >> 23) & 0xffu) - 127 + 15;
+    uint32_t m = (x & 0x7fffffu) >> 13;
+    return (uint16_t)(sign | ((uint32_t)e << 10) | m);
+}
+static uint32_t bits_of(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
+static uint32_t bitrev32(uint32_t v) { uint32_t r = 0; for (int i = 0; i < 32; i++) { r = (r << 1) | (v & 1u); v >>= 1; } return r; }
 
 int main() {
     printf("== test_rdna2_to_spirv ==\n");
@@ -264,6 +278,42 @@ int main() {
     uint32_t bad13 = 0; for (uint32_t i=0;i<N&&got13.size()==N;i++) if (std::fabs(got13[i]-exp13[i])>1e-3f) bad13++;
     printf("  kernel13 mismatches=%u (out[3]=%g expect=%g)\n", bad13, got13.size()==N?got13[3]:-1, exp13[3]);
     CHECK(got13.size()==N && bad13==0, "recompiled kernel 13 (signed compare ge_i32 + select) correct");
+
+    // Kernel 14: v_cvt_pkrtz_f16_f32 (VOP2 e32 form, opcode 0x2f). packed = f16(a1)<<16 | f16(a0).
+    // Bit-exact verification (inputs chosen f16-exact so RTZ vs RTE rounding agree).
+    const uint32_t code14[] = { 0x5e000300u, 0xbf810000u };
+    std::vector<uint32_t> spv14 = recompile_valu(code14, sizeof(code14)/sizeof(code14[0]), 2, 0);
+    CHECK(!spv14.empty(), "recompiled kernel 14 (v_cvt_pkrtz_f16_f32 e32) -> SPIR-V");
+    std::vector<float> in14(N * 2); std::vector<uint32_t> exp14(N);
+    for (uint32_t i = 0; i < N; i++) {
+        float a0 = (float)(i % 13) * 0.5f - 2.75f, a1 = (float)(i % 11) * 0.5f - 1.75f;  // f16-exact, nonzero
+        in14[i*2+0]=a0; in14[i*2+1]=a1;
+        exp14[i] = ((uint32_t)f32_to_f16_exact(a1) << 16) | f32_to_f16_exact(a0);
+    }
+    std::vector<float> got14 = prosper::test::run_compute(spv14, in14, N, N);
+    uint32_t bad14 = 0; for (uint32_t i=0;i<N&&got14.size()==N;i++) if (bits_of(got14[i]) != exp14[i]) bad14++;
+    printf("  kernel14 mismatches=%u (out[3]=0x%08x expect=0x%08x)\n", bad14, got14.size()==N?bits_of(got14[3]):0, exp14[3]);
+    CHECK(got14.size()==N && bad14==0, "recompiled kernel 14 (pkrtz e32) packs f16 bit-exactly");
+
+    // Kernel 14b: same op via the VOP3 e64 form (opcode 0x12f) — the path whose mapping was wrong.
+    const uint32_t code14b[] = { 0xd52f0000u, 0x00020300u, 0xbf810000u };
+    std::vector<uint32_t> spv14b = recompile_valu(code14b, sizeof(code14b)/sizeof(code14b[0]), 2, 0);
+    CHECK(!spv14b.empty(), "recompiled kernel 14b (v_cvt_pkrtz_f16_f32 e64 / 0x12f) -> SPIR-V");
+    std::vector<float> got14b = prosper::test::run_compute(spv14b, in14, N, N);
+    uint32_t bad14b = 0; for (uint32_t i=0;i<N&&got14b.size()==N;i++) if (bits_of(got14b[i]) != exp14[i]) bad14b++;
+    printf("  kernel14b mismatches=%u\n", bad14b);
+    CHECK(got14b.size()==N && bad14b==0, "recompiled kernel 14b (pkrtz e64 / VOP3 0x12f) packs f16 bit-exactly");
+
+    // Kernel 15: v_bfrev_b32 (VOP1 0x38). u0=(uint)a0; out_bits = bitreverse(u0). Bit-exact.
+    const uint32_t code15[] = { 0x7e000f00u, 0x7e007100u, 0xbf810000u };
+    std::vector<uint32_t> spv15 = recompile_valu(code15, sizeof(code15)/sizeof(code15[0]), 1, 0);
+    CHECK(!spv15.empty(), "recompiled kernel 15 (v_bfrev_b32) -> SPIR-V");
+    std::vector<float> in15(N); std::vector<uint32_t> exp15(N);
+    for (uint32_t i = 0; i < N; i++) { in15[i] = (float)i; exp15[i] = bitrev32(i); }
+    std::vector<float> got15 = prosper::test::run_compute(spv15, in15, N, N);
+    uint32_t bad15 = 0; for (uint32_t i=0;i<N&&got15.size()==N;i++) if (bits_of(got15[i]) != exp15[i]) bad15++;
+    printf("  kernel15 mismatches=%u (out[1]=0x%08x expect=0x%08x)\n", bad15, got15.size()==N?bits_of(got15[1]):0, exp15[1]);
+    CHECK(got15.size()==N && bad15==0, "recompiled kernel 15 (v_bfrev_b32) reverses bits exactly");
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
