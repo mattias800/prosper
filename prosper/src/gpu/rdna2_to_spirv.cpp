@@ -26,7 +26,7 @@ enum : uint32_t {
     Op_BitwiseXor=198, Op_BitwiseAnd=199, Op_Not=200, Op_BitFieldSExtract=202, Op_BitFieldUExtract=203,
     Op_BitReverse=204,
     Op_TypeImage=25, Op_TypeSampledImage=27, Op_SampledImage=86,
-    Op_ImageSampleImplicitLod=87, Op_ImageFetch=95, Op_Image=100,
+    Op_ImageSampleImplicitLod=87, Op_ImageSampleExplicitLod=88, Op_ImageFetch=95, Op_Image=100,
     Op_SelectionMerge=247, Op_Label=248, Op_Branch=249, Op_BranchConditional=250, Op_Return=253,
 };
 // GLSL.std.450 extended-instruction numbers.
@@ -170,6 +170,15 @@ struct SpirvCompute {
         uint32_t si    = id(); put(code, Op_Load, {t_sampled_image, si, tex_var[binding]});
         uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
         uint32_t res   = id(); put(code, Op_ImageSampleImplicitLod, {t_v4f, res, si, coord});
+        for (uint32_t c = 0; c < 4; c++) {
+            uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, res, c}); out[c] = bcu(e);
+        }
+    }
+    // image_sample_l / _lz: sample with an EXPLICIT LOD (lod_bits float). Stage-agnostic (no derivatives).
+    void image_sample_lod_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t lod_bits, uint32_t out[4]) {
+        uint32_t si    = id(); put(code, Op_Load, {t_sampled_image, si, tex_var[binding]});
+        uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
+        uint32_t res   = id(); put(code, Op_ImageSampleExplicitLod, {t_v4f, res, si, coord, ImgOp_Lod, bcf(lod_bits)});
         for (uint32_t c = 0; c < 4; c++) {
             uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, res, c}); out[c] = bcu(e);
         }
@@ -918,10 +927,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // not mis-translated.
             if (!allow_smem || !rt) { ok = false; return true; }
             const uint32_t SQ_DIM_2D = 1u;
-            // image_sample = 0x20 (normalized float coords + sampler), image_load = 0x00 (integer texel
-            // fetch, no sampler). 2D, non-NSA only; other dims / NSA / LOD-gradient-compare deferred.
+            // image_sample = 0x20 (implicit-LOD sample), image_sample_l = 0x24 (explicit LOD in the 3rd
+            // coord), image_sample_lz = 0x27 (LOD 0), image_load = 0x00 (integer texel fetch, no sampler).
+            // 2D, non-NSA only; other dims / NSA / gradient / compare variants deferred.
             const bool is_sample = (in.opcode == 0x20), is_load = (in.opcode == 0x00);
-            if ((!is_sample && !is_load) || in.mimg_dim != SQ_DIM_2D || in.len_dwords != 2) { ok = false; return true; }
+            const bool is_sample_l = (in.opcode == 0x24), is_sample_lz = (in.opcode == 0x27);
+            if ((!is_sample && !is_load && !is_sample_l && !is_sample_lz) ||
+                in.mimg_dim != SQ_DIM_2D || in.len_dwords != 2) { ok = false; return true; }
             // Resolve the T# via SRSRC (src[1]) provenance: s_load tag (indirect) else user-data SGPR.
             const ShaderResource* res = nullptr;
             { auto it = rs.sreg_srt.find(in.src[1].value);
@@ -933,8 +945,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             int va = in.src[0].value;
             auto vread = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
             uint32_t out[4];
-            if (is_sample) b.image_sample_2d(res->binding, vread(va), vread(va + 1), out);
-            else           b.image_fetch_2d (res->binding, vread(va), vread(va + 1), out);
+            if (is_sample)         b.image_sample_2d(res->binding, vread(va), vread(va + 1), out);
+            else if (is_sample_lz) b.image_sample_lod_2d(res->binding, vread(va), vread(va + 1), b.uconst(0), out);   // LOD 0
+            else if (is_sample_l)  b.image_sample_lod_2d(res->binding, vread(va), vread(va + 1), vread(va + 2), out); // LOD = 3rd coord
+            else                   b.image_fetch_2d (res->binding, vread(va), vread(va + 1), out);
             // dmask selects which result components are written to consecutive VDATA VGPRs (LSB=R first).
             int vd = in.dst.value, w = 0;
             for (uint32_t c = 0; c < 4; c++) if (in.mimg_dmask & (1u << c)) {

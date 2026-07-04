@@ -104,6 +104,21 @@ int main() {
     printf("  image_load(1,1) center=(%u,%u,%u)\n", okL1?rgb[0]:0, okL1?rgb[1]:0, okL1?rgb[2]:0);
     CHECK(okL1 && rgb[0] > 0x80 && rgb[1] > 0x80 && rgb[2] > 0x80, "image_load texel (1,1) yields WHITE (proves integer coords)");
 
+    // image_sample_lz (explicit LOD 0): coords (0.75,0.25) -> texel (1,0) = green, same as image_sample.
+    const uint32_t lz[] = {
+        0x7e0002ffu, 0x3f400000u, 0x7e0202ffu, 0x3e800000u, 0xf09c0f08u, 0x00820000u,
+        0xf800080fu, 0x03020100u, 0xbf810000u,
+    };
+    std::vector<uint32_t> lzf = recompile_fragment(lz, sizeof(lz)/sizeof(lz[0]), &rt);
+    bool okLz = !lzf.empty() && lzf[0] == 0x07230203u;
+    if (okLz) {
+        std::vector<uint8_t> px = prosper::test::render_triangle_rgba(vert, lzf, W, H, nullptr, nullptr, nullptr, &td);
+        okLz = px.size() == (size_t)W*H*4;
+        if (okLz) { const uint8_t* c = &px[((size_t)(H/2)*W + W/2)*4]; rgb[0]=c[0]; rgb[1]=c[1]; rgb[2]=c[2]; }
+    }
+    printf("  image_sample_lz(0.75,0.25) center=(%u,%u,%u)\n", okLz?rgb[0]:0, okLz?rgb[1]:0, okLz?rgb[2]:0);
+    CHECK(okLz && rgb[1] > 0x80 && rgb[0] < 0x40 && rgb[2] < 0x40, "image_sample_lz (explicit LOD 0) samples texel (1,0) = GREEN");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
