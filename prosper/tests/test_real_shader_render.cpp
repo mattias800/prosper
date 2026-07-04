@@ -16,6 +16,7 @@
 #include "../src/gpu/rdna2_to_spirv.hpp"
 #include "render_runner.h"
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cstdint>
 #include <vector>
@@ -104,6 +105,9 @@ int main(int argc, char** argv) {
     if (px.size() == (size_t)W*H*4) {
         const uint8_t* c = &px[((size_t)(H/2)*W + W/2)*4];
         printf("  center pixel = (%u,%u,%u,%u)\n", c[0], c[1], c[2], c[3]);
+        const char* dir = getenv("PROSPER_SHOTS");
+        char path[1024]; snprintf(path, sizeof(path), "%s/real_game_shader.bmp", dir ? dir : ".");
+        if (prosper::test::dump_bmp(path, px, W, H)) printf("  wrote screenshot: %s\n", path);
     }
     CHECK(vs_real || ps_real, "at least one stage rendered is a REAL game shader (not synthetic)");
 

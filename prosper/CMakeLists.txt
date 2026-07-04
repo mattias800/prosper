@@ -249,6 +249,11 @@ if(TARGET prosper_core)
       target_link_libraries(test_interp_render PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME interp_render COMMAND test_interp_render)
 
+      # Full textured-draw path: VS exports interpolated UVs, PS samples a texture at them (+screenshot).
+      add_executable(test_textured_interp_render tests/test_textured_interp_render.cpp)
+      target_link_libraries(test_textured_interp_render PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME textured_interp_render COMMAND test_textured_interp_render)
+
       # Pipeline realization: build a VkPipeline whose fixed-function state comes from
       # resolve_pipeline_state(RenderState) and prove the resolved state drives rendering.
       add_executable(test_pipeline_render tests/test_pipeline_render.cpp)
