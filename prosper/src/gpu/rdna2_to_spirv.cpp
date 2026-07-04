@@ -644,24 +644,46 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // + inst-offset; index = addr>>2; N dwords -> VDATA..+N-1. Descriptor (SRSRC), idxen*stride,
             // and the format-converting buffer_load_format_* variants are deferred. Compute-only (cbuf).
             if (!allow_smem) { ok = false; return true; }
-            uint32_t n = 0;
+            uint32_t n = 0; bool is_format = false;
             switch (in.opcode) {
-                case 0xC: n = 1; break;   // buffer_load_dword
-                case 0xD: n = 2; break;   // buffer_load_dwordx2
-                case 0xE: n = 4; break;   // buffer_load_dwordx4
-                default: ok = false; return true;   // stores / format / typed not yet
+                case 0xC: n = 1; break;                     // buffer_load_dword
+                case 0xD: n = 2; break;                     // buffer_load_dwordx2
+                case 0xE: n = 4; break;                     // buffer_load_dwordx4
+                case 0x0: n = 1; is_format = true; break;   // buffer_load_format_x  (vertex fetch)
+                case 0x1: n = 2; is_format = true; break;   // buffer_load_format_xy
+                case 0x2: n = 3; is_format = true; break;   // buffer_load_format_xyz
+                case 0x3: n = 4; is_format = true; break;   // buffer_load_format_xyzw
+                default: ok = false; return true;           // stores / typed / packed formats not yet
             }
             uint32_t offset = in.literal & 0xFFFu;
-            bool offen = (in.literal >> 12) & 1u;
+            bool offen = (in.literal >> 12) & 1u, idxen = (in.literal >> 13) & 1u;
+            uint32_t slot = 0, stride = 0;
+            if (is_format) {
+                // A format load reads a vertex/buffer attribute — it needs the V# descriptor for the
+                // binding, stride, and data format. Resolve SRSRC (src[1]) via provenance: an s_load
+                // tag (indirect) else the SGPR index (direct/user-data). Only the FLOAT32 fast path is
+                // implemented (a float32 component is a raw dword in our bit model); packed formats
+                // (unorm8/…) need conversion (stage 3), so reject them rather than approximate.
+                const ShaderResource* res = nullptr;
+                if (rt) { auto it = rs.sreg_srt.find(in.src[1].value);
+                    if (it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second);
+                    if (!res) res = rt->by_sgpr_base(in.src[1].value); }
+                if (!res || res->format != DataFormat::Float32) { ok = false; return true; }
+                slot = (res->binding >= 3) ? 1 : 0;
+                stride = res->stride;
+            }
+            // Byte address: idxen -> VADDR is an element index (×stride); offen -> VADDR is a byte
+            // offset; plus the inst offset and SOFFSET. index = addr>>2; N dwords -> VDATA..+N-1.
             uint32_t addr = b.uconst(offset);
-            if (offen) addr = b.ibin(Op_IAdd, addr, val(in.src[0]));   // per-lane VADDR (byte offset)
+            if (idxen && stride) addr = b.ibin(Op_IAdd, addr, b.ibin(Op_IMul, val(in.src[0]), b.uconst(stride)));
+            else if (offen)      addr = b.ibin(Op_IAdd, addr, val(in.src[0]));
             addr = b.ibin(Op_IAdd, addr, val(in.src[2]));              // SOFFSET
             uint32_t idx = b.ibin(Op_ShiftRightLogical, addr, b.uconst(2));
             for (uint32_t k = 0; k < n; k++) {
                 uint32_t kidx = k ? b.ibin(Op_IAdd, idx, b.uconst(k)) : idx;
                 int d = in.dst.value + (int)k;
                 uint32_t old = vreg_old(b, rs, d);
-                rs.vreg[d] = b.cbuf_load(kidx);
+                rs.vreg[d] = b.cbuf_load(kidx, slot);
                 predicate_write(b, rs, d, old);
             }
             return true;
