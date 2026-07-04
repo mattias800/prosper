@@ -2,8 +2,9 @@
 
 **Status:** open, blocking. **Audience:** an agent who has *not* lived this investigation and needs
 full context. **Ask:** a fresh framework / a second pair of eyes on why Unity's GfxDevice object
-graph comes up systematically null in our environment. Three mechanism-hypotheses have missed; we
-think the way forward is *ground-truth observation*, not a fourth guess (see §8).
+graph comes up systematically null in our environment. Four mechanism-hypotheses have missed; the
+latest watchpoint result changes the question from "who builds the missing companion?" to "why does
+the reader require a companion that this pipeline class legitimately lacks?" (see §8).
 
 ---
 
@@ -96,6 +97,11 @@ draw). So we are stuck in **CPU-side engine construction**, before any real rend
    by an AGC call, it's a call we *do* implement — as a no-op / return-0 — not a missing one.
 6. The GfxDevice sub-object graph is **systematically null** (one zero page satisfies every null
    field read), terminating in a **virtual call on a null object**.
+7. **The companion slot is not built late.** `PROSPER_WATCH_COMPANION` showed the faulting
+   `[obj+0x140]` slot is written many times, but every observed write stores zero from reset/memset
+   paths on both the reader thread and a worker thread. The object tag stays `[+0]=0x2b`, so this is
+   the same live object being zeroed, not a non-null builder that races the reader. No non-null
+   companion write was observed.
 
 ---
 
@@ -141,6 +147,8 @@ evidence. The pattern — reasoning *about* Unity's internals from the fault sit
   Kyty's VS→PS linkage expects). The faulting pair are genuinely **zero-varying** shaders
   (position-only / blit / clear) — so the empty reflection worklist is a *correct* consequence for
   them, not a surfacing bug. (One PS does have a single `sharp[3]` storage-buffer binding.)
+- **Late writer / ordering race** is not the gate: the companion watchpoint saw only zero writes, not
+  a delayed non-null construction. The `[+0x140]` companion is absent by design for this object shape.
 
 ---
 
@@ -182,6 +190,9 @@ shifted across probes — treat offsets as observations, not confirmed semantics
 - `PROSPER_SKIP_NULL_COMPANION` — at `0xba6e08`, skip the null-companion deref (RIP redirect) and log.
 - `PROSPER_NULL_PAGE` — back low-address read faults with a shared zero page; leaves write/call-through
   -null unbacked (the real endpoints). Reveals the whole null-read chain.
+- `PROSPER_WATCH_COMPANION` — at the first `0xba6e08` null read, arm a page-protection
+  write-watchpoint on `[obj+0x140]`, single-step writer faults, and log writer PC/thread plus the
+  post-write slot value. Its first result: only zero writes from reset/memset paths.
 - `PROSPER_FAULTMEM` / `PROSPER_FAULTLOG` — fault-time register/memory dump + logging.
 - `tools/boot_trace` — links all modules, boots headless, prints the unimplemented-call trace +
   register state + module-classified rbp backtrace on fault.
@@ -192,24 +203,30 @@ shifted across probes — treat offsets as observations, not confirmed semantics
 
 ---
 
-## 8. Current plan — stop guessing the mechanism, observe it
+## 8. Current plan — the watchpoint answered; decide whether to keep chasing this wall
 
-Three misses all came from *inferring* Unity's internals. The proposed next step is **ground truth**:
+Four misses all came from *inferring* Unity's internals. The watchpoint supplied the requested ground
+truth and refuted the last ordering theory: `[obj+0x140]` is zero-initialized/reset, never populated
+with a real companion. Combined with the `0xd58710` predicate result, this means the companion is
+legitimately absent for these zero-varying pipelines.
 
-> **Watchpoint the null slot.** Pick the *earliest* null sub-object slot in the chain (not the deep
-> `0x95c823` one). Put a **write-watchpoint** on its address (hardware debug register `DR0–3`, or
-> `mprotect` the page + catch the write — same fault machinery as the probes) and replay the boot.
-> Report: (a) does *anything* ever write that slot? (b) if yes — from what PC/function, storing what,
-> and what were the last few HLE calls before it? (c) if nothing ever writes it — what is the last HLE
-> call before the slot is *read* as null?
+The remaining question is now narrower and harder:
 
-That single observation distinguishes the remaining possibilities **with data instead of a guess**:
-- a write happens but stores null / early-returns → that's the builder; see *why* it produced null;
-- nothing ever writes it → the builder never ran → correlate the expected-write moment against the
-  HLE call trace to find what *should* have triggered it (tests "an AGC call we no-op should populate
-  it");
-- a write comes from a completion/readback path → then (and only then) does "needs real GPU execution"
-  have evidence.
+> Why does the `0xba6e08` reader take the companion-required path for a pipeline whose companion is
+> legitimately absent?
+
+The plausible next probes are reader-side, not writer-side:
+- Watch `[obj+0x1a0]` and the type/mask inputs to prove whether a "processed/no-companion-needed" bit
+  is never set, is reset to zero, or is not the real gate.
+- Disassemble/trace `0xba6720..0xba6e40` enough to prove the exact branch contract before changing
+  any state. A local RIP skip is still only a diagnostic; it is not a correctness fix.
+- Compare the faulting zero-varying pipeline against a non-faulting pipeline that does get a
+  companion, focusing on the reflection records consumed by `0xd58710` and the reader's type remap.
+
+Strategically, this path now has uncertain ROI. The renderer and shader path are already verified
+offscreen; absent new reference evidence for the Unity PS5 reader contract, parking `0xba6e08` as a
+well-characterized Unity-init wall and redirecting effort to present/swapchain, recompiler coverage,
+or a real-shader demonstration frame is defensible.
 
 ### A hypothesis we explicitly do NOT endorse yet
 "These sub-objects are built by **GPU-execution side-effects** we don't perform, so this needs real
