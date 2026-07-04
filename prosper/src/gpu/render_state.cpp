@@ -1,6 +1,7 @@
 // render_state.cpp — see render_state.hpp.
 #include "render_state.hpp"
 #include "pm4_registers.hpp"
+#include "vk_translate.hpp"
 
 namespace prosper::gpu {
 
@@ -60,6 +61,28 @@ RenderState extract_render_state(const GpuState& st) {
     rs.cb_target_mask    = rd(st.cx, P::CB_TARGET_MASK);
 
     return rs;
+}
+
+ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
+    ResolvedPipelineState ps;
+    ps.topology      = static_cast<uint32_t>(vk_topology(rs.prim_type));
+    ps.color0_format = static_cast<uint32_t>(
+        vk_color_format(rs.color0_format, rs.color0_number_type, rs.color0_comp_swap));
+
+    ps.depth_test_enable  = rs.z_enable;
+    ps.depth_write_enable = rs.z_write_enable;
+    ps.depth_compare_op   = vk_compare_op(rs.zfunc);
+
+    ps.blend_enable            = rs.blend_enable;
+    ps.src_color_blend_factor  = vk_blend_factor(rs.color_src_blend);
+    ps.dst_color_blend_factor  = vk_blend_factor(rs.color_dst_blend);
+    ps.color_blend_op          = vk_blend_op(rs.color_comb_fcn);
+
+    // CB_TARGET_MASK holds a 4-bit write mask per MRT; MRT0 is bits [3:0]. RDNA2's R/G/B/A bit order
+    // matches VkColorComponentFlags (R=1,G=2,B=4,A=8), so the nibble maps 1:1.
+    ps.color_write_mask = rs.cb_target_mask & 0xFu;
+
+    return ps;
 }
 
 } // namespace prosper::gpu

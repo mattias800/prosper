@@ -78,6 +78,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_render_state PRIVATE prosper_core)
   add_test(NAME render_state_extract COMMAND test_render_state)
 
+  # Pipeline-state resolution: RenderState (RDNA2 enums) -> Vulkan-ready pipeline state (pure, no Vulkan).
+  add_executable(test_pipeline_state tests/test_pipeline_state.cpp)
+  target_link_libraries(test_pipeline_state PRIVATE prosper_core)
+  add_test(NAME pipeline_state_resolve COMMAND test_pipeline_state)
+
   # RDNA2 shader instruction-stream walker (first stage of the RDNA2->SPIR-V recompiler).
   add_executable(test_rdna2_decode tests/test_rdna2_decode.cpp)
   target_link_libraries(test_rdna2_decode PRIVATE prosper_core)

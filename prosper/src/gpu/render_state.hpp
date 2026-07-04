@@ -53,4 +53,24 @@ struct RenderState {
 // Extract the render-state from a folded GpuState (pure; reads register files only).
 RenderState extract_render_state(const GpuState& st);
 
+// A pipeline's fixed-function state with every RDNA2 enum already translated to its Vulkan value
+// (via vk_translate). All fields are plain integers equal to the corresponding Vk* enumerators, so
+// the Vulkan backend can drop them straight into a VkGraphicsPipelineCreateInfo with no further
+// mapping — and this resolution is unit-testable with no Vulkan dependency (it runs on any host).
+struct ResolvedPipelineState {
+    uint32_t topology         = 0;   // == VkPrimitiveTopology
+    uint32_t color0_format    = 0;   // == VkFormat (0 = VK_FORMAT_UNDEFINED)
+    bool     depth_test_enable  = false;
+    bool     depth_write_enable = false;
+    uint32_t depth_compare_op  = 0;  // == VkCompareOp
+    bool     blend_enable        = false;
+    uint32_t src_color_blend_factor = 0;   // == VkBlendFactor
+    uint32_t dst_color_blend_factor = 0;   // == VkBlendFactor
+    uint32_t color_blend_op         = 0;   // == VkBlendOp
+    uint32_t color_write_mask       = 0xF; // == VkColorComponentFlags (RGBA); MRT0 nibble of CB_TARGET_MASK
+};
+
+// Translate a RenderState's RDNA2 register semantics into Vulkan-ready pipeline state (pure).
+ResolvedPipelineState resolve_pipeline_state(const RenderState& rs);
+
 } // namespace prosper::gpu
