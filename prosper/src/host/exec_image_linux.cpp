@@ -55,9 +55,12 @@ namespace {
     bool g_faultmem = false;
     bool g_faultlog = false;
     int  g_devnull_fd = -1;
-    const char* g_peek_reg = nullptr;   // register name for PROSPER_PEEK (e.g. "r15")
-    uint64_t g_peek_off[16] = {0};      // offsets to read off that register at fault time
-    int      g_peek_n = 0;
+    // PROSPER_PEEK dumps offsets off registers at fault time. Supports N specs separated by ';',
+    // each "reg:off,off,..."; an offset may be prefixed '*' to chase one pointer level first
+    // (e.g. "r15:*0x18+0x0" = read [[r15+0x18]+0x0]).
+    struct PeekSpec { char reg[4]; uint64_t off[12]; bool deref[12]; uint64_t pre[12]; int n; };
+    PeekSpec g_peek[6] = {};
+    int      g_peek_specs = 0;
 
     // Async-signal-safe readability probe: write() to /dev/null returns EFAULT (not a fault) for
     // an unmapped source, so we can test guest addresses without risking a nested SIGSEGV.
@@ -95,21 +98,31 @@ namespace {
                          r.n, (unsigned long long)r.v, part[0], part[1], part[2], part[3]);
             write(2, b, n);
         }
-        // Deep field peek (PROSPER_PEEK="rN:0xoff,0xoff,..."): read specific offsets off one register
-        // to classify a large object beyond the 0x20-byte window above. Env is parsed once at arm
-        // time into g_peek_* (getenv is not signal-safe). Values are read at fault time.
-        if (g_peek_reg) {
+        // Deep field peek (PROSPER_PEEK, parsed once at arm time — getenv is not signal-safe): read
+        // specific offsets off one or more registers to classify a large object beyond the 0x20-byte
+        // window above. See g_peek definition for the syntax.
+        for (int sp = 0; sp < g_peek_specs; sp++) {
+            const PeekSpec& ps = g_peek[sp];
             uint64_t base = 0;
-            for (auto& r : regs) { bool m = true; for (int i=0;i<3;i++) if (r.n[i]!=g_peek_reg[i]&&!(r.n[i]==' '&&g_peek_reg[i]==0)) { m=false; break; } if (m) { base=r.v; break; } }
-            n = snprintf(b, sizeof b, "  PEEK %s=0x%llx:\n", g_peek_reg, (unsigned long long)base);
+            for (auto& r : regs) { bool m = true; for (int i=0;i<3;i++) if (r.n[i]!=ps.reg[i]&&!(r.n[i]==' '&&ps.reg[i]==0)) { m=false; break; } if (m) { base=r.v; break; } }
+            n = snprintf(b, sizeof b, "  PEEK %s=0x%llx:\n", ps.reg, (unsigned long long)base);
             write(2, b, n);
-            for (int k = 0; k < g_peek_n; k++) {
-                uint64_t addr = base + g_peek_off[k];
+            for (int k = 0; k < ps.n; k++) {
+                uint64_t obj = base;
+                if (ps.deref[k]) {   // chase one pointer level: obj = [base + pre]
+                    uint64_t pa = base + ps.pre[k];
+                    if (!probe_readable(pa)) { n = snprintf(b, sizeof b, "    [+0x%llx]-><unmapped>\n", (unsigned long long)ps.pre[k]); write(2,b,n); continue; }
+                    obj = *(const uint64_t*)pa;
+                }
+                uint64_t addr = obj + ps.off[k];
+                const char* pfx = ps.deref[k] ? "*" : "";
                 if (probe_readable(addr))
-                    n = snprintf(b, sizeof b, "    [+0x%llx] = 0x%llx\n",
-                                 (unsigned long long)g_peek_off[k], (unsigned long long)*(const uint64_t*)addr);
+                    n = snprintf(b, sizeof b, "    %s[+0x%llx]@+0x%llx = 0x%llx\n", pfx,
+                                 (unsigned long long)ps.pre[k], (unsigned long long)ps.off[k],
+                                 (unsigned long long)*(const uint64_t*)addr);
                 else
-                    n = snprintf(b, sizeof b, "    [+0x%llx] = <unmapped>\n", (unsigned long long)g_peek_off[k]);
+                    n = snprintf(b, sizeof b, "    %s[+0x%llx]@+0x%llx = <unmapped>\n", pfx,
+                                 (unsigned long long)ps.pre[k], (unsigned long long)ps.off[k]);
                 write(2, b, n);
             }
         }
@@ -255,16 +268,29 @@ void install_trap_handler() {
     g_faultlog = getenv("PROSPER_FAULTLOG") != nullptr;
     if (g_faultmem && g_devnull_fd < 0)
         g_devnull_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
-    // PROSPER_PEEK="r15:0x140,0x1a0,0x1e4c" — parse the register + offsets once (signal-safe at fault).
+    // PROSPER_PEEK="r15:0x140,0x1a0;rbx:0x78,0x88;r15:*0x18+0x0" — N specs (';'), each reg:off[,off];
+    // a '*pre+off' offset chases one pointer level ([[reg+pre]+off]). Parsed once (getenv unsafe at fault).
     if (const char* pk = getenv("PROSPER_PEEK")) {
-        static char reg[4] = {0};
-        const char* colon = strchr(pk, ':');
-        if (colon && colon - pk <= 3) {
-            for (const char* c = pk; c < colon; c++) reg[c - pk] = *c;
-            g_peek_reg = reg;
-            const char* s = colon + 1;
-            while (*s && g_peek_n < 16) { g_peek_off[g_peek_n++] = strtoull(s, nullptr, 0);
-                const char* comma = strchr(s, ','); if (!comma) break; s = comma + 1; }
+        const char* spec = pk;
+        while (*spec && g_peek_specs < 6) {
+            const char* semi = strchr(spec, ';');
+            const char* end  = semi ? semi : spec + strlen(spec);
+            const char* colon = strchr(spec, ':');
+            if (colon && colon < end && colon - spec <= 3) {
+                PeekSpec& ps = g_peek[g_peek_specs++];
+                for (const char* c = spec; c < colon; c++) ps.reg[c - spec] = *c;
+                const char* s = colon + 1;
+                while (s < end && ps.n < 12) {
+                    if (*s == '*') { ps.deref[ps.n] = true; s++;
+                        ps.pre[ps.n] = strtoull(s, nullptr, 0);
+                        const char* plus = strchr(s, '+');
+                        ps.off[ps.n] = (plus && plus < end) ? strtoull(plus + 1, nullptr, 0) : 0;
+                    } else ps.off[ps.n] = strtoull(s, nullptr, 0);
+                    ps.n++;
+                    const char* comma = strchr(s, ','); if (!comma || comma >= end) break; s = comma + 1;
+                }
+            }
+            if (!semi) break; spec = semi + 1;
         }
     }
     install_sigaltstack();

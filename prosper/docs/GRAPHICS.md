@@ -100,6 +100,44 @@ initializers to construct valid GPU objects (correctness-first — no plausible-
 - Graphics libs are sparsely documented; most NIDs don't resolve to names — reverse-engineer from
   call args (`PROSPER_GFXLOG`) and `build-linux/tools/pltm` (maps a module GOT offset → NID).
 
+## ⚠ RE UPDATE (2026-07-04): the 0xba6e08 object is a Unity PIPELINE object, and NO resource-creation call feeds [+0x140]
+
+Investigating the resource-layer integration (gpu_resources.hpp contract) turned up evidence that
+**contradicts the "hook one AGC resource-creation NID → store handle at [obj+0x140]" plan** — flagging
+for the back-half agent before writing integration code (per "flag it rather than edit silently").
+
+Findings (via the multi-spec/deref `PROSPER_PEEK`, see below):
+- **No AGC/Gnm resource-creation call fires before the fault.** The complete graphics-call set in the
+  run is register setup (`23LRUSvYu1M`/`BfBDZGbti7A`/`H7uZqCoNuWk`/register-indirect triplets), the
+  register-context builders (now implemented), and `Zw7uUVPulbw`. The only unimplemented graphics
+  calls at fault are 5 pre-graphics `libSceVideoOut` queries. There is no texture/buffer/`createResource`
+  call with a `(gpu_addr, size, width, height, format)` shape anywhere in the trace.
+- **`Zw7uUVPulbw` is a red herring** — disassembly of its consumer (`eboot+0x14dfb04`) shows a
+  GPU-timing/profiler loop (computes frametimes: `×0xf4240`, reciprocal-divide, `vcvtsi2ss`→float,
+  stored to a ring at `rbx+0xc40`). It does not gate resource upload.
+- **The fault object is a Unity pipeline/material object, not a texture/buffer.** `PROSPER_PEEK` of the
+  faulting `r15` (`0x…e2c300`, game-heap): `[+0]=0x2b`, `[+8]=0xf`, `[+0x20]=7`, `[+0x28]=0x19`,
+  `[+0x18]==[+0x40]`→ a shared sub-object holding **packed register-like fields** (`[+0x10]=0x28a7…000e`,
+  `[+0x18]=0xbba2…002b`). `[+0x140]` (the GPU-backing companion, deref'd as `[+0x08]`/`[+0x40]` byte)
+  is null; `[+0x520]/[+0x530]` (an array ptr/count) are 0. It sits in a **3-element collection**
+  (outer `rbx`: array@`+0x78`, count@`+0x88`=3).
+- The deref is **residency-gated**: `0xba6e08` is reached only for resources whose remapped type is in
+  mask `bt 0xc8220` (specific formats) AND whose flag `[+0x1a0]==0` ("not resident"). So this is a
+  GPU-residency check that assumes an upload/creation step already populated `[+0x140]`.
+
+**Interpretation:** Unity's resource-upload/creation path (which on PS5 would allocate GPU memory +
+build a descriptor and set `[+0x140]`) either never ran or was no-op'd by our stubs — but it is *not*
+a direct game→AGC `createResource` call we can hook. Populating `[+0x140]` with a fabricated handle to
+"advance the boot" would be a correctness-first violation (a fake that moves the fault deeper).
+**Proposed next step (needs back-half input):** trace Unity's texture/pipeline upload path to find the
+real creation site (likely built from the shader/pipeline AGC calls already implemented +
+direct-memory allocation), then wire `resource_create()` there. The `ResourceDesc` contract looks
+right for the *eventual* texture case; this specific object is a pipeline object whose companion may
+warrant a distinct `ResourceKind`. Left unresolved pending that trace rather than guess-fabricated.
+
+Tooling: `PROSPER_PEEK` now takes multiple `;`-separated specs and a `*pre+off` one-level pointer
+chase (`[[reg+pre]+off]`), for classifying linked object graphs at fault time.
+
 ## ▶ NEXT FRONTIER (2026-07-04): past all AGC HLE → Unity GPU-resource residency (needs real backing)
 
 After CreateShader + the CommandProcessor submit path (below), the boot advances through the entire
