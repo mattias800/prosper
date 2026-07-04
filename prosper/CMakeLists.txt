@@ -79,6 +79,12 @@ if(TARGET prosper_core)
   add_executable(shader_histo tools/shader_histo/shader_histo.cpp)
   target_link_libraries(shader_histo PRIVATE prosper_core)
 
+  # AGC→Vulkan resource layer: the front-half↔back-half contract (gpu_resources.hpp). Registry
+  # behavior is fixed here so both halves integrate against a stable API. Pure/cross-platform.
+  add_executable(test_gpu_resources tests/test_gpu_resources.cpp)
+  target_link_libraries(test_gpu_resources PRIVATE prosper_core)
+  add_test(NAME gpu_resource_registry COMMAND test_gpu_resources)
+
   # M2+: real memory mapping, trap, boot, and the boot-trace debug tool (Linux only).
   if(UNIX AND NOT APPLE)
     add_executable(boot_trace tools/boot_trace/boot_trace.cpp)
