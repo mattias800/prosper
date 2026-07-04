@@ -273,6 +273,31 @@ HLE(agc_create_shader) {  // (Shader** dst, void* header, const void* code)
                 agc_shaders().size(), (void*)h, (void*)code, h->type, h->target, h->shader_size,
                 h->num_cx_registers, h->num_sh_registers, (int)patched);
 
+    // Semantic surfacing probe (PROSPER_PIPETRACE): the VS->PS linkage predicate (eboot+0xd58710)
+    // scans input/output semantics; a short/empty set leaves the pipeline reflection table empty and
+    // the [+0x140] companion uncreated (the 0xba6e08 fault). Log the counts + the relocated arrays'
+    // first entries so we can see whether the metadata we surface is real.
+    if (getenv("PROSPER_PIPETRACE")) {
+        fprintf(stderr, "  [sem] type=%u num_in=%u num_out=%u in_sem=%p out_sem=%p\n",
+                h->type, h->num_input_semantics, h->num_output_semantics,
+                (void*)h->input_semantics, (void*)h->output_semantics);
+        auto dump = [](const char* tag, const void* arr, uint32_t n) {
+            if (!arr || n == 0 || n > 64) { fprintf(stderr, "    %s: (none)\n", tag); return; }
+            const uint32_t* s = (const uint32_t*)arr;
+            fprintf(stderr, "    %s[%u]:", tag, n);
+            for (uint32_t i = 0; i < n && i < 8; i++) fprintf(stderr, " %08x", s[i]);
+            fprintf(stderr, "\n");
+        };
+        dump("in ", h->input_semantics,  h->num_input_semantics);
+        dump("out", h->output_semantics, (uint32_t)h->num_output_semantics);
+        // Raw header count region (0x50..0x5f) to confirm counts are read from the real blob, not a
+        // relocation artifact: num_input_semantics u32@0x50, num_output_semantics u16@0x56.
+        const uint8_t* hb = (const uint8_t*)h;
+        fprintf(stderr, "    raw[0x50..0x5f]:");
+        for (int i = 0x50; i < 0x60; i++) fprintf(stderr, " %02x", hb[i]);
+        fprintf(stderr, "\n");
+    }
+
     agc_shaders().push_back(h);
     *dst = h;               // <- the write our old stub omitted; populates the shader-registry slots
     return 0;
@@ -383,6 +408,10 @@ HLE(agc_create_interpolant_mapping) {  // (ShaderRegister regs[32], const Shader
     const auto* gs_out = (const AgcShaderSemantic*)gs->output_semantics;
     const auto* ps_in  = ps ? (const AgcShaderSemantic*)ps->input_semantics : nullptr;
     uint32_t n = ps ? ps->num_input_semantics : (uint32_t)gs->num_output_semantics;
+    if (getenv("PROSPER_PIPETRACE"))
+        fprintf(stderr, "  [interp] gs.num_out=%u ps=%p ps.num_in=%u -> mapping %u interpolants\n",
+                (uint32_t)gs->num_output_semantics, (void*)ps,
+                ps ? ps->num_input_semantics : 0u, n);
     for (uint32_t i = 0; i < 32; i++) {
         regs[i].offset = SPI_PS_INPUT_CNTL_0 + i;
         uint32_t value = 0;
