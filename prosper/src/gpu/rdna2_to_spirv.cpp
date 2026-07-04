@@ -31,7 +31,7 @@ enum : uint32_t {
     Op_SelectionMerge=247, Op_Label=248, Op_Branch=249, Op_BranchConditional=250, Op_Return=253,
 };
 // GLSL.std.450 extended-instruction numbers.
-enum : uint32_t { Glsl_Trunc=3, Glsl_Floor=8, Glsl_Ceil=9, Glsl_Fract=10, Glsl_Exp2=29, Glsl_Log2=30,
+enum : uint32_t { Glsl_RoundEven=2, Glsl_Trunc=3, Glsl_Floor=8, Glsl_Ceil=9, Glsl_Fract=10, Glsl_Exp2=29, Glsl_Log2=30,
                   Glsl_Sqrt=31, Glsl_InverseSqrt=32, Glsl_FMin=37, Glsl_UMin=38, Glsl_SMin=39, Glsl_FMax=40,
                   Glsl_UMax=41, Glsl_SMax=42, Glsl_PackHalf2x16=58, Glsl_UnpackHalf2x16=62 };
 enum : uint32_t {
@@ -146,6 +146,21 @@ struct SpirvCompute {
     uint32_t unpack_half(uint32_t dword, uint32_t which) {
         uint32_t vec = id(); putv(code, Op_ExtInst, {t_v2f(), vec, glsl, Glsl_UnpackHalf2x16, dword});
         uint32_t f = id(); put(code, Op_CompositeExtract, {t_f32, f, vec, which}); return bcu(f);
+    }
+    // Inverse of unpack_norm: pack a float VGPR (bits) into a `bits`-wide UNORM/SNORM integer field:
+    // clamp to [0,1] (unsigned) or [-1,1] (signed), scale by `norm`, round-to-nearest-even, mask to width.
+    uint32_t pack_norm(uint32_t fbits, uint32_t bits, bool is_signed, float norm) {
+        uint32_t lo = bcu(fconstf(is_signed ? -1.0f : 0.0f)), hi = bcu(fconstf(1.0f));
+        uint32_t clamped = fext2(Glsl_FMax, fext2(Glsl_FMin, fbits, hi), lo);
+        uint32_t scaled  = fbin(Op_FMul, clamped, bcu(fconstf(norm)));
+        uint32_t rounded = fext1(Glsl_RoundEven, scaled);
+        uint32_t ival    = is_signed ? cvt_f2i(rounded) : cvt_f2u(rounded);
+        uint32_t mask    = (bits >= 32) ? 0xFFFFFFFFu : ((1u << bits) - 1u);
+        return ibin(Op_BitwiseAnd, ival, uconst(mask));
+    }
+    // Pack a float into the low 16 bits as an f16 (inverse of unpack_half low half).
+    uint32_t pack_half_lo(uint32_t fbits) {
+        return ibin(Op_BitwiseAnd, pack_half2x16(fbits, bcu(fconstf(0.0f))), uconst(0xFFFFu));
     }
 
     // Combined image+sampler support (MIMG image_sample). One float-2D OpTypeImage/OpTypeSampledImage
@@ -927,17 +942,33 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             addr = b.ibin(Op_IAdd, addr, val(in.src[2]));              // SOFFSET
             uint32_t idx = b.ibin(Op_ShiftRightLogical, addr, b.uconst(2));
             if (is_store) {
-                // Store the VDATA VGPRs (in.dst..+n-1) to the buffer. Only raw/Float32 (4-byte) stores
-                // are implemented; packed-format packing (unorm/snorm/f16) is deferred, not faked.
-                if (packed) { ok = false; return true; }
-                for (uint32_t k = 0; k < n; k++) {
-                    uint32_t kidx = k ? b.ibin(Op_IAdd, idx, b.uconst(k)) : idx;
-                    int s = in.dst.value + (int)k;
-                    auto it = rs.vreg.find(s);
-                    uint32_t val_bits = (it == rs.vreg.end()) ? b.uconst(0) : it->second;
-                    // Under a narrowed EXEC (e.g. after v_cmpx), inactive lanes must not write — emit a
-                    // real conditional store; when EXEC is full, store unconditionally.
-                    b.cbuf_store(kidx, val_bits, slot, rs.exec_narrowed, rs.exec);
+                // Store the VDATA VGPRs (in.dst..+n-1). Integer sub-dword formats (Uint8/Sint8/...) have
+                // no packing path here -> reject rather than mis-store (packed && norm==0 was caught above).
+                auto vread = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
+                if (!packed) {
+                    // Raw/Float32/Uint32: one dword per component.
+                    for (uint32_t k = 0; k < n; k++) {
+                        uint32_t kidx = k ? b.ibin(Op_IAdd, idx, b.uconst(k)) : idx;
+                        b.cbuf_store(kidx, vread(in.dst.value + (int)k), slot, rs.exec_narrowed, rs.exec);
+                    }
+                } else {
+                    // Packed UNORM/SNORM/Float16: pack the components tightly into ceil(n*bytes/4) dwords
+                    // (inverse of the packed load). Each dword ORs together the fields that land in it.
+                    const uint32_t dwords = (n * comp_bytes + 3) / 4;
+                    for (uint32_t d = 0; d < dwords; d++) {
+                        uint32_t acc = b.uconst(0);
+                        for (uint32_t k = 0; k < n; k++) {
+                            uint32_t byte_off = k * comp_bytes;
+                            if (byte_off / 4 != d) continue;
+                            uint32_t field = is_half ? b.pack_half_lo(vread(in.dst.value + (int)k))
+                                                     : b.pack_norm(vread(in.dst.value + (int)k), comp_bytes * 8, is_snorm, norm);
+                            uint32_t sh = (byte_off % 4) * 8;
+                            if (sh) field = b.ibin(Op_ShiftLeftLogical, field, b.uconst(sh));
+                            acc = b.ibin(Op_BitwiseOr, acc, field);
+                        }
+                        uint32_t did = d ? b.ibin(Op_IAdd, idx, b.uconst(d)) : idx;
+                        b.cbuf_store(did, acc, slot, rs.exec_narrowed, rs.exec);
+                    }
                 }
                 return true;
             }
