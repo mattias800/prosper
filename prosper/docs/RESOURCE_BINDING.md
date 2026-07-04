@@ -88,8 +88,29 @@ lives front-half (it owns the descriptor bit layout); the recompiler only consum
    verify the exact numbers. Integer sub-dword formats (Uint8/Sint8/…) are still rejected (no
    integer-attribute path yet) rather than mis-normalized.
 4. **MIMG `image_sample`/`image_load`.** Bind a Vulkan sampled image + sampler from the T#/S#;
-   emit `OpImageSampleImplicitLod`. Test: sample a known 2×2 texture. *(Next — needs the front-half
-   to extract T#/S# descriptors; agent 2 does this when the recompiler reaches MIMG.)*
+   emit `OpImageSampleImplicitLod`. Test: sample a known 2×2 texture. **DONE** — combined image+sampler
+   (`OpTypeImage`/`OpTypeSampledImage`); `image_sample` (0x20, implicit LOD), `image_sample_lz` (0x27,
+   LOD 0) / `image_sample_l` (0x24, explicit LOD) via `OpImageSampleExplicitLod`, `image_load` (0x00)
+   via `OpImageFetch`; T# resolved through the same SRSRC provenance as vertex buffers (SMEM x8 tags it).
+   Tests: `texture_sample_render` (2×2 texel, u/v routing + LOD variant + fetch) and `textured_interp_
+   render` (VS-interpolated UVs → sample, the full textured-draw path). 2D float non-NSA; other dims /
+   NSA / gradient / compare-shadow variants deferred (rejected, not faked).
+
+## Beyond the staged plan (also DONE this line of work)
+
+- **MUBUF stores** — `buffer_store_dword/x2/x4` + `buffer_store_format_*` (raw/Float32), with a real
+  **EXEC-predicated conditional store** (selection-merge on the per-lane EXEC bool) + `robustBufferAccess`.
+- **VINTRP** — pixel-shader attribute interpolation: VS `EXP PARAM_n` → Output varying, PS
+  `v_interp_p1/p2/mov` → interpolated Input varying (deferred EntryPoint so varyings join the interface).
+- **`s_cbranch_execz` guard-to-`s_endpgm`** linearization; **SCC** (`s_cmp`/`s_cselect`).
+
+**Status:** the recompiler covers the full shape of a real textured, interpolated, buffer-reading/
+writing draw. The remaining gap to recompiling the game's *own* format-dependent shaders is not the
+recompiler — it is the **resource table**, which `build_shader_resources` (agc_shader_layout) can only
+fill from the shader's *bound user-data SGPRs* (V#/T#/S# descriptors), which the game sets at DRAW time.
+So it is gated on the game reaching draw submission = the parked GfxDevice boot wall (front-half). The
+table-less coverage metric (~74%) therefore *understates* real render-path coverage: every MIMG /
+`buffer_load_format` "blocker" it reports is a shape the recompiler already handles given a table.
 
 Stage 2 was the high-value unlock (real VS recompile → real VS+PS frames from the game). Stages 1–3
 depend only on this contract + the front-half filling the table for constant/vertex buffers; stage 4
