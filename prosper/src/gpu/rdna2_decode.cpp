@@ -93,6 +93,19 @@ void decode_operands(Rdna2Inst& i) {
             i.src[0] = sgpr((w & 0x3Fu) << 1);       // SBASE (pair base)
             i.literal = i.words[1] & 0x1FFFFFu;       // immediate byte offset (not a trailing constant)
             i.n_src = 1; break;
+        case Rdna2Format::MUBUF: {
+            // Untyped buffer op. opcode[24:18]; VDATA (dest/src VGPR) d1[15:8]; VADDR d1[7:0];
+            // SRSRC (V# descriptor base SGPR, field ×4) d1[20:16]; SOFFSET d1[30:24]. 12-bit inst
+            // offset d0[11:0] + offen d0[12] + idxen d0[13] packed into `literal`.
+            const uint32_t d1 = i.words[1];
+            i.opcode = (w >> 18) & 0x7Fu;
+            i.dst    = vgpr(d1 >> 8);                          // VDATA
+            i.src[0] = vgpr(d1);                              // VADDR
+            i.src[1] = sgpr(((d1 >> 16) & 0x1Fu) << 2);       // SRSRC (descriptor base)
+            i.src[2] = decode_src_field((d1 >> 24) & 0x7Fu);  // SOFFSET
+            i.literal = (w & 0xFFFu) | (((w >> 12) & 1u) << 12) | (((w >> 13) & 1u) << 13);
+            i.n_src = 3; break;
+        }
         default: break;   // MUBUF/MTBUF/MIMG/DS/FLAT/VINTRP: operands not decoded at this stage
     }
 }

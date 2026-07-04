@@ -619,6 +619,34 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rs.sreg[in.dst.value + (int)k] = b.cbuf_load(b.uconst(base_idx + k));
             return true;
         }
+        case Rdna2Format::MUBUF: {
+            // Untyped buffer LOAD — the per-lane fetch mechanism (vertex fetch et al.). Modeled as a
+            // per-lane load from the bound constant buffer: byte addr = (offen ? VADDR : 0) + SOFFSET
+            // + inst-offset; index = addr>>2; N dwords -> VDATA..+N-1. Descriptor (SRSRC), idxen*stride,
+            // and the format-converting buffer_load_format_* variants are deferred. Compute-only (cbuf).
+            if (!allow_smem) { ok = false; return true; }
+            uint32_t n = 0;
+            switch (in.opcode) {
+                case 0xC: n = 1; break;   // buffer_load_dword
+                case 0xD: n = 2; break;   // buffer_load_dwordx2
+                case 0xE: n = 4; break;   // buffer_load_dwordx4
+                default: ok = false; return true;   // stores / format / typed not yet
+            }
+            uint32_t offset = in.literal & 0xFFFu;
+            bool offen = (in.literal >> 12) & 1u;
+            uint32_t addr = b.uconst(offset);
+            if (offen) addr = b.ibin(Op_IAdd, addr, val(in.src[0]));   // per-lane VADDR (byte offset)
+            addr = b.ibin(Op_IAdd, addr, val(in.src[2]));              // SOFFSET
+            uint32_t idx = b.ibin(Op_ShiftRightLogical, addr, b.uconst(2));
+            for (uint32_t k = 0; k < n; k++) {
+                uint32_t kidx = k ? b.ibin(Op_IAdd, idx, b.uconst(k)) : idx;
+                int d = in.dst.value + (int)k;
+                uint32_t old = vreg_old(b, rs, d);
+                rs.vreg[d] = b.cbuf_load(kidx);
+                predicate_write(b, rs, d, old);
+            }
+            return true;
+        }
         default: return false;   // not a VALU format
     }
 }
