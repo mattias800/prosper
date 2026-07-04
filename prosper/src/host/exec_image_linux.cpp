@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <cstdint>
 #include <map>
 #include <mutex>
@@ -54,6 +55,9 @@ namespace {
     bool g_faultmem = false;
     bool g_faultlog = false;
     int  g_devnull_fd = -1;
+    const char* g_peek_reg = nullptr;   // register name for PROSPER_PEEK (e.g. "r15")
+    uint64_t g_peek_off[16] = {0};      // offsets to read off that register at fault time
+    int      g_peek_n = 0;
 
     // Async-signal-safe readability probe: write() to /dev/null returns EFAULT (not a fault) for
     // an unmapped source, so we can test guest addresses without risking a nested SIGSEGV.
@@ -90,6 +94,24 @@ namespace {
             n = snprintf(b, sizeof b, "  %s=0x%llx -> [0]=%s [8]=%s [10]=%s [18]=%s\n",
                          r.n, (unsigned long long)r.v, part[0], part[1], part[2], part[3]);
             write(2, b, n);
+        }
+        // Deep field peek (PROSPER_PEEK="rN:0xoff,0xoff,..."): read specific offsets off one register
+        // to classify a large object beyond the 0x20-byte window above. Env is parsed once at arm
+        // time into g_peek_* (getenv is not signal-safe). Values are read at fault time.
+        if (g_peek_reg) {
+            uint64_t base = 0;
+            for (auto& r : regs) { bool m = true; for (int i=0;i<3;i++) if (r.n[i]!=g_peek_reg[i]&&!(r.n[i]==' '&&g_peek_reg[i]==0)) { m=false; break; } if (m) { base=r.v; break; } }
+            n = snprintf(b, sizeof b, "  PEEK %s=0x%llx:\n", g_peek_reg, (unsigned long long)base);
+            write(2, b, n);
+            for (int k = 0; k < g_peek_n; k++) {
+                uint64_t addr = base + g_peek_off[k];
+                if (probe_readable(addr))
+                    n = snprintf(b, sizeof b, "    [+0x%llx] = 0x%llx\n",
+                                 (unsigned long long)g_peek_off[k], (unsigned long long)*(const uint64_t*)addr);
+                else
+                    n = snprintf(b, sizeof b, "    [+0x%llx] = <unmapped>\n", (unsigned long long)g_peek_off[k]);
+                write(2, b, n);
+            }
         }
     }
 
@@ -233,6 +255,18 @@ void install_trap_handler() {
     g_faultlog = getenv("PROSPER_FAULTLOG") != nullptr;
     if (g_faultmem && g_devnull_fd < 0)
         g_devnull_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    // PROSPER_PEEK="r15:0x140,0x1a0,0x1e4c" — parse the register + offsets once (signal-safe at fault).
+    if (const char* pk = getenv("PROSPER_PEEK")) {
+        static char reg[4] = {0};
+        const char* colon = strchr(pk, ':');
+        if (colon && colon - pk <= 3) {
+            for (const char* c = pk; c < colon; c++) reg[c - pk] = *c;
+            g_peek_reg = reg;
+            const char* s = colon + 1;
+            while (*s && g_peek_n < 16) { g_peek_off[g_peek_n++] = strtoull(s, nullptr, 0);
+                const char* comma = strchr(s, ','); if (!comma) break; s = comma + 1; }
+        }
+    }
     install_sigaltstack();
     struct sigaction sa{};
     sa.sa_sigaction = fault_handler;

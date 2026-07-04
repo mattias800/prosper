@@ -100,6 +100,34 @@ initializers to construct valid GPU objects (correctness-first — no plausible-
 - Graphics libs are sparsely documented; most NIDs don't resolve to names — reverse-engineer from
   call args (`PROSPER_GFXLOG`) and `build-linux/tools/pltm` (maps a module GOT offset → NID).
 
+## ▶ NEXT FRONTIER (2026-07-04): past all AGC HLE → Unity GPU-resource residency (needs real backing)
+
+After CreateShader + the CommandProcessor submit path (below), the boot advances through the entire
+AGC command frontend and now faults **with ZERO unimplemented libSceAgc calls remaining** (only 5
+pre-graphics libSceVideoOut queries stay stubbed, tolerated). The command buffer executes:
+`sceAgcDriverSubmitDcb` → `gpu::run_command_buffer` folds it into a GpuState (verified: "SubmitDcb #1:
+71 dwords -> 12 packets applied"). Unity then proceeds to load `unity default resources`.
+
+**The fault: `eboot+0xba6e08`**, a Unity `GfxDevice` routine (`eboot+0xba6720`, reached via the
+`0xd3xxxx`/`0xd4xxxx`/`0x15fxxxx` GfxDevice chain) iterating a resource list. For a resource whose
+type is in a specific mask (`bt 0xc8220`) and whose flag `[obj+0x1a0]==0`, it reads a GPU-backing
+pointer `[obj+0x140]` and dereferences `[that+0x08]` → SIGSEGV at addr 0x8 because `[obj+0x140]` is
+null. `PROSPER_PEEK="r15:0x140,0x1a0,0x520,0x530"` at fault shows the object (a **game-heap**
+allocation `0x…e2c300`, i.e. Unity's own, not one of our zeroed singletons) is only partially
+initialized: `[+0]=0x2b`, `[+0x140]=0`, `[+0x1a0]=0`, `[+0x520]=0` (array ptr), `[+0x530]=0` (count).
+
+**Diagnosis:** this is no longer an AGC-HLE gap — it is the **AGC→Vulkan resource-backing boundary**.
+Unity created a resource object but its GPU-side backing (`+0x140`) was never populated, because our
+AGC resource path returns handles/zeros without constructing real GPU objects. Pushing past this
+means the real GPU resource layer (textures/buffers/render targets backed by Vulkan), which is the
+M4/M5 work in the "Recommended implementation order" below — largely the back-half (render_state /
+vk_translate / command_processor → live Vulkan resources) now fed by real submitted command buffers.
+Fabricating a `+0x140` object would be a correctness-first violation (a fake that moves the fault
+deeper), so this is the point to build the real resource backend rather than stub further.
+
+New diagnostic: `PROSPER_PEEK="rN:0xoff,0xoff,…"` (exec_image_linux.cpp) reads arbitrary offsets off a
+register at fault time — for classifying large objects past FAULTMEM's 0x20-byte window.
+
 ## ✅ THE BOOT BLOCKER — RESOLVED (2026-07-04): the "source" is the Shader; CreateShader was the gap
 
 **Resolution (supersedes the "SDK-gated / parked" conclusion below).** The null register-source

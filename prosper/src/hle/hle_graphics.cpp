@@ -125,6 +125,7 @@ const char* const kAgcNids[] = {
     "f3dg2CSgRKY", "hvUfkUIQcOE", "6lNcCp+fxi4", "vRoArM9zaIk", "0fWWK5uG9rQ", "3KDcnM3lrcU",
     "57labkp+rSQ", "LtTouSCZjHM", "V++UgBtQhn0", "aJf+j5yntiU", "fPSCdQxgpSw", "i1jyy49AjXU",
     "tSBxhAPyytQ",   // fires once after the Sh patch pair during CreateWorkload; not in Kyty — RE via args
+    "k3GhuSNmBLU",   // fires once just before "unity default resources" load; not in Kyty — RE via args
 };
 constexpr size_t kAgcNidCount = sizeof(kAgcNids) / sizeof(kAgcNids[0]);
 
