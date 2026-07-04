@@ -3,6 +3,7 @@
 #include "rdna2_decode.hpp"
 #include <cstring>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace prosper::gpu {
 namespace {
@@ -285,6 +286,48 @@ inline uint32_t vreg_old(SpirvCompute& b, RegState& rs, int idx) {
     auto it = rs.vreg.find(idx); return it == rs.vreg.end() ? b.uconst(0) : it->second;
 }
 
+bool sopp_is_noop(const Rdna2Inst& in) {
+    if (in.fmt != Rdna2Format::SOPP) return false;
+    switch (in.opcode) {
+        case 0x00:   // s_nop
+        case 0x0c:   // s_waitcnt
+        case 0x20:   // s_inst_prefetch
+        case 0x21:   // s_clause
+        case 0x22:   // s_wait_idle
+        case 0x7d:   // s_waitcnt_vscnt
+            return true;
+        default:
+            return false;
+    }
+}
+
+std::unordered_set<uint32_t> safe_execz_branches(const std::vector<Rdna2Inst>& ins) {
+    std::unordered_set<uint32_t> safe;
+    for (const auto& br : ins) {
+        if (br.fmt != Rdna2Format::SOPP || br.opcode != 0x08 || br.simm16 <= 0) continue;
+        const uint32_t target = br.pc + br.len_dwords + (uint32_t)br.simm16;
+        bool ok = target > br.pc;
+        bool target_found = false;
+        for (const auto& in : ins) {
+            if (in.pc == target) { target_found = true; break; }
+        }
+        if (!target_found) ok = false;
+        for (const auto& in : ins) {
+            if (in.pc <= br.pc || in.pc >= target || in.is_end) continue;
+            // Only VGPR writes are made EXEC-preserving by predicate_write(); scalar/VCC/memory/export
+            // side effects would still happen under linearization, so they are not safe to skip.
+            if (in.fmt == Rdna2Format::VOP1 || in.fmt == Rdna2Format::VOP2 || in.fmt == Rdna2Format::VOP3 ||
+                sopp_is_noop(in)) {
+                continue;
+            }
+            ok = false;
+            break;
+        }
+        if (ok) safe.insert(br.pc);
+    }
+    return safe;
+}
+
 // Resolve an operand to its raw 32-bit value (bits). Float ops bitcast these to float.
 uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, const Operand& o) {
     switch (o.kind) {
@@ -300,7 +343,8 @@ uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, const 
 // Emit one ALU instruction (VOP1/2/C/3 or SOP1/2) into `b`, updating `rs`. Returns true if `in` is an
 // ALU format handled here; sets ok=false if it is an ALU op this stage doesn't support yet. Non-ALU
 // formats (EXP/memory/...) return false so the stage-specific caller can handle them.
-bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool allow_exec_update) {
+bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool allow_exec_update,
+              const std::unordered_set<uint32_t>* safe_execz = nullptr) {
     auto& vreg = rs.vreg; uint32_t& vcc = rs.vcc;
     auto val = [&](const Operand& o) { return operand_bits(b, rs, in, o); };
     switch (in.fmt) {
@@ -527,6 +571,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     break;
                 case 0x08:                                          // s_cbranch_execz
                     if (in.simm16 < 0) ok = false;                 // backward = loop -> unsupported
+                    else if (rs.exec_narrowed && (!safe_execz || !safe_execz->count(in.pc))) ok = false;
                     break;                                          // forward = no-op (predication covers it)
                 case 0x04: case 0x05:                              // s_cbranch_scc0 / scc1
                 case 0x06: case 0x07:                              // s_cbranch_vccz / vccnz
@@ -549,12 +594,13 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
     SpirvCompute b;
     b.begin(num_inputs ? num_inputs : 1);
     RegState rs; rs.vcc = b.bfalse(); rs.exec = b.btrue();
+    auto safe_branches = safe_execz_branches(ins);
     for (uint32_t k = 0; k < num_inputs; k++) rs.vreg[(int)k] = b.load_input(k);
 
     for (const auto& in : ins) {
         if (in.is_end) break;
         bool ok = true;
-        if (!emit_alu(b, rs, in, ok, true) || !ok) return {};   // compute kernels are pure ALU
+        if (!emit_alu(b, rs, in, ok, true, &safe_branches) || !ok) return {};   // compute kernels are pure ALU
     }
 
     auto it = rs.vreg.find((int)out_vgpr);
@@ -573,6 +619,7 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
     // A scratch builder/state so emit_alu can run; its emitted code is discarded — we only want `ok`.
     SpirvCompute b; b.begin(1);
     RegState rs; rs.vcc = b.bfalse(); rs.exec = b.btrue();
+    auto safe_branches = safe_execz_branches(ins);
 
     RecompileCoverage cov;
     for (const auto& in : ins) {
@@ -580,7 +627,7 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
         cov.total++;
         if (in.fmt == Rdna2Format::EXP) { cov.exports++; continue; }   // handled by the stage recompilers
         bool ok = true;
-        bool handled = emit_alu(b, rs, in, ok, /*allow_exec_update*/true) && ok;
+        bool handled = emit_alu(b, rs, in, ok, /*allow_exec_update*/true, &safe_branches) && ok;
         if (handled) { cov.alu++; }
         else {
             cov.unsupported++;
@@ -597,6 +644,7 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords) {
     SpirvCompute b;
     b.begin_fragment();
     RegState rs; rs.vcc = b.bfalse(); rs.exec = b.btrue();
+    auto safe_branches = safe_execz_branches(ins);
     bool exported = false;
 
     for (const auto& in : ins) {
@@ -612,7 +660,7 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords) {
         bool ok = true;
         // Graphics-stage exports do not yet model EXEC-masked export/discard, so reject cmpx for now
         // instead of accepting a shader that would export from inactive lanes.
-        if (!emit_alu(b, rs, in, ok, false) || !ok) return {};
+        if (!emit_alu(b, rs, in, ok, false, &safe_branches) || !ok) return {};
     }
     if (!exported) return {};
     return b.finish();
@@ -625,6 +673,7 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords) {
     SpirvCompute b;
     b.begin_vertex();
     RegState rs; rs.vcc = b.bfalse(); rs.exec = b.btrue();
+    auto safe_branches = safe_execz_branches(ins);
     rs.vreg[0] = b.load_vertex_index();     // VS ABI: v0 = vertex index
     bool exported = false;
 
@@ -641,7 +690,7 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords) {
         bool ok = true;
         // Graphics-stage exports do not yet model EXEC-masked export/discard, so reject cmpx for now
         // instead of accepting a shader that would export from inactive lanes.
-        if (!emit_alu(b, rs, in, ok, false) || !ok) return {};
+        if (!emit_alu(b, rs, in, ok, false, &safe_branches) || !ok) return {};
     }
     if (!exported) return {};
     return b.finish();

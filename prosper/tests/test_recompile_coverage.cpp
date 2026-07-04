@@ -37,6 +37,15 @@ int main() {
     CHECK(recompile_valu(vcc_branch, sizeof(vcc_branch)/sizeof(vcc_branch[0]), 2, 3).empty(),
           "the production recompiler rejects the unsafe forward VCC branch");
 
+    // Even s_cbranch_execz is only safe to linearize when the skipped block is made of EXEC-predicated
+    // VGPR writes. Scalar writes are not protected by predicate_write(), so reject that shape.
+    const uint32_t execz_scalar[] = { 0x7da80300u, 0xbf880001u, 0xbe800381u, 0xBF810000u };
+    RecompileCoverage d = recompile_coverage(execz_scalar, sizeof(execz_scalar)/sizeof(execz_scalar[0]));
+    CHECK(d.unsupported == 1 && d.first_bad_fmt >= 0 && d.first_bad_op == 0x08,
+          "a narrowed EXEC branch over scalar state is rejected");
+    CHECK(recompile_valu(execz_scalar, sizeof(execz_scalar)/sizeof(execz_scalar[0]), 2, 0).empty(),
+          "the production recompiler rejects execz branches that would skip scalar writes");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
