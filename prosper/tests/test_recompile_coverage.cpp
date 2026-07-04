@@ -28,6 +28,24 @@ int main() {
     CHECK(b.total == 2 && b.alu == 1 && b.unsupported == 1 && b.first_bad_fmt >= 0 && b.first_bad_op == 0x02,
           "an unconditional s_branch is reported as the first unsupported instruction");
 
+    // A forward VCC branch is not covered by EXEC predication. Treating it as a no-op would execute
+    // the skipped block even when VCC says to branch, so the recompiler must reject it for now.
+    const uint32_t vcc_branch[] = { 0x7da80300u, 0xbf860001u, 0x4a060300u, 0xBF810000u };
+    RecompileCoverage c = recompile_coverage(vcc_branch, sizeof(vcc_branch)/sizeof(vcc_branch[0]));
+    CHECK(c.unsupported == 1 && c.first_bad_fmt >= 0 && c.first_bad_op == 0x06,
+          "a forward s_cbranch_vccz is rejected instead of linearized as a no-op");
+    CHECK(recompile_valu(vcc_branch, sizeof(vcc_branch)/sizeof(vcc_branch[0]), 2, 3).empty(),
+          "the production recompiler rejects the unsafe forward VCC branch");
+
+    // Even s_cbranch_execz is only safe to linearize when the skipped block is made of EXEC-predicated
+    // VGPR writes. Scalar writes are not protected by predicate_write(), so reject that shape.
+    const uint32_t execz_scalar[] = { 0x7da80300u, 0xbf880001u, 0xbe800381u, 0xBF810000u };
+    RecompileCoverage d = recompile_coverage(execz_scalar, sizeof(execz_scalar)/sizeof(execz_scalar[0]));
+    CHECK(d.unsupported == 1 && d.first_bad_fmt >= 0 && d.first_bad_op == 0x08,
+          "a narrowed EXEC branch over scalar state is rejected");
+    CHECK(recompile_valu(execz_scalar, sizeof(execz_scalar)/sizeof(execz_scalar[0]), 2, 0).empty(),
+          "the production recompiler rejects execz branches that would skip scalar writes");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
