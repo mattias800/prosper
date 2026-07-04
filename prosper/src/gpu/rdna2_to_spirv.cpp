@@ -456,6 +456,9 @@ bool sopp_is_noop(const Rdna2Inst& in) {
 
 std::unordered_set<uint32_t> safe_execz_branches(const std::vector<Rdna2Inst>& ins) {
     std::unordered_set<uint32_t> safe;
+    // pc of the terminating s_endpgm — a forward execz whose target is here skips straight to the end.
+    uint32_t end_pc = 0; bool have_end = false;
+    for (const auto& in : ins) if (in.is_end) { end_pc = in.pc; have_end = true; break; }
     for (const auto& br : ins) {
         if (br.fmt != Rdna2Format::SOPP || br.opcode != 0x08 || br.simm16 <= 0) continue;
         const uint32_t target = br.pc + br.len_dwords + (uint32_t)br.simm16;
@@ -465,10 +468,18 @@ std::unordered_set<uint32_t> safe_execz_branches(const std::vector<Rdna2Inst>& i
             if (in.pc == target) { target_found = true; break; }
         }
         if (!target_found) ok = false;
+        // Two shapes are safe to linearize (drop the branch, run the block under per-lane EXEC):
+        //  * IF/ENDIF rejoining live code (target < end): only EXEC-predicated VGPR writes are safe,
+        //    since scalar/VCC/memory writes past the merge would be observed by later code.
+        //  * GUARD-TO-END (target == s_endpgm): the block's scalar/SGPR/VCC writes are DEAD (nothing
+        //    runs after s_endpgm) and wave-uniform, memory loads are fault-free (robustBufferAccess) into
+        //    predicated VGPRs, and memory stores are EXEC-predicated (conditional store). So anything is
+        //    safe EXCEPT an EXP export (not EXEC-predicated → would export from inactive lanes).
+        const bool guard_to_end = have_end && target >= end_pc;
         for (const auto& in : ins) {
             if (in.pc <= br.pc || in.pc >= target || in.is_end) continue;
-            // Only VGPR writes are made EXEC-preserving by predicate_write(); scalar/VCC/memory/export
-            // side effects would still happen under linearization, so they are not safe to skip.
+            if (in.fmt == Rdna2Format::EXP) { ok = false; break; }   // exports are never EXEC-masked
+            if (guard_to_end) continue;                              // dead-at-end / predicated / fault-free
             if (in.fmt == Rdna2Format::VOP1 || in.fmt == Rdna2Format::VOP2 || in.fmt == Rdna2Format::VOP3 ||
                 sopp_is_noop(in)) {
                 continue;

@@ -598,6 +598,25 @@ int main() {
       printf("  kernel30 mismatches=%u (buf[2]=%g expect=4, buf[9]=%g expect=0)\n", bad30, f2, f9); }
     CHECK(stored30_out.size() == N && bad30 == 0, "recompiled kernel 30 (predicated store: only lanes gid<4 write) correct");
 
+    // Kernel 31: the full compute grid-tail idiom — v_cmpx narrows EXEC, s_cbranch_execz skips straight
+    // to s_endpgm (now linearized as a no-op for the guard-to-end shape), then a predicated store. Same
+    // observable result as kernel 30 (gid<4 write 2*gid, else 0), proving the execz relaxation is safe.
+    const uint32_t code31[] = {
+        0x7e040f00u, 0x06060100u, 0x7e0a0284u, 0x7da20b02u, 0xbf880002u, 0xe0102000u, 0x80020302u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv31 = recompile_valu(code31, sizeof(code31)/sizeof(code31[0]), 1, 0, &rt29);
+    CHECK(!spv31.empty(), "recompiled kernel 31 (v_cmpx + s_cbranch_execz-to-end + store) -> SPIR-V");
+    std::vector<uint32_t> stored31(N, 0), stored31_out;
+    prosper::test::run_compute(spv31, in29, N, N, /*cbuf0*/{}, /*cbuf1*/stored31, &stored31_out);
+    uint32_t bad31 = 0;
+    for (uint32_t i = 0; i < N && stored31_out.size() == N; i++) {
+        float f; std::memcpy(&f, &stored31_out[i], 4);
+        float expect = (i < 4) ? 2.0f*(float)i : 0.0f;
+        if (std::fabs(f - expect) > 1e-3f) bad31++;
+    }
+    printf("  kernel31 mismatches=%u (execz-to-end guard linearized + predicated store)\n", bad31);
+    CHECK(stored31_out.size() == N && bad31 == 0, "recompiled kernel 31 (guard-to-endpgm execz + store) correct");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

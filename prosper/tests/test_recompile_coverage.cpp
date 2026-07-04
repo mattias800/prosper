@@ -37,14 +37,26 @@ int main() {
     CHECK(recompile_valu(vcc_branch, sizeof(vcc_branch)/sizeof(vcc_branch[0]), 2, 3).empty(),
           "the production recompiler rejects the unsafe forward VCC branch");
 
-    // Even s_cbranch_execz is only safe to linearize when the skipped block is made of EXEC-predicated
-    // VGPR writes. Scalar writes are not protected by predicate_write(), so reject that shape.
-    const uint32_t execz_scalar[] = { 0x7da80300u, 0xbf880001u, 0xbe800381u, 0xBF810000u };
+    // A forward s_cbranch_execz that REJOINS LIVE CODE is only safe to linearize when its skipped block
+    // is EXEC-predicated VGPR writes. Here the block is a scalar write (s_mov_b32 s0,1) and the branch
+    // target is a live use of s0 (v_mov_b32 v0,s0) — the scalar write is NOT dead, so linearizing would
+    // wrongly set s0 for lanes that should have skipped. Must reject.
+    //   v_cmpx ; s_cbranch_execz +1 ; s_mov_b32 s0,1 ; v_mov_b32 v0,s0 ; s_endpgm
+    const uint32_t execz_scalar[] = { 0x7da80300u, 0xbf880001u, 0xbe800381u, 0x7e000200u, 0xBF810000u };
     RecompileCoverage d = recompile_coverage(execz_scalar, sizeof(execz_scalar)/sizeof(execz_scalar[0]));
     CHECK(d.unsupported == 1 && d.first_bad_fmt >= 0 && d.first_bad_op == 0x08,
-          "a narrowed EXEC branch over scalar state is rejected");
+          "a narrowed EXEC branch over live scalar state (rejoining live code) is rejected");
     CHECK(recompile_valu(execz_scalar, sizeof(execz_scalar)/sizeof(execz_scalar[0]), 2, 0).empty(),
-          "the production recompiler rejects execz branches that would skip scalar writes");
+          "the production recompiler rejects execz branches that would skip live scalar writes");
+
+    // But the SAME scalar write IS safe to linearize when the execz skips straight to s_endpgm: the
+    // write is dead (nothing runs after s_endpgm) and scalar ops are wave-uniform, so running it under
+    // linearization is observationally a no-op. This is the compute grid-tail guard idiom.
+    //   v_cmpx ; s_cbranch_execz +1 ; s_mov_b32 s0,1 ; s_endpgm
+    const uint32_t execz_end[] = { 0x7da80300u, 0xbf880001u, 0xbe800381u, 0xBF810000u };
+    RecompileCoverage e = recompile_coverage(execz_end, sizeof(execz_end)/sizeof(execz_end[0]));
+    CHECK(e.unsupported == 0,
+          "a narrowed EXEC branch to s_endpgm over a dead scalar write is linearized (guard-to-end shape)");
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
