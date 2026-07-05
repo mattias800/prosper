@@ -80,10 +80,13 @@ namespace {
     bool     g_watch_armed = false;
     bool     g_watch_stepping = false;
     volatile sig_atomic_t g_watch_hits = 0;
-    // PROSPER_BP=0xOFFSET (guest image offset): int3 code-breakpoint that LOGS r15 + companion/flag
-    // fields at each hit, then steps over and re-arms. Diagnostic (never changes control flow). Used to
-    // enumerate the GfxDevice drain: is ANY category-{5,9,15,18,19} pipeline's [+0x140] companion
-    // non-null in our env, or is the whole build pass absent? Single-init-pass use; not race-hardened.
+    // PROSPER_BP=0xOFFSET (guest image offset): int3 code-breakpoint that LOGS registers at each hit,
+    // then steps over and re-arms. Diagnostic (never changes control flow). Used to enumerate the
+    // GfxDevice drain (proved every category-{5,9,15,18,19} pipeline has a null [+0x140] companion).
+    // LIMITATION: the restore-byte + single-step + re-insert dance is NOT thread-safe. It is reliable
+    // only on functions reached by ONE thread (e.g. the drain 0xba6720). On a hot/multi-threaded
+    // function (e.g. the GfxDevice ctor 0x95c700) concurrent execution during the byte-restored window
+    // corrupts control flow (observed: wild jump). For those, read fault-time state instead of stepping.
     bool     g_bp_on = false;
     uint64_t g_bp_addr = 0;                    // guest VA of the breakpoint (0x400000000 + offset)
     uint8_t  g_bp_orig = 0;                    // original byte replaced by 0xCC
@@ -198,11 +201,16 @@ namespace {
                     g_bp_count = g_bp_count + 1;
                     auto rd = [](uint64_t a) -> unsigned long long {
                         return probe_readable(a) ? (unsigned long long)*(const uint64_t*)a : 0xBADBADull; };
-                    char b[256];
+                    auto& gr = uc->uc_mcontext.gregs;
+                    uint64_t rdi = (uint64_t)gr[REG_RDI], rsi = (uint64_t)gr[REG_RSI];
+                    uint64_t rax = (uint64_t)gr[REG_RAX], r14 = (uint64_t)gr[REG_R14];
+                    char b[320];
                     int n = snprintf(b, sizeof b,
-                        "[bp] #%d r15=0x%llx [+0]=0x%llx [+0x140]=0x%llx [+0x1a0]=0x%llx [+0x520]=0x%llx [+0x530]=0x%llx tid=%ld\n",
-                        (int)g_bp_count, (unsigned long long)r15, rd(r15+0x0), rd(r15+0x140),
-                        rd(r15+0x1a0), rd(r15+0x520), rd(r15+0x530), cur_tid());
+                        "[bp] #%d rdi=0x%llx rsi=0x%llx rax=0x%llx r14=0x%llx r15=0x%llx [rdi]=0x%llx [rdi+0x1e4c]=0x%llx tid=%ld\n",
+                        (int)g_bp_count, (unsigned long long)rdi, (unsigned long long)rsi,
+                        (unsigned long long)rax, (unsigned long long)r14, (unsigned long long)r15,
+                        rd(rdi), (unsigned long long)(probe_readable(rdi+0x1e4c) ? *(const uint32_t*)(rdi+0x1e4c) : 0xBADBAD),
+                        cur_tid());
                     write(2, b, n);
                 }
                 bp_write_byte(g_bp_addr, g_bp_orig);              // restore real instruction
