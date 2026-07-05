@@ -19,6 +19,8 @@ enum : uint32_t {
     Op_ConstantTrue=41, Op_ConstantFalse=42, Op_Constant=43, Op_Function=54, Op_FunctionEnd=56, Op_Variable=59,
     Op_LogicalOr=166, Op_LogicalAnd=167, Op_Select=169, Op_FOrdEqual=180, Op_FOrdNotEqual=182, Op_FOrdLessThan=184, Op_FOrdGreaterThan=186,
     Op_FOrdLessThanEqual=188, Op_FOrdGreaterThanEqual=190,
+    Op_FUnordEqual=181, Op_FUnordNotEqual=183, Op_FUnordLessThan=185, Op_FUnordGreaterThan=187,   // NaN-inclusive ("n"-prefix) compares
+    Op_FUnordLessThanEqual=189, Op_FUnordGreaterThanEqual=191,
     Op_Load=61, Op_Store=62, Op_AccessChain=65, Op_Decorate=71, Op_MemberDecorate=72,
     Op_ConvertFToU=109, Op_ConvertFToS=110, Op_ConvertSToF=111, Op_ConvertUToF=112, Op_Bitcast=124,
     Op_CompositeConstruct=80, Op_CompositeExtract=81, Op_IAdd=128, Op_FAdd=129, Op_ISub=130, Op_FSub=131, Op_IMul=132, Op_FMul=133,
@@ -1023,6 +1025,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x25: d = b.ibin(Op_IAdd, a, c); break;          // v_add_nc_u32
                 case 0x26: d = b.ibin(Op_ISub, a, c); break;          // v_sub_nc_u32
                 case 0x27: d = b.ibin(Op_ISub, c, a); break;          // v_subrev_nc_u32 (reverse: src1 - src0)
+                // The four mul-add-with-literal-K ops (K = in.literal). madmk/fmamk = src0*K + src1;
+                // madak/fmaak = src0*src1 + K. (mad vs fma differ only in fused rounding — immaterial here.)
+                case 0x20: case 0x2C: d = b.fbin(Op_FAdd, b.fbin(Op_FMul, a, b.uconst(in.literal)), c); break;  // v_madmk / v_fmamk
+                case 0x21: case 0x2D: d = b.fbin(Op_FAdd, b.fbin(Op_FMul, a, c), b.uconst(in.literal)); break;  // v_madak / v_fmaak
                 case 0x2F: d = b.pack_half2x16(a, c); break;          // v_cvt_pkrtz_f16_f32 (e32 form)
                 default: ok = false;
             }
@@ -1046,6 +1052,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x04: cmp = b.fcmp(Op_FOrdGreaterThan, a, c); break;      // v_cmp_gt_f32
                 case 0x05: cmp = b.fcmp(Op_FOrdNotEqual, a, c); break;         // v_cmp_lg_f32
                 case 0x06: cmp = b.fcmp(Op_FOrdGreaterThanEqual, a, c); break; // v_cmp_ge_f32
+                // NaN-inclusive f32 compares (the "n"-prefix set is the unordered negation of 0x1-0x6):
+                case 0x09: cmp = b.fcmp(Op_FUnordLessThan, a, c); break;       // v_cmp_nge_f32 = !(a>=b)
+                case 0x0A: cmp = b.fcmp(Op_FUnordEqual, a, c); break;          // v_cmp_nlg_f32 = !(a!=b)
+                case 0x0B: cmp = b.fcmp(Op_FUnordLessThanEqual, a, c); break;  // v_cmp_ngt_f32 = !(a>b)
+                case 0x0C: cmp = b.fcmp(Op_FUnordGreaterThan, a, c); break;    // v_cmp_nle_f32 = !(a<=b)
+                case 0x0D: cmp = b.fcmp(Op_FUnordNotEqual, a, c); break;       // v_cmp_neq_f32 = !(a==b)
+                case 0x0E: cmp = b.fcmp(Op_FUnordGreaterThanEqual, a, c); break;// v_cmp_nlt_f32 = !(a<b)
                 case 0x81: cmp = b.scmp(Op_SLessThan, a, c); break;            // v_cmp_lt_i32
                 case 0x82: cmp = b.ucmp(Op_IEqual, a, c); break;               // v_cmp_eq_i32
                 case 0x83: cmp = b.scmp(Op_SLessThanEqual, a, c); break;       // v_cmp_le_i32
@@ -1607,6 +1620,11 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords, co
     auto safe_branches = safe_execz_branches(ins);
     bool exported = false;
     auto exp_fn = [&](const Rdna2Inst& in) -> bool {         // EXP MRT0..7 -> the color output
+        // We don't model EXEC-masked export/discard, so an export while EXEC is narrowed (a lane killed by
+        // v_cmpx and not restored) would wrongly write inactive lanes -> reject. In practice the export
+        // runs after EXEC is restored to all-on (the common sRGB/tonemap divergent-if shape), so this is
+        // only a guard against genuine mid-discard exports.
+        if (rs.exec_narrowed) return false;
         if (in.exp_target <= 7 && !exported) {
             b.export_color(operand_bits(b, rs, in, in.src[0]), operand_bits(b, rs, in, in.src[1]),
                            operand_bits(b, rs, in, in.src[2]), operand_bits(b, rs, in, in.src[3]));
@@ -1614,9 +1632,10 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords, co
         }
         return true;   // ignore NULL / additional exports for now
     };
-    // Graphics-stage exports don't model EXEC-masked export/discard, so cmpx is rejected (allow_exec_update
-    // = false); memory ops need a resource table. Loops (if any) are reconstructed by emit_body.
-    if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/false, /*allow_smem*/rt != nullptr, exp_fn)) return {};
+    // cmpx is now ALLOWED (allow_exec_update=true): a fragment divergent-if (v_cmpx ... s_mov exec,saved)
+    // is handled by EXEC predication like compute, and the export is guarded above. Memory ops need a
+    // resource table. Loops (if any) are reconstructed by emit_body.
+    if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/true, /*allow_smem*/rt != nullptr, exp_fn)) return {};
     if (!exported) return {};
     return b.finish();
 }

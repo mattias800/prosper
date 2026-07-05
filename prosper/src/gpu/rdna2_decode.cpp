@@ -75,7 +75,18 @@ void decode_operands(Rdna2Inst& i) {
             break;
         case Rdna2Format::VOPC:
             i.opcode = (w >> 17) & 0xFFu; i.dst = {OperandKind::Special, 106 /*VCC_LO*/};
-            i.src[0] = decode_src_field(w & 0x1FFu); i.src[1] = vgpr(w >> 9); i.n_src = 2; break;
+            if ((w & 0x1FFu) == 0xF9u) {                          // SDWA (same layout as VOP2)
+                const uint32_t sd = i.words[1];
+                i.src[0] = ((sd >> 23) & 1u) ? decode_src_field(sd & 0xFFu)     : vgpr(sd & 0xFFu);
+                i.src[1] = ((sd >> 31) & 1u) ? decode_src_field((w >> 9) & 0xFFu) : vgpr((w >> 9) & 0xFFu);
+                i.n_src = 2;
+                // VOPC SDWA has NO dst_sel/clamp/omod (byte1 is 0 — the result is VCC, not a VGPR); trivial
+                // iff both source selects are DWORD and no source modifiers.
+                if (((sd >> 16) & 7u) == 6u && ((sd >> 24) & 7u) == 6u &&
+                    !((sd >> 19) & 0xFu) && !((sd >> 27) & 0xFu))
+                    i.has_modifier = false;
+            } else { i.src[0] = decode_src_field(w & 0x1FFu); i.src[1] = vgpr(w >> 9); i.n_src = 2; }
+            break;
         case Rdna2Format::VOP3: {
             const uint32_t d1 = i.words[1];
             i.opcode = (w >> 16) & 0x3FFu; i.dst = vgpr(w);   // VOP3A: vdst in [7:0] of dword0
@@ -201,9 +212,12 @@ Rdna2Inst rdna2_decode_one(const uint32_t* code, size_t max_dwords) {
             i.len_dwords = (max_dwords >= 2) ? 2 : 1;
             if (max_dwords >= 2) i.words[1] = code[1];
         } else {
-            // v_fmamk_f32 (0x2C) / v_fmaak_f32 (0x2D) also embed a mandatory 32-bit literal K.
+            // The four K-carrying VOP2 mul-adds embed a mandatory 32-bit literal K: v_madmk_f32 (0x20),
+            // v_madak_f32 (0x21), v_fmamk_f32 (0x2C), v_fmaak_f32 (0x2D). Miss it and K mis-decodes as a
+            // phantom instruction, desyncing the stream. (Verified opcodes via round-trip llvm-mc gfx1010.)
             bool lit = (src0 == 0xFFu);
-            if (vf == Rdna2Format::VOP2) { uint32_t op = (w >> 25) & 0x3Fu; if (op == 0x2Cu || op == 0x2Du) lit = true; }
+            if (vf == Rdna2Format::VOP2) { uint32_t op = (w >> 25) & 0x3Fu;
+                if (op == 0x20u || op == 0x21u || op == 0x2Cu || op == 0x2Du) lit = true; }
             one_plus_lit(vf, lit);
         }
     } else if ((w & 0xC0000000u) == 0x80000000u) {
