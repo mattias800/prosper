@@ -376,6 +376,39 @@ a **constructor-breakpoint-triggered watchpoint** — the only design that dodge
    type_id. So breakpoint `0x1476b77` and read `eax` + `rbx`.
 2. Filter to `eax` ∈ {8,11,17} (category {5,9,15}), then arm a `[rbx+0x1a0]` and `[rbx+0x140]`
    write-watchpoint (reuse the existing mprotect+single-step machinery in `exec_image_linux.cpp`).
+
+**DISPROVEN 2026-07-05 (probe BUILT + run — `PROSPER_CTOR_WATCH`, gated, non-destructive, 41/41 tests,
+boot byte-identical with it off; then reverted since the site is wrong).** The int3-breakpoint +
+mprotect-watchpoint FRAMEWORK works and is the right mechanism — but the type-store SITE is wrong.
+Ground truth from the built probe + reader disassembly at `0xba6dc9`:
+```
+ba6dc9  mov 0x30(%rsp),%rax    ; owner/container (NOT r15)
+ba6dce  mov (%rax),%rax        ; rax = [owner+0] = a class-descriptor object
+ba6dd1  mov 0x1e4c(%rax),%eax  ; type_id = [class-descriptor + 0x1e4c]   <-- NOT an r15 field!
+```
+The type_id is a field of an **external class-descriptor**, not a per-instance field of `r15`
+(`r15[+0]` is just a tag `0x2b`; `r15[+0x1e4c]` is asset-name bytes). At `0x1476b77` only **type 26**
+was ever seen (one hit, single-threaded); `0xe07f4b` never fired. So a breakpoint keyed on a
+`mov …,[obj+0x1e4c]` store CANNOT identify the faulting pipelines — their type lives on their
+class-descriptor, and they never flow through those copy-ctors. (Third misattribution corrected this
+session, after `0xd58710` and `k3GhuSNmBLU`.)
+
+**CORRECTED reliable probe (reuse the working `PROSPER_CTOR_WATCH` int3+watchpoint framework, re-targeted):**
+- Path A — **class-descriptor keyed:** at the fault, capture `owner=[rsp+0x30]`, `descriptor=[owner+0]`
+  (its `[+0x1e4c]∈{8,11,17}`). Breakpoint the ctor that STAMPS that descriptor pointer into new objects,
+  and watch those instances' `[+0x140]`/`[+0x1a0]` from birth.
+- Path B — **container-populate keyed:** `r15` is walked from the container at `[container+0x78]`/count
+  `[+0x88]` (via `[rsp+0x30]`). Trace how the drain loop (`0xba6720…`) obtains `r15`, and watch the
+  container's element pages — that catches the "subsystem that populates the pipelines," which is the
+  real gap.
+
+**Honest status (unchanged, reinforced):** three probe designs, three ground-truth misattribution
+corrections, fix still a layer deeper each time = a genuinely deep, layered GfxDevice-construction
+subsystem that isn't running in our env. This needs a focused, interactive, likely reference-backed
+(Unity PS5 backend) session — the `PROSPER_CTOR_WATCH` framework is ready to re-target, but pointing it
+correctly requires the class-descriptor/container-populate RE above, done with a human reacting to each
+layer. Autonomous probe-cycles are returning corrections, not a fix, at high cost — recommend pausing
+autonomous drilling here.
 3. Log every writer PC → disassemble → find why `+0x1a0`'s low byte / the `+0x140` companion is never set.
 **CAVEAT (why this is NOT a quick autonomous probe):** `exec_image_linux.cpp` has mprotect watchpoints
 but NO code-breakpoint (int3) support, and the code + docs warn that breakpoints RACE in this
