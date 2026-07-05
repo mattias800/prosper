@@ -582,7 +582,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // 64-bit per-lane MASK ops (EXEC / VCC / saved masks). In our per-invocation model a wave
             // mask is a single bool for this lane. EXEC=SGPR 126/127, VCC=106/107; a saved mask lives
             // in sreg_bool. These implement divergent control flow (if/endif via saveexec + restore).
-            if (in.opcode == 0x04 || in.opcode == 0x24 || in.opcode == 0x25) {
+            if (in.opcode == 0x04 || in.opcode == 0x0a || in.opcode == 0x24 || in.opcode == 0x25) {
                 auto is_exec = [](const Operand& o){ return o.value == 126 || o.value == 127; };
                 auto src_mask = [&](const Operand& o) -> uint32_t {
                     if (o.value == 106 || o.value == 107) return rs.vcc;    // VCC
@@ -593,6 +593,28 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         if (o.value == 0) return b.bfalse(); }
                     return 0;   // not a recognizable mask
                 };
+                if (in.opcode == 0x0a) {                    // s_wqm_b64: whole-quad-mode mask widen
+                    // WQM widens a lane mask to whole 2x2 quads so derivative/sample helper lanes stay
+                    // active. In our per-invocation scalar SPIR-V model each lane is one bool and helper
+                    // lanes are implicit in the fragment stage, so WQM-widening a mask is the IDENTITY.
+                    // VERIFIED(round-trip llvm-mc gfx1030): SOP1 op 0x0a. Common PS preamble around
+                    // image_sample (real game shaders 26-29,39), where it is `s_wqm_b64 exec,exec`.
+                    // exec_narrowed handling mirrors s_mov_b64 (0x04): the exec<-exec self case is a true
+                    // no-op (leave exec AND its narrowed flag untouched — so a later forward s_cbranch_execz
+                    // is not spuriously rejected); replacing exec with a *different* mask may narrow it, so
+                    // set exec_narrowed conservatively (else inactive-lane writes would escape predication).
+                    // SCC = (mask != 0) is a CROSS-lane reduction our per-lane model can't form, so — like
+                    // every mask op here (s_mov_b64/saveexec) — we intentionally do not write rs.scc.
+                    uint32_t m = src_mask(in.src[0]);
+                    if (!m) { ok = false; return true; }
+                    if (is_exec(in.dst)) {
+                        if (is_exec(in.src[0])) { /* exec <- wqm(exec): identity; exec & narrowed unchanged */ }
+                        else if (in.src[0].kind == OperandKind::InlineInt && in.src[0].value == -1) {
+                            rs.exec = b.btrue(); rs.exec_narrowed = false;      // exec = all lanes on
+                        } else { rs.exec = m; rs.exec_narrowed = true; }        // replaced by a (maybe narrowed) mask
+                    } else rs.sreg_bool[in.dst.value] = m;
+                    return true;
+                }
                 if (in.opcode == 0x04) {                    // s_mov_b64
                     if (is_exec(in.dst)) {                  // set/restore EXEC
                         if (in.src[0].kind == OperandKind::InlineInt && in.src[0].value == -1) {
@@ -626,12 +648,27 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             switch (in.opcode) {
                 case 0x00: d = b.ibin(Op_IAdd, a, c); rs.scc = b.ucmp(Op_ULessThan, d, a); break;  // s_add_u32 (SCC=carry)
                 case 0x01: d = b.ibin(Op_ISub, a, c); rs.scc = b.ucmp(Op_ULessThan, a, c); break;  // s_sub_u32 (SCC=borrow)
+                // Signed add/sub: two's-complement result is bit-identical to the unsigned op; SCC is
+                // signed OVERFLOW. add ovf = operands same sign AND result sign differs: (~(a^c))&(a^d);
+                // sub ovf = operands differ in sign AND result sign differs from a: (a^c)&(a^d). Bit 31 = ovf.
+                case 0x02: { d = b.ibin(Op_IAdd, a, c);                                              // s_add_i32
+                             uint32_t o = b.ibin(Op_BitwiseAnd, b.iun(Op_Not, b.ibin(Op_BitwiseXor, a, c)),
+                                                               b.ibin(Op_BitwiseXor, a, d));
+                             rs.scc = b.ucmp(Op_INotEqual, b.ibin(Op_ShiftRightLogical, o, b.uconst(31)), b.uconst(0)); break; }
+                case 0x03: { d = b.ibin(Op_ISub, a, c);                                              // s_sub_i32
+                             uint32_t o = b.ibin(Op_BitwiseAnd, b.ibin(Op_BitwiseXor, a, c),
+                                                               b.ibin(Op_BitwiseXor, a, d));
+                             rs.scc = b.ucmp(Op_INotEqual, b.ibin(Op_ShiftRightLogical, o, b.uconst(31)), b.uconst(0)); break; }
                 case 0x0A: d = b.sel(rs.scc, a, c); break;           // s_cselect_b32: SCC ? src0 : src1
                 case 0x0E: d = b.ibin(Op_BitwiseAnd, a, c); scc_nz(d); break;   // s_and_b32
                 case 0x10: d = b.ibin(Op_BitwiseOr,  a, c); scc_nz(d); break;   // s_or_b32
                 case 0x12: d = b.ibin(Op_BitwiseXor, a, c); scc_nz(d); break;   // s_xor_b32
                 case 0x1E: { uint32_t sh = b.ibin(Op_BitwiseAnd, c, b.uconst(31));   // s_lshl_b32
                              d = b.ibin(Op_ShiftLeftLogical, a, sh); scc_nz(d); break; }  // dst = src0 << (src1 & 31)
+                case 0x24: { uint32_t w  = b.ibin(Op_BitwiseAnd, a, b.uconst(0x1f));   // s_bfm_b32: bitfield mask
+                             uint32_t sh = b.ibin(Op_BitwiseAnd, c, b.uconst(0x1f));   // dst = ((1<<(src0&31))-1)<<(src1&31)
+                             uint32_t mask = b.ibin(Op_ISub, b.ibin(Op_ShiftLeftLogical, b.uconst(1), w), b.uconst(1));
+                             d = b.ibin(Op_ShiftLeftLogical, mask, sh); break; }       // no SCC write
                 case 0x26: d = b.ibin(Op_IMul, a, c); break;         // s_mul_i32 (low 32 bits; no SCC)
                 case 0x27: {                                         // s_bfe_u32: offset=src1[4:0], width=src1[22:16]
                     uint32_t off = b.ibin(Op_BitwiseAnd, c, b.uconst(0x1f));
