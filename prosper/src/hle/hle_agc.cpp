@@ -309,10 +309,17 @@ HLE(agc_create_shader) {  // (Shader** dst, void* header, const void* code)
                 agc_shaders().size(), (void*)h, (void*)code, h->type, h->target, h->shader_size,
                 h->num_cx_registers, h->num_sh_registers, (int)patched);
 
-    // Semantic surfacing probe (PROSPER_PIPETRACE): the VS->PS linkage predicate (eboot+0xd58710)
-    // scans input/output semantics; a short/empty set leaves the pipeline reflection table empty and
-    // the [+0x140] companion uncreated (the 0xba6e08 fault). Log the counts + the relocated arrays'
-    // first entries so we can see whether the metadata we surface is real.
+    // Semantic surfacing probe (PROSPER_PIPETRACE): logs the shader's input/output vertex semantics.
+    // CORRECTION (2026-07-05, fresh 3-agent RE, ground-truth via eboot x86 disasm): an earlier theory
+    // blamed the eboot+0xba6e08 GfxDevice fault on "empty semantics leaving the reflection table empty
+    // via a VS->PS linkage predicate at eboot+0xd58710." That was WRONG. eboot+0xd58710 is Unity's
+    // generic SafeBinaryRead::Transfer (asset deserialization; ~4955 call sites; references the
+    // "SafeBinaryRead::BeginTransfer name mismatch" string) — unrelated to the crash. The 0xba6e08 fault
+    // is a GfxDevice GC / deferred-release DRAIN pass (fn eboot+0xba6720) that, for a category-{5,9,15}
+    // pipeline whose processed-flag [+0x1a0]==0, consults its GPU companion [+0x140] to decide keep-vs-
+    // release — and ours is null. The companion is built eagerly on a normal PS5 path (writers in the
+    // eboot 0xb3xxxx GfxDevice module); the fix is to make that companion get built (an AGC/GPU-resource
+    // gap), NOT to surface semantics. See docs/GFXDEVICE_BRINGUP_PROBLEM.md §"2026-07-05 correction".
     if (getenv("PROSPER_PIPETRACE")) {
         fprintf(stderr, "  [sem] type=%u num_in=%u num_out=%u in_sem=%p out_sem=%p\n",
                 h->type, h->num_input_semantics, h->num_output_semantics,

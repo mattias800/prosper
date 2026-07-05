@@ -257,3 +257,50 @@ evidence before committing to it.
 
 **Nothing is lost either way** — the renderer is staged and verified. The moment this wall falls and
 real draws flow through `run_command_buffer`, the downstream pipeline is ready to render them.
+
+---
+
+## 2026-07-05 correction — fresh 3-agent RE (ground truth via eboot x86-64 disassembly)
+
+A three-investigator pass (read-only x86 disassembly of the flat eboot image via `imgdump` +
+`objdump`) **corrected two load-bearing errors** in the analysis above and reframed the fix.
+
+**(A) `eboot+0xd58710` was MISIDENTIFIED.** It is NOT "the predicate gating companion creation" (the
+basis of Hypothesis 1 and the `[+0xc0]/[+0xe0]` "reflection table" reading). It is Unity's generic
+**`SafeBinaryRead::Transfer`** — asset-deserialization TypeTree field reader. Proof (ground truth):
+it references the string `"SafeBinaryRead::BeginTransfer name mismatch, name='%s' oldBaseTypeName='%s'"`
+at `eboot+0x1b95eb2`, and has **4,955 direct call sites**. The `[+0x140]` it feeds (via `0x15aef7d`)
+is a **Mesh** GPU vertex/index buffer (`m_BakedTriangleCollisionMesh` etc.) on a *different* object
+type than the crash object. ⟹ **The "empty shader semantics → empty reflection table → no companion"
+theory is dead.** Surfacing shader semantics will NOT fix `0xba6e08`. (The stale `hle_agc.cpp` comment
+that encoded this has been corrected.)
+
+**(B) The reader `eboot+0xba6720` is a GfxDevice GC / DEFERRED-RELEASE DRAIN pass**, not a render or
+residency pass. It walks a work-list at `[container+0x78]`/count `[+0x88]`, and per pipeline `r15`
+decides keep-vs-release; the "skip" target `0xba6e40` calls the object's Release/destructor
+`eboot+0xb9ca80` (refcount at `[+0x514]`) and removes it from the list. The exact fault gate:
+```
+ba6dd1 type_id=[rax+0x1e4c]; category=remap_table[0x1ca3b80][type_id]
+ba6de1 cmp $0x13 / bt $0xc8220   ; category ∈ {5,9,15,18,19} (NOTE: 15, not 13 — the brief's 0xc8220 bit)
+ba6df0 cmpb $0,0x1a0(%r15) / jne ; UNLESS the processed-flag [+0x1a0] is set → release path (safe)
+ba6dfa mov 0x140(%r15),%rsi      ; else read GPU companion (NULL for us)
+ba6e08 mov 0x8(%rsi),%rax        ; SIGSEGV
+```
+Remap table @ `0x1ca3b80`: type_id 8→cat5, 11→cat9, 17→cat15 are the only in-range companion-required
+types, so **r15 ∈ {type_id 8, 11, 17}**.
+
+**(C) `[pipeline+0x1a0]` has no setter for this class.** A full-image scan (only 17 byte-flag sites
+touch `+0x1a0`) found it is zero-initialized in the constructor, only propagated by the move-ctor, and
+read by the GC drain — in BOTH environments. So the engine does NOT rely on `[+0x1a0]` to keep these
+pipelines safe; **safety comes from the companion `[+0x140]` existing.** On a real PS5 this drain path
+runs without faulting ⟹ `[+0x140]` is normally non-null ⟹ the companion is built eagerly (writers exist
+in the `eboot 0xb3xxxx` GfxDevice module).
+
+**Conclusion / corrected fix direction.** The root cause is a **missing GPU companion** `[pipeline+0x140]`
+for category-{5,9,15} GfxDevice pipelines — an **AGC/GPU-resource gap in prosper's HLE**, consistent
+with the "we reimplement the absent, undocumented `libSceAgc` and must reconstruct the GPU objects it
+builds" nature of this project. The correct fix is to make that companion get built (implement whichever
+AGC/graphics call the `0xb3xxxx` builder depends on that we currently stub/no-op); setting `[+0x1a0]=1`
+is a crash-avoidance shim only (changes GC keep/release semantics, not what the game does). **Next
+concrete step:** trace the `0xb3xxxx` `[+0x140]` companion-builder — what invokes it at pipeline
+creation, and which AGC/memory call it needs — to name the exact API to implement.
