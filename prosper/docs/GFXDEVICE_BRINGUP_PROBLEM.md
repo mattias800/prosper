@@ -304,3 +304,29 @@ AGC/graphics call the `0xb3xxxx` builder depends on that we currently stub/no-op
 is a crash-avoidance shim only (changes GC keep/release semantics, not what the game does). **Next
 concrete step:** trace the `0xb3xxxx` `[+0x140]` companion-builder — what invokes it at pipeline
 creation, and which AGC/memory call it needs — to name the exact API to implement.
+
+### 2026-07-05 (later) — companion-builder trace + k3 probe: REFUTED, and why static/watchpoint stall
+
+- The follow-up trace found the earlier "companion writer in `0xb3xxxx`" hint was a **misattribution**
+  (offset `0x140` is reused across dozens of unrelated classes — `std::vector` members, move-ctors,
+  int arrays; static byte-slicing on `mov …,0x140` cannot disambiguate the crash object's writer).
+- It named **`k3GhuSNmBLU`** (a return-0 thunk that "fires once just before 'unity default resources'
+  load") as the top companion-builder suspect. **Tested and REFUTED** (gated probe
+  `g_agc_k3_companion_probe`, `hle_graphics.cpp`): (1) returning a shape-valid companion → fault
+  unchanged; (2) also writing it into `a0[+0x140]` (k3's arg) → fault unchanged. So k3 neither returns
+  nor out-params the companion for the faulting pipeline `r15`.
+- **Why the reliable probes stall:** the `PROSPER_WATCH_COMPANION` watchpoint arms on the *read* (the
+  fault site), by which time `r15`'s construction — and its `[+0x140]` write — already happened; it only
+  ever catches later memset/zero writes. And static search can't find the writer (offset reuse).
+
+**Revised next reliable probe (not yet done):** arm a `[obj+0x140]` write-watchpoint on `r15`'s
+**constructor** (backtrace `eboot+0x1478fc9 → 0x1485851`), not on the reader — i.e. identify the
+allocation that becomes a category-{5,9,15} pipeline and watch its `[+0x140]` from birth. That
+definitively catches the real builder (or proves it never runs) and yields the writer PC to disassemble
+→ the missing input → the API. This is front-half (`exec_image_linux.cpp`) work of moderate size.
+
+**Strategic note:** this wall has now survived 4 prior hypotheses + a fresh 4-agent pass (which still
+delivered real value: corrected two wrong premises, pinned the exact mechanism, refuted the leading
+suspect). ROI on continued drilling is uncertain. Higher-confidence parallel tracks: (a) the cross-engine
+recompiler generality check on the new UE4 title (PPSA17942); (b) Path B — drive the game's real
+recompiled shaders through the verified `GpuState → frame` spine for a demonstrable game-shader frame.
