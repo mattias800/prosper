@@ -368,10 +368,13 @@ count (4–7). The companion at `[+0x140]` may be built by walking `[+0xe0][0..c
 **DEFINITIVE probe design (survives all obstacles found; for a focused/interactive session):**
 a **constructor-breakpoint-triggered watchpoint** — the only design that dodges every obstacle above
 (offset reuse, read-arm-too-late, non-deterministic addresses, Unity's custom allocator):
-1. Set a code breakpoint at a pipeline ctor's `[+0x1e4c]` type-id write (a FIXED eboot address, e.g.
-   `0xe08000` = `movl $0x4,0x1e4c(%rbx)`; also `0x1476b77`/`0x1493743`/`0x10669ec`). The object pointer is
-   in the register (`rbx`) at that instant — no address-determinism needed.
-2. Filter to type_id ∈ {8,11,17} (category {5,9,15}), then arm a `[obj+0x1a0]` and `[obj+0x140]`
+1. Set a code breakpoint at the pipeline type-set site. **PINNED 2026-07-05:** the faulting pipelines'
+   type_id is NOT set by an immediate store — a raw-byte scan found ZERO `movl $8/$0xb/$0x11,0x1e4c`
+   anywhere. The known immediate ctors are other types (`0xe08000`=type 4, `0x1493743`=0x1a,
+   `0x10669ec`=0x1b). The faulting pipelines get their type by COPY at **`eboot+0x1476b77`**
+   (`mov 0x1e4c(%rax),%eax ; mov %eax,0x1e4c(%rbx)`) — `rbx` = the pipeline being built, `eax` = its
+   type_id. So breakpoint `0x1476b77` and read `eax` + `rbx`.
+2. Filter to `eax` ∈ {8,11,17} (category {5,9,15}), then arm a `[rbx+0x1a0]` and `[rbx+0x140]`
    write-watchpoint (reuse the existing mprotect+single-step machinery in `exec_image_linux.cpp`).
 3. Log every writer PC → disassemble → find why `+0x1a0`'s low byte / the `+0x140` companion is never set.
 **CAVEAT (why this is NOT a quick autonomous probe):** `exec_image_linux.cpp` has mprotect watchpoints
