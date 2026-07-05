@@ -330,3 +330,34 @@ delivered real value: corrected two wrong premises, pinned the exact mechanism, 
 suspect). ROI on continued drilling is uncertain. Higher-confidence parallel tracks: (a) the cross-engine
 recompiler generality check on the new UE4 title (PPSA17942); (b) Path B — drive the game's real
 recompiled shaders through the verified `GpuState → frame` spine for a demonstrable game-shader frame.
+
+### 2026-07-05 (later still) — per-pipeline ground truth + two corrections + the reliable entry probe
+
+`PROSPER_SKIP_NULL_COMPANION` dumped the 4 faulting pipelines' fields (skipping each → the documented
+cascade to a **new** null fault at `eboot+0x95c823`, confirming this is a *systematically-null GfxDevice
+subsystem*, not a single-companion gap):
+```
+#1 r15=…62c300 [+0xc0]=7 [+0xe0]=<ptr> [+0x138]=7 [+0x140]=0 [+0x1a0]=0x00000000
+#2 r15=…add4c0 [+0xc0]=4 [+0xe0]=<ptr> [+0x138]=4 [+0x140]=0 [+0x1a0]=0xe8de52_00
+#3 r15=…c5da00 [+0xc0]=7 [+0xe0]=<ptr> [+0x138]=7 [+0x140]=0 [+0x1a0]=0x……0c02_00
+#4 r15=…d5e1c0 [+0xc0]=6 [+0xe0]=<ptr> [+0x138]=6 [+0x140]=0 [+0x1a0]=0xbfb989_00
+```
+**Correction 1 — `[+0x1a0]` HAS a runtime writer.** #2/#3/#4 show non-zero *upper* bytes; only the low
+"processed" byte is 0. The earlier "no setter exists" (static-scan) conclusion was wrong — the writer
+uses `lea`/SIB addressing invisible to a `disp32(base)` grep. So a real pass writes `+0x1a0` and just
+never sets the low byte. **This is the single best runtime probe target.**
+**Correction 2 — `[+0xe0]` is a valid heap pointer** (not a count) and `[+0xc0]==[+0x138]` is a small
+count (4–7). The companion at `[+0x140]` may be built by walking `[+0xe0][0..count]`.
+
+**THE reliable entry probe for a focused next session (two-pass; boot is deterministic):**
+1. Pass 1 (done): `PROSPER_SKIP_NULL_COMPANION` → the r15 addresses above.
+2. Pass 2 (to build): arm a write-watchpoint on `[r15+0x1a0]` (and `[r15+0x140]`) from BEFORE construction
+   — either a hardware debug-register breakpoint (perf_event_open / self-ptrace) on the now-known address,
+   or page-protect the r15 page once mapped. Log the writer PC(s). That reveals the pass that
+   partial-inits `+0x1a0` (Correction 1) → disassemble it → why it stops short of the low byte / the
+   companion. First verify the r15 addresses are stable across runs (the high mmap bits may vary even if
+   the boot order is deterministic; if so, key the watch off the owning mapping + offset).
+
+**Honest status:** this is a subsystem-level null cascade (likely a whole GfxDevice-construction pass
+that doesn't run in our env), not a one-API fix. It plausibly needs the two-pass watchpoint above and/or
+Unity-PS5-backend reference material. Materially advanced, but a fix is not close by autonomous drilling.
