@@ -663,6 +663,39 @@ bool sopp_is_noop(const Rdna2Inst& in) {
     }
 }
 
+// Is SGPR `R` provably DEAD at pc `target` — i.e. redefined before any read on the fall-through, so a
+// write to it inside a divergent (execz) block linearized before `target` cannot be observed by later
+// code? Sound/conservative: we only reason across the simple wave-uniform ALU formats whose SGPR source
+// operands we can fully enumerate (at most a single reg or a 64-bit pair). At the first memory / control-
+// flow / interp / export / unknown instruction (whose reads of R we can't bound — e.g. a wide T#/V#
+// descriptor source) we give up and report NOT-dead. Checking value ∈ {R, R-1} covers both a 32-bit read
+// of R and a 64-bit pair whose low half is R-1. (RE-TAG: divergent-block scalar liveness.)
+inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t target, int R) {
+    for (const auto& in : ins) {
+        if (in.pc < target) continue;
+        if (in.is_end) return true;                        // never read past here -> dead
+        switch (in.fmt) {
+            // SOPK is intentionally EXCLUDED: several SOPK ops (s_addk/s_mulk/s_cmovk/s_cmpk) READ or
+            // read-modify-write their "dst" via the implicit SIMM16, but decode with n_src==0 — so the
+            // read-scan below can't see the read and the dst-match would falsely report a redefinition.
+            case Rdna2Format::SOP1: case Rdna2Format::SOP2: case Rdna2Format::SOPC:
+            case Rdna2Format::VOP1: case Rdna2Format::VOP2: case Rdna2Format::VOP3: case Rdna2Format::VOPC:
+            case Rdna2Format::EXP:   // EXP data sources are all VGPRs — it can never read an SGPR
+                for (int k = 0; k < in.n_src; k++)
+                    if (in.src[k].kind == OperandKind::SGPR &&
+                        (in.src[k].value == R || in.src[k].value == R - 1)) return false;   // read before redef -> live
+                // A redefinition kills R only if it's a plain numbered SGPR dst (s0..s105). EXEC/VCC/M0
+                // (106/107/124/126/127) also decode as SGPR-kind here but are read implicitly, never as an
+                // SGPR operand — the scan can't observe their reads, so we must not treat them as redefs.
+                if (in.dst.kind == OperandKind::SGPR && in.dst.value == R && R <= 105) return true;
+                break;
+            default:
+                return false;   // memory/branch/interp/unknown: can't bound reads of R -> assume live
+        }
+    }
+    return true;   // fell off the end without a read
+}
+
 std::unordered_set<uint32_t> safe_execz_branches(const std::vector<Rdna2Inst>& ins) {
     std::unordered_set<uint32_t> safe;
     // pc of the terminating s_endpgm — a forward execz whose target is here skips straight to the end.
@@ -697,6 +730,20 @@ std::unordered_set<uint32_t> safe_execz_branches(const std::vector<Rdna2Inst>& i
                 in.fmt == Rdna2Format::MIMG || in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::DS ||
                 sopp_is_noop(in)) {
                 continue;
+            }
+            // A pure scalar move (s_mov_b32/b64: no SCC/VCC/memory side effect) whose destination SGPR is
+            // DEAD at the merge is also safe to linearize: the unconditional write is overwritten before any
+            // later read, so masked-off lanes never observe it. (The tonemap/sRGB divergent-ifs load a scalar
+            // constant used only within the block and reset it right after — see shader 033.)
+            if (in.fmt == Rdna2Format::SOP1 && (in.opcode == 0x03 || in.opcode == 0x04) &&
+                in.dst.kind == OperandKind::SGPR) {
+                const bool b64 = (in.opcode == 0x04);
+                // dst must be a plain SGPR (s0..s105). SOP1 destinations also decode EXEC/VCC/M0
+                // (106/107/124/126/127) as SGPR-kind, but a move into those has wave-wide side effects read
+                // implicitly (not via an SGPR operand) — they can never be proven dead, so exclude them.
+                const int hi = in.dst.value + (b64 ? 1 : 0);
+                if (hi <= 105 && sgpr_dead_at_merge(ins, target, in.dst.value) &&
+                    (!b64 || sgpr_dead_at_merge(ins, target, in.dst.value + 1))) continue;
             }
             ok = false;
             break;

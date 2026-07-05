@@ -848,6 +848,67 @@ int main() {
     printf("  kernel46 mismatches=%u (out[5]=%g expect=11)\n", bad46, got46.size()==N?got46[5]:-1);
     CHECK(got46.size()==N && bad46==0, "recompiled kernel 46 (v_madak_f32: 2*a0+1) correct");
 
+    // Kernel 47: a SCALAR write inside a divergent (execz) IF-block that is DEAD at the merge — the
+    // relaxation added for the tonemap/sRGB shaders (033). v3=100; vcc=(u0>u1); s_and_saveexec; execz;
+    //   { s5 = 50.0; v3 = s5 + u0 }   (predicated VGPR write; s5 is a wave-uniform scalar written
+    //   unconditionally under linearization); restore exec; s5 = 5.0 (redefines s5 -> the block's s5 is
+    // dead); v3 = s5 + v3. Active lanes: (u0+50)+5 = u0+55; masked lanes keep v3=100 -> 105. Proves the
+    // unconditional in-block scalar write does NOT corrupt masked lanes (its value is never observed past
+    // the merge), i.e. the dead-at-merge liveness relaxation is sound.
+    const uint32_t code47[] = {
+        0x7e0602ffu, 0x42c80000u, 0x7d880300u, 0xbe80246au, 0xbf880003u, 0xbe8503ffu, 0x42480000u,
+        0x06060005u, 0xbefe0400u, 0xbe8503ffu, 0x40a00000u, 0x06060605u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv47 = recompile_valu(code47, sizeof(code47)/sizeof(code47[0]), 2, /*out_vgpr*/3);
+    CHECK(!spv47.empty(), "recompiled kernel 47 (dead scalar write in divergent block) -> SPIR-V");
+    std::vector<float> in47(N * 2), exp47(N);
+    for (uint32_t i = 0; i < N; i++) {
+        uint32_t u0 = i % 17, u1 = i % 13;
+        in47[i*2+0]=(float)u0; in47[i*2+1]=(float)u1;
+        exp47[i] = (u0 > u1) ? ((float)u0 + 55.0f) : 105.0f;
+    }
+    std::vector<float> got47 = prosper::test::run_compute(spv47, in47, N, N);
+    uint32_t bad47 = 0, act47 = 0, msk47 = 0;
+    for (uint32_t i=0;i<N&&got47.size()==N;i++){ if (std::fabs(got47[i]-exp47[i])>1e-3f) bad47++;
+        if ((i%17)>(i%13)) act47++; else msk47++; }
+    printf("  kernel47 mismatches=%u (active=%u masked=%u, out[1]=%g exp=%g)\n", bad47, act47, msk47,
+           got47.size()==N?got47[1]:-1, exp47[1]);
+    CHECK(act47>0 && msk47>0, "kernel 47 exercises both active and masked lanes");
+    CHECK(got47.size()==N && bad47==0, "recompiled kernel 47 (dead scalar write in divergent block) correct");
+
+    // Kernel 47b (NEGATIVE): same shape but the block's s5 is READ after the merge without being
+    // redefined -> s5 is LIVE at the merge, so linearizing the unconditional scalar write would corrupt
+    // masked lanes. The dead-at-merge analysis must NOT prove it dead, so the execz block is not
+    // linearizable and recompilation must FAIL (return empty) rather than silently miscompile. Guards the
+    // soundness of the relaxation (it accepts only provably-dead scalar writes).
+    const uint32_t code47b[] = {
+        0x7e0602ffu, 0x42c80000u, 0x7d880300u, 0xbe80246au, 0xbf880003u, 0xbe8503ffu, 0x42480000u,
+        0x06060005u, 0xbefe0400u, 0x06060605u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv47b = recompile_valu(code47b, sizeof(code47b)/sizeof(code47b[0]), 2, /*out_vgpr*/3);
+    CHECK(spv47b.empty(), "kernel 47b (LIVE scalar write in divergent block) correctly REJECTED (not miscompiled)");
+
+    // Kernel 47c (NEGATIVE, soundness): the in-block "scalar move" targets vcc_lo (SDST code 106, which
+    // decodes as SGPR-kind). A move into VCC/EXEC/M0 has wave-wide side effects read IMPLICITLY, so it can
+    // never be proven dead — the relaxation must exclude dst > s105 and reject the block (else EXEC/VCC
+    // corruption past the merge). Must return empty.
+    const uint32_t code47c[] = {
+        0x7e0602ffu, 0x42c80000u, 0x7d880300u, 0xbe80246au, 0xbf880003u, 0xbeea03ffu, 0x42480000u,
+        0x06060100u, 0xbefe0400u, 0x06060703u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv47c = recompile_valu(code47c, sizeof(code47c)/sizeof(code47c[0]), 2, /*out_vgpr*/3);
+    CHECK(spv47c.empty(), "kernel 47c (special-reg (vcc) write in divergent block) correctly REJECTED");
+
+    // Kernel 47d (NEGATIVE, soundness): s5 is written in the block, then an SOPK s_addk_i32 s5 (a
+    // read-modify-write whose SIMM16 operand leaves n_src==0) reads s5 after the merge -> s5 is LIVE. The
+    // liveness scan must NOT mistake the SOPK dst for a redefinition; the block must be rejected. Empty.
+    const uint32_t code47d[] = {
+        0x7e0602ffu, 0x42c80000u, 0x7d880300u, 0xbe80246au, 0xbf880003u, 0xbe8503ffu, 0x42480000u,
+        0x06060005u, 0xbefe0400u, 0xb7850010u, 0x06060605u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv47d = recompile_valu(code47d, sizeof(code47d)/sizeof(code47d[0]), 2, /*out_vgpr*/3);
+    CHECK(spv47d.empty(), "kernel 47d (SOPK RMW reads block scalar after merge) correctly REJECTED");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
