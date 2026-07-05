@@ -115,6 +115,7 @@ struct SpirvCompute {
     uint32_t fcmp(uint32_t cmpop, uint32_t a, uint32_t b) { uint32_t r = id(); put(code, cmpop, {t_bool, r, bcf(a), bcf(b)}); return r; }
     uint32_t bfalse() { if (!bconst_false) { bconst_false = id(); put(types, Op_ConstantFalse, {t_bool, bconst_false}); } return bconst_false; }
     uint32_t sel(uint32_t cond, uint32_t tval, uint32_t fval) { uint32_t r = id(); put(code, Op_Select, {t_u32, r, cond, tval, fval}); return r; }
+    uint32_t bsel(uint32_t cond, uint32_t tval, uint32_t fval) { uint32_t r = id(); put(code, Op_Select, {t_bool, r, cond, tval, fval}); return r; }  // bool-domain select (wave masks)
     // Signed-int helpers: bits are bitcast to i32, the op runs, and the i32 result is bitcast to bits.
     uint32_t bcs(uint32_t u) { uint32_t r = id(); put(code, Op_Bitcast, {t_i32, r, u}); return r; }   // bits -> i32
     uint32_t i2u(uint32_t i) { uint32_t r = id(); put(code, Op_Bitcast, {t_u32, r, i}); return r; }   // i32 -> bits
@@ -729,6 +730,27 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             return true;
         }
         case Rdna2Format::SOP2: {
+            if (in.opcode == 0x0b) {   // s_cselect_b64: 64-bit MASK dst = SCC ? src0 : src1 (mask domain)
+                // Operands/dest are wave masks (EXEC/VCC/saved/inline), NOT uint bits — resolve like the
+                // SOP1 mask ops and select in the bool domain. (s_cselect_b32 0x0a stays in the uint path.)
+                auto is_exec = [](const Operand& o){ return o.value == 126 || o.value == 127; };
+                auto mask = [&](const Operand& o) -> uint32_t {
+                    if (o.value == 106 || o.value == 107) return rs.vcc;
+                    if (o.value == 126 || o.value == 127) return rs.exec;
+                    if (o.kind == OperandKind::SGPR) { auto it = rs.sreg_bool.find(o.value);
+                        if (it != rs.sreg_bool.end()) return it->second; }
+                    if (o.kind == OperandKind::InlineInt) { if (o.value == -1) return b.btrue();
+                        if (o.value == 0) return b.bfalse(); }
+                    return 0;   // not a recognizable mask
+                };
+                uint32_t m0 = mask(in.src[0]), m1 = mask(in.src[1]);
+                if (!m0 || !m1) { ok = false; return true; }
+                uint32_t r = b.bsel(rs.scc, m0, m1);
+                if (is_exec(in.dst)) { rs.exec = r; rs.exec_narrowed = true; }
+                else if (in.dst.value == 106 || in.dst.value == 107) rs.vcc = r;
+                else rs.sreg_bool[in.dst.value] = r;
+                return true;
+            }
             uint32_t a = val(in.src[0]), c = val(in.src[1]); uint32_t& d = rs.sreg[in.dst.value];
             auto scc_nz = [&](uint32_t v){ rs.scc = b.ucmp(Op_INotEqual, v, b.uconst(0)); };  // SCC = (result != 0)
             switch (in.opcode) {
@@ -780,6 +802,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x09: rs.scc = b.ucmp(Op_UGreaterThanEqual, a, c); break;        // s_cmp_ge_u32
                 case 0x0A: rs.scc = b.ucmp(Op_ULessThan, a, c); break;                // s_cmp_lt_u32
                 case 0x0B: rs.scc = b.ucmp(Op_ULessThanEqual, a, c); break;           // s_cmp_le_u32
+                default: ok = false;
+            }
+            return true;
+        }
+        case Rdna2Format::SOPK: {
+            // 16-bit-immediate scalar ops. s_movk_i32 (0x00): dst = sign-extend(simm16). The decoder
+            // already sign-extended simm16 to 32 bits. (s_cmovk/s_cmpk/s_addk/s_mulk deferred.)
+            switch (in.opcode) {
+                case 0x00: rs.sreg[in.dst.value] = b.uconst((uint32_t)in.simm16); break;   // s_movk_i32
                 default: ok = false;
             }
             return true;
