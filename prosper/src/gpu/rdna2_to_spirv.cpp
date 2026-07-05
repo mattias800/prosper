@@ -3,6 +3,7 @@
 #include "rdna2_decode.hpp"
 #include "shader_resources.hpp"
 #include <cstring>
+#include <functional>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -45,10 +46,11 @@ enum : uint32_t {
     SC_Input=1, SC_UniformConstant=0, SC_Output=3, SC_StorageBuffer=12, FC_None=0,
     Dim_1D=0, Dim_2D=1, Dim_3D=2,   // SPIR-V Dim. (2D coincides with the SQ_RSRC 2D dim value, but distinct.)
     Cap_Sampled1D=43, Cap_Image1D=44,   // Dim=1D needs Sampled1D; a 1D STORAGE image (read/write) also needs Image1D
+    Cap_StorageImageMultisample=27,      // MS=1 storage image (read/write a multisampled image)
     Cap_StorageImageReadWithoutFormat=55, Cap_StorageImageWriteWithoutFormat=56,  // for Format=Unknown storage images
     Img_Sampled_Storage=2,   // OpTypeImage "Sampled" operand: 2 = used WITHOUT a sampler (read/write storage image)
     ImgFmt_Unknown=0,        // OpTypeImage "Image Format": Unknown (runtime view format; needs the caps above)
-    ImgOp_Lod=2,   // ImageOperands bit: an explicit LOD follows (for OpImageFetch on a sampled image).
+    ImgOp_Lod=2, ImgOp_Sample=0x40,   // ImageOperands bits: explicit LOD (Fetch on sampled img) / MSAA Sample index.
     SC_Workgroup=4, Scope_Workgroup=2, MemSem_WGAcqRel=0x108,   // LDS: Workgroup storage + barrier scope/semantics
     Dec_Block=2, Dec_ArrayStride=6, Dec_BuiltIn=11, Dec_Location=30, Dec_Binding=33,
     Dec_DescriptorSet=34, Dec_Offset=35,
@@ -261,21 +263,23 @@ struct SpirvCompute {
     uint32_t t_v4u_cache = 0;
     uint32_t t_v4u() { if (!t_v4u_cache) { t_v4u_cache = id(); put(types, Op_TypeVector, {t_v4u_cache, t_u32, 4}); } return t_v4u_cache; }
     uint32_t t_v3u_c = 0;   // integer coordinate vector type (uvec3); 2D reuses the shared t_v2u()
-    std::unordered_map<uint32_t, uint32_t> stg_img_type;   // (dim | arrayed<<8) -> OpTypeImage id
+    std::unordered_map<uint32_t, uint32_t> stg_img_type;   // (dim | arrayed<<8 | ms<<9) -> OpTypeImage id
     std::unordered_map<uint32_t, uint32_t> stg_img_var;    // binding -> storage-image OpVariable id
-    bool declared_read_wo_fmt = false, declared_write_wo_fmt = false, declared_sampled1d = false;
-    // Declare (idempotently) a uint storage image of SPIR-V `dim` (arrayed = layer index in the coord) at
-    // set 0, `binding`. An arrayed image is a distinct OpTypeImage (Arrayed=1) so it's keyed separately.
-    void declare_storage_image(uint32_t binding, uint32_t dim, bool arrayed = false) {
+    bool declared_read_wo_fmt = false, declared_write_wo_fmt = false, declared_sampled1d = false, declared_ms = false;
+    static uint32_t stg_key(uint32_t dim, bool arrayed, bool ms) { return dim | (arrayed ? 0x100u : 0u) | (ms ? 0x200u : 0u); }
+    // Declare (idempotently) a uint storage image of SPIR-V `dim` (arrayed = layer in the coord; ms =
+    // multisampled) at set 0, `binding`. Each (dim,arrayed,ms) is a distinct OpTypeImage, keyed separately.
+    void declare_storage_image(uint32_t binding, uint32_t dim, bool arrayed = false, bool ms = false) {
         if (dim == Dim_1D && !declared_sampled1d) {   // SPIR-V: Dim=1D needs Sampled1D; storage 1D also needs Image1D
             put(caps, Op_Capability, {Cap_Sampled1D});
             put(caps, Op_Capability, {Cap_Image1D});
             declared_sampled1d = true;
         }
-        uint32_t key = dim | (arrayed ? 0x100u : 0u);
+        if (ms && !declared_ms) { put(caps, Op_Capability, {Cap_StorageImageMultisample}); declared_ms = true; }
+        uint32_t key = stg_key(dim, arrayed, ms);
         if (!stg_img_type.count(key)) {
             uint32_t ti = id();
-            put(types, Op_TypeImage, {ti, t_u32, dim, 0, arrayed ? 1u : 0u, 0, Img_Sampled_Storage, ImgFmt_Unknown});
+            put(types, Op_TypeImage, {ti, t_u32, dim, 0, arrayed ? 1u : 0u, ms ? 1u : 0u, Img_Sampled_Storage, ImgFmt_Unknown});
             stg_img_type[key] = ti;
         }
         if (stg_img_var.count(binding)) return;
@@ -285,7 +289,7 @@ struct SpirvCompute {
         put(deco, Op_Decorate, {v, Dec_Binding, binding});
         stg_img_var[binding] = v;
     }
-    uint32_t stg_img_id(uint32_t dim, bool arrayed) { return stg_img_type[dim | (arrayed ? 0x100u : 0u)]; }
+    uint32_t stg_img_id(uint32_t dim, bool arrayed, bool ms = false) { return stg_img_type[stg_key(dim, arrayed, ms)]; }
     // Build the integer coordinate operand from `n` raw-bit VGPR coords (u32 texel indices, incl. the
     // array layer as the last component for arrayed images). n=1 -> scalar u32; 2 -> uvec2; 3 -> uvec3.
     uint32_t stg_coord(uint32_t n, const uint32_t* c) {
@@ -310,11 +314,14 @@ struct SpirvCompute {
     // (robustImageAccess / VK_EXT_image_robustness: OOB image reads return 0), the image analogue of the
     // robustBufferAccess this recompiler already depends on for buffer loads. The runtime must enable it
     // (the test harness does). The store side is instead EXEC-predicated (no robust "harmless" OOB write).
-    void image_read(uint32_t binding, uint32_t dim, bool arrayed, uint32_t ncoord, const uint32_t* coords, uint32_t out[4]) {
+    void image_read(uint32_t binding, uint32_t dim, bool arrayed, uint32_t ncoord, const uint32_t* coords,
+                    uint32_t out[4], bool ms = false, uint32_t sample = 0) {
         if (!declared_read_wo_fmt) { put(caps, Op_Capability, {Cap_StorageImageReadWithoutFormat}); declared_read_wo_fmt = true; }
-        uint32_t img   = id(); put(code, Op_Load,      {stg_img_id(dim, arrayed), img, stg_img_var[binding]});
+        uint32_t img   = id(); put(code, Op_Load,      {stg_img_id(dim, arrayed, ms), img, stg_img_var[binding]});
         uint32_t coord = stg_coord(ncoord, coords);
-        uint32_t res   = id(); put(code, Op_ImageRead, {t_v4u(), res, img, coord});
+        uint32_t res   = id();
+        if (ms) put(code, Op_ImageRead, {t_v4u(), res, img, coord, ImgOp_Sample, sample});  // MSAA: read sample `sample`
+        else    put(code, Op_ImageRead, {t_v4u(), res, img, coord});
         for (uint32_t c = 0; c < 4; c++) { uint32_t e = id(); put(code, Op_CompositeExtract, {t_u32, e, res, c}); out[c] = e; }
     }
     // image_store: OpImageWrite raw-bit VGPR components vals[0..3] as a uvec4 texel to the storage image.
@@ -606,6 +613,7 @@ struct SpirvCompute {
 struct RegState {
     std::unordered_map<int, uint32_t> vreg, sreg;
     std::unordered_map<int, uint32_t> sreg_bool;   // SGPR (pairs) holding a saved per-lane mask (bool id)
+    std::unordered_map<int, bool> sreg_bool_narrowed;  // was EXEC narrowed when this mask was saved? (restores it)
     std::unordered_map<int, uint32_t> sreg_srt;    // SGPR holding a descriptor -> its user_data/SRT byte offset
                                                    // (descriptor provenance: s_load_dwordx4 tags, s_buffer_load resolves)
     uint32_t vcc = 0;
@@ -664,7 +672,12 @@ std::unordered_set<uint32_t> safe_execz_branches(const std::vector<Rdna2Inst>& i
             if (in.pc <= br.pc || in.pc >= target || in.is_end) continue;
             if (in.fmt == Rdna2Format::EXP) { ok = false; break; }   // exports are never EXEC-masked
             if (guard_to_end) continue;                              // dead-at-end / predicated / fault-free
+            // IF/ENDIF rejoining live code: safe to linearize iff every write is EXEC-predicated. VGPR ALU
+            // (VOP1/2/3) predicates its writes; memory ops (MIMG/MUBUF/DS) predicate their VGPR loads (and
+            // are fault-free under robust access) and EXEC-predicate their stores. SGPR/VCC writes (SOP*/
+            // VOPC/SMEM) are NOT predicated and would be observed past the merge -> still unsafe.
             if (in.fmt == Rdna2Format::VOP1 || in.fmt == Rdna2Format::VOP2 || in.fmt == Rdna2Format::VOP3 ||
+                in.fmt == Rdna2Format::MIMG || in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::DS ||
                 sopp_is_noop(in)) {
                 continue;
             }
@@ -818,21 +831,34 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         else if (in.src[0].kind == OperandKind::InlineInt && in.src[0].value == -1) {
                             rs.exec = b.btrue(); rs.exec_narrowed = false;      // exec = all lanes on
                         } else { rs.exec = m; rs.exec_narrowed = true; }        // replaced by a (maybe narrowed) mask
-                    } else rs.sreg_bool[in.dst.value] = m;
+                    } else { rs.sreg_bool[in.dst.value] = m; rs.sreg_bool_narrowed[in.dst.value] = true; }  // conservative: WQM widens
                     return true;
                 }
+                // Narrowed-state carried alongside a saved mask: restoring EXEC from a mask that was saved
+                // while EXEC was all-on must clear exec_narrowed (else it stays stuck true past an if/endif
+                // — which e.g. breaks a loop that must re-enter the header with full EXEC).
+                auto saved_narrowed = [&](const Operand& o) -> bool {
+                    // Key by operand VALUE (VCC=106/107 and saved SGPR pairs alike; VCC decodes as Special,
+                    // not SGPR, so don't gate on kind). The flag is kept in sync with the mask at EVERY
+                    // writer (v_cmp/saveexec/s_mov/s_cselect all update it), so a lookup is accurate.
+                    // Unknown provenance -> conservatively narrowed (over-narrowing is a safe no-op).
+                    auto it = rs.sreg_bool_narrowed.find(o.value);
+                    return it != rs.sreg_bool_narrowed.end() ? it->second : true;
+                };
                 if (in.opcode == 0x04) {                    // s_mov_b64
                     if (is_exec(in.dst)) {                  // set/restore EXEC
                         if (in.src[0].kind == OperandKind::InlineInt && in.src[0].value == -1) {
                             rs.exec = b.btrue(); rs.exec_narrowed = false;   // exec = all lanes on
                         } else { uint32_t m = src_mask(in.src[0]); if (!m) ok = false;
-                                 else { rs.exec = m; rs.exec_narrowed = true; } }
+                                 else { rs.exec = m; rs.exec_narrowed = saved_narrowed(in.src[0]); } }
                     } else {                                // s_mov_b64 sDST, <mask> : save a mask
                         uint32_t m = src_mask(in.src[0]); if (!m) ok = false;
-                        else rs.sreg_bool[in.dst.value] = m;
+                        else { rs.sreg_bool[in.dst.value] = m;
+                               rs.sreg_bool_narrowed[in.dst.value] = is_exec(in.src[0]) ? rs.exec_narrowed : saved_narrowed(in.src[0]); }
                     }
                 } else {                                    // s_and/or_saveexec_b64 sDST, src
                     rs.sreg_bool[in.dst.value] = rs.exec;   // save current EXEC to the dest SGPR pair
+                    rs.sreg_bool_narrowed[in.dst.value] = rs.exec_narrowed;   // ...and its narrowed-state
                     uint32_t m = src_mask(in.src[0]);
                     if (!m) ok = false;
                     else { rs.exec = (in.opcode == 0x24) ? b.land(rs.exec, m) : b.lor(rs.exec, m);
@@ -866,8 +892,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (!m0 || !m1) { ok = false; return true; }
                 uint32_t r = b.bsel(rs.scc, m0, m1);
                 if (is_exec(in.dst)) { rs.exec = r; rs.exec_narrowed = true; }
-                else if (in.dst.value == 106 || in.dst.value == 107) rs.vcc = r;
-                else rs.sreg_bool[in.dst.value] = r;
+                else if (in.dst.value == 106 || in.dst.value == 107) { rs.vcc = r; rs.sreg_bool_narrowed[in.dst.value] = true; }
+                else { rs.sreg_bool[in.dst.value] = r; rs.sreg_bool_narrowed[in.dst.value] = true; }  // conservative flag
                 return true;
             }
             uint32_t a = val(in.src[0]), c = val(in.src[1]); uint32_t& d = rs.sreg[in.dst.value];
@@ -1034,7 +1060,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0xC6: cmp = b.ucmp(Op_UGreaterThanEqual, a, c); break;    // v_cmp_ge_u32
                 default: ok = false;
             }
-            if (ok) { vcc = cmp; if (is_cmpx) { rs.exec = b.land(rs.exec, cmp); rs.exec_narrowed = true; } }
+            // A compare result is a per-lane mask; track VCC's narrowed-state in sync with its value so a
+            // later `s_mov_b64 exec, vcc` restores the correct exec_narrowed (106/107 = VCC_LO/HI).
+            if (ok) { vcc = cmp; rs.sreg_bool_narrowed[106] = true; rs.sreg_bool_narrowed[107] = true;
+                      if (is_cmpx) { rs.exec = b.land(rs.exec, cmp); rs.exec_narrowed = true; } }
             return true;
         }
         case Rdna2Format::VOP3: {
@@ -1306,16 +1335,18 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             if (res->cls == ResourceClass::StorageImage) {
                 const bool is_ld = (in.opcode == 0x00), is_st = (in.opcode == 0x08);
                 if (!is_ld && !is_st) { ok = false; return true; }
-                uint32_t dim, ncoord; bool arrayed = false;
-                switch (in.mimg_dim) {   // SQ_RSRC dim -> SPIR-V Dim + coord count (+ array layer)
+                uint32_t dim, ncoord; bool arrayed = false, ms = false;
+                switch (in.mimg_dim) {   // SQ_RSRC dim -> SPIR-V Dim + coord count (+ array layer / MSAA sample)
                     case 0: dim = Dim_1D; ncoord = 1; break;                       // 1D
                     case 1: dim = Dim_2D; ncoord = 2; break;                       // 2D
                     case 2: dim = Dim_3D; ncoord = 3; break;                       // 3D
                     case 4: dim = Dim_1D; ncoord = 2; arrayed = true; break;       // 1D_ARRAY (x, layer)
                     case 5: dim = Dim_2D; ncoord = 3; arrayed = true; break;       // 2D_ARRAY (x, y, layer)
-                    default: ok = false; return true;   // cube / MSAA storage images deferred
+                    case 6: dim = Dim_2D; ncoord = 2; ms = true; break;            // 2D_MSAA (x, y) + sample index
+                    default: ok = false; return true;   // cube / MSAA-array storage images deferred
                 }
-                b.declare_storage_image(res->binding, dim, arrayed);
+                if (ms && is_st) { ok = false; return true; }   // per-sample MSAA store not modeled (resolve shaders read)
+                b.declare_storage_image(res->binding, dim, arrayed, ms);
                 // Coordinate VGPR per axis. Non-NSA (len==2): consecutive from VADDR (src[0]). NSA (len>2):
                 // split across the extra address dwords — coord0 = VADDR, coord k>=1 = byte (k-1) of
                 // words[2..3] (dword2 = addr1..4, dword3 = addr5..8). Layout verified via llvm-mc gfx1010.
@@ -1328,8 +1359,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 };
                 uint32_t coords[3] = {0, 0, 0};
                 for (uint32_t k = 0; k < ncoord; k++) coords[k] = vread(coord_vgpr(k));
+                uint32_t sample = ms ? vread(coord_vgpr(ncoord)) : 0;   // MSAA sample index = coord after the spatial ones
                 if (is_ld) {
-                    uint32_t out[4]; b.image_read(res->binding, dim, arrayed, ncoord, coords, out);
+                    uint32_t out[4]; b.image_read(res->binding, dim, arrayed, ncoord, coords, out, ms, sample);
                     int vd = in.dst.value, w = 0;   // dmask -> consecutive VDATA VGPRs (LSB=R first)
                     for (uint32_t c = 0; c < 4; c++) if (in.mimg_dmask & (1u << c)) {
                         uint32_t old = vreg_old(b, rs, vd + w); rs.vreg[vd + w] = out[c];
@@ -1405,22 +1437,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
     }
 }
 
-std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
-                                     uint32_t num_inputs, uint32_t out_vgpr,
-                                     const ShaderResourceTable* rt) {
-    std::vector<Rdna2Inst> ins;
-    rdna2_walk(code, dwords, ins);
-
-    SpirvCompute b;
-    b.begin(num_inputs ? num_inputs : 1);
-    RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
-    auto safe_branches = safe_execz_branches(ins);
-    for (uint32_t k = 0; k < num_inputs; k++) rs.vreg[(int)k] = b.load_input(k);
-
-    // A recognized COUNTED loop is emitted as a real structured SPIR-V loop (OpLoopMerge + OpPhi for the
-    // loop-carried registers). Loop-FREE shaders take the unchanged straight-line path below, so nothing
-    // that already works is perturbed. Anything but the simple single-back-edge/single-SCC-exit shape is
-    // not detected and falls through (and, as before, fails on the back-edge → returns {}).
+// Emit the instruction body (shared by every stage). Handles a single recognized COUNTED loop as a real
+// structured SPIR-V loop (OpLoopMerge + OpPhi for loop-carried registers); loop-FREE streams walk straight
+// through, byte-identical to the pre-loop-feature behavior. `exp_fn` handles an EXP instruction per stage
+// (compute: reject; fragment: MRT color; vertex: POS/PARAM). Returns false if any instruction is
+// unsupported. allow_exec_update / allow_smem match the stage's emit_alu flags.
+bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
+               const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt,
+               bool allow_exec_update, bool allow_smem,
+               const std::function<bool(const Rdna2Inst&)>& exp_fn) {
     const CountedLoop L = detect_counted_loop(ins);
     size_t idx = 0;
     auto emit_range = [&](uint32_t pc_lo, uint32_t pc_hi) -> bool {   // emit ins whose pc ∈ [pc_lo, pc_hi)
@@ -1428,17 +1453,19 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
             const Rdna2Inst& in = ins[idx];
             if (in.is_end || in.pc >= pc_hi) break;
             if (in.pc < pc_lo) continue;
+            if (in.fmt == Rdna2Format::EXP) { if (!exp_fn(in)) return false; continue; }
             bool ok = true;
-            if (!emit_alu(b, rs, in, ok, true, &safe_branches, /*allow_smem*/true, rt) || !ok) return false;
+            if (!emit_alu(b, rs, in, ok, allow_exec_update, &safe, allow_smem, rt) || !ok) return false;
         }
         return true;
     };
+    auto& safe_branches = safe;
     if (L.found) {
         auto vget = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
         auto sget = [&](int r){ auto it = rs.sreg.find(r); return it == rs.sreg.end() ? b.uconst(0) : it->second; };
         // 1. Pre-loop body. Loops require full EXEC at entry (per-lane loop semantics); bail if narrowed.
-        if (!emit_range(0, L.header_pc)) return {};
-        if (rs.exec_narrowed) return {};
+        if (!emit_range(0, L.header_pc)) return false;
+        if (rs.exec_narrowed) return false;
         // 2. Loop-carried registers -> a header OpPhi each. `cond_written` = regs written in the CONDITION
         // region [header, exit_branch): those execute on the exiting iteration too, so their post-loop
         // value is the condition-block value (which dominates the merge), NOT the phi (defect A). SCC/VCC
@@ -1458,7 +1485,7 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
         { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.vcc, preheader, p); rs.vcc = ph; phis.push_back({0, 3, ph, p}); }
         b.emit_loopmerge(merge, cont); b.emit_branch(check); b.emit_label(check);
         // 3. Condition block: emit [header, exit_branch); the SCC exit becomes OpBranchConditional.
-        if (!emit_range(L.header_pc, L.exit_branch_pc)) return {};
+        if (!emit_range(L.header_pc, L.exit_branch_pc)) return false;
         // Snapshot condition-region register values (these dominate the merge — see defect A above).
         std::unordered_map<int,uint32_t> condv_val, conds_val;
         for (int r : condv) condv_val[r] = vget(r);
@@ -1470,8 +1497,8 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
         if (idx < ins.size() && ins[idx].pc == L.exit_branch_pc) ++idx;     // skip the exit branch itself
         b.emit_label(body);
         // 4. Body [after exit_branch, back-edge). Must restore EXEC before looping (bail if left narrowed).
-        if (!emit_range(L.exit_branch_pc + 1, L.backedge_pc)) return {};
-        if (rs.exec_narrowed) return {};
+        if (!emit_range(L.exit_branch_pc + 1, L.backedge_pc)) return false;
+        if (rs.exec_narrowed) return false;
         if (idx < ins.size() && ins[idx].pc == L.backedge_pc) ++idx;        // skip the back-edge branch
         // 5. Continue block branches back to the header; patch each phi's back-edge (value = current, cont).
         b.emit_branch(cont); b.emit_label(cont);
@@ -1493,19 +1520,31 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
             else                  rs.vcc = pr.phi;
         }
         // 7. Post-loop body.
-        if (!emit_range(L.exit_pc, UINT32_MAX)) return {};
+        if (!emit_range(L.exit_pc, UINT32_MAX)) return false;
     } else {
-        for (const auto& in : ins) {
-            if (in.is_end) break;
-            bool ok = true;
-            if (!emit_alu(b, rs, in, ok, true, &safe_branches, /*allow_smem*/true, rt) || !ok) return {};   // compute kernels are pure ALU
-        }
+        if (!emit_range(0, UINT32_MAX)) return false;   // loop-free: straight-line, unchanged behavior
     }
+    (void)safe_branches;
+    return true;
+}
 
+std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
+                                     uint32_t num_inputs, uint32_t out_vgpr,
+                                     const ShaderResourceTable* rt) {
+    std::vector<Rdna2Inst> ins;
+    rdna2_walk(code, dwords, ins);
+    SpirvCompute b;
+    b.begin(num_inputs ? num_inputs : 1);
+    RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
+    auto safe_branches = safe_execz_branches(ins);
+    for (uint32_t k = 0; k < num_inputs; k++) rs.vreg[(int)k] = b.load_input(k);
+    // Compute kernels have no EXP output; reject if one appears.
+    if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/true, /*allow_smem*/true,
+                   [](const Rdna2Inst&){ return false; })) return {};
     auto it = rs.vreg.find((int)out_vgpr);
     uint32_t outbits = it == rs.vreg.end() ? b.uconst(0) : it->second;
-    // If EXEC is still narrowed (a v_cmpx with no restore), masked-off lanes keep the output slot's
-    // prior value; if it was restored to all-lanes-on, every lane stores.
+    // If EXEC is still narrowed (a v_cmpx with no restore), masked-off lanes keep the output slot's prior
+    // value; if it was restored to all-lanes-on, every lane stores.
     if (!rs.exec_narrowed) b.store_output(outbits);
     else                   b.store_output_pred(outbits, rs.exec);
     return b.finish();
@@ -1535,10 +1574,11 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
         auto table_dependent = [](const Rdna2Inst& i) {
             switch (i.fmt) {
                 case Rdna2Format::MIMG: {
-                    // Storage load/store handle 1D/2D/3D + 1D/2D_ARRAY (dims 0,1,2,4,5) and NSA; sample*
-                    // go through the sampled-texture path: 2D non-arrayed, non-NSA only.
-                    const bool ldst_dim = i.mimg_dim <= 2u || i.mimg_dim == 4u || i.mimg_dim == 5u;
-                    if (i.opcode == 0x00u || i.opcode == 0x08u) return ldst_dim;
+                    // Storage load/store handle 1D/2D/3D + 1D/2D_ARRAY (dims 0,1,2,4,5) and NSA; image_load
+                    // also handles 2D_MSAA (dim 6). sample* go through the sampled-texture path (2D, non-NSA).
+                    const bool st_dim = i.mimg_dim <= 2u || i.mimg_dim == 4u || i.mimg_dim == 5u;
+                    if (i.opcode == 0x00u) return st_dim || i.mimg_dim == 6u;   // image_load (+ 2D_MSAA)
+                    if (i.opcode == 0x08u) return st_dim;                       // image_store (no per-sample MSAA store)
                     if (i.opcode == 0x20u || i.opcode == 0x24u || i.opcode == 0x27u) return i.mimg_dim <= 2u && i.len_dwords == 2;
                     return false;
                 }
@@ -1566,23 +1606,17 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords, co
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
     auto safe_branches = safe_execz_branches(ins);
     bool exported = false;
-
-    for (const auto& in : ins) {
-        if (in.is_end) break;
-        if (in.fmt == Rdna2Format::EXP) {                    // EXP MRT0..7 -> the color output
-            if (in.exp_target <= 7 && !exported) {
-                b.export_color(operand_bits(b, rs, in, in.src[0]), operand_bits(b, rs, in, in.src[1]),
-                               operand_bits(b, rs, in, in.src[2]), operand_bits(b, rs, in, in.src[3]));
-                exported = true;
-            }
-            continue;   // ignore NULL / additional exports for now
+    auto exp_fn = [&](const Rdna2Inst& in) -> bool {         // EXP MRT0..7 -> the color output
+        if (in.exp_target <= 7 && !exported) {
+            b.export_color(operand_bits(b, rs, in, in.src[0]), operand_bits(b, rs, in, in.src[1]),
+                           operand_bits(b, rs, in, in.src[2]), operand_bits(b, rs, in, in.src[3]));
+            exported = true;
         }
-        bool ok = true;
-        // Graphics-stage exports do not yet model EXEC-masked export/discard, so reject cmpx for now
-        // instead of accepting a shader that would export from inactive lanes. Memory ops (SMEM/MUBUF)
-        // are allowed only when a resource table is supplied (so their bindings resolve).
-        if (!emit_alu(b, rs, in, ok, false, &safe_branches, /*allow_smem*/rt != nullptr, rt) || !ok) return {};
-    }
+        return true;   // ignore NULL / additional exports for now
+    };
+    // Graphics-stage exports don't model EXEC-masked export/discard, so cmpx is rejected (allow_exec_update
+    // = false); memory ops need a resource table. Loops (if any) are reconstructed by emit_body.
+    if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/false, /*allow_smem*/rt != nullptr, exp_fn)) return {};
     if (!exported) return {};
     return b.finish();
 }
@@ -1597,25 +1631,18 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords, cons
     auto safe_branches = safe_execz_branches(ins);
     rs.vreg[0] = b.load_vertex_index();     // VS ABI: v0 = vertex index
     bool exported = false;
-
-    for (const auto& in : ins) {
-        if (in.is_end) break;
-        if (in.fmt == Rdna2Format::EXP) {                    // EXP POS0..3 -> gl_Position; PARAM -> varyings
-            if (in.exp_target >= 12 && in.exp_target <= 15 && !exported) {
-                b.export_position(operand_bits(b, rs, in, in.src[0]), operand_bits(b, rs, in, in.src[1]),
-                                  operand_bits(b, rs, in, in.src[2]), operand_bits(b, rs, in, in.src[3]));
-                exported = true;
-            } else if (in.exp_target >= 32) {                // PARAM0.. -> Output varying (location N)
-                b.export_param(in.exp_target - 32, operand_bits(b, rs, in, in.src[0]), operand_bits(b, rs, in, in.src[1]),
-                               operand_bits(b, rs, in, in.src[2]), operand_bits(b, rs, in, in.src[3]));
-            }
-            continue;
+    auto exp_fn = [&](const Rdna2Inst& in) -> bool {         // EXP POS0..3 -> gl_Position; PARAM -> varyings
+        if (in.exp_target >= 12 && in.exp_target <= 15 && !exported) {
+            b.export_position(operand_bits(b, rs, in, in.src[0]), operand_bits(b, rs, in, in.src[1]),
+                              operand_bits(b, rs, in, in.src[2]), operand_bits(b, rs, in, in.src[3]));
+            exported = true;
+        } else if (in.exp_target >= 32) {                    // PARAM0.. -> Output varying (location N)
+            b.export_param(in.exp_target - 32, operand_bits(b, rs, in, in.src[0]), operand_bits(b, rs, in, in.src[1]),
+                           operand_bits(b, rs, in, in.src[2]), operand_bits(b, rs, in, in.src[3]));
         }
-        bool ok = true;
-        // cmpx rejected in graphics stages (no EXEC-masked export yet); SMEM/MUBUF allowed only with a
-        // resource table so vertex-fetch / constant bindings resolve.
-        if (!emit_alu(b, rs, in, ok, false, &safe_branches, /*allow_smem*/rt != nullptr, rt) || !ok) return {};
-    }
+        return true;
+    };
+    if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/false, /*allow_smem*/rt != nullptr, exp_fn)) return {};
     if (!exported) return {};
     return b.finish();
 }
