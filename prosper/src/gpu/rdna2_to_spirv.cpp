@@ -27,6 +27,7 @@ enum : uint32_t {
     Op_BitReverse=204,
     Op_TypeImage=25, Op_TypeSampledImage=27, Op_SampledImage=86,
     Op_ImageSampleImplicitLod=87, Op_ImageSampleExplicitLod=88, Op_ImageFetch=95, Op_Image=100,
+    Op_ImageRead=98, Op_ImageWrite=99,
     Op_TypeArray=28, Op_ControlBarrier=224,
     Op_SelectionMerge=247, Op_Label=248, Op_Branch=249, Op_BranchConditional=250, Op_Return=253,
 };
@@ -38,7 +39,11 @@ enum : uint32_t {
     Cap_Shader=1, Addr_Logical=0, Mem_GLSL450=1, Exec_Vertex=0, Exec_Fragment=4, Exec_GLCompute=5,
     EM_OriginUpperLeft=7, EM_LocalSize=17,
     SC_Input=1, SC_UniformConstant=0, SC_Output=3, SC_StorageBuffer=12, FC_None=0,
-    Dim_2D=1,   // SPIR-V Dim (2D image). (Note: coincides with the SQ_RSRC 2D dim value, but distinct.)
+    Dim_1D=0, Dim_2D=1, Dim_3D=2,   // SPIR-V Dim. (2D coincides with the SQ_RSRC 2D dim value, but distinct.)
+    Cap_Sampled1D=43, Cap_Image1D=44,   // Dim=1D needs Sampled1D; a 1D STORAGE image (read/write) also needs Image1D
+    Cap_StorageImageReadWithoutFormat=55, Cap_StorageImageWriteWithoutFormat=56,  // for Format=Unknown storage images
+    Img_Sampled_Storage=2,   // OpTypeImage "Sampled" operand: 2 = used WITHOUT a sampler (read/write storage image)
+    ImgFmt_Unknown=0,        // OpTypeImage "Image Format": Unknown (runtime view format; needs the caps above)
     ImgOp_Lod=2,   // ImageOperands bit: an explicit LOD follows (for OpImageFetch on a sampled image).
     SC_Workgroup=4, Scope_Workgroup=2, MemSem_WGAcqRel=0x108,   // LDS: Workgroup storage + barrier scope/semantics
     Dec_Block=2, Dec_ArrayStride=6, Dec_BuiltIn=11, Dec_Location=30, Dec_Binding=33,
@@ -214,6 +219,87 @@ struct SpirvCompute {
         for (uint32_t c = 0; c < 4; c++) {
             uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, res, c}); out[c] = bcu(e);
         }
+    }
+
+    // --- STORAGE images (MIMG image_load / image_store WITHOUT a sampler; compute copy/blit) ---
+    // Modeled with a UINT-sampled OpTypeImage, Format=Unknown, Sampled=2 (storage), so OpImageRead/Write
+    // move raw 32-bit texels — an exact fit for our untyped-VGPR model (any real format reinterpretation
+    // lives in the bound image view / T# descriptor). Requires the read/write-without-format caps.
+    uint32_t t_v4u_cache = 0;
+    uint32_t t_v4u() { if (!t_v4u_cache) { t_v4u_cache = id(); put(types, Op_TypeVector, {t_v4u_cache, t_u32, 4}); } return t_v4u_cache; }
+    uint32_t t_v3u_c = 0;   // integer coordinate vector type (3D); 2D reuses the shared t_v2u()
+    std::unordered_map<uint32_t, uint32_t> stg_img_type;   // spirv Dim -> OpTypeImage id
+    std::unordered_map<uint32_t, uint32_t> stg_img_var;    // binding -> storage-image OpVariable id
+    bool declared_read_wo_fmt = false, declared_write_wo_fmt = false, declared_sampled1d = false;
+    // Declare (idempotently) a uint storage image of SPIR-V `dim` at set 0, `binding`.
+    void declare_storage_image(uint32_t binding, uint32_t dim) {
+        if (dim == Dim_1D && !declared_sampled1d) {   // SPIR-V: Dim=1D needs Sampled1D; storage 1D also needs Image1D
+            put(caps, Op_Capability, {Cap_Sampled1D});
+            put(caps, Op_Capability, {Cap_Image1D});
+            declared_sampled1d = true;
+        }
+        if (!stg_img_type.count(dim)) {
+            uint32_t ti = id();
+            put(types, Op_TypeImage, {ti, t_u32, dim, 0, 0, 0, Img_Sampled_Storage, ImgFmt_Unknown});
+            stg_img_type[dim] = ti;
+        }
+        if (stg_img_var.count(binding)) return;
+        uint32_t t_ptr = id(); put(types, Op_TypePointer, {t_ptr, SC_UniformConstant, stg_img_type[dim]});
+        uint32_t v = id();     put(types, Op_Variable,    {t_ptr, v, SC_UniformConstant});
+        put(deco, Op_Decorate, {v, Dec_DescriptorSet, 0});
+        put(deco, Op_Decorate, {v, Dec_Binding, binding});
+        stg_img_var[binding] = v;
+    }
+    // Build the integer coordinate operand for `dim` from up to 3 raw-bit VGPR coords (used as u32 texel
+    // indices). 1D = scalar u32; 2D = uvec2; 3D = uvec3.
+    uint32_t stg_coord(uint32_t dim, const uint32_t* c) {
+        if (dim == Dim_1D) return c[0];
+        // 2D reuses the shared uvec2 helper (also used by texelFetch) so a shader mixing a texture
+        // image_load and a 2D storage image doesn't emit a duplicate OpTypeVector %uint 2.
+        if (dim == Dim_2D) { uint32_t v = id(); put(code, Op_CompositeConstruct, {t_v2u(), v, c[0], c[1]}); return v; }
+        // 3D: reuse the compute shell's uvec3 (t_v3u, declared for gl_GlobalInvocationID) if present —
+        // a second OpTypeVector %uint 3 would be an illegal duplicate non-aggregate type.
+        if (!t_v3u_c) {
+            if (t_v3u) t_v3u_c = t_v3u;
+            else { t_v3u_c = id(); put(types, Op_TypeVector, {t_v3u_c, t_u32, 3}); }
+        }
+        uint32_t v = id(); put(code, Op_CompositeConstruct, {t_v3u_c, v, c[0], c[1], c[2]}); return v;
+    }
+    // image_load: OpImageRead the storage image at `binding` (dim gives the coord count); fills out[0..3]
+    // with the RGBA texel components as raw VGPR bits (uint sampled type -> no bitcast needed).
+    // OOB CONTRACT: like a buffer load (which relies on robustBufferAccess), the read is issued for ALL
+    // invocations — including EXEC-inactive lanes whose coordinate may be out of range (e.g. a grid-tail
+    // bounds check narrowed EXEC). The loaded value for such a lane is discarded by write-back predication
+    // (predicate_write) at the call site, so it is harmless — PROVIDED the device enables IMAGE ROBUSTNESS
+    // (robustImageAccess / VK_EXT_image_robustness: OOB image reads return 0), the image analogue of the
+    // robustBufferAccess this recompiler already depends on for buffer loads. The runtime must enable it
+    // (the test harness does). The store side is instead EXEC-predicated (no robust "harmless" OOB write).
+    void image_read(uint32_t binding, uint32_t dim, const uint32_t* coords, uint32_t out[4]) {
+        if (!declared_read_wo_fmt) { put(caps, Op_Capability, {Cap_StorageImageReadWithoutFormat}); declared_read_wo_fmt = true; }
+        uint32_t img   = id(); put(code, Op_Load,      {stg_img_type[dim], img, stg_img_var[binding]});
+        uint32_t coord = stg_coord(dim, coords);
+        uint32_t res   = id(); put(code, Op_ImageRead, {t_v4u(), res, img, coord});
+        for (uint32_t c = 0; c < 4; c++) { uint32_t e = id(); put(code, Op_CompositeExtract, {t_u32, e, res, c}); out[c] = e; }
+    }
+    // image_store: OpImageWrite raw-bit VGPR components vals[0..3] as a uvec4 texel to the storage image.
+    // When `predicated` (narrowed EXEC), the write is wrapped in a selection merge on `pred` (the per-lane
+    // EXEC bool) so inactive lanes do not write — a real conditional store, like cbuf_store. (Image OOB is
+    // not covered by robustBufferAccess, so guarding matters: it also skips a lane's write when EXEC is off
+    // e.g. a grid-tail bounds check.)
+    void image_write(uint32_t binding, uint32_t dim, const uint32_t* coords, const uint32_t vals[4],
+                     bool predicated = false, uint32_t pred = 0) {
+        if (!declared_write_wo_fmt) { put(caps, Op_Capability, {Cap_StorageImageWriteWithoutFormat}); declared_write_wo_fmt = true; }
+        uint32_t img   = id(); put(code, Op_Load, {stg_img_type[dim], img, stg_img_var[binding]});
+        uint32_t coord = stg_coord(dim, coords);
+        uint32_t texel = id(); put(code, Op_CompositeConstruct, {t_v4u(), texel, vals[0], vals[1], vals[2], vals[3]});
+        if (!predicated) { put(code, Op_ImageWrite, {img, coord, texel}); return; }
+        uint32_t then = id(), merge = id();
+        put(code, Op_SelectionMerge, {merge, 0});
+        put(code, Op_BranchConditional, {pred, then, merge});
+        put(code, Op_Label, {then});
+        put(code, Op_ImageWrite, {img, coord, texel});
+        put(code, Op_Branch, {merge});
+        put(code, Op_Label, {merge});
     }
 
     // buffer element pointer: base[ gid.x*stride + k ]
@@ -1036,29 +1122,65 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             return true;
         }
         case Rdna2Format::MIMG: {
-            // Texture read. Needs the resource table for the binding + a graphics shell for t_v4f, so
-            // gated on allow_smem (fragment/vertex) + rt. Minimal correct slice: image_sample (0x20),
-            // 2D, non-NSA (len==2). image_load / other dims / NSA / LOD variants are rejected (deferred),
-            // not mis-translated.
+            // Image op. Needs the resource table for the binding, so gated on allow_smem + rt. Two paths,
+            // selected by the resolved resource's class: a STORAGE image (image_load/image_store, no
+            // sampler — compute copy/blit) or a sampled TEXTURE (image_sample* / image_load via a combined
+            // image+sampler). Other opcodes / NSA / gradient / compare variants are rejected (deferred).
             if (!allow_smem || !rt) { ok = false; return true; }
             const uint32_t SQ_DIM_2D = 1u;
-            // image_sample = 0x20 (implicit-LOD sample), image_sample_l = 0x24 (explicit LOD in the 3rd
-            // coord), image_sample_lz = 0x27 (LOD 0), image_load = 0x00 (integer texel fetch, no sampler).
-            // 2D, non-NSA only; other dims / NSA / gradient / compare variants deferred.
-            const bool is_sample = (in.opcode == 0x20), is_load = (in.opcode == 0x00);
-            const bool is_sample_l = (in.opcode == 0x24), is_sample_lz = (in.opcode == 0x27);
-            if ((!is_sample && !is_load && !is_sample_l && !is_sample_lz) ||
-                in.mimg_dim != SQ_DIM_2D || in.len_dwords != 2) { ok = false; return true; }
-            // Resolve the T# via SRSRC (src[1]) provenance: s_load tag (indirect) else user-data SGPR.
+            auto vread = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
+            // Resolve the T#/U# via SRSRC (src[1]) provenance: s_load tag (indirect) else user-data SGPR.
             const ShaderResource* res = nullptr;
             { auto it = rs.sreg_srt.find(in.src[1].value);
               if (it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second);
               if (!res) res = rt->by_sgpr_base(in.src[1].value); }
-            if (!res || res->cls != ResourceClass::Texture) { ok = false; return true; }
+            if (!res) { ok = false; return true; }
+
+            // --- Storage-image path: image_load (0x00) / image_store (0x08), no sampler, any dim ---
+            if (res->cls == ResourceClass::StorageImage) {
+                const bool is_ld = (in.opcode == 0x00), is_st = (in.opcode == 0x08);
+                if ((!is_ld && !is_st) || in.len_dwords != 2) { ok = false; return true; }  // NSA deferred
+                uint32_t dim, ncoord;
+                switch (in.mimg_dim) {   // SQ_RSRC dim -> SPIR-V Dim + coord count
+                    case 0: dim = Dim_1D; ncoord = 1; break;
+                    case 1: dim = Dim_2D; ncoord = 2; break;
+                    case 2: dim = Dim_3D; ncoord = 3; break;
+                    default: ok = false; return true;   // cube/array/msaa storage images deferred
+                }
+                b.declare_storage_image(res->binding, dim);
+                int va = in.src[0].value;
+                uint32_t coords[3] = {0, 0, 0};
+                for (uint32_t k = 0; k < ncoord; k++) coords[k] = vread(va + (int)k);
+                if (is_ld) {
+                    uint32_t out[4]; b.image_read(res->binding, dim, coords, out);
+                    int vd = in.dst.value, w = 0;   // dmask -> consecutive VDATA VGPRs (LSB=R first)
+                    for (uint32_t c = 0; c < 4; c++) if (in.mimg_dmask & (1u << c)) {
+                        uint32_t old = vreg_old(b, rs, vd + w); rs.vreg[vd + w] = out[c];
+                        predicate_write(b, rs, vd + w, old); w++;
+                    }
+                } else {
+                    // image_store: gather the VDATA VGPRs selected by dmask into an RGBA texel (channels
+                    // absent from dmask store as 0). Under a narrowed EXEC (e.g. a grid-tail bounds check),
+                    // the write is EXEC-predicated so inactive lanes don't write out-of-range texels.
+                    uint32_t vals[4] = { b.uconst(0), b.uconst(0), b.uconst(0), b.uconst(0) };
+                    int vd = in.dst.value, w = 0;
+                    for (uint32_t c = 0; c < 4; c++) if (in.mimg_dmask & (1u << c)) { vals[c] = vread(vd + w); w++; }
+                    b.image_write(res->binding, dim, coords, vals, rs.exec_narrowed, rs.exec);
+                }
+                return true;
+            }
+
+            // --- Sampled-texture path: image_sample* (0x20/0x24/0x27) / image_load (0x00), 2D, non-NSA ---
+            // image_sample = 0x20 (implicit-LOD), image_sample_l = 0x24 (explicit LOD in 3rd coord),
+            // image_sample_lz = 0x27 (LOD 0), image_load = 0x00 (integer texel fetch).
+            const bool is_sample = (in.opcode == 0x20), is_load = (in.opcode == 0x00);
+            const bool is_sample_l = (in.opcode == 0x24), is_sample_lz = (in.opcode == 0x27);
+            if ((!is_sample && !is_load && !is_sample_l && !is_sample_lz) ||
+                in.mimg_dim != SQ_DIM_2D || in.len_dwords != 2) { ok = false; return true; }
+            if (res->cls != ResourceClass::Texture) { ok = false; return true; }
             b.declare_texture(res->binding);
             // coords: VGPR[VADDR], VGPR[VADDR+1] — normalized float for sample, integer texel for load.
             int va = in.src[0].value;
-            auto vread = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
             uint32_t out[4];
             if (is_sample)         b.image_sample_2d(res->binding, vread(va), vread(va + 1), out);
             else if (is_sample_lz) b.image_sample_lod_2d(res->binding, vread(va), vread(va + 1), b.uconst(0), out);   // LOD 0
@@ -1149,19 +1271,26 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
         if (in.fmt == Rdna2Format::EXP) { cov.exports++; continue; }   // handled by the stage recompilers
         bool ok = true;
         bool handled = emit_alu(b, rs, in, ok, /*allow_exec_update*/true, &safe_branches, /*allow_smem*/true) && ok;
-        // Shapes the recompiler handles only in context (a resource table for MIMG sample/load/LOD and
-        // buffer_load/store_format; a fragment stage for VINTRP). This table-less compute-shell pass
-        // rejects them, so count them apart from truly-unsupported (cross-lane, etc.).
-        auto table_dependent = [](Rdna2Format f, uint32_t op) {
-            switch (f) {
-                case Rdna2Format::MIMG:   return op == 0x00u || op == 0x20u || op == 0x24u || op == 0x27u;
-                case Rdna2Format::MUBUF:  return op <= 0x07u;   // buffer_load/store_format_* (need the V#)
-                case Rdna2Format::VINTRP: return true;          // handled in the fragment shell
+        // Shapes the recompiler handles only in context (a resource table for MIMG sample/load/LOD/store
+        // and buffer_load/store_format; a fragment stage for VINTRP). This table-less compute-shell pass
+        // rejects them, so count them apart from truly-unsupported (cross-lane, etc.). Instruction-aware
+        // for MIMG so deferred variants (NSA multi-dword addr; arrayed/cube/MSAA dims) are NOT overcounted
+        // as recompilable — they still land in `unsupported`, matching what the recompiler actually accepts.
+        auto table_dependent = [](const Rdna2Inst& i) {
+            switch (i.fmt) {
+                case Rdna2Format::MIMG: {
+                    const bool op_ok = i.opcode == 0x00u || i.opcode == 0x08u || i.opcode == 0x20u ||
+                                       i.opcode == 0x24u || i.opcode == 0x27u;
+                    const bool dim_ok = i.mimg_dim <= 2u;      // 1D/2D/3D only (not 1D/2D_ARRAY, CUBE, MSAA)
+                    return op_ok && dim_ok && i.len_dwords == 2;   // non-NSA (single address dword group)
+                }
+                case Rdna2Format::MUBUF:  return i.opcode <= 0x07u;   // buffer_load/store_format_* (need the V#)
+                case Rdna2Format::VINTRP: return true;               // handled in the fragment shell
                 default: return false;
             }
         };
         if (handled) { cov.alu++; }
-        else if (table_dependent(in.fmt, in.opcode)) { cov.table_dependent++; }
+        else if (table_dependent(in)) { cov.table_dependent++; }
         else {
             cov.unsupported++;
             if (cov.first_bad_fmt < 0) { cov.first_bad_fmt = (int)in.fmt; cov.first_bad_op = in.opcode; }

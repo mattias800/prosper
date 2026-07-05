@@ -35,8 +35,12 @@ uint32_t data_format_bytes(DataFormat f);
 enum class ResourceClass : uint32_t {
     ConstantBuffer,  // read by s_buffer_load_* (scalar, uniform across the wave)
     VertexBuffer,    // read by buffer_load_format_* (per-lane attribute fetch)
-    Texture,         // read by image_sample / image_load
+    Texture,         // read by image_sample / image_load (sampled image + sampler)
     Sampler,         // paired with a Texture for image_sample
+    StorageImage,    // read/written by image_load / image_store WITHOUT a sampler (compute copy/blit).
+                     // Bound as a Vulkan STORAGE_IMAGE; img_dim gives 1D/2D/3D. Our raw-32-bit-VGPR
+                     // model uses a uint-sampled storage image (Format=Unknown + read/write-without-
+                     // format), so texels move bit-exact (format reinterpretation lives in the descriptor).
 };
 
 // One resource a shader accesses. FILLED BY THE FRONT-HALF from the game's real descriptors (the
