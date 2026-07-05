@@ -1087,6 +1087,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x25: d = b.ibin(Op_IAdd, a, c); break;          // v_add_nc_u32
                 case 0x26: d = b.ibin(Op_ISub, a, c); break;          // v_sub_nc_u32
                 case 0x27: d = b.ibin(Op_ISub, c, a); break;          // v_subrev_nc_u32 (reverse: src1 - src0)
+                // v_mac_f32 (0x1f) / v_fmac_f32 (0x2b): dst = src0*src1 + dst (accumulate into the dest).
+                // mac vs fmac differ only in fused rounding — immaterial here. old_d = the dst accumulator.
+                case 0x1F: case 0x2B: d = b.fbin(Op_FAdd, b.fbin(Op_FMul, a, c), old_d); break;
                 // The four mul-add-with-literal-K ops (K = in.literal). madmk/fmamk = src0*K + src1;
                 // madak/fmaak = src0*src1 + K. (mad vs fma differ only in fused rounding — immaterial here.)
                 case 0x20: case 0x2C: d = b.fbin(Op_FAdd, b.fbin(Op_FMul, a, b.uconst(in.literal)), c); break;  // v_madmk / v_fmamk
