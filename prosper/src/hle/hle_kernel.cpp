@@ -322,7 +322,11 @@ void exc_delivery_handler(int, siginfo_t* si, void* uc_) {
     greg_t* g = uc->uc_mcontext.gregs;
     // FreeBSD amd64 mcontext_t: rdi@0x08 rsi@0x10 rdx@0x18 rcx@0x20 r8@0x28 r9@0x30 rax@0x38
     // rbx@0x40 rbp@0x48 r10@0x50 r11@0x58 r12@0x60 r13@0x68 r14@0x70 r15@0x78 rip@0xA0 rsp@0xB8
-    static __thread uint8_t ctx[0x400];
+    // NOT `static __thread`: guest threads run under a GUEST %fs, so a host thread_local resolves into
+    // the GUEST TLS block — and this buffer's negative tpoff aliased the guest's thread-local GfxDevice
+    // pointer at [fs-0x80], so zeroing it nulled Unity's GfxDevice object graph (the 0xba6e08 wall). A
+    // plain stack buffer lives on the per-thread sigaltstack (SA_ONSTACK, above), clear of the guest TLS.
+    uint8_t ctx[0x400];
     memset(ctx, 0, sizeof ctx);
     auto WQ = [&](int off, uint64_t v) { *(uint64_t*)(ctx + off) = v; };
     WQ(0x08, g[REG_RDI]); WQ(0x10, g[REG_RSI]); WQ(0x18, g[REG_RDX]); WQ(0x20, g[REG_RCX]);
@@ -346,7 +350,14 @@ void ensure_exc_sig() {
     g_exc_sig = SIGRTMIN + 4;                    // free RT signal (not our SIGSEGV/ILL/BUS)
     struct sigaction sa; memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = exc_delivery_handler;
-    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    // SA_ONSTACK: run on the per-thread sigaltstack (installed for the main thread and every worker in
+    // thread_trampoline), NOT the interrupted guest stack. Critical: the guest thread's TLS (%fs base)
+    // can sit only a few hundred bytes below its live stack pointer, so running this handler — and the
+    // guest exception handler it invokes — on the guest stack overruns and ZEROES the guest TLS,
+    // including the thread-local GfxDevice pointer at [fs-0x80]. That is what made Unity's GfxDevice
+    // object graph come up systematically null (the eboot+0xba6e08 / 0x95c823 bring-up wall). Unlike the
+    // fault handler, this handler never siglongjmps, so SA_ONSTACK is safe here.
+    sa.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;
     sigemptyset(&sa.sa_mask);
     sigaction(g_exc_sig, &sa, nullptr);
 }
