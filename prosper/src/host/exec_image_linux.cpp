@@ -119,6 +119,7 @@ namespace {
     // every writer of that slot with its RIP — reveals what sets/clears the scoped device pointer.
     bool     g_hwwatch_req = false;
     int64_t  g_hwwatch_delta = -0x80;
+    char     g_hwwatch_reg[8] = "rax";   // which register the delta is relative to (PROSPER_HWWATCH_REG)
     int      g_hwwatch_fd = -1;
     uint64_t g_hwwatch_addr = 0;
     volatile sig_atomic_t g_hwwatch_count = 0;
@@ -295,15 +296,26 @@ namespace {
                     return (v >= 0x400000000ull && v < 0x420000000ull) ? v - 0x400000000ull : v; };
                 char b[380];
                 int n = snprintf(b, sizeof b,
-                    "[hwbp] #%d rip=eboot+0x%llx rdi=0x%llx rsi=0x%llx r15=0x%llx [rax-0x80]=0x%llx caller=eboot+0x%llx caller2=eboot+0x%llx tid=%ld\n",
+                    "[hwbp] #%d rip=eboot+0x%llx rdi=0x%llx rsi=0x%llx rdx=0x%llx r14=0x%llx ret=eboot+0x%llx caller_rbp=eboot+0x%llx tid=%ld\n",
                     (int)g_hwbp_count, (unsigned long long)((uint64_t)gr[REG_RIP] - 0x400000000ull),
-                    (unsigned long long)rdi, (unsigned long long)rsi, (unsigned long long)r15, rd(rax - 0x80),
-                    off(rd(rbp + 8)), off(rd(rbp)!=0xBADBADull ? rd(*(uint64_t*)(rbp)+8) : 0xBADBAD), cur_tid());
-                (void)r14; (void)rsp;
+                    (unsigned long long)rdi, (unsigned long long)rsi, (unsigned long long)gr[REG_RDX],
+                    (unsigned long long)r14, off(rd(rsp)), off(rd(rbp + 8)), cur_tid());
+                (void)r15; (void)rax;
                 write(2, b, n);
             }
-            // On the first exec hit, optionally arm a data write-watch on [rax + delta] (the TLS slot).
-            if (g_hwwatch_req && g_hwwatch_fd < 0) arm_hwwatch(rax + (uint64_t)g_hwwatch_delta);
+            // On the first exec hit, optionally arm a data write-watch on [<reg> + delta].
+            if (g_hwwatch_req && g_hwwatch_fd < 0) {
+                const char* r = g_hwwatch_reg; uint64_t base = rax;
+                if      (!strcmp(r,"rbx")) base = (uint64_t)gr[REG_RBX];
+                else if (!strcmp(r,"rcx")) base = (uint64_t)gr[REG_RCX];
+                else if (!strcmp(r,"rdx")) base = (uint64_t)gr[REG_RDX];
+                else if (!strcmp(r,"rdi")) base = rdi;
+                else if (!strcmp(r,"rsi")) base = rsi;
+                else if (!strcmp(r,"r14")) base = r14;
+                else if (!strcmp(r,"r15")) base = r15;
+                else if (!strcmp(r,"rbp")) base = (uint64_t)gr[REG_RBP];
+                arm_hwwatch(base + (uint64_t)g_hwwatch_delta);
+            }
             ioctl(g_hwbp_fd, PERF_EVENT_IOC_DISABLE, 0);   // disable so we can step off the bp address
             if (g_hwbp_count < g_hwbp_max) {               // step past, then re-enable for the next hit
                 uc->uc_mcontext.gregs[REG_EFL] |= 0x100ll; g_hwbp_stepping = true;
@@ -640,6 +652,7 @@ void install_trap_handler() {
         if (const char* w = getenv("PROSPER_HWWATCH")) {
             g_hwwatch_req = true;
             if (*w) g_hwwatch_delta = (int64_t)strtoll(w, nullptr, 0);
+            if (const char* rg = getenv("PROSPER_HWWATCH_REG")) { strncpy(g_hwwatch_reg, rg, sizeof(g_hwwatch_reg)-1); g_hwwatch_reg[sizeof(g_hwwatch_reg)-1]=0; }
         }
     }
     install_sigaltstack();
