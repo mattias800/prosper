@@ -24,7 +24,7 @@ presented, framebuffer CRC == golden" is. Each change adds the check that proves
 
 ---
 
-## Current status (2026-07-04) — at a glance
+## Current status (2026-07-05) — at a glance
 
 *(The milestone log below is a historical, append-only record; this section is the current truth.)*
 
@@ -37,16 +37,32 @@ presented, framebuffer CRC == golden" is. Each change adds the check that proves
   - **AGC→Vulkan pipeline** — `pm4_decode → command_processor → render_state/resolve_pipeline_state
     → vk_translate → real VkGraphicsPipeline`, with topology/blend/depth/write-mask pixel-verified,
     plus the `gpu_resources` contract (Buffer/Texture/RT/Depth/ShaderProgram/Pipeline).
-  - **RDNA2→SPIR-V recompiler** — ~52 ALU ops + convert/compare/select/bitfield/pack + **divergent
-    control flow** (EXEC predication, `saveexec`/restore, forward `s_cbranch_execz`); **67%
-    instruction coverage** over the 41 real game shaders (`recompile_coverage`/`shader_histo`).
-    Remaining: `SMEM`/`MUBUF`/`MIMG` (need the resource-binding model) and loops (backward branches).
+  - **RDNA2→SPIR-V recompiler** — full ALU (SOP1/2/K/C, VOP1/2/C/3: arith/convert/compare/select/
+    bitfield/pack, `mul_hi` via OpU/SMulExtended, 64-bit mask ops `s_wqm`/`s_cselect_b64`, `v_mad_f32`
+    from gfx10.1); **divergent control flow** (EXEC predication, `saveexec`/restore, forward
+    `s_cbranch_execz`, SCC); the full **resource-binding memory path** — `SMEM` constant buffers,
+    `MUBUF` vertex-fetch + format load/store, `MIMG` sampled textures (`image_sample`/`_l`/`_lz`,
+    `image_load`) AND compute **storage images** (`image_load`/`image_store`, 1D/2D/3D + 1D/2D_ARRAY,
+    NSA split-address coords), `LDS`+`s_barrier`, `VINTRP`; and trivial (all-DWORD) `SDWA`. **~86%
+    instruction coverage; 30 of 41 real game shaders fully recompile in-context** — every bring-up-
+    critical class (position/blit/clear, textured, interpolated, image-copy, integer-divide). All
+    strictly `spirv-val`-validated and, where a harness exists, execution-differential-tested on real
+    Vulkan (`recompile_coverage`/`shader_histo`/`test_rdna2_to_spirv`). Remaining 11 shaders need deep
+    features only: **structured control-flow reconstruction** (uniform branches + loops → SPIR-V
+    if/else + `OpPhi`), **NGG** primitive-shader preambles (`s_sendmsg`/`exp prim`), and cube/MSAA
+    image dims — none needed for the initial frame.
   - **`GpuState → recompiled shaders → VkPipeline → frame`** spine proven end-to-end (pixel-verified).
-- 🚧 **Live boot blocker (root-caused, fix in progress):** Unity's GPU-resource **residency pass is
-  completion-event-driven** — it runs when the game drains a GPU-completion event from the AGC equeue.
-  Our headless equeue never delivers one, so pipeline objects stay unprocessed (null companion → later
-  deref fault). Fix = **deliver a real completion event on submit/flip** so the game's own pass runs
-  (not fabricate residency). When it fires, real draws flow into the spine above. See `docs/GRAPHICS.md`.
+- 🚧 **Live boot blocker (root-caused; needs an interactive/reference-backed session):** the game boots
+  through IL2CPP into Unity's `GfxDevice` bring-up and faults **before any draw**, dereferencing a null
+  GPU companion `[pipeline+0x140]` for category-{5,9,15} pipelines during a GC/deferred-release drain.
+  The CPU-side GfxDevice object graph comes up **systematically null**. Root-cause work **corrected three
+  successive misattributions** (the "completion-event-driven residency pass", the `0xd58710`
+  reflection-predicate, and the `k3GhuSNmBLU`/type-store probe designs — all disproven with evidence);
+  the remaining question is which absent/stubbed AGC-GPU-resource call should build that companion.
+  Autonomous probe-cycles return corrections, not a fix, at high cost — this needs a focused, likely
+  reference-backed debugging session. The recompiler + pipeline are staged and verified: the moment this
+  wall falls and real draws flow through `run_command_buffer`, the spine above renders them. Full brief:
+  `docs/GFXDEVICE_BRINGUP_PROBLEM.md`.
 - 🔁 **Multi-agent + CI:** developed by parallel agents (recompiler/back-half, AGC/host front-half,
   infra/review) over a branch-protected `master`; GitHub Actions builds + `ctest` on Linux + Windows.
 
