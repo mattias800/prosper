@@ -18,12 +18,19 @@ makes this project possible without console keys.
 - 🚧 **M4/M5 — Graphics (AGC → Vulkan), active.** AGC command frontend complete (CreateShader +
   SubmitDcb, zero unimplemented `libSceAgc` calls); PM4 decode → command processor → render state →
   `resolve_pipeline_state` → a real `VkGraphicsPipeline` (topology/blend/depth/write-mask
-  pixel-verified). **RDNA2→SPIR-V recompiler**: ~52 ALU ops + **divergent control flow** (EXEC
-  predication, saveexec/restore, forward branches), **67% instruction coverage** over the 41 real
-  game shaders (`shader_histo`); the wall is `SMEM` (needs the resource-binding model). Boot root
-  cause found: the GPU-resource residency pass is **completion-event-driven** and our headless equeue
-  never fires it — fix in progress is delivering a real completion on submit/flip. See
-  [`docs/GRAPHICS.md`](docs/GRAPHICS.md).
+  pixel-verified). **RDNA2→SPIR-V recompiler — the back-half render path is comprehensively done:**
+  full ALU (float/int/bitwise/convert/compare/select) + `SCC` (`s_cmp`/`s_cselect`); **divergent
+  control flow** (EXEC predication, saveexec/restore, forward + guard-to-`s_endpgm` `execz`); **memory**
+  — `SMEM` x1–x16, `MUBUF` load + vertex-fetch (float32/unorm/snorm/f16) + store (raw + packed),
+  `MIMG` `image_sample`/`_l`/`_lz`/`image_load` (real textures), `LDS` + `s_barrier`; **shader I/O** —
+  `EXP` MRT/POS/PARAM + `VINTRP` interpolation. Every path is strictly `spirv-val`-verified
+  (`spv_validate`). Coverage over the 41 real game shaders: **79.7% recompilable in context**, 10/41
+  fully covered *given resource tables* (`shader_histo`). End-to-end demos render a **textured triangle
+  with interpolated UVs** and the game's **own recompiled pixel shader** (see `screenshots/`). The
+  remaining gap to the game's *own* format-dependent shaders is the **resource table** — which is built
+  from the shader's *draw-time* bound descriptors, so it is gated on the game reaching draw submission =
+  the Unity **GfxDevice boot wall** (front-half), not the recompiler. See
+  [`docs/GRAPHICS.md`](docs/GRAPHICS.md) and [`docs/RESOURCE_BINDING.md`](docs/RESOURCE_BINDING.md).
 
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) for milestones, [`docs/GRAPHICS.md`](docs/GRAPHICS.md) for
 the graphics frontier, and [`docs/VERIFICATION.md`](docs/VERIFICATION.md) for the agentic-first
@@ -39,7 +46,7 @@ prosper/
   src/host/        host execution: image mapping, stubs, fault handling (Linux)
   src/gpu/         AGC→Vulkan: PM4 decode, command processor, render state,
                    vk_translate, resource layer (gpu_resources), RDNA2→SPIR-V recompiler
-  tools/           self_dump, boot_trace, shader_histo, imgdump
+  tools/           self_dump, boot_trace, shader_histo, imgdump, spv_validate
   tests/           unit + boot + Vulkan-execution tests (ctest)
   CMakeLists.txt
 ```
