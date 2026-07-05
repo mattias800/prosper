@@ -3,8 +3,10 @@
 #include "rdna2_decode.hpp"
 #include "shader_resources.hpp"
 #include <cstring>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace prosper::gpu {
 namespace {
@@ -30,6 +32,7 @@ enum : uint32_t {
     Op_ImageSampleImplicitLod=87, Op_ImageSampleExplicitLod=88, Op_ImageFetch=95, Op_Image=100,
     Op_ImageRead=98, Op_ImageWrite=99,
     Op_TypeArray=28, Op_ControlBarrier=224,
+    Op_Phi=245, Op_LoopMerge=246,
     Op_SelectionMerge=247, Op_Label=248, Op_Branch=249, Op_BranchConditional=250, Op_Return=253,
 };
 // GLSL.std.450 extended-instruction numbers.
@@ -117,6 +120,22 @@ struct SpirvCompute {
     uint32_t bfalse() { if (!bconst_false) { bconst_false = id(); put(types, Op_ConstantFalse, {t_bool, bconst_false}); } return bconst_false; }
     uint32_t sel(uint32_t cond, uint32_t tval, uint32_t fval) { uint32_t r = id(); put(code, Op_Select, {t_u32, r, cond, tval, fval}); return r; }
     uint32_t bsel(uint32_t cond, uint32_t tval, uint32_t fval) { uint32_t r = id(); put(code, Op_Select, {t_bool, r, cond, tval, fval}); return r; }  // bool-domain select (wave masks)
+
+    // --- Structured control-flow primitives (for counted-loop reconstruction) ---
+    uint32_t cur_block = 0;   // label id of the block currently being emitted (predecessor for OpPhi)
+    void emit_label(uint32_t l)          { put(code, Op_Label, {l}); cur_block = l; }
+    void emit_branch(uint32_t t)         { put(code, Op_Branch, {t}); }
+    void emit_condbranch(uint32_t c, uint32_t t, uint32_t f) { put(code, Op_BranchConditional, {c, t, f}); }
+    void emit_loopmerge(uint32_t m, uint32_t c)              { put(code, Op_LoopMerge, {m, c, 0}); }
+    // OpPhi with two predecessors; the back-edge (value,label) is patched later via patch_phi(). Returns
+    // the phi result id and sets `patch_off` to the code index of the placeholder back-edge value word.
+    uint32_t emit_phi2(uint32_t type, uint32_t v0, uint32_t l0, size_t& patch_off) {
+        uint32_t r = id();
+        put(code, Op_Phi, {type, r, v0, l0, 0u, 0u});
+        patch_off = code.size() - 2;   // the trailing {v1, l1} placeholders
+        return r;
+    }
+    void patch_phi(size_t patch_off, uint32_t v1, uint32_t l1) { code[patch_off] = v1; code[patch_off + 1] = l1; }
     // Signed-int helpers: bits are bitcast to i32, the op runs, and the i32 result is bitcast to bits.
     uint32_t bcs(uint32_t u) { uint32_t r = id(); put(code, Op_Bitcast, {t_i32, r, u}); return r; }   // bits -> i32
     uint32_t i2u(uint32_t i) { uint32_t r = id(); put(code, Op_Bitcast, {t_u32, r, i}); return r; }   // i32 -> bits
@@ -313,10 +332,10 @@ struct SpirvCompute {
         uint32_t then = id(), merge = id();
         put(code, Op_SelectionMerge, {merge, 0});
         put(code, Op_BranchConditional, {pred, then, merge});
-        put(code, Op_Label, {then});
+        put(code, Op_Label, {then}); cur_block = then;
         put(code, Op_ImageWrite, {img, coord, texel});
         put(code, Op_Branch, {merge});
-        put(code, Op_Label, {merge});
+        put(code, Op_Label, {merge}); cur_block = merge;
     }
 
     // buffer element pointer: base[ gid.x*stride + k ]
@@ -347,11 +366,11 @@ struct SpirvCompute {
         uint32_t then = id(), merge = id();
         put(code, Op_SelectionMerge, {merge, 0});
         put(code, Op_BranchConditional, {pred, then, merge});
-        put(code, Op_Label, {then});
+        put(code, Op_Label, {then}); cur_block = then;
         uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_sb_u32, p, buf, uconst(0), idx});
         put(code, Op_Store, {p, value});
         put(code, Op_Branch, {merge});
-        put(code, Op_Label, {merge});
+        put(code, Op_Label, {merge}); cur_block = merge;
     }
     // LDS (Local Data Share) — a workgroup-shared u32 array for compute ds_read/ds_write. Declared on
     // first use. 4096 dwords (16 KB, the RDNA2 per-workgroup LDS size).
@@ -377,11 +396,11 @@ struct SpirvCompute {
         uint32_t then = id(), merge = id();
         put(code, Op_SelectionMerge, {merge, 0});
         put(code, Op_BranchConditional, {pred, then, merge});
-        put(code, Op_Label, {then});
+        put(code, Op_Label, {then}); cur_block = then;
         uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_wg_u32, p, lds_var, idx});
         put(code, Op_Store, {p, value});
         put(code, Op_Branch, {merge});
-        put(code, Op_Label, {merge});
+        put(code, Op_Label, {merge}); cur_block = merge;
     }
     // s_barrier: workgroup execution + memory barrier (OpControlBarrier).
     void barrier() {
@@ -461,7 +480,7 @@ struct SpirvCompute {
         put(types, Op_TypePointer, {t_ptr_sb_f32, SC_StorageBuffer, t_f32});
         declare_cbufs();   // scalar-memory constant/vertex buffers (bindings 2 & 3)
         put(code, Op_Function, {t_void, f_main, FC_None, t_fn});
-        put(code, Op_Label, {lbl});
+        put(code, Op_Label, {lbl}); cur_block = lbl;
         uint32_t ld = id(); put(code, Op_Load, {t_v3u, ld, v_gid});
         gidx = id(); put(code, Op_CompositeExtract, {t_u32, gidx, ld, 0});
     }
@@ -488,7 +507,7 @@ struct SpirvCompute {
         put(types, Op_Variable, {t_ptr_out, v_color, SC_Output});
         if (with_cbufs) declare_cbufs();   // only when the shader has memory ops (keeps no-op renders binding-free)
         put(code, Op_Function, {t_void, f_main, FC_None, t_fn});
-        put(code, Op_Label, {lbl});
+        put(code, Op_Label, {lbl}); cur_block = lbl;
     }
     // Write a vec4(r,g,b,a) (bit-operands) to the fragment color output (EXP MRT0).
     void export_color(uint32_t r, uint32_t g, uint32_t bl, uint32_t a) {
@@ -526,7 +545,7 @@ struct SpirvCompute {
         put(types, Op_TypePointer, {t_ptr_out_v4f, SC_Output, t_v4f});
         if (with_cbufs) declare_cbufs();   // vertex fetch (buffer_load_format_*) reads these
         put(code, Op_Function, {t_void, f_main, FC_None, t_fn});
-        put(code, Op_Label, {lbl});
+        put(code, Op_Label, {lbl}); cur_block = lbl;
     }
     // Load gl_VertexIndex as raw bits (VGPR v0 for a vertex shader).
     uint32_t load_vertex_index() { uint32_t r = id(); put(code, Op_Load, {t_i32, r, v_vid}); return i2u(r); }
@@ -655,6 +674,90 @@ std::unordered_set<uint32_t> safe_execz_branches(const std::vector<Rdna2Inst>& i
         if (ok) safe.insert(br.pc);
     }
     return safe;
+}
+
+// A recognized COUNTED loop (the game's MSAA-resolve / accumulation shape): a single backward
+// unconditional branch (the back-edge) to a header, with exactly one forward SCC exit branch inside.
+// Anything more complex (nested loops, VCC/EXECNZ exits, multiple back-edges, mid-loop s_branch) is
+// rejected — the recompiler then falls back to the straight-line path (which fails on the loop, as before).
+struct CountedLoop {
+    bool found = false;
+    uint32_t header_pc = 0;       // loop header (target of the back-edge; condition eval starts here)
+    uint32_t exit_branch_pc = 0;  // the forward s_cbranch_scc0/scc1 that leaves the loop
+    uint32_t backedge_pc = 0;     // the backward s_branch
+    uint32_t exit_pc = 0;         // first pc after the loop (== backedge_pc + its length)
+    bool exit_on_scc0 = true;     // s_cbranch_scc0 (exit when SCC==0) vs s_cbranch_scc1 (exit when SCC==1)
+};
+inline uint32_t branch_target(const Rdna2Inst& in) { return in.pc + in.len_dwords + (uint32_t)(int32_t)in.simm16; }
+
+CountedLoop detect_counted_loop(const std::vector<Rdna2Inst>& ins) {
+    CountedLoop L;
+    const Rdna2Inst* back = nullptr; int nback = 0;
+    for (const auto& in : ins) {
+        if (in.is_end) break;
+        if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x02 && in.simm16 < 0) { back = &in; nback++; }
+    }
+    if (nback != 1) return L;                       // 0 -> no loop; >1 -> nested/multiple (unhandled)
+    const uint32_t header = branch_target(*back);
+    bool header_ok = false;
+    for (const auto& in : ins) if (in.pc == header && in.pc < back->pc) { header_ok = true; break; }
+    if (!header_ok) return L;
+    const uint32_t exit_pc = back->pc + back->len_dwords;
+    const Rdna2Inst* exitbr = nullptr; int nexit = 0;
+    for (const auto& in : ins) {                    // scan the loop body [header, back-edge]
+        if (in.pc < header || in.pc > back->pc || in.fmt != Rdna2Format::SOPP) continue;
+        switch (in.opcode) {
+            case 0x04: case 0x05:                   // s_cbranch_scc0 / scc1 — must be the single exit
+                if (branch_target(in) != exit_pc) return L;
+                exitbr = &in; nexit++; break;
+            case 0x02:                              // any s_branch other than the back-edge -> reject
+                if (&in != back) return L; break;
+            case 0x06: case 0x07: case 0x09:        // vcc / execnz branches -> reject
+                return L;
+            case 0x08: default: break;              // execz (forward, predication-handled) / hints ok
+        }
+    }
+    if (nexit != 1) return L;
+    L.found = true; L.header_pc = header; L.exit_branch_pc = exitbr->pc; L.backedge_pc = back->pc;
+    L.exit_pc = exit_pc; L.exit_on_scc0 = (exitbr->opcode == 0x04);
+    return L;
+}
+
+// Registers WRITTEN in the pc range [lo, hi): candidates for an OpPhi at the loop header. Over-
+// approximation is safe (an extra phi for a non-carried value merges equal values). Mirrors emit_alu's
+// write targets, INCLUDING multi-register writes (MIMG dmask -> N consecutive VGPRs, SMEM -> N SGPRs) so
+// no genuinely-carried register is missed (a missing phi = an undominated use = invalid SPIR-V).
+void loop_written_regs(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t hi,
+                       std::set<int>& vregs, std::set<int>& sregs) {
+    for (const auto& in : ins) {
+        if (in.pc < lo || in.pc >= hi) continue;
+        switch (in.fmt) {
+            case Rdna2Format::VOP1:
+                if (in.opcode == 0x02) sregs.insert(in.dst.value);        // v_readfirstlane -> SGPR
+                else vregs.insert(in.dst.value); break;
+            case Rdna2Format::VOP2: case Rdna2Format::VOP3:
+                vregs.insert(in.dst.value); break;
+            case Rdna2Format::DS:                                          // ds_read writes one VGPR
+                if (in.opcode == 0x36) vregs.insert(in.dst.value); break;
+            case Rdna2Format::MUBUF: {                                     // load_format/load: N consecutive VGPRs
+                uint32_t n = 1; switch (in.opcode) { case 0x1: case 0x5: case 0xD: n=2; break;
+                    case 0x2: case 0x6: n=3; break; case 0x3: case 0x7: case 0xE: n=4; break; }
+                for (uint32_t k = 0; k < n; k++) vregs.insert(in.dst.value + (int)k); break;
+            }
+            case Rdna2Format::MIMG: {                                      // image_load: one VGPR per dmask bit
+                int w = 0; for (uint32_t c = 0; c < 4; c++) if (in.mimg_dmask & (1u << c)) vregs.insert(in.dst.value + w++);
+                break;
+            }
+            case Rdna2Format::SOP1: case Rdna2Format::SOP2: case Rdna2Format::SOPK:
+                sregs.insert(in.dst.value); break;
+            case Rdna2Format::SMEM: {                                      // s_load/s_buffer_load: N consecutive SGPRs
+                uint32_t n = 1; switch (in.opcode) { case 0x1: case 0x9: n=2; break; case 0x2: case 0xA: n=4; break;
+                    case 0x3: case 0xB: n=8; break; case 0x4: case 0xC: n=16; break; }
+                for (uint32_t k = 0; k < n; k++) sregs.insert(in.dst.value + (int)k); break;
+            }
+            default: break;                          // VOPC/SOPC write VCC/SCC — handled by their own phis
+        }
+    }
 }
 
 // Resolve an operand to its raw 32-bit value (bits). Float ops bitcast these to float.
@@ -1314,10 +1417,89 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
     auto safe_branches = safe_execz_branches(ins);
     for (uint32_t k = 0; k < num_inputs; k++) rs.vreg[(int)k] = b.load_input(k);
 
-    for (const auto& in : ins) {
-        if (in.is_end) break;
-        bool ok = true;
-        if (!emit_alu(b, rs, in, ok, true, &safe_branches, /*allow_smem*/true, rt) || !ok) return {};   // compute kernels are pure ALU
+    // A recognized COUNTED loop is emitted as a real structured SPIR-V loop (OpLoopMerge + OpPhi for the
+    // loop-carried registers). Loop-FREE shaders take the unchanged straight-line path below, so nothing
+    // that already works is perturbed. Anything but the simple single-back-edge/single-SCC-exit shape is
+    // not detected and falls through (and, as before, fails on the back-edge → returns {}).
+    const CountedLoop L = detect_counted_loop(ins);
+    size_t idx = 0;
+    auto emit_range = [&](uint32_t pc_lo, uint32_t pc_hi) -> bool {   // emit ins whose pc ∈ [pc_lo, pc_hi)
+        for (; idx < ins.size(); ++idx) {
+            const Rdna2Inst& in = ins[idx];
+            if (in.is_end || in.pc >= pc_hi) break;
+            if (in.pc < pc_lo) continue;
+            bool ok = true;
+            if (!emit_alu(b, rs, in, ok, true, &safe_branches, /*allow_smem*/true, rt) || !ok) return false;
+        }
+        return true;
+    };
+    if (L.found) {
+        auto vget = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
+        auto sget = [&](int r){ auto it = rs.sreg.find(r); return it == rs.sreg.end() ? b.uconst(0) : it->second; };
+        // 1. Pre-loop body. Loops require full EXEC at entry (per-lane loop semantics); bail if narrowed.
+        if (!emit_range(0, L.header_pc)) return {};
+        if (rs.exec_narrowed) return {};
+        // 2. Loop-carried registers -> a header OpPhi each. `cond_written` = regs written in the CONDITION
+        // region [header, exit_branch): those execute on the exiting iteration too, so their post-loop
+        // value is the condition-block value (which dominates the merge), NOT the phi (defect A). SCC/VCC
+        // always get a phi so any cross-iteration carry is valid SSA (defect C); they're recomputed each
+        // iteration in practice, so the phi is usually dead — harmless.
+        std::set<int> cv, cs, condv, conds;
+        loop_written_regs(ins, L.header_pc, L.backedge_pc, cv, cs);
+        loop_written_regs(ins, L.header_pc, L.exit_branch_pc, condv, conds);
+        const uint32_t preheader = b.cur_block;
+        const uint32_t hdr = b.id(), check = b.id(), body = b.id(), cont = b.id(), merge = b.id();
+        b.emit_branch(hdr); b.emit_label(hdr);
+        struct PhiRec { int reg; int dom; uint32_t phi; size_t patch; };   // dom: 0=vreg,1=sreg,2=scc,3=vcc
+        std::vector<PhiRec> phis;
+        for (int r : cv) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, vget(r), preheader, p); rs.vreg[r] = ph; phis.push_back({r, 0, ph, p}); }
+        for (int r : cs) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, sget(r), preheader, p); rs.sreg[r] = ph; phis.push_back({r, 1, ph, p}); }
+        { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.scc, preheader, p); rs.scc = ph; phis.push_back({0, 2, ph, p}); }
+        { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.vcc, preheader, p); rs.vcc = ph; phis.push_back({0, 3, ph, p}); }
+        b.emit_loopmerge(merge, cont); b.emit_branch(check); b.emit_label(check);
+        // 3. Condition block: emit [header, exit_branch); the SCC exit becomes OpBranchConditional.
+        if (!emit_range(L.header_pc, L.exit_branch_pc)) return {};
+        // Snapshot condition-region register values (these dominate the merge — see defect A above).
+        std::unordered_map<int,uint32_t> condv_val, conds_val;
+        for (int r : condv) condv_val[r] = vget(r);
+        for (int r : conds) conds_val[r] = sget(r);
+        // s_cbranch_scc0 exits when SCC==0 (so the loop CONTINUES when SCC!=0); scc1 is the inverse.
+        uint32_t loop_cond = L.exit_on_scc0 ? rs.scc : b.bsel(rs.scc, b.bfalse(), b.btrue());
+        b.emit_condbranch(loop_cond, body, merge);
+        while (idx < ins.size() && ins[idx].pc < L.exit_branch_pc) ++idx;   // (already past it)
+        if (idx < ins.size() && ins[idx].pc == L.exit_branch_pc) ++idx;     // skip the exit branch itself
+        b.emit_label(body);
+        // 4. Body [after exit_branch, back-edge). Must restore EXEC before looping (bail if left narrowed).
+        if (!emit_range(L.exit_branch_pc + 1, L.backedge_pc)) return {};
+        if (rs.exec_narrowed) return {};
+        if (idx < ins.size() && ins[idx].pc == L.backedge_pc) ++idx;        // skip the back-edge branch
+        // 5. Continue block branches back to the header; patch each phi's back-edge (value = current, cont).
+        b.emit_branch(cont); b.emit_label(cont);
+        for (auto& pr : phis) {
+            uint32_t nv = pr.dom == 0 ? vget(pr.reg) : pr.dom == 1 ? sget(pr.reg) : pr.dom == 2 ? rs.scc : rs.vcc;
+            b.patch_phi(pr.patch, nv, cont);
+        }
+        b.emit_branch(hdr);
+        // 6. Merge (loop exit): a condition-region reg keeps its exit-iteration (%check) value; a body-only
+        //    reg (and scc/vcc) takes the header phi (its value when the loop exited).
+        b.emit_label(merge);
+        for (auto& pr : phis) {
+            if (pr.dom == 0)      rs.vreg[pr.reg] = condv.count(pr.reg) ? condv_val[pr.reg] : pr.phi;
+            else if (pr.dom == 1) rs.sreg[pr.reg] = conds.count(pr.reg) ? conds_val[pr.reg] : pr.phi;
+            // SCC/VCC take the phi (not a condition-region snapshot): reading a wave flag AFTER a loop is
+            // not a real codegen pattern (flags are transient, consumed by their branch), so the A-class
+            // exit-iteration refinement is intentionally omitted for them.
+            else if (pr.dom == 2) rs.scc = pr.phi;
+            else                  rs.vcc = pr.phi;
+        }
+        // 7. Post-loop body.
+        if (!emit_range(L.exit_pc, UINT32_MAX)) return {};
+    } else {
+        for (const auto& in : ins) {
+            if (in.is_end) break;
+            bool ok = true;
+            if (!emit_alu(b, rs, in, ok, true, &safe_branches, /*allow_smem*/true, rt) || !ok) return {};   // compute kernels are pure ALU
+        }
     }
 
     auto it = rs.vreg.find((int)out_vgpr);
