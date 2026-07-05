@@ -11,11 +11,15 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <sys/ioctl.h>
 #include <fcntl.h>
+#include <linux/perf_event.h>
+#include <linux/hw_breakpoint.h>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
+#include <cerrno>
 #include <map>
 #include <mutex>
 
@@ -98,6 +102,72 @@ namespace {
         mprotect((void*)pg, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
         *(volatile uint8_t*)addr = val;
         __builtin___clear_cache((char*)addr, (char*)addr + 1);
+    }
+    // PROSPER_HWBP=0xOFFSET: a RACE-FREE x86 hardware execute breakpoint (via perf_event_open, no code
+    // modification) that logs registers at each hit. The int3 logger corrupts hot/multi-threaded code;
+    // this doesn't touch code, so it is safe there. Stepping past a hit uses per-thread TF (also race-
+    // free) with the perf event disabled during the step. Armed on the main thread (pid=0 = calling
+    // thread); breakpoints are per-thread, so this observes main-thread execution of the target.
+    bool     g_hwbp_on = false;
+    uint64_t g_hwbp_addr = 0;
+    int      g_hwbp_fd = -1;
+    bool     g_hwbp_stepping = false;
+    volatile sig_atomic_t g_hwbp_count = 0;
+    int      g_hwbp_max = 200;
+    // Optional chained DATA write-watchpoint: on the first exec-bp hit, arm a HW write watch on
+    // [rax + g_hwwatch_delta] (default rax-0x80, the thread-local device slot the ctor reads). Catches
+    // every writer of that slot with its RIP — reveals what sets/clears the scoped device pointer.
+    bool     g_hwwatch_req = false;
+    int64_t  g_hwwatch_delta = -0x80;
+    int      g_hwwatch_fd = -1;
+    uint64_t g_hwwatch_addr = 0;
+    volatile sig_atomic_t g_hwwatch_count = 0;
+    long perf_bp_open(uint64_t addr, uint32_t bp_type) {
+        struct perf_event_attr pe; memset(&pe, 0, sizeof pe);
+        pe.type = PERF_TYPE_BREAKPOINT; pe.size = sizeof pe;
+        pe.bp_type = bp_type; pe.bp_addr = addr;
+        pe.bp_len = (bp_type == HW_BREAKPOINT_X) ? sizeof(long) : (uint64_t)HW_BREAKPOINT_LEN_8;
+        pe.sample_period = 1; pe.disabled = 1; pe.exclude_kernel = 1; pe.exclude_hv = 1;
+        return syscall(SYS_perf_event_open, &pe, 0, -1, -1, 0UL);
+    }
+    // Async-safe-ish: write the /proc/self/maps line containing `addr` to stderr (identifies the module
+    // that a writer RIP belongs to). Fixed buffers, no malloc; open/read/write are signal-safe.
+    void classify_addr(uint64_t addr) {
+        int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return;
+        char buf[8192]; ssize_t got; char line[512]; size_t li = 0;
+        char pend[96]; int pn = snprintf(pend, sizeof pend, "[hwwatch]   writer 0x%llx is in: ", (unsigned long long)addr);
+        while ((got = read(fd, buf, sizeof buf)) > 0) {
+            for (ssize_t i = 0; i < got; i++) {
+                char c = buf[i];
+                if (c != '\n' && li < sizeof(line) - 1) { line[li++] = c; continue; }
+                line[li] = 0;
+                // parse "start-end" hex prefix
+                uint64_t s = 0, e = 0; const char* p = line; bool ok = true;
+                auto hx = [&](uint64_t& out) { uint64_t v = 0; int d = 0; for (; *p && *p != '-' && *p != ' '; p++) {
+                    char h = *p; int nib; if (h>='0'&&h<='9') nib=h-'0'; else if (h>='a'&&h<='f') nib=h-'a'+10;
+                    else { ok=false; return; } v=(v<<4)|nib; d++; } out=v; if(!d) ok=false; };
+                hx(s); if (*p=='-') { p++; hx(e); }
+                if (ok && addr >= s && addr < e) { write(2, pend, pn); write(2, line, (size_t)li);
+                    write(2, "\n", 1); close(fd); return; }
+                li = 0;
+            }
+        }
+        close(fd);
+    }
+    void arm_hwwatch(uint64_t addr) {
+        long fd = perf_bp_open(addr, HW_BREAKPOINT_W);
+        char b[160];
+        if (fd < 0) { int n = snprintf(b, sizeof b, "[hwwatch] perf W-watch FAILED addr=0x%llx errno=%d\n",
+                          (unsigned long long)addr, errno); write(2, b, n); return; }
+        g_hwwatch_fd = (int)fd; g_hwwatch_addr = addr;
+        fcntl(g_hwwatch_fd, F_SETFL, O_ASYNC);
+        fcntl(g_hwwatch_fd, F_SETSIG, SIGTRAP);
+        struct f_owner_ex ow; ow.type = F_OWNER_TID; ow.pid = (pid_t)syscall(SYS_gettid);
+        fcntl(g_hwwatch_fd, F_SETOWN_EX, &ow);
+        ioctl(g_hwwatch_fd, PERF_EVENT_IOC_ENABLE, 0);
+        int n = snprintf(b, sizeof b, "[hwwatch] armed W-watch at 0x%llx (fd=%d)\n",
+                         (unsigned long long)addr, g_hwwatch_fd); write(2, b, n);
     }
     // PROSPER_PEEK dumps offsets off registers at fault time. Supports N specs separated by ';',
     // each "reg:off,off,..."; an offset may be prefixed '*' to chase one pointer level first
@@ -182,6 +252,64 @@ namespace {
     volatile sig_atomic_t g_lazy_pages = 0;                 // count (diagnostic)
 
     void fault_handler(int sig, siginfo_t* si, void* uctx) {
+        // PROSPER_HWBP race-free hardware breakpoint. The perf event is disabled while single-stepping,
+        // so a SIGTRAP while g_hwbp_stepping is the step-completion (TF) -> re-enable + clear TF. Any
+        // other SIGTRAP while armed is a HW-breakpoint hit -> log registers, then disable + single-step
+        // over it (TF), re-enabling on the step trap. No code bytes are touched (unlike int3), so this is
+        // safe on hot/multi-threaded functions.
+        if (sig == SIGTRAP && g_hwbp_on && g_hwbp_fd >= 0) {
+            auto* uc = (ucontext_t*)uctx;
+            if (g_hwbp_stepping && si->si_code == TRAP_TRACE) {
+                ioctl(g_hwbp_fd, PERF_EVENT_IOC_ENABLE, 0);
+                uc->uc_mcontext.gregs[REG_EFL] &= ~0x100ll;
+                g_hwbp_stepping = false;
+                return;
+            }
+            // Chained DATA write-watchpoint hit (a write to the watched slot completed): log the writer
+            // RIP + the value just stored. Write-watchpoints trap AFTER the store, so no step is needed.
+            if (g_hwwatch_fd >= 0 && si->si_fd == g_hwwatch_fd) {
+                auto& gr2 = uc->uc_mcontext.gregs;
+                unsigned long long v = 0; { auto p=(volatile uint64_t*)g_hwwatch_addr; v=*p; }
+                if (g_hwwatch_count < 60) {
+                    g_hwwatch_count = g_hwwatch_count + 1;
+                    char b[200];
+                    uint64_t wr = (uint64_t)gr2[REG_RIP];
+                    bool in_eboot = (wr >= 0x400000000ull && wr < 0x420000000ull);
+                    int n = snprintf(b, sizeof b, "[hwwatch] #%d WRITE [0x%llx]=0x%llx by rip=%s0x%llx tid=%ld\n",
+                        (int)g_hwwatch_count, (unsigned long long)g_hwwatch_addr, v,
+                        in_eboot ? "eboot+" : "", (unsigned long long)(in_eboot ? wr - 0x400000000ull : wr), cur_tid());
+                    write(2, b, n);
+                    if (!in_eboot) classify_addr(wr);
+                }
+                return;
+            }
+            auto& gr = uc->uc_mcontext.gregs;
+            uint64_t rdi = (uint64_t)gr[REG_RDI], rsi = (uint64_t)gr[REG_RSI];
+            uint64_t rax = (uint64_t)gr[REG_RAX], r14 = (uint64_t)gr[REG_R14], r15 = (uint64_t)gr[REG_R15];
+            if (g_hwbp_count < g_hwbp_max) {
+                g_hwbp_count = g_hwbp_count + 1;
+                auto rd = [](uint64_t a) -> unsigned long long {
+                    return probe_readable(a) ? (unsigned long long)*(const uint64_t*)a : 0xBADBADull; };
+                uint64_t rbp = (uint64_t)gr[REG_RBP], rsp = (uint64_t)gr[REG_RSP];
+                auto off = [](unsigned long long v) -> unsigned long long {
+                    return (v >= 0x400000000ull && v < 0x420000000ull) ? v - 0x400000000ull : v; };
+                char b[380];
+                int n = snprintf(b, sizeof b,
+                    "[hwbp] #%d rip=eboot+0x%llx rdi=0x%llx rsi=0x%llx r15=0x%llx [rax-0x80]=0x%llx caller=eboot+0x%llx caller2=eboot+0x%llx tid=%ld\n",
+                    (int)g_hwbp_count, (unsigned long long)((uint64_t)gr[REG_RIP] - 0x400000000ull),
+                    (unsigned long long)rdi, (unsigned long long)rsi, (unsigned long long)r15, rd(rax - 0x80),
+                    off(rd(rbp + 8)), off(rd(rbp)!=0xBADBADull ? rd(*(uint64_t*)(rbp)+8) : 0xBADBAD), cur_tid());
+                (void)r14; (void)rsp;
+                write(2, b, n);
+            }
+            // On the first exec hit, optionally arm a data write-watch on [rax + delta] (the TLS slot).
+            if (g_hwwatch_req && g_hwwatch_fd < 0) arm_hwwatch(rax + (uint64_t)g_hwwatch_delta);
+            ioctl(g_hwbp_fd, PERF_EVENT_IOC_DISABLE, 0);   // disable so we can step off the bp address
+            if (g_hwbp_count < g_hwbp_max) {               // step past, then re-enable for the next hit
+                uc->uc_mcontext.gregs[REG_EFL] |= 0x100ll; g_hwbp_stepping = true;
+            }                                              // else: leave disabled (one-and-done at the cap)
+            return;
+        }
         // PROSPER_BP int3 breakpoint-logger. Two SIGTRAP cases:
         //  (a) mid-step: we restored the orig byte + set TF; now re-insert 0xCC and clear TF.
         //  (b) hit: RIP is one past our int3 -> log r15's fields, then restore orig byte, back up RIP,
@@ -501,6 +629,19 @@ void install_trap_handler() {
         if (g_devnull_fd < 0) g_devnull_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
         g_bp_on = true;   // the actual 0xCC is written after the image is mapped (arm_bp below)
     }
+    // PROSPER_HWBP=0xOFFSET installs a race-free hardware execute breakpoint at guest VA 0x400000000+off.
+    if (const char* hb = getenv("PROSPER_HWBP")) {
+        g_hwbp_addr = 0x400000000ull + strtoull(hb, nullptr, 0);
+        if (const char* m = getenv("PROSPER_HWBP_MAX")) g_hwbp_max = (int)strtoul(m, nullptr, 0);
+        if (g_devnull_fd < 0) g_devnull_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+        g_hwbp_on = true;   // perf_event_open done in arm_hwbp() after the image is mapped
+        // PROSPER_HWWATCH=<signed delta>: on the first exec-bp hit, arm a data write-watch on [rax+delta]
+        // (default -0x80). Reveals what writes the thread-local device slot the ctor reads.
+        if (const char* w = getenv("PROSPER_HWWATCH")) {
+            g_hwwatch_req = true;
+            if (*w) g_hwwatch_delta = (int64_t)strtoll(w, nullptr, 0);
+        }
+    }
     install_sigaltstack();
     struct sigaction sa{};
     sa.sa_sigaction = fault_handler;
@@ -510,7 +651,7 @@ void install_trap_handler() {
     sigaction(SIGSEGV, &sa, nullptr);
     sigaction(SIGBUS,  &sa, nullptr);
     sigaction(SIGILL,  &sa, nullptr);
-    if (g_watch_companion || g_bp_on) sigaction(SIGTRAP, &sa, nullptr);   // single-step / breakpoint
+    if (g_watch_companion || g_bp_on || g_hwbp_on) sigaction(SIGTRAP, &sa, nullptr);   // single-step / breakpoint
 }
 
 // Write the 0xCC breakpoint into the (now-mapped) guest image. Call after the image load.
@@ -521,6 +662,28 @@ void arm_bp() {
     char b[96];
     int n = snprintf(b, sizeof b, "[bp] armed int3 at eboot+0x%llx (orig=0x%02x)\n",
                      (unsigned long long)(g_bp_addr - 0x400000000ull), g_bp_orig);
+    write(2, b, n);
+}
+
+// Open + enable the PROSPER_HWBP hardware breakpoint (must run on the main/guest thread — the perf
+// event monitors the calling thread). Call after the image is mapped, before jumping to the entry.
+void arm_hwbp() {
+    if (!g_hwbp_on || !g_hwbp_addr) return;
+    long fd = perf_bp_open(g_hwbp_addr, HW_BREAKPOINT_X);
+    char b[160];
+    if (fd < 0) {
+        int n = snprintf(b, sizeof b, "[hwbp] perf_event_open FAILED for eboot+0x%llx (errno=%d) — HW bp disabled\n",
+                         (unsigned long long)(g_hwbp_addr - 0x400000000ull), errno);
+        write(2, b, n); g_hwbp_on = false; return;
+    }
+    g_hwbp_fd = (int)fd;
+    fcntl(g_hwbp_fd, F_SETFL, O_ASYNC);
+    fcntl(g_hwbp_fd, F_SETSIG, SIGTRAP);
+    struct f_owner_ex ow; ow.type = F_OWNER_TID; ow.pid = (pid_t)syscall(SYS_gettid);
+    fcntl(g_hwbp_fd, F_SETOWN_EX, &ow);
+    ioctl(g_hwbp_fd, PERF_EVENT_IOC_ENABLE, 0);
+    int n = snprintf(b, sizeof b, "[hwbp] armed HW execute bp at eboot+0x%llx (fd=%d tid=%ld)\n",
+                     (unsigned long long)(g_hwbp_addr - 0x400000000ull), g_hwbp_fd, (long)syscall(SYS_gettid));
     write(2, b, n);
 }
 
@@ -582,7 +745,8 @@ BootResult run_entry(const LoadedImage& img) {
     uint64_t sp = top, rdi = sp, rsi = 0;
 
     g_trap_kind = 0; g_fault_addr = nullptr; g_fault_rip = 0; g_armed_tid = cur_tid();
-    arm_bp();   // write the PROSPER_BP int3 now that the guest image is fully mapped
+    arm_bp();     // write the PROSPER_BP int3 now that the guest image is fully mapped
+    arm_hwbp();   // open the PROSPER_HWBP hardware breakpoint on this (guest main) thread
     if (sigsetjmp(g_jb, 1) == 0) {
         register uint64_t e  asm("rax") = img.entry;
         register uint64_t s  asm("r8")  = sp;
