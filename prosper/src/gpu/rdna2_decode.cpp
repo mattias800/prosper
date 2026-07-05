@@ -49,10 +49,30 @@ void decode_operands(Rdna2Inst& i) {
     switch (i.fmt) {
         case Rdna2Format::VOP1:
             i.opcode = (w >> 9) & 0xFFu;  i.dst = vgpr(w >> 17);
-            i.src[0] = decode_src_field(w & 0x1FFu); i.n_src = 1; break;
+            if ((w & 0x1FFu) == 0xF9u) {                          // SDWA (src0 only)
+                const uint32_t sd = i.words[1];
+                i.src[0] = ((sd >> 23) & 1u) ? decode_src_field(sd & 0xFFu) : vgpr(sd & 0xFFu);  // S0 -> scalar
+                i.n_src = 1;
+                // "Trivial" SDWA carries no sub-dword effect (all sels = DWORD(6), no clamp/omod/src0 mods),
+                // so it equals the base VOP1 (with SGPR-capable operands). Un-flag it so the recompiler
+                // handles it normally; any real sub-dword select keeps has_modifier and is rejected.
+                if (((sd >> 8) & 7u) == 6u && ((sd >> 16) & 7u) == 6u &&
+                    !((sd >> 13) & 1u) && !((sd >> 14) & 3u) && !((sd >> 19) & 0xFu)) i.has_modifier = false;
+            } else { i.src[0] = decode_src_field(w & 0x1FFu); i.n_src = 1; }
+            break;
         case Rdna2Format::VOP2:
             i.opcode = (w >> 25) & 0x3Fu; i.dst = vgpr(w >> 17);
-            i.src[0] = decode_src_field(w & 0x1FFu); i.src[1] = vgpr(w >> 9); i.n_src = 2; break;
+            if ((w & 0x1FFu) == 0xF9u) {                          // SDWA (src0 in ctrl dword; src1 in dword0)
+                const uint32_t sd = i.words[1];
+                i.src[0] = ((sd >> 23) & 1u) ? decode_src_field(sd & 0xFFu)     : vgpr(sd & 0xFFu);       // S0
+                i.src[1] = ((sd >> 31) & 1u) ? decode_src_field((w >> 9) & 0xFFu) : vgpr((w >> 9) & 0xFFu); // S1
+                i.n_src = 2;
+                // Trivial (no sub-dword effect): dst/src0/src1 sels all DWORD(6), no clamp/omod/src mods.
+                if (((sd >> 8) & 7u) == 6u && ((sd >> 16) & 7u) == 6u && ((sd >> 24) & 7u) == 6u &&
+                    !((sd >> 13) & 1u) && !((sd >> 14) & 3u) && !((sd >> 19) & 0xFu) && !((sd >> 27) & 0xFu))
+                    i.has_modifier = false;
+            } else { i.src[0] = decode_src_field(w & 0x1FFu); i.src[1] = vgpr(w >> 9); i.n_src = 2; }
+            break;
         case Rdna2Format::VOPC:
             i.opcode = (w >> 17) & 0xFFu; i.dst = {OperandKind::Special, 106 /*VCC_LO*/};
             i.src[0] = decode_src_field(w & 0x1FFu); i.src[1] = vgpr(w >> 9); i.n_src = 2; break;
