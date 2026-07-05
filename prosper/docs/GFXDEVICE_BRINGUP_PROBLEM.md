@@ -1,4 +1,23 @@
-# The GfxDevice bring-up wall — problem brief (for a fresh reviewer)
+# The GfxDevice bring-up wall — ✅ RESOLVED 2026-07-06
+
+**Status: RESOLVED.** Root cause was NOT in Unity or the renderer: our async-exception / GC
+stop-the-world handler `exc_delivery_handler` (hle_kernel.cpp) used a `static __thread` scratch buffer.
+Guest threads run under a GUEST `%fs`, so that host thread_local resolved into the GUEST TLS block and
+its negative tpoff aliased the guest's thread-local GfxDevice pointer at `[fs-0x80]`. Every GC suspension
+zeroed it, so the GfxDevice object graph came up systematically null (no pipeline GPU companion
+`[+0x140]`; the device-scoped ctor took its "Graphics device is null." path) — the `0xba6e08` / `0x95c823`
+crashes. **Fix:** make the buffer a plain stack local (no guest-%fs TLS aliasing) + run the handler on the
+per-thread sigaltstack (`SA_ONSTACK`). The boot now runs into Unity's render loop (repeated
+`sce::Agc::suspendPoint` frame submissions, no fault). Found with the new race-free `perf_event_open` HW
+execute-breakpoint + data write-watchpoint + `/proc/self/maps` writer-classifier (`PROSPER_HWBP` /
+`PROSPER_HWWATCH` in exec_image_linux.cpp), which watched `[fs-0x80]`, caught the zeroing write, and
+attributed it to our own host binary. The problem brief below is retained as the investigation history —
+note it contains several since-corrected mislabelings (the companion/`[+0x1a0]` theories were symptoms,
+not the cause).
+
+---
+
+_Historical problem brief (for a fresh reviewer) — superseded by the resolution above:_
 
 **Status:** open, blocking. **Audience:** an agent who has *not* lived this investigation and needs
 full context. **Ask:** a fresh framework / a second pair of eyes on why Unity's GfxDevice object
