@@ -988,6 +988,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                              d = b.ibin(Op_ShiftLeftLogical, mask, sh); break; }       // no SCC write
                 case 0x20: { uint32_t sh = b.ibin(Op_BitwiseAnd, c, b.uconst(31));   // s_lshr_b32
                              d = b.ibin(Op_ShiftRightLogical, a, sh); scc_nz(d); break; }  // dst = src0 >> (src1 & 31)
+                case 0x21:   // s_lshr_b64 — only the NGG wave-packing form (dst = EXEC) is modeled: it sets
+                             // EXEC to the count of active vertices/primitives in the wave. A per-invocation
+                             // SPIR-V shader has no wave to pack (each invocation is one vertex), so leave
+                             // EXEC full — no narrowing. Non-EXEC 64-bit shifts stay unsupported.
+                             // (RE-TAG: NGG exec packing.)
+                    if (in.dst.value != 126 && in.dst.value != 127) ok = false;
+                    break;
                 case 0x26: d = b.ibin(Op_IMul, a, c); break;         // s_mul_i32 (low 32 bits; no SCC)
                 case 0x35: d = b.umul_hi(a, c); break;               // s_mul_hi_u32 (high 32 bits; no SCC)
                 case 0x37: d = b.smul_hi(a, c); break;               // s_mul_hi_i32 (high 32 bits; no SCC)
@@ -1219,6 +1226,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // Hints / sync with no effect in our synchronous SSA model — safe no-ops.
                 case 0x00:   // s_nop
                 case 0x0c:   // s_waitcnt        (no async memory latency to wait on)
+                case 0x10:   // s_sendmsg        (NGG GS_ALLOC_REQ etc. — no wave/primitive allocation in
+                             //                   our per-invocation model; only meaningful for NGG/GS,
+                             //                   which we lower per-invocation, so it's a safe no-op)
                 case 0x20:   // s_inst_prefetch  (I-cache hint)
                 case 0x21:   // s_clause         (memory-clause scheduling hint)
                 case 0x22:   // s_wait_idle
@@ -1735,7 +1745,15 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords, cons
     b.begin_vertex(rt != nullptr);
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
     auto safe_branches = safe_execz_branches(ins);
-    rs.vreg[0] = b.load_vertex_index();     // VS ABI: v0 = vertex index
+    // NGG vertex shaders (s_sendmsg GS_ALLOC_REQ present) carry the vertex index in v5, not v0, and wrap
+    // the body in wave-packing plumbing (s_sendmsg / exp prim / s_lshr_b64 exec) that lowers to no-ops in
+    // our per-invocation model. Detect NGG and bind the index to v5 as well.
+    bool ngg = false;
+    for (const auto& in : ins) { if (in.is_end) break;
+        if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x10) { ngg = true; break; } }
+    uint32_t vidx = b.load_vertex_index();
+    rs.vreg[0] = vidx;                       // VS ABI: v0 = vertex index
+    if (ngg) rs.vreg[5] = vidx;              // NGG VS ABI: v5 = vertex index
     bool exported = false;
     auto exp_fn = [&](const Rdna2Inst& in) -> bool {         // EXP POS0..3 -> gl_Position; PARAM -> varyings
         if (in.exp_target >= 12 && in.exp_target <= 15 && !exported) {

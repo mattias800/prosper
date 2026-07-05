@@ -50,6 +50,30 @@ int main() {
     printf("  center=(%u,%u,%u,%u)  green samples %u/%u\n", c[0],c[1],c[2],c[3], green, total);
     CHECK(green == total, "every sampled pixel is GREEN (recompiled VS positioned the tri, PS colored it)");
 
+    // --- NGG vertex shader (the game's shaders 004/025 pattern) ---------------------------------------
+    // An NGG VS wraps the vertex work in wave-packing plumbing (s_sendmsg GS_ALLOC_REQ / exp prim /
+    // s_lshr_b64 exec) that lowers to no-ops per-invocation, and carries the vertex index in v5. This
+    // shader computes pos = (((v5<<1)&2)-1, (v5&-2)-1, 0, 1): v5=0,1,2 -> (-1,-1),(1,-1),(-1,1) — a
+    // triangle over the lower-left half of NDC (screen verts (0,0),(63,0),(0,63)). Verifies the NGG
+    // no-op lowering AND the v5=gl_VertexIndex ABI produce correct geometry, not just valid SPIR-V.
+    const uint32_t nggvs[] = {
+        0x93EAFF03u, 0x00080008u, 0x876BFF03u, 0x000000FFu, 0x8F6A8C6Au, 0x887C6A6Bu, 0xBF900009u,
+        0x906A8803u, 0x81EA6A80u, 0x90FE6AC1u, 0xF8000941u, 0x00000000u, 0x81EA0380u, 0x90FE6AC1u,
+        0x34040A81u, 0x36060AC2u, 0x7E000280u, 0x7E0202F2u, 0x36040482u, 0x4A0606C1u, 0x4A0404C1u,
+        0x7E060B03u, 0x7E040B02u, 0xF80008CFu, 0x01000302u, 0xBF810000u,
+    };
+    std::vector<uint32_t> nvert = recompile_vertex(nggvs, sizeof(nggvs)/sizeof(nggvs[0]));
+    CHECK(!nvert.empty() && nvert[0] == 0x07230203u, "recompiled NGG vertex shader -> SPIR-V");
+    if (!nvert.empty()) {
+        std::vector<uint8_t> npx = prosper::test::render_triangle_rgba(nvert, frag, W, H);
+        // Inside the lower-left-half triangle (x+y < ~63) is green; outside (bottom-right) is the clear.
+        auto grn = [&](uint32_t x, uint32_t y){ const uint8_t* p=&npx[((size_t)y*W+x)*4]; return p[1]>0x80 && p[0]<0x40 && p[2]<0x40; };
+        bool inside_green = grn(16, 16), outside_not = !grn(60, 60);
+        printf("  NGG: inside(16,16)green=%d outside(60,60)notgreen=%d\n", inside_green, outside_not);
+        CHECK(npx.size()==(size_t)W*H*4, "pipeline accepted the recompiled NGG VS + rendered");
+        CHECK(inside_green && outside_not, "NGG VS geometry correct (v5->lower-left-half triangle)");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
