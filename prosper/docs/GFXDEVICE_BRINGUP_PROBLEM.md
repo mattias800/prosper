@@ -365,6 +365,22 @@ count (4–7). The companion at `[+0x140]` may be built by walking `[+0xe0][0..c
    write-watchpoint on each from birth, log the writer PC. Multi-step in-run instrumentation — a focused
    effort, not a quick probe.
 
+**DEFINITIVE probe design (survives all obstacles found; for a focused/interactive session):**
+a **constructor-breakpoint-triggered watchpoint** — the only design that dodges every obstacle above
+(offset reuse, read-arm-too-late, non-deterministic addresses, Unity's custom allocator):
+1. Set a code breakpoint at a pipeline ctor's `[+0x1e4c]` type-id write (a FIXED eboot address, e.g.
+   `0xe08000` = `movl $0x4,0x1e4c(%rbx)`; also `0x1476b77`/`0x1493743`/`0x10669ec`). The object pointer is
+   in the register (`rbx`) at that instant — no address-determinism needed.
+2. Filter to type_id ∈ {8,11,17} (category {5,9,15}), then arm a `[obj+0x1a0]` and `[obj+0x140]`
+   write-watchpoint (reuse the existing mprotect+single-step machinery in `exec_image_linux.cpp`).
+3. Log every writer PC → disassemble → find why `+0x1a0`'s low byte / the `+0x140` companion is never set.
+**CAVEAT (why this is NOT a quick autonomous probe):** `exec_image_linux.cpp` has mprotect watchpoints
+but NO code-breakpoint (int3) support, and the code + docs warn that breakpoints RACE in this
+multithreaded, RT-signal-scheduled guest (live gdb is unreliable here). So this needs careful, likely
+INTERACTIVE debugging — a focused human-in-the-loop session — not a fire-and-forget env probe. Combined
+with the subsystem-cascade nature (skipping one null reveals the next), the honest recommendation is a
+dedicated debugging session (and/or Unity-PS5-backend reference material), not further autonomous drilling.
+
 **Honest status:** this is a subsystem-level null cascade (likely a whole GfxDevice-construction pass
 that doesn't run in our env), not a one-API fix. It plausibly needs the two-pass watchpoint above and/or
 Unity-PS5-backend reference material. Materially advanced, but a fix is not close by autonomous drilling.
