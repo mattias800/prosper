@@ -118,6 +118,13 @@ if(TARGET prosper_core)
   add_executable(shader_histo tools/shader_histo/shader_histo.cpp)
   target_link_libraries(shader_histo PRIVATE prosper_core)
 
+  # spv_validate: recompile one shader from every path and run spirv-val on each — a strict-validation
+  # gate (the render tests only prove llvmpipe accepts them; llvmpipe is lenient). No Vulkan needed;
+  # skips validation gracefully if spirv-val is not on PATH (still checks recompilation succeeds).
+  add_executable(spv_validate tools/spv_validate/spv_validate.cpp)
+  target_link_libraries(spv_validate PRIVATE prosper_core)
+  add_test(NAME spv_validate COMMAND spv_validate ${CMAKE_CURRENT_BINARY_DIR})
+
   # AGC→Vulkan resource layer: the front-half↔back-half contract (gpu_resources.hpp). Registry
   # behavior is fixed here so both halves integrate against a stable API. Pure/cross-platform.
   add_executable(test_gpu_resources tests/test_gpu_resources.cpp)
