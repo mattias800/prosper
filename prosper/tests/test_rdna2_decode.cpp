@@ -139,6 +139,14 @@ int main() {
     const uint32_t mimg_nsa[] = { 0xf0800f0au, 0x00400000u, 0x00000001u };
     CHECK(rdna2_decode_one(mimg_nsa, 3).fmt == Rdna2Format::MIMG && rdna2_decode_one(mimg_nsa, 3).len_dwords == 3,
           "NSA MIMG with one extra address dword is 3 dwords");
+    // NSA extra-dword CAPTURE + coord layout: image_load v[0:3], [v0,v7,v3], s[0:7] dim:3D (llvm-mc gfx1010).
+    // coord0 = words[1][7:0] = v0; coord1 = words[2][7:0] = v7; coord2 = words[2][15:8] = v3. The recompiler
+    // reads exactly these bytes to gather the non-sequential coords.
+    const uint32_t mimg_nsa3d[] = { 0xf0000f12u, 0x00000000u, 0x00000307u };
+    Rdna2Inst n3 = rdna2_decode_one(mimg_nsa3d, 3);
+    CHECK(n3.fmt == Rdna2Format::MIMG && n3.opcode == 0x00u && n3.len_dwords == 3 && n3.mimg_dim == 2u &&
+          (n3.words[1] & 0xFFu) == 0u && (n3.words[2] & 0xFFu) == 7u && ((n3.words[2] >> 8) & 0xFFu) == 3u,
+          "NSA MIMG 3D captures the extra address dword; coords decode to v0,v7,v3");
 
     // inline-constant field decode: SGPR106 special, field 129 -> +1, 193 -> -1, 242 -> 1.0f
     CHECK(decode_src_field(0).kind == OperandKind::SGPR && decode_src_field(0).value == 0, "field 0 -> SGPR0");

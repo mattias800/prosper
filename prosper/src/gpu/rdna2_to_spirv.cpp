@@ -1170,7 +1170,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // --- Storage-image path: image_load (0x00) / image_store (0x08), no sampler, any dim ---
             if (res->cls == ResourceClass::StorageImage) {
                 const bool is_ld = (in.opcode == 0x00), is_st = (in.opcode == 0x08);
-                if ((!is_ld && !is_st) || in.len_dwords != 2) { ok = false; return true; }  // NSA deferred
+                if (!is_ld && !is_st) { ok = false; return true; }
                 uint32_t dim, ncoord;
                 switch (in.mimg_dim) {   // SQ_RSRC dim -> SPIR-V Dim + coord count
                     case 0: dim = Dim_1D; ncoord = 1; break;
@@ -1179,9 +1179,18 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     default: ok = false; return true;   // cube/array/msaa storage images deferred
                 }
                 b.declare_storage_image(res->binding, dim);
+                // Coordinate VGPR per axis. Non-NSA (len==2): consecutive from VADDR (src[0]). NSA (len>2):
+                // split across the extra address dwords — coord0 = VADDR, coord k>=1 = byte (k-1) of
+                // words[2..3] (dword2 = addr1..4, dword3 = addr5..8). Layout verified via llvm-mc gfx1010.
+                const bool nsa = in.len_dwords > 2;
                 int va = in.src[0].value;
+                auto coord_vgpr = [&](uint32_t k) -> int {
+                    if (!nsa || k == 0) return va + (nsa ? 0 : (int)k);
+                    uint32_t j = k - 1;
+                    return (int)((in.words[2 + j / 4] >> (8 * (j % 4))) & 0xFFu);
+                };
                 uint32_t coords[3] = {0, 0, 0};
-                for (uint32_t k = 0; k < ncoord; k++) coords[k] = vread(va + (int)k);
+                for (uint32_t k = 0; k < ncoord; k++) coords[k] = vread(coord_vgpr(k));
                 if (is_ld) {
                     uint32_t out[4]; b.image_read(res->binding, dim, coords, out);
                     int vd = in.dst.value, w = 0;   // dmask -> consecutive VDATA VGPRs (LSB=R first)
@@ -1310,10 +1319,12 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
         auto table_dependent = [](const Rdna2Inst& i) {
             switch (i.fmt) {
                 case Rdna2Format::MIMG: {
-                    const bool op_ok = i.opcode == 0x00u || i.opcode == 0x08u || i.opcode == 0x20u ||
-                                       i.opcode == 0x24u || i.opcode == 0x27u;
                     const bool dim_ok = i.mimg_dim <= 2u;      // 1D/2D/3D only (not 1D/2D_ARRAY, CUBE, MSAA)
-                    return op_ok && dim_ok && i.len_dwords == 2;   // non-NSA (single address dword group)
+                    // load/store go through the storage path, which handles NSA (split address dwords);
+                    // sample* go through the sampled-texture path, still non-NSA only (len==2).
+                    if (i.opcode == 0x00u || i.opcode == 0x08u) return dim_ok;
+                    if (i.opcode == 0x20u || i.opcode == 0x24u || i.opcode == 0x27u) return dim_ok && i.len_dwords == 2;
+                    return false;
                 }
                 case Rdna2Format::MUBUF:  return i.opcode <= 0x07u;   // buffer_load/store_format_* (need the V#)
                 case Rdna2Format::VINTRP: return true;               // handled in the fragment shell

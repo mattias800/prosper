@@ -45,7 +45,8 @@ float inline_float_value(uint32_t code);
 struct Rdna2Inst {
     Rdna2Format fmt = Rdna2Format::Unknown;
     uint32_t    pc = 0;            // dword offset from the start of the stream
-    uint32_t    words[2] = {0, 0}; // the (up to 2) instruction dwords (not incl. a trailing literal)
+    uint32_t    words[4] = {0, 0, 0, 0}; // the instruction dwords (not incl. a trailing literal); [2]/[3]
+                                         // hold MIMG NSA extra address dwords (0 for every other encoding)
     uint32_t    len_dwords = 1;    // total length incl. any inline literal
     bool        has_literal = false;
     uint32_t    literal = 0;       // the inline 32-bit constant, if has_literal

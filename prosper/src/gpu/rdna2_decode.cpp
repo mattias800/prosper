@@ -247,6 +247,10 @@ Rdna2Inst rdna2_decode_one(const uint32_t* code, size_t max_dwords) {
                 uint32_t extra = (w >> 1) & 0x3u;
                 i.len_dwords = 2 + extra;
                 if (max_dwords >= 2) i.words[1] = code[1];
+                // NSA extra dwords hold the split (non-sequential) address VGPRs, one per byte; keep them
+                // so the recompiler can gather the coords (dword2 = addr1..4, dword3 = addr5..8).
+                if (extra >= 1 && max_dwords >= 3) i.words[2] = code[2];
+                if (extra >= 2 && max_dwords >= 4) i.words[3] = code[3];
                 break;
             }
             case 0x3d: two_dword(Rdna2Format::SMEM);  break;
