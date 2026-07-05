@@ -68,6 +68,7 @@ struct Rdna2Inst {
     // per-component enable mask. The 4 exported VGPRs are in src[0..3].
     uint32_t exp_target = 0;
     uint32_t exp_en = 0;
+    bool     exp_compr = false;     // COMPR: the 4 channels are two f16x2 pairs in src[0] (r,g) / src[1] (b,a)
 
     // MIMG-only: destination component mask (dmask), image dimensionality (SQ_RSRC_IMG dim: 1D=0,
     // 2D=1, 3D=2, Cube=3, 1D_ARRAY=4, 2D_ARRAY=5, ...), and the unnormalized-coordinate flag. VDATA is

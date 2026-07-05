@@ -1655,8 +1655,16 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords, co
         // only a guard against genuine mid-discard exports.
         if (rs.exec_narrowed) return false;
         if (in.exp_target <= 7 && !exported) {
-            b.export_color(operand_bits(b, rs, in, in.src[0]), operand_bits(b, rs, in, in.src[1]),
-                           operand_bits(b, rs, in, in.src[2]), operand_bits(b, rs, in, in.src[3]));
+            if (in.exp_compr) {
+                // COMPR: the 4 channels are two f16x2 pairs — src[0] holds (r,g), src[1] holds (b,a).
+                // Unpack each half to a float and reassemble the vec4 (the pkrtz'd tonemap/sRGB output).
+                uint32_t p0 = operand_bits(b, rs, in, in.src[0]), p1 = operand_bits(b, rs, in, in.src[1]);
+                b.export_color(b.unpack_half(p0, 0), b.unpack_half(p0, 1),
+                               b.unpack_half(p1, 0), b.unpack_half(p1, 1));
+            } else {
+                b.export_color(operand_bits(b, rs, in, in.src[0]), operand_bits(b, rs, in, in.src[1]),
+                               operand_bits(b, rs, in, in.src[2]), operand_bits(b, rs, in, in.src[3]));
+            }
             exported = true;
         }
         return true;   // ignore NULL / additional exports for now

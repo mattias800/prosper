@@ -112,6 +112,7 @@ void decode_operands(Rdna2Inst& i) {
         case Rdna2Format::EXP: {
             const uint32_t d1 = i.words[1];
             i.exp_en = w & 0xFu; i.exp_target = (w >> 4) & 0x3Fu;
+            i.exp_compr = ((w >> 10) & 1u) != 0;    // COMPR (bit 10): src[0]/src[1] hold packed f16x2
             for (int k = 0; k < 4; k++) i.src[k] = vgpr((d1 >> (8 * k)) & 0xFFu);
             i.n_src = 4; break;
         }
