@@ -1,6 +1,13 @@
-# ---- Game dump: copyrighted, huge, NEVER commit ----
+# ---- Game dumps: copyrighted, huge, NEVER commit ----
+# Any PS5 title dump at the repo root is <TITLEID>-app0. Generic pattern catches every game
+# (PPSA24651 = The Messenger / Unity; PPSA17942 = an Unreal Engine 4 title; + any future ones);
+# explicit entries kept for clarity.
+/*-app0/
+/*-app0
 /PPSA24651-app0/
 /PPSA24651-app0
+/PPSA17942-app0/
+/PPSA17942-app0
 *.prx
 *.sprx
 *.self
