@@ -106,6 +106,13 @@ int main(int argc, char** argv) {
       // image_load 2D_MSAA_ARRAY (dim 7): coords (x,y,layer) + sample — needs Arrayed+MS + ImageMSArray cap.
       const uint32_t cmsa[] = {0xF0000F3Au,0x00000000u,0x00030201u,0xBF8C3F70u,0xBF810000u};
       dump(dir, "storage_msaa_array_2d", recompile_valu(cmsa, sizeof(cmsa)/4, 1, 0, &rt)); }
+    // Compute that SAMPLES a texture and STORES to a storage image (the bloom/downsample shape, shader 006):
+    // exercises the sampled-texture path inside a compute shell (needs vec4<float> declared there).
+    { ShaderResourceTable rt;
+      ShaderResource t{};  t.cls=ResourceClass::Texture;      t.binding=0; t.sgpr_base=0;  t.img_dim=1; rt.resources.push_back(t);
+      ShaderResource s{};  s.cls=ResourceClass::StorageImage; s.binding=1; s.sgpr_base=16; rt.resources.push_back(s);
+      const uint32_t c[] = {0x7E0002F0u,0x7E0202F0u,0xF09C0F08u,0x00400400u,0xBF8C3F70u,0xF0200108u,0x00040402u,0xBF810000u};
+      dump(dir, "compute_sample_store", recompile_valu(c, sizeof(c)/4, 0, 0, &rt)); }
     // Compute mul_hi (high 32 bits via OpUMulExtended -> {lo,hi} struct extract).
     { const uint32_t c[] = {0x7E0202FFu,0x80000000u,0xD56A0002u,0x00020301u,0x7E000D02u,0xBF810000u};
       dump(dir, "compute_mul_hi", recompile_valu(c, sizeof(c)/4, 1, 0)); }

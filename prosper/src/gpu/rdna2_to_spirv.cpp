@@ -472,6 +472,7 @@ struct SpirvCompute {
     void begin(uint32_t input_stride) {
         stride = input_stride;
         t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_i32 = id(); t_v3u = id(); t_bool = id();
+        t_v4f = id();   // vec4<float>: needed by the sampled-texture path (image_sample) in a compute shader
         uint32_t t_ptr_in_v3u = id(); v_gid = id();
         uint32_t t_rta = id(), t_struct = id(), t_ptr_sb_struct = id();
         v_in = id(); v_out = id(); t_ptr_sb_f32 = id();
@@ -495,6 +496,7 @@ struct SpirvCompute {
         put(types, Op_TypeInt, {t_u32, 32, 0});
         put(types, Op_TypeInt, {t_i32, 32, 1});
         put(types, Op_TypeVector, {t_v3u, t_u32, 3});
+        put(types, Op_TypeVector, {t_v4f, t_f32, 4});
         put(types, Op_TypeBool, {t_bool});
         put(types, Op_TypePointer, {t_ptr_in_v3u, SC_Input, t_v3u});
         put(types, Op_Variable, {t_ptr_in_v3u, v_gid, SC_Input});
