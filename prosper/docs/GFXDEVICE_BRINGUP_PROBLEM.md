@@ -420,3 +420,37 @@ dedicated debugging session (and/or Unity-PS5-backend reference material), not f
 **Honest status:** this is a subsystem-level null cascade (likely a whole GfxDevice-construction pass
 that doesn't run in our env), not a one-API fix. It plausibly needs the two-pass watchpoint above and/or
 Unity-PS5-backend reference material. Materially advanced, but a fix is not close by autonomous drilling.
+
+### 2026-07-05 (interactive session) — int3 breakpoint-logger built; "no companion ever built" PROVEN
+
+Built a general int3 code-breakpoint-logger (`PROSPER_BP=0xOFFSET`, `PROSPER_BP_MAX=N`, gated, non-
+destructive — boot byte-identical with it off, 42/42 tests). Standard int3 + restore-byte + single-step-
+TF + re-arm; logs `r15` fields at each hit. The reusable framework prior sessions kept needing.
+
+**Decisive result (upgrades the earlier inference to a hard fact).** `PROSPER_BP=0xba6df0` (the companion
+decision, hit by every category-{5,9,15,18,19} pipeline) + `SKIP_NULL_COMPANION` (continue past each
+crash) enumerated the WHOLE drain: **exactly 4 qualifying pipelines, and ALL 4 have `[+0x140]=0`.** No
+companion is ever built for ANY of them — the entire companion-build pass is absent, not a per-object
+race/gap. (`[+0x1a0]` low byte 0 on all; upper bytes `0`,`0x5bb85000`,`0`,`0xffffff00`. `[+0x520]/[+0x530]`
+inner array/count: `0/0`,`0/0`,`ptr/5`,`ptr/5`.)
+
+**Drain call structure pinned (ground truth).** `0xba6720(container)` is called from an OUTER GC loop at
+`0xb9a353`:
+```
+b9a35f  mov (%rbx),%rax                ; rbx = GC root; [rbx] = array of pools
+b9a362  mov -0x8(%rax,%r15,8),%rdi     ; container = pools[r15-1]  (iterate backwards, r15 = count)
+b9a367  call 0xba6720                  ; drain(container)  — per pool
+```
+A **deferred-release GC sweeping every GfxDevice object pool**; the 4 pipelines live in one pool
+(`container[+0x78]`=elements, `[+0x88]`=count), released during "unity default resources" load (transient
+built-in blit/clear/position pipelines), and the release path derefs their never-built GPU companion.
+
+**Where this leaves the fix.** The builder code exists in the binary (real PS5 builds it eagerly at
+pipeline creation) but its branch is never taken here. Catching it still requires watching
+`[pipeline+0x140]` from BEFORE construction — construction is deep in Unity's asset/shader load with
+non-deterministic addresses, so the watchpoint must hook the allocation/pool-insert of a tag-`0x2b`
+category-{5,9,15,18,19} object, not the drain. That (or Unity PS5 backend reference for what gates the
+build) is the next step. Alternative (pragmatic/Proton-style, explicitly a shim not a model): construct a
+minimal valid companion graph so the release path is safe, to measure whether the boot then reaches the
+render loop — though the known cascade (next null at `0x95c823`) means the whole GfxDevice object graph,
+not just this companion, is unbuilt.

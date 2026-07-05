@@ -80,6 +80,22 @@ namespace {
     bool     g_watch_armed = false;
     bool     g_watch_stepping = false;
     volatile sig_atomic_t g_watch_hits = 0;
+    // PROSPER_BP=0xOFFSET (guest image offset): int3 code-breakpoint that LOGS r15 + companion/flag
+    // fields at each hit, then steps over and re-arms. Diagnostic (never changes control flow). Used to
+    // enumerate the GfxDevice drain: is ANY category-{5,9,15,18,19} pipeline's [+0x140] companion
+    // non-null in our env, or is the whole build pass absent? Single-init-pass use; not race-hardened.
+    bool     g_bp_on = false;
+    uint64_t g_bp_addr = 0;                    // guest VA of the breakpoint (0x400000000 + offset)
+    uint8_t  g_bp_orig = 0;                    // original byte replaced by 0xCC
+    bool     g_bp_stepping = false;            // mid single-step (orig byte restored, TF set)
+    volatile sig_atomic_t g_bp_count = 0;
+    int      g_bp_max = 400;                   // cap log volume
+    void bp_write_byte(uint64_t addr, uint8_t val) {
+        uint64_t pg = addr & ~(uint64_t)0xfff;
+        mprotect((void*)pg, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
+        *(volatile uint8_t*)addr = val;
+        __builtin___clear_cache((char*)addr, (char*)addr + 1);
+    }
     // PROSPER_PEEK dumps offsets off registers at fault time. Supports N specs separated by ';',
     // each "reg:off,off,..."; an offset may be prefixed '*' to chase one pointer level first
     // (e.g. "r15:*0x18+0x0" = read [[r15+0x18]+0x0]).
@@ -163,6 +179,39 @@ namespace {
     volatile sig_atomic_t g_lazy_pages = 0;                 // count (diagnostic)
 
     void fault_handler(int sig, siginfo_t* si, void* uctx) {
+        // PROSPER_BP int3 breakpoint-logger. Two SIGTRAP cases:
+        //  (a) mid-step: we restored the orig byte + set TF; now re-insert 0xCC and clear TF.
+        //  (b) hit: RIP is one past our int3 -> log r15's fields, then restore orig byte, back up RIP,
+        //      set TF to execute the real instruction, and re-arm on the following (a) trap.
+        if (sig == SIGTRAP && g_bp_on) {
+            auto* uc = (ucontext_t*)uctx;
+            if (g_bp_stepping) {
+                bp_write_byte(g_bp_addr, 0xCC);
+                uc->uc_mcontext.gregs[REG_EFL] &= ~0x100ll;   // clear TF
+                g_bp_stepping = false;
+                return;
+            }
+            uint64_t rip = (uint64_t)uc->uc_mcontext.gregs[REG_RIP];
+            if (rip == g_bp_addr + 1) {
+                uint64_t r15 = (uint64_t)uc->uc_mcontext.gregs[REG_R15];
+                if (g_bp_count < g_bp_max) {
+                    g_bp_count = g_bp_count + 1;
+                    auto rd = [](uint64_t a) -> unsigned long long {
+                        return probe_readable(a) ? (unsigned long long)*(const uint64_t*)a : 0xBADBADull; };
+                    char b[256];
+                    int n = snprintf(b, sizeof b,
+                        "[bp] #%d r15=0x%llx [+0]=0x%llx [+0x140]=0x%llx [+0x1a0]=0x%llx [+0x520]=0x%llx [+0x530]=0x%llx tid=%ld\n",
+                        (int)g_bp_count, (unsigned long long)r15, rd(r15+0x0), rd(r15+0x140),
+                        rd(r15+0x1a0), rd(r15+0x520), rd(r15+0x530), cur_tid());
+                    write(2, b, n);
+                }
+                bp_write_byte(g_bp_addr, g_bp_orig);              // restore real instruction
+                uc->uc_mcontext.gregs[REG_RIP] = (greg_t)g_bp_addr;  // re-execute it
+                uc->uc_mcontext.gregs[REG_EFL] |= 0x100ll;        // single-step (TF)
+                g_bp_stepping = true;
+                return;
+            }
+        }
         // Companion-slot write-watchpoint: SIGTRAP after single-stepping a write to the watched page —
         // re-arm (re-protect read-only) and clear the trap flag so we keep watching.
         if (sig == SIGTRAP && g_watch_stepping) {
@@ -437,6 +486,13 @@ void install_trap_handler() {
             if (!semi) break; spec = semi + 1;
         }
     }
+    // PROSPER_BP=0xOFFSET installs an int3 code-breakpoint-logger at guest VA 0x400000000+offset.
+    if (const char* bp = getenv("PROSPER_BP")) {
+        g_bp_addr = 0x400000000ull + strtoull(bp, nullptr, 0);
+        if (const char* m = getenv("PROSPER_BP_MAX")) g_bp_max = (int)strtoul(m, nullptr, 0);
+        if (g_devnull_fd < 0) g_devnull_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+        g_bp_on = true;   // the actual 0xCC is written after the image is mapped (arm_bp below)
+    }
     install_sigaltstack();
     struct sigaction sa{};
     sa.sa_sigaction = fault_handler;
@@ -446,7 +502,18 @@ void install_trap_handler() {
     sigaction(SIGSEGV, &sa, nullptr);
     sigaction(SIGBUS,  &sa, nullptr);
     sigaction(SIGILL,  &sa, nullptr);
-    if (g_watch_companion) sigaction(SIGTRAP, &sa, nullptr);   // single-step for the write-watchpoint
+    if (g_watch_companion || g_bp_on) sigaction(SIGTRAP, &sa, nullptr);   // single-step / breakpoint
+}
+
+// Write the 0xCC breakpoint into the (now-mapped) guest image. Call after the image load.
+void arm_bp() {
+    if (!g_bp_on || !g_bp_addr) return;
+    g_bp_orig = *(volatile uint8_t*)g_bp_addr;
+    bp_write_byte(g_bp_addr, 0xCC);
+    char b[96];
+    int n = snprintf(b, sizeof b, "[bp] armed int3 at eboot+0x%llx (orig=0x%02x)\n",
+                     (unsigned long long)(g_bp_addr - 0x400000000ull), g_bp_orig);
+    write(2, b, n);
 }
 
 uint64_t stub_addr(uint64_t idx) { return g_stub_base + idx * g_stub_size; }
@@ -507,6 +574,7 @@ BootResult run_entry(const LoadedImage& img) {
     uint64_t sp = top, rdi = sp, rsi = 0;
 
     g_trap_kind = 0; g_fault_addr = nullptr; g_fault_rip = 0; g_armed_tid = cur_tid();
+    arm_bp();   // write the PROSPER_BP int3 now that the guest image is fully mapped
     if (sigsetjmp(g_jb, 1) == 0) {
         register uint64_t e  asm("rax") = img.entry;
         register uint64_t s  asm("r8")  = sp;
