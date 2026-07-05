@@ -19,6 +19,7 @@ enum : uint32_t {
     Op_Load=61, Op_Store=62, Op_AccessChain=65, Op_Decorate=71, Op_MemberDecorate=72,
     Op_ConvertFToU=109, Op_ConvertFToS=110, Op_ConvertSToF=111, Op_ConvertUToF=112, Op_Bitcast=124,
     Op_CompositeConstruct=80, Op_CompositeExtract=81, Op_IAdd=128, Op_FAdd=129, Op_ISub=130, Op_FSub=131, Op_IMul=132, Op_FMul=133,
+    Op_UMulExtended=151, Op_SMulExtended=152,   // {lo,hi} struct results (for mul_hi)
     Op_FDiv=136, Op_IEqual=170, Op_INotEqual=171, Op_UGreaterThan=172, Op_SGreaterThan=173,
     Op_UGreaterThanEqual=174, Op_SGreaterThanEqual=175, Op_ULessThan=176, Op_SLessThan=177,
     Op_ULessThanEqual=178, Op_SLessThanEqual=179,
@@ -119,6 +120,18 @@ struct SpirvCompute {
     // Signed-int helpers: bits are bitcast to i32, the op runs, and the i32 result is bitcast to bits.
     uint32_t bcs(uint32_t u) { uint32_t r = id(); put(code, Op_Bitcast, {t_i32, r, u}); return r; }   // bits -> i32
     uint32_t i2u(uint32_t i) { uint32_t r = id(); put(code, Op_Bitcast, {t_u32, r, i}); return r; }   // i32 -> bits
+    // High 32 bits of a 32x32 multiply (v_/s_mul_hi_*), via the {lo,hi} struct of OpU/SMulExtended.
+    uint32_t t_u32pair = 0, t_i32pair = 0;
+    uint32_t umul_hi(uint32_t a, uint32_t b_) {
+        if (!t_u32pair) { t_u32pair = id(); put(types, Op_TypeStruct, {t_u32pair, t_u32, t_u32}); }
+        uint32_t r = id(); put(code, Op_UMulExtended, {t_u32pair, r, a, b_});
+        uint32_t hi = id(); put(code, Op_CompositeExtract, {t_u32, hi, r, 1}); return hi;
+    }
+    uint32_t smul_hi(uint32_t a, uint32_t b_) {
+        if (!t_i32pair) { t_i32pair = id(); put(types, Op_TypeStruct, {t_i32pair, t_i32, t_i32}); }
+        uint32_t r = id(); put(code, Op_SMulExtended, {t_i32pair, r, bcs(a), bcs(b_)});
+        uint32_t hi = id(); put(code, Op_CompositeExtract, {t_i32, hi, r, 1}); return i2u(hi);
+    }
     uint32_t sbin(uint32_t op, uint32_t a, uint32_t b) { uint32_t ri = id(); put(code, op, {t_i32, ri, bcs(a), bcs(b)}); return i2u(ri); }
     uint32_t sext2(uint32_t inst, uint32_t a, uint32_t b) { uint32_t ri = id(); putv(code, Op_ExtInst, {t_i32, ri, glsl, inst, bcs(a), bcs(b)}); return i2u(ri); }
     uint32_t cvt_f2i(uint32_t bits) { uint32_t ri = id(); put(code, Op_ConvertFToS, {t_i32, ri, bcf(bits)}); return i2u(ri); }
@@ -777,7 +790,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                              uint32_t sh = b.ibin(Op_BitwiseAnd, c, b.uconst(0x1f));   // dst = ((1<<(src0&31))-1)<<(src1&31)
                              uint32_t mask = b.ibin(Op_ISub, b.ibin(Op_ShiftLeftLogical, b.uconst(1), w), b.uconst(1));
                              d = b.ibin(Op_ShiftLeftLogical, mask, sh); break; }       // no SCC write
+                case 0x20: { uint32_t sh = b.ibin(Op_BitwiseAnd, c, b.uconst(31));   // s_lshr_b32
+                             d = b.ibin(Op_ShiftRightLogical, a, sh); scc_nz(d); break; }  // dst = src0 >> (src1 & 31)
                 case 0x26: d = b.ibin(Op_IMul, a, c); break;         // s_mul_i32 (low 32 bits; no SCC)
+                case 0x35: d = b.umul_hi(a, c); break;               // s_mul_hi_u32 (high 32 bits; no SCC)
+                case 0x37: d = b.smul_hi(a, c); break;               // s_mul_hi_i32 (high 32 bits; no SCC)
                 case 0x27: {                                         // s_bfe_u32: offset=src1[4:0], width=src1[22:16]
                     uint32_t off = b.ibin(Op_BitwiseAnd, c, b.uconst(0x1f));
                     uint32_t width = b.ibin(Op_BitwiseAnd, b.ibin(Op_ShiftRightLogical, c, b.uconst(16)), b.uconst(0x7f));
@@ -817,6 +834,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
         }
         case Rdna2Format::VOP1: {
             uint32_t a = val(in.src[0]); uint32_t old_d = vreg_old(b, rs, in.dst.value);
+            if (in.opcode == 0x02) {   // v_readfirstlane_b32: SGPR dst = value of the lowest active lane
+                // Cross-lane broadcast. Our per-lane scalar model has no cross-lane reduction, so we use
+                // THIS lane's value. SPECULATIVE(confidence: med): exact only when src0 is wave-uniform —
+                // which is the standard use (reading a uniformly-computed VGPR into an SGPR, e.g. the
+                // integer-divide reciprocal in the game's shaders). Writes an SGPR, not a VGPR.
+                rs.sreg[in.dst.value] = a; return true;
+            }
             uint32_t& d = vreg[in.dst.value];
             switch (in.opcode) {
                 case 0x01: d = a; break;                              // v_mov_b32
@@ -866,6 +890,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x1D: d = b.ibin(Op_BitwiseXor, a, c); break;    // v_xor_b32
                 case 0x25: d = b.ibin(Op_IAdd, a, c); break;          // v_add_nc_u32
                 case 0x26: d = b.ibin(Op_ISub, a, c); break;          // v_sub_nc_u32
+                case 0x27: d = b.ibin(Op_ISub, c, a); break;          // v_subrev_nc_u32 (reverse: src1 - src0)
                 case 0x2F: d = b.pack_half2x16(a, c); break;          // v_cvt_pkrtz_f16_f32 (e32 form)
                 default: ok = false;
             }
@@ -918,6 +943,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 vreg[in.dst.value] = b.fbin(Op_FAdd, m, val(in.src[2]));
             } else if (in.opcode == 0x169) {                          // v_mul_lo_u32
                 vreg[in.dst.value] = b.ibin(Op_IMul, val(in.src[0]), val(in.src[1]));
+            } else if (in.opcode == 0x16a) {                          // v_mul_hi_u32 (high 32 bits)
+                vreg[in.dst.value] = b.umul_hi(val(in.src[0]), val(in.src[1]));
+            } else if (in.opcode == 0x16c) {                          // v_mul_hi_i32 (high 32 bits, signed)
+                vreg[in.dst.value] = b.smul_hi(val(in.src[0]), val(in.src[1]));
             } else if (in.opcode == 0x157) {                          // v_med3_f32 = median(s0,s1,s2)
                 uint32_t s0 = val(in.src[0]), s1 = val(in.src[1]), s2 = val(in.src[2]);
                 uint32_t mn = b.fext2(Glsl_FMin, s0, s1), mx = b.fext2(Glsl_FMax, s0, s1);
