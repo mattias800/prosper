@@ -205,20 +205,25 @@ struct SpirvCompute {
         return ibin(Op_BitwiseAnd, pack_half2x16(fbits, bcu(fconstf(0.0f))), uconst(0xFFFFu));
     }
 
-    // Combined image+sampler support (MIMG image_sample). One float-2D OpTypeImage/OpTypeSampledImage
-    // is shared across textures; each texture is a COMBINED_IMAGE_SAMPLER UniformConstant at its binding.
-    uint32_t t_image = 0, t_sampled_image = 0;
-    std::unordered_map<uint32_t, uint32_t> tex_var;   // binding -> combined-sampler OpVariable id
-    // Declare (idempotently) a combined image+sampler at descriptor-set 0, `binding`. Requires t_f32.
-    void declare_texture(uint32_t binding) {
+    // Combined image+sampler support (MIMG image_sample). One float OpTypeImage/OpTypeSampledImage PER DIM
+    // (2D/3D) is shared; each texture is a COMBINED_IMAGE_SAMPLER UniformConstant at its binding.
+    uint32_t t_image = 0, t_sampled_image = 0;            // 2D (the common case; kept for existing callers)
+    std::unordered_map<uint32_t, uint32_t> tex_var;       // binding -> combined-sampler OpVariable id
+    std::unordered_map<uint32_t, uint32_t> tex_simg_dim;  // SPIR-V Dim -> OpTypeSampledImage id
+    uint32_t t_v3f_cache = 0;
+    uint32_t t_v3f() { if (!t_v3f_cache) { t_v3f_cache = id(); put(types, Op_TypeVector, {t_v3f_cache, t_f32, 3}); } return t_v3f_cache; }
+    uint32_t sampled_image_type(uint32_t dim) {
+        auto it = tex_simg_dim.find(dim); if (it != tex_simg_dim.end()) return it->second;
+        uint32_t ti = id(); put(types, Op_TypeImage, {ti, t_f32, dim, 0, 0, 0, 1, 0});  // sampled f32, Sampled=1
+        uint32_t si = id(); put(types, Op_TypeSampledImage, {si, ti});
+        if (dim == Dim_2D) { t_image = ti; t_sampled_image = si; }
+        tex_simg_dim[dim] = si; return si;
+    }
+    // Declare (idempotently) a combined image+sampler of SPIR-V `dim` at descriptor-set 0, `binding`.
+    void declare_texture(uint32_t binding, uint32_t dim = Dim_2D) {
+        uint32_t simg = sampled_image_type(dim);
         if (tex_var.count(binding)) return;
-        if (!t_image) {
-            t_image = id();   // sampled f32, Dim=2D, Depth=0, Arrayed=0, MS=0, Sampled=1, Format=Unknown
-            put(types, Op_TypeImage, {t_image, t_f32, Dim_2D, 0, 0, 0, 1, 0});
-            t_sampled_image = id();
-            put(types, Op_TypeSampledImage, {t_sampled_image, t_image});
-        }
-        uint32_t t_ptr = id(); put(types, Op_TypePointer, {t_ptr, SC_UniformConstant, t_sampled_image});
+        uint32_t t_ptr = id(); put(types, Op_TypePointer, {t_ptr, SC_UniformConstant, simg});
         uint32_t v = id();     put(types, Op_Variable,    {t_ptr, v, SC_UniformConstant});
         put(deco, Op_Decorate, {v, Dec_DescriptorSet, 0});
         put(deco, Op_Decorate, {v, Dec_Binding, binding});
@@ -229,6 +234,16 @@ struct SpirvCompute {
     void image_sample_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t out[4]) {
         uint32_t si    = id(); put(code, Op_Load, {t_sampled_image, si, tex_var[binding]});
         uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
+        uint32_t res   = id(); put(code, Op_ImageSampleImplicitLod, {t_v4f, res, si, coord});
+        for (uint32_t c = 0; c < 4; c++) {
+            uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, res, c}); out[c] = bcu(e);
+        }
+    }
+    // image_sample 3D: (u,v,w) float-BITS coords -> RGBA (implicit LOD). Uses the Dim_3D sampled image.
+    void image_sample_3d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t w_bits, uint32_t out[4]) {
+        uint32_t simg  = sampled_image_type(Dim_3D);
+        uint32_t si    = id(); put(code, Op_Load, {simg, si, tex_var[binding]});
+        uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v3f(), coord, bcf(u_bits), bcf(v_bits), bcf(w_bits)});
         uint32_t res   = id(); put(code, Op_ImageSampleImplicitLod, {t_v4f, res, si, coord});
         for (uint32_t c = 0; c < 4; c++) {
             uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, res, c}); out[c] = bcu(e);
@@ -1392,22 +1407,34 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 return true;
             }
 
-            // --- Sampled-texture path: image_sample* (0x20/0x24/0x27) / image_load (0x00), 2D, non-NSA ---
+            // --- Sampled-texture path: image_sample* (0x20/0x24/0x27) / image_load (0x00). 2D (any LOD
+            // variant) or 3D (implicit-LOD sample only); NSA allowed (coords gathered below).
             // image_sample = 0x20 (implicit-LOD), image_sample_l = 0x24 (explicit LOD in 3rd coord),
             // image_sample_lz = 0x27 (LOD 0), image_load = 0x00 (integer texel fetch).
             const bool is_sample = (in.opcode == 0x20), is_load = (in.opcode == 0x00);
             const bool is_sample_l = (in.opcode == 0x24), is_sample_lz = (in.opcode == 0x27);
-            if ((!is_sample && !is_load && !is_sample_l && !is_sample_lz) ||
-                in.mimg_dim != SQ_DIM_2D || in.len_dwords != 2) { ok = false; return true; }
+            const bool dim2d = (in.mimg_dim == 1u), dim3d = (in.mimg_dim == 2u);
+            if ((!is_sample && !is_load && !is_sample_l && !is_sample_lz) || (!dim2d && !dim3d)) { ok = false; return true; }
             if (res->cls != ResourceClass::Texture) { ok = false; return true; }
-            b.declare_texture(res->binding);
-            // coords: VGPR[VADDR], VGPR[VADDR+1] — normalized float for sample, integer texel for load.
+            // coords (normalized float for sample, integer texel for load). Non-NSA: consecutive from VADDR.
+            // NSA (len>2): coord0 = VADDR, coord k>=1 = byte (k-1) of the extra address dwords words[2..3].
+            const bool nsa = in.len_dwords > 2;
             int va = in.src[0].value;
+            auto cvg = [&](uint32_t k) -> int { if (!nsa || k == 0) return va + (nsa ? 0 : (int)k);
+                uint32_t j = k - 1; return (int)((in.words[2 + j / 4] >> (8 * (j % 4))) & 0xFFu); };
             uint32_t out[4];
-            if (is_sample)         b.image_sample_2d(res->binding, vread(va), vread(va + 1), out);
-            else if (is_sample_lz) b.image_sample_lod_2d(res->binding, vread(va), vread(va + 1), b.uconst(0), out);   // LOD 0
-            else if (is_sample_l)  b.image_sample_lod_2d(res->binding, vread(va), vread(va + 1), vread(va + 2), out); // LOD = 3rd coord
-            else                   b.image_fetch_2d (res->binding, vread(va), vread(va + 1), out);
+            if (dim3d) {
+                if (!is_sample) { ok = false; return true; }   // only implicit-LOD sample from a 3D texture for now
+                b.declare_texture(res->binding, Dim_3D);
+                b.image_sample_3d(res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)), out);
+            } else {
+                b.declare_texture(res->binding, Dim_2D);
+                uint32_t cu = vread(cvg(0)), cv = vread(cvg(1));
+                if (is_sample)         b.image_sample_2d(res->binding, cu, cv, out);
+                else if (is_sample_lz) b.image_sample_lod_2d(res->binding, cu, cv, b.uconst(0), out);      // LOD 0
+                else if (is_sample_l)  b.image_sample_lod_2d(res->binding, cu, cv, vread(cvg(2)), out);    // LOD = 3rd coord
+                else                   b.image_fetch_2d (res->binding, cu, cv, out);
+            }
             // dmask selects which result components are written to consecutive VDATA VGPRs (LSB=R first).
             int vd = in.dst.value, w = 0;
             for (uint32_t c = 0; c < 4; c++) if (in.mimg_dmask & (1u << c)) {
@@ -1592,7 +1619,9 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
                     const bool st_dim = i.mimg_dim <= 2u || i.mimg_dim == 4u || i.mimg_dim == 5u;
                     if (i.opcode == 0x00u) return st_dim || i.mimg_dim == 6u;   // image_load (+ 2D_MSAA)
                     if (i.opcode == 0x08u) return st_dim;                       // image_store (no per-sample MSAA store)
-                    if (i.opcode == 0x20u || i.opcode == 0x24u || i.opcode == 0x27u) return i.mimg_dim <= 2u && i.len_dwords == 2;
+                    // sample*: 2D (NSA ok); plus implicit-LOD image_sample (0x20) from a 3D texture.
+                    if (i.opcode == 0x20u) return i.mimg_dim == 1u || i.mimg_dim == 2u;
+                    if (i.opcode == 0x24u || i.opcode == 0x27u) return i.mimg_dim == 1u;
                     return false;
                 }
                 case Rdna2Format::MUBUF:  return i.opcode <= 0x07u;   // buffer_load/store_format_* (need the V#)

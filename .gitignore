@@ -39,3 +39,4 @@ Thumbs.db
 
 # Rendered screenshot artifacts (viewable locally, not committed)
 prosper/screenshots/
+*.spv

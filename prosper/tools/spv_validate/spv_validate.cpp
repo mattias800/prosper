@@ -59,6 +59,12 @@ int main(int argc, char** argv) {
       ShaderResourceTable rt; ShaderResource t{}; t.cls=ResourceClass::Texture; t.format=DataFormat::Float32;
       t.num_components=4; t.binding=4; t.img_dim=1; t.width=2; t.height=2; t.sgpr_base=8; rt.resources.push_back(t);
       dump(dir, "fragment_texture", recompile_fragment(c, sizeof(c)/4, &rt)); }
+    // Fragment: image_sample a 3D texture (3 coords) -> mrt0. (shader_028 pattern)
+    { const uint32_t c[] = {0x7E0002FFu,0x3E800000u,0x7E0202FFu,0x3E800000u,0x7E0402FFu,0x3E800000u,
+                            0xF0800F10u,0x00400000u,0xF800180Fu,0x03020100u,0xBF810000u};
+      ShaderResourceTable rt; ShaderResource t{}; t.cls=ResourceClass::Texture; t.format=DataFormat::Float32;
+      t.num_components=4; t.binding=4; t.img_dim=2; t.width=2; t.height=2; t.sgpr_base=0; rt.resources.push_back(t);
+      dump(dir, "fragment_texture_3d", recompile_fragment(c, sizeof(c)/4, &rt)); }
     // Vertex with PARAM export (interpolated varying out).
     { const uint32_t c[] = {0x7e140d00u,0x36020081u,0x2c040081u,0x7e020d01u,0x7e040d02u,0x100202f6u,0x100404f6u,
                             0x060202f3u,0x060404f3u,0x7e060280u,0x7e0802f2u,0xf80008cfu,0x04030201u,0xf800020fu,0x0403030au,0xbf810000u};
