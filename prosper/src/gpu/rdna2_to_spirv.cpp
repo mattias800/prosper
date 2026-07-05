@@ -791,7 +791,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
         }
         case Rdna2Format::VOP3: {
             uint32_t old_d = vreg_old(b, rs, in.dst.value);
-            if (in.opcode == 0x14B) {                                 // v_fma_f32 = src0*src1 + src2
+            if (in.opcode == 0x14B || in.opcode == 0x141) {           // v_fma_f32 / v_mad_f32 = src0*src1 + src2
+                // v_mad_f32 (op 0x141) is a gfx10.1 (Navi) instruction REMOVED in gfx10.3, so llvm-mc
+                // -mcpu=gfx1030 rejects it as invalid — but the PS5 shader compiler targets gfx10.1 and
+                // emits it (real game shaders 5,26-29: manual attribute interpolation p0+i*p1). Its result
+                // (unfused mul-then-add) maps exactly to OpFMul+OpFAdd; v_fma's fused rounding is
+                // immaterial here. VERIFIED(round-trip llvm-mc gfx1010, both directions): VOP3 op 0x141.
                 uint32_t m = b.fbin(Op_FMul, val(in.src[0]), val(in.src[1]));
                 vreg[in.dst.value] = b.fbin(Op_FAdd, m, val(in.src[2]));
             } else if (in.opcode == 0x169) {                          // v_mul_lo_u32
