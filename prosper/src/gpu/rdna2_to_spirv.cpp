@@ -998,6 +998,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (in.dst.value != 126 && in.dst.value != 127) ok = false;
                     break;
                 case 0x26: d = b.ibin(Op_IMul, a, c); break;         // s_mul_i32 (low 32 bits; no SCC)
+                case 0x31: d = b.ibin(Op_IAdd, b.ibin(Op_ShiftLeftLogical, a, b.uconst(4)), c); break;  // s_lshl4_add_u32 = (src0<<4)+src1
                 case 0x35: d = b.umul_hi(a, c); break;               // s_mul_hi_u32 (high 32 bits; no SCC)
                 case 0x37: d = b.smul_hi(a, c); break;               // s_mul_hi_i32 (high 32 bits; no SCC)
                 case 0x27: {                                         // s_bfe_u32: offset=src1[4:0], width=src1[22:16]
