@@ -6,9 +6,16 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <atomic>
 #include <ctime>
+#include <deque>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <unordered_map>
+#include <vector>
 
 namespace prosper {
 
@@ -72,14 +79,93 @@ HLE(m_cnd_destroy){ if (a0 && *(void**)P(a0)) { pthread_cond_destroy((pthread_co
 // --- event queue (sceKernelEqueue): kqueue-like event mechanism the engine uses for vsync/flip
 // and async I/O completion. Headless: give a valid queue object; WaitEqueue yields briefly and
 // reports no events (callers time out and retry) so nothing busy-spins and no null queue is used. ---
-HLE(k_eq_create) { if (a0) *(void**)P(a0) = calloc(1, 64); return 0; }   // *eq = valid opaque queue
-HLE(k_eq_delete) { if (a0) free(P(a0)); return 0; }
-HLE(k_eq_wait)   {   // (eq, ev*, num, out*, timeout*): brief yield, 0 events ready
-    struct timespec ts{ 0, 1 * 1000 * 1000 }; nanosleep(&ts, nullptr);
-    if (a3) *(int32_t*)P(a3) = 0;
+namespace { bool evlog() { static int v = getenv("PROSPER_EVLOG") ? 1 : 0; return v; } }
+
+// --- Real event-queue backend (kqueue/kevent model). Registered flip/vblank sources post events into
+// their equeue; WaitEqueue blocks until an event is ready (or timeout) and returns it. A single ~60 Hz
+// pump thread drives vblank + flip-completion events so Unity's render/timing threads pace frames. ---
+namespace {
+    // SceKernelEvent (FreeBSD kevent layout, 0x20 bytes): ident@0, filter@8(i16), flags@0xA(u16),
+    // fflags@0xC(u32), data@0x10, udata@0x18. The game reads udata (its flip context) + data.
+    struct SceKEvent { int64_t ident; int16_t filter; uint16_t flags; uint32_t fflags; int64_t data; uint64_t udata; };
+    // PS5 filter ids (negative, FreeBSD-style). VideoOut flip/vblank use the DISPLAY filter family.
+    constexpr int16_t EVFILT_VIDEO_OUT = -0x0a;   // SCE VideoOut event filter (flip + vblank)
+
+    struct EqState { std::mutex m; std::condition_variable cv; std::deque<SceKEvent> ready; };
+    std::mutex g_eq_mx;
+    std::unordered_map<uint64_t, EqState*> g_eqs;              // guest eq ptr -> state
+    struct FlipReg { uint64_t eq; int64_t ident; uint64_t udata; };
+    std::vector<FlipReg> g_flip_regs, g_vblank_regs;
+    std::atomic<bool> g_pump_started{false};
+
+    EqState* eq_find(uint64_t eq) { std::lock_guard<std::mutex> lk(g_eq_mx); auto it = g_eqs.find(eq); return it == g_eqs.end() ? nullptr : it->second; }
+    void eq_post(uint64_t eq, const SceKEvent& e) {
+        EqState* s = eq_find(eq); if (!s) return;
+        std::lock_guard<std::mutex> lk(s->m);
+        if (s->ready.size() < 4) s->ready.push_back(e);   // cap so an un-drained queue can't grow unbounded
+        s->cv.notify_all();
+    }
+    void vblank_pump() {
+        uint64_t frame = 0;
+        for (;;) {
+            struct timespec ts{ 0, 16666667 }; nanosleep(&ts, nullptr);   // ~60 Hz
+            frame++;
+            std::vector<FlipReg> fr, vr;
+            { std::lock_guard<std::mutex> lk(g_eq_mx); fr = g_flip_regs; vr = g_vblank_regs; }
+            for (auto& r : vr) { SceKEvent e{}; e.ident = r.ident; e.filter = EVFILT_VIDEO_OUT; e.data = (int64_t)frame; e.udata = r.udata; eq_post(r.eq, e); }
+            for (auto& r : fr) { SceKEvent e{}; e.ident = r.ident; e.filter = EVFILT_VIDEO_OUT; e.data = (int64_t)frame; e.udata = r.udata; eq_post(r.eq, e); }
+        }
+    }
+    void ensure_pump() { if (!g_pump_started.exchange(true)) std::thread(vblank_pump).detach(); }
+}
+
+// Exposed to hle_graphics.cpp (sceVideoOut* flip/vblank event registration).
+void prosper_eq_add_flip(uint64_t eq, int64_t ident, uint64_t udata) {
+    { std::lock_guard<std::mutex> lk(g_eq_mx); g_flip_regs.push_back({ eq, ident, udata }); }
+    ensure_pump();
+}
+void prosper_eq_add_vblank(uint64_t eq, int64_t ident, uint64_t udata) {
+    { std::lock_guard<std::mutex> lk(g_eq_mx); g_vblank_regs.push_back({ eq, ident, udata }); }
+    ensure_pump();
+}
+
+HLE(k_eq_create) {
+    EqState* s = new EqState();
+    if (a0) *(void**)P(a0) = (void*)s;   // the guest's opaque SceKernelEqueue handle IS our state ptr
+    { std::lock_guard<std::mutex> lk(g_eq_mx); g_eqs[(uint64_t)(uintptr_t)s] = s; }
+    if (evlog()) fprintf(stderr, "[ev] CreateEqueue -> eq=%p name=%s\n", (void*)s, a1 ? (const char*)P(a1) : "");
     return 0;
 }
-HLE(k_eq_getcount){ return 0; }
+HLE(k_eq_delete) {
+    if (a0) { std::lock_guard<std::mutex> lk(g_eq_mx); auto it = g_eqs.find(a0); if (it != g_eqs.end()) { delete it->second; g_eqs.erase(it); } }
+    return 0;
+}
+HLE(k_eq_wait)   {   // (eq, SceKernelEvent* ev, int num, int* out, SceKernelUseconds* timeout)
+    if (evlog()) fprintf(stderr, "[ev] WaitEqueue eq=0x%llx num=%llu timeout=%s ra=eboot+0x%llx\n",
+        (unsigned long long)a0, (unsigned long long)a2, a4 ? "yes" : "inf",
+        (unsigned long long)((uint64_t)__builtin_return_address(0) - 0x400000000ull));
+    EqState* s = eq_find(a0);
+    int num = (int)a2; if (num < 1) num = 1;
+    if (!s) { struct timespec ts{ 0, 1000000 }; nanosleep(&ts, nullptr); if (a3) *(int32_t*)P(a3) = 0; return 0; }
+    std::unique_lock<std::mutex> lk(s->m);
+    if (s->ready.empty()) {
+        // timeout arg is a pointer to micro-seconds (null = wait forever). Cap the wait so a headless
+        // run never hard-blocks the guest thread even if no source is registered yet.
+        uint64_t us = a4 ? *(uint32_t*)P(a4) : 100000;
+        if (us > 100000) us = 100000;
+        s->cv.wait_for(lk, std::chrono::microseconds(us), [&]{ return !s->ready.empty(); });
+    }
+    int n = 0; auto* ev = (SceKEvent*)P(a1);
+    while (n < num && !s->ready.empty()) { if (ev) ev[n] = s->ready.front(); s->ready.pop_front(); n++; }
+    if (a3) *(int32_t*)P(a3) = n;
+    return 0;   // 0 = success (n events returned; n may be 0 on timeout)
+}
+HLE(k_eq_getcount){
+    EqState* s = eq_find(a0); int n = 0;
+    if (s) { std::lock_guard<std::mutex> lk(s->m); n = (int)s->ready.size(); }
+    if (evlog()) fprintf(stderr, "[ev] GetEventCount eq=0x%llx -> %d\n", (unsigned long long)a0, n);
+    return (uint64_t)n;
+}
 
 void register_kernel_time_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)

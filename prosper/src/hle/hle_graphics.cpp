@@ -135,16 +135,36 @@ extern "C" uint64_t prosper_vo_display_format() { return g_display.pixel_format;
 extern "C" uint64_t prosper_vo_buffer_addr(int i) {
     return (i >= 0 && i < g_display.buffer_num) ? g_display.buffer_addr[i] : 0;
 }
+namespace { bool evlog() { static int v = getenv("PROSPER_EVLOG") ? 1 : 0; return v; } }
+// Implemented in hle_kernel_time.cpp (the equeue backend). Register a flip/vblank event source so the
+// ~60 Hz pump posts events into the given equeue; the game's WaitEqueue then returns them.
+void prosper_eq_add_flip(uint64_t eq, int64_t ident, uint64_t udata);
+void prosper_eq_add_vblank(uint64_t eq, int64_t ident, uint64_t udata);
 HLE(g_vo_open)        { gfx_tick(); return (uint64_t)(int64_t)(++g_vo_handle + 0x1000); }  // positive handle
 HLE(g_vo_close)       { return 0; }
+// sceVideoOutAddFlipEvent(eq, handle, udata): register a flip-completion event source on an equeue.
+HLE(g_vo_addflipevent) {
+    if (evlog()) fprintf(stderr, "[ev] AddFlipEvent eq=0x%llx handle=0x%llx udata=0x%llx\n",
+        (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2);
+    prosper_eq_add_flip(a0, (int64_t)(int32_t)a1, a2);
+    return 0;
+}
+HLE(g_vo_addvblankevent) {
+    if (evlog()) fprintf(stderr, "[ev] AddVblankEvent eq=0x%llx handle=0x%llx udata=0x%llx\n",
+        (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2);
+    prosper_eq_add_vblank(a0, (int64_t)(int32_t)a1, a2);
+    return 0;
+}
 HLE(g_vo_submitflip)  {
+    if (evlog()) fprintf(stderr, "[ev] SubmitFlip handle=0x%llx bufidx=%lld flipmode=0x%llx fl013arg=0x%llx\n",
+        (unsigned long long)a0, (long long)(int32_t)a1, (unsigned long long)a2, (unsigned long long)a3);
     g_flip_count++;
     g_current_buffer = (int32_t)a1;
     g_last_flip_arg = (int64_t)a3;
     gpu::present_flip((int)(int32_t)a1, (int64_t)a3);   // present the buffer (scanout front + count)
     return 0;
 }
-HLE(g_vo_flippending) { return 0; }                                            // never pending -> can submit next
+HLE(g_vo_flippending) { if (evlog()) fprintf(stderr, "[ev] IsFlipPending\n"); return 0; }        // never pending
 HLE(g_vo_flipstatus)  { // (handle, SceVideoOutFlipStatus* status): report our simulated flip count.
     // SceVideoOutFlipStatus is exactly 0x40 bytes — writing more smashes the caller's stack canary!
     if (a1) { uint8_t* s = (uint8_t*)(uintptr_t)a1; memset(s, 0, 0x40);
@@ -316,7 +336,8 @@ void register_graphics_hle() {
     // libSceVideoOut display / flip
     R("sceVideoOutOpen", g_vo_open);            R("sceVideoOutClose", g_vo_close);
     R("sceVideoOutSubmitFlip", g_vo_submitflip);R("sceVideoOutIsFlipPending", g_vo_flippending);
-    R("sceVideoOutSetFlipRate", g_vo_close);    R("sceVideoOutAddFlipEvent", g_vo_close);
+    R("sceVideoOutSetFlipRate", g_vo_close);    R("sceVideoOutAddFlipEvent", g_vo_addflipevent);
+    R("sceVideoOutAddVblankEvent", g_vo_addvblankevent);
     R("sceVideoOutGetFlipStatus", g_vo_flipstatus);
     R("sceVideoOutGetResolutionStatus", g_vo_resstatus);
     R("sceVideoOutGetVblankStatus", g_vo_vblankstatus);
