@@ -1,27 +1,34 @@
-# RDNA2→SPIR-V recompiler — remaining work (the last 11 of 41 shaders)
+# RDNA2→SPIR-V recompiler — remaining work
 
-**Date:** 2026-07-05. **Status:** the recompiler is at a well-tested plateau — **30 of 41** real game
-shaders fully recompile in-context (~86% instruction coverage), every **bring-up-critical class** covered
-(position/blit/clear, textured, interpolated, image-copy incl. 1D/2D/3D + arrayed + NSA, integer
-divide/modulo). All paths are `spirv-val`-gated (`tools/spv_validate`, permanent ctest) and, where a Vulkan
-harness exists, execution-differential-tested.
+**Date:** 2026-07-05. **Status:** ~90.9% instruction coverage in-context. Every **bring-up-critical class**
+is covered (position/blit/clear, textured incl. **3D sampling** + NSA, interpolated, image-copy 1D/2D/3D +
+arrayed + NSA + MSAA, integer divide/modulo), plus the two big structural features have landed:
+**counted-loop reconstruction** (`OpLoopMerge`/`OpPhi`) and **divergent-if handling** (EXEC-predicated
+linearization, including scalar writes that are provably dead at the merge). All paths are `spirv-val`-gated
+(`tools/spv_validate`, permanent ctest) and, where a Vulkan harness exists, execution-differential-tested.
 
-The remaining 11 shaders each need **one or more genuinely deep features** — verified below by
-disassembly. **None is completable by a single bounded opcode/feature add**, which is why coverage has
-plateaued: the cheap, safe, data-driven wins are exhausted. These are also all **advanced compute/geometry
-effects — none is needed for the first frame** (the critical path to on-screen graphics is the GfxDevice
-boot wall; see `GFXDEVICE_BRINGUP_PROBLEM.md`).
+**Landed / recompiling end-to-end (spirv-val VALID):** the textured, interpolated and image-copy families,
+plus the counted-loop MSAA-resolve fragment shaders **031** and **033**, the 3D-texture-sample shader
+**028**, and the compressed-export shader **029**. (031/033/028/029 completed most recently.)
+
+The remaining shaders each need **one or more genuinely deep features** — verified below by disassembly.
+**None is completable by a single bounded opcode/feature add**, and **none is needed for the first frame**
+(the critical path to on-screen graphics is the GfxDevice boot wall; see `GFXDEVICE_BRINGUP_PROBLEM.md`).
 
 ## What each remaining shader needs
 
 | Shaders | Class | Blocking features (all required together) |
 |---|---|---|
-| **031, 033** | counted-loop MSAA resolve | **loop reconstruction** (`s_cmp`→`s_cbranch_scc0` exit + backward `s_branch`; SGPR loop counter `s10`; loop-carried FP accumulators `v6–v10`) **+ 2D_MSAA** image dim |
-| **032, 034** | loop + arrayed/MSAA sampling | loop reconstruction + **2D_ARRAY / 2D_MSAA_ARRAY** image dims (arrayed non-MSAA storage is done; MSAA + the loop are not) |
+| **032, 034** | loop + arrayed/MSAA sampling | loop reconstruction (done) + **2D_ARRAY / 2D_MSAA_ARRAY** *sampled* image dims (arrayed/MSAA storage is done; arrayed/MSAA **sampling** is not) |
 | **004, 025, 040** | NGG vertex/primitive | **NGG preamble**: `s_sendmsg(GS_ALLOC_REQ)`, `exp prim`, and wave-packing EXEC setup (`s_lshr_b64 exec,-1,vcc`) — modellable as per-invocation no-ops, but needs care to prove correctness |
-| **006, 030, 037, 038** | large / wave-level | loop reconstruction **+ wave-level ops**: `s_bfe_u64`/`s_lshr_b64` writing **EXEC** (wave-lane setup), **cross-lane** `v_mbcnt_lo/hi` (active-lane count), `v_readlane`; plus a long ALU tail. Hardest; multiple features each. |
+| **006** | multi-tap sample + inline sampler | **inline sampler descriptor construction** (`s[8:11]` reused as a buffer V# then rebuilt as an S# via `s_movk`/`s_bfm`/`s_lshl`/`s_mov`) + dmask≠0xF (3-component) sampling. NSA + implicit-LOD sampling itself is done. |
+| **030, 037, 038** | large / wave-level | **wave-level ops**: `s_bfe_u64`/`s_lshr_b64` writing **EXEC** (wave-lane setup), **cross-lane** `v_mbcnt_lo/hi` (active-lane count), `v_readlane`; plus a long ALU tail. Hardest; multiple features each. |
 
-## The big lever: loop reconstruction (unblocks the most, but is architectural)
+## The big lever: loop reconstruction — **LANDED**
+
+Counted-loop reconstruction (`OpLoopMerge` + `OpPhi` for loop-carried registers, per-block value maps)
+and divergent-if handling now recompile the MSAA-resolve fragment shaders 031/033 end-to-end. The design
+notes below are retained as the reference for the value-map/phi machinery.
 
 Worked example — **shader 031** (an MSAA-sample-average resolve):
 ```
@@ -56,10 +63,9 @@ deliberate, multi-step effort best done with a human in the loop, not an overnig
 Given (a) all remaining shaders are advanced effects not needed for the first frame, and (b) the actual
 graphics blocker is the boot wall, the highest-value next steps are, in order:
 1. **The GfxDevice boot wall** (interactive/reference-backed session) — the true critical path.
-2. **Loop reconstruction** — as a deliberate generality investment (also the gate for many UE4/other-title
-   shaders), when prioritized.
-3. NGG preamble; MSAA/MSAA-array image dims — smaller, each unblocking 2–3 of the remaining shaders once
-   loops land.
+2. NGG preamble (`s_sendmsg`/`exp prim`) — unblocks 004/025/040.
+3. Arrayed/MSAA *sampled* image dims — unblocks 032/034 (loop reconstruction they also need is done).
+4. Inline-sampler descriptor construction + 3-component (dmask) sampling — unblocks 006.
 
 Marginal instruction-coverage ops (e.g. `v_cndmask_b32_e64`, `s_bfe_u64`) can still be added safely but
 **complete no additional shader** on their own, so they are deferred in favour of the above.
