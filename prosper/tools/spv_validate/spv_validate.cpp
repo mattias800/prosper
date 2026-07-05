@@ -102,7 +102,10 @@ int main(int argc, char** argv) {
       const uint32_t carr[] = {0xF0000F28u,0x00000004u,0xBF8C3F70u,0xF0200F28u,0x00020004u,0xBF810000u};
       dump(dir, "storage_arrayed_2d", recompile_valu(carr, sizeof(carr)/4, 1, 0, &rt));
       const uint32_t cms[]  = {0xF0000F30u,0x00000000u,0xBF8C3F70u,0x7E000D00u,0xBF810000u};   // image_load 2D_MSAA (x,y,sample)
-      dump(dir, "storage_msaa_2d",    recompile_valu(cms,  sizeof(cms)/4,  1, 0, &rt)); }
+      dump(dir, "storage_msaa_2d",    recompile_valu(cms,  sizeof(cms)/4,  1, 0, &rt));
+      // image_load 2D_MSAA_ARRAY (dim 7): coords (x,y,layer) + sample — needs Arrayed+MS + ImageMSArray cap.
+      const uint32_t cmsa[] = {0xF0000F3Au,0x00000000u,0x00030201u,0xBF8C3F70u,0xBF810000u};
+      dump(dir, "storage_msaa_array_2d", recompile_valu(cmsa, sizeof(cmsa)/4, 1, 0, &rt)); }
     // Compute mul_hi (high 32 bits via OpUMulExtended -> {lo,hi} struct extract).
     { const uint32_t c[] = {0x7E0202FFu,0x80000000u,0xD56A0002u,0x00020301u,0x7E000D02u,0xBF810000u};
       dump(dir, "compute_mul_hi", recompile_valu(c, sizeof(c)/4, 1, 0)); }

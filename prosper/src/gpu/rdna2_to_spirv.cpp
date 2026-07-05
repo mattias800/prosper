@@ -49,6 +49,7 @@ enum : uint32_t {
     Dim_1D=0, Dim_2D=1, Dim_3D=2,   // SPIR-V Dim. (2D coincides with the SQ_RSRC 2D dim value, but distinct.)
     Cap_Sampled1D=43, Cap_Image1D=44,   // Dim=1D needs Sampled1D; a 1D STORAGE image (read/write) also needs Image1D
     Cap_StorageImageMultisample=27,      // MS=1 storage image (read/write a multisampled image)
+    Cap_ImageMSArray=48,                 // MS=1 AND Arrayed=1 image (2D_MSAA_ARRAY)
     Cap_StorageImageReadWithoutFormat=55, Cap_StorageImageWriteWithoutFormat=56,  // for Format=Unknown storage images
     Img_Sampled_Storage=2,   // OpTypeImage "Sampled" operand: 2 = used WITHOUT a sampler (read/write storage image)
     ImgFmt_Unknown=0,        // OpTypeImage "Image Format": Unknown (runtime view format; needs the caps above)
@@ -282,7 +283,7 @@ struct SpirvCompute {
     uint32_t t_v3u_c = 0;   // integer coordinate vector type (uvec3); 2D reuses the shared t_v2u()
     std::unordered_map<uint32_t, uint32_t> stg_img_type;   // (dim | arrayed<<8 | ms<<9) -> OpTypeImage id
     std::unordered_map<uint32_t, uint32_t> stg_img_var;    // binding -> storage-image OpVariable id
-    bool declared_read_wo_fmt = false, declared_write_wo_fmt = false, declared_sampled1d = false, declared_ms = false;
+    bool declared_read_wo_fmt = false, declared_write_wo_fmt = false, declared_sampled1d = false, declared_ms = false, declared_msarray = false;
     static uint32_t stg_key(uint32_t dim, bool arrayed, bool ms) { return dim | (arrayed ? 0x100u : 0u) | (ms ? 0x200u : 0u); }
     // Declare (idempotently) a uint storage image of SPIR-V `dim` (arrayed = layer in the coord; ms =
     // multisampled) at set 0, `binding`. Each (dim,arrayed,ms) is a distinct OpTypeImage, keyed separately.
@@ -293,6 +294,7 @@ struct SpirvCompute {
             declared_sampled1d = true;
         }
         if (ms && !declared_ms) { put(caps, Op_Capability, {Cap_StorageImageMultisample}); declared_ms = true; }
+        if (ms && arrayed && !declared_msarray) { put(caps, Op_Capability, {Cap_ImageMSArray}); declared_msarray = true; }
         uint32_t key = stg_key(dim, arrayed, ms);
         if (!stg_img_type.count(key)) {
             uint32_t ti = id();
@@ -1431,7 +1433,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     case 4: dim = Dim_1D; ncoord = 2; arrayed = true; break;       // 1D_ARRAY (x, layer)
                     case 5: dim = Dim_2D; ncoord = 3; arrayed = true; break;       // 2D_ARRAY (x, y, layer)
                     case 6: dim = Dim_2D; ncoord = 2; ms = true; break;            // 2D_MSAA (x, y) + sample index
-                    default: ok = false; return true;   // cube / MSAA-array storage images deferred
+                    case 7: dim = Dim_2D; ncoord = 3; arrayed = true; ms = true; break;  // 2D_MSAA_ARRAY (x,y,layer)+sample
+                    default: ok = false; return true;   // cube storage images deferred
                 }
                 if (ms && is_st) { ok = false; return true; }   // per-sample MSAA store not modeled (resolve shaders read)
                 b.declare_storage_image(res->binding, dim, arrayed, ms);
@@ -1677,7 +1680,7 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
                     // Storage load/store handle 1D/2D/3D + 1D/2D_ARRAY (dims 0,1,2,4,5) and NSA; image_load
                     // also handles 2D_MSAA (dim 6). sample* go through the sampled-texture path (2D, non-NSA).
                     const bool st_dim = i.mimg_dim <= 2u || i.mimg_dim == 4u || i.mimg_dim == 5u;
-                    if (i.opcode == 0x00u) return st_dim || i.mimg_dim == 6u;   // image_load (+ 2D_MSAA)
+                    if (i.opcode == 0x00u) return st_dim || i.mimg_dim == 6u || i.mimg_dim == 7u;   // image_load (+ 2D_MSAA[_ARRAY])
                     if (i.opcode == 0x08u) return st_dim;                       // image_store (no per-sample MSAA store)
                     // sample*: 2D (NSA ok); plus implicit-LOD image_sample (0x20) from a 3D texture.
                     if (i.opcode == 0x20u) return i.mimg_dim == 1u || i.mimg_dim == 2u;
