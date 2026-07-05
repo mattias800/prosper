@@ -29,7 +29,8 @@ int main(int argc, char** argv) {
     std::map<std::pair<int, uint32_t>, uint32_t> histo;
     int shaders = 0; size_t total = 0, unknown = 0, maxsz = 0;
     // Recompiler coverage aggregates (data-driven: how much of the REAL shaders we can translate now).
-    size_t cov_total = 0, cov_alu = 0, cov_exp = 0, cov_unsup = 0; int shaders_full = 0;
+    size_t cov_total = 0, cov_alu = 0, cov_exp = 0, cov_unsup = 0, cov_tabdep = 0;
+    int shaders_full = 0, shaders_full_ctx = 0;
     std::map<std::pair<int, uint32_t>, uint32_t> blockers;   // first-unsupported (fmt,op) -> shader count
     for (size_t i = 0; i + 64 < f.size(); i++) {
         if (!(f[i] == 0x7f && f[i+1] == 'E' && f[i+2] == 'L' && f[i+3] == 'F')) continue;
@@ -66,8 +67,10 @@ int main(int argc, char** argv) {
             // Per-shader recompiler coverage.
             RecompileCoverage cov = recompile_coverage(code, sz/4);
             cov_total += cov.total; cov_alu += cov.alu; cov_exp += cov.exports; cov_unsup += cov.unsupported;
-            if (cov.unsupported == 0) shaders_full++;
-            else blockers[{cov.first_bad_fmt, cov.first_bad_op}]++;
+            cov_tabdep += cov.table_dependent;
+            if (cov.unsupported == 0 && cov.table_dependent == 0) shaders_full++;      // fully covered table-less
+            if (cov.unsupported == 0) shaders_full_ctx++;                              // + those needing only resources
+            if (cov.unsupported) blockers[{cov.first_bad_fmt, cov.first_bad_op}]++;
             // argv[3] = a directory: dump every shader's .shader_text to shader_<idx>.bin and print a
             // per-shader row (idx, size, first-unsupported fmt/op) so a team can analyze each in parallel.
             if (argc > 3) {
@@ -86,12 +89,18 @@ int main(int argc, char** argv) {
     for (auto& [k, c] : histo) printf("  %-6s op=0x%-4x x%u\n", fn[k.first], k.second, c);
 
     // --- Recompiler coverage report (how much of the real shaders we can translate today) ---
-    double pct = cov_total ? 100.0 * (double)(cov_alu + cov_exp) / (double)cov_total : 0.0;
+    // Two numbers: the table-LESS floor (what this compute-shell/no-table pass exercises), and the
+    // in-CONTEXT total (also counting shapes handled given a resource table / fragment stage — MIMG,
+    // buffer_load/store_format, VINTRP — which real draws supply). The gap = boot-wall-gated, not missing.
+    double pct     = cov_total ? 100.0 * (double)(cov_alu + cov_exp) / (double)cov_total : 0.0;
+    double pct_ctx = cov_total ? 100.0 * (double)(cov_alu + cov_exp + cov_tabdep) / (double)cov_total : 0.0;
     printf("\n== recompiler coverage ==\n");
-    printf("  instructions: alu=%zu + exports=%zu of %zu handled (%.1f%%), unsupported=%zu\n",
-           cov_alu, cov_exp, cov_total, pct, cov_unsup);
-    printf("  shaders fully covered: %d / %d\n", shaders_full, shaders);
-    printf("  top blockers (first unsupported inst per shader):\n");
+    printf("  instructions: alu=%zu + exports=%zu of %zu handled table-less (%.1f%%); +%zu table/stage-\n"
+           "                dependent (MIMG/buffer_format/VINTRP) = %.1f%% recompilable in context; unsupported=%zu\n",
+           cov_alu, cov_exp, cov_total, pct, cov_tabdep, pct_ctx, cov_unsup);
+    printf("  shaders fully covered: %d table-less, %d given resource tables / stage (of %d)\n",
+           shaders_full, shaders_full_ctx, shaders);
+    printf("  top blockers (first TRULY-unsupported inst per shader — table-dependent shapes excluded):\n");
     for (auto& [k, c] : blockers)
         printf("    %-6s op=0x%-4x blocks %u shader(s)\n", k.first < 0 ? "?" : fn[k.first], k.second, c);
     return 0;

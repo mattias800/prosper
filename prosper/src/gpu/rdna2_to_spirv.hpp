@@ -44,7 +44,12 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
 // (memory ops / unknown), with the first such (format, opcode) recorded. A data-driven coverage metric.
 struct RecompileCoverage {
     uint32_t total = 0, alu = 0, exports = 0, unsupported = 0;
-    int      first_bad_fmt = -1;   // Rdna2Format of the first unsupported instruction (-1 if none)
+    // Instructions the recompiler handles GIVEN the right context (a resource table for MIMG /
+    // buffer_load_format, or a fragment stage for VINTRP) but that recompile_coverage — which runs
+    // table-less on a compute shell — cannot exercise. Counting them apart from `unsupported` gives an
+    // honest "recompilable in context" number; the table-less `alu`/`unsupported` split understates it.
+    uint32_t table_dependent = 0;
+    int      first_bad_fmt = -1;   // Rdna2Format of the first TRULY-unsupported instruction (-1 if none)
     uint32_t first_bad_op  = 0;
 };
 RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords);

@@ -1107,7 +1107,19 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
         if (in.fmt == Rdna2Format::EXP) { cov.exports++; continue; }   // handled by the stage recompilers
         bool ok = true;
         bool handled = emit_alu(b, rs, in, ok, /*allow_exec_update*/true, &safe_branches, /*allow_smem*/true) && ok;
+        // Shapes the recompiler handles only in context (a resource table for MIMG sample/load/LOD and
+        // buffer_load/store_format; a fragment stage for VINTRP). This table-less compute-shell pass
+        // rejects them, so count them apart from truly-unsupported (cross-lane, etc.).
+        auto table_dependent = [](Rdna2Format f, uint32_t op) {
+            switch (f) {
+                case Rdna2Format::MIMG:   return op == 0x00u || op == 0x20u || op == 0x24u || op == 0x27u;
+                case Rdna2Format::MUBUF:  return op <= 0x07u;   // buffer_load/store_format_* (need the V#)
+                case Rdna2Format::VINTRP: return true;          // handled in the fragment shell
+                default: return false;
+            }
+        };
         if (handled) { cov.alu++; }
+        else if (table_dependent(in.fmt, in.opcode)) { cov.table_dependent++; }
         else {
             cov.unsupported++;
             if (cov.first_bad_fmt < 0) { cov.first_bad_fmt = (int)in.fmt; cov.first_bad_op = in.opcode; }
