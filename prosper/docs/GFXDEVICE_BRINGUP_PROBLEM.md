@@ -357,6 +357,13 @@ count (4–7). The companion at `[+0x140]` may be built by walking `[+0xe0][0..c
    partial-inits `+0x1a0` (Correction 1) → disassemble it → why it stops short of the low byte / the
    companion. First verify the r15 addresses are stable across runs (the high mmap bits may vary even if
    the boot order is deterministic; if so, key the watch off the owning mapping + offset).
+   **VERIFIED 2026-07-05: r15 addresses are NOT deterministic** across runs (run A `…0d62c300`, run B
+   `…2ee2c300` — high mmap bits AND the relative offset differ, from the multithreaded boot). So the
+   simple "hardcode r15, watch it in pass 2" approach is out. The reliable probe must HOOK THE
+   ALLOCATOR/CONSTRUCTOR and watch by object *type*: catch every object the gfx-init at `0x1471fe0`
+   builds (or whose ctor writes `[+0x1e4c]` = a category-{5,9,15} type_id), arm a `[+0x1a0]`/`[+0x140]`
+   write-watchpoint on each from birth, log the writer PC. Multi-step in-run instrumentation — a focused
+   effort, not a quick probe.
 
 **Honest status:** this is a subsystem-level null cascade (likely a whole GfxDevice-construction pass
 that doesn't run in our env), not a one-API fix. It plausibly needs the two-pass watchpoint above and/or
