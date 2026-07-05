@@ -454,3 +454,44 @@ build) is the next step. Alternative (pragmatic/Proton-style, explicitly a shim 
 minimal valid companion graph so the release path is safe, to measure whether the boot then reaches the
 render loop — though the known cascade (next null at `0x95c823`) means the whole GfxDevice object graph,
 not just this companion, is unbuilt.
+
+### 2026-07-05 (interactive, cont.) — the cascade fault dissected + a thread-local-device GATE lead
+
+Drilled the cascade fault `0x95c823` (reached after skipping the drain). It lives in fn `0x95c700`, which
+does:
+```
+95c760  mov %fs:0x0,%rax          ; rax = thread pointer (TP)
+95c76c  mov -0x80(%rax),%rdi      ; rdi = [TP-0x80]  = a scoped thread-local "current GfxDevice/context"
+95c773  test %rdi,%rdi
+95c776  jne 0x95c823              ; device present -> use it
+95c77c  ... lea 0x1c75097 ("Graphics device is null.") ; else -> DEGENERATE path
+95c820  mov (%r14),%rdi           ; r14 = TP-0x80 region;  rdi = [TP-0x80] = 0
+95c823  mov (%rdi),%rax           ; SIGSEGV (rdi=0)
+```
+At the fault: `rdi=0, rax=0xe0b8480000013fbf` (a pipeline register-pack). So `[TP-0x80]` (the thread-local
+device pointer) is **NULL** here and Unity takes its "Graphics device is null." path → degenerate/null
+objects. Crucially the SAME slot `[TP-0x80]` was **non-null** (`0x755da9130b00`) at the drain moment on the
+SAME main thread — i.e. it is a **scoped** thread-local that is set during some device operations and
+cleared otherwise, and GfxDevice construction is running while it is cleared. Note the string table here:
+`"Graphics device is null."` is immediately followed by `"gfx-disable-mt-rendering"` / `"gfx-enable-gfx-
+jobs"` / `"gfx-enable-native-gfx-jobs"` — Unity's **multithreaded-rendering** switches. Working hypothesis:
+GfxDevice objects are built under Unity's MT-render/gfx-jobs path on a thread/scope where `[TP-0x80]` is not
+set in our env, so the companion-build branch (which needs the device) is skipped. This UNIFIES the primary
+(missing companion) and secondary (`0x95c823` device-null) faults under one root: **the scoped thread-local
+GfxDevice pointer is absent when construction runs.**
+
+**Tooling limit hit (important for next session).** The int3 breakpoint-logger (`PROSPER_BP`) is reliable
+only on single-thread-reached sites (proved the drain enumeration). On the hot/multi-threaded ctor
+`0x95c700` the restore-byte→single-step→re-insert dance RACES and corrupts control flow (observed a wild
+jump). To observe worker-thread construction we need **race-free x86 hardware breakpoints (DR0–3 via
+perf_event_open/ptrace — no code modification)**. That is the recommended next tooling build; then hw-BP
+the ctor + hw-data-watch `[+0x140]`/`[+0x1a0]` from birth across all threads.
+
+**Recommended next steps (for the collaborative/tooling session):**
+1. Build HW-breakpoint support (DR0–3) — race-free in this 14-thread RT-signal guest.
+2. Determine what sets/clears `[TP-0x80]` (the scoped thread-local device) and why it is null when GfxDevice
+   ctors run — likely tied to Unity's MT-render / gfx-jobs threading. If a single scope/flag gates it,
+   setting it up (or forcing single-threaded rendering) makes the game build its OWN companions — the
+   cheapest real fix.
+3. Failing that: Unity 2022.3 PS5 backend reference, or the demo-frame path (real recompiled shaders through
+   the verified GpuState→frame spine) to show graphics decoupled from this wall.
