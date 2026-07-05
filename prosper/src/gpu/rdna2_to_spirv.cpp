@@ -241,37 +241,40 @@ struct SpirvCompute {
     // lives in the bound image view / T# descriptor). Requires the read/write-without-format caps.
     uint32_t t_v4u_cache = 0;
     uint32_t t_v4u() { if (!t_v4u_cache) { t_v4u_cache = id(); put(types, Op_TypeVector, {t_v4u_cache, t_u32, 4}); } return t_v4u_cache; }
-    uint32_t t_v3u_c = 0;   // integer coordinate vector type (3D); 2D reuses the shared t_v2u()
-    std::unordered_map<uint32_t, uint32_t> stg_img_type;   // spirv Dim -> OpTypeImage id
+    uint32_t t_v3u_c = 0;   // integer coordinate vector type (uvec3); 2D reuses the shared t_v2u()
+    std::unordered_map<uint32_t, uint32_t> stg_img_type;   // (dim | arrayed<<8) -> OpTypeImage id
     std::unordered_map<uint32_t, uint32_t> stg_img_var;    // binding -> storage-image OpVariable id
     bool declared_read_wo_fmt = false, declared_write_wo_fmt = false, declared_sampled1d = false;
-    // Declare (idempotently) a uint storage image of SPIR-V `dim` at set 0, `binding`.
-    void declare_storage_image(uint32_t binding, uint32_t dim) {
+    // Declare (idempotently) a uint storage image of SPIR-V `dim` (arrayed = layer index in the coord) at
+    // set 0, `binding`. An arrayed image is a distinct OpTypeImage (Arrayed=1) so it's keyed separately.
+    void declare_storage_image(uint32_t binding, uint32_t dim, bool arrayed = false) {
         if (dim == Dim_1D && !declared_sampled1d) {   // SPIR-V: Dim=1D needs Sampled1D; storage 1D also needs Image1D
             put(caps, Op_Capability, {Cap_Sampled1D});
             put(caps, Op_Capability, {Cap_Image1D});
             declared_sampled1d = true;
         }
-        if (!stg_img_type.count(dim)) {
+        uint32_t key = dim | (arrayed ? 0x100u : 0u);
+        if (!stg_img_type.count(key)) {
             uint32_t ti = id();
-            put(types, Op_TypeImage, {ti, t_u32, dim, 0, 0, 0, Img_Sampled_Storage, ImgFmt_Unknown});
-            stg_img_type[dim] = ti;
+            put(types, Op_TypeImage, {ti, t_u32, dim, 0, arrayed ? 1u : 0u, 0, Img_Sampled_Storage, ImgFmt_Unknown});
+            stg_img_type[key] = ti;
         }
         if (stg_img_var.count(binding)) return;
-        uint32_t t_ptr = id(); put(types, Op_TypePointer, {t_ptr, SC_UniformConstant, stg_img_type[dim]});
+        uint32_t t_ptr = id(); put(types, Op_TypePointer, {t_ptr, SC_UniformConstant, stg_img_type[key]});
         uint32_t v = id();     put(types, Op_Variable,    {t_ptr, v, SC_UniformConstant});
         put(deco, Op_Decorate, {v, Dec_DescriptorSet, 0});
         put(deco, Op_Decorate, {v, Dec_Binding, binding});
         stg_img_var[binding] = v;
     }
-    // Build the integer coordinate operand for `dim` from up to 3 raw-bit VGPR coords (used as u32 texel
-    // indices). 1D = scalar u32; 2D = uvec2; 3D = uvec3.
-    uint32_t stg_coord(uint32_t dim, const uint32_t* c) {
-        if (dim == Dim_1D) return c[0];
+    uint32_t stg_img_id(uint32_t dim, bool arrayed) { return stg_img_type[dim | (arrayed ? 0x100u : 0u)]; }
+    // Build the integer coordinate operand from `n` raw-bit VGPR coords (u32 texel indices, incl. the
+    // array layer as the last component for arrayed images). n=1 -> scalar u32; 2 -> uvec2; 3 -> uvec3.
+    uint32_t stg_coord(uint32_t n, const uint32_t* c) {
+        if (n == 1) return c[0];
         // 2D reuses the shared uvec2 helper (also used by texelFetch) so a shader mixing a texture
-        // image_load and a 2D storage image doesn't emit a duplicate OpTypeVector %uint 2.
-        if (dim == Dim_2D) { uint32_t v = id(); put(code, Op_CompositeConstruct, {t_v2u(), v, c[0], c[1]}); return v; }
-        // 3D: reuse the compute shell's uvec3 (t_v3u, declared for gl_GlobalInvocationID) if present —
+        // image_load and a 2-coord storage image doesn't emit a duplicate OpTypeVector %uint 2.
+        if (n == 2) { uint32_t v = id(); put(code, Op_CompositeConstruct, {t_v2u(), v, c[0], c[1]}); return v; }
+        // uvec3: reuse the compute shell's uvec3 (t_v3u, declared for gl_GlobalInvocationID) if present —
         // a second OpTypeVector %uint 3 would be an illegal duplicate non-aggregate type.
         if (!t_v3u_c) {
             if (t_v3u) t_v3u_c = t_v3u;
@@ -288,10 +291,10 @@ struct SpirvCompute {
     // (robustImageAccess / VK_EXT_image_robustness: OOB image reads return 0), the image analogue of the
     // robustBufferAccess this recompiler already depends on for buffer loads. The runtime must enable it
     // (the test harness does). The store side is instead EXEC-predicated (no robust "harmless" OOB write).
-    void image_read(uint32_t binding, uint32_t dim, const uint32_t* coords, uint32_t out[4]) {
+    void image_read(uint32_t binding, uint32_t dim, bool arrayed, uint32_t ncoord, const uint32_t* coords, uint32_t out[4]) {
         if (!declared_read_wo_fmt) { put(caps, Op_Capability, {Cap_StorageImageReadWithoutFormat}); declared_read_wo_fmt = true; }
-        uint32_t img   = id(); put(code, Op_Load,      {stg_img_type[dim], img, stg_img_var[binding]});
-        uint32_t coord = stg_coord(dim, coords);
+        uint32_t img   = id(); put(code, Op_Load,      {stg_img_id(dim, arrayed), img, stg_img_var[binding]});
+        uint32_t coord = stg_coord(ncoord, coords);
         uint32_t res   = id(); put(code, Op_ImageRead, {t_v4u(), res, img, coord});
         for (uint32_t c = 0; c < 4; c++) { uint32_t e = id(); put(code, Op_CompositeExtract, {t_u32, e, res, c}); out[c] = e; }
     }
@@ -300,11 +303,11 @@ struct SpirvCompute {
     // EXEC bool) so inactive lanes do not write — a real conditional store, like cbuf_store. (Image OOB is
     // not covered by robustBufferAccess, so guarding matters: it also skips a lane's write when EXEC is off
     // e.g. a grid-tail bounds check.)
-    void image_write(uint32_t binding, uint32_t dim, const uint32_t* coords, const uint32_t vals[4],
-                     bool predicated = false, uint32_t pred = 0) {
+    void image_write(uint32_t binding, uint32_t dim, bool arrayed, uint32_t ncoord, const uint32_t* coords,
+                     const uint32_t vals[4], bool predicated = false, uint32_t pred = 0) {
         if (!declared_write_wo_fmt) { put(caps, Op_Capability, {Cap_StorageImageWriteWithoutFormat}); declared_write_wo_fmt = true; }
-        uint32_t img   = id(); put(code, Op_Load, {stg_img_type[dim], img, stg_img_var[binding]});
-        uint32_t coord = stg_coord(dim, coords);
+        uint32_t img   = id(); put(code, Op_Load, {stg_img_id(dim, arrayed), img, stg_img_var[binding]});
+        uint32_t coord = stg_coord(ncoord, coords);
         uint32_t texel = id(); put(code, Op_CompositeConstruct, {t_v4u(), texel, vals[0], vals[1], vals[2], vals[3]});
         if (!predicated) { put(code, Op_ImageWrite, {img, coord, texel}); return; }
         uint32_t then = id(), merge = id();
@@ -1200,14 +1203,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             if (res->cls == ResourceClass::StorageImage) {
                 const bool is_ld = (in.opcode == 0x00), is_st = (in.opcode == 0x08);
                 if (!is_ld && !is_st) { ok = false; return true; }
-                uint32_t dim, ncoord;
-                switch (in.mimg_dim) {   // SQ_RSRC dim -> SPIR-V Dim + coord count
-                    case 0: dim = Dim_1D; ncoord = 1; break;
-                    case 1: dim = Dim_2D; ncoord = 2; break;
-                    case 2: dim = Dim_3D; ncoord = 3; break;
-                    default: ok = false; return true;   // cube/array/msaa storage images deferred
+                uint32_t dim, ncoord; bool arrayed = false;
+                switch (in.mimg_dim) {   // SQ_RSRC dim -> SPIR-V Dim + coord count (+ array layer)
+                    case 0: dim = Dim_1D; ncoord = 1; break;                       // 1D
+                    case 1: dim = Dim_2D; ncoord = 2; break;                       // 2D
+                    case 2: dim = Dim_3D; ncoord = 3; break;                       // 3D
+                    case 4: dim = Dim_1D; ncoord = 2; arrayed = true; break;       // 1D_ARRAY (x, layer)
+                    case 5: dim = Dim_2D; ncoord = 3; arrayed = true; break;       // 2D_ARRAY (x, y, layer)
+                    default: ok = false; return true;   // cube / MSAA storage images deferred
                 }
-                b.declare_storage_image(res->binding, dim);
+                b.declare_storage_image(res->binding, dim, arrayed);
                 // Coordinate VGPR per axis. Non-NSA (len==2): consecutive from VADDR (src[0]). NSA (len>2):
                 // split across the extra address dwords — coord0 = VADDR, coord k>=1 = byte (k-1) of
                 // words[2..3] (dword2 = addr1..4, dword3 = addr5..8). Layout verified via llvm-mc gfx1010.
@@ -1221,7 +1226,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 uint32_t coords[3] = {0, 0, 0};
                 for (uint32_t k = 0; k < ncoord; k++) coords[k] = vread(coord_vgpr(k));
                 if (is_ld) {
-                    uint32_t out[4]; b.image_read(res->binding, dim, coords, out);
+                    uint32_t out[4]; b.image_read(res->binding, dim, arrayed, ncoord, coords, out);
                     int vd = in.dst.value, w = 0;   // dmask -> consecutive VDATA VGPRs (LSB=R first)
                     for (uint32_t c = 0; c < 4; c++) if (in.mimg_dmask & (1u << c)) {
                         uint32_t old = vreg_old(b, rs, vd + w); rs.vreg[vd + w] = out[c];
@@ -1234,7 +1239,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     uint32_t vals[4] = { b.uconst(0), b.uconst(0), b.uconst(0), b.uconst(0) };
                     int vd = in.dst.value, w = 0;
                     for (uint32_t c = 0; c < 4; c++) if (in.mimg_dmask & (1u << c)) { vals[c] = vread(vd + w); w++; }
-                    b.image_write(res->binding, dim, coords, vals, rs.exec_narrowed, rs.exec);
+                    b.image_write(res->binding, dim, arrayed, ncoord, coords, vals, rs.exec_narrowed, rs.exec);
                 }
                 return true;
             }
@@ -1348,11 +1353,11 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
         auto table_dependent = [](const Rdna2Inst& i) {
             switch (i.fmt) {
                 case Rdna2Format::MIMG: {
-                    const bool dim_ok = i.mimg_dim <= 2u;      // 1D/2D/3D only (not 1D/2D_ARRAY, CUBE, MSAA)
-                    // load/store go through the storage path, which handles NSA (split address dwords);
-                    // sample* go through the sampled-texture path, still non-NSA only (len==2).
-                    if (i.opcode == 0x00u || i.opcode == 0x08u) return dim_ok;
-                    if (i.opcode == 0x20u || i.opcode == 0x24u || i.opcode == 0x27u) return dim_ok && i.len_dwords == 2;
+                    // Storage load/store handle 1D/2D/3D + 1D/2D_ARRAY (dims 0,1,2,4,5) and NSA; sample*
+                    // go through the sampled-texture path: 2D non-arrayed, non-NSA only.
+                    const bool ldst_dim = i.mimg_dim <= 2u || i.mimg_dim == 4u || i.mimg_dim == 5u;
+                    if (i.opcode == 0x00u || i.opcode == 0x08u) return ldst_dim;
+                    if (i.opcode == 0x20u || i.opcode == 0x24u || i.opcode == 0x27u) return i.mimg_dim <= 2u && i.len_dwords == 2;
                     return false;
                 }
                 case Rdna2Format::MUBUF:  return i.opcode <= 0x07u;   // buffer_load/store_format_* (need the V#)
