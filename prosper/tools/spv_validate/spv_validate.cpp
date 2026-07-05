@@ -81,6 +81,21 @@ int main(int argc, char** argv) {
       vb.num_components=1; vb.binding=3; vb.stride=4; vb.sgpr_base=8; rt.resources.push_back(vb);
       dump(dir, "compute_pred_store", recompile_valu(c, sizeof(c)/4, 1, 0, &rt)); }
 
+    // Compute STORAGE images (image_load -> image_store, no sampler): 1D, NSA 3D (split-address coords),
+    // and 2D_ARRAY (layer coord). One shared rt: src U# in user-data s[0:7]->binding 4, dst s[8:15]->5.
+    { ShaderResourceTable rt;
+      ShaderResource s{}; s.cls = ResourceClass::StorageImage; s.binding = 4; s.sgpr_base = 0; rt.resources.push_back(s);
+      ShaderResource d{}; d.cls = ResourceClass::StorageImage; d.binding = 5; d.sgpr_base = 8; rt.resources.push_back(d);
+      const uint32_t c1d[]  = {0x7E080300u,0xF0000F00u,0x00000004u,0xBF8C3F70u,0xF0200F00u,0x00020004u,0xBF810000u};
+      dump(dir, "storage_copy_1d",    recompile_valu(c1d,  sizeof(c1d)/4,  1, 0, &rt));
+      const uint32_t cnsa[] = {0xF0000F12u,0x0000000Au,0x00000C0Bu,0xBF8C3F70u,0xF0200F12u,0x0002000Au,0x00000C0Bu,0xBF810000u};
+      dump(dir, "storage_nsa_3d",     recompile_valu(cnsa, sizeof(cnsa)/4, 1, 0, &rt));
+      const uint32_t carr[] = {0xF0000F28u,0x00000004u,0xBF8C3F70u,0xF0200F28u,0x00020004u,0xBF810000u};
+      dump(dir, "storage_arrayed_2d", recompile_valu(carr, sizeof(carr)/4, 1, 0, &rt)); }
+    // Compute mul_hi (high 32 bits via OpUMulExtended -> {lo,hi} struct extract).
+    { const uint32_t c[] = {0x7E0202FFu,0x80000000u,0xD56A0002u,0x00020301u,0x7E000D02u,0xBF810000u};
+      dump(dir, "compute_mul_hi", recompile_valu(c, sizeof(c)/4, 1, 0)); }
+
     if (fails) { printf("== FAIL: %d shader(s) failed recompile/validation ==\n", fails); return 1; }
     printf("== PASS%s ==\n", have_val ? " (all modules pass spirv-val)" : " (recompiled; spirv-val not found)");
     return 0;
