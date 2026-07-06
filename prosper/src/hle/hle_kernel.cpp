@@ -14,6 +14,7 @@
 #include <cstring>
 #include <vector>
 #include <unordered_map>
+#include <mutex>
 #ifdef __linux__
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -476,9 +477,20 @@ HLE(k_tls_get_addr) {   // __tls_get_addr(tls_index* ti): ti[0]=module id, ti[1]
     const uint64_t* ti = (const uint64_t*)(uintptr_t)a0;
     if (!ti) return 0;
     uint64_t modid = ti[0], off = ti[1];
-    thread_local std::unordered_map<uint64_t, void*> t_dtv;   // per-thread: module id -> block
-    auto it = t_dtv.find(modid);
-    if (it != t_dtv.end()) return (uint64_t)(uintptr_t)it->second + off;
+    // Per-thread DTV (module id -> TLS block). MUST NOT use a host `thread_local` here: guest threads run
+    // under the GUEST %fs, and host thread_local storage is %fs-relative, so it ALIASES guest memory —
+    // reads come back as garbage (an unordered_map whose bucket_count reads 0 → `hash % 0` → SIGFPE).
+    // This is the same host↔guest %fs-aliasing landmine as the GfxDevice boot wall. Key by the host tid
+    // (a syscall, %fs-independent) in a mutex-guarded global map instead. CONFIDENCE: HIGH (root-caused
+    // via gdb: SIGFPE in k_tls_get_addr with a corrupt thread_local map under a guest %fs).
+    static std::mutex s_dtv_mx;
+    static std::unordered_map<long, std::unordered_map<uint64_t, void*>> s_dtv;   // tid -> (modid -> block)
+    long tid = (long)syscall(SYS_gettid);
+    { std::lock_guard<std::mutex> lk(s_dtv_mx);
+      auto& dtv = s_dtv[tid];
+      auto it = dtv.find(modid);
+      if (it != dtv.end()) return (uint64_t)(uintptr_t)it->second + off;
+    }
     size_t memsz = 64, filesz = 0; uint64_t init_va = 0;
     if (modid < g_tls_mods.size()) {
         memsz  = g_tls_mods[modid].memsz ? g_tls_mods[modid].memsz : 64;
@@ -487,7 +499,7 @@ HLE(k_tls_get_addr) {   // __tls_get_addr(tls_index* ti): ti[0]=module id, ti[1]
     }
     void* blk = calloc(1, memsz);
     if (init_va && filesz) memcpy(blk, (const void*)(uintptr_t)init_va, filesz);
-    t_dtv[modid] = blk;
+    { std::lock_guard<std::mutex> lk(s_dtv_mx); s_dtv[tid][modid] = blk; }
     return (uint64_t)(uintptr_t)blk + off;
 }
 
