@@ -4,8 +4,13 @@
 (The earlier "34/41" was a coverage-tool undercount — it ran a per-instruction check that didn't credit
 `emit_body`'s loop/if reconstruction, so the MSAA-resolve loop shaders 031-034 were mis-flagged as blocked
 even though they recompile. Fixed 2026-07-06; true count is 38/41. **The only genuine remaining blocker is
-cross-lane `v_mbcnt`/`v_readlane` — the LDS wave-model — affecting the last 3 shaders**, one of which also
-uses `v_add_co_ci_u32`. See the wave-model design note below.) Every bring-up-critical class is covered (position/blit/clear,
+cross-lane `v_mbcnt`/`v_readlane` — the LDS wave-model — affecting the last 3 shaders.** All bounded ALU
+gaps are now closed: `v_add_co_ci_u32`/sub/subrev (VOP3B carry) landed (kernel 62); the 1 shader that used
+it now stops at `s_and_b64` (SOP2 0xf, a 64-bit wave-mask op) and, like the other 2, needs the wave-model
+underneath. So the LDS wave-model (`v_mbcnt`/`v_readlane` + 64-bit mask ops as workgroup/LDS cross-lane) is
+the single remaining recompiler feature for 41/41 on this title — a real architectural change (design note
+below), and one that gets no game frames on its own (those 3 are GPU-culling compute, off the first-frame
+path; frames are gated on the GPU-executor build). Every other bounded win has been harvested this session.) Every bring-up-critical class is covered (position/blit/clear,
 textured incl. 3D sampling + NSA, interpolated, image-copy 1D/2D/3D + arrayed + NSA + MSAA + MSAA_ARRAY,
 integer divide/modulo), plus the big structural features: counted-loop reconstruction (`OpLoopMerge`/
 `OpPhi`), divergent-if handling (EXEC-predicated linearization incl. provably-dead scalar writes),
