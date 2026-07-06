@@ -39,4 +39,24 @@ inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn&
     return render(vs, fs, ps);
 }
 
+// --- Live submit renderer registry (Stage A wiring; implemented in gpu_executor.cpp) --------------------
+// The live renderer additionally receives the target width/height (from videoout) so it can size its
+// attachments. Registered by whoever owns a persistent Vulkan device — the runtime binary at startup, or a
+// test — so prosper_core itself stays Vulkan-free (this just stores a std::function). Signature adds w,h to
+// RenderFn; the tests' render_triangle_rgba already takes (vs, fs, w, h, &ps).
+using LiveRenderFn = std::function<std::vector<uint8_t>(const std::vector<uint32_t>& vs,
+                                                        const std::vector<uint32_t>& fs,
+                                                        const ResolvedPipelineState& ps,
+                                                        uint32_t width, uint32_t height)>;
+
+// Register (or clear, with {}) the live render backend that agc_driver_submit_dcb uses on each submit.
+void set_submit_renderer(LiveRenderFn fn);
+bool have_submit_renderer();
+
+// Render a folded GpuState at (width,height) via the registered live renderer and hand the frame to the
+// present path (present_write_frame). Returns true iff a frame was produced and presented. A no-op
+// returning false when there is no renderer registered or the state has no draws — so it is inert on the
+// game path until the runtime wires a device, yet fully exercised by tests. Stage A of GPU_EXECUTOR_DESIGN.
+bool execute_and_present(const GpuState& st, uint32_t width, uint32_t height);
+
 } // namespace prosper::gpu

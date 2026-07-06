@@ -12,6 +12,8 @@
 #include "gpu/pm4_registers.hpp"
 #include "gpu/command_processor.hpp"
 #include "gpu/pm4_decode.hpp"
+#include "gpu/gpu_execute.hpp"
+#include "gpu/videoout_present.hpp"
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -524,6 +526,16 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     if (!p || !p->addr || !p->dw_num) return kAgcErrInvalidArg;
     size_t applied = gpu::run_command_buffer(p->addr, p->dw_num, agc_gpu_state());
     g_submit_count++;
+    // Stage A: if a live renderer has been registered (runtime binary wires a Vulkan device) and this
+    // submit accumulated draws, execute the folded GpuState and present the frame. Inert (returns false)
+    // on the pure-HLE path until a device is registered, so it never perturbs the existing boot behavior.
+    if (gpu::have_submit_renderer() && !agc_gpu_state().draws.empty()) {
+        uint32_t w = gpu::present_width(), h = gpu::present_height();
+        bool presented = gpu::execute_and_present(agc_gpu_state(), w, h);
+        if (presented && getenv("PROSPER_GFXLOG"))
+            fprintf(stderr, "[agc] SubmitDcb #%llu: executed %zu draws -> presented %ux%u frame\n",
+                    (unsigned long long)g_submit_count, agc_gpu_state().draws.size(), w, h);
+    }
     if (getenv("PROSPER_GFXLOG")) {
         fprintf(stderr, "[agc] SubmitDcb #%llu: %u dwords -> %zu packets applied (draws so far: %zu)\n",
                 (unsigned long long)g_submit_count, p->dw_num, applied, agc_gpu_state().draws.size());

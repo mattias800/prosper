@@ -71,6 +71,23 @@ int main() {
     GpuState empty; empty.draws.clear();
     CHECK(execute_gpustate(empty, backend).empty(), "a draw-less GpuState renders no frame (state-only submit)");
 
+    // The live-submit registry path — exactly what agc_driver_submit_dcb drives once a device is wired.
+    CHECK(!have_submit_renderer(), "no live renderer registered by default (game path stays inert)");
+    CHECK(!execute_and_present(st, W, H), "execute_and_present is a no-op with no renderer registered");
+    set_submit_renderer([&](const std::vector<uint32_t>& vs, const std::vector<uint32_t>& fs,
+                            const ResolvedPipelineState& ps, uint32_t w, uint32_t h) {
+        return prosper::test::render_triangle_rgba(vs, fs, w, h, &ps);
+    });
+    CHECK(have_submit_renderer(), "live renderer registered");
+    prosper::gpu::present_reset();
+    CHECK(execute_and_present(st, W, H), "execute_and_present rendered + presented the submit");
+    CHECK(prosper::gpu::present_has_frame(), "the presented submit frame reached the scanout path");
+    std::vector<uint8_t> submit_scan((size_t)W * H * 4, 0);
+    prosper::gpu::present_readback(submit_scan.data(), submit_scan.size());
+    CHECK(submit_scan == px, "live-submit path presents the same GREEN frame as the direct executor");
+    CHECK(!execute_and_present(empty, W, H), "execute_and_present skips a draw-less submit even with a renderer");
+    set_submit_renderer({});  // restore inert default
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
