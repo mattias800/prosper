@@ -435,40 +435,18 @@ namespace {
                 // PROSPER_HWBP_DIVCAP: log the typetree-vector transfer's elemSize/byteSize/count from the
                 // caller frame (rbp-relative), for the ~6 `call *0x88` array reads.
                 if (g_hwbp_divcap) {
-                    // At the DRIVER (0x1612c70) rbp is the driver's frame; the caller (0xd4ce00) frame is the
-                    // saved rbp = [rbp]. The transfer's elemSize/byteSize/count live at caller_rbp-0xf0/-0xe8/-0xf8.
+                    // Single compact write (minimal perturbation): the transfer count triplet from the caller
+                    // frame (crbp-0xf0/-0xe8/-0xf8) + the typetree NODE saved at crbp-0x1c0 (its fields
+                    // [n]/[n+8]=byteSize/[n+0x10]/[n+0x18]) — compare CubeBlur (#6) to the working #4/#5.
                     unsigned long long crbp = rd(rbp);
-                    unsigned long long elemSize = rd(crbp - 0xf0), byteSize = rd(crbp - 0xe8), cnt = rd(crbp - 0xf8);
-                    // rdi = the transfer/`this` object passed to the driver (mov %r13,%rdi at 0xd4cf3d).
-                    // Its mode byte [+0x190] gates the read path (movzbl 0x190(%rcx);cmp $1 at 0xd4ce0d).
-                    uint64_t r13v = (uint64_t)gr[REG_R13];
-                    uint64_t tobj = r13v;   // r13 is the `this`/transfer object (mov %r13,%rdi; call *0x88([r13]))
-                    auto rb = [](uint64_t a) -> unsigned { return probe_readable(a) ? *(const uint8_t*)a : 0x100u; };
-                    { char vb0[200]; uint64_t vt = rd(r13v);
-                      int vn0 = snprintf(vb0, sizeof vb0, "[hwbp-divcap]   #%d r13=0x%llx rdi=0x%llx [r13]=0x%llx [[r13]+0x88]=eboot+0x%llx\n",
-                        (int)g_hwbp_count, (unsigned long long)r13v, (unsigned long long)rdi, vt,
-                        (unsigned long long)(rd(vt+0x88) >= 0x400000000ull && rd(vt+0x88) < 0x420000000ull ? rd(vt+0x88)-0x400000000ull : rd(vt+0x88)));
-                      write(2, vb0, vn0); }
-                    char db[420];
+                    unsigned long long node = rd(crbp - 0x1c0);
+                    char db[300];
                     int dn = snprintf(db, sizeof db,
-                        "[hwbp-divcap] #%d tid=%ld transfer(rdi)=0x%llx mode[+0x190]=0x%x [+0x188]=0x%x [+0x180]=0x%llx [+0x170]=0x%llx | elemSize=0x%llx byteSize=0x%llx count=0x%llx | cur=0x%llx base=0x%llx end=0x%llx\n",
-                        (int)g_hwbp_count, cur_tid(), (unsigned long long)tobj,
-                        rb(tobj + 0x190), rb(tobj + 0x188), rd(tobj + 0x180), rd(tobj + 0x170),
-                        elemSize, byteSize, cnt,
-                        rd((uint64_t)gr[REG_RBX] + 0x38), rd((uint64_t)gr[REG_RBX] + 0x40), rd((uint64_t)gr[REG_RBX] + 0x48));
+                        "[hwbp-divcap] #%d elemSz=0x%llx byteSz=0x%llx cnt=0x%llx | node=0x%llx [n]=0x%llx [n+8]=0x%llx [n+0x10]=0x%llx [n+0x18]=0x%llx [n+0x20]=0x%llx | cur=0x%llx\n",
+                        (int)g_hwbp_count, rd(crbp - 0xf0), rd(crbp - 0xe8), rd(crbp - 0xf8),
+                        node, rd(node), rd(node + 8), rd(node + 0x10), rd(node + 0x18), rd(node + 0x20),
+                        rd((uint64_t)gr[REG_RBX] + 0x38));
                     write(2, db, dn);
-                    // Dump the transfer object [rdi-0x40 .. rdi+0x200] + its vtable, so #6 can be compared to #1-5.
-                    char vb[160];
-                    int vn = snprintf(vb, sizeof vb, "[hwbp-divcap]   #%d vtable[rdi]=eboot+0x%llx [rdi+8]=0x%llx [rdi+0x40]=0x%llx [rdi+0x48]=0x%llx\n",
-                        (int)g_hwbp_count,
-                        (unsigned long long)(rd(tobj) >= 0x400000000ull && rd(tobj) < 0x420000000ull ? rd(tobj) - 0x400000000ull : rd(tobj)),
-                        rd(tobj + 8), rd(tobj + 0x40), rd(tobj + 0x48));
-                    write(2, vb, vn);
-                    if (probe_readable(tobj) && probe_readable(tobj + 0x200)) {
-                        char fn[64]; snprintf(fn, sizeof fn, "/tmp/prosper_xfer_%d.bin", (int)g_hwbp_count);
-                        int fd = open(fn, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                        if (fd >= 0) { (void)!write(fd, (const void*)(tobj), 0x200); close(fd); }
-                    }
                 }
                 // PROSPER_HWBP_BUFDUMP: write the reader window [base..end] to a per-hit file.
                 if (g_hwbp_bufdump) {
