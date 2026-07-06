@@ -212,6 +212,26 @@ producer — identify which of {main 0x18a83b5, GfxDevice 0xb0672a, worker 0x938
 root and what game event (GPU submit-with-draws + EOP-QUEUE event? async-load-completion callback?) is
 supposed to post it within the budget.
 
+## 2026-07-06 — punch-through experiment: clearing consumer waits does NOT create work (dead end)
+Added a gated diagnostic (`PROSPER_PUNCH=<secs>`, off by default, `hle_kernel_mem.cpp`): an INFINITE
+sync_on_address wait from one of the three stuck sites that stays blocked past `secs` fabricates its awaited
+signal (bump `*addr`, wake) so the thread proceeds — purely to observe what's *downstream* of the deadlock.
+Findings:
+- The **GfxDevice (0xb0672a)** and **worker (0x9385d7)** waits are **infinite** (a2==0); the **main
+  PreloadManager (0x18a83b5)** wait is **finite/budgeted** (a2=&timeout) — so on real HW main gets its
+  signal within budget while the two workers wait indefinitely for work.
+- Punching GfxDevice+worker every 3 s: they wake 14× each, **do nothing useful, and re-block** — no crash,
+  **no SubmitDcb-with-draws, no advance** (still only the setup submit, 0 draws; suspendPoint loop
+  continues). Main is never reached (it's not an infinite wait, so unpunched).
+- **Conclusion: the deadlock is producer-side, not a lost signal.** Waking the consumers creates nothing
+  because there is no real work item to process — the producer that would ENQUEUE work + post the
+  semaphores is itself gated on GPU/asset-integration completion we don't provide. No consumer-side shortcut
+  exists. (Consistent with the earlier HW-watchpoint finding that the PreloadManager count is only ever
+  decremented.) **The GPU-execution + completion build is the required path** — execute the submitted Dcb on
+  a real device and post the completion the producer waits on, so it enqueues real work → main proceeds →
+  draws. The recompiler (34 shaders) and the offscreen GpuState→frame spine are ready to receive those draws.
+The punch tool stays (gated off, `CONFIDENCE: LOW`, fabricates a fake for observation only).
+
 So the game plants an EOP fence: RELEASE_MEM writes a completion value to label `A` when the GPU pipe
 drains; WAIT_REG_MEM (and, cross-thread, the PreloadManager/FTM producers) block until `[A]` satisfies the
 compare. **We never write `A`** — our AGC Dcb builders (`agc_cb_release_mem`, `agc_dcb_wait_reg_mem`,

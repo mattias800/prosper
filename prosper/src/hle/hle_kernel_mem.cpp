@@ -16,6 +16,9 @@
 #include <ctime>
 #include <cstdint>
 #include <cstdio>
+#include <unordered_map>
+#include <mutex>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <atomic>
@@ -237,6 +240,25 @@ HLE(k_wait_on_address) {
         if (us > 5000000u) us = 5000000u;    // cap 5s so a huge/garbage value can't hang the thread
         ts.tv_sec = us / 1000000u; ts.tv_nsec = (long)(us % 1000000u) * 1000L; pts = &ts;
     }
+    // --- DIAGNOSTIC punch-through (PROSPER_PUNCH=<secs>) -----------------------------------------
+    // The render loop deadlocks: 3 threads block on sync_on_address semaphores whose producer never
+    // runs (it's gated on GPU completion we don't yet provide). To learn what's DOWNSTREAM of the
+    // deadlock — does clearing it lead to draws/rendering, or another wall? — this makes an INFINITE
+    // wait (a2==0) that stays blocked past `secs` fabricate a signal: bump *addr and return success, as
+    // if the resource were produced. This is a deliberate FAKE for observation only (gated, off by
+    // default). CONFIDENCE: LOW — the punched thread proceeds on a phantom resource; a resulting crash
+    // location is itself the diagnostic (it names what the producer was supposed to set up).
+    static const long punch_secs = getenv("PROSPER_PUNCH") ? atol(getenv("PROSPER_PUNCH")) : 0;
+    static std::atomic<int> punch_budget{64};   // cap total fabricated signals so it can't run away
+    // Only punch the specific deadlocked wait sites (return addresses in eboot, from the gdb thread map),
+    // NOT the job pool (0xae1af9 / 0x18ab088) — those need real jobs and crash on a phantom. Whitelist:
+    // main PreloadManager 0x18a83b5, GfxDevice work-queue 0xb0672a, worker 0x9385d7.
+    uint64_t gra = ((uint64_t*)__builtin_frame_address(0))[1];   // guest return address (stub tail-jumped)
+    uint64_t goff = gra - 0x400000000ull;
+    bool punch_site = (goff == 0x18a83b5 || goff == 0xb0672a || goff == 0x9385d7);
+    if (punch_secs > 0 && a2 == 0 && !pts && punch_site) {
+        ts.tv_sec = punch_secs; ts.tv_nsec = 0; pts = &ts;   // bound this otherwise-infinite wait
+    }
     if (synclog()) fprintf(stderr, "[sync] T%ld WAIT.enter  addr=0x%llx *addr=0x%x exp=0x%llx timo_us=%lld a2=0x%llx a3=0x%llx\n",
                            (long)syscall(SYS_gettid), (unsigned long long)a0, *(uint32_t*)a0,
                            (unsigned long long)a1, pts ? (long long)(ts.tv_sec*1000000 + ts.tv_nsec/1000) : -1,
@@ -251,7 +273,19 @@ HLE(k_wait_on_address) {
     // timeout error so the guest's bounded wait re-loops / handles it instead of proceeding on garbage.
     // CONFIDENCE: HIGH on the semantics (must distinguish timeout from wake).
     // CONFIDENCE: MED on the exact code value 0x80020060 (SCE_KERNEL_ERROR_ETIMEDOUT).
-    if (r < 0 && e == ETIMEDOUT) return 0x80020060ull;   // SCE_KERNEL_ERROR_ETIMEDOUT
+    if (r < 0 && e == ETIMEDOUT) {
+        if (punch_secs > 0 && punch_site && punch_budget.load() > 0 && *(volatile uint32_t*)(uintptr_t)a0 == (uint32_t)a1) {
+            // Fabricate the awaited signal: bump the count so the guest's loop acquires and proceeds.
+            punch_budget.fetch_sub(1);
+            *(volatile uint32_t*)(uintptr_t)a0 = (uint32_t)a1 + 1;
+            syscall(SYS_futex, (uint32_t*)a0, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, INT_MAX, nullptr, nullptr, 0);
+            fprintf(stderr, "[punch] T%ld addr=0x%llx exp=0x%llx -> fabricated signal (ra=eboot+0x%llx, budget=%d)\n",
+                    (long)syscall(SYS_gettid), (unsigned long long)a0, (unsigned long long)a1,
+                    (unsigned long long)(gra - 0x400000000ull), punch_budget.load());
+            return 0;
+        }
+        return 0x80020060ull;   // SCE_KERNEL_ERROR_ETIMEDOUT
+    }
     return 0;   // woken, or EAGAIN (value already changed) — treat as success; guest re-checks the count
 }
 HLE(k_wake_by_address) {
