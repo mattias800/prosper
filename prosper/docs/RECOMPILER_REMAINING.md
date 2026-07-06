@@ -25,6 +25,20 @@ faked (correctness-first). None is on the first-frame path. 030 additionally use
 **The recompiler is DONE for this title.** Reaching the game's actual pixels is now gated on the GPU-
 execution / render-loop frontier (see `RENDER_LOOP.md`), not the recompiler.
 
+## How to eventually add the cross-lane wave ops (design note, 2026-07-06)
+The remaining shaders (030/037/038) need `v_mbcnt_lo/hi` (this lane's index among active lanes) and
+`v_readlane` (read another lane's value). The obvious lowering — SPIR-V subgroup ops
+(`OpGroupNonUniformBallot` + `…BallotBitCount`, `OpGroupNonUniformShuffle`) — **will not work faithfully on
+our test path:** llvmpipe reports `subgroupSize = 8` with `minSubgroupSize == maxSubgroupSize == 8` (Mesa
+25.2 / LLVM 20), and RDNA2 waves are 32 or 64 lanes. A 32/64-lane wave can't be one 8-lane subgroup, so
+`mbcnt`/`readlane` computed over a subgroup would use the wrong lane grouping → wrong results, and there's
+no way to force a 32-wide subgroup on llvmpipe. **The faithful model is a workgroup-as-wave with LDS:**
+dispatch one workgroup per wave (local_size = wave size), keep the per-lane active mask + values in
+shared memory, and compute `v_mbcnt` as an LDS prefix-count over the active mask and `v_readlane` as an LDS
+read + barrier. That works on any Vulkan (no subgroup-size dependency) and is execution-differential-testable
+on llvmpipe. It is a real architectural change to the recompiler's per-invocation model (add an LDS/wave
+layer), not a bounded add — the right investment for cross-title generality, best done deliberately.
+
 The remaining shaders each need **one or more genuinely deep features** — verified below by disassembly.
 **None is completable by a single bounded opcode/feature add**, and **none is needed for the first frame**
 (the critical path to on-screen graphics is the GfxDevice boot wall; see `GFXDEVICE_BRINGUP_PROBLEM.md`).
