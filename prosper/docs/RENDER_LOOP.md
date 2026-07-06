@@ -623,3 +623,26 @@ typetree / read for `MatrixParameter` (and `VectorParameter`, same {…, SInt8 m
 layout) uses a 12-byte stride instead of 16 -- i.e. its byteSize/children omit the SInt8 tail (+align4).
 **NEXT:** find why the generated typetree gives MatrixParameter byteSize=12 (dropped SInt8 children or a
 missing kAlignBytesFlag / SInt8-node), which is the fixable root.
+
+### Crash backtrace + read-path (from the SIGSEGV dump, deterministic)
+```
+eboot+0x7e4115   alignedString length read (crash: reads garbage len -> ~16 EiB)
+eboot+0x7fcafb   {count}{alignedString[]} array reader (0x7fc9f0)
+eboot+0x1612c92  the array driver 0x1612c70 (reads u32 count from cursor, reserves it)
+eboot+0xd4cf72   generic vector reader 0xd4ce00 (count = byteSize/elemSize; call *0x88 per elem)
+eboot+0xd3d34b   struct reader (reads SerializedProgramParameters / ConstantBuffer; calls the vector reader)
+eboot+0xd3db38 / 0xd3d8b1   outer struct readers
+eboot+0xb500a6 / 0xb4fcfd / 0xaf3e43 / 0xae47e1 / 0xae4836   shader/subprogram load
+eboot+0x147b483 / 0x1485851   asset load entry
+```
+- `eboot+0x15fe650` = MatrixParameter's `GenerateTypeTree` transfer (registers m_NameIndex/m_Index/m_ArraySize
+  =4B, m_Type/m_RowCount=1B, + align via 0xd572e0). **It is NEVER called at runtime (0 hits)** — it's the
+  editor-only GenerateTypeTree instantiation. So the release read is NOT via this; it's the generic
+  node/vtable-driven read above (`0xd4ce00` computes `count = byteSize / elemSize` and dispatches the element
+  read via `*0x88`; element size via `*0x38`).
+- **So the fixable cause is: the element size / node byteSize used for the `MatrixParameter` (and
+  `VectorParameter`) array is 12, not 16** — the generic reader strides 12 bytes/element and the next
+  vector-count read lands 4 bytes early on `{m_Type,m_RowCount,pad}`=0x400. NEXT: capture the elemSize
+  (`*0x38` result) for the `m_MatrixParams` vector read, and/or find where MatrixParameter's serialized size
+  is computed as 12 (a compiled size fn or a typetree node byteSize). Undocumented Unity runtime typetree
+  layout — needs disassembly of the `*0x38`/`*0x88` element-size/read methods for the param types.
