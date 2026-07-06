@@ -525,10 +525,22 @@ Unity's GENERIC typetree-driven `Transfer` machinery (vtable dispatch, not shade
 So counts + cursor come from TYPETREE METADATA (`[r8+8]`/`[r8+0x10]`/the element-size vtable), not a
 hardcoded layout. A typetree whose node offsets/sizes are 2021.2-shaped over 2022.3 data yields wrong
 offsets → the cursor lands on numeric `ConstantBuffer` bytes → read as strings. Confirms Fable's wrong-model
-at the instruction level. **NEXT (leads, ranked):** (1) the fault is on a WORKER thread under guest-`%fs` —
-Unity's serialize transfer often uses TLS; verify the worker's guest-fs TLS isn't handing the deserializer a
-corrupted transfer/typetree context (capture `r8`, `[r8+8]`, `[r8+0x10]`, elemSize at `0xd4cec0`/`0xd4cef7`
-for the crash invocation). (2) determine whether the SerializedFile TypeTree is embedded (our file read may
-truncate/misread it) or stripped (runtime uses compiled-in 2022.3 layout — then the desync is a version field
-we feed wrong). (3) cross-check with a reference parse (AssetRipper rips 2022.3 built-ins fine per Fable),
-proving the shipped data is well-formed and the desync is env-induced.
+at the instruction level.
+
+**Node-ring probe (`PROSPER_HWBP_NODE=1`, bp at `0xd4cec0`, dump on worker fault):** typetree nodes are
+SANE — `r8` walks a contiguous 24-byte node array (`…3f98`+0x18…), `[r8+8]` byteOffsets grow monotonically
+(`0x54a88`→`0x55648`), `[r8+0x10]` byteSizes are sane (0x44–0x90). ⇒ evidence AGAINST worker guest-`%fs`
+TLS corrupting the typetree context. CAVEAT: `0xd4cec0` is a very hot generic function; single-stepping it
+perturbs the boot into an early UNRELATED fault (~40 hits, `mov esi,[rcx+8]`, non-null addr) before reaching
+the deser crash — so this probe can't reach the crash node. The `0x7e40d9` anom-ring CAN reach the crash
+(fewer hits). **No-guest-`%fs` control:** without guest-`%fs` the boot faults earlier INSIDE host libc
+(`rip∈libc.so.6`, `addr=nil`) — the initial-exec TLS landmine — so the deser crash is only reachable WITH
+guest-`%fs`; TLS can't be isolated by toggling it.
+
+**Deduction:** the desync is SPECIFIC to CubeBlur's stereo variants (Fable), not systematic — a TLS/file-I/O
+bug would break the thousands of shaders that parse fine. **NEXT (leads, ranked):** (1) reference-parse this
+game's `Hidden/CubeBlur` with UnityPy/AssetRipper — if it parses clean, the shipped data is well-formed
+2022.3 and the runtime desync is env-induced (dispatch/timing); if it also chokes, the file is unusual.
+(2) gate the node capture to the crash buffer only (arm `0xd4cec0` after the 5th `0x1612c70` driver hit) to
+read the crash node's offset/size + the element-size vtable result without perturbing the whole boot.
+(3) understand why `-force-gfx-direct` routes this deser onto a worker and whether the worker path differs.
