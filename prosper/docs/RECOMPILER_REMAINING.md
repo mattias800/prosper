@@ -65,6 +65,25 @@ read + barrier. That works on any Vulkan (no subgroup-size dependency) and is ex
 on llvmpipe. It is a real architectural change to the recompiler's per-invocation model (add an LDS/wave
 layer), not a bounded add — the right investment for cross-title generality, best done deliberately.
 
+**Concrete implementation plan (scoped 2026-07-06 — the compute shell ALREADY has what's needed):**
+`begin()` sets `EM_LocalSize 64` and `barrier()` emits `OpControlBarrier(Workgroup)`, so a workgroup IS a
+64-lane wave and inactive lanes still EXECUTE (exec is a predication bool), so they still reach barriers.
+Steps: (1) in the compute shell declare `gl_LocalInvocationID` (BuiltIn 27, Input uvec3) → load `.x` =
+`localid`, and an LDS array `uint active[64]` (StorageClass Workgroup=4). (2) `v_mbcnt_lo_u32_b32 dst,
+src0, src1`: only when `src0` is EXEC (126/127) — else reject (we lack the general 32-bit mask value);
+emit `active[localid] = (exec ? 1 : 0)`, `barrier()`, then an UNROLLED prefix-count `sum = Σ_{i=0..31}
+(i<localid ? active[i] : 0)` (32 iters: `ucmp ULessThan(i,localid)` → `sel` → `iadd`), `dst = src1 + sum`,
+trailing `barrier()` so the next op can't overwrite LDS mid-read. `v_mbcnt_hi` is identical over i=32..63.
+Combined lo→hi (hi's acc = lo's dst) = full 64-lane compaction index = count of active lanes below `localid`
+— exactly what culling/compaction wants (correct for PARTIAL/divergent exec, unlike a `localid`
+approximation). (3) HAZARD: barriers must be wave-uniform — valid only when the mbcnt is NOT inside a
+divergent structured-if/loop. For the current compaction shaders it's top-level (uniform), but a general
+guard should reject mbcnt emitted inside `emit_body`'s if/loop paths. (4) TEST: a compute kernel that
+`v_cmpx`-narrows exec by a per-lane predicate, then mbcnt, storing the compaction index — expected computed
+per-64-lane-workgroup on the CPU (count of predicate-true lanes below each localid). `v_readlane` similarly
+via an LDS `value[64]` write+barrier+read of `value[srclane]`. This is ~100 lines of careful SPIR-V + a
+non-trivial divergent test — a focused/reviewed effort, not a tail-of-session rush.
+
 The remaining shaders each need **one or more genuinely deep features** — verified below by disassembly.
 **None is completable by a single bounded opcode/feature add**, and **none is needed for the first frame**
 (the critical path to on-screen graphics is the GfxDevice boot wall; see `GFXDEVICE_BRINGUP_PROBLEM.md`).
