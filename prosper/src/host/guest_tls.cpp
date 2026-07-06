@@ -78,6 +78,14 @@ uint64_t guest_tls_activate_thread() {
     *(uint64_t*)(tp + 0)          = tp;         // TCB self-pointer
     *(uint64_t*)(tp + HOSTFS_OFF) = host_fs;    // stash for the stub swap-back
     *(uint32_t*)(tp + MAGIC_OFF)  = TCB_MAGIC;  // marks this as OUR guest TCB (stubs swap only if present)
+    // Replicate the HOST glibc stack-guard (%fs:0x28) + pointer-guard (%fs:0x30) into the guest TCB. HOST
+    // code compiled with -fstack-protector can transiently run under the guest %fs (our SIGSEGV/SIGTRAP
+    // signal handlers fire while the guest %fs is live); its prologue/epilogue canary reads come from
+    // [fs+0x28], so without this the epilogue would read a zeroed guest slot, mismatch, and abort via
+    // __stack_chk_fail (observed: single-stepping under guest-fs "stack smashing detected"). Copying the
+    // host canary makes those reads correct and re-enables HWBP/single-step-based tracing under guest-fs.
+    *(uint64_t*)(tp + 0x28) = *(volatile uint64_t*)(host_fs + 0x28);   // stack canary
+    *(uint64_t*)(tp + 0x30) = *(volatile uint64_t*)(host_fs + 0x30);   // pointer guard
     wr_fsbase(tp);
     return tp;
 }
