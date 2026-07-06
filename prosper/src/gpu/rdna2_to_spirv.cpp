@@ -1081,6 +1081,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
         }
         case Rdna2Format::VOP1: {
             uint32_t a = val(in.src[0]); uint32_t old_d = vreg_old(b, rs, in.dst.value);
+            // SDWA float source modifiers on src0 (abs then neg) — only set on float ops by the assembler.
+            if (in.src_abs[0]) a = b.fext1(Glsl_FAbs, a);
+            if (in.src_neg[0]) a = b.fbin(Op_FSub, b.uconst(0), a);
             if (in.opcode == 0x02) {   // v_readfirstlane_b32: SGPR dst = value of the lowest active lane
                 // Cross-lane broadcast. Our per-lane scalar model has no cross-lane reduction, so we use
                 // THIS lane's value. SPECULATIVE(confidence: med): exact only when src0 is wave-uniform —
@@ -1114,6 +1117,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
         }
         case Rdna2Format::VOP2: {
             uint32_t a = val(in.src[0]), c = val(in.src[1]); uint32_t old_d = vreg_old(b, rs, in.dst.value);
+            // SDWA float source modifiers (only ever set on float ops by the assembler): abs then neg.
+            if (in.src_abs[0]) a = b.fext1(Glsl_FAbs, a);
+            if (in.src_neg[0]) a = b.fbin(Op_FSub, b.uconst(0), a);
+            if (in.src_abs[1]) c = b.fext1(Glsl_FAbs, c);
+            if (in.src_neg[1]) c = b.fbin(Op_FSub, b.uconst(0), c);
             uint32_t& d = vreg[in.dst.value];
             switch (in.opcode) {
                 case 0x01: d = b.sel(vcc, c, a); break;               // v_cndmask_b32: dst = vcc ? src1 : src0

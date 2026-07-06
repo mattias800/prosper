@@ -53,11 +53,12 @@ void decode_operands(Rdna2Inst& i) {
                 const uint32_t sd = i.words[1];
                 i.src[0] = ((sd >> 23) & 1u) ? decode_src_field(sd & 0xFFu) : vgpr(sd & 0xFFu);  // S0 -> scalar
                 i.n_src = 1;
-                // "Trivial" SDWA carries no sub-dword effect (all sels = DWORD(6), no clamp/omod/src0 mods),
-                // so it equals the base VOP1 (with SGPR-capable operands). Un-flag it so the recompiler
-                // handles it normally; any real sub-dword select keeps has_modifier and is rejected.
+                // "Trivial-or-modifier-only" SDWA: DWORD(6) sels, no clamp/omod, no sext/reserved — but
+                // src0 neg@20/abs@21 are read + applied by the recompiler (like VOP3). Any real sub-dword
+                // select or sext keeps has_modifier and is rejected.
+                i.src_neg[0] = ((sd >> 20) & 1u) != 0; i.src_abs[0] = ((sd >> 21) & 1u) != 0;
                 if (((sd >> 8) & 7u) == 6u && ((sd >> 16) & 7u) == 6u &&
-                    !((sd >> 13) & 1u) && !((sd >> 14) & 3u) && !((sd >> 19) & 0xFu)) i.has_modifier = false;
+                    !((sd >> 13) & 1u) && !((sd >> 14) & 3u) && !((sd >> 19) & 0x9u)) i.has_modifier = false;
             } else { i.src[0] = decode_src_field(w & 0x1FFu); i.n_src = 1; }
             break;
         case Rdna2Format::VOP2:
@@ -67,9 +68,14 @@ void decode_operands(Rdna2Inst& i) {
                 i.src[0] = ((sd >> 23) & 1u) ? decode_src_field(sd & 0xFFu)     : vgpr(sd & 0xFFu);       // S0
                 i.src[1] = ((sd >> 31) & 1u) ? decode_src_field((w >> 9) & 0xFFu) : vgpr((w >> 9) & 0xFFu); // S1
                 i.n_src = 2;
-                // Trivial (no sub-dword effect): dst/src0/src1 sels all DWORD(6), no clamp/omod/src mods.
+                // SDWA source float modifiers: src0 neg@20/abs@21, src1 neg@28/abs@29 — the recompiler
+                // applies these (like VOP3). Read them, then treat the packet as handleable ("trivial")
+                // when the only sub-dword controls present are neg/abs: DWORD(6) sels, no clamp/omod, and
+                // no SEXT(bit19/27) or reserved(bit22/30) — i.e. mask out neg/abs (0x6) from the nibble check.
+                i.src_neg[0] = ((sd >> 20) & 1u) != 0; i.src_abs[0] = ((sd >> 21) & 1u) != 0;
+                i.src_neg[1] = ((sd >> 28) & 1u) != 0; i.src_abs[1] = ((sd >> 29) & 1u) != 0;
                 if (((sd >> 8) & 7u) == 6u && ((sd >> 16) & 7u) == 6u && ((sd >> 24) & 7u) == 6u &&
-                    !((sd >> 13) & 1u) && !((sd >> 14) & 3u) && !((sd >> 19) & 0xFu) && !((sd >> 27) & 0xFu))
+                    !((sd >> 13) & 1u) && !((sd >> 14) & 3u) && !((sd >> 19) & 0x9u) && !((sd >> 27) & 0x9u))
                     i.has_modifier = false;
             } else { i.src[0] = decode_src_field(w & 0x1FFu); i.src[1] = vgpr(w >> 9); i.n_src = 2; }
             break;

@@ -1043,6 +1043,29 @@ int main() {
     printf("  kernel58 mismatches=%u (out[90]=%g expect=%g)\n", bad58, got58.size()==N?got58[90]:-1, exp58[90]);
     CHECK(got58.size()==N && bad58==0, "recompiled kernel 58 (VOP3 v_max_f32) correct");
 
+    // Kernels 59-60: SDWA source modifiers (were rejected via has_modifier). Shader-030 pattern
+    // v_mul_f32_sdwa v14,-s13,v3. 59: v_mul_f32_sdwa v3,-v0,v1 = -a0*a1 (src0 neg, DWORD sels).
+    const uint32_t code59[] = { 0x100602F9u, 0x06161600u, 0xBF810000u };
+    std::vector<uint32_t> spv59 = recompile_valu(code59, 3, 2, 3);
+    CHECK(!spv59.empty(), "recompiled kernel 59 (v_mul_f32_sdwa -src0) -> SPIR-V");
+    std::vector<float> in59(N*2), exp59(N);
+    for (uint32_t i=0;i<N;i++){ float a0=(float)i*0.1f-4.0f,a1=(float)i*0.03f+1.0f; in59[i*2]=a0; in59[i*2+1]=a1; exp59[i]=-a0*a1; }
+    std::vector<float> got59 = prosper::test::run_compute(spv59, in59, N, N);
+    uint32_t bad59=0; for(uint32_t i=0;i<N&&got59.size()==N;i++) if(std::fabs(got59[i]-exp59[i])>1e-3f) bad59++;
+    printf("  kernel59 mismatches=%u (out[30]=%g expect=%g)\n", bad59, got59.size()==N?got59[30]:-1, exp59[30]);
+    CHECK(got59.size()==N && bad59==0, "recompiled kernel 59 (SDWA -src0: -a0*a1) correct");
+
+    // 60: v_mul_f32_sdwa v3, |v0|, v1 = |a0|*a1 (src0 abs).
+    const uint32_t code60[] = { 0x100602F9u, 0x06261600u, 0xBF810000u };
+    std::vector<uint32_t> spv60 = recompile_valu(code60, 3, 2, 3);
+    CHECK(!spv60.empty(), "recompiled kernel 60 (v_mul_f32_sdwa |src0|) -> SPIR-V");
+    std::vector<float> in60(N*2), exp60(N);
+    for (uint32_t i=0;i<N;i++){ float a0=(float)i*0.1f-4.0f,a1=2.0f; in60[i*2]=a0; in60[i*2+1]=a1; exp60[i]=std::fabs(a0)*a1; }
+    std::vector<float> got60 = prosper::test::run_compute(spv60, in60, N, N);
+    uint32_t bad60=0; for(uint32_t i=0;i<N&&got60.size()==N;i++) if(std::fabs(got60[i]-exp60[i])>1e-3f) bad60++;
+    printf("  kernel60 mismatches=%u (out[10]=%g expect=%g)\n", bad60, got60.size()==N?got60[10]:-1, exp60[10]);
+    CHECK(got60.size()==N && bad60==0, "recompiled kernel 60 (SDWA |src0|: |a0|*a1) correct");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
