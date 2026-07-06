@@ -669,3 +669,27 @@ Kyty's init-ordering divergence note and Fable's "corrupted RTTI/static-init gen
 fields / byteSize 12 (init-array ordering: we run PRX init reverse vs Kyty forward; confirm we don't
 double-run or skip `_init`); or (b) gated capture of `0xd4ce00`'s `*0x38` elemSize for the m_MatrixParams read
 (arm after the 5th driver hit to avoid init perturbation) to nail the 12.
+
+### Instrumentation limit reached — the release reader path resists ad-hoc breakpoints
+Confirmed (all bps verified ARMED, all reach the real crash eboot+0x46beb4):
+- The div `0xd4cef7` (count = byteSize/elemSize in 0xd4ce00) is hit ONLY with `elemSize`=0x100000/0x10000
+  (the alignedString-array path); gating to small element sizes (4..0x1000, i.e. real structs) yields ZERO
+  hits. So `MatrixParameter`/`VectorParameter` arrays are NOT read via that div — they use a different branch
+  of the multi-branch reader `0xd4ce00` (gated on the mode byte `[rcx+0x190]` at `0xd4ce0d`).
+- Single-stepping `0xd4cef7` SURVIVES to the crash (so the string path is steppable), but `0xd4cec0`
+  (earlier in the same fn) perturbs the boot into an early unrelated fault.
+- None of the three `MatrixParameter`-named functions (editor gen 0x15fe650, SafeBinaryRead read 0x160d630,
+  vector reader 0x1609850) are called (verified armed + 0 hits). So the struct read is a name-less generic
+  branch consulting a reflection/typetree whose `MatrixParameter` byteSize is 12 (3 ints), dropping the
+  trailing 2 `SInt8` + align.
+
+**VERIFIED MECHANISM (solid):** cursor drifts ~4 bytes because the param struct is consumed 12B not 16B;
+the next alignedString-array read (driver `0x1612c70`) lands on the `MatrixParameter` `{m_Type=0,m_RowCount=4,pad}`
+= `0x00000400`, reads it as count 1024, reserves+reads 1024 "strings" from numeric data → ~16 EiB alloc → crash.
+Verified against the UnityPy reference (ref offset 5064 = m_Type/m_RowCount SInt8).
+
+**DEFINITIVE NEXT STEP:** a bounded instruction/cursor trace of the DRIFT WINDOW — chained single-step armed
+only between driver hit #5 (cursor base+0x4840) and hit #6 (base+0x7a20), logging each cursor advance — to
+see exactly which field read consumes 12 instead of 16 (element-size branch, a version/mode gate, or a
+mishandled SInt8+align). This needs a chained-bp (arm the step window on the 5th `0x1612c70` hit). Ad-hoc
+single-breakpoints have been exhausted; the release generic reader is multi-branch and undocumented.

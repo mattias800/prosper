@@ -131,7 +131,7 @@ namespace {
     uint64_t g_hwbp_anom = 0; bool g_hwbp_anom_on = false;
     static const int HWBP_RING = 256;
     struct HwbpRingEnt { unsigned long long rip_off, cur, rax; unsigned val;
-                         unsigned long long r8, f8, f10, r14; };
+                         unsigned long long r8, f8, f10, r14, rcx; };
     HwbpRingEnt g_hwbp_ring[HWBP_RING];
     volatile int g_hwbp_ring_pos = 0;
     volatile bool g_hwbp_ring_dumped = false;
@@ -213,8 +213,9 @@ namespace {
             long long dcur = prev_cur ? (long long)(e.cur - prev_cur) : 0;
             char lb[220];
             int ln = snprintf(lb, sizeof lb,
-                "  [%3d] rip=eboot+0x%llx cur=0x%llx(+%lld) [cur]=0x%08x rax=0x%llx | r8=0x%llx [r8+8]=0x%llx [r8+0x10]=0x%llx r14=0x%llx\n",
-                i, e.rip_off, e.cur, dcur, e.val, e.rax, e.r8, e.f8, e.f10, e.r14);
+                "  [%3d] rip=eboot+0x%llx rax(byteSize)=0x%llx rcx(elemSize)=0x%llx count=%llu | r8=0x%llx [r8+8]=0x%llx [r8+0x10]=0x%llx r14=0x%llx\n",
+                i, e.rip_off, e.rax, e.rcx, (unsigned long long)(e.rcx ? e.rax / e.rcx : 0), e.r8, e.f8, e.f10, e.r14);
+            (void)dcur;
             write(2, lb, ln);
             prev_cur = e.cur;
         }
@@ -362,19 +363,21 @@ namespace {
                 unsigned long long cur = probe_readable(rbxr + 0x38) ? *(const uint64_t*)(rbxr + 0x38) : 0;
                 int p = g_hwbp_ring_pos % HWBP_RING;
                 g_hwbp_ring[p] = { (unsigned long long)((uint64_t)gr[REG_RIP] - 0x400000000ull),
-                                   cur, (unsigned long long)rax, val, 0, 0, 0, (unsigned long long)r14 };
+                                   cur, (unsigned long long)rax, val, 0, 0, 0, (unsigned long long)r14, 0 };
                 g_hwbp_ring_pos = g_hwbp_ring_pos + 1;
                 if ((uint64_t)val >= g_hwbp_anom) hwbp_dump_ring("anom");
             }
             // PROSPER_HWBP_NODE: capture typetree-node metadata {r8,[r8+8],[r8+0x10],r14} at eboot+0xd4cec0;
             // the ring is dumped on the worker fault, so its last entry is the crash node.
-            if (g_hwbp_node_on && !g_hwbp_ring_dumped) {
+            if (g_hwbp_node_on && !g_hwbp_ring_dumped && (uint64_t)gr[REG_RCX] >= 4 && (uint64_t)gr[REG_RCX] < 0x1000) {
                 uint64_t r8 = (uint64_t)gr[REG_R8];
                 unsigned long long f8  = probe_readable(r8 + 8)   ? *(const uint64_t*)(r8 + 8)   : 0xBADBADull;
                 unsigned long long f10 = probe_readable(r8 + 0x10)? *(const uint64_t*)(r8 + 0x10): 0xBADBADull;
                 int p = g_hwbp_ring_pos % HWBP_RING;
+                // At the div site 0xd4cef7: rax=byteSize(dividend), rcx=elemSize(divisor) -> count.
                 g_hwbp_ring[p] = { (unsigned long long)((uint64_t)gr[REG_RIP] - 0x400000000ull),
-                                   0, 0, 0, (unsigned long long)r8, f8, f10, (unsigned long long)r14 };
+                                   0, (unsigned long long)rax, 0, (unsigned long long)r8, f8, f10,
+                                   (unsigned long long)r14, (unsigned long long)gr[REG_RCX] };
                 g_hwbp_ring_pos = g_hwbp_ring_pos + 1;
             }
             if (g_hwbp_strdump && cond_ok) {
@@ -440,6 +443,17 @@ namespace {
                     // [n]/[n+8]=byteSize/[n+0x10]/[n+0x18]) — compare CubeBlur (#6) to the working #4/#5.
                     unsigned long long crbp = rd(rbp);
                     unsigned long long node = rd(crbp - 0x1c0);
+                    // On hit #4 dump a large window around the Shader typetree node array (nodes + likely
+                    // string buffer) so we can locate MatrixParameter's node and check its byteSize/children.
+                    if ((int)g_hwbp_count == 4 && node > 0x10000) {
+                        uint64_t lo = node - 0x6000, hi = node + 0x6000;
+                        if (probe_readable(lo) && probe_readable(hi - 1)) {
+                            int fd = open("/tmp/prosper_ttnodes.bin", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                            if (fd >= 0) { (void)!write(fd, (const void*)lo, (size_t)(hi - lo)); close(fd);
+                                char m2[96]; int mn = snprintf(m2, sizeof m2, "[ttnodes] dumped [0x%llx..0x%llx] base=0x%llx\n",
+                                    (unsigned long long)lo, (unsigned long long)hi, (unsigned long long)node); write(2, m2, mn); }
+                        }
+                    }
                     char db[300];
                     int dn = snprintf(db, sizeof db,
                         "[hwbp-divcap] #%d elemSz=0x%llx byteSz=0x%llx cnt=0x%llx | node=0x%llx [n]=0x%llx [n+8]=0x%llx [n+0x10]=0x%llx [n+0x18]=0x%llx [n+0x20]=0x%llx | cur=0x%llx\n",
