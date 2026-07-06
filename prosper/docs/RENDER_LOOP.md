@@ -753,3 +753,58 @@ Build a **chained single-step drift trace**: arm a windowed single-step *only* b
 advance, to pin the exact field read that consumes 12 instead of 16 (element-size branch, a version/mode
 gate, or a mishandled SInt8+align). Ad-hoc single breakpoints are exhausted; this windowed trace is the tool
 that should identify the precise instruction, after which the fix is targeted.
+
+### Raw test results / evidence (for handoff to another agent)
+
+**(1) UnityPy reference field-layout at the crash offset** (forced Python path, hooked `read_value`;
+`obj.byte_start` for CubeBlur; ref offset = buffer_offset − (nameBufOff − nameRefOff)):
+```
+off 5040  m_ConstantBuffers            (vector)
+off 5044    ConstantBuffer.m_NameIndex (int) = 0
+off 5048    m_MatrixParams             (vector)
+off 5052      MatrixParameter.m_NameIndex(int)=2  m_Index(int)=0@5056  m_ArraySize(int)=0@5060
+off 5064      MatrixParameter.m_Type     (SInt8) = 0
+off 5065      MatrixParameter.m_RowCount (SInt8) = 4     (+2 pad -> 16-byte struct, ends 5068)
+off 5068    m_VectorParams (vector)  off 5072 m_StructParams  off 5076 m_Size(int)=176  off 5080 m_IsPartialCB(bool)=1
+off 5084    ConstantBuffer[1] ... m_Size=368@5116 ... off 5124 m_ConstantBufferBindings ...
+off 5024  SerializedProgramParameters m_CommonParameters (dict)  |  off 5000 m_ParameterBlobIndices
+```
+Bytes at ref 5064 = `00 04 00 00` = `0x00000400`. buf6[cursor] == ref[5064] byte-identical (buffer dump vs
+`obj.get_raw_data()`). CubeBlur ref object = 17168 B; markers: `_MainTex`@12, `RenderType`@2244,
+`Opaque`@2260, `STEREO_INSTANCING_ON`@5608, `Hidden/CubeBlur`@5720.
+
+**(2) Driver `0x1612c70` hits (6 total; #4/#5/#6 same buffer base):**
+```
+#4 cur=base+0x2434  #5 cur=base+0x4840  #6 cur=base+0x7a20 (=ref 5064)  end=base+0xb304
+all tid=<one thread>  caller_rbp=eboot+0xd4cf72
+```
+
+**(3) PROSPER_HWBP_DIVCAP (elemSize/byteSize/count from caller frame at the driver):**
+```
+#1 elemSz=0x10000  byteSz=0xf78   cnt=0     #4 elemSz=0x10000  byteSz=0x716d0 cnt=7
+#2 elemSz=0x100000 byteSz=0x5b3b0 cnt=0     #5 elemSz=0x10000  byteSz=0x737f8 cnt=7
+#3 elemSz=0x100000 byteSz=0x5d770 cnt=0     #6 elemSz=0x10000  byteSz=0x27a10 cnt=2
+```
+Transfer/`this` object (rdi): #1-5 share a fixed pooled object; #6 differs and sits in the shader arena.
+(The `[+0x190]` "mode byte" was UNSTABLE across runs = shader-arena noise, NOT a real flag — do not trust it.)
+
+**(4) Node capture (`[caller_rbp-0x1c0]` saved node; records 0x18 B, byteSize field at +8):**
+```
+#1 node f0=0x11 byteSz=0xf78     #4 node f0=0x2a05 byteSz=0x716d0    (#1 diff type array; #2/3 another;
+#2 node f0=0x3  byteSz=0x5b3b0   #5 node f0=0x2a12 byteSz=0x737f8     #4/5/6 all index the Shader typetree
+#3 node f0=0x4  byteSz=0x5d770   #6 node f0=0x42  byteSz=0x27a10       node array 0x…d132d…)
+```
+
+**(5) Div-site `0xd4cef7` (count=byteSize/elemSize) ring — ALL hits are string-array (elemSize 0x100000),
+count=0, node byteSize [r8+0x10]=0x44..0xa4 (name/string lengths). Gating to small struct elemSizes
+(4..0x1000) yielded ZERO hits ⇒ struct arrays don't use this div; they take another branch of 0xd4ce00.**
+
+**(6) Breakpoint hit-counts (all verified `[hwbp] armed`, all reach the crash):**
+`0x15fe650`=0, `0x160d630`=0, `0x160d6b7`=0, `0x16098d4`=0, `0x1609850`=0 (all MatrixParameter-named fns
+never called); `0x1612c70`=6; `0xd58f4f` (SafeBinaryRead name-mismatch)=0.
+
+**(7) Relocation histogram (`PROSPER_RELOC_HISTO`): eboot 51475/51475 applied — type 8(RELATIVE)=49664,
+1(_64)=1201, 7(JUMP_SLOT)=606, 6(GLOB_DAT)=4; no unhandled types in any module.**
+
+**(8) Without `PROSPER_GUEST_FS`: faults earlier inside host `libc.so.6` (initial-exec TLS landmine), so the
+deser crash is only reachable WITH guest-`%fs`. `unity_builtin_extra` header: version=22, no embedded typetree.**
