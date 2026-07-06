@@ -284,12 +284,23 @@ and it reaches **audio init** (Ajm/AudioOut) — further than ever before. This 
 standing MT-rendering hypothesis: our env can't complete the cross-thread gfx-jobs handshake, so forcing
 single-threaded rendering (the game's own supported mode) sidesteps it. CONFIDENCE: HIGH.
 
-**New frontier (post-deadlock):** two fresh faults now appear (racing threads):
-- Worker-thread SIGSEGV at a high mapped region `rip≈0x7eb826…` (executing data / bad fn-ptr).
-- Main-ish guest fault at **`eboot+0xa9c0bb`**: fn `0xa9c0a0` (checks global flag `0x401f3de24`, loads global
-  `0x401ff2e00`, then `mov 0x8(%rdi)` — a report/log-shaped fn) is called from `eboot+0x10fa24c` with
-  `rdi` = return of `0xa99d50`, which returned **2** (a small int where a pointer is expected) → deref of
-  `[0xa]`. Next: identify `0xa99d50` (why it returns 2) and whether this is on the audio-init or gfx path.
+**New frontier (post-deadlock) = the `%fs` initial-exec TLS landmine, CONFIRMED.** Two fresh faults appear
+(racing threads), both rooted in guest initial-exec (`%fs`-relative) TLS aliasing the HOST glibc TCB:
+- **Main thread** faults at `eboot+0xa9c0bb`. Chain: `eboot+0x10fa24c` calls `0xa99d50` (a lazy
+  thread-local get-or-create: `mov %fs:0x0,%rax; mov -0xa8(%rax),%r14; if r14 nonzero return it else
+  allocate+store`), which returns `[TP-0xa8]`; the result feeds `0xa9c0a0` which does `mov 0x8(%rdi)`.
+  **Ground truth (gdb, main thread):** `fs_base=0x7ffff7e99740` is the HOST pthread TCB (we run guest code
+  on the host `%fs`, deliberately, so real libc.prx works), so the guest's initial-exec var at `[TP-0xa8]`
+  reads **host glibc garbage `0x2`** instead of a zero-init guest slot. On HW `[TP-0xa8]` starts 0 → the
+  lazy-alloc path runs → valid object; here it returns `2` → `0xa9c0a0` derefs `[0xa]` → SIGSEGV.
+- **Worker-thread SIGSEGV** at a high mapped region (`rip` ASLR-varying, e.g. `0x…82e4772d`): same class —
+  a thread-local callback/vtable read via `%fs` returns host garbage → call through a bad pointer.
+Both are the recurring landmine the project beat case-by-case before (`k_tls_get_addr`→gettid, exc-handler
+stack-local). `-force-gfx-direct` newly runs Unity's GfxDevice/telemetry code that uses **initial-exec**
+guest TLS (direct `%fs`-relative, NOT `__tls_get_addr`), which our host-`%fs` model doesn't back. **The next
+milestone is proper guest initial-exec TLS** — give guest static-TLS variables real zero-init guest storage
+at their negative `%fs` offsets (without breaking host libc which shares the same `%fs`). This is the
+foundational fix that unblocks the direct-mode gfx path. CONFIDENCE: HIGH on the diagnosis.
 
 ## 2026-07-06 — GPU-executor Stages A/B/C landed; correct EOP writes CONFIRMED live (still not the unblock)
 Built the GPU executor per `docs/GPU_EXECUTOR_DESIGN.md` (all committed, Linux 45/45 + Windows 20/20):
