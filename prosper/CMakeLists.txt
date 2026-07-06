@@ -283,6 +283,11 @@ if(TARGET prosper_core)
       target_link_libraries(test_gpustate_render PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME gpustate_render COMMAND test_gpustate_render)
 
+      # GPU-executor core (Stage A): GpuState -> execute_gpustate() -> render -> present round-trip.
+      add_executable(test_gpu_execute tests/test_gpu_execute.cpp)
+      target_link_libraries(test_gpu_execute PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME gpu_execute COMMAND test_gpu_execute)
+
       # Payoff demo: recompile the GAME'S OWN embedded shaders and render them on real Vulkan.
       # Needs both Vulkan and the (gitignored) game dump, so it's gated on HAVE_GAME_DUMP.
       if(HAVE_GAME_DUMP)

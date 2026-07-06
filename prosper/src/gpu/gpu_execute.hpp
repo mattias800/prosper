@@ -1,0 +1,42 @@
+// gpu_execute.hpp — the stage-independent core of the GPU executor (Stage A of docs/GPU_EXECUTOR_DESIGN.md).
+//
+// Turns a folded GpuState (exactly what agc_driver_submit_dcb produces via run_command_buffer) into a
+// rendered frame: extract the RDNA2 render-state, recompile the vertex+pixel shaders straight from their
+// SHADER_PGM addresses, resolve fixed-function state to Vulkan-ready values, and invoke a caller-supplied
+// render backend. It is deliberately **Vulkan-agnostic** — the backend is a std::function — so this lives
+// in prosper_core (which does not link Vulkan) while the live-device renderer is supplied by whoever has a
+// device (the app/HLE, or tests via render_runner.h). agc_driver_submit_dcb calls this with the live
+// renderer once the device is wired; tests call it with the offscreen renderer to verify the spine.
+#pragma once
+#include "command_processor.hpp"   // GpuState
+#include "render_state.hpp"        // extract_render_state / resolve_pipeline_state / ResolvedPipelineState
+#include "rdna2_to_spirv.hpp"      // recompile_vertex / recompile_fragment
+#include <cstdint>
+#include <functional>
+#include <vector>
+
+namespace prosper::gpu {
+
+// The pluggable Vulkan backend: given recompiled VS+PS SPIR-V and resolved pipeline state, render and
+// return W*H*4 RGBA8 pixels (or {} on failure). Signature matches tests/render_runner.h::render_triangle_rgba.
+using RenderFn = std::function<std::vector<uint8_t>(const std::vector<uint32_t>& vs,
+                                                    const std::vector<uint32_t>& fs,
+                                                    const ResolvedPipelineState& ps)>;
+
+// Recompile + resolve a GpuState and render it via `render`. Returns the pixels, or {} if there is nothing
+// to draw or a stage fails to recompile. `max_shader_dwords` bounds the recompiler's walk (it stops at
+// S_ENDPGM, so this is just an upper bound). CONFIDENCE: HIGH on the orchestration (mirrors the verified
+// test_gpustate_render spine); the general multi-draw / vertex-fetch path is handled by the backend.
+inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn& render,
+                                             uint32_t max_shader_dwords = 0x10000) {
+    if (st.draws.empty() || !render) return {};              // nothing to render (e.g. a state-only submit)
+    RenderState rs = extract_render_state(st);
+    if (!rs.es_addr || !rs.ps_addr) return {};               // no vertex/pixel program bound
+    std::vector<uint32_t> vs = recompile_vertex((const uint32_t*)(uintptr_t)rs.es_addr, max_shader_dwords);
+    std::vector<uint32_t> fs = recompile_fragment((const uint32_t*)(uintptr_t)rs.ps_addr, max_shader_dwords);
+    if (vs.empty() || fs.empty()) return {};                 // an unsupported shader — leave frame untouched
+    ResolvedPipelineState ps = resolve_pipeline_state(rs);
+    return render(vs, fs, ps);
+}
+
+} // namespace prosper::gpu
