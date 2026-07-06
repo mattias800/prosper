@@ -119,6 +119,10 @@ namespace {
     // catch the one deserializer read that produces a garbage std::string length without the gdb-bp overhead
     // that times out on hot addresses. r15 is used because it carries the read length at eboot+0x7e40e1.
     uint64_t g_hwbp_r15 = 0; bool g_hwbp_r15_on = false;
+    // PROSPER_HWBP_RAXMIN=<hex>: only LOG when rax >= this (a cursor-range gate). Lets a trace of a hot
+    // shared reader isolate one buffer/context (e.g. the 16 MB shader pool at 0x7ffefc…) out of thousands
+    // of unrelated small-string reads, so the log + the max-count apply to the context of interest.
+    uint64_t g_hwbp_raxmin = 0;
     // Optional chained DATA write-watchpoint: on the first exec-bp hit, arm a HW write watch on
     // [rax + g_hwwatch_delta] (default rax-0x80, the thread-local device slot the ctor reads). Catches
     // every writer of that slot with its RIP — reveals what sets/clears the scoped device pointer.
@@ -295,7 +299,7 @@ namespace {
             // This handler returns to the guest, which may be on the guest %fs — swap to host %fs for the
             // host-libc logging below, restore before returning. No-op off the guest-fs path.
             uint64_t saved_fs = guest_fs_to_host_scoped();
-            bool cond_ok = !g_hwbp_r15_on || (r15 == g_hwbp_r15);
+            bool cond_ok = (!g_hwbp_r15_on || (r15 == g_hwbp_r15)) && (rax >= g_hwbp_raxmin);
             if (cond_ok && g_hwbp_r15_on) {
                 // The matching read: dump the window around rax (the source pointer) + classify its mapping,
                 // so we can see whether the deserializer's cursor points into a file buffer / heap / garbage.
@@ -317,13 +321,16 @@ namespace {
                 uint64_t rbp = (uint64_t)gr[REG_RBP], rsp = (uint64_t)gr[REG_RSP];
                 auto off = [](unsigned long long v) -> unsigned long long {
                     return (v >= 0x400000000ull && v < 0x420000000ull) ? v - 0x400000000ull : v; };
-                char b[380];
+                // Also surface rax + the u32 at [rax] — at the deserializer length-read site (0x7e40d9/e1)
+                // rax is the stream cursor and [rax] the value being read, so a trace shows the parse walk.
+                unsigned rax_u32 = probe_readable(rax) ? *(const uint32_t*)rax : 0xBADBADu;
+                char b[420];
                 int n = snprintf(b, sizeof b,
-                    "[hwbp] #%d rip=eboot+0x%llx rdi=0x%llx rsi=0x%llx rdx=0x%llx r14=0x%llx ret=eboot+0x%llx caller_rbp=eboot+0x%llx tid=%ld\n",
+                    "[hwbp] #%d rip=eboot+0x%llx rax=0x%llx [rax]=0x%08x r14=0x%llx rdi=0x%llx rsi=0x%llx ret=eboot+0x%llx caller_rbp=eboot+0x%llx tid=%ld\n",
                     (int)g_hwbp_count, (unsigned long long)((uint64_t)gr[REG_RIP] - 0x400000000ull),
-                    (unsigned long long)rdi, (unsigned long long)rsi, (unsigned long long)gr[REG_RDX],
-                    (unsigned long long)r14, off(rd(rsp)), off(rd(rbp + 8)), cur_tid());
-                (void)r15; (void)rax;
+                    (unsigned long long)rax, rax_u32, (unsigned long long)r14,
+                    (unsigned long long)rdi, (unsigned long long)rsi, off(rd(rsp)), off(rd(rbp + 8)), cur_tid());
+                (void)r15;
                 write(2, b, n);
             }
             // On the first exec hit, optionally arm a data write-watch on [<reg> + delta].
@@ -723,6 +730,7 @@ void install_trap_handler() {
         g_hwbp_addr = 0x400000000ull + strtoull(hb, nullptr, 0);
         if (const char* m = getenv("PROSPER_HWBP_MAX")) g_hwbp_max = (int)strtoul(m, nullptr, 0);
         if (const char* c = getenv("PROSPER_HWBP_R15")) { g_hwbp_r15 = strtoull(c, nullptr, 0); g_hwbp_r15_on = true; }
+        if (const char* c = getenv("PROSPER_HWBP_RAXMIN")) g_hwbp_raxmin = strtoull(c, nullptr, 0);
         if (g_devnull_fd < 0) g_devnull_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
         g_hwbp_on = true;   // perf_event_open done in arm_hwbp() after the image is mapped
         // PROSPER_HWWATCH=<signed delta>: on the first exec-bp hit, arm a data write-watch on [rax+delta]
