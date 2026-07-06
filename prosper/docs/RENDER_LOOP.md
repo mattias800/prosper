@@ -338,6 +338,32 @@ TypeTree. Tooling added this session: `PROSPER_STUBDUMP` (stub idx→NID; ruled 
 hypothesis — stub #319 = `__stack_chk_guard`), `PROSPER_HWBP_R15` (conditional HWBP log — works OFF the
 guest-fs path only), and `guest_fs_to_host_scoped`/`_restore_scoped` (fs swap for diagnostic handlers).
 
+## 2026-07-06 — deserializer MECHANISM fully mapped (count-prefixed string arrays); + boot made deterministic
+Two big things this cycle:
+1. **Fixed the consistent worker crash: a data race in `prosper_on_unimpl`.** It mutated `g_count[idx]`
+   + `g_order.push_back` with NO lock; once `-force-gfx-direct`/guest-fs bring worker threads online, they
+   call unimplemented imports concurrently → the unordered_map/vector corrupt → SIGSEGV *inside
+   prosper_on_unimpl on a worker* (traced via the new worker-fault region classifier → it was OUR code,
+   not guest). Added a mutex. Effect: boot is now DETERMINISTIC — 5/5 runs exit 0 (was 90) and reach RUN
+   ENDED at the main deser fault, instead of a worker crash killing the process first. Also fixed
+   single-step-under-guest-fs (guest TCB now replicates the host `%fs:0x28` stack-guard / `:0x30` pointer-
+   guard, so `-fstack-protector` signal handlers running transiently under guest `%fs` don't false-abort).
+2. **The deserializer is a count-prefixed string-array reader** (static RE, no perturbation):
+   - `0x7fc9f0` (frame C): reads a 4-byte COUNT at `[cursor]` (`movslq`), then loops `count` times calling
+     the string reader `0x7e4090`, storing into an array of `0x28`-byte items (frame C loop `0x7fcaf0`).
+   - So the parse is: {read count N} {read N length-prefixed strings} … repeated for many arrays.
+   - The 6000+ traced reads are MANY small arrays read CORRECTLY (sane small lengths), then one field
+     diverges and the cursor walks into the shader-bytecode blob → a code dword read as a string length →
+     `alloc(~16 EiB)` → null → crash.
+**Why this is the autonomous wall:** the divergence is ONE field among thousands of correct reads, deep in
+the boot. Single-step tracing to it is impractical (0x7e40d9 is hit for every string in the whole boot;
+7 min of stepping reached 0 shader-pool reads). Fault-time capture gives only the endpoint (reader+buffer).
+The exact divergent field needs **Unity SerializedShader/TypeTree format reference** (to know the expected
+field layout and spot the one we consume with the wrong size/count) or an interactive reference-backed
+session — not more autonomous trace/static-RE cycles. Everything upstream is now solid + deterministic:
+the game reliably boots (via the two gated switches) to this single, well-characterized deserialization
+divergence.
+
 ## 2026-07-06 — ⭐⭐ guest initial-exec TLS landmine FIXED; boot now reaches INPUT/IME init
 The `%fs` TLS fault below is **fixed** (gated `PROSPER_GUEST_FS`, validated). Implementation
 (`src/host/guest_tls.cpp` + `exec_image_linux.cpp` swap stubs, all default-off):
