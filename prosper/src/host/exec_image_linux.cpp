@@ -491,6 +491,11 @@ namespace {
                 return;   // re-execute from the reader's skip label
             }
         }
+        // Fatal crash path (all diagnostic/stepping cases above already returned). If this thread was
+        // running on OUR guest %fs, restore the host %fs NOW so the host-libc reporting below (snprintf/
+        // write) + the siglongjmp-return into host C++ don't double-fault reading guest TLS as glibc's TCB.
+        // No-op when guest-fs is off. (The GC RT-signal handler is separate and keeps the guest %fs.)
+        guest_fs_enter_host_for_signal();
         if (g_faultlog) {
             char b[128]; auto* uc = (ucontext_t*)uctx;
             int n = snprintf(b, sizeof b, "[fault] sig=%d addr=%p rip=0x%llx armed=%d tid=%ld\n",

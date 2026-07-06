@@ -82,5 +82,18 @@ uint64_t guest_tls_activate_thread() {
     return tp;
 }
 
+// Called at the entry of the CRASH signal handler (fault_handler). If the faulting thread is running on
+// OUR guest %fs, switch to the stashed host %fs so the handler's host-libc calls (snprintf/write) and any
+// siglongjmp-return into host C++ run on the correct TCB — otherwise they read guest TLS as glibc's TCB and
+// double-fault (an uncaught SIGSEGV -> core dump). No-op if fs isn't one of our guest TCBs (host thread, or
+// gate off): reading [fs+MAGIC_OFF] is safe on the host TCB (positive offset into the allocated TLS/dtv
+// area) and simply won't match the magic. NOT used by the GC RT-signal handler, which must KEEP the guest
+// %fs to run the guest's own exception handler. Safe to call unconditionally.
+void guest_fs_enter_host_for_signal() {
+    uint64_t fs = rd_fsbase();
+    if (fs && *(volatile uint32_t*)(fs + MAGIC_OFF) == TCB_MAGIC)
+        wr_fsbase(*(volatile uint64_t*)(fs + HOSTFS_OFF));
+}
+
 } // namespace prosper
 #endif
