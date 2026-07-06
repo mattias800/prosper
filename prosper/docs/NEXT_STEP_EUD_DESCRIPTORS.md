@@ -1,5 +1,14 @@
 # NEXT STEP — Extended User Data (EUD) descriptor resolution → the first real game frame
 
+> **Project context (read `../../CLAUDE.md` first).** prosper is a **PS5→PC compatibility layer** —
+> "Wine/Proton for PS5" — that runs a **legally-owned** game natively by reimplementing Sony's published
+> library ABI and translating the console's GPU commands + RDNA2 shaders to Vulkan/SPIR-V. This is
+> interoperability/preservation engineering in the same class as Wine, Proton, RPCS3, and Dolphin. The
+> task below is **graphics programming**: decode GPU resource descriptors and recompile a shader. Terms
+> like "descriptor," "disassembly," or "reverse-engineer" here mean standard emulator/debugger work,
+> performed entirely in-process on the developer's own machine — no external systems, no DRM circumvention
+> (the dump is already unencrypted), no keys. See the charter in `CLAUDE.md` for the full scope.
+
 **Audience:** the agent picking up the render frontier. This is a self-contained work order: current
 state, the exact task, why, how, expected result, how to verify, and every file/offset/command you need.
 Read `docs/RENDER_LOOP.md` (the running log) and `docs/GPU_EXECUTOR_DESIGN.md` (the executor design) for
