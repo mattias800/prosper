@@ -256,6 +256,33 @@ ones above). This is the GPU-execution build; it is the definitive next mileston
 focused, likely-interactive effort. Everything upstream (boot, IL2CPP, asset load, shader creation ×35,
 recompiler ×34, flip loop, offscreen GpuState→frame spine) is in place.
 
+## 2026-07-06 — GPU-executor Stages A/B/C landed; correct EOP writes CONFIRMED live (still not the unblock)
+Built the GPU executor per `docs/GPU_EXECUTOR_DESIGN.md` (all committed, Linux 45/45 + Windows 20/20):
+- **Stage A** — `execute_gpustate()` (Vulkan-agnostic core, `gpu_execute.hpp`) + the live-submit registry
+  `set_submit_renderer`/`execute_and_present` (`gpu_executor.cpp`); `agc_driver_submit_dcb` calls it after
+  folding, gated on `have_submit_renderer() && draws>0`. Inert until a device is registered. `test_gpu_execute`.
+- **Stage B** — RESOLVES the "blocker for doing it correctly" below (capturing the fence value beyond a0–a5).
+  Pinned the AGC ABI to Kyty `GraphicsCbReleaseMem(buf, action, gcr_cntl, dst, cache_policy, address,
+  data_sel, data, …)`: a5=label address, stack arg 7=`data_sel`, stack arg 8=the **full 64-bit value**.
+  `honor_eop_write` now writes the correct value honoring `data_sel` (1=32b, 2=64b, 3=GPU clock), on by
+  default (`PROSPER_NO_EOP_WRITE=1` disables). `honor_write_data` copies WRITE_DATA's real dwords. `test_eop_write`.
+- **Stage C** — `sceGnmAddEqEvent` (`b0xyllnVY-I`) EOP-event registration + `prosper_eq_trigger_eop()` on
+  submit completion (shadPS4-pinned: ident=id, filter=GraphicsCore=-14). `test_equeue_events` extended.
+
+**Live boot confirmation (boot_trace + `PROSPER_GFXLOG`):** the correct EOP writes now fire on the real
+setup submit — e.g. `ReleaseMem addr=…4aa8 data_sel=2 data=0x1` is immediately followed by
+`WaitRegMem a5=…4aa8` on the SAME address, and our `EOP write [..4aa8] data_sel=2 value=0x1` satisfies it.
+So the earlier fence experiments' "guessed value" caveat is gone — we now write the **correct** values by
+default. **Result: still the identical suspendPoint stall** (1 setup submit, 0 draws, 36 shaders created,
+no advance). This is the decisive confirmation of the earlier finding: **no stalled CPU thread is gated on
+the EOP fence label** — the correct value doesn't change that. The remaining gap is unchanged and precise:
+the 3-thread sync_on_address producer (main `0x18a83b5` / GfxDevice `0xb0672a` / worker `0x9385d7`) that is
+gated on GPU-resource-**upload** completion via a mechanism still not identified (all obvious ones ruled
+out above). Since the game never submits draws pre-upload, Stage A's `execute_and_present` never fires on
+the game yet — it is chicken/egg: identifying + posting the upload-completion the producer polls is the
+one remaining boot-wall-caliber piece (needs interactive HW-watchpoint RE on the producer, per §"gdb
+snapshot"). Everything else in the executor is built and verified.
+
 So the game plants an EOP fence: RELEASE_MEM writes a completion value to label `A` when the GPU pipe
 drains; WAIT_REG_MEM (and, cross-thread, the PreloadManager/FTM producers) block until `[A]` satisfies the
 compare. **We never write `A`** — our AGC Dcb builders (`agc_cb_release_mem`, `agc_dcb_wait_reg_mem`,
