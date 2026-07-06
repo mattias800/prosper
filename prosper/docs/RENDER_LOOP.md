@@ -693,3 +693,63 @@ only between driver hit #5 (cursor base+0x4840) and hit #6 (base+0x7a20), loggin
 see exactly which field read consumes 12 instead of 16 (element-size branch, a version/mode gate, or a
 mishandled SInt8+align). This needs a chained-bp (arm the step window on the 5th `0x1612c70` hit). Ad-hoc
 single-breakpoints have been exhausted; the release generic reader is multi-branch and undocumented.
+
+---
+
+## ★ DESER FAULT — CONSOLIDATED SUMMARY & CURRENT STATE (2026-07-06, authoritative)
+
+**Where the boot is:** past the render-loop deadlock (via `-force-gfx-direct`) and the guest-`%fs` TLS
+landmine (via `PROSPER_GUEST_FS`), the game loads assets and **deterministically crashes deserializing the
+built-in shader `Hidden/CubeBlur`** (from `Media/Resources/unity_builtin_extra`) at `eboot+0x46beb4`
+(`movb $0,[0]` after a null alloc). Repro:
+`PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct ./boot_trace`.
+
+### VERIFIED root mechanism (high confidence)
+The parser consumes a `MatrixParameter` (and `VectorParameter`, identical layout) as **12 bytes instead of
+16** — it does NOT consume the trailing `SInt8 m_Type` + `SInt8 m_RowCount`(/`m_Dim`) + 2 pad. That 4-byte
+**cursor drift** makes the next alignedString-array read (`{count}{alignedString[]}` driver `eboot+0x1612c70`)
+start on the `MatrixParameter`'s `{m_Type=0, m_RowCount=4, pad, pad}` = little-endian **`0x00000400`**, read
+as a **count of 1024**, reserve/read 1024 "strings" out of numeric shader data → a bogus ~16 EiB length →
+null alloc → crash.
+
+### Proven facts (with method)
+- **Data is byte-perfect** (not a data/version bug): dumped the exact runtime buffer and byte-diffed it
+  against a **UnityPy 1.25 reference parse** of `unity_builtin_extra` (a clean 2022.3.32f1 SerializedFile;
+  `Hidden/CubeBlur` and all 43 built-ins parse fine). The crash-cursor bytes are IDENTICAL to the reference.
+- **Exact field pinned:** forcing UnityPy's Python path + hooking `read_value` mapped the crash cursor
+  (buffer `0x7a20` = CubeBlur object ref offset **5064**) to `m_ParsedForm…progVertex.m_CommonParameters.
+  m_ConstantBuffers[0].m_MatrixParams[0]` — its `m_Type`(SInt8)@5064 / `m_RowCount`(SInt8)@5065.
+- **Only CubeBlur trips it:** its `m_CommonParameters` (the 2021.2+ deduped-parameter path, exercised by
+  stereo variants) contains a `MatrixParameter`; SInt8-tail-free shaders don't drift.
+- **Ruled out:** wrong data/version; guest-`%fs`/TLS (Fable: transfer ctx is never in TLS; nodes sane);
+  threading (all on one thread; it's the main/armed thread, `RUN ENDED kind=2`); a parse-mode flag (Fable:
+  none flips numeric↔string); typetree field-name mismatch (SafeBinaryRead name-check `eboot+0xd58f4f`
+  never fires); missing/unhandled relocations (51475/51475 applied, only handled types).
+- **Read path (crash backtrace):** `0x7e4115 ← 0x7fcafb ← 0x1612c92(driver) ← 0xd4cf72(vector reader
+  0xd4ce00) ← 0xd3d34b ← 0xd3db38 ← 0xd3d8b1 ← 0xb500a6 ← … ← 0x1485851`.
+- **Reader is name-less generic:** all three `MatrixParameter`-named functions (editor GenerateTypeTree
+  `0x15fe650`, SafeBinaryRead read `0x160d630`, vector reader `0x1609850`) are **verified-armed but never
+  called**. The `count = byteSize/elemSize` div (`0xd4cef7`) is **string-array-only** (elemSize 0x100000);
+  struct arrays take a different branch of `0xd4ce00` gated on the mode byte `[rcx+0x190]` (`0xd4ce0d`).
+  `unity_builtin_extra` has **no embedded typetree** (UnityPy: 1 type, 0 nodes), so the 12-byte element
+  size comes from a runtime-built, name-less reflection whose `MatrixParameter` byteSize is 12.
+
+### Fixable root class
+A runtime reflection/registration produces `MatrixParameter`/`VectorParameter` with only 3 fields (byteSize
+12) instead of 5 (16) in our env — matching Fable's "corrupted RTTI/static-init generation" mechanism and
+Kyty's init-ordering divergence note. On real PS5 the same build reads 16 (game ships), so our env induces
+the 12.
+
+### Reusable tooling added (all in `exec_image_linux.cpp`, gated, non-destructive)
+`PROSPER_HWBP_ANOM` (ring dump on anomalous read), `PROSPER_HWBP_NODE` (typetree-node ring, dumps on fault;
+now also captures `rcx`=elemSize), `PROSPER_HWBP_BUFDUMP` (dump reader window per driver hit),
+`PROSPER_HWBP_DIVCAP` (elemSize/byteSize/count + saved node from the caller frame), `PROSPER_HWBP_STRDUMP`
+(ASCII at arg regs), `PROSPER_RELOC_HISTO` (per-module reloc-type histogram). Plus UnityPy reference-parse
+recipe (apt `python3-pip`; force `read_typetree_boost=None`; hook `read_value` for offset→field mapping).
+
+### DEFINITIVE NEXT STEP (in progress — "option 1")
+Build a **chained single-step drift trace**: arm a windowed single-step *only* between driver hit #5
+(cursor base+0x4840) and hit #6 (base+0x7a20) — the one record whose parse drifts — logging each cursor
+advance, to pin the exact field read that consumes 12 instead of 16 (element-size branch, a version/mode
+gate, or a mishandled SInt8+align). Ad-hoc single breakpoints are exhausted; this windowed trace is the tool
+that should identify the precise instruction, after which the fix is targeted.
