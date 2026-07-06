@@ -355,7 +355,7 @@ namespace {
         // other SIGTRAP while armed is a HW-breakpoint hit -> log registers, then disable + single-step
         // over it (TF), re-enabling on the step trap. No code bytes are touched (unlike int3), so this is
         // safe on hot/multi-threaded functions.
-        if (sig == SIGTRAP && g_hwbp_on && g_hwbp_fd >= 0) {
+        if (sig == SIGTRAP && ((g_hwbp_on && g_hwbp_fd >= 0) || g_hwwatch_fd >= 0)) {
             auto* uc = (ucontext_t*)uctx;
             // Step-window: continuous single-step from driver hit N to the next driver hit. On each step,
             // find the live read cursor (a GP reg pointing inside [base,end]) and ring-log advances.
@@ -932,6 +932,15 @@ void install_sigaltstack() {
 
 void install_trap_handler() {
     g_faultmem = getenv("PROSPER_FAULTMEM") != nullptr;   // read once (getenv is not signal-safe)
+    // Expose the perf HW write-watch to HLE code (dispatch.hpp g_hwwatch_hook): lets an HLE-side
+    // diagnostic arm a watch on a runtime-discovered guest slot (one watch; extra calls ignored).
+    // Installs the SIGTRAP handler on demand (the watch may be armed without PROSPER_HWBP).
+    g_hwwatch_hook = [](uint64_t addr) {
+        if (g_hwwatch_fd >= 0) return;
+        struct sigaction ta{}; ta.sa_sigaction = fault_handler; ta.sa_flags = SA_SIGINFO;
+        sigemptyset(&ta.sa_mask); sigaction(SIGTRAP, &ta, nullptr);
+        arm_hwwatch(addr);
+    };
     g_faultlog = getenv("PROSPER_FAULTLOG") != nullptr;
     g_skip_null_companion = getenv("PROSPER_SKIP_NULL_COMPANION") != nullptr;
     g_null_page = getenv("PROSPER_NULL_PAGE") != nullptr;

@@ -69,8 +69,19 @@ HLE(g_agc_regdefs_int) { gfx_tick(); return (uint64_t)(uintptr_t)prosper_agc_reg
 // is a structurally-valid empty init: it unblocks the boot so the NEXT blocker is observable. STAGE 2
 // will populate the tables from the real register offsets (agc_reg_defaults.cpp) and allocate the
 // register banks so registers are actually stored.
+// RE convergence (2026-07-06): the "classify table" IS an AgcShaderUserData descriptor — the u16
+// limits at +0x2e are sharp_resource_count[4], the void*[4] at +0x08 are sharp_resource_offset[4],
+// and +0x00 is direct_resource_offset: a u16 table the EUD writer (eboot+0x3af620, via the reader
+// eboot+0x3b5e90) indexes UNCONDITIONALLY by resource type before its `cmp $0xffff -> skip` guard.
+// [sub+0x08] is the sub-object's ACTIVE user-data descriptor: this ctor installs the default and
+// SetSource (eboot+0x3af400) swaps in the bound shader's ud (re-init restores the default). A bare
+// zeroed block left direct_resource_offset null -> the first real pipeline bind (post-deser-fix)
+// null-derefed at eboot+0x3b5e95 (addr=0x8). The empty descriptor must therefore carry a real
+// direct table filled with the 0xffff "no entry" sentinel; counts/limits stay 0 so the register
+// classify path (eboot+0x3b5ea0) keeps returning 0x7fff (skip) exactly as before.
 namespace {
-alignas(64) uint8_t g_agc_ctx_regmap[0x40] = {0};   // all four per-selector limits (u16 @ +0x2e) = 0
+alignas(64) uint16_t g_agc_ud_no_entries[32] = {};  // set to all-0xffff at first ctx init
+alignas(64) uint8_t g_agc_ctx_regmap[0x40] = {0};   // the empty AgcShaderUserData descriptor
 constexpr int   kAgcCtxSubCount  = 3;               // cx / sh / uc register-set sub-objects
 constexpr size_t kAgcCtxSubBase  = 0x38;            // first sub-object offset inside the context
 constexpr size_t kAgcCtxSubStride = 0x70;           // per sub-object (matches eboot+0x3b0210: *0x70)
@@ -78,6 +89,10 @@ constexpr size_t kAgcCtxSubStride = 0x70;           // per sub-object (matches e
 HLE(g_agc_ctx_init) {   // a0 = context pointer (device+0x48)
     gfx_tick();
     if (a0) {
+        if (g_agc_ud_no_entries[0] != 0xffffu) {    // one-time: wire the sentinel direct table
+            for (auto& e : g_agc_ud_no_entries) e = 0xffffu;
+            *(void**)(g_agc_ctx_regmap + 0x00) = g_agc_ud_no_entries;   // direct_resource_offset
+        }
         uint8_t* ctx = (uint8_t*)(uintptr_t)a0;
         for (int i = 0; i < kAgcCtxSubCount; i++)
             *(void**)(ctx + kAgcCtxSubBase + i * kAgcCtxSubStride + 0x08) = g_agc_ctx_regmap;
@@ -296,6 +311,25 @@ uint64_t glog_impl(const char* nid, void* ra,
                 nid, (unsigned long long)((uint64_t)ra - 0x400000000ull),
                 (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
                 (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)a5);
+    // PROSPER_CTXDUMP: dump the register-context per-stage sub-objects' {source, user_data} pair at
+    // each AGC call, treating a0 as the ctx wrapper (subs at a0+0x38+stage*0x70 — layout from the
+    // eboot+0x3b0210 accessor + live fault frame). Diagnostic for the stale-[sub+8] shader-bind crash:
+    // shows WHICH call first plants a shared ud pointer across subs. Reads are blind-but-plausible
+    // (heap-interior a0), gated off by default.
+    // PROSPER_SUBWATCH: on the H7uZqCoNuWk(ctx, 7, ...) call (the last AGC call before the pre-draw
+    // pass that flips the stage subs' user_data to the shared scratch descriptor), arm a HW write-
+    // watch on stage-1's ud slot [ctx+0x38+0x70+8] — catches the flip writer's RIP.
+    if (getenv("PROSPER_SUBWATCH") && g_hwwatch_hook && !strcmp(nid, "H7uZqCoNuWk") && a1 == 7 &&
+        a0 > 0x100000ull)
+        g_hwwatch_hook(a0 + 0x38 + 0x70 + 8);
+    if (getenv("PROSPER_CTXDUMP") && a0 > 0x100000ull) {
+        fprintf(stderr, "  [ctx] %s a0=0x%llx subs:", nid, (unsigned long long)a0);
+        for (int st = 0; st < 4; st++) {
+            const uint64_t* sub = (const uint64_t*)(uintptr_t)(a0 + 0x38 + (uint64_t)st * 0x70);
+            fprintf(stderr, " s%d={%llx,%llx}", st, (unsigned long long)sub[0], (unsigned long long)sub[1]);
+        }
+        fprintf(stderr, "\n");
+    }
     // Shader-recompiler prep: dump the blob args of sceAgcCreateShader (f3dg2CSgRKY) to identify the
     // RDNA2 shader container format. Args are game-heap pointers (already mapped), so the reads are
     // safe; we only touch plausible pointers. Gated on PROSPER_AGCSHADER.

@@ -854,3 +854,45 @@ populated descriptors. THE FIX SITE = wherever our env builds this one type's de
 table. Open leads for that: (a) the name-less descriptor/reflection builder (not yet found); (b) a stubbed
 sce/API call consulted during that build returning wrong; (c) the build runs during early static-init /
 on a worker thread that instrumentation missed; (d) a relocation of a compiled field-descriptor table.
+
+## 2026-07-06 — ⭐⭐⭐ FIRST DRAWS SUBMITTED — the render loop is ALIVE
+
+The full multi-session chain is broken through. Two fixes this session (both committed, Linux 45/45 +
+Windows 20/20):
+
+1. **Deser crash RESOLVED (fd-semantics fix, `hle_file.cpp`)** — see `DESER_STALE_CACHE_BLOCK.md`. The
+   "MatrixParameter byteSize 12" model was disproven: the parser was reading BlitCopy's typetree over
+   STALE cache-block bytes (block 7 instead of block 2) because a spurious guest `close(0)`
+   ("close invalid-handle sentinel", harmless on PS5 where fds 0-2 are reserved) killed the live
+   `unity_builtin_extra` fd after host fd 0 got recycled to it. Fix: guest never receives fd<3 from
+   open; guest closes of fd 0-2 refused. Boot then proceeds through ALL shader deserialization.
+
+2. **Pipeline-bind null-deref RESOLVED (`hle_graphics.cpp` g_agc_ctx_init)** — post-deser the first real
+   pipeline bind faulted at `eboot+0x3b5e95` (addr=0x8): the ctx-init "classify table" we install at
+   `[sub+0x08]` IS an `AgcShaderUserData` descriptor (limits@+0x2e = sharp_resource_count[4],
+   ptrs@+0x08 = sharp_resource_offset[4]) and its `direct_resource_offset` (+0x00) is indexed
+   UNCONDITIONALLY by the EUD writer (`eboot+0x3af620` via reader `0x3b5e90`) before its
+   `cmp $0xffff -> skip` guard. Our zeroed block left that pointer null. Fix: the empty descriptor now
+   carries a real 32-entry u16 table of 0xffff "no entry" sentinels (limits stay 0, so the classify
+   path still returns 0x7fff/skip — the Stage-1 semantics are preserved, now structurally complete).
+   RE'd via: FAULTMEM regs → object-table decode → PROSPER_CTXDUMP sub-state timeline → HLE-armed
+   HW write-watch (`g_hwwatch_hook`) catching the writer = our own ctor.
+
+**Result (deterministic): the game submits real draws and flips.**
+```
+[agc] SubmitDcb #2: 186 dwords -> 32 packets applied (draws so far: 2)
+  ... DrawIndexAuto count=3 (x2, fullscreen-triangle pass), full SetRegsIndirect/SetShRegDirect
+  register setup, EOP ReleaseMem fences, Flip(bufidx=1) ...
+```
+The frame loop cycles (~1800 AgcDriver iterations observed over 3 min, no crash); the TRC suspendPoint
+watchdog still fires because no frame is PRESENTED — the pure-HLE path has no live Vulkan device.
+
+**NEXT (the pixels milestone):** register a live renderer (`gpu::set_submit_renderer`, Stage A executor —
+already built + tested offscreen) so `execute_and_present` fires on these submits: translate the 2-draw
+frame through the recompiler (36 shaders already registered via CreateShader) and present. Also worth
+following: whether the game advances past the first frame's WaitRegMem (our EOP writes satisfy the fence
+labels — verify SubmitDcb #3+ arrives with scene content once presentation completes).
+
+Diagnostics added (all gated): `PROSPER_CTXDUMP` (per-AGC-call ctx sub-object {src,ud} dump),
+`PROSPER_SUBWATCH` (HLE-armed HW write-watch on a ctx sub slot), `g_hwwatch_hook` (dispatch.hpp — lets
+HLE code arm the perf write-watch on runtime-discovered addresses; SIGTRAP handler installs on demand).

@@ -25,6 +25,8 @@ namespace {
 
 void dispatch_set_progress(volatile int* counter) { g_progress = counter; }
 
+void (*g_hwwatch_hook)(uint64_t) = nullptr;   // set by the Linux exec harness (perf HW watchpoints)
+
 void Hle::register_fn(const std::string& nid, HleFn fn, const char* name) {
     registry()[nid] = { fn, name ? name : "" };
 }

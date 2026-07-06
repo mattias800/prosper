@@ -109,4 +109,10 @@ void set_proc_param(uint64_t guest_va);
 void dump_call_log(FILE* f);
 void reset_call_log();
 
+// Optional hook to arm a hardware data write-watchpoint on an address (diagnostic). Set by the
+// Linux exec harness (exec_image_linux.cpp, perf_event-based); null elsewhere. HLE code may call
+// through it (when non-null) to catch the guest writer of a specific slot — e.g. the AGC
+// register-context sub-object fields. One watch at a time; extra calls are ignored.
+extern void (*g_hwwatch_hook)(uint64_t addr);
+
 } // namespace prosper
