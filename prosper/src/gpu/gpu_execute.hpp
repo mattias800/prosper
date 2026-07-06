@@ -11,10 +11,12 @@
 #include "command_processor.hpp"   // GpuState
 #include "render_state.hpp"        // extract_render_state / resolve_pipeline_state / ResolvedPipelineState
 #include "rdna2_to_spirv.hpp"      // recompile_vertex / recompile_fragment
+#include "shader_resources.hpp"    // ShaderResourceTable
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <memory>
 #include <vector>
 
 namespace prosper::gpu {
@@ -24,6 +26,13 @@ namespace prosper::gpu {
 using RenderFn = std::function<std::vector<uint8_t>(const std::vector<uint32_t>& vs,
                                                     const std::vector<uint32_t>& fs,
                                                     const ResolvedPipelineState& ps)>;
+
+// Build a shader stage's resource table from the folded GpuState: look up the registered shader header
+// by its bound code address, read its user-data SGPR block from the sh register file, decode the V#/T#/S#
+// descriptors, and assign bindings matching the recompiler+backend convention (constant buffer -> binding
+// 2, vertex buffer -> binding 3, textures -> binding 4+). Returns null if the stage has no shader header
+// or no resources. Implemented in gpu_executor.cpp (needs the AGC registry + descriptor decode).
+std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps);
 
 // Recompile + resolve a GpuState and render it via `render`. Returns the pixels, or {} if there is nothing
 // to draw or a stage fails to recompile. `max_shader_dwords` bounds the recompiler's walk (it stops at
@@ -39,8 +48,10 @@ inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn&
                          (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr, st.draws.size());
         return {};
     }
-    std::vector<uint32_t> vs = recompile_vertex((const uint32_t*)(uintptr_t)rs.es_addr, max_shader_dwords);
-    std::vector<uint32_t> fs = recompile_fragment((const uint32_t*)(uintptr_t)rs.ps_addr, max_shader_dwords);
+    std::shared_ptr<ShaderResourceTable> vrt = build_stage_table(st, rs.es_addr, false);
+    std::shared_ptr<ShaderResourceTable> prt = build_stage_table(st, rs.ps_addr, true);
+    std::vector<uint32_t> vs = recompile_vertex((const uint32_t*)(uintptr_t)rs.es_addr, max_shader_dwords, vrt.get());
+    std::vector<uint32_t> fs = recompile_fragment((const uint32_t*)(uintptr_t)rs.ps_addr, max_shader_dwords, prt.get());
     if (vs.empty() || fs.empty()) {                          // an unsupported shader — leave frame untouched
         if (log) {
             fprintf(stderr, "[exec] skip: recompile failed (vs=%zu fs=%zu dwords; es=0x%llx ps=0x%llx)\n",

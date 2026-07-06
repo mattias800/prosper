@@ -53,6 +53,17 @@ DecodedBufferDescriptor decode_buffer_descriptor(const uint32_t v[4]) {
     return d;
 }
 
+DecodedImageDescriptor decode_image_descriptor(const uint32_t t[8]) {
+    DecodedImageDescriptor d;
+    d.base      = (((uint64_t)t[0] | ((uint64_t)t[1] << 32)) & 0xFFFFFFFFFFull) << 8;             // Base40
+    d.width     = (uint32_t)(((t[1] >> 30) & 0x3u) | (((t[2] >> 0) & 0xFFFu) << 2)) + 1;          // Width5
+    d.height    = (uint32_t)((t[2] >> 14) & 0x3FFFu) + 1;                                          // Height5
+    d.format    = (t[1] >> 20) & 0x1FFu;                                                           // Format
+    d.tile_mode = (t[3] >> 20) & 0x1Fu;                                                            // TileMode
+    d.type      = (uint8_t)((t[3] >> 28) & 0xFu);                                                  // Type
+    return d;
+}
+
 ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                                            const uint32_t* user_sgprs, uint32_t num_user_sgprs) {
     ShaderResourceTable table;
@@ -81,6 +92,33 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             r.size           = d.size_bytes;
             r.stride         = d.stride;
             r.srt_offset     = off * 4;   // byte offset within user_data
+            table.resources.push_back(r);
+        }
+    }
+
+    // Textures: sharp_resource_offset[0] (textures2D). Each slot's offset_dw points at an 8-dword T#
+    // in the user-data SGPR block. The PS reads it directly in SGPRs (image_sample SRSRC), so DIRECT
+    // provenance: sgpr_base = offset_dw. The paired sampler (sharp[2]) is folded into the combined
+    // image-sampler at the same binding by the backend, so we don't emit a separate Sampler resource.
+    const AgcShaderSharp* texs = ud->sharp_resource_offset[0];
+    if (texs) {
+        for (uint16_t slot = 0; slot < ud->sharp_resource_count[0]; slot++) {
+            const AgcShaderSharp& s = texs[slot];
+            if (s.empty()) continue;
+            uint32_t off = s.offset_dw();
+            if ((uint64_t)off + 8 > num_user_sgprs) continue;   // T# (8 dwords) must fit in the block
+            DecodedImageDescriptor d = decode_image_descriptor(&user_sgprs[off]);
+            ShaderResource r;
+            r.cls           = ResourceClass::Texture;
+            r.format        = DataFormat::Unorm8;   // sampled UI textures are 8-bit UNORM RGBA
+            r.num_components = 4;
+            r.binding       = binding++;
+            r.gpu_addr      = d.base;
+            r.width         = d.width;
+            r.height        = d.height;
+            r.size          = d.width * d.height * 4;
+            r.sgpr_base     = off;                  // DIRECT provenance key (image_sample SRSRC SGPR)
+            r.srt_offset    = 0xFFFFFFFFu;
             table.resources.push_back(r);
         }
     }

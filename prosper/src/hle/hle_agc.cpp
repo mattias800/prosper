@@ -244,6 +244,19 @@ template <class T> inline void agc_fix_ptr(T*& m) {
 // Exposed for tests: how many shaders the guest successfully registered.
 extern "C" size_t prosper_agc_shader_count() { return agc_shaders().size(); }
 
+// Look up a registered shader header by its bound code address (the SHADER_PGM base the executor
+// recovers from the sh registers). Returns the AgcShader* (layout-compatible with gpu::AgcShaderHeader
+// — file_header@0, user_data@0x08, code@0x10, type@0x5a) so the GPU executor can build the shader's
+// resource table from its user_data descriptors. Null if no registered shader binds that code. The
+// registry is append-only during boot and CreateShader is main-thread; reads here are on the submit
+// thread — benign for a lookup (worst case a just-registered shader isn't seen yet, then it retries).
+extern "C" const void* prosper_agc_shader_header_for_code(uint64_t code_addr) {
+    if (!code_addr) return nullptr;
+    for (const AgcShader* h : agc_shaders())
+        if (h && (uint64_t)(uintptr_t)h->code == code_addr) return h;
+    return nullptr;
+}
+
 // Bounded RE probe (PROSPER_PIPETRACE): log the raw pointer args of the shader/pipeline construction
 // calls, so their argument/return pointers can be diffed against a later fault object (e.g. the
 // eboot+0xba6e08 pipeline object's [+0x140] companion). Purely observational.

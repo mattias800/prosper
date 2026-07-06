@@ -57,6 +57,19 @@ struct DecodedBufferDescriptor {
 // Decode a 4-dword V# (RDNA2/Gen5 buffer resource). Pure; exposed for reuse + testing.
 DecodedBufferDescriptor decode_buffer_descriptor(const uint32_t v[4]);
 
+// A decoded image resource descriptor (T#, 8 dwords / 256-bit). Layout = Kyty ShaderTextureResource
+// Gen5 getters (Base40/Width5/Height5/Format/TileMode). `base` is the byte address of the texel data
+// in unified guest memory. `tile_mode` 0 = linear (no detiling needed); non-zero = GPU-tiled.
+struct DecodedImageDescriptor {
+    uint64_t base = 0;
+    uint32_t width = 0, height = 0;
+    uint32_t format = 0;      // Gen5 surface-format enum (fields[1] bits 20..28)
+    uint32_t tile_mode = 0;   // 0 = linear
+    uint8_t  type = 0;        // SQ_RSRC_IMG dim (8 = 2D, 9 = 2D_ARRAY, ...)
+};
+// Decode an 8-dword T# (RDNA2/Gen5 image resource). Pure; exposed for reuse + testing.
+DecodedImageDescriptor decode_image_descriptor(const uint32_t t[8]);
+
 // Map a GCN/Gen5 buffer (DFMT, NFMT) pair to a DataFormat + component count. Pure.
 void buffer_format(uint32_t dfmt, uint32_t nfmt, DataFormat* out_fmt, uint32_t* out_components);
 
