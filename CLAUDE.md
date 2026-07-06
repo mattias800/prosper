@@ -61,9 +61,10 @@ Key docs to orient: `prosper/README.md` (status), `prosper/docs/ROADMAP.md`, `pr
 ## Current frontier (2026-07)
 
 The game **boots through IL2CPP into Unity's frame loop and submits real GPU draws.** A live Vulkan
-renderer is wired in; the game's **real pixel shader recompiles to valid SPIR-V.** The **one** remaining
-step to the first rendered frame is **Extended User Data (EUD) descriptor resolution** for the vertex
-shader — fully specified in `prosper/docs/NEXT_STEP_EUD_DESCRIPTORS.md`. Start there.
+renderer is wired in; the game's **real pixel shader recompiles to valid SPIR-V** and its real descriptors
++ 1920×1080 sampled texture decode correctly. The **one** remaining step to the first rendered frame is
+**bindless-dynamic vertex-fetch resolution** for the vertex shader — fully specified in
+`prosper/docs/NEXT_STEP_VERTEX_FETCH.md`. Start there.
 
 ## How to work here
 

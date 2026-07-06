@@ -21,10 +21,12 @@ namespace prosper::gpu {
 namespace {
 LiveRenderFn g_live;   // empty until the runtime/test registers a device-backed renderer
 
-// Read a 16-dword user-data SGPR block from a stage's register file. `base` = the stage's
-// SPI_SHADER_USER_DATA_*_0 register offset; absent registers read as 0.
-void read_user_sgprs(const std::unordered_map<uint32_t, uint32_t>& sh, uint32_t base, uint32_t out[16]) {
-    for (uint32_t i = 0; i < 16; i++) { auto it = sh.find(base + i); out[i] = it == sh.end() ? 0u : it->second; }
+// Read a 32-dword user-data SGPR block from a stage's register file. `base` = the stage's
+// SPI_SHADER_USER_DATA_*_0 register offset; absent registers read as 0. 32 (not 16) because NGG merged
+// shaders place descriptors in the extended user SGPRs s16..s31 (e.g. vertex buffers at s16/s18).
+static constexpr uint32_t kUserSgprs = 32;
+void read_user_sgprs(const std::unordered_map<uint32_t, uint32_t>& sh, uint32_t base, uint32_t out[kUserSgprs]) {
+    for (uint32_t i = 0; i < kUserSgprs; i++) { auto it = sh.find(base + i); out[i] = it == sh.end() ? 0u : it->second; }
 }
 
 // Reassign a built table's bindings to the recompiler+backend convention: constant buffer -> binding 2
@@ -87,9 +89,9 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
             }
         }
         for (uint32_t base : bases) {
-            uint32_t sgprs[16]; read_user_sgprs(st.sh, base, sgprs);
+            uint32_t sgprs[kUserSgprs]; read_user_sgprs(st.sh, base, sgprs);
             fprintf(stderr, "[resdump]   sgprs@0x%x:", base);
-            for (int i = 0; i < 16; i++) fprintf(stderr, " %08x", sgprs[i]);
+            for (uint32_t i = 0; i < kUserSgprs; i++) fprintf(stderr, " %08x", sgprs[i]);
             fprintf(stderr, "\n");
         }
         // ALL set sh registers (sorted) — finds where the user-data SGPRs actually landed, including
@@ -102,8 +104,8 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
     }
 
     for (uint32_t base : bases) {
-        uint32_t sgprs[16]; read_user_sgprs(st.sh, base, sgprs);
-        ShaderResourceTable t = build_shader_resources(*hdr, sgprs, 16);
+        uint32_t sgprs[kUserSgprs]; read_user_sgprs(st.sh, base, sgprs);
+        ShaderResourceTable t = build_shader_resources(*hdr, sgprs, kUserSgprs);
         if (t.resources.empty()) continue;
         assign_convention_bindings(t);
         if (log) {

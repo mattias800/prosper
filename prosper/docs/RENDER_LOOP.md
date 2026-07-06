@@ -951,3 +951,51 @@ shader s_loads its descriptor table from: `s[24:25]` in the observed VS). Descri
 guest pointers, so binding is a direct read. This resolves the VS's `buffer_load_format` V#s (and the
 PS's real T#/cbuf, replacing the degenerate inline 1×1), after which BOTH stages recompile and the live
 renderer produces the first real game frame. This is the single, well-characterized next step.
+
+## 2026-07-07 — ⭐⭐ SET_SH_REG range bug FIXED; real descriptors + 1920×1080 texture now decode
+
+Picked up the "first frame" work. The EUD theory from the prior entry was WRONG — `eud_size_dw=0` for both
+first-frame shaders (no EUD). The real bug was upstream and broad:
+
+**`SET_SH_REG` (IT_SET_SH_REG, 0x76) uploads a consecutive RANGE of registers** — `payload[0]`=start
+offset, `payload[1..]`=values — and the driver loads the **entire user-data descriptor block** (all the
+V#/T# SGPRs) in one len-N packet. Our decode + `GpuState::apply` only wrote the **first** register of each
+range and dropped the rest. So every shader's descriptor SGPRs past a range's first register were empty:
+constant buffers read `addr=0`, and the PS's sampled texture decoded to a degenerate 1×1. **Fixed**
+(`pm4_decode` captures the full range via `sh_reg_count`/`sh_reg_data`; `apply` writes every value;
+regression test in `test_command_processor`). This was a general register-fidelity bug, not graphics-only.
+
+**Result:** the `[restab]` descriptors are now real —
+- VS: 4 constant buffers with real bases + `stride=16` (UnityPerDraw/PerFrame/etc.).
+- PS: 1 constant buffer + a **1920×1080** sampled texture (`fmt=9`) — the real full-screen render target
+  the draw composites, not the old 1×1.
+Also: read 32 user SGPRs (not 16) since NGG merged shaders use the extended `s16..s31` block; added
+plausibility guards so a non-descriptor SGPR can't emit a garbage V#/T# binding.
+
+**The PS recompiles (737 dwords). The VS still does not — and now for a precisely-known reason:** its
+vertex fetch is **bindless-dynamic**. Disassembly:
+```
+s_load_dwordx2 s[64:65], s[26:27]                 ; load an index/table base
+...
+s_lshl_b32  vcc_hi, s64, 4                          ; vcc_hi = (s64<<4) & 0x1f0  -> a COMPUTED offset
+s_and_b32   vcc_hi, vcc_hi, 0x1f0
+s_load_dwordx4 s[8:11], s[24:25], vcc_hi            ; load the vertex-buffer V# from a table at that offset
+buffer_load_format_xyzw v[0:3], v0, s[8:11] idxen  ; fetch THROUGH the dynamically-loaded V#
+```
+The V# is loaded from a descriptor table (`s[24:25]`) at a **runtime-computed** offset (`vcc_hi` derived
+from `s64`, itself loaded from another table). The recompiler resolves descriptors by matching a **static**
+s_load immediate offset (`sreg_srt`/`by_srt_offset`); a computed offset can't be matched statically. The
+`direct_resource_offset[8]=16/[10]=18` entries do NOT rescue it — the fetch's SRSRC is the dynamically
+loaded `s[8:11]`, not `s[16:19]`, and s16/s18 don't even hold clean V#s here (guarded out).
+
+**NEXT (the real remaining frontier — a recompiler feature, not a descriptor read):** resolve
+bindless-dynamic vertex fetch. Two viable approaches:
+1. **Constant-fold the setup chain** at recompile time: the offset (`vcc_hi`) is computed from
+   scalar-constant inputs (`s64` ← a table load ← user-data pointers), so a small scalar interpreter over
+   the prologue could evaluate the concrete V# address, read it from guest memory, and bind it. Correct but
+   involved (must model the s_load chain + the ALU that computes the index).
+2. **Higher-level vertex-input model:** recognize the NGG fetch-shader pattern and bind the draw's vertex
+   buffers from the draw state directly, bypassing per-lane V# resolution. Closer to how real drivers stage
+   a "fetch shader," but needs the draw's vertex-buffer table (VGT/attribute state) captured.
+Everything upstream is now correct and complete: full register state, real descriptors, real texture, PS
+recompiles. This is the one feature between here and the first rendered frame.

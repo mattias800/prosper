@@ -108,6 +108,8 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             uint32_t off = s.offset_dw();
             if ((uint64_t)off + 8 > num_user_sgprs) continue;   // T# (8 dwords) must fit in the block
             DecodedImageDescriptor d = decode_image_descriptor(&user_sgprs[off]);
+            if (d.base == 0 || d.width == 0 || d.height == 0 ||
+                d.width > 16384 || d.height > 16384) continue;  // skip a garbage/degenerate T#
             ShaderResource r;
             r.cls           = ResourceClass::Texture;
             r.format        = DataFormat::Unorm8;   // sampled UI textures are 8-bit UNORM RGBA
@@ -135,6 +137,13 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             if (reg == 0xffff) continue;
             if ((uint64_t)reg + 4 > num_user_sgprs) continue;   // V# (4 dwords) must fit in the block
             DecodedBufferDescriptor d = decode_buffer_descriptor(&user_sgprs[reg]);
+            // Plausibility guard: a real vertex-buffer V# has a non-zero base and a sane size. This
+            // game's vertex fetch is bindless-dynamic (the V# is s_loaded from a table at a computed
+            // offset, not placed directly at this SGPR), so direct_resource_offset here often points at
+            // non-descriptor SGPRs -> a garbage decode (e.g. size ~1.4 GB). Skip those rather than emit
+            // a bogus binding. (When the dynamic-fetch path is implemented, this direct case still holds
+            // for shaders that DO place the V# inline.)
+            if (d.base == 0 || d.size_bytes == 0 || d.size_bytes > 0x10000000u) continue;
             ShaderResource r;
             r.cls            = ResourceClass::VertexBuffer;
             r.format         = d.format;          // Float32 for this game (dfmt {4,11,13,14}, nfmt 7)
