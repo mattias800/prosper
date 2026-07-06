@@ -1,7 +1,11 @@
 # RDNA2→SPIR-V recompiler — remaining work
 
-**Date:** 2026-07-06. **Status: ~93.0% instruction coverage in-context; 34 of 41 shaders fully recompile —
-at the practical ceiling for THIS title.** Every bring-up-critical class is covered (position/blit/clear,
+**Date:** 2026-07-06. **Status: ~93.7% instruction coverage in-context; 38 of 41 shaders fully recompile.**
+(The earlier "34/41" was a coverage-tool undercount — it ran a per-instruction check that didn't credit
+`emit_body`'s loop/if reconstruction, so the MSAA-resolve loop shaders 031-034 were mis-flagged as blocked
+even though they recompile. Fixed 2026-07-06; true count is 38/41. **The only genuine remaining blocker is
+cross-lane `v_mbcnt`/`v_readlane` — the LDS wave-model — affecting the last 3 shaders**, one of which also
+uses `v_add_co_ci_u32`. See the wave-model design note below.) Every bring-up-critical class is covered (position/blit/clear,
 textured incl. 3D sampling + NSA, interpolated, image-copy 1D/2D/3D + arrayed + NSA + MSAA + MSAA_ARRAY,
 integer divide/modulo), plus the big structural features: counted-loop reconstruction (`OpLoopMerge`/
 `OpPhi`), divergent-if handling (EXEC-predicated linearization incl. provably-dead scalar writes),
