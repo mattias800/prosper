@@ -60,6 +60,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_hle_registered PRIVATE prosper_core)
   add_test(NAME hle_functions_registered COMMAND test_hle_registered)
 
+  add_executable(test_equeue_events tests/test_equeue_events.cpp)
+  target_link_libraries(test_equeue_events PRIVATE prosper_core)
+  add_test(NAME equeue_events COMMAND test_equeue_events)
+
   # UserService/libkernel startup stubs (HLE audit): getters write deterministic defaults; the
   # libkernel registration/hook calls resolve to benign OK no-ops.
   add_executable(test_service_getters tests/test_service_getters.cpp)

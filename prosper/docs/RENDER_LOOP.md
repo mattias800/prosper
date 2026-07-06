@@ -78,3 +78,29 @@ choreography advances) — a large, focused, likely reference/interactive effort
 punch-through experiment done with a human watching each cascade. This is the clear next milestone for the
 game's actual pixels; the recompiler and the offscreen `GpuState→frame` spine are both ready to receive
 real draws the moment it lands.
+
+## 2026-07-06 (later) — CORRECTION: the game gets much further than "no submit"
+Re-ran under `PROSPER_EVLOG=1 PROSPER_GFXLOG=1` (WSL Linux build) with new event-delivery tracing. The
+earlier "no SubmitDcb fires" claim was wrong — the game reaches deep into GfxDevice bring-up:
+- **Creates 35 shaders** (`sceAgcCreateShader`, types ps/vs/cs — so the recompiler WILL be exercised).
+- **`SubmitDcb #1`**: 71 dwords → 12 packets, **0 draws** (a state/setup submit, no geometry yet).
+- **`SubmitFlip bufidx=-1 flipmode=1 arg=0`**: one initial blank flip (no buffer presented).
+- Four equeues: `eq to wait flip`, `UnityFTMFlipQueue`, `EOP QUEUE`, `Flip Event Queue GfxDeviceAgc`.
+
+Two steady-state waiters (the frame loop), both spinning:
+- **Flip thread** `eboot+0x14bd47f` waits on *Flip Event Queue GfxDeviceAgc*. Our ~60 Hz pump posts flip
+  events here and they **are delivered** (traced 1167× with ident=0x1001, filter=−10). The thread's loop
+  (`0x14bd450`) processes each event and continues — flip handling is **working**.
+- **FTM thread** `eboot+0x14dfb43` waits on *UnityFTMFlipQueue* for **user event id=999**
+  (`sceKernelAddUserEvent(eq,999)` is called once). That user event is **never triggered**
+  (`sceKernelTriggerUserEvent` is called 0×), so this thread never advances.
+
+Root deadlock (unchanged in nature, now precisely located): the FTM user-event-999 producer and the
+PreloadManager work-queue producer both live **downstream of GPU-resource-upload completion**, which we
+never signal (no live GPU execution + no EOP writeback). Implementing the user/timer event sources for
+real (done this session — `sceKernelAddUserEvent/TriggerUserEvent/AddHRTimerEvent/AddTimerEvent`, was
+no-op) is correct HLE and verified by `test_equeue_events`, but does **not** unblock: the trigger call is
+itself gated by the upstream stall. Confirmed empirically — boot reaches the identical suspendPoint loop
+after the fix. **The GPU-execution build remains the real unblock.** New permanent `PROSPER_EVLOG` traces
+(event delivery `-> delivered N ev(s)`, and the user/timer registration+trigger lines) make this loop
+re-diagnosable in one run.

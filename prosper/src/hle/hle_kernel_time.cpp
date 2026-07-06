@@ -158,6 +158,9 @@ HLE(k_eq_wait)   {   // (eq, SceKernelEvent* ev, int num, int* out, SceKernelUse
     int n = 0; auto* ev = (SceKEvent*)P(a1);
     while (n < num && !s->ready.empty()) { if (ev) ev[n] = s->ready.front(); s->ready.pop_front(); n++; }
     if (a3) *(int32_t*)P(a3) = n;
+    if (evlog() && n > 0) fprintf(stderr, "[ev]   -> delivered %d ev(s) eq=0x%llx ra=eboot+0x%llx (ident=%lld filter=%d)\n",
+        n, (unsigned long long)a0, (unsigned long long)((uint64_t)__builtin_return_address(0) - 0x400000000ull),
+        (long long)(ev ? ev[0].ident : 0), (int)(ev ? ev[0].filter : 0));
     return 0;   // 0 = success (n events returned; n may be 0 on timeout)
 }
 HLE(k_eq_getcount){
@@ -167,14 +170,69 @@ HLE(k_eq_getcount){
     return (uint64_t)n;
 }
 
+// --- User + timer event sources (sceKernelAddUserEvent / TriggerUserEvent / AddHRTimerEvent /
+// AddTimerEvent). Previously no-ops, which starved any equeue the game feeds via these (e.g. Unity's
+// FTM queue registers user event id=999 and blocks on it). Now real: registration records the source;
+// a trigger (or timer expiry) posts a matching SceKernelEvent so WaitEqueue returns it. FreeBSD-style
+// negative filter ids: EVFILT_USER=-11, EVFILT_TIMER=-7 (PS5 SCE_KERNEL_EVFILT_* match FreeBSD). ---
+namespace {
+    constexpr int16_t EVFILT_USER  = -11;
+    constexpr int16_t EVFILT_TIMER = -7;
+    // Registered user-event sources: (eq,id) the game added and may later trigger. udata is captured
+    // at registration and echoed on trigger (matches orbis semantics where udata is bound at add-time).
+    struct UserReg { uint64_t eq; int64_t id; uint64_t udata; };
+    std::vector<UserReg> g_user_regs;   // guarded by g_eq_mx
+}
+HLE(k_add_user_event) {   // (eq, id, udata?) — register a user event source on the equeue
+    { std::lock_guard<std::mutex> lk(g_eq_mx); g_user_regs.push_back({ a0, (int64_t)a1, a2 }); }
+    if (evlog()) fprintf(stderr, "[ev] AddUserEvent eq=0x%llx id=%lld udata=0x%llx\n",
+        (unsigned long long)a0, (long long)a1, (unsigned long long)a2);
+    return 0;
+}
+HLE(k_trigger_user_event) {   // (eq, id, udata) — fire the user event: post it to the equeue
+    uint64_t udata = a2;
+    { std::lock_guard<std::mutex> lk(g_eq_mx);
+      for (auto& r : g_user_regs) if (r.eq == a0 && r.id == (int64_t)a1) { if (!udata) udata = r.udata; break; } }
+    SceKEvent e{}; e.ident = (int64_t)a1; e.filter = EVFILT_USER; e.udata = udata;
+    eq_post(a0, e);
+    if (evlog()) fprintf(stderr, "[ev] TriggerUserEvent eq=0x%llx id=%lld udata=0x%llx\n",
+        (unsigned long long)a0, (long long)a1, (unsigned long long)udata);
+    return 0;
+}
+// One-shot timer: post an EVFILT_TIMER event to the equeue after `usec` microseconds.
+static void post_after(uint64_t eq, int64_t id, uint64_t udata, uint64_t usec, int16_t filter) {
+    std::thread([eq, id, udata, usec, filter]{
+        struct timespec ts{ (time_t)(usec / 1000000), (long)((usec % 1000000) * 1000) };
+        nanosleep(&ts, nullptr);
+        SceKEvent e{}; e.ident = id; e.filter = filter; e.data = (int64_t)usec; e.udata = udata;
+        eq_post(eq, e);
+    }).detach();
+}
+HLE(k_add_hrtimer_event) {   // (eq, id, SceKernelTimespec* ts, udata) — orbis: 3rd arg is a timespec*
+    uint64_t usec = 1000;
+    if (a2) { const int64_t* ts = (const int64_t*)P(a2);   // { tv_sec, tv_nsec }
+              usec = (uint64_t)ts[0] * 1000000ull + (uint64_t)ts[1] / 1000ull; if (!usec) usec = 1000; }
+    post_after(a0, (int64_t)a1, a3, usec, EVFILT_TIMER);
+    if (evlog()) fprintf(stderr, "[ev] AddHRTimerEvent eq=0x%llx id=%lld usec=%llu\n",
+        (unsigned long long)a0, (long long)a1, (unsigned long long)usec);
+    return 0;
+}
+HLE(k_add_timer_event) {   // (eq, id, usec, udata) — coarse timer, same one-shot post
+    uint64_t usec = a2 ? a2 : 1000;
+    post_after(a0, (int64_t)a1, a3, usec, EVFILT_TIMER);
+    if (evlog()) fprintf(stderr, "[ev] AddTimerEvent eq=0x%llx id=%lld usec=%llu\n",
+        (unsigned long long)a0, (long long)a1, (unsigned long long)usec);
+    return 0;
+}
+
 void register_kernel_time_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
     R("sceKernelCreateEqueue", k_eq_create);   R("sceKernelDeleteEqueue", k_eq_delete);
     R("sceKernelWaitEqueue", k_eq_wait);        R("sceKernelGetEventCount", k_eq_getcount);
-    R("sceKernelAddHRTimerEvent", k_ok);        R("sceKernelAddUserEvent", k_ok);
-    R("sceKernelAddUserEventEdge", k_ok);       R("sceKernelTriggerUserEvent", k_ok);
+    R("sceKernelAddHRTimerEvent", k_add_hrtimer_event); R("sceKernelAddUserEvent", k_add_user_event);
+    R("sceKernelAddUserEventEdge", k_add_user_event);   R("sceKernelTriggerUserEvent", k_trigger_user_event);
     R("sceKernelDeleteUserEvent", k_ok);        R("sceKernelDeleteHRTimerEvent", k_ok);
-    R("sceKernelDeleteTimerEvent", k_ok);       R("sceKernelAddTimerEvent", k_ok);
+    R("sceKernelDeleteTimerEvent", k_ok);       R("sceKernelAddTimerEvent", k_add_timer_event);
     R("sceKernelGetProcessTimeCounter", k_get_ptc);
     R("sceKernelGetProcessTimeCounterFrequency", k_get_ptc_freq);
     R("sceKernelGetProcessTime", k_get_proc_time);
