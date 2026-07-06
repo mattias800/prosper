@@ -557,10 +557,15 @@ Reference-parsed the game's assets with UnityPy 1.25.0 (installed via apt python
 ⇒ **The shipped CubeBlur data is well-formed 2022.3.32f1**; a reference parser reads it without error. So the
 game's own (correct) runtime parser would too — **the deser desync is INDUCED BY OUR ENV**, not the data or a
 version mismatch. Combined with: nodes are sane, thousands of shaders parse fine, and the crash is
-worker-side — the prime suspect is **our HLE file I/O corrupting the `unity_builtin_extra` load buffer**
-(built-ins may take a different read path than the game `.assets`; the boot log shows some files are "not
-considered suitable for apr reads" → fallback path). **NEXT:** dump the exact bytes our HLE `read`/`pread`
-returns for `unity_builtin_extra` and diff against the on-disk file (byte-faithfulness test). If they differ,
-that is the root; if identical, look at decompression/memory or worker-thread dispatch. (Note: on-disk uses
-`m_NameIndex`+string-table while the crash buffer inlines strings, so compare at the FILE-read layer, not the
-parsed-structure layer.)
+worker-side. NOTE: our file reads (`hle_file.cpp`) are thin passthroughs over host `::pread`/`::read`, and
+the "not suitable for apr reads" line is Unity's OWN benign log (see 2026-07-06 overnight entry), not a
+fallback path of ours — so raw file I/O is likely faithful, weakening the file-corruption theory. Remaining
+env-induced candidates, ranked: (a) **guest→host pointer translation `P()`** handing the parser a
+wrong-but-valid buffer/cursor mid-parse; (b) **our allocator (malloc/mmap HLE) overlapping two regions** so a
+concurrent worker corrupts the load buffer (cf. the ~0xd4-byte zero hole seen mid-buffer); (c) the blob
+**decompression** path if our env mediates it; (d) a wrong return value from a Sony size/alloc query the
+transfer uses. **NEXT (decisive):** gate the node capture to the crash buffer only — chain-arm the `0xd4cec0`
+node bp on the 5th `0x1612c70` driver hit (reuse the existing `g_hwwatch_req` chaining) so only the crash
+record is single-stepped — then read the crash node's `[r8+8]`/`[r8+0x10]` + the element-size vtable result
+and compare to a known-good shader's. That pins whether the node offset/size or the element size is wrong,
+which distinguishes (a)/(b) from a data/decompression issue.
