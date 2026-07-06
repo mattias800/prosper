@@ -15,6 +15,7 @@
 #include <vector>
 #include <unordered_map>
 #include <mutex>
+#include <thread>
 #ifdef __linux__
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -484,8 +485,8 @@ HLE(k_tls_get_addr) {   // __tls_get_addr(tls_index* ti): ti[0]=module id, ti[1]
     // (a syscall, %fs-independent) in a mutex-guarded global map instead. CONFIDENCE: HIGH (root-caused
     // via gdb: SIGFPE in k_tls_get_addr with a corrupt thread_local map under a guest %fs).
     static std::mutex s_dtv_mx;
-    static std::unordered_map<long, std::unordered_map<uint64_t, void*>> s_dtv;   // tid -> (modid -> block)
-    long tid = (long)syscall(SYS_gettid);
+    static std::unordered_map<std::thread::id, std::unordered_map<uint64_t, void*>> s_dtv;   // per-thread DTV
+    std::thread::id tid = std::this_thread::get_id();   // portable per-OS-thread key (no %fs, no syscall)
     { std::lock_guard<std::mutex> lk(s_dtv_mx);
       auto& dtv = s_dtv[tid];
       auto it = dtv.find(modid);
