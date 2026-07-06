@@ -74,15 +74,19 @@ synchronously (GPU "done" the instant SubmitDcb returns → this IS the end-of-p
 Correct end-of-pipe semantics, on by default; `PROSPER_NO_EOP_WRITE=1` disables for bisection. Verified by
 `test_eop_write` (data_sel 1/2/3 + WRITE_DATA + overflow-clamp). Replaces the old `PROSPER_AGC_FENCE` scaffold.
 
-**Stage C — completion signaling + emulate the driver's post.**
-- Hook `GraphicsAddEqEvent` (`b0xyllnVY-I`) to record `(eq, id, udata)` as an EOP source (mirror shadPS4
-  `sceGnmAddEqEvent`). On submit completion, `TriggerEvent(eq, 0x40, EVFILT_GRAPHICS=-? , udata)` for each
-  registered EOP eq (mirror Kyty `TriggerEopEvent`). Harmless if the game never registers one.
+**Stage C — completion signaling + emulate the driver's post. (EOP hook DONE; game-crux is Stage D.)**
+- DONE: hook `GraphicsAddEqEvent` (`b0xyllnVY-I`, `g_gnm_add_eq_event`) records `(eq, id, udata)` as an EOP
+  source (`prosper_eq_add_eop`), and `agc_driver_submit_dcb` fires `prosper_eq_trigger_eop()` on each
+  completed submit → posts `SceKernelEvent{ident=id, filter=GraphicsCore(-14), data=id, udata}` to every
+  registered equeue (values pinned to shadPS4 `sceGnmAddEqEvent` + `equeue.h`). Harmless/inert if the game
+  never registers one. Verified by `test_equeue_events` (register id=0x40 → submit → `WaitEqueue` returns
+  the GfxEop event with the right ident/filter/data/udata).
 - Since our game uses the flip path + semaphores, also ensure `SubmitFlip` posts a real flip-completion
   (present + flip kevent) — already partially done via the ~60 Hz pump; make it fire on the actual submit.
-- The crux experiment: determine what posts the PreloadManager semaphore on hardware. Instrument which
-  thread would consume the EOP/flip event and post @0x18a83b5. Likely the GfxDevice render thread
-  (0xb0672a) waits for upload completion; once the executor signals it, it posts main's semaphore.
+- The crux experiment (Stage D, needs the boot): determine what posts the PreloadManager semaphore on
+  hardware. Instrument which thread would consume the EOP/flip event and post @0x18a83b5. Likely the
+  GfxDevice render thread (0xb0672a) waits for upload completion; once the executor signals it, it posts
+  main's semaphore. This is the one piece the EOP hook above does NOT cover for our specific target.
 
 **Stage D — close the loop on the game.** With A–C, boot and watch the stall: does the GfxDevice thread
 advance, submit draws (SubmitDcb with draws>0), and present? Iterate on the exact completion the producer

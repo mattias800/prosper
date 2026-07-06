@@ -109,6 +109,12 @@ namespace {
     std::unordered_map<uint64_t, EqState*> g_eqs;              // guest eq ptr -> state
     struct FlipReg { uint64_t eq; int64_t ident; uint64_t udata; };
     std::vector<FlipReg> g_flip_regs, g_vblank_regs;
+    // GPU end-of-pipe (EOP) event sources registered via sceGnmAddEqEvent / GraphicsAddEqEvent
+    // (NID b0xyllnVY-I). Mirrors shadPS4 sceGnmAddEqEvent: on submit completion the GPU interrupt
+    // triggers TriggerEvent(ident=id, filter=GraphicsCore, data=id, udata). id is GfxEop=0x40 (or a
+    // ComputeN ring id). Filter GraphicsCore=-14 (shadPS4 equeue.h).
+    constexpr int16_t EVFILT_GRAPHICS_CORE = -14;
+    std::vector<FlipReg> g_eop_regs;   // same (eq,id,udata) shape
     std::atomic<bool> g_pump_started{false};
 
     EqState* eq_find(uint64_t eq) { std::lock_guard<std::mutex> lk(g_eq_mx); auto it = g_eqs.find(eq); return it == g_eqs.end() ? nullptr : it->second; }
@@ -140,6 +146,21 @@ void prosper_eq_add_flip(uint64_t eq, int64_t ident, uint64_t udata) {
 void prosper_eq_add_vblank(uint64_t eq, int64_t ident, uint64_t udata) {
     { std::lock_guard<std::mutex> lk(g_eq_mx); g_vblank_regs.push_back({ eq, ident, udata }); }
     ensure_pump();
+}
+// Exposed to the AGC submit path (hle_agc.cpp). Register a GPU EOP event source (sceGnmAddEqEvent).
+void prosper_eq_add_eop(uint64_t eq, int64_t id, uint64_t udata) {
+    std::lock_guard<std::mutex> lk(g_eq_mx); g_eop_regs.push_back({ eq, id, udata });
+}
+// Fire the registered EOP events — called when a submit completes (our fold is synchronous, so submit
+// == GPU pipe drain == the EOP interrupt moment). Posts TriggerEvent(ident=id, filter=GraphicsCore,
+// data=id, udata) to each registered equeue, matching shadPS4's IRQ handler. Inert if none registered.
+void prosper_eq_trigger_eop() {
+    std::vector<FlipReg> regs;
+    { std::lock_guard<std::mutex> lk(g_eq_mx); regs = g_eop_regs; }
+    for (auto& r : regs) {
+        SceKEvent e{}; e.ident = r.ident; e.filter = EVFILT_GRAPHICS_CORE; e.data = r.ident; e.udata = r.udata;
+        eq_post(r.eq, e);
+    }
 }
 
 HLE(k_eq_create) {

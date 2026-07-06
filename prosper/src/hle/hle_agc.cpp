@@ -524,6 +524,10 @@ gpu::GpuState& agc_gpu_state() { static gpu::GpuState st; return st; }
 uint64_t g_submit_count = 0;
 }
 
+// EOP completion signaling (hle_kernel_time.cpp): fire the GPU end-of-pipe events the game registered
+// via sceGnmAddEqEvent. Our fold is synchronous, so a completed SubmitDcb == the GPU pipe having drained.
+void prosper_eq_trigger_eop();
+
 extern "C" void prosper_agc_submit_stats(uint64_t* submits, uint64_t* draws) {
     if (submits) *submits = g_submit_count;
     if (draws)   *draws   = (uint64_t)agc_gpu_state().draws.size();
@@ -535,6 +539,9 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     if (!p || !p->addr || !p->dw_num) return kAgcErrInvalidArg;
     size_t applied = gpu::run_command_buffer(p->addr, p->dw_num, agc_gpu_state());
     g_submit_count++;
+    // The submit has "completed" (synchronous fold): fire any registered GPU EOP events. Inert unless the
+    // game called sceGnmAddEqEvent (b0xyllnVY-I); the RELEASE_MEM label write already happened in apply().
+    prosper_eq_trigger_eop();
     // Stage A: if a live renderer has been registered (runtime binary wires a Vulkan device) and this
     // submit accumulated draws, execute the folded GpuState and present the frame. Inert (returns false)
     // on the pure-HLE path until a device is registered, so it never perturbs the existing boot behavior.

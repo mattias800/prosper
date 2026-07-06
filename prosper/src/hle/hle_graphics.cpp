@@ -140,6 +140,18 @@ namespace { bool evlog() { static int v = getenv("PROSPER_EVLOG") ? 1 : 0; retur
 // ~60 Hz pump posts events into the given equeue; the game's WaitEqueue then returns them.
 void prosper_eq_add_flip(uint64_t eq, int64_t ident, uint64_t udata);
 void prosper_eq_add_vblank(uint64_t eq, int64_t ident, uint64_t udata);
+void prosper_eq_add_eop(uint64_t eq, int64_t id, uint64_t udata);
+// sceGnmAddEqEvent / GraphicsAddEqEvent (NID b0xyllnVY-I): register a GPU EOP/compute-ring completion
+// event source on an equeue. Mirrors shadPS4 sceGnmAddEqEvent (id=GfxEop=0x40 for gfx). The submit path
+// (hle_agc.cpp) fires prosper_eq_trigger_eop() on completion. NOTE: our target (The Messenger) never
+// calls this — it uses the flip path + sync_on_address semaphores — so this is inert for it, but it is
+// the correct, ref-validated behavior for the general case and lets test_equeue_events verify the path.
+HLE(g_gnm_add_eq_event) {   // (eq, id, udata)
+    if (evlog()) fprintf(stderr, "[ev] GnmAddEqEvent eq=0x%llx id=0x%llx udata=0x%llx\n",
+        (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2);
+    prosper_eq_add_eop(a0, (int64_t)a1, a2);
+    return 0;
+}
 HLE(g_vo_open)        { gfx_tick(); return (uint64_t)(int64_t)(++g_vo_handle + 0x1000); }  // positive handle
 HLE(g_vo_close)       { return 0; }
 // sceVideoOutAddFlipEvent(eq, handle, udata): register a flip-completion event source on an equeue.
@@ -350,6 +362,7 @@ void register_graphics_hle() {
     RN("rKBUtgRrtbk", g_vo_register_buffers2);       // sceVideoOutRegisterBuffers2
     RN("utPrVdxio-8", g_vo_get_output_status);        // sceVideoOutGetOutputStatus
     RN("w0hLuNarQxY", g_vo_configure_output);          // sceVideoOutConfigureOutput
+    RN("b0xyllnVY-I", g_gnm_add_eq_event);             // sceGnmAddEqEvent / GraphicsAddEqEvent (GPU EOP)
     #undef R
     #undef RN
 }
