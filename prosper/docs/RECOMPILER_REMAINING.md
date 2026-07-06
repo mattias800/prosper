@@ -23,18 +23,21 @@ were rejected), all with source+output modifiers. This is a real fidelity gain f
 shaders (they use fma/mad/med3/pkrtz **with** modifiers) — "recompiles" now also means "computes the right
 values". Not a shader-count change; the remaining 030/037/038 are still cross-lane-blocked (below).
 
-**REMAINING BLOCKERS — ACTUAL BREAKDOWN (2026-07-06, from `shader_histo` first-truly-unsupported-per-shader):**
+**REMAINING BLOCKERS — ACTUAL BREAKDOWN (2026-07-06, from `shader_histo` first-truly-unsupported-per-shader,
+opcodes confirmed via llvm-mc round-trip disasm; SDWA source-modifiers now DONE so VOP2 0x8 is cleared):**
 | Blocker | Op | # shaders | Tractability |
 |---|---|---|---|
-| **s_branch (unconditional)** | SOPP 0x4 | **4** | control-flow — needs general forward-branch/CFG handling (the recompiler does structured if/loop but not arbitrary s_branch). **The LARGEST remaining gap — and likely more tractable than the wave model.** |
-| **v_mbcnt_lo_u32_b32** | VOP3 0x365 | 2 | cross-lane — needs the workgroup/LDS wave-model (see design note below). Approximation `mbcnt=lane_id` holds only for full EXEC. |
-| **v_mul_f32 SDWA source-negate** | VOP2 0x8 | 1 | bounded — extend SDWA decode to carry src neg/abs (like VOP3) + apply in the VOP2 float path (the VOP3 fv() machinery already exists). |
+| **s_cbranch_scc0** (uniform cond. branch) | SOPP 0x4 | **4** | control-flow — a *scalar-uniform* if (all lanes same path). The recompiler linearizes divergent (EXEC) ifs and reconstructs loops, but rejects forward scalar branches. Needs structured OpSelectionMerge on the SCC bool. **Largest gap; tractable via the existing block/phi machinery but real CFG work.** |
+| **v_mbcnt_lo_u32_b32** | VOP3 0x365 | 2 | cross-lane — needs the workgroup/LDS wave-model (design note below). `mbcnt=lane_id` holds only for full EXEC. |
+| **v_add_co_ci_u32_e64** (add w/ carry-in+out) | VOP3 0x128 | 1 | bounded — sum=s0+s1+carryin(VCC/sgpr bool); carryout→mask. Common in 64-bit address math. This shader ALSO needs mbcnt, so fixing it alone completes 0 shaders (marginal for THIS title). |
 
-This corrects the earlier "remaining = cross-lane only" framing: the biggest blocker is actually **s_branch
-control flow (4 shaders)**, not the wave ops. All are correctly REJECTED rather than faked (correctness-first),
-and none is on the first-frame path (frames are gated on the GPU-executor build, not the recompiler). Next
-recompiler wins in priority order: (1) structured s_branch → +4 shaders; (2) SDWA source modifiers → +1;
-(3) the LDS wave-model → +2 (mbcnt/readlane).
+Corrects the earlier notes: SOPP 0x4 is **s_cbranch_scc0** (uniform conditional), NOT unconditional s_branch;
+and VOP2 0x8 (SDWA source-negate) is **now handled** (SDWA neg/abs decode+apply landed, kernels 59/60), which
+moved shader-030's first blocker forward to VOP3 0x128. All remaining are correctly REJECTED rather than
+faked, and none is on the first-frame path (frames gated on the GPU-executor, not the recompiler). Next wins
+in priority: (1) structured s_cbranch_scc0 → +4 shaders (biggest); (2) LDS wave-model → +2 (mbcnt/readlane);
+(3) v_add_co_ci_u32 → correctness/coverage for address math (0 completions here). Coverage now 93.2%
+in-context (unsupported 107), 34/41 shaders.
 
 **The recompiler is DONE for this title.** Reaching the game's actual pixels is now gated on the GPU-
 execution / render-loop frontier (see `RENDER_LOOP.md`), not the recompiler.
