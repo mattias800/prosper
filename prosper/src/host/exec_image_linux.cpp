@@ -553,11 +553,23 @@ namespace {
         // Fault on a thread with no recovery point (a guest worker thread). Report where
         // (async-signal-safe write) then terminate cleanly instead of a cross-thread longjmp.
         {
-            char b[160];
-            int n = snprintf(b, sizeof b, "[prosper] WORKER-THREAD FAULT: sig=%d addr=%p rip=0x%llx (image+0x%llx)\n",
+            char b[200];
+            int n = snprintf(b, sizeof b, "[prosper] WORKER-THREAD FAULT: sig=%d addr=%p rip=0x%llx (image+0x%llx) rbp=0x%llx\n",
                              sig, g_fault_addr, (unsigned long long)g_fault_rip,
-                             (unsigned long long)(g_base && g_fault_rip >= g_base ? g_fault_rip - g_base : g_fault_rip));
+                             (unsigned long long)(g_base && g_fault_rip >= g_base ? g_fault_rip - g_base : g_fault_rip),
+                             (unsigned long long)g_rbp);
             write(2, b, n);
+            // Classify the fault rip + fault-addr regions (which mapping / module) and dump the instruction
+            // bytes at rip — turns the ASLR-relocated "rip=0x...48b" into an identifiable location.
+            classify_addr(g_fault_rip);
+            classify_addr((uint64_t)g_fault_addr);
+            auto rdb = [](uint64_t a) -> unsigned { return probe_readable(a) ? *(const uint8_t*)a : 0x100u; };
+            char ib[160]; int m = snprintf(ib, sizeof ib,
+                "[prosper]   insn bytes @rip: %02x %02x %02x %02x %02x %02x %02x %02x  ret@[rsp]=0x%llx\n",
+                rdb(g_fault_rip), rdb(g_fault_rip+1), rdb(g_fault_rip+2), rdb(g_fault_rip+3),
+                rdb(g_fault_rip+4), rdb(g_fault_rip+5), rdb(g_fault_rip+6), rdb(g_fault_rip+7),
+                (unsigned long long)(probe_readable(g_rsp) ? *(const uint64_t*)g_rsp : 0));
+            write(2, ib, m);
         }
         _exit(90);
     }

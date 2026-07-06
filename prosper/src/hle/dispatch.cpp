@@ -1,5 +1,6 @@
 #include "dispatch.hpp"
 #include <unordered_map>
+#include <mutex>
 
 namespace prosper {
 
@@ -15,6 +16,11 @@ namespace {
     std::vector<uint32_t>            g_order;      // first-seen import indices
     std::unordered_map<uint32_t, uint64_t> g_count; // index -> call count
     volatile int*                    g_progress = nullptr;
+    // Guards g_order/g_count/g_progress. prosper_on_unimpl runs on ANY guest thread, and once real
+    // multithreaded rendering is active (-force-gfx-direct/guest-fs), many worker threads call
+    // unimplemented imports concurrently — an unlocked g_count[idx] insert + g_order.push_back races and
+    // corrupts the containers (observed: a SIGSEGV inside prosper_on_unimpl on a worker thread).
+    std::mutex                       g_unimpl_mx;
 }
 
 void dispatch_set_progress(volatile int* counter) { g_progress = counter; }
@@ -37,6 +43,7 @@ const std::vector<uint32_t>& call_order() { return g_order; }
 
 extern "C" uint64_t prosper_on_unimpl(uint64_t import_index) {
     uint32_t idx = (uint32_t)import_index;
+    std::lock_guard<std::mutex> lk(g_unimpl_mx);   // serialize concurrent worker-thread unimpl calls
     uint64_t c = ++g_count[idx];
     if (c == 1) {
         g_order.push_back(idx);
