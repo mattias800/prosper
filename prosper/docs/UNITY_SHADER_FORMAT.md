@@ -71,11 +71,40 @@ The reader reads a garbage `{count}` (`0x400` at buffer offset `0x7a20`) for an 
 reading "strings" out of the shader bytecode, and reads a garbage length at `0x7f70` → `alloc(~16 EiB)` →
 null → `movb $0,[0]` crash at `eboot+0x46beb4`. The reader's bounds check (`cursor+4 ≤ end`) PASSES, so the
 `end` is correct — the CURSOR is mis-positioned within valid bounds from an upstream field read with the
-wrong size. No clean `202012090` magic appears near the crash in a 103KB dump (the one at rel-base `0x2568`
-is coincidental — parsing from it yields garbage stats), so the crash is likely in the typetree string
-table / param reflection rather than a blob `ShaderSubProgram`, OR the record layout isn't statically
-anchorable. **Open:** why the game misparses its own (correctly-decompressed — strings are valid) shader
-data. Static byte-analysis has been exhausted; the decisive next step is a LIVE cursor trace of the crash
-record's parse — feasible now that single-step works under guest-fs and the deser driver `eboot+0x1612c70`
-is hit only 6 times (the 6th is the crash): HWBP that driver, and on hit 6 trace the cursor advances to
-find the one field read with the wrong size.
+wrong size.
+
+### Confirmed this session (Fable collaboration + static walk of the 103KB reader-buffer dump)
+
+- **Layer = typetree `m_Parameters`, NOT the LZ4 blob.** No `202012090` magic near the crash (the one at
+  rel-base `0x2568` is coincidental). The bytes decode cleanly as Fable's typetree `SerializedProgramParameters`:
+  16-byte `VectorParameter`/`MatrixParameter` records (`{s32 nameIdx; s32 index; s32 arraySize; s8 type; s8 dim; 2pad}`)
+  and `ConstantBuffer` records. Verified anchor at buffer off `0x7080`: a clean CB — `nameIdx=5`, mat 0,
+  **vec 3** (three floats, index 0/4/8, type=0 Float dim=1), struct 0, `m_Size=0x10`, `isPartialCB=1`.
+- **`0x400` is NOT a cbuffer `m_Size`.** Forward-parsing the CB array from `0x7080` shows the real cbuffers
+  are tiny; by the 8th "CB" the parse walks into the `<none>` string bytes. So Fable's MED-confidence
+  `0x400=UnityStereoGlobals.m_Size` did not hold — the `0x7a20` divergence is in a LATER subprogram in the
+  `m_SubPrograms`/`m_PlayerSubPrograms` stream, reached after an upstream field-size/align desync.
+- **prosper has NO Unity shader-reflection/typetree parser** (only `gpu/agc_shader_layout.cpp` = RDNA2 GPU
+  resource binding, unrelated). So the crashing reader is **100% game-side Unity 2022.3 code** on a buffer
+  prosper does not produce. ⇒ the bug is EITHER (a) data our env emitted diverges from 2022.3 layout, OR
+  (b) a value we fed upstream flipped the parse dispatch. CubeBlur is the FIRST built-in with populated
+  stereo variants (`m_PlayerSubPrograms` non-empty, odd-length `m_KeywordIndices` needing align-pad,
+  `UnityStereoGlobals`); a reader with a 2021.2-shaped model silently survives every earlier shader (empty
+  fields read as 0) and dies only here.
+
+### Fable's three ranked off-by-one candidates (deficit arithmetic distinguishes them)
+
+1. `m_ShaderRequirements` consumed as **s32 (4B) instead of s64 (8B)** — 2022.x widened it. Deficit = 4 ×
+   subprograms parsed. **Top suspect.**
+2. Missing **align-to-4 after the odd-count `u16[]`** arrays (`m_KeywordIndices`/`m_Channels`). Deficit = 2
+   per odd-length array (CubeBlur's per-variant keyword arrays are count=1 = odd; most shaders are 0/even).
+3. Missing **`m_IsPartialCB`+3pad** per ConstantBuffer (2021.1+). Deficit = 4 per cbuffer.
+
+### Decisive next step — LIVE cursor trace
+
+Static byte-analysis is exhausted (the data itself parses clean to 2022.3; the desync is dynamic/cumulative).
+HWBP the deser driver `eboot+0x1612c70` (hit only ~6 times; the last is the crash), and on the crash-shader
+invocation trace the cursor advances field-by-field. At the divergence cursor, per Fable: confirm 16-byte
+stride with byte12∈{0..5}/byte13∈{1..4}, walk back to the enclosing `SerializedSubProgram` start, and check
+in order (a) requirements consumed as 8B, (b) odd u16[] arrays 4-aligned, (c) `m_IsPartialCB`+pad consumed.
+The cursor-deficit arithmetic (4×subprograms vs 2×odd-arrays vs 4×cbuffers) names the single mis-sized field.
