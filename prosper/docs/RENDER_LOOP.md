@@ -544,3 +544,23 @@ game's `Hidden/CubeBlur` with UnityPy/AssetRipper — if it parses clean, the sh
 (2) gate the node capture to the crash buffer only (arm `0xd4cec0` after the 5th `0x1612c70` driver hit) to
 read the crash node's offset/size + the element-size vtable result without perturbing the whole boot.
 (3) understand why `-force-gfx-direct` routes this deser onto a worker and whether the worker path differs.
+
+## 2026-07-06 (cont.) — ⭐ REFERENCE PARSE: the data is well-formed; the desync is ENV-INDUCED
+
+Reference-parsed the game's assets with UnityPy 1.25.0 (installed via apt python3-pip):
+- Game assets (`resources.assets`, `globalgamemanagers.assets`): all **58 shaders parse clean**; none is
+  CubeBlur — it is a BUILT-IN shader.
+- `Media/Resources/unity_builtin_extra` = a clean **2022.3.32f1** SerializedFile; **`Hidden/CubeBlur`
+  (pathid 15104) parses perfectly** (2 subshaders, 4 props, 4 keywords). All 43 built-ins parse.
+- (Aside: `unity default resources` is **2022.3.26f1** — a different sub-version — but CubeBlur is not in it.)
+
+⇒ **The shipped CubeBlur data is well-formed 2022.3.32f1**; a reference parser reads it without error. So the
+game's own (correct) runtime parser would too — **the deser desync is INDUCED BY OUR ENV**, not the data or a
+version mismatch. Combined with: nodes are sane, thousands of shaders parse fine, and the crash is
+worker-side — the prime suspect is **our HLE file I/O corrupting the `unity_builtin_extra` load buffer**
+(built-ins may take a different read path than the game `.assets`; the boot log shows some files are "not
+considered suitable for apr reads" → fallback path). **NEXT:** dump the exact bytes our HLE `read`/`pread`
+returns for `unity_builtin_extra` and diff against the on-disk file (byte-faithfulness test). If they differ,
+that is the root; if identical, look at decompression/memory or worker-thread dispatch. (Note: on-disk uses
+`m_NameIndex`+string-table while the crash buffer inlines strings, so compare at the FILE-read layer, not the
+parsed-structure layer.)
