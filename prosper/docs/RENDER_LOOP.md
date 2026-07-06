@@ -334,8 +334,11 @@ activated. stub_size bumped 32→96 for the larger stub. **Result:** with `PROSP
 PROSPER_GUEST_ARGS="-force-gfx-direct"` the `eboot+0xa9c0bb` crash is GONE (exit 90→124) — `[TP-0xa8]` now
 reads its zero-init guest slot, `0xa99d50` lazy-allocs correctly, and the game runs stably past gfx/audio
 init. Gated OFF by default (Linux 45/45 + Windows 20/20 unchanged; `PROSPER_GUEST_FS=1` alone reaches the
-identical baseline stall = mechanism sound). NEXT: the game is again in a `suspendPoint`/no-draws loop after
-this fix — characterize the new (post-TLS) stall in direct mode. CONFIDENCE: HIGH.
+identical baseline stall = mechanism sound). With both flags the boot now progresses THROUGH gfx init →
+audio init → **input/IME init** (`sceImeKeyboardGetInfo`/`sceImeUpdate`, further than any prior state) and
+settles into a slow `suspendPoint`/no-draws frame loop (still just the 1 setup submit, 0 draws). NEXT:
+characterize why the direct-mode frame loop doesn't reach a draw submit (each fix so far has peeled another
+init layer — gfx→audio→IME). CONFIDENCE: HIGH.
 
 ## 2026-07-06 — GPU-executor Stages A/B/C landed; correct EOP writes CONFIRMED live (still not the unblock)
 Built the GPU executor per `docs/GPU_EXECUTOR_DESIGN.md` (all committed, Linux 45/45 + Windows 20/20):
