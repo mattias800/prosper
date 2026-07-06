@@ -14,12 +14,14 @@ namespace {
 
     // unimplemented-call bookkeeping
     std::vector<uint32_t>            g_order;      // first-seen import indices
-    std::unordered_map<uint32_t, uint64_t> g_count; // index -> call count
+    // Call count per import index. A pre-sized VECTOR (not an unordered_map): indexed directly by idx, it
+    // never hashes or rehash-allocates on the hot path. The map form crashed inside prosper_on_unimpl on a
+    // worker thread (a rehash allocation racing under heavy concurrent unimpl traffic during live render);
+    // a fixed vector eliminates that whole class. Sized once from the import table (dispatch_init).
+    std::vector<uint64_t>            g_count;      // index -> call count (index-addressed, no alloc after init)
     volatile int*                    g_progress = nullptr;
-    // Guards g_order/g_count/g_progress. prosper_on_unimpl runs on ANY guest thread, and once real
-    // multithreaded rendering is active (-force-gfx-direct/guest-fs), many worker threads call
-    // unimplemented imports concurrently — an unlocked g_count[idx] insert + g_order.push_back races and
-    // corrupts the containers (observed: a SIGSEGV inside prosper_on_unimpl on a worker thread).
+    // Guards g_order/g_count/g_progress against concurrent worker-thread unimpl calls (many under
+    // -force-gfx-direct/guest-fs). The lock is cheap; the state changes are tiny.
     std::mutex                       g_unimpl_mx;
 }
 
@@ -39,13 +41,19 @@ const char* Hle::name_of(const std::string& nid) {
     return it == registry().end() ? "" : it->second.name.c_str();
 }
 
-void dispatch_init(const std::vector<ImportSlot>* slots, NidDb* db) { g_slots = slots; g_db = db; }
-void reset_call_log() { g_order.clear(); g_count.clear(); }
+void dispatch_init(const std::vector<ImportSlot>* slots, NidDb* db) {
+    g_slots = slots; g_db = db;
+    // Pre-size the call-count vector to the import table so prosper_on_unimpl never allocates.
+    if (slots) { std::lock_guard<std::mutex> lk(g_unimpl_mx); g_count.assign(slots->size(), 0); }
+}
+void reset_call_log() { std::lock_guard<std::mutex> lk(g_unimpl_mx); g_order.clear();
+                        for (auto& c : g_count) c = 0; }
 const std::vector<uint32_t>& call_order() { return g_order; }
 
 extern "C" uint64_t prosper_on_unimpl(uint64_t import_index) {
     uint32_t idx = (uint32_t)import_index;
     std::lock_guard<std::mutex> lk(g_unimpl_mx);   // serialize concurrent worker-thread unimpl calls
+    if (idx >= g_count.size()) return 0;           // out-of-range import index: ignore (no alloc, no fault)
     uint64_t c = ++g_count[idx];
     if (c == 1) {
         g_order.push_back(idx);

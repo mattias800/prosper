@@ -87,6 +87,14 @@ int main(int argc, char** argv) {
         prosper::gpu::set_submit_renderer(
             [](const std::vector<uint32_t>& vs, const std::vector<uint32_t>& fs,
                const prosper::gpu::ResolvedPipelineState& ps, uint32_t w, uint32_t h) {
+                // Dump the recompiled SPIR-V FIRST (before the slow Vulkan render), so it survives even if
+                // a concurrent worker fault kills the process mid-render — lets us spirv-val it offline.
+                if (getenv("PROSPER_SHADER_DUMP")) {
+                    std::string d = getenv("PROSPER_SHADER_DUMP");
+                    if (FILE* f = fopen((d + "/frame_vs.spv").c_str(), "wb")) { fwrite(vs.data(), 4, vs.size(), f); fclose(f); }
+                    if (FILE* f = fopen((d + "/frame_fs.spv").c_str(), "wb")) { fwrite(fs.data(), 4, fs.size(), f); fclose(f); }
+                    fprintf(stderr, "[render] dumped SPIR-V vs=%zu fs=%zu dwords\n", vs.size(), fs.size()); fflush(stderr);
+                }
                 std::vector<uint8_t> px = prosper::test::render_triangle_rgba(vs, fs, w, h, &ps);
                 int n = frame_no++;
                 if (px.empty()) {
