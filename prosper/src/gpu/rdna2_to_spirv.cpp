@@ -1279,7 +1279,19 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 uint32_t sh = b.ibin(Op_BitwiseAnd, val(in.src[2]), b.uconst(31));
                 vreg[in.dst.value] = b.ibin(Op_ShiftLeftLogical, b.ibin(Op_IAdd, val(in.src[0]), val(in.src[1])), sh);
             } else if (in.opcode == 0x12F) {                          // v_cvt_pkrtz_f16_f32 = pack(s0->lo, s1->hi)
-                vreg[in.dst.value] = b.pack_half2x16(val(in.src[0]), val(in.src[1]));
+                vreg[in.dst.value] = b.pack_half2x16(fv(0), fv(1));    // float sources honor neg/abs modifiers
+            } else if (in.opcode == 0x103) {                          // v_add_f32 (VOP3 form)
+                vreg[in.dst.value] = fresult(b.fbin(Op_FAdd, fv(0), fv(1)));
+            } else if (in.opcode == 0x104) {                          // v_sub_f32 (VOP3 form) = s0 - s1
+                vreg[in.dst.value] = fresult(b.fbin(Op_FSub, fv(0), fv(1)));
+            } else if (in.opcode == 0x105) {                          // v_subrev_f32 (VOP3 form) = s1 - s0
+                vreg[in.dst.value] = fresult(b.fbin(Op_FSub, fv(1), fv(0)));
+            } else if (in.opcode == 0x108) {                          // v_mul_f32 (VOP3 form)
+                vreg[in.dst.value] = fresult(b.fbin(Op_FMul, fv(0), fv(1)));
+            } else if (in.opcode == 0x10F) {                          // v_min_f32 (VOP3 form)
+                vreg[in.dst.value] = fresult(b.fext2(Glsl_FMin, fv(0), fv(1)));
+            } else if (in.opcode == 0x110) {                          // v_max_f32 (VOP3 form)
+                vreg[in.dst.value] = fresult(b.fext2(Glsl_FMax, fv(0), fv(1)));
             } else if (in.opcode == 0x107) {                          // v_mul_legacy_f32 ~= s0*s1
                 vreg[in.dst.value] = fresult(b.fbin(Op_FMul, fv(0), fv(1)));
             } else if (in.opcode == 0x101) {                          // v_cndmask_b32_e64: src2_mask ? src1 : src0

@@ -1009,6 +1009,40 @@ int main() {
     printf("  kernel55 mismatches=%u (out[80]=%g expect=%g)\n", bad55, got55.size()==N?got55[80]:-1, exp55[80]);
     CHECK(got55.size()==N && bad55==0, "recompiled kernel 55 (VOP3 omod mul:2: 2*(a0*a1+a2)) correct");
 
+    // Kernels 56-58: VOP3-encoded VOP2 float ops (were rejected) with modifiers.
+    // 56: v_add_f32_e64 v3, -v0, v1  = -a0 + a1  (VOP3 v_add_f32 0x103 + neg src0).
+    const uint32_t code56[] = { 0xD5030003u, 0x20020300u, 0xBF810000u };
+    std::vector<uint32_t> spv56 = recompile_valu(code56, 3, 2, 3);
+    CHECK(!spv56.empty(), "recompiled kernel 56 (VOP3 v_add_f32 -src0) -> SPIR-V");
+    std::vector<float> in56(N*2), exp56(N);
+    for (uint32_t i=0;i<N;i++){ float a0=(float)i*0.1f-3.0f,a1=(float)i*0.05f+2.0f; in56[i*2]=a0; in56[i*2+1]=a1; exp56[i]=-a0+a1; }
+    std::vector<float> got56 = prosper::test::run_compute(spv56, in56, N, N);
+    uint32_t bad56=0; for(uint32_t i=0;i<N&&got56.size()==N;i++) if(std::fabs(got56[i]-exp56[i])>1e-3f) bad56++;
+    printf("  kernel56 mismatches=%u (out[40]=%g expect=%g)\n", bad56, got56.size()==N?got56[40]:-1, exp56[40]);
+    CHECK(got56.size()==N && bad56==0, "recompiled kernel 56 (VOP3 v_add_f32 -a0+a1) correct");
+
+    // 57: v_mul_f32_e64 v3, v0, |v1|  = a0 * |a1|  (VOP3 v_mul_f32 0x108 + abs src1).
+    const uint32_t code57[] = { 0xD5080203u, 0x00020300u, 0xBF810000u };
+    std::vector<uint32_t> spv57 = recompile_valu(code57, 3, 2, 3);
+    CHECK(!spv57.empty(), "recompiled kernel 57 (VOP3 v_mul_f32 |src1|) -> SPIR-V");
+    std::vector<float> in57(N*2), exp57(N);
+    for (uint32_t i=0;i<N;i++){ float a0=(float)i*0.1f-2.0f,a1=(float)i*0.07f-4.0f; in57[i*2]=a0; in57[i*2+1]=a1; exp57[i]=a0*std::fabs(a1); }
+    std::vector<float> got57 = prosper::test::run_compute(spv57, in57, N, N);
+    uint32_t bad57=0; for(uint32_t i=0;i<N&&got57.size()==N;i++) if(std::fabs(got57[i]-exp57[i])>1e-3f) bad57++;
+    printf("  kernel57 mismatches=%u (out[10]=%g expect=%g)\n", bad57, got57.size()==N?got57[10]:-1, exp57[10]);
+    CHECK(got57.size()==N && bad57==0, "recompiled kernel 57 (VOP3 v_mul_f32 a0*|a1|) correct");
+
+    // 58: v_max_f32_e64 v3, v0, v1  = max(a0,a1)  (VOP3 v_max_f32 0x110).
+    const uint32_t code58[] = { 0xD5100003u, 0x00020300u, 0xBF810000u };
+    std::vector<uint32_t> spv58 = recompile_valu(code58, 3, 2, 3);
+    CHECK(!spv58.empty(), "recompiled kernel 58 (VOP3 v_max_f32) -> SPIR-V");
+    std::vector<float> in58(N*2), exp58(N);
+    for (uint32_t i=0;i<N;i++){ float a0=(float)i*0.1f-6.0f,a1=(float)i*-0.03f+1.0f; in58[i*2]=a0; in58[i*2+1]=a1; exp58[i]=a0>a1?a0:a1; }
+    std::vector<float> got58 = prosper::test::run_compute(spv58, in58, N, N);
+    uint32_t bad58=0; for(uint32_t i=0;i<N&&got58.size()==N;i++) if(std::fabs(got58[i]-exp58[i])>1e-3f) bad58++;
+    printf("  kernel58 mismatches=%u (out[90]=%g expect=%g)\n", bad58, got58.size()==N?got58[90]:-1, exp58[90]);
+    CHECK(got58.size()==N && bad58==0, "recompiled kernel 58 (VOP3 v_max_f32) correct");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
