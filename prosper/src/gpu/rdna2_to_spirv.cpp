@@ -3,6 +3,8 @@
 #include "rdna2_decode.hpp"
 #include "shader_resources.hpp"
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <set>
 #include <unordered_map>
@@ -1187,10 +1189,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0xC6: cmp = b.ucmp(Op_UGreaterThanEqual, a, c); break;    // v_cmp_ge_u32
                 default: ok = false;
             }
-            // A compare result is a per-lane mask; track VCC's narrowed-state in sync with its value so a
-            // later `s_mov_b64 exec, vcc` restores the correct exec_narrowed (106/107 = VCC_LO/HI).
-            if (ok) { vcc = cmp; rs.sreg_bool_narrowed[106] = true; rs.sreg_bool_narrowed[107] = true;
-                      if (is_cmpx) { rs.exec = b.land(rs.exec, cmp); rs.exec_narrowed = true; } }
+            // A compare result is a per-lane mask. The e64/SDWAB form can target an SGPR pair (SDST)
+            // instead of VCC — track it in sreg_bool so a later v_cndmask_b32_e64 / s_cselect can read it.
+            // Otherwise it writes VCC; keep VCC's narrowed-state in sync (106/107 = VCC_LO/HI).
+            if (ok) {
+                if (in.dst.kind == OperandKind::SGPR && in.dst.value <= 105) {
+                    rs.sreg_bool[in.dst.value] = cmp; rs.sreg_bool_narrowed[in.dst.value] = true;
+                } else {
+                    vcc = cmp; rs.sreg_bool_narrowed[106] = true; rs.sreg_bool_narrowed[107] = true;
+                }
+                if (is_cmpx) { rs.exec = b.land(rs.exec, cmp); rs.exec_narrowed = true; }
+            }
             return true;
         }
         case Rdna2Format::VOP3: {
@@ -1603,7 +1612,15 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             if (in.pc < pc_lo) continue;
             if (in.fmt == Rdna2Format::EXP) { if (!exp_fn(in)) return false; continue; }
             bool ok = true;
-            if (!emit_alu(b, rs, in, ok, allow_exec_update, &safe, allow_smem, rt) || !ok) return false;
+            if (!emit_alu(b, rs, in, ok, allow_exec_update, &safe, allow_smem, rt) || !ok) {
+                // PROSPER_DBG (gated, off by default): report the instruction that fails recompilation —
+                // the first unsupported op / unresolved resource that makes a shader return empty.
+                if (getenv("PROSPER_DBG"))
+                    fprintf(stderr, "[recompile-reject] pc=%u fmt=%d op=0x%x dst=%d(kind%d) dmask=0x%x dim=%u len=%u\n",
+                        in.pc, (int)in.fmt, in.opcode, in.dst.value, (int)in.dst.kind,
+                        in.mimg_dmask, in.mimg_dim, in.len_dwords);
+                return false;
+            }
         }
         return true;
     };

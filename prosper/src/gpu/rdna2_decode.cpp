@@ -80,7 +80,9 @@ void decode_operands(Rdna2Inst& i) {
                 i.src[0] = ((sd >> 23) & 1u) ? decode_src_field(sd & 0xFFu)     : vgpr(sd & 0xFFu);
                 i.src[1] = ((sd >> 31) & 1u) ? decode_src_field((w >> 9) & 0xFFu) : vgpr((w >> 9) & 0xFFu);
                 i.n_src = 2;
-                // VOPC SDWA has NO dst_sel/clamp/omod (byte1 is 0 — the result is VCC, not a VGPR); trivial
+                // SDWAB: bit15 = SD (write the SDST SGPR pair instead of VCC), bits[14:8] = SDST index.
+                if ((sd >> 15) & 1u) i.dst = sgpr((sd >> 8) & 0x7Fu);
+                // VOPC SDWA has NO dst_sel/clamp/omod (byte1 holds SDST/SD, not a VGPR dst_sel); trivial
                 // iff both source selects are DWORD and no source modifiers.
                 if (((sd >> 16) & 7u) == 6u && ((sd >> 24) & 7u) == 6u &&
                     !((sd >> 19) & 0xFu) && !((sd >> 27) & 0xFu))
