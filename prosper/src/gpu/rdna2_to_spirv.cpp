@@ -1833,6 +1833,17 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
     SpirvCompute b; b.begin(1);
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
     auto safe_branches = safe_execz_branches(ins);
+    // emit_alu is a per-instruction check and rejects control-flow branches, but the whole-stream emit_body
+    // RECONSTRUCTS a counted loop and a forward uniform-if. Credit the branches emit_body consumes (loop
+    // back-edge + exit, and the forward-if branch) as handled, so coverage matches what actually recompiles
+    // (previously the MSAA-resolve loop shaders 031-034 were mis-flagged "blocked" at their s_cbranch_scc0).
+    const CountedLoop cL = detect_counted_loop(ins);
+    const ForwardIf   cF = detect_forward_if(ins);
+    auto cf_reconstructed = [&](const Rdna2Inst& i) {
+        if (cL.found && (i.pc == cL.backedge_pc || i.pc == cL.exit_branch_pc)) return true;
+        if (cF.found && i.pc == cF.branch_pc) return true;
+        return false;
+    };
 
     RecompileCoverage cov;
     for (const auto& in : ins) {
@@ -1840,7 +1851,8 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
         cov.total++;
         if (in.fmt == Rdna2Format::EXP) { cov.exports++; continue; }   // handled by the stage recompilers
         bool ok = true;
-        bool handled = emit_alu(b, rs, in, ok, /*allow_exec_update*/true, &safe_branches, /*allow_smem*/true) && ok;
+        bool handled = cf_reconstructed(in)
+                     || (emit_alu(b, rs, in, ok, /*allow_exec_update*/true, &safe_branches, /*allow_smem*/true) && ok);
         // Shapes the recompiler handles only in context (a resource table for MIMG sample/load/LOD/store
         // and buffer_load/store_format; a fragment stage for VINTRP). This table-less compute-shell pass
         // rejects them, so count them apart from truly-unsupported (cross-lane, etc.). Instruction-aware
