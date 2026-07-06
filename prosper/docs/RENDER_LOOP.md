@@ -256,6 +256,39 @@ ones above). This is the GPU-execution build; it is the definitive next mileston
 focused, likely-interactive effort. Everything upstream (boot, IL2CPP, asset load, shader creation ×35,
 recompiler ×34, flip loop, offscreen GpuState→frame spine) is in place.
 
+## 2026-07-06 — guest-fs hardened (worker free-order + signal-handler %fs); new frontier = allocator returns null
+Two follow-up fixes made the guest-fs path robust (both committed, gated):
+- **Worker free-order:** `thread_trampoline` switched `%fs` to guest BEFORE `free(ts)`; `free` (host glibc,
+  tcache in host TLS) then corrupted the host heap → intermittent null-alloc crash. Reordered so all host
+  libc runs on host `%fs` and `guest_tls_activate_thread()` is last.
+- **Crash-handler %fs:** a fault on a guest-`%fs` thread entered `fault_handler` on the guest `%fs`, so its
+  snprintf/write + siglongjmp-return double-faulted → uncaught core dump. `guest_fs_enter_host_for_signal()`
+  (magic-guarded) restores host `%fs` on the FATAL path only (SIGTRAP diagnostic paths + the GC RT-signal
+  handler keep the guest `%fs`). Faults are now caught + reported cleanly.
+
+**NEW FRONTIER (post-guest-fs, caught deterministically): `eboot+0x46beb4`.** A string build:
+`alloc(0x809910, size=r14+1)` → `memcpy(0x4019b41d0, len=r15)` → `movb $0,[r13+r15]` (null-terminate).
+The allocator returns **null** (`r13=0`), and `r15=0`, so it writes to addr 0 → SIGSEGV. Ground truth
+(gdb, main thread, guest-fs ACTIVE — `fs_base` has the `PROS` magic): the allocator global
+`[0x40204b838]=0x401f5a230` IS set, so `0x809910` calls the real allocator `0x808e10` which returns null.
+**ROOT (captured): the allocator is FINE — `r14` (the string length) is garbage `0xffffffffcf3e1608`** = a
+negative pointer-difference (`end - begin` that underflowed at `0x46be80 sub %rax,%r15`). `alloc(r14+1)` =
+~16 EiB → correctly returns null → the `movb $0,[0+0]` crash. `0x808e10` is a real bump/pool allocator
+(dec/or-15 alignment, `lea 0x10001(%rbx)` overflow check → returns null on absurd size). So the bug is
+**upstream: a string object's begin/end pointers are bad**, during IME init (`sceIme*` calls, which we stub
+to return 0 — a likely source: the game builds a std::string from an IME struct/result we left zeroed, so
+`end-begin` underflows). Sibling worker fault at a relocated `…d7b` address is likely the same string path.
+**NEXT:** trace back where the begin/end (`rax`/`r15` at `0x46be80`) come from — the object at `rbx`/`r12`
+(a stack std::string, `[rbx+0x24]=0x4b`) — and which `sceIme*` (or other stubbed) call should have filled
+it. Implementing that call to return a sane empty-string/struct likely clears this fault. Candidate: give
+the `libSceIme` stubs real zeroed-but-valid output (empty strings with begin==end, not garbage ranges).
+The fault backtrace (rbp chain is broken — the string-build fn omits frame ptrs) shows an HLE **stub**
+(`0x6000077a0`, ~import #319 at stub_size 96) in the near call chain + `eboot+0x7e4115`, consistent with
+the string being built from data an HLE call returned. NEXT tooling step: map stub #319 → NID (the value
+returned that becomes the bad begin/end), or set `PROSPER_BP`/hwbp at `0x46be80` to capture where `rax`
+(end) and `r15` (begin) are loaded from. NOTE: this fault is only reached on the `-force-gfx-direct` +
+`PROSPER_GUEST_FS` path (both gated); master's default boot is unaffected.
+
 ## 2026-07-06 — ⭐⭐ guest initial-exec TLS landmine FIXED; boot now reaches INPUT/IME init
 The `%fs` TLS fault below is **fixed** (gated `PROSPER_GUEST_FS`, validated). Implementation
 (`src/host/guest_tls.cpp` + `exec_image_linux.cpp` swap stubs, all default-off):
