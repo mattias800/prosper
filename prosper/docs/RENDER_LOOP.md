@@ -515,5 +515,20 @@ stays armed independent of `PROSPER_HWBP_MAX`, so set `MAX=0` to suppress the pe
 records — a **field-dispatch/version desync** (2021.2-shaped read model over 2022.3 data), matching Fable.
 prosper has NO shader parser, so this is 100% game-side code; the root is EITHER a dispatch value our env
 feeds the parser wrong OR data our env produced/left-stale (note the ~0xd4-byte zero region near the crash).
-**NEXT:** disassemble `eboot+0xd4cf72` (the dispatching parser) + the `0x1612c70` call site to find the
-field the parser branches on (version/count/flag) and whether our env supplies it wrong.
+**Disassembly of the parser (`eboot+0xd4ce00..0xd4d000`, code seg file-off = 0xd830+vaddr):** it is
+Unity's GENERIC typetree-driven `Transfer` machinery (vtable dispatch, not shader-specific):
+- `d4cec0 add 0x8(%r8),%r14` / `d4cec4 mov 0x10(%r8),%ebx` — cursor positioned from **typetree-node fields**
+  `[r8+8]` (byteOffset) and `[r8+0x10]` (byteSize).
+- `d4ced2 call *0x38(%rax)` → element size; `d4cef7 div %rcx` → **count = byteSize / elementSize**.
+- `d4cf6c call *0x88(%rax)` → the array driver `0x1612c70` (return `0xd4cf72` ✓), which reads the array.
+
+So counts + cursor come from TYPETREE METADATA (`[r8+8]`/`[r8+0x10]`/the element-size vtable), not a
+hardcoded layout. A typetree whose node offsets/sizes are 2021.2-shaped over 2022.3 data yields wrong
+offsets → the cursor lands on numeric `ConstantBuffer` bytes → read as strings. Confirms Fable's wrong-model
+at the instruction level. **NEXT (leads, ranked):** (1) the fault is on a WORKER thread under guest-`%fs` —
+Unity's serialize transfer often uses TLS; verify the worker's guest-fs TLS isn't handing the deserializer a
+corrupted transfer/typetree context (capture `r8`, `[r8+8]`, `[r8+0x10]`, elemSize at `0xd4cec0`/`0xd4cef7`
+for the crash invocation). (2) determine whether the SerializedFile TypeTree is embedded (our file read may
+truncate/misread it) or stripped (runtime uses compiled-in 2022.3 layout — then the desync is a version field
+we feed wrong). (3) cross-check with a reference parse (AssetRipper rips 2022.3 built-ins fine per Fable),
+proving the shipped data is well-formed and the desync is env-induced.
