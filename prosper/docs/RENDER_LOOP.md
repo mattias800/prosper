@@ -104,3 +104,32 @@ itself gated by the upstream stall. Confirmed empirically — boot reaches the i
 after the fix. **The GPU-execution build remains the real unblock.** New permanent `PROSPER_EVLOG` traces
 (event delivery `-> delivered N ev(s)`, and the user/timer registration+trigger lines) make this loop
 re-diagnosable in one run.
+
+## 2026-07-06 (breakthrough) — the exact GPU→CPU fence handshake is the unblock
+Dumped `SubmitDcb #1`'s 12 packets (`PROSPER_GFXLOG` now prints each packet's kind + payload, and the
+ReleaseMem/WaitRegMem/WriteData builders now log their args). The setup submit is a **GPU-fence
+handshake**, not draws:
+```
+  DrawReset | WaitFlipDone(h=0x1001) | ReleaseMem | WaitRegMem | ReleaseMem×2 |
+  Flip(h=0x1001, bufidx=2) | AcquireMem | EventWrite(0x2e) EventWrite(0x2c) | ReleaseMem×2
+```
+The **ReleaseMem** (EOP) and **WaitRegMem** builder args expose the real pointers we were discarding:
+- `ReleaseMem  a1=eventType a2=dstSel a3=0x1 a4=cacheAction a5=<dstGpuAddr>` — e.g. a5=0x731a455c4aa8
+- `WaitRegMem  a1=0 a2=ref(0x3) a3=0 a4=cmpFunc(0x2) a5=<addr>` — **a5=0x731a455c4aa8, the SAME address**
+
+So the game plants an EOP fence: RELEASE_MEM writes a completion value to label `A` when the GPU pipe
+drains; WAIT_REG_MEM (and, cross-thread, the PreloadManager/FTM producers) block until `[A]` satisfies the
+compare. **We never write `A`** — our AGC Dcb builders (`agc_cb_release_mem`, `agc_dcb_wait_reg_mem`,
+`agc_dcb_write_data`) zero their payloads and the CommandProcessor's `apply()` treats events/fences as
+no-ops (`command_processor.cpp:27`). Hence the eternal stall.
+
+**The concrete unblock (next milestone):** on submit, honor the fence — since our CommandProcessor folds
+each Dcb synchronously (the "GPU" is done the instant SubmitDcb returns), perform the RELEASE_MEM label
+write to `[dstGpuAddr]` (1:1-mapped host write) and satisfy the matching WAIT_REG_MEM. That is correct EOP
+semantics, not a hack. **Blocker for doing it correctly:** the fence *value* RELEASE_MEM writes is a 7th
+argument passed on the guest stack (beyond a0–a5), which the current HLE ABI shim doesn't capture, and the
+`cmpFunc`/`ref` encoding of WAIT_REG_MEM must be honored exactly (writing a guessed value would be a fake —
+correctness-first). Doing this right needs either (a) capturing the stack args in the HLE trampoline, or
+(b) the Kyty Gen5 RELEASE_MEM/WAIT_REG_MEM field reference. This is the precise, bounded task that should
+crack the render loop — best done with the user/reference in the loop (boot-wall-caliber), but it is now a
+*specific* mechanism, not a vague "GPU-execution build."

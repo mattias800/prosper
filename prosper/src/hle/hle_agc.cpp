@@ -11,6 +11,7 @@
 #include "dispatch.hpp"
 #include "gpu/pm4_registers.hpp"
 #include "gpu/command_processor.hpp"
+#include "gpu/pm4_decode.hpp"
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -118,15 +119,21 @@ HLE(agc_dcb_acquire_mem) {  // (buf, engine, cb_db_op, gcr_cntl, ...) — 8 dw
     return (uint64_t)(uintptr_t)cmd;
 }
 HLE(agc_cb_release_mem) {  // GraphicsCbReleaseMem (buf, ...) — 7 dw
+    if (getenv("PROSPER_GFXLOG")) fprintf(stderr, "[agc] ReleaseMem args a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx\n",
+        (unsigned long long)a1,(unsigned long long)a2,(unsigned long long)a3,(unsigned long long)a4,(unsigned long long)a5);
     uint32_t* cmd; if (!begin_packet(a0, 7, IT_NOP, R_RELEASE_MEM, &cmd)) return 0;
     cmd[1] = cmd[2] = cmd[3] = cmd[4] = cmd[5] = cmd[6] = 0; return (uint64_t)(uintptr_t)cmd;
 }
 HLE(agc_dcb_write_data) {  // (buf, dst, cache_policy, address_or_offset, ...) — 4 dw (num_dwords via stack, approx 0)
+    if (getenv("PROSPER_GFXLOG")) fprintf(stderr, "[agc] WriteData args a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx\n",
+        (unsigned long long)a1,(unsigned long long)a2,(unsigned long long)a3,(unsigned long long)a4,(unsigned long long)a5);
     uint32_t* cmd; if (!begin_packet(a0, 4, IT_NOP, R_WRITE_DATA, &cmd)) return 0;
     cmd[1] = (uint32_t)a1; cmd[2] = (uint32_t)(a3 & 0xffffffffu); cmd[3] = (uint32_t)(a3 >> 32u);
     return (uint64_t)(uintptr_t)cmd;
 }
 HLE(agc_dcb_wait_reg_mem) {  // (buf, ...) — 9 dw
+    if (getenv("PROSPER_GFXLOG")) fprintf(stderr, "[agc] WaitRegMem args a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx\n",
+        (unsigned long long)a1,(unsigned long long)a2,(unsigned long long)a3,(unsigned long long)a4,(unsigned long long)a5);
     uint32_t* cmd; if (!begin_packet(a0, 9, IT_NOP, R_WAIT_MEM_64, &cmd)) return 0;
     for (int i = 1; i < 9; i++) cmd[i] = 0; return (uint64_t)(uintptr_t)cmd;
 }
@@ -500,9 +507,22 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     if (!p || !p->addr || !p->dw_num) return kAgcErrInvalidArg;
     size_t applied = gpu::run_command_buffer(p->addr, p->dw_num, agc_gpu_state());
     g_submit_count++;
-    if (getenv("PROSPER_GFXLOG"))
+    if (getenv("PROSPER_GFXLOG")) {
         fprintf(stderr, "[agc] SubmitDcb #%llu: %u dwords -> %zu packets applied (draws so far: %zu)\n",
                 (unsigned long long)g_submit_count, p->dw_num, applied, agc_gpu_state().draws.size());
+        // Dump each packet's kind + first payload dwords so we can see whether the game embeds a
+        // completion-label write (WriteData/ReleaseMem/EventWrite) or a GPU-side wait in the stream.
+        std::vector<gpu::Pm4Command> ops; gpu::decode_pm4(p->addr, p->dw_num, ops);
+        static const char* kKindName[] = {"DrawReset","WaitFlipDone","SetShRegDirect","SetRegsIndirect",
+            "SetIndexType","DrawIndexAuto","EventWrite","AcquireMem","WriteData","WaitRegMem","Flip",
+            "ReleaseMem","Unknown"};
+        for (auto& c : ops) {
+            uint32_t k = (uint32_t)c.kind; const char* nm = k < 13 ? kKindName[k] : "?";
+            fprintf(stderr, "[agc]   pkt op=0x%02x r=0x%02x len=%u kind=%s pl0=0x%08x pl1=0x%08x pl2=0x%08x\n",
+                    c.op, c.r, c.len, nm,
+                    c.len > 1 ? c.payload[0] : 0, c.len > 2 ? c.payload[1] : 0, c.len > 3 ? c.payload[2] : 0);
+        }
+    }
     return 0;
 }
 
