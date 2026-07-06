@@ -1149,6 +1149,23 @@ int main() {
            got64.size()==N?got64[4]:-1, exp64[4], got64.size()==N?got64[6]:-1, exp64[6], got64.size()==N?got64[7]:-1, exp64[7]);
     CHECK(got64.size()==N && bad64==0, "recompiled kernel 64 (v_mbcnt divergent: active lane L -> L/2) correct");
 
+    // Kernel 65: v_mbcnt with src0 = inline -1 (all-ones mask) — the "get my lane id" idiom (shader 037).
+    // mbcnt_lo(-1,0) + mbcnt_hi(-1,·) counts ALL lanes below => v1 = localid, independent of EXEC.
+    const uint32_t code65[] = {
+        0xD7650001u, 0x000100C1u,   // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0xD7660001u, 0x000202C1u,   // v_mbcnt_hi_u32_b32 v1, -1, v1
+        0x7E020D01u,                // v_cvt_f32_u32 v1, v1
+        0xBF810000u,                // s_endpgm
+    };
+    std::vector<uint32_t> spv65 = recompile_valu(code65, sizeof(code65)/sizeof(code65[0]), 1, /*out_vgpr*/1);
+    CHECK(!spv65.empty(), "recompiled kernel 65 (v_mbcnt src0=-1) -> SPIR-V");
+    std::vector<float> in65(N, 0.0f), exp65(N);
+    for (uint32_t i=0;i<N;i++) exp65[i] = (float)(i % 64);
+    std::vector<float> got65 = prosper::test::run_compute(spv65, in65, N, N);
+    uint32_t bad65=0; for(uint32_t i=0;i<N&&got65.size()==N;i++) if(std::fabs(got65[i]-exp65[i])>1e-3f) bad65++;
+    printf("  kernel65 mismatches=%u (out[9]=%g exp=%g)\n", bad65, got65.size()==N?got65[9]:-1, exp65[9]);
+    CHECK(got65.size()==N && bad65==0, "recompiled kernel 65 (v_mbcnt -1 = localid) correct");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

@@ -1390,13 +1390,18 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (in.sdst.value == 106 || in.sdst.value == 107) rs.vcc = cout;
                 else if (in.sdst.kind == OperandKind::SGPR) rs.sreg_bool[in.sdst.value] = cout;
             } else if ((in.opcode == 0x365 || in.opcode == 0x366) && allow_wave && b.is_compute) {
-                // v_mbcnt_lo/hi_u32_b32 (cross-lane): dst = src1 + count of active lanes below this one in
-                // the low/high 32. Only handled when src0 is EXEC (the standard compaction idiom); a general
-                // 32-bit mask VALUE isn't representable in our per-lane model, so reject that. Uses LDS +
-                // barriers (wave model) — allow_wave is true only in the straight-line path (barrier-uniform).
-                const Operand& s0 = in.src[0];
-                if (s0.value == 126 || s0.value == 127)   // EXEC_LO / EXEC_HI -> this lane's exec bit
-                    vreg[in.dst.value] = b.mbcnt(rs.exec, val(in.src[1]), in.opcode == 0x365);
+                // v_mbcnt_lo/hi_u32_b32 (cross-lane): dst = src1 + count of lanes below this one whose mask
+                // bit (src0) is set, in the low/high 32. The per-lane "mask bit" comes from src0: EXEC
+                // (126/127) -> this lane's exec bool; inline -1 (all-ones) -> always set (mbcnt = lane
+                // index, the common "get my lane id" idiom, e.g. shader 037); inline 0 -> never; an SGPR
+                // pair -> that saved mask's bool. A general computed 32-bit mask VALUE isn't representable
+                // per-lane, so reject that. LDS+barriers (allow_wave => straight-line, barrier-uniform).
+                const Operand& s0 = in.src[0]; uint32_t active = 0;
+                if (s0.value == 126 || s0.value == 127) active = rs.exec;
+                else if (s0.kind == OperandKind::InlineInt && s0.value == -1) active = b.btrue();
+                else if (s0.kind == OperandKind::InlineInt && s0.value == 0)  active = b.bfalse();
+                else if (s0.kind == OperandKind::SGPR) { auto it = rs.sreg_bool.find(s0.value); if (it != rs.sreg_bool.end()) active = it->second; }
+                if (active) vreg[in.dst.value] = b.mbcnt(active, val(in.src[1]), in.opcode == 0x365);
                 else ok = false;
             } else if (in.opcode == 0x12F) {                          // v_cvt_pkrtz_f16_f32 = pack(s0->lo, s1->hi)
                 vreg[in.dst.value] = b.pack_half2x16(fv(0), fv(1));    // float sources honor neg/abs modifiers
