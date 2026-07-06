@@ -14,6 +14,15 @@ export **029**; the **NGG family 004/025/040** (position-only + indexed-fetch cu
 compute **006** (texture-sample → storage-store). Op families added 2026-07-06: v_mac/v_fmac_f32,
 s_lshl4_add_u32, s_bfe_u64 (Int64), v_cndmask_b32_e64, v_cmp→SGPR-pair mask (SDWAB), 2D_MSAA_ARRAY.
 
+**Correctness audit (2026-07-06, exec-diff-verified, kernels 52-58):** VOP3 **source modifiers** (neg/abs,
+dword0[10:8]/dword1[63:61]) were being **silently ignored** — `a-b`, `abs()`, `-x` miscomputed in every
+recompiling shader; now applied (OpFAbs→OpFNegate). VOP3 **output modifiers** CLAMP (saturate, dword0[15])
++ OMOD (×2/×4/×0.5, dword1[28:27]) now applied (were rejected). v_cvt_pkrtz_f16_f32 sources honor
+modifiers. Added the VOP3-encoded forms of v_add/sub/subrev/mul/min/max_f32 (0x103/104/105/108/10F/110,
+were rejected), all with source+output modifiers. This is a real fidelity gain for the 34 recompiling
+shaders (they use fma/mad/med3/pkrtz **with** modifiers) — "recompiles" now also means "computes the right
+values". Not a shader-count change; the remaining 030/037/038 are still cross-lane-blocked (below).
+
 **THE REMAINING ~4-7 SHADERS ARE NOT RECOMPILABLE IN THE PER-INVOCATION MODEL (by design):** 030/037/038
 (and the scc0 group) are wave-cooperative compute shaders (GPU culling/compaction) that need CROSS-LANE
 ops — `v_mbcnt_lo/hi` (this lane's index among active lanes) and `v_readlane` (read another lane's value).
