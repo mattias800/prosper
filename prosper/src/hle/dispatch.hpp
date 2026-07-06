@@ -85,6 +85,8 @@ void guest_tls_set_templates(const TlsModuleDesc* descs, size_t count);
 bool guest_tls_enabled();
 uint64_t guest_tls_activate_thread();   // per guest thread at entry; returns guest TP (0 if disabled)
 void guest_fs_enter_host_for_signal();  // crash-signal-handler entry: swap guest %fs -> host %fs (no-op if not guest TCB)
+uint64_t guest_fs_to_host_scoped();     // diagnostic handler (returns to guest): swap to host %fs, return prev fs
+void guest_fs_restore_scoped(uint64_t prev_fs);  // restore the fs returned by guest_fs_to_host_scoped
 
 // Per-module info for C++ exception unwinding (sceKernelGetModuleInfoForUnwind). The guest's libunwind
 // asks, for a code address, where that module's .eh_frame_hdr / text segment live. `lo/hi` is the module's

@@ -95,5 +95,18 @@ void guest_fs_enter_host_for_signal() {
         wr_fsbase(*(volatile uint64_t*)(fs + HOSTFS_OFF));
 }
 
+// Scoped variant for diagnostic signal handlers that RETURN to the guest (HWBP/int3 logging): swap to the
+// host %fs for the handler's host-libc calls and return the previous (guest) fs so the caller can restore
+// it before returning to guest code. Returns 0 if not on a guest TCB (nothing to restore).
+uint64_t guest_fs_to_host_scoped() {
+    uint64_t fs = rd_fsbase();
+    if (fs && *(volatile uint32_t*)(fs + MAGIC_OFF) == TCB_MAGIC) {
+        wr_fsbase(*(volatile uint64_t*)(fs + HOSTFS_OFF));
+        return fs;
+    }
+    return 0;
+}
+void guest_fs_restore_scoped(uint64_t prev_fs) { if (prev_fs) wr_fsbase(prev_fs); }
+
 } // namespace prosper
 #endif

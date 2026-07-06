@@ -114,6 +114,11 @@ namespace {
     bool     g_hwbp_stepping = false;
     volatile sig_atomic_t g_hwbp_count = 0;
     int      g_hwbp_max = 200;
+    // PROSPER_HWBP_R15=<hex>: only LOG when r15 == this value (a condition, evaluated in-process = no gdb
+    // round-trip). When matched, also dump a window of memory around rax + classify rax's mapping. Built to
+    // catch the one deserializer read that produces a garbage std::string length without the gdb-bp overhead
+    // that times out on hot addresses. r15 is used because it carries the read length at eboot+0x7e40e1.
+    uint64_t g_hwbp_r15 = 0; bool g_hwbp_r15_on = false;
     // Optional chained DATA write-watchpoint: on the first exec-bp hit, arm a HW write watch on
     // [rax + g_hwwatch_delta] (default rax-0x80, the thread-local device slot the ctor reads). Catches
     // every writer of that slot with its RIP — reveals what sets/clears the scoped device pointer.
@@ -287,7 +292,25 @@ namespace {
             auto& gr = uc->uc_mcontext.gregs;
             uint64_t rdi = (uint64_t)gr[REG_RDI], rsi = (uint64_t)gr[REG_RSI];
             uint64_t rax = (uint64_t)gr[REG_RAX], r14 = (uint64_t)gr[REG_R14], r15 = (uint64_t)gr[REG_R15];
-            if (g_hwbp_count < g_hwbp_max) {
+            // This handler returns to the guest, which may be on the guest %fs — swap to host %fs for the
+            // host-libc logging below, restore before returning. No-op off the guest-fs path.
+            uint64_t saved_fs = guest_fs_to_host_scoped();
+            bool cond_ok = !g_hwbp_r15_on || (r15 == g_hwbp_r15);
+            if (cond_ok && g_hwbp_r15_on) {
+                // The matching read: dump the window around rax (the source pointer) + classify its mapping,
+                // so we can see whether the deserializer's cursor points into a file buffer / heap / garbage.
+                uint64_t rbx = (uint64_t)gr[REG_RBX];
+                auto rd = [](uint64_t a) -> unsigned long long {
+                    return probe_readable(a) ? (unsigned long long)*(const uint64_t*)a : 0xBADBADull; };
+                char b2[320];
+                int n2 = snprintf(b2, sizeof b2,
+                    "[hwbp] MATCH r15=0x%llx rax(src)=0x%llx rbx=0x%llx | [rax-16..+24]= %llx %llx %llx %llx %llx %llx\n",
+                    (unsigned long long)r15, (unsigned long long)rax, (unsigned long long)rbx,
+                    rd(rax-16), rd(rax-8), rd(rax), rd(rax+8), rd(rax+16), rd(rax+24));
+                write(2, b2, n2);
+                classify_addr(rax);
+            }
+            if (cond_ok && g_hwbp_count < g_hwbp_max) {
                 g_hwbp_count = g_hwbp_count + 1;
                 auto rd = [](uint64_t a) -> unsigned long long {
                     return probe_readable(a) ? (unsigned long long)*(const uint64_t*)a : 0xBADBADull; };
@@ -320,6 +343,7 @@ namespace {
             if (g_hwbp_count < g_hwbp_max) {               // step past, then re-enable for the next hit
                 uc->uc_mcontext.gregs[REG_EFL] |= 0x100ll; g_hwbp_stepping = true;
             }                                              // else: leave disabled (one-and-done at the cap)
+            guest_fs_restore_scoped(saved_fs);             // back to guest %fs before returning to guest code
             return;
         }
         // PROSPER_BP int3 breakpoint-logger. Two SIGTRAP cases:
@@ -626,6 +650,15 @@ bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
                   else      emit_unimpl(slot, (uint32_t)i, (uint64_t)&prosper_on_unimpl); }
     }
     g_stub_base = stub_base; g_stub_size = stub_size; g_nstubs = n;
+    // PROSPER_STUBDUMP: dump the stub table (index, guest offset from stub_base, lib::nid + resolved name).
+    // Used to map a stub address seen on a stack (e.g. 0x600000000+off) back to the import it calls.
+    if (getenv("PROSPER_STUBDUMP")) {
+        for (uint64_t i = 0; i < n; i++) {
+            const std::string& nm = g_nid_db ? g_nid_db->resolve(slots[i].nid) : std::string();
+            fprintf(stderr, "[stub] #%llu off=0x%llx %s::%s %s\n", (unsigned long long)i,
+                    (unsigned long long)(i * stub_size), slots[i].lib.c_str(), slots[i].nid.c_str(), nm.c_str());
+        }
+    }
     return true;
 }
 
@@ -689,6 +722,7 @@ void install_trap_handler() {
     if (const char* hb = getenv("PROSPER_HWBP")) {
         g_hwbp_addr = 0x400000000ull + strtoull(hb, nullptr, 0);
         if (const char* m = getenv("PROSPER_HWBP_MAX")) g_hwbp_max = (int)strtoul(m, nullptr, 0);
+        if (const char* c = getenv("PROSPER_HWBP_R15")) { g_hwbp_r15 = strtoull(c, nullptr, 0); g_hwbp_r15_on = true; }
         if (g_devnull_fd < 0) g_devnull_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
         g_hwbp_on = true;   // perf_event_open done in arm_hwbp() after the image is mapped
         // PROSPER_HWWATCH=<signed delta>: on the first exec-bp hit, arm a data write-watch on [rax+delta]

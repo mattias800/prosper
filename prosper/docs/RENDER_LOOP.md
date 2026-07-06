@@ -312,6 +312,32 @@ next frontier now that the MT-deadlock + guest-TLS walls are down and the boot r
   compared as UNSIGNED (`0xffffffffcf3e1608` is negative signed, so `> 0x10000000` is false) or matched
   exactly (`== 0xffffffffcf3e1608`).
 
+## 2026-07-06 — PINPOINTED: misaligned deserialization is reading SHADER BYTECODE as a string length
+Cracked it with a **fault-time stack walk** (reliable; the HWBP single-step approach SIGABRTs under
+guest-fs — stack-smashing — so it's out here, as the docs long warned). Ground truth:
+- The reader fn is `eboot+0x7e4090`: a length-prefixed binary reader. `rdi`=reader object; `[rdi+0x38]`=
+  cursor ptr, `[rdi+0x48]`=end ptr, `[rdi+0x40]`=base ptr. It reads a u32 at `[cursor]`, advances cursor+4,
+  then builds a `std::string` of that length. Recover the reader at the fault via frame A's saved r14:
+  `r14 = *(long*)($rbp-0x10)` (frame B's live r14 = `&reader+0x38`, saved by frame A's prologue), then
+  `reader = r14 - 0x38`.
+- Captured: `reader`=a stack object; `base=[reader+0x40]`, `end=[reader+0x48]` bound a **37KB** window inside
+  a **16 MB ANONYMOUS mapping** (`0x7ffefc7c0000..0x7ffefd7c0000`, rw-p, no file backing = a guest
+  flexible/direct-mem pool). The cursor sits ~`0x7f74` into that window.
+- **The bytes at the cursor are RDNA2 SHADER INSTRUCTIONS** (`0xbf8c…`=s_waitcnt, `0xf800…08cf`=EXP; the
+  read "length" `0xcf3e1608` is a shader-code dword). Buffer start also looks like shader code.
+⟹ Unity is **deserializing a shader** (SerializedShader/subprogram bytecode) from an in-memory buffer, and
+the reader is **misaligned inside the bytecode blob** — it reads a code dword as the next field's length.
+The parse diverged upstream (an earlier field consumed the wrong byte count so the cursor landed inside the
+blob instead of at the next length/count). Because it's deterministic + the buffer holds plausible shader
+code (not garbage), the buffer DATA is likely fine — the divergence is in how the parse consumes it (a
+field type/size/alignment we make the game mis-handle, or a shader-blob sub-count we feed wrong; NOT file
+I/O). **NEXT:** set a fault-time bp at `0x7e40b5` (the cursor read) OR walk the reader's prior reads to find
+where the cursor first diverges from the expected shader-blob layout — i.e. what field just before offset
+`0x7f74` should have advanced the cursor to a real length. Cross-ref Unity SerializedShader/ShaderData
+TypeTree. Tooling added this session: `PROSPER_STUBDUMP` (stub idx→NID; ruled out the stub-as-source
+hypothesis — stub #319 = `__stack_chk_guard`), `PROSPER_HWBP_R15` (conditional HWBP log — works OFF the
+guest-fs path only), and `guest_fs_to_host_scoped`/`_restore_scoped` (fs swap for diagnostic handlers).
+
 ## 2026-07-06 — ⭐⭐ guest initial-exec TLS landmine FIXED; boot now reaches INPUT/IME init
 The `%fs` TLS fault below is **fixed** (gated `PROSPER_GUEST_FS`, validated). Implementation
 (`src/host/guest_tls.cpp` + `exec_image_linux.cpp` swap stubs, all default-off):
