@@ -69,6 +69,31 @@ The remaining shaders each need **one or more genuinely deep features** — veri
 | **006** | multi-tap sample + inline sampler | **inline sampler descriptor construction** (`s[8:11]` reused as a buffer V# then rebuilt as an S# via `s_movk`/`s_bfm`/`s_lshl`/`s_mov`) + dmask≠0xF (3-component) sampling. NSA + implicit-LOD sampling itself is done. |
 | **030, 037, 038** | large / wave-level | **wave-level ops**: `s_bfe_u64`/`s_lshr_b64` writing **EXEC** (wave-lane setup), **cross-lane** `v_mbcnt_lo/hi` (active-lane count), `v_readlane`; plus a long ALU tail. Hardest; multiple features each. |
 
+## Actionable plan: structured s_cbranch_scc0 (the +4-shader win)
+Scoped 2026-07-06. Current state: `s_cbranch_scc0`/`scc1` are handled ONLY as a loop's single exit branch
+(the `emit_body` loop reconstruction, rdna2_to_spirv.cpp ~line 819/1691); a general **forward** scc branch
+that is NOT a loop exit is rejected (`emit_alu` SOPP case 0x04/0x05 → `ok=false`, ~line 1339). These are
+scalar-**uniform** conditionals (all lanes take the same path — distinct from the EXEC-predicated divergent
+ifs, which are already linearized). Implementation approach:
+1. **Detect** in the pre-pass (alongside loop detection): a forward `s_cbranch_scc0 T` at pc P where T>P and
+   [P+1,T) contains no other branch out and T is not a loop header — a single structured if. (Start with the
+   non-nested single-forward-if case; nested/irreducible needs a general relooper — defer.)
+2. **Emit** as structured selection: emit [.., P); then `OpSelectionMerge(Lmerge=T)` +
+   `OpBranchConditional(scc_bool, Lfall, Lmerge)` where scc_bool is `rs.scc` (already tracked by s_cmp/
+   s_and etc.). For scc0 the branch is TAKEN (skip to T) when SCC==0, so the fall-through block Lfall =
+   [P+1,T) executes when SCC!=0. Emit Lfall, then branch to Lmerge=T, then continue [T,..).
+3. **Values across the merge**: the skipped block writes SGPRs/VGPRs; registers written in Lfall and live
+   after T need an **OpPhi** at Lmerge merging the pre-branch value with the Lfall value. This is exactly
+   the per-block value-map + phi machinery the loop reconstruction already has — the real work is
+   generalizing it from the loop shape to an if-merge (make the value-map per-block with phi at any join,
+   not just the loop header/back-edge). `rs.scc` is a per-lane bool but the branch is uniform, so a normal
+   OpBranchConditional is valid (no EXEC interaction).
+4. **Verify**: a synthetic kernel `s_cmp_lt; s_cbranch_scc0 skip; <write>; skip: <use>` through the
+   execution-differential harness, plus spirv-val. Then re-run shader_histo (expect the 4 SOPP-0x4 shaders
+   to advance past this blocker).
+This is a real but bounded CFG addition (parallels the loop work); best done deliberately with review since
+it touches the control-flow core every shader flows through.
+
 ## The big lever: loop reconstruction — **LANDED**
 
 Counted-loop reconstruction (`OpLoopMerge` + `OpPhi` for loop-carried registers, per-block value maps)
