@@ -282,12 +282,25 @@ to return 0 — a likely source: the game builds a std::string from an IME struc
 (a stack std::string, `[rbx+0x24]=0x4b`) — and which `sceIme*` (or other stubbed) call should have filled
 it. Implementing that call to return a sane empty-string/struct likely clears this fault. Candidate: give
 the `libSceIme` stubs real zeroed-but-valid output (empty strings with begin==end, not garbage ranges).
-The fault backtrace (rbp chain is broken — the string-build fn omits frame ptrs) shows an HLE **stub**
-(`0x6000077a0`, ~import #319 at stub_size 96) in the near call chain + `eboot+0x7e4115`, consistent with
-the string being built from data an HLE call returned. NEXT tooling step: map stub #319 → NID (the value
-returned that becomes the bad begin/end), or set `PROSPER_BP`/hwbp at `0x46be80` to capture where `rax`
-(end) and `r15` (begin) are loaded from. NOTE: this fault is only reached on the `-force-gfx-direct` +
-`PROSPER_GUEST_FS` path (both gated); master's default boot is unaffected.
+NOTE: this fault is only reached on the `-force-gfx-direct` + `PROSPER_GUEST_FS` path (both gated);
+master's default boot is unaffected.
+
+**ROOT PINNED (deterministic — 3/3 crashes identical rip + identical len `0xffffffffcf3e1608`): Unity
+binary-asset DESERIALIZATION is misaligned.** Real caller chain (raw stack walk, rbp chain broken):
+`0x46beb4` (std::string build) ← `eboot+0x7e4115` (a `std::string::assign(ptr,len)`-shape fn; the length is
+`movslq (%rax)` — a 32-bit length read straight from the stream at `[rax]`) ← `eboot+0x7fcafb` ←
+`eboot+0x1612c92`. `0x1612c70..0x1612c8d` is a classic **aligned binary reader**: `eax=[rbx+0x38]-[rbx+0x40]`
+(cursor − base), `add $3 / and ~3` (round to 4), `[rbx+0x38]+=…` (advance cursor), `call 0x4007fc9f0`. So
+`rbx` is a stream reader (`+0x40`=base, `+0x38`=cursor) — this is Unity's TypeTree/SafeBinaryRead reader
+(cf. `GFXDEVICE_BRINGUP_PROBLEM.md` §2026-07-05, `SafeBinaryRead::Transfer` @ `eboot+0xd58710`). It reads a
+dword as a string length and gets `0xcf3e1608` → the reader is **misaligned** (some earlier field consumed
+the wrong byte count, so the cursor now points at non-length bytes). Because it's deterministic, it's a
+real parse divergence, not a race/uninit. **Candidate causes:** a TypeTree field whose size/alignment we
+diverge on, or wrong bytes fed in (file I/O returning wrong data for level0/sharedassets). **NEXT (deep,
+the next milestone):** trace the reader from a known-good field back to the first divergent read — e.g. bp
+`0x1612c70` and watch `[rbx+0x38]` (cursor) vs the expected TypeTree layout, or verify our `pread`/mmap of
+`level0` returns byte-correct data. This is Unity-asset-deserialization RE — a large surface, the clear
+next frontier now that the MT-deadlock + guest-TLS walls are down and the boot reaches scene load.
 
 ## 2026-07-06 — ⭐⭐ guest initial-exec TLS landmine FIXED; boot now reaches INPUT/IME init
 The `%fs` TLS fault below is **fixed** (gated `PROSPER_GUEST_FS`, validated). Implementation
