@@ -232,6 +232,30 @@ Findings:
   draws. The recompiler (34 shaders) and the offscreen GpuState→frame spine are ready to receive those draws.
 The punch tool stays (gated off, `CONFIDENCE: LOW`, fabricates a fake for observation only).
 
+## 2026-07-06 — EOP QUEUE is never waited on (last completion mechanism ruled out)
+Confirmed over a full 30 s run: of the four equeues the game creates, only **UnityFTMFlipQueue** and
+**Flip Event Queue GfxDeviceAgc** are ever `WaitEqueue`d (295 and 1762 times). The **"EOP QUEUE" equeue is
+waited on 0 times** — so posting GPU end-of-pipe *events* there (the RELEASE_MEM-interrupt→equeue-event
+form of completion, distinct from the fence-label write already ruled out) would have no consumer and
+cannot unblock anything.
+
+### Ruled-out unblock hypotheses (all tested this session)
+| Hypothesis | Result |
+|---|---|
+| EOP fence **label** write on submit (5 value variants) | no effect — no CPU thread polls it |
+| Honor WaitOnAddress **timeout** → guest handles it | guest throws an UNCAUGHT "timed out" exception (symptom) |
+| **Punch** the stuck consumer semaphores | they wake, find no work, re-block — no draws, no advance |
+| Post **EOP-QUEUE events** | no consumer — EOP QUEUE is never waited on |
+| sync_on_address **lost-wake** bug | ruled out — FUTEX_WAIT re-checks atomically |
+
+**Net:** there is no consumer-side or shim-level shortcut. The producer that would enqueue the
+PreloadManager/GfxDevice work and post the semaphores is gated on **real GPU/asset-integration work
+completing**, which requires executing the submitted command buffer on a real device and posting the
+completion via whatever mechanism that producer actually polls (still unidentified — none of the obvious
+ones above). This is the GPU-execution build; it is the definitive next milestone for game pixels and is a
+focused, likely-interactive effort. Everything upstream (boot, IL2CPP, asset load, shader creation ×35,
+recompiler ×34, flip loop, offscreen GpuState→frame spine) is in place.
+
 So the game plants an EOP fence: RELEASE_MEM writes a completion value to label `A` when the GPU pipe
 drains; WAIT_REG_MEM (and, cross-thread, the PreloadManager/FTM producers) block until `[A]` satisfies the
 compare. **We never write `A`** — our AGC Dcb builders (`agc_cb_release_mem`, `agc_dcb_wait_reg_mem`,
