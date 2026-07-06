@@ -108,6 +108,13 @@ void decode_operands(Rdna2Inst& i) {
             // Applied to the float result in the recompiler (rdna2_to_spirv VOP3 float ops).
             i.clamp = ((w >> 15) & 1u) != 0;
             i.omod  = (uint8_t)((d1 >> 27) & 3u);
+            // VOP3B carry ops (v_add/sub/subrev_co_ci_u32 = 0x128/0x129/0x12A): dword0[14:8] is a scalar
+            // carry-OUT dst, not abs modifiers — decode it and clear the mis-read abs/clamp bits.
+            if (i.opcode == 0x128u || i.opcode == 0x129u || i.opcode == 0x12Au) {
+                i.sdst = sgpr((w >> 8) & 0x7Fu);
+                i.src_abs[0] = i.src_abs[1] = i.src_abs[2] = false;
+                i.clamp = false;
+            }
             break;
         }
         case Rdna2Format::SOP1:

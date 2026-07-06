@@ -73,6 +73,10 @@ struct Rdna2Inst {
     // result ×2 (1) / ×4 (2) / ×0.5 (3) (dword1[28:27]). Applied after the op, before writing dst.
     bool     clamp = false;
     uint8_t  omod  = 0;
+    // VOP3B scalar destination (carry-out for v_add/sub_co_ci_u32 etc.): dword0[14:8]. Only set for the
+    // VOP3B carry ops; kind==None otherwise. (VOP3B reuses the abs-modifier bits for sdst, so the decode
+    // clears src_abs for these opcodes.)
+    Operand  sdst;
 
     // EXP-only: export target (MRT0=0..7, MRTZ=8, NULL=9, POS0=12..15, PARAM0=32..) and the 4-bit
     // per-component enable mask. The 4 exported VGPRs are in src[0..3].

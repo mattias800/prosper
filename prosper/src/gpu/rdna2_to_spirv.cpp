@@ -1323,6 +1323,34 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             } else if (in.opcode == 0x347) {                          // v_add_lshl_u32 = (s0+s1)<<(s2&31)
                 uint32_t sh = b.ibin(Op_BitwiseAnd, val(in.src[2]), b.uconst(31));
                 vreg[in.dst.value] = b.ibin(Op_ShiftLeftLogical, b.ibin(Op_IAdd, val(in.src[0]), val(in.src[1])), sh);
+            } else if (in.opcode == 0x128 || in.opcode == 0x129 || in.opcode == 0x12A) {
+                // Add/sub with carry-in + carry-out (VOP3B): v_add_co_ci_u32 (0x128), v_sub_co_ci (0x129),
+                // v_subrev_co_ci (0x12A). carry-in = src2 mask (VCC or an SGPR bool); carry-out -> sdst mask.
+                // dst = s0 (+/-) s1 (+/-) cin; carryout = unsigned overflow (add) / borrow (sub).
+                const Operand& s2 = in.src[2]; uint32_t cin_mask = b.bfalse();
+                if (s2.value == 106 || s2.value == 107) cin_mask = rs.vcc;
+                else if (s2.kind == OperandKind::SGPR) { auto it = rs.sreg_bool.find(s2.value); if (it != rs.sreg_bool.end()) cin_mask = it->second; }
+                uint32_t a = val(in.src[0]), c = val(in.src[1]);
+                uint32_t cin = b.sel(cin_mask, b.uconst(1), b.uconst(0));
+                uint32_t res, cout;
+                if (in.opcode == 0x128) {                             // add: (a + b) + cin
+                    uint32_t s1 = b.ibin(Op_IAdd, a, c);
+                    uint32_t c1 = b.ucmp(Op_ULessThan, s1, a);        // wrap in a+b
+                    res = b.ibin(Op_IAdd, s1, cin);
+                    uint32_t c2 = b.ucmp(Op_ULessThan, res, s1);      // wrap in +cin
+                    cout = b.bsel(c1, b.btrue(), c2);                 // c1 || c2
+                } else {                                              // sub / subrev: (a - b) - cin (borrow)
+                    uint32_t x = in.opcode == 0x129 ? a : c, y = in.opcode == 0x129 ? c : a;  // subrev swaps
+                    uint32_t s1 = b.ibin(Op_ISub, x, y);
+                    uint32_t b1 = b.ucmp(Op_ULessThan, x, y);         // borrow in x-y
+                    res = b.ibin(Op_ISub, s1, cin);
+                    uint32_t b2 = b.ucmp(Op_ULessThan, s1, cin);      // borrow in -cin
+                    cout = b.bsel(b1, b.btrue(), b2);
+                }
+                vreg[in.dst.value] = res;
+                // carry-out -> sdst mask (VCC or a saved SGPR-pair bool).
+                if (in.sdst.value == 106 || in.sdst.value == 107) rs.vcc = cout;
+                else if (in.sdst.kind == OperandKind::SGPR) rs.sreg_bool[in.sdst.value] = cout;
             } else if (in.opcode == 0x12F) {                          // v_cvt_pkrtz_f16_f32 = pack(s0->lo, s1->hi)
                 vreg[in.dst.value] = b.pack_half2x16(fv(0), fv(1));    // float sources honor neg/abs modifiers
             } else if (in.opcode == 0x103) {                          // v_add_f32 (VOP3 form)

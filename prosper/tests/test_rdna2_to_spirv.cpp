@@ -1089,6 +1089,25 @@ int main() {
            bad61, got61.size()==N?got61[10]:-1, exp61[10], got61.size()==N?got61[100]:-1, exp61[100]);
     CHECK(got61.size()==N && bad61==0, "recompiled kernel 61 (structured scc0 if: (a<b)?a+b:a) correct");
 
+    // Kernel 62: v_add_co_ci_u32 (VOP3B 0x128, add-with-carry). Convert inputs to uint, add with carry-in
+    // = VCC (starts 0), convert back: v2 = (uint)a + (uint)b. Exercises the VOP3B sdst/carry decode + emit.
+    const uint32_t code62[] = {
+        0x7E000F00u,              // v_cvt_u32_f32 v0, v0
+        0x7E020F01u,              // v_cvt_u32_f32 v1, v1
+        0xD5286A02u, 0x01AA0300u, // v_add_co_ci_u32_e64 v2, vcc_lo, v0, v1, vcc_lo
+        0x7E040D02u,              // v_cvt_f32_u32 v2, v2
+        0xBF810000u,              // s_endpgm
+    };
+    std::vector<uint32_t> spv62 = recompile_valu(code62, sizeof(code62)/sizeof(code62[0]), 2, /*out_vgpr*/2);
+    CHECK(!spv62.empty(), "recompiled kernel 62 (v_add_co_ci_u32 add-with-carry) -> SPIR-V");
+    std::vector<float> in62(N*2), exp62(N);
+    for (uint32_t i=0;i<N;i++){ float a=(float)i, b=(float)(i*2); in62[i*2]=a; in62[i*2+1]=b;
+        exp62[i]=(float)((uint32_t)a + (uint32_t)b); }
+    std::vector<float> got62 = prosper::test::run_compute(spv62, in62, N, N);
+    uint32_t bad62=0; for(uint32_t i=0;i<N&&got62.size()==N;i++) if(std::fabs(got62[i]-exp62[i])>1e-3f) bad62++;
+    printf("  kernel62 mismatches=%u (out[30]=%g expect=%g)\n", bad62, got62.size()==N?got62[30]:-1, exp62[30]);
+    CHECK(got62.size()==N && bad62==0, "recompiled kernel 62 (v_add_co_ci_u32: (uint)a+(uint)b) correct");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
