@@ -1066,6 +1066,29 @@ int main() {
     printf("  kernel60 mismatches=%u (out[10]=%g expect=%g)\n", bad60, got60.size()==N?got60[10]:-1, exp60[10]);
     CHECK(got60.size()==N && bad60==0, "recompiled kernel 60 (SDWA |src0|: |a0|*a1) correct");
 
+    // Kernel 61: structured forward s_cbranch_scc0 (uniform if) — NEW control-flow feature.
+    //   s0=bits(a); s1=bits(b); SCC=(bits(a)<bits(b)); v2=a; if SCC: v2=a+b; out v2.
+    // For positive floats bits(a)<bits(b) == a<b, so v2 = (a<b) ? a+b : a. Exercises OpSelectionMerge +
+    // OpBranchConditional(scc) + the merge OpPhi for v2 (live-across register written in the block).
+    const uint32_t code61[] = {
+        0x7E000500u,   // v_readfirstlane_b32 s0, v0
+        0x7E020501u,   // v_readfirstlane_b32 s1, v1
+        0xBF0A0100u,   // s_cmp_lt_u32 s0, s1     -> SCC
+        0x7E040300u,   // v_mov_b32 v2, v0        (else value)
+        0xBF840001u,   // s_cbranch_scc0 +1       (skip the v_add when SCC==0)
+        0x06040300u,   // v_add_f32 v2, v0, v1    (then: v2 = a+b)
+        0xBF810000u,   // s_endpgm
+    };
+    std::vector<uint32_t> spv61 = recompile_valu(code61, sizeof(code61)/sizeof(code61[0]), 2, /*out_vgpr*/2);
+    CHECK(!spv61.empty(), "recompiled kernel 61 (forward s_cbranch_scc0 uniform if) -> SPIR-V");
+    std::vector<float> in61(N*2), exp61(N);
+    for (uint32_t i=0;i<N;i++){ float a=(float)i*0.1f+0.5f, b=6.0f; in61[i*2]=a; in61[i*2+1]=b; exp61[i]=(a<b)?(a+b):a; }
+    std::vector<float> got61 = prosper::test::run_compute(spv61, in61, N, N);
+    uint32_t bad61=0; for(uint32_t i=0;i<N&&got61.size()==N;i++) if(std::fabs(got61[i]-exp61[i])>1e-3f) bad61++;
+    printf("  kernel61 mismatches=%u (out[10]=%g expect=%g out[100]=%g expect=%g)\n",
+           bad61, got61.size()==N?got61[10]:-1, exp61[10], got61.size()==N?got61[100]:-1, exp61[100]);
+    CHECK(got61.size()==N && bad61==0, "recompiled kernel 61 (structured scc0 if: (a<b)?a+b:a) correct");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

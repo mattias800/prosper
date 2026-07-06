@@ -143,6 +143,11 @@ struct SpirvCompute {
         return r;
     }
     void patch_phi(size_t patch_off, uint32_t v1, uint32_t l1) { code[patch_off] = v1; code[patch_off + 1] = l1; }
+    void emit_selmerge(uint32_t m) { put(code, Op_SelectionMerge, {m, 0}); }   // structured if (before condbranch)
+    // OpPhi with two fully-known predecessors (both edges' values available now) — for an if/merge join.
+    uint32_t emit_phi_2way(uint32_t type, uint32_t va, uint32_t la, uint32_t vb, uint32_t lb) {
+        uint32_t r = id(); put(code, Op_Phi, {type, r, va, la, vb, lb}); return r;
+    }
     // Signed-int helpers: bits are bitcast to i32, the op runs, and the i32 result is bitcast to bits.
     uint32_t bcs(uint32_t u) { uint32_t r = id(); put(code, Op_Bitcast, {t_i32, r, u}); return r; }   // bits -> i32
     uint32_t i2u(uint32_t i) { uint32_t r = id(); put(code, Op_Bitcast, {t_u32, r, i}); return r; }   // i32 -> bits
@@ -830,6 +835,38 @@ CountedLoop detect_counted_loop(const std::vector<Rdna2Inst>& ins) {
     L.found = true; L.header_pc = header; L.exit_branch_pc = exitbr->pc; L.backedge_pc = back->pc;
     L.exit_pc = exit_pc; L.exit_on_scc0 = (exitbr->opcode == 0x04);
     return L;
+}
+
+// A single structured uniform IF: exactly ONE control-flow branch in the whole stream, and it is a
+// FORWARD s_cbranch_scc0/scc1 (a scalar-uniform conditional — all lanes take the same path). The
+// conditional block is [branch_pc+1, target_pc). Anything more (any s_branch/vcc/execz/execnz branch,
+// a backward branch/loop, or a target outside the stream) is rejected → falls back to straight-line
+// (which then rejects the scc branch, as before). Deliberately conservative: covers the common single
+// forward uniform-if without a general structurizer.
+struct ForwardIf {
+    bool found = false;
+    uint32_t branch_pc = 0, target_pc = 0;
+    bool on_scc0 = true;   // s_cbranch_scc0 (branch taken == skip block when SCC==0) vs scc1
+};
+ForwardIf detect_forward_if(const std::vector<Rdna2Inst>& ins) {
+    ForwardIf F; const Rdna2Inst* br = nullptr; int nbranch = 0; uint32_t end_pc = UINT32_MAX;
+    for (const auto& in : ins) if (in.is_end) { end_pc = in.pc; break; }
+    for (const auto& in : ins) {
+        if (in.is_end) break;
+        if (in.fmt != Rdna2Format::SOPP) continue;
+        switch (in.opcode) {
+            case 0x02: case 0x06: case 0x07: case 0x08: case 0x09:   // any other branch class -> reject
+                return F;
+            case 0x04: case 0x05:                                    // scc0 / scc1
+                br = &in; nbranch++; break;
+            default: break;                                          // hints (nop/waitcnt/…) are fine
+        }
+    }
+    if (nbranch != 1 || !br) return F;
+    const uint32_t tgt = branch_target(*br);
+    if (tgt <= br->pc || tgt > end_pc) return F;                     // must be forward, within the stream
+    F.found = true; F.branch_pc = br->pc; F.target_pc = tgt; F.on_scc0 = (br->opcode == 0x04);
+    return F;
 }
 
 // Registers WRITTEN in the pc range [lo, hi): candidates for an OpPhi at the loop header. Over-
@@ -1724,6 +1761,41 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         }
         // 7. Post-loop body.
         if (!emit_range(L.exit_pc, UINT32_MAX)) return false;
+    } else if (const ForwardIf F = detect_forward_if(ins); F.found) {
+        // Single structured uniform IF (forward s_cbranch_scc0/scc1): emit as OpSelectionMerge +
+        // OpBranchConditional on the SCC bool, with an OpPhi per register written in the conditional
+        // block that is live after the merge. Parallels the loop path's phi machinery. CONFIDENCE: MED —
+        // covers the single non-nested forward uniform-if; guarded by the 43-test suite + exec-diff.
+        auto vget = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
+        auto sget = [&](int r){ auto it = rs.sreg.find(r); return it == rs.sreg.end() ? b.uconst(0) : it->second; };
+        if (!emit_range(0, F.branch_pc)) return false;
+        if (rs.exec_narrowed) return false;                 // uniform branch needs full EXEC; bail if narrowed
+        if (idx < ins.size() && ins[idx].pc == F.branch_pc) ++idx;   // skip the scc branch itself
+        std::set<int> ifv, ifs;
+        loop_written_regs(ins, F.branch_pc + 1, F.target_pc, ifv, ifs);
+        std::unordered_map<int,uint32_t> pre_v, pre_s;
+        for (int r : ifv) pre_v[r] = vget(r);
+        for (int r : ifs) pre_s[r] = sget(r);
+        uint32_t pre_scc = rs.scc, pre_vcc = rs.vcc;
+        const uint32_t preblock = b.cur_block;              // block holding the OpBranchConditional (skip edge)
+        // scc0: branch (skip block) taken when SCC==0 → the block runs when SCC!=0; scc1 is the inverse.
+        uint32_t exec_cond = F.on_scc0 ? rs.scc : b.bsel(rs.scc, b.bfalse(), b.btrue());
+        uint32_t thenL = b.id(), mergeL = b.id();
+        b.emit_selmerge(mergeL); b.emit_condbranch(exec_cond, thenL, mergeL);
+        b.emit_label(thenL);
+        if (!emit_range(F.branch_pc + 1, F.target_pc)) return false;
+        if (rs.exec_narrowed) return false;                 // block must not narrow EXEC (reject if it does)
+        const uint32_t thenEnd = b.cur_block;               // single block (no inner branches) → == thenL
+        std::unordered_map<int,uint32_t> then_v, then_s;
+        for (int r : ifv) then_v[r] = vget(r);
+        for (int r : ifs) then_s[r] = sget(r);
+        uint32_t then_scc = rs.scc, then_vcc = rs.vcc;
+        b.emit_branch(mergeL); b.emit_label(mergeL);
+        for (int r : ifv) rs.vreg[r] = b.emit_phi_2way(b.t_u32,  pre_v[r], preblock, then_v[r], thenEnd);
+        for (int r : ifs) rs.sreg[r] = b.emit_phi_2way(b.t_u32,  pre_s[r], preblock, then_s[r], thenEnd);
+        if (then_scc != pre_scc) rs.scc = b.emit_phi_2way(b.t_bool, pre_scc, preblock, then_scc, thenEnd);
+        if (then_vcc != pre_vcc) rs.vcc = b.emit_phi_2way(b.t_bool, pre_vcc, preblock, then_vcc, thenEnd);
+        if (!emit_range(F.target_pc, UINT32_MAX)) return false;
     } else {
         if (!emit_range(0, UINT32_MAX)) return false;   // loop-free: straight-line, unchanged behavior
     }
