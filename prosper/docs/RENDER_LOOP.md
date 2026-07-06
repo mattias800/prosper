@@ -838,3 +838,19 @@ The descriptor is a runtime reflection object (allocated in the shader arena) wh
 empty ONLY for this type in our env (other structs at the same branch have populated tables). **NEXT:** find
 where this descriptor is built/populated (the code that sets `[r14+0x20]`/`[r14+0x30]`) and why our env
 leaves the param struct's field table empty — that is the exact fix site.
+
+### Descriptor builder is name-less (int3 all-thread confirmation)
+`PROSPER_BP=0x15fe650` (int3 code-patch, fires on ANY thread — not the per-thread perf HWBP) armed but got
+**0 hits**: the field-registering `MatrixParameter` GenerateTypeTree instantiation is never executed at all
+(dead in the player). Combined with `0x160d630`/`0x1609850` (also uncalled) and the fact that `m_RowCount`'s
+name is referenced ONLY by those, the runtime type descriptor is built by a **name-less mechanism** (compiled
+reflection / a generic RTTI walk), whose builder I have not located.
+
+**STATE FOR HANDOFF:** root is definitively pinned — the type descriptor for the crash param struct
+(MatrixParameter/VectorParameter) has field-count `[r14+0x30]=0` and NULL field table `[r14+0x20]=0`, so the
+reader at `eboot+0x1612209` skips the trailing SInt8 fields (`je 0x1612c70`) → 4B drift → the alignedString
+driver reads `{m_Type,m_RowCount,pad}`=`0x400` as a 1024 count → crash. Other structs at the same branch have
+populated descriptors. THE FIX SITE = wherever our env builds this one type's descriptor with an empty field
+table. Open leads for that: (a) the name-less descriptor/reflection builder (not yet found); (b) a stubbed
+sce/API call consulted during that build returning wrong; (c) the build runs during early static-init /
+on a worker thread that instrumentation missed; (d) a relocation of a compiled field-descriptor table.
