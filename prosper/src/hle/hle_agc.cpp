@@ -120,30 +120,39 @@ HLE(agc_dcb_acquire_mem) {  // (buf, engine, cb_db_op, gcr_cntl, ...) — 8 dw
     cmd[1] = (uint32_t)a2; cmd[2] = cmd[3] = cmd[4] = cmd[5] = cmd[6] = 0; cmd[7] = (uint32_t)a3;
     return (uint64_t)(uintptr_t)cmd;
 }
-HLE(agc_cb_release_mem) {  // GraphicsCbReleaseMem (buf, eventType,?,dstSel,cacheAction, dstGpuAddr; a6,a7=value) — 7 dw
-    volatile uint64_t* fp = (uint64_t*)__builtin_frame_address(0);  // fp[1]=ret, fp[2..]=stack args a6..
-    uint64_t a6 = fp[2], a7 = fp[3];
+HLE(agc_cb_release_mem) {  // sceAgcCbReleaseMem(buf, action, gcr_cntl, dst, cache_policy, address, data_sel, data, …)
+    // ABI pinned to Kyty GraphicsCbReleaseMem (Graphics.cpp:1763): a5=label address, then the two stack
+    // args are data_sel (7th) and the 64-bit fence value (8th). SysV: fp[1]=ret, fp[2]=data_sel, fp[3]=data.
+    volatile uint64_t* fp = (uint64_t*)__builtin_frame_address(0);
+    uint64_t data_sel = fp[2], data = fp[3];
     if (getenv("PROSPER_GFXLOG"))
-        fprintf(stderr, "[agc] ReleaseMem a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx | ret=0x%llx a6=0x%llx a7=0x%llx a8=0x%llx\n",
-            (unsigned long long)a1,(unsigned long long)a2,(unsigned long long)a3,(unsigned long long)a4,(unsigned long long)a5,
-            (unsigned long long)fp[1],(unsigned long long)a6,(unsigned long long)a7,(unsigned long long)fp[4]);
-    // EOP fence: stash the destination label address (a5) + both candidate value args (a6,a7) + the
-    // event type (a1) into the packet payload so the CommandProcessor can perform the completion write
-    // at SUBMIT time (correct end-of-pipe timing — our GPU folds synchronously, so submit == pipe drain).
-    // CONFIDENCE: HIGH — a5 is the label address (verified: WaitRegMem polls the SAME address).
-    // CONFIDENCE: LOW  — which stack arg is the value (a6∈{2,3} looks like a data-select/size; a7 looks
-    //   like the fence value, e.g. 0x1bfba062). Both are carried so the writeback (command_processor.cpp,
-    //   PROSPER_AGC_FENCE-selectable) can pick without a rebuild while we find what the game's poll wants.
+        fprintf(stderr, "[agc] ReleaseMem action=0x%llx dst=0x%llx addr=0x%llx data_sel=0x%llx data=0x%llx\n",
+            (unsigned long long)a1,(unsigned long long)a3,(unsigned long long)a5,
+            (unsigned long long)data_sel,(unsigned long long)data);
+    // EOP fence: stash the label address (a5), the data_sel, the full 64-bit value, and the event action
+    // into the packet so the CommandProcessor performs the completion write at SUBMIT time (correct
+    // end-of-pipe timing — our GPU folds synchronously, so submit == pipe drain). CONFIDENCE: HIGH — the
+    // arg positions are fixed by the AGC ABI; a5-as-label was independently confirmed (WaitRegMem polls it).
     uint32_t* cmd; if (!begin_packet(a0, 7, IT_NOP, R_RELEASE_MEM, &cmd)) return 0;
     cmd[1] = (uint32_t)(a5 & 0xffffffffu); cmd[2] = (uint32_t)(a5 >> 32u);
-    cmd[3] = (uint32_t)a6; cmd[4] = (uint32_t)a7; cmd[5] = (uint32_t)a1; cmd[6] = 0;
+    cmd[3] = (uint32_t)data_sel;
+    cmd[4] = (uint32_t)(data & 0xffffffffu); cmd[5] = (uint32_t)(data >> 32u);
+    cmd[6] = (uint32_t)a1;
     return (uint64_t)(uintptr_t)cmd;
 }
-HLE(agc_dcb_write_data) {  // (buf, dst, cache_policy, address_or_offset, ...) — 4 dw (num_dwords via stack, approx 0)
-    if (getenv("PROSPER_GFXLOG")) fprintf(stderr, "[agc] WriteData args a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx\n",
-        (unsigned long long)a1,(unsigned long long)a2,(unsigned long long)a3,(unsigned long long)a4,(unsigned long long)a5);
-    uint32_t* cmd; if (!begin_packet(a0, 4, IT_NOP, R_WRITE_DATA, &cmd)) return 0;
-    cmd[1] = (uint32_t)a1; cmd[2] = (uint32_t)(a3 & 0xffffffffu); cmd[3] = (uint32_t)(a3 >> 32u);
+HLE(agc_dcb_write_data) {  // sceAgcDcbWriteData(buf, dst, cache_policy, address_or_offset, data*, num_dwords, …)
+    // ABI per Kyty GraphicsDcbWriteData (Graphics.cpp:2061): a1=dst, a3=addr, a4=data ptr, a5=num_dwords.
+    const uint32_t* src = (const uint32_t*)(uintptr_t)a4;
+    uint32_t num = (uint32_t)a5;
+    if (num > 60) num = 60;   // clamp to keep the packet within a reasonable bound (labels/fences are tiny)
+    if (getenv("PROSPER_GFXLOG")) fprintf(stderr, "[agc] WriteData dst=0x%llx addr=0x%llx num=%u src=%p\n",
+        (unsigned long long)a1,(unsigned long long)a3, num, (const void*)src);
+    // Copy the inline data into the packet so the CommandProcessor can perform the write at submit time.
+    uint32_t* cmd; if (!begin_packet(a0, 5 + num, IT_NOP, R_WRITE_DATA, &cmd)) return 0;
+    cmd[1] = (uint32_t)a1;
+    cmd[2] = (uint32_t)(a3 & 0xffffffffu); cmd[3] = (uint32_t)(a3 >> 32u);
+    cmd[4] = num;
+    if (src) for (uint32_t i = 0; i < num; i++) cmd[5 + i] = src[i];
     return (uint64_t)(uintptr_t)cmd;
 }
 HLE(agc_dcb_wait_reg_mem) {  // (buf, ...) — 9 dw

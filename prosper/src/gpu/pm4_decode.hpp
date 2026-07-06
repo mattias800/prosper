@@ -51,11 +51,22 @@ struct Pm4Command {
     uint32_t event_type = 0;             // EventWrite
     uint32_t sh_reg_offset = 0, sh_reg_value = 0;  // SetShRegDirect
 
-    // ReleaseMem (EOP fence) — laid out by hle_agc.cpp agc_cb_release_mem into the packet payload:
-    // [0..1]=dst label GPU address (lo/hi), [2]=value candidate a6, [3]=value candidate a7, [4]=eventType.
-    // CONFIDENCE: HIGH addr; LOW which value arg — see agc_cb_release_mem / command_processor.cpp.
+    // ReleaseMem (EOP fence) — laid out by hle_agc.cpp agc_cb_release_mem, whose args are now pinned to the
+    // AGC ABI sceAgcCbReleaseMem(buf, action, gcr_cntl, dst, cache_policy, address, data_sel, data, …)
+    // (Kyty GraphicsCbReleaseMem, Graphics.cpp:1763). Packet payload: [0..1]=label address (lo/hi),
+    // [2]=data_sel, [3..4]=64-bit fence value (lo/hi), [5]=event action. data_sel (Kyty allows {2,3};
+    // shadPS4 DataSelect): 1=write 32-bit value, 2=write 64-bit value, 3=write 64-bit GPU clock.
+    // CONFIDENCE: HIGH — every field decoded straight from the packet the builder wrote.
     uint64_t rel_addr = 0;               // ReleaseMem: destination label address
-    uint32_t rel_v6 = 0, rel_v7 = 0;     // ReleaseMem: the two candidate fence values (a6, a7)
+    uint32_t rel_data_sel = 0;           // ReleaseMem: DATA_SEL (1/2/3)
+    uint64_t rel_value = 0;              // ReleaseMem: 64-bit fence value (for data_sel 1/2)
+
+    // WriteData — laid out by hle_agc.cpp agc_dcb_write_data per sceAgcDcbWriteData(buf, dst, cache_policy,
+    // address_or_offset, data*, num_dwords, …) (Kyty GraphicsDcbWriteData, Graphics.cpp:2061). Packet
+    // payload: [0]=dst, [1..2]=destination address (lo/hi), [3]=num_dwords, [4..]=inline data dwords.
+    uint64_t wd_addr = 0;                // WriteData: destination address
+    uint32_t wd_num = 0;                 // WriteData: number of dwords to write
+    const uint32_t* wd_data = nullptr;   // WriteData: -> the inline data dwords within the packet
 };
 
 // Decode `dwords` dwords starting at `buf` into `out` (appended). Returns the number of dwords

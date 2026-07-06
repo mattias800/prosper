@@ -93,6 +93,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_command_processor PRIVATE prosper_core)
   add_test(NAME command_processor_apply COMMAND test_command_processor)
 
+  # Stage B: CommandProcessor honors RELEASE_MEM/WRITE_DATA memory writes (synchronous end-of-pipe).
+  add_executable(test_eop_write tests/test_eop_write.cpp)
+  target_link_libraries(test_eop_write PRIVATE prosper_core)
+  add_test(NAME eop_write COMMAND test_eop_write)
+
   # Render-state extraction: fold a stream into a GpuState, then interpret RDNA2 registers.
   add_executable(test_render_state tests/test_render_state.cpp)
   target_link_libraries(test_render_state PRIVATE prosper_core)

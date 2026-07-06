@@ -49,21 +49,30 @@ because (a) no CPU thread polls those labels and (b) nothing was registered on t
 with "the app expects the driver to do the completion plumbing".
 
 ## Design — staged, each stage independently testable
-**Stage A — live device + execute on submit (no behavior risk; pure back-half wiring).**
-Promote a persistent `VulkanDevice` singleton (lift the device/queue setup from `render_runner.h` into
-`src/gpu/`). On `agc_driver_submit_dcb`, after folding, if the `GpuState` has draws: recompile its shaders,
-resolve pipeline state, execute the draws into the color target (`CB_COLOR0_BASE`, a 1:1-mapped guest
-addr), and `present_write_frame` it. Verify with a synthetic clear+triangle Dcb (extend `test_agc_submit`)
-→ readback asserts pixels. This makes "submit → real pixels" real; it's inert for the game until the stall
-clears but is the executor's core and fully unit-testable now.
+**Stage A — live device + execute on submit (no behavior risk; pure back-half wiring). DONE.**
+Implemented as the Vulkan-agnostic core `execute_gpustate()` (`src/gpu/gpu_execute.hpp`) plus the live-submit
+registry `set_submit_renderer`/`execute_and_present` (`src/gpu/gpu_executor.cpp`): whoever owns a device (the
+runtime binary at startup, or a test) registers a `LiveRenderFn`; `agc_driver_submit_dcb` calls
+`execute_and_present(state, present_width(), present_height())` after folding, gated on
+`have_submit_renderer() && draws>0`, so it is inert on the game path until a device is wired yet fully
+unit-tested (`test_gpu_execute`: GpuState → recompile+resolve+render → GREEN frame → `present_readback`
+byte-for-byte, via the registry path). Deliberately kept `prosper_core` Vulkan-free (backend is a
+`std::function`). Still open: promote a *persistent* device in the runtime binary and target `CB_COLOR0_BASE`
+directly (currently the backend renders to its own attachment at videoout resolution).
 
-**Stage B — honor the Dcb's memory-side effects (correct EOP semantics).**
-In `run_command_buffer`/`apply`, perform the writes the Dcb requests, since our CommandProcessor folds a
-submit synchronously (GPU "done" the instant SubmitDcb returns):
-- `RELEASE_MEM`/`EVENT_WRITE_EOP`: write the fence value to `dstGpuAddr` (the `maybe_fence_write` scaffold
-  exists — finish it using the exact value/width from the packet, per shadPS4 `PM4CmdReleaseMem::SignalFence`).
-- `WRITE_DATA`: write its value. `WAIT_REG_MEM`: no-op (the label is already written → condition satisfied).
-This is correct end-of-pipe semantics (not a shim) now that the reference confirms the value/encoding.
+**Stage B — honor the Dcb's memory-side effects (correct EOP semantics). DONE.**
+`GpuState::apply` performs the writes the Dcb requests, since our CommandProcessor folds a submit
+synchronously (GPU "done" the instant SubmitDcb returns → this IS the end-of-pipe moment):
+- `RELEASE_MEM`/`EVENT_WRITE_EOP` (`honor_eop_write`): write the fence value to the label address, honoring
+  `data_sel` (1=32-bit value, 2=64-bit value, 3=64-bit monotonic GPU clock). The AGC ABI is pinned to Kyty
+  `GraphicsCbReleaseMem` (`buf, action, gcr_cntl, dst, cache_policy, address, data_sel, data, …`) — this
+  resolved the earlier LOW-confidence "which arg is the value" (a5=address, stack arg 7=data_sel, stack arg
+  8=the 64-bit value). `agc_cb_release_mem` now lays out `[0..1]=addr [2]=data_sel [3..4]=value [5]=action`.
+- `WRITE_DATA` (`honor_write_data`): copy the inline dwords to the destination; `agc_dcb_write_data` now
+  copies the real `data*`/`num_dwords` (Kyty `GraphicsDcbWriteData`) into the packet. `WAIT_REG_MEM`: no-op
+  (the label is already written → condition satisfied).
+Correct end-of-pipe semantics, on by default; `PROSPER_NO_EOP_WRITE=1` disables for bisection. Verified by
+`test_eop_write` (data_sel 1/2/3 + WRITE_DATA + overflow-clamp). Replaces the old `PROSPER_AGC_FENCE` scaffold.
 
 **Stage C — completion signaling + emulate the driver's post.**
 - Hook `GraphicsAddEqEvent` (`b0xyllnVY-I`) to record `(eq, id, udata)` as an EOP source (mirror shadPS4

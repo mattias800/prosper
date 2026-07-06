@@ -48,14 +48,24 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
                 case R_DRAW_RESET:    c.kind = K::DrawReset;    break;
                 case R_WAIT_FLIP_DONE:c.kind = K::WaitFlipDone; break;
                 case R_ACQUIRE_MEM:   c.kind = K::AcquireMem;   break;
-                case R_WRITE_DATA:    c.kind = K::WriteData;    break;
+                case R_WRITE_DATA:
+                    c.kind = K::WriteData;
+                    // payload: [0]=dst, [1..2]=addr lo/hi, [3]=num_dwords, [4..]=inline data dwords.
+                    if (npl >= 3) c.wd_addr = (uint64_t)pl[1] | ((uint64_t)pl[2] << 32);
+                    if (npl >= 4) {
+                        c.wd_num  = pl[3];
+                        uint32_t avail = (npl > 4) ? (npl - 4) : 0;   // dwords actually present in the packet
+                        if (c.wd_num > avail) c.wd_num = avail;       // never read past the packet
+                        c.wd_data = (c.wd_num > 0) ? &pl[4] : nullptr;
+                    }
+                    break;
                 case R_WAIT_MEM_64:   c.kind = K::WaitRegMem;   break;
                 case R_RELEASE_MEM:
                     c.kind = K::ReleaseMem;
-                    // payload: [0..1]=dst label addr lo/hi, [2]=value a6, [3]=value a7 (see agc_cb_release_mem)
+                    // payload: [0..1]=label addr lo/hi, [2]=data_sel, [3..4]=64-bit value (see agc_cb_release_mem)
                     if (npl >= 2) c.rel_addr = lo_hi(pl);
-                    if (npl >= 3) c.rel_v6 = pl[2];
-                    if (npl >= 4) c.rel_v7 = pl[3];
+                    if (npl >= 3) c.rel_data_sel = pl[2];
+                    if (npl >= 5) c.rel_value = (uint64_t)pl[3] | ((uint64_t)pl[4] << 32);
                     break;
                 case R_FLIP:          c.kind = K::Flip;         break;
                 case R_DRAW_INDEX_AUTO:

@@ -3,34 +3,51 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <chrono>
 
 namespace prosper::gpu {
 
-// EOP fence writeback (bring-up experiment). RELEASE_MEM asks the GPU to write a completion value to a
-// label address when the pipe drains; a CPU thread then polls that label to know the submit finished.
-// Because our CommandProcessor folds each Dcb synchronously, the "GPU" is done at submit time, so writing
-// the label here is correct end-of-pipe semantics. The DESTINATION address is HIGH-confidence (WaitRegMem
-// polls the same address); the VALUE is LOW-confidence (unsure which captured arg / width the game's poll
-// wants), so PROSPER_AGC_FENCE selects the variant without a rebuild while we find what unblocks the game:
-//   1 = write a7 (32-bit)   2 = write a6 (32-bit)   3 = write 0xFFFFFFFF (satisfy >=/!= compares)
-//   4 = write 64-bit a7:a6  5 = write 64-bit 0xFFFF..FF   (unset/0 = do nothing)
-// CONFIDENCE: LOW — value mapping is a hypothesis; see docs/RENDER_LOOP.md fence-handshake section.
-static void maybe_fence_write(const Pm4Command& c) {
-    const char* mode = getenv("PROSPER_AGC_FENCE");
-    if (!mode || mode[0] == '0' || !c.rel_addr || (c.rel_addr & 3)) return;
-    auto* p32 = (volatile uint32_t*)(uintptr_t)c.rel_addr;
-    auto* p64 = (volatile uint64_t*)(uintptr_t)c.rel_addr;
-    switch (mode[0]) {
-        case '1': *p32 = c.rel_v7; break;
-        case '2': *p32 = c.rel_v6; break;
-        case '3': *p32 = 0xFFFFFFFFu; break;
-        case '4': *p64 = (uint64_t)c.rel_v6 | ((uint64_t)c.rel_v7 << 32); break;
-        case '5': *p64 = ~0ull; break;
-        default: break;
+// Disabled only for bring-up bisection. Honoring the Dcb's memory writes is correct default behavior:
+// because our CommandProcessor folds each submit synchronously, the pipe has "drained" by the time we
+// apply a packet, so this IS the end-of-pipe moment. Set PROSPER_NO_EOP_WRITE=1 to suppress the writes.
+static bool eop_writes_disabled() {
+    const char* off = getenv("PROSPER_NO_EOP_WRITE");
+    return off && off[0] == '1';
+}
+
+// A monotonic 64-bit "GPU clock" for RELEASE_MEM data_sel==3 (GpuClock64). Real hardware writes the GPU
+// timestamp; a strictly increasing counter has the property the game's poll needs (a later fence reads a
+// larger value). CONFIDENCE: MED — units differ from HW ticks, but monotonicity is what a >= poll checks.
+static uint64_t gpu_clock64() {
+    return (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count();
+}
+
+// Honor a RELEASE_MEM / EVENT_WRITE_EOP completion write. data_sel (Kyty GraphicsCbReleaseMem allows {2,3};
+// shadPS4 DataSelect enum): 1=write 32-bit value, 2=write 64-bit value, 3=write 64-bit GPU clock. The write
+// uses memcpy so an only-4-byte-aligned 64-bit label is handled portably. CONFIDENCE: HIGH — address,
+// data_sel and value are decoded directly from the packet the game's ReleaseMem call built.
+static void honor_eop_write(const Pm4Command& c) {
+    if (eop_writes_disabled() || !c.rel_addr || (c.rel_addr & 3)) return;
+    void* dst = (void*)(uintptr_t)c.rel_addr;
+    switch (c.rel_data_sel) {
+        case 1: { uint32_t v = (uint32_t)c.rel_value; memcpy(dst, &v, sizeof v); break; }
+        case 2: { uint64_t v = c.rel_value;           memcpy(dst, &v, sizeof v); break; }
+        case 3: { uint64_t v = gpu_clock64();         memcpy(dst, &v, sizeof v); break; }
+        default: return;   // None / unsupported: nothing to write
     }
     if (getenv("PROSPER_GFXLOG"))
-        fprintf(stderr, "[agc]   fence-write [0x%llx] mode=%c (a6=0x%x a7=0x%x)\n",
-                (unsigned long long)c.rel_addr, mode[0], c.rel_v6, c.rel_v7);
+        fprintf(stderr, "[agc]   EOP write [0x%llx] data_sel=%u value=0x%llx\n",
+                (unsigned long long)c.rel_addr, c.rel_data_sel, (unsigned long long)c.rel_value);
+}
+
+// Honor a WRITE_DATA packet: copy the inline dwords to the destination address (same synchronous timing).
+static void honor_write_data(const Pm4Command& c) {
+    if (eop_writes_disabled() || !c.wd_addr || (c.wd_addr & 3) || !c.wd_data || !c.wd_num) return;
+    memcpy((void*)(uintptr_t)c.wd_addr, c.wd_data, (size_t)c.wd_num * 4);
+    if (getenv("PROSPER_GFXLOG"))
+        fprintf(stderr, "[agc]   WriteData [0x%llx] %u dwords (first=0x%08x)\n",
+                (unsigned long long)c.wd_addr, c.wd_num, c.wd_data[0]);
 }
 
 void GpuState::apply(const Pm4Command& c) {
@@ -54,7 +71,10 @@ void GpuState::apply(const Pm4Command& c) {
             draws.push_back({ c.index_count });
             break;
         case K::ReleaseMem:
-            maybe_fence_write(c);   // EOP completion label write (bring-up, PROSPER_AGC_FENCE-gated)
+            honor_eop_write(c);     // EOP completion label write (correct synchronous end-of-pipe timing)
+            break;
+        case K::WriteData:
+            honor_write_data(c);    // inline data write requested by the Dcb
             break;
         default:
             break;   // events / flips / unknown: no register-state effect (handled later)
