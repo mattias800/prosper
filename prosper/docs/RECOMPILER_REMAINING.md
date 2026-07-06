@@ -69,7 +69,20 @@ The remaining shaders each need **one or more genuinely deep features** — veri
 | **006** | multi-tap sample + inline sampler | **inline sampler descriptor construction** (`s[8:11]` reused as a buffer V# then rebuilt as an S# via `s_movk`/`s_bfm`/`s_lshl`/`s_mov`) + dmask≠0xF (3-component) sampling. NSA + implicit-LOD sampling itself is done. |
 | **030, 037, 038** | large / wave-level | **wave-level ops**: `s_bfe_u64`/`s_lshr_b64` writing **EXEC** (wave-lane setup), **cross-lane** `v_mbcnt_lo/hi` (active-lane count), `v_readlane`; plus a long ALU tail. Hardest; multiple features each. |
 
-## Actionable plan: structured s_cbranch_scc0 (the +4-shader win)
+## Structured uniform-if: single forward s_cbranch_scc0 — **LANDED** (2026-07-06)
+The single forward `s_cbranch_scc0`/`scc1` case now recompiles: `detect_forward_if` + a structured-if path
+in `emit_body` (OpSelectionMerge + OpBranchConditional on the SCC bool + a merge OpPhi per register written
+in the conditional block). Additive (loop + straight-line paths untouched), verified by exec-diff kernel 61
+`(a<b)?a+b:a`, spirv-val green. **This did NOT move the 34/41 count**: the 4 shaders that `shader_histo`
+flags at SOPP 0x4 have more complex control flow (multiple/nested branches, likely if-else or
+loop-with-inner-if) that the conservative single-if detector rejects — and `shader_histo`'s blocker report
+is a *static per-opcode* check, so it still lists SOPP 0x4 regardless of the new whole-stream handling.
+**Follow-up for the +4:** extend to a SEQUENCE of non-overlapping forward-ifs (still bounded), then a
+general relooper-style structurizer for nested/if-else/loop+if. Needs per-blocked-shader CF dumps to size
+(shader_histo dumps only the biggest, which is branch-free — a small tool to dump a *named/blocked* shader
+would help). The single-if machinery (value-map + emit_phi_2way at a join) is the reusable foundation.
+
+## (original plan retained) structured s_cbranch_scc0
 Scoped 2026-07-06. Current state: `s_cbranch_scc0`/`scc1` are handled ONLY as a loop's single exit branch
 (the `emit_body` loop reconstruction, rdna2_to_spirv.cpp ~line 819/1691); a general **forward** scc branch
 that is NOT a loop exit is rejected (`emit_alu` SOPP case 0x04/0x05 → `ok=false`, ~line 1339). These are
