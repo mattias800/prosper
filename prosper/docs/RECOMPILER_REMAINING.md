@@ -4,8 +4,11 @@
 (The earlier "34/41" was a coverage-tool undercount — it ran a per-instruction check that didn't credit
 `emit_body`'s loop/if reconstruction, so the MSAA-resolve loop shaders 031-034 were mis-flagged as blocked
 even though they recompile. Fixed 2026-07-06; true count is 38/41. **The only genuine remaining blocker is
-cross-lane `v_mbcnt`/`v_readlane` — the LDS wave-model — affecting the last 3 shaders.** All bounded ALU
-gaps are now closed: `v_add_co_ci_u32`/sub/subrev (VOP3B carry) landed (kernel 62); the 1 shader that used
+cross-lane `v_mbcnt`/`v_readlane` — the LDS wave-model.** **UPDATE 2026-07-06: the LDS wave-model is now
+BUILT and verified** — `v_mbcnt_lo/hi` with `src0=EXEC` recompiles via a workgroup-as-wave + LDS
+prefix-count (kernels 63 full-exec + 64 divergent, both exec-diff-green). The remaining 2-3 shaders use a
+non-EXEC `src0` (a ballot-mask value) and `v_readlane`, which build on this same foundation — follow-up
+extensions, not new architecture. Still 38/41 pending those. All bounded ALU gaps are closed: `v_add_co_ci_u32`/sub/subrev (VOP3B carry) landed (kernel 62); the 1 shader that used
 it now stops at `s_and_b64` (SOP2 0xf, a 64-bit wave-mask op) and, like the other 2, needs the wave-model
 underneath. So the LDS wave-model (`v_mbcnt`/`v_readlane` + 64-bit mask ops as workgroup/LDS cross-lane) is
 the single remaining recompiler feature for 41/41 on this title — a real architectural change (design note
