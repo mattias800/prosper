@@ -896,3 +896,58 @@ labels — verify SubmitDcb #3+ arrives with scene content once presentation com
 Diagnostics added (all gated): `PROSPER_CTXDUMP` (per-AGC-call ctx sub-object {src,ud} dump),
 `PROSPER_SUBWATCH` (HLE-armed HW write-watch on a ctx sub slot), `g_hwwatch_hook` (dispatch.hpp — lets
 HLE code arm the perf write-watch on runtime-discovered addresses; SIGTRAP handler installs on demand).
+
+## 2026-07-06 — ⭐⭐ LIVE RENDERER WIRED + the game's real PIXEL shader recompiles to SPIR-V
+
+Wired the Stage-A executor to a live Vulkan device (`boot_trace` `PROSPER_RENDER=1` registers
+`render_triangle_rgba` as the submit renderer; frames dump to BMP). On each `SubmitDcb` with draws,
+`execute_gpustate` now recompiles the game's real shaders and renders. Progress on the actual
+first-frame draw (SubmitDcb #2, the Unity textured-UI pair):
+
+- **Added `v_rndne_f32` (VOP1 0x23)** — the one truly-unsupported ALU op. Both shaders now report
+  `unsupported=0`.
+- **Resource-table bridge** (`execute_gpustate` → `build_stage_table` in `gpu_executor.cpp`): looks up
+  the registered `AgcShader` header by its bound code address (`prosper_agc_shader_header_for_code`),
+  reads the user-data SGPR block from the folded `sh` register file, decodes V#/T#/S# descriptors, and
+  assigns bindings to the recompiler convention (cbuf→2, vertex buffer→3, textures→4+). Added
+  `decode_image_descriptor` (T#, Kyty Gen5 layout) + texture emission in `build_shader_resources`.
+- **Result: the PIXEL shader RECOMPILES to 737 dwords of valid SPIR-V** — `image_sample` and
+  `s_buffer_load` resolve against the table.
+
+**The remaining blocker for a live frame = VERTEX-shader bindless/SRT descriptor resolution.** The VS
+loads its vertex-buffer V#s **indirectly**:
+```
+s_load_dwordx4 s[8:11], s[24:25], <soffset>      ; V# loaded from a table ptr in user SGPRs s[24:25]
+buffer_load_format_xyzw v[0:3], v0, s[8:11] idxen ; vertex fetch THROUGH the loaded V#
+```
+Our `build_shader_resources` assumes descriptors are **inline** in the user-SGPR block; here they live in
+an EUD/SRT table that s[24:25] points at, s_loaded at per-descriptor offsets (some immediate: 0x8/0x50/
+0x60/0x110; the vertex-buffer ones use an SGPR soffset). The `[restab]` dump confirms the inline read is
+wrong (cbuf addrs=0, T# decodes to a degenerate 1×1) — the real descriptors are behind the indirection.
+
+**NEXT (the frontier for actual game pixels):** implement indirect SRT/EUD descriptor resolution —
+follow the table pointer in the user SGPRs into guest memory, read the real V#/T# bytes at each s_load's
+offset, and (for the recompiler's `sreg_srt` provenance already present) emit resources keyed by
+`srt_offset`. Then the VS recompiles, the descriptor DATA is correct, and the frame renders. Texture
+detiling (`tile_mode`≠0) is the following step. Everything up to here is committed + green (Linux 45/45,
+Windows 20/20); the live renderer fires the moment both stages recompile.
+
+### The EUD (Extended User Data) mechanism — the exact recipe for the VS unblock (RE'd via Kyty)
+
+Kyty `Shader.cpp` `ShaderParseUsage` shows how descriptors resolve when they don't fit in the 16-dword
+user-SGPR block:
+- A descriptor sharp's `offset_dw` (Kyty `start_register`) selects where its V#/T# bytes live:
+  - `offset_dw < 16`  → **inline**: read from `user_sgpr[offset_dw + j]` (what we do today).
+  - `offset_dw >= 16` → **extended**: read from `extended_buffer[offset_dw - 16 + j]`, where
+    `extended_buffer` is a pointer into guest memory (the EUD).
+- The **EUD base pointer** is a 2-dword value in the user SGPRs, tagged by usage **type 0x1b**:
+  `extended.data.fields[0..1] = user_sgpr[start_register..+1]`, and `.Base()` (a V#-style base) is the
+  EUD address. So: find the type-0x1b user-data slot → read its 2 dwords → that's the EUD base.
+
+**Concrete fix for `build_shader_resources`/`build_stage_table`:** when `offset_dw >= 16`, read the
+descriptor from `*(guest)(eud_base + (offset_dw-16)*4)` instead of `user_sgprs[offset_dw]`. Provide the
+EUD base (from the type-0x1b slot, or — pending our own usage parse — the 2-dword user-SGPR pair the
+shader s_loads its descriptor table from: `s[24:25]` in the observed VS). Descriptors are 1:1-mapped
+guest pointers, so binding is a direct read. This resolves the VS's `buffer_load_format` V#s (and the
+PS's real T#/cbuf, replacing the degenerate inline 1×1), after which BOTH stages recompile and the live
+renderer produces the first real game frame. This is the single, well-characterized next step.
