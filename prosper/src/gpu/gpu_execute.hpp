@@ -12,6 +12,8 @@
 #include "render_state.hpp"        // extract_render_state / resolve_pipeline_state / ResolvedPipelineState
 #include "rdna2_to_spirv.hpp"      // recompile_vertex / recompile_fragment
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <vector>
 
@@ -31,10 +33,34 @@ inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn&
                                              uint32_t max_shader_dwords = 0x10000) {
     if (st.draws.empty() || !render) return {};              // nothing to render (e.g. a state-only submit)
     RenderState rs = extract_render_state(st);
-    if (!rs.es_addr || !rs.ps_addr) return {};               // no vertex/pixel program bound
+    const bool log = getenv("PROSPER_GFXLOG") != nullptr;    // bail-point visibility (why no frame?)
+    if (!rs.es_addr || !rs.ps_addr) {                        // no vertex/pixel program bound
+        if (log) fprintf(stderr, "[exec] skip: no PGM bound (es=0x%llx ps=0x%llx, %zu draws)\n",
+                         (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr, st.draws.size());
+        return {};
+    }
     std::vector<uint32_t> vs = recompile_vertex((const uint32_t*)(uintptr_t)rs.es_addr, max_shader_dwords);
     std::vector<uint32_t> fs = recompile_fragment((const uint32_t*)(uintptr_t)rs.ps_addr, max_shader_dwords);
-    if (vs.empty() || fs.empty()) return {};                 // an unsupported shader — leave frame untouched
+    if (vs.empty() || fs.empty()) {                          // an unsupported shader — leave frame untouched
+        if (log) {
+            fprintf(stderr, "[exec] skip: recompile failed (vs=%zu fs=%zu dwords; es=0x%llx ps=0x%llx)\n",
+                    vs.size(), fs.size(), (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr);
+            for (auto [tag, addr] : {std::pair{"vs", rs.es_addr}, std::pair{"ps", rs.ps_addr}}) {
+                RecompileCoverage c = recompile_coverage((const uint32_t*)(uintptr_t)addr, max_shader_dwords);
+                fprintf(stderr, "[exec]   %s coverage: total=%u alu=%u exp=%u tabledep=%u unsupported=%u "
+                                "first_bad fmt=%d op=0x%x\n",
+                        tag, c.total, c.alu, c.exports, c.table_dependent, c.unsupported,
+                        c.first_bad_fmt, c.first_bad_op);
+                // PROSPER_SHADER_DUMP: write the raw code (4 KB cap) for offline llvm-mc disassembly.
+                if (const char* dd = getenv("PROSPER_SHADER_DUMP")) {
+                    char fn[512]; snprintf(fn, sizeof fn, "%s/exec_%s_%llx.bin", dd, tag,
+                                           (unsigned long long)addr);
+                    if (FILE* f = fopen(fn, "wb")) { fwrite((const void*)(uintptr_t)addr, 1, 4096, f); fclose(f); }
+                }
+            }
+        }
+        return {};
+    }
     ResolvedPipelineState ps = resolve_pipeline_state(rs);
     return render(vs, fs, ps);
 }

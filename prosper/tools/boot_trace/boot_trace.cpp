@@ -7,6 +7,12 @@
 #include "hle/dispatch.hpp"
 #include <cstdio>
 #include <string>
+#ifdef PROSPER_HAVE_VULKAN
+#include "gpu/gpu_execute.hpp"
+#include "../../tests/render_runner.h"   // offscreen Vulkan backend (render_triangle_rgba) + dump_bmp
+#include <atomic>
+#include <cstdlib>
+#endif
 
 using namespace prosper;
 
@@ -69,6 +75,32 @@ int main(int argc, char** argv) {
     if (!install_stubs(p.slots, p.stub_base, p.stub_size, &e)) { printf("stubs failed: %s\n", e.c_str()); return 1; }
     install_trap_handler();
     run_guest_inits(p.init_fns);
+
+#ifdef PROSPER_HAVE_VULKAN
+    // PROSPER_RENDER=1: register the live Vulkan renderer so execute_and_present fires on every
+    // submitted Dcb with draws (Stage A of GPU_EXECUTOR_DESIGN.md, now live). Each rendered frame
+    // goes to the present path; the first few (and then every 60th) are also dumped as BMP
+    // screenshots under PROSPER_FRAME_DIR (default cwd). llvmpipe renders headless in WSL.
+    if (getenv("PROSPER_RENDER")) {
+        static std::atomic<int> frame_no{0};
+        static std::string fdir = getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".";
+        prosper::gpu::set_submit_renderer(
+            [](const std::vector<uint32_t>& vs, const std::vector<uint32_t>& fs,
+               const prosper::gpu::ResolvedPipelineState& ps, uint32_t w, uint32_t h) {
+                std::vector<uint8_t> px = prosper::test::render_triangle_rgba(vs, fs, w, h, &ps);
+                int n = frame_no++;
+                if (px.empty()) {
+                    fprintf(stderr, "[render] frame %d: Vulkan render FAILED (%ux%u)\n", n, w, h);
+                } else if (n < 8 || n % 60 == 0) {
+                    char fn[512]; snprintf(fn, sizeof fn, "%s/frame_%04d.bmp", fdir.c_str(), n);
+                    prosper::test::dump_bmp(fn, px, w, h);
+                    fprintf(stderr, "[render] frame %d rendered (%ux%u) -> %s\n", n, w, h, fn);
+                }
+                return px;
+            });
+        fprintf(stderr, "[render] live Vulkan submit renderer registered (frames -> %s)\n", fdir.c_str());
+    }
+#endif
 
     BootResult r = run_entry(p.imgs[0]);
     printf("\n=== RUN ENDED: kind=%d  %s ===\n", r.kind, r.detail.c_str());

@@ -213,6 +213,11 @@ if(TARGET prosper_core)
     # (render/clear -> readback -> pixel/CRC assert). Only built if Vulkan dev files are present.
     find_package(Vulkan QUIET)
     if(Vulkan_FOUND)
+      # Live game rendering: with Vulkan available, boot_trace can register the live submit renderer
+      # (PROSPER_RENDER=1) so the game's SubmitDcb draws execute + present + dump frames to disk.
+      target_link_libraries(boot_trace PRIVATE Vulkan::Vulkan)
+      target_compile_definitions(boot_trace PRIVATE PROSPER_HAVE_VULKAN=1)
+
       add_executable(test_vulkan_offscreen tests/test_vulkan_offscreen.cpp)
       target_link_libraries(test_vulkan_offscreen PRIVATE Vulkan::Vulkan)
       add_test(NAME vulkan_offscreen_clear COMMAND test_vulkan_offscreen)

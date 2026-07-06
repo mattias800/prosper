@@ -1202,6 +1202,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x20: d = b.fext1(Glsl_Fract, a); break;         // v_fract_f32
                 case 0x21: d = b.fext1(Glsl_Trunc, a); break;         // v_trunc_f32
                 case 0x22: d = b.fext1(Glsl_Ceil, a); break;          // v_ceil_f32
+                case 0x23: d = b.fext1(Glsl_RoundEven, a); break;     // v_rndne_f32 (round to nearest even)
                 case 0x24: d = b.fext1(Glsl_Floor, a); break;         // v_floor_f32
                 case 0x25: d = b.fext1(Glsl_Exp2, a); break;          // v_exp_f32 (2^x)
                 case 0x27: d = b.fext1(Glsl_Log2, a); break;          // v_log_f32 (log2)
