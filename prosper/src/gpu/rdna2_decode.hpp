@@ -69,6 +69,10 @@ struct Rdna2Inst {
     // set has_modifier so the instruction is rejected rather than miscomputed. VOP2 has no source mods.
     bool     src_neg[4] = {false, false, false, false};
     bool     src_abs[4] = {false, false, false, false};
+    // VOP3 output modifiers (float ops): CLAMP = saturate result to [0,1] (dword0[15]); OMOD scales the
+    // result ×2 (1) / ×4 (2) / ×0.5 (3) (dword1[28:27]). Applied after the op, before writing dst.
+    bool     clamp = false;
+    uint8_t  omod  = 0;
 
     // EXP-only: export target (MRT0=0..7, MRTZ=8, NULL=9, POS0=12..15, PARAM0=32..) and the 4-bit
     // per-component enable mask. The 4 exported VGPRs are in src[0..3].

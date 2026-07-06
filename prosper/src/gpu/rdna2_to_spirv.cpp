@@ -1213,6 +1213,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (in.src_neg[k]) bits = b.fbin(Op_FSub, b.uconst(0), bits);   // 0.0 - x = -x
                 return bits;
             };
+            // Output modifiers on a FLOAT result: OMOD scale (×2/×4/×0.5) then CLAMP saturate to [0,1]
+            // (hardware order: clamp(omod(x))). Wrap each float op's result through this.
+            auto fresult = [&](uint32_t bits) -> uint32_t {
+                if (in.omod == 1)      bits = b.fbin(Op_FMul, bits, b.uconst(fbits(2.0f)));
+                else if (in.omod == 2) bits = b.fbin(Op_FMul, bits, b.uconst(fbits(4.0f)));
+                else if (in.omod == 3) bits = b.fbin(Op_FMul, bits, b.uconst(fbits(0.5f)));
+                if (in.clamp) bits = b.fext2(Glsl_FMax, b.fext2(Glsl_FMin, bits, b.uconst(fbits(1.0f))), b.uconst(fbits(0.0f)));
+                return bits;
+            };
             if (in.opcode == 0x14B || in.opcode == 0x141) {           // v_fma_f32 / v_mad_f32 = src0*src1 + src2
                 // v_mad_f32 (op 0x141) is a gfx10.1 (Navi) instruction REMOVED in gfx10.3, so llvm-mc
                 // -mcpu=gfx1030 rejects it as invalid — but the PS5 shader compiler targets gfx10.1 and
@@ -1220,7 +1229,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // (unfused mul-then-add) maps exactly to OpFMul+OpFAdd; v_fma's fused rounding is
                 // immaterial here. VERIFIED(round-trip llvm-mc gfx1010, both directions): VOP3 op 0x141.
                 uint32_t m = b.fbin(Op_FMul, fv(0), fv(1));
-                vreg[in.dst.value] = b.fbin(Op_FAdd, m, fv(2));
+                vreg[in.dst.value] = fresult(b.fbin(Op_FAdd, m, fv(2)));
             } else if (in.opcode == 0x169) {                          // v_mul_lo_u32
                 vreg[in.dst.value] = b.ibin(Op_IMul, val(in.src[0]), val(in.src[1]));
             } else if (in.opcode == 0x16a) {                          // v_mul_hi_u32 (high 32 bits)
@@ -1230,7 +1239,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             } else if (in.opcode == 0x157) {                          // v_med3_f32 = median(s0,s1,s2)
                 uint32_t s0 = fv(0), s1 = fv(1), s2 = fv(2);
                 uint32_t mn = b.fext2(Glsl_FMin, s0, s1), mx = b.fext2(Glsl_FMax, s0, s1);
-                vreg[in.dst.value] = b.fext2(Glsl_FMax, mn, b.fext2(Glsl_FMin, mx, s2));
+                vreg[in.dst.value] = fresult(b.fext2(Glsl_FMax, mn, b.fext2(Glsl_FMin, mx, s2)));
             } else if (in.opcode == 0x143) {                          // v_mad_u32_u24 = (s0&0xFFFFFF)*(s1&0xFFFFFF)+s2
                 uint32_t m24 = b.uconst(0xFFFFFF);
                 uint32_t p = b.ibin(Op_IMul, b.ibin(Op_BitwiseAnd, val(in.src[0]), m24),
@@ -1272,7 +1281,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             } else if (in.opcode == 0x12F) {                          // v_cvt_pkrtz_f16_f32 = pack(s0->lo, s1->hi)
                 vreg[in.dst.value] = b.pack_half2x16(val(in.src[0]), val(in.src[1]));
             } else if (in.opcode == 0x107) {                          // v_mul_legacy_f32 ~= s0*s1
-                vreg[in.dst.value] = b.fbin(Op_FMul, fv(0), fv(1));
+                vreg[in.dst.value] = fresult(b.fbin(Op_FMul, fv(0), fv(1)));
             } else if (in.opcode == 0x101) {                          // v_cndmask_b32_e64: src2_mask ? src1 : src0
                 const Operand& s2 = in.src[2]; uint32_t m = 0;        // src2 is an SGPR-pair (or VCC) wave mask
                 if (s2.value == 106 || s2.value == 107) m = rs.vcc;

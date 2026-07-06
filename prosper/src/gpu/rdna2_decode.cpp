@@ -98,8 +98,10 @@ void decode_operands(Rdna2Inst& i) {
             // Source float modifiers: ABS = dword0[10:8], NEG = dword1[31:29] (one bit per source). These
             // are correctness-critical (a-b, abs(), -x are ubiquitous) — previously ignored → silent wrong.
             for (int k = 0; k < 3; k++) { i.src_abs[k] = ((w >> (8 + k)) & 1u) != 0; i.src_neg[k] = ((d1 >> (29 + k)) & 1u) != 0; }
-            // CLAMP (dword0[15]) / OMOD (dword1[28:27]) are not modeled — reject rather than miscompute.
-            if (((w >> 15) & 1u) || ((d1 >> 27) & 3u)) i.has_modifier = true;
+            // CLAMP (dword0[15]) = saturate result to [0,1]; OMOD (dword1[28:27]) = result ×2/×4/×0.5.
+            // Applied to the float result in the recompiler (rdna2_to_spirv VOP3 float ops).
+            i.clamp = ((w >> 15) & 1u) != 0;
+            i.omod  = (uint8_t)((d1 >> 27) & 3u);
             break;
         }
         case Rdna2Format::SOP1:

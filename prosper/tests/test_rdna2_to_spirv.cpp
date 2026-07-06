@@ -985,6 +985,30 @@ int main() {
     printf("  kernel53 mismatches=%u (out[10]=%g expect=%g)\n", bad53, got53.size()==N?got53[10]:-1, exp53[10]);
     CHECK(got53.size()==N && bad53==0, "recompiled kernel 53 (VOP3 |src0|: |a0|*a1+a2) correct");
 
+    // Kernel 54: VOP3 CLAMP output modifier. v_fma_f32 v3, v0, v1, v2 clamp = saturate(a0*a1+a2) to [0,1].
+    const uint32_t code54[] = { 0xD54B8003u, 0x040A0300u, 0xBF810000u };
+    std::vector<uint32_t> spv54 = recompile_valu(code54, sizeof(code54)/sizeof(code54[0]), 3, /*out_vgpr*/3);
+    CHECK(!spv54.empty(), "recompiled kernel 54 (v_fma_f32 clamp) -> SPIR-V");
+    std::vector<float> in54(N * 3), exp54(N);
+    for (uint32_t i = 0; i < N; i++) { float a0=(float)i*0.05f-2.0f, a1=1.0f, a2=0.25f; float r=a0*a1+a2;
+        in54[i*3+0]=a0; in54[i*3+1]=a1; in54[i*3+2]=a2; exp54[i] = r<0.0f?0.0f:(r>1.0f?1.0f:r); }
+    std::vector<float> got54 = prosper::test::run_compute(spv54, in54, N, N);
+    uint32_t bad54 = 0; for (uint32_t i=0;i<N&&got54.size()==N;i++) if (std::fabs(got54[i]-exp54[i])>1e-3f) bad54++;
+    printf("  kernel54 mismatches=%u (out[5]=%g expect=%g out[100]=%g)\n", bad54, got54.size()==N?got54[5]:-1, exp54[5], got54.size()==N?got54[100]:-1);
+    CHECK(got54.size()==N && bad54==0, "recompiled kernel 54 (VOP3 clamp: saturate(a0*a1+a2)) correct");
+
+    // Kernel 55: VOP3 OMOD (mul:2). v_fma_f32 v3, v0, v1, v2 mul:2 = 2*(a0*a1+a2).
+    const uint32_t code55[] = { 0xD54B0003u, 0x0C0A0300u, 0xBF810000u };
+    std::vector<uint32_t> spv55 = recompile_valu(code55, sizeof(code55)/sizeof(code55[0]), 3, /*out_vgpr*/3);
+    CHECK(!spv55.empty(), "recompiled kernel 55 (v_fma_f32 mul:2) -> SPIR-V");
+    std::vector<float> in55(N * 3), exp55(N);
+    for (uint32_t i = 0; i < N; i++) { float a0=(float)i*0.1f-6.0f, a1=0.5f, a2=1.0f;
+        in55[i*3+0]=a0; in55[i*3+1]=a1; in55[i*3+2]=a2; exp55[i] = 2.0f*(a0*a1+a2); }
+    std::vector<float> got55 = prosper::test::run_compute(spv55, in55, N, N);
+    uint32_t bad55 = 0; for (uint32_t i=0;i<N&&got55.size()==N;i++) if (std::fabs(got55[i]-exp55[i])>1e-3f) bad55++;
+    printf("  kernel55 mismatches=%u (out[80]=%g expect=%g)\n", bad55, got55.size()==N?got55[80]:-1, exp55[80]);
+    CHECK(got55.size()==N && bad55==0, "recompiled kernel 55 (VOP3 omod mul:2: 2*(a0*a1+a2)) correct");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
