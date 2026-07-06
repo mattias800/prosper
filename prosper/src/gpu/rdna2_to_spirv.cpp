@@ -59,7 +59,7 @@ enum : uint32_t {
     SC_Workgroup=4, Scope_Workgroup=2, MemSem_WGAcqRel=0x108,   // LDS: Workgroup storage + barrier scope/semantics
     Dec_Block=2, Dec_ArrayStride=6, Dec_BuiltIn=11, Dec_Location=30, Dec_Binding=33,
     Dec_DescriptorSet=34, Dec_Offset=35,
-    BI_Position=0, BI_GlobalInvocationId=28, BI_VertexIndex=42,
+    BI_Position=0, BI_LocalInvocationId=27, BI_GlobalInvocationId=28, BI_VertexIndex=42,
 };
 
 uint32_t fbits(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
@@ -465,6 +465,40 @@ struct SpirvCompute {
     void barrier() {
         put(code, Op_ControlBarrier, {uconst(Scope_Workgroup), uconst(Scope_Workgroup), uconst(MemSem_WGAcqRel)});
     }
+
+    // --- Wave model (cross-lane ops via a workgroup-as-wave + LDS). The compute shell dispatches one
+    // 64-invocation workgroup per wave; gl_LocalInvocationID.x is the lane. A dedicated LDS scratch array
+    // (separate from ds_read/write's lds_var) holds each lane's contribution so cross-lane reductions work.
+    // Inactive lanes still EXECUTE (exec is a per-lane predication bool), so all 64 reach the barriers —
+    // valid only at wave-uniform points (the caller must not emit these inside divergent control flow). ---
+    uint32_t v_localid = 0, localid = 0, lds_wave = 0, t_ptr_wg_u32b = 0;
+    void declare_wave_lds() {
+        if (lds_wave) return;
+        uint32_t t_arr = id();  put(types, Op_TypeArray, {t_arr, t_u32, uconst(64)});
+        uint32_t t_ptr = id();  put(types, Op_TypePointer, {t_ptr, SC_Workgroup, t_arr});
+        lds_wave = id();        put(types, Op_Variable, {t_ptr, lds_wave, SC_Workgroup});
+        t_ptr_wg_u32b = id();   put(types, Op_TypePointer, {t_ptr_wg_u32b, SC_Workgroup, t_u32});
+    }
+    // v_mbcnt_lo/hi: count active lanes below this one. active_bool = this lane's mask bit (EXEC); acc =
+    // src1 accumulator (bits); `lo` selects the [0,32) half (lo) or [32,64) half (hi). Combined lo→hi over
+    // a wave = the lane's compaction index among active lanes. Populate LDS[lane]=active, barrier, then an
+    // unrolled prefix-count over the half; trailing barrier so a following mbcnt can safely re-populate.
+    uint32_t mbcnt(uint32_t active_bool, uint32_t acc_bits, bool lo) {
+        declare_wave_lds();
+        uint32_t bit = sel(active_bool, uconst(1), uconst(0));
+        { uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_wg_u32b, p, lds_wave, localid}); put(code, Op_Store, {p, bit}); }
+        barrier();
+        uint32_t sum = uconst(0);
+        for (uint32_t i = (lo ? 0u : 32u); i < (lo ? 32u : 64u); i++) {
+            uint32_t cond = ucmp(Op_ULessThan, uconst(i), localid);        // i < lane
+            uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_wg_u32b, p, lds_wave, uconst(i)});
+            uint32_t v = id(); put(code, Op_Load, {t_u32, v, p});
+            sum = b_iadd(sum, sel(cond, v, uconst(0)));
+        }
+        barrier();
+        return b_iadd(acc_bits, sum);
+    }
+    uint32_t b_iadd(uint32_t a, uint32_t b_) { uint32_t r = id(); put(code, Op_IAdd, {t_u32, r, a, b_}); return r; }
     // Declare the two scalar-memory constant/vertex buffers (bindings 2 & 3) that SMEM / buffer_load_
     // format_* read. Called by every shell (compute/vertex/fragment) so cbuf_load works in each.
     // Requires t_u32 to already be declared. Unused by shaders without memory ops.
@@ -506,7 +540,7 @@ struct SpirvCompute {
         stride = input_stride;
         t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_i32 = id(); t_v3u = id(); t_bool = id();
         t_v4f = id();   // vec4<float>: needed by the sampled-texture path (image_sample) in a compute shader
-        uint32_t t_ptr_in_v3u = id(); v_gid = id();
+        uint32_t t_ptr_in_v3u = id(); v_gid = id(); v_localid = id();
         uint32_t t_rta = id(), t_struct = id(), t_ptr_sb_struct = id();
         v_in = id(); v_out = id(); t_ptr_sb_f32 = id();
         f_main = id(); uint32_t lbl = id(); glsl = id();
@@ -515,9 +549,10 @@ struct SpirvCompute {
         { std::vector<uint32_t> o{glsl}; pstr(o, "GLSL.std.450"); putv(extimp, Op_ExtInstImport, o); }
         put(mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
         is_compute = true;
-        exec_model = Exec_GLCompute; iface = {v_gid};   // EntryPoint deferred to finish()
+        exec_model = Exec_GLCompute; iface = {v_gid, v_localid};   // EntryPoint deferred to finish()
         put(exec, Op_ExecutionMode, {f_main, EM_LocalSize, 64, 1, 1});
         put(deco, Op_Decorate, {v_gid, Dec_BuiltIn, BI_GlobalInvocationId});
+        put(deco, Op_Decorate, {v_localid, Dec_BuiltIn, BI_LocalInvocationId});   // wave lane index (.x)
         put(deco, Op_Decorate, {t_rta, Dec_ArrayStride, 4});
         put(deco, Op_MemberDecorate, {t_struct, 0, Dec_Offset, 0});
         put(deco, Op_Decorate, {t_struct, Dec_Block});
@@ -533,6 +568,7 @@ struct SpirvCompute {
         put(types, Op_TypeBool, {t_bool});
         put(types, Op_TypePointer, {t_ptr_in_v3u, SC_Input, t_v3u});
         put(types, Op_Variable, {t_ptr_in_v3u, v_gid, SC_Input});
+        put(types, Op_Variable, {t_ptr_in_v3u, v_localid, SC_Input});
         put(types, Op_TypeRuntimeArray, {t_rta, t_f32});
         put(types, Op_TypeStruct, {t_struct, t_rta});
         put(types, Op_TypePointer, {t_ptr_sb_struct, SC_StorageBuffer, t_struct});
@@ -544,6 +580,8 @@ struct SpirvCompute {
         put(code, Op_Label, {lbl}); cur_block = lbl;
         uint32_t ld = id(); put(code, Op_Load, {t_v3u, ld, v_gid});
         gidx = id(); put(code, Op_CompositeExtract, {t_u32, gidx, ld, 0});
+        uint32_t ldl = id(); put(code, Op_Load, {t_v3u, ldl, v_localid});
+        localid = id(); put(code, Op_CompositeExtract, {t_u32, localid, ldl, 0});   // wave lane index
     }
     // --- Fragment-shader shell: a location-0 vec4 color output; EXP MRT0 stores to it. ---
     uint32_t t_v4f = 0, v_color = 0;
@@ -923,7 +961,7 @@ uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, const 
 // formats (EXP/memory/...) return false so the stage-specific caller can handle them.
 bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool allow_exec_update,
               const std::unordered_set<uint32_t>* safe_execz = nullptr, bool allow_smem = false,
-              const ShaderResourceTable* rt = nullptr) {
+              const ShaderResourceTable* rt = nullptr, bool allow_wave = false) {
     auto& vreg = rs.vreg; uint32_t& vcc = rs.vcc;
     auto val = [&](const Operand& o) { return operand_bits(b, rs, in, o); };
     // SDWA/DPP forms carry a sub-dword select or cross-lane control word we don't model. The decoder
@@ -1351,6 +1389,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // carry-out -> sdst mask (VCC or a saved SGPR-pair bool).
                 if (in.sdst.value == 106 || in.sdst.value == 107) rs.vcc = cout;
                 else if (in.sdst.kind == OperandKind::SGPR) rs.sreg_bool[in.sdst.value] = cout;
+            } else if ((in.opcode == 0x365 || in.opcode == 0x366) && allow_wave && b.is_compute) {
+                // v_mbcnt_lo/hi_u32_b32 (cross-lane): dst = src1 + count of active lanes below this one in
+                // the low/high 32. Only handled when src0 is EXEC (the standard compaction idiom); a general
+                // 32-bit mask VALUE isn't representable in our per-lane model, so reject that. Uses LDS +
+                // barriers (wave model) — allow_wave is true only in the straight-line path (barrier-uniform).
+                const Operand& s0 = in.src[0];
+                if (s0.value == 126 || s0.value == 127)   // EXEC_LO / EXEC_HI -> this lane's exec bit
+                    vreg[in.dst.value] = b.mbcnt(rs.exec, val(in.src[1]), in.opcode == 0x365);
+                else ok = false;
             } else if (in.opcode == 0x12F) {                          // v_cvt_pkrtz_f16_f32 = pack(s0->lo, s1->hi)
                 vreg[in.dst.value] = b.pack_half2x16(fv(0), fv(1));    // float sources honor neg/abs modifiers
             } else if (in.opcode == 0x103) {                          // v_add_f32 (VOP3 form)
@@ -1708,6 +1755,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                const std::function<bool(const Rdna2Inst&)>& exp_fn) {
     const CountedLoop L = detect_counted_loop(ins);
     size_t idx = 0;
+    // Cross-lane wave ops (mbcnt) emit LDS + barriers, which are only valid at wave-uniform points — so
+    // they're allowed ONLY in the straight-line path (no divergent loop/if around them). Set true below.
+    bool wave_ok = false;
     auto emit_range = [&](uint32_t pc_lo, uint32_t pc_hi) -> bool {   // emit ins whose pc ∈ [pc_lo, pc_hi)
         for (; idx < ins.size(); ++idx) {
             const Rdna2Inst& in = ins[idx];
@@ -1715,7 +1765,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             if (in.pc < pc_lo) continue;
             if (in.fmt == Rdna2Format::EXP) { if (!exp_fn(in)) return false; continue; }
             bool ok = true;
-            if (!emit_alu(b, rs, in, ok, allow_exec_update, &safe, allow_smem, rt) || !ok) {
+            if (!emit_alu(b, rs, in, ok, allow_exec_update, &safe, allow_smem, rt, wave_ok) || !ok) {
                 // PROSPER_DBG (gated, off by default): report the instruction that fails recompilation —
                 // the first unsupported op / unresolved resource that makes a shader return empty.
                 if (getenv("PROSPER_DBG"))
@@ -1825,6 +1875,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         if (then_vcc != pre_vcc) rs.vcc = b.emit_phi_2way(b.t_bool, pre_vcc, preblock, then_vcc, thenEnd);
         if (!emit_range(F.target_pc, UINT32_MAX)) return false;
     } else {
+        wave_ok = true;   // straight-line: barriers are wave-uniform, so cross-lane mbcnt is safe here
         if (!emit_range(0, UINT32_MAX)) return false;   // loop-free: straight-line, unchanged behavior
     }
     (void)safe_branches;
@@ -1880,7 +1931,8 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
         if (in.fmt == Rdna2Format::EXP) { cov.exports++; continue; }   // handled by the stage recompilers
         bool ok = true;
         bool handled = cf_reconstructed(in)
-                     || (emit_alu(b, rs, in, ok, /*allow_exec_update*/true, &safe_branches, /*allow_smem*/true) && ok);
+                     || (emit_alu(b, rs, in, ok, /*allow_exec_update*/true, &safe_branches, /*allow_smem*/true,
+                                  /*rt*/nullptr, /*allow_wave*/true) && ok);
         // Shapes the recompiler handles only in context (a resource table for MIMG sample/load/LOD/store
         // and buffer_load/store_format; a fragment stage for VINTRP). This table-less compute-shell pass
         // rejects them, so count them apart from truly-unsupported (cross-lane, etc.). Instruction-aware

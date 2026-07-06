@@ -1108,6 +1108,47 @@ int main() {
     printf("  kernel62 mismatches=%u (out[30]=%g expect=%g)\n", bad62, got62.size()==N?got62[30]:-1, exp62[30]);
     CHECK(got62.size()==N && bad62==0, "recompiled kernel 62 (v_add_co_ci_u32: (uint)a+(uint)b) correct");
 
+    // Kernel 63: v_mbcnt_lo/hi (cross-lane wave-model via LDS). Full EXEC (all lanes active), so the
+    // compaction index == this lane's index within its 64-wide workgroup: v1 = mbcnt_hi(exec_hi,
+    // mbcnt_lo(exec_lo,0)) = localid. Verifies the LDS prefix-count + lo/hi split + LocalInvocationId.
+    const uint32_t code63[] = {
+        0xD7650001u, 0x0001007Eu,   // v_mbcnt_lo_u32_b32 v1, exec_lo, 0
+        0xD7660001u, 0x0002027Fu,   // v_mbcnt_hi_u32_b32 v1, exec_hi, v1
+        0x7E020D01u,                // v_cvt_f32_u32 v1, v1
+        0xBF810000u,                // s_endpgm
+    };
+    std::vector<uint32_t> spv63 = recompile_valu(code63, sizeof(code63)/sizeof(code63[0]), 1, /*out_vgpr*/1);
+    CHECK(!spv63.empty(), "recompiled kernel 63 (v_mbcnt wave-model) -> SPIR-V");
+    std::vector<float> in63(N, 0.0f), exp63(N);
+    for (uint32_t i=0;i<N;i++) exp63[i] = (float)(i % 64);   // localid within the 64-wide workgroup
+    std::vector<float> got63 = prosper::test::run_compute(spv63, in63, N, N);
+    uint32_t bad63=0; for(uint32_t i=0;i<N&&got63.size()==N;i++) if(std::fabs(got63[i]-exp63[i])>1e-3f) bad63++;
+    printf("  kernel63 mismatches=%u (out[5]=%g exp=%g out[70]=%g exp=%g)\n", bad63,
+           got63.size()==N?got63[5]:-1, exp63[5], got63.size()==N?got63[70]:-1, exp63[70]);
+    CHECK(got63.size()==N && bad63==0, "recompiled kernel 63 (v_mbcnt full-exec = localid) correct");
+
+    // Kernel 64: v_mbcnt with DIVERGENT exec — the real compaction use. v_cmpx narrows exec to (a>thr);
+    // then mbcnt gives each active lane its index among active lanes. Even lanes active (a=1>0.5), odd
+    // inactive (a=0): active lane L -> L/2 (count of active lanes below); inactive lanes keep 0 (the
+    // store is exec-predicated). Verifies the wave-model over a PARTIAL mask (not just full exec).
+    const uint32_t code64[] = {
+        0x7C280300u,                // v_cmpx_gt_f32 v0, v1   -> exec = (a > thr)
+        0xD7650002u, 0x0001007Eu,   // v_mbcnt_lo_u32_b32 v2, exec_lo, 0
+        0xD7660002u, 0x0002047Fu,   // v_mbcnt_hi_u32_b32 v2, exec_hi, v2
+        0x7E040D02u,                // v_cvt_f32_u32 v2, v2
+        0xBF810000u,                // s_endpgm
+    };
+    std::vector<uint32_t> spv64 = recompile_valu(code64, sizeof(code64)/sizeof(code64[0]), 2, /*out_vgpr*/2);
+    CHECK(!spv64.empty(), "recompiled kernel 64 (v_mbcnt divergent-exec) -> SPIR-V");
+    std::vector<float> in64(N*2), exp64(N);
+    for (uint32_t i=0;i<N;i++){ uint32_t lane=i%64; float a=(lane%2==0)?1.0f:0.0f; in64[i*2]=a; in64[i*2+1]=0.5f;
+        exp64[i] = (lane%2==0) ? (float)(lane/2) : 0.0f; }
+    std::vector<float> got64 = prosper::test::run_compute(spv64, in64, N, N);
+    uint32_t bad64=0; for(uint32_t i=0;i<N&&got64.size()==N;i++) if(std::fabs(got64[i]-exp64[i])>1e-3f) bad64++;
+    printf("  kernel64 mismatches=%u (out[4]=%g exp=%g out[6]=%g exp=%g out[7]=%g exp=%g)\n", bad64,
+           got64.size()==N?got64[4]:-1, exp64[4], got64.size()==N?got64[6]:-1, exp64[6], got64.size()==N?got64[7]:-1, exp64[7]);
+    CHECK(got64.size()==N && bad64==0, "recompiled kernel 64 (v_mbcnt divergent: active lane L -> L/2) correct");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
