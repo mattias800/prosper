@@ -23,13 +23,18 @@ were rejected), all with source+output modifiers. This is a real fidelity gain f
 shaders (they use fma/mad/med3/pkrtz **with** modifiers) — "recompiles" now also means "computes the right
 values". Not a shader-count change; the remaining 030/037/038 are still cross-lane-blocked (below).
 
-**THE REMAINING ~4-7 SHADERS ARE NOT RECOMPILABLE IN THE PER-INVOCATION MODEL (by design):** 030/037/038
-(and the scc0 group) are wave-cooperative compute shaders (GPU culling/compaction) that need CROSS-LANE
-ops — `v_mbcnt_lo/hi` (this lane's index among active lanes) and `v_readlane` (read another lane's value).
-Our recompiler models one SPIR-V invocation per lane with no wave, so these have no faithful lowering
-without a wave/subgroup rewrite (a large architectural change). They are correctly REJECTED rather than
-faked (correctness-first). None is on the first-frame path. 030 additionally uses SDWA source-negate
-(`v_mul_f32_sdwa v14,-s13,v3`), a real-but-narrow gap that wouldn't unblock it anyway.
+**REMAINING BLOCKERS — ACTUAL BREAKDOWN (2026-07-06, from `shader_histo` first-truly-unsupported-per-shader):**
+| Blocker | Op | # shaders | Tractability |
+|---|---|---|---|
+| **s_branch (unconditional)** | SOPP 0x4 | **4** | control-flow — needs general forward-branch/CFG handling (the recompiler does structured if/loop but not arbitrary s_branch). **The LARGEST remaining gap — and likely more tractable than the wave model.** |
+| **v_mbcnt_lo_u32_b32** | VOP3 0x365 | 2 | cross-lane — needs the workgroup/LDS wave-model (see design note below). Approximation `mbcnt=lane_id` holds only for full EXEC. |
+| **v_mul_f32 SDWA source-negate** | VOP2 0x8 | 1 | bounded — extend SDWA decode to carry src neg/abs (like VOP3) + apply in the VOP2 float path (the VOP3 fv() machinery already exists). |
+
+This corrects the earlier "remaining = cross-lane only" framing: the biggest blocker is actually **s_branch
+control flow (4 shaders)**, not the wave ops. All are correctly REJECTED rather than faked (correctness-first),
+and none is on the first-frame path (frames are gated on the GPU-executor build, not the recompiler). Next
+recompiler wins in priority order: (1) structured s_branch → +4 shaders; (2) SDWA source modifiers → +1;
+(3) the LDS wave-model → +2 (mbcnt/readlane).
 
 **The recompiler is DONE for this title.** Reaching the game's actual pixels is now gated on the GPU-
 execution / render-loop frontier (see `RENDER_LOOP.md`), not the recompiler.
