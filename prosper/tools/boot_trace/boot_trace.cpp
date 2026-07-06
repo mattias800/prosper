@@ -10,6 +10,7 @@
 #ifdef PROSPER_HAVE_VULKAN
 #include "gpu/gpu_execute.hpp"
 #include "gpu/shader_resources.hpp"       // ShaderResourceTable / ResourceClass (bind the shaders' resources)
+#include "gpu/rdna2_to_spirv.hpp"         // recompile_fragment (diagnostic solid-color PS)
 #include "../../tests/render_runner.h"   // offscreen Vulkan backend (render_triangle_rgba) + dump_bmp
 #include <atomic>
 #include <cstdlib>
@@ -136,7 +137,17 @@ int main(int argc, char** argv) {
                 if (dn >= 0) close(dn);
                 if (getenv("PROSPER_GFXLOG")) { fprintf(stderr, "[render] binding %zu resources (draw %u verts)\n",
                     R.size(), draw_vcount); fflush(stderr); }
-                std::vector<uint8_t> px = prosper::test::render_triangle_rgba(vs, fs, w, h, &ps,
+                // PROSPER_RENDER_TESTPS: replace the real pixel shader with a solid MAGENTA one (recompiled
+                // from a tiny RDNA2 EXP blob) to isolate VS geometry from PS shading — if the VS positions
+                // are on-screen, magenta triangles appear regardless of the texture/PS math.
+                std::vector<uint32_t> fs_use = fs;
+                if (getenv("PROSPER_RENDER_TESTPS")) {
+                    static const uint32_t kMagentaPs[] = {   // v0=1.0(R) v1=0.0(G) v2=1.0(B) v3=1.0(A); exp mrt0; endpgm
+                        0x7E0002F2u, 0x7E020280u, 0x7E0402F2u, 0x7E0602F2u, 0xF800180Fu, 0x03020100u, 0xBF810000u };
+                    auto m = prosper::gpu::recompile_fragment(kMagentaPs, sizeof(kMagentaPs) / 4, nullptr);
+                    if (!m.empty()) fs_use = m;
+                }
+                std::vector<uint8_t> px = prosper::test::render_triangle_rgba(vs, fs_use, w, h, &ps,
                     nullptr, nullptr, nullptr, R.empty() ? nullptr : &R, draw_vcount);
                 int n = frame_no++;
                 if (px.empty()) {

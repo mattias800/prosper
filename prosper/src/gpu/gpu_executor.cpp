@@ -165,7 +165,11 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     auto it = descr.find(srsrc);
                     if (trc) fprintf(stderr, "[dyntrace] MUBUF fetch op=0x%x SRSRC=s%d have_descr=%d\n",
                                      in.opcode, srsrc, it != descr.end());
-                    if (it != descr.end()) out[srsrc] = decode_buffer_descriptor(it->second.data());
+                    // Keep the FIRST fetch's V# per SRSRC: the SGPR is reloaded with a different V# between
+                    // fetches (one per vertex attribute), and the position (visible geometry) comes from
+                    // the first fetch. (A later increment can key each fetch to its own V#.)
+                    if (it != descr.end() && out.find(srsrc) == out.end())
+                        out[srsrc] = decode_buffer_descriptor(it->second.data());
                 }
                 break;
             }
@@ -260,6 +264,15 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                 fprintf(stderr, "[dynvb]   SRSRC s%d -> base=0x%llx stride=%u num_records=%u size=%u fmt=%u nc=%u\n",
                         kv.first, (unsigned long long)d.base, d.stride, d.num_records, d.size_bytes,
                         (unsigned)d.format, d.num_components);
+                if (guest_readable(d.base, 64)) {   // first 2 vertices as floats to see if positions vary
+                    const float* f = (const float*)(uintptr_t)d.base;
+                    fprintf(stderr, "[dynvb]     v0: %.3f %.3f %.3f %.3f | v1(@stride): %.3f %.3f %.3f %.3f\n",
+                            f[0], f[1], f[2], f[3],
+                            d.stride ? *(const float*)(uintptr_t)(d.base + d.stride) : 0.0f,
+                            d.stride ? *(const float*)(uintptr_t)(d.base + d.stride + 4) : 0.0f,
+                            d.stride ? *(const float*)(uintptr_t)(d.base + d.stride + 8) : 0.0f,
+                            d.stride ? *(const float*)(uintptr_t)(d.base + d.stride + 12) : 0.0f);
+                }
             }
         }
     }
@@ -292,10 +305,21 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
         if (log) {
             fprintf(stderr, "[restab] %s code=0x%llx base=0x%x -> %zu resources:\n",
                     is_ps ? "PS" : "VS", (unsigned long long)code_addr, base, t.resources.size());
-            for (auto& r : t.resources)
+            for (auto& r : t.resources) {
                 fprintf(stderr, "[restab]   cls=%u binding=%u addr=0x%llx size=%u %ux%u fmt=%u stride=%u\n",
                         (unsigned)r.cls, r.binding, (unsigned long long)r.gpu_addr, r.size,
                         r.width, r.height, (unsigned)r.format, r.stride);
+                if (r.cls == ResourceClass::ConstantBuffer && guest_readable(r.gpu_addr, 32)) {
+                    const float* f = (const float*)(uintptr_t)r.gpu_addr;
+                    fprintf(stderr, "[restab]     cbuf@0 floats: %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f\n",
+                            f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
+                    if (r.size >= 0x150 && guest_readable(r.gpu_addr + 0x110, 32)) {
+                        const float* g = (const float*)(uintptr_t)(r.gpu_addr + 0x110);
+                        fprintf(stderr, "[restab]     cbuf@0x110:    %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f\n",
+                                g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7]);
+                    }
+                }
+            }
         }
         return std::make_shared<ShaderResourceTable>(std::move(t));
     }
