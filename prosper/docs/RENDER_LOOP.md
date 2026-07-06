@@ -59,3 +59,22 @@ The render milestone is the GPU-execution frontier — a large, multi-session bu
 committable progress toward full-game rendering = expanding RDNA2→SPIR-V recompiler coverage on the game's
 real shaders (each spirv-val + execution verified). When GPU execution lands, more covered shaders = more
 of the game renders.
+
+## 2026-07-06 (overnight) — hard-stall confirmed; no easy crack; needs GPU execution
+Exhaustively re-probed the stall. Findings:
+- The last new AGC call before the stall, `libSceAgc::h9z6+0hEydk`, is called from `eboot+0x14eb1f2` —
+  inside the TRC watchdog: it **IS `sce::Agc::suspendPoint`** (a per-frame checkpoint), not a blocker.
+- "path … not considered suitable for apr reads" is a **benign** Unity async-page-read decision — it
+  prints for files that loaded fine (globalgamemanagers etc.), not a stall indicator.
+- gdb thread dumps during the stall show **every thread idle-waiting** (futex / nanosleep / audio-mix /
+  scheduler) with **no thread in a read syscall** — the load is not actively progressing; it's a quiescent
+  stall, and the PreloadManager work-queue producer never runs (count only ever decremented by the
+  consumer). So it is NOT a lost-signal a punch could safely fix — the item is never produced (a punch
+  would dequeue a phantom → crash).
+**Conclusion:** the render-loop unblock is not crackable by AGC-call/file/semaphore shims in autonomous
+iterations. It genuinely requires the **GPU-execution build** (execute submitted command buffers on a live
+Vulkan device + write back GPU memory + post EOP/flip completion so Unity's asset-integration/upload
+choreography advances) — a large, focused, likely reference/interactive effort — OR a deliberate
+punch-through experiment done with a human watching each cascade. This is the clear next milestone for the
+game's actual pixels; the recompiler and the offscreen `GpuState→frame` spine are both ready to receive
+real draws the moment it lands.

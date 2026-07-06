@@ -1,15 +1,29 @@
 # RDNA2→SPIR-V recompiler — remaining work
 
-**Date:** 2026-07-05. **Status:** ~90.9% instruction coverage in-context. Every **bring-up-critical class**
-is covered (position/blit/clear, textured incl. **3D sampling** + NSA, interpolated, image-copy 1D/2D/3D +
-arrayed + NSA + MSAA, integer divide/modulo), plus the two big structural features have landed:
-**counted-loop reconstruction** (`OpLoopMerge`/`OpPhi`) and **divergent-if handling** (EXEC-predicated
-linearization, including scalar writes that are provably dead at the merge). All paths are `spirv-val`-gated
+**Date:** 2026-07-06. **Status: ~93.0% instruction coverage in-context; 34 of 41 shaders fully recompile —
+at the practical ceiling for THIS title.** Every bring-up-critical class is covered (position/blit/clear,
+textured incl. 3D sampling + NSA, interpolated, image-copy 1D/2D/3D + arrayed + NSA + MSAA + MSAA_ARRAY,
+integer divide/modulo), plus the big structural features: counted-loop reconstruction (`OpLoopMerge`/
+`OpPhi`), divergent-if handling (EXEC-predicated linearization incl. provably-dead scalar writes),
+64-bit scalar (`s_bfe_u64` via Int64), and NGG vertex shaders. All paths are `spirv-val`-gated
 (`tools/spv_validate`, permanent ctest) and, where a Vulkan harness exists, execution-differential-tested.
 
-**Landed / recompiling end-to-end (spirv-val VALID):** the textured, interpolated and image-copy families,
-plus the counted-loop MSAA-resolve fragment shaders **031** and **033**, the 3D-texture-sample shader
-**028**, and the compressed-export shader **029**. (031/033/028/029 completed most recently.)
+**Recompiling end-to-end (spirv-val VALID):** the textured/interpolated/image-copy families; the full
+MSAA-resolve family **031/032/033/034** (counted loop + 2D_MSAA[_ARRAY]); 3D-sample **028**; compressed-
+export **029**; the **NGG family 004/025/040** (position-only + indexed-fetch cull); the bloom/downsample
+compute **006** (texture-sample → storage-store). Op families added 2026-07-06: v_mac/v_fmac_f32,
+s_lshl4_add_u32, s_bfe_u64 (Int64), v_cndmask_b32_e64, v_cmp→SGPR-pair mask (SDWAB), 2D_MSAA_ARRAY.
+
+**THE REMAINING ~4-7 SHADERS ARE NOT RECOMPILABLE IN THE PER-INVOCATION MODEL (by design):** 030/037/038
+(and the scc0 group) are wave-cooperative compute shaders (GPU culling/compaction) that need CROSS-LANE
+ops — `v_mbcnt_lo/hi` (this lane's index among active lanes) and `v_readlane` (read another lane's value).
+Our recompiler models one SPIR-V invocation per lane with no wave, so these have no faithful lowering
+without a wave/subgroup rewrite (a large architectural change). They are correctly REJECTED rather than
+faked (correctness-first). None is on the first-frame path. 030 additionally uses SDWA source-negate
+(`v_mul_f32_sdwa v14,-s13,v3`), a real-but-narrow gap that wouldn't unblock it anyway.
+
+**The recompiler is DONE for this title.** Reaching the game's actual pixels is now gated on the GPU-
+execution / render-loop frontier (see `RENDER_LOOP.md`), not the recompiler.
 
 The remaining shaders each need **one or more genuinely deep features** — verified below by disassembly.
 **None is completable by a single bounded opcode/feature add**, and **none is needed for the first frame**
