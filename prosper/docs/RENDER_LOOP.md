@@ -113,9 +113,21 @@ handshake**, not draws:
   DrawReset | WaitFlipDone(h=0x1001) | ReleaseMem | WaitRegMem | ReleaseMem×2 |
   Flip(h=0x1001, bufidx=2) | AcquireMem | EventWrite(0x2e) EventWrite(0x2c) | ReleaseMem×2
 ```
-The **ReleaseMem** (EOP) and **WaitRegMem** builder args expose the real pointers we were discarding:
-- `ReleaseMem  a1=eventType a2=dstSel a3=0x1 a4=cacheAction a5=<dstGpuAddr>` — e.g. a5=0x731a455c4aa8
-- `WaitRegMem  a1=0 a2=ref(0x3) a3=0 a4=cmpFunc(0x2) a5=<addr>` — **a5=0x731a455c4aa8, the SAME address**
+The **ReleaseMem** (EOP) and **WaitRegMem** builder args expose the real pointers we were discarding
+(captured incl. the guest-stack args a6..a8 via `__builtin_frame_address` — the stub tail-jumps, so
+[rbp+16..]=a6..):
+```
+ReleaseMem  a1     a2     a3   a4    a5=dstGpuAddr     a6    a7(value?)   a8   (ret=eboot+0x3ae3dc)
+            0x28   0x0    0x1  0x0   0x..715c4aa8      0x2   0x1          0x0   <- WaitRegMem polls THIS addr
+            0x28   0x0    0x1  0x0   0x..715d3810      0x3   0x0          0x0
+            0x14   0x200  0x1  0x3   0x..55464f0       0x2   0x4          0x0
+            0x4    0x200  0x1  0x3   0x..55c0550       0x2   0x1bfba062   0x0   <- a7 looks like a real fence value
+WaitRegMem  a1=0   a2=0x3 a3=0 a4=0x2(cmpFunc) a5=0x..715c4aa8  a6=0x1  a7=0xffffffff(mask?)
+```
+So a5=dstGpuAddr (confirmed: WaitRegMem waits on the SAME address a ReleaseMem writes), a3=0x1 is the
+immediate-write selector, and the EOP value is in the stack args (a6/a7 — a7=0x1bfba062 is a plausible
+fence value, but the exact value/selector/width mapping and WaitRegMem's mask/ref/cmpFunc encoding are
+NOT yet disambiguated). `PROSPER_GFXLOG` now dumps all of this every run.
 
 So the game plants an EOP fence: RELEASE_MEM writes a completion value to label `A` when the GPU pipe
 drains; WAIT_REG_MEM (and, cross-thread, the PreloadManager/FTM producers) block until `[A]` satisfies the

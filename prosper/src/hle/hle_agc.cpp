@@ -119,8 +119,12 @@ HLE(agc_dcb_acquire_mem) {  // (buf, engine, cb_db_op, gcr_cntl, ...) — 8 dw
     return (uint64_t)(uintptr_t)cmd;
 }
 HLE(agc_cb_release_mem) {  // GraphicsCbReleaseMem (buf, ...) — 7 dw
-    if (getenv("PROSPER_GFXLOG")) fprintf(stderr, "[agc] ReleaseMem args a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx\n",
-        (unsigned long long)a1,(unsigned long long)a2,(unsigned long long)a3,(unsigned long long)a4,(unsigned long long)a5);
+    if (getenv("PROSPER_GFXLOG")) {
+        volatile uint64_t* fp = (uint64_t*)__builtin_frame_address(0);  // fp[1]=ret, fp[2..]=stack args a6..
+        fprintf(stderr, "[agc] ReleaseMem a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx | ret=0x%llx a6=0x%llx a7=0x%llx a8=0x%llx\n",
+            (unsigned long long)a1,(unsigned long long)a2,(unsigned long long)a3,(unsigned long long)a4,(unsigned long long)a5,
+            (unsigned long long)fp[1],(unsigned long long)fp[2],(unsigned long long)fp[3],(unsigned long long)fp[4]);
+    }
     uint32_t* cmd; if (!begin_packet(a0, 7, IT_NOP, R_RELEASE_MEM, &cmd)) return 0;
     cmd[1] = cmd[2] = cmd[3] = cmd[4] = cmd[5] = cmd[6] = 0; return (uint64_t)(uintptr_t)cmd;
 }
@@ -132,8 +136,12 @@ HLE(agc_dcb_write_data) {  // (buf, dst, cache_policy, address_or_offset, ...) �
     return (uint64_t)(uintptr_t)cmd;
 }
 HLE(agc_dcb_wait_reg_mem) {  // (buf, ...) — 9 dw
-    if (getenv("PROSPER_GFXLOG")) fprintf(stderr, "[agc] WaitRegMem args a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx\n",
-        (unsigned long long)a1,(unsigned long long)a2,(unsigned long long)a3,(unsigned long long)a4,(unsigned long long)a5);
+    if (getenv("PROSPER_GFXLOG")) {
+        volatile uint64_t* fp = (uint64_t*)__builtin_frame_address(0);
+        fprintf(stderr, "[agc] WaitRegMem a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx | ret=0x%llx a6=0x%llx a7=0x%llx\n",
+            (unsigned long long)a1,(unsigned long long)a2,(unsigned long long)a3,(unsigned long long)a4,(unsigned long long)a5,
+            (unsigned long long)fp[1],(unsigned long long)fp[2],(unsigned long long)fp[3]);
+    }
     uint32_t* cmd; if (!begin_packet(a0, 9, IT_NOP, R_WAIT_MEM_64, &cmd)) return 0;
     for (int i = 1; i < 9; i++) cmd[i] = 0; return (uint64_t)(uintptr_t)cmd;
 }
