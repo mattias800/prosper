@@ -140,6 +140,10 @@ namespace {
     // last entries are the crash node's typetree metadata (byteOffset/byteSize/cursor) — reveals whether
     // a wrong typetree node (bad offset or garbage r8 from worker guest-fs TLS) mis-positions the cursor.
     bool g_hwbp_node_on = false;
+    // PROSPER_HWBP_BUFDUMP=1: at the driver bp (rbx = reader), write the reader window [rbx+0x40 .. rbx+0x48]
+    // to /tmp/prosper_buf_<hit>.bin per hit — captures the EXACT decompressed object buffer the deserializer
+    // reads, so it can be byte-diffed against the reference (UnityPy) object (load-corruption vs dispatch).
+    bool g_hwbp_bufdump = false;
     void hwbp_dump_ring(const char* why);   // fwd decl (defined after probe_readable)
     // Optional chained DATA write-watchpoint: on the first exec-bp hit, arm a HW write watch on
     // [rax + g_hwwatch_delta] (default rax-0x80, the thread-local device slot the ctor reads). Catches
@@ -398,6 +402,17 @@ namespace {
                     rd(rbx+0x38), rd(rbx+0x40), rd(rbx+0x48), off(rd(rsp)), off(rd(rbp + 8)), cur_tid());
                 (void)r15; (void)rdi; (void)rsi;
                 write(2, b, n);
+                // PROSPER_HWBP_BUFDUMP: write the reader window [base..end] to a per-hit file.
+                if (g_hwbp_bufdump) {
+                    uint64_t base = rd(rbx + 0x40), end = rd(rbx + 0x48);
+                    if (end > base && end - base < 0x400000 && probe_readable(base) && probe_readable(end - 1)) {
+                        char fn[64]; snprintf(fn, sizeof fn, "/tmp/prosper_buf_%d.bin", (int)g_hwbp_count);
+                        int fd = open(fn, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                        if (fd >= 0) { (void)!write(fd, (const void*)base, (size_t)(end - base)); close(fd);
+                            char m2[96]; int mn = snprintf(m2, sizeof m2, "[hwbp] bufdump #%d -> %s (%llu bytes)\n",
+                                (int)g_hwbp_count, fn, (unsigned long long)(end - base)); write(2, m2, mn); }
+                    }
+                }
             }
             // On the first exec hit, optionally arm a data write-watch on [<reg> + delta].
             if (g_hwwatch_req && g_hwwatch_fd < 0) {
@@ -815,6 +830,7 @@ void install_trap_handler() {
         if (const char* c = getenv("PROSPER_HWBP_RAXMIN")) g_hwbp_raxmin = strtoull(c, nullptr, 0);
         if (const char* c = getenv("PROSPER_HWBP_ANOM")) { g_hwbp_anom = strtoull(c, nullptr, 0); g_hwbp_anom_on = true; }
         if (getenv("PROSPER_HWBP_NODE")) g_hwbp_node_on = true;
+        if (getenv("PROSPER_HWBP_BUFDUMP")) g_hwbp_bufdump = true;
         if (g_devnull_fd < 0) g_devnull_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
         g_hwbp_on = true;   // perf_event_open done in arm_hwbp() after the image is mapped
         // PROSPER_HWWATCH=<signed delta>: on the first exec-bp hit, arm a data write-watch on [rax+delta]

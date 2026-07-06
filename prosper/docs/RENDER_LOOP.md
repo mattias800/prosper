@@ -569,3 +569,31 @@ node bp on the 5th `0x1612c70` driver hit (reuse the existing `g_hwwatch_req` ch
 record is single-stepped — then read the crash node's `[r8+8]`/`[r8+0x10]` + the element-size vtable result
 and compare to a known-good shader's. That pins whether the node offset/size or the element size is wrong,
 which distinguishes (a)/(b) from a data/decompression issue.
+
+## 2026-07-06 (cont.) — ⭐⭐ BUFFER DUMP: data byte-faithful; desync is DISPATCH-SIDE in m_CommonParameters
+
+Added `PROSPER_HWBP_BUFDUMP=1`: at the driver bp (`0x1612c70`, rbx=reader) dumps the reader window
+`[rbx+0x40..rbx+0x48]` per hit to `/tmp/prosper_buf_<n>.bin` (6 hits, no single-step perturbation). Diffed
+hit #6 (37636 B, the crash record) against the UnityPy reference CubeBlur object (`obj.get_raw_data()`,
+17168 B):
+- Aligned on `Hidden/CubeBlur`, the 4 KB window before the name (which contains the crash cursor at buffer
+  offset `0x7a20`) is **BYTE-IDENTICAL** to the reference. At the crash cursor both hold
+  `00 04 00 00 | 00·0 | 00·0 | b0 00 00 00 | 01 01 01 | 03 | 10 01 00 00 | … | 00 04 00 00` — well-formed data.
+- Mapping that offset through UnityPy's parsed typetree: it is
+  `m_ParsedForm.m_SubShaders[0].m_Passes[0].progVertex.m_CommonParameters.m_ConstantBuffers` — the `0xb0`
+  is `m_ConstantBuffers[0].m_Size` (176 = UnityPerDraw). UnityPy parses this region as constant buffers
+  without error.
+
+⇒ **The load is byte-perfect; the deser desync is 100% in the runtime parser's control flow under our env**,
+and it is localized to the **`m_CommonParameters`** (shared/deduped program-parameter) path — a 2022-era
+feature exercised by CubeBlur's stereo-variant fan-out. The parser reads a cbuffer numeric field (`0x400`)
+as a `{count}` for an alignedString array, i.e. it is in the WRONG parse STATE on CORRECT data.
+
+**Leading hypothesis (prosper-side, fixable):** a **vtable / function-pointer relocation** in the engine's
+serialization machinery is wrong under our loader, so a virtual call during the typetree Transfer
+(`call *0x38(%rax)`=element size, `call *0x88(%rax)`=array read) dispatches to the WRONG method → wrong
+element size/count → numeric read as strings. This would be specific to whichever transfer/type path
+`m_CommonParameters` uses, explaining why only this desyncs. **NEXT:** capture the RESOLVED targets of
+`call *0x38`/`call *0x88` (and the transfer object's vtable ptr) at the crash and check them against the
+engine's real method addresses; if a vtable slot is mis-relocated, fix the loader's relocation of that
+region. Cross-check prosper's RELA/relative-reloc handling for the engine's `.data.rel.ro`/vtable sections.
