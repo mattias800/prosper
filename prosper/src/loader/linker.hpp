@@ -26,7 +26,7 @@ struct Program {
     std::vector<uint64_t>                init_fns; // dependent-module init fns, in call order
     std::vector<TlsTemplate>             tls_templates; // indexed by module TLS id (0 = unused)
     uint64_t entry = 0;                            // main module entry
-    uint64_t stub_base = 0, stub_size = 32;
+    uint64_t stub_base = 0, stub_size = 96;   // 96 leaves room for the gated guest-%fs swap stub (~74 bytes)
 
     // Stats for reporting.
     size_t total_imports = 0, resolved_cross_module = 0, stubbed = 0;

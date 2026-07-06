@@ -49,7 +49,8 @@ int main(int argc, char** argv) {
     set_app0_root(d);
     for (auto& img : p.imgs) if (!map_image(img, &e)) { printf("map failed: %s\n", e.c_str()); return 1; }
     { std::vector<TlsModuleDesc> td; for (auto& t : p.tls_templates) td.push_back({t.init_va, t.filesz, t.memsz});
-      set_tls_modules(td.data(), td.size()); }   // enable __tls_get_addr for loaded modules (real libc.prx)
+      set_tls_modules(td.data(), td.size());      // enable __tls_get_addr for loaded modules (real libc.prx)
+      guest_tls_set_templates(td.data(), td.size()); }   // gated PROSPER_GUEST_FS: guest initial-exec %fs TLS
     // C++ exception unwinding: give sceKernelGetModuleInfoForUnwind each module's .eh_frame_hdr + text seg.
     { static std::vector<std::string> names; names.reserve(p.imgs.size());   // stable name storage
       std::vector<UnwindModuleDesc> um;

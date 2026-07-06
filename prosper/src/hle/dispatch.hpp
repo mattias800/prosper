@@ -77,6 +77,14 @@ struct TlsModuleDesc { uint64_t init_va = 0, filesz = 0, memsz = 0; };
 // __tls_get_addr HLE to serve real per-thread TLS blocks for loaded modules (e.g. real libc.prx).
 void set_tls_modules(const TlsModuleDesc* descs, size_t count);
 
+// Guest initial-exec TLS (Linux; GATED behind PROSPER_GUEST_FS, default off). Backs guest %fs-relative
+// static thread-locals by giving each guest thread its own guest TCB + Variant-II static TLS and running
+// guest code with %fs = guest TP; import stubs swap %fs back to the host TCB for HLE calls. See
+// guest_tls.cpp. Call set_templates with the SAME descs as set_tls_modules (after images are mapped).
+void guest_tls_set_templates(const TlsModuleDesc* descs, size_t count);
+bool guest_tls_enabled();
+uint64_t guest_tls_activate_thread();   // per guest thread at entry; returns guest TP (0 if disabled)
+
 // Per-module info for C++ exception unwinding (sceKernelGetModuleInfoForUnwind). The guest's libunwind
 // asks, for a code address, where that module's .eh_frame_hdr / text segment live. `lo/hi` is the module's
 // absolute VA span (for the addr→module lookup); ehframe_hdr = absolute VA of its PT_GNU_EH_FRAME segment.

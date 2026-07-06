@@ -186,6 +186,7 @@ void* thread_trampoline(void* p) {
     auto* ts = (ThreadStart*)p;
     if (ts->sbase) register_thread_stack((uint64_t)pthread_self(), ts->sbase, ts->ssz);
     install_sigaltstack();   // so a guest stack overflow on this worker is still catchable
+    guest_tls_activate_thread();   // gated (PROSPER_GUEST_FS): give this guest worker its own guest %fs/TLS
     auto entry = ts->entry; void* arg = ts->arg; free(ts);
     return entry ? entry(arg) : nullptr;
 }
@@ -473,6 +474,11 @@ HLE(k_dlsym) {   // sceKernelDlsym(SceKernelModule handle, const char* name, voi
 namespace { std::vector<TlsModuleDesc> g_tls_mods; }
 void set_tls_modules(const TlsModuleDesc* descs, size_t count) {
     g_tls_mods.assign(descs, descs + count);
+    if (getenv("PROSPER_TLSLOG"))
+        for (size_t i = 0; i < count; i++)
+            fprintf(stderr, "[tls] module %zu: init_va=0x%llx filesz=0x%llx memsz=0x%llx\n", i,
+                    (unsigned long long)descs[i].init_va, (unsigned long long)descs[i].filesz,
+                    (unsigned long long)descs[i].memsz);
 }
 HLE(k_tls_get_addr) {   // __tls_get_addr(tls_index* ti): ti[0]=module id, ti[1]=offset-in-block
     const uint64_t* ti = (const uint64_t*)(uintptr_t)a0;

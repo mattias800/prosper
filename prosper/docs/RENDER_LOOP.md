@@ -297,10 +297,22 @@ single-threaded rendering (the game's own supported mode) sidesteps it. CONFIDEN
   a thread-local callback/vtable read via `%fs` returns host garbage → call through a bad pointer.
 Both are the recurring landmine the project beat case-by-case before (`k_tls_get_addr`→gettid, exc-handler
 stack-local). `-force-gfx-direct` newly runs Unity's GfxDevice/telemetry code that uses **initial-exec**
-guest TLS (direct `%fs`-relative, NOT `__tls_get_addr`), which our host-`%fs` model doesn't back. **The next
-milestone is proper guest initial-exec TLS** — give guest static-TLS variables real zero-init guest storage
-at their negative `%fs` offsets (without breaking host libc which shares the same `%fs`). This is the
-foundational fix that unblocks the direct-mode gfx path. CONFIDENCE: HIGH on the diagnosis.
+guest TLS (direct `%fs`-relative, NOT `__tls_get_addr`), which our host-`%fs` model doesn't back.
+
+**FIXED (gated `PROSPER_GUEST_FS`, `src/host/guest_tls.cpp`).** Give each guest thread its own guest TCB
+with the modules' static TLS laid out below the thread pointer (Variant II) and run guest code with `%fs` =
+guest TP. `guest_tls_activate_thread()` is called on the main thread (as the last step before entering the
+guest, in `run_entry`) and on each worker (`thread_trampoline`). HLE import stubs (`exec_image_linux.cpp`)
+became `%fs`-swap stubs: they check a magic at `[fs+0x108]` marking OUR guest TCB, and if present swap `%fs`
+to the stashed host TCB (`[fs+0x100]`) for the handler call, then restore the guest `%fs` — using FSGSBASE
+(`rd/wrfsbase`). If the magic is absent (host-context thread, or main before entry), they tail-call the
+handler on the current `%fs` exactly as before, so the mechanism is inert/safe when a thread isn't guest-
+activated. stub_size bumped 32→96 for the larger stub. **Result:** with `PROSPER_GUEST_FS=1
+PROSPER_GUEST_ARGS="-force-gfx-direct"` the `eboot+0xa9c0bb` crash is GONE (exit 90→124) — `[TP-0xa8]` now
+reads its zero-init guest slot, `0xa99d50` lazy-allocs correctly, and the game runs stably past gfx/audio
+init. Gated OFF by default (Linux 45/45 + Windows 20/20 unchanged; `PROSPER_GUEST_FS=1` alone reaches the
+identical baseline stall = mechanism sound). NEXT: the game is again in a `suspendPoint`/no-draws loop after
+this fix — characterize the new (post-TLS) stall in direct mode. CONFIDENCE: HIGH.
 
 ## 2026-07-06 — GPU-executor Stages A/B/C landed; correct EOP writes CONFIRMED live (still not the unblock)
 Built the GPU executor per `docs/GPU_EXECUTOR_DESIGN.md` (all committed, Linux 45/45 + Windows 20/20):

@@ -545,6 +545,42 @@ namespace {
         p[0] = 0xBF; memcpy(p + 1, &idx, 4);
         p[5] = 0x48; p[6] = 0xB8; memcpy(p + 7, &fn, 8); p[15] = 0xFF; p[16] = 0xE0;
     }
+    // --- Guest-%fs swap stubs (only when PROSPER_GUEST_FS is enabled). Guest code runs with %fs = guest
+    // TP; HLE handlers need the host %fs (host libc TLS). The stub is ROBUST to the calling thread's fs:
+    // it checks a magic at [fs+0x108] that marks OUR guest TCB (guest_tls.cpp). If present (guest thread),
+    // it swaps %fs to the stashed host TCB [fs+0x100] for the handler call, then restores the guest %fs.
+    // If absent (a host-context thread, or the main thread during pre-entry init), it just tail-calls the
+    // handler on the current fs — exactly the old behavior. Uses FSGSBASE. `push r11` also re-aligns rsp to
+    // the SysV rsp≡8(mod16) contract. Clobbers only rax/r11 (never the arg regs rdi..r9).
+    // Keep 0x108/0x100/magic in sync with guest_tls.cpp (MAGIC_OFF/HOSTFS_OFF/TCB_MAGIC).
+    void emit_swap_stub(uint8_t* p, uint32_t idx, uint64_t fn, bool unimpl) {
+        uint8_t* s = p;
+        auto mid = [&](uint8_t*& q) {   // per-variant: unimpl loads its slot index into edi first
+            if (unimpl) { *q++ = 0xBF; memcpy(q, &idx, 4); q += 4; }         // mov edi, idx
+            *q++ = 0x48; *q++ = 0xB8; memcpy(q, &fn, 8); q += 8;            // movabs rax, fn
+        };
+        // rdfsbase r11 ; cmp dword [r11+0x108], MAGIC ; jne .host
+        *p++=0xF3; *p++=0x49; *p++=0x0F; *p++=0xAE; *p++=0xC3;
+        *p++=0x41; *p++=0x81; *p++=0xBB; uint32_t mo=0x108; memcpy(p,&mo,4); p+=4;
+        uint32_t magic=0x50524F53u; memcpy(p,&magic,4); p+=4;
+        *p++=0x75; uint8_t* jne_rel = p++;                                  // jne rel8 (patched below)
+        // .guest: push r11 ; mov rax,[r11+0x100] ; wrfsbase rax ; <mid> ; call rax ; pop r11 ; wrfsbase r11 ; ret
+        *p++=0x41; *p++=0x53;
+        *p++=0x49; *p++=0x8B; *p++=0x83; uint32_t ho=0x100; memcpy(p,&ho,4); p+=4;
+        *p++=0xF3; *p++=0x48; *p++=0x0F; *p++=0xAE; *p++=0xD0;
+        mid(p);
+        *p++=0xFF; *p++=0xD0;                                               // call rax
+        *p++=0x41; *p++=0x5B;                                               // pop r11
+        *p++=0xF3; *p++=0x49; *p++=0x0F; *p++=0xAE; *p++=0xD3;              // wrfsbase r11
+        *p++=0xC3;                                                          // ret
+        // .host: <mid> ; jmp rax   (host-context: no swap, tail-call as before)
+        *jne_rel = (uint8_t)(p - (jne_rel + 1));
+        mid(p);
+        *p++=0xFF; *p++=0xE0;                                               // jmp rax
+        (void)s;
+    }
+    void emit_impl_swap(uint8_t* p, uint64_t fn)              { emit_swap_stub(p, 0,   fn, false); }
+    void emit_unimpl_swap(uint8_t* p, uint32_t idx, uint64_t fn) { emit_swap_stub(p, idx, fn, true); }
 }
 
 bool map_image(const LoadedImage& img, std::string* err) {
@@ -574,12 +610,15 @@ bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
     if (got == MAP_FAILED || got != want) return fail("mmap stub region failed");
 
+    bool swap = guest_tls_enabled();   // gated: emit the %fs swap stubs so HLE handlers run on the host TCB
+    if (swap && stub_size < 80) return fail("stub_size too small for guest-%fs swap stub (need >= 80)");
     uint8_t* base = (uint8_t*)got;
     for (uint64_t i = 0; i < n; i++) {
         uint8_t* slot = base + i * stub_size;
         HleFn fn = Hle::lookup(slots[i].nid);
-        if (fn) emit_impl(slot, (uint64_t)fn);
-        else    emit_unimpl(slot, (uint32_t)i, (uint64_t)&prosper_on_unimpl);
+        if (fn) { if (swap) emit_impl_swap(slot, (uint64_t)fn);       else emit_impl(slot, (uint64_t)fn); }
+        else    { if (swap) emit_unimpl_swap(slot, (uint32_t)i, (uint64_t)&prosper_on_unimpl);
+                  else      emit_unimpl(slot, (uint32_t)i, (uint64_t)&prosper_on_unimpl); }
     }
     g_stub_base = stub_base; g_stub_size = stub_size; g_nstubs = n;
     return true;
@@ -788,6 +827,9 @@ BootResult run_entry(const LoadedImage& img) {
     arm_bp();     // write the PROSPER_BP int3 now that the guest image is fully mapped
     arm_hwbp();   // open the PROSPER_HWBP hardware breakpoint on this (guest main) thread
     if (sigsetjmp(g_jb, 1) == 0) {
+        // gated (PROSPER_GUEST_FS): switch %fs to a guest TCB as the LAST host action before entering the
+        // guest — any host C++ after this point would run on the guest TCB. Import stubs swap back per-call.
+        guest_tls_activate_thread();
         register uint64_t e  asm("rax") = img.entry;
         register uint64_t s  asm("r8")  = sp;
         register uint64_t d  asm("r9")  = rdi;
