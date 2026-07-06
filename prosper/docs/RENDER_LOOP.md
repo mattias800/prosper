@@ -129,6 +129,42 @@ immediate-write selector, and the EOP value is in the stack args (a6/a7 — a7=0
 fence value, but the exact value/selector/width mapping and WaitRegMem's mask/ref/cmpFunc encoding are
 NOT yet disambiguated). `PROSPER_GFXLOG` now dumps all of this every run.
 
+## 2026-07-06 — EOP fence writeback tried; NOT the CPU gate + full thread deadlock map
+Implemented the fence writeback (`command_processor.cpp` `maybe_fence_write`, `PROSPER_AGC_FENCE`-gated):
+on submit, write the completion value to `[dstGpuAddr]`. Tested all 5 value variants (a7 / a6 /
+0xFFFFFFFF / 64-bit a7:a6 / 64-bit all-ones). **Result: none unblocks the game** — identical suspendPoint
+loop, no draws, user-event 999 never triggered. So the EOP fence is a GPU-internal handshake; **no
+stalled CPU thread is gated on the fence label.** (The writeback is kept — gated + `CONFIDENCE`-tagged —
+as correct GPU-execution infra needed later.) Also verified our sync_on_address futex is correct
+(`FUTEX_WAIT` re-checks `*addr==expected` atomically → no lost-wake race with the check-then-wait loops),
+so producers genuinely never post.
+
+**gdb 55-thread snapshot during the stall (the real topology):**
+| Thread | Wait site (eboot+) | Role | Blocked on |
+|---|---|---|---|
+| 1 (main) | 0x18a83b5 | Unity PreloadManager | sync_on_address semaphore `[r14]`, count≤0 forever |
+| 2 | 0xb0672a | GfxDevice work-queue (region 0xb06940) | sync_on_address semaphore `[r12]`, count≤0 |
+| 11 | 0x9385d7 | (unidentified worker) | sync_on_address semaphore `[rbx]`, count≤0 |
+| 7 | 0x14bd47f | flip thread | WaitEqueue (alive — processes ~1167 flips) |
+| 8 | 0x14dfb43 | Unity FTM | WaitEqueue for user-event 999 (never triggered) |
+| 9 | 0x14eb148 | TRC watchdog | nanosleep (forces suspendPoint) |
+| 3,4 | 0x194c441/0x194c403 | scheduler | nanosleep / mutex on 0x194c2c0 |
+| 5 | 0x195d8f0 | audio mix | — |
+| 42 | Il2cpp+0x1e23b8 | C# thread | syscall |
+| ~44 | 0x18ab088 / 0xae1af9 | job pool (idle) | sync_on_address, no work |
+
+**The deadlock:** three threads (main / GfxDevice / worker-11) each block on a sync_on_address semaphore
+whose count stays ≤0 — a producer/consumer cycle where the root kick never fires. All three wait loops are
+the same shape: `mov (%reg),%rax; test; jle →WaitOnAddress(0x19b4050); else lock cmpxchg (decrement);
+proceed`. The post side is `lock add [sem]; WakeByAddress(0x19b4060)`. The break-in event is NOT the EOP
+fence (ruled out above) and NOT a futex bug (ruled out). **Next leads:** (a) identify thread 11's semaphore
+(0x9385d7) and thread 2's (0xb0672a) — which produces which — to find the cycle's root; (b) check whether
+the root expects a GPU-submit *with draws* + its EOP-QUEUE *event* (RELEASE_MEM interrupt → equeue event,
+distinct from the label write we tried) — the "EOP QUEUE" equeue exists but nothing posts to it; (c)
+whether Unity's async-load-completion callback (should post main's semaphore after level0 integrates) runs
+on an idle pool thread that returns without posting. Tooling: `PROSPER_AGC_FENCE`, and the gdb snapshot
+recipe (attach to the boot_trace child, `handle SIG34-40 nostop noprint pass`, `thread apply all bt`).
+
 So the game plants an EOP fence: RELEASE_MEM writes a completion value to label `A` when the GPU pipe
 drains; WAIT_REG_MEM (and, cross-thread, the PreloadManager/FTM producers) block until `[A]` satisfies the
 compare. **We never write `A`** — our AGC Dcb builders (`agc_cb_release_mem`, `agc_dcb_wait_reg_mem`,
