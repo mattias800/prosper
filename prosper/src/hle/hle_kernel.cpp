@@ -186,8 +186,13 @@ void* thread_trampoline(void* p) {
     auto* ts = (ThreadStart*)p;
     if (ts->sbase) register_thread_stack((uint64_t)pthread_self(), ts->sbase, ts->ssz);
     install_sigaltstack();   // so a guest stack overflow on this worker is still catchable
-    guest_tls_activate_thread();   // gated (PROSPER_GUEST_FS): give this guest worker its own guest %fs/TLS
-    auto entry = ts->entry; void* arg = ts->arg; free(ts);
+    auto entry = ts->entry; void* arg = ts->arg; free(ts);   // all host libc — MUST run on the host %fs
+    // gated (PROSPER_GUEST_FS): give this guest worker its own guest TCB + static TLS and switch %fs to it
+    // as the LAST host action before entering guest code (so guest initial-exec TLS — incl. libc.prx's
+    // allocator arena/tcache — resolves to real guest storage, not the aliased host glibc TCB). The import
+    // stubs swap back to host %fs per HLE call. No-op when the gate is off. Order matters: the free() above
+    // is host glibc (host-TLS tcache) — running it under the guest %fs corrupts the host heap.
+    guest_tls_activate_thread();
     return entry ? entry(arg) : nullptr;
 }
 }
