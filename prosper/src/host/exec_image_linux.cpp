@@ -123,6 +123,17 @@ namespace {
     // shared reader isolate one buffer/context (e.g. the 16 MB shader pool at 0x7ffefc…) out of thousands
     // of unrelated small-string reads, so the log + the max-count apply to the context of interest.
     uint64_t g_hwbp_raxmin = 0;
+    // PROSPER_HWBP_ANOM=<hex>: ring-buffer trace. Every reader hit is pushed to a ring of the last
+    // RING entries {rip_off, cursor, [cursor]-as-u32}. When a hit reads a value >= this threshold
+    // (an anomalous string {count}/{length} — the deser fault reads ~16 EiB), dump the whole ring
+    // oldest->newest ONCE, so we see the exact cursor walk that over-advanced INTO the over-read
+    // without needing to know the dynamic buffer base or isolate the crash shader up front.
+    uint64_t g_hwbp_anom = 0; bool g_hwbp_anom_on = false;
+    static const int HWBP_RING = 256;
+    struct HwbpRingEnt { unsigned long long rip_off, cur, rax; unsigned val; };
+    HwbpRingEnt g_hwbp_ring[HWBP_RING];
+    volatile int g_hwbp_ring_pos = 0;
+    volatile bool g_hwbp_ring_dumped = false;
     // Optional chained DATA write-watchpoint: on the first exec-bp hit, arm a HW write watch on
     // [rax + g_hwwatch_delta] (default rax-0x80, the thread-local device slot the ctor reads). Catches
     // every writer of that slot with its RIP — reveals what sets/clears the scoped device pointer.
@@ -300,6 +311,39 @@ namespace {
             // host-libc logging below, restore before returning. No-op off the guest-fs path.
             uint64_t saved_fs = guest_fs_to_host_scoped();
             bool cond_ok = (!g_hwbp_r15_on || (r15 == g_hwbp_r15)) && (rax >= g_hwbp_raxmin);
+            // PROSPER_HWBP_ANOM ring trace: push every gated hit; when a read yields a value >= the
+            // anomaly threshold, dump the ring (the cursor walk into the over-read) exactly once.
+            if (g_hwbp_anom_on && cond_ok && !g_hwbp_ring_dumped) {
+                uint64_t rbxr = (uint64_t)gr[REG_RBX];
+                unsigned val = probe_readable(rax) ? *(const uint32_t*)rax : 0xBADBADu;
+                unsigned long long cur = probe_readable(rbxr + 0x38) ? *(const uint64_t*)(rbxr + 0x38) : 0;
+                int p = g_hwbp_ring_pos % HWBP_RING;
+                g_hwbp_ring[p] = { (unsigned long long)((uint64_t)gr[REG_RIP] - 0x400000000ull),
+                                   cur, (unsigned long long)rax, val };
+                g_hwbp_ring_pos = g_hwbp_ring_pos + 1;
+                if ((uint64_t)val >= g_hwbp_anom) {
+                    g_hwbp_ring_dumped = true;
+                    char hdr[160];
+                    int hn = snprintf(hdr, sizeof hdr,
+                        "[hwbp-anom] TRIGGER val=0x%x >= 0x%llx at rax=0x%llx cur=0x%llx — dumping last %d reads:\n",
+                        val, (unsigned long long)g_hwbp_anom, (unsigned long long)rax, cur,
+                        g_hwbp_ring_pos < HWBP_RING ? g_hwbp_ring_pos : HWBP_RING);
+                    write(2, hdr, hn);
+                    int total = g_hwbp_ring_pos < HWBP_RING ? g_hwbp_ring_pos : HWBP_RING;
+                    int start = g_hwbp_ring_pos < HWBP_RING ? 0 : (g_hwbp_ring_pos % HWBP_RING);
+                    unsigned long long prev_cur = 0;
+                    for (int i = 0; i < total; ++i) {
+                        const HwbpRingEnt& e = g_hwbp_ring[(start + i) % HWBP_RING];
+                        long long delta = prev_cur ? (long long)(e.cur - prev_cur) : 0;
+                        char lb[200];
+                        int ln = snprintf(lb, sizeof lb,
+                            "  [%3d] rip=eboot+0x%llx cur=0x%llx (+%lld) [cur]=0x%08x rax=0x%llx\n",
+                            i, e.rip_off, e.cur, delta, e.val, e.rax);
+                        write(2, lb, ln);
+                        prev_cur = e.cur;
+                    }
+                }
+            }
             if (cond_ok && g_hwbp_r15_on) {
                 // The matching read: dump the window around rax (the source pointer) + classify its mapping,
                 // so we can see whether the deserializer's cursor points into a file buffer / heap / garbage.
@@ -351,7 +395,9 @@ namespace {
                 arm_hwwatch(base + (uint64_t)g_hwwatch_delta);
             }
             ioctl(g_hwbp_fd, PERF_EVENT_IOC_DISABLE, 0);   // disable so we can step off the bp address
-            if (g_hwbp_count < g_hwbp_max) {               // step past, then re-enable for the next hit
+            // Stay armed while logging OR while the anomaly-ring trace is still hunting (PROSPER_HWBP_MAX
+            // can be 0 to suppress the per-hit log yet keep the bp live feeding the ring until it dumps).
+            if (g_hwbp_count < g_hwbp_max || (g_hwbp_anom_on && !g_hwbp_ring_dumped)) {
                 uc->uc_mcontext.gregs[REG_EFL] |= 0x100ll; g_hwbp_stepping = true;
             }                                              // else: leave disabled (one-and-done at the cap)
             guest_fs_restore_scoped(saved_fs);             // back to guest %fs before returning to guest code
@@ -747,6 +793,7 @@ void install_trap_handler() {
         if (const char* m = getenv("PROSPER_HWBP_MAX")) g_hwbp_max = (int)strtoul(m, nullptr, 0);
         if (const char* c = getenv("PROSPER_HWBP_R15")) { g_hwbp_r15 = strtoull(c, nullptr, 0); g_hwbp_r15_on = true; }
         if (const char* c = getenv("PROSPER_HWBP_RAXMIN")) g_hwbp_raxmin = strtoull(c, nullptr, 0);
+        if (const char* c = getenv("PROSPER_HWBP_ANOM")) { g_hwbp_anom = strtoull(c, nullptr, 0); g_hwbp_anom_on = true; }
         if (g_devnull_fd < 0) g_devnull_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
         g_hwbp_on = true;   // perf_event_open done in arm_hwbp() after the image is mapped
         // PROSPER_HWWATCH=<signed delta>: on the first exec-bp hit, arm a data write-watch on [rax+delta]

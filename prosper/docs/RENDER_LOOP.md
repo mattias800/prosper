@@ -491,3 +491,29 @@ correctness-first). Doing this right needs either (a) capturing the stack args i
 (b) the Kyty Gen5 RELEASE_MEM/WAIT_REG_MEM field reference. This is the precise, bounded task that should
 crack the render loop — best done with the user/reference in the loop (boot-wall-caliber), but it is now a
 *specific* mechanism, not a vague "GPU-execution build."
+
+## 2026-07-06 (cont.) — ⭐ LIVE cursor-trace of the deser fault (ring-buffer tool)
+
+Added `PROSPER_HWBP_ANOM=<hex>` to `exec_image_linux.cpp`: a 256-entry ring of every gated reader hit
+`{rip, rax(cursor), [cursor]}` that dumps the ring the instant a read yields a value ≥ threshold (the bp
+stays armed independent of `PROSPER_HWBP_MAX`, so set `MAX=0` to suppress the per-hit log). Run:
+`PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_HWBP=0x7e40d9 PROSPER_HWBP_ANOM=0x400 PROSPER_HWBP_MAX=0`.
+
+**Trace results (deterministic):**
+- alignedString reader `eboot+0x7e40d9`: delta between reads = `4 + align4(len)` exactly, so `rax` IS the
+  per-read source cursor. Reads `[…196–248]` are a valid name/keyword/property table (lengths 4–0x1a).
+- Then a **+12564-byte hop** into a far region, where the reader consumes `0xb0` (176) and `0x400` (1024)
+  **as alignedString lengths** — i.e. it applies the `{count}{alignedString[]}` model to NUMERIC cbuffer
+  reflection (`usedSize` values). `0xb0` = UnityPerDraw usedSize (Fable). Reading `0x400` as a string count →
+  loops reading shader bytecode as strings → huge length → `alloc(~16 EiB)` → null write → crash.
+- Deser driver `eboot+0x1612c70` fires 6×; hits #4/#5/#6 share buffer base `…601920`: #5 cur=base+0x4840,
+  #6 cur=base+**0x7a20** (Δ=0x31e0=12768), end=base+0xb304. Hit #6 begins the crash record with the cursor
+  at 0x7a20 and immediately reads count=`0x400`. Same caller for all 6: `caller_rbp=eboot+0xd4cf72`.
+
+**Pinned mechanism:** the parser at/above `eboot+0xd4cf72` calls the alignedString-array driver
+(`0x1612c70`→`0x7fc9f0`→`0x7e40d9`) on a region that in Unity 2022.3 holds numeric `ConstantBuffer`
+records — a **field-dispatch/version desync** (2021.2-shaped read model over 2022.3 data), matching Fable.
+prosper has NO shader parser, so this is 100% game-side code; the root is EITHER a dispatch value our env
+feeds the parser wrong OR data our env produced/left-stale (note the ~0xd4-byte zero region near the crash).
+**NEXT:** disassemble `eboot+0xd4cf72` (the dispatching parser) + the `0x1612c70` call site to find the
+field the parser branches on (version/count/flag) and whether our env supplies it wrong.
