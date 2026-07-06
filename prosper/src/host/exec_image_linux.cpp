@@ -144,6 +144,12 @@ namespace {
     // to /tmp/prosper_buf_<hit>.bin per hit — captures the EXACT decompressed object buffer the deserializer
     // reads, so it can be byte-diffed against the reference (UnityPy) object (load-corruption vs dispatch).
     bool g_hwbp_bufdump = false;
+    // PROSPER_HWBP_DIVCAP=1: at the bp (set to eboot+0xd4cf6c, the `call *0x88` array-read site — hit once
+    // per driver call, ~6x, minimal perturbation), log the typetree-vector transfer's computed
+    // count=byteSize/elemSize from the caller frame: [rbp-0xf0]=elemSize, [rbp-0xe8]=byteSize,
+    // [rbp-0xf8]=count. Compares the crash record (#6) to the succeeding ones (#4/#5) to see if a wrong
+    // element size (from the `call *0x38` vtable) yields a bogus count on correct data.
+    bool g_hwbp_divcap = false;
     void hwbp_dump_ring(const char* why);   // fwd decl (defined after probe_readable)
     // Optional chained DATA write-watchpoint: on the first exec-bp hit, arm a HW write watch on
     // [rax + g_hwwatch_delta] (default rax-0x80, the thread-local device slot the ctor reads). Catches
@@ -402,6 +408,22 @@ namespace {
                     rd(rbx+0x38), rd(rbx+0x40), rd(rbx+0x48), off(rd(rsp)), off(rd(rbp + 8)), cur_tid());
                 (void)r15; (void)rdi; (void)rsi;
                 write(2, b, n);
+                // PROSPER_HWBP_DIVCAP: log the typetree-vector transfer's elemSize/byteSize/count from the
+                // caller frame (rbp-relative), for the ~6 `call *0x88` array reads.
+                if (g_hwbp_divcap) {
+                    // At the DRIVER (0x1612c70) rbp is the driver's frame; the caller (0xd4ce00) frame is the
+                    // saved rbp = [rbp]. The transfer's elemSize/byteSize/count live at caller_rbp-0xf0/-0xe8/-0xf8.
+                    unsigned long long crbp = rd(rbp);
+                    unsigned long long elemSize = rd(crbp - 0xf0), byteSize = rd(crbp - 0xe8), cnt = rd(crbp - 0xf8);
+                    // reader cursor/base/end from rbx (the reader object)
+                    char db[320];
+                    int dn = snprintf(db, sizeof db,
+                        "[hwbp-divcap] #%d caller_rbp=0x%llx elemSize=0x%llx byteSize=0x%llx count=0x%llx (bs/es=%llu) | cur=0x%llx base=0x%llx end=0x%llx\n",
+                        (int)g_hwbp_count, crbp, elemSize, byteSize, cnt,
+                        (unsigned long long)(elemSize ? byteSize / elemSize : 0),
+                        rd((uint64_t)gr[REG_RBX] + 0x38), rd((uint64_t)gr[REG_RBX] + 0x40), rd((uint64_t)gr[REG_RBX] + 0x48));
+                    write(2, db, dn);
+                }
                 // PROSPER_HWBP_BUFDUMP: write the reader window [base..end] to a per-hit file.
                 if (g_hwbp_bufdump) {
                     uint64_t base = rd(rbx + 0x40), end = rd(rbx + 0x48);
@@ -831,6 +853,7 @@ void install_trap_handler() {
         if (const char* c = getenv("PROSPER_HWBP_ANOM")) { g_hwbp_anom = strtoull(c, nullptr, 0); g_hwbp_anom_on = true; }
         if (getenv("PROSPER_HWBP_NODE")) g_hwbp_node_on = true;
         if (getenv("PROSPER_HWBP_BUFDUMP")) g_hwbp_bufdump = true;
+        if (getenv("PROSPER_HWBP_DIVCAP")) g_hwbp_divcap = true;
         if (g_devnull_fd < 0) g_devnull_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
         g_hwbp_on = true;   // perf_event_open done in arm_hwbp() after the image is mapped
         // PROSPER_HWWATCH=<signed delta>: on the first exec-bp hit, arm a data write-watch on [rax+delta]
