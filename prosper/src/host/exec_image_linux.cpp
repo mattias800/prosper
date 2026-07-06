@@ -150,6 +150,11 @@ namespace {
     // [rbp-0xf8]=count. Compares the crash record (#6) to the succeeding ones (#4/#5) to see if a wrong
     // element size (from the `call *0x38` vtable) yields a bogus count on correct data.
     bool g_hwbp_divcap = false;
+    // PROSPER_HWBP_STRDUMP=1: at the bp, print any ASCII strings pointed to by the arg registers
+    // (rdi/rsi/rdx/rcx/r8/r9). For the SafeBinaryRead name-mismatch log site (eboot+0xd58f4f) this
+    // captures the mismatching field name + oldBaseTypeName — i.e. exactly where the generated typetree
+    // disagrees with the stream, pinning the wrong-typetree/dispatch divergence.
+    bool g_hwbp_strdump = false;
     void hwbp_dump_ring(const char* why);   // fwd decl (defined after probe_readable)
     // Optional chained DATA write-watchpoint: on the first exec-bp hit, arm a HW write watch on
     // [rax + g_hwwatch_delta] (default rax-0x80, the thread-local device slot the ctor reads). Catches
@@ -372,6 +377,25 @@ namespace {
                                    0, 0, 0, (unsigned long long)r8, f8, f10, (unsigned long long)r14 };
                 g_hwbp_ring_pos = g_hwbp_ring_pos + 1;
             }
+            if (g_hwbp_strdump && cond_ok) {
+                auto pstr = [&](const char* rn, uint64_t p) {
+                    if (!probe_readable(p)) return;
+                    char s[80]; size_t k = 0;
+                    for (; k < 72 && probe_readable(p + k); ++k) {
+                        char c = *(const char*)(p + k);
+                        if (c == 0) break;
+                        if (c < 0x20 || c > 0x7e) { s[k] = 0; if (k < 2) return; break; }
+                        s[k] = c;
+                    }
+                    s[k] = 0;
+                    if (k >= 2) { char b[128]; int n = snprintf(b, sizeof b, "[hwbp-str] %s=0x%llx -> \"%s\"\n", rn, (unsigned long long)p, s); write(2, b, n); }
+                };
+                char hdr[64]; int hn = snprintf(hdr, sizeof hdr, "[hwbp-str] hit @eboot+0x%llx:\n",
+                    (unsigned long long)((uint64_t)gr[REG_RIP] - 0x400000000ull)); write(2, hdr, hn);
+                pstr("rdi", (uint64_t)gr[REG_RDI]); pstr("rsi", (uint64_t)gr[REG_RSI]);
+                pstr("rdx", (uint64_t)gr[REG_RDX]); pstr("rcx", (uint64_t)gr[REG_RCX]);
+                pstr("r8",  (uint64_t)gr[REG_R8]);  pstr("r9",  (uint64_t)gr[REG_R9]);
+            }
             if (cond_ok && g_hwbp_r15_on) {
                 // The matching read: dump the window around rax (the source pointer) + classify its mapping,
                 // so we can see whether the deserializer's cursor points into a file buffer / heap / garbage.
@@ -415,14 +439,36 @@ namespace {
                     // saved rbp = [rbp]. The transfer's elemSize/byteSize/count live at caller_rbp-0xf0/-0xe8/-0xf8.
                     unsigned long long crbp = rd(rbp);
                     unsigned long long elemSize = rd(crbp - 0xf0), byteSize = rd(crbp - 0xe8), cnt = rd(crbp - 0xf8);
-                    // reader cursor/base/end from rbx (the reader object)
-                    char db[320];
+                    // rdi = the transfer/`this` object passed to the driver (mov %r13,%rdi at 0xd4cf3d).
+                    // Its mode byte [+0x190] gates the read path (movzbl 0x190(%rcx);cmp $1 at 0xd4ce0d).
+                    uint64_t r13v = (uint64_t)gr[REG_R13];
+                    uint64_t tobj = r13v;   // r13 is the `this`/transfer object (mov %r13,%rdi; call *0x88([r13]))
+                    auto rb = [](uint64_t a) -> unsigned { return probe_readable(a) ? *(const uint8_t*)a : 0x100u; };
+                    { char vb0[200]; uint64_t vt = rd(r13v);
+                      int vn0 = snprintf(vb0, sizeof vb0, "[hwbp-divcap]   #%d r13=0x%llx rdi=0x%llx [r13]=0x%llx [[r13]+0x88]=eboot+0x%llx\n",
+                        (int)g_hwbp_count, (unsigned long long)r13v, (unsigned long long)rdi, vt,
+                        (unsigned long long)(rd(vt+0x88) >= 0x400000000ull && rd(vt+0x88) < 0x420000000ull ? rd(vt+0x88)-0x400000000ull : rd(vt+0x88)));
+                      write(2, vb0, vn0); }
+                    char db[420];
                     int dn = snprintf(db, sizeof db,
-                        "[hwbp-divcap] #%d caller_rbp=0x%llx elemSize=0x%llx byteSize=0x%llx count=0x%llx (bs/es=%llu) | cur=0x%llx base=0x%llx end=0x%llx\n",
-                        (int)g_hwbp_count, crbp, elemSize, byteSize, cnt,
-                        (unsigned long long)(elemSize ? byteSize / elemSize : 0),
+                        "[hwbp-divcap] #%d tid=%ld transfer(rdi)=0x%llx mode[+0x190]=0x%x [+0x188]=0x%x [+0x180]=0x%llx [+0x170]=0x%llx | elemSize=0x%llx byteSize=0x%llx count=0x%llx | cur=0x%llx base=0x%llx end=0x%llx\n",
+                        (int)g_hwbp_count, cur_tid(), (unsigned long long)tobj,
+                        rb(tobj + 0x190), rb(tobj + 0x188), rd(tobj + 0x180), rd(tobj + 0x170),
+                        elemSize, byteSize, cnt,
                         rd((uint64_t)gr[REG_RBX] + 0x38), rd((uint64_t)gr[REG_RBX] + 0x40), rd((uint64_t)gr[REG_RBX] + 0x48));
                     write(2, db, dn);
+                    // Dump the transfer object [rdi-0x40 .. rdi+0x200] + its vtable, so #6 can be compared to #1-5.
+                    char vb[160];
+                    int vn = snprintf(vb, sizeof vb, "[hwbp-divcap]   #%d vtable[rdi]=eboot+0x%llx [rdi+8]=0x%llx [rdi+0x40]=0x%llx [rdi+0x48]=0x%llx\n",
+                        (int)g_hwbp_count,
+                        (unsigned long long)(rd(tobj) >= 0x400000000ull && rd(tobj) < 0x420000000ull ? rd(tobj) - 0x400000000ull : rd(tobj)),
+                        rd(tobj + 8), rd(tobj + 0x40), rd(tobj + 0x48));
+                    write(2, vb, vn);
+                    if (probe_readable(tobj) && probe_readable(tobj + 0x200)) {
+                        char fn[64]; snprintf(fn, sizeof fn, "/tmp/prosper_xfer_%d.bin", (int)g_hwbp_count);
+                        int fd = open(fn, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                        if (fd >= 0) { (void)!write(fd, (const void*)(tobj), 0x200); close(fd); }
+                    }
                 }
                 // PROSPER_HWBP_BUFDUMP: write the reader window [base..end] to a per-hit file.
                 if (g_hwbp_bufdump) {
@@ -854,6 +900,7 @@ void install_trap_handler() {
         if (getenv("PROSPER_HWBP_NODE")) g_hwbp_node_on = true;
         if (getenv("PROSPER_HWBP_BUFDUMP")) g_hwbp_bufdump = true;
         if (getenv("PROSPER_HWBP_DIVCAP")) g_hwbp_divcap = true;
+        if (getenv("PROSPER_HWBP_STRDUMP")) g_hwbp_strdump = true;
         if (g_devnull_fd < 0) g_devnull_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
         g_hwbp_on = true;   // perf_event_open done in arm_hwbp() after the image is mapped
         // PROSPER_HWWATCH=<signed delta>: on the first exec-bp hit, arm a data write-watch on [rax+delta]

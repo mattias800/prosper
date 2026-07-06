@@ -1,6 +1,7 @@
 #include "module.hpp"
 #include <cstdio>
 #include <cstring>
+#include <unordered_map>
 #include <algorithm>
 
 namespace prosper {
@@ -213,8 +214,10 @@ size_t apply_relocations(const Module& m, LoadedImage& img) {
         if (sym < m.symbols.size()) return img.base + m.symbols[sym].value; // internal def
         return 0;
     };
+    std::unordered_map<uint32_t, uint64_t> histo, unhandled;
     for (auto& r : m.relocs) {
         uint64_t va = img.base + r.offset;
+        histo[r.type]++;
         switch (r.type) {
             case R_X86_64_RELATIVE:  if (write64(va, img.base + (uint64_t)r.addend)) applied++; break;
             case R_X86_64_64:        if (write64(va, sym_addr(r.sym) + (uint64_t)r.addend)) applied++; break;
@@ -234,8 +237,15 @@ size_t apply_relocations(const Module& m, LoadedImage& img) {
                 if (write64(va, off)) applied++;
                 break;
             }
-            default: break;
+            default: unhandled[r.type]++; break;
         }
+    }
+    if (getenv("PROSPER_RELOC_HISTO")) {
+        fprintf(stderr, "[reloc] module base=0x%llx: %zu relocs, %zu applied\n",
+                (unsigned long long)img.base, m.relocs.size(), applied);
+        for (auto& kv : histo)
+            fprintf(stderr, "[reloc]   type %u: %llu%s\n", kv.first, (unsigned long long)kv.second,
+                    unhandled.count(kv.first) ? "  <<< UNHANDLED (silently skipped)" : "");
     }
     return applied;
 }
