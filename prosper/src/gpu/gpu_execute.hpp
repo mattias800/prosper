@@ -21,11 +21,17 @@
 
 namespace prosper::gpu {
 
-// The pluggable Vulkan backend: given recompiled VS+PS SPIR-V and resolved pipeline state, render and
-// return W*H*4 RGBA8 pixels (or {} on failure). Signature matches tests/render_runner.h::render_triangle_rgba.
+struct ShaderResourceTable;   // fwd (shader_resources.hpp); passed to the backend so it can bind resources
+
+// The pluggable Vulkan backend: given recompiled VS+PS SPIR-V, resolved pipeline state, and the two
+// stages' resource tables (so it can bind the constant/vertex buffers + textures the shaders declare,
+// reading their bytes from 1:1-mapped guest memory), render and return W*H*4 RGBA8 pixels (or {} on
+// failure). The tables may be null (e.g. the simple offscreen tests that render color-only shaders).
 using RenderFn = std::function<std::vector<uint8_t>(const std::vector<uint32_t>& vs,
                                                     const std::vector<uint32_t>& fs,
-                                                    const ResolvedPipelineState& ps)>;
+                                                    const ResolvedPipelineState& ps,
+                                                    const ShaderResourceTable* vrt,
+                                                    const ShaderResourceTable* prt)>;
 
 // Build a shader stage's resource table from the folded GpuState: look up the registered shader header
 // by its bound code address, read its user-data SGPR block from the sh register file, decode the V#/T#/S#
@@ -75,7 +81,7 @@ inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn&
     if (log) { fprintf(stderr, "[exec] BOTH stages recompiled: vs=%zu fs=%zu dwords -> rendering\n",
                        vs.size(), fs.size()); fflush(stderr); }
     ResolvedPipelineState ps = resolve_pipeline_state(rs);
-    return render(vs, fs, ps);
+    return render(vs, fs, ps, vrt.get(), prt.get());
 }
 
 // --- Live submit renderer registry (Stage A wiring; implemented in gpu_executor.cpp) --------------------
@@ -86,6 +92,8 @@ inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn&
 using LiveRenderFn = std::function<std::vector<uint8_t>(const std::vector<uint32_t>& vs,
                                                         const std::vector<uint32_t>& fs,
                                                         const ResolvedPipelineState& ps,
+                                                        const ShaderResourceTable* vrt,
+                                                        const ShaderResourceTable* prt,
                                                         uint32_t width, uint32_t height)>;
 
 // Register (or clear, with {}) the live render backend that agc_driver_submit_dcb uses on each submit.
