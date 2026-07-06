@@ -41,7 +41,7 @@ enum : uint32_t {
     Op_SelectionMerge=247, Op_Label=248, Op_Branch=249, Op_BranchConditional=250, Op_Return=253,
 };
 // GLSL.std.450 extended-instruction numbers.
-enum : uint32_t { Glsl_RoundEven=2, Glsl_Trunc=3, Glsl_Floor=8, Glsl_Ceil=9, Glsl_Fract=10, Glsl_Exp2=29, Glsl_Log2=30,
+enum : uint32_t { Glsl_FAbs=4, Glsl_RoundEven=2, Glsl_Trunc=3, Glsl_Floor=8, Glsl_Ceil=9, Glsl_Fract=10, Glsl_Exp2=29, Glsl_Log2=30,
                   Glsl_Sqrt=31, Glsl_InverseSqrt=32, Glsl_FMin=37, Glsl_UMin=38, Glsl_SMin=39, Glsl_FMax=40,
                   Glsl_UMax=41, Glsl_SMax=42, Glsl_PackHalf2x16=58, Glsl_UnpackHalf2x16=62 };
 enum : uint32_t {
@@ -1204,14 +1204,23 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
         }
         case Rdna2Format::VOP3: {
             uint32_t old_d = vreg_old(b, rs, in.dst.value);
+            // Float source with its VOP3 modifiers applied: OpFAbs then OpFNegate (hardware order neg(abs(x))).
+            // Returns raw bits (fbin/fext re-bitcast), so it's a drop-in for val() in the FLOAT ops only —
+            // integer VOP3 ops keep val() (modifiers are float-domain; assemblers don't set them on int ops).
+            auto fv = [&](int k) -> uint32_t {
+                uint32_t bits = val(in.src[k]);
+                if (in.src_abs[k]) bits = b.fext1(Glsl_FAbs, bits);
+                if (in.src_neg[k]) bits = b.fbin(Op_FSub, b.uconst(0), bits);   // 0.0 - x = -x
+                return bits;
+            };
             if (in.opcode == 0x14B || in.opcode == 0x141) {           // v_fma_f32 / v_mad_f32 = src0*src1 + src2
                 // v_mad_f32 (op 0x141) is a gfx10.1 (Navi) instruction REMOVED in gfx10.3, so llvm-mc
                 // -mcpu=gfx1030 rejects it as invalid — but the PS5 shader compiler targets gfx10.1 and
                 // emits it (real game shaders 5,26-29: manual attribute interpolation p0+i*p1). Its result
                 // (unfused mul-then-add) maps exactly to OpFMul+OpFAdd; v_fma's fused rounding is
                 // immaterial here. VERIFIED(round-trip llvm-mc gfx1010, both directions): VOP3 op 0x141.
-                uint32_t m = b.fbin(Op_FMul, val(in.src[0]), val(in.src[1]));
-                vreg[in.dst.value] = b.fbin(Op_FAdd, m, val(in.src[2]));
+                uint32_t m = b.fbin(Op_FMul, fv(0), fv(1));
+                vreg[in.dst.value] = b.fbin(Op_FAdd, m, fv(2));
             } else if (in.opcode == 0x169) {                          // v_mul_lo_u32
                 vreg[in.dst.value] = b.ibin(Op_IMul, val(in.src[0]), val(in.src[1]));
             } else if (in.opcode == 0x16a) {                          // v_mul_hi_u32 (high 32 bits)
@@ -1219,7 +1228,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             } else if (in.opcode == 0x16c) {                          // v_mul_hi_i32 (high 32 bits, signed)
                 vreg[in.dst.value] = b.smul_hi(val(in.src[0]), val(in.src[1]));
             } else if (in.opcode == 0x157) {                          // v_med3_f32 = median(s0,s1,s2)
-                uint32_t s0 = val(in.src[0]), s1 = val(in.src[1]), s2 = val(in.src[2]);
+                uint32_t s0 = fv(0), s1 = fv(1), s2 = fv(2);
                 uint32_t mn = b.fext2(Glsl_FMin, s0, s1), mx = b.fext2(Glsl_FMax, s0, s1);
                 vreg[in.dst.value] = b.fext2(Glsl_FMax, mn, b.fext2(Glsl_FMin, mx, s2));
             } else if (in.opcode == 0x143) {                          // v_mad_u32_u24 = (s0&0xFFFFFF)*(s1&0xFFFFFF)+s2
@@ -1263,7 +1272,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             } else if (in.opcode == 0x12F) {                          // v_cvt_pkrtz_f16_f32 = pack(s0->lo, s1->hi)
                 vreg[in.dst.value] = b.pack_half2x16(val(in.src[0]), val(in.src[1]));
             } else if (in.opcode == 0x107) {                          // v_mul_legacy_f32 ~= s0*s1
-                vreg[in.dst.value] = b.fbin(Op_FMul, val(in.src[0]), val(in.src[1]));
+                vreg[in.dst.value] = b.fbin(Op_FMul, fv(0), fv(1));
             } else if (in.opcode == 0x101) {                          // v_cndmask_b32_e64: src2_mask ? src1 : src0
                 const Operand& s2 = in.src[2]; uint32_t m = 0;        // src2 is an SGPR-pair (or VCC) wave mask
                 if (s2.value == 106 || s2.value == 107) m = rs.vcc;

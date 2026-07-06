@@ -94,7 +94,13 @@ void decode_operands(Rdna2Inst& i) {
             i.opcode = (w >> 16) & 0x3FFu; i.dst = vgpr(w);   // VOP3A: vdst in [7:0] of dword0
             i.src[0] = decode_src_field(d1 & 0x1FFu);
             i.src[1] = decode_src_field((d1 >> 9) & 0x1FFu);
-            i.src[2] = decode_src_field((d1 >> 18) & 0x1FFu); i.n_src = 3; break;
+            i.src[2] = decode_src_field((d1 >> 18) & 0x1FFu); i.n_src = 3;
+            // Source float modifiers: ABS = dword0[10:8], NEG = dword1[31:29] (one bit per source). These
+            // are correctness-critical (a-b, abs(), -x are ubiquitous) — previously ignored → silent wrong.
+            for (int k = 0; k < 3; k++) { i.src_abs[k] = ((w >> (8 + k)) & 1u) != 0; i.src_neg[k] = ((d1 >> (29 + k)) & 1u) != 0; }
+            // CLAMP (dword0[15]) / OMOD (dword1[28:27]) are not modeled — reject rather than miscompute.
+            if (((w >> 15) & 1u) || ((d1 >> 27) & 3u)) i.has_modifier = true;
+            break;
         }
         case Rdna2Format::SOP1:
             i.opcode = (w >> 8) & 0xFFu;  i.dst = sgpr(w >> 16);

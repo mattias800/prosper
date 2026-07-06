@@ -64,6 +64,12 @@ struct Rdna2Inst {
     uint8_t  n_src = 0;
     int32_t  simm16 = 0;
 
+    // VOP3 float source modifiers (per source): abs (bits[10:8] of dword0) then neg (bits[63:61]). The
+    // recompiler applies OpFAbs then OpFNegate for float ops. CLAMP/OMOD (which we don't model) instead
+    // set has_modifier so the instruction is rejected rather than miscomputed. VOP2 has no source mods.
+    bool     src_neg[4] = {false, false, false, false};
+    bool     src_abs[4] = {false, false, false, false};
+
     // EXP-only: export target (MRT0=0..7, MRTZ=8, NULL=9, POS0=12..15, PARAM0=32..) and the 4-bit
     // per-component enable mask. The 4 exported VGPRs are in src[0..3].
     uint32_t exp_target = 0;
