@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #ifndef _WIN32
 #include <unistd.h>
+#include <sys/syscall.h>
 #else
 #include <direct.h>
 #include <io.h>
@@ -144,16 +145,13 @@ HLE(f_rewind)  { if (a0) rewind((FILE*)P(a0)); return 0; }
 HLE(f_fgetc)   { return a0 ? (uint64_t)(int64_t)fgetc((FILE*)P(a0)) : (uint64_t)-1; }
 
 // --- POSIX fd ---
-HLE(f_open)  { std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::open(h.c_str(), (int)a1, (mode_t)a2); }
-HLE(f_close) { return (uint64_t)(int64_t)::close((int)a0); }
-HLE(f_read)  { return (uint64_t)(int64_t)::read((int)a0, P(a1), (size_t)a2); }
-HLE(f_write) { return (uint64_t)(int64_t)::write((int)a0, P(a1), (size_t)a2); }
-HLE(f_lseek) { return (uint64_t)(int64_t)::lseek((int)a0, (off_t)a1, (int)a2); }
+// PROSPER_PREADLOG: log fd-lifecycle ops (open/close/read/pread/lseek) with fd->path + the guest
+// call chain (first eboot-range return addrs on the stack). Used to trace Unity's FileCacher block
+// fetches — which offsets are read vs which blocks are skipped, and who closes a file mid-load.
 #ifndef _WIN32
-// PROSPER_PREADLOG: log fd/offset/count + the guest caller (first eboot-range return addr on the stack).
-// Used to trace Unity's FileCacher block fetches — which offsets are read vs which blocks are skipped.
+static bool fdlog_on() { static int on = getenv("PROSPER_PREADLOG") ? 1 : 0; return on; }
 static void preadlog(const char* fn, uint64_t fd, uint64_t off, uint64_t cnt) {
-    static int on = getenv("PROSPER_PREADLOG") ? 1 : 0; if (!on) return;
+    if (!fdlog_on()) return;
     // resolve fd -> path
     char path[256] = "?"; char lp[64]; snprintf(lp, sizeof lp, "/proc/self/fd/%lld", (long long)fd);
     ssize_t k = readlink(lp, path, sizeof path - 1); if (k > 0) path[k] = 0; else path[0] = '?', path[1] = 0;
@@ -163,10 +161,34 @@ static void preadlog(const char* fn, uint64_t fd, uint64_t off, uint64_t cnt) {
     for (int i = 0; i < 800 && nc < 3; i++) { uint64_t v = sp[i];
         if (v >= 0x400000000ull && v < 0x420000000ull) { uint64_t o = v - 0x400000000ull;
             if (nc == 0 || cc[nc-1] != o) cc[nc++] = o; } }
-    fprintf(stderr, "[preadlog] %-24s fd=%lld off=0x%llx(blk %lld) cnt=0x%llx callers=eboot+0x%llx,0x%llx,0x%llx\n",
-            base, (long long)fd, (unsigned long long)off, (long long)(off / 0x10000),
-            (unsigned long long)cnt, (unsigned long long)cc[0], (unsigned long long)cc[1], (unsigned long long)cc[2]);
+    fprintf(stderr, "[preadlog] %-6s %-24s fd=%lld off=0x%llx(blk %lld) cnt=0x%llx tid=%ld callers=eboot+0x%llx,0x%llx,0x%llx\n",
+            fn, base, (long long)fd, (unsigned long long)off, (long long)(off / 0x10000),
+            (unsigned long long)cnt, (long)syscall(SYS_gettid),
+            (unsigned long long)cc[0], (unsigned long long)cc[1], (unsigned long long)cc[2]);
 }
+#else
+static bool fdlog_on() { return false; }
+static void preadlog(const char*, uint64_t, uint64_t, uint64_t) {}
+#endif
+// PS5 fd semantics: the guest never receives fds 0-2 from sceKernelOpen (they are process-reserved),
+// and the game exploits that — Unity teardown paths issue close(0) as a "close invalid-handle
+// sentinel" no-op. On the host, stdin CAN be closed and fd 0 recycled to a game file; the next
+// spurious guest close(0) then kills a live file mid-load (proven: unity_builtin_extra's block-2
+// pread hit EBADF -> Unity silently kept a stale 64KB cache block -> deser crash at eboot+0x46beb4).
+// So: (a) never return fd<3 from open (dup up); (b) refuse guest closes of fd 0-2.
+HLE(f_open)  { std::string h = translate(CS(a0)); int fd = (int)::open(h.c_str(), (int)a1, (mode_t)a2);
+#ifndef _WIN32
+               while (fd >= 0 && fd < 3) { int nfd = fcntl(fd, F_DUPFD, 3); ::close(fd); fd = nfd; }
+#endif
+               if (fd >= 0) preadlog("open", (uint64_t)fd, 0, 0); return (uint64_t)(int64_t)fd; }
+HLE(f_close) { if (a0 < 3) { preadlog("close-lo-ignored", a0, 0, 0); return 0; }
+               preadlog("close", a0, 0, 0); return (uint64_t)(int64_t)::close((int)a0); }
+HLE(f_read)  { if (fdlog_on()) preadlog("read", a0, (uint64_t)::lseek((int)a0, 0, SEEK_CUR), a2);
+               return (uint64_t)(int64_t)::read((int)a0, P(a1), (size_t)a2); }
+HLE(f_write) { return (uint64_t)(int64_t)::write((int)a0, P(a1), (size_t)a2); }
+HLE(f_lseek) { if (fdlog_on() && ((int)a2 != SEEK_CUR || a1 != 0)) preadlog("lseek", a0, a1, (uint64_t)a2);
+               return (uint64_t)(int64_t)::lseek((int)a0, (off_t)a1, (int)a2); }
+#ifndef _WIN32
 HLE(f_pread)  { preadlog("pread", a0, a3, a2); return (uint64_t)(int64_t)::pread((int)a0, P(a1), (size_t)a2, (off_t)a3); }
 HLE(f_pwrite) { return (uint64_t)(int64_t)::pwrite((int)a0, P(a1), (size_t)a2, (off_t)a3); }
 #else

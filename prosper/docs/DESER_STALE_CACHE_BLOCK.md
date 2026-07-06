@@ -1,5 +1,8 @@
 # DESER CRASH ROOT CAUSE — stale CachedReader block, NOT a typetree/descriptor bug (2026-07-06)
 
+> **RESOLVED — see the final section: guest `close(0)` sentinel closes killed a live fd.
+> Fixed in `hle_file.cpp` (guest never receives fd<3; guest closes of fd 0-2 refused).**
+
 **TL;DR: the deserializer is fine. The crash reads correct-parse-state over WRONG FILE BYTES: Unity's
 64KB CachedReader window is positioned/bounded for file block 2 (0x20000) but still holds block 7's
 (0x70000) data — the block-2 `pread` is NEVER issued (verified by strace). Every "misaligned parse /
@@ -104,3 +107,39 @@ call site or return early at `0xb173ef` / go async?).
 Tooling added (gated, in exec_image_linux.cpp / hle_file.cpp): `PROSPER_PREADLOG` (pread offset+fd-path+guest
 callers), `PROSPER_STEPWIN` (chained windowed single-step between driver hits), and the cacher-slot ring
 capture.
+
+## ✅ RESOLVED (2026-07-06) — guest `close(0)` sentinel killed a live fd; FIXED in hle_file.cpp
+
+Extended `PROSPER_PREADLOG` to the full fd lifecycle (open/close/read/lseek with fd→path + guest callers).
+The complete picture, in one log (pre-fix):
+
+```
+open   unity_builtin_extra  fd=0            (fd 0 was free — see below)
+pread  unity_builtin_extra  fd=0 off=0x0     (block 0, metadata)
+pread  unity_builtin_extra  fd=0 off=0x70000 (block 7, Sprites/Mask + UI/Default)
+close  unity_builtin_extra  fd=0  callers=eboot+0x1f5bc30,0x146b209,0x809a39   <- SPURIOUS (see below)
+close  ?                    fd=0  callers=eboot+0x1f5bc30,0x146b209,0x809a39   <- same path, fd already dead
+pread  ?                    fd=0 off=0x20000 (block 2, BlitCopy)               <- EBADF — the "missing" read!
+```
+
+**The block-2 pread was issued all along** — it failed with EBADF because the fd had been closed under it.
+The sync read path `0x93a730` stores the error status in the request (`[req+0x28]=2/3`) but the FileCacher
+fetch/lookup never checks it → the stale block-7 buffer is handed to the deserializer.
+
+**Root cause (env divergence, not a game bug):** Unity teardown paths issue `close(0)` as a
+"close-the-invalid-handle-sentinel" no-op — harmless on PS5, where fds 0–2 are process-reserved and
+`sceKernelOpen` never returns them. In our env the first spurious `close(0)` closed the inherited fd 0,
+making it allocatable; `open(unity_builtin_extra)` then received fd 0; the NEXT spurious `close(0)` (from
+another object's teardown, distinct call path `…0x146b209 ← 0x809a39` vs the legitimate close path
+`…0xbd667a ← 0x806f76`) killed the live file mid-load. Deterministic because the load order is.
+
+**Fix (default-on, faithful PS5 fd semantics, `hle_file.cpp`):**
+- `f_open`: never return fd<3 to the guest (`fcntl(F_DUPFD, 3)` loop).
+- `f_close`: guest closes of fd 0–2 are refused (logged as `close-lo-ignored` under `PROSPER_PREADLOG`).
+
+**Verified:** 3/3 boots deterministic — the spurious `close(0)`s are neutralized (5× per boot, incl. from
+`0x46beb4`/`0x46be3f` teardown sites), `unity_builtin_extra` gets a real fd, the block-2 pread executes,
+and the 16-EiB-alloc deser crash at `eboot+0x46beb4` is GONE. Boot proceeds through shader deser into
+IME init. Linux tests 45/45. Remaining terminal event: a pre-existing 1×/run worker fault inside
+`prosper_on_unimpl` (our code — addr2line-pinned; present before this fix too) — that is the next,
+separate frontier.
