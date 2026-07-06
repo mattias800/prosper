@@ -1574,7 +1574,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const ShaderResource* res = nullptr;
                 if (rt) { auto it = rs.sreg_srt.find(in.src[1].value);
                     if (it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second);
-                    if (!res) res = rt->by_sgpr_base(in.src[1].value); }
+                    // A DIRECT vertex-buffer match (by SRSRC SGPR) wins over an s_load-tag match that
+                    // resolved to a non-vertex resource: bindless-dynamic fetch shaders load the V# with a
+                    // register (computed) offset, so the static srt tag (offset 0) spuriously matches the
+                    // first constant buffer. The executor keys the const-fold-resolved vertex buffer by its
+                    // SRSRC SGPR, so prefer that here.
+                    if (!res || res->cls != ResourceClass::VertexBuffer) {
+                        const ShaderResource* d = rt->by_sgpr_base(in.src[1].value);
+                        if (d) res = d;
+                    }
+                }
                 if (!res) { ok = false; return true; }
                 slot = (res->binding >= 3) ? 1 : 0;
                 stride = res->stride;

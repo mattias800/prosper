@@ -72,6 +72,8 @@ inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn&
         }
         return {};
     }
+    if (log) { fprintf(stderr, "[exec] BOTH stages recompiled: vs=%zu fs=%zu dwords -> rendering\n",
+                       vs.size(), fs.size()); fflush(stderr); }
     ResolvedPipelineState ps = resolve_pipeline_state(rs);
     return render(vs, fs, ps);
 }
