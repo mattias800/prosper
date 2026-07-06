@@ -324,13 +324,17 @@ namespace {
                 // Also surface rax + the u32 at [rax] — at the deserializer length-read site (0x7e40d9/e1)
                 // rax is the stream cursor and [rax] the value being read, so a trace shows the parse walk.
                 unsigned rax_u32 = probe_readable(rax) ? *(const uint32_t*)rax : 0xBADBADu;
-                char b[420];
+                // Also surface a candidate stream-reader object in rbx: cursor [+0x38], base [+0x40],
+                // end [+0x48] — at the 0x1612 deserializer driver rbx IS the reader, so this shows the
+                // cursor's position/window per field (to see which read walks it into the shader blob).
+                uint64_t rbx = (uint64_t)gr[REG_RBX];
+                char b[512];
                 int n = snprintf(b, sizeof b,
-                    "[hwbp] #%d rip=eboot+0x%llx rax=0x%llx [rax]=0x%08x r14=0x%llx rdi=0x%llx rsi=0x%llx ret=eboot+0x%llx caller_rbp=eboot+0x%llx tid=%ld\n",
+                    "[hwbp] #%d rip=eboot+0x%llx rax=0x%llx [rax]=0x%08x r14=0x%llx rbx=0x%llx cur=0x%llx base=0x%llx end=0x%llx ret=eboot+0x%llx caller_rbp=eboot+0x%llx tid=%ld\n",
                     (int)g_hwbp_count, (unsigned long long)((uint64_t)gr[REG_RIP] - 0x400000000ull),
-                    (unsigned long long)rax, rax_u32, (unsigned long long)r14,
-                    (unsigned long long)rdi, (unsigned long long)rsi, off(rd(rsp)), off(rd(rbp + 8)), cur_tid());
-                (void)r15;
+                    (unsigned long long)rax, rax_u32, (unsigned long long)r14, (unsigned long long)rbx,
+                    rd(rbx+0x38), rd(rbx+0x40), rd(rbx+0x48), off(rd(rsp)), off(rd(rbp + 8)), cur_tid());
+                (void)r15; (void)rdi; (void)rsi;
                 write(2, b, n);
             }
             // On the first exec hit, optionally arm a data write-watch on [<reg> + delta].
