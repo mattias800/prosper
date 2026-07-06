@@ -190,6 +190,28 @@ the HLE (mirror `set_tls_modules`), then fill the struct. Once the unwinder work
 `PROSPER_WAIT_TIMEOUT` and see how far the exception-driven path gets. Default stays infinite-wait (stable,
 no crash) until then.
 
+## 2026-07-06 — the exception path, followed to its end (unwind + TLS fixed; it's a SYMPTOM)
+Implemented `sceKernelGetModuleInfoForUnwind` (committed) — libunwind now walks the full stack cleanly
+(libc/Il2cpp/eboot, no eh_frame error). That exposed a SIGFPE in our own `k_tls_get_addr`: it kept the
+per-thread DTV in a host `thread_local`, which under the guest %fs aliases guest memory → the map's
+bucket_count read 0 → `hash % 0` → SIGFPE. Fixed by keying the DTV on `gettid` in a mutex-guarded global
+map (committed; same %fs landmine class as the boot wall). With both fixed, under `PROSPER_WAIT_TIMEOUT=1`
+the throw now unwinds + resolves TLS and runs a **guest handler at eboot+0xa9c0bb**, which derefs `[rdi+8]`
+with **rdi=null** → SIGSEGV. The unwind reached the top of the stack (eboot+0xae ≈ entry) — i.e. the
+exception is **UNCAUGHT**, reaching a terminate/error path.
+
+**Conclusion — the timeout/exception cascade is a symptom, not the route to frames.** The stuck waits have
+a *finite total budget* (the main/GfxDevice wait loops compute one and, when exhausted, branch to a
+give-up path that throws). On real HW the awaited resource arrives within budget because the producer runs;
+our **missing semaphore producer** means the budget expires → the game throws its own "timed out" error →
+(uncaught) crash. So honoring the timeout just walks the game into its timeout-error handling; it does NOT
+render. The productive root remains **the 3-thread sync_on_address producer that never posts** (see the
+thread map above). The unwind + TLS fixes are correct and valuable regardless (C++ exceptions will occur
+legitimately later). `PROSPER_WAIT_TIMEOUT` stays gated (off) so master is stable. NEXT: go back to the
+producer — identify which of {main 0x18a83b5, GfxDevice 0xb0672a, worker 0x9385d7} semaphores is the cycle
+root and what game event (GPU submit-with-draws + EOP-QUEUE event? async-load-completion callback?) is
+supposed to post it within the budget.
+
 So the game plants an EOP fence: RELEASE_MEM writes a completion value to label `A` when the GPU pipe
 drains; WAIT_REG_MEM (and, cross-thread, the PreloadManager/FTM producers) block until `[A]` satisfies the
 compare. **We never write `A`** — our AGC Dcb builders (`agc_cb_release_mem`, `agc_dcb_wait_reg_mem`,
