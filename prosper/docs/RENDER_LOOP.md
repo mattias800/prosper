@@ -256,6 +256,29 @@ ones above). This is the GPU-execution build; it is the definitive next mileston
 focused, likely-interactive effort. Everything upstream (boot, IL2CPP, asset load, shader creation ×35,
 recompiler ×34, flip loop, offscreen GpuState→frame spine) is in place.
 
+## 2026-07-06 — ⭐⭐ guest initial-exec TLS landmine FIXED; boot now reaches INPUT/IME init
+The `%fs` TLS fault below is **fixed** (gated `PROSPER_GUEST_FS`, validated). Implementation
+(`src/host/guest_tls.cpp` + `exec_image_linux.cpp` swap stubs, all default-off):
+- Give each guest thread its own **guest TCB + Variant-II static TLS** laid out below the thread pointer
+  (main exe/eboot closest to TP), tdata copied + tbss zeroed, `[TP]`=self, and run guest code with
+  `%fs = guest TP` (`guest_tls_activate_thread()` at `run_entry`). Total static TLS below TP = 0x6c0 bytes
+  for our 3 TLS modules (eboot 0xd0 / Il2cpp 0x150 / libc 0x468).
+- HLE handlers need the HOST `%fs` (host libc TLS), so the emitted import stubs (`emit_swap_stub`,
+  FSGSBASE) check a magic at `[fs+0x108]` marking OUR guest TCB; if present they `wrfsbase` the stashed
+  host TCB (`[fs+0x100]`) for the handler call and restore the guest `%fs` after — and if ABSENT (host
+  thread / pre-entry) they tail-call exactly as before, so it's inert off the guest path. `stub_size`→96.
+- **Result (`PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS="-force-gfx-direct"`): the `eboot+0xa9c0bb` fault and the
+  worker fault are GONE. The boot advances into NEW subsystems — new `libSceAgc` direct-mode calls and
+  `libSceIme` (keyboard/IME input init) — past audio init, no crash.** So the two fixes stack:
+  `-force-gfx-direct` (bypass the MT gfx-jobs deadlock) + guest `%fs` TLS (back initial-exec thread-locals)
+  → the game boots dramatically further. Linux 45/45 + Windows 20/20 green with the gate OFF (zero
+  regression; guest_tls.cpp is `#ifdef __linux__`). CONFIDENCE: HIGH.
+- **Open (next):** it settles back into a `suspendPoint` wait (further along now) — re-map where. Worker
+  threads aren't yet `guest_tls_activate_thread()`'d (their swap stubs tail-call safely; wire them when a
+  worker needs initial-exec TLS). Signal handlers run with whatever `%fs` is live — revisit if a fault
+  handler misbehaves under the gate. Consider making `-force-gfx-direct` + guest-fs the default once the
+  downstream path is stable.
+
 ## 2026-07-06 — ⭐ RENDER-LOOP DEADLOCK BROKEN via `-force-gfx-direct` (single-threaded rendering)
 **The multi-session render-loop deadlock is broken.** Producer-RE (gdb thread dump + `PROSPER_SYNCLOG`
 with caller offsets, done interactively with the user) pinned the exact topology, then a one-switch
