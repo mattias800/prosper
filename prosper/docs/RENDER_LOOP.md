@@ -597,3 +597,29 @@ element size/count → numeric read as strings. This would be specific to whiche
 `call *0x38`/`call *0x88` (and the transfer object's vtable ptr) at the crash and check them against the
 engine's real method addresses; if a vtable slot is mis-relocated, fix the loader's relocation of that
 region. Cross-check prosper's RELA/relative-reloc handling for the engine's `.data.rel.ro`/vtable sections.
+
+## 2026-07-06 (cont.) — ⭐⭐⭐ EXACT MECHANISM: MatrixParameter read 12 bytes not 16 (SInt8 tail dropped)
+
+Ground-truthed via UnityPy (forced Python path, hooked `read_value` to map ref offset -> field):
+the crash cursor (buffer 0x7a20 = CubeBlur-object ref offset 5064) sits at a `MatrixParameter`'s
+`m_Type`(SInt8)/`m_RowCount`(SInt8) fields:
+
+```
+off 5052  MatrixParameter { m_NameIndex(int)=2, m_Index(int)=0, m_ArraySize(int)=0,
+off 5064    m_Type   SInt8 = 0,
+off 5065    m_RowCount SInt8 = 4,  (+2 pad) }   -> 16-byte struct, ends at 5068
+off 5068  m_VectorParams (vector)  <- correct next read position
+```
+
+`{m_Type=0, m_RowCount=4, pad, pad}` little-endian == **0x00000400**. Our runtime reads a u32 COUNT at
+5064 (via driver 0x1612c70) = 0x400 = 1024, reserves 1024, reads garbage strings -> ~16 EiB alloc -> crash.
+So our runtime consumed the `MatrixParameter` as **12 bytes (3 ints only), skipping the trailing two
+`SInt8` fields + pad**, drifting exactly 4 bytes so the next vector-count read lands on `m_Type/m_RowCount`.
+
+CubeBlur's UnityPerDraw cbuffer (in `m_CommonParameters`) has 1 MatrixParameter -> 4-byte drift -> the
+count read lands on 0x400. This is why only CubeBlur (deduped stereo params with a matrix) trips it and
+`m_Type`/`m_RowCount`-free shaders (#4/#5) don't. Data is byte-perfect; the bug is that the generated
+typetree / read for `MatrixParameter` (and `VectorParameter`, same {…, SInt8 m_Type, SInt8 m_Dim/RowCount}
+layout) uses a 12-byte stride instead of 16 -- i.e. its byteSize/children omit the SInt8 tail (+align4).
+**NEXT:** find why the generated typetree gives MatrixParameter byteSize=12 (dropped SInt8 children or a
+missing kAlignBytesFlag / SInt8-node), which is the fixable root.
