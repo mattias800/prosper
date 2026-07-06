@@ -49,7 +49,9 @@ struct Pm4Command {
     uint32_t index_count = 0;            // DrawIndexAuto
     uint32_t index_size = 0;             // SetIndexType
     uint32_t event_type = 0;             // EventWrite
-    uint32_t sh_reg_offset = 0, sh_reg_value = 0;  // SetShRegDirect
+    uint32_t sh_reg_offset = 0, sh_reg_value = 0;  // SetShRegDirect (sh_reg_value = first value)
+    uint32_t sh_reg_count = 0;                 // SetShRegDirect: # of consecutive registers this packet sets
+    const uint32_t* sh_reg_data = nullptr;     // SetShRegDirect: -> the value dwords (count of them) in-packet
 
     // ReleaseMem (EOP fence) — laid out by hle_agc.cpp agc_cb_release_mem, whose args are now pinned to the
     // AGC ABI sceAgcCbReleaseMem(buf, action, gcr_cntl, dst, cache_policy, address, data_sel, data, …)

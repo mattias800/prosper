@@ -73,6 +73,24 @@ int main() {
     CHECK(st.draws.size() == 2 && st.draws[0].index_count == 0x0300, "draw0 index_count = 0x300");
     CHECK(st.draws.size() == 2 && st.draws[1].index_count == 0x0006, "draw1 index_count = 0x6");
 
+    // SET_SH_REG (IT_SET_SH_REG=0x76) sets a RANGE: payload[0]=start offset, payload[1..]=consecutive
+    // values. The driver uploads the whole user-data descriptor block this way, so the decode+apply MUST
+    // write every value — regressing to "first register only" silently drops the shaders' V#/T# SGPRs.
+    {
+        // Build a type-3 SET_SH_REG packet: header + [offset, v0,v1,v2,v3,v4] (5 registers @ 0x100).
+        const uint32_t M = 6;                                   // payload dwords (offset + 5 values)
+        uint32_t pkt[1 + M];
+        pkt[0] = 0xC0000000u | ((M - 1u) << 16) | (0x76u << 8); // type3, len, op=IT_SET_SH_REG
+        pkt[1] = 0x100u;                                        // start register offset
+        for (uint32_t k = 0; k < 5; k++) pkt[2 + k] = 0xD0000000u + k;
+        GpuState s2;
+        run_command_buffer(pkt, 1 + M, s2);
+        CHECK(s2.sh.size() == 5, "SET_SH_REG range set all 5 registers (not just the first)");
+        bool all = true;
+        for (uint32_t k = 0; k < 5; k++) all &= (s2.sh.count(0x100u + k) && s2.sh[0x100u + k] == 0xD0000000u + k);
+        CHECK(all, "SET_SH_REG range values sh[0x100..0x104] are the consecutive payload values");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

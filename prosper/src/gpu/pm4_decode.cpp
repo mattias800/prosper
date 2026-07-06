@@ -41,8 +41,14 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
             c.kind = K::EventWrite;
             if (npl >= 1) c.event_type = pl[0] & 0xffu;
         } else if (c.op == IT_SET_SH_REG) {
+            // SET_SH_REG sets a RANGE: pl[0] = start register offset, pl[1..npl-1] = consecutive values
+            // (this is how the driver uploads the whole user-data descriptor block in one packet — e.g. a
+            // len-22 packet at GS_0 loads s0..s20). Capture the full range, not just the first register.
             c.kind = K::SetShRegDirect;
-            if (npl >= 2) { c.sh_reg_offset = pl[0]; c.sh_reg_value = pl[1]; }
+            if (npl >= 2) {
+                c.sh_reg_offset = pl[0]; c.sh_reg_value = pl[1];
+                c.sh_reg_count = npl - 1; c.sh_reg_data = &pl[1];
+            }
         } else if (c.op == IT_NOP) {
             switch (c.r) {
                 case R_DRAW_RESET:    c.kind = K::DrawReset;    break;

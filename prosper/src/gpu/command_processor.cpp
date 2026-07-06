@@ -58,11 +58,27 @@ void GpuState::apply(const Pm4Command& c) {
             auto* regs = reinterpret_cast<const ShaderReg*>(static_cast<uintptr_t>(c.regs_vaddr));
             auto& file = (c.reg_class == RegClass::Cx) ? cx
                        : (c.reg_class == RegClass::Sh) ? sh : uc;
+            if (getenv("PROSPER_RESDUMP")) {
+                const char* cn = c.reg_class == RegClass::Cx ? "Cx" : c.reg_class == RegClass::Sh ? "Sh" : "Uc";
+                fprintf(stderr, "[regindir] class=%s num=%u vaddr=0x%llx first pairs:", cn, c.num_regs,
+                        (unsigned long long)c.regs_vaddr);
+                for (uint32_t i = 0; i < c.num_regs && i < 6; i++)
+                    fprintf(stderr, " (off=0x%x val=0x%x)", regs[i].offset, regs[i].value);
+                fprintf(stderr, "\n");
+            }
             for (uint32_t i = 0; i < c.num_regs; i++) file[regs[i].offset] = regs[i].value;
             break;
         }
         case K::SetShRegDirect:
-            sh[c.sh_reg_offset] = c.sh_reg_value;
+            // SET_SH_REG writes a consecutive RANGE (the driver uploads the whole user-data SGPR block
+            // this way). Write every value, not just the first — else all descriptors past the range's
+            // first register are silently dropped (which left the shaders' V#/T# SGPRs empty).
+            if (c.sh_reg_data && c.sh_reg_count) {
+                for (uint32_t k = 0; k < c.sh_reg_count && c.sh_reg_count <= kMaxRegsPerPacket; k++)
+                    sh[c.sh_reg_offset + k] = c.sh_reg_data[k];
+            } else {
+                sh[c.sh_reg_offset] = c.sh_reg_value;   // fallback (single-register / legacy path)
+            }
             break;
         case K::SetIndexType:
             index_type = c.index_size;
