@@ -677,6 +677,10 @@ struct SpirvCompute {
     uint32_t load_vertex_index() { uint32_t r = id(); put(code, Op_Load, {t_i32, r, v_vid}); return i2u(r); }
     // Write vec4(x,y,z,w) (bit-operands) to gl_Position (EXP POS0).
     void export_position(uint32_t x, uint32_t y, uint32_t z, uint32_t w) {
+        // PROSPER_FORCE_W: diagnostic — force the clip-space w to 1.0. Some shaders' factored MVP
+        // multiply leaves w at 0 under our (still-incomplete) descriptor decode, collapsing the
+        // perspective divide; forcing w=1 reveals whether the x/y are otherwise on-screen.
+        if (getenv("PROSPER_FORCE_W")) w = uconst(0x3f800000u);   // raw bits of 1.0f (bcf bitcasts to float)
         uint32_t v = id(); putv(code, Op_CompositeConstruct, {t_v4f, v, bcf(x), bcf(y), bcf(z), bcf(w)});
         uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_out_v4f, p, v_pos, uconst(0)});
         put(code, Op_Store, {p, v});
