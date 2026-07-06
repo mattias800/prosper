@@ -301,6 +301,16 @@ the next milestone):** trace the reader from a known-good field back to the firs
 `0x1612c70` and watch `[rbx+0x38]` (cursor) vs the expected TypeTree layout, or verify our `pread`/mmap of
 `level0` returns byte-correct data. This is Unity-asset-deserialization RE — a large surface, the clear
 next frontier now that the MT-deadlock + guest-TLS walls are down and the boot reaches scene load.
+- **Refinement:** the length `0xcf3e1608` is NOT present as bytes in `level0`/`sharedassets0.assets`/
+  `globalgamemanagers`(.assets) (searched LE `08 16 3e cf` + BE) — and it's identical across runs (so not
+  an ASLR pointer). So it's a **computed/transformed value in memory**, not raw file bytes read at a wrong
+  offset ⟹ NOT a simple file-I/O byte bug; it's deeper in the deserializer's logic (a field decoded/
+  transformed wrong, or a wrong reader object). Note `0x7e4115`/`0x7fcafb`/`0x7e40d9` are libc++ std::string
+  internals (low eboot addrs = statically-linked libc++); `0x1612c92` is the Unity/game caller holding the
+  reader object `rbx`. NEXT: capture `rax` (the length source ptr) + `rbx` (reader) live and dump what
+  region `rax` points into (decompressed buffer? heap object?) — the gdb conditional needs the value
+  compared as UNSIGNED (`0xffffffffcf3e1608` is negative signed, so `> 0x10000000` is false) or matched
+  exactly (`== 0xffffffffcf3e1608`).
 
 ## 2026-07-06 — ⭐⭐ guest initial-exec TLS landmine FIXED; boot now reaches INPUT/IME init
 The `%fs` TLS fault below is **fixed** (gated `PROSPER_GUEST_FS`, validated). Implementation
