@@ -118,15 +118,24 @@ HLE(agc_dcb_acquire_mem) {  // (buf, engine, cb_db_op, gcr_cntl, ...) — 8 dw
     cmd[1] = (uint32_t)a2; cmd[2] = cmd[3] = cmd[4] = cmd[5] = cmd[6] = 0; cmd[7] = (uint32_t)a3;
     return (uint64_t)(uintptr_t)cmd;
 }
-HLE(agc_cb_release_mem) {  // GraphicsCbReleaseMem (buf, ...) — 7 dw
-    if (getenv("PROSPER_GFXLOG")) {
-        volatile uint64_t* fp = (uint64_t*)__builtin_frame_address(0);  // fp[1]=ret, fp[2..]=stack args a6..
+HLE(agc_cb_release_mem) {  // GraphicsCbReleaseMem (buf, eventType,?,dstSel,cacheAction, dstGpuAddr; a6,a7=value) — 7 dw
+    volatile uint64_t* fp = (uint64_t*)__builtin_frame_address(0);  // fp[1]=ret, fp[2..]=stack args a6..
+    uint64_t a6 = fp[2], a7 = fp[3];
+    if (getenv("PROSPER_GFXLOG"))
         fprintf(stderr, "[agc] ReleaseMem a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx | ret=0x%llx a6=0x%llx a7=0x%llx a8=0x%llx\n",
             (unsigned long long)a1,(unsigned long long)a2,(unsigned long long)a3,(unsigned long long)a4,(unsigned long long)a5,
-            (unsigned long long)fp[1],(unsigned long long)fp[2],(unsigned long long)fp[3],(unsigned long long)fp[4]);
-    }
+            (unsigned long long)fp[1],(unsigned long long)a6,(unsigned long long)a7,(unsigned long long)fp[4]);
+    // EOP fence: stash the destination label address (a5) + both candidate value args (a6,a7) + the
+    // event type (a1) into the packet payload so the CommandProcessor can perform the completion write
+    // at SUBMIT time (correct end-of-pipe timing — our GPU folds synchronously, so submit == pipe drain).
+    // CONFIDENCE: HIGH — a5 is the label address (verified: WaitRegMem polls the SAME address).
+    // CONFIDENCE: LOW  — which stack arg is the value (a6∈{2,3} looks like a data-select/size; a7 looks
+    //   like the fence value, e.g. 0x1bfba062). Both are carried so the writeback (command_processor.cpp,
+    //   PROSPER_AGC_FENCE-selectable) can pick without a rebuild while we find what the game's poll wants.
     uint32_t* cmd; if (!begin_packet(a0, 7, IT_NOP, R_RELEASE_MEM, &cmd)) return 0;
-    cmd[1] = cmd[2] = cmd[3] = cmd[4] = cmd[5] = cmd[6] = 0; return (uint64_t)(uintptr_t)cmd;
+    cmd[1] = (uint32_t)(a5 & 0xffffffffu); cmd[2] = (uint32_t)(a5 >> 32u);
+    cmd[3] = (uint32_t)a6; cmd[4] = (uint32_t)a7; cmd[5] = (uint32_t)a1; cmd[6] = 0;
+    return (uint64_t)(uintptr_t)cmd;
 }
 HLE(agc_dcb_write_data) {  // (buf, dst, cache_policy, address_or_offset, ...) — 4 dw (num_dwords via stack, approx 0)
     if (getenv("PROSPER_GFXLOG")) fprintf(stderr, "[agc] WriteData args a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx\n",

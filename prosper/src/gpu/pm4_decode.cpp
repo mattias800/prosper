@@ -50,7 +50,13 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
                 case R_ACQUIRE_MEM:   c.kind = K::AcquireMem;   break;
                 case R_WRITE_DATA:    c.kind = K::WriteData;    break;
                 case R_WAIT_MEM_64:   c.kind = K::WaitRegMem;   break;
-                case R_RELEASE_MEM:   c.kind = K::ReleaseMem;   break;
+                case R_RELEASE_MEM:
+                    c.kind = K::ReleaseMem;
+                    // payload: [0..1]=dst label addr lo/hi, [2]=value a6, [3]=value a7 (see agc_cb_release_mem)
+                    if (npl >= 2) c.rel_addr = lo_hi(pl);
+                    if (npl >= 3) c.rel_v6 = pl[2];
+                    if (npl >= 4) c.rel_v7 = pl[3];
+                    break;
                 case R_FLIP:          c.kind = K::Flip;         break;
                 case R_DRAW_INDEX_AUTO:
                     c.kind = K::DrawIndexAuto;

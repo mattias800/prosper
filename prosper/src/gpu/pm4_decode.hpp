@@ -50,6 +50,12 @@ struct Pm4Command {
     uint32_t index_size = 0;             // SetIndexType
     uint32_t event_type = 0;             // EventWrite
     uint32_t sh_reg_offset = 0, sh_reg_value = 0;  // SetShRegDirect
+
+    // ReleaseMem (EOP fence) — laid out by hle_agc.cpp agc_cb_release_mem into the packet payload:
+    // [0..1]=dst label GPU address (lo/hi), [2]=value candidate a6, [3]=value candidate a7, [4]=eventType.
+    // CONFIDENCE: HIGH addr; LOW which value arg — see agc_cb_release_mem / command_processor.cpp.
+    uint64_t rel_addr = 0;               // ReleaseMem: destination label address
+    uint32_t rel_v6 = 0, rel_v7 = 0;     // ReleaseMem: the two candidate fence values (a6, a7)
 };
 
 // Decode `dwords` dwords starting at `buf` into `out` (appended). Returns the number of dwords
