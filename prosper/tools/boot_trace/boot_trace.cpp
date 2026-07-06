@@ -50,6 +50,18 @@ int main(int argc, char** argv) {
     for (auto& img : p.imgs) if (!map_image(img, &e)) { printf("map failed: %s\n", e.c_str()); return 1; }
     { std::vector<TlsModuleDesc> td; for (auto& t : p.tls_templates) td.push_back({t.init_va, t.filesz, t.memsz});
       set_tls_modules(td.data(), td.size()); }   // enable __tls_get_addr for loaded modules (real libc.prx)
+    // C++ exception unwinding: give sceKernelGetModuleInfoForUnwind each module's .eh_frame_hdr + text seg.
+    { static std::vector<std::string> names; names.reserve(p.imgs.size());   // stable name storage
+      std::vector<UnwindModuleDesc> um;
+      for (size_t i = 0; i < p.imgs.size() && i < p.mods.size(); i++) {
+          auto& img = p.imgs[i]; auto& mod = *p.mods[i];
+          UnwindModuleDesc dd; dd.lo = img.base + img.min_vaddr; dd.hi = img.base + img.max_vaddr;
+          for (auto& s : mod.segments) if (s.type == 0x6474e550u) { dd.ehframe_hdr = img.base + s.vaddr; dd.ehframe_hdr_sz = s.memsz; }
+          if (!mod.loads.empty()) { dd.seg0 = img.base + mod.loads[0].vaddr; dd.seg0_sz = mod.loads[0].memsz; }
+          std::string nm = mod.path; auto sl = nm.find_last_of("/\\"); if (sl != std::string::npos) nm = nm.substr(sl + 1);
+          names.push_back(nm); dd.name = names.back().c_str(); um.push_back(dd);
+      }
+      set_unwind_modules(um.data(), um.size()); }
     // sceKernelGetProcParam -> eboot's SCE_PROCPARAM (real libc reads its heap/malloc config here).
     for (auto& s : p.mods[0]->segments)
         if (s.type == PT_SCE_PROCPARAM) { set_proc_param(EBOOT + s.vaddr); break; }

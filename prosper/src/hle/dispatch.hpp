@@ -77,6 +77,18 @@ struct TlsModuleDesc { uint64_t init_va = 0, filesz = 0, memsz = 0; };
 // __tls_get_addr HLE to serve real per-thread TLS blocks for loaded modules (e.g. real libc.prx).
 void set_tls_modules(const TlsModuleDesc* descs, size_t count);
 
+// Per-module info for C++ exception unwinding (sceKernelGetModuleInfoForUnwind). The guest's libunwind
+// asks, for a code address, where that module's .eh_frame_hdr / text segment live. `lo/hi` is the module's
+// absolute VA span (for the addr→module lookup); ehframe_hdr = absolute VA of its PT_GNU_EH_FRAME segment.
+struct UnwindModuleDesc {
+    uint64_t lo = 0, hi = 0;             // absolute VA range covering the module
+    uint64_t ehframe_hdr = 0, ehframe_hdr_sz = 0;   // .eh_frame_hdr (PT_GNU_EH_FRAME), absolute VA
+    uint64_t seg0 = 0, seg0_sz = 0;      // first PT_LOAD, absolute VA
+    const char* name = nullptr;          // stable module name (basename)
+};
+// Install module unwind descriptors (call after images are mapped). Enables sceKernelGetModuleInfoForUnwind.
+void set_unwind_modules(const UnwindModuleDesc* descs, size_t count);
+
 // Guest address of the main module's SCE_PROCPARAM segment. sceKernelGetProcParam returns this;
 // real libc reads its heap/malloc config (sceLibcParam) from it, so a correct value is required for
 // real libc.prx's heap to initialize. Set from the eboot's PT_SCE_PROCPARAM segment after mapping.

@@ -300,6 +300,59 @@ HLE(k_sema_signal) { auto* s = (Sema*)(uintptr_t)a0; if (!s) return 0; int64_t n
 HLE(k_sema_poll)   { auto* s = (Sema*)(uintptr_t)a0; if (!s) return 0; int64_t need = a1 ? (int64_t)a1 : 1;
     pthread_mutex_lock(&s->m); bool ok = s->count >= need; if (ok) s->count -= need; pthread_mutex_unlock(&s->m); return ok ? 0 : 0x80020023; }
 
+// ---- C++ exception unwinding: sceKernelGetModuleInfoForUnwind (libkernel RpQJJVKTiFM) ----
+// The guest's libunwind calls this per code address to locate that module's .eh_frame_hdr for stack
+// unwinding. It was an unimplemented stub returning 0 with the caller's struct left uninitialised, so
+// libunwind read a garbage eh_frame_hdr address ("Unsupported .eh_frame_hdr version" → stack smash) and
+// ANY thrown C++ exception was fatal. Now we fill the real info from the loaded modules' program headers.
+namespace {
+    std::vector<UnwindModuleDesc> g_unwind_mods;
+    // Decode the eh_frame pointer out of an .eh_frame_hdr. Layout: [0]=version(1), [1]=eh_frame_ptr_enc,
+    // [2]=fde_count_enc, [3]=table_enc, [4..]=eh_frame_ptr (encoded). The common encoding is 0x1B
+    // (DW_EH_PE_pcrel|sdata4): a signed 32-bit offset from the field's own address.
+    // CONFIDENCE: MED — handles the common 0x1B encoding; other encodings fall back to 0.
+    uint64_t decode_eh_frame_ptr(uint64_t hdr_va) {
+        if (!hdr_va) return 0;
+        const uint8_t* h = (const uint8_t*)(uintptr_t)hdr_va;
+        if (h[0] != 1) return 0;                       // unknown version
+        if (h[1] == 0x1B) {                            // pcrel | sdata4
+            int32_t off = *(const int32_t*)(h + 4);
+            return (hdr_va + 4) + (int64_t)off;
+        }
+        if (h[1] == 0x03) return *(const uint32_t*)(h + 4);           // absptr (udata4)
+        if (h[1] == 0x0C) return *(const uint64_t*)(h + 4);           // udata8-ish
+        return 0;
+    }
+}
+// ModuleInfoForUnwind (orbis, 0x130 bytes): st_size@0x00 (caller-set), name[256]@0x08,
+// eh_frame_hdr_addr@0x108, eh_frame_addr@0x110, eh_frame_size@0x118, seg0_addr@0x120, seg0_size@0x128.
+// CONFIDENCE: MED on the struct layout (matches shadPS4's OrbisModuleInfoForUnwind) — verify by whether
+// the guest's libunwind stops erroring after this fills real values.
+HLE(k_get_module_info_for_unwind) {   // (VAddr addr, int flags, ModuleInfoForUnwind* info)
+    uint8_t* info = (uint8_t*)(uintptr_t)a2;
+    if (!info) return 0x80020016;                      // SCE_KERNEL_ERROR_EINVAL
+    const UnwindModuleDesc* m = nullptr;
+    for (auto& d : g_unwind_mods) if (a0 >= d.lo && a0 < d.hi) { m = &d; break; }
+    if (!m) return 0x80020003;                         // SCE_KERNEL_ERROR_ESRCH: addr not in any module
+    char* nm = (char*)(info + 0x08);
+    const char* src = m->name ? m->name : "";
+    size_t n = 0; for (; src[n] && n < 255; n++) nm[n] = src[n]; nm[n] = 0;
+    uint64_t eh = decode_eh_frame_ptr(m->ehframe_hdr);
+    *(uint64_t*)(info + 0x108) = m->ehframe_hdr;
+    *(uint64_t*)(info + 0x110) = eh;
+    // eh_frame extends from its start to the end of the text segment (an over-estimate is safe —
+    // libunwind reads FDEs on demand via the hdr's binary-search table). 0 if we couldn't decode.
+    *(uint64_t*)(info + 0x118) = (eh && eh < m->seg0 + m->seg0_sz) ? (m->seg0 + m->seg0_sz - eh) : 0;
+    *(uint64_t*)(info + 0x120) = m->seg0;
+    *(uint64_t*)(info + 0x128) = m->seg0_sz;
+    if (getenv("PROSPER_UNWINDLOG"))
+        fprintf(stderr, "[unwind] addr=0x%llx -> %s eh_frame_hdr=0x%llx eh_frame=0x%llx seg0=0x%llx\n",
+                (unsigned long long)a0, nm, (unsigned long long)m->ehframe_hdr,
+                (unsigned long long)eh, (unsigned long long)m->seg0);
+    return 0;
+}
+void set_unwind_modules(const UnwindModuleDesc* d, size_t c) { g_unwind_mods.assign(d, d + c); }
+
 // ---- Async exception delivery = the IL2CPP GC's stop-the-world thread suspension ----
 // The runtime installs a handler (sceKernelInstallExceptionHandler) for exception type 0x1e,
 // then to stop the world it calls sceKernelRaiseException(thread, 0x1e) on each thread. On
@@ -542,6 +595,7 @@ void register_kernel_hle() {
     R("sceKernelCreateSema", k_sema_create);    R("sceKernelDeleteSema", k_sema_delete);
     R("sceKernelWaitSema", k_sema_wait);        R("sceKernelSignalSema", k_sema_signal);
     R("sceKernelPollSema", k_sema_poll);
+    R("sceKernelGetModuleInfoForUnwind", k_get_module_info_for_unwind);   // C++ exception unwinding
     // Registration / hook / debug libkernel calls the app makes at startup that have no observable
     // effect in our headless boot — returning OK without side effects is the correct behavior:
     //  - SetThreadDtors / SetThreadAtexitCount / SetThreadAtexitReport: per-thread exit bookkeeping;
