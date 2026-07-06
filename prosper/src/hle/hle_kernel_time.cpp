@@ -52,6 +52,19 @@ HLE(k_gettimeofday) {                                      // (struct timeval*, 
 }
 HLE(k_time) { uint64_t s = ns_now() / 1000000000ull + 1700000000ull; if (a0) *(int64_t*)P(a0) = (int64_t)s; return s; }
 HLE(k_clock) { return ns_now() / 1000; }   // clock(): CLOCKS_PER_SEC=1e6 -> microseconds
+// sceRtcGetCurrentTick(SceRtcTick* tick): a SceRtcTick is a single u64 = microseconds since the Sony RTC
+// epoch 0001-01-01 00:00:00 UTC. Was unimplemented (→0), which zeroes the game's wall-clock and skews any
+// timestamp/interval math derived from it. Return a real, monotonically-advancing tick built from our
+// synthetic unix time (base 1700000000 ≈ 2023-11) + the RTC↔unix epoch offset (62135596800 s).
+// CONFIDENCE: MED — SceRtcTick = bare u64 µs and the 62135596800 s offset are the documented Orbis RTC
+// convention; the wall-clock base is synthetic (we don't read the host RTC) but advances correctly.
+HLE(k_rtc_get_current_tick) {
+    if (!a0) return 0;
+    uint64_t unix_us = (ns_now() / 1000ull) + 1700000000ull * 1000000ull;
+    uint64_t tick = unix_us + 62135596800ull * 1000000ull;   // shift to the 0001-01-01 RTC epoch
+    *(uint64_t*)P(a0) = tick;
+    return 0;
+}
 // real sleeps so timed wait loops actually yield the CPU (and advance real time)
 HLE(k_usleep)   { uint64_t us = a0; struct timespec ts{ (time_t)(us / 1000000), (long)((us % 1000000) * 1000) }; nanosleep(&ts, nullptr); return 0; }
 HLE(k_sleep_s)  { struct timespec ts{ (time_t)a0, 0 }; nanosleep(&ts, nullptr); return (uint64_t)a0; }
@@ -247,6 +260,8 @@ void register_kernel_time_hle() {
     R("gettimeofday", k_gettimeofday);
     R("time", k_time);
     R("clock", k_clock);
+    R("sceRtcGetCurrentTick", k_rtc_get_current_tick);
+    R("sceRtcGetCurrentNetworkTick", k_rtc_get_current_tick);
     // module loading (report success; real PRX are already resident in our address space)
     R("sceSysmoduleLoadModule", k_ok);
     R("sceSysmoduleUnloadModule", k_ok);
