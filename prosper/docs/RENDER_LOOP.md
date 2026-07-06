@@ -646,3 +646,26 @@ eboot+0x147b483 / 0x1485851   asset load entry
   (`*0x38` result) for the `m_MatrixParams` vector read, and/or find where MatrixParameter's serialized size
   is computed as 12 (a compiled size fn or a typetree node byteSize). Undocumented Unity runtime typetree
   layout — needs disassembly of the `*0x38`/`*0x88` element-size/read methods for the param types.
+
+### Read is FULLY generic; none of the MatrixParameter-named functions run
+Breakpoint hit-counts during the boot (all reach the real crash eboot+0x46beb4, all got 0 hits):
+- `eboot+0x15fe650` MatrixParameter `GenerateTypeTree` transfer (editor instantiation) — 0 hits.
+- `eboot+0x160d630` MatrixParameter `SafeBinaryRead` element read (reads m_NameIndex/Index/ArraySize via
+  0x7f2a50, m_Type via 0x160d7c0, m_RowCount via `0xd58710` with a `test eax;je`-skip) — 0 hits.
+- `eboot+0x1609850` vector<MatrixParameter> reader (calls `0xd58710` → mode `eax`; `cmp $2` → elementwise
+  loop of 0x160d630 else bulk path; element byteSize `r13 = [node+0xc]`) — 0 hits.
+`m_RowCount`'s name string (vaddr 0x1c4efed) is lea'd ONLY by 0x15fe7b2 (in 0x15fe650) and 0x160d696 (in
+0x160d630) — both uncalled. So no called function transfers m_Type/m_RowCount by name.
+
+⟹ The runtime read is the fully-generic node/byteSize walker (`0xd3d34b → 0xd4ce00 → driver`), and it strides
+the m_MatrixParams array by an **element byteSize of 12** (3 ints), so it never consumes MatrixParameter's
+trailing `SInt8 m_Type`/`m_RowCount` + align. `unity_builtin_extra` has NO embedded typetree (UnityPy: 1 type,
+0 nodes; SerializedFileHeader version=22), so that byteSize comes from a **compiled reflection/registration
+descriptor** built WITHOUT referencing the type by name (a static init table), not from the per-type Transfer
+functions. **This is the fixable root class: a static-initializer / RTTI-field-registration built the
+MatrixParameter (and VectorParameter) descriptor with only 3 fields (byteSize 12) in our env** — matching
+Kyty's init-ordering divergence note and Fable's "corrupted RTTI/static-init generation" mechanism #2.
+**NEXT:** (a) find the static init that registers MatrixParameter's fields and why our env leaves it with 3
+fields / byteSize 12 (init-array ordering: we run PRX init reverse vs Kyty forward; confirm we don't
+double-run or skip `_init`); or (b) gated capture of `0xd4ce00`'s `*0x38` elemSize for the m_MatrixParams read
+(arm after the 5th driver hit to avoid init perturbation) to nail the 12.
