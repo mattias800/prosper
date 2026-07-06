@@ -165,6 +165,31 @@ whether Unity's async-load-completion callback (should post main's semaphore aft
 on an idle pool thread that returns without posting. Tooling: `PROSPER_AGC_FENCE`, and the gdb snapshot
 recipe (attach to the boot_trace child, `handle SIG34-40 nostop noprint pass`, `thread apply all bt`).
 
+## 2026-07-06 — sceKernelWaitOnAddress ignored its timeout → BLOCKS FOREVER (bug found)
+The three stuck threads call `sceKernelWaitOnAddress(addr, expected, &timeout, 0)` (the thunk is
+eboot+0x19b4050; wake side eboot+0x19b4060 = `sceKernelWakeByAddress`). **Our impl passed `nullptr` for
+the futex timeout, so every bounded wait blocked forever** and could never reach the guest's
+timeout-exhausted branch. Fixed to honor `a2` (a `uint32` microseconds pointer; most waits pass a2=0 =
+infinite, but ~25 pass 1000 µs) AND to return `SCE_KERNEL_ERROR_ETIMEDOUT` (0x80020060) on a real timeout
+instead of always 0 — returning 0 told the guest its semaphore was *signaled* when it wasn't (phantom).
+
+**Effect (gated behind `PROSPER_WAIT_TIMEOUT` for now):** with the timeout honored, the game leaves the
+quiescent suspendPoint loop and takes a **new path** — it reaches audio init and then **throws a C++
+exception**, whose stack unwind crashes: `sceKernelGetModuleInfoForUnwind` (libkernel `RpQJJVKTiFM`) is
+unimplemented → libunwind reads garbage → `decodeEHHdr … Unsupported .eh_frame_hdr version` → stack-smash
+abort. So **the game uses C++ exceptions for control flow (incl. wait timeouts), and our broken unwinder
+makes any throw fatal.** This is likely a bigger unlock than the fence: with a working unwinder the throw
+would be caught and the game could proceed.
+
+**NEXT (concrete):** implement `sceKernelGetModuleInfoForUnwind(addr, flags, info*)` — given a code addr,
+find the containing module and fill the `ModuleInfoForUnwind` struct (0x130 bytes: st_size@0x00,
+name[256]@0x08, eh_frame_hdr_addr@0x108, eh_frame_addr@0x110, eh_frame_size@0x118, seg0_addr@0x120,
+seg0_size@0x128). We have the data: each `Module` carries all program headers, and the `PT_GNU_EH_FRAME`
+(0x6474e550) segment IS `.eh_frame_hdr`. Plumb per-module {base, eh_frame_hdr va/sz, seg0 va/sz, name} to
+the HLE (mirror `set_tls_modules`), then fill the struct. Once the unwinder works, un-gate
+`PROSPER_WAIT_TIMEOUT` and see how far the exception-driven path gets. Default stays infinite-wait (stable,
+no crash) until then.
+
 So the game plants an EOP fence: RELEASE_MEM writes a completion value to label `A` when the GPU pipe
 drains; WAIT_REG_MEM (and, cross-thread, the PreloadManager/FTM producers) block until `[A]` satisfies the
 compare. **We never write `A`** — our AGC Dcb builders (`agc_cb_release_mem`, `agc_dcb_wait_reg_mem`,

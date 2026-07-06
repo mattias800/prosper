@@ -12,6 +12,8 @@
 #include <linux/futex.h>
 #include <unistd.h>
 #include <climits>
+#include <cerrno>
+#include <ctime>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -211,12 +213,46 @@ HLE(k_virtual_query) {
 namespace { bool synclog() { static int v = getenv("PROSPER_SYNCLOG") ? 1 : 0; return v; } }
 HLE(k_wait_on_address) {
     if (!a0) return 0;
-    if (synclog()) fprintf(stderr, "[sync] T%ld WAIT.enter  addr=0x%llx *addr=0x%x exp=0x%llx\n",
-                           (long)syscall(SYS_gettid), (unsigned long long)a0, *(uint32_t*)a0, (unsigned long long)a1);
-    long r = syscall(SYS_futex, (uint32_t*)a0, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, (uint32_t)a1, nullptr, nullptr, 0);
-    if (synclog()) fprintf(stderr, "[sync] T%ld WAIT.exit   addr=0x%llx r=%ld\n",
-                           (long)syscall(SYS_gettid), (unsigned long long)a0, r);
-    return 0;
+    // Args (verified against the game's wait wrapper eboot+0x19b4050, called as (addr, 0, &timeout, 0)):
+    //   a0 = wait address, a1 = expected 32-bit value (blocks while *addr == a1 — confirmed: the waits
+    //   that block do so with a1 == *addr), a2 = pointer to the timeout.
+    // CONFIDENCE: HIGH addr/expected (empirically correct — 80+ waits block+wake normally).
+    // CONFIDENCE: MED  a2 = timeout pointer, *a2 = uint32 microseconds (the game stores it via a 32-bit
+    //   `mov %eax` after a double→int convert). We previously IGNORED the timeout and passed nullptr to
+    //   futex → the guest's *bounded* semaphore-wait blocked FOREVER and could never reach its
+    //   timeout-exhausted branch. Honor it so timed waits actually time out and the guest re-evaluates.
+    struct timespec ts, *pts = nullptr;
+    // NOTE: honoring the timeout is gated behind PROSPER_WAIT_TIMEOUT for now. It is the correct
+    // behavior (we were ignoring a timeout the guest passes → bounded semaphore-waits blocked forever),
+    // and it demonstrably changes execution — but it makes the guest take its *timeout* branch, which
+    // throws a C++ exception whose unwind then crashes because sceKernelGetModuleInfoForUnwind is
+    // unimplemented (libunwind reads garbage eh_frame → "Unsupported .eh_frame_hdr version" → stack
+    // smash). Until the unwinder is fed real eh_frame info, default to infinite waits (stable) and let
+    // the flag exercise the exception path during bring-up. See docs/RENDER_LOOP.md.
+    static const bool honor_timeout = getenv("PROSPER_WAIT_TIMEOUT") != nullptr;
+    if (a2 && honor_timeout) {
+        uint32_t us = *(volatile uint32_t*)(uintptr_t)a2;
+        // FUTEX_WAIT's timeout is a RELATIVE duration; guard against absurd values.
+        if (us == 0) us = 1;                 // 0 == "poll" — a minimal wait keeps us re-checking
+        if (us > 5000000u) us = 5000000u;    // cap 5s so a huge/garbage value can't hang the thread
+        ts.tv_sec = us / 1000000u; ts.tv_nsec = (long)(us % 1000000u) * 1000L; pts = &ts;
+    }
+    if (synclog()) fprintf(stderr, "[sync] T%ld WAIT.enter  addr=0x%llx *addr=0x%x exp=0x%llx timo_us=%lld a2=0x%llx a3=0x%llx\n",
+                           (long)syscall(SYS_gettid), (unsigned long long)a0, *(uint32_t*)a0,
+                           (unsigned long long)a1, pts ? (long long)(ts.tv_sec*1000000 + ts.tv_nsec/1000) : -1,
+                           (unsigned long long)a2, (unsigned long long)a3);
+    long r = syscall(SYS_futex, (uint32_t*)a0, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, (uint32_t)a1, pts, nullptr, 0);
+    int e = errno;
+    if (synclog()) fprintf(stderr, "[sync] T%ld WAIT.exit   addr=0x%llx r=%ld errno=%d\n",
+                           (long)syscall(SYS_gettid), (unsigned long long)a0, r, r < 0 ? e : 0);
+    // Return the RIGHT status to the guest. Previously we always returned 0 (=woken/success), so on a
+    // timeout the guest believed its semaphore was signaled → it consumed a resource that was never
+    // produced → phantom item → crash in the exception unwinder. On a futex timeout, report the Sony
+    // timeout error so the guest's bounded wait re-loops / handles it instead of proceeding on garbage.
+    // CONFIDENCE: HIGH on the semantics (must distinguish timeout from wake).
+    // CONFIDENCE: MED on the exact code value 0x80020060 (SCE_KERNEL_ERROR_ETIMEDOUT).
+    if (r < 0 && e == ETIMEDOUT) return 0x80020060ull;   // SCE_KERNEL_ERROR_ETIMEDOUT
+    return 0;   // woken, or EAGAIN (value already changed) — treat as success; guest re-checks the count
 }
 HLE(k_wake_by_address) {
     if (!a0) return 0;
