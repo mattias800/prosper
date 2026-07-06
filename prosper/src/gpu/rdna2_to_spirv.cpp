@@ -1067,6 +1067,32 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 else { rs.sreg_bool[in.dst.value] = r; rs.sreg_bool_narrowed[in.dst.value] = true; }  // conservative flag
                 return true;
             }
+            if (in.opcode == 0x0f || in.opcode == 0x11 || in.opcode == 0x13 || in.opcode == 0x15) {
+                // 64-bit wave-mask LOGICAL ops on per-lane bools: s_and_b64(0x0f)/s_or_b64(0x11)/
+                // s_xor_b64(0x13)/s_andn2_b64(0x15, = m0 AND NOT m1). Used for lane-mask arithmetic around
+                // divergent control flow / ballot. SCC=(result!=0) is a cross-lane reduction we can't form
+                // per-lane, so (like every mask op) we don't write SCC. Same mask-resolution as s_cselect_b64.
+                auto is_exec = [](const Operand& o){ return o.value == 126 || o.value == 127; };
+                auto mask = [&](const Operand& o) -> uint32_t {
+                    if (o.value == 106 || o.value == 107) return rs.vcc;
+                    if (o.value == 126 || o.value == 127) return rs.exec;
+                    if (o.kind == OperandKind::SGPR) { auto it = rs.sreg_bool.find(o.value);
+                        if (it != rs.sreg_bool.end()) return it->second; }
+                    if (o.kind == OperandKind::InlineInt) { if (o.value == -1) return b.btrue();
+                        if (o.value == 0) return b.bfalse(); }
+                    return 0;
+                };
+                uint32_t m0 = mask(in.src[0]), m1 = mask(in.src[1]);
+                if (!m0 || !m1) { ok = false; return true; }
+                uint32_t r = in.opcode == 0x0f ? b.land(m0, m1)
+                           : in.opcode == 0x11 ? b.lor(m0, m1)
+                           : in.opcode == 0x13 ? b.bsel(m0, b.bsel(m1, b.bfalse(), b.btrue()), m1)   // xor = m0?!m1:m1
+                           : b.land(m0, b.bsel(m1, b.bfalse(), b.btrue()));                            // andn2 = m0 & !m1
+                if (is_exec(in.dst)) { rs.exec = r; rs.exec_narrowed = true; }
+                else if (in.dst.value == 106 || in.dst.value == 107) { rs.vcc = r; rs.sreg_bool_narrowed[in.dst.value] = true; }
+                else { rs.sreg_bool[in.dst.value] = r; rs.sreg_bool_narrowed[in.dst.value] = true; }
+                return true;
+            }
             uint32_t a = val(in.src[0]), c = val(in.src[1]); uint32_t& d = rs.sreg[in.dst.value];
             auto scc_nz = [&](uint32_t v){ rs.scc = b.ucmp(Op_INotEqual, v, b.uconst(0)); };  // SCC = (result != 0)
             switch (in.opcode) {
@@ -1221,6 +1247,22 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x25: d = b.ibin(Op_IAdd, a, c); break;          // v_add_nc_u32
                 case 0x26: d = b.ibin(Op_ISub, a, c); break;          // v_sub_nc_u32
                 case 0x27: d = b.ibin(Op_ISub, c, a); break;          // v_subrev_nc_u32 (reverse: src1 - src0)
+                // Carry ops (VOP2 e32 form): carry-in + carry-out are VCC. v_add_co_ci(0x28)/
+                // v_sub_co_ci(0x29)/v_subrev_co_ci(0x2a). Mirrors the VOP3B 0x128/129/12A logic with VCC.
+                case 0x28: case 0x29: case 0x2A: {
+                    uint32_t cin = b.sel(vcc, b.uconst(1), b.uconst(0));
+                    if (in.opcode == 0x28) {                          // (a + c) + cin
+                        uint32_t s1 = b.ibin(Op_IAdd, a, c); uint32_t k1 = b.ucmp(Op_ULessThan, s1, a);
+                        d = b.ibin(Op_IAdd, s1, cin); uint32_t k2 = b.ucmp(Op_ULessThan, d, s1);
+                        vcc = b.bsel(k1, b.btrue(), k2);
+                    } else {                                          // (x - y) - cin  (subrev swaps)
+                        uint32_t x = in.opcode == 0x29 ? a : c, y = in.opcode == 0x29 ? c : a;
+                        uint32_t s1 = b.ibin(Op_ISub, x, y); uint32_t k1 = b.ucmp(Op_ULessThan, x, y);
+                        d = b.ibin(Op_ISub, s1, cin); uint32_t k2 = b.ucmp(Op_ULessThan, s1, cin);
+                        vcc = b.bsel(k1, b.btrue(), k2);
+                    }
+                    break;
+                }
                 // v_mac_f32 (0x1f) / v_fmac_f32 (0x2b): dst = src0*src1 + dst (accumulate into the dest).
                 // mac vs fmac differ only in fused rounding — immaterial here. old_d = the dst accumulator.
                 case 0x1F: case 0x2B: d = b.fbin(Op_FAdd, b.fbin(Op_FMul, a, c), old_d); break;
