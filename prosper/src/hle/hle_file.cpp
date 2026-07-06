@@ -150,7 +150,24 @@ HLE(f_read)  { return (uint64_t)(int64_t)::read((int)a0, P(a1), (size_t)a2); }
 HLE(f_write) { return (uint64_t)(int64_t)::write((int)a0, P(a1), (size_t)a2); }
 HLE(f_lseek) { return (uint64_t)(int64_t)::lseek((int)a0, (off_t)a1, (int)a2); }
 #ifndef _WIN32
-HLE(f_pread)  { return (uint64_t)(int64_t)::pread((int)a0, P(a1), (size_t)a2, (off_t)a3); }
+// PROSPER_PREADLOG: log fd/offset/count + the guest caller (first eboot-range return addr on the stack).
+// Used to trace Unity's FileCacher block fetches — which offsets are read vs which blocks are skipped.
+static void preadlog(const char* fn, uint64_t fd, uint64_t off, uint64_t cnt) {
+    static int on = getenv("PROSPER_PREADLOG") ? 1 : 0; if (!on) return;
+    // resolve fd -> path
+    char path[256] = "?"; char lp[64]; snprintf(lp, sizeof lp, "/proc/self/fd/%lld", (long long)fd);
+    ssize_t k = readlink(lp, path, sizeof path - 1); if (k > 0) path[k] = 0; else path[0] = '?', path[1] = 0;
+    const char* base = strrchr(path, '/'); base = base ? base + 1 : path;
+    // top 3 distinct eboot-range return addresses on the stack (guest call chain)
+    uint64_t cc[3] = {0,0,0}; int nc = 0; uint64_t* sp = (uint64_t*)__builtin_frame_address(0);
+    for (int i = 0; i < 800 && nc < 3; i++) { uint64_t v = sp[i];
+        if (v >= 0x400000000ull && v < 0x420000000ull) { uint64_t o = v - 0x400000000ull;
+            if (nc == 0 || cc[nc-1] != o) cc[nc++] = o; } }
+    fprintf(stderr, "[preadlog] %-24s fd=%lld off=0x%llx(blk %lld) cnt=0x%llx callers=eboot+0x%llx,0x%llx,0x%llx\n",
+            base, (long long)fd, (unsigned long long)off, (long long)(off / 0x10000),
+            (unsigned long long)cnt, (unsigned long long)cc[0], (unsigned long long)cc[1], (unsigned long long)cc[2]);
+}
+HLE(f_pread)  { preadlog("pread", a0, a3, a2); return (uint64_t)(int64_t)::pread((int)a0, P(a1), (size_t)a2, (off_t)a3); }
 HLE(f_pwrite) { return (uint64_t)(int64_t)::pwrite((int)a0, P(a1), (size_t)a2, (off_t)a3); }
 #else
 HLE(f_pread)  { return (uint64_t)-1; }

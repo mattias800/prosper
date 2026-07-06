@@ -225,8 +225,9 @@ namespace {
             long long dcur = prev_cur ? (long long)(e.cur - prev_cur) : 0;
             char lb[220];
             int ln = snprintf(lb, sizeof lb,
-                "  [%3d] rip=eboot+0x%llx rax(byteSize)=0x%llx rcx(elemSize)=0x%llx count=%llu | r8=0x%llx [r8+8]=0x%llx [r8+0x10]=0x%llx r14=0x%llx\n",
-                i, e.rip_off, e.rax, e.rcx, (unsigned long long)(e.rcx ? e.rax / e.rcx : 0), e.r8, e.f8, e.f10, e.r14);
+                "  [%3d] rip=eboot+0x%llx req/cur=0x%llx cacher/rax=0x%llx | s50/r8=0x%llx s68/f8=0x%llx f10=0x%llx r14=0x%llx  %s\n",
+                i, e.rip_off, e.cur, e.rax, e.r8, e.f8, e.f10, e.r14,
+                (e.cur == e.r8 || e.cur == e.f8) ? "<<< MATCH (skip fetch)" : "");
             (void)dcur;
             write(2, lb, ln);
             prev_cur = e.cur;
@@ -435,15 +436,16 @@ namespace {
                 // At 0x1612209: r14 = the type DESCRIPTOR; [r14+0x30]=extra-field-count, [r14+0x20]=field
                 // table ptr, [r14+0x18]=type-name ptr. Capture per struct read; dump on fault. The
                 // MatrixParameter reads (near the crash) should show [r14+0x30]==0 (the bug).
-                uint64_t r14r = (uint64_t)gr[REG_R14];
-                unsigned long long f30 = probe_readable(r14r + 0x30)? *(const uint64_t*)(r14r + 0x30): 0xBADBADull;
-                unsigned long long f20 = probe_readable(r14r + 0x20)? *(const uint64_t*)(r14r + 0x20): 0xBADBADull;
-                unsigned long long f18 = probe_readable(r14r + 0x18)? *(const uint64_t*)(r14r + 0x18): 0xBADBADull;
-                unsigned long long cur = probe_readable((uint64_t)gr[REG_RBX]+0x38)? *(const uint64_t*)((uint64_t)gr[REG_RBX]+0x38):0;
+                // At the FileCacher lookup 0xb1760d: rdi=cacher, rsi=requested block. Capture the requested
+                // block vs cached slots [rdi+0x50]/[rdi+0x68] to see which wrongly matches for block 2.
+                uint64_t cacher = (uint64_t)gr[REG_RDI], req = (uint64_t)gr[REG_RSI];
+                unsigned long long s50 = probe_readable(cacher + 0x50)? *(const uint64_t*)(cacher + 0x50): 0xBADBADull;
+                unsigned long long s68 = probe_readable(cacher + 0x68)? *(const uint64_t*)(cacher + 0x68): 0xBADBADull;
+                unsigned long long f160= probe_readable(cacher + 0x160)?*(const uint64_t*)(cacher + 0x160):0xBADBADull;
                 int p = g_hwbp_ring_pos % HWBP_RING;
                 g_hwbp_ring[p] = { (unsigned long long)((uint64_t)gr[REG_RIP] - 0x400000000ull),
-                                   cur, (unsigned long long)r14r, 0, f18/*[r14+0x18]*/, f20/*[r14+0x20]*/,
-                                   f30/*[r14+0x30]*/, 0, 0 };
+                                   req/*cur=requested block*/, (unsigned long long)cacher, 0,
+                                   s50/*[+0x50]*/, s68/*[+0x68]*/, f160/*[+0x160]*/, 0, 0 };
                 g_hwbp_ring_pos = g_hwbp_ring_pos + 1;
             }
             if (g_hwbp_strdump && cond_ok) {

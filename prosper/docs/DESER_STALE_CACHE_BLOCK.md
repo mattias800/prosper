@@ -71,3 +71,36 @@ before skipping the fetch. Compare the fetch call flow for block 7 (works) vs bl
 - `/tmp/prosper_buf_6.bin` vs `file[0x70000..0x79304)` — byte-identity check.
 - `/tmp/prosper_ttnodes.bin` — object-info table dump; decode with pathIDs above.
 - UnityPy cross-check: all 43 builtin shaders parse; object table byteStart/size match the r8 entries 1:1.
+
+## Refinement (2026-07-06, second agent) — the lookup MISSES; the skip is inside the FETCH
+
+Independently instrumented the FileCacher and CONFIRMED the stale-block root, plus narrowed it:
+- **FileCacher block-lookup = `eboot+0xb175f0`** (verified by disasm + live capture). It compares the
+  requested block index (`rsi`) against two cached-slot indices `[cacher+0x50]` / `[cacher+0x68]`:
+  ```
+  b1760d cmp %rsi,0x50(%rdi); je 0xb1767e   ; slot A hit -> skip fetch
+  b17619 cmp %r14,0x68(%rbx); je 0xb1767e   ; slot B hit -> skip fetch
+  ...else -> call 0xb17340 (fetch)
+  ```
+- **Live capture at `0xb1760d`, ring-dumped on the crash:** the LAST lookup is
+  `req=0x2 (block 2, BlitCopy), cacher slots [+0x50]=-1(empty) [+0x68]=0x7(block 7)` → **NO MATCH**
+  (contrast `req=0x7` earlier → matches slot B → correctly skipped). So the lookup for block 2 **correctly
+  MISSES** and falls through to `call 0xb17340`.
+- ⟹ **This RULES OUT candidate (a) "block-lookup wrongly hits."** The bug is NOT in the lookup — block 2 is
+  correctly identified as not-cached. The skip is **inside the fetch `0xb17340`**: it is entered on a correct
+  miss but never issues the block-2 `pread` (strace + our f_pread log both confirm no read at 0x20000).
+- pread confirmation (`PROSPER_PREADLOG`, fd→path resolved): `unity_builtin_extra` is pread ONLY at block 0
+  and block 7 — every other logged block-2 pread is a different file reusing the fd. Matches the strace.
+
+**So the fix site is `eboot+0xb17340` (the block fetch) — why does it, on a correct cache miss for block 2,
+return without issuing the read?** Ranked (candidate a is now excluded): (b) the fetch dispatches the read
+async / to a slot it marks loaded without filling (producer/consumer, like the render-loop deadlock — but
+note blocks 0/7 were SYNC preads, so if async it is a block-specific path); (c) allocator/buffer bookkeeping
+so the fetch believes the slot buffer already holds valid data; or a wrong vtable/size result inside
+`0xb17340` (`call *0x38(%rax)` = block size) steering an early return. Decisive next: HWBP `0xb17340` logging
+`rsi`(=block index) + trace its internal branches for block 2 (entered? which exit? does it reach the pread
+call site or return early at `0xb173ef` / go async?).
+
+Tooling added (gated, in exec_image_linux.cpp / hle_file.cpp): `PROSPER_PREADLOG` (pread offset+fd-path+guest
+callers), `PROSPER_STEPWIN` (chained windowed single-step between driver hits), and the cacher-slot ring
+capture.
