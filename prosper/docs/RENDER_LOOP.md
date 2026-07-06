@@ -808,3 +808,33 @@ never called); `0x1612c70`=6; `0xd58f4f` (SafeBinaryRead name-mismatch)=0.
 
 **(8) Without `PROSPER_GUEST_FS`: faults earlier inside host `libc.so.6` (initial-exec TLS landmine), so the
 deser crash is only reachable WITH guest-`%fs`. `unity_builtin_extra` header: version=22, no embedded typetree.**
+
+## ★★★ ROOT CONFIRMED (2026-07-06) — empty type-descriptor field list for the param struct
+
+The chained **step-window single-step trace** (`PROSPER_STEPWIN`, arm on driver hit #5, step to #6) revealed
+the REAL reader (not the earlier name-referencing functions): `eboot+0x1611d00..0x1612c70`. The exact skip
+branch:
+```
+1612180+ : read m_NameIndex, m_Index, m_ArraySize (3 fixed inline s32 reads; cursor 0x7a10->0x7a20)
+1612202  : mov -0x140(%rbp),%r14          ; r14 = the type DESCRIPTOR for the struct being read
+1612209  : mov 0x30(%r14),%rax            ; rax = descriptor extra-field COUNT [r14+0x30]
+161220d  : test %rax,%rax
+1612210  : je 0x1612c70                   ; if field-count==0 -> JUMP to the {count}{alignedString[]} driver
+1612216+ : else loop over [r14+0x20] (field table, [r14+0x30] entries x 0x50B) reading the extra fields
+```
+So the extra fields (`m_Type`/`m_RowCount` SInt8 for MatrixParameter, `m_Type`/`m_Dim` for VectorParameter)
+come from the descriptor's field table `[r14+0x20]` / count `[r14+0x30]`.
+
+**Captured `[r14+0x30]` per struct read at `0x1612209` (6 hits; dump on the kind=2 recovery crash):**
+```
+[0..4] descriptor=<valid>  [r14+0x20]=<field-table ptr>  [r14+0x30]=1
+[5]    descriptor=0x…e93e70 [r14+0x18]=1  [r14+0x20]=0x0(NULL)  [r14+0x30]=0   <- the crash struct
+```
+⟹ **CONFIRMED ROOT: the type descriptor for the crash param struct has a NULL field table and field-count
+0**, so its trailing `SInt8` fields are never read → 4-byte cursor drift → the alignedString-array driver
+`0x1612c70` reads `{m_Type=0,m_RowCount=4,pad}`=`0x400` as a 1024 count → ~16 EiB alloc → crash.
+
+The descriptor is a runtime reflection object (allocated in the shader arena) whose extra-field table is
+empty ONLY for this type in our env (other structs at the same branch have populated tables). **NEXT:** find
+where this descriptor is built/populated (the code that sets `[r14+0x20]`/`[r14+0x30]`) and why our env
+leaves the param struct's field table empty — that is the exact fix site.

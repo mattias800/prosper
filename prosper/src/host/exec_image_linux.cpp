@@ -140,6 +140,18 @@ namespace {
     // last entries are the crash node's typetree metadata (byteOffset/byteSize/cursor) — reveals whether
     // a wrong typetree node (bad offset or garbage r8 from worker guest-fs TLS) mis-positions the cursor.
     bool g_hwbp_node_on = false;
+    // PROSPER_STEPWIN=1 + PROSPER_STEPWIN_AFTER=N: on the Nth hit of the driver bp (0x1612c70), enter a
+    // WINDOWED single-step until the NEXT driver hit — the one record whose parse drifts. On each step,
+    // scan the GP registers for a pointer inside the reader buffer [base,end] (the live read cursor) and
+    // ring-log rip+cursor when the cursor changes; dump the ring at the next driver hit / crash. Pins the
+    // exact field read that advances the cursor by 12 instead of 16 for MatrixParameter/VectorParameter.
+    bool g_stepwin_on = false; int g_stepwin_after = 5;
+    volatile bool g_stepwin_active = false;
+    uint64_t g_stepwin_base = 0, g_stepwin_end = 0;
+    unsigned long long g_stepwin_prevcur = 0; long g_stepwin_steps = 0; long g_stepwin_max = 4000000;
+    static const int STEPWIN_RING = 512;
+    struct StepEnt { unsigned long long rip_off, cur; };
+    StepEnt g_stepwin_ring[STEPWIN_RING]; int g_stepwin_pos = 0;
     // PROSPER_HWBP_BUFDUMP=1: at the driver bp (rbx = reader), write the reader window [rbx+0x40 .. rbx+0x48]
     // to /tmp/prosper_buf_<hit>.bin per hit — captures the EXACT decompressed object buffer the deserializer
     // reads, so it can be byte-diffed against the reference (UnityPy) object (load-corruption vs dispatch).
@@ -218,6 +230,26 @@ namespace {
             (void)dcur;
             write(2, lb, ln);
             prev_cur = e.cur;
+        }
+    }
+    // Dump the step-window cursor ring (oldest->newest): each entry is a cursor ADVANCE during the
+    // single-stepped drift window, with the field size = delta. Reveals the 12-vs-16 stride directly.
+    void hwbp_dump_stepwin(const char* why) {
+        int total = g_stepwin_pos < STEPWIN_RING ? g_stepwin_pos : STEPWIN_RING;
+        int start = g_stepwin_pos < STEPWIN_RING ? 0 : (g_stepwin_pos % STEPWIN_RING);
+        char hdr[128]; int hn = snprintf(hdr, sizeof hdr,
+            "[stepwin] dump (%s) after %ld steps: %d cursor advances, base=0x%llx:\n",
+            why, g_stepwin_steps, total, (unsigned long long)g_stepwin_base);
+        write(2, hdr, hn);
+        unsigned long long prev = 0;
+        for (int i = 0; i < total; ++i) {
+            const StepEnt& e = g_stepwin_ring[(start + i) % STEPWIN_RING];
+            long long d = prev ? (long long)(e.cur - prev) : 0;
+            char lb[160];
+            int ln = snprintf(lb, sizeof lb, "  [%3d] rip=eboot+0x%llx cur=0x%llx (off 0x%llx) delta=%+lld\n",
+                i, e.rip_off, e.cur, (unsigned long long)(e.cur - g_stepwin_base), d);
+            write(2, lb, ln);
+            prev = e.cur;
         }
     }
     void arm_hwwatch(uint64_t addr) {
@@ -324,6 +356,36 @@ namespace {
         // safe on hot/multi-threaded functions.
         if (sig == SIGTRAP && g_hwbp_on && g_hwbp_fd >= 0) {
             auto* uc = (ucontext_t*)uctx;
+            // Step-window: continuous single-step from driver hit N to the next driver hit. On each step,
+            // find the live read cursor (a GP reg pointing inside [base,end]) and ring-log advances.
+            if (g_stepwin_active && si->si_code == TRAP_TRACE) {
+                auto& gs = uc->uc_mcontext.gregs;
+                uint64_t rip = (uint64_t)gs[REG_RIP];
+                g_stepwin_steps++;
+                static const int idx[] = { REG_RAX,REG_RBX,REG_RCX,REG_RDX,REG_RSI,REG_RDI,REG_R8,
+                                           REG_R9,REG_R10,REG_R11,REG_R12,REG_R13,REG_R14,REG_R15 };
+                unsigned long long cur = 0;
+                for (int i = 0; i < 14; i++) { uint64_t v = (uint64_t)gs[idx[i]];
+                    if (v >= g_stepwin_base && v < g_stepwin_end) { cur = v; break; } }
+                if (cur && cur != g_stepwin_prevcur) {
+                    g_stepwin_ring[g_stepwin_pos % STEPWIN_RING] =
+                        { (unsigned long long)(rip - 0x400000000ull), cur };
+                    g_stepwin_pos++; g_stepwin_prevcur = cur;
+                }
+                bool at_driver = (rip == g_hwbp_addr);
+                if (at_driver || g_stepwin_steps > g_stepwin_max) {
+                    g_stepwin_active = false;
+                    gs[REG_EFL] &= ~0x100ll;                       // clear TF; leave the driver bp DISABLED
+                    // (we're AT the bp address on at_driver; re-enabling would re-trigger. The crash
+                    // follows immediately at hit #6, which is the behavior we want to observe.)
+                    uint64_t sfs = guest_fs_to_host_scoped();
+                    hwbp_dump_stepwin(at_driver ? "next-driver-hit" : "step-cap");
+                    guest_fs_restore_scoped(sfs);
+                } else {
+                    gs[REG_EFL] |= 0x100ll;                        // keep single-stepping
+                }
+                return;
+            }
             if (g_hwbp_stepping && si->si_code == TRAP_TRACE) {
                 ioctl(g_hwbp_fd, PERF_EVENT_IOC_ENABLE, 0);
                 uc->uc_mcontext.gregs[REG_EFL] &= ~0x100ll;
@@ -369,15 +431,19 @@ namespace {
             }
             // PROSPER_HWBP_NODE: capture typetree-node metadata {r8,[r8+8],[r8+0x10],r14} at eboot+0xd4cec0;
             // the ring is dumped on the worker fault, so its last entry is the crash node.
-            if (g_hwbp_node_on && !g_hwbp_ring_dumped && (uint64_t)gr[REG_RCX] >= 4 && (uint64_t)gr[REG_RCX] < 0x1000) {
-                uint64_t r8 = (uint64_t)gr[REG_R8];
-                unsigned long long f8  = probe_readable(r8 + 8)   ? *(const uint64_t*)(r8 + 8)   : 0xBADBADull;
-                unsigned long long f10 = probe_readable(r8 + 0x10)? *(const uint64_t*)(r8 + 0x10): 0xBADBADull;
+            if (g_hwbp_node_on && !g_hwbp_ring_dumped) {
+                // At 0x1612209: r14 = the type DESCRIPTOR; [r14+0x30]=extra-field-count, [r14+0x20]=field
+                // table ptr, [r14+0x18]=type-name ptr. Capture per struct read; dump on fault. The
+                // MatrixParameter reads (near the crash) should show [r14+0x30]==0 (the bug).
+                uint64_t r14r = (uint64_t)gr[REG_R14];
+                unsigned long long f30 = probe_readable(r14r + 0x30)? *(const uint64_t*)(r14r + 0x30): 0xBADBADull;
+                unsigned long long f20 = probe_readable(r14r + 0x20)? *(const uint64_t*)(r14r + 0x20): 0xBADBADull;
+                unsigned long long f18 = probe_readable(r14r + 0x18)? *(const uint64_t*)(r14r + 0x18): 0xBADBADull;
+                unsigned long long cur = probe_readable((uint64_t)gr[REG_RBX]+0x38)? *(const uint64_t*)((uint64_t)gr[REG_RBX]+0x38):0;
                 int p = g_hwbp_ring_pos % HWBP_RING;
-                // At the div site 0xd4cef7: rax=byteSize(dividend), rcx=elemSize(divisor) -> count.
                 g_hwbp_ring[p] = { (unsigned long long)((uint64_t)gr[REG_RIP] - 0x400000000ull),
-                                   0, (unsigned long long)rax, 0, (unsigned long long)r8, f8, f10,
-                                   (unsigned long long)r14, (unsigned long long)gr[REG_RCX] };
+                                   cur, (unsigned long long)r14r, 0, f18/*[r14+0x18]*/, f20/*[r14+0x20]*/,
+                                   f30/*[r14+0x30]*/, 0, 0 };
                 g_hwbp_ring_pos = g_hwbp_ring_pos + 1;
             }
             if (g_hwbp_strdump && cond_ok) {
@@ -488,6 +554,25 @@ namespace {
                 arm_hwwatch(base + (uint64_t)g_hwwatch_delta);
             }
             ioctl(g_hwbp_fd, PERF_EVENT_IOC_DISABLE, 0);   // disable so we can step off the bp address
+            // Step-window ENTRY: on the Nth driver hit, begin continuous single-stepping (bp stays disabled;
+            // the window ends when we single-step back to the driver = next hit). Buffer range is [base,
+            // base+0x20000) — the reader's own end grows across the window, so use a generous span.
+            if (g_stepwin_on && !g_stepwin_active && (int)g_hwbp_count == g_stepwin_after) {
+                uint64_t rbx = (uint64_t)gr[REG_RBX];
+                auto rdq = [](uint64_t a) -> uint64_t { return probe_readable(a) ? *(const uint64_t*)a : 0; };
+                g_stepwin_base = rdq(rbx + 0x40);
+                g_stepwin_end  = g_stepwin_base + 0x20000;
+                g_stepwin_prevcur = rdq(rbx + 0x38);
+                g_stepwin_steps = 0; g_stepwin_pos = 0; g_stepwin_active = true;
+                char sb[160]; int sn = snprintf(sb, sizeof sb,
+                    "[stepwin] ENTER at driver hit #%d: base=0x%llx cur=0x%llx (off 0x%llx)\n",
+                    (int)g_hwbp_count, (unsigned long long)g_stepwin_base, (unsigned long long)g_stepwin_prevcur,
+                    (unsigned long long)(g_stepwin_prevcur - g_stepwin_base));
+                write(2, sb, sn);
+                uc->uc_mcontext.gregs[REG_EFL] |= 0x100ll;   // start single-stepping
+                guest_fs_restore_scoped(saved_fs);
+                return;
+            }
             // Stay armed while logging OR while the anomaly-ring trace is still hunting (PROSPER_HWBP_MAX
             // can be 0 to suppress the per-hit log yet keep the bp live feeding the ring until it dumps).
             if (g_hwbp_count < g_hwbp_max || ((g_hwbp_anom_on || g_hwbp_node_on) && !g_hwbp_ring_dumped)) {
@@ -692,6 +777,9 @@ namespace {
         g_trap_sig = sig;
         g_trap_kind = (sig == SIGILL) ? 3 : 2;
         dump_fault_mem();   // no-op unless PROSPER_FAULTMEM is set
+        // Dump the HWBP ring on the recoverable (armed/main-thread) crash too — the deser fault is kind=2.
+        if (g_hwbp_node_on && !g_hwbp_ring_dumped) { uint64_t sfs = guest_fs_to_host_scoped();
+            hwbp_dump_ring("recover"); guest_fs_restore_scoped(sfs); }
         if (g_armed_tid && cur_tid() == g_armed_tid) siglongjmp(g_jb, 1);
         // Fault on a thread with no recovery point (a guest worker thread). Report where
         // (async-signal-safe write) then terminate cleanly instead of a cross-thread longjmp.
@@ -890,6 +978,8 @@ void install_trap_handler() {
         if (const char* c = getenv("PROSPER_HWBP_RAXMIN")) g_hwbp_raxmin = strtoull(c, nullptr, 0);
         if (const char* c = getenv("PROSPER_HWBP_ANOM")) { g_hwbp_anom = strtoull(c, nullptr, 0); g_hwbp_anom_on = true; }
         if (getenv("PROSPER_HWBP_NODE")) g_hwbp_node_on = true;
+        if (getenv("PROSPER_STEPWIN")) { g_stepwin_on = true;
+            if (const char* a = getenv("PROSPER_STEPWIN_AFTER")) g_stepwin_after = (int)strtol(a, nullptr, 0); }
         if (getenv("PROSPER_HWBP_BUFDUMP")) g_hwbp_bufdump = true;
         if (getenv("PROSPER_HWBP_DIVCAP")) g_hwbp_divcap = true;
         if (getenv("PROSPER_HWBP_STRDUMP")) g_hwbp_strdump = true;
