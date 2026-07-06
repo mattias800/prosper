@@ -30,7 +30,7 @@ enum : uint32_t {
     Op_ULessThanEqual=178, Op_SLessThanEqual=179,
     Op_ShiftRightLogical=194, Op_ShiftRightArithmetic=195, Op_ShiftLeftLogical=196, Op_BitwiseOr=197,
     Op_BitwiseXor=198, Op_BitwiseAnd=199, Op_Not=200, Op_BitFieldSExtract=202, Op_BitFieldUExtract=203,
-    Op_BitReverse=204,
+    Op_BitReverse=204, Op_UConvert=113,
     Op_TypeImage=25, Op_TypeSampledImage=27, Op_SampledImage=86,
     Op_ImageSampleImplicitLod=87, Op_ImageSampleExplicitLod=88, Op_ImageFetch=95, Op_Image=100,
     Op_ImageRead=98, Op_ImageWrite=99,
@@ -43,7 +43,7 @@ enum : uint32_t { Glsl_RoundEven=2, Glsl_Trunc=3, Glsl_Floor=8, Glsl_Ceil=9, Gls
                   Glsl_Sqrt=31, Glsl_InverseSqrt=32, Glsl_FMin=37, Glsl_UMin=38, Glsl_SMin=39, Glsl_FMax=40,
                   Glsl_UMax=41, Glsl_SMax=42, Glsl_PackHalf2x16=58, Glsl_UnpackHalf2x16=62 };
 enum : uint32_t {
-    Cap_Shader=1, Addr_Logical=0, Mem_GLSL450=1, Exec_Vertex=0, Exec_Fragment=4, Exec_GLCompute=5,
+    Cap_Shader=1, Cap_Int64=11, Addr_Logical=0, Mem_GLSL450=1, Exec_Vertex=0, Exec_Fragment=4, Exec_GLCompute=5,
     EM_OriginUpperLeft=7, EM_LocalSize=17,
     SC_Input=1, SC_UniformConstant=0, SC_Output=3, SC_StorageBuffer=12, FC_None=0,
     Dim_1D=0, Dim_2D=1, Dim_3D=2,   // SPIR-V Dim. (2D coincides with the SQ_RSRC 2D dim value, but distinct.)
@@ -166,6 +166,32 @@ struct SpirvCompute {
     // Bitfield extract (base, offset, count) -> bits. Unsigned and signed variants.
     uint32_t bfe_u(uint32_t base, uint32_t off, uint32_t cnt) { uint32_t r = id(); put(code, Op_BitFieldUExtract, {t_u32, r, base, off, cnt}); return r; }
     uint32_t bfe_s(uint32_t base, uint32_t off, uint32_t cnt) { uint32_t ri = id(); put(code, Op_BitFieldSExtract, {t_i32, ri, bcs(base), off, cnt}); return i2u(ri); }
+    // Lazily declared 64-bit uint (+ Int64 capability), for s_bfe_u64 etc. that operate on SGPR pairs.
+    uint32_t t_u64_cache = 0; bool declared_int64 = false;
+    uint32_t t_u64() { if (!t_u64_cache) { if (!declared_int64) { put(caps, Op_Capability, {Cap_Int64}); declared_int64 = true; }
+                       t_u64_cache = id(); put(types, Op_TypeInt, {t_u64_cache, 64, 0}); } return t_u64_cache; }
+    // A 64-bit uint constant needs two value words. Shift amounts MUST be u64 here: a u32 shift operand on
+    // a u64 base is mishandled by some drivers (llvmpipe), silently dropping the high half.
+    uint32_t uconst64(uint64_t v) { uint32_t c = id(); put(types, Op_Constant, {t_u64(), c, (uint32_t)v, (uint32_t)(v >> 32)}); return c; }
+    uint32_t u64_from_lohi(uint32_t lo, uint32_t hi) {   // (u64)hi<<32 | (u64)lo  — combine an SGPR pair
+        uint32_t l = id(); put(code, Op_UConvert, {t_u64(), l, lo});
+        uint32_t h = id(); put(code, Op_UConvert, {t_u64(), h, hi});
+        uint32_t hs = id(); put(code, Op_ShiftLeftLogical, {t_u64(), hs, h, uconst64(32)});
+        uint32_t r = id(); put(code, Op_BitwiseOr, {t_u64(), r, l, hs}); return r;
+    }
+    uint32_t bfe_u64(uint32_t base64, uint32_t off, uint32_t cnt) {   // 64-bit unsigned bitfield extract
+        // res = (base << (64-off-cnt)) >> (64-cnt), all logical u64 (portable — OpBitFieldUExtract on a
+        // 64-bit base isn't reliably supported, e.g. llvmpipe returns 0). Valid for off+cnt<=64, cnt in [1,64].
+        uint32_t total = ibin(Op_IAdd, off, cnt);
+        uint32_t lsh32 = ibin(Op_ISub, uconst(64), total);
+        uint32_t rsh32 = ibin(Op_ISub, uconst(64), cnt);
+        uint32_t lsh = id(); put(code, Op_UConvert, {t_u64(), lsh, lsh32});
+        uint32_t rsh = id(); put(code, Op_UConvert, {t_u64(), rsh, rsh32});
+        uint32_t sl  = id(); put(code, Op_ShiftLeftLogical,  {t_u64(), sl, base64, lsh});
+        uint32_t r   = id(); put(code, Op_ShiftRightLogical, {t_u64(), r, sl, rsh}); return r; }
+    uint32_t u64_lo(uint32_t v64) { uint32_t r = id(); put(code, Op_UConvert, {t_u32, r, v64}); return r; }  // truncate low 32
+    uint32_t u64_hi(uint32_t v64) { uint32_t s = id(); put(code, Op_ShiftRightLogical, {t_u64(), s, v64, uconst64(32)});
+        uint32_t r = id(); put(code, Op_UConvert, {t_u32, r, s}); return r; }
     // Lazily declared 2-float vector type (types are emitted as a block before code, so on-demand is safe).
     uint32_t t_v2f_cache = 0;
     uint32_t t_v2f() { if (!t_v2f_cache) { t_v2f_cache = id(); put(types, Op_TypeVector, {t_v2f_cache, t_f32, 2}); } return t_v2f_cache; }
@@ -1008,6 +1034,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     uint32_t width = b.ibin(Op_BitwiseAnd, b.ibin(Op_ShiftRightLogical, c, b.uconst(16)), b.uconst(0x7f));
                     d = b.bfe_u(a, off, width); scc_nz(d); break;
                 }
+                case 0x29: {   // s_bfe_u64: 64-bit unsigned bitfield extract of the SGPR pair src0=[lo,hi];
+                    // offset=src1[5:0], width=src1[22:16]; dst is a pair. (a = low reg; read the high reg too.)
+                    auto sread = [&](int r) -> uint32_t { auto it = rs.sreg.find(r); return it == rs.sreg.end() ? b.uconst(0) : it->second; };
+                    uint32_t off = b.ibin(Op_BitwiseAnd, c, b.uconst(0x3f));
+                    uint32_t wid = b.ibin(Op_BitwiseAnd, b.ibin(Op_ShiftRightLogical, c, b.uconst(16)), b.uconst(0x7f));
+                    uint32_t res = b.bfe_u64(b.u64_from_lohi(a, sread(in.src[0].value + 1)), off, wid);
+                    uint32_t lo = b.u64_lo(res), hi = b.u64_hi(res);
+                    rs.sreg[in.dst.value] = lo; rs.sreg[in.dst.value + 1] = hi;   // (map insert may rehash — don't use `d` after)
+                    rs.scc = b.ucmp(Op_INotEqual, b.ibin(Op_BitwiseOr, lo, hi), b.uconst(0));
+                    break;
+                }
                 default: ok = false;
             }
             return true;
@@ -1218,6 +1255,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 vreg[in.dst.value] = b.pack_half2x16(val(in.src[0]), val(in.src[1]));
             } else if (in.opcode == 0x107) {                          // v_mul_legacy_f32 ~= s0*s1
                 vreg[in.dst.value] = b.fbin(Op_FMul, val(in.src[0]), val(in.src[1]));
+            } else if (in.opcode == 0x101) {                          // v_cndmask_b32_e64: src2_mask ? src1 : src0
+                const Operand& s2 = in.src[2]; uint32_t m = 0;        // src2 is an SGPR-pair (or VCC) wave mask
+                if (s2.value == 106 || s2.value == 107) m = rs.vcc;
+                else if (s2.kind == OperandKind::SGPR) { auto it = rs.sreg_bool.find(s2.value); if (it != rs.sreg_bool.end()) m = it->second; }
+                if (!m) ok = false; else vreg[in.dst.value] = b.sel(m, val(in.src[1]), val(in.src[0]));
             } else ok = false;
             if (ok) predicate_write(b, rs, in.dst.value, old_d);
             return true;
