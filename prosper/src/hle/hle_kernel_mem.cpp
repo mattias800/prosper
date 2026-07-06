@@ -259,10 +259,10 @@ HLE(k_wait_on_address) {
     if (punch_secs > 0 && a2 == 0 && !pts && punch_site) {
         ts.tv_sec = punch_secs; ts.tv_nsec = 0; pts = &ts;   // bound this otherwise-infinite wait
     }
-    if (synclog()) fprintf(stderr, "[sync] T%ld WAIT.enter  addr=0x%llx *addr=0x%x exp=0x%llx timo_us=%lld a2=0x%llx a3=0x%llx\n",
+    if (synclog()) fprintf(stderr, "[sync] T%ld WAIT.enter  addr=0x%llx *addr=0x%x exp=0x%llx timo_us=%lld caller=eboot+0x%llx\n",
                            (long)syscall(SYS_gettid), (unsigned long long)a0, *(uint32_t*)a0,
                            (unsigned long long)a1, pts ? (long long)(ts.tv_sec*1000000 + ts.tv_nsec/1000) : -1,
-                           (unsigned long long)a2, (unsigned long long)a3);
+                           (unsigned long long)goff);
     long r = syscall(SYS_futex, (uint32_t*)a0, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, (uint32_t)a1, pts, nullptr, 0);
     int e = errno;
     if (synclog()) fprintf(stderr, "[sync] T%ld WAIT.exit   addr=0x%llx r=%ld errno=%d\n",
@@ -292,8 +292,11 @@ HLE(k_wake_by_address) {
     if (!a0) return 0;
     int n = a1 ? (int)a1 : INT_MAX;
     long w = syscall(SYS_futex, (uint32_t*)a0, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, n, nullptr, nullptr, 0);
-    if (synclog()) fprintf(stderr, "[sync] T%ld WAKE       addr=0x%llx n=%d woke=%ld\n",
-                           (long)syscall(SYS_gettid), (unsigned long long)a0, n, w);
+    if (synclog()) {
+        uint64_t wgoff = ((uint64_t*)__builtin_frame_address(0))[1] - 0x400000000ull;
+        fprintf(stderr, "[sync] T%ld WAKE       addr=0x%llx *addr=0x%x n=%d woke=%ld caller=eboot+0x%llx\n",
+                (long)syscall(SYS_gettid), (unsigned long long)a0, *(uint32_t*)a0, n, w, (unsigned long long)wgoff);
+    }
     return 0;
 }
 

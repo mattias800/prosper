@@ -256,6 +256,41 @@ ones above). This is the GPU-execution build; it is the definitive next mileston
 focused, likely-interactive effort. Everything upstream (boot, IL2CPP, asset load, shader creation ×35,
 recompiler ×34, flip loop, offscreen GpuState→frame spine) is in place.
 
+## 2026-07-06 — ⭐ RENDER-LOOP DEADLOCK BROKEN via `-force-gfx-direct` (single-threaded rendering)
+**The multi-session render-loop deadlock is broken.** Producer-RE (gdb thread dump + `PROSPER_SYNCLOG`
+with caller offsets, done interactively with the user) pinned the exact topology, then a one-switch
+experiment cracked it.
+
+**Ground truth of the deadlock (all 3 stuck threads sit in `k_wait_on_address`):**
+- The 3 semaphores live in ONE object `rbx` (Unity's MT GfxDevice job-scheduler): `[rbx+0x00]`=GfxDevice-
+  worker sem (addr `…e458`, site `0xb0672a`), `[rbx+0xc0]`=main sem (`…e518`, site `0x18a83b5`),
+  `[rbx+0x130]`=PreloadManager job count, `[rbx+0x178/0x180]`=another sem, `[rbx+0x1c8]` a flag.
+- Timeline: GfxDevice posts main's sem ONCE (`0xb06717`, the release path `lock add [sem]; WakeByAddress`),
+  main wakes, consumes one job, **re-waits** on `e518`; GfxDevice then acquires `e458` and blocks FOREVER —
+  **`e458` is never posted by anyone (0 wakes)**. The worker (`0x9385d7`) is the same shape (woken once by
+  `0x95d58d`, re-waits). So the MT client/worker rendezvous wedges after exactly one handoff.
+- main's wait (`0x18a82a0`→`0x18a83b5`) is a *timed* semaphore acquire (deadline from clock `0x401d94798`),
+  but we pass nullptr for the timeout (PROSPER_WAIT_TIMEOUT off) so it's infinite — confirming again the
+  timeout path is a give-up, not the fix.
+
+**The unblock:** the eboot contains Unity's own switches `force-gfx-direct` / `force-gfx-st` /
+`force-gfx-mt` / `gfx-enable-gfx-jobs` (boot.config has NO gfx-jobs line → Unity defaults to MT + jobs).
+Added a gated guest-argv injector (`PROSPER_GUEST_ARGS`, `exec_image_linux.cpp run_entry`; a legitimate
+compat-layer config, off by default → normal boot still argc=1). Running with
+`PROSPER_GUEST_ARGS="-force-gfx-direct"`: the game parses it (`Argument Count = 2, Arg 1 =
+-force-gfx-direct`), the **`suspendPoint` watchdog loop is GONE**, and the boot advances into NEW code —
+GfxDevice init now runs INLINE on the main thread (new AGC calls `H7uZqCoNuWk`, `-KRzWekV120`, `Zw7uUVPulbw`)
+and it reaches **audio init** (Ajm/AudioOut) — further than ever before. This validates the docs' long-
+standing MT-rendering hypothesis: our env can't complete the cross-thread gfx-jobs handshake, so forcing
+single-threaded rendering (the game's own supported mode) sidesteps it. CONFIDENCE: HIGH.
+
+**New frontier (post-deadlock):** two fresh faults now appear (racing threads):
+- Worker-thread SIGSEGV at a high mapped region `rip≈0x7eb826…` (executing data / bad fn-ptr).
+- Main-ish guest fault at **`eboot+0xa9c0bb`**: fn `0xa9c0a0` (checks global flag `0x401f3de24`, loads global
+  `0x401ff2e00`, then `mov 0x8(%rdi)` — a report/log-shaped fn) is called from `eboot+0x10fa24c` with
+  `rdi` = return of `0xa99d50`, which returned **2** (a small int where a pointer is expected) → deref of
+  `[0xa]`. Next: identify `0xa99d50` (why it returns 2) and whether this is on the audio-init or gfx path.
+
 ## 2026-07-06 — GPU-executor Stages A/B/C landed; correct EOP writes CONFIRMED live (still not the unblock)
 Built the GPU executor per `docs/GPU_EXECUTOR_DESIGN.md` (all committed, Linux 45/45 + Windows 20/20):
 - **Stage A** — `execute_gpustate()` (Vulkan-agnostic core, `gpu_execute.hpp`) + the live-submit registry

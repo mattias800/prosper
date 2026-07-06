@@ -743,18 +743,45 @@ BootResult run_entry(const LoadedImage& img) {
     register_thread_stack((uint64_t)pthread_self(), stk, STK);   // guest main thread
 
     uint64_t top = ((uint64_t)stk + STK) & ~(uint64_t)0xf;
-    static const char argstr[] = "/app0/eboot.bin";
-    top -= sizeof(argstr); uint64_t arg0 = top;
-    memcpy((void*)arg0, argstr, sizeof(argstr));
+    // Guest argv[0] is always the eboot path. Optionally inject extra args via PROSPER_GUEST_ARGS
+    // (space-separated) — e.g. Unity's own switches like "-force-gfx-direct" to force single-threaded
+    // rendering. This is a legitimate compat-layer configuration (the game parses these switches), off by
+    // default so the normal boot is unchanged. CONFIDENCE: HIGH on the argv/crt0 stack layout.
+    std::vector<std::string> args = { "/app0/eboot.bin" };
+    if (const char* extra = getenv("PROSPER_GUEST_ARGS")) {
+        const char* p = extra;
+        while (*p) {
+            while (*p == ' ') p++;
+            if (!*p) break;
+            const char* s = p;
+            while (*p && *p != ' ') p++;
+            args.emplace_back(s, (size_t)(p - s));
+        }
+    }
+    // Copy each arg string onto the stack (high→low), collecting guest pointers.
+    std::vector<uint64_t> argptrs;
+    for (const auto& a : args) {
+        size_t n = a.size() + 1;
+        top -= n; memcpy((void*)top, a.c_str(), n);
+        argptrs.push_back(top);
+    }
     top &= ~(uint64_t)0xf;
-    uint64_t vec[] = { 1, arg0, 0, 0, 0, 0 };   // argc, argv0, NULL, envp NULL, auxv AT_NULL
-    top -= sizeof(vec); top &= ~(uint64_t)0xf;   // 16-aligned base for the vector
+    // crt0 vector: argc, argv[0..N-1], NULL, envp NULL, auxv AT_NULL(0,0).
+    std::vector<uint64_t> vecv;
+    vecv.push_back(args.size());
+    for (uint64_t pp : argptrs) vecv.push_back(pp);
+    vecv.push_back(0);   // argv terminator
+    vecv.push_back(0);   // envp NULL
+    vecv.push_back(0); vecv.push_back(0);   // auxv AT_NULL
+    if (vecv.size() & 1) vecv.push_back(0);   // keep an even count so the ≡8(mod16) placement below holds
+    const uint64_t* vec = vecv.data(); size_t vecsz = vecv.size() * sizeof(uint64_t);
+    top -= vecsz; top &= ~(uint64_t)0xf;   // 16-aligned base for the vector
     // The Sony crt _start pushes an odd number of words before its first call, so it
     // expects entry rsp ≡ 8 (mod 16) (like a normal callee), NOT 16-aligned. Placing
     // the vector 8 below a 16-boundary makes every downstream call correctly aligned,
     // so alignment-sensitive SIMD (vmovaps) in callees doesn't #GP.
     top -= 8;
-    memcpy((void*)top, vec, sizeof(vec));
+    memcpy((void*)top, vec, vecsz);
     uint64_t sp = top, rdi = sp, rsi = 0;
 
     g_trap_kind = 0; g_fault_addr = nullptr; g_fault_rip = 0; g_armed_tid = cur_tid();
