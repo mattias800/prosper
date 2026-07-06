@@ -65,7 +65,8 @@ DecodedImageDescriptor decode_image_descriptor(const uint32_t t[8]) {
 }
 
 ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
-                                           const uint32_t* user_sgprs, uint32_t num_user_sgprs) {
+                                           const uint32_t* user_sgprs, uint32_t num_user_sgprs,
+                                           uint32_t user_sgpr_base) {
     ShaderResourceTable table;
     const AgcShaderUserData* ud = shdr.user_data;
     if (!ud || !user_sgprs) return table;
@@ -91,7 +92,8 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             r.gpu_addr       = d.base;
             r.size           = d.size_bytes;
             r.stride         = d.stride;
-            r.srt_offset     = off * 4;   // byte offset within user_data
+            r.srt_offset     = off * 4;                 // byte offset within user_data (indirect path)
+            r.sgpr_base      = user_sgpr_base + off;    // the shader SGPR holding this V# (s_buffer_load SBASE)
             table.resources.push_back(r);
         }
     }
@@ -119,7 +121,7 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             r.width         = d.width;
             r.height        = d.height;
             r.size          = d.width * d.height * 4;
-            r.sgpr_base     = off;                  // DIRECT provenance key (image_sample SRSRC SGPR)
+            r.sgpr_base     = user_sgpr_base + off;  // DIRECT provenance key (image_sample SRSRC SGPR)
             r.srt_offset    = 0xFFFFFFFFu;
             table.resources.push_back(r);
         }

@@ -31,7 +31,8 @@ using RenderFn = std::function<std::vector<uint8_t>(const std::vector<uint32_t>&
                                                     const std::vector<uint32_t>& fs,
                                                     const ResolvedPipelineState& ps,
                                                     const ShaderResourceTable* vrt,
-                                                    const ShaderResourceTable* prt)>;
+                                                    const ShaderResourceTable* prt,
+                                                    uint32_t vertex_count)>;
 
 // Build a shader stage's resource table from the folded GpuState: look up the registered shader header
 // by its bound code address, read its user-data SGPR block from the sh register file, decode the V#/T#/S#
@@ -81,7 +82,10 @@ inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn&
     if (log) { fprintf(stderr, "[exec] BOTH stages recompiled: vs=%zu fs=%zu dwords -> rendering\n",
                        vs.size(), fs.size()); fflush(stderr); }
     ResolvedPipelineState ps = resolve_pipeline_state(rs);
-    return render(vs, fs, ps, vrt.get(), prt.get());
+    // The draw's vertex count (first draw; 3 as a fallback) so the VS runs for the right # of vertices.
+    uint32_t vertex_count = st.draws.empty() ? 3u : st.draws[0].index_count;
+    if (vertex_count == 0) vertex_count = 3;
+    return render(vs, fs, ps, vrt.get(), prt.get(), vertex_count);
 }
 
 // --- Live submit renderer registry (Stage A wiring; implemented in gpu_executor.cpp) --------------------
@@ -94,7 +98,8 @@ using LiveRenderFn = std::function<std::vector<uint8_t>(const std::vector<uint32
                                                         const ResolvedPipelineState& ps,
                                                         const ShaderResourceTable* vrt,
                                                         const ShaderResourceTable* prt,
-                                                        uint32_t width, uint32_t height)>;
+                                                        uint32_t width, uint32_t height,
+                                                        uint32_t vertex_count)>;
 
 // Register (or clear, with {}) the live render backend that agc_driver_submit_dcb uses on each submit.
 void set_submit_renderer(LiveRenderFn fn);

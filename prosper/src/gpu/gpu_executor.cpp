@@ -177,21 +177,14 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     return out;
 }
 
-// Reassign a built table's bindings to the recompiler+backend convention: constant buffer -> binding 2
-// (cbuf slot 0), vertex buffer -> binding 3 (cbuf slot 1 / vertex-fetch storage), textures -> 4,5,...
-// (combined image-samplers). The recompiler routes cbuf slot by `binding>=3` and uses `binding`
-// directly for image samplers, so these fixed assignments make provenance resolve to the right slot.
+// Give every resource its OWN descriptor binding, starting at 2 (0/1 reserved). The N-buffer model: the
+// shader reads several distinct constant buffers (Unity's per-draw transform, per-frame, …) + vertex
+// buffers + textures, and each must land at a separate binding so they don't collapse. The recompiler
+// declares a storage buffer (cbuf/vbuf) or image sampler (texture) at each binding and resolves an
+// s_buffer_load/image_sample to its resource's binding via provenance (by_sgpr_base / by_srt_offset).
 void assign_convention_bindings(ShaderResourceTable& t) {
-    uint32_t tex_binding = 4;
-    for (auto& r : t.resources) {
-        switch (r.cls) {
-            case ResourceClass::ConstantBuffer: r.binding = 2; break;
-            case ResourceClass::VertexBuffer:   r.binding = 3; break;
-            case ResourceClass::Texture:
-            case ResourceClass::StorageImage:   r.binding = tex_binding++; break;
-            default: break;
-        }
-    }
+    uint32_t next = 2;
+    for (auto& r : t.resources) r.binding = next++;
 }
 }
 
@@ -271,9 +264,12 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
         }
     }
 
+    // NGG VS/GS loads user data at shader s8 (s0..s7 = system SGPRs); PS at s0. The resource sgpr_base
+    // (an s_buffer_load/image_sample's SBASE/SRSRC register) is in that shader-SGPR space.
+    const uint32_t user_sgpr_base = is_ps ? 0u : 8u;
     for (uint32_t base : bases) {
         uint32_t sgprs[kUserSgprs]; read_user_sgprs(st.sh, base, sgprs);
-        ShaderResourceTable t = build_shader_resources(*hdr, sgprs, kUserSgprs);
+        ShaderResourceTable t = build_shader_resources(*hdr, sgprs, kUserSgprs, user_sgpr_base);
         // Add the const-fold-resolved dynamic vertex buffers, keyed by their SRSRC SGPR so the
         // recompiler's by_sgpr_base() resolves each buffer_load_format. The V#'s data format is patched
         // at runtime by the fetch shader (so the load-time snapshot reads Unknown) — default to Float32
@@ -318,7 +314,7 @@ bool execute_and_present(const GpuState& st, uint32_t width, uint32_t height) {
     std::vector<uint8_t> px = execute_gpustate(st,
         [&](const std::vector<uint32_t>& vs, const std::vector<uint32_t>& fs,
             const ResolvedPipelineState& ps, const ShaderResourceTable* vrt,
-            const ShaderResourceTable* prt) { return g_live(vs, fs, ps, vrt, prt, width, height); });
+            const ShaderResourceTable* prt, uint32_t vcount) { return g_live(vs, fs, ps, vrt, prt, width, height, vcount); });
     if (px.size() != static_cast<size_t>(width) * height * 4) return false;   // recompile/render failed
     present_write_frame(px.data(), width, height);
     return true;

@@ -26,6 +26,12 @@ const ShaderResource* ShaderResourceTable::by_sgpr_base(uint32_t sgpr) const {
     return nullptr;
 }
 
+const ShaderResource* ShaderResourceTable::by_sgpr_base_cls(uint32_t sgpr, ResourceClass cls) const {
+    if (sgpr == 0xFFFFFFFFu) return nullptr;
+    for (const auto& r : resources) if (r.sgpr_base == sgpr && r.cls == cls) return &r;
+    return nullptr;
+}
+
 const ShaderResource* ShaderResourceTable::by_binding(uint32_t binding) const {
     for (const auto& r : resources) if (r.binding == binding) return &r;
     return nullptr;

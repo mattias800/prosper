@@ -47,7 +47,7 @@ int main() {
     // The executor core, with the offscreen Vulkan renderer supplied as the backend (as the HLE will
     // supply the live-device renderer). execute_gpustate does recompile + resolve + render internally.
     auto backend = [&](const std::vector<uint32_t>& vs, const std::vector<uint32_t>& fs,
-                       const ResolvedPipelineState& ps, const ShaderResourceTable*, const ShaderResourceTable*) {
+                       const ResolvedPipelineState& ps, const ShaderResourceTable*, const ShaderResourceTable*, uint32_t) {
         return prosper::test::render_triangle_rgba(vs, fs, W, H, &ps);
     };
     std::vector<uint8_t> px = execute_gpustate(st, backend);
@@ -76,7 +76,7 @@ int main() {
     CHECK(!execute_and_present(st, W, H), "execute_and_present is a no-op with no renderer registered");
     set_submit_renderer([&](const std::vector<uint32_t>& vs, const std::vector<uint32_t>& fs,
                             const ResolvedPipelineState& ps, const ShaderResourceTable*,
-                            const ShaderResourceTable*, uint32_t w, uint32_t h) {
+                            const ShaderResourceTable*, uint32_t w, uint32_t h, uint32_t) {
         return prosper::test::render_triangle_rgba(vs, fs, w, h, &ps);
     });
     CHECK(have_submit_renderer(), "live renderer registered");

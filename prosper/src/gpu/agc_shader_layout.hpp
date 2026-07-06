@@ -81,7 +81,11 @@ void buffer_format(uint32_t dfmt, uint32_t nfmt, DataFormat* out_fmt, uint32_t* 
 // Signature takes the user-data SGPR block because the V# descriptor bytes live there (confirmed with
 // agent 1). Fills constant buffers (sharp[3], INDIRECT srt_offset provenance) + vertex buffers
 // (direct usage types 8/10, DIRECT sgpr_base provenance). Textures/samplers follow.
+// `user_sgpr_base` = the shader SGPR the SPI loads the user-data block into (0 for PS; 8 for NGG VS/GS,
+// whose s0..s7 are system SGPRs). Each resource's sgpr_base is set to that shader SGPR so the recompiler
+// resolves an s_buffer_load / image_sample by its SBASE/SRSRC register (by_sgpr_base).
 ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
-                                           const uint32_t* user_sgprs, uint32_t num_user_sgprs);
+                                           const uint32_t* user_sgprs, uint32_t num_user_sgprs,
+                                           uint32_t user_sgpr_base = 0);
 
 } // namespace prosper::gpu

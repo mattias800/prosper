@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <map>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -75,6 +76,7 @@ struct SpirvCompute {
     uint32_t t_void=0, t_fn=0, t_f32=0, t_u32=0, t_i32=0, t_v3u=0, t_bool=0, t_ptr_sb_f32=0;
     uint32_t v_gid=0, v_in=0, v_out=0, gidx=0, f_main=0, glsl=0, bconst_false=0;
     uint32_t v_cbuf=0, v_cbuf1=0, t_ptr_sb_u32=0;   // scalar-memory constant buffers (bindings 2 and 3)
+    std::map<uint32_t, uint32_t> cbuf_var;          // binding -> storage-buffer var (N-buffer model; 2/3 map to v_cbuf/v_cbuf1)
     bool     is_fragment=0;                          // true in the fragment shell (gates VINTRP interp)
     bool     is_compute=0;                            // true in the compute shell (gates LDS / s_barrier)
     uint32_t exec_model=0;                           // deferred EntryPoint (emitted in finish() so lazily-
@@ -406,18 +408,28 @@ struct SpirvCompute {
     }
     // Load one float from the input buffer and return it as raw bits (VGPR value).
     uint32_t load_input(uint32_t k) { uint32_t p = elem_ptr(v_in, k); uint32_t r = id(); put(code, Op_Load, {t_f32, r, p}); return bcu(r); }
-    // Load one dword (raw bits) from constant-buffer `slot` (0 -> binding 2, 1 -> binding 3) at dword
-    // index `idx` (SMEM). Multiple bindings let descriptor provenance route loads to distinct buffers.
-    uint32_t cbuf_load(uint32_t idx, uint32_t slot = 0) {
-        uint32_t buf = slot ? v_cbuf1 : v_cbuf;
+    // The storage-buffer variable for a descriptor `binding`. N-buffer model: each distinct constant/
+    // vertex buffer the shader reads is bound at its own descriptor binding (the executor assigns them),
+    // so multiple constant buffers (e.g. Unity's per-draw transform vs per-frame) don't collapse onto one.
+    // Bindings 2/3 keep mapping to v_cbuf/v_cbuf1 for the compute-shell + legacy 2-slot callers; any other
+    // binding uses cbuf_var[] (declared by declare_cbufs from the resource table). Falls back to v_cbuf.
+    uint32_t buf_for_binding(uint32_t binding) {
+        if (binding == 2) return v_cbuf;
+        if (binding == 3) return v_cbuf1;
+        auto it = cbuf_var.find(binding); return it != cbuf_var.end() ? it->second : v_cbuf;
+    }
+    // Load one dword (raw bits) from the constant/vertex buffer at descriptor `binding` at dword index
+    // `idx` (SMEM). The 1-arg form keeps the legacy slot convention (0 -> binding 2, 1 -> binding 3).
+    uint32_t cbuf_load(uint32_t idx, uint32_t binding = 2) {
+        uint32_t buf = buf_for_binding(binding);
         uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_sb_u32, p, buf, uconst(0), idx});
         uint32_t r = id(); put(code, Op_Load, {t_u32, r, p}); return r;
     }
-    // Store one dword `value` to constant/vertex buffer `slot` at dword index `idx` (MUBUF store). When
-    // `predicated`, the store is wrapped in a selection merge on `pred` (the per-lane EXEC bool) so
+    // Store one dword `value` to the buffer at descriptor `binding` at dword index `idx` (MUBUF store).
+    // When `predicated`, the store is wrapped in a selection merge on `pred` (the per-lane EXEC bool) so
     // inactive lanes do not write — a real conditional store, not a select of a loaded old value.
-    void cbuf_store(uint32_t idx, uint32_t value, uint32_t slot, bool predicated, uint32_t pred) {
-        uint32_t buf = slot ? v_cbuf1 : v_cbuf;
+    void cbuf_store(uint32_t idx, uint32_t value, uint32_t binding, bool predicated, uint32_t pred) {
+        uint32_t buf = buf_for_binding(binding);
         if (!predicated) {
             uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_sb_u32, p, buf, uconst(0), idx});
             put(code, Op_Store, {p, value}); return;
@@ -502,7 +514,7 @@ struct SpirvCompute {
     // Declare the two scalar-memory constant/vertex buffers (bindings 2 & 3) that SMEM / buffer_load_
     // format_* read. Called by every shell (compute/vertex/fragment) so cbuf_load works in each.
     // Requires t_u32 to already be declared. Unused by shaders without memory ops.
-    void declare_cbufs() {
+    void declare_cbufs(const ShaderResourceTable* rt = nullptr) {
         uint32_t t_rta_u = id(), t_struct_u = id(), t_ptr_sb_struct_u = id();
         v_cbuf = id(); v_cbuf1 = id(); t_ptr_sb_u32 = id();
         put(deco, Op_Decorate, {t_rta_u, Dec_ArrayStride, 4});
@@ -516,6 +528,21 @@ struct SpirvCompute {
         put(types, Op_Variable, {t_ptr_sb_struct_u, v_cbuf,  SC_StorageBuffer});
         put(types, Op_Variable, {t_ptr_sb_struct_u, v_cbuf1, SC_StorageBuffer});
         put(types, Op_TypePointer, {t_ptr_sb_u32, SC_StorageBuffer, t_u32});
+        cbuf_var[2] = v_cbuf; cbuf_var[3] = v_cbuf1;
+        // N-buffer model: declare an additional storage buffer for each distinct constant/vertex buffer
+        // binding the resource table uses beyond 2/3, so the shader's several buffers stay distinct. All
+        // share the same Block struct type (a runtime array of u32); only the binding decoration differs.
+        if (rt) {
+            std::set<uint32_t> seen{2, 3};
+            for (const auto& r : rt->resources) {
+                if (r.cls != ResourceClass::ConstantBuffer && r.cls != ResourceClass::VertexBuffer) continue;
+                if (!seen.insert(r.binding).second) continue;
+                uint32_t v = id();
+                put(deco, Op_Decorate, {v, Dec_DescriptorSet, 0}); put(deco, Op_Decorate, {v, Dec_Binding, r.binding});
+                put(types, Op_Variable, {t_ptr_sb_struct_u, v, SC_StorageBuffer});
+                cbuf_var[r.binding] = v;
+            }
+        }
     }
     // Store a VGPR (bits) as one float per invocation: b[gid.x] (stride 1), independent of input stride.
     void     store_output(uint32_t bits) {
@@ -585,7 +612,7 @@ struct SpirvCompute {
     }
     // --- Fragment-shader shell: a location-0 vec4 color output; EXP MRT0 stores to it. ---
     uint32_t t_v4f = 0, v_color = 0;
-    void begin_fragment(bool with_cbufs = false) {
+    void begin_fragment(const ShaderResourceTable* rt = nullptr) { bool with_cbufs = rt != nullptr;
         t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_i32 = id(); t_bool = id();
         t_v4f = id(); uint32_t t_ptr_out = id(); v_color = id(); f_main = id(); uint32_t lbl = id(); glsl = id();
         put(caps, Op_Capability, {Cap_Shader});
@@ -604,7 +631,7 @@ struct SpirvCompute {
         put(types, Op_TypeVector, {t_v4f, t_f32, 4});
         put(types, Op_TypePointer, {t_ptr_out, SC_Output, t_v4f});
         put(types, Op_Variable, {t_ptr_out, v_color, SC_Output});
-        if (with_cbufs) declare_cbufs();   // only when the shader has memory ops (keeps no-op renders binding-free)
+        if (with_cbufs) declare_cbufs(rt);   // only when the shader has memory ops (keeps no-op renders binding-free)
         put(code, Op_Function, {t_void, f_main, FC_None, t_fn});
         put(code, Op_Label, {lbl}); cur_block = lbl;
     }
@@ -616,7 +643,7 @@ struct SpirvCompute {
 
     // --- Vertex-shader shell: gl_VertexIndex input + gl_Position (member 0 of a gl_PerVertex Block). ---
     uint32_t v_vid = 0, v_pos = 0, t_ptr_out_v4f = 0;
-    void begin_vertex(bool with_cbufs = false) {
+    void begin_vertex(const ShaderResourceTable* rt = nullptr) { bool with_cbufs = rt != nullptr;
         t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_i32 = id(); t_bool = id();
         t_v4f = id();
         uint32_t t_ptr_in_i32 = id(); v_vid = id();
@@ -642,7 +669,7 @@ struct SpirvCompute {
         put(types, Op_TypePointer, {t_ptr_out_pv, SC_Output, t_pv});
         put(types, Op_Variable, {t_ptr_out_pv, v_pos, SC_Output});
         put(types, Op_TypePointer, {t_ptr_out_v4f, SC_Output, t_v4f});
-        if (with_cbufs) declare_cbufs();   // vertex fetch (buffer_load_format_*) reads these
+        if (with_cbufs) declare_cbufs(rt);   // vertex fetch (buffer_load_format_*) reads these
         put(code, Op_Function, {t_void, f_main, FC_None, t_fn});
         put(code, Op_Label, {lbl}); cur_block = lbl;
     }
@@ -1521,15 +1548,21 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 default: ok = false; return true;    // register-offset / stores / others not yet
             }
             uint32_t base_idx = in.literal >> 2;    // immediate byte offset -> dword index
-            // Descriptor provenance: pick which bound constant buffer via the resource table. For
-            // s_buffer_load, SBASE (src[0]) is the V# — if a prior s_load_dwordx4 tagged it with the
-            // SRT offset it came from, resolve that to a ShaderResource and route to its binding.
-            uint32_t slot = 0;
-            if (rt) { auto it = rs.sreg_srt.find(in.src[0].value);
-                if (it != rs.sreg_srt.end()) { const ShaderResource* res = rt->by_srt_offset(it->second);
-                    if (res && res->binding >= 3) slot = 1; } }
+            // Descriptor provenance: pick which bound constant buffer via the resource table, routing this
+            // load to that buffer's OWN binding (N-buffer model) — so Unity's several constant buffers
+            // (per-draw transform, per-frame, …) don't collapse onto one. For s_buffer_load, SBASE
+            // (src[0]) is the V#: resolve it by an earlier s_load's SRT tag (indirect) or directly by its
+            // user-data SGPR index (the V# was placed in SGPRs by the driver). Default binding 2.
+            uint32_t binding = 2;
+            if (rt) { const ShaderResource* res = nullptr;
+                auto it = rs.sreg_srt.find(in.src[0].value);
+                if (it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second);
+                // A scalar buffer load reads a CONSTANT buffer — resolve the SBASE SGPR to a constant
+                // buffer specifically (the same SGPR may also hold a vertex-buffer V# elsewhere).
+                if (!res) res = rt->by_sgpr_base_cls(in.src[0].value, ResourceClass::ConstantBuffer);
+                if (res) binding = res->binding; }
             for (uint32_t k = 0; k < n; k++)
-                rs.sreg[in.dst.value + (int)k] = b.cbuf_load(b.uconst(base_idx + k), slot);
+                rs.sreg[in.dst.value + (int)k] = b.cbuf_load(b.uconst(base_idx + k), binding);
             // A wide scalar load is a descriptor fetch — tag its dest SGPRs with the SRT offset so a
             // later buffer/image op using them resolves to the right resource (provenance). x4 = V#/S#
             // (buffers, samplers), x8 = T# (textures, 8 dwords).
@@ -1563,7 +1596,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
             uint32_t offset = in.literal & 0xFFFu;
             bool offen = (in.literal >> 12) & 1u, idxen = (in.literal >> 13) & 1u;
-            uint32_t slot = 0, stride = 0;
+            uint32_t binding = 2, stride = 0;   // untyped buffer_load defaults to binding 2 (compute cbuf);
+                                                // a format load (vertex fetch) overrides with its V#'s binding
             // Format of the fetched components. Untyped buffer_load_dword* is raw 32-bit (comp_bytes=4);
             // buffer_load_format_* takes the format from the resolved V# descriptor.
             DataFormat fmt = DataFormat::Uint32;   // untyped default: raw dwords
@@ -1572,20 +1606,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // binding, stride, and data format. Resolve SRSRC (src[1]) via provenance: an s_load
                 // tag (indirect) else the SGPR index (direct/user-data).
                 const ShaderResource* res = nullptr;
-                if (rt) { auto it = rs.sreg_srt.find(in.src[1].value);
-                    if (it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second);
-                    // A DIRECT vertex-buffer match (by SRSRC SGPR) wins over an s_load-tag match that
-                    // resolved to a non-vertex resource: bindless-dynamic fetch shaders load the V# with a
-                    // register (computed) offset, so the static srt tag (offset 0) spuriously matches the
-                    // first constant buffer. The executor keys the const-fold-resolved vertex buffer by its
-                    // SRSRC SGPR, so prefer that here.
-                    if (!res || res->cls != ResourceClass::VertexBuffer) {
-                        const ShaderResource* d = rt->by_sgpr_base(in.src[1].value);
-                        if (d) res = d;
-                    }
+                // A format load (vertex fetch) reads a VERTEX buffer — resolve the SRSRC SGPR to a vertex
+                // buffer specifically (that SGPR may hold a constant-buffer V# at other points; the const-
+                // fold-resolved vertex buffer is keyed by this SRSRC SGPR). Fall back to an s_load SRT tag.
+                if (rt) {
+                    res = rt->by_sgpr_base_cls(in.src[1].value, ResourceClass::VertexBuffer);
+                    if (!res) { auto it = rs.sreg_srt.find(in.src[1].value);
+                        if (it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second); }
                 }
                 if (!res) { ok = false; return true; }
-                slot = (res->binding >= 3) ? 1 : 0;
+                binding = res->binding;
                 stride = res->stride;
                 fmt = res->format;
             }
@@ -1623,7 +1653,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // Raw/Float32/Uint32: one dword per component.
                     for (uint32_t k = 0; k < n; k++) {
                         uint32_t kidx = k ? b.ibin(Op_IAdd, idx, b.uconst(k)) : idx;
-                        b.cbuf_store(kidx, vread(in.dst.value + (int)k), slot, rs.exec_narrowed, rs.exec);
+                        b.cbuf_store(kidx, vread(in.dst.value + (int)k), binding, rs.exec_narrowed, rs.exec);
                     }
                 } else {
                     // Packed UNORM/SNORM/Float16: pack the components tightly into ceil(n*bytes/4) dwords
@@ -1641,7 +1671,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                             acc = b.ibin(Op_BitwiseOr, acc, field);
                         }
                         uint32_t did = d ? b.ibin(Op_IAdd, idx, b.uconst(d)) : idx;
-                        b.cbuf_store(did, acc, slot, rs.exec_narrowed, rs.exec);
+                        b.cbuf_store(did, acc, binding, rs.exec_narrowed, rs.exec);
                     }
                 }
                 return true;
@@ -1652,13 +1682,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 uint32_t value;
                 if (!packed) {
                     uint32_t kidx = k ? b.ibin(Op_IAdd, idx, b.uconst(k)) : idx;
-                    value = b.cbuf_load(kidx, slot);                  // raw 32-bit component
+                    value = b.cbuf_load(kidx, binding);                  // raw 32-bit component
                 } else {
                     // Component k lives at byte k*comp_bytes within the element: pick its dword + field.
                     uint32_t byte_off = k * comp_bytes;
                     uint32_t drel = byte_off / 4, boff = (byte_off % 4) * 8;
                     uint32_t did = drel ? b.ibin(Op_IAdd, idx, b.uconst(drel)) : idx;
-                    uint32_t dw  = b.cbuf_load(did, slot);
+                    uint32_t dw  = b.cbuf_load(did, binding);
                     value = is_half ? b.unpack_half(dw, boff ? 1u : 0u)
                                     : b.unpack_norm(dw, boff, comp_bytes * 8, is_snorm, norm);
                 }
@@ -2028,7 +2058,7 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords, co
     rdna2_walk(code, dwords, ins);
 
     SpirvCompute b;
-    b.begin_fragment(rt != nullptr);
+    b.begin_fragment(rt);
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
     auto safe_branches = safe_execz_branches(ins);
     bool exported = false;
@@ -2066,7 +2096,7 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords, cons
     rdna2_walk(code, dwords, ins);
 
     SpirvCompute b;
-    b.begin_vertex(rt != nullptr);
+    b.begin_vertex(rt);
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
     auto safe_branches = safe_execz_branches(ins);
     // NGG vertex shaders (s_sendmsg GS_ALLOC_REQ present) carry the vertex index in v5, not v0, and wrap

@@ -94,7 +94,7 @@ int main(int argc, char** argv) {
             [](const std::vector<uint32_t>& vs, const std::vector<uint32_t>& fs,
                const prosper::gpu::ResolvedPipelineState& ps,
                const prosper::gpu::ShaderResourceTable* vrt, const prosper::gpu::ShaderResourceTable* prt,
-               uint32_t w, uint32_t h) {
+               uint32_t w, uint32_t h, uint32_t draw_vcount) {
                 // Dump the recompiled SPIR-V FIRST (before the slow Vulkan render), so it survives even if
                 // a concurrent worker fault kills the process mid-render — lets us spirv-val it offline.
                 if (getenv("PROSPER_SHADER_DUMP")) {
@@ -103,43 +103,41 @@ int main(int argc, char** argv) {
                     if (FILE* f = fopen((d + "/frame_fs.spv").c_str(), "wb")) { fwrite(fs.data(), 4, fs.size(), f); fclose(f); }
                     fprintf(stderr, "[render] dumped SPIR-V vs=%zu fs=%zu dwords\n", vs.size(), fs.size()); fflush(stderr);
                 }
-                // Bind the shaders' declared resources from 1:1-mapped guest memory so the descriptor set
-                // is complete (an unbound image_sample/storage binding is undefined behavior). Read the
-                // first constant buffer (binding 2), first vertex buffer (binding 3), and the sampled
-                // texture (binding 4) each shader references. Guarded by /dev/null-write readability.
+                // Bind EVERY resource each shader declares, each at its own descriptor binding, reading the
+                // bytes from 1:1-mapped guest memory (an unbound image_sample/storage binding is UB). The
+                // executor gave each constant/vertex buffer + texture a distinct binding; the recompiler
+                // declared a storage buffer / image sampler at each, so we must bind them all.
                 using RC = prosper::gpu::ResourceClass;
                 int dn = open("/dev/null", O_WRONLY);
                 auto readable = [&](uint64_t a, size_t n){ return a > 0x1000 && dn >= 0 && write(dn, (const void*)(uintptr_t)a, n) == (ssize_t)n; };
-                auto rd_words = [&](uint64_t addr, uint32_t bytes) {
-                    std::vector<uint32_t> v; uint32_t nb = std::min(bytes, 1u << 20);   // cap 1 MB
-                    if (nb >= 4 && readable(addr, nb)) v.assign((const uint32_t*)(uintptr_t)addr, (const uint32_t*)(uintptr_t)(addr + (nb & ~3u)));
-                    if (v.empty()) v.assign(64, 0);   // fallback zero buffer so the binding is still satisfied
-                    return v;
-                };
-                std::vector<uint32_t> cbuf, vbuf; std::vector<uint8_t> texrgba; prosper::test::TexDesc td{}; const prosper::test::TexDesc* tdp = nullptr;
-                auto pick = [&](const prosper::gpu::ShaderResourceTable* t){
+                std::vector<prosper::test::FrameResource> R;
+                static std::vector<std::vector<uint8_t>> texstore;  // keep texture bytes alive across the call
+                texstore.clear();
+                auto add = [&](const prosper::gpu::ShaderResourceTable* t){
                     if (!t) return;
                     for (auto& r : t->resources) {
-                        if (r.cls == RC::ConstantBuffer && cbuf.empty()) cbuf = rd_words(r.gpu_addr, r.size ? r.size : 256);
-                        else if (r.cls == RC::VertexBuffer && vbuf.empty()) vbuf = rd_words(r.gpu_addr, r.size ? r.size : 512);
-                        else if (r.cls == RC::Texture && !tdp) {
+                        prosper::test::FrameResource fr; fr.binding = r.binding;
+                        if (r.cls == RC::Texture || r.cls == RC::StorageImage) {
                             uint32_t tw = r.width ? r.width : 4, th = r.height ? r.height : 4;
                             size_t nb = (size_t)tw * th * 4;
-                            if (readable(r.gpu_addr, nb < 4096 ? nb : 4096)) {   // probe a page; then copy full
-                                texrgba.resize(nb);
-                                if (readable(r.gpu_addr, nb)) std::memcpy(texrgba.data(), (const void*)(uintptr_t)r.gpu_addr, nb);
-                                else std::fill(texrgba.begin(), texrgba.end(), 0x80);   // partially-mapped -> gray
-                                td = { r.binding, tw, th, texrgba.data() }; tdp = &td;
-                            }
+                            texstore.emplace_back(nb, 0x00);
+                            if (readable(r.gpu_addr, nb)) std::memcpy(texstore.back().data(), (const void*)(uintptr_t)r.gpu_addr, nb);
+                            fr.tex_rgba = texstore.back().data(); fr.tw = tw; fr.th = th;
+                        } else {
+                            uint32_t nb = std::min(r.size ? r.size : 256u, 1u << 20);   // cap 1 MB
+                            if (nb >= 4 && readable(r.gpu_addr, nb))
+                                fr.dwords.assign((const uint32_t*)(uintptr_t)r.gpu_addr, (const uint32_t*)(uintptr_t)(r.gpu_addr + (nb & ~3u)));
+                            if (fr.dwords.empty()) fr.dwords.assign(64, 0);
                         }
+                        R.push_back(std::move(fr));
                     }
                 };
-                pick(vrt); pick(prt);
+                add(vrt); add(prt);
                 if (dn >= 0) close(dn);
-                if (getenv("PROSPER_GFXLOG")) { fprintf(stderr, "[render] binding cbuf=%zu vbuf=%zu tex=%s (%ux%u)\n",
-                    cbuf.size(), vbuf.size(), tdp ? "yes" : "no", td.w, td.h); fflush(stderr); }
+                if (getenv("PROSPER_GFXLOG")) { fprintf(stderr, "[render] binding %zu resources (draw %u verts)\n",
+                    R.size(), draw_vcount); fflush(stderr); }
                 std::vector<uint8_t> px = prosper::test::render_triangle_rgba(vs, fs, w, h, &ps,
-                    vbuf.empty() ? nullptr : &vbuf, cbuf.empty() ? nullptr : &cbuf, tdp);
+                    nullptr, nullptr, nullptr, R.empty() ? nullptr : &R, draw_vcount);
                 int n = frame_no++;
                 if (px.empty()) {
                     fprintf(stderr, "[render] frame %d: Vulkan render FAILED (%ux%u)\n", n, w, h);

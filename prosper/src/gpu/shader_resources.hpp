@@ -91,6 +91,11 @@ struct ShaderResourceTable {
     // Resolve the resource whose descriptor lives at SGPR `sgpr` (direct/user-data provenance);
     // nullptr if none.
     const ShaderResource* by_sgpr_base(uint32_t sgpr) const;
+    // Same, but restricted to a resource class. A single SGPR can hold different descriptors at different
+    // points (e.g. s8 = a constant-buffer V# for an early s_buffer_load, then a vertex-buffer V# after a
+    // dynamic reload for a later buffer_load_format). The instruction type implies the class, so filtering
+    // by class disambiguates without tracking per-instruction reloads. nullptr if none.
+    const ShaderResource* by_sgpr_base_cls(uint32_t sgpr, ResourceClass cls) const;
     // Resolve by assigned Vulkan binding (the pipeline's lookup); nullptr if none.
     const ShaderResource* by_binding(uint32_t binding) const;
 };
