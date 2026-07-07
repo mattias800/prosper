@@ -51,9 +51,12 @@ HLE(s_pad_info)       { if (a1) memset(PW(a1), 0, 0x20); return 0; }          //
 // sticks @0x04, touch data @0x30, connected @0x48, timestamp @0x50, extension tail to 0x77).
 // Zero ALL of it: a stub that claims "1 entry read" while zeroing only part of the struct hands
 // the game uninitialized touch/timestamp/connected bytes. CONFIDENCE: MED (offsets from Kyty).
+// Pad polling is per-frame, so the env probes are cached in statics (getenv scans environ linearly).
+static bool padlog()    { static const bool v = getenv("PROSPER_PADLOG")    != nullptr; return v; }
+static bool pad_press() { static const bool v = getenv("PROSPER_PAD_PRESS") != nullptr; return v; }
 static void fill_pad_data(uint8_t* d) {
     memset(d, 0, 0x78);
-    if (getenv("PROSPER_PAD_PRESS")) {
+    if (pad_press()) {
         *(uint32_t*)(d + 0x00) = 0x4000u;              // buttons: CROSS held
         d[0x04] = d[0x05] = d[0x06] = d[0x07] = 128;   // sticks centered
         d[0x48] = 1;                                   // connected = true
@@ -61,7 +64,7 @@ static void fill_pad_data(uint8_t* d) {
 }
 HLE(s_pad_read)       {
     static unsigned n = 0; n++;
-    if (getenv("PROSPER_PADLOG") && (n <= 5 || n % 200 == 0)) fprintf(stderr, "[pad] scePadRead call #%u\n", n);
+    if (padlog() && (n <= 5 || n % 200 == 0)) fprintf(stderr, "[pad] scePadRead call #%u\n", n);
     if (!a1) return 0;                                 // no output buffer -> no entries read
     fill_pad_data((uint8_t*)PW(a1));
     return 1;   // scePadRead returns the number of pad data entries read (>0 = data available)
@@ -71,7 +74,7 @@ HLE(s_pad_read)       {
 // with a button held (CROSS=0x4000) so a "Press [button]" title screen can advance to a shader-drawn scene.
 HLE(s_pad_readstate)  {
     static unsigned n = 0; n++;
-    if (getenv("PROSPER_PADLOG") && (n <= 5 || n % 200 == 0))
+    if (padlog() && (n <= 5 || n % 200 == 0))
         fprintf(stderr, "[pad] scePadReadState call #%u\n", n);
     if (a1) fill_pad_data((uint8_t*)PW(a1));
     return 0;

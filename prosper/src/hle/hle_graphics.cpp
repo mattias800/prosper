@@ -360,13 +360,17 @@ uint64_t glog_impl(const char* nid, void* ra,
     // The stub returns 0 forever, so if the guest polls "is it ready? (0=no)" it spins. Return the env
     // value for that NID to test whether a non-zero ("ready"/handle) result breaks the spin and lets the
     // render thread proceed. Diagnostic only (gated) — the value that works tells us the real semantics.
-    if (const char* rv = getenv("PROSPER_AGCRET")) {
+    // Cached: glog_impl is the thunk for EVERY stubbed AGC NID, including the documented tight spin on
+    // Zw7uUVPulbw — per-call getenv() environ scans here are paid on every iteration of that spin.
+    static const char* const agcret = getenv("PROSPER_AGCRET");
+    if (const char* rv = agcret) {
         if (!strcmp(nid, "Zw7uUVPulbw")) return (uint64_t)strtoull(rv, nullptr, 0);
     }
     // PROSPER_ZWDUMP: is Zw7uUVPulbw a GPU submit (does its context/args reference a PM4 command buffer
     // with draws we're not processing)? Dump the context (a0) and probe args as pointers, on the first
     // few calls, so we can tell "no scene" from "scene submitted via a path we don't hook."
-    if (getenv("PROSPER_ZWDUMP") && !strcmp(nid, "Zw7uUVPulbw")) {
+    static const bool zwdump = getenv("PROSPER_ZWDUMP") != nullptr;
+    if (zwdump && !strcmp(nid, "Zw7uUVPulbw")) {
         static int n = 0;
         if (n++ < 3) {
             // Guest memory is mapped at high addresses (0x70xx_........), so a valid pointer just needs to
