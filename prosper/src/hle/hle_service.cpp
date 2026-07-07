@@ -30,11 +30,15 @@ HLE(s_user_age)       { if (a1) *(int32_t*)PW(a1) = 18; return 0; }          // 
 // user's LOGIN event once at startup, then reports "no more events" so the game's drain loop terminates.
 // The previous (unimplemented) stub returned 0 = "got an event" but left the struct unfilled -> the game
 // either drained a garbage event or never saw the login it waits on. SceUserServiceEvent = { int32
-// eventType (0=LOGIN,1=LOGOUT); int32 userId }. NO_EVENT = 0x80960009.
+// eventType (0=LOGIN,1=LOGOUT); int32 userId }.
+// NO_EVENT = 0x80960007 (Kyty Errno.h USER_SERVICE_ERROR_NO_EVENT). We first shipped 0x80960009 —
+// a DIFFERENT UserService error — and the game's main-thread drain loop, not recognizing it as
+// "no more events", retried GetEvent forever: the frame loop never built frame 2 (gdb-sampled spin,
+// 4/6 PC samples inside this function). One wrong errno constant == a full render stall.
 HLE(s_user_getevent)  {
     static std::atomic<int> delivered{0};
     if (a0 && delivered.exchange(1) == 0) { int32_t* ev = (int32_t*)PW(a0); ev[0] = 0; ev[1] = 1; return 0; }
-    return 0x80960009ull;   // SCE_USER_SERVICE_ERROR_NO_EVENT
+    return 0x80960007ull;   // SCE_USER_SERVICE_ERROR_NO_EVENT
 }
 HLE(s_ok)             { return 0; }
 
