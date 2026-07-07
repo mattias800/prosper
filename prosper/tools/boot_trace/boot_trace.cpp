@@ -164,6 +164,14 @@ int main(int argc, char** argv) {
         prosper::gpu::set_submit_renderer(
             [](const std::vector<prosper::gpu::DrawItem>& items, uint32_t w, uint32_t h) -> std::vector<uint8_t> {
                 using RC = prosper::gpu::ResourceClass;
+                // PROSPER_RENDER_FIRST=<N>: skip the slow (~400x) Vulkan render for the first N GPU submits, so
+                // the game reaches a LATE scene (e.g. the level1 cutscene, which only starts submitting after
+                // ~5000 title-loop submits) at native speed before we begin rendering/dumping. Returning {}
+                // means "not rendered this submit". Without this, rendering from boot is far too slow to ever
+                // reach a post-loading-screen scene.
+                static std::atomic<int> g_submit_idx{0};
+                static int g_render_first = getenv("PROSPER_RENDER_FIRST") ? atoi(getenv("PROSPER_RENDER_FIRST")) : 0;
+                if (g_submit_idx++ < g_render_first) return {};
                 // Dump the FIRST item's recompiled SPIR-V (diagnostic; survives a mid-render crash).
                 if (getenv("PROSPER_SHADER_DUMP") && !items.empty()) {
                     std::string d = getenv("PROSPER_SHADER_DUMP");

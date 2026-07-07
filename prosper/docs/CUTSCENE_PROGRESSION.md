@@ -166,3 +166,28 @@ remove the GC abort.
 (top open lead: a Unity job-worker created/exiting *during* a stop-the-world — see
 `CUTSCENE_GC_ABORT.md`), AND then the per-draw/multi-draw executor (PR #31) to render the
 cutscene's `mask=0`/`color0_base=0` draws. Neither is a small change.
+
+## 2026-07-07 (third pass) — CORRECTION: the async scene load COMPLETES; the crash is AT activation, not a load stall
+
+Independent re-verification on the current tip (`334dc7f`), `PROSPER_GUEST_FS=1
+PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_PREADLOG=1`. Earlier passes said the load "plateaus ~block 977
+(≈82%)" and "crashes before the load finishes and the scene can activate". That framing is **wrong** — the
+async load runs to completion:
+```
+[preadlog] pread  resources.assets … off=0x49f0000 (blk 1183, ≈97% of the 77.6 MB file)
+[preadlog] close  sharedassets1.assets
+[preadlog] close  level1
+[preadlog] close  resources.assets      <-- Unity closes every scene file: the async load reached 100%
+=== RUN ENDED: SIGSEGV at addr=0x20  rip=Il2cpp+0x1637697 ===   <-- crash fires immediately after
+```
+So the crash is **at scene ACTIVATION** (the main-thread integrate/activate step that runs right after the
+async load closes its files), not a mid-load stall and not an `allowSceneActivation`/progress gate. Every
+one of the preceding ~3000–7500 submits is the level0 1-draw loading composite; the cutscene's multi-draw
+geometry is never submitted because the process dies the instant activation begins. Also re-confirmed this
+pass: no `unimplemented -> returning 0` HLE call fires at activation (last calls are all implemented AGC
+direct-mode), and the `Il2cpp+0x1637697` null (`[callerObj+0x40]`) persists with the incremental-GC pump
+patched to `ret` (`PROSPER_PATCH_RET=0x440005df0`) — so this null is the deser/init one, independent of the
+GC. Which specific terminal fault wins (`Il2cpp+0x1637697` activation-NRE vs. the `libc.prx+0x4a20` GC
+"Unexpected state" abort) is timing-dependent, but both fire at/just-before activation. **Net: the single
+remaining blocker is unchanged — populate the null managed field `[callerObj+0x40]` on the activation path
+(and/or fix the GC stop-the-world race) — but the scene now provably loads to 100% first.**

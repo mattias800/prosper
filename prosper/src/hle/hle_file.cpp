@@ -28,12 +28,31 @@ namespace prosper {
 namespace {
     std::string g_app0;   // host directory backing guest "/app0"
     bool filelog() { static int v = getenv("PROSPER_FILELOG") ? 1 : 0; return v; }
+    // Host directory backing guest "/temp0" — the app temp-data area that
+    // sceAppContentTemporaryDataMount2 (hle_service.cpp) reports to the game. Created on first
+    // use; override with PROSPER_TEMP0. A scratch dir outside the dump keeps the game's writes
+    // out of /app0 (which is read-only content).
+    std::string temp0_root() {
+        static std::string root;
+        if (root.empty()) {
+            const char* e = getenv("PROSPER_TEMP0");
+            root = e ? e : "/tmp/prosper-temp0";
+#ifdef _WIN32
+            _mkdir(root.c_str());
+#else
+            ::mkdir(root.c_str(), 0777);
+#endif
+        }
+        return root;
+    }
     std::string translate(const char* guest) {
         if (!guest) return {};
         std::string p = guest;
         if (g_app0.empty()) { if (const char* e = getenv("PROSPER_APP0")) g_app0 = e; }
-        // Map /app0[/...] -> <root>[/...]; leave other absolute paths as-is.
-        std::string h = (p.rfind("/app0", 0) == 0) ? g_app0 + p.substr(5) : p;
+        // Map /app0[/...] -> <root>[/...], /temp0[/...] -> scratch dir; other paths as-is.
+        std::string h = (p.rfind("/app0", 0) == 0)  ? g_app0 + p.substr(5)
+                      : (p.rfind("/temp0", 0) == 0) ? temp0_root() + p.substr(6)
+                      : p;
         if (filelog()) fprintf(stderr, "[file] open '%s' -> '%s'\n", guest, h.c_str());
         return h;
     }

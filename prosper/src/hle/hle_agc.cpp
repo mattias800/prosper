@@ -32,7 +32,7 @@ namespace {
 // --- PM4 encoding (Kyty Pm4.h) ---------------------------------------------------------------
 constexpr uint32_t IT_NOP = 0x10, IT_INDEX_TYPE = 0x2A, IT_EVENT_WRITE = 0x46, IT_SET_SH_REG = 0x76;
 // Custom sub-opcodes carried inside IT_NOP:
-constexpr uint32_t R_DRAW_INDEX_AUTO = 0x04, R_DRAW_RESET = 0x05, R_WAIT_FLIP_DONE = 0x06,
+constexpr uint32_t R_DRAW_INDEX = 0x03, R_DRAW_INDEX_AUTO = 0x04, R_DRAW_RESET = 0x05, R_WAIT_FLIP_DONE = 0x06,
                    R_SH_REGS_INDIRECT = 0x11, R_CX_REGS_INDIRECT = 0x12, R_UC_REGS_INDIRECT = 0x13,
                    R_ACQUIRE_MEM = 0x14, R_WRITE_DATA = 0x15, R_WAIT_MEM_64 = 0x16, R_FLIP = 0x17,
                    R_RELEASE_MEM = 0x18;
@@ -111,6 +111,28 @@ HLE(agc_dcb_draw_index_auto) {  // (buf, index_count, modifier)
     uint32_t* cmd; if (!begin_packet(a0, 7, IT_NOP, R_DRAW_INDEX_AUTO, &cmd)) return 0;
     cmd[1] = (uint32_t)a1; cmd[2] = 0; return (uint64_t)(uintptr_t)cmd;
 }
+// sceAgcDcbDrawIndex (NID q88lQ+GP5Yk, name via shadPS4 aerolib.inl) — the indexed-draw sibling of
+// DrawIndexAuto. Kyty has no Gen5 reference; arg shape inferred from the Gen4 form
+// (index_count, index_addr, …) + the Gen5 Dcb convention (buf first, modifier last):
+// (Dcb* buf, uint32_t index_count, const void* indices, uint64_t modifier). CONFIDENCE: LOW on
+// a2/a3 meaning — the packet stores them raw and pm4_decode currently skips R_DRAW_INDEX (indexed
+// draws are the documented "remaining polish"). What this fixes NOW: every Dcb append returns the
+// allocated packet pointer, and the previous unimplemented stub returned 0 — a caller patching
+// its draw packet through that return (the AGC patch idiom, cf. agc_patch_set_address) would have
+// written through NULL/garbage instead of into the DCB.
+HLE(agc_dcb_draw_index) {
+    uint32_t* cmd; if (!begin_packet(a0, 7, IT_NOP, R_DRAW_INDEX, &cmd)) return 0;
+    cmd[1] = (uint32_t)a1;
+    cmd[2] = (uint32_t)(a2 & 0xffffffffu); cmd[3] = (uint32_t)(a2 >> 32u);
+    cmd[4] = (uint32_t)(a3 & 0xffffffffu); cmd[5] = (uint32_t)(a3 >> 32u);
+    cmd[6] = 0;
+    return (uint64_t)(uintptr_t)cmd;
+}
+// sceAgcSuspendPoint (NID h9z6+0hEydk, name via shadPS4) — the TRC R5089 GPU suspend point the
+// game forces in a loop ("Forcing call to sce::Agc::suspendPoint" spam). It has no out-params and
+// no game-visible state; on a devkit it just gives the system a safe suspend opportunity.
+// Returning 0 (OK) is the full contract for us — registered so it stops logging as unimplemented.
+HLE(agc_suspend_point) { return 0; }
 HLE(agc_dcb_event_write) {  // (buf, event_type, address)
     uint32_t* cmd; if (!begin_packet(a0, 2, IT_EVENT_WRITE, 0, &cmd)) return 0;
     cmd[1] = (uint32_t)(a1 & 0xffu); return (uint64_t)(uintptr_t)cmd;
@@ -630,6 +652,8 @@ void register_agc_hle() {
     RN("hvUfkUIQcOE", agc_dcb_set_uc_regs_indirect);
     RN("GIIW2J37e70", agc_dcb_set_index_size);
     RN("Yw0jKSqop+E", agc_dcb_draw_index_auto);
+    RN("q88lQ+GP5Yk", agc_dcb_draw_index);      // sceAgcDcbDrawIndex (see handler comment)
+    RN("h9z6+0hEydk", agc_suspend_point);       // sceAgcSuspendPoint — no-op OK
     RN("aJf+j5yntiU", agc_dcb_event_write);
     RN("57labkp+rSQ", agc_dcb_acquire_mem);
     RN("wr23dPKyWc0", agc_cb_release_mem);

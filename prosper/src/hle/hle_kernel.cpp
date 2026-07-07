@@ -58,6 +58,62 @@ HLE(k_mutexattr_setpshared)  { return 0; }
 HLE(k_mutexattr_destroy)     { if (a0 && *(void**)a0) { free(*(void**)a0); *(void**)a0 = nullptr; } return 0; }
 
 // --- mutexes ---
+// FreeBSD/PS5 pthread objects are POINTERS, and a STATICALLY-INITIALIZED object is a small
+// sentinel (PTHREAD_MUTEX_INITIALIZER == NULL, adaptive == 1, ...). Real libthr SELF-INITIALIZES
+// such an object on first use (Kyty models the same with its PthreadStaticObject lazy creation).
+// We previously treated a NULL handle as a no-op that RETURNED SUCCESS — which silently voided
+// every statically-initialized lock. ROOT CAUSE of the level1 scene-load heap corruption: the
+// IL2CPP/bdwgc GC allocation lock (GC_allocate_ml, a static PTHREAD_MUTEX_INITIALIZER in
+// Il2cppUserAssemblies' .bss, locked via libScePosix pthread_mutex_trylock/lock) never locked,
+// so the collector raced concurrently-allocating / lazy-sweeping mutator threads and corrupted
+// the GC free lists ("Rewired_" ASCII popped as a free-list link, marker ABORT "Unexpected
+// state", varying downstream SIGSEGVs). Self-init closes that class for mutex/cond/rwlock.
+// CONFIDENCE: HIGH (semantics cross-checked against FreeBSD libthr + the Kyty reference).
+namespace {
+    inline bool pt_static_sentinel(void* v) { return (uintptr_t)v < 0x1000; }  // NULL/1/2/3... = static initializer
+    pthread_mutex_t* ensure_mutex(uint64_t slot_addr) {
+        if (!slot_addr) return nullptr;
+        void** slot = (void**)(uintptr_t)slot_addr;
+        void* cur = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+        if (!pt_static_sentinel(cur)) return (pthread_mutex_t*)cur;
+        auto* m = (pthread_mutex_t*)calloc(1, sizeof(pthread_mutex_t));
+        pthread_mutexattr_t at; pthread_mutexattr_init(&at);
+        pthread_mutexattr_settype(&at, PTHREAD_MUTEX_RECURSIVE);
+        pthread_mutex_init(m, &at);
+        pthread_mutexattr_destroy(&at);
+        if (__atomic_compare_exchange_n(slot, &cur, (void*)m, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            return m;
+        pthread_mutex_destroy(m); free(m);          // lost the init race: use the winner's object
+        return (pthread_mutex_t*)cur;
+    }
+    pthread_cond_t* ensure_cond(uint64_t slot_addr) {
+        if (!slot_addr) return nullptr;
+        void** slot = (void**)(uintptr_t)slot_addr;
+        void* cur = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+        if (!pt_static_sentinel(cur)) return (pthread_cond_t*)cur;
+        auto* c = (pthread_cond_t*)calloc(1, sizeof(pthread_cond_t));
+        pthread_cond_init(c, nullptr);
+        if (__atomic_compare_exchange_n(slot, &cur, (void*)c, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            return c;
+        pthread_cond_destroy(c); free(c);
+        return (pthread_cond_t*)cur;
+    }
+    pthread_rwlock_t* ensure_rwlock(uint64_t slot_addr) {
+        if (!slot_addr) return nullptr;
+        void** slot = (void**)(uintptr_t)slot_addr;
+        void* cur = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+        if (!pt_static_sentinel(cur)) return (pthread_rwlock_t*)cur;
+        auto* rw = (pthread_rwlock_t*)calloc(1, sizeof(pthread_rwlock_t));
+        pthread_rwlock_init(rw, nullptr);
+        if (__atomic_compare_exchange_n(slot, &cur, (void*)rw, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            return rw;
+        pthread_rwlock_destroy(rw); free(rw);
+        return (pthread_rwlock_t*)cur;
+    }
+}
 HLE(k_mutex_init) {
     if (!a0) return 0x16;
     auto* m = (pthread_mutex_t*)calloc(1, sizeof(pthread_mutex_t));
@@ -69,20 +125,21 @@ HLE(k_mutex_init) {
     *(void**)a0 = m;
     return 0;
 }
-HLE(k_mutex_destroy) { if (a0 && *(void**)a0) { pthread_mutex_destroy((pthread_mutex_t*)*(void**)a0); free(*(void**)a0); *(void**)a0 = nullptr; } return 0; }
-HLE(k_mutex_lock)    { if (a0 && *(void**)a0) pthread_mutex_lock((pthread_mutex_t*)*(void**)a0); return 0; }
-HLE(k_mutex_trylock) { return (a0 && *(void**)a0) ? (uint64_t)pthread_mutex_trylock((pthread_mutex_t*)*(void**)a0) : 0x16; }
-HLE(k_mutex_unlock)  { if (a0 && *(void**)a0) pthread_mutex_unlock((pthread_mutex_t*)*(void**)a0); return 0; }
+HLE(k_mutex_destroy) { if (a0 && !pt_static_sentinel(*(void**)a0)) { pthread_mutex_destroy((pthread_mutex_t*)*(void**)a0); free(*(void**)a0); } if (a0) *(void**)a0 = nullptr; return 0; }
+HLE(k_mutex_lock)    { if (auto* m = ensure_mutex(a0)) pthread_mutex_lock(m); return 0; }
+HLE(k_mutex_trylock) { auto* m = ensure_mutex(a0); return m ? (uint64_t)pthread_mutex_trylock(m) : 0x16; }
+HLE(k_mutex_unlock)  { if (auto* m = ensure_mutex(a0)) pthread_mutex_unlock(m); return 0; }
 
 // --- condition variables ---
 HLE(k_condattr_init)    { if (a0) { auto* c = (pthread_condattr_t*)calloc(1, sizeof(pthread_condattr_t)); pthread_condattr_init(c); *(void**)a0 = c; } return 0; }
 HLE(k_condattr_destroy) { if (a0 && *(void**)a0) { free(*(void**)a0); *(void**)a0 = nullptr; } return 0; }
 HLE(k_cond_init)      { if (!a0) return 0x16; auto* c = (pthread_cond_t*)calloc(1, sizeof(pthread_cond_t)); pthread_cond_init(c, nullptr); *(void**)a0 = c; return 0; }
-HLE(k_cond_destroy)   { if (a0 && *(void**)a0) { pthread_cond_destroy((pthread_cond_t*)*(void**)a0); free(*(void**)a0); *(void**)a0 = nullptr; } return 0; }
-HLE(k_cond_signal)    { if (sclog()) fprintf(stderr, "[sync2] T%ld COND.signal    cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); if (a0 && *(void**)a0) pthread_cond_signal((pthread_cond_t*)*(void**)a0); return 0; }
-HLE(k_cond_broadcast) { if (sclog()) fprintf(stderr, "[sync2] T%ld COND.broadcast cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); if (a0 && *(void**)a0) pthread_cond_broadcast((pthread_cond_t*)*(void**)a0); return 0; }
+HLE(k_cond_destroy)   { if (a0 && !pt_static_sentinel(*(void**)a0)) { pthread_cond_destroy((pthread_cond_t*)*(void**)a0); free(*(void**)a0); } if (a0) *(void**)a0 = nullptr; return 0; }
+HLE(k_cond_signal)    { if (sclog()) fprintf(stderr, "[sync2] T%ld COND.signal    cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); if (auto* c = ensure_cond(a0)) pthread_cond_signal(c); return 0; }
+HLE(k_cond_broadcast) { if (sclog()) fprintf(stderr, "[sync2] T%ld COND.broadcast cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); if (auto* c = ensure_cond(a0)) pthread_cond_broadcast(c); return 0; }
 HLE(k_cond_wait)      { if (sclog()) fprintf(stderr, "[sync2] T%ld COND.wait.ent  cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0);
-    if (a0 && *(void**)a0 && a1 && *(void**)a1) pthread_cond_wait((pthread_cond_t*)*(void**)a0, (pthread_mutex_t*)*(void**)a1);
+    { auto* c = ensure_cond(a0); auto* m = ensure_mutex(a1);
+      if (c && m) pthread_cond_wait(c, m); }
     if (sclog()) fprintf(stderr, "[sync2] T%ld COND.wait.exit cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); return 0; }
 
 // --- read/write locks (opaque handle -> host pthread_rwlock_t). Real libc.prx uses these for its
@@ -95,12 +152,12 @@ HLE(k_rwlock_init) {
     *(void**)a0 = rw;   // store handle through caller's slot (a1=attr, a2=name ignored)
     return 0;
 }
-HLE(k_rwlock_destroy) { if (a0 && *(void**)a0) { pthread_rwlock_destroy((pthread_rwlock_t*)*(void**)a0); free(*(void**)a0); *(void**)a0 = nullptr; } return 0; }
-HLE(k_rwlock_rdlock)  { if (a0 && *(void**)a0) pthread_rwlock_rdlock((pthread_rwlock_t*)*(void**)a0); return 0; }
-HLE(k_rwlock_wrlock)  { if (a0 && *(void**)a0) pthread_rwlock_wrlock((pthread_rwlock_t*)*(void**)a0); return 0; }
-HLE(k_rwlock_unlock)  { if (a0 && *(void**)a0) pthread_rwlock_unlock((pthread_rwlock_t*)*(void**)a0); return 0; }
-HLE(k_rwlock_tryrdlock){ return (a0 && *(void**)a0) ? (uint64_t)pthread_rwlock_tryrdlock((pthread_rwlock_t*)*(void**)a0) : 0x16; }
-HLE(k_rwlock_trywrlock){ return (a0 && *(void**)a0) ? (uint64_t)pthread_rwlock_trywrlock((pthread_rwlock_t*)*(void**)a0) : 0x16; }
+HLE(k_rwlock_destroy) { if (a0 && !pt_static_sentinel(*(void**)a0)) { pthread_rwlock_destroy((pthread_rwlock_t*)*(void**)a0); free(*(void**)a0); } if (a0) *(void**)a0 = nullptr; return 0; }
+HLE(k_rwlock_rdlock)  { if (auto* rw = ensure_rwlock(a0)) pthread_rwlock_rdlock(rw); return 0; }
+HLE(k_rwlock_wrlock)  { if (auto* rw = ensure_rwlock(a0)) pthread_rwlock_wrlock(rw); return 0; }
+HLE(k_rwlock_unlock)  { if (auto* rw = ensure_rwlock(a0)) pthread_rwlock_unlock(rw); return 0; }
+HLE(k_rwlock_tryrdlock){ auto* rw = ensure_rwlock(a0); return rw ? (uint64_t)pthread_rwlock_tryrdlock(rw) : 0x16; }
+HLE(k_rwlock_trywrlock){ auto* rw = ensure_rwlock(a0); return rw ? (uint64_t)pthread_rwlock_trywrlock(rw) : 0x16; }
 
 // scePthreadOnce(once_control*, init_routine): run init exactly once. We run it UNDER a lock so all
 // callers see it complete before returning (pthread_once semantics). A recursive mutex avoids
@@ -373,12 +430,49 @@ void set_unwind_modules(const UnwindModuleDesc* d, size_t c) { g_unwind_mods.ass
 namespace {
 uint64_t g_exc_handlers[128] = {0};   // guest handler fn ptr, indexed by exception type
 bool g_exc_log = false;               // set once (outside signal ctx) from PROSPER_SYNCLOG
+// PROSPER_EXCLOG: dedicated, cheap GC stop-the-world tracing (raise/deliver/ack) — used to correlate
+// GC suspend cycles with the level1 loader heap-corruption crash. Independent of the very verbose
+// PROSPER_SYNCLOG. Read once (getenv is not signal-safe).
+bool g_exc_log2 = false;
 volatile int* g_exc_counter = nullptr; // optional fork-safe raise counter (tests)
 #ifdef __linux__
 int  g_exc_sig = -1;
 void exc_delivery_handler(int, siginfo_t* si, void* uc_) {
     int type = si->si_value.sival_int;
-    if (type < 0 || type >= 128 || !g_exc_handlers[type]) return;
+    if (type < 0 || type >= 128 || !g_exc_handlers[type]) {
+        if (g_exc_log2) {   // a suspend request that silently does NOTHING = an unstopped thread
+            // %fs-safe: this handler can interrupt guest code running on the GUEST %fs, where host
+            // libc TLS (locale, stack canary) reads garbage — swap to host %fs for the logging.
+            uint64_t sfs = guest_fs_to_host_scoped();
+            char b[96]; int n = snprintf(b, sizeof b, "[exc2] DROPPED type=%d tid=%ld (no handler)\n",
+                                         type, (long)syscall(SYS_gettid));
+            (void)!write(2, b, n);
+            guest_fs_restore_scoped(sfs);
+        }
+        return;
+    }
+    if (g_exc_log2) {
+        // Log the interrupted context: rip (classified guest module+off / host) and whether the
+        // thread was on the guest or host %fs at interrupt time. %fs-safe (scoped host swap).
+        uint64_t irip = (uint64_t)((ucontext_t*)uc_)->uc_mcontext.gregs[REG_RIP];
+        uint64_t sfs = guest_fs_to_host_scoped();
+        const char* fss = sfs ? "guest" : "host";
+        char b[160]; int n;
+        if (irip >= 0x400000000ull && irip < 0x420000000ull)
+            n = snprintf(b, sizeof b, "[exc2] ENTER tid=%ld type=%d fs=%s rip=eboot+0x%llx\n",
+                         (long)syscall(SYS_gettid), type, fss, (unsigned long long)(irip - 0x400000000ull));
+        else if (irip >= 0x440000000ull && irip < 0x443000000ull)
+            n = snprintf(b, sizeof b, "[exc2] ENTER tid=%ld type=%d fs=%s rip=il2cpp+0x%llx\n",
+                         (long)syscall(SYS_gettid), type, fss, (unsigned long long)(irip - 0x440000000ull));
+        else if (irip >= 0x500000000ull && irip < 0x501000000ull)
+            n = snprintf(b, sizeof b, "[exc2] ENTER tid=%ld type=%d fs=%s rip=libc+0x%llx\n",
+                         (long)syscall(SYS_gettid), type, fss, (unsigned long long)(irip - 0x500000000ull));
+        else
+            n = snprintf(b, sizeof b, "[exc2] ENTER tid=%ld type=%d fs=%s rip=host:0x%llx\n",
+                         (long)syscall(SYS_gettid), type, fss, (unsigned long long)irip);
+        (void)!write(2, b, n);
+        guest_fs_restore_scoped(sfs);
+    }
     auto* uc = (ucontext_t*)uc_;
     greg_t* g = uc->uc_mcontext.gregs;
     // FreeBSD amd64 mcontext_t: rdi@0x08 rsi@0x10 rdx@0x18 rcx@0x20 r8@0x28 r9@0x30 rax@0x38
@@ -404,10 +498,18 @@ void exc_delivery_handler(int, siginfo_t* si, void* uc_) {
     if (g_exc_log) { const char m[] = "[exc] handler ENTER on target\n"; (void)!write(2, m, sizeof m - 1); }
     ((void (*)(uint64_t, void*))(uintptr_t)g_exc_handlers[type])((uint64_t)type, ctx);
     if (g_exc_log) { const char m[] = "[exc] handler EXIT (resumed)\n";   (void)!write(2, m, sizeof m - 1); }
+    if (g_exc_log2) {
+        uint64_t sfs = guest_fs_to_host_scoped();   // %fs-safe logging (see ENTER)
+        char b[96]; int n = snprintf(b, sizeof b, "[exc2] RESUME tid=%ld type=%d\n",
+                                     (long)syscall(SYS_gettid), type);
+        (void)!write(2, b, n);
+        guest_fs_restore_scoped(sfs);
+    }
 }
 void ensure_exc_sig() {
     if (g_exc_sig != -1) return;
     g_exc_log = getenv("PROSPER_SYNCLOG") != nullptr;
+    g_exc_log2 = getenv("PROSPER_EXCLOG") != nullptr;
     g_exc_sig = SIGRTMIN + 4;                    // free RT signal (not our SIGSEGV/ILL/BUS)
     struct sigaction sa; memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = exc_delivery_handler;
@@ -444,7 +546,14 @@ HLE(k_raise_exception) {       // (targetThread /*host pthread_t*/, exceptionTyp
 #ifdef __linux__
     if (a0 && a1 < 128 && g_exc_handlers[a1]) {
         union sigval sv; sv.sival_int = (int)a1;
-        pthread_sigqueue((pthread_t)a0, g_exc_sig, sv);
+        int qr = pthread_sigqueue((pthread_t)a0, g_exc_sig, sv);
+        if (g_exc_log2)
+            fprintf(stderr, "[exc2] RAISE by tid=%ld target=0x%llx type=0x%llx sigqueue=%d\n",
+                    sctid(), (unsigned long long)a0, (unsigned long long)a1, qr);
+        if (qr != 0) return 0x80020000u | (uint32_t)qr;   // deliverance FAILED — report, don't lie
+    } else if (g_exc_log2) {
+        fprintf(stderr, "[exc2] RAISE-NOOP by tid=%ld target=0x%llx type=0x%llx (no handler)\n",
+                sctid(), (unsigned long long)a0, (unsigned long long)a1);
     }
 #endif
     return 0;
@@ -620,6 +729,12 @@ void register_kernel_hle() {
     R("sceKernelWaitSema", k_sema_wait);        R("sceKernelSignalSema", k_sema_signal);
     R("sceKernelPollSema", k_sema_poll);
     R("sceKernelGetModuleInfoForUnwind", k_get_module_info_for_unwind);   // C++ exception unwinding
+    // sceSysmoduleGetModuleInfoForUnwind (libSceSysmodule, NID 4fU5yvOkVG4): same contract — shadPS4's
+    // implementation just delegates to sceKernelGetModuleInfoForUnwind (sysmodule.cpp:31). It was an
+    // unimplemented stub returning 0 (= SUCCESS) with the caller's 0x130-byte info struct left
+    // uninitialized, so any exception unwound through a sysmodule-resolved frame read a garbage
+    // eh_frame_hdr — the same stack-smash failure mode the kernel variant had before it was implemented.
+    Hle::register_fn("4fU5yvOkVG4", (HleFn)k_get_module_info_for_unwind, "sceSysmoduleGetModuleInfoForUnwind");
     // Registration / hook / debug libkernel calls the app makes at startup that have no observable
     // effect in our headless boot — returning OK without side effects is the correct behavior:
     //  - SetThreadDtors / SetThreadAtexitCount / SetThreadAtexitReport: per-thread exit bookkeeping;
