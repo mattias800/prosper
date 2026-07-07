@@ -178,21 +178,25 @@ int main(int argc, char** argv) {
                 c[o++] = 0xe9;                                               // jmp addr+len
                 int32_t rel = (int32_t)((int64_t)(addr + len) - (int64_t)(uintptr_t)(c + o + 4));
                 memcpy(c + o, &rel, 4); o += 4;
-                // ret0: return a SLOWLY-incrementing counter as the "elapsed" value. A null/unstarted
-                // Stopwatch returning 0 makes Unity's async-integration time-budget never yield (it sees no
-                // time pass); returning rdtsc (huge) makes it always yield (starving integration -> the
-                // block-966 loader thrash). A small monotonic counter mimics a real running timer so the
-                // budget processes a sane amount per pass. PROSPER_NULLGUARD_STEP scales the increment
-                // (default 1). Counter lives at cave+0xF00 (zeroed by mmap); addressed via an imm64 (the
-                // cave is at 0x460000000, out of disp32 reach, so use a register).
-                long step = 1; if (const char* sv = getenv("PROSPER_NULLGUARD_STEP")) { long v = strtol(sv, nullptr, 0); if (v > 0) step = v; }
-                uint64_t counter_addr = (uint64_t)(uintptr_t)cave + 0xF00;
-                c[o++] = 0x48; c[o++] = 0xb8; memcpy(c + o, &counter_addr, 8); o += 8;  // mov rax, counter_addr
-                if (step == 1) { c[o++] = 0x48; c[o++] = 0xff; c[o++] = 0x00; }          // inc qword [rax]
-                else { c[o++] = 0x48; c[o++] = 0x81; c[o++] = 0x00;                        // add qword [rax], imm32
-                       int32_t s32 = (int32_t)step; memcpy(c + o, &s32, 4); o += 4; }
-                c[o++] = 0x48; c[o++] = 0x8b; c[o++] = 0x00;                             // mov rax, [rax]
-                c[o++] = 0xc3;                                                           // ret
+                // ret0: value returned for a null receiver. PROSPER_NULLGUARD_RET selects the model:
+                //   "tsc" (default) = raw rdtsc counter; "zero" = 0; "ms" = rdtsc>>22 (~milliseconds @4GHz).
+                // WHY it matters: if the guarded method is Unity's async-load time-budget Stopwatch, returning
+                // raw TSC cycles where the caller expects MILLISECONDS makes every elapsed check overshoot the
+                // budget -> it integrates 0 objects/frame -> the load stalls forever on a black screen. A
+                // scaled ~ms value lets the budget see plausible small elapsed and actually integrate.
+                const char* ngret = getenv("PROSPER_NULLGUARD_RET");
+                if (ngret && !strcmp(ngret, "zero")) {
+                    c[o++] = 0x31; c[o++] = 0xc0;                               // xor eax,eax  (rax=0)
+                    c[o++] = 0xc3;                                             // ret
+                } else {
+                    c[o++] = 0x0f; c[o++] = 0x31;                              // rdtsc  (edx:eax = tsc)
+                    c[o++] = 0x48; c[o++] = 0xc1; c[o++] = 0xe2; c[o++] = 0x20; // shl rdx, 32
+                    c[o++] = 0x48; c[o++] = 0x09; c[o++] = 0xd0;               // or rax, rdx
+                    if (ngret && !strcmp(ngret, "ms")) {
+                        c[o++] = 0x48; c[o++] = 0xc1; c[o++] = 0xe8; c[o++] = 0x16; // shr rax, 22 (~ns->ms scale)
+                    }
+                    c[o++] = 0xc3;                                             // ret
+                }
                 // Patch method entry: jmp cave (5 bytes). Remaining relocated bytes stay as harmless tail.
                 uint8_t* g = (uint8_t*)(uintptr_t)addr;
                 int32_t jrel = (int32_t)((int64_t)(uintptr_t)cave - (int64_t)(uintptr_t)(g + 5));

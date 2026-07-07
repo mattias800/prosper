@@ -228,7 +228,17 @@ HLE(k_attr_getstacksize) {
 }
 // scePthreadAttrGetaffinity(attr, SceKernelCpumask* mask): report all 8 PS5 cores available.
 // Returning 0 (the old stub) yields an EMPTY mask -> the guest may conclude no CPUs are usable.
-HLE(k_attr_getaffinity) { if (a1) *(uint64_t*)(uintptr_t)a1 = 0xff; return 0; }
+// PROSPER_ONE_CPU (default off): report a SINGLE core (0x01). Unity sizes its job-system worker
+// pool from the available-core mask; a 1-core mask makes it run jobs on the main thread instead of
+// spawning ~8 worker threads. That eliminates the async-load thread races (e.g. a WorkerThread whose
+// Stopwatch/+0x40 isn't created yet when the main thread times it — see docs/CUTSCENE_PROGRESSION.md).
+// CONFIDENCE: MED — the mask→worker-count coupling is the standard Unity behavior; gated so default
+// boot (0xff) is unchanged.
+HLE(k_attr_getaffinity) {
+    static const bool one = getenv("PROSPER_ONE_CPU") != nullptr;
+    if (a1) *(uint64_t*)(uintptr_t)a1 = one ? 0x01 : 0xff;
+    return 0;
+}
 
 // --- thread creation: run the guest entry on a real host thread (ABI matches) ---
 // We give each worker a stack we allocate and TRACK, so GC/thread-stack queries get
@@ -495,9 +505,13 @@ void exc_delivery_handler(int, siginfo_t* si, void* uc_) {
     WQ(0xF8, g[REG_RSP]);
     // Run the guest handler on this (the target) thread: handler(type, &mcontext). It captures
     // the registers, acks via SuspendSemaphore, and blocks on ResumeSemaphore until resumed.
-    if (g_exc_log) { const char m[] = "[exc] handler ENTER on target\n"; (void)!write(2, m, sizeof m - 1); }
+    // Log via raw SYS_write, NOT glibc write(): this handler keeps the GUEST %fs (to run the guest GC
+    // handler), and glibc's write() is a cancellation point whose prologue reads THREAD_SELF at %fs:0x10
+    // (== 0 on our guest TCB) and dereferences self->cancelhandling at +0x308 -> null+0x308 fault. The raw
+    // syscall touches no TLS. (This bit us only under PROSPER_SYNCLOG, but it was a latent guest-%fs landmine.)
+    if (g_exc_log) { const char m[] = "[exc] handler ENTER on target\n"; (void)syscall(SYS_write, 2, m, sizeof m - 1); }
     ((void (*)(uint64_t, void*))(uintptr_t)g_exc_handlers[type])((uint64_t)type, ctx);
-    if (g_exc_log) { const char m[] = "[exc] handler EXIT (resumed)\n";   (void)!write(2, m, sizeof m - 1); }
+    if (g_exc_log) { const char m[] = "[exc] handler EXIT (resumed)\n";   (void)syscall(SYS_write, 2, m, sizeof m - 1); }
     if (g_exc_log2) {
         uint64_t sfs = guest_fs_to_host_scoped();   // %fs-safe logging (see ENTER)
         char b[96]; int n = snprintf(b, sizeof b, "[exc2] RESUME tid=%ld type=%d\n",
