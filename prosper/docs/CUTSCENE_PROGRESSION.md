@@ -114,6 +114,38 @@ least two distinct corruption sources feeding the null-deref crashes; both must 
 cutscene. `PROSPER_NULL_PAGE` does not rescue these (the surviving faults include null writes / non-low
 addresses → uncaught SIGSEGV).
 
+## Handoff (2026-07-07, render-side agent) — the deser-null crash is in Unity's SerializedFile scene-load path
+
+Independently confirmed the two-root-cause picture and pinned the **deser-null** crash to Unity's
+scene-deserialization chain (not a missing HLE, not the render path). With the incremental-GC pump
+neutralized (`PROSPER_PATCH_RET=0x440005df0`), the game reaches scene activation and crashes at the
+getter with a **22-frame backtrace rooted in Unity's asset/serialized-file code**:
+
+```
+Il2cpp+0x1637697  (deref [null+0x20]; fault_addr=0x20)   rax=<real heap obj> rsi=1 rdx=1
+Il2cpp+0x175c99c  (the caller that passed the null object)
+Il2cpp+0x618556 → +0x617fff → +0x16ba41 → +0x16b981
+eboot +0xcc8e5f → 0xd36ebb → 0xce8671 → 0xce8eb3 → 0xce8593 → 0xd4f607 → 0xd4f3c7 → 0xb03e32 …
+```
+
+The `eboot+0xce8xxx / 0xd4fxxx / 0xb03e32` frames are the same Unity `SerializedFile`/`FileCacher`
+deserialization code family as `DESER_STALE_CACHE_BLOCK.md` — i.e. the scene deserializer produced a
+managed object with a null reference, and scene activation then dereferences it. So the pure remaining
+blocker is **deserialization correctness for the cutscene scene's assets**, not a Sony HLE gap.
+
+Ruled out this pass (evidence above / in `CUTSCENE_GC_ABORT.md`):
+- **No new unimplemented HLE fires at activation** — the last stubbed calls are all startup-time
+  (`libSceAmpr`/`Ajm`/`Ime`/`Agc`), so the `sceSystemServiceParamGetString`-style "missing HLE leaves a
+  buffer null" pattern does **not** apply to this null.
+- **The short-read fix (`read_full`, #39) does not remove it** — so this is a *different* corruption
+  source than short reads (candidate: a `FileCacher` stale/misordered block for a specific asset around
+  `resources.assets` block ~966, or a deser field-order/type mismatch; byte-diff the block-966 object
+  against the file like `DESER_STALE_CACHE_BLOCK.md` did).
+- **There is no cutscene frame to capture yet**: with the pump ret'd, over ~97 submits before the crash
+  only ONE carries draws (the loading-screen blit); the cutscene scene issues no draws before the deser
+  crash aborts activation. So reaching the cutscene visually is gated entirely on this deser fix (after
+  which the merged multi-draw executor renders the `mask=0`/`color0_base` cutscene draws).
+
 ## Next steps (for reaching the cutscene)
 
 1. **Resolve the scene-load deserialization corruption** (the `FileCacher` stale-block issue in
