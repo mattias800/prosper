@@ -247,9 +247,11 @@ int main(int argc, char** argv) {
                     }
                 }
                 if (getenv("PROSPER_GFXLOG")) fprintf(stderr,
-                    "[render] ps: topo=%u fmt=%u depth(test=%d write=%d op=%u) blend(en=%d src=%u dst=%u op=%u) mask=0x%x\n",
+                    "[render] ps: topo=%u fmt=%u depth(test=%d write=%d op=%u) blend(en=%d src=%u dst=%u op=%u) mask=0x%x "
+                    "vp(has=%d x=%.1f y=%.1f w=%.1f h=%.1f z=%.3f..%.3f)\n",
                     ps.topology, ps.color0_format, ps.depth_test_enable, ps.depth_write_enable, ps.depth_compare_op,
-                    ps.blend_enable, ps.src_color_blend_factor, ps.dst_color_blend_factor, ps.color_blend_op, ps.color_write_mask);
+                    ps.blend_enable, ps.src_color_blend_factor, ps.dst_color_blend_factor, ps.color_blend_op, ps.color_write_mask,
+                    ps.has_viewport, ps.viewport_x, ps.viewport_y, ps.viewport_w, ps.viewport_h, ps.min_depth, ps.max_depth);
                 // PROSPER_RENDER_NOPS: bypass the game's resolved pipeline state (default state instead) to
                 // isolate whether blend/depth/color-mask is discarding the fragments.
                 const prosper::gpu::ResolvedPipelineState* ps_use = getenv("PROSPER_RENDER_NOPS") ? nullptr : &ps;

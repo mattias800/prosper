@@ -45,6 +45,20 @@ int main() {
     ResolvedPipelineState def = resolve_pipeline_state(RenderState{});
     CHECK(def.topology == 0 && def.color0_format == 0 && !def.blend_enable && !def.depth_test_enable,
           "empty render-state resolves to a safe default pipeline");
+    CHECK(!def.has_viewport, "empty render-state has no guest viewport (backend keeps full-target default)");
+
+    // GNM-style 1080p viewport: xscale=960 xoffset=960, yscale=-540 yoffset=540 (+Y-up NDC). Resolves to
+    // the Vulkan FLIPPED viewport {x=0, y=1080, w=1920, h=-1080} (negative height = core-1.1 Y flip).
+    RenderState vv;
+    vv.vport_xscale = 960.0f;  vv.vport_xoffset = 960.0f;
+    vv.vport_yscale = -540.0f; vv.vport_yoffset = 540.0f;
+    vv.vport_zscale = 1.0f;    vv.vport_zoffset = 0.0f;
+    ResolvedPipelineState vp = resolve_pipeline_state(vv);
+    CHECK(vp.has_viewport, "programmed PA_CL_VPORT -> has_viewport");
+    CHECK(vp.viewport_x == 0.0f && vp.viewport_w == 1920.0f, "xscale/xoffset 960/960 -> x=0 w=1920");
+    CHECK(vp.viewport_y == 1080.0f && vp.viewport_h == -1080.0f,
+          "negative yscale (-540, +Y-up NDC) -> flipped Vulkan viewport y=1080 h=-1080");
+    CHECK(vp.min_depth == 0.0f && vp.max_depth == 1.0f, "zscale/zoffset 1/0 -> depth range 0..1");
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");

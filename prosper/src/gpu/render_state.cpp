@@ -2,6 +2,8 @@
 #include "render_state.hpp"
 #include "pm4_registers.hpp"
 #include "vk_translate.hpp"
+#include <algorithm>
+#include <cstring>
 
 namespace prosper::gpu {
 
@@ -18,6 +20,13 @@ uint32_t rd(const std::unordered_map<uint32_t, uint32_t>& file, uint32_t off) {
 // GraphicsRun.cpp (`(lo<<8) | ((hi&0xff)<<40)`).
 uint64_t addr_of(uint32_t lo, uint32_t hi) {
     return (static_cast<uint64_t>(lo) << 8) | (static_cast<uint64_t>(hi & 0xffu) << 40);
+}
+
+// PA_CL_VPORT_* registers hold IEEE-754 floats.
+float flt(uint32_t bits) {
+    float f;
+    std::memcpy(&f, &bits, sizeof f);
+    return f;
 }
 }  // namespace
 
@@ -62,6 +71,14 @@ RenderState extract_render_state(const GpuState& st) {
     rs.cb_blend0_control = bc;
     rs.cb_target_mask    = rd(st.cx, P::CB_TARGET_MASK);
 
+    // Viewport 0 transform (guest floats; all-zero when never programmed).
+    rs.vport_xscale  = flt(rd(st.cx, P::PA_CL_VPORT_XSCALE));
+    rs.vport_xoffset = flt(rd(st.cx, P::PA_CL_VPORT_XOFFSET));
+    rs.vport_yscale  = flt(rd(st.cx, P::PA_CL_VPORT_YSCALE));
+    rs.vport_yoffset = flt(rd(st.cx, P::PA_CL_VPORT_YOFFSET));
+    rs.vport_zscale  = flt(rd(st.cx, P::PA_CL_VPORT_ZSCALE));
+    rs.vport_zoffset = flt(rd(st.cx, P::PA_CL_VPORT_ZOFFSET));
+
     return rs;
 }
 
@@ -83,6 +100,24 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
     // CB_TARGET_MASK holds a 4-bit write mask per MRT; MRT0 is bits [3:0]. RDNA2's R/G/B/A bit order
     // matches VkColorComponentFlags (R=1,G=2,B=4,A=8), so the nibble maps 1:1.
     ps.color_write_mask = rs.cb_target_mask & 0xFu;
+
+    // Viewport: hardware maps screen = offset + scale * ndc; Vulkan maps px = (x + w/2) + ndc * (w/2).
+    // Equating the two: x = xoffset - xscale, w = 2*xscale (same for y). A guest with GNM's +Y-up NDC
+    // programs a NEGATIVE yscale, which lands here as a negative-height Vulkan viewport (core 1.1) —
+    // the exact hardware Y orientation, with no flip heuristics. Depth: hw z = zoffset + zscale * ndc_z
+    // and Vulkan z = min + ndc_z * (max - min), so min = zoffset, max = zoffset + zscale (clamped to
+    // Vulkan's required [0,1]; a zero zscale/zoffset pair means "never programmed" -> default 0..1).
+    if (rs.vport_xscale != 0.0f && rs.vport_yscale != 0.0f) {
+        ps.has_viewport = true;
+        ps.viewport_x   = rs.vport_xoffset - rs.vport_xscale;
+        ps.viewport_w   = 2.0f * rs.vport_xscale;
+        ps.viewport_y   = rs.vport_yoffset - rs.vport_yscale;
+        ps.viewport_h   = 2.0f * rs.vport_yscale;
+        if (rs.vport_zscale != 0.0f || rs.vport_zoffset != 0.0f) {
+            ps.min_depth = std::clamp(rs.vport_zoffset, 0.0f, 1.0f);
+            ps.max_depth = std::clamp(rs.vport_zoffset + rs.vport_zscale, 0.0f, 1.0f);
+        }
+    }
 
     return ps;
 }
