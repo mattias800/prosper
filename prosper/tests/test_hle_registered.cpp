@@ -36,6 +36,9 @@ int main() {
         "sceSystemServiceHideSplashScreen",
         // graphics (headless bring-up)
         "sceVideoOutOpen", "sceVideoOutSubmitFlip", "sceVideoOutGetFlipStatus",
+        // audio (headless / pluggable backend)
+        "sceAudioOutInit", "sceAudioOutOpen", "sceAudioOutOutput", "sceAudioOutOutputs",
+        "sceAudioOutSetVolume", "sceAudioOutClose", "sceAudioOutGetPortState",
     };
     for (const char* n : names) must(n);
     // sync_on_address futex is registered by raw NID (no symbol name) — check it directly.

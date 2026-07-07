@@ -45,6 +45,8 @@ void register_service_hle();
 void register_pad_hle();
 // Headless graphics bring-up (libSceAgc/libSceVideoOut placeholders); see hle_graphics.cpp.
 void register_graphics_hle();
+// libSceAudioOut HLE backed by a pluggable, headless AudioSink; see hle_audio.cpp / audio.hpp.
+void register_audio_hle();
 // libSceAgc "Gen5" Draw Command Buffer HLE (real PM4-building Dcb functions); see hle_agc.cpp.
 // Call AFTER register_graphics_hle so these override the observe-only glog stubs.
 void register_agc_hle();

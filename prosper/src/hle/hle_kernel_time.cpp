@@ -115,6 +115,10 @@ namespace {
     // ComputeN ring id). Filter GraphicsCore=-14 (shadPS4 equeue.h).
     constexpr int16_t EVFILT_GRAPHICS_CORE = -14;
     std::vector<FlipReg> g_eop_regs;   // same (eq,id,udata) shape
+    // Registered user-event sources: (eq,id,udata) the game added via sceKernelAddUserEvent and may later
+    // trigger. Declared here (before the pump) so the diagnostic PROSPER_PUMP_USEREV heartbeat can fire them.
+    struct UserReg { uint64_t eq; int64_t id; uint64_t udata; };
+    std::vector<UserReg> g_user_regs;   // guarded by g_eq_mx
     std::atomic<bool> g_pump_started{false};
 
     EqState* eq_find(uint64_t eq) { std::lock_guard<std::mutex> lk(g_eq_mx); auto it = g_eqs.find(eq); return it == g_eqs.end() ? nullptr : it->second; }
@@ -133,6 +137,14 @@ namespace {
             { std::lock_guard<std::mutex> lk(g_eq_mx); fr = g_flip_regs; vr = g_vblank_regs; }
             for (auto& r : vr) { SceKEvent e{}; e.ident = r.ident; e.filter = EVFILT_VIDEO_OUT; e.data = (int64_t)frame; e.udata = r.udata; eq_post(r.eq, e); }
             for (auto& r : fr) { SceKEvent e{}; e.ident = r.ident; e.filter = EVFILT_VIDEO_OUT; e.data = (int64_t)frame; e.udata = r.udata; eq_post(r.eq, e); }
+            // PROSPER_PUMP_USEREV: heartbeat-fire registered user events. Some engines run a worker thread
+            // that blocks on a user event (Unity's FTM queue: user event id=999) waiting for the producer
+            // to signal work; if the producer path isn't reached, that thread starves and the game idles.
+            // Firing it each vblank tests whether waking that consumer lets the game progress to real draws.
+            if (getenv("PROSPER_PUMP_USEREV")) {
+                std::vector<UserReg> ur; { std::lock_guard<std::mutex> lk(g_eq_mx); ur = g_user_regs; }
+                for (auto& r : ur) { SceKEvent e{}; e.ident = r.id; e.filter = -11 /*EVFILT_USER*/; e.udata = r.udata; eq_post(r.eq, e); }
+            }
         }
     }
     void ensure_pump() { if (!g_pump_started.exchange(true)) std::thread(vblank_pump).detach(); }
@@ -178,6 +190,48 @@ HLE(k_eq_wait)   {   // (eq, SceKernelEvent* ev, int num, int* out, SceKernelUse
     if (evlog()) fprintf(stderr, "[ev] WaitEqueue eq=0x%llx num=%llu timeout=%s ra=eboot+0x%llx\n",
         (unsigned long long)a0, (unsigned long long)a2, a4 ? "yes" : "inf",
         (unsigned long long)((uint64_t)__builtin_return_address(0) - 0x400000000ull));
+    // PROSPER_WAITCALLER: scan the stack for the GAME's wait-loop return address (eboot code range,
+    // NOT the stub region at 0x6..) so we can disassemble the loop's exit condition. Log once per eq.
+    // PROSPER_DUMPCODE=<hex eboot offset>[,<off2>...]: dump 224 code bytes at each (guest memory is mapped),
+    // so a game function reached from the wait loop can be disassembled offline. Runs once.
+    if (const char* dc = getenv("PROSPER_DUMPCODE")) {
+        static std::atomic<int> once{0};
+        if (once.fetch_add(1) == 0) {
+            const char* p = dc;
+            while (*p) {
+                uint64_t off = strtoull(p, nullptr, 16);
+                const uint8_t* code = (const uint8_t*)(uintptr_t)(0x400000000ull + off);
+                fprintf(stderr, "[dumpcode] eboot+0x%llx:", (unsigned long long)off);
+                for (int b = 0; b < 224; b++) fprintf(stderr, "%02x", code[b]);
+                fprintf(stderr, "\n");
+                const char* c = strchr(p, ','); if (!c) break; p = c + 1;
+            }
+        }
+    }
+    if (getenv("PROSPER_WAITCALLER")) {
+        static std::atomic<int> shown{0};
+        if (shown.fetch_add(1) < 4) {
+            uint64_t* sp = (uint64_t*)__builtin_frame_address(0);
+            for (int i = 0; i < 80; i++) {
+                uint64_t v = sp[i];
+                if (v < 0x400000000ull || v >= 0x4c0000000ull) continue;   // eboot / IL2CPP executable range
+                // PRECISE: a genuine caller is a return address whose preceding 5 bytes are `call rel32`
+                // (0xe8) targeting the STUB region (0x6..) — i.e. the game's actual import call site, not an
+                // unrelated eboot address that happens to be on the stack (e.g. a Vorbis-decode frame).
+                const uint8_t* pre = (const uint8_t*)(uintptr_t)(v - 5);
+                if (pre[0] != 0xe8) continue;
+                int32_t rel = *(const int32_t*)(pre + 1);
+                uint64_t target = v + (uint64_t)(int64_t)rel;
+                if (target < 0x600000000ull || target >= 0x700000000ull) continue;   // must call a stub
+                fprintf(stderr, "[waitcaller] stack[%d] eboot+0x%llx -> stub+0x%llx | loopcode:", i,
+                        (unsigned long long)(v - 0x400000000ull), (unsigned long long)(target - 0x600000000ull));
+                const uint8_t* code = (const uint8_t*)(uintptr_t)(v - 0x18);
+                for (int b = 0; b < 0x40; b++) fprintf(stderr, "%02x", code[b]);
+                fprintf(stderr, "\n");
+            }
+            fprintf(stderr, "[waitcaller] ---\n");
+        }
+    }
     EqState* s = eq_find(a0);
     int num = (int)a2; if (num < 1) num = 1;
     if (!s) { struct timespec ts{ 0, 1000000 }; nanosleep(&ts, nullptr); if (a3) *(int32_t*)P(a3) = 0; return 0; }
@@ -185,8 +239,15 @@ HLE(k_eq_wait)   {   // (eq, SceKernelEvent* ev, int num, int* out, SceKernelUse
     if (s->ready.empty()) {
         // timeout arg is a pointer to micro-seconds (null = wait forever). Cap the wait so a headless
         // run never hard-blocks the guest thread even if no source is registered yet.
-        uint64_t us = a4 ? *(uint32_t*)P(a4) : 100000;
-        if (us > 100000) us = 100000;
+        uint64_t req = a4 ? *(uint32_t*)P(a4) : 100000;
+        // PROSPER_WAITCAP: cap the empty-queue wait (µs). Our 60 Hz pump posts a flip/vblank event every
+        // ~16 ms, so a >16 ms cap makes an event-DRAIN loop (while WaitEqueue keeps returning events) never
+        // reach the empty state → the guest's frame loop stalls draining pumped events. A sub-vblank cap
+        // (e.g. 8 ms) lets an empty drain time out (0 events) so the guest exits the drain and renders.
+        uint64_t cap = getenv("PROSPER_WAITCAP") ? (uint64_t)atoll(getenv("PROSPER_WAITCAP")) : 100000;
+        uint64_t us = req; if (us > cap) us = cap;
+        if (evlog()) fprintf(stderr, "[ev]   WAIT.empty req=%lluus cap=%lluus\n",
+                             (unsigned long long)req, (unsigned long long)cap);
         s->cv.wait_for(lk, std::chrono::microseconds(us), [&]{ return !s->ready.empty(); });
     }
     int n = 0; auto* ev = (SceKEvent*)P(a1);
@@ -212,10 +273,7 @@ HLE(k_eq_getcount){
 namespace {
     constexpr int16_t EVFILT_USER  = -11;
     constexpr int16_t EVFILT_TIMER = -7;
-    // Registered user-event sources: (eq,id) the game added and may later trigger. udata is captured
-    // at registration and echoed on trigger (matches orbis semantics where udata is bound at add-time).
-    struct UserReg { uint64_t eq; int64_t id; uint64_t udata; };
-    std::vector<UserReg> g_user_regs;   // guarded by g_eq_mx
+    // (UserReg / g_user_regs are declared above, before the vblank pump.)
 }
 HLE(k_add_user_event) {   // (eq, id, udata?) — register a user event source on the equeue
     { std::lock_guard<std::mutex> lk(g_eq_mx); g_user_regs.push_back({ a0, (int64_t)a1, a2 }); }

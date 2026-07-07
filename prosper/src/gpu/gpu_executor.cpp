@@ -63,16 +63,21 @@ bool guest_readable(uint64_t, uint32_t) { return true; }
 // VertexBuffer keyed by sgpr_base so the recompiler's by_sgpr_base() resolves it. Uniform-scalar only: any
 // value that would depend on a VGPR/lane is left unknown (the op's dest becomes unknown), so we never
 // fabricate a per-lane-dependent descriptor. CONFIDENCE: MED (covers this game's fetch-shader shape).
-std::unordered_map<int, DecodedBufferDescriptor>
+// One resolved vertex fetch: the exact fetch instruction (pc), its SRSRC SGPR, and the V# live in that
+// SGPR at that instruction. Emitted per-fetch so a reloaded SRSRC (one V# per attribute) doesn't collapse.
+struct DynFetch { uint32_t fetch_pc; int srsrc; DecodedBufferDescriptor desc; uint32_t desc_v3; };
+
+std::vector<DynFetch>
 resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_sgprs, uint32_t nsgpr,
                       uint32_t user_sgpr_base) {
-    std::unordered_map<int, DecodedBufferDescriptor> out;
+    std::vector<DynFetch> out;
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
 
     const bool trc = getenv("PROSPER_DYNTRACE") != nullptr;
     std::unordered_map<int, uint32_t> val;                 // known concrete SGPR values (by SHADER SGPR #)
     std::unordered_map<int, std::array<uint32_t, 4>> descr; // SGPR -> the 4-dword V# it holds (load-time snapshot)
+    int scc = -1;   // tracked SCC (-1 unknown): set by s_cmp_*, consumed by s_cselect (the format patch's tail)
     // The SPI loads the user-data block starting at shader SGPR `user_sgpr_base` (s0..s7 are NGG system
     // SGPRs). So user-data block index k lands in shader SGPR (user_sgpr_base + k).
     for (uint32_t i = 0; i < nsgpr; i++) val[(int)(user_sgpr_base + i)] = user_sgprs[i];
@@ -107,6 +112,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 ka = (in.src[0].kind == OperandKind::Literal) ? (a = in.literal, true) : srcval(in.src[0], a);
                 kc = (in.src[1].kind == OperandKind::Literal) ? (c = in.literal, true) : srcval(in.src[1], c);
                 int d = in.dst.value; bool ok = ka && kc; uint32_t r = 0;
+                uint32_t hi64 = 0; bool wrote_pair = false;
                 if (ok) switch (in.opcode) {
                     case 0x00: case 0x02: r = a + c; break;                 // s_add_u32 / s_add_i32
                     case 0x01: case 0x03: r = a - c; break;                 // s_sub_u32 / s_sub_i32
@@ -119,9 +125,46 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     case 0x31: r = (a << 4) + c; break;                     // s_lshl4_add_u32
                     case 0x27: { uint32_t off = c & 0x1f, wid = (c >> 16) & 0x7f;   // s_bfe_u32
                                  r = wid == 0 ? 0 : (wid >= 32 ? (a >> off) : ((a >> off) & ((1u << wid) - 1))); break; }
+                    case 0x0A:   // s_cselect_b32: dst = SCC ? src0 : src1 (the vertex-fetch format patch's tail)
+                        if (scc < 0) ok = false; else r = scc ? a : c;
+                        break;
+                    case 0x29: {  // s_bfe_u64: dst[63:0] = bitfield of src0[63:0] (format patch reads a small field)
+                        uint32_t off = c & 0x3f, wid = (c >> 16) & 0x7f, ahi = 0;
+                        uint64_t src64 = (uint64_t)a | ((uint64_t)(known(in.src[0].value + 1, ahi) ? ahi : 0u) << 32);
+                        uint64_t res = wid == 0 ? 0 : (wid >= 64 ? (src64 >> off) : ((src64 >> off) & (((uint64_t)1 << wid) - 1)));
+                        r = (uint32_t)res; hi64 = (uint32_t)(res >> 32); wrote_pair = true; break;
+                    }
                     default: ok = false; break;                            // SCC-dependent / unmodeled -> unknown
                 }
-                if (ok) val[d] = r; else val.erase(d);
+                // Every SOP2 ALU op except s_cselect writes SCC to a value we don't track here — invalidate so a
+                // later s_cselect only trusts SCC set by an immediately-preceding s_cmp.
+                if (trc && in.pc < 170 && (d == 60 || d == 62 || d == 63 || d == 106 || d == 107 || d == 11))
+                    fprintf(stderr, "[dyntrace]   SOP2 pc=%u op=0x%x dst=s%d src0=%d(k%d) src1=%d(k%d) ok=%d r=0x%x\n",
+                            in.pc, in.opcode, d, in.src[0].value, ka, in.src[1].value, kc, ok, r);
+                if (in.opcode != 0x0A) scc = -1;
+                if (ok) { val[d] = r; if (wrote_pair) val[d + 1] = hi64; }
+                else    { val.erase(d); if (wrote_pair) val.erase(d + 1); }
+                break;
+            }
+            case Rdna2Format::SOPC: {   // scalar compare -> SCC (feeds the format patch's s_cselect)
+                uint32_t a, c;
+                bool ka = (in.src[0].kind == OperandKind::Literal) ? (a = in.literal, true) : srcval(in.src[0], a);
+                bool kc = (in.src[1].kind == OperandKind::Literal) ? (c = in.literal, true) : srcval(in.src[1], c);
+                if (ka && kc) switch (in.opcode) {
+                    case 0x00: scc = (a == c); break;                            // s_cmp_eq_i32
+                    case 0x01: scc = (a != c); break;                            // s_cmp_lg_i32
+                    case 0x02: scc = ((int32_t)a >  (int32_t)c); break;          // s_cmp_gt_i32
+                    case 0x03: scc = ((int32_t)a >= (int32_t)c); break;          // s_cmp_ge_i32
+                    case 0x04: scc = ((int32_t)a <  (int32_t)c); break;          // s_cmp_lt_i32
+                    case 0x05: scc = ((int32_t)a <= (int32_t)c); break;          // s_cmp_le_i32
+                    case 0x06: scc = (a == c); break;                            // s_cmp_eq_u32
+                    case 0x07: scc = (a != c); break;                            // s_cmp_lg_u32
+                    case 0x08: scc = (a >  c); break;                            // s_cmp_gt_u32
+                    case 0x09: scc = (a >= c); break;                            // s_cmp_ge_u32
+                    case 0x0A: scc = (a <  c); break;                            // s_cmp_lt_u32
+                    case 0x0B: scc = (a <= c); break;                            // s_cmp_le_u32
+                    default: scc = -1; break;
+                } else scc = -1;
                 break;
             }
             case Rdna2Format::SMEM: {
@@ -162,14 +205,23 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // V# most-recently loaded into it.
                 if (in.opcode <= 3) {
                     int srsrc = in.src[1].value;
+                    // Prefer the FETCH-TIME V#: the fetch shader patches the descriptor's format field (v[3])
+                    // between load and fetch — so read the CURRENT SGPR values (which the interpreter has
+                    // tracked through the patch, incl. the s_cselect tail) to get the real data format (e.g.
+                    // UNORM8 for a packed vertex color, vs the load-time Unknown). Fall back to the load-time
+                    // snapshot if the patched dwords aren't fully known.
+                    uint32_t vv[4]; bool k0 = known(srsrc, vv[0]), k1 = known(srsrc + 1, vv[1]),
+                                         k2 = known(srsrc + 2, vv[2]), k3 = known(srsrc + 3, vv[3]);
+                    bool patched = k0 && k1 && k2 && k3;
                     auto it = descr.find(srsrc);
-                    if (trc) fprintf(stderr, "[dyntrace] MUBUF fetch op=0x%x SRSRC=s%d have_descr=%d\n",
-                                     in.opcode, srsrc, it != descr.end());
-                    // Keep the FIRST fetch's V# per SRSRC: the SGPR is reloaded with a different V# between
-                    // fetches (one per vertex attribute), and the position (visible geometry) comes from
-                    // the first fetch. (A later increment can key each fetch to its own V#.)
-                    if (it != descr.end() && out.find(srsrc) == out.end())
-                        out[srsrc] = decode_buffer_descriptor(it->second.data());
+                    if (trc) fprintf(stderr, "[dyntrace] MUBUF fetch pc=%u op=0x%x SRSRC=s%d patched=%d (k=%d%d%d%d v3=0x%x) have_descr=%d\n",
+                                     in.pc, in.opcode, srsrc, patched, k0, k1, k2, k3, k3 ? vv[3] : 0, it != descr.end());
+                    // Per-fetch: record THIS fetch's live V# (the SRSRC SGPR is reloaded with a different V#
+                    // per vertex attribute — position, uv, color…). Keyed by the fetch's pc so the recompiler
+                    // resolves each buffer_load_format to the descriptor as loaded at that instruction.
+                    if (patched)          out.push_back({ in.pc, srsrc, decode_buffer_descriptor(vv), vv[3] });
+                    else if (it != descr.end())
+                        out.push_back({ in.pc, srsrc, decode_buffer_descriptor(it->second.data()), it->second[3] });
                 }
                 break;
             }
@@ -251,7 +303,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
     // Bindless-dynamic vertex fetch (VS): const-fold the scalar setup to resolve each buffer_load_format's
     // V#, then emit it as a VertexBuffer keyed by its SRSRC SGPR so the recompiler's by_sgpr_base resolves
     // it. Only meaningful for the vertex stage (the PS has no vertex fetch).
-    std::unordered_map<int, DecodedBufferDescriptor> dyn_vb;
+    std::vector<DynFetch> dyn_vb;
     if (!is_ps) {
         uint32_t sgprs[kUserSgprs]; read_user_sgprs(st.sh, bases[0], sgprs);
         // NGG merged VS/GS: s0..s7 are system SGPRs, user data starts at s8 (confirmed by matching the
@@ -260,11 +312,14 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
         if (getenv("PROSPER_GFXLOG") || getenv("PROSPER_RESDUMP")) {
             fprintf(stderr, "[dynvb] VS resolved %zu dynamic vertex-fetch descriptor(s):\n", dyn_vb.size());
             for (auto& kv : dyn_vb) {
-                const auto& d = kv.second;
-                fprintf(stderr, "[dynvb]   SRSRC s%d -> base=0x%llx stride=%u num_records=%u size=%u fmt=%u nc=%u\n",
-                        kv.first, (unsigned long long)d.base, d.stride, d.num_records, d.size_bytes,
+                const auto& d = kv.desc;
+                fprintf(stderr, "[dynvb]   pc=%u SRSRC s%d -> base=0x%llx stride=%u num_records=%u size=%u fmt=%u nc=%u\n",
+                        kv.fetch_pc, kv.srsrc, (unsigned long long)d.base, d.stride, d.num_records, d.size_bytes,
                         (unsigned)d.format, d.num_components);
-                if (guest_readable(d.base, 64)) {   // first 2 vertices as floats to see if positions vary
+                if (guest_readable(d.base, 64)) {   // raw dwords of vertex 0 (to read packed formats) + floats
+                    const uint32_t* u = (const uint32_t*)(uintptr_t)d.base;
+                    fprintf(stderr, "[dynvb]     v3fmt=0x%x  raw v0: %08x %08x %08x %08x\n",
+                            kv.desc_v3, u[0], u[1], u[2], u[3]);
                     const float* f = (const float*)(uintptr_t)d.base;
                     fprintf(stderr, "[dynvb]     v0: %.3f %.3f %.3f %.3f | v1(@stride): %.3f %.3f %.3f %.3f\n",
                             f[0], f[1], f[2], f[3],
@@ -288,7 +343,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
         // at runtime by the fetch shader (so the load-time snapshot reads Unknown) — default to Float32
         // (a raw 32-bit-per-component fetch, correct for float attributes like positions).
         for (auto& kv : dyn_vb) {
-            const auto& d = kv.second;
+            const auto& d = kv.desc;
             ShaderResource r;
             r.cls           = ResourceClass::VertexBuffer;
             r.format        = (d.format == DataFormat::Unknown) ? DataFormat::Float32 : d.format;
@@ -296,7 +351,8 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
             r.gpu_addr      = d.base;
             r.size          = d.size_bytes ? d.size_bytes : (d.stride ? d.stride * 4 : 128);
             r.stride        = d.stride;
-            r.sgpr_base     = kv.first;           // DIRECT provenance = the fetch's SRSRC SGPR
+            r.sgpr_base     = kv.srsrc;           // DIRECT provenance = the fetch's SRSRC SGPR (fallback)
+            r.fetch_pc      = kv.fetch_pc;        // PER-FETCH provenance = the exact fetch instruction
             r.srt_offset    = 0xFFFFFFFFu;
             t.resources.push_back(r);
         }

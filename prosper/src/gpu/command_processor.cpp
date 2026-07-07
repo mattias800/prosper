@@ -5,8 +5,31 @@
 #include <cstdio>
 #include <cstring>
 #include <chrono>
+#include <climits>
+#if defined(__linux__)
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <linux/futex.h>
+#endif
 
 namespace prosper::gpu {
+
+// Wake any thread blocked in sync_on_address (a futex) on `addr`. A GPU completion label write only
+// changes memory; a futex waiter does NOT wake on a value change — it needs an explicit FUTEX_WAKE. The
+// game's render/producer threads sync_on_address on the very labels the GPU writes via RELEASE_MEM /
+// WRITE_DATA, so without this wake they block forever on already-satisfied semaphores (the documented
+// 3-thread render deadlock — see hle_kernel_mem.cpp). This provides that missing GPU-completion wake.
+// CONFIDENCE: HIGH (matches the futex model of sceKernelWaitOnAddress; guest+host share the address space).
+static void wake_on_label(uint64_t addr) {
+#if defined(__linux__)
+    if (!addr) return;
+    syscall(SYS_futex, (uint32_t*)(uintptr_t)addr, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, INT_MAX, nullptr, nullptr, 0);
+    // 64-bit labels: a waiter may block on the high dword too.
+    syscall(SYS_futex, (uint32_t*)(uintptr_t)(addr + 4), FUTEX_WAKE | FUTEX_PRIVATE_FLAG, INT_MAX, nullptr, nullptr, 0);
+#else
+    (void)addr;
+#endif
+}
 
 // Disabled only for bring-up bisection. Honoring the Dcb's memory writes is correct default behavior:
 // because our CommandProcessor folds each submit synchronously, the pipe has "drained" by the time we
@@ -34,11 +57,16 @@ static void honor_eop_write(const Pm4Command& c) {
         case 1: { uint32_t v = (uint32_t)c.rel_value; memcpy(dst, &v, sizeof v); break; }
         case 2: { uint64_t v = c.rel_value;           memcpy(dst, &v, sizeof v); break; }
         case 3: { uint64_t v = gpu_clock64();         memcpy(dst, &v, sizeof v); break; }
-        default: return;   // None / unsupported: nothing to write
+        // A RELEASE_MEM ALWAYS writes a completion fence — that's its purpose. Our stack-arg ABI
+        // extraction can mis-read data_sel (it arrives as a pointer, not the 1/2/3 enum), so don't SKIP the
+        // write on an unrecognized selector: default to the 64-bit value. Skipping it starved the render
+        // thread's completion wait and stalled the frame loop after the first real draw. CONFIDENCE: MED.
+        default: { uint64_t v = c.rel_value;          memcpy(dst, &v, sizeof v); break; }
     }
     if (getenv("PROSPER_GFXLOG"))
         fprintf(stderr, "[agc]   EOP write [0x%llx] data_sel=%u value=0x%llx\n",
                 (unsigned long long)c.rel_addr, c.rel_data_sel, (unsigned long long)c.rel_value);
+    wake_on_label(c.rel_addr);   // wake any sync_on_address futex waiter on this completion label
 }
 
 // Honor a WRITE_DATA packet: copy the inline dwords to the destination address (same synchronous timing).
@@ -48,6 +76,7 @@ static void honor_write_data(const Pm4Command& c) {
     if (getenv("PROSPER_GFXLOG"))
         fprintf(stderr, "[agc]   WriteData [0x%llx] %u dwords (first=0x%08x)\n",
                 (unsigned long long)c.wd_addr, c.wd_num, c.wd_data[0]);
+    wake_on_label(c.wd_addr);   // wake any sync_on_address futex waiter on this written label
 }
 
 void GpuState::apply(const Pm4Command& c) {
