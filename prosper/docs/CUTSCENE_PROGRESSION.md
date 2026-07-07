@@ -68,3 +68,36 @@ PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_PREADLOG=1 \
   ./build/boot_trace /path/to/PPSA24651-app0
 # watch resources.assets block offsets climb, then a main-thread SIGSEGV in the Il2cpp+0x49d1 chain.
 ```
+
+## Follow-up (2026-07-07, second pass) — the wall is the GC stop-the-world race; it fires BEFORE scene-activation
+
+Confirmed the "remaining Il2cpp crash" is the same **IL2CPP Boehm-GC `ABORT("Unexpected state")`**
+documented in `CUTSCENE_GC_ABORT.md` (fault `rip=libc.prx+0x4a20` = `int 0x45 ; ud2`; abort arg
+`rdi -> "Unexpected state"`; call chain `Il2cpp+0x5428 → +0x4a6f → +0x49d1`, identical registers
+every run). It is a **timing-sensitive stop-the-world race** during the cutscene's asset-load
+allocation storm, and it fires **before the scene activates** — so the cutscene is never drawn,
+regardless of how deep the asset stream gets.
+
+Measured behavior (this pass):
+- **Deep survival is timing-dependent, not progress-dependent.** Plain run: crashes after ~2
+  `resources.assets` reads. With `PROSPER_PREADLOG=1` (heavy per-read logging = serialization):
+  **144 reads, block 2916** before the *same* GC abort. Adding/removing `PROSPER_PAD_PRESS` does
+  not change the early crash. The extra serialization just shifts the race window — it does not
+  eliminate it, and the scene still never activates.
+- **The synchronous 1080p render makes it worse.** `execute_and_present` blocks the guest submit
+  thread ~15 s inside host Vulkan; while blocked there the GC's stop-the-world can't get that
+  thread's ack → earlier crash (~350 submits at full res). `PROSPER_RENDER_SCALE=6` (~0.5 s
+  render) pushes that to ~2640 submits — but every captured frame is still the **title composite**
+  (the scene never activated), then the same GC abort.
+- **The guest scanout buffer is empty** (`PROSPER_DUMP_SCANOUT`, all-zero to flip #2700): our
+  renderer targets a Vulkan image, not guest memory, so there is no cheap non-render capture path.
+
+Attempted and ruled out this pass (details in `CUTSCENE_GC_ABORT.md`): TSD-exit-`%fs`, GC-handler
+guest-`%fs`, and env-based GC-disable (both env delivery paths blocked). A **short-read fix**
+(`read_full`, this branch) is a real correctness bug on the asset-streaming path but does not
+remove the GC abort.
+
+**Bottom line:** reaching the cutscene visually requires fixing the GC stop-the-world race
+(top open lead: a Unity job-worker created/exiting *during* a stop-the-world — see
+`CUTSCENE_GC_ABORT.md`), AND then the per-draw/multi-draw executor (PR #31) to render the
+cutscene's `mask=0`/`color0_base=0` draws. Neither is a small change.
