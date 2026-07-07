@@ -57,7 +57,11 @@ static void honor_eop_write(const Pm4Command& c) {
         case 1: { uint32_t v = (uint32_t)c.rel_value; memcpy(dst, &v, sizeof v); break; }
         case 2: { uint64_t v = c.rel_value;           memcpy(dst, &v, sizeof v); break; }
         case 3: { uint64_t v = gpu_clock64();         memcpy(dst, &v, sizeof v); break; }
-        default: return;   // None / unsupported: nothing to write
+        // A RELEASE_MEM ALWAYS writes a completion fence — that's its purpose. Our stack-arg ABI
+        // extraction can mis-read data_sel (it arrives as a pointer, not the 1/2/3 enum), so don't SKIP the
+        // write on an unrecognized selector: default to the 64-bit value. Skipping it starved the render
+        // thread's completion wait and stalled the frame loop after the first real draw. CONFIDENCE: MED.
+        default: { uint64_t v = c.rel_value;          memcpy(dst, &v, sizeof v); break; }
     }
     if (getenv("PROSPER_GFXLOG"))
         fprintf(stderr, "[agc]   EOP write [0x%llx] data_sel=%u value=0x%llx\n",
