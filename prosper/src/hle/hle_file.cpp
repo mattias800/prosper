@@ -183,13 +183,39 @@ HLE(f_open)  { std::string h = translate(CS(a0)); int fd = (int)::open(h.c_str()
                if (fd >= 0) preadlog("open", (uint64_t)fd, 0, 0); return (uint64_t)(int64_t)fd; }
 HLE(f_close) { if (a0 < 3) { preadlog("close-lo-ignored", a0, 0, 0); return 0; }
                preadlog("close", a0, 0, 0); return (uint64_t)(int64_t)::close((int)a0); }
+#ifndef _WIN32
+// FULL read: loop until `count` bytes are read (or EOF/error). POSIX read()/pread() may return FEWER
+// bytes than requested (a "short read") for a perfectly valid regular file — at internal buffer
+// boundaries, under memory pressure, or on a signal. sceKernelRead/Pread on PS5 return the full count
+// for a regular file, and Unity's asset streamer (FileCacher/CachedReader) assumes it: a short read
+// leaves its 64 KB cache block PARTIALLY filled, the tail stays stale, and the object deserialized from
+// that block gets a corrupt/null managed reference — which a later per-frame GC/finalizer pump then
+// null-derefs (the intermittent Il2cpp crash on the cutscene-scene load; see CUTSCENE_PROGRESSION.md).
+// Looping restores the full-read contract. Returns bytes read (== count on success), or -1/errno.
+static int64_t read_full(int fd, void* buf, size_t count, bool positioned, off_t off) {
+    size_t done = 0;
+    while (done < count) {
+        ssize_t r = positioned ? ::pread(fd, (char*)buf + done, count - done, off + (off_t)done)
+                               : ::read(fd, (char*)buf + done, count - done);
+        if (r < 0) { if (errno == EINTR) continue; return done ? (int64_t)done : (int64_t)-1; }
+        if (r == 0) break;   // EOF — return the partial count the file actually had
+        done += (size_t)r;
+    }
+    return (int64_t)done;
+}
+#endif
 HLE(f_read)  { if (fdlog_on()) preadlog("read", a0, (uint64_t)::lseek((int)a0, 0, SEEK_CUR), a2);
-               return (uint64_t)(int64_t)::read((int)a0, P(a1), (size_t)a2); }
+#ifndef _WIN32
+               return (uint64_t)read_full((int)a0, P(a1), (size_t)a2, false, 0);
+#else
+               return (uint64_t)(int64_t)::read((int)a0, P(a1), (size_t)a2);
+#endif
+             }
 HLE(f_write) { return (uint64_t)(int64_t)::write((int)a0, P(a1), (size_t)a2); }
 HLE(f_lseek) { if (fdlog_on() && ((int)a2 != SEEK_CUR || a1 != 0)) preadlog("lseek", a0, a1, (uint64_t)a2);
                return (uint64_t)(int64_t)::lseek((int)a0, (off_t)a1, (int)a2); }
 #ifndef _WIN32
-HLE(f_pread)  { preadlog("pread", a0, a3, a2); return (uint64_t)(int64_t)::pread((int)a0, P(a1), (size_t)a2, (off_t)a3); }
+HLE(f_pread)  { preadlog("pread", a0, a3, a2); return (uint64_t)read_full((int)a0, P(a1), (size_t)a2, true, (off_t)a3); }
 HLE(f_pwrite) { return (uint64_t)(int64_t)::pwrite((int)a0, P(a1), (size_t)a2, (off_t)a3); }
 #else
 HLE(f_pread)  { return (uint64_t)-1; }
