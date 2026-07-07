@@ -570,6 +570,9 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
         // vertex count under whatever register state the latest submit left behind.
         agc_gpu_state().draws.clear();
     }
+    // Execute the submit's in-stream flips AFTER its draws rendered: the Dcb queues the flip after
+    // the frame's draws, and the flip's scanout (present the guest buffer) must observe the frame.
+    gpu::execute_pending_flips(agc_gpu_state());
     if (getenv("PROSPER_GFXLOG")) {
         fprintf(stderr, "[agc] SubmitDcb #%llu: %u dwords -> %zu packets applied (draws so far: %zu)\n",
                 (unsigned long long)g_submit_count, p->dw_num, applied, agc_gpu_state().draws.size());

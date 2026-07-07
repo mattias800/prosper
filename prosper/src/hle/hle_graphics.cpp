@@ -148,6 +148,7 @@ extern "C" int      prosper_vo_buffer_count()   { return g_display.buffer_num; }
 extern "C" uint32_t prosper_vo_display_width()  { return g_display.width; }
 extern "C" uint32_t prosper_vo_display_height() { return g_display.height; }
 extern "C" uint64_t prosper_vo_display_format() { return g_display.pixel_format; }
+extern "C" uint32_t prosper_vo_display_tiling() { return g_display.tiling_mode; }
 extern "C" uint64_t prosper_vo_buffer_addr(int i) {
     return (i >= 0 && i < g_display.buffer_num) ? g_display.buffer_addr[i] : 0;
 }
