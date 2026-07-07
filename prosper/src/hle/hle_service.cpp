@@ -25,6 +25,16 @@ HLE(s_user_idlist)    { if (a0) { int32_t* p = (int32_t*)PW(a0); p[0] = 1; for (
 HLE(s_user_name)      { if (a1) snprintf((char*)PW(a1), a2 ? (size_t)a2 : 17, "%s", "Player"); return 0; }
 HLE(s_user_int_out)   { if (a1) *(int32_t*)PW(a1) = 0; return 0; }           // accessibility getters -> 0
 HLE(s_user_age)       { if (a1) *(int32_t*)PW(a1) = 18; return 0; }          // GetAgeLevel -> adult (no restriction)
+// sceUserServiceGetEvent(SceUserServiceEvent* ev): the event stream. A real system delivers the initial
+// user's LOGIN event once at startup, then reports "no more events" so the game's drain loop terminates.
+// The previous (unimplemented) stub returned 0 = "got an event" but left the struct unfilled -> the game
+// either drained a garbage event or never saw the login it waits on. SceUserServiceEvent = { int32
+// eventType (0=LOGIN,1=LOGOUT); int32 userId }. NO_EVENT = 0x80960009.
+HLE(s_user_getevent)  {
+    static std::atomic<int> delivered{0};
+    if (a0 && delivered.exchange(1) == 0) { int32_t* ev = (int32_t*)PW(a0); ev[0] = 0; ev[1] = 1; return 0; }
+    return 0x80960009ull;   // SCE_USER_SERVICE_ERROR_NO_EVENT
+}
 HLE(s_ok)             { return 0; }
 
 // --- NP / online (single-player: report signed-out / unreachable, success) ---
@@ -37,8 +47,29 @@ HLE(s_np_country)     { if (a1) memset(PW(a1), 0, 4); return 0; }
 HLE(s_open)           { return g_handle++; }                                 // scePadOpen/sceMouseOpen -> handle
 // Conservative output sizes so we don't smash a smaller caller buffer.
 HLE(s_pad_info)       { if (a1) memset(PW(a1), 0, 0x20); return 0; }          // controller info -> zeroed
-HLE(s_pad_read)       { if (a1) memset(PW(a1), 0, 0x30); return 0; }          // pad state -> neutral
-HLE(s_pad_readstate)  { if (a1) memset(PW(a1), 0, 0x30); return 0; }
+HLE(s_pad_read)       {
+    static unsigned n = 0; n++;
+    if (getenv("PROSPER_PADLOG") && (n <= 5 || n % 200 == 0)) fprintf(stderr, "[pad] scePadRead call #%u\n", n);
+    if (a1) { uint8_t* d = (uint8_t*)PW(a1); memset(d, 0, 0x30);
+        if (getenv("PROSPER_PAD_PRESS")) { *(uint32_t*)(d + 0x00) = 0x4000u; d[0x04]=d[0x05]=d[0x06]=d[0x07]=128; d[0x2C]=1; } }
+    return 1;   // scePadRead returns the number of pad data entries read (>0 = data available)
+}
+// scePadReadState. Normally neutral (all zero). Two diagnostics: PROSPER_PADLOG counts calls (is the game
+// polling input each frame, i.e. is the frame loop live?); PROSPER_PAD_PRESS injects a connected controller
+// with a button held (CROSS=0x4000) so a "Press [button]" title screen can advance to a shader-drawn scene.
+HLE(s_pad_readstate)  {
+    static unsigned n = 0; n++;
+    if (getenv("PROSPER_PADLOG") && (n <= 5 || n % 200 == 0))
+        fprintf(stderr, "[pad] scePadReadState call #%u\n", n);
+    if (a1) { uint8_t* d = (uint8_t*)PW(a1); memset(d, 0, 0x30);
+        if (getenv("PROSPER_PAD_PRESS")) {
+            *(uint32_t*)(d + 0x00) = 0x4000u;   // buttons: CROSS held
+            d[0x04] = d[0x05] = d[0x06] = d[0x07] = 128;   // sticks centered
+            d[0x2C] = 1;                        // connected = true (best-effort offset)
+        }
+    }
+    return 0;
+}
 
 // --- app content ---
 HLE(s_appcontent_int) { if (a1) *(int32_t*)PW(a1) = 0; return 0; }
@@ -53,6 +84,7 @@ void register_service_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
     // user service
     R("sceUserServiceGetInitialUser", s_user_initial);
+    R("sceUserServiceGetEvent", s_user_getevent);   // deliver the initial-user LOGIN event once
     R("sceUserServiceGetLoginUserIdList", s_user_idlist);
     R("sceUserServiceGetUserName", s_user_name);
     R("sceUserServiceGetAccessibilityVibration", s_user_int_out);

@@ -1614,7 +1614,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // buffer specifically (that SGPR may hold a constant-buffer V# at other points; the const-
                 // fold-resolved vertex buffer is keyed by this SRSRC SGPR). Fall back to an s_load SRT tag.
                 if (rt) {
-                    res = rt->by_sgpr_base_cls(in.src[1].value, ResourceClass::VertexBuffer);
+                    // PER-FETCH first: a reloaded SRSRC holds a different V# per attribute, so match this
+                    // exact fetch instruction's pc; fall back to the SGPR (direct) then s_load SRT tag.
+                    res = rt->by_fetch_pc(in.pc);
+                    if (!res) res = rt->by_sgpr_base_cls(in.src[1].value, ResourceClass::VertexBuffer);
                     if (!res) { auto it = rs.sreg_srt.find(in.src[1].value);
                         if (it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second); }
                 }

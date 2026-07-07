@@ -32,6 +32,12 @@ const ShaderResource* ShaderResourceTable::by_sgpr_base_cls(uint32_t sgpr, Resou
     return nullptr;
 }
 
+const ShaderResource* ShaderResourceTable::by_fetch_pc(uint32_t pc) const {
+    if (pc == 0xFFFFFFFFu) return nullptr;
+    for (const auto& r : resources) if (r.fetch_pc == pc) return &r;
+    return nullptr;
+}
+
 const ShaderResource* ShaderResourceTable::by_binding(uint32_t binding) const {
     for (const auto& r : resources) if (r.binding == binding) return &r;
     return nullptr;

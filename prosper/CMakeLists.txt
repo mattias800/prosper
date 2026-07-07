@@ -84,6 +84,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_agc_shader PRIVATE prosper_core)
   add_test(NAME agc_shader_create COMMAND test_agc_shader)
 
+  add_executable(test_tile tests/test_tile.cpp)
+  target_link_libraries(test_tile PRIVATE prosper_core)
+  add_test(NAME gpu_surface_detile COMMAND test_tile)
+
   add_executable(test_stat tests/test_stat.cpp)
   target_link_libraries(test_stat PRIVATE prosper_core)
   add_test(NAME sce_stat_layout COMMAND test_stat)

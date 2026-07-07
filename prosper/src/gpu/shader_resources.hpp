@@ -69,6 +69,12 @@ struct ShaderResource {
     uint32_t      srt_offset    = 0xFFFFFFFFu;
     uint32_t      sgpr_base     = 0xFFFFFFFFu;
 
+    //   * fetch_pc — PER-FETCH: the pc of the exact buffer_load_format_* instruction this descriptor was
+    //     resolved for. A single SRSRC SGPR is reloaded with a DIFFERENT V# per vertex attribute (position,
+    //     uv, color, …), so keying only by sgpr_base collapses them to the first. The recompiler resolves a
+    //     vertex fetch by its instruction pc first (exact), falling back to sgpr_base. 0xFFFFFFFF = unset.
+    uint32_t      fetch_pc      = 0xFFFFFFFFu;
+
     // Texture-only (cls == Texture). img_dim mirrors the MIMG dim field (1D=0, 2D=1, 3D=2, ...).
     // width/height are for image_load/texelFetch + unnormalized addressing (unused by normalized
     // image_sample). sampler_sgpr_base = the paired sampler's S# base SGPR (SSAMP); with a Vulkan
@@ -96,6 +102,9 @@ struct ShaderResourceTable {
     // dynamic reload for a later buffer_load_format). The instruction type implies the class, so filtering
     // by class disambiguates without tracking per-instruction reloads. nullptr if none.
     const ShaderResource* by_sgpr_base_cls(uint32_t sgpr, ResourceClass cls) const;
+    // Resolve the vertex buffer for the fetch instruction at `pc` (per-fetch provenance — disambiguates an
+    // SRSRC SGPR reloaded with a different V# per attribute). nullptr if none.
+    const ShaderResource* by_fetch_pc(uint32_t pc) const;
     // Resolve by assigned Vulkan binding (the pipeline's lookup); nullptr if none.
     const ShaderResource* by_binding(uint32_t binding) const;
 };
