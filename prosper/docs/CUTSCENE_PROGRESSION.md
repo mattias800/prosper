@@ -21,7 +21,7 @@ null-object deref.
 ## Where the game is now — actively loading the cutscene, then a per-frame Il2cpp crash
 
 With the fix, the game:
-1. Renders and fades in the loading screen (time-driven animation works — see `docs/img/loading_screen_frame.png`).
+1. Renders and fades in the loading screen (time-driven animation works — verified via frame dumps).
 2. **Streams the cutscene scene's assets**: the loader thread `pread`s progressively through
    `resources.assets` (77 MB) to ~block 977 (≈82%), plus `resources.resource` / `sharedassets1.assets`
    (verified with `PROSPER_PREADLOG`; offsets increase monotonically — it is loading, not spinning).
