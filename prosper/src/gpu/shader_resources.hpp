@@ -83,6 +83,7 @@ struct ShaderResource {
     uint32_t      img_dim           = 1;
     uint32_t      width             = 0;
     uint32_t      height            = 0;
+    uint32_t      tile_mode         = 0;                  // T# GFX10 TileMode; drives auto-detile of a sampled surface
     uint32_t      sampler_sgpr_base = 0xFFFFFFFFu;
 };
 

@@ -259,13 +259,20 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     return out;
 }
 
-// Give every resource its OWN descriptor binding, starting at 2 (0/1 reserved). The N-buffer model: the
-// shader reads several distinct constant buffers (Unity's per-draw transform, per-frame, …) + vertex
+// Give every resource its OWN descriptor binding, starting at `first` (0/1 reserved). The N-buffer model:
+// the shader reads several distinct constant buffers (Unity's per-draw transform, per-frame, …) + vertex
 // buffers + textures, and each must land at a separate binding so they don't collapse. The recompiler
 // declares a storage buffer (cbuf/vbuf) or image sampler (texture) at each binding and resolves an
 // s_buffer_load/image_sample to its resource's binding via provenance (by_sgpr_base / by_srt_offset).
-void assign_convention_bindings(ShaderResourceTable& t) {
-    uint32_t next = 2;
+//
+// The VS and PS tables are bound together in ONE descriptor set by the live renderer, so the two stages'
+// binding ranges MUST be disjoint: both stages numbering from 2 made the PS's small zero-filled cbuf land
+// on the SAME binding as the VS's cbuf holding the UV scale/offset (Unity _MainTex_ST) — the later
+// descriptor write won, the VS read zeros, and every vertex output uv = attr*0 + 0 (a constant, so the
+// whole triangle sampled one texel). VS keeps 2.., PS starts at kPsBindingBase.
+constexpr uint32_t kPsBindingBase = 32;
+void assign_convention_bindings(ShaderResourceTable& t, uint32_t first) {
+    uint32_t next = first;
     for (auto& r : t.resources) r.binding = next++;
 }
 }
@@ -346,13 +353,14 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     const uint32_t* u = (const uint32_t*)(uintptr_t)d.base;
                     fprintf(stderr, "[dynvb]     v3fmt=0x%x  raw v0: %08x %08x %08x %08x\n",
                             kv.desc_v3, u[0], u[1], u[2], u[3]);
-                    const float* f = (const float*)(uintptr_t)d.base;
-                    fprintf(stderr, "[dynvb]     v0: %.3f %.3f %.3f %.3f | v1(@stride): %.3f %.3f %.3f %.3f\n",
-                            f[0], f[1], f[2], f[3],
-                            d.stride ? *(const float*)(uintptr_t)(d.base + d.stride) : 0.0f,
-                            d.stride ? *(const float*)(uintptr_t)(d.base + d.stride + 4) : 0.0f,
-                            d.stride ? *(const float*)(uintptr_t)(d.base + d.stride + 8) : 0.0f,
-                            d.stride ? *(const float*)(uintptr_t)(d.base + d.stride + 12) : 0.0f);
+                    // Print the first 3 vertex records (the DrawIndexAuto count=3 triangle) as floats, so the
+                    // actual on/off-screen span can be computed offline. Each record is `stride` bytes.
+                    for (int rec = 0; rec < 3 && d.stride; rec++) {
+                        uint64_t a = d.base + (uint64_t)rec * d.stride;
+                        if (!guest_readable(a, 16)) break;
+                        const float* f = (const float*)(uintptr_t)a;
+                        fprintf(stderr, "[dynvb]     rec%d: %.3f %.3f %.3f %.3f\n", rec, f[0], f[1], f[2], f[3]);
+                    }
                 }
             }
         }
@@ -383,7 +391,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
             t.resources.push_back(r);
         }
         if (t.resources.empty()) continue;
-        assign_convention_bindings(t);
+        assign_convention_bindings(t, is_ps ? kPsBindingBase : 2u);
         if (log) {
             fprintf(stderr, "[restab] %s code=0x%llx base=0x%x -> %zu resources:\n",
                     is_ps ? "PS" : "VS", (unsigned long long)code_addr, base, t.resources.size());
@@ -395,10 +403,17 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     const float* f = (const float*)(uintptr_t)r.gpu_addr;
                     fprintf(stderr, "[restab]     cbuf@0 floats: %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f\n",
                             f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
-                    if (r.size >= 0x150 && guest_readable(r.gpu_addr + 0x110, 32)) {
+                    if (r.size >= 64 && guest_readable(r.gpu_addr, 64))
+                        fprintf(stderr, "[restab]     cbuf@0 8..15:   %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f\n",
+                                f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]);
+                    if (r.size >= 0x150 && guest_readable(r.gpu_addr + 0x110, 64)) {
                         const float* g = (const float*)(uintptr_t)(r.gpu_addr + 0x110);
-                        fprintf(stderr, "[restab]     cbuf@0x110:    %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f\n",
-                                g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7]);
+                        // Full 4x4 projection matrix at 0x110 (16 floats). Row 3's w element (g[15]) must be
+                        // ~1.0 for clip.w to be nonzero — a zero here collapses the perspective divide.
+                        fprintf(stderr, "[restab]     mtx@0x110 r0: %.4f %.4f %.4f %.4f\n", g[0], g[1], g[2], g[3]);
+                        fprintf(stderr, "[restab]     mtx@0x110 r1: %.4f %.4f %.4f %.4f\n", g[4], g[5], g[6], g[7]);
+                        fprintf(stderr, "[restab]     mtx@0x110 r2: %.4f %.4f %.4f %.4f\n", g[8], g[9], g[10], g[11]);
+                        fprintf(stderr, "[restab]     mtx@0x110 r3: %.4f %.4f %.4f %.4f  <- g[15]=clip.w src\n", g[12], g[13], g[14], g[15]);
                     }
                 }
             }

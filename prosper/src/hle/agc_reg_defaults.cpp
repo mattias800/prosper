@@ -34,7 +34,7 @@ static RegisterDefaultInfo g_cx_reg_info1[] = {
     /* 1 */ {0xF6C28182, {{Pm4::CB_DCC_CONTROL, 0x00000000}}},
     /* 2 */ {0x6F6E55A5, {{Pm4::CB_RMI_GL2_CACHE_CONTROL, 0x00000000}}},
     /* 3 */ {0x0BC65DA4, {{Pm4::CB_SHADER_MASK, 0x00000000}}},
-    /* 4 */ {0x9E5AD592, {{Pm4::CB_TARGET_MASK, 0x00000000}}},
+    /* 4 */ {0x9E5AD592, {{Pm4::CB_TARGET_MASK, 0x0000000F}}},
     /* 5 */ {0xBB513B98, {{Pm4::DB_ALPHA_TO_MASK, 0x0000aa00}}},
     /* 6 */ {0xAB64B23B, {{Pm4::DB_COUNT_CONTROL, 0x00000000}}},
     /* 7 */ {0x53C39964, {{Pm4::DB_DEPTH_CONTROL, 0x00000000}}},

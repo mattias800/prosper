@@ -2,6 +2,8 @@
 #include "videoout_present.hpp"
 #include <atomic>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <vector>
 
@@ -43,7 +45,20 @@ void present_flip(int buffer_index, int64_t /*flip_arg*/) {
     // invalid index shouldn't corrupt scanout state).
     if (buffer_index >= 0 && buffer_index < prosper_vo_buffer_count())
         g_front.store(buffer_index, std::memory_order_relaxed);
-    g_present_count.fetch_add(1, std::memory_order_relaxed);
+    uint64_t n = g_present_count.fetch_add(1, std::memory_order_relaxed);
+    // PROSPER_DUMP_SCANOUT=<dir>: dump the RAW guest display buffer the game just flipped (what the game
+    // actually puts on screen — vs our execute_and_present composite render). First 8 flips + every 60th.
+    // Written as raw w*h*4 bytes; convert offline. This reveals whether the game's real display holds the
+    // title/scene even when the captured draws are a no-op composite.
+    if (const char* dir = getenv("PROSPER_DUMP_SCANOUT"); dir && (n < 8 || n % 60 == 0)) {
+        int idx = (buffer_index >= 0 && buffer_index < prosper_vo_buffer_count()) ? buffer_index : g_front.load();
+        uint64_t addr = prosper_vo_buffer_addr(idx);
+        uint32_t w = prosper_vo_display_width(), h = prosper_vo_display_height();
+        if (addr && w && h) {
+            char fn[512]; snprintf(fn, sizeof fn, "%s/scanout_%04llu_buf%d.rgba", dir, (unsigned long long)n, idx);
+            if (FILE* f = fopen(fn, "wb")) { fwrite((const void*)(uintptr_t)addr, 1, (size_t)w * h * 4, f); fclose(f); }
+        }
+    }
 }
 
 int      present_front_index() { return g_front.load(std::memory_order_relaxed); }

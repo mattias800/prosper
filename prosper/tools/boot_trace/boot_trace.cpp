@@ -140,10 +140,10 @@ int main(int argc, char** argv) {
                 std::vector<prosper::test::FrameResource> R;
                 static std::vector<std::vector<uint8_t>> texstore;  // keep texture bytes alive across the call
                 texstore.clear();
-                auto add = [&](const prosper::gpu::ShaderResourceTable* t){
+                auto add = [&](const prosper::gpu::ShaderResourceTable* t, uint32_t set){
                     if (!t) return;
                     for (auto& r : t->resources) {
-                        prosper::test::FrameResource fr; fr.binding = r.binding;
+                        prosper::test::FrameResource fr; fr.binding = r.binding; fr.set = set;
                         if (r.cls == RC::Texture || r.cls == RC::StorageImage) {
                             uint32_t tw = r.width ? r.width : 4, th = r.height ? r.height : 4;
                             size_t nb = (size_t)tw * th * 4;
@@ -171,13 +171,14 @@ int main(int argc, char** argv) {
                             if (getenv("PROSPER_GFXLOG")) { const uint8_t* b = texstore.back().data();
                                 size_t nz = 0; for (size_t i = 0; i < nb && i < (1u<<16); i++) nz += (b[i] != 0);
                                 fprintf(stderr, "[render] tex binding=%u %ux%u first64k-nonzero=%zu\n", r.binding, tw, th, nz); }
-                            // PROSPER_DETILE=1: de-swizzle the GPU-tiled render target (SW_4KB_S) into the
-                            // linear texstore via the shared, tested gpu module. Reads the PADDED tiled
-                            // buffer (height rounded to whole 32-texel tile rows) so the bottom tile-row
-                            // isn't dropped. (The T# tile_mode should drive this once threaded through the
-                            // resource table; gated for now.)
-                            if (const char* dt = getenv("PROSPER_DETILE"); dt && atoi(dt) != 0) {
-                                const uint32_t tmode = (uint32_t)prosper::gpu::TileMode::Sw4KbS;
+                            // AUTO-DETILE: de-swizzle a GPU-tiled sampled surface into the linear texstore,
+                            // driven by the T# tile_mode now threaded through the resource table (r.tile_mode).
+                            // PROSPER_DETILE forces it (for surfaces whose tiling we don't yet flag); PROSPER_NODETILE
+                            // disables it. Reads the PADDED tiled buffer (height rounded to whole 32-texel tile rows).
+                            bool auto_tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode);
+                            const char* dt = getenv("PROSPER_DETILE");
+                            if (!getenv("PROSPER_NODETILE") && (auto_tiled || (dt && atoi(dt) != 0))) {
+                                const uint32_t tmode = auto_tiled ? r.tile_mode : (uint32_t)prosper::gpu::TileMode::Sw4KbS;
                                 // PROSPER_PITCH: padded row pitch in texels for surfaces whose pitch > width.
                                 const uint32_t pitch = getenv("PROSPER_PITCH") ? (uint32_t)atoi(getenv("PROSPER_PITCH")) : 0;
                                 size_t tiled_bytes = prosper::gpu::tiled_surface_bytes(tw, th, tmode, pitch);
@@ -211,7 +212,7 @@ int main(int argc, char** argv) {
                         R.push_back(std::move(fr));
                     }
                 };
-                add(vrt); add(prt);
+                add(vrt, 0); add(prt, 1);   // VS resources -> descriptor set 0, PS -> set 1 (no binding collision)
                 if (dn >= 0) close(dn);
                 if (getenv("PROSPER_GFXLOG")) { fprintf(stderr, "[render] binding %zu resources (draw %u verts)\n",
                     R.size(), draw_vcount); fflush(stderr); }
@@ -234,6 +235,17 @@ int main(int argc, char** argv) {
                     auto m = prosper::gpu::recompile_fragment(kMagentaPs, sizeof(kMagentaPs) / 4, nullptr);
                     if (!m.empty()) fs_use = m;
                 }
+                // PROSPER_FS_SPV=<file.spv>: replace the fragment shader with a caller-supplied SPIR-V
+                // module (diagnostic: e.g. a UV-visualizer PS that writes the interpolated location-1
+                // varying as color, to see EXACTLY what the real VS feeds the interpolators).
+                if (const char* fsp = getenv("PROSPER_FS_SPV")) {
+                    if (FILE* f = fopen(fsp, "rb")) {
+                        fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+                        std::vector<uint32_t> m((size_t)sz / 4);
+                        if (sz >= 20 && fread(m.data(), 4, m.size(), f) == m.size()) fs_use = std::move(m);
+                        fclose(f);
+                    }
+                }
                 if (getenv("PROSPER_GFXLOG")) fprintf(stderr,
                     "[render] ps: topo=%u fmt=%u depth(test=%d write=%d op=%u) blend(en=%d src=%u dst=%u op=%u) mask=0x%x\n",
                     ps.topology, ps.color0_format, ps.depth_test_enable, ps.depth_write_enable, ps.depth_compare_op,
@@ -246,7 +258,7 @@ int main(int argc, char** argv) {
                 int n = frame_no++;
                 if (px.empty()) {
                     fprintf(stderr, "[render] frame %d: Vulkan render FAILED (%ux%u)\n", n, w, h);
-                } else if (n < 8 || n % 60 == 0) {
+                } else if (n < 60 || n % 10 == 0) {   // widened to capture the title fade-in progression
                     char fn[512]; snprintf(fn, sizeof fn, "%s/frame_%04d.bmp", fdir.c_str(), n);
                     prosper::test::dump_bmp(fn, px, w, h);
                     fprintf(stderr, "[render] frame %d rendered (%ux%u) -> %s\n", n, w, h, fn);

@@ -7,6 +7,7 @@
 #include "../src/gpu/render_state.hpp"
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -54,6 +55,9 @@ struct TexDesc { uint32_t binding; uint32_t w; uint32_t h; const uint8_t* rgba; 
 // real game shader that declares several constant/vertex buffers + textures have each bound distinctly.
 struct FrameResource {
     uint32_t binding = 0;
+    uint32_t set = 0;               // descriptor set: VS resources -> 0, PS resources -> 1 (they must not
+                                    // share a set — both stages number bindings from 2, so one set would
+                                    // collide binding 2/3 between stages and make the layout invalid).
     std::vector<uint32_t> dwords;   // storage-buffer contents (empty -> a 1-dword zero buffer)
     const uint8_t* tex_rgba = nullptr;   // non-null => a texture; then tw/th are its dimensions
     uint32_t tw = 0, th = 0;
@@ -215,12 +219,26 @@ inline std::vector<uint8_t> render_triangle_rgba(const std::vector<uint32_t>& ve
     std::vector<FrameResource> R;
     if (gres && !gres->empty()) { R = *gres; }
     else {
-        FrameResource b2; b2.binding = 2; if (cbuf) b2.dwords = *cbuf; R.push_back(std::move(b2));
-        FrameResource b3; b3.binding = 3; if (vbuf) b3.dwords = *vbuf; R.push_back(std::move(b3));
-        if (tex) { FrameResource t; t.binding = tex->binding; t.tex_rgba = tex->rgba; t.tw = tex->w; t.th = tex->h; R.push_back(std::move(t)); }
+        // The recompiler places FRAGMENT-stage resources in descriptor set 1 (the VS owns set 0), and a
+        // legacy test may exercise either stage with the same cbuf/vbuf convention (bindings 2/3) -- so
+        // mirror the buffers into BOTH sets (the copy the shader does not reference is simply unused).
+        for (uint32_t s2 = 0; s2 < 2; s2++) {
+            FrameResource b2; b2.binding = 2; b2.set = s2; if (cbuf) b2.dwords = *cbuf; R.push_back(std::move(b2));
+            FrameResource b3; b3.binding = 3; b3.set = s2; if (vbuf) b3.dwords = *vbuf; R.push_back(std::move(b3));
+        }
+        // A sampled texture is a fragment-stage resource -> descriptor set 1 (the recompiler puts PS
+        // resources in set 1; the VS owns set 0). Binding it in set 0 would not match the FS's layout.
+        if (tex) { FrameResource t; t.binding = tex->binding; t.set = 1; t.tex_rgba = tex->rgba; t.tw = tex->w; t.th = tex->h; R.push_back(std::move(t)); }
     }
     const bool use_desc = !R.empty();
-    VkDescriptorSetLayout dsl = VK_NULL_HANDLE; VkDescriptorPool dpool = VK_NULL_HANDLE; VkDescriptorSet dset = VK_NULL_HANDLE;
+    // VS and PS resources live in SEPARATE descriptor sets (r.set: VS=0, PS=1) so their independent
+    // binding numbering (both start at 2) can't collide within one set. Create one layout+set per set
+    // index present (0..n_sets-1); empty sets still get a layout so the pipeline-layout set indices stay
+    // contiguous and match the SPIR-V's DescriptorSet decorations.
+    uint32_t n_sets = 1; for (auto& r : R) n_sets = std::max(n_sets, r.set + 1);
+    std::vector<VkDescriptorSetLayout> dsls(n_sets, VK_NULL_HANDLE);
+    std::vector<VkDescriptorSet> dsets(n_sets, VK_NULL_HANDLE);
+    VkDescriptorPool dpool = VK_NULL_HANDLE;
     // Per-resource Vulkan objects (freed at the end). Storage buffers use sbuf/sbmem; textures use the
     // image/view/sampler/staging quintet (indexed parallel to R; unused entries stay VK_NULL_HANDLE).
     std::vector<VkBuffer> sbuf(R.size(), VK_NULL_HANDLE), tstage(R.size(), VK_NULL_HANDLE);
@@ -286,19 +304,28 @@ inline std::vector<uint8_t> render_triangle_rgba(const std::vector<uint32_t>& ve
                 wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wr[i].pBufferInfo = &dbi[i];
             }
         }
-        VkDescriptorSetLayoutCreateInfo dslci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        dslci.bindingCount = (uint32_t)lb.size(); dslci.pBindings = lb.data(); vkCreateDescriptorSetLayout(dev, &dslci, nullptr, &dsl);
+        // One descriptor-set layout per set index, each holding only its own resources' bindings.
+        for (uint32_t s = 0; s < n_sets; s++) {
+            std::vector<VkDescriptorSetLayoutBinding> slb;
+            for (size_t i = 0; i < R.size(); i++) if (R[i].set == s) slb.push_back(lb[i]);
+            VkDescriptorSetLayoutCreateInfo dslci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            dslci.bindingCount = (uint32_t)slb.size(); dslci.pBindings = slb.data();
+            VkResult _dslr = vkCreateDescriptorSetLayout(dev, &dslci, nullptr, &dsls[s]);
+            if (getenv("PROSPER_GFXLOG")) { fprintf(stderr, "[rr] set %u dslayout result=%d bindings:", s, (int)_dslr);
+                for (auto& x : slb) fprintf(stderr, " %u(t%d)", x.binding, (int)x.descriptorType); fprintf(stderr, "\n"); }
+        }
         VkDescriptorPoolSize psz[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, n_storage ? n_storage : 1},
                                        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, n_sampler ? n_sampler : 1}};
         VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        dpci.maxSets = 1; dpci.poolSizeCount = n_sampler ? 2 : 1; dpci.pPoolSizes = psz; vkCreateDescriptorPool(dev, &dpci, nullptr, &dpool);
+        dpci.maxSets = n_sets; dpci.poolSizeCount = n_sampler ? 2 : 1; dpci.pPoolSizes = psz; vkCreateDescriptorPool(dev, &dpci, nullptr, &dpool);
         VkDescriptorSetAllocateInfo dsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-        dsai.descriptorPool = dpool; dsai.descriptorSetCount = 1; dsai.pSetLayouts = &dsl; vkAllocateDescriptorSets(dev, &dsai, &dset);
-        for (auto& x : wr) x.dstSet = dset;
+        dsai.descriptorPool = dpool; dsai.descriptorSetCount = n_sets; dsai.pSetLayouts = dsls.data();
+        vkAllocateDescriptorSets(dev, &dsai, dsets.data());
+        for (size_t i = 0; i < R.size(); i++) wr[i].dstSet = dsets[R[i].set];
         vkUpdateDescriptorSets(dev, (uint32_t)wr.size(), wr.data(), 0, nullptr);
     }
     VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    if (use_desc) { plci.setLayoutCount = 1; plci.pSetLayouts = &dsl; }
+    if (use_desc) { plci.setLayoutCount = n_sets; plci.pSetLayouts = dsls.data(); }
     VkPipelineLayout layout; vkCreatePipelineLayout(dev, &plci, nullptr, &layout);
     VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     gp.stageCount = 2; gp.pStages = st; gp.pVertexInputState = &vin; gp.pInputAssemblyState = &ia;
@@ -345,7 +372,7 @@ inline std::vector<uint8_t> render_triangle_rgba(const std::vector<uint32_t>& ve
     rpbi.renderPass = rp; rpbi.framebuffer = fb; rpbi.renderArea = {{0, 0}, {W, H}}; rpbi.clearValueCount = use_depth ? 2 : 1; rpbi.pClearValues = clear;
     vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-    if (use_desc) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &dset, 0, nullptr);
+    if (use_desc) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, n_sets, dsets.data(), 0, nullptr);
     vkCmdDraw(cmd, vcount, 1, 0, 0);
     vkCmdEndRenderPass(cmd);
     VkBufferImageCopy cp{}; cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; cp.imageExtent = {W, H, 1};
@@ -368,7 +395,8 @@ inline std::vector<uint8_t> render_triangle_rgba(const std::vector<uint32_t>& ve
     vkDestroyImage(dev, img, nullptr); vkFreeMemory(dev, imem, nullptr);
     if (use_depth) { vkDestroyImageView(dev, dview, nullptr); vkDestroyImage(dev, dimg, nullptr); vkFreeMemory(dev, dmem, nullptr); }
     if (use_desc) {
-        vkDestroyDescriptorPool(dev, dpool, nullptr); vkDestroyDescriptorSetLayout(dev, dsl, nullptr);
+        vkDestroyDescriptorPool(dev, dpool, nullptr);
+        for (auto d : dsls) if (d) vkDestroyDescriptorSetLayout(dev, d, nullptr);
         for (size_t i = 0; i < R.size(); i++) {
             if (sbuf[i])     vkDestroyBuffer(dev, sbuf[i], nullptr);
             if (sbmem[i])    vkFreeMemory(dev, sbmem[i], nullptr);

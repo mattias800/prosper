@@ -47,11 +47,29 @@ DecodedBufferDescriptor decode_buffer_descriptor(const uint32_t v[4]) {
     d.base        = ((uint64_t)v[0] | ((uint64_t)v[1] << 32)) & 0xFFFFFFFFFFFFull;  // Base48
     d.stride      = (v[1] >> 16) & 0x3FFFu;                                          // 14-bit stride
     d.num_records = v[2];
-    uint32_t nfmt = (v[3] >> 12) & 0x7u;
-    uint32_t dfmt = (v[3] >> 15) & 0xFu;
-    buffer_format(dfmt, nfmt, &d.format, &d.num_components);
-    // num_records is in units of `stride` when strided, else raw bytes.
-    d.size_bytes = d.stride ? d.num_records * d.stride : d.num_records;
+    // RDNA2 (GFX10) buffer V# dword3 packs a single 7-bit unified FORMAT at bits[18:12] (NOT the
+    // separate GCN dfmt/nfmt fields, which live at different bits). Decode the RDNA2 format for the
+    // number-format-sensitive cases; the 32-bit float formats fall through to the legacy path (which
+    // already yields a raw-dword read that is correct for Float32 — this game's position/uv).
+    uint32_t rdna2_fmt = (v[3] >> 12) & 0x7Fu;
+    if (rdna2_fmt == 56) {
+        // GFX10 unified format 56 == 8_8_8_8_UNORM (confirmed: Kyty maps T# format 56 to R8G8B8A8, and
+        // this game's per-vertex modulate color fades 0xff000000->0xffffffff, i.e. UNORM8 black->white).
+        // Reading it as raw float32 (the legacy fallback) yields garbage -> a wrong PS output alpha ->
+        // the composite blends to the clear. Decode it as 4x UNORM8 so the recompiler normalizes /255.
+        // CONFIDENCE: HIGH (format value empirically + Kyty cross-checked).
+        d.format = DataFormat::Unorm8;
+        d.num_components = 4;
+    } else {
+        uint32_t nfmt = (v[3] >> 12) & 0x7u;
+        uint32_t dfmt = (v[3] >> 15) & 0xFu;
+        buffer_format(dfmt, nfmt, &d.format, &d.num_components);
+    }
+    // num_records is in units of `stride` when strided, else raw bytes. Compute in 64-bit and clamp so a
+    // 32-bit wrap (num_records is a full 32-bit field) can't produce a small value that slips a bogus
+    // buffer under the caller's `size_bytes > 0x10000000` plausibility guard.
+    uint64_t sz = d.stride ? (uint64_t)d.num_records * d.stride : (uint64_t)d.num_records;
+    d.size_bytes = sz > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)sz;
     return d;
 }
 
@@ -128,6 +146,7 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             r.gpu_addr      = d.base;
             r.width         = d.width;
             r.height        = d.height;
+            r.tile_mode     = d.tile_mode;          // so the renderer can auto-detile a GPU-tiled surface
             r.size          = d.width * d.height * 4;
             r.sgpr_base     = user_sgpr_base + off;  // DIRECT provenance key (image_sample SRSRC SGPR)
             r.srt_offset    = 0xFFFFFFFFu;

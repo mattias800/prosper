@@ -79,6 +79,12 @@ struct SpirvCompute {
     std::map<uint32_t, uint32_t> cbuf_var;          // binding -> storage-buffer var (N-buffer model; 2/3 map to v_cbuf/v_cbuf1)
     bool     is_fragment=0;                          // true in the fragment shell (gates VINTRP interp)
     bool     is_compute=0;                            // true in the compute shell (gates LDS / s_barrier)
+    // Descriptor set for this stage's resources. VS and PS share ONE Vulkan pipeline, so they must NOT
+    // reuse binding numbers within one set (both stages number their cbuf/texture from binding 2 -> a
+    // set-0 collision made the descriptor layout invalid, corrupting the VS's reads -> degenerate
+    // geometry). Each stage owns its own set: VS=set 0, PS=set 1 (mirrors the PS5's per-stage resource
+    // tables). Set in begin_fragment(); the host binds one descriptor set per stage.
+    uint32_t desc_set=0;
     uint32_t exec_model=0;                           // deferred EntryPoint (emitted in finish() so lazily-
     std::vector<uint32_t> iface;                     // declared I/O varyings can join the interface list)
 
@@ -261,7 +267,7 @@ struct SpirvCompute {
         if (tex_var.count(binding)) return;
         uint32_t t_ptr = id(); put(types, Op_TypePointer, {t_ptr, SC_UniformConstant, simg});
         uint32_t v = id();     put(types, Op_Variable,    {t_ptr, v, SC_UniformConstant});
-        put(deco, Op_Decorate, {v, Dec_DescriptorSet, 0});
+        put(deco, Op_Decorate, {v, Dec_DescriptorSet, desc_set});
         put(deco, Op_Decorate, {v, Dec_Binding, binding});
         tex_var[binding] = v;
     }
@@ -339,7 +345,7 @@ struct SpirvCompute {
         if (stg_img_var.count(binding)) return;
         uint32_t t_ptr = id(); put(types, Op_TypePointer, {t_ptr, SC_UniformConstant, stg_img_type[key]});
         uint32_t v = id();     put(types, Op_Variable,    {t_ptr, v, SC_UniformConstant});
-        put(deco, Op_Decorate, {v, Dec_DescriptorSet, 0});
+        put(deco, Op_Decorate, {v, Dec_DescriptorSet, desc_set});
         put(deco, Op_Decorate, {v, Dec_Binding, binding});
         stg_img_var[binding] = v;
     }
@@ -520,8 +526,8 @@ struct SpirvCompute {
         put(deco, Op_Decorate, {t_rta_u, Dec_ArrayStride, 4});
         put(deco, Op_MemberDecorate, {t_struct_u, 0, Dec_Offset, 0});
         put(deco, Op_Decorate, {t_struct_u, Dec_Block});
-        put(deco, Op_Decorate, {v_cbuf,  Dec_DescriptorSet, 0}); put(deco, Op_Decorate, {v_cbuf,  Dec_Binding, 2});
-        put(deco, Op_Decorate, {v_cbuf1, Dec_DescriptorSet, 0}); put(deco, Op_Decorate, {v_cbuf1, Dec_Binding, 3});
+        put(deco, Op_Decorate, {v_cbuf,  Dec_DescriptorSet, desc_set}); put(deco, Op_Decorate, {v_cbuf,  Dec_Binding, 2});
+        put(deco, Op_Decorate, {v_cbuf1, Dec_DescriptorSet, desc_set}); put(deco, Op_Decorate, {v_cbuf1, Dec_Binding, 3});
         put(types, Op_TypeRuntimeArray, {t_rta_u, t_u32});
         put(types, Op_TypeStruct, {t_struct_u, t_rta_u});
         put(types, Op_TypePointer, {t_ptr_sb_struct_u, SC_StorageBuffer, t_struct_u});
@@ -538,7 +544,7 @@ struct SpirvCompute {
                 if (r.cls != ResourceClass::ConstantBuffer && r.cls != ResourceClass::VertexBuffer) continue;
                 if (!seen.insert(r.binding).second) continue;
                 uint32_t v = id();
-                put(deco, Op_Decorate, {v, Dec_DescriptorSet, 0}); put(deco, Op_Decorate, {v, Dec_Binding, r.binding});
+                put(deco, Op_Decorate, {v, Dec_DescriptorSet, desc_set}); put(deco, Op_Decorate, {v, Dec_Binding, r.binding});
                 put(types, Op_Variable, {t_ptr_sb_struct_u, v, SC_StorageBuffer});
                 cbuf_var[r.binding] = v;
             }
@@ -619,6 +625,7 @@ struct SpirvCompute {
         { std::vector<uint32_t> o{glsl}; pstr(o, "GLSL.std.450"); putv(extimp, Op_ExtInstImport, o); }
         put(mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
         is_fragment = true;
+        desc_set = 1;   // PS resources live in descriptor set 1 (VS owns set 0) — no cross-stage binding collision
         exec_model = Exec_Fragment; iface = {v_color};   // EntryPoint deferred to finish()
         put(exec, Op_ExecutionMode, {f_main, EM_OriginUpperLeft});
         put(deco, Op_Decorate, {v_color, Dec_Location, 0});
