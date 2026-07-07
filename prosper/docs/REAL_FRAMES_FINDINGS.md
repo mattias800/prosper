@@ -4,6 +4,12 @@ Goal: get *The Messenger* rendering real frames in prosper. This maps the **comp
 frame, discovered this session via a multi-agent investigation. It lists what's fixed, what remains, and the
 exact root cause + next step for each remaining item.
 
+![The Messenger title screen, rendered by prosper](images/messenger_title_prosper.png)
+
+*The Messenger's title screen, rendered by prosper's AGC→Vulkan pipeline — the game's real pixel shader
+sampling the game's real (auto-detiled) 1920×1080 texture (3051 distinct colors). A reference fullscreen VS
+supplies UVs (the real VS's UV output is fixed in a sibling PR); the mask + auto-detile fixes are in this PR.*
+
 ## TL;DR — the game runs; the title composite is one recompiler bug + one register-apply bug away
 
 After the merged flip/event fixes, the game **no longer stalls** — it runs a healthy frame loop (~23 fps
