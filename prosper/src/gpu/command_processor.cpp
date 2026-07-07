@@ -99,6 +99,7 @@ void GpuState::apply(const Pm4Command& c) {
                 fprintf(stderr, "\n");
             }
             for (uint32_t i = 0; i < c.num_regs; i++) file[regs[i].offset] = regs[i].value;
+            state_dirty_ = true;   // register state changed -> the next draw needs a fresh snapshot
             break;
         }
         case K::SetShRegDirect:
@@ -111,13 +112,25 @@ void GpuState::apply(const Pm4Command& c) {
             } else {
                 sh[c.sh_reg_offset] = c.sh_reg_value;   // fallback (single-register / legacy path)
             }
+            state_dirty_ = true;
             break;
         case K::SetIndexType:
             index_type = c.index_size;
+            state_dirty_ = true;
             break;
-        case K::DrawIndexAuto:
-            draws.push_back({ c.index_count });
+        case K::DrawIndexAuto: {
+            // Snapshot the register state AT THE DRAW (shared with consecutive draws until a register
+            // write dirties it), so a future per-draw executor can render each draw under its own
+            // shaders/mask/blend instead of the end-of-submit fold. Inert for the current renderer.
+            if (state_dirty_ || !last_snapshot_) {
+                auto snap = std::make_shared<GpuState>();
+                snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
+                last_snapshot_ = std::move(snap);
+                state_dirty_ = false;
+            }
+            draws.push_back({ c.index_count, last_snapshot_ });
             break;
+        }
         case K::ReleaseMem:
             honor_eop_write(c);     // EOP completion label write (correct synchronous end-of-pipe timing)
             break;

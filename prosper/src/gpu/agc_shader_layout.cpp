@@ -5,41 +5,59 @@
 
 namespace prosper::gpu {
 
-// GCN/Gen5 buffer DATA_FORMAT (dfmt) -> component count. 0 = invalid/unhandled.
-static uint32_t dfmt_components(uint32_t dfmt) {
-    switch (dfmt) {
-        case 1: case 2: case 4:            return 1;   // 8 / 16 / 32
-        case 3: case 5: case 11:           return 2;   // 8_8 / 16_16 / 32_32
-        case 13:                           return 3;   // 32_32_32
-        case 10: case 12: case 14:         return 4;   // 8_8_8_8 / 16_16_16_16 / 32_32_32_32
-        default:                           return 0;
-    }
-}
-// dfmt -> per-component byte width (1/2/4).
-static uint32_t dfmt_comp_bytes(uint32_t dfmt) {
-    switch (dfmt) {
-        case 1: case 3: case 10:           return 1;   // 8-bit components
-        case 2: case 5: case 12:           return 2;   // 16-bit components
-        case 4: case 11: case 13: case 14: return 4;   // 32-bit components
-        default:                           return 0;
-    }
-}
-
-void buffer_format(uint32_t dfmt, uint32_t nfmt, DataFormat* out_fmt, uint32_t* out_components) {
-    uint32_t comp_bytes = dfmt_comp_bytes(dfmt);
-    if (out_components) *out_components = dfmt_components(dfmt);
-    // NFMT: 0=unorm, 1=snorm, 4=uint, 5=sint, 7=float.
-    DataFormat f = DataFormat::Unknown;
-    if (comp_bytes == 4) {
-        f = (nfmt == 7) ? DataFormat::Float32 : (nfmt == 5) ? DataFormat::Sint32 : DataFormat::Uint32;
-    } else if (comp_bytes == 2) {
-        f = (nfmt == 7) ? DataFormat::Float16 : (nfmt == 0) ? DataFormat::Unorm16 : (nfmt == 1) ? DataFormat::Snorm16
-          : (nfmt == 5) ? DataFormat::Sint16  : DataFormat::Uint16;
-    } else if (comp_bytes == 1) {
-        f = (nfmt == 0) ? DataFormat::Unorm8 : (nfmt == 1) ? DataFormat::Snorm8
-          : (nfmt == 5) ? DataFormat::Sint8  : DataFormat::Uint8;
+// RDNA2 (GFX10/PS5) V# dword3 carries a COMBINED 7-bit FORMAT at bits[18:12] — NOT the separate GCN/PS4
+// NFMT[14:12]/DFMT[18:15] split (reading that on a PS5 V# yields garbage fields, so every descriptor came
+// out DataFormat::Unknown and fell back to Float32 downstream — e.g. a UNORM8 vertex color 0xffffffff
+// became a float32 NaN → the title composite multiplied to black). Cross-checked against Kyty
+// (Shader.h:585 `Format()=(fields[3]>>12)&0x7F` on the Gen5 path). The value list follows the RDNA2 ISA
+// buffer-format table; the four game-observed anchors 56/64/74/77 are Kyty-confirmed.
+// CONFIDENCE: HIGH on the anchors, MED on the rest of the table.
+void rdna2_buffer_format(uint32_t fmt, DataFormat* out_fmt, uint32_t* out_components) {
+    DataFormat f = DataFormat::Unknown; uint32_t n = 0;
+    switch (fmt) {
+        case  1: f = DataFormat::Unorm8;  n = 1; break;
+        case  2: f = DataFormat::Snorm8;  n = 1; break;
+        case  5: f = DataFormat::Uint8;   n = 1; break;
+        case  6: f = DataFormat::Sint8;   n = 1; break;
+        case  7: f = DataFormat::Unorm16; n = 1; break;
+        case  8: f = DataFormat::Snorm16; n = 1; break;
+        case 11: f = DataFormat::Uint16;  n = 1; break;
+        case 12: f = DataFormat::Sint16;  n = 1; break;
+        case 13: f = DataFormat::Float16; n = 1; break;
+        case 14: f = DataFormat::Unorm8;  n = 2; break;
+        case 15: f = DataFormat::Snorm8;  n = 2; break;
+        case 18: f = DataFormat::Uint8;   n = 2; break;
+        case 19: f = DataFormat::Sint8;   n = 2; break;
+        case 20: f = DataFormat::Uint32;  n = 1; break;
+        case 21: f = DataFormat::Sint32;  n = 1; break;
+        case 22: f = DataFormat::Float32; n = 1; break;
+        case 23: f = DataFormat::Unorm16; n = 2; break;
+        case 24: f = DataFormat::Snorm16; n = 2; break;
+        case 27: f = DataFormat::Uint16;  n = 2; break;
+        case 28: f = DataFormat::Sint16;  n = 2; break;
+        case 29: f = DataFormat::Float16; n = 2; break;
+        case 56: f = DataFormat::Unorm8;  n = 4; break;   // 8_8_8_8_UNORM (vertex colors) — Kyty-confirmed
+        case 57: f = DataFormat::Snorm8;  n = 4; break;
+        case 60: f = DataFormat::Uint8;   n = 4; break;
+        case 61: f = DataFormat::Sint8;   n = 4; break;
+        case 62: f = DataFormat::Uint32;  n = 2; break;
+        case 63: f = DataFormat::Sint32;  n = 2; break;
+        case 64: f = DataFormat::Float32; n = 2; break;   // 32_32_FLOAT (UVs) — Kyty-confirmed
+        case 65: f = DataFormat::Unorm16; n = 4; break;
+        case 66: f = DataFormat::Snorm16; n = 4; break;
+        case 69: f = DataFormat::Uint16;  n = 4; break;
+        case 70: f = DataFormat::Sint16;  n = 4; break;
+        case 71: f = DataFormat::Float16; n = 4; break;
+        case 72: f = DataFormat::Uint32;  n = 3; break;
+        case 73: f = DataFormat::Sint32;  n = 3; break;
+        case 74: f = DataFormat::Float32; n = 3; break;   // 32_32_32_FLOAT (positions) — Kyty-confirmed
+        case 75: f = DataFormat::Uint32;  n = 4; break;
+        case 76: f = DataFormat::Sint32;  n = 4; break;
+        case 77: f = DataFormat::Float32; n = 4; break;   // 32_32_32_32_FLOAT — Kyty-confirmed
+        default: break;                                    // Unknown -> caller/recompiler fallback
     }
     if (out_fmt) *out_fmt = f;
+    if (out_components) *out_components = n;
 }
 
 DecodedBufferDescriptor decode_buffer_descriptor(const uint32_t v[4]) {
@@ -47,11 +65,12 @@ DecodedBufferDescriptor decode_buffer_descriptor(const uint32_t v[4]) {
     d.base        = ((uint64_t)v[0] | ((uint64_t)v[1] << 32)) & 0xFFFFFFFFFFFFull;  // Base48
     d.stride      = (v[1] >> 16) & 0x3FFFu;                                          // 14-bit stride
     d.num_records = v[2];
-    uint32_t nfmt = (v[3] >> 12) & 0x7u;
-    uint32_t dfmt = (v[3] >> 15) & 0xFu;
-    buffer_format(dfmt, nfmt, &d.format, &d.num_components);
-    // num_records is in units of `stride` when strided, else raw bytes.
-    d.size_bytes = d.stride ? d.num_records * d.stride : d.num_records;
+    rdna2_buffer_format((v[3] >> 12) & 0x7Fu, &d.format, &d.num_components);
+    // num_records is in units of `stride` when strided, else raw bytes. Compute in 64-bit and clamp so a
+    // 32-bit wrap (num_records is a full 32-bit field) can't produce a small value that slips a bogus
+    // buffer under the caller's `size_bytes > 0x10000000` plausibility guard.
+    uint64_t sz = d.stride ? (uint64_t)d.num_records * d.stride : (uint64_t)d.num_records;
+    d.size_bytes = sz > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)sz;
     return d;
 }
 
@@ -128,6 +147,7 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             r.gpu_addr      = d.base;
             r.width         = d.width;
             r.height        = d.height;
+            r.tile_mode     = d.tile_mode;          // so the renderer can auto-detile a GPU-tiled surface
             r.size          = d.width * d.height * 4;
             r.sgpr_base     = user_sgpr_base + off;  // DIRECT provenance key (image_sample SRSRC SGPR)
             r.srt_offset    = 0xFFFFFFFFu;

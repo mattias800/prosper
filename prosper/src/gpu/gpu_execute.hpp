@@ -90,9 +90,32 @@ inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn&
                        0u, (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr, st.draws.size(),
                        st.draws.empty() ? 0u : st.draws[0].index_count); fflush(stderr); }
     ResolvedPipelineState ps = resolve_pipeline_state(rs);
+    // Skip a draw with no color writes (CB_TARGET_MASK/color_write_mask == 0): it contributes no pixels, so
+    // rendering + presenting its bare clear would overwrite the last real frame (an art/clear flicker).
+    // (Ported from PR #31.)
+    if (ps.color_write_mask == 0) {
+        if (log) fprintf(stderr, "[exec] skip: color_write_mask==0 (no-op draw)\n");
+        return {};
+    }
     // The draw's vertex count (first draw; 3 as a fallback) so the VS runs for the right # of vertices.
     uint32_t vertex_count = st.draws.empty() ? 3u : st.draws[0].index_count;
     if (vertex_count == 0) vertex_count = 3;
+    // Fullscreen-composite quad fill. The game tiles a 4-corner quad buffer into two triangles via
+    // *indexed* triangle-list draws; our single-draw offscreen spine renders draws[0] (one triangle),
+    // leaving the other half as the clear. When the bound vertex buffer is exactly a 4-vertex quad, render
+    // its 4 corners as a triangle FAN — for a convex quad in perimeter order (BL,TL,TR,BR) the fan tris
+    // {0,1,2},{0,2,3} tile the whole quad. Only triggers for a 4-record buffer, so real triangle meshes
+    // (records != 4) keep the single-draw behavior. Proper fix = honor indexed/multi-draw (see
+    // docs/REAL_FRAMES_FINDINGS.md). CONFIDENCE: MED (heuristic; correct for this game's fullscreen blit).
+    if (vrt) for (const auto& r : vrt->resources) {
+        if (r.cls == ResourceClass::VertexBuffer && r.stride && (r.size / r.stride) == 4 && vertex_count <= 4) {
+            vertex_count = 4; ps.topology = 5 /*VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN*/; break;
+        }
+    }
+    if (const char* vc = getenv("PROSPER_VCOUNT")) { int v = atoi(vc); if (v > 0) vertex_count = (uint32_t)v; }
+    if (const char* tp = getenv("PROSPER_TOPO")) { int t = atoi(tp); if (t >= 0) ps.topology = (uint32_t)t; }
+    if (getenv("PROSPER_DRAWLOG")) { fprintf(stderr, "[exec] draws=%zu:", st.draws.size());
+        for (auto& d : st.draws) fprintf(stderr, " ic=%u", d.index_count); fprintf(stderr, " topo=%u -> vcount=%u\n", rs.prim_type, vertex_count); fflush(stderr); }
     return render(vs, fs, ps, vrt.get(), prt.get(), vertex_count);
 }
 
