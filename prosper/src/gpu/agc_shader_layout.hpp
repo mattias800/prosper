@@ -70,8 +70,9 @@ struct DecodedImageDescriptor {
 // Decode an 8-dword T# (RDNA2/Gen5 image resource). Pure; exposed for reuse + testing.
 DecodedImageDescriptor decode_image_descriptor(const uint32_t t[8]);
 
-// Map a GCN/Gen5 buffer (DFMT, NFMT) pair to a DataFormat + component count. Pure.
-void buffer_format(uint32_t dfmt, uint32_t nfmt, DataFormat* out_fmt, uint32_t* out_components);
+// Map an RDNA2 (GFX10/PS5) combined 7-bit buffer FORMAT (V# dword3 bits [18:12]) to a DataFormat +
+// component count. Unknown/unhandled values yield DataFormat::Unknown. Pure; exposed for testing.
+void rdna2_buffer_format(uint32_t fmt, DataFormat* out_fmt, uint32_t* out_components);
 
 // FRONT-HALF DELIVERABLE: build the resource table a shader uses. `user_sgprs` is the shader's bound
 // user-data SGPR block (num_user_sgprs dwords) — the V# descriptors live there at each sharp's
