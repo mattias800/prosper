@@ -60,6 +60,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_hle_registered PRIVATE prosper_core)
   add_test(NAME hle_functions_registered COMMAND test_hle_registered)
 
+  # sceAudioOut HLE: format decode, port lifecycle, PCM forwarding, volume, batch, error paths
+  # (via a capturing AudioSink — headless, no device).
+  add_executable(test_audio tests/test_audio.cpp)
+  target_link_libraries(test_audio PRIVATE prosper_core)
+  add_test(NAME audio_hle COMMAND test_audio)
+
   add_executable(test_equeue_events tests/test_equeue_events.cpp)
   target_link_libraries(test_equeue_events PRIVATE prosper_core)
   add_test(NAME equeue_events COMMAND test_equeue_events)
