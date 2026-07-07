@@ -47,11 +47,23 @@ HLE(s_np_country)     { if (a1) memset(PW(a1), 0, 4); return 0; }
 HLE(s_open)           { return g_handle++; }                                 // scePadOpen/sceMouseOpen -> handle
 // Conservative output sizes so we don't smash a smaller caller buffer.
 HLE(s_pad_info)       { if (a1) memset(PW(a1), 0, 0x20); return 0; }          // controller info -> zeroed
+// ScePadData is 0x78 bytes (cross-checked against the Kyty reference PadData: buttons @0x00,
+// sticks @0x04, touch data @0x30, connected @0x48, timestamp @0x50, extension tail to 0x77).
+// Zero ALL of it: a stub that claims "1 entry read" while zeroing only part of the struct hands
+// the game uninitialized touch/timestamp/connected bytes. CONFIDENCE: MED (offsets from Kyty).
+static void fill_pad_data(uint8_t* d) {
+    memset(d, 0, 0x78);
+    if (getenv("PROSPER_PAD_PRESS")) {
+        *(uint32_t*)(d + 0x00) = 0x4000u;              // buttons: CROSS held
+        d[0x04] = d[0x05] = d[0x06] = d[0x07] = 128;   // sticks centered
+        d[0x48] = 1;                                   // connected = true
+    }
+}
 HLE(s_pad_read)       {
     static unsigned n = 0; n++;
     if (getenv("PROSPER_PADLOG") && (n <= 5 || n % 200 == 0)) fprintf(stderr, "[pad] scePadRead call #%u\n", n);
-    if (a1) { uint8_t* d = (uint8_t*)PW(a1); memset(d, 0, 0x30);
-        if (getenv("PROSPER_PAD_PRESS")) { *(uint32_t*)(d + 0x00) = 0x4000u; d[0x04]=d[0x05]=d[0x06]=d[0x07]=128; d[0x2C]=1; } }
+    if (!a1) return 0;                                 // no output buffer -> no entries read
+    fill_pad_data((uint8_t*)PW(a1));
     return 1;   // scePadRead returns the number of pad data entries read (>0 = data available)
 }
 // scePadReadState. Normally neutral (all zero). Two diagnostics: PROSPER_PADLOG counts calls (is the game
@@ -61,15 +73,14 @@ HLE(s_pad_readstate)  {
     static unsigned n = 0; n++;
     if (getenv("PROSPER_PADLOG") && (n <= 5 || n % 200 == 0))
         fprintf(stderr, "[pad] scePadReadState call #%u\n", n);
-    if (a1) { uint8_t* d = (uint8_t*)PW(a1); memset(d, 0, 0x30);
-        if (getenv("PROSPER_PAD_PRESS")) {
-            *(uint32_t*)(d + 0x00) = 0x4000u;   // buttons: CROSS held
-            d[0x04] = d[0x05] = d[0x06] = d[0x07] = 128;   // sticks centered
-            d[0x2C] = 1;                        // connected = true (best-effort offset)
-        }
-    }
+    if (a1) fill_pad_data((uint8_t*)PW(a1));
     return 0;
 }
+// sceMouseRead(handle, SceMouseData*, num) returns the number of mouse events read. SceMouseData
+// (~0x18 bytes) is NOT ScePadData — sharing the pad stub returned one "valid" entry whose 0x30-byte
+// memset already overran a single-entry mouse buffer, and the game consumed a phantom mouse event
+// every call. No mouse attached: zero one entry defensively, report 0 events.
+HLE(s_mouse_read)     { if (a1) memset(PW(a1), 0, 0x18); return 0; }
 
 // --- app content ---
 HLE(s_appcontent_int) { if (a1) *(int32_t*)PW(a1) = 0; return 0; }
@@ -118,7 +129,7 @@ void register_service_hle() {
     R("scePadRead", s_pad_read);
     R("sceMouseInit", s_ok);
     R("sceMouseOpen", s_open);
-    R("sceMouseRead", s_pad_read);
+    R("sceMouseRead", s_mouse_read);
     // app content / dialogs
     R("sceAppContentInitialize", s_ok);
     R("sceAppContentAppParamGetInt", s_appcontent_int);
