@@ -5,6 +5,7 @@
 // guest's address-space construction. Guarded to Linux.
 #include "dispatch.hpp"
 #include "nid.hpp"
+#include "sync_futex.hpp"   // shared futex wake + waiter registration (also used by the GPU's label wake)
 
 #ifdef __linux__
 #include <sys/mman.h>
@@ -263,8 +264,10 @@ HLE(k_wait_on_address) {
                            (long)syscall(SYS_gettid), (unsigned long long)a0, *(uint32_t*)a0,
                            (unsigned long long)a1, pts ? (long long)(ts.tv_sec*1000000 + ts.tv_nsec/1000) : -1,
                            (unsigned long long)goff);
+    futex_wait_enter();   // registers this waiter so GPU-side label wakes know someone is blocked
     long r = syscall(SYS_futex, (uint32_t*)a0, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, (uint32_t)a1, pts, nullptr, 0);
     int e = errno;
+    futex_wait_exit();
     if (synclog()) fprintf(stderr, "[sync] T%ld WAIT.exit   addr=0x%llx r=%ld errno=%d\n",
                            (long)syscall(SYS_gettid), (unsigned long long)a0, r, r < 0 ? e : 0);
     // Return the RIGHT status to the guest. Previously we always returned 0 (=woken/success), so on a
@@ -278,7 +281,7 @@ HLE(k_wait_on_address) {
             // Fabricate the awaited signal: bump the count so the guest's loop acquires and proceeds.
             punch_budget.fetch_sub(1);
             *(volatile uint32_t*)(uintptr_t)a0 = (uint32_t)a1 + 1;
-            syscall(SYS_futex, (uint32_t*)a0, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, INT_MAX, nullptr, nullptr, 0);
+            futex_wake(a0, INT_MAX);
             fprintf(stderr, "[punch] T%ld addr=0x%llx exp=0x%llx -> fabricated signal (ra=eboot+0x%llx, budget=%d)\n",
                     (long)syscall(SYS_gettid), (unsigned long long)a0, (unsigned long long)a1,
                     (unsigned long long)(gra - 0x400000000ull), punch_budget.load());
@@ -291,11 +294,11 @@ HLE(k_wait_on_address) {
 HLE(k_wake_by_address) {
     if (!a0) return 0;
     int n = a1 ? (int)a1 : INT_MAX;
-    long w = syscall(SYS_futex, (uint32_t*)a0, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, n, nullptr, nullptr, 0);
+    futex_wake(a0, n);
     if (synclog()) {
         uint64_t wgoff = ((uint64_t*)__builtin_frame_address(0))[1] - 0x400000000ull;
-        fprintf(stderr, "[sync] T%ld WAKE       addr=0x%llx *addr=0x%x n=%d woke=%ld caller=eboot+0x%llx\n",
-                (long)syscall(SYS_gettid), (unsigned long long)a0, *(uint32_t*)a0, n, w, (unsigned long long)wgoff);
+        fprintf(stderr, "[sync] T%ld WAKE       addr=0x%llx *addr=0x%x n=%d caller=eboot+0x%llx\n",
+                (long)syscall(SYS_gettid), (unsigned long long)a0, *(uint32_t*)a0, n, (unsigned long long)wgoff);
     }
     return 0;
 }

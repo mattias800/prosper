@@ -1,16 +1,11 @@
 // command_processor.cpp — see command_processor.hpp.
 #include "command_processor.hpp"
+#include "hle/sync_futex.hpp"   // wake_label_waiters (shared with sceKernelWaitOnAddress's futex)
 #include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <chrono>
-#include <climits>
-#if defined(__linux__)
-#include <unistd.h>
-#include <sys/syscall.h>
-#include <linux/futex.h>
-#endif
 
 namespace prosper::gpu {
 
@@ -19,17 +14,10 @@ namespace prosper::gpu {
 // game's render/producer threads sync_on_address on the very labels the GPU writes via RELEASE_MEM /
 // WRITE_DATA, so without this wake they block forever on already-satisfied semaphores (the documented
 // 3-thread render deadlock — see hle_kernel_mem.cpp). This provides that missing GPU-completion wake.
+// wake_label_waiters shares the sync HLE's futex implementation and skips the syscalls (this runs per
+// RELEASE_MEM/WRITE_DATA packet) when no thread is blocked.
 // CONFIDENCE: HIGH (matches the futex model of sceKernelWaitOnAddress; guest+host share the address space).
-static void wake_on_label(uint64_t addr) {
-#if defined(__linux__)
-    if (!addr) return;
-    syscall(SYS_futex, (uint32_t*)(uintptr_t)addr, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, INT_MAX, nullptr, nullptr, 0);
-    // 64-bit labels: a waiter may block on the high dword too.
-    syscall(SYS_futex, (uint32_t*)(uintptr_t)(addr + 4), FUTEX_WAKE | FUTEX_PRIVATE_FLAG, INT_MAX, nullptr, nullptr, 0);
-#else
-    (void)addr;
-#endif
-}
+static void wake_on_label(uint64_t addr) { wake_label_waiters(addr); }
 
 // Disabled only for bring-up bisection. Honoring the Dcb's memory writes is correct default behavior:
 // because our CommandProcessor folds each submit synchronously, the pipe has "drained" by the time we
