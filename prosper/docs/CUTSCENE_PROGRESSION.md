@@ -338,3 +338,18 @@ timing Stopwatch) → null-guard past it → PREADLOG past the timing race → *
 assets with NO crash**, blocked only by the block-966 deser completion thrash + scene-activation/render.
 Remaining, all localized: (A) create a real WorkerThread Stopwatch [worked around], (B) block-966 deser
 completion, (C) cutscene draw render-target (color0_base==0) once the scene activates.
+
+### Block-966 stall characterized: main-thread deser loop / producer-consumer deadlock (well-formed data)
+- `/proc` thread states at the stall: the **main thread is state=R (busy-looping in userspace)** while
+  ~50 worker threads are blocked on `futex_do_wait`. Classic producer-consumer stall.
+- Read tids: the **main thread issues most `resources.assets` reads** (3966) and is the one re-reading
+  the 3 cycling blocks (727 AnimationClip / 961 RectTransform / 966 MonoBehaviour pathid 18918).
+- The objects are **well-formed** (UnityPy parses the file; its MonoBehaviour "read fail" is just a missing
+  custom type-tree, not corruption). So the game's deserializer loops on **valid data in our environment** —
+  an env-specific FileCacher/threading issue (cache-slot thrash under our thread layout, or a lost-wakeup
+  in the .NET Semaphore/EventWaitHandle coordination the WorkerThreads use), NOT a bad file or bad bytes.
+
+**Net:** the cutscene is behind a FileCacher/deser **completion deadlock** at ~80% (main spins, workers
+park). This is the final localized layer; it needs deep RE of the async-load thread coordination
+(.NET Semaphore/EventWaitHandle wakeups) or the SerializedFile CachedReader slot behavior under our
+threading — the same *class* as #42 (a sync primitive not behaving), one level up in the .NET threading stack.
