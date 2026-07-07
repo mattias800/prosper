@@ -36,6 +36,9 @@ void read_user_sgprs(const std::unordered_map<uint32_t, uint32_t>& sh, uint32_t 
     for (uint32_t i = 0; i < kUserSgprs; i++) { auto it = sh.find(base + i); out[i] = it == sh.end() ? 0u : it->second; }
 }
 
+} // namespace (guest_readable below has external linkage — declared in gpu_execute.hpp, shared with
+  // the HLE diagnostic probes that chase raw guest pointers)
+
 // Async-signal-safe-ish readability probe (guest memory is 1:1-mapped, but a mis-decoded address could
 // be unmapped): write() to /dev/null returns EFAULT for an unmapped source, so we can test a guest
 // address without risking a nested SIGSEGV on the render/submit thread. Always-true on Windows (the
@@ -51,6 +54,8 @@ bool guest_readable(uint64_t a, uint32_t n) {
 #else
 bool guest_readable(uint64_t, uint32_t) { return true; }
 #endif
+
+namespace {
 
 // --- Bindless-dynamic vertex-fetch resolution (const-fold the scalar setup) ---------------------------
 // This game's NGG vertex shader loads its vertex-buffer V# from a descriptor table at a RUNTIME-computed

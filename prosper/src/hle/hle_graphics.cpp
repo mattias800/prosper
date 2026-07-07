@@ -13,6 +13,7 @@
 #include "dispatch.hpp"
 #include "nid.hpp"
 #include "gpu/videoout_present.hpp"
+#include "gpu/gpu_execute.hpp"      // guest_readable (safe pointer probe for the diagnostic dumps)
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
@@ -372,24 +373,30 @@ uint64_t glog_impl(const char* nid, void* ra,
             // be >0x100000 and not obviously garbage. probe reads 16 dwords.
             // Only guest-mapped ranges: modules [0x4_00000000,0x7_00000000) or heap [0x7000_00000000,
             // 0x8000_00000000). Excludes ASCII-as-value (e.g. "Thread"=0x646165726854) that would segfault.
+            // A range check alone isn't enough — these windows are mostly UNMAPPED, so every deref is
+            // additionally gated on guest_readable (a probe that can't SIGSEGV). A worker-thread fault
+            // here would _exit(90) the emulator — the probe must never kill the process it diagnoses.
             auto looks_ptr = [](uint64_t p){ return (p >= 0x400000000ull && p < 0x700000000ull) ||
                                                     (p >= 0x700000000000ull && p < 0x800000000000ull); };
             auto probe = [&](const char* nm, uint64_t p){
-                if (!looks_ptr(p)) { fprintf(stderr, "  [zw] %s=0x%llx (imm/not-ptr)\n", nm, (unsigned long long)p); return; }
+                if (!looks_ptr(p) || !gpu::guest_readable(p, 16 * 4)) {
+                    fprintf(stderr, "  [zw] %s=0x%llx (imm/not-ptr/unmapped)\n", nm, (unsigned long long)p); return; }
                 const uint32_t* u = (const uint32_t*)(uintptr_t)p;
                 fprintf(stderr, "  [zw] %s=0x%llx:", nm, (unsigned long long)p);
                 for (int i = 0; i < 16; i++) fprintf(stderr, " %08x", u[i]);
                 fprintf(stderr, "\n");
             };
             probe("a0", a0); probe("a3", a3); probe("a4", a4);
-            const uint64_t* ctx = (const uint64_t*)(uintptr_t)a0;
-            for (int i = 0; i < 40; i++) {
-                uint64_t v = ctx[i];
-                if (looks_ptr(v)) {
-                    const uint32_t* u = (const uint32_t*)(uintptr_t)v;
-                    fprintf(stderr, "  [zw] a0[%d]=0x%llx ->", i, (unsigned long long)v);
-                    for (int j = 0; j < 8; j++) fprintf(stderr, " %08x", u[j]);
-                    fprintf(stderr, "\n");
+            if (looks_ptr(a0) && gpu::guest_readable(a0, 40 * 8)) {
+                const uint64_t* ctx = (const uint64_t*)(uintptr_t)a0;
+                for (int i = 0; i < 40; i++) {
+                    uint64_t v = ctx[i];
+                    if (looks_ptr(v) && gpu::guest_readable(v, 8 * 4)) {
+                        const uint32_t* u = (const uint32_t*)(uintptr_t)v;
+                        fprintf(stderr, "  [zw] a0[%d]=0x%llx ->", i, (unsigned long long)v);
+                        for (int j = 0; j < 8; j++) fprintf(stderr, " %08x", u[j]);
+                        fprintf(stderr, "\n");
+                    }
                 }
             }
         }
