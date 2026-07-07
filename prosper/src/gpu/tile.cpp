@@ -48,7 +48,19 @@ void detile_surface(uint8_t* dst, const uint8_t* src, uint32_t width, uint32_t h
 std::vector<uint8_t> detile_surface(const std::vector<uint8_t>& src, uint32_t width, uint32_t height,
                                     uint32_t tile_mode, uint32_t pitch) {
     std::vector<uint8_t> out((size_t)width * height * 4, 0);
-    if (!src.empty()) detile_surface(out.data(), src.data(), width, height, tile_mode, pitch);
+    if (src.empty()) return out;
+    // Enforce the "src holds at least tiled_surface_bytes" precondition here instead of trusting the
+    // caller: the pointer overload's bounds guard is computed from the DIMENSIONS (padded height), so a
+    // naturally-sized width*height*4 vector would be read past its heap allocation. Short input is
+    // zero-padded — missing tail texels detile as zero, matching the pointer overload's OOB policy.
+    const size_t need = tiled_surface_bytes(width, height, tile_mode, pitch);
+    if (src.size() < need) {
+        std::vector<uint8_t> padded(need, 0);
+        std::memcpy(padded.data(), src.data(), src.size());
+        detile_surface(out.data(), padded.data(), width, height, tile_mode, pitch);
+    } else {
+        detile_surface(out.data(), src.data(), width, height, tile_mode, pitch);
+    }
     return out;
 }
 
