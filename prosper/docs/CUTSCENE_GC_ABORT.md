@@ -74,6 +74,28 @@ PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_PAD_PRESS=1 \
   host stack-protector ("stack smashing detected"). Reverted. The `%fs`-mid-HLE case is a real
   latent hazard worth fixing properly, but it is **not** the (sole) cause of this abort.
 
+## Attempted bypass: disable/defer the GC via its env knobs — BLOCKED (dead end)
+
+bdwgc reads `GC_DONT_GC` / `GC_INITIAL_HEAP_SIZE` / `GC_PRINT_STATS` from the environment; since
+the abort only fires *during* a collection, disabling or deferring collection would sidestep it
+entirely (a bounded leak is fine for a short cutscene — a standard emulator GC-bug workaround).
+Both delivery paths are blocked:
+
+1. **Stack `envp`** — the loader now builds a SysV `envp` from `PROSPER_GUEST_ENV`, but the PS5
+   crt0 does not consume it (`GC_PRINT_STATS=1` produced no GC output). The guest's `environ`
+   stays empty. (PS5 process env likely comes from the Sony process-param / `sceLibcParam`
+   structure, not the SysV stack vector.)
+2. **`getenv` HLE override** — registering our own `getenv` does not intercept the call: the
+   loader resolves imports "cross-module export beats a stub slot" (linker.cpp), and `libc.prx`
+   **exports** `getenv`, so the guest binds to the real libc.prx `getenv` (which reads the empty
+   `environ`). `PROSPER_GETENVLOG` showed zero calls routed to our handler.
+
+To make env-based GC control work, a future change must either fix the crt0 `envp` consumption
+(populate `libc.prx`'s `environ`) or patch the Sony process-param env — and even then it is
+unproven that `GC_DONT_GC` helps, since a Unity scene-transition `GC.Collect()` is explicit and
+`GC_DONT_GC` only disables *automatic* collection. Both env-plumbing changes were reverted (they
+did not function); only the diagnostics below remain.
+
 ## Open leads (ranked, for the next investigator)
 
 1. **A thread created/exited DURING a stop-the-world.** Unity's job system spins worker threads
@@ -104,3 +126,8 @@ PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_PAD_PRESS=1 \
   llvmpipe a 1080p render is ~10–20 s and `execute_and_present` is synchronous in the submit
   call, throttling the whole frame loop; sampling lets the game run near full speed toward a
   distant scene while still producing periodic frames.
+- **`PROSPER_PEEK_CODE=0xADDR[,0xADDR…]`** (boot_trace.cpp, under `PROSPER_CRASHPEEK`): dump 512
+  code bytes at each guest address after the recovered fault (guest memory still mapped) for
+  offline `objdump -b binary -m i386:x86-64`. Used to disassemble the guest GC suspend-handler
+  thunk at `0x4c0000210` (confirmed it extracts `ctx[0xf8]` as the thread sp — which our exception
+  delivery already populates correctly — and tail-calls the real handler behind a global pointer).

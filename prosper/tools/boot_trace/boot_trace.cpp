@@ -321,6 +321,21 @@ int main(int argc, char** argv) {
         insn("rip", r.fault_rip);
         for (size_t i = 0; i < r.backtrace.size() && i < 5; i++)
             insn("call@", r.backtrace[i] >= 5 ? r.backtrace[i] - 5 : r.backtrace[i]);
+        // PROSPER_PEEK_CODE=0xADDR[,0xADDR...]: dump 512 code bytes at each guest address (still mapped
+        // post-fault) for offline `objdump -b binary -m i386:x86-64 --adjust-vma=ADDR`. Used to
+        // disassemble the guest GC suspend handler etc. without extracting the SELF module.
+        if (const char* pc = getenv("PROSPER_PEEK_CODE")) {
+            for (const char* p = pc; *p; ) {
+                uint64_t a = strtoull(p, nullptr, 0);
+                printf("  [code] 0x%llx:", (unsigned long long)a);
+                for (int i = 0; i < 512; i++) {
+                    if (prosper::gpu::guest_readable(a + i, 1)) printf(" %02x", *(const uint8_t*)(uintptr_t)(a + i));
+                    else { printf(" ??"); break; }
+                }
+                printf("\n");
+                const char* c = strchr(p, ','); if (!c) break; p = c + 1;
+            }
+        }
     }
     return 0;
 }
