@@ -215,3 +215,24 @@ managed object the getter reads `[+0x20]` from) is never initialized before the 
 candidates: the worker's C# init/ctor didn't run, or a native icall backing it returns wrong. It is now a
 clean, deterministic, single-field bug (no longer corruption), so a data write-watch on that field or the
 `WorkerThread` ctor is the decisive next probe.
+
+### Stub test + full backtrace (confirming the field must be REAL, not bypassed)
+
+Stubbing the getter to `xor eax,eax; ret` (`0x4416375e0=0x31,c0,c3`) — the workaround the parallel agent
+tried pre-#42 — was RE-TESTED on merged master (with #42's corruption fixes): the game now runs
+**crash-free for 386+ frames** (no crash), BUT stays **stuck** — only 3 `resources.assets` reads, every
+frame a plain blue clear, the cutscene scene never activates. So the getter's real return value drives
+async-load progression; returning 0 stalls it. **The field must be genuinely populated, not bypassed.**
+
+Full crash backtrace (main frame loop → Unity PreloadManager async-scene integration → managed getter):
+```
+Il2cpp+0x1637697 (cmpb 0x20(%rbx), rbx=WorkerThread.field_0x40=null)
+Il2cpp+0x175c99c → +0x618556 → +0x617fff → +0x16ba41 → +0x16b981
+eboot +0xcc8e5f → 0xd36ebb → 0xce8671 → 0xce8eb3 → 0xce8593  (SerializedFile / PreloadManager integrate)
+eboot +0xd4f607 → 0xd4f3c7 → 0xb03e32 → 0xb03c24 → 0xb05e7b → 0xb06d3a → 0xae47e1 → 0xae4836
+eboot +0x147b483 (Unity main frame loop) → 0x1485851 → 0xaf
+```
+So the remaining, precisely-scoped blocker: **the managed `WorkerThread` object's `+0x40` field is never
+initialized before Unity's PreloadManager integrates the async scene load on the main thread.** Next probe:
+a write-watch on `[WorkerThread+0x40]` from the object's allocation to find its intended writer (the
+WorkerThread ctor / a native icall), or resolve the getter's declaring class to name the expected type.
