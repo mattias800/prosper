@@ -1,6 +1,12 @@
 // command_processor.cpp — see command_processor.hpp.
 #include "command_processor.hpp"
 #include "hle/sync_futex.hpp"   // wake_label_waiters (shared with sceKernelWaitOnAddress's futex)
+
+// hle_graphics.cpp: perform the videoout flip for an in-stream SetFlip packet — advances the flip
+// status (count/flipArg/currentBuffer) that sceVideoOutGetFlipStatus reports, exactly like the API
+// flip does. The game's frame pacer polls that status for its submitted flipArg; a dropped in-stream
+// flip stalls the frame loop at one rendered frame.
+extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx, uint32_t flip_mode, int64_t flip_arg);
 #include <cstdlib>
 #include <cstdint>
 #include <cstdio>
@@ -118,8 +124,14 @@ void GpuState::apply(const Pm4Command& c) {
         case K::WriteData:
             honor_write_data(c);    // inline data write requested by the Dcb
             break;
+        case K::Flip:
+            // The GPU reaching the SetFlip packet IS the flip moment (synchronous fold): perform the
+            // videoout flip so GetFlipStatus advances and the game's frame pacer sees its flipArg
+            // complete. Only for a fully-decoded payload — a short packet must not fabricate a flip.
+            if (c.flip_valid) prosper_vo_flip_from_gpu(c.flip_handle, c.flip_bufidx, c.flip_mode, c.flip_arg);
+            break;
         default:
-            break;   // events / flips / unknown: no register-state effect (handled later)
+            break;   // events / waits / unknown: no register-state effect (handled later)
     }
 }
 

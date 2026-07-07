@@ -157,6 +157,7 @@ namespace { bool evlog() { static int v = getenv("PROSPER_EVLOG") ? 1 : 0; retur
 void prosper_eq_add_flip(uint64_t eq, int64_t ident, uint64_t udata);
 void prosper_eq_add_vblank(uint64_t eq, int64_t ident, uint64_t udata);
 void prosper_eq_add_eop(uint64_t eq, int64_t id, uint64_t udata);
+void prosper_eq_trigger_flip(int64_t flip_arg);   // fire flip-completion events (data=flipArg)
 // sceGnmAddEqEvent / GraphicsAddEqEvent (NID b0xyllnVY-I): register a GPU EOP/compute-ring completion
 // event source on an equeue. Mirrors shadPS4 sceGnmAddEqEvent (id=GfxEop=0x40 for gfx). The submit path
 // (hle_agc.cpp) fires prosper_eq_trigger_eop() on completion. NOTE: our target (The Messenger) never
@@ -190,7 +191,23 @@ HLE(g_vo_submitflip)  {
     g_current_buffer = (int32_t)a1;
     g_last_flip_arg = (int64_t)a3;
     gpu::present_flip((int)(int32_t)a1, (int64_t)a3);   // present the buffer (scanout front + count)
+    prosper_eq_trigger_flip((int64_t)a3);   // flip completed (synchronous): fire the flip event
     return 0;
+}
+// The GPU-side flip: an in-stream SetFlip packet (agc_dcb_set_flip) processed by the CommandProcessor.
+// This is how the game actually flips each frame — it queues the flip in the Dcb rather than calling
+// sceVideoOutSubmitFlip. The GPU reaching the packet IS the flip moment (our fold is synchronous), and
+// it must advance the SAME flip status (count/flipArg/currentBuffer) that GetFlipStatus reports:
+// Unity's frame pacer polls for its submitted flipArg to complete before building the next frame, so
+// dropping this packet stalls the game at one rendered frame forever.
+extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx, uint32_t flip_mode, int64_t flip_arg) {
+    if (evlog()) fprintf(stderr, "[ev] GpuFlip handle=0x%x bufidx=%d mode=0x%x fliparg=0x%llx\n",
+                         handle, bufidx, flip_mode, (unsigned long long)flip_arg);
+    g_flip_count++;
+    g_current_buffer = bufidx;
+    g_last_flip_arg = flip_arg;
+    gpu::present_flip(bufidx, flip_arg);   // scanout bookkeeping, same as the API flip
+    prosper_eq_trigger_flip(flip_arg);     // flip completed (synchronous): fire the flip event
 }
 HLE(g_vo_flippending) { if (evlog()) fprintf(stderr, "[ev] IsFlipPending\n"); return 0; }        // never pending
 HLE(g_vo_flipstatus)  { // (handle, SceVideoOutFlipStatus* status): report our simulated flip count.

@@ -73,7 +73,18 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
                     if (npl >= 3) c.rel_data_sel = pl[2];
                     if (npl >= 5) { c.rel_value = (uint64_t)pl[3] | ((uint64_t)pl[4] << 32); c.rel_value_valid = true; }
                     break;
-                case R_FLIP:          c.kind = K::Flip;         break;
+                case R_FLIP:
+                    c.kind = K::Flip;
+                    // payload: [0]=videoout handle, [1]=buffer index, [2]=flip mode, [3..4]=64-bit
+                    // flipArg (see agc_dcb_set_flip).
+                    if (npl >= 5) {
+                        c.flip_handle = pl[0];
+                        c.flip_bufidx = (int32_t)pl[1];
+                        c.flip_mode   = pl[2];
+                        c.flip_arg    = (int64_t)((uint64_t)pl[3] | ((uint64_t)pl[4] << 32));
+                        c.flip_valid  = true;
+                    }
+                    break;
                 case R_DRAW_INDEX_AUTO:
                     c.kind = K::DrawIndexAuto;
                     if (npl >= 1) c.index_count = pl[0];

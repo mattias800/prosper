@@ -70,6 +70,16 @@ struct Pm4Command {
     uint64_t wd_addr = 0;                // WriteData: destination address
     uint32_t wd_num = 0;                 // WriteData: number of dwords to write
     const uint32_t* wd_data = nullptr;   // WriteData: -> the inline data dwords within the packet
+
+    // Flip — laid out by hle_agc.cpp agc_dcb_set_flip per sceAgcDcbSetFlip(buf, video_out_handle,
+    // display_buffer_index, flip_mode, flip_arg). Packet payload: [0]=videoout handle, [1]=display
+    // buffer index, [2]=flip mode, [3..4]=64-bit flipArg. The GPU processing this packet IS the flip
+    // moment: it must advance the videoout flip status (count/flipArg/currentBuffer) the game polls.
+    uint32_t flip_handle = 0;            // Flip: sceVideoOut handle
+    int32_t  flip_bufidx = -1;           // Flip: display buffer index (-1 = not decoded)
+    uint32_t flip_mode = 0;              // Flip: flip mode
+    int64_t  flip_arg = 0;               // Flip: the game's 64-bit flip argument
+    bool     flip_valid = false;         // Flip: payload was long enough to carry the fields
 };
 
 // Decode `dwords` dwords starting at `buf` into `out` (appended). Returns the number of dwords
