@@ -30,6 +30,7 @@
 #include <vector>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #endif
 
 // PROSPER_CRASHPEEK (below) needs these in every config — the gpu/*.hpp includes above are gated on
@@ -150,6 +151,47 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "[patch] byte 0x%02x @ 0x%llx\n", (unsigned)(v & 0xff), (unsigned long long)a);
                 s = (e2 && *e2 == ',') ? e2 + 1 : (e2 ? e2 : s + 1);
             } else s = (e1 && *e1) ? e1 + 1 : s + 1;
+        }
+    }
+    // PROSPER_NULLGUARD=addr,len : install a null-receiver guard trampoline on the guest method at `addr`.
+    // If its first arg (rdi = the C# `this`) is null, return 0 immediately; otherwise run the original.
+    // Motivation: the cutscene-load crash is a property getter on `WorkerThread.field_0x40`, a
+    // System.Diagnostics.Stopwatch that Unity's async loader has not yet created (see
+    // CUTSCENE_PROGRESSION.md) — the getter dereferences the null Stopwatch in every path. Returning 0 for a
+    // null/unstarted timer is a defensible, non-faking behavior (an unstarted Stopwatch reads 0 elapsed), so
+    // this lets the REAL cutscene render past the crash while the engine-level "create the Stopwatch"
+    // fix is developed. `len` = number of whole prologue bytes to relocate (>=5). Requires an executable
+    // guest-adjacent cave within +/-2GB so a 5-byte jmp rel32 reaches it.
+    if (const char* ng = getenv("PROSPER_NULLGUARD")) {
+        char* e1 = nullptr; uint64_t addr = strtoull(ng, &e1, 0);
+        long len = (e1 && *e1 == ',') ? strtol(e1 + 1, nullptr, 0) : 13;
+        if (addr && len >= 5) {
+            // Cave near the guest modules (within 2GB of Il2cpp at 0x440000000) so jmp rel32 reaches.
+            void* cave = mmap((void*)0x460000000ull, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC,
+                              MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+            if (cave == MAP_FAILED) { fprintf(stderr, "[nullguard] cave mmap failed\n"); }
+            else {
+                uint8_t* c = (uint8_t*)cave; size_t o = 0;
+                c[o++] = 0x48; c[o++] = 0x85; c[o++] = 0xff;                 // test rdi,rdi
+                c[o++] = 0x74; c[o++] = (uint8_t)(len + 5);                  // jz ret0 (past prologue+jmp)
+                memcpy(c + o, (void*)(uintptr_t)addr, len); o += len;        // relocated original prologue
+                c[o++] = 0xe9;                                               // jmp addr+len
+                int32_t rel = (int32_t)((int64_t)(addr + len) - (int64_t)(uintptr_t)(c + o + 4));
+                memcpy(c + o, &rel, 4); o += 4;
+                // ret0: return a monotonic counter (rdtsc) as the "elapsed" value. A null/unstarted Stopwatch
+                // returning 0 breaks Unity's async-load time-budget (it measures elapsed to decide when to
+                // yield); a real increasing value lets that logic see time pass and progress. rax = tsc.
+                c[o++] = 0x0f; c[o++] = 0x31;                                // rdtsc  (edx:eax = tsc)
+                c[o++] = 0x48; c[o++] = 0xc1; c[o++] = 0xe2; c[o++] = 0x20;  // shl rdx, 32
+                c[o++] = 0x48; c[o++] = 0x09; c[o++] = 0xd0;                 // or rax, rdx
+                c[o++] = 0xc3;                                               // ret
+                // Patch method entry: jmp cave (5 bytes). Remaining relocated bytes stay as harmless tail.
+                uint8_t* g = (uint8_t*)(uintptr_t)addr;
+                int32_t jrel = (int32_t)((int64_t)(uintptr_t)cave - (int64_t)(uintptr_t)(g + 5));
+                g[0] = 0xe9; memcpy(g + 1, &jrel, 4);
+                fprintf(stderr, "[nullguard] installed on 0x%llx (len=%ld) cave=%p\n",
+                        (unsigned long long)addr, len, cave);
+            }
         }
     }
 

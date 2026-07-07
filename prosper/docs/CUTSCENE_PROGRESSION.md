@@ -191,3 +191,104 @@ GC. Which specific terminal fault wins (`Il2cpp+0x1637697` activation-NRE vs. th
 "Unexpected state" abort) is timing-dependent, but both fire at/just-before activation. **Net: the single
 remaining blocker is unchanged — populate the null managed field `[callerObj+0x40]` on the activation path
 (and/or fix the GC stop-the-world race) — but the scene now provably loads to 100% first.**
+
+## UPDATE (post-#42) — crash is now DETERMINISTIC and identified: `WorkerThread.field_0x40` is null
+
+After #42 (static-mutex/GC-lock fix) landed, the level1 crash changed character completely:
+- **Before #42:** random crash signatures (`0x500004a20` GC abort, `0x44000b03b`, `0x44017fc23`, …) —
+  the fingerprint of heap/free-list corruption from the never-locked GC allocation lock.
+- **After #42:** 4/4 repros crash **identically** at `Il2cpp+0x1637697`, `kind=2`, after exactly 2
+  `resources.assets` reads. The corruption randomness is gone; this is now a single deterministic bug.
+
+**Identified via `PROSPER_HWBP_KLASS` (new, this branch)** — a bp at the caller (`Il2cpp+0x175c991`,
+`mov rdi,[rbx+0x40]; call getter`) dumps the il2cpp class name of the receiver:
+```
+[hwbp-klass] rbx obj=… klass=… name="WorkerThread"    [obj+0x40]=0x0     <- the null field
+[hwbp-klass] r14 obj=… klass=… name="AsyncRequest`1"  [obj+0x40]=<valid> <- the node being iterated
+```
+So a **`WorkerThread`** managed object has a **null field at +0x40**, and the caller loop (iterating a
+list of `AsyncRequest\`1`) calls a property getter on that null → `cmpb 0x20(%rbx)` with `rbx=null`
+(`Il2cpp+0x1637694`). This is Unity's **async asset-loading job system**; `WorkerThread.field_0x40` (a
+managed object the getter reads `[+0x20]` from) is never initialized before the main thread accesses it.
+
+**Next (the pure remaining blocker):** find what sets `WorkerThread.field_0x40` and why it's null here —
+candidates: the worker's C# init/ctor didn't run, or a native icall backing it returns wrong. It is now a
+clean, deterministic, single-field bug (no longer corruption), so a data write-watch on that field or the
+`WorkerThread` ctor is the decisive next probe.
+
+### Stub test + full backtrace (confirming the field must be REAL, not bypassed)
+
+Stubbing the getter to `xor eax,eax; ret` (`0x4416375e0=0x31,c0,c3`) — the workaround the parallel agent
+tried pre-#42 — was RE-TESTED on merged master (with #42's corruption fixes): the game now runs
+**crash-free for 386+ frames** (no crash), BUT stays **stuck** — only 3 `resources.assets` reads, every
+frame a plain blue clear, the cutscene scene never activates. So the getter's real return value drives
+async-load progression; returning 0 stalls it. **The field must be genuinely populated, not bypassed.**
+
+Full crash backtrace (main frame loop → Unity PreloadManager async-scene integration → managed getter):
+```
+Il2cpp+0x1637697 (cmpb 0x20(%rbx), rbx=WorkerThread.field_0x40=null)
+Il2cpp+0x175c99c → +0x618556 → +0x617fff → +0x16ba41 → +0x16b981
+eboot +0xcc8e5f → 0xd36ebb → 0xce8671 → 0xce8eb3 → 0xce8593  (SerializedFile / PreloadManager integrate)
+eboot +0xd4f607 → 0xd4f3c7 → 0xb03e32 → 0xb03c24 → 0xb05e7b → 0xb06d3a → 0xae47e1 → 0xae4836
+eboot +0x147b483 (Unity main frame loop) → 0x1485851 → 0xaf
+```
+So the remaining, precisely-scoped blocker: **the managed `WorkerThread` object's `+0x40` field is never
+initialized before Unity's PreloadManager integrates the async scene load on the main thread.** Next probe:
+a write-watch on `[WorkerThread+0x40]` from the object's allocation to find its intended writer (the
+WorkerThread ctor / a native icall), or resolve the getter's declaring class to name the expected type.
+
+### Write-watch: `WorkerThread.field_0x40` is NEVER written (confirmed missing init)
+
+Armed a HW write-watch on `[WorkerThread+0x40]` (`PROSPER_HWWATCH=0x40 PROSPER_HWWATCH_REG=rbx` at the
+caller bp) with the getter stubbed so the game runs freely. Result: the watch armed, the game ran, and
+**no writer of that field was ever caught on the main thread** — the field is simply never initialized.
+Also observed: with the getter bypassed the async loader **stalls after 3 `resources.assets` reads**
+(386 blue frames, no progress) — integration and the loader are coupled, so the missing field both
+crashes integration AND leaves the scene unloaded.
+
+Conclusion: the blocker is a **missing initialization of the managed `WorkerThread.field_0x40`** in Unity's
+async-scene-load path (PreloadManager). It is deterministic (post-#42), never written by the main thread,
+and cannot be bypassed (stub → scene never activates). The fix requires identifying the field's intended
+initializer — either the `WorkerThread` ctor path (if main-thread) or a worker/preload thread's setup
+(a HW watch is per-thread, so a worker-thread writer would not appear in the main-thread watch above).
+This is Unity async-load engine internals; handing off with the exact field + backtrace + repro.
+
+### RESOLVED the type: `WorkerThread.field_0x40` is a null `System.Diagnostics.Stopwatch`
+
+`PROSPER_HWBP_GLOBAL=0x442302518` resolves the getter's declaring class from its class-global:
+**`name="Stopwatch"`**. So `WorkerThread.field_0x40` is a `System.Diagnostics.Stopwatch` instance that
+Unity's async loader uses to time each `AsyncRequest`, and it is null. Our timer HLE
+(`sceKernelGetProcessTimeCounter`, `clock_gettime`, `sceKernelReadTsc`) is implemented, so the Stopwatch
+*class* works — the *instance* is simply never created for this WorkerThread.
+
+`PROSPER_HWBP_FIELDS=1` dumps the WorkerThread object — it is **partially initialized**, NOT a raw
+uninitialized object:
+```
+WorkerThread @…: +0x10=0 +0x18=0 +0x20=<obj> +0x28=<obj> +0x30=<obj> +0x38=0 +0x40=0(Stopwatch) +0x48=<obj> +0x50=0 +0x58=0 +0x60=<obj>
+```
+Several fields hold real objects (its ctor ran); only the Stopwatch at +0x40 (and a few others) is null.
+So the Stopwatch is created **later than the ctor** — most likely lazily on first use, or in the worker
+thread's `Run()` (to time its own work). The main thread's PreloadManager integration reaches the timing
+loop and reads the Stopwatch **before** it is created → deterministic null deref.
+
+**Precise remaining fix (for whoever owns Unity async-load):** ensure `WorkerThread`'s Stopwatch (+0x40)
+is created before PreloadManager's main-thread integration times its AsyncRequests — i.e. the worker's
+`Run()`/lazy Stopwatch setup must complete first (a start-ordering / worker-not-yet-run condition), OR the
+timing path must tolerate a not-yet-started worker. New diagnostics on this branch: `PROSPER_HWBP_KLASS`,
+`PROSPER_HWBP_GLOBAL`, `PROSPER_HWBP_FIELDS`.
+
+### Null-guard experiment: Stopwatch is crash #1, but a SEPARATE async-load stall (#2) sits behind it
+
+Added `PROSPER_NULLGUARD=addr,len` (boot_trace): a trampoline that returns early (0, or an rdtsc counter)
+when a guest method's receiver (`rdi`) is null. Installed on the Stopwatch getter, it **eliminates the
+crash** — the game runs 700+ frames with no fault. But the cutscene still does NOT render:
+- The async loader **stalls at exactly 3 `resources.assets` reads** and every frame is a blue clear.
+- Tested BOTH guard returns — `0` (unstarted-timer) and `rdtsc` (large monotonic). **Both stall at the
+  same 3 reads**, so the stall is NOT a Stopwatch-timing-magnitude artifact — it is a genuine SECOND
+  blocker in the async-scene-load path, sitting directly behind the Stopwatch crash.
+
+So reaching the cutscene needs (in order): #42 (done) → the `WorkerThread` Stopwatch init (crash #1) →
+whatever stalls `resources.assets` streaming at 3 reads (#2 — the loader stops issuing reads; likely
+waiting on a main-thread integration step that the missing-Stopwatch path never reaches on real HW).
+The layers keep peeling — each is Unity async-load engine internals. `PROSPER_NULLGUARD` is kept as a
+gated diagnostic (default no-op) for bisecting null-receiver crashes.
