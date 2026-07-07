@@ -67,6 +67,25 @@ is a 6-state jump-table mark/sweep machine driven by `[Il2cpp+0x267dee8]`. The r
 scene-load thread. The scene never activates (draw shader/`color0_base` unchanged; reads plateau ~block 977),
 because the GC crash kills the game during scene integration.
 
+## KEY finding — the GC is collecting LIVE objects (root/marking bug), not just tripping over deser garbage
+
+Added a bring-up diagnostic `PROSPER_PATCH_RET=addr[,addr...]` (boot_trace) that writes `0xC3` (ret) at a
+guest address to neutralize a function. Patching the per-frame incremental-GC pump
+(`PROSPER_PATCH_RET=0x440005df0`, = `Il2cpp+0x5df0`) **changes the render output**: `color0_base` goes from
+always `0x0` to real render-target addresses (`0x…df790000`). So with the incremental GC stopped, the
+scene's render targets **survive** — i.e. the incremental GC was **collecting live objects** (a missed
+root / missed write during incremental marking), not merely dereferencing a corrupt deserialized object.
+This redirects the root-cause hunt from "deser produces garbage" toward "our incremental-GC support drops a
+live reference." (Root capture in `exc_delivery_handler` looks complete — all 15 GP regs + rsp + `ctx[0xf8]`
+— so suspect either the incremental write-barrier path or static-field root registration.)
+
+**A second, INDEPENDENT null remains** even with the GC pump patched: the crash at `Il2cpp+0x1637697` is in
+a function whose start (`0x16375e0`) sets `rbx = rdi` (its argument), then derefs `[rbx+0x20]` — i.e. the
+**caller passed a null object**. This one is not GC-collected (it persists with GC off), so there are at
+least two distinct corruption sources feeding the null-deref crashes; both must be resolved to reach the
+cutscene. `PROSPER_NULL_PAGE` does not rescue these (the surviving faults include null writes / non-low
+addresses → uncaught SIGSEGV).
+
 ## Next steps (for reaching the cutscene)
 
 1. **Resolve the scene-load deserialization corruption** (the `FileCacher` stale-block issue in

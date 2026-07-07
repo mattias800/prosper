@@ -117,6 +117,20 @@ int main(int argc, char** argv) {
     install_trap_handler();
     run_guest_inits(p.init_fns);
 
+    // PROSPER_PATCH_RET=addr[,addr...]: write 0xC3 (ret) at each absolute guest address, neutralizing that
+    // function (returns immediately, stack balanced). Bring-up diagnostic to bisect a crashing subsystem —
+    // e.g. skip the per-frame incremental-GC pump (Il2cpp+0x5df0 => 0x440005df0) to test whether the GC is
+    // the wall to scene activation. Guest code is RWX; write before the guest starts.
+    if (const char* pr = getenv("PROSPER_PATCH_RET")) {
+        const char* s = pr;
+        while (*s) {
+            char* end = nullptr; uint64_t a = strtoull(s, &end, 0);
+            if (a && end != s) { *(volatile uint8_t*)(uintptr_t)a = 0xC3;
+                fprintf(stderr, "[patch] ret @ 0x%llx\n", (unsigned long long)a); }
+            s = (end && *end == ',') ? end + 1 : (end ? end : s + 1);
+        }
+    }
+
 #ifdef PROSPER_HAVE_VULKAN
     // PROSPER_RENDER=1: register the live Vulkan renderer so execute_and_present fires on every
     // submitted Dcb with draws (Stage A of GPU_EXECUTOR_DESIGN.md, now live). Each rendered frame
