@@ -564,6 +564,11 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
         if (presented && getenv("PROSPER_GFXLOG"))
             fprintf(stderr, "[agc] SubmitDcb #%llu: executed %zu draws -> presented %ux%u frame\n",
                     (unsigned long long)g_submit_count, agc_gpu_state().draws.size(), w, h);
+        // The draw list belongs to THIS submit — clear it after execution. (The register files
+        // legitimately persist: hardware context survives across submits.) Without this, draws
+        // accumulate for the whole process and every later frame re-renders with the FIRST draw's
+        // vertex count under whatever register state the latest submit left behind.
+        agc_gpu_state().draws.clear();
     }
     if (getenv("PROSPER_GFXLOG")) {
         fprintf(stderr, "[agc] SubmitDcb #%llu: %u dwords -> %zu packets applied (draws so far: %zu)\n",

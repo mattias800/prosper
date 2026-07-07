@@ -259,18 +259,22 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     return out;
 }
 
-// Give every resource its OWN descriptor binding, starting at 2 (0/1 reserved). The N-buffer model: the
-// shader reads several distinct constant buffers (Unity's per-draw transform, per-frame, …) + vertex
-// buffers + textures, and each must land at a separate binding so they don't collapse. The recompiler
-// declares a storage buffer (cbuf/vbuf) or image sampler (texture) at each binding and resolves an
-// s_buffer_load/image_sample to its resource's binding via provenance (by_sgpr_base / by_srt_offset).
-void assign_convention_bindings(ShaderResourceTable& t) {
-    uint32_t next = 2;
+// Give every resource its OWN descriptor binding, starting at `base` (0/1 reserved). The N-buffer
+// model: the shader reads several distinct constant buffers (Unity's per-draw transform, per-frame, …)
+// + vertex buffers + textures, and each must land at a separate binding so they don't collapse. The
+// recompiler declares a storage buffer (cbuf/vbuf) or image sampler (texture) at each binding and
+// resolves an s_buffer_load/image_sample to its resource's binding via provenance (by_sgpr_base /
+// by_srt_offset). `base` exists because BOTH stage tables land in ONE Vulkan descriptor set: if the VS
+// and PS tables each started at 2, their binding numbers would COLLIDE in the set layout (invalid —
+// and observed to make the PS's sampled texture read zeros, blanking the frame).
+void assign_convention_bindings(ShaderResourceTable& t, uint32_t base) {
+    uint32_t next = base;
     for (auto& r : t.resources) r.binding = next++;
 }
 }
 
-std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps) {
+std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps,
+                                                       uint32_t binding_base) {
     if (!code_addr) return nullptr;
     const auto* hdr = (const AgcShaderHeader*)prosper_agc_shader_header_for_code(code_addr);
     if (!hdr) return nullptr;
@@ -383,7 +387,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
             t.resources.push_back(r);
         }
         if (t.resources.empty()) continue;
-        assign_convention_bindings(t);
+        assign_convention_bindings(t, binding_base);
         if (log) {
             fprintf(stderr, "[restab] %s code=0x%llx base=0x%x -> %zu resources:\n",
                     is_ps ? "PS" : "VS", (unsigned long long)code_addr, base, t.resources.size());

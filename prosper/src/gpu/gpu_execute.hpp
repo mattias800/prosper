@@ -41,10 +41,14 @@ bool guest_readable(uint64_t addr, uint32_t bytes);
 
 // Build a shader stage's resource table from the folded GpuState: look up the registered shader header
 // by its bound code address, read its user-data SGPR block from the sh register file, decode the V#/T#/S#
-// descriptors, and assign bindings matching the recompiler+backend convention (constant buffer -> binding
-// 2, vertex buffer -> binding 3, textures -> binding 4+). Returns null if the stage has no shader header
-// or no resources. Implemented in gpu_executor.cpp (needs the AGC registry + descriptor decode).
-std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps);
+// descriptors, and assign each resource its own descriptor binding starting at `binding_base`. Returns
+// null if the stage has no shader header or no resources. Implemented in gpu_executor.cpp.
+// `binding_base`: BOTH stage tables land in ONE Vulkan descriptor set, so the bases must not overlap —
+// the caller gives the VS table base 2 and starts the PS table after the VS table's last binding.
+// Duplicate binding numbers in one set layout are invalid Vulkan and observably made the PS's sampled
+// texture read zeros (a black/blank composite).
+std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps,
+                                                       uint32_t binding_base = 2);
 
 // Recompile + resolve a GpuState and render it via `render`. Returns the pixels, or {} if there is nothing
 // to draw or a stage fails to recompile. `max_shader_dwords` bounds the recompiler's walk (it stops at
@@ -60,8 +64,11 @@ inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn&
                          (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr, st.draws.size());
         return {};
     }
-    std::shared_ptr<ShaderResourceTable> vrt = build_stage_table(st, rs.es_addr, false);
-    std::shared_ptr<ShaderResourceTable> prt = build_stage_table(st, rs.ps_addr, true);
+    std::shared_ptr<ShaderResourceTable> vrt = build_stage_table(st, rs.es_addr, false, 2);
+    // The PS table's bindings start AFTER the VS table's (both land in one descriptor set — see
+    // build_stage_table's contract; overlapping bindings zeroed the PS's sampled texture).
+    uint32_t ps_base = 2 + (vrt ? (uint32_t)vrt->resources.size() : 0);
+    std::shared_ptr<ShaderResourceTable> prt = build_stage_table(st, rs.ps_addr, true, ps_base);
     std::vector<uint32_t> vs = recompile_vertex((const uint32_t*)(uintptr_t)rs.es_addr, max_shader_dwords, vrt.get());
     std::vector<uint32_t> fs = recompile_fragment((const uint32_t*)(uintptr_t)rs.ps_addr, max_shader_dwords, prt.get());
     if (vs.empty() || fs.empty()) {                          // an unsupported shader — leave frame untouched
