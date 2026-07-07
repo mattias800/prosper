@@ -214,14 +214,20 @@ HLE(k_eq_wait)   {   // (eq, SceKernelEvent* ev, int num, int* out, SceKernelUse
             uint64_t* sp = (uint64_t*)__builtin_frame_address(0);
             for (int i = 0; i < 80; i++) {
                 uint64_t v = sp[i];
-                if (v >= 0x400000000ull && v < 0x4c0000000ull) {   // eboot / IL2CPP executable range
-                    fprintf(stderr, "[waitcaller] stack[%d] = eboot+0x%llx | code:", i, (unsigned long long)(v - 0x400000000ull));
-                    // Dump the bytes of the call + the loop's post-call check/branch (from a bit before the
-                    // return addr) so the wait-loop's exit condition can be disassembled offline.
-                    const uint8_t* code = (const uint8_t*)(uintptr_t)(v - 0x10);
-                    for (int b = 0; b < 0x40; b++) fprintf(stderr, "%02x", code[b]);
-                    fprintf(stderr, "\n");
-                }
+                if (v < 0x400000000ull || v >= 0x4c0000000ull) continue;   // eboot / IL2CPP executable range
+                // PRECISE: a genuine caller is a return address whose preceding 5 bytes are `call rel32`
+                // (0xe8) targeting the STUB region (0x6..) — i.e. the game's actual import call site, not an
+                // unrelated eboot address that happens to be on the stack (e.g. a Vorbis-decode frame).
+                const uint8_t* pre = (const uint8_t*)(uintptr_t)(v - 5);
+                if (pre[0] != 0xe8) continue;
+                int32_t rel = *(const int32_t*)(pre + 1);
+                uint64_t target = v + (uint64_t)(int64_t)rel;
+                if (target < 0x600000000ull || target >= 0x700000000ull) continue;   // must call a stub
+                fprintf(stderr, "[waitcaller] stack[%d] eboot+0x%llx -> stub+0x%llx | loopcode:", i,
+                        (unsigned long long)(v - 0x400000000ull), (unsigned long long)(target - 0x600000000ull));
+                const uint8_t* code = (const uint8_t*)(uintptr_t)(v - 0x18);
+                for (int b = 0; b < 0x40; b++) fprintf(stderr, "%02x", code[b]);
+                fprintf(stderr, "\n");
             }
             fprintf(stderr, "[waitcaller] ---\n");
         }
