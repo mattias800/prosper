@@ -48,6 +48,14 @@ struct RenderState {
     uint32_t cb_color_control  = 0;   // CB_COLOR_CONTROL
     uint32_t cb_blend0_control = 0;   // CB_BLEND0_CONTROL
     uint32_t cb_target_mask    = 0;   // CB_TARGET_MASK (per-MRT write mask)
+
+    // Viewport 0 transform (PA_CL_VPORT_{X,Y,Z}{SCALE,OFFSET} — IEEE-754 floats stored in the context
+    // registers; 0 when the guest never set them). Hardware applies screen = offset + scale * ndc, with
+    // screen-space Y increasing downward — a NEGATIVE yscale is how GNM-style +Y-up NDC reaches the
+    // top-left-origin render target.
+    float vport_xscale = 0, vport_xoffset = 0;
+    float vport_yscale = 0, vport_yoffset = 0;
+    float vport_zscale = 0, vport_zoffset = 0;
 };
 
 // Extract the render-state from a folded GpuState (pure; reads register files only).
@@ -68,6 +76,14 @@ struct ResolvedPipelineState {
     uint32_t dst_color_blend_factor = 0;   // == VkBlendFactor
     uint32_t color_blend_op         = 0;   // == VkBlendOp
     uint32_t color_write_mask       = 0xF; // == VkColorComponentFlags (RGBA); MRT0 nibble of CB_TARGET_MASK
+
+    // Guest viewport as a Vulkan viewport rect. `has_viewport` is false when the guest never programmed
+    // PA_CL_VPORT (then the backend keeps its full-target default). A guest with a negative yscale
+    // resolves to a NEGATIVE viewport_h — Vulkan's core-1.1 (maintenance1) flipped viewport — which
+    // reproduces the hardware's Y orientation exactly.
+    bool  has_viewport = false;
+    float viewport_x = 0, viewport_y = 0, viewport_w = 0, viewport_h = 0;
+    float min_depth = 0.0f, max_depth = 1.0f;
 };
 
 // Translate a RenderState's RDNA2 register semantics into Vulkan-ready pipeline state (pure).

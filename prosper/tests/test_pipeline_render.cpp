@@ -12,6 +12,7 @@
 #include "render_runner.h"
 #include "spirv_triangle.h"
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -108,6 +109,44 @@ int main() {
         printf("  center (z GREATER)   = (%u,%u,%u)\n", r, imgzf[center+1], b);
         CHECK(b > 128 && r < 128, "depth GREATER: fragment z=0 > clear 0.5 fails -> stays blue (depth honored)");
     } else { CHECK(false, "depth GREATER render produced a frame"); }
+
+    // Viewport honored: a guest PA_CL_VPORT with NEGATIVE yscale (GNM's +Y-up NDC) resolves to a
+    // negative-height Vulkan viewport, which must render the scene vertically MIRRORED relative to
+    // the default full-target viewport. Proof: the flipped render matches the default render mirrored
+    // row-by-row (small tolerance for edge fill-rule differences), and the triangle is vertically
+    // asymmetric so the comparison cannot pass vacuously.
+    {
+        namespace P = prosper::agc::Pm4;
+        auto f2u = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+        GpuState st;
+        st.uc[P::VGT_PRIMITIVE_TYPE]   = 4;                    // triangle list
+        st.cx[P::CB_TARGET_MASK]       = 0xF;
+        st.cx[P::PA_CL_VPORT_XSCALE]   = f2u((float)W / 2);    // full-target X
+        st.cx[P::PA_CL_VPORT_XOFFSET]  = f2u((float)W / 2);
+        st.cx[P::PA_CL_VPORT_YSCALE]   = f2u(-(float)H / 2);   // +Y-up NDC -> Vulkan flip
+        st.cx[P::PA_CL_VPORT_YOFFSET]  = f2u((float)H / 2);
+        st.cx[P::PA_CL_VPORT_ZSCALE]   = f2u(1.0f);
+        st.cx[P::PA_CL_VPORT_ZOFFSET]  = f2u(0.0f);
+        ResolvedPipelineState flip = resolve_pipeline_state(extract_render_state(st));
+        CHECK(flip.has_viewport, "PA_CL_VPORT registers resolved to a guest viewport");
+        CHECK(flip.viewport_h == -(float)H && flip.viewport_y == (float)H,
+              "negative yscale resolved to a negative-height (flipped) Vulkan viewport");
+        std::vector<uint8_t> imgf = render_triangle_rgba(vert, frag, W, H, &flip);
+        CHECK(imgf.size() == (size_t)W*H*4, "rendered with flipped guest viewport");
+        if (imgf.size() == (size_t)W*H*4) {
+            auto redat = [&](const std::vector<uint8_t>& im, uint32_t x, uint32_t y) {
+                const uint8_t* p = &im[((size_t)y * W + x) * 4]; return p[0] > 128 && p[2] < 128; };
+            // The default render (`img`, full mask, from above) mirrored must match the flipped render.
+            size_t mismatch = 0, self_mismatch = 0;
+            for (uint32_t y = 0; y < H; y++) for (uint32_t x = 0; x < W; x++) {
+                if (redat(imgf, x, y) != redat(img, x, H - 1 - y)) mismatch++;
+                if (redat(img,  x, y) != redat(img, x, H - 1 - y)) self_mismatch++;
+            }
+            printf("  flip mismatch=%zu asymmetry=%zu (of %u px)\n", mismatch, self_mismatch, W * H);
+            CHECK(mismatch < (size_t)W * H / 50, "flipped viewport == default render mirrored vertically");
+            CHECK(self_mismatch > (size_t)W * H / 50, "triangle is vertically asymmetric (test not vacuous)");
+        }
+    }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");

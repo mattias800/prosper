@@ -66,6 +66,14 @@ int main(int argc, char** argv) {
         { d + "/Media/Modules/PS5Util.prx", PS5UTIL },
         { d + "/sce_module/libc.prx", LIBC },
     };
+    // Cross-title tolerance (docs/CROSS_ENGINE_UE4.md step 1, minimal form): drop dependent modules
+    // whose file doesn't exist in this dump — e.g. the UE4 title ships no Il2cpp/PS5Util, so it links
+    // eboot + libc.prx only. The eboot (index 0) is always kept; each module keeps its fixed base.
+    // For the primary target every file exists, so its link is byte-for-byte unchanged.
+    for (size_t i = in.size(); i-- > 1; ) {
+        if (FILE* f = fopen(in[i].path.c_str(), "rb")) fclose(f);
+        else { printf("skipping absent module: %s\n", in[i].path.c_str()); in.erase(in.begin() + (ptrdiff_t)i); }
+    }
     if (!link_program(in, STUB, p, &e)) { printf("link failed: %s\n", e.c_str()); return 1; }
     printf("linked %zu modules; %zu imports (%zu cross-module, %zu stub slots); %zu init fns\n",
            p.mods.size(), p.total_imports, p.resolved_cross_module, p.slots.size(), p.init_fns.size());
@@ -247,9 +255,11 @@ int main(int argc, char** argv) {
                     }
                 }
                 if (getenv("PROSPER_GFXLOG")) fprintf(stderr,
-                    "[render] ps: topo=%u fmt=%u depth(test=%d write=%d op=%u) blend(en=%d src=%u dst=%u op=%u) mask=0x%x\n",
+                    "[render] ps: topo=%u fmt=%u depth(test=%d write=%d op=%u) blend(en=%d src=%u dst=%u op=%u) mask=0x%x "
+                    "vp(has=%d x=%.1f y=%.1f w=%.1f h=%.1f z=%.3f..%.3f)\n",
                     ps.topology, ps.color0_format, ps.depth_test_enable, ps.depth_write_enable, ps.depth_compare_op,
-                    ps.blend_enable, ps.src_color_blend_factor, ps.dst_color_blend_factor, ps.color_blend_op, ps.color_write_mask);
+                    ps.blend_enable, ps.src_color_blend_factor, ps.dst_color_blend_factor, ps.color_blend_op, ps.color_write_mask,
+                    ps.has_viewport, ps.viewport_x, ps.viewport_y, ps.viewport_w, ps.viewport_h, ps.min_depth, ps.max_depth);
                 // PROSPER_RENDER_NOPS: bypass the game's resolved pipeline state (default state instead) to
                 // isolate whether blend/depth/color-mask is discarding the fragments.
                 const prosper::gpu::ResolvedPipelineState* ps_use = getenv("PROSPER_RENDER_NOPS") ? nullptr : &ps;
