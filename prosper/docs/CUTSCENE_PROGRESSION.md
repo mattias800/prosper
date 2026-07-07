@@ -322,3 +322,19 @@ With #42 + null-guard + PREADLOG the game **runs with NO crash** and streams the
   independent FileCacher/deser cache-thrash.
 
 New gated diagnostics: `PROSPER_HWBP_FIELDS` now resolves each object-field's class; `PROSPER_FORCE_COLORWRITE`.
+
+### Block-966 thrash objects identified (UnityPy on resources.assets, 23495 objects)
+The tail-cycled blocks hold real cutscene content:
+- block 727 (0x2d70000): `AnimationClip` (pathid 2229)
+- block 961 (0x3c10000): `RectTransform` (pathid 18489)
+- block 966 (0x3c60000): `MonoBehaviour` (pathid 18918)
+So the deserializer is streaming the cutscene's UI/animation objects and re-reading around block 966. The
+thrash is at a specific object in the cutscene scene graph (independent of the Stopwatch timing). Cracking
+it needs deser-level RE of the object at pathid 18918 (a MonoBehaviour) and why its block set re-reads.
+
+### Session checkpoint — distance covered
+crash-at-SubmitDcb#46 (start) → #42 GC fix → deterministic null-Stopwatch crash (identified: WorkerThread
+timing Stopwatch) → null-guard past it → PREADLOG past the timing race → **streams ~80% of the cutscene
+assets with NO crash**, blocked only by the block-966 deser completion thrash + scene-activation/render.
+Remaining, all localized: (A) create a real WorkerThread Stopwatch [worked around], (B) block-966 deser
+completion, (C) cutscene draw render-target (color0_base==0) once the scene activates.
