@@ -126,6 +126,31 @@ namespace {
         void* p = mmap((void*)hint, len, prot, flags, -1, 0);
         return p == MAP_FAILED ? nullptr : p;
     }
+
+    // The direct-memory pool is backed by ONE shared memfd so every mapping of a phys offset
+    // aliases the SAME bytes — the console's unified-physical-memory contract. Independent
+    // anonymous pages per mapping broke aliasing: UE4's MallocBinned3 re-maps a committed phys
+    // page at a second VA and expects its block canaries there ("MallocBinned3 Corruption
+    // Canary" fatal without this). Sized to cover [0, kDmemBase + kDmemTotal) so offset == phys;
+    // the file is sparse, so unused ranges cost nothing.
+    int dmem_fd() {
+        static int fd = [] {
+            int f = (int)syscall(SYS_memfd_create, "prosper-dmem", 1 /*MFD_CLOEXEC*/);
+            if (f >= 0 && ftruncate(f, (off_t)(kDmemBase + kDmemTotal)) != 0) { close(f); f = -1; }
+            return f;
+        }();
+        return fd;
+    }
+    // Map `len` bytes of the phys pool at `hint` (0 = anywhere). Falls back to anonymous memory
+    // if the memfd is unavailable (still boots; loses aliasing).
+    void* map_phys_at(uint64_t hint, uint64_t len, int prot, uint64_t phys) {
+        int fd = dmem_fd();
+        if (fd >= 0 && phys < kDmemBase + kDmemTotal) {
+            void* p = mmap((void*)hint, len, prot, MAP_SHARED | (hint ? MAP_FIXED : 0), fd, (off_t)phys);
+            if (p != MAP_FAILED) return p;
+        }
+        return map_at(hint, len, prot);
+    }
 }
 
 // sceKernelReserveVirtualRange(void** addrInOut, size_t len, int flags, size_t align)
@@ -243,7 +268,7 @@ HLE(k_direct_memory_query) {
 // sceKernelMapDirectMemory(void** addrInOut, size_t len, int prot, int flags, off_t phys, size_t align)
 HLE(k_map_dmem) {
     uint64_t hint = a0 ? *(uint64_t*)a0 : 0;
-    void* p = map_at(hint, a1, host_prot(a2));
+    void* p = map_phys_at(hint, a1, host_prot(a2), a4);
     if (!p) { MLOG("map_dmem hint=0x%llx len=0x%llx FAILED\n", (unsigned long long)hint, (unsigned long long)a1); return 0x16; }
     if (a0) *(uint64_t*)a0 = (uint64_t)p;
     track((uint64_t)p, a1, host_prot(a2), true, "direct");
@@ -263,7 +288,11 @@ HLE(k_virtual_query) {
     uint64_t start, end; int prot; uint32_t flags;
     const char* how;
     if (m) {                                   // inside a real mapping
-        start = m->base; end = m->base + m->size; prot = 0x3; flags = 0x10; how = "tracked";
+        // Report the mapping's REAL commit state: a reserved-but-uncommitted range has NO access
+        // (prot 0). Lying prot=RW for the whole 512GB reservation made UE4's allocator skip its
+        // BatchMap commit for pages VirtualQuery claimed were already writable -> first-touch crash.
+        start = m->base; end = m->base + m->size;
+        prot = m->committed ? 0x3 : 0x0; flags = m->committed ? 0x10 : 0x0; how = "tracked";
     } else {                                   // unmapped: report the whole hole to the next mapping
         uint64_t nb = next_base(a0);
         if (!nb) { MLOG("virtual_query(0x%llx) -> end-of-space (EACCES)\n", (unsigned long long)a0); return 0x8002000e; }
@@ -385,6 +414,70 @@ HLE(k_release_dmem) {
     return 0;
 }
 
+// Most-specific tracked-mapping state at `addr` for the fault handler's lazy-commit probe:
+// 0 = untracked, 1 = reserved-but-uncommitted, 2 = committed. Called from a signal handler on the
+// FAULTING thread — that thread is in guest code, so it cannot itself hold g_mx (only HLE memory
+// entry points take it, briefly); a contended lock just waits for the other thread's release.
+extern "C" int prosper_reserved_range_state(uint64_t addr) {
+    std::lock_guard<std::mutex> lk(g_mx);
+    const Mapping* best = nullptr;
+    for (auto& m : g_maps)
+        if (addr >= m.base && addr < m.base + m.size)
+            if (!best || m.base > best->base) best = &m;
+    return best ? (best->committed ? 2 : 1) : 0;
+}
+
+// sceKernelBatchMap(SceKernelBatchMapEntry* entries, int numberOfEntries, int* numberOfEntriesOut)
+// Entry (0x20 bytes, Orbis ABI): start@0x00, physOffset@0x08, length@0x10, protection@0x18 (char),
+// type@0x19 (char), operation@0x1c (int). Operations: 0=MAP_DIRECT, 1=UNMAP, 2=PROTECT,
+// 3=MAP_FLEXIBLE, 4=TYPE_PROTECT. The UE4 title (PPSA17942) commits EVERY 64KB page of its
+// allocator arena through 1-entry batches (identified from the eboot's own assert strings:
+// "sceKernelBatchMap failed ..."); the previous unimplemented stub returned "success" having
+// mapped NOTHING, so the engine's memory never materialized and boot wedged before any file IO.
+// CONFIDENCE: MED on the exact entry ABI (PS4-documented layout; call sites disassembled match:
+// 0x4000-byte entry buffer = 512 * 0x20, count compared against numberOfEntriesOut).
+HLE(k_batch_map) {
+    const uint8_t* e = (const uint8_t*)(uintptr_t)a0;
+    int n = (int)(int64_t)a1, done = 0;
+    if (!e || n < 0) return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL
+    uint64_t ret = 0;
+    for (int i = 0; i < n; i++, e += 0x20) {
+        uint64_t start = *(const uint64_t*)(e + 0x00);
+        uint64_t phys  = *(const uint64_t*)(e + 0x08);
+        uint64_t len   = *(const uint64_t*)(e + 0x10);
+        uint8_t  prot  = e[0x18];
+        int32_t  op    = *(const int32_t*)(e + 0x1c);
+        bool ok = true;
+        switch (op) {
+            case 0: {                               // MAP_DIRECT: phys-backed (aliasing preserved)
+                void* p = map_phys_at(start, len, host_prot(prot), phys);
+                ok = (p != nullptr);
+                if (ok) track((uint64_t)p, len, host_prot(prot), true, "batch-direct");
+                break;
+            }
+            case 3: {                               // MAP_FLEXIBLE: anonymous
+                void* p = map_at(start, len, host_prot(prot));
+                ok = (p != nullptr);
+                if (ok) track((uint64_t)p, len, host_prot(prot), true, "batch-flex");
+                break;
+            }
+            case 1: if (start) munmap((void*)(uintptr_t)start, len); break;              // UNMAP
+            case 2: case 4:                                                              // PROTECT / TYPE_PROTECT
+                if (start) mprotect((void*)(uintptr_t)start, len, host_prot(prot)); break;
+            default: ok = false; ret = 0x80020016ull; break;
+        }
+        if (!ok) { if (!ret) ret = 0x8002000Cull; break; }   // ENOMEM on a failed map
+        done++;
+    }
+    MLOG("batchmap n=%d done=%d first{op=%d start=0x%llx len=0x%llx prot=0x%x} -> 0x%llx\n",
+         n, done, n ? *(const int32_t*)((const uint8_t*)(uintptr_t)a0 + 0x1c) : -1,
+         n ? (unsigned long long)*(const uint64_t*)(uintptr_t)a0 : 0ull,
+         n ? (unsigned long long)*(const uint64_t*)((const uint8_t*)(uintptr_t)a0 + 0x10) : 0ull,
+         n ? *((const uint8_t*)(uintptr_t)a0 + 0x18) : 0, (unsigned long long)ret);
+    if (a2) *(int32_t*)(uintptr_t)a2 = done;
+    return ret;
+}
+
 void register_kernel_mem_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
     R("sceKernelReserveVirtualRange", k_reserve_vrange);
@@ -398,6 +491,8 @@ void register_kernel_mem_hle() {
     R("sceKernelMprotect", k_mprotect);
     R("sceKernelReleaseDirectMemory", k_release_dmem);
     R("sceKernelCheckedReleaseDirectMemory", k_release_dmem);
+    R("sceKernelBatchMap", k_batch_map);
+    R("sceKernelBatchMap2", k_batch_map);   // (entries, num, out, flags) — extra flags arg ignored
     R("sceKernelVirtualQuery", k_virtual_query);
     R("sceKernelDirectMemoryQuery", k_direct_memory_query);
     R("sceKernelGetDirectMemorySize", k_dmem_size);
