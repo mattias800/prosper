@@ -257,6 +257,42 @@ HLE(f_mkdir) { std::string h = translate(CS(a0));   // sceKernelMkdir(path, mode
 #endif
 }
 HLE(f_rmdir) { std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::rmdir(h.c_str()); }
+
+#ifndef _WIN32
+// sceKernelGetdents(int fd, char* buf, size_t nbytes) — fill FreeBSD dirent records
+// {u32 fileno; u16 reclen; u8 type; u8 namlen; char name[]} (4-aligned). Backed by the host's
+// getdents64 on the SAME fd so the kernel keeps the directory cursor; Linux and BSD DT_* type
+// values match. Returns bytes written (0 = end of directory), or an SCE error. UE4 (PPSA17942)
+// enumerates its pak directory with this during IO-stack init.
+HLE(f_getdents) {
+    if (!a1 || a2 < 32) return 0x80020016ull;   // EINVAL
+    struct LinuxDirent64 { uint64_t ino; int64_t off; uint16_t reclen; uint8_t type; char name[]; };
+    uint8_t tmp[4096];
+    size_t want = a2 < sizeof tmp ? (size_t)a2 : sizeof tmp;
+    long n = syscall(SYS_getdents64, (int)a0, tmp, (unsigned)want);
+    if (n < 0)  return 0x80020000ull | (uint64_t)(errno & 0xff);
+    if (n == 0) return 0;
+    uint8_t* out = (uint8_t*)P(a1);
+    size_t o = 0, w = 0;
+    while (o < (size_t)n) {
+        auto* d = (const LinuxDirent64*)(tmp + o);
+        size_t namlen = strlen(d->name);
+        size_t rec = (8 + namlen + 1 + 3) & ~(size_t)3;   // 4-byte header + name + NUL, 4-aligned
+        if (w + rec > a2) break;
+        uint8_t* r = out + w;
+        *(uint32_t*)(r + 0) = (uint32_t)d->ino;
+        *(uint16_t*)(r + 4) = (uint16_t)rec;
+        r[6] = d->type;
+        r[7] = (uint8_t)namlen;
+        memcpy(r + 8, d->name, namlen + 1);
+        w += rec;
+        o += d->reclen;
+    }
+    return (uint64_t)w;
+}
+#else
+HLE(f_getdents) { return 0; }
+#endif
 HLE(f_unlink){ std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::
 #ifdef _WIN32
     _unlink
@@ -288,6 +324,7 @@ void register_file_hle() {
     R("mkdir", f_mkdir);          R("sceKernelMkdir", f_mkdir);
     R("rmdir", f_rmdir);          R("sceKernelRmdir", f_rmdir);
     R("unlink", f_unlink);        R("sceKernelUnlink", f_unlink);
+    R("sceKernelGetdents", f_getdents); R("getdents", f_getdents);
     #undef R
 }
 
