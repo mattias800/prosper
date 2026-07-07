@@ -8,7 +8,13 @@ exact root cause + next step for each remaining item.
 
 *The Messenger's title screen, rendered by prosper's AGC→Vulkan pipeline — the game's real pixel shader
 sampling the game's real (auto-detiled) 1920×1080 texture (3051 distinct colors). A reference fullscreen VS
-supplies UVs (the real VS's UV output is fixed in a sibling PR); the mask + auto-detile fixes are in this PR.*
+supplies UVs here; the mask + auto-detile fixes are in this PR.*
+
+![Rendered by the game's real VS+PS](images/messenger_title_real_vs.png)
+
+*With the sibling recompiler fixes (item 3) added, the title renders with the **game's OWN vertex + pixel
+shaders** — correct art and orientation. It fills one triangle of the fullscreen quad (the executor renders
+`draws[0]`); rendering both triangles is the remaining polish (item "Full-quad" below).*
 
 ## TL;DR — the game runs; the title composite is one recompiler bug + one register-apply bug away
 
@@ -23,7 +29,7 @@ with exact root causes:
 |---|------|--------|------------------|
 | 1 | Tiled texture not de-swizzled | ✅ fixed here | T# is `tile_mode=5` (GFX10 SW_4KB_S). Threaded `tile_mode` into `ShaderResource`; renderer auto-detiles. |
 | 2 | Color writes disabled (`CB_TARGET_MASK=0`) | ⚠️ worked-around here; real fix identified | The game DOES write `0x8e`: **`0xF` for the composite** template and **`0x0` for a depth-clear pass** in the same indirect block. Our **flat last-wins apply** (`command_processor.cpp`) lets the clear's `0x0` clobber the composite's `0xF`, and `execute_gpustate` renders with the submit-final register file. Real fix = **per-draw state capture + AGC indirect-log segmentation** (each draw consumes only its own `0x8e`-terminated template). Workaround in this branch: default `CB_TARGET_MASK` `0→0xF`. |
-| 3 | Real VS outputs degenerate UV | 🔗 fixed in a sibling PR | VS and PS both numbered descriptor bindings from a shared **set 0** → invalid descriptor layout → **corrupted VS reads → degenerate geometry/UV** → the PS samples one texel (uniform). Fix (concurrent agent): VS = set 0, PS = set 1. |
+| 3 | Real VS gave degenerate geometry/UV | ✅ RESOLVED (sibling recompiler work) | **Two** stacked recompiler bugs (both hidden by a `render_runner.h` `getenv`/`<cstdlib>` build trap that made prior binaries stale): (a) **VS/PS descriptor-set collision** — both stages numbered bindings from 2 in **set 0**, so set-0 binding-3 was simultaneously the VS's storage buffer and the PS's texture → corrupted VS reads → degenerate geometry. Fix: VS = set 0, PS = set 1. (b) **Vertex color decoded as float32 not `8_8_8_8_UNORM`** — RDNA2 V# dword3 packs a unified 7-bit FORMAT; format **56 = R8G8B8A8_UNORM** (the fade) fell through to a float32 read → garbage PS alpha → blended to clear. Fix: `decode_buffer_descriptor` maps fmt 56 → `Unorm8×4`. **With items 1+2+3, the game's OWN VS+PS render the title.** |
 | 4 | Title *scene* never loads (deeper) | ❌ open | See "Deeper blocker" below. |
 
 The modulate color is a **title fade-in** (`ff000000 → … → ffffffff`, black→white over ~24 frames) — *not*
