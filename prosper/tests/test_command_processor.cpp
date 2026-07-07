@@ -118,6 +118,33 @@ int main() {
         }
     }
 
+    // Per-draw register snapshots: each DrawIndexAuto captures the register state AT the draw, so a
+    // register changed between two draws is visible in the first draw's snapshot at its old value.
+    // (Consecutive draws with no writes in between share one snapshot.)
+    {
+        uint32_t pkt[3];
+        auto set_sh = [&](uint32_t off, uint32_t val, GpuState& s) {
+            pkt[0] = 0xC0000000u | (1u << 16) | (0x76u << 8);   // SET_SH_REG, 2 payload dwords
+            pkt[1] = off; pkt[2] = val;
+            run_command_buffer(pkt, 3, s);
+        };
+        uint32_t draw_pkt[3] = { 0xC0000000u | (1u << 16) | (0x10u << 8) | (0x04u << 2), 6, 0 };
+        GpuState s4;
+        set_sh(0x42, 0xAAAA, s4);
+        run_command_buffer(draw_pkt, 3, s4);                    // draw 0 under 0xAAAA
+        run_command_buffer(draw_pkt, 3, s4);                    // draw 1: no writes since draw 0
+        set_sh(0x42, 0xBBBB, s4);
+        run_command_buffer(draw_pkt, 3, s4);                    // draw 2 under 0xBBBB
+        CHECK(s4.draws.size() == 3 && s4.draws[0].state && s4.draws[2].state, "3 draws with snapshots");
+        if (s4.draws.size() == 3 && s4.draws[0].state && s4.draws[2].state) {
+            CHECK(s4.draws[0].state->sh.at(0x42) == 0xAAAA, "draw 0 snapshot holds the value AT the draw");
+            CHECK(s4.draws[0].state == s4.draws[1].state, "no-write consecutive draws share one snapshot");
+            CHECK(s4.draws[2].state->sh.at(0x42) == 0xBBBB, "draw 2 snapshot holds the updated value");
+            CHECK(s4.sh.at(0x42) == 0xBBBB, "folded end state is the last write");
+            CHECK(&s4.state_at_draw(0) == s4.draws[0].state.get(), "state_at_draw returns the snapshot");
+        }
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
