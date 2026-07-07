@@ -76,16 +76,20 @@ struct FrameResource {
 //
 // When `tex` is non-null, its RGBA8 texels are uploaded to a sampled VkImage and bound as a combined
 // image sampler at tex->binding — how a recompiled pixel shader's image_sample reaches a real texture.
-inline std::vector<uint8_t> render_triangle_rgba(const std::vector<uint32_t>& vert,
-                                                 const std::vector<uint32_t>& frag,
-                                                 uint32_t W, uint32_t H,
-                                                 const prosper::gpu::ResolvedPipelineState* ps = nullptr,
-                                                 const std::vector<uint32_t>* vbuf = nullptr,
-                                                 const std::vector<uint32_t>* cbuf = nullptr,
-                                                 const TexDesc* tex = nullptr,
-                                                 const std::vector<FrameResource>* gres = nullptr,
-                                                 uint32_t vcount = 3) {
+// One draw for the multi-draw backend: recompiled VS+PS SPIR-V, its resolved fixed-function state, its
+// set-tagged resources, and its vertex count. render_draws_rgba records ALL of a submit's draws into ONE
+// render pass (clear once, then per-draw pipeline+descriptors+draw) so a multi-draw frame composites
+// correctly. render_triangle_rgba is a thin single-draw wrapper (below).
+struct BackendDraw {
+    std::vector<uint32_t> vs, fs;
+    const prosper::gpu::ResolvedPipelineState* ps = nullptr;   // null -> triangle-list, write RGBA, no depth
+    std::vector<FrameResource> R;                              // set-tagged resources (empty -> no descriptors)
+    uint32_t vcount = 3;
+};
+
+inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& draws, uint32_t W, uint32_t H) {
     std::vector<uint8_t> out;
+    if (draws.empty()) return out;
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO}; app.apiVersion = VK_API_VERSION_1_1;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; ici.pApplicationInfo = &app;
     VkInstance inst = VK_NULL_HANDLE;
@@ -116,9 +120,10 @@ inline std::vector<uint8_t> render_triangle_rgba(const std::vector<uint32_t>& ve
             if ((bits & (1u << i)) && (memp.memoryTypes[i].propertyFlags & want) == want) return i;
         return UINT32_MAX; };
     const VkFormat FMT = VK_FORMAT_R8G8B8A8_UNORM;
-    // Depth is opt-in: only when the resolved state enables the depth test. Every caller that passes
-    // no state (or depth disabled) takes the exact color-only path below — unchanged.
-    const bool use_depth = ps && ps->depth_test_enable;
+    // Depth attachment is created if ANY draw enables the depth test (the shared render pass has one
+    // fixed attachment set); each draw's pipeline sets its own depthTest/Write/CompareOp. A frame with
+    // no depth-using draw takes the color-only path unchanged.
+    bool use_depth = false; for (const auto& d : draws) if (d.ps && d.ps->depth_test_enable) use_depth = true;
     const VkFormat DFMT = VK_FORMAT_D32_SFLOAT;
     VkImage dimg = VK_NULL_HANDLE; VkDeviceMemory dmem = VK_NULL_HANDLE; VkImageView dview = VK_NULL_HANDLE;
 
@@ -179,166 +184,156 @@ inline std::vector<uint8_t> render_triangle_rgba(const std::vector<uint32_t>& ve
         VkShaderModuleCreateInfo s{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         s.codeSize = c.size() * 4; s.pCode = c.data(); VkShaderModule m = VK_NULL_HANDLE;
         vkCreateShaderModule(dev, &s, nullptr, &m); return m; };
-    VkShaderModule vs = mkmod(vert), fs = mkmod(frag);
-    if (!vs || !fs) return out;   // rejected SPIR-V
-    VkPipelineShaderStageCreateInfo st[2]{};
-    st[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}; st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = vs; st[0].pName = "main";
-    st[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}; st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = fs; st[1].pName = "main";
-    VkPipelineVertexInputStateCreateInfo vin{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-    ia.topology = ps ? (VkPrimitiveTopology)ps->topology : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    // Default: full-target viewport. When the resolved state carries the guest's PA_CL_VPORT transform,
-    // honor it — a guest yscale < 0 arrives as a negative viewport_h (Vulkan core-1.1 flipped viewport,
-    // instance is created with apiVersion 1.1 above), reproducing the hardware's Y orientation.
-    VkViewport vp{0, 0, (float)W, (float)H, 0, 1}; VkRect2D sc{{0, 0}, {W, H}};
-    if (ps && ps->has_viewport)
-        vp = {ps->viewport_x, ps->viewport_y, ps->viewport_w, ps->viewport_h, ps->min_depth, ps->max_depth};
-    VkPipelineViewportStateCreateInfo vpst{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
-    vpst.viewportCount = 1; vpst.pViewports = &vp; vpst.scissorCount = 1; vpst.pScissors = &sc;
-    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
-    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
-    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-    VkPipelineColorBlendAttachmentState cba{}; cba.colorWriteMask = 0xF;
-    if (ps) {
-        cba.colorWriteMask = ps->color_write_mask;
-        cba.blendEnable    = ps->blend_enable ? VK_TRUE : VK_FALSE;
-        cba.srcColorBlendFactor = (VkBlendFactor)ps->src_color_blend_factor;
-        cba.dstColorBlendFactor = (VkBlendFactor)ps->dst_color_blend_factor;
-        cba.colorBlendOp        = (VkBlendOp)ps->color_blend_op;
-        cba.srcAlphaBlendFactor = (VkBlendFactor)ps->src_color_blend_factor;   // mirror color for alpha
-        cba.dstAlphaBlendFactor = (VkBlendFactor)ps->dst_color_blend_factor;
-        cba.alphaBlendOp        = (VkBlendOp)ps->color_blend_op;
-    }
-    VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-    cb.attachmentCount = 1; cb.pAttachments = &cba;
-    VkPipelineDepthStencilStateCreateInfo dss{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-    if (use_depth) {
-        dss.depthTestEnable  = VK_TRUE;
-        dss.depthWriteEnable = ps->depth_write_enable ? VK_TRUE : VK_FALSE;
-        dss.depthCompareOp   = (VkCompareOp)ps->depth_compare_op;
-    }
-    // Build the descriptor-set resource list. Either the general `gres` list (a real game shader's several
-    // constant/vertex buffers + textures, each at its own binding) OR — for the simple tests — bindings 2/3
-    // from cbuf/vbuf (always present, zero-filled if null) plus the optional `tex`.
-    std::vector<FrameResource> R;
-    if (gres && !gres->empty()) { R = *gres; }
-    else {
-        // The recompiler places FRAGMENT-stage resources in descriptor set 1 (the VS owns set 0), and a
-        // legacy test may exercise either stage with the same cbuf/vbuf convention (bindings 2/3) -- so
-        // mirror the buffers into BOTH sets (the copy the shader does not reference is simply unused).
-        for (uint32_t s2 = 0; s2 < 2; s2++) {
-            FrameResource b2; b2.binding = 2; b2.set = s2; if (cbuf) b2.dwords = *cbuf; R.push_back(std::move(b2));
-            FrameResource b3; b3.binding = 3; b3.set = s2; if (vbuf) b3.dwords = *vbuf; R.push_back(std::move(b3));
+    // Per-draw Vulkan objects — kept alive until after the queue submit, freed at the end.
+    struct DV {
+        VkShaderModule vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
+        std::vector<FrameResource> R;
+        std::vector<VkDescriptorSetLayout> dsls; std::vector<VkDescriptorSet> dsets;
+        VkDescriptorPool dpool = VK_NULL_HANDLE;
+        std::vector<VkBuffer> sbuf, tstage; std::vector<VkDeviceMemory> sbmem, tmem, tstagemem;
+        std::vector<VkImage> timg; std::vector<VkImageView> tview; std::vector<VkSampler> tsamp;
+        VkPipelineLayout layout = VK_NULL_HANDLE; VkPipeline pipe = VK_NULL_HANDLE;
+        uint32_t n_sets = 1, vcount = 3; bool use_desc = false, ok = false;
+    };
+    std::vector<DV> dv(draws.size());
+    // Pass 1: create each draw's shader modules, descriptors (with texture staging upload), and pipeline.
+    for (size_t di = 0; di < draws.size(); di++) {
+        const BackendDraw& bd = draws[di];
+        DV& v = dv[di];
+        v.vs = mkmod(bd.vs); v.fs = mkmod(bd.fs);
+        if (!v.vs || !v.fs) continue;   // rejected SPIR-V -> skip this draw
+        const prosper::gpu::ResolvedPipelineState* ps = bd.ps;
+        v.vcount = bd.vcount;
+        VkPipelineShaderStageCreateInfo st[2]{};
+        st[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}; st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = v.vs; st[0].pName = "main";
+        st[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}; st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = v.fs; st[1].pName = "main";
+        VkPipelineVertexInputStateCreateInfo vin{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        ia.topology = ps ? (VkPrimitiveTopology)ps->topology : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        // Default: full-target viewport. When the resolved state carries the guest's PA_CL_VPORT transform,
+        // honor it — a guest yscale < 0 arrives as a negative viewport_h (Vulkan core-1.1 flipped viewport),
+        // reproducing the hardware's Y orientation (#38; each draw item keeps its own resolved viewport).
+        VkViewport vp{0, 0, (float)W, (float)H, 0, 1}; VkRect2D sc{{0, 0}, {W, H}};
+        if (ps && ps->has_viewport)
+            vp = {ps->viewport_x, ps->viewport_y, ps->viewport_w, ps->viewport_h, ps->min_depth, ps->max_depth};
+        VkPipelineViewportStateCreateInfo vpst{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        vpst.viewportCount = 1; vpst.pViewports = &vp; vpst.scissorCount = 1; vpst.pScissors = &sc;
+        VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
+        VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        VkPipelineColorBlendAttachmentState cba{}; cba.colorWriteMask = 0xF;
+        if (ps) {
+            cba.colorWriteMask = ps->color_write_mask;
+            cba.blendEnable    = ps->blend_enable ? VK_TRUE : VK_FALSE;
+            cba.srcColorBlendFactor = (VkBlendFactor)ps->src_color_blend_factor;
+            cba.dstColorBlendFactor = (VkBlendFactor)ps->dst_color_blend_factor;
+            cba.colorBlendOp        = (VkBlendOp)ps->color_blend_op;
+            cba.srcAlphaBlendFactor = (VkBlendFactor)ps->src_color_blend_factor;   // mirror color for alpha
+            cba.dstAlphaBlendFactor = (VkBlendFactor)ps->dst_color_blend_factor;
+            cba.alphaBlendOp        = (VkBlendOp)ps->color_blend_op;
         }
-        // A sampled texture is a fragment-stage resource -> descriptor set 1 (the recompiler puts PS
-        // resources in set 1; the VS owns set 0). Binding it in set 0 would not match the FS's layout.
-        if (tex) { FrameResource t; t.binding = tex->binding; t.set = 1; t.tex_rgba = tex->rgba; t.tw = tex->w; t.th = tex->h; R.push_back(std::move(t)); }
-    }
-    const bool use_desc = !R.empty();
-    // VS and PS resources live in SEPARATE descriptor sets (r.set: VS=0, PS=1) so their independent
-    // binding numbering (both start at 2) can't collide within one set. Create one layout+set per set
-    // index present (0..n_sets-1); empty sets still get a layout so the pipeline-layout set indices stay
-    // contiguous and match the SPIR-V's DescriptorSet decorations.
-    uint32_t n_sets = 1; for (auto& r : R) n_sets = std::max(n_sets, r.set + 1);
-    std::vector<VkDescriptorSetLayout> dsls(n_sets, VK_NULL_HANDLE);
-    std::vector<VkDescriptorSet> dsets(n_sets, VK_NULL_HANDLE);
-    VkDescriptorPool dpool = VK_NULL_HANDLE;
-    // Per-resource Vulkan objects (freed at the end). Storage buffers use sbuf/sbmem; textures use the
-    // image/view/sampler/staging quintet (indexed parallel to R; unused entries stay VK_NULL_HANDLE).
-    std::vector<VkBuffer> sbuf(R.size(), VK_NULL_HANDLE), tstage(R.size(), VK_NULL_HANDLE);
-    std::vector<VkDeviceMemory> sbmem(R.size(), VK_NULL_HANDLE), tmem(R.size(), VK_NULL_HANDLE), tstagemem(R.size(), VK_NULL_HANDLE);
-    std::vector<VkImage> timg(R.size(), VK_NULL_HANDLE);
-    std::vector<VkImageView> tview(R.size(), VK_NULL_HANDLE);
-    std::vector<VkSampler> tsamp(R.size(), VK_NULL_HANDLE);
-    if (use_desc) {
-        std::vector<VkDescriptorSetLayoutBinding> lb(R.size());
-        std::vector<VkDescriptorBufferInfo> dbi(R.size());
-        std::vector<VkDescriptorImageInfo> dii(R.size());
-        std::vector<VkWriteDescriptorSet> wr(R.size());
-        uint32_t n_storage = 0, n_sampler = 0;
-        for (size_t i = 0; i < R.size(); i++) {
-            const FrameResource& r = R[i];
-            lb[i] = {}; lb[i].binding = r.binding; lb[i].descriptorCount = 1;
-            if (r.is_texture()) {
-                n_sampler++;
-                lb[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; lb[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-                VkImageCreateInfo tci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-                tci.imageType = VK_IMAGE_TYPE_2D; tci.format = VK_FORMAT_R8G8B8A8_UNORM; tci.extent = {r.tw, r.th, 1};
-                tci.mipLevels = 1; tci.arrayLayers = 1; tci.samples = VK_SAMPLE_COUNT_1_BIT; tci.tiling = VK_IMAGE_TILING_OPTIMAL;
-                tci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-                vkCreateImage(dev, &tci, nullptr, &timg[i]);
-                VkMemoryRequirements tr; vkGetImageMemoryRequirements(dev, timg[i], &tr);
-                VkMemoryAllocateInfo tai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; tai.allocationSize = tr.size;
-                tai.memoryTypeIndex = pick(tr.memoryTypeBits, 0); vkAllocateMemory(dev, &tai, nullptr, &tmem[i]);
-                vkBindImageMemory(dev, timg[i], tmem[i], 0);
-                VkImageViewCreateInfo tvci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-                tvci.image = timg[i]; tvci.viewType = VK_IMAGE_VIEW_TYPE_2D; tvci.format = VK_FORMAT_R8G8B8A8_UNORM;
-                tvci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}; vkCreateImageView(dev, &tvci, nullptr, &tview[i]);
-                VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-                sci.magFilter = sci.minFilter = VK_FILTER_LINEAR; sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-                sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-                vkCreateSampler(dev, &sci, nullptr, &tsamp[i]);
-                VkDeviceSize tbytes = (VkDeviceSize)r.tw * r.th * 4;
-                VkBufferCreateInfo stci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; stci.size = tbytes; stci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-                vkCreateBuffer(dev, &stci, nullptr, &tstage[i]);
-                VkMemoryRequirements sr; vkGetBufferMemoryRequirements(dev, tstage[i], &sr);
-                VkMemoryAllocateInfo sai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; sai.allocationSize = sr.size;
-                sai.memoryTypeIndex = pick(sr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-                vkAllocateMemory(dev, &sai, nullptr, &tstagemem[i]); vkBindBufferMemory(dev, tstage[i], tstagemem[i], 0);
-                void* sp = nullptr; vkMapMemory(dev, tstagemem[i], 0, tbytes, 0, &sp);
-                std::memcpy(sp, r.tex_rgba, (size_t)tbytes); vkUnmapMemory(dev, tstagemem[i]);
-                dii[i] = {tsamp[i], tview[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-                wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; wr[i].dstBinding = r.binding; wr[i].descriptorCount = 1;
-                wr[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wr[i].pImageInfo = &dii[i];
-            } else {
-                n_storage++;
-                lb[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; lb[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-                VkDeviceSize sz = r.dwords.empty() ? 4 : (VkDeviceSize)r.dwords.size() * 4;
-                VkBufferCreateInfo sbci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; sbci.size = sz; sbci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-                vkCreateBuffer(dev, &sbci, nullptr, &sbuf[i]);
-                VkMemoryRequirements mr; vkGetBufferMemoryRequirements(dev, sbuf[i], &mr);
-                VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; mai.allocationSize = mr.size;
-                mai.memoryTypeIndex = pick(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-                vkAllocateMemory(dev, &mai, nullptr, &sbmem[i]); vkBindBufferMemory(dev, sbuf[i], sbmem[i], 0);
-                void* p = nullptr; vkMapMemory(dev, sbmem[i], 0, sz, 0, &p);
-                if (r.dwords.empty()) ((uint32_t*)p)[0] = 0; else std::memcpy(p, r.dwords.data(), r.dwords.size() * 4);
-                vkUnmapMemory(dev, sbmem[i]);
-                dbi[i] = {sbuf[i], 0, VK_WHOLE_SIZE};
-                wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; wr[i].dstBinding = r.binding; wr[i].descriptorCount = 1;
-                wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wr[i].pBufferInfo = &dbi[i];
+        VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        cb.attachmentCount = 1; cb.pAttachments = &cba;
+        VkPipelineDepthStencilStateCreateInfo dss{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        if (ps && ps->depth_test_enable) {
+            dss.depthTestEnable  = VK_TRUE;
+            dss.depthWriteEnable = ps->depth_write_enable ? VK_TRUE : VK_FALSE;
+            dss.depthCompareOp   = (VkCompareOp)ps->depth_compare_op;
+        }
+        // Descriptor resources for this draw (two-set: VS=set0, PS=set1 — same layout as the single path).
+        v.R = bd.R; auto& R = v.R;
+        v.use_desc = !R.empty();
+        for (auto& r : R) v.n_sets = std::max(v.n_sets, r.set + 1);
+        v.dsls.assign(v.n_sets, VK_NULL_HANDLE); v.dsets.assign(v.n_sets, VK_NULL_HANDLE);
+        v.sbuf.assign(R.size(), VK_NULL_HANDLE); v.tstage.assign(R.size(), VK_NULL_HANDLE);
+        v.sbmem.assign(R.size(), VK_NULL_HANDLE); v.tmem.assign(R.size(), VK_NULL_HANDLE); v.tstagemem.assign(R.size(), VK_NULL_HANDLE);
+        v.timg.assign(R.size(), VK_NULL_HANDLE); v.tview.assign(R.size(), VK_NULL_HANDLE); v.tsamp.assign(R.size(), VK_NULL_HANDLE);
+        if (v.use_desc) {
+            std::vector<VkDescriptorSetLayoutBinding> lb(R.size());
+            std::vector<VkDescriptorBufferInfo> dbi(R.size());
+            std::vector<VkDescriptorImageInfo> dii(R.size());
+            std::vector<VkWriteDescriptorSet> wr(R.size());
+            uint32_t n_storage = 0, n_sampler = 0;
+            for (size_t i = 0; i < R.size(); i++) {
+                const FrameResource& r = R[i];
+                lb[i] = {}; lb[i].binding = r.binding; lb[i].descriptorCount = 1;
+                if (r.is_texture()) {
+                    n_sampler++;
+                    lb[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; lb[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+                    VkImageCreateInfo tci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+                    tci.imageType = VK_IMAGE_TYPE_2D; tci.format = VK_FORMAT_R8G8B8A8_UNORM; tci.extent = {r.tw, r.th, 1};
+                    tci.mipLevels = 1; tci.arrayLayers = 1; tci.samples = VK_SAMPLE_COUNT_1_BIT; tci.tiling = VK_IMAGE_TILING_OPTIMAL;
+                    tci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+                    vkCreateImage(dev, &tci, nullptr, &v.timg[i]);
+                    VkMemoryRequirements tr; vkGetImageMemoryRequirements(dev, v.timg[i], &tr);
+                    VkMemoryAllocateInfo tai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; tai.allocationSize = tr.size;
+                    tai.memoryTypeIndex = pick(tr.memoryTypeBits, 0); vkAllocateMemory(dev, &tai, nullptr, &v.tmem[i]);
+                    vkBindImageMemory(dev, v.timg[i], v.tmem[i], 0);
+                    VkImageViewCreateInfo tvci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+                    tvci.image = v.timg[i]; tvci.viewType = VK_IMAGE_VIEW_TYPE_2D; tvci.format = VK_FORMAT_R8G8B8A8_UNORM;
+                    tvci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}; vkCreateImageView(dev, &tvci, nullptr, &v.tview[i]);
+                    VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+                    sci.magFilter = sci.minFilter = VK_FILTER_LINEAR; sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+                    sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+                    vkCreateSampler(dev, &sci, nullptr, &v.tsamp[i]);
+                    VkDeviceSize tbytes = (VkDeviceSize)r.tw * r.th * 4;
+                    VkBufferCreateInfo stci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; stci.size = tbytes; stci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+                    vkCreateBuffer(dev, &stci, nullptr, &v.tstage[i]);
+                    VkMemoryRequirements sr; vkGetBufferMemoryRequirements(dev, v.tstage[i], &sr);
+                    VkMemoryAllocateInfo sai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; sai.allocationSize = sr.size;
+                    sai.memoryTypeIndex = pick(sr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                    vkAllocateMemory(dev, &sai, nullptr, &v.tstagemem[i]); vkBindBufferMemory(dev, v.tstage[i], v.tstagemem[i], 0);
+                    void* sp = nullptr; vkMapMemory(dev, v.tstagemem[i], 0, tbytes, 0, &sp);
+                    std::memcpy(sp, r.tex_rgba, (size_t)tbytes); vkUnmapMemory(dev, v.tstagemem[i]);
+                    dii[i] = {v.tsamp[i], v.tview[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+                    wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; wr[i].dstBinding = r.binding; wr[i].descriptorCount = 1;
+                    wr[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wr[i].pImageInfo = &dii[i];
+                } else {
+                    n_storage++;
+                    lb[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; lb[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+                    VkDeviceSize sz = r.dwords.empty() ? 4 : (VkDeviceSize)r.dwords.size() * 4;
+                    VkBufferCreateInfo sbci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; sbci.size = sz; sbci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+                    vkCreateBuffer(dev, &sbci, nullptr, &v.sbuf[i]);
+                    VkMemoryRequirements mr; vkGetBufferMemoryRequirements(dev, v.sbuf[i], &mr);
+                    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; mai.allocationSize = mr.size;
+                    mai.memoryTypeIndex = pick(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                    vkAllocateMemory(dev, &mai, nullptr, &v.sbmem[i]); vkBindBufferMemory(dev, v.sbuf[i], v.sbmem[i], 0);
+                    void* p = nullptr; vkMapMemory(dev, v.sbmem[i], 0, sz, 0, &p);
+                    if (r.dwords.empty()) ((uint32_t*)p)[0] = 0; else std::memcpy(p, r.dwords.data(), r.dwords.size() * 4);
+                    vkUnmapMemory(dev, v.sbmem[i]);
+                    dbi[i] = {v.sbuf[i], 0, VK_WHOLE_SIZE};
+                    wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; wr[i].dstBinding = r.binding; wr[i].descriptorCount = 1;
+                    wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wr[i].pBufferInfo = &dbi[i];
+                }
             }
+            for (uint32_t s = 0; s < v.n_sets; s++) {
+                std::vector<VkDescriptorSetLayoutBinding> slb;
+                for (size_t i = 0; i < R.size(); i++) if (R[i].set == s) slb.push_back(lb[i]);
+                VkDescriptorSetLayoutCreateInfo dslci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+                dslci.bindingCount = (uint32_t)slb.size(); dslci.pBindings = slb.data();
+                vkCreateDescriptorSetLayout(dev, &dslci, nullptr, &v.dsls[s]);
+            }
+            VkDescriptorPoolSize psz[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, n_storage ? n_storage : 1},
+                                           {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, n_sampler ? n_sampler : 1}};
+            VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            dpci.maxSets = v.n_sets; dpci.poolSizeCount = n_sampler ? 2 : 1; dpci.pPoolSizes = psz; vkCreateDescriptorPool(dev, &dpci, nullptr, &v.dpool);
+            VkDescriptorSetAllocateInfo dsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            dsai.descriptorPool = v.dpool; dsai.descriptorSetCount = v.n_sets; dsai.pSetLayouts = v.dsls.data();
+            vkAllocateDescriptorSets(dev, &dsai, v.dsets.data());
+            for (size_t i = 0; i < R.size(); i++) wr[i].dstSet = v.dsets[R[i].set];
+            vkUpdateDescriptorSets(dev, (uint32_t)wr.size(), wr.data(), 0, nullptr);
         }
-        // One descriptor-set layout per set index, each holding only its own resources' bindings.
-        for (uint32_t s = 0; s < n_sets; s++) {
-            std::vector<VkDescriptorSetLayoutBinding> slb;
-            for (size_t i = 0; i < R.size(); i++) if (R[i].set == s) slb.push_back(lb[i]);
-            VkDescriptorSetLayoutCreateInfo dslci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-            dslci.bindingCount = (uint32_t)slb.size(); dslci.pBindings = slb.data();
-            VkResult _dslr = vkCreateDescriptorSetLayout(dev, &dslci, nullptr, &dsls[s]);
-            if (getenv("PROSPER_GFXLOG")) { fprintf(stderr, "[rr] set %u dslayout result=%d bindings:", s, (int)_dslr);
-                for (auto& x : slb) fprintf(stderr, " %u(t%d)", x.binding, (int)x.descriptorType); fprintf(stderr, "\n"); }
-        }
-        VkDescriptorPoolSize psz[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, n_storage ? n_storage : 1},
-                                       {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, n_sampler ? n_sampler : 1}};
-        VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        dpci.maxSets = n_sets; dpci.poolSizeCount = n_sampler ? 2 : 1; dpci.pPoolSizes = psz; vkCreateDescriptorPool(dev, &dpci, nullptr, &dpool);
-        VkDescriptorSetAllocateInfo dsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-        dsai.descriptorPool = dpool; dsai.descriptorSetCount = n_sets; dsai.pSetLayouts = dsls.data();
-        vkAllocateDescriptorSets(dev, &dsai, dsets.data());
-        for (size_t i = 0; i < R.size(); i++) wr[i].dstSet = dsets[R[i].set];
-        vkUpdateDescriptorSets(dev, (uint32_t)wr.size(), wr.data(), 0, nullptr);
+        VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        if (v.use_desc) { plci.setLayoutCount = v.n_sets; plci.pSetLayouts = v.dsls.data(); }
+        vkCreatePipelineLayout(dev, &plci, nullptr, &v.layout);
+        VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        gp.stageCount = 2; gp.pStages = st; gp.pVertexInputState = &vin; gp.pInputAssemblyState = &ia;
+        gp.pViewportState = &vpst; gp.pRasterizationState = &rs; gp.pMultisampleState = &ms;
+        gp.pColorBlendState = &cb; gp.layout = v.layout; gp.renderPass = rp; gp.subpass = 0;
+        if (ps && ps->depth_test_enable) gp.pDepthStencilState = &dss;
+        if (vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gp, nullptr, &v.pipe) == VK_SUCCESS) v.ok = true;
     }
-    VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    if (use_desc) { plci.setLayoutCount = n_sets; plci.pSetLayouts = dsls.data(); }
-    VkPipelineLayout layout; vkCreatePipelineLayout(dev, &plci, nullptr, &layout);
-    VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-    gp.stageCount = 2; gp.pStages = st; gp.pVertexInputState = &vin; gp.pInputAssemblyState = &ia;
-    gp.pViewportState = &vpst; gp.pRasterizationState = &rs; gp.pMultisampleState = &ms;
-    gp.pColorBlendState = &cb; gp.layout = layout; gp.renderPass = rp; gp.subpass = 0;
-    if (use_depth) gp.pDepthStencilState = &dss;
-    VkPipeline pipe;
-    if (vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gp, nullptr, &pipe) != VK_SUCCESS) return out;
 
     VkDeviceSize bytes = (VkDeviceSize)W * H * 4;
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; bci.size = bytes; bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -355,19 +350,19 @@ inline std::vector<uint8_t> render_triangle_rgba(const std::vector<uint32_t>& ve
     VkCommandBuffer cmd; vkAllocateCommandBuffers(dev, &cbai, &cmd);
     VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &cbbi);
-    // Upload each texture's texels: UNDEFINED -> TRANSFER_DST, copy staging buffer, TRANSFER_DST -> SHADER_READ.
-    for (size_t i = 0; i < R.size(); i++) {
-        if (!R[i].is_texture()) continue;
+    // Upload each draw's textures: UNDEFINED -> TRANSFER_DST, copy staging buffer, TRANSFER_DST -> SHADER_READ.
+    for (auto& v : dv) for (size_t i = 0; i < v.R.size(); i++) {
+        if (!v.R[i].is_texture()) continue;
         VkImageMemoryBarrier b0{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         b0.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; b0.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        b0.image = timg[i]; b0.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        b0.image = v.timg[i]; b0.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         b0.srcAccessMask = 0; b0.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b0);
-        VkBufferImageCopy tc{}; tc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; tc.imageExtent = {R[i].tw, R[i].th, 1};
-        vkCmdCopyBufferToImage(cmd, tstage[i], timg[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &tc);
+        VkBufferImageCopy tc{}; tc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; tc.imageExtent = {v.R[i].tw, v.R[i].th, 1};
+        vkCmdCopyBufferToImage(cmd, v.tstage[i], v.timg[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &tc);
         VkImageMemoryBarrier b1{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         b1.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b1.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        b1.image = timg[i]; b1.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        b1.image = v.timg[i]; b1.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         b1.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b1.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b1);
     }
@@ -375,10 +370,14 @@ inline std::vector<uint8_t> render_triangle_rgba(const std::vector<uint32_t>& ve
     clear[1].depthStencil = {0.5f, 0};   // depth cleared to 0.5 (fragments at z=0.0 pass LESS, fail GREATER)
     VkRenderPassBeginInfo rpbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rpbi.renderPass = rp; rpbi.framebuffer = fb; rpbi.renderArea = {{0, 0}, {W, H}}; rpbi.clearValueCount = use_depth ? 2 : 1; rpbi.pClearValues = clear;
+    // ONE render pass (cleared once): record every realized draw with its own pipeline + descriptors.
     vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-    if (use_desc) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, n_sets, dsets.data(), 0, nullptr);
-    vkCmdDraw(cmd, vcount, 1, 0, 0);
+    for (auto& v : dv) {
+        if (!v.ok) continue;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v.pipe);
+        if (v.use_desc) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v.layout, 0, v.n_sets, v.dsets.data(), 0, nullptr);
+        vkCmdDraw(cmd, v.vcount, 1, 0, 0);
+    }
     vkCmdEndRenderPass(cmd);
     VkBufferImageCopy cp{}; cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; cp.imageExtent = {W, H, 1};
     vkCmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb, 1, &cp);
@@ -393,28 +392,54 @@ inline std::vector<uint8_t> render_triangle_rgba(const std::vector<uint32_t>& ve
     vkUnmapMemory(dev, bmem);
 
     vkDestroyFence(dev, fence, nullptr); vkDestroyCommandPool(dev, pool, nullptr);
-    vkDestroyPipeline(dev, pipe, nullptr); vkDestroyPipelineLayout(dev, layout, nullptr);
-    vkDestroyShaderModule(dev, vs, nullptr); vkDestroyShaderModule(dev, fs, nullptr);
+    for (auto& v : dv) {   // per-draw objects
+        if (v.pipe)   vkDestroyPipeline(dev, v.pipe, nullptr);
+        if (v.layout) vkDestroyPipelineLayout(dev, v.layout, nullptr);
+        if (v.vs)     vkDestroyShaderModule(dev, v.vs, nullptr);
+        if (v.fs)     vkDestroyShaderModule(dev, v.fs, nullptr);
+        if (v.dpool)  vkDestroyDescriptorPool(dev, v.dpool, nullptr);
+        for (auto d : v.dsls) if (d) vkDestroyDescriptorSetLayout(dev, d, nullptr);
+        for (size_t i = 0; i < v.R.size(); i++) {
+            if (v.sbuf[i])     vkDestroyBuffer(dev, v.sbuf[i], nullptr);
+            if (v.sbmem[i])    vkFreeMemory(dev, v.sbmem[i], nullptr);
+            if (v.tsamp[i])    vkDestroySampler(dev, v.tsamp[i], nullptr);
+            if (v.tview[i])    vkDestroyImageView(dev, v.tview[i], nullptr);
+            if (v.timg[i])     vkDestroyImage(dev, v.timg[i], nullptr);
+            if (v.tmem[i])     vkFreeMemory(dev, v.tmem[i], nullptr);
+            if (v.tstage[i])   vkDestroyBuffer(dev, v.tstage[i], nullptr);
+            if (v.tstagemem[i])vkFreeMemory(dev, v.tstagemem[i], nullptr);
+        }
+    }
     vkDestroyBuffer(dev, rb, nullptr); vkFreeMemory(dev, bmem, nullptr);
     vkDestroyFramebuffer(dev, fb, nullptr); vkDestroyRenderPass(dev, rp, nullptr); vkDestroyImageView(dev, view, nullptr);
     vkDestroyImage(dev, img, nullptr); vkFreeMemory(dev, imem, nullptr);
     if (use_depth) { vkDestroyImageView(dev, dview, nullptr); vkDestroyImage(dev, dimg, nullptr); vkFreeMemory(dev, dmem, nullptr); }
-    if (use_desc) {
-        vkDestroyDescriptorPool(dev, dpool, nullptr);
-        for (auto d : dsls) if (d) vkDestroyDescriptorSetLayout(dev, d, nullptr);
-        for (size_t i = 0; i < R.size(); i++) {
-            if (sbuf[i])     vkDestroyBuffer(dev, sbuf[i], nullptr);
-            if (sbmem[i])    vkFreeMemory(dev, sbmem[i], nullptr);
-            if (tsamp[i])    vkDestroySampler(dev, tsamp[i], nullptr);
-            if (tview[i])    vkDestroyImageView(dev, tview[i], nullptr);
-            if (timg[i])     vkDestroyImage(dev, timg[i], nullptr);
-            if (tmem[i])     vkFreeMemory(dev, tmem[i], nullptr);
-            if (tstage[i])   vkDestroyBuffer(dev, tstage[i], nullptr);
-            if (tstagemem[i])vkFreeMemory(dev, tstagemem[i], nullptr);
-        }
-    }
     vkDestroyDevice(dev, nullptr); vkDestroyInstance(inst, nullptr);
     return out;
+}
+
+// Single-draw entry — a thin wrapper over render_draws_rgba, preserving the exact signature/behavior the
+// recompiled-shader render tests rely on. Builds one draw's set-tagged resources (`gres`, or the legacy
+// cbuf/vbuf@bindings 2/3 mirrored into both sets + optional `tex` in set 1).
+inline std::vector<uint8_t> render_triangle_rgba(const std::vector<uint32_t>& vert,
+                                                 const std::vector<uint32_t>& frag,
+                                                 uint32_t W, uint32_t H,
+                                                 const prosper::gpu::ResolvedPipelineState* ps = nullptr,
+                                                 const std::vector<uint32_t>* vbuf = nullptr,
+                                                 const std::vector<uint32_t>* cbuf = nullptr,
+                                                 const TexDesc* tex = nullptr,
+                                                 const std::vector<FrameResource>* gres = nullptr,
+                                                 uint32_t vcount = 3) {
+    BackendDraw d; d.vs = vert; d.fs = frag; d.ps = ps; d.vcount = vcount;
+    if (gres && !gres->empty()) { d.R = *gres; }
+    else {
+        for (uint32_t s2 = 0; s2 < 2; s2++) {
+            FrameResource b2; b2.binding = 2; b2.set = s2; if (cbuf) b2.dwords = *cbuf; d.R.push_back(std::move(b2));
+            FrameResource b3; b3.binding = 3; b3.set = s2; if (vbuf) b3.dwords = *vbuf; d.R.push_back(std::move(b3));
+        }
+        if (tex) { FrameResource t; t.binding = tex->binding; t.set = 1; t.tex_rgba = tex->rgba; t.tw = tex->w; t.th = tex->h; d.R.push_back(std::move(t)); }
+    }
+    return render_draws_rgba({std::move(d)}, W, H);
 }
 
 } // namespace prosper::test

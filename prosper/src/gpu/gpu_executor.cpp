@@ -433,9 +433,7 @@ bool execute_and_present(const GpuState& st, uint32_t width, uint32_t height) {
     // Bind the target dimensions and defer to the pure core, which recompiles the shaders from their
     // SHADER_PGM addresses and resolves fixed-function state before calling back into the live renderer.
     std::vector<uint8_t> px = execute_gpustate(st,
-        [&](const std::vector<uint32_t>& vs, const std::vector<uint32_t>& fs,
-            const ResolvedPipelineState& ps, const ShaderResourceTable* vrt,
-            const ShaderResourceTable* prt, uint32_t vcount) { return g_live(vs, fs, ps, vrt, prt, width, height, vcount); });
+        [&](const std::vector<DrawItem>& items) { return g_live(items, width, height); });
     if (px.size() != static_cast<size_t>(width) * height * 4) return false;   // recompile/render failed
     present_write_frame(px.data(), width, height);
     return true;
