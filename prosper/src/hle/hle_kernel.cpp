@@ -250,6 +250,7 @@ void* thread_trampoline(void* p) {
     // stubs swap back to host %fs per HLE call. No-op when the gate is off. Order matters: the free() above
     // is host glibc (host-TLS tcache) — running it under the guest %fs corrupts the host heap.
     guest_tls_activate_thread();
+    arm_hwbp_this_thread();   // no-op unless PROSPER_HWBP_ALLTHREADS: observe this worker's execution
     return entry ? entry(arg) : nullptr;
 }
 }
