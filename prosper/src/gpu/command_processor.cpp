@@ -54,6 +54,10 @@ static void honor_eop_write(const Pm4Command& c) {
     if (eop_writes_disabled() || !c.rel_addr || (c.rel_addr & 3)) return;
     void* dst = (void*)(uintptr_t)c.rel_addr;
     switch (c.rel_data_sel) {
+        // data_sel==0 is "interrupt only, NO data write" (PM4 spec) — writing anyway clobbers 8 bytes
+        // at a live label address (and a mis-extraction that yields 0 has a garbage value dword too,
+        // so skipping is right in both readings). CONFIDENCE: MED.
+        case 0: return;
         case 1: { uint32_t v = (uint32_t)c.rel_value; memcpy(dst, &v, sizeof v); break; }
         case 2: { uint64_t v = c.rel_value;           memcpy(dst, &v, sizeof v); break; }
         case 3: { uint64_t v = gpu_clock64();         memcpy(dst, &v, sizeof v); break; }
@@ -61,7 +65,12 @@ static void honor_eop_write(const Pm4Command& c) {
         // extraction can mis-read data_sel (it arrives as a pointer, not the 1/2/3 enum), so don't SKIP the
         // write on an unrecognized selector: default to the 64-bit value. Skipping it starved the render
         // thread's completion wait and stalled the frame loop after the first real draw. CONFIDENCE: MED.
-        default: { uint64_t v = c.rel_value;          memcpy(dst, &v, sizeof v); break; }
+        default:
+            // ... but only when the packet actually carried a value: a short-decoded packet's
+            // rel_value is a fabricated 0 that could move a fence label BACKWARDS.
+            if (!c.rel_value_valid) return;
+            { uint64_t v = c.rel_value;               memcpy(dst, &v, sizeof v); }
+            break;
     }
     if (getenv("PROSPER_GFXLOG"))
         fprintf(stderr, "[agc]   EOP write [0x%llx] data_sel=%u value=0x%llx\n",

@@ -71,7 +71,7 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
                     // payload: [0..1]=label addr lo/hi, [2]=data_sel, [3..4]=64-bit value (see agc_cb_release_mem)
                     if (npl >= 2) c.rel_addr = lo_hi(pl);
                     if (npl >= 3) c.rel_data_sel = pl[2];
-                    if (npl >= 5) c.rel_value = (uint64_t)pl[3] | ((uint64_t)pl[4] << 32);
+                    if (npl >= 5) { c.rel_value = (uint64_t)pl[3] | ((uint64_t)pl[4] << 32); c.rel_value_valid = true; }
                     break;
                 case R_FLIP:          c.kind = K::Flip;         break;
                 case R_DRAW_INDEX_AUTO:

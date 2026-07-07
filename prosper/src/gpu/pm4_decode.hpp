@@ -62,6 +62,7 @@ struct Pm4Command {
     uint64_t rel_addr = 0;               // ReleaseMem: destination label address
     uint32_t rel_data_sel = 0;           // ReleaseMem: DATA_SEL (1/2/3)
     uint64_t rel_value = 0;              // ReleaseMem: 64-bit fence value (for data_sel 1/2)
+    bool rel_value_valid = false;        // ReleaseMem: packet was long enough to carry rel_value
 
     // WriteData — laid out by hle_agc.cpp agc_dcb_write_data per sceAgcDcbWriteData(buf, dst, cache_policy,
     // address_or_offset, data*, num_dwords, …) (Kyty GraphicsDcbWriteData, Graphics.cpp:2061). Packet
