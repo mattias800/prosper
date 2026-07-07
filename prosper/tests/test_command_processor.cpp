@@ -74,6 +74,29 @@ int main() {
     CHECK(st.draws.size() == 2 && st.draws[0].index_count == 0x0300, "draw0 index_count = 0x300");
     CHECK(st.draws.size() == 2 && st.draws[1].index_count == 0x0006, "draw1 index_count = 0x6");
 
+    // Per-draw state snapshot: each draw froze the register files at its issue point, and state_at_draw()
+    // reconstructs a single-draw GpuState from that snapshot (so the executor renders every draw with its
+    // OWN bound shaders/pipeline/resources, not just the final folded state).
+    CHECK(st.draws[0].snapshot && st.draws[1].snapshot, "both draws captured a state snapshot");
+    CHECK(st.draws[0].sh.count(0x2C0Cu) && st.draws[0].sh[0x2C0Cu] == 0xAAAAAAAAu, "draw0 snapshot has sh reg");
+    {
+        GpuState d0 = st.state_at_draw(0);
+        CHECK(d0.draws.size() == 1 && d0.draws[0].index_count == 0x0300, "state_at_draw(0): single draw 0x300");
+        CHECK(d0.cx.count(0xA318u) && d0.cx[0xA318u] == 0x11111111u, "state_at_draw(0): cx restored");
+        CHECK(d0.sh.count(0x2C0Cu) && d0.sh[0x2C0Cu] == 0xAAAAAAAAu, "state_at_draw(0): sh restored");
+    }
+    // Snapshots are independent: a state change AFTER a draw does not alter earlier snapshots.
+    {
+        GpuState g; g.sh[0x2C0Cu] = 0x1111u;
+        Pm4Command dc{}; dc.kind = Pm4Command::Kind::DrawIndexAuto; dc.index_count = 5;
+        g.apply(dc);
+        g.sh[0x2C0Cu] = 0x2222u;                       // change state between draws
+        dc.index_count = 7; g.apply(dc);
+        CHECK(g.draws.size() == 2, "2 draws applied directly");
+        CHECK(g.draws[0].sh[0x2C0Cu] == 0x1111u, "draw0 snapshot froze the OLD sh value");
+        CHECK(g.draws[1].sh[0x2C0Cu] == 0x2222u, "draw1 snapshot has the NEW sh value");
+    }
+
     // SET_SH_REG (IT_SET_SH_REG=0x76) sets a RANGE: payload[0]=start offset, payload[1..]=consecutive
     // values. The driver uploads the whole user-data descriptor block this way, so the decode+apply MUST
     // write every value — regressing to "first register only" silently drops the shaders' V#/T# SGPRs.

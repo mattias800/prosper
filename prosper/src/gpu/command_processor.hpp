@@ -21,16 +21,41 @@ struct ShaderReg { uint32_t offset; uint32_t value; };
 
 // Folded GPU state after replaying a command stream.
 struct GpuState {
-    std::unordered_map<uint32_t, uint32_t> cx, sh, uc;   // register files by offset
+    using RegFile = std::unordered_map<uint32_t, uint32_t>;
+    RegFile cx, sh, uc;                                  // register files by offset
     uint32_t index_type = 0;                             // last SetIndexType
-    struct Draw { uint32_t index_count; };
-    std::vector<Draw> draws;                             // one per DrawIndexAuto
+
+    // A draw records its vertex count AND a snapshot of the register state at the moment it was issued.
+    // Real frames are built from MANY draws, each with its own bound shaders/pipeline/resources; folding
+    // every write into one final state (and rendering only draws[0]) collapses that to a single primitive.
+    // Snapshotting per draw lets the executor resolve+render each draw with its own state, in order, into
+    // one accumulating framebuffer. `snapshot` is true for draws captured with a snapshot (game path);
+    // legacy/synthetic draws leave it false and fall back to the folded GpuState.
+    struct Draw {
+        uint32_t index_count = 0;
+        bool     snapshot = false;
+        RegFile  cx, sh, uc;
+        uint32_t index_type = 0;
+    };
+    std::vector<Draw> draws;                             // one per DrawIndexAuto, in submit order
 
     // Safety cap on an indirect register count (a malformed/huge count won't run away).
     static constexpr uint32_t kMaxRegsPerPacket = 4096;
 
     // Fold one decoded command into the state. Reads register arrays via their (1:1-mapped) vaddr.
     void apply(const Pm4Command& c);
+
+    // Reconstruct a single-draw GpuState from draw `i`'s snapshot: its register files + that one draw.
+    // extract_render_state()/build_stage_table() then resolve exactly the state that draw was issued
+    // under. Falls back to the current folded state for a draw captured without a snapshot.
+    GpuState state_at_draw(size_t i) const {
+        GpuState s;
+        const Draw& d = draws[i];
+        if (d.snapshot) { s.cx = d.cx; s.sh = d.sh; s.uc = d.uc; s.index_type = d.index_type; }
+        else            { s.cx = cx;   s.sh = sh;   s.uc = uc;   s.index_type = index_type; }
+        s.draws.push_back(Draw{ d.index_count, false, {}, {}, {}, d.index_type });
+        return s;
+    }
 };
 
 // Decode `dwords` dwords at `buf` and apply every op to `st`. Returns the number of packets applied.

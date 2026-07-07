@@ -116,7 +116,10 @@ void GpuState::apply(const Pm4Command& c) {
             index_type = c.index_size;
             break;
         case K::DrawIndexAuto:
-            draws.push_back({ c.index_count });
+            // Snapshot the register state AT THIS DRAW so the executor can render each draw with its own
+            // bound shaders/pipeline/resources (not just the final folded state). The maps are small per
+            // frame (draws are reset each flip), so the copy is cheap relative to a rendered frame.
+            draws.push_back(Draw{ c.index_count, true, cx, sh, uc, index_type });
             break;
         case K::ReleaseMem:
             honor_eop_write(c);     // EOP completion label write (correct synchronous end-of-pipe timing)
