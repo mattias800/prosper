@@ -191,3 +191,27 @@ GC. Which specific terminal fault wins (`Il2cpp+0x1637697` activation-NRE vs. th
 "Unexpected state" abort) is timing-dependent, but both fire at/just-before activation. **Net: the single
 remaining blocker is unchanged — populate the null managed field `[callerObj+0x40]` on the activation path
 (and/or fix the GC stop-the-world race) — but the scene now provably loads to 100% first.**
+
+## UPDATE (post-#42) — crash is now DETERMINISTIC and identified: `WorkerThread.field_0x40` is null
+
+After #42 (static-mutex/GC-lock fix) landed, the level1 crash changed character completely:
+- **Before #42:** random crash signatures (`0x500004a20` GC abort, `0x44000b03b`, `0x44017fc23`, …) —
+  the fingerprint of heap/free-list corruption from the never-locked GC allocation lock.
+- **After #42:** 4/4 repros crash **identically** at `Il2cpp+0x1637697`, `kind=2`, after exactly 2
+  `resources.assets` reads. The corruption randomness is gone; this is now a single deterministic bug.
+
+**Identified via `PROSPER_HWBP_KLASS` (new, this branch)** — a bp at the caller (`Il2cpp+0x175c991`,
+`mov rdi,[rbx+0x40]; call getter`) dumps the il2cpp class name of the receiver:
+```
+[hwbp-klass] rbx obj=… klass=… name="WorkerThread"    [obj+0x40]=0x0     <- the null field
+[hwbp-klass] r14 obj=… klass=… name="AsyncRequest`1"  [obj+0x40]=<valid> <- the node being iterated
+```
+So a **`WorkerThread`** managed object has a **null field at +0x40**, and the caller loop (iterating a
+list of `AsyncRequest\`1`) calls a property getter on that null → `cmpb 0x20(%rbx)` with `rbx=null`
+(`Il2cpp+0x1637694`). This is Unity's **async asset-loading job system**; `WorkerThread.field_0x40` (a
+managed object the getter reads `[+0x20]` from) is never initialized before the main thread accesses it.
+
+**Next (the pure remaining blocker):** find what sets `WorkerThread.field_0x40` and why it's null here —
+candidates: the worker's C# init/ctor didn't run, or a native icall backing it returns wrong. It is now a
+clean, deterministic, single-field bug (no longer corruption), so a data write-watch on that field or the
+`WorkerThread` ctor is the decisive next probe.
