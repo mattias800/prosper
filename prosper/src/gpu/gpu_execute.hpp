@@ -79,8 +79,11 @@ inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn&
         }
         return {};
     }
-    if (log) { fprintf(stderr, "[exec] BOTH stages recompiled: vs=%zu fs=%zu dwords -> rendering\n",
-                       vs.size(), fs.size()); fflush(stderr); }
+    if (log) { fprintf(stderr, "[exec] BOTH stages recompiled: vs=%zu fs=%zu dwords -> rendering | "
+                       "color0_base=0x%llx fmt=%u %ux? es=0x%llx ps=0x%llx draws=%zu vcount=%u\n",
+                       vs.size(), fs.size(), (unsigned long long)rs.color0_base, rs.color0_format,
+                       0u, (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr, st.draws.size(),
+                       st.draws.empty() ? 0u : st.draws[0].index_count); fflush(stderr); }
     ResolvedPipelineState ps = resolve_pipeline_state(rs);
     // The draw's vertex count (first draw; 3 as a fallback) so the VS runs for the right # of vertices.
     uint32_t vertex_count = st.draws.empty() ? 3u : st.draws[0].index_count;
