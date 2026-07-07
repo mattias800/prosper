@@ -66,6 +66,14 @@ int main(int argc, char** argv) {
         { d + "/Media/Modules/PS5Util.prx", PS5UTIL },
         { d + "/sce_module/libc.prx", LIBC },
     };
+    // Cross-title tolerance (docs/CROSS_ENGINE_UE4.md step 1, minimal form): drop dependent modules
+    // whose file doesn't exist in this dump — e.g. the UE4 title ships no Il2cpp/PS5Util, so it links
+    // eboot + libc.prx only. The eboot (index 0) is always kept; each module keeps its fixed base.
+    // For the primary target every file exists, so its link is byte-for-byte unchanged.
+    for (size_t i = in.size(); i-- > 1; ) {
+        if (FILE* f = fopen(in[i].path.c_str(), "rb")) fclose(f);
+        else { printf("skipping absent module: %s\n", in[i].path.c_str()); in.erase(in.begin() + (ptrdiff_t)i); }
+    }
     if (!link_program(in, STUB, p, &e)) { printf("link failed: %s\n", e.c_str()); return 1; }
     printf("linked %zu modules; %zu imports (%zu cross-module, %zu stub slots); %zu init fns\n",
            p.mods.size(), p.total_imports, p.resolved_cross_module, p.slots.size(), p.init_fns.size());

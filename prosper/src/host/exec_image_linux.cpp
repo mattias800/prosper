@@ -887,6 +887,10 @@ bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
     dispatch_init(&slots, g_nid_db);
 
     uint64_t n = slots.size();
+    // Zero unresolved imports (e.g. a title whose every import resolved cross-module, or a dump whose
+    // dynamic section yields none): nothing to emit — a 0-byte mmap would fail with EINVAL, so record
+    // the empty table and succeed.
+    if (n == 0) { g_stub_base = stub_base; g_stub_size = stub_size; g_nstubs = 0; return true; }
     uint64_t region = page_up(n * stub_size);
     void* want = (void*)stub_base;
     void* got = mmap(want, region, PROT_READ | PROT_WRITE | PROT_EXEC,
