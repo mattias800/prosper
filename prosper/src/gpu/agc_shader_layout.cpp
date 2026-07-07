@@ -128,6 +128,7 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             r.gpu_addr      = d.base;
             r.width         = d.width;
             r.height        = d.height;
+            r.tile_mode     = d.tile_mode;          // so the renderer can auto-detile a GPU-tiled surface
             r.size          = d.width * d.height * 4;
             r.sgpr_base     = user_sgpr_base + off;  // DIRECT provenance key (image_sample SRSRC SGPR)
             r.srt_offset    = 0xFFFFFFFFu;
