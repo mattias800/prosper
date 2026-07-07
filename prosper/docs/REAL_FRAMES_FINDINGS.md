@@ -34,14 +34,19 @@ here, one of which remains:
      blended to the blue clear. `decode_buffer_descriptor` now decodes the RDNA2 format field and maps 56 →
      `Unorm8`×4; the recompiler already normalises UNORM8 (÷255), so the color/alpha are now correct.
 
-   **Result:** a late frame (post texture-load + fade) renders **The Messenger's title art with the game's
-   real VS+PS** — ~65k distinct colors (title logo, character crowd, moon). See the PR screenshot. The frame
-   shows one triangle of the fullscreen quad (the executor renders `draws[0]`); rendering the full 2-triangle
-   quad (all draws of the submit) is the remaining polish item, below.
+4. ✅ **Full-quad composite.** The game tiles the fullscreen quad from a 4-corner vertex buffer into two
+   triangles via *indexed* triangle-list draws; our single-draw offscreen spine renders `draws[0]` (one
+   triangle), so half the frame was the clear. `execute_gpustate` now detects a 4-record quad vertex buffer
+   and renders its corners as a triangle FAN (perimeter order BL,TL,TR,BR → tris {0,1,2},{0,2,3} tile the
+   quad), so the whole frame fills. Only triggers for a 4-record buffer (real meshes unaffected).
 
-### Remaining polish (not blockers to "real frames")
-- **Full-quad composite:** execute *all* draws of the submit (currently `draws[0]` only) so both triangles
-  of the fullscreen quad fill the frame, instead of the single triangle.
+   **Result:** a late frame (post texture-load + fade) renders **The Messenger's full title screen with the
+   game's real VS+PS** — ~137k distinct colors, 0% clear-color, the complete logo + ninja + moon + crowd.
+   See the PR screenshot.
+
+### Remaining polish (not blockers)
+- **Honor indexed / multi-draw** properly (replace the 4-vertex-fan quad heuristic) so arbitrary scene
+  geometry (not just the fullscreen composite) renders — needed once the title/gameplay scene loads.
 
 ## The modulate color is a fade-in (not a bug)
 
