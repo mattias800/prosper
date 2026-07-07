@@ -326,3 +326,14 @@ async-load integration never finishes after the assets stream in (an engine-leve
 not fixing a fault. (Note: a one-shot fault-handler unwind of the Stopwatch getter — `PROSPER_SKIP_WT_GETTER`
 — instead diverges to a `%fs:-0x80` thread-local artifact at `eboot+0x9f1ba0`; the persistent `NULLGUARD`
 is the correct, non-diverging bypass and gets strictly further.)
+
+**5. The stall is INDEPENDENT of the Stopwatch return value, and of APR.** Added `PROSPER_NULLGUARD_RET`
+(`tsc`|`zero`|`ms`) to select what the guarded null-receiver returns. All three **stall at the same 28
+`resources.resource` reads** — so the time-budget/unit theory is wrong; the guard's return value does not
+gate the stall. (`ms` holds on a dark-blue/purple screen, `tsc` fades to black — cosmetic difference only,
+neither reaches the cutscene text card, which has white text; the stalled frames have 0% white.) Also: the
+"not considered suitable for apr reads flags:0x0" line is the GAME's own `LocalFileSystemPS5` decision and
+prints for **every** file (including ones that load fine during boot), so APR-rejection is not the blocker.
+Net: the wall is specifically Unity's async **load-completion / integration** after the scene's bytes have
+streamed in — the main thread stays in its frame loop (renders 90+ frames) but the operation never reports
+complete. That main-thread integration step is the precise next target.

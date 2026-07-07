@@ -178,13 +178,25 @@ int main(int argc, char** argv) {
                 c[o++] = 0xe9;                                               // jmp addr+len
                 int32_t rel = (int32_t)((int64_t)(addr + len) - (int64_t)(uintptr_t)(c + o + 4));
                 memcpy(c + o, &rel, 4); o += 4;
-                // ret0: return a monotonic counter (rdtsc) as the "elapsed" value. A null/unstarted Stopwatch
-                // returning 0 breaks Unity's async-load time-budget (it measures elapsed to decide when to
-                // yield); a real increasing value lets that logic see time pass and progress. rax = tsc.
-                c[o++] = 0x0f; c[o++] = 0x31;                                // rdtsc  (edx:eax = tsc)
-                c[o++] = 0x48; c[o++] = 0xc1; c[o++] = 0xe2; c[o++] = 0x20;  // shl rdx, 32
-                c[o++] = 0x48; c[o++] = 0x09; c[o++] = 0xd0;                 // or rax, rdx
-                c[o++] = 0xc3;                                               // ret
+                // ret0: value returned for a null receiver. PROSPER_NULLGUARD_RET selects the model:
+                //   "tsc" (default) = raw rdtsc counter; "zero" = 0; "ms" = rdtsc>>22 (~milliseconds @4GHz).
+                // WHY it matters: if the guarded method is Unity's async-load time-budget Stopwatch, returning
+                // raw TSC cycles where the caller expects MILLISECONDS makes every elapsed check overshoot the
+                // budget -> it integrates 0 objects/frame -> the load stalls forever on a black screen. A
+                // scaled ~ms value lets the budget see plausible small elapsed and actually integrate.
+                const char* ngret = getenv("PROSPER_NULLGUARD_RET");
+                if (ngret && !strcmp(ngret, "zero")) {
+                    c[o++] = 0x31; c[o++] = 0xc0;                               // xor eax,eax  (rax=0)
+                    c[o++] = 0xc3;                                             // ret
+                } else {
+                    c[o++] = 0x0f; c[o++] = 0x31;                              // rdtsc  (edx:eax = tsc)
+                    c[o++] = 0x48; c[o++] = 0xc1; c[o++] = 0xe2; c[o++] = 0x20; // shl rdx, 32
+                    c[o++] = 0x48; c[o++] = 0x09; c[o++] = 0xd0;               // or rax, rdx
+                    if (ngret && !strcmp(ngret, "ms")) {
+                        c[o++] = 0x48; c[o++] = 0xc1; c[o++] = 0xe8; c[o++] = 0x16; // shr rax, 22 (~ns->ms scale)
+                    }
+                    c[o++] = 0xc3;                                             // ret
+                }
                 // Patch method entry: jmp cave (5 bytes). Remaining relocated bytes stay as harmless tail.
                 uint8_t* g = (uint8_t*)(uintptr_t)addr;
                 int32_t jrel = (int32_t)((int64_t)(uintptr_t)cave - (int64_t)(uintptr_t)(g + 5));
