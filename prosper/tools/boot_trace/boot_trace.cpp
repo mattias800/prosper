@@ -117,6 +117,36 @@ int main(int argc, char** argv) {
     install_trap_handler();
     run_guest_inits(p.init_fns);
 
+    // PROSPER_PATCH_RET=addr[,addr...]: write 0xC3 (ret) at each absolute guest address, neutralizing that
+    // function (returns immediately, stack balanced). Bring-up diagnostic to bisect a crashing subsystem —
+    // e.g. skip the per-frame incremental-GC pump (Il2cpp+0x5df0 => 0x440005df0) to test whether the GC is
+    // the wall to scene activation. Guest code is RWX; write before the guest starts.
+    if (const char* pr = getenv("PROSPER_PATCH_RET")) {
+        const char* s = pr;
+        while (*s) {
+            char* end = nullptr; uint64_t a = strtoull(s, &end, 0);
+            if (a && end != s) { *(volatile uint8_t*)(uintptr_t)a = 0xC3;
+                fprintf(stderr, "[patch] ret @ 0x%llx\n", (unsigned long long)a); }
+            // Always make progress: skip the comma if present, else advance past what we parsed; if
+            // strtoull consumed nothing (end == s, malformed) step one char so we never spin forever.
+            s = (*end == ',') ? end + 1 : (end != s) ? end : s + 1;
+        }
+    }
+    // PROSPER_PATCH_BYTE=addr=val[,addr=val...]: write an arbitrary byte at a guest address (finer than
+    // PATCH_RET — e.g. flip a conditional 0x74 je -> 0xEB jmp to force a branch). Same bring-up bisection use.
+    if (const char* pb = getenv("PROSPER_PATCH_BYTE")) {
+        const char* s = pb;
+        while (*s) {
+            char* e1 = nullptr; uint64_t a = strtoull(s, &e1, 0);
+            if (a && e1 && *e1 == '=') {
+                char* e2 = nullptr; unsigned long v = strtoul(e1 + 1, &e2, 0);
+                *(volatile uint8_t*)(uintptr_t)a = (uint8_t)v;
+                fprintf(stderr, "[patch] byte 0x%02x @ 0x%llx\n", (unsigned)(v & 0xff), (unsigned long long)a);
+                s = (e2 && *e2 == ',') ? e2 + 1 : (e2 ? e2 : s + 1);
+            } else s = (e1 && *e1) ? e1 + 1 : s + 1;
+        }
+    }
+
 #ifdef PROSPER_HAVE_VULKAN
     // PROSPER_RENDER=1: register the live Vulkan renderer so execute_and_present fires on every
     // submitted Dcb with draws (Stage A of GPU_EXECUTOR_DESIGN.md, now live). Each rendered frame
