@@ -540,6 +540,9 @@ uint64_t g_submit_count = 0;
 // EOP completion signaling (hle_kernel_time.cpp): fire the GPU end-of-pipe events the game registered
 // via sceGnmAddEqEvent. Our fold is synchronous, so a completed SubmitDcb == the GPU pipe having drained.
 void prosper_eq_trigger_eop();
+// Execute a DCB-embedded flip (hle_graphics.cpp): advance flip status, present, and post the VIDEO_OUT
+// flip-done event carrying flip_arg. This is the completion Unity's frame-pacing loop waits on.
+void prosper_vo_dcb_flip(int handle, int bufidx, int mode, uint64_t flip_arg);
 
 extern "C" void prosper_agc_submit_stats(uint64_t* submits, uint64_t* draws) {
     if (submits) *submits = g_submit_count;
@@ -564,6 +567,17 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
         if (presented && getenv("PROSPER_GFXLOG"))
             fprintf(stderr, "[agc] SubmitDcb #%llu: executed %zu draws -> presented %ux%u frame\n",
                     (unsigned long long)g_submit_count, agc_gpu_state().draws.size(), w, h);
+    }
+    // Execute the game's DCB-embedded flip (captured during the fold), if any. This advances flip status,
+    // presents the buffer, and posts the flip-done event carrying flip_arg — the signal Unity's main-thread
+    // frame loop blocks on (UnityFTMFlipQueue). Previously the R_FLIP packet was dropped, so that flip never
+    // "completed" and the frame loop parked forever. CONFIDENCE: HIGH (root cause cross-confirmed vs Kyty).
+    if (auto& pf = agc_gpu_state().pending_flip; pf.valid) {
+        prosper_vo_dcb_flip(pf.handle, pf.bufidx, pf.mode, pf.arg);
+        if (getenv("PROSPER_GFXLOG"))
+            fprintf(stderr, "[agc] SubmitDcb #%llu: DCB flip -> buf=%d arg=0x%llx\n",
+                    (unsigned long long)g_submit_count, pf.bufidx, (unsigned long long)pf.arg);
+        pf.valid = false;
     }
     if (getenv("PROSPER_GFXLOG")) {
         fprintf(stderr, "[agc] SubmitDcb #%llu: %u dwords -> %zu packets applied (draws so far: %zu)\n",

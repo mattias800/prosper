@@ -26,6 +26,13 @@ struct GpuState {
     struct Draw { uint32_t index_count; };
     std::vector<Draw> draws;                             // one per DrawIndexAuto
 
+    // A DCB-embedded Flip packet (R_FLIP / sceAgcDcbSetFlip) captured during the fold: the game's real
+    // per-frame flip. The submit path executes it after the fold (advance flip status + present + post a
+    // VIDEO_OUT flip event carrying flip_arg) so Unity's frame-pacing sees ITS flip complete. Without this
+    // the flip is silently dropped and the main thread parks forever waiting on the flip-done it never gets.
+    struct PendingFlip { bool valid = false; int handle = 0, bufidx = 0, mode = 0; uint64_t arg = 0; };
+    PendingFlip pending_flip;
+
     // Safety cap on an indirect register count (a malformed/huge count won't run away).
     static constexpr uint32_t kMaxRegsPerPacket = 4096;
 

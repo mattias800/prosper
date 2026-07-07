@@ -157,6 +157,10 @@ namespace { bool evlog() { static int v = getenv("PROSPER_EVLOG") ? 1 : 0; retur
 void prosper_eq_add_flip(uint64_t eq, int64_t ident, uint64_t udata);
 void prosper_eq_add_vblank(uint64_t eq, int64_t ident, uint64_t udata);
 void prosper_eq_add_eop(uint64_t eq, int64_t id, uint64_t udata);
+// Post a flip-done event carrying the game's flip_arg to every registered flip equeue (vs the pump's
+// generic frame counter). Unity matches event.data against the flipArg it submitted, so a real flip must
+// carry it or the game never recognizes ITS flip completed.
+void prosper_eq_post_flip(int64_t flip_arg);
 // sceGnmAddEqEvent / GraphicsAddEqEvent (NID b0xyllnVY-I): register a GPU EOP/compute-ring completion
 // event source on an equeue. Mirrors shadPS4 sceGnmAddEqEvent (id=GfxEop=0x40 for gfx). The submit path
 // (hle_agc.cpp) fires prosper_eq_trigger_eop() on completion. NOTE: our target (The Messenger) never
@@ -164,6 +168,18 @@ void prosper_eq_add_eop(uint64_t eq, int64_t id, uint64_t udata);
 // the correct, ref-validated behavior for the general case and lets test_equeue_events verify the path.
 HLE(g_gnm_add_eq_event) {   // (eq, id, udata)
     if (evlog()) fprintf(stderr, "[ev] GnmAddEqEvent eq=0x%llx id=0x%llx udata=0x%llx\n",
+        (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2);
+    prosper_eq_add_eop(a0, (int64_t)a1, a2);
+    return 0;
+}
+// sceAgcDriverAddEqEvent (NID w2rJhmD+dsE) — the libSceAgc *driver* path's GPU-completion event
+// registration (the Agc analogue of sceGnmAddEqEvent; The Messenger uses the Agc path, not Gnm). The game
+// registers this on its UnityFTMFlipQueue and EOP QUEUE, then the main thread blocks on the flip queue for
+// GPU-submit completion. Previously a trace-only stub, so no source was registered and that queue starved
+// forever (the frame-loop stall). Wire it to the same EOP backend the submit path fires each SubmitDcb.
+// CONFIDENCE: MED — a0=equeue is confirmed; id/udata mapping mirrors the Gnm variant.
+HLE(g_agc_add_eq_event) {   // (eq, id, udata, ...)
+    if (evlog()) fprintf(stderr, "[ev] AgcDriverAddEqEvent eq=0x%llx id=0x%llx udata=0x%llx\n",
         (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2);
     prosper_eq_add_eop(a0, (int64_t)a1, a2);
     return 0;
@@ -191,6 +207,18 @@ HLE(g_vo_submitflip)  {
     g_last_flip_arg = (int64_t)a3;
     gpu::present_flip((int)(int32_t)a1, (int64_t)a3);   // present the buffer (scanout front + count)
     return 0;
+}
+// Execute a DCB-embedded flip (R_FLIP / sceAgcDcbSetFlip), called from the AGC submit path. The game
+// submits its REAL per-frame flip inside the Dcb (not via sceVideoOutSubmitFlip), so this is where that
+// flip actually completes: advance flip status (so GetFlipStatus shows progress), present the buffer, and
+// post a flip-done event carrying flip_arg to the registered flip equeues. Mirrors g_vo_submitflip.
+void prosper_vo_dcb_flip(int handle, int bufidx, int mode, uint64_t flip_arg) {
+    (void)handle; (void)mode;
+    g_flip_count++;
+    g_current_buffer = bufidx;
+    g_last_flip_arg = (int64_t)flip_arg;
+    gpu::present_flip(bufidx, (int64_t)flip_arg);
+    prosper_eq_post_flip((int64_t)flip_arg);
 }
 HLE(g_vo_flippending) { if (evlog()) fprintf(stderr, "[ev] IsFlipPending\n"); return 0; }        // never pending
 HLE(g_vo_flipstatus)  { // (handle, SceVideoOutFlipStatus* status): report our simulated flip count.
@@ -429,6 +457,9 @@ void register_graphics_hle() {
     // Override the +kSrjIVxKFE tracer with the real register-context constructor (must come AFTER the
     // tracer registration above so it wins; registry is last-write-wins per NID).
     RN("+kSrjIVxKFE", g_agc_ctx_init);      // AGC register-context init (installs classify table)
+    // Override the w2rJhmD+dsE tracer with the real sceAgcDriverAddEqEvent (registers the GPU-completion
+    // event source the game's frame loop waits on — the un-parking fix). Must come AFTER the tracers.
+    RN("w2rJhmD+dsE", g_agc_add_eq_event);   // sceAgcDriverAddEqEvent (GPU EOP completion, Agc driver path)
     // libSceVideoOut display / flip
     R("sceVideoOutOpen", g_vo_open);            R("sceVideoOutClose", g_vo_close);
     R("sceVideoOutSubmitFlip", g_vo_submitflip);R("sceVideoOutIsFlipPending", g_vo_flippending);

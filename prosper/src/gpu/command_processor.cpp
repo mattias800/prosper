@@ -118,8 +118,18 @@ void GpuState::apply(const Pm4Command& c) {
         case K::WriteData:
             honor_write_data(c);    // inline data write requested by the Dcb
             break;
+        case K::Flip:
+            // Capture the game's real per-frame flip (R_FLIP payload: [0]=handle, [1]=buffer index,
+            // [2]=mode, [3..4]=64-bit flip_arg). The submit path executes it after the fold. Previously
+            // dropped, which starved Unity's flip-done wait (the frame-loop stall). CONFIDENCE: HIGH
+            // (payload layout matches the sceAgcDcbSetFlip builder).
+            if (c.payload && c.len >= 6) {
+                pending_flip = { true, (int)c.payload[0], (int)c.payload[1], (int)c.payload[2],
+                                 (uint64_t)c.payload[3] | ((uint64_t)c.payload[4] << 32) };
+            }
+            break;
         default:
-            break;   // events / flips / unknown: no register-state effect (handled later)
+            break;   // events / unknown: no register-state effect
     }
 }
 

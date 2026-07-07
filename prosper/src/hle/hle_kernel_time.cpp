@@ -174,6 +174,18 @@ void prosper_eq_trigger_eop() {
         eq_post(r.eq, e);
     }
 }
+// Post a real flip-done event (VIDEO_OUT filter) carrying the game's flip_arg to every registered flip
+// equeue. Called from the DCB-flip path (hle_graphics.cpp prosper_vo_dcb_flip) when the game's actual
+// per-frame flip completes. The pump posts a generic frame counter as `data`; a real flip must carry the
+// submitted flip_arg so the guest's "did MY flip land?" predicate matches.
+void prosper_eq_post_flip(int64_t flip_arg) {
+    std::vector<FlipReg> regs;
+    { std::lock_guard<std::mutex> lk(g_eq_mx); regs = g_flip_regs; }
+    for (auto& r : regs) {
+        SceKEvent e{}; e.ident = r.ident; e.filter = EVFILT_VIDEO_OUT; e.data = flip_arg; e.udata = r.udata;
+        eq_post(r.eq, e);
+    }
+}
 
 HLE(k_eq_create) {
     EqState* s = new EqState();
