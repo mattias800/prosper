@@ -337,3 +337,35 @@ prints for **every** file (including ones that load fine during boot), so APR-re
 Net: the wall is specifically Unity's async **load-completion / integration** after the scene's bytes have
 streamed in — the main thread stays in its frame loop (renders 90+ frames) but the operation never reports
 complete. That main-thread integration step is the precise next target.
+## Hypotheses TESTED AND ELIMINATED for crash #1 (`WorkerThread.+0x40` null Stopwatch)
+
+A parallel session (95a32e9e) working on top of merged #42/#43 tested and ruled out the following as the
+cause of the never-initialized Stopwatch field — recorded so they are not re-tried:
+
+- **Thread-start ordering race** — added a `scePthreadCreate` start-handshake (creator waits for the new
+  thread to begin running + a slice budget for its `Run()` init) gated by `PROSPER_TSTART`. Crash unchanged
+  (`Il2cpp+0x1637697` still). Workers start and park normally, so it is **not** a "worker hasn't started" race.
+- **Thread-creation failure** — instrumented `k_pthread_create` to log any `pthread_create` that returns
+  nonzero: **0 failures** the whole run. The worker threads are created successfully.
+- **Stopwatch timestamp/frequency backing** — `sceKernelReadTsc`/`GetTscFrequency` return a sane 1 GHz and
+  `ns_now()` is monotonic, so `Stopwatch.StartNew()` cannot divide-by-zero / throw on the timer path.
+- **CPU-count / .NET ThreadPool starvation** — the game imports **no** `sysconf`/`sched_getaffinity`/
+  `GetCpumaskInfo` (only `UnityEngine.SystemInfo::GetProcessorCount`, backed by `scePthreadGetAffinity`
+  which we already return as 8 cores). So `Environment.ProcessorCount` is not low; the managed pool is not
+  CPU-count-starved.
+- **Null-bypass with a fake value** — `PROSPER_NULLGUARD` returning `rdtsc` did NOT stall at 3 reads here; it
+  **looped** re-reading `unity default resources` to **4096 preads → OOM**. Returning 0 stalls (per #43).
+  Confirms both: the field must be *genuinely* populated, and crash #2 (loader mis-behaving) is real.
+- **Missing HLE** — all `unimplemented → 0` NIDs fire once at startup; none during the steady-state load.
+
+**Architecture traced:** the one managed thread created has `Run()` at `Il2cpp+0x1cac50` — a **.NET
+ThreadPool worker** (atomic work-count on `[r15+0x10]`, then `call *%r12` to dispatch a queued delegate).
+So the Stopwatch-init runs as a **dispatched managed work item that never executes** in our env; the scene
+still loads (block 1183) because the *native* Unity job workers do the streaming, but the managed work item
+that would init `WorkerThread.+0x40` is the gap.
+
+**Decisive next probe (untried — needs process-wide tooling):** a hardware WRITE-watch on
+`[WorkerThread+0x40]` armed from the object's *allocation* across *all* threads (not the caller bp, which is
+after the write should have happened — that main-thread-only watch caught nothing). It answers definitively:
+does some worker/pool thread write the field (a dispatch/visibility race) or does no thread ever run the
+init (a never-dispatched work item)? That points straight at the fix.
