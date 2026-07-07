@@ -287,5 +287,40 @@ int main(int argc, char** argv) {
            (unsigned long long)r.rdx, (unsigned long long)r.rbp, (unsigned long long)r.rsp);
     printf("  backtrace (%zu frames):\n", r.backtrace.size());
     for (uint64_t a : r.backtrace) printf("    %-12s +0x%llx\n", cls(a), (unsigned long long)bof(a));
+    // PROSPER_CRASHPEEK: after a recovered main-thread fault, dump guest memory at the fault registers
+    // (still 1:1-mapped) so a null-source deref (e.g. an IL2CPP memcpy from a null field) can be traced
+    // to the object + field that is null. Reads are bounded by guest_readable (never re-faults).
+    if (getenv("PROSPER_CRASHPEEK") && r.kind == 2) {
+        auto dump = [&](const char* tag, uint64_t addr) {
+            printf("  [peek] %s=0x%llx:", tag, (unsigned long long)addr);
+            if (!addr || !prosper::gpu::guest_readable(addr, 8)) { printf(" <unmapped>\n"); return; }
+            for (int i = 0; i < 8; i++) {
+                uint64_t a = addr + (uint64_t)i * 8;
+                if (prosper::gpu::guest_readable(a, 8)) printf(" %016llx", (unsigned long long)*(const uint64_t*)(uintptr_t)a);
+                else { printf(" ...."); break; }
+            }
+            printf("\n");
+        };
+        dump("rax", r.rax); dump("rdi", r.rdi);
+        // The dest rdi is unaligned; also show the object rax as bytes (type tags / vtable ptr @+0).
+        // Scan rax's first 8 qwords for the null field (the likely memcpy source).
+        for (int i = 0; i < 8; i++) {
+            uint64_t a = r.rax + (uint64_t)i * 8;
+            if (prosper::gpu::guest_readable(a, 8) && *(const uint64_t*)(uintptr_t)a == 0)
+                printf("  [peek] rax+0x%x is NULL (candidate memcpy source field)\n", i * 8);
+        }
+        // Dump 24 instruction bytes at the fault rip and each backtrace frame's return site
+        // (return addr - 5, the call instruction) for offline `objdump -b binary -m i386:x86-64`.
+        auto insn = [&](const char* tag, uint64_t addr) {
+            printf("  [insn] %s 0x%llx:", tag, (unsigned long long)addr);
+            for (int i = 0; i < 24; i++)
+                if (prosper::gpu::guest_readable(addr + i, 1)) printf(" %02x", *(const uint8_t*)(uintptr_t)(addr + i));
+                else { printf(" ??"); break; }
+            printf("\n");
+        };
+        insn("rip", r.fault_rip);
+        for (size_t i = 0; i < r.backtrace.size() && i < 5; i++)
+            insn("call@", r.backtrace[i] >= 5 ? r.backtrace[i] - 5 : r.backtrace[i]);
+    }
     return 0;
 }
