@@ -54,7 +54,11 @@ std::optional<Module> Module::load(const std::string& path, std::string* err) {
     // SELF wrapper -> inner ELF, and SELF data segment map (flag 0x800 => real data).
     std::map<uint64_t, SelfSegment> data_seg; // phdr index -> data segment
     auto sh = rd<SelfHeader>(m.file, 0);
-    if (sh.magic == 0x1D3D154F) {
+    // Two observed SELF magics with an identical header/segment-table layout from offset 4 on
+    // (byte-compared across both dumps): 0x1D3D154F (The Messenger) and 0xEEF51454 (the UE4 title).
+    // Missing this map is fatal-but-silent: the raw-ELF fallback below still finds the inner ELF, but
+    // every segment file offset is then wrong, so the guest maps garbage bytes.
+    if (sh.magic == 0x1D3D154F || sh.magic == 0xEEF51454) {
         for (int i = 0; i < sh.num_segments; i++) {
             auto s = rd<SelfSegment>(m.file, 0x20 + i * sizeof(SelfSegment));
             if (s.flags & 0x800) data_seg[s.flags >> 20] = s;
