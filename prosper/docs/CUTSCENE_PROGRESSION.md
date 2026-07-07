@@ -292,3 +292,48 @@ whatever stalls `resources.assets` streaming at 3 reads (#2 — the loader stops
 waiting on a main-thread integration step that the missing-Stopwatch path never reaches on real HW).
 The layers keep peeling — each is Unity async-load engine internals. `PROSPER_NULLGUARD` is kept as a
 gated diagnostic (default no-op) for bisecting null-receiver crashes.
+
+## 2026-07-08 — GC-suspend guest-%fs landmine FIXED; post-#43 blocker is an async-load *completion stall*
+
+Built on merged #43 (the null `System.Diagnostics.Stopwatch` at `WorkerThread+0x40`). Findings:
+
+**1. Fixed a real GC-suspend bug (this branch).** The IL2CPP GC stop-the-world handler (exception
+type `0x1e`) keeps the guest `%fs` to run the guest's suspend handler, but logged with glibc `write()`
+— a cancellation point whose prologue reads `THREAD_SELF` at `%fs:0x10` (0 on our guest TCB) and
+dereferences `self->cancelhandling` at `+0x308`. That is the `SIGSEGV addr=0x308 rip=<libc>` seen under
+`PROSPER_SYNCLOG` (faulting insn `mov %fs:0x10,%rcx; mov 0x308(%rcx),%edx`). Switched to raw
+`syscall(SYS_write)`. A latent guest-`%fs` landmine in the suspend path; the fix also re-enables
+`SYNCLOG`-instrumented GC tracing (which previously self-crashed).
+
+**2. `GC_DONT_GC=1` is a NO-OP here.** Injecting it via `PROSPER_GUEST_ENV` does **not** stop the world —
+type-`0x1e` suspend cycles still fire with it set. IL2CPP's bundled Boehm does not honor that env knob in
+this build. (An earlier "determinism" reading was actually just the absence of `SYNCLOG` timing overhead,
+not GC being disabled. Corrected.)
+
+**3. `PROSPER_ONE_CPU` (new, gated) rules out core-count as the worker driver.** Reporting a 1-core
+affinity mask (`scePthreadAttrGetaffinity` → `0x01`) does **not** reduce the ~47 `Loading.PreloadManager`
+threads — they are cumulative async-load churn, not a core-sized pool. So single-threading the job system
+via affinity is not the lever.
+
+**4. The true post-#43 blocker is an async-load COMPLETION STALL, not a crash.** With the persistent
+`PROSPER_NULLGUARD` bypass of the #43 Stopwatch crash, the game does **not** crash — it runs 270+ rendered
+frames. It fades from the title to black to load the cutscene (`level1`), and the loader **does stream the
+cutscene's assets**: it opens `level1`, `resources.assets`, `resources.assets.resS`, and reads ~28
+`resources.resource` chunks (the real texture/audio blob). Then the load **stalls**: the worker thread
+pool keeps churning on its per-thread futexes but the load never *completes/integrates*, so the scene
+never activates — every frame stays a static black clear. Reaching the cutscene now means resolving why
+async-load integration never finishes after the assets stream in (an engine-level PreloadManager step),
+not fixing a fault. (Note: a one-shot fault-handler unwind of the Stopwatch getter — `PROSPER_SKIP_WT_GETTER`
+— instead diverges to a `%fs:-0x80` thread-local artifact at `eboot+0x9f1ba0`; the persistent `NULLGUARD`
+is the correct, non-diverging bypass and gets strictly further.)
+
+**5. The stall is INDEPENDENT of the Stopwatch return value, and of APR.** Added `PROSPER_NULLGUARD_RET`
+(`tsc`|`zero`|`ms`) to select what the guarded null-receiver returns. All three **stall at the same 28
+`resources.resource` reads** — so the time-budget/unit theory is wrong; the guard's return value does not
+gate the stall. (`ms` holds on a dark-blue/purple screen, `tsc` fades to black — cosmetic difference only,
+neither reaches the cutscene text card, which has white text; the stalled frames have 0% white.) Also: the
+"not considered suitable for apr reads flags:0x0" line is the GAME's own `LocalFileSystemPS5` decision and
+prints for **every** file (including ones that load fine during boot), so APR-rejection is not the blocker.
+Net: the wall is specifically Unity's async **load-completion / integration** after the scene's bytes have
+streamed in — the main thread stays in its frame loop (renders 90+ frames) but the operation never reports
+complete. That main-thread integration step is the precise next target.
