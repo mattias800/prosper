@@ -323,7 +323,8 @@ void register_builtin_hle() {
     R("expm1", m_expm1); R("expm1f", m_expm1f);
     #undef R
     register_file_hle();     // file I/O (stdio + POSIX, /app0 translation)
-    register_service_hle();  // PS5 system services (user/NP/pad/mouse/appcontent)
+    register_service_hle();  // PS5 system services (user/NP/mouse/appcontent/dialog)
+    register_pad_hle();      // libScePad: real game-controller input (input/pad.cpp)
     register_audio_hle();    // libSceAudioOut backed by a headless/pluggable AudioSink
     register_graphics_hle(); // headless libSceAgc/libSceVideoOut placeholders (bring-up)
     register_agc_hle();      // real AGC Dcb functions (override the glog stubs for Dcb NIDs)

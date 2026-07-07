@@ -10,6 +10,13 @@
 #ifdef PROSPER_AUDIO_SDL3
 #include "audio_sdl3.hpp"                 // optional SDL3 audio frontend (-DPROSPER_AUDIO_SDL3=ON)
 #endif
+#include <cstdlib>                        // getenv (PROSPER_PAD gate)
+#ifdef PROSPER_PAD_SDL3
+#include "pad_sdl3.hpp"                   // optional SDL3 gamepad frontend (-DPROSPER_PAD_SDL3=ON)
+#endif
+#ifdef PROSPER_PAD_EVDEV
+#include "pad_evdev.hpp"                  // zero-dep Linux evdev gamepad frontend
+#endif
 #ifdef PROSPER_HAVE_VULKAN
 #include "gpu/gpu_execute.hpp"
 #include "gpu/tile.hpp"                   // render-target de-swizzle (detile_surface, tiled_surface_bytes)
@@ -67,6 +74,17 @@ int main(int argc, char** argv) {
 #ifdef PROSPER_AUDIO_SDL3
     prosper::install_sdl3_audio_sink();   // route the guest's sceAudioOut output to the host via SDL3
 #endif
+    // Controller input, gated by PROSPER_PAD (default: core's neutral/disconnected pad, deterministic).
+    // Prefer the cross-platform SDL3 gamepad backend; fall back to the zero-dep Linux evdev reader.
+    if (getenv("PROSPER_PAD")) {
+        bool pad_ok = false; (void)pad_ok;
+#ifdef PROSPER_PAD_SDL3
+        pad_ok = prosper::install_sdl3_pad_backend();
+#endif
+#ifdef PROSPER_PAD_EVDEV
+        if (!pad_ok) pad_ok = prosper::install_evdev_pad_backend();
+#endif
+    }
     set_app0_root(d);
     for (auto& img : p.imgs) if (!map_image(img, &e)) { printf("map failed: %s\n", e.c_str()); return 1; }
     { std::vector<TlsModuleDesc> td; for (auto& t : p.tls_templates) td.push_back({t.init_va, t.filesz, t.memsz});

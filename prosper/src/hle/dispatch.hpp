@@ -39,8 +39,10 @@ void register_kernel_hle();
 void register_file_hle();
 // Set the host directory backing the guest's "/app0" (the game data root).
 void set_app0_root(const std::string& root);
-// PS5 system services (user/NP/pad/mouse/appcontent/dialog); called by register_builtin_hle().
+// PS5 system services (user/NP/mouse/appcontent/dialog); called by register_builtin_hle().
 void register_service_hle();
+// libScePad game-controller input (real host controller via input/pad.cpp); called by register_builtin_hle().
+void register_pad_hle();
 // Headless graphics bring-up (libSceAgc/libSceVideoOut placeholders); see hle_graphics.cpp.
 void register_graphics_hle();
 // libSceAudioOut HLE backed by a pluggable, headless AudioSink; see hle_audio.cpp / audio.hpp.

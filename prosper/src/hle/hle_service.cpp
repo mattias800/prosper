@@ -1,7 +1,8 @@
-// hle_service.cpp — HLE of PS5 system services (user, NP/online, pad, mouse, app content,
+// hle_service.cpp — HLE of PS5 system services (user, NP/online, mouse, app content,
 // dialogs). Bring-up policy: openers return a valid positive handle; queries zero their
 // output struct and report a sane "not signed in / no device" state and success, so the
 // game gets consistent values instead of uninitialized memory.
+// (Game-controller input — libScePad — moved to hle_pad.cpp with a real host backend.)
 #include "dispatch.hpp"
 #include "nid.hpp"
 #include <cstdint>
@@ -43,46 +44,12 @@ HLE(s_np_reach)       { if (a1) *(int32_t*)PW(a1) = 0; return 0; }
 HLE(s_np_accountid)   { if (a1) *(uint64_t*)PW(a1) = 0; return 0; }
 HLE(s_np_country)     { if (a1) memset(PW(a1), 0, 4); return 0; }
 
-// --- pad / mouse (report a device that exists but has no input) ---
-HLE(s_open)           { return g_handle++; }                                 // scePadOpen/sceMouseOpen -> handle
-// Conservative output sizes so we don't smash a smaller caller buffer.
-HLE(s_pad_info)       { if (a1) memset(PW(a1), 0, 0x20); return 0; }          // controller info -> zeroed
-// ScePadData is 0x78 bytes (cross-checked against the Kyty reference PadData: buttons @0x00,
-// sticks @0x04, touch data @0x30, connected @0x48, timestamp @0x50, extension tail to 0x77).
-// Zero ALL of it: a stub that claims "1 entry read" while zeroing only part of the struct hands
-// the game uninitialized touch/timestamp/connected bytes. CONFIDENCE: MED (offsets from Kyty).
-// Pad polling is per-frame, so the env probes are cached in statics (getenv scans environ linearly).
-static bool padlog()    { static const bool v = getenv("PROSPER_PADLOG")    != nullptr; return v; }
-static bool pad_press() { static const bool v = getenv("PROSPER_PAD_PRESS") != nullptr; return v; }
-static void fill_pad_data(uint8_t* d) {
-    memset(d, 0, 0x78);
-    if (pad_press()) {
-        *(uint32_t*)(d + 0x00) = 0x4000u;              // buttons: CROSS held
-        d[0x04] = d[0x05] = d[0x06] = d[0x07] = 128;   // sticks centered
-        d[0x48] = 1;                                   // connected = true
-    }
-}
-HLE(s_pad_read)       {
-    static unsigned n = 0; n++;
-    if (padlog() && (n <= 5 || n % 200 == 0)) fprintf(stderr, "[pad] scePadRead call #%u\n", n);
-    if (!a1) return 0;                                 // no output buffer -> no entries read
-    fill_pad_data((uint8_t*)PW(a1));
-    return 1;   // scePadRead returns the number of pad data entries read (>0 = data available)
-}
-// scePadReadState. Normally neutral (all zero). Two diagnostics: PROSPER_PADLOG counts calls (is the game
-// polling input each frame, i.e. is the frame loop live?); PROSPER_PAD_PRESS injects a connected controller
-// with a button held (CROSS=0x4000) so a "Press [button]" title screen can advance to a shader-drawn scene.
-HLE(s_pad_readstate)  {
-    static unsigned n = 0; n++;
-    if (padlog() && (n <= 5 || n % 200 == 0))
-        fprintf(stderr, "[pad] scePadReadState call #%u\n", n);
-    if (a1) fill_pad_data((uint8_t*)PW(a1));
-    return 0;
-}
+// --- mouse (report a device that exists but has no input; pad -> hle_pad.cpp real backend) ---
+HLE(s_open)           { return g_handle++; }                                 // sceMouseOpen -> handle
 // sceMouseRead(handle, SceMouseData*, num) returns the number of mouse events read. SceMouseData
-// (~0x18 bytes) is NOT ScePadData — sharing the pad stub returned one "valid" entry whose 0x30-byte
-// memset already overran a single-entry mouse buffer, and the game consumed a phantom mouse event
-// every call. No mouse attached: zero one entry defensively, report 0 events.
+// (~0x18 bytes) is NOT ScePadData — sharing the pad stub returned one "valid" entry whose memset
+// overran a single-entry mouse buffer, and the game consumed a phantom mouse event every call. No
+// mouse attached: zero one entry defensively, report 0 events.
 HLE(s_mouse_read)     { if (a1) memset(PW(a1), 0, 0x18); return 0; }
 
 // --- app content ---
@@ -122,14 +89,7 @@ void register_service_hle() {
     R("sceNpGetAccountCountryA", s_np_country);
     R("sceNpCheckCallback", s_ok);
     R("sceNpRegisterStateCallback", s_ok);
-    // pad / mouse
-    R("scePadInit", s_ok);
-    R("scePadOpen", s_open);
-    R("scePadClose", s_ok);
-    R("scePadGetControllerInformation", s_pad_info);
-    R("scePadDeviceClassGetExtendedInformation", s_pad_info);
-    R("scePadReadState", s_pad_readstate);
-    R("scePadRead", s_pad_read);
+    // pad -> hle_pad.cpp (register_pad_hle). mouse:
     R("sceMouseInit", s_ok);
     R("sceMouseOpen", s_open);
     R("sceMouseRead", s_mouse_read);
