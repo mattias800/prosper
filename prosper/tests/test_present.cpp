@@ -35,7 +35,9 @@ int main() {
 
     // SetBufferAttribute2 with our test dimensions, then RegisterBuffers2 with the 3 framebuffers.
     uint8_t attr[0x50]; memset(attr, 0, sizeof attr);
-    setba2((uint64_t)(uintptr_t)attr, 0x8000000000000000ull /*fmt*/, 0 /*tiling*/, W, H, 0 /*option*/);
+    // tiling=1 = LINEAR (Kyty VideoOutBufferAttribute): the test framebuffers are plain linear
+    // arrays. (The real game registers tiling=0 = tiled; scanout then de-swizzles SW_4KB_S.)
+    setba2((uint64_t)(uintptr_t)attr, 0x8000000000000000ull /*fmt*/, 1 /*tiling: linear*/, W, H, 0 /*option*/);
     struct VOB { const void* data; const void* metadata; const void* reserved[2]; };
     VOB buffers[3] = { {fb0.data(),0,{0,0}}, {fb1.data(),0,{0,0}}, {fb2.data(),0,{0,0}} };
     uint64_t rc = regb2(0x1001, 0, 0, (uint64_t)(uintptr_t)buffers, 3, (uint64_t)(uintptr_t)attr);
@@ -83,10 +85,15 @@ int main() {
     size_t rb = gpu::present_readback(out.data(), out.size());
     CHECK(rb == FB_BYTES, "readback returns the rendered frame size");
     CHECK(memcmp(out.data(), rendered.data(), FB_BYTES) == 0, "readback returns the exact rendered pixels");
-    // The rendered frame wins over the raw guest buffer even across flips.
+    // Most-recent-wins: a flip AFTER the rendered frame makes the flipped guest buffer the scanout
+    // source again (the flip presents the buffer — that's what a flip IS); a newer rendered frame
+    // would win back. This mirrors hardware: scanout shows whatever was presented last.
     flip(0x1001, 0, 0, 0, 0, 0);
     gpu::present_readback(out.data(), out.size());
-    CHECK(memcmp(out.data(), rendered.data(), FB_BYTES) == 0, "rendered frame takes precedence over the flipped guest buffer");
+    CHECK(out[0] == 0x11 && out[FB_BYTES - 1] == 0x11, "a newer flip supersedes the rendered frame (scanout = buffer 0)");
+    gpu::present_write_frame(rendered.data(), W, H);
+    gpu::present_readback(out.data(), out.size());
+    CHECK(memcmp(out.data(), rendered.data(), FB_BYTES) == 0, "a newer rendered frame supersedes the flip");
 
     // After reset, readback falls back to the guest buffer again.
     gpu::present_reset();
