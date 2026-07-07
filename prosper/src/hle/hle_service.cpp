@@ -38,7 +38,22 @@ HLE(s_open)           { return g_handle++; }                                 // 
 // Conservative output sizes so we don't smash a smaller caller buffer.
 HLE(s_pad_info)       { if (a1) memset(PW(a1), 0, 0x20); return 0; }          // controller info -> zeroed
 HLE(s_pad_read)       { if (a1) memset(PW(a1), 0, 0x30); return 0; }          // pad state -> neutral
-HLE(s_pad_readstate)  { if (a1) memset(PW(a1), 0, 0x30); return 0; }
+// scePadReadState. Normally neutral (all zero). Two diagnostics: PROSPER_PADLOG counts calls (is the game
+// polling input each frame, i.e. is the frame loop live?); PROSPER_PAD_PRESS injects a connected controller
+// with a button held (CROSS=0x4000) so a "Press [button]" title screen can advance to a shader-drawn scene.
+HLE(s_pad_readstate)  {
+    static unsigned n = 0; n++;
+    if (getenv("PROSPER_PADLOG") && (n <= 5 || n % 200 == 0))
+        fprintf(stderr, "[pad] scePadReadState call #%u\n", n);
+    if (a1) { uint8_t* d = (uint8_t*)PW(a1); memset(d, 0, 0x30);
+        if (getenv("PROSPER_PAD_PRESS")) {
+            *(uint32_t*)(d + 0x00) = 0x4000u;   // buttons: CROSS held
+            d[0x04] = d[0x05] = d[0x06] = d[0x07] = 128;   // sticks centered
+            d[0x2C] = 1;                        // connected = true (best-effort offset)
+        }
+    }
+    return 0;
+}
 
 // --- app content ---
 HLE(s_appcontent_int) { if (a1) *(int32_t*)PW(a1) = 0; return 0; }
