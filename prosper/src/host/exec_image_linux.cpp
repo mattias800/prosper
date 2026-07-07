@@ -1156,9 +1156,13 @@ void arm_hwbp() {
 // Arm the same execute bp on the CURRENT (worker) thread, gated by PROSPER_HWBP_ALLTHREADS. Each thread
 // owns its own perf fd + SIGTRAP delivery, so off-main-thread execution of the target is observed too.
 void arm_hwbp_this_thread() {
+    if (getenv("PROSPER_HWBP_ARMLOG")) { char b[128]; int n = snprintf(b, sizeof b,
+        "[hwbp] arm_this_thread tid=%ld on=%d all=%d addr=0x%llx tfd=%d\n", (long)syscall(SYS_gettid),
+        g_hwbp_on, g_hwbp_allthreads, (unsigned long long)g_hwbp_addr, t_hwbp_fd); write(2, b, n); }
     if (!g_hwbp_on || !g_hwbp_allthreads || !g_hwbp_addr || t_hwbp_fd >= 0) return;
     long fd = perf_bp_open(g_hwbp_addr, HW_BREAKPOINT_X);
-    if (fd < 0) return;
+    if (fd < 0) { char b[96]; int n = snprintf(b, sizeof b, "[hwbp] worker-arm FAILED tid=%ld errno=%d\n",
+        (long)syscall(SYS_gettid), errno); write(2, b, n); return; }
     t_hwbp_fd = (int)fd;
     fcntl(t_hwbp_fd, F_SETFL, O_ASYNC);
     fcntl(t_hwbp_fd, F_SETSIG, SIGTRAP);
