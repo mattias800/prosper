@@ -353,6 +353,10 @@ namespace {
     static constexpr uint64_t GPU_VA_LO = 0x100000000ull;   // 4 GiB
     static constexpr uint64_t GPU_VA_HI = 0x1000000000ull;  // 64 GiB
     volatile sig_atomic_t g_lazy_pages = 0;                 // count (diagnostic)
+}
+// Tracked-mapping state probe for the lazy-commit fault path (hle_kernel_mem.cpp).
+extern "C" int prosper_reserved_range_state(uint64_t addr);
+namespace {
 
     // no_stack_protector: this handler can be entered while the faulting thread runs on the GUEST %fs and
     // then switches to the HOST %fs mid-function (guest_fs_enter_host_for_signal at line ~759). A
@@ -766,6 +770,27 @@ namespace {
             if ((uint64_t)uc->uc_mcontext.gregs[REG_RIP] == g_skip_rip) {
                 uc->uc_mcontext.gregs[REG_RIP] = (greg_t)g_skip_target;
                 return;
+            }
+        }
+        // Lazy commit inside a guest-RESERVED range: the guest reserved this VA (tracked by the
+        // memory HLE) and touches a page it believes committed. Observed with UE4 (PPSA17942): its
+        // binned allocator touches one pool page per size-class bucket whose BatchMap commit it
+        // skips (bookkeeping real HW satisfies via semantics we don't fully replicate yet). Back
+        // the 64KB page on first touch — the same faithful unified-memory model as the GPU-VA
+        // window below — and log every page so a systematic commit-protocol gap stays visible.
+        // CONFIDENCE: MED (unblocks boot; the committed-page protocol deserves a real RE pass).
+        if (sig == SIGSEGV && si->si_addr) {
+            uint64_t a = (uint64_t)si->si_addr;
+            if (a >= 0x1000000000ull && prosper_reserved_range_state(a) == 1) {
+                void* page = (void*)(a & ~(uint64_t)0xffff);
+                bool ok = mmap(page, 0x10000, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == page;
+                char b[128]; auto* uc2 = (ucontext_t*)uctx;
+                int n = snprintf(b, sizeof b, "[lazy-commit] %s page=0x%llx rip=0x%llx\n",
+                                 ok ? "mapped" : "MMAP-FAILED", (unsigned long long)(uint64_t)(uintptr_t)page,
+                                 (unsigned long long)uc2->uc_mcontext.gregs[REG_RIP]);
+                write(2, b, n);
+                if (ok) return;   // re-execute against the now-backed page
             }
         }
         // Lazy unified-memory backing: back an unmapped GPU-VA page on demand and retry.

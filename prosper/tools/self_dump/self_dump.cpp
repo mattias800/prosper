@@ -156,7 +156,7 @@ int main(int argc, char** argv) {
 
     // -- SELF header --
     auto sh = rd<SelfHeader>(b, 0);
-    bool is_self = (sh.magic == 0x1D3D154F);
+    bool is_self = (sh.magic == 0x1D3D154F || sh.magic == 0xEEF51454);   // both observed SELF variants
     size_t elf_base = 0;
     std::vector<SelfSegment> segs;
     printf("== FILE: %s (%zu bytes) ==\n", argv[1], b.size());

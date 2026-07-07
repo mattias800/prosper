@@ -718,6 +718,9 @@ void register_kernel_hle() {
     // POSIX pthread_* names. The guest's libc is FreeBSD-derived (pointer/opaque pthread
     // types), so these have the same semantics as our Sony handlers — alias them.
     R("pthread_create", k_pthread_create);   R("pthread_join", k_pthread_join);
+    // libScePosix variant with a trailing name arg — same (tid*, attr, entry, arg, name) shape as
+    // scePthreadCreate. Unimplemented-0 silently created NO thread (UE4's IO stack starves).
+    R("pthread_create_name_np", k_pthread_create);
     R("pthread_detach", k_pthread_detach);    R("pthread_exit", k_pthread_exit);
     R("pthread_yield", k_pthread_yield);      R("sched_yield", k_pthread_yield);
     R("pthread_mutex_init", k_mutex_init);    R("pthread_mutex_destroy", k_mutex_destroy);
