@@ -78,6 +78,14 @@ HLE(s_appcontent_tmpmount2) {
 // value games use to size caches/allocations.
 HLE(s_appcontent_tmpspace) { if (a1) *(uint64_t*)PW(a1) = 1048576ull; return 0; }
 
+// sceSystemServiceParamGetString(paramId, char* buf, size_t bufSize): fetch a system string parameter
+// (e.g. the console/user nickname). The default unimplemented stub returned 0 (SUCCESS) but never wrote
+// the buffer, so the game read whatever uninitialized bytes were there as a "valid" string and derefed
+// into it (null-deref crash in managed code during scene load). Match this file's policy: write a valid
+// NUL-terminated string and report success. CONFIDENCE: MED — signature (paramId, buf, size) is the
+// documented Sony ABI; an empty string is a safe, defined default when we have no real system value.
+HLE(s_param_string)   { if (a1 && a2) ((char*)PW(a1))[0] = '\0'; return 0; }
+
 // Common/message dialogs: report FINISHED immediately so the game's "wait until dismissed" loop
 // exits and it proceeds (we have no interactive dialog UI yet). Status enum: NONE=0, INITIALIZED=1,
 // RUNNING=2, FINISHED=3. GetResult -> zeroed struct = OK/no button pressed.
@@ -135,6 +143,8 @@ void register_service_hle() {
     Hle::register_fn("bcolXMmp6qQ", (HleFn)s_ok,                  "sceAppContentTemporaryDataUnmount");
     R("sceCommonDialogInitialize", s_ok);
     R("sceSystemServiceParamGetInt", s_appcontent_int);
+    // sceSystemServiceParamGetString (SsC-m-S9JTA): write a valid empty string (not an unfilled buffer).
+    Hle::register_fn("SsC-m-S9JTA", (HleFn)s_param_string, "sceSystemServiceParamGetString");
     // message dialog: auto-dismiss (report FINISHED) so the startup dialog flow completes
     R("sceMsgDialogInitialize", s_ok);      R("sceMsgDialogTerminate", s_ok);
     R("sceMsgDialogOpen", s_ok);            R("sceMsgDialogClose", s_ok);
