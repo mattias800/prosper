@@ -91,7 +91,25 @@ HLE(k_reserve_vrange) {
     uint64_t align = a3 ? a3 : 0x4000;
     if (hint) {
         void* p = mmap((void*)hint, a1, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-        if (p == MAP_FAILED) { MLOG("reserve hint=0x%llx FAILED\n", (unsigned long long)hint); return 0x16; }
+        if (p == MAP_FAILED) {
+            // The hint region is already mapped. If it's ALREADY one of OUR reservations (uncommitted),
+            // the guest is re-reserving its own fixed range — PS5's reserve is idempotent for the caller's
+            // own range (the game's allocator no-hint-reserves, records the base, then re-claims it with a
+            // fixed hint). Returning an error here made the guest allocator hand back NULL, which the level1
+            // asset-load FileCacher then memcpy'd from (crash: memcpy(dst, NULL, n) during deserialization).
+            // Treat a re-reserve of our own reservation as success. CONFIDENCE: HIGH (matches the observed
+            // no-hint@line23 -> fixed-hint@line143 collision that precedes the loader-thread SIGSEGV).
+            bool ours = false;
+            { std::lock_guard<std::mutex> lk(g_mx);
+              for (auto& m : g_maps)
+                  if (!m.committed && hint >= m.base && hint < m.base + m.size) { ours = true; break; } }
+            if (ours) {
+                if (a0) *(uint64_t*)a0 = hint;
+                MLOG("reserve hint=0x%llx re-reserve-of-own-range -> OK\n", (unsigned long long)hint);
+                return 0;
+            }
+            MLOG("reserve hint=0x%llx FAILED\n", (unsigned long long)hint); return 0x16;
+        }
         if (a0) *(uint64_t*)a0 = (uint64_t)p;
         track((uint64_t)p, a1, 0, false, "reserved");
         MLOG("reserve(hint) -> 0x%llx len=0x%llx align=0x%llx\n", (unsigned long long)p, (unsigned long long)a1, (unsigned long long)align);
