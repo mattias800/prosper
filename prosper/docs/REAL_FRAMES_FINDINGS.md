@@ -40,9 +40,9 @@ here, one of which remains:
    and renders its corners as a triangle FAN (perimeter order BL,TL,TR,BR → tris {0,1,2},{0,2,3} tile the
    quad), so the whole frame fills. Only triggers for a 4-record buffer (real meshes unaffected).
 
-   **Result:** a late frame (post texture-load + fade) renders **The Messenger's full title screen with the
-   game's real VS+PS** — ~137k distinct colors, 0% clear-color, the complete logo + ninja + moon + crowd.
-   See the PR screenshot.
+   **Result:** a late frame (post texture-load + fade) renders **the game's full title composite with its
+   real VS+PS** — ~137k distinct colors, 0% clear-color. Verify locally with the repro below (frames land
+   as BMPs under `PROSPER_FRAME_DIR`); no game imagery is committed to the repo.
 
 ### Remaining polish (not blockers)
 - **Honor indexed / multi-draw** properly (replace the 4-vertex-fan quad heuristic) so arbitrary scene
