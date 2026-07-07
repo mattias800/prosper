@@ -113,6 +113,28 @@ using LiveRenderFn = std::function<std::vector<uint8_t>(const std::vector<uint32
 void set_submit_renderer(LiveRenderFn fn);
 bool have_submit_renderer();
 
+// --- Multi-draw frame rendering (a whole frame = many draws into one target) ---------------------------
+// One resolved draw within a frame: its recompiled shaders, resolved fixed-function state, the two stages'
+// resource tables (kept alive by shared_ptr so the backend can read their descriptors), and vertex count.
+struct FrameDraw {
+    std::vector<uint32_t> vs, fs;
+    ResolvedPipelineState ps;
+    std::shared_ptr<ShaderResourceTable> vrt, prt;
+    uint32_t vertex_count = 3;
+};
+// The multi-draw backend: render an ordered list of resolved draws into ONE WxH framebuffer (clear once,
+// accumulate) and return the composited RGBA8 pixels. Supplied by whoever owns a Vulkan device.
+using FrameRenderFn = std::function<std::vector<uint8_t>(const std::vector<FrameDraw>& draws,
+                                                         uint32_t width, uint32_t height)>;
+void set_frame_renderer(FrameRenderFn fn);
+bool have_frame_renderer();
+
+// Resolve EVERY draw of `st` (each under its own captured register snapshot) into a FrameDraw, hand the
+// ordered list to the registered frame backend, and present the composited frame. Returns true iff a
+// frame was produced. Inert (false) with no frame renderer or no draws. This is the real-frame path:
+// unlike execute_and_present (which renders only draws[0] of the folded state), it renders all draws.
+bool execute_frame_and_present(const GpuState& st, uint32_t width, uint32_t height);
+
 // Render a folded GpuState at (width,height) via the registered live renderer and hand the frame to the
 // present path (present_write_frame). Returns true iff a frame was produced and presented. A no-op
 // returning false when there is no renderer registered or the state has no draws — so it is inert on the

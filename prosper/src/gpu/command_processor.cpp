@@ -132,6 +132,7 @@ void GpuState::apply(const Pm4Command& c) {
             // videoout flip so GetFlipStatus advances and the game's frame pacer sees its flipArg
             // complete. Only for a fully-decoded payload — a short packet must not fabricate a flip.
             if (c.flip_valid) prosper_vo_flip_from_gpu(c.flip_handle, c.flip_bufidx, c.flip_mode, c.flip_arg);
+            flips++;   // frame boundary: the multi-draw executor renders the accumulated draws here
             break;
         default:
             break;   // events / waits / unknown: no register-state effect (handled later)

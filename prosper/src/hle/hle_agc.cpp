@@ -555,10 +555,29 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     // The submit has "completed" (synchronous fold): fire any registered GPU EOP events. Inert unless the
     // game called sceGnmAddEqEvent (b0xyllnVY-I); the RELEASE_MEM label write already happened in apply().
     prosper_eq_trigger_eop();
-    // Stage A: if a live renderer has been registered (runtime binary wires a Vulkan device) and this
-    // submit accumulated draws, execute the folded GpuState and present the frame. Inert (returns false)
-    // on the pure-HLE path until a device is registered, so it never perturbs the existing boot behavior.
-    if (gpu::have_submit_renderer() && !agc_gpu_state().draws.empty()) {
+    // Real-frame path (preferred): a frame is all the draws between flips, composited into one target. If a
+    // multi-draw frame renderer is registered, accumulate draws across submits and, when this submit crossed
+    // a flip boundary, render every accumulated draw (each under its own captured state) into one frame and
+    // present it — then reset the draw list for the next frame. A safety cap renders+resets if a frame runs
+    // away without a flip, so the snapshot list can't grow unbounded.
+    static uint64_t s_last_flips = 0;
+    if (gpu::have_frame_renderer()) {
+        gpu::GpuState& st = agc_gpu_state();
+        constexpr size_t kMaxDrawsPerFrame = 4096;
+        const bool flipped = st.flips > s_last_flips;
+        if (flipped || st.draws.size() >= kMaxDrawsPerFrame) {
+            s_last_flips = st.flips;
+            if (!st.draws.empty()) {
+                uint32_t w = gpu::present_width(), h = gpu::present_height();
+                bool presented = gpu::execute_frame_and_present(st, w, h);
+                if (presented && getenv("PROSPER_GFXLOG"))
+                    fprintf(stderr, "[agc] frame @flip #%u: composited %zu draws -> presented %ux%u\n",
+                            st.flips, st.draws.size(), w, h);
+            }
+            st.draws.clear();   // begin the next frame (register state carries over, as on real HW)
+        }
+    } else if (gpu::have_submit_renderer() && !agc_gpu_state().draws.empty()) {
+        // Legacy single-draw path (unchanged): render draws[0] of the folded state per submit.
         uint32_t w = gpu::present_width(), h = gpu::present_height();
         bool presented = gpu::execute_and_present(agc_gpu_state(), w, h);
         if (presented && getenv("PROSPER_GFXLOG"))

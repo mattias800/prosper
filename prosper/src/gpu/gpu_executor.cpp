@@ -26,7 +26,8 @@ extern "C" const void* prosper_agc_shader_header_for_code(uint64_t code_addr);
 
 namespace prosper::gpu {
 namespace {
-LiveRenderFn g_live;   // empty until the runtime/test registers a device-backed renderer
+LiveRenderFn g_live;    // empty until the runtime/test registers a device-backed (single-draw) renderer
+FrameRenderFn g_frame;  // empty until the runtime/test registers a multi-draw frame renderer
 
 // Read a 32-dword user-data SGPR block from a stage's register file. `base` = the stage's
 // SPI_SHADER_USER_DATA_*_0 register offset; absent registers read as 0. 32 (not 16) because NGG merged
@@ -422,6 +423,53 @@ bool execute_and_present(const GpuState& st, uint32_t width, uint32_t height) {
             const ResolvedPipelineState& ps, const ShaderResourceTable* vrt,
             const ShaderResourceTable* prt, uint32_t vcount) { return g_live(vs, fs, ps, vrt, prt, width, height, vcount); });
     if (px.size() != static_cast<size_t>(width) * height * 4) return false;   // recompile/render failed
+    present_write_frame(px.data(), width, height);
+    return true;
+}
+
+void set_frame_renderer(FrameRenderFn fn) { g_frame = std::move(fn); }
+bool have_frame_renderer()                { return static_cast<bool>(g_frame); }
+
+bool execute_frame_and_present(const GpuState& st, uint32_t width, uint32_t height) {
+    if (!g_frame || st.draws.empty() || !width || !height) return false;
+    const bool log = getenv("PROSPER_GFXLOG") != nullptr;
+    const uint32_t max_dwords = 0x10000;
+    // Recompiling a 4000+-dword shader once per draw is wasteful when a frame reuses a handful of shaders;
+    // cache the recompiled SPIR-V by program address (shaders are stable in guest memory for the run). The
+    // descriptor LAYOUT a shader declares is a property of the shader, not the bound data, so a cached
+    // module is valid across draws that bind different buffers to the same shader.
+    static std::unordered_map<uint64_t, std::vector<uint32_t>> vs_cache, fs_cache;
+
+    std::vector<FrameDraw> frame;
+    frame.reserve(st.draws.size());
+    size_t skipped = 0;
+    for (size_t i = 0; i < st.draws.size(); i++) {
+        GpuState ds = st.state_at_draw(i);
+        RenderState rs = extract_render_state(ds);
+        if (!rs.es_addr || !rs.ps_addr) { skipped++; continue; }
+        FrameDraw fd;
+        fd.vrt = build_stage_table(ds, rs.es_addr, false);
+        fd.prt = build_stage_table(ds, rs.ps_addr, true);
+        auto get = [&](std::unordered_map<uint64_t, std::vector<uint32_t>>& cache, uint64_t addr, bool ps,
+                       const ShaderResourceTable* t) -> const std::vector<uint32_t>& {
+            auto it = cache.find(addr);
+            if (it != cache.end()) return it->second;
+            std::vector<uint32_t> code = ps ? recompile_fragment((const uint32_t*)(uintptr_t)addr, max_dwords, t)
+                                            : recompile_vertex((const uint32_t*)(uintptr_t)addr, max_dwords, t);
+            return cache.emplace(addr, std::move(code)).first->second;
+        };
+        fd.vs = get(vs_cache, rs.es_addr, false, fd.vrt.get());
+        fd.fs = get(fs_cache, rs.ps_addr, true,  fd.prt.get());
+        if (fd.vs.empty() || fd.fs.empty()) { skipped++; continue; }
+        fd.ps = resolve_pipeline_state(rs);
+        fd.vertex_count = ds.draws[0].index_count ? ds.draws[0].index_count : 3;
+        frame.push_back(std::move(fd));
+    }
+    if (log) fprintf(stderr, "[frame] resolved %zu/%zu draws (%zu skipped) -> rendering %ux%u\n",
+                     frame.size(), st.draws.size(), skipped, width, height);
+    if (frame.empty()) return false;
+    std::vector<uint8_t> px = g_frame(frame, width, height);
+    if (px.size() != static_cast<size_t>(width) * height * 4) return false;
     present_write_frame(px.data(), width, height);
     return true;
 }

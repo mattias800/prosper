@@ -27,12 +27,67 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <deque>
 #include <vector>
 #include <fcntl.h>
 #include <unistd.h>
 #endif
 
 using namespace prosper;
+
+#ifdef PROSPER_HAVE_VULKAN
+// Build one draw's descriptor-bound resources from its two stages' resource tables: read each declared
+// constant/vertex buffer + texture out of 1:1-mapped guest memory into a FrameResource. Texture bytes are
+// appended to `store` (a std::deque so earlier textures' .data() pointers stay valid as more are added) and
+// must outlive the render call. Honors PROSPER_TESTTEX (recognizable gradient) and PROSPER_DETILE (de-
+// swizzle SW_4KB_S render targets). Shared by the multi-draw frame renderer below.
+static std::vector<prosper::test::FrameResource> build_frame_resources(
+        const prosper::gpu::ShaderResourceTable* vrt, const prosper::gpu::ShaderResourceTable* prt,
+        std::deque<std::vector<uint8_t>>& store) {
+    using RC = prosper::gpu::ResourceClass;
+    std::vector<prosper::test::FrameResource> R;
+    int dn = open("/dev/null", O_WRONLY);
+    auto readable = [&](uint64_t a, size_t n){ return a > 0x1000 && dn >= 0 && write(dn, (const void*)(uintptr_t)a, n) == (ssize_t)n; };
+    auto add = [&](const prosper::gpu::ShaderResourceTable* t){
+        if (!t) return;
+        for (auto& r : t->resources) {
+            prosper::test::FrameResource fr; fr.binding = r.binding;
+            if (r.cls == RC::Texture || r.cls == RC::StorageImage) {
+                uint32_t tw = r.width ? r.width : 4, th = r.height ? r.height : 4;
+                size_t nb = (size_t)tw * th * 4;
+                store.emplace_back(nb, 0x00);
+                if (readable(r.gpu_addr, nb)) std::memcpy(store.back().data(), (const void*)(uintptr_t)r.gpu_addr, nb);
+                if (getenv("PROSPER_TESTTEX")) {
+                    for (uint32_t y = 0; y < th; y++) for (uint32_t x = 0; x < tw; x++) {
+                        uint8_t* p = &store.back()[((size_t)y * tw + x) * 4];
+                        bool ck = ((x / 64) ^ (y / 64)) & 1;
+                        p[0] = (uint8_t)(255 * x / tw); p[1] = (uint8_t)(255 * y / th); p[2] = ck ? 200 : 40; p[3] = 255;
+                    }
+                }
+                if (const char* dt = getenv("PROSPER_DETILE"); dt && atoi(dt) != 0) {
+                    const uint32_t tmode = (uint32_t)prosper::gpu::TileMode::Sw4KbS;
+                    const uint32_t pitch = getenv("PROSPER_PITCH") ? (uint32_t)atoi(getenv("PROSPER_PITCH")) : 0;
+                    size_t tiled_bytes = prosper::gpu::tiled_surface_bytes(tw, th, tmode, pitch);
+                    std::vector<uint8_t> tiled(tiled_bytes, 0);
+                    if (readable(r.gpu_addr, tiled_bytes)) std::memcpy(tiled.data(), (const void*)(uintptr_t)r.gpu_addr, tiled_bytes);
+                    else std::memcpy(tiled.data(), store.back().data(), std::min(nb, tiled_bytes));
+                    prosper::gpu::detile_surface(store.back().data(), tiled.data(), tw, th, tmode, pitch);
+                }
+                fr.tex_rgba = store.back().data(); fr.tw = tw; fr.th = th;
+            } else {
+                uint32_t nb = std::min(r.size ? r.size : 256u, 1u << 20);
+                if (nb >= 4 && readable(r.gpu_addr, nb))
+                    fr.dwords.assign((const uint32_t*)(uintptr_t)r.gpu_addr, (const uint32_t*)(uintptr_t)(r.gpu_addr + (nb & ~3u)));
+                if (fr.dwords.empty()) fr.dwords.assign(64, 0);
+            }
+            R.push_back(std::move(fr));
+        }
+    };
+    add(vrt); add(prt);
+    if (dn >= 0) close(dn);
+    return R;
+}
+#endif
 
 
 // Module bases (keep in sync with the inputs below).
@@ -254,6 +309,37 @@ int main(int argc, char** argv) {
                 return px;
             });
         fprintf(stderr, "[render] live Vulkan submit renderer registered (frames -> %s)\n", fdir.c_str());
+
+        // Multi-draw frame renderer (DEFAULT under PROSPER_RENDER; the single-draw path above stays
+        // registered as a fallback and for the REFVS/TESTPS/NOPS isolation hooks under PROSPER_RENDER_SINGLE).
+        // A real frame is all of a frame's draws composited into one target — the AGC submit handler prefers
+        // this renderer (have_frame_renderer) and calls it once per flip with every accumulated draw.
+        if (!getenv("PROSPER_RENDER_SINGLE")) {
+            prosper::gpu::set_frame_renderer(
+                [](const std::vector<prosper::gpu::FrameDraw>& draws, uint32_t w, uint32_t h) -> std::vector<uint8_t> {
+                    std::deque<std::vector<uint8_t>> store;   // keeps every draw's texture bytes alive until render
+                    std::vector<prosper::test::FramePass> passes; passes.reserve(draws.size());
+                    for (const auto& d : draws) {
+                        prosper::test::FramePass p;
+                        p.vs = &d.vs; p.fs = &d.fs; p.ps = &d.ps; p.vcount = d.vertex_count;
+                        p.R = build_frame_resources(d.vrt.get(), d.prt.get(), store);
+                        passes.push_back(std::move(p));
+                    }
+                    std::vector<uint8_t> px = prosper::test::render_frame_rgba(passes, w, h);
+                    static std::atomic<int> fno{0};
+                    int n = fno++;
+                    static std::string fd = getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".";
+                    if (px.empty()) {
+                        fprintf(stderr, "[frame] %d: render FAILED (%ux%u, %zu draws)\n", n, w, h, draws.size());
+                    } else if (n < 12 || n % 60 == 0) {
+                        char fn[512]; snprintf(fn, sizeof fn, "%s/frame_%04d.bmp", fd.c_str(), n);
+                        prosper::test::dump_bmp(fn, px, w, h);
+                        fprintf(stderr, "[frame] %d composited %zu draws (%ux%u) -> %s\n", n, draws.size(), w, h, fn);
+                    }
+                    return px;
+                });
+            fprintf(stderr, "[frame] multi-draw frame renderer registered (composited frames -> %s)\n", fdir.c_str());
+        }
     }
 #endif
 

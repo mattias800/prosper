@@ -24,6 +24,7 @@ struct GpuState {
     using RegFile = std::unordered_map<uint32_t, uint32_t>;
     RegFile cx, sh, uc;                                  // register files by offset
     uint32_t index_type = 0;                             // last SetIndexType
+    uint32_t flips = 0;                                  // incremented per in-stream Flip (frame boundary)
 
     // A draw records its vertex count AND a snapshot of the register state at the moment it was issued.
     // Real frames are built from MANY draws, each with its own bound shaders/pipeline/resources; folding
