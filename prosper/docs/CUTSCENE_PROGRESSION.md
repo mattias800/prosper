@@ -49,6 +49,24 @@ null) that then crash when a per-frame update/GC/finalizer touches them — i.e.
 is the alternative/compounding cause. It is **not** a worker-thread fault (0 observed) and **not** a missing
 HLE call (no unimplemented call fires during the steady-state load).
 
+## Also fixed — spurious `%fs` stack-smash abort in `fault_handler`
+
+A second, intermittent fatal crash independent of the GC one: `*** stack smashing detected ***` (SIGABRT).
+Caught with an `LD_PRELOAD` `__stack_chk_fail` interposer — the "smash" was inside our own SIGSEGV/SIGBUS/
+SIGILL `fault_handler`, with `%fs:0x28` already equal to the host canary at abort time (no real overflow).
+The handler is entered while the faulting thread runs on the **guest `%fs`**, then switches to the **host
+`%fs`** mid-function (`guest_fs_enter_host_for_signal`); a `-fstack-protector` prologue reads its canary from
+the guest TCB and the epilogue re-reads it from the host TCB, so any divergence trips `__stack_chk_fail`.
+Fixed by marking exactly this `%fs`-switching handler `__attribute__((no_stack_protector))`
+(`exec_image_linux.cpp`) — removes the false positive at its source. Eliminated one of the two intermittent
+long-run crash modes (`smashing=0` across repeated runs); the incremental-GC crash below remains.
+
+**The per-frame pump is Boehm's INCREMENTAL GC:** `Il2cpp+0x5df0` is a time-sliced work loop, and `0x5ee0`
+is a 6-state jump-table mark/sweep machine driven by `[Il2cpp+0x267dee8]`. The remaining crash is a **race**
+(point varies `SubmitDcb #20..#6530`) inside that collector — stop-the-world likely not covering a
+scene-load thread. The scene never activates (draw shader/`color0_base` unchanged; reads plateau ~block 977),
+because the GC crash kills the game during scene integration.
+
 ## Next steps (for reaching the cutscene)
 
 1. **Resolve the scene-load deserialization corruption** (the `FileCacher` stale-block issue in
