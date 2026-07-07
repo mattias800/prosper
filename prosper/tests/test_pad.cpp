@@ -76,6 +76,13 @@ int main() {
     CHECK(pad_axis_u8(100, 0, 0) == 0x80,            "degenerate range -> center 0x80");
     CHECK(pad_axis_u8(-99999, -32768, 32767) == 0,   "axis below min clamps to 0");
 
+    // (4b) Analog trigger -> digital L2/R2 bit (thresholded so rest/noise doesn't trip it).
+    CHECK(pad_trigger_buttons(0, 0) == 0, "triggers at rest -> no digital bit");
+    CHECK(pad_trigger_buttons(kPadTriggerButtonThreshold, 0) == 0, "trigger at threshold -> no bit");
+    CHECK(pad_trigger_buttons(0xFF, 0) == SCE_PAD_BUTTON_L2, "L2 full -> L2 bit only");
+    CHECK(pad_trigger_buttons(0, 0xFF) == SCE_PAD_BUTTON_R2, "R2 full -> R2 bit only");
+    CHECK(pad_trigger_buttons(0xFF, 0xFF) == (SCE_PAD_BUTTON_L2 | SCE_PAD_BUTTON_R2), "both -> both bits");
+
     // (5) Controller information.
     {
         ScePadControllerInformation ci;

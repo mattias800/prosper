@@ -335,24 +335,27 @@ if(TARGET prosper_core)
   endif()
 endif()
 
-# --- optional SDL3 audio frontend (headless core stays dependency-free) ---------------------
-# The sceAudioOut HLE is backend-agnostic (src/hle/audio.hpp). This builds an SDL3-backed sink,
-# entirely OUTSIDE prosper_core, so the guest's audio plays on the host. Off by default.
-#   Enable with:  -DPROSPER_AUDIO_SDL3=ON   (uses a system SDL3 if found, else fetches + builds it)
-option(PROSPER_AUDIO_SDL3 "Build the optional SDL3 audio frontend" OFF)
-if(PROSPER_AUDIO_SDL3 AND TARGET prosper_core)
+# --- SDL3 frontends (optional; headless core stays dependency-free) --------------------------
+# The sceAudioOut sink (frontends/audio_sdl3) and the libScePad gamepad backend (frontends/pad_sdl3)
+# can both use SDL3. They must share ONE SDL3 build: if each fetched independently, the first fetch's
+# option set would win — e.g. an AUDIO+PAD build would get audio's joystick-less SDL and the gamepad
+# backend would silently have no device. So acquire SDL3 ONCE here, with the UNION of the subsystems
+# the enabled frontends need (JOYSTICK/HIDAPI only when the pad frontend is on). Both consumer blocks
+# below just use the resulting SDL3::SDL3 target.
+option(PROSPER_AUDIO_SDL3 "Build the optional SDL3 audio frontend"   OFF)
+option(PROSPER_PAD_SDL3   "Build the optional SDL3 gamepad frontend" OFF)
+if((PROSPER_AUDIO_SDL3 OR PROSPER_PAD_SDL3) AND TARGET prosper_core AND NOT TARGET SDL3::SDL3)
   find_package(SDL3 QUIET CONFIG)
   if(NOT SDL3_FOUND)
-    message(STATUS "SDL3 not found on system — fetching release-3.2.30")
+    message(STATUS "SDL3 not found — fetching release-3.2.30 (audio=${PROSPER_AUDIO_SDL3} pad=${PROSPER_PAD_SDL3})")
     include(FetchContent)
     set(SDL_TEST OFF CACHE BOOL "" FORCE)
     set(SDL_TESTS OFF CACHE BOOL "" FORCE)
     set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(SDL_SHARED OFF CACHE BOOL "" FORCE)
     set(SDL_STATIC ON CACHE BOOL "" FORCE)
-    # Audio-only build: disabling video drops SDL's hard X11/Wayland requirement so it builds on
-    # headless hosts (SDL_UNIX_CONSOLE_BUILD is SDL's documented "no windowing system" escape hatch).
-    # Trim the other subsystems we don't use to keep the SDL build lean.
+    # No windowing system required (audio sink / controller state only). SDL_UNIX_CONSOLE_BUILD is
+    # SDL's documented "no windowing system" escape hatch; trim the subsystems we never use.
     set(SDL_UNIX_CONSOLE_BUILD ON CACHE BOOL "" FORCE)
     set(SDL_VIDEO OFF CACHE BOOL "" FORCE)
     set(SDL_WAYLAND OFF CACHE BOOL "" FORCE)
@@ -360,19 +363,32 @@ if(PROSPER_AUDIO_SDL3 AND TARGET prosper_core)
     set(SDL_RENDER OFF CACHE BOOL "" FORCE)
     set(SDL_GPU OFF CACHE BOOL "" FORCE)
     set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
-    set(SDL_JOYSTICK OFF CACHE BOOL "" FORCE)
     set(SDL_HAPTIC OFF CACHE BOOL "" FORCE)
-    set(SDL_HIDAPI OFF CACHE BOOL "" FORCE)
     set(SDL_SENSOR OFF CACHE BOOL "" FORCE)
     set(SDL_POWER OFF CACHE BOOL "" FORCE)
     set(SDL_DIALOG OFF CACHE BOOL "" FORCE)
+    # Gamepad support is needed ONLY by the pad frontend — enable JOYSTICK + HIDAPI whenever it's on,
+    # regardless of which frontend triggers the (single) fetch. This is the union that fixes the
+    # combined-build trap: an AUDIO+PAD build now gets a joystick-capable SDL.
+    if(PROSPER_PAD_SDL3)
+      set(SDL_JOYSTICK ON CACHE BOOL "" FORCE)
+      set(SDL_HIDAPI   ON CACHE BOOL "" FORCE)
+    else()
+      set(SDL_JOYSTICK OFF CACHE BOOL "" FORCE)
+      set(SDL_HIDAPI   OFF CACHE BOOL "" FORCE)
+    endif()
     FetchContent_Declare(SDL3
       GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
       GIT_TAG release-3.2.30
       GIT_SHALLOW TRUE)
     FetchContent_MakeAvailable(SDL3)
   endif()
+endif()
 
+# --- optional SDL3 audio frontend (headless core stays dependency-free) ---------------------
+# The sceAudioOut HLE is backend-agnostic (src/hle/audio.hpp). This builds an SDL3-backed sink,
+# entirely OUTSIDE prosper_core, so the guest's audio plays on the host.
+if(PROSPER_AUDIO_SDL3 AND TARGET SDL3::SDL3)
   add_library(prosper_audio_sdl3 STATIC frontends/audio_sdl3/audio_sink_sdl3.cpp)
   target_include_directories(prosper_audio_sdl3 PUBLIC frontends/audio_sdl3 src)
   target_link_libraries(prosper_audio_sdl3 PUBLIC prosper_core SDL3::SDL3)
@@ -397,45 +413,9 @@ endif()
 # --- optional SDL3 gamepad frontend (headless core stays dependency-free) --------------------
 # The libScePad HLE is backend-agnostic (src/input/pad.hpp). This builds an SDL_Gamepad-backed
 # PadBackend, entirely OUTSIDE prosper_core, so a real controller drives the guest cross-platform.
-# Off by default.  Enable with:  -DPROSPER_PAD_SDL3=ON
-option(PROSPER_PAD_SDL3 "Build the optional SDL3 gamepad frontend" OFF)
-if(PROSPER_PAD_SDL3 AND TARGET prosper_core)
-  # Reuse an SDL3 already provided (system, or fetched by the audio frontend); else fetch + build it.
-  # Gamepad needs JOYSTICK + HIDAPI ON (the audio frontend builds SDL with them OFF, so a combined
-  # AUDIO+PAD build should configure with -DPROSPER_PAD_SDL3=ON so this block's options win).
-  if(NOT TARGET SDL3::SDL3)
-    find_package(SDL3 QUIET CONFIG)
-  endif()
-  if(NOT TARGET SDL3::SDL3)
-    message(STATUS "SDL3 not found on system — fetching release-3.2.30 (gamepad build)")
-    include(FetchContent)
-    set(SDL_TEST OFF CACHE BOOL "" FORCE)
-    set(SDL_TESTS OFF CACHE BOOL "" FORCE)
-    set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
-    set(SDL_SHARED OFF CACHE BOOL "" FORCE)
-    set(SDL_STATIC ON CACHE BOOL "" FORCE)
-    # Headless-friendly: no windowing system required (we only read controller state).
-    set(SDL_UNIX_CONSOLE_BUILD ON CACHE BOOL "" FORCE)
-    set(SDL_VIDEO OFF CACHE BOOL "" FORCE)
-    set(SDL_WAYLAND OFF CACHE BOOL "" FORCE)
-    set(SDL_X11 OFF CACHE BOOL "" FORCE)
-    set(SDL_RENDER OFF CACHE BOOL "" FORCE)
-    set(SDL_GPU OFF CACHE BOOL "" FORCE)
-    set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
-    set(SDL_HAPTIC OFF CACHE BOOL "" FORCE)
-    set(SDL_SENSOR OFF CACHE BOOL "" FORCE)
-    set(SDL_POWER OFF CACHE BOOL "" FORCE)
-    set(SDL_DIALOG OFF CACHE BOOL "" FORCE)
-    # Gamepad support: these must be ON.
-    set(SDL_JOYSTICK ON CACHE BOOL "" FORCE)
-    set(SDL_HIDAPI ON CACHE BOOL "" FORCE)
-    FetchContent_Declare(SDL3
-      GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
-      GIT_TAG release-3.2.30
-      GIT_SHALLOW TRUE)
-    FetchContent_MakeAvailable(SDL3)
-  endif()
-
+# Off by default.  Enable with:  -DPROSPER_PAD_SDL3=ON  (SDL3 acquired by the shared step above,
+# with JOYSTICK/HIDAPI ON because this option is set).
+if(PROSPER_PAD_SDL3 AND TARGET SDL3::SDL3)
   add_library(prosper_pad_sdl3 STATIC frontends/pad_sdl3/pad_sink_sdl3.cpp)
   target_include_directories(prosper_pad_sdl3 PUBLIC frontends/pad_sdl3 src)
   target_link_libraries(prosper_pad_sdl3 PUBLIC prosper_core SDL3::SDL3)

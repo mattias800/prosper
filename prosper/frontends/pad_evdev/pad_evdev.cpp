@@ -176,8 +176,7 @@ public:
         out.right_y = norm(p.ry, p.cal_ry);
         out.l2      = norm(p.l2, p.cal_l2);
         out.r2      = norm(p.r2, p.cal_r2);
-        if (out.l2 > 0) b |= SCE_PAD_BUTTON_L2;   // digital bit trips off the analog travel
-        if (out.r2 > 0) b |= SCE_PAD_BUTTON_R2;
+        b |= pad_trigger_buttons(out.l2, out.r2);   // digital L2/R2 bit off the analog travel
 
         out.buttons   = b;
         out.connected = true;

@@ -5,6 +5,7 @@
 #include "pad.hpp"
 #include <cstddef>
 #include <cstring>
+#include <atomic>
 
 namespace prosper::input {
 
@@ -32,6 +33,13 @@ uint8_t pad_axis_u8(int raw, int min, int max) {
     if (v < 0)   v = 0;
     if (v > 255) v = 255;
     return (uint8_t)v;
+}
+
+uint32_t pad_trigger_buttons(uint8_t l2, uint8_t r2) {
+    uint32_t b = 0;
+    if (l2 > kPadTriggerButtonThreshold) b |= SCE_PAD_BUTTON_L2;
+    if (r2 > kPadTriggerButtonThreshold) b |= SCE_PAD_BUTTON_R2;
+    return b;
 }
 
 void pad_fill_data(ScePadData* out, const HostPadState& s, uint64_t timestamp, uint8_t connected_count) {
@@ -69,12 +77,12 @@ namespace {
 struct NeutralPadBackend : PadBackend {
     bool poll(int /*index*/, HostPadState& out) override { out = HostPadState{}; return false; }
 };
-NeutralPadBackend g_neutral;
-PadBackend*       g_backend = &g_neutral;
+NeutralPadBackend        g_neutral;
+std::atomic<PadBackend*> g_backend{&g_neutral};   // a frontend may install from another thread
 } // namespace
 
-void pad_set_backend(PadBackend* backend) { g_backend = backend ? backend : &g_neutral; }
-PadBackend* pad_backend() { return g_backend; }
+void pad_set_backend(PadBackend* backend) { g_backend.store(backend ? backend : &g_neutral); }
+PadBackend* pad_backend() { return g_backend.load(); }
 
 void pad_fill_controller_info(ScePadControllerInformation* out, bool connected, uint8_t connected_count) {
     if (!out) return;

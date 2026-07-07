@@ -82,8 +82,7 @@ public:
         out.right_y = stick_u8(SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHTY));
         out.l2      = trigger_u8(SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFT_TRIGGER));
         out.r2      = trigger_u8(SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER));
-        if (out.l2 > 0) b |= SCE_PAD_BUTTON_L2;
-        if (out.r2 > 0) b |= SCE_PAD_BUTTON_R2;
+        b |= pad_trigger_buttons(out.l2, out.r2);
 
         out.buttons   = b;
         out.connected = true;

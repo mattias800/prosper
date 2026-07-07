@@ -4,13 +4,14 @@
 //   1. A PURE mapping core (pad_fill_data / pad_fill_controller_info) that turns a host-neutral
 //      HostPadState into Sony's exact ScePadData / ScePadControllerInformation byte layout. This is
 //      unit-tested (struct offsets + field mapping) with no device present.
-//   2. A host BACKEND (pad_backend_poll) that reads a real controller. Implemented for Linux via
-//      evdev (zero external deps); a no-op elsewhere. The backend degrades gracefully to
-//      "no device" so the pure core and the whole boot still run on a machine with no gamepad.
+//   2. A pluggable PadBackend (interface below) that reads a real controller. prosper_core ships a
+//      dependency-free NEUTRAL default; a host frontend under frontends/ (SDL3 gamepad — the
+//      cross-platform primary — or the zero-dep Linux evdev reader) installs itself via
+//      pad_set_backend() from the harness. So prosper_core stays free of host/device code and the
+//      whole boot runs on a machine with no gamepad.
 //
 // Layout cross-checked against the Kyty PS5 emulator (source/emulator/src/Controller.cpp) and the
-// published Sony ScePadData; asserted byte-for-byte in pad.cpp. CONFIDENCE: HIGH (layout), MED
-// (per-device evdev axis/button mapping — standard Linux gamepad codes, but device drivers vary).
+// published Sony ScePadData; asserted byte-for-byte in pad.cpp. CONFIDENCE: HIGH (layout).
 #pragma once
 #include <cstdint>
 
@@ -122,6 +123,14 @@ void pad_fill_controller_info(ScePadControllerInformation* out, bool connected, 
 
 // Normalize a raw axis reading in [min,max] to the Sony 0..255 range (clamped).
 uint8_t pad_axis_u8(int raw, int min, int max);
+
+// The digital L2/R2 button bit trips once the analog trigger passes a small rest threshold — this
+// filters sensor noise / drift while staying responsive (real pads trip near the start of travel).
+constexpr uint8_t kPadTriggerButtonThreshold = 0x08;   // ~3% of full travel
+
+// Return the L2/R2 button bits for analog trigger values past the threshold (0 for both at rest).
+// Shared by every backend so the analog->digital rule lives in one unit-tested place.
+uint32_t pad_trigger_buttons(uint8_t l2, uint8_t r2);
 
 // ---- Pluggable host backend (mirrors AudioSink / audio_set_sink) -------------------------------
 //
