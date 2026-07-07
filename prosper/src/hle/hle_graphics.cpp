@@ -355,6 +355,13 @@ uint64_t glog_impl(const char* nid, void* ra,
             }
         }
     }
+    // PROSPER_AGCRET: RE probe for the render thread's tight spin on Zw7uUVPulbw(ctx,0x81,1,ptr,ts,iter).
+    // The stub returns 0 forever, so if the guest polls "is it ready? (0=no)" it spins. Return the env
+    // value for that NID to test whether a non-zero ("ready"/handle) result breaks the spin and lets the
+    // render thread proceed. Diagnostic only (gated) — the value that works tells us the real semantics.
+    if (const char* rv = getenv("PROSPER_AGCRET")) {
+        if (!strcmp(nid, "Zw7uUVPulbw")) return (uint64_t)strtoull(rv, nullptr, 0);
+    }
     return 0;
 }
 template <size_t I>
