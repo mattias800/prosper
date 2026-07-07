@@ -79,7 +79,11 @@ HLE(k_rtc_get_clock_localtime) {
     uint64_t us = (ns_now() / 1000ull) + 1700000000ull * 1000000ull;
     time_t secs = (time_t)(us / 1000000ull);
     struct tm tmv {};
+#ifdef _WIN32
+    gmtime_s(&tmv, &secs);
+#else
     gmtime_r(&secs, &tmv);
+#endif
     uint16_t* d = (uint16_t*)P(a0);
     d[0] = (uint16_t)(tmv.tm_year + 1900);
     d[1] = (uint16_t)(tmv.tm_mon + 1);

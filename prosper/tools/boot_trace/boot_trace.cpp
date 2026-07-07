@@ -36,7 +36,12 @@
 // PROSPER_CRASHPEEK (below) needs these in every config — the gpu/*.hpp includes above are gated on
 // PROSPER_HAVE_VULKAN, but guest_readable is a core (non-Vulkan) symbol always linked into prosper_core,
 // and strchr needs <cstring>. Declare/include them unconditionally so the no-Vulkan build compiles.
+// PROSPER_NULLGUARD's cave mmap likewise needs <sys/mman.h> in every non-Windows config (the Vulkan
+// block above only transitively provided it in some local configs — CI's no-Vulkan build broke).
 #include <cstring>
+#ifndef _WIN32
+#include <sys/mman.h>
+#endif
 namespace prosper::gpu { bool guest_readable(uint64_t addr, uint32_t bytes); }
 
 using namespace prosper;
