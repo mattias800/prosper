@@ -7,6 +7,9 @@
 #include "hle/dispatch.hpp"
 #include <cstdio>
 #include <string>
+#ifdef PROSPER_AUDIO_SDL3
+#include "audio_sdl3.hpp"                 // optional SDL3 audio frontend (-DPROSPER_AUDIO_SDL3=ON)
+#endif
 #ifdef PROSPER_HAVE_VULKAN
 #include "gpu/gpu_execute.hpp"
 #include "gpu/tile.hpp"                   // render-target de-swizzle (detile_surface, tiled_surface_bytes)
@@ -61,6 +64,9 @@ int main(int argc, char** argv) {
            p.mods.size(), p.total_imports, p.resolved_cross_module, p.slots.size(), p.init_fns.size());
 
     register_builtin_hle();
+#ifdef PROSPER_AUDIO_SDL3
+    prosper::install_sdl3_audio_sink();   // route the guest's sceAudioOut output to the host via SDL3
+#endif
     set_app0_root(d);
     for (auto& img : p.imgs) if (!map_image(img, &e)) { printf("map failed: %s\n", e.c_str()); return 1; }
     { std::vector<TlsModuleDesc> td; for (auto& t : p.tls_templates) td.push_back({t.init_va, t.filesz, t.memsz});
