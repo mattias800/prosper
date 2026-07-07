@@ -77,6 +77,15 @@ inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn&
     for (const auto& d : st.draws) {
         const GpuState& ds = (perdraw && d.state) ? *d.state : st;   // the draw's register snapshot
         RenderState rs = extract_render_state(ds);
+        // The draw rasterizes with the PRIMITIVE TYPE in effect AT the draw, and the context log
+        // stages a post-draw rewrite (the composite's end state reads 4=trilist while its draw-time
+        // value is 7=rect) — so prefer the snapshot's prim type whenever it is a value we recognize.
+        // (Snapshot values we don't know yet fall back to the end state rather than degrading to
+        // points; see the sectioned-log notes in command_processor.cpp.)
+        if (!perdraw && d.state) {
+            uint32_t sp = extract_render_state(*d.state).prim_type;
+            if ((sp >= 1 && sp <= 7) || sp == 17 || sp == 19) rs.prim_type = sp;
+        }
         if (!rs.es_addr || !rs.ps_addr) {                    // no vertex/pixel program bound at this draw
             if (log) fprintf(stderr, "[exec] skip draw: no PGM bound (es=0x%llx ps=0x%llx)\n",
                              (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr);
@@ -121,9 +130,23 @@ inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn&
         it.ps = resolve_pipeline_state(rs);
         it.vrt = vrt; it.prt = prt;
         it.vertex_count = d.index_count ? d.index_count : 3;
+        // RECT primitives (raw 7 / 17): the hardware expands a 3-corner draw into the full
+        // rectangle. We translate to a triangle strip, so draw the 4th corner too — the game's
+        // vertex buffer carries it (num_records=4), and it equals the corner hardware derivation
+        // would produce (Kyty's Gen5 rect path draws 4 strip vertices the same way).
+        if ((rs.prim_type == 7 || rs.prim_type == 17) && it.vertex_count == 3) it.vertex_count = 4;
+        // A draw whose color write mask is 0 cannot contribute pixels — don't realize it (our
+        // fresh-cleared target model would otherwise PRESENT the bare clear color over the last
+        // real frame; on hardware the render target simply keeps its contents).
+        if (it.ps.color_write_mask == 0) {
+            if (log) fprintf(stderr, "[exec] skip draw: color_write_mask=0 (contributes no pixels)\n");
+            continue;
+        }
         if (log) fprintf(stderr, "[exec] draw item %zu: vs=%zu fs=%zu dwords vcount=%u mask=0x%x blend=%d "
-                         "fmt=%u es=0x%llx ps=0x%llx\n", items.size(), it.vs.size(), it.fs.size(),
-                         it.vertex_count, it.ps.color_write_mask, (int)it.ps.blend_enable, rs.color0_format,
+                         "fmt=%u prim=%u snapprim=%d es=0x%llx ps=0x%llx\n", items.size(), it.vs.size(),
+                         it.fs.size(), it.vertex_count, it.ps.color_write_mask, (int)it.ps.blend_enable,
+                         rs.color0_format, rs.prim_type,
+                         d.state ? (int)extract_render_state(*d.state).prim_type : -1,
                          (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr);
         items.push_back(std::move(it));
         prev_state = &ds; prev_es = rs.es_addr; prev_ps = rs.ps_addr;

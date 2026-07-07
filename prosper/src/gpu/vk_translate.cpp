@@ -5,7 +5,7 @@ namespace prosper::gpu {
 
 VkTopology vk_topology(uint32_t prim_type) {
     // RDNA2 VGT_DI_PRIMITIVE_TYPE (kPrimitiveType*): 1=point, 2=line list, 3=line strip,
-    // 4=triangle list, 5=triangle fan, 6=triangle strip.
+    // 4=triangle list, 5=triangle fan, 6=triangle strip, 17=rect list.
     switch (prim_type) {
         case 1:  return VkTopology::PointList;
         case 2:  return VkTopology::LineList;
@@ -13,6 +13,17 @@ VkTopology vk_topology(uint32_t prim_type) {
         case 4:  return VkTopology::TriangleList;
         case 5:  return VkTopology::TriangleFan;
         case 6:  return VkTopology::TriangleStrip;
+        // RECT/QUAD primitives (Vulkan has neither; the executor bumps a 3-vertex draw to 4 —
+        // the game's vertex buffer carries the 4th corner, cf. Kyty's Gen5 rect path issuing
+        // vkCmdDraw(4) for a 3-corner rect):
+        //  7  = the value The Messenger's AGC context holds at its fullscreen-composite draws.
+        //       Its 4 buffer vertices are in PERIMETER order (A->B->C->D around the quad), so the
+        //       correct expansion is a triangle FAN — (A,B,C)+(A,C,D) covers the quad exactly.
+        //       (As a strip it rendered 75% of the frame; as a raw trilist, 50%.) Matches Kyty's
+        //       quad-list treatment (GraphicsRender.cpp:4870, fan). CONFIDENCE: MED (empirical).
+        //  17 = PM4 DI_PT_RECTLIST, strip-ordered corners (Kyty GraphicsRender.cpp:4869).
+        case 7:  return VkTopology::TriangleFan;
+        case 17: return VkTopology::TriangleStrip;
         default: return VkTopology::PointList;
     }
 }

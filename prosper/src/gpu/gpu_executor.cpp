@@ -357,6 +357,14 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                             d.stride ? *(const float*)(uintptr_t)(d.base + d.stride + 4) : 0.0f,
                             d.stride ? *(const float*)(uintptr_t)(d.base + d.stride + 8) : 0.0f,
                             d.stride ? *(const float*)(uintptr_t)(d.base + d.stride + 12) : 0.0f);
+                    // The rect-primitive fix draws 4 strip vertices — dump v2/v3 too so the corner
+                    // order (and whether record 3 is the opposite corner) is verifiable from the log.
+                    if (d.stride && d.num_records >= 4 && guest_readable(d.base, d.stride * 4)) {
+                        const float* f2 = (const float*)(uintptr_t)(d.base + d.stride * 2);
+                        const float* f3 = (const float*)(uintptr_t)(d.base + d.stride * 3);
+                        fprintf(stderr, "[dynvb]     v2: %.3f %.3f %.3f | v3: %.3f %.3f %.3f\n",
+                                f2[0], f2[1], f2[2], f3[0], f3[1], f3[2]);
+                    }
                 }
             }
         }
