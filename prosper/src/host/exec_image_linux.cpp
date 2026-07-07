@@ -349,6 +349,15 @@ namespace {
     static constexpr uint64_t GPU_VA_HI = 0x1000000000ull;  // 64 GiB
     volatile sig_atomic_t g_lazy_pages = 0;                 // count (diagnostic)
 
+    // no_stack_protector: this handler can be entered while the faulting thread runs on the GUEST %fs and
+    // then switches to the HOST %fs mid-function (guest_fs_enter_host_for_signal at line ~759). A
+    // -fstack-protector prologue reads its canary from %fs:0x28 at entry (guest TCB) and the epilogue
+    // re-reads it (host TCB); if a thread's guest-TCB canary copy ever diverges from the host canary, the
+    // epilogue sees a spurious mismatch and aborts via __stack_chk_fail ("stack smashing detected") even
+    // though no buffer overflowed — a fatal false positive that intermittently killed long runs. Disabling
+    // the canary on exactly this %fs-switching handler removes the false positive at its source (more
+    // robust than copying the canary into every guest TCB, which is per-thread-fragile).
+    __attribute__((no_stack_protector))
     void fault_handler(int sig, siginfo_t* si, void* uctx) {
         // PROSPER_HWBP race-free hardware breakpoint. The perf event is disabled while single-stepping,
         // so a SIGTRAP while g_hwbp_stepping is the step-completion (TF) -> re-enable + clear TF. Any
