@@ -25,6 +25,16 @@ HLE(s_user_idlist)    { if (a0) { int32_t* p = (int32_t*)PW(a0); p[0] = 1; for (
 HLE(s_user_name)      { if (a1) snprintf((char*)PW(a1), a2 ? (size_t)a2 : 17, "%s", "Player"); return 0; }
 HLE(s_user_int_out)   { if (a1) *(int32_t*)PW(a1) = 0; return 0; }           // accessibility getters -> 0
 HLE(s_user_age)       { if (a1) *(int32_t*)PW(a1) = 18; return 0; }          // GetAgeLevel -> adult (no restriction)
+// sceUserServiceGetEvent(SceUserServiceEvent* ev): the event stream. A real system delivers the initial
+// user's LOGIN event once at startup, then reports "no more events" so the game's drain loop terminates.
+// The previous (unimplemented) stub returned 0 = "got an event" but left the struct unfilled -> the game
+// either drained a garbage event or never saw the login it waits on. SceUserServiceEvent = { int32
+// eventType (0=LOGIN,1=LOGOUT); int32 userId }. NO_EVENT = 0x80960009.
+HLE(s_user_getevent)  {
+    static std::atomic<int> delivered{0};
+    if (a0 && delivered.exchange(1) == 0) { int32_t* ev = (int32_t*)PW(a0); ev[0] = 0; ev[1] = 1; return 0; }
+    return 0x80960009ull;   // SCE_USER_SERVICE_ERROR_NO_EVENT
+}
 HLE(s_ok)             { return 0; }
 
 // --- NP / online (single-player: report signed-out / unreachable, success) ---
@@ -74,6 +84,7 @@ void register_service_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
     // user service
     R("sceUserServiceGetInitialUser", s_user_initial);
+    R("sceUserServiceGetEvent", s_user_getevent);   // deliver the initial-user LOGIN event once
     R("sceUserServiceGetLoginUserIdList", s_user_idlist);
     R("sceUserServiceGetUserName", s_user_name);
     R("sceUserServiceGetAccessibilityVibration", s_user_int_out);
