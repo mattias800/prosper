@@ -1127,13 +1127,29 @@ BootResult run_entry(const LoadedImage& img) {
         top -= n; memcpy((void*)top, a.c_str(), n);
         argptrs.push_back(top);
     }
+    // PROSPER_GUEST_ENV="KEY=VAL;KEY=VAL": inject environment strings the guest's libc getenv() will see
+    // (the crt0 envp is otherwise empty). Used to feed the guest's bundled Boehm GC its env knobs
+    // (e.g. GC_DONT_GC=1 to disable collection, or GC_INITIAL_HEAP_SIZE) when investigating GC-driven
+    // corruption. ';'-separated so values may contain '='. CONFIDENCE: HIGH on the SysV envp layout.
+    std::vector<uint64_t> envptrs;
+    if (const char* ge = getenv("PROSPER_GUEST_ENV")) {
+        std::string s(ge); size_t i = 0;
+        while (i < s.size()) {
+            size_t j = s.find(';', i);
+            std::string kv = s.substr(i, j == std::string::npos ? std::string::npos : j - i);
+            if (!kv.empty()) { size_t n = kv.size() + 1; top -= n; memcpy((void*)top, kv.c_str(), n); envptrs.push_back(top); }
+            if (j == std::string::npos) break; i = j + 1;
+        }
+        top &= ~(uint64_t)0xf;
+    }
     top &= ~(uint64_t)0xf;
-    // crt0 vector: argc, argv[0..N-1], NULL, envp NULL, auxv AT_NULL(0,0).
+    // crt0 vector: argc, argv[0..N-1], NULL, envp[0..M-1], NULL, auxv AT_NULL(0,0).
     std::vector<uint64_t> vecv;
     vecv.push_back(args.size());
     for (uint64_t pp : argptrs) vecv.push_back(pp);
     vecv.push_back(0);   // argv terminator
-    vecv.push_back(0);   // envp NULL
+    for (uint64_t pp : envptrs) vecv.push_back(pp);
+    vecv.push_back(0);   // envp terminator
     vecv.push_back(0); vecv.push_back(0);   // auxv AT_NULL
     if (vecv.size() & 1) vecv.push_back(0);   // keep an even count so the ≡8(mod16) placement below holds
     const uint64_t* vec = vecv.data(); size_t vecsz = vecv.size() * sizeof(uint64_t);
