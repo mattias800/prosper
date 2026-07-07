@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <chrono>
+#include <climits>
 #if defined(__linux__)
 #include <unistd.h>
 #include <sys/syscall.h>
