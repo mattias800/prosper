@@ -40,12 +40,15 @@ struct BootResult {
     int          kind = 0;      // 0 = returned, 2 = faulted (SIGSEGV/BUS), 3 = SIGILL
     std::string  detail;        // fault description
     uint64_t     fault_addr = 0, fault_rip = 0;
-    uint64_t     rbp = 0, rsp = 0, rax = 0, rdi = 0, rsi = 0, rdx = 0; // regs at fault
+    uint64_t     rbp = 0, rsp = 0, rax = 0, rdi = 0, rsi = 0, rdx = 0, rbx = 0; // regs at fault
     std::vector<uint64_t> backtrace;   // return addresses (rbp chain) at the fault
 };
 // Register the stack a guest thread runs on (main thread + workers we spawn), keyed by
 // its pthread id, so GC/thread code gets accurate bounds without pthread_getattr_np.
 void register_thread_stack(uint64_t tid, void* base, uint64_t size);
+// Arm the PROSPER_HWBP execute breakpoint on the calling (worker) thread (no-op unless
+// PROSPER_HWBP_ALLTHREADS is set). Lets off-main-thread execution of the target be observed.
+void arm_hwbp_this_thread();
 // Report the calling guest thread's registered stack bounds (false if not registered).
 bool guest_stack_for_current_thread(void** base, size_t* size);
 bool guest_stack_for_thread(uint64_t tid, void** base, size_t* size);

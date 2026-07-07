@@ -402,6 +402,76 @@ int main(int argc, char** argv) {
         insn("rip", r.fault_rip);
         for (size_t i = 0; i < r.backtrace.size() && i < 5; i++)
             insn("call@", r.backtrace[i] >= 5 ? r.backtrace[i] - 5 : r.backtrace[i]);
+
+        // --- IL2CPP managed-object class resolver ---------------------------------------
+        // A managed object is { Il2CppClass* klass; void* monitor; ... }. Il2CppClass (Unity
+        // 2022.3 il2cpp) starts { Il2CppImage* image; void* gc_desc; const char* name;
+        // const char* namespaze; ... } so name = *(char**)(klass+0x10), ns = *(klass+0x18).
+        // Given a candidate object pointer, validate klass + name look sane and print the name.
+        auto rd8 = [&](uint64_t a) -> uint64_t {
+            return prosper::gpu::guest_readable(a, 8) ? *(const uint64_t*)(uintptr_t)a : 0;
+        };
+        auto ascii_at = [&](uint64_t p, char* out, int cap) -> int {
+            if (!p || !prosper::gpu::guest_readable(p, 1)) return 0;
+            int n = 0;
+            for (; n < cap - 1; n++) {
+                if (!prosper::gpu::guest_readable(p + n, 1)) return 0;
+                char c = *(const char*)(uintptr_t)(p + n);
+                if (c == 0) break;
+                if (c < 0x20 || (unsigned char)c > 0x7e) return 0;   // not a clean C identifier/name
+                out[n] = c;
+            }
+            if (n == 0) return 0;
+            out[n] = 0; return n;
+        };
+        auto klass_name = [&](uint64_t klass, char* nm, int ncap, char* ns, int nscap) -> bool {
+            if (!klass || !prosper::gpu::guest_readable(klass, 0x20)) return false;
+            uint64_t namep = rd8(klass + 0x10), nsp = rd8(klass + 0x18);
+            if (!ascii_at(namep, nm, ncap)) return false;
+            if (!ascii_at(nsp, ns, nscap)) ns[0] = 0;   // namespace may legitimately be empty
+            return true;
+        };
+        auto try_obj = [&](const char* tag, uint64_t obj) {
+            if (!obj || !prosper::gpu::guest_readable(obj, 8)) return false;
+            uint64_t klass = rd8(obj);
+            char nm[128], ns[128];
+            if (!klass_name(klass, nm, sizeof nm, ns, sizeof ns)) return false;
+            printf("  [class] %s obj=0x%llx klass=0x%llx name=\"%s%s%s\" [obj+0x40]=0x%llx\n",
+                   tag, (unsigned long long)obj, (unsigned long long)klass,
+                   ns[0] ? ns : "", ns[0] ? "." : "", nm, (unsigned long long)rd8(obj + 0x40));
+            return true;
+        };
+        // PROSPER_PEEK_CLASS=0xADDR[,..]: treat each ADDR as an Il2CppClass* and print its name;
+        // also chase its static-fields singleton ([class+0xb8] -> statics -> [statics+0] = obj) and name it.
+        if (const char* pk = getenv("PROSPER_PEEK_CLASS")) {
+            for (const char* p = pk; *p; ) {
+                uint64_t k = strtoull(p, nullptr, 0);
+                char nm[128], ns[128];
+                if (klass_name(k, nm, sizeof nm, ns, sizeof ns))
+                    printf("  [peekclass] klass=0x%llx name=\"%s%s%s\" statics=0x%llx\n",
+                           (unsigned long long)k, ns[0]?ns:"", ns[0]?".":"", nm, (unsigned long long)rd8(k + 0xb8));
+                else printf("  [peekclass] klass=0x%llx <no name>\n", (unsigned long long)k);
+                uint64_t statics = rd8(k + 0xb8);
+                if (statics) { uint64_t obj = rd8(statics);
+                    try_obj("  singleton[statics+0]", obj);
+                    // also scan first 8 static slots for managed objects
+                    for (int i = 0; i < 16; i++) { uint64_t o = rd8(statics + i*8);
+                        char t[32]; snprintf(t,sizeof t,"  static+0x%x", i*8); try_obj(t, o); }
+                }
+                const char* c = strchr(p, ','); if (!c) break; p = c + 1;
+            }
+        }
+        printf("  --- il2cpp class scan (rbx=0x%llx) ---\n", (unsigned long long)r.rbx);
+        try_obj("rax", r.rax);
+        try_obj("rbx", r.rbx);
+        try_obj("rdi", r.rdi);
+        // Scan the crashing frame's stack for managed-object pointers (callerObj lives here as a
+        // saved/spilled register). Report each qword whose target resolves to an Il2CppClass name.
+        for (uint64_t sp = r.rsp; sp && sp <= r.rbp + 0x80 && sp < r.rsp + 0x400; sp += 8) {
+            uint64_t v = rd8(sp);
+            char lbl[48]; snprintf(lbl, sizeof lbl, "stack[rbp%+lld]", (long long)((int64_t)sp - (int64_t)r.rbp));
+            try_obj(lbl, v);
+        }
         // PROSPER_PEEK_CODE=0xADDR[,0xADDR...]: dump 512 code bytes at each guest address (still mapped
         // post-fault) for offline `objdump -b binary -m i386:x86-64 --adjust-vma=ADDR`. Used to
         // disassemble the guest GC suspend handler etc. without extracting the SELF module.
