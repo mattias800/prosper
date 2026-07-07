@@ -106,6 +106,10 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         val[in.dst.value] = v;
                     else val.erase(in.dst.value);
                 } else if (in.dst.kind == OperandKind::SGPR) { val.erase(in.dst.value); }
+                // Several SOP1 ops write SCC (s_abs_i32, s_not_b32, s_and_saveexec_*, …). Only the moves
+                // (s_mov_b32 0x03 / s_mov_b64 0x04) are known not to — anything else invalidates the
+                // tracked SCC, or a later s_cselect folds with a stale compare result.
+                if (in.opcode != 0x03 && in.opcode != 0x04) scc = -1;
                 break;
             case Rdna2Format::SOP2: {
                 uint32_t a, c; bool ka, kc;
@@ -225,7 +229,15 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 }
                 break;
             }
+            case Rdna2Format::SOPK:
+                // s_cmpk_* / s_addk_i32 write SCC (only s_movk/s_version/s_cmovk/s_mulk don't); this
+                // interpreter doesn't model SOPK, so ANY SOPK conservatively invalidates the tracked SCC —
+                // a stale SCC consumed by a later s_cselect would fabricate a confidently-wrong V# patch.
+                scc = -1;
+                if (in.dst.kind == OperandKind::SGPR) val.erase(in.dst.value);
+                break;
             default:
+                // Remaining formats (SOPP, VALU, memory, …) don't write SCC, so the tracked SCC survives.
                 if (in.dst.kind == OperandKind::SGPR) val.erase(in.dst.value);   // unmodeled scalar write -> unknown
                 break;
         }
