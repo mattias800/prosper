@@ -550,6 +550,12 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     struct Packet { uint32_t* addr; uint32_t dw_num; uint8_t pad[4]; };
     const auto* p = (const Packet*)(uintptr_t)a0;
     if (!p || !p->addr || !p->dw_num) return kAgcErrInvalidArg;
+    // Reset the per-submit draw list BEFORE folding this Dcb. The folded GpuState is process-lifetime and
+    // its register files (cx/sh/uc) persist across submits (as on real hardware), but its `draws` vector
+    // must NOT accumulate — otherwise it grows unbounded and every later frame re-renders stale geometry.
+    // Clearing here (not after) keeps this submit's draws inspectable once the handler returns. (Ported
+    // from PRs #31/#32.)
+    agc_gpu_state().draws.clear();
     size_t applied = gpu::run_command_buffer(p->addr, p->dw_num, agc_gpu_state());
     g_submit_count++;
     // The submit has "completed" (synchronous fold): fire any registered GPU EOP events. Inert unless the

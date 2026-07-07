@@ -90,6 +90,13 @@ inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn&
                        0u, (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr, st.draws.size(),
                        st.draws.empty() ? 0u : st.draws[0].index_count); fflush(stderr); }
     ResolvedPipelineState ps = resolve_pipeline_state(rs);
+    // Skip a draw with no color writes (CB_TARGET_MASK/color_write_mask == 0): it contributes no pixels, so
+    // rendering + presenting its bare clear would overwrite the last real frame (an art/clear flicker).
+    // (Ported from PR #31.)
+    if (ps.color_write_mask == 0) {
+        if (log) fprintf(stderr, "[exec] skip: color_write_mask==0 (no-op draw)\n");
+        return {};
+    }
     // The draw's vertex count (first draw; 3 as a fallback) so the VS runs for the right # of vertices.
     uint32_t vertex_count = st.draws.empty() ? 3u : st.draws[0].index_count;
     if (vertex_count == 0) vertex_count = 3;

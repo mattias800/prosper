@@ -71,7 +71,9 @@ struct DecodedImageDescriptor {
 DecodedImageDescriptor decode_image_descriptor(const uint32_t t[8]);
 
 // Map a GCN/Gen5 buffer (DFMT, NFMT) pair to a DataFormat + component count. Pure.
-void buffer_format(uint32_t dfmt, uint32_t nfmt, DataFormat* out_fmt, uint32_t* out_components);
+// Decode an RDNA2 (GFX10/PS5) buffer V# combined 7-bit FORMAT field (dword3 bits[18:12]) into a
+// DataFormat + component count. (Replaces the GCN dfmt/nfmt split, which is wrong for PS5 V#s.)
+void rdna2_buffer_format(uint32_t fmt, DataFormat* out_fmt, uint32_t* out_components);
 
 // FRONT-HALF DELIVERABLE: build the resource table a shader uses. `user_sgprs` is the shader's bound
 // user-data SGPR block (num_user_sgprs dwords) — the V# descriptors live there at each sharp's
