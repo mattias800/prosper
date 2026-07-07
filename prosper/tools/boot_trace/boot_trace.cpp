@@ -118,29 +118,26 @@ int main(int argc, char** argv) {
         static std::atomic<int> frame_no{0};
         static std::string fdir = getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".";
         prosper::gpu::set_submit_renderer(
-            [](const std::vector<uint32_t>& vs, const std::vector<uint32_t>& fs,
-               const prosper::gpu::ResolvedPipelineState& ps,
-               const prosper::gpu::ShaderResourceTable* vrt, const prosper::gpu::ShaderResourceTable* prt,
-               uint32_t w, uint32_t h, uint32_t draw_vcount) {
-                // Dump the recompiled SPIR-V FIRST (before the slow Vulkan render), so it survives even if
-                // a concurrent worker fault kills the process mid-render — lets us spirv-val it offline.
-                if (getenv("PROSPER_SHADER_DUMP")) {
+            [](const std::vector<prosper::gpu::DrawItem>& items, uint32_t w, uint32_t h) {
+                // Dump the first item's recompiled SPIR-V FIRST (before the slow Vulkan render), so it
+                // survives even if a concurrent worker fault kills the process mid-render.
+                if (getenv("PROSPER_SHADER_DUMP") && !items.empty()) {
                     std::string d = getenv("PROSPER_SHADER_DUMP");
-                    if (FILE* f = fopen((d + "/frame_vs.spv").c_str(), "wb")) { fwrite(vs.data(), 4, vs.size(), f); fclose(f); }
-                    if (FILE* f = fopen((d + "/frame_fs.spv").c_str(), "wb")) { fwrite(fs.data(), 4, fs.size(), f); fclose(f); }
-                    fprintf(stderr, "[render] dumped SPIR-V vs=%zu fs=%zu dwords\n", vs.size(), fs.size()); fflush(stderr);
+                    const auto& it0 = items[0];
+                    if (FILE* f = fopen((d + "/frame_vs.spv").c_str(), "wb")) { fwrite(it0.vs.data(), 4, it0.vs.size(), f); fclose(f); }
+                    if (FILE* f = fopen((d + "/frame_fs.spv").c_str(), "wb")) { fwrite(it0.fs.data(), 4, it0.fs.size(), f); fclose(f); }
+                    fprintf(stderr, "[render] dumped SPIR-V vs=%zu fs=%zu dwords\n", it0.vs.size(), it0.fs.size()); fflush(stderr);
                 }
-                // Bind EVERY resource each shader declares, each at its own descriptor binding, reading the
-                // bytes from 1:1-mapped guest memory (an unbound image_sample/storage binding is UB). The
-                // executor gave each constant/vertex buffer + texture a distinct binding; the recompiler
+                // Bind EVERY resource each draw's shaders declare, each at its own descriptor binding,
+                // reading the bytes from 1:1-mapped guest memory (an unbound image_sample/storage binding
+                // is UB). The executor gave each resource a distinct binding per draw; the recompiler
                 // declared a storage buffer / image sampler at each, so we must bind them all.
                 using RC = prosper::gpu::ResourceClass;
                 int dn = open("/dev/null", O_WRONLY);
                 auto readable = [&](uint64_t a, size_t n){ return a > 0x1000 && dn >= 0 && write(dn, (const void*)(uintptr_t)a, n) == (ssize_t)n; };
-                std::vector<prosper::test::FrameResource> R;
                 static std::vector<std::vector<uint8_t>> texstore;  // keep texture bytes alive across the call
                 texstore.clear();
-                auto add = [&](const prosper::gpu::ShaderResourceTable* t){
+                auto add = [&](const prosper::gpu::ShaderResourceTable* t, std::vector<prosper::test::FrameResource>& R){
                     if (!t) return;
                     for (auto& r : t->resources) {
                         prosper::test::FrameResource fr; fr.binding = r.binding;
@@ -211,38 +208,45 @@ int main(int argc, char** argv) {
                         R.push_back(std::move(fr));
                     }
                 };
-                add(vrt); add(prt);
+                // Build one BackendDraw per DrawItem — each with ITS OWN resources and pipeline state.
+                // The diagnostic overrides (REFVS / TESTPS / NOPS) apply per draw.
+                static std::vector<std::vector<uint32_t>> spv_store;   // keep override SPIR-V alive
+                spv_store.clear();
+                spv_store.reserve(items.size() * 2);   // pointers into it are taken below — no realloc
+                std::vector<prosper::test::BackendDraw> bd;
+                for (const auto& it : items) {
+                    prosper::test::BackendDraw d;
+                    d.vs = &it.vs; d.fs = &it.fs; d.ps = &it.ps; d.vcount = it.vertex_count;
+                    add(it.vrt.get(), d.res); add(it.prt.get(), d.res);
+                    // PROSPER_RENDER_REFVS: replace the game's vertex shader with a known-good
+                    // fullscreen-triangle VS (uv in [0,1], white color) — isolates the VS.
+                    if (getenv("PROSPER_RENDER_REFVS")) {
+                        #include "refvs.inc"
+                        spv_store.emplace_back(kRefVs, kRefVs + sizeof(kRefVs) / 4);
+                        d.vs = &spv_store.back(); d.vcount = 3;
+                    }
+                    // PROSPER_RENDER_TESTPS: replace the real pixel shader with solid MAGENTA — isolates
+                    // VS geometry from PS shading.
+                    if (getenv("PROSPER_RENDER_TESTPS")) {
+                        static const uint32_t kMagentaPs[] = {   // v0=1.0(R) v1=0.0(G) v2=1.0(B) v3=1.0(A); exp mrt0; endpgm
+                            0x7E0002F2u, 0x7E020280u, 0x7E0402F2u, 0x7E0602F2u, 0xF800180Fu, 0x03020100u, 0xBF810000u };
+                        auto m = prosper::gpu::recompile_fragment(kMagentaPs, sizeof(kMagentaPs) / 4, nullptr);
+                        if (!m.empty()) { spv_store.push_back(std::move(m)); d.fs = &spv_store.back(); }
+                    }
+                    if (getenv("PROSPER_GFXLOG")) fprintf(stderr,
+                        "[render] draw %zu: %zu res vcount=%u topo=%u fmt=%u depth(test=%d write=%d op=%u) "
+                        "blend(en=%d src=%u dst=%u op=%u) mask=0x%x\n",
+                        bd.size(), d.res.size(), d.vcount, it.ps.topology, it.ps.color0_format,
+                        it.ps.depth_test_enable, it.ps.depth_write_enable, it.ps.depth_compare_op,
+                        it.ps.blend_enable, it.ps.src_color_blend_factor, it.ps.dst_color_blend_factor,
+                        it.ps.color_blend_op, it.ps.color_write_mask);
+                    // PROSPER_RENDER_NOPS: bypass the game's resolved pipeline state (default state) to
+                    // isolate whether blend/depth/color-mask is discarding the fragments.
+                    if (getenv("PROSPER_RENDER_NOPS")) d.ps = nullptr;
+                    bd.push_back(std::move(d));
+                }
                 if (dn >= 0) close(dn);
-                if (getenv("PROSPER_GFXLOG")) { fprintf(stderr, "[render] binding %zu resources (draw %u verts)\n",
-                    R.size(), draw_vcount); fflush(stderr); }
-                // PROSPER_RENDER_REFVS: replace the game's (intricate) vertex shader with a known-good
-                // fullscreen-triangle VS that exports uv in [0,1] across the screen (location 1) + white
-                // (location 0). Paired with the game's REAL pixel shader + texture, this shows the game's
-                // actual composited texture — isolating the VS from the rest of the pipeline.
-                std::vector<uint32_t> vs_use = vs; uint32_t vcount_use = draw_vcount;
-                if (getenv("PROSPER_RENDER_REFVS")) {
-                    #include "refvs.inc"
-                    vs_use.assign(kRefVs, kRefVs + sizeof(kRefVs) / 4); vcount_use = 3;
-                }
-                // PROSPER_RENDER_TESTPS: replace the real pixel shader with a solid MAGENTA one (recompiled
-                // from a tiny RDNA2 EXP blob) to isolate VS geometry from PS shading — if the VS positions
-                // are on-screen, magenta triangles appear regardless of the texture/PS math.
-                std::vector<uint32_t> fs_use = fs;
-                if (getenv("PROSPER_RENDER_TESTPS")) {
-                    static const uint32_t kMagentaPs[] = {   // v0=1.0(R) v1=0.0(G) v2=1.0(B) v3=1.0(A); exp mrt0; endpgm
-                        0x7E0002F2u, 0x7E020280u, 0x7E0402F2u, 0x7E0602F2u, 0xF800180Fu, 0x03020100u, 0xBF810000u };
-                    auto m = prosper::gpu::recompile_fragment(kMagentaPs, sizeof(kMagentaPs) / 4, nullptr);
-                    if (!m.empty()) fs_use = m;
-                }
-                if (getenv("PROSPER_GFXLOG")) fprintf(stderr,
-                    "[render] ps: topo=%u fmt=%u depth(test=%d write=%d op=%u) blend(en=%d src=%u dst=%u op=%u) mask=0x%x\n",
-                    ps.topology, ps.color0_format, ps.depth_test_enable, ps.depth_write_enable, ps.depth_compare_op,
-                    ps.blend_enable, ps.src_color_blend_factor, ps.dst_color_blend_factor, ps.color_blend_op, ps.color_write_mask);
-                // PROSPER_RENDER_NOPS: bypass the game's resolved pipeline state (default state instead) to
-                // isolate whether blend/depth/color-mask is discarding the fragments.
-                const prosper::gpu::ResolvedPipelineState* ps_use = getenv("PROSPER_RENDER_NOPS") ? nullptr : &ps;
-                std::vector<uint8_t> px = prosper::test::render_triangle_rgba(vs_use, fs_use, w, h, ps_use,
-                    nullptr, nullptr, nullptr, R.empty() ? nullptr : &R, vcount_use);
+                std::vector<uint8_t> px = prosper::test::render_draws_rgba(bd, w, h);
                 int n = frame_no++;
                 if (px.empty()) {
                     fprintf(stderr, "[render] frame %d: Vulkan render FAILED (%ux%u)\n", n, w, h);

@@ -108,6 +108,9 @@ int main() {
             setflip((uint64_t)(uintptr_t)&fd, 0x1001, 1, 2, 0x1234567890abcdefull, 0);
             GpuState s3;
             run_command_buffer(fbuf, 64, s3);
+            CHECK(s3.pending_flips.size() == 1, "in-stream Flip collected as a pending flip");
+            execute_pending_flips(s3);          // the submit path runs this after the draws render
+            CHECK(s3.pending_flips.empty(), "pending flips cleared after execution");
             flipstatus(0x1001, (uint64_t)(uintptr_t)st_after, 0, 0, 0, 0);
             uint64_t cnt_b = *(uint64_t*)(st_before + 0x00), cnt_a = *(uint64_t*)(st_after + 0x00);
             int64_t  arg_a = *(int64_t*)(st_after + 0x18);
@@ -115,6 +118,32 @@ int main() {
             CHECK(cnt_a == cnt_b + 1, "in-stream Flip advances GetFlipStatus.count");
             CHECK(arg_a == (int64_t)0x1234567890abcdefll, "in-stream Flip publishes its 64-bit flipArg");
             CHECK(buf_a == 1, "in-stream Flip publishes its buffer index");
+        }
+    }
+
+    // Per-draw register snapshots: each DrawIndexAuto captures the register state AT the draw, so a
+    // register changed between two draws is visible in the first draw's snapshot at its old value.
+    // (Consecutive draws with no writes in between share one snapshot.)
+    {
+        uint32_t pkt[4];
+        auto set_sh = [&](uint32_t off, uint32_t val, GpuState& s) {
+            pkt[0] = 0xC0000000u | (1u << 16) | (0x76u << 8);   // SET_SH_REG, 2 payload dwords
+            pkt[1] = off; pkt[2] = val;
+            run_command_buffer(pkt, 3, s);
+        };
+        uint32_t draw_pkt[3] = { 0xC0000000u | (1u << 16) | (0x10u << 8) | (0x04u << 2), 6, 0 };
+        GpuState s4;
+        set_sh(0x42, 0xAAAA, s4);
+        run_command_buffer(draw_pkt, 3, s4);                    // draw 0 under 0xAAAA
+        run_command_buffer(draw_pkt, 3, s4);                    // draw 1: no writes since draw 0
+        set_sh(0x42, 0xBBBB, s4);
+        run_command_buffer(draw_pkt, 3, s4);                    // draw 2 under 0xBBBB
+        CHECK(s4.draws.size() == 3 && s4.draws[0].state && s4.draws[2].state, "3 draws with snapshots");
+        if (s4.draws.size() == 3 && s4.draws[0].state && s4.draws[2].state) {
+            CHECK(s4.draws[0].state->sh.at(0x42) == 0xAAAA, "draw 0 snapshot holds the value AT the draw");
+            CHECK(s4.draws[0].state == s4.draws[1].state, "no-write consecutive draws share one snapshot");
+            CHECK(s4.draws[2].state->sh.at(0x42) == 0xBBBB, "draw 2 snapshot holds the updated value");
+            CHECK(s4.sh.at(0x42) == 0xBBBB, "folded end state is the last write");
         }
     }
 

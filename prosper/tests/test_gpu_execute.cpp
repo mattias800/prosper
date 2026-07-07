@@ -46,9 +46,13 @@ int main() {
 
     // The executor core, with the offscreen Vulkan renderer supplied as the backend (as the HLE will
     // supply the live-device renderer). execute_gpustate does recompile + resolve + render internally.
-    auto backend = [&](const std::vector<uint32_t>& vs, const std::vector<uint32_t>& fs,
-                       const ResolvedPipelineState& ps, const ShaderResourceTable*, const ShaderResourceTable*, uint32_t) {
-        return prosper::test::render_triangle_rgba(vs, fs, W, H, &ps);
+    auto backend = [&](const std::vector<DrawItem>& items) {
+        std::vector<prosper::test::BackendDraw> bd;
+        for (const auto& it : items) {
+            prosper::test::BackendDraw d; d.vs = &it.vs; d.fs = &it.fs; d.ps = &it.ps; d.vcount = it.vertex_count;
+            bd.push_back(std::move(d));
+        }
+        return prosper::test::render_draws_rgba(bd, W, H);
     };
     std::vector<uint8_t> px = execute_gpustate(st, backend);
     CHECK(px.size() == (size_t)W * H * 4, "execute_gpustate rendered a frame from the GpuState");
@@ -74,10 +78,13 @@ int main() {
     // The live-submit registry path — exactly what agc_driver_submit_dcb drives once a device is wired.
     CHECK(!have_submit_renderer(), "no live renderer registered by default (game path stays inert)");
     CHECK(!execute_and_present(st, W, H), "execute_and_present is a no-op with no renderer registered");
-    set_submit_renderer([&](const std::vector<uint32_t>& vs, const std::vector<uint32_t>& fs,
-                            const ResolvedPipelineState& ps, const ShaderResourceTable*,
-                            const ShaderResourceTable*, uint32_t w, uint32_t h, uint32_t) {
-        return prosper::test::render_triangle_rgba(vs, fs, w, h, &ps);
+    set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t w, uint32_t h) {
+        std::vector<prosper::test::BackendDraw> bd;
+        for (const auto& it : items) {
+            prosper::test::BackendDraw d; d.vs = &it.vs; d.fs = &it.fs; d.ps = &it.ps; d.vcount = it.vertex_count;
+            bd.push_back(std::move(d));
+        }
+        return prosper::test::render_draws_rgba(bd, w, h);
     });
     CHECK(have_submit_renderer(), "live renderer registered");
     prosper::gpu::present_reset();

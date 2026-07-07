@@ -23,16 +23,22 @@ namespace prosper::gpu {
 
 struct ShaderResourceTable;   // fwd (shader_resources.hpp); passed to the backend so it can bind resources
 
-// The pluggable Vulkan backend: given recompiled VS+PS SPIR-V, resolved pipeline state, and the two
-// stages' resource tables (so it can bind the constant/vertex buffers + textures the shaders declare,
-// reading their bytes from 1:1-mapped guest memory), render and return W*H*4 RGBA8 pixels (or {} on
-// failure). The tables may be null (e.g. the simple offscreen tests that render color-only shaders).
-using RenderFn = std::function<std::vector<uint8_t>(const std::vector<uint32_t>& vs,
-                                                    const std::vector<uint32_t>& fs,
-                                                    const ResolvedPipelineState& ps,
-                                                    const ShaderResourceTable* vrt,
-                                                    const ShaderResourceTable* prt,
-                                                    uint32_t vertex_count)>;
+// One realized draw of a submit: recompiled VS+PS SPIR-V, the draw's OWN resolved fixed-function
+// state, the two stages' resource tables (descriptors from the draw's register snapshot), and its
+// vertex count. execute_gpustate() emits one per Draw; the backend records ALL of them into ONE
+// render pass (clear once, then draw each with its own pipeline) so a multi-draw submit — e.g.
+// Unity's background + composite pair, whose per-draw masks/blends/shaders differ — composites
+// correctly instead of collapsing onto the last draw's state.
+struct DrawItem {
+    std::vector<uint32_t> vs, fs;                        // recompiled SPIR-V
+    ResolvedPipelineState ps;                            // THIS draw's fixed-function state
+    std::shared_ptr<ShaderResourceTable> vrt, prt;       // may be null (color-only shaders)
+    uint32_t vertex_count = 3;
+};
+
+// The pluggable Vulkan backend: render the submit's draw items into one image and return W*H*4 RGBA8
+// pixels (or {} on failure).
+using RenderFn = std::function<std::vector<uint8_t>(const std::vector<DrawItem>& items)>;
 
 // Safe guest-address readability probe: write() to /dev/null returns EFAULT for an unmapped source
 // (Linux; always-true on Windows), so callers can test a guest pointer without risking a SIGSEGV.
@@ -50,71 +56,90 @@ bool guest_readable(uint64_t addr, uint32_t bytes);
 std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps,
                                                        uint32_t binding_base = 2);
 
-// Recompile + resolve a GpuState and render it via `render`. Returns the pixels, or {} if there is nothing
-// to draw or a stage fails to recompile. `max_shader_dwords` bounds the recompiler's walk (it stops at
-// S_ENDPGM, so this is just an upper bound). CONFIDENCE: HIGH on the orchestration (mirrors the verified
-// test_gpustate_render spine); the general multi-draw / vertex-fetch path is handled by the backend.
+// Recompile + resolve a GpuState's draws and render them via `render`. Each draw uses ITS OWN register
+// snapshot (Draw::state; the folded end state for snapshot-less draws, e.g. hand-built tests), so
+// per-draw masks/blends/shaders/descriptors are honored. Returns the pixels, or {} if nothing could be
+// realized. `max_shader_dwords` bounds the recompiler's walk (it stops at S_ENDPGM).
 inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn& render,
                                              uint32_t max_shader_dwords = 0x10000) {
     if (st.draws.empty() || !render) return {};              // nothing to render (e.g. a state-only submit)
-    RenderState rs = extract_render_state(st);
     const bool log = getenv("PROSPER_GFXLOG") != nullptr;    // bail-point visibility (why no frame?)
-    if (!rs.es_addr || !rs.ps_addr) {                        // no vertex/pixel program bound
-        if (log) fprintf(stderr, "[exec] skip: no PGM bound (es=0x%llx ps=0x%llx, %zu draws)\n",
-                         (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr, st.draws.size());
-        return {};
-    }
-    std::shared_ptr<ShaderResourceTable> vrt = build_stage_table(st, rs.es_addr, false, 2);
-    // The PS table's bindings start AFTER the VS table's (both land in one descriptor set — see
-    // build_stage_table's contract; overlapping bindings zeroed the PS's sampled texture).
-    uint32_t ps_base = 2 + (vrt ? (uint32_t)vrt->resources.size() : 0);
-    std::shared_ptr<ShaderResourceTable> prt = build_stage_table(st, rs.ps_addr, true, ps_base);
-    std::vector<uint32_t> vs = recompile_vertex((const uint32_t*)(uintptr_t)rs.es_addr, max_shader_dwords, vrt.get());
-    std::vector<uint32_t> fs = recompile_fragment((const uint32_t*)(uintptr_t)rs.ps_addr, max_shader_dwords, prt.get());
-    if (vs.empty() || fs.empty()) {                          // an unsupported shader — leave frame untouched
-        if (log) {
-            fprintf(stderr, "[exec] skip: recompile failed (vs=%zu fs=%zu dwords; es=0x%llx ps=0x%llx)\n",
-                    vs.size(), fs.size(), (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr);
-            for (auto [tag, addr] : {std::pair{"vs", rs.es_addr}, std::pair{"ps", rs.ps_addr}}) {
-                RecompileCoverage c = recompile_coverage((const uint32_t*)(uintptr_t)addr, max_shader_dwords);
-                fprintf(stderr, "[exec]   %s coverage: total=%u alu=%u exp=%u tabledep=%u unsupported=%u "
-                                "first_bad fmt=%d op=0x%x\n",
-                        tag, c.total, c.alu, c.exports, c.table_dependent, c.unsupported,
-                        c.first_bad_fmt, c.first_bad_op);
-                // PROSPER_SHADER_DUMP: write the raw code (4 KB cap) for offline llvm-mc disassembly.
-                if (const char* dd = getenv("PROSPER_SHADER_DUMP")) {
-                    char fn[512]; snprintf(fn, sizeof fn, "%s/exec_%s_%llx.bin", dd, tag,
-                                           (unsigned long long)addr);
-                    if (FILE* f = fopen(fn, "wb")) { fwrite((const void*)(uintptr_t)addr, 1, 4096, f); fclose(f); }
+    std::vector<DrawItem> items;
+    // PROSPER_PERDRAW=1: realize each draw from ITS OWN register snapshot (captured at the draw
+    // during the fold). Architecturally correct, but currently OPT-IN: the game's AGC context-log
+    // packets carry duplicate register writes in sectioned form (current-draw + staged post-draw
+    // state — see command_processor.cpp), and until those section semantics are reverse-engineered,
+    // draw-time snapshots resolve some state one draw off (observed: the composite gets the previous
+    // draw's PGM/mask). Default: every draw uses the submit's folded end state, which renders the
+    // known-good title composite.
+    static const bool perdraw = getenv("PROSPER_PERDRAW") != nullptr;
+    const GpuState* prev_state = nullptr; uint64_t prev_es = 0, prev_ps = 0;
+    for (const auto& d : st.draws) {
+        const GpuState& ds = (perdraw && d.state) ? *d.state : st;   // the draw's register snapshot
+        RenderState rs = extract_render_state(ds);
+        if (!rs.es_addr || !rs.ps_addr) {                    // no vertex/pixel program bound at this draw
+            if (log) fprintf(stderr, "[exec] skip draw: no PGM bound (es=0x%llx ps=0x%llx)\n",
+                             (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr);
+            continue;
+        }
+        // Same snapshot + same shader pair as the previous draw -> reuse its recompile/resolve
+        // (the common N-draws-one-pipeline case; recompiling per draw would be pure waste).
+        if (!items.empty() && &ds == prev_state && rs.es_addr == prev_es && rs.ps_addr == prev_ps) {
+            DrawItem it = items.back();
+            it.vertex_count = d.index_count ? d.index_count : 3;
+            items.push_back(std::move(it));
+            continue;
+        }
+        std::shared_ptr<ShaderResourceTable> vrt = build_stage_table(ds, rs.es_addr, false, 2);
+        // The PS table's bindings start AFTER the VS table's (both land in one descriptor set — see
+        // build_stage_table's contract; overlapping bindings zeroed the PS's sampled texture).
+        uint32_t ps_base = 2 + (vrt ? (uint32_t)vrt->resources.size() : 0);
+        std::shared_ptr<ShaderResourceTable> prt = build_stage_table(ds, rs.ps_addr, true, ps_base);
+        DrawItem it;
+        it.vs = recompile_vertex((const uint32_t*)(uintptr_t)rs.es_addr, max_shader_dwords, vrt.get());
+        it.fs = recompile_fragment((const uint32_t*)(uintptr_t)rs.ps_addr, max_shader_dwords, prt.get());
+        if (it.vs.empty() || it.fs.empty()) {                // an unsupported shader — skip THIS draw only
+            if (log) {
+                fprintf(stderr, "[exec] skip draw: recompile failed (vs=%zu fs=%zu dwords; es=0x%llx ps=0x%llx)\n",
+                        it.vs.size(), it.fs.size(), (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr);
+                for (auto [tag, addr] : {std::pair{"vs", rs.es_addr}, std::pair{"ps", rs.ps_addr}}) {
+                    RecompileCoverage c = recompile_coverage((const uint32_t*)(uintptr_t)addr, max_shader_dwords);
+                    fprintf(stderr, "[exec]   %s coverage: total=%u alu=%u exp=%u tabledep=%u unsupported=%u "
+                                    "first_bad fmt=%d op=0x%x\n",
+                            tag, c.total, c.alu, c.exports, c.table_dependent, c.unsupported,
+                            c.first_bad_fmt, c.first_bad_op);
+                    // PROSPER_SHADER_DUMP: write the raw code (4 KB cap) for offline llvm-mc disassembly.
+                    if (const char* dd = getenv("PROSPER_SHADER_DUMP")) {
+                        char fn[512]; snprintf(fn, sizeof fn, "%s/exec_%s_%llx.bin", dd, tag,
+                                               (unsigned long long)addr);
+                        if (FILE* f = fopen(fn, "wb")) { fwrite((const void*)(uintptr_t)addr, 1, 4096, f); fclose(f); }
+                    }
                 }
             }
+            continue;
         }
-        return {};
+        it.ps = resolve_pipeline_state(rs);
+        it.vrt = vrt; it.prt = prt;
+        it.vertex_count = d.index_count ? d.index_count : 3;
+        if (log) fprintf(stderr, "[exec] draw item %zu: vs=%zu fs=%zu dwords vcount=%u mask=0x%x blend=%d "
+                         "fmt=%u es=0x%llx ps=0x%llx\n", items.size(), it.vs.size(), it.fs.size(),
+                         it.vertex_count, it.ps.color_write_mask, (int)it.ps.blend_enable, rs.color0_format,
+                         (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr);
+        items.push_back(std::move(it));
+        prev_state = &ds; prev_es = rs.es_addr; prev_ps = rs.ps_addr;
     }
-    if (log) { fprintf(stderr, "[exec] BOTH stages recompiled: vs=%zu fs=%zu dwords -> rendering | "
-                       "color0_base=0x%llx fmt=%u %ux? es=0x%llx ps=0x%llx draws=%zu vcount=%u\n",
-                       vs.size(), fs.size(), (unsigned long long)rs.color0_base, rs.color0_format,
-                       0u, (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr, st.draws.size(),
-                       st.draws.empty() ? 0u : st.draws[0].index_count); fflush(stderr); }
-    ResolvedPipelineState ps = resolve_pipeline_state(rs);
-    // The draw's vertex count (first draw; 3 as a fallback) so the VS runs for the right # of vertices.
-    uint32_t vertex_count = st.draws.empty() ? 3u : st.draws[0].index_count;
-    if (vertex_count == 0) vertex_count = 3;
-    return render(vs, fs, ps, vrt.get(), prt.get(), vertex_count);
+    if (items.empty()) return {};
+    if (log) { fprintf(stderr, "[exec] rendering %zu draw item(s) (of %zu draws)\n",
+                       items.size(), st.draws.size()); fflush(stderr); }
+    return render(items);
 }
 
 // --- Live submit renderer registry (Stage A wiring; implemented in gpu_executor.cpp) --------------------
 // The live renderer additionally receives the target width/height (from videoout) so it can size its
 // attachments. Registered by whoever owns a persistent Vulkan device — the runtime binary at startup, or a
-// test — so prosper_core itself stays Vulkan-free (this just stores a std::function). Signature adds w,h to
-// RenderFn; the tests' render_triangle_rgba already takes (vs, fs, w, h, &ps).
-using LiveRenderFn = std::function<std::vector<uint8_t>(const std::vector<uint32_t>& vs,
-                                                        const std::vector<uint32_t>& fs,
-                                                        const ResolvedPipelineState& ps,
-                                                        const ShaderResourceTable* vrt,
-                                                        const ShaderResourceTable* prt,
-                                                        uint32_t width, uint32_t height,
-                                                        uint32_t vertex_count)>;
+// test — so prosper_core itself stays Vulkan-free (this just stores a std::function).
+using LiveRenderFn = std::function<std::vector<uint8_t>(const std::vector<DrawItem>& items,
+                                                        uint32_t width, uint32_t height)>;
 
 // Register (or clear, with {}) the live render backend that agc_driver_submit_dcb uses on each submit.
 void set_submit_renderer(LiveRenderFn fn);

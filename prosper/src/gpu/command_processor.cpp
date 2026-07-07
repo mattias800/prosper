@@ -98,7 +98,30 @@ void GpuState::apply(const Pm4Command& c) {
                     fprintf(stderr, " (off=0x%x val=0x%x)", regs[i].offset, regs[i].value);
                 fprintf(stderr, "\n");
             }
+            // Linear, last-wins application (matches Kyty cp_op_indirect_cx_regs). KNOWN OPEN
+            // SEMANTIC: the game's per-frame context packet contains DUPLICATE writes of the same
+            // register with different values (e.g. CB_TARGET_MASK=0xf at [82] and =0x0 at [95] around
+            // an (offset 0x0, 0x22) entry) — the array appears to be a SECTIONED context log
+            // (current-draw state + staged post-draw state), not a flat command list. Last-wins makes
+            // the visible composite draw resolve mask=0 (provably invisible — cannot be the game's
+            // intent); first-wins was tried and resolves the PREVIOUS draw's shaders instead. Until
+            // the section semantics are RE'd, per-draw snapshots exist but their APPLICATION is
+            // opt-in (PROSPER_PERDRAW, gpu_execute.hpp). PROSPER_MASKLOG traces the duplicates.
             for (uint32_t i = 0; i < c.num_regs; i++) file[regs[i].offset] = regs[i].value;
+            // PROSPER_MASKLOG: trace CB_TARGET_MASK (0x8E) writes relative to draws — resolves
+            // whether a mask value at draw time is genuine or a state-timing artifact. Prints the
+            // entry's index + neighbors so an over-read/misparse (garbage tail) is distinguishable
+            // from a genuine in-array rewrite.
+            if (getenv("PROSPER_MASKLOG"))
+                for (uint32_t i = 0; i < c.num_regs; i++)
+                    if (regs[i].offset == 0x8E) {
+                        fprintf(stderr, "[masklog] CB_TARGET_MASK=0x%x at [%u]/%u (after %zu draws); neighbors:",
+                                regs[i].value, i, c.num_regs, draws.size());
+                        for (uint32_t k = (i >= 2 ? i - 2 : 0); k < c.num_regs && k <= i + 2; k++)
+                            fprintf(stderr, " [%u]=(0x%x,0x%x)", k, regs[k].offset, regs[k].value);
+                        fprintf(stderr, "\n");
+                    }
+            state_dirty_ = true;
             break;
         }
         case K::SetShRegDirect:
@@ -111,12 +134,25 @@ void GpuState::apply(const Pm4Command& c) {
             } else {
                 sh[c.sh_reg_offset] = c.sh_reg_value;   // fallback (single-register / legacy path)
             }
+            state_dirty_ = true;
             break;
         case K::SetIndexType:
             index_type = c.index_size;
+            state_dirty_ = true;
             break;
         case K::DrawIndexAuto:
-            draws.push_back({ c.index_count });
+            // Snapshot the register state AT THE DRAW (shared between consecutive draws with no
+            // register writes in between). The draw's pipeline/shaders/descriptors are these values,
+            // not the end-of-submit fold — the game changes mask/blend/shaders between the draws of
+            // one submit, and last-writer-wins state rendered every draw with the final draw's
+            // pipeline (black-masked frames whenever the stream ended in a mask=0 pass).
+            if (state_dirty_ || !last_snapshot_) {
+                auto snap = std::make_shared<GpuState>();
+                snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
+                last_snapshot_ = std::move(snap);
+                state_dirty_ = false;
+            }
+            draws.push_back({ c.index_count, last_snapshot_ });
             break;
         case K::ReleaseMem:
             honor_eop_write(c);     // EOP completion label write (correct synchronous end-of-pipe timing)
@@ -125,14 +161,20 @@ void GpuState::apply(const Pm4Command& c) {
             honor_write_data(c);    // inline data write requested by the Dcb
             break;
         case K::Flip:
-            // The GPU reaching the SetFlip packet IS the flip moment (synchronous fold): perform the
-            // videoout flip so GetFlipStatus advances and the game's frame pacer sees its flipArg
-            // complete. Only for a fully-decoded payload — a short packet must not fabricate a flip.
-            if (c.flip_valid) prosper_vo_flip_from_gpu(c.flip_handle, c.flip_bufidx, c.flip_mode, c.flip_arg);
+            // Collect the flip; execute_pending_flips() performs it AFTER the submit's draws render
+            // (the Dcb queues the flip after the frame's draws — its scanout must observe them).
+            // Only for a fully-decoded payload — a short packet must not fabricate a flip.
+            if (c.flip_valid) pending_flips.push_back({ c.flip_handle, c.flip_bufidx, c.flip_mode, c.flip_arg });
             break;
         default:
             break;   // events / waits / unknown: no register-state effect (handled later)
     }
+}
+
+void execute_pending_flips(GpuState& st) {
+    for (const auto& f : st.pending_flips)
+        prosper_vo_flip_from_gpu(f.handle, f.bufidx, f.mode, f.arg);
+    st.pending_flips.clear();
 }
 
 size_t run_command_buffer(const uint32_t* buf, size_t dwords, GpuState& st) {
