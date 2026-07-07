@@ -32,6 +32,12 @@
 #include <unistd.h>
 #endif
 
+// PROSPER_CRASHPEEK (below) needs these in every config — the gpu/*.hpp includes above are gated on
+// PROSPER_HAVE_VULKAN, but guest_readable is a core (non-Vulkan) symbol always linked into prosper_core,
+// and strchr needs <cstring>. Declare/include them unconditionally so the no-Vulkan build compiles.
+#include <cstring>
+namespace prosper::gpu { bool guest_readable(uint64_t addr, uint32_t bytes); }
+
 using namespace prosper;
 
 
@@ -317,5 +323,55 @@ int main(int argc, char** argv) {
            (unsigned long long)r.rdx, (unsigned long long)r.rbp, (unsigned long long)r.rsp);
     printf("  backtrace (%zu frames):\n", r.backtrace.size());
     for (uint64_t a : r.backtrace) printf("    %-12s +0x%llx\n", cls(a), (unsigned long long)bof(a));
+    // PROSPER_CRASHPEEK: after a recovered main-thread fault, dump guest memory at the fault registers
+    // (still 1:1-mapped) so a null-source deref (e.g. an IL2CPP memcpy from a null field) can be traced
+    // to the object + field that is null. Reads are bounded by guest_readable (never re-faults).
+    if (getenv("PROSPER_CRASHPEEK") && r.kind == 2) {
+        auto dump = [&](const char* tag, uint64_t addr) {
+            printf("  [peek] %s=0x%llx:", tag, (unsigned long long)addr);
+            if (!addr || !prosper::gpu::guest_readable(addr, 8)) { printf(" <unmapped>\n"); return; }
+            for (int i = 0; i < 8; i++) {
+                uint64_t a = addr + (uint64_t)i * 8;
+                if (prosper::gpu::guest_readable(a, 8)) printf(" %016llx", (unsigned long long)*(const uint64_t*)(uintptr_t)a);
+                else { printf(" ...."); break; }
+            }
+            printf("\n");
+        };
+        dump("rax", r.rax); dump("rdi", r.rdi);
+        // The dest rdi is unaligned; also show the object rax as bytes (type tags / vtable ptr @+0).
+        // Scan rax's first 8 qwords for the null field (the likely memcpy source).
+        for (int i = 0; i < 8; i++) {
+            uint64_t a = r.rax + (uint64_t)i * 8;
+            if (prosper::gpu::guest_readable(a, 8) && *(const uint64_t*)(uintptr_t)a == 0)
+                printf("  [peek] rax+0x%x is NULL (candidate memcpy source field)\n", i * 8);
+        }
+        // Dump 24 instruction bytes at the fault rip and each backtrace frame's return site
+        // (return addr - 5, the call instruction) for offline `objdump -b binary -m i386:x86-64`.
+        auto insn = [&](const char* tag, uint64_t addr) {
+            printf("  [insn] %s 0x%llx:", tag, (unsigned long long)addr);
+            for (int i = 0; i < 24; i++)
+                if (prosper::gpu::guest_readable(addr + i, 1)) printf(" %02x", *(const uint8_t*)(uintptr_t)(addr + i));
+                else { printf(" ??"); break; }
+            printf("\n");
+        };
+        insn("rip", r.fault_rip);
+        for (size_t i = 0; i < r.backtrace.size() && i < 5; i++)
+            insn("call@", r.backtrace[i] >= 5 ? r.backtrace[i] - 5 : r.backtrace[i]);
+        // PROSPER_PEEK_CODE=0xADDR[,0xADDR...]: dump 512 code bytes at each guest address (still mapped
+        // post-fault) for offline `objdump -b binary -m i386:x86-64 --adjust-vma=ADDR`. Used to
+        // disassemble the guest GC suspend handler etc. without extracting the SELF module.
+        if (const char* pc = getenv("PROSPER_PEEK_CODE")) {
+            for (const char* p = pc; *p; ) {
+                uint64_t a = strtoull(p, nullptr, 0);
+                printf("  [code] 0x%llx:", (unsigned long long)a);
+                for (int i = 0; i < 512; i++) {
+                    if (prosper::gpu::guest_readable(a + i, 1)) printf(" %02x", *(const uint8_t*)(uintptr_t)(a + i));
+                    else { printf(" ??"); break; }
+                }
+                printf("\n");
+                const char* c = strchr(p, ','); if (!c) break; p = c + 1;
+            }
+        }
+    }
     return 0;
 }
