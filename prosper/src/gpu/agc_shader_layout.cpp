@@ -1,5 +1,7 @@
 // agc_shader_layout.cpp — see agc_shader_layout.hpp. V# decode + the front-half resource-table build.
 #include "agc_shader_layout.hpp"
+#include <cstdio>
+#include <cstdlib>
 
 namespace prosper::gpu {
 
@@ -112,6 +114,12 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             DecodedImageDescriptor d = decode_image_descriptor(&user_sgprs[off]);
             if (d.base == 0 || d.width == 0 || d.height == 0 ||
                 d.width > 16384 || d.height > 16384) continue;  // skip a garbage/degenerate T#
+            if (getenv("PROSPER_GFXLOG")) {
+                const uint32_t* t = &user_sgprs[off];
+                fprintf(stderr, "[t#] %ux%u base=0x%llx tile_mode=%u type=%u fmt=%u | raw: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                        d.width, d.height, (unsigned long long)d.base, d.tile_mode, d.type, d.format,
+                        t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7]);
+            }
             ShaderResource r;
             r.cls           = ResourceClass::Texture;
             r.format        = DataFormat::Unorm8;   // sampled UI textures are 8-bit UNORM RGBA

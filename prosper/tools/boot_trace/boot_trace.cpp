@@ -23,6 +23,88 @@
 
 using namespace prosper;
 
+#ifdef PROSPER_HAVE_VULKAN
+// Kyty VideoOutTiled detiler (AMD GFX9 macro-tile swizzle) — maps a linear (x,y) to its tiled byte
+// offset, used to de-swizzle a tiled render target into a linear image. `neo` selects PS4 vs PS4Pro
+// params (PS5 is close to the neo path). Ported from Kyty Tile.cpp Tiler32::GetTiledOffset.
+namespace tile {
+static inline uint32_t ilog2(uint32_t n) { uint32_t l = 0; while (n > 1) { n >>= 1; l++; } return l; }
+static inline uint32_t elem_index(uint32_t x, uint32_t y) {
+    return (((x >> 0) & 1) << 0) | (((x >> 1) & 1) << 1) | (((y >> 0) & 1) << 2) |
+           (((x >> 2) & 1) << 3) | (((y >> 1) & 1) << 4) | (((y >> 2) & 1) << 5);
+}
+static inline uint32_t pipe_index(uint32_t x, uint32_t y, bool neo) {
+    uint32_t p = (((x >> 3) ^ (y >> 3) ^ (x >> 4)) & 1) | ((((x >> 4) ^ (y >> 4)) & 1) << 1) |
+                 ((((x >> 5) ^ (y >> 5)) & 1) << 2);
+    if (neo) p |= (((x >> 6) ^ (y >> 5)) & 1) << 3;
+    return p;
+}
+static inline uint32_t bank_index(uint32_t x, uint32_t y, uint32_t bank_h, uint32_t num_banks, uint32_t num_pipes) {
+    uint32_t xs = x >> ilog2(1 * num_pipes), ys = y >> ilog2(bank_h), bank = 0;
+    if (num_banks == 8) {
+        bank = (((xs >> 3) ^ (ys >> 5)) & 1) | ((((xs >> 4) ^ (ys >> 4) ^ (ys >> 5)) & 1) << 1) | ((((xs >> 5) ^ (ys >> 3)) & 1) << 2);
+    } else {  // 16
+        bank = (((xs >> 3) ^ (ys >> 6)) & 1) | ((((xs >> 4) ^ (ys >> 5) ^ (ys >> 6)) & 1) << 1) |
+               ((((xs >> 5) ^ (ys >> 4)) & 1) << 2) | ((((xs >> 6) ^ (ys >> 3)) & 1) << 3);
+    }
+    return bank;
+}
+static uint64_t tiled_offset(uint32_t x, uint32_t y, uint32_t padded_w, uint32_t padded_h, bool neo) {
+    uint32_t macro_h = neo ? 128 : 64, bank_h = neo ? 2 : 1, num_banks = neo ? 8 : 16, num_pipes = neo ? 16 : 8;
+    uint32_t pipe_bits = neo ? 4 : 3, bank_bits = neo ? 3 : 4;
+    uint64_t element_index = elem_index(x, y);
+    uint64_t pipe = pipe_index(x, y, neo);
+    uint64_t bank = bank_index(x, y, bank_h, num_banks, num_pipes);
+    uint32_t tile_bytes = (8 * 8 * 32 + 7) / 8;
+    uint64_t element_offset = element_index * 32, tile_split_slice = 0;
+    if (tile_bytes > 512) { tile_split_slice = element_offset / (512ull * 8); element_offset %= (512ull * 8); tile_bytes = 512; }
+    uint64_t macro_tile_bytes = (128 / 8) * (macro_h / 8) * tile_bytes / (num_pipes * num_banks);
+    uint64_t macro_tiles_per_row = padded_w / 128;
+    uint64_t macro_tile_index = (y / macro_h) * macro_tiles_per_row + (x / 128);
+    uint64_t macro_tile_offset = macro_tile_index * macro_tile_bytes;
+    uint64_t slice_bytes = macro_tiles_per_row * (padded_h / macro_h) * macro_tile_bytes;
+    uint64_t slice_offset = tile_split_slice * slice_bytes;
+    uint64_t tile_offset = ((y / 8) % bank_h) * tile_bytes;
+    bank ^= ((num_banks / 2) + 1) * tile_split_slice; bank &= (num_banks - 1);
+    uint64_t total = (slice_offset + macro_tile_offset + tile_offset) * 8 + element_offset;
+    uint64_t bit_off = total & 7; total /= 8;
+    uint64_t pipe_il = total & 0xff, off = total >> 8;
+    uint64_t byte = pipe_il | (pipe << 8) | (bank << (8 + pipe_bits)) | (off << (8 + pipe_bits + bank_bits));
+    return ((byte << 3) | bit_off) / 8;
+}
+// GFX10 SW_4KB_S de-swizzle (matches PS5 render targets, T# tile_mode=5): the surface is `tile`x`tile`
+// micro-tiles (4KB = 32x32 at 32bpp) laid out row-major, and within a tile the pixels follow a Morton
+// order with the Y bit taking the low position of each pair (y0,x0,y1,x1,…). `pw` is the padded pitch.
+static void detile_micro(std::vector<uint8_t>& px, uint32_t w, uint32_t h, uint32_t tile, uint32_t pw) {
+    uint32_t tb = 0; for (uint32_t t = tile; t > 1; t >>= 1) tb++;   // log2(tile)
+    uint32_t tiles_per_row = (pw + tile - 1) / tile;
+    std::vector<uint8_t> out(px.size(), 0);
+    for (uint32_t y = 0; y < h; y++) for (uint32_t x = 0; x < w; x++) {
+        uint32_t tx = x >> tb, ty = y >> tb, ix = x & (tile - 1), iy = y & (tile - 1);
+        uint32_t morton = 0; for (uint32_t b = 0; b < tb; b++) { morton |= ((iy >> b) & 1) << (2 * b); morton |= ((ix >> b) & 1) << (2 * b + 1); }
+        uint64_t src = ((uint64_t)(ty * tiles_per_row + tx) * (tile * tile) + morton) * 4;
+        if (src + 4 <= px.size()) std::memcpy(&out[((size_t)y * w + x) * 4], &px[src], 4);
+    }
+    px.swap(out);
+}
+// De-swizzle a tiled 32bpp surface into a linear RGBA buffer. mode: 0/1 = Kyty GFX9 macro-tile (neo flag);
+// 2 = 8x8 micro-tile, 3 = 32x32 micro-tile (GFX10-style), with PROSPER_PITCH overriding the padded width.
+static void detile_rgba(std::vector<uint8_t>& px, uint32_t w, uint32_t h, int mode) {
+    uint32_t pw = getenv("PROSPER_PITCH") ? (uint32_t)atoi(getenv("PROSPER_PITCH")) : w;
+    if (mode == 2) { detile_micro(px, w, h, 8, pw); return; }
+    if (mode == 3) { detile_micro(px, w, h, 32, pw); return; }
+    bool neo = (mode == 1);
+    uint32_t padded_w = pw, padded_h = (h == 1080) ? (neo ? 1152 : 1088) : (h == 720 ? 768 : ((h + 63) & ~63u));
+    std::vector<uint8_t> out(px.size(), 0);
+    for (uint32_t y = 0; y < h; y++) for (uint32_t x = 0; x < w; x++) {
+        uint64_t src = tiled_offset(x, y, padded_w, padded_h, neo);   // byte offset of this pixel's 4 bytes
+        if (src + 4 <= px.size()) std::memcpy(&out[((size_t)y * w + x) * 4], &px[src], 4);
+    }
+    px.swap(out);
+}
+}
+#endif
+
 // Module bases (keep in sync with the inputs below).
 static const uint64_t EBOOT = 0x400000000ull, IL2CPP = 0x440000000ull, PS5UTIL = 0x4c0000000ull,
                       LIBC = 0x500000000ull, STUB = 0x600000000ull;
@@ -123,6 +205,14 @@ int main(int argc, char** argv) {
                             size_t nb = (size_t)tw * th * 4;
                             texstore.emplace_back(nb, 0x00);
                             if (readable(r.gpu_addr, nb)) std::memcpy(texstore.back().data(), (const void*)(uintptr_t)r.gpu_addr, nb);
+                            // PROSPER_DUMP_RAWTEX: write the raw tiled RGBA bytes (pre-detile) to a .bin for
+                            // offline swizzle experimentation.
+                            if (getenv("PROSPER_DUMP_RAWTEX") && !texstore.back().empty()) {
+                                std::string d = getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".";
+                                char fn[512]; snprintf(fn, sizeof fn, "%s/rawtex_%ux%u.bin", d.c_str(), tw, th);
+                                if (FILE* f = fopen(fn, "wb")) { fwrite(texstore.back().data(), 1, nb, f); fclose(f);
+                                    fprintf(stderr, "[render] dumped raw tiled bytes -> %s (%zu)\n", fn, nb); fflush(stderr); }
+                            }
                             // PROSPER_TESTTEX: overwrite with a recognizable gradient/checker to prove the
                             // sample path (the game's real render-target texture is empty until we execute
                             // the scene draws that fill it).
@@ -137,6 +227,19 @@ int main(int argc, char** argv) {
                             if (getenv("PROSPER_GFXLOG")) { const uint8_t* b = texstore.back().data();
                                 size_t nz = 0; for (size_t i = 0; i < nb && i < (1u<<16); i++) nz += (b[i] != 0);
                                 fprintf(stderr, "[render] tex binding=%u %ux%u first64k-nonzero=%zu\n", r.binding, tw, th, nz); }
+                            // PROSPER_DETILE=0/1: de-swizzle the tiled render target into a linear image
+                            // (neo=1 = PS4Pro/PS5-ish 8-bank params). The game's render target is GPU-tiled.
+                            if (const char* dt = getenv("PROSPER_DETILE"))
+                                tile::detile_rgba(texstore.back(), tw, th, atoi(dt));
+                            // PROSPER_DUMP_TEX: write the RAW texture memory (interpreted linearly) to a BMP,
+                            // bypassing the shader — reveals whether the render target is tiled (scrambled) or
+                            // linear (recognizable), and the tiling structure.
+                            if (getenv("PROSPER_DUMP_TEX") && !texstore.back().empty()) {
+                                std::string d = getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".";
+                                char fn[512]; snprintf(fn, sizeof fn, "%s/rawtex_b%u.bmp", d.c_str(), r.binding);
+                                prosper::test::dump_bmp(fn, texstore.back(), tw, th);
+                                fprintf(stderr, "[render] dumped raw texture -> %s\n", fn); fflush(stderr);
+                            }
                             fr.tex_rgba = texstore.back().data(); fr.tw = tw; fr.th = th;
                         } else {
                             uint32_t nb = std::min(r.size ? r.size : 256u, 1u << 20);   // cap 1 MB
