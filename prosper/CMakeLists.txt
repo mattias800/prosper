@@ -277,6 +277,12 @@ if(TARGET prosper_core)
       target_link_libraries(test_recompiled_shaders PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME recompiled_shaders_render COMMAND test_recompiled_shaders)
 
+      # Multi-draw accumulation: render_frame_rgba draws MANY passes into ONE framebuffer (a real frame
+      # is many draws into one target). Two passes (red opaque + green additive) must sum to yellow.
+      add_executable(test_multidraw_render tests/test_multidraw_render.cpp)
+      target_link_libraries(test_multidraw_render PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME multidraw_render COMMAND test_multidraw_render)
+
       # Vertex fetch: a VS that pulls positions from a bound vertex buffer via buffer_load_format,
       # keyed by a ShaderResourceTable — real game vertex shaders work this way.
       add_executable(test_vertex_fetch_render tests/test_vertex_fetch_render.cpp)
