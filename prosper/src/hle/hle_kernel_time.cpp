@@ -115,6 +115,10 @@ namespace {
     // ComputeN ring id). Filter GraphicsCore=-14 (shadPS4 equeue.h).
     constexpr int16_t EVFILT_GRAPHICS_CORE = -14;
     std::vector<FlipReg> g_eop_regs;   // same (eq,id,udata) shape
+    // Registered user-event sources: (eq,id,udata) the game added via sceKernelAddUserEvent and may later
+    // trigger. Declared here (before the pump) so the diagnostic PROSPER_PUMP_USEREV heartbeat can fire them.
+    struct UserReg { uint64_t eq; int64_t id; uint64_t udata; };
+    std::vector<UserReg> g_user_regs;   // guarded by g_eq_mx
     std::atomic<bool> g_pump_started{false};
 
     EqState* eq_find(uint64_t eq) { std::lock_guard<std::mutex> lk(g_eq_mx); auto it = g_eqs.find(eq); return it == g_eqs.end() ? nullptr : it->second; }
@@ -133,6 +137,14 @@ namespace {
             { std::lock_guard<std::mutex> lk(g_eq_mx); fr = g_flip_regs; vr = g_vblank_regs; }
             for (auto& r : vr) { SceKEvent e{}; e.ident = r.ident; e.filter = EVFILT_VIDEO_OUT; e.data = (int64_t)frame; e.udata = r.udata; eq_post(r.eq, e); }
             for (auto& r : fr) { SceKEvent e{}; e.ident = r.ident; e.filter = EVFILT_VIDEO_OUT; e.data = (int64_t)frame; e.udata = r.udata; eq_post(r.eq, e); }
+            // PROSPER_PUMP_USEREV: heartbeat-fire registered user events. Some engines run a worker thread
+            // that blocks on a user event (Unity's FTM queue: user event id=999) waiting for the producer
+            // to signal work; if the producer path isn't reached, that thread starves and the game idles.
+            // Firing it each vblank tests whether waking that consumer lets the game progress to real draws.
+            if (getenv("PROSPER_PUMP_USEREV")) {
+                std::vector<UserReg> ur; { std::lock_guard<std::mutex> lk(g_eq_mx); ur = g_user_regs; }
+                for (auto& r : ur) { SceKEvent e{}; e.ident = r.id; e.filter = -11 /*EVFILT_USER*/; e.udata = r.udata; eq_post(r.eq, e); }
+            }
         }
     }
     void ensure_pump() { if (!g_pump_started.exchange(true)) std::thread(vblank_pump).detach(); }
@@ -212,10 +224,7 @@ HLE(k_eq_getcount){
 namespace {
     constexpr int16_t EVFILT_USER  = -11;
     constexpr int16_t EVFILT_TIMER = -7;
-    // Registered user-event sources: (eq,id) the game added and may later trigger. udata is captured
-    // at registration and echoed on trigger (matches orbis semantics where udata is bound at add-time).
-    struct UserReg { uint64_t eq; int64_t id; uint64_t udata; };
-    std::vector<UserReg> g_user_regs;   // guarded by g_eq_mx
+    // (UserReg / g_user_regs are declared above, before the vblank pump.)
 }
 HLE(k_add_user_event) {   // (eq, id, udata?) — register a user event source on the equeue
     { std::lock_guard<std::mutex> lk(g_eq_mx); g_user_regs.push_back({ a0, (int64_t)a1, a2 }); }
