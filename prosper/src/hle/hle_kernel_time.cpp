@@ -194,7 +194,10 @@ HLE(k_eq_wait)   {   // (eq, SceKernelEvent* ev, int num, int* out, SceKernelUse
     // NOT the stub region at 0x6..) so we can disassemble the loop's exit condition. Log once per eq.
     // PROSPER_DUMPCODE=<hex eboot offset>[,<off2>...]: dump 224 code bytes at each (guest memory is mapped),
     // so a game function reached from the wait loop can be disassembled offline. Runs once.
-    if (const char* dc = getenv("PROSPER_DUMPCODE")) {
+    // Env probes are cached in statics: k_eq_wait is the guest frame loop's wait (called every frame by
+    // several threads), so per-call getenv() environ scans are pure hot-path waste (cf. evlog()).
+    static const char* const dumpcode = getenv("PROSPER_DUMPCODE");
+    if (const char* dc = dumpcode) {
         static std::atomic<int> once{0};
         if (once.fetch_add(1) == 0) {
             const char* p = dc;
@@ -208,9 +211,10 @@ HLE(k_eq_wait)   {   // (eq, SceKernelEvent* ev, int num, int* out, SceKernelUse
             }
         }
     }
-    if (getenv("PROSPER_WAITCALLER")) {
+    static const bool waitcaller = getenv("PROSPER_WAITCALLER") != nullptr;
+    if (waitcaller) {
         static std::atomic<int> shown{0};
-        if (shown.fetch_add(1) < 4) {
+        if (shown.load() < 4 && shown.fetch_add(1) < 4) {
             uint64_t* sp = (uint64_t*)__builtin_frame_address(0);
             for (int i = 0; i < 80; i++) {
                 uint64_t v = sp[i];
@@ -244,7 +248,8 @@ HLE(k_eq_wait)   {   // (eq, SceKernelEvent* ev, int num, int* out, SceKernelUse
         // ~16 ms, so a >16 ms cap makes an event-DRAIN loop (while WaitEqueue keeps returning events) never
         // reach the empty state → the guest's frame loop stalls draining pumped events. A sub-vblank cap
         // (e.g. 8 ms) lets an empty drain time out (0 events) so the guest exits the drain and renders.
-        uint64_t cap = getenv("PROSPER_WAITCAP") ? (uint64_t)atoll(getenv("PROSPER_WAITCAP")) : 100000;
+        static const uint64_t cap = [] {   // parsed once (cf. punch_secs in hle_kernel_mem.cpp)
+            const char* e = getenv("PROSPER_WAITCAP"); return e ? (uint64_t)atoll(e) : (uint64_t)100000; }();
         uint64_t us = req; if (us > cap) us = cap;
         if (evlog()) fprintf(stderr, "[ev]   WAIT.empty req=%lluus cap=%lluus\n",
                              (unsigned long long)req, (unsigned long long)cap);

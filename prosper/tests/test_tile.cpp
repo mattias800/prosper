@@ -2,6 +2,7 @@
 // the tile (round-trip identity for arbitrary sizes), that linear mode is a passthrough, and that the
 // tiled layout is genuinely a permutation (no texel dropped/duplicated).
 #include "../src/gpu/tile.hpp"
+#include <algorithm>
 #include <cstdio>
 #include <cstdint>
 #include <vector>
@@ -52,6 +53,22 @@ int main() {
     CHECK(roundtrip_ok(64, 64),     "round-trip 64x64");
     CHECK(roundtrip_ok(1920, 1080), "round-trip 1920x1080 (the game's render target)");
     CHECK(roundtrip_ok(96, 64),     "round-trip 96x64 (non-square)");
+
+    // The vector convenience overload must be safe for a NATURALLY-sized (width*height*4, unpadded)
+    // tiled input: it zero-pads internally instead of reading past the vector (heap OOB). The visible
+    // texels must still match; only the bottom (padded) tile-row region may detile as zero.
+    {
+        const uint32_t w = 1920, h = 1080;
+        auto ref = make_ref(w, h);
+        std::vector<uint8_t> tiled(tiled_surface_bytes(w, h, (uint32_t)TileMode::Sw4KbS), 0);
+        tile_surface(tiled.data(), ref.data(), w, h, (uint32_t)TileMode::Sw4KbS);
+        std::vector<uint8_t> truncated(tiled.begin(), tiled.begin() + (size_t)w * h * 4);
+        auto full = detile_surface(tiled, w, h, (uint32_t)TileMode::Sw4KbS);
+        auto part = detile_surface(truncated, w, h, (uint32_t)TileMode::Sw4KbS);
+        CHECK(full == ref, "vector overload detiles a fully-padded input to the reference");
+        bool top_matches = std::equal(part.begin(), part.begin() + (size_t)w * 1024 * 4, ref.begin());
+        CHECK(top_matches, "vector overload on an UNPADDED input: rows above the last tile-row intact");
+    }
 
     // The tiled layout must be a permutation: every source index used exactly once (no drops/dupes) for a
     // tile-aligned surface.

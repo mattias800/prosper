@@ -178,11 +178,19 @@ int main(int argc, char** argv) {
                             // resource table; gated for now.)
                             if (const char* dt = getenv("PROSPER_DETILE"); dt && atoi(dt) != 0) {
                                 const uint32_t tmode = (uint32_t)prosper::gpu::TileMode::Sw4KbS;
-                                size_t tiled_bytes = prosper::gpu::tiled_surface_bytes(tw, th, tmode);
+                                // PROSPER_PITCH: padded row pitch in texels for surfaces whose pitch > width.
+                                const uint32_t pitch = getenv("PROSPER_PITCH") ? (uint32_t)atoi(getenv("PROSPER_PITCH")) : 0;
+                                size_t tiled_bytes = prosper::gpu::tiled_surface_bytes(tw, th, tmode, pitch);
                                 std::vector<uint8_t> tiled(tiled_bytes, 0);
                                 if (readable(r.gpu_addr, tiled_bytes))
                                     std::memcpy(tiled.data(), (const void*)(uintptr_t)r.gpu_addr, tiled_bytes);
-                                prosper::gpu::detile_surface(texstore.back().data(), tiled.data(), tw, th, tmode);
+                                else
+                                    // Padded tail (th rounded to whole 32-row tiles) is unmapped: detile
+                                    // from the width*height bytes already validated + copied above, rather
+                                    // than an all-zero buffer (which would BLANK the whole texture and make
+                                    // a live frame look empty). Only the bottom tile-row degrades.
+                                    std::memcpy(tiled.data(), texstore.back().data(), std::min(nb, tiled_bytes));
+                                prosper::gpu::detile_surface(texstore.back().data(), tiled.data(), tw, th, tmode, pitch);
                             }
                             // PROSPER_DUMP_TEX: write the RAW texture memory (interpreted linearly) to a BMP,
                             // bypassing the shader — reveals whether the render target is tiled (scrambled) or

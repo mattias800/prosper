@@ -36,6 +36,9 @@ void read_user_sgprs(const std::unordered_map<uint32_t, uint32_t>& sh, uint32_t 
     for (uint32_t i = 0; i < kUserSgprs; i++) { auto it = sh.find(base + i); out[i] = it == sh.end() ? 0u : it->second; }
 }
 
+} // namespace (guest_readable below has external linkage — declared in gpu_execute.hpp, shared with
+  // the HLE diagnostic probes that chase raw guest pointers)
+
 // Async-signal-safe-ish readability probe (guest memory is 1:1-mapped, but a mis-decoded address could
 // be unmapped): write() to /dev/null returns EFAULT for an unmapped source, so we can test a guest
 // address without risking a nested SIGSEGV on the render/submit thread. Always-true on Windows (the
@@ -51,6 +54,8 @@ bool guest_readable(uint64_t a, uint32_t n) {
 #else
 bool guest_readable(uint64_t, uint32_t) { return true; }
 #endif
+
+namespace {
 
 // --- Bindless-dynamic vertex-fetch resolution (const-fold the scalar setup) ---------------------------
 // This game's NGG vertex shader loads its vertex-buffer V# from a descriptor table at a RUNTIME-computed
@@ -106,6 +111,10 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         val[in.dst.value] = v;
                     else val.erase(in.dst.value);
                 } else if (in.dst.kind == OperandKind::SGPR) { val.erase(in.dst.value); }
+                // Several SOP1 ops write SCC (s_abs_i32, s_not_b32, s_and_saveexec_*, …). Only the moves
+                // (s_mov_b32 0x03 / s_mov_b64 0x04) are known not to — anything else invalidates the
+                // tracked SCC, or a later s_cselect folds with a stale compare result.
+                if (in.opcode != 0x03 && in.opcode != 0x04) scc = -1;
                 break;
             case Rdna2Format::SOP2: {
                 uint32_t a, c; bool ka, kc;
@@ -130,20 +139,29 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         break;
                     case 0x29: {  // s_bfe_u64: dst[63:0] = bitfield of src0[63:0] (format patch reads a small field)
                         uint32_t off = c & 0x3f, wid = (c >> 16) & 0x7f, ahi = 0;
-                        uint64_t src64 = (uint64_t)a | ((uint64_t)(known(in.src[0].value + 1, ahi) ? ahi : 0u) << 32);
+                        // src0's high dword: the next SGPR of the pair, or 0 for a 32-bit inline/literal
+                        // constant (zero-extended). Only an SGPR operand may index val[value+1] — a
+                        // literal's `value` is not an SGPR number. And an UNTRACKED high dword must not
+                        // silently fold as 0: if the field reaches bits >= 32 the result is unknown.
+                        bool khi = (in.src[0].kind == OperandKind::SGPR) ? known(in.src[0].value + 1, ahi)
+                                                                         : (ahi = 0, true);
+                        if (!khi && wid != 0 && off + wid > 32) { ok = false; wrote_pair = true; break; }
+                        uint64_t src64 = (uint64_t)a | ((uint64_t)ahi << 32);
                         uint64_t res = wid == 0 ? 0 : (wid >= 64 ? (src64 >> off) : ((src64 >> off) & (((uint64_t)1 << wid) - 1)));
                         r = (uint32_t)res; hi64 = (uint32_t)(res >> 32); wrote_pair = true; break;
                     }
                     default: ok = false; break;                            // SCC-dependent / unmodeled -> unknown
                 }
-                // Every SOP2 ALU op except s_cselect writes SCC to a value we don't track here — invalidate so a
-                // later s_cselect only trusts SCC set by an immediately-preceding s_cmp.
-                if (trc && in.pc < 170 && (d == 60 || d == 62 || d == 63 || d == 106 || d == 107 || d == 11))
+                if (trc)   // unfiltered like the SMEM/MUBUF traces (one shader walk — volume is bounded)
                     fprintf(stderr, "[dyntrace]   SOP2 pc=%u op=0x%x dst=s%d src0=%d(k%d) src1=%d(k%d) ok=%d r=0x%x\n",
                             in.pc, in.opcode, d, in.src[0].value, ka, in.src[1].value, kc, ok, r);
+                // Every SOP2 ALU op except s_cselect writes SCC to a value we don't track here — invalidate so a
+                // later s_cselect only trusts SCC set by an immediately-preceding s_cmp.
                 if (in.opcode != 0x0A) scc = -1;
                 if (ok) { val[d] = r; if (wrote_pair) val[d + 1] = hi64; }
-                else    { val.erase(d); if (wrote_pair) val.erase(d + 1); }
+                // A 64-bit-dst op (s_bfe_u64) invalidates BOTH dwords even when its sources were
+                // unknown (the opcode switch never ran, so wrote_pair may still be false).
+                else    { val.erase(d); if (wrote_pair || in.opcode == 0x29) val.erase(d + 1); }
                 break;
             }
             case Rdna2Format::SOPC: {   // scalar compare -> SCC (feeds the format patch's s_cselect)
@@ -225,7 +243,15 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 }
                 break;
             }
+            case Rdna2Format::SOPK:
+                // s_cmpk_* / s_addk_i32 write SCC (only s_movk/s_version/s_cmovk/s_mulk don't); this
+                // interpreter doesn't model SOPK, so ANY SOPK conservatively invalidates the tracked SCC —
+                // a stale SCC consumed by a later s_cselect would fabricate a confidently-wrong V# patch.
+                scc = -1;
+                if (in.dst.kind == OperandKind::SGPR) val.erase(in.dst.value);
+                break;
             default:
+                // Remaining formats (SOPP, VALU, memory, …) don't write SCC, so the tracked SCC survives.
                 if (in.dst.kind == OperandKind::SGPR) val.erase(in.dst.value);   // unmodeled scalar write -> unknown
                 break;
         }

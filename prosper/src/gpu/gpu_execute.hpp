@@ -34,6 +34,11 @@ using RenderFn = std::function<std::vector<uint8_t>(const std::vector<uint32_t>&
                                                     const ShaderResourceTable* prt,
                                                     uint32_t vertex_count)>;
 
+// Safe guest-address readability probe: write() to /dev/null returns EFAULT for an unmapped source
+// (Linux; always-true on Windows), so callers can test a guest pointer without risking a SIGSEGV.
+// Implemented in gpu_executor.cpp; shared by the executor's const-eval and HLE diagnostic probes.
+bool guest_readable(uint64_t addr, uint32_t bytes);
+
 // Build a shader stage's resource table from the folded GpuState: look up the registered shader header
 // by its bound code address, read its user-data SGPR block from the sh register file, decode the V#/T#/S#
 // descriptors, and assign bindings matching the recompiler+backend convention (constant buffer -> binding

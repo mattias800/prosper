@@ -44,10 +44,13 @@ HLE(s_np_reach)       { if (a1) *(int32_t*)PW(a1) = 0; return 0; }
 HLE(s_np_accountid)   { if (a1) *(uint64_t*)PW(a1) = 0; return 0; }
 HLE(s_np_country)     { if (a1) memset(PW(a1), 0, 4); return 0; }
 
-// --- mouse (report a device that exists but has no input; pad is handled in hle_pad.cpp) ---
+// --- mouse (report a device that exists but has no input; pad -> hle_pad.cpp real backend) ---
 HLE(s_open)           { return g_handle++; }                                 // sceMouseOpen -> handle
-// Conservative output size so we don't smash a smaller caller buffer.
-HLE(s_pad_read)       { if (a1) memset(PW(a1), 0, 0x30); return 0; }          // mouse state -> neutral
+// sceMouseRead(handle, SceMouseData*, num) returns the number of mouse events read. SceMouseData
+// (~0x18 bytes) is NOT ScePadData — sharing the pad stub returned one "valid" entry whose memset
+// overran a single-entry mouse buffer, and the game consumed a phantom mouse event every call. No
+// mouse attached: zero one entry defensively, report 0 events.
+HLE(s_mouse_read)     { if (a1) memset(PW(a1), 0, 0x18); return 0; }
 
 // --- app content ---
 HLE(s_appcontent_int) { if (a1) *(int32_t*)PW(a1) = 0; return 0; }
@@ -89,7 +92,7 @@ void register_service_hle() {
     // pad -> hle_pad.cpp (register_pad_hle). mouse:
     R("sceMouseInit", s_ok);
     R("sceMouseOpen", s_open);
-    R("sceMouseRead", s_pad_read);
+    R("sceMouseRead", s_mouse_read);
     // app content / dialogs
     R("sceAppContentInitialize", s_ok);
     R("sceAppContentAppParamGetInt", s_appcontent_int);
