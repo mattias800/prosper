@@ -60,6 +60,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_hle_registered PRIVATE prosper_core)
   add_test(NAME hle_functions_registered COMMAND test_hle_registered)
 
+  # sceAudioOut HLE: format decode, port lifecycle, PCM forwarding, volume, batch, error paths
+  # (via a capturing AudioSink — headless, no device).
+  add_executable(test_audio tests/test_audio.cpp)
+  target_link_libraries(test_audio PRIVATE prosper_core)
+  add_test(NAME audio_hle COMMAND test_audio)
+
   add_executable(test_equeue_events tests/test_equeue_events.cpp)
   target_link_libraries(test_equeue_events PRIVATE prosper_core)
   add_test(NAME equeue_events COMMAND test_equeue_events)
@@ -314,4 +320,63 @@ if(TARGET prosper_core)
       message(STATUS "Vulkan not found — skipping offscreen graphics harness")
     endif()
   endif()
+endif()
+
+# --- optional SDL3 audio frontend (headless core stays dependency-free) ---------------------
+# The sceAudioOut HLE is backend-agnostic (src/hle/audio.hpp). This builds an SDL3-backed sink,
+# entirely OUTSIDE prosper_core, so the guest's audio plays on the host. Off by default.
+#   Enable with:  -DPROSPER_AUDIO_SDL3=ON   (uses a system SDL3 if found, else fetches + builds it)
+option(PROSPER_AUDIO_SDL3 "Build the optional SDL3 audio frontend" OFF)
+if(PROSPER_AUDIO_SDL3 AND TARGET prosper_core)
+  find_package(SDL3 QUIET CONFIG)
+  if(NOT SDL3_FOUND)
+    message(STATUS "SDL3 not found on system — fetching release-3.2.30")
+    include(FetchContent)
+    set(SDL_TEST OFF CACHE BOOL "" FORCE)
+    set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+    set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+    set(SDL_STATIC ON CACHE BOOL "" FORCE)
+    # Audio-only build: disabling video drops SDL's hard X11/Wayland requirement so it builds on
+    # headless hosts (SDL_UNIX_CONSOLE_BUILD is SDL's documented "no windowing system" escape hatch).
+    # Trim the other subsystems we don't use to keep the SDL build lean.
+    set(SDL_UNIX_CONSOLE_BUILD ON CACHE BOOL "" FORCE)
+    set(SDL_VIDEO OFF CACHE BOOL "" FORCE)
+    set(SDL_WAYLAND OFF CACHE BOOL "" FORCE)
+    set(SDL_X11 OFF CACHE BOOL "" FORCE)
+    set(SDL_RENDER OFF CACHE BOOL "" FORCE)
+    set(SDL_GPU OFF CACHE BOOL "" FORCE)
+    set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
+    set(SDL_JOYSTICK OFF CACHE BOOL "" FORCE)
+    set(SDL_HAPTIC OFF CACHE BOOL "" FORCE)
+    set(SDL_HIDAPI OFF CACHE BOOL "" FORCE)
+    set(SDL_SENSOR OFF CACHE BOOL "" FORCE)
+    set(SDL_POWER OFF CACHE BOOL "" FORCE)
+    set(SDL_DIALOG OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(SDL3
+      GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+      GIT_TAG release-3.2.30
+      GIT_SHALLOW TRUE)
+    FetchContent_MakeAvailable(SDL3)
+  endif()
+
+  add_library(prosper_audio_sdl3 STATIC frontends/audio_sdl3/audio_sink_sdl3.cpp)
+  target_include_directories(prosper_audio_sdl3 PUBLIC frontends/audio_sdl3 src)
+  target_link_libraries(prosper_audio_sdl3 PUBLIC prosper_core SDL3::SDL3)
+  target_compile_definitions(prosper_audio_sdl3 PUBLIC PROSPER_AUDIO_SDL3=1)
+
+  # Headless self-test of the full SDL3 path (run under the SDL "dummy" audio driver in CI):
+  # install the sink, drive the sceAudioOut HLE, assert grains flow through SDL with no device.
+  add_executable(test_audio_sdl3 frontends/audio_sdl3/test_audio_sdl3.cpp)
+  target_link_libraries(test_audio_sdl3 PRIVATE prosper_audio_sdl3)
+  add_test(NAME audio_sdl3 COMMAND test_audio_sdl3)
+  set_tests_properties(audio_sdl3 PROPERTIES ENVIRONMENT "SDL_AUDIO_DRIVER=dummy")
+
+  # Route the live game's audio to the host when the runner is built (guarded by the macro).
+  if(TARGET boot_trace)
+    target_link_libraries(boot_trace PRIVATE prosper_audio_sdl3)
+    target_compile_definitions(boot_trace PRIVATE PROSPER_AUDIO_SDL3=1)
+  endif()
+
+  message(STATUS "SDL3 audio frontend enabled (prosper_audio_sdl3)")
 endif()

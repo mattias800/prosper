@@ -324,6 +324,7 @@ void register_builtin_hle() {
     #undef R
     register_file_hle();     // file I/O (stdio + POSIX, /app0 translation)
     register_service_hle();  // PS5 system services (user/NP/pad/mouse/appcontent)
+    register_audio_hle();    // libSceAudioOut backed by a headless/pluggable AudioSink
     register_graphics_hle(); // headless libSceAgc/libSceVideoOut placeholders (bring-up)
     register_agc_hle();      // real AGC Dcb functions (override the glog stubs for Dcb NIDs)
     register_kernel_hle();   // libkernel primitives (pthread/sync/...)
