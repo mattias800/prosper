@@ -288,6 +288,12 @@ if(TARGET prosper_core)
       target_link_libraries(test_texture_sample_render PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME texture_sample_render COMMAND test_texture_sample_render)
 
+      # Multi-draw backend: N draws composited into ONE cleared-once framebuffer (red opaque + green
+      # additive -> yellow center proves accumulation into a single target).
+      add_executable(test_multidraw_render tests/test_multidraw_render.cpp)
+      target_link_libraries(test_multidraw_render PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME multidraw_render COMMAND test_multidraw_render)
+
       # Storage images: a recompiled compute kernel does MIMG image_load->image_store (no sampler) to
       # copy a 1D storage image bit-exact (the game's blit/copy compute-shader class).
       add_executable(test_storage_image_copy tests/test_storage_image_copy.cpp)

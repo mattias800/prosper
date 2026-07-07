@@ -46,9 +46,11 @@ int main() {
 
     // The executor core, with the offscreen Vulkan renderer supplied as the backend (as the HLE will
     // supply the live-device renderer). execute_gpustate does recompile + resolve + render internally.
-    auto backend = [&](const std::vector<uint32_t>& vs, const std::vector<uint32_t>& fs,
-                       const ResolvedPipelineState& ps, const ShaderResourceTable*, const ShaderResourceTable*, uint32_t) {
-        return prosper::test::render_triangle_rgba(vs, fs, W, H, &ps);
+    // The backend gets the submit's DrawItem list; this test submits a single draw, so render items[0] via
+    // the single-draw wrapper (default empty-buffer resources), exactly as before.
+    auto backend = [&](const std::vector<DrawItem>& items) -> std::vector<uint8_t> {
+        if (items.empty()) return {};
+        return prosper::test::render_triangle_rgba(items[0].vs, items[0].fs, W, H, &items[0].ps);
     };
     std::vector<uint8_t> px = execute_gpustate(st, backend);
     CHECK(px.size() == (size_t)W * H * 4, "execute_gpustate rendered a frame from the GpuState");
@@ -74,10 +76,9 @@ int main() {
     // The live-submit registry path — exactly what agc_driver_submit_dcb drives once a device is wired.
     CHECK(!have_submit_renderer(), "no live renderer registered by default (game path stays inert)");
     CHECK(!execute_and_present(st, W, H), "execute_and_present is a no-op with no renderer registered");
-    set_submit_renderer([&](const std::vector<uint32_t>& vs, const std::vector<uint32_t>& fs,
-                            const ResolvedPipelineState& ps, const ShaderResourceTable*,
-                            const ShaderResourceTable*, uint32_t w, uint32_t h, uint32_t) {
-        return prosper::test::render_triangle_rgba(vs, fs, w, h, &ps);
+    set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t w, uint32_t h) -> std::vector<uint8_t> {
+        if (items.empty()) return {};
+        return prosper::test::render_triangle_rgba(items[0].vs, items[0].fs, w, h, &items[0].ps);
     });
     CHECK(have_submit_renderer(), "live renderer registered");
     prosper::gpu::present_reset();

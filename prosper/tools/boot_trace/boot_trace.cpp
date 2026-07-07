@@ -32,6 +32,12 @@
 #include <unistd.h>
 #endif
 
+// PROSPER_CRASHPEEK (below) needs these in every config — the gpu/*.hpp includes above are gated on
+// PROSPER_HAVE_VULKAN, but guest_readable is a core (non-Vulkan) symbol always linked into prosper_core,
+// and strchr needs <cstring>. Declare/include them unconditionally so the no-Vulkan build compiles.
+#include <cstring>
+namespace prosper::gpu { bool guest_readable(uint64_t addr, uint32_t bytes); }
+
 using namespace prosper;
 
 
@@ -66,6 +72,14 @@ int main(int argc, char** argv) {
         { d + "/Media/Modules/PS5Util.prx", PS5UTIL },
         { d + "/sce_module/libc.prx", LIBC },
     };
+    // Cross-title tolerance (docs/CROSS_ENGINE_UE4.md step 1, minimal form): drop dependent modules
+    // whose file doesn't exist in this dump — e.g. the UE4 title ships no Il2cpp/PS5Util, so it links
+    // eboot + libc.prx only. The eboot (index 0) is always kept; each module keeps its fixed base.
+    // For the primary target every file exists, so its link is byte-for-byte unchanged.
+    for (size_t i = in.size(); i-- > 1; ) {
+        if (FILE* f = fopen(in[i].path.c_str(), "rb")) fclose(f);
+        else { printf("skipping absent module: %s\n", in[i].path.c_str()); in.erase(in.begin() + (ptrdiff_t)i); }
+    }
     if (!link_program(in, STUB, p, &e)) { printf("link failed: %s\n", e.c_str()); return 1; }
     printf("linked %zu modules; %zu imports (%zu cross-module, %zu stub slots); %zu init fns\n",
            p.mods.size(), p.total_imports, p.resolved_cross_module, p.slots.size(), p.init_fns.size());
@@ -109,6 +123,36 @@ int main(int argc, char** argv) {
     install_trap_handler();
     run_guest_inits(p.init_fns);
 
+    // PROSPER_PATCH_RET=addr[,addr...]: write 0xC3 (ret) at each absolute guest address, neutralizing that
+    // function (returns immediately, stack balanced). Bring-up diagnostic to bisect a crashing subsystem —
+    // e.g. skip the per-frame incremental-GC pump (Il2cpp+0x5df0 => 0x440005df0) to test whether the GC is
+    // the wall to scene activation. Guest code is RWX; write before the guest starts.
+    if (const char* pr = getenv("PROSPER_PATCH_RET")) {
+        const char* s = pr;
+        while (*s) {
+            char* end = nullptr; uint64_t a = strtoull(s, &end, 0);
+            if (a && end != s) { *(volatile uint8_t*)(uintptr_t)a = 0xC3;
+                fprintf(stderr, "[patch] ret @ 0x%llx\n", (unsigned long long)a); }
+            // Always make progress: skip the comma if present, else advance past what we parsed; if
+            // strtoull consumed nothing (end == s, malformed) step one char so we never spin forever.
+            s = (*end == ',') ? end + 1 : (end != s) ? end : s + 1;
+        }
+    }
+    // PROSPER_PATCH_BYTE=addr=val[,addr=val...]: write an arbitrary byte at a guest address (finer than
+    // PATCH_RET — e.g. flip a conditional 0x74 je -> 0xEB jmp to force a branch). Same bring-up bisection use.
+    if (const char* pb = getenv("PROSPER_PATCH_BYTE")) {
+        const char* s = pb;
+        while (*s) {
+            char* e1 = nullptr; uint64_t a = strtoull(s, &e1, 0);
+            if (a && e1 && *e1 == '=') {
+                char* e2 = nullptr; unsigned long v = strtoul(e1 + 1, &e2, 0);
+                *(volatile uint8_t*)(uintptr_t)a = (uint8_t)v;
+                fprintf(stderr, "[patch] byte 0x%02x @ 0x%llx\n", (unsigned)(v & 0xff), (unsigned long long)a);
+                s = (e2 && *e2 == ',') ? e2 + 1 : (e2 ? e2 : s + 1);
+            } else s = (e1 && *e1) ? e1 + 1 : s + 1;
+        }
+    }
+
 #ifdef PROSPER_HAVE_VULKAN
     // PROSPER_RENDER=1: register the live Vulkan renderer so execute_and_present fires on every
     // submitted Dcb with draws (Stage A of GPU_EXECUTOR_DESIGN.md, now live). Each rendered frame
@@ -118,36 +162,33 @@ int main(int argc, char** argv) {
         static std::atomic<int> frame_no{0};
         static std::string fdir = getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".";
         prosper::gpu::set_submit_renderer(
-            [](const std::vector<uint32_t>& vs, const std::vector<uint32_t>& fs,
-               const prosper::gpu::ResolvedPipelineState& ps,
-               const prosper::gpu::ShaderResourceTable* vrt, const prosper::gpu::ShaderResourceTable* prt,
-               uint32_t w, uint32_t h, uint32_t draw_vcount) {
-                // PROSPER_RENDER_FIRST=<N>: skip the slow (~400x) Vulkan render for the first N GPU submits so
+            [](const std::vector<prosper::gpu::DrawItem>& items, uint32_t w, uint32_t h) -> std::vector<uint8_t> {
+                using RC = prosper::gpu::ResourceClass;
+                // PROSPER_RENDER_FIRST=<N>: skip the slow (~400x) Vulkan render for the first N GPU submits, so
                 // the game reaches a LATE scene (e.g. the level1 cutscene, which only starts submitting after
-                // ~5000 title-loop submits) at native speed, then renders + dumps only the late frames.
-                // Without this, rendering from boot is far too slow to ever reach the cutscene.
+                // ~5000 title-loop submits) at native speed before we begin rendering/dumping. Returning {}
+                // means "not rendered this submit". Without this, rendering from boot is far too slow to ever
+                // reach a post-loading-screen scene.
                 static std::atomic<int> g_submit_idx{0};
                 static int g_render_first = getenv("PROSPER_RENDER_FIRST") ? atoi(getenv("PROSPER_RENDER_FIRST")) : 0;
-                if (g_submit_idx++ < g_render_first) return;
-                // Dump the recompiled SPIR-V FIRST (before the slow Vulkan render), so it survives even if
-                // a concurrent worker fault kills the process mid-render — lets us spirv-val it offline.
-                if (getenv("PROSPER_SHADER_DUMP")) {
+                if (g_submit_idx++ < g_render_first) return {};
+                // Dump the FIRST item's recompiled SPIR-V (diagnostic; survives a mid-render crash).
+                if (getenv("PROSPER_SHADER_DUMP") && !items.empty()) {
                     std::string d = getenv("PROSPER_SHADER_DUMP");
-                    if (FILE* f = fopen((d + "/frame_vs.spv").c_str(), "wb")) { fwrite(vs.data(), 4, vs.size(), f); fclose(f); }
-                    if (FILE* f = fopen((d + "/frame_fs.spv").c_str(), "wb")) { fwrite(fs.data(), 4, fs.size(), f); fclose(f); }
-                    fprintf(stderr, "[render] dumped SPIR-V vs=%zu fs=%zu dwords\n", vs.size(), fs.size()); fflush(stderr);
+                    if (FILE* f = fopen((d + "/frame_vs.spv").c_str(), "wb")) { fwrite(items[0].vs.data(), 4, items[0].vs.size(), f); fclose(f); }
+                    if (FILE* f = fopen((d + "/frame_fs.spv").c_str(), "wb")) { fwrite(items[0].fs.data(), 4, items[0].fs.size(), f); fclose(f); }
+                    fprintf(stderr, "[render] dumped SPIR-V vs=%zu fs=%zu dwords\n", items[0].vs.size(), items[0].fs.size()); fflush(stderr);
                 }
-                // Bind EVERY resource each shader declares, each at its own descriptor binding, reading the
-                // bytes from 1:1-mapped guest memory (an unbound image_sample/storage binding is UB). The
-                // executor gave each constant/vertex buffer + texture a distinct binding; the recompiler
-                // declared a storage buffer / image sampler at each, so we must bind them all.
-                using RC = prosper::gpu::ResourceClass;
                 int dn = open("/dev/null", O_WRONLY);
                 auto readable = [&](uint64_t a, size_t n){ return a > 0x1000 && dn >= 0 && write(dn, (const void*)(uintptr_t)a, n) == (ssize_t)n; };
-                std::vector<prosper::test::FrameResource> R;
-                static std::vector<std::vector<uint8_t>> texstore;  // keep texture bytes alive across the call
+                static std::vector<std::vector<uint8_t>> texstore;  // keep every item's texture bytes alive
                 texstore.clear();
-                auto add = [&](const prosper::gpu::ShaderResourceTable* t, uint32_t set){
+                // Build one draw's set-tagged resources from its VS (set 0) + PS (set 1) tables — read the
+                // bytes from 1:1-mapped guest memory, detile textures. (Each constant/vertex buffer + texture
+                // gets its own binding; the recompiler declared a storage buffer / image sampler at each.)
+                auto build_R = [&](const prosper::gpu::ShaderResourceTable* vrt, const prosper::gpu::ShaderResourceTable* prt) {
+                  std::vector<prosper::test::FrameResource> R;
+                  auto add = [&](const prosper::gpu::ShaderResourceTable* t, uint32_t set){
                     if (!t) return;
                     for (auto& r : t->resources) {
                         prosper::test::FrameResource fr; fr.binding = r.binding; fr.set = set;
@@ -218,50 +259,51 @@ int main(int argc, char** argv) {
                         }
                         R.push_back(std::move(fr));
                     }
+                  };
+                  add(vrt, 0); add(prt, 1);   // VS resources -> descriptor set 0, PS -> set 1
+                  return R;
                 };
-                add(vrt, 0); add(prt, 1);   // VS resources -> descriptor set 0, PS -> set 1 (no binding collision)
-                if (dn >= 0) close(dn);
-                if (getenv("PROSPER_GFXLOG")) { fprintf(stderr, "[render] binding %zu resources (draw %u verts)\n",
-                    R.size(), draw_vcount); fflush(stderr); }
-                // PROSPER_RENDER_REFVS: replace the game's (intricate) vertex shader with a known-good
-                // fullscreen-triangle VS that exports uv in [0,1] across the screen (location 1) + white
-                // (location 0). Paired with the game's REAL pixel shader + texture, this shows the game's
-                // actual composited texture — isolating the VS from the rest of the pipeline.
-                std::vector<uint32_t> vs_use = vs; uint32_t vcount_use = draw_vcount;
-                if (getenv("PROSPER_RENDER_REFVS")) {
-                    #include "refvs.inc"
-                    vs_use.assign(kRefVs, kRefVs + sizeof(kRefVs) / 4); vcount_use = 3;
-                }
-                // PROSPER_RENDER_TESTPS: replace the real pixel shader with a solid MAGENTA one (recompiled
-                // from a tiny RDNA2 EXP blob) to isolate VS geometry from PS shading — if the VS positions
-                // are on-screen, magenta triangles appear regardless of the texture/PS math.
-                std::vector<uint32_t> fs_use = fs;
+                // Diagnostic shader/state overrides (computed once, applied to EVERY draw item):
+                //   REFVS  -> a known-good fullscreen-triangle VS (isolates the game's real VS).
+                //   TESTPS -> a solid-magenta PS (isolates VS geometry from PS shading).
+                //   FS_SPV -> a caller-supplied PS SPIR-V (e.g. a UV visualizer).
+                //   NOPS   -> bypass the resolved pipeline state (default state).
+                #include "refvs.inc"
+                const bool refvs = getenv("PROSPER_RENDER_REFVS");
+                std::vector<uint32_t> refvs_spv(kRefVs, kRefVs + sizeof(kRefVs) / 4);
+                std::vector<uint32_t> ps_override;
                 if (getenv("PROSPER_RENDER_TESTPS")) {
                     static const uint32_t kMagentaPs[] = {   // v0=1.0(R) v1=0.0(G) v2=1.0(B) v3=1.0(A); exp mrt0; endpgm
                         0x7E0002F2u, 0x7E020280u, 0x7E0402F2u, 0x7E0602F2u, 0xF800180Fu, 0x03020100u, 0xBF810000u };
-                    auto m = prosper::gpu::recompile_fragment(kMagentaPs, sizeof(kMagentaPs) / 4, nullptr);
-                    if (!m.empty()) fs_use = m;
+                    ps_override = prosper::gpu::recompile_fragment(kMagentaPs, sizeof(kMagentaPs) / 4, nullptr);
                 }
-                // PROSPER_FS_SPV=<file.spv>: replace the fragment shader with a caller-supplied SPIR-V
-                // module (diagnostic: e.g. a UV-visualizer PS that writes the interpolated location-1
-                // varying as color, to see EXACTLY what the real VS feeds the interpolators).
                 if (const char* fsp = getenv("PROSPER_FS_SPV")) {
                     if (FILE* f = fopen(fsp, "rb")) {
                         fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
                         std::vector<uint32_t> m((size_t)sz / 4);
-                        if (sz >= 20 && fread(m.data(), 4, m.size(), f) == m.size()) fs_use = std::move(m);
+                        if (sz >= 20 && fread(m.data(), 4, m.size(), f) == m.size()) ps_override = std::move(m);
                         fclose(f);
                     }
                 }
-                if (getenv("PROSPER_GFXLOG")) fprintf(stderr,
-                    "[render] ps: topo=%u fmt=%u depth(test=%d write=%d op=%u) blend(en=%d src=%u dst=%u op=%u) mask=0x%x\n",
-                    ps.topology, ps.color0_format, ps.depth_test_enable, ps.depth_write_enable, ps.depth_compare_op,
-                    ps.blend_enable, ps.src_color_blend_factor, ps.dst_color_blend_factor, ps.color_blend_op, ps.color_write_mask);
-                // PROSPER_RENDER_NOPS: bypass the game's resolved pipeline state (default state instead) to
-                // isolate whether blend/depth/color-mask is discarding the fragments.
-                const prosper::gpu::ResolvedPipelineState* ps_use = getenv("PROSPER_RENDER_NOPS") ? nullptr : &ps;
-                std::vector<uint8_t> px = prosper::test::render_triangle_rgba(vs_use, fs_use, w, h, ps_use,
-                    nullptr, nullptr, nullptr, R.empty() ? nullptr : &R, vcount_use);
+                const bool nops = getenv("PROSPER_RENDER_NOPS");
+                // Assemble the backend draws — one per realized DrawItem, each with its own resources +
+                // fixed-function state (or the diagnostic overrides above). render_draws_rgba composites
+                // them into ONE framebuffer.
+                std::vector<prosper::test::BackendDraw> bds;
+                for (const auto& it : items) {
+                    prosper::test::BackendDraw bd;
+                    bd.vs     = refvs ? refvs_spv : it.vs;
+                    bd.fs     = ps_override.empty() ? it.fs : ps_override;
+                    bd.vcount = refvs ? 3u : it.vertex_count;
+                    bd.ps     = nops ? nullptr : &it.ps;
+                    bd.R      = build_R(it.vrt.get(), it.prt.get());
+                    if (getenv("PROSPER_GFXLOG")) fprintf(stderr,
+                        "[render] item %zu: %zu resources vcount=%u topo=%u mask=0x%x blend=%d\n",
+                        bds.size(), bd.R.size(), bd.vcount, it.ps.topology, it.ps.color_write_mask, (int)it.ps.blend_enable);
+                    bds.push_back(std::move(bd));
+                }
+                if (dn >= 0) close(dn);
+                std::vector<uint8_t> px = prosper::test::render_draws_rgba(bds, w, h);
                 int n = frame_no++;
                 if (px.empty()) {
                     fprintf(stderr, "[render] frame %d: Vulkan render FAILED (%ux%u)\n", n, w, h);
@@ -284,5 +326,55 @@ int main(int argc, char** argv) {
            (unsigned long long)r.rdx, (unsigned long long)r.rbp, (unsigned long long)r.rsp);
     printf("  backtrace (%zu frames):\n", r.backtrace.size());
     for (uint64_t a : r.backtrace) printf("    %-12s +0x%llx\n", cls(a), (unsigned long long)bof(a));
+    // PROSPER_CRASHPEEK: after a recovered main-thread fault, dump guest memory at the fault registers
+    // (still 1:1-mapped) so a null-source deref (e.g. an IL2CPP memcpy from a null field) can be traced
+    // to the object + field that is null. Reads are bounded by guest_readable (never re-faults).
+    if (getenv("PROSPER_CRASHPEEK") && r.kind == 2) {
+        auto dump = [&](const char* tag, uint64_t addr) {
+            printf("  [peek] %s=0x%llx:", tag, (unsigned long long)addr);
+            if (!addr || !prosper::gpu::guest_readable(addr, 8)) { printf(" <unmapped>\n"); return; }
+            for (int i = 0; i < 8; i++) {
+                uint64_t a = addr + (uint64_t)i * 8;
+                if (prosper::gpu::guest_readable(a, 8)) printf(" %016llx", (unsigned long long)*(const uint64_t*)(uintptr_t)a);
+                else { printf(" ...."); break; }
+            }
+            printf("\n");
+        };
+        dump("rax", r.rax); dump("rdi", r.rdi);
+        // The dest rdi is unaligned; also show the object rax as bytes (type tags / vtable ptr @+0).
+        // Scan rax's first 8 qwords for the null field (the likely memcpy source).
+        for (int i = 0; i < 8; i++) {
+            uint64_t a = r.rax + (uint64_t)i * 8;
+            if (prosper::gpu::guest_readable(a, 8) && *(const uint64_t*)(uintptr_t)a == 0)
+                printf("  [peek] rax+0x%x is NULL (candidate memcpy source field)\n", i * 8);
+        }
+        // Dump 24 instruction bytes at the fault rip and each backtrace frame's return site
+        // (return addr - 5, the call instruction) for offline `objdump -b binary -m i386:x86-64`.
+        auto insn = [&](const char* tag, uint64_t addr) {
+            printf("  [insn] %s 0x%llx:", tag, (unsigned long long)addr);
+            for (int i = 0; i < 24; i++)
+                if (prosper::gpu::guest_readable(addr + i, 1)) printf(" %02x", *(const uint8_t*)(uintptr_t)(addr + i));
+                else { printf(" ??"); break; }
+            printf("\n");
+        };
+        insn("rip", r.fault_rip);
+        for (size_t i = 0; i < r.backtrace.size() && i < 5; i++)
+            insn("call@", r.backtrace[i] >= 5 ? r.backtrace[i] - 5 : r.backtrace[i]);
+        // PROSPER_PEEK_CODE=0xADDR[,0xADDR...]: dump 512 code bytes at each guest address (still mapped
+        // post-fault) for offline `objdump -b binary -m i386:x86-64 --adjust-vma=ADDR`. Used to
+        // disassemble the guest GC suspend handler etc. without extracting the SELF module.
+        if (const char* pc = getenv("PROSPER_PEEK_CODE")) {
+            for (const char* p = pc; *p; ) {
+                uint64_t a = strtoull(p, nullptr, 0);
+                printf("  [code] 0x%llx:", (unsigned long long)a);
+                for (int i = 0; i < 512; i++) {
+                    if (prosper::gpu::guest_readable(a + i, 1)) printf(" %02x", *(const uint8_t*)(uintptr_t)(a + i));
+                    else { printf(" ??"); break; }
+                }
+                printf("\n");
+                const char* c = strchr(p, ','); if (!c) break; p = c + 1;
+            }
+        }
+    }
     return 0;
 }
