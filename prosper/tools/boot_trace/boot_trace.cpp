@@ -36,6 +36,10 @@
 using namespace prosper;
 
 #ifdef PROSPER_HAVE_VULKAN
+namespace { namespace blitvs {
+#include "refvs.inc"   // kRefVs: a fullscreen-triangle VS emitting uv in [0,1] (blit-VS bring-up substitution)
+} }
+
 // Build one draw's descriptor-bound resources from its two stages' resource tables: read each declared
 // constant/vertex buffer + texture out of 1:1-mapped guest memory into a FrameResource. Texture bytes are
 // appended to `store` (a std::deque so earlier textures' .data() pointers stay valid as more are added) and
@@ -318,10 +322,29 @@ int main(int argc, char** argv) {
             prosper::gpu::set_frame_renderer(
                 [](const std::vector<prosper::gpu::FrameDraw>& draws, uint32_t w, uint32_t h) -> std::vector<uint8_t> {
                     std::deque<std::vector<uint8_t>> store;   // keeps every draw's texture bytes alive until render
+                    // PROSPER_BLIT_VS: substitute a fullscreen-triangle VS (uv in [0,1]) for the draws' vertex
+                    // shader. The title/menu is a fullscreen blit whose real VS fetches its 3 vertices through a
+                    // bindless-DYNAMIC V# (a runtime-computed table offset) the recompiler can't yet resolve, so
+                    // the real VS emits a degenerate half-screen triangle with zero UVs. This substitution keeps
+                    // the game's REAL pixel shader + REAL texture + resolved pipeline state and only replaces the
+                    // unresolved vertex fetch, so the composed frame is displayed. Bring-up aid; the real fix is
+                    // resolving the bindless fetch (docs/RENDER_LOOP.md). CONFIDENCE: HIGH that this is a faithful
+                    // fullscreen blit for the title screen.
+                    static const std::vector<uint32_t> kBlitVs(blitvs::kRefVs, blitvs::kRefVs + sizeof(blitvs::kRefVs)/4);
+                    const bool blit = getenv("PROSPER_BLIT_VS") != nullptr;
+                    // For the blit substitution, also present the composed texture OPAQUELY: the game's real
+                    // per-draw pipeline state for these passes uses alpha blend / a zero color-write mask (it
+                    // composites over a live backbuffer), which over our single cleared framebuffer writes
+                    // nothing. A fullscreen blit's job is to show the image, so force opaque (mask=RGBA, no
+                    // blend, no depth). Gated with PROSPER_BLIT_VS.
+                    static prosper::gpu::ResolvedPipelineState kOpaque = []{
+                        prosper::gpu::ResolvedPipelineState s; s.topology = 3; s.color_write_mask = 0xF;
+                        s.blend_enable = false; s.depth_test_enable = false; return s; }();
                     std::vector<prosper::test::FramePass> passes; passes.reserve(draws.size());
                     for (const auto& d : draws) {
                         prosper::test::FramePass p;
-                        p.vs = &d.vs; p.fs = &d.fs; p.ps = &d.ps; p.vcount = d.vertex_count;
+                        p.vs = blit ? &kBlitVs : &d.vs; p.fs = &d.fs; p.ps = blit ? &kOpaque : &d.ps;
+                        p.vcount = blit ? 3u : d.vertex_count;
                         p.R = build_frame_resources(d.vrt.get(), d.prt.get(), store);
                         passes.push_back(std::move(p));
                     }

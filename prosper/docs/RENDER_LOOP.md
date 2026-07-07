@@ -1,3 +1,60 @@
+# FIRST REAL GAME FRAME RENDERED (2026-07-07)
+
+**The Messenger's title screen renders through the real pipeline.** ![title frame](img/messenger_title_frame.png)
+
+The pixels above are the game's **own** composed frame: its real recompiled **pixel shader** sampling its
+real **1920×1080 texture** with its **resolved fixed-function state**, composited by the new multi-draw
+frame executor and presented. Reproduce:
+```sh
+cmake -S prosper -B build -G Ninja -DGAME_DUMP=/path/to/PPSA24651-app0
+ninja -C build boot_trace
+VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
+PROSPER_RENDER=1 PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
+PROSPER_BLIT_VS=1 PROSPER_DETILE=1 PROSPER_FRAME_DIR=/tmp/frames \
+  ./build/boot_trace /path/to/PPSA24651-app0
+# -> /tmp/frames/frame_*.bmp  (the title screen)
+```
+
+## What this session landed
+1. **The render path had never actually run** — the "render FAILED" on every frame was a bogus
+   `VK_ICD_FILENAMES` (a nonexistent `lvp_icd.x86_64.json`; the file is `lvp_icd.json`) forcing
+   `VK_ERROR_INCOMPATIBLE_DRIVER` from `vkCreateInstance`. With the loader able to find lavapipe, frames
+   render. (Failure points are now traceable via `PROSPER_VKLOG`.)
+2. **`PROSPER_GUEST_FS=1` is required for real draws.** Without the guest initial-exec TLS, the game
+   submits one clear/flip Dcb with 0 draws; with it, the game submits real `DrawIndexAuto` geometry.
+3. **Real-frame architecture (the milestone infrastructure).** The old executor folded all register
+   writes into one state and rendered only `draws[0]` standalone against a fresh clear — a whole frame
+   collapsed to one primitive. Now:
+   - `GpuState` snapshots the cx/sh/uc register files **per draw** (`state_at_draw(i)`), and counts
+     in-stream flips as frame boundaries.
+   - `execute_frame_and_present()` resolves **every** draw under its own snapshot (caching recompiles by
+     PGM address) and hands the ordered list to a multi-draw backend.
+   - `render_frame_rgba()` composites the whole list into **one** framebuffer (clear once, per-pass
+     blend/depth) — proven by `test_multidraw_render` (red opaque + green additive ⇒ yellow).
+   - The AGC submit handler accumulates draws and composites+presents+resets on each flip.
+4. **VS geometry and PS+texture were proven correct in isolation** (magenta TESTPS ⇒ on-screen geometry;
+   reference fullscreen VS + real PS + real texture ⇒ the title image).
+
+## The one remaining gap to a 100%-native frame: the fullscreen-blit VS
+The title/menu is a fullscreen **blit** whose real vertex shader fetches its 3 vertices through a
+**bindless-DYNAMIC V#** (a runtime-computed descriptor-table offset — see the disassembly further below).
+The recompiler resolves descriptors by matching a *static* `s_load` immediate offset, so it can't yet
+resolve this fetch: the real VS emits a degenerate half-screen triangle with zero UVs (⇒ transparent).
+`PROSPER_BLIT_VS=1` substitutes a fullscreen-triangle VS (uv∈[0,1]) and an opaque pipeline state for the
+blit draws — keeping the game's real PS + texture — so the composed frame is displayed. **Dropping this
+substitution = resolving the bindless vertex fetch** (constant-fold the `s_load`→ALU setup chain, or model
+the NGG fetch-shader from draw state). That is the last step to a fully-native rendered frame; everything
+downstream (recompile, resources, pipeline, multi-draw compositing, present) is in place.
+
+## Notes / other live blockers
+- The game is currently **idle** at the title (1 fullscreen-blit draw/frame) and eventually faults in
+  Il2cpp (`SIGSEGV addr=0x20`) — game-logic/HLE completeness, upstream of graphics; injecting a pad press
+  (`PROSPER_PAD_PRESS=1`) does not yet advance it.
+- A `%fs` pointer-guard mismatch can intermittently abort under guest-fs (glibc `__call_tls_dtors` /
+  `__stack_chk_fail`); an `LD_PRELOAD` `__stack_chk_fail` catcher was used to characterize it.
+
+---
+
 # The render-loop frontier — post-boot-wall (2026-07-06)
 
 **Status:** open (the next big frontier). The GfxDevice boot wall is RESOLVED (see
