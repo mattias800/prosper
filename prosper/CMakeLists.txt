@@ -70,6 +70,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_service_getters PRIVATE prosper_core)
   add_test(NAME service_getters COMMAND test_service_getters)
 
+  # libScePad controller input: ScePadData layout + HostPadState mapping + HLE fill contract (pure).
+  add_executable(test_pad tests/test_pad.cpp)
+  target_link_libraries(test_pad PRIVATE prosper_core)
+  add_test(NAME pad_input COMMAND test_pad)
+
   add_executable(test_sync_on_address tests/test_sync_on_address.cpp)
   target_link_libraries(test_sync_on_address PRIVATE prosper_core)
   add_test(NAME sync_on_address COMMAND test_sync_on_address)

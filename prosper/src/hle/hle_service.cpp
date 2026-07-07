@@ -1,7 +1,8 @@
-// hle_service.cpp — HLE of PS5 system services (user, NP/online, pad, mouse, app content,
+// hle_service.cpp — HLE of PS5 system services (user, NP/online, mouse, app content,
 // dialogs). Bring-up policy: openers return a valid positive handle; queries zero their
 // output struct and report a sane "not signed in / no device" state and success, so the
 // game gets consistent values instead of uninitialized memory.
+// (Game-controller input — libScePad — moved to hle_pad.cpp with a real host backend.)
 #include "dispatch.hpp"
 #include "nid.hpp"
 #include <cstdint>
@@ -33,12 +34,10 @@ HLE(s_np_reach)       { if (a1) *(int32_t*)PW(a1) = 0; return 0; }
 HLE(s_np_accountid)   { if (a1) *(uint64_t*)PW(a1) = 0; return 0; }
 HLE(s_np_country)     { if (a1) memset(PW(a1), 0, 4); return 0; }
 
-// --- pad / mouse (report a device that exists but has no input) ---
-HLE(s_open)           { return g_handle++; }                                 // scePadOpen/sceMouseOpen -> handle
-// Conservative output sizes so we don't smash a smaller caller buffer.
-HLE(s_pad_info)       { if (a1) memset(PW(a1), 0, 0x20); return 0; }          // controller info -> zeroed
-HLE(s_pad_read)       { if (a1) memset(PW(a1), 0, 0x30); return 0; }          // pad state -> neutral
-HLE(s_pad_readstate)  { if (a1) memset(PW(a1), 0, 0x30); return 0; }
+// --- mouse (report a device that exists but has no input; pad is handled in hle_pad.cpp) ---
+HLE(s_open)           { return g_handle++; }                                 // sceMouseOpen -> handle
+// Conservative output size so we don't smash a smaller caller buffer.
+HLE(s_pad_read)       { if (a1) memset(PW(a1), 0, 0x30); return 0; }          // mouse state -> neutral
 
 // --- app content ---
 HLE(s_appcontent_int) { if (a1) *(int32_t*)PW(a1) = 0; return 0; }
@@ -76,14 +75,7 @@ void register_service_hle() {
     R("sceNpGetAccountCountryA", s_np_country);
     R("sceNpCheckCallback", s_ok);
     R("sceNpRegisterStateCallback", s_ok);
-    // pad / mouse
-    R("scePadInit", s_ok);
-    R("scePadOpen", s_open);
-    R("scePadClose", s_ok);
-    R("scePadGetControllerInformation", s_pad_info);
-    R("scePadDeviceClassGetExtendedInformation", s_pad_info);
-    R("scePadReadState", s_pad_readstate);
-    R("scePadRead", s_pad_read);
+    // pad -> hle_pad.cpp (register_pad_hle). mouse:
     R("sceMouseInit", s_ok);
     R("sceMouseOpen", s_open);
     R("sceMouseRead", s_pad_read);
