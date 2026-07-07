@@ -252,3 +252,27 @@ and cannot be bypassed (stub → scene never activates). The fix requires identi
 initializer — either the `WorkerThread` ctor path (if main-thread) or a worker/preload thread's setup
 (a HW watch is per-thread, so a worker-thread writer would not appear in the main-thread watch above).
 This is Unity async-load engine internals; handing off with the exact field + backtrace + repro.
+
+### RESOLVED the type: `WorkerThread.field_0x40` is a null `System.Diagnostics.Stopwatch`
+
+`PROSPER_HWBP_GLOBAL=0x442302518` resolves the getter's declaring class from its class-global:
+**`name="Stopwatch"`**. So `WorkerThread.field_0x40` is a `System.Diagnostics.Stopwatch` instance that
+Unity's async loader uses to time each `AsyncRequest`, and it is null. Our timer HLE
+(`sceKernelGetProcessTimeCounter`, `clock_gettime`, `sceKernelReadTsc`) is implemented, so the Stopwatch
+*class* works — the *instance* is simply never created for this WorkerThread.
+
+`PROSPER_HWBP_FIELDS=1` dumps the WorkerThread object — it is **partially initialized**, NOT a raw
+uninitialized object:
+```
+WorkerThread @…: +0x10=0 +0x18=0 +0x20=<obj> +0x28=<obj> +0x30=<obj> +0x38=0 +0x40=0(Stopwatch) +0x48=<obj> +0x50=0 +0x58=0 +0x60=<obj>
+```
+Several fields hold real objects (its ctor ran); only the Stopwatch at +0x40 (and a few others) is null.
+So the Stopwatch is created **later than the ctor** — most likely lazily on first use, or in the worker
+thread's `Run()` (to time its own work). The main thread's PreloadManager integration reaches the timing
+loop and reads the Stopwatch **before** it is created → deterministic null deref.
+
+**Precise remaining fix (for whoever owns Unity async-load):** ensure `WorkerThread`'s Stopwatch (+0x40)
+is created before PreloadManager's main-thread integration times its AsyncRequests — i.e. the worker's
+`Run()`/lazy Stopwatch setup must complete first (a start-ordering / worker-not-yet-run condition), OR the
+timing path must tolerate a not-yet-started worker. New diagnostics on this branch: `PROSPER_HWBP_KLASS`,
+`PROSPER_HWBP_GLOBAL`, `PROSPER_HWBP_FIELDS`.

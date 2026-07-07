@@ -497,6 +497,20 @@ namespace {
                         rn, (unsigned long long)obj, (unsigned long long)klass, s,
                         (unsigned long long)(probe_readable(obj+0x40)?*(const uint64_t*)(obj+0x40):0)); write(2, b, n); }
                 };
+                // PROSPER_HWBP_FIELDS=1: dump rbx's object fields [0x10..0x60] + the class name of any
+                // field that is itself an object — to tell "whole object uninitialized (all null)" from
+                // "one specific field null".
+                if (getenv("PROSPER_HWBP_FIELDS")) {
+                    uint64_t o = (uint64_t)gr[REG_RBX];
+                    if (probe_readable(o + 0x60)) {
+                        char b[400]; int n = snprintf(b, sizeof b, "[hwbp-fields] rbx=0x%llx:", (unsigned long long)o);
+                        for (uint64_t off = 0x10; off <= 0x60; off += 8) {
+                            uint64_t v = *(const uint64_t*)(o + off);
+                            n += snprintf(b+n, sizeof b-n, " +0x%llx=0x%llx", (unsigned long long)off, (unsigned long long)v);
+                        }
+                        n += snprintf(b+n, sizeof b-n, "\n"); write(2, b, n);
+                    }
+                }
                 pklass("rbx", (uint64_t)gr[REG_RBX]); pklass("rdi", (uint64_t)gr[REG_RDI]);
                 pklass("rax", (uint64_t)gr[REG_RAX]); pklass("r14", (uint64_t)gr[REG_R14]);
                 // Also treat rdi as a raw Il2CppClass* (name @ +0x10) — for a bp inside a getter where a
@@ -513,6 +527,12 @@ namespace {
                         rn, (unsigned long long)klass, s); write(2, b, n); }
                 };
                 pcname("rdi(class)", (uint64_t)gr[REG_RDI]);
+                // PROSPER_HWBP_GLOBAL=0xADDR: also resolve the class name stored at a fixed guest global
+                // (the getter loads its declaring class from [0x442302515]); guest mem is 1:1-mapped.
+                if (const char* g = getenv("PROSPER_HWBP_GLOBAL")) {
+                    uint64_t ga = strtoull(g, nullptr, 0);
+                    if (probe_readable(ga + 7)) pcname("global", *(const uint64_t*)ga);
+                }
             }
             if (cond_ok && g_hwbp_r15_on) {
                 // The matching read: dump the window around rax (the source pointer) + classify its mapping,
