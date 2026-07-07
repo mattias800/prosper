@@ -62,6 +62,20 @@ void pad_fill_data(ScePadData* out, const HostPadState& s, uint64_t timestamp, u
     out->device_unique_data_len = 0;
 }
 
+// --- pluggable backend: default neutral (headless), plus the injector -----------------------------
+namespace {
+// The built-in backend: no host device. Reports a neutral, disconnected pad so the HLE contract is
+// fully defined with zero dependencies. A frontend replaces this via pad_set_backend().
+struct NeutralPadBackend : PadBackend {
+    bool poll(int /*index*/, HostPadState& out) override { out = HostPadState{}; return false; }
+};
+NeutralPadBackend g_neutral;
+PadBackend*       g_backend = &g_neutral;
+} // namespace
+
+void pad_set_backend(PadBackend* backend) { g_backend = backend ? backend : &g_neutral; }
+PadBackend* pad_backend() { return g_backend; }
+
 void pad_fill_controller_info(ScePadControllerInformation* out, bool connected, uint8_t connected_count) {
     if (!out) return;
     std::memset(out, 0, sizeof(*out));

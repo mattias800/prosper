@@ -172,6 +172,14 @@ if(TARGET prosper_core)
     add_executable(boot_trace tools/boot_trace/boot_trace.cpp)
     target_link_libraries(boot_trace PRIVATE prosper_core)
 
+    # Zero-dependency Linux evdev gamepad frontend (outside prosper_core). Always available on Linux;
+    # boot_trace installs it (gated by PROSPER_PAD) when the SDL3 gamepad frontend isn't built.
+    add_library(prosper_pad_evdev STATIC frontends/pad_evdev/pad_evdev.cpp)
+    target_include_directories(prosper_pad_evdev PUBLIC frontends/pad_evdev src)
+    target_link_libraries(prosper_pad_evdev PUBLIC prosper_core)
+    target_link_libraries(boot_trace PRIVATE prosper_pad_evdev)
+    target_compile_definitions(boot_trace PRIVATE PROSPER_PAD_EVDEV=1)
+
     add_executable(imgdump tools/imgdump/imgdump.cpp)
     target_link_libraries(imgdump PRIVATE prosper_core)
 
@@ -384,4 +392,66 @@ if(PROSPER_AUDIO_SDL3 AND TARGET prosper_core)
   endif()
 
   message(STATUS "SDL3 audio frontend enabled (prosper_audio_sdl3)")
+endif()
+
+# --- optional SDL3 gamepad frontend (headless core stays dependency-free) --------------------
+# The libScePad HLE is backend-agnostic (src/input/pad.hpp). This builds an SDL_Gamepad-backed
+# PadBackend, entirely OUTSIDE prosper_core, so a real controller drives the guest cross-platform.
+# Off by default.  Enable with:  -DPROSPER_PAD_SDL3=ON
+option(PROSPER_PAD_SDL3 "Build the optional SDL3 gamepad frontend" OFF)
+if(PROSPER_PAD_SDL3 AND TARGET prosper_core)
+  # Reuse an SDL3 already provided (system, or fetched by the audio frontend); else fetch + build it.
+  # Gamepad needs JOYSTICK + HIDAPI ON (the audio frontend builds SDL with them OFF, so a combined
+  # AUDIO+PAD build should configure with -DPROSPER_PAD_SDL3=ON so this block's options win).
+  if(NOT TARGET SDL3::SDL3)
+    find_package(SDL3 QUIET CONFIG)
+  endif()
+  if(NOT TARGET SDL3::SDL3)
+    message(STATUS "SDL3 not found on system — fetching release-3.2.30 (gamepad build)")
+    include(FetchContent)
+    set(SDL_TEST OFF CACHE BOOL "" FORCE)
+    set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+    set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+    set(SDL_STATIC ON CACHE BOOL "" FORCE)
+    # Headless-friendly: no windowing system required (we only read controller state).
+    set(SDL_UNIX_CONSOLE_BUILD ON CACHE BOOL "" FORCE)
+    set(SDL_VIDEO OFF CACHE BOOL "" FORCE)
+    set(SDL_WAYLAND OFF CACHE BOOL "" FORCE)
+    set(SDL_X11 OFF CACHE BOOL "" FORCE)
+    set(SDL_RENDER OFF CACHE BOOL "" FORCE)
+    set(SDL_GPU OFF CACHE BOOL "" FORCE)
+    set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
+    set(SDL_HAPTIC OFF CACHE BOOL "" FORCE)
+    set(SDL_SENSOR OFF CACHE BOOL "" FORCE)
+    set(SDL_POWER OFF CACHE BOOL "" FORCE)
+    set(SDL_DIALOG OFF CACHE BOOL "" FORCE)
+    # Gamepad support: these must be ON.
+    set(SDL_JOYSTICK ON CACHE BOOL "" FORCE)
+    set(SDL_HIDAPI ON CACHE BOOL "" FORCE)
+    FetchContent_Declare(SDL3
+      GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+      GIT_TAG release-3.2.30
+      GIT_SHALLOW TRUE)
+    FetchContent_MakeAvailable(SDL3)
+  endif()
+
+  add_library(prosper_pad_sdl3 STATIC frontends/pad_sdl3/pad_sink_sdl3.cpp)
+  target_include_directories(prosper_pad_sdl3 PUBLIC frontends/pad_sdl3 src)
+  target_link_libraries(prosper_pad_sdl3 PUBLIC prosper_core SDL3::SDL3)
+  target_compile_definitions(prosper_pad_sdl3 PUBLIC PROSPER_PAD_SDL3=1)
+
+  # Headless self-test of the full SDL3 gamepad path (no controller attached in CI): install the
+  # backend, poll -> disconnected/neutral, drive the pure mapping. Uses the SDL dummy video driver.
+  add_executable(test_pad_sdl3 frontends/pad_sdl3/test_pad_sdl3.cpp)
+  target_link_libraries(test_pad_sdl3 PRIVATE prosper_pad_sdl3)
+  add_test(NAME pad_sdl3 COMMAND test_pad_sdl3)
+  set_tests_properties(pad_sdl3 PROPERTIES ENVIRONMENT "SDL_VIDEO_DRIVER=dummy;SDL_AUDIO_DRIVER=dummy")
+
+  if(TARGET boot_trace)
+    target_link_libraries(boot_trace PRIVATE prosper_pad_sdl3)
+    target_compile_definitions(boot_trace PRIVATE PROSPER_PAD_SDL3=1)
+  endif()
+
+  message(STATUS "SDL3 gamepad frontend enabled (prosper_pad_sdl3)")
 endif()

@@ -123,14 +123,25 @@ void pad_fill_controller_info(ScePadControllerInformation* out, bool connected, 
 // Normalize a raw axis reading in [min,max] to the Sony 0..255 range (clamped).
 uint8_t pad_axis_u8(int raw, int min, int max);
 
-// ---- Host backend (platform-specific; see pad_evdev.cpp) --------------------------------------
+// ---- Pluggable host backend (mirrors AudioSink / audio_set_sink) -------------------------------
+//
+// prosper_core is HEADLESS: it ships a default backend that reports a neutral, disconnected pad, so
+// the HLE contract is fully defined with no dependencies and is unit-testable. A concrete host
+// backend (SDL3 gamepad, or the zero-dep Linux evdev reader) lives OUTSIDE prosper_core, under
+// frontends/, and installs itself via pad_set_backend() from the harness (boot_trace). This keeps
+// prosper_core free of any host-input / device code, and makes a future libretro core trivial — it
+// installs its own backend that reads retro_input_state_t instead of touching /dev/input.
+struct PadBackend {
+    virtual ~PadBackend() = default;
+    // Poll controller `index` (0-based) into `out`. Return true if a physical device is present
+    // (and out.connected/state are filled); false if none (leave `out` neutral/disconnected).
+    // Called on the guest's input-polling thread; implementations must be thread-safe.
+    virtual bool poll(int index, HostPadState& out) = 0;
+};
 
-// True if a real input backend is compiled in for this platform (Linux evdev). When false,
-// pad_backend_poll always reports "no device".
-bool pad_backend_available();
-
-// Poll controller `index` (0-based) into `out`. Opens the device lazily on first call. Sets
-// out.connected=false and leaves neutral values if no device is present. Thread-safe.
-void pad_backend_poll(int index, HostPadState& out);
+// Install a backend. Non-owning; pass nullptr to restore the built-in neutral/disconnected default.
+void pad_set_backend(PadBackend* backend);
+// The active backend (never null — the neutral default is returned when none is installed).
+PadBackend* pad_backend();
 
 } // namespace prosper::input

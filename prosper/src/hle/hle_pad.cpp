@@ -1,14 +1,17 @@
 // hle_pad.cpp — libScePad HLE: real game-controller input.
 //
 // Replaces the earlier zero-filling pad stubs (hle_service.cpp) with a correct ScePadData/
-// ScePadControllerInformation contract backed by a host controller (Linux evdev; see input/pad.cpp).
+// ScePadControllerInformation contract. Input comes from a pluggable PadBackend (input/pad.hpp):
+// prosper_core's default is neutral/disconnected, and a host frontend (SDL3 gamepad or Linux evdev,
+// under frontends/) installs itself from the harness — so this file, and all of prosper_core, is
+// free of host-device code and fully unit-testable.
 //
-// Gating: live host input is behind PROSPER_PAD=1 so the default boot stays deterministic (no
-// nondeterministic device state in ctest / headless runs) — exactly the project's gated-switch
-// policy (cf. PROSPER_RENDER, PROSPER_GUEST_FS). With the gate off, the pad reports a valid but
-// disconnected/neutral state (identical observable behavior to the old stub, but now filling the
-// FULL 120-byte struct instead of only 48 bytes — the old stub left connected/timestamp/count
-// uninitialized). CONFIDENCE: HIGH (contract), MED (which titles gate on `connected`).
+// This also fixes a latent stub bug: the old scePadReadState wrote only 48 of the 120-byte struct,
+// leaving connected/timestamp/count uninitialized. The full struct is now filled.
+//
+// Diagnostics: PROSPER_PADLOG traces calls; PROSPER_PAD_PRESS injects a connected pad with CROSS
+// held (hardware-free way to drive a "Press [button]" screen / verify the full path). CONFIDENCE:
+// HIGH (contract), MED (which titles gate on `connected`).
 #include "dispatch.hpp"
 #include "nid.hpp"
 #include "../input/pad.hpp"
@@ -30,11 +33,6 @@ namespace {
 
 std::atomic<int> g_pad_handle{1};
 
-bool live_input() {
-    static const bool on = (getenv("PROSPER_PAD") != nullptr) && pad_backend_available();
-    return on;
-}
-
 // PROSPER_PADLOG=1: trace pad calls (rate-limited) so a boot run shows the game polling input.
 bool padlog() { static const bool on = getenv("PROSPER_PADLOG") != nullptr; return on; }
 void padlog_once(const char* what, const HostPadState* s) {
@@ -54,12 +52,17 @@ uint64_t now_us() {
     return (uint64_t)duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
-// Snapshot the host controller for a given pad handle. Off the live path, returns a neutral,
-// disconnected pad (centered sticks, no buttons) — matching the pre-existing "device exists but no
-// input" bring-up behavior, now with a fully-formed struct.
+// Snapshot the controller for a given pad handle via the installed backend. With no host frontend
+// installed, prosper_core's default backend reports a neutral, disconnected pad (fully-formed
+// struct). PROSPER_PAD_PRESS overrides with a synthetic connected pad (CROSS held) for hardware-free
+// end-to-end testing — a device-independent successor to the old stub's inline press injection.
 HostPadState snapshot(int /*handle*/, const char* what) {
     HostPadState s;   // neutral, disconnected by default
-    if (live_input()) pad_backend_poll(0, s);
+    pad_backend()->poll(0, s);
+    if (getenv("PROSPER_PAD_PRESS")) {
+        s.connected = true;
+        s.buttons  |= SCE_PAD_BUTTON_CROSS;
+    }
     padlog_once(what, &s);
     return s;
 }
