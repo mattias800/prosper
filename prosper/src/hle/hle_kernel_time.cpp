@@ -192,6 +192,22 @@ HLE(k_eq_wait)   {   // (eq, SceKernelEvent* ev, int num, int* out, SceKernelUse
         (unsigned long long)((uint64_t)__builtin_return_address(0) - 0x400000000ull));
     // PROSPER_WAITCALLER: scan the stack for the GAME's wait-loop return address (eboot code range,
     // NOT the stub region at 0x6..) so we can disassemble the loop's exit condition. Log once per eq.
+    // PROSPER_DUMPCODE=<hex eboot offset>[,<off2>...]: dump 224 code bytes at each (guest memory is mapped),
+    // so a game function reached from the wait loop can be disassembled offline. Runs once.
+    if (const char* dc = getenv("PROSPER_DUMPCODE")) {
+        static std::atomic<int> once{0};
+        if (once.fetch_add(1) == 0) {
+            const char* p = dc;
+            while (*p) {
+                uint64_t off = strtoull(p, nullptr, 16);
+                const uint8_t* code = (const uint8_t*)(uintptr_t)(0x400000000ull + off);
+                fprintf(stderr, "[dumpcode] eboot+0x%llx:", (unsigned long long)off);
+                for (int b = 0; b < 224; b++) fprintf(stderr, "%02x", code[b]);
+                fprintf(stderr, "\n");
+                const char* c = strchr(p, ','); if (!c) break; p = c + 1;
+            }
+        }
+    }
     if (getenv("PROSPER_WAITCALLER")) {
         static std::atomic<int> shown{0};
         if (shown.fetch_add(1) < 4) {
