@@ -564,8 +564,23 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     // Stage A: if a live renderer has been registered (runtime binary wires a Vulkan device) and this
     // submit accumulated draws, execute the folded GpuState and present the frame. Inert (returns false)
     // on the pure-HLE path until a device is registered, so it never perturbs the existing boot behavior.
-    if (gpu::have_submit_renderer() && !agc_gpu_state().draws.empty()) {
+    // PROSPER_RENDER_EVERY=K: render only every Kth draw-carrying submit (default 1). Under llvmpipe a
+    // 1080p render is ~10-20 s and execute_and_present is SYNCHRONOUS here, throttling the frame loop to
+    // a crawl — so a distant scene (the cutscene, thousands of frames in) would take hours. Sampling
+    // keeps the game running near full speed while still producing periodic frames of the live scene.
+    static const unsigned render_every = [] {
+        const char* e = getenv("PROSPER_RENDER_EVERY"); long v = e ? atol(e) : 1; return v > 0 ? (unsigned)v : 1u; }();
+    static unsigned draw_submits = 0;
+    if (gpu::have_submit_renderer() && !agc_gpu_state().draws.empty() && (draw_submits++ % render_every) == 0) {
         uint32_t w = gpu::present_width(), h = gpu::present_height();
+        // PROSPER_RENDER_SCALE=N: render at 1/N resolution. execute_and_present is SYNCHRONOUS on the
+        // guest submit thread; a full 1080p llvmpipe render blocks it ~15 s, and while it is blocked in
+        // host Vulkan the guest GC's stop-the-world can't get its ack -> the collection races and aborts
+        // ("Unexpected state"), so the game crashes long before reaching a distant scene. A 1/4 render
+        // (~1 s) shrinks that window enough to run deep into the cutscene while still capturing a frame.
+        static const uint32_t scale = [] {
+            const char* e = getenv("PROSPER_RENDER_SCALE"); long v = e ? atol(e) : 1; return v > 0 ? (uint32_t)v : 1u; }();
+        if (scale > 1) { w = (w / scale) & ~1u; h = (h / scale) & ~1u; if (!w) w = 2; if (!h) h = 2; }
         bool presented = gpu::execute_and_present(agc_gpu_state(), w, h);
         if (presented && getenv("PROSPER_GFXLOG"))
             fprintf(stderr, "[agc] SubmitDcb #%llu: executed %zu draws -> presented %ux%u frame\n",
