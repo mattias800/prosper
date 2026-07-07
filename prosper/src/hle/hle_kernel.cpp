@@ -228,7 +228,17 @@ HLE(k_attr_getstacksize) {
 }
 // scePthreadAttrGetaffinity(attr, SceKernelCpumask* mask): report all 8 PS5 cores available.
 // Returning 0 (the old stub) yields an EMPTY mask -> the guest may conclude no CPUs are usable.
-HLE(k_attr_getaffinity) { if (a1) *(uint64_t*)(uintptr_t)a1 = 0xff; return 0; }
+// PROSPER_ONE_CPU (default off): report a SINGLE core (0x01). Unity sizes its job-system worker
+// pool from the available-core mask; a 1-core mask makes it run jobs on the main thread instead of
+// spawning ~8 worker threads. That eliminates the async-load thread races (e.g. a WorkerThread whose
+// Stopwatch/+0x40 isn't created yet when the main thread times it — see docs/CUTSCENE_PROGRESSION.md).
+// CONFIDENCE: MED — the mask→worker-count coupling is the standard Unity behavior; gated so default
+// boot (0xff) is unchanged.
+HLE(k_attr_getaffinity) {
+    static const bool one = getenv("PROSPER_ONE_CPU") != nullptr;
+    if (a1) *(uint64_t*)(uintptr_t)a1 = one ? 0x01 : 0xff;
+    return 0;
+}
 
 // --- thread creation: run the guest entry on a real host thread (ABI matches) ---
 // We give each worker a stack we allocate and TRACK, so GC/thread-stack queries get
