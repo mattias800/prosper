@@ -127,7 +127,9 @@ int main(int argc, char** argv) {
             char* end = nullptr; uint64_t a = strtoull(s, &end, 0);
             if (a && end != s) { *(volatile uint8_t*)(uintptr_t)a = 0xC3;
                 fprintf(stderr, "[patch] ret @ 0x%llx\n", (unsigned long long)a); }
-            s = (end && *end == ',') ? end + 1 : (end ? end : s + 1);
+            // Always make progress: skip the comma if present, else advance past what we parsed; if
+            // strtoull consumed nothing (end == s, malformed) step one char so we never spin forever.
+            s = (*end == ',') ? end + 1 : (end != s) ? end : s + 1;
         }
     }
     // PROSPER_PATCH_BYTE=addr=val[,addr=val...]: write an arbitrary byte at a guest address (finer than
