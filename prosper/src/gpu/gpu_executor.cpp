@@ -152,11 +152,11 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     }
                     default: ok = false; break;                            // SCC-dependent / unmodeled -> unknown
                 }
-                // Every SOP2 ALU op except s_cselect writes SCC to a value we don't track here — invalidate so a
-                // later s_cselect only trusts SCC set by an immediately-preceding s_cmp.
-                if (trc && in.pc < 170 && (d == 60 || d == 62 || d == 63 || d == 106 || d == 107 || d == 11))
+                if (trc)   // unfiltered like the SMEM/MUBUF traces (one shader walk — volume is bounded)
                     fprintf(stderr, "[dyntrace]   SOP2 pc=%u op=0x%x dst=s%d src0=%d(k%d) src1=%d(k%d) ok=%d r=0x%x\n",
                             in.pc, in.opcode, d, in.src[0].value, ka, in.src[1].value, kc, ok, r);
+                // Every SOP2 ALU op except s_cselect writes SCC to a value we don't track here — invalidate so a
+                // later s_cselect only trusts SCC set by an immediately-preceding s_cmp.
                 if (in.opcode != 0x0A) scc = -1;
                 if (ok) { val[d] = r; if (wrote_pair) val[d + 1] = hi64; }
                 // A 64-bit-dst op (s_bfe_u64) invalidates BOTH dwords even when its sources were
