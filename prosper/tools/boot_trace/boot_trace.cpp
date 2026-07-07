@@ -123,6 +123,20 @@ int main(int argc, char** argv) {
                             size_t nb = (size_t)tw * th * 4;
                             texstore.emplace_back(nb, 0x00);
                             if (readable(r.gpu_addr, nb)) std::memcpy(texstore.back().data(), (const void*)(uintptr_t)r.gpu_addr, nb);
+                            // PROSPER_TESTTEX: overwrite with a recognizable gradient/checker to prove the
+                            // sample path (the game's real render-target texture is empty until we execute
+                            // the scene draws that fill it).
+                            if (getenv("PROSPER_TESTTEX")) {
+                                for (uint32_t y = 0; y < th; y++) for (uint32_t x = 0; x < tw; x++) {
+                                    uint8_t* p = &texstore.back()[((size_t)y * tw + x) * 4];
+                                    bool ck = ((x / 64) ^ (y / 64)) & 1;
+                                    p[0] = (uint8_t)(255 * x / tw); p[1] = (uint8_t)(255 * y / th);
+                                    p[2] = ck ? 200 : 40; p[3] = 255;
+                                }
+                            }
+                            if (getenv("PROSPER_GFXLOG")) { const uint8_t* b = texstore.back().data();
+                                size_t nz = 0; for (size_t i = 0; i < nb && i < (1u<<16); i++) nz += (b[i] != 0);
+                                fprintf(stderr, "[render] tex binding=%u %ux%u first64k-nonzero=%zu\n", r.binding, tw, th, nz); }
                             fr.tex_rgba = texstore.back().data(); fr.tw = tw; fr.th = th;
                         } else {
                             uint32_t nb = std::min(r.size ? r.size : 256u, 1u << 20);   // cap 1 MB
