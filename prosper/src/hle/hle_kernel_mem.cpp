@@ -38,11 +38,56 @@ namespace {
     struct Mapping { uint64_t base, size; int prot; bool committed; char name[32]; };
     std::mutex g_mx;
     std::vector<Mapping> g_maps;
-    std::atomic<uint64_t> g_dmem_off{0x10000000};   // "physical" bump allocator
-    // Direct ("physical") memory allocations, for sceKernelDirectMemoryQuery.
+    // Direct ("physical") memory: a bump allocator over a FINITE pool. The pool size is what
+    // sceKernelGetDirectMemorySize advertises, and exhaustion MUST fail with ENOMEM like real
+    // hardware: guests rely on it — UE4 (PPSA17942) sizes its pool requests from
+    // GetDirectMemorySize and allocates chunks in a loop until ENOMEM ends it. A never-failing
+    // allocator handed out offsets past the pool, the guest's 512GB-arena block bitmap indexed
+    // out of range, and user_malloc_init crashed on the bitmap read.
+    constexpr uint64_t kDmemBase  = 0x10000000;
+    constexpr uint64_t kDmemTotal = 8ull * 1024 * 1024 * 1024;   // 8 GiB pool
+    // Direct ("physical") memory allocations, kept SORTED by start (first-fit allocation walks the
+    // gaps). Also serves sceKernelDirectMemoryQuery.
     struct DMem { uint64_t start, end; int type; };
     std::mutex g_dmx;
     std::vector<DMem> g_dmem;
+
+    // Claim `sz` bytes of direct memory at `align` (first-fit over the pool's free gaps). False (no
+    // state change) when nothing fits — callers translate that to SCE_KERNEL_ERROR_ENOMEM
+    // (0x8002000C, Kyty Errno.h). First-fit (not bump) because guests genuinely RELEASE ranges:
+    // UE4 (PPSA17942) probes the pool full with halving allocations, releases the probes, then
+    // allocates its real pools — a bump cursor would be permanently exhausted.
+    bool dmem_take(uint64_t sz, uint64_t align, int type, uint64_t& off_out) {
+        if (!align) align = 0x4000;
+        std::lock_guard<std::mutex> lk(g_dmx);
+        uint64_t cursor = kDmemBase;
+        size_t insert_at = 0;
+        for (size_t i = 0; i <= g_dmem.size(); i++) {
+            uint64_t gap_end = (i < g_dmem.size()) ? g_dmem[i].start : kDmemBase + kDmemTotal;
+            uint64_t off = (cursor + align - 1) & ~(align - 1);
+            if (off + sz <= gap_end) { insert_at = i; off_out = off; goto found; }
+            if (i < g_dmem.size()) cursor = g_dmem[i].end;
+        }
+        return false;
+    found:
+        g_dmem.insert(g_dmem.begin() + insert_at, { off_out, off_out + sz, type });
+        return true;
+    }
+
+    // Release [start, start+len): remove or trim every overlapping allocation (kernel semantics —
+    // the range is freed regardless of how it was carved into allocations).
+    void dmem_release(uint64_t start, uint64_t len) {
+        uint64_t end = start + len;
+        std::lock_guard<std::mutex> lk(g_dmx);
+        std::vector<DMem> out;
+        out.reserve(g_dmem.size());
+        for (auto& d : g_dmem) {
+            if (d.end <= start || d.start >= end) { out.push_back(d); continue; }
+            if (d.start < start) out.push_back({ d.start, start, d.type });
+            if (d.end > end)     out.push_back({ end, d.end, d.type });
+        }
+        g_dmem.swap(out);
+    }
 
     void track(uint64_t base, uint64_t size, int prot, bool committed, const char* nm) {
         std::lock_guard<std::mutex> lk(g_mx);
@@ -146,8 +191,11 @@ HLE(k_map_flexible) {
 HLE(k_alloc_dmem) {
     uint64_t align = a3 ? a3 : 0x4000;
     uint64_t sz = align_up(a2, align);
-    uint64_t off = align_up(g_dmem_off.fetch_add(sz), align);
-    { std::lock_guard<std::mutex> lk(g_dmx); g_dmem.push_back({ off, off + sz, (int)a4 }); }
+    uint64_t off;
+    if (!dmem_take(sz, align, (int)a4, off)) {
+        MLOG("alloc_dmem len=0x%llx -> ENOMEM (pool exhausted)\n", (unsigned long long)a2);
+        return 0x8002000Cull;   // SCE_KERNEL_ERROR_ENOMEM
+    }
     if (a5 > 0xffff) *(uint64_t*)a5 = off;   // only write through a plausible out-pointer
     MLOG("alloc_dmem len=0x%llx -> phys=0x%llx\n", (unsigned long long)a2, (unsigned long long)off);
     return 0;
@@ -159,8 +207,11 @@ HLE(k_alloc_dmem) {
 HLE(k_alloc_main_dmem) {
     uint64_t align = a1 ? a1 : 0x4000;
     uint64_t sz = align_up(a0, align);
-    uint64_t off = align_up(g_dmem_off.fetch_add(sz), align);
-    { std::lock_guard<std::mutex> lk(g_dmx); g_dmem.push_back({ off, off + sz, (int)a2 }); }
+    uint64_t off;
+    if (!dmem_take(sz, align, (int)a2, off)) {
+        MLOG("alloc_main_dmem len=0x%llx -> ENOMEM (pool exhausted)\n", (unsigned long long)a0);
+        return 0x8002000Cull;   // SCE_KERNEL_ERROR_ENOMEM
+    }
     if (a3 > 0xffff) *(uint64_t*)a3 = off;
     MLOG("alloc_main_dmem len=0x%llx -> phys=0x%llx\n", (unsigned long long)a0, (unsigned long long)off);
     return 0;
@@ -323,7 +374,16 @@ HLE(k_wake_by_address) {
 
 HLE(k_munmap)   { if (a0) munmap((void*)a0, a1); return 0; }
 HLE(k_mprotect) { if (a0) mprotect((void*)a0, a1, host_prot(a2)); return 0; }
-HLE(k_dmem_size){ return 8ull * 1024 * 1024 * 1024; }   // 8 GiB pool
+HLE(k_dmem_size){ return kDmemTotal; }   // 8 GiB pool (allocation failures enforce this bound)
+
+// sceKernelReleaseDirectMemory(off_t start, size_t len) — return a range to the pool. Any VA still
+// mapped to it is the guest's problem (same as the real kernel); UE4 releases only unmapped probe
+// allocations here.
+HLE(k_release_dmem) {
+    dmem_release(a0, a1);
+    MLOG("release_dmem [0x%llx,0x%llx)\n", (unsigned long long)a0, (unsigned long long)(a0 + a1));
+    return 0;
+}
 
 void register_kernel_mem_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
@@ -336,6 +396,8 @@ void register_kernel_mem_hle() {
     R("sceKernelMapNamedDirectMemory", k_map_dmem);
     R("sceKernelMunmap", k_munmap);
     R("sceKernelMprotect", k_mprotect);
+    R("sceKernelReleaseDirectMemory", k_release_dmem);
+    R("sceKernelCheckedReleaseDirectMemory", k_release_dmem);
     R("sceKernelVirtualQuery", k_virtual_query);
     R("sceKernelDirectMemoryQuery", k_direct_memory_query);
     R("sceKernelGetDirectMemorySize", k_dmem_size);
