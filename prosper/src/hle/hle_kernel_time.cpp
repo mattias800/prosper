@@ -103,6 +103,10 @@ namespace {
     struct SceKEvent { int64_t ident; int16_t filter; uint16_t flags; uint32_t fflags; int64_t data; uint64_t udata; };
     // PS5 filter ids (negative, FreeBSD-style). VideoOut flip/vblank use the DISPLAY filter family.
     constexpr int16_t EVFILT_VIDEO_OUT = -0x0a;   // SCE VideoOut event filter (flip + vblank)
+    // VideoOut event idents (Kyty VideoOut.cpp:34): the kevent's ident names the EVENT KIND, not the
+    // videoout handle. A flip event's data is the completed flip's flipArg (Kyty
+    // flip_event_trigger_func) — the game compares it against the arg it submitted.
+    constexpr int64_t VIDEO_OUT_EVENT_FLIP = 0, VIDEO_OUT_EVENT_VBLANK = 1;
 
     struct EqState { std::mutex m; std::condition_variable cv; std::deque<SceKEvent> ready; };
     std::mutex g_eq_mx;
@@ -133,10 +137,15 @@ namespace {
         for (;;) {
             struct timespec ts{ 0, 16666667 }; nanosleep(&ts, nullptr);   // ~60 Hz
             frame++;
-            std::vector<FlipReg> fr, vr;
-            { std::lock_guard<std::mutex> lk(g_eq_mx); fr = g_flip_regs; vr = g_vblank_regs; }
-            for (auto& r : vr) { SceKEvent e{}; e.ident = r.ident; e.filter = EVFILT_VIDEO_OUT; e.data = (int64_t)frame; e.udata = r.udata; eq_post(r.eq, e); }
-            for (auto& r : fr) { SceKEvent e{}; e.ident = r.ident; e.filter = EVFILT_VIDEO_OUT; e.data = (int64_t)frame; e.udata = r.udata; eq_post(r.eq, e); }
+            std::vector<FlipReg> vr;
+            { std::lock_guard<std::mutex> lk(g_eq_mx); vr = g_vblank_regs; }
+            // Vblank ticks are periodic by nature — pump them. FLIP events are NOT pumped: a flip
+            // event fires when a submitted flip completes (prosper_eq_trigger_flip below), carrying
+            // that flip's flipArg in `data`. The old timer-driven flip event carried a frame counter
+            // — the game compared it against its submitted flipArg (top-bit-set values like
+            // 0x8000000000000001), never saw its flip complete, and re-waited forever.
+            for (auto& r : vr) { SceKEvent e{}; e.ident = VIDEO_OUT_EVENT_VBLANK; e.filter = EVFILT_VIDEO_OUT;
+                                 e.fflags = 1; e.data = (int64_t)frame; e.udata = r.udata; eq_post(r.eq, e); }
             // PROSPER_PUMP_USEREV: heartbeat-fire registered user events. Some engines run a worker thread
             // that blocks on a user event (Unity's FTM queue: user event id=999) waiting for the producer
             // to signal work; if the producer path isn't reached, that thread starves and the game idles.
@@ -154,6 +163,18 @@ namespace {
 void prosper_eq_add_flip(uint64_t eq, int64_t ident, uint64_t udata) {
     { std::lock_guard<std::mutex> lk(g_eq_mx); g_flip_regs.push_back({ eq, ident, udata }); }
     ensure_pump();
+}
+// Fire the flip-completion event on every registered flip equeue — called by BOTH flip paths
+// (sceVideoOutSubmitFlip and the in-stream Dcb SetFlip) at the flip moment. Kevent shape per Kyty
+// flip_event_trigger_func: ident=VIDEO_OUT_EVENT_FLIP, data=the completed flip's flipArg.
+void prosper_eq_trigger_flip(int64_t flip_arg) {
+    std::vector<FlipReg> regs;
+    { std::lock_guard<std::mutex> lk(g_eq_mx); regs = g_flip_regs; }
+    for (auto& r : regs) {
+        SceKEvent e{}; e.ident = VIDEO_OUT_EVENT_FLIP; e.filter = EVFILT_VIDEO_OUT;
+        e.fflags = 1; e.data = flip_arg; e.udata = r.udata;
+        eq_post(r.eq, e);
+    }
 }
 void prosper_eq_add_vblank(uint64_t eq, int64_t ident, uint64_t udata) {
     { std::lock_guard<std::mutex> lk(g_eq_mx); g_vblank_regs.push_back({ eq, ident, udata }); }
