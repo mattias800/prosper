@@ -353,3 +353,11 @@ completion, (C) cutscene draw render-target (color0_base==0) once the scene acti
 park). This is the final localized layer; it needs deep RE of the async-load thread coordination
 (.NET Semaphore/EventWaitHandle wakeups) or the SerializedFile CachedReader slot behavior under our
 threading — the same *class* as #42 (a sync primitive not behaving), one level up in the .NET threading stack.
+
+### Single-core test: block-966 stall is DETERMINISTIC (not a concurrency/lost-wakeup race)
+`taskset -c 0` (all threads serialized) still stalls at 696 unique blocks — identical to multi-core. So the
+block-966 deser loop is deterministic and independent of true parallelism / wakeup timing. Combined with
+the earlier results (independent of Stopwatch value too), this is a **structural main-thread deserializer
+loop** on the object at block 966 — not a race, not a lost-wakeup, not the Stopwatch. The remaining fix
+needs deep RE of the game's SerializedFile/CachedReader object-read path (why it re-reads blocks
+727/961/966 for a well-formed object in our environment) — a multi-hour guest-deser investigation.
