@@ -509,6 +509,22 @@ namespace {
                             n += snprintf(b+n, sizeof b-n, " +0x%llx=0x%llx", (unsigned long long)off, (unsigned long long)v);
                         }
                         n += snprintf(b+n, sizeof b-n, "\n"); write(2, b, n);
+                        // Resolve the class name of each object-typed field (its [obj]->klass->[+0x10]=name).
+                        for (uint64_t off = 0x10; off <= 0x88; off += 8) {
+                            if (!probe_readable(o + off + 7)) continue;
+                            uint64_t v = *(const uint64_t*)(o + off);
+                            if (v < 0x1000 || !probe_readable(v + 7)) continue;
+                            uint64_t klass = *(const uint64_t*)v;
+                            if (!probe_readable(klass + 0x17)) continue;
+                            uint64_t namep = *(const uint64_t*)(klass + 0x10);
+                            if (!probe_readable(namep)) continue;
+                            char s[64]; size_t k = 0;
+                            for (; k < 56 && probe_readable(namep + k); ++k) { char c = *(const char*)(namep + k);
+                                if (c == 0) break; if (c < 0x20 || c > 0x7e) { k = 0; break; } s[k] = c; }
+                            s[k] = 0;
+                            if (k >= 2) { char fb[128]; int fn = snprintf(fb, sizeof fb,
+                                "[hwbp-field] +0x%llx -> %s\n", (unsigned long long)off, s); write(2, fb, fn); }
+                        }
                     }
                 }
                 pklass("rbx", (uint64_t)gr[REG_RBX]); pklass("rdi", (uint64_t)gr[REG_RDI]);
