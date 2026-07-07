@@ -27,7 +27,7 @@ static ResolvedPipelineState resolve_for(uint32_t target_mask) {
     namespace P = prosper::agc::Pm4;
     GpuState st;
     // VGT_PRIMITIVE_TYPE.PRIM_TYPE = 4 (triangle list). Field is at bit 0 for PRIM_TYPE.
-    st.cx[P::VGT_PRIMITIVE_TYPE] = 4;
+    st.uc[P::VGT_PRIMITIVE_TYPE] = 4;
     st.cx[P::CB_TARGET_MASK]     = target_mask;
     return resolve_pipeline_state(extract_render_state(st));
 }

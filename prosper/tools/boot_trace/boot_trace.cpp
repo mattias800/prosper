@@ -137,6 +137,15 @@ int main(int argc, char** argv) {
                 if (dn >= 0) close(dn);
                 if (getenv("PROSPER_GFXLOG")) { fprintf(stderr, "[render] binding %zu resources (draw %u verts)\n",
                     R.size(), draw_vcount); fflush(stderr); }
+                // PROSPER_RENDER_REFVS: replace the game's (intricate) vertex shader with a known-good
+                // fullscreen-triangle VS that exports uv in [0,1] across the screen (location 1) + white
+                // (location 0). Paired with the game's REAL pixel shader + texture, this shows the game's
+                // actual composited texture — isolating the VS from the rest of the pipeline.
+                std::vector<uint32_t> vs_use = vs; uint32_t vcount_use = draw_vcount;
+                if (getenv("PROSPER_RENDER_REFVS")) {
+                    #include "refvs.inc"
+                    vs_use.assign(kRefVs, kRefVs + sizeof(kRefVs) / 4); vcount_use = 3;
+                }
                 // PROSPER_RENDER_TESTPS: replace the real pixel shader with a solid MAGENTA one (recompiled
                 // from a tiny RDNA2 EXP blob) to isolate VS geometry from PS shading — if the VS positions
                 // are on-screen, magenta triangles appear regardless of the texture/PS math.
@@ -147,8 +156,15 @@ int main(int argc, char** argv) {
                     auto m = prosper::gpu::recompile_fragment(kMagentaPs, sizeof(kMagentaPs) / 4, nullptr);
                     if (!m.empty()) fs_use = m;
                 }
-                std::vector<uint8_t> px = prosper::test::render_triangle_rgba(vs, fs_use, w, h, &ps,
-                    nullptr, nullptr, nullptr, R.empty() ? nullptr : &R, draw_vcount);
+                if (getenv("PROSPER_GFXLOG")) fprintf(stderr,
+                    "[render] ps: topo=%u fmt=%u depth(test=%d write=%d op=%u) blend(en=%d src=%u dst=%u op=%u) mask=0x%x\n",
+                    ps.topology, ps.color0_format, ps.depth_test_enable, ps.depth_write_enable, ps.depth_compare_op,
+                    ps.blend_enable, ps.src_color_blend_factor, ps.dst_color_blend_factor, ps.color_blend_op, ps.color_write_mask);
+                // PROSPER_RENDER_NOPS: bypass the game's resolved pipeline state (default state instead) to
+                // isolate whether blend/depth/color-mask is discarding the fragments.
+                const prosper::gpu::ResolvedPipelineState* ps_use = getenv("PROSPER_RENDER_NOPS") ? nullptr : &ps;
+                std::vector<uint8_t> px = prosper::test::render_triangle_rgba(vs_use, fs_use, w, h, ps_use,
+                    nullptr, nullptr, nullptr, R.empty() ? nullptr : &R, vcount_use);
                 int n = frame_no++;
                 if (px.empty()) {
                     fprintf(stderr, "[render] frame %d: Vulkan render FAILED (%ux%u)\n", n, w, h);

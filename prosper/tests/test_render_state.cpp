@@ -31,8 +31,9 @@ int main() {
     register_builtin_hle();
     auto setcx = Hle::lookup("ZvwO9euwYzc");   // SetCxRegistersIndirect
     auto setsh = Hle::lookup("-HOOCn0JY48");   // SetShRegistersIndirect
-    CHECK(setcx && setsh, "AGC Dcb builders registered");
-    if (!(setcx && setsh)) { printf("== FAIL ==\n"); return 1; }
+    auto setuc = Hle::lookup("hvUfkUIQcOE");   // SetUcRegistersIndirect (VGT_PRIMITIVE_TYPE is uconfig)
+    CHECK(setcx && setsh && setuc, "AGC Dcb builders registered");
+    if (!(setcx && setsh && setuc)) { printf("== FAIL ==\n"); return 1; }
 
     // Context registers: color target base(+ext), color info(format), prim type, depth/blend/mask.
     ShaderReg cx_regs[] = {
@@ -40,7 +41,6 @@ int main() {
         { P::CB_COLOR0_BASE_EXT, 0x00000012u },
         // CB_COLOR0_INFO: FORMAT=0xA (bits[6:2]) | NUMBER_TYPE=6/SRGB (bits[10:8]) | COMP_SWAP=1/BGRA (bits[12:11])
         { P::CB_COLOR0_INFO,     (0x0Au << 2) | (6u << 8) | (1u << 11) },
-        { P::VGT_PRIMITIVE_TYPE, 0x00000004u },   // PRIM_TYPE = 4
         // DB_DEPTH_CONTROL: Z_ENABLE(bit1)|Z_WRITE_ENABLE(bit2)|ZFUNC=4(bits[6:4]) = 0x46
         { P::DB_DEPTH_CONTROL,   0x00000046u },
         { P::CB_COLOR_CONTROL,   0x00CC0010u },
@@ -57,8 +57,10 @@ int main() {
     uint32_t buffer[256]; memset(buffer, 0, sizeof buffer);
     Dcb dcb{}; dcb.bottom = buffer; dcb.top = buffer + 256; dcb.cursor_up = buffer; dcb.cursor_down = buffer + 256;
     auto D = (uint64_t)(uintptr_t)&dcb;
+    ShaderReg uc_regs[] = { { P::VGT_PRIMITIVE_TYPE, 0x00000004u } };   // PRIM_TYPE = 4 (uconfig register)
     setcx(D, (uint64_t)(uintptr_t)cx_regs, sizeof(cx_regs)/sizeof(cx_regs[0]), 0, 0, 0);
     setsh(D, (uint64_t)(uintptr_t)sh_regs, sizeof(sh_regs)/sizeof(sh_regs[0]), 0, 0, 0);
+    setuc(D, (uint64_t)(uintptr_t)uc_regs, sizeof(uc_regs)/sizeof(uc_regs[0]), 0, 0, 0);
 
     GpuState st;
     run_command_buffer(buffer, 256, st);

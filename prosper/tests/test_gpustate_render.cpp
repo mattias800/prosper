@@ -46,7 +46,7 @@ int main() {
     GpuState st;
     set_pgm(st, P::SPI_SHADER_PGM_LO_ES, P::SPI_SHADER_PGM_HI_ES, kVs);   // vertex/export stage
     set_pgm(st, P::SPI_SHADER_PGM_LO_PS, P::SPI_SHADER_PGM_HI_PS, kPs);   // pixel stage
-    st.cx[P::VGT_PRIMITIVE_TYPE] = 4;      // triangle list
+    st.uc[P::VGT_PRIMITIVE_TYPE] = 4;      // triangle list
     st.cx[P::CB_TARGET_MASK]     = 0xF;    // write RGBA
     st.draws.push_back({3});               // one draw, 3 vertices
 

@@ -37,8 +37,10 @@ RenderState extract_render_state(const GpuState& st) {
     rs.color0_number_type      = PM4_FIELD(cinfo, CB_COLOR0_INFO, NUMBER_TYPE);
     rs.color0_comp_swap        = PM4_FIELD(cinfo, CB_COLOR0_INFO, COMP_SWAP);
 
-    // Primitive topology.
-    rs.prim_type = PM4_FIELD(rd(st.cx, P::VGT_PRIMITIVE_TYPE), VGT_PRIMITIVE_TYPE, PRIM_TYPE);
+    // Primitive topology. VGT_PRIMITIVE_TYPE (0x242) is a UCONFIG register in RDNA2 (the game sets it via
+    // a Uc-class SetRegsIndirect / CreatePrimState's uc[2]), NOT a context register — read it from st.uc.
+    // (Reading st.cx left it 0 -> the default PointList topology, so triangles rasterized as ~3 points.)
+    rs.prim_type = PM4_FIELD(rd(st.uc, P::VGT_PRIMITIVE_TYPE), VGT_PRIMITIVE_TYPE, PRIM_TYPE);
 
     // Depth/stencil test state (decoded fields of DB_DEPTH_CONTROL).
     const uint32_t dc = rd(st.cx, P::DB_DEPTH_CONTROL);
