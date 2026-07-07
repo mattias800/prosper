@@ -345,3 +345,52 @@ registered but its trigger event never fires. NOTE: `EnsureVMInitialized`/`Reque
 conflate them with this bug. Tooling added this pass (gated, no default change): `boot_trace` il2cpp
 class-name walker under `PROSPER_CRASHPEEK` (+`PROSPER_PEEK_CLASS`), `PROSPER_HWBP_OBJ` (dump rdi as an
 il2cpp object at a method-entry bp), `PROSPER_HWBP_ALLTHREADS`, and `PROSPER_WORKER_PARK`.
+
+## 2026-07-08 (cont.) — the divergence point: PSN bootstrap `G` NEVER runs; native `PSN.prx` isn't loaded
+
+Traced the full call chain up from the null timer and pinned the exact divergence (all addresses are
+`Il2cpp+`):
+
+- `WorkerThread.timer` ← created ONLY in `WorkerThread.Start` (`0x1757a00`; `timer=Stopwatch.StartNew()`).
+- `Start` ← called ONLY from the worker-pool init `0x1758250` (14 `Start` calls, one per PSN subsystem
+  singleton). **Inside pool-init there is a native gate:** it resolves+calls `PSN_PrxInitialize(&out)`
+  (`call rax` @ `0x4417584b0`) then `cmp DWORD[rbp-0x90],0 ; jne 0x441758da6` — on a non-zero result it
+  branches away and **skips all 14 `Start` calls**. (A second `PSN_PrxInitializeA` gate follows.)
+- pool-init ← called ONLY from `G` (`0x6ec470`), which does `UnityEngine.Object::DontDestroyOnLoad` +
+  pool-init — i.e. the PSN system bootstrap (`Unity.PSN.PS5.Main.Initialize` path).
+- **`G` (`0x6ec470`) never executes on ANY thread.** Proven with a fixed `PROSPER_HWBP_ALLTHREADS`
+  (the arm must run on the host `%fs`, *before* `guest_tls_activate_thread()` — moving it fixed silent
+  no-arming): 52 guest worker threads armed + main, `G` hit count = 0. pool-init entry hit count = 0 too.
+  So the pool-init native gate is never even *reached*; the pool simply never bootstraps.
+
+**Environmental root cause:** the 4 linked modules are `eboot + Il2cpp + PS5Util + libc` — **native
+`PSN.prx` (Media/Plugins/PSN.prx) is NOT loaded**, and neither is `libkernel.prx`. Consequently Unity's
+native-plugin loader can't resolve the PSN plugin's exports — `[dlsym] unresolved 'PSN_PrxInitialize' ->
+ESRCH`, `'PSN_PrxInitializeA'`, `'UnityPluginLoad'`, `'UnityPluginUnload'`, etc. (our `k_dlsym` returns
+ESRCH unconditionally and doesn't search loaded modules). With the native plugin never loaded, Unity/the
+game never triggers the managed PSN bootstrap `G`, so the worker pool never starts and `timer` stays null.
+(Thread-binding candidate (a) is RULED OUT: all 52 guest threads go through our HLE `k_pthread_create` →
+`thread_trampoline`; nothing binds `pthread_create` cross-module to a Sony prx.)
+
+**IMPORTANT experimental caveat (re-scopes the premise):** avoiding the crash is NOT sufficient to render
+the cutscene. Two independent interventions each run crash-free to thousands of submits but **stay on the
+loading composite (draws/submit stays 3, scene never activates):** (1) stubbing the getter to `xor eax,eax;
+ret` (→ #82738); (2) neutralizing the whole PSN poll `F` with a `ret` at `0x175c880` (→ #51455). So the
+PSN null-timer NRE is a real crash but is **not, by itself, the thing gating scene activation** — either
+the activation genuinely needs a *properly running* PSN worker (real `Stopwatch` + live `RunProc` draining
+the async queue), or the activation blocker is partly independent. The scene loader itself is Unity's own
+`Loading.PreloadManager`/`Loading.AsyncRead` (created via our HLE, not PSN).
+
+**Fix plan (the real fix is large, spanning the loader + native HLE — not a getter guard):**
+1. Make the native PSN plugin available so the bootstrap triggers and the pool-init native gate passes:
+   either (a) **load `Media/Plugins/PSN.prx`** as a guest module (like Il2cpp/PS5Util) AND extend
+   `k_dlsym` to resolve exports by name from loaded modules (so `UnityPluginLoad`/`PSN_PrxInitialize`
+   resolve), or (b) **HLE the PSN native surface** — return "loaded/initialized, success" for the plugin
+   load + `PSN_PrxInitialize`/`PSN_PrxInitializeA` (leave their out-param 0) so `G`→pool-init→`Start`
+   proceeds and `timer` is created + `RunProc` runs. (b) is lighter but will surface further PSN native
+   calls from `RunProc` that must also be HLE'd honestly.
+2. THEN re-test scene activation with a properly-running pool; if it still doesn't activate, the remaining
+   blocker is a separate Unity async-integration step to be investigated on the (now crash-free) path.
+
+Tooling this pass: fixed `PROSPER_HWBP_ALLTHREADS` (arm on host `%fs` before `guest_tls_activate_thread`)
++ `PROSPER_HWBP_ARMLOG`.
