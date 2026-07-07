@@ -76,10 +76,26 @@ always `0x0` to real render-target addresses (`0x…df790000`). So with the incr
 scene's render targets **survive** — i.e. the incremental GC was **collecting live objects** (a missed
 root / missed write during incremental marking), not merely dereferencing a corrupt deserialized object.
 This redirects the root-cause hunt from "deser produces garbage" toward "our incremental-GC support drops a
-live reference." (Root capture in `exc_delivery_handler` looks complete — all 15 GP regs + rsp + `ctx[0xf8]`
-— so suspect either the incremental write-barrier path or static-field root registration.)
+live reference." **Decisive evidence (not a timing confound):** across a full unpatched run `color0_base` is
+`0x0` for *every* draw — a real render target is *never* bound; with `0x5df0` patched, real render-target
+addresses appear from the *first* draw. So the collector running is precisely what prevents the scene's
+render targets from surviving. This dovetails with the parallel agent's data point that all 13/13 GC
+stop-the-world suspends caught threads **parked in a futex** (host code), never an actively-mutating guest
+thread — i.e. an active mutator may escape suspension, so the incremental mark proceeds over a heap that is
+still changing and reclaims a still-referenced object. (Root capture in `exc_delivery_handler` itself looks
+complete — all 15 GP regs + rsp + `ctx[0xf8]`; suspect the incremental write-barrier / active-mutator
+suspension, or static-field root registration.)
 
-**A second, INDEPENDENT null remains** even with the GC pump patched: the crash at `Il2cpp+0x1637697` is in
+****Cleanly separating the two root causes (via `PROSPER_PATCH_BYTE=0x440005dfe=0xeb`, which forces the pump's
+`je` to an unconditional `jmp` so incremental marking never runs — no half-collection, unlike ret'ing the
+whole pump):** real render targets survive from draw 1 AND the game deterministically advances to a *new*
+crash at `SubmitDcb #28` — `Il2cpp+0x1637697`, same backtrace every run. Its caller (`Il2cpp+0x175c991`)
+does `mov 0x40(%rbx),%rdi; call 0x16375e0`, i.e. it passes **`[callerObj+0x40]`, which is null**. That field
+stays null with the GC OFF, so this second crash is an **uninitialized / mis-deserialized object field**, NOT
+a GC-collected reference — i.e. the deser frontier the parallel agent owns. So reaching the cutscene needs
+BOTH: (1) the incremental-GC live-object drop, and (2) the deser/init null at `[obj+0x40]`.
+
+A second, INDEPENDENT null remains** even with the GC pump patched: the crash at `Il2cpp+0x1637697` is in
 a function whose start (`0x16375e0`) sets `rbx = rdi` (its argument), then derefs `[rbx+0x20]` — i.e. the
 **caller passed a null object**. This one is not GC-collected (it persists with GC off), so there are at
 least two distinct corruption sources feeding the null-deref crashes; both must be resolved to reach the

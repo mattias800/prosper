@@ -130,6 +130,20 @@ int main(int argc, char** argv) {
             s = (end && *end == ',') ? end + 1 : (end ? end : s + 1);
         }
     }
+    // PROSPER_PATCH_BYTE=addr=val[,addr=val...]: write an arbitrary byte at a guest address (finer than
+    // PATCH_RET — e.g. flip a conditional 0x74 je -> 0xEB jmp to force a branch). Same bring-up bisection use.
+    if (const char* pb = getenv("PROSPER_PATCH_BYTE")) {
+        const char* s = pb;
+        while (*s) {
+            char* e1 = nullptr; uint64_t a = strtoull(s, &e1, 0);
+            if (a && e1 && *e1 == '=') {
+                char* e2 = nullptr; unsigned long v = strtoul(e1 + 1, &e2, 0);
+                *(volatile uint8_t*)(uintptr_t)a = (uint8_t)v;
+                fprintf(stderr, "[patch] byte 0x%02x @ 0x%llx\n", (unsigned)(v & 0xff), (unsigned long long)a);
+                s = (e2 && *e2 == ',') ? e2 + 1 : (e2 ? e2 : s + 1);
+            } else s = (e1 && *e1) ? e1 + 1 : s + 1;
+        }
+    }
 
 #ifdef PROSPER_HAVE_VULKAN
     // PROSPER_RENDER=1: register the live Vulkan renderer so execute_and_present fires on every
