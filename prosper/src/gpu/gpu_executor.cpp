@@ -134,7 +134,14 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         break;
                     case 0x29: {  // s_bfe_u64: dst[63:0] = bitfield of src0[63:0] (format patch reads a small field)
                         uint32_t off = c & 0x3f, wid = (c >> 16) & 0x7f, ahi = 0;
-                        uint64_t src64 = (uint64_t)a | ((uint64_t)(known(in.src[0].value + 1, ahi) ? ahi : 0u) << 32);
+                        // src0's high dword: the next SGPR of the pair, or 0 for a 32-bit inline/literal
+                        // constant (zero-extended). Only an SGPR operand may index val[value+1] — a
+                        // literal's `value` is not an SGPR number. And an UNTRACKED high dword must not
+                        // silently fold as 0: if the field reaches bits >= 32 the result is unknown.
+                        bool khi = (in.src[0].kind == OperandKind::SGPR) ? known(in.src[0].value + 1, ahi)
+                                                                         : (ahi = 0, true);
+                        if (!khi && wid != 0 && off + wid > 32) { ok = false; wrote_pair = true; break; }
+                        uint64_t src64 = (uint64_t)a | ((uint64_t)ahi << 32);
                         uint64_t res = wid == 0 ? 0 : (wid >= 64 ? (src64 >> off) : ((src64 >> off) & (((uint64_t)1 << wid) - 1)));
                         r = (uint32_t)res; hi64 = (uint32_t)(res >> 32); wrote_pair = true; break;
                     }
@@ -147,7 +154,9 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             in.pc, in.opcode, d, in.src[0].value, ka, in.src[1].value, kc, ok, r);
                 if (in.opcode != 0x0A) scc = -1;
                 if (ok) { val[d] = r; if (wrote_pair) val[d + 1] = hi64; }
-                else    { val.erase(d); if (wrote_pair) val.erase(d + 1); }
+                // A 64-bit-dst op (s_bfe_u64) invalidates BOTH dwords even when its sources were
+                // unknown (the opcode switch never ran, so wrote_pair may still be false).
+                else    { val.erase(d); if (wrote_pair || in.opcode == 0x29) val.erase(d + 1); }
                 break;
             }
             case Rdna2Format::SOPC: {   // scalar compare -> SCC (feeds the format patch's s_cselect)
