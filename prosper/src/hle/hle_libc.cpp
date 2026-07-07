@@ -258,8 +258,37 @@ HLE(h_execute_once) {
 HLE(h_cxa_dec_refcount) { return 0; }
 HLE(h_cxa_inc_refcount) { return 0; }
 
+// sceLibcHeapGetTraceInfo (libSceLibcInternalExt, NID NWtTN10cJzE) — the guest allocator's
+// malloc-trace coordination block. Contract (Kyty LibC.cpp:139 + shadPS4 kernel.cpp:161, identical):
+// the caller passes a 32-byte struct { u64 size(=32, caller-set); u32 flag; u32 getSegmentInfo;
+// u64* mspace_atomic_id_mask; u64* mstate_table } and the callee fills the two pointers with
+// PERSISTENT storage (Kyty: static u64 + static u64[64]) that the guest mspace allocator then
+// reads AND WRITES on allocation paths. Our previous behavior (unimplemented stub -> return 0,
+// struct untouched) handed the guest two garbage stack values as pointers: every subsequent
+// traced-mspace operation stored through random addresses — silent heap/stack corruption that
+// surfaces only under heavy allocation (e.g. the level1 resources.assets loader thread).
+// CONFIDENCE: HIGH — two independent references agree on layout and semantics.
+namespace { uint64_t g_mspace_atomic_id_mask = 0; uint64_t g_mstate_table[64] = {0}; }
+HLE(h_heap_get_trace_info) {
+    uint8_t* info = (uint8_t*)P(a0);
+    if (!info) return 0;
+    // The size field is caller-set; only fill the layout we know (exactly 32 bytes — never write
+    // past the caller's struct; cf. the f_fstat oversized-write lesson).
+    if (*(uint64_t*)info != 32) {
+        fprintf(stderr, "[prosper] sceLibcHeapGetTraceInfo: unexpected info->size=%llu (want 32) — leaving untouched\n",
+                (unsigned long long)*(uint64_t*)info);
+        return 0;
+    }
+    *(uint32_t*)(info + 0x0c)  = 0;                        // getSegmentInfo: no segment-info callback
+    *(uint64_t**)(info + 0x10) = &g_mspace_atomic_id_mask; // persistent, zero-initialized
+    *(uint64_t**)(info + 0x18) = g_mstate_table;
+    return 0;
+}
+
 void register_builtin_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
+    // libSceLibcInternalExt heap-trace hookup (raw NID — guaranteed match; see handler comment).
+    Hle::register_fn("NWtTN10cJzE", (HleFn)h_heap_get_trace_info, "sceLibcHeapGetTraceInfo");
     R("memcpy", h_memcpy);   R("memmove", h_memmove); R("memset", h_memset);
     R("memcmp", h_memcmp);   R("memchr", h_memchr);
     R("strlen", h_strlen);   R("strnlen", h_strnlen);

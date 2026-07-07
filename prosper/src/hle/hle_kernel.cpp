@@ -620,6 +620,12 @@ void register_kernel_hle() {
     R("sceKernelWaitSema", k_sema_wait);        R("sceKernelSignalSema", k_sema_signal);
     R("sceKernelPollSema", k_sema_poll);
     R("sceKernelGetModuleInfoForUnwind", k_get_module_info_for_unwind);   // C++ exception unwinding
+    // sceSysmoduleGetModuleInfoForUnwind (libSceSysmodule, NID 4fU5yvOkVG4): same contract — shadPS4's
+    // implementation just delegates to sceKernelGetModuleInfoForUnwind (sysmodule.cpp:31). It was an
+    // unimplemented stub returning 0 (= SUCCESS) with the caller's 0x130-byte info struct left
+    // uninitialized, so any exception unwound through a sysmodule-resolved frame read a garbage
+    // eh_frame_hdr — the same stack-smash failure mode the kernel variant had before it was implemented.
+    Hle::register_fn("4fU5yvOkVG4", (HleFn)k_get_module_info_for_unwind, "sceSysmoduleGetModuleInfoForUnwind");
     // Registration / hook / debug libkernel calls the app makes at startup that have no observable
     // effect in our headless boot — returning OK without side effects is the correct behavior:
     //  - SetThreadDtors / SetThreadAtexitCount / SetThreadAtexitReport: per-thread exit bookkeeping;
