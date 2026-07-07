@@ -276,3 +276,19 @@ is created before PreloadManager's main-thread integration times its AsyncReques
 `Run()`/lazy Stopwatch setup must complete first (a start-ordering / worker-not-yet-run condition), OR the
 timing path must tolerate a not-yet-started worker. New diagnostics on this branch: `PROSPER_HWBP_KLASS`,
 `PROSPER_HWBP_GLOBAL`, `PROSPER_HWBP_FIELDS`.
+
+### Null-guard experiment: Stopwatch is crash #1, but a SEPARATE async-load stall (#2) sits behind it
+
+Added `PROSPER_NULLGUARD=addr,len` (boot_trace): a trampoline that returns early (0, or an rdtsc counter)
+when a guest method's receiver (`rdi`) is null. Installed on the Stopwatch getter, it **eliminates the
+crash** — the game runs 700+ frames with no fault. But the cutscene still does NOT render:
+- The async loader **stalls at exactly 3 `resources.assets` reads** and every frame is a blue clear.
+- Tested BOTH guard returns — `0` (unstarted-timer) and `rdtsc` (large monotonic). **Both stall at the
+  same 3 reads**, so the stall is NOT a Stopwatch-timing-magnitude artifact — it is a genuine SECOND
+  blocker in the async-scene-load path, sitting directly behind the Stopwatch crash.
+
+So reaching the cutscene needs (in order): #42 (done) → the `WorkerThread` Stopwatch init (crash #1) →
+whatever stalls `resources.assets` streaming at 3 reads (#2 — the loader stops issuing reads; likely
+waiting on a main-thread integration step that the missing-Stopwatch path never reaches on real HW).
+The layers keep peeling — each is Unity async-load engine internals. `PROSPER_NULLGUARD` is kept as a
+gated diagnostic (default no-op) for bisecting null-receiver crashes.
