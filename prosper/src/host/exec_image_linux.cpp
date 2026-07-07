@@ -167,6 +167,11 @@ namespace {
     // captures the mismatching field name + oldBaseTypeName — i.e. exactly where the generated typetree
     // disagrees with the stream, pinning the wrong-typetree/dispatch divergence.
     bool g_hwbp_strdump = false;
+    // PROSPER_HWBP_KLASS=1: at the bp, treat rbx/rdi/rax/r14 as candidate IL2CPP object pointers and print
+    // each one's class name. IL2CPP layout: object[0x00]=Il2CppClass* klass; Il2CppClass{ image@0x00,
+    // gc_desc@0x08, const char* name@0x10, const char* namespaze@0x18 }. So klass=[obj]; name=[[obj]+0x10].
+    // Used to identify the managed type whose field is null at the deser/activation getter crash.
+    bool g_hwbp_klass = false;
     void hwbp_dump_ring(const char* why);   // fwd decl (defined after probe_readable)
     // Optional chained DATA write-watchpoint: on the first exec-bp hit, arm a HW write watch on
     // [rax + g_hwwatch_delta] (default rax-0x80, the thread-local device slot the ctor reads). Catches
@@ -475,6 +480,59 @@ namespace {
                 pstr("rdi", (uint64_t)gr[REG_RDI]); pstr("rsi", (uint64_t)gr[REG_RSI]);
                 pstr("rdx", (uint64_t)gr[REG_RDX]); pstr("rcx", (uint64_t)gr[REG_RCX]);
                 pstr("r8",  (uint64_t)gr[REG_R8]);  pstr("r9",  (uint64_t)gr[REG_R9]);
+            }
+            if (g_hwbp_klass && cond_ok) {
+                auto pklass = [&](const char* rn, uint64_t obj) {
+                    if (!probe_readable(obj) || !probe_readable(obj + 7)) return;
+                    uint64_t klass = *(const uint64_t*)obj;                 // Il2CppObject.klass
+                    if (!probe_readable(klass + 0x10 + 7)) return;
+                    uint64_t namep = *(const uint64_t*)(klass + 0x10);      // Il2CppClass.name
+                    if (!probe_readable(namep)) return;
+                    char s[80]; size_t k = 0;
+                    for (; k < 72 && probe_readable(namep + k); ++k) { char c = *(const char*)(namep + k);
+                        if (c == 0) break; if (c < 0x20 || c > 0x7e) { if (k < 2) return; break; } s[k] = c; }
+                    s[k] = 0;
+                    if (k >= 2) { char b[160]; int n = snprintf(b, sizeof b,
+                        "[hwbp-klass] %s obj=0x%llx klass=0x%llx name=\"%s\" [obj+0x40]=0x%llx\n",
+                        rn, (unsigned long long)obj, (unsigned long long)klass, s,
+                        (unsigned long long)(probe_readable(obj+0x40)?*(const uint64_t*)(obj+0x40):0)); write(2, b, n); }
+                };
+                // PROSPER_HWBP_FIELDS=1: dump rbx's object fields [0x10..0x60] + the class name of any
+                // field that is itself an object — to tell "whole object uninitialized (all null)" from
+                // "one specific field null".
+                if (getenv("PROSPER_HWBP_FIELDS")) {
+                    uint64_t o = (uint64_t)gr[REG_RBX];
+                    if (probe_readable(o + 0x60)) {
+                        char b[400]; int n = snprintf(b, sizeof b, "[hwbp-fields] rbx=0x%llx:", (unsigned long long)o);
+                        for (uint64_t off = 0x10; off <= 0x60; off += 8) {
+                            uint64_t v = *(const uint64_t*)(o + off);
+                            n += snprintf(b+n, sizeof b-n, " +0x%llx=0x%llx", (unsigned long long)off, (unsigned long long)v);
+                        }
+                        n += snprintf(b+n, sizeof b-n, "\n"); write(2, b, n);
+                    }
+                }
+                pklass("rbx", (uint64_t)gr[REG_RBX]); pklass("rdi", (uint64_t)gr[REG_RDI]);
+                pklass("rax", (uint64_t)gr[REG_RAX]); pklass("r14", (uint64_t)gr[REG_R14]);
+                // Also treat rdi as a raw Il2CppClass* (name @ +0x10) — for a bp inside a getter where a
+                // register holds the declaring class ptr, this reveals the class of the (null) receiver.
+                auto pcname = [&](const char* rn, uint64_t klass) {
+                    if (!probe_readable(klass + 0x10 + 7)) return;
+                    uint64_t namep = *(const uint64_t*)(klass + 0x10);
+                    if (!probe_readable(namep)) return;
+                    char s[80]; size_t k = 0;
+                    for (; k < 72 && probe_readable(namep + k); ++k) { char c = *(const char*)(namep + k);
+                        if (c == 0) break; if (c < 0x20 || c > 0x7e) { if (k < 2) return; break; } s[k] = c; }
+                    s[k] = 0;
+                    if (k >= 2) { char b[128]; int n = snprintf(b, sizeof b, "[hwbp-cname] %s klass=0x%llx name=\"%s\"\n",
+                        rn, (unsigned long long)klass, s); write(2, b, n); }
+                };
+                pcname("rdi(class)", (uint64_t)gr[REG_RDI]);
+                // PROSPER_HWBP_GLOBAL=0xADDR: also resolve the class name stored at a fixed guest global
+                // (the getter loads its declaring class from [0x442302515]); guest mem is 1:1-mapped.
+                if (const char* g = getenv("PROSPER_HWBP_GLOBAL")) {
+                    uint64_t ga = strtoull(g, nullptr, 0);
+                    if (probe_readable(ga + 7)) pcname("global", *(const uint64_t*)ga);
+                }
             }
             if (cond_ok && g_hwbp_r15_on) {
                 // The matching read: dump the window around rax (the source pointer) + classify its mapping,
@@ -1007,6 +1065,7 @@ void install_trap_handler() {
         if (getenv("PROSPER_HWBP_BUFDUMP")) g_hwbp_bufdump = true;
         if (getenv("PROSPER_HWBP_DIVCAP")) g_hwbp_divcap = true;
         if (getenv("PROSPER_HWBP_STRDUMP")) g_hwbp_strdump = true;
+        if (getenv("PROSPER_HWBP_KLASS")) g_hwbp_klass = true;
         if (g_devnull_fd < 0) g_devnull_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
         g_hwbp_on = true;   // perf_event_open done in arm_hwbp() after the image is mapped
         // PROSPER_HWWATCH=<signed delta>: on the first exec-bp hit, arm a data write-watch on [rax+delta]
