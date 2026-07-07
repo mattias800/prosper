@@ -90,10 +90,14 @@ inline bool realize_draw_item(const GpuState& ds, uint32_t vcount_hint, uint32_t
     ResolvedPipelineState ps = resolve_pipeline_state(rs);
     // Skip a draw with no color writes: it contributes no pixels, so recording it (and, in the single-item
     // case, presenting its bare clear) would just overwrite the last real frame (an art/clear flicker).
-    if (ps.color_write_mask == 0) {
+    if (ps.color_write_mask == 0 && !getenv("PROSPER_FORCE_COLORWRITE")) {
         if (log) fprintf(stderr, "[exec] skip draw: color_write_mask==0 (no-op)\n");
         return false;
     }
+    // PROSPER_FORCE_COLORWRITE: diagnostic — render color_write_mask==0 draws anyway (force mask to RGBA).
+    // The cutscene submits ~66 draws/frame that resolve to mask==0; if that is a mis-decode (not a genuine
+    // depth-only pass), rendering them reveals whether they are the cutscene content.
+    if (ps.color_write_mask == 0) ps.color_write_mask = 0xf;
     uint32_t vertex_count = vcount_hint ? vcount_hint : 3u;
     // Fullscreen-composite quad fill: the game tiles a 4-corner quad buffer into two triangles via indexed
     // draws; rendering only 3 vertices paints half the quad. When the bound vertex buffer is exactly a

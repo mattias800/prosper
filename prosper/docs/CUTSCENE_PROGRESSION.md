@@ -292,3 +292,33 @@ whatever stalls `resources.assets` streaming at 3 reads (#2 — the loader stops
 waiting on a main-thread integration step that the missing-Stopwatch path never reaches on real HW).
 The layers keep peeling — each is Unity async-load engine internals. `PROSPER_NULLGUARD` is kept as a
 gated diagnostic (default no-op) for bisecting null-receiver crashes.
+
+## MAJOR PROGRESS (solo, post-#43): crash → streams 80% of the cutscene, down to the deser frontier
+
+Chained the workarounds to peel the cutscene blocker down layer by layer:
+1. **#42 (merged)** — GC free-list corruption fixed.
+2. **`PROSPER_NULLGUARD=0x4416375e0,13`** — guards the null-`Stopwatch` getter crash (returns a value for a
+   null receiver). Identified the field as `WorkerThread.field_0x40` = `System.Diagnostics.Stopwatch`;
+   the WorkerThread is a work-queue (Semaphore@0x20, lock Object@0x28, Queue@0x30, EventWaitHandle@0x48,
+   Stopwatch@0x40-null). Both WorkerThreads have a null Stopwatch (systematic, never created).
+3. **`PROSPER_PREADLOG`** — its serialization unblocks a timing-sensitive stall (without it the loader
+   stalls at 3 reads; with it, streams deep). So there is a real async-load **race** that serialization masks.
+
+With #42 + null-guard + PREADLOG the game **runs with NO crash** and streams the cutscene assets, BUT:
+- **`resources.assets` reads progress to block ~966 (~80%) then CYCLE** — 696 unique blocks, 4537 total
+  reads, the tail re-reading only blocks 733/961/966 forever (FileCacher thrash / deser loop at the
+  block-966 frontier — the same ~82% point in the original findings). The load never completes.
+- Every rendered frame stays a blue clear; the game submits ~69 draws/frame but ~66 resolve to
+  `color_write_mask==0` (skipped) and forcing them on (`PROSPER_FORCE_COLORWRITE`) does not change the
+  output — they target an unresolved `color0_base==0`. The cutscene scene never activates because its
+  load never completes.
+
+**The two precise remaining blockers (both localized):**
+- **(A) The Stopwatch timing is wrong** — the null-guard returns 0 or rdtsc (extremes); neither is a real
+  running-timer magnitude, so Unity's async-integration time-budget mis-behaves (over/under budget),
+  which likely drives the block-966 thrash. Real fix: create/run a proper WorkerThread Stopwatch.
+- **(B) The block-966 deser thrash** — resources.assets deserialization re-reads 3 blocks forever at ~80%
+  (the DESER_STALE_CACHE_BLOCK frontier). May be a consequence of (A) starving integration, or an
+  independent FileCacher/deser cache-thrash.
+
+New gated diagnostics: `PROSPER_HWBP_FIELDS` now resolves each object-field's class; `PROSPER_FORCE_COLORWRITE`.
