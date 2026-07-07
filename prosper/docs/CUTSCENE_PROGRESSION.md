@@ -236,3 +236,19 @@ So the remaining, precisely-scoped blocker: **the managed `WorkerThread` object'
 initialized before Unity's PreloadManager integrates the async scene load on the main thread.** Next probe:
 a write-watch on `[WorkerThread+0x40]` from the object's allocation to find its intended writer (the
 WorkerThread ctor / a native icall), or resolve the getter's declaring class to name the expected type.
+
+### Write-watch: `WorkerThread.field_0x40` is NEVER written (confirmed missing init)
+
+Armed a HW write-watch on `[WorkerThread+0x40]` (`PROSPER_HWWATCH=0x40 PROSPER_HWWATCH_REG=rbx` at the
+caller bp) with the getter stubbed so the game runs freely. Result: the watch armed, the game ran, and
+**no writer of that field was ever caught on the main thread** — the field is simply never initialized.
+Also observed: with the getter bypassed the async loader **stalls after 3 `resources.assets` reads**
+(386 blue frames, no progress) — integration and the loader are coupled, so the missing field both
+crashes integration AND leaves the scene unloaded.
+
+Conclusion: the blocker is a **missing initialization of the managed `WorkerThread.field_0x40`** in Unity's
+async-scene-load path (PreloadManager). It is deterministic (post-#42), never written by the main thread,
+and cannot be bypassed (stub → scene never activates). The fix requires identifying the field's intended
+initializer — either the `WorkerThread` ctor path (if main-thread) or a worker/preload thread's setup
+(a HW watch is per-thread, so a worker-thread writer would not appear in the main-thread watch above).
+This is Unity async-load engine internals; handing off with the exact field + backtrace + repro.
