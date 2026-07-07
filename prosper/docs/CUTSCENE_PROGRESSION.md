@@ -95,6 +95,18 @@ stays null with the GC OFF, so this second crash is an **uninitialized / mis-des
 a GC-collected reference — i.e. the deser frontier the parallel agent owns. So reaching the cutscene needs
 BOTH: (1) the incremental-GC live-object drop, and (2) the deser/init null at `[obj+0x40]`.
 
+**Crash-free-but-stuck isolation (strongest handle on the wall):** disabling incremental marking
+(`0x440005dfe=0xeb`) *and* stubbing the null-`this` getter to return 0
+(`0x4416375e0=0x31,0x4416375e1=0xc0,0x4416375e2=0xc3` = `xor eax,eax; ret`) makes the game **run crash-free
+for the full run** — but it stays on the loading screen (`color0_base=0x0`, the single blit). So the getter
+`0x16375e0` is on the **scene-activation path**: returning 0 (because `[callerObj+0x40]` is null) makes the
+game not advance; with the GC on but the getter crashing, real render targets briefly appear (the game *was*
+starting to render the scene). Net: the crashes are fully avoidable via workarounds, and the pure remaining
+blocker to the cutscene is **populating the null managed field `[callerObj+0x40]`** (an uninitialized / mis-
+deserialized object) so the getter returns its real value and activation proceeds. That single field is the
+next thing to fix; identifying `callerObj`'s type + what writes `+0x40` (via il2cpp metadata / the deser
+path) is the concrete remaining task.
+
 A second, INDEPENDENT null remains** even with the GC pump patched: the crash at `Il2cpp+0x1637697` is in
 a function whose start (`0x16375e0`) sets `rbx = rdi` (its argument), then derefs `[rbx+0x20]` — i.e. the
 **caller passed a null object**. This one is not GC-collected (it persists with GC off), so there are at
