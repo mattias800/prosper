@@ -378,12 +378,32 @@ std::string prosper_apr_path_for_id(uint32_t id) {
     std::lock_guard<std::mutex> lk(g_apr_mx);
     return (id >= 1 && id <= g_apr_files.size()) ? g_apr_files[id - 1].path : std::string();
 }
-// Find the resolved host path for a given file size (the APR read-request object carries the total
-// size at obj+0x30 but no directly-legible id; sizes of the boot-critical containers are distinct).
-static std::string apr_path_for_size(uint64_t size) {
+// Register a resolved container and return its stable 1-based id. Re-resolving the same host path
+// returns the existing id (updated size) instead of a duplicate entry — a duplicate would make
+// every size-keyed read of that file look ambiguous. Exposed (not static) for the unit test.
+uint32_t prosper_apr_register(const std::string& path, uint64_t size) {
     std::lock_guard<std::mutex> lk(g_apr_mx);
-    for (auto& f : g_apr_files) if (f.size == size) return f.path;
-    return {};
+    for (size_t i = 0; i < g_apr_files.size(); i++)
+        if (g_apr_files[i].path == path) { g_apr_files[i].size = size; return (uint32_t)(i + 1); }
+    g_apr_files.push_back({ path, size });
+    return (uint32_t)g_apr_files.size();
+}
+// Test hook: drop all registered containers (the registry is process-global).
+void prosper_apr_reset_for_test() {
+    std::lock_guard<std::mutex> lk(g_apr_mx);
+    g_apr_files.clear();
+}
+// Find resolved host paths whose TOTAL size equals `size`. Returns the match count and sets
+// *out_path to the first match. The read path may only act on an unambiguous (count==1) match:
+// the APR read-request object carries the total byte count at obj+0x30 but the file id is NOT
+// legible in the captured request layout (docs/UE4_APR_IOSTORE_BRINGUP.md field map, +0x00..+0x40),
+// so size is the only correlation currently available. Exposed (not static) for the unit test.
+int prosper_apr_match_by_size(uint64_t size, std::string* out_path) {
+    std::lock_guard<std::mutex> lk(g_apr_mx);
+    int n = 0;
+    for (auto& f : g_apr_files)
+        if (f.size == size) { if (n++ == 0 && out_path) *out_path = f.path; }
+    return n;
 }
 HLE(f_apr_resolve) {
     const char** paths = (const char**)P(a0);
@@ -405,7 +425,14 @@ HLE(f_apr_resolve) {
 #endif
         else { if (out_ids) out_ids[i] = 0; if (out_sizes) out_sizes[i] = 0; if (out_flags) out_flags[i] = 0;
                if (filelog()) fprintf(stderr, "[apr] resolve MISS %s\n", gp ? gp : "(null)"); continue; }
-        { std::lock_guard<std::mutex> lk(g_apr_mx); g_apr_files.push_back({ host, size }); id = (uint32_t)g_apr_files.size(); }
+        // Warn loudly (unconditionally) when a DIFFERENT container shares this size: the read
+        // path is size-keyed (see f_apr_read_submit) and will refuse such reads as ambiguous.
+        std::string clash; int same_size = prosper_apr_match_by_size(size, &clash);
+        id = prosper_apr_register(host, size);
+        if (same_size > 0 && clash != host)
+            fprintf(stderr, "[apr] WARNING: %s and %s share byte size %llu — size-keyed reads of "
+                    "either will be refused as ambiguous (issue #62)\n",
+                    host.c_str(), clash.c_str(), (unsigned long long)size);
         if (out_ids)   out_ids[i]   = id;
         if (out_sizes) out_sizes[i] = size;
         if (out_flags) out_flags[i] = 0;
@@ -420,8 +447,16 @@ HLE(f_apr_resolve) {
 // at readReq+0x30. Real hardware DMAs the resolved file's bytes into that buffer; we do it with a
 // synchronous pread (the boot-critical global container is uncompressed — utoc header
 // compressionMethodNameCount==0). Route B of docs/UE4_APR_IOSTORE_BRINGUP.md. CONFIDENCE: MED
-// (object layout from live capture; file matched by size since the id isn't directly legible in
-// the request object — boot container sizes are distinct).
+// (object layout from live capture).
+//
+// File identification (issue #62): the captured request layout (+0x00 count, +0x08/+0x40 stack
+// ptrs, +0x10 fn/vtable, +0x18 stack scratch, +0x20 dest, +0x28 status, +0x30 byte count, +0x38
+// canary) contains NO legible file id and NO offset field, so the file is keyed by TOTAL size and
+// read whole from offset 0. That key is only sound when unambiguous, so reads are REFUSED loudly
+// when (a) two registered containers share the size, or (b) the count matches no container's
+// total size (a partial/chunk read — unsupported until the id/offset linkage is decoded from the
+// 0x90-byte descriptor buffer (a4) or the Ampr CB read command; both are dumped/loggable below
+// for that RE). CONFIDENCE: LOW on file identification — safe-refuse fallback, not a real decode.
 HLE(f_apr_read_submit) {
     uint8_t* req = (uint8_t*)P(a0);
     if (!req) return 0x80020016ull;
@@ -431,6 +466,14 @@ HLE(f_apr_read_submit) {
                 (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)a5);
         for (int o = 0; o < 0x48; o += 8)
             fprintf(stderr, "[apr]   req+0x%02x = 0x%016llx\n", o, (unsigned long long)*(uint64_t*)(req + o));
+        // Dump the descriptor buffer (a4, a5 bytes — 0x90 in the live capture): the most likely
+        // home of the real (file id, offset, size) tuples needed to retire the size keying.
+        if (a4 && a5 && a5 <= 0x200) {
+            const uint8_t* d = (const uint8_t*)P(a4);
+            for (uint64_t o = 0; o + 8 <= a5; o += 8)
+                fprintf(stderr, "[apr]   desc+0x%02llx = 0x%016llx\n",
+                        (unsigned long long)o, (unsigned long long)*(const uint64_t*)(d + o));
+        }
     }
     // req+0x20 is the mapped data buffer (guest direct/flexible memory, 0x10xxxxxxxx range); req+0x18
     // is only a small stack scratch (writing the full file there smashed the stack). req+0x30 is the
@@ -439,9 +482,20 @@ HLE(f_apr_read_submit) {
     uint64_t size = *(uint64_t*)(req + 0x30);
     if (!dest || !size) { if (filelog()) fprintf(stderr, "[apr] read-submit: empty (dest=0x%llx size=0x%llx)\n",
                           (unsigned long long)dest, (unsigned long long)size); return 0; }
-    std::string host = apr_path_for_size(size);
-    if (host.empty()) { if (filelog()) fprintf(stderr, "[apr] read-submit: no file for size=%llu\n",
-                        (unsigned long long)size); return 0x80020016ull; }
+    std::string host;
+    int matches = prosper_apr_match_by_size(size, &host);
+    if (matches == 0) {   // no container has this TOTAL size: a partial/chunk read we cannot place
+        fprintf(stderr, "[apr] ERROR: read-submit for %llu bytes matches no resolved container's "
+                "total size — partial/chunk reads are unsupported until the file id + offset are "
+                "decoded from the request (issue #62); refusing\n", (unsigned long long)size);
+        return 0x80020016ull;   // EINVAL
+    }
+    if (matches > 1) {    // ambiguous: serving the first match could deliver the WRONG file's bytes
+        fprintf(stderr, "[apr] ERROR: read-submit for %llu bytes is AMBIGUOUS (%d resolved "
+                "containers share that size, first: %s) — refusing rather than guessing "
+                "(issue #62)\n", (unsigned long long)size, matches, host.c_str());
+        return 0x80020016ull;   // EINVAL
+    }
 #ifndef _WIN32
     int fd = ::open(host.c_str(), O_RDONLY);
     if (fd < 0) return 0x80020016ull;
