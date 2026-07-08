@@ -501,15 +501,27 @@ HLE(f_apr_resolve) {
 extern uint64_t g_apr_last_cb, g_apr_last_cb_size;
 
 #ifndef _WIN32
-extern "C" __thread uint64_t g_apr_entry_rsp;
-__thread uint64_t g_apr_entry_rsp = 0;
+// MUST NOT be `__thread` (issue #89). An initial-exec thread-local here (`%fs:...@tpoff`) grows the
+// HOST binary's static TLS block, and prosper's guest boot aliases the host TCB through %fs (the
+// guest runs on the host %fs in the non-GUEST_FS boot; the fault-recovery point was moved off
+// `__thread` to gettid-keyed globals for exactly this reason). Adding one static-TLS slot shifted
+// the layout enough to crash The Messenger's minimal boot before graphics init ~9 runs in 10 — a
+// clean bisect to 653cf6f. A plain global is captured on the SAME thread that immediately reads it
+// (the entry shim tail-jumps straight into the handler, which reads apr_stack_arg() first thing),
+// so it is correct as long as APR reads don't overlap across threads — they don't in practice: the
+// engine builds each sceAmprAprCommandBufferReadFile into its single Ampr command buffer and our
+// completion is synchronous. CONFIDENCE: HIGH on the fix (boot restored to 10/10); MED on the
+// serialized-APR assumption — if concurrent APR reads ever appear, key this by gettid (still NOT
+// __thread) rather than reintroducing static TLS.
+extern "C" uint64_t g_apr_entry_rsp;
+uint64_t g_apr_entry_rsp = 0;
 extern "C" uint64_t f_apr_read_submit_c(uint64_t a0, uint64_t a1, uint64_t a2,
                                         uint64_t a3, uint64_t a4, uint64_t a5);
 asm(".text\n"
     ".globl f_apr_read_submit_entry\n"
     ".type f_apr_read_submit_entry,@function\n"
     "f_apr_read_submit_entry:\n"
-    "  movq %rsp, %fs:g_apr_entry_rsp@tpoff\n"
+    "  movq %rsp, g_apr_entry_rsp(%rip)\n"
     "  jmp f_apr_read_submit_c\n");
 extern "C" void f_apr_read_submit_entry();
 // Fetch the Nth stack argument (0-based: arg7 is n=0) of the in-flight ReadFile call.
