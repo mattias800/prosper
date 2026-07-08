@@ -108,14 +108,164 @@ init-guard-style function (`rax`=0x2001c10000 a BatchMap buffer, null deref, `rd
 read happens before this — the engine crashes *processing* the parsed TOC, before the next read.
 
 Field map of the APR read-request object (live `req` dump):
-`+0x00` count(1) · `+0x08` stack ptr · `+0x10` fn/vtable · `+0x18` small stack scratch ·
-`+0x20` **mapped data buffer (dest)** · `+0x28` status(err\|cboff) · `+0x30` **byte count** ·
+`+0x00` count(1) · `+0x08` stack ptr · `+0x10` fn/vtable · `+0x18` **begin out-slot 1** ·
+`+0x20` **begin out-slot 2 = data pointer** · `+0x28` status(err\|cboff) · `+0x30` **byte count** ·
 `+0x38` stack canary · `+0x40` stack ptr.
 
-Next: disassemble `0x2316c91` / `0x22fce69` — likely another null global/uninitialized IoStore
-struct (a missing init call or a container/registry the TOC parse expected to populate). Then the
-`.ucas` chunk reads begin (those MAY be Oodle-compressed — check each container's utoc
-`compressionMethodNameCount`; `global` was 0/uncompressed).
+### RESOLVED: the `eboot+0x2316c91` freelist crash was a stale, never-populated begin-cursor
+
+Root cause (proven by a full-run `PROSPER_HWWATCH_ABS` write history of the "dest" and by
+`PROSPER_AMPRLOG` arg/out-slot capture):
+
+- The APR read flow inits its request through the SAME Ampr NIDs as the page-map path:
+  `8aI7R7WaOlc(req, cbSize=0x40, 0, pathStruct, allocCtx=0x2001c10060, 3)` then
+  `a8uLzYY--tM(req, &req->0x18, &req->0x20, 0, 0x2a, 0)` then `mQ16(req, …)`. The `begin` call's
+  two pointer args are OUT-SLOTS the library must populate; the engine reads the file data back
+  through `*(req+0x20)` after completion — the library chooses the data location, not the engine.
+- Our `begin` HLE returned 0 WITHOUT writing the slots, so `req+0x20` kept stale stack garbage
+  that happened to point at a FREED 0x50-byte block (`0x1080e10a50`) of the engine's own live
+  path-string pool (freelist head `0x2001c10080`, carve-linker `eboot+0x230f1d8`, push
+  `eboot+0x2316e0c` — the push LINKS `node->next := head`, it does not zero). The HW watch showed
+  the block sitting free on the freelist at read time; writing the 645-byte TOC over it clobbered
+  the free nodes' next pointers with the TOC magic → the later pop at `eboot+0x2316c80` popped
+  `next == 0x2d3d3d2d2d3d3d2d` and faulted at `+0x2316c91`.
+- Why the TOC still "parsed": both our read HLE (write) and the engine (read-back) dereferenced
+  the SAME stale slot, so the data round-tripped consistently — only the pool underneath was
+  corrupted. There was never a prosper memory-model overlap: MEMLOG showed the page
+  `0x1080e10000` BatchMap-committed exactly once, no alias, no mirror (dmem/batchmap are clean).
+- Fix: `k_ampr_begin` now populates both out-slots with a prosper-owned 16 MiB staging buffer
+  (modeling the library-owned staging on real HW); a zero-length submit also clears the `req+0x28`
+  status. The crash is gone and the engine advances through global.utoc parse, `.ucas` open,
+  saved-paks probing, and pakchunk resolve.
+
+### RESOLVED: the "multi-segment" 3rd submit was frame residue — a3 IS the file id
+
+The `count=0x4 / total=36144292` reading of the 3rd submit was wrong: those request-frame slots
+are pure residue at that callsite (`req+0x00 = 0x402316d88` and `req+0x08 = 0x402316d50` are
+eboot CODE addresses; `req+0x30 = 0x22784a4` — 36,144,292 — recurs there across runs while
+`req+0x28` holds a stack pointer). The pak-read wrapper (descSize `0xdd`, a heap desc buffer)
+simply doesn't initialize the frame the way the utoc-read wrapper (descSize `0x90`) does.
+
+The real contract, proven over 6 live reads at both callsites (A/B-tested by rewriting the
+record and watching the engine follow it):
+
+- **`a3` is the APR file id** from resolve — a3=1 global.utoc, 3 pakchunk2-ps5.utoc,
+  4 pakchunk1-ps5.pak (twice), 5 pakchunk1-ps5.utoc, 6 pakchunk0-ps5.pak (twice),
+  7 pakchunk0-ps5.utoc. `mQ16(reqFrame, a1=&rec.scratch, a2=&rec.data, a3=fileId, descBuf,
+  descSize)`.
+- **`a2` points at a completion record the LIBRARY fills**: `[0]` data pointer (library-chosen
+  location — begin's staging cursor until submit publishes the final buffer), `[+8]` status
+  (0 = success; on failure `{low32 err, high32 CB offset}` — exactly the `24|40` / `2b|48`
+  pairs the "Apr read failure" fatal prints; checked at eboot `0x22738a5`), `[+0x10]` bytes.
+- **Byte count = the whole resolved file** (the engine got sizes from resolve; nothing in the
+  record is a trustworthy input).
+
+`f_apr_read_submit` now resolves by id, reads the whole file into a per-read prosper-owned
+buffer (never freed — the engine treats the pages as library-owned), and completes the record
+through `a2`. Result: the `eboot+0x22ebe7f` failure-path fault is gone and ALL containers read
+clean (global 645, pakchunk1 pak 339 + utoc 32,485, pakchunk0 pak 2,062,854,722 (!) + utoc
+14,271,592, empty pakchunk2 completes trivially with size 0). The whole IoStore container-mount
+phase finishes; the engine walks on to `globalshadercache-sf_ps5.bin` and a (legitimately
+absent) `doll/doll.uproject` probe.
+
+**Current wall (deeper again): `GEngineLoop.PreInit Failed!`** →
+`sceKernelDebugRaiseExceptionOnReleaseMode(0xa0020005)`. No fault — the engine reports init
+failure itself. Suspects, in order: (1) whole-file-from-offset-0 semantics for the TWO pak reads
+per pak (descSize `0xdd`/`0xde` — real HW likely reads the pak index/footer at an offset carried
+somewhere we don't decode yet; if the engine expects the published pointer to start AT its
+requested offset, the FPakFile index parse fails silently and no containers mount → PreInit
+can't find the engine inis); (2) the `resolve MISS` output contract (we write id=0/size=0 —
+verify against real errno/flag semantics); (3) `.ucas` chunk reads never happen before the
+failure — possibly downstream of (1). Watch item for (1): the 2 GiB pak is read whole TWICE
+(two leaked 2 GiB buffers) — finding the offset/size input fixes both correctness and cost.
+Then decompression: `.ucas` chunks MAY be Oodle-compressed (check `compressionMethodNameCount`;
+`global` was 0/uncompressed).
+
+Leads for (1), captured live (`PROSPER_APR_DIAG` + the now-logged four extra Ampr NIDs):
+
+- `a5` of the submit looks like the intended READ SIZE, not a descriptor size: utoc reads pass
+  `0x90` = exactly the utoc TocHeaderSize, pak reads pass `0xdd` = 221 = the FPakInfo footer
+  size (61 + 5×32 compression-method names) and then `0xde` (a second footer-version probe) —
+  i.e. the pak reads want the LAST `a5` bytes (`filesize-221`), which whole-file-from-0 does not
+  deliver at the published pointer.
+- For the pakchunk0 pak read the desc buffer (`a4=0x20018f0000`, BatchMap memory) is a
+  structured ENGINE-PREWRITTEN array (~0x28-byte records): `{seq 0x456/0x467/0x485/0x4a7, small
+  count 0/1/3/4, eboot ptr 0x4058d26b0, dest VA 0x10e0dfff8000, {high32 seq | low32 0xffffffff}
+  pending markers}` — very likely the real per-read command/completion descriptors. Decoding
+  this array is the next concrete step for offset-correct pak reads.
+- The four other Ampr NIDs the flow calls fire AFTER each submit with constant args
+  (`baQO9ez2gL4(req,0,0,0,0x40|0,0)`, `ULvXMDz56po(req,stack,0,0,0x45,4|7)`,
+  `Qs1xtplKo0U(req,&rec.scratch,&rec.data,0,0x45,0xe)`, `GuchCTefuZw(req,stack,0,0,0x45,0xf)`) —
+  teardown/end-of-request, not the offset carrier (arg capture via `PROSPER_AMPRLOG`).
+
+### SOLVED (2026-07-08, feat/ue4-apr-read): pak mounting works — the read is (offset, size) and offset is the 7th arg
+
+Two facts closed the loop:
+
+1. **NID names recovered by brute-force** (`nid_hash(name)` over a generated libSceAmpr corpus —
+   the algorithm in `nid.cpp`): the read is **`sceAmprAprCommandBufferReadFile`** (`mQ16-QdKv7k`),
+   and the flow is `sceAmprCommandBufferConstructor`(`8aI7R7WaOlc`) →
+   `sceAmprAprCommandBufferConstructor`(`a8uLzYY--tM`) → `sceAmprCommandBufferSetBuffer`
+   (`N-FSPA4S3nI`) → `sceAmprAprCommandBufferReadFile` → `sceAmprCommandBufferReset`
+   (`baQO9ez2gL4`) → `sceAmprAprCommandBufferDestructor`(`Qs1xtplKo0U`) →
+   `sceAmprCommandBufferDestructor`(`GuchCTefuZw`). "ReadFile" being a command *builder* means
+   **every read parameter is an argument** of that one call.
+
+2. **`ReadFile` has ≥7 args; the FILE OFFSET is the 7th, passed ON THE STACK** — which the plain
+   6-arg HleFn signature never saw (the exact blind spot that made pak footer reads look
+   offset-less). An asm entry shim (`f_apr_read_submit_entry` in `hle_file.cpp`) snapshots `rsp`
+   into a TLS slot so the handler reads stack args; it distinguishes the two stub tails (swap-stub
+   `call` vs `jmp`) by whether `[rsp]` is in the stub region `[0x6_0000_0000, 0x7_0000_0000)`.
+
+   Live-verified offsets (exact footer math, 8 reads, 3 file kinds): utoc header reads
+   `(off=0, size=0x90)`; the two FPakInfo footer probes per pak `(off=filesize-221, size=221)` and
+   `(off=filesize-222, size=222)` — e.g. pakchunk1 pak (339 B): `0x76`/`0x75`; pakchunk0 pak
+   (2,062,854,722 B): `0x7af4a965`/`0x7af4a964`. So **`a5` = size, `arg7` = offset**; the read is
+   a host `pread(fd, dst, a5, arg7)` clamped to EOF.
+
+3. **The destination is `a4` (arg5), the caller's `dst` buffer — not only the completion record.**
+   After fixing offset+size, PreInit *still* failed until the bytes were also written INTO `a4`:
+   the utoc callsite consumes data via the record pointer, but the **pak-footer callsite reads its
+   own `dst` buffer directly** (with only the side record published, the correct footer bytes were
+   never seen, no index read followed, mount failed). `f_apr_read_submit` now
+   `process_vm_writev`s into `a4` and publishes `record[0]=a4`; it falls back to a prosper-owned
+   staging buffer only if `a4` is absent/unmapped.
+
+**Result: `GEngineLoop.PreInit Failed!` is GONE. All containers mount.** The engine now issues the
+real post-footer reads it previously never reached: the FPakFile **index** at the footer's
+`IndexOffset`, then chunk/index-entry reads at learned offsets (e.g. pakchunk0 pak reads at
+`0x7af0b825`, `0x7af3550c`, `0x78a559dd`, …), and it opens+resolves the `.ucas` (pakchunk0-ps5.ucas
+id=10, 17.8 GB) — i.e. IoStore container mounting is complete. CONFIDENCE: HIGH (offset/size/dst all
+verified on live reads; PreInit-passes is the end-to-end proof).
+
+### NEW WALL: post-mount engine/RHI init — a null virtual call (racy, two faces)
+
+Boot now reaches early UE engine init and dies in one of two timing-dependent spots (the RHI /
+task-graph worker threads are now live, so it is nondeterministic):
+
+- **Main-thread face (representative):** a null vtable call. At `eboot+0x24c75ef`
+  `mov 0x28(%r15),%rdi ; mov (%rdi),%rax ; call *0x10(%rax)` the object's vtable slot `+0x10` is 0
+  → control jumps to `rip=0` (`RUN ENDED kind=2, rip=0x0`; backtrace
+  `eboot+0x24c75f2 ← +0x24c7234 ← +0x95a2 ← +0x7b26 ← +0x9c7 ← +0x508e ← +0xbf`, i.e. reached
+  from CRT `_start`/main on the main thread). The neighbourhood registers CVars by name — the
+  rodata strings loaded just before are `LoadModule  - `, and the sibling singleton-init block
+  (`eboot+0x503b878`) registers `r.Shadow.CacheWPOPrimitivesError` / `r.ShowMaterialDrawEvents` /
+  `r.RHIThread…` via `call *0xb0(%rax)` on a CVar-manager object. So this is **RHI / CVar / module
+  bring-up**, past PreInit.
+- **Worker-thread face:** a fault in host HLE code reading a small address (~`0x2936xx`, grows per
+  run) — a worker racing the same half-initialized subsystem.
+
+Next steps (in order):
+1. Resolve the null vtable object at `eboot+0x24c75ef`: break there, walk `[[r15+0x28]]` and its
+   vtable to see which interface method `+0x10` should be — likely a subsystem/module singleton
+   the engine expects a prior init to have populated (an unimplemented Sony import returning 0
+   where the engine stored the result as an object pointer, or a module we skip loading:
+   `SaveData.prx` / `PSN.prx` / `PS5Util.prx` / `Il2cppUserAssemblies.prx` are all "skipping absent
+   module"). Check whether one of those provides the missing vtable.
+2. Then the `.ucas` chunk reads proper (asset registry / shader cache). Check each utoc's
+   `CompressionMethodNameCount`: `global` was 0/uncompressed; the pakchunk `.ucas` chunks are
+   likely Oodle Kraken/Mermaid and will need a decode path.
+3. Then RHI/AGC init → first UE draw via the existing `execute_and_present`.
 
 ## Remaining work to the first frame (the subsystem)
 

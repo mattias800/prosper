@@ -309,7 +309,28 @@ namespace {
         if (w > 0) { char b[8]; syscall(SYS_read, g_probe_pipe[0], b, (size_t)w); }
         return w == 8;
     }
+    // PROSPER_DUMPAT="0xADDR[,0xADDR...]" — dump 0x40 bytes at each ABSOLUTE guest address at fault
+    // time (up to 6). Complements the register-relative FAULTMEM/PEEK when the address of interest
+    // is a fixed VA (e.g. comparing two candidate destination buffers). Parsed at arm time.
+    uint64_t g_dumpat[6] = {}; int g_dumpat_n = 0;
+    void dump_at_addrs() {
+        char b[256];
+        for (int i = 0; i < g_dumpat_n; i++) {
+            uint64_t a = g_dumpat[i];
+            int n = snprintf(b, sizeof b, "[prosper] DUMPAT 0x%llx:\n", (unsigned long long)a);
+            syscall(SYS_write, 2, b, (size_t)n);
+            for (int r = 0; r < 8; r++) {
+                uint64_t addr = a + (uint64_t)r * 8;
+                if (probe_readable(addr))
+                    n = snprintf(b, sizeof b, "  +0x%02x = 0x%016llx\n", r * 8, (unsigned long long)*(const uint64_t*)addr);
+                else
+                    n = snprintf(b, sizeof b, "  +0x%02x = <unmapped>\n", r * 8);
+                syscall(SYS_write, 2, b, (size_t)n);
+            }
+        }
+    }
     void dump_fault_mem() {
+        if (g_dumpat_n) dump_at_addrs();
         if (!g_faultmem) return;
         const struct { const char* n; uint64_t v; } regs[] = {
             {"rdi", g_rdi}, {"rsi", g_rsi}, {"rdx", g_rdx}, {"rcx", g_rcx},
@@ -440,7 +461,11 @@ namespace {
             if (g_hwwatch_fd >= 0 && si->si_fd == g_hwwatch_fd) {
                 auto& gr2 = uc->uc_mcontext.gregs;
                 unsigned long long v = 0; { auto p=(volatile uint64_t*)g_hwwatch_addr; v=*p; }
-                if (g_hwwatch_count < 60) {
+                // Always log an ANOMALOUS store (not a plausible guest heap pointer 0x1000000000..
+                // 0x1720000000, and nonzero) even past the count cap — this is how a corrupt value
+                // (e.g. a magic constant landing where a pointer belongs) is caught among the churn.
+                bool anomalous = v && (v < 0x1000000000ull || v >= 0x1730000000ull);
+                if (g_hwwatch_count < 60 || anomalous) {
                     g_hwwatch_count = g_hwwatch_count + 1;
                     char b[200];
                     uint64_t wr = (uint64_t)gr2[REG_RIP];
@@ -1158,6 +1183,26 @@ void install_trap_handler() {
             }
             if (!semi) break; spec = semi + 1;
         }
+    }
+    // PROSPER_HWWATCH_ABS=0xADDR — arm a hardware WRITE-watch on a FIXED absolute guest VA right now
+    // (owner = this = the main guest thread). Unlike PROSPER_HWWATCH (register-relative, armed on the
+    // first exec-bp hit), this catches writes to a known slot with no exec breakpoint. Each write logs
+    // the writer RIP + the value stored (see the g_hwwatch handler), so a corrupt value (e.g. a magic
+    // constant landing where a pointer belongs) is traced to its writer.
+    if (const char* wa = getenv("PROSPER_HWWATCH_ABS")) {
+        uint64_t addr = strtoull(wa, nullptr, 0);
+        struct sigaction ta{}; ta.sa_sigaction = fault_handler; ta.sa_flags = SA_SIGINFO;
+        sigemptyset(&ta.sa_mask); sigaction(SIGTRAP, &ta, nullptr);
+        arm_hwwatch(addr);
+    }
+    // PROSPER_DUMPAT="0xADDR[,0xADDR...]" — absolute guest addresses to hex-dump at fault time.
+    if (const char* da = getenv("PROSPER_DUMPAT")) {
+        const char* s = da;
+        while (*s && g_dumpat_n < 6) {
+            g_dumpat[g_dumpat_n++] = strtoull(s, nullptr, 0);
+            const char* comma = strchr(s, ','); if (!comma) break; s = comma + 1;
+        }
+        ensure_probe_pipe();   // DUMPAT uses probe_readable(); the readability probe now backs on a pipe (master #61)
     }
     // PROSPER_BP=0xOFFSET installs an int3 code-breakpoint-logger at guest VA 0x400000000+offset.
     if (const char* bp = getenv("PROSPER_BP")) {

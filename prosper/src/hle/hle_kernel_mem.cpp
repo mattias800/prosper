@@ -12,6 +12,8 @@
 #include <sys/syscall.h>
 #include <linux/futex.h>
 #include <unistd.h>
+#include <fcntl.h>          // fallocate
+#include <linux/falloc.h>  // FALLOC_FL_PUNCH_HOLE / FALLOC_FL_KEEP_SIZE
 #include <climits>
 #include <cerrno>
 #include <ctime>
@@ -168,6 +170,17 @@ namespace {
         }();
         return fd;
     }
+    // Zero a phys range in the memfd — real hardware hands out ZEROED pages on a fresh direct-memory
+    // allocation, but our memfd RETAINS bytes across release/reuse (a released phys re-allocated to a
+    // new buffer would otherwise expose stale content). Punch a hole (reads back as zeros, keeps the
+    // range sparse). Called only at ALLOCATION time, so it never disturbs the aliasing contract
+    // (which is about mapping an already-allocated phys at a second VA). CONFIDENCE: HIGH (matches
+    // the console's fresh-page-zeroed semantics).
+    void dmem_zero(uint64_t phys, uint64_t sz) {
+        int fd = dmem_fd();
+        if (fd >= 0 && phys < kDmemBase + kDmemTotal && sz)
+            fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, (off_t)phys, (off_t)sz);
+    }
     // Map `len` bytes of the phys pool at `hint` (0 = anywhere). Falls back to anonymous memory
     // if the memfd is unavailable (still boots; loses aliasing).
     void* map_phys_at(uint64_t hint, uint64_t len, int prot, uint64_t phys) {
@@ -248,6 +261,7 @@ HLE(k_alloc_dmem) {
         MLOG("alloc_dmem len=0x%llx -> ENOMEM (pool exhausted)\n", (unsigned long long)a2);
         return 0x8002000Cull;   // SCE_KERNEL_ERROR_ENOMEM
     }
+    dmem_zero(off, sz);                       // fresh allocation -> zeroed pages (console semantics)
     if (a5 > 0xffff) *(uint64_t*)a5 = off;   // only write through a plausible out-pointer
     MLOG("alloc_dmem len=0x%llx -> phys=0x%llx\n", (unsigned long long)a2, (unsigned long long)off);
     return 0;
@@ -264,6 +278,7 @@ HLE(k_alloc_main_dmem) {
         MLOG("alloc_main_dmem len=0x%llx -> ENOMEM (pool exhausted)\n", (unsigned long long)a0);
         return 0x8002000Cull;   // SCE_KERNEL_ERROR_ENOMEM
     }
+    dmem_zero(off, sz);                       // fresh allocation -> zeroed pages (console semantics)
     if (a3 > 0xffff) *(uint64_t*)a3 = off;
     MLOG("alloc_main_dmem len=0x%llx -> phys=0x%llx\n", (unsigned long long)a0, (unsigned long long)off);
     return 0;
@@ -442,6 +457,84 @@ HLE(k_dmem_size){ return kDmemTotal; }   // 8 GiB pool (allocation failures enfo
 // internally on real hardware; anonymous host pages model that). Names unknown — registered by
 // raw NID. CONFIDENCE: MED (semantics from live arg capture at all three call sites).
 HLE(k_ampr_ok) { return 0; }
+// DIAGNOSTIC (PROSPER_AMPRLOG=1): log every Ampr init/begin call with args and, for begin, the
+// CURRENT contents of the two out-cursor slots (a1/a2). Purpose: test whether the engine derives
+// the APR read destination from a begin-cursor we never populate (k_ampr_ok returns 0 without
+// writing outputs) — i.e. whether the stale value in *(a1)/*(a2) is where the bogus
+// req+0x20 = freed-pool-block pointer comes from.
+namespace { bool amprlog() { static int v = getenv("PROSPER_AMPRLOG") ? 1 : 0; return v; } }
+// Last Ampr command-buffer (address/size) seen at init: the APR read-submit path inits its request
+// with (req, cbSize, 0, cbBuf, poolCtx, 3) — the actual read COMMAND (file offset / dest / size)
+// lives inside cbBuf (the "CB offset 40" of the guest's error message is a byte offset into it).
+// Exposed so the read-submit HLE can locate and decode the real command. CONFIDENCE: MED.
+uint64_t g_apr_last_cb = 0, g_apr_last_cb_size = 0;
+HLE(k_ampr_init) {
+    if (a3 > 0xffff && a1 && a1 <= 0x10000) { g_apr_last_cb = a3; g_apr_last_cb_size = a1; }
+    if (amprlog()) {
+        fprintf(stderr, "[amprlog] init  a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx\n",
+                (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
+                (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)a5);
+        if (a0 > 0xffff) for (int o = 0; o < 0x40; o += 8)
+            fprintf(stderr, "[amprlog]   ctx+0x%02x = 0x%016llx\n", o, (unsigned long long)*(uint64_t*)(a0 + o));
+    }
+    return 0;
+}
+// DIAGNOSTIC (PROSPER_AMPRLOG=1): arg capture for the four other libSceAmpr NIDs the APR read flow
+// touches (baQO9ez2gL4 / ULvXMDz56po / Qs1xtplKo0U / GuchCTefuZw, previously anonymous unimpl
+// stubs). One of these likely carries the READ RANGE: the pak reads want the FPakInfo footer at
+// filesize-0xdd (a5 of the submit = 0xdd = footer size, 0x90 = utoc header size), so a per-read
+// {offset,size} must flow through some pre-submit call. CONFIDENCE: LOW until captured.
+static uint64_t ampr_arglog(const char* tag, uint64_t a0, uint64_t a1, uint64_t a2,
+                            uint64_t a3, uint64_t a4, uint64_t a5) {
+    if (amprlog()) {
+        fprintf(stderr, "[amprlog] %s a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx\n",
+                tag, (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
+                (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)a5);
+        for (uint64_t p : { a0, a1, a2 }) if (p > 0xffff && !(p & 7))
+            fprintf(stderr, "[amprlog]   [0x%llx] = 0x%016llx 0x%016llx\n", (unsigned long long)p,
+                    (unsigned long long)*(uint64_t*)p, (unsigned long long)*(uint64_t*)(p + 8));
+    }
+    return 0;
+}
+HLE(k_ampr_x1) { return ampr_arglog("baQO9ez2gL4", a0, a1, a2, a3, a4, a5); }
+HLE(k_ampr_x2) { return ampr_arglog("ULvXMDz56po", a0, a1, a2, a3, a4, a5); }
+HLE(k_ampr_x3) { return ampr_arglog("Qs1xtplKo0U", a0, a1, a2, a3, a4, a5); }
+HLE(k_ampr_x4) { return ampr_arglog("GuchCTefuZw", a0, a1, a2, a3, a4, a5); }
+HLE(k_ampr_begin) {
+    if (amprlog()) {
+        fprintf(stderr, "[amprlog] begin a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx\n",
+                (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
+                (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)a5);
+        if (a1 > 0xffff) fprintf(stderr, "[amprlog]   *out1 = 0x%016llx\n", (unsigned long long)*(uint64_t*)a1);
+        if (a2 > 0xffff) fprintf(stderr, "[amprlog]   *out2 = 0x%016llx\n", (unsigned long long)*(uint64_t*)a2);
+        if (a0 > 0xffff) for (int o = 0; o < 0x40; o += 8)
+            fprintf(stderr, "[amprlog]   ctx+0x%02x = 0x%016llx\n", o, (unsigned long long)*(uint64_t*)(a0 + o));
+    }
+    // POPULATE the out-slots with a library-owned staging buffer. Root cause of the eboot+0x2316c91
+    // freelist crash (UE4 PPSA17942 IoStore): the APR read flow is
+    //   init(req, cbSize, 0, pathStruct, allocCtx, 3); begin(req, &req->0x18, &req->0x20); submit(req,…)
+    // and after completion the ENGINE reads the file bytes through *(req+0x20) — i.e. begin's second
+    // out-slot is the data pointer the library chooses. Returning 0 WITHOUT writing the slots left
+    // stale stack garbage in req+0x20 that happened to point at a FREED 0x50-byte block of the
+    // engine's own live path-string pool (freelist head 0x2001c10080, blocks 0x1080e10xxx — proven by
+    // a full-run HW write-watch: the block was carve-linked, churned as UTF-16 path storage, and was
+    // sitting FREE on the freelist when the APR read wrote the 645-byte TOC over it, clobbering the
+    // free nodes' next pointers with the TOC magic). Both we and the engine dereferenced the same
+    // stale slot, which is why the TOC still parsed while the pool corrupted. On real hardware the
+    // Ampr library returns its own staging pointer here; model that with a prosper-owned buffer.
+    // The engine consumes the data synchronously after submit, so one buffer serves consecutive
+    // reads. CONFIDENCE: MED (out-slot semantics inferred from live capture + the NOWRITE/WRITELEN
+    // experiments; staging size generous for the .ucas chunk reads that follow).
+    static void* staging = [] {
+        void* p = mmap(nullptr, 16ull << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        return p == MAP_FAILED ? nullptr : p;
+    }();
+    if (staging) {
+        if (a1 > 0xffff) *(uint64_t*)a1 = (uint64_t)staging;
+        if (a2 > 0xffff) *(uint64_t*)a2 = (uint64_t)staging;
+    }
+    return 0;
+}
 HLE(k_ampr_push_map) {
     if (a1 && a2) {
         // Back the page from the shared phys pool so BOTH pool views alias the same bytes: the
@@ -567,10 +660,18 @@ void register_kernel_mem_hle() {
     // sync_on_address futex — registered by raw NID (names not in any public DB yet).
     Hle::register_fn("Hc4CaR6JBL0", (HleFn)k_wait_on_address, "sceKernelWaitOnAddress?");
     Hle::register_fn("q2y-wDIVWZA", (HleFn)k_wake_by_address, "sceKernelWakeByAddress?");
-    // libSceAmpr command-buffer trio (raw NIDs; see the block comment above k_ampr_push_map).
-    Hle::register_fn("8aI7R7WaOlc", (HleFn)k_ampr_ok,       "sceAmprCommandBufferInit?");
-    Hle::register_fn("a8uLzYY--tM", (HleFn)k_ampr_ok,       "sceAmprCommandBufferBegin?");
-    Hle::register_fn("N-FSPA4S3nI", (HleFn)k_ampr_push_map, "sceAmprPushMapPages?");
+    // libSceAmpr command-buffer trio. NID names recovered by brute-forcing nid_hash() over a
+    // generated libSceAmpr corpus (see hle_file.cpp block comment above f_apr_read_submit).
+    Hle::register_fn("8aI7R7WaOlc", (HleFn)k_ampr_init,     "sceAmprCommandBufferConstructor");
+    Hle::register_fn("a8uLzYY--tM", (HleFn)k_ampr_begin,    "sceAmprAprCommandBufferConstructor");
+    Hle::register_fn("N-FSPA4S3nI", (HleFn)k_ampr_push_map, "sceAmprCommandBufferSetBuffer");
+    // The rest of the APR read flow: Reset (pre-submit) + the two Destructors (post-submit
+    // teardown). Modeled as no-ops (arg capture under PROSPER_AMPRLOG); the read itself is
+    // sceAmprAprCommandBufferReadFile in hle_file.cpp.
+    Hle::register_fn("baQO9ez2gL4", (HleFn)k_ampr_x1, "sceAmprCommandBufferReset");
+    Hle::register_fn("ULvXMDz56po", (HleFn)k_ampr_x2, "sceAmpr?ULvXMDz56po");
+    Hle::register_fn("Qs1xtplKo0U", (HleFn)k_ampr_x3, "sceAmprAprCommandBufferDestructor");
+    Hle::register_fn("GuchCTefuZw", (HleFn)k_ampr_x4, "sceAmprCommandBufferDestructor");
 }
 
 } // namespace prosper
