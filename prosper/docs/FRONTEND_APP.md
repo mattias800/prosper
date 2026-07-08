@@ -1,0 +1,172 @@
+# prosper-app — the OS-integration frontend (design)
+
+**Status:** design / not started. Later-priority. This doc is the plan of record so the design
+survives until someone builds it.
+
+## What it is
+
+`prosper-app` is a **separate frontend binary** that turns the headless prosper core into a real
+desktop app: a window showing the game, audio out, controller in, and close-to-quit. It exists so
+we can watch prosper run on a real GPU with sound — a human-perspective smoke test — **without
+compromising the headless-first core**, which stays the source of truth for agentic/CI verification.
+
+On Windows this runs under WSL2: Windows 11's **WSLg** already provides a Wayland/X11 compositor
++ PulseAudio + (vendor-ICD) Vulkan, so a Linux GUI app's window appears on the Windows desktop
+(taskbar + Start-menu entry), plays audio through Windows, and quits when the window closes. The
+frontend is an ordinary Linux SDL app; WSLg is the whole "Windows app" story. See *Deployment*.
+
+## First principle: the dependency arrow points one way
+
+```
+prosper_core   (static lib — ZERO windowing/surface/OS-device deps; headless; CI-tested)
+     ▲ links
+     │      audio_set_sink() · pad_set_backend() · present_* readback · run/request_stop()
+frontends/prosper-app   (new binary — owns ALL OS integration, via SDL3)
+```
+
+The core never links SDL, a window system, or a presentation surface. The frontend depends on the
+core; the core never depends on the frontend. Delete `frontends/` and CI is unaffected. This makes
+"separate" and "headless-first" structural guarantees, not conventions to remember.
+
+## The seam contract (three of four already exist)
+
+The core already exposes exactly the injection points a frontend needs. The frontend *supplies*
+implementations; the core calls them.
+
+### 1. Audio — `AudioSink` (exists, `src/hle/audio.hpp`)
+```cpp
+struct AudioSink {
+    virtual bool open(int port, const AudioPortInfo& info);        // configure a port
+    virtual void output(int port, const void* pcm, int frames) = 0;// one interleaved-PCM grain
+    virtual void set_volume(int port, uint32_t mask, const int* vols);
+    virtual void close(int port);
+};
+void audio_set_sink(AudioSink*);   // nullptr restores the built-in silent/real-time sink
+```
+Frontend supplies an **SDL3 audio sink** (queue each `output()` grain to an SDL audio stream). The
+`feat/audio-sdl3` branch is already most of this — coordinate with it, don't duplicate.
+
+### 2. Controllers — `PadBackend` (exists, `src/input/pad.hpp`)
+```cpp
+struct PadBackend {
+    virtual bool poll(int index, HostPadState& out) = 0;  // called on the guest's input thread; MUST be thread-safe
+};
+void pad_set_backend(PadBackend*);   // nullptr restores the neutral (no-device) backend
+```
+Frontend supplies an **SDL3 `GameController` backend**, mapping SDL buttons/axes → `HostPadState`.
+The pad header already documents frontends installing this from the harness.
+
+### 3. Video — the present readback (exists, `src/gpu/videoout_present.hpp`)
+```cpp
+bool     present_has_frame();
+uint32_t present_width();  uint32_t present_height();
+uint64_t present_count();                 // total flips presented (advances on guest flip)
+size_t   present_readback(void* dst, size_t dst_cap);   // copy the presented frame's pixels (w*h*4)
+```
+On each guest flip the renderer writes the finished frame into the scanout buffer; `present_readback`
+hands out those **CPU pixels**. The frontend polls `present_count()` for a new frame and blits the
+readback into its swapchain. This is the whole video boundary — the frontend is a pure *consumer* of
+finished frames.
+
+### 4. Lifecycle — run/stop (the ONE new core hook)
+Today `boot_trace` runs the guest to a fixed frame budget. An app needs the guest loop to live with
+the window. Add a minimal, headless-agnostic control:
+```cpp
+// in the run harness / a small host lifecycle header
+void prosper_request_stop();     // idempotent; sets a flag the guest run-loop checks
+bool prosper_stop_requested();
+```
+`boot_trace` keeps its fixed-budget behavior for CI; the frontend calls `prosper_request_stop()` on
+window close, and the run-loop (guest driver) exits, threads join, teardown runs. **This is the only
+change inside the core-adjacent code, and it touches the run harness — coordinate (see Risks).**
+
+## The Vulkan-context decision: two contexts, frames cross as CPU pixels
+
+**The frontend owns its own Vulkan context (instance + device + swapchain on the window surface).
+The core keeps its existing headless render device. Frames cross the boundary as CPU pixels via
+`present_readback`.** Rationale:
+
+- The core's render device stays **surface-free and unchanged** — no swapchain dependency leaks into
+  the renderer, no `#ifdef`, headless + CI identical.
+- The seam already emits CPU pixels, so the frontend is a pure consumer — the cleanest boundary, and
+  the same seam becomes a shared-memory frame ring if the two are ever split into separate processes.
+- Cost = one readback + one upload per frame. The Messenger is 2D at 1080p (~8 MB/frame) — negligible.
+
+**When to revisit:** only if a future 3D-heavy title makes the per-frame copy a real bottleneck. Then
+unify on a single frontend-provided device and share the render target via `VK_KHR_external_memory`
+(zero-copy) — but keep `present_readback` as the abstraction so headless still works. Not now.
+
+## Present loop (sketch)
+
+```
+init:  SDL_Init(VIDEO|AUDIO|GAMECONTROLLER); create window;
+       create VkInstance(+VK_KHR_surface, win32/wayland), VkSurfaceKHR, pick device, swapchain,
+       one staging buffer + one sampled VkImage sized to present_width()×present_height();
+       audio_set_sink(&sdl_sink); pad_set_backend(&sdl_pads);
+       start the guest run-loop on its own thread.
+
+frame: SDL_PollEvent → on SDL_QUIT / window-close: prosper_request_stop(); break;
+       if present_count() advanced since last shown:
+           n = present_readback(staging_mapped, cap);
+           upload staging → VkImage; blit/scale VkImage → acquired swapchain image; vkQueuePresentKHR;
+       else: small sleep / wait on a frame condvar to avoid spinning.
+
+quit:  prosper_request_stop(); join guest thread; destroy swapchain/device/window; SDL_Quit().
+```
+Handle swapchain resize (`present_width/height` change or window resize → recreate). Vsync via
+`VK_PRESENT_MODE_FIFO`.
+
+## Threading
+
+- **Guest run-loop thread**: drives the guest (as `boot_trace` does), renders into scanout on flip.
+- **Main/UI thread**: SDL event pump + swapchain present. It only *reads* via `present_readback`
+  (already mutex-guarded: renderer writes, present reads) — no new shared state.
+- Audio/pad callbacks run on whatever thread the core calls them from; the SDL sink/backend must be
+  thread-safe (the pad header already requires it).
+
+Shutdown ordering: `request_stop` → guest thread observes the flag at its loop boundary and returns →
+join → tear down GPU/window. No teardown races because the frontend owns the window/device and only
+destroys them after the guest thread has joined.
+
+## Target / build layout
+
+- New dir `frontends/prosper-app/` with its own `main.cpp` + the SDL sink/backend.
+- Its own CMake target linking `prosper_core`, gated `if(BUILD_FRONTEND_APP)` (**default OFF**), and
+  on `find_package(SDL3)` + `find_package(Vulkan)` being present. The core and all existing tests
+  build and pass with the frontend absent — never a core/CI dependency.
+- SDL3 unifies window + audio + gamepad in one dep, matching the existing SDL3 direction
+  (`feat/audio-sdl3`, the gamepad frontend).
+
+## Deployment on Windows (WSLg)
+
+1. Prereq check: `vulkaninfo` in the WSL shell confirms a usable Vulkan device (vendor WSL ICD, else
+   Mesa Dozen over D3D12). This is the one external dependency worth verifying up front.
+2. Build the frontend in WSL with `-DBUILD_FRONTEND_APP=ON`.
+3. Run it; WSLg surfaces the window on the Windows desktop with audio + a taskbar/Start entry.
+4. Optional: a `.desktop` file (WSLg auto-registers Start-menu shortcuts) or a one-line `.bat`/`.lnk`
+   launcher on the Windows side.
+
+## Keeping it agentic-first
+
+The human-facing app is **opt-in and additive**. The BMP/CRC headless path stays the default and the
+CI source of truth. Nothing the frontend adds gates a core test. A future *frontend* smoke test, if
+wanted, should use an offscreen/hidden surface and stay out of the default `ctest` set (needs a real
+Vulkan device + display, which CI may lack).
+
+## Phased plan
+
+- **P0 — window + present**: SDL window, swapchain, present-from-readback, `SDL_QUIT`→stop, the
+  run/request_stop hook. Result: watch the game render on a real GPU, close to quit.
+- **P1 — audio**: land the SDL3 `AudioSink` (from `feat/audio-sdl3`). Result: sound.
+- **P2 — controllers**: SDL3 `GameController` `PadBackend`. Result: play it.
+- **P3 — polish**: resize, fullscreen, pause/quit UX, present-mode/latency tuning, packaging.
+
+## Risks & open questions
+
+- **Vulkan-in-WSL ICD** — the single external unknown; verify with `vulkaninfo` before P0.
+- **The run/stop hook touches the run harness** (`boot_trace`/how the guest loop is driven), which the
+  render-frontier and audio workstreams also use — coordinate; keep the fixed-budget CI path intact.
+- **`feat/audio-sdl3` overlap** — P1 must build on that branch, not fork it.
+- **Present latency/vsync** under WSLg is decent, not native — acceptable for a smoke/dev view.
+- **Later zero-copy** (`external_memory`) is deliberately deferred; the readback seam is the v1 answer.
+- **area:** shared/host infrastructure — needs an `area:` decision and coordination before build.
