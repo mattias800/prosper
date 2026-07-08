@@ -52,19 +52,24 @@ static void honor_eop_write(const Pm4Command& c) {
         // at a live label address (and a mis-extraction that yields 0 has a garbage value dword too,
         // so skipping is right in both readings). CONFIDENCE: MED.
         case 0: return;
-        case 1: { uint32_t v = (uint32_t)c.rel_value; memcpy(dst, &v, sizeof v); break; }
-        case 2: { uint64_t v = c.rel_value;           memcpy(dst, &v, sizeof v); break; }
+        // Cases 1/2 need the same rel_value_valid guard the default case got: a short-decoded
+        // packet's rel_value is a fabricated 0 that could move a satisfied fence label BACKWARDS
+        // (re-blocking a `*label >= expected` poll).
+        case 1: { if (!c.rel_value_valid) return;
+                  uint32_t v = (uint32_t)c.rel_value; memcpy(dst, &v, sizeof v); break; }
+        case 2: { if (!c.rel_value_valid) return;
+                  uint64_t v = c.rel_value;           memcpy(dst, &v, sizeof v); break; }
         case 3: { uint64_t v = gpu_clock64();         memcpy(dst, &v, sizeof v); break; }
-        // A RELEASE_MEM ALWAYS writes a completion fence — that's its purpose. Our stack-arg ABI
-        // extraction can mis-read data_sel (it arrives as a pointer, not the 1/2/3 enum), so don't SKIP the
-        // write on an unrecognized selector: default to the 64-bit value. Skipping it starved the render
-        // thread's completion wait and stalled the frame loop after the first real draw. CONFIDENCE: MED.
+        // Unknown selector: LOG AND SKIP. The old default wrote the 64-bit value for ANY
+        // unrecognized data_sel — a band-aid for the swap-stub stack-arg mis-extraction that made
+        // data_sel arrive as a pointer (fixed in exec_image_linux.cpp emit_swap_stub: handlers now
+        // see real stack args, verified live with data_sel=0x2/0x3). With the root cause gone, an
+        // unknown selector means a genuinely unexpected packet: writing 8 bytes on a guess could
+        // clobber the dword after a 32-bit label. Log so the gap is visible, never write.
         default:
-            // ... but only when the packet actually carried a value: a short-decoded packet's
-            // rel_value is a fabricated 0 that could move a fence label BACKWARDS.
-            if (!c.rel_value_valid) return;
-            { uint64_t v = c.rel_value;               memcpy(dst, &v, sizeof v); }
-            break;
+            fprintf(stderr, "[agc] RELEASE_MEM: unknown data_sel=%u addr=0x%llx value=0x%llx — write SKIPPED\n",
+                    c.rel_data_sel, (unsigned long long)c.rel_addr, (unsigned long long)c.rel_value);
+            return;
     }
     if (getenv("PROSPER_GFXLOG"))
         fprintf(stderr, "[agc]   EOP write [0x%llx] data_sel=%u value=0x%llx\n",
@@ -136,6 +141,32 @@ void GpuState::apply(const Pm4Command& c) {
             break;
         case K::WriteData:
             honor_write_data(c);    // inline data write requested by the Dcb
+            break;
+        case K::WaitRegMem:
+            // Synchronous fold: by the time we process this packet the CPU-side producer has
+            // usually already written the label, so the wait is normally satisfied. We can't
+            // BLOCK here (single-threaded fold) — but a wait that is NOT satisfied means the
+            // dependency would have been violated (packets after this one read data the guest
+            // hadn't produced at submit), so surface it loudly instead of silently proceeding.
+            if (c.wm_valid && c.wm_addr && !(c.wm_addr & 3)) {
+                uint64_t mem = 0; memcpy(&mem, (const void*)(uintptr_t)c.wm_addr, sizeof mem);
+                uint64_t v = mem & c.wm_mask, r = c.wm_ref;
+                bool sat;
+                switch (c.wm_func) {           // PM4 WAIT_REG_MEM compare functions
+                    case 0: sat = true;    break;
+                    case 1: sat = v <  r;  break;
+                    case 2: sat = v <= r;  break;
+                    case 3: sat = v == r;  break;
+                    case 4: sat = v != r;  break;
+                    case 5: sat = v >= r;  break;
+                    case 6: sat = v >  r;  break;
+                    default: sat = false;  break;
+                }
+                if (!sat)
+                    fprintf(stderr, "[agc] WaitRegMem NOT satisfied at fold time: [0x%llx]&0x%llx = 0x%llx, func=%u ref=0x%llx — dependency violated\n",
+                            (unsigned long long)c.wm_addr, (unsigned long long)c.wm_mask,
+                            (unsigned long long)v, c.wm_func, (unsigned long long)r);
+            }
             break;
         case K::Flip:
             // The GPU reaching the SetFlip packet IS the flip moment (synchronous fold): perform the
