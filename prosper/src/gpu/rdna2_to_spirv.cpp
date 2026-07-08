@@ -39,7 +39,7 @@ enum : uint32_t {
     Op_ImageRead=98, Op_ImageWrite=99,
     Op_TypeArray=28, Op_ControlBarrier=224,
     Op_Phi=245, Op_LoopMerge=246,
-    Op_SelectionMerge=247, Op_Label=248, Op_Branch=249, Op_BranchConditional=250, Op_Return=253,
+    Op_SelectionMerge=247, Op_Label=248, Op_Branch=249, Op_BranchConditional=250, Op_Kill=252, Op_Return=253,
 };
 // GLSL.std.450 extended-instruction numbers.
 enum : uint32_t { Glsl_FAbs=4, Glsl_RoundEven=2, Glsl_Trunc=3, Glsl_Floor=8, Glsl_Ceil=9, Glsl_Fract=10, Glsl_Exp2=29, Glsl_Log2=30,
@@ -152,6 +152,17 @@ struct SpirvCompute {
     }
     void patch_phi(size_t patch_off, uint32_t v1, uint32_t l1) { code[patch_off] = v1; code[patch_off + 1] = l1; }
     void emit_selmerge(uint32_t m) { put(code, Op_SelectionMerge, {m, 0}); }   // structured if (before condbranch)
+    // Fragment discard: OpKill any lane where `alive` is false, survivors fall through to `mergeL`. Used to
+    // lower an EXP done under a narrowed EXEC (an alpha-test / WQM discard — the surviving lanes are the
+    // ones that pass the kill test) to a real per-invocation discard. OpKill is a block terminator, so the
+    // kill block has no back-edge to the merge; the merge's sole predecessor is the conditional branch.
+    void discard_unless(uint32_t alive) {
+        uint32_t killL = id(), mergeL = id();
+        put(code, Op_SelectionMerge, {mergeL, 0});
+        put(code, Op_BranchConditional, {alive, mergeL, killL});
+        emit_label(killL); put(code, Op_Kill, {});
+        emit_label(mergeL);
+    }
     // OpPhi with two fully-known predecessors (both edges' values available now) — for an if/merge join.
     uint32_t emit_phi_2way(uint32_t type, uint32_t va, uint32_t la, uint32_t vb, uint32_t lb) {
         uint32_t r = id(); put(code, Op_Phi, {type, r, va, la, vb, lb}); return r;
@@ -924,16 +935,25 @@ struct ForwardIf {
     uint32_t branch_pc = 0, target_pc = 0;
     bool on_scc0 = true;   // s_cbranch_scc0/vccz (branch taken == skip block when flag==0) vs scc1/vccnz
     bool on_vcc  = false;  // condition register: false = SCC, true = VCC (both are wave-uniform branches)
+    bool early_out = false;// branch target was clamped to end_pc: the conditional block ENDS the shader
 };
-ForwardIf detect_forward_if(const std::vector<Rdna2Inst>& ins) {
+// allow_vcc: also accept a forward s_cbranch_vccz/vccnz. Only the per-invocation VS/FS shells set this —
+// there each SPIR-V invocation IS one lane, so branching on this lane's VCC bit (rs.vcc) is exactly the
+// per-vertex / per-pixel divergent-if the hardware runs. The 64-lane COMPUTE shell must NOT (its VCC is a
+// wave mask needing a wave-uniform reduce — test_recompile_coverage guards this), so it leaves allow_vcc
+// false and vcc branches fall through to straight-line (which rejects them).
+ForwardIf detect_forward_if(const std::vector<Rdna2Inst>& ins, bool allow_vcc) {
     ForwardIf F; const Rdna2Inst* br = nullptr; int nbranch = 0; uint32_t end_pc = UINT32_MAX;
     for (const auto& in : ins) if (in.is_end) { end_pc = in.pc; break; }
     for (const auto& in : ins) {
         if (in.is_end) break;
         if (in.fmt != Rdna2Format::SOPP) continue;
         switch (in.opcode) {
-            case 0x02: case 0x06: case 0x07: case 0x08: case 0x09:   // s_branch / vcc* / execz / execnz -> reject
-                return F;                                            // (VCC branches need a wave-uniform test)
+            case 0x02: case 0x08: case 0x09:                         // s_branch / execz / execnz -> reject
+                return F;
+            case 0x06: case 0x07:                                    // vccz / vccnz
+                if (!allow_vcc) return F;                            // compute: needs a wave-uniform VCC test
+                br = &in; nbranch++; break;
             case 0x04: case 0x05:                                    // scc0 / scc1 (SCC is scalar/wave-uniform)
                 br = &in; nbranch++; break;
             default: break;                                          // hints (nop/waitcnt/…) are fine
@@ -944,9 +964,12 @@ ForwardIf detect_forward_if(const std::vector<Rdna2Inst>& ins) {
     // Early-out: a forward branch to the instruction AFTER s_endpgm skips the rest of the shader. Clamp the
     // merge to end_pc so the conditional block is [branch_pc+1, end_pc) (the skipped work) and s_endpgm is
     // emitted normally after the merge — the exact "if (cond) { work } end" early-out shape.
-    if (tgt > end_pc && tgt != UINT32_MAX) tgt = end_pc;
+    bool early = false;
+    if (tgt > end_pc && tgt != UINT32_MAX) { tgt = end_pc; early = true; }
     if (tgt <= br->pc || tgt > end_pc) return F;                     // must be forward, within the stream
-    F.found = true; F.branch_pc = br->pc; F.target_pc = tgt; F.on_scc0 = (br->opcode == 0x04);
+    F.found = true; F.branch_pc = br->pc; F.target_pc = tgt; F.early_out = (early || tgt == end_pc);
+    F.on_scc0 = (br->opcode == 0x04 || br->opcode == 0x06);         // scc0/vccz: skip block when flag==0
+    F.on_vcc  = (br->opcode == 0x06 || br->opcode == 0x07);
     return F;
 }
 
@@ -1309,6 +1332,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 // v_mac_f32 (0x1f) / v_fmac_f32 (0x2b): dst = src0*src1 + dst (accumulate into the dest).
                 // mac vs fmac differ only in fused rounding — immaterial here. old_d = the dst accumulator.
+                // NOTE(opcode ID): op 0x1f is v_mac_f32 on the PS5's ISA. v_mac_f32 was REMOVED on desktop
+                // RDNA2/gfx1030 (where 0x1f is invalid and llvm-mc reads canonical v_dot2c at 0x02), but the
+                // PS5 GPU retains the RDNA1/gfx1010 encoding — VERIFIED by round-tripping the scene VS's
+                // actual op-0x1f word 0x3e261221 through `llvm-mc -mcpu=gfx1010` → `v_mac_f32_e32`. The VOP3
+                // (e64) form of this same op is 0x11f, handled in the VOP3 switch below.
                 case 0x1F: case 0x2B: d = b.fbin(Op_FAdd, b.fbin(Op_FMul, a, c), old_d); break;
                 // The four mul-add-with-literal-K ops (K = in.literal). madmk/fmamk = src0*K + src1;
                 // madak/fmaak = src0*src1 + K. (mad vs fma differ only in fused rounding — immaterial here.)
@@ -1510,6 +1538,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (s2.value == 106 || s2.value == 107) m = rs.vcc;
                 else if (s2.kind == OperandKind::SGPR) { auto it = rs.sreg_bool.find(s2.value); if (it != rs.sreg_bool.end()) m = it->second; }
                 if (!m) ok = false; else vreg[in.dst.value] = b.sel(m, val(in.src[1]), val(in.src[0]));
+            } else if (in.opcode == 0x11F) {                          // v_mac_f32_e64 (VOP3 form of VOP2 0x1f)
+                // dst = src0*src1 + dst, with the VOP3 float source modifiers (neg/abs via fv) and output
+                // modifiers (omod/clamp via fresult). The scene VS emits this e64 form with a `-|v10|`
+                // modifier (round-trip: `llvm-mc -mcpu=gfx1010` of 0xd51f020a → v_mac_f32_e64 v10,v28,-|v10|).
+                vreg[in.dst.value] = fresult(b.fbin(Op_FAdd, b.fbin(Op_FMul, fv(0), fv(1)), old_d));
             } else ok = false;
             if (ok) predicate_write(b, rs, in.dst.value, old_d);
             return true;
@@ -1945,7 +1978,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         }
         // 7. Post-loop body.
         if (!emit_range(L.exit_pc, UINT32_MAX)) return false;
-    } else if (const ForwardIf F = detect_forward_if(ins); F.found) {
+    } else if (const ForwardIf F = detect_forward_if(ins, /*allow_vcc*/!b.is_compute); F.found) {
         // Single structured uniform IF (forward s_cbranch_scc0/scc1): emit as OpSelectionMerge +
         // OpBranchConditional on the SCC bool, with an OpPhi per register written in the conditional
         // block that is live after the merge. Parallels the loop path's phi machinery. CONFIDENCE: MED —
@@ -1970,7 +2003,11 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         b.emit_selmerge(mergeL); b.emit_condbranch(exec_cond, thenL, mergeL);
         b.emit_label(thenL);
         if (!emit_range(F.branch_pc + 1, F.target_pc)) return false;
-        if (rs.exec_narrowed) return false;                 // block must not narrow EXEC (reject if it does)
+        // A block that narrows EXEC is unsafe to leave open into the merge — UNLESS it's an early-out block
+        // that ENDS the shader (only s_endpgm follows the merge, so the post-merge phi values are never
+        // read). The alpha-test discard PS lands here: it exports (lowered to OpKill+export) then restores
+        // EXEC to the survivor mask just before s_endpgm — that trailing narrow is harmless.
+        if (rs.exec_narrowed && !F.early_out) return false;
         const uint32_t thenEnd = b.cur_block;               // single block (no inner branches) → == thenL
         std::unordered_map<int,uint32_t> then_v, then_s;
         for (int r : ifv) then_v[r] = vget(r);
@@ -2025,7 +2062,7 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
     // back-edge + exit, and the forward-if branch) as handled, so coverage matches what actually recompiles
     // (previously the MSAA-resolve loop shaders 031-034 were mis-flagged "blocked" at their s_cbranch_scc0).
     const CountedLoop cL = detect_counted_loop(ins);
-    const ForwardIf   cF = detect_forward_if(ins);
+    const ForwardIf   cF = detect_forward_if(ins, /*allow_vcc*/false);   // conservative diagnostic (compute-safe)
     auto cf_reconstructed = [&](const Rdna2Inst& i) {
         if (cL.found && (i.pc == cL.backedge_pc || i.pc == cL.exit_branch_pc)) return true;
         if (cF.found && i.pc == cF.branch_pc) return true;
@@ -2084,11 +2121,13 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords, co
     auto safe_branches = safe_execz_branches(ins);
     bool exported = false;
     auto exp_fn = [&](const Rdna2Inst& in) -> bool {         // EXP MRT0..7 -> the color output
-        // We don't model EXEC-masked export/discard, so an export while EXEC is narrowed (a lane killed by
-        // v_cmpx and not restored) would wrongly write inactive lanes -> reject. In practice the export
-        // runs after EXEC is restored to all-on (the common sRGB/tonemap divergent-if shape), so this is
-        // only a guard against genuine mid-discard exports.
-        if (rs.exec_narrowed) return false;
+        // An export while EXEC is narrowed (lanes killed by an alpha test / v_cmpx and not restored to
+        // all-on) must not write the inactive lanes. Lower it to a real fragment discard: OpKill the lanes
+        // whose EXEC bit is false, then export from the survivors under full EXEC. This is exactly the
+        // alpha-tested-sprite shape (image_sample -> v_cmp alpha<ref -> s_andn2 saved,saved,vcc -> s_wqm
+        // exec,saved -> shade -> export): the surviving lanes are the ones that passed the test. (When EXEC
+        // was never narrowed this is a no-op — the common sRGB/tonemap restore-then-export path.)
+        if (rs.exec_narrowed) { b.discard_unless(rs.exec); rs.exec = b.btrue(); rs.exec_narrowed = false; }
         if (in.exp_target <= 7 && !exported) {
             if (in.exp_compr) {
                 // COMPR: the 4 channels are two f16x2 pairs — src[0] holds (r,g), src[1] holds (b,a).

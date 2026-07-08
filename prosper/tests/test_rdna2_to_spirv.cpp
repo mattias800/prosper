@@ -910,6 +910,9 @@ int main() {
     CHECK(spv47d.empty(), "kernel 47d (SOPK RMW reads block scalar after merge) correctly REJECTED");
 
     // Kernel 48: v_mac_f32 (VOP2 0x1f) = src0*src1 + dst (accumulate). v3 = 3.0; v3 = a0*a1 + v3.
+    // op 0x1f is v_mac_f32 on the PS5 ISA — the RDNA1/gfx1010 encoding (removed on desktop gfx1030, where
+    // 0x1f is invalid). Verified by round-tripping the scene VS's op-0x1f word 0x3e261221 through
+    // `llvm-mc -mcpu=gfx1010` → v_mac_f32_e32. The scene VS uses this heavily for its vertex transform.
     const uint32_t code48[] = { 0x7E0602FFu, 0x40400000u, 0x3E060300u, 0xBF810000u };
     std::vector<uint32_t> spv48 = recompile_valu(code48, sizeof(code48)/sizeof(code48[0]), 2, /*out_vgpr*/3);
     CHECK(!spv48.empty(), "recompiled kernel 48 (v_mac_f32 accumulate) -> SPIR-V");
@@ -920,6 +923,20 @@ int main() {
     uint32_t bad48 = 0; for (uint32_t i=0;i<N&&got48.size()==N;i++) if (std::fabs(got48[i]-exp48[i])>1e-3f) bad48++;
     printf("  kernel48 mismatches=%u (out[8]=%g expect=%g)\n", bad48, got48.size()==N?got48[8]:-1, exp48[8]);
     CHECK(got48.size()==N && bad48==0, "recompiled kernel 48 (v_mac_f32: a0*a1+3) correct");
+
+    // Kernel 48b: v_mac_f32_e64 (VOP3 op 0x11f — the e64 form of VOP2 0x1f). v3 = 5.0; v3 = a0*a1 + v3.
+    // The scene VS emits this e64 form (with source modifiers); verifies the VOP3 0x11f -> v_mac path.
+    // Encoding via `llvm-mc -mcpu=gfx1010`: v_mac_f32_e64 v3, v0, v1 = [0xd51f0003, 0x00020300].
+    const uint32_t code48b[] = { 0x7E0602FFu, 0x40A00000u, 0xd51f0003u, 0x00020300u, 0xBF810000u };
+    std::vector<uint32_t> spv48b = recompile_valu(code48b, sizeof(code48b)/sizeof(code48b[0]), 2, /*out_vgpr*/3);
+    CHECK(!spv48b.empty(), "recompiled kernel 48b (v_mac_f32_e64 VOP3) -> SPIR-V");
+    std::vector<float> in48b(N * 2), exp48b(N);
+    for (uint32_t i = 0; i < N; i++) { float a0 = (float)(i % 6), a1 = (float)(i % 4);
+        in48b[i*2+0]=a0; in48b[i*2+1]=a1; exp48b[i] = a0 * a1 + 5.0f; }
+    std::vector<float> got48b = prosper::test::run_compute(spv48b, in48b, N, N);
+    uint32_t bad48b = 0; for (uint32_t i=0;i<N&&got48b.size()==N;i++) if (std::fabs(got48b[i]-exp48b[i])>1e-3f) bad48b++;
+    printf("  kernel48b mismatches=%u (out[7]=%g expect=%g)\n", bad48b, got48b.size()==N?got48b[7]:-1, exp48b[7]);
+    CHECK(got48b.size()==N && bad48b==0, "recompiled kernel 48b (v_dot2c_f32_f16 packed dot) correct");
 
     // Kernel 49: s_bfe_u64 (SOP2 0x29, 64-bit bitfield extract via Int64). s0=0xabcdef12, s1=0x77 ->
     // the 64-bit value 0x00000077_abcdef12; extract width=8 at offset=32 (src1=0x80020) = bits[32:39] =

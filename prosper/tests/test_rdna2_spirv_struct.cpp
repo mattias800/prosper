@@ -97,16 +97,24 @@ int main() {
     }
     printf("  [ok]   signed kernel SPIR-V declares signed i32 with a nonzero id\n");
 
-    // v_cmpx_* narrows EXEC. Compute has a predicated store for that, but graphics-stage exporters
-    // do not yet model EXEC-masked export/discard, so fragment/vertex recompilation must reject it.
+    // v_cmpx_* narrows EXEC. A FRAGMENT export under a narrowed EXEC is a discard (alpha test / kill): it
+    // now lowers to a per-invocation OpKill of the inactive lanes followed by an export from the survivors,
+    // so fragment recompilation ACCEPTS it and emits valid SPIR-V. (A VERTEX shader cannot discard — OpKill
+    // is fragment-only — so the vertex cmpx-export case below still rejects.)
     const uint32_t cmpx_fragment[] = {
         0x7DA80300u, 0xF800180Fu, 0x03020100u, 0xBF810000u,
     };
-    if (!recompile_fragment(cmpx_fragment, sizeof(cmpx_fragment) / sizeof(cmpx_fragment[0])).empty()) {
-        printf("  [FAIL] fragment cmpx shader was accepted without EXEC-masked export support\n");
+    auto frag_spv = recompile_fragment(cmpx_fragment, sizeof(cmpx_fragment) / sizeof(cmpx_fragment[0]));
+    if (frag_spv.empty()) {
+        printf("  [FAIL] fragment cmpx discard shader was rejected (should lower to OpKill + export)\n");
         return 1;
     }
-    printf("  [ok]   fragment cmpx shader is rejected until EXEC-masked export is modeled\n");
+    { uint32_t bad_op = 0;
+      if (!type_result_ids_are_nonzero(frag_spv, &bad_op)) {
+          printf("  [FAIL] fragment discard SPIR-V has an invalid result id (op=%u)\n", bad_op);
+          return 1;
+      } }
+    printf("  [ok]   fragment cmpx export lowers to a discard (OpKill + export), valid SPIR-V\n");
 
     const uint32_t cmpx_vertex[] = {
         0x7DA80300u, 0xF80008CFu, 0x03020100u, 0xBF810000u,
