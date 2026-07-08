@@ -524,6 +524,10 @@ HLE(f_apr_read_submit) {
             fprintf(stderr, "[apr]   desc+0x%02x = 0x%016llx\n", o, (unsigned long long)*(uint64_t*)(a4 + o));
         // The real read command lives in the Ampr command buffer registered at init (a3 of the
         // (req, cbSize, 0, cbBuf, poolCtx, 3) init call); "CB offset 40" is decimal 40 = 0x28 into it.
+        // g_apr_last_cb is defined in hle_kernel_mem.cpp, which is entirely #ifdef __linux__ (the whole
+        // Ampr/APR path is Linux-only), so this diagnostic must be Linux-only too or MinGW fails to
+        // link (undefined reference to prosper::g_apr_last_cb).
+#ifndef _WIN32
         if (g_apr_last_cb) {
             fprintf(stderr, "[apr]   cb=0x%llx size=0x%llx\n",
                     (unsigned long long)g_apr_last_cb, (unsigned long long)g_apr_last_cb_size);
@@ -532,6 +536,7 @@ HLE(f_apr_read_submit) {
                 fprintf(stderr, "[apr]   cb+0x%02llx = 0x%016llx\n", (unsigned long long)o,
                         (unsigned long long)*(uint64_t*)(g_apr_last_cb + o));
         }
+#endif
     }
     // a3 is the APR file id (read1 a3=1 global.utoc, read2 a3=3 pakchunk2-ps5.utoc, read3 a3=4
     // pakchunk1-ps5.pak — read3's stack record is pure frame residue, which is what proved a3 is
