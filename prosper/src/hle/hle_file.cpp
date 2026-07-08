@@ -175,15 +175,16 @@ static void preadlog(const char* fn, uint64_t fd, uint64_t off, uint64_t cnt) {
     char path[256] = "?"; char lp[64]; snprintf(lp, sizeof lp, "/proc/self/fd/%lld", (long long)fd);
     ssize_t k = readlink(lp, path, sizeof path - 1); if (k > 0) path[k] = 0; else path[0] = '?', path[1] = 0;
     const char* base = strrchr(path, '/'); base = base ? base + 1 : path;
-    // top 3 distinct eboot-range return addresses on the stack (guest call chain)
-    uint64_t cc[3] = {0,0,0}; int nc = 0; uint64_t* sp = (uint64_t*)__builtin_frame_address(0);
-    for (int i = 0; i < 800 && nc < 3; i++) { uint64_t v = sp[i];
+    // top N distinct eboot-range return addresses on the stack (guest call chain)
+    uint64_t cc[8] = {0,0,0,0,0,0,0,0}; int nc = 0; uint64_t* sp = (uint64_t*)__builtin_frame_address(0);
+    for (int i = 0; i < 1200 && nc < 8; i++) { uint64_t v = sp[i];
         if (v >= 0x400000000ull && v < 0x420000000ull) { uint64_t o = v - 0x400000000ull;
             if (nc == 0 || cc[nc-1] != o) cc[nc++] = o; } }
-    fprintf(stderr, "[preadlog] %-6s %-24s fd=%lld off=0x%llx(blk %lld) cnt=0x%llx tid=%ld callers=eboot+0x%llx,0x%llx,0x%llx\n",
+    fprintf(stderr, "[preadlog] %-6s %-24s fd=%lld off=0x%llx(blk %lld) cnt=0x%llx tid=%ld callers=eboot+0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx\n",
             fn, base, (long long)fd, (unsigned long long)off, (long long)(off / 0x10000),
             (unsigned long long)cnt, (long)syscall(SYS_gettid),
-            (unsigned long long)cc[0], (unsigned long long)cc[1], (unsigned long long)cc[2]);
+            (unsigned long long)cc[0], (unsigned long long)cc[1], (unsigned long long)cc[2], (unsigned long long)cc[3],
+            (unsigned long long)cc[4], (unsigned long long)cc[5], (unsigned long long)cc[6], (unsigned long long)cc[7]);
 }
 #else
 static bool fdlog_on() { return false; }
