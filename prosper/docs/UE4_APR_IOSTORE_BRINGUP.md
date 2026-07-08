@@ -138,12 +138,47 @@ Root cause (proven by a full-run `PROSPER_HWWATCH_ABS` write history of the "des
   status. The crash is gone and the engine advances through global.utoc parse, `.ucas` open,
   saved-paks probing, and pakchunk resolve.
 
-Current wall (much deeper): the 3rd submit is a MULTI-segment read — `count=0x4`, descSize=0xdd
-(not 0x90), total `req+0x30 = 36144292` bytes which matches NO single container file, so the
-match-by-size heuristic fails ("no file for size") and the engine crashes at `eboot+0x22ebe7f`
-(null+8). Next: decode the per-segment layout (file id / offset / size list — likely behind
-`req+0x08` or the desc buffer) and pread per segment via `prosper_apr_path_for_id`. Then
-decompression: `.ucas` chunks MAY be Oodle-compressed (check `compressionMethodNameCount`;
+### RESOLVED: the "multi-segment" 3rd submit was frame residue — a3 IS the file id
+
+The `count=0x4 / total=36144292` reading of the 3rd submit was wrong: those request-frame slots
+are pure residue at that callsite (`req+0x00 = 0x402316d88` and `req+0x08 = 0x402316d50` are
+eboot CODE addresses; `req+0x30 = 0x22784a4` — 36,144,292 — recurs there across runs while
+`req+0x28` holds a stack pointer). The pak-read wrapper (descSize `0xdd`, a heap desc buffer)
+simply doesn't initialize the frame the way the utoc-read wrapper (descSize `0x90`) does.
+
+The real contract, proven over 6 live reads at both callsites (A/B-tested by rewriting the
+record and watching the engine follow it):
+
+- **`a3` is the APR file id** from resolve — a3=1 global.utoc, 3 pakchunk2-ps5.utoc,
+  4 pakchunk1-ps5.pak (twice), 5 pakchunk1-ps5.utoc, 6 pakchunk0-ps5.pak (twice),
+  7 pakchunk0-ps5.utoc. `mQ16(reqFrame, a1=&rec.scratch, a2=&rec.data, a3=fileId, descBuf,
+  descSize)`.
+- **`a2` points at a completion record the LIBRARY fills**: `[0]` data pointer (library-chosen
+  location — begin's staging cursor until submit publishes the final buffer), `[+8]` status
+  (0 = success; on failure `{low32 err, high32 CB offset}` — exactly the `24|40` / `2b|48`
+  pairs the "Apr read failure" fatal prints; checked at eboot `0x22738a5`), `[+0x10]` bytes.
+- **Byte count = the whole resolved file** (the engine got sizes from resolve; nothing in the
+  record is a trustworthy input).
+
+`f_apr_read_submit` now resolves by id, reads the whole file into a per-read prosper-owned
+buffer (never freed — the engine treats the pages as library-owned), and completes the record
+through `a2`. Result: the `eboot+0x22ebe7f` failure-path fault is gone and ALL containers read
+clean (global 645, pakchunk1 pak 339 + utoc 32,485, pakchunk0 pak 2,062,854,722 (!) + utoc
+14,271,592, empty pakchunk2 completes trivially with size 0). The whole IoStore container-mount
+phase finishes; the engine walks on to `globalshadercache-sf_ps5.bin` and a (legitimately
+absent) `doll/doll.uproject` probe.
+
+**Current wall (deeper again): `GEngineLoop.PreInit Failed!`** →
+`sceKernelDebugRaiseExceptionOnReleaseMode(0xa0020005)`. No fault — the engine reports init
+failure itself. Suspects, in order: (1) whole-file-from-offset-0 semantics for the TWO pak reads
+per pak (descSize `0xdd`/`0xde` — real HW likely reads the pak index/footer at an offset carried
+somewhere we don't decode yet; if the engine expects the published pointer to start AT its
+requested offset, the FPakFile index parse fails silently and no containers mount → PreInit
+can't find the engine inis); (2) the `resolve MISS` output contract (we write id=0/size=0 —
+verify against real errno/flag semantics); (3) `.ucas` chunk reads never happen before the
+failure — possibly downstream of (1). Watch item for (1): the 2 GiB pak is read whole TWICE
+(two leaked 2 GiB buffers) — finding the offset/size input fixes both correctness and cost.
+Then decompression: `.ucas` chunks MAY be Oodle-compressed (check `compressionMethodNameCount`;
 `global` was 0/uncompressed).
 
 ## Remaining work to the first frame (the subsystem)

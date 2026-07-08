@@ -18,7 +18,10 @@
 #ifndef _WIN32
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>     // process_vm_readv: fault-safe guest-memory reads for the APR diagnostics
+#include <sys/mman.h>    // PROSPER_APR_ALTDEST: prosper-owned guest read buffer
 #include <pthread.h>
+#include <thread>        // PROSPER_APR_DEFER: async (real-hardware-timing) APR fill
 #else
 #include <direct.h>
 #include <io.h>
@@ -396,18 +399,41 @@ HLE(f_apr_resolve) {
 }
 
 // libSceAmpr::mQ16-QdKv7k — the APR read SUBMIT (identified by tracing readFile eboot 0x59b6110 ->
-// this import). Live-captured call: mQ16(readReq, &cur1, &cur2, count, outDescBuf, descSize=0x90).
-// The read-request object carries the destination buffer at readReq+0x18 and the total byte count
-// at readReq+0x30. Real hardware DMAs the resolved file's bytes into that buffer; we do it with a
-// synchronous pread (the boot-critical global container is uncompressed — utoc header
-// compressionMethodNameCount==0). Route B of docs/UE4_APR_IOSTORE_BRINGUP.md. CONFIDENCE: MED
-// (object layout from live capture; file matched by size since the id isn't directly legible in
-// the request object — boot container sizes are distinct).
+// this import). Call shape: mQ16(reqFrame, outScratchPtr /*a1*/, outRecord /*a2*/, fileId /*a3*/,
+// descBuf /*a4*/, descSize /*a5: 0x90, 0x90, 0xdd in the three boot captures*/).
+//
+// CORRECT CONTRACT (established 2026-07-08 on this branch, by A/B experiment over three live
+// reads): a3 is the APR file id from sceKernelAprResolveFilepathsToIdsAndFileSizes (read1 id=1
+// global.utoc, read2 id=3 pakchunk2-ps5.utoc, read3 id=4 pakchunk1-ps5.pak), and a2 points at a
+// COMPLETION RECORD the LIBRARY must fill:
+//   a2+0x00  OUT data pointer  — WHERE THE LIBRARY PUT THE BYTES (library-chosen pages)
+//   a2+0x08  OUT status        — 0 = success; on failure {low32 err, high32 CB offset}, exactly
+//            what the guest's "Apr read failure %x at CB offset %d" fatal prints (read1 24|40,
+//            read2 2b|48); checked at eboot 0x22738a5 after the guest's completion wait
+//   a2+0x10  OUT bytes transferred
+// Every one of those stack slots is FRAME RESIDUE at submit (read3's record held code addresses
+// and stack pointers), so nothing in the record is a usable input; the byte count is the whole
+// resolved file (the engine got sizes from resolve).
+//
+// The READ DESTINATION IS LIBRARY-CHOSEN, not an engine input. The old model treated the residue
+// at a2+0 as the destination and pread() the TOC into it in place — that pointer was the freed
+// resolve-path-string block sitting as the LIVE HEAD of a guest pool freelist class
+// (PROSPER_APR_POOLSCAN: "dest-on-list=YES(head-eq)"; the block still held UTF-16
+// "…ll/content/paks/global.utoc" residue), so the TOC magic landed in a free node's next-pointer
+// and the pool pop dereferenced it -> the crash at eboot+0x2316c91. Publishing a prosper-owned
+// buffer through the record instead: the engine parses the TOC from the published pointer, the
+// crash vanishes, and boot advances through the next containers — proving the record-output
+// model both ways. We model the Ampr engine's page pool with per-read host mmaps that are never
+// freed (the engine treats the pages as library-owned). Zero-byte files (the dump's empty
+// pakchunk2 placeholders) complete trivially with size 0.
+// CONFIDENCE: HIGH on id=a3 + record-output via a2 (three callsites, A/B-tested); MED on
+// whole-file semantics — a partial/offset read has not been observed yet (fine for TOC/pak-header
+// reads; revisit at the first .ucas chunk read).
 HLE(f_apr_read_submit) {
     uint8_t* req = (uint8_t*)P(a0);
     if (!req) return 0x80020016ull;
     if (filelog()) {
-        fprintf(stderr, "[apr] read-submit req=0x%llx a1=0x%llx a2=0x%llx count=0x%llx desc=0x%llx descsz=0x%llx\n",
+        fprintf(stderr, "[apr] read-submit req=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx desc=0x%llx descsz=0x%llx\n",
                 (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
                 (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)a5);
         for (int o = 0; o < 0x48; o += 8)
@@ -431,69 +457,127 @@ HLE(f_apr_read_submit) {
                         (unsigned long long)*(uint64_t*)(g_apr_last_cb + o));
         }
     }
-    // req+0x20 is the mapped data buffer (guest direct/flexible memory, 0x10xxxxxxxx range); req+0x18
-    // is only a small stack scratch (writing the full file there smashed the stack). req+0x30 is the
-    // total byte count. CONFIDENCE: MED (field roles from live req dump).
-    uint64_t dest = *(uint64_t*)(req + 0x20);
-    uint64_t size = *(uint64_t*)(req + 0x30);
-    if (!dest || !size) {
-        // A zero-length request completes trivially: clear the pre-seeded failure status at
-        // req+0x28 (low32 = error, high32 = CB offset), same as the successful-read path — leaving
-        // it made the engine treat the no-op submit as "Apr read failure". CONFIDENCE: MED.
-        *(uint64_t*)(req + 0x28) = 0;
-        if (filelog()) fprintf(stderr, "[apr] read-submit: empty (dest=0x%llx size=0x%llx)\n",
-                               (unsigned long long)dest, (unsigned long long)size);
-        return 0;
+    // a3 is the APR file id (read1 a3=1 global.utoc, read2 a3=3 pakchunk2-ps5.utoc, read3 a3=4
+    // pakchunk1-ps5.pak — read3's stack record is pure frame residue, which is what proved a3 is
+    // the id and every record field is an OUTPUT; the begin-populated staging cursor sits in
+    // req+0x18/+0x20 until we publish the final data pointer). A begin-cursor "multi-segment"
+    // reading of req+0x00=4 / req+0x30=0x22784a4 (36,144,292) is that same residue: id 4 with the
+    // whole-file model reads pakchunk1-ps5.pak (339 bytes) and the boot advances through every
+    // container.
+    uint64_t id   = a3;
+    uint64_t dest = *(uint64_t*)(req + 0x20);   // begin staging / residue; diagnostics only
+    std::string host = prosper_apr_path_for_id((uint32_t)id);
+    if (host.empty()) host = apr_path_for_size(*(uint64_t*)(req + 0x30));   // last-resort residue match
+    if (host.empty()) {
+        if (filelog()) fprintf(stderr, "[apr] read-submit: no file for id=%llu\n",
+                               (unsigned long long)id);
+        return 0x80020016ull;    // record stays incomplete -> the engine reports this read as failed
     }
-    std::string host = apr_path_for_size(size);
-    if (host.empty()) { if (filelog()) fprintf(stderr, "[apr] read-submit: no file for size=%llu\n",
-                        (unsigned long long)size); return 0x80020016ull; }
+    // Byte count: the record carries no trustworthy size (call 3's +0x30 is residue) — the APR
+    // page-read covers the whole resolved file (sizes were returned to the engine by resolve).
+    uint64_t size = 0;
+    { struct stat st {}; if (::stat(host.c_str(), &st) == 0) size = (uint64_t)st.st_size; }
 #ifndef _WIN32
-    int fd = ::open(host.c_str(), O_RDONLY);
-    if (fd < 0) return 0x80020016ull;
-    // DIAGNOSTIC (PROSPER_APR_NOWRITE): read into a HOST scratch instead of the guest dest, to test
-    // whether the engine actually reads the TOC from `dest` (req+0x20). If the boot advances the SAME
-    // as writing to dest, the engine reads the TOC elsewhere and dest is the wrong buffer.
-    static bool nowrite = getenv("PROSPER_APR_NOWRITE") != nullptr;
-    // PROSPER_APR_WRITELEN=<n>: write only the first n bytes to the guest dest (read the rest into a
-    // host scratch to keep got==size). Tests whether dest is a small header buffer that a full-file
-    // write overflows into the adjacent allocator pool.
-    static uint64_t wlen = getenv("PROSPER_APR_WRITELEN") ? strtoull(getenv("PROSPER_APR_WRITELEN"), nullptr, 0) : 0;
-    ssize_t got;
-    if (nowrite) {
-        static uint8_t scratch[1 << 20];
-        got = ::pread(fd, scratch, (size_t)(size < sizeof scratch ? size : sizeof scratch), 0);
-    } else if (wlen && wlen < size) {
-        static uint8_t scratch[1 << 20];
-        ssize_t g1 = ::pread(fd, (void*)(uintptr_t)dest, (size_t)wlen, 0);
-        ssize_t g2 = ::pread(fd, scratch, (size_t)(size - wlen < sizeof scratch ? size - wlen : sizeof scratch), (off_t)wlen);
-        got = (g1 == (ssize_t)wlen && g2 >= 0) ? (ssize_t)(g1 + g2) : -1;
-    } else {
-        got = ::pread(fd, (void*)(uintptr_t)dest, (size_t)size, 0);
+    // Fault-safe guest-memory read (unmapped guest VA -> false, never SIGSEGV in the HLE).
+    auto safe_read = [](uint64_t va, void* out, size_t n) -> bool {
+        struct iovec l { out, n }, r { (void*)(uintptr_t)va, n };
+        return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t)n;
+    };
+    auto hexdump = [](const char* tag, uint64_t va, const uint8_t* b, size_t n) {
+        for (size_t o = 0; o < n; o += 0x10) {
+            fprintf(stderr, "[apr]   %s+0x%02zx @0x%llx:", tag, o, (unsigned long long)(va + o));
+            for (size_t i = o; i < o + 0x10 && i < n; i++) fprintf(stderr, " %02x", b[i]);
+            fprintf(stderr, "\n");
+        }
+    };
+    // DIAGNOSTIC (PROSPER_APR_DIAG): PRE-fill state of every pointer the request carries — is dest a
+    // linked freelist node right now? does the seg (req+0x08) hold a scatter-gather (offset,dest,size)
+    // descriptor? do the cursors/descBuf carry the real DMA destination?
+    static bool aprdiag = getenv("PROSPER_APR_DIAG") != nullptr;
+    if (aprdiag) {
+        uint8_t b[0x90];
+        if (safe_read(dest, b, 0x50)) hexdump("dest-pre", dest, b, 0x50);
+        else fprintf(stderr, "[apr]   dest-pre 0x%llx UNMAPPED\n", (unsigned long long)dest);
+        uint64_t seg = *(uint64_t*)(req + 0x08);
+        if (seg && safe_read(seg, b, 0x60)) hexdump("seg", seg, b, 0x60);
+        if (a1 && safe_read(a1, b, 0x20)) hexdump("cur1", a1, b, 0x20);
+        if (a2 && safe_read(a2, b, 0x20)) hexdump("cur2", a2, b, 0x20);
+        if (a4 && safe_read(a4, b, 0x90)) hexdump("desc-pre", a4, b, 0x90);
     }
-    ::close(fd);
-#else
-    FILE* f = ::fopen(host.c_str(), "rb"); if (!f) return 0x80020016ull;
-    size_t got = ::fread((void*)(uintptr_t)dest, 1, (size_t)size, f); ::fclose(f);
-#endif
+    // DIAGNOSTIC (PROSPER_APR_POOLSCAN=0xADDR): the crash-side structure is an array of {ptr,count}
+    // entries (0x20 stride). Walk each entry's pointer as a freelist chain BEFORE we fill dest and
+    // report whether dest is a LIVE free node right now (the live-overlap hypothesis) or joins the
+    // pool only later (a retire/recycle path).
+    if (const char* ps = getenv("PROSPER_APR_POOLSCAN")) {
+        uint64_t pool = strtoull(ps, nullptr, 0);
+        for (int e = 0; e < 8; e++) {
+            uint64_t hd[4] = {0, 0, 0, 0};
+            if (!safe_read(pool + (uint64_t)e * 0x20, hd, 0x20)) {
+                fprintf(stderr, "[apr] pool[%d] @0x%llx UNMAPPED\n", e,
+                        (unsigned long long)(pool + (uint64_t)e * 0x20));
+                break;
+            }
+            uint64_t n = hd[0]; int hops = 0; const char* hit = "no";
+            while (n && hops < 4096) {
+                if (dest >= n && dest < n + 0x50) { hit = (dest == n) ? "YES(head-eq)" : "YES(inside)"; break; }
+                uint64_t nx;
+                if (!safe_read(n, &nx, 8)) { hit = "walk-fault"; break; }
+                n = nx; hops++;
+            }
+            fprintf(stderr, "[apr] pool[%d] head=0x%llx w1=0x%llx w2=0x%llx w3=0x%llx walked=%d dest-on-list=%s\n",
+                    e, (unsigned long long)hd[0], (unsigned long long)hd[1],
+                    (unsigned long long)hd[2], (unsigned long long)hd[3], hops, hit);
+        }
+    }
+    // The read: fill a library-owned page-aligned buffer (models the Ampr engine's own DMA pages;
+    // one per read, never freed — the engine only ever reads through the published pointer) and
+    // COMPLETE the record: +0x20 = data pointer, +0x28 = 0 (success). The completion check is at
+    // eboot 0x22738a5 (mov 0x30(%rbx)/0x34(%rbx), rbx = req-8).
+    uint64_t rounded = (size + 0xfff) & ~0xfffull; if (!rounded) rounded = 0x1000;
+    void* slot = mmap(nullptr, rounded, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (slot == MAP_FAILED) return 0x80020016ull;
+    ssize_t got = 0;
+    if (size) {
+        int fd = ::open(host.c_str(), O_RDONLY);
+        if (fd < 0) { munmap(slot, rounded); return 0x80020016ull; }
+        got = ::pread(fd, slot, (size_t)size, 0);
+        ::close(fd);
+    }
     bool ok = ((uint64_t)got == size);
-    if (ok) {
-        // Clear the completion-status word at req+0x28 (low32 = error code, high32 = CB offset).
-        // The guest's readFile checks this AFTER waitCommandBufferCompletion — a synchronous read
-        // that returns 0 but leaves the pre-seeded failure code (0x24 "Apr read failure 24 at CB
-        // offset 40") there still fatals. Decoded from the check at eboot 0x22738a5
-        // (mov 0x30(%rbx)/0x34(%rbx) with rbx = req-8). CONFIDENCE: MED.
-        *(uint64_t*)(req + 0x28) = 0;
+    if (ok && a2) {
+        // Complete the record through the caller-supplied out-pointer (a2 = &record.data; the
+        // stack offsets differ per callsite, a2 is the stable handle): [0] data pointer,
+        // [+8] status (0 = success; on failure holds {err, CB offset} that the fatal prints),
+        // [+0x10] bytes transferred.
+        *(uint64_t*)(uintptr_t)(a2 + 0x00) = (uint64_t)(uintptr_t)slot;
+        *(uint64_t*)(uintptr_t)(a2 + 0x08) = 0;
+        *(uint64_t*)(uintptr_t)(a2 + 0x10) = size;
+    } else if (!ok) {
+        munmap(slot, rounded);                                  // record stays -> guest reports failure
     }
-    if (filelog()) fprintf(stderr, "[apr] read-submit %s -> dest=0x%llx size=%llu got=%lld %s\n",
-                   host.c_str(), (unsigned long long)dest, (unsigned long long)size, (long long)got,
-                   ok ? "OK" : "SHORT");
-    // DIAGNOSTIC (PROSPER_APR_WATCHDEST): arm a HW write-watch on dest+0 so every subsequent store to
-    // the block's first 8 bytes (where the freelist keeps its "next" pointer) is logged — reveals
-    // whether the guest overwrites the TOC magic with a valid pointer (an aliasing/visibility bug) or
-    // never re-links the block (a recycle-without-reinit bug).
-    if (ok && getenv("PROSPER_APR_WATCHDEST") && g_hwwatch_hook) g_hwwatch_hook(dest);
+    if (filelog()) fprintf(stderr, "[apr] read-submit id=%llu %s -> buf=0x%llx size=%llu got=%lld %s\n",
+                   (unsigned long long)id, host.c_str(), (unsigned long long)(uintptr_t)slot,
+                   (unsigned long long)size, (long long)got, ok ? "OK" : "SHORT");
     return ok ? 0 : 0x80020016ull;
+#else
+    (void)dest;
+    // Windows host: same record-completion model over stdio, buffer from the host heap (in-process,
+    // guest-readable).
+    void* slot = ::malloc(size ? (size_t)size : 16);
+    if (!slot) return 0x80020016ull;
+    size_t got = 0;
+    if (size) {
+        FILE* f = ::fopen(host.c_str(), "rb"); if (!f) { ::free(slot); return 0x80020016ull; }
+        got = ::fread(slot, 1, (size_t)size, f); ::fclose(f);
+    }
+    if ((uint64_t)got != size) { ::free(slot); return 0x80020016ull; }
+    if (a2) {
+        *(uint64_t*)(uintptr_t)(a2 + 0x00) = (uint64_t)(uintptr_t)slot;
+        *(uint64_t*)(uintptr_t)(a2 + 0x08) = 0;
+        *(uint64_t*)(uintptr_t)(a2 + 0x10) = size;
+    }
+    return 0;
+#endif
 }
 
 void register_file_hle() {
