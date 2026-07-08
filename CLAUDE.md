@@ -84,6 +84,9 @@ renderer is wired in; the game's **real pixel shader recompiles to valid SPIR-V*
 - **Correctness-first:** implement real behavior (cross-checked against the Kyty PS5-emulator reference in
   `../Kyty`), not shims that fake output. Mark genuinely-uncertain code with `CONFIDENCE: HIGH/MED/LOW`.
 - **Commit style:** small, verified commits; push to `origin` promptly. Co-author trailer as configured.
+  **Do NOT add "Generated with Claude Code" attribution lines** (the 🤖 badge, "Generated with
+  [Claude Code](...)" footers, session links) to PR bodies, commit messages, issue text, or
+  comments — anywhere. They are noise in the project record; the co-author trailer alone is enough.
 - **Track work in GitHub issues** (`gh issue ...`). The rules:
   - **Any bug you find but do not fix in the same session gets an issue, immediately**, while the
     context is fresh: exact `file:line`, the concrete failure scenario (inputs/state → wrong
