@@ -100,14 +100,21 @@ inline bool realize_draw_item(const GpuState& ds, uint32_t vcount_hint, uint32_t
     // depth-only pass), rendering them reveals whether they are the cutscene content.
     if (ps.color_write_mask == 0) ps.color_write_mask = 0xf;
     uint32_t vertex_count = vcount_hint ? vcount_hint : 3u;
-    // Fullscreen-composite quad fill: the game tiles a 4-corner quad buffer into two triangles via indexed
-    // draws; rendering only 3 vertices paints half the quad. When the bound vertex buffer is exactly a
-    // 4-vertex quad, render its corners as a triangle FAN (perimeter order BL,TL,TR,BR -> tris {0,1,2},
-    // {0,2,3} tile the quad). Only triggers for a 4-record buffer, so real meshes are unaffected.
+    // Real vertex count: the draw's index_count (vcount_hint) is often a low/stale value for these NGG draws
+    // (folding uses draws[0]'s count), so rendering it paints only a degenerate sliver of the mesh (4 of ~20
+    // verts -> nothing on screen). The bound vertex buffer's entry count (size/stride) is the true per-vertex
+    // record count; use the largest bound VB's entry count when it exceeds the hint so the whole mesh renders.
+    // (A shader fetching past a real vertex reads 0 under robustBufferAccess -> a degenerate, clipped vertex,
+    // so a slightly-generous count is harmless; a too-small count drops geometry.)
+    uint32_t vb_entries = 0;
     if (vrt) for (const auto& r : vrt->resources)
-        if (r.cls == ResourceClass::VertexBuffer && r.stride && (r.size / r.stride) == 4 && vertex_count <= 4) {
-            vertex_count = 4; ps.topology = 5 /*VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN*/; break;
-        }
+        if (r.cls == ResourceClass::VertexBuffer && r.stride)
+            vb_entries = std::max(vb_entries, r.size / r.stride);
+    if (vb_entries > 65536u) vb_entries = 65536u;   // sanity cap: don't stall llvmpipe on an over-sized VB
+    if (vb_entries > vertex_count) vertex_count = vb_entries;
+    // Fullscreen-composite quad fill: a 4-corner quad buffer tiles into two triangles; render its corners as
+    // a triangle FAN (perimeter order BL,TL,TR,BR -> tris {0,1,2}, {0,2,3}). Only for a 4-record buffer.
+    if (vb_entries == 4) ps.topology = 5 /*VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN*/;
     if (const char* vc = getenv("PROSPER_VCOUNT")) { int v = atoi(vc); if (v > 0) vertex_count = (uint32_t)v; }
     if (const char* tp = getenv("PROSPER_TOPO")) { int t = atoi(tp); if (t >= 0) ps.topology = (uint32_t)t; }
     out.vs = std::move(vs); out.fs = std::move(fs); out.ps = ps;
@@ -140,8 +147,10 @@ inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn&
         uint32_t vcount = st.draws.empty() ? 3u : st.draws[0].index_count;
         if (realize_draw_item(st, vcount, max_shader_dwords, log, it)) items.push_back(std::move(it));
     }
-    if (getenv("PROSPER_DRAWLOG")) { fprintf(stderr, "[exec] draws=%zu perdraw=%d -> %zu item(s):",
+    if (getenv("PROSPER_DRAWLOG")) { fprintf(stderr, "[exec] draws=%zu perdraw=%d -> %zu item(s): raw index_counts=[",
         st.draws.size(), (int)perdraw, items.size());
+        for (size_t i = 0; i < st.draws.size(); i++) fprintf(stderr, "%s%u", i?",":"", st.draws[i].index_count);
+        fprintf(stderr, "] items:");
         for (auto& it : items) fprintf(stderr, " (vcount=%u topo=%u mask=0x%x)", it.vertex_count, it.ps.topology, it.ps.color_write_mask);
         fprintf(stderr, "\n"); fflush(stderr); }
     if (items.empty()) return {};
