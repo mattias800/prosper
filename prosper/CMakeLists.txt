@@ -70,6 +70,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_equeue_events PRIVATE prosper_core)
   add_test(NAME equeue_events COMMAND test_equeue_events)
 
+  # Anchored wall-clock sources (#92): CLOCK_REALTIME ≈ host now, one shared epoch across
+  # time()/gettimeofday/sceRtc*, FreeBSD clockid mapping, valid LocalTime calendar dates.
+  add_executable(test_wall_clock tests/test_wall_clock.cpp)
+  target_link_libraries(test_wall_clock PRIVATE prosper_core)
+  add_test(NAME wall_clock COMMAND test_wall_clock)
+
   # UserService/libkernel startup stubs (HLE audit): getters write deterministic defaults; the
   # libkernel registration/hook calls resolve to benign OK no-ops.
   add_executable(test_service_getters tests/test_service_getters.cpp)
