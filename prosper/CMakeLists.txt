@@ -70,6 +70,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_equeue_events PRIVATE prosper_core)
   add_test(NAME equeue_events COMMAND test_equeue_events)
 
+  # EventFlag/Sema delete-under-waiter safety (issue #104): delete wakes parked waiters with EACCES
+  # and defers the free to the last one out, instead of free()ing the object under a live wait (UAF).
+  add_executable(test_sync_delete tests/test_sync_delete.cpp)
+  target_link_libraries(test_sync_delete PRIVATE prosper_core)
+  add_test(NAME sync_delete COMMAND test_sync_delete)
+
   # Anchored wall-clock sources (#92): CLOCK_REALTIME ≈ host now, one shared epoch across
   # time()/gettimeofday/sceRtc*, FreeBSD clockid mapping, valid LocalTime calendar dates.
   add_executable(test_wall_clock tests/test_wall_clock.cpp)
