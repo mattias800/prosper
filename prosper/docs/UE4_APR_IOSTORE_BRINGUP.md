@@ -42,6 +42,35 @@ Apr read failure 24 at CB offset 40
 - Ruled out this session, with measurements: begin-cursor population (no effect), fd exhaustion,
   larger dmem pool, aliasing/mirror machinery (all were cascades of the EINVAL resolve).
 
+## CRUCIAL: the read is DEVICE-LEVEL DMA, not an interceptable import
+
+Confirmed by capturing all 28 `libSceAmpr` import stubs *after* real resolve reaches the read:
+the page read invokes **none of them**. Only the 3 setup imports fire per APR object
+(`8aI7R7WaOlc` init, `a8uLzYY--tM` begin/cursors, `N-FSPA4S3nI` setBuffer). Nor does it use our
+`pread` (no pak file is `pread` before the failure), nor a raw syscall (`int $0x45` at
+`libc.prx+0x48e0` is the *abort* path after the failure, not the read).
+
+Therefore the read is executed by the **Ampr DMA engine at the device level**: the guest writes
+read command(s) into its command buffer (the failing one is at CB offset `0x40`), rings a
+doorbell via a plain memory write to a device-register/MMIO region, and the engine DMAs file
+bytes into the `setBuffer`'d destination (e.g. `0x1720df0000`). We back none of that, so the
+destination stays empty and the guest's reader returns error `24`.
+
+**Implication for step 1 below:** it cannot be done as import HLE. Two viable routes:
+- (A) **Doorbell watchpoint + command-buffer executor.** Identify the doorbell MMIO address (the
+  memory write the guest does right before it polls for completion), trap writes to it
+  (`PROSPER_HWWATCH`-style, or a guarded page), parse the command buffer (decode the read command
+  at offset `0x40`: source id/handle, file offset, dest VA, size), `pread` from
+  `prosper_apr_path_for_id(id)` into the dest, then set the command's completion/result field so
+  the guest's poll succeeds. This is the faithful model.
+- (B) **Patch the guest reader method** (`B.vtable[+0x28]`, reached at `eboot 0x23d7232`) to a
+  trampoline that reads the 0x90-byte descriptor (`rsi`/`r12`), performs the `pread`, and returns
+  success — bypassing the DMA emulation entirely. Lower-fidelity but far smaller; a good first
+  milestone to get past IoStore and expose the next wall (decompression / RHI).
+
+Route (B) is the recommended first step: it needs only the descriptor layout (dump the 0x90 bytes
+at the `0x23d7232` call — offset, dest, size, id) and the existing `prosper_apr_path_for_id` hook.
+
 ## Remaining work to the first frame (the subsystem)
 
 This is genuine subsystem construction, sized (per `CROSS_ENGINE_UE4.md`) like a second-title
