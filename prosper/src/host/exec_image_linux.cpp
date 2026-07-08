@@ -999,9 +999,17 @@ namespace {
     // it checks a magic at [fs+0x108] that marks OUR guest TCB (guest_tls.cpp). If present (guest thread),
     // it swaps %fs to the stashed host TCB [fs+0x100] for the handler call, then restores the guest %fs.
     // If absent (a host-context thread, or the main thread during pre-entry init), it just tail-calls the
-    // handler on the current fs — exactly the old behavior. Uses FSGSBASE. `push r11` also re-aligns rsp to
-    // the SysV rsp≡8(mod16) contract. Clobbers only rax/r11 (never the arg regs rdi..r9).
-    // Keep 0x108/0x100/magic in sync with guest_tls.cpp (MAGIC_OFF/HOSTFS_OFF/TCB_MAGIC).
+    // handler on the current fs — exactly the old behavior. Uses FSGSBASE. Clobbers only rax/r11 (never
+    // the arg regs rdi..r9).
+    //
+    // STACK-ARG FORWARDING: the guest path interposes `push r11` + `call` between the guest caller and
+    // the handler, which shifts the caller's STACK args (args 7+) by two qwords — a handler reading its
+    // 7th arg at the SysV frame slot fp[2] silently got the saved guest-fs base instead (ReleaseMem read
+    // a TCB pointer as data_sel and the guest return address as the 64-bit fence value). The stub now
+    // re-pushes the first TWO stack args before the call, so handlers see the documented SysV layout
+    // (fp[2]=arg7, fp[3]=arg8) on BOTH paths. Alignment: entry rsp≡8 (caller's call), +3 pushes ≡0,
+    // call ≡8 at handler entry — the SysV contract. Handlers needing >2 stack args would need this
+    // widened. Keep 0x108/0x100/magic in sync with guest_tls.cpp (MAGIC_OFF/HOSTFS_OFF/TCB_MAGIC).
     void emit_swap_stub(uint8_t* p, uint32_t idx, uint64_t fn, bool unimpl) {
         uint8_t* s = p;
         auto mid = [&](uint8_t*& q) {   // per-variant: unimpl loads its slot index into edi first
@@ -1013,12 +1021,16 @@ namespace {
         *p++=0x41; *p++=0x81; *p++=0xBB; uint32_t mo=0x108; memcpy(p,&mo,4); p+=4;
         uint32_t magic=0x50524F53u; memcpy(p,&magic,4); p+=4;
         *p++=0x75; uint8_t* jne_rel = p++;                                  // jne rel8 (patched below)
-        // .guest: push r11 ; mov rax,[r11+0x100] ; wrfsbase rax ; <mid> ; call rax ; pop r11 ; wrfsbase r11 ; ret
+        // .guest: push r11 ; push [rsp+0x18] (arg8) ; push [rsp+0x18] (arg7) ; mov rax,[r11+0x100] ;
+        //         wrfsbase rax ; <mid> ; call rax ; add rsp,0x10 ; pop r11 ; wrfsbase r11 ; ret
         *p++=0x41; *p++=0x53;
+        *p++=0xFF; *p++=0x74; *p++=0x24; *p++=0x18;                         // push qword [rsp+0x18] = arg8
+        *p++=0xFF; *p++=0x74; *p++=0x24; *p++=0x18;                         // push qword [rsp+0x18] = arg7
         *p++=0x49; *p++=0x8B; *p++=0x83; uint32_t ho=0x100; memcpy(p,&ho,4); p+=4;
         *p++=0xF3; *p++=0x48; *p++=0x0F; *p++=0xAE; *p++=0xD0;
         mid(p);
         *p++=0xFF; *p++=0xD0;                                               // call rax
+        *p++=0x48; *p++=0x83; *p++=0xC4; *p++=0x10;                         // add rsp, 0x10
         *p++=0x41; *p++=0x5B;                                               // pop r11
         *p++=0xF3; *p++=0x49; *p++=0x0F; *p++=0xAE; *p++=0xD3;              // wrfsbase r11
         *p++=0xC3;                                                          // ret
@@ -1064,7 +1076,7 @@ bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
     if (got == MAP_FAILED || got != want) return fail("mmap stub region failed");
 
     bool swap = guest_tls_enabled();   // gated: emit the %fs swap stubs so HLE handlers run on the host TCB
-    if (swap && stub_size < 80) return fail("stub_size too small for guest-%fs swap stub (need >= 80)");
+    if (swap && stub_size < 96) return fail("stub_size too small for guest-%fs swap stub (need >= 96)");
     uint8_t* base = (uint8_t*)got;
     for (uint64_t i = 0; i < n; i++) {
         uint8_t* slot = base + i * stub_size;
