@@ -21,6 +21,7 @@
 #include <cstring>
 #include <unordered_set>
 #include <vector>
+#include <mutex>
 
 namespace prosper {
 
@@ -109,7 +110,13 @@ HLE(agc_dcb_set_index_size) {  // (buf, index_size, cache_policy)
 }
 HLE(agc_dcb_draw_index_auto) {  // (buf, index_count, modifier)
     uint32_t* cmd; if (!begin_packet(a0, 7, IT_NOP, R_DRAW_INDEX_AUTO, &cmd)) return 0;
-    cmd[1] = (uint32_t)a1; cmd[2] = 0; return (uint64_t)(uintptr_t)cmd;
+    cmd[1] = (uint32_t)a1;
+    // Store the draw modifier (ShaderDrawModifier bits) instead of dropping it, and zero the
+    // packet tail — cmd[3..6] previously carried stale ring-buffer memory inside a packet whose
+    // header says len=7 (poisoned GFXLOG dumps; live bug the moment a consumer reads past pl[0]).
+    cmd[2] = (uint32_t)(a2 & 0xffffffffu); cmd[3] = (uint32_t)(a2 >> 32u);
+    cmd[4] = cmd[5] = cmd[6] = 0;
+    return (uint64_t)(uintptr_t)cmd;
 }
 // sceAgcDcbDrawIndex (NID q88lQ+GP5Yk, name via shadPS4 aerolib.inl) — the indexed-draw sibling of
 // DrawIndexAuto. Kyty has no Gen5 reference; arg shape inferred from the Gen4 form
@@ -145,6 +152,9 @@ HLE(agc_dcb_acquire_mem) {  // (buf, engine, cb_db_op, gcr_cntl, ...) — 8 dw
 HLE(agc_cb_release_mem) {  // sceAgcCbReleaseMem(buf, action, gcr_cntl, dst, cache_policy, address, data_sel, data, …)
     // ABI pinned to Kyty GraphicsCbReleaseMem (Graphics.cpp:1763): a5=label address, then the two stack
     // args are data_sel (7th) and the 64-bit fence value (8th). SysV: fp[1]=ret, fp[2]=data_sel, fp[3]=data.
+    // Valid under BOTH stub shapes: the guest-%fs swap stub forwards the first two stack args
+    // (exec_image_linux.cpp emit_swap_stub) — previously fp[2]/fp[3] were the saved guest-fs base and
+    // guest return address there, so every fence under PROSPER_GUEST_FS was written with garbage.
     volatile uint64_t* fp = (uint64_t*)__builtin_frame_address(0);
     uint64_t data_sel = fp[2], data = fp[3];
     if (getenv("PROSPER_GFXLOG"))
@@ -166,7 +176,14 @@ HLE(agc_dcb_write_data) {  // sceAgcDcbWriteData(buf, dst, cache_policy, address
     // ABI per Kyty GraphicsDcbWriteData (Graphics.cpp:2061): a1=dst, a3=addr, a4=data ptr, a5=num_dwords.
     const uint32_t* src = (const uint32_t*)(uintptr_t)a4;
     uint32_t num = (uint32_t)a5;
-    if (num > 60) num = 60;   // clamp to keep the packet within a reasonable bound (labels/fences are tiny)
+    // Real PM4 WRITE_DATA carries a 14-bit dword count — accept up to that, and REJECT (loudly)
+    // anything larger as a mis-decoded arg. The previous silent clamp to 60 returned success while
+    // dropping the tail of any larger write (e.g. a 256-byte descriptor table), leaving the
+    // destination stale beyond dword 60 with no diagnostic. begin_packet bounds-checks the Dcb.
+    if (num > 0x3FFF) {
+        fprintf(stderr, "[agc] WriteData REJECTED num_dwords=%u (>PM4 max 0x3FFF — mis-decoded arg?)\n", num);
+        return 0;
+    }
     if (getenv("PROSPER_GFXLOG")) fprintf(stderr, "[agc] WriteData dst=0x%llx addr=0x%llx num=%u src=%p\n",
         (unsigned long long)a1,(unsigned long long)a3, num, (const void*)src);
     // Copy the inline data into the packet so the CommandProcessor can perform the write at submit time.
@@ -253,7 +270,11 @@ constexpr uint64_t kAgcErrInvalidArg = 0x8a6c000aull;
 
 // Shaders whose headers we already relocated (the fixup is not idempotent), and the registry of all
 // created shaders — the AGC->Vulkan pipeline consumes this to find shader code by PGM base.
+// The registry mutex covers CreateShader's push_back (guest loader threads) against the submit
+// thread's lookup iteration: an unsynchronized push_back REALLOCATION frees the vector's backing
+// store mid-iteration — a use-after-free read, not the "benign stale read" it was assumed to be.
 std::unordered_set<const void*>& agc_relocated() { static std::unordered_set<const void*> s; return s; }
+std::mutex&                      agc_shaders_mx() { static std::mutex m; return m; }
 std::vector<const AgcShader*>&   agc_shaders()   { static std::vector<const AgcShader*> v; return v; }
 
 // Relocate one self-relative pointer field in place (no-op for null fields).
@@ -264,16 +285,20 @@ template <class T> inline void agc_fix_ptr(T*& m) {
 }  // namespace
 
 // Exposed for tests: how many shaders the guest successfully registered.
-extern "C" size_t prosper_agc_shader_count() { return agc_shaders().size(); }
+extern "C" size_t prosper_agc_shader_count() {
+    std::lock_guard<std::mutex> lk(agc_shaders_mx());
+    return agc_shaders().size();
+}
 
 // Look up a registered shader header by its bound code address (the SHADER_PGM base the executor
 // recovers from the sh registers). Returns the AgcShader* (layout-compatible with gpu::AgcShaderHeader
 // — file_header@0, user_data@0x08, code@0x10, type@0x5a) so the GPU executor can build the shader's
 // resource table from its user_data descriptors. Null if no registered shader binds that code. The
-// registry is append-only during boot and CreateShader is main-thread; reads here are on the submit
-// thread — benign for a lookup (worst case a just-registered shader isn't seen yet, then it retries).
+// registry is written by guest loader threads (CreateShader) and read on the submit thread; both
+// sides take the registry mutex (an unlocked read raced push_back's reallocation — UAF).
 extern "C" const void* prosper_agc_shader_header_for_code(uint64_t code_addr) {
     if (!code_addr) return nullptr;
+    std::lock_guard<std::mutex> lk(agc_shaders_mx());
     for (const AgcShader* h : agc_shaders())
         if (h && (uint64_t)(uintptr_t)h->code == code_addr) return h;
     return nullptr;
@@ -412,7 +437,7 @@ HLE(agc_create_shader) {  // (Shader** dst, void* header, const void* code)
     }
     pipetrace_shader_user_data("CreateShader", h);
 
-    agc_shaders().push_back(h);
+    { std::lock_guard<std::mutex> lk(agc_shaders_mx()); agc_shaders().push_back(h); }
     *dst = h;               // <- the write our old stub omitted; populates the shader-registry slots
     return 0;
 }
