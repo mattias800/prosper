@@ -82,6 +82,24 @@ int main() {
     avail(0, kEnd, 0x4000, (uint64_t)(uintptr_t)&phys, (uint64_t)(uintptr_t)&size, 0);
     CHECK(phys == kBase && size == kTotal, "available after release -> whole pool free again");
 
+    // --- Allocate HONORS the search window (issue #108): a request constrained to a window well
+    //     above the pool base must land INSIDE that window, not at the base as before. ---
+    {
+        uint64_t wlo = 0x40000000ull;                 // 1 GiB into the pool
+        uint64_t p = 0;
+        uint64_t rr = alloc(wlo, wlo + 0x200000, 0x100000, 0x4000, 0, (uint64_t)(uintptr_t)&p);
+        CHECK(rr == 0 && p >= wlo && p + 0x100000 <= wlo + 0x200000,
+              "allocate honors [searchStart,searchEnd) -> phys inside the window");
+        release(p, 0x100000, 0, 0, 0, 0);
+    }
+    // A window too small for the request -> ENOMEM (not a base-of-pool fallback).
+    {
+        uint64_t wlo = 0x50000000ull; uint64_t p = 0xdead;
+        uint64_t rr = alloc(wlo, wlo + 0x1000 /*window < 0x100000 request*/, 0x100000, 0x4000, 0,
+                            (uint64_t)(uintptr_t)&p);
+        CHECK((uint32_t)rr == 0x8002000Cu, "allocate with too-small window -> ENOMEM (no out-of-window fallback)");
+    }
+
     if (fails) { printf("== FAIL: %d check(s) ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
