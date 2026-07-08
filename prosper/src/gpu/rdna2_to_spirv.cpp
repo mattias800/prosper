@@ -780,7 +780,8 @@ bool sopp_is_noop(const Rdna2Inst& in) {
         case 0x20:   // s_inst_prefetch
         case 0x21:   // s_clause
         case 0x22:   // s_wait_idle
-        case 0x7d:   // s_waitcnt_vscnt
+            // NOTE: s_waitcnt_vscnt is NOT SOPP on gfx10 — it is SOPK opcode 0x17
+            // (round-trip: llvm-mc gfx1010 encodes it 0xBBFD0000). Handled in the SOPK case.
             return true;
         default:
             return false;
@@ -850,11 +851,22 @@ std::unordered_set<uint32_t> safe_execz_branches(const std::vector<Rdna2Inst>& i
             // (VOP1/2/3) predicates its writes; memory ops (MIMG/MUBUF/DS) predicate their VGPR loads (and
             // are fault-free under robust access) and EXEC-predicate their stores. SGPR/VCC writes (SOP*/
             // VOPC/SMEM) are NOT predicated and would be observed past the merge -> still unsafe.
-            if (in.fmt == Rdna2Format::VOP1 || in.fmt == Rdna2Format::VOP2 || in.fmt == Rdna2Format::VOP3 ||
-                in.fmt == Rdna2Format::MIMG || in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::DS ||
-                sopp_is_noop(in)) {
+            // CARVE-OUTS: three op groups inside the "safe" VALU formats have UNPREDICATED scalar side
+            // effects (emit_alu writes rs.sreg/rs.vcc/rs.sreg_bool for them, and predicate_write only
+            // covers VGPRs) — on hardware the skipped block would have preserved VCC/the SGPR:
+            //   VOP1 0x02 v_readfirstlane_b32 (writes an SGPR), VOP2 0x28-0x2A carry ops (write VCC),
+            //   VOP3B 0x128-0x12A (write the carry-out SGPR pair/VCC).
+            const bool scalar_side_effect =
+                (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x02) ||
+                (in.fmt == Rdna2Format::VOP2 && in.opcode >= 0x28 && in.opcode <= 0x2A) ||
+                (in.fmt == Rdna2Format::VOP3 && in.opcode >= 0x128 && in.opcode <= 0x12A);
+            if (!scalar_side_effect &&
+                (in.fmt == Rdna2Format::VOP1 || in.fmt == Rdna2Format::VOP2 || in.fmt == Rdna2Format::VOP3 ||
+                 in.fmt == Rdna2Format::MIMG || in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::DS ||
+                 sopp_is_noop(in))) {
                 continue;
             }
+            if (scalar_side_effect) { ok = false; break; }
             // A pure scalar move (s_mov_b32/b64: no SCC/VCC/memory side effect) whose destination SGPR is
             // DEAD at the merge is also safe to linearize: the unconditional write is overwritten before any
             // later read, so masked-off lanes never observe it. (The tonemap/sRGB divergent-ifs load a scalar
@@ -1242,6 +1254,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // already sign-extended simm16 to 32 bits. (s_cmovk/s_cmpk/s_addk/s_mulk deferred.)
             switch (in.opcode) {
                 case 0x00: rs.sreg[in.dst.value] = b.uconst((uint32_t)in.simm16); break;   // s_movk_i32
+                // s_waitcnt_vscnt/vmcnt/expcnt/lgkmcnt: wait-for-counter — benign no-ops in our
+                // synchronous model (like SOPP s_waitcnt). These are SOPK on gfx10, NOT SOPP 0x7d
+                // as previously claimed (that case was unreachable dead code, and a real
+                // s_waitcnt_vscnt — routinely emitted after buffer/image stores — failed the whole
+                // shader recompile via this default). VERIFIED(round-trip llvm-mc gfx1010):
+                // vscnt=0xBBFD0000 (op 0x17), vmcnt=0xBC7D0000 (0x18), expcnt=0xBCFD0000 (0x19),
+                // lgkmcnt=0xBD7D0000 (0x1A).
+                case 0x17: case 0x18: case 0x19: case 0x1A: break;
                 default: ok = false;
             }
             return true;
@@ -1479,30 +1499,36 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // Add/sub with carry-in + carry-out (VOP3B): v_add_co_ci_u32 (0x128), v_sub_co_ci (0x129),
                 // v_subrev_co_ci (0x12A). carry-in = src2 mask (VCC or an SGPR bool); carry-out -> sdst mask.
                 // dst = s0 (+/-) s1 (+/-) cin; carryout = unsigned overflow (add) / borrow (sub).
-                const Operand& s2 = in.src[2]; uint32_t cin_mask = b.bfalse();
+                // Carry-in from an UNTRACKED mask must reject (like cndmask above), not silently
+                // default to 0 — a wrong carry produces 64-bit address math off by one in the low
+                // word with no diagnostic.
+                const Operand& s2 = in.src[2]; uint32_t cin_mask = 0;
                 if (s2.value == 106 || s2.value == 107) cin_mask = rs.vcc;
                 else if (s2.kind == OperandKind::SGPR) { auto it = rs.sreg_bool.find(s2.value); if (it != rs.sreg_bool.end()) cin_mask = it->second; }
-                uint32_t a = val(in.src[0]), c = val(in.src[1]);
-                uint32_t cin = b.sel(cin_mask, b.uconst(1), b.uconst(0));
-                uint32_t res, cout;
-                if (in.opcode == 0x128) {                             // add: (a + b) + cin
-                    uint32_t s1 = b.ibin(Op_IAdd, a, c);
-                    uint32_t c1 = b.ucmp(Op_ULessThan, s1, a);        // wrap in a+b
-                    res = b.ibin(Op_IAdd, s1, cin);
-                    uint32_t c2 = b.ucmp(Op_ULessThan, res, s1);      // wrap in +cin
-                    cout = b.bsel(c1, b.btrue(), c2);                 // c1 || c2
-                } else {                                              // sub / subrev: (a - b) - cin (borrow)
-                    uint32_t x = in.opcode == 0x129 ? a : c, y = in.opcode == 0x129 ? c : a;  // subrev swaps
-                    uint32_t s1 = b.ibin(Op_ISub, x, y);
-                    uint32_t b1 = b.ucmp(Op_ULessThan, x, y);         // borrow in x-y
-                    res = b.ibin(Op_ISub, s1, cin);
-                    uint32_t b2 = b.ucmp(Op_ULessThan, s1, cin);      // borrow in -cin
-                    cout = b.bsel(b1, b.btrue(), b2);
+                if (!cin_mask) ok = false;
+                else {
+                    uint32_t a = val(in.src[0]), c = val(in.src[1]);
+                    uint32_t cin = b.sel(cin_mask, b.uconst(1), b.uconst(0));
+                    uint32_t res, cout;
+                    if (in.opcode == 0x128) {                             // add: (a + b) + cin
+                        uint32_t s1 = b.ibin(Op_IAdd, a, c);
+                        uint32_t c1 = b.ucmp(Op_ULessThan, s1, a);        // wrap in a+b
+                        res = b.ibin(Op_IAdd, s1, cin);
+                        uint32_t c2 = b.ucmp(Op_ULessThan, res, s1);      // wrap in +cin
+                        cout = b.bsel(c1, b.btrue(), c2);                 // c1 || c2
+                    } else {                                              // sub / subrev: (a - b) - cin (borrow)
+                        uint32_t x = in.opcode == 0x129 ? a : c, y = in.opcode == 0x129 ? c : a;  // subrev swaps
+                        uint32_t s1 = b.ibin(Op_ISub, x, y);
+                        uint32_t b1 = b.ucmp(Op_ULessThan, x, y);         // borrow in x-y
+                        res = b.ibin(Op_ISub, s1, cin);
+                        uint32_t b2 = b.ucmp(Op_ULessThan, s1, cin);      // borrow in -cin
+                        cout = b.bsel(b1, b.btrue(), b2);
+                    }
+                    vreg[in.dst.value] = res;
+                    // carry-out -> sdst mask (VCC or a saved SGPR-pair bool).
+                    if (in.sdst.value == 106 || in.sdst.value == 107) rs.vcc = cout;
+                    else if (in.sdst.kind == OperandKind::SGPR) rs.sreg_bool[in.sdst.value] = cout;
                 }
-                vreg[in.dst.value] = res;
-                // carry-out -> sdst mask (VCC or a saved SGPR-pair bool).
-                if (in.sdst.value == 106 || in.sdst.value == 107) rs.vcc = cout;
-                else if (in.sdst.kind == OperandKind::SGPR) rs.sreg_bool[in.sdst.value] = cout;
             } else if ((in.opcode == 0x365 || in.opcode == 0x366) && allow_wave && b.is_compute) {
                 // v_mbcnt_lo/hi_u32_b32 (cross-lane): dst = src1 + count of lanes below this one whose mask
                 // bit (src0) is set, in the low/high 32. The per-lane "mask bit" comes from src0: EXEC
@@ -1542,7 +1568,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const Operand& s2 = in.src[2]; uint32_t m = 0;        // src2 is an SGPR-pair (or VCC) wave mask
                 if (s2.value == 106 || s2.value == 107) m = rs.vcc;
                 else if (s2.kind == OperandKind::SGPR) { auto it = rs.sreg_bool.find(s2.value); if (it != rs.sreg_bool.end()) m = it->second; }
-                if (!m) ok = false; else vreg[in.dst.value] = b.sel(m, val(in.src[1]), val(in.src[0]));
+                // fv (not val): cndmask is float-modifier-capable and compilers emit it with -v/|v|
+                // sources (sign-select idioms). Raw val() silently dropped neg/abs — the shader
+                // recompiled "successfully" and computed the un-negated value. fv == val when no
+                // modifier bits are set.
+                if (!m) ok = false; else vreg[in.dst.value] = b.sel(m, fv(1), fv(0));
             } else if (in.opcode == 0x11F) {                          // v_mac_f32_e64 (VOP3 form of VOP2 0x1f)
                 // dst = src0*src1 + dst, with the VOP3 float source modifiers (neg/abs via fv) and output
                 // modifiers (omod/clamp via fresult). The scene VS emits this e64 form with a `-|v10|`
@@ -1567,8 +1597,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x20:   // s_inst_prefetch  (I-cache hint)
                 case 0x21:   // s_clause         (memory-clause scheduling hint)
                 case 0x22:   // s_wait_idle
-                case 0x7d:   // s_waitcnt_vscnt
-                    break;
+                    break;   // (s_waitcnt_vscnt is SOPK on gfx10, not SOPP 0x7d — see the SOPK case)
                 case 0x08:                                          // s_cbranch_execz
                     if (in.simm16 < 0) ok = false;                 // backward = loop -> unsupported
                     else if (rs.exec_narrowed && (!safe_execz || !safe_execz->count(in.pc))) ok = false;
