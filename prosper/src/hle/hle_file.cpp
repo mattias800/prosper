@@ -422,9 +422,19 @@ HLE(f_apr_read_submit) {
     FILE* f = ::fopen(host.c_str(), "rb"); if (!f) return 0x80020016ull;
     size_t got = ::fread((void*)(uintptr_t)dest, 1, (size_t)size, f); ::fclose(f);
 #endif
-    if (filelog()) fprintf(stderr, "[apr] read-submit %s -> dest=0x%llx size=%llu got=%lld\n",
-                   host.c_str(), (unsigned long long)dest, (unsigned long long)size, (long long)got);
-    return ((uint64_t)got == size) ? 0 : 0x80020016ull;
+    bool ok = ((uint64_t)got == size);
+    if (ok) {
+        // Clear the completion-status word at req+0x28 (low32 = error code, high32 = CB offset).
+        // The guest's readFile checks this AFTER waitCommandBufferCompletion — a synchronous read
+        // that returns 0 but leaves the pre-seeded failure code (0x24 "Apr read failure 24 at CB
+        // offset 40") there still fatals. Decoded from the check at eboot 0x22738a5
+        // (mov 0x30(%rbx)/0x34(%rbx) with rbx = req-8). CONFIDENCE: MED.
+        *(uint64_t*)(req + 0x28) = 0;
+    }
+    if (filelog()) fprintf(stderr, "[apr] read-submit %s -> dest=0x%llx size=%llu got=%lld %s\n",
+                   host.c_str(), (unsigned long long)dest, (unsigned long long)size, (long long)got,
+                   ok ? "OK" : "SHORT");
+    return ok ? 0 : 0x80020016ull;
 }
 
 void register_file_hle() {
