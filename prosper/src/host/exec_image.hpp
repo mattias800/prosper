@@ -58,6 +58,14 @@ bool guest_stack_for_thread(uint64_t tid, void** base, size_t* size);
 // Returns the number that ran without faulting.
 size_t run_guest_inits(const std::vector<uint64_t>& fns);
 
+// Register guest-address ranges whose module_start expects a real SCE module-param
+// descriptor instead of (argc=0, argp=NULL). An init fn whose address falls in one of
+// these ranges is called as module_start(argc=0x10, argp=&{u32 0x10, u32 0x200, u64 0}) —
+// the descriptor Sony's native PSN.prx / SaveData.prx plugins validate before registering
+// their version (their user module_start dereferences argp and null-faults with (0,NULL)).
+// Default: empty (every init fn is called (0,0) — the normal boot is unchanged).
+void set_module_start_param_ranges(const std::vector<std::pair<uint64_t, uint64_t>>& ranges);
+
 // Set up a SysV-style stack + argc/argv, jump to img.entry, run until it returns or
 // faults. Unimplemented imports are logged along the way (see dispatch.hpp).
 BootResult run_entry(const LoadedImage& img);

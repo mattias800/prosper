@@ -1196,6 +1196,19 @@ bool guest_stack_for_current_thread(void** base, size_t* size) {
     return guest_stack_for_thread((uint64_t)pthread_self(), base, size);
 }
 
+// Guest-address ranges whose module_start needs a real SCE module-param descriptor (see header).
+std::vector<std::pair<uint64_t, uint64_t>> g_modstart_param_ranges;
+// The descriptor Sony's PSN/SaveData plugin module_start validates: [+0]=0x10 (size), [+4]=0x200
+// (interface version the native plugin requires), [+8]=0 (optional callback-registration fn ptr;
+// NULL is honored — PSN_PrxInitialize skips the optional callbacks and still reports its real
+// native version). Static so it has a stable, guest-readable address for the whole run.
+static const struct __attribute__((packed)) { uint32_t size; uint32_t version; uint64_t cb; }
+    g_modstart_desc = { 0x10, 0x200, 0 };
+
+void set_module_start_param_ranges(const std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
+    g_modstart_param_ranges = ranges;
+}
+
 size_t run_guest_inits(const std::vector<uint64_t>& fns) {
     size_t ok = 0;
     for (uint64_t f : fns) {
@@ -1204,10 +1217,44 @@ size_t run_guest_inits(const std::vector<uint64_t>& fns) {
         // argp=NULL. Plain init_array ctors take no args and harmlessly ignore rdi/rsi (SysV), but a real
         // module_start (e.g. the PSN.prx / SaveData.prx plugins) READS these — calling f() left garbage in
         // rdi/rsi, so it dereferenced a garbage argp and faulted at boot (SIGSEGV addr=0x1/0x5). CONFIDENCE: HIGH.
-        if (sigsetjmp(g_jb, 1) == 0) { ((void (*)(uint64_t, uint64_t))(uintptr_t)f)(0, 0); ok++; }
+        // A plugin module_start registered in g_modstart_param_ranges further requires a valid descriptor:
+        // its user module_start validates argp={0x10,0x200,...} and null-faults on (0,NULL). CONFIDENCE: HIGH.
+        uint64_t argc = 0, argp = 0;
+        for (auto& r : g_modstart_param_ranges)
+            if (f >= r.first && f < r.second) { argc = 0x10; argp = (uint64_t)&g_modstart_desc; break; }
+        if (sigsetjmp(g_jb, 1) == 0) { ((void (*)(uint64_t, uint64_t))(uintptr_t)f)(argc, argp); ok++; }
         g_armed_tid = 0;
-        if (g_trap_kind) fprintf(stderr, "[prosper] init fn 0x%llx faulted (%s); continuing\n",
-                                 (unsigned long long)f, trap_detail().c_str());
+        if (g_trap_kind) {
+            fprintf(stderr, "[prosper] init fn 0x%llx faulted (%s); continuing\n",
+                    (unsigned long long)f, trap_detail().c_str());
+            // Full register capture at the init fault — diagnoses the PSN.prx module_start fault
+            // (null global / TLS / unresolved import). g_r* were latched by the fault handler.
+            fprintf(stderr, "[prosper]   rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx\n"
+                            "[prosper]   rsi=%016llx rdi=%016llx rbp=%016llx rsp=%016llx\n"
+                            "[prosper]   r8 =%016llx r9 =%016llx r10=%016llx r11=%016llx\n"
+                            "[prosper]   r12=%016llx r13=%016llx r14=%016llx r15=%016llx\n",
+                    (unsigned long long)g_rax, (unsigned long long)g_rbx, (unsigned long long)g_rcx,
+                    (unsigned long long)g_rdx, (unsigned long long)g_rsi, (unsigned long long)g_rdi,
+                    (unsigned long long)g_rbp, (unsigned long long)g_rsp, (unsigned long long)g_r8,
+                    (unsigned long long)g_r9, (unsigned long long)g_r10, (unsigned long long)g_r11,
+                    (unsigned long long)g_r12, (unsigned long long)g_r13, (unsigned long long)g_r14,
+                    (unsigned long long)g_r15);
+            // Dump the 24 bytes around the faulting rip straight from mapped memory — resolves the
+            // exact faulting instruction. The exec segment is often mapped execute-only (PS5 PF_X with
+            // no PF_R), so temporarily add PROT_READ to the page before reading.
+            uint64_t pg = g_fault_rip & ~(uint64_t)0xfff;
+            mprotect((void*)pg, 0x2000, PROT_READ | PROT_EXEC);
+            const uint8_t* p = (const uint8_t*)g_fault_rip;
+            fprintf(stderr, "[prosper]   bytes@rip-8:");
+            for (int i = -8; i < 16; i++) fprintf(stderr, " %02x", p[i]);
+            fprintf(stderr, "  (rip=0x%llx)\n", (unsigned long long)g_fault_rip);
+            uint64_t fpg = f & ~(uint64_t)0xfff;
+            mprotect((void*)fpg, 0x2000, PROT_READ | PROT_EXEC);
+            const uint8_t* fp = (const uint8_t*)f;
+            fprintf(stderr, "[prosper]   bytes@entry:");
+            for (int i = 0; i < 24; i++) fprintf(stderr, " %02x", fp[i]);
+            fprintf(stderr, "  (entry=0x%llx)\n", (unsigned long long)f);
+        }
     }
     return ok;
 }

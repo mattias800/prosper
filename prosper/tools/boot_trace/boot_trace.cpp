@@ -145,6 +145,12 @@ int main(int argc, char** argv) {
         if (s.type == PT_SCE_PROCPARAM) { set_proc_param(EBOOT + s.vaddr); break; }
     if (!install_stubs(p.slots, p.stub_base, p.stub_size, &e)) { printf("stubs failed: %s\n", e.c_str()); return 1; }
     install_trap_handler();
+    // PSN.prx / SaveData.prx are SCE native plugins whose user module_start validates a module-param
+    // descriptor {size=0x10, version=0x200, cb=NULL} and null-faults if started with (argc=0, argp=NULL)
+    // — the fault that left PSN unregistered ("PSN is an old version"). Register their guest ranges so
+    // run_guest_inits starts them with the real descriptor. Skipped when PROSPER_NO_PSN drops them.
+    if (!getenv("PROSPER_NO_PSN"))
+        set_module_start_param_ranges({ { PSN, SAVEDATA }, { SAVEDATA, LIBC } });
     run_guest_inits(p.init_fns);
 
     // PROSPER_PATCH_RET=addr[,addr...]: write 0xC3 (ret) at each absolute guest address, neutralizing that
