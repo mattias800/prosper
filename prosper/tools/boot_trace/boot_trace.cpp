@@ -351,9 +351,12 @@ int main(int argc, char** argv) {
                             // PROSPER_DUMP_TEX: write the RAW texture memory (interpreted linearly) to a BMP,
                             // bypassing the shader — reveals whether the render target is tiled (scrambled) or
                             // linear (recognizable), and the tiling structure.
-                            if (getenv("PROSPER_DUMP_TEX") && !texstore.back().empty()) {
+                            if (getenv("PROSPER_DUMP_TEX") && !texstore.back().empty() && frame_no < 200) {
                                 std::string d = getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".";
-                                char fn[512]; snprintf(fn, sizeof fn, "%s/rawtex_b%u.bmp", d.c_str(), r.binding);
+                                // Frame-numbered so a specific frame's texture (loading screen, cutscene) can be
+                                // recovered — a bare per-binding name overwrites every frame. Bounded to the first
+                                // 200 frames (loading + intro) so a long run doesn't fill the disk.
+                                char fn[512]; snprintf(fn, sizeof fn, "%s/rawtex_f%04d_b%u.bmp", d.c_str(), (int)frame_no, r.binding);
                                 prosper::test::dump_bmp(fn, texstore.back(), tw, th);
                                 fprintf(stderr, "[render] dumped raw texture -> %s\n", fn); fflush(stderr);
                             }
