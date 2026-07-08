@@ -24,8 +24,48 @@ static void make_vsharp(uint32_t v[4], uint64_t base, uint32_t stride, uint32_t 
     v[3] = (fmt & 0x7Fu) << 12;
 }
 
+// Build an 8-dword T# (Gen5 image resource): Base40 (stored >>8), 9-bit IMG_FMT @[28:20] of word1,
+// Width5-1 split over word1[31:30] (lo) + word2[11:0] (hi), Height5-1 @word2[27:14], TileMode
+// @word3[24:20], Type @word3[31:28]. Mirrors decode_image_descriptor / Kyty's Gen5 getters.
+static void make_tsharp(uint32_t t[8], uint64_t base, uint32_t w, uint32_t h, uint32_t fmt,
+                        uint32_t tile_mode, uint32_t type) {
+    memset(t, 0, 8 * sizeof(uint32_t));
+    uint64_t b = base >> 8;                       // 256-byte-aligned base, stored >>8
+    t[0] = (uint32_t)(b & 0xffffffffu);
+    t[1] = (uint32_t)((b >> 32) & 0xffu) | ((fmt & 0x1ffu) << 20) | (((w - 1) & 0x3u) << 30);
+    t[2] = (((w - 1) >> 2) & 0xfffu) | (((h - 1) & 0x3fffu) << 14);
+    t[3] = ((tile_mode & 0x1fu) << 20) | ((type & 0xfu) << 28);
+}
+
 int main() {
     printf("== test_build_shader_resources ==\n");
+
+    // --- Gen5 IMG_FMT mapper (pure table, #65) --------------------------------------------------
+    {
+        Gen5ImageFormatInfo fi;
+        // The two title-live anchors: fmt=56 (composite RT, Kyty-confirmed) and fmt=1 (2048x1024 atlas).
+        CHECK(gen5_image_format(56, &fi) && fi.format == DataFormat::Unorm8 && fi.num_components == 4 &&
+              fi.bytes_per_block == 4 && fi.block_width == 1 && !fi.srgb, "IMG_FMT 56 -> Unorm8 x4, 4 B/texel");
+        CHECK(gen5_image_format(1, &fi) && fi.format == DataFormat::Unorm8 && fi.num_components == 1 &&
+              fi.bytes_per_block == 1, "IMG_FMT 1 -> Unorm8 x1 (R8), 1 B/texel");
+        CHECK(gen5_image_format(14, &fi) && fi.format == DataFormat::Unorm8 && fi.num_components == 2 &&
+              fi.bytes_per_block == 2, "IMG_FMT 14 -> Unorm8 x2 (RG8)");
+        CHECK(gen5_image_format(71, &fi) && fi.format == DataFormat::Float16 && fi.num_components == 4 &&
+              fi.bytes_per_block == 8, "IMG_FMT 71 -> Float16 x4 (RGBA16F), 8 B/texel");
+        CHECK(gen5_image_format(130, &fi) && fi.format == DataFormat::Unorm8 && fi.num_components == 4 &&
+              fi.bytes_per_block == 4 && fi.srgb, "IMG_FMT 130 -> Unorm8 x4 SRGB");
+        CHECK(gen5_image_format(169, &fi) && fi.format == DataFormat::Bc1 && fi.bytes_per_block == 8 &&
+              fi.block_width == 4 && fi.block_height == 4, "IMG_FMT 169 -> BC1, 8 B per 4x4 block");
+        CHECK(gen5_image_format(173, &fi) && fi.format == DataFormat::Bc3 && fi.bytes_per_block == 16,
+              "IMG_FMT 173 -> BC3, 16 B per 4x4 block");
+        CHECK(gen5_image_format(182, &fi) && fi.format == DataFormat::Bc7 && fi.srgb,
+              "IMG_FMT 182 -> BC7 SRGB");
+        CHECK(!gen5_image_format(0, &fi) && fi.format == DataFormat::Unknown, "IMG_FMT 0 (INVALID) unmapped");
+        CHECK(!gen5_image_format(9, &fi), "IMG_FMT 9 (16_USCALED) unmapped -> false");
+        CHECK(!gen5_image_format(44, &fi), "IMG_FMT 44 (10_10_10_2) unmapped -> false");
+        CHECK(!gen5_image_format(157, &fi), "IMG_FMT 157 (FMASK) unmapped -> false");
+        CHECK(!gen5_image_format(511, &fi), "IMG_FMT 511 out-of-table -> false");
+    }
 
     // --- V# decode in isolation ---------------------------------------------------------------
     {
@@ -101,6 +141,47 @@ int main() {
     CHECK(vb && vb->srt_offset == 0xFFFFFFFFu, "DIRECT vbuf leaves srt_offset unset");
     CHECK(t3.by_srt_offset(4 * 4) != nullptr, "constant buffers still present alongside vertex buffers");
     CHECK(t3.by_sgpr_base(99) == nullptr, "unknown sgpr_base -> null");
+
+    // --- textures: sharp[0] T#s carry their real format + byte size; BCn/unmapped are skipped (#65) ---
+    {
+        uint32_t tsgprs[32]; memset(tsgprs, 0, sizeof tsgprs);
+        make_tsharp(&tsgprs[0],  0xD0000000ull, 1920, 1080, /*fmt*/56,  /*tile*/5, /*type 2D*/9);
+        make_tsharp(&tsgprs[8],  0xE0000000ull, 2048, 1024, /*fmt*/1,   /*tile*/5, /*type*/9);
+        make_tsharp(&tsgprs[16], 0xF0000000ull,  256,  256, /*fmt*/169, /*tile*/5, /*type*/9);  // BC1
+        make_tsharp(&tsgprs[24], 0xF0010000ull,  128,  128, /*fmt*/44,  /*tile*/5, /*type*/9);  // unmapped
+
+        {   // T# decode round-trip of the first descriptor
+            DecodedImageDescriptor d = decode_image_descriptor(&tsgprs[0]);
+            CHECK(d.base == 0xD0000000ull && d.width == 1920 && d.height == 1080 &&
+                  d.format == 56 && d.tile_mode == 5 && d.type == 9, "T# decode round-trip (base/w/h/fmt/tile/type)");
+        }
+
+        AgcShaderSharp tex_sharps[4];
+        for (int i = 0; i < 4; i++) tex_sharps[i].bits = (uint16_t)(i * 8);
+        AgcShaderUserData tud; memset(&tud, 0, sizeof tud);
+        tud.sharp_resource_offset[0] = tex_sharps;
+        tud.sharp_resource_count[0]  = 4;
+        AgcShaderHeader tshdr; memset(&tshdr, 0, sizeof tshdr);
+        tshdr.file_header = 0x34333231u; tshdr.version = 0x18; tshdr.type = 1;   // PS
+        tshdr.user_data = &tud;
+
+        ShaderResourceTable tt = build_shader_resources(tshdr, tsgprs, 32);
+        CHECK(tt.resources.size() == 2, "BC1 + unmapped-format T#s skipped; 2 textures emitted");
+
+        const ShaderResource* t0 = tt.by_sgpr_base(0);
+        CHECK(t0 && t0->cls == ResourceClass::Texture, "fmt=56 texture emitted (title composite path)");
+        CHECK(t0 && t0->format == DataFormat::Unorm8 && t0->num_components == 4,
+              "fmt=56 -> Unorm8 x4 (current behavior preserved)");
+        CHECK(t0 && t0->size == 1920u * 1080u * 4u, "fmt=56 size = w*h*4 (unchanged)");
+
+        const ShaderResource* t1 = tt.by_sgpr_base(8);
+        CHECK(t1 && t1->format == DataFormat::Unorm8 && t1->num_components == 1,
+              "fmt=1 -> Unorm8 x1 (R8, no longer assumed RGBA)");
+        CHECK(t1 && t1->size == 2048u * 1024u, "fmt=1 size = w*h (was w*h*4, an 8 MB over-read of 2 MB)");
+
+        CHECK(tt.by_sgpr_base(16) == nullptr, "BC1 T# skipped (recognized, not yet sampleable)");
+        CHECK(tt.by_sgpr_base(24) == nullptr, "unmapped IMG_FMT T# skipped (no silent RGBA8)");
+    }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");

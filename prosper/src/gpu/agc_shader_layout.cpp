@@ -74,6 +74,50 @@ DecodedBufferDescriptor decode_buffer_descriptor(const uint32_t v[4]) {
     return d;
 }
 
+// The Gen5 T# carries a 9-bit COMBINED IMG_FMT at dword1 bits[28:20] (the GFX10 image-format enum,
+// not the GCN dfmt/nfmt split). Values 1..77 share the buffer-format numbering decoded by
+// rdna2_buffer_format above; image-only values sit at 128+ — SRGB at 128..130, BC1..BC7 at 169..182 —
+// per AMD's published GFX10 register database (mesa src/amd/registers/gfx10-rsrc.json, enum
+// GFX10_FORMAT). Anchors: fmt=56 (8_8_8_8_UNORM) is Kyty-confirmed (Texture.cpp get_texture_format,
+// gen5 path) AND is the title's live 1920x1080 composite T#; fmt=1 (8_UNORM) is the title's live
+// 2048x1024 single-channel atlas. USCALED/SSCALED, 10/11-bit packed, depth, FMASK and video formats
+// are deliberately left unmapped until a target needs them (callers log + skip, never assume RGBA8).
+// CONFIDENCE: HIGH on 1..77 and the two live anchors, MED on the image-only rows (register-DB-derived,
+// no game-observed instance yet).
+bool gen5_image_format(uint32_t fmt, Gen5ImageFormatInfo* out) {
+    Gen5ImageFormatInfo fi;
+    auto plain = [&](DataFormat f, uint32_t n, bool srgb = false) {
+        fi.format = f; fi.num_components = n; fi.bytes_per_block = data_format_bytes(f) * n; fi.srgb = srgb;
+    };
+    auto bcn = [&](DataFormat f, uint32_t n, uint32_t bpb, bool srgb = false) {
+        fi.format = f; fi.num_components = n; fi.bytes_per_block = bpb;
+        fi.block_width = fi.block_height = 4; fi.srgb = srgb;
+    };
+    if (fmt >= 1 && fmt <= 77) {                 // shared with the V# buffer-format numbering
+        DataFormat f = DataFormat::Unknown; uint32_t n = 0;
+        rdna2_buffer_format(fmt, &f, &n);
+        if (f != DataFormat::Unknown) plain(f, n);
+    } else switch (fmt) {
+        case 128: plain(DataFormat::Unorm8, 1, true); break;   // 8_SRGB
+        case 129: plain(DataFormat::Unorm8, 2, true); break;   // 8_8_SRGB
+        case 130: plain(DataFormat::Unorm8, 4, true); break;   // 8_8_8_8_SRGB
+        case 169: bcn(DataFormat::Bc1, 4,  8);        break;   // BC1_UNORM
+        case 170: bcn(DataFormat::Bc1, 4,  8, true);  break;   // BC1_SRGB
+        case 171: bcn(DataFormat::Bc2, 4, 16);        break;   // BC2_UNORM
+        case 172: bcn(DataFormat::Bc2, 4, 16, true);  break;   // BC2_SRGB
+        case 173: bcn(DataFormat::Bc3, 4, 16);        break;   // BC3_UNORM
+        case 174: bcn(DataFormat::Bc3, 4, 16, true);  break;   // BC3_SRGB
+        case 175: case 176: bcn(DataFormat::Bc4, 1,  8); break; // BC4_UNORM/_SNORM (snorm not modeled
+        case 177: case 178: bcn(DataFormat::Bc5, 2, 16); break; // BC5_UNORM/_SNORM  yet — skip-only)
+        case 179: case 180: bcn(DataFormat::Bc6, 3, 16); break; // BC6_UFLOAT/_SFLOAT
+        case 181: bcn(DataFormat::Bc7, 4, 16);        break;   // BC7_UNORM
+        case 182: bcn(DataFormat::Bc7, 4, 16, true);  break;   // BC7_SRGB
+        default: break;                                         // unmapped -> false
+    }
+    if (out) *out = fi;
+    return fi.format != DataFormat::Unknown;
+}
+
 DecodedImageDescriptor decode_image_descriptor(const uint32_t t[8]) {
     DecodedImageDescriptor d;
     d.base      = (((uint64_t)t[0] | ((uint64_t)t[1] << 32)) & 0xFFFFFFFFFFull) << 8;             // Base40
@@ -139,16 +183,39 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                         d.width, d.height, (unsigned long long)d.base, d.tile_mode, d.type, d.format,
                         t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7]);
             }
+            // Decode the T#'s real Gen5 IMG_FMT (#65 — was hardcoded Unorm8 x4 / size w*h*4, which
+            // mis-samples any non-RGBA8 texture and over-reads a BCn allocation up to 8x). Policy:
+            //   * mapped uncompressed  -> emit truthfully (format/components/real byte size);
+            //   * mapped BCn           -> recognized but no backend samples blocks yet: log once + SKIP
+            //     (a wrong RGBA8 binding samples garbage AND reads w*h*4 past the real allocation);
+            //   * unmapped value       -> log once, loudly, + SKIP (never silently assume RGBA8).
+            // Skipping mirrors the degenerate-T# guard above: the sampling shader fails to recompile
+            // and its draw is dropped, which is diagnosable — garbage pixels are not.
+            Gen5ImageFormatInfo fi;
+            static bool warned[512] = {};                        // once per 9-bit format value
+            if (!gen5_image_format(d.format, &fi)) {
+                if (!warned[d.format & 511u]) { warned[d.format & 511u] = true;
+                    fprintf(stderr, "[t#] UNMAPPED Gen5 IMG_FMT %u (%ux%u T#) -> skipping texture binding "
+                                    "(extend gen5_image_format)\n", d.format, d.width, d.height); }
+                continue;
+            }
+            if (fi.block_width > 1) {
+                if (!warned[d.format & 511u]) { warned[d.format & 511u] = true;
+                    fprintf(stderr, "[t#] Gen5 IMG_FMT %u is block-compressed (%ux%u T#) -> recognized but "
+                                    "BCn sampling is not wired; skipping texture binding\n",
+                            d.format, d.width, d.height); }
+                continue;
+            }
             ShaderResource r;
             r.cls           = ResourceClass::Texture;
-            r.format        = DataFormat::Unorm8;   // sampled UI textures are 8-bit UNORM RGBA
-            r.num_components = 4;
+            r.format        = fi.format;
+            r.num_components = fi.num_components;
             r.binding       = binding++;
             r.gpu_addr      = d.base;
             r.width         = d.width;
             r.height        = d.height;
             r.tile_mode     = d.tile_mode;          // so the renderer can auto-detile a GPU-tiled surface
-            r.size          = d.width * d.height * 4;
+            r.size          = d.width * d.height * fi.bytes_per_block;   // real bytes-per-texel (fmt=56 -> *4)
             r.sgpr_base     = user_sgpr_base + off;  // DIRECT provenance key (image_sample SRSRC SGPR)
             r.srt_offset    = 0xFFFFFFFFu;
             table.resources.push_back(r);

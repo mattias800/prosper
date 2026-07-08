@@ -26,10 +26,16 @@ enum class DataFormat : uint32_t {
     Float32, Uint32, Sint32,
     Float16, Unorm16, Snorm16, Uint16, Sint16,
     Unorm8,  Snorm8,  Uint8,  Sint8,
-    // 10/11-bit packed and block-compressed formats are added as the target needs them.
+    // Block-compressed texture formats (4x4-texel blocks). RECOGNIZED by the Gen5 T# mapper
+    // (gen5_image_format) so a BCn texture sizes correctly and is skipped explicitly instead of
+    // binding as garbage RGBA8 (#65) — but no backend samples them yet. data_format_bytes()
+    // returns 0 for these (a per-COMPONENT byte size is meaningless for a block format; use
+    // Gen5ImageFormatInfo::bytes_per_block).
+    Bc1, Bc2, Bc3, Bc4, Bc5, Bc6, Bc7,
+    // 10/11-bit packed formats are added as the target needs them.
 };
 
-// How many bytes one component of `format` occupies (0 for Unknown).
+// How many bytes one component of `format` occupies (0 for Unknown and block-compressed formats).
 uint32_t data_format_bytes(DataFormat f);
 
 enum class ResourceClass : uint32_t {
