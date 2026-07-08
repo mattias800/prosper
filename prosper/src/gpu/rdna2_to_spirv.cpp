@@ -1330,15 +1330,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     }
                     break;
                 }
-                // v_fmac_f32 (0x2b): dst = src0*src1 + dst (accumulate). old_d = the dst accumulator.
-                case 0x2B: d = b.fbin(Op_FAdd, b.fbin(Op_FMul, a, c), old_d); break;
-                // v_dot2c_f32_f16 (0x1f on RDNA — the pre-GCN10 v_mac_f32 slot was REPURPOSED): dst.f32 +=
-                // f16lo(s0)*f16lo(s1) + f16hi(s0)*f16hi(s1). Each source packs TWO f16 lanes; unpack both,
-                // multiply pairwise, sum, accumulate. The game's scene VS uses this heavily (packed-f16
-                // vertex transform). VERIFIED(llvm-mc gfx1030 round-trip: VOP2 op 0x1f = v_dot2c_f32_f16).
-                case 0x1F: { uint32_t p0 = b.fbin(Op_FMul, b.unpack_half(a, 0), b.unpack_half(c, 0));
-                             uint32_t p1 = b.fbin(Op_FMul, b.unpack_half(a, 1), b.unpack_half(c, 1));
-                             d = b.fbin(Op_FAdd, b.fbin(Op_FAdd, p0, p1), old_d); break; }
+                // v_mac_f32 (0x1f) / v_fmac_f32 (0x2b): dst = src0*src1 + dst (accumulate into the dest).
+                // mac vs fmac differ only in fused rounding — immaterial here. old_d = the dst accumulator.
+                // NOTE(opcode ID): op 0x1f is v_mac_f32 on the PS5's ISA. v_mac_f32 was REMOVED on desktop
+                // RDNA2/gfx1030 (where 0x1f is invalid and llvm-mc reads canonical v_dot2c at 0x02), but the
+                // PS5 GPU retains the RDNA1/gfx1010 encoding — VERIFIED by round-tripping the scene VS's
+                // actual op-0x1f word 0x3e261221 through `llvm-mc -mcpu=gfx1010` → `v_mac_f32_e32`. The VOP3
+                // (e64) form of this same op is 0x11f, handled in the VOP3 switch below.
+                case 0x1F: case 0x2B: d = b.fbin(Op_FAdd, b.fbin(Op_FMul, a, c), old_d); break;
                 // The four mul-add-with-literal-K ops (K = in.literal). madmk/fmamk = src0*K + src1;
                 // madak/fmaak = src0*src1 + K. (mad vs fma differ only in fused rounding — immaterial here.)
                 case 0x20: case 0x2C: d = b.fbin(Op_FAdd, b.fbin(Op_FMul, a, b.uconst(in.literal)), c); break;  // v_madmk / v_fmamk
@@ -1539,13 +1538,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (s2.value == 106 || s2.value == 107) m = rs.vcc;
                 else if (s2.kind == OperandKind::SGPR) { auto it = rs.sreg_bool.find(s2.value); if (it != rs.sreg_bool.end()) m = it->second; }
                 if (!m) ok = false; else vreg[in.dst.value] = b.sel(m, val(in.src[1]), val(in.src[0]));
-            } else if (in.opcode == 0x11F) {                          // v_dot2c_f32_f16 (VOP3/e64 form)
-                // dst.f32 += f16lo(s0)*f16lo(s1) + f16hi(s0)*f16hi(s1). Raw operand bits (the f16 pair is
-                // unpacked directly); float src modifiers don't apply to a packed-f16 dot. Same as VOP2 0x1f.
-                uint32_t s0 = val(in.src[0]), s1 = val(in.src[1]);
-                uint32_t p0 = b.fbin(Op_FMul, b.unpack_half(s0, 0), b.unpack_half(s1, 0));
-                uint32_t p1 = b.fbin(Op_FMul, b.unpack_half(s0, 1), b.unpack_half(s1, 1));
-                vreg[in.dst.value] = b.fbin(Op_FAdd, b.fbin(Op_FAdd, p0, p1), old_d);
+            } else if (in.opcode == 0x11F) {                          // v_mac_f32_e64 (VOP3 form of VOP2 0x1f)
+                // dst = src0*src1 + dst, with the VOP3 float source modifiers (neg/abs via fv) and output
+                // modifiers (omod/clamp via fresult). The scene VS emits this e64 form with a `-|v10|`
+                // modifier (round-trip: `llvm-mc -mcpu=gfx1010` of 0xd51f020a → v_mac_f32_e64 v10,v28,-|v10|).
+                vreg[in.dst.value] = fresult(b.fbin(Op_FAdd, b.fbin(Op_FMul, fv(0), fv(1)), old_d));
             } else ok = false;
             if (ok) predicate_write(b, rs, in.dst.value, old_d);
             return true;
