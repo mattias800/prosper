@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <chrono>
+#include <thread>
 
 using namespace prosper;
 
@@ -42,11 +44,17 @@ int main() {
     CHECK(*(uint32_t*)(rs + 0x08) == 1920 && *(uint32_t*)(rs + 0x0c) == 1080, "resolution 1920x1080 (pane)");
     CHECK(*(uint64_t*)(rs + 0x10) == 3, "refresh rate = 59.94Hz (enum 3)");
 
-    // Vblank counter advances across calls.
+    // Vblank counter advances with TIME (one tick per ~16.68 ms vblank period), not per poll —
+    // the old ++-per-call behavior made every poll look like a fresh vblank (issue #82). Two
+    // immediate calls land in the same period; a > one-period sleep must advance the count.
     uint8_t vb[0x28];
     vbl(0x1001, (uint64_t)(uintptr_t)vb, 0, 0, 0, 0); uint64_t c0 = *(uint64_t*)vb;
     vbl(0x1001, (uint64_t)(uintptr_t)vb, 0, 0, 0, 0); uint64_t c1 = *(uint64_t*)vb;
-    CHECK(c1 == c0 + 1, "vblank counter advances");
+    CHECK(c1 - c0 <= 1, "vblank counter does NOT tick per poll (immediate re-poll ~same period)");
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));   // > 2 vblank periods
+    vbl(0x1001, (uint64_t)(uintptr_t)vb, 0, 0, 0, 0); uint64_t c2 = *(uint64_t*)vb;
+    CHECK(c2 > c1, "vblank counter advances across a >1-period sleep");
+    CHECK(*(uint64_t*)(vb + 0x08) > 0, "vblank processTime filled (Kyty layout @0x08)");
 
     // Device capability: plain SDR display (capability 0).
     uint64_t dc = 0xDEAD;

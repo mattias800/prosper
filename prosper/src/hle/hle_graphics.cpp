@@ -18,6 +18,9 @@
 #include <cstring>
 #include <cstdint>
 #include <cstdio>
+#include <mutex>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <utility>
 
@@ -111,10 +114,21 @@ HLE(g_agc_ctx_init) {   // a0 = context pointer (device+0x48)
 // stack canary (cf. the historical f_fstat bug).
 namespace {
     int      g_vo_handle = 0;
-    uint64_t g_flip_count = 0;    // incremented per SubmitFlip so GetFlipStatus shows progress
-    uint64_t g_vblank_count = 0;
+    // Flip bookkeeping (#82): count/flipArg/currentBuffer are written by TWO paths — SubmitFlip on
+    // any guest thread and prosper_vo_flip_from_gpu on the submit thread — and read by GetFlipStatus
+    // on Unity's pacer thread. They must move as ONE unit under a mutex: an unsynchronized reader
+    // could observe the count advanced but a stale flipArg/buffer (torn triple), making the pacer
+    // believe a flip completed with the wrong arg; concurrent flips could lose an increment.
+    std::mutex g_flip_mx;
+    uint64_t g_flip_count = 0;      // incremented per flip so GetFlipStatus shows progress
     int32_t  g_current_buffer = 0;
     int64_t  g_last_flip_arg = 0;
+    void flip_advance(int32_t bufidx, int64_t flip_arg) {
+        std::lock_guard<std::mutex> lk(g_flip_mx);
+        g_flip_count++;
+        g_current_buffer = bufidx;
+        g_last_flip_arg = flip_arg;
+    }
 
     // The one display we advertise. 1920x1080 @ 59.94Hz (refresh-rate enum 3), 16:9, ~50".
     constexpr uint32_t kDispW = 1920, kDispH = 1080;
@@ -201,9 +215,7 @@ HLE(g_vo_addvblankevent) {
 HLE(g_vo_submitflip)  {
     if (evlog()) fprintf(stderr, "[ev] SubmitFlip handle=0x%llx bufidx=%lld flipmode=0x%llx fl013arg=0x%llx\n",
         (unsigned long long)a0, (long long)(int32_t)a1, (unsigned long long)a2, (unsigned long long)a3);
-    g_flip_count++;
-    g_current_buffer = (int32_t)a1;
-    g_last_flip_arg = (int64_t)a3;
+    flip_advance((int32_t)a1, (int64_t)a3);
     gpu::present_flip((int)(int32_t)a1, (int64_t)a3);   // present the buffer (scanout front + count)
     prosper_eq_trigger_flip((int64_t)a3);   // flip completed (synchronous): fire the flip event
     return 0;
@@ -217,9 +229,7 @@ HLE(g_vo_submitflip)  {
 extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx, uint32_t flip_mode, int64_t flip_arg) {
     if (evlog()) fprintf(stderr, "[ev] GpuFlip handle=0x%x bufidx=%d mode=0x%x fliparg=0x%llx\n",
                          handle, bufidx, flip_mode, (unsigned long long)flip_arg);
-    g_flip_count++;
-    g_current_buffer = bufidx;
-    g_last_flip_arg = flip_arg;
+    flip_advance(bufidx, flip_arg);
     gpu::present_flip(bufidx, flip_arg);   // scanout bookkeeping, same as the API flip
     prosper_eq_trigger_flip(flip_arg);     // flip completed (synchronous): fire the flip event
 }
@@ -227,9 +237,12 @@ HLE(g_vo_flippending) { if (evlog()) fprintf(stderr, "[ev] IsFlipPending\n"); re
 HLE(g_vo_flipstatus)  { // (handle, SceVideoOutFlipStatus* status): report our simulated flip count.
     // SceVideoOutFlipStatus is exactly 0x40 bytes — writing more smashes the caller's stack canary!
     if (a1) { uint8_t* s = (uint8_t*)(uintptr_t)a1; memset(s, 0, 0x40);
-              *(uint64_t*)(s + 0x00) = g_flip_count;          // count
-              *(int64_t*) (s + 0x18) = g_last_flip_arg;       // flipArg
-              *(int32_t*) (s + 0x38) = g_current_buffer; }    // currentBuffer
+              uint64_t cnt; int64_t arg; int32_t buf;
+              { std::lock_guard<std::mutex> lk(g_flip_mx);   // consistent snapshot of the flip triple
+                cnt = g_flip_count; arg = g_last_flip_arg; buf = g_current_buffer; }
+              *(uint64_t*)(s + 0x00) = cnt;    // count
+              *(int64_t*) (s + 0x18) = arg;    // flipArg
+              *(int32_t*) (s + 0x38) = buf; }  // currentBuffer
     return 0;
 }
 // SceVideoOutResolutionStatus (0x20 bytes, Kyty VideoOutResolutionStatus): report a real 1080p60
@@ -243,11 +256,20 @@ HLE(g_vo_resstatus)   {
     return 0;
 }
 
-// sceVideoOutGetVblankStatus (SceVideoOutVblankStatus, 0x28 bytes): advancing vblank counter so any
-// vsync wait/poll sees progress.
+// sceVideoOutGetVblankStatus (SceVideoOutVblankStatus, 0x28 bytes — Kyty VideoOut.cpp:94:
+// u64 count @0, u64 processTime @8, u64 tsc @0x10, u64 reserved @0x18, u8 flags @0x20).
+// The count is derived from a monotonic ~59.94 Hz timebase — the previous ++g_vblank_count
+// advanced once per CALL, so a poll loop saw a "vblank" on every poll (uncapped pacing) and the
+// counter disagreed arbitrarily with the real 60 Hz equeue vblank pump.
 HLE(g_vo_vblankstatus) {
     if (a1) { uint8_t* s = (uint8_t*)(uintptr_t)a1; memset(s, 0, 0x28);
-              *(uint64_t*)(s + 0x00) = ++g_vblank_count; }   // count
+              uint64_t ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count();
+              static const uint64_t t0 = ns;                       // process-relative, first-call anchored
+              constexpr uint64_t kVblankNs = 16683350;             // 59.94 Hz period
+              *(uint64_t*)(s + 0x00) = (ns - t0) / kVblankNs;      // count: one tick per vblank period
+              *(uint64_t*)(s + 0x08) = (ns - t0) / 1000;           // processTime (µs)
+              *(uint64_t*)(s + 0x10) = ns; }                       // tsc (monotonic ns; matches ReadTsc's unit)
     return 0;
 }
 // sceVideoOutGetDeviceCapabilityInfo (SceVideoOutDeviceCapabilityInfo: single u64 capability).
@@ -305,10 +327,22 @@ HLE(g_vo_register_buffers2) {  // a0=handle a1=set_index a2=buffer_index_start a
 // advertise one mode (1080p60), so accept the configuration.
 HLE(g_vo_configure_output) { vo_argtrace("ConfigureOutput", a0,a1,a2,a3,a4,a5); return 0; }
 
-// sceVideoOutGetOutputStatus (utPrVdxio-8): (handle, status*). PASS 1 — trace only, do NOT write the
-// output struct until its exact size is confirmed from a real call (over-writing smashes the guest
-// stack canary). Filled in once the arg/size is captured.
-HLE(g_vo_get_output_status) { vo_argtrace("GetOutputStatus", a0,a1,a2,a3,a4,a5); return 0; }
+// sceVideoOutGetOutputStatus (utPrVdxio-8): (handle, status*). The out-struct layout has NO
+// reference anywhere (Kyty predates it, shadPS4 only stubs the name, neither SDK repo declares it),
+// so inventing field offsets would be worse than not writing — but returning success with an
+// UNWRITTEN out-struct silently hands the caller stale stack as a "valid" status (the harmful-stub
+// pattern). Until the layout is captured from a real call, the gap is at least LOUD: warn once per
+// boot, unconditionally. CONFIDENCE: LOW — success-without-write retained only because the current
+// title demonstrably tolerates it and a wrong guessed layout could smash its stack canary.
+HLE(g_vo_get_output_status) {
+    vo_argtrace("GetOutputStatus", a0,a1,a2,a3,a4,a5);
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true))
+        fprintf(stderr, "[vo] WARNING: sceVideoOutGetOutputStatus returns success WITHOUT filling the "
+                        "status struct (layout unknown — no Kyty/shadPS4/SDK reference); caller reads "
+                        "uninitialized memory. Capture the struct size to fix (issue #82).\n");
+    return 0;
+}
 
 // Diagnostic tracer for the (undocumented) libSceAgc / libSceAgcDriver calls: logs the NID, the guest
 // callsite, and all six args (gated on PROSPER_GFXLOG). Behaviour is identical to the unimplemented
