@@ -84,6 +84,19 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     }
     std::shared_ptr<ShaderResourceTable> vrt = build_stage_table(ds, rs.es_addr, false);
     std::shared_ptr<ShaderResourceTable> prt = build_stage_table(ds, rs.ps_addr, true);
+    // PROSPER_RTLOG: correlate this draw's render-target address (CB_COLOR0_BASE) with the addresses of
+    // the textures it SAMPLES. If a sampled texture's base equals some draw's color0_base, that surface is
+    // a GPU render target (the game renders into it then samples it) -> render-to-texture (#83/#101).
+    if (getenv("PROSPER_RTLOG")) {
+        fprintf(stderr, "[rt] color0=0x%llx", (unsigned long long)rs.color0_base);
+        if (prt) for (const auto& r : prt->resources)
+            if (r.cls == ResourceClass::Texture)
+                fprintf(stderr, " tex=0x%llx(%ux%u)", (unsigned long long)r.gpu_addr, r.width, r.height);
+        if (vrt) for (const auto& r : vrt->resources)
+            if (r.cls == ResourceClass::Texture)
+                fprintf(stderr, " vtex=0x%llx(%ux%u)", (unsigned long long)r.gpu_addr, r.width, r.height);
+        fprintf(stderr, "\n");
+    }
     std::vector<uint32_t> vs = recompile_vertex((const uint32_t*)(uintptr_t)rs.es_addr, max_shader_dwords, vrt.get());
     std::vector<uint32_t> fs = recompile_fragment((const uint32_t*)(uintptr_t)rs.ps_addr, max_shader_dwords, prt.get());
     if (vs.empty() || fs.empty()) {
