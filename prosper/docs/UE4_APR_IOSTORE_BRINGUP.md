@@ -198,6 +198,75 @@ Leads for (1), captured live (`PROSPER_APR_DIAG` + the now-logged four extra Amp
   `Qs1xtplKo0U(req,&rec.scratch,&rec.data,0,0x45,0xe)`, `GuchCTefuZw(req,stack,0,0,0x45,0xf)`) —
   teardown/end-of-request, not the offset carrier (arg capture via `PROSPER_AMPRLOG`).
 
+### SOLVED (2026-07-08, feat/ue4-apr-read): pak mounting works — the read is (offset, size) and offset is the 7th arg
+
+Two facts closed the loop:
+
+1. **NID names recovered by brute-force** (`nid_hash(name)` over a generated libSceAmpr corpus —
+   the algorithm in `nid.cpp`): the read is **`sceAmprAprCommandBufferReadFile`** (`mQ16-QdKv7k`),
+   and the flow is `sceAmprCommandBufferConstructor`(`8aI7R7WaOlc`) →
+   `sceAmprAprCommandBufferConstructor`(`a8uLzYY--tM`) → `sceAmprCommandBufferSetBuffer`
+   (`N-FSPA4S3nI`) → `sceAmprAprCommandBufferReadFile` → `sceAmprCommandBufferReset`
+   (`baQO9ez2gL4`) → `sceAmprAprCommandBufferDestructor`(`Qs1xtplKo0U`) →
+   `sceAmprCommandBufferDestructor`(`GuchCTefuZw`). "ReadFile" being a command *builder* means
+   **every read parameter is an argument** of that one call.
+
+2. **`ReadFile` has ≥7 args; the FILE OFFSET is the 7th, passed ON THE STACK** — which the plain
+   6-arg HleFn signature never saw (the exact blind spot that made pak footer reads look
+   offset-less). An asm entry shim (`f_apr_read_submit_entry` in `hle_file.cpp`) snapshots `rsp`
+   into a TLS slot so the handler reads stack args; it distinguishes the two stub tails (swap-stub
+   `call` vs `jmp`) by whether `[rsp]` is in the stub region `[0x6_0000_0000, 0x7_0000_0000)`.
+
+   Live-verified offsets (exact footer math, 8 reads, 3 file kinds): utoc header reads
+   `(off=0, size=0x90)`; the two FPakInfo footer probes per pak `(off=filesize-221, size=221)` and
+   `(off=filesize-222, size=222)` — e.g. pakchunk1 pak (339 B): `0x76`/`0x75`; pakchunk0 pak
+   (2,062,854,722 B): `0x7af4a965`/`0x7af4a964`. So **`a5` = size, `arg7` = offset**; the read is
+   a host `pread(fd, dst, a5, arg7)` clamped to EOF.
+
+3. **The destination is `a4` (arg5), the caller's `dst` buffer — not only the completion record.**
+   After fixing offset+size, PreInit *still* failed until the bytes were also written INTO `a4`:
+   the utoc callsite consumes data via the record pointer, but the **pak-footer callsite reads its
+   own `dst` buffer directly** (with only the side record published, the correct footer bytes were
+   never seen, no index read followed, mount failed). `f_apr_read_submit` now
+   `process_vm_writev`s into `a4` and publishes `record[0]=a4`; it falls back to a prosper-owned
+   staging buffer only if `a4` is absent/unmapped.
+
+**Result: `GEngineLoop.PreInit Failed!` is GONE. All containers mount.** The engine now issues the
+real post-footer reads it previously never reached: the FPakFile **index** at the footer's
+`IndexOffset`, then chunk/index-entry reads at learned offsets (e.g. pakchunk0 pak reads at
+`0x7af0b825`, `0x7af3550c`, `0x78a559dd`, …), and it opens+resolves the `.ucas` (pakchunk0-ps5.ucas
+id=10, 17.8 GB) — i.e. IoStore container mounting is complete. CONFIDENCE: HIGH (offset/size/dst all
+verified on live reads; PreInit-passes is the end-to-end proof).
+
+### NEW WALL: post-mount engine/RHI init — a null virtual call (racy, two faces)
+
+Boot now reaches early UE engine init and dies in one of two timing-dependent spots (the RHI /
+task-graph worker threads are now live, so it is nondeterministic):
+
+- **Main-thread face (representative):** a null vtable call. At `eboot+0x24c75ef`
+  `mov 0x28(%r15),%rdi ; mov (%rdi),%rax ; call *0x10(%rax)` the object's vtable slot `+0x10` is 0
+  → control jumps to `rip=0` (`RUN ENDED kind=2, rip=0x0`; backtrace
+  `eboot+0x24c75f2 ← +0x24c7234 ← +0x95a2 ← +0x7b26 ← +0x9c7 ← +0x508e ← +0xbf`, i.e. reached
+  from CRT `_start`/main on the main thread). The neighbourhood registers CVars by name — the
+  rodata strings loaded just before are `LoadModule  - `, and the sibling singleton-init block
+  (`eboot+0x503b878`) registers `r.Shadow.CacheWPOPrimitivesError` / `r.ShowMaterialDrawEvents` /
+  `r.RHIThread…` via `call *0xb0(%rax)` on a CVar-manager object. So this is **RHI / CVar / module
+  bring-up**, past PreInit.
+- **Worker-thread face:** a fault in host HLE code reading a small address (~`0x2936xx`, grows per
+  run) — a worker racing the same half-initialized subsystem.
+
+Next steps (in order):
+1. Resolve the null vtable object at `eboot+0x24c75ef`: break there, walk `[[r15+0x28]]` and its
+   vtable to see which interface method `+0x10` should be — likely a subsystem/module singleton
+   the engine expects a prior init to have populated (an unimplemented Sony import returning 0
+   where the engine stored the result as an object pointer, or a module we skip loading:
+   `SaveData.prx` / `PSN.prx` / `PS5Util.prx` / `Il2cppUserAssemblies.prx` are all "skipping absent
+   module"). Check whether one of those provides the missing vtable.
+2. Then the `.ucas` chunk reads proper (asset registry / shader cache). Check each utoc's
+   `CompressionMethodNameCount`: `global` was 0/uncompressed; the pakchunk `.ucas` chunks are
+   likely Oodle Kraken/Mermaid and will need a decode path.
+3. Then RHI/AGC init → first UE draw via the existing `execute_and_present`.
+
 ## Remaining work to the first frame (the subsystem)
 
 This is genuine subsystem construction, sized (per `CROSS_ENGINE_UE4.md`) like a second-title

@@ -429,13 +429,69 @@ HLE(f_apr_resolve) {
 // CONFIDENCE: HIGH on id=a3 + record-output via a2 (three callsites, A/B-tested); MED on
 // whole-file semantics — a partial/offset read has not been observed yet (fine for TOC/pak-header
 // reads; revisit at the first .ucas chunk read).
+// --- Stack-argument capture for sceAmprAprCommandBufferReadFile ---------------------------------
+// The NID reverses to the real Sony name (brute-forced against nid_hash):
+//   mQ16-QdKv7k = sceAmprAprCommandBufferReadFile   (and the rest of the flow:
+//   8aI7R7WaOlc = sceAmprCommandBufferConstructor, a8uLzYY--tM = sceAmprAprCommandBufferConstructor,
+//   N-FSPA4S3nI = sceAmprCommandBufferSetBuffer, baQO9ez2gL4 = sceAmprCommandBufferReset,
+//   Qs1xtplKo0U = sceAmprAprCommandBufferDestructor, GuchCTefuZw = sceAmprCommandBufferDestructor).
+// ReadFile is a command-BUILDER: every read parameter is an argument of this call. Six land in
+// registers (cb, out1, out2, fileId, dst?, size) — the FILE OFFSET is the 7th argument and lives
+// ON THE GUEST STACK, which the plain HleFn signature never saw (that blind spot is exactly why
+// pak footer reads looked offset-less). The asm entry below snapshots rsp into a TLS slot so the
+// C handler can read the stack args. Both stub paths run on the HOST %fs (the swap stub switches
+// before the call; the tail-jmp path never left it), so TLS is safe here.
+// Stack layout depends on which stub path invoked us:
+//   swap stub ("call rax" after push r11):  [rsp]=stub ret (0x6xxxxxxxx), [rsp+8]=saved r11,
+//                                           [rsp+16]=guest ret, [rsp+24]=arg7, [rsp+32]=arg8
+//   tail-jmp ("jmp rax"):                   [rsp]=guest ret, [rsp+8]=arg7, [rsp+16]=arg8
+// Distinguished by whether [rsp] lies in the stub region [0x600000000, 0x700000000).
+// Ampr command-buffer address/size captured at init (hle_kernel_mem.cpp). Declared at namespace
+// scope (NOT inside the extern "C" handler, where a block-scope extern would take C linkage and
+// miss the mangled prosper:: definition).
+extern uint64_t g_apr_last_cb, g_apr_last_cb_size;
+
+#ifndef _WIN32
+extern "C" __thread uint64_t g_apr_entry_rsp;
+__thread uint64_t g_apr_entry_rsp = 0;
+extern "C" uint64_t f_apr_read_submit_c(uint64_t a0, uint64_t a1, uint64_t a2,
+                                        uint64_t a3, uint64_t a4, uint64_t a5);
+asm(".text\n"
+    ".globl f_apr_read_submit_entry\n"
+    ".type f_apr_read_submit_entry,@function\n"
+    "f_apr_read_submit_entry:\n"
+    "  movq %rsp, %fs:g_apr_entry_rsp@tpoff\n"
+    "  jmp f_apr_read_submit_c\n");
+extern "C" void f_apr_read_submit_entry();
+// Fetch the Nth stack argument (0-based: arg7 is n=0) of the in-flight ReadFile call.
+static uint64_t apr_stack_arg(int n) {
+    uint64_t rsp = g_apr_entry_rsp;
+    if (!rsp) return 0;
+    uint64_t ret = *(uint64_t*)rsp;
+    bool via_call = (ret >= 0x600000000ull && ret < 0x700000000ull);
+    return *(uint64_t*)(rsp + (via_call ? 0x18 : 0x8) + (uint64_t)n * 8);
+}
+#endif
+
+#ifndef _WIN32
+extern "C" uint64_t f_apr_read_submit_c(uint64_t a0, uint64_t a1, uint64_t a2,
+                                        uint64_t a3, uint64_t a4, uint64_t a5) {
+#else
 HLE(f_apr_read_submit) {
+#endif
     uint8_t* req = (uint8_t*)P(a0);
     if (!req) return 0x80020016ull;
     if (filelog()) {
         fprintf(stderr, "[apr] read-submit req=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx desc=0x%llx descsz=0x%llx\n",
                 (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
                 (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)a5);
+#ifndef _WIN32
+        fprintf(stderr, "[apr]   stack-args a6=0x%llx a7=0x%llx a8=0x%llx a9=0x%llx (rsp=0x%llx ret=0x%llx)\n",
+                (unsigned long long)apr_stack_arg(0), (unsigned long long)apr_stack_arg(1),
+                (unsigned long long)apr_stack_arg(2), (unsigned long long)apr_stack_arg(3),
+                (unsigned long long)g_apr_entry_rsp,
+                (unsigned long long)(g_apr_entry_rsp ? *(uint64_t*)g_apr_entry_rsp : 0));
+#endif
         for (int o = 0; o < 0x48; o += 8)
             fprintf(stderr, "[apr]   req+0x%02x = 0x%016llx\n", o, (unsigned long long)*(uint64_t*)(req + o));
         // Cursor slots (a1/a2 point at them) and the 0x90-byte descriptor buffer (a4): the desc may
@@ -447,7 +503,6 @@ HLE(f_apr_read_submit) {
             fprintf(stderr, "[apr]   desc+0x%02x = 0x%016llx\n", o, (unsigned long long)*(uint64_t*)(a4 + o));
         // The real read command lives in the Ampr command buffer registered at init (a3 of the
         // (req, cbSize, 0, cbBuf, poolCtx, 3) init call); "CB offset 40" is decimal 40 = 0x28 into it.
-        extern uint64_t g_apr_last_cb, g_apr_last_cb_size;
         if (g_apr_last_cb) {
             fprintf(stderr, "[apr]   cb=0x%llx size=0x%llx\n",
                     (unsigned long long)g_apr_last_cb, (unsigned long long)g_apr_last_cb_size);
@@ -473,10 +528,27 @@ HLE(f_apr_read_submit) {
                                (unsigned long long)id);
         return 0x80020016ull;    // record stays incomplete -> the engine reports this read as failed
     }
-    // Byte count: the record carries no trustworthy size (call 3's +0x30 is residue) — the APR
-    // page-read covers the whole resolved file (sizes were returned to the engine by resolve).
-    uint64_t size = 0;
-    { struct stat st {}; if (::stat(host.c_str(), &st) == 0) size = (uint64_t)st.st_size; }
+    // Read range: a5 = byte count, and the FILE OFFSET is the 7th argument (on the guest stack).
+    // Verified live with exact footer math (2026-07-08): utoc header reads pass (offset=0,
+    // size=0x90=TocHeaderSize); the two FPakInfo footer probes per pak pass
+    // (offset=filesize-221, size=221=FPakInfo::Size8a) then (offset=filesize-222, size=222=Size9)
+    // — e.g. pakchunk1-ps5.pak (339 bytes): offsets 0x76/0x75; pakchunk0-ps5.pak (2,062,854,722
+    // bytes): offsets 0x7af4a965/0x7af4a964. Reads are clamped to EOF like a host pread (empty
+    // pakchunk2 placeholders complete with 0 bytes, status 0 — the model the engine already
+    // accepted). CONFIDENCE: HIGH (offset+size confirmed on 8 live reads across 3 file kinds).
+    uint64_t fsize = 0;
+    { struct stat st {}; if (::stat(host.c_str(), &st) == 0) fsize = (uint64_t)st.st_size; }
+    uint64_t offset = 0;
+#ifndef _WIN32
+    offset = apr_stack_arg(0);
+#endif
+    uint64_t size = a5;
+    if (offset > fsize) {
+        if (filelog()) fprintf(stderr, "[apr] read-submit: offset 0x%llx past EOF (file %llu) — clamped\n",
+                               (unsigned long long)offset, (unsigned long long)fsize);
+        offset = fsize;
+    }
+    if (size > fsize - offset) size = fsize - offset;
 #ifndef _WIN32
     // Fault-safe guest-memory read (unmapped guest VA -> false, never SIGSEGV in the HLE).
     auto safe_read = [](uint64_t va, void* out, size_t n) -> bool {
@@ -547,24 +619,44 @@ HLE(f_apr_read_submit) {
     if (size) {
         int fd = ::open(host.c_str(), O_RDONLY);
         if (fd < 0) { munmap(slot, rounded); return 0x80020016ull; }
-        got = ::pread(fd, slot, (size_t)size, 0);
+        got = ::pread(fd, slot, (size_t)size, (off_t)offset);
         ::close(fd);
     }
     bool ok = ((uint64_t)got == size);
+    // a4 is the caller's DESTINATION buffer (the `dst` argument of
+    // sceAmprAprCommandBufferReadFile) — on real hardware the DMA engine fills it and the
+    // completion record's data pointer equals it. The utoc callsite consumes data via the record
+    // pointer, but the pak-footer callsite reads its own dst buffer directly (with only the
+    // record published to a side buffer, the correct footer bytes were provably never seen: no
+    // index read followed and PreInit failed). Copy into dst fault-safely (process_vm_writev
+    // refuses unmapped ranges instead of SIGSEGVing in the HLE) and publish record[0] = dst;
+    // fall back to the prosper-owned buffer only if dst is absent/unmapped.
+    // CONFIDENCE: MED-HIGH (dst role from the recovered real prototype + both callsites' behavior).
+    bool in_dst = false;
+    if (ok && a4 > 0xffff) {
+        if (size) {
+            struct iovec l { slot, (size_t)size }, r { (void*)(uintptr_t)a4, (size_t)size };
+            in_dst = process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)size;
+        } else in_dst = true;
+    }
     if (ok && a2) {
         // Complete the record through the caller-supplied out-pointer (a2 = &record.data; the
         // stack offsets differ per callsite, a2 is the stable handle): [0] data pointer,
         // [+8] status (0 = success; on failure holds {err, CB offset} that the fatal prints),
         // [+0x10] bytes transferred.
-        *(uint64_t*)(uintptr_t)(a2 + 0x00) = (uint64_t)(uintptr_t)slot;
+        *(uint64_t*)(uintptr_t)(a2 + 0x00) = in_dst ? a4 : (uint64_t)(uintptr_t)slot;
         *(uint64_t*)(uintptr_t)(a2 + 0x08) = 0;
         *(uint64_t*)(uintptr_t)(a2 + 0x10) = size;
-    } else if (!ok) {
-        munmap(slot, rounded);                                  // record stays -> guest reports failure
     }
-    if (filelog()) fprintf(stderr, "[apr] read-submit id=%llu %s -> buf=0x%llx size=%llu got=%lld %s\n",
-                   (unsigned long long)id, host.c_str(), (unsigned long long)(uintptr_t)slot,
-                   (unsigned long long)size, (long long)got, ok ? "OK" : "SHORT");
+    if (!ok || in_dst) {
+        munmap(slot, rounded);   // failure: record stays -> guest reports it; success-into-dst: staging no longer needed
+    }
+    if (filelog()) fprintf(stderr, "[apr] read-submit id=%llu %s -> dst=0x%llx(%s) off=0x%llx size=%llu got=%lld %s\n",
+                   (unsigned long long)id, host.c_str(),
+                   in_dst ? (unsigned long long)a4 : (unsigned long long)(uintptr_t)slot,
+                   in_dst ? "guest" : "staging",
+                   (unsigned long long)offset, (unsigned long long)size, (long long)got,
+                   ok ? "OK" : "SHORT");
     return ok ? 0 : 0x80020016ull;
 #else
     (void)dest;
@@ -612,8 +704,14 @@ void register_file_hle() {
     R("unlink", f_unlink);        R("sceKernelUnlink", f_unlink);
     R("sceKernelGetdents", f_getdents); R("getdents", f_getdents);
     R("sceKernelAprResolveFilepathsToIdsAndFileSizes", f_apr_resolve);   // real APR resolve (was EINVAL)
-    // libSceAmpr read-submit (raw NID; the APR page-read that fills the request buffer via pread).
-    Hle::register_fn("mQ16-QdKv7k", (HleFn)f_apr_read_submit, "sceAmprAprReadSubmit?");
+    // libSceAmpr sceAmprAprCommandBufferReadFile (NID name recovered by brute-force). The Linux
+    // entry is an asm shim that snapshots rsp so the handler can read the stack args (arg7 = file
+    // offset); see f_apr_read_submit_entry above.
+#ifndef _WIN32
+    Hle::register_fn("mQ16-QdKv7k", (HleFn)f_apr_read_submit_entry, "sceAmprAprCommandBufferReadFile");
+#else
+    Hle::register_fn("mQ16-QdKv7k", (HleFn)f_apr_read_submit, "sceAmprAprCommandBufferReadFile");
+#endif
     #undef R
 }
 

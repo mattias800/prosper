@@ -632,16 +632,18 @@ void register_kernel_mem_hle() {
     // sync_on_address futex — registered by raw NID (names not in any public DB yet).
     Hle::register_fn("Hc4CaR6JBL0", (HleFn)k_wait_on_address, "sceKernelWaitOnAddress?");
     Hle::register_fn("q2y-wDIVWZA", (HleFn)k_wake_by_address, "sceKernelWakeByAddress?");
-    // libSceAmpr command-buffer trio (raw NIDs; see the block comment above k_ampr_push_map).
-    Hle::register_fn("8aI7R7WaOlc", (HleFn)k_ampr_init,     "sceAmprCommandBufferInit?");
-    Hle::register_fn("a8uLzYY--tM", (HleFn)k_ampr_begin,    "sceAmprCommandBufferBegin?");
-    Hle::register_fn("N-FSPA4S3nI", (HleFn)k_ampr_push_map, "sceAmprPushMapPages?");
-    // The four other Ampr NIDs the APR read flow calls (arg capture under PROSPER_AMPRLOG; same
-    // return-0 behavior they had as anonymous unimpl stubs).
-    Hle::register_fn("baQO9ez2gL4", (HleFn)k_ampr_x1, "sceAmpr?baQO9ez2gL4");
+    // libSceAmpr command-buffer trio. NID names recovered by brute-forcing nid_hash() over a
+    // generated libSceAmpr corpus (see hle_file.cpp block comment above f_apr_read_submit).
+    Hle::register_fn("8aI7R7WaOlc", (HleFn)k_ampr_init,     "sceAmprCommandBufferConstructor");
+    Hle::register_fn("a8uLzYY--tM", (HleFn)k_ampr_begin,    "sceAmprAprCommandBufferConstructor");
+    Hle::register_fn("N-FSPA4S3nI", (HleFn)k_ampr_push_map, "sceAmprCommandBufferSetBuffer");
+    // The rest of the APR read flow: Reset (pre-submit) + the two Destructors (post-submit
+    // teardown). Modeled as no-ops (arg capture under PROSPER_AMPRLOG); the read itself is
+    // sceAmprAprCommandBufferReadFile in hle_file.cpp.
+    Hle::register_fn("baQO9ez2gL4", (HleFn)k_ampr_x1, "sceAmprCommandBufferReset");
     Hle::register_fn("ULvXMDz56po", (HleFn)k_ampr_x2, "sceAmpr?ULvXMDz56po");
-    Hle::register_fn("Qs1xtplKo0U", (HleFn)k_ampr_x3, "sceAmpr?Qs1xtplKo0U");
-    Hle::register_fn("GuchCTefuZw", (HleFn)k_ampr_x4, "sceAmpr?GuchCTefuZw");
+    Hle::register_fn("Qs1xtplKo0U", (HleFn)k_ampr_x3, "sceAmprAprCommandBufferDestructor");
+    Hle::register_fn("GuchCTefuZw", (HleFn)k_ampr_x4, "sceAmprCommandBufferDestructor");
 }
 
 } // namespace prosper
