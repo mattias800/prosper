@@ -150,14 +150,17 @@ void decode_operands(Rdna2Inst& i) {
             i.n_src = 1; break;
         case Rdna2Format::MUBUF: {
             // Untyped buffer op. opcode[24:18]; VDATA (dest/src VGPR) d1[15:8]; VADDR d1[7:0];
-            // SRSRC (V# descriptor base SGPR, field ×4) d1[20:16]; SOFFSET d1[30:24]. 12-bit inst
+            // SRSRC (V# descriptor base SGPR, field ×4) d1[20:16]; SOFFSET d1[31:24]. 12-bit inst
             // offset d0[11:0] + offen d0[12] + idxen d0[13] packed into `literal`.
             const uint32_t d1 = i.words[1];
             i.opcode = (w >> 18) & 0x7Fu;
             i.dst    = vgpr(d1 >> 8);                          // VDATA
             i.src[0] = vgpr(d1);                              // VADDR
             i.src[1] = sgpr(((d1 >> 16) & 0x1Fu) << 2);       // SRSRC (descriptor base)
-            i.src[2] = decode_src_field((d1 >> 24) & 0x7Fu);  // SOFFSET
+            // SOFFSET is a full 8-bit src field: 0x80 = inline 0 (the standard "no soffset" encoding).
+            // A 7-bit mask folded 0x80 onto SGPR s0, silently adding a live descriptor dword to every
+            // buffer address whenever a shader wrote s0 before the fetch.
+            i.src[2] = decode_src_field((d1 >> 24) & 0xFFu);  // SOFFSET
             i.literal = (w & 0xFFFu) | (((w >> 12) & 1u) << 12) | (((w >> 13) & 1u) << 13);
             i.n_src = 3; break;
         }

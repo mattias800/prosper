@@ -95,11 +95,14 @@ int main() {
     CHECK(ins[7].fmt == Rdna2Format::SMEM && ins[7].opcode == 0x2u && isS(ins[7].dst, 0) &&
           isS(ins[7].src[0], 4) && ins[7].literal == 0x0u, "s_load_dwordx4 SMEM op/SDATA/SBASE/offset");
     // MUBUF decode: buffer_load_dwordx4 v[4:7], v2, s[8:11], 0 offen -> op 0xe, VDATA v4, VADDR v2,
-    // SRSRC s8 (×4), offen bit set in `literal`.
+    // SRSRC s8 (×4), offen bit set in `literal`. SOFFSET field is 0x80 = inline integer 0 (llvm-mc's
+    // encoding of literal `0`) — it must NOT decode as SGPR s0 (8-bit field, not 7).
     const uint32_t mubuf[] = { 0xe0381000u, 0x80020402u };
     Rdna2Inst mb = rdna2_decode_one(mubuf, 2);
     CHECK(mb.fmt == Rdna2Format::MUBUF && mb.opcode == 0xeu && isV(mb.dst, 4) && isV(mb.src[0], 2) &&
           isS(mb.src[1], 8) && ((mb.literal >> 12) & 1u), "buffer_load_dwordx4 MUBUF op/VDATA/VADDR/SRSRC/offen");
+    CHECK(mb.src[2].kind == OperandKind::InlineInt && mb.src[2].value == 0,
+          "MUBUF SOFFSET 0x80 decodes as inline 0, not SGPR s0");
     // VOP SDWA/DPP forms carry a mandatory 2nd (control) dword — the decoder must count it (miss it and
     // the whole downstream stream mis-aligns) and flag has_modifier so the recompiler rejects it.
     // Encodings from llvm-mc gfx1030: SDWA src0=0xf9, DPP16 src0=0xfa, DPP8 src0=0xe9.
