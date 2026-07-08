@@ -295,6 +295,103 @@ is where the bogus free happens). The five still-unimplemented libSceAmpr NIDs
 (`vWU-odnS+fU sSAUCCU1dv4 tZDDEo2tE5k GnxKOHEawhk H896Pt-yB4I`) fire during mount and may be part
 of the compressed-read contract.
 
+### SOLVED (2026-07-08, issue #107): the Ampr map-flavor MIRROR clobbered live MallocBinned heap
+
+Deep diagnosis of the `FMallocBinned3 Attempt to free an unrecognized block` crash. Every ticket
+hypothesis (Oodle decompress; compressed-pak buffer ownership; the 5 unimplemented Ampr NIDs) was
+tested and **disproven**. The real fault is a guest-side MallocBinned heap overlap; prosper serves
+the config bytes correctly.
+
+- **The freed pointer is `0xd` (13), not a real allocation.** Captured at the free site by both the
+  in-process int3 logger (`PROSPER_BP=0x22f527a`) and a gdb HW watchpoint: `rdi=0xd`. The message
+  "...unrecognized block d" is literally the `%p` of `0xd`. The free instruction is
+  `eboot+0x22f5270  mov 0x18(%r14,%r15,1),%rdi ; test ; call 0x231ece0` — a loop freeing
+  `element[idx]+0x18` (0x30-byte stride) of an array whose base `r14 = *object = 0x12dadfcf80`
+  (stable across runs). The freed object is a **stack-temp** container (`object r15 = 0x7fffec7fee20`,
+  a `0x7fff…` stack VA), idx=0.
+
+- **DECOMPRESSION IS NOT NEEDED — the entry is plaintext.** `dd` of `pakchunk0-ps5.pak` at the exact
+  read offset `0x2dcc378` shows ASCII INI for all 46135 bytes: begins `[Core.System]\r\n
+  CanUseUnversionedPropertySerialization=True…`, ends `…bCompileBlueprintsInDevelopmentMode=False
+  \r\n\r\n\0`. So `bCompressed=True` in the ticket referred to the ini's *directive*, not this
+  entry; the FPakEntry data is stored uncompressed. No Oodle/Kraken path is required here.
+
+- **THE READ PATH IS CORRECT.** `PROSPER_DUMPAT=0x2007a4002a` (the read dst `a4`) shows the correct
+  plaintext landed in the guest buffer, and the config parse *did* consume it (the crash element's
+  SavedValue is a valid 100-char UTF-16 config value `(Material="/Engine/BufferVisualization/…`).
+  A gated experiment mirroring the bytes into the begin-cursor staging buffer too
+  (`PROSPER_APR_FILL_CUR1`) left the crash bit-identical — the guest reads its data from `a4`, not
+  the cursor, so the read contract is not implicated.
+
+- **ROOT CAUSE: two live guest containers share memory 0x10 apart (heap overlap).** A gdb HW
+  write-watch on the exact freed slot `0x12dadfcf98` traced who wrote `0xd`: a
+  `TSparseArray`/`TSet` element-relocation loop at `eboot+0x2467850…0x2467927`
+  (`mov (%rbx),%rax` src = `*mapObject`; per-field 0x30-byte MOVE with FString move-semantics on the
+  two FStrings at `+0x08`/`+0x18`; heap object `rbx=0x1620e05148`). That loop writes its element at
+  **base `0x12dadfcf70`**, and `0xd` is that element's `+0x28` field (a valid TSparseArray
+  hash-next / free-list index). But the stack-temp free loop reads the SAME region at **base
+  `0x12dadfcf80`** (0x10 higher), so the neighbour's `+0x28` bookkeeping word aliases the freed
+  object's `+0x18` `FConfigValue::ProcessedValue.Data` slot — which on real HW is null (empty,
+  skipped by the `test rdi,rdi; je`). Two DISTINCT live objects (heap map @0x…cf70 relocation dest,
+  stack-temp array @0x…cf80) with overlapping storage ⇒ a MallocBinned pool corruption. The page
+  `0x12dadf0000` is freshly lazy-committed (zeroed) right before, so `0xd` is actively written by
+  the guest, not stale residue — the guest's own allocator handed out overlapping blocks.
+
+- **The 5 Ampr NIDs are a dead end for this crash.** Named 2 by brute-forcing `nid_hash` over a
+  generated libSceAmpr corpus: `tZDDEo2tE5k = sceAmprCommandBufferGetSize`,
+  `ULvXMDz56po = sceAmprCommandBufferClearBuffer` (both now registered in `hle_kernel_mem.cpp`).
+  `GetSize` fires during APR read teardown; making it return the real cb size instead of 0 left the
+  crash bit-identical, confirming the Ampr teardown functions do not gate it. The other three
+  (`vWU-odnS+fU sSAUCCU1dv4 GnxKOHEawhk H896Pt-yB4I`) resisted the corpus (non-`CommandBuffer<Verb>`
+  shapes) and are harmless no-ops (returning 0) — they are not on the corruption path.
+
+- **THE CLOBBER, PROVEN BY MEMLOG.** `PROSPER_MEMLOG` shows page `0x11e0df0000` appears TWICE:
+  `[lazy-commit] mapped page=0x11e0df0000` (line 321 — the guest wrote there, so prosper committed
+  it as a normal anon MallocBinned heap page) and later `[memhle] ampr push-map va=0x1720df0000 …
+  mirror=0x11e0df0000` (line 453 — strictly LATER). `k_ampr_push_map`'s map flavor maps the buffer
+  at `va` AND `MAP_FIXED`s a "mirror" at `va - 0x540000000` (a LOW-confidence rule pinned on The
+  Messenger). For this title `va = 0x1720df0000` ⇒ mirror `0x11e0df0000`, which is exactly the live
+  heap page — so `MAP_FIXED` replaced the heap page with a fresh page aliased to the Ampr buffer's
+  phys `0x10220000`, destroying the pool bookkeeping there. Downstream, MallocBinned carved two
+  blocks 0x10 apart (`0x12dadfcf70` heap-map relocation dest vs `0x12dadfcf80` stack-temp array),
+  their fields aliased, and the teardown freed the `0xd` bookkeeping word. Same clobber class as
+  issue #88 (SetBuffer over live heap), here via the **map-flavor mirror** instead of the
+  existing-buffer flavor.
+
+- **FIX (hle_kernel_mem.cpp, `k_ampr_push_map`):** only create the mirror when its target VA is NOT
+  already backed guest memory (`mincore(mirror,1,&vec) == 0` means fully mapped == live ⇒ skip). A
+  live target means the guest is using that VA as its own heap, not as a second view of the Ampr
+  pool, so the mirror is a false positive of the `0x540000000` heuristic and must not overwrite it.
+  Verified: the `FMallocBinned3` crash is GONE and DOLL boots through `InitializeConfigSystem` all
+  the way into UE's online/PSN subsystem init (SSL, HTTP, NpWebApi, Json, NpManager, NpTrophy2,
+  VoiceQoS, SystemService, Share, NetCtl, GameUpdate, NpUniversalDataSystem, NpGameIntent). The
+  Messenger is UNAFFECTED: its mirror targets are unmapped at map time (`mincore` fails), so it takes
+  the create-mirror path exactly as before — smoke shows 0 mirror-skips, 30k+ render lines, no crash;
+  ctest 50/50. CONFIDENCE: HIGH (collision proven by MEMLOG page-double-listing + strict ordering;
+  fix is target-conditional so it cannot regress the create-mirror case).
+
+- **NEW WALL: UE online/PSN subsystem init.** After config, the engine constructs its online
+  subsystem and hits a long run of unimplemented online/social NIDs
+  (`libSceNpManager qQJfO8HAiaY`, `libSceNpTrophy2 sUXGfNMalIo`, `libSceNpWebApi2`, `libSceHttp/Http2`,
+  `libSceSsl`, `libSceJson2 *`, `libSceNetCtl obuxdTiwkF8/iQw3iQPhvUQ`, `libSceSystemService`,
+  `libSceShare`, `libSceVoiceQoS`, `libSceGameUpdate`, `libSceNpGameIntent`), all returning 0. The
+  boot does not crash but does not visibly advance to RHI/AGC within 200s — likely blocked/polling in
+  online init (a service call that must report "signed out / offline" rather than 0, or an init that
+  the engine waits on). NEXT: trace which online-init call the main thread blocks on (break after the
+  last new NID; `PROSPER_BP`/gdb), and give the NpManager/NetCtl/SystemService "get state" queries a
+  real offline/no-network status so the engine proceeds to RHI creation → AGC → first UE draw (the
+  same `libSceAgc` path The Messenger renders through).
+
+### The remaining 3 unnamed Ampr NIDs (issue #107, not on the crash path)
+
+`vWU-odnS+fU`, `sSAUCCU1dv4`, `GnxKOHEawhk`, `H896Pt-yB4I` still resist the generated
+`sceAmprCommandBuffer<Verb><Noun>` corpus (the same brute-forcer that named the other 8 Ampr NIDs).
+They fire during mount, return 0 via the generic unimplemented stub, and are proven irrelevant to the
+config crash (fixed without them). Likely non-`CommandBuffer`-shaped names (Amm/Measure/util helpers);
+leave as no-ops until a future frontier needs them.
+
+### (superseded) original issue-#107 diagnosis notes
+
 ### OLD ANALYSIS (superseded): post-mount engine/RHI init — a null virtual call (racy, two faces)
 
 Boot now reaches early UE engine init and dies in one of two timing-dependent spots (the RHI /

@@ -553,6 +553,17 @@ static uint64_t ampr_arglog(const char* tag, uint64_t a0, uint64_t a1, uint64_t 
 }
 HLE(k_ampr_x1) { return ampr_arglog("baQO9ez2gL4", a0, a1, a2, a3, a4, a5); }
 HLE(k_ampr_x2) { return ampr_arglog("ULvXMDz56po", a0, a1, a2, a3, a4, a5); }
+// sceAmprCommandBufferGetSize (NID tZDDEo2tE5k, recovered by brute-forcing nid_hash over a
+// generated libSceAmpr corpus). Returns the command buffer's byte size. It fires during APR read
+// teardown; verified (issue #107) NOT to gate the config-load FMallocBinned3 crash — returning the
+// recorded cb size vs 0 leaves the crash bit-identical, so the value is non-critical here.
+// CONFIDENCE: MED (name from the same corpus that yielded the other 7 verified Ampr NIDs; exact
+// semantics of "size" — total vs used — unconfirmed, so we report the recorded cb size).
+HLE(k_ampr_getsize) {
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    ampr_arglog("tZDDEo2tE5k(GetSize)", a0, a1, a2, a3, a4, a5);
+    return g_apr_last_cb_size;
+}
 HLE(k_ampr_x3) { return ampr_arglog("Qs1xtplKo0U", a0, a1, a2, a3, a4, a5); }
 HLE(k_ampr_x4) { return ampr_arglog("GuchCTefuZw", a0, a1, a2, a3, a4, a5); }
 HLE(k_ampr_begin) {
@@ -640,11 +651,35 @@ HLE(k_ampr_push_map) {
         if (p) track((uint64_t)p, a2, PROT_READ | PROT_WRITE, true, "ampr-map");
         if (p && have_phys && a1 > 0x540000000ull + 0x1000000000ull) {
             uint64_t mirror = a1 - 0x540000000ull;
-            void* q = map_phys_at(mirror, a2, PROT_READ | PROT_WRITE, phys);
-            if (q) track((uint64_t)q, a2, PROT_READ | PROT_WRITE, true, "ampr-mirror");
+            // issue #107: the mirror is a LOW-confidence heuristic (the 0x540000000 rule was pinned
+            // on one title, The Messenger). On UE4 PPSA17942 the mirror VA lands squarely on LIVE
+            // MallocBinned heap that the guest already lazy-committed and filled (e.g. mirror
+            // 0x11e0df0000 aliases Ampr buffer phys 0x10220000 but was committed as heap earlier):
+            // MAP_FIXED'ing the aliased page there DESTROYS the heap page, corrupting the pool so it
+            // later carves two blocks 0x10 apart. That overlap is what makes FConfigCacheIni's
+            // teardown free a bookkeeping word (0xd) as a pointer -> "FMallocBinned3 Attempt to free
+            // an unrecognized block". This is the same clobber class as issue #88 (SetBuffer over
+            // live heap), here via the map-flavor mirror. Only create the mirror when its target is
+            // NOT already backed guest memory (mincore succeeds == fully mapped == live): that keeps
+            // the Messenger's genuine two-view pool working (its mirror target is unmapped at map
+            // time) while never overwriting a live heap page. CONFIDENCE: HIGH (the collision is
+            // proven by MEMLOG: page 0x11e0df0000 appears as both [lazy-commit] heap and ampr
+            // mirror; the mirror map is strictly later, so it clobbers the live page).
+            unsigned char vec;
+            bool mirror_live = (mincore((void*)(uintptr_t)mirror, 1, &vec) == 0);
+            void* q = nullptr;
+            if (mirror_live) {
+                MLOG("ampr push-map va=0x%llx mirror=0x%llx SKIPPED (target is live guest memory — "
+                     "map-flavor mirror would clobber MallocBinned heap, issue #107)\n",
+                     (unsigned long long)a1, (unsigned long long)mirror);
+            } else {
+                q = map_phys_at(mirror, a2, PROT_READ | PROT_WRITE, phys);
+                if (q) track((uint64_t)q, a2, PROT_READ | PROT_WRITE, true, "ampr-mirror");
+            }
             MLOG("ampr push-map va=0x%llx len=0x%llx phys=0x%llx mirror=0x%llx -> %s/%s\n",
                  (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)phys,
-                 (unsigned long long)mirror, p ? "ok" : "FAIL", q ? "ok" : "FAIL");
+                 (unsigned long long)mirror, p ? "ok" : "FAIL",
+                 mirror_live ? "skip" : (q ? "ok" : "FAIL"));
         } else {
             MLOG("ampr push-map va=0x%llx len=0x%llx -> %s\n",
                  (unsigned long long)a1, (unsigned long long)a2, p ? "ok" : "FAILED");
@@ -759,7 +794,10 @@ void register_kernel_mem_hle() {
     // teardown). Modeled as no-ops (arg capture under PROSPER_AMPRLOG); the read itself is
     // sceAmprAprCommandBufferReadFile in hle_file.cpp.
     Hle::register_fn("baQO9ez2gL4", (HleFn)k_ampr_x1, "sceAmprCommandBufferReset");
-    Hle::register_fn("ULvXMDz56po", (HleFn)k_ampr_x2, "sceAmpr?ULvXMDz56po");
+    // ULvXMDz56po and tZDDEo2tE5k names recovered by brute-forcing nid_hash() over a generated
+    // libSceAmpr corpus (sceAmprCommandBuffer<Verb>): ClearBuffer and GetSize.
+    Hle::register_fn("ULvXMDz56po", (HleFn)k_ampr_x2, "sceAmprCommandBufferClearBuffer");
+    Hle::register_fn("tZDDEo2tE5k", (HleFn)k_ampr_getsize, "sceAmprCommandBufferGetSize");
     Hle::register_fn("Qs1xtplKo0U", (HleFn)k_ampr_x3, "sceAmprAprCommandBufferDestructor");
     Hle::register_fn("GuchCTefuZw", (HleFn)k_ampr_x4, "sceAmprCommandBufferDestructor");
 }
