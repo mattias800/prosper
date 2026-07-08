@@ -83,6 +83,14 @@ renderer is wired in; the game's **real pixel shader recompiles to valid SPIR-V*
   live renderer, `PROSPER_GFXLOG=1` for graphics diagnostics.
 - **Correctness-first:** implement real behavior (cross-checked against the Kyty PS5-emulator reference in
   `../Kyty`), not shims that fake output. Mark genuinely-uncertain code with `CONFIDENCE: HIGH/MED/LOW`.
+- **Kyty is a reference, NOT an oracle.** Kyty is a very early-stage emulator — it cannot boot any
+  commercial game (prosper can). Its value is as a map of Sony's API surface: struct layouts, error
+  constants, packet encodings, ABI shapes — things its author transcribed from the platform. Its
+  *runtime behavior* (what a function actually needs to do for a real game to progress) is largely
+  unexercised and may be wrong or incomplete. Trust order when sources disagree:
+  (1) prosper's own live captures/traces of the real guest, (2) Kyty + shadPS4 when they agree,
+  (3) either one alone — cite which and mark CONFIDENCE accordingly. Never weaken a behavior that a
+  live boot demonstrates just to match Kyty.
 - **Commit style:** small, verified commits; push to `origin` promptly. Co-author trailer as configured.
   **Do NOT add "Generated with Claude Code" attribution lines** (the 🤖 badge, "Generated with
   [Claude Code](...)" footers, session links) to PR bodies, commit messages, issue text, or
@@ -104,3 +112,17 @@ renderer is wired in; the game's **real pixel shader recompiles to valid SPIR-V*
     sessions — issues are the durable queue; `docs/` files explain *how*, issues track *what
     remains*. The umbrella issue for the history-review backlog is #72
     (full annotated list: `prosper/docs/BUG_HUNT_BACKLOG.md`).
+  - **Claiming an issue (multi-agent lock).** Several agents work this repo concurrently; claim
+    before you code so two agents never fix the same issue:
+    1. Check it's free: no `in-progress` label, no unexpired claim comment, and no remote fix
+       branch — `gh issue view NN` + `git ls-remote origin 'refs/heads/fix/issue-NN-*'`.
+    2. Claim it: add the `in-progress` label AND post a comment
+       `CLAIMING: <agent/session identifier> | branch fix/issue-NN-<slug> | <UTC timestamp>`.
+    3. Re-check for a race: re-read the comments right after posting; if two claims landed, the
+       EARLIER timestamp wins (tie → lexicographically smaller branch name); the loser comments
+       "unclaiming" , removes the label only if they added it, and picks other work.
+    4. Push your `fix/issue-NN-<slug>` branch early — the remote branch doubles as the lock.
+    5. Release: the merged `Fixes #NN` PR closes the issue (label goes with it). If you abandon
+       or park the work, comment what state it's in and remove the `in-progress` label.
+    6. Claims expire: `in-progress` with no open PR and no activity for 24 h is stale — anyone
+       may re-claim after posting a takeover comment.
