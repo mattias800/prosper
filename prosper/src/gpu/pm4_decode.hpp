@@ -20,7 +20,7 @@ enum : uint32_t {
     IT_NOP = 0x10, IT_INDEX_TYPE = 0x2A, IT_EVENT_WRITE = 0x46, IT_SET_SH_REG = 0x76,
 };
 enum : uint32_t {
-    R_DRAW_INDEX_AUTO = 0x04, R_DRAW_RESET = 0x05, R_WAIT_FLIP_DONE = 0x06,
+    R_DRAW_INDEX = 0x03, R_DRAW_INDEX_AUTO = 0x04, R_DRAW_RESET = 0x05, R_WAIT_FLIP_DONE = 0x06,
     R_SH_REGS_INDIRECT = 0x11, R_CX_REGS_INDIRECT = 0x12, R_UC_REGS_INDIRECT = 0x13,
     R_ACQUIRE_MEM = 0x14, R_WRITE_DATA = 0x15, R_WAIT_MEM_64 = 0x16, R_FLIP = 0x17,
     R_RELEASE_MEM = 0x18, R_NUM = 0x40,
@@ -35,7 +35,7 @@ enum class RegClass { Cx, Sh, Uc };
 struct Pm4Command {
     enum class Kind {
         DrawReset, WaitFlipDone, SetShRegDirect, SetRegsIndirect, SetIndexType,
-        DrawIndexAuto, EventWrite, AcquireMem, WriteData, WaitRegMem, Flip, ReleaseMem, Unknown,
+        DrawIndex, DrawIndexAuto, EventWrite, AcquireMem, WriteData, WaitRegMem, Flip, ReleaseMem, Unknown,
     } kind = Kind::Unknown;
 
     uint32_t        header = 0;
@@ -46,8 +46,22 @@ struct Pm4Command {
     RegClass reg_class = RegClass::Cx;   // SetRegsIndirect
     uint32_t num_regs = 0;               // SetRegsIndirect
     uint64_t regs_vaddr = 0;             // SetRegsIndirect: guest addr of the register array
-    uint32_t index_count = 0;            // DrawIndexAuto
+    uint32_t index_count = 0;            // DrawIndexAuto / DrawIndex
     uint32_t index_size = 0;             // SetIndexType
+
+    // DrawIndex (sceAgcDcbDrawIndex -> R_DRAW_INDEX, laid out by hle_agc.cpp agc_dcb_draw_index).
+    // Packet payload: [0]=index_count, [1..2]=index-buffer guest address (lo/hi), [3..4]=64-bit draw
+    // modifier (lo/hi). Field roles cross-checked against Kyty: GraphicsDrawIndex (Graphics.cpp:313)
+    // emits exactly cmd[1]=index_count, cmd[2..3]=index_addr lo/hi under R_DRAW_INDEX, and its consumer
+    // cp_op_draw_index (GraphicsRun.cpp:2757) reads buffer[0]=index_count, buffer[1..2]=index_addr —
+    // CONFIDENCE: HIGH for count/address. [3..4] follows the Gen5 Dcb convention of a trailing 64-bit
+    // ShaderDrawModifier (cf. GraphicsDcbDrawIndexAuto (buf, index_count, modifier), Graphics.cpp:1971);
+    // Kyty's Gen4 form carries 32-bit flags+type there instead — CONFIDENCE: MED, decoded raw.
+    // The index ELEMENT SIZE is not in this packet: it comes from the preceding SetIndexType
+    // (GpuState::index_type), which the per-draw snapshot already captures.
+    uint64_t di_index_addr = 0;          // DrawIndex: guest address of the index buffer
+    uint64_t di_modifier = 0;            // DrawIndex: raw 64-bit draw-modifier bits
+    bool     di_valid = false;           // DrawIndex: payload was long enough to carry addr+modifier
     uint32_t event_type = 0;             // EventWrite
     uint32_t sh_reg_offset = 0, sh_reg_value = 0;  // SetShRegDirect (sh_reg_value = first value)
     uint32_t sh_reg_count = 0;                 // SetShRegDirect: # of consecutive registers this packet sets

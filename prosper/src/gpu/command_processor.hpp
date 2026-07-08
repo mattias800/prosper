@@ -31,8 +31,19 @@ struct GpuState {
     // states), and callers fall back to the folded end state. Foundational for a future multi-draw
     // executor (a reference consumer exists in the sibling PR #31); the default renderer still uses the
     // folded state, so this field is inert until that executor lands. (Snapshot infra ported from #31.)
-    struct Draw { uint32_t index_count; std::shared_ptr<const GpuState> state; };
-    std::vector<Draw> draws;                             // one per DrawIndexAuto
+    // Indexed draws (sceAgcDcbDrawIndex): `indexed` is set only when the packet carried the full
+    // operand set; `index_addr` is the guest address of the index buffer (1:1-mapped, so directly
+    // readable) and `modifier` the raw 64-bit draw-modifier bits. The index ELEMENT SIZE lives in the
+    // draw's register snapshot (`state->index_type`, from the preceding SetIndexType). The current
+    // executor does not consume the index buffer yet (renders these like DrawIndexAuto) — issue #64.
+    struct Draw {
+        uint32_t index_count;
+        std::shared_ptr<const GpuState> state;
+        bool     indexed = false;
+        uint64_t index_addr = 0;
+        uint64_t modifier = 0;
+    };
+    std::vector<Draw> draws;                             // one per DrawIndexAuto / DrawIndex
 
     // Safety cap on an indirect register count (a malformed/huge count won't run away).
     static constexpr uint32_t kMaxRegsPerPacket = 4096;

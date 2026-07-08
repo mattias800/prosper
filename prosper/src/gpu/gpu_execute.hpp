@@ -128,6 +128,10 @@ inline bool realize_draw_item(const GpuState& ds, uint32_t vcount_hint, uint32_t
 // composite correctly — the path for multi-geometry scenes (opt-in until the AGC context-log section
 // semantics that stage duplicate register writes are fully RE'd; see docs/REAL_FRAMES_FINDINGS.md).
 // `max_shader_dwords` bounds the recompiler's walk (it stops at S_ENDPGM).
+// Indexed draws (Draw::indexed, from sceAgcDcbDrawIndex): the index buffer (Draw::index_addr +
+// the snapshot's index_type) is carried on the draw record but NOT consumed yet — these render
+// exactly like a DrawIndexAuto with the same count (the fan heuristic above included). Wiring the
+// index buffer into vertex fetch (and retiring the quad-fan hack) is issue #64.
 inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn& render,
                                              uint32_t max_shader_dwords = 0x10000) {
     if (st.draws.empty() || !render) return {};              // nothing to render (e.g. a state-only submit)
