@@ -181,6 +181,23 @@ failure — possibly downstream of (1). Watch item for (1): the 2 GiB pak is rea
 Then decompression: `.ucas` chunks MAY be Oodle-compressed (check `compressionMethodNameCount`;
 `global` was 0/uncompressed).
 
+Leads for (1), captured live (`PROSPER_APR_DIAG` + the now-logged four extra Ampr NIDs):
+
+- `a5` of the submit looks like the intended READ SIZE, not a descriptor size: utoc reads pass
+  `0x90` = exactly the utoc TocHeaderSize, pak reads pass `0xdd` = 221 = the FPakInfo footer
+  size (61 + 5×32 compression-method names) and then `0xde` (a second footer-version probe) —
+  i.e. the pak reads want the LAST `a5` bytes (`filesize-221`), which whole-file-from-0 does not
+  deliver at the published pointer.
+- For the pakchunk0 pak read the desc buffer (`a4=0x20018f0000`, BatchMap memory) is a
+  structured ENGINE-PREWRITTEN array (~0x28-byte records): `{seq 0x456/0x467/0x485/0x4a7, small
+  count 0/1/3/4, eboot ptr 0x4058d26b0, dest VA 0x10e0dfff8000, {high32 seq | low32 0xffffffff}
+  pending markers}` — very likely the real per-read command/completion descriptors. Decoding
+  this array is the next concrete step for offset-correct pak reads.
+- The four other Ampr NIDs the flow calls fire AFTER each submit with constant args
+  (`baQO9ez2gL4(req,0,0,0,0x40|0,0)`, `ULvXMDz56po(req,stack,0,0,0x45,4|7)`,
+  `Qs1xtplKo0U(req,&rec.scratch,&rec.data,0,0x45,0xe)`, `GuchCTefuZw(req,stack,0,0,0x45,0xf)`) —
+  teardown/end-of-request, not the offset carrier (arg capture via `PROSPER_AMPRLOG`).
+
 ## Remaining work to the first frame (the subsystem)
 
 This is genuine subsystem construction, sized (per `CROSS_ENGINE_UE4.md`) like a second-title

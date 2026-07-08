@@ -502,7 +502,14 @@ HLE(f_apr_read_submit) {
         if (seg && safe_read(seg, b, 0x60)) hexdump("seg", seg, b, 0x60);
         if (a1 && safe_read(a1, b, 0x20)) hexdump("cur1", a1, b, 0x20);
         if (a2 && safe_read(a2, b, 0x20)) hexdump("cur2", a2, b, 0x20);
-        if (a4 && safe_read(a4, b, 0x90)) hexdump("desc-pre", a4, b, 0x90);
+        if (a4 && safe_read(a4, b, 0x90)) {
+            hexdump("desc-pre", a4, b, 0x90);
+            // The pak-read callsite's desc[0] points at a second heap block — follow one level
+            // (candidate real parameter block: path/offset/size for the index/footer read).
+            uint64_t d0 = *(uint64_t*)b;
+            uint8_t b2[0x100];
+            if (d0 > 0xffff && safe_read(d0, b2, 0x100)) hexdump("desc0->", d0, b2, 0x100);
+        }
     }
     // DIAGNOSTIC (PROSPER_APR_POOLSCAN=0xADDR): the crash-side structure is an array of {ptr,count}
     // entries (0x20 stride). Walk each entry's pointer as a freelist chain BEFORE we fill dest and

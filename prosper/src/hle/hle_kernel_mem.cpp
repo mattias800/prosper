@@ -452,6 +452,27 @@ HLE(k_ampr_init) {
     }
     return 0;
 }
+// DIAGNOSTIC (PROSPER_AMPRLOG=1): arg capture for the four other libSceAmpr NIDs the APR read flow
+// touches (baQO9ez2gL4 / ULvXMDz56po / Qs1xtplKo0U / GuchCTefuZw, previously anonymous unimpl
+// stubs). One of these likely carries the READ RANGE: the pak reads want the FPakInfo footer at
+// filesize-0xdd (a5 of the submit = 0xdd = footer size, 0x90 = utoc header size), so a per-read
+// {offset,size} must flow through some pre-submit call. CONFIDENCE: LOW until captured.
+static uint64_t ampr_arglog(const char* tag, uint64_t a0, uint64_t a1, uint64_t a2,
+                            uint64_t a3, uint64_t a4, uint64_t a5) {
+    if (amprlog()) {
+        fprintf(stderr, "[amprlog] %s a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx\n",
+                tag, (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
+                (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)a5);
+        for (uint64_t p : { a0, a1, a2 }) if (p > 0xffff && !(p & 7))
+            fprintf(stderr, "[amprlog]   [0x%llx] = 0x%016llx 0x%016llx\n", (unsigned long long)p,
+                    (unsigned long long)*(uint64_t*)p, (unsigned long long)*(uint64_t*)(p + 8));
+    }
+    return 0;
+}
+HLE(k_ampr_x1) { return ampr_arglog("baQO9ez2gL4", a0, a1, a2, a3, a4, a5); }
+HLE(k_ampr_x2) { return ampr_arglog("ULvXMDz56po", a0, a1, a2, a3, a4, a5); }
+HLE(k_ampr_x3) { return ampr_arglog("Qs1xtplKo0U", a0, a1, a2, a3, a4, a5); }
+HLE(k_ampr_x4) { return ampr_arglog("GuchCTefuZw", a0, a1, a2, a3, a4, a5); }
 HLE(k_ampr_begin) {
     if (amprlog()) {
         fprintf(stderr, "[amprlog] begin a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx\n",
@@ -615,6 +636,12 @@ void register_kernel_mem_hle() {
     Hle::register_fn("8aI7R7WaOlc", (HleFn)k_ampr_init,     "sceAmprCommandBufferInit?");
     Hle::register_fn("a8uLzYY--tM", (HleFn)k_ampr_begin,    "sceAmprCommandBufferBegin?");
     Hle::register_fn("N-FSPA4S3nI", (HleFn)k_ampr_push_map, "sceAmprPushMapPages?");
+    // The four other Ampr NIDs the APR read flow calls (arg capture under PROSPER_AMPRLOG; same
+    // return-0 behavior they had as anonymous unimpl stubs).
+    Hle::register_fn("baQO9ez2gL4", (HleFn)k_ampr_x1, "sceAmpr?baQO9ez2gL4");
+    Hle::register_fn("ULvXMDz56po", (HleFn)k_ampr_x2, "sceAmpr?ULvXMDz56po");
+    Hle::register_fn("Qs1xtplKo0U", (HleFn)k_ampr_x3, "sceAmpr?Qs1xtplKo0U");
+    Hle::register_fn("GuchCTefuZw", (HleFn)k_ampr_x4, "sceAmpr?GuchCTefuZw");
 }
 
 } // namespace prosper
