@@ -444,7 +444,8 @@ void register_kernel_time_hle() {
     R("sceKernelDebugRaiseExceptionOnReleaseMode", k_debug_raise_release);
     R("scePthreadGetthreadid", k_getthreadid);
     R("pthread_getthreadid_np", k_getthreadid);
-    R("sceKernelAprResolveFilepathsToIdsAndFileSizes", k_apr_unavailable);
+    // sceKernelAprResolveFilepathsToIdsAndFileSizes is now implemented for real in hle_file.cpp
+    // (f_apr_resolve: stat each path, assign an id, record id->host-path). Registered there.
     // C11 threads
     R("_Mtx_init", m_mtx_init);   R("_Mtx_lock", m_mtx_lock);   R("_Mtx_unlock", m_mtx_unlock);
     R("_Mtx_destroy", m_mtx_destroy);

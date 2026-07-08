@@ -11,6 +11,8 @@
 #include <cstring>
 #include <cerrno>
 #include <string>
+#include <mutex>
+#include <vector>
 #include <fcntl.h>
 #include <sys/stat.h>
 #ifndef _WIN32
@@ -338,6 +340,113 @@ HLE(f_unlink){ std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::
 #endif
     (h.c_str()); }
 
+// --- APR (Async Page Read) file resolution -----------------------------------------------------
+// sceKernelAprResolveFilepathsToIdsAndFileSizes(const char** paths, int count, uint32_t* outIds,
+//   uint64_t* outSizes, uint32_t* outFlags, int reserved) — the entry point of UE4's IoStore/APR
+// pipeline. Live capture (PPSA17942): called once per pak container with a /app0-translated path
+// (global.utoc/.ucas, pakchunkN-ps5.pak/.utoc/.ucas). Stubbing it to EINVAL made APR proceed on
+// garbage ids/sizes and wild-write over the allocator (the "MallocBinned unrecognized block" /
+// canary corruption). Resolve each path for real: stat the host file, assign a stable id, record
+// id->host-path so the read path can pread by id. CONFIDENCE: MED (arg roles from live capture;
+// outFlags semantics unknown -> 0).
+namespace {
+    std::mutex g_apr_mx;
+    struct AprFile { std::string path; uint64_t size; };
+    std::vector<AprFile> g_apr_files;   // id (1-based index) -> {host path, size}
+}
+// Exposed to the read path (Ampr page-read) to map an APR id back to its host file.
+std::string prosper_apr_path_for_id(uint32_t id) {
+    std::lock_guard<std::mutex> lk(g_apr_mx);
+    return (id >= 1 && id <= g_apr_files.size()) ? g_apr_files[id - 1].path : std::string();
+}
+// Find the resolved host path for a given file size (the APR read-request object carries the total
+// size at obj+0x30 but no directly-legible id; sizes of the boot-critical containers are distinct).
+static std::string apr_path_for_size(uint64_t size) {
+    std::lock_guard<std::mutex> lk(g_apr_mx);
+    for (auto& f : g_apr_files) if (f.size == size) return f.path;
+    return {};
+}
+HLE(f_apr_resolve) {
+    const char** paths = (const char**)P(a0);
+    int count = (int)(int64_t)a1;
+    uint32_t* out_ids   = (uint32_t*)P(a2);
+    uint64_t* out_sizes = (uint64_t*)P(a3);
+    uint32_t* out_flags = (uint32_t*)P(a4);
+    if (!paths || count <= 0) return 0x80020016ull;   // EINVAL
+    for (int i = 0; i < count; i++) {
+        const char* gp = paths[i];
+        std::string host = gp ? translate(gp) : std::string();
+        uint64_t size = 0; uint32_t id = 0;
+#ifndef _WIN32
+        struct stat st;
+        if (!host.empty() && ::stat(host.c_str(), &st) == 0) size = (uint64_t)st.st_size;
+#else
+        struct _stat64 st;
+        if (!host.empty() && ::_stat64(host.c_str(), &st) == 0) size = (uint64_t)st.st_size;
+#endif
+        else { if (out_ids) out_ids[i] = 0; if (out_sizes) out_sizes[i] = 0; if (out_flags) out_flags[i] = 0;
+               if (filelog()) fprintf(stderr, "[apr] resolve MISS %s\n", gp ? gp : "(null)"); continue; }
+        { std::lock_guard<std::mutex> lk(g_apr_mx); g_apr_files.push_back({ host, size }); id = (uint32_t)g_apr_files.size(); }
+        if (out_ids)   out_ids[i]   = id;
+        if (out_sizes) out_sizes[i] = size;
+        if (out_flags) out_flags[i] = 0;
+        if (filelog()) fprintf(stderr, "[apr] resolve %s -> id=%u size=%llu\n", gp, id, (unsigned long long)size);
+    }
+    return 0;
+}
+
+// libSceAmpr::mQ16-QdKv7k — the APR read SUBMIT (identified by tracing readFile eboot 0x59b6110 ->
+// this import). Live-captured call: mQ16(readReq, &cur1, &cur2, count, outDescBuf, descSize=0x90).
+// The read-request object carries the destination buffer at readReq+0x18 and the total byte count
+// at readReq+0x30. Real hardware DMAs the resolved file's bytes into that buffer; we do it with a
+// synchronous pread (the boot-critical global container is uncompressed — utoc header
+// compressionMethodNameCount==0). Route B of docs/UE4_APR_IOSTORE_BRINGUP.md. CONFIDENCE: MED
+// (object layout from live capture; file matched by size since the id isn't directly legible in
+// the request object — boot container sizes are distinct).
+HLE(f_apr_read_submit) {
+    uint8_t* req = (uint8_t*)P(a0);
+    if (!req) return 0x80020016ull;
+    if (filelog()) {
+        fprintf(stderr, "[apr] read-submit req=0x%llx a1=0x%llx a2=0x%llx count=0x%llx desc=0x%llx descsz=0x%llx\n",
+                (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
+                (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)a5);
+        for (int o = 0; o < 0x48; o += 8)
+            fprintf(stderr, "[apr]   req+0x%02x = 0x%016llx\n", o, (unsigned long long)*(uint64_t*)(req + o));
+    }
+    // req+0x20 is the mapped data buffer (guest direct/flexible memory, 0x10xxxxxxxx range); req+0x18
+    // is only a small stack scratch (writing the full file there smashed the stack). req+0x30 is the
+    // total byte count. CONFIDENCE: MED (field roles from live req dump).
+    uint64_t dest = *(uint64_t*)(req + 0x20);
+    uint64_t size = *(uint64_t*)(req + 0x30);
+    if (!dest || !size) { if (filelog()) fprintf(stderr, "[apr] read-submit: empty (dest=0x%llx size=0x%llx)\n",
+                          (unsigned long long)dest, (unsigned long long)size); return 0; }
+    std::string host = apr_path_for_size(size);
+    if (host.empty()) { if (filelog()) fprintf(stderr, "[apr] read-submit: no file for size=%llu\n",
+                        (unsigned long long)size); return 0x80020016ull; }
+#ifndef _WIN32
+    int fd = ::open(host.c_str(), O_RDONLY);
+    if (fd < 0) return 0x80020016ull;
+    ssize_t got = ::pread(fd, (void*)(uintptr_t)dest, (size_t)size, 0);
+    ::close(fd);
+#else
+    FILE* f = ::fopen(host.c_str(), "rb"); if (!f) return 0x80020016ull;
+    size_t got = ::fread((void*)(uintptr_t)dest, 1, (size_t)size, f); ::fclose(f);
+#endif
+    bool ok = ((uint64_t)got == size);
+    if (ok) {
+        // Clear the completion-status word at req+0x28 (low32 = error code, high32 = CB offset).
+        // The guest's readFile checks this AFTER waitCommandBufferCompletion — a synchronous read
+        // that returns 0 but leaves the pre-seeded failure code (0x24 "Apr read failure 24 at CB
+        // offset 40") there still fatals. Decoded from the check at eboot 0x22738a5
+        // (mov 0x30(%rbx)/0x34(%rbx) with rbx = req-8). CONFIDENCE: MED.
+        *(uint64_t*)(req + 0x28) = 0;
+    }
+    if (filelog()) fprintf(stderr, "[apr] read-submit %s -> dest=0x%llx size=%llu got=%lld %s\n",
+                   host.c_str(), (unsigned long long)dest, (unsigned long long)size, (long long)got,
+                   ok ? "OK" : "SHORT");
+    return ok ? 0 : 0x80020016ull;
+}
+
 void register_file_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
     R("fopen", f_fopen);   R("fclose", f_fclose); R("fread", f_fread);   R("fwrite", f_fwrite);
@@ -362,6 +471,9 @@ void register_file_hle() {
     R("rmdir", f_rmdir);          R("sceKernelRmdir", f_rmdir);
     R("unlink", f_unlink);        R("sceKernelUnlink", f_unlink);
     R("sceKernelGetdents", f_getdents); R("getdents", f_getdents);
+    R("sceKernelAprResolveFilepathsToIdsAndFileSizes", f_apr_resolve);   // real APR resolve (was EINVAL)
+    // libSceAmpr read-submit (raw NID; the APR page-read that fills the request buffer via pread).
+    Hle::register_fn("mQ16-QdKv7k", (HleFn)f_apr_read_submit, "sceAmprAprReadSubmit?");
     #undef R
 }
 
