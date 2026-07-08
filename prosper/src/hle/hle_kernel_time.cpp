@@ -35,6 +35,31 @@ namespace {
     clk::time_point g_start = clk::now();
     uint64_t ns_now() { return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - g_start).count(); }
     std::atomic<uint64_t> g_module_handle{1};
+
+    // --- Wall-clock anchor (#92). The host real-time clock is sampled ONCE, paired with the
+    // monotonic ns_now() at the same instant; every wall-clock surface (CLOCK_REALTIME,
+    // gettimeofday, time(), sceRtc*) derives from base + monotonic-elapsed. This makes all of
+    // them (a) agree on one "now", (b) show the true current date instead of the old synthetic
+    // bases (uptime-since-1970 for clock_gettime/gettimeofday vs frozen 1700000000 ≈ Nov 2023
+    // for time()/sceRtc — three notions of now, ~54 years apart), and (c) advance strictly
+    // monotonically — a host NTP step after boot cannot make guest wall time jump backwards.
+    struct WallAnchor { uint64_t base_us; uint64_t mono_ns; };
+    const WallAnchor& wall_anchor() {
+        static const WallAnchor a = [] {
+            uint64_t mono = ns_now();
+            uint64_t us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                              std::chrono::system_clock::now().time_since_epoch()).count();
+            return WallAnchor{ us, mono };
+        }();
+        return a;
+    }
+    uint64_t wall_now_us() {   // microseconds since the unix epoch, monotonically advancing
+        const WallAnchor& a = wall_anchor();
+        return a.base_us + (ns_now() - a.mono_ns) / 1000ull;
+    }
+    // RTC epoch: SceRtcTick counts microseconds since 0001-01-01 00:00:00 UTC; the unix epoch is
+    // 62135596800 s after it (the documented Orbis RTC convention, also shadPS4 UNIX_EPOCH_TICKS).
+    constexpr uint64_t kRtcUnixEpochOffsetUs = 62135596800ull * 1000000ull;
 }
 
 // --- time / clock (return real, advancing time so wait-for-time loops progress) ---
@@ -43,43 +68,113 @@ HLE(k_get_ptc_freq)   { return 1000000000ull; }            // counter is in ns -
 HLE(k_get_proc_time)  { return ns_now() / 1000; }          // microseconds
 HLE(k_read_tsc)       { return ns_now(); }
 HLE(k_tsc_freq)       { return 1000000000ull; }
+// sceKernelClockGettime / clock_gettime(clockid, struct timespec*). The PS5 inherits FreeBSD's
+// clockid numbering (shadPS4 time.h ORBIS_CLOCK_* == FreeBSD sys/time.h CLOCK_*; Kyty Pthread.cpp
+// KernelClockGettime agrees on 0=REALTIME, 4=MONOTONIC). Previously the id was IGNORED — every
+// clock, including CLOCK_REALTIME, returned uptime-since-process-start, i.e. wall time = Jan 1
+// 1970 + uptime (#92). Realtime family -> the anchored wall clock; monotonic/uptime family -> the
+// steady clock (FreeBSD's UPTIME clocks ARE its MONOTONIC clocks — both count since boot).
+// CONFIDENCE: HIGH on ids {0,4,5,7,8,9,10,11,12,13} (FreeBSD + both references); MED on the
+// default branch (cpu-time ids 1/2/14 fall back to the steady clock rather than real cpu time —
+// still monotonic, never backwards).
 HLE(k_clock_gettime) {                                     // (clockid, struct timespec*)
-    if (!a1) return 0;
-    uint64_t ns = ns_now();
-    ((int64_t*)P(a1))[0] = (int64_t)(ns / 1000000000ull);   // tv_sec
-    ((int64_t*)P(a1))[1] = (int64_t)(ns % 1000000000ull);   // tv_nsec
+    if (!a1) return 0x8002000eull;                          // SCE_KERNEL_ERROR_EFAULT (Kyty/shadPS4)
+    int64_t sec, nsec;
+    switch ((int)a0) {
+    case 0: case 9: case 10: {                              // REALTIME / _PRECISE / _FAST
+        uint64_t us = wall_now_us();
+        sec = (int64_t)(us / 1000000ull); nsec = (int64_t)(us % 1000000ull) * 1000;
+        break;
+    }
+    case 13: {                                              // CLOCK_SECOND: realtime, 1 s resolution
+        sec = (int64_t)(wall_now_us() / 1000000ull); nsec = 0;
+        break;
+    }
+    case 4: case 5: case 7: case 8: case 11: case 12:       // MONOTONIC/UPTIME family
+    case 15:                                                // PROCTIME (uptime == our process time)
+    default: {                                              // incl. cpu-time ids — steady fallback
+        uint64_t ns = ns_now();
+        sec = (int64_t)(ns / 1000000000ull); nsec = (int64_t)(ns % 1000000000ull);
+        break;
+    }
+    }
+    ((int64_t*)P(a1))[0] = sec;                             // tv_sec
+    ((int64_t*)P(a1))[1] = nsec;                            // tv_nsec
     return 0;
 }
 HLE(k_gettimeofday) {                                      // (struct timeval*, tz*)
     if (!a0) return 0;
-    uint64_t us = ns_now() / 1000;
+    uint64_t us = wall_now_us();
     ((int64_t*)P(a0))[0] = (int64_t)(us / 1000000ull);      // tv_sec
     ((int64_t*)P(a0))[1] = (int64_t)(us % 1000000ull);      // tv_usec
     return 0;
 }
-HLE(k_time) { uint64_t s = ns_now() / 1000000000ull + 1700000000ull; if (a0) *(int64_t*)P(a0) = (int64_t)s; return s; }
+HLE(k_time) { uint64_t s = wall_now_us() / 1000000ull; if (a0) *(int64_t*)P(a0) = (int64_t)s; return s; }
 HLE(k_clock) { return ns_now() / 1000; }   // clock(): CLOCKS_PER_SEC=1e6 -> microseconds
 // sceRtcGetCurrentTick(SceRtcTick* tick): a SceRtcTick is a single u64 = microseconds since the Sony RTC
-// epoch 0001-01-01 00:00:00 UTC. Was unimplemented (→0), which zeroes the game's wall-clock and skews any
-// timestamp/interval math derived from it. Return a real, monotonically-advancing tick built from our
-// synthetic unix time (base 1700000000 ≈ 2023-11) + the RTC↔unix epoch offset (62135596800 s).
-// CONFIDENCE: MED — SceRtcTick = bare u64 µs and the 62135596800 s offset are the documented Orbis RTC
-// convention; the wall-clock base is synthetic (we don't read the host RTC) but advances correctly.
+// epoch 0001-01-01 00:00:00 UTC. Built from the anchored wall clock (#92 — was the frozen synthetic base
+// 1700000000 ≈ Nov 2023) + the RTC↔unix epoch offset. CONFIDENCE: HIGH — SceRtcTick = bare u64 µs and the
+// 62135596800 s offset are the documented Orbis RTC convention (shadPS4 rtc.cpp UNIX_EPOCH_TICKS agrees).
 HLE(k_rtc_get_current_tick) {
     if (!a0) return 0;
-    uint64_t unix_us = (ns_now() / 1000ull) + 1700000000ull * 1000000ull;
-    uint64_t tick = unix_us + 62135596800ull * 1000000ull;   // shift to the 0001-01-01 RTC epoch
-    *(uint64_t*)P(a0) = tick;
+    *(uint64_t*)P(a0) = wall_now_us() + kRtcUnixEpochOffsetUs;
     return 0;
 }
-// sceRtcGetCurrentClockLocalTime / sceRtcGetCurrentClock(SceRtcDateTime* dt[, int tz_minutes]) —
-// fill the 16-byte SceRtcDateTime {u16 year,month,day,hour,minute,second; u32 microsecond} from the
-// same synthetic wall clock as sceRtcGetCurrentTick. Unimplemented-zero output (month=0, day=0)
-// trips UE4's FDateTime "Invalid Date values" assert, whose failed-assert handler then calls a
-// null crash-handler pointer — so a REAL calendar conversion is load-bearing for the UE4 boot.
+// Fill the 16-byte SceRtcDateTime {u16 year,month,day,hour,minute,second; u32 microsecond} from a
+// broken-down tm + microsecond remainder. A real calendar conversion is load-bearing for the UE4
+// boot: zeroed output (month=0, day=0) trips UE4's FDateTime "Invalid Date values" assert, whose
+// failed-assert handler then calls a null crash-handler pointer.
+static void fill_rtc_datetime(void* out, const struct tm& tmv, uint32_t usec) {
+    uint16_t* d = (uint16_t*)out;
+    d[0] = (uint16_t)(tmv.tm_year + 1900);
+    d[1] = (uint16_t)(tmv.tm_mon + 1);
+    d[2] = (uint16_t)tmv.tm_mday;
+    d[3] = (uint16_t)tmv.tm_hour;
+    d[4] = (uint16_t)tmv.tm_min;
+    d[5] = (uint16_t)tmv.tm_sec;
+    *(uint32_t*)(d + 6) = usec;
+}
+// sceRtcGetCurrentClockLocalTime(SceRtcDateTime* dt) — the current wall clock in the HOST's local
+// timezone (previously gmtime on the frozen synthetic base: "local" was UTC and the date was stuck
+// at Nov 2023, #92). Reference: shadPS4 rtc.cpp sceRtcGetCurrentClockLocalTime = current tick +
+// the sceKernelGettimezone offset (minuteswest/dst) — i.e. the host tz including DST, which is
+// exactly what localtime_r/localtime_s compute. Kyty has no LibRtc to cross-check; single-arg
+// signature and host-tz semantics per shadPS4. CONFIDENCE: MED.
 HLE(k_rtc_get_clock_localtime) {
     if (!a0) return 0;
-    uint64_t us = (ns_now() / 1000ull) + 1700000000ull * 1000000ull;
+    uint64_t us = wall_now_us();
+    time_t secs = (time_t)(us / 1000000ull);
+    struct tm tmv {};
+#ifdef _WIN32
+    localtime_s(&tmv, &secs);
+#else
+    localtime_r(&secs, &tmv);
+#endif
+    fill_rtc_datetime(P(a0), tmv, (uint32_t)(us % 1000000ull));
+    return 0;
+}
+// sceRtcGetCurrentClock(SceRtcDateTime* dt, int tz_minutes) — the current wall clock shifted by an
+// EXPLICIT caller-supplied timezone offset in minutes (tz was previously ignored). Reference:
+// shadPS4 rtc.cpp sceRtcGetCurrentClock does tick + sceRtcTickAddMinutes(timeZone). Signed: west
+// of UTC is negative. CONFIDENCE: MED (shadPS4 only; Kyty has no LibRtc).
+HLE(k_rtc_get_current_clock) {
+    if (!a0) return 0;
+    int64_t us = (int64_t)wall_now_us() + (int64_t)(int32_t)a1 * 60000000ll;
+    if (us < 0) us = 0;                                     // absurd tz on a near-epoch clock: clamp
+    time_t secs = (time_t)(us / 1000000ll);
+    struct tm tmv {};
+#ifdef _WIN32
+    gmtime_s(&tmv, &secs);
+#else
+    gmtime_r(&secs, &tmv);
+#endif
+    fill_rtc_datetime(P(a0), tmv, (uint32_t)(us % 1000000ll));
+    return 0;
+}
+// sceRtcGetCurrentDateTimeUtc(SceRtcDateTime* dt) — plain UTC.
+HLE(k_rtc_get_clock_utc) {
+    if (!a0) return 0;
+    uint64_t us = wall_now_us();
     time_t secs = (time_t)(us / 1000000ull);
     struct tm tmv {};
 #ifdef _WIN32
@@ -87,14 +182,7 @@ HLE(k_rtc_get_clock_localtime) {
 #else
     gmtime_r(&secs, &tmv);
 #endif
-    uint16_t* d = (uint16_t*)P(a0);
-    d[0] = (uint16_t)(tmv.tm_year + 1900);
-    d[1] = (uint16_t)(tmv.tm_mon + 1);
-    d[2] = (uint16_t)tmv.tm_mday;
-    d[3] = (uint16_t)tmv.tm_hour;
-    d[4] = (uint16_t)tmv.tm_min;
-    d[5] = (uint16_t)tmv.tm_sec;
-    *(uint32_t*)(d + 6) = (uint32_t)(us % 1000000ull);
+    fill_rtc_datetime(P(a0), tmv, (uint32_t)(us % 1000000ull));
     return 0;
 }
 
@@ -531,9 +619,9 @@ void register_kernel_time_hle() {
     R("clock", k_clock);
     R("sceRtcGetCurrentTick", k_rtc_get_current_tick);
     R("sceRtcGetCurrentNetworkTick", k_rtc_get_current_tick);
-    R("sceRtcGetCurrentClockLocalTime", k_rtc_get_clock_localtime);
-    R("sceRtcGetCurrentClock", k_rtc_get_clock_localtime);          // (dt, tz) — tz ignored (UTC clock)
-    R("sceRtcGetCurrentDateTimeUtc", k_rtc_get_clock_localtime);
+    R("sceRtcGetCurrentClockLocalTime", k_rtc_get_clock_localtime); // (dt) — host-local tz
+    R("sceRtcGetCurrentClock", k_rtc_get_current_clock);            // (dt, tz_minutes)
+    R("sceRtcGetCurrentDateTimeUtc", k_rtc_get_clock_utc);
     // module loading (report success; real PRX are already resident in our address space)
     R("sceSysmoduleLoadModule", k_ok);
     R("sceSysmoduleUnloadModule", k_ok);
