@@ -179,7 +179,9 @@ HLE(agc_dcb_write_data) {  // sceAgcDcbWriteData(buf, dst, cache_policy, address
     // Real PM4 WRITE_DATA carries a 14-bit dword count — accept up to that, and REJECT (loudly)
     // anything larger as a mis-decoded arg. The previous silent clamp to 60 returned success while
     // dropping the tail of any larger write (e.g. a 256-byte descriptor table), leaving the
-    // destination stale beyond dword 60 with no diagnostic. begin_packet bounds-checks the Dcb.
+    // destination stale beyond dword 60 with no diagnostic. An accepted-but-large num cannot
+    // overrun the ring: begin_packet -> allocate_dw() checks 5+num against available_dw() (with
+    // the grow callback) and returns null on failure, which takes the `return 0` path below.
     if (num > 0x3FFF) {
         fprintf(stderr, "[agc] WriteData REJECTED num_dwords=%u (>PM4 max 0x3FFF — mis-decoded arg?)\n", num);
         return 0;

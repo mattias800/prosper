@@ -62,9 +62,13 @@ namespace {
     // unmapped memory) where a /dev/null write does not. O_NONBLOCK so a full pipe can never
     // block the fault handler; drained after every probe.
     int  g_probe_pipe[2] = {-1, -1};
+    // One-time init via a C++11 magic static (thread-safe): the unguarded `if (fd < 0) pipe2`
+    // pattern could tear the fd pair under two concurrent first-calls (PR #61 review). Called
+    // only from install-time paths (never from the signal handler itself), so the guard's
+    // internal locking is safe here.
     void ensure_probe_pipe() {
-        if (g_probe_pipe[0] < 0 && pipe2(g_probe_pipe, O_CLOEXEC | O_NONBLOCK) != 0)
-            g_probe_pipe[0] = g_probe_pipe[1] = -1;
+        static const bool ok = pipe2(g_probe_pipe, O_CLOEXEC | O_NONBLOCK) == 0;
+        if (!ok) g_probe_pipe[0] = g_probe_pipe[1] = -1;
     }
     // DIAGNOSTIC (PROSPER_SKIP_NULL_COMPANION, default off): at the Unity GfxDevice pipeline reader
     // eboot+0xba6e08 — which derefs a null GPU-companion pointer [obj+0x140] for pipelines that were

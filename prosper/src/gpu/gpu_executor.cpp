@@ -50,6 +50,14 @@ void read_user_sgprs(const std::unordered_map<uint32_t, uint32_t>& sh, uint32_t 
 // pass wild addresses).
 #ifndef _WIN32
 static int g_probe_pipe[2] = {-1, -1};
+// One-time pipe creation via a C++11 magic static (thread-safe). guest_readable is shared with
+// the multi-threaded HLE pointer probes: an unguarded `if (fd < 0) pipe2(...)` lazy init let two
+// first-callers each pipe2 into the array — a torn pair (write-end of pipe B, read-end of pipe A)
+// never drains, fills, and EAGAINs: VALID memory reported unreadable, silently. (PR #61 review.)
+static bool probe_pipe_ok() {
+    static const bool ok = pipe2(g_probe_pipe, O_CLOEXEC | O_NONBLOCK) == 0;
+    return ok;
+}
 static bool probe_byte(uint64_t a) {
     ssize_t w = write(g_probe_pipe[1], (const void*)(uintptr_t)a, 1);
     if (w == 1) { char c; (void)!read(g_probe_pipe[0], &c, 1); return true; }
@@ -58,10 +66,7 @@ static bool probe_byte(uint64_t a) {
 bool guest_readable(uint64_t a, uint32_t n) {
     if (a < 0x1000 || n == 0) return false;
     if (a + n < a) return false;   // wrap
-    if (g_probe_pipe[0] < 0 && pipe2(g_probe_pipe, O_CLOEXEC | O_NONBLOCK) != 0) {
-        g_probe_pipe[0] = g_probe_pipe[1] = -1;
-        return false;
-    }
+    if (!probe_pipe_ok()) return false;
     uint64_t last_page = (a + n - 1) & ~0xfffull;
     for (uint64_t p = a & ~0xfffull; p <= last_page; p += 0x1000)
         if (!probe_byte(p < a ? a : p)) return false;
