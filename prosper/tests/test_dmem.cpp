@@ -22,6 +22,13 @@ static constexpr uint64_t kEnd   = kBase + kTotal;
 
 int main() {
     printf("== test_dmem ==\n");
+#ifndef __linux__
+    // The direct-memory HLE (hle_kernel_mem.cpp) is #ifdef __linux__ — its functions aren't
+    // registered on other platforms (e.g. the Windows/MinGW CI build), so there is nothing to
+    // exercise here. Skip cleanly rather than fail on the absent registrations.
+    printf("  [skip] direct-memory HLE is Linux-only on this build\n== PASS ==\n");
+    return 0;
+#else
     register_builtin_hle();
 
     auto avail   = Hle::lookup(nid_hash("sceKernelAvailableDirectMemorySize"));
@@ -78,4 +85,5 @@ int main() {
     if (fails) { printf("== FAIL: %d check(s) ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
+#endif
 }
