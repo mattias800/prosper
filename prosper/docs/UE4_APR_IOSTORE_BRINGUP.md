@@ -90,6 +90,33 @@ first milestone — get the (uncompressed) global TOC to load and expose the nex
 non-zero read offsets and the file-id linkage will be needed for the compressed `.ucas` chunk
 reads that follow.
 
+### STATUS: read executor working end-to-end — the global TOC now reads AND parses
+
+Four commits on `feat/ue4-apr` implement the read path and get the engine through IoStore TOC
+handling entirely:
+1. `f_apr_read_submit` (mQ16-QdKv7k): synchronous `pread` of the resolved file.
+2. Clear the completion-status word at `req+0x28` on success (else the pre-seeded `0x24` "Apr read
+   failure 24 at CB offset 40" still fatals — check decoded at eboot `0x22738a5`, `rbx = req-8`).
+3. Destination is `req+0x20` (the mapped guest data buffer, `0x10xxxxxxxx`), NOT `req+0x18` (a
+   small stack scratch — the earlier 645-byte write there smashed the stack; crash was a `ret`
+   with the TOC magic in `rbp`). `req+0x30` = byte count.
+
+Verified: `read-submit global.utoc -> size=645 got=645 OK`, `aprreadfail=0`, TOC parses, and the
+engine advances FAR deeper — new crash at **`eboot+0x2316c91`** via a 17-frame IoStore/IoDispatcher
+backtrace (`0x22fce69 <- 0x245f78 <- 0x22dfbb5 <- 0x4551748 <- 0x45529c2 <- 0x4552317`), a static-
+init-guard-style function (`rax`=0x2001c10000 a BatchMap buffer, null deref, `rdx`=0x50). Only ONE
+read happens before this — the engine crashes *processing* the parsed TOC, before the next read.
+
+Field map of the APR read-request object (live `req` dump):
+`+0x00` count(1) · `+0x08` stack ptr · `+0x10` fn/vtable · `+0x18` small stack scratch ·
+`+0x20` **mapped data buffer (dest)** · `+0x28` status(err\|cboff) · `+0x30` **byte count** ·
+`+0x38` stack canary · `+0x40` stack ptr.
+
+Next: disassemble `0x2316c91` / `0x22fce69` — likely another null global/uninitialized IoStore
+struct (a missing init call or a container/registry the TOC parse expected to populate). Then the
+`.ucas` chunk reads begin (those MAY be Oodle-compressed — check each container's utoc
+`compressionMethodNameCount`; `global` was 0/uncompressed).
+
 ## Remaining work to the first frame (the subsystem)
 
 This is genuine subsystem construction, sized (per `CROSS_ENGINE_UE4.md`) like a second-title
