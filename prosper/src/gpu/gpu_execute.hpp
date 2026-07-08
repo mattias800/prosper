@@ -180,7 +180,16 @@ inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn&
                                              uint32_t max_shader_dwords = 0x10000) {
     if (st.draws.empty() || !render) return {};              // nothing to render (e.g. a state-only submit)
     const bool log = getenv("PROSPER_GFXLOG") != nullptr;    // bail-point visibility (why no frame?)
-    static const bool perdraw = getenv("PROSPER_PERDRAW") != nullptr;
+    // Render each draw from its OWN register snapshot when the submit has MULTIPLE draws — a real
+    // multi-geometry scene (the game's in-game/cutscene submits carry 8-11 distinct draws with per-draw
+    // shaders/textures/blends). Folding those to just the last draw drops the rest and the frame comes out
+    // as the bare clear; per-draw rendering makes the intro cutscene's real content appear (black scene +
+    // its geometry) instead of a blank blue clear. A single-draw submit stays folded (nothing to composite).
+    // Overridable: PROSPER_PERDRAW forces per-draw always, PROSPER_FOLDED forces the old single-item path.
+    // CONFIDENCE: MED — verified multi-draw scenes render their content per-draw vs. a blank clear folded.
+    static const bool force_perdraw = getenv("PROSPER_PERDRAW") != nullptr;
+    static const bool force_folded  = getenv("PROSPER_FOLDED") != nullptr;
+    const bool perdraw = force_perdraw || (!force_folded && st.draws.size() > 1);
     std::vector<DrawItem> items;
     if (perdraw) {
         for (size_t i = 0; i < st.draws.size(); i++) {
