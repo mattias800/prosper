@@ -83,14 +83,17 @@ renderer is wired in; the game's **real pixel shader recompiles to valid SPIR-V*
   live renderer, `PROSPER_GFXLOG=1` for graphics diagnostics.
 - **Correctness-first:** implement real behavior (cross-checked against the Kyty PS5-emulator reference in
   `../Kyty`), not shims that fake output. Mark genuinely-uncertain code with `CONFIDENCE: HIGH/MED/LOW`.
-- **Kyty is a reference, NOT an oracle.** Kyty is a very early-stage emulator — it cannot boot any
-  commercial game (prosper can). Its value is as a map of Sony's API surface: struct layouts, error
-  constants, packet encodings, ABI shapes — things its author transcribed from the platform. Its
-  *runtime behavior* (what a function actually needs to do for a real game to progress) is largely
-  unexercised and may be wrong or incomplete. Trust order when sources disagree:
-  (1) prosper's own live captures/traces of the real guest, (2) Kyty + shadPS4 when they agree,
-  (3) either one alone — cite which and mark CONFIDENCE accordingly. Never weaken a behavior that a
-  live boot demonstrates just to match Kyty.
+- **Kyty is a reference, NOT an oracle — and its reliability is split by platform generation.**
+  Kyty CAN run PS4 games, so the PS4-inherited surface (libkernel, pthreads, equeue, VideoOut,
+  filesystem, GNM-era graphics concepts) is exercised by real titles and is solid evidence — PS5
+  evolved from PS4, so those behaviors usually carry over. But Kyty's PS5-SPECIFIC surface is
+  early transcription work it never runs: **AGC (the PS5's replacement for GNM) especially** —
+  Gen5 Dcb builders, T#/V# Gen5 descriptor formats, PS5-only kernel calls (APR/Ampr/BatchMap).
+  There, prosper's own live captures are the only exercised evidence (we boot the PS5 titles;
+  Kyty does not). Trust order when sources disagree: (1) prosper's live captures/traces of the
+  real guest, (2) Kyty+shadPS4 agreeing (strongest for PS4-inherited surfaces), (3) either alone
+  — cite which and mark CONFIDENCE accordingly, and weight Kyty DOWN for anything Gen5/AGC.
+  Never weaken a behavior that a live boot demonstrates just to match a reference.
 - **Commit style:** small, verified commits; push to `origin` promptly. Co-author trailer as configured.
   **Do NOT add "Generated with Claude Code" attribution lines** (the 🤖 badge, "Generated with
   [Claude Code](...)" footers, session links) to PR bodies, commit messages, issue text, or
