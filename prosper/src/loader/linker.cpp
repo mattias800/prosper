@@ -1,6 +1,8 @@
 #include "linker.hpp"
 #include <unordered_map>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 
 namespace prosper {
 
@@ -79,6 +81,14 @@ bool link_program(const std::vector<LinkInput>& inputs, uint64_t stub_base,
     // own ctors via _start; PRX modules need their init_array run by the loader). We run
     // them in reverse load order (deepest dependency first). init_array entries were just
     // relocated to absolute addresses, so read them straight from the image. ---
+    if (getenv("PROSPER_INITLOG")) {
+        for (size_t i = 0; i < out.mods.size(); i++) {
+            const Module& m = *out.mods[i];
+            fprintf(stderr, "[initlog] module %zu base=0x%llx init_va=0x%llx init_array_va=0x%llx entries=%llu\n",
+                    i, (unsigned long long)out.imgs[i].base, (unsigned long long)m.init_va,
+                    (unsigned long long)m.init_array_va, (unsigned long long)(m.init_array_sz / 8));
+        }
+    }
     for (size_t i = out.mods.size(); i-- > 1; ) {
         const Module& m = *out.mods[i];
         LoadedImage& img = out.imgs[i];

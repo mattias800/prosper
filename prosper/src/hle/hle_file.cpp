@@ -499,6 +499,10 @@ HLE(f_apr_resolve) {
 // scope (NOT inside the extern "C" handler, where a block-scope extern would take C linkage and
 // miss the mangled prosper:: definition).
 extern uint64_t g_apr_last_cb, g_apr_last_cb_size;
+// Tracked-mapping state probe (hle_kernel_mem.cpp): 1 = addr is inside a guest-RESERVED range
+// whose pages lazy-commit on first touch. Used by the read path's dst-write to replicate the
+// fault handler's commit-on-write semantics for kernel-side (process_vm_writev) copies.
+extern "C" int prosper_reserved_range_state(uint64_t addr);
 
 #ifndef _WIN32
 // MUST NOT be `__thread` (issue #89). An initial-exec thread-local here (`%fs:...@tpoff`) grows the
@@ -709,6 +713,29 @@ HLE(f_apr_read_submit) {
         if (size) {
             struct iovec l { slot, (size_t)size }, r { (void*)(uintptr_t)a4, (size_t)size };
             in_dst = process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)size;
+            if (!in_dst) {
+                // The kernel-side writev CANNOT fault through prosper's SIGSEGV lazy-commit
+                // handler, so a dst inside a guest-RESERVED range whose pages were never touched
+                // reports EFAULT even though a real guest write would succeed (the fault handler
+                // would back the page). That EFAULT used to demote the read to "publish the
+                // prosper-owned staging pointer through the record" — and the engine later
+                // FMemory::Free()d that HOST pointer: "FMallocBinned3 Attempt to free an
+                // unrecognized block" during config-file loads (issue #88's second face).
+                // Replicate the guest-write semantics instead: commit the lazy 64K pages the
+                // exact way the fault handler does, then retry once. CONFIDENCE: HIGH (same
+                // policy as the lazy-commit path in exec_image_linux.cpp).
+                bool committed = false;
+                for (uint64_t p = a4 & ~0xffffull; p < a4 + size; p += 0x10000) {
+                    unsigned char vec;
+                    if (mincore((void*)(uintptr_t)p, 1, &vec) != 0 &&
+                        prosper_reserved_range_state(p) == 1 &&
+                        mmap((void*)(uintptr_t)p, 0x10000, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == (void*)(uintptr_t)p)
+                        committed = true;
+                }
+                if (committed)
+                    in_dst = process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)size;
+            }
         } else in_dst = true;
     }
     if (ok && a2) {

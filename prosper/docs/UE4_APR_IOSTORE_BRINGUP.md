@@ -238,7 +238,64 @@ real post-footer reads it previously never reached: the FPakFile **index** at th
 id=10, 17.8 GB) — i.e. IoStore container mounting is complete. CONFIDENCE: HIGH (offset/size/dst all
 verified on live reads; PreInit-passes is the end-to-end proof).
 
-### NEW WALL: post-mount engine/RHI init — a null virtual call (racy, two faces)
+### SOLVED (2026-07-08, issue #88): the null virtual call was a SetBuffer heap clobber
+
+Full causal chain, proven step by step (single-run reg-time vs crash-time dumps + a silent HW
+write-watch):
+
+1. The `eboot+0x24c75ef` `call *0x10(%rax)` is `IModuleInterface::StartupModule()` inside
+   `FModuleManager::LoadModuleWithFailureReason` (the "LoadModule  - " boot scope) — loading
+   **"Engine"** from `SCOPED_BOOT_TIMING("LoadPreInitModules")`. The rbp-chain backtrace hid the
+   real fault: it is INSIDE `FEngineModule::StartupModule` at `eboot+0x503b72e/731`
+   (`mov (%rbx),%rax ; call *0xb0(%rax)`), where `rbx` = a guarded function-local static caching
+   `IConsoleManager::FindConsoleVariable(L"r.Shadow.CacheWPOPrimitives")` — which returned NULL,
+   and the code calls `SetOnChangedCallback` on it with no null check (a sibling block does the
+   same for `r.ShowMaterialDrawEvents`).
+2. The CVar IS registered: the TAutoConsoleVariable static ctor (in the eboot's .ctors table —
+   walked backward from `0x4094939e8` to the -1 sentinel by DT_INIT at eboot+0x10; all 1498 ran)
+   called `RegisterConsoleVariable` successfully; the object sat in FConsoleManager's 3000+ entry
+   map. But by StartupModule time the map entry's FString KEY DATA was ALL ZEROS in place —
+   FindConsoleVariable can never match it.
+3. The zeroing had NO writer (a HW write-watch on the exact key address never fired): it was a
+   MAPPING REPLACED UNDER THE VA. `k_ampr_push_map` (sceAmprCommandBufferSetBuffer HLE) treated
+   EVERY SetBuffer as "map fresh phys page at va (+ mirror at va-0x540000000)". The APR read
+   flow also issues SetBuffer for an ALREADY-LIVE 0x4000-byte descriptor buffer
+   (`va=0x15a0dfc000`), and the MIRROR (`0x1060dfc000`) MAP_FIXED'd fresh zero pages over live
+   MallocBinned heap — the exact 16KB holding the console map's key strings.
+4. Fix (hle_kernel_mem.cpp): the two SetBuffer flavors are discriminated by their own args —
+   captured live: map flavor has `a3 != va, a4 = 0xffffffff sentinel`; existing-buffer flavor has
+   `a3 == va, a4 = allocCtx, a5 = small flags` (13/13 and 3/3 in capture). The existing-buffer
+   flavor is now a memory no-op. The worker-thread face was the same corruption seen from the
+   other side.
+5. Companion fix (hle_file.cpp): the read-submit dst write (`process_vm_writev`) cannot fault
+   through the lazy-commit SIGSEGV handler, so an untouched reserved dst returned EFAULT and the
+   record published the PROSPER-OWNED staging pointer — which the engine later
+   `FMemory::Free()`d ("FMallocBinned3 Attempt to free an unrecognized block"). The dst write now
+   commits lazy 64K pages exactly like the fault handler and retries.
+
+**Result: boot passes LoadPreInitModules, `FConfigCacheIni::InitializeConfigSystem` runs (the
+BinaryConfig probe prints), plugin/localization/ICU pak reads all serve, and the engine reads
+`DefaultEngine.ini` from the pak.** Note this build's PreInit really does run LoadPreInitModules
+BEFORE InitializeConfigSystem (verified in the binary at `eboot+0x7af3` vs `+0x7eda`).
+
+### NEW WALL (deterministic): FMallocBinned3 "Attempt to free an unrecognized block"
+
+Right after the engine reads the `DefaultEngine.ini` pak entry (off=0x2dcc378, 46135 bytes,
+served OK — the command buffer even carries the UTF-16 name), the main thread hits
+`LowLevelFatalError [Line: 1228] FMallocBinned3 Attempt to free an unrecognized block` inside the
+config-load call chain (`eboot+0x2451492 <- +0x245217a <- +0x245288d <- +0x24561a1 <- +0x24b1153
+<- +0x243e8ca <- +0x243ff73 <- +0x24679e8`), then UE's own crash handler prints a backtrace and
+aborts (`libc.prx+0x48e0`). 4/4 runs deterministic. The `[nullpage] addr=0x8 rip=eboot+0x22ebe7f`
+line right before it is BENIGN — that is UE's rbp-chain backtrace walker hitting the null
+terminator during crash reporting, not a fault. Suspects: the freed pointer is likely a pak-read
+buffer pointer the engine did not allocate (check the remaining record/descriptor contract of the
+0xdd/0xde pak callsites for compressed entries — `PakFileCompressionFormats=Oodle`,
+`bCompressed=True`: DefaultEngine.ini's entry is compressed, and the post-read decompress path
+is where the bogus free happens). The five still-unimplemented libSceAmpr NIDs
+(`vWU-odnS+fU sSAUCCU1dv4 tZDDEo2tE5k GnxKOHEawhk H896Pt-yB4I`) fire during mount and may be part
+of the compressed-read contract.
+
+### OLD ANALYSIS (superseded): post-mount engine/RHI init — a null virtual call (racy, two faces)
 
 Boot now reaches early UE engine init and dies in one of two timing-dependent spots (the RHI /
 task-graph worker threads are now live, so it is nondeterministic):

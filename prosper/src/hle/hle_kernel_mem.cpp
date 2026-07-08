@@ -577,7 +577,42 @@ HLE(k_ampr_begin) {
     return 0;
 }
 HLE(k_ampr_push_map) {
+    MLOG("ampr SetBuffer args a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx\n",
+         (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
+         (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)a5);
     if (a1 && a2) {
+        // Back the page from the shared phys pool so BOTH pool views alias the same bytes: the
+        // guest WRITES its MallocBinned pool-page headers through this (high) view and READS them
+        // through a second view exactly 0x540000000 lower (empirically pinned — the two views'
+        // canary reads returned zeros with independent anonymous pages). Map the mirror too.
+        // CONFIDENCE: LOW on the 0x540000000 rule (observed constant, one title) — refine by
+        // finding the guest's own second-view creation; the aliasing itself is the HW contract.
+        //
+        // TWO FLAVORS of SetBuffer, discriminated by live arg capture (issue #88 root cause):
+        //   MAP flavor      — (cb, va, len, a3!=va, a4=0xffffffff/-1 sentinel, a5=0/0x720):
+        //                     "map fresh direct memory at va" (the AMM pool flow; the guest
+        //                     expects FRESH ZEROED pages, like sceKernelMapDirectMemory).
+        //   BUFFER flavor   — (cb, va, len, a3==va, a4=allocCtx e.g. 0x2001c10060, a5=3/0x2d):
+        //                     "use this ALREADY-EXISTING buffer" (the APR read flow's 0x40-byte
+        //                     completion records and its 0x4000 descriptor buffer). Real HW does
+        //                     NOT touch the buffer's memory here.
+        // The old handler treated BOTH as map requests. For the BUFFER flavor the target
+        // (va=0x15a0dfc000 len=0x4000) — and worse, the va-0x540000000 "second view" mirror —
+        // landed on LIVE MallocBinned heap holding the console manager's registered-CVar name
+        // strings; MAP_FIXED silently replaced them with fresh zero pages (invisible to HW
+        // watchpoints: no CPU store ever happened). The zeroed key made FEngineModule::
+        // StartupModule's FindConsoleVariable("r.Shadow.CacheWPOPrimitives") return null ->
+        // null virtual call -> rip=0: the issue-#88 crash. Registering the buffer is a no-op for
+        // memory state, so the BUFFER flavor now leaves memory strictly untouched.
+        // CONFIDENCE: HIGH on the discriminator (a3==a1 in all 13 captured buffer-flavor calls,
+        // a3!=a1 + a4 sentinel in all 3 captured map-flavor calls) and on the clobber diagnosis
+        // (single-run reg-time vs crash-time key dump + silent HW write-watch).
+        if (a3 == a1) {
+            MLOG("ampr set-buffer va=0x%llx len=0x%llx ctx=0x%llx flags=0x%llx -> no-op (existing buffer)\n",
+                 (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a4,
+                 (unsigned long long)a5);
+            return 0;
+        }
         // Back the page from the shared phys pool so BOTH pool views alias the same bytes: the
         // guest WRITES its MallocBinned pool-page headers through this (high) view and READS them
         // through a second view exactly 0x540000000 lower (empirically pinned — the two views'
