@@ -1232,6 +1232,23 @@ int main() {
       printf("  kernel68 mismatches=%u (buf[6]=%g expect=12)\n", bad68, f6); }
     CHECK(stored68_out.size() == N && bad68 == 0, "recompiled kernel 68 (raw store routes to binding 3 via SRSRC) correct");
 
+    // Kernel N: v_nop (VOP1 op 0x00) between real ALU ops must be a transparent no-op. This was the
+    // #121 blocker — PPSA02664's vertex shaders contain v_nop (a common scheduling/hazard filler), and
+    // the recompiler rejected it, failing the whole shader and skipping ~182 draws/frame (black screen).
+    //   v_add_f32 v0,v0,v1 | v_nop | v_mul_f32 v0,v0,v2 | s_endpgm  =>  out = (a0+a1)*a2
+    const uint32_t codeN[] = { 0x06000300u, 0x7E000000u, 0x10000500u, 0xBF810000u };
+    std::vector<uint32_t> spvN = recompile_valu(codeN, sizeof(codeN)/sizeof(codeN[0]), 3, 0);
+    CHECK(!spvN.empty(), "recompiled kernel with v_nop -> SPIR-V (v_nop no longer fails the shader)");
+    std::vector<float> inN(N * 3), expN(N);
+    for (uint32_t i = 0; i < N; i++) {
+        float a0 = (float)i * 0.2f - 8.0f, a1 = (float)i * 0.05f + 2.0f, a2 = 1.5f;
+        inN[i*3+0]=a0; inN[i*3+1]=a1; inN[i*3+2]=a2; expN[i] = (a0 + a1) * a2;
+    }
+    std::vector<float> gotN = prosper::test::run_compute(spvN, inN, N, N);
+    uint32_t badN = 0; for (uint32_t i=0;i<N&&gotN.size()==N;i++) if (std::fabs(gotN[i]-expN[i])>1e-3f) badN++;
+    printf("  kernelN(v_nop) mismatches=%u (out[33]=%g expect=%g)\n", badN, gotN.size()==N?gotN[33]:-1, expN[33]);
+    CHECK(gotN.size()==N && badN==0, "v_nop is transparent: out = (a0+a1)*a2 computed correctly");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

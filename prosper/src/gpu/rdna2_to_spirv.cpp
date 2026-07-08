@@ -1280,6 +1280,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
             uint32_t& d = vreg[in.dst.value];
             switch (in.opcode) {
+                case 0x00: return true;                              // v_nop — no-op (writes nothing; common
+                                                                     // scheduling/hazard filler in real shaders)
                 case 0x01: d = a; break;                              // v_mov_b32
                 case 0x05: d = b.cvt_i2f(a); break;                   // v_cvt_f32_i32
                 case 0x06: d = b.cvt_u2f(a); break;                   // v_cvt_f32_u32
