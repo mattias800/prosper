@@ -58,7 +58,14 @@ namespace {
     // trustworthy way to inspect deep crashes (e.g. the null std::ctype facet at eboot+0x3b5ea6).
     bool g_faultmem = false;
     bool g_faultlog = false;
-    int  g_devnull_fd = -1;
+    // Probe pipe for probe_readable() below — a pipe write imports the source pages (EFAULT on
+    // unmapped memory) where a /dev/null write does not. O_NONBLOCK so a full pipe can never
+    // block the fault handler; drained after every probe.
+    int  g_probe_pipe[2] = {-1, -1};
+    void ensure_probe_pipe() {
+        if (g_probe_pipe[0] < 0 && pipe2(g_probe_pipe, O_CLOEXEC | O_NONBLOCK) != 0)
+            g_probe_pipe[0] = g_probe_pipe[1] = -1;
+    }
     // DIAGNOSTIC (PROSPER_SKIP_NULL_COMPANION, default off): at the Unity GfxDevice pipeline reader
     // eboot+0xba6e08 — which derefs a null GPU-companion pointer [obj+0x140] for pipelines that were
     // never processed — log the object state and redirect RIP to the reader's own skip label
@@ -285,11 +292,18 @@ namespace {
     PeekSpec g_peek[6] = {};
     int      g_peek_specs = 0;
 
-    // Async-signal-safe readability probe: write() to /dev/null returns EFAULT (not a fault) for
-    // an unmapped source, so we can test guest addresses without risking a nested SIGSEGV.
+    // Async-signal-safe readability probe. NOTE: /dev/null does NOT work for this — the kernel's
+    // null_write returns count without ever touching the source buffer, so it reports EVERY
+    // address "readable" (verified empirically on this project's WSL kernel: writing an unmapped
+    // pointer to /dev/null returned success; the same write to a pipe returned EFAULT). A pipe
+    // write actually imports the user pages. Raw syscalls: this runs inside the fault handler
+    // where glibc write()/read() are guest-%fs-unsafe; we drain what we wrote immediately so the
+    // pipe can never fill (probes are single small reads, well under PIPE_BUF).
     bool probe_readable(uint64_t a) {
-        if (a < 0x1000 || g_devnull_fd < 0) return false;
-        return write(g_devnull_fd, (const void*)a, 8) == 8;
+        if (a < 0x1000 || g_probe_pipe[1] < 0) return false;
+        long w = syscall(SYS_write, g_probe_pipe[1], (const void*)a, 8);
+        if (w > 0) { char b[8]; syscall(SYS_read, g_probe_pipe[0], b, (size_t)w); }
+        return w == 8;
     }
     void dump_fault_mem() {
         if (!g_faultmem) return;
@@ -824,17 +838,27 @@ namespace {
             }
         }
         // Lazy unified-memory backing: back an unmapped GPU-VA page on demand and retry.
-        if (sig == SIGSEGV && si->si_addr) {
+        // Gates (both required — everything interesting lives inside the 4-64 GiB window,
+        // including guest module images and dmem mappings):
+        //  - si_code == SEGV_MAPERR: only back genuinely UNMAPPED pages. A protection fault
+        //    (SEGV_ACCERR, e.g. a guest write to a CPU_READ-only dmem mapping) must NOT be
+        //    "handled" by mmap'ing a detached zero page over the live mapping — that silently
+        //    destroys the original contents and breaks memfd CPU/GPU aliasing.
+        //  - fault addr != RIP: an instruction fetch through a garbage-but-in-window pointer
+        //    would get a non-executable RW page mapped at RIP, refault with SEGV_ACCERR at the
+        //    same address forever (infinite fault loop) instead of a clean fault report.
+        if (sig == SIGSEGV && si->si_addr && si->si_code == SEGV_MAPERR) {
             uint64_t a = (uint64_t)si->si_addr;
-            if (a >= GPU_VA_LO && a < GPU_VA_HI) {
+            uint64_t rip = (uint64_t)((ucontext_t*)uctx)->uc_mcontext.gregs[REG_RIP];
+            if (a >= GPU_VA_LO && a < GPU_VA_HI && a != rip) {
                 void* page = (void*)(a & ~(uint64_t)0xfff);
                 bool ok = mmap(page, 0x1000, PROT_READ | PROT_WRITE,
                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == page;
                 if (g_faultlog) {
-                    char b[128]; auto* uc = (ucontext_t*)uctx;
+                    char b[128];
                     int n = snprintf(b, sizeof b, "[fault] GPU-VA %s addr=0x%llx rip=0x%llx\n",
                                      ok ? "mapped" : "MMAP-FAILED", (unsigned long long)a,
-                                     (unsigned long long)uc->uc_mcontext.gregs[REG_RIP]);
+                                     (unsigned long long)rip);
                     syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
                 }
                 if (ok) { g_lazy_pages = g_lazy_pages + 1; return; }  // re-execute against the now-mapped page
@@ -1093,8 +1117,7 @@ void install_trap_handler() {
     g_watch_companion = getenv("PROSPER_WATCH_COMPANION") != nullptr;
     if (const char* r = getenv("PROSPER_SKIP_RIP"))    g_skip_rip    = strtoull(r, nullptr, 0);
     if (const char* t = getenv("PROSPER_SKIP_TARGET")) g_skip_target = strtoull(t, nullptr, 0);
-    if ((g_faultmem || g_skip_null_companion) && g_devnull_fd < 0)
-        g_devnull_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    if (g_faultmem || g_skip_null_companion) ensure_probe_pipe();
     // PROSPER_PEEK="r15:0x140,0x1a0;rbx:0x78,0x88;r15:*0x18+0x0" — N specs (';'), each reg:off[,off];
     // a '*pre+off' offset chases one pointer level ([[reg+pre]+off]). Parsed once (getenv unsafe at fault).
     if (const char* pk = getenv("PROSPER_PEEK")) {
@@ -1124,7 +1147,7 @@ void install_trap_handler() {
     if (const char* bp = getenv("PROSPER_BP")) {
         g_bp_addr = 0x400000000ull + strtoull(bp, nullptr, 0);
         if (const char* m = getenv("PROSPER_BP_MAX")) g_bp_max = (int)strtoul(m, nullptr, 0);
-        if (g_devnull_fd < 0) g_devnull_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+        ensure_probe_pipe();
         g_bp_on = true;   // the actual 0xCC is written after the image is mapped (arm_bp below)
     }
     // PROSPER_HWBP=0xOFFSET installs a race-free hardware execute breakpoint at guest VA 0x400000000+off.
@@ -1142,7 +1165,7 @@ void install_trap_handler() {
         if (getenv("PROSPER_HWBP_STRDUMP")) g_hwbp_strdump = true;
         if (getenv("PROSPER_HWBP_KLASS")) g_hwbp_klass = true;
         if (getenv("PROSPER_HWBP_ALLTHREADS")) g_hwbp_allthreads = true;
-        if (g_devnull_fd < 0) g_devnull_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+        ensure_probe_pipe();
         g_hwbp_on = true;   // perf_event_open done in arm_hwbp() after the image is mapped
         // PROSPER_HWWATCH=<signed delta>: on the first exec-bp hit, arm a data write-watch on [rax+delta]
         // (default -0x80). Reveals what writes the thread-local device slot the ctor reads.
