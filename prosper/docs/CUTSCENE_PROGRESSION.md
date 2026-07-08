@@ -394,3 +394,43 @@ the async queue), or the activation blocker is partly independent. The scene loa
 
 Tooling this pass: fixed `PROSPER_HWBP_ALLTHREADS` (arm on host `%fs` before `guest_tls_activate_thread`)
 + `PROSPER_HWBP_ARMLOG`.
+
+## 2026-07-08 (cont.) — SOLVED: PSN.prx module_start fault; the PSN worker pool now RUNS and drains the async queue
+
+The last blocker to starting the pool — PSN.prx's `module_start` faulting during init (`SIGSEGV addr=0x4,
+rip=PSN+0x3f47`, recovered) — is **fixed**. Full root cause (decoded from the real load map, not the
+displayed base):
+
+- The loader maps PSN.prx **by raw file offset**: `module_start` entry sits at raw `0xc60` → guest
+  `0x4e0000010`; the faulting instruction is at raw `0x4b97`. (The displayed `PSN+0x3f47` is not
+  `vaddr 0x3f47` in the ELF — the exec bytes are laid out by the SELF segment table, so
+  `guest = raw + 0x4dffff3b0`.)
+- The CRT `module_start` (raw `0xc60`) runs the init_arrays, then — because `[0x49020]` is a **relocated,
+  always-nonzero** pointer — tail-jumps to the module's **user** `module_start` (raw `0x4b30`) passing
+  `(argc=rdi, argp=rsi)`. That user start validates a **module-param descriptor**:
+  `test (argc & 0xfffffff0)`; require `[argp+0]==0x10 && [argp+4]==0x200`; on success store `[argp+8]`
+  into global `[0x50e78]` and return 0.
+- We were starting it as `module_start(0, NULL)`. `argc=0` fails the `test` and branches to the error/log
+  path, which then does `mov 0x4(%rbx),%esi` with `rbx=argp=NULL` → the null read at `0x4`. It never
+  reached the success store, so PSN.prx never registered → managed side: *"PSN is an old version…"*.
+
+**Fix** (commit `fix(cutscene): PSN.prx module_start no longer faults …`): `run_guest_inits` now starts
+module_start fns in registered ranges as `module_start(argc=0x10, argp=&{u32 0x10, u32 0x200, u64 0})`.
+`cb=NULL` is honored — `PSN_PrxInitialize` (`0x4e0003810`) sees `[0x50e78]==0`, **skips** the optional
+callback-registration steps, and still writes its out-param version (`[out]=1`, `[out+4]=0x9000047`) and
+runs all PSN subsystem inits. boot_trace registers the PSN.prx + SaveData.prx guest ranges via
+`set_module_start_param_ranges` (gated by `PROSPER_NO_PSN`, so the 4-module fallback boot is unchanged).
+
+**Proven effect** (`PROSPER_GUEST_FS=1 -force-gfx-direct`): no init fault, no *"old version"*, **no crash**
+across 160 s / 7381 submits. `PSN_PrxInitialize` resolves + runs; a managed PSN worker thread spawns
+(`[thread] create entry=Il2cpp+0x170570 name=…`) and RunProc drains the async queue: the loader goes from
+the old **3-read stall** to **5386+ reads** streaming `resources.assets` / `.resS` + `level3` / `level5` /
+`sharedassets3..5` (blocks to 3149, files opened *and closed*). The null-`Stopwatch` NRE is gone
+(WorkerThread.Start now runs → `timer` created).
+
+**Remaining (separate layer, owned elsewhere):** the scene still does not submit its render geometry —
+`draws/submit` stays ≤ 3 for the whole run (dist over 7381 submits: 1→6081, 2→421, 3→878; never > 3). We do
+**not** stall at block 966 (we blow past to 3149 loading level3/level5). So the cutscene not drawing is the
+**color-render-state capture** bug (`cb_target_mask=0` draws skipped; needs `PROSPER_FORCE_COLORWRITE`,
+on master) and/or the **type-tree-less `InventoryItemDefinition` MonoBehaviour deser** completion — not the
+PSN pool, which is now running.
