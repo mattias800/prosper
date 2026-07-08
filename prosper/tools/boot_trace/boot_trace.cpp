@@ -346,6 +346,14 @@ int main(int argc, char** argv) {
                                     // above rather than an all-zero buffer (which would BLANK the texture).
                                     // Only the bottom tile-row degrades.
                                     std::memcpy(tiled.data(), texstore.back().data(), std::min(nb, tiled_bytes));
+                                // PROSPER_DUMP_RAWTILE: write the EXACT padded tiled bytes to a .bin (no lossy BMP
+                                // round-trip) so the de-swizzle can be reversed offline against a known image (#101).
+                                if (getenv("PROSPER_DUMP_RAWTILE") && frame_no < 200) {
+                                    std::string dd = getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".";
+                                    char bn[512]; snprintf(bn, sizeof bn, "%s/tiled_f%04d_b%u_%ux%u.bin",
+                                                           dd.c_str(), (int)frame_no, r.binding, tw, th);
+                                    if (FILE* bf = fopen(bn, "wb")) { fwrite(tiled.data(), 1, tiled.size(), bf); fclose(bf); }
+                                }
                                 prosper::gpu::detile_surface(texstore.back().data(), tiled.data(), tw, th, tmode, pitch);
                             }
                             // PROSPER_DUMP_TEX: write the RAW texture memory (interpreted linearly) to a BMP,
