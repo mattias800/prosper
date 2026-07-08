@@ -673,3 +673,40 @@ loop is reliably reproduced.
 race — the primary blocker), and (B) capturing the color render-target state so the composited draws are
 visible (proven by FORCE_COLORWRITE rendering the title). Neither is a mystery anymore; both are scoped
 to one subsystem each (il2cpp deser; GPU context-register capture).
+
+## 2026-07-08 (cont.) — CUTSCENE SCENE REACHED; final blocker is scene-content render-target resolution
+
+With #52 (deeptrace bound) + #53 (CB_TARGET_MASK default) + #54 (PSN.prx → async worker pool) merged,
+the async-load wall is **solved** and the game now boots **all the way through the intro scene sequence**:
+
+- **Scene sequence reached:** `level0 → level1 (the cutscene) → level3 → level4 → level5`, cleanly, no
+  crash (previously deadlocked at the block-966 deser). The load/threading wall is gone.
+- **What renders correctly:** the "THE MESSENGER" title screen (full art, via #53's color-target default),
+  and the game's signature **diagonal scene-transition wipe** into the cutscene (a white diagonal on blue).
+- **What does NOT render:** the cutscene's actual pixel-art content — the island overview + the
+  "AT THE WESTERN EDGE OF A FALLEN WORLD LIES A CLIFFSIDE VILLAGE…" text. Every scene (including level1)
+  presents as a **blue clear**: the scene's fullscreen clear + transition wipe render, but the sprite/text
+  content draws do not appear.
+
+**The final blocker for a visible cutscene:** scene-content draws render to an unresolved surface — the
+per-draw color target (`CB_COLOR0_BASE`/render-to-texture) is not resolved to a presented image for the
+content pass, so only the clear + fullscreen composite show. This is the same *class* as #53 (a color
+render-state the game programs that we don't fully capture), one level up: a render-to-texture / present
+composition step. Secondary: the game advances through level0–5 very fast (scenes not held), suggesting
+frame-timing (deltaTime) is also compressed — so even the blue clears flash past.
+
+**Net:** the cutscene is REACHED (level1 active, its background + transition render); the remaining work
+to a recognizable cutscene screenshot is GPU render-to-texture/present resolution for scene-content draws
+(and likely a frame-timing fix so scenes hold). Both are now the precise, scoped next targets.
+
+### CORRECTION (root cause) — it's shader recompilation, not render-target
+
+The "render-target resolution" hypothesis above is **superseded**. The actual reason the cutscene's
+scene-content draws output nothing is **gaps in RDNA2→SPIR-V shader recompilation** for the real scene
+shaders — the content draws execute against shaders that don't fully recompile, so they produce no
+pixels (leaving the scene's blue clear). This is being fixed directly in the recompiler: #55
+(`s_cbranch_scc0` forward early-out to `s_endpgm`) unblocks real scene shaders, with further
+recompiler-coverage work in progress. The render-target state is correct (title + transition wipe render
+fine via #53); the missing piece is shader coverage for the scene-content passes. Milestone above stands:
+the load/threading wall is solved and the game boots through level0→1(cutscene)→3→4→5; a recognizable
+cutscene frame follows once scene-shader recompilation coverage is complete.
