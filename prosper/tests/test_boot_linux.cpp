@@ -8,6 +8,7 @@
 #include "../src/host/exec_image.hpp"
 #include "../src/hle/dispatch.hpp"
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <sys/mman.h>
 #include <sys/wait.h>
@@ -58,7 +59,20 @@ int main(int argc, char** argv) {
            (unsigned long long)prog.entry, prog.init_fns.size());
     pid_t pid = fork();
     if (pid == 0) { run_guest_inits(prog.init_fns); run_entry(prog.imgs[0]); _exit(0); }
-    for (int i = 0; i < 200; i++) { int st; if (waitpid(pid, &st, WNOHANG) == pid) break; struct timespec ts{0, 50 * 1000 * 1000}; nanosleep(&ts, nullptr); }
+    // Wait for the depth milestones, not a fixed wall-clock window. The guest reads the ~GB game
+    // dump over WSL's /mnt/c 9p mount, which on a COLD page cache is far slower than warm — the old
+    // fixed 200×50 ms = 10 s budget made this test flaky (issue #89): a cold first-of-session run
+    // could stall before graphics while a warm run reached gfx in ~1 s. Poll to a generous ceiling
+    // but BREAK as soon as the milestones (GC stop-the-world + a graphics-lib call) are met, so a
+    // warm run still finishes fast. PROSPER_BOOTTEST_TIMEOUT_MS overrides the ceiling for slow CI.
+    long ceil_ms = 60000;
+    if (const char* e = getenv("PROSPER_BOOTTEST_TIMEOUT_MS")) { long v = atol(e); if (v > 0) ceil_ms = v; }
+    const long tick_ms = 50;
+    for (long waited = 0; waited < ceil_ms; waited += tick_ms) {
+        int st; if (waitpid(pid, &st, WNOHANG) == pid) break;           // child exited on its own
+        if (*ex >= 1 && *gfx >= 1) break;                               // milestones reached — done early
+        struct timespec ts{ 0, tick_ms * 1000 * 1000 }; nanosleep(&ts, nullptr);
+    }
     int st; if (waitpid(pid, &st, WNOHANG) == 0) { kill(pid, SIGKILL); waitpid(pid, &st, 0); }
 
     int reached = *p;
@@ -66,27 +80,22 @@ int main(int argc, char** argv) {
     int gfxcalls = *gfx;
     printf("  guest reached %d distinct unimplemented system calls; %d GC stop-the-world exception(s); %d graphics-lib call(s)\n",
            reached, raises, gfxcalls);
-    // (1) unimpl count *drops* as we implement more functions (boot then advances to new, deeper
-    // calls) — so this is a floor, not a target. It reached 1 once sceKernelDlsym became a real
-    // by-name resolver (PSN.prx plugin path) — fewer *distinct* unimplemented calls, yet the boot
-    // now runs DEEPER (graphics + GC below, and the full boot reaches in-game levels). >=1 still
-    // proves the pipeline reached running game code; the graphics + GC milestones below are the
-    // real depth proof and are forward-compatible.
-    const int THRESHOLD = 1;
-    // (2) >=1 exception raise proves the boot got *through* the IL2CPP GC thread-suspension
-    // handshake (the deadlock we fixed) and ran the exception-based stop-the-world + stack scan.
-    // (3) >=1 graphics-lib call proves the boot ran the whole runtime into GPU/display init — the
-    // deepest reproducible milestone. Forward-compatible: stays true as deeper blockers are fixed.
-    bool pipeline = reached >= THRESHOLD;
+    // Pass gates on the two DEPTH milestones, which are forward-compatible (they stay true as deeper
+    // blockers are fixed):
+    // (1) >=1 GC stop-the-world exception proves the boot got *through* the IL2CPP GC thread-
+    //     suspension handshake (the deadlock we fixed) and ran the exception-based stop-the-world.
+    // (2) >=1 graphics-lib call proves the boot ran the whole runtime into GPU/display init.
+    // The distinct-unimplemented-syscall count is now INFORMATIONAL only, not a gate: it legitimately
+    // DROPS toward 0 as functions get implemented (the boot then advances to deeper, already-handled
+    // calls), so the old `>=1` floor produced false failures independent of real boot depth.
     bool gc_stw   = raises  >= 1;
     bool graphics = gfxcalls >= 1;
-    if (pipeline && gc_stw && graphics) {
-        printf("\n== PASS: booted through IL2CPP + GC stop-the-world into graphics init (%d>=%d unimpl, %d>=1 raise, %d>=1 gfx) ==\n",
-               reached, THRESHOLD, raises, gfxcalls);
+    if (gc_stw && graphics) {
+        printf("\n== PASS: booted through IL2CPP + GC stop-the-world into graphics init (%d unimpl [informational], %d>=1 raise, %d>=1 gfx) ==\n",
+               reached, raises, gfxcalls);
         return 0;
     }
-    if (!pipeline) printf("\n== FAIL: stalled early (%d < %d unimpl) ==\n", reached, THRESHOLD);
     if (!gc_stw)   printf("\n== FAIL: GC stop-the-world never ran (%d raises) — deadlock/GC regression? ==\n", raises);
-    if (!graphics) printf("\n== FAIL: never reached graphics init (%d gfx calls) — boot regressed before GPU/display ==\n", gfxcalls);
+    if (!graphics) printf("\n== FAIL: never reached graphics init (%d gfx calls) in %ld ms — boot regressed before GPU/display (or raise PROSPER_BOOTTEST_TIMEOUT_MS) ==\n", gfxcalls, ceil_ms);
     return 2;
 }
