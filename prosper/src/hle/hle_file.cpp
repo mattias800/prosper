@@ -11,6 +11,8 @@
 #include <cstring>
 #include <cerrno>
 #include <string>
+#include <mutex>
+#include <vector>
 #include <fcntl.h>
 #include <sys/stat.h>
 #ifndef _WIN32
@@ -338,6 +340,53 @@ HLE(f_unlink){ std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::
 #endif
     (h.c_str()); }
 
+// --- APR (Async Page Read) file resolution -----------------------------------------------------
+// sceKernelAprResolveFilepathsToIdsAndFileSizes(const char** paths, int count, uint32_t* outIds,
+//   uint64_t* outSizes, uint32_t* outFlags, int reserved) — the entry point of UE4's IoStore/APR
+// pipeline. Live capture (PPSA17942): called once per pak container with a /app0-translated path
+// (global.utoc/.ucas, pakchunkN-ps5.pak/.utoc/.ucas). Stubbing it to EINVAL made APR proceed on
+// garbage ids/sizes and wild-write over the allocator (the "MallocBinned unrecognized block" /
+// canary corruption). Resolve each path for real: stat the host file, assign a stable id, record
+// id->host-path so the read path can pread by id. CONFIDENCE: MED (arg roles from live capture;
+// outFlags semantics unknown -> 0).
+namespace {
+    std::mutex g_apr_mx;
+    std::vector<std::string> g_apr_paths;   // id (1-based index) -> host path
+}
+// Exposed to the read path (Ampr page-read) to map an APR id back to its host file.
+std::string prosper_apr_path_for_id(uint32_t id) {
+    std::lock_guard<std::mutex> lk(g_apr_mx);
+    return (id >= 1 && id <= g_apr_paths.size()) ? g_apr_paths[id - 1] : std::string();
+}
+HLE(f_apr_resolve) {
+    const char** paths = (const char**)P(a0);
+    int count = (int)(int64_t)a1;
+    uint32_t* out_ids   = (uint32_t*)P(a2);
+    uint64_t* out_sizes = (uint64_t*)P(a3);
+    uint32_t* out_flags = (uint32_t*)P(a4);
+    if (!paths || count <= 0) return 0x80020016ull;   // EINVAL
+    for (int i = 0; i < count; i++) {
+        const char* gp = paths[i];
+        std::string host = gp ? translate(gp) : std::string();
+        uint64_t size = 0; uint32_t id = 0;
+#ifndef _WIN32
+        struct stat st;
+        if (!host.empty() && ::stat(host.c_str(), &st) == 0) size = (uint64_t)st.st_size;
+#else
+        struct _stat64 st;
+        if (!host.empty() && ::_stat64(host.c_str(), &st) == 0) size = (uint64_t)st.st_size;
+#endif
+        else { if (out_ids) out_ids[i] = 0; if (out_sizes) out_sizes[i] = 0; if (out_flags) out_flags[i] = 0;
+               if (filelog()) fprintf(stderr, "[apr] resolve MISS %s\n", gp ? gp : "(null)"); continue; }
+        { std::lock_guard<std::mutex> lk(g_apr_mx); g_apr_paths.push_back(host); id = (uint32_t)g_apr_paths.size(); }
+        if (out_ids)   out_ids[i]   = id;
+        if (out_sizes) out_sizes[i] = size;
+        if (out_flags) out_flags[i] = 0;
+        if (filelog()) fprintf(stderr, "[apr] resolve %s -> id=%u size=%llu\n", gp, id, (unsigned long long)size);
+    }
+    return 0;
+}
+
 void register_file_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
     R("fopen", f_fopen);   R("fclose", f_fclose); R("fread", f_fread);   R("fwrite", f_fwrite);
@@ -362,6 +411,7 @@ void register_file_hle() {
     R("rmdir", f_rmdir);          R("sceKernelRmdir", f_rmdir);
     R("unlink", f_unlink);        R("sceKernelUnlink", f_unlink);
     R("sceKernelGetdents", f_getdents); R("getdents", f_getdents);
+    R("sceKernelAprResolveFilepathsToIdsAndFileSizes", f_apr_resolve);   // real APR resolve (was EINVAL)
     #undef R
 }
 
