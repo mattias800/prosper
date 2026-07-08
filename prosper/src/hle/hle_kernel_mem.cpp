@@ -76,6 +76,29 @@ namespace {
         return true;
     }
 
+    // Largest FREE aligned block within [lo, hi) of the direct-memory pool (for
+    // sceKernelAvailableDirectMemorySize). Walks the same sorted free gaps dmem_take allocates from,
+    // clipping each gap to the requested [lo, hi) window and aligning its start. Returns the biggest
+    // such block's aligned offset + size; size 0 means nothing fits (caller -> ENOMEM).
+    void dmem_largest_free(uint64_t lo, uint64_t hi, uint64_t align, uint64_t& off_out, uint64_t& size_out) {
+        if (!align) align = 0x4000;
+        if (lo < kDmemBase) lo = kDmemBase;
+        if (hi > kDmemBase + kDmemTotal) hi = kDmemBase + kDmemTotal;
+        off_out = 0; size_out = 0;
+        std::lock_guard<std::mutex> lk(g_dmx);
+        uint64_t cursor = kDmemBase;
+        for (size_t i = 0; i <= g_dmem.size(); i++) {
+            uint64_t gap_beg = cursor;
+            uint64_t gap_end = (i < g_dmem.size()) ? g_dmem[i].start : kDmemBase + kDmemTotal;
+            // Clip the free gap to the caller's search window, then align its start.
+            uint64_t beg = gap_beg < lo ? lo : gap_beg;
+            uint64_t end = gap_end > hi ? hi : gap_end;
+            uint64_t aligned = (beg + align - 1) & ~(align - 1);
+            if (end > aligned && end - aligned > size_out) { off_out = aligned; size_out = end - aligned; }
+            if (i < g_dmem.size()) cursor = g_dmem[i].end;
+        }
+    }
+
     // Release [start, start+len): remove or trim every overlapping allocation (kernel semantics —
     // the range is freed regardless of how it was carved into allocations).
     void dmem_release(uint64_t start, uint64_t len) {
@@ -446,6 +469,24 @@ HLE(k_wake_by_address) {
 HLE(k_munmap)   { if (a0) { munmap((void*)a0, a1); untrack(a0, a1); } return 0; }
 HLE(k_mprotect) { if (a0) { mprotect((void*)a0, a1, host_prot(a2)); retrack_prot(a0, a1, host_prot(a2), "mprotect"); } return 0; }
 HLE(k_dmem_size){ return kDmemTotal; }   // 8 GiB pool (allocation failures enforce this bound)
+// sceKernelAvailableDirectMemorySize(searchStart, searchEnd, alignment, off_t* physAddrOut,
+// size_t* sizeOut) — report the LARGEST free aligned direct-memory block in [searchStart, searchEnd).
+// Signature per shadPS4 memory.cpp:120 (NID C0f7TJcbfac, PS4-inherited). Was aliased to
+// k_dmem_size, which returned the pool TOTAL and never wrote the out-params — a caller sizing an
+// allocation from *sizeOut or seeding a search from *physAddrOut read uninitialized stack after a
+// "success". Now walks the real free gaps.
+HLE(k_avail_dmem) {   // a0=searchStart a1=searchEnd a2=alignment a3=physAddrOut a4=sizeOut
+    if (!a3 || !a4) return 0x80020016ull;                 // EINVAL: out-params required
+    uint64_t off = 0, size = 0;
+    dmem_largest_free(a0, a1 ? a1 : (kDmemBase + kDmemTotal), a2, off, size);
+    if (!size) return 0x8002000Cull;                      // ENOMEM: nothing available in the window
+    *(uint64_t*)(uintptr_t)a3 = off;
+    *(uint64_t*)(uintptr_t)a4 = size;
+    MLOG("avail-dmem [0x%llx,0x%llx) align=0x%llx -> phys=0x%llx size=0x%llx\n",
+         (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
+         (unsigned long long)off, (unsigned long long)size);
+    return 0;
+}
 
 // --- libSceAmpr (PS5 async memory-programming engine) -------------------------------------------
 // The UE4 title (PPSA17942) commits one class of its allocator pool pages through an Ampr command
@@ -655,7 +696,7 @@ void register_kernel_mem_hle() {
     R("sceKernelVirtualQuery", k_virtual_query);
     R("sceKernelDirectMemoryQuery", k_direct_memory_query);
     R("sceKernelGetDirectMemorySize", k_dmem_size);
-    R("sceKernelAvailableDirectMemorySize", k_dmem_size);
+    R("sceKernelAvailableDirectMemorySize", k_avail_dmem);
     #undef R
     // sync_on_address futex — registered by raw NID (names not in any public DB yet).
     Hle::register_fn("Hc4CaR6JBL0", (HleFn)k_wait_on_address, "sceKernelWaitOnAddress?");
