@@ -54,20 +54,31 @@ namespace {
     std::mutex g_dmx;
     std::vector<DMem> g_dmem;
 
-    // Claim `sz` bytes of direct memory at `align` (first-fit over the pool's free gaps). False (no
-    // state change) when nothing fits — callers translate that to SCE_KERNEL_ERROR_ENOMEM
-    // (0x8002000C, Kyty Errno.h). First-fit (not bump) because guests genuinely RELEASE ranges:
-    // UE4 (PPSA17942) probes the pool full with halving allocations, releases the probes, then
-    // allocates its real pools — a bump cursor would be permanently exhausted.
-    bool dmem_take(uint64_t sz, uint64_t align, int type, uint64_t& off_out) {
+    // Claim `sz` bytes of direct memory at `align`, first-fit over the pool's free gaps WITHIN the
+    // caller's [lo, hi) search window (default = the whole pool). False (no state change) when
+    // nothing fits — callers translate that to SCE_KERNEL_ERROR_ENOMEM (0x8002000C, Kyty Errno.h).
+    // sceKernelAllocateDirectMemory passes searchStart/searchEnd here: a guest that partitions
+    // physical memory by window (GPU pool above a CPU pool, etc.) must get an offset inside its
+    // window, not wherever the base-first walk lands. First-fit (not bump) because guests genuinely
+    // RELEASE ranges: UE4 (PPSA17942) probes the pool full with halving allocations, releases the
+    // probes, then allocates its real pools — a bump cursor would be permanently exhausted.
+    bool dmem_take(uint64_t sz, uint64_t align, int type, uint64_t& off_out,
+                   uint64_t lo = 0, uint64_t hi = ~0ull) {
         if (!align) align = 0x4000;
+        if (lo < kDmemBase) lo = kDmemBase;
+        if (hi > kDmemBase + kDmemTotal) hi = kDmemBase + kDmemTotal;
+        if (lo >= hi) return false;
         std::lock_guard<std::mutex> lk(g_dmx);
         uint64_t cursor = kDmemBase;
         size_t insert_at = 0;
         for (size_t i = 0; i <= g_dmem.size(); i++) {
+            uint64_t gap_beg = cursor;
             uint64_t gap_end = (i < g_dmem.size()) ? g_dmem[i].start : kDmemBase + kDmemTotal;
-            uint64_t off = (cursor + align - 1) & ~(align - 1);
-            if (off + sz <= gap_end) { insert_at = i; off_out = off; goto found; }
+            // Clip the free gap to the search window, then align the start.
+            uint64_t beg = gap_beg < lo ? lo : gap_beg;
+            uint64_t end = gap_end > hi ? hi : gap_end;
+            uint64_t off = (beg + align - 1) & ~(align - 1);
+            if (off + sz <= end) { insert_at = i; off_out = off; goto found; }
             if (i < g_dmem.size()) cursor = g_dmem[i].end;
         }
         return false;
@@ -276,12 +287,15 @@ HLE(k_map_flexible) {
 }
 
 // sceKernelAllocateDirectMemory(off_t start, off_t end, size_t len, size_t align, int memType, off_t* physOut)
-HLE(k_alloc_dmem) {
+HLE(k_alloc_dmem) {   // (searchStart, searchEnd, len, alignment, memoryType, physAddrOut)
     uint64_t align = a3 ? a3 : 0x4000;
     uint64_t sz = align_up(a2, align);
     uint64_t off;
-    if (!dmem_take(sz, align, (int)a4, off)) {
-        MLOG("alloc_dmem len=0x%llx -> ENOMEM (pool exhausted)\n", (unsigned long long)a2);
+    // Honor the [searchStart, searchEnd) window (a0/a1) — dropping it handed the guest an offset
+    // outside the window it asked for.
+    if (!dmem_take(sz, align, (int)a4, off, a0, a1 ? a1 : ~0ull)) {
+        MLOG("alloc_dmem len=0x%llx in [0x%llx,0x%llx) -> ENOMEM\n",
+             (unsigned long long)a2, (unsigned long long)a0, (unsigned long long)a1);
         return 0x8002000Cull;   // SCE_KERNEL_ERROR_ENOMEM
     }
     dmem_zero(off, sz);                       // fresh allocation -> zeroed pages (console semantics)
