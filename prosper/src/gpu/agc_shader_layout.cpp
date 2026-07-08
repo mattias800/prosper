@@ -182,7 +182,12 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             r.gpu_addr       = d.base;
             r.size           = d.size_bytes;
             r.stride         = d.stride;
-            r.sgpr_base      = reg;               // DIRECT provenance key (SRSRC SGPR index)
+            // DIRECT provenance key in SHADER-SGPR space: user_sgpr_base + block index, exactly
+            // like the cbuf/texture classes above. `reg` alone is the user-data BLOCK index; the
+            // recompiler looks resources up by shader SGPR (by_sgpr_base_cls on the fetch's SRSRC),
+            // and vertex buffers only matter in the VS where user_sgpr_base is 8 — the un-based key
+            // could never match (or collided with an unrelated SGPR).
+            r.sgpr_base      = user_sgpr_base + reg;
             r.srt_offset     = 0xFFFFFFFFu;       // not s_loaded
             table.resources.push_back(r);
         }
