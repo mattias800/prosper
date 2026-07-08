@@ -430,10 +430,19 @@ HLE(f_apr_read_submit) {
     // whether the engine actually reads the TOC from `dest` (req+0x20). If the boot advances the SAME
     // as writing to dest, the engine reads the TOC elsewhere and dest is the wrong buffer.
     static bool nowrite = getenv("PROSPER_APR_NOWRITE") != nullptr;
+    // PROSPER_APR_WRITELEN=<n>: write only the first n bytes to the guest dest (read the rest into a
+    // host scratch to keep got==size). Tests whether dest is a small header buffer that a full-file
+    // write overflows into the adjacent allocator pool.
+    static uint64_t wlen = getenv("PROSPER_APR_WRITELEN") ? strtoull(getenv("PROSPER_APR_WRITELEN"), nullptr, 0) : 0;
     ssize_t got;
     if (nowrite) {
         static uint8_t scratch[1 << 20];
         got = ::pread(fd, scratch, (size_t)(size < sizeof scratch ? size : sizeof scratch), 0);
+    } else if (wlen && wlen < size) {
+        static uint8_t scratch[1 << 20];
+        ssize_t g1 = ::pread(fd, (void*)(uintptr_t)dest, (size_t)wlen, 0);
+        ssize_t g2 = ::pread(fd, scratch, (size_t)(size - wlen < sizeof scratch ? size - wlen : sizeof scratch), (off_t)wlen);
+        got = (g1 == (ssize_t)wlen && g2 >= 0) ? (ssize_t)(g1 + g2) : -1;
     } else {
         got = ::pread(fd, (void*)(uintptr_t)dest, (size_t)size, 0);
     }
