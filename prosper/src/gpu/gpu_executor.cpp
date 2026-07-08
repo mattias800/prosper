@@ -39,17 +39,38 @@ void read_user_sgprs(const std::unordered_map<uint32_t, uint32_t>& sh, uint32_t 
 } // namespace (guest_readable below has external linkage — declared in gpu_execute.hpp, shared with
   // the HLE diagnostic probes that chase raw guest pointers)
 
-// Async-signal-safe-ish readability probe (guest memory is 1:1-mapped, but a mis-decoded address could
-// be unmapped): write() to /dev/null returns EFAULT for an unmapped source, so we can test a guest
-// address without risking a nested SIGSEGV on the render/submit thread. Always-true on Windows (the
-// const-eval only runs on the live-render path, which is Linux; tests never pass wild addresses).
+// Readability probe (guest memory is 1:1-mapped, but a mis-decoded address could be unmapped),
+// so guarded derefs on the render/submit thread don't risk a SIGSEGV. NOTE: /dev/null does NOT
+// work for this — the kernel's null_write returns count without ever touching the source buffer,
+// so the old probe reported EVERY address >= 0x1000 "readable" and all guards built on it were
+// no-ops (verified empirically on this project's WSL kernel). A pipe write actually imports the
+// user pages and returns EFAULT for unmapped memory. Readability is page-granular: probe one byte
+// in each page the range touches, draining after every write so the pipe can never fill. Always-
+// true on Windows (the const-eval only runs on the live-render path, which is Linux; tests never
+// pass wild addresses).
 #ifndef _WIN32
-static int g_devnull = -1;
+static int g_probe_pipe[2] = {-1, -1};
+// One-time pipe creation via a C++11 magic static (thread-safe). guest_readable is shared with
+// the multi-threaded HLE pointer probes: an unguarded `if (fd < 0) pipe2(...)` lazy init let two
+// first-callers each pipe2 into the array — a torn pair (write-end of pipe B, read-end of pipe A)
+// never drains, fills, and EAGAINs: VALID memory reported unreadable, silently. (PR #61 review.)
+static bool probe_pipe_ok() {
+    static const bool ok = pipe2(g_probe_pipe, O_CLOEXEC | O_NONBLOCK) == 0;
+    return ok;
+}
+static bool probe_byte(uint64_t a) {
+    ssize_t w = write(g_probe_pipe[1], (const void*)(uintptr_t)a, 1);
+    if (w == 1) { char c; (void)!read(g_probe_pipe[0], &c, 1); return true; }
+    return false;   // EFAULT: unmapped (EAGAIN can't happen — we drain after every byte)
+}
 bool guest_readable(uint64_t a, uint32_t n) {
-    if (a < 0x1000) return false;
-    if (g_devnull < 0) g_devnull = open("/dev/null", O_WRONLY | O_CLOEXEC);
-    if (g_devnull < 0) return false;
-    return write(g_devnull, (const void*)(uintptr_t)a, n) == (ssize_t)n;
+    if (a < 0x1000 || n == 0) return false;
+    if (a + n < a) return false;   // wrap
+    if (!probe_pipe_ok()) return false;
+    uint64_t last_page = (a + n - 1) & ~0xfffull;
+    for (uint64_t p = a & ~0xfffull; p <= last_page; p += 0x1000)
+        if (!probe_byte(p < a ? a : p)) return false;
+    return true;
 }
 #else
 bool guest_readable(uint64_t, uint32_t) { return true; }

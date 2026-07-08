@@ -112,13 +112,16 @@ int main() {
     // --- 5. get port state fills the struct --------------------------------------------------
     uint8_t state[0x20]; memset(state, 0xEE, sizeof state);
     CHECK(call("sceAudioOutGetPortState", (uint64_t)h, PTR(state)) == 0);
+    // Layout per Kyty Audio.cpp:340: u16 output @0; u8 channel @2; i16 volume @4; u16 reroute @6; u64 flag @8.
     CHECK(*(uint16_t*)(state + 0) == 1);                  // output enabled
-    CHECK(*(uint16_t*)(state + 2) == 2);                  // channels
+    CHECK(*(uint8_t*)(state + 2) == 2);                   // channel (u8, capped at 2 for main port)
+    CHECK(*(int16_t*)(state + 4) == 127);                 // volume (Kyty reports 127)
+    CHECK(*(uint64_t*)(state + 8) == 0);                  // flag must NOT carry a bogus volume
 
-    // --- 6. error paths ---------------------------------------------------------------------
-    CHECK(call("sceAudioOutOutput", 999, PTR(pcm.data())) < 0);     // bad handle
-    CHECK(call("sceAudioOutSetVolume", 999, 0x1, PTR(vols)) < 0);
-    CHECK(call("sceAudioOutClose", 999) < 0);
+    // --- 6. error paths: the real SCE codes (Kyty Errno.h), not a generic -1 -----------------
+    CHECK((int32_t)call("sceAudioOutOutput", 999, PTR(pcm.data())) == (int32_t)0x80260003);  // INVALID_PORT
+    CHECK((int32_t)call("sceAudioOutSetVolume", 999, 0x1, PTR(vols)) == (int32_t)0x80260003);
+    CHECK((int32_t)call("sceAudioOutClose", 999) == (int32_t)0x80260003);
     CHECK(call("sceAudioOutInit", 0) == 0);
 
     // --- 7. close, then output-after-close fails --------------------------------------------
@@ -131,7 +134,7 @@ int main() {
     int opened = 0;
     for (int i = 0; i < 16; i++) if (call("sceAudioOutOpen", 1, 0, 0, 512, 44100, 4 /*F32 stereo*/) >= 1) opened++;
     CHECK(opened == 16);
-    CHECK(call("sceAudioOutOpen", 1, 0, 0, 512, 44100, 4) < 0);     // no free port
+    CHECK((int32_t)call("sceAudioOutOpen", 1, 0, 0, 512, 44100, 4) == (int32_t)0x80260005);  // PORT_FULL
     CHECK(sink.opens.size() == 16);
     if (!sink.opens.empty()) {
         CHECK(sink.opens[0].info.fmt == AudioFmt::F32);

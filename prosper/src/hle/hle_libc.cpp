@@ -11,6 +11,9 @@
 #include <cctype>
 #include <cmath>
 #include <cerrno>
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
 #ifdef _WIN32
 #include <malloc.h>   // _aligned_malloc
 #endif
@@ -237,22 +240,66 @@ HLE(h_setlocale)  { static char c[] = "C"; return (uint64_t)(uintptr_t)c; }
 HLE(h_atexit)      { return 0; }
 HLE(h_cxa_atexit)  { return 0; }
 HLE(h_cxa_finalize){ return 0; }
-// Itanium C++ ABI static-init guards: byte 0 of the guard = "initialized".
-HLE(h_guard_acquire) { uint8_t* g = (uint8_t*)P(a0); return (*g) ? 0 : 1; }
-HLE(h_guard_release) { uint8_t* g = (uint8_t*)P(a0); *g = 1; return 0; }
-HLE(h_guard_abort)   { return 0; }
+// Itanium C++ ABI static-init guards: byte 0 of the guard = "initialized", byte 1 = an init is in
+// flight. The old implementation was a non-atomic check with no blocking, so two threads racing an
+// uninitialized function-local static BOTH got "you initialize" — concurrent double-construction
+// (torn singletons) in the guest's 15-thread IL2CPP pool. Real contract: acquire returns 1 to
+// exactly one thread and blocks the rest until release/abort. Contenders park on one global
+// mutex/condvar pair (init is cold; the winner runs its constructor OUTSIDE the lock, so
+// independent guards cannot deadlock each other); the fast path stays a lock-free acquire-load.
+namespace { std::mutex g_guard_mx; std::condition_variable g_guard_cv; }
+HLE(h_guard_acquire) {
+    auto* g = (std::atomic<uint8_t>*)P(a0);
+    if (g->load(std::memory_order_acquire)) return 0;      // already initialized
+    std::unique_lock<std::mutex> lk(g_guard_mx);
+    for (;;) {
+        if (g->load(std::memory_order_acquire)) return 0;  // init finished while we waited
+        uint8_t* busy = (uint8_t*)g + 1;
+        if (!*busy) { *busy = 1; return 1; }               // we win: caller runs the initializer
+        g_guard_cv.wait(lk);
+    }
+}
+HLE(h_guard_release) {
+    auto* g = (std::atomic<uint8_t>*)P(a0);
+    { std::lock_guard<std::mutex> lk(g_guard_mx);
+      ((uint8_t*)g)[1] = 0;
+      g->store(1, std::memory_order_release); }
+    g_guard_cv.notify_all();
+    return 0;
+}
+HLE(h_guard_abort) {   // initializer threw: clear busy so another thread can retry
+    auto* g = (std::atomic<uint8_t>*)P(a0);
+    { std::lock_guard<std::mutex> lk(g_guard_mx); ((uint8_t*)g)[1] = 0; }
+    g_guard_cv.notify_all();
+    return 0;
+}
 
 // std::_Execute_once(once_flag&, int(*cb)(void*,void*,void**), void* arg) — the guts
 // of std::call_once. It MUST invoke the callback (which runs the real one-time init),
-// exactly once per flag, and return nonzero on success (call_once throws on 0).
+// exactly once per flag, and return nonzero on success (call_once throws on 0). The old
+// check-then-run had no synchronization: concurrent first calls ran the initializer twice
+// in parallel. Flag word: 0 = not run, 2 = running, 1 = done; the callback runs OUTSIDE
+// the lock so once-inits that depend on other threads' progress can't deadlock.
 HLE(h_execute_once) {
-    uint32_t* flag = (uint32_t*)P(a0);
-    if (flag && *flag) return 1;                 // already executed
+    auto* flag = (std::atomic<uint32_t>*)P(a0);
     auto cb = (int (*)(void*, void*, void**))P(a1);
-    int r = 1;
-    if (cb) { void* ctx = nullptr; r = cb((void*)P(a0), (void*)P(a2), &ctx); }
-    if (flag) *flag = 1;
-    return (uint64_t)(r ? 1 : 0);
+    if (!flag) { void* ctx = nullptr; return (uint64_t)((!cb || cb(nullptr, (void*)P(a2), &ctx)) ? 1 : 0); }
+    for (;;) {
+        if (flag->load(std::memory_order_acquire) == 1) return 1;   // already executed
+        std::unique_lock<std::mutex> lk(g_guard_mx);
+        uint32_t v = flag->load(std::memory_order_acquire);
+        if (v == 1) return 1;
+        if (v == 2) { g_guard_cv.wait(lk); continue; }              // another thread is running it
+        flag->store(2, std::memory_order_relaxed);
+        lk.unlock();
+        void* ctx = nullptr;
+        int r = cb ? cb((void*)P(a0), (void*)P(a2), &ctx) : 1;
+        lk.lock();
+        flag->store(r ? 1u : 0u, std::memory_order_release);        // failure -> retryable next call
+        lk.unlock();
+        g_guard_cv.notify_all();
+        return (uint64_t)(r ? 1 : 0);
+    }
 }
 // C++ exception refcounting — no-op is safe for the non-throwing boot path.
 HLE(h_cxa_dec_refcount) { return 0; }

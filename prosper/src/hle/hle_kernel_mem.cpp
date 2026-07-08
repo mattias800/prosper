@@ -97,6 +97,33 @@ namespace {
         if (nm) { strncpy(m.name, nm, sizeof m.name - 1); }
         g_maps.push_back(m);
     }
+    // Trim/split tracked mappings overlapping [base, base+len). munmap/BatchMap-UNMAP must remove
+    // their tracking (this never happened before — g_maps only ever grew): stale "committed"
+    // records made VirtualQuery report freed VAs as live, made the fault handler's lazy-commit
+    // probe (prosper_reserved_range_state) mis-decide on re-reserved ranges, and let the render
+    // thread's safe_copy memcpy a texture whose backing the game had batch-unmapped — the exact
+    // SIGSEGV class safe_copy exists to prevent (same overlap-trim shape as dmem_release above).
+    void untrack(uint64_t base, uint64_t len) {
+        if (!len) return;
+        uint64_t end = base + len;
+        std::lock_guard<std::mutex> lk(g_mx);
+        std::vector<Mapping> out;
+        out.reserve(g_maps.size() + 1);
+        for (auto& m : g_maps) {
+            uint64_t me = m.base + m.size;
+            if (me <= base || m.base >= end) { out.push_back(m); continue; }
+            if (m.base < base) { Mapping lo = m; lo.size = base - m.base; out.push_back(lo); }
+            if (me > end)      { Mapping hi = m; hi.base = end; hi.size = me - end; out.push_back(hi); }
+        }
+        g_maps.swap(out);
+    }
+    // Re-tag [base, base+len) with a new protection (mprotect): replace the overlapped span so
+    // VirtualQuery/the fault probe report the CURRENT prot, not the one from map time.
+    void retrack_prot(uint64_t base, uint64_t len, int prot, const char* nm) {
+        if (!len) return;
+        untrack(base, len);
+        track(base, len, prot, true, nm);
+    }
     const Mapping* find(uint64_t addr) {
         std::lock_guard<std::mutex> lk(g_mx);
         const Mapping* best = nullptr;
@@ -416,8 +443,8 @@ HLE(k_wake_by_address) {
     return 0;
 }
 
-HLE(k_munmap)   { if (a0) munmap((void*)a0, a1); return 0; }
-HLE(k_mprotect) { if (a0) mprotect((void*)a0, a1, host_prot(a2)); return 0; }
+HLE(k_munmap)   { if (a0) { munmap((void*)a0, a1); untrack(a0, a1); } return 0; }
+HLE(k_mprotect) { if (a0) { mprotect((void*)a0, a1, host_prot(a2)); retrack_prot(a0, a1, host_prot(a2), "mprotect"); } return 0; }
 HLE(k_dmem_size){ return kDmemTotal; }   // 8 GiB pool (allocation failures enforce this bound)
 
 // --- libSceAmpr (PS5 async memory-programming engine) -------------------------------------------
@@ -592,9 +619,10 @@ HLE(k_batch_map) {
                 if (ok) track((uint64_t)p, len, host_prot(prot), true, "batch-flex");
                 break;
             }
-            case 1: if (start) munmap((void*)(uintptr_t)start, len); break;              // UNMAP
+            case 1: if (start) { munmap((void*)(uintptr_t)start, len); untrack(start, len); } break;  // UNMAP
             case 2: case 4:                                                              // PROTECT / TYPE_PROTECT
-                if (start) mprotect((void*)(uintptr_t)start, len, host_prot(prot)); break;
+                if (start) { mprotect((void*)(uintptr_t)start, len, host_prot(prot));
+                             retrack_prot(start, len, host_prot(prot), "batch-prot"); } break;
             default: ok = false; ret = 0x80020016ull; break;
         }
         if (!ok) { if (!ret) ret = 0x8002000Cull; break; }   // ENOMEM on a failed map

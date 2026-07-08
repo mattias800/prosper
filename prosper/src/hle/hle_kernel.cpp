@@ -239,6 +239,24 @@ HLE(k_attr_getaffinity) {
     if (a1) *(uint64_t*)(uintptr_t)a1 = one ? 0x01 : 0xff;
     return 0;
 }
+// Scheduling Get* handlers. The Set* side is a legitimate no-op (we don't re-prioritize host
+// threads), but a Get* that returns SUCCESS while never writing its out-params hands the caller
+// uninitialized stack memory — the exact harmful-stub class k_attr_getaffinity above was fixed
+// for. Report deterministic defaults: policy SCHED_OTHER(=1)-equivalent RR, priority 700 (the
+// Sony default thread priority; Kyty Pthread.cpp uses the same 700 midpoint).
+HLE(k_getschedparam)      { // scePthread/pthread_getschedparam(thread, int* policy, SchedParam* param)
+    if (a1) *(int32_t*)(uintptr_t)a1 = 1;
+    if (a2) *(int32_t*)(uintptr_t)a2 = 700;   // SceKernelSchedParam = { int sched_priority }
+    return 0;
+}
+HLE(k_attr_getschedparam) { // scePthreadAttrGetschedparam(attr, SchedParam* param)
+    if (a1) *(int32_t*)(uintptr_t)a1 = 700;
+    return 0;
+}
+HLE(k_getprio)            { // scePthreadGetprio(thread, int* prio)
+    if (a1) *(int32_t*)(uintptr_t)a1 = 700;
+    return 0;
+}
 
 // --- thread creation: run the guest entry on a real host thread (ABI matches) ---
 // We give each worker a stack we allocate and TRACK, so GC/thread-stack queries get
@@ -335,15 +353,44 @@ HLE(k_ef_create) {   // (ef*, name, attr, initPattern, opt)
 HLE(k_ef_delete)  { if (a0) free((void*)(uintptr_t)a0); return 0; }
 HLE(k_ef_set)     { auto* e = (EventFlag*)(uintptr_t)a0; if (!e) return 0; pthread_mutex_lock(&e->m); e->bits |= a1; pthread_cond_broadcast(&e->c); pthread_mutex_unlock(&e->m); return 0; }
 HLE(k_ef_clear)   { auto* e = (EventFlag*)(uintptr_t)a0; if (!e) return 0; pthread_mutex_lock(&e->m); e->bits &= a1; pthread_mutex_unlock(&e->m); return 0; }
-HLE(k_ef_wait)    { // (ef, pattern, waitMode, resultPat*, timeout*)
+// Absolute CLOCK_REALTIME deadline `usec` microseconds from now (for pthread_cond_timedwait
+// on default-attr condvars, which time against CLOCK_REALTIME).
+static timespec abs_deadline_us(uint64_t usec) {
+    timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec  += (time_t)(usec / 1000000u);
+    ts.tv_nsec += (long)(usec % 1000000u) * 1000L;
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    return ts;
+}
+HLE(k_ef_wait)    { // (ef, pattern, waitMode, resultPat*, SceKernelUseconds* timeout)
+    // The timeout arg (a4) was previously IGNORED — a bounded guest wait blocked forever (the
+    // same class of silent hang root-caused for wait_on_address, hle_kernel_mem.cpp). Sony
+    // semantics: *timeout is a u32 microsecond budget, updated on return with the time left;
+    // expiry returns KERNEL_ERROR_ETIMEDOUT (Kyty EventFlag.cpp / Errno.h 0x8002003C).
     auto* e = (EventFlag*)(uintptr_t)a0; if (!e) return 0;
+    uint64_t ret = 0;
     pthread_mutex_lock(&e->m);
-    while (!evf_match(e->bits, a1, (uint32_t)a2)) pthread_cond_wait(&e->c, &e->m);
+    if (a4) {
+        uint32_t usec = *(uint32_t*)(uintptr_t)a4;
+        timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+        timespec dl = abs_deadline_us(usec);
+        int rc = 0;
+        while (!evf_match(e->bits, a1, (uint32_t)a2) && rc != ETIMEDOUT)
+            rc = pthread_cond_timedwait(&e->c, &e->m, &dl);
+        timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
+        int64_t spent_i = (int64_t)(t1.tv_sec - t0.tv_sec) * 1000000
+                        + ((int64_t)t1.tv_nsec - (int64_t)t0.tv_nsec) / 1000;
+        uint64_t spent = spent_i < 0 ? 0u : (uint64_t)spent_i;
+        *(uint32_t*)(uintptr_t)a4 = spent >= usec ? 0u : (uint32_t)(usec - spent);
+        if (!evf_match(e->bits, a1, (uint32_t)a2)) ret = 0x8002003Cull;  // KERNEL_ERROR_ETIMEDOUT
+    } else {
+        while (!evf_match(e->bits, a1, (uint32_t)a2)) pthread_cond_wait(&e->c, &e->m);
+    }
     uint64_t res = e->bits;
-    if (a2 & 0x10) e->bits = 0; else if (a2 & 0x20) e->bits &= ~a1;   // CLEAR_ALL / CLEAR_PAT
+    if (!ret) { if (a2 & 0x10) e->bits = 0; else if (a2 & 0x20) e->bits &= ~a1; }  // CLEAR_ALL / CLEAR_PAT
     pthread_mutex_unlock(&e->m);
     if (a3) *(uint64_t*)(uintptr_t)a3 = res;
-    return 0;
+    return ret;
 }
 HLE(k_ef_poll)    { // (ef, pattern, waitMode, resultPat*)
     auto* e = (EventFlag*)(uintptr_t)a0; if (!e) return 0;
@@ -367,9 +414,29 @@ HLE(k_sema_create) { // (sema*, name, attr, initCount, maxCount, opt)
     return 0;
 }
 HLE(k_sema_delete) { if (a0) free((void*)(uintptr_t)a0); return 0; }
-HLE(k_sema_wait)   { auto* s = (Sema*)(uintptr_t)a0; if (!s) return 0; int64_t need = a1 ? (int64_t)a1 : 1;
+HLE(k_sema_wait)   { // (sema, need, SceKernelUseconds* timeout) — timeout honored like k_ef_wait
+    auto* s = (Sema*)(uintptr_t)a0; if (!s) return 0; int64_t need = a1 ? (int64_t)a1 : 1;
     if (sclog()) fprintf(stderr, "[sync2] T%ld SEMA.wait     sema=0x%llx need=%lld\n", sctid(), (unsigned long long)a0, (long long)need);
-    pthread_mutex_lock(&s->m); while (s->count < need) pthread_cond_wait(&s->c, &s->m); s->count -= need; pthread_mutex_unlock(&s->m); return 0; }
+    uint64_t ret = 0;
+    pthread_mutex_lock(&s->m);
+    if (a2) {
+        uint32_t usec = *(uint32_t*)(uintptr_t)a2;
+        timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+        timespec dl = abs_deadline_us(usec);
+        int rc = 0;
+        while (s->count < need && rc != ETIMEDOUT) rc = pthread_cond_timedwait(&s->c, &s->m, &dl);
+        timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
+        int64_t spent_i = (int64_t)(t1.tv_sec - t0.tv_sec) * 1000000
+                        + ((int64_t)t1.tv_nsec - (int64_t)t0.tv_nsec) / 1000;
+        uint64_t spent = spent_i < 0 ? 0u : (uint64_t)spent_i;
+        *(uint32_t*)(uintptr_t)a2 = spent >= usec ? 0u : (uint32_t)(usec - spent);
+        if (s->count < need) ret = 0x8002003Cull;    // KERNEL_ERROR_ETIMEDOUT
+    } else {
+        while (s->count < need) pthread_cond_wait(&s->c, &s->m);
+    }
+    if (!ret) s->count -= need;
+    pthread_mutex_unlock(&s->m);
+    return ret; }
 HLE(k_sema_signal) { auto* s = (Sema*)(uintptr_t)a0; if (!s) return 0; int64_t n = a1 ? (int64_t)a1 : 1;
     if (sclog()) fprintf(stderr, "[sync2] T%ld SEMA.signal   sema=0x%llx n=%lld\n", sctid(), (unsigned long long)a0, (long long)n);
     pthread_mutex_lock(&s->m); s->count += n; pthread_cond_broadcast(&s->c); pthread_mutex_unlock(&s->m); return 0; }
@@ -716,16 +783,16 @@ void register_kernel_hle() {
     R("scePthreadAttrSetschedpolicy", k_attr_noop);
     R("scePthreadAttrSetschedparam", k_attr_noop);
     R("scePthreadAttrSetdetachstate", k_attr_noop);
-    R("scePthreadAttrGetschedparam", k_attr_noop);
+    R("scePthreadAttrGetschedparam", k_attr_getschedparam);
     R("scePthreadAttrGet", k_attr_get);
     R("scePthreadAttrGetstackaddr", k_attr_getstackaddr);
     R("scePthreadAttrGetstacksize", k_attr_getstacksize);
     R("scePthreadAttrGetaffinity", k_attr_getaffinity);  // report 8 cores (not an empty mask)
     R("scePthreadAttrSetaffinity", k_attr_noop);         // accept affinity requests (we don't pin)
     R("scePthreadGetaffinity", k_attr_getaffinity);      R("scePthreadSetaffinity", k_attr_noop);
-    R("scePthreadGetschedparam", k_attr_noop);  R("pthread_getschedparam", k_attr_noop);
+    R("scePthreadGetschedparam", k_getschedparam);  R("pthread_getschedparam", k_getschedparam);
     R("scePthreadSetschedparam", k_attr_noop);  R("scePthreadSetprio", k_attr_noop);
-    R("scePthreadGetprio", k_attr_noop);
+    R("scePthreadGetprio", k_getprio);
     R("scePthreadGetstack", k_attr_getstackaddr);
     // TLS keys (POSIX + Sony names -> host pthread keys)
     R("pthread_key_create", k_key_create);   R("scePthreadKeyCreate", k_key_create);

@@ -84,3 +84,23 @@ renderer is wired in; the game's **real pixel shader recompiles to valid SPIR-V*
 - **Correctness-first:** implement real behavior (cross-checked against the Kyty PS5-emulator reference in
   `../Kyty`), not shims that fake output. Mark genuinely-uncertain code with `CONFIDENCE: HIGH/MED/LOW`.
 - **Commit style:** small, verified commits; push to `origin` promptly. Co-author trailer as configured.
+  **Do NOT add "Generated with Claude Code" attribution lines** (the 🤖 badge, "Generated with
+  [Claude Code](...)" footers, session links) to PR bodies, commit messages, issue text, or
+  comments — anywhere. They are noise in the project record; the co-author trailer alone is enough.
+- **Track work in GitHub issues** (`gh issue ...`). The rules:
+  - **Any bug you find but do not fix in the same session gets an issue, immediately**, while the
+    context is fresh: exact `file:line`, the concrete failure scenario (inputs/state → wrong
+    behavior), the introducing commit if known, and a suggested fix. Apply the label `bug` plus
+    `bug-hunt` if it came from a systematic review. A bug that lives only in a commit message,
+    doc, or your head is a bug that gets rediscovered the hard way.
+  - **Before starting non-trivial work, check the tracker** (`gh issue list --label bug-hunt`,
+    or by area) — the fix may already be specified, or an issue may conflict with what you're
+    about to change. Before fixing an issue, **re-verify it still exists on current master**
+    (another PR may have fixed it independently).
+  - **One issue → one focused PR** where feasible; reference the issue in the PR body
+    (`Fixes #NN`) so the merge closes it. When a fix lands that partially addresses an issue,
+    comment on the issue with what remains instead of closing it.
+  - Larger planned work (frontier steps, refactors) also gets an issue when it will span
+    sessions — issues are the durable queue; `docs/` files explain *how*, issues track *what
+    remains*. The umbrella issue for the history-review backlog is #72
+    (full annotated list: `prosper/docs/BUG_HUNT_BACKLOG.md`).

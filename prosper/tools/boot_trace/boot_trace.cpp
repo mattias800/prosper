@@ -43,6 +43,10 @@
 #include <sys/mman.h>
 #endif
 namespace prosper::gpu { bool guest_readable(uint64_t addr, uint32_t bytes); }
+// Lazy-commit reserved-range probe: 0 = not in any guest mapping (a memcpy would SIGSEGV), 1 = reserved
+// (the fault handler will commit it on touch), 2 = already committed. Used to bound texture/buffer copies
+// to their real backing — a resource's declared size can run past what the game actually mapped.
+extern "C" int prosper_reserved_range_state(uint64_t addr);
 
 using namespace prosper;
 
@@ -267,8 +271,24 @@ int main(int argc, char** argv) {
                     if (FILE* f = fopen((d + "/frame_fs.spv").c_str(), "wb")) { fwrite(items[0].fs.data(), 4, items[0].fs.size(), f); fclose(f); }
                     fprintf(stderr, "[render] dumped SPIR-V vs=%zu fs=%zu dwords\n", items[0].vs.size(), items[0].fs.size()); fflush(stderr);
                 }
-                int dn = open("/dev/null", O_WRONLY);
-                auto readable = [&](uint64_t a, size_t n){ return a > 0x1000 && dn >= 0 && write(dn, (const void*)(uintptr_t)a, n) == (ssize_t)n; };
+                // Copy [a, a+n) into dst, but stop at the first 64KB block that is NOT within a reserved guest
+                // mapping (prosper_reserved_range_state == 0). A resource's declared size (e.g. a 2048x1024
+                // atlas = 8 MB) can run past its real committed backing; an unguarded memcpy then walks off
+                // the mapping and SIGSEGVs the render thread mid-copy — /dev/null-write "readable" can't catch
+                // it because /dev/null discards without faulting. Returns bytes copied; dst is pre-zeroed so a
+                // short copy just leaves a transparent/black tail (only the missing region degrades).
+                auto safe_copy = [](uint8_t* dst, uint64_t a, size_t n) -> size_t {
+                    const size_t PG = 0x10000;   // lazy-commit granularity (64 KB)
+                    size_t done = 0;
+                    while (done < n) {
+                        uint64_t cur = a + done;
+                        if (cur < 0x1000 || prosper_reserved_range_state(cur) == 0) break;
+                        size_t chunk = std::min(n - done, PG - (size_t)(cur & (PG - 1)));
+                        std::memcpy(dst + done, (const void*)(uintptr_t)cur, chunk);
+                        done += chunk;
+                    }
+                    return done;
+                };
                 static std::vector<std::vector<uint8_t>> texstore;  // keep every item's texture bytes alive
                 texstore.clear();
                 // Build one draw's set-tagged resources from its VS (set 0) + PS (set 1) tables — read the
@@ -284,7 +304,7 @@ int main(int argc, char** argv) {
                             uint32_t tw = r.width ? r.width : 4, th = r.height ? r.height : 4;
                             size_t nb = (size_t)tw * th * 4;
                             texstore.emplace_back(nb, 0x00);
-                            if (readable(r.gpu_addr, nb)) std::memcpy(texstore.back().data(), (const void*)(uintptr_t)r.gpu_addr, nb);
+                            safe_copy(texstore.back().data(), r.gpu_addr, nb);
                             // PROSPER_DUMP_RAWTEX: write the raw tiled RGBA bytes (pre-detile) to a .bin for
                             // offline swizzle experimentation.
                             if (getenv("PROSPER_DUMP_RAWTEX") && !texstore.back().empty()) {
@@ -319,13 +339,12 @@ int main(int argc, char** argv) {
                                 const uint32_t pitch = getenv("PROSPER_PITCH") ? (uint32_t)atoi(getenv("PROSPER_PITCH")) : 0;
                                 size_t tiled_bytes = prosper::gpu::tiled_surface_bytes(tw, th, tmode, pitch);
                                 std::vector<uint8_t> tiled(tiled_bytes, 0);
-                                if (readable(r.gpu_addr, tiled_bytes))
-                                    std::memcpy(tiled.data(), (const void*)(uintptr_t)r.gpu_addr, tiled_bytes);
-                                else
-                                    // Padded tail (th rounded to whole 32-row tiles) is unmapped: detile
-                                    // from the width*height bytes already validated + copied above, rather
-                                    // than an all-zero buffer (which would BLANK the whole texture and make
-                                    // a live frame look empty). Only the bottom tile-row degrades.
+                                size_t got = safe_copy(tiled.data(), r.gpu_addr, tiled_bytes);
+                                if (got < nb)
+                                    // The padded tiled buffer's tail (th rounded to whole 32-row tiles) runs
+                                    // past the real backing: fall back to the width*height linear bytes copied
+                                    // above rather than an all-zero buffer (which would BLANK the texture).
+                                    // Only the bottom tile-row degrades.
                                     std::memcpy(tiled.data(), texstore.back().data(), std::min(nb, tiled_bytes));
                                 prosper::gpu::detile_surface(texstore.back().data(), tiled.data(), tw, th, tmode, pitch);
                             }
@@ -340,9 +359,12 @@ int main(int argc, char** argv) {
                             }
                             fr.tex_rgba = texstore.back().data(); fr.tw = tw; fr.th = th;
                         } else {
-                            uint32_t nb = std::min(r.size ? r.size : 256u, 1u << 20);   // cap 1 MB
-                            if (nb >= 4 && readable(r.gpu_addr, nb))
-                                fr.dwords.assign((const uint32_t*)(uintptr_t)r.gpu_addr, (const uint32_t*)(uintptr_t)(r.gpu_addr + (nb & ~3u)));
+                            uint32_t nb = std::min(r.size ? r.size : 256u, 1u << 20) & ~3u;   // cap 1 MB, dword-aligned
+                            if (nb >= 4) {
+                                std::vector<uint8_t> tmp(nb, 0);
+                                if (safe_copy(tmp.data(), r.gpu_addr, nb) > 0)
+                                    fr.dwords.assign((const uint32_t*)tmp.data(), (const uint32_t*)(tmp.data() + nb));
+                            }
                             if (fr.dwords.empty()) fr.dwords.assign(64, 0);
                         }
                         R.push_back(std::move(fr));
@@ -390,7 +412,6 @@ int main(int argc, char** argv) {
                         bds.size(), bd.R.size(), bd.vcount, it.ps.topology, it.ps.color_write_mask, (int)it.ps.blend_enable);
                     bds.push_back(std::move(bd));
                 }
-                if (dn >= 0) close(dn);
                 std::vector<uint8_t> px = prosper::test::render_draws_rgba(bds, w, h);
                 int n = frame_no++;
                 if (px.empty()) {
