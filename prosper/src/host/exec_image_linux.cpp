@@ -262,7 +262,7 @@ namespace {
         long fd = perf_bp_open(addr, HW_BREAKPOINT_W);
         char b[160];
         if (fd < 0) { int n = snprintf(b, sizeof b, "[hwwatch] perf W-watch FAILED addr=0x%llx errno=%d\n",
-                          (unsigned long long)addr, errno); write(2, b, n); return; }
+                          (unsigned long long)addr, errno); syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */ return; }
         g_hwwatch_fd = (int)fd; g_hwwatch_addr = addr;
         fcntl(g_hwwatch_fd, F_SETFL, O_ASYNC);
         fcntl(g_hwwatch_fd, F_SETSIG, SIGTRAP);
@@ -270,7 +270,7 @@ namespace {
         fcntl(g_hwwatch_fd, F_SETOWN_EX, &ow);
         ioctl(g_hwwatch_fd, PERF_EVENT_IOC_ENABLE, 0);
         int n = snprintf(b, sizeof b, "[hwwatch] armed W-watch at 0x%llx (fd=%d)\n",
-                         (unsigned long long)addr, g_hwwatch_fd); write(2, b, n);
+                         (unsigned long long)addr, g_hwwatch_fd); syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
     }
     // PROSPER_PEEK dumps offsets off registers at fault time. Supports N specs separated by ';',
     // each "reg:off,off,..."; an offset may be prefixed '*' to chase one pointer level first
@@ -295,12 +295,12 @@ namespace {
         };
         char b[256];
         int n = snprintf(b, sizeof b, "[prosper] FAULTMEM dump (regs -> guest memory):\n");
-        write(2, b, n);
+        syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
         for (auto& r : regs) {
             if (!probe_readable(r.v)) {
                 n = snprintf(b, sizeof b, "  %s=0x%llx  (unmapped/immediate)\n",
                              r.n, (unsigned long long)r.v);
-                write(2, b, n);
+                syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
                 continue;
             }
             uint64_t q[4] = {0, 0, 0, 0};
@@ -313,7 +313,7 @@ namespace {
             }
             n = snprintf(b, sizeof b, "  %s=0x%llx -> [0]=%s [8]=%s [10]=%s [18]=%s\n",
                          r.n, (unsigned long long)r.v, part[0], part[1], part[2], part[3]);
-            write(2, b, n);
+            syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
         }
         // Deep field peek (PROSPER_PEEK, parsed once at arm time — getenv is not signal-safe): read
         // specific offsets off one or more registers to classify a large object beyond the 0x20-byte
@@ -323,7 +323,7 @@ namespace {
             uint64_t base = 0;
             for (auto& r : regs) { bool m = true; for (int i=0;i<3;i++) if (r.n[i]!=ps.reg[i]&&!(r.n[i]==' '&&ps.reg[i]==0)) { m=false; break; } if (m) { base=r.v; break; } }
             n = snprintf(b, sizeof b, "  PEEK %s=0x%llx:\n", ps.reg, (unsigned long long)base);
-            write(2, b, n);
+            syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
             for (int k = 0; k < ps.n; k++) {
                 uint64_t obj = base;
                 if (ps.deref[k]) {   // chase one pointer level: obj = [base + pre]
@@ -340,7 +340,7 @@ namespace {
                 else
                     n = snprintf(b, sizeof b, "    %s[+0x%llx]@+0x%llx = <unmapped>\n", pfx,
                                  (unsigned long long)ps.pre[k], (unsigned long long)ps.off[k]);
-                write(2, b, n);
+                syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
             }
         }
     }
@@ -424,7 +424,7 @@ namespace {
                     int n = snprintf(b, sizeof b, "[hwwatch] #%d WRITE [0x%llx]=0x%llx by rip=%s0x%llx tid=%ld\n",
                         (int)g_hwwatch_count, (unsigned long long)g_hwwatch_addr, v,
                         in_eboot ? "eboot+" : "", (unsigned long long)(in_eboot ? wr - 0x400000000ull : wr), cur_tid());
-                    write(2, b, n);
+                    syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
                     if (!in_eboot) classify_addr(wr);
                 }
                 return;
@@ -477,7 +477,7 @@ namespace {
                         s[k] = c;
                     }
                     s[k] = 0;
-                    if (k >= 2) { char b[128]; int n = snprintf(b, sizeof b, "[hwbp-str] %s=0x%llx -> \"%s\"\n", rn, (unsigned long long)p, s); write(2, b, n); }
+                    if (k >= 2) { char b[128]; int n = snprintf(b, sizeof b, "[hwbp-str] %s=0x%llx -> \"%s\"\n", rn, (unsigned long long)p, s); syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */ }
                 };
                 char hdr[64]; int hn = snprintf(hdr, sizeof hdr, "[hwbp-str] hit @eboot+0x%llx:\n",
                     (unsigned long long)((uint64_t)gr[REG_RIP] - 0x400000000ull)); write(2, hdr, hn);
@@ -499,7 +499,7 @@ namespace {
                     if (k >= 2) { char b[160]; int n = snprintf(b, sizeof b,
                         "[hwbp-klass] %s obj=0x%llx klass=0x%llx name=\"%s\" [obj+0x40]=0x%llx\n",
                         rn, (unsigned long long)obj, (unsigned long long)klass, s,
-                        (unsigned long long)(probe_readable(obj+0x40)?*(const uint64_t*)(obj+0x40):0)); write(2, b, n); }
+                        (unsigned long long)(probe_readable(obj+0x40)?*(const uint64_t*)(obj+0x40):0)); syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */ }
                 };
                 // PROSPER_HWBP_FIELDS=1: dump rbx's object fields [0x10..0x60] + the class name of any
                 // field that is itself an object — to tell "whole object uninitialized (all null)" from
@@ -512,7 +512,7 @@ namespace {
                             uint64_t v = *(const uint64_t*)(o + off);
                             n += snprintf(b+n, sizeof b-n, " +0x%llx=0x%llx", (unsigned long long)off, (unsigned long long)v);
                         }
-                        n += snprintf(b+n, sizeof b-n, "\n"); write(2, b, n);
+                        n += snprintf(b+n, sizeof b-n, "\n"); syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
                         // Resolve the class name of each object-typed field (its [obj]->klass->[+0x10]=name).
                         for (uint64_t off = 0x10; off <= 0x88; off += 8) {
                             if (!probe_readable(o + off + 7)) continue;
@@ -544,7 +544,7 @@ namespace {
                         if (c == 0) break; if (c < 0x20 || c > 0x7e) { if (k < 2) return; break; } s[k] = c; }
                     s[k] = 0;
                     if (k >= 2) { char b[128]; int n = snprintf(b, sizeof b, "[hwbp-cname] %s klass=0x%llx name=\"%s\"\n",
-                        rn, (unsigned long long)klass, s); write(2, b, n); }
+                        rn, (unsigned long long)klass, s); syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */ }
                 };
                 pcname("rdi(class)", (uint64_t)gr[REG_RDI]);
                 // PROSPER_HWBP_GLOBAL=0xADDR: also resolve the class name stored at a fixed guest global
@@ -589,7 +589,7 @@ namespace {
                     (unsigned long long)rax, rax_u32, (unsigned long long)r14, (unsigned long long)rbx,
                     rd(rbx+0x38), rd(rbx+0x40), rd(rbx+0x48), off(rd(rsp)), off(rd(rbp + 8)), cur_tid());
                 (void)r15; (void)rdi; (void)rsi;
-                write(2, b, n);
+                syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
                 // PROSPER_HWBP_DIVCAP: log the typetree-vector transfer's elemSize/byteSize/count from the
                 // caller frame (rbp-relative), for the ~6 `call *0x88` array reads.
                 if (g_hwbp_divcap) {
@@ -699,7 +699,7 @@ namespace {
                         (unsigned long long)rax, (unsigned long long)r14, (unsigned long long)r15,
                         rd(rdi), (unsigned long long)(probe_readable(rdi+0x1e4c) ? *(const uint32_t*)(rdi+0x1e4c) : 0xBADBAD),
                         cur_tid());
-                    write(2, b, n);
+                    syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
                 }
                 bp_write_byte(g_bp_addr, g_bp_orig);              // restore real instruction
                 uc->uc_mcontext.gregs[REG_RIP] = (greg_t)g_bp_addr;  // re-execute it
@@ -719,7 +719,7 @@ namespace {
             unsigned long long tag  = *(const uint64_t*)(g_watch_addr - 0x140);
             char b[128];
             int n = snprintf(b, sizeof b, "[watch]   -> slot now=0x%llx  obj[+0]=0x%llx\n", slot, tag);
-            write(2, b, n);
+            syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
             mprotect((void*)g_watch_page, 0x1000, PROT_READ);
             g_watch_stepping = false;
             return;
@@ -736,7 +736,7 @@ namespace {
                     char b[128];
                     int n = snprintf(b, sizeof b, "[watch] armed on companion slot 0x%llx (obj r15=0x%llx) reader-tid=%ld\n",
                                      (unsigned long long)g_watch_addr, (unsigned long long)r15, cur_tid());
-                    write(2, b, n);
+                    syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
                 }
                 // Skip this (null) read so the boot proceeds; the slot's page is now watched.
                 uc->uc_mcontext.gregs[REG_RIP] = (greg_t)g_skip_target;
@@ -756,7 +756,7 @@ namespace {
                                      (unsigned long long)fa,
                                      (unsigned long long)uc->uc_mcontext.gregs[REG_RIP], cur_tid(),
                                      (int)g_watch_hits);
-                    write(2, b, n);
+                    syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
                 }
                 mprotect((void*)g_watch_page, 0x1000, PROT_READ | PROT_WRITE);
                 uc->uc_mcontext.gregs[REG_EFL] |= 0x100ll;   // set TF -> single-step the write
@@ -789,7 +789,11 @@ namespace {
                 int n = snprintf(b, sizeof b, "[lazy-commit] %s page=0x%llx rip=0x%llx\n",
                                  ok ? "mapped" : "MMAP-FAILED", (unsigned long long)(uint64_t)(uintptr_t)page,
                                  (unsigned long long)uc2->uc_mcontext.gregs[REG_RIP]);
-                write(2, b, n);
+                // RAW syscall, NOT glibc write(): this handler can run on a thread whose %fs is the
+                // GUEST TCB (PROSPER_GUEST_FS), and glibc write()'s cancellation prologue reads the
+                // TCB through %fs — a nested SIGSEGV inside the handler killed the process (the UE4
+                // boot's silent exit-139).
+                syscall(SYS_write, 2, b, (size_t)n);
                 if (ok) return;   // re-execute against the now-backed page
             }
         }
@@ -805,7 +809,7 @@ namespace {
                     int n = snprintf(b, sizeof b, "[fault] GPU-VA %s addr=0x%llx rip=0x%llx\n",
                                      ok ? "mapped" : "MMAP-FAILED", (unsigned long long)a,
                                      (unsigned long long)uc->uc_mcontext.gregs[REG_RIP]);
-                    write(2, b, n);
+                    syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
                 }
                 if (ok) { g_lazy_pages = g_lazy_pages + 1; return; }  // re-execute against the now-mapped page
             }
@@ -833,7 +837,7 @@ namespace {
                     int n = snprintf(b, sizeof b, "[nullpage] #%d addr=0x%llx rip=eboot+0x%llx\n",
                                      (int)g_null_page_count, (unsigned long long)a,
                                      (unsigned long long)(rip - 0x400000000ull));
-                    write(2, b, n);
+                    syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
                     return;   // re-execute; the null read now sees zero
                 }
             }
@@ -855,7 +859,7 @@ namespace {
                     "[+0x1a0]=0x%llx -> skip to 0x%llx\n",
                     (int)g_skip_count, (unsigned long long)r15, rd(r15+0xc0), rd(r15+0xe0),
                     rd(r15+0x138), rd(r15+0x140), rd(r15+0x1a0), (unsigned long long)g_skip_target);
-                write(2, b, n);
+                syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
                 uc->uc_mcontext.gregs[REG_RIP] = (greg_t)g_skip_target;
                 return;   // re-execute from the reader's skip label
             }
@@ -870,7 +874,7 @@ namespace {
             int n = snprintf(b, sizeof b, "[fault] sig=%d addr=%p rip=0x%llx armed=%d tid=%ld\n",
                              sig, si->si_addr, (unsigned long long)uc->uc_mcontext.gregs[REG_RIP],
                              (int)(g_armed_tid && cur_tid() == g_armed_tid), cur_tid());
-            write(2, b, n);
+            syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
         }
         g_fault_addr = si->si_addr;
         auto* uc = (ucontext_t*)uctx;
@@ -899,7 +903,7 @@ namespace {
                              sig, g_fault_addr, (unsigned long long)g_fault_rip,
                              (unsigned long long)(g_base && g_fault_rip >= g_base ? g_fault_rip - g_base : g_fault_rip),
                              (unsigned long long)g_rbp);
-            write(2, b, n);
+            syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
             // Classify the fault rip + fault-addr regions (which mapping / module) and dump the instruction
             // bytes at rip — turns the ASLR-relocated "rip=0x...48b" into an identifiable location.
             classify_addr(g_fault_rip);
@@ -1137,7 +1141,7 @@ void arm_bp() {
     char b[96];
     int n = snprintf(b, sizeof b, "[bp] armed int3 at eboot+0x%llx (orig=0x%02x)\n",
                      (unsigned long long)(g_bp_addr - 0x400000000ull), g_bp_orig);
-    write(2, b, n);
+    syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
 }
 
 // Open + enable the PROSPER_HWBP hardware breakpoint (must run on the main/guest thread — the perf
@@ -1149,7 +1153,7 @@ void arm_hwbp() {
     if (fd < 0) {
         int n = snprintf(b, sizeof b, "[hwbp] perf_event_open FAILED for eboot+0x%llx (errno=%d) — HW bp disabled\n",
                          (unsigned long long)(g_hwbp_addr - 0x400000000ull), errno);
-        write(2, b, n); g_hwbp_on = false; return;
+        syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */ g_hwbp_on = false; return;
     }
     g_hwbp_fd = (int)fd;
     fcntl(g_hwbp_fd, F_SETFL, O_ASYNC);
@@ -1159,7 +1163,7 @@ void arm_hwbp() {
     ioctl(g_hwbp_fd, PERF_EVENT_IOC_ENABLE, 0);
     int n = snprintf(b, sizeof b, "[hwbp] armed HW execute bp at eboot+0x%llx (fd=%d tid=%ld)\n",
                      (unsigned long long)(g_hwbp_addr - 0x400000000ull), g_hwbp_fd, (long)syscall(SYS_gettid));
-    write(2, b, n);
+    syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
 }
 
 uint64_t stub_addr(uint64_t idx) { return g_stub_base + idx * g_stub_size; }
