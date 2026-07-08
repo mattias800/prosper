@@ -1183,6 +1183,55 @@ int main() {
     printf("  kernel65 mismatches=%u (out[9]=%g exp=%g)\n", bad65, got65.size()==N?got65[9]:-1, exp65[9]);
     CHECK(got65.size()==N && bad65==0, "recompiled kernel 65 (v_mbcnt -1 = localid) correct");
 
+    // Kernel 66: RAW MUBUF SRSRC RESOLUTION (#91). Same code as kernel 21 (buffer_load_dword v0, v0
+    // offen, SRSRC s[8:11]) but WITH a resource table mapping s[8:11] -> binding 3. The load must
+    // route to binding 3 (cbuf1), not the old hardcoded binding 2 — binding 2 (cbuf0) is bound with
+    // DECOY values, so any binding-2 read fails the value check.
+    const uint32_t code66[] = {
+        0x7e000f00u, 0x34000082u, 0xe0301000u, 0x80020000u, 0x7e000d00u, 0xbf810000u,
+    };
+    ShaderResourceTable rt66;
+    { ShaderResource rb{}; rb.cls = ResourceClass::ConstantBuffer; rb.format = DataFormat::Float32;
+      rb.num_components = 1; rb.binding = 3; rb.stride = 0; rb.sgpr_base = 8; rt66.resources.push_back(rb); }
+    std::vector<uint32_t> spv66 = recompile_valu(code66, sizeof(code66)/sizeof(code66[0]), 1, 0, &rt66);
+    CHECK(!spv66.empty(), "recompiled kernel 66 (raw buffer_load_dword, SRSRC via table -> binding 3) -> SPIR-V");
+    std::vector<float> in66(N); std::vector<uint32_t> decoy66(N, 0xDEADu), buf66(N);
+    for (uint32_t i = 0; i < N; i++) { in66[i] = (float)i; buf66[i] = 500u + i; }
+    std::vector<float> got66 = prosper::test::run_compute(spv66, in66, N, N, /*binding2=decoy*/decoy66, /*binding3*/buf66);
+    uint32_t bad66 = 0; for (uint32_t i=0;i<N&&got66.size()==N;i++) if (std::fabs(got66[i]-(float)(500u+i))>1e-3f) bad66++;
+    printf("  kernel66 mismatches=%u (out[7]=%g expect=507)\n", bad66, got66.size()==N?got66[7]:-1);
+    CHECK(got66.size()==N && bad66==0, "recompiled kernel 66 (raw load resolves SRSRC -> binding 3, not binding 2) correct");
+
+    // Kernel 67: RAW MUBUF UNRESOLVABLE SRSRC -> REJECT (#91). Same code, but the table's only
+    // resource lives at sgpr_base 4 — SRSRC s[8:11] resolves to nothing. With a table present the
+    // recompiler must reject (empty SPIR-V), never silently fall back to binding 2.
+    ShaderResourceTable rt67;
+    { ShaderResource rb{}; rb.cls = ResourceClass::ConstantBuffer; rb.format = DataFormat::Float32;
+      rb.num_components = 1; rb.binding = 3; rb.stride = 0; rb.sgpr_base = 4; rt67.resources.push_back(rb); }
+    std::vector<uint32_t> spv67 = recompile_valu(code66, sizeof(code66)/sizeof(code66[0]), 1, 0, &rt67);
+    CHECK(spv67.empty(), "kernel 67 (raw MUBUF, table present, SRSRC unresolvable) REJECTED (no binding-2 fallback)");
+
+    // Kernel 68: RAW MUBUF STORE via the table (#91 store side). v2=(uint)gid; v3=2*float(gid);
+    // buffer_store_dword v3, v2, s[8:11] idxen (op 0x1C) -> table maps s[8:11] to binding 3, stride 4
+    // => buf[gid] = bits(2*gid). The old code stored these into binding 2, corrupting the wrong buffer.
+    const uint32_t code68[] = { 0x7e040f00u, 0x06060100u, 0xe0702000u, 0x80020302u, 0xbf810000u };
+    ShaderResourceTable rt68;
+    { ShaderResource rb{}; rb.cls = ResourceClass::ConstantBuffer; rb.format = DataFormat::Float32;
+      rb.num_components = 1; rb.binding = 3; rb.stride = 4; rb.sgpr_base = 8; rt68.resources.push_back(rb); }
+    std::vector<uint32_t> spv68 = recompile_valu(code68, sizeof(code68)/sizeof(code68[0]), 1, 0, &rt68);
+    CHECK(!spv68.empty(), "recompiled kernel 68 (raw buffer_store_dword, SRSRC via table -> binding 3) -> SPIR-V");
+    std::vector<float> in68(N); for (uint32_t i = 0; i < N; i++) in68[i] = (float)i;
+    std::vector<uint32_t> stored68(N, 0), stored68_out;
+    prosper::test::run_compute(spv68, in68, N, N, /*binding2*/{}, /*binding3=store target*/stored68, &stored68_out);
+    uint32_t bad68 = 0;
+    for (uint32_t i = 0; i < N && stored68_out.size() == N; i++) {
+        float f; std::memcpy(&f, &stored68_out[i], 4);
+        if (std::fabs(f - 2.0f*(float)i) > 1e-3f) bad68++;
+    }
+    { float f6 = 0; if (stored68_out.size()==N) std::memcpy(&f6, &stored68_out[6], 4);
+      printf("  kernel68 mismatches=%u (buf[6]=%g expect=12)\n", bad68, f6); }
+    CHECK(stored68_out.size() == N && bad68 == 0, "recompiled kernel 68 (raw store routes to binding 3 via SRSRC) correct");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
