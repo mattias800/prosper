@@ -407,9 +407,13 @@ int main(int argc, char** argv) {
                     bd.vcount = refvs ? 3u : it.vertex_count;
                     bd.ps     = nops ? nullptr : &it.ps;
                     bd.R      = build_R(it.vrt.get(), it.prt.get());
+                    // Indexed draw: hand the executor-fetched index data to the backend (vkCmdDrawIndexed).
+                    // Skipped under REFVS — the reference VS is a 3-vertex non-indexed fullscreen triangle.
+                    if (!refvs) bd.indices = it.indices;
                     if (getenv("PROSPER_GFXLOG")) fprintf(stderr,
-                        "[render] item %zu: %zu resources vcount=%u topo=%u mask=0x%x blend=%d\n",
-                        bds.size(), bd.R.size(), bd.vcount, it.ps.topology, it.ps.color_write_mask, (int)it.ps.blend_enable);
+                        "[render] item %zu: %zu resources vcount=%u nidx=%zu topo=%u mask=0x%x blend=%d\n",
+                        bds.size(), bd.R.size(), bd.vcount, bd.indices.size(), it.ps.topology,
+                        it.ps.color_write_mask, (int)it.ps.blend_enable);
                     bds.push_back(std::move(bd));
                 }
                 std::vector<uint8_t> px = prosper::test::render_draws_rgba(bds, w, h);

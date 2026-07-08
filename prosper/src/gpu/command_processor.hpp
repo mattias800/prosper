@@ -34,8 +34,8 @@ struct GpuState {
     // Indexed draws (sceAgcDcbDrawIndex): `indexed` is set only when the packet carried the full
     // operand set; `index_addr` is the guest address of the index buffer (1:1-mapped, so directly
     // readable) and `modifier` the raw 64-bit draw-modifier bits. The index ELEMENT SIZE lives in the
-    // draw's register snapshot (`state->index_type`, from the preceding SetIndexType). The current
-    // executor does not consume the index buffer yet (renders these like DrawIndexAuto) — issue #64.
+    // draw's register snapshot (`state->index_type`, from the preceding SetIndexType; 0 = 16-bit,
+    // 1 = 32-bit). The executor fetches the index data and renders with vkCmdDrawIndexed (#64).
     struct Draw {
         uint32_t index_count;
         std::shared_ptr<const GpuState> state;

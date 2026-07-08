@@ -74,7 +74,8 @@ letterbox appears even before the island/text draw correctly.
   (+ `PROSPER_RENDER_FIRST=140` to skip to the post-loading phase).
 - `PROSPER_DRAWLOG` (per-draw counts), `PROSPER_SHADER_DUMP=<dir>` (`frame_vs.spv`/`frame_fs.spv` +
   `exec_*_*.bin` for *failed* recompiles), `PROSPER_DUMP_TEX` (bound textures → BMP),
-  `PROSPER_FORCE_COLORWRITE`, `PROSPER_VCOUNT`/`PROSPER_TOPO` overrides.
+  `PROSPER_FORCE_COLORWRITE`. (`PROSPER_VCOUNT`/`PROSPER_TOPO` overrides and the quad-fan topology
+  heuristic were removed with real indexed-draw support, issue #64.)
 - **Disassemble PS5 shaders with `llvm-mc -mcpu=gfx1010`, NOT gfx1030** — the PS5 keeps RDNA1-era encodings
   (e.g. `v_mac_f32` at VOP2 op 0x1f, invalid on gfx1030). See PR #58.
 - Frames are BMP; read via PIL→PNG (`ImageFile.LOAD_TRUNCATED_IMAGES=True` for `safe_copy`-truncated tails).

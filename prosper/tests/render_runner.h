@@ -85,6 +85,11 @@ struct BackendDraw {
     const prosper::gpu::ResolvedPipelineState* ps = nullptr;   // null -> triangle-list, write RGBA, no depth
     std::vector<FrameResource> R;                              // set-tagged resources (empty -> no descriptors)
     uint32_t vcount = 3;
+    // Indexed draw: 32-bit index data (the executor widens guest 16-bit indices). Non-empty -> the draw
+    // is recorded as vkCmdBindIndexBuffer + vkCmdDrawIndexed(indices.size()), so gl_VertexIndex is the
+    // fetched index — exactly what the recompiled VS's storage-buffer vertex fetch expects. Empty ->
+    // plain vkCmdDraw(vcount).
+    std::vector<uint32_t> indices;
 };
 
 inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& draws, uint32_t W, uint32_t H) {
@@ -193,7 +198,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         std::vector<VkBuffer> sbuf, tstage; std::vector<VkDeviceMemory> sbmem, tmem, tstagemem;
         std::vector<VkImage> timg; std::vector<VkImageView> tview; std::vector<VkSampler> tsamp;
         VkPipelineLayout layout = VK_NULL_HANDLE; VkPipeline pipe = VK_NULL_HANDLE;
-        uint32_t n_sets = 1, vcount = 3; bool use_desc = false, ok = false;
+        VkBuffer ibuf = VK_NULL_HANDLE; VkDeviceMemory ibmem = VK_NULL_HANDLE;   // index buffer (indexed draws)
+        uint32_t n_sets = 1, vcount = 3, icount = 0; bool use_desc = false, ok = false;
     };
     std::vector<DV> dv(draws.size());
     // Pass 1: create each draw's shader modules, descriptors (with texture staging upload), and pipeline.
@@ -204,6 +210,21 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         if (!v.vs || !v.fs) continue;   // rejected SPIR-V -> skip this draw
         const prosper::gpu::ResolvedPipelineState* ps = bd.ps;
         v.vcount = bd.vcount;
+        // Indexed draw: upload the 32-bit index data to a host-visible VkIndexBuffer now; the record
+        // pass binds it and issues vkCmdDrawIndexed instead of vkCmdDraw.
+        if (!bd.indices.empty()) {
+            VkDeviceSize isz = (VkDeviceSize)bd.indices.size() * 4;
+            VkBufferCreateInfo ibci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            ibci.size = isz; ibci.usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+            vkCreateBuffer(dev, &ibci, nullptr, &v.ibuf);
+            VkMemoryRequirements imr; vkGetBufferMemoryRequirements(dev, v.ibuf, &imr);
+            VkMemoryAllocateInfo imai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; imai.allocationSize = imr.size;
+            imai.memoryTypeIndex = pick(imr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            vkAllocateMemory(dev, &imai, nullptr, &v.ibmem); vkBindBufferMemory(dev, v.ibuf, v.ibmem, 0);
+            void* ip = nullptr; vkMapMemory(dev, v.ibmem, 0, isz, 0, &ip);
+            std::memcpy(ip, bd.indices.data(), (size_t)isz); vkUnmapMemory(dev, v.ibmem);
+            v.icount = (uint32_t)bd.indices.size();
+        }
         VkPipelineShaderStageCreateInfo st[2]{};
         st[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}; st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = v.vs; st[0].pName = "main";
         st[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}; st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = v.fs; st[1].pName = "main";
@@ -376,7 +397,12 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         if (!v.ok) continue;
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v.pipe);
         if (v.use_desc) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v.layout, 0, v.n_sets, v.dsets.data(), 0, nullptr);
-        vkCmdDraw(cmd, v.vcount, 1, 0, 0);
+        if (v.icount) {
+            vkCmdBindIndexBuffer(cmd, v.ibuf, 0, VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexed(cmd, v.icount, 1, 0, 0, 0);
+        } else {
+            vkCmdDraw(cmd, v.vcount, 1, 0, 0);
+        }
     }
     vkCmdEndRenderPass(cmd);
     VkBufferImageCopy cp{}; cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; cp.imageExtent = {W, H, 1};
@@ -395,6 +421,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     for (auto& v : dv) {   // per-draw objects
         if (v.pipe)   vkDestroyPipeline(dev, v.pipe, nullptr);
         if (v.layout) vkDestroyPipelineLayout(dev, v.layout, nullptr);
+        if (v.ibuf)   vkDestroyBuffer(dev, v.ibuf, nullptr);
+        if (v.ibmem)  vkFreeMemory(dev, v.ibmem, nullptr);
         if (v.vs)     vkDestroyShaderModule(dev, v.vs, nullptr);
         if (v.fs)     vkDestroyShaderModule(dev, v.fs, nullptr);
         if (v.dpool)  vkDestroyDescriptorPool(dev, v.dpool, nullptr);

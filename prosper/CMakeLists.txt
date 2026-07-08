@@ -306,6 +306,12 @@ if(TARGET prosper_core)
       target_link_libraries(test_multidraw_render PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME multidraw_render COMMAND test_multidraw_render)
 
+      # Indexed draws (#64): vkCmdDrawIndexed from a BackendDraw's index data — the [0,1,2,2,3,0] quad
+      # must match the retired perimeter-fan rendering pixel-exact, and indices must really be applied.
+      add_executable(test_indexed_render tests/test_indexed_render.cpp)
+      target_link_libraries(test_indexed_render PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME indexed_render COMMAND test_indexed_render)
+
       # Storage images: a recompiled compute kernel does MIMG image_load->image_store (no sampler) to
       # copy a 1D storage image bit-exact (the game's blit/copy compute-shader class).
       add_executable(test_storage_image_copy tests/test_storage_image_copy.cpp)

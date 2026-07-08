@@ -73,6 +73,47 @@ int main() {
     GpuState empty; empty.draws.clear();
     CHECK(execute_gpustate(empty, backend).empty(), "a draw-less GpuState renders no frame (state-only submit)");
 
+    // --- Indexed draws through the executor (issue #64) -------------------------------------------------
+    // realize_draw_item fetches a REAL 16-bit guest index buffer (index_type 0, the SetIndexType reset
+    // default this title relies on) and the backend renders it with vkCmdDrawIndexed — gl_VertexIndex is
+    // then the FETCHED index. kVs computes the fullscreen triangle from gl_VertexIndex, so indices
+    // {0,1,2} reproduce the non-indexed green frame exactly, while degenerate indices {0,0,0} collapse
+    // the triangle and leave the frame blue (clear) — proving the index data actually drives the draw.
+    auto backend_idx = [&](const std::vector<DrawItem>& items) -> std::vector<uint8_t> {
+        if (items.empty()) return {};
+        prosper::test::BackendDraw d;
+        d.vs = items[0].vs; d.fs = items[0].fs; d.ps = &items[0].ps;
+        d.vcount = items[0].vertex_count; d.indices = items[0].indices;
+        return prosper::test::render_draws_rgba({std::move(d)}, W, H);
+    };
+    static const uint16_t kIdx012[3] = {0, 1, 2};
+    static const uint16_t kIdx000[3] = {0, 0, 0};
+    GpuState sti = st;
+    sti.index_type = 0;   // 16-bit
+    auto set_indexed = [&](const uint16_t* idx, uint32_t n) {
+        GpuState::Draw d; d.index_count = n; d.indexed = true;
+        d.index_addr = (uint64_t)(uintptr_t)idx;
+        sti.draws.clear(); sti.draws.push_back(d);
+    };
+    set_indexed(kIdx012, 3);
+    std::vector<uint8_t> pxi = execute_gpustate(sti, backend_idx);
+    CHECK(pxi.size() == px.size() && pxi == px,
+          "16-bit indexed draw {0,1,2} renders the SAME green frame as the non-indexed triangle");
+    set_indexed(kIdx000, 3);
+    std::vector<uint8_t> pxz = execute_gpustate(sti, backend_idx);
+    bool all_blue = pxz.size() == (size_t)W * H * 4;
+    if (all_blue) for (uint32_t y : {0u, H/2, H-1}) for (uint32_t x : {0u, W/2, W-1}) {
+        const uint8_t* p = &pxz[((size_t)y*W+x)*4];
+        if (!(p[2] > 0x80 && p[0] < 0x40 && p[1] < 0x40)) all_blue = false;
+    }
+    CHECK(all_blue, "degenerate indices {0,0,0} collapse the triangle (frame stays clear-blue)");
+    // Unknown index element size -> loud fallback to a NON-indexed draw of the hint count (never
+    // misread the buffer): with kVs that is the plain fullscreen triangle again.
+    set_indexed(kIdx012, 3);
+    sti.index_type = 7;   // no such encoding (0=16-bit, 1=32-bit)
+    std::vector<uint8_t> pxu = execute_gpustate(sti, backend_idx);
+    CHECK(pxu == px, "unknown index_type falls back to a non-indexed draw of the hint count");
+
     // The live-submit registry path — exactly what agc_driver_submit_dcb drives once a device is wired.
     CHECK(!have_submit_renderer(), "no live renderer registered by default (game path stays inert)");
     CHECK(!execute_and_present(st, W, H), "execute_and_present is a no-op with no renderer registered");

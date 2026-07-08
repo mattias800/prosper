@@ -35,6 +35,11 @@ struct DrawItem {
     ResolvedPipelineState ps;                         // THIS draw's fixed-function state
     std::shared_ptr<ShaderResourceTable> vrt, prt;    // may be null
     uint32_t vertex_count = 3;
+    // Indexed draw (sceAgcDcbDrawIndex): the guest index buffer, fetched from 1:1-mapped memory and
+    // widened to 32-bit. Non-empty -> the backend must render with vkCmdDrawIndexed (gl_VertexIndex
+    // then IS the fetched index, which the recompiled VS uses for its storage-buffer vertex fetch);
+    // empty -> plain vkCmdDraw(vertex_count).
+    std::vector<uint32_t> indices;
 };
 
 // The pluggable Vulkan backend: render the submit's draw items into one image and return W*H*4 RGBA8
@@ -53,13 +58,24 @@ bool guest_readable(uint64_t addr, uint32_t bytes);
 // or no resources. Implemented in gpu_executor.cpp (needs the AGC registry + descriptor decode).
 std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps);
 
+// Byte size of one index element for a GpuState::index_type (the last SetIndexType value).
+// 0 -> 16-bit, 1 -> 32-bit, exactly Kyty's index_type_and_size switch (GraphicsRender.cpp:4724) and
+// the hardware VGT_INDEX_TYPE encoding; 0 is also the reset default, matching this title, which never
+// emits SetIndexType yet packs its quad index streams 12 bytes apart (6 x 2-byte indices) — live
+// capture confirms 16-bit. CONFIDENCE: HIGH for 0/1; any other value is unseen -> returns 0 and the
+// caller falls back to a non-indexed draw (loudly), rather than mis-reading the buffer.
+inline uint32_t index_elem_bytes(uint32_t index_type) {
+    return index_type == 0 ? 2u : index_type == 1 ? 4u : 0u;
+}
+
 // Realize ONE draw of `ds` (a register snapshot or the folded state) into a DrawItem: recompile the
-// VS+PS, resolve fixed-function state, apply the fullscreen-quad fan heuristic + env overrides. Returns
-// false (and leaves `out` untouched) if the draw is a no-op (no PGM bound, recompile failed, or
-// color_write_mask==0). Shared by the default (folded-state, one item) and PROSPER_PERDRAW (per-draw)
-// paths so their per-draw handling is identical.
-inline bool realize_draw_item(const GpuState& ds, uint32_t vcount_hint, uint32_t max_shader_dwords,
-                              bool log, DrawItem& out) {
+// VS+PS, resolve fixed-function state, and — for an indexed draw — fetch the guest index buffer.
+// `draw` is the PM4 draw record (index count + indexed/index_addr); null means "no record" (hand-built
+// states) and renders vcount_hint vertices non-indexed. Returns false (and leaves `out` untouched) if
+// the draw is a no-op (no PGM bound, recompile failed, or color_write_mask==0). Shared by the default
+// (folded-state, one item) and PROSPER_PERDRAW (per-draw) paths so their per-draw handling is identical.
+inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcount_hint,
+                              uint32_t max_shader_dwords, bool log, DrawItem& out) {
     RenderState rs = extract_render_state(ds);
     if (!rs.es_addr || !rs.ps_addr) {
         if (log) fprintf(stderr, "[exec] skip draw: no PGM bound (es=0x%llx ps=0x%llx)\n",
@@ -100,38 +116,66 @@ inline bool realize_draw_item(const GpuState& ds, uint32_t vcount_hint, uint32_t
     // depth-only pass), rendering them reveals whether they are the cutscene content.
     if (ps.color_write_mask == 0) ps.color_write_mask = 0xf;
     uint32_t vertex_count = vcount_hint ? vcount_hint : 3u;
-    // Real vertex count: the draw's index_count (vcount_hint) is often a low/stale value for these NGG draws
-    // (folding uses draws[0]'s count), so rendering it paints only a degenerate sliver of the mesh (4 of ~20
-    // verts -> nothing on screen). The bound vertex buffer's entry count (size/stride) is the true per-vertex
-    // record count; use the largest bound VB's entry count when it exceeds the hint so the whole mesh renders.
-    // (A shader fetching past a real vertex reads 0 under robustBufferAccess -> a degenerate, clipped vertex,
-    // so a slightly-generous count is harmless; a too-small count drops geometry.)
+    // The bound vertex buffer's record count (size/stride) — bounds an indexed draw's vertex range, and
+    // for a NON-indexed draw is often the truer count: a draw record's index_count can be a low/stale
+    // value for these NGG draws (4 of ~20 verts -> a degenerate sliver), while the VB's record count is
+    // the whole mesh. A shader fetching past a real vertex reads 0 under robustBufferAccess -> a
+    // degenerate, clipped vertex, so a slightly-generous count is harmless.
     uint32_t vb_entries = 0;
     if (vrt) for (const auto& r : vrt->resources)
         if (r.cls == ResourceClass::VertexBuffer && r.stride)
             vb_entries = std::max(vb_entries, r.size / r.stride);
     if (vb_entries > 65536u) vb_entries = 65536u;   // sanity cap: don't stall llvmpipe on an over-sized VB
-    if (vb_entries > vertex_count) vertex_count = vb_entries;
-    // Fullscreen-composite quad fill: a 4-corner quad buffer tiles into two triangles; render its corners as
-    // a triangle FAN (perimeter order BL,TL,TR,BR -> tris {0,1,2}, {0,2,3}). Only for a 4-record buffer.
-    if (vb_entries == 4) ps.topology = 5 /*VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN*/;
-    if (const char* vc = getenv("PROSPER_VCOUNT")) { int v = atoi(vc); if (v > 0) vertex_count = (uint32_t)v; }
-    if (const char* tp = getenv("PROSPER_TOPO")) { int t = atoi(tp); if (t >= 0) ps.topology = (uint32_t)t; }
+    // Indexed draw (sceAgcDcbDrawIndex): fetch the real index data from guest memory (1:1-mapped) and
+    // hand it to the backend, which renders it with vkCmdDrawIndexed. This replaced the old "4-record
+    // VB -> TRIANGLE_FAN" heuristic (issue #64): the sprite quads that heuristic guessed at are in fact
+    // DrawIndex packets with a 6-entry index list ([0,1,2, 2,3,0]-style two-triangle quads), so the
+    // real indices + the real decoded VGT_PRIMITIVE_TYPE topology render every 4-vertex mesh correctly,
+    // whatever its vertex order. Unknown element size or an unreadable buffer falls back (loudly) to a
+    // non-indexed draw of the hint count instead of reading garbage.
+    static constexpr uint32_t kMaxIndices = 1u << 20;   // sanity cap (largest seen live: 0x61e)
+    if (draw && draw->indexed && draw->index_addr && draw->index_count) {
+        const uint32_t esz = index_elem_bytes(ds.index_type);
+        uint32_t n = std::min(draw->index_count, kMaxIndices);
+        if (esz == 0) {
+            if (log) fprintf(stderr, "[exec] indexed draw: UNKNOWN index_type=%u — falling back to non-indexed\n",
+                             ds.index_type);
+        } else if (!guest_readable(draw->index_addr, n * esz)) {
+            if (log) fprintf(stderr, "[exec] indexed draw: index buffer 0x%llx (%u x %uB) unreadable — "
+                             "falling back to non-indexed\n",
+                             (unsigned long long)draw->index_addr, n, esz);
+        } else {
+            out.indices.resize(n);
+            uint32_t max_index = 0;
+            if (esz == 2) {
+                const uint16_t* src = (const uint16_t*)(uintptr_t)draw->index_addr;
+                for (uint32_t i = 0; i < n; i++) { out.indices[i] = src[i]; max_index = std::max(max_index, out.indices[i]); }
+            } else {
+                const uint32_t* src = (const uint32_t*)(uintptr_t)draw->index_addr;
+                for (uint32_t i = 0; i < n; i++) { out.indices[i] = src[i]; max_index = std::max(max_index, out.indices[i]); }
+            }
+            // Vertex count = the indexed range (max index + 1), bounded by the bound VB's record count
+            // (an index past the VB reads 0 under robustBufferAccess — same degenerate-vertex fallback).
+            vertex_count = max_index + 1;
+            if (vb_entries && vertex_count > vb_entries) vertex_count = vb_entries;
+        }
+    }
+    if (out.indices.empty() && vb_entries > vertex_count) vertex_count = vb_entries;
     out.vs = std::move(vs); out.fs = std::move(fs); out.ps = ps;
     out.vrt = std::move(vrt); out.prt = std::move(prt); out.vertex_count = vertex_count;
     return true;
 }
 
 // Recompile + resolve a GpuState's draws and render them via `render`. Default: ONE item from the folded
-// end state (the fullscreen-quad fan fills the current title composite). PROSPER_PERDRAW=1: ONE item per
-// draw, each realized from ITS OWN register snapshot (Draw::state), so per-draw masks/blends/shaders
-// composite correctly — the path for multi-geometry scenes (opt-in until the AGC context-log section
-// semantics that stage duplicate register writes are fully RE'd; see docs/REAL_FRAMES_FINDINGS.md).
+// end state, realized as the submit's LAST draw — the folded register file IS the state at the last
+// draw, so that is the one draw record (count + index buffer) coherent with it. (The pre-#64 code paired
+// the end state with draws[0]'s count instead, and needed a "4-record VB -> TRIANGLE_FAN" heuristic to
+// paper over the mismatch; the title composite is in fact the submit's last draw, a 6-index DrawIndex
+// quad, which now renders through the real indexed path.) PROSPER_PERDRAW=1: ONE item per draw, each
+// realized from ITS OWN register snapshot (Draw::state), so per-draw masks/blends/shaders composite
+// correctly — the path for multi-geometry scenes (opt-in until the AGC context-log section semantics
+// that stage duplicate register writes are fully RE'd; see docs/REAL_FRAMES_FINDINGS.md).
 // `max_shader_dwords` bounds the recompiler's walk (it stops at S_ENDPGM).
-// Indexed draws (Draw::indexed, from sceAgcDcbDrawIndex): the index buffer (Draw::index_addr +
-// the snapshot's index_type) is carried on the draw record but NOT consumed yet — these render
-// exactly like a DrawIndexAuto with the same count (the fan heuristic above included). Wiring the
-// index buffer into vertex fetch (and retiring the quad-fan hack) is issue #64.
 inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn& render,
                                              uint32_t max_shader_dwords = 0x10000) {
     if (st.draws.empty() || !render) return {};              // nothing to render (e.g. a state-only submit)
@@ -141,21 +185,24 @@ inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn&
     if (perdraw) {
         for (size_t i = 0; i < st.draws.size(); i++) {
             DrawItem it;
-            if (realize_draw_item(st.state_at_draw(i), st.draws[i].index_count, max_shader_dwords, log, it))
+            if (realize_draw_item(st.state_at_draw(i), &st.draws[i], st.draws[i].index_count,
+                                  max_shader_dwords, log, it))
                 items.push_back(std::move(it));
         }
     } else {
-        // Default: render the submit's composite from the folded end state as a single item (the fan
-        // heuristic fills the fullscreen quad). Preserves the merged single-draw behavior exactly.
+        // Default: render the submit's last draw from the folded end state as a single item.
         DrawItem it;
-        uint32_t vcount = st.draws.empty() ? 3u : st.draws[0].index_count;
-        if (realize_draw_item(st, vcount, max_shader_dwords, log, it)) items.push_back(std::move(it));
+        const GpuState::Draw& last = st.draws.back();
+        if (realize_draw_item(st, &last, last.index_count, max_shader_dwords, log, it))
+            items.push_back(std::move(it));
     }
     if (getenv("PROSPER_DRAWLOG")) { fprintf(stderr, "[exec] draws=%zu perdraw=%d -> %zu item(s): raw index_counts=[",
         st.draws.size(), (int)perdraw, items.size());
-        for (size_t i = 0; i < st.draws.size(); i++) fprintf(stderr, "%s%u", i?",":"", st.draws[i].index_count);
+        for (size_t i = 0; i < st.draws.size(); i++) fprintf(stderr, "%s%u%s", i?",":"", st.draws[i].index_count,
+                                                             st.draws[i].indexed ? "i" : "");
         fprintf(stderr, "] items:");
-        for (auto& it : items) fprintf(stderr, " (vcount=%u topo=%u mask=0x%x)", it.vertex_count, it.ps.topology, it.ps.color_write_mask);
+        for (auto& it : items) fprintf(stderr, " (vcount=%u nidx=%zu topo=%u mask=0x%x)",
+                                       it.vertex_count, it.indices.size(), it.ps.topology, it.ps.color_write_mask);
         fprintf(stderr, "\n"); fflush(stderr); }
     if (items.empty()) return {};
     if (log) fprintf(stderr, "[exec] rendering %zu draw item(s) (of %zu draws)\n", items.size(), st.draws.size());
