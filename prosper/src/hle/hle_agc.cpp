@@ -36,7 +36,7 @@ constexpr uint32_t IT_NOP = 0x10, IT_INDEX_TYPE = 0x2A, IT_EVENT_WRITE = 0x46, I
 constexpr uint32_t R_DRAW_INDEX = 0x03, R_DRAW_INDEX_AUTO = 0x04, R_DRAW_RESET = 0x05, R_WAIT_FLIP_DONE = 0x06,
                    R_SH_REGS_INDIRECT = 0x11, R_CX_REGS_INDIRECT = 0x12, R_UC_REGS_INDIRECT = 0x13,
                    R_ACQUIRE_MEM = 0x14, R_WRITE_DATA = 0x15, R_WAIT_MEM_64 = 0x16, R_FLIP = 0x17,
-                   R_RELEASE_MEM = 0x18;
+                   R_RELEASE_MEM = 0x18, R_DMA_DATA = 0x19;
 constexpr uint32_t R_NUM = 0x40;
 inline uint32_t PM4(uint32_t len, uint32_t op, uint32_t r) {
     return 0xC0000000u | (((len - 2u) & 0x3fffu) << 16u) | ((op & 0xffu) << 8u) | ((r & (R_NUM - 1u)) << 2u);
@@ -141,6 +141,25 @@ HLE(agc_dcb_draw_index) {
 // no game-visible state; on a devkit it just gives the system a safe suspend opportunity.
 // Returning 0 (OK) is the full contract for us — registered so it stops logging as unimplemented.
 HLE(agc_suspend_point) { return 0; }
+
+// --- #117 experiment: real appenders for the CreateWorkload Dcb builders. -----------------------
+// sceAgcCbNop (LtTouSCZjHM) — append a1 padding dwords as a single NOP packet; return its pointer.
+HLE(agc_cb_nop) {  // (dcb, num_dwords, ...)
+    uint32_t num = (uint32_t)a1; if (!a0 || !num) return 0;
+    uint32_t* cmd; if (!begin_packet(a0, num, IT_NOP, 0, &cmd)) return 0;
+    for (uint32_t i = 1; i < num; i++) cmd[i] = 0;
+    return (uint64_t)(uintptr_t)cmd;
+}
+// sceAgcDcbDmaData (WmAc2MEj6Io) — append a DMA_DATA packet; observed args (live capture): a4 = src
+// address, a5 = size in dwords, a1 = dst (0 here, patched later via DmaDataPatchSetDstAddressOrOffset).
+// Custom R_DMA_DATA payload: [1..2]=dst lo/hi, [3..4]=src lo/hi, [5]=size_dw, [6]=flags. Return ptr.
+HLE(agc_dcb_dma_data) {  // (dcb, dst, cache_policy, flags, src, size_dw)
+    uint32_t* cmd; if (!begin_packet(a0, 7, IT_NOP, R_DMA_DATA, &cmd)) return 0;
+    cmd[1] = (uint32_t)(a1 & 0xffffffffu); cmd[2] = (uint32_t)(a1 >> 32u);
+    cmd[3] = (uint32_t)(a4 & 0xffffffffu); cmd[4] = (uint32_t)(a4 >> 32u);
+    cmd[5] = (uint32_t)a5; cmd[6] = (uint32_t)a3;
+    return (uint64_t)(uintptr_t)cmd;
+}
 HLE(agc_dcb_event_write) {  // (buf, event_type, address)
     uint32_t* cmd; if (!begin_packet(a0, 2, IT_EVENT_WRITE, 0, &cmd)) return 0;
     cmd[1] = (uint32_t)(a1 & 0xffu); return (uint64_t)(uintptr_t)cmd;
@@ -703,6 +722,8 @@ void register_agc_hle() {
     RN("vcmNN+AAXnY", agc_patch_set_address);   RN("d-6uF9sZDIU", agc_patch_add_registers);   // Cx
     RN("Qrj4c+61z4A", agc_patch_set_address);   RN("z2duB-hHQSM", agc_patch_add_registers);   // Sh
     RN("6lNcCp+fxi4", agc_patch_set_address);   RN("vRoArM9zaIk", agc_patch_add_registers);   // Uc
+    RN("LtTouSCZjHM", agc_cb_nop);              // sceAgcCbNop — append padding dwords (#117)
+    RN("WmAc2MEj6Io", agc_dcb_dma_data);        // sceAgcDcbDmaData — append DMA_DATA packet (#117)
     RN("YUeqkyT7mEQ", agc_dcb_set_flip);        // sceAgcDcbSetFlip (Kyty LibGraphicsDriver.cpp:98)
     RN("UglJIZjGssM", agc_driver_submit_dcb);   // sceAgcDriverSubmitDcb -> CommandProcessor replay
     #undef RN
