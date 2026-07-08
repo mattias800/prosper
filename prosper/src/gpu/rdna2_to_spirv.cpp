@@ -1531,8 +1531,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 vreg[in.dst.value] = fresult(b.fext2(Glsl_FMin, fv(0), fv(1)));
             } else if (in.opcode == 0x110) {                          // v_max_f32 (VOP3 form)
                 vreg[in.dst.value] = fresult(b.fext2(Glsl_FMax, fv(0), fv(1)));
-            } else if (in.opcode == 0x107) {                          // v_mul_legacy_f32 ~= s0*s1
-                vreg[in.dst.value] = fresult(b.fbin(Op_FMul, fv(0), fv(1)));
+            } else if (in.opcode == 0x107) {                          // v_mul_legacy_f32: DX9 multiply —
+                // 0 * x == 0 for ALL x including ±Inf/NaN (that guarantee is WHY compilers emit it,
+                // e.g. attenuation=0 times 1/dist). Plain IEEE FMul gives NaN for 0*Inf, so emit
+                // select(s0==0 || s1==0, 0, s0*s1). ±0.0 both compare equal to 0.0 under FOrdEqual.
+                uint32_t s0b = fv(0), s1b = fv(1), zb = b.uconst(0);
+                uint32_t anyz = b.lor(b.fcmp(Op_FOrdEqual, s0b, zb), b.fcmp(Op_FOrdEqual, s1b, zb));
+                vreg[in.dst.value] = fresult(b.sel(anyz, zb, b.fbin(Op_FMul, s0b, s1b)));
             } else if (in.opcode == 0x101) {                          // v_cndmask_b32_e64: src2_mask ? src1 : src0
                 const Operand& s2 = in.src[2]; uint32_t m = 0;        // src2 is an SGPR-pair (or VCC) wave mask
                 if (s2.value == 106 || s2.value == 107) m = rs.vcc;
