@@ -967,7 +967,8 @@ regression test in `test_command_processor`). This was a general register-fideli
 
 **Result:** the `[restab]` descriptors are now real —
 - VS: 4 constant buffers with real bases + `stride=16` (UnityPerDraw/PerFrame/etc.).
-- PS: 1 constant buffer + a **1920×1080** sampled texture (`fmt=9`) — the real full-screen render target
+- PS: 1 constant buffer + a **1920×1080** sampled texture (`fmt=56`, 8_8_8_8_UNORM; this note originally
+  said `fmt=9` — a misread of `type=9`, corrected while fixing #65) — the real full-screen render target
   the draw composites, not the old 1×1.
 Also: read 32 user SGPRs (not 16) since NGG merged shaders use the extended `s16..s31` block; added
 plausibility guards so a non-descriptor SGPR can't emit a garbage V#/T# binding.
