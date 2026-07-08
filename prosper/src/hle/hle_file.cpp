@@ -12,6 +12,7 @@
 #include <cerrno>
 #include <string>
 #include <mutex>
+#include <map>
 #include <vector>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -505,41 +506,85 @@ extern uint64_t g_apr_last_cb, g_apr_last_cb_size;
 extern "C" int prosper_reserved_range_state(uint64_t addr);
 
 #ifndef _WIN32
-// MUST NOT be `__thread` (issue #89). An initial-exec thread-local here (`%fs:...@tpoff`) grows the
-// HOST binary's static TLS block, and prosper's guest boot aliases the host TCB through %fs (the
-// guest runs on the host %fs in the non-GUEST_FS boot; the fault-recovery point was moved off
-// `__thread` to gettid-keyed globals for exactly this reason). Adding one static-TLS slot shifted
-// the layout enough to crash The Messenger's minimal boot before graphics init ~9 runs in 10 — a
-// clean bisect to 653cf6f. A plain global is captured on the SAME thread that immediately reads it
-// (the entry shim tail-jumps straight into the handler, which reads apr_stack_arg() first thing),
-// so it is correct as long as APR reads don't overlap across threads — they don't in practice: the
-// engine builds each sceAmprAprCommandBufferReadFile into its single Ampr command buffer and our
-// completion is synchronous. CONFIDENCE: HIGH on the fix (boot restored to 10/10); MED on the
-// serialized-APR assumption — if concurrent APR reads ever appear, key this by gettid (still NOT
-// __thread) rather than reintroducing static TLS.
-extern "C" uint64_t g_apr_entry_rsp;
-uint64_t g_apr_entry_rsp = 0;
+// The entry shim passes its %rsp to the C handler as a SEVENTH argument (on the stack, per SysV).
+// History: this was a plain global (`g_apr_entry_rsp`) — NOT `__thread`, because an initial-exec
+// TLS slot grows the HOST binary's static TLS block and prosper's non-GUEST_FS boot aliases the
+// host TCB through %fs (issue #89: one static-TLS slot crashed The Messenger's minimal boot 9/10).
+// The global relied on APR reads never overlapping across threads. With APR completion EVENTS
+// delivered (issue #115) the engine's loader/precacher threads DO submit concurrently, and a
+// cross-thread overwrite makes the handler read arg7 (the FILE OFFSET) from another thread's
+// frame — wrong-offset reads served as "OK" corrupt whatever the engine parses. Passing rsp as a
+// real argument is race-free with no TLS. Alignment: at shim entry rsp%16==8; the single push
+// re-aligns for the call and lands the 7th arg at the callee's [rsp+8], exactly where SysV wants
+// it. CONFIDENCE: HIGH.
 extern "C" uint64_t f_apr_read_submit_c(uint64_t a0, uint64_t a1, uint64_t a2,
-                                        uint64_t a3, uint64_t a4, uint64_t a5);
+                                        uint64_t a3, uint64_t a4, uint64_t a5,
+                                        uint64_t entry_rsp);
 asm(".text\n"
     ".globl f_apr_read_submit_entry\n"
     ".type f_apr_read_submit_entry,@function\n"
     "f_apr_read_submit_entry:\n"
-    "  movq %rsp, g_apr_entry_rsp(%rip)\n"
-    "  jmp f_apr_read_submit_c\n");
+    "  movq %rsp, %rax\n"
+    "  pushq %rax\n"
+    "  call f_apr_read_submit_c\n"
+    "  addq $8, %rsp\n"
+    "  ret\n");
 extern "C" void f_apr_read_submit_entry();
 // Fetch the Nth stack argument (0-based: arg7 is n=0) of the in-flight ReadFile call.
-static uint64_t apr_stack_arg(int n) {
-    uint64_t rsp = g_apr_entry_rsp;
-    if (!rsp) return 0;
-    // Both paths land the forwarded/natural stack args at [rsp+8] (see the layout note above).
-    return *(uint64_t*)(rsp + 0x8 + (uint64_t)n * 8);
+// Both stub paths land the forwarded/natural stack args at [entry_rsp+8] (layout note above).
+static uint64_t apr_stack_arg(uint64_t entry_rsp, int n) {
+    if (!entry_rsp) return 0;
+    return *(uint64_t*)(entry_rsp + 0x8 + (uint64_t)n * 8);
+}
+#endif
+
+#ifndef _WIN32
+// Cached host fd per resolved APR container path. The engine issues hundreds of small reads
+// against the 2 GB pak during shader-library/asset loading; an open()+close() pair per read over
+// the WSL 9p filesystem dominated the boot (~1.7 s/read live-measured). Containers are immutable
+// game data, so a per-path fd held for the process lifetime is safe.
+static int apr_cached_fd(const std::string& host) {
+    static std::mutex mx;
+    static std::map<std::string, int> fds;
+    std::lock_guard<std::mutex> lk(mx);
+    auto it = fds.find(host);
+    if (it != fds.end()) return it->second;
+    int fd = ::open(host.c_str(), O_RDONLY);
+    if (fd >= 0) fds[host] = fd;
+    return fd;
+}
+
+// Write `size` bytes into guest VA `dst`, committing lazy-reserved 64K pages the same way the
+// SIGSEGV fault handler does. The kernel-side writev CANNOT fault through prosper's lazy-commit
+// handler, so a dst inside a guest-RESERVED range whose pages were never touched reports EFAULT
+// even though a real guest write would succeed. That EFAULT used to demote the read to "publish
+// the prosper-owned staging pointer through the record" — and the engine later FMemory::Free()d
+// that HOST pointer: "FMallocBinned3 Attempt to free an unrecognized block" (issue #88's second
+// face). Commit the pages exactly like the fault handler and retry once. CONFIDENCE: HIGH (same
+// policy as the lazy-commit path in exec_image_linux.cpp). Shared by the record-based
+// sceAmprAprCommandBufferReadFile path and the direct vWU-odnS+fU read (issue #115).
+static bool apr_write_guest_dst(uint64_t dst, void* buf, uint64_t size) {
+    if (!size) return true;
+    struct iovec l { buf, (size_t)size }, r { (void*)(uintptr_t)dst, (size_t)size };
+    if (process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)size) return true;
+    bool committed = false;
+    for (uint64_t p = dst & ~0xffffull; p < dst + size; p += 0x10000) {
+        unsigned char vec;
+        if (mincore((void*)(uintptr_t)p, 1, &vec) != 0 &&
+            prosper_reserved_range_state(p) == 1 &&
+            mmap((void*)(uintptr_t)p, 0x10000, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == (void*)(uintptr_t)p)
+            committed = true;
+    }
+    if (!committed) return false;
+    return process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)size;
 }
 #endif
 
 #ifndef _WIN32
 extern "C" uint64_t f_apr_read_submit_c(uint64_t a0, uint64_t a1, uint64_t a2,
-                                        uint64_t a3, uint64_t a4, uint64_t a5) {
+                                        uint64_t a3, uint64_t a4, uint64_t a5,
+                                        uint64_t entry_rsp) {
 #else
 HLE(f_apr_read_submit) {
 #endif
@@ -551,10 +596,23 @@ HLE(f_apr_read_submit) {
                 (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)a5);
 #ifndef _WIN32
         fprintf(stderr, "[apr]   stack-args a6=0x%llx a7=0x%llx a8=0x%llx a9=0x%llx (rsp=0x%llx ret=0x%llx)\n",
-                (unsigned long long)apr_stack_arg(0), (unsigned long long)apr_stack_arg(1),
-                (unsigned long long)apr_stack_arg(2), (unsigned long long)apr_stack_arg(3),
-                (unsigned long long)g_apr_entry_rsp,
-                (unsigned long long)(g_apr_entry_rsp ? *(uint64_t*)g_apr_entry_rsp : 0));
+                (unsigned long long)apr_stack_arg(entry_rsp, 0), (unsigned long long)apr_stack_arg(entry_rsp, 1),
+                (unsigned long long)apr_stack_arg(entry_rsp, 2), (unsigned long long)apr_stack_arg(entry_rsp, 3),
+                (unsigned long long)entry_rsp,
+                (unsigned long long)(entry_rsp ? *(uint64_t*)entry_rsp : 0));
+        // Guest call chain: first eboot-range return addresses on the stack (identifies which engine
+        // wrapper submitted this read — sync mount path vs async FAPREventQueue path, issue #115).
+        if (entry_rsp) {
+            const uint64_t* sp = (const uint64_t*)entry_rsp;
+            int shown = 0;
+            for (int i = 0; i < 160 && shown < 6; i++) {
+                uint64_t v = sp[i];
+                if (v < 0x400000000ull || v >= 0x4c0000000ull) continue;
+                fprintf(stderr, "[apr]   guest-ra[%d] = eboot+0x%llx\n", i,
+                        (unsigned long long)(v - 0x400000000ull));
+                shown++;
+            }
+        }
 #endif
         for (int o = 0; o < 0x48; o += 8)
             fprintf(stderr, "[apr]   req+0x%02x = 0x%016llx\n", o, (unsigned long long)*(uint64_t*)(req + o));
@@ -616,7 +674,7 @@ HLE(f_apr_read_submit) {
     { struct stat st {}; if (::stat(host.c_str(), &st) == 0) fsize = (uint64_t)st.st_size; }
     uint64_t offset = 0;
 #ifndef _WIN32
-    offset = apr_stack_arg(0);
+    offset = apr_stack_arg(entry_rsp, 0);
 #endif
     uint64_t size = a5;
     if (offset > fsize) {
@@ -693,10 +751,9 @@ HLE(f_apr_read_submit) {
     if (slot == MAP_FAILED) return 0x80020016ull;
     ssize_t got = 0;
     if (size) {
-        int fd = ::open(host.c_str(), O_RDONLY);
+        int fd = apr_cached_fd(host);
         if (fd < 0) { munmap(slot, rounded); return 0x80020016ull; }
         got = ::pread(fd, slot, (size_t)size, (off_t)offset);
-        ::close(fd);
     }
     bool ok = ((uint64_t)got == size);
     // a4 is the caller's DESTINATION buffer (the `dst` argument of
@@ -708,36 +765,7 @@ HLE(f_apr_read_submit) {
     // refuses unmapped ranges instead of SIGSEGVing in the HLE) and publish record[0] = dst;
     // fall back to the prosper-owned buffer only if dst is absent/unmapped.
     // CONFIDENCE: MED-HIGH (dst role from the recovered real prototype + both callsites' behavior).
-    bool in_dst = false;
-    if (ok && a4 > 0xffff) {
-        if (size) {
-            struct iovec l { slot, (size_t)size }, r { (void*)(uintptr_t)a4, (size_t)size };
-            in_dst = process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)size;
-            if (!in_dst) {
-                // The kernel-side writev CANNOT fault through prosper's SIGSEGV lazy-commit
-                // handler, so a dst inside a guest-RESERVED range whose pages were never touched
-                // reports EFAULT even though a real guest write would succeed (the fault handler
-                // would back the page). That EFAULT used to demote the read to "publish the
-                // prosper-owned staging pointer through the record" — and the engine later
-                // FMemory::Free()d that HOST pointer: "FMallocBinned3 Attempt to free an
-                // unrecognized block" during config-file loads (issue #88's second face).
-                // Replicate the guest-write semantics instead: commit the lazy 64K pages the
-                // exact way the fault handler does, then retry once. CONFIDENCE: HIGH (same
-                // policy as the lazy-commit path in exec_image_linux.cpp).
-                bool committed = false;
-                for (uint64_t p = a4 & ~0xffffull; p < a4 + size; p += 0x10000) {
-                    unsigned char vec;
-                    if (mincore((void*)(uintptr_t)p, 1, &vec) != 0 &&
-                        prosper_reserved_range_state(p) == 1 &&
-                        mmap((void*)(uintptr_t)p, 0x10000, PROT_READ | PROT_WRITE,
-                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == (void*)(uintptr_t)p)
-                        committed = true;
-                }
-                if (committed)
-                    in_dst = process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)size;
-            }
-        } else in_dst = true;
-    }
+    bool in_dst = ok && a4 > 0xffff && apr_write_guest_dst(a4, slot, size);
     if (ok && a2) {
         // Complete the record through the caller-supplied out-pointer (a2 = &record.data; the
         // stack offsets differ per callsite, a2 is the stable handle): [0] data pointer,
@@ -778,6 +806,55 @@ HLE(f_apr_read_submit) {
 #endif
 }
 
+#ifndef _WIN32
+// libSceAmpr vWU-odnS+fU — the APR DIRECT (whole-range) async file read, issue #115. Live capture
+// at the CreateGlobalShaderMap hang:
+//   vWU-odnS+fU(fileId=8, dst=0x2002860000, size=0x107e3a, off=0x7adec90a, off, 5thArg=4)
+// — fileId 8 = pakchunk0-ps5.pak from APR resolve, and (off,size) is EXACTLY the engine's
+// GlobalShaderCache-SF_PS5.bin region inside that pak (size matched the reader global's recorded
+// file size 0x107e3a). No command buffer, no completion record: the read completes by posting a
+// completion token to the registered APREventQueue (see hle_kernel_time.cpp), where the
+// FAPREventQueueListener picks it up and signals the waiting FEvent. a3==a4 in the only capture;
+// a5 is modeled as the 1-based ring index like the ASoW5WE-UPo submit (the completion handler
+// proves 1-based for that path; if a5 turns out to be flags the hash-map fallback in the guest's
+// handler still matches the token). CONFIDENCE: HIGH on (id,dst,size,off) — verified against the
+// resolved file and the reader's recorded size; MED on a5-as-ring.
+uint64_t prosper_apr_next_token(unsigned ring, bool tracked_catchup);   // hle_kernel_time.cpp
+void prosper_eq_trigger_apr(uint64_t token);                            // "
+HLE(f_apr_read_direct) {
+    uint64_t id = a0, dst = a1, size = a2, offset = a3;
+    std::string host = prosper_apr_path_for_id((uint32_t)id);
+    if (host.empty()) {
+        if (filelog()) fprintf(stderr, "[apr] read-direct: no file for id=%llu\n", (unsigned long long)id);
+        return 0x80020016ull;   // EINVAL-class: engine sees a synchronous submit failure
+    }
+    uint64_t fsize = 0;
+    { struct stat st {}; if (::stat(host.c_str(), &st) == 0) fsize = (uint64_t)st.st_size; }
+    if (offset > fsize) offset = fsize;
+    if (size > fsize - offset) size = fsize - offset;
+    uint64_t rounded = (size + 0xfff) & ~0xfffull; if (!rounded) rounded = 0x1000;
+    void* buf = mmap(nullptr, rounded, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (buf == MAP_FAILED) return 0x80020016ull;
+    ssize_t got = 0;
+    if (size) {
+        int fd = apr_cached_fd(host);
+        if (fd < 0) { munmap(buf, rounded); return 0x80020016ull; }
+        got = ::pread(fd, buf, (size_t)size, (off_t)offset);
+    }
+    bool ok = (uint64_t)got == size && (size == 0 || apr_write_guest_dst(dst, buf, size));
+    munmap(buf, rounded);
+    if (filelog()) fprintf(stderr, "[apr] read-direct id=%llu %s -> dst=0x%llx off=0x%llx size=%llu %s\n",
+                           (unsigned long long)id, host.c_str(), (unsigned long long)dst,
+                           (unsigned long long)offset, (unsigned long long)size, ok ? "OK" : "FAIL");
+    if (!ok) return 0x80020016ull;
+    unsigned ring = a5 ? (unsigned)(a5 - 1) & 0x3f : 0;
+    prosper_eq_trigger_apr(prosper_apr_next_token(ring, /*tracked_catchup=*/true));
+    return 0;
+}
+// APR completion-token plumbing (hle_kernel_time.cpp) — see the k_apr_submit block in
+// hle_kernel_mem.cpp for the recovered contract.
+#endif
+
 void register_file_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
     R("fopen", f_fopen);   R("fclose", f_fclose); R("fread", f_fread);   R("fwrite", f_fwrite);
@@ -808,6 +885,8 @@ void register_file_hle() {
     // offset); see f_apr_read_submit_entry above.
 #ifndef _WIN32
     Hle::register_fn("mQ16-QdKv7k", (HleFn)f_apr_read_submit_entry, "sceAmprAprCommandBufferReadFile");
+    // The direct (whole-range) APR read — completion via the APREventQueue (issue #115).
+    Hle::register_fn("vWU-odnS+fU", (HleFn)f_apr_read_direct, "AprReadFileDirect?");
 #else
     Hle::register_fn("mQ16-QdKv7k", (HleFn)f_apr_read_submit, "sceAmprAprCommandBufferReadFile");
 #endif

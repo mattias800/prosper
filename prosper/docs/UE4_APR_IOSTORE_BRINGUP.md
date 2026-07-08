@@ -382,6 +382,95 @@ the config bytes correctly.
   real offline/no-network status so the engine proceeds to RHI creation → AGC → first UE draw (the
   same `libSceAgc` path The Messenger renders through).
 
+### SOLVED (2026-07-09, issue #115): the "online init hang" was CreateGlobalShaderMap waiting on
+### APR async-read completions that prosper never delivered
+
+The issue-#115 hypothesis (main thread polling an online/PSN "get state" call) was **disproven** by
+evidence: every unimplemented online NID fires exactly ONCE (dispatch dedupe counts), and a gdb
+all-thread dump at the hang showed every thread parked in waits — no poller. The online subsystem
+init completes fine with the return-0 stubs. The real chain, recovered by guest stack scan + live
+disassembly (all offsets eboot-relative):
+
+1. Main thread parks in `FEventPThread::Wait` (+0x22eaa2b) ← a blocking "wait for archive" reader
+   (+0x24ae6e0: `IAsyncReadRequest::WaitCompletion(0)` then `WaitCompletion(INFINITE)` on
+   `*(obj+0x28)`) ← **`CreateGlobalShaderMap`** (+0x4ea8c20 — UTF-16 scope strings "Creating
+   Global Shader Map...", "GlobalShaderCache", "VerifyShaderSourceFiles"). The file being read:
+   `../../../Engine/GlobalShaderCache-SF_PS5.bin`, 0x107e3a bytes, **inside pakchunk0-ps5.pak**.
+2. The async read completes on real HW via the **APREventQueue**: the engine creates that equeue,
+   registers APR completions on it, and runs an `FAPREventQueueListener` thread in
+   `WaitEqueue(eq, evs, 15, ...)` (+0x22740b0). Each event is decoded with `sceKernelGetEventData`:
+   **`data = (ring_index << 58) | completion_counter`**; for every newly completed counter the
+   listener calls the completion handler (+0x229dcb0), which matches the token against the tracked
+   request's `+0x10` slot, else a hash map keyed by the full token. prosper served the READS
+   (synchronously) but never posted any EVENT → the listener never woke → WaitCompletion waited
+   forever. That is the whole hang.
+3. The previously-unknown NIDs, pinned by live arg capture + thunk→GOT→stub mapping:
+   - `libSceAmpr::sSAUCCU1dv4 (eq, id=0x7502, 0, 0, 0x43, 0)` — register APR completion events on
+     the equeue.
+   - `libSceAmpr::H896Pt-yB4I (cbCtx, eq, id, 0x10000000000003e8, 0, 7)` — bind a command-buffer
+     ctx to the equeue.
+   - `libSceAmpr::vWU-odnS+fU (fileId=8, dst, size=0x107e3a, off=0x7adec90a, off, 4)` — the DIRECT
+     async read: exactly the GlobalShaderCache region of pakchunk0-ps5.pak (fileId from APR
+     resolve). Implemented as `f_apr_read_direct` in hle_file.cpp (pread + lazy-commit dst write +
+     completion token/event).
+   - `libkernel::ASoW5WE-UPo (cb, ring_1based, u64* out1, u64* out2)` — the APR **submit**
+     (wrapper +0x59b6420 → thunk +0x669afd0; the completion handler resubmits queued CBs with
+     `ring = (data>>58)+1`, proving 1-based). Nonzero return = error (checked at +0x22a1d55);
+     the completion token is returned through the OUT slots. Implemented as `k_apr_submit`.
+4. Contract subtleties (each crash-verified live, both ways):
+   - **No phantom sequence numbers.** Pre-registration (mount-era) submits are consumed by
+     polling the completion record; delivering their seqs after registration makes the listener
+     hand the handler tokens with no tracking entry, and the handler's hash-miss path is NOT
+     null-tolerant (`vmovups` from `0x10`, fault at +0x229df3e). Untracked rings reset to 0 at
+     first registration so post-registration submissions start at seq 1 (matching the listener's
+     zero-initialized per-ring "last processed").
+   - **Completions must be delivered ASYNCHRONOUSLY.** Posting the event inside the submit loses
+     the race the real DMA never runs (the engine inserts its {token→request} entry right after
+     submit returns); prosper defers each post ~2 ms and posts the ring's counter at post time.
+   - **Sync-flow submits (`ring_1based == 6`, hardcoded at +0x22a1d89) get NO events** — their
+     completions are record-polled; ring-4 (tracked async) events are consumed correctly. The
+     real discriminator is likely the H896 cb↔eq binding; ring-id gating reproduces observed
+     behavior (CONFIDENCE MED).
+   - `sceKernelGetEventData/Id/Filter/Fflags/UserData/Error` implemented (Kyty field-read
+     semantics) — the listener consumes events exclusively through GetEventData.
+
+**Result: the GlobalShaderMap loads, PreInit continues through online/PSN init (which was never
+the blocker), pak/precacher async reads flow (180+ served in one run), and the boot reaches the
+AGC RHI bring-up — AgcCleanupThread/AgcInterruptThread/AgcSubmissionThread + AgcEqueue with
+AgcDriverAddEqEvent(id=0x20, id=0x0) + user event 6144 — then keeps loading content.** ctest
+50/50, Messenger smoke unaffected.
+
+Follow-on fixes landed in the same change (each its own live-diagnosed wall):
+
+- **POSIX `pthread_cond_timedwait` (libScePosix 27bAgiJmOh0)** implemented for real (shared
+  cond/mutex pointer-slot scheme; FreeBSD ETIMEDOUT=60). The unimplemented-0 stub returned
+  "signaled" instantly, spinning UE's `IAsyncReadRequest::WaitCompletion(timeout)` loop at 100%
+  CPU (caught live: the only busy thread's RA 0x4022ea954 inside prosper_on_unimpl).
+- **`sceRtcSetTick` / `sceRtcGetTick`** (tick <-> UTC datetime, shadPS4 semantics). Unimplemented
+  SetTick left the out datetime zeroed and UE spammed
+  `LowLevelFatalError: Invalid Date values. Y:0, M:0, D:0...` thousands of times during the
+  post-shader-map load.
+- **Per-container host fd cache for APR reads.** open()+close() per read against the 2 GB pak
+  over the WSL 9p mount cost ~1.7 s/read; the whole load phase now runs ~15x faster.
+- **Race-free stack-arg capture for `sceAmprAprCommandBufferReadFile`.** The entry shim now
+  passes its %rsp as a real 7th argument instead of a plain global — with completions delivered,
+  loader/precacher threads submit APR reads CONCURRENTLY and a cross-thread overwrite of the
+  global made the handler read the file OFFSET from another thread's frame (wrong-offset reads
+  served as "OK"). No TLS (issue #89 constraint respected).
+
+### NEW WALL: MallocBinned3 free-block canary corruption during the parallel content-load burst
+
+With loading fast and parallel, the boot dies ~10 s in, right after online init, spamming
+`LowLevelFatalError [Line: 186] MallocBinned3 Corruption Canary was 0xN, will be 0x1` (N varies
+run to run: 0x0, 0x2) until a SIGSEGV. Established so far: NOT a prosper page clobber (MEMLOG
+shows zero lazy-commit/batchmap overlaps, zero remaps, the #107 mirror is SKIPPED cleanly, and
+all 951 BatchMap ops in the window are plain op=0 commits — no unmaps); NOT caused by the RTC or
+timedwait fixes (A/B-verified: corruption persists with them unregistered, only the canary value
+changes). The phase is a burst of MallocBinned3 arena growth (hundreds of 64K batchmap commits)
+under multiple loading threads — candidates: guest-%fs TLS-cache interaction (MB3 per-thread
+caches under PROSPER_GUEST_FS), or a completion-delivery race making the engine free a block on
+two paths. Needs its own session with a HW write-watch on a corrupted free-block header.
+
 ### The remaining 3 unnamed Ampr NIDs (issue #107, not on the crash path)
 
 `vWU-odnS+fU`, `sSAUCCU1dv4`, `GnxKOHEawhk`, `H896Pt-yB4I` still resist the generated

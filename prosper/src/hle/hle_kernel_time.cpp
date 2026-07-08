@@ -186,6 +186,44 @@ HLE(k_rtc_get_clock_utc) {
     return 0;
 }
 
+// sceRtcSetTick(SceRtcDateTime* dt, const SceRtcTick* tick): broken-down UTC datetime from a tick
+// (u64 µs since 0001-01-01, the Orbis RTC convention above). Reference: shadPS4 rtc.cpp
+// sceRtcSetTick (tick - UNIX_EPOCH_TICKS -> gmtime). Unimplemented-0 left the out struct at the
+// caller's zero-init, and UE4's FDateTime(Y:0,M:0,D:0,...) "Invalid Date values" fatal spammed
+// thousands of times during the post-shader-map load (issue #115 follow-on wall). glibc gmtime_r
+// handles pre-1970 (negative time_t) fine, so ticks below the unix epoch still convert.
+// CONFIDENCE: MED-HIGH (shadPS4 reference; struct layout shared with the GetCurrentClock family).
+HLE(k_rtc_set_tick) {   // (SceRtcDateTime* dt, const SceRtcTick* tick)
+    if (!a0 || !a1) return 0x80250001ull;   // SCE_RTC_ERROR_INVALID_POINTER
+    int64_t us = (int64_t)*(const uint64_t*)P(a1) - (int64_t)kRtcUnixEpochOffsetUs;
+    time_t secs = (time_t)(us >= 0 ? us / 1000000ll : (us - 999999ll) / 1000000ll);   // floor
+    int64_t rem = us - (int64_t)secs * 1000000ll;
+    struct tm tmv {};
+#ifdef _WIN32
+    gmtime_s(&tmv, &secs);
+#else
+    gmtime_r(&secs, &tmv);
+#endif
+    fill_rtc_datetime(P(a0), tmv, (uint32_t)rem);
+    return 0;
+}
+// sceRtcGetTick(const SceRtcDateTime* dt, SceRtcTick* tick): the inverse (datetime assumed UTC).
+HLE(k_rtc_get_tick) {   // (const SceRtcDateTime* dt, SceRtcTick* tick)
+    if (!a0 || !a1) return 0x80250001ull;
+    const uint16_t* d = (const uint16_t*)P(a0);
+    struct tm tmv {};
+    tmv.tm_year = (int)d[0] - 1900; tmv.tm_mon = (int)d[1] - 1; tmv.tm_mday = (int)d[2];
+    tmv.tm_hour = (int)d[3]; tmv.tm_min = (int)d[4]; tmv.tm_sec = (int)d[5];
+#ifdef _WIN32
+    int64_t secs = _mkgmtime64(&tmv);
+#else
+    int64_t secs = (int64_t)timegm(&tmv);
+#endif
+    *(uint64_t*)P(a1) = (uint64_t)(secs * 1000000ll + (int64_t)*(const uint32_t*)(d + 6)
+                                   + (int64_t)kRtcUnixEpochOffsetUs);
+    return 0;
+}
+
 // real sleeps so timed wait loops actually yield the CPU (and advance real time)
 HLE(k_usleep)   { uint64_t us = a0; struct timespec ts{ (time_t)(us / 1000000), (long)((us % 1000000) * 1000) }; nanosleep(&ts, nullptr); return 0; }
 HLE(k_sleep_s)  { struct timespec ts{ (time_t)a0, 0 }; nanosleep(&ts, nullptr); return (uint64_t)a0; }
@@ -438,21 +476,21 @@ HLE(k_eq_wait)   {   // (eq, SceKernelEvent* ev, int num, int* out, SceKernelUse
     static const bool waitcaller = getenv("PROSPER_WAITCALLER") != nullptr;
     if (waitcaller) {
         static std::atomic<int> shown{0};
-        if (shown.load() < 4 && shown.fetch_add(1) < 4) {
+        if (shown.load() < 8 && shown.fetch_add(1) < 8) {
             uint64_t* sp = (uint64_t*)__builtin_frame_address(0);
-            for (int i = 0; i < 80; i++) {
+            for (int i = 0; i < 160; i++) {
                 uint64_t v = sp[i];
                 if (v < 0x400000000ull || v >= 0x4c0000000ull) continue;   // eboot / IL2CPP executable range
-                // PRECISE: a genuine caller is a return address whose preceding 5 bytes are `call rel32`
-                // (0xe8) targeting the STUB region (0x6..) — i.e. the game's actual import call site, not an
-                // unrelated eboot address that happens to be on the stack (e.g. a Vorbis-decode frame).
-                const uint8_t* pre = (const uint8_t*)(uintptr_t)(v - 5);
-                if (pre[0] != 0xe8) continue;
-                int32_t rel = *(const int32_t*)(pre + 1);
-                uint64_t target = v + (uint64_t)(int64_t)rel;
-                if (target < 0x600000000ull || target >= 0x700000000ull) continue;   // must call a stub
-                fprintf(stderr, "[waitcaller] stack[%d] eboot+0x%llx -> stub+0x%llx | loopcode:", i,
-                        (unsigned long long)(v - 0x400000000ull), (unsigned long long)(target - 0x600000000ull));
+                // A genuine caller is a return address preceded by a call: `call rel32` (0xe8 at v-5,
+                // any target — the import call goes through an in-eboot thunk, NOT straight to the
+                // stub region, so no target filter) or an indirect `call` (0xff at v-6/-3/-2).
+                const uint8_t* pre = (const uint8_t*)(uintptr_t)(v - 8);
+                bool is_call = pre[3] == 0xe8 ||                            // call rel32 at v-5
+                               pre[2] == 0xff || pre[5] == 0xff || pre[6] == 0xff;  // call r/m64 forms
+                if (!is_call) continue;
+                fprintf(stderr, "[waitcaller] eq=0x%llx num=%llu stack[%d] eboot+0x%llx | code@ra-0x18:",
+                        (unsigned long long)a0, (unsigned long long)a2, i,
+                        (unsigned long long)(v - 0x400000000ull));
                 const uint8_t* code = (const uint8_t*)(uintptr_t)(v - 0x18);
                 for (int b = 0; b < 0x40; b++) fprintf(stderr, "%02x", code[b]);
                 fprintf(stderr, "\n");
@@ -503,6 +541,118 @@ HLE(k_eq_getcount){
     if (evlog()) fprintf(stderr, "[ev] GetEventCount eq=0x%llx -> %d\n", (unsigned long long)a0, n);
     return (uint64_t)n;
 }
+
+// --- APR (Ampr file-read engine) completion events — issue #115. ------------------------------
+// UE4's PS5 platform file layer runs an "FAPREventQueueListener" thread that blocks in
+// WaitEqueue(APREventQueue, evs, 15, ...) and decodes each event with sceKernelGetEventData():
+//   data = (ring_index << 58) | completion_counter      (live-disassembled at eboot+0x4022740b0:
+//   r15 = data >> 0x3a; cnt = bzhi(data, 0x3a); per-ring "last processed" at listener+0xc8+ring*40;
+//   for seq in last+1..cnt: handler(ctx, (ring<<58)|seq) — eboot+0x40229dcb0 matches the token
+//   against the tracking object's +0x10 slot, else a hash-map keyed by the full token.)
+// The token the engine stores at submit time comes OUT of the submit call (ASoW5WE-UPo writes it
+// through its two out-pointers; the vWU-odnS+fU direct read returns it). prosper's APR reads are
+// synchronous, so "submit" == "complete": we assign the token and immediately post the event.
+// Event shape: guest code reads ONLY data (GetEventData) — ident/filter are never inspected — but
+// eq_post coalesces on (ident,filter), so ident carries the ring index to keep concurrent rings'
+// completions from replacing each other (per-ring coalescing to the HIGHEST counter is exactly the
+// kqueue/"completed up to" semantics the listener's range loop implements).
+// CONFIDENCE: HIGH on the data encoding + listener decode (disassembly); MED on registration arg
+// order (live capture: sSAUCCU1dv4(eq, id=0x7502, 0, 0, 0x43, 0), H896Pt-yB4I(ctx, eq, id, ...)).
+namespace {
+    constexpr int16_t EVFILT_AMPR_MODELED = -24;   // guest never reads filter; distinct on purpose
+    struct AprEqReg { uint64_t eq; int64_t id; };
+    // Own mutex (NOT g_eq_mx): the post path calls eq_post/eq_find, which lock g_eq_mx themselves.
+    std::mutex g_apr_mx;
+    std::vector<AprEqReg> g_apr_eq_regs;               // guarded by g_apr_mx
+    uint64_t g_apr_ring_seq[64]     = {};              // per-ring completion counters (guarded)
+    bool     g_apr_ring_catchup[64] = {};              // ring had a TRACKED pre-registration read
+    void apr_post(const AprEqReg& r, unsigned ring, uint64_t token) {   // no APR lock held
+        SceKEvent e{}; e.ident = r.id + (int64_t)ring; e.filter = EVFILT_AMPR_MODELED;
+        e.data = (int64_t)token; e.udata = 0;
+        eq_post(r.eq, e);
+    }
+}
+// Assign the next completion token for `ring` (0-based, 6 bits). Called by the APR submit paths.
+// `tracked_catchup`: the caller's completion must survive a registration that happens AFTER the
+// submit (the vWU direct read fires 2 calls before sSAUCCU1dv4 registers the queue). Untracked
+// submissions (the mount-era synchronous ASoW flow, consumed by polling the completion record)
+// must NOT replay at registration: the listener's range loop would hand their seqs to the
+// completion handler, whose hash-miss path is not null-tolerant (live crash: phantom ring-5 seqs
+// 1..13 -> vmovups from 0x10 at eboot+0x229df3e). Their rings reset to 0 instead, so the first
+// post-registration submission is seq 1 — matching the listener's zero-initialized per-ring
+// "last processed" counter. CONFIDENCE: MED-HIGH (crash-verified both ways).
+uint64_t prosper_apr_next_token(unsigned ring, bool tracked_catchup) {
+    ring &= 0x3f;
+    std::lock_guard<std::mutex> lk(g_apr_mx);
+    uint64_t seq = ++g_apr_ring_seq[ring];
+    if (tracked_catchup && g_apr_eq_regs.empty()) g_apr_ring_catchup[ring] = true;
+    return ((uint64_t)ring << 58) | (seq & ((1ull << 58) - 1));
+}
+// Post the completion event for `token`'s ring to every registered APR event queue — DEFERRED by
+// ~2 ms on a detached thread. Posting synchronously inside the submit loses the race the real
+// hardware never runs: the engine inserts its {token -> request} hash entry right AFTER the
+// submit call returns, and the listener's hash-MISS path is not tolerant (it copies from
+// entry 0 + 0x10 — the live eboot+0x229df3e fault). A real DMA read takes far longer than the
+// submitter's few bookkeeping instructions; the delay models that latency. The deferred post
+// reads the ring's counter AT POST TIME (not the captured token), so out-of-order wakeups can
+// never regress the coalesced event's "completed up to" counter. CONFIDENCE: MED (latency model;
+// the guest-visible contract — event data = (ring<<58)|counter after the tracking insert — is
+// crash-verified in both failure modes).
+namespace {
+void apr_schedule_post(unsigned ring) {
+    std::thread([ring] {
+        struct timespec ts{ 0, 2000000 };   // 2 ms
+        nanosleep(&ts, nullptr);
+        std::vector<AprEqReg> regs; uint64_t cur;
+        {
+            std::lock_guard<std::mutex> lk(g_apr_mx);
+            regs = g_apr_eq_regs;
+            cur  = g_apr_ring_seq[ring];
+        }
+        if (!cur) return;
+        uint64_t tok = ((uint64_t)ring << 58) | (cur & ((1ull << 58) - 1));
+        for (auto& r : regs) apr_post(r, ring, tok);
+        if (evlog()) fprintf(stderr, "[ev] AprComplete posted ring=%u upto=%llu -> %zu eq(s)\n",
+            ring, (unsigned long long)cur, regs.size());
+    }).detach();
+}
+}
+void prosper_eq_trigger_apr(uint64_t token) {
+    unsigned ring = (unsigned)(token >> 58) & 0x3f;
+    if (evlog()) fprintf(stderr, "[ev] AprComplete token=0x%llx (ring=%u seq=%llu) scheduled\n",
+        (unsigned long long)token, ring, (unsigned long long)(token & ((1ull << 58) - 1)));
+    apr_schedule_post(ring);
+}
+// Register an APR completion target. Tracked pre-registration completions (vWU direct reads) are
+// re-delivered so their listener wake-up isn't lost; untracked rings reset (see above).
+void prosper_eq_add_apr(uint64_t eq, int64_t id) {
+    bool pending[64] = {};
+    {
+        std::lock_guard<std::mutex> lk(g_apr_mx);
+        for (auto& r : g_apr_eq_regs) if (r.eq == eq && r.id == id) return;   // idempotent
+        bool first = g_apr_eq_regs.empty();
+        g_apr_eq_regs.push_back({ eq, id });
+        for (unsigned ring = 0; ring < 64; ring++) {
+            if (!g_apr_ring_seq[ring]) continue;
+            if (g_apr_ring_catchup[ring]) pending[ring] = true;
+            else if (first)               g_apr_ring_seq[ring] = 0;   // drop untracked history
+        }
+    }
+    // Deferred like every completion post (the engine may still be inserting its tracking entry
+    // for the pre-registration read when this registration call runs).
+    for (unsigned ring = 0; ring < 64; ring++)
+        if (pending[ring]) apr_schedule_post(ring);
+}
+
+// --- SceKernelEvent field accessors (Kyty EventQueue.cpp:318-378: plain field reads). The APR
+// listener consumes its events EXCLUSIVELY through sceKernelGetEventData; unimplemented-0 here made
+// every event decode as ring 0 / counter 0 (a no-op for the range loop). ---
+HLE(k_get_event_data)    { return a0 ? (uint64_t)((const SceKEvent*)P(a0))->data   : 0; }
+HLE(k_get_event_id)      { return a0 ? (uint64_t)((const SceKEvent*)P(a0))->ident  : 0; }
+HLE(k_get_event_filter)  { return a0 ? (uint64_t)(int64_t)((const SceKEvent*)P(a0))->filter : 0; }
+HLE(k_get_event_fflags)  { return a0 ? (uint64_t)((const SceKEvent*)P(a0))->fflags : 0; }
+HLE(k_get_event_udata)   { return a0 ? ((const SceKEvent*)P(a0))->udata : 0; }
+HLE(k_get_event_error)   { return 0; }
 
 // --- User + timer event sources (sceKernelAddUserEvent / TriggerUserEvent / AddHRTimerEvent /
 // AddTimerEvent). Previously no-ops, which starved any equeue the game feeds via these (e.g. Unity's
@@ -599,6 +749,10 @@ void register_kernel_time_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
     R("sceKernelCreateEqueue", k_eq_create);   R("sceKernelDeleteEqueue", k_eq_delete);
     R("sceKernelWaitEqueue", k_eq_wait);        R("sceKernelGetEventCount", k_eq_getcount);
+    // SceKernelEvent accessors (the APR listener reads its events only through GetEventData)
+    R("sceKernelGetEventData", k_get_event_data);     R("sceKernelGetEventId", k_get_event_id);
+    R("sceKernelGetEventFilter", k_get_event_filter); R("sceKernelGetEventFflags", k_get_event_fflags);
+    R("sceKernelGetEventUserData", k_get_event_udata);R("sceKernelGetEventError", k_get_event_error);
     R("sceKernelAddHRTimerEvent", k_add_hrtimer_event); R("sceKernelAddUserEvent", k_add_user_event);
     R("sceKernelAddUserEventEdge", k_add_user_event);   R("sceKernelTriggerUserEvent", k_trigger_user_event);
     R("sceKernelDeleteUserEvent", k_del_user_event);   R("sceKernelDeleteHRTimerEvent", k_del_timer_event);
@@ -622,6 +776,8 @@ void register_kernel_time_hle() {
     R("sceRtcGetCurrentClockLocalTime", k_rtc_get_clock_localtime); // (dt) — host-local tz
     R("sceRtcGetCurrentClock", k_rtc_get_current_clock);            // (dt, tz_minutes)
     R("sceRtcGetCurrentDateTimeUtc", k_rtc_get_clock_utc);
+    R("sceRtcSetTick", k_rtc_set_tick);   // tick -> UTC datetime (issue #115 follow-on: FDateTime spam)
+    R("sceRtcGetTick", k_rtc_get_tick);   // UTC datetime -> tick
     // module loading (report success; real PRX are already resident in our address space)
     R("sceSysmoduleLoadModule", k_ok);
     R("sceSysmoduleUnloadModule", k_ok);

@@ -566,6 +566,64 @@ HLE(k_ampr_getsize) {
 }
 HLE(k_ampr_x3) { return ampr_arglog("Qs1xtplKo0U", a0, a1, a2, a3, a4, a5); }
 HLE(k_ampr_x4) { return ampr_arglog("GuchCTefuZw", a0, a1, a2, a3, a4, a5); }
+// --- APR completion-event plumbing (issue #115: DOLL hangs in CreateGlobalShaderMap because its
+// FAPREventQueueListener never receives read-completion events). Live-captured contract:
+//   sSAUCCU1dv4(eq=APREventQueue, id=0x7502, 0, 0, 0x43, 0)      — register APR events on an equeue
+//   H896Pt-yB4I(cbCtx, eq, id=0x7502, 0x10000000000003e8, 0, 7)  — bind a command buffer to the eq
+//   ASoW5WE-UPo(cb, ring_1based, u64* out1, u64* out2)           — libkernel: SUBMIT the APR cb;
+//     the engine treats a nonzero return as an error (test eax,eax at eboot+0x4022a1d55) and the
+//     completion handler (eboot+0x40229dcb0) RESUBMITS the next queued cb with ring = (data>>58)+1,
+//     proving the ring argument is 1-based and the out slots carry the completion token the
+//     listener later matches ((ring<<58)|counter — see hle_kernel_time.cpp).
+// prosper's reads complete synchronously inside the builders, so submit == complete: assign the
+// token, publish it through the out slots, and fire the equeue event.
+// CONFIDENCE: HIGH on listener decode + 1-based ring (disassembly); MED on out-slot roles (both
+// receive the token — the tracking object stores whichever it uses).
+uint64_t prosper_apr_next_token(unsigned ring, bool tracked_catchup);   // hle_kernel_time.cpp
+void prosper_eq_trigger_apr(uint64_t token);                            // "
+void prosper_eq_add_apr(uint64_t eq, int64_t id);                       // "
+namespace {
+    // Command-buffer ctxs bound to the APR event queue via H896Pt-yB4I. Only THEIR submissions
+    // generate completion events (confirmed live: the one bound ctx 0x1060e090c8 is exactly the
+    // one submit — ring1b=5 — whose event the listener consumed; all 70+ unbound stack-frame cbs
+    // submit on ring1b=6 and are consumed by record polling. Delivering events for unbound
+    // submissions hands the listener sequence numbers with no tracking entry, and its hash-miss
+    // path faults: eboot+0x229df3e, addr 0x10 — 2/2 runs, gone when gated).
+    std::mutex g_apr_bound_mx;
+    std::vector<uint64_t> g_apr_bound_cbs;
+    bool apr_cb_bound(uint64_t cb) {
+        std::lock_guard<std::mutex> lk(g_apr_bound_mx);
+        for (uint64_t b : g_apr_bound_cbs) if (b == cb) return true;
+        return false;
+    }
+}
+HLE(k_apr_set_equeue) {          // sSAUCCU1dv4 (eq, id, ...)
+    ampr_arglog("sSAUCCU1dv4(SetEqueue)", a0, a1, a2, a3, a4, a5);
+    if (a0) prosper_eq_add_apr(a0, (int64_t)a1);
+    return 0;
+}
+HLE(k_apr_cb_set_equeue) {       // H896Pt-yB4I (cbCtx, eq, id, ...)
+    ampr_arglog("H896Pt-yB4I(CbSetEqueue)", a0, a1, a2, a3, a4, a5);
+    if (a1) prosper_eq_add_apr(a1, (int64_t)a2);
+    if (a0) { std::lock_guard<std::mutex> lk(g_apr_bound_mx); g_apr_bound_cbs.push_back(a0); }
+    return 0;
+}
+HLE(k_apr_submit) {              // libkernel ASoW5WE-UPo (cb, ring_1based, out1, out2)
+    unsigned ring = a1 ? (unsigned)(a1 - 1) & 0x3f : 0;
+    uint64_t token = prosper_apr_next_token(ring, /*tracked_catchup=*/false);
+    if (a2 > 0xffff) *(uint64_t*)(uintptr_t)a2 = token;
+    if (a3 > 0xffff) *(uint64_t*)(uintptr_t)a3 = token;
+    if (amprlog()) fprintf(stderr, "[amprlog] ASoW5WE-UPo(Submit) cb=0x%llx ring1b=%llu -> token=0x%llx%s\n",
+                           (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)token,
+                           apr_cb_bound(a0) ? " (bound)" : "");
+    // Completion events only for submissions of an equeue-BOUND cb (see g_apr_bound_cbs).
+    // CONFIDENCE: MED-HIGH (bound-vs-unbound split observed exactly once each way; the crash the
+    // gate prevents reproduced 2/2 without it).
+    if (apr_cb_bound(a0)) prosper_eq_trigger_apr(token);
+    return 0;
+}
+// Still-unnamed mount-time Ampr NID (state query?); arg-logging no-op under PROSPER_AMPRLOG.
+HLE(k_ampr_u3) { return ampr_arglog("GnxKOHEawhk", a0, a1, a2, a3, a4, a5); }
 HLE(k_ampr_begin) {
     if (amprlog()) {
         fprintf(stderr, "[amprlog] begin a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx\n",
@@ -800,6 +858,12 @@ void register_kernel_mem_hle() {
     Hle::register_fn("tZDDEo2tE5k", (HleFn)k_ampr_getsize, "sceAmprCommandBufferGetSize");
     Hle::register_fn("Qs1xtplKo0U", (HleFn)k_ampr_x3, "sceAmprAprCommandBufferDestructor");
     Hle::register_fn("GuchCTefuZw", (HleFn)k_ampr_x4, "sceAmprCommandBufferDestructor");
+    // APR completion-event plumbing (issue #115). vWU-odnS+fU (the direct async file read) is
+    // registered in hle_file.cpp next to the other APR read path.
+    Hle::register_fn("sSAUCCU1dv4", (HleFn)k_apr_set_equeue,    "AprSetEventQueue?");
+    Hle::register_fn("H896Pt-yB4I", (HleFn)k_apr_cb_set_equeue, "AprCbSetEventQueue?");
+    Hle::register_fn("ASoW5WE-UPo", (HleFn)k_apr_submit,        "AprSubmitCommandBuffer?");
+    Hle::register_fn("GnxKOHEawhk", (HleFn)k_ampr_u3,           "AmprUnknown3");
 }
 
 } // namespace prosper
