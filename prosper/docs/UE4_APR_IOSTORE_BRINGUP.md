@@ -108,14 +108,43 @@ init-guard-style function (`rax`=0x2001c10000 a BatchMap buffer, null deref, `rd
 read happens before this — the engine crashes *processing* the parsed TOC, before the next read.
 
 Field map of the APR read-request object (live `req` dump):
-`+0x00` count(1) · `+0x08` stack ptr · `+0x10` fn/vtable · `+0x18` small stack scratch ·
-`+0x20` **mapped data buffer (dest)** · `+0x28` status(err\|cboff) · `+0x30` **byte count** ·
+`+0x00` count(1) · `+0x08` stack ptr · `+0x10` fn/vtable · `+0x18` **begin out-slot 1** ·
+`+0x20` **begin out-slot 2 = data pointer** · `+0x28` status(err\|cboff) · `+0x30` **byte count** ·
 `+0x38` stack canary · `+0x40` stack ptr.
 
-Next: disassemble `0x2316c91` / `0x22fce69` — likely another null global/uninitialized IoStore
-struct (a missing init call or a container/registry the TOC parse expected to populate). Then the
-`.ucas` chunk reads begin (those MAY be Oodle-compressed — check each container's utoc
-`compressionMethodNameCount`; `global` was 0/uncompressed).
+### RESOLVED: the `eboot+0x2316c91` freelist crash was a stale, never-populated begin-cursor
+
+Root cause (proven by a full-run `PROSPER_HWWATCH_ABS` write history of the "dest" and by
+`PROSPER_AMPRLOG` arg/out-slot capture):
+
+- The APR read flow inits its request through the SAME Ampr NIDs as the page-map path:
+  `8aI7R7WaOlc(req, cbSize=0x40, 0, pathStruct, allocCtx=0x2001c10060, 3)` then
+  `a8uLzYY--tM(req, &req->0x18, &req->0x20, 0, 0x2a, 0)` then `mQ16(req, …)`. The `begin` call's
+  two pointer args are OUT-SLOTS the library must populate; the engine reads the file data back
+  through `*(req+0x20)` after completion — the library chooses the data location, not the engine.
+- Our `begin` HLE returned 0 WITHOUT writing the slots, so `req+0x20` kept stale stack garbage
+  that happened to point at a FREED 0x50-byte block (`0x1080e10a50`) of the engine's own live
+  path-string pool (freelist head `0x2001c10080`, carve-linker `eboot+0x230f1d8`, push
+  `eboot+0x2316e0c` — the push LINKS `node->next := head`, it does not zero). The HW watch showed
+  the block sitting free on the freelist at read time; writing the 645-byte TOC over it clobbered
+  the free nodes' next pointers with the TOC magic → the later pop at `eboot+0x2316c80` popped
+  `next == 0x2d3d3d2d2d3d3d2d` and faulted at `+0x2316c91`.
+- Why the TOC still "parsed": both our read HLE (write) and the engine (read-back) dereferenced
+  the SAME stale slot, so the data round-tripped consistently — only the pool underneath was
+  corrupted. There was never a prosper memory-model overlap: MEMLOG showed the page
+  `0x1080e10000` BatchMap-committed exactly once, no alias, no mirror (dmem/batchmap are clean).
+- Fix: `k_ampr_begin` now populates both out-slots with a prosper-owned 16 MiB staging buffer
+  (modeling the library-owned staging on real HW); a zero-length submit also clears the `req+0x28`
+  status. The crash is gone and the engine advances through global.utoc parse, `.ucas` open,
+  saved-paks probing, and pakchunk resolve.
+
+Current wall (much deeper): the 3rd submit is a MULTI-segment read — `count=0x4`, descSize=0xdd
+(not 0x90), total `req+0x30 = 36144292` bytes which matches NO single container file, so the
+match-by-size heuristic fails ("no file for size") and the engine crashes at `eboot+0x22ebe7f`
+(null+8). Next: decode the per-segment layout (file id / offset / size list — likely behind
+`req+0x08` or the desc buffer) and pread per segment via `prosper_apr_path_for_id`. Then
+decompression: `.ucas` chunks MAY be Oodle-compressed (check `compressionMethodNameCount`;
+`global` was 0/uncompressed).
 
 ## Remaining work to the first frame (the subsystem)
 

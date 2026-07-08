@@ -412,14 +412,39 @@ HLE(f_apr_read_submit) {
                 (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)a5);
         for (int o = 0; o < 0x48; o += 8)
             fprintf(stderr, "[apr]   req+0x%02x = 0x%016llx\n", o, (unsigned long long)*(uint64_t*)(req + o));
+        // Cursor slots (a1/a2 point at them) and the 0x90-byte descriptor buffer (a4): the desc may
+        // carry the REAL read layout (file offset / dest / size) — dump to check whether req+0x20 is
+        // truly the engine-chosen dest or a stale value from an unpopulated Ampr begin-cursor.
+        if (a1 > 0xffff) fprintf(stderr, "[apr]   *cur1 = 0x%016llx\n", (unsigned long long)*(uint64_t*)a1);
+        if (a2 > 0xffff) fprintf(stderr, "[apr]   *cur2 = 0x%016llx\n", (unsigned long long)*(uint64_t*)a2);
+        if (a4 > 0xffff) for (int o = 0; o < 0x90; o += 8)
+            fprintf(stderr, "[apr]   desc+0x%02x = 0x%016llx\n", o, (unsigned long long)*(uint64_t*)(a4 + o));
+        // The real read command lives in the Ampr command buffer registered at init (a3 of the
+        // (req, cbSize, 0, cbBuf, poolCtx, 3) init call); "CB offset 40" is decimal 40 = 0x28 into it.
+        extern uint64_t g_apr_last_cb, g_apr_last_cb_size;
+        if (g_apr_last_cb) {
+            fprintf(stderr, "[apr]   cb=0x%llx size=0x%llx\n",
+                    (unsigned long long)g_apr_last_cb, (unsigned long long)g_apr_last_cb_size);
+            uint64_t n = g_apr_last_cb_size > 0x80 ? 0x80 : g_apr_last_cb_size;
+            for (uint64_t o = 0; o < n; o += 8)
+                fprintf(stderr, "[apr]   cb+0x%02llx = 0x%016llx\n", (unsigned long long)o,
+                        (unsigned long long)*(uint64_t*)(g_apr_last_cb + o));
+        }
     }
     // req+0x20 is the mapped data buffer (guest direct/flexible memory, 0x10xxxxxxxx range); req+0x18
     // is only a small stack scratch (writing the full file there smashed the stack). req+0x30 is the
     // total byte count. CONFIDENCE: MED (field roles from live req dump).
     uint64_t dest = *(uint64_t*)(req + 0x20);
     uint64_t size = *(uint64_t*)(req + 0x30);
-    if (!dest || !size) { if (filelog()) fprintf(stderr, "[apr] read-submit: empty (dest=0x%llx size=0x%llx)\n",
-                          (unsigned long long)dest, (unsigned long long)size); return 0; }
+    if (!dest || !size) {
+        // A zero-length request completes trivially: clear the pre-seeded failure status at
+        // req+0x28 (low32 = error, high32 = CB offset), same as the successful-read path — leaving
+        // it made the engine treat the no-op submit as "Apr read failure". CONFIDENCE: MED.
+        *(uint64_t*)(req + 0x28) = 0;
+        if (filelog()) fprintf(stderr, "[apr] read-submit: empty (dest=0x%llx size=0x%llx)\n",
+                               (unsigned long long)dest, (unsigned long long)size);
+        return 0;
+    }
     std::string host = apr_path_for_size(size);
     if (host.empty()) { if (filelog()) fprintf(stderr, "[apr] read-submit: no file for size=%llu\n",
                         (unsigned long long)size); return 0x80020016ull; }
