@@ -115,6 +115,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_apr_registry PRIVATE prosper_core)
   add_test(NAME apr_registry_size_keying COMMAND test_apr_registry)
 
+  # Direct-memory allocate/available (issue #99): AvailableDirectMemorySize reports the largest
+  # free aligned block in the search window and writes both out-params (was a total-size stub).
+  add_executable(test_dmem tests/test_dmem.cpp)
+  target_link_libraries(test_dmem PRIVATE prosper_core)
+  add_test(NAME dmem_available COMMAND test_dmem)
+
   # PM4 command-stream decoder (front of the CommandProcessor): decode a Dcb built by the AGC
   # Dcb functions and assert the ops. Pure/cross-platform, no game dump needed.
   add_executable(test_pm4_decode tests/test_pm4_decode.cpp)
