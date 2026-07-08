@@ -279,7 +279,17 @@ void* thread_trampoline(void* p) {
     // is host glibc (host-TLS tcache) — running it under the guest %fs corrupts the host heap.
     arm_hwbp_this_thread();   // no-op unless PROSPER_HWBP_ALLTHREADS; MUST run on host %fs (host libc calls)
     guest_tls_activate_thread();
-    return entry ? entry(arg) : nullptr;
+    void* rv = entry ? entry(arg) : nullptr;
+    // Normal-return exit path: purge this thread's __tls_get_addr DTV entries and free the blocks
+    // (#68 — glibc recycles pthread ids, so a stale entry would hand the NEXT thread on this id the
+    // dead thread's dirty TLS). The guest entry can return with %fs still = the guest TP
+    // (PROSPER_GUEST_FS), and the purge is host libc (mutex/free), so run it under the host %fs
+    // (scoped swap; both calls are no-ops when the gate is off / not on a guest TCB). Threads that
+    // exit via scePthreadExit never get here — k_pthread_exit purges before host pthread_exit.
+    uint64_t sfs = guest_fs_to_host_scoped();
+    tls_dtv_purge_current_thread();
+    guest_fs_restore_scoped(sfs);
+    return rv;
 }
 }
 #endif
@@ -322,7 +332,15 @@ HLE(k_pthread_create) {
 }
 HLE(k_pthread_join)   { void* rv = nullptr; pthread_join((pthread_t)a0, a1 ? &rv : nullptr); if (a1) *(void**)(uintptr_t)a1 = rv; return 0; }
 HLE(k_pthread_detach) { pthread_detach((pthread_t)a0); return 0; }
-HLE(k_pthread_exit)   { pthread_exit((void*)(uintptr_t)a0); return 0; }
+HLE(k_pthread_exit)   {
+    // Host pthread_exit unwinds without ever returning through thread_trampoline, so this is its own
+    // thread-exit path: purge the exiting thread's __tls_get_addr DTV first (#68). HLE handlers run
+    // under the HOST %fs (the import stubs swap), so the host libc below is safe. No-op for threads
+    // that never touched __tls_get_addr.
+    tls_dtv_purge_current_thread();
+    pthread_exit((void*)(uintptr_t)a0);
+    return 0;
+}
 
 // --- thread-local storage keys (IL2CPP uses these heavily) -> host pthread keys ---
 HLE(k_key_create) {
@@ -687,7 +705,35 @@ HLE(k_dlsym) {   // sceKernelDlsym(SceKernelModule handle, const char* name, voi
 // module id, lazily allocated from the module's PT_TLS template (memsz block, filesz copied from
 // the init image, tbss zeroed). This is the general-dynamic model — no %fs needed (that's only for
 // the main exe's initial-exec TLS, which the current boot already tolerates).
-namespace { std::vector<TlsModuleDesc> g_tls_mods; }
+namespace {
+std::vector<TlsModuleDesc> g_tls_mods;
+// Per-thread DTV (thread -> module id -> TLS block). MUST NOT use a host `thread_local`: guest threads
+// run under the GUEST %fs, and host thread_local storage is %fs-relative, so it ALIASES guest memory —
+// reads come back as garbage (an unordered_map whose bucket_count reads 0 → `hash % 0` → SIGFPE).
+// This is the same host↔guest %fs-aliasing landmine as the GfxDevice boot wall. Key by
+// std::thread::id in a mutex-guarded global map instead. CONFIDENCE: HIGH (root-caused via gdb:
+// SIGFPE in k_tls_get_addr with a corrupt thread_local map under a guest %fs).
+// The map is PURGED on every HLE-controlled thread-exit path (thread_trampoline return +
+// scePthreadExit/pthread_exit) via tls_dtv_purge_current_thread(): glibc recycles pthread ids, so a
+// stale entry would hand a NEW thread the dead thread's dirty TLS blocks instead of the fresh
+// zero/tdata-initialized state the ABI guarantees — and the blocks would leak per thread churn (#68).
+std::mutex g_dtv_mx;
+std::unordered_map<std::thread::id, std::unordered_map<uint64_t, void*>> g_dtv;
+}
+void tls_dtv_purge_current_thread() {
+    std::unordered_map<uint64_t, void*> mine;
+    { std::lock_guard<std::mutex> lk(g_dtv_mx);
+      auto it = g_dtv.find(std::this_thread::get_id());
+      if (it == g_dtv.end()) return;   // main/host threads may never have touched __tls_get_addr
+      mine = std::move(it->second);
+      g_dtv.erase(it);
+    }
+    for (auto& kv : mine) free(kv.second);   // free the blocks outside the lock
+}
+size_t tls_dtv_thread_count() {   // test/diagnostic introspection: threads with live DTV entries
+    std::lock_guard<std::mutex> lk(g_dtv_mx);
+    return g_dtv.size();
+}
 void set_tls_modules(const TlsModuleDesc* descs, size_t count) {
     g_tls_mods.assign(descs, descs + count);
     if (getenv("PROSPER_TLSLOG"))
@@ -700,17 +746,9 @@ HLE(k_tls_get_addr) {   // __tls_get_addr(tls_index* ti): ti[0]=module id, ti[1]
     const uint64_t* ti = (const uint64_t*)(uintptr_t)a0;
     if (!ti) return 0;
     uint64_t modid = ti[0], off = ti[1];
-    // Per-thread DTV (module id -> TLS block). MUST NOT use a host `thread_local` here: guest threads run
-    // under the GUEST %fs, and host thread_local storage is %fs-relative, so it ALIASES guest memory —
-    // reads come back as garbage (an unordered_map whose bucket_count reads 0 → `hash % 0` → SIGFPE).
-    // This is the same host↔guest %fs-aliasing landmine as the GfxDevice boot wall. Key by the host tid
-    // (a syscall, %fs-independent) in a mutex-guarded global map instead. CONFIDENCE: HIGH (root-caused
-    // via gdb: SIGFPE in k_tls_get_addr with a corrupt thread_local map under a guest %fs).
-    static std::mutex s_dtv_mx;
-    static std::unordered_map<std::thread::id, std::unordered_map<uint64_t, void*>> s_dtv;   // per-thread DTV
     std::thread::id tid = std::this_thread::get_id();   // portable per-OS-thread key (no %fs, no syscall)
-    { std::lock_guard<std::mutex> lk(s_dtv_mx);
-      auto& dtv = s_dtv[tid];
+    { std::lock_guard<std::mutex> lk(g_dtv_mx);
+      auto& dtv = g_dtv[tid];
       auto it = dtv.find(modid);
       if (it != dtv.end()) return (uint64_t)(uintptr_t)it->second + off;
     }
@@ -720,9 +758,9 @@ HLE(k_tls_get_addr) {   // __tls_get_addr(tls_index* ti): ti[0]=module id, ti[1]
         filesz = g_tls_mods[modid].filesz;
         init_va = g_tls_mods[modid].init_va;
     }
-    void* blk = calloc(1, memsz);
+    void* blk = calloc(1, memsz);   // zero-init (tbss), then copy the tdata image
     if (init_va && filesz) memcpy(blk, (const void*)(uintptr_t)init_va, filesz);
-    { std::lock_guard<std::mutex> lk(s_dtv_mx); s_dtv[tid][modid] = blk; }
+    { std::lock_guard<std::mutex> lk(g_dtv_mx); g_dtv[tid][modid] = blk; }
     return (uint64_t)(uintptr_t)blk + off;
 }
 

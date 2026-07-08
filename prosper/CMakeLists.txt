@@ -97,6 +97,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_stat PRIVATE prosper_core)
   add_test(NAME sce_stat_layout COMMAND test_stat)
 
+  # APR container registry + size-keyed read matching (issue #62): stable ids, path dedup, and
+  # the ambiguity/chunk-read refusal the read-submit path relies on. Pure, no game dump needed.
+  add_executable(test_apr_registry tests/test_apr_registry.cpp)
+  target_link_libraries(test_apr_registry PRIVATE prosper_core)
+  add_test(NAME apr_registry_size_keying COMMAND test_apr_registry)
+
   # PM4 command-stream decoder (front of the CommandProcessor): decode a Dcb built by the AGC
   # Dcb functions and assert the ops. Pure/cross-platform, no game dump needed.
   add_executable(test_pm4_decode tests/test_pm4_decode.cpp)
@@ -209,6 +215,12 @@ if(TARGET prosper_core)
     add_executable(test_rwlock_once tests/test_rwlock_once.cpp)
     target_link_libraries(test_rwlock_once PRIVATE prosper_core)
     add_test(NAME rwlock_once_semantics COMMAND test_rwlock_once)
+
+    # __tls_get_addr per-thread DTV is purged (blocks freed) on both thread-exit paths (#68):
+    # a recycled pthread id must get fresh zero/tdata-initialized TLS, never a dead thread's bytes.
+    add_executable(test_tls_dtv_purge tests/test_tls_dtv_purge.cpp)
+    target_link_libraries(test_tls_dtv_purge PRIVATE prosper_core)
+    add_test(NAME tls_dtv_purge_on_thread_exit COMMAND test_tls_dtv_purge)
 
     add_executable(test_agc_dcb tests/test_agc_dcb.cpp)
     target_link_libraries(test_agc_dcb PRIVATE prosper_core)

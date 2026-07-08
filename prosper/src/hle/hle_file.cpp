@@ -381,12 +381,32 @@ std::string prosper_apr_path_for_id(uint32_t id) {
     std::lock_guard<std::mutex> lk(g_apr_mx);
     return (id >= 1 && id <= g_apr_files.size()) ? g_apr_files[id - 1].path : std::string();
 }
-// Find the resolved host path for a given file size (the APR read-request object carries the total
-// size at obj+0x30 but no directly-legible id; sizes of the boot-critical containers are distinct).
-static std::string apr_path_for_size(uint64_t size) {
+// Register a resolved container and return its stable 1-based id. Re-resolving the same host path
+// returns the existing id (updated size) instead of a duplicate entry — a duplicate would make
+// every size-keyed read of that file look ambiguous. Exposed (not static) for the unit test.
+uint32_t prosper_apr_register(const std::string& path, uint64_t size) {
     std::lock_guard<std::mutex> lk(g_apr_mx);
-    for (auto& f : g_apr_files) if (f.size == size) return f.path;
-    return {};
+    for (size_t i = 0; i < g_apr_files.size(); i++)
+        if (g_apr_files[i].path == path) { g_apr_files[i].size = size; return (uint32_t)(i + 1); }
+    g_apr_files.push_back({ path, size });
+    return (uint32_t)g_apr_files.size();
+}
+// Test hook: drop all registered containers (the registry is process-global).
+void prosper_apr_reset_for_test() {
+    std::lock_guard<std::mutex> lk(g_apr_mx);
+    g_apr_files.clear();
+}
+// Find resolved host paths whose TOTAL size equals `size`. Returns the match count and sets
+// *out_path to the first match. The read path may only act on an unambiguous (count==1) match:
+// the APR read-request object carries the total byte count at obj+0x30 but the file id is NOT
+// legible in the captured request layout (docs/UE4_APR_IOSTORE_BRINGUP.md field map, +0x00..+0x40),
+// so size is the only correlation currently available. Exposed (not static) for the unit test.
+int prosper_apr_match_by_size(uint64_t size, std::string* out_path) {
+    std::lock_guard<std::mutex> lk(g_apr_mx);
+    int n = 0;
+    for (auto& f : g_apr_files)
+        if (f.size == size) { if (n++ == 0 && out_path) *out_path = f.path; }
+    return n;
 }
 HLE(f_apr_resolve) {
     const char** paths = (const char**)P(a0);
@@ -408,7 +428,14 @@ HLE(f_apr_resolve) {
 #endif
         else { if (out_ids) out_ids[i] = 0; if (out_sizes) out_sizes[i] = 0; if (out_flags) out_flags[i] = 0;
                if (filelog()) fprintf(stderr, "[apr] resolve MISS %s\n", gp ? gp : "(null)"); continue; }
-        { std::lock_guard<std::mutex> lk(g_apr_mx); g_apr_files.push_back({ host, size }); id = (uint32_t)g_apr_files.size(); }
+        // Warn loudly (unconditionally) when a DIFFERENT container shares this size: the read
+        // path is size-keyed (see f_apr_read_submit) and will refuse such reads as ambiguous.
+        std::string clash; int same_size = prosper_apr_match_by_size(size, &clash);
+        id = prosper_apr_register(host, size);
+        if (same_size > 0 && clash != host)
+            fprintf(stderr, "[apr] WARNING: %s and %s share byte size %llu — size-keyed reads of "
+                    "either will be refused as ambiguous (issue #62)\n",
+                    host.c_str(), clash.c_str(), (unsigned long long)size);
         if (out_ids)   out_ids[i]   = id;
         if (out_sizes) out_sizes[i] = size;
         if (out_flags) out_flags[i] = 0;
@@ -548,7 +575,14 @@ HLE(f_apr_read_submit) {
     uint64_t id   = a3;
     uint64_t dest = *(uint64_t*)(req + 0x20);   // begin staging / residue; diagnostics only
     std::string host = prosper_apr_path_for_id((uint32_t)id);
-    if (host.empty()) host = apr_path_for_size(*(uint64_t*)(req + 0x30));   // last-resort residue match
+    // Fallback when the id (a3) doesn't resolve: key by the request's total byte count, but ONLY on
+    // an unambiguous match — exactly one resolved container of that size (prosper_apr_match_by_size,
+    // the safe-refuse helper from master #76). Ambiguous or no match -> host stays empty and the read
+    // fails loudly below, rather than serving the wrong file's bytes.
+    if (host.empty()) {
+        std::string m;
+        if (prosper_apr_match_by_size(*(uint64_t*)(req + 0x30), &m) == 1) host = m;
+    }
     if (host.empty()) {
         if (filelog()) fprintf(stderr, "[apr] read-submit: no file for id=%llu\n",
                                (unsigned long long)id);

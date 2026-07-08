@@ -81,6 +81,15 @@ struct TlsModuleDesc { uint64_t init_va = 0, filesz = 0, memsz = 0; };
 // Install the TLS templates (call AFTER images are mapped, so init_va is readable). Enables the
 // __tls_get_addr HLE to serve real per-thread TLS blocks for loaded modules (e.g. real libc.prx).
 void set_tls_modules(const TlsModuleDesc* descs, size_t count);
+// Free + forget the CURRENT thread's __tls_get_addr DTV blocks. Called on every HLE-controlled
+// thread-exit path (thread_trampoline's normal return, scePthreadExit/pthread_exit): glibc recycles
+// pthread ids, so a stale DTV entry would hand a new thread the dead thread's dirty TLS blocks
+// instead of the fresh zero/tdata-initialized state the ABI guarantees — and leak them (#68).
+// Safe (no-op) on threads that never called __tls_get_addr, incl. the main thread.
+void tls_dtv_purge_current_thread();
+// Number of threads currently holding live DTV entries (test/diagnostic introspection: lets the
+// regression test assert that thread exit really purged — i.e. no per-thread-churn leak).
+size_t tls_dtv_thread_count();
 
 // Guest initial-exec TLS (Linux; GATED behind PROSPER_GUEST_FS, default off). Backs guest %fs-relative
 // static thread-locals by giving each guest thread its own guest TCB + Variant-II static TLS and running

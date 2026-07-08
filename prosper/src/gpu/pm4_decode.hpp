@@ -64,6 +64,16 @@ struct Pm4Command {
     uint64_t rel_value = 0;              // ReleaseMem: 64-bit fence value (for data_sel 1/2)
     bool rel_value_valid = false;        // ReleaseMem: packet was long enough to carry rel_value
 
+    // WaitRegMem — laid out by hle_agc.cpp agc_dcb_wait_reg_mem per sceAgcDcbWaitRegMem(buf, size,
+    // compare_func, op, cache_policy, address, reference, mask, poll_cycles) (Kyty
+    // GraphicsDcbWaitRegMem, Graphics.cpp:2096). Payload: [0..1]=addr, [2..3]=mask, [4..5]=reference,
+    // [6]=compare_function (PM4 WAIT_REG_MEM: 0=always 1=< 2=<= 3=== 4=!= 5=>= 6=>), [7]=interval.
+    uint64_t wm_addr = 0;                // WaitRegMem: label address to poll
+    uint64_t wm_mask = 0;                // WaitRegMem: AND-mask applied to the memory value
+    uint64_t wm_ref  = 0;                // WaitRegMem: reference value
+    uint32_t wm_func = 0;                // WaitRegMem: compare function
+    bool     wm_valid = false;           // WaitRegMem: packet carried the full operand set
+
     // WriteData — laid out by hle_agc.cpp agc_dcb_write_data per sceAgcDcbWriteData(buf, dst, cache_policy,
     // address_or_offset, data*, num_dwords, …) (Kyty GraphicsDcbWriteData, Graphics.cpp:2061). Packet
     // payload: [0]=dst, [1..2]=destination address (lo/hi), [3]=num_dwords, [4..]=inline data dwords.

@@ -65,7 +65,18 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
                         c.wd_data = (c.wd_num > 0) ? &pl[4] : nullptr;
                     }
                     break;
-                case R_WAIT_MEM_64:   c.kind = K::WaitRegMem;   break;
+                case R_WAIT_MEM_64:
+                    c.kind = K::WaitRegMem;
+                    // payload: [0..1]=addr lo/hi, [2..3]=mask lo/hi, [4..5]=reference lo/hi,
+                    // [6]=compare_function (Kyty GraphicsDcbWaitRegMem layout; see agc_dcb_wait_reg_mem).
+                    if (npl >= 7) {
+                        c.wm_addr = lo_hi(pl);
+                        c.wm_mask = (uint64_t)pl[2] | ((uint64_t)pl[3] << 32);
+                        c.wm_ref  = (uint64_t)pl[4] | ((uint64_t)pl[5] << 32);
+                        c.wm_func = pl[6];
+                        c.wm_valid = true;
+                    }
+                    break;
                 case R_RELEASE_MEM:
                     c.kind = K::ReleaseMem;
                     // payload: [0..1]=label addr lo/hi, [2]=data_sel, [3..4]=64-bit value (see agc_cb_release_mem)
