@@ -30,8 +30,21 @@ struct Rela { uint64_t r_offset, r_info; int64_t r_addend; };
 #pragma pack(pop)
 
 int64_t Module::va2foff(uint64_t va) const {
+    // Resolve against PT_LOAD segments FIRST — they define the actual mapped image,
+    // and the dynamic tables (DYNAMIC/strtab/symtab/relocs) physically live inside
+    // them. `loads` also carries non-LOAD file-backed phdrs (DYNAMIC/PROCPARAM/TLS)
+    // as a fallback for layouts where those sit outside every LOAD; but such an entry
+    // must NEVER shadow the LOAD that truly contains the VA. A DYNAMIC phdr whose own
+    // logical p_offset addresses unmapped bytes would otherwise self-resolve when its
+    // phdr precedes the covering LOAD in program-header order, returning garbage —
+    // exactly the "0 imports" boot failure in issue #113 (PPSA02664). Two passes:
+    // LOAD wins; non-LOAD only when no LOAD maps the address.
     for (auto& L : loads)
-        if (va >= L.vaddr && va < L.vaddr + L.filesz) return (int64_t)(L.file_off + (va - L.vaddr));
+        if (L.type == PT_LOAD && va >= L.vaddr && va < L.vaddr + L.filesz)
+            return (int64_t)(L.file_off + (va - L.vaddr));
+    for (auto& L : loads)
+        if (L.type != PT_LOAD && va >= L.vaddr && va < L.vaddr + L.filesz)
+            return (int64_t)(L.file_off + (va - L.vaddr));
     return -1;
 }
 const char* Module::str_at(uint64_t off) const {
