@@ -1,5 +1,10 @@
 # Cutscene render frontier — reaching the intro cutscene's pixels
 
+> **See also `CUTSCENE_PROGRESSION.md`** for the boot/load history (getting *through* IL2CPP + the async
+> loader to where the cutscene's draws are submitted). This doc is the **render** frontier that follows it:
+> those draws reach the GPU translator but don't yet produce pixels.
+
+
 > **Project context (read `../../CLAUDE.md` first).** prosper is a PS5→PC compatibility layer. This is a
 > graphics/GPU-translation work log: getting *The Messenger*'s intro cutscene to render, in-process, on the
 > developer's own machine. Standard emulator graphics work (same class as RPCS3/Dolphin/DXVK).
