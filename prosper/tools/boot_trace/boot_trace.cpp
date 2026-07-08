@@ -271,8 +271,6 @@ int main(int argc, char** argv) {
                     if (FILE* f = fopen((d + "/frame_fs.spv").c_str(), "wb")) { fwrite(items[0].fs.data(), 4, items[0].fs.size(), f); fclose(f); }
                     fprintf(stderr, "[render] dumped SPIR-V vs=%zu fs=%zu dwords\n", items[0].vs.size(), items[0].fs.size()); fflush(stderr);
                 }
-                int dn = open("/dev/null", O_WRONLY);
-                auto readable = [&](uint64_t a, size_t n){ return a > 0x1000 && dn >= 0 && write(dn, (const void*)(uintptr_t)a, n) == (ssize_t)n; };
                 // Copy [a, a+n) into dst, but stop at the first 64KB block that is NOT within a reserved guest
                 // mapping (prosper_reserved_range_state == 0). A resource's declared size (e.g. a 2048x1024
                 // atlas = 8 MB) can run past its real committed backing; an unguarded memcpy then walks off
@@ -414,7 +412,6 @@ int main(int argc, char** argv) {
                         bds.size(), bd.R.size(), bd.vcount, it.ps.topology, it.ps.color_write_mask, (int)it.ps.blend_enable);
                     bds.push_back(std::move(bd));
                 }
-                if (dn >= 0) close(dn);
                 std::vector<uint8_t> px = prosper::test::render_draws_rgba(bds, w, h);
                 int n = frame_no++;
                 if (px.empty()) {
