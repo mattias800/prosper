@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace prosper {
@@ -103,6 +104,12 @@ struct UnwindModuleDesc {
 };
 // Install module unwind descriptors (call after images are mapped). Enables sceKernelGetModuleInfoForUnwind.
 void set_unwind_modules(const UnwindModuleDesc* descs, size_t count);
+
+// Register the linked program's global export table (NID -> absolute guest address) so
+// sceKernelDlsym can resolve exported symbols by name. Unity's native-plugin loader dlsym's
+// UnityPluginLoad / PSN_PrxInitialize / etc. by name; k_dlsym hashes the name (nid_hash) and
+// returns the matching export address (e.g. into the loaded PSN.prx). Pointer must outlive the run.
+void set_module_exports(const std::unordered_map<std::string, uint64_t>* exports);
 
 // Guest address of the main module's SCE_PROCPARAM segment. sceKernelGetProcParam returns this;
 // real libc reads its heap/malloc config (sceLibcParam) from it, so a correct value is required for

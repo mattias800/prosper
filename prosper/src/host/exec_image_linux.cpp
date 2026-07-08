@@ -1200,7 +1200,11 @@ size_t run_guest_inits(const std::vector<uint64_t>& fns) {
     size_t ok = 0;
     for (uint64_t f : fns) {
         g_trap_kind = 0; g_armed_tid = cur_tid();
-        if (sigsetjmp(g_jb, 1) == 0) { ((void (*)())(uintptr_t)f)(); ok++; }
+        // Call with the PS5 module-entry ABI module_start(size_t argc, const void* argp): pass argc=0,
+        // argp=NULL. Plain init_array ctors take no args and harmlessly ignore rdi/rsi (SysV), but a real
+        // module_start (e.g. the PSN.prx / SaveData.prx plugins) READS these — calling f() left garbage in
+        // rdi/rsi, so it dereferenced a garbage argp and faulted at boot (SIGSEGV addr=0x1/0x5). CONFIDENCE: HIGH.
+        if (sigsetjmp(g_jb, 1) == 0) { ((void (*)(uint64_t, uint64_t))(uintptr_t)f)(0, 0); ok++; }
         g_armed_tid = 0;
         if (g_trap_kind) fprintf(stderr, "[prosper] init fn 0x%llx faulted (%s); continuing\n",
                                  (unsigned long long)f, trap_detail().c_str());

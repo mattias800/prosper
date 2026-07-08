@@ -44,20 +44,25 @@ using namespace prosper;
 
 // Module bases (keep in sync with the inputs below).
 static const uint64_t EBOOT = 0x400000000ull, IL2CPP = 0x440000000ull, PS5UTIL = 0x4c0000000ull,
-                      LIBC = 0x500000000ull, STUB = 0x600000000ull;
+                      PSN = 0x4e0000000ull, SAVEDATA = 0x4f0000000ull, LIBC = 0x500000000ull,
+                      STUB = 0x600000000ull;
 static const char* cls(uint64_t a) {
-    if (a >= EBOOT   && a < IL2CPP)  return "eboot";
-    if (a >= IL2CPP  && a < PS5UTIL) return "Il2cpp";
-    if (a >= PS5UTIL && a < LIBC)    return "PS5Util";
-    if (a >= LIBC    && a < STUB)    return "libc.prx";
-    if (a >= STUB    && a < 0x610000000ull) return "STUB";
+    if (a >= EBOOT    && a < IL2CPP)   return "eboot";
+    if (a >= IL2CPP   && a < PS5UTIL)  return "Il2cpp";
+    if (a >= PS5UTIL  && a < PSN)      return "PS5Util";
+    if (a >= PSN      && a < SAVEDATA) return "PSN.prx";
+    if (a >= SAVEDATA && a < LIBC)     return "SaveData.prx";
+    if (a >= LIBC     && a < STUB)     return "libc.prx";
+    if (a >= STUB     && a < 0x610000000ull) return "STUB";
     return "mapped/host";
 }
 static uint64_t bof(uint64_t a) {
-    if (a >= EBOOT   && a < IL2CPP)  return a - EBOOT;
-    if (a >= IL2CPP  && a < PS5UTIL) return a - IL2CPP;
-    if (a >= PS5UTIL && a < LIBC)    return a - PS5UTIL;
-    if (a >= LIBC    && a < STUB)    return a - LIBC;
+    if (a >= EBOOT    && a < IL2CPP)   return a - EBOOT;
+    if (a >= IL2CPP   && a < PS5UTIL)  return a - IL2CPP;
+    if (a >= PS5UTIL  && a < PSN)      return a - PS5UTIL;
+    if (a >= PSN      && a < SAVEDATA) return a - PSN;
+    if (a >= SAVEDATA && a < LIBC)     return a - SAVEDATA;
+    if (a >= LIBC     && a < STUB)     return a - LIBC;
     return a;
 }
 
@@ -71,8 +76,21 @@ int main(int argc, char** argv) {
         { d + "/eboot.bin", EBOOT },
         { d + "/Media/Modules/Il2cppUserAssemblies.prx", IL2CPP },
         { d + "/Media/Modules/PS5Util.prx", PS5UTIL },
+        // Native PSN Unity plugin. Loading it as a guest module (its imports resolve to our HLE)
+        // makes its exports — PSN_PrxInitialize / PSN_PrxUpdate / UnityPluginLoad — reachable via
+        // sceKernelDlsym, so the managed PSN bootstrap (Unity.PSN.PS5.Main.Initialize) can start the
+        // async worker pool. Gate behind PROSPER_NO_PSN=1 to fall back to the 4-module boot.
+        { d + "/Media/Plugins/PSN.prx", PSN },
+        // Native SaveData Unity plugin — exports PrxSaveDataInitialize / PrxSaveDataMount / etc. The
+        // managed SaveData layer dlsym's these at startup to read the save slot (new-game vs. continue),
+        // which gates the transition from the loading screen into the intro. Same load path as PSN.prx.
+        { d + "/Media/Plugins/SaveData.prx", SAVEDATA },
         { d + "/sce_module/libc.prx", LIBC },
     };
+    if (getenv("PROSPER_NO_PSN"))
+        for (size_t i = in.size(); i-- > 0; )
+            if (in[i].path.find("PSN.prx") != std::string::npos ||
+                in[i].path.find("SaveData.prx") != std::string::npos) in.erase(in.begin() + (ptrdiff_t)i);
     // Cross-title tolerance (docs/CROSS_ENGINE_UE4.md step 1, minimal form): drop dependent modules
     // whose file doesn't exist in this dump — e.g. the UE4 title ships no Il2cpp/PS5Util, so it links
     // eboot + libc.prx only. The eboot (index 0) is always kept; each module keeps its fixed base.
@@ -84,6 +102,11 @@ int main(int argc, char** argv) {
     if (!link_program(in, STUB, p, &e)) { printf("link failed: %s\n", e.c_str()); return 1; }
     printf("linked %zu modules; %zu imports (%zu cross-module, %zu stub slots); %zu init fns\n",
            p.mods.size(), p.total_imports, p.resolved_cross_module, p.slots.size(), p.init_fns.size());
+
+    // Let sceKernelDlsym resolve exported symbols by name against all loaded modules (e.g. the
+    // PSN.prx plugin's PSN_PrxInitialize / UnityPluginLoad), so Unity's native-plugin loader binds
+    // real export addresses instead of getting ESRCH.
+    set_module_exports(&p.exports);
 
     register_builtin_hle();
 #ifdef PROSPER_AUDIO_SDL3

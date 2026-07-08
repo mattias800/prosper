@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace prosper {
@@ -27,6 +28,11 @@ struct Program {
     std::vector<TlsTemplate>             tls_templates; // indexed by module TLS id (0 = unused)
     uint64_t entry = 0;                            // main module entry
     uint64_t stub_base = 0, stub_size = 96;   // 96 leaves room for the gated guest-%fs swap stub (~74 bytes)
+
+    // Global export table: NID -> absolute guest address (first definition wins). Retained so the
+    // HLE can serve sceKernelDlsym by name (nid_hash(name)) against loaded modules — e.g. resolve
+    // the native PSN.prx plugin's PSN_PrxInitialize / UnityPluginLoad exports for Unity's plugin loader.
+    std::unordered_map<std::string, uint64_t> exports;
 
     // Stats for reporting.
     size_t total_imports = 0, resolved_cross_module = 0, stubbed = 0;
