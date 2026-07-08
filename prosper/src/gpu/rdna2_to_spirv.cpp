@@ -922,7 +922,8 @@ CountedLoop detect_counted_loop(const std::vector<Rdna2Inst>& ins) {
 struct ForwardIf {
     bool found = false;
     uint32_t branch_pc = 0, target_pc = 0;
-    bool on_scc0 = true;   // s_cbranch_scc0 (branch taken == skip block when SCC==0) vs scc1
+    bool on_scc0 = true;   // s_cbranch_scc0/vccz (branch taken == skip block when flag==0) vs scc1/vccnz
+    bool on_vcc  = false;  // condition register: false = SCC, true = VCC (both are wave-uniform branches)
 };
 ForwardIf detect_forward_if(const std::vector<Rdna2Inst>& ins) {
     ForwardIf F; const Rdna2Inst* br = nullptr; int nbranch = 0; uint32_t end_pc = UINT32_MAX;
@@ -931,15 +932,19 @@ ForwardIf detect_forward_if(const std::vector<Rdna2Inst>& ins) {
         if (in.is_end) break;
         if (in.fmt != Rdna2Format::SOPP) continue;
         switch (in.opcode) {
-            case 0x02: case 0x06: case 0x07: case 0x08: case 0x09:   // any other branch class -> reject
-                return F;
-            case 0x04: case 0x05:                                    // scc0 / scc1
+            case 0x02: case 0x06: case 0x07: case 0x08: case 0x09:   // s_branch / vcc* / execz / execnz -> reject
+                return F;                                            // (VCC branches need a wave-uniform test)
+            case 0x04: case 0x05:                                    // scc0 / scc1 (SCC is scalar/wave-uniform)
                 br = &in; nbranch++; break;
             default: break;                                          // hints (nop/waitcnt/…) are fine
         }
     }
     if (nbranch != 1 || !br) return F;
-    const uint32_t tgt = branch_target(*br);
+    uint32_t tgt = branch_target(*br);
+    // Early-out: a forward branch to the instruction AFTER s_endpgm skips the rest of the shader. Clamp the
+    // merge to end_pc so the conditional block is [branch_pc+1, end_pc) (the skipped work) and s_endpgm is
+    // emitted normally after the merge — the exact "if (cond) { work } end" early-out shape.
+    if (tgt > end_pc && tgt != UINT32_MAX) tgt = end_pc;
     if (tgt <= br->pc || tgt > end_pc) return F;                     // must be forward, within the stream
     F.found = true; F.branch_pc = br->pc; F.target_pc = tgt; F.on_scc0 = (br->opcode == 0x04);
     return F;
@@ -1957,8 +1962,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         for (int r : ifs) pre_s[r] = sget(r);
         uint32_t pre_scc = rs.scc, pre_vcc = rs.vcc;
         const uint32_t preblock = b.cur_block;              // block holding the OpBranchConditional (skip edge)
-        // scc0: branch (skip block) taken when SCC==0 → the block runs when SCC!=0; scc1 is the inverse.
-        uint32_t exec_cond = F.on_scc0 ? rs.scc : b.bsel(rs.scc, b.bfalse(), b.btrue());
+        // scc0/vccz: branch (skip block) taken when the flag==0 → the block runs when flag!=0; scc1/vccnz
+        // are the inverse. The condition register is SCC or VCC (both scalar/wave-uniform for these branches).
+        uint32_t cond_reg  = F.on_vcc ? rs.vcc : rs.scc;
+        uint32_t exec_cond = F.on_scc0 ? cond_reg : b.bsel(cond_reg, b.bfalse(), b.btrue());
         uint32_t thenL = b.id(), mergeL = b.id();
         b.emit_selmerge(mergeL); b.emit_condbranch(exec_cond, thenL, mergeL);
         b.emit_label(thenL);
