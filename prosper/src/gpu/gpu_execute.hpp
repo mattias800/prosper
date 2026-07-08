@@ -91,7 +91,8 @@ inline bool realize_draw_item(const GpuState& ds, uint32_t vcount_hint, uint32_t
     // Skip a draw with no color writes: it contributes no pixels, so recording it (and, in the single-item
     // case, presenting its bare clear) would just overwrite the last real frame (an art/clear flicker).
     if (ps.color_write_mask == 0 && !getenv("PROSPER_FORCE_COLORWRITE")) {
-        if (log) fprintf(stderr, "[exec] skip draw: color_write_mask==0 (no-op)\n");
+        if (log) fprintf(stderr, "[exec] skip draw: color_write_mask==0 (no-op) cb_target_mask=0x%x cb_color_control=0x%x color0_fmt=%u\n",
+                         rs.cb_target_mask, rs.cb_color_control, ps.color0_format);
         return false;
     }
     // PROSPER_FORCE_COLORWRITE: diagnostic — render color_write_mask==0 draws anyway (force mask to RGBA).

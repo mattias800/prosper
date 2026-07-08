@@ -184,6 +184,23 @@ static void preadlog(const char* fn, uint64_t fd, uint64_t off, uint64_t cnt) {
             fn, base, (long long)fd, (unsigned long long)off, (long long)(off / 0x10000),
             (unsigned long long)cnt, (long)syscall(SYS_gettid),
             (unsigned long long)cc[0], (unsigned long long)cc[1], (unsigned long long)cc[2]);
+    // PROSPER_DEEPTRACE: on the block-966 thrash reads of resources.assets (the cutscene deser loop,
+    // blk 961..966 = 0x3c10000..0x3c60000), dump a DEEP guest backtrace including il2cpp frames — reveals
+    // the loop head + whether il2cpp reflection/deser is in the chain. Rate-limited to avoid spam.
+    static int deep_budget = getenv("PROSPER_DEEPTRACE") ? 30 : 0;
+    if (deep_budget > 0 && !strcmp(base, "resources.assets") && off >= 0x3c10000ull && off <= 0x3c60000ull) {
+        deep_budget--;
+        char line[1024]; int p = snprintf(line, sizeof line, "[deeptrace] blk %lld frames:", (long long)(off / 0x10000));
+        int nf = 0; uint64_t last = 0;
+        for (int i = 0; i < 1600 && nf < 20 && p < (int)sizeof line - 24; i++) {
+            uint64_t v = sp[i];
+            const char* m = nullptr; uint64_t o = 0;
+            if (v >= 0x400000000ull && v < 0x420000000ull) { m = "eb"; o = v - 0x400000000ull; }
+            else if (v >= 0x440000000ull && v < 0x4c0000000ull) { m = "il"; o = v - 0x440000000ull; }
+            if (m && o != last) { p += snprintf(line + p, sizeof line - p, " %s+%llx", m, (unsigned long long)o); last = o; nf++; }
+        }
+        fprintf(stderr, "%s\n", line);
+    }
 }
 #else
 static bool fdlog_on() { return false; }
