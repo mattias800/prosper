@@ -453,8 +453,15 @@ bool execute_and_present(const GpuState& st, uint32_t width, uint32_t height) {
     if (!g_live || st.draws.empty() || !width || !height) return false;
     // Bind the target dimensions and defer to the pure core, which recompiles the shaders from their
     // SHADER_PGM addresses and resolves fixed-function state before calling back into the live renderer.
+    // Scale the guest viewport to our framebuffer: `width`/`height` are the render target (reduced by
+    // PROSPER_RENDER_SCALE), while the guest programs its viewport in full present-resolution pixels — so
+    // without this a 1/N render shows only the bottom-left 1/N of the frame.
+    uint32_t fw = present_width(), fh = present_height();
+    float sx = fw ? (float)width  / (float)fw : 1.0f;
+    float sy = fh ? (float)height / (float)fh : 1.0f;
     std::vector<uint8_t> px = execute_gpustate(st,
-        [&](const std::vector<DrawItem>& items) { return g_live(items, width, height); });
+        [&](const std::vector<DrawItem>& items) { return g_live(items, width, height); },
+        0x10000, sx, sy);
     if (px.size() != static_cast<size_t>(width) * height * 4) return false;   // recompile/render failed
     present_write_frame(px.data(), width, height);
     return true;
