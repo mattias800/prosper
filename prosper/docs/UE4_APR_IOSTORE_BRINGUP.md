@@ -71,6 +71,25 @@ destination stays empty and the guest's reader returns error `24`.
 Route (B) is the recommended first step: it needs only the descriptor layout (dump the 0x90 bytes
 at the `0x23d7232` call — offset, dest, size, id) and the existing `prosper_apr_path_for_id` hook.
 
+### Read-submit function IDENTIFIED and initial executor implemented
+
+Tracing `readFile` (guest `0x59b6110`, a thin wrapper) → import thunk `0x669ae90` → GOT
+`0x409490678` → stub `0x600028810` = **`libSceAmpr::mQ16-QdKv7k`** (stub #1728 — *beyond* the 28
+Ampr stubs the earlier sweep covered, which is why it was never seen). NOT one of the setup trio.
+
+Live-captured call: `mQ16(readReq, &cur1, &cur2, count, outDescBuf, descSize=0x90)`. The
+read-request object (`readReq`, on stack) layout: `+0x18` = destination buffer VA
+(`0x7fffeb400000`), `+0x20` = second buffer, `+0x30` = total byte count (`0x285` = 645 = exactly
+`global.utoc`'s size), `+0x28` = post-failure result word (`0x24`=err 36, `0x28`=CB offset 40).
+The file id is NOT directly legible in `readReq`.
+
+Initial executor (`hle_file.cpp` `f_apr_read_submit`, registered for `mQ16-QdKv7k`): read
+`*(readReq+0x30)` bytes from the resolved host file into `*(readReq+0x18)` via `pread(offset 0)`.
+File matched by size (boot-container sizes are distinct; the id isn't in the request). This is the
+first milestone — get the (uncompressed) global TOC to load and expose the next wall. Iterate:
+non-zero read offsets and the file-id linkage will be needed for the compressed `.ucas` chunk
+reads that follow.
+
 ## Remaining work to the first frame (the subsystem)
 
 This is genuine subsystem construction, sized (per `CROSS_ENGINE_UE4.md`) like a second-title
