@@ -374,10 +374,15 @@ HLE(k_setspecific)   { return (uint64_t)(int64_t)pthread_setspecific((pthread_ke
 
 // --- event flags (SceKernelEventFlag): a bit pattern with wait/set/clear ---
 namespace {
-    struct EventFlag { pthread_mutex_t m; pthread_cond_t c; uint64_t bits; };
+    // `deleted` + `waiters` make sceKernelDeleteEventFlag safe against blocked waiters: delete marks
+    // the flag, wakes everyone, and defers destroy+free to the last waiter leaving (or frees now if
+    // none are parked). Freeing under a live pthread_cond_wait is a UAF — destroying a condvar with
+    // waiters is explicitly UB.
+    struct EventFlag { pthread_mutex_t m; pthread_cond_t c; uint64_t bits; bool deleted; int waiters; };
     bool evf_match(uint64_t bits, uint64_t pat, uint32_t mode) {
         return (mode & 0x1) ? ((bits & pat) == pat) : ((bits & pat) != 0);  // AND vs OR
     }
+    void ef_destroy(EventFlag* e) { pthread_mutex_destroy(&e->m); pthread_cond_destroy(&e->c); free(e); }
 }
 HLE(k_ef_create) {   // (ef*, name, attr, initPattern, opt)
     auto* e = (EventFlag*)calloc(1, sizeof(EventFlag));
@@ -385,7 +390,16 @@ HLE(k_ef_create) {   // (ef*, name, attr, initPattern, opt)
     if (a0) *(void**)(uintptr_t)a0 = e;
     return 0;
 }
-HLE(k_ef_delete)  { if (a0) free((void*)(uintptr_t)a0); return 0; }
+HLE(k_ef_delete)  {
+    auto* e = (EventFlag*)(uintptr_t)a0; if (!e) return 0;
+    pthread_mutex_lock(&e->m);
+    e->deleted = true;
+    pthread_cond_broadcast(&e->c);                 // wake every waiter -> they return EACCES
+    bool has_waiters = e->waiters > 0;
+    pthread_mutex_unlock(&e->m);
+    if (!has_waiters) ef_destroy(e);               // none parked -> free now; else the last waiter frees
+    return 0;
+}
 HLE(k_ef_set)     { auto* e = (EventFlag*)(uintptr_t)a0; if (!e) return 0; pthread_mutex_lock(&e->m); e->bits |= a1; pthread_cond_broadcast(&e->c); pthread_mutex_unlock(&e->m); return 0; }
 HLE(k_ef_clear)   { auto* e = (EventFlag*)(uintptr_t)a0; if (!e) return 0; pthread_mutex_lock(&e->m); e->bits &= a1; pthread_mutex_unlock(&e->m); return 0; }
 // Absolute CLOCK_REALTIME deadline `usec` microseconds from now (for pthread_cond_timedwait
@@ -405,25 +419,30 @@ HLE(k_ef_wait)    { // (ef, pattern, waitMode, resultPat*, SceKernelUseconds* ti
     auto* e = (EventFlag*)(uintptr_t)a0; if (!e) return 0;
     uint64_t ret = 0;
     pthread_mutex_lock(&e->m);
+    e->waiters++;
     if (a4) {
         uint32_t usec = *(uint32_t*)(uintptr_t)a4;
         timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
         timespec dl = abs_deadline_us(usec);
         int rc = 0;
-        while (!evf_match(e->bits, a1, (uint32_t)a2) && rc != ETIMEDOUT)
+        while (!evf_match(e->bits, a1, (uint32_t)a2) && rc != ETIMEDOUT && !e->deleted)
             rc = pthread_cond_timedwait(&e->c, &e->m, &dl);
         timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
         int64_t spent_i = (int64_t)(t1.tv_sec - t0.tv_sec) * 1000000
                         + ((int64_t)t1.tv_nsec - (int64_t)t0.tv_nsec) / 1000;
         uint64_t spent = spent_i < 0 ? 0u : (uint64_t)spent_i;
         *(uint32_t*)(uintptr_t)a4 = spent >= usec ? 0u : (uint32_t)(usec - spent);
-        if (!evf_match(e->bits, a1, (uint32_t)a2)) ret = 0x8002003Cull;  // KERNEL_ERROR_ETIMEDOUT
+        if (!e->deleted && !evf_match(e->bits, a1, (uint32_t)a2)) ret = 0x8002003Cull;  // ETIMEDOUT
     } else {
-        while (!evf_match(e->bits, a1, (uint32_t)a2)) pthread_cond_wait(&e->c, &e->m);
+        while (!evf_match(e->bits, a1, (uint32_t)a2) && !e->deleted) pthread_cond_wait(&e->c, &e->m);
     }
+    bool deleted = e->deleted;                     // deleted under us -> EACCES (Kyty EventFlag.cpp)
+    if (deleted) ret = 0x8002000Dull;
     uint64_t res = e->bits;
     if (!ret) { if (a2 & 0x10) e->bits = 0; else if (a2 & 0x20) e->bits &= ~a1; }  // CLEAR_ALL / CLEAR_PAT
+    bool last = (--e->waiters == 0) && deleted;    // last waiter out of a deleted flag frees it
     pthread_mutex_unlock(&e->m);
+    if (last) ef_destroy(e);                        // safe: `res` was copied before the free
     if (a3) *(uint64_t*)(uintptr_t)a3 = res;
     return ret;
 }
@@ -438,7 +457,12 @@ HLE(k_ef_poll)    { // (ef, pattern, waitMode, resultPat*)
 }
 
 // --- semaphores (SceKernelSema): counting sem with wait/signal ---
-namespace { struct Sema { pthread_mutex_t m; pthread_cond_t c; int64_t count; }; }
+// deleted/waiters: same defer-free-to-last-waiter scheme as EventFlag above (delete under a blocked
+// waiter would otherwise free the mutex/condvar out from under it — UAF).
+namespace {
+    struct Sema { pthread_mutex_t m; pthread_cond_t c; int64_t count; bool deleted; int waiters; };
+    void sema_destroy(Sema* s) { pthread_mutex_destroy(&s->m); pthread_cond_destroy(&s->c); free(s); }
+}
 HLE(k_sema_create) { // (sema*, name, attr, initCount, maxCount, opt)
     auto* s = (Sema*)calloc(1, sizeof(Sema));
     pthread_mutex_init(&s->m, nullptr); pthread_cond_init(&s->c, nullptr); s->count = (int64_t)(int32_t)a3;
@@ -448,29 +472,43 @@ HLE(k_sema_create) { // (sema*, name, attr, initCount, maxCount, opt)
                          (long long)(int32_t)a3, (long long)(int32_t)a4);
     return 0;
 }
-HLE(k_sema_delete) { if (a0) free((void*)(uintptr_t)a0); return 0; }
+HLE(k_sema_delete) {
+    auto* s = (Sema*)(uintptr_t)a0; if (!s) return 0;
+    pthread_mutex_lock(&s->m);
+    s->deleted = true;
+    pthread_cond_broadcast(&s->c);
+    bool has_waiters = s->waiters > 0;
+    pthread_mutex_unlock(&s->m);
+    if (!has_waiters) sema_destroy(s);
+    return 0;
+}
 HLE(k_sema_wait)   { // (sema, need, SceKernelUseconds* timeout) — timeout honored like k_ef_wait
     auto* s = (Sema*)(uintptr_t)a0; if (!s) return 0; int64_t need = a1 ? (int64_t)a1 : 1;
     if (sclog()) fprintf(stderr, "[sync2] T%ld SEMA.wait     sema=0x%llx need=%lld\n", sctid(), (unsigned long long)a0, (long long)need);
     uint64_t ret = 0;
     pthread_mutex_lock(&s->m);
+    s->waiters++;
     if (a2) {
         uint32_t usec = *(uint32_t*)(uintptr_t)a2;
         timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
         timespec dl = abs_deadline_us(usec);
         int rc = 0;
-        while (s->count < need && rc != ETIMEDOUT) rc = pthread_cond_timedwait(&s->c, &s->m, &dl);
+        while (s->count < need && rc != ETIMEDOUT && !s->deleted) rc = pthread_cond_timedwait(&s->c, &s->m, &dl);
         timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
         int64_t spent_i = (int64_t)(t1.tv_sec - t0.tv_sec) * 1000000
                         + ((int64_t)t1.tv_nsec - (int64_t)t0.tv_nsec) / 1000;
         uint64_t spent = spent_i < 0 ? 0u : (uint64_t)spent_i;
         *(uint32_t*)(uintptr_t)a2 = spent >= usec ? 0u : (uint32_t)(usec - spent);
-        if (s->count < need) ret = 0x8002003Cull;    // KERNEL_ERROR_ETIMEDOUT
+        if (!s->deleted && s->count < need) ret = 0x8002003Cull;    // KERNEL_ERROR_ETIMEDOUT
     } else {
-        while (s->count < need) pthread_cond_wait(&s->c, &s->m);
+        while (s->count < need && !s->deleted) pthread_cond_wait(&s->c, &s->m);
     }
+    bool deleted = s->deleted;                       // deleted under us -> EACCES
+    if (deleted) ret = 0x8002000Dull;
     if (!ret) s->count -= need;
+    bool last = (--s->waiters == 0) && deleted;
     pthread_mutex_unlock(&s->m);
+    if (last) sema_destroy(s);
     return ret; }
 HLE(k_sema_signal) { auto* s = (Sema*)(uintptr_t)a0; if (!s) return 0; int64_t n = a1 ? (int64_t)a1 : 1;
     if (sclog()) fprintf(stderr, "[sync2] T%ld SEMA.signal   sema=0x%llx n=%lld\n", sctid(), (unsigned long long)a0, (long long)n);
