@@ -426,7 +426,17 @@ HLE(f_apr_read_submit) {
 #ifndef _WIN32
     int fd = ::open(host.c_str(), O_RDONLY);
     if (fd < 0) return 0x80020016ull;
-    ssize_t got = ::pread(fd, (void*)(uintptr_t)dest, (size_t)size, 0);
+    // DIAGNOSTIC (PROSPER_APR_NOWRITE): read into a HOST scratch instead of the guest dest, to test
+    // whether the engine actually reads the TOC from `dest` (req+0x20). If the boot advances the SAME
+    // as writing to dest, the engine reads the TOC elsewhere and dest is the wrong buffer.
+    static bool nowrite = getenv("PROSPER_APR_NOWRITE") != nullptr;
+    ssize_t got;
+    if (nowrite) {
+        static uint8_t scratch[1 << 20];
+        got = ::pread(fd, scratch, (size_t)(size < sizeof scratch ? size : sizeof scratch), 0);
+    } else {
+        got = ::pread(fd, (void*)(uintptr_t)dest, (size_t)size, 0);
+    }
     ::close(fd);
 #else
     FILE* f = ::fopen(host.c_str(), "rb"); if (!f) return 0x80020016ull;

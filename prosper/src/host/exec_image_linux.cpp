@@ -443,7 +443,11 @@ namespace {
             if (g_hwwatch_fd >= 0 && si->si_fd == g_hwwatch_fd) {
                 auto& gr2 = uc->uc_mcontext.gregs;
                 unsigned long long v = 0; { auto p=(volatile uint64_t*)g_hwwatch_addr; v=*p; }
-                if (g_hwwatch_count < 60) {
+                // Always log an ANOMALOUS store (not a plausible guest heap pointer 0x1000000000..
+                // 0x1720000000, and nonzero) even past the count cap — this is how a corrupt value
+                // (e.g. a magic constant landing where a pointer belongs) is caught among the churn.
+                bool anomalous = v && (v < 0x1000000000ull || v >= 0x1730000000ull);
+                if (g_hwwatch_count < 60 || anomalous) {
                     g_hwwatch_count = g_hwwatch_count + 1;
                     char b[200];
                     uint64_t wr = (uint64_t)gr2[REG_RIP];
@@ -1140,6 +1144,17 @@ void install_trap_handler() {
             }
             if (!semi) break; spec = semi + 1;
         }
+    }
+    // PROSPER_HWWATCH_ABS=0xADDR — arm a hardware WRITE-watch on a FIXED absolute guest VA right now
+    // (owner = this = the main guest thread). Unlike PROSPER_HWWATCH (register-relative, armed on the
+    // first exec-bp hit), this catches writes to a known slot with no exec breakpoint. Each write logs
+    // the writer RIP + the value stored (see the g_hwwatch handler), so a corrupt value (e.g. a magic
+    // constant landing where a pointer belongs) is traced to its writer.
+    if (const char* wa = getenv("PROSPER_HWWATCH_ABS")) {
+        uint64_t addr = strtoull(wa, nullptr, 0);
+        struct sigaction ta{}; ta.sa_sigaction = fault_handler; ta.sa_flags = SA_SIGINFO;
+        sigemptyset(&ta.sa_mask); sigaction(SIGTRAP, &ta, nullptr);
+        arm_hwwatch(addr);
     }
     // PROSPER_DUMPAT="0xADDR[,0xADDR...]" — absolute guest addresses to hex-dump at fault time.
     if (const char* da = getenv("PROSPER_DUMPAT")) {
