@@ -1679,8 +1679,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
             uint32_t offset = in.literal & 0xFFFu;
             bool offen = (in.literal >> 12) & 1u, idxen = (in.literal >> 13) & 1u;
-            uint32_t binding = 2, stride = 0;   // untyped buffer_load defaults to binding 2 (compute cbuf);
-                                                // a format load (vertex fetch) overrides with its V#'s binding
+            uint32_t binding = 2, stride = 0;   // overwritten by SRSRC resolution below whenever a resource
+                                                // table is present (format AND raw ops); the binding-2 default
+                                                // survives only on the table-less offline path (see below)
             // Format of the fetched components. Untyped buffer_load_dword* is raw 32-bit (comp_bytes=4);
             // buffer_load_format_* takes the format from the resolved V# descriptor.
             DataFormat fmt = DataFormat::Uint32;   // untyped default: raw dwords
@@ -1704,7 +1705,27 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 binding = res->binding;
                 stride = res->stride;
                 fmt = res->format;
+            } else if (rt) {
+                // RAW (untyped) MUBUF with a resource table: resolve SRSRC (src[1]) exactly like the
+                // format path — a raw buffer op targets whatever buffer its V# describes, NOT a fixed
+                // binding (#91: the old hardcoded binding-2 silently read/wrote the wrong buffer for
+                // any other target). Raw ops don't imply a resource class the way a format load implies
+                // VertexBuffer, so the direct-SGPR lookup is class-unrestricted (by_sgpr_base).
+                // Provenance order mirrors the format path: exact fetch pc, then s_load SRT tag
+                // (indirect), then user-data SGPR (direct).
+                const ShaderResource* res = rt->by_fetch_pc(in.pc);
+                if (!res) { auto it = rs.sreg_srt.find(in.src[1].value);
+                    if (it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second); }
+                if (!res) res = rt->by_sgpr_base(in.src[1].value);
+                if (!res) { ok = false; return true; }   // unresolvable V# -> reject; NEVER default to binding 2
+                binding = res->binding;
+                stride  = res->stride;
+                // fmt stays raw Uint32: untyped ops move raw dwords regardless of the V#'s declared format.
             }
+            // else (rt == nullptr): table-less offline compute shell (recompile_valu without a resource
+            // table — the unit-test harness). Keep the legacy single-cbuf convention: binding 2, stride 0.
+            // The live graphics path can never reach here table-less: recompile_vertex/recompile_fragment
+            // set allow_smem = (rt != nullptr), so MUBUF already rejected above when rt is null there.
             const uint32_t comp_bytes = data_format_bytes(fmt);
             if (comp_bytes == 0) { ok = false; return true; }   // unknown / unsupported format
             // Per-component decode. 4-byte formats (Float32/Uint32/Sint32) are a raw dword load — no
