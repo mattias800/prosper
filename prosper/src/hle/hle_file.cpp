@@ -234,7 +234,26 @@ static void preadlog(const char*, uint64_t, uint64_t, uint64_t) {}
 // spurious guest close(0) then kills a live file mid-load (proven: unity_builtin_extra's block-2
 // pread hit EBADF -> Unity silently kept a stale 64KB cache block -> deser crash at eboot+0x46beb4).
 // So: (a) never return fd<3 from open (dup up); (b) refuse guest closes of fd 0-2.
-HLE(f_open)  { std::string h = translate(CS(a0)); int fd = (int)::open(h.c_str(), (int)a1, (mode_t)a2);
+// FreeBSD/Orbis open(2) flags share only the access mode with Linux: SCE O_CREAT=0x0200,
+// O_TRUNC=0x0400, O_EXCL=0x0800 vs Linux 0x40/0x200/0x80. Passing the guest word raw turned
+// "O_WRONLY|O_CREAT" (0x201) into Linux "O_WRONLY|O_TRUNC" — write-path opens failed with
+// ENOENT on new files and silently truncated existing ones. Translate bit by bit (same
+// FreeBSD-vs-Linux reason the stat struct is already translated below).
+static int host_open_flags(uint64_t f) {
+    int h = (int)(f & 3);                       // O_RDONLY/O_WRONLY/O_RDWR coincide
+    if (f & 0x0008) h |= O_APPEND;              // FreeBSD O_APPEND
+    if (f & 0x0200) h |= O_CREAT;
+    if (f & 0x0400) h |= O_TRUNC;
+    if (f & 0x0800) h |= O_EXCL;
+#ifndef _WIN32
+    if (f & 0x0004) h |= O_NONBLOCK;
+    if (f & 0x0080) h |= O_SYNC;                // FreeBSD O_FSYNC
+    if (f & 0x0100) h |= O_NOFOLLOW;
+    if (f & 0x00020000) h |= O_DIRECTORY;
+#endif
+    return h;
+}
+HLE(f_open)  { std::string h = translate(CS(a0)); int fd = (int)::open(h.c_str(), host_open_flags(a1), (mode_t)a2);
 #ifndef _WIN32
                while (fd >= 0 && fd < 3) { int nfd = fcntl(fd, F_DUPFD, 3); ::close(fd); fd = nfd; }
 #endif
