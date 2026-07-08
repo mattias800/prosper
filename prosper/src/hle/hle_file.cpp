@@ -506,35 +506,35 @@ extern uint64_t g_apr_last_cb, g_apr_last_cb_size;
 extern "C" int prosper_reserved_range_state(uint64_t addr);
 
 #ifndef _WIN32
-// MUST NOT be `__thread` (issue #89). An initial-exec thread-local here (`%fs:...@tpoff`) grows the
-// HOST binary's static TLS block, and prosper's guest boot aliases the host TCB through %fs (the
-// guest runs on the host %fs in the non-GUEST_FS boot; the fault-recovery point was moved off
-// `__thread` to gettid-keyed globals for exactly this reason). Adding one static-TLS slot shifted
-// the layout enough to crash The Messenger's minimal boot before graphics init ~9 runs in 10 — a
-// clean bisect to 653cf6f. A plain global is captured on the SAME thread that immediately reads it
-// (the entry shim tail-jumps straight into the handler, which reads apr_stack_arg() first thing),
-// so it is correct as long as APR reads don't overlap across threads — they don't in practice: the
-// engine builds each sceAmprAprCommandBufferReadFile into its single Ampr command buffer and our
-// completion is synchronous. CONFIDENCE: HIGH on the fix (boot restored to 10/10); MED on the
-// serialized-APR assumption — if concurrent APR reads ever appear, key this by gettid (still NOT
-// __thread) rather than reintroducing static TLS.
-extern "C" uint64_t g_apr_entry_rsp;
-uint64_t g_apr_entry_rsp = 0;
+// The entry shim passes its %rsp to the C handler as a SEVENTH argument (on the stack, per SysV).
+// History: this was a plain global (`g_apr_entry_rsp`) — NOT `__thread`, because an initial-exec
+// TLS slot grows the HOST binary's static TLS block and prosper's non-GUEST_FS boot aliases the
+// host TCB through %fs (issue #89: one static-TLS slot crashed The Messenger's minimal boot 9/10).
+// The global relied on APR reads never overlapping across threads. With APR completion EVENTS
+// delivered (issue #115) the engine's loader/precacher threads DO submit concurrently, and a
+// cross-thread overwrite makes the handler read arg7 (the FILE OFFSET) from another thread's
+// frame — wrong-offset reads served as "OK" corrupt whatever the engine parses. Passing rsp as a
+// real argument is race-free with no TLS. Alignment: at shim entry rsp%16==8; the single push
+// re-aligns for the call and lands the 7th arg at the callee's [rsp+8], exactly where SysV wants
+// it. CONFIDENCE: HIGH.
 extern "C" uint64_t f_apr_read_submit_c(uint64_t a0, uint64_t a1, uint64_t a2,
-                                        uint64_t a3, uint64_t a4, uint64_t a5);
+                                        uint64_t a3, uint64_t a4, uint64_t a5,
+                                        uint64_t entry_rsp);
 asm(".text\n"
     ".globl f_apr_read_submit_entry\n"
     ".type f_apr_read_submit_entry,@function\n"
     "f_apr_read_submit_entry:\n"
-    "  movq %rsp, g_apr_entry_rsp(%rip)\n"
-    "  jmp f_apr_read_submit_c\n");
+    "  movq %rsp, %rax\n"
+    "  pushq %rax\n"
+    "  call f_apr_read_submit_c\n"
+    "  addq $8, %rsp\n"
+    "  ret\n");
 extern "C" void f_apr_read_submit_entry();
 // Fetch the Nth stack argument (0-based: arg7 is n=0) of the in-flight ReadFile call.
-static uint64_t apr_stack_arg(int n) {
-    uint64_t rsp = g_apr_entry_rsp;
-    if (!rsp) return 0;
-    // Both paths land the forwarded/natural stack args at [rsp+8] (see the layout note above).
-    return *(uint64_t*)(rsp + 0x8 + (uint64_t)n * 8);
+// Both stub paths land the forwarded/natural stack args at [entry_rsp+8] (layout note above).
+static uint64_t apr_stack_arg(uint64_t entry_rsp, int n) {
+    if (!entry_rsp) return 0;
+    return *(uint64_t*)(entry_rsp + 0x8 + (uint64_t)n * 8);
 }
 #endif
 
@@ -583,7 +583,8 @@ static bool apr_write_guest_dst(uint64_t dst, void* buf, uint64_t size) {
 
 #ifndef _WIN32
 extern "C" uint64_t f_apr_read_submit_c(uint64_t a0, uint64_t a1, uint64_t a2,
-                                        uint64_t a3, uint64_t a4, uint64_t a5) {
+                                        uint64_t a3, uint64_t a4, uint64_t a5,
+                                        uint64_t entry_rsp) {
 #else
 HLE(f_apr_read_submit) {
 #endif
@@ -595,14 +596,14 @@ HLE(f_apr_read_submit) {
                 (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)a5);
 #ifndef _WIN32
         fprintf(stderr, "[apr]   stack-args a6=0x%llx a7=0x%llx a8=0x%llx a9=0x%llx (rsp=0x%llx ret=0x%llx)\n",
-                (unsigned long long)apr_stack_arg(0), (unsigned long long)apr_stack_arg(1),
-                (unsigned long long)apr_stack_arg(2), (unsigned long long)apr_stack_arg(3),
-                (unsigned long long)g_apr_entry_rsp,
-                (unsigned long long)(g_apr_entry_rsp ? *(uint64_t*)g_apr_entry_rsp : 0));
+                (unsigned long long)apr_stack_arg(entry_rsp, 0), (unsigned long long)apr_stack_arg(entry_rsp, 1),
+                (unsigned long long)apr_stack_arg(entry_rsp, 2), (unsigned long long)apr_stack_arg(entry_rsp, 3),
+                (unsigned long long)entry_rsp,
+                (unsigned long long)(entry_rsp ? *(uint64_t*)entry_rsp : 0));
         // Guest call chain: first eboot-range return addresses on the stack (identifies which engine
         // wrapper submitted this read — sync mount path vs async FAPREventQueue path, issue #115).
-        if (g_apr_entry_rsp) {
-            const uint64_t* sp = (const uint64_t*)g_apr_entry_rsp;
+        if (entry_rsp) {
+            const uint64_t* sp = (const uint64_t*)entry_rsp;
             int shown = 0;
             for (int i = 0; i < 160 && shown < 6; i++) {
                 uint64_t v = sp[i];
@@ -673,7 +674,7 @@ HLE(f_apr_read_submit) {
     { struct stat st {}; if (::stat(host.c_str(), &st) == 0) fsize = (uint64_t)st.st_size; }
     uint64_t offset = 0;
 #ifndef _WIN32
-    offset = apr_stack_arg(0);
+    offset = apr_stack_arg(entry_rsp, 0);
 #endif
     uint64_t size = a5;
     if (offset > fsize) {

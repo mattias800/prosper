@@ -440,6 +440,37 @@ AGC RHI bring-up — AgcCleanupThread/AgcInterruptThread/AgcSubmissionThread + A
 AgcDriverAddEqEvent(id=0x20, id=0x0) + user event 6144 — then keeps loading content.** ctest
 50/50, Messenger smoke unaffected.
 
+Follow-on fixes landed in the same change (each its own live-diagnosed wall):
+
+- **POSIX `pthread_cond_timedwait` (libScePosix 27bAgiJmOh0)** implemented for real (shared
+  cond/mutex pointer-slot scheme; FreeBSD ETIMEDOUT=60). The unimplemented-0 stub returned
+  "signaled" instantly, spinning UE's `IAsyncReadRequest::WaitCompletion(timeout)` loop at 100%
+  CPU (caught live: the only busy thread's RA 0x4022ea954 inside prosper_on_unimpl).
+- **`sceRtcSetTick` / `sceRtcGetTick`** (tick <-> UTC datetime, shadPS4 semantics). Unimplemented
+  SetTick left the out datetime zeroed and UE spammed
+  `LowLevelFatalError: Invalid Date values. Y:0, M:0, D:0...` thousands of times during the
+  post-shader-map load.
+- **Per-container host fd cache for APR reads.** open()+close() per read against the 2 GB pak
+  over the WSL 9p mount cost ~1.7 s/read; the whole load phase now runs ~15x faster.
+- **Race-free stack-arg capture for `sceAmprAprCommandBufferReadFile`.** The entry shim now
+  passes its %rsp as a real 7th argument instead of a plain global — with completions delivered,
+  loader/precacher threads submit APR reads CONCURRENTLY and a cross-thread overwrite of the
+  global made the handler read the file OFFSET from another thread's frame (wrong-offset reads
+  served as "OK"). No TLS (issue #89 constraint respected).
+
+### NEW WALL: MallocBinned3 free-block canary corruption during the parallel content-load burst
+
+With loading fast and parallel, the boot dies ~10 s in, right after online init, spamming
+`LowLevelFatalError [Line: 186] MallocBinned3 Corruption Canary was 0xN, will be 0x1` (N varies
+run to run: 0x0, 0x2) until a SIGSEGV. Established so far: NOT a prosper page clobber (MEMLOG
+shows zero lazy-commit/batchmap overlaps, zero remaps, the #107 mirror is SKIPPED cleanly, and
+all 951 BatchMap ops in the window are plain op=0 commits — no unmaps); NOT caused by the RTC or
+timedwait fixes (A/B-verified: corruption persists with them unregistered, only the canary value
+changes). The phase is a burst of MallocBinned3 arena growth (hundreds of 64K batchmap commits)
+under multiple loading threads — candidates: guest-%fs TLS-cache interaction (MB3 per-thread
+caches under PROSPER_GUEST_FS), or a completion-delivery race making the engine free a block on
+two paths. Needs its own session with a HW write-watch on a corrupted free-block header.
+
 ### The remaining 3 unnamed Ampr NIDs (issue #107, not on the crash path)
 
 `vWU-odnS+fU`, `sSAUCCU1dv4`, `GnxKOHEawhk`, `H896Pt-yB4I` still resist the generated

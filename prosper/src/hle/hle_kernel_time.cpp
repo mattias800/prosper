@@ -186,6 +186,44 @@ HLE(k_rtc_get_clock_utc) {
     return 0;
 }
 
+// sceRtcSetTick(SceRtcDateTime* dt, const SceRtcTick* tick): broken-down UTC datetime from a tick
+// (u64 µs since 0001-01-01, the Orbis RTC convention above). Reference: shadPS4 rtc.cpp
+// sceRtcSetTick (tick - UNIX_EPOCH_TICKS -> gmtime). Unimplemented-0 left the out struct at the
+// caller's zero-init, and UE4's FDateTime(Y:0,M:0,D:0,...) "Invalid Date values" fatal spammed
+// thousands of times during the post-shader-map load (issue #115 follow-on wall). glibc gmtime_r
+// handles pre-1970 (negative time_t) fine, so ticks below the unix epoch still convert.
+// CONFIDENCE: MED-HIGH (shadPS4 reference; struct layout shared with the GetCurrentClock family).
+HLE(k_rtc_set_tick) {   // (SceRtcDateTime* dt, const SceRtcTick* tick)
+    if (!a0 || !a1) return 0x80250001ull;   // SCE_RTC_ERROR_INVALID_POINTER
+    int64_t us = (int64_t)*(const uint64_t*)P(a1) - (int64_t)kRtcUnixEpochOffsetUs;
+    time_t secs = (time_t)(us >= 0 ? us / 1000000ll : (us - 999999ll) / 1000000ll);   // floor
+    int64_t rem = us - (int64_t)secs * 1000000ll;
+    struct tm tmv {};
+#ifdef _WIN32
+    gmtime_s(&tmv, &secs);
+#else
+    gmtime_r(&secs, &tmv);
+#endif
+    fill_rtc_datetime(P(a0), tmv, (uint32_t)rem);
+    return 0;
+}
+// sceRtcGetTick(const SceRtcDateTime* dt, SceRtcTick* tick): the inverse (datetime assumed UTC).
+HLE(k_rtc_get_tick) {   // (const SceRtcDateTime* dt, SceRtcTick* tick)
+    if (!a0 || !a1) return 0x80250001ull;
+    const uint16_t* d = (const uint16_t*)P(a0);
+    struct tm tmv {};
+    tmv.tm_year = (int)d[0] - 1900; tmv.tm_mon = (int)d[1] - 1; tmv.tm_mday = (int)d[2];
+    tmv.tm_hour = (int)d[3]; tmv.tm_min = (int)d[4]; tmv.tm_sec = (int)d[5];
+#ifdef _WIN32
+    int64_t secs = _mkgmtime64(&tmv);
+#else
+    int64_t secs = (int64_t)timegm(&tmv);
+#endif
+    *(uint64_t*)P(a1) = (uint64_t)(secs * 1000000ll + (int64_t)*(const uint32_t*)(d + 6)
+                                   + (int64_t)kRtcUnixEpochOffsetUs);
+    return 0;
+}
+
 // real sleeps so timed wait loops actually yield the CPU (and advance real time)
 HLE(k_usleep)   { uint64_t us = a0; struct timespec ts{ (time_t)(us / 1000000), (long)((us % 1000000) * 1000) }; nanosleep(&ts, nullptr); return 0; }
 HLE(k_sleep_s)  { struct timespec ts{ (time_t)a0, 0 }; nanosleep(&ts, nullptr); return (uint64_t)a0; }
@@ -738,6 +776,8 @@ void register_kernel_time_hle() {
     R("sceRtcGetCurrentClockLocalTime", k_rtc_get_clock_localtime); // (dt) — host-local tz
     R("sceRtcGetCurrentClock", k_rtc_get_current_clock);            // (dt, tz_minutes)
     R("sceRtcGetCurrentDateTimeUtc", k_rtc_get_clock_utc);
+    R("sceRtcSetTick", k_rtc_set_tick);   // tick -> UTC datetime (issue #115 follow-on: FDateTime spam)
+    R("sceRtcGetTick", k_rtc_get_tick);   // UTC datetime -> tick
     // module loading (report success; real PRX are already resident in our address space)
     R("sceSysmoduleLoadModule", k_ok);
     R("sceSysmoduleUnloadModule", k_ok);
