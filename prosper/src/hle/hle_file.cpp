@@ -500,45 +500,29 @@ HLE(f_apr_resolve) {
 // miss the mangled prosper:: definition).
 extern uint64_t g_apr_last_cb, g_apr_last_cb_size;
 
-#ifndef _WIN32
-extern "C" __thread uint64_t g_apr_entry_rsp;
-__thread uint64_t g_apr_entry_rsp = 0;
-extern "C" uint64_t f_apr_read_submit_c(uint64_t a0, uint64_t a1, uint64_t a2,
-                                        uint64_t a3, uint64_t a4, uint64_t a5);
-asm(".text\n"
-    ".globl f_apr_read_submit_entry\n"
-    ".type f_apr_read_submit_entry,@function\n"
-    "f_apr_read_submit_entry:\n"
-    "  movq %rsp, %fs:g_apr_entry_rsp@tpoff\n"
-    "  jmp f_apr_read_submit_c\n");
-extern "C" void f_apr_read_submit_entry();
-// Fetch the Nth stack argument (0-based: arg7 is n=0) of the in-flight ReadFile call.
-static uint64_t apr_stack_arg(int n) {
-    uint64_t rsp = g_apr_entry_rsp;
-    if (!rsp) return 0;
-    // Both paths land the forwarded/natural stack args at [rsp+8] (see the layout note above).
-    return *(uint64_t*)(rsp + 0x8 + (uint64_t)n * 8);
-}
-#endif
-
-#ifndef _WIN32
-extern "C" uint64_t f_apr_read_submit_c(uint64_t a0, uint64_t a1, uint64_t a2,
-                                        uint64_t a3, uint64_t a4, uint64_t a5) {
-#else
 HLE(f_apr_read_submit) {
-#endif
     uint8_t* req = (uint8_t*)P(a0);
     if (!req) return 0x80020016ull;
+#ifndef _WIN32
+    // Read ReadFile's stack args (the 6-register HleFn only sees args 1-6; arg7 = the file offset).
+    // Master #61's guest-%fs swap stub FORWARDS the first two stack args, so — exactly like
+    // hle_agc.cpp's ReleaseMem does — __builtin_frame_address(0)[2] == arg7, [3] == arg8, etc.
+    // This REPLACES an earlier `__thread g_apr_entry_rsp` + `%fs:...@tpoff` asm entry shim: that
+    // added a host thread-local, which enlarged the executable's static-TLS block and collided with
+    // prosper's fixed guest-TCB layout (%fs:0x100/0x108), stalling the minimal boot before graphics
+    // even though the Messenger never calls this handler (GitHub issue #89). A frame-address read
+    // has zero global/TLS footprint. CONFIDENCE: HIGH (same mechanism as ReleaseMem, verified live).
+    volatile uint64_t* apr_fp = (volatile uint64_t*)__builtin_frame_address(0);
+    auto apr_stack_arg = [&](int n) -> uint64_t { return apr_fp[2 + n]; };
+#endif
     if (filelog()) {
         fprintf(stderr, "[apr] read-submit req=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx desc=0x%llx descsz=0x%llx\n",
                 (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
                 (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)a5);
 #ifndef _WIN32
-        fprintf(stderr, "[apr]   stack-args a6=0x%llx a7=0x%llx a8=0x%llx a9=0x%llx (rsp=0x%llx ret=0x%llx)\n",
+        fprintf(stderr, "[apr]   stack-args arg7=0x%llx arg8=0x%llx arg9=0x%llx arg10=0x%llx\n",
                 (unsigned long long)apr_stack_arg(0), (unsigned long long)apr_stack_arg(1),
-                (unsigned long long)apr_stack_arg(2), (unsigned long long)apr_stack_arg(3),
-                (unsigned long long)g_apr_entry_rsp,
-                (unsigned long long)(g_apr_entry_rsp ? *(uint64_t*)g_apr_entry_rsp : 0));
+                (unsigned long long)apr_stack_arg(2), (unsigned long long)apr_stack_arg(3));
 #endif
         for (int o = 0; o < 0x48; o += 8)
             fprintf(stderr, "[apr]   req+0x%02x = 0x%016llx\n", o, (unsigned long long)*(uint64_t*)(req + o));
@@ -764,14 +748,10 @@ void register_file_hle() {
     R("unlink", f_unlink);        R("sceKernelUnlink", f_unlink);
     R("sceKernelGetdents", f_getdents); R("getdents", f_getdents);
     R("sceKernelAprResolveFilepathsToIdsAndFileSizes", f_apr_resolve);   // real APR resolve (was EINVAL)
-    // libSceAmpr sceAmprAprCommandBufferReadFile (NID name recovered by brute-force). The Linux
-    // entry is an asm shim that snapshots rsp so the handler can read the stack args (arg7 = file
-    // offset); see f_apr_read_submit_entry above.
-#ifndef _WIN32
-    Hle::register_fn("mQ16-QdKv7k", (HleFn)f_apr_read_submit_entry, "sceAmprAprCommandBufferReadFile");
-#else
+    // libSceAmpr sceAmprAprCommandBufferReadFile (NID name recovered by brute-force). The handler
+    // reads its 7th arg (file offset) off the stack via __builtin_frame_address (issue #89: the old
+    // asm/__thread shim broke the guest TLS layout).
     Hle::register_fn("mQ16-QdKv7k", (HleFn)f_apr_read_submit, "sceAmprAprCommandBufferReadFile");
-#endif
     #undef R
 }
 
