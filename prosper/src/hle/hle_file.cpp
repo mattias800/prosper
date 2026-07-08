@@ -1,6 +1,9 @@
 // hle_file.cpp — HLE file I/O. Guest paths like "/app0/..." (the game's own data) are
 // translated to the host dump directory; stdio FILE* and POSIX fd calls thunk to the
 // host. Set the app0 root via set_app0_root() or the PROSPER_APP0 env var.
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE   // pthread_getattr_np (bound the PREADLOG/DEEPTRACE stack walk to the real stack)
+#endif
 #include "dispatch.hpp"
 #include "nid.hpp"
 #include <cstdio>
@@ -13,6 +16,7 @@
 #ifndef _WIN32
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <pthread.h>
 #else
 #include <direct.h>
 #include <io.h>
@@ -169,6 +173,23 @@ HLE(f_fgetc)   { return a0 ? (uint64_t)(int64_t)fgetc((FILE*)P(a0)) : (uint64_t)
 // fetches — which offsets are read vs which blocks are skipped, and who closes a file mid-load.
 #ifndef _WIN32
 static bool fdlog_on() { static int on = getenv("PROSPER_PREADLOG") ? 1 : 0; return on; }
+// How many 8-byte words we can read UP from `sp` before running off the top of THIS thread's stack.
+// Worker threads have small stacks, so an unbounded scan (1200-1600 words) SIGSEGVs past the top —
+// which faulted inside preadlog itself and destabilized the very load it was tracing. Bound it.
+static int stack_words_above(uint64_t* sp) {
+    pthread_attr_t a; void* base = nullptr; size_t sz = 0;
+    if (pthread_getattr_np(pthread_self(), &a) == 0) {
+        pthread_attr_getstack(&a, &base, &sz);
+        pthread_attr_destroy(&a);
+        uintptr_t top = (uintptr_t)base + sz;                 // highest address of the stack
+        if (top > (uintptr_t)sp) {
+            size_t words = (top - (uintptr_t)sp) / 8;
+            if (words > 4) words -= 2;                          // stop short of the very top guard page
+            return words > 4096 ? 4096 : (int)words;
+        }
+    }
+    return 256;   // conservative fallback if the stack extent is unavailable
+}
 static void preadlog(const char* fn, uint64_t fd, uint64_t off, uint64_t cnt) {
     if (!fdlog_on()) return;
     // resolve fd -> path
@@ -177,7 +198,8 @@ static void preadlog(const char* fn, uint64_t fd, uint64_t off, uint64_t cnt) {
     const char* base = strrchr(path, '/'); base = base ? base + 1 : path;
     // top N distinct eboot-range return addresses on the stack (guest call chain)
     uint64_t cc[8] = {0,0,0,0,0,0,0,0}; int nc = 0; uint64_t* sp = (uint64_t*)__builtin_frame_address(0);
-    for (int i = 0; i < 1200 && nc < 8; i++) { uint64_t v = sp[i];
+    int maxw = stack_words_above(sp);
+    for (int i = 0; i < 1200 && i < maxw && nc < 8; i++) { uint64_t v = sp[i];
         if (v >= 0x400000000ull && v < 0x420000000ull) { uint64_t o = v - 0x400000000ull;
             if (nc == 0 || cc[nc-1] != o) cc[nc++] = o; } }
     fprintf(stderr, "[preadlog] %-6s %-24s fd=%lld off=0x%llx(blk %lld) cnt=0x%llx tid=%ld callers=eboot+0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx\n",
@@ -190,7 +212,7 @@ static void preadlog(const char* fn, uint64_t fd, uint64_t off, uint64_t cnt) {
         deep_budget--;
         char line[1024]; int p = snprintf(line, sizeof line, "[deeptrace] blk %lld frames:", (long long)(off / 0x10000));
         int nf = 0; uint64_t last = 0;
-        for (int i = 0; i < 1600 && nf < 20 && p < (int)sizeof line - 24; i++) {
+        for (int i = 0; i < 1600 && i < maxw && nf < 20 && p < (int)sizeof line - 24; i++) {
             uint64_t v = sp[i];
             const char* m = nullptr; uint64_t o = 0;
             if (v >= 0x400000000ull && v < 0x420000000ull) { m = "eb"; o = v - 0x400000000ull; }
