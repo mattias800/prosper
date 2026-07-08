@@ -405,6 +405,44 @@ HLE(k_munmap)   { if (a0) munmap((void*)a0, a1); return 0; }
 HLE(k_mprotect) { if (a0) mprotect((void*)a0, a1, host_prot(a2)); return 0; }
 HLE(k_dmem_size){ return kDmemTotal; }   // 8 GiB pool (allocation failures enforce this bound)
 
+// --- libSceAmpr (PS5 async memory-programming engine) -------------------------------------------
+// The UE4 title (PPSA17942) commits one class of its allocator pool pages through an Ampr command
+// buffer instead of BatchMap. Live-captured sequence per page (gdb at the import stubs):
+//   8aI7R7WaOlc(ctx, 0, 1, 0, -1, 0x720)          — command-buffer init (0x720 = size?)
+//   a8uLzYY--tM(ctx, ctx+0x18, ctx+0x20, 0, …)    — begin/get-cursors (outputs unused before push)
+//   N-FSPA4S3nI(ctx, va, 0x10000, 0, flags, 0)    — push "map 64KB page at va"
+// We execute the mapping SYNCHRONOUSLY at push time (AMM allocates backing physical pages
+// internally on real hardware; anonymous host pages model that). Names unknown — registered by
+// raw NID. CONFIDENCE: MED (semantics from live arg capture at all three call sites).
+HLE(k_ampr_ok) { return 0; }
+HLE(k_ampr_push_map) {
+    if (a1 && a2) {
+        // Back the page from the shared phys pool so BOTH pool views alias the same bytes: the
+        // guest WRITES its MallocBinned pool-page headers through this (high) view and READS them
+        // through a second view exactly 0x540000000 lower (empirically pinned — the two views'
+        // canary reads returned zeros with independent anonymous pages). Map the mirror too.
+        // CONFIDENCE: LOW on the 0x540000000 rule (observed constant, one title) — refine by
+        // finding the guest's own second-view creation; the aliasing itself is the HW contract.
+        uint64_t phys = 0;
+        bool have_phys = dmem_take(a2, 0x10000, 0x0c, phys);
+        void* p = have_phys ? map_phys_at(a1, a2, PROT_READ | PROT_WRITE, phys)
+                            : map_at(a1, a2, PROT_READ | PROT_WRITE);
+        if (p) track((uint64_t)p, a2, PROT_READ | PROT_WRITE, true, "ampr-map");
+        if (p && have_phys && a1 > 0x540000000ull + 0x1000000000ull) {
+            uint64_t mirror = a1 - 0x540000000ull;
+            void* q = map_phys_at(mirror, a2, PROT_READ | PROT_WRITE, phys);
+            if (q) track((uint64_t)q, a2, PROT_READ | PROT_WRITE, true, "ampr-mirror");
+            MLOG("ampr push-map va=0x%llx len=0x%llx phys=0x%llx mirror=0x%llx -> %s/%s\n",
+                 (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)phys,
+                 (unsigned long long)mirror, p ? "ok" : "FAIL", q ? "ok" : "FAIL");
+        } else {
+            MLOG("ampr push-map va=0x%llx len=0x%llx -> %s\n",
+                 (unsigned long long)a1, (unsigned long long)a2, p ? "ok" : "FAILED");
+        }
+    }
+    return 0;
+}
+
 // sceKernelReleaseDirectMemory(off_t start, size_t len) — return a range to the pool. Any VA still
 // mapped to it is the guest's problem (same as the real kernel); UE4 releases only unmapped probe
 // allocations here.
@@ -501,6 +539,10 @@ void register_kernel_mem_hle() {
     // sync_on_address futex — registered by raw NID (names not in any public DB yet).
     Hle::register_fn("Hc4CaR6JBL0", (HleFn)k_wait_on_address, "sceKernelWaitOnAddress?");
     Hle::register_fn("q2y-wDIVWZA", (HleFn)k_wake_by_address, "sceKernelWakeByAddress?");
+    // libSceAmpr command-buffer trio (raw NIDs; see the block comment above k_ampr_push_map).
+    Hle::register_fn("8aI7R7WaOlc", (HleFn)k_ampr_ok,       "sceAmprCommandBufferInit?");
+    Hle::register_fn("a8uLzYY--tM", (HleFn)k_ampr_ok,       "sceAmprCommandBufferBegin?");
+    Hle::register_fn("N-FSPA4S3nI", (HleFn)k_ampr_push_map, "sceAmprPushMapPages?");
 }
 
 } // namespace prosper
