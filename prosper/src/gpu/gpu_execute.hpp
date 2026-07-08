@@ -176,8 +176,13 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
 // correctly — the path for multi-geometry scenes (opt-in until the AGC context-log section semantics
 // that stage duplicate register writes are fully RE'd; see docs/REAL_FRAMES_FINDINGS.md).
 // `max_shader_dwords` bounds the recompiler's walk (it stops at S_ENDPGM).
+// vp_scale_{x,y}: scale each draw's guest viewport by this factor. The guest programs PA_CL_VPORT in
+// full present-resolution pixels; when we render into a reduced-resolution framebuffer (PROSPER_RENDER_SCALE)
+// the viewport must shrink by the same ratio, or a full-res viewport into a small framebuffer clips the
+// image to its bottom-left corner. Default 1.0 (full-res / tests: no change).
 inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn& render,
-                                             uint32_t max_shader_dwords = 0x10000) {
+                                             uint32_t max_shader_dwords = 0x10000,
+                                             float vp_scale_x = 1.0f, float vp_scale_y = 1.0f) {
     if (st.draws.empty() || !render) return {};              // nothing to render (e.g. a state-only submit)
     const bool log = getenv("PROSPER_GFXLOG") != nullptr;    // bail-point visibility (why no frame?)
     // Render each draw from its OWN register snapshot when the submit has MULTIPLE draws — a real
@@ -214,6 +219,14 @@ inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn&
                                        it.vertex_count, it.indices.size(), it.ps.topology, it.ps.color_write_mask);
         fprintf(stderr, "\n"); fflush(stderr); }
     if (items.empty()) return {};
+    // Scale each item's guest viewport to the actual (possibly reduced-resolution) framebuffer. Skip if
+    // 1.0 (full-res) or if this draw has no guest viewport (the backend then uses the full-target default).
+    if (vp_scale_x != 1.0f || vp_scale_y != 1.0f)
+        for (auto& it : items)
+            if (it.ps.has_viewport) {
+                it.ps.viewport_x *= vp_scale_x; it.ps.viewport_w *= vp_scale_x;
+                it.ps.viewport_y *= vp_scale_y; it.ps.viewport_h *= vp_scale_y;
+            }
     if (log) fprintf(stderr, "[exec] rendering %zu draw item(s) (of %zu draws)\n", items.size(), st.draws.size());
     return render(items);
 }
