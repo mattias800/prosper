@@ -27,10 +27,18 @@ constexpr int kVolume0dB = 32768;   // SCE_AUDIO_VOLUME_0DB
 
 struct Port {
     bool          in_use = false;
+    int           type = 0;   // SceAudioOutPortType (0=MAIN, 1=BGM, 2=VOICE, 3=PERSONAL, 4=PADSPK, 127=AUX)
     AudioPortInfo info;
     int           vol[8] = { kVolume0dB, kVolume0dB, kVolume0dB, kVolume0dB,
                              kVolume0dB, kVolume0dB, kVolume0dB, kVolume0dB };
 };
+
+// SCE audio error codes the guest actually tests for (Kyty Errno.h:342/344). A generic -1 is
+// unrecognizable to retry-vs-abort logic (a single wrong errno already caused a full render
+// stall once — see hle_service.cpp's GetEvent note). Sign-extended: the guest ABI returns
+// int32 in eax (negative), and host-side callers/tests compare the full u64 as int64.
+constexpr uint64_t kAudioErrInvalidPort = (uint64_t)(int64_t)(int32_t)0x80260003;
+constexpr uint64_t kAudioErrPortFull    = (uint64_t)(int64_t)(int32_t)0x80260005;
 
 std::mutex g_mx;                 // guards the port table
 Port       g_ports[kMaxPorts];
@@ -109,23 +117,25 @@ HLE(audio_init) { (void)a0; return 0; }   // sceAudioOutInit: idempotent success
 
 // sceAudioOutOpen(userId, type, index, len, freq, param) -> handle (>=1) or negative error.
 HLE(audio_open) {
-    (void)a0; (void)a1; (void)a2;
+    (void)a0; (void)a2;
     AudioPortInfo info;
     info.grain = (int)(a3 ? a3 : 256);
     info.freq  = (int)(a4 ? a4 : 48000);
     audio_decode_format((uint32_t)a5, info.channels, info.fmt);
+    int type = (int)a1;   // kept for GetPortState's type-dependent output/channel report
 
     int handle = 0;
     { std::lock_guard<std::mutex> lk(g_mx);
       for (int i = 0; i < kMaxPorts; i++) {
           if (g_ports[i].in_use) continue;
           g_ports[i].in_use = true;
+          g_ports[i].type = type;
           g_ports[i].info = info;
           for (int c = 0; c < 8; c++) g_ports[i].vol[c] = kVolume0dB;
           handle = i + 1;
           break;
       } }
-    if (!handle) return (uint64_t)(int64_t)-1;   // no free port
+    if (!handle) return kAudioErrPortFull;
     if (auto* s = audio_sink()) s->open(handle, info);
     return (uint64_t)handle;
 }
@@ -133,7 +143,7 @@ HLE(audio_open) {
 // sceAudioOutOutput(handle, ptr) -> frames written (>=0) or negative error. ptr==0 => drain.
 HLE(audio_output) {
     AudioPortInfo info;
-    { std::lock_guard<std::mutex> lk(g_mx); Port* p = port_of((int)a0); if (!p) return (uint64_t)(int64_t)-1; info = p->info; }
+    { std::lock_guard<std::mutex> lk(g_mx); Port* p = port_of((int)a0); if (!p) return kAudioErrInvalidPort; info = p->info; }
     if (a1 == 0) return 0;   // drain/flush: nothing buffered in the headless model
     if (auto* s = audio_sink()) s->output((int)a0, P(a1), info.grain);
     return (uint64_t)info.grain;
@@ -162,7 +172,7 @@ HLE(audio_set_volume) {
     uint32_t mask = (uint32_t)a1;
     const int* vols = (const int*)P(a2);
     { std::lock_guard<std::mutex> lk(g_mx);
-      Port* p = port_of((int)a0); if (!p) return (uint64_t)(int64_t)-1;
+      Port* p = port_of((int)a0); if (!p) return kAudioErrInvalidPort;
       if (vols) { int vi = 0; for (int c = 0; c < 8; c++) if (mask & (1u << c)) p->vol[c] = vols[vi++]; } }
     if (auto* s = audio_sink()) s->set_volume((int)a0, mask, vols);
     return 0;
@@ -172,21 +182,29 @@ HLE(audio_set_volume) {
 HLE(audio_close) {
     int handle = (int)a0;
     { std::lock_guard<std::mutex> lk(g_mx);
-      Port* p = port_of(handle); if (!p) return (uint64_t)(int64_t)-1; p->in_use = false; }
+      Port* p = port_of(handle); if (!p) return kAudioErrInvalidPort; p->in_use = false; }
     if (auto* s = audio_sink()) s->close(handle);
     return 0;
 }
 
 // sceAudioOutGetPortState(handle, SceAudioOutPortState* state) -> 0 or negative error.
+// Layout per Kyty Audio.cpp:340 (the previous fill invented its own: channel as u16 @2
+// clobbering reserved1, volume as u32 @8 — which is the FLAG field — and left the real
+// volume @4 zero, i.e. "muted"): uint16 output @0; uint8 channel @2; uint8 reserved @3;
+// int16 volume @4; uint16 reroute_counter @6; uint64 flag @8; uint64 reserved2[2] @0x10.
 HLE(audio_get_port_state) {
-    int channels;
-    { std::lock_guard<std::mutex> lk(g_mx); Port* p = port_of((int)a0); if (!p) return (uint64_t)(int64_t)-1; channels = p->info.channels; }
-    if (a1) {   // SceAudioOutPortState (0x20): uint16 output; uint16 channel; ...; uint32 volume
+    int channels, type;
+    { std::lock_guard<std::mutex> lk(g_mx); Port* p = port_of((int)a0); if (!p) return kAudioErrInvalidPort;
+      channels = p->info.channels; type = p->type; }
+    if (a1) {
         auto* st = (uint8_t*)P(a1);
         memset(st, 0, 0x20);
-        *(uint16_t*)(st + 0) = 1;                     // output: enabled
-        *(uint16_t*)(st + 2) = (uint16_t)channels;    // channels
-        *(uint32_t*)(st + 8) = (uint32_t)kVolume0dB;  // volume
+        *(int16_t*)(st + 4) = 127;   // volume (Kyty AudioOutGetPortState reports 127)
+        switch (type) {              // output/channel are port-type dependent (Kyty :432-448)
+            case 3: case 127: /* output=0, channel=0 */ break;
+            case 4:  *(uint16_t*)(st + 0) = 4; st[2] = 1; break;                          // pad speaker
+            default: *(uint16_t*)(st + 0) = 1; st[2] = (uint8_t)(channels > 2 ? 2 : channels); break;
+        }
     }
     return 0;
 }

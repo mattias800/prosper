@@ -60,6 +60,20 @@ HLE(s_mouse_read)     { if (a1) memset(PW(a1), 0, 0x18); return 0; }
 // --- app content ---
 HLE(s_appcontent_int) { if (a1) *(int32_t*)PW(a1) = 0; return 0; }
 
+// sceSystemServiceGetStatus(SceSystemServiceStatus* status) — the out-struct is ARG 0 (single-arg
+// call). This was aliased to s_appcontent_int, which returned success while writing 4 bytes through
+// a1 — whatever stale value the caller left in RSI — and left the real status struct uninitialized.
+// Layout cross-checked against Kyty LibSystemService.cpp:83: int32 eventNum @0; bool
+// isSystemUiOverlaid @4, isInBackgroundExecution @5, isCpuMode7CpuNormal @6 (defaults TRUE),
+// isGameLiveStreamingOnAir @7, isOutOfVrPlayArea @8; 12 bytes with tail padding.
+HLE(s_syss_getstatus) {
+    auto* st = (uint8_t*)PW(a0);
+    if (!st) return 0x80A10003ull;   // SYSTEM_SERVICE_ERROR_PARAMETER (Kyty Errno.h:382)
+    memset(st, 0, 12);
+    st[6] = 1;                       // isCpuMode7CpuNormal = true
+    return 0;
+}
+
 // sceAppContentTemporaryDataMount2(option, SceAppContentMountPoint* mp) — mount the app's temp-data
 // area and write its guest path into mp. SceAppContentMountPoint = char data[16] (shadPS4
 // app_content.h; PS4/PS5 identical). shadPS4 writes exactly "/temp0\0" and returns 0. Our previous
@@ -152,7 +166,7 @@ void register_service_hle() {
     R("sceMsgDialogGetStatus", s_dialog_finished);
     R("sceMsgDialogGetResult", s_dialog_result);
     R("sceSystemServiceHideSplashScreen", s_ok);
-    R("sceSystemServiceGetStatus", s_appcontent_int);
+    R("sceSystemServiceGetStatus", s_syss_getstatus);
     #undef R
 }
 
