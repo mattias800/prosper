@@ -1,6 +1,7 @@
 // tile.cpp — see tile.hpp. GFX10 SW_4KB_S de-swizzle for 32-bpp surfaces.
 #include "tile.hpp"
 #include <cstring>
+#include <algorithm>
 
 namespace prosper::gpu {
 
@@ -80,6 +81,37 @@ void tile_surface(uint8_t* dst, const uint8_t* src, uint32_t width, uint32_t hei
     const size_t dst_bytes = tiled_surface_bytes(width, height, tile_mode, pitch);
     std::memset(dst, 0, dst_bytes);   // padding texels (rows beyond height) stay zero
     sw4kb_s_copy<true>(dst, src, width, height, pitch, dst_bytes);
+}
+
+size_t tiled_elements_bytes(uint32_t ew, uint32_t eh, uint32_t bpe, uint32_t tile_side, uint32_t tile_mode) {
+    if (!tile_mode_is_tiled(tile_mode) || tile_side == 0) return (size_t)ew * eh * bpe;
+    uint32_t tiles_per_row = (ew + tile_side - 1) / tile_side, tile_rows = (eh + tile_side - 1) / tile_side;
+    return (size_t)tiles_per_row * tile_rows * (size_t)tile_side * tile_side * bpe;
+}
+
+void detile_elements(uint8_t* dst, const uint8_t* src, size_t src_bytes,
+                     uint32_t ew, uint32_t eh, uint32_t bpe, uint32_t tile_side, uint32_t tile_mode) {
+    if (!tile_mode_is_tiled(tile_mode) || tile_side == 0) {
+        size_t n = std::min(src_bytes, (size_t)ew * eh * bpe);
+        std::memcpy(dst, src, n);
+        if (n < (size_t)ew * eh * bpe) std::memset(dst + n, 0, (size_t)ew * eh * bpe - n);
+        return;
+    }
+    uint32_t tb = 0; while ((1u << tb) < tile_side) tb++;       // log2(tile_side)
+    uint32_t tiles_per_row = (ew + tile_side - 1) / tile_side;
+    for (uint32_t y = 0; y < eh; y++)
+        for (uint32_t x = 0; x < ew; x++) {
+            uint32_t tx = x >> tb, ty = y >> tb, ix = x & (tile_side - 1), iy = y & (tile_side - 1);
+            uint32_t morton = 0;
+            for (uint32_t b = 0; b < tb; b++) {
+                morton |= ((iy >> b) & 1u) << (2 * b);
+                morton |= ((ix >> b) & 1u) << (2 * b + 1);
+            }
+            uint64_t t = ((uint64_t)(ty * tiles_per_row + tx) * ((uint64_t)tile_side * tile_side) + morton) * bpe;
+            size_t   l = ((size_t)y * ew + x) * bpe;
+            if (t + bpe <= src_bytes) std::memcpy(dst + l, src + (size_t)t, bpe);
+            else                      std::memset(dst + l, 0, bpe);
+        }
 }
 
 } // namespace prosper::gpu
