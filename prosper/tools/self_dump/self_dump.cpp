@@ -224,7 +224,7 @@ int main(int argc, char** argv) {
     // resolve DYNAMIC and the dynamic tables (strtab/symtab) by virtual address.
     // In the SELF segment table, the actual data segments have bit 0x800 set;
     // the companion "info/digest" segments (0x..10004) are skipped.
-    struct Load { uint64_t vaddr, memsz, foff, fsz; };
+    struct Load { uint64_t vaddr, memsz, foff, fsz; uint32_t type; };
     std::vector<Load> loads;
     std::map<uint64_t, SelfSegment> data_seg_by_id;   // phdr index -> data segment
     if (is_self)
@@ -235,10 +235,14 @@ int main(int argc, char** argv) {
         uint64_t foff;
         if (is_self && data_seg_by_id.count(i)) foff = data_seg_by_id[i].file_offset;
         else                                    foff = elf_base + p.p_offset;
-        loads.push_back({ p.p_vaddr, p.p_memsz, foff, p.p_filesz });
+        loads.push_back({ p.p_vaddr, p.p_memsz, foff, p.p_filesz, p.p_type });
     }
+    // PT_LOAD wins; non-LOAD file-backed phdrs (DYNAMIC/PROCPARAM/TLS) only resolve a
+    // VA when no LOAD maps it. Mirrors Module::va2foff — without this, a DYNAMIC phdr
+    // preceding its covering LOAD self-resolves to unmapped bytes (issue #113).
     auto va2foff = [&](uint64_t va) -> int64_t {
-        for (auto& L : loads) if (va >= L.vaddr && va < L.vaddr + L.fsz) return (int64_t)(L.foff + (va - L.vaddr));
+        for (auto& L : loads) if (L.type == 1 && va >= L.vaddr && va < L.vaddr + L.fsz) return (int64_t)(L.foff + (va - L.vaddr));
+        for (auto& L : loads) if (L.type != 1 && va >= L.vaddr && va < L.vaddr + L.fsz) return (int64_t)(L.foff + (va - L.vaddr));
         return -1;
     };
 

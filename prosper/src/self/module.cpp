@@ -30,8 +30,21 @@ struct Rela { uint64_t r_offset, r_info; int64_t r_addend; };
 #pragma pack(pop)
 
 int64_t Module::va2foff(uint64_t va) const {
+    // Resolve against PT_LOAD segments FIRST — they define the actual mapped image,
+    // and the dynamic tables (DYNAMIC/strtab/symtab/relocs) physically live inside
+    // them. `loads` also carries non-LOAD file-backed phdrs (DYNAMIC/PROCPARAM/TLS)
+    // as a fallback for layouts where those sit outside every LOAD; but such an entry
+    // must NEVER shadow the LOAD that truly contains the VA. A DYNAMIC phdr whose own
+    // logical p_offset addresses unmapped bytes would otherwise self-resolve when its
+    // phdr precedes the covering LOAD in program-header order, returning garbage —
+    // exactly the "0 imports" boot failure in issue #113 (PPSA02664). Two passes:
+    // LOAD wins; non-LOAD only when no LOAD maps the address.
     for (auto& L : loads)
-        if (va >= L.vaddr && va < L.vaddr + L.filesz) return (int64_t)(L.file_off + (va - L.vaddr));
+        if (L.type == PT_LOAD && va >= L.vaddr && va < L.vaddr + L.filesz)
+            return (int64_t)(L.file_off + (va - L.vaddr));
+    for (auto& L : loads)
+        if (L.type != PT_LOAD && va >= L.vaddr && va < L.vaddr + L.filesz)
+            return (int64_t)(L.file_off + (va - L.vaddr));
     return -1;
 }
 const char* Module::str_at(uint64_t off) const {
@@ -99,6 +112,35 @@ std::optional<Module> Module::load(const std::string& path, std::string* err) {
     if (dyn_foff < 0) dyn_foff = (int64_t)dynseg->file_off; // dynamic may sit inside a LOAD
     // If DYNAMIC vaddr wasn't inside a load's filesz range, resolve via its own file_off.
     if (m.va2foff(dynseg->vaddr) < 0) dyn_foff = (int64_t)dynseg->file_off;
+
+    // On some PS5 modules (e.g. Unity's Il2CppUserAssemblies.prx) the PT_DYNAMIC program header's
+    // own file offset is mis-based: `elf_base + p_offset` points at garbage, so the DYNAMIC reads
+    // as junk and the module yields 0 exports / 0 init (IL2CPP never bootstraps -> null-fn crash).
+    // The .dynamic vaddr, however, also lies inside the sce_dynlibdata PT_LOAD, which IS mapped
+    // correctly (its strtab/symtab/rela/jmprel resolve fine). va2foff returns the PT_DYNAMIC's own
+    // (wrong) mapping because that segment is listed first; when the result isn't a valid run of DT
+    // entries, re-derive the offset from the containing PT_LOAD. Only fires on a genuinely misread
+    // DYNAMIC, so modules that already parse are untouched. CONFIDENCE: HIGH (byte-exact verified on
+    // Il2CppUserAssemblies.prx: DYNAMIC/STRTAB/SYMTAB/JMPREL/RELA all resolve, IL2CPP API binds).
+    auto tag_ok = [](uint64_t t){ return t == 0 || t < 0x100 || (t >= 0x61000000 && t <= 0x610000ffull)
+                                       || t == 0x6ffffff9 || t == 0x6ffffffb; };
+    auto dyn_run_ok = [&](int64_t off)->bool{
+        if (off < 0 || (size_t)off + 16 * 8 > m.file.size()) return false;
+        bool saw_sce = false;
+        for (int i = 0; i < 8; i++) {
+            uint64_t t = (uint64_t)rd<Dyn>(m.file, (size_t)off + i * 16).d_tag;
+            if (!tag_ok(t)) return false;
+            if (t >= 0x61000000 && t <= 0x610000ffull) saw_sce = true;
+        }
+        return saw_sce;   // a real PS5 .dynamic always carries DT_SCE_* tags
+    };
+    if (!dyn_run_ok(dyn_foff)) {
+        for (auto& L : m.loads)
+            if (L.type == PT_LOAD && dynseg->vaddr >= L.vaddr && dynseg->vaddr < L.vaddr + L.filesz) {
+                int64_t cand = (int64_t)(L.file_off + (dynseg->vaddr - L.vaddr));
+                if (dyn_run_ok(cand)) { dyn_foff = cand; break; }
+            }
+    }
 
     // Parse dynamic tags
     std::vector<Dyn> dyns;

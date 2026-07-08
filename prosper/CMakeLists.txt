@@ -60,6 +60,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_hle_registered PRIVATE prosper_core)
   add_test(NAME hle_functions_registered COMMAND test_hle_registered)
 
+  # va2foff resolution order (issue #113): DYNAMIC/PROCPARAM/TLS must never shadow
+  # the PT_LOAD that truly maps a VA. Pure unit test — no game dump required.
+  add_executable(test_va2foff tests/test_va2foff.cpp)
+  target_link_libraries(test_va2foff PRIVATE prosper_core)
+  add_test(NAME va2foff_load_priority COMMAND test_va2foff)
+
   # sceAudioOut HLE: format decode, port lifecycle, PCM forwarding, volume, batch, error paths
   # (via a capturing AudioSink — headless, no device).
   add_executable(test_audio tests/test_audio.cpp)
@@ -69,6 +75,12 @@ if(TARGET prosper_core)
   add_executable(test_equeue_events tests/test_equeue_events.cpp)
   target_link_libraries(test_equeue_events PRIVATE prosper_core)
   add_test(NAME equeue_events COMMAND test_equeue_events)
+
+  # Variadic libc formatters (issue #122): real va_list capture so %f/XMM + stack + %s-past-4th
+  # args format correctly (was a 3-integer-register forward). Cross-platform (host libc printf).
+  add_executable(test_printf tests/test_printf.cpp)
+  target_link_libraries(test_printf PRIVATE prosper_core)
+  add_test(NAME printf_varargs COMMAND test_printf)
 
   # EventFlag/Sema delete-under-waiter safety (issue #104): delete wakes parked waiters with EACCES
   # and defers the free to the last one out, instead of free()ing the object under a live wait (UAF).

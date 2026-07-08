@@ -366,6 +366,8 @@ const char* const kAgcNids[] = {
     "57labkp+rSQ", "LtTouSCZjHM", "V++UgBtQhn0", "aJf+j5yntiU", "fPSCdQxgpSw", "i1jyy49AjXU",
     "tSBxhAPyytQ",   // fires once after the Sh patch pair during CreateWorkload; not in Kyty — RE via args
     "k3GhuSNmBLU",   // fires once just before "unity default resources" load; not in Kyty — RE via args
+    "WmAc2MEj6Io",   // sceAgcDcbDmaData (shadPS4 aerolib) — OVERRIDDEN by agc_dcb_dma_data (real appender, #117)
+    "IxYiarKlXxM",   // sceAgcDmaDataPatchSetDstAddressOrOffset — observe-only (packet now gets valid ptrs, #117)
 };
 constexpr size_t kAgcNidCount = sizeof(kAgcNids) / sizeof(kAgcNids[0]);
 
