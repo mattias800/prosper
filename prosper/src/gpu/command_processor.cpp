@@ -123,17 +123,29 @@ void GpuState::apply(const Pm4Command& c) {
             index_type = c.index_size;
             state_dirty_ = true;
             break;
-        case K::DrawIndexAuto: {
+        case K::DrawIndexAuto:
+        case K::DrawIndex: {
             // Snapshot the register state AT THE DRAW (shared with consecutive draws until a register
             // write dirties it), so a future per-draw executor can render each draw under its own
             // shaders/mask/blend instead of the end-of-submit fold. Inert for the current renderer.
+            // The snapshot also carries index_type — the index element size a DrawIndex needs (#64).
             if (state_dirty_ || !last_snapshot_) {
                 auto snap = std::make_shared<GpuState>();
                 snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
                 last_snapshot_ = std::move(snap);
                 state_dirty_ = false;
             }
-            draws.push_back({ c.index_count, last_snapshot_ });
+            Draw d;
+            d.index_count = c.index_count;
+            d.state = last_snapshot_;
+            if (c.kind == K::DrawIndex) {
+                // Mark as indexed only when the packet was fully decoded — a short packet's addr/
+                // modifier would be fabricated zeros, and `indexed` promises index_addr is real.
+                d.indexed = c.di_valid;
+                d.index_addr = c.di_index_addr;
+                d.modifier = c.di_modifier;
+            }
+            draws.push_back(std::move(d));
             break;
         }
         case K::ReleaseMem:

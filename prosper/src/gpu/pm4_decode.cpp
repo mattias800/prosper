@@ -96,6 +96,14 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
                         c.flip_valid  = true;
                     }
                     break;
+                case R_DRAW_INDEX:
+                    // payload: [0]=index_count, [1..2]=index-buffer addr lo/hi, [3..4]=64-bit draw
+                    // modifier lo/hi (see agc_dcb_draw_index + the ABI evidence in pm4_decode.hpp).
+                    c.kind = K::DrawIndex;
+                    if (npl >= 1) c.index_count = pl[0];
+                    if (npl >= 3) c.di_index_addr = lo_hi(pl + 1);
+                    if (npl >= 5) { c.di_modifier = lo_hi(pl + 3); c.di_valid = true; }
+                    break;
                 case R_DRAW_INDEX_AUTO:
                     c.kind = K::DrawIndexAuto;
                     if (npl >= 1) c.index_count = pl[0];

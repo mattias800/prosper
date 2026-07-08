@@ -33,9 +33,10 @@ int main() {
     auto p_add = Hle::lookup("d-6uF9sZDIU");   // patch: AddRegisters
     auto p_adr = Hle::lookup("vcmNN+AAXnY");   // patch: SetAddress
     auto draw  = Hle::lookup("Yw0jKSqop+E");   // DrawIndexAuto
+    auto drawi = Hle::lookup("q88lQ+GP5Yk");   // DrawIndex (indexed sibling)
     auto evt   = Hle::lookup("aJf+j5yntiU");   // EventWrite
-    CHECK(reset && idx && setcx && p_add && p_adr && draw && evt, "AGC Dcb builders registered");
-    if (!(reset && idx && setcx && p_add && p_adr && draw && evt)) { printf("== FAIL ==\n"); return 1; }
+    CHECK(reset && idx && setcx && p_add && p_adr && draw && drawi && evt, "AGC Dcb builders registered");
+    if (!(reset && idx && setcx && p_add && p_adr && draw && drawi && evt)) { printf("== FAIL ==\n"); return 1; }
 
     uint32_t buffer[256];
     memset(buffer, 0, sizeof buffer);          // zero => any tail dword is a non-type3 stream end
@@ -50,6 +51,7 @@ int main() {
     p_add(rc, 5, 0, 0, 0, 0);                                     // num_regs: 3 -> 8
     p_adr(rc, 0xCAFEF00DDEADBEEFull, 0, 0, 0, 0);                 // rewrite the regs vaddr
     draw(D, /*index_count*/ 0x1234, 0, 0, 0, 0);
+    drawi(D, /*index_count*/ 0x0600, /*indices*/ 0xDEAD0000BEEF0040ull, /*modifier*/ 0x40000000ull, 0, 0);
     evt(D, /*event_type*/ 0x42, 0, 0, 0, 0);
 
     size_t used_dw = (size_t)(dcb.cursor_up - dcb.bottom);
@@ -58,8 +60,8 @@ int main() {
     std::vector<Pm4Command> ops;
     size_t consumed = decode_pm4(buffer, 256, ops);   // pass full buffer; decoder stops at the zero tail
     CHECK(consumed == used_dw, "decoder consumed exactly the built dwords (stops at zero pad)");
-    CHECK(ops.size() == 5, "decoded 5 packets");
-    if (ops.size() != 5) { printf("== FAIL: got %zu packets ==\n", ops.size()); return 1; }
+    CHECK(ops.size() == 6, "decoded 6 packets");
+    if (ops.size() != 6) { printf("== FAIL: got %zu packets ==\n", ops.size()); return 1; }
 
     using K = Pm4Command::Kind;
     CHECK(ops[0].kind == K::DrawReset, "op0 = DrawReset");
@@ -73,7 +75,13 @@ int main() {
 
     CHECK(ops[3].kind == K::DrawIndexAuto && ops[3].index_count == 0x1234, "op3 = DrawIndexAuto(0x1234)");
 
-    CHECK(ops[4].kind == K::EventWrite && ops[4].event_type == 0x42, "op4 = EventWrite(0x42)");
+    // DrawIndex round-trip (issue #63): the builder wrote [1]=count, [2..3]=index addr, [4..5]=modifier;
+    // the decoder must hand every field back (indexed draws were previously dropped as unknown NOPs).
+    CHECK(ops[4].kind == K::DrawIndex && ops[4].index_count == 0x0600, "op4 = DrawIndex(count=0x600)");
+    CHECK(ops[4].di_index_addr == 0xDEAD0000BEEF0040ull, "op4 index-buffer address round-trips");
+    CHECK(ops[4].di_modifier == 0x40000000ull && ops[4].di_valid, "op4 modifier round-trips (valid)");
+
+    CHECK(ops[5].kind == K::EventWrite && ops[5].event_type == 0x42, "op5 = EventWrite(0x42)");
 
     // Every decoded packet's len must match its header, and the payload pointer must be in-buffer.
     bool spans_ok = true;

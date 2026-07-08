@@ -118,6 +118,33 @@ int main() {
         }
     }
 
+    // Indexed draw (sceAgcDcbDrawIndex -> R_DRAW_INDEX, issue #63): the packet must land in
+    // GpuState::draws carrying its index data — previously it decoded as an unknown NOP and every
+    // indexed draw the guest submitted was silently dropped while the HLE returned success.
+    {
+        auto drawi = Hle::lookup("q88lQ+GP5Yk");                                 // sceAgcDcbDrawIndex
+        CHECK(drawi != nullptr, "DrawIndex builder registered");
+        if (drawi) {
+            static uint16_t indices[6] = { 0, 1, 2, 0, 2, 3 };
+            uint32_t ibuf[64]; memset(ibuf, 0, sizeof ibuf);
+            Dcb id{}; id.bottom = ibuf; id.top = ibuf + 64; id.cursor_up = ibuf; id.cursor_down = ibuf + 64;
+            auto ID = (uint64_t)(uintptr_t)&id;
+            idx(ID, /*index_size*/ 2, 0, 0, 0, 0);              // 16-bit indices
+            drawi(ID, /*index_count*/ 6, (uint64_t)(uintptr_t)indices, /*modifier*/ 0x40000000ull, 0, 0);
+            GpuState s5;
+            run_command_buffer(ibuf, 64, s5);
+            CHECK(s5.draws.size() == 1, "DrawIndex recorded one draw");
+            if (s5.draws.size() == 1) {
+                const auto& d = s5.draws[0];
+                CHECK(d.indexed, "draw is marked indexed (fully-decoded packet)");
+                CHECK(d.index_count == 6, "indexed draw index_count = 6");
+                CHECK(d.index_addr == (uint64_t)(uintptr_t)indices, "index-buffer address carried through");
+                CHECK(d.modifier == 0x40000000ull, "draw modifier carried through");
+                CHECK(d.state && d.state->index_type == 2, "snapshot carries the index element size (SetIndexType)");
+            }
+        }
+    }
+
     // Per-draw register snapshots: each DrawIndexAuto captures the register state AT the draw, so a
     // register changed between two draws is visible in the first draw's snapshot at its old value.
     // (Consecutive draws with no writes in between share one snapshot.)

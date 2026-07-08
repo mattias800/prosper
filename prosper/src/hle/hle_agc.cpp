@@ -119,14 +119,15 @@ HLE(agc_dcb_draw_index_auto) {  // (buf, index_count, modifier)
     return (uint64_t)(uintptr_t)cmd;
 }
 // sceAgcDcbDrawIndex (NID q88lQ+GP5Yk, name via shadPS4 aerolib.inl) — the indexed-draw sibling of
-// DrawIndexAuto. Kyty has no Gen5 reference; arg shape inferred from the Gen4 form
-// (index_count, index_addr, …) + the Gen5 Dcb convention (buf first, modifier last):
-// (Dcb* buf, uint32_t index_count, const void* indices, uint64_t modifier). CONFIDENCE: LOW on
-// a2/a3 meaning — the packet stores them raw and pm4_decode currently skips R_DRAW_INDEX (indexed
-// draws are the documented "remaining polish"). What this fixes NOW: every Dcb append returns the
-// allocated packet pointer, and the previous unimplemented stub returned 0 — a caller patching
-// its draw packet through that return (the AGC patch idiom, cf. agc_patch_set_address) would have
-// written through NULL/garbage instead of into the DCB.
+// DrawIndexAuto: (Dcb* buf, uint32_t index_count, const void* indices, uint64_t modifier).
+// Kyty has no Gen5 reference, but the a1/a2 roles are pinned by its Gen4 pair: GraphicsDrawIndex
+// (Graphics.cpp:313) emits this same R_DRAW_INDEX custom packet as cmd[1]=index_count,
+// cmd[2..3]=index_addr lo/hi, and its CommandProcessor consumer cp_op_draw_index
+// (GraphicsRun.cpp:2757) reads buffer[0]=index_count, buffer[1..2]=index_addr — CONFIDENCE: HIGH.
+// a3 follows the Gen5 Dcb convention of a trailing 64-bit ShaderDrawModifier (cf.
+// GraphicsDcbDrawIndexAuto (buf, index_count, modifier), Graphics.cpp:1971), where Gen4 carried
+// 32-bit flags+type instead — CONFIDENCE: MED, stored raw. pm4_decode decodes this packet as
+// Kind::DrawIndex (issue #63); the index ELEMENT SIZE comes from the preceding SetIndexSize packet.
 HLE(agc_dcb_draw_index) {
     uint32_t* cmd; if (!begin_packet(a0, 7, IT_NOP, R_DRAW_INDEX, &cmd)) return 0;
     cmd[1] = (uint32_t)a1;
@@ -654,10 +655,10 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
         // completion-label write (WriteData/ReleaseMem/EventWrite) or a GPU-side wait in the stream.
         std::vector<gpu::Pm4Command> ops; gpu::decode_pm4(p->addr, p->dw_num, ops);
         static const char* kKindName[] = {"DrawReset","WaitFlipDone","SetShRegDirect","SetRegsIndirect",
-            "SetIndexType","DrawIndexAuto","EventWrite","AcquireMem","WriteData","WaitRegMem","Flip",
-            "ReleaseMem","Unknown"};
+            "SetIndexType","DrawIndex","DrawIndexAuto","EventWrite","AcquireMem","WriteData","WaitRegMem",
+            "Flip","ReleaseMem","Unknown"};
         for (auto& c : ops) {
-            uint32_t k = (uint32_t)c.kind; const char* nm = k < 13 ? kKindName[k] : "?";
+            uint32_t k = (uint32_t)c.kind; const char* nm = k < 14 ? kKindName[k] : "?";
             fprintf(stderr, "[agc]   pkt op=0x%02x r=0x%02x len=%u kind=%s pl0=0x%08x pl1=0x%08x pl2=0x%08x\n",
                     c.op, c.r, c.len, nm,
                     c.len > 1 ? c.payload[0] : 0, c.len > 2 ? c.payload[1] : 0, c.len > 3 ? c.payload[2] : 0);
