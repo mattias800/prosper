@@ -143,6 +143,25 @@ HLE(k_cond_wait)      { if (sclog()) fprintf(stderr, "[sync2] T%ld COND.wait.ent
     { auto* c = ensure_cond(a0); auto* m = ensure_mutex(a1);
       if (c && m) pthread_cond_wait(c, m); }
     if (sclog()) fprintf(stderr, "[sync2] T%ld COND.wait.exit cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); return 0; }
+// POSIX pthread_cond_timedwait(cond_slot, mutex_slot, const timespec* abstime) — abstime is an
+// ABSOLUTE CLOCK_REALTIME deadline ({i64 sec, i64 nsec}, FreeBSD == Linux x86-64 layout), and the
+// POSIX shim returns the errno VALUE directly (FreeBSD ETIMEDOUT = 60). This was an unimplemented
+// stub returning 0 = "signaled": UE's IAsyncReadRequest::WaitCompletion(timeout) loop (guest
+// eboot+0x22ea8ca, live-caught spinning at 100% CPU with RA 0x4022ea954 inside prosper_on_unimpl)
+// re-checked its predicate and retried instantly, forever. The cond/mutex SLOTS are the same
+// pointer-slot scheme as scePthreadCond* (the same objects flow through k_cond_wait's infinite
+// branch), so ensure_cond/ensure_mutex map them to the identical host objects.
+// CONFIDENCE: HIGH (POSIX semantics; spin diagnosed live; FreeBSD errno per Kyty Errno.h).
+HLE(k_cond_timedwait) {
+    auto* c = ensure_cond(a0); auto* m = ensure_mutex(a1);
+    if (!c || !m) return 22;                                   // EINVAL
+    if (!a2) { pthread_cond_wait(c, m); return 0; }
+    const int64_t* gts = (const int64_t*)(uintptr_t)a2;
+    struct timespec dl { (time_t)gts[0], (long)gts[1] };
+    int rc = pthread_cond_timedwait(c, m, &dl);
+    if (rc == ETIMEDOUT) return 60;                            // FreeBSD ETIMEDOUT
+    return (uint64_t)rc;
+}
 
 // --- read/write locks (opaque handle -> host pthread_rwlock_t). Real libc.prx uses these for its
 // internal state (locale, stdio, malloc arenas); stubbing them to no-ops leaves that state UNLOCKED
@@ -912,6 +931,7 @@ void register_kernel_hle() {
     R("pthread_cond_init", k_cond_init);      R("pthread_cond_destroy", k_cond_destroy);
     R("pthread_cond_signal", k_cond_signal);  R("pthread_cond_broadcast", k_cond_broadcast);
     R("pthread_cond_wait", k_cond_wait);
+    R("pthread_cond_timedwait", k_cond_timedwait);   // issue #115: unimpl-0 spun WaitCompletion loops
     R("pthread_condattr_init", k_condattr_init); R("pthread_condattr_destroy", k_condattr_destroy);
     R("pthread_attr_init", k_attr_init);      R("pthread_attr_destroy", k_attr_destroy);
     R("pthread_attr_setstacksize", k_attr_setstacksize);
