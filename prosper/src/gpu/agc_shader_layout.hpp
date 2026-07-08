@@ -70,6 +70,21 @@ struct DecodedImageDescriptor {
 // Decode an 8-dword T# (RDNA2/Gen5 image resource). Pure; exposed for reuse + testing.
 DecodedImageDescriptor decode_image_descriptor(const uint32_t t[8]);
 
+// A Gen5/GFX10 T# IMG_FMT (the 9-bit combined format field) decoded to sizing + conversion info.
+// bytes_per_block is the byte size of one block_width x block_height texel block — for uncompressed
+// formats block dims are 1x1 and it equals bytes-per-texel; for BCn blocks are 4x4.
+struct Gen5ImageFormatInfo {
+    DataFormat format         = DataFormat::Unknown;
+    uint32_t   num_components = 0;
+    uint32_t   bytes_per_block = 0;
+    uint32_t   block_width = 1, block_height = 1;
+    bool       srgb = false;   // gamma-encoded variant (sampling it as UNORM is a gamma error only,
+                               // not garbage — the numbering distinguishes e.g. 56 vs 130)
+};
+// Map a T#'s 9-bit Gen5 IMG_FMT value to format info. Returns false (out left Unknown/zero) for
+// values not in the table — callers must not assume RGBA8 for those (#65). Pure; exposed for testing.
+bool gen5_image_format(uint32_t fmt, Gen5ImageFormatInfo* out);
+
 // Map a GCN/Gen5 buffer (DFMT, NFMT) pair to a DataFormat + component count. Pure.
 // Decode an RDNA2 (GFX10/PS5) buffer V# combined 7-bit FORMAT field (dword3 bits[18:12]) into a
 // DataFormat + component count. (Replaces the GCN dfmt/nfmt split, which is wrong for PS5 V#s.)
