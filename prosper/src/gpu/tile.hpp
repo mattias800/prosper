@@ -41,4 +41,16 @@ std::vector<uint8_t> detile_surface(const std::vector<uint8_t>& src, uint32_t wi
 void tile_surface(uint8_t* dst, const uint8_t* src, uint32_t width, uint32_t height,
                   uint32_t tile_mode, uint32_t pitch = 0);
 
+// General SW_4KB_S de-swizzle for `bpe`-byte ELEMENTS (not fixed at 4). The 4KB micro-tile holds
+// 4096/bpe elements arranged `tile_side`x`tile_side` (Morton order, Y in the low bit of each pair,
+// identical structure to the 32-bpp path). Block-compressed surfaces use this with element = one
+// compressed block (BC3 = 16 bytes -> tile_side 16). `dst` holds ew*eh*bpe linear bytes; `src_bytes`
+// bounds the tiled read (short/OOB elements detile to zero). tile_mode!=SW_4KB_S -> straight copy.
+void detile_elements(uint8_t* dst, const uint8_t* src, size_t src_bytes,
+                     uint32_t ew, uint32_t eh, uint32_t bpe, uint32_t tile_side, uint32_t tile_mode);
+
+// Byte size of the TILED element surface (element grid padded up to whole tile_side tiles). The caller
+// must read at least this many bytes of tiled source before detiling.
+size_t tiled_elements_bytes(uint32_t ew, uint32_t eh, uint32_t bpe, uint32_t tile_side, uint32_t tile_mode);
+
 } // namespace prosper::gpu

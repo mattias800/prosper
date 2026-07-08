@@ -117,6 +117,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_tile PRIVATE prosper_core)
   add_test(NAME gpu_surface_detile COMMAND test_tile)
 
+  # BC1/BC2/BC3 block decompression to RGBA8 (#121): hand-built blocks with known output. Pure.
+  add_executable(test_bc_decode tests/test_bc_decode.cpp)
+  target_link_libraries(test_bc_decode PRIVATE prosper_core)
+  add_test(NAME bc_decode COMMAND test_bc_decode)
+
   add_executable(test_stat tests/test_stat.cpp)
   target_link_libraries(test_stat PRIVATE prosper_core)
   add_test(NAME sce_stat_layout COMMAND test_stat)

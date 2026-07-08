@@ -20,6 +20,7 @@
 #ifdef PROSPER_HAVE_VULKAN
 #include "gpu/gpu_execute.hpp"
 #include "gpu/tile.hpp"                   // render-target de-swizzle (detile_surface, tiled_surface_bytes)
+#include "gpu/bc_decode.hpp"              // BC1/2/3 block decompression -> RGBA8 (#121)
 #include "gpu/shader_resources.hpp"       // ShaderResourceTable / ResourceClass (bind the shaders' resources)
 #include "gpu/rdna2_to_spirv.hpp"         // recompile_fragment (diagnostic solid-color PS)
 #include "../../tests/render_runner.h"   // offscreen Vulkan backend (render_triangle_rgba) + dump_bmp
@@ -304,7 +305,33 @@ int main(int argc, char** argv) {
                             uint32_t tw = r.width ? r.width : 4, th = r.height ? r.height : 4;
                             size_t nb = (size_t)tw * th * 4;
                             texstore.emplace_back(nb, 0x00);
-                            safe_copy(texstore.back().data(), r.gpu_addr, nb);
+                            // Block-compressed (BC1/2/3): read the (possibly tiled) compressed blocks, block-
+                            // detile, and decode to RGBA8 in-place. The blocks are the tiled element (BC3 =
+                            // 16 bytes -> SW_4KB_S 16x16-block micro-tiles). #121.
+                            const uint32_t bcb = prosper::gpu::bc_block_bytes(r.format);
+                            if (bcb) {
+                                uint32_t bw = (tw + 3) / 4, bh = (th + 3) / 4;
+                                // CONFIDENCE: MED — SW_4KB_S keeps a 4KB micro-tile, so element count =
+                                // 4096/bpe arranged square: 16-byte blocks (BC2/3/5/7) -> 16x16, 8-byte
+                                // (BC1/4) -> 32x16 (approximated as 32 here). Verified against the 32-bpp
+                                // path (bpe=4 -> 32x32) and llvmpipe re-tiling, but NOT yet against a
+                                // structured (non-uniform) BC surface — the one live BC3 tex is ~solid white.
+                                uint32_t tside = (bcb == 16) ? 16u : 32u;
+                                size_t comp_bytes = (size_t)bw * bh * bcb;
+                                std::vector<uint8_t> lin(comp_bytes, 0);
+                                bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) && !getenv("PROSPER_NODETILE");
+                                if (tiled) {
+                                    size_t tbytes = prosper::gpu::tiled_elements_bytes(bw, bh, bcb, tside, r.tile_mode);
+                                    std::vector<uint8_t> traw(tbytes, 0);
+                                    safe_copy(traw.data(), r.gpu_addr, tbytes);
+                                    prosper::gpu::detile_elements(lin.data(), traw.data(), tbytes, bw, bh, bcb, tside, r.tile_mode);
+                                } else {
+                                    safe_copy(lin.data(), r.gpu_addr, comp_bytes);
+                                }
+                                prosper::gpu::bc_decode_surface(texstore.back().data(), lin.data(), lin.size(), tw, th, r.format);
+                            } else {
+                                safe_copy(texstore.back().data(), r.gpu_addr, nb);
+                            }
                             // PROSPER_DUMP_RAWTEX: write the raw tiled RGBA bytes (pre-detile) to a .bin for
                             // offline swizzle experimentation.
                             if (getenv("PROSPER_DUMP_RAWTEX") && !texstore.back().empty()) {
@@ -333,7 +360,8 @@ int main(int argc, char** argv) {
                             // disables it. Reads the PADDED tiled buffer (height rounded to whole 32-texel tile rows).
                             bool auto_tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode);
                             const char* dt = getenv("PROSPER_DETILE");
-                            if (!getenv("PROSPER_NODETILE") && (auto_tiled || (dt && atoi(dt) != 0))) {
+                            // BC textures already block-detiled + decoded above; the 32-bpp detiler must not touch them.
+                            if (!bcb && !getenv("PROSPER_NODETILE") && (auto_tiled || (dt && atoi(dt) != 0))) {
                                 const uint32_t tmode = auto_tiled ? r.tile_mode : (uint32_t)prosper::gpu::TileMode::Sw4KbS;
                                 // PROSPER_PITCH: padded row pitch in texels for surfaces whose pitch > width.
                                 const uint32_t pitch = getenv("PROSPER_PITCH") ? (uint32_t)atoi(getenv("PROSPER_PITCH")) : 0;

@@ -199,11 +199,14 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                                     "(extend gen5_image_format)\n", d.format, d.width, d.height); }
                 continue;
             }
-            if (fi.block_width > 1) {
+            // Block-compressed: BC1/BC2/BC3 are decoded to RGBA8 on upload (bc_decode). BC4/5/6/7 aren't
+            // decoded yet, so keep skipping them (a raw RGBA8 binding would sample garbage + over-read).
+            const bool is_bcn = fi.block_width > 1;
+            if (is_bcn && fi.format != DataFormat::Bc1 && fi.format != DataFormat::Bc2 &&
+                          fi.format != DataFormat::Bc3) {
                 if (!warned[d.format & 511u]) { warned[d.format & 511u] = true;
-                    fprintf(stderr, "[t#] Gen5 IMG_FMT %u is block-compressed (%ux%u T#) -> recognized but "
-                                    "BCn sampling is not wired; skipping texture binding\n",
-                            d.format, d.width, d.height); }
+                    fprintf(stderr, "[t#] Gen5 IMG_FMT %u is block-compressed BC4-7 (%ux%u T#) -> decode not "
+                                    "wired; skipping texture binding\n", d.format, d.width, d.height); }
                 continue;
             }
             ShaderResource r;
@@ -215,7 +218,10 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             r.width         = d.width;
             r.height        = d.height;
             r.tile_mode     = d.tile_mode;          // so the renderer can auto-detile a GPU-tiled surface
-            r.size          = d.width * d.height * fi.bytes_per_block;   // real bytes-per-texel (fmt=56 -> *4)
+            // Backing byte size: block-compressed surfaces store one bytes_per_block unit per 4x4 block
+            // (ceil dims); uncompressed store bytes_per_block per texel (fmt=56 -> *4).
+            r.size          = is_bcn ? (((d.width + 3) / 4) * ((d.height + 3) / 4) * fi.bytes_per_block)
+                                     : (d.width * d.height * fi.bytes_per_block);
             r.sgpr_base     = user_sgpr_base + off;  // DIRECT provenance key (image_sample SRSRC SGPR)
             r.srt_offset    = 0xFFFFFFFFu;
             table.resources.push_back(r);
