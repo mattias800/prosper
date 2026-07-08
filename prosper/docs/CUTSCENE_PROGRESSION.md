@@ -293,6 +293,147 @@ waiting on a main-thread integration step that the missing-Stopwatch path never 
 The layers keep peeling — each is Unity async-load engine internals. `PROSPER_NULLGUARD` is kept as a
 gated diagnostic (default no-op) for bisecting null-receiver crashes.
 
+## 2026-07-08 — ROOT CAUSE of the null `[obj+0x40]`: `WorkerThread.timer` is never created because `WorkerThread.Start()` never runs
+
+Full identification of the null field and *why* it is null (all via disasm of `Il2cppUserAssemblies.prx`
+[code file-off `0xe530`, vaddr 0] + a v29 `global-metadata.dat` parse + live `PROSPER_CRASHPEEK` register
+capture with an added il2cpp class-name walker in `boot_trace`):
+
+- **The null object is `Unity.PSN.PS5.Aysnc.WorkerThread`** (namespace literally `Aysnc` — a typo in
+  Sony's PSN Unity plugin). Confirmed by resolving `[[obj]+0x10]` (Il2CppClass `name`) — the same walker
+  correctly names `System.Object`/`System.Int32`/`System.Diagnostics.Stopwatch` on the same stack, so the
+  offsets are right. `[rbp-0x18]` at the getter frame (its saved-rbx = the caller `F`'s `this`) is the
+  WorkerThread.
+- **`[WorkerThread+0x40]` is the field `timer`, a `System.Diagnostics.Stopwatch`** (field token `0x40000e9`;
+  WorkerThread field list: `workerThread, stopThread, workLoad, workerQueueSyncObj, asyncOps, allThreads,
+  trackingSyncObj, activeOp, timer, pollingEvent`). The faulting getter `Il2cpp+0x16375e0` is
+  `Stopwatch.get_ElapsedTicks` (reads `[this+0x10]`=elapsed, `[+0x18]`=startTimeStamp, `[+0x20]`=IsRunning;
+  `cmp byte[rbx+0x20],0` with `rbx=this=null` → `SIGSEGV addr=0x20`). Caller `F` = `Il2cpp+0x175c880`, a
+  main-thread PlayerLoop PSN poll: `mov rdi,[rbx+0x40]; call get_ElapsedTicks; mov [r14+0x18],rax; r14=[r14+0x40]`
+  — it stamps `timer.Elapsed` onto each queued async op.
+- **`timer` is created in exactly ONE place: `WorkerThread.Start` (`Il2cpp+0x1757a00`)** does
+  `timer = Stopwatch.StartNew()` → `mov [rbx+0x40],rax`. `Stopwatch.StartNew` (`Il2cpp+0x16371e0`) has
+  **exactly one caller in the whole assembly** — this store. `Start` also sets `workerThread` (the
+  `System.Threading.Thread`, +0x10) and `stopThread` (+0x18). In the live crash object, `timer`(+0x40),
+  `workerThread`(+0x10) and `stopThread`(+0x18) are all null/0, while the `.ctor`-set collections
+  (`+0x20/+0x28/+0x30/+0x48`) ARE set ⟹ **`.ctor` ran but `Start()` did not.**
+- **`Start()` is never called.** Its only call sites (14 of them) are inside the PSN worker-pool init
+  `Il2cpp+0x1758250` (unconditional — no `ret`/branch before them), whose only caller is
+  `Il2cpp+0x6ec470` (does `UnityEngine.Object::DontDestroyOnLoad` — the `Unity.PSN.PS5.Main.Initialize`
+  bootstrap, invoked via a delegate/MethodInfo, not a direct call). HWBP on `Start`, the pool init, and the
+  bootstrap all show **0 hits on the main thread** (`PROSPER_HWBP` is per-thread/main-only; an added
+  `PROSPER_HWBP_ALLTHREADS` can't cover guest threads that bind `pthread_create` cross-module to
+  `libkernel.prx` and thus bypass our `thread_trampoline`).
+
+**Why guarding the getter is insufficient (matches PR #43's `PROSPER_NULLGUARD` result):** with the getter
+stubbed to `xor eax,eax; ret` the process survives to `SubmitDcb #82738` but every submit stays the
+**3-draw loading composite** — the scene never activates. Returning a monotonic `rdtsc` (PR #43) also
+stalls the async loader at ~3 `resources.assets` reads. Reason: the missing piece is not the *value* of the
+timer but the **`WorkerThread` was never started at all** — `workerThread` (its background `Thread` that runs
+`RunProc` to pump the async work queue) is also null. No `Start()` ⟹ no worker thread ⟹ the async op queue is
+never drained ⟹ the scene-activation/async-load op never completes.
+
+**Fix direction (the real fix, not a guard):** make the PSN worker pool actually start —
+`Unity.PSN.PS5.Main.Initialize` → pool init (`0x1758250`) → `WorkerThread.Start` (`0x1757a00`) must execute,
+so `timer` + the background `Thread` are created and `RunProc` pumps the queue. Open question for the fix:
+*why is the `Main.Initialize` worker-pool-start path never reached?* Candidates: (a) it runs on a guest
+thread that binds thread creation to `libkernel.prx` (bypassing our HLE/trampoline) and faults early — note
+the recurring `WORKER-THREAD FAULT sig=11 addr=0x2000xxxx` (a tagged-value deref) that `_exit(90)`s; (b) a
+stubbed PS5/NP init NID makes `Main.Initialize` bail before the pool-start; (c) the pool-start delegate is
+registered but its trigger event never fires. NOTE: `EnsureVMInitialized`/`RequestWorkerThread`/
+`TryPopCustomWorkItem` belong to **`System.Threading.ThreadPool`** (mscorlib), NOT the PSN worker — do not
+conflate them with this bug. Tooling added this pass (gated, no default change): `boot_trace` il2cpp
+class-name walker under `PROSPER_CRASHPEEK` (+`PROSPER_PEEK_CLASS`), `PROSPER_HWBP_OBJ` (dump rdi as an
+il2cpp object at a method-entry bp), `PROSPER_HWBP_ALLTHREADS`, and `PROSPER_WORKER_PARK`.
+
+## 2026-07-08 (cont.) — the divergence point: PSN bootstrap `G` NEVER runs; native `PSN.prx` isn't loaded
+
+Traced the full call chain up from the null timer and pinned the exact divergence (all addresses are
+`Il2cpp+`):
+
+- `WorkerThread.timer` ← created ONLY in `WorkerThread.Start` (`0x1757a00`; `timer=Stopwatch.StartNew()`).
+- `Start` ← called ONLY from the worker-pool init `0x1758250` (14 `Start` calls, one per PSN subsystem
+  singleton). **Inside pool-init there is a native gate:** it resolves+calls `PSN_PrxInitialize(&out)`
+  (`call rax` @ `0x4417584b0`) then `cmp DWORD[rbp-0x90],0 ; jne 0x441758da6` — on a non-zero result it
+  branches away and **skips all 14 `Start` calls**. (A second `PSN_PrxInitializeA` gate follows.)
+- pool-init ← called ONLY from `G` (`0x6ec470`), which does `UnityEngine.Object::DontDestroyOnLoad` +
+  pool-init — i.e. the PSN system bootstrap (`Unity.PSN.PS5.Main.Initialize` path).
+- **`G` (`0x6ec470`) never executes on ANY thread.** Proven with a fixed `PROSPER_HWBP_ALLTHREADS`
+  (the arm must run on the host `%fs`, *before* `guest_tls_activate_thread()` — moving it fixed silent
+  no-arming): 52 guest worker threads armed + main, `G` hit count = 0. pool-init entry hit count = 0 too.
+  So the pool-init native gate is never even *reached*; the pool simply never bootstraps.
+
+**Environmental root cause:** the 4 linked modules are `eboot + Il2cpp + PS5Util + libc` — **native
+`PSN.prx` (Media/Plugins/PSN.prx) is NOT loaded**, and neither is `libkernel.prx`. Consequently Unity's
+native-plugin loader can't resolve the PSN plugin's exports — `[dlsym] unresolved 'PSN_PrxInitialize' ->
+ESRCH`, `'PSN_PrxInitializeA'`, `'UnityPluginLoad'`, `'UnityPluginUnload'`, etc. (our `k_dlsym` returns
+ESRCH unconditionally and doesn't search loaded modules). With the native plugin never loaded, Unity/the
+game never triggers the managed PSN bootstrap `G`, so the worker pool never starts and `timer` stays null.
+(Thread-binding candidate (a) is RULED OUT: all 52 guest threads go through our HLE `k_pthread_create` →
+`thread_trampoline`; nothing binds `pthread_create` cross-module to a Sony prx.)
+
+**IMPORTANT experimental caveat (re-scopes the premise):** avoiding the crash is NOT sufficient to render
+the cutscene. Two independent interventions each run crash-free to thousands of submits but **stay on the
+loading composite (draws/submit stays 3, scene never activates):** (1) stubbing the getter to `xor eax,eax;
+ret` (→ #82738); (2) neutralizing the whole PSN poll `F` with a `ret` at `0x175c880` (→ #51455). So the
+PSN null-timer NRE is a real crash but is **not, by itself, the thing gating scene activation** — either
+the activation genuinely needs a *properly running* PSN worker (real `Stopwatch` + live `RunProc` draining
+the async queue), or the activation blocker is partly independent. The scene loader itself is Unity's own
+`Loading.PreloadManager`/`Loading.AsyncRead` (created via our HLE, not PSN).
+
+**Fix plan (the real fix is large, spanning the loader + native HLE — not a getter guard):**
+1. Make the native PSN plugin available so the bootstrap triggers and the pool-init native gate passes:
+   either (a) **load `Media/Plugins/PSN.prx`** as a guest module (like Il2cpp/PS5Util) AND extend
+   `k_dlsym` to resolve exports by name from loaded modules (so `UnityPluginLoad`/`PSN_PrxInitialize`
+   resolve), or (b) **HLE the PSN native surface** — return "loaded/initialized, success" for the plugin
+   load + `PSN_PrxInitialize`/`PSN_PrxInitializeA` (leave their out-param 0) so `G`→pool-init→`Start`
+   proceeds and `timer` is created + `RunProc` runs. (b) is lighter but will surface further PSN native
+   calls from `RunProc` that must also be HLE'd honestly.
+2. THEN re-test scene activation with a properly-running pool; if it still doesn't activate, the remaining
+   blocker is a separate Unity async-integration step to be investigated on the (now crash-free) path.
+
+Tooling this pass: fixed `PROSPER_HWBP_ALLTHREADS` (arm on host `%fs` before `guest_tls_activate_thread`)
++ `PROSPER_HWBP_ARMLOG`.
+
+## 2026-07-08 (cont.) — SOLVED: PSN.prx module_start fault; the PSN worker pool now RUNS and drains the async queue
+
+The last blocker to starting the pool — PSN.prx's `module_start` faulting during init (`SIGSEGV addr=0x4,
+rip=PSN+0x3f47`, recovered) — is **fixed**. Full root cause (decoded from the real load map, not the
+displayed base):
+
+- The loader maps PSN.prx **by raw file offset**: `module_start` entry sits at raw `0xc60` → guest
+  `0x4e0000010`; the faulting instruction is at raw `0x4b97`. (The displayed `PSN+0x3f47` is not
+  `vaddr 0x3f47` in the ELF — the exec bytes are laid out by the SELF segment table, so
+  `guest = raw + 0x4dffff3b0`.)
+- The CRT `module_start` (raw `0xc60`) runs the init_arrays, then — because `[0x49020]` is a **relocated,
+  always-nonzero** pointer — tail-jumps to the module's **user** `module_start` (raw `0x4b30`) passing
+  `(argc=rdi, argp=rsi)`. That user start validates a **module-param descriptor**:
+  `test (argc & 0xfffffff0)`; require `[argp+0]==0x10 && [argp+4]==0x200`; on success store `[argp+8]`
+  into global `[0x50e78]` and return 0.
+- We were starting it as `module_start(0, NULL)`. `argc=0` fails the `test` and branches to the error/log
+  path, which then does `mov 0x4(%rbx),%esi` with `rbx=argp=NULL` → the null read at `0x4`. It never
+  reached the success store, so PSN.prx never registered → managed side: *"PSN is an old version…"*.
+
+**Fix** (commit `fix(cutscene): PSN.prx module_start no longer faults …`): `run_guest_inits` now starts
+module_start fns in registered ranges as `module_start(argc=0x10, argp=&{u32 0x10, u32 0x200, u64 0})`.
+`cb=NULL` is honored — `PSN_PrxInitialize` (`0x4e0003810`) sees `[0x50e78]==0`, **skips** the optional
+callback-registration steps, and still writes its out-param version (`[out]=1`, `[out+4]=0x9000047`) and
+runs all PSN subsystem inits. boot_trace registers the PSN.prx + SaveData.prx guest ranges via
+`set_module_start_param_ranges` (gated by `PROSPER_NO_PSN`, so the 4-module fallback boot is unchanged).
+
+**Proven effect** (`PROSPER_GUEST_FS=1 -force-gfx-direct`): no init fault, no *"old version"*, **no crash**
+across 160 s / 7381 submits. `PSN_PrxInitialize` resolves + runs; a managed PSN worker thread spawns
+(`[thread] create entry=Il2cpp+0x170570 name=…`) and RunProc drains the async queue: the loader goes from
+the old **3-read stall** to **5386+ reads** streaming `resources.assets` / `.resS` + `level3` / `level5` /
+`sharedassets3..5` (blocks to 3149, files opened *and closed*). The null-`Stopwatch` NRE is gone
+(WorkerThread.Start now runs → `timer` created).
+
+**Remaining (separate layer, owned elsewhere):** the scene still does not submit its render geometry —
+`draws/submit` stays ≤ 3 for the whole run (dist over 7381 submits: 1→6081, 2→421, 3→878; never > 3). We do
+**not** stall at block 966 (we blow past to 3149 loading level3/level5). So the cutscene not drawing is the
+**color-render-state capture** bug (`cb_target_mask=0` draws skipped; needs `PROSPER_FORCE_COLORWRITE`,
+on master) and/or the **type-tree-less `InventoryItemDefinition` MonoBehaviour deser** completion — not the
+PSN pool, which is now running.
 ## MAJOR PROGRESS (solo, post-#43): crash → streams 80% of the cutscene, down to the deser frontier
 
 Chained the workarounds to peel the cutscene blocker down layer by layer:

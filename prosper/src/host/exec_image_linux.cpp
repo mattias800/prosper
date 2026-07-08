@@ -114,6 +114,12 @@ namespace {
     bool     g_hwbp_stepping = false;
     volatile sig_atomic_t g_hwbp_count = 0;
     int      g_hwbp_max = 200;
+    // PROSPER_HWBP_ALLTHREADS=1: also arm the same execute bp on every guest worker thread (each thread
+    // gets its own perf fd + owns its own SIGTRAP). Lets us observe code that runs off the main thread
+    // (e.g. an async-loader worker) which a main-thread-only bp misses. Per-thread fd + stepping state.
+    bool                 g_hwbp_allthreads = false;
+    thread_local int     t_hwbp_fd = -1;       // this thread's own bp fd (main thread mirrors g_hwbp_fd)
+    thread_local bool    t_hwbp_stepping = false;
     // PROSPER_HWBP_R15=<hex>: only LOG when r15 == this value (a condition, evaluated in-process = no gdb
     // round-trip). When matched, also dump a window of memory around rax + classify rax's mapping. Built to
     // catch the one deserializer read that produces a garbage std::string length without the gdb-bp overhead
@@ -405,10 +411,10 @@ namespace {
                 }
                 return;
             }
-            if (g_hwbp_stepping && si->si_code == TRAP_TRACE) {
-                ioctl(g_hwbp_fd, PERF_EVENT_IOC_ENABLE, 0);
+            if ((t_hwbp_stepping || g_hwbp_stepping) && si->si_code == TRAP_TRACE) {
+                ioctl(t_hwbp_fd >= 0 ? t_hwbp_fd : g_hwbp_fd, PERF_EVENT_IOC_ENABLE, 0);
                 uc->uc_mcontext.gregs[REG_EFL] &= ~0x100ll;
-                g_hwbp_stepping = false;
+                t_hwbp_stepping = false; g_hwbp_stepping = false;
                 return;
             }
             // Chained DATA write-watchpoint hit (a write to the watched slot completed): log the writer
@@ -554,6 +560,25 @@ namespace {
                     if (probe_readable(ga + 7)) pcname("global", *(const uint64_t*)ga);
                 }
             }
+            // PROSPER_HWBP_OBJ=1: treat rdi as an il2cpp object (at a method-entry bp); print its class
+            // name ([[rdi]+0x10]) and fields [rdi+0x00..+0x60], plus [rdi+0x40] chased as an object too.
+            if (getenv("PROSPER_HWBP_OBJ") && cond_ok) {
+                auto rd = [](uint64_t a) -> uint64_t { return probe_readable(a) ? *(const uint64_t*)a : 0; };
+                auto nm = [&](uint64_t klass, char* o, int cap) { o[0]=0; if(!probe_readable(klass+0x18)) return;
+                    uint64_t p = rd(klass+0x10); int k=0; if(!probe_readable(p)){return;}
+                    for(;k<cap-1&&probe_readable(p+k);k++){char c=*(const char*)(p+k); if(!c)break; if(c<0x20||c>0x7e){o[0]=0;return;} o[k]=c;} o[k]=0; };
+                uint64_t rdi = (uint64_t)gr[REG_RDI];
+                char cn[96], sn[96]; nm(rd(rdi), cn, sizeof cn);
+                uint64_t sw = rd(rdi+0x40); nm(rd(sw), sn, sizeof sn);
+                char b[400]; int n = snprintf(b, sizeof b,
+                    "[hwbp-obj] rdi=0x%llx class=\"%s\" | +0x40(sw)=0x%llx swclass=\"%s\" swRunning=[+0x20]=%d | fields: +8=0x%llx +10=0x%llx +18=0x%llx +20=0x%llx +28=0x%llx +30=0x%llx +38=0x%llx +48=0x%llx\n",
+                    (unsigned long long)rdi, cn, (unsigned long long)sw, sn,
+                    sw&&probe_readable(sw+0x20)?*(const unsigned char*)(sw+0x20):-1,
+                    (unsigned long long)rd(rdi+8),(unsigned long long)rd(rdi+0x10),(unsigned long long)rd(rdi+0x18),
+                    (unsigned long long)rd(rdi+0x20),(unsigned long long)rd(rdi+0x28),(unsigned long long)rd(rdi+0x30),
+                    (unsigned long long)rd(rdi+0x38),(unsigned long long)rd(rdi+0x48));
+                write(2, b, n);
+            }
             if (cond_ok && g_hwbp_r15_on) {
                 // The matching read: dump the window around rax (the source pointer) + classify its mapping,
                 // so we can see whether the deserializer's cursor points into a file buffer / heap / garbage.
@@ -642,7 +667,7 @@ namespace {
                 else if (!strcmp(r,"rbp")) base = (uint64_t)gr[REG_RBP];
                 arm_hwwatch(base + (uint64_t)g_hwwatch_delta);
             }
-            ioctl(g_hwbp_fd, PERF_EVENT_IOC_DISABLE, 0);   // disable so we can step off the bp address
+            ioctl(t_hwbp_fd >= 0 ? t_hwbp_fd : g_hwbp_fd, PERF_EVENT_IOC_DISABLE, 0);   // disable so we can step off the bp address
             // Step-window ENTRY: on the Nth driver hit, begin continuous single-stepping (bp stays disabled;
             // the window ends when we single-step back to the driver = next hit). Buffer range is [base,
             // base+0x20000) — the reader's own end grows across the window, so use a generous span.
@@ -665,7 +690,8 @@ namespace {
             // Stay armed while logging OR while the anomaly-ring trace is still hunting (PROSPER_HWBP_MAX
             // can be 0 to suppress the per-hit log yet keep the bp live feeding the ring until it dumps).
             if (g_hwbp_count < g_hwbp_max || ((g_hwbp_anom_on || g_hwbp_node_on) && !g_hwbp_ring_dumped)) {
-                uc->uc_mcontext.gregs[REG_EFL] |= 0x100ll; g_hwbp_stepping = true;
+                uc->uc_mcontext.gregs[REG_EFL] |= 0x100ll;
+                if (t_hwbp_fd >= 0) t_hwbp_stepping = true; else g_hwbp_stepping = true;
             }                                              // else: leave disabled (one-and-done at the cap)
             guest_fs_restore_scoped(saved_fs);             // back to guest %fs before returning to guest code
             return;
@@ -918,6 +944,10 @@ namespace {
             // If PROSPER_HWBP_NODE ring-capture is active, the crash node's typetree metadata is the tail.
             if (g_hwbp_node_on) hwbp_dump_ring("worker-fault");
         }
+        // PROSPER_WORKER_PARK=1 (diagnostic): instead of terminating the whole process on a guest
+        // worker-thread fault, park the faulting thread so the main thread can proceed to its own
+        // recoverable crash (lets CRASHPEEK/PEEK_CLASS run). May deadlock if the worker held a lock.
+        if (getenv("PROSPER_WORKER_PARK")) { for (;;) pause(); }
         _exit(90);
     }
 
@@ -1111,6 +1141,7 @@ void install_trap_handler() {
         if (getenv("PROSPER_HWBP_DIVCAP")) g_hwbp_divcap = true;
         if (getenv("PROSPER_HWBP_STRDUMP")) g_hwbp_strdump = true;
         if (getenv("PROSPER_HWBP_KLASS")) g_hwbp_klass = true;
+        if (getenv("PROSPER_HWBP_ALLTHREADS")) g_hwbp_allthreads = true;
         if (g_devnull_fd < 0) g_devnull_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
         g_hwbp_on = true;   // perf_event_open done in arm_hwbp() after the image is mapped
         // PROSPER_HWWATCH=<signed delta>: on the first exec-bp hit, arm a data write-watch on [rax+delta]
@@ -1161,9 +1192,31 @@ void arm_hwbp() {
     struct f_owner_ex ow; ow.type = F_OWNER_TID; ow.pid = (pid_t)syscall(SYS_gettid);
     fcntl(g_hwbp_fd, F_SETOWN_EX, &ow);
     ioctl(g_hwbp_fd, PERF_EVENT_IOC_ENABLE, 0);
+    t_hwbp_fd = g_hwbp_fd;   // main thread uses the same fd for its per-thread stepping state
     int n = snprintf(b, sizeof b, "[hwbp] armed HW execute bp at eboot+0x%llx (fd=%d tid=%ld)\n",
                      (unsigned long long)(g_hwbp_addr - 0x400000000ull), g_hwbp_fd, (long)syscall(SYS_gettid));
     syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
+}
+
+// Arm the same execute bp on the CURRENT (worker) thread, gated by PROSPER_HWBP_ALLTHREADS. Each thread
+// owns its own perf fd + SIGTRAP delivery, so off-main-thread execution of the target is observed too.
+void arm_hwbp_this_thread() {
+    if (getenv("PROSPER_HWBP_ARMLOG")) { char b[128]; int n = snprintf(b, sizeof b,
+        "[hwbp] arm_this_thread tid=%ld on=%d all=%d addr=0x%llx tfd=%d\n", (long)syscall(SYS_gettid),
+        g_hwbp_on, g_hwbp_allthreads, (unsigned long long)g_hwbp_addr, t_hwbp_fd); write(2, b, n); }
+    if (!g_hwbp_on || !g_hwbp_allthreads || !g_hwbp_addr || t_hwbp_fd >= 0) return;
+    long fd = perf_bp_open(g_hwbp_addr, HW_BREAKPOINT_X);
+    if (fd < 0) { char b[96]; int n = snprintf(b, sizeof b, "[hwbp] worker-arm FAILED tid=%ld errno=%d\n",
+        (long)syscall(SYS_gettid), errno); write(2, b, n); return; }
+    t_hwbp_fd = (int)fd;
+    fcntl(t_hwbp_fd, F_SETFL, O_ASYNC);
+    fcntl(t_hwbp_fd, F_SETSIG, SIGTRAP);
+    struct f_owner_ex ow; ow.type = F_OWNER_TID; ow.pid = (pid_t)syscall(SYS_gettid);
+    fcntl(t_hwbp_fd, F_SETOWN_EX, &ow);
+    ioctl(t_hwbp_fd, PERF_EVENT_IOC_ENABLE, 0);
+    char b[128]; int n = snprintf(b, sizeof b, "[hwbp] armed on worker tid=%ld (fd=%d) for eboot+0x%llx\n",
+        (long)syscall(SYS_gettid), t_hwbp_fd, (unsigned long long)(g_hwbp_addr - 0x400000000ull));
+    write(2, b, n);
 }
 
 uint64_t stub_addr(uint64_t idx) { return g_stub_base + idx * g_stub_size; }
@@ -1188,14 +1241,65 @@ bool guest_stack_for_current_thread(void** base, size_t* size) {
     return guest_stack_for_thread((uint64_t)pthread_self(), base, size);
 }
 
+// Guest-address ranges whose module_start needs a real SCE module-param descriptor (see header).
+std::vector<std::pair<uint64_t, uint64_t>> g_modstart_param_ranges;
+// The descriptor Sony's PSN/SaveData plugin module_start validates: [+0]=0x10 (size), [+4]=0x200
+// (interface version the native plugin requires), [+8]=0 (optional callback-registration fn ptr;
+// NULL is honored — PSN_PrxInitialize skips the optional callbacks and still reports its real
+// native version). Static so it has a stable, guest-readable address for the whole run.
+static const struct __attribute__((packed)) { uint32_t size; uint32_t version; uint64_t cb; }
+    g_modstart_desc = { 0x10, 0x200, 0 };
+
+void set_module_start_param_ranges(const std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
+    g_modstart_param_ranges = ranges;
+}
+
 size_t run_guest_inits(const std::vector<uint64_t>& fns) {
     size_t ok = 0;
     for (uint64_t f : fns) {
         g_trap_kind = 0; g_armed_tid = cur_tid();
-        if (sigsetjmp(g_jb, 1) == 0) { ((void (*)())(uintptr_t)f)(); ok++; }
+        // Call with the PS5 module-entry ABI module_start(size_t argc, const void* argp): pass argc=0,
+        // argp=NULL. Plain init_array ctors take no args and harmlessly ignore rdi/rsi (SysV), but a real
+        // module_start (e.g. the PSN.prx / SaveData.prx plugins) READS these — calling f() left garbage in
+        // rdi/rsi, so it dereferenced a garbage argp and faulted at boot (SIGSEGV addr=0x1/0x5). CONFIDENCE: HIGH.
+        // A plugin module_start registered in g_modstart_param_ranges further requires a valid descriptor:
+        // its user module_start validates argp={0x10,0x200,...} and null-faults on (0,NULL). CONFIDENCE: HIGH.
+        uint64_t argc = 0, argp = 0;
+        for (auto& r : g_modstart_param_ranges)
+            if (f >= r.first && f < r.second) { argc = 0x10; argp = (uint64_t)&g_modstart_desc; break; }
+        if (sigsetjmp(g_jb, 1) == 0) { ((void (*)(uint64_t, uint64_t))(uintptr_t)f)(argc, argp); ok++; }
         g_armed_tid = 0;
-        if (g_trap_kind) fprintf(stderr, "[prosper] init fn 0x%llx faulted (%s); continuing\n",
-                                 (unsigned long long)f, trap_detail().c_str());
+        if (g_trap_kind) {
+            fprintf(stderr, "[prosper] init fn 0x%llx faulted (%s); continuing\n",
+                    (unsigned long long)f, trap_detail().c_str());
+            // Full register capture at the init fault — diagnoses the PSN.prx module_start fault
+            // (null global / TLS / unresolved import). g_r* were latched by the fault handler.
+            fprintf(stderr, "[prosper]   rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx\n"
+                            "[prosper]   rsi=%016llx rdi=%016llx rbp=%016llx rsp=%016llx\n"
+                            "[prosper]   r8 =%016llx r9 =%016llx r10=%016llx r11=%016llx\n"
+                            "[prosper]   r12=%016llx r13=%016llx r14=%016llx r15=%016llx\n",
+                    (unsigned long long)g_rax, (unsigned long long)g_rbx, (unsigned long long)g_rcx,
+                    (unsigned long long)g_rdx, (unsigned long long)g_rsi, (unsigned long long)g_rdi,
+                    (unsigned long long)g_rbp, (unsigned long long)g_rsp, (unsigned long long)g_r8,
+                    (unsigned long long)g_r9, (unsigned long long)g_r10, (unsigned long long)g_r11,
+                    (unsigned long long)g_r12, (unsigned long long)g_r13, (unsigned long long)g_r14,
+                    (unsigned long long)g_r15);
+            // Dump the 24 bytes around the faulting rip straight from mapped memory — resolves the
+            // exact faulting instruction. The exec segment is often mapped execute-only (PS5 PF_X with
+            // no PF_R), so temporarily add PROT_READ to the page before reading.
+            uint64_t pg = g_fault_rip & ~(uint64_t)0xfff;
+            mprotect((void*)pg, 0x2000, PROT_READ | PROT_EXEC);
+            const uint8_t* p = (const uint8_t*)g_fault_rip;
+            fprintf(stderr, "[prosper]   bytes@rip-8:");
+            for (int i = -8; i < 16; i++) fprintf(stderr, " %02x", p[i]);
+            fprintf(stderr, "  (rip=0x%llx)\n", (unsigned long long)g_fault_rip);
+            uint64_t fpg = f & ~(uint64_t)0xfff;
+            mprotect((void*)fpg, 0x2000, PROT_READ | PROT_EXEC);
+            const uint8_t* fp = (const uint8_t*)f;
+            fprintf(stderr, "[prosper]   bytes@entry:");
+            for (int i = 0; i < 24; i++) fprintf(stderr, " %02x", fp[i]);
+            fprintf(stderr, "  (entry=0x%llx)\n", (unsigned long long)f);
+        }
     }
     return ok;
 }
@@ -1288,7 +1392,7 @@ BootResult run_entry(const LoadedImage& img) {
         r.fault_addr = (uint64_t)g_fault_addr;
         r.fault_rip = g_fault_rip;
         r.rbp = g_rbp; r.rsp = g_rsp; r.rax = g_rax;
-        r.rdi = g_rdi; r.rsi = g_rsi; r.rdx = g_rdx;
+        r.rdi = g_rdi; r.rsi = g_rsi; r.rdx = g_rdx; r.rbx = g_rbx;
         // Walk the rbp chain for a backtrace, guarded so a bad frame can't crash us.
         g_armed_tid = cur_tid();
         if (sigsetjmp(g_jb, 1) == 0) {

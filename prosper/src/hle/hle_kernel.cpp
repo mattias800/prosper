@@ -259,6 +259,7 @@ void* thread_trampoline(void* p) {
     // allocator arena/tcache — resolves to real guest storage, not the aliased host glibc TCB). The import
     // stubs swap back to host %fs per HLE call. No-op when the gate is off. Order matters: the free() above
     // is host glibc (host-TLS tcache) — running it under the guest %fs corrupts the host heap.
+    arm_hwbp_this_thread();   // no-op unless PROSPER_HWBP_ALLTHREADS; MUST run on host %fs (host libc calls)
     guest_tls_activate_thread();
     return entry ? entry(arg) : nullptr;
 }
@@ -584,12 +585,32 @@ HLE(k_is_stack) {   // sceKernelIsStack(void* addr): is addr within the current 
 #endif
     return 0;
 }
+// Global export table (NID -> guest addr) registered by the loader, so dlsym can resolve
+// exported symbols by name against loaded modules (e.g. PSN.prx's plugin/init exports).
+namespace { const std::unordered_map<std::string, uint64_t>* g_exports = nullptr; }
+void set_module_exports(const std::unordered_map<std::string, uint64_t>* exports) { g_exports = exports; }
+
 HLE(k_dlsym) {   // sceKernelDlsym(SceKernelModule handle, const char* name, void** funcAddr)
-    // We don't resolve dynamic symbols through the HLE layer. Return ESRCH ("not found") but leave
-    // *funcAddr untouched — callers pre-seed it with a fallback and keep that on failure. (The old
-    // path returned success; nulling the out pointer here broke a caller that then invoked it.)
+    // Resolve the requested symbol by name against the linked program's global export table
+    // (Unity's native-plugin loader dlsym's UnityPluginLoad / PSN_PrxInitialize by name). We hash
+    // the name to its Sony NID (nid_hash) and look it up among all loaded modules' exports; a hit
+    // is written through *funcAddr and reported as success. This is what makes the native PSN.prx
+    // plugin's exports reachable so the managed PSN bootstrap + worker pool start.
+    const char* name = a1 ? (const char*)(uintptr_t)a1 : nullptr;
+    if (name && g_exports) {
+        auto it = g_exports->find(nid_hash(name));
+        if (it != g_exports->end()) {
+            if (a2) *(uint64_t*)(uintptr_t)a2 = it->second;   // *funcAddr = export
+            if (getenv("PROSPER_SYNCLOG"))
+                fprintf(stderr, "[dlsym] '%s' -> 0x%llx\n", name, (unsigned long long)it->second);
+            return 0;
+        }
+    }
+    // Not an exported symbol of any loaded module. Return ESRCH ("not found") but leave *funcAddr
+    // untouched — callers pre-seed it with a fallback and keep that on failure. (The old path
+    // returned success; nulling the out pointer here broke a caller that then invoked it.)
     if (getenv("PROSPER_SYNCLOG"))
-        fprintf(stderr, "[dlsym] unresolved '%s' -> ESRCH (fallback kept)\n", a1 ? (const char*)(uintptr_t)a1 : "?");
+        fprintf(stderr, "[dlsym] unresolved '%s' -> ESRCH (fallback kept)\n", name ? name : "?");
     return 0x80020003;   // SCE_KERNEL_ERROR_ESRCH
 }
 

@@ -40,12 +40,15 @@ struct BootResult {
     int          kind = 0;      // 0 = returned, 2 = faulted (SIGSEGV/BUS), 3 = SIGILL
     std::string  detail;        // fault description
     uint64_t     fault_addr = 0, fault_rip = 0;
-    uint64_t     rbp = 0, rsp = 0, rax = 0, rdi = 0, rsi = 0, rdx = 0; // regs at fault
+    uint64_t     rbp = 0, rsp = 0, rax = 0, rdi = 0, rsi = 0, rdx = 0, rbx = 0; // regs at fault
     std::vector<uint64_t> backtrace;   // return addresses (rbp chain) at the fault
 };
 // Register the stack a guest thread runs on (main thread + workers we spawn), keyed by
 // its pthread id, so GC/thread code gets accurate bounds without pthread_getattr_np.
 void register_thread_stack(uint64_t tid, void* base, uint64_t size);
+// Arm the PROSPER_HWBP execute breakpoint on the calling (worker) thread (no-op unless
+// PROSPER_HWBP_ALLTHREADS is set). Lets off-main-thread execution of the target be observed.
+void arm_hwbp_this_thread();
 // Report the calling guest thread's registered stack bounds (false if not registered).
 bool guest_stack_for_current_thread(void** base, size_t* size);
 bool guest_stack_for_thread(uint64_t tid, void** base, size_t* size);
@@ -54,6 +57,14 @@ bool guest_stack_for_thread(uint64_t tid, void** base, size_t* size);
 // called under a per-thread recovery point; a faulting init is skipped (best-effort).
 // Returns the number that ran without faulting.
 size_t run_guest_inits(const std::vector<uint64_t>& fns);
+
+// Register guest-address ranges whose module_start expects a real SCE module-param
+// descriptor instead of (argc=0, argp=NULL). An init fn whose address falls in one of
+// these ranges is called as module_start(argc=0x10, argp=&{u32 0x10, u32 0x200, u64 0}) —
+// the descriptor Sony's native PSN.prx / SaveData.prx plugins validate before registering
+// their version (their user module_start dereferences argp and null-faults with (0,NULL)).
+// Default: empty (every init fn is called (0,0) — the normal boot is unchanged).
+void set_module_start_param_ranges(const std::vector<std::pair<uint64_t, uint64_t>>& ranges);
 
 // Set up a SysV-style stack + argc/argv, jump to img.entry, run until it returns or
 // faults. Unimplemented imports are logged along the way (see dispatch.hpp).

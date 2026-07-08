@@ -34,8 +34,9 @@ bool link_program(const std::vector<LinkInput>& inputs, uint64_t stub_base,
                                       m.tls_filesz, m.tls_memsz, m.tls_align });
     }
 
-    // --- Global export table: NID -> guest address (first definition wins). ---
-    std::unordered_map<std::string, uint64_t> exports;
+    // --- Global export table: NID -> guest address (first definition wins). Retained in
+    // out.exports so sceKernelDlsym can resolve exported symbols by name post-link. ---
+    std::unordered_map<std::string, uint64_t>& exports = out.exports;
     for (size_t i = 0; i < out.mods.size(); i++) {
         const Module& m = *out.mods[i];
         uint64_t base = out.imgs[i].base;
