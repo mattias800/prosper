@@ -4,6 +4,10 @@
 #include "nid.hpp"
 #include <pthread.h>
 #include <chrono>
+#ifndef _WIN32
+#include <unistd.h>
+#include <sys/syscall.h>
+#endif
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
@@ -65,6 +69,32 @@ HLE(k_rtc_get_current_tick) {
     *(uint64_t*)P(a0) = tick;
     return 0;
 }
+// sceRtcGetCurrentClockLocalTime / sceRtcGetCurrentClock(SceRtcDateTime* dt[, int tz_minutes]) —
+// fill the 16-byte SceRtcDateTime {u16 year,month,day,hour,minute,second; u32 microsecond} from the
+// same synthetic wall clock as sceRtcGetCurrentTick. Unimplemented-zero output (month=0, day=0)
+// trips UE4's FDateTime "Invalid Date values" assert, whose failed-assert handler then calls a
+// null crash-handler pointer — so a REAL calendar conversion is load-bearing for the UE4 boot.
+HLE(k_rtc_get_clock_localtime) {
+    if (!a0) return 0;
+    uint64_t us = (ns_now() / 1000ull) + 1700000000ull * 1000000ull;
+    time_t secs = (time_t)(us / 1000000ull);
+    struct tm tmv {};
+#ifdef _WIN32
+    gmtime_s(&tmv, &secs);
+#else
+    gmtime_r(&secs, &tmv);
+#endif
+    uint16_t* d = (uint16_t*)P(a0);
+    d[0] = (uint16_t)(tmv.tm_year + 1900);
+    d[1] = (uint16_t)(tmv.tm_mon + 1);
+    d[2] = (uint16_t)tmv.tm_mday;
+    d[3] = (uint16_t)tmv.tm_hour;
+    d[4] = (uint16_t)tmv.tm_min;
+    d[5] = (uint16_t)tmv.tm_sec;
+    *(uint32_t*)(d + 6) = (uint32_t)(us % 1000000ull);
+    return 0;
+}
+
 // real sleeps so timed wait loops actually yield the CPU (and advance real time)
 HLE(k_usleep)   { uint64_t us = a0; struct timespec ts{ (time_t)(us / 1000000), (long)((us % 1000000) * 1000) }; nanosleep(&ts, nullptr); return 0; }
 HLE(k_sleep_s)  { struct timespec ts{ (time_t)a0, 0 }; nanosleep(&ts, nullptr); return (uint64_t)a0; }
@@ -73,6 +103,32 @@ HLE(k_nanosleep){ if (a0) nanosleep((const struct timespec*)P(a0), a1 ? (struct 
 // --- assorted libkernel stubs ---
 HLE(k_ok)              { return 0; }                       // generic success no-op
 HLE(k_load_start_mod)  { return g_module_handle++; }       // return a positive module id
+
+// _exit(status): terminate the process. Previously an unimplemented stub RETURNED 0, so libc's
+// exit path fell through into its deliberate ud2 (SIGILL) — terminate for real, loudly.
+HLE(k_exit) {
+    fprintf(stderr, "[prosper] guest _exit(%d) — terminating\n", (int)a0);
+    fflush(nullptr);
+    _Exit((int)a0);
+}
+// sceKernelDebugRaiseExceptionOnReleaseMode(code, arg) — the guest's FATAL-error raise (UE4 calls
+// it from failed check()s in shipping builds). Report and terminate rather than "return 0" and
+// let the guest run on in an undefined state.
+HLE(k_debug_raise_release) {
+    fprintf(stderr, "[prosper] guest sceKernelDebugRaiseExceptionOnReleaseMode(code=0x%llx, arg=0x%llx) — terminating\n",
+            (unsigned long long)a0, (unsigned long long)a1);
+    fflush(nullptr);
+    _Exit(0x66);
+}
+#ifndef _WIN32
+HLE(k_getthreadid) { return (uint64_t)syscall(SYS_gettid); }   // scePthreadGetthreadid
+#else
+HLE(k_getthreadid) { return 1; }
+#endif
+// sceKernelAprResolveFilepathsToIdsAndFileSizes — PS5 APR (async page read) IO path. Signature
+// unconfirmed; a garbage-out "success" poisons the engine's file table, so fail cleanly and let
+// the engine take its non-APR file path. CONFIDENCE: LOW on ABI, MED that failing is safer.
+HLE(k_apr_unavailable) { return 0x80020016ull; }   // EINVAL
 HLE(k_uuid_create) {                                       // fill 16 non-zero bytes
     if (a0) { uint8_t* u = (uint8_t*)P(a0); uint64_t t = ns_now(); for (int i = 0; i < 16; i++) u[i] = (uint8_t)(t >> (i * 4)) ^ (0xA5 + i); }
     return 0;
@@ -367,6 +423,9 @@ void register_kernel_time_hle() {
     R("clock", k_clock);
     R("sceRtcGetCurrentTick", k_rtc_get_current_tick);
     R("sceRtcGetCurrentNetworkTick", k_rtc_get_current_tick);
+    R("sceRtcGetCurrentClockLocalTime", k_rtc_get_clock_localtime);
+    R("sceRtcGetCurrentClock", k_rtc_get_clock_localtime);          // (dt, tz) — tz ignored (UTC clock)
+    R("sceRtcGetCurrentDateTimeUtc", k_rtc_get_clock_localtime);
     // module loading (report success; real PRX are already resident in our address space)
     R("sceSysmoduleLoadModule", k_ok);
     R("sceSysmoduleUnloadModule", k_ok);
@@ -381,6 +440,11 @@ void register_kernel_time_hle() {
     R("scePthreadSetschedparam", k_ok);
     R("scePthreadRename", k_ok);
     R("sceKernelUuidCreate", k_uuid_create);
+    R("_exit", k_exit);
+    R("sceKernelDebugRaiseExceptionOnReleaseMode", k_debug_raise_release);
+    R("scePthreadGetthreadid", k_getthreadid);
+    R("pthread_getthreadid_np", k_getthreadid);
+    R("sceKernelAprResolveFilepathsToIdsAndFileSizes", k_apr_unavailable);
     // C11 threads
     R("_Mtx_init", m_mtx_init);   R("_Mtx_lock", m_mtx_lock);   R("_Mtx_unlock", m_mtx_unlock);
     R("_Mtx_destroy", m_mtx_destroy);

@@ -434,3 +434,242 @@ the old **3-read stall** to **5386+ reads** streaming `resources.assets` / `.res
 **color-render-state capture** bug (`cb_target_mask=0` draws skipped; needs `PROSPER_FORCE_COLORWRITE`,
 on master) and/or the **type-tree-less `InventoryItemDefinition` MonoBehaviour deser** completion — not the
 PSN pool, which is now running.
+## MAJOR PROGRESS (solo, post-#43): crash → streams 80% of the cutscene, down to the deser frontier
+
+Chained the workarounds to peel the cutscene blocker down layer by layer:
+1. **#42 (merged)** — GC free-list corruption fixed.
+2. **`PROSPER_NULLGUARD=0x4416375e0,13`** — guards the null-`Stopwatch` getter crash (returns a value for a
+   null receiver). Identified the field as `WorkerThread.field_0x40` = `System.Diagnostics.Stopwatch`;
+   the WorkerThread is a work-queue (Semaphore@0x20, lock Object@0x28, Queue@0x30, EventWaitHandle@0x48,
+   Stopwatch@0x40-null). Both WorkerThreads have a null Stopwatch (systematic, never created).
+3. **`PROSPER_PREADLOG`** — its serialization unblocks a timing-sensitive stall (without it the loader
+   stalls at 3 reads; with it, streams deep). So there is a real async-load **race** that serialization masks.
+
+With #42 + null-guard + PREADLOG the game **runs with NO crash** and streams the cutscene assets, BUT:
+- **`resources.assets` reads progress to block ~966 (~80%) then CYCLE** — 696 unique blocks, 4537 total
+  reads, the tail re-reading only blocks 733/961/966 forever (FileCacher thrash / deser loop at the
+  block-966 frontier — the same ~82% point in the original findings). The load never completes.
+- Every rendered frame stays a blue clear; the game submits ~69 draws/frame but ~66 resolve to
+  `color_write_mask==0` (skipped) and forcing them on (`PROSPER_FORCE_COLORWRITE`) does not change the
+  output — they target an unresolved `color0_base==0`. The cutscene scene never activates because its
+  load never completes.
+
+**The two precise remaining blockers (both localized):**
+- **(A) The Stopwatch timing is wrong** — the null-guard returns 0 or rdtsc (extremes); neither is a real
+  running-timer magnitude, so Unity's async-integration time-budget mis-behaves (over/under budget),
+  which likely drives the block-966 thrash. Real fix: create/run a proper WorkerThread Stopwatch.
+- **(B) The block-966 deser thrash** — resources.assets deserialization re-reads 3 blocks forever at ~80%
+  (the DESER_STALE_CACHE_BLOCK frontier). May be a consequence of (A) starving integration, or an
+  independent FileCacher/deser cache-thrash.
+
+New gated diagnostics: `PROSPER_HWBP_FIELDS` now resolves each object-field's class; `PROSPER_FORCE_COLORWRITE`.
+
+### Block-966 thrash objects identified (UnityPy on resources.assets, 23495 objects)
+The tail-cycled blocks hold real cutscene content:
+- block 727 (0x2d70000): `AnimationClip` (pathid 2229)
+- block 961 (0x3c10000): `RectTransform` (pathid 18489)
+- block 966 (0x3c60000): `MonoBehaviour` (pathid 18918)
+So the deserializer is streaming the cutscene's UI/animation objects and re-reading around block 966. The
+thrash is at a specific object in the cutscene scene graph (independent of the Stopwatch timing). Cracking
+it needs deser-level RE of the object at pathid 18918 (a MonoBehaviour) and why its block set re-reads.
+
+### Session checkpoint — distance covered
+crash-at-SubmitDcb#46 (start) → #42 GC fix → deterministic null-Stopwatch crash (identified: WorkerThread
+timing Stopwatch) → null-guard past it → PREADLOG past the timing race → **streams ~80% of the cutscene
+assets with NO crash**, blocked only by the block-966 deser completion thrash + scene-activation/render.
+Remaining, all localized: (A) create a real WorkerThread Stopwatch [worked around], (B) block-966 deser
+completion, (C) cutscene draw render-target (color0_base==0) once the scene activates.
+
+### Block-966 stall characterized: main-thread deser loop / producer-consumer deadlock (well-formed data)
+- `/proc` thread states at the stall: the **main thread is state=R (busy-looping in userspace)** while
+  ~50 worker threads are blocked on `futex_do_wait`. Classic producer-consumer stall.
+- Read tids: the **main thread issues most `resources.assets` reads** (3966) and is the one re-reading
+  the 3 cycling blocks (727 AnimationClip / 961 RectTransform / 966 MonoBehaviour pathid 18918).
+- The objects are **well-formed** (UnityPy parses the file; its MonoBehaviour "read fail" is just a missing
+  custom type-tree, not corruption). So the game's deserializer loops on **valid data in our environment** —
+  an env-specific FileCacher/threading issue (cache-slot thrash under our thread layout, or a lost-wakeup
+  in the .NET Semaphore/EventWaitHandle coordination the WorkerThreads use), NOT a bad file or bad bytes.
+
+**Net:** the cutscene is behind a FileCacher/deser **completion deadlock** at ~80% (main spins, workers
+park). This is the final localized layer; it needs deep RE of the async-load thread coordination
+(.NET Semaphore/EventWaitHandle wakeups) or the SerializedFile CachedReader slot behavior under our
+threading — the same *class* as #42 (a sync primitive not behaving), one level up in the .NET threading stack.
+
+### Single-core test: block-966 stall is DETERMINISTIC (not a concurrency/lost-wakeup race)
+`taskset -c 0` (all threads serialized) still stalls at 696 unique blocks — identical to multi-core. So the
+block-966 deser loop is deterministic and independent of true parallelism / wakeup timing. Combined with
+the earlier results (independent of Stopwatch value too), this is a **structural main-thread deserializer
+loop** on the object at block 966 — not a race, not a lost-wakeup, not the Stopwatch. The remaining fix
+needs deep RE of the game's SerializedFile/CachedReader object-read path (why it re-reads blocks
+727/961/966 for a well-formed object in our environment) — a multi-hour guest-deser investigation.
+## 2026-07-08 — GC-suspend guest-%fs landmine FIXED; post-#43 blocker is an async-load *completion stall*
+
+Built on merged #43 (the null `System.Diagnostics.Stopwatch` at `WorkerThread+0x40`). Findings:
+
+**1. Fixed a real GC-suspend bug (this branch).** The IL2CPP GC stop-the-world handler (exception
+type `0x1e`) keeps the guest `%fs` to run the guest's suspend handler, but logged with glibc `write()`
+— a cancellation point whose prologue reads `THREAD_SELF` at `%fs:0x10` (0 on our guest TCB) and
+dereferences `self->cancelhandling` at `+0x308`. That is the `SIGSEGV addr=0x308 rip=<libc>` seen under
+`PROSPER_SYNCLOG` (faulting insn `mov %fs:0x10,%rcx; mov 0x308(%rcx),%edx`). Switched to raw
+`syscall(SYS_write)`. A latent guest-`%fs` landmine in the suspend path; the fix also re-enables
+`SYNCLOG`-instrumented GC tracing (which previously self-crashed).
+
+**2. `GC_DONT_GC=1` is a NO-OP here.** Injecting it via `PROSPER_GUEST_ENV` does **not** stop the world —
+type-`0x1e` suspend cycles still fire with it set. IL2CPP's bundled Boehm does not honor that env knob in
+this build. (An earlier "determinism" reading was actually just the absence of `SYNCLOG` timing overhead,
+not GC being disabled. Corrected.)
+
+**3. `PROSPER_ONE_CPU` (new, gated) rules out core-count as the worker driver.** Reporting a 1-core
+affinity mask (`scePthreadAttrGetaffinity` → `0x01`) does **not** reduce the ~47 `Loading.PreloadManager`
+threads — they are cumulative async-load churn, not a core-sized pool. So single-threading the job system
+via affinity is not the lever.
+
+**4. The true post-#43 blocker is an async-load COMPLETION STALL, not a crash.** With the persistent
+`PROSPER_NULLGUARD` bypass of the #43 Stopwatch crash, the game does **not** crash — it runs 270+ rendered
+frames. It fades from the title to black to load the cutscene (`level1`), and the loader **does stream the
+cutscene's assets**: it opens `level1`, `resources.assets`, `resources.assets.resS`, and reads ~28
+`resources.resource` chunks (the real texture/audio blob). Then the load **stalls**: the worker thread
+pool keeps churning on its per-thread futexes but the load never *completes/integrates*, so the scene
+never activates — every frame stays a static black clear. Reaching the cutscene now means resolving why
+async-load integration never finishes after the assets stream in (an engine-level PreloadManager step),
+not fixing a fault. (Note: a one-shot fault-handler unwind of the Stopwatch getter — `PROSPER_SKIP_WT_GETTER`
+— instead diverges to a `%fs:-0x80` thread-local artifact at `eboot+0x9f1ba0`; the persistent `NULLGUARD`
+is the correct, non-diverging bypass and gets strictly further.)
+
+**5. The stall is INDEPENDENT of the Stopwatch return value, and of APR.** Added `PROSPER_NULLGUARD_RET`
+(`tsc`|`zero`|`ms`) to select what the guarded null-receiver returns. All three **stall at the same 28
+`resources.resource` reads** — so the time-budget/unit theory is wrong; the guard's return value does not
+gate the stall. (`ms` holds on a dark-blue/purple screen, `tsc` fades to black — cosmetic difference only,
+neither reaches the cutscene text card, which has white text; the stalled frames have 0% white.) Also: the
+"not considered suitable for apr reads flags:0x0" line is the GAME's own `LocalFileSystemPS5` decision and
+prints for **every** file (including ones that load fine during boot), so APR-rejection is not the blocker.
+Net: the wall is specifically Unity's async **load-completion / integration** after the scene's bytes have
+streamed in — the main thread stays in its frame loop (renders 90+ frames) but the operation never reports
+complete. That main-thread integration step is the precise next target.
+## Hypotheses TESTED AND ELIMINATED for crash #1 (`WorkerThread.+0x40` null Stopwatch)
+
+A parallel session (95a32e9e) working on top of merged #42/#43 tested and ruled out the following as the
+cause of the never-initialized Stopwatch field — recorded so they are not re-tried:
+
+- **Thread-start ordering race** — added a `scePthreadCreate` start-handshake (creator waits for the new
+  thread to begin running + a slice budget for its `Run()` init) gated by `PROSPER_TSTART`. Crash unchanged
+  (`Il2cpp+0x1637697` still). Workers start and park normally, so it is **not** a "worker hasn't started" race.
+- **Thread-creation failure** — instrumented `k_pthread_create` to log any `pthread_create` that returns
+  nonzero: **0 failures** the whole run. The worker threads are created successfully.
+- **Stopwatch timestamp/frequency backing** — `sceKernelReadTsc`/`GetTscFrequency` return a sane 1 GHz and
+  `ns_now()` is monotonic, so `Stopwatch.StartNew()` cannot divide-by-zero / throw on the timer path.
+- **CPU-count / .NET ThreadPool starvation** — the game imports **no** `sysconf`/`sched_getaffinity`/
+  `GetCpumaskInfo` (only `UnityEngine.SystemInfo::GetProcessorCount`, backed by `scePthreadGetAffinity`
+  which we already return as 8 cores). So `Environment.ProcessorCount` is not low; the managed pool is not
+  CPU-count-starved.
+- **Null-bypass with a fake value** — `PROSPER_NULLGUARD` returning `rdtsc` did NOT stall at 3 reads here; it
+  **looped** re-reading `unity default resources` to **4096 preads → OOM**. Returning 0 stalls (per #43).
+  Confirms both: the field must be *genuinely* populated, and crash #2 (loader mis-behaving) is real.
+- **Missing HLE** — all `unimplemented → 0` NIDs fire once at startup; none during the steady-state load.
+
+**Architecture traced:** the one managed thread created has `Run()` at `Il2cpp+0x1cac50` — a **.NET
+ThreadPool worker** (atomic work-count on `[r15+0x10]`, then `call *%r12` to dispatch a queued delegate).
+So the Stopwatch-init runs as a **dispatched managed work item that never executes** in our env; the scene
+still loads (block 1183) because the *native* Unity job workers do the streaming, but the managed work item
+that would init `WorkerThread.+0x40` is the gap.
+
+**Decisive next probe (untried — needs process-wide tooling):** a hardware WRITE-watch on
+`[WorkerThread+0x40]` armed from the object's *allocation* across *all* threads (not the caller bp, which is
+after the write should have happened — that main-thread-only watch caught nothing). It answers definitively:
+does some worker/pool thread write the field (a dispatch/visibility race) or does no thread ever run the
+init (a never-dispatched work item)? That points straight at the fix.
+
+## Block-966 wall REFINED: a deterministic infinite 3-object deserialization loop (not a deadlock)
+
+Post-#44/#46, with `PROSPER_NULLGUARD=0x4416375e0,13` past the Stopwatch crash, the cutscene streams ~80%
+then hits its true final wall. A parallel session (95a32e9e) drilled it and **refines #46's "deser deadlock"**:
+
+**It is NOT a lost-wakeup, GC thrash, or memory starvation** (each tested & ruled out):
+- Attaching gdb at the stall shows the **main thread busy in `__libc_malloc(16)`** — actively deserializing,
+  NOT blocked on a sync primitive. The 46 parked workers are idle, not starved of a wakeup.
+- Only **20 GC (`type=0x1e`) cycles** over the whole run — not GC thrash.
+- We report **8 GiB** (`sceKernelGetDirectMemorySize`) — the FileCacher is not memory-starved.
+- `PROSPER_WAIT_TIMEOUT` does not break it (the workers aren't on a timed `WaitOnAddress`).
+
+**What it actually is:** the main thread re-reads a **perfect 3-block cycle** forever:
+`blk 961 (RectTransform) → 727 (AnimationClip) → 966 (MonoBehaviour, pathid 18918) → 961 → 727 → 966 → …`
+i.e. it re-deserializes the same 3 objects in a fixed cycle, allocating 16-byte nodes each pass and never
+marking them integrated. The cycle thrashes a **2-slot FileCacher** (`eboot+0xb17601`: checks the request
+key against slot-0 key `[this+0x50]` and slot-1 key `[this+0x68]`; a miss on both reloads via `0xb17340`).
+
+**Full guest call chain of the re-read** (captured via an 8-deep PREADLOG caller walk, this change):
+```
+sceKernelPread
+  <- eboot+0x146c1a9   (chunked read: reads until r13 remaining==0)
+  <- eboot+0x93a810
+  <- eboot+0xb1767e    (2-slot FileCacher body, 0xb17601)
+  <- eboot+0x1d68990
+  <- eboot+0xd4cf19    (offset->block math: `div rcx` then virtual read `call *0x28(rax)`)
+  <- eboot+0xd3ab1b / 0xd226d6   (per-object-TYPE deser dispatch — varies by object)
+  <- eboot+0xd3a996
+  <- eboot+0xd3d34b    (deser body; guards the FileCacher read under PS5 `PlatformMutex.cpp`)
+```
+So the FileCacher read is mutex-guarded (`eboot+0x19b29c0` logs `PlatformMutex.cpp`). Real HW reads each of
+these 3 blocks ONCE (the deser terminates); our env re-reads them forever — a value/state our environment
+feeds the deserializer (a misread field size → offset misalignment, or a never-set "object integrated"
+flag) makes the per-object deser fail to advance. **Next probe:** diff the exact bytes/positions the deser
+requests from block 966 across iterations (does the requested offset advance, or repeat?) to decide
+misalignment-vs-requeue; then find the field/flag our env sets wrong. This is the single remaining wall to
+the cutscene.
+## 2026-07-08 (cont.) — block-966 object identified: type-tree-LESS il2cpp MonoBehaviour deser (InventoryItemDefinition)
+
+Building on #46 (block-966 deser deadlock) with a UnityPy dissection of the exact objects:
+
+- **The block-966 object (pathid 18918) is a `MonoBehaviour` named "KeyOvChaos"** — an
+  `InventoryItemDefinition` ScriptableObject (an inventory item, key "KEY_OF_CHAOS"). Its `m_Script`
+  PPtr = **fileid 1 → `globalgamemanagers.assets`, pathid 1075 = MonoScript `InventoryItemDefinition`
+  (Assembly-CSharp)**. Raw object size is 132 bytes (12 `m_GameObject` + 4 `m_Enabled` + 12 `m_Script`
+  + 16 `m_Name` + 88 script fields).
+- **`resources.assets` has `enable_type_tree = False`** — there are NO embedded type-trees. So Unity
+  cannot deserialize these MonoBehaviours from the file alone; it **must** obtain each field layout from
+  the **il2cpp runtime type** (`InventoryItemDefinition`'s serialized fields). UnityPy, lacking that
+  runtime layout, fails these exact objects ("expected 132 bytes, read 44") — the same information gap the
+  game's deserializer must fill from il2cpp.
+- There are **49 `InventoryItemDefinition` MonoBehaviours** (script pathid 1075) among the 4823
+  MonoBehaviours in `resources.assets`; blocks 727/961/966 (the thrash set) are three of them.
+
+**Refined root:** the loop is not corruption and not the Stopwatch — it is **il2cpp MonoBehaviour
+field-layout resolution for a type-tree-less serialized asset**. The deserializer, reading an
+`InventoryItemDefinition` with no type-tree, asks the il2cpp runtime for the type's SerializeField layout
+to advance its cursor 132 bytes; if that resolution returns a wrong/incomplete layout (or a "not-ready"
+retry) in our environment, the object cursor never advances and it re-reads the same blocks forever. The
+next concrete step is to inspect what the game's SafeBinaryRead / il2cpp `Class::GetFields`-driven
+transfer returns for `InventoryItemDefinition` in our il2cpp (vs the 132-byte on-disk layout) — that is
+the precise mismatch to fix, and it is squarely in il2cpp reflection, not the file/GC/Stopwatch layers.
+
+## 2026-07-08 (cont.) — TWO independent blockers mapped: (1) missing color render-state, (2) variable deser/threading
+
+Two concrete findings this round, both verified:
+
+### (1) `FORCE_COLORWRITE` renders the FULL title screen — the color render-target state is not captured
+Running with `PROSPER_FORCE_COLORWRITE` (renders the ~66 skipped `mask==0` draws/frame) produces the
+**complete, correct "THE MESSENGER" title screen** (ninja, moon, logo, monster horde) at 1920×1080 — our
+GPU pipeline recompiles and renders The Messenger's real art correctly. Instrumenting the skipped draws
+shows **`cb_target_mask=0x0`, `cb_color_control=0x0`, `color0_fmt=0` for ALL of them** — the *entire*
+color render-target state is zero/unprogrammed, not just the write mask. So valid color draws are being
+dropped because we never capture their color-target setup (the game programs it via a path we miss;
+`FORCE_COLORWRITE` + the render path's default target is what makes them appear). This is a real,
+separate GPU state-tracking bug — and it means that **even once the load completes, the cutscene draws
+would be invisible without either this fix or `FORCE_COLORWRITE`**. Fix target: find where the guest
+programs CB_TARGET_MASK / CB_COLOR_CONTROL / the color0 surface for these draws and capture it into the
+context-register state (`st.cx`), rather than defaulting to 0.
+
+### (2) The block-966 deser stall is VARIABLE, not purely deterministic
+Re-running the deser trace multiple times (multi-core and single-core via `taskset -c 0`) gives
+**different outcomes per run**: sometimes the heavy block-961..966 loop (4500+ reads), sometimes light
+progress to block ~986/2843 then a worker-thread fault, sometimes a clean-ish exit. So layered on the
+deterministic deser loop there is *also* a **threading race** (the earlier "deterministic single-core"
+reading does not reproduce reliably). Added `PROSPER_DEEPTRACE` (hle_file.cpp): dumps a deep guest
+backtrace (eboot + il2cpp frames) on block-961..966 re-reads to catch the loop head — useful once the
+loop is reliably reproduced.
+
+**Net for the cutscene:** two things now stand between here and a visible cutscene, both mapped:
+(A) async-load completion of `resources.assets` (the InventoryItemDefinition/deser loop + a threading
+race — the primary blocker), and (B) capturing the color render-target state so the composited draws are
+visible (proven by FORCE_COLORWRITE rendering the title). Neither is a mystery anymore; both are scoped
+to one subsystem each (il2cpp deser; GPU context-register capture).

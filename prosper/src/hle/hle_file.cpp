@@ -175,15 +175,30 @@ static void preadlog(const char* fn, uint64_t fd, uint64_t off, uint64_t cnt) {
     char path[256] = "?"; char lp[64]; snprintf(lp, sizeof lp, "/proc/self/fd/%lld", (long long)fd);
     ssize_t k = readlink(lp, path, sizeof path - 1); if (k > 0) path[k] = 0; else path[0] = '?', path[1] = 0;
     const char* base = strrchr(path, '/'); base = base ? base + 1 : path;
-    // top 3 distinct eboot-range return addresses on the stack (guest call chain)
-    uint64_t cc[3] = {0,0,0}; int nc = 0; uint64_t* sp = (uint64_t*)__builtin_frame_address(0);
-    for (int i = 0; i < 800 && nc < 3; i++) { uint64_t v = sp[i];
+    // top N distinct eboot-range return addresses on the stack (guest call chain)
+    uint64_t cc[8] = {0,0,0,0,0,0,0,0}; int nc = 0; uint64_t* sp = (uint64_t*)__builtin_frame_address(0);
+    for (int i = 0; i < 1200 && nc < 8; i++) { uint64_t v = sp[i];
         if (v >= 0x400000000ull && v < 0x420000000ull) { uint64_t o = v - 0x400000000ull;
             if (nc == 0 || cc[nc-1] != o) cc[nc++] = o; } }
-    fprintf(stderr, "[preadlog] %-6s %-24s fd=%lld off=0x%llx(blk %lld) cnt=0x%llx tid=%ld callers=eboot+0x%llx,0x%llx,0x%llx\n",
+    fprintf(stderr, "[preadlog] %-6s %-24s fd=%lld off=0x%llx(blk %lld) cnt=0x%llx tid=%ld callers=eboot+0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx\n",
             fn, base, (long long)fd, (unsigned long long)off, (long long)(off / 0x10000),
             (unsigned long long)cnt, (long)syscall(SYS_gettid),
-            (unsigned long long)cc[0], (unsigned long long)cc[1], (unsigned long long)cc[2]);
+            (unsigned long long)cc[0], (unsigned long long)cc[1], (unsigned long long)cc[2], (unsigned long long)cc[3],
+            (unsigned long long)cc[4], (unsigned long long)cc[5], (unsigned long long)cc[6], (unsigned long long)cc[7]);
+    static int deep_budget = getenv("PROSPER_DEEPTRACE") ? 30 : 0;
+    if (deep_budget > 0 && !strcmp(base, "resources.assets") && off >= 0x3c10000ull && off <= 0x3c60000ull) {
+        deep_budget--;
+        char line[1024]; int p = snprintf(line, sizeof line, "[deeptrace] blk %lld frames:", (long long)(off / 0x10000));
+        int nf = 0; uint64_t last = 0;
+        for (int i = 0; i < 1600 && nf < 20 && p < (int)sizeof line - 24; i++) {
+            uint64_t v = sp[i];
+            const char* m = nullptr; uint64_t o = 0;
+            if (v >= 0x400000000ull && v < 0x420000000ull) { m = "eb"; o = v - 0x400000000ull; }
+            else if (v >= 0x440000000ull && v < 0x4c0000000ull) { m = "il"; o = v - 0x440000000ull; }
+            if (m && o != last) { p += snprintf(line + p, sizeof line - p, " %s+%llx", m, (unsigned long long)o); last = o; nf++; }
+        }
+        fprintf(stderr, "%s\n", line);
+    }
 }
 #else
 static bool fdlog_on() { return false; }
@@ -257,6 +272,42 @@ HLE(f_mkdir) { std::string h = translate(CS(a0));   // sceKernelMkdir(path, mode
 #endif
 }
 HLE(f_rmdir) { std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::rmdir(h.c_str()); }
+
+#ifndef _WIN32
+// sceKernelGetdents(int fd, char* buf, size_t nbytes) — fill FreeBSD dirent records
+// {u32 fileno; u16 reclen; u8 type; u8 namlen; char name[]} (4-aligned). Backed by the host's
+// getdents64 on the SAME fd so the kernel keeps the directory cursor; Linux and BSD DT_* type
+// values match. Returns bytes written (0 = end of directory), or an SCE error. UE4 (PPSA17942)
+// enumerates its pak directory with this during IO-stack init.
+HLE(f_getdents) {
+    if (!a1 || a2 < 32) return 0x80020016ull;   // EINVAL
+    struct LinuxDirent64 { uint64_t ino; int64_t off; uint16_t reclen; uint8_t type; char name[]; };
+    uint8_t tmp[4096];
+    size_t want = a2 < sizeof tmp ? (size_t)a2 : sizeof tmp;
+    long n = syscall(SYS_getdents64, (int)a0, tmp, (unsigned)want);
+    if (n < 0)  return 0x80020000ull | (uint64_t)(errno & 0xff);
+    if (n == 0) return 0;
+    uint8_t* out = (uint8_t*)P(a1);
+    size_t o = 0, w = 0;
+    while (o < (size_t)n) {
+        auto* d = (const LinuxDirent64*)(tmp + o);
+        size_t namlen = strlen(d->name);
+        size_t rec = (8 + namlen + 1 + 3) & ~(size_t)3;   // 4-byte header + name + NUL, 4-aligned
+        if (w + rec > a2) break;
+        uint8_t* r = out + w;
+        *(uint32_t*)(r + 0) = (uint32_t)d->ino;
+        *(uint16_t*)(r + 4) = (uint16_t)rec;
+        r[6] = d->type;
+        r[7] = (uint8_t)namlen;
+        memcpy(r + 8, d->name, namlen + 1);
+        w += rec;
+        o += d->reclen;
+    }
+    return (uint64_t)w;
+}
+#else
+HLE(f_getdents) { return 0; }
+#endif
 HLE(f_unlink){ std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::
 #ifdef _WIN32
     _unlink
@@ -288,6 +339,7 @@ void register_file_hle() {
     R("mkdir", f_mkdir);          R("sceKernelMkdir", f_mkdir);
     R("rmdir", f_rmdir);          R("sceKernelRmdir", f_rmdir);
     R("unlink", f_unlink);        R("sceKernelUnlink", f_unlink);
+    R("sceKernelGetdents", f_getdents); R("getdents", f_getdents);
     #undef R
 }
 
