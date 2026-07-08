@@ -236,9 +236,10 @@ size_t apply_relocations(const Module& m, LoadedImage& img) {
             // appears. DTPOFF64 = the TLS symbol's offset within its module's TLS block.
             case R_X86_64_DTPMOD64:  if (write64(va, img.tls_modid)) applied++; break;
             case R_X86_64_DTPOFF64: {
-                uint64_t off = (r.sym && r.sym < m.symbols.size()) ? m.symbols[r.sym].value
-                                                                   : (uint64_t)r.addend;
-                if (write64(va, off)) applied++;
+                // psABI: DTPOFF64 = S + A. The addend addresses a field INSIDE the TLS object
+                // (e.g. a struct member); picking S *or* A drops it and resolves to the object base.
+                uint64_t sv = (r.sym && r.sym < m.symbols.size()) ? m.symbols[r.sym].value : 0;
+                if (write64(va, sv + (uint64_t)r.addend)) applied++;
                 break;
             }
             default: unhandled[r.type]++; break;
