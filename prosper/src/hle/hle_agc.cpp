@@ -196,15 +196,27 @@ HLE(agc_dcb_write_data) {  // sceAgcDcbWriteData(buf, dst, cache_policy, address
     if (src) for (uint32_t i = 0; i < num; i++) cmd[5 + i] = src[i];
     return (uint64_t)(uintptr_t)cmd;
 }
-HLE(agc_dcb_wait_reg_mem) {  // (buf, ...) — 9 dw
-    if (getenv("PROSPER_GFXLOG")) {
-        volatile uint64_t* fp = (uint64_t*)__builtin_frame_address(0);
-        fprintf(stderr, "[agc] WaitRegMem a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx | ret=0x%llx a6=0x%llx a7=0x%llx\n",
-            (unsigned long long)a1,(unsigned long long)a2,(unsigned long long)a3,(unsigned long long)a4,(unsigned long long)a5,
-            (unsigned long long)fp[1],(unsigned long long)fp[2],(unsigned long long)fp[3]);
-    }
+HLE(agc_dcb_wait_reg_mem) {  // sceAgcDcbWaitRegMem(buf, size, compare_func, op, cache_policy, address, reference, mask, poll_cycles)
+    // ABI pinned to Kyty GraphicsDcbWaitRegMem (Graphics.cpp:2096): a5 = label address; the 7th/8th
+    // args (reference, mask) are STACK args, readable at fp[2]/fp[3] under both stub shapes (the
+    // guest-%fs swap stub forwards two stack args). poll_cycles (9th) is beyond the forwarded
+    // window and is only a poll-interval hint — encode 0. The payload previously ZEROED every
+    // wait parameter at build time (address/ref/mask/function destroyed — the wait could never be
+    // honored downstream); now it mirrors Kyty's layout exactly:
+    // [1..2]=addr lo/hi, [3..4]=mask lo/hi, [5..6]=reference lo/hi, [7]=compare_function, [8]=interval.
+    volatile uint64_t* fp = (uint64_t*)__builtin_frame_address(0);
+    uint64_t reference = fp[2], mask = fp[3];
+    if (getenv("PROSPER_GFXLOG"))
+        fprintf(stderr, "[agc] WaitRegMem size=%llu func=%llu op=%llu addr=0x%llx ref=0x%llx mask=0x%llx\n",
+            (unsigned long long)a1,(unsigned long long)a2,(unsigned long long)a3,
+            (unsigned long long)a5,(unsigned long long)reference,(unsigned long long)mask);
     uint32_t* cmd; if (!begin_packet(a0, 9, IT_NOP, R_WAIT_MEM_64, &cmd)) return 0;
-    for (int i = 1; i < 9; i++) cmd[i] = 0; return (uint64_t)(uintptr_t)cmd;
+    cmd[1] = (uint32_t)(a5 & 0xffffffffu);        cmd[2] = (uint32_t)(a5 >> 32u);
+    cmd[3] = (uint32_t)(mask & 0xffffffffu);      cmd[4] = (uint32_t)(mask >> 32u);
+    cmd[5] = (uint32_t)(reference & 0xffffffffu); cmd[6] = (uint32_t)(reference >> 32u);
+    cmd[7] = (uint32_t)a2;                        // compare_function
+    cmd[8] = 0;                                   // poll interval hint (arg9 not forwarded; unused by our fold)
+    return (uint64_t)(uintptr_t)cmd;
 }
 HLE(agc_dcb_set_flip) {  // (buf, video_out_handle, display_buffer_index, flip_mode, flip_arg) — 6 dw
     uint32_t* cmd; if (!begin_packet(a0, 6, IT_NOP, R_FLIP, &cmd)) return 0;
