@@ -69,7 +69,14 @@ RenderState extract_render_state(const GpuState& st) {
     rs.db_depth_control  = dc;
     rs.cb_color_control  = rd(st.cx, P::CB_COLOR_CONTROL);
     rs.cb_blend0_control = bc;
-    rs.cb_target_mask    = rd(st.cx, P::CB_TARGET_MASK);
+    // CB_TARGET_MASK (per-MRT color write mask). The AGC driver defaults it to write-all when the game
+    // does not program register 0x8E explicitly — and this game NEVER emits it (verified with
+    // PROSPER_RESDUMP: the title/cutscene bind CB_COLOR0_BASE/INFO but no 0x8E), relying on that default.
+    // Our register file starts empty, so an ABSENT CB_TARGET_MASK must resolve to write-all (0xF per MRT),
+    // NOT 0 — reading 0 dropped every color draw (color_write_mask==0 skip), i.e. the "blue screen" where
+    // the real art rendered only under PROSPER_FORCE_COLORWRITE. A register that IS present (even 0) is
+    // honored, so a genuine depth-only pass that programs mask 0 still skips correctly.
+    rs.cb_target_mask    = st.cx.count(P::CB_TARGET_MASK) ? rd(st.cx, P::CB_TARGET_MASK) : 0xFFFFFFFFu;
 
     // Viewport 0 transform (guest floats; all-zero when never programmed).
     rs.vport_xscale  = flt(rd(st.cx, P::PA_CL_VPORT_XSCALE));
