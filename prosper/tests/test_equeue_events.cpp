@@ -9,6 +9,8 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <chrono>
+#include <thread>
 
 using namespace prosper;
 
@@ -81,6 +83,65 @@ int main() {
         CHECK(gev.filter == -14, "EOP event filter == GraphicsCore (-14)");
         CHECK(gev.data == kEop, "EOP event data == id (sceGnmGetEqEventType semantics)");
         CHECK(gev.udata == kEopUdata, "EOP event echoed the registered udata");
+    }
+
+    // --- Real wait semantics (#67): a timed wait that expires with nothing returns ETIMEDOUT
+    //     (0x8002003C, Kyty EventQueue.cpp:310), NOT success-with-0-events; an unknown queue
+    //     handle returns EBADF (0x80020009), not success. ---
+    {
+        KEvent xev{}; int32_t xout = -1; uint32_t xcap = 2000;   // 2ms, queue is drained by now
+        uint64_t r = wait(eq, (uint64_t)(uintptr_t)&xev, 1, (uint64_t)(uintptr_t)&xout,
+                          (uint64_t)(uintptr_t)&xcap, 0);
+        CHECK((uint32_t)r == 0x8002003Cu && xout == 0, "timed empty wait returns ETIMEDOUT with 0 events");
+        uint64_t rb = wait(0xDEAD0000ull, (uint64_t)(uintptr_t)&xev, 1, (uint64_t)(uintptr_t)&xout,
+                           (uint64_t)(uintptr_t)&xcap, 0);
+        CHECK((uint32_t)rb == 0x80020009u, "unknown equeue handle returns EBADF");
+    }
+
+    // --- kqueue coalescing (#67): two triggers of the SAME (ident, filter) update one pending
+    //     event in place — the wait returns exactly 1 event carrying the NEWEST udata; a queue
+    //     stuffed with pumped events can no longer drop a fresh event. ---
+    {
+        trigger(eq, (uint64_t)kId, 0x1111, 0, 0, 0);
+        trigger(eq, (uint64_t)kId, 0x2222, 0, 0, 0);
+        KEvent cev[2]{}; int32_t cout = -1; uint32_t ccap = 50000;
+        uint64_t r = wait(eq, (uint64_t)(uintptr_t)cev, 2, (uint64_t)(uintptr_t)&cout,
+                          (uint64_t)(uintptr_t)&ccap, 0);
+        CHECK(r == 0 && cout == 1, "double-trigger coalesces to exactly 1 pending event");
+        CHECK(cev[0].udata == 0x2222, "coalesced event carries the NEWEST trigger's udata");
+    }
+
+    // --- Timer cancellation (#67): DeleteHRTimerEvent stops a pending one-shot — previously a
+    //     no-op, so the "cancelled" timer still fired with possibly-freed udata. ---
+    auto deltimer = Hle::lookup(nid_hash("sceKernelDeleteHRTimerEvent"));
+    CHECK(deltimer != nullptr, "DeleteHRTimerEvent registered");
+    if (deltimer) {
+        int64_t cts[2] = { 0, 20 * 1000 * 1000 };   // 20ms one-shot
+        addhrt(eq, (uint64_t)777, (uint64_t)(uintptr_t)cts, 0xDEAD, 0, 0);
+        deltimer(eq, 777, 0, 0, 0, 0);              // cancel before expiry
+        KEvent dev{}; int32_t dout = -1; uint32_t dcap = 60000;   // > the timer's 20ms
+        uint64_t r = wait(eq, (uint64_t)(uintptr_t)&dev, 1, (uint64_t)(uintptr_t)&dout,
+                          (uint64_t)(uintptr_t)&dcap, 0);
+        CHECK((uint32_t)r == 0x8002003Cu && dout == 0, "cancelled timer never fires (wait times out)");
+    }
+
+    // --- Delete-while-wait (#67): DeleteEqueue while a thread is blocked in WaitEqueue must WAKE
+    //     it with EBADF — the old raw-pointer scheme destroyed the mutex/condvar under the waiter
+    //     (use-after-free). The shared_ptr + deleted-flag scheme keeps the state alive. ---
+    auto dele = Hle::lookup(nid_hash("sceKernelDeleteEqueue"));
+    CHECK(dele != nullptr, "DeleteEqueue registered");
+    if (dele) {
+        uint64_t eq2 = 0;
+        create((uint64_t)(uintptr_t)&eq2, 0, 0, 0, 0, 0);
+        uint64_t wret = ~0ull; int32_t wout = -1;
+        std::thread waiter([&]{
+            KEvent wev{};
+            wret = wait(eq2, (uint64_t)(uintptr_t)&wev, 1, (uint64_t)(uintptr_t)&wout, 0 /*infinite*/, 0);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));   // let the waiter block
+        dele(eq2, 0, 0, 0, 0, 0);
+        waiter.join();   // must not hang, must not crash
+        CHECK((uint32_t)wret == 0x80020009u && wout == 0, "DeleteEqueue wakes an infinite waiter with EBADF");
     }
 
     if (fails) { printf("== FAIL: %d check(s) ==\n", fails); return 1; }

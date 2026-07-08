@@ -20,6 +20,9 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <map>
+#include <memory>
+#include <algorithm>
 
 namespace prosper {
 
@@ -168,9 +171,14 @@ namespace {
     // flip_event_trigger_func) — the game compares it against the arg it submitted.
     constexpr int64_t VIDEO_OUT_EVENT_FLIP = 0, VIDEO_OUT_EVENT_VBLANK = 1;
 
-    struct EqState { std::mutex m; std::condition_variable cv; std::deque<SceKEvent> ready; };
+    // Equeue lifetime (#67): states are SHARED-ptr owned. eq_find hands out a reference that keeps
+    // the object alive across the caller's wait, so sceKernelDeleteEqueue can never destroy a mutex/
+    // condvar a waiter is blocked on (the old raw-pointer scheme was a use-after-free: delete freed
+    // the state while k_eq_wait sat in cv.wait on it). Delete marks `deleted` and wakes waiters; the
+    // object dies when the last reference drops.
+    struct EqState { std::mutex m; std::condition_variable cv; std::deque<SceKEvent> ready; bool deleted = false; };
     std::mutex g_eq_mx;
-    std::unordered_map<uint64_t, EqState*> g_eqs;              // guest eq ptr -> state
+    std::unordered_map<uint64_t, std::shared_ptr<EqState>> g_eqs;   // guest eq handle -> state
     struct FlipReg { uint64_t eq; int64_t ident; uint64_t udata; };
     std::vector<FlipReg> g_flip_regs, g_vblank_regs;
     // GPU end-of-pipe (EOP) event sources registered via sceGnmAddEqEvent / GraphicsAddEqEvent
@@ -183,13 +191,34 @@ namespace {
     // trigger. Declared here (before the pump) so the diagnostic PROSPER_PUMP_USEREV heartbeat can fire them.
     struct UserReg { uint64_t eq; int64_t id; uint64_t udata; };
     std::vector<UserReg> g_user_regs;   // guarded by g_eq_mx
+    // Pending one-shot timers (#67): (eq,id) -> cancellation token. The detached timer thread
+    // checks the token before posting, so sceKernelDelete(HR)TimerEvent (previously a no-op — a
+    // cancelled timer still fired, delivering a phantom event with possibly-freed udata) and
+    // sceKernelDeleteEqueue really cancel. Guarded by g_eq_mx.
+    struct TimerTok { std::shared_ptr<std::atomic<bool>> cancelled; };
+    std::map<std::pair<uint64_t, int64_t>, TimerTok> g_timers;
     std::atomic<bool> g_pump_started{false};
 
-    EqState* eq_find(uint64_t eq) { std::lock_guard<std::mutex> lk(g_eq_mx); auto it = g_eqs.find(eq); return it == g_eqs.end() ? nullptr : it->second; }
+    std::shared_ptr<EqState> eq_find(uint64_t eq) {
+        std::lock_guard<std::mutex> lk(g_eq_mx);
+        auto it = g_eqs.find(eq);
+        return it == g_eqs.end() ? nullptr : it->second;
+    }
     void eq_post(uint64_t eq, const SceKEvent& e) {
-        EqState* s = eq_find(eq); if (!s) return;
+        auto s = eq_find(eq); if (!s) return;
         std::lock_guard<std::mutex> lk(s->m);
-        if (s->ready.size() < 4) s->ready.push_back(e);   // cap so an un-drained queue can't grow unbounded
+        if (s->deleted) return;
+        // kqueue semantics: one knote per (ident, filter) — a re-trigger UPDATES the pending event
+        // in place (fresh data/fflags/udata) instead of queuing a duplicate. This is what makes the
+        // 60 Hz vblank pump safe: previously a fixed 4-entry cap dropped the NEWEST event once the
+        // queue filled with pumped vblanks — and the dropped one could be the flip-completion event
+        // carrying the exact flipArg the game's pacer was waiting to observe (frame-pacing stall).
+        for (auto& q : s->ready)
+            if (q.ident == e.ident && q.filter == e.filter) { q = e; s->cv.notify_all(); return; }
+        // Distinct (ident, filter) pairs are few; the cap is a leak guard only. If it ever fires,
+        // shed the OLDEST event — never the just-posted one.
+        if (s->ready.size() >= 64) s->ready.pop_front();
+        s->ready.push_back(e);
         s->cv.notify_all();
     }
     void vblank_pump() {
@@ -257,14 +286,40 @@ void prosper_eq_trigger_eop() {
 }
 
 HLE(k_eq_create) {
-    EqState* s = new EqState();
-    if (a0) *(void**)P(a0) = (void*)s;   // the guest's opaque SceKernelEqueue handle IS our state ptr
-    { std::lock_guard<std::mutex> lk(g_eq_mx); g_eqs[(uint64_t)(uintptr_t)s] = s; }
-    if (evlog()) fprintf(stderr, "[ev] CreateEqueue -> eq=%p name=%s\n", (void*)s, a1 ? (const char*)P(a1) : "");
+    auto s = std::make_shared<EqState>();
+    if (a0) *(void**)P(a0) = (void*)s.get();   // the guest's opaque SceKernelEqueue handle IS our state ptr
+    { std::lock_guard<std::mutex> lk(g_eq_mx); g_eqs[(uint64_t)(uintptr_t)s.get()] = s; }
+    if (evlog()) fprintf(stderr, "[ev] CreateEqueue -> eq=%p name=%s\n", (void*)s.get(), a1 ? (const char*)P(a1) : "");
     return 0;
 }
 HLE(k_eq_delete) {
-    if (a0) { std::lock_guard<std::mutex> lk(g_eq_mx); auto it = g_eqs.find(a0); if (it != g_eqs.end()) { delete it->second; g_eqs.erase(it); } }
+    if (!a0) return 0;
+    std::shared_ptr<EqState> s;
+    {
+        std::lock_guard<std::mutex> lk(g_eq_mx);
+        auto it = g_eqs.find(a0);
+        if (it != g_eqs.end()) { s = std::move(it->second); g_eqs.erase(it); }
+        // Purge every registration pointing at this queue (#67). Without this, a later heap
+        // allocation reusing the same address RESURRECTED the dead registrations: pump/flip/EOP
+        // events were delivered onto an unrelated new queue.
+        auto drop_eq = [&](std::vector<FlipReg>& v) {
+            v.erase(std::remove_if(v.begin(), v.end(), [&](const FlipReg& r){ return r.eq == a0; }), v.end());
+        };
+        drop_eq(g_flip_regs); drop_eq(g_vblank_regs); drop_eq(g_eop_regs);
+        g_user_regs.erase(std::remove_if(g_user_regs.begin(), g_user_regs.end(),
+                                         [&](const UserReg& r){ return r.eq == a0; }), g_user_regs.end());
+        // Cancel this queue's pending one-shot timers.
+        for (auto it2 = g_timers.begin(); it2 != g_timers.end(); ) {
+            if (it2->first.first == a0) { it2->second.cancelled->store(true); it2 = g_timers.erase(it2); }
+            else ++it2;
+        }
+    }
+    if (s) {   // wake waiters; the shared_ptr they hold keeps the state alive until they exit
+        std::lock_guard<std::mutex> lk(s->m);
+        s->deleted = true;
+        s->cv.notify_all();
+    }
+    if (evlog()) fprintf(stderr, "[ev] DeleteEqueue eq=0x%llx\n", (unsigned long long)a0);
     return 0;
 }
 HLE(k_eq_wait)   {   // (eq, SceKernelEvent* ev, int num, int* out, SceKernelUseconds* timeout)
@@ -317,35 +372,45 @@ HLE(k_eq_wait)   {   // (eq, SceKernelEvent* ev, int num, int* out, SceKernelUse
             fprintf(stderr, "[waitcaller] ---\n");
         }
     }
-    EqState* s = eq_find(a0);
+    auto s = eq_find(a0);
     int num = (int)a2; if (num < 1) num = 1;
-    if (!s) { struct timespec ts{ 0, 1000000 }; nanosleep(&ts, nullptr); if (a3) *(int32_t*)P(a3) = 0; return 0; }
+    // Unknown/deleted queue: the real API errors (Kyty EventQueue.cpp returns KERNEL_ERROR_EBADF);
+    // the old success-with-0-events reply made the caller consume a never-written event struct.
+    if (!s) { if (a3) *(int32_t*)P(a3) = 0; return 0x80020009ull; }   // KERNEL_ERROR_EBADF
     std::unique_lock<std::mutex> lk(s->m);
-    if (s->ready.empty()) {
-        // timeout arg is a pointer to micro-seconds (null = wait forever). Cap the wait so a headless
-        // run never hard-blocks the guest thread even if no source is registered yet.
-        uint64_t req = a4 ? *(uint32_t*)P(a4) : 100000;
-        // PROSPER_WAITCAP: cap the empty-queue wait (µs). Our 60 Hz pump posts a flip/vblank event every
-        // ~16 ms, so a >16 ms cap makes an event-DRAIN loop (while WaitEqueue keeps returning events) never
-        // reach the empty state → the guest's frame loop stalls draining pumped events. A sub-vblank cap
-        // (e.g. 8 ms) lets an empty drain time out (0 events) so the guest exits the drain and renders.
-        static const uint64_t cap = [] {   // parsed once (cf. punch_secs in hle_kernel_mem.cpp)
-            const char* e = getenv("PROSPER_WAITCAP"); return e ? (uint64_t)atoll(e) : (uint64_t)100000; }();
-        uint64_t us = req; if (us > cap) us = cap;
-        if (evlog()) fprintf(stderr, "[ev]   WAIT.empty req=%lluus cap=%lluus\n",
-                             (unsigned long long)req, (unsigned long long)cap);
-        s->cv.wait_for(lk, std::chrono::microseconds(us), [&]{ return !s->ready.empty(); });
+    if (s->ready.empty() && !s->deleted) {
+        // timeout arg is a pointer to micro-seconds; NULL = wait forever (real semantics — the old
+        // 100 ms cap-and-return-success invented a state the API never produces, and callers
+        // following the documented `if (Wait(...) == 0) consume(ev[0])` pattern read stale stack).
+        // PROSPER_WAITCAP (diagnostic, default off) still bounds a TIMED wait for bisection runs.
+        auto pred = [&]{ return !s->ready.empty() || s->deleted; };
+        if (a4) {
+            uint64_t us = *(uint32_t*)P(a4);
+            static const uint64_t cap = [] {   // parsed once (cf. punch_secs in hle_kernel_mem.cpp)
+                const char* e = getenv("PROSPER_WAITCAP"); return e ? (uint64_t)atoll(e) : 0; }();
+            if (cap && us > cap) us = cap;
+            if (evlog()) fprintf(stderr, "[ev]   WAIT.empty req=%lluus\n", (unsigned long long)us);
+            s->cv.wait_for(lk, std::chrono::microseconds(us), pred);
+        } else {
+            if (evlog()) fprintf(stderr, "[ev]   WAIT.empty (infinite)\n");
+            s->cv.wait(lk, pred);
+        }
     }
+    if (s->deleted && s->ready.empty()) { if (a3) *(int32_t*)P(a3) = 0; return 0x80020009ull; }  // deleted under us
     int n = 0; auto* ev = (SceKEvent*)P(a1);
     while (n < num && !s->ready.empty()) { if (ev) ev[n] = s->ready.front(); s->ready.pop_front(); n++; }
     if (a3) *(int32_t*)P(a3) = n;
     if (evlog() && n > 0) fprintf(stderr, "[ev]   -> delivered %d ev(s) eq=0x%llx ra=eboot+0x%llx (ident=%lld filter=%d)\n",
         n, (unsigned long long)a0, (unsigned long long)((uint64_t)__builtin_return_address(0) - 0x400000000ull),
         (long long)(ev ? ev[0].ident : 0), (int)(ev ? ev[0].filter : 0));
-    return 0;   // 0 = success (n events returned; n may be 0 on timeout)
+    // Timed wait that expired with nothing: the real API distinguishes this from success (Kyty
+    // EventQueue.cpp:310 KERNEL_ERROR_ETIMEDOUT). Only reachable with a timeout arg — the infinite
+    // wait can only exit with events or a delete.
+    if (n == 0) { return 0x8002003Cull; }   // KERNEL_ERROR_ETIMEDOUT
+    return 0;
 }
 HLE(k_eq_getcount){
-    EqState* s = eq_find(a0); int n = 0;
+    auto s = eq_find(a0); int n = 0;
     if (s) { std::lock_guard<std::mutex> lk(s->m); n = (int)s->ready.size(); }
     if (evlog()) fprintf(stderr, "[ev] GetEventCount eq=0x%llx -> %d\n", (unsigned long long)a0, n);
     return (uint64_t)n;
@@ -377,14 +442,53 @@ HLE(k_trigger_user_event) {   // (eq, id, udata) — fire the user event: post i
         (unsigned long long)a0, (long long)a1, (unsigned long long)udata);
     return 0;
 }
-// One-shot timer: post an EVFILT_TIMER event to the equeue after `usec` microseconds.
+// One-shot timer: post an EVFILT_TIMER event to the equeue after `usec` microseconds. The timer is
+// CANCELLABLE (#67): registration stores a token in g_timers; the detached thread re-checks it after
+// the sleep, so sceKernelDelete(HR)TimerEvent / DeleteEqueue really stop a pending timer (previously
+// Delete* were no-ops — a "cancelled" timer still fired, delivering a phantom event whose udata the
+// guest may have freed). Posting through eq_post's shared_ptr lookup is safe even if the queue died.
 static void post_after(uint64_t eq, int64_t id, uint64_t udata, uint64_t usec, int16_t filter) {
-    std::thread([eq, id, udata, usec, filter]{
+    auto cancelled = std::make_shared<std::atomic<bool>>(false);
+    {
+        std::lock_guard<std::mutex> lk(g_eq_mx);
+        auto key = std::make_pair(eq, id);
+        auto it = g_timers.find(key);
+        if (it != g_timers.end()) it->second.cancelled->store(true);   // re-arm replaces the pending shot
+        g_timers[key] = TimerTok{ cancelled };
+    }
+    std::thread([eq, id, udata, usec, filter, cancelled]{
         struct timespec ts{ (time_t)(usec / 1000000), (long)((usec % 1000000) * 1000) };
         nanosleep(&ts, nullptr);
+        if (cancelled->load()) return;
+        {   // one-shot: forget the registration (only if it is still OUR token, not a re-arm's)
+            std::lock_guard<std::mutex> lk(g_eq_mx);
+            auto it = g_timers.find(std::make_pair(eq, id));
+            if (it != g_timers.end() && it->second.cancelled == cancelled) g_timers.erase(it);
+        }
         SceKEvent e{}; e.ident = id; e.filter = filter; e.data = (int64_t)usec; e.udata = udata;
         eq_post(eq, e);
     }).detach();
+}
+// Cancel a pending one-shot timer registered for (eq, id). Shared by both Delete*TimerEvent names.
+HLE(k_del_timer_event) {   // (eq, id)
+    bool cancelled = false;
+    {
+        std::lock_guard<std::mutex> lk(g_eq_mx);
+        auto it = g_timers.find(std::make_pair(a0, (int64_t)a1));
+        if (it != g_timers.end()) { it->second.cancelled->store(true); g_timers.erase(it); cancelled = true; }
+    }
+    if (evlog()) fprintf(stderr, "[ev] DeleteTimerEvent eq=0x%llx id=%lld -> %s\n",
+        (unsigned long long)a0, (long long)a1, cancelled ? "cancelled" : "not-pending");
+    return 0;
+}
+// Remove a registered user-event source (previously a no-op: a deleted source kept receiving
+// TriggerUserEvent posts and diagnostic-pump heartbeats).
+HLE(k_del_user_event) {   // (eq, id)
+    std::lock_guard<std::mutex> lk(g_eq_mx);
+    g_user_regs.erase(std::remove_if(g_user_regs.begin(), g_user_regs.end(),
+                      [&](const UserReg& r){ return r.eq == a0 && r.id == (int64_t)a1; }), g_user_regs.end());
+    if (evlog()) fprintf(stderr, "[ev] DeleteUserEvent eq=0x%llx id=%lld\n", (unsigned long long)a0, (long long)a1);
+    return 0;
 }
 HLE(k_add_hrtimer_event) {   // (eq, id, SceKernelTimespec* ts, udata) — orbis: 3rd arg is a timespec*
     uint64_t usec = 1000;
@@ -409,8 +513,8 @@ void register_kernel_time_hle() {
     R("sceKernelWaitEqueue", k_eq_wait);        R("sceKernelGetEventCount", k_eq_getcount);
     R("sceKernelAddHRTimerEvent", k_add_hrtimer_event); R("sceKernelAddUserEvent", k_add_user_event);
     R("sceKernelAddUserEventEdge", k_add_user_event);   R("sceKernelTriggerUserEvent", k_trigger_user_event);
-    R("sceKernelDeleteUserEvent", k_ok);        R("sceKernelDeleteHRTimerEvent", k_ok);
-    R("sceKernelDeleteTimerEvent", k_ok);       R("sceKernelAddTimerEvent", k_add_timer_event);
+    R("sceKernelDeleteUserEvent", k_del_user_event);   R("sceKernelDeleteHRTimerEvent", k_del_timer_event);
+    R("sceKernelDeleteTimerEvent", k_del_timer_event); R("sceKernelAddTimerEvent", k_add_timer_event);
     R("sceKernelGetProcessTimeCounter", k_get_ptc);
     R("sceKernelGetProcessTimeCounterFrequency", k_get_ptc_freq);
     R("sceKernelGetProcessTime", k_get_proc_time);
