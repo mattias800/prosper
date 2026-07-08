@@ -437,3 +437,29 @@ that would init `WorkerThread.+0x40` is the gap.
 after the write should have happened — that main-thread-only watch caught nothing). It answers definitively:
 does some worker/pool thread write the field (a dispatch/visibility race) or does no thread ever run the
 init (a never-dispatched work item)? That points straight at the fix.
+
+## 2026-07-08 (cont.) — block-966 object identified: type-tree-LESS il2cpp MonoBehaviour deser (InventoryItemDefinition)
+
+Building on #46 (block-966 deser deadlock) with a UnityPy dissection of the exact objects:
+
+- **The block-966 object (pathid 18918) is a `MonoBehaviour` named "KeyOvChaos"** — an
+  `InventoryItemDefinition` ScriptableObject (an inventory item, key "KEY_OF_CHAOS"). Its `m_Script`
+  PPtr = **fileid 1 → `globalgamemanagers.assets`, pathid 1075 = MonoScript `InventoryItemDefinition`
+  (Assembly-CSharp)**. Raw object size is 132 bytes (12 `m_GameObject` + 4 `m_Enabled` + 12 `m_Script`
+  + 16 `m_Name` + 88 script fields).
+- **`resources.assets` has `enable_type_tree = False`** — there are NO embedded type-trees. So Unity
+  cannot deserialize these MonoBehaviours from the file alone; it **must** obtain each field layout from
+  the **il2cpp runtime type** (`InventoryItemDefinition`'s serialized fields). UnityPy, lacking that
+  runtime layout, fails these exact objects ("expected 132 bytes, read 44") — the same information gap the
+  game's deserializer must fill from il2cpp.
+- There are **49 `InventoryItemDefinition` MonoBehaviours** (script pathid 1075) among the 4823
+  MonoBehaviours in `resources.assets`; blocks 727/961/966 (the thrash set) are three of them.
+
+**Refined root:** the loop is not corruption and not the Stopwatch — it is **il2cpp MonoBehaviour
+field-layout resolution for a type-tree-less serialized asset**. The deserializer, reading an
+`InventoryItemDefinition` with no type-tree, asks the il2cpp runtime for the type's SerializeField layout
+to advance its cursor 132 bytes; if that resolution returns a wrong/incomplete layout (or a "not-ready"
+retry) in our environment, the object cursor never advances and it re-reads the same blocks forever. The
+next concrete step is to inspect what the game's SafeBinaryRead / il2cpp `Class::GetFields`-driven
+transfer returns for `InventoryItemDefinition` in our il2cpp (vs the 132-byte on-disk layout) — that is
+the precise mismatch to fix, and it is squarely in il2cpp reflection, not the file/GC/Stopwatch layers.
