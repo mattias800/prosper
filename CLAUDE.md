@@ -129,3 +129,13 @@ renderer is wired in; the game's **real pixel shader recompiles to valid SPIR-V*
        or park the work, comment what state it's in and remove the `in-progress` label.
     6. Claims expire: `in-progress` with no open PR and no activity for 24 h is stale — anyone
        may re-claim after posting a takeover comment.
+  - **Stay in your area lane (multi-workstream).** Separate workstreams run in parallel, each
+    possibly coordinating its own sub-agents, split by title/subsystem via `area:` labels:
+    `area:ue4` (PPSA17942 / Unreal Engine — IoStore/APR/Ampr, RHI, the UE allocator) and
+    `area:messenger` (PPSA24651 / The Messenger, IL2CPP/Unity, and shared infra: loader, libc,
+    libkernel, the recompiler, generic GPU/AGC). **Do NOT touch code or claim issues outside your
+    workstream's area** — cross-lane edits collide with the other workstream's in-flight sub-agents.
+    If a fix genuinely spans both (shared infra that a UE issue also needs), coordinate on the issue
+    first; default to the shared-infra/Messenger lane owning shared files. Label every new issue with
+    its `area:` so the lanes stay legible; when unsure which lane a file belongs to, check which
+    title's boot path exercises it.
