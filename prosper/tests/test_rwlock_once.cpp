@@ -7,6 +7,9 @@
 #include "../src/hle/nid.hpp"
 #include <cstdio>
 #include <cstdint>
+#include <atomic>
+#include <chrono>
+#include <thread>
 
 using namespace prosper;
 
@@ -52,6 +55,33 @@ int main() {
     int ctl = 0; g_once_count = 0;
     for (int i = 0; i < 3; i++) call2(ONCE, (uint64_t)(uintptr_t)&ctl, (uint64_t)(uintptr_t)&once_init);
     CHECK(g_once_count == 1, "scePthreadOnce runs init exactly once across 3 calls");
+
+    // Cross-control independence (#69): init routine for control X blocks until ANOTHER thread
+    // completes once(Y). The old one-global-recursive-mutex implementation deadlocked here (Y's
+    // caller parked behind X's global lock; X waited on Y forever). Per-control serialization
+    // (real pthread_once semantics) must let Y proceed while X's init is still running.
+    {
+        static HleFn s_once = ONCE;
+        static int s_ctl_y = 0;
+        static std::atomic<bool> s_y_done{false};
+        static auto s_init_y = +[]() { s_y_done.store(true); };
+        static auto s_init_x = +[]() {
+            // From inside X's init: run once(Y) on a worker and WAIT for it — cross-thread,
+            // cross-control dependency, legal on real hardware.
+            std::thread t([]{ s_once((uint64_t)(uintptr_t)&s_ctl_y, (uint64_t)(uintptr_t)+s_init_y, 0, 0, 0, 0); });
+            t.join();
+        };
+        int ctl_x = 0;
+        std::atomic<bool> x_returned{false};
+        std::thread xt([&]{ s_once((uint64_t)(uintptr_t)&ctl_x, (uint64_t)(uintptr_t)+s_init_x, 0, 0, 0, 0);
+                            x_returned.store(true); });
+        // Deadlock watchdog: the whole thing must finish well within 5 s.
+        for (int i = 0; i < 500 && !x_returned.load(); i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        CHECK(x_returned.load(), "once(X) whose init depends on another thread's once(Y) completes (no global-lock deadlock)");
+        CHECK(s_y_done.load(), "the dependent once(Y) actually ran");
+        if (x_returned.load()) xt.join(); else xt.detach();   // don't hang the test binary on failure
+    }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");

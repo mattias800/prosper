@@ -16,6 +16,8 @@
 #include <unordered_map>
 #include <mutex>
 #include <thread>
+#include <atomic>
+#include <condition_variable>
 #ifdef __linux__
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -159,21 +161,36 @@ HLE(k_rwlock_unlock)  { if (auto* rw = ensure_rwlock(a0)) pthread_rwlock_unlock(
 HLE(k_rwlock_tryrdlock){ auto* rw = ensure_rwlock(a0); return rw ? (uint64_t)pthread_rwlock_tryrdlock(rw) : 0x16; }
 HLE(k_rwlock_trywrlock){ auto* rw = ensure_rwlock(a0); return rw ? (uint64_t)pthread_rwlock_trywrlock(rw) : 0x16; }
 
-// scePthreadOnce(once_control*, init_routine): run init exactly once. We run it UNDER a lock so all
-// callers see it complete before returning (pthread_once semantics). A recursive mutex avoids
-// self-deadlock if an init routine itself calls scePthreadOnce. The once-control's first int is the
-// done-flag. init is a guest fn (guest ABI == host SysV) so it's callable directly.
+// scePthreadOnce(once_control*, init_routine): run init exactly once, PER CONTROL. The old
+// implementation held ONE process-global recursive mutex across the guest init routine — if init
+// routine A blocked on another thread's progress and that thread touched ANY other once-control,
+// both deadlocked (impossible on real hardware, which serializes per control). Now the control
+// word itself is the state machine (0 = not run, 2 = running, 1 = done — same shape as
+// h_execute_once in hle_libc.cpp), losers park on a condvar, and the init routine runs OUTSIDE
+// the lock so independent once-inits never serialize. Same-thread re-entry (an init calling
+// scePthreadOnce on ANOTHER control) works naturally; re-entry on the SAME control would be a
+// guest bug on real hardware too (pthread_once self-deadlocks there).
 HLE(k_pthread_once) {
-    auto* ctl = (volatile int*)(uintptr_t)a0;
+    auto* ctl = (std::atomic<int>*)(uintptr_t)a0;
     auto init = (void (*)())(uintptr_t)a1;
     if (!ctl || !init) return 0x16;
-    static pthread_mutex_t om = []{ pthread_mutex_t m; pthread_mutexattr_t a;
-        pthread_mutexattr_init(&a); pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
-        pthread_mutex_init(&m, &a); pthread_mutexattr_destroy(&a); return m; }();
-    pthread_mutex_lock(&om);
-    if (*ctl == 0) { init(); *ctl = 1; }
-    pthread_mutex_unlock(&om);
-    return 0;
+    static std::mutex om;                    // guards state TRANSITIONS only, never held during init()
+    static std::condition_variable ocv;
+    for (;;) {
+        if (ctl->load(std::memory_order_acquire) == 1) return 0;   // fast path: already done
+        std::unique_lock<std::mutex> lk(om);
+        int v = ctl->load(std::memory_order_acquire);
+        if (v == 1) return 0;
+        if (v == 2) { ocv.wait(lk); continue; }   // another thread runs this control's init
+        ctl->store(2, std::memory_order_relaxed);
+        lk.unlock();
+        init();
+        lk.lock();
+        ctl->store(1, std::memory_order_release);
+        lk.unlock();
+        ocv.notify_all();
+        return 0;
+    }
 }
 
 // --- thread identity ---
