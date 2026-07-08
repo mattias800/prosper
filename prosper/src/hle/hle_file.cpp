@@ -197,8 +197,7 @@ static void preadlog(const char* fn, uint64_t fd, uint64_t off, uint64_t cnt) {
             else if (v >= 0x440000000ull && v < 0x4c0000000ull) { m = "il"; o = v - 0x440000000ull; }
             if (m && o != last) { p += snprintf(line + p, sizeof line - p, " %s+%llx", m, (unsigned long long)o); last = o; nf++; }
         }
-        fprintf(stderr, "%s
-", line);
+        fprintf(stderr, "%s\n", line);
     }
 }
 #else
