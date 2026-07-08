@@ -500,3 +500,35 @@ retry) in our environment, the object cursor never advances and it re-reads the 
 next concrete step is to inspect what the game's SafeBinaryRead / il2cpp `Class::GetFields`-driven
 transfer returns for `InventoryItemDefinition` in our il2cpp (vs the 132-byte on-disk layout) — that is
 the precise mismatch to fix, and it is squarely in il2cpp reflection, not the file/GC/Stopwatch layers.
+
+## 2026-07-08 (cont.) — TWO independent blockers mapped: (1) missing color render-state, (2) variable deser/threading
+
+Two concrete findings this round, both verified:
+
+### (1) `FORCE_COLORWRITE` renders the FULL title screen — the color render-target state is not captured
+Running with `PROSPER_FORCE_COLORWRITE` (renders the ~66 skipped `mask==0` draws/frame) produces the
+**complete, correct "THE MESSENGER" title screen** (ninja, moon, logo, monster horde) at 1920×1080 — our
+GPU pipeline recompiles and renders The Messenger's real art correctly. Instrumenting the skipped draws
+shows **`cb_target_mask=0x0`, `cb_color_control=0x0`, `color0_fmt=0` for ALL of them** — the *entire*
+color render-target state is zero/unprogrammed, not just the write mask. So valid color draws are being
+dropped because we never capture their color-target setup (the game programs it via a path we miss;
+`FORCE_COLORWRITE` + the render path's default target is what makes them appear). This is a real,
+separate GPU state-tracking bug — and it means that **even once the load completes, the cutscene draws
+would be invisible without either this fix or `FORCE_COLORWRITE`**. Fix target: find where the guest
+programs CB_TARGET_MASK / CB_COLOR_CONTROL / the color0 surface for these draws and capture it into the
+context-register state (`st.cx`), rather than defaulting to 0.
+
+### (2) The block-966 deser stall is VARIABLE, not purely deterministic
+Re-running the deser trace multiple times (multi-core and single-core via `taskset -c 0`) gives
+**different outcomes per run**: sometimes the heavy block-961..966 loop (4500+ reads), sometimes light
+progress to block ~986/2843 then a worker-thread fault, sometimes a clean-ish exit. So layered on the
+deterministic deser loop there is *also* a **threading race** (the earlier "deterministic single-core"
+reading does not reproduce reliably). Added `PROSPER_DEEPTRACE` (hle_file.cpp): dumps a deep guest
+backtrace (eboot + il2cpp frames) on block-961..966 re-reads to catch the loop head — useful once the
+loop is reliably reproduced.
+
+**Net for the cutscene:** two things now stand between here and a visible cutscene, both mapped:
+(A) async-load completion of `resources.assets` (the InventoryItemDefinition/deser loop + a threading
+race — the primary blocker), and (B) capturing the color render-target state so the composited draws are
+visible (proven by FORCE_COLORWRITE rendering the title). Neither is a mystery anymore; both are scoped
+to one subsystem each (il2cpp deser; GPU context-register capture).

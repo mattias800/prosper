@@ -185,6 +185,21 @@ static void preadlog(const char* fn, uint64_t fd, uint64_t off, uint64_t cnt) {
             (unsigned long long)cnt, (long)syscall(SYS_gettid),
             (unsigned long long)cc[0], (unsigned long long)cc[1], (unsigned long long)cc[2], (unsigned long long)cc[3],
             (unsigned long long)cc[4], (unsigned long long)cc[5], (unsigned long long)cc[6], (unsigned long long)cc[7]);
+    static int deep_budget = getenv("PROSPER_DEEPTRACE") ? 30 : 0;
+    if (deep_budget > 0 && !strcmp(base, "resources.assets") && off >= 0x3c10000ull && off <= 0x3c60000ull) {
+        deep_budget--;
+        char line[1024]; int p = snprintf(line, sizeof line, "[deeptrace] blk %lld frames:", (long long)(off / 0x10000));
+        int nf = 0; uint64_t last = 0;
+        for (int i = 0; i < 1600 && nf < 20 && p < (int)sizeof line - 24; i++) {
+            uint64_t v = sp[i];
+            const char* m = nullptr; uint64_t o = 0;
+            if (v >= 0x400000000ull && v < 0x420000000ull) { m = "eb"; o = v - 0x400000000ull; }
+            else if (v >= 0x440000000ull && v < 0x4c0000000ull) { m = "il"; o = v - 0x440000000ull; }
+            if (m && o != last) { p += snprintf(line + p, sizeof line - p, " %s+%llx", m, (unsigned long long)o); last = o; nf++; }
+        }
+        fprintf(stderr, "%s
+", line);
+    }
 }
 #else
 static bool fdlog_on() { return false; }
