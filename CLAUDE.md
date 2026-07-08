@@ -83,6 +83,17 @@ renderer is wired in; the game's **real pixel shader recompiles to valid SPIR-V*
   live renderer, `PROSPER_GFXLOG=1` for graphics diagnostics.
 - **Correctness-first:** implement real behavior (cross-checked against the Kyty PS5-emulator reference in
   `../Kyty`), not shims that fake output. Mark genuinely-uncertain code with `CONFIDENCE: HIGH/MED/LOW`.
+- **Kyty is a reference, NOT an oracle — and its reliability is split by platform generation.**
+  Kyty CAN run PS4 games, so the PS4-inherited surface (libkernel, pthreads, equeue, VideoOut,
+  filesystem, GNM-era graphics concepts) is exercised by real titles and is solid evidence — PS5
+  evolved from PS4, so those behaviors usually carry over. But Kyty's PS5-SPECIFIC surface is
+  early transcription work it never runs: **AGC (the PS5's replacement for GNM) especially** —
+  Gen5 Dcb builders, T#/V# Gen5 descriptor formats, PS5-only kernel calls (APR/Ampr/BatchMap).
+  There, prosper's own live captures are the only exercised evidence (we boot the PS5 titles;
+  Kyty does not). Trust order when sources disagree: (1) prosper's live captures/traces of the
+  real guest, (2) Kyty+shadPS4 agreeing (strongest for PS4-inherited surfaces), (3) either alone
+  — cite which and mark CONFIDENCE accordingly, and weight Kyty DOWN for anything Gen5/AGC.
+  Never weaken a behavior that a live boot demonstrates just to match a reference.
 - **Commit style:** small, verified commits; push to `origin` promptly. Co-author trailer as configured.
   **Do NOT add "Generated with Claude Code" attribution lines** (the 🤖 badge, "Generated with
   [Claude Code](...)" footers, session links) to PR bodies, commit messages, issue text, or
@@ -104,3 +115,17 @@ renderer is wired in; the game's **real pixel shader recompiles to valid SPIR-V*
     sessions — issues are the durable queue; `docs/` files explain *how*, issues track *what
     remains*. The umbrella issue for the history-review backlog is #72
     (full annotated list: `prosper/docs/BUG_HUNT_BACKLOG.md`).
+  - **Claiming an issue (multi-agent lock).** Several agents work this repo concurrently; claim
+    before you code so two agents never fix the same issue:
+    1. Check it's free: no `in-progress` label, no unexpired claim comment, and no remote fix
+       branch — `gh issue view NN` + `git ls-remote origin 'refs/heads/fix/issue-NN-*'`.
+    2. Claim it: add the `in-progress` label AND post a comment
+       `CLAIMING: <agent/session identifier> | branch fix/issue-NN-<slug> | <UTC timestamp>`.
+    3. Re-check for a race: re-read the comments right after posting; if two claims landed, the
+       EARLIER timestamp wins (tie → lexicographically smaller branch name); the loser comments
+       "unclaiming" , removes the label only if they added it, and picks other work.
+    4. Push your `fix/issue-NN-<slug>` branch early — the remote branch doubles as the lock.
+    5. Release: the merged `Fixes #NN` PR closes the issue (label goes with it). If you abandon
+       or park the work, comment what state it's in and remove the `in-progress` label.
+    6. Claims expire: `in-progress` with no open PR and no activity for 24 h is stale — anyone
+       may re-claim after posting a takeover comment.
