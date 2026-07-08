@@ -44,10 +44,14 @@ Tags: [defect] wrong behavior · [hack] shortcut standing in for real behavior �
 ## High-priority remaining
 
 1. **[hack] APR read resolves the file by BYTE-SIZE match** — `hle_file.cpp`
-   apr_path_for_size/f_apr_read_submit: request matched against stat'd sizes of known
-   containers; whole-file reads at offset 0 only. Two same-size files ⇒ wrong bytes,
-   silently. Decode the file id (prosper_apr_path_for_id exists) + offset/chunk support;
-   at minimum refuse loudly on size collision. (introduced 41b01f3)
+   f_apr_read_submit: request matched against stat'd sizes of known containers;
+   whole-file reads at offset 0 only. SAFE-FALLBACK LANDED (#62): size collisions and
+   partial/chunk reads are now detected and refused loudly (EINVAL + unconditional
+   stderr), resolve dedups re-registered paths, and PROSPER_FILELOG dumps the 0x90-byte
+   descriptor buffer for the remaining RE. Still open: decode the real (file id, offset)
+   from the descriptor buffer / Ampr CB read command and read via
+   prosper_apr_path_for_id — required for the compressed .ucas chunk reads.
+   (introduced 41b01f3)
 2. **[simplification] Indexed draws silently dropped** — hle_agc.cpp emits R_DRAW_INDEX
    (0x03) but pm4_decode never decodes it: every sceAgcDcbDrawIndex vanishes downstream
    while the guest sees success. Decode it (verify a2/a3 roles vs Kyty), push a Draw

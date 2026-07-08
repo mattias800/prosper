@@ -97,6 +97,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_stat PRIVATE prosper_core)
   add_test(NAME sce_stat_layout COMMAND test_stat)
 
+  # APR container registry + size-keyed read matching (issue #62): stable ids, path dedup, and
+  # the ambiguity/chunk-read refusal the read-submit path relies on. Pure, no game dump needed.
+  add_executable(test_apr_registry tests/test_apr_registry.cpp)
+  target_link_libraries(test_apr_registry PRIVATE prosper_core)
+  add_test(NAME apr_registry_size_keying COMMAND test_apr_registry)
+
   # PM4 command-stream decoder (front of the CommandProcessor): decode a Dcb built by the AGC
   # Dcb functions and assert the ops. Pure/cross-platform, no game dump needed.
   add_executable(test_pm4_decode tests/test_pm4_decode.cpp)
