@@ -438,6 +438,43 @@ after the write should have happened — that main-thread-only watch caught noth
 does some worker/pool thread write the field (a dispatch/visibility race) or does no thread ever run the
 init (a never-dispatched work item)? That points straight at the fix.
 
+## Block-966 wall REFINED: a deterministic infinite 3-object deserialization loop (not a deadlock)
+
+Post-#44/#46, with `PROSPER_NULLGUARD=0x4416375e0,13` past the Stopwatch crash, the cutscene streams ~80%
+then hits its true final wall. A parallel session (95a32e9e) drilled it and **refines #46's "deser deadlock"**:
+
+**It is NOT a lost-wakeup, GC thrash, or memory starvation** (each tested & ruled out):
+- Attaching gdb at the stall shows the **main thread busy in `__libc_malloc(16)`** — actively deserializing,
+  NOT blocked on a sync primitive. The 46 parked workers are idle, not starved of a wakeup.
+- Only **20 GC (`type=0x1e`) cycles** over the whole run — not GC thrash.
+- We report **8 GiB** (`sceKernelGetDirectMemorySize`) — the FileCacher is not memory-starved.
+- `PROSPER_WAIT_TIMEOUT` does not break it (the workers aren't on a timed `WaitOnAddress`).
+
+**What it actually is:** the main thread re-reads a **perfect 3-block cycle** forever:
+`blk 961 (RectTransform) → 727 (AnimationClip) → 966 (MonoBehaviour, pathid 18918) → 961 → 727 → 966 → …`
+i.e. it re-deserializes the same 3 objects in a fixed cycle, allocating 16-byte nodes each pass and never
+marking them integrated. The cycle thrashes a **2-slot FileCacher** (`eboot+0xb17601`: checks the request
+key against slot-0 key `[this+0x50]` and slot-1 key `[this+0x68]`; a miss on both reloads via `0xb17340`).
+
+**Full guest call chain of the re-read** (captured via an 8-deep PREADLOG caller walk, this change):
+```
+sceKernelPread
+  <- eboot+0x146c1a9   (chunked read: reads until r13 remaining==0)
+  <- eboot+0x93a810
+  <- eboot+0xb1767e    (2-slot FileCacher body, 0xb17601)
+  <- eboot+0x1d68990
+  <- eboot+0xd4cf19    (offset->block math: `div rcx` then virtual read `call *0x28(rax)`)
+  <- eboot+0xd3ab1b / 0xd226d6   (per-object-TYPE deser dispatch — varies by object)
+  <- eboot+0xd3a996
+  <- eboot+0xd3d34b    (deser body; guards the FileCacher read under PS5 `PlatformMutex.cpp`)
+```
+So the FileCacher read is mutex-guarded (`eboot+0x19b29c0` logs `PlatformMutex.cpp`). Real HW reads each of
+these 3 blocks ONCE (the deser terminates); our env re-reads them forever — a value/state our environment
+feeds the deserializer (a misread field size → offset misalignment, or a never-set "object integrated"
+flag) makes the per-object deser fail to advance. **Next probe:** diff the exact bytes/positions the deser
+requests from block 966 across iterations (does the requested offset advance, or repeat?) to decide
+misalignment-vs-requeue; then find the field/flag our env sets wrong. This is the single remaining wall to
+the cutscene.
 ## 2026-07-08 (cont.) — block-966 object identified: type-tree-LESS il2cpp MonoBehaviour deser (InventoryItemDefinition)
 
 Building on #46 (block-966 deser deadlock) with a UnityPy dissection of the exact objects:
