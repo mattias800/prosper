@@ -698,3 +698,15 @@ frame-timing (deltaTime) is also compressed — so even the blue clears flash pa
 **Net:** the cutscene is REACHED (level1 active, its background + transition render); the remaining work
 to a recognizable cutscene screenshot is GPU render-to-texture/present resolution for scene-content draws
 (and likely a frame-timing fix so scenes hold). Both are now the precise, scoped next targets.
+
+### CORRECTION (root cause) — it's shader recompilation, not render-target
+
+The "render-target resolution" hypothesis above is **superseded**. The actual reason the cutscene's
+scene-content draws output nothing is **gaps in RDNA2→SPIR-V shader recompilation** for the real scene
+shaders — the content draws execute against shaders that don't fully recompile, so they produce no
+pixels (leaving the scene's blue clear). This is being fixed directly in the recompiler: #55
+(`s_cbranch_scc0` forward early-out to `s_endpgm`) unblocks real scene shaders, with further
+recompiler-coverage work in progress. The render-target state is correct (title + transition wipe render
+fine via #53); the missing piece is shader coverage for the scene-content passes. Milestone above stands:
+the load/threading wall is solved and the game boots through level0→1(cutscene)→3→4→5; a recognizable
+cutscene frame follows once scene-shader recompilation coverage is complete.
