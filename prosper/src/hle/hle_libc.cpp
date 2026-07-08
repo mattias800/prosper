@@ -199,11 +199,29 @@ static double m_expm1(double x){return expm1(x);} static float m_expm1f(float x)
 
 HLE(h_vsnprintf) { va_list ap; if (a3) memcpy(&ap, P(a3), sizeof(va_list)); return (uint64_t)(int64_t)vsnprintf((char*)P(a0), (size_t)a1, (const char*)P(a2), ap); }
 HLE(h_vsprintf)  { va_list ap; if (a2) memcpy(&ap, P(a2), sizeof(va_list)); return (uint64_t)(int64_t)vsprintf((char*)P(a0), (const char*)P(a1), ap); }
-// Variadic forms: forward the register args best-effort (handles the common
-// integer/pointer/≤4-arg case; float/stack args are a later refinement).
-HLE(h_snprintf)  { return (uint64_t)(int64_t)snprintf((char*)P(a0), (size_t)a1, (const char*)P(a2), a3, a4, a5); }
-HLE(h_sprintf)   { return (uint64_t)(int64_t)sprintf((char*)P(a0), (const char*)P(a1), a2, a3, a4, a5); }
-HLE(h_printf)    { return (uint64_t)(int64_t)printf((const char*)P(a0), a1, a2, a3, a4, a5); }
+// Variadic forms: REAL C variadic functions, not the old 3-int-register forward (which dropped
+// %f/XMM args, all stack args, and %s past the 4th argument -> garbage output or a SIGSEGV on a
+// bogus %s pointer). The import stub TAIL-JUMPS into these with the guest's SysV call frame intact
+// (GP regs + XMM + AL + overflow stack), so the compiler-generated variadic prologue captures the
+// full argument set and va_start/v*printf format it correctly. Guest pointers are identity-mapped
+// (guest VA == host VA), so the buffer, format string, and any %s arguments are usable host
+// pointers directly — no P() translation needed (the tail-jump passes the raw guest values).
+// CONFIDENCE: HIGH for register + XMM args (the overwhelmingly common case, correct on both the
+// tail-jmp and GUEST_FS swap-stub paths). MED only for args that spill to the STACK (>6 GP or
+// >8 FP) under the GUEST_FS swap stub, whose reframing shifts the overflow area — rare for a
+// format call, and still strictly better than the old register-only truncation.
+static uint64_t h_snprintf(void* buf, size_t n, const char* fmt, ...) {
+    va_list ap; va_start(ap, fmt); int r = vsnprintf((char*)buf, n, fmt, ap); va_end(ap);
+    return (uint64_t)(int64_t)r;
+}
+static uint64_t h_sprintf(void* buf, const char* fmt, ...) {
+    va_list ap; va_start(ap, fmt); int r = vsprintf((char*)buf, fmt, ap); va_end(ap);
+    return (uint64_t)(int64_t)r;
+}
+static uint64_t h_printf(const char* fmt, ...) {
+    va_list ap; va_start(ap, fmt); int r = vprintf(fmt, ap); va_end(ap);
+    return (uint64_t)(int64_t)r;
+}
 HLE(h_puts)      { int r = fputs((const char*)P(a0), stdout); fputc('\n', stdout); return (uint64_t)(int64_t)r; }
 HLE(h_putchar)   { return (uint64_t)(int64_t)putchar((int)a0); }
 HLE(h_fputs)     { return (uint64_t)(int64_t)fputs((const char*)P(a0), a1 ? (FILE*)P(a1) : stdout); }
