@@ -291,7 +291,28 @@ namespace {
         if (a < 0x1000 || g_devnull_fd < 0) return false;
         return write(g_devnull_fd, (const void*)a, 8) == 8;
     }
+    // PROSPER_DUMPAT="0xADDR[,0xADDR...]" — dump 0x40 bytes at each ABSOLUTE guest address at fault
+    // time (up to 6). Complements the register-relative FAULTMEM/PEEK when the address of interest
+    // is a fixed VA (e.g. comparing two candidate destination buffers). Parsed at arm time.
+    uint64_t g_dumpat[6] = {}; int g_dumpat_n = 0;
+    void dump_at_addrs() {
+        char b[256];
+        for (int i = 0; i < g_dumpat_n; i++) {
+            uint64_t a = g_dumpat[i];
+            int n = snprintf(b, sizeof b, "[prosper] DUMPAT 0x%llx:\n", (unsigned long long)a);
+            syscall(SYS_write, 2, b, (size_t)n);
+            for (int r = 0; r < 8; r++) {
+                uint64_t addr = a + (uint64_t)r * 8;
+                if (probe_readable(addr))
+                    n = snprintf(b, sizeof b, "  +0x%02x = 0x%016llx\n", r * 8, (unsigned long long)*(const uint64_t*)addr);
+                else
+                    n = snprintf(b, sizeof b, "  +0x%02x = <unmapped>\n", r * 8);
+                syscall(SYS_write, 2, b, (size_t)n);
+            }
+        }
+    }
     void dump_fault_mem() {
+        if (g_dumpat_n) dump_at_addrs();
         if (!g_faultmem) return;
         const struct { const char* n; uint64_t v; } regs[] = {
             {"rdi", g_rdi}, {"rsi", g_rsi}, {"rdx", g_rdx}, {"rcx", g_rcx},
@@ -1119,6 +1140,15 @@ void install_trap_handler() {
             }
             if (!semi) break; spec = semi + 1;
         }
+    }
+    // PROSPER_DUMPAT="0xADDR[,0xADDR...]" — absolute guest addresses to hex-dump at fault time.
+    if (const char* da = getenv("PROSPER_DUMPAT")) {
+        const char* s = da;
+        while (*s && g_dumpat_n < 6) {
+            g_dumpat[g_dumpat_n++] = strtoull(s, nullptr, 0);
+            const char* comma = strchr(s, ','); if (!comma) break; s = comma + 1;
+        }
+        if (g_devnull_fd < 0) g_devnull_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
     }
     // PROSPER_BP=0xOFFSET installs an int3 code-breakpoint-logger at guest VA 0x400000000+offset.
     if (const char* bp = getenv("PROSPER_BP")) {

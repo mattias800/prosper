@@ -12,6 +12,8 @@
 #include <sys/syscall.h>
 #include <linux/futex.h>
 #include <unistd.h>
+#include <fcntl.h>          // fallocate
+#include <linux/falloc.h>  // FALLOC_FL_PUNCH_HOLE / FALLOC_FL_KEEP_SIZE
 #include <climits>
 #include <cerrno>
 #include <ctime>
@@ -141,6 +143,17 @@ namespace {
         }();
         return fd;
     }
+    // Zero a phys range in the memfd — real hardware hands out ZEROED pages on a fresh direct-memory
+    // allocation, but our memfd RETAINS bytes across release/reuse (a released phys re-allocated to a
+    // new buffer would otherwise expose stale content). Punch a hole (reads back as zeros, keeps the
+    // range sparse). Called only at ALLOCATION time, so it never disturbs the aliasing contract
+    // (which is about mapping an already-allocated phys at a second VA). CONFIDENCE: HIGH (matches
+    // the console's fresh-page-zeroed semantics).
+    void dmem_zero(uint64_t phys, uint64_t sz) {
+        int fd = dmem_fd();
+        if (fd >= 0 && phys < kDmemBase + kDmemTotal && sz)
+            fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, (off_t)phys, (off_t)sz);
+    }
     // Map `len` bytes of the phys pool at `hint` (0 = anywhere). Falls back to anonymous memory
     // if the memfd is unavailable (still boots; loses aliasing).
     void* map_phys_at(uint64_t hint, uint64_t len, int prot, uint64_t phys) {
@@ -221,6 +234,7 @@ HLE(k_alloc_dmem) {
         MLOG("alloc_dmem len=0x%llx -> ENOMEM (pool exhausted)\n", (unsigned long long)a2);
         return 0x8002000Cull;   // SCE_KERNEL_ERROR_ENOMEM
     }
+    dmem_zero(off, sz);                       // fresh allocation -> zeroed pages (console semantics)
     if (a5 > 0xffff) *(uint64_t*)a5 = off;   // only write through a plausible out-pointer
     MLOG("alloc_dmem len=0x%llx -> phys=0x%llx\n", (unsigned long long)a2, (unsigned long long)off);
     return 0;
@@ -237,6 +251,7 @@ HLE(k_alloc_main_dmem) {
         MLOG("alloc_main_dmem len=0x%llx -> ENOMEM (pool exhausted)\n", (unsigned long long)a0);
         return 0x8002000Cull;   // SCE_KERNEL_ERROR_ENOMEM
     }
+    dmem_zero(off, sz);                       // fresh allocation -> zeroed pages (console semantics)
     if (a3 > 0xffff) *(uint64_t*)a3 = off;
     MLOG("alloc_main_dmem len=0x%llx -> phys=0x%llx\n", (unsigned long long)a0, (unsigned long long)off);
     return 0;
