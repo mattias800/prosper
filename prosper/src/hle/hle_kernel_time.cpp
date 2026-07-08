@@ -158,7 +158,11 @@ namespace {
     // fflags@0xC(u32), data@0x10, udata@0x18. The game reads udata (its flip context) + data.
     struct SceKEvent { int64_t ident; int16_t filter; uint16_t flags; uint32_t fflags; int64_t data; uint64_t udata; };
     // PS5 filter ids (negative, FreeBSD-style). VideoOut flip/vblank use the DISPLAY filter family.
-    constexpr int16_t EVFILT_VIDEO_OUT = -0x0a;   // SCE VideoOut event filter (flip + vblank)
+    // SCE VideoOut event filter (flip + vblank): -13 per BOTH references (Kyty EventQueue.h:19
+    // KERNEL_EVFILT_VIDEO_OUT = -13; shadPS4 equeue.h Filter::VideoOut = -13). The previous -10
+    // is FreeBSD's EVFILT_LIO and matched neither — guest code switching on event.filter (the
+    // standard way to recognize a flip kevent, cf. Kyty's assert) would never match our events.
+    constexpr int16_t EVFILT_VIDEO_OUT = -13;
     // VideoOut event idents (Kyty VideoOut.cpp:34): the kevent's ident names the EVENT KIND, not the
     // videoout handle. A flip event's data is the completed flip's flipArg (Kyty
     // flip_event_trigger_func) — the game compares it against the arg it submitted.
