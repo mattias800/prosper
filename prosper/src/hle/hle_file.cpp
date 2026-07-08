@@ -454,6 +454,11 @@ HLE(f_apr_read_submit) {
     if (filelog()) fprintf(stderr, "[apr] read-submit %s -> dest=0x%llx size=%llu got=%lld %s\n",
                    host.c_str(), (unsigned long long)dest, (unsigned long long)size, (long long)got,
                    ok ? "OK" : "SHORT");
+    // DIAGNOSTIC (PROSPER_APR_WATCHDEST): arm a HW write-watch on dest+0 so every subsequent store to
+    // the block's first 8 bytes (where the freelist keeps its "next" pointer) is logged — reveals
+    // whether the guest overwrites the TOC magic with a valid pointer (an aliasing/visibility bug) or
+    // never re-links the block (a recycle-without-reinit bug).
+    if (ok && getenv("PROSPER_APR_WATCHDEST") && g_hwwatch_hook) g_hwwatch_hook(dest);
     return ok ? 0 : 0x80020016ull;
 }
 
