@@ -406,7 +406,17 @@ HLE(f_apr_resolve) {
 HLE(f_apr_read_submit) {
     uint8_t* req = (uint8_t*)P(a0);
     if (!req) return 0x80020016ull;
-    uint64_t dest = *(uint64_t*)(req + 0x18);
+    if (filelog()) {
+        fprintf(stderr, "[apr] read-submit req=0x%llx a1=0x%llx a2=0x%llx count=0x%llx desc=0x%llx descsz=0x%llx\n",
+                (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
+                (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)a5);
+        for (int o = 0; o < 0x48; o += 8)
+            fprintf(stderr, "[apr]   req+0x%02x = 0x%016llx\n", o, (unsigned long long)*(uint64_t*)(req + o));
+    }
+    // req+0x20 is the mapped data buffer (guest direct/flexible memory, 0x10xxxxxxxx range); req+0x18
+    // is only a small stack scratch (writing the full file there smashed the stack). req+0x30 is the
+    // total byte count. CONFIDENCE: MED (field roles from live req dump).
+    uint64_t dest = *(uint64_t*)(req + 0x20);
     uint64_t size = *(uint64_t*)(req + 0x30);
     if (!dest || !size) { if (filelog()) fprintf(stderr, "[apr] read-submit: empty (dest=0x%llx size=0x%llx)\n",
                           (unsigned long long)dest, (unsigned long long)size); return 0; }
