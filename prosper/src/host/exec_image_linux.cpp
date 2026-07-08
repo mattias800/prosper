@@ -1202,7 +1202,7 @@ void install_trap_handler() {
             g_dumpat[g_dumpat_n++] = strtoull(s, nullptr, 0);
             const char* comma = strchr(s, ','); if (!comma) break; s = comma + 1;
         }
-        if (g_devnull_fd < 0) g_devnull_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+        ensure_probe_pipe();   // DUMPAT uses probe_readable(); the readability probe now backs on a pipe (master #61)
     }
     // PROSPER_BP=0xOFFSET installs an int3 code-breakpoint-logger at guest VA 0x400000000+offset.
     if (const char* bp = getenv("PROSPER_BP")) {

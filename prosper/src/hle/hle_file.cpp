@@ -460,11 +460,14 @@ HLE(f_apr_resolve) {
 // pak footer reads looked offset-less). The asm entry below snapshots rsp into a TLS slot so the
 // C handler can read the stack args. Both stub paths run on the HOST %fs (the swap stub switches
 // before the call; the tail-jmp path never left it), so TLS is safe here.
-// Stack layout depends on which stub path invoked us:
-//   swap stub ("call rax" after push r11):  [rsp]=stub ret (0x6xxxxxxxx), [rsp+8]=saved r11,
-//                                           [rsp+16]=guest ret, [rsp+24]=arg7, [rsp+32]=arg8
-//   tail-jmp ("jmp rax"):                   [rsp]=guest ret, [rsp+8]=arg7, [rsp+16]=arg8
-// Distinguished by whether [rsp] lies in the stub region [0x600000000, 0x700000000).
+// Stack layout at our entry (after master #61 taught the swap stub to FORWARD the first two stack
+// args, re-pushing arg7/arg8 right below the call): BOTH stub paths now put the stack args at the
+// same slots — arg7 at [rsp+8], arg8 at [rsp+0x10]:
+//   swap stub ("push r11; push arg8; push arg7; call rax"): [rsp]=stub ret (0x6xxxxxxxx),
+//                                           [rsp+8]=arg7 (forwarded), [rsp+0x10]=arg8 (forwarded)
+//   tail-jmp ("jmp rax"):                   [rsp]=guest ret, [rsp+8]=arg7, [rsp+0x10]=arg8
+// (Before #61 the swap path had arg7 at [rsp+0x18] behind saved-r11/guest-ret — reading that slot
+// post-#61 returns the saved guest-fs base, which clamped every offset to EOF and broke the mount.)
 // Ampr command-buffer address/size captured at init (hle_kernel_mem.cpp). Declared at namespace
 // scope (NOT inside the extern "C" handler, where a block-scope extern would take C linkage and
 // miss the mangled prosper:: definition).
@@ -486,9 +489,8 @@ extern "C" void f_apr_read_submit_entry();
 static uint64_t apr_stack_arg(int n) {
     uint64_t rsp = g_apr_entry_rsp;
     if (!rsp) return 0;
-    uint64_t ret = *(uint64_t*)rsp;
-    bool via_call = (ret >= 0x600000000ull && ret < 0x700000000ull);
-    return *(uint64_t*)(rsp + (via_call ? 0x18 : 0x8) + (uint64_t)n * 8);
+    // Both paths land the forwarded/natural stack args at [rsp+8] (see the layout note above).
+    return *(uint64_t*)(rsp + 0x8 + (uint64_t)n * 8);
 }
 #endif
 
