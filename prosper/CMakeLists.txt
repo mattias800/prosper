@@ -120,6 +120,18 @@ if(TARGET prosper_core)
   target_link_libraries(test_sync_on_address PRIVATE prosper_core)
   add_test(NAME sync_on_address COMMAND test_sync_on_address)
 
+  # sceKernelDlsym honors its module handle (#147): per-module export tables, real handles from
+  # LoadStartModule for linked-module paths, global first-wins fallback. Pure, no game dump needed.
+  add_executable(test_dlsym_handle tests/test_dlsym_handle.cpp)
+  target_link_libraries(test_dlsym_handle PRIVATE prosper_core)
+  add_test(NAME dlsym_handle COMMAND test_dlsym_handle)
+
+  # Guest mutex TYPE semantics (#145): settype honored, Sony/FreeBSD ERRORCHECK default (incl.
+  # static-sentinel self-init), FreeBSD errno values (EDEADLK=11). Pure, no game dump needed.
+  add_executable(test_mutex_types tests/test_mutex_types.cpp)
+  target_link_libraries(test_mutex_types PRIVATE prosper_core)
+  add_test(NAME mutex_types COMMAND test_mutex_types)
+
   add_executable(test_agc_shader tests/test_agc_shader.cpp)
   target_link_libraries(test_agc_shader PRIVATE prosper_core)
   add_test(NAME agc_shader_create COMMAND test_agc_shader)
@@ -148,6 +160,14 @@ if(TARGET prosper_core)
   add_executable(test_dmem tests/test_dmem.cpp)
   target_link_libraries(test_dmem PRIVATE prosper_core)
   add_test(NAME dmem_available COMMAND test_dmem)
+
+  # Hinted map must not clobber a live mapping (#137): MAP_FIXED_NOREPLACE unless the hint is our
+  # own uncommitted reservation. Drives the real map HLE handlers. Linux-only (mmap semantics).
+  if(UNIX AND NOT APPLE)
+    add_executable(test_map_noreplace tests/test_map_noreplace.cpp)
+    target_link_libraries(test_map_noreplace PRIVATE prosper_core)
+    add_test(NAME map_noreplace COMMAND test_map_noreplace)
+  endif()
 
   # PM4 command-stream decoder (front of the CommandProcessor): decode a Dcb built by the AGC
   # Dcb functions and assert the ops. Pure/cross-platform, no game dump needed.
@@ -247,6 +267,11 @@ if(TARGET prosper_core)
                COMMAND test_trap_linux "${GAME_DUMP}")
     endif()
 
+    # The init-fault report must survive a wild/null faulting rip (#128). No game dump needed.
+    add_executable(test_initfault_dump tests/test_initfault_dump.cpp)
+    target_link_libraries(test_initfault_dump PRIVATE prosper_core)
+    add_test(NAME initfault_dump_survives COMMAND test_initfault_dump)
+
     add_executable(test_boot_linux tests/test_boot_linux.cpp)
     target_link_libraries(test_boot_linux PRIVATE prosper_core)
     if(HAVE_GAME_DUMP)
@@ -303,6 +328,15 @@ if(TARGET prosper_core)
       # (PROSPER_RENDER=1) so the game's SubmitDcb draws execute + present + dump frames to disk.
       target_link_libraries(boot_trace PRIVATE Vulkan::Vulkan)
       target_compile_definitions(boot_trace PRIVATE PROSPER_HAVE_VULKAN=1)
+
+      # Shared live renderer (frontends/shared): the DrawItem->Vulkan compositor, factored out of
+      # boot_trace so BOTH boot_trace and prosper-app register the SAME renderer instead of
+      # duplicating it. Needs render_runner.h (tests/) and refvs.inc (tools/boot_trace/).
+      add_library(prosper_live_renderer STATIC frontends/shared/live_renderer.cpp)
+      target_include_directories(prosper_live_renderer PRIVATE src tests tools/boot_trace)
+      target_link_libraries(prosper_live_renderer PUBLIC prosper_core Vulkan::Vulkan)
+      target_include_directories(prosper_live_renderer PUBLIC frontends/shared)
+      target_link_libraries(boot_trace PRIVATE prosper_live_renderer)
 
       add_executable(test_vulkan_offscreen tests/test_vulkan_offscreen.cpp)
       target_link_libraries(test_vulkan_offscreen PRIVATE Vulkan::Vulkan)
@@ -480,6 +514,11 @@ if(PROSPER_APP AND TARGET SDL3::SDL3)
     add_executable(prosper-app frontends/prosper-app/main.cpp)
     target_include_directories(prosper-app PRIVATE src)
     target_link_libraries(prosper-app PRIVATE prosper_core SDL3::SDL3 Vulkan::Vulkan)
+    # Share the live renderer with boot_trace so the window shows composited game frames (not blank).
+    if(TARGET prosper_live_renderer)
+      target_link_libraries(prosper-app PRIVATE prosper_live_renderer)
+      target_compile_definitions(prosper-app PRIVATE PROSPER_HAVE_LIVE_RENDERER=1)
+    endif()
     message(STATUS "prosper-app frontend enabled (SDL3 window + Vulkan present)")
   else()
     message(WARNING "PROSPER_APP=ON but Vulkan not found — skipping prosper-app")
@@ -535,4 +574,22 @@ if(PROSPER_PAD_SDL3 AND TARGET SDL3::SDL3)
   endif()
 
   message(STATUS "SDL3 gamepad frontend enabled (prosper_pad_sdl3)")
+endif()
+
+# --- wire the SDL3 audio/pad frontends into prosper-app (after their targets exist) ---------
+# prosper-app is defined above (before these libs), so link them here once they're built. Enable
+# both alongside the app for a full experience:  -DPROSPER_APP=ON -DPROSPER_AUDIO_SDL3=ON -DPROSPER_PAD_SDL3=ON
+if(TARGET prosper-app)
+  if(TARGET prosper_audio_sdl3)
+    target_link_libraries(prosper-app PRIVATE prosper_audio_sdl3)
+    target_include_directories(prosper-app PRIVATE frontends/audio_sdl3)
+    target_compile_definitions(prosper-app PRIVATE PROSPER_AUDIO_SDL3=1)
+    message(STATUS "prosper-app: audio out enabled")
+  endif()
+  if(TARGET prosper_pad_sdl3)
+    target_link_libraries(prosper-app PRIVATE prosper_pad_sdl3)
+    target_include_directories(prosper-app PRIVATE frontends/pad_sdl3)
+    target_compile_definitions(prosper-app PRIVATE PROSPER_PAD_SDL3=1)
+    message(STATUS "prosper-app: controller input enabled")
+  endif()
 endif()

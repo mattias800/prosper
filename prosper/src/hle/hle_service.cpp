@@ -100,10 +100,19 @@ HLE(s_appcontent_tmpspace) { if (a1) *(uint64_t*)PW(a1) = 1048576ull; return 0; 
 // documented Sony ABI; an empty string is a safe, defined default when we have no real system value.
 HLE(s_param_string)   { if (a1 && a2) ((char*)PW(a1))[0] = '\0'; return 0; }
 
-// Common/message dialogs: report FINISHED immediately so the game's "wait until dismissed" loop
-// exits and it proceeds (we have no interactive dialog UI yet). Status enum: NONE=0, INITIALIZED=1,
-// RUNNING=2, FINISHED=3. GetResult -> zeroed struct = OK/no button pressed.
-HLE(s_dialog_finished) { return 3; }
+// Message-dialog LIFECYCLE (#144). Status enum: NONE=0, INITIALIZED=1, RUNNING=2, FINISHED=3.
+// The old handler returned FINISHED(3) UNCONDITIONALLY — including before any Open, where the real
+// API reports NONE/INITIALIZED — so a guest polling GetStatus as a guard saw "dialog already done"
+// at the wrong stage and skipped/duplicated its dialog logic. We track the real transitions:
+// Initialize -> INITIALIZED, Open -> auto-dismiss to FINISHED (headless: no interactive UI, so the
+// game's "wait until dismissed" loop still exits immediately), Close/Terminate -> back to NONE.
+// GetResult -> zeroed struct = OK/no button pressed.
+namespace { std::atomic<int> g_msgdialog_status{0 /*NONE*/}; }
+HLE(s_dialog_initialize) { g_msgdialog_status.store(1 /*INITIALIZED*/); return 0; }
+HLE(s_dialog_open)       { g_msgdialog_status.store(3 /*FINISHED (auto-dismiss)*/); return 0; }
+HLE(s_dialog_close)      { g_msgdialog_status.store(0 /*NONE*/); return 0; }
+HLE(s_dialog_terminate)  { g_msgdialog_status.store(0 /*NONE*/); return 0; }
+HLE(s_dialog_status)     { return (uint64_t)(unsigned)g_msgdialog_status.load(); }
 // SceMsgDialogResult = { u32 mode; u32 result; u32 buttonId; char reserved[32] } = 0x2C bytes
 // (shadPS4 msgdialog_ui.h DialogResult). Was memset(0x30) — 4 bytes PAST the caller's struct,
 // exactly the f_fstat oversized-write class this file warns about.
@@ -159,11 +168,12 @@ void register_service_hle() {
     R("sceSystemServiceParamGetInt", s_appcontent_int);
     // sceSystemServiceParamGetString (SsC-m-S9JTA): write a valid empty string (not an unfilled buffer).
     Hle::register_fn("SsC-m-S9JTA", (HleFn)s_param_string, "sceSystemServiceParamGetString");
-    // message dialog: auto-dismiss (report FINISHED) so the startup dialog flow completes
-    R("sceMsgDialogInitialize", s_ok);      R("sceMsgDialogTerminate", s_ok);
-    R("sceMsgDialogOpen", s_ok);            R("sceMsgDialogClose", s_ok);
-    R("sceMsgDialogUpdateStatus", s_dialog_finished);
-    R("sceMsgDialogGetStatus", s_dialog_finished);
+    // message dialog: track the Initialize/Open/Close lifecycle (#144) — NONE/INITIALIZED before an
+    // Open, then auto-dismiss to FINISHED so the startup dialog flow still completes headless.
+    R("sceMsgDialogInitialize", s_dialog_initialize);  R("sceMsgDialogTerminate", s_dialog_terminate);
+    R("sceMsgDialogOpen", s_dialog_open);              R("sceMsgDialogClose", s_dialog_close);
+    R("sceMsgDialogUpdateStatus", s_dialog_status);
+    R("sceMsgDialogGetStatus", s_dialog_status);
     R("sceMsgDialogGetResult", s_dialog_result);
     R("sceSystemServiceHideSplashScreen", s_ok);
     R("sceSystemServiceGetStatus", s_syss_getstatus);

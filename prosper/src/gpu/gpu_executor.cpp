@@ -230,7 +230,9 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                                  is_buffer ? "bufload" : "load", sdst, sbase, (unsigned long long)base, base_ok,
                                  soff_field, soff_val, soff_ok, in.literal, n);
                 if (n == 0 || !base_ok || !soff_ok) { for (uint32_t k = 0; k < n; k++) val.erase(sdst + (int)k); break; }
-                uint64_t addr = base + in.literal + soff_val;
+                // in.literal is the SIGN-EXTENDED 21-bit immediate (#149) — add it as signed so a
+                // negative offset subtracts from the base instead of wrapping to a huge address.
+                uint64_t addr = base + (uint64_t)(int64_t)(int32_t)in.literal + soff_val;
                 if (!guest_readable(addr, n * 4)) { if (trc) fprintf(stderr, "[dyntrace]   addr 0x%llx unreadable\n", (unsigned long long)addr);
                                                     for (uint32_t k = 0; k < n; k++) val.erase(sdst + (int)k); break; }
                 const uint32_t* mem = (const uint32_t*)(uintptr_t)addr;

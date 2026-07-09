@@ -12,6 +12,10 @@
 
 using namespace prosper::gpu;
 
+// The guest TSC clock the GPU EOP timestamp shares (hle_kernel_time.cpp) — same source as
+// sceKernelReadTsc, so a GPU fence timestamp and a CPU TSC read lie on one timeline (#156).
+extern "C" uint64_t prosper_guest_tsc_ns();
+
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
                          else       { printf("  [ok]   %s\n", m); } } while (0)
@@ -70,6 +74,24 @@ int main() {
         CHECK(l1 != 0 && l2 >= l1, "RELEASE_MEM (data_sel=3) wrote a monotonic non-zero GPU clock");
     }
 
+    // #156: the GPU EOP timestamp must share the guest TSC timeline (sceKernelReadTsc) — on real
+    // hardware they are the SAME counter. A data_sel=3 fence value must fall between a TSC read
+    // taken just before and just after the submit (the old steady_clock had a disjoint epoch, so
+    // it would land far outside this window).
+    {
+        uint64_t label = 0;
+        uint32_t buf[7];
+        uint64_t addr = (uint64_t)(uintptr_t)&label;
+        buf[0] = PM4(7, IT_NOP, R_RELEASE_MEM);
+        buf[1] = (uint32_t)(addr & 0xffffffffu); buf[2] = (uint32_t)(addr >> 32);
+        buf[3] = 3; buf[4] = 0; buf[5] = 0; buf[6] = 0x04;
+        uint64_t before = prosper_guest_tsc_ns();
+        GpuState st; run_command_buffer(buf, 7, st);
+        uint64_t after = prosper_guest_tsc_ns();
+        CHECK(label >= before && label <= after,
+              "data_sel=3 fence lies on the sceKernelReadTsc timeline (shared guest TSC, not steady_clock)");
+    }
+
     // WRITE_DATA: [0]=hdr [1]=dst [2..3]=addr [4]=num_dwords [5..]=data.
     {
         uint32_t target[3] = {0, 0, 0};
@@ -97,6 +119,29 @@ int main() {
         GpuState st; run_command_buffer(buf, 7, st);
         CHECK(target[0] == 0xDEADu && target[1] == 0xBEEFu && target[2] == 0 && target[3] == 0,
               "WRITE_DATA clamped num_dwords to what the packet actually holds");
+    }
+
+    // Address-carrying EVENT_WRITE (#132): the widened packet ([0]=hdr [1]=event_type [2..3]=addr)
+    // writes a monotonic completion value to its address so a guest waiting on that label unblocks
+    // (the old 2-dword packet discarded the address -> the CommandProcessor no-op'd -> wait forever).
+    {
+        uint64_t label = 0;
+        uint32_t buf[4];
+        uint64_t addr = (uint64_t)(uintptr_t)&label;
+        buf[0] = PM4(4, IT_EVENT_WRITE, 0);
+        buf[1] = 0x14;                                // some event_type
+        buf[2] = (uint32_t)(addr & 0xffffffffu); buf[3] = (uint32_t)(addr >> 32);
+        GpuState st; run_command_buffer(buf, 4, st);
+        CHECK(label != 0, "address-carrying EVENT_WRITE wrote a completion value to the label (was dropped)");
+    }
+    // An address-LESS EVENT_WRITE (event_addr == 0, a pipeline-sync event) must remain a no-op.
+    {
+        uint32_t buf[4];
+        buf[0] = PM4(4, IT_EVENT_WRITE, 0);
+        buf[1] = 0x16; buf[2] = 0; buf[3] = 0;        // no address
+        GpuState st;
+        size_t n = run_command_buffer(buf, 4, st);    // must not fault / write anywhere
+        CHECK(n == 1, "address-less EVENT_WRITE decodes and is a harmless no-op");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }

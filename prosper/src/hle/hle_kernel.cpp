@@ -9,6 +9,7 @@
 #include "nid.hpp"
 #include "../host/exec_image.hpp"
 #include <pthread.h>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -54,7 +55,23 @@ HLE(k_mutexattr_init) {
     *(void**)a0 = at;                     // store handle through caller's slot
     return 0;
 }
-HLE(k_mutexattr_settype)     { return 0; } // type/protocol/pshared ignored for now
+// Sony/FreeBSD mutex types: 1=ERRORCHECK (the FreeBSD/Sony DEFAULT), 2=RECURSIVE, 3=NORMAL,
+// 4=ADAPTIVE_NP (NORMAL semantics + spin). Kyty's PthreadMutexattrSettype uses exactly this
+// mapping and its attr-init defaults to type 1 — PS4-inherited surface, so solid evidence (#145).
+// Previously a no-op, and init forced RECURSIVE: a guest relying on trylock-fails-on-owner or
+// EDEADLK semantics silently got different behavior.
+HLE(k_mutexattr_settype) {
+    if (!a0 || !*(void**)a0) return 0x16;
+    int host;
+    switch ((int)a1) {
+        case 1: host = PTHREAD_MUTEX_ERRORCHECK; break;
+        case 2: host = PTHREAD_MUTEX_RECURSIVE;  break;
+        case 3: case 4: host = PTHREAD_MUTEX_NORMAL; break;
+        default: return 0x16;   // EINVAL
+    }
+    pthread_mutexattr_settype((pthread_mutexattr_t*)*(void**)a0, host);
+    return 0;
+}
 HLE(k_mutexattr_setprotocol) { return 0; }
 HLE(k_mutexattr_setpshared)  { return 0; }
 HLE(k_mutexattr_destroy)     { if (a0 && *(void**)a0) { free(*(void**)a0); *(void**)a0 = nullptr; } return 0; }
@@ -80,7 +97,11 @@ namespace {
         if (!pt_static_sentinel(cur)) return (pthread_mutex_t*)cur;
         auto* m = (pthread_mutex_t*)calloc(1, sizeof(pthread_mutex_t));
         pthread_mutexattr_t at; pthread_mutexattr_init(&at);
-        pthread_mutexattr_settype(&at, PTHREAD_MUTEX_RECURSIVE);
+        // The FreeBSD static sentinel ENCODES the type: NULL = PTHREAD_MUTEX_INITIALIZER (the
+        // DEFAULT type, which is ERRORCHECK on FreeBSD), 1 = PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP
+        // (NORMAL semantics + spin). Previously every sentinel self-init forced RECURSIVE (#145).
+        pthread_mutexattr_settype(&at, (uintptr_t)cur == 1 ? PTHREAD_MUTEX_NORMAL
+                                                           : PTHREAD_MUTEX_ERRORCHECK);
         pthread_mutex_init(m, &at);
         pthread_mutexattr_destroy(&at);
         if (__atomic_compare_exchange_n(slot, &cur, (void*)m, false,
@@ -116,21 +137,33 @@ namespace {
         return (pthread_rwlock_t*)cur;
     }
 }
+// scePthreadMutexInit(mutex_slot, attr_slot, name) / pthread_mutex_init(mutex_slot, attr_slot):
+// honor the caller's attr (type set via k_mutexattr_settype); no attr means Sony's default,
+// ERRORCHECK — FreeBSD PTHREAD_MUTEX_DEFAULT, and what Kyty's attr-init settype(1) produces (#145).
 HLE(k_mutex_init) {
     if (!a0) return 0x16;
     auto* m = (pthread_mutex_t*)calloc(1, sizeof(pthread_mutex_t));
-    // Default to recursive: game code often locks re-entrantly and Sony's default differs.
-    pthread_mutexattr_t at; pthread_mutexattr_init(&at);
-    pthread_mutexattr_settype(&at, PTHREAD_MUTEX_RECURSIVE);
-    pthread_mutex_init(m, &at);
-    pthread_mutexattr_destroy(&at);
+    pthread_mutexattr_t* at = (a1 && !pt_static_sentinel(*(void**)a1)) ? (pthread_mutexattr_t*)*(void**)a1 : nullptr;
+    pthread_mutexattr_t def;
+    if (!at) { pthread_mutexattr_init(&def); pthread_mutexattr_settype(&def, PTHREAD_MUTEX_ERRORCHECK); at = &def; }
+    pthread_mutex_init(m, at);
+    if (at == &def) pthread_mutexattr_destroy(&def);
     *(void**)a0 = m;
     return 0;
 }
+// The guest sees FreeBSD errno values; EBUSY(16)/EPERM(1)/EINVAL(22) coincide with both Linux and
+// MinGW, but EDEADLK differs on every host (FreeBSD 11, Linux 35, MinGW/winpthreads 36) — an
+// ERRORCHECK relock must report the FreeBSD value. `EDEADLK` is the HOST's own constant, so the
+// comparison remaps whatever the host returns on ALL platforms (the Windows CI build hit exactly
+// this: winpthreads returned its EDEADLK=36 and the old __linux__-only guard left it unremapped).
+namespace { inline uint64_t fbsd_errno(int host) {
+    if (host == EDEADLK) return 11;
+    return (uint64_t)(unsigned)host;
+} }
 HLE(k_mutex_destroy) { if (a0 && !pt_static_sentinel(*(void**)a0)) { pthread_mutex_destroy((pthread_mutex_t*)*(void**)a0); free(*(void**)a0); } if (a0) *(void**)a0 = nullptr; return 0; }
-HLE(k_mutex_lock)    { if (auto* m = ensure_mutex(a0)) pthread_mutex_lock(m); return 0; }
-HLE(k_mutex_trylock) { auto* m = ensure_mutex(a0); return m ? (uint64_t)pthread_mutex_trylock(m) : 0x16; }
-HLE(k_mutex_unlock)  { if (auto* m = ensure_mutex(a0)) pthread_mutex_unlock(m); return 0; }
+HLE(k_mutex_lock)    { auto* m = ensure_mutex(a0); return m ? fbsd_errno(pthread_mutex_lock(m))    : 0x16; }
+HLE(k_mutex_trylock) { auto* m = ensure_mutex(a0); return m ? fbsd_errno(pthread_mutex_trylock(m)) : 0x16; }
+HLE(k_mutex_unlock)  { auto* m = ensure_mutex(a0); return m ? fbsd_errno(pthread_mutex_unlock(m))  : 0x16; }
 
 // --- condition variables ---
 HLE(k_condattr_init)    { if (a0) { auto* c = (pthread_condattr_t*)calloc(1, sizeof(pthread_condattr_t)); pthread_condattr_init(c); *(void**)a0 = c; } return 0; }
@@ -295,17 +328,30 @@ HLE(k_getprio)            { // scePthreadGetprio(thread, int* prio)
 }
 
 // --- thread creation: run the guest entry on a real host thread (ABI matches) ---
-// We give each worker a stack we allocate and TRACK, so GC/thread-stack queries get
-// accurate bounds (see k_attr_get) without relying on pthread_getattr_np.
+// Worker stacks are GLIBC-OWNED (#138): create passes only a stacksize (honoring the guest attr),
+// so glibc allocates the stack and — crucially — RECLAIMS it when the thread is joined or a
+// detached thread exits. The old code mmap'd a fixed 8 MiB per thread via pthread_attr_setstack
+// and never munmapped it (glibc never frees a CALLER-owned stack): a thread-churning title leaked
+// 8 MiB per exited thread. The trampoline still TRACKS the bounds (via pthread_getattr_np, keyed
+// by our tid) so GC/thread-stack queries stay accurate, and unregisters them on exit — pthread
+// ids are recycled, so a stale entry would serve the next thread the dead thread's bounds.
 #ifdef __linux__
 namespace {
-struct ThreadStart { void* (*entry)(void*); void* arg; void* sbase; uint64_t ssz; };
+struct ThreadStart { void* (*entry)(void*); void* arg; };
 // Runs first on the new thread: register our own stack (keyed by our tid) BEFORE any guest code,
 // so an early GC_register_my_thread / stack-base query from this thread finds it. Closes a race
 // where a fast-starting worker ran before the parent's post-create registration → "Bad stack base".
 void* thread_trampoline(void* p) {
     auto* ts = (ThreadStart*)p;
-    if (ts->sbase) register_thread_stack((uint64_t)pthread_self(), ts->sbase, ts->ssz);
+    {
+        pthread_attr_t sa;
+        if (pthread_getattr_np(pthread_self(), &sa) == 0) {
+            void* sb = nullptr; size_t ss = 0;
+            if (pthread_attr_getstack(&sa, &sb, &ss) == 0 && sb)
+                register_thread_stack((uint64_t)pthread_self(), sb, ss);
+            pthread_attr_destroy(&sa);
+        }
+    }
     install_sigaltstack();   // so a guest stack overflow on this worker is still catchable
     auto entry = ts->entry; void* arg = ts->arg; free(ts);   // all host libc — MUST run on the host %fs
     // gated (PROSPER_GUEST_FS): give this guest worker its own guest TCB + static TLS and switch %fs to it
@@ -324,6 +370,7 @@ void* thread_trampoline(void* p) {
     // exit via scePthreadExit never get here — k_pthread_exit purges before host pthread_exit.
     uint64_t sfs = guest_fs_to_host_scoped();
     tls_dtv_purge_current_thread();
+    unregister_thread_stack((uint64_t)pthread_self());   // ids recycle; stale bounds = wrong bounds (#138)
     guest_fs_restore_scoped(sfs);
     return rv;
 }
@@ -338,26 +385,30 @@ HLE(k_pthread_create) {
                 (unsigned long long)a2, (unsigned long long)a3, a4 ? (const char*)(uintptr_t)a4 : "");
     pthread_t tid;
 #ifdef __linux__
-    pthread_attr_t la; bool own = false;
-    pthread_attr_t* at;
-    if (a1 && *(void**)a1) at = (pthread_attr_t*)*(void**)a1;
-    else { pthread_attr_init(&la); at = &la; own = true; }
-    size_t ssz = 8 * 1024 * 1024;
-    void* sbase = mmap(nullptr, ssz, PROT_READ | PROT_WRITE,
-                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
-    int r;
-    if (sbase != MAP_FAILED) {
-        pthread_attr_setstack(at, sbase, ssz);
-        auto* ts = (ThreadStart*)malloc(sizeof(ThreadStart));
-        ts->entry = entry; ts->arg = arg; ts->sbase = sbase; ts->ssz = ssz;
-        r = pthread_create(&tid, at, thread_trampoline, ts);   // trampoline registers the stack first
-        if (r) free(ts);
-    } else {
-        r = pthread_create(&tid, at, entry, arg);
+    // Stack size: honor the guest attr's stacksize (previously ignored — everything got a fixed
+    // 8 MiB), floored at 1 MiB because our HLE + host libc frames run deeper than Sony's runtime
+    // would on the same stack. No attr (or no explicit size) keeps the 8 MiB default.
+    constexpr size_t kStackFloor = 1 * 1024 * 1024, kStackDefault = 8 * 1024 * 1024;
+    size_t ssz = kStackDefault;
+    int detach = PTHREAD_CREATE_JOINABLE;
+    if (a1 && *(void**)a1) {
+        auto* gat = (pthread_attr_t*)*(void**)a1;
+        size_t req = 0;
+        if (pthread_attr_getstacksize(gat, &req) == 0 && req)
+            ssz = req < kStackFloor ? kStackFloor : req;
+        pthread_attr_getdetachstate(gat, &detach);
     }
-    if (own) pthread_attr_destroy(&la);
-    if (r) { if (sbase != MAP_FAILED) munmap(sbase, ssz); return (uint64_t)r; }
-    if (sbase != MAP_FAILED) register_thread_stack((uint64_t)tid, sbase, ssz);  // redundant safety net
+    // A local attr with setstackSIZE (not setstack): glibc allocates AND RECLAIMS the stack
+    // (join / detached exit) — the old caller-owned mmap was never freed (#138). Also stops
+    // mutating the guest's own attr object (setstack used to be applied to it in place).
+    pthread_attr_t la; pthread_attr_init(&la);
+    pthread_attr_setstacksize(&la, ssz);
+    pthread_attr_setdetachstate(&la, detach);
+    auto* ts = (ThreadStart*)malloc(sizeof(ThreadStart));
+    ts->entry = entry; ts->arg = arg;
+    int r = pthread_create(&tid, &la, thread_trampoline, ts);   // trampoline registers the stack first
+    pthread_attr_destroy(&la);
+    if (r) { free(ts); return (uint64_t)r; }
 #else
     pthread_attr_t* at = (a1 && *(void**)a1) ? (pthread_attr_t*)*(void**)a1 : nullptr;
     int r = pthread_create(&tid, at, entry, arg);
@@ -370,10 +421,13 @@ HLE(k_pthread_join)   { void* rv = nullptr; pthread_join((pthread_t)a0, a1 ? &rv
 HLE(k_pthread_detach) { pthread_detach((pthread_t)a0); return 0; }
 HLE(k_pthread_exit)   {
     // Host pthread_exit unwinds without ever returning through thread_trampoline, so this is its own
-    // thread-exit path: purge the exiting thread's __tls_get_addr DTV first (#68). HLE handlers run
-    // under the HOST %fs (the import stubs swap), so the host libc below is safe. No-op for threads
-    // that never touched __tls_get_addr.
+    // thread-exit path: purge the exiting thread's __tls_get_addr DTV first (#68) and drop its stack
+    // registration (#138 — pthread ids recycle). HLE handlers run under the HOST %fs (the import
+    // stubs swap), so the host libc below is safe. No-op for threads that never touched either.
     tls_dtv_purge_current_thread();
+#ifdef __linux__
+    unregister_thread_stack((uint64_t)pthread_self());
+#endif
     pthread_exit((void*)(uintptr_t)a0);
     return 0;
 }
@@ -746,16 +800,49 @@ HLE(k_is_stack) {   // sceKernelIsStack(void* addr): is addr within the current 
 }
 // Global export table (NID -> guest addr) registered by the loader, so dlsym can resolve
 // exported symbols by name against loaded modules (e.g. PSN.prx's plugin/init exports).
-namespace { const std::unordered_map<std::string, uint64_t>* g_exports = nullptr; }
+namespace {
+    const std::unordered_map<std::string, uint64_t>* g_exports = nullptr;
+    std::vector<ModuleExportTable> g_mod_exports;   // per-module tables (#147)
+    // Real module handles occupy 0x10000+index — far above the synthetic success counter
+    // (k_load_start_mod's g_module_handle, which starts at 1), so the ranges can't collide.
+    constexpr uint64_t kModuleHandleBase = 0x10000;
+    const char* path_basename(const char* p) {
+        const char* b = p;
+        for (const char* c = p; *c; c++) if (*c == '/' || *c == '\\') b = c + 1;
+        return b;
+    }
+}
 void set_module_exports(const std::unordered_map<std::string, uint64_t>* exports) { g_exports = exports; }
+void set_module_export_tables(std::vector<ModuleExportTable> tables) { g_mod_exports = std::move(tables); }
+uint64_t module_handle_for_path(const char* path) {
+    if (!path || !*path) return 0;
+    const char* want = path_basename(path);
+    for (size_t i = 0; i < g_mod_exports.size(); i++)
+        if (strcmp(path_basename(g_mod_exports[i].path.c_str()), want) == 0)
+            return kModuleHandleBase + i;
+    return 0;
+}
 
 HLE(k_dlsym) {   // sceKernelDlsym(SceKernelModule handle, const char* name, void** funcAddr)
-    // Resolve the requested symbol by name against the linked program's global export table
-    // (Unity's native-plugin loader dlsym's UnityPluginLoad / PSN_PrxInitialize by name). We hash
-    // the name to its Sony NID (nid_hash) and look it up among all loaded modules' exports; a hit
-    // is written through *funcAddr and reported as success. This is what makes the native PSN.prx
-    // plugin's exports reachable so the managed PSN bootstrap + worker pool start.
+    // Resolve the requested symbol by name against the HANDLE'S module first (#147) — a real
+    // handle from k_load_start_mod names one linked module, and two modules exporting the same
+    // NID must not alias to the global table's first definition — then fall back to the global
+    // export table (Unity's native-plugin loader dlsym's UnityPluginLoad / PSN_PrxInitialize by
+    // name; synthetic handles for unknown paths land here). We hash the name to its Sony NID
+    // (nid_hash); a hit is written through *funcAddr and reported as success.
     const char* name = a1 ? (const char*)(uintptr_t)a1 : nullptr;
+    if (name && a0 >= kModuleHandleBase && a0 - kModuleHandleBase < g_mod_exports.size()) {
+        if (const auto* nids = g_mod_exports[a0 - kModuleHandleBase].nids) {
+            auto it = nids->find(nid_hash(name));
+            if (it != nids->end()) {
+                if (a2) *(uint64_t*)(uintptr_t)a2 = it->second;
+                if (getenv("PROSPER_SYNCLOG"))
+                    fprintf(stderr, "[dlsym] '%s' (module handle 0x%llx) -> 0x%llx\n",
+                            name, (unsigned long long)a0, (unsigned long long)it->second);
+                return 0;
+            }
+        }
+    }
     if (name && g_exports) {
         auto it = g_exports->find(nid_hash(name));
         if (it != g_exports->end()) {

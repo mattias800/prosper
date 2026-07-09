@@ -411,6 +411,15 @@ int main() {
     printf("  kernel20 mismatches=%u (out[0]=%g expect=50)\n", bad20, got20.size()==N?got20[0]:-1);
     CHECK(got20.size()==N && bad20==0, "recompiled kernel 20 (SMEM: cbuf[1]+cbuf[2] from constant buffer) correct");
 
+    // Kernel 20b (#149): a register-SOFFSET s_buffer_load must be REJECTED, not silently translated
+    // with the immediate alone (the register offset is unmodeled). s_buffer_load_dword s0, s[..], s8.
+    // Same first-load prefix as kernel 20 so the difference is purely the register SOFFSET.
+    const uint32_t code20b[] = {
+        0xf4000001u, 0xfa000004u, 0xf4200002u, 0x10000008u, 0x7e000c00u, 0xbf810000u,
+    };
+    CHECK(recompile_valu(code20b, sizeof(code20b)/sizeof(code20b[0]), 1, 0).empty(),
+          "kernel 20b (s_buffer_load with a register SOFFSET) is REJECTED (not silently mistranslated)");
+
     // Kernel 21: MUBUF per-lane buffer_load_dword (the vertex-fetch mechanism). v0=(uint)gid;
     // v0<<=2 (byte offset); buffer_load_dword v0, v0 offen -> cbuf[gid]; out=(float)cbuf[gid].
     const uint32_t code21[] = {
@@ -485,6 +494,14 @@ int main() {
     uint32_t bad24 = 0; for (uint32_t i=0;i<N&&got24.size()==N;i++) if (std::fabs(got24[i]-exp24[i])>2e-3f) bad24++;
     printf("  kernel24 mismatches=%u (out[5]=%g expect=%g)\n", bad24, got24.size()==N?got24[5]:-1, got24.size()==N?exp24[5]:-1);
     CHECK(got24.size()==N && bad24==0, "recompiled kernel 24 (unorm8x4 -> 4 normalized floats) correct");
+
+    // Kernel 24b (#150): the SAME unorm8x4 fetch but with a NON-dword-aligned inst offset (offset:2).
+    // The packed unpack extracts components at static byte offsets from a dword-aligned base and drops
+    // addr&3, so a non-aligned element base would decode the wrong bits — it must be REJECTED (the
+    // alignment can't be proven) rather than silently mis-decoded. Kernel 24 (offset 0) still succeeds.
+    const uint32_t code24b[] = { 0x7e000f00u, 0xe00c2002u, 0x80020100u, 0xbf810000u };
+    CHECK(recompile_valu(code24b, sizeof(code24b)/sizeof(code24b[0]), 1, /*out_vgpr*/1, &rt24).empty(),
+          "kernel 24b (packed unorm8x4 at a non-dword-aligned offset:2) is REJECTED (not mis-decoded)");
 
     // Kernel 25: SNORM16x2 vertex fetch — signed 16-bit fields, normalized /32767 and clamped to -1.0
     // (the SNORM rule: -32768 maps to -1.0, not -1.00003). out = v1 + 10*v2. y is fixed at -32768 to
@@ -1202,6 +1219,29 @@ int main() {
     printf("  kernel66 mismatches=%u (out[7]=%g expect=507)\n", bad66, got66.size()==N?got66[7]:-1);
     CHECK(got66.size()==N && bad66==0, "recompiled kernel 66 (raw load resolves SRSRC -> binding 3, not binding 2) correct");
 
+    // Kernel 66b: MUBUF idxen+offen — BOTH VADDR terms must apply (#148). v1=(uint)gid (index), v2=4
+    // (per-lane byte offset), buffer_load_dword v3, v[1:2], s[8:11] idxen offen, stride 8 -> addr =
+    // gid*8 + 4 => dword index 2*gid+1 => buf[2*gid+1]. The old code applied only the index term and
+    // silently dropped v2, reading buf[2*gid] instead. cvt in/out (the shell's inputs are float bits).
+    // Encodings llvm-mc gfx1030 verified.
+    const uint32_t code66b[] = {
+        0x7e020f00u, 0x7e040284u, 0xe0303000u, 0x80020301u, 0x7e060d03u, 0xbf810000u,
+    };
+    ShaderResourceTable rt66b;
+    { ShaderResource rb{}; rb.cls = ResourceClass::ConstantBuffer; rb.format = DataFormat::Float32;
+      rb.num_components = 1; rb.binding = 3; rb.stride = 8; rb.sgpr_base = 8; rt66b.resources.push_back(rb); }
+    std::vector<uint32_t> spv66b = recompile_valu(code66b, sizeof(code66b)/sizeof(code66b[0]), 1, /*out_vgpr*/3, &rt66b);
+    CHECK(!spv66b.empty(), "recompiled kernel 66b (MUBUF idxen+offen) -> SPIR-V");
+    std::vector<float> in66b(N); std::vector<uint32_t> decoy66b(2*N, 0xDEADu), buf66b(2*N);
+    for (uint32_t i = 0; i < N; i++)   in66b[i] = (float)i;
+    for (uint32_t i = 0; i < 2*N; i++) buf66b[i] = 500u + i;
+    std::vector<float> got66b = prosper::test::run_compute(spv66b, in66b, N, N, decoy66b, buf66b);
+    uint32_t bad66b = 0;
+    for (uint32_t i=0;i<N&&got66b.size()==N;i++) if (std::fabs(got66b[i]-(float)(500u + 2u*i + 1u))>1e-3f) bad66b++;
+    printf("  kernel66b mismatches=%u (out[3]=%g expect=%u)\n", bad66b,
+           got66b.size()==N?got66b[3]:-1, 500u + 2u*3u + 1u);
+    CHECK(got66b.size()==N && bad66b==0, "kernel 66b (idxen+offen): addr = idx*stride + byteoffset (both applied)");
+
     // Kernel 67: RAW MUBUF UNRESOLVABLE SRSRC -> REJECT (#91). Same code, but the table's only
     // resource lives at sgpr_base 4 — SRSRC s[8:11] resolves to nothing. With a table present the
     // recompiler must reject (empty SPIR-V), never silently fall back to binding 2.
@@ -1249,6 +1289,43 @@ int main() {
     printf("  kernelN(v_nop) mismatches=%u (out[33]=%g expect=%g)\n", badN, gotN.size()==N?gotN[33]:-1, expN[33]);
     CHECK(gotN.size()==N && badN==0, "v_nop is transparent: out = (a0+a1)*a2 computed correctly");
 
+    // Kernels J1/J2/J3: forward-branch targets PAST the first s_endpgm (#129). A branch past
+    // s_endpgm is a benign early-out ONLY if execution at the target immediately terminates
+    // (s_nop* then s_endpgm). Real code at the target (an else-block) used to be silently
+    // discarded by a blanket clamp — valid SPIR-V, wrong semantics; it must now REJECT.
+    // Shape: s0=7; s1=7|8; s_cmp_eq_u32; s_cbranch_scc0 +3 (-> pc7); v0=42.0; s_endpgm; <target...>
+    //   J1: target is s_endpgm            -> accept; SCC=1 runs the block (42), SCC=0 skips (input)
+    //   J2: target is REAL code (v0=9.0)  -> REJECT (was: clamped, taken path silently lost v0=9)
+    //   J3: target is s_nop; s_endpgm     -> accept (nop padding before the end is still an early-out)
+    // Encodings llvm-mc gfx1030 verified.
+    const uint32_t codeJ1t[] = { 0xbe800387u, 0xbe810387u, 0xbf060100u, 0xbf840003u,
+                                 0x7e0002ffu, 0x42280000u, 0xbf810000u, 0xbf810000u };
+    const uint32_t codeJ1f[] = { 0xbe800387u, 0xbe810388u, 0xbf060100u, 0xbf840003u,
+                                 0x7e0002ffu, 0x42280000u, 0xbf810000u, 0xbf810000u };
+    const uint32_t codeJ2[]  = { 0xbe800387u, 0xbe810388u, 0xbf060100u, 0xbf840003u,
+                                 0x7e0002ffu, 0x42280000u, 0xbf810000u,
+                                 0x7e0002ffu, 0x41100000u, 0xbf810000u };
+    const uint32_t codeJ3[]  = { 0xbe800387u, 0xbe810387u, 0xbf060100u, 0xbf840003u,
+                                 0x7e0002ffu, 0x42280000u, 0xbf810000u, 0xbf800000u, 0xbf810000u };
+    std::vector<uint32_t> spvJ1t = recompile_valu(codeJ1t, sizeof(codeJ1t)/sizeof(codeJ1t[0]), 1, 0);
+    std::vector<uint32_t> spvJ1f = recompile_valu(codeJ1f, sizeof(codeJ1f)/sizeof(codeJ1f[0]), 1, 0);
+    std::vector<uint32_t> spvJ2  = recompile_valu(codeJ2,  sizeof(codeJ2)/sizeof(codeJ2[0]),  1, 0);
+    std::vector<uint32_t> spvJ3  = recompile_valu(codeJ3,  sizeof(codeJ3)/sizeof(codeJ3[0]),  1, 0);
+    CHECK(!spvJ1t.empty() && !spvJ1f.empty(), "kernel J1 (early-out branch to a trailing s_endpgm) -> SPIR-V");
+    CHECK(spvJ2.empty(), "kernel J2 (branch past s_endpgm into REAL code) is REJECTED, not clamped");
+    CHECK(!spvJ3.empty(), "kernel J3 (early-out through s_nop padding) -> SPIR-V");
+    std::vector<float> inJ(N);
+    for (uint32_t i = 0; i < N; i++) inJ[i] = (float)i * 0.25f;
+    std::vector<float> gotJt = prosper::test::run_compute(spvJ1t, inJ, N, N);
+    std::vector<float> gotJf = prosper::test::run_compute(spvJ1f, inJ, N, N);
+    uint32_t badJ = 0;
+    for (uint32_t i = 0; i < N && gotJt.size() == N; i++) if (std::fabs(gotJt[i] - 42.0f) > 1e-3f) badJ++;
+    for (uint32_t i = 0; i < N && gotJf.size() == N; i++) if (std::fabs(gotJf[i] - inJ[i]) > 1e-3f) badJ++;
+    printf("  kernelJ mismatches=%u (scc1->%g expect 42, scc0->%g expect %g)\n", badJ,
+           gotJt.size()==N?gotJt[8]:-1, gotJf.size()==N?gotJf[8]:-1, inJ[8]);
+    CHECK(gotJt.size()==N && gotJf.size()==N && badJ==0,
+          "kernel J1 early-out: block runs on SCC=1 (42), skipped on SCC=0 (input)");
+
     // Kernels S1/S2: v_cvt_u32_f32 / v_cvt_i32_f32 SATURATION (#135). RDNA2 saturates the
     // float->int converts (NaN -> 0, negative -> 0 for u32, out-of-range clamps to the type
     // min/max); a bare OpConvertFToU/S is undefined out of range, so drivers returned garbage.
@@ -1295,6 +1372,59 @@ int main() {
            gotS2.size()==N?gotS2[9]:-1, gotS2.size()==N?gotS2[5]:-1, gotS2.size()==N?gotS2[6]:-1, expS2[5], expS2[6]);
     CHECK(gotS1.size()==N && badS1==0, "v_cvt_u32_f32 saturates (NaN/neg -> 0, >=2^32 -> UINT_MAX)");
     CHECK(gotS2.size()==N && badS2==0, "v_cvt_i32_f32 saturates (NaN -> 0, clamps to INT_MIN/INT_MAX)");
+
+    // Kernels X1..X3: SPECIAL operands read as ALU DATA (#134). VCC/EXEC live as per-lane bools in
+    // the per-invocation model (their 32-bit wave-mask value doesn't exist) and M0 isn't modeled —
+    // such reads previously computed with a silent 0; they must now REJECT. SGPR_NULL (field 125)
+    // is the one Special whose data value IS 0, and must keep recompiling. llvm-mc gfx1030 verified.
+    const uint32_t codeX1[] = { 0x4A02007Eu, 0xBF810000u };   // v_add_nc_u32 v1, exec_lo, v0
+    const uint32_t codeX2[] = { 0x4A02007Cu, 0xBF810000u };   // v_add_nc_u32 v1, m0, v0
+    const uint32_t codeX3[] = { 0x4A02007Du, 0xBF810000u };   // v_add_nc_u32 v1, null, v0
+    CHECK(recompile_valu(codeX1, 2, 1, 1).empty(), "kernel X1 (exec_lo read as ALU data) is REJECTED");
+    CHECK(recompile_valu(codeX2, 2, 1, 1).empty(), "kernel X2 (m0 read as ALU data) is REJECTED");
+    std::vector<uint32_t> spvX3 = recompile_valu(codeX3, 2, 1, /*out_vgpr*/1);
+    CHECK(!spvX3.empty(), "kernel X3 (null read as ALU data) still recompiles (null == 0)");
+    std::vector<float> inX(N);
+    for (uint32_t i = 0; i < N; i++) inX[i] = (float)i;
+    std::vector<float> gotX3 = prosper::test::run_compute(spvX3, inX, N, N);
+    uint32_t badX = 0;
+    for (uint32_t i = 0; i < N && gotX3.size() == N; i++) if (gotX3[i] != inX[i]) badX++;
+    printf("  kernelX3(null+v0) mismatches=%u (out[9]=%g expect %g)\n", badX,
+           gotX3.size()==N?gotX3[9]:-1, inX[9]);
+    CHECK(gotX3.size()==N && badX==0, "kernel X3 computes null(0) + a0 = a0");
+
+    // Kernel X4: VCC as plain scalar SCRATCH (the NGG-preamble pattern: a scalar write to vcc_lo
+    // then a data read of it). s_mov_b32 vcc_lo, 5 ; v_add_nc_u32 v1, vcc_lo, v0 => out = a0 + 5.
+    // The tracked write must be read back (not 0, not rejected).
+    const uint32_t codeX4[] = { 0xBEEA0385u, 0x4A02006Au, 0xBF810000u };
+    std::vector<uint32_t> spvX4 = recompile_valu(codeX4, 3, 1, /*out_vgpr*/1);
+    CHECK(!spvX4.empty(), "kernel X4 (scalar-written vcc_lo read as data) recompiles");
+    std::vector<float> gotX4 = prosper::test::run_compute(spvX4, inX, N, N);
+    uint32_t badX4 = 0;   // integer add on raw VGPR bits: out bits = bits(a0) + 5
+    for (uint32_t i = 0; i < N && gotX4.size() == N; i++) {
+        uint32_t gb; std::memcpy(&gb, &gotX4[i], 4);
+        if (gb != bits_of(inX[i]) + 5u) badX4++;
+    }
+    printf("  kernelX4(vcc scratch) mismatches=%u\n", badX4);
+    CHECK(gotX4.size()==N && badX4==0, "kernel X4 computes bits(a0) + vcc_lo(5) via the tracked scalar write");
+
+    // Kernel O: VOP2 v_mul_f32 in SDWA form with OMOD ×2 output modifier. This was a #121 blocker —
+    // PPSA02664's pixel shaders emit `v_mul_f32 v,v,v mul:2` (full-DWORD selects, omod=×2), which the
+    // decoder rejected as an unhandled modifier, failing the whole PS. Now the ×2 is applied.
+    //   w0=0x100002f9 (op 0x08, dst v0, vsrc1 v1, src0=0xF9=SDWA), w1=0x06064600 (dst/s0/s1 sel=DWORD, omod=1)
+    //   => out = (a0 * a1) * 2
+    const uint32_t codeO[] = { 0x100002f9u, 0x06064600u, 0xBF810000u };
+    std::vector<uint32_t> spvO = recompile_valu(codeO, sizeof(codeO)/sizeof(codeO[0]), 2, 0);
+    CHECK(!spvO.empty(), "recompiled v_mul_f32 SDWA omod:2 -> SPIR-V (no longer rejected)");
+    std::vector<float> inO(N * 2), expO(N);
+    for (uint32_t i = 0; i < N; i++) {
+        float a0 = (float)i * 0.1f - 3.0f, a1 = 1.25f;
+        inO[i*2+0] = a0; inO[i*2+1] = a1; expO[i] = (a0 * a1) * 2.0f;
+    }
+    std::vector<float> gotO = prosper::test::run_compute(spvO, inO, N, N);
+    uint32_t badO = 0; for (uint32_t i=0;i<N&&gotO.size()==N;i++) if (std::fabs(gotO[i]-expO[i])>1e-3f) badO++;
+    printf("  kernelO(omod:2) mismatches=%u (out[20]=%g expect=%g)\n", badO, gotO.size()==N?gotO[20]:-1, expO[20]);
+    CHECK(gotO.size()==N && badO==0, "v_mul_f32 SDWA omod:2 doubles the product: out = (a0*a1)*2");
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");

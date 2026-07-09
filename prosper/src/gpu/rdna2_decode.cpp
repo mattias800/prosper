@@ -74,8 +74,12 @@ void decode_operands(Rdna2Inst& i) {
                 // no SEXT(bit19/27) or reserved(bit22/30) — i.e. mask out neg/abs (0x6) from the nibble check.
                 i.src_neg[0] = ((sd >> 20) & 1u) != 0; i.src_abs[0] = ((sd >> 21) & 1u) != 0;
                 i.src_neg[1] = ((sd >> 28) & 1u) != 0; i.src_abs[1] = ((sd >> 29) & 1u) != 0;
+                // Output modifiers CLAMP@13 / OMOD@[15:14] (×2/×4/×0.5) — the recompiler applies these to the
+                // float result (like VOP3), so they no longer force rejection. Only real sub-dword selects
+                // (dst/src != DWORD=6) or SEXT/reserved keep has_modifier. (PPSA02664 PS: v_mul_f32 ×2, #121.)
+                i.clamp = ((sd >> 13) & 1u) != 0; i.omod = (uint8_t)((sd >> 14) & 3u);
                 if (((sd >> 8) & 7u) == 6u && ((sd >> 16) & 7u) == 6u && ((sd >> 24) & 7u) == 6u &&
-                    !((sd >> 13) & 1u) && !((sd >> 14) & 3u) && !((sd >> 19) & 0x9u) && !((sd >> 27) & 0x9u))
+                    !((sd >> 19) & 0x9u) && !((sd >> 27) & 0x9u))
                     i.has_modifier = false;
             } else { i.src[0] = decode_src_field(w & 0x1FFu); i.src[1] = vgpr(w >> 9); i.n_src = 2; }
             break;
@@ -139,15 +143,21 @@ void decode_operands(Rdna2Inst& i) {
             for (int k = 0; k < 4; k++) i.src[k] = vgpr((d1 >> (8 * k)) & 0xFFu);
             i.n_src = 4; break;
         }
-        case Rdna2Format::SMEM:
+        case Rdna2Format::SMEM: {
             // Scalar memory load. opcode[25:18]; SDATA (dest SGPR) [12:6]; SBASE (SGPR *pair*, field
-            // is the pair index so ×2) [5:0]; 21-bit immediate byte OFFSET in dword1[20:0] (stored in
-            // `literal`). Register-offset (SOFFSET) and buffer descriptors are not decoded yet.
+            // is the pair index so ×2) [5:0]. Address = SBASE + SOFFSET-reg + OFFSET, where dword1[20:0]
+            // is a SIGNED 21-bit immediate byte OFFSET (stored sign-extended in `literal`) and
+            // dword1[31:25] is the 7-bit SOFFSET register field (125 = NULL = immediate-only). Both are
+            // decoded now (#149): SOFFSET into src[1] so a register-offset load can be recognized (and
+            // rejected until supported) instead of silently translating with the immediate alone.
             i.opcode = (w >> 18) & 0xFFu;
             i.dst    = sgpr(w >> 6);                 // SDATA
             i.src[0] = sgpr((w & 0x3Fu) << 1);       // SBASE (pair base)
-            i.literal = i.words[1] & 0x1FFFFFu;       // immediate byte offset (not a trailing constant)
-            i.n_src = 1; break;
+            uint32_t off21 = i.words[1] & 0x1FFFFFu;
+            i.literal = (off21 & 0x100000u) ? (off21 | 0xFFE00000u) : off21;   // sign-extend bit 20
+            i.src[1] = decode_src_field((i.words[1] >> 25) & 0x7Fu);           // SOFFSET (125 = NULL)
+            i.n_src = 2; break;
+        }
         case Rdna2Format::MUBUF: {
             // Untyped buffer op. opcode[24:18]; VDATA (dest/src VGPR) d1[15:8]; VADDR d1[7:0];
             // SRSRC (V# descriptor base SGPR, field ×4) d1[20:16]; SOFFSET d1[31:24]. 12-bit inst

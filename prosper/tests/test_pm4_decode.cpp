@@ -52,7 +52,7 @@ int main() {
     p_adr(rc, 0xCAFEF00DDEADBEEFull, 0, 0, 0, 0);                 // rewrite the regs vaddr
     draw(D, /*index_count*/ 0x1234, 0, 0, 0, 0);
     drawi(D, /*index_count*/ 0x0600, /*indices*/ 0xDEAD0000BEEF0040ull, /*modifier*/ 0x40000000ull, 0, 0);
-    evt(D, /*event_type*/ 0x42, 0, 0, 0, 0);
+    evt(D, /*event_type*/ 0x42, /*address*/ 0x1400ABCD00ull, 0, 0, 0);
 
     size_t used_dw = (size_t)(dcb.cursor_up - dcb.bottom);
     printf("  built %zu dwords\n", used_dw);
@@ -82,6 +82,9 @@ int main() {
     CHECK(ops[4].di_modifier == 0x40000000ull && ops[4].di_valid, "op4 modifier round-trips (valid)");
 
     CHECK(ops[5].kind == K::EventWrite && ops[5].event_type == 0x42, "op5 = EventWrite(0x42)");
+    // Address-carrying EVENT_WRITE (#132): the widened packet now round-trips its destination
+    // address (was discarded, so an address-carrying event lost its write target).
+    CHECK(ops[5].event_addr == 0x1400ABCD00ull, "op5 EventWrite address round-trips (was dropped)");
 
     // Every decoded packet's len must match its header, and the payload pointer must be in-buffer.
     bool spans_ok = true;

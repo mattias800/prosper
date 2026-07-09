@@ -166,6 +166,30 @@ namespace {
                 if (!best || m.base > best->base) best = &m;   // most specific (latest overlay)
         return best;
     }
+    // Is [base, base+len) entirely covered by our OWN UNCOMMITTED (PROT_NONE reservation) mappings?
+    // Only then is a MAP_FIXED replace safe: the guest is committing a range it reserved (#137). A
+    // committed span (live guest memory) or a gap (an untracked host mapping / loaded image) means a
+    // MAP_FIXED would silently destroy it — so map_at/map_phys_at must fail instead. Walks boundary to
+    // boundary (not page by page) so a 512 GiB reservation is checked in a few steps.
+    bool range_is_free_reservation(uint64_t base, uint64_t len) {
+        if (!len) return false;
+        std::lock_guard<std::mutex> lk(g_mx);
+        uint64_t cur = base, end = base + len;
+        while (cur < end) {
+            const Mapping* cover = nullptr;      // most-specific mapping containing cur
+            uint64_t next_start = end;           // nearest mapping that STARTS after cur (a coverage gap boundary)
+            for (auto& m : g_maps) {
+                uint64_t me = m.base + m.size;
+                if (cur >= m.base && cur < me) { if (!cover || m.base > cover->base) cover = &m; }
+                else if (m.base > cur && m.base < next_start) next_start = m.base;
+            }
+            if (!cover || cover->committed) return false;   // gap (untracked) or committed = unsafe to replace
+            uint64_t adv = cover->base + cover->size;
+            if (next_start < adv) adv = next_start;         // don't skip a mapping that starts inside `cover`
+            cur = adv;
+        }
+        return true;
+    }
     // Smallest mapping base strictly greater than addr (0 if none) — for hole reporting.
     uint64_t next_base(uint64_t addr) {
         std::lock_guard<std::mutex> lk(g_mx);
@@ -185,9 +209,21 @@ namespace {
     }
     uint64_t align_up(uint64_t v, uint64_t a) { return a ? (v + a - 1) & ~(a - 1) : v; }
     void* map_at(uint64_t hint, uint64_t len, int prot) {
-        int flags = MAP_PRIVATE | MAP_ANONYMOUS | (hint ? MAP_FIXED : 0);
-        void* p = mmap((void*)hint, len, prot, flags, -1, 0);
-        return p == MAP_FAILED ? nullptr : p;
+        if (!hint) {
+            void* p = mmap(nullptr, len, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            return p == MAP_FAILED ? nullptr : p;
+        }
+        // Non-zero hint: claim it WITHOUT clobbering (#137). MAP_FIXED_NOREPLACE fails if anything
+        // is already there; only if the occupant is entirely our own uncommitted reservation do we
+        // replace it with MAP_FIXED (the guest is committing a range it reserved). A hint that
+        // overlaps a committed mapping or an untracked host mapping fails instead of destroying it.
+        void* p = mmap((void*)hint, len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        if (p != MAP_FAILED) return p;
+        if (range_is_free_reservation(hint, len)) {
+            p = mmap((void*)hint, len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+            return p == MAP_FAILED ? nullptr : p;
+        }
+        return nullptr;
     }
 
     // The direct-memory pool is backed by ONE shared memfd so every mapping of a phys offset
@@ -220,8 +256,22 @@ namespace {
     void* map_phys_at(uint64_t hint, uint64_t len, int prot, uint64_t phys) {
         int fd = dmem_fd();
         if (fd >= 0 && phys < kDmemBase + kDmemTotal) {
-            void* p = mmap((void*)hint, len, prot, MAP_SHARED | (hint ? MAP_FIXED : 0), fd, (off_t)phys);
-            if (p != MAP_FAILED) return p;
+            if (!hint) {
+                void* p = mmap(nullptr, len, prot, MAP_SHARED, fd, (off_t)phys);
+                if (p != MAP_FAILED) return p;
+            } else {
+                // Same no-clobber discipline as map_at (#137): NOREPLACE first, MAP_FIXED replace
+                // only over our own uncommitted reservation, else refuse rather than destroy a live
+                // (committed / untracked) mapping — the exact clobber class of issues #88 / #107.
+                void* p = mmap((void*)hint, len, prot, MAP_SHARED | MAP_FIXED_NOREPLACE, fd, (off_t)phys);
+                if (p != MAP_FAILED) return p;
+                if (range_is_free_reservation(hint, len)) {
+                    p = mmap((void*)hint, len, prot, MAP_SHARED | MAP_FIXED, fd, (off_t)phys);
+                    if (p != MAP_FAILED) return p;
+                } else {
+                    return nullptr;
+                }
+            }
         }
         return map_at(hint, len, prot);
     }

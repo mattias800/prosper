@@ -494,11 +494,18 @@ struct SpirvCompute {
         put(code, Op_Label, {merge}); cur_block = merge;
     }
     // LDS (Local Data Share) — a workgroup-shared u32 array for compute ds_read/ds_write. Declared on
-    // first use. 4096 dwords (16 KB, the RDNA2 per-workgroup LDS size).
+    // first use, sized to `lds_dwords`. RDNA2's per-workgroup LDS MAX is 64 KB (16384 dwords); the real
+    // per-shader allocation is COMPUTE_PGM_RSRC2.LDS_SIZE. `lds_dwords` defaults to 4096 (16 KB) — a
+    // shader whose real allocation exceeds that would ds_read/write past the array (OOB Workgroup
+    // access, UB — NOT covered by robustBufferAccess), so recompile_valu raises it from the plumbed
+    // size when known (#130). Kept at 16 KB by default because it must also stay within the target
+    // device's VkPhysicalDeviceLimits::maxComputeSharedMemorySize (e.g. llvmpipe = 32 KB), so we can't
+    // just declare the full 64 KB unconditionally.
+    uint32_t lds_dwords = 4096;
     uint32_t lds_var = 0, t_ptr_wg_u32 = 0;
     void declare_lds() {
         if (lds_var) return;
-        uint32_t len = uconst(4096);
+        uint32_t len = uconst(lds_dwords);
         uint32_t t_arr = id();        put(types, Op_TypeArray, {t_arr, t_u32, len});
         uint32_t t_ptr_wg_arr = id(); put(types, Op_TypePointer, {t_ptr_wg_arr, SC_Workgroup, t_arr});
         lds_var = id();               put(types, Op_Variable, {t_ptr_wg_arr, lds_var, SC_Workgroup});
@@ -987,7 +994,10 @@ struct ForwardIf {
 // per-vertex / per-pixel divergent-if the hardware runs. The 64-lane COMPUTE shell must NOT (its VCC is a
 // wave mask needing a wave-uniform reduce — test_recompile_coverage guards this), so it leaves allow_vcc
 // false and vcc branches fall through to straight-line (which rejects them).
-ForwardIf detect_forward_if(const std::vector<Rdna2Inst>& ins, bool allow_vcc) {
+// code/dwords: the raw stream, so a branch target past the first s_endpgm can be decoded and
+// verified to be a genuine early-out (see below) instead of blanket-clamped.
+ForwardIf detect_forward_if(const std::vector<Rdna2Inst>& ins, bool allow_vcc,
+                            const uint32_t* code, size_t dwords) {
     ForwardIf F; const Rdna2Inst* br = nullptr; int nbranch = 0; uint32_t end_pc = UINT32_MAX;
     for (const auto& in : ins) if (in.is_end) { end_pc = in.pc; break; }
     for (const auto& in : ins) {
@@ -1006,11 +1016,27 @@ ForwardIf detect_forward_if(const std::vector<Rdna2Inst>& ins, bool allow_vcc) {
     }
     if (nbranch != 1 || !br) return F;
     uint32_t tgt = branch_target(*br);
-    // Early-out: a forward branch to the instruction AFTER s_endpgm skips the rest of the shader. Clamp the
-    // merge to end_pc so the conditional block is [branch_pc+1, end_pc) (the skipped work) and s_endpgm is
-    // emitted normally after the merge — the exact "if (cond) { work } end" early-out shape.
+    // Early-out: a forward branch PAST s_endpgm skips the rest of the shader — but only if execution
+    // at the target immediately terminates. Decode from tgt and require the first non-s_nop
+    // instruction to be s_endpgm (the compiled early-out shape `s_cbranch L; work; s_endpgm;
+    // L: s_endpgm`). Anything else is REAL reachable code (an else-block) that the old blanket clamp
+    // silently discarded — valid SPIR-V, wrong semantics (#129) — so reject instead (the caller's
+    // straight-line fallback also rejects the branch, loudly). When verified, clamp the merge to
+    // end_pc so the conditional block is [branch_pc+1, end_pc) and s_endpgm is emitted after the merge.
     bool early = false;
-    if (tgt > end_pc && tgt != UINT32_MAX) { tgt = end_pc; early = true; }
+    if (tgt > end_pc && tgt != UINT32_MAX) {
+        if (!code || tgt >= dwords) return F;    // target outside the decode window: can't verify
+        std::vector<Rdna2Inst> tail;
+        rdna2_walk(code + tgt, dwords - tgt, tail);
+        bool ends_immediately = false;
+        for (const auto& ti : tail) {
+            if (ti.is_end) { ends_immediately = true; break; }
+            if (ti.fmt == Rdna2Format::SOPP && ti.opcode == 0x00) continue;   // s_nop padding
+            break;                               // real instruction at the target -> not an early-out
+        }
+        if (!ends_immediately) return F;
+        tgt = end_pc; early = true;
+    }
     if (tgt <= br->pc || tgt > end_pc) return F;                     // must be forward, within the stream
     F.found = true; F.branch_pc = br->pc; F.target_pc = tgt; F.early_out = (early || tgt == end_pc);
     F.on_scc0 = (br->opcode == 0x04 || br->opcode == 0x06);         // scc0/vccz: skip block when flag==0
@@ -1056,14 +1082,34 @@ void loop_written_regs(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t 
 }
 
 // Resolve an operand to its raw 32-bit value (bits). Float ops bitcast these to float.
-uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, const Operand& o) {
+// `ok`: cleared when the operand's VALUE is not representable — a Special operand read as ALU DATA
+// (VCC/EXEC live as per-lane bools in rs.vcc/rs.exec; their 32-bit wave-mask value does not exist
+// in the per-invocation model, and M0/SCC/ttmp aren't modeled at all). Only SGPR_NULL (field 125)
+// has a defined value, 0. Previously every Special silently read as 0 and the shader computed
+// garbage (#134); now it rejects, matching the SDWA/DPP reject-rather-than-miscompute discipline.
+uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, const Operand& o, bool* ok = nullptr) {
     switch (o.kind) {
         case OperandKind::VGPR: { auto it = rs.vreg.find(o.value); return it == rs.vreg.end() ? b.uconst(0) : it->second; }
         case OperandKind::SGPR: { auto it = rs.sreg.find(o.value); return it == rs.sreg.end() ? b.uconst(0) : it->second; }
         case OperandKind::InlineInt:   return b.uconst((uint32_t)o.value);
         case OperandKind::InlineFloat: return b.uconst(fbits(inline_float_value((uint32_t)o.value)));
         case OperandKind::Literal:     return b.uconst(in.literal);
-        default: return b.uconst(0);
+        case OperandKind::Special:
+            if (o.value == 125) return b.uconst(0);   // SGPR_NULL: the one Special whose data value IS 0
+            // VCC_LO/HI (106/107) and ttmp0..15 (108..123) double as plain scalar SCRATCH in compiled
+            // code — the NGG preamble does `s_bfe_u32 vcc_lo, s3, ...` then reads vcc back as data.
+            // A scalar write lands in rs.sreg[o.value] (the DST field decodes as SGPR); read it back
+            // from there. Only an UNTRACKED read (a VOPC-produced mask, EXEC, M0, SCC) has no
+            // representable per-invocation data value.
+            if (o.value >= 106 && o.value <= 123) {
+                auto it = rs.sreg.find(o.value);
+                if (it != rs.sreg.end()) return it->second;
+            }
+            if (ok) *ok = false;
+            return b.uconst(0);
+        default:
+            if (ok) *ok = false;
+            return b.uconst(0);
     }
 }
 
@@ -1074,7 +1120,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
               const std::unordered_set<uint32_t>* safe_execz = nullptr, bool allow_smem = false,
               const ShaderResourceTable* rt = nullptr, bool allow_wave = false) {
     auto& vreg = rs.vreg; uint32_t& vcc = rs.vcc;
-    auto val = [&](const Operand& o) { return operand_bits(b, rs, in, o); };
+    auto val = [&](const Operand& o) { return operand_bits(b, rs, in, o, &ok); };
     // SDWA/DPP forms carry a sub-dword select or cross-lane control word we don't model. The decoder
     // flags them (and gets their length right); reject here rather than compute with a wrong operand.
     if (in.has_modifier) { ok = false; return true; }
@@ -1400,6 +1446,23 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x2F: d = b.pack_half2x16(a, c); break;          // v_cvt_pkrtz_f16_f32 (e32 form)
                 default: ok = false;
             }
+            // SDWA output modifier: OMOD scale (×2/×4/×0.5) then CLAMP saturate, on FLOAT-result opcodes
+            // only (int ops never carry omod). Mirrors the VOP3 fresult path; a no-op when omod/clamp unset.
+            if (ok && (in.omod || in.clamp)) switch (in.opcode) {
+                case 0x03: case 0x04: case 0x08: case 0x0F: case 0x10:
+                case 0x1F: case 0x2B: case 0x20: case 0x2C: case 0x21: case 0x2D:
+                    if      (in.omod == 1) d = b.fbin(Op_FMul, d, b.uconst(fbits(2.0f)));
+                    else if (in.omod == 2) d = b.fbin(Op_FMul, d, b.uconst(fbits(4.0f)));
+                    else if (in.omod == 3) d = b.fbin(Op_FMul, d, b.uconst(fbits(0.5f)));
+                    if (in.clamp) d = b.fext2(Glsl_FMax, b.fext2(Glsl_FMin, d, b.uconst(fbits(1.0f))), b.uconst(fbits(0.0f)));
+                    break;
+                // A non-float-result opcode carrying a modifier (e.g. an INTEGER SDWA op with CLAMP =
+                // integer saturation) is not modeled by the float-domain omod/clamp above, so applying
+                // nothing would SILENTLY drop the saturation and emit a valid-but-wrong shader. Reject
+                // loudly instead — the same fail-visibly-over-miscompile discipline as the forward-if
+                // clamp (#129/#174). The guard means this only fires for a modifier-carrying op.
+                default: ok = false; break;
+            }
             if (ok) predicate_write(b, rs, in.dst.value, old_d);
             return true;
         }
@@ -1663,22 +1726,31 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x2: case 0xA: n = 4;  break;   // s_load_dwordx4   / s_buffer_load_dwordx4
                 case 0x3: case 0xB: n = 8;  break;   // s_load_dwordx8   / s_buffer_load_dwordx8
                 case 0x4: case 0xC: n = 16; break;   // s_load_dwordx16  / s_buffer_load_dwordx16
-                default: ok = false; return true;    // register-offset / stores / others not yet
+                default: ok = false; return true;    // stores / others not yet
             }
+            // Register SOFFSET (src[1] not the NULL sentinel) adds an SGPR-computed byte offset we don't
+            // model — reject rather than translate with the immediate alone (#149). Immediate-only loads
+            // encode SOFFSET = SGPR_NULL (125). A negative signed immediate can't index a constant
+            // buffer (dword index would wrap), so reject that too.
+            if (!(in.src[1].kind == OperandKind::Special && in.src[1].value == 125)) { ok = false; return true; }
+            if ((int32_t)in.literal < 0) { ok = false; return true; }
             uint32_t base_idx = in.literal >> 2;    // immediate byte offset -> dword index
             // Descriptor provenance: pick which bound constant buffer via the resource table, routing this
             // load to that buffer's OWN binding (N-buffer model) — so Unity's several constant buffers
             // (per-draw transform, per-frame, …) don't collapse onto one. For s_buffer_load, SBASE
             // (src[0]) is the V#: resolve it by an earlier s_load's SRT tag (indirect) or directly by its
             // user-data SGPR index (the V# was placed in SGPRs by the driver). Default binding 2.
-            uint32_t binding = 2;
+            uint32_t binding = 2; bool cbuf_resolved = false;
             if (rt) { const ShaderResource* res = nullptr;
                 auto it = rs.sreg_srt.find(in.src[0].value);
                 if (it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second);
                 // A scalar buffer load reads a CONSTANT buffer — resolve the SBASE SGPR to a constant
                 // buffer specifically (the same SGPR may also hold a vertex-buffer V# elsewhere).
                 if (!res) res = rt->by_sgpr_base_cls(in.src[0].value, ResourceClass::ConstantBuffer);
-                if (res) binding = res->binding; }
+                if (res) { binding = res->binding; cbuf_resolved = true; } }
+            if (getenv("PROSPER_CBUFLOG"))
+                fprintf(stderr, "[cbuf] s_buffer_load x%u src0=s%d off=0x%x(dw%u) -> binding=%u %s\n",
+                        n, in.src[0].value, in.literal, base_idx, binding, cbuf_resolved ? "resolved" : "DEFAULT-2");
             for (uint32_t k = 0; k < n; k++)
                 rs.sreg[in.dst.value + (int)k] = b.cbuf_load(b.uconst(base_idx + k), binding);
             // A wide scalar load is a descriptor fetch — tag its dest SGPRs with the SRT offset so a
@@ -1780,11 +1852,33 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // Integer sub-dword formats (Uint8/Sint8/Uint16/Sint16) aren't normalized floats and would
             // need an integer-attribute path; reject rather than mis-normalize.
             if (packed && !is_half && norm == 0.0f) { ok = false; return true; }
-            // Byte address of the element: idxen -> VADDR is an element index (×stride); offen -> VADDR
-            // is a byte offset; plus the inst offset and SOFFSET. dword index = addr>>2.
+            // Packed (sub-dword) components are extracted at STATIC byte offsets relative to a
+            // DWORD-ALIGNED element base — the low 2 bits of the address (addr&3) are dropped by the
+            // addr>>2 dword index and never folded into the bit extraction (#150). That is only correct
+            // when the element base is provably 4-byte aligned; otherwise a component (a half2 UV after
+            // a snorm16x3 normal, an unorm8 at a byte offset) decodes the wrong bits. A fully general
+            // fix needs a runtime bit position that can straddle dwords; until then, prove alignment
+            // from the address terms and REJECT the packed load/store when it can't be proven (surfacing
+            // the gap) rather than silently mis-decode. Aligned iff: inst offset %4==0; stride %4==0
+            // when idxen; no offen (a runtime per-lane byte offset is unprovable); SOFFSET is NULL/0.
+            if (packed) {
+                bool soff_zero = (in.src[2].kind == OperandKind::Special && in.src[2].value == 125) ||
+                                 (in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0);
+                bool base_aligned = ((offset & 3u) == 0) && !offen &&
+                                    (!idxen || (stride & 3u) == 0) && soff_zero;
+                if (!base_aligned) { ok = false; return true; }
+            }
+            // Byte address of the element (#148): idxen -> a VADDR VGPR is an element index (×stride);
+            // offen -> a VADDR VGPR is a per-lane byte offset; both terms ADD (were mutually exclusive,
+            // silently dropping the byte offset when both were set). When idxen AND offen are set, VADDR
+            // is TWO consecutive VGPRs — [0] = index (in.src[0]), [1] = byte offset (in.src[0]+1). Plus
+            // the inst offset and SOFFSET. dword index = addr>>2.
             uint32_t addr = b.uconst(offset);
             if (idxen && stride) addr = b.ibin(Op_IAdd, addr, b.ibin(Op_IMul, val(in.src[0]), b.uconst(stride)));
-            else if (offen)      addr = b.ibin(Op_IAdd, addr, val(in.src[0]));
+            if (offen) {
+                Operand off_vgpr{ OperandKind::VGPR, idxen ? in.src[0].value + 1 : in.src[0].value };
+                addr = b.ibin(Op_IAdd, addr, val(off_vgpr));
+            }
             addr = b.ibin(Op_IAdd, addr, val(in.src[2]));              // SOFFSET
             uint32_t idx = b.ibin(Op_ShiftRightLogical, addr, b.uconst(2));
             if (is_store) {
@@ -1981,7 +2075,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
 bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt,
                bool allow_exec_update, bool allow_smem,
-               const std::function<bool(const Rdna2Inst&)>& exp_fn) {
+               const std::function<bool(const Rdna2Inst&)>& exp_fn,
+               const uint32_t* code = nullptr, size_t dwords = 0) {   // raw stream (forward-if target check)
     const CountedLoop L = detect_counted_loop(ins);
     size_t idx = 0;
     // Cross-lane wave ops (mbcnt) emit LDS + barriers, which are only valid at wave-uniform points — so
@@ -2068,7 +2163,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         }
         // 7. Post-loop body.
         if (!emit_range(L.exit_pc, UINT32_MAX)) return false;
-    } else if (const ForwardIf F = detect_forward_if(ins, /*allow_vcc*/!b.is_compute); F.found) {
+    } else if (const ForwardIf F = detect_forward_if(ins, /*allow_vcc*/!b.is_compute, code, dwords); F.found) {
         // Single structured uniform IF (forward s_cbranch_scc0/scc1): emit as OpSelectionMerge +
         // OpBranchConditional on the SCC bool, with an OpPhi per register written in the conditional
         // block that is live after the merge. Parallels the loop path's phi machinery. CONFIDENCE: MED —
@@ -2119,17 +2214,23 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
 
 std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
                                      uint32_t num_inputs, uint32_t out_vgpr,
-                                     const ShaderResourceTable* rt) {
+                                     const ShaderResourceTable* rt, uint32_t lds_bytes) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
     SpirvCompute b;
+    // Size the LDS array from the shader's real allocation when known (#130): bytes -> dwords, at
+    // least the ds ops need, clamped to the RDNA2 64 KB (16384-dword) max. 0 keeps the 16 KB default.
+    if (lds_bytes) {
+        uint32_t dw = (lds_bytes + 3) / 4;
+        b.lds_dwords = dw > 16384u ? 16384u : (dw ? dw : 1u);
+    }
     b.begin(num_inputs ? num_inputs : 1);
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
     auto safe_branches = safe_execz_branches(ins);
     for (uint32_t k = 0; k < num_inputs; k++) rs.vreg[(int)k] = b.load_input(k);
     // Compute kernels have no EXP output; reject if one appears.
     if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/true, /*allow_smem*/true,
-                   [](const Rdna2Inst&){ return false; })) return {};
+                   [](const Rdna2Inst&){ return false; }, code, dwords)) return {};
     auto it = rs.vreg.find((int)out_vgpr);
     uint32_t outbits = it == rs.vreg.end() ? b.uconst(0) : it->second;
     // If EXEC is still narrowed (a v_cmpx with no restore), masked-off lanes keep the output slot's prior
@@ -2152,7 +2253,7 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
     // back-edge + exit, and the forward-if branch) as handled, so coverage matches what actually recompiles
     // (previously the MSAA-resolve loop shaders 031-034 were mis-flagged "blocked" at their s_cbranch_scc0).
     const CountedLoop cL = detect_counted_loop(ins);
-    const ForwardIf   cF = detect_forward_if(ins, /*allow_vcc*/false);   // conservative diagnostic (compute-safe)
+    const ForwardIf   cF = detect_forward_if(ins, /*allow_vcc*/false, code, dwords);   // conservative diagnostic (compute-safe)
     auto cf_reconstructed = [&](const Rdna2Inst& i) {
         if (cL.found && (i.pc == cL.backedge_pc || i.pc == cL.exit_branch_pc)) return true;
         if (cF.found && i.pc == cF.branch_pc) return true;
@@ -2219,16 +2320,18 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords, co
         // was never narrowed this is a no-op — the common sRGB/tonemap restore-then-export path.)
         if (rs.exec_narrowed) { b.discard_unless(rs.exec); rs.exec = b.btrue(); rs.exec_narrowed = false; }
         if (in.exp_target <= 7 && !exported) {
+            bool eok = true;   // a Special (wave-mask) source has no data value — reject, don't export 0 (#134)
             if (in.exp_compr) {
                 // COMPR: the 4 channels are two f16x2 pairs — src[0] holds (r,g), src[1] holds (b,a).
                 // Unpack each half to a float and reassemble the vec4 (the pkrtz'd tonemap/sRGB output).
-                uint32_t p0 = operand_bits(b, rs, in, in.src[0]), p1 = operand_bits(b, rs, in, in.src[1]);
+                uint32_t p0 = operand_bits(b, rs, in, in.src[0], &eok), p1 = operand_bits(b, rs, in, in.src[1], &eok);
                 b.export_color(b.unpack_half(p0, 0), b.unpack_half(p0, 1),
                                b.unpack_half(p1, 0), b.unpack_half(p1, 1));
             } else {
-                b.export_color(operand_bits(b, rs, in, in.src[0]), operand_bits(b, rs, in, in.src[1]),
-                               operand_bits(b, rs, in, in.src[2]), operand_bits(b, rs, in, in.src[3]));
+                b.export_color(operand_bits(b, rs, in, in.src[0], &eok), operand_bits(b, rs, in, in.src[1], &eok),
+                               operand_bits(b, rs, in, in.src[2], &eok), operand_bits(b, rs, in, in.src[3], &eok));
             }
+            if (!eok) return false;
             exported = true;
         }
         return true;   // ignore NULL / additional exports for now
@@ -2236,7 +2339,7 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords, co
     // cmpx is now ALLOWED (allow_exec_update=true): a fragment divergent-if (v_cmpx ... s_mov exec,saved)
     // is handled by EXEC predication like compute, and the export is guarded above. Memory ops need a
     // resource table. Loops (if any) are reconstructed by emit_body.
-    if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/true, /*allow_smem*/rt != nullptr, exp_fn)) return {};
+    if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/true, /*allow_smem*/rt != nullptr, exp_fn, code, dwords)) return {};
     if (!exported) return {};
     return b.finish();
 }
@@ -2260,17 +2363,18 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords, cons
     if (ngg) rs.vreg[5] = vidx;              // NGG VS ABI: v5 = vertex index
     bool exported = false;
     auto exp_fn = [&](const Rdna2Inst& in) -> bool {         // EXP POS0..3 -> gl_Position; PARAM -> varyings
+        bool eok = true;   // a Special (wave-mask) source has no data value — reject, don't export 0 (#134)
         if (in.exp_target >= 12 && in.exp_target <= 15 && !exported) {
-            b.export_position(operand_bits(b, rs, in, in.src[0]), operand_bits(b, rs, in, in.src[1]),
-                              operand_bits(b, rs, in, in.src[2]), operand_bits(b, rs, in, in.src[3]));
+            b.export_position(operand_bits(b, rs, in, in.src[0], &eok), operand_bits(b, rs, in, in.src[1], &eok),
+                              operand_bits(b, rs, in, in.src[2], &eok), operand_bits(b, rs, in, in.src[3], &eok));
             exported = true;
         } else if (in.exp_target >= 32) {                    // PARAM0.. -> Output varying (location N)
-            b.export_param(in.exp_target - 32, operand_bits(b, rs, in, in.src[0]), operand_bits(b, rs, in, in.src[1]),
-                           operand_bits(b, rs, in, in.src[2]), operand_bits(b, rs, in, in.src[3]));
+            b.export_param(in.exp_target - 32, operand_bits(b, rs, in, in.src[0], &eok), operand_bits(b, rs, in, in.src[1], &eok),
+                           operand_bits(b, rs, in, in.src[2], &eok), operand_bits(b, rs, in, in.src[3], &eok));
         }
-        return true;
+        return eok;
     };
-    if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/false, /*allow_smem*/rt != nullptr, exp_fn)) return {};
+    if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/false, /*allow_smem*/rt != nullptr, exp_fn, code, dwords)) return {};
     if (!exported) return {};
     return b.finish();
 }

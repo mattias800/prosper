@@ -4,6 +4,7 @@
 // libkernel registration/hook calls must resolve to a benign OK-returning no-op. Registered by raw
 // NID, so this looks them up by NID and exercises the output contract.
 #include "../src/hle/dispatch.hpp"
+#include "../src/hle/nid.hpp"
 #include <cstdio>
 #include <cstdint>
 
@@ -45,6 +46,30 @@ int main() {
         HleFn fn = Hle::lookup(nid);
         CHECK(fn != nullptr, nid);
         if (fn) CHECK(fn(0, 0, 0, 0, 0, 0) == 0, nid);
+    }
+
+    // Message-dialog lifecycle (#144): GetStatus must report NONE before an Open (the old handler
+    // returned FINISHED unconditionally, so a guest guarding on GetStatus saw "done" at the wrong
+    // stage). Transitions: Initialize -> INITIALIZED(1); Open -> FINISHED(3, auto-dismiss); Close ->
+    // NONE(0). Registered by name; look up the NIDs.
+    {
+        auto init   = Hle::lookup(nid_hash("sceMsgDialogInitialize"));
+        auto open   = Hle::lookup(nid_hash("sceMsgDialogOpen"));
+        auto close  = Hle::lookup(nid_hash("sceMsgDialogClose"));
+        auto status = Hle::lookup(nid_hash("sceMsgDialogGetStatus"));
+        auto upd    = Hle::lookup(nid_hash("sceMsgDialogUpdateStatus"));
+        CHECK(init && open && close && status && upd, "MsgDialog lifecycle functions registered");
+        if (init && open && close && status && upd) {
+            close(0,0,0,0,0,0);   // reset to a known idle state
+            CHECK(status(0,0,0,0,0,0) == 0, "GetStatus before Initialize -> NONE(0) (was FINISHED)");
+            init(0,0,0,0,0,0);
+            CHECK(status(0,0,0,0,0,0) == 1, "after Initialize -> INITIALIZED(1)");
+            CHECK(upd(0,0,0,0,0,0) == 1, "UpdateStatus before Open also reports INITIALIZED, not FINISHED");
+            open(0,0,0,0,0,0);
+            CHECK(status(0,0,0,0,0,0) == 3, "after Open -> FINISHED(3) (auto-dismiss)");
+            close(0,0,0,0,0,0);
+            CHECK(status(0,0,0,0,0,0) == 0, "after Close -> back to NONE(0)");
+        }
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }

@@ -34,6 +34,12 @@ struct Program {
     // the native PSN.prx plugin's PSN_PrxInitialize / UnityPluginLoad exports for Unity's plugin loader.
     std::unordered_map<std::string, uint64_t> exports;
 
+    // Per-module export tables (parallel to mods): the module's load path + its own NID -> guest
+    // address map. sceKernelDlsym resolves against the HANDLE'S module first (#147) — with only the
+    // global first-definition-wins table, two modules exporting the same NID alias to the first.
+    struct ModuleExports { std::string path; std::unordered_map<std::string, uint64_t> nids; };
+    std::vector<ModuleExports> mod_exports;
+
     // Stats for reporting.
     size_t total_imports = 0, resolved_cross_module = 0, stubbed = 0;
 };

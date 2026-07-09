@@ -116,6 +116,24 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     // robustBufferAccess: out-of-range storage-buffer accesses are well-defined, so a predicated memory
     // op run by an inactive lane (narrowed EXEC) can't fault.
     VkPhysicalDeviceFeatures feats{}; feats.robustBufferAccess = VK_TRUE; dci.pEnabledFeatures = &feats;
+    // robustImageAccess (VK_EXT_image_robustness; core in 1.3): the recompiled storage-image load
+    // path issues OpImageRead for ALL invocations — including EXEC-inactive lanes whose coordinates
+    // can be out of range — relying on OOB image reads returning zero (#131). This is the LIVE
+    // render backend (boot_trace registers render_draws_rgba as the submit renderer), so real game
+    // shaders run here on non-multiple image sizes. Feature-query guarded: a device without it
+    // still creates (visibly logged risk is preferable to failing device creation outright).
+    VkPhysicalDeviceImageRobustnessFeaturesEXT irf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES_EXT};
+    const char* img_robust_ext[] = { "VK_EXT_image_robustness" };
+    { uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(phys, nullptr, &ne, nullptr);
+      std::vector<VkExtensionProperties> de(ne);
+      vkEnumerateDeviceExtensionProperties(phys, nullptr, &ne, de.data());
+      for (uint32_t i = 0; i < ne; i++) if (!strcmp(de[i].extensionName, "VK_EXT_image_robustness")) {
+          VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+          f2.pNext = &irf; vkGetPhysicalDeviceFeatures2(phys, &f2);
+          if (irf.robustImageAccess) { dci.pNext = &irf;
+              dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = img_robust_ext; }
+          break;
+      } }
     VkDevice dev = VK_NULL_HANDLE;
     if (vkCreateDevice(phys, &dci, nullptr, &dev) != VK_SUCCESS || !dev) { vkDestroyInstance(inst, nullptr); return out; }
     VkQueue queue; vkGetDeviceQueue(dev, qfi, 0, &queue);
@@ -129,6 +147,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     // fixed attachment set); each draw's pipeline sets its own depthTest/Write/CompareOp. A frame with
     // no depth-using draw takes the color-only path unchanged.
     bool use_depth = false; for (const auto& d : draws) if (d.ps && d.ps->depth_test_enable) use_depth = true;
+    if (getenv("PROSPER_NO_DEPTH")) use_depth = false;   // diag: isolate depth-test rejection
     const VkFormat DFMT = VK_FORMAT_D32_SFLOAT;
     VkImage dimg = VK_NULL_HANDLE; VkDeviceMemory dmem = VK_NULL_HANDLE; VkImageView dview = VK_NULL_HANDLE;
 
@@ -247,6 +266,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         if (ps) {
             cba.colorWriteMask = ps->color_write_mask;
             cba.blendEnable    = ps->blend_enable ? VK_TRUE : VK_FALSE;
+            if (getenv("PROSPER_NO_BLEND")) cba.blendEnable = VK_FALSE;   // diag: isolate blend compositing
             cba.srcColorBlendFactor = (VkBlendFactor)ps->src_color_blend_factor;
             cba.dstColorBlendFactor = (VkBlendFactor)ps->dst_color_blend_factor;
             cba.colorBlendOp        = (VkBlendOp)ps->color_blend_op;
@@ -261,6 +281,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             dss.depthTestEnable  = VK_TRUE;
             dss.depthWriteEnable = ps->depth_write_enable ? VK_TRUE : VK_FALSE;
             dss.depthCompareOp   = (VkCompareOp)ps->depth_compare_op;
+            if (getenv("PROSPER_DEPTH_ALWAYS")) dss.depthCompareOp = VK_COMPARE_OP_ALWAYS;   // diag
         }
         // Descriptor resources for this draw (two-set: VS=set0, PS=set1 — same layout as the single path).
         v.R = bd.R; auto& R = v.R;
@@ -391,6 +412,12 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     clear[1].depthStencil = {0.5f, 0};   // depth cleared to 0.5 (fragments at z=0.0 pass LESS, fail GREATER)
     VkRenderPassBeginInfo rpbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rpbi.renderPass = rp; rpbi.framebuffer = fb; rpbi.renderArea = {{0, 0}, {W, H}}; rpbi.clearValueCount = use_depth ? 2 : 1; rpbi.pClearValues = clear;
+    if (getenv("PROSPER_PIPELOG")) {   // diag: how many draws' pipelines built + will be recorded
+        int nok = 0; for (auto& v : dv) if (v.ok) nok++;
+        fprintf(stderr, "[pipe] %zu draws, %d pipelines OK, use_depth=%d; counts:", dv.size(), nok, (int)use_depth);
+        for (auto& v : dv) fprintf(stderr, " %s%u", v.ok ? "" : "SKIP", v.icount ? v.icount : v.vcount);
+        fprintf(stderr, "\n");
+    }
     // ONE render pass (cleared once): record every realized draw with its own pipeline + descriptors.
     vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
     for (auto& v : dv) {

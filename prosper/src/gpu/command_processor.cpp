@@ -33,12 +33,15 @@ static bool eop_writes_disabled() {
     return off && off[0] == '1';
 }
 
-// A monotonic 64-bit "GPU clock" for RELEASE_MEM data_sel==3 (GpuClock64). Real hardware writes the GPU
-// timestamp; a strictly increasing counter has the property the game's poll needs (a later fence reads a
-// larger value). CONFIDENCE: MED — units differ from HW ticks, but monotonicity is what a >= poll checks.
-static uint64_t gpu_clock64() {
-    return (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count();
-}
+// A monotonic 64-bit "GPU clock" for RELEASE_MEM data_sel==3 (GpuClock64). On real hardware the GPU
+// EOP timestamp is the SAME counter the guest reads via sceKernelReadTsc (Kyty: GraphicsRender writes
+// KernelReadTsc() for the EOP timestamp; GetGpuCoreClockFrequency == GetTscFrequency), so we share
+// the guest TSC clock rather than a separate steady_clock (#156). It reports monotonic nanoseconds at
+// the 1 GHz that sceKernelGetTscFrequency advertises, so a guest that reads two fence timestamps and
+// divides the delta by the queried frequency gets real seconds — AND a GPU fence timestamp lies on the
+// same timeline as a CPU sceKernelReadTsc value (the old steady_clock had a disjoint epoch/period).
+extern "C" uint64_t prosper_guest_tsc_ns();   // hle_kernel_time.cpp — same source as sceKernelReadTsc
+static uint64_t gpu_clock64() { return prosper_guest_tsc_ns(); }
 
 // Honor a RELEASE_MEM / EVENT_WRITE_EOP completion write. data_sel (Kyty GraphicsCbReleaseMem allows {2,3};
 // shadPS4 DataSelect enum): 1=write 32-bit value, 2=write 64-bit value, 3=write 64-bit GPU clock. The write
@@ -75,6 +78,25 @@ static void honor_eop_write(const Pm4Command& c) {
         fprintf(stderr, "[agc]   EOP write [0x%llx] data_sel=%u value=0x%llx\n",
                 (unsigned long long)c.rel_addr, c.rel_data_sel, (unsigned long long)c.rel_value);
     wake_on_label(c.rel_addr);   // wake any sync_on_address futex waiter on this completion label
+}
+
+// Honor an address-carrying EVENT_WRITE (#132): the timestamp/label variant writes a completion
+// value to its address. Our GPU folds synchronously (submit == pipe drain), so by the time we
+// process this packet the event has "happened" — write a monotonic GPU clock (the value a timestamp
+// event carries) and wake any waiter, resolving the "a guest waiting on the label blocks forever"
+// case. Address-less events (event_addr == 0, the pipeline-sync variants: partial-flush, cache
+// inval) stay no-ops. CONFIDENCE: LOW on the value for the counter-sample event types
+// (ZPASS_DONE / streamout stats read a counter, not a timestamp) — but a defined monotonic write is
+// strictly better than the old discard (no write at all, which is what blocked the waiter). No title
+// currently exercises this (the Messenger fences via ReleaseMem/WriteData), so it's latent.
+static void honor_event_write(const Pm4Command& c) {
+    if (eop_writes_disabled() || !c.event_addr || (c.event_addr & 3)) return;
+    uint64_t v = gpu_clock64();
+    memcpy((void*)(uintptr_t)c.event_addr, &v, sizeof v);
+    if (getenv("PROSPER_GFXLOG"))
+        fprintf(stderr, "[agc]   EventWrite [0x%llx] event_type=%u -> clock 0x%llx\n",
+                (unsigned long long)c.event_addr, c.event_type, (unsigned long long)v);
+    wake_on_label(c.event_addr);   // wake any sync_on_address futex waiter on this completion label
 }
 
 // Honor a WRITE_DATA packet: copy the inline dwords to the destination address (same synchronous timing).
@@ -153,6 +175,9 @@ void GpuState::apply(const Pm4Command& c) {
             break;
         case K::WriteData:
             honor_write_data(c);    // inline data write requested by the Dcb
+            break;
+        case K::EventWrite:
+            honor_event_write(c);   // address-carrying (timestamp/label) EVENT_WRITE completion (#132)
             break;
         case K::WaitRegMem:
             // Synchronous fold: by the time we process this packet the CPU-side producer has
