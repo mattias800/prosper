@@ -52,23 +52,43 @@ HLE(k_mutexattr_init) {
     if (!a0) return 0x16; // EINVAL-ish
     auto* at = (pthread_mutexattr_t*)calloc(1, sizeof(pthread_mutexattr_t));
     pthread_mutexattr_init(at);
+    // A FRESH attr's type must be the FreeBSD/Sony DEFAULT — ERRORCHECK — not the host default
+    // (glibc: NORMAL). Kyty's PthreadMutexattrInit does exactly this (settype(1) on init). The
+    // #183 change covered the no-attr init path but left attr-without-settype at glibc NORMAL,
+    // which self-deadlocks guests that build their own recursion on the EDEADLK contract: UE4's
+    // PS5 lock wrapper (PPSA17942 eboot+0x24ca4b6) does
+    //   err = mutex_lock(obj); if (err) /* EDEADLK: already mine */ skip-acquire; depth++;
+    // — with a NORMAL mutex the relock BLOCKS forever instead of returning EDEADLK (live-verified:
+    // single-thread wedge in k_mutex_lock, mutex __owner == self, ~10 s into the DOLL boot).
+    // CONFIDENCE: HIGH (FreeBSD contract + Kyty + live wedge disassembly).
+    pthread_mutexattr_settype(at, PTHREAD_MUTEX_ERRORCHECK);
     *(void**)a0 = at;                     // store handle through caller's slot
     return 0;
 }
 // Sony/FreeBSD mutex types: 1=ERRORCHECK (the FreeBSD/Sony DEFAULT), 2=RECURSIVE, 3=NORMAL,
-// 4=ADAPTIVE_NP (NORMAL semantics + spin). Kyty's PthreadMutexattrSettype uses exactly this
-// mapping and its attr-init defaults to type 1 — PS4-inherited surface, so solid evidence (#145).
-// Previously a no-op, and init forced RECURSIVE: a guest relying on trylock-fails-on-owner or
-// EDEADLK semantics silently got different behavior.
+// 4=ADAPTIVE_NP. The guest-visible SELF-LOCK contract is what matters for the host mapping
+// (FreeBSD libthr mutex_self_lock): ERRORCHECK and ADAPTIVE_NP return EDEADLK; only NORMAL
+// hard-deadlocks. So type 4 maps to host ERRORCHECK (adaptive is errorcheck + a spin heuristic —
+// pure performance), NOT to host NORMAL: glibc ADAPTIVE/NORMAL self-lock blocks forever. Kyty
+// maps 3/4 -> NORMAL, which self-deadlocks any guest that builds recursion on the EDEADLK
+// contract — exactly what UE4's PS5 lock wrapper does (PPSA17942 eboot+0x24ca4b6:
+//   err = mutex_lock(obj); if (err) /* EDEADLK: already mine */ skip-acquire; depth++;
+// its mutexes are created with settype(4) — live-captured via PROSPER_MUTEXLOG at the #208-era
+// DOLL boot wedge: single-thread self-deadlock in k_mutex_lock, mutex __owner == self).
+// Weight Kyty DOWN here: no PS4 title it runs exercises adaptive self-lock; FreeBSD libthr is
+// the platform contract. CONFIDENCE: HIGH (FreeBSD source + the live wedge -> unwedge flip).
 HLE(k_mutexattr_settype) {
     if (!a0 || !*(void**)a0) return 0x16;
     int host;
     switch ((int)a1) {
         case 1: host = PTHREAD_MUTEX_ERRORCHECK; break;
         case 2: host = PTHREAD_MUTEX_RECURSIVE;  break;
-        case 3: case 4: host = PTHREAD_MUTEX_NORMAL; break;
+        case 3: host = PTHREAD_MUTEX_NORMAL; break;
+        case 4: host = PTHREAD_MUTEX_ERRORCHECK; break;   // ADAPTIVE_NP: EDEADLK on self-lock
         default: return 0x16;   // EINVAL
     }
+    static const bool mtxlog = getenv("PROSPER_MUTEXLOG") != nullptr;
+    if (mtxlog) fprintf(stderr, "[mtx] settype attr=%p type=%d\n", *(void**)a0, (int)a1);
     pthread_mutexattr_settype((pthread_mutexattr_t*)*(void**)a0, host);
     return 0;
 }
@@ -98,10 +118,10 @@ namespace {
         auto* m = (pthread_mutex_t*)calloc(1, sizeof(pthread_mutex_t));
         pthread_mutexattr_t at; pthread_mutexattr_init(&at);
         // The FreeBSD static sentinel ENCODES the type: NULL = PTHREAD_MUTEX_INITIALIZER (the
-        // DEFAULT type, which is ERRORCHECK on FreeBSD), 1 = PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP
-        // (NORMAL semantics + spin). Previously every sentinel self-init forced RECURSIVE (#145).
-        pthread_mutexattr_settype(&at, (uintptr_t)cur == 1 ? PTHREAD_MUTEX_NORMAL
-                                                           : PTHREAD_MUTEX_ERRORCHECK);
+        // DEFAULT type, which is ERRORCHECK on FreeBSD), 1 = PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP.
+        // BOTH map to host ERRORCHECK: FreeBSD's self-lock contract returns EDEADLK for the
+        // default AND adaptive types (libthr mutex_self_lock; adaptive's spin is pure
+        // performance). Previously every sentinel self-init forced RECURSIVE (#145).
         pthread_mutex_init(m, &at);
         pthread_mutexattr_destroy(&at);
         if (__atomic_compare_exchange_n(slot, &cur, (void*)m, false,
@@ -147,6 +167,12 @@ HLE(k_mutex_init) {
     pthread_mutexattr_t def;
     if (!at) { pthread_mutexattr_init(&def); pthread_mutexattr_settype(&def, PTHREAD_MUTEX_ERRORCHECK); at = &def; }
     pthread_mutex_init(m, at);
+    static const bool mtxlog = getenv("PROSPER_MUTEXLOG") != nullptr;
+    if (mtxlog) {
+        int t = -1; pthread_mutexattr_gettype(at, &t);
+        fprintf(stderr, "[mtx] init m=%p slot=0x%llx attr=%p type=%d\n", (void*)m,
+                (unsigned long long)a0, at == &def ? nullptr : (void*)at, t);
+    }
     if (at == &def) pthread_mutexattr_destroy(&def);
     *(void**)a0 = m;
     return 0;
