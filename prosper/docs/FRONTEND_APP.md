@@ -1,9 +1,9 @@
 # prosper-app — the OS-integration frontend (design)
 
-**Status:** **P0a landed** (issue #164) — the lifecycle hook + the full SDL3-window / Vulkan-swapchain
-present pipeline exist and are verified (present the frame from `present_readback` end-to-end;
-`--test-pattern` proves the path without a guest). **P0b is the open next step:** wire the actual
-guest boot in front of the present layer so the window shows the game — see "P0b decision" below.
+**Status:** **the app runs the game in a window** (issue #164). P0a (present pipeline) + P0b (shared
+`boot_program()`) + the shared live renderer (#177) are landed: `prosper-app --dump <app0>` boots the
+title, composites its GPU submits, and presents them to an SDL3 window on the desktop. Remaining is
+audio (P1), controllers (P2), and polish (P3).
 
 ## What it is
 

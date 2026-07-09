@@ -315,6 +315,15 @@ if(TARGET prosper_core)
       target_link_libraries(boot_trace PRIVATE Vulkan::Vulkan)
       target_compile_definitions(boot_trace PRIVATE PROSPER_HAVE_VULKAN=1)
 
+      # Shared live renderer (frontends/shared): the DrawItem->Vulkan compositor, factored out of
+      # boot_trace so BOTH boot_trace and prosper-app register the SAME renderer instead of
+      # duplicating it. Needs render_runner.h (tests/) and refvs.inc (tools/boot_trace/).
+      add_library(prosper_live_renderer STATIC frontends/shared/live_renderer.cpp)
+      target_include_directories(prosper_live_renderer PRIVATE src tests tools/boot_trace)
+      target_link_libraries(prosper_live_renderer PUBLIC prosper_core Vulkan::Vulkan)
+      target_include_directories(prosper_live_renderer PUBLIC frontends/shared)
+      target_link_libraries(boot_trace PRIVATE prosper_live_renderer)
+
       add_executable(test_vulkan_offscreen tests/test_vulkan_offscreen.cpp)
       target_link_libraries(test_vulkan_offscreen PRIVATE Vulkan::Vulkan)
       add_test(NAME vulkan_offscreen_clear COMMAND test_vulkan_offscreen)
@@ -491,6 +500,11 @@ if(PROSPER_APP AND TARGET SDL3::SDL3)
     add_executable(prosper-app frontends/prosper-app/main.cpp)
     target_include_directories(prosper-app PRIVATE src)
     target_link_libraries(prosper-app PRIVATE prosper_core SDL3::SDL3 Vulkan::Vulkan)
+    # Share the live renderer with boot_trace so the window shows composited game frames (not blank).
+    if(TARGET prosper_live_renderer)
+      target_link_libraries(prosper-app PRIVATE prosper_live_renderer)
+      target_compile_definitions(prosper-app PRIVATE PROSPER_HAVE_LIVE_RENDERER=1)
+    endif()
     message(STATUS "prosper-app frontend enabled (SDL3 window + Vulkan present)")
   else()
     message(WARNING "PROSPER_APP=ON but Vulkan not found — skipping prosper-app")

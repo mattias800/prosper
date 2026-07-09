@@ -17,6 +17,9 @@
 #include "host/boot_program.hpp"       // boot_program (shared guest-boot path, also used by boot_trace)
 #include "host/exec_image.hpp"         // run_entry
 #include "loader/linker.hpp"           // Program
+#ifdef PROSPER_HAVE_LIVE_RENDERER
+#include "live_renderer.hpp"           // shared DrawItem->Vulkan compositor (register_live_renderer)
+#endif
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
@@ -273,13 +276,18 @@ int main(int argc, char** argv) {
         else if (a[0] != '-' && dump.empty()) dump = a;                          // positional dump path
     }
 
-    // Boot the game (unless test-pattern): the shared boot_program path sets the guest up, then the
-    // guest runs on its own thread while this thread owns the window + present. Reaching the frame
-    // loop needs PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct in the environment (same as
-    // boot_trace). NOTE: composite rendering (registering the live renderer) is the render-frontier-
-    // owned next step; without it the present layer shows the guest's raw scanout buffer.
+    // Boot the game (unless test-pattern): register the shared live renderer so the guest's GPU
+    // submits composite to frames on the present layer, then the shared boot_program path sets the
+    // guest up and it runs on its own thread while this thread owns the window + present. Reaching
+    // the frame loop needs PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct in the environment
+    // (same as boot_trace).
     std::thread guestThread;
     if (!testPattern && !dump.empty()) {
+#ifdef PROSPER_HAVE_LIVE_RENDERER
+        prosper::frontend::register_live_renderer(".", /*dump_bmps=*/false);   // composite to the present layer, no disk spam
+#else
+        fprintf(stderr, "[app] built without the live renderer; the window will stay blank.\n");
+#endif
         static Program prog; std::string err;
         if (!boot_program(dump, prog, &err)) { fprintf(stderr, "[app] boot failed: %s\n", err.c_str()); return 1; }
         guestThread = std::thread([]{ run_entry(prog.imgs[0]); });   // runs the guest frame loop
