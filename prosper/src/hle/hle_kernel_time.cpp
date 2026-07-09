@@ -231,7 +231,14 @@ HLE(k_nanosleep){ if (a0) nanosleep((const struct timespec*)P(a0), a1 ? (struct 
 
 // --- assorted libkernel stubs ---
 HLE(k_ok)              { return 0; }                       // generic success no-op
-HLE(k_load_start_mod)  { return g_module_handle++; }       // return a positive module id
+// sceKernelLoadStartModule(path, ...): the PRX are pre-linked into our address space, so
+// "loading" resolves the path to its linked module and returns a REAL handle — dlsym then
+// consults that module's own exports first (#147). An unknown path still gets the synthetic
+// success counter (that behavior is #146's scope) so optional plugins don't fail the boot.
+HLE(k_load_start_mod)  {
+    if (uint64_t h = module_handle_for_path(a0 ? (const char*)P(a0) : nullptr)) return h;
+    return g_module_handle++;
+}
 
 // _exit(status): terminate the process. Previously an unimplemented stub RETURNED 0, so libc's
 // exit path fell through into its deliberate ud2 (SIGILL) — terminate for real, loudly.

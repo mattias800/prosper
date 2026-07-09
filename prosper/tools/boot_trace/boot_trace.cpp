@@ -117,6 +117,11 @@ int main(int argc, char** argv) {
     // PSN.prx plugin's PSN_PrxInitialize / UnityPluginLoad), so Unity's native-plugin loader binds
     // real export addresses instead of getting ESRCH.
     set_module_exports(&p.exports);
+    // Per-module tables (#147): LoadStartModule hands out real handles for linked-module paths and
+    // dlsym consults the handle's module before the global first-definition-wins table.
+    { std::vector<ModuleExportTable> mt;
+      for (const auto& me : p.mod_exports) mt.push_back({ me.path, &me.nids });
+      set_module_export_tables(std::move(mt)); }
 
     register_builtin_hle();
 #ifdef PROSPER_AUDIO_SDL3

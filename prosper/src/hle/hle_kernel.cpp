@@ -779,16 +779,49 @@ HLE(k_is_stack) {   // sceKernelIsStack(void* addr): is addr within the current 
 }
 // Global export table (NID -> guest addr) registered by the loader, so dlsym can resolve
 // exported symbols by name against loaded modules (e.g. PSN.prx's plugin/init exports).
-namespace { const std::unordered_map<std::string, uint64_t>* g_exports = nullptr; }
+namespace {
+    const std::unordered_map<std::string, uint64_t>* g_exports = nullptr;
+    std::vector<ModuleExportTable> g_mod_exports;   // per-module tables (#147)
+    // Real module handles occupy 0x10000+index — far above the synthetic success counter
+    // (k_load_start_mod's g_module_handle, which starts at 1), so the ranges can't collide.
+    constexpr uint64_t kModuleHandleBase = 0x10000;
+    const char* path_basename(const char* p) {
+        const char* b = p;
+        for (const char* c = p; *c; c++) if (*c == '/' || *c == '\\') b = c + 1;
+        return b;
+    }
+}
 void set_module_exports(const std::unordered_map<std::string, uint64_t>* exports) { g_exports = exports; }
+void set_module_export_tables(std::vector<ModuleExportTable> tables) { g_mod_exports = std::move(tables); }
+uint64_t module_handle_for_path(const char* path) {
+    if (!path || !*path) return 0;
+    const char* want = path_basename(path);
+    for (size_t i = 0; i < g_mod_exports.size(); i++)
+        if (strcmp(path_basename(g_mod_exports[i].path.c_str()), want) == 0)
+            return kModuleHandleBase + i;
+    return 0;
+}
 
 HLE(k_dlsym) {   // sceKernelDlsym(SceKernelModule handle, const char* name, void** funcAddr)
-    // Resolve the requested symbol by name against the linked program's global export table
-    // (Unity's native-plugin loader dlsym's UnityPluginLoad / PSN_PrxInitialize by name). We hash
-    // the name to its Sony NID (nid_hash) and look it up among all loaded modules' exports; a hit
-    // is written through *funcAddr and reported as success. This is what makes the native PSN.prx
-    // plugin's exports reachable so the managed PSN bootstrap + worker pool start.
+    // Resolve the requested symbol by name against the HANDLE'S module first (#147) — a real
+    // handle from k_load_start_mod names one linked module, and two modules exporting the same
+    // NID must not alias to the global table's first definition — then fall back to the global
+    // export table (Unity's native-plugin loader dlsym's UnityPluginLoad / PSN_PrxInitialize by
+    // name; synthetic handles for unknown paths land here). We hash the name to its Sony NID
+    // (nid_hash); a hit is written through *funcAddr and reported as success.
     const char* name = a1 ? (const char*)(uintptr_t)a1 : nullptr;
+    if (name && a0 >= kModuleHandleBase && a0 - kModuleHandleBase < g_mod_exports.size()) {
+        if (const auto* nids = g_mod_exports[a0 - kModuleHandleBase].nids) {
+            auto it = nids->find(nid_hash(name));
+            if (it != nids->end()) {
+                if (a2) *(uint64_t*)(uintptr_t)a2 = it->second;
+                if (getenv("PROSPER_SYNCLOG"))
+                    fprintf(stderr, "[dlsym] '%s' (module handle 0x%llx) -> 0x%llx\n",
+                            name, (unsigned long long)a0, (unsigned long long)it->second);
+                return 0;
+            }
+        }
+    }
     if (name && g_exports) {
         auto it = g_exports->find(nid_hash(name));
         if (it != g_exports->end()) {
