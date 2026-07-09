@@ -21,12 +21,22 @@ inline void sw4kb_dims(uint32_t bpe, uint32_t& bx, uint32_t& by) {
     uint32_t bits = 0; while ((4096u >> bits) > bpe) bits++;   // log2(4096/bpe), bpe a power of two
     bx = (bits + 1) / 2; by = bits / 2;
 }
-// Morton order within the tile with Y in the LOW bit of each (y,x) pair — the empirically-derived,
-// pixel-verified 32-bpp order — and, for non-square tiles, the wider dimension's extra X bits
-// directly above the shared pairs (x5 at bit 10 for 64x32, etc.).
+// GFX10 SW_4KB_S element order within the tile. The lowest FOUR element-index bits are a 4x4
+// pixel sub-block [x0, x1, y0, y1] (both low X bits, then both low Y bits); above that the usual
+// interleaved (y,x) Morton pairs, and for non-square tiles the wider dimension's extra X bits on top.
+// The previous plain Y-low Morton ([y0,x0,y1,x1,...]) placed the wrong bits in the lowest positions,
+// which is invisible in flat regions but SERRATED every sprite/gradient EDGE of every tiled texture —
+// the cross-game "dither"/unreadable-text bug. This order is pixel-verified clean (crisp cel-shaded
+// edges + smooth gradients) against The Messenger's title art at 32-bpp; the same micro-pattern is
+// applied at every bpe (round-trip-symmetric — verify other bpe visually as surfaces surface). #118.
 inline uint32_t sw4kb_morton(uint32_t ix, uint32_t iy, uint32_t bx, uint32_t by) {
     uint32_t m = 0;
-    for (uint32_t b = 0; b < by; b++) {
+    // low 4 bits: x0, x1, y0, y1  (a 4x4 sub-block; requires bx>=2 and by>=2, true for every real bpe)
+    m |= (ix & 1u) << 0;
+    m |= ((ix >> 1) & 1u) << 1;
+    m |= (iy & 1u) << 2;
+    m |= ((iy >> 1) & 1u) << 3;
+    for (uint32_t b = 2; b < by; b++) {
         m |= ((iy >> b) & 1u) << (2 * b);
         m |= ((ix >> b) & 1u) << (2 * b + 1);
     }
