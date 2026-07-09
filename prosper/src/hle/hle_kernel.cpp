@@ -10,6 +10,7 @@
 #include "../host/exec_image.hpp"
 #include <pthread.h>
 #include <cerrno>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -837,6 +838,15 @@ namespace {
         for (const char* c = p; *c; c++) if (*c == '/' || *c == '\\') b = c + 1;
         return b;
     }
+    // Case-INSENSITIVE basename compare: the guest's runtime sceKernelLoadStartModule path can differ
+    // in case from the linker's preload path (observed: the Messenger loads "Il2CppUserAssemblies.prx"
+    // but the module is preloaded as "Il2cppUserAssemblies.prx"), and PS5 module paths are effectively
+    // case-insensitive. Without this the game's own PRX miss the match and — with #146's ENOENT — the
+    // load fails, so IL2CPP never bootstraps.
+    inline bool ieq(const char* a, const char* b) {
+        for (; *a && *b; a++, b++) if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return false;
+        return *a == *b;
+    }
 }
 void set_module_exports(const std::unordered_map<std::string, uint64_t>* exports) { g_exports = exports; }
 void set_module_export_tables(std::vector<ModuleExportTable> tables) { g_mod_exports = std::move(tables); }
@@ -844,7 +854,7 @@ uint64_t module_handle_for_path(const char* path) {
     if (!path || !*path) return 0;
     const char* want = path_basename(path);
     for (size_t i = 0; i < g_mod_exports.size(); i++)
-        if (strcmp(path_basename(g_mod_exports[i].path.c_str()), want) == 0)
+        if (ieq(path_basename(g_mod_exports[i].path.c_str()), want))
             return kModuleHandleBase + i;
     return 0;
 }

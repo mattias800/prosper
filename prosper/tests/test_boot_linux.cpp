@@ -35,6 +35,14 @@ int main(int argc, char** argv) {
     printf("  linked %zu modules: %zu imports (%zu cross-module, %zu stubbed / %zu slots)\n",
            prog.mods.size(), prog.total_imports, prog.resolved_cross_module, prog.stubbed, prog.slots.size());
 
+    // Register the linked module set so sceKernelLoadStartModule resolves the game's OWN runtime
+    // PRX loads to real handles (#146/#147) — the guest LoadStartModule's its preloaded Il2Cpp/
+    // PS5Util modules, which must succeed for IL2CPP to bootstrap. Mirrors boot_program.cpp.
+    set_module_exports(&prog.exports);
+    { std::vector<ModuleExportTable> mt;
+      for (const auto& me : prog.mod_exports) mt.push_back({ me.path, &me.nids });
+      set_module_export_tables(std::move(mt)); }
+
     register_builtin_hle();
     set_app0_root(dump);                        // guest "/app0" -> the game dump directory
     for (auto& img : prog.imgs)

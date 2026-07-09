@@ -1,8 +1,8 @@
 // test_dlsym_handle — sceKernelDlsym must honor its MODULE HANDLE (#147). Two modules exporting
 // the same NID: a lookup against the second module's handle must return the SECOND's address —
 // the old global first-definition-wins table aliased it to the first (wrong plugin initialized).
-// LoadStartModule resolves a linked-module path (basename match) to a real handle; unknown paths
-// keep the synthetic success counter (#146's scope), which falls back to the global table.
+// LoadStartModule resolves a linked-module path (basename match) to a real handle; an unknown path
+// returns ENOENT (#146) — dlsym against a non-module handle still falls back to the global table.
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
 #include <cstdio>
@@ -40,6 +40,11 @@ int main() {
     uint64_t hB = load(U("/app0/sce_module/B.prx"), 0, 0, 0, 0, 0);
     CHECK(hA >= 0x10000 && hB >= 0x10000 && hA != hB,
           "linked-module paths resolve to real, distinct handles (basename match)");
+    // Case-INSENSITIVE basename match (#146): the guest's runtime path can differ in case from the
+    // preload path (the Messenger loads "Il2CppUserAssemblies.prx" vs preloaded "Il2cpp..."). A
+    // different-case load of A.prx must resolve to the SAME real handle, not ENOENT.
+    CHECK(load(U("/app0/other/a.PRX"), 0, 0, 0, 0, 0) == hA,
+          "different-case basename resolves to the same module handle (case-insensitive)");
 
     uint64_t addr = 0;
     CHECK(dlsym(hA, U("PSN_PrxInitialize"), U(&addr), 0, 0, 0) == 0 && addr == 0x1111,
@@ -53,12 +58,15 @@ int main() {
     CHECK(dlsym(hB, U("OnlyInA"), U(&addr), 0, 0, 0) == 0 && addr == 0xAAAA,
           "dlsym(handle B, symbol only in A) falls back to the global table");
 
-    // Unknown path -> synthetic handle (below the real-handle range) -> global resolution.
+    // Unknown path -> ENOENT (#146): a PRX not in the linked set isn't present, so LoadStartModule
+    // reports module-not-found instead of a fake success handle that loads nothing.
     uint64_t hX = load(U("/app0/sce_module/NotLinked.prx"), 0, 0, 0, 0, 0);
-    CHECK(hX > 0 && hX < 0x10000, "unknown path keeps the synthetic success handle");
+    CHECK(hX == 0x80020002ull, "unknown path -> SCE_KERNEL_ERROR_ENOENT (not a fake success handle)");
+    // A dlsym against a non-module handle (0, or the ENOENT value) still falls back to the global
+    // export table — the PSN.prx / UnityPluginLoad by-name path is unaffected.
     addr = 0;
-    CHECK(dlsym(hX, U("PSN_PrxInitialize"), U(&addr), 0, 0, 0) == 0 && addr == 0x1111,
-          "dlsym(synthetic handle) resolves via the global table");
+    CHECK(dlsym(0, U("PSN_PrxInitialize"), U(&addr), 0, 0, 0) == 0 && addr == 0x1111,
+          "dlsym(non-module handle) resolves via the global table");
 
     // Unknown symbol: ESRCH, out param untouched (callers pre-seed a fallback).
     addr = 0xFEED;
