@@ -1034,6 +1034,18 @@ namespace {
         g_r14 = (uint64_t)g[REG_R14]; g_r15 = (uint64_t)g[REG_R15];
         g_trap_sig = sig;
         g_trap_kind = (sig == SIGILL) ? 3 : 2;
+        // PROSPER_FAULT_SKIP="<fault-off>[:<resume-off>]" DIAGNOSTIC (bring-up, NOT a fix): when a fault
+        // hits at eboot+<fault-off>, set rax=0 and resume the guest at eboot+<resume-off> (default
+        // fault-off+4, i.e. skip one short instruction). Lets the guest survive ONE specific crash so
+        // you can see whether it gates later progress. Found PPSA02664's boot gate (#238): skipping the
+        // engine state-machine null-handler deref chain (`PROSPER_FAULT_SKIP=0x410b3:0x410bb`) makes the
+        // title load its scene, instantiate MonoBehaviours, and run 76k GPU submits crash-free.
+        if (const char* fsk = getenv("PROSPER_FAULT_SKIP")) {
+            uint64_t foff = strtoull(fsk, nullptr, 0);
+            const char* colon = strchr(fsk, ':');
+            uint64_t roff = colon ? strtoull(colon + 1, nullptr, 0) : foff + 4;
+            if (g_base && g_fault_rip == g_base + foff) { g[REG_RAX] = 0; g[REG_RIP] = g_base + roff; return; }
+        }
         dump_fault_mem();   // no-op unless PROSPER_FAULTMEM is set
         // Dump the HWBP ring on the recoverable (armed/main-thread) crash too — the deser fault is kind=2.
         if (g_hwbp_node_on && !g_hwbp_ring_dumped) { uint64_t sfs = guest_fs_to_host_scoped();
