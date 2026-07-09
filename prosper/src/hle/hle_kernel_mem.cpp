@@ -620,8 +620,26 @@ namespace { bool amprlog() { static int v = getenv("PROSPER_AMPRLOG") ? 1 : 0; r
 // lives inside cbBuf (the "CB offset 40" of the guest's error message is a byte offset into it).
 // Exposed so the read-submit HLE can locate and decode the real command. CONFIDENCE: MED.
 uint64_t g_apr_last_cb = 0, g_apr_last_cb_size = 0;
+// Per-cb capacity, recorded at init (issue #208 follow-up). Two live-captured init flavors carry
+// the size in different args: the APR read flow inits (req, cbSize=a1, 0, cbBuf=a3, poolCtx, 3),
+// and the IoStore batch-append cb inits (cb=a0, 0, 0, 0, -1, size=a5 — observed a5=0x720). The
+// guest's append loop (eboot+0x227e2c0) polls GetSize(cb) - GetUsed(cb) and only appends the next
+// command when the difference exceeds 0xff — with the old global "last size" (0 for this cb) the
+// loop spun forever, parking the IoStore thread and stalling the whole post-shader-map load.
+namespace {
+    std::mutex g_ampr_cb_mx;
+    std::unordered_map<uint64_t, uint64_t> g_ampr_cb_size;   // cb ctx -> byte capacity
+}
 HLE(k_ampr_init) {
     if (a3 > 0xffff && a1 && a1 <= 0x10000) { g_apr_last_cb = a3; g_apr_last_cb_size = a1; }
+    if (a0 > 0xffff) {
+        uint64_t sz = (a1 && a1 <= 0x100000) ? a1 : (a5 && a5 <= 0x100000) ? a5 : 0;
+        if (sz) {
+            std::lock_guard<std::mutex> lk(g_ampr_cb_mx);
+            g_ampr_cb_size[a0] = sz;
+            if (g_ampr_cb_size.size() > 4096) g_ampr_cb_size.clear();   // bound (ctxs recycle)
+        }
+    }
     if (amprlog()) {
         fprintf(stderr, "[amprlog] init  a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx\n",
                 (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
@@ -651,15 +669,25 @@ static uint64_t ampr_arglog(const char* tag, uint64_t a0, uint64_t a1, uint64_t 
 HLE(k_ampr_x1) { return ampr_arglog("baQO9ez2gL4", a0, a1, a2, a3, a4, a5); }
 HLE(k_ampr_x2) { return ampr_arglog("ULvXMDz56po", a0, a1, a2, a3, a4, a5); }
 // sceAmprCommandBufferGetSize (NID tZDDEo2tE5k, recovered by brute-forcing nid_hash over a
-// generated libSceAmpr corpus). Returns the command buffer's byte size. It fires during APR read
-// teardown; verified (issue #107) NOT to gate the config-load FMallocBinned3 crash — returning the
-// recorded cb size vs 0 leaves the crash bit-identical, so the value is non-critical here.
-// CONFIDENCE: MED (name from the same corpus that yielded the other 7 verified Ampr NIDs; exact
-// semantics of "size" — total vs used — unconfirmed, so we report the recorded cb size).
+// generated libSceAmpr corpus). Returns the command buffer's byte CAPACITY. Live contract
+// (issue #208 follow-up, guest append loop eboot+0x227e2c0, wrapper 0x59b5dd0): the IoStore
+// batch builder polls `GetSize(cb) - <companion>(cb) > 0xff` before appending the next command
+// packet — GetSize is the fixed capacity and the companion (0x59b5e00, currently a 0-returning
+// stub) is the used/pending byte count. prosper serves every appended command synchronously at
+// ReadFile time, so "used" is truthfully always 0 and the free space is the full capacity.
+// Returns: the per-cb capacity recorded at init; falls back to the legacy "last cb size" global,
+// then to a roomy 0x10000 (a starved 0 here parks the IoStore thread in a permanent poll spin —
+// the post-shader-map wall this fixes). CONFIDENCE: MED (semantics inferred from the decompiled
+// append loop + live spin -> unblock flip; name from the verified NID corpus).
 HLE(k_ampr_getsize) {
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
     ampr_arglog("tZDDEo2tE5k(GetSize)", a0, a1, a2, a3, a4, a5);
-    return g_apr_last_cb_size;
+    {
+        std::lock_guard<std::mutex> lk(g_ampr_cb_mx);
+        auto it = g_ampr_cb_size.find(a0);
+        if (it != g_ampr_cb_size.end()) return it->second;
+    }
+    return g_apr_last_cb_size ? g_apr_last_cb_size : 0x10000;
 }
 HLE(k_ampr_x3) { return ampr_arglog("Qs1xtplKo0U", a0, a1, a2, a3, a4, a5); }
 HLE(k_ampr_x4) { return ampr_arglog("GuchCTefuZw", a0, a1, a2, a3, a4, a5); }
