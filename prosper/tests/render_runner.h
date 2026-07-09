@@ -129,6 +129,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     // fixed attachment set); each draw's pipeline sets its own depthTest/Write/CompareOp. A frame with
     // no depth-using draw takes the color-only path unchanged.
     bool use_depth = false; for (const auto& d : draws) if (d.ps && d.ps->depth_test_enable) use_depth = true;
+    if (getenv("PROSPER_NO_DEPTH")) use_depth = false;   // diag: isolate depth-test rejection
     const VkFormat DFMT = VK_FORMAT_D32_SFLOAT;
     VkImage dimg = VK_NULL_HANDLE; VkDeviceMemory dmem = VK_NULL_HANDLE; VkImageView dview = VK_NULL_HANDLE;
 
