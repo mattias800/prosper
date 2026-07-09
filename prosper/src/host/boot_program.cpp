@@ -26,11 +26,20 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
         // (PSN_PrxInitialize / UnityPluginLoad / PrxSaveDataInitialize ...) resolve via sceKernelDlsym.
         { d + "/Media/Plugins/PSN.prx", BOOT_PSN },
         { d + "/Media/Plugins/SaveData.prx", BOOT_SAVEDATA },
+        // Some titles (e.g. PPSA02664) ship the Unity PSN plugin as PSNCore.prx (+ PSNCommon.prx
+        // dependency) rather than PSN.prx. Preload them so the C# P/Invoke ("PSNCore"::"PrxInitialize")
+        // resolves via sceKernelDlsym. Without this the il2cpp P/Invoke resolver tries to on-demand-load
+        // PSNCore.prx and HANGS, stalling the whole app-init -> scene-load chain (#238). PSNCommon later
+        // in the list => its init runs first (it's PSNCore's dependency). Absent-file titles skip these.
+        { d + "/Media/Plugins/PSNCore.prx", BOOT_PSNCORE },
+        { d + "/Media/Plugins/PSNCommon.prx", BOOT_PSNCOMMON },
         { d + "/sce_module/libc.prx", BOOT_LIBC },
     };
     if (getenv("PROSPER_NO_PSN"))
         for (size_t i = in.size(); i-- > 0; )
             if (in[i].path.find("PSN.prx") != std::string::npos ||
+                in[i].path.find("PSNCore.prx") != std::string::npos ||
+                in[i].path.find("PSNCommon.prx") != std::string::npos ||
                 in[i].path.find("SaveData.prx") != std::string::npos) in.erase(in.begin() + (ptrdiff_t)i);
     // Cross-title tolerance: drop dependent modules whose file doesn't exist in this dump (the eboot
     // at index 0 is always kept; each module keeps its fixed base).
@@ -85,7 +94,8 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
     // started with (argc=0, argp=NULL). Register their guest ranges so run_guest_inits starts them
     // with the real descriptor. Skipped when PROSPER_NO_PSN drops them.
     if (!getenv("PROSPER_NO_PSN"))
-        set_module_start_param_ranges({ { BOOT_PSN, BOOT_SAVEDATA }, { BOOT_SAVEDATA, BOOT_LIBC } });
+        set_module_start_param_ranges({ { BOOT_PSN, BOOT_SAVEDATA }, { BOOT_SAVEDATA, BOOT_LIBC },
+                                        { BOOT_PSNCORE, 0x490000000ull }, { BOOT_PSNCOMMON, 0x4b0000000ull } });
 
     run_guest_inits(p.init_fns);
     return true;
