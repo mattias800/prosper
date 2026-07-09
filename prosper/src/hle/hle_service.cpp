@@ -10,6 +10,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <atomic>
+#ifdef __linux__
+#include <sys/mman.h>   // msync page-mapped probe in svc_log (diagnostic-only)
+#endif
 
 namespace prosper {
 
@@ -199,6 +202,12 @@ void svc_log(const char* fn, uint64_t a0, uint64_t a1, uint64_t a2,
         // page neighbor is unmapped, and a diagnostic must not be able to fault the boot.
         uint64_t page_left = 0x1000 - (args[i] & 0xfff);
         int words = (int)(page_left / 8); if (words > dump_words) words = dump_words;
+#ifdef __linux__
+        // Integer-valued args can masquerade as pointers; probe the page is actually mapped
+        // (msync on an unmapped range fails ENOMEM) before dereferencing — a diagnostic must
+        // never be able to fault the boot.
+        if (msync((void*)(uintptr_t)(args[i] & ~0xfffull), 1, MS_ASYNC) != 0) continue;
+#endif
         fprintf(stderr, "[svc]   a%d ->", i);
         const uint64_t* q = (const uint64_t*)PW(args[i]);
         for (int w = 0; w < words; w++) fprintf(stderr, " %016lx", (unsigned long)q[w]);
