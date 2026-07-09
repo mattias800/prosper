@@ -1410,7 +1410,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     else if (in.omod == 3) d = b.fbin(Op_FMul, d, b.uconst(fbits(0.5f)));
                     if (in.clamp) d = b.fext2(Glsl_FMax, b.fext2(Glsl_FMin, d, b.uconst(fbits(1.0f))), b.uconst(fbits(0.0f)));
                     break;
-                default: break;
+                // A non-float-result opcode carrying a modifier (e.g. an INTEGER SDWA op with CLAMP =
+                // integer saturation) is not modeled by the float-domain omod/clamp above, so applying
+                // nothing would SILENTLY drop the saturation and emit a valid-but-wrong shader. Reject
+                // loudly instead — the same fail-visibly-over-miscompile discipline as the forward-if
+                // clamp (#129/#174). The guard means this only fires for a modifier-carrying op.
+                default: ok = false; break;
             }
             if (ok) predicate_write(b, rs, in.dst.value, old_d);
             return true;
