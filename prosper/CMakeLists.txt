@@ -161,6 +161,14 @@ if(TARGET prosper_core)
   target_link_libraries(test_dmem PRIVATE prosper_core)
   add_test(NAME dmem_available COMMAND test_dmem)
 
+  # Hinted map must not clobber a live mapping (#137): MAP_FIXED_NOREPLACE unless the hint is our
+  # own uncommitted reservation. Drives the real map HLE handlers. Linux-only (mmap semantics).
+  if(UNIX AND NOT APPLE)
+    add_executable(test_map_noreplace tests/test_map_noreplace.cpp)
+    target_link_libraries(test_map_noreplace PRIVATE prosper_core)
+    add_test(NAME map_noreplace COMMAND test_map_noreplace)
+  endif()
+
   # PM4 command-stream decoder (front of the CommandProcessor): decode a Dcb built by the AGC
   # Dcb functions and assert the ops. Pure/cross-platform, no game dump needed.
   add_executable(test_pm4_decode tests/test_pm4_decode.cpp)
