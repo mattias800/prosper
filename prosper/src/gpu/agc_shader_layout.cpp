@@ -233,6 +233,30 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                                      : (d.width * d.height * fi.bytes_per_block);
             r.sgpr_base     = user_sgpr_base + off;  // DIRECT provenance key (image_sample SRSRC SGPR)
             r.srt_offset    = 0xFFFFFFFFu;
+            // Paired sampler S# (sharp[2], same slot): decode its filter + wrap modes so the backend
+            // samples the way the game asked (point vs bilinear, wrap vs clamp), instead of a hardcoded
+            // LINEAR/clamp. 4-dword SQ_IMG_SAMP: WORD0 has CLAMP_X/Y/Z (bits [2:0]/[5:3]/[8:6]); WORD2
+            // has XY_MAG_FILTER [21:20], XY_MIN_FILTER [23:22], MIP_FILTER [27:26] (0 = point/nearest).
+            // Absent/garbage sampler -> keep the linear/clamp defaults. CONFIDENCE: HIGH (layout matches
+            // GCN/RDNA2 SQ_IMG_SAMP; verified against decoded raw dwords under PROSPER_GFXLOG).
+            if (const AgcShaderSharp* samps = ud->sharp_resource_offset[2]) {
+                if (slot < ud->sharp_resource_count[2] && !samps[slot].empty()) {
+                    uint32_t soff = samps[slot].offset_dw();
+                    if ((uint64_t)soff + 4 <= num_user_sgprs) {
+                        const uint32_t* sm = &user_sgprs[soff];
+                        r.mag_filter  = ((sm[2] >> 20) & 0x3u) ? 1u : 0u;
+                        r.min_filter  = ((sm[2] >> 22) & 0x3u) ? 1u : 0u;
+                        r.mip_filter  = ((sm[2] >> 26) & 0x3u) ? 1u : 0u;
+                        r.addr_uvw[0] = (sm[0] >> 0) & 0x7u;
+                        r.addr_uvw[1] = (sm[0] >> 3) & 0x7u;
+                        r.addr_uvw[2] = (sm[0] >> 6) & 0x7u;
+                        if (getenv("PROSPER_GFXLOG"))
+                            fprintf(stderr, "[s#] slot%u mag=%u min=%u mip=%u addr=%u,%u,%u | raw %08x %08x %08x %08x\n",
+                                    slot, r.mag_filter, r.min_filter, r.mip_filter,
+                                    r.addr_uvw[0], r.addr_uvw[1], r.addr_uvw[2], sm[0], sm[1], sm[2], sm[3]);
+                    }
+                }
+            }
             table.resources.push_back(r);
         }
     }

@@ -61,6 +61,12 @@ struct FrameResource {
     std::vector<uint32_t> dwords;   // storage-buffer contents (empty -> a 1-dword zero buffer)
     const uint8_t* tex_rgba = nullptr;   // non-null => a texture; then tw/th are its dimensions
     uint32_t tw = 0, th = 0;
+    // Sampler state (Texture only). Defaults = LINEAR + clamp-to-edge — the harness's prior fixed
+    // sampler — so render tests that build FrameResources directly stay byte-identical. The live path
+    // fills these from the decoded S# (shader_resources.hpp). filter: 0=nearest, 1=linear; addr = Gen5
+    // SQ_TEX CLAMP enum (0=wrap, 1=mirror, 2=clamp-last-texel, 6/7=border).
+    uint32_t mag_filter = 1, min_filter = 1, mip_filter = 0;
+    uint32_t addr_uvw[3] = {2, 2, 2};
     bool is_texture() const { return tex_rgba != nullptr; }
 };
 
@@ -316,8 +322,23 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     tvci.image = v.timg[i]; tvci.viewType = VK_IMAGE_VIEW_TYPE_2D; tvci.format = VK_FORMAT_R8G8B8A8_UNORM;
                     tvci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}; vkCreateImageView(dev, &tvci, nullptr, &v.tview[i]);
                     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-                    sci.magFilter = sci.minFilter = VK_FILTER_LINEAR; sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-                    sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+                    // Honor the game's decoded S# (r.mag/min/mip_filter, r.addr_uvw) instead of a fixed
+                    // LINEAR/clamp sampler — point-sampled art (pixel-art titles) no longer gets a blurred
+                    // per-texel outline, and real wrap modes work. Gen5 CLAMP enum -> Vk address mode.
+                    auto vkflt  = [](uint32_t f){ return f ? VK_FILTER_LINEAR : VK_FILTER_NEAREST; };
+                    auto vkaddr = [](uint32_t c) -> VkSamplerAddressMode {
+                        switch (c) {
+                            case 0:  return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+                            case 1:  return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+                            case 6: case 7: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+                            default: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;   // 2,3,4,5: clamp-ish
+                        }
+                    };
+                    sci.magFilter = vkflt(r.mag_filter); sci.minFilter = vkflt(r.min_filter);
+                    sci.mipmapMode = r.mip_filter ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
+                    sci.addressModeU = vkaddr(r.addr_uvw[0]);
+                    sci.addressModeV = vkaddr(r.addr_uvw[1]);
+                    sci.addressModeW = vkaddr(r.addr_uvw[2]);
                     vkCreateSampler(dev, &sci, nullptr, &v.tsamp[i]);
                     VkDeviceSize tbytes = (VkDeviceSize)r.tw * r.th * 4;
                     VkBufferCreateInfo stci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; stci.size = tbytes; stci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
