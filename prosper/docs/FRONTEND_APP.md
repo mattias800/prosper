@@ -1,7 +1,9 @@
 # prosper-app — the OS-integration frontend (design)
 
-**Status:** design / not started. Later-priority. This doc is the plan of record so the design
-survives until someone builds it.
+**Status:** **P0a landed** (issue #164) — the lifecycle hook + the full SDL3-window / Vulkan-swapchain
+present pipeline exist and are verified (present the frame from `present_readback` end-to-end;
+`--test-pattern` proves the path without a guest). **P0b is the open next step:** wire the actual
+guest boot in front of the present layer so the window shows the game — see "P0b decision" below.
 
 ## What it is
 
@@ -153,10 +155,30 @@ CI source of truth. Nothing the frontend adds gates a core test. A future *front
 wanted, should use an offscreen/hidden surface and stay out of the default `ctest` set (needs a real
 Vulkan device + display, which CI may lack).
 
+## P0b decision (open — needs a call before wiring the guest boot)
+
+P0a is deliberately decoupled from the guest boot. Wiring the boot (P0b) so the window shows the
+*game* faces a fork, because the boot glue (~150 lines: module bases, PSN/SaveData/libc.prx, TLS,
+unwind, procparam, plugin registration, `run_guest_inits`/`run_entry` + registering the live
+renderer) lives in `boot_trace`'s `main()` and is **actively evolving** (multi-title boot work):
+- **(a) Duplicate** the boot glue into the frontend — fast, no collision, but fragile and diverges
+  from `boot_trace` as the boot changes.
+- **(b) Extract a shared `boot_program()` helper** both `boot_trace` and the frontend call — the
+  clean answer, but it refactors the hot `boot_trace` and needs coordination with the workstreams
+  editing it.
+
+Recommendation: **(b)**, sequenced as its own small refactor PR (extract the boot into a reusable
+tool-side helper without changing behavior), then the frontend calls it + registers the renderer +
+runs `run_entry` on a thread; on window-close the present loop already calls `prosper_request_stop()`.
+Until then P0a is usable standalone (`--test-pattern`) and against any external feeder of
+`present_write_frame`.
+
 ## Phased plan
 
-- **P0 — window + present**: SDL window, swapchain, present-from-readback, `SDL_QUIT`→stop, the
-  run/request_stop hook. Result: watch the game render on a real GPU, close to quit.
+- **P0a — window + present** ✅ **done** (this PR): lifecycle hook, SDL3 window, Vulkan swapchain,
+  present-from-readback, `SDL_QUIT`/Esc→stop. Verified with `--test-pattern` (30 frames, clean exit)
+  on WSLg + llvmpipe.
+- **P0b — guest boot** (next): show the actual game (see the decision above).
 - **P1 — audio**: land the SDL3 `AudioSink` (from `feat/audio-sdl3`). Result: sound.
 - **P2 — controllers**: SDL3 `GameController` `PadBackend`. Result: play it.
 - **P3 — polish**: resize, fullscreen, pause/quit UX, present-mode/latency tuning, packaging.
