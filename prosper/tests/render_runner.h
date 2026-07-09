@@ -152,9 +152,17 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     // Depth attachment is created if ANY draw enables the depth test (the shared render pass has one
     // fixed attachment set); each draw's pipeline sets its own depthTest/Write/CompareOp. A frame with
     // no depth-using draw takes the color-only path unchanged.
-    bool use_depth = false; for (const auto& d : draws) if (d.ps && d.ps->depth_test_enable) use_depth = true;
-    if (getenv("PROSPER_NO_DEPTH")) use_depth = false;   // diag: isolate depth-test rejection
-    const VkFormat DFMT = VK_FORMAT_D32_SFLOAT;
+    bool use_depth = false, use_stencil = false;
+    for (const auto& d : draws) { if (d.ps && d.ps->depth_test_enable) use_depth = true;
+                                  if (d.ps && d.ps->stencil_enable)    use_stencil = true; }
+    if (getenv("PROSPER_NO_DEPTH"))   use_depth = false;     // diag: isolate depth-test rejection
+    if (getenv("PROSPER_NO_STENCIL")) use_stencil = false;   // diag: isolate stencil masking
+    const bool use_ds = use_depth || use_stencil;
+    // Use a stencil-capable depth format ONLY when a draw actually uses stencil (a UI mask). The
+    // depth-only path keeps the original D32 depth-only format + aspect, so existing render tests are
+    // byte-identical (#264).
+    const VkFormat DFMT = use_stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT;
+    const VkImageAspectFlags DASPECT = VK_IMAGE_ASPECT_DEPTH_BIT | (use_stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
     VkImage dimg = VK_NULL_HANDLE; VkDeviceMemory dmem = VK_NULL_HANDLE; VkImageView dview = VK_NULL_HANDLE;
 
     VkImageCreateInfo imgci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -172,7 +180,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     ivci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     VkImageView view; vkCreateImageView(dev, &ivci, nullptr, &view);
 
-    if (use_depth) {
+    if (use_ds) {
         VkImageCreateInfo dci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         dci.imageType = VK_IMAGE_TYPE_2D; dci.format = DFMT; dci.extent = {W, H, 1};
         dci.mipLevels = 1; dci.arrayLayers = 1; dci.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -184,7 +192,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         vkAllocateMemory(dev, &dai, nullptr, &dmem); vkBindImageMemory(dev, dimg, dmem, 0);
         VkImageViewCreateInfo dvci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         dvci.image = dimg; dvci.viewType = VK_IMAGE_VIEW_TYPE_2D; dvci.format = DFMT;
-        dvci.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+        dvci.subresourceRange = {DASPECT, 0, 1, 0, 1};
         vkCreateImageView(dev, &dvci, nullptr, &dview);
     }
 
@@ -195,19 +203,22 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     att[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED; att[0].finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     att[1].format = DFMT; att[1].samples = VK_SAMPLE_COUNT_1_BIT;
     att[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; att[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    att[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; att[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    // Clear the stencil at pass start when a mask uses it (so the mask draw defines the stenciled
+    // region from 0); within the pass the stencil persists across draws, so store-op can be DONT_CARE.
+    att[1].stencilLoadOp = use_stencil ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     att[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED; att[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     VkAttachmentReference ar{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
     VkAttachmentReference dar{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
     VkSubpassDescription sub{}; sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     sub.colorAttachmentCount = 1; sub.pColorAttachments = &ar;
-    if (use_depth) sub.pDepthStencilAttachment = &dar;
+    if (use_ds) sub.pDepthStencilAttachment = &dar;
     VkRenderPassCreateInfo rpci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
-    rpci.attachmentCount = use_depth ? 2 : 1; rpci.pAttachments = att; rpci.subpassCount = 1; rpci.pSubpasses = &sub;
+    rpci.attachmentCount = use_ds ? 2 : 1; rpci.pAttachments = att; rpci.subpassCount = 1; rpci.pSubpasses = &sub;
     VkRenderPass rp; vkCreateRenderPass(dev, &rpci, nullptr, &rp);
     VkImageView fbviews[2] = {view, dview};
     VkFramebufferCreateInfo fbci{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
-    fbci.renderPass = rp; fbci.attachmentCount = use_depth ? 2 : 1; fbci.pAttachments = fbviews; fbci.width = W; fbci.height = H; fbci.layers = 1;
+    fbci.renderPass = rp; fbci.attachmentCount = use_ds ? 2 : 1; fbci.pAttachments = fbviews; fbci.width = W; fbci.height = H; fbci.layers = 1;
     VkFramebuffer fb; vkCreateFramebuffer(dev, &fbci, nullptr, &fb);
 
     auto mkmod = [&](const std::vector<uint32_t>& c) -> VkShaderModule {
@@ -288,6 +299,23 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             dss.depthWriteEnable = ps->depth_write_enable ? VK_TRUE : VK_FALSE;
             dss.depthCompareOp   = (VkCompareOp)ps->depth_compare_op;
             if (getenv("PROSPER_DEPTH_ALWAYS")) dss.depthCompareOp = VK_COMPARE_OP_ALWAYS;   // diag
+        }
+        if (ps && ps->stencil_enable) {
+            // Wire the front/back stencil op-state so masks clip (e.g. the title shimmer tests the
+            // stencil the logo draw wrote). ref/compareMask/writeMask are baked (not dynamic).
+            dss.stencilTestEnable = VK_TRUE;
+            auto mkop = [&](int fb) {
+                VkStencilOpState s{};
+                s.failOp      = (VkStencilOp)ps->stencil_fail_op[fb];
+                s.passOp      = (VkStencilOp)ps->stencil_pass_op[fb];
+                s.depthFailOp = (VkStencilOp)ps->stencil_depth_fail_op[fb];
+                s.compareOp   = (VkCompareOp)ps->stencil_compare_op[fb];
+                s.compareMask = ps->stencil_compare_mask[fb];
+                s.writeMask   = ps->stencil_write_mask[fb];
+                s.reference   = ps->stencil_ref[fb];
+                return s;
+            };
+            dss.front = mkop(0); dss.back = mkop(1);
         }
         // Descriptor resources for this draw (two-set: VS=set0, PS=set1 — same layout as the single path).
         v.R = bd.R; auto& R = v.R;
@@ -394,7 +422,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         gp.stageCount = 2; gp.pStages = st; gp.pVertexInputState = &vin; gp.pInputAssemblyState = &ia;
         gp.pViewportState = &vpst; gp.pRasterizationState = &rs; gp.pMultisampleState = &ms;
         gp.pColorBlendState = &cb; gp.layout = v.layout; gp.renderPass = rp; gp.subpass = 0;
-        if (ps && ps->depth_test_enable) gp.pDepthStencilState = &dss;
+        if (ps && (ps->depth_test_enable || ps->stencil_enable)) gp.pDepthStencilState = &dss;
         if (vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gp, nullptr, &v.pipe) == VK_SUCCESS) v.ok = true;
     }
 
@@ -432,10 +460,10 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     VkClearValue clear[2]{}; clear[0].color = {{0.0f, 0.0f, 1.0f, 1.0f}};   // blue
     clear[1].depthStencil = {0.5f, 0};   // depth cleared to 0.5 (fragments at z=0.0 pass LESS, fail GREATER)
     VkRenderPassBeginInfo rpbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-    rpbi.renderPass = rp; rpbi.framebuffer = fb; rpbi.renderArea = {{0, 0}, {W, H}}; rpbi.clearValueCount = use_depth ? 2 : 1; rpbi.pClearValues = clear;
+    rpbi.renderPass = rp; rpbi.framebuffer = fb; rpbi.renderArea = {{0, 0}, {W, H}}; rpbi.clearValueCount = use_ds ? 2 : 1; rpbi.pClearValues = clear;
     if (getenv("PROSPER_PIPELOG")) {   // diag: how many draws' pipelines built + will be recorded
         int nok = 0; for (auto& v : dv) if (v.ok) nok++;
-        fprintf(stderr, "[pipe] %zu draws, %d pipelines OK, use_depth=%d; counts:", dv.size(), nok, (int)use_depth);
+        fprintf(stderr, "[pipe] %zu draws, %d pipelines OK, use_depth=%d use_stencil=%d; counts:", dv.size(), nok, (int)use_depth, (int)use_stencil);
         for (auto& v : dv) fprintf(stderr, " %s%u", v.ok ? "" : "SKIP", v.icount ? v.icount : v.vcount);
         fprintf(stderr, "\n");
     }
