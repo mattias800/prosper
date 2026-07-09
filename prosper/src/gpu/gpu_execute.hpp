@@ -19,6 +19,7 @@
 #include <functional>
 #include <memory>
 #include <vector>
+#include <set>
 
 namespace prosper::gpu {
 
@@ -212,13 +213,98 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                 const uint32_t* src = (const uint32_t*)(uintptr_t)draw->index_addr;
                 for (uint32_t i = 0; i < n; i++) { out.indices[i] = src[i]; max_index = std::max(max_index, out.indices[i]); }
             }
-            // Vertex count = the indexed range (max index + 1), bounded by the bound VB's record count
-            // (an index past the VB reads 0 under robustBufferAccess — same degenerate-vertex fallback).
+            // Vertex count = the indexed range (max index + 1). The INDEX BUFFER is authoritative for how
+            // many vertices the draw touches — do NOT clamp down to the bound VB's record count: the
+            // bindless per-glyph fetch resolves a tiny per-glyph V# (num_records=4 = one glyph), so clamping
+            // to it would drop every glyph but the first (#257). The VB is grown below to span this range;
+            // a truly-unmapped tail still degrades safely (safe_copy stops at the mapping edge -> zero).
             vertex_count = max_index + 1;
-            if (vb_entries && vertex_count > vb_entries) vertex_count = vb_entries;
         }
     }
     if (out.indices.empty() && vb_entries > vertex_count) vertex_count = vb_entries;
+    // Bindless per-glyph vertex fetch (#257): the fetch-shader patches a SMALL per-glyph V# (num_records=4
+    // = one glyph's 4 corners, size=304). But the draw indexes ALL vertices (gl_VertexIndex 0..N-1) out of
+    // the CONTIGUOUS vertex pool that begins at that base — so uploading only num_records*stride bytes
+    // leaves every vertex past the first glyph reading out-of-bounds (robustBufferAccess 0), collapsing the
+    // whole caption to the first glyph. Grow each vertex buffer to cover the draw's full vertex range so
+    // gl_VertexIndex reads the real per-vertex data. (Correct in general: a VB must span the drawn range.)
+    if (vrt) for (auto& r : vrt->resources)
+        if (r.cls == ResourceClass::VertexBuffer && r.stride) {
+            uint32_t need = vertex_count * r.stride;
+            if (r.size < need) r.size = need;
+        }
+    // PROSPER_CAPTION_DIAG: for the caption text mesh (a draw whose PS samples the 2048x1024 R8 font
+    // atlas), dump everything needed to see WHY its geometry collapses — vertex count, the bound vertex
+    // buffers (base/stride/size), the index range, and the VS bytecode (for offline llvm-mc disasm of the
+    // position export). Once per distinct VS. #102 follow-up (font atlas decodes; glyphs land nowhere).
+    // PROSPER_ONLY_ATLAS: render ONLY the caption text draw (samples the 2048x1024 font atlas), skipping
+    // every other draw — so the caption geometry renders alone onto a clear frame. With TESTPS this shows
+    // whether the caption rasterizes at all (magenta glyphs) or is culled/degenerate/clipped. #257.
+    if (getenv("PROSPER_ONLY_ATLAS")) {
+        bool sa = false;
+        if (prt) for (const auto& r : prt->resources)
+            if (r.cls == ResourceClass::Texture && r.width == 2048 && r.height == 1024) sa = true;
+        if (!sa) return false;
+        // PROSPER_ONLY_IC=<n>: further restrict to draws whose index count == n (isolate one atlas mesh,
+        // e.g. the main glyph batch idx=1566 vs a fullscreen atlas draw).
+        if (const char* ic_s = getenv("PROSPER_ONLY_IC")) {
+            uint32_t want = (uint32_t)atoi(ic_s);
+            uint32_t ic = (draw && draw->indexed) ? draw->index_count : vcount_hint;
+            if (ic != want) return false;
+        }
+    }
+    if (getenv("PROSPER_CAPTION_DIAG") && prt) {
+        bool samples_atlas = false;
+        for (const auto& r : prt->resources)
+            if (r.cls == ResourceClass::Texture && r.width == 2048 && r.height == 1024) samples_atlas = true;
+        static std::set<uint64_t> seen_vs;
+        if (samples_atlas && seen_vs.insert(rs.es_addr).second) {
+            uint32_t maxi = 0; for (uint32_t v : out.indices) maxi = std::max(maxi, v);
+            fprintf(stderr, "[caption] es=0x%llx vertex_count=%u indices=%zu max_index=%u vb_entries=%u\n",
+                    (unsigned long long)rs.es_addr, vertex_count, out.indices.size(), maxi, vb_entries);
+            if (vrt) for (const auto& r : vrt->resources) {
+                fprintf(stderr, "[caption]   %s binding=%u base=0x%llx stride=%u size=%u fmt=%u nc=%u\n",
+                        r.cls == ResourceClass::VertexBuffer ? "VB" :
+                        r.cls == ResourceClass::ConstantBuffer ? "CB" : "TEX",
+                        r.binding, (unsigned long long)r.gpu_addr, r.stride, r.size, (unsigned)r.format, r.num_components);
+                // Raw first 3 records as floats — reveals whether the fetched position/attr data is valid or
+                // NaN/degenerate (a stride-0 buffer reads record 0 for every vertex -> collapse). #257.
+                if (r.cls == ResourceClass::VertexBuffer && r.gpu_addr > 0x10000) {
+                    uint32_t st = r.stride ? r.stride : 16;
+                    for (int rec = 0; rec < 3; rec++) {
+                        const float* f = (const float*)(uintptr_t)(r.gpu_addr + (uint64_t)rec * st);
+                        const uint32_t* u = (const uint32_t*)(uintptr_t)(r.gpu_addr + (uint64_t)rec * st);
+                        fprintf(stderr, "[caption]       rec%d: %.3f %.3f %.3f %.3f  (raw %08x %08x %08x %08x)\n",
+                                rec, f[0], f[1], f[2], f[3], u[0], u[1], u[2], u[3]);
+                    }
+                }
+                // Constant buffers = the transform matrices / uniforms. Dump as vec4 rows (the collapse may
+                // be a mis-resolved MVP -> valid glyph coords transform off-screen / to w<=0). #257.
+                if (r.cls == ResourceClass::ConstantBuffer && r.gpu_addr > 0x10000) {
+                    uint32_t nvec = r.size / 16; if (nvec > 24) nvec = 24;
+                    for (uint32_t v = 0; v < nvec; v++) {
+                        const float* f = (const float*)(uintptr_t)(r.gpu_addr + (uint64_t)v * 16);
+                        fprintf(stderr, "[caption]       cb[%u]: %.4f %.4f %.4f %.4f\n", v, f[0], f[1], f[2], f[3]);
+                    }
+                }
+            }
+            fflush(stderr);
+            if (const char* dd = getenv("PROSPER_FRAME_DIR")) {
+                char fn[512]; snprintf(fn, sizeof fn, "%s/caption_vs_%llx.bin", dd, (unsigned long long)rs.es_addr);
+                if (FILE* f = fopen(fn, "wb")) { fwrite((const void*)(uintptr_t)rs.es_addr, 1, 8192, f); fclose(f); }
+                // The RECOMPILED VS SPIR-V — disassemble offline (spirv-dis) to trace the gl_Position export
+                // op-by-op against the RDNA2 source and find the mis-modeled op / bad matrix input. #257.
+                snprintf(fn, sizeof fn, "%s/caption_recompiled_%llx.spv", dd, (unsigned long long)rs.es_addr);
+                if (FILE* f = fopen(fn, "wb")) { fwrite(vs.data(), 4, vs.size(), f); fclose(f); }
+                // The recompiled PIXEL shader — the text is invisible because the PS discards every fragment
+                // (SDF alpha-test). Dump it (spirv-dis) to inspect the discard condition + atlas sample. #257.
+                snprintf(fn, sizeof fn, "%s/caption_ps_%llx.spv", dd, (unsigned long long)rs.ps_addr);
+                if (FILE* f = fopen(fn, "wb")) { fwrite(fs.data(), 4, fs.size(), f); fclose(f); }
+                snprintf(fn, sizeof fn, "%s/caption_ps_raw_%llx.bin", dd, (unsigned long long)rs.ps_addr);
+                if (FILE* f = fopen(fn, "wb")) { fwrite((const void*)(uintptr_t)rs.ps_addr, 1, 8192, f); fclose(f); }
+            }
+        }
+    }
     out.vs = std::move(vs); out.fs = std::move(fs); out.ps = ps;
     out.vrt = std::move(vrt); out.prt = std::move(prt); out.vertex_count = vertex_count;
     out.color0_base = rs.color0_base;   // render-to-texture: the target this draw writes into (#167)
