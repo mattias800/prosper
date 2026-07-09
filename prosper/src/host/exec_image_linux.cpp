@@ -424,6 +424,7 @@ namespace {
     // Control for the /78 imm forms is the two trailing imm8s; for the /79 reg forms it comes from the
     // source xmm (EXTRQ: rm[13:0]; INSERTQ: rm[77:64]).  len==0 means 64. CONFIDENCE: HIGH (Intel SDM).
     volatile unsigned long g_sse4a_emulated = 0;
+    const bool g_sse4a_stat = getenv("PROSPER_SSE4A_STAT") != nullptr;
     bool try_emulate_sse4a(ucontext_t* uc) {
         auto& g = uc->uc_mcontext.gregs;
         uint64_t rip = (uint64_t)g[REG_RIP];
@@ -460,6 +461,12 @@ namespace {
         }
         g[REG_RIP] = (greg_t)(rip + i);
         g_sse4a_emulated++;
+        // PROSPER_SSE4A_STAT: async-safe rate probe — every 2^20 emulations, write the count so a
+        // timed run reveals whether the SIGILL round-trip is the throughput wall. Diagnostic only.
+        if (g_sse4a_stat && (g_sse4a_emulated & 0xFFFFF) == 0) {
+            char b[64]; int n = snprintf(b, sizeof b, "[sse4a] %lu emulated\n", g_sse4a_emulated);
+            if (n > 0) { ssize_t w = write(2, b, (size_t)n); (void)w; }
+        }
         return true;
     }
 
@@ -1292,8 +1299,15 @@ void install_trap_handler() {
     install_sigaltstack();
     struct sigaction sa{};
     sa.sa_sigaction = fault_handler;
-    sa.sa_flags = SA_SIGINFO;   // (SA_ONSTACK disabled: siglongjmp from the alt stack tripped glibc's
-                                // %fs-guarded ____longjmp_chk -> jump-to-garbage fault storm)
+    sa.sa_flags = SA_SIGINFO;   // (SA_ONSTACK disabled by default: siglongjmp from the alt stack tripped
+                                // glibc's %fs-guarded ____longjmp_chk -> jump-to-garbage fault storm)
+    // PROSPER_FAULT_ONSTACK: run the handler on the per-thread sigaltstack. Needed to diagnose a
+    // guest-thread STACK OVERFLOW: the fault destroys the thread's own stack, so a handler without an
+    // alt stack cannot even enter (nested #PF -> forced-default SIGSEGV, killed with no report — the
+    // exact "fatal signal 11, no output" we see mid-load). On the alt stack the worker-thread fault
+    // path (which does NOT siglongjmp) can print the faulting RIP. Gated so the default boot's
+    // main-thread siglongjmp recovery is unchanged. CONFIDENCE: HIGH (mechanism).
+    if (getenv("PROSPER_FAULT_ONSTACK")) sa.sa_flags |= SA_ONSTACK;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, nullptr);
     sigaction(SIGBUS,  &sa, nullptr);

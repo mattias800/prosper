@@ -40,6 +40,9 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
         } else if (c.op == IT_EVENT_WRITE) {
             c.kind = K::EventWrite;
             if (npl >= 1) c.event_type = pl[0] & 0xffu;
+            // Address-carrying (timestamp/label) variant: [1..2] = address lo/hi (#132). Address-less
+            // pipeline-sync events leave event_addr == 0 (a no-op in the CommandProcessor).
+            if (npl >= 3) c.event_addr = (uint64_t)pl[1] | ((uint64_t)pl[2] << 32);
         } else if (c.op == IT_SET_SH_REG) {
             // SET_SH_REG sets a RANGE: pl[0] = start register offset, pl[1..npl-1] = consecutive values
             // (this is how the driver uploads the whole user-data descriptor block in one packet — e.g. a

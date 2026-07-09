@@ -124,6 +124,35 @@ int main() {
         }
     }
 
+    // (7) PROSPER_PAD_SCRIPT pure helpers — parse + time-eval (drives menus headless, issue #163).
+    {
+        CHECK(pad_button_by_name("start")   == SCE_PAD_BUTTON_OPTIONS, "name: start -> OPTIONS");
+        CHECK(pad_button_by_name("options") == SCE_PAD_BUTTON_OPTIONS, "name: options -> OPTIONS");
+        CHECK(pad_button_by_name("cross")   == SCE_PAD_BUTTON_CROSS,   "name: cross -> CROSS");
+        CHECK(pad_button_by_name("x")       == SCE_PAD_BUTTON_CROSS,   "name: x -> CROSS");
+        CHECK(pad_button_by_name("up")      == SCE_PAD_BUTTON_UP,      "name: up -> UP");
+        CHECK(pad_button_by_name("nonsense")== 0,                      "name: unknown -> 0");
+
+        auto s = parse_pad_script("3:start;9.5:cross;16:up+cross");
+        CHECK(s.size() == 3, "parse: 3 entries");
+        CHECK(s[0].t_secs == 3.0 && s[0].button_mask == SCE_PAD_BUTTON_OPTIONS, "parse: entry0 t/mask");
+        CHECK(s[1].t_secs == 9.5 && s[1].button_mask == SCE_PAD_BUTTON_CROSS,   "parse: fractional time");
+        CHECK(s[2].button_mask == (SCE_PAD_BUTTON_UP | SCE_PAD_BUTTON_CROSS),   "parse: '+' combines buttons");
+
+        // Malformed pieces are skipped, not fatal; an all-unknown entry drops out.
+        auto s2 = parse_pad_script("nocolon;5:garbagebtn;7:down");
+        CHECK(s2.size() == 1 && s2[0].button_mask == SCE_PAD_BUTTON_DOWN, "parse: skips malformed/empty entries");
+
+        // Time-eval: a button is held only within [t, t+hold).
+        const double hold = 0.30;
+        CHECK(pad_script_buttons_at(s, 2.9, hold) == 0,                       "eval: before window -> none");
+        CHECK(pad_script_buttons_at(s, 3.0, hold) == SCE_PAD_BUTTON_OPTIONS,  "eval: at window start -> pressed");
+        CHECK(pad_script_buttons_at(s, 3.29, hold) == SCE_PAD_BUTTON_OPTIONS, "eval: within window -> pressed");
+        CHECK(pad_script_buttons_at(s, 3.30, hold) == 0,                      "eval: at window end (exclusive) -> released");
+        CHECK(pad_script_buttons_at(s, 16.1, hold) == (SCE_PAD_BUTTON_UP | SCE_PAD_BUTTON_CROSS), "eval: combined press");
+        CHECK(parse_pad_script("").empty(), "parse: empty spec -> no entries");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
