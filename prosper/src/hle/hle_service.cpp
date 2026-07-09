@@ -41,7 +41,20 @@ HLE(s_user_getevent)  {
     return 0x80960007ull;   // SCE_USER_SERVICE_ERROR_NO_EVENT
 }
 HLE(s_ok)             { return 0; }
-HLE(s_gamepresets)    { return 0x80960006ull; }   // SCE_USER_SERVICE_ERROR_OPERATION_NOT_SUPPORTED (see reg. comment)
+// sceUserServiceGetGamePresets(userId, presets): MUST return success (0). The Unity engine's
+// per-controller connection check (eboot 0x14707e0, reached from the pad "reset" path 0x1470ca0)
+// calls this and treats ANY non-zero user-service return as "controller invalid" — it then clears the
+// pad's connected flag (eboot+0x201d150) EVERY FRAME, so scePadGetLoginUserIdList-based enumeration
+// reports 0 controllers and the game never calls scePadOpen. i.e. this one wrong errno silently killed
+// ALL gamepad input in The Messenger (#234). The prior 0x80960006 was chosen to avoid the game reading
+// an untouched (garbage) out-struct; instead return 0 AND zero the payload: the out-struct's first field
+// is its byte size (the caller sets it, e.g. 0x30) — zero the bytes after it (bounded) for clean default
+// presets. CONFIDENCE: HIGH — root-caused via HWBP/HWWATCH on the eboot connection flag; verified fix
+// makes scePadOpen + scePadReadState fire and input register.
+HLE(s_gamepresets) {
+    if (a1) { uint32_t sz = *(uint32_t*)PW(a1); if (sz > 8 && sz <= 0x400) memset((char*)PW(a1) + 8, 0, sz - 8); }
+    return 0;
+}
 
 // --- NP / online (single-player: report signed-out / unreachable, success) ---
 HLE(s_np_state)       { if (a1) *(int32_t*)PW(a1) = 1; return 0; }           // SCE_NP_STATE_SIGNED_OUT
@@ -156,14 +169,11 @@ void register_service_hle() {
     Hle::register_fn("rnEhHqG-4xo", (HleFn)s_user_int_out, "sceUserServiceGetAccessibilityChatTranscription");
     Hle::register_fn("O6IW1-Dwm-w", (HleFn)s_user_int_out, "sceUserServiceGetAccessibilityZoomFollowFocus");
     Hle::register_fn("-3Y5GO+-i78", (HleFn)s_user_int_out, "sceUserServiceGetAccessibilityTriggerEffect");
-    // sceUserServiceGetGamePresets (-sD02mFDBh4): output struct layout unknown (shadPS4 has only a
-    // stub; no Kyty reference), so we must NOT write into it (wrong-size default = stack-smash risk,
-    // cf. f_fstat). But the generic unimplemented stub returned 0 = SUCCESS with the struct untouched,
-    // so the game consumed uninitialized memory as its preset data. Returning a clean UserService
-    // error makes the game take its no-presets fallback instead. OPERATION_NOT_SUPPORTED is a terminal
-    // (non-retryable) errno — deliberately NOT NO_EVENT/NOT_LOGGED_IN, which drain loops retry (the
-    // GetEvent 0x80960009 stall taught us a poll-class errno can spin the caller forever).
-    // CONFIDENCE: MED on errno choice; HIGH that success+garbage is wrong.
+    // sceUserServiceGetGamePresets (-sD02mFDBh4): returns 0 with a zeroed payload (see s_gamepresets).
+    // History: it once returned 0x80960006 to avoid the game reading an untouched garbage struct — but
+    // that non-zero errno made the Unity engine's per-controller check disconnect the pad every frame
+    // and killed ALL gamepad input (#234). s_gamepresets now zeroes the payload after the caller-set
+    // size field and returns success, satisfying both concerns.
     Hle::register_fn("-sD02mFDBh4", (HleFn)s_gamepresets, "sceUserServiceGetGamePresets");
     R("sceUserServiceInitialize", s_ok);
     R("sceUserServiceTerminate", s_ok);
