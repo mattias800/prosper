@@ -66,6 +66,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_va2foff PRIVATE prosper_core)
   add_test(NAME va2foff_load_priority COMMAND test_va2foff)
 
+  # AMD SSE4a INSERTQ/EXTRQ emulation (the SIGILL handler emulates these Zen2-only ops on Intel
+  # hosts). Golden bit-math vectors — header-only, no game dump required.
+  add_executable(test_sse4a tests/test_sse4a.cpp)
+  add_test(NAME sse4a_insertq_extrq COMMAND test_sse4a)
+
   # sceAudioOut HLE: format decode, port lifecycle, PCM forwarding, volume, batch, error paths
   # (via a capturing AudioSink — headless, no device).
   add_executable(test_audio tests/test_audio.cpp)
