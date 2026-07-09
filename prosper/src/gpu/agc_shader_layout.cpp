@@ -124,8 +124,12 @@ DecodedImageDescriptor decode_image_descriptor(const uint32_t t[8]) {
     d.width     = (uint32_t)(((t[1] >> 30) & 0x3u) | (((t[2] >> 0) & 0xFFFu) << 2)) + 1;          // Width5
     d.height    = (uint32_t)((t[2] >> 14) & 0x3FFFu) + 1;                                          // Height5
     d.format    = (t[1] >> 20) & 0x1FFu;                                                           // Format
-    d.tile_mode = (t[3] >> 20) & 0x1Fu;                                                            // TileMode
+    d.tile_mode = (t[3] >> 20) & 0x1Fu;                                                            // TileMode (SW_MODE)
     d.type      = (uint8_t)((t[3] >> 28) & 0xFu);                                                  // Type
+    d.dst_sel[0] = (uint8_t)((t[3] >> 0) & 0x7u);   // DST_SEL_X (WORD3 [2:0])
+    d.dst_sel[1] = (uint8_t)((t[3] >> 3) & 0x7u);   // DST_SEL_Y ([5:3])
+    d.dst_sel[2] = (uint8_t)((t[3] >> 6) & 0x7u);   // DST_SEL_Z ([8:6])
+    d.dst_sel[3] = (uint8_t)((t[3] >> 9) & 0x7u);   // DST_SEL_W ([11:9])
     return d;
 }
 
@@ -179,8 +183,9 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                 d.width > 16384 || d.height > 16384) continue;  // skip a garbage/degenerate T#
             if (getenv("PROSPER_GFXLOG")) {
                 const uint32_t* t = &user_sgprs[off];
-                fprintf(stderr, "[t#] %ux%u base=0x%llx tile_mode=%u type=%u fmt=%u | raw: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                fprintf(stderr, "[t#] %ux%u base=0x%llx tile_mode=%u type=%u fmt=%u swz=%u,%u,%u,%u | raw: %08x %08x %08x %08x %08x %08x %08x %08x\n",
                         d.width, d.height, (unsigned long long)d.base, d.tile_mode, d.type, d.format,
+                        d.dst_sel[0], d.dst_sel[1], d.dst_sel[2], d.dst_sel[3],
                         t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7]);
             }
             // Decode the T#'s real Gen5 IMG_FMT (#65 — was hardcoded Unorm8 x4 / size w*h*4, which
@@ -227,6 +232,8 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             r.width         = d.width;
             r.height        = d.height;
             r.tile_mode     = d.tile_mode;          // so the renderer can auto-detile a GPU-tiled surface
+            r.swizzle[0] = d.dst_sel[0]; r.swizzle[1] = d.dst_sel[1];
+            r.swizzle[2] = d.dst_sel[2]; r.swizzle[3] = d.dst_sel[3];   // T# DST_SEL channel remap (#261)
             // Backing byte size: block-compressed surfaces store one bytes_per_block unit per 4x4 block
             // (ceil dims); uncompressed store bytes_per_block per texel (fmt=56 -> *4).
             r.size          = is_bcn ? (((d.width + 3) / 4) * ((d.height + 3) / 4) * fi.bytes_per_block)
