@@ -27,6 +27,36 @@ jobs:
       - name: Test
         run: ctest --test-dir prosper/build-ci --output-on-failure
 
+  linux-app:
+    name: Linux App
+    runs-on: ubuntu-latest
+
+    # Builds the desktop frontend (prosper-app) with the SDL3 audio + gamepad frontends and Vulkan,
+    # so the windowing/present/boot glue and the frontends stay compiling. Build-only: the app opens a
+    # window and needs a display, so it isn't run here (the headless core is covered by the `linux` job).
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        # Vulkan (loader + FindVulkan) for the renderer; Wayland/X11 dev libs so the fetched SDL3
+        # builds its video backends; PulseAudio/ALSA for the SDL3 audio backend. SDL3 itself is
+        # fetched + built by CMake (FetchContent), so no libsdl package is needed.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config libvulkan-dev \
+            libwayland-dev wayland-protocols libxkbcommon-dev libx11-dev \
+            libxext-dev libxcursor-dev libxi-dev libxrandr-dev libxfixes-dev \
+            libpulse-dev libasound2-dev
+
+      - name: Configure
+        run: cmake -S prosper -B prosper/build-app -G Ninja -DCMAKE_BUILD_TYPE=Debug -DPROSPER_APP=ON -DPROSPER_AUDIO_SDL3=ON -DPROSPER_PAD_SDL3=ON
+
+      - name: Build prosper-app
+        # Building this target also builds its deps: prosper_core, prosper_live_renderer, SDL3, and
+        # the prosper_audio_sdl3 / prosper_pad_sdl3 frontends.
+        run: cmake --build prosper/build-app --target prosper-app
+
   windows-mingw:
     name: Windows MinGW
     runs-on: windows-latest
