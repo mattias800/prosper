@@ -779,3 +779,57 @@ bring-up. In dependency order:
   benign SIGSEGV wedges gdb.
 - Caveat seen this session: batch-gdb breakpoints on guest RWX addresses sometimes don't fire
   cleanly (worker-thread timing); prefer breaking on a host symbol first, then arming guest bps.
+
+### SOLVED (2026-07-09, issue #213/#222): four post-load walls cleared — DOLL runs deep into engine init with the AGC draw-path wired; the remaining wall is characterized
+
+Building on the stable frame loop (#213), four distinct walls between "empty present loop" and
+"scene draws" were RE'd and fixed (all offsets eboot-relative; captures via gdb on the ext4 fast
+path). The game now runs 200+ flips / 470+ compute dispatches, deep into post-load engine init
+(trophy, error-dialog, telemetry subsystems), with 0 faults and 0 OOM.
+
+1. **The #222 EUD-ring fault (eboot+0x59949e4) was the FIRST scene-draw prep crash, not a race.**
+   `+kSrjIVxKFE` (the AGC register-context ctor) is called repeatedly on LIVE contexts (a per-
+   frame/post-bind reset; DOLL even builds contexts on the stack), not once at device init. The
+   guest's SetSource (eboot+0x5994620) EARLY-OUTS when [sub+0x00] still equals the shader being
+   bound; a full bind derives +0x34/+0x38/+0x3c/+0x40/+0x44 from the SAME user_data descriptor,
+   so +0x44!=0 always implies direct-table[10]!=0xffff. Our Stage-1 ctor overwrote ONLY [sub+0x08]
+   with the empty all-0xffff descriptor; after a reset of a bound context, re-binding the SAME
+   shader early-outed, leaving +0x44 stale-nonzero against the sentinel table. The EUD writer
+   (eboot+0x5994940, no 0xffff guard in DOLL's build) then computed slot 0xffff -> spill base 0 +
+   0xffff*4 - 0x80 = 0x3ff7c (the exact captured fault addr). Fix: model the ctor as the guest's
+   own sub-reset (eboot+0x59945e0) — zero [sub+0x00..0x47] + the +0x60/+0x68 cached bank & flags,
+   preserve the +0x48/+0x50 allocator pointers & +0x58 mode byte, install the empty descriptor.
+
+2. **The per-draw fence cluster was never wired.** The guest fence builder (eboot+0x59a1780)
+   allocates a label inside a Dcb NOP data packet, pre-builds WriteData/ReleaseMem/WaitRegMem with
+   NULL placeholder addresses, then patches the label address through three imports that were
+   observe-only glog no-ops: `fPSCdQxgpSw`=WriteData-patch-addr, `3KDcnM3lrcU`=WaitRegMem-patch-
+   addr, `0fWWK5uG9rQ`=ReleaseMem-patch-addr. With them stubbed, every per-draw GPU fence targeted
+   address 0. Implemented all three (each validates the packet header sub-op first; 0 refusals
+   across a full run). Also implemented `k3GhuSNmBLU`=sceAgcDcbDispatchDirect(dcb,x,y,z,modifier)
+   as a new R_DISPATCH_DIRECT packet (guest wrapper eboot+0x220ede0; Kyty Gen4 DispatchDirect ABI)
+   — DOLL's compute prologue issues ~470 of these.
+
+3. **The 34.6 GB OOM / RenderThread-timeout was a trophy success-with-garbage-out.**
+   `sceNpTrophy2GetGameInfo` (NID 4IzqhhUQ3nk, nid_hash brute force) + fill sibling y3zHpdZO6ME:
+   the guest (eboot+0xdbcb43) reads a u32 count from the out-struct and grows two TArrays from it;
+   the unimplemented stub's success-without-write fed heap garbage as the count -> a 34,644,492,288-
+   byte array grow ("Ran out of memory allocating 34644492288 bytes"), or (garbage allocatable-huge)
+   a multi-minute zero-fill that starved the RenderThread until UE's 120 s watchdog fired. Fix:
+   return failure (0x80551500) so the caller takes its clean trophy-unavailable path (eboot+0xdbd239).
+
+4. **sceVideoOutGetOutputStatus (#82) — the ONE consumer is now RE'd.** DOLL's swapchain init
+   (eboot+0x2226fea) reads a u32 at status+0x04 and switches to an HDR pixel format when it == 2.
+   Success-without-write fed it stack garbage. Fix: write a defined {u32 state=0, u32 mode=0}
+   prefix (SDR, 8 bytes — within the caller's 0x50-byte reservation).
+
+**Remaining wall (characterized, next session):** the main GameThread is parked in a ~1 ms
+timed-poll loop — guest fn eboot+0x2cc2340 does a vtable poll (`call *0x20(%rax)` at +0x2cc236a)
+then a `vucomisd` elapsed-time/timeout compare (eboot+0x2324190), backed by a timed cond-wait
+(eboot+0x22ea94f -> the guest's ~1 ms sleep helper). It is polling an async completion that a
+worker never delivers — the same "wait-for-completion-with-timeout" scene-activation shape, now
+reached far deeper (past PreInit, RHI, plugin load, trophy/telemetry init). Next: resolve the
+vtable object at eboot+0x2cc236a's `*0x20(%rax)` (break there, walk the interface) and what the
++0x2324190 double compare gates — likely a streaming-level / world-activation handshake, still on
+the FlushAsyncLoading -> TickAsyncLoading axis. Still 0 graphics draws (DrawIndex/DrawIndexAuto);
+the compute-only dispatch stream is UE4's persistent per-frame GPU setup, not scene geometry.

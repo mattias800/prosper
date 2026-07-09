@@ -111,6 +111,12 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
                     c.kind = K::DrawIndexAuto;
                     if (npl >= 1) c.index_count = pl[0];
                     break;
+                case R_DISPATCH_DIRECT:
+                    c.kind = K::DispatchDirect;
+                    // payload: [0..2]=threadgroups x/y/z, [3..4]=64-bit dispatch modifier.
+                    if (npl >= 3) { c.tg_x = pl[0]; c.tg_y = pl[1]; c.tg_z = pl[2]; }
+                    if (npl >= 5) c.dispatch_modifier = (uint64_t)pl[3] | ((uint64_t)pl[4] << 32);
+                    break;
                 case R_CX_REGS_INDIRECT:
                 case R_SH_REGS_INDIRECT:
                 case R_UC_REGS_INDIRECT:
