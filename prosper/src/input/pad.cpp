@@ -5,6 +5,7 @@
 #include "pad.hpp"
 #include <cstddef>
 #include <cstring>
+#include <cstdlib>
 #include <atomic>
 
 namespace prosper::input {
@@ -99,6 +100,54 @@ void pad_fill_controller_info(ScePadControllerInformation* out, bool connected, 
     out->connected_count = connected_count;
     out->connected       = connected ? 1 : 0;
     out->device_class    = 0;       // SCE_PAD_DEVICE_CLASS_STANDARD
+}
+
+// --- Scripted input (PROSPER_PAD_SCRIPT) pure helpers — see pad.hpp -----------------------------
+uint32_t pad_button_by_name(const std::string& n) {
+    if (n == "start" || n == "options") return SCE_PAD_BUTTON_OPTIONS;
+    if (n == "cross" || n == "x")       return SCE_PAD_BUTTON_CROSS;
+    if (n == "circle" || n == "o")      return SCE_PAD_BUTTON_CIRCLE;
+    if (n == "square")                  return SCE_PAD_BUTTON_SQUARE;
+    if (n == "triangle")                return SCE_PAD_BUTTON_TRIANGLE;
+    if (n == "up")                      return SCE_PAD_BUTTON_UP;
+    if (n == "down")                    return SCE_PAD_BUTTON_DOWN;
+    if (n == "left")                    return SCE_PAD_BUTTON_LEFT;
+    if (n == "right")                   return SCE_PAD_BUTTON_RIGHT;
+    if (n == "l1") return SCE_PAD_BUTTON_L1; if (n == "r1") return SCE_PAD_BUTTON_R1;
+    if (n == "l2") return SCE_PAD_BUTTON_L2; if (n == "r2") return SCE_PAD_BUTTON_R2;
+    if (n == "l3") return SCE_PAD_BUTTON_L3; if (n == "r3") return SCE_PAD_BUTTON_R3;
+    return 0;
+}
+
+std::vector<PadScriptEntry> parse_pad_script(const std::string& spec) {
+    std::vector<PadScriptEntry> v;
+    size_t i = 0;
+    while (i < spec.size()) {
+        size_t semi = spec.find(';', i);
+        std::string tok = spec.substr(i, semi == std::string::npos ? std::string::npos : semi - i);
+        i = (semi == std::string::npos) ? spec.size() : semi + 1;
+        size_t colon = tok.find(':');
+        if (colon == std::string::npos) continue;
+        double t = atof(tok.substr(0, colon).c_str());
+        std::string btns = tok.substr(colon + 1);
+        uint32_t mask = 0;
+        size_t j = 0;
+        while (j < btns.size()) {                       // '+'-separated buttons pressed together
+            size_t plus = btns.find('+', j);
+            std::string one = btns.substr(j, plus == std::string::npos ? std::string::npos : plus - j);
+            j = (plus == std::string::npos) ? btns.size() : plus + 1;
+            mask |= pad_button_by_name(one);
+        }
+        if (mask) v.push_back({t, mask});
+    }
+    return v;
+}
+
+uint32_t pad_script_buttons_at(const std::vector<PadScriptEntry>& script, double elapsed_secs, double hold_secs) {
+    uint32_t mask = 0;
+    for (const auto& e : script)
+        if (elapsed_secs >= e.t_secs && elapsed_secs < e.t_secs + hold_secs) mask |= e.button_mask;
+    return mask;
 }
 
 } // namespace prosper::input
