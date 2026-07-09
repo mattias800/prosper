@@ -94,6 +94,18 @@ renderer is wired in; the game's **real pixel shader recompiles to valid SPIR-V*
   real guest, (2) Kyty+shadPS4 agreeing (strongest for PS4-inherited surfaces), (3) either alone
   — cite which and mark CONFIDENCE accordingly, and weight Kyty DOWN for anything Gen5/AGC.
   Never weaken a behavior that a live boot demonstrates just to match a reference.
+- **PS5 3.20 firmware library reference — the definitive NID↔name database (`../PS5-3.20_Libs/`).**
+  A `genstub.py`-generated dump of **all 275 PS5 3.20 system libraries**, one `libSceXxx.c` per library.
+  Each file lists **every exported function AND its exact NID**: the loader lines read
+  `sprx_dlsym(__handle, "<NID>", &__ptr_<funcName>)`, so each is a `<NID> ↔ <funcName>` pair. This is
+  the **authoritative PS5-specific symbol map** — trust it OVER the PS4-era shadPS4 aerolib / Kyty for
+  any Gen5/PS5-only surface (AGC, Ampr, Pad/UserService Gen5, etc.), and use it to see a library's
+  *complete* real API surface (e.g. what functions exist that a title might call). Recipes:
+  - Resolve an unknown NID → name: `grep -rn '<NID>' ../PS5-3.20_Libs/` (the matching `__ptr_<name>` names it).
+  - A library's full export list: `grep -oE '\.global sce[A-Za-z0-9]+' ../PS5-3.20_Libs/libSceXxx.c | sort -u`.
+  - Which library exports a symbol: `grep -rl '<funcName>' ../PS5-3.20_Libs/`.
+  Caveat: it gives **names + NIDs only, no bodies** — argument layouts and behavior still come from
+  prosper's live captures + Kyty/shadPS4. Gitignored sibling of the repo; never commit its contents.
 - **Commit style:** small, verified commits; push to `origin` promptly. Co-author trailer as configured.
   **Do NOT add "Generated with Claude Code" attribution lines** (the 🤖 badge, "Generated with
   [Claude Code](...)" footers, session links) to PR bodies, commit messages, issue text, or
