@@ -230,19 +230,37 @@ namespace {
 // sceKernelReserveVirtualRange(void** addrInOut, size_t len, int flags, size_t align)
 // MUST return an address aligned to `align`: guest allocators round the returned base
 // down to their requested alignment and would otherwise land below the mapping.
+//
+// FLAG SEMANTICS (issue #161): SCE_KERNEL_MAP_FIXED (0x10) means "exactly this address".
+// WITHOUT it, the hint is only a SEARCH START — the kernel finds the first free range at or
+// above the hint (shadPS4 MemoryManager::MapMemory SearchFree; BSD mmap contract). Treating
+// every hinted reserve as fixed — and, worse, blessing a hinted reserve that lands inside an
+// EXISTING reservation as "OK, same base" (the old #115 workaround below) — handed the SAME
+// base 0x1000000000 to two DIFFERENT guest VM spaces: UE4 PPSA17942 reserves its 512 GiB
+// MallocBinned3 arena (len=0x8000000000, flags=0) and then a 64 MiB allocator-metadata pool
+// (len=0x4000000, flags=0) with the SAME hint. With both spaces based at the same VA, MB3's
+// class-0 pool-info-table pointer array and its block-of-blocks BIT TREE were carved at the
+// SAME address (0x1000000000): when pools 0-63 of size-class 0 filled up, the bit tree's
+// root-propagation write (Bits[0] |= 1, caught live by a HW watchpoint at eboot+0x231c0ca)
+// flipped the low byte of the stored table pointer 0x20015f0000 -> 0x20015f0001, all
+// subsequent FPoolInfoSmall reads came back misaligned, and the boot died in a
+// "MallocBinned3 Corruption Canary" spam-loop. CONFIDENCE: HIGH (reserve args live-captured;
+// the corrupting write watched in-place; search semantics cross-checked against shadPS4).
 HLE(k_reserve_vrange) {
     uint64_t hint = a0 ? *(uint64_t*)a0 : 0;
     uint64_t align = a3 ? a3 : 0x4000;
-    if (hint) {
+    const bool fixed = (a2 & 0x10) != 0;   // SCE_KERNEL_MAP_FIXED
+    MLOG("reserve ENTRY hint=0x%llx len=0x%llx flags=0x%llx align=0x%llx\n",
+         (unsigned long long)hint, (unsigned long long)a1, (unsigned long long)a2,
+         (unsigned long long)a3);
+    if (!a1) return 0x80020016ull;         // SCE_KERNEL_ERROR_EINVAL (len 0; shadPS4 rejects too)
+    if (hint && fixed) {
         void* p = mmap((void*)hint, a1, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
         if (p == MAP_FAILED) {
-            // The hint region is already mapped. If it's ALREADY one of OUR reservations (uncommitted),
-            // the guest is re-reserving its own fixed range — PS5's reserve is idempotent for the caller's
-            // own range (the game's allocator no-hint-reserves, records the base, then re-claims it with a
-            // fixed hint). Returning an error here made the guest allocator hand back NULL, which the level1
-            // asset-load FileCacher then memcpy'd from (crash: memcpy(dst, NULL, n) during deserialization).
-            // Treat a re-reserve of our own reservation as success. CONFIDENCE: HIGH (matches the observed
-            // no-hint@line23 -> fixed-hint@line143 collision that precedes the loader-thread SIGSEGV).
+            // The FIXED hint region is already mapped. If it's ALREADY one of OUR reservations
+            // (uncommitted), the guest is re-claiming its own recorded range — idempotent success
+            // (#115: an error here made the guest allocator hand back NULL, which the level1
+            // asset-load FileCacher then memcpy'd from).
             bool ours = false;
             { std::lock_guard<std::mutex> lk(g_mx);
               for (auto& m : g_maps)
@@ -252,12 +270,41 @@ HLE(k_reserve_vrange) {
                 MLOG("reserve hint=0x%llx re-reserve-of-own-range -> OK\n", (unsigned long long)hint);
                 return 0;
             }
-            MLOG("reserve hint=0x%llx FAILED\n", (unsigned long long)hint); return 0x16;
+            MLOG("reserve FIXED hint=0x%llx FAILED\n", (unsigned long long)hint); return 0x16;
         }
         if (a0) *(uint64_t*)a0 = (uint64_t)p;
         track((uint64_t)p, a1, 0, false, "reserved");
-        MLOG("reserve(hint) -> 0x%llx len=0x%llx align=0x%llx\n", (unsigned long long)p, (unsigned long long)a1, (unsigned long long)align);
+        MLOG("reserve(fixed) -> 0x%llx len=0x%llx align=0x%llx\n", (unsigned long long)p, (unsigned long long)a1, (unsigned long long)align);
         return 0;
+    }
+    if (hint) {
+        // Non-fixed hint: search for a free range starting at the hint. Probe candidates with
+        // MAP_FIXED_NOREPLACE (also catches host mappings the tracker doesn't know); on a miss,
+        // skip past whichever TRACKED mapping covers the candidate (fast-forwards the search past
+        // the 512 GiB arena in one step), else advance one alignment granule.
+        uint64_t cand = align_up(hint, align);
+        const uint64_t kSearchLimit = 0x40000000000ull;   // 4 TiB — far above any guest range
+        while (cand < kSearchLimit) {
+            void* p = mmap((void*)cand, a1, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+            if (p != MAP_FAILED) {
+                if (a0) *(uint64_t*)a0 = (uint64_t)p;
+                track((uint64_t)p, a1, 0, false, "reserved");
+                MLOG("reserve(search from 0x%llx) -> 0x%llx len=0x%llx align=0x%llx\n",
+                     (unsigned long long)hint, (unsigned long long)p,
+                     (unsigned long long)a1, (unsigned long long)align);
+                return 0;
+            }
+            uint64_t next = cand + (align > 0x10000 ? align : 0x10000);
+            { std::lock_guard<std::mutex> lk(g_mx);
+              for (auto& m : g_maps)
+                  if (cand >= m.base && cand < m.base + m.size) {
+                      uint64_t past = align_up(m.base + m.size, align);
+                      if (past > next) next = past;
+                  } }
+            cand = next;
+        }
+        MLOG("reserve search from 0x%llx FAILED (no free range)\n", (unsigned long long)hint);
+        return 0x8002000cull;   // SCE_KERNEL_ERROR_ENOMEM
     }
     // Over-map by `align`, then trim the head/tail slack to yield an aligned span.
     uint64_t total = a1 + align;
