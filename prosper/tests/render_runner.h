@@ -116,6 +116,24 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     // robustBufferAccess: out-of-range storage-buffer accesses are well-defined, so a predicated memory
     // op run by an inactive lane (narrowed EXEC) can't fault.
     VkPhysicalDeviceFeatures feats{}; feats.robustBufferAccess = VK_TRUE; dci.pEnabledFeatures = &feats;
+    // robustImageAccess (VK_EXT_image_robustness; core in 1.3): the recompiled storage-image load
+    // path issues OpImageRead for ALL invocations — including EXEC-inactive lanes whose coordinates
+    // can be out of range — relying on OOB image reads returning zero (#131). This is the LIVE
+    // render backend (boot_trace registers render_draws_rgba as the submit renderer), so real game
+    // shaders run here on non-multiple image sizes. Feature-query guarded: a device without it
+    // still creates (visibly logged risk is preferable to failing device creation outright).
+    VkPhysicalDeviceImageRobustnessFeaturesEXT irf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES_EXT};
+    const char* img_robust_ext[] = { "VK_EXT_image_robustness" };
+    { uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(phys, nullptr, &ne, nullptr);
+      std::vector<VkExtensionProperties> de(ne);
+      vkEnumerateDeviceExtensionProperties(phys, nullptr, &ne, de.data());
+      for (uint32_t i = 0; i < ne; i++) if (!strcmp(de[i].extensionName, "VK_EXT_image_robustness")) {
+          VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+          f2.pNext = &irf; vkGetPhysicalDeviceFeatures2(phys, &f2);
+          if (irf.robustImageAccess) { dci.pNext = &irf;
+              dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = img_robust_ext; }
+          break;
+      } }
     VkDevice dev = VK_NULL_HANDLE;
     if (vkCreateDevice(phys, &dci, nullptr, &dev) != VK_SUCCESS || !dev) { vkDestroyInstance(inst, nullptr); return out; }
     VkQueue queue; vkGetDeviceQueue(dev, qfi, 0, &queue);

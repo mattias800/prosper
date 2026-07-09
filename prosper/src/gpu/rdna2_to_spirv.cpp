@@ -1419,6 +1419,23 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x2F: d = b.pack_half2x16(a, c); break;          // v_cvt_pkrtz_f16_f32 (e32 form)
                 default: ok = false;
             }
+            // SDWA output modifier: OMOD scale (×2/×4/×0.5) then CLAMP saturate, on FLOAT-result opcodes
+            // only (int ops never carry omod). Mirrors the VOP3 fresult path; a no-op when omod/clamp unset.
+            if (ok && (in.omod || in.clamp)) switch (in.opcode) {
+                case 0x03: case 0x04: case 0x08: case 0x0F: case 0x10:
+                case 0x1F: case 0x2B: case 0x20: case 0x2C: case 0x21: case 0x2D:
+                    if      (in.omod == 1) d = b.fbin(Op_FMul, d, b.uconst(fbits(2.0f)));
+                    else if (in.omod == 2) d = b.fbin(Op_FMul, d, b.uconst(fbits(4.0f)));
+                    else if (in.omod == 3) d = b.fbin(Op_FMul, d, b.uconst(fbits(0.5f)));
+                    if (in.clamp) d = b.fext2(Glsl_FMax, b.fext2(Glsl_FMin, d, b.uconst(fbits(1.0f))), b.uconst(fbits(0.0f)));
+                    break;
+                // A non-float-result opcode carrying a modifier (e.g. an INTEGER SDWA op with CLAMP =
+                // integer saturation) is not modeled by the float-domain omod/clamp above, so applying
+                // nothing would SILENTLY drop the saturation and emit a valid-but-wrong shader. Reject
+                // loudly instead — the same fail-visibly-over-miscompile discipline as the forward-if
+                // clamp (#129/#174). The guard means this only fires for a modifier-carrying op.
+                default: ok = false; break;
+            }
             if (ok) predicate_write(b, rs, in.dst.value, old_d);
             return true;
         }

@@ -74,8 +74,12 @@ void decode_operands(Rdna2Inst& i) {
                 // no SEXT(bit19/27) or reserved(bit22/30) — i.e. mask out neg/abs (0x6) from the nibble check.
                 i.src_neg[0] = ((sd >> 20) & 1u) != 0; i.src_abs[0] = ((sd >> 21) & 1u) != 0;
                 i.src_neg[1] = ((sd >> 28) & 1u) != 0; i.src_abs[1] = ((sd >> 29) & 1u) != 0;
+                // Output modifiers CLAMP@13 / OMOD@[15:14] (×2/×4/×0.5) — the recompiler applies these to the
+                // float result (like VOP3), so they no longer force rejection. Only real sub-dword selects
+                // (dst/src != DWORD=6) or SEXT/reserved keep has_modifier. (PPSA02664 PS: v_mul_f32 ×2, #121.)
+                i.clamp = ((sd >> 13) & 1u) != 0; i.omod = (uint8_t)((sd >> 14) & 3u);
                 if (((sd >> 8) & 7u) == 6u && ((sd >> 16) & 7u) == 6u && ((sd >> 24) & 7u) == 6u &&
-                    !((sd >> 13) & 1u) && !((sd >> 14) & 3u) && !((sd >> 19) & 0x9u) && !((sd >> 27) & 0x9u))
+                    !((sd >> 19) & 0x9u) && !((sd >> 27) & 0x9u))
                     i.has_modifier = false;
             } else { i.src[0] = decode_src_field(w & 0x1FFu); i.src[1] = vgpr(w >> 9); i.n_src = 2; }
             break;

@@ -1333,6 +1333,24 @@ int main() {
     CHECK(gotS1.size()==N && badS1==0, "v_cvt_u32_f32 saturates (NaN/neg -> 0, >=2^32 -> UINT_MAX)");
     CHECK(gotS2.size()==N && badS2==0, "v_cvt_i32_f32 saturates (NaN -> 0, clamps to INT_MIN/INT_MAX)");
 
+    // Kernel O: VOP2 v_mul_f32 in SDWA form with OMOD ×2 output modifier. This was a #121 blocker —
+    // PPSA02664's pixel shaders emit `v_mul_f32 v,v,v mul:2` (full-DWORD selects, omod=×2), which the
+    // decoder rejected as an unhandled modifier, failing the whole PS. Now the ×2 is applied.
+    //   w0=0x100002f9 (op 0x08, dst v0, vsrc1 v1, src0=0xF9=SDWA), w1=0x06064600 (dst/s0/s1 sel=DWORD, omod=1)
+    //   => out = (a0 * a1) * 2
+    const uint32_t codeO[] = { 0x100002f9u, 0x06064600u, 0xBF810000u };
+    std::vector<uint32_t> spvO = recompile_valu(codeO, sizeof(codeO)/sizeof(codeO[0]), 2, 0);
+    CHECK(!spvO.empty(), "recompiled v_mul_f32 SDWA omod:2 -> SPIR-V (no longer rejected)");
+    std::vector<float> inO(N * 2), expO(N);
+    for (uint32_t i = 0; i < N; i++) {
+        float a0 = (float)i * 0.1f - 3.0f, a1 = 1.25f;
+        inO[i*2+0] = a0; inO[i*2+1] = a1; expO[i] = (a0 * a1) * 2.0f;
+    }
+    std::vector<float> gotO = prosper::test::run_compute(spvO, inO, N, N);
+    uint32_t badO = 0; for (uint32_t i=0;i<N&&gotO.size()==N;i++) if (std::fabs(gotO[i]-expO[i])>1e-3f) badO++;
+    printf("  kernelO(omod:2) mismatches=%u (out[20]=%g expect=%g)\n", badO, gotO.size()==N?gotO[20]:-1, expO[20]);
+    CHECK(gotO.size()==N && badO==0, "v_mul_f32 SDWA omod:2 doubles the product: out = (a0*a1)*2");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
