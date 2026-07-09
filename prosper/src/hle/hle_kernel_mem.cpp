@@ -500,19 +500,19 @@ HLE(k_wait_on_address) {
     //   futex → the guest's *bounded* semaphore-wait blocked FOREVER and could never reach its
     //   timeout-exhausted branch. Honor it so timed waits actually time out and the guest re-evaluates.
     struct timespec ts, *pts = nullptr;
-    // NOTE: honoring the timeout is gated behind PROSPER_WAIT_TIMEOUT for now. It is the correct
-    // behavior (we were ignoring a timeout the guest passes → bounded semaphore-waits blocked forever),
-    // and it demonstrably changes execution — but it makes the guest take its *timeout* branch, which
-    // throws a C++ exception whose unwind then crashes because sceKernelGetModuleInfoForUnwind is
-    // unimplemented (libunwind reads garbage eh_frame → "Unsupported .eh_frame_hdr version" → stack
-    // smash). Until the unwinder is fed real eh_frame info, default to infinite waits (stable) and let
-    // the flag exercise the exception path during bring-up. See docs/RENDER_LOOP.md.
-    static const bool honor_timeout = getenv("PROSPER_WAIT_TIMEOUT") != nullptr;
+    // Honor the guest's timeout by DEFAULT (#139): ignoring it made a bounded semaphore-wait block
+    // FOREVER and return 0 (=signaled), so the guest consumed a resource never produced (phantom item
+    // -> crash). The original reason for keeping this gated off — the guest's timeout branch threw a
+    // C++ exception whose unwind crashed via the then-unimplemented sceKernelGetModuleInfoForUnwind —
+    // was fixed the same day (ca17aa9) and is stale: a 240 s run honoring the timeout on The Messenger
+    // showed no unwind/eh_frame fault. PROSPER_NO_WAIT_TIMEOUT restores infinite waits for bisection.
+    static const bool honor_timeout = getenv("PROSPER_NO_WAIT_TIMEOUT") == nullptr;
     if (a2 && honor_timeout) {
         uint32_t us = *(volatile uint32_t*)(uintptr_t)a2;
-        // FUTEX_WAIT's timeout is a RELATIVE duration; guard against absurd values.
-        if (us == 0) us = 1;                 // 0 == "poll" — a minimal wait keeps us re-checking
-        if (us > 5000000u) us = 5000000u;    // cap 5s so a huge/garbage value can't hang the thread
+        // FUTEX_WAIT's timeout is a RELATIVE duration. Honor the guest's EXACT value (uint32 µs, so at
+        // most ~71 min — no timespec overflow); the old hardcoded 5 s cap turned a longer legitimate
+        // timeout into an early ETIMEDOUT. Only 0 ("poll") is nudged to a minimal wait so we re-check.
+        if (us == 0) us = 1;
         ts.tv_sec = us / 1000000u; ts.tv_nsec = (long)(us % 1000000u) * 1000L; pts = &ts;
     }
     // --- DIAGNOSTIC punch-through (PROSPER_PUNCH=<secs>) -----------------------------------------

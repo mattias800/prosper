@@ -46,6 +46,21 @@ int main() {
     CHECK(done.load(std::memory_order_acquire), "wake releases a waiter after the value changes");
     waiter.join();
 
+    // Timed wait honors the timeout by DEFAULT (#139): a wait on a still-matching value with a short
+    // timeout must return the Sony ETIMEDOUT (0x80020060) after ~the timeout — not block forever and
+    // return 0 (=signaled). Previously this was gated off (PROSPER_WAIT_TIMEOUT) so it blocked forever.
+    {
+        alignas(4) uint32_t tw = 5;
+        uint32_t timeout_us = 30000;   // 30 ms
+        auto t0 = std::chrono::steady_clock::now();
+        uint64_t rc = wait((uint64_t)(uintptr_t)&tw, 5 /*expected == value -> blocks*/,
+                           (uint64_t)(uintptr_t)&timeout_us, 0, 0, 0);
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - t0).count();
+        CHECK(rc == 0x80020060ull, "timed wait returns SCE ETIMEDOUT (0x80020060), not 0/blocked-forever");
+        CHECK(elapsed >= 20 && elapsed < 2000, "timed wait actually waited ~the timeout (not the old 5 s cap / forever)");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
