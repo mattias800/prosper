@@ -9,6 +9,7 @@
 #include "nid.hpp"
 #include "../host/exec_image.hpp"
 #include <pthread.h>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -54,7 +55,23 @@ HLE(k_mutexattr_init) {
     *(void**)a0 = at;                     // store handle through caller's slot
     return 0;
 }
-HLE(k_mutexattr_settype)     { return 0; } // type/protocol/pshared ignored for now
+// Sony/FreeBSD mutex types: 1=ERRORCHECK (the FreeBSD/Sony DEFAULT), 2=RECURSIVE, 3=NORMAL,
+// 4=ADAPTIVE_NP (NORMAL semantics + spin). Kyty's PthreadMutexattrSettype uses exactly this
+// mapping and its attr-init defaults to type 1 — PS4-inherited surface, so solid evidence (#145).
+// Previously a no-op, and init forced RECURSIVE: a guest relying on trylock-fails-on-owner or
+// EDEADLK semantics silently got different behavior.
+HLE(k_mutexattr_settype) {
+    if (!a0 || !*(void**)a0) return 0x16;
+    int host;
+    switch ((int)a1) {
+        case 1: host = PTHREAD_MUTEX_ERRORCHECK; break;
+        case 2: host = PTHREAD_MUTEX_RECURSIVE;  break;
+        case 3: case 4: host = PTHREAD_MUTEX_NORMAL; break;
+        default: return 0x16;   // EINVAL
+    }
+    pthread_mutexattr_settype((pthread_mutexattr_t*)*(void**)a0, host);
+    return 0;
+}
 HLE(k_mutexattr_setprotocol) { return 0; }
 HLE(k_mutexattr_setpshared)  { return 0; }
 HLE(k_mutexattr_destroy)     { if (a0 && *(void**)a0) { free(*(void**)a0); *(void**)a0 = nullptr; } return 0; }
@@ -80,7 +97,11 @@ namespace {
         if (!pt_static_sentinel(cur)) return (pthread_mutex_t*)cur;
         auto* m = (pthread_mutex_t*)calloc(1, sizeof(pthread_mutex_t));
         pthread_mutexattr_t at; pthread_mutexattr_init(&at);
-        pthread_mutexattr_settype(&at, PTHREAD_MUTEX_RECURSIVE);
+        // The FreeBSD static sentinel ENCODES the type: NULL = PTHREAD_MUTEX_INITIALIZER (the
+        // DEFAULT type, which is ERRORCHECK on FreeBSD), 1 = PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP
+        // (NORMAL semantics + spin). Previously every sentinel self-init forced RECURSIVE (#145).
+        pthread_mutexattr_settype(&at, (uintptr_t)cur == 1 ? PTHREAD_MUTEX_NORMAL
+                                                           : PTHREAD_MUTEX_ERRORCHECK);
         pthread_mutex_init(m, &at);
         pthread_mutexattr_destroy(&at);
         if (__atomic_compare_exchange_n(slot, &cur, (void*)m, false,
@@ -116,21 +137,33 @@ namespace {
         return (pthread_rwlock_t*)cur;
     }
 }
+// scePthreadMutexInit(mutex_slot, attr_slot, name) / pthread_mutex_init(mutex_slot, attr_slot):
+// honor the caller's attr (type set via k_mutexattr_settype); no attr means Sony's default,
+// ERRORCHECK — FreeBSD PTHREAD_MUTEX_DEFAULT, and what Kyty's attr-init settype(1) produces (#145).
 HLE(k_mutex_init) {
     if (!a0) return 0x16;
     auto* m = (pthread_mutex_t*)calloc(1, sizeof(pthread_mutex_t));
-    // Default to recursive: game code often locks re-entrantly and Sony's default differs.
-    pthread_mutexattr_t at; pthread_mutexattr_init(&at);
-    pthread_mutexattr_settype(&at, PTHREAD_MUTEX_RECURSIVE);
-    pthread_mutex_init(m, &at);
-    pthread_mutexattr_destroy(&at);
+    pthread_mutexattr_t* at = (a1 && !pt_static_sentinel(*(void**)a1)) ? (pthread_mutexattr_t*)*(void**)a1 : nullptr;
+    pthread_mutexattr_t def;
+    if (!at) { pthread_mutexattr_init(&def); pthread_mutexattr_settype(&def, PTHREAD_MUTEX_ERRORCHECK); at = &def; }
+    pthread_mutex_init(m, at);
+    if (at == &def) pthread_mutexattr_destroy(&def);
     *(void**)a0 = m;
     return 0;
 }
+// The guest sees FreeBSD errno values; EBUSY(16)/EPERM(1)/EINVAL(22) coincide with both Linux and
+// MinGW, but EDEADLK differs on every host (FreeBSD 11, Linux 35, MinGW/winpthreads 36) — an
+// ERRORCHECK relock must report the FreeBSD value. `EDEADLK` is the HOST's own constant, so the
+// comparison remaps whatever the host returns on ALL platforms (the Windows CI build hit exactly
+// this: winpthreads returned its EDEADLK=36 and the old __linux__-only guard left it unremapped).
+namespace { inline uint64_t fbsd_errno(int host) {
+    if (host == EDEADLK) return 11;
+    return (uint64_t)(unsigned)host;
+} }
 HLE(k_mutex_destroy) { if (a0 && !pt_static_sentinel(*(void**)a0)) { pthread_mutex_destroy((pthread_mutex_t*)*(void**)a0); free(*(void**)a0); } if (a0) *(void**)a0 = nullptr; return 0; }
-HLE(k_mutex_lock)    { if (auto* m = ensure_mutex(a0)) pthread_mutex_lock(m); return 0; }
-HLE(k_mutex_trylock) { auto* m = ensure_mutex(a0); return m ? (uint64_t)pthread_mutex_trylock(m) : 0x16; }
-HLE(k_mutex_unlock)  { if (auto* m = ensure_mutex(a0)) pthread_mutex_unlock(m); return 0; }
+HLE(k_mutex_lock)    { auto* m = ensure_mutex(a0); return m ? fbsd_errno(pthread_mutex_lock(m))    : 0x16; }
+HLE(k_mutex_trylock) { auto* m = ensure_mutex(a0); return m ? fbsd_errno(pthread_mutex_trylock(m)) : 0x16; }
+HLE(k_mutex_unlock)  { auto* m = ensure_mutex(a0); return m ? fbsd_errno(pthread_mutex_unlock(m))  : 0x16; }
 
 // --- condition variables ---
 HLE(k_condattr_init)    { if (a0) { auto* c = (pthread_condattr_t*)calloc(1, sizeof(pthread_condattr_t)); pthread_condattr_init(c); *(void**)a0 = c; } return 0; }
