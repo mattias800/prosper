@@ -22,11 +22,12 @@ namespace prosper {
 
 namespace {
     std::vector<TlsModuleDesc> g_mods;   // index 0 reserved; 1 = main exe (eboot), then deps
+    std::vector<uint64_t> g_below;       // per-module distance below TP (parallel to g_mods; [0] unused)
     uint64_t g_total_below = 0;          // bytes of static TLS below the thread pointer
     bool     g_enabled = false;
     bool     g_configured = false;
 
-    inline uint64_t align_up(uint64_t v, uint64_t a) { return (v + a - 1) & ~(a - 1); }
+    inline uint64_t align_up(uint64_t v, uint64_t a) { return a ? (v + a - 1) & ~(a - 1) : v; }
     inline uint64_t rd_fsbase() { uint64_t v; __asm__ volatile("rdfsbase %0" : "=r"(v)); return v; }
     inline void     wr_fsbase(uint64_t v) { __asm__ volatile("wrfsbase %0" : : "r"(v)); }
 }
@@ -42,11 +43,26 @@ static constexpr uint32_t TCB_MAGIC       = 0x50524F53u;  // "PROS" — marks OU
 void guest_tls_set_templates(const TlsModuleDesc* descs, size_t count) {
     g_enabled = getenv("PROSPER_GUEST_FS") != nullptr;
     g_mods.assign(descs, descs + count);
-    // Variant II: sum each module's aligned static-TLS size. Module 1 (main exe) ends up closest to TP.
-    g_total_below = 0;
-    for (size_t i = 1; i < g_mods.size(); i++)
-        g_total_below += align_up(g_mods[i].memsz, 16);
-    g_total_below = align_up(g_total_below, 64);
+    // x86-64 Variant II static-TLS layout (glibc _dl_determine_tlsoffset, TLS_TCB_AT_TP): each
+    // module's block sits BELOW the thread pointer at a distance rounded to that module's REAL
+    // PT_TLS p_align — off[i] = round_up(off[i-1] + memsz[i], align[i]) — so its start (TP - off[i])
+    // is p_align-aligned and a symbol at byte X reads at %fs:(X - off[i]), exactly the tpoff the
+    // guest static linker baked into its initial-exec accesses. The old code rounded each module's
+    // SIZE to a hardcoded 16 (and the total to 64), which for a module with p_align > 16 placed the
+    // block at the wrong offset -> every %fs:-N read resolved off (#143). For the common p_align<=16
+    // case the per-module offsets are identical to before (round_up up a 16-multiple running total by
+    // 16 == the old per-size rounding), so nothing changes there.
+    g_below.assign(g_mods.size(), 0);
+    uint64_t off = 0, max_align = 16;
+    for (size_t i = 1; i < g_mods.size(); i++) {
+        uint64_t a = g_mods[i].align ? g_mods[i].align : 16;
+        if (a > max_align) max_align = a;
+        off = align_up(off + g_mods[i].memsz, a);
+        g_below[i] = off;
+    }
+    // Round the total (hence the TP position within the page-aligned block) up to the max module
+    // align, with a 64-byte floor preserved from the original (TCB/cache-line headroom).
+    g_total_below = align_up(off, max_align < 64 ? 64 : max_align);
     g_configured = true;
     if (getenv("PROSPER_TLSLOG"))
         fprintf(stderr, "[tls] guest-fs %s; static TLS below TP = 0x%llx bytes\n",
@@ -67,13 +83,11 @@ uint64_t guest_tls_activate_thread() {
     if (block == MAP_FAILED) return 0;
     memset(block, 0, total);                    // tbss + TCB start zeroed
     uint64_t tp = (uint64_t)block + g_total_below;
-    // Lay each module's TLS below TP, main exe (module 1) closest. Copy tdata (filesz), leave tbss zero.
-    uint64_t off = 0;
+    // Lay each module's TLS below TP at the precomputed Variant II offset (#143). Copy tdata (filesz),
+    // leave tbss zero. g_below[i] is the module's distance below TP, so its block start is tp-g_below[i].
     for (size_t i = 1; i < g_mods.size(); i++) {
-        uint64_t sz = align_up(g_mods[i].memsz, 16);
-        off += sz;
         if (g_mods[i].filesz && g_mods[i].init_va)
-            memcpy((void*)(tp - off), (const void*)(uintptr_t)g_mods[i].init_va, g_mods[i].filesz);
+            memcpy((void*)(tp - g_below[i]), (const void*)(uintptr_t)g_mods[i].init_va, g_mods[i].filesz);
     }
     *(uint64_t*)(tp + 0)          = tp;         // TCB self-pointer
     *(uint64_t*)(tp + HOSTFS_OFF) = host_fs;    // stash for the stub swap-back
@@ -115,6 +129,13 @@ uint64_t guest_fs_to_host_scoped() {
     return 0;
 }
 void guest_fs_restore_scoped(uint64_t prev_fs) { if (prev_fs) wr_fsbase(prev_fs); }
+
+// Diagnostic/test accessors for the Variant II static-TLS layout (#143): the distance below the
+// thread pointer at which module `modid`'s block starts (0 if out of range), and the total static
+// TLS below TP. Computed by guest_tls_set_templates regardless of the PROSPER_GUEST_FS gate, so a
+// test can verify the per-module p_align offsets without wrfsbase / an enabled guest-fs.
+uint64_t guest_tls_module_below(uint32_t modid) { return modid < g_below.size() ? g_below[modid] : 0; }
+uint64_t guest_tls_total_below() { return g_total_below; }
 
 } // namespace prosper
 #endif
