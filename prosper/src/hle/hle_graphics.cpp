@@ -91,16 +91,48 @@ constexpr int   kAgcCtxSubCount  = 3;               // cx / sh / uc register-set
 constexpr size_t kAgcCtxSubBase  = 0x38;            // first sub-object offset inside the context
 constexpr size_t kAgcCtxSubStride = 0x70;           // per sub-object (matches eboot+0x3b0210: *0x70)
 }
+// RE update (2026-07-09, issue #222 — DOLL/PPSA17942 EUD-ring fault at eboot+0x59949e4): this ctor
+// is ALSO called on LIVE contexts (a per-frame/POST-BIND reset), not just at device init. The sub-
+// object contract, recovered from DOLL's statically-linked AGC context code (identical library to
+// the Messenger eboot's 0x3afxxx block, at DOLL eboot+0x599xxxx):
+//   SetSource (+0x5994620) EARLY-OUTS when [sub+0x00] already equals the shader being bound; a full
+//   bind installs [sub+0x08] = shader->user_data and derives +0x34 (eud_size_dw), +0x38/+0x3c (the
+//   ud register range), +0x40 (0x20 if ud direct table[8] valid), +0x44 (nonzero iff table[10]
+//   valid) — all from the SAME descriptor, so table[10]==0xffff with +0x44!=0 cannot happen on real
+//   hardware. The EUD writer (+0x5994940, gated on +0x44!=0) indexes table[10] with NO 0xffff guard
+//   and stores through bank A [sub+0x10] / spill [sub+0x18]-0x80.
+// Our old Stage-1 ctor overwrote ONLY [sub+0x08] with the empty all-0xffff descriptor. On a live
+// context that had a shader bound, the next SetSource of the SAME shader early-outs (its cache key
+// [sub+0x00] survived), leaving +0x44 stale-nonzero against our sentinel table: the writer computes
+// slot 0xffff -> spill base 0 + 0xffff*4 - 0x80 = the exact observed fault address 0x3ff7c
+// (gdb-captured live: [sub+0x08] == g_agc_ctx_regmap, [sub+0x00] == live shader, +0x44 == 4).
+// Fix: model the ctor as the guest's own sub-reset (DOLL eboot+0x59945e0) — zero the source key,
+// banks and every ud-derived field ([sub+0x00..0x47] and the +0x60 cached bank / +0x68 init flags),
+// PRESERVE the guest-owned allocator pointers (+0x48/+0x50) and the +0x58 mode byte, then install
+// the empty descriptor. A later SetSource can then never early-out against the sentinel — it always
+// re-installs the real shader ud together with its derived fields. First-call behaviour on a fresh
+// zeroed context (the Messenger path) is bit-identical to the old ctor. CONFIDENCE: HIGH on the
+// reset semantics (guest reset fn + SetSource disassembly + live fault capture), MED on sub COUNT
+// (DOLL stage-selects sub indices up to 7; we reset the 3 we install descriptors into — subs we
+// never touched stay guest-consistent by construction).
 HLE(g_agc_ctx_init) {   // a0 = context pointer (device+0x48)
     gfx_tick();
+    if (getenv("PROSPER_GFXLOG"))
+        fprintf(stderr, "[gfx] libSceAgc::+kSrjIVxKFE(CtxInit) a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx\n",
+                (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
+                (unsigned long long)a3);
     if (a0) {
         if (g_agc_ud_no_entries[0] != 0xffffu) {    // one-time: wire the sentinel direct table
             for (auto& e : g_agc_ud_no_entries) e = 0xffffu;
             *(void**)(g_agc_ctx_regmap + 0x00) = g_agc_ud_no_entries;   // direct_resource_offset
         }
         uint8_t* ctx = (uint8_t*)(uintptr_t)a0;
-        for (int i = 0; i < kAgcCtxSubCount; i++)
-            *(void**)(ctx + kAgcCtxSubBase + i * kAgcCtxSubStride + 0x08) = g_agc_ctx_regmap;
+        for (int i = 0; i < kAgcCtxSubCount; i++) {
+            uint8_t* sub = ctx + kAgcCtxSubBase + i * kAgcCtxSubStride;
+            memset(sub + 0x00, 0, 0x48);            // source key, ud ptr, banks, derived fields
+            memset(sub + 0x60, 0, 0x09);            // cached bank (+0x60 qword) + init flags (+0x68)
+            *(void**)(sub + 0x08) = g_agc_ctx_regmap;
+        }
     }
     return 0;
 }
