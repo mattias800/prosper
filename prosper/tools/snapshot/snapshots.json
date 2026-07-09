@@ -1,0 +1,13 @@
+{
+  "snapshots": [
+    {
+      "name": "messenger-scene",
+      "dump": "PPSA24651-app0",
+      "scale": 4,
+      "timeout": 200,
+      "env": {},
+      "min_colors": 5000,
+      "_note": "Content-metric guard (min_colors): The Messenger's boot render isn't pixel-deterministic across runs (exact hashing AND a single settled frame both flake — the stable screen varies run-to-run). So `check` runs the whole boot and takes the RICHEST frame's distinct-color count — robust to per-frame variance, but still catches the regression that matters: a rejected/dropped shader (the #199/#201/#239 class) collapses every frame to the debug clear (~1 color), while a real render peaks in the tens of thousands (observed ~34k-137k once the scene/cutscene renders). 5000 is a wide margin below that and far above any blue-clear."
+    }
+  ]
+}

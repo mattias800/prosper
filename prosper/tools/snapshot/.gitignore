@@ -1,0 +1,4 @@
+failures/
+*.bmp
+*.png
+snap_*/
