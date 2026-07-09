@@ -936,6 +936,39 @@ std::unordered_set<uint32_t> safe_execz_branches(const std::vector<Rdna2Inst>& i
     return safe;
 }
 
+// FRAGMENT alpha-test / clip() discard via a SCALAR BRANCH. A per-lane condition (v_cmp -> VCC) is folded
+// into a saved-EXEC survivor mask by a 64-bit wave-mask op (s_and/s_andn2_b64 sDST,sDST,vcc — which on HW
+// sets SCC = "any lane survives"), then `s_cbranch_scc0 <fwd>` skips the shading when NO lane survives; the
+// block then narrows EXEC (s_wqm exec, sDST) and shades, and the export lowers to an OpKill of the failed
+// lanes. Per-invocation the wave early-out is a pure optimization — running the block for a lane that will
+// be OpKill'd at export is harmless — so the branch is safe to LINEARIZE (drop it, run the block straight-
+// line) exactly like a forward s_cbranch_execz. Recognize it by the mask op IMMEDIATELY preceding the
+// branch (hints ignored). Returns the pc of each such branch. This is the shape of every Unity cutout /
+// text draw; rejecting the branch dropped all of them (The Messenger's missing cutscene text, #102).
+std::unordered_set<uint32_t> mask_test_branches(const std::vector<Rdna2Inst>& ins) {
+    std::unordered_set<uint32_t> out;
+    const Rdna2Inst* prev = nullptr;
+    for (const auto& in : ins) {
+        if (in.is_end) break;
+        if (sopp_is_noop(in)) continue;                         // hints don't break the mask->branch pairing
+        if (in.fmt == Rdna2Format::SOPP && (in.opcode == 0x04 || in.opcode == 0x05) && in.simm16 > 0) {
+            // scc0/scc1 FORWARD branch whose SCC was set by a 64-bit wave-mask op: SOP2 s_and_b64(0x0f) /
+            // s_or_b64(0x11) / s_xor_b64(0x13) / s_andn2_b64(0x15), or SOP1 s_and/or_saveexec_b64 (0x24/0x25),
+            // writing a plain SGPR-pair kill mask. (A branch on a v_cmp/s_cmp SCC is a REAL uniform-if and is
+            // NOT matched — prev would be a SOPC/ALU, not a mask op.)
+            if (prev) {
+                bool mask_sop2 = prev->fmt == Rdna2Format::SOP2 &&
+                    (prev->opcode == 0x0f || prev->opcode == 0x11 || prev->opcode == 0x13 || prev->opcode == 0x15);
+                bool mask_saveexec = prev->fmt == Rdna2Format::SOP1 && (prev->opcode == 0x24 || prev->opcode == 0x25);
+                if ((mask_sop2 || mask_saveexec) && prev->dst.kind == OperandKind::SGPR && prev->dst.value <= 105)
+                    out.insert(in.pc);
+            }
+        }
+        prev = &in;
+    }
+    return out;
+}
+
 // A recognized COUNTED loop (the game's MSAA-resolve / accumulation shape): a single backward
 // unconditional branch (the back-edge) to a header, with exactly one forward SCC exit branch inside.
 // Anything more complex (nested loops, VCC/EXECNZ exits, multiple back-edges, mid-loop s_branch) is
@@ -1004,7 +1037,8 @@ struct ForwardIf {
 // code/dwords: the raw stream, so a branch target past the first s_endpgm can be decoded and
 // verified to be a genuine early-out (see below) instead of blanket-clamped.
 ForwardIf detect_forward_if(const std::vector<Rdna2Inst>& ins, bool allow_vcc,
-                            const uint32_t* code, size_t dwords) {
+                            const uint32_t* code, size_t dwords,
+                            const std::unordered_set<uint32_t>* skip = nullptr) {
     ForwardIf F; const Rdna2Inst* br = nullptr; int nbranch = 0; uint32_t end_pc = UINT32_MAX;
     for (const auto& in : ins) if (in.is_end) { end_pc = in.pc; break; }
     for (const auto& in : ins) {
@@ -1017,6 +1051,8 @@ ForwardIf detect_forward_if(const std::vector<Rdna2Inst>& ins, bool allow_vcc,
                 if (!allow_vcc) return F;                            // compute: needs a wave-uniform VCC test
                 br = &in; nbranch++; break;
             case 0x04: case 0x05:                                    // scc0 / scc1 (SCC is scalar/wave-uniform)
+                if (skip && skip->count(in.pc)) break;               // alpha-test kill-mask branch: handled by
+                                                                     // straight-line linearization, not a struct-if
                 br = &in; nbranch++; break;
             default: break;                                          // hints (nop/waitcnt/…) are fine
         }
@@ -1712,6 +1748,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     else ok = false;                                // barrier only meaningful in compute
                     break;
                 case 0x04: case 0x05:                              // s_cbranch_scc0 / scc1
+                    // An alpha-test / clip() kill-mask early-out (SCC = "any lane survives", set by a 64-bit
+                    // wave-mask op — see mask_test_branches) is a pure wave optimization: per-invocation the
+                    // survivor mask narrows EXEC in the block below and the export OpKills the failed lanes,
+                    // so the branch LINEARIZES away exactly like a forward s_cbranch_execz. Only these
+                    // recognized branches are dropped; any other SCC branch is still a real uniform-if we
+                    // can't model straight-line, so it rejects.
+                    if (safe_execz && safe_execz->count(in.pc)) break;   // recognized kill-mask branch -> no-op
+                    ok = false;
+                    break;
                 case 0x06: case 0x07:                              // s_cbranch_vccz / vccnz
                 case 0x09:                                         // s_cbranch_execnz
                     ok = false;
@@ -2211,7 +2256,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         }
         // 7. Post-loop body.
         if (!emit_range(L.exit_pc, UINT32_MAX)) return false;
-    } else if (const ForwardIf F = detect_forward_if(ins, /*allow_vcc*/!b.is_compute, code, dwords); F.found) {
+    } else if (const ForwardIf F = detect_forward_if(ins, /*allow_vcc*/!b.is_compute, code, dwords, &safe); F.found) {
         // Single structured uniform IF (forward s_cbranch_scc0/scc1): emit as OpSelectionMerge +
         // OpBranchConditional on the SCC bool, with an OpPhi per register written in the conditional
         // block that is live after the merge. Parallels the loop path's phi machinery. CONFIDENCE: MED —
@@ -2372,6 +2417,11 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords, co
     }
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
     auto safe_branches = safe_execz_branches(ins);
+    // FRAGMENT-only: also linearize alpha-test / clip() kill-mask s_cbranch_scc0/scc1 early-outs (Unity
+    // cutout + text draws). Merged into the same set so emit_alu drops the branch and detect_forward_if
+    // skips it; the block's EXEC narrow + the export's OpKill do the per-invocation discard (#102). This is
+    // NOT added for the vertex/compute shells (their scc branches are real uniform-ifs / NGG culling).
+    for (uint32_t pc : mask_test_branches(ins)) safe_branches.insert(pc);
     bool exported = false;
     auto exp_fn = [&](const Rdna2Inst& in) -> bool {         // EXP MRT0..7 -> the color output
         // An export while EXEC is narrowed (lanes killed by an alpha test / v_cmpx and not restored to

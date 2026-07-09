@@ -364,7 +364,7 @@ HLE(k_getprio)            { // scePthreadGetprio(thread, int* prio)
 // ids are recycled, so a stale entry would serve the next thread the dead thread's bounds.
 #ifdef __linux__
 namespace {
-struct ThreadStart { void* (*entry)(void*); void* arg; };
+struct ThreadStart { void* (*entry)(void*); void* arg; char name[16]; };
 // Runs first on the new thread: register our own stack (keyed by our tid) BEFORE any guest code,
 // so an early GC_register_my_thread / stack-base query from this thread finds it. Closes a race
 // where a fast-starting worker ran before the parent's post-create registration → "Bad stack base".
@@ -380,6 +380,11 @@ void* thread_trampoline(void* p) {
         }
     }
     install_sigaltstack();   // so a guest stack overflow on this worker is still catchable
+    // Adopt the guest's thread name (scePthreadCreate/pthread_create_name_np arg) as the HOST
+    // thread name so debugger/procfs views (gdb, /proc/PID/task/*/comm) show the engine's own
+    // role names (GameThread, RenderThread, RHIThread, ...) instead of the binary name. Kernel
+    // limit is 15 chars + NUL; host libc call, so it must run on the host %fs (we are).
+    if (ts->name[0]) pthread_setname_np(pthread_self(), ts->name);
     auto entry = ts->entry; void* arg = ts->arg; free(ts);   // all host libc — MUST run on the host %fs
     // gated (PROSPER_GUEST_FS): give this guest worker its own guest TCB + static TLS and switch %fs to it
     // as the LAST host action before entering guest code (so guest initial-exec TLS — incl. libc.prx's
@@ -432,7 +437,8 @@ HLE(k_pthread_create) {
     pthread_attr_setstacksize(&la, ssz);
     pthread_attr_setdetachstate(&la, detach);
     auto* ts = (ThreadStart*)malloc(sizeof(ThreadStart));
-    ts->entry = entry; ts->arg = arg;
+    ts->entry = entry; ts->arg = arg; ts->name[0] = 0;
+    if (a4) { strncpy(ts->name, (const char*)(uintptr_t)a4, sizeof(ts->name) - 1); ts->name[sizeof(ts->name) - 1] = 0; }
     int r = pthread_create(&tid, &la, thread_trampoline, ts);   // trampoline registers the stack first
     pthread_attr_destroy(&la);
     if (r) { free(ts); return (uint64_t)r; }

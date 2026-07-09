@@ -37,7 +37,7 @@ constexpr uint32_t IT_NOP = 0x10, IT_INDEX_TYPE = 0x2A, IT_EVENT_WRITE = 0x46, I
 constexpr uint32_t R_DRAW_INDEX = 0x03, R_DRAW_INDEX_AUTO = 0x04, R_DRAW_RESET = 0x05, R_WAIT_FLIP_DONE = 0x06,
                    R_SH_REGS_INDIRECT = 0x11, R_CX_REGS_INDIRECT = 0x12, R_UC_REGS_INDIRECT = 0x13,
                    R_ACQUIRE_MEM = 0x14, R_WRITE_DATA = 0x15, R_WAIT_MEM_64 = 0x16, R_FLIP = 0x17,
-                   R_RELEASE_MEM = 0x18, R_DMA_DATA = 0x19;
+                   R_RELEASE_MEM = 0x18, R_DMA_DATA = 0x19, R_DISPATCH_DIRECT = 0x1a;
 constexpr uint32_t R_NUM = 0x40;
 inline uint32_t PM4(uint32_t len, uint32_t op, uint32_t r) {
     return 0xC0000000u | (((len - 2u) & 0x3fffu) << 16u) | ((op & 0xffu) << 8u) | ((r & (R_NUM - 1u)) << 2u);
@@ -646,6 +646,77 @@ extern "C" void prosper_agc_submit_stats(uint64_t* submits, uint64_t* draws) {
     if (draws)   *draws   = (uint64_t)agc_gpu_state().draws.size();
 }
 
+// Fold one raw Dcb dword stream through the CommandProcessor, fire the GPU EOP completion events, and
+// (if a live renderer is wired and the submit produced draws) execute+present. Shared by the primary
+// submit path (sceAgcDriverSubmitDcb) and the DOLL warmup-submit variant (w1KFAHVqpaU) below.
+// `dw_num == 0` means "length unknown" — decode_pm4 self-terminates at the first non-type-3 dword, and
+// we cap the walk at kUnknownCap dwords as a runaway guard (a bounded ring can't legitimately exceed it).
+static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const char* who) {
+    if (!addr) return 0;
+    constexpr uint32_t kUnknownCap = 0x80000;   // 512 KiB of dwords — well past any real Dcb
+    uint32_t walk = dw_num ? dw_num : kUnknownCap;
+    agc_gpu_state().draws.clear();
+    size_t applied = gpu::run_command_buffer(addr, walk, agc_gpu_state());
+    g_submit_count++;
+    prosper_eq_trigger_eop();
+    static const unsigned render_every2 = [] {
+        const char* e = getenv("PROSPER_RENDER_EVERY"); long v = e ? atol(e) : 1; return v > 0 ? (unsigned)v : 1u; }();
+    static unsigned draw_submits2 = 0;
+    if (gpu::have_submit_renderer() && !agc_gpu_state().draws.empty() && (draw_submits2++ % render_every2) == 0) {
+        uint32_t w = gpu::present_width(), h = gpu::present_height();
+        static const uint32_t scale = [] {
+            const char* e = getenv("PROSPER_RENDER_SCALE"); long v = e ? atol(e) : 1; return v > 0 ? (uint32_t)v : 1u; }();
+        if (scale > 1) { w = (w / scale) & ~1u; h = (h / scale) & ~1u; if (!w) w = 2; if (!h) h = 2; }
+        gpu::execute_and_present(agc_gpu_state(), w, h);
+    }
+    if (getenv("PROSPER_GFXLOG"))
+        fprintf(stderr, "[agc] %s #%llu: %u dwords (walk=%u) -> %zu packets applied (draws: %zu, dispatches: %llu)\n",
+                who, (unsigned long long)g_submit_count, dw_num, walk, applied,
+                agc_gpu_state().draws.size(), (unsigned long long)agc_gpu_state().dispatch_count);
+    return 0;
+}
+
+// sceAgc submit variant (NID w1KFAHVqpaU) — DOLL's UE4 RHI submits its per-frame command buffers
+// through TWO driver entry points: intermediate buffers via sceAgcDriverSubmitDcb (UglJIZjGssM,
+// folded above) and the FINAL buffer of a SubmitCommandBuffers batch through THIS one (the guest's
+// SubmitCommandBuffers impl at eboot+0x220a9a0 loops the buffer array, calling the indirect submit for
+// buffers [0..n-2] and w1KFAHVqpaU for buffer n-1). Left unimplemented, the final buffer's GPU EOP
+// fences (ReleaseMem writes) never executed, so the label the RenderThread polls (eboot+0x221d6c2,
+// FRenderCommandFence/RHI frame-sync) stayed 0 forever and the GameThread timed out — the #232 wall.
+//
+// ABI (RE'd from the compiler-generated adapter thunk at eboot+0x58df3f0, which marshals DOLL's
+// internal call at eboot+0x220aace into the Sony import): the raw Dcb dword-stream address arrives as
+// stack arg8, which the guest-%fs swap stub forwards to fp[3] (the same slot ReleaseMem/WaitRegMem read
+// their 8th arg from). The dword count (arg9) is beyond the 2-arg forward window, so we fold with an
+// unknown length — decode_pm4 self-terminates at the first non-type-3 header. We validate that fp[3]
+// points at a real PM4 type-3 stream before folding, and if it doesn't, scan a0..a5 as a fallback;
+// anything that fails to validate is refused (no fold, logged once) rather than folding garbage.
+// CONFIDENCE: MED — the buffer address slot is pinned by the adapter disassembly + the missing-fence
+// symptom; the unknown-length fold relies on decode_pm4's type-3 termination (verified: the warmup
+// buffer is contiguous builder-emitted packets). Proven by the RenderThread advancing once folded.
+HLE(agc_driver_submit_dcb_variant) {
+    auto is_pm4 = [](uint64_t p) -> bool {
+        if (p < 0x10000 || (p & 3)) return false;
+        uint32_t h = *(const volatile uint32_t*)(uintptr_t)p;
+        return (h & 0xC0000000u) == 0xC0000000u;
+    };
+    volatile uint64_t* fp = (uint64_t*)__builtin_frame_address(0);
+    uint64_t cand = fp[3];                                  // arg8 = the Dcb stream address (adapter ABI)
+    if (!is_pm4(cand)) {                                    // fallback: scan the register args
+        const uint64_t regs[6] = { a0, a1, a2, a3, a4, a5 };
+        cand = 0;
+        for (uint64_t r : regs) if (is_pm4(r)) { cand = r; break; }
+    }
+    if (!cand) {
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) < 4)
+            fprintf(stderr, "[agc] w1KFAHVqpaU: no PM4 stream found (fp[3]=0x%llx a0=0x%llx a1=0x%llx) — submit refused\n",
+                    (unsigned long long)fp[3], (unsigned long long)a0, (unsigned long long)a1);
+        return 0;
+    }
+    return submit_dcb_stream((const uint32_t*)(uintptr_t)cand, 0, "SubmitDcbFinal");
+}
+
 HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     struct Packet { uint32_t* addr; uint32_t dw_num; uint8_t pad[4]; };
     const auto* p = (const Packet*)(uintptr_t)a0;
@@ -687,16 +758,17 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
                     (unsigned long long)g_submit_count, agc_gpu_state().draws.size(), w, h);
     }
     if (getenv("PROSPER_GFXLOG")) {
-        fprintf(stderr, "[agc] SubmitDcb #%llu: %u dwords -> %zu packets applied (draws so far: %zu)\n",
-                (unsigned long long)g_submit_count, p->dw_num, applied, agc_gpu_state().draws.size());
+        fprintf(stderr, "[agc] SubmitDcb #%llu: %u dwords -> %zu packets applied (draws so far: %zu, dispatches total: %llu)\n",
+                (unsigned long long)g_submit_count, p->dw_num, applied, agc_gpu_state().draws.size(),
+                (unsigned long long)agc_gpu_state().dispatch_count);
         // Dump each packet's kind + first payload dwords so we can see whether the game embeds a
         // completion-label write (WriteData/ReleaseMem/EventWrite) or a GPU-side wait in the stream.
         std::vector<gpu::Pm4Command> ops; gpu::decode_pm4(p->addr, p->dw_num, ops);
         static const char* kKindName[] = {"DrawReset","WaitFlipDone","SetShRegDirect","SetRegsIndirect",
             "SetIndexType","DrawIndex","DrawIndexAuto","EventWrite","AcquireMem","WriteData","WaitRegMem",
-            "Flip","ReleaseMem","Unknown"};
+            "Flip","ReleaseMem","DispatchDirect","Unknown"};
         for (auto& c : ops) {
-            uint32_t k = (uint32_t)c.kind; const char* nm = k < 14 ? kKindName[k] : "?";
+            uint32_t k = (uint32_t)c.kind; const char* nm = k < 15 ? kKindName[k] : "?";
             fprintf(stderr, "[agc]   pkt op=0x%02x r=0x%02x len=%u kind=%s pl0=0x%08x pl1=0x%08x pl2=0x%08x\n",
                     c.op, c.r, c.len, nm,
                     c.len > 1 ? c.payload[0] : 0, c.len > 2 ? c.payload[1] : 0, c.len > 3 ? c.payload[2] : 0);
@@ -714,6 +786,69 @@ HLE(agc_patch_set_address) {  // (cmd, regs): cmd[2..3] = regs vaddr
 HLE(agc_patch_add_registers) {  // (cmd, num_regs): cmd[1] += num_regs
     auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
     cmd[1] += (uint32_t)a1; return 0;
+}
+
+// --- Sync-packet address patch family (issue #213/#222 — the DOLL per-draw fence cluster). ------
+//
+// RE'd from DOLL's statically-linked AGC fence builder (eboot+0x59a1780, gdb-verified live): the
+// guest allocates a LABEL inside a Dcb NOP data packet (sceAgcCbNop + sceAgcGetDataPacketPayload-
+// Address), pre-builds WriteData(label:=0) / ReleaseMem(label<-1) / WaitRegMem(label==1) packets
+// with NULL placeholder addresses, then patches the label address into each packet through these
+// three imports (call order fPS->3KD->0fW; the per-draw burst passes each packet at exactly our
+// builders' emitted offsets: WriteData at +0x1c(6dw), ReleaseMem at +0x34(7dw), WaitRegMem at
+// +0x50(9dw) after the 7-dword NOP label packet — the offset arithmetic pins which patch targets
+// which packet kind). Signature is (cmd, address) — the fence-builder disassembly passes exactly
+// two args; the varying a2..a4 seen under GFXLOG are deterministic register residue from the PLT
+// thunks. Leaving these as no-ops was the RenderThread stall: the GPU-side label writes all
+// targeted address 0 (skipped), so the engine's CPU-side poll of the label never completed and
+// "GameThread timed out waiting for RenderThread after 120.00 secs" fired. Each patcher verifies
+// the packet's own header sub-op before writing — a mismatch means the RE drifted, so it logs
+// loudly (once) and refuses to corrupt the stream. CONFIDENCE: HIGH (disassembly + live capture
+// + offset arithmetic all agree).
+namespace {
+inline bool patch_check(uint32_t* cmd, uint32_t want_r, const char* who) {
+    uint32_t r = (cmd[0] >> 2) & (R_NUM - 1u), op = (cmd[0] >> 8) & 0xffu;
+    if (op == IT_NOP && r == want_r) return true;
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 8)
+        fprintf(stderr, "[agc] %s: header 0x%08x is not the expected packet (op=0x%x r=0x%x want r=0x%x) — patch refused\n",
+                who, cmd[0], op, r, want_r);
+    return false;
+}
+}
+HLE(agc_patch_write_data_addr) {  // fPSCdQxgpSw (cmd, address): WriteData payload [1..2] = address
+    auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
+    if (!patch_check(cmd, R_WRITE_DATA, "WriteDataPatchAddress")) return 0;
+    cmd[2] = (uint32_t)(a1 & 0xffffffffu); cmd[3] = (uint32_t)(a1 >> 32u);
+    return 0;
+}
+HLE(agc_patch_wait_reg_mem_addr) {  // 3KDcnM3lrcU (cmd, address): WaitRegMem payload [0..1] = address
+    auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
+    if (!patch_check(cmd, R_WAIT_MEM_64, "WaitRegMemPatchAddress")) return 0;
+    cmd[1] = (uint32_t)(a1 & 0xffffffffu); cmd[2] = (uint32_t)(a1 >> 32u);
+    return 0;
+}
+HLE(agc_patch_release_mem_addr) {  // 0fWWK5uG9rQ (cmd, address): ReleaseMem payload [0..1] = address
+    auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
+    if (!patch_check(cmd, R_RELEASE_MEM, "ReleaseMemPatchAddress")) return 0;
+    cmd[1] = (uint32_t)(a1 & 0xffffffffu); cmd[2] = (uint32_t)(a1 >> 32u);
+    return 0;
+}
+
+// sceAgcDcbDispatchDirect (NID k3GhuSNmBLU) — compute dispatch. RE'd from the guest wrapper
+// eboot+0x220ede0: it reserves Dcb space from the bound CS shader's scratch needs, reads the
+// shader's specials->dispatch_modifier (eboot+0x5999750 = [[sub0.shader]+0x28]+0x10) and calls
+// this import as (dcb, tg_x, tg_y, tg_z, modifier). Kyty's Gen4 GraphicsDispatchDirect carries the
+// same (x, y, z, mode) operand set. DOLL's first real frame issues ~535 of these (UE4's compute
+// prologue: GPUScene build, clears, culling) before any graphics draw. Appending the packet keeps
+// the stream faithful; the CommandProcessor records it (no compute execution yet — that is a later
+// milestone; the fence cluster around each dispatch completes at fold time regardless).
+// CONFIDENCE: HIGH on (dcb,x,y,z) (disassembly), MED on a4=modifier (from specials, unexecuted).
+HLE(agc_dcb_dispatch_direct) {  // (buf, tg_x, tg_y, tg_z, modifier)
+    uint32_t* cmd; if (!begin_packet(a0, 6, IT_NOP, R_DISPATCH_DIRECT, &cmd)) return 0;
+    cmd[1] = (uint32_t)a1; cmd[2] = (uint32_t)a2; cmd[3] = (uint32_t)a3;
+    cmd[4] = (uint32_t)(a4 & 0xffffffffu); cmd[5] = (uint32_t)(a4 >> 32u);
+    return (uint64_t)(uintptr_t)cmd;
 }
 
 void register_agc_hle() {
@@ -742,9 +877,17 @@ void register_agc_hle() {
     RN("Qrj4c+61z4A", agc_patch_set_address);   RN("z2duB-hHQSM", agc_patch_add_registers);   // Sh
     RN("6lNcCp+fxi4", agc_patch_set_address);   RN("vRoArM9zaIk", agc_patch_add_registers);   // Uc
     RN("LtTouSCZjHM", agc_cb_nop);              // sceAgcCbNop — append padding dwords (#117)
+    // Sync-packet address patchers + compute dispatch (issue #213 — the DOLL per-draw fence
+    // cluster; RE write-up at each handler). These OVERRIDE the glog no-op thunks (map insert
+    // order: register_agc_hle runs after the glog registration, same as WmAc2MEj6Io).
+    RN("fPSCdQxgpSw", agc_patch_write_data_addr);    // WriteData packet: set destination address
+    RN("3KDcnM3lrcU", agc_patch_wait_reg_mem_addr);  // WaitRegMem packet: set label address
+    RN("0fWWK5uG9rQ", agc_patch_release_mem_addr);   // ReleaseMem packet: set label address
+    RN("k3GhuSNmBLU", agc_dcb_dispatch_direct);      // sceAgcDcbDispatchDirect (tg_x, tg_y, tg_z, mod)
     RN("WmAc2MEj6Io", agc_dcb_dma_data);        // sceAgcDcbDmaData — append DMA_DATA packet (#117)
     RN("YUeqkyT7mEQ", agc_dcb_set_flip);        // sceAgcDcbSetFlip (Kyty LibGraphicsDriver.cpp:98)
     RN("UglJIZjGssM", agc_driver_submit_dcb);   // sceAgcDriverSubmitDcb -> CommandProcessor replay
+    RN("w1KFAHVqpaU", agc_driver_submit_dcb_variant);  // final-buffer submit variant (#232, DOLL RHI batch)
     #undef RN
 }
 

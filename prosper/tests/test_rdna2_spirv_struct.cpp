@@ -166,6 +166,42 @@ int main() {
       } }
     printf("  [ok]   fragment cmpx export lowers to a discard (OpKill + export), valid SPIR-V\n");
 
+    // Alpha-test discard via the SCALAR-BRANCH form (not v_cmpx): compare a sampled/interpolated value,
+    // ANDN2 the survivor mask into a saved EXEC copy (SCC = "any lane survives"), and s_cbranch_scc0 skips
+    // the shading if NO lane survives; the block then narrows EXEC (s_wqm exec, survivors) and shades. This
+    // is Unity's clip()/cutout text+sprite shape (The Messenger's cutscene text, #102). The recompiler must
+    // lower it — drop the wave early-out, run the block, OpKill the failed lanes at export — instead of
+    // rejecting the s_cbranch_scc0, which dropped every alpha-tested text/sprite draw. Bytes assembled with
+    // llvm-mc gfx1010 (round-trip verified).
+    const uint32_t altest_kill_branch[] = {
+        0xbe82047eu,               // s_mov_b64  s[2:3], exec
+        0x7c020300u,               // v_cmp_lt_f32_e32 vcc_lo, v0, v1      (alpha < ref -> vcc)
+        0x8a826a02u,               // s_andn2_b64 s[2:3], s[2:3], vcc      (survivors; SCC = any-survivor)
+        0xbf840003u,               // s_cbranch_scc0 +3                    (skip shading if none survive)
+        0xbefe0a02u,               // s_wqm_b64  exec, s[2:3]              (narrow EXEC to survivors)
+        0x7e040300u,               // v_mov_b32  v2, v0
+        0x7e060301u,               // v_mov_b32  v3, v1
+        0x7e0802f2u,               // v_mov_b32  v4, 1.0
+        0x7e0a02f2u,               // v_mov_b32  v5, 1.0
+        0xf800180fu, 0x05040302u,  // exp mrt0 v2, v3, v4, v5 done vm
+        0xbf810000u,               // s_endpgm
+    };
+    auto altest_spv = recompile_fragment(altest_kill_branch, sizeof(altest_kill_branch) / sizeof(altest_kill_branch[0]));
+    if (altest_spv.empty()) {
+        printf("  [FAIL] alpha-test scalar-branch discard (s_cbranch_scc0 on kill mask) was rejected\n");
+        return 1;
+    }
+    { uint32_t bad_op = 0;
+      if (!type_result_ids_are_nonzero(altest_spv, &bad_op)) {
+          printf("  [FAIL] alpha-test discard SPIR-V has an invalid result id (op=%u)\n", bad_op);
+          return 1;
+      } }
+    { bool has_kill = false;                       // the discard must actually emit OpKill (op 252)
+      for (size_t i = 5; i < altest_spv.size(); ) { uint32_t wc = altest_spv[i] >> 16, op = altest_spv[i] & 0xffff;
+          if (op == 252u) { has_kill = true; break; } i += wc ? wc : 1; }
+      if (!has_kill) { printf("  [FAIL] alpha-test discard SPIR-V lacks an OpKill\n"); return 1; } }
+    printf("  [ok]   alpha-test scalar-branch (s_andn2+s_cbranch_scc0) lowers to a discard (OpKill), valid SPIR-V\n");
+
     const uint32_t cmpx_vertex[] = {
         0x7DA80300u, 0xF80008CFu, 0x03020100u, 0xBF810000u,
     };
