@@ -1,0 +1,17 @@
+{
+  "snapshots": [
+    {
+      "name": "messenger-title",
+      "dump": "PPSA24651-app0",
+      "frame": 40,
+      "scale": 4,
+      "timeout": 240,
+      "env": {},
+      "hash": "5d086de6916e517db7c3ead7ce90e66bdfbc06c53ef78df245d1af5cfa10323a",
+      "dims": [
+        480,
+        270
+      ]
+    }
+  ]
+}
