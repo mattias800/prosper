@@ -8,6 +8,45 @@ Boot recipe: `PROSPER_GUEST_FS=1 PROSPER_NULL_PAGE=1 ./boot_trace <PPSA17942-app
 (GUEST_FS: UE MallocBinned TLS caches read `%fs`; NULL_PAGE: UE's FP-chain backtrace walker
 derefs the null chain terminator).
 
+## Frame loop reached; 0 draws = early-load present loop (issue #213, 2026-07-09)
+
+DOLL now boots fully and runs a **stable frame loop**. Two blockers cleared this session:
+
+1. **CRI Atom audio init crash (fixed).** DOLL's CRI Atom (ADX) middleware drives audio through
+   **libSceAudioOut2** (PS5-only; no Kyty/shadPS4 surface). The generic unimplemented stub returned
+   0 with out-params untouched, so CRI read an UNINITIALIZED context work-memory size, malloc'd it,
+   and memset the result — when the stack garbage was unallocatable the MAIN thread died in
+   `libc.prx+0x10556` (`mov %rdx,(%rdi)` inside memset) through the CRI region — the intermittent
+   "1 flip then crash" (tail frames `0x276f7a0 <- 0xb008 <- ... <- 0xbf`). NIDs recovered by
+   nid_hash brute force: `g2tViFIohHE`=sceAudioOut2Initialize, `t5YrizufpQc`=ContextResetParam,
+   `pDmme7Bgm6E`=ContextQueryMemory. Contracts recovered by live capture (PROSPER_AUDIO2LOG):
+   ResetParam param is 0x40 bytes; QueryMemory writes the work-mem size to `a1` (the guest hands it
+   straight to ContextCreate); then UserCreate/PortCreate and a pump loop (PortGetState →
+   PortSetAttributes → ContextAdvance → ContextPush) on a dedicated CRI server thread. Implemented
+   as a **null-device backend** (Wine null-audio sense): real handle lifecycle + ContextPush pacing
+   one grain of wall-clock per call (blocking-when-full HW semantics). hle_audio.cpp. CONFIDENCE MED
+   (LOW on PortGetState layout — zero-filled 0x20).
+
+2. **The 0-draws state is diagnosed as EARLY-LOAD, not a render bug.** With audio fixed DOLL runs
+   146+ flips / 147 DCB submits over a 480s run. But the steady-state frame DCB is a fixed
+   **444-dword pure vblank-sync control stream** — `ReleaseMem` (EOP fence) ×8, `WaitRegMem` ×3,
+   `WriteData` ×3, `GetDataPacketPayloadAddress` ×3, plus the AGC patch-address NIDs
+   (`0fWWK5uG9rQ`/`3KDcnM3lrcU`/`fPSCdQxgpSw`/`-KRzWekV120`/`tSBxhAPyytQ`). Across the **entire**
+   post-flip run there are **0 `DcbSetCxRegistersIndirect` (ZvwO9euwYzc) and 0 `CreateShader`** — all
+   2593 shaders are created during init, before the frame loop, and no draw setup happens after.
+   The game builds all pipelines at load then parks in a present-only loop showing cleared frames.
+   This mirrors The Messenger's earlier "scene activation" gap: the game is NOT idling for input
+   (pad is never opened, #213 parallel finding) — it is in early-load / pre-world-activation,
+   presenting blank frames while the GameThread has not yet activated a UWorld/level that submits
+   geometry. libScePlayGo fires only twice at boot (not polled → not the content gate); PlayGo/
+   SaveData/AJM all one-shot. The remaining gate is a GameThread world/level-activation step, not a
+   missing GPU event — see #213 for the next-session trace target.
+
+**Next hard blocker: racy worker-thread fault at `eboot+0x59949e4` (issue #222).** A libSceAgc
+EUD-ring store (`mov %r14,(%rax)` where `%rax` = `obj+0x10 + idx*4`) faults on a guest worker
+thread with a stale/small ring pointer — intermittently, after ~140 flips — terminating long runs.
+Not on the draw path (frame DCBs carry no draws). Full disasm + repro in #222.
+
 ## What already works (merged / on feat/ue4-apr)
 
 - PS5 SELF-variant loading (magic `0xEEF51454`), the real direct-memory model, `sceKernelBatchMap`,

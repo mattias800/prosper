@@ -258,6 +258,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_build_shader_resources PRIVATE prosper_core)
   add_test(NAME build_shader_resources COMMAND test_build_shader_resources)
 
+  # Descriptor-binding policy (#157): textures/storage images never land on the recompiler's hardwired
+  # cbuf bindings 2/3; constant/vertex buffers assigned first. Pure, no game dump / Vulkan needed.
+  add_executable(test_convention_bindings tests/test_convention_bindings.cpp)
+  target_link_libraries(test_convention_bindings PRIVATE prosper_core)
+  add_test(NAME convention_bindings COMMAND test_convention_bindings)
+
   # M2+: real memory mapping, trap, boot, and the boot-trace debug tool (Linux only).
   if(UNIX AND NOT APPLE)
     add_executable(boot_trace tools/boot_trace/boot_trace.cpp)
