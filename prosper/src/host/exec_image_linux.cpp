@@ -1367,6 +1367,10 @@ void register_thread_stack(uint64_t tid, void* base, uint64_t size) {
     std::lock_guard<std::mutex> lk(g_smx);
     g_stacks[tid] = { (uint64_t)base, size };
 }
+void unregister_thread_stack(uint64_t tid) {
+    std::lock_guard<std::mutex> lk(g_smx);
+    g_stacks.erase(tid);
+}
 bool guest_stack_for_thread(uint64_t tid, void** base, size_t* size) {
     std::lock_guard<std::mutex> lk(g_smx);
     auto it = g_stacks.find(tid);

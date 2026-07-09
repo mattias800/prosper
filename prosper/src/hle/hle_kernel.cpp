@@ -328,17 +328,30 @@ HLE(k_getprio)            { // scePthreadGetprio(thread, int* prio)
 }
 
 // --- thread creation: run the guest entry on a real host thread (ABI matches) ---
-// We give each worker a stack we allocate and TRACK, so GC/thread-stack queries get
-// accurate bounds (see k_attr_get) without relying on pthread_getattr_np.
+// Worker stacks are GLIBC-OWNED (#138): create passes only a stacksize (honoring the guest attr),
+// so glibc allocates the stack and — crucially — RECLAIMS it when the thread is joined or a
+// detached thread exits. The old code mmap'd a fixed 8 MiB per thread via pthread_attr_setstack
+// and never munmapped it (glibc never frees a CALLER-owned stack): a thread-churning title leaked
+// 8 MiB per exited thread. The trampoline still TRACKS the bounds (via pthread_getattr_np, keyed
+// by our tid) so GC/thread-stack queries stay accurate, and unregisters them on exit — pthread
+// ids are recycled, so a stale entry would serve the next thread the dead thread's bounds.
 #ifdef __linux__
 namespace {
-struct ThreadStart { void* (*entry)(void*); void* arg; void* sbase; uint64_t ssz; };
+struct ThreadStart { void* (*entry)(void*); void* arg; };
 // Runs first on the new thread: register our own stack (keyed by our tid) BEFORE any guest code,
 // so an early GC_register_my_thread / stack-base query from this thread finds it. Closes a race
 // where a fast-starting worker ran before the parent's post-create registration → "Bad stack base".
 void* thread_trampoline(void* p) {
     auto* ts = (ThreadStart*)p;
-    if (ts->sbase) register_thread_stack((uint64_t)pthread_self(), ts->sbase, ts->ssz);
+    {
+        pthread_attr_t sa;
+        if (pthread_getattr_np(pthread_self(), &sa) == 0) {
+            void* sb = nullptr; size_t ss = 0;
+            if (pthread_attr_getstack(&sa, &sb, &ss) == 0 && sb)
+                register_thread_stack((uint64_t)pthread_self(), sb, ss);
+            pthread_attr_destroy(&sa);
+        }
+    }
     install_sigaltstack();   // so a guest stack overflow on this worker is still catchable
     auto entry = ts->entry; void* arg = ts->arg; free(ts);   // all host libc — MUST run on the host %fs
     // gated (PROSPER_GUEST_FS): give this guest worker its own guest TCB + static TLS and switch %fs to it
@@ -357,6 +370,7 @@ void* thread_trampoline(void* p) {
     // exit via scePthreadExit never get here — k_pthread_exit purges before host pthread_exit.
     uint64_t sfs = guest_fs_to_host_scoped();
     tls_dtv_purge_current_thread();
+    unregister_thread_stack((uint64_t)pthread_self());   // ids recycle; stale bounds = wrong bounds (#138)
     guest_fs_restore_scoped(sfs);
     return rv;
 }
@@ -371,26 +385,30 @@ HLE(k_pthread_create) {
                 (unsigned long long)a2, (unsigned long long)a3, a4 ? (const char*)(uintptr_t)a4 : "");
     pthread_t tid;
 #ifdef __linux__
-    pthread_attr_t la; bool own = false;
-    pthread_attr_t* at;
-    if (a1 && *(void**)a1) at = (pthread_attr_t*)*(void**)a1;
-    else { pthread_attr_init(&la); at = &la; own = true; }
-    size_t ssz = 8 * 1024 * 1024;
-    void* sbase = mmap(nullptr, ssz, PROT_READ | PROT_WRITE,
-                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
-    int r;
-    if (sbase != MAP_FAILED) {
-        pthread_attr_setstack(at, sbase, ssz);
-        auto* ts = (ThreadStart*)malloc(sizeof(ThreadStart));
-        ts->entry = entry; ts->arg = arg; ts->sbase = sbase; ts->ssz = ssz;
-        r = pthread_create(&tid, at, thread_trampoline, ts);   // trampoline registers the stack first
-        if (r) free(ts);
-    } else {
-        r = pthread_create(&tid, at, entry, arg);
+    // Stack size: honor the guest attr's stacksize (previously ignored — everything got a fixed
+    // 8 MiB), floored at 1 MiB because our HLE + host libc frames run deeper than Sony's runtime
+    // would on the same stack. No attr (or no explicit size) keeps the 8 MiB default.
+    constexpr size_t kStackFloor = 1 * 1024 * 1024, kStackDefault = 8 * 1024 * 1024;
+    size_t ssz = kStackDefault;
+    int detach = PTHREAD_CREATE_JOINABLE;
+    if (a1 && *(void**)a1) {
+        auto* gat = (pthread_attr_t*)*(void**)a1;
+        size_t req = 0;
+        if (pthread_attr_getstacksize(gat, &req) == 0 && req)
+            ssz = req < kStackFloor ? kStackFloor : req;
+        pthread_attr_getdetachstate(gat, &detach);
     }
-    if (own) pthread_attr_destroy(&la);
-    if (r) { if (sbase != MAP_FAILED) munmap(sbase, ssz); return (uint64_t)r; }
-    if (sbase != MAP_FAILED) register_thread_stack((uint64_t)tid, sbase, ssz);  // redundant safety net
+    // A local attr with setstackSIZE (not setstack): glibc allocates AND RECLAIMS the stack
+    // (join / detached exit) — the old caller-owned mmap was never freed (#138). Also stops
+    // mutating the guest's own attr object (setstack used to be applied to it in place).
+    pthread_attr_t la; pthread_attr_init(&la);
+    pthread_attr_setstacksize(&la, ssz);
+    pthread_attr_setdetachstate(&la, detach);
+    auto* ts = (ThreadStart*)malloc(sizeof(ThreadStart));
+    ts->entry = entry; ts->arg = arg;
+    int r = pthread_create(&tid, &la, thread_trampoline, ts);   // trampoline registers the stack first
+    pthread_attr_destroy(&la);
+    if (r) { free(ts); return (uint64_t)r; }
 #else
     pthread_attr_t* at = (a1 && *(void**)a1) ? (pthread_attr_t*)*(void**)a1 : nullptr;
     int r = pthread_create(&tid, at, entry, arg);
@@ -403,10 +421,13 @@ HLE(k_pthread_join)   { void* rv = nullptr; pthread_join((pthread_t)a0, a1 ? &rv
 HLE(k_pthread_detach) { pthread_detach((pthread_t)a0); return 0; }
 HLE(k_pthread_exit)   {
     // Host pthread_exit unwinds without ever returning through thread_trampoline, so this is its own
-    // thread-exit path: purge the exiting thread's __tls_get_addr DTV first (#68). HLE handlers run
-    // under the HOST %fs (the import stubs swap), so the host libc below is safe. No-op for threads
-    // that never touched __tls_get_addr.
+    // thread-exit path: purge the exiting thread's __tls_get_addr DTV first (#68) and drop its stack
+    // registration (#138 — pthread ids recycle). HLE handlers run under the HOST %fs (the import
+    // stubs swap), so the host libc below is safe. No-op for threads that never touched either.
     tls_dtv_purge_current_thread();
+#ifdef __linux__
+    unregister_thread_stack((uint64_t)pthread_self());
+#endif
     pthread_exit((void*)(uintptr_t)a0);
     return 0;
 }
