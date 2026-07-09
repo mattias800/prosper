@@ -892,3 +892,46 @@ cleanly). Fixing the ring-drain/EOP delivery should let the RenderThread complet
 the fence, and advance the GameThread into world activation + the first scene draws. Diagnostic
 gdb tooling added this session: `tools/dbg/poll_probe.{sh,gdb}`, `poll_deep.{sh,gdb}`,
 `stall_bt2.sh`, `gwalk.sh`.
+
+### SOLVED (2026-07-09, issue #232): the FRenderCommandFence wall was an UNFOLDED submit variant (w1KFAHVqpaU) — DOLL advances 178 → 284 flips past it
+
+Post-#236 (EOP coalesce=false), DOLL still parked: every thread idle except **RenderThread 1**,
+which spin-yielded in a timeout poll at **eboot+0x221d6c2** (`mov 0x30(%rbx),%rax ; cmpq $0,(%rax)`
+reached from eboot+0x3bf4862) waiting for a GPU **fence label to become nonzero**. Live probe
+(`tools/dbg/slot232.py`): the polled label = `*[obj+0x30]` = **0x1180f06760**, value stuck at 0.
+That label is the destination of a `ReleaseMem action=0x14 addr=0x1180f06760 data=0x1` the guest
+BUILT — but `EOP write [0x1180f0*]` count was **0**: the Dcb carrying those fences was never folded.
+
+**Root cause: DOLL's UE4 RHI submits through TWO driver entry points, and we only folded one.** The
+guest `SubmitCommandBuffers` impl (eboot+0x220a9a0) loops the buffer array, submitting buffers
+[0..n−2] via `sceAgcDriverSubmitDcb` (UglJIZjGssM — folded) and the **final** buffer (eboot+0x220aace)
+via **w1KFAHVqpaU**, which was unimplemented (returned 0). So every batch's final buffer — carrying
+the RenderThread's completion fences at 0x1180f0xxxx — was dropped on the floor; the label never went
+nonzero, the RenderThread never completed the frame, and the GameThread's 120 s watchdog fired.
+
+**Fix (committed, `hle_agc.cpp` `agc_driver_submit_dcb_variant`):** fold w1KFAHVqpaU's Dcb through the
+CommandProcessor and fire EOP, same as the primary path. ABI RE'd from the compiler adapter thunk
+(eboot+0x58df3f0) that marshals the internal call into the Sony import — the raw dword-stream address
+is stack **arg8**, forwarded by the guest-%fs swap stub to **fp[3]** (the slot ReleaseMem/WaitRegMem
+already read arg8 from). The dword count (arg9) is past the 2-arg forward window, so the fold relies on
+`decode_pm4`'s type-3 self-termination (observed bounded: 377–10386 packets, well under the
+512 Ki-dword runaway cap). The PM4 header is validated before folding (fallback: scan a0..a5; refuse +
+log otherwise) so a wrong pointer can never fold garbage.
+
+**Verified:** w1KFAHVqpaU now folds every frame; **2100 EOP writes land in the 0x1180f0 fence region**
+(was 0); the frame loop advances **178 → 284 flips** past the wall. ctest 63/63; Messenger unregressed
+(153 rendered frames to #980, 0 faults — it never calls this path). CONFIDENCE: MED (buffer-slot ABI +
+missing-fence symptom pinned; unknown-length fold empirically bounded, not ABI-confirmed).
+
+**NEW WALL (next session):** past the fence, DOLL hits a deeper **worker-thread fault at
+eboot+0x2316c91** — `mov (%rbx),%rcx` on a corrupt free-list node (`rbx≈0x20015f00`, a bad "next"
+pointer popped by `mov (%r8),%rbx` at +0x2316c85; this is a memory-pool/free-list alloc). Still **0
+scene DrawIndex/DrawIndexAuto** — the ~1500-packet-per-frame stream folded via w1KFAHVqpaU is still
+UE4's compute/setup work (dispatches climb to 3500+), not scene geometry. Open questions: (a) is the
+0x2316c91 free-list node corrupted by the unknown-length fold over-walking (lower the cap / widen the
+swap stub to forward arg9 = the true count and re-check), or is it an independent deeper init-race
+(the doc's "worker-thread face")? (b) what populates that pool, and does world/level activation gate
+on it? Probes added: `tools/dbg/slot232.py`, `w1k232.py`, `gw232.py`, `waketrace232.py`,
+`unimpl232.py`, `gotwho.cpp`, `nid2got.cpp`, `run232{b..h}.sh`. Thread-name adoption
+(`pthread_setname_np` in `k_pthread_create`) now labels all guest threads in gdb/procfs — the probe
+that made the RenderThread identifiable.
