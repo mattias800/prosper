@@ -642,14 +642,30 @@ WriteData/AcquireMem/ReleaseMem streams, 0 draws yet) and performs its first fli
 (`GpuFlip handle=0x1001 bufidx=0 mode=0x1 fliparg=0x1`). ctest 60/60; Messenger smoke renders
 3860 frames in 300 s.
 
-**NEXT (the new frontier):** after the first flip the RHI thread settles into a
-WaitEqueue(VideoOutQueue) loop (ident=1, filter=-13, one event delivered per cycle) and no further
-draws/flips arrive over 480 s — the game thread is presumably parked post-registry (thread dump
-needed). New unimplemented NIDs on this path worth wiring next: libSceAgc dbOlWdppb4o,
-qj7QZpgr9Uw, bbFueFP+J4k, xSAR0LTcRKM, w6Dj1VJt5qY; libSceVideoOut MTxxrOCeSig, U2JJtSqNKZI; plus
-the sceVideoOutGetOutputStatus struct fill (issue #82) which this boot now hits with a warning.
-There is also a mount-era polling loop (GnxKOHEawhk + tZDDEo2tE5k(GetSize) spam under
-PROSPER_AMPRLOG) that the boot passes through but which merits a real implementation.
+**Second wall in the same session — the IoStore append-loop spin — also SOLVED:** with
+completions flowing, the boot next parked its IoStore thread in a busy poll (the only running
+thread, inside k_ampr_getsize, guest RA +0x227e2eb). The guest's batch-append loop (+0x227e2c0)
+polls `GetSize(cb) - <used>(cb) > 0xff` (wrappers 0x59b5dd0/0x59b5e00) before appending the next
+command packet; GetSize (tZDDEo2tE5k) is the cb's fixed byte CAPACITY (carried by the batch cb's
+init in a5 = 0x720 — a different arg than the APR read-request flavor's a1), and the old global
+"last cb size" answer starved it to 0. k_ampr_init now records {cb -> capacity} for both init
+flavors and k_ampr_getsize answers per-cb; the spin cleared (the thread parks in eq_wait like the
+rest of the pool).
+
+**NEXT (the new frontier, diagnosed to the thread level):** after the first flip and the plugin
+assetregistry.bin loads, no further draws/flips arrive (480-600 s runs). Live state: the RHI-side
+thread cycles a WaitEqueue(VideoOutQueue) loop (ident=1, filter=-13, one event delivered per
+cycle — vblank pump, normal); every IoDispatcher/IoService/TaskGraph worker is parked in
+k_eq_wait/k_cond_wait; and the MAIN thread runs HOT (~70% cpu) in a lock-poll-unlock loop over
+shared state (sampled: scePthreadGetthreadid + glibc mutex futexes at high rate, FName-machinery
+frames on the stack, alternating lock words 0x10a0e4f120 / 0x200ff00628) — the classic UE4
+flush-async-loading shape: the game thread polls package-loading state that the idle IO threads
+never advance. The question for the next session is which completion/user-event the async-loading
+pipeline is missing (the IoDispatcher threads wait on their OWN user-event equeues, AddUserEvent
+id=-1 — force-posting those was already shown in #180 to wake them to empty queues). Also worth
+wiring: new unimplemented NIDs on this path — libSceAgc dbOlWdppb4o, qj7QZpgr9Uw, bbFueFP+J4k,
+xSAR0LTcRKM, w6Dj1VJt5qY; libSceVideoOut MTxxrOCeSig, U2JJtSqNKZI; plus the
+sceVideoOutGetOutputStatus struct fill (issue #82) which this boot now hits with a warning.
 
 ### The remaining 3 unnamed Ampr NIDs (issue #107, not on the crash path)
 
