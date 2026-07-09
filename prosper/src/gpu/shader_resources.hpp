@@ -91,6 +91,18 @@ struct ShaderResource {
     uint32_t      height            = 0;
     uint32_t      tile_mode         = 0;                  // T# GFX10 TileMode; drives auto-detile of a sampled surface
     uint32_t      sampler_sgpr_base = 0xFFFFFFFFu;
+
+    // Sampler state decoded from the PAIRED S# (Texture only). The backend previously hardcoded a
+    // LINEAR + clamp-to-edge sampler for every texture, which blurs point-sampled content (pixel art
+    // gets an outline halo on every texel) and ignores the game's real wrap modes. Honoring the S#
+    // fixes that for pixel-art titles AND keeps linear-filtered art correct. Defaults preserve the old
+    // LINEAR/clamp behavior for any texture whose S# we cannot resolve.
+    //   mag/min/mip_filter: 0 = point/nearest, 1 = bilinear/linear (SQ_IMG_SAMP XY_*_FILTER / MIP_FILTER).
+    //   addr_uvw:           Gen5 SQ_TEX CLAMP enum per axis (0=wrap,1=mirror,2=clamp-last-texel,6/7=border).
+    uint32_t      mag_filter        = 1;
+    uint32_t      min_filter        = 1;
+    uint32_t      mip_filter        = 0;
+    uint32_t      addr_uvw[3]       = {2, 2, 2};
 };
 
 // The set of resources a shader uses. The front-half builds it from the shader's user_data; the

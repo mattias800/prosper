@@ -245,6 +245,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             }
                         }
                         fr.tex_rgba = texstore.back().data(); fr.tw = tw; fr.th = th;
+                        // Carry the decoded S# sampler state (filter/wrap/mip) so the pipeline samples the
+                        // way the game asked instead of a fixed LINEAR/clamp sampler (#<sampler-fix>).
+                        fr.mag_filter = r.mag_filter; fr.min_filter = r.min_filter; fr.mip_filter = r.mip_filter;
+                        fr.addr_uvw[0] = r.addr_uvw[0]; fr.addr_uvw[1] = r.addr_uvw[1]; fr.addr_uvw[2] = r.addr_uvw[2];
                     } else {
                         uint32_t nb = std::min(r.size ? r.size : 256u, 1u << 20) & ~3u;   // cap 1 MB, dword-aligned
                         if (nb >= 4) {
