@@ -12,6 +12,10 @@
 
 using namespace prosper::gpu;
 
+// The guest TSC clock the GPU EOP timestamp shares (hle_kernel_time.cpp) — same source as
+// sceKernelReadTsc, so a GPU fence timestamp and a CPU TSC read lie on one timeline (#156).
+extern "C" uint64_t prosper_guest_tsc_ns();
+
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
                          else       { printf("  [ok]   %s\n", m); } } while (0)
@@ -68,6 +72,24 @@ int main() {
         build(b1, (uint64_t)(uintptr_t)&l1); build(b2, (uint64_t)(uintptr_t)&l2);
         GpuState st; run_command_buffer(b1, 7, st); run_command_buffer(b2, 7, st);
         CHECK(l1 != 0 && l2 >= l1, "RELEASE_MEM (data_sel=3) wrote a monotonic non-zero GPU clock");
+    }
+
+    // #156: the GPU EOP timestamp must share the guest TSC timeline (sceKernelReadTsc) — on real
+    // hardware they are the SAME counter. A data_sel=3 fence value must fall between a TSC read
+    // taken just before and just after the submit (the old steady_clock had a disjoint epoch, so
+    // it would land far outside this window).
+    {
+        uint64_t label = 0;
+        uint32_t buf[7];
+        uint64_t addr = (uint64_t)(uintptr_t)&label;
+        buf[0] = PM4(7, IT_NOP, R_RELEASE_MEM);
+        buf[1] = (uint32_t)(addr & 0xffffffffu); buf[2] = (uint32_t)(addr >> 32);
+        buf[3] = 3; buf[4] = 0; buf[5] = 0; buf[6] = 0x04;
+        uint64_t before = prosper_guest_tsc_ns();
+        GpuState st; run_command_buffer(buf, 7, st);
+        uint64_t after = prosper_guest_tsc_ns();
+        CHECK(label >= before && label <= after,
+              "data_sel=3 fence lies on the sceKernelReadTsc timeline (shared guest TSC, not steady_clock)");
     }
 
     // WRITE_DATA: [0]=hdr [1]=dst [2..3]=addr [4]=num_dwords [5..]=data.
