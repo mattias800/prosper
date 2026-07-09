@@ -628,45 +628,132 @@ HLE(k_ampr_x4) { return ampr_arglog("GuchCTefuZw", a0, a1, a2, a3, a4, a5); }
 // receive the token — the tracking object stores whichever it uses).
 uint64_t prosper_apr_next_token(unsigned ring, bool tracked_catchup);   // hle_kernel_time.cpp
 void prosper_eq_trigger_apr(uint64_t token);                            // "
-void prosper_eq_add_apr(uint64_t eq, int64_t id);                       // "
+void prosper_eq_add_apr(uint64_t eq, int64_t id, uint64_t ctx);         // "
+void prosper_apr_slot_scan_schedule();                                  // " (slot-echo, issue #180)
+void prosper_eq_post_apr_token(uint64_t eq, int64_t id, uint64_t token); // " (tag echo, issue #180)
 namespace {
-    // Command-buffer ctxs bound to the APR event queue via H896Pt-yB4I. Only THEIR submissions
-    // generate completion events (confirmed live: the one bound ctx 0x1060e090c8 is exactly the
-    // one submit — ring1b=5 — whose event the listener consumed; all 70+ unbound stack-frame cbs
-    // submit on ring1b=6 and are consumed by record polling. Delivering events for unbound
-    // submissions hands the listener sequence numbers with no tracking entry, and its hash-miss
-    // path faults: eboot+0x229df3e, addr 0x10 — 2/2 runs, gone when gated).
+    // Command-buffer ctxs bound to the APR event queue via H896Pt-yB4I, with the binding's a3 TAG
+    // and target equeue. The tag IS the guest-chosen completion token for that cb ((ring<<58)|n,
+    // observed n starting at 0x3e8=1000 and incrementing per binding — live capture 2026-07-09):
+    // the guest's listener context (an eboot GLOBAL, ctx+0xa8+ring*0x28 in-flight slot, expected
+    // token at [slot+0x10] — read live at the issue-#180 stall: ring-4 slot expecting exactly
+    // 0x10000000000003e8, the first H896 tag) tracks the cb under this exact value. The submit
+    // must ECHO it through the out slots and the completion event must carry it verbatim — the
+    // pre-#180 code posted an invented per-ring counter (seq 1,2,...) that could never match, so
+    // the engine believed batch #1 was in flight forever and the whole async IO pipeline jammed
+    // behind it (the CreateGlobalShaderMap precache stall).
+    struct AprBoundCb { uint64_t cb, tag, eq; int64_t id; };
     std::mutex g_apr_bound_mx;
-    std::vector<uint64_t> g_apr_bound_cbs;
-    bool apr_cb_bound(uint64_t cb) {
+    std::vector<AprBoundCb> g_apr_bound_cbs;
+    bool apr_cb_bound(uint64_t cb, AprBoundCb* out = nullptr) {
         std::lock_guard<std::mutex> lk(g_apr_bound_mx);
-        for (uint64_t b : g_apr_bound_cbs) if (b == cb) return true;
+        for (auto& b : g_apr_bound_cbs)
+            if (b.cb == cb) { if (out) *out = b; return true; }
         return false;
     }
+    // Per-request "eventful" marks for UNBOUND one-shot cbs (issue #180). The engine drives two
+    // flavors of sceAmprAprCommandBufferReadFile through ONE wrapper (identical guest-RA chains):
+    //   - sync reads: the caller consumes the completion RECORD inline; NO equeue event may be
+    //     posted for them (the listener's hash-miss path faults at eboot+0x229df3e reading 0x10 —
+    //     re-verified 2026-07-09: posting events for every submit crashes there within seconds);
+    //   - async streaming reads: the submitting worker returns to its pool immediately (its frame
+    //     is dead at stall time — verified live) and the ONLY completion path is the APREventQueue
+    //     event -> FAPREventQueueListener -> completion handler -> FEvent. Suppressing their event
+    //     stalls the boot forever in IAsyncReadRequest::WaitCompletion (spin RA eboot+0x22ea954).
+    // The observable that separates them (only ReadFile-level distinction found across 4 runs /
+    // 90 reads each): the async wrapper passes a live 8th argument — a pointer into its OWN stack
+    // frame just above the request object (arg8 - req == +0x94 in every capture, 3 independent
+    // runs) — while sync callsites leave frame residue there (small ints, code addresses, heap
+    // garbage). f_apr_read_submit marks each request eventful/sync at ReadFile time; the ASoW
+    // submit consumes the mark. CONFIDENCE: MED — the discriminator is empirical (single eventful
+    // specimen at implementation time, deterministic across runs; every subsequent streaming read
+    // of a full boot validates or refutes it loudly: a missed eventful read re-stalls, a false
+    // positive crashes the listener).
+    std::mutex g_apr_eventful_mx;
+    std::unordered_map<uint64_t, bool> g_apr_eventful;   // req/cb ptr -> eventful (updated per ReadFile)
 }
-HLE(k_apr_set_equeue) {          // sSAUCCU1dv4 (eq, id, ...)
+void prosper_apr_mark_eventful(uint64_t req, bool eventful) {
+    std::lock_guard<std::mutex> lk(g_apr_eventful_mx);
+    g_apr_eventful[req] = eventful;   // stack frames are reused: update, don't accumulate stale marks
+    if (g_apr_eventful.size() > 4096) g_apr_eventful.clear();   // bound (frames recycle constantly)
+}
+namespace {
+    bool apr_req_eventful(uint64_t req) {
+        std::lock_guard<std::mutex> lk(g_apr_eventful_mx);
+        auto it = g_apr_eventful.find(req);
+        return it != g_apr_eventful.end() && it->second;
+    }
+}
+HLE(k_apr_set_equeue) {          // sSAUCCU1dv4 (eq, id, 0, 0, listenerCtx, flags)
     ampr_arglog("sSAUCCU1dv4(SetEqueue)", a0, a1, a2, a3, a4, a5);
-    if (a0) prosper_eq_add_apr(a0, (int64_t)a1);
+    // a4 = the listener context object whose per-ring in-flight slots ([ctx+0xa8+ring*0x28]) the
+    // slot-echo scan reads (live captures: a heap object, same one across re-registrations).
+    if (a0) prosper_eq_add_apr(a0, (int64_t)a1, a4 > 0xffff ? a4 : 0);
     return 0;
 }
-HLE(k_apr_cb_set_equeue) {       // H896Pt-yB4I (cbCtx, eq, id, ...)
+HLE(k_apr_cb_set_equeue) {       // H896Pt-yB4I (cb, eq, id, tag, 0, flags)
     ampr_arglog("H896Pt-yB4I(CbSetEqueue)", a0, a1, a2, a3, a4, a5);
-    if (a1) prosper_eq_add_apr(a1, (int64_t)a2);
-    if (a0) { std::lock_guard<std::mutex> lk(g_apr_bound_mx); g_apr_bound_cbs.push_back(a0); }
+    if (a1) prosper_eq_add_apr(a1, (int64_t)a2, 0);
+    if (a0) {
+        std::lock_guard<std::mutex> lk(g_apr_bound_mx);
+        bool seen = false;
+        for (auto& b : g_apr_bound_cbs)
+            if (b.cb == a0) { b.tag = a3; b.eq = a1; b.id = (int64_t)a2; seen = true; break; }
+        if (!seen) g_apr_bound_cbs.push_back({ a0, a3, a1, (int64_t)a2 });
+    }
     return 0;
 }
 HLE(k_apr_submit) {              // libkernel ASoW5WE-UPo (cb, ring_1based, out1, out2)
     unsigned ring = a1 ? (unsigned)(a1 - 1) & 0x3f : 0;
-    uint64_t token = prosper_apr_next_token(ring, /*tracked_catchup=*/false);
-    if (a2 > 0xffff) *(uint64_t*)(uintptr_t)a2 = token;
-    if (a3 > 0xffff) *(uint64_t*)(uintptr_t)a3 = token;
-    if (amprlog()) fprintf(stderr, "[amprlog] ASoW5WE-UPo(Submit) cb=0x%llx ring1b=%llu -> token=0x%llx%s\n",
-                           (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)token,
-                           apr_cb_bound(a0) ? " (bound)" : "");
-    // Completion events only for submissions of an equeue-BOUND cb (see g_apr_bound_cbs).
-    // CONFIDENCE: MED-HIGH (bound-vs-unbound split observed exactly once each way; the crash the
-    // gate prevents reproduced 2/2 without it).
-    if (apr_cb_bound(a0)) prosper_eq_trigger_apr(token);
+    // Completion-token contract (issue #180, established by live disassembly of the guest handler
+    // eboot+0x229dcb0 + the post-stall streaming captures):
+    //   - The guest TRACKS one in-flight cb per ring at [listenerCtx+0xa8+ring*0x28], expected
+    //     token at [slot+0x10]. Whatever token value the engine associates with the cb — the
+    //     H896Pt-yB4I binding tag for the streaming channel ((ring<<58)|0x3e8+n, guest-chosen), or
+    //     the value THIS call returns through its out slots for the ring-6 async-archive flow —
+    //     the completion event's data must equal it exactly.
+    //   - So: for an H896-bound cb, ECHO the binding tag through the out slots; otherwise hand out
+    //     our own per-ring counter token (the engine stores it verbatim when it tracks the read,
+    //     e.g. CreateGlobalShaderMap's blocking precache read — the #180 boot stall).
+    //   - Events are NOT posted from here with invented counters (a mismatched or slot-less event
+    //     faults the handler at +0x229dd21/+0x229df3e — crash-verified 2/2 both ways this
+    //     session). Instead the deferred SLOT-ECHO scan (hle_kernel_time.cpp) reads back the
+    //     guest's own tracking slots and posts exactly the expected tokens.
+    AprBoundCb bc{};
+    const bool bound = apr_cb_bound(a0, &bc);
+    // PROSPER_APR_TAG_ECHO=1 (EXPERIMENTAL, issue #180 follow-up): model the guest-chosen-token
+    // contract instead of the #115 invented-counter one —
+    //   - a BOUND cb's token is its H896 tag; echo it (not a counter) and post the completion
+    //     event with the tag verbatim on the binding's own equeue;
+    //   - do NOT write the out slots for bound cbs: a2/a3 alias the request's completion RECORD
+    //     ({status@req+0x28, bytes@req+0x30}, already completed {0,size} by ReadFile) — writing a
+    //     token there marks the record FAILED (nonzero status = the "Apr read failure" encoding,
+    //     checked at eboot+0x22738a5) and turned the shader-map load into "GEngineLoop.PreInit
+    //     Failed!" (live run 12, 2026-07-09);
+    //   - additionally run the slot-echo scan (hle_kernel_time.cpp).
+    // Still OFF by default: the tag event's counter (base 0x3e8=1000) makes the listener range-
+    // walk seqs 1..1000, and with a non-empty tracking hash the walk's misses fall off the chain
+    // sentinel into the eboot+0x229df3e fault (live run 12). The missing piece is how real HW
+    // initializes the listener's per-ring last-processed to the tag base — likely visible in the
+    // listener loop disassembly (eboot+0x2274130..) — see docs/UE4_APR_IOSTORE_BRINGUP.md.
+    static const bool tag_echo = getenv("PROSPER_APR_TAG_ECHO") != nullptr;
+    uint64_t token = (tag_echo && bound && bc.tag) ? bc.tag
+                                                   : prosper_apr_next_token(ring, /*tracked_catchup=*/false);
+    if (!(tag_echo && bound)) {
+        if (a2 > 0xffff) *(uint64_t*)(uintptr_t)a2 = token;
+        if (a3 > 0xffff) *(uint64_t*)(uintptr_t)a3 = token;
+    }
+    if (amprlog()) fprintf(stderr, "[amprlog] ASoW5WE-UPo(Submit) cb=0x%llx ring1b=%llu out1=0x%llx out2=0x%llx -> token=0x%llx%s%s\n",
+                           (unsigned long long)a0, (unsigned long long)a1,
+                           (unsigned long long)a2, (unsigned long long)a3, (unsigned long long)token,
+                           bound ? " (bound)" : "", apr_req_eventful(a0) ? " (arg8-async)" : "");
+    if (tag_echo) {
+        if (bound && bc.tag && bc.eq) prosper_eq_post_apr_token(bc.eq, bc.id, bc.tag);
+        prosper_apr_slot_scan_schedule();
+    } else if (bound) {
+        // Pre-#180 behavior (default): bound submissions post a per-ring counter event.
+        prosper_eq_trigger_apr(token);
+    }
     return 0;
 }
 // Still-unnamed mount-time Ampr NID (state query?); arg-logging no-op under PROSPER_AMPRLOG.

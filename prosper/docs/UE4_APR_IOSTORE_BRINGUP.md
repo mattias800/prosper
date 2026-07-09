@@ -510,6 +510,84 @@ page-cache warm-up or larger read batching) and follow the AGC submission stream
 `execute_and_present` for the first UE4 draw (the same libSceAgc path The Messenger renders
 through).
 
+### CORRECTED (2026-07-09, issue #180 session): the "IO-bound load" reading above is WRONG —
+### the boot stalls DETERMINISTICALLY after exactly 90 APR reads, on every IO speed
+
+Two changes of fact, both measured:
+
+1. **IO fast path.** Copying the dump to WSL-native ext4 (`cp -r /mnt/c/.../PPSA17942-app0
+   /root/PPSA17942-app0`, ~20 GB) and booting `/root/PPSA17942-app0` cuts time-to-first-AGC-driver
+   -call from ~9.5 min (9p) to **~80 s cold / ~13 s warm page cache**. The load was never
+   streaming-bound on guest demand — the 845 MB rchar figure was dominated by eboot/module/footer
+   reads, and total pak consumption before the wall is only ~45 MB (90 APR reads).
+2. **The wall is a correctness gap, not latency.** With identical binaries, both the ext4 boot and
+   a 9p control boot stop issuing APR reads after EXACTLY the same 90th read (`pakchunk0-ps5.pak
+   off=0x32687c8e size=0x40000` — the first async-archive precache chunk after
+   `GlobalShaderCache-SF_PS5.bin`), a few seconds after the `23LRUSvYu1M`/`BfBDZGbti7A` +
+   AgcEqueue setup. The earlier 9.5-minute runs were sitting at this SAME stall — there was never
+   additional progress to be had by waiting.
+
+**The stall, fully dissected (all live-verified under gdb on the stalled process):**
+
+- MAIN THREAD is parked at `eboot+0x24ae718` — inside the #115-documented blocking archive reader
+  (`IAsyncReadRequest::WaitCompletion(INFINITE)` on the FEvent at `*(obj+0x28)`) under
+  `CreateGlobalShaderMap` (`eboot+0x4ea8ea0` on the same stack). Its FEvent (state u32 at
+  obj+0x14, mutex slot +0x20, cond slot +0x28) is never triggered. Manually setting state=2 +
+  `pthread_cond_broadcast` un-wedges the whole machine (the engine then re-reads the chunk and
+  streams on through vWU direct reads) — proving the ONLY missing piece is the completion signal.
+- One worker spins in `k_cond_timedwait` (~16k futex/s, RA `eboot+0x22ea954` = FEventPS5 timed
+  wait) — a second waiter on the same stuck pipeline. IoService/IoDispatcher threads wait in
+  `sceKernelWaitEqueue` on their user-event queues (`AddUserEvent id=-1`); force-posting those
+  events (gdb) wakes them to EMPTY queues — the request is not queued anywhere, it is tracked and
+  waiting for its APR completion event.
+- **The guest's APR completion machinery** (handler `eboot+0x229dcb0`, listener loop
+  `eboot+0x22740b0`, both disassembled live):
+  - The listener object is an **eboot GLOBAL (`eboot+0x95aebd8`)**, NOT the sSAUCCU1dv4 a4 heap
+    object. Per-ring in-flight tracking slot at `[ctx+0xa8+ring*0x28]` (a request object whose
+    `+0x10` holds the EXPECTED completion token, `+0x00` the cb), queued-batch array pointer at
+    `+0xb8` (0x20-byte entries, `+0x18` submitted flag; completion resubmits the next entry via
+    the ASoW wrapper `eboot+0x59b6420` with `ring_1b = ring+1`), per-ring last-processed counter
+    at `+0xc8+ring*0x28`.
+  - **Completion tokens are GUEST-CHOSEN**: the `H896Pt-yB4I` binding's a3 tag IS the token
+    ((ring<<58)|n, live captures n = 0x3e8, 0x3e9, ... — the engine's own counter base 1000).
+    Read live at the stall: the ring-4 slot expects EXACTLY `0x10000000000003e8` — the first
+    H896 tag — while prosper posted an invented `(4<<58)|1`. The engine has therefore considered
+    async batch #1 in flight FOREVER, and the whole async IO pipeline (including the archive
+    precache the main thread waits on) is jammed behind it.
+  - An event whose data does not match: slot-compare fails -> hash walk; with a NON-empty
+    tracking hash the walk falls off the -1 chain sentinel and dereferences `0 + 0x10` — the
+    `eboot+0x229df3e` fault (re-verified 2/2 this session by posting events for unbound ring-6
+    submissions; `eboot+0x229dd21` is the same fault when the ring slot is null —
+    PROSPER_NULL_PAGE shims that one).
+  - `ASoW5WE-UPo`'s two out-pointers ALIAS the request's completion record: a2/a3 = req+0x28
+    (status) / req+0x30 (bytes) — the same fields `sceAmprAprCommandBufferReadFile` completes
+    with {0, size}. Writing a nonzero "token" there marks the read FAILED (the
+    `eboot+0x22738a5` check) — with tag-echo enabled this turned the shader-map load into
+    "GEngineLoop.PreInit Failed!" until the write was skipped for bound cbs.
+- **Experiments gated in the code** (all default-OFF; `hle_kernel_mem.cpp` / `hle_kernel_time.cpp`):
+  - `PROSPER_APR_TAG_ECHO=1` — bound cbs echo the H896 tag as their token, post the tag verbatim
+    on the binding's own equeue (2 ms deferred), leave the record untouched, and run a "slot-echo"
+    scan that re-reads registered listener ctxs' tracking slots and posts exactly the expected
+    tokens. Current result: the tag event IS consumed (the jam breaks) but the listener's range
+    walk over seqs 1..1000 (its last-processed starts at 0; the tag base is 1000) crosses a
+    non-empty tracking hash and faults at `eboot+0x229df3e`. THE remaining unknown: how real HW
+    seeds the listener's per-ring last-processed to the tag base — the answer is in the listener
+    loop body (`eboot+0x2274130..`), un-disassembled past `+0x2274146`.
+  - `PROSPER_APR_EVENT_ARG8=1` — mark requests whose ReadFile arg8 points just above the request
+    frame as eventful. Disproven as a discriminator (sync flavors pass live arg8 pointers too;
+    crashes the listener); kept only for bisection.
+- The next session should: (1) disassemble the listener loop body to learn the last-processed
+  seeding (or write it to tag_base-1 from the HLE before the first tag post — the listener object
+  address is discoverable by scanning eboot .data for the pointer-to-slot whose `[slot+0x10]`
+  equals the known H896 tag); (2) then enable tag-echo semantics by default; (3) the ring-6
+  async-archive read (#90) completes through the same machinery once the ring-4 channel drains —
+  re-verify, then follow the boot toward VideoOut/RHI init and the first SubmitDcb.
+
+Boot recipe (fast): `cp -r` the dump to `/root/PPSA17942-app0` once, then
+`PROSPER_GUEST_FS=1 PROSPER_NULL_PAGE=1 [PROSPER_RENDER=1 PROSPER_GFXLOG=1 PROSPER_FILELOG=1
+PROSPER_EVLOG=1 PROSPER_AMPRLOG=1] ./build-linux/boot_trace /root/PPSA17942-app0` — reaches the
+stall (the current frontier) in ~15-80 s.
+
 ### The remaining 3 unnamed Ampr NIDs (issue #107, not on the crash path)
 
 `vWU-odnS+fU`, `sSAUCCU1dv4`, `GnxKOHEawhk`, `H896Pt-yB4I` still resist the generated

@@ -7,6 +7,7 @@
 #ifndef _WIN32
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>   // process_vm_readv (slot-echo scan, issue #180)
 #endif
 #include <cstdint>
 #include <cstdlib>
@@ -560,7 +561,7 @@ HLE(k_eq_getcount){
 // order (live capture: sSAUCCU1dv4(eq, id=0x7502, 0, 0, 0x43, 0), H896Pt-yB4I(ctx, eq, id, ...)).
 namespace {
     constexpr int16_t EVFILT_AMPR_MODELED = -24;   // guest never reads filter; distinct on purpose
-    struct AprEqReg { uint64_t eq; int64_t id; };
+    struct AprEqReg { uint64_t eq; int64_t id; uint64_t ctx; };
     // Own mutex (NOT g_eq_mx): the post path calls eq_post/eq_find, which lock g_eq_mx themselves.
     std::mutex g_apr_mx;
     std::vector<AprEqReg> g_apr_eq_regs;               // guarded by g_apr_mx
@@ -571,6 +572,95 @@ namespace {
         e.data = (int64_t)token; e.udata = 0;
         eq_post(r.eq, e);
     }
+}
+// --- Slot-echo completion posting (issue #180) -------------------------------------------------
+// The guest's APR completion machinery (eboot+0x229dcb0, disassembled live 2026-07-09) keeps, per
+// listener context, ONE tracked in-flight command buffer per ring at [ctx + 0xa8 + ring*0x28] with
+// the EXPECTED completion token at [slot + 0x10] — and the expected token values are chosen by the
+// GUEST, not the library: the H896Pt-yB4I binding carries the token as its a3 tag ((ring<<58)|n,
+// observed n = 0x3e8, 0x3e9, ... — the engine's own counter base), and the ring-6 async-archive
+// flow (CreateGlobalShaderMap's FAsyncArchive precache, the issue-#180 boot stall) stores whatever
+// the ASoW submit returned through its out slots. A completion event whose data does not EXACTLY
+// match the slot's expected token is at best a benign wakeup (slot compare fails -> empty-hash
+// skip) and at worst a crash (non-empty hash chain walk falls off the -1 sentinel and dereferences
+// entry 0 + 0x10 -> the eboot+0x229df3e fault). So instead of inventing counter values, ECHO the
+// guest's own expectation: after a submit, read each registered listener ctx's per-ring slot and
+// post exactly the token it says it is waiting for. Deduped per (eq,ring,token) so the coalesced
+// kqueue knote isn't thrashed. Reads are process_vm_readv-safe (a freed/unmapped ctx reads as
+// nothing rather than faulting the HLE). Scans run ~2/10/50 ms after each submit — the engine
+// installs the slot right after the submit call returns, so the earliest scan usually hits, and
+// the later ones close the install race the 2 ms deferral could lose. CONFIDENCE: MED-HIGH — slot
+// layout and token-choice are from live disassembly + live captures; the scan model (poll the
+// guest's tracking state instead of modeling the library's private counters) is prosper's, chosen
+// because the library-side counter contract is guest-invisible.
+namespace {
+    constexpr uint64_t kAprSlotBase = 0xa8, kAprSlotStride = 0x28, kAprSlotTokenOff = 0x10;
+    constexpr unsigned kAprScanRings = 16;   // rings observed live: 2..5; 16 is generous
+    struct AprEcho { uint64_t eq; unsigned ring; uint64_t token; };
+    std::vector<AprEcho> g_apr_echoed;                 // guarded by g_apr_mx (dedupe memory)
+    bool apr_safe_read_u64(uint64_t addr, uint64_t* out) {
+#ifdef __linux__
+        if (addr < 0x10000) return false;
+        struct iovec l { out, 8 }, r { (void*)(uintptr_t)addr, 8 };
+        return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == 8;
+#else
+        (void)addr; (void)out; return false;
+#endif
+    }
+    void apr_slot_scan_once() {
+        std::vector<AprEqReg> regs;
+        { std::lock_guard<std::mutex> lk(g_apr_mx); regs = g_apr_eq_regs; }
+        for (auto& r : regs) {
+            if (!r.ctx) continue;
+            for (unsigned ring = 0; ring < kAprScanRings; ring++) {
+                uint64_t slot = 0, tok = 0;
+                if (!apr_safe_read_u64(r.ctx + kAprSlotBase + ring * kAprSlotStride, &slot) || !slot)
+                    continue;
+                if (!apr_safe_read_u64(slot + kAprSlotTokenOff, &tok) || !tok)
+                    continue;
+                if ((unsigned)(tok >> 58) != ring) continue;   // sanity: token names its ring
+                bool fresh = false;
+                {
+                    std::lock_guard<std::mutex> lk(g_apr_mx);
+                    fresh = true;
+                    for (auto& e : g_apr_echoed)
+                        if (e.eq == r.eq && e.ring == ring && e.token == tok) { fresh = false; break; }
+                    if (fresh) {
+                        g_apr_echoed.push_back({ r.eq, ring, tok });
+                        if (g_apr_echoed.size() > 65536) g_apr_echoed.erase(g_apr_echoed.begin(),
+                                                                            g_apr_echoed.begin() + 32768);
+                    }
+                }
+                if (fresh) {
+                    apr_post(r, ring, tok);
+                    if (evlog()) fprintf(stderr, "[ev] AprSlotEcho ring=%u token=0x%llx -> eq=0x%llx\n",
+                                         ring, (unsigned long long)tok, (unsigned long long)r.eq);
+                }
+            }
+        }
+    }
+}
+void prosper_apr_slot_scan_schedule() {
+    std::thread([] {
+        for (long ns : { 2000000l, 8000000l, 40000000l }) {   // scans at ~2 / 10 / 50 ms
+            struct timespec ts{ 0, ns }; nanosleep(&ts, nullptr);
+            apr_slot_scan_once();
+        }
+    }).detach();
+}
+// Deferred post of an EXACT guest-chosen completion token (the H896Pt-yB4I binding tag) to the
+// binding's own equeue. This is the completion signal for the bound/batched APR channel — the
+// token must match [trackedSlot+0x10] verbatim (see the slot-echo comment above; issue #180).
+// Deferred ~2 ms like every completion so the engine finishes installing its tracking slot first.
+void prosper_eq_post_apr_token(uint64_t eq, int64_t id, uint64_t token) {
+    if (evlog()) fprintf(stderr, "[ev] AprTagComplete token=0x%llx (ring=%u) -> eq=0x%llx scheduled\n",
+                         (unsigned long long)token, (unsigned)(token >> 58), (unsigned long long)eq);
+    std::thread([eq, id, token] {
+        struct timespec ts{ 0, 2000000 };   // 2 ms
+        nanosleep(&ts, nullptr);
+        AprEqReg r{ eq, id, 0 };
+        apr_post(r, (unsigned)(token >> 58) & 0x3f, token);
+    }).detach();
 }
 // Assign the next completion token for `ring` (0-based, 6 bits). Called by the APR submit paths.
 // `tracked_catchup`: the caller's completion must survive a registration that happens AFTER the
@@ -625,13 +715,17 @@ void prosper_eq_trigger_apr(uint64_t token) {
 }
 // Register an APR completion target. Tracked pre-registration completions (vWU direct reads) are
 // re-delivered so their listener wake-up isn't lost; untracked rings reset (see above).
-void prosper_eq_add_apr(uint64_t eq, int64_t id) {
+// `ctx` = the listener context object (sSAUCCU1dv4's a4) whose per-ring in-flight slots the
+// slot-echo scan reads; 0 when the caller doesn't know it (H896 bindings — the sSAUCCU
+// registration for the same eq carries it).
+void prosper_eq_add_apr(uint64_t eq, int64_t id, uint64_t ctx) {
     bool pending[64] = {};
     {
         std::lock_guard<std::mutex> lk(g_apr_mx);
-        for (auto& r : g_apr_eq_regs) if (r.eq == eq && r.id == id) return;   // idempotent
+        for (auto& r : g_apr_eq_regs)
+            if (r.eq == eq && r.id == id) { if (ctx && !r.ctx) r.ctx = ctx; return; }   // idempotent
         bool first = g_apr_eq_regs.empty();
-        g_apr_eq_regs.push_back({ eq, id });
+        g_apr_eq_regs.push_back({ eq, id, ctx });
         for (unsigned ring = 0; ring < 64; ring++) {
             if (!g_apr_ring_seq[ring]) continue;
             if (g_apr_ring_catchup[ring]) pending[ring] = true;
