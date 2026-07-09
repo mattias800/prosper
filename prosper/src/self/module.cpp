@@ -247,7 +247,8 @@ void bind_imports_to_stubs(const Module& m, LoadedImage& img, uint64_t stub_base
         img.import_addr[m.imports[i].sym_index] = stub_base + i * stub_size;
 }
 
-size_t apply_relocations(const Module& m, LoadedImage& img) {
+size_t apply_relocations(const Module& m, LoadedImage& img,
+                         const std::unordered_map<std::string, uint32_t>* tls_modid_by_nid) {
     size_t applied = 0;
     auto write64 = [&](uint64_t va, uint64_t val) -> bool {
         uint8_t* p = img.at(va);
@@ -271,12 +272,31 @@ size_t apply_relocations(const Module& m, LoadedImage& img) {
             case R_X86_64_JUMP_SLOT:  if (write64(va, sym_addr(r.sym))) applied++; break;
             // TLS (general-dynamic model, used by .prx shared libs like libc.prx). A GOT
             // tls_index{module_id, offset} pair is patched by DTPMOD64 + DTPOFF64; the guest then
-            // calls __tls_get_addr(tls_index*) which our HLE resolves to a per-thread block. We
-            // resolve the module id to THIS module's assigned id (correct for module-local TLS,
-            // which is the common case for libc's own errno/locale state); a cross-module TLS ref
-            // (import symbol) would need the defining module's id — logged as unhandled if it ever
-            // appears. DTPOFF64 = the TLS symbol's offset within its module's TLS block.
-            case R_X86_64_DTPMOD64:  if (write64(va, img.tls_modid)) applied++; break;
+            // calls __tls_get_addr(tls_index*) which our HLE resolves to a per-thread block. For a
+            // module-LOCAL TLS symbol the module id is THIS module's assigned id (the common case:
+            // libc's own errno/locale state). A cross-module TLS ref (an IMPORT symbol defined in
+            // another module) needs the DEFINING module's id — resolved via tls_modid_by_nid when
+            // the linker supplies it (#136), else logged unhandled with a best-effort local fallback
+            // (previously it silently used the wrong module's id). DTPOFF64 = offset within the block.
+            case R_X86_64_DTPMOD64: {
+                uint32_t modid = img.tls_modid;
+                if (r.sym && r.sym < m.symbols.size() && m.symbols[r.sym].is_import) {
+                    bool resolved = false;
+                    if (tls_modid_by_nid) {
+                        auto it = tls_modid_by_nid->find(m.symbols[r.sym].nid);
+                        if (it != tls_modid_by_nid->end()) { modid = it->second; resolved = true; }
+                    }
+                    if (!resolved) {
+                        unhandled[r.type]++;
+                        if (getenv("PROSPER_RELOC_HISTO"))
+                            fprintf(stderr, "[reloc]   DTPMOD64 cross-module TLS import '%s' unresolved "
+                                    "-> best-effort local modid %u\n",
+                                    m.symbols[r.sym].nid.c_str(), modid);
+                    }
+                }
+                if (write64(va, modid)) applied++;
+                break;
+            }
             case R_X86_64_DTPOFF64: {
                 // psABI: DTPOFF64 = S + A. The addend addresses a field INSIDE the TLS object
                 // (e.g. a struct member); picking S *or* A drops it and resolves to the object base.

@@ -77,9 +77,21 @@ bool link_program(const std::vector<LinkInput>& inputs, uint64_t stub_base,
         }
     }
 
+    // --- TLS module-id by exported symbol NID (#136): so a cross-module DTPMOD64 (a TLS symbol
+    // imported from another module) resolves to the DEFINING module's TLS module id, not the
+    // relocating module's. Only TLS-bearing modules (tls_modid != 0) contribute their exported
+    // (defined, non-import) symbols. First definition wins (same rule as the global export table). ---
+    std::unordered_map<std::string, uint32_t> tls_modid_by_nid;
+    for (size_t i = 0; i < out.mods.size(); i++) {
+        uint32_t mid = out.imgs[i].tls_modid;
+        if (!mid) continue;
+        for (auto& s : out.mods[i]->symbols)
+            if (!s.is_import && !s.nid.empty()) tls_modid_by_nid.emplace(s.nid, mid);
+    }
+
     // --- Pass 3: apply relocations now that all import addresses are known. ---
     for (size_t i = 0; i < out.mods.size(); i++)
-        apply_relocations(*out.mods[i], out.imgs[i]);
+        apply_relocations(*out.mods[i], out.imgs[i], &tls_modid_by_nid);
 
     // --- Collect init functions for dependent modules (module 0 = main exe runs its
     // own ctors via _start; PRX modules need their init_array run by the loader). We run
