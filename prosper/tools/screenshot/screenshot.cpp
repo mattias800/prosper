@@ -85,9 +85,11 @@ bool write_png(const char* path, const uint8_t* rgba, uint32_t w, uint32_t h) {
 int main(int argc, char** argv) {
     std::string dump, out = ".";
     int every = 60, count = 30, timeout = 900;
+    double seconds = 0.0;   // >0 => capture every N wall-clock seconds instead of every N rendered frames
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if      (a == "--every"   && i + 1 < argc) every = atoi(argv[++i]);
+        else if (a == "--seconds" && i + 1 < argc) seconds = atof(argv[++i]);
         else if (a == "--count"   && i + 1 < argc) count = atoi(argv[++i]);
         else if (a == "--out"     && i + 1 < argc) out   = argv[++i];
         else if (a == "--timeout" && i + 1 < argc) timeout = atoi(argv[++i]);
@@ -95,7 +97,7 @@ int main(int argc, char** argv) {
         else { fprintf(stderr, "screenshot: unknown/duplicate arg '%s'\n", a.c_str()); return 2; }
     }
     if (dump.empty()) {
-        fprintf(stderr, "usage: screenshot <app0-dir> [--every N=60] [--count M=30] [--out DIR] [--timeout SECS]\n");
+        fprintf(stderr, "usage: screenshot <app0-dir> [--every N=60 | --seconds S] [--count M=30] [--out DIR] [--timeout SECS]\n");
         return 2;
     }
     if (every < 1) every = 1;
@@ -127,22 +129,31 @@ int main(int argc, char** argv) {
     std::thread guest([&prog] { run_entry(prog.imgs[0]); });
     guest.detach();
 
-    fprintf(stderr, "[shot] %s: %d screenshots, every %d frames -> %s/%s_%s_*.png\n",
-            code.c_str(), count, every, out.c_str(), code.c_str(), ts);
+    const bool time_mode = seconds > 0;   // capture on wall-clock interval vs. every N rendered frames
+    if (time_mode)
+        fprintf(stderr, "[shot] %s: %d screenshots, one every %gs -> %s/%s_%s_*.png\n",
+                code.c_str(), count, seconds, out.c_str(), code.c_str(), ts);
+    else
+        fprintf(stderr, "[shot] %s: %d screenshots, every %d frames -> %s/%s_%s_*.png\n",
+                code.c_str(), count, every, out.c_str(), code.c_str(), ts);
 
     std::vector<uint8_t> buf;
     int saved = 0;
-    uint64_t next = (uint64_t)every;   // first shot after `every` flips (frame 0 is usually blank)
+    uint64_t next = (uint64_t)every;   // frame-mode: rendered-frame # for the next shot
     auto t0 = std::chrono::steady_clock::now();
+    auto last_cap = t0;                // time-mode: wall-clock of the previous shot
     while (saved < count) {
-        double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        auto now = std::chrono::steady_clock::now();
+        double el = std::chrono::duration<double>(now - t0).count();
         if (timeout > 0 && el > timeout) {
-            fprintf(stderr, "[shot] timeout after %.0fs with %d/%d saved — game not flipping enough "
-                            "(wrong guest env for this title? see --help notes)\n", el, saved, count);
+            fprintf(stderr, "[shot] timeout after %.0fs with %d/%d saved — game not rendering enough "
+                            "(wrong guest env for this title? see the README)\n", el, saved, count);
             break;
         }
-        if (gpu::present_has_frame() && gpu::present_frame_seq() >= next) {
-            uint64_t at = gpu::present_frame_seq();   // rendered-frame # at this shot; next is `every` later
+        bool due = time_mode ? (std::chrono::duration<double>(now - last_cap).count() >= seconds)
+                             : (gpu::present_frame_seq() >= next);
+        if (gpu::present_has_frame() && due) {
+            uint64_t at = gpu::present_frame_seq();
             uint32_t w = gpu::present_width(), h = gpu::present_height();
             if (w && h) {
                 buf.resize((size_t)w * h * 4);
@@ -150,14 +161,15 @@ int main(int argc, char** argv) {
                     char fn[1024];
                     snprintf(fn, sizeof fn, "%s/%s_%s_%0*d.png", out.c_str(), code.c_str(), ts, pad, saved);
                     if (write_png(fn, buf.data(), w, h)) {
-                        fprintf(stderr, "[shot] %d/%d  %s  (frame %llu)\n", saved + 1, count, fn, (unsigned long long)at);
+                        fprintf(stderr, "[shot] %d/%d  %s  (frame %llu, %.1fs)\n",
+                                saved + 1, count, fn, (unsigned long long)at, el);
                         saved++;
                     } else {
                         fprintf(stderr, "[shot] PNG write failed: %s\n", fn);
                     }
+                    if (time_mode) last_cap = now; else next = at + (uint64_t)every;
                 }
             }
-            next = at + (uint64_t)every;   // schedule `every` flips after THIS shot (not accumulating from 0)
         } else {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }

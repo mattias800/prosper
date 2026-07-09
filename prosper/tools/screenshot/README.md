@@ -26,6 +26,7 @@ screenshot <app0-dir> [--every N] [--count M] [--out DIR] [--timeout SECS]
 |--------|---------|---------|
 | `<app0-dir>` | **required** | Game dump root, e.g. `.../PPSA24651-app0` |
 | `--every N` | 60 | Rendered frames between screenshots |
+| `--seconds S` | — | Wall-clock seconds between screenshots (overrides `--every`; e.g. `--seconds 1` = one per second) |
 | `--count M` | 30 | Number of screenshots, then exit |
 | `--out DIR` | `.` | Output directory |
 | `--timeout S` | 900 | Give up after S seconds if the game isn't rendering enough (0 = no limit) |
