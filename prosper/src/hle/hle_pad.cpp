@@ -20,6 +20,8 @@
 #include <cstdlib>
 #include <atomic>
 #include <chrono>
+#include <string>
+#include <vector>
 
 namespace prosper {
 
@@ -52,10 +54,55 @@ uint64_t now_us() {
     return (uint64_t)duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
+// --- PROSPER_PAD_SCRIPT: hardware-free timed button sequence -------------------------------------
+// Drives a scripted controller so a headless run can navigate menus (e.g. the title→menu→save→name
+// flow in issue #163) with no host device. Format: a ';'-separated list of "<seconds>:<button>[+..]"
+// entries, e.g. "3:start;9:start;16:cross;24:cross;31:up+cross". Each entry presses its button(s)
+// for PROSPER_PAD_HOLD ms (default 300) starting at <seconds>. When a script is set the pad reports
+// CONNECTED for the whole run (a menu that gates on a controller sees one).
+//
+// Timing is anchored to the FIRST input poll, not process start: the game only reads the pad once it
+// reaches the interactive menu, so t=0 == "menu appeared" — robust to how long asset loading takes.
+// CONFIDENCE: HIGH (mechanism); MED (that the game's submit maps to OPTIONS="Start" / CROSS).
+// The parse + time-eval live in pad.cpp (pure, unit-tested); this file supplies getenv + the clock.
+const std::vector<PadScriptEntry>& pad_script() {
+    static const std::vector<PadScriptEntry> script = [] {
+        const char* env = getenv("PROSPER_PAD_SCRIPT");
+        return env ? parse_pad_script(env) : std::vector<PadScriptEntry>{};
+    }();
+    return script;
+}
+
+double pad_hold_secs() {
+    static const double h = [] {
+        const char* e = getenv("PROSPER_PAD_HOLD");
+        return e ? atof(e) / 1000.0 : 0.30;   // ms -> s
+    }();
+    return h;
+}
+
+// t0 (us) of the first poll; 0 until set. steady_clock so it matches now_us().
+std::atomic<uint64_t> g_pad_t0_us{0};
+
+// Overlay any active scripted press onto `s`. Returns true if a script is driving the pad.
+bool apply_pad_script(HostPadState& s) {
+    const auto& script = pad_script();
+    if (script.empty()) return false;
+    s.connected = true;                                     // a controller is present for the whole run
+    uint64_t t0 = g_pad_t0_us.load(std::memory_order_relaxed);
+    if (t0 == 0) {                                          // anchor to this first poll
+        uint64_t expect = 0, now = now_us();
+        if (g_pad_t0_us.compare_exchange_strong(expect, now)) t0 = now; else t0 = expect;
+    }
+    double elapsed = (now_us() - t0) / 1e6;
+    s.buttons |= pad_script_buttons_at(script, elapsed, pad_hold_secs());
+    return true;
+}
+
 // Snapshot the controller for a given pad handle via the installed backend. With no host frontend
 // installed, prosper_core's default backend reports a neutral, disconnected pad (fully-formed
-// struct). PROSPER_PAD_PRESS overrides with a synthetic connected pad (CROSS held) for hardware-free
-// end-to-end testing — a device-independent successor to the old stub's inline press injection.
+// struct). PROSPER_PAD_PRESS overrides with a synthetic connected pad (CROSS held); PROSPER_PAD_SCRIPT
+// overrides with a timed button sequence — both are device-independent end-to-end test drivers.
 HostPadState snapshot(int /*handle*/, const char* what) {
     HostPadState s;   // neutral, disconnected by default
     pad_backend()->poll(0, s);
@@ -63,6 +110,7 @@ HostPadState snapshot(int /*handle*/, const char* what) {
         s.connected = true;
         s.buttons  |= SCE_PAD_BUTTON_CROSS;
     }
+    apply_pad_script(s);
     padlog_once(what, &s);
     return s;
 }
