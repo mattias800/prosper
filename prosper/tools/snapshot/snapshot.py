@@ -68,6 +68,26 @@ def pixel_hash(bmp_path):
     return hashlib.sha256(d[off:]).hexdigest(), (w, h)
 
 
+def distinct_colors(bmp_path):
+    """Count distinct RGB pixel values + return (count, (w,h)). A content metric that is ROBUST to the
+    run-to-run pixel variance of a threaded boot (where exact hashing flakes) while still catching the
+    regression that matters: a dropped/rejected shader collapses the frame to the debug clear (1 color),
+    whereas a real rendered frame has hundreds+. Use `min_colors` in the manifest for such titles."""
+    with open(bmp_path, "rb") as f:
+        d = f.read()
+    if len(d) < 54 or d[:2] != b"BM":
+        raise ValueError(f"{bmp_path}: not a BMP ({len(d)} bytes)")
+    off = struct.unpack_from("<I", d, 10)[0]
+    w = struct.unpack_from("<i", d, 18)[0]
+    h = abs(struct.unpack_from("<i", d, 22)[0])
+    bpp = struct.unpack_from("<H", d, 28)[0]
+    step = bpp // 8
+    px = d[off:]
+    n = min(len(px) // step, w * h) if step else 0
+    colors = {px[i:i + 3] for i in range(0, n * step, step)}
+    return len(colors), (w, h)
+
+
 def resolve_dump(entry):
     dump = entry["dump"]
     return dump if os.path.isabs(dump) else os.path.join(GAME_ROOT, dump)
@@ -171,6 +191,65 @@ def capture(entry, run_log=None):
             logf.close()
 
 
+def capture_richest(entry, run_log=None):
+    """Run the whole boot and return the RICHEST frame it produced: (best_bmp_path, max_colors, dims, tmp).
+    For a threaded boot whose per-frame output isn't reproducible, neither an exact hash nor a single
+    settled frame is stable (the settled screen — a blank loading flicker vs real content — varies). The
+    MAX distinct-color count OVER THE WHOLE RUN is robust: a working render always produces some rich
+    frame; a rejected/dropped shader collapses every frame to the debug clear (~1 color). Powers the
+    `min_colors` guard (see distinct_colors)."""
+    bt = boot_trace_path()
+    if not os.path.exists(bt):
+        raise RuntimeError(f"boot_trace not found at {bt} (build it, or set PROSPER_BOOT_TRACE)")
+    dump = resolve_dump(entry)
+    if not os.path.exists(dump):
+        raise RuntimeError(f"game dump not found: {dump} (set PROSPER_GAME_ROOT)")
+    scale = int(entry.get("scale", 4))
+    timeout = int(entry.get("timeout", 240))
+    env = dict(os.environ)
+    env.update({
+        "PROSPER_GUEST_FS": "1", "PROSPER_GUEST_ARGS": "-force-gfx-direct",
+        "PROSPER_RENDER": "1", "PROSPER_RENDER_EVERY": "1", "PROSPER_RENDER_FIRST": "0",
+        "PROSPER_RENDER_SCALE": str(scale), "PROSPER_FAULT_ONSTACK": "1",
+    })
+    env.update(entry.get("env", {}))
+    tmp = tempfile.mkdtemp(prefix="snap_")
+    env["PROSPER_FRAME_DIR"] = tmp
+    bt_run = os.path.join(tmp, "bt_snap")
+    shutil.copyfile(bt, bt_run); os.chmod(bt_run, 0o755)
+    logf = open(run_log, "wb") if run_log else subprocess.DEVNULL
+    try:
+        proc = subprocess.Popen([bt_run, dump], env=env, stdout=logf, stderr=subprocess.STDOUT,
+                                preexec_fn=os.setsid)
+        deadline = time.time() + timeout
+        while time.time() < deadline and proc.poll() is None:
+            time.sleep(1.0)
+    finally:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            pass
+        if run_log:
+            logf.close()
+    frames = sorted(f for f in os.listdir(tmp) if f.startswith("frame_") and f.endswith(".bmp"))
+    if not frames:
+        raise RuntimeError(f"no frames rendered in {timeout}s")
+    best_p, best_n, best_dims = None, -1, (0, 0)
+    for f in frames:
+        p = os.path.join(tmp, f)
+        try:
+            if os.path.getsize(p) <= 0:
+                continue
+            n, dims = distinct_colors(p)
+        except (OSError, ValueError):
+            continue
+        if n > best_n:
+            best_p, best_n, best_dims = p, n, dims
+    dst = os.path.join(tmp, "captured.bmp")
+    shutil.copyfile(best_p, dst)
+    return dst, best_n, best_dims, tmp
+
+
 def _last_frame(tmp):
     fs = sorted(f for f in os.listdir(tmp) if f.startswith("frame_") and f.endswith(".bmp"))
     return fs[-1] if fs else "no frames"
@@ -210,6 +289,14 @@ def cmd_update(m, names):
     rc = 0
     for s in select(m, names):
         try:
+            if s.get("min_colors"):     # content-metric entry: nothing to bless; report the margin
+                b, nc, dims, t = capture_richest(s); _cleanup(t)
+                ok = nc >= int(s["min_colors"])
+                print(f"[update] {s['name']}: {dims[0]}x{dims[1]}, richest frame {nc} distinct colors "
+                      f"(threshold min_colors={s['min_colors']}, {'OK' if ok else 'BELOW'})")
+                if not ok:
+                    rc = 1
+                continue
             b1, t1 = capture(s); h1, dims = pixel_hash(b1); _cleanup(t1)
             if force:
                 s["hash"] = h1; s["dims"] = list(dims)
@@ -251,13 +338,29 @@ def cmd_check(m, names):
     os.makedirs(FAIL_DIR, exist_ok=True)
     rc = 0
     for s in select(m, names):
+        min_colors = s.get("min_colors")
         base = s.get("hash")
-        if not base:
+        if not min_colors and not base:
             print(f"[check] {s['name']}: NO BASELINE — run `snapshot.py update {s['name']}`", file=sys.stderr)
             rc = 1
             continue
         log = os.path.join(FAIL_DIR, f"{s['name']}.log")
         try:
+            if min_colors:                                  # content-metric mode (robust to pixel variance)
+                bmp, nc, dims, tmp = capture_richest(s, run_log=log)
+                if nc >= int(min_colors):
+                    print(f"[check] {s['name']}: OK ({dims[0]}x{dims[1]}, richest {nc} colors >= {min_colors})")
+                    os.remove(log) if os.path.exists(log) else None
+                else:
+                    out = os.path.join(FAIL_DIR, f"{s['name']}.bmp")
+                    shutil.copyfile(bmp, out)
+                    print(f"[check] {s['name']}: FAIL — richest frame only {nc} distinct colors < min "
+                          f"{min_colors} (render collapsed to the debug clear?)")
+                    print(f"         screenshot: {out}")
+                    print(f"         boot log:   {log}")
+                    rc = 1
+                _cleanup(tmp)
+                continue
             bmp, tmp = capture(s, run_log=log)
             h, dims = pixel_hash(bmp)
             if h == base:
