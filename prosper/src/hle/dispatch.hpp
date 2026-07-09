@@ -76,8 +76,10 @@ void set_exc_raise_counter(volatile int* counter);
 void set_gfx_call_counter(volatile int* counter);
 // Per-module TLS template for the general-dynamic model (see linker.cpp / __tls_get_addr).
 // init_va = mapped tdata (guest==host addr); a per-thread block of memsz is allocated lazily,
-// filesz bytes copied from init_va, the rest zeroed. Indexed by module TLS id.
-struct TlsModuleDesc { uint64_t init_va = 0, filesz = 0, memsz = 0; };
+// filesz bytes copied from init_va, the rest zeroed. `align` is the module's PT_TLS p_align — the
+// static-TLS layout must round each module's offset to it so an x86-64 Variant II initial-exec
+// %fs:-N access lands where the guest static linker compiled it (#143). Indexed by module TLS id.
+struct TlsModuleDesc { uint64_t init_va = 0, filesz = 0, memsz = 0, align = 0; };
 // Install the TLS templates (call AFTER images are mapped, so init_va is readable). Enables the
 // __tls_get_addr HLE to serve real per-thread TLS blocks for loaded modules (e.g. real libc.prx).
 void set_tls_modules(const TlsModuleDesc* descs, size_t count);
@@ -101,6 +103,10 @@ uint64_t guest_tls_activate_thread();   // per guest thread at entry; returns gu
 void guest_fs_enter_host_for_signal();  // crash-signal-handler entry: swap guest %fs -> host %fs (no-op if not guest TCB)
 uint64_t guest_fs_to_host_scoped();     // diagnostic handler (returns to guest): swap to host %fs, return prev fs
 void guest_fs_restore_scoped(uint64_t prev_fs);  // restore the fs returned by guest_fs_to_host_scoped
+// Diagnostic (test): the Variant II static-TLS distance below the thread pointer for module id
+// `modid`, and the total below TP — verifies the per-module PT_TLS p_align layout (#143). Linux-only.
+uint64_t guest_tls_module_below(uint32_t modid);
+uint64_t guest_tls_total_below();
 
 // Per-module info for C++ exception unwinding (sceKernelGetModuleInfoForUnwind). The guest's libunwind
 // asks, for a code address, where that module's .eh_frame_hdr / text segment live. `lo/hi` is the module's

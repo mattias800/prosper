@@ -72,6 +72,14 @@ if(TARGET prosper_core)
   target_link_libraries(test_va2foff PRIVATE prosper_core)
   add_test(NAME va2foff_load_priority COMMAND test_va2foff)
 
+  # Guest static-TLS Variant II layout uses each module's real PT_TLS p_align (#143). The layout
+  # code is Linux-only (guest %fs), so gate the test on it too.
+  if(UNIX AND NOT APPLE)
+    add_executable(test_guest_tls_align tests/test_guest_tls_align.cpp)
+    target_link_libraries(test_guest_tls_align PRIVATE prosper_core)
+    add_test(NAME guest_tls_align COMMAND test_guest_tls_align)
+  endif()
+
   # AMD SSE4a INSERTQ/EXTRQ emulation (the SIGILL handler emulates these Zen2-only ops on Intel
   # hosts). Golden bit-math vectors — header-only, no game dump required.
   add_executable(test_sse4a tests/test_sse4a.cpp)

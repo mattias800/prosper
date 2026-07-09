@@ -57,7 +57,7 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
 
     set_app0_root(d);
     for (auto& img : p.imgs) if (!map_image(img, &e)) return fail("map failed: " + e);
-    { std::vector<TlsModuleDesc> td; for (auto& t : p.tls_templates) td.push_back({t.init_va, t.filesz, t.memsz});
+    { std::vector<TlsModuleDesc> td; for (auto& t : p.tls_templates) td.push_back({t.init_va, t.filesz, t.memsz, t.align});
       set_tls_modules(td.data(), td.size());              // __tls_get_addr for loaded modules (real libc.prx)
       guest_tls_set_templates(td.data(), td.size()); }    // gated PROSPER_GUEST_FS: guest initial-exec %fs TLS
 
