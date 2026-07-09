@@ -20,37 +20,40 @@ enum class TileMode : uint32_t { Linear = 0, Sw4KbS = 5 };
 // True if `tile_mode` denotes a swizzled layout that detile_surface will de-swizzle.
 bool tile_mode_is_tiled(uint32_t tile_mode);
 
-// Byte size of the TILED surface for `tile_mode` — for swizzled modes the height is padded up to a whole
-// number of 32-texel tile rows (e.g. 1080 -> 1088), so the tiled buffer is larger than width*height*4.
-// The caller must read at least this many bytes of tiled source before detiling. Linear -> width*height*4.
-size_t tiled_surface_bytes(uint32_t width, uint32_t height, uint32_t tile_mode, uint32_t pitch = 0);
+// Byte size of the TILED surface for `tile_mode` — for swizzled modes the dimensions are padded up
+// to whole 4KB micro-tiles, whose texel size depends on bytes_per_texel (a tile is a FIXED 4096
+// bytes: 32x32 at 4 B, 64x32 at 2 B, 64x64 at 1 B — #119), so the tiled buffer is larger than
+// w*h*bpt. The caller must read at least this many bytes of tiled source. Linear -> w*h*bpt.
+size_t tiled_surface_bytes(uint32_t width, uint32_t height, uint32_t tile_mode, uint32_t pitch = 0,
+                           uint32_t bytes_per_texel = 4);
 
-// De-swizzle a 32-bpp (RGBA8) surface from tiled `src` into linear `dst` (each width*height*4 bytes).
-// `tile_mode` selects the swizzle; Linear/unknown modes do a straight copy. `pitch` is the padded row
-// pitch in texels (0 -> use `width`).
+// De-swizzle a surface of `bytes_per_texel`-byte texels from tiled `src` into linear `dst` (each
+// width*height*bpt bytes). `tile_mode` selects the swizzle; Linear/unknown modes do a straight
+// copy. `pitch` is the padded row pitch in texels (0 -> use `width`).
 void detile_surface(uint8_t* dst, const uint8_t* src, uint32_t width, uint32_t height,
-                    uint32_t tile_mode, uint32_t pitch = 0);
+                    uint32_t tile_mode, uint32_t pitch = 0, uint32_t bytes_per_texel = 4);
 
 // Convenience wrapper: detile `src` (tiled) into a returned linear vector. Returns a copy of `src` for
 // linear/unknown modes.
 std::vector<uint8_t> detile_surface(const std::vector<uint8_t>& src, uint32_t width, uint32_t height,
-                                    uint32_t tile_mode, uint32_t pitch = 0);
+                                    uint32_t tile_mode, uint32_t pitch = 0, uint32_t bytes_per_texel = 4);
 
 // Inverse of detile_surface (linear -> tiled). Provided for testing the round-trip; the runtime only
 // detiles. Same parameters.
 void tile_surface(uint8_t* dst, const uint8_t* src, uint32_t width, uint32_t height,
-                  uint32_t tile_mode, uint32_t pitch = 0);
+                  uint32_t tile_mode, uint32_t pitch = 0, uint32_t bytes_per_texel = 4);
 
-// General SW_4KB_S de-swizzle for `bpe`-byte ELEMENTS (not fixed at 4). The 4KB micro-tile holds
-// 4096/bpe elements arranged `tile_side`x`tile_side` (Morton order, Y in the low bit of each pair,
-// identical structure to the 32-bpp path). Block-compressed surfaces use this with element = one
-// compressed block (BC3 = 16 bytes -> tile_side 16). `dst` holds ew*eh*bpe linear bytes; `src_bytes`
-// bounds the tiled read (short/OOB elements detile to zero). tile_mode!=SW_4KB_S -> straight copy.
+// General SW_4KB_S de-swizzle for `bpe`-byte ELEMENTS. The 4KB micro-tile holds 4096/bpe elements;
+// its dimensions derive from bpe (wide-before-tall: 16 B -> 16x16, 8 B -> 32x16, ...) — previously
+// a caller-supplied SQUARE tile_side, which could not represent the non-square 8 B geometry (#119).
+// Block-compressed surfaces use this with element = one compressed block (BC3 = 16 bytes). `dst`
+// holds ew*eh*bpe linear bytes; `src_bytes` bounds the tiled read (short/OOB elements detile to
+// zero). tile_mode!=SW_4KB_S -> straight copy.
 void detile_elements(uint8_t* dst, const uint8_t* src, size_t src_bytes,
-                     uint32_t ew, uint32_t eh, uint32_t bpe, uint32_t tile_side, uint32_t tile_mode);
+                     uint32_t ew, uint32_t eh, uint32_t bpe, uint32_t tile_mode);
 
-// Byte size of the TILED element surface (element grid padded up to whole tile_side tiles). The caller
+// Byte size of the TILED element surface (element grid padded up to whole 4KB tiles). The caller
 // must read at least this many bytes of tiled source before detiling.
-size_t tiled_elements_bytes(uint32_t ew, uint32_t eh, uint32_t bpe, uint32_t tile_side, uint32_t tile_mode);
+size_t tiled_elements_bytes(uint32_t ew, uint32_t eh, uint32_t bpe, uint32_t tile_mode);
 
 } // namespace prosper::gpu

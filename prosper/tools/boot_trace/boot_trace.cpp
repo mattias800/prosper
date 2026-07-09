@@ -316,20 +316,17 @@ int main(int argc, char** argv) {
                             const uint32_t bcb = prosper::gpu::bc_block_bytes(r.format);
                             if (bcb) {
                                 uint32_t bw = (tw + 3) / 4, bh = (th + 3) / 4;
-                                // CONFIDENCE: MED — SW_4KB_S keeps a 4KB micro-tile, so element count =
-                                // 4096/bpe arranged square: 16-byte blocks (BC2/3/5/7) -> 16x16, 8-byte
-                                // (BC1/4) -> 32x16 (approximated as 32 here). Verified against the 32-bpp
-                                // path (bpe=4 -> 32x32) and llvmpipe re-tiling, but NOT yet against a
-                                // structured (non-uniform) BC surface — the one live BC3 tex is ~solid white.
-                                uint32_t tside = (bcb == 16) ? 16u : 32u;
+                                // The 4KB micro-tile's element dims now derive from bpe inside the
+                                // detiler (16-byte blocks -> 16x16, 8-byte -> 32x16, #119) — the old
+                                // caller-supplied square tile_side mis-shaped the 8-byte geometry.
                                 size_t comp_bytes = (size_t)bw * bh * bcb;
                                 std::vector<uint8_t> lin(comp_bytes, 0);
                                 bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) && !getenv("PROSPER_NODETILE");
                                 if (tiled) {
-                                    size_t tbytes = prosper::gpu::tiled_elements_bytes(bw, bh, bcb, tside, r.tile_mode);
+                                    size_t tbytes = prosper::gpu::tiled_elements_bytes(bw, bh, bcb, r.tile_mode);
                                     std::vector<uint8_t> traw(tbytes, 0);
                                     safe_copy(traw.data(), r.gpu_addr, tbytes);
-                                    prosper::gpu::detile_elements(lin.data(), traw.data(), tbytes, bw, bh, bcb, tside, r.tile_mode);
+                                    prosper::gpu::detile_elements(lin.data(), traw.data(), tbytes, bw, bh, bcb, r.tile_mode);
                                 } else {
                                     safe_copy(lin.data(), r.gpu_addr, comp_bytes);
                                 }
