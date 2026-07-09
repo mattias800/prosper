@@ -16,6 +16,8 @@ namespace prosper {
 inline constexpr uint64_t BOOT_EBOOT    = 0x400000000ull;
 inline constexpr uint64_t BOOT_IL2CPP   = 0x440000000ull;
 inline constexpr uint64_t BOOT_PS5UTIL  = 0x4c0000000ull;
+inline constexpr uint64_t BOOT_PSNCORE  = 0x480000000ull;   // PPSA02664's Unity PSN native plugin
+inline constexpr uint64_t BOOT_PSNCOMMON= 0x4a0000000ull;   //   (PSNCore.prx + PSNCommon.prx)
 inline constexpr uint64_t BOOT_PSN      = 0x4e0000000ull;
 inline constexpr uint64_t BOOT_SAVEDATA = 0x4f0000000ull;
 inline constexpr uint64_t BOOT_LIBC     = 0x500000000ull;
