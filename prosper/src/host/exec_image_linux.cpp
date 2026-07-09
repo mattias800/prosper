@@ -1391,6 +1391,49 @@ void set_module_start_param_ranges(const std::vector<std::pair<uint64_t, uint64_
     g_modstart_param_ranges = ranges;
 }
 
+// Find the /proc/self/maps region containing `addr`: [s,e) and its "rwxp" perms. False if unmapped.
+static bool region_of(uint64_t addr, uint64_t& s, uint64_t& e, char perms[5]) {
+    FILE* mf = fopen("/proc/self/maps", "re");
+    if (!mf) return false;
+    char line[512];
+    while (fgets(line, sizeof line, mf)) {
+        unsigned long long ls = 0, le = 0; char pr[8] = {0};
+        if (sscanf(line, "%llx-%llx %4s", &ls, &le, pr) != 3) continue;
+        if (addr >= ls && addr < le) { s = ls; e = le; memcpy(perms, pr, 4); perms[4] = 0; fclose(mf); return true; }
+    }
+    fclose(mf);
+    return false;
+}
+
+// Print the `n` bytes at [start, start+n) for the init-fault report WITHOUT risking a second,
+// fatal fault (#128): the faulting rip can be a wild/null jump — the exact case this diagnostic
+// exists for — and by the time the report runs the sigsetjmp guard is disarmed, so an unguarded
+// deref (or an mprotect that silently failed) turns a tolerated, logged failure into process
+// death. Each region the range touches is checked in /proc/self/maps; unmapped stretches print a
+// marker. Execute-only pages get PROT_READ temporarily and their ORIGINAL protection restored
+// (the old code force-set R|X, stripping W from an RW span and leaving the page readable forever).
+static void dump_fault_bytes(uint64_t start, int n) {
+    uint64_t cur = start;
+    int remaining = n;
+    while (remaining > 0) {
+        uint64_t s = 0, e = 0; char perms[5] = {0};
+        if (!region_of(cur, s, e, perms)) { fprintf(stderr, " (unmapped@0x%llx)", (unsigned long long)cur); return; }
+        int chunk = (int)((e - cur) < (uint64_t)remaining ? (e - cur) : (uint64_t)remaining);
+        bool readable = perms[0] == 'r';
+        int prot_orig = (perms[0] == 'r' ? PROT_READ : 0) | (perms[1] == 'w' ? PROT_WRITE : 0)
+                      | (perms[2] == 'x' ? PROT_EXEC : 0);
+        uint64_t pg_lo = cur & ~0xfffull;
+        size_t span = (size_t)(((cur + chunk - 1) & ~0xfffull) - pg_lo + 0x1000);
+        if (!readable && mprotect((void*)pg_lo, span, prot_orig | PROT_READ) != 0) {
+            fprintf(stderr, " (unreadable@0x%llx)", (unsigned long long)cur); return;
+        }
+        const uint8_t* p = (const uint8_t*)cur;
+        for (int i = 0; i < chunk; i++) fprintf(stderr, " %02x", p[i]);
+        if (!readable) mprotect((void*)pg_lo, span, prot_orig);   // restore execute-only
+        cur += chunk; remaining -= chunk;
+    }
+}
+
 size_t run_guest_inits(const std::vector<uint64_t>& fns) {
     size_t ok = 0;
     for (uint64_t f : fns) {
@@ -1421,20 +1464,15 @@ size_t run_guest_inits(const std::vector<uint64_t>& fns) {
                     (unsigned long long)g_r9, (unsigned long long)g_r10, (unsigned long long)g_r11,
                     (unsigned long long)g_r12, (unsigned long long)g_r13, (unsigned long long)g_r14,
                     (unsigned long long)g_r15);
-            // Dump the 24 bytes around the faulting rip straight from mapped memory — resolves the
-            // exact faulting instruction. The exec segment is often mapped execute-only (PS5 PF_X with
-            // no PF_R), so temporarily add PROT_READ to the page before reading.
-            uint64_t pg = g_fault_rip & ~(uint64_t)0xfff;
-            mprotect((void*)pg, 0x2000, PROT_READ | PROT_EXEC);
-            const uint8_t* p = (const uint8_t*)g_fault_rip;
+            // Dump the 24 bytes around the faulting rip — resolves the exact faulting instruction.
+            // The exec segment is often mapped execute-only (PS5 PF_X with no PF_R), so
+            // dump_fault_bytes temporarily adds PROT_READ (and restores the original protection);
+            // a wild/null rip prints an unmapped marker instead of faulting the reporter (#128).
             fprintf(stderr, "[prosper]   bytes@rip-8:");
-            for (int i = -8; i < 16; i++) fprintf(stderr, " %02x", p[i]);
+            dump_fault_bytes(g_fault_rip - 8, 24);
             fprintf(stderr, "  (rip=0x%llx)\n", (unsigned long long)g_fault_rip);
-            uint64_t fpg = f & ~(uint64_t)0xfff;
-            mprotect((void*)fpg, 0x2000, PROT_READ | PROT_EXEC);
-            const uint8_t* fp = (const uint8_t*)f;
             fprintf(stderr, "[prosper]   bytes@entry:");
-            for (int i = 0; i < 24; i++) fprintf(stderr, " %02x", fp[i]);
+            dump_fault_bytes(f, 24);
             fprintf(stderr, "  (entry=0x%llx)\n", (unsigned long long)f);
         }
     }

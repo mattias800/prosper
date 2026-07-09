@@ -247,6 +247,11 @@ if(TARGET prosper_core)
                COMMAND test_trap_linux "${GAME_DUMP}")
     endif()
 
+    # The init-fault report must survive a wild/null faulting rip (#128). No game dump needed.
+    add_executable(test_initfault_dump tests/test_initfault_dump.cpp)
+    target_link_libraries(test_initfault_dump PRIVATE prosper_core)
+    add_test(NAME initfault_dump_survives COMMAND test_initfault_dump)
+
     add_executable(test_boot_linux tests/test_boot_linux.cpp)
     target_link_libraries(test_boot_linux PRIVATE prosper_core)
     if(HAVE_GAME_DUMP)
