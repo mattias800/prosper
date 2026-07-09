@@ -1,9 +1,10 @@
 # prosper-app — the OS-integration frontend (design)
 
-**Status:** **the app runs the game in a window** (issue #164). P0a (present pipeline) + P0b (shared
-`boot_program()`) + the shared live renderer (#177) are landed: `prosper-app --dump <app0>` boots the
-title, composites its GPU submits, and presents them to an SDL3 window on the desktop. Remaining is
-audio (P1), controllers (P2), and polish (P3).
+**Status:** **the app runs the game in a window, with audio out and controller in** (issue #164).
+`prosper-app --dump <app0>` (built with `-DPROSPER_APP=ON -DPROSPER_AUDIO_SDL3=ON -DPROSPER_PAD_SDL3=ON`)
+boots the title, composites its GPU submits to an SDL3 window on the desktop, routes `sceAudioOut` to
+the host via SDL3, and feeds a host controller into `libScePad`. P0 (present) + P0b (shared boot) +
+the shared renderer (#177) + P1 (audio) + P2 (controllers) are landed; P3 is polish.
 
 ## What it is
 
@@ -182,11 +183,15 @@ duplicate. Until then the app is fully functional via `--test-pattern` (and any 
 ## Phased plan
 
 - **P0a — window + present** ✅ **done**: lifecycle hook, SDL3 window, Vulkan swapchain,
-  present-from-readback, `SDL_QUIT`/Esc→stop. Verified with `--test-pattern` (30 frames, clean exit)
-  on WSLg + llvmpipe.
-- **P0b — shared boot** ✅ **done**: `boot_program()` helper; `boot_trace` + `prosper-app` both call
-  it; `prosper-app --dump <app0>` boots the game (window up). The one remaining piece to show the
-  game — registering the composite renderer — is the render-frontier-coordinated next step (above).
+  present-from-readback, `SDL_QUIT`/Esc→stop. Verified with `--test-pattern`.
+- **P0b — shared boot** ✅ **done**: `boot_program()` helper; `boot_trace` + `prosper-app` both call it.
+- **renderer (#177)** ✅ **done**: shared `register_live_renderer` (frontends/shared); the window
+  shows the composited game (verified `--dump … --frames 3`).
+- **P1 — audio** ✅ **done**: `prosper-app` installs the SDL3 `AudioSink` (`sceAudioOut` → host).
+- **P2 — controllers** ✅ **done**: installs the SDL3 `PadBackend` (host gamepad → `libScePad`).
+- **P3 — polish** (in progress): resize/fullscreen, pause/quit UX, present-mode/latency tuning,
+  packaging (WSLg launcher). Cooperative guest-stop at a flip boundary is a follow-up (today the
+  guest thread is detached at window-close and reclaimed by process exit).
 - **P1 — audio**: land the SDL3 `AudioSink` (from `feat/audio-sdl3`). Result: sound.
 - **P2 — controllers**: SDL3 `GameController` `PadBackend`. Result: play it.
 - **P3 — polish**: resize, fullscreen, pause/quit UX, present-mode/latency tuning, packaging.

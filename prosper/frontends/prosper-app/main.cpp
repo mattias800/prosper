@@ -20,6 +20,12 @@
 #ifdef PROSPER_HAVE_LIVE_RENDERER
 #include "live_renderer.hpp"           // shared DrawItem->Vulkan compositor (register_live_renderer)
 #endif
+#ifdef PROSPER_AUDIO_SDL3
+#include "audio_sdl3.hpp"              // install_sdl3_audio_sink (route sceAudioOut to the host)
+#endif
+#ifdef PROSPER_PAD_SDL3
+#include "pad_sdl3.hpp"                // install_sdl3_pad_backend (route a host controller to libScePad)
+#endif
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
@@ -289,7 +295,18 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[app] built without the live renderer; the window will stay blank.\n");
 #endif
         static Program prog; std::string err;
-        if (!boot_program(dump, prog, &err)) { fprintf(stderr, "[app] boot failed: %s\n", err.c_str()); return 1; }
+        // Install host frontends (audio out, controller in) at the same point boot_trace does —
+        // right after the built-in HLE is registered, before the guest runs. Built in only when the
+        // corresponding SDL3 frontend is enabled; a window app wants both on by default.
+        auto install_backends = []{
+#ifdef PROSPER_AUDIO_SDL3
+            prosper::install_sdl3_audio_sink();
+#endif
+#ifdef PROSPER_PAD_SDL3
+            if (prosper::install_sdl3_pad_backend()) fprintf(stderr, "[app] controller backend installed.\n");
+#endif
+        };
+        if (!boot_program(dump, prog, &err, install_backends)) { fprintf(stderr, "[app] boot failed: %s\n", err.c_str()); return 1; }
         guestThread = std::thread([]{ run_entry(prog.imgs[0]); });   // runs the guest frame loop
         fprintf(stderr, "[app] guest booted; presenting its frames.\n");
     } else if (!testPattern) {
@@ -297,7 +314,11 @@ int main(int argc, char** argv) {
     }
 
     if (!SDL_Init(SDL_INIT_VIDEO)) { fprintf(stderr, "[app] SDL_Init: %s\n", SDL_GetError()); return 1; }
-    SDL_Window* win = SDL_CreateWindow("prosper", (int)winW, (int)winH, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+    // Title: "prosper — <app0 basename>" for a booted game, else a plain label.
+    std::string title = "prosper";
+    if (!dump.empty()) { auto sl = dump.find_last_of("/\\"); title += " — " + (sl == std::string::npos ? dump : dump.substr(sl + 1)); }
+    else if (testPattern) title += " — test pattern";
+    SDL_Window* win = SDL_CreateWindow(title.c_str(), (int)winW, (int)winH, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
     if (!win) { fprintf(stderr, "[app] SDL_CreateWindow: %s\n", SDL_GetError()); return 1; }
 
     Vk vk;
@@ -358,6 +379,14 @@ int main(int argc, char** argv) {
                     create_swapchain(vk, (uint32_t)dw, (uint32_t)dh);
                 } else {
                     lastCount = gpu::present_count(); shown++;
+                    // Periodic present-rate log (every 60 presented frames).
+                    static auto t0 = std::chrono::steady_clock::now(); static uint64_t mark = 0;
+                    if (shown - mark >= 60) {
+                        auto now = std::chrono::steady_clock::now();
+                        double s = std::chrono::duration<double>(now - t0).count();
+                        fprintf(stderr, "[app] %.1f fps (%llu frames)\n", (shown - mark) / (s > 0 ? s : 1), (unsigned long long)shown);
+                        t0 = now; mark = shown;
+                    }
                     if (exitAfter && (int)shown >= exitAfter) running = false;
                 }
             }

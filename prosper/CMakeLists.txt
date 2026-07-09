@@ -561,3 +561,21 @@ if(PROSPER_PAD_SDL3 AND TARGET SDL3::SDL3)
 
   message(STATUS "SDL3 gamepad frontend enabled (prosper_pad_sdl3)")
 endif()
+
+# --- wire the SDL3 audio/pad frontends into prosper-app (after their targets exist) ---------
+# prosper-app is defined above (before these libs), so link them here once they're built. Enable
+# both alongside the app for a full experience:  -DPROSPER_APP=ON -DPROSPER_AUDIO_SDL3=ON -DPROSPER_PAD_SDL3=ON
+if(TARGET prosper-app)
+  if(TARGET prosper_audio_sdl3)
+    target_link_libraries(prosper-app PRIVATE prosper_audio_sdl3)
+    target_include_directories(prosper-app PRIVATE frontends/audio_sdl3)
+    target_compile_definitions(prosper-app PRIVATE PROSPER_AUDIO_SDL3=1)
+    message(STATUS "prosper-app: audio out enabled")
+  endif()
+  if(TARGET prosper_pad_sdl3)
+    target_link_libraries(prosper-app PRIVATE prosper_pad_sdl3)
+    target_include_directories(prosper-app PRIVATE frontends/pad_sdl3)
+    target_compile_definitions(prosper-app PRIVATE PROSPER_PAD_SDL3=1)
+    message(STATUS "prosper-app: controller input enabled")
+  endif()
+endif()
