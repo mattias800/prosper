@@ -347,7 +347,7 @@ namespace {
         auto it = g_eqs.find(eq);
         return it == g_eqs.end() ? nullptr : it->second;
     }
-    void eq_post(uint64_t eq, const SceKEvent& e) {
+    void eq_post(uint64_t eq, const SceKEvent& e, bool coalesce = true) {
         auto s = eq_find(eq); if (!s) return;
         std::lock_guard<std::mutex> lk(s->m);
         if (s->deleted) return;
@@ -356,8 +356,12 @@ namespace {
         // 60 Hz vblank pump safe: previously a fixed 4-entry cap dropped the NEWEST event once the
         // queue filled with pumped vblanks — and the dropped one could be the flip-completion event
         // carrying the exact flipArg the game's pacer was waiting to observe (frame-pacing stall).
-        for (auto& q : s->ready)
-            if (q.ident == e.ident && q.filter == e.filter) { q = e; s->cv.notify_all(); return; }
+        // coalesce=false queues a distinct entry instead: the APR pointer-tag channel (#210) needs
+        // EVERY completion delivered — two in-flight completions share (ident, filter) but carry
+        // different request tags in data, and replacing one loses a completion forever.
+        if (coalesce)
+            for (auto& q : s->ready)
+                if (q.ident == e.ident && q.filter == e.filter) { q = e; s->cv.notify_all(); return; }
         // Distinct (ident, filter) pairs are few; the cap is a leak guard only. If it ever fires,
         // shed the OLDEST event — never the just-posted one.
         if (s->ready.size() >= 64) s->ready.pop_front();
@@ -618,6 +622,32 @@ namespace {
 // coalesced knote must never regress the "completed up to" counter (the listener walks
 // last+1..cnt, so the highest counter covers every pending batch on the ring).
 void prosper_eq_post_apr_token(uint64_t eq, int64_t id, uint64_t token) {
+    // TWO tag dialects share the H896 binding call, discriminated by the binding's id (a2):
+    //   id = 0x74fe+ring (the FAPREventQueueListener channel, #208): tag = (ring<<58)|counter with
+    //     a ctor-seeded dense per-ring counter. The listener range-walks last+1..cnt, so the knote
+    //     coalesces per ring to the HIGHEST counter ("completed up to" — the kqueue semantics the
+    //     walk implements). Handled below with the per-ring HWM.
+    //   id = 0 (the IoDispatcher direct channel, #210 — live capture: H896(cb, ioDispatcherEq,
+    //     id=0, tag=REQUEST POINTER, 0, 7|0xf)): the tag is an opaque per-request pointer, NOT a
+    //     counter. Ring/HWM math on a pointer is nonsense (every post regressed to the max pointer
+    //     ever seen, and eq_post's (ident,filter) coalescing replaced still-pending completions —
+    //     two of the last three in-flight IoDispatcher reads never completed, which is exactly the
+    //     post-first-flip flush-async-loading hang: the packages behind those reads never advanced).
+    //     Post the EXACT tag, one distinct queued event per submit, no coalescing.
+    // CONFIDENCE: HIGH on the discrimination (both dialects live-captured; id 0x7501 tags are
+    // counters, id 0 tags are request pointers in every capture); MED on the id-0 event shape
+    // (ident=id=0 kept, guest consumes via GetEventData like the #208 listener).
+    if (id == 0) {
+        if (evlog()) fprintf(stderr, "[ev] AprPtrTagComplete tag=0x%llx -> eq=0x%llx scheduled\n",
+                             (unsigned long long)token, (unsigned long long)eq);
+        std::thread([eq, id, token] {
+            struct timespec ts{ 0, 2000000 };   // 2 ms (same modeled DMA latency as the #208 path)
+            nanosleep(&ts, nullptr);
+            SceKEvent e{}; e.ident = id; e.filter = EVFILT_AMPR_MODELED; e.data = (int64_t)token;
+            eq_post(eq, e, /*coalesce=*/false);
+        }).detach();
+        return;
+    }
     unsigned ring = (unsigned)(token >> 58) & 0x3f;
     uint64_t cnt = token & ((1ull << 58) - 1);
     {

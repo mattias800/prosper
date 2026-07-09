@@ -345,6 +345,28 @@ HLE(g_vo_get_output_status) {
     return 0;
 }
 
+// sceVideoOutGetEventId (U2JJtSqNKZI — named via nid_hash brute-force over the libSceVideoOut stub
+// corpus, issue #210): decode which VideoOut event a kevent delivered on a VideoOut equeue is.
+// Contract (Kyty EventQueue.cpp:354 KernelGetEventId = plain ev->ident read; the VideoOut wrapper is
+// the same field read on PS4 — shadPS4 videoout returns ev->ident after a filter check): the kevent's
+// ident IS the event id (FLIP=0, VBLANK=1 — exactly what our flip/vblank posts set). The previous
+// unimplemented-0 return decoded EVERY event (vblank included) as a FLIP: UE4's VideoOut pump thread
+// dispatched vblank ticks into its flip-completion handler and never saw a real vblank tick.
+// SceKernelEvent layout: ident @0 (i64), filter @8 (i16). CONFIDENCE: HIGH (both references agree and
+// the field is ours to define — we post these events).
+HLE(g_vo_get_event_id) {
+    if (!a0) return (uint64_t)(int64_t)(int32_t)0x80290002;   // SCE_VIDEO_OUT_ERROR_INVALID_ADDRESS
+    const uint8_t* ev = (const uint8_t*)(uintptr_t)a0;
+    if (*(const int16_t*)(ev + 8) != -13)                     // not a VideoOut-filter kevent
+        return (uint64_t)(int64_t)(int32_t)0x80290011;        // SCE_VIDEO_OUT_ERROR_INVALID_EVENT_QUEUE
+    return (uint64_t)*(const int64_t*)ev;                     // ident: FLIP=0 / VBLANK=1 / ...
+}
+
+// sceVideoOutSetWindowModeMargins (MTxxrOCeSig — same brute-force naming): windowed-mode margin
+// hint for the system compositor. No compositor here — accept and ignore. CONFIDENCE: HIGH (pure
+// cosmetic setter; success unblocks the caller).
+HLE(g_vo_set_window_mode_margins) { vo_argtrace("SetWindowModeMargins", a0,a1,a2,a3,a4,a5); return 0; }
+
 // Diagnostic tracer for the (undocumented) libSceAgc / libSceAgcDriver calls: logs the NID, the guest
 // callsite, and all six args (gated on PROSPER_GFXLOG). Behaviour is identical to the unimplemented
 // stub — returns 0, changes no control flow — it is purely observable. This is the RE bootstrap for
@@ -535,6 +557,8 @@ void register_graphics_hle() {
     RN("rKBUtgRrtbk", g_vo_register_buffers2);       // sceVideoOutRegisterBuffers2
     RN("utPrVdxio-8", g_vo_get_output_status);        // sceVideoOutGetOutputStatus
     RN("w0hLuNarQxY", g_vo_configure_output);          // sceVideoOutConfigureOutput
+    RN("U2JJtSqNKZI", g_vo_get_event_id);              // sceVideoOutGetEventId (#210)
+    RN("MTxxrOCeSig", g_vo_set_window_mode_margins);   // sceVideoOutSetWindowModeMargins (#210)
     RN("b0xyllnVY-I", g_gnm_add_eq_event);             // sceGnmAddEqEvent / GraphicsAddEqEvent (GPU EOP)
     #undef R
     #undef RN
