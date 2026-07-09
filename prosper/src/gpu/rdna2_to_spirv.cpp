@@ -1075,14 +1075,34 @@ void loop_written_regs(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t 
 }
 
 // Resolve an operand to its raw 32-bit value (bits). Float ops bitcast these to float.
-uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, const Operand& o) {
+// `ok`: cleared when the operand's VALUE is not representable — a Special operand read as ALU DATA
+// (VCC/EXEC live as per-lane bools in rs.vcc/rs.exec; their 32-bit wave-mask value does not exist
+// in the per-invocation model, and M0/SCC/ttmp aren't modeled at all). Only SGPR_NULL (field 125)
+// has a defined value, 0. Previously every Special silently read as 0 and the shader computed
+// garbage (#134); now it rejects, matching the SDWA/DPP reject-rather-than-miscompute discipline.
+uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, const Operand& o, bool* ok = nullptr) {
     switch (o.kind) {
         case OperandKind::VGPR: { auto it = rs.vreg.find(o.value); return it == rs.vreg.end() ? b.uconst(0) : it->second; }
         case OperandKind::SGPR: { auto it = rs.sreg.find(o.value); return it == rs.sreg.end() ? b.uconst(0) : it->second; }
         case OperandKind::InlineInt:   return b.uconst((uint32_t)o.value);
         case OperandKind::InlineFloat: return b.uconst(fbits(inline_float_value((uint32_t)o.value)));
         case OperandKind::Literal:     return b.uconst(in.literal);
-        default: return b.uconst(0);
+        case OperandKind::Special:
+            if (o.value == 125) return b.uconst(0);   // SGPR_NULL: the one Special whose data value IS 0
+            // VCC_LO/HI (106/107) and ttmp0..15 (108..123) double as plain scalar SCRATCH in compiled
+            // code — the NGG preamble does `s_bfe_u32 vcc_lo, s3, ...` then reads vcc back as data.
+            // A scalar write lands in rs.sreg[o.value] (the DST field decodes as SGPR); read it back
+            // from there. Only an UNTRACKED read (a VOPC-produced mask, EXEC, M0, SCC) has no
+            // representable per-invocation data value.
+            if (o.value >= 106 && o.value <= 123) {
+                auto it = rs.sreg.find(o.value);
+                if (it != rs.sreg.end()) return it->second;
+            }
+            if (ok) *ok = false;
+            return b.uconst(0);
+        default:
+            if (ok) *ok = false;
+            return b.uconst(0);
     }
 }
 
@@ -1093,7 +1113,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
               const std::unordered_set<uint32_t>* safe_execz = nullptr, bool allow_smem = false,
               const ShaderResourceTable* rt = nullptr, bool allow_wave = false) {
     auto& vreg = rs.vreg; uint32_t& vcc = rs.vcc;
-    auto val = [&](const Operand& o) { return operand_bits(b, rs, in, o); };
+    auto val = [&](const Operand& o) { return operand_bits(b, rs, in, o, &ok); };
     // SDWA/DPP forms carry a sub-dword select or cross-lane control word we don't model. The decoder
     // flags them (and gets their length right); reject here rather than compute with a wrong operand.
     if (in.has_modifier) { ok = false; return true; }
@@ -2256,16 +2276,18 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords, co
         // was never narrowed this is a no-op — the common sRGB/tonemap restore-then-export path.)
         if (rs.exec_narrowed) { b.discard_unless(rs.exec); rs.exec = b.btrue(); rs.exec_narrowed = false; }
         if (in.exp_target <= 7 && !exported) {
+            bool eok = true;   // a Special (wave-mask) source has no data value — reject, don't export 0 (#134)
             if (in.exp_compr) {
                 // COMPR: the 4 channels are two f16x2 pairs — src[0] holds (r,g), src[1] holds (b,a).
                 // Unpack each half to a float and reassemble the vec4 (the pkrtz'd tonemap/sRGB output).
-                uint32_t p0 = operand_bits(b, rs, in, in.src[0]), p1 = operand_bits(b, rs, in, in.src[1]);
+                uint32_t p0 = operand_bits(b, rs, in, in.src[0], &eok), p1 = operand_bits(b, rs, in, in.src[1], &eok);
                 b.export_color(b.unpack_half(p0, 0), b.unpack_half(p0, 1),
                                b.unpack_half(p1, 0), b.unpack_half(p1, 1));
             } else {
-                b.export_color(operand_bits(b, rs, in, in.src[0]), operand_bits(b, rs, in, in.src[1]),
-                               operand_bits(b, rs, in, in.src[2]), operand_bits(b, rs, in, in.src[3]));
+                b.export_color(operand_bits(b, rs, in, in.src[0], &eok), operand_bits(b, rs, in, in.src[1], &eok),
+                               operand_bits(b, rs, in, in.src[2], &eok), operand_bits(b, rs, in, in.src[3], &eok));
             }
+            if (!eok) return false;
             exported = true;
         }
         return true;   // ignore NULL / additional exports for now
@@ -2297,15 +2319,16 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords, cons
     if (ngg) rs.vreg[5] = vidx;              // NGG VS ABI: v5 = vertex index
     bool exported = false;
     auto exp_fn = [&](const Rdna2Inst& in) -> bool {         // EXP POS0..3 -> gl_Position; PARAM -> varyings
+        bool eok = true;   // a Special (wave-mask) source has no data value — reject, don't export 0 (#134)
         if (in.exp_target >= 12 && in.exp_target <= 15 && !exported) {
-            b.export_position(operand_bits(b, rs, in, in.src[0]), operand_bits(b, rs, in, in.src[1]),
-                              operand_bits(b, rs, in, in.src[2]), operand_bits(b, rs, in, in.src[3]));
+            b.export_position(operand_bits(b, rs, in, in.src[0], &eok), operand_bits(b, rs, in, in.src[1], &eok),
+                              operand_bits(b, rs, in, in.src[2], &eok), operand_bits(b, rs, in, in.src[3], &eok));
             exported = true;
         } else if (in.exp_target >= 32) {                    // PARAM0.. -> Output varying (location N)
-            b.export_param(in.exp_target - 32, operand_bits(b, rs, in, in.src[0]), operand_bits(b, rs, in, in.src[1]),
-                           operand_bits(b, rs, in, in.src[2]), operand_bits(b, rs, in, in.src[3]));
+            b.export_param(in.exp_target - 32, operand_bits(b, rs, in, in.src[0], &eok), operand_bits(b, rs, in, in.src[1], &eok),
+                           operand_bits(b, rs, in, in.src[2], &eok), operand_bits(b, rs, in, in.src[3], &eok));
         }
-        return true;
+        return eok;
     };
     if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/false, /*allow_smem*/rt != nullptr, exp_fn, code, dwords)) return {};
     if (!exported) return {};
