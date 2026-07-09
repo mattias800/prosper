@@ -50,7 +50,8 @@ prosper/
   src/host/        host execution: image mapping, import stubs, fault handling (Linux)
   src/gpu/         AGC->Vulkan: PM4 decode, command processor, render state, vk_translate,
                    resource layer, RDNA2->SPIR-V recompiler
-  tools/           self_dump, boot_trace, shader_histo, imgdump, spv_validate
+  tools/           self_dump, boot_trace, shader_histo, imgdump, spv_validate,
+                   snapshot (golden-image rendering regression guard — see tools/AGENTS.md)
   tests/           unit + boot + Vulkan-execution tests (ctest)
 ```
 
@@ -77,7 +78,10 @@ renderer is wired in; the game's **real pixel shader recompiles to valid SPIR-V*
   ```
 - **Verification is agentic-first / programmatic** (`docs/VERIFICATION.md`): ctest exit code is truth;
   shaders are `spirv-val`-gated; rendered frames are pixel/CRC-asserted or dumped to BMP. No manual
-  eyeballing is required to know a change works.
+  eyeballing is required to know a change works. **After any change that can affect rendered output**
+  (recompiler, AGC decode, render state, detile, executor/present), run the golden-image guard
+  `python3 tools/snapshot/snapshot.py check` (local-only, boots a real game and pixel-hashes an exact
+  frame vs a stored baseline — see `tools/snapshot/AGENTS.md`).
 - **Reaching the running frame loop** needs two gated switches (off by default, so the default boot stays
   stable): `PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct`. Add `PROSPER_RENDER=1` to run the
   live renderer, `PROSPER_GFXLOG=1` for graphics diagnostics.
