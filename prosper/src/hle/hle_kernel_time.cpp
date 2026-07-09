@@ -704,14 +704,45 @@ void prosper_eq_post_apr_token(uint64_t eq, int64_t id, uint64_t token) {
     // counters, id 0 tags are request pointers in every capture); MED on the id-0 event shape
     // (ident=id=0 kept, guest consumes via GetEventData like the #208 listener).
     if (id == 0) {
+        // ORDERED delivery is load-bearing here (issue #232, the DOLL FlushAsyncLoading wall). The
+        // ptr-tag is the guest's BATCH object pointer, and the consumer (eboot+0x22aa7d0 ->
+        // batch-retire 0x227e8e0) retires its in-flight list FROM THE HEAD *up to* the tagged batch,
+        // decrementing the in-flight batch counter [disp+0x30] once per retired node. Submission
+        // order == list order, so an event delivered OUT of submission order over-retires: the walk
+        // for the earlier batch's late event no longer finds it and marches through batches that are
+        // still in flight, driving [disp+0x30] past zero. The tail-flush gate
+        // (`if ([disp+0x30] <= 1) flush()` at eboot+0x227e7d3, UNSIGNED compare) then never passes
+        // again, the final partial batch never submits, and the GameThread spins in
+        // FlushAsyncLoading forever (~16k gettid/s) while every IO thread idles — 0 scene draws.
+        // The old per-post detached threads (independent 2 ms sleeps) made cross-post ordering a
+        // scheduler coin toss exactly under IO bursts. One FIFO worker + one modeled-latency sleep
+        // per batch preserves submission order by construction. CONFIDENCE: HIGH (retire-walk
+        // semantics from static disassembly; the stall's log signature — final ReadFile appended,
+        // no H896/ASoW after it, all delivered events balanced — matches exactly).
         if (evlog()) fprintf(stderr, "[ev] AprPtrTagComplete tag=0x%llx -> eq=0x%llx scheduled\n",
                              (unsigned long long)token, (unsigned long long)eq);
-        std::thread([eq, id, token] {
-            struct timespec ts{ 0, 2000000 };   // 2 ms (same modeled DMA latency as the #208 path)
-            nanosleep(&ts, nullptr);
-            SceKEvent e{}; e.ident = id; e.filter = EVFILT_AMPR_MODELED; e.data = (int64_t)token;
-            eq_post(eq, e, /*coalesce=*/false);
+        struct PtrPost { uint64_t eq; uint64_t token; };
+        struct PtrQueue { std::mutex mx; std::condition_variable cv; std::deque<PtrPost> q; };
+        static PtrQueue* pq = new PtrQueue;   // immortal: the worker is detached and outlives exit
+        static std::atomic<bool> started{false};
+        if (!started.exchange(true)) std::thread([] {
+            std::unique_lock<std::mutex> lk(pq->mx);
+            for (;;) {
+                pq->cv.wait(lk, [] { return !pq->q.empty(); });
+                std::deque<PtrPost> batch;
+                batch.swap(pq->q);
+                lk.unlock();
+                struct timespec ts{ 0, 2000000 };   // 2 ms modeled DMA latency (as the #208 path)
+                nanosleep(&ts, nullptr);
+                for (auto& p : batch) {
+                    SceKEvent e{}; e.ident = 0; e.filter = EVFILT_AMPR_MODELED; e.data = (int64_t)p.token;
+                    eq_post(p.eq, e, /*coalesce=*/false);
+                }
+                lk.lock();
+            }
         }).detach();
+        { std::lock_guard<std::mutex> lk(pq->mx); pq->q.push_back({ eq, token }); }
+        pq->cv.notify_one();
         return;
     }
     unsigned ring = (unsigned)(token >> 58) & 0x3f;

@@ -8,14 +8,14 @@ for try in 1 2 3 4 5 6 7 8; do
   ./build-linux/boot_trace /root/PPSA17942-app0 > /root/d232o.log 2>&1 &
   PID=$!
   echo "try=$try pid=$PID"
-  sleep 30
+  sleep 16
   kill -0 $PID 2>/dev/null && break
   echo "DIED (try $try) flips=$(grep -ac GpuFlip /root/d232o.log)"
   PID=
 done
 [ -n "$PID" ] || { echo "ALL TRIES DIED"; exit 1; }
 rm -f /root/disp.txt
-echo "=== phase 1: find disp (t=30s, reads flowing) ==="
+echo "=== phase 1: find disp (t=16s, reads flowing) ==="
 timeout 150 gdb -p $PID -batch -x "$WT/tools/dbg/find_disp.py" 2>&1 | tail -6
 test -f /root/disp.txt || { echo "NO DISP CAPTURED"; kill -9 $PID; exit 1; }
 echo "disp=$(cat /root/disp.txt)"
