@@ -500,6 +500,9 @@ HLE(f_apr_resolve) {
 // scope (NOT inside the extern "C" handler, where a block-scope extern would take C linkage and
 // miss the mangled prosper:: definition).
 extern uint64_t g_apr_last_cb, g_apr_last_cb_size;
+// Mark an APR request frame eventful (async streaming read -> equeue completion event) or sync;
+// consumed by the ASoW5WE-UPo submit handler (hle_kernel_mem.cpp, issue #180).
+void prosper_apr_mark_eventful(uint64_t req, bool eventful);
 // Tracked-mapping state probe (hle_kernel_mem.cpp): 1 = addr is inside a guest-RESERVED range
 // whose pages lazy-commit on first touch. Used by the read path's dst-write to replicate the
 // fault handler's commit-on-write semantics for kernel-side (process_vm_writev) copies.
@@ -675,6 +678,31 @@ HLE(f_apr_read_submit) {
     uint64_t offset = 0;
 #ifndef _WIN32
     offset = apr_stack_arg(entry_rsp, 0);
+    // arg8 discriminates the engine's ASYNC streaming reads from its sync (record-polled) reads —
+    // the ONLY ReadFile-level difference found across 90-read boots (identical guest-RA chains):
+    // the async wrapper passes a live pointer into its own frame just above the request object
+    // (arg8 - req == +0x94, deterministic across runs), sync callsites leave residue in the slot.
+    // Async requests must complete via an APREventQueue event (their submitter returns to the
+    // thread pool; the blocked consumer's only wake-up is the listener), sync requests must NOT
+    // get one (untracked tokens fault the listener's hash-miss path at eboot+0x229df3e). The mark
+    // is consumed by k_apr_submit (hle_kernel_mem.cpp). Bounds: same 64 KiB stack page, above the
+    // request frame, within 4 KiB — tight enough that observed sync residue (small ints, code
+    // addresses, unrelated heap/stack pointers) can't satisfy it. CONFIDENCE: MED (see the
+    // g_apr_eventful comment for the full evidence trail; issue #180).
+    {
+        uint64_t arg8 = apr_stack_arg(entry_rsp, 1);
+        bool async_notify = arg8 > a0 && arg8 - a0 < 0x1000 &&
+                            (arg8 >> 16) == (a0 >> 16);
+        prosper_apr_mark_eventful(a0, async_notify);
+        if (filelog()) {
+            fprintf(stderr, "[apr]   arg8=0x%llx -> %s\n", (unsigned long long)arg8,
+                    async_notify ? "ASYNC(eventful)" : "sync");
+            if (async_notify)   // dump the notify slot region for offline RE of its real layout
+                for (int o = 0; o < 0x20; o += 8)
+                    fprintf(stderr, "[apr]   notify+0x%02x = 0x%016llx\n", o,
+                            (unsigned long long)*(uint64_t*)(uintptr_t)(arg8 + o));
+        }
+    }
 #endif
     uint64_t size = a5;
     if (offset > fsize) {
@@ -812,15 +840,11 @@ HLE(f_apr_read_submit) {
 //   vWU-odnS+fU(fileId=8, dst=0x2002860000, size=0x107e3a, off=0x7adec90a, off, 5thArg=4)
 // — fileId 8 = pakchunk0-ps5.pak from APR resolve, and (off,size) is EXACTLY the engine's
 // GlobalShaderCache-SF_PS5.bin region inside that pak (size matched the reader global's recorded
-// file size 0x107e3a). No command buffer, no completion record: the read completes by posting a
-// completion token to the registered APREventQueue (see hle_kernel_time.cpp), where the
-// FAPREventQueueListener picks it up and signals the waiting FEvent. a3==a4 in the only capture;
-// a5 is modeled as the 1-based ring index like the ASoW5WE-UPo submit (the completion handler
-// proves 1-based for that path; if a5 turns out to be flags the hash-map fallback in the guest's
-// handler still matches the token). CONFIDENCE: HIGH on (id,dst,size,off) — verified against the
-// resolved file and the reader's recorded size; MED on a5-as-ring.
-uint64_t prosper_apr_next_token(unsigned ring, bool tracked_catchup);   // hle_kernel_time.cpp
-void prosper_eq_trigger_apr(uint64_t token);                            // "
+// file size 0x107e3a). No command buffer, no completion record — and NO completion event (#208):
+// the guest consumes these reads without a listener event; only the H896-bound batch channel gets
+// events, carrying the guest-chosen binding tag (see hle_kernel_time.cpp for the full contract).
+// a3==a4 in the only capture. CONFIDENCE: HIGH on (id,dst,size,off) — verified against the
+// resolved file and the reader's recorded size.
 HLE(f_apr_read_direct) {
     uint64_t id = a0, dst = a1, size = a2, offset = a3;
     std::string host = prosper_apr_path_for_id((uint32_t)id);
@@ -847,8 +871,12 @@ HLE(f_apr_read_direct) {
                            (unsigned long long)id, host.c_str(), (unsigned long long)dst,
                            (unsigned long long)offset, (unsigned long long)size, ok ? "OK" : "FAIL");
     if (!ok) return 0x80020016ull;
-    unsigned ring = a5 ? (unsigned)(a5 - 1) & 0x3f : 0;
-    prosper_eq_trigger_apr(prosper_apr_next_token(ring, /*tracked_catchup=*/true));
+    // No completion event (issue #208). Direct reads are consumed by the guest WITHOUT a listener
+    // event (live-verified: the gdb-unwedged engine streamed the whole remaining load through
+    // these with no matching events in flight), and posting an invented counter would REGRESS the
+    // listener's ctor-seeded per-ring last-processed (unconditional last:=cnt store at
+    // eboot+0x2274143), setting up the fatal +0x229df3e range walk. Only exact H896 binding tags
+    // are ever posted (k_apr_submit -> prosper_eq_post_apr_token).
     return 0;
 }
 // APR completion-token plumbing (hle_kernel_time.cpp) — see the k_apr_submit block in

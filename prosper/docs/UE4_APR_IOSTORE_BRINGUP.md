@@ -510,6 +510,163 @@ page-cache warm-up or larger read batching) and follow the AGC submission stream
 `execute_and_present` for the first UE4 draw (the same libSceAgc path The Messenger renders
 through).
 
+### CORRECTED (2026-07-09, issue #180 session): the "IO-bound load" reading above is WRONG —
+### the boot stalls DETERMINISTICALLY after exactly 90 APR reads, on every IO speed
+
+Two changes of fact, both measured:
+
+1. **IO fast path.** Copying the dump to WSL-native ext4 (`cp -r /mnt/c/.../PPSA17942-app0
+   /root/PPSA17942-app0`, ~20 GB) and booting `/root/PPSA17942-app0` cuts time-to-first-AGC-driver
+   -call from ~9.5 min (9p) to **~80 s cold / ~13 s warm page cache**. The load was never
+   streaming-bound on guest demand — the 845 MB rchar figure was dominated by eboot/module/footer
+   reads, and total pak consumption before the wall is only ~45 MB (90 APR reads).
+2. **The wall is a correctness gap, not latency.** With identical binaries, both the ext4 boot and
+   a 9p control boot stop issuing APR reads after EXACTLY the same 90th read (`pakchunk0-ps5.pak
+   off=0x32687c8e size=0x40000` — the first async-archive precache chunk after
+   `GlobalShaderCache-SF_PS5.bin`), a few seconds after the `23LRUSvYu1M`/`BfBDZGbti7A` +
+   AgcEqueue setup. The earlier 9.5-minute runs were sitting at this SAME stall — there was never
+   additional progress to be had by waiting.
+
+**The stall, fully dissected (all live-verified under gdb on the stalled process):**
+
+- MAIN THREAD is parked at `eboot+0x24ae718` — inside the #115-documented blocking archive reader
+  (`IAsyncReadRequest::WaitCompletion(INFINITE)` on the FEvent at `*(obj+0x28)`) under
+  `CreateGlobalShaderMap` (`eboot+0x4ea8ea0` on the same stack). Its FEvent (state u32 at
+  obj+0x14, mutex slot +0x20, cond slot +0x28) is never triggered. Manually setting state=2 +
+  `pthread_cond_broadcast` un-wedges the whole machine (the engine then re-reads the chunk and
+  streams on through vWU direct reads) — proving the ONLY missing piece is the completion signal.
+- One worker spins in `k_cond_timedwait` (~16k futex/s, RA `eboot+0x22ea954` = FEventPS5 timed
+  wait) — a second waiter on the same stuck pipeline. IoService/IoDispatcher threads wait in
+  `sceKernelWaitEqueue` on their user-event queues (`AddUserEvent id=-1`); force-posting those
+  events (gdb) wakes them to EMPTY queues — the request is not queued anywhere, it is tracked and
+  waiting for its APR completion event.
+- **The guest's APR completion machinery** (handler `eboot+0x229dcb0`, listener loop
+  `eboot+0x22740b0`, both disassembled live):
+  - The listener object is an **eboot GLOBAL (`eboot+0x95aebd8`)**, NOT the sSAUCCU1dv4 a4 heap
+    object. Per-ring in-flight tracking slot at `[ctx+0xa8+ring*0x28]` (a request object whose
+    `+0x10` holds the EXPECTED completion token, `+0x00` the cb), queued-batch array pointer at
+    `+0xb8` (0x20-byte entries, `+0x18` submitted flag; completion resubmits the next entry via
+    the ASoW wrapper `eboot+0x59b6420` with `ring_1b = ring+1`), per-ring last-processed counter
+    at `+0xc8+ring*0x28`.
+  - **Completion tokens are GUEST-CHOSEN**: the `H896Pt-yB4I` binding's a3 tag IS the token
+    ((ring<<58)|n, live captures n = 0x3e8, 0x3e9, ... — the engine's own counter base 1000).
+    Read live at the stall: the ring-4 slot expects EXACTLY `0x10000000000003e8` — the first
+    H896 tag — while prosper posted an invented `(4<<58)|1`. The engine has therefore considered
+    async batch #1 in flight FOREVER, and the whole async IO pipeline (including the archive
+    precache the main thread waits on) is jammed behind it.
+  - An event whose data does not match: slot-compare fails -> hash walk; with a NON-empty
+    tracking hash the walk falls off the -1 chain sentinel and dereferences `0 + 0x10` — the
+    `eboot+0x229df3e` fault (re-verified 2/2 this session by posting events for unbound ring-6
+    submissions; `eboot+0x229dd21` is the same fault when the ring slot is null —
+    PROSPER_NULL_PAGE shims that one).
+  - `ASoW5WE-UPo`'s two out-pointers ALIAS the request's completion record: a2/a3 = req+0x28
+    (status) / req+0x30 (bytes) — the same fields `sceAmprAprCommandBufferReadFile` completes
+    with {0, size}. Writing a nonzero "token" there marks the read FAILED (the
+    `eboot+0x22738a5` check) — with tag-echo enabled this turned the shader-map load into
+    "GEngineLoop.PreInit Failed!" until the write was skipped for bound cbs.
+- **Experiments gated in the code** (all default-OFF; `hle_kernel_mem.cpp` / `hle_kernel_time.cpp`):
+  - `PROSPER_APR_TAG_ECHO=1` — bound cbs echo the H896 tag as their token, post the tag verbatim
+    on the binding's own equeue (2 ms deferred), leave the record untouched, and run a "slot-echo"
+    scan that re-reads registered listener ctxs' tracking slots and posts exactly the expected
+    tokens. Current result: the tag event IS consumed (the jam breaks) but the listener's range
+    walk over seqs 1..1000 (its last-processed starts at 0; the tag base is 1000) crosses a
+    non-empty tracking hash and faults at `eboot+0x229df3e`. THE remaining unknown: how real HW
+    seeds the listener's per-ring last-processed to the tag base — the answer is in the listener
+    loop body (`eboot+0x2274130..`), un-disassembled past `+0x2274146`.
+  - `PROSPER_APR_EVENT_ARG8=1` — mark requests whose ReadFile arg8 points just above the request
+    frame as eventful. Disproven as a discriminator (sync flavors pass live arg8 pointers too;
+    crashes the listener); kept only for bisection.
+- The next session should: (1) disassemble the listener loop body to learn the last-processed
+  seeding (or write it to tag_base-1 from the HLE before the first tag post — the listener object
+  address is discoverable by scanning eboot .data for the pointer-to-slot whose `[slot+0x10]`
+  equals the known H896 tag); (2) then enable tag-echo semantics by default; (3) the ring-6
+  async-archive read (#90) completes through the same machinery once the ring-4 channel drains —
+  re-verify, then follow the boot toward VideoOut/RHI init and the first SubmitDcb.
+
+Boot recipe (fast): `cp -r` the dump to `/root/PPSA17942-app0` once, then
+`PROSPER_GUEST_FS=1 PROSPER_NULL_PAGE=1 [PROSPER_RENDER=1 PROSPER_GFXLOG=1 PROSPER_FILELOG=1
+PROSPER_EVLOG=1 PROSPER_AMPRLOG=1] ./build-linux/boot_trace /root/PPSA17942-app0` — reaches the
+stall (the current frontier) in ~15-80 s.
+
+### SOLVED (2026-07-09, issue #208): the APR completion contract is fully recovered — the GUEST
+### seeds the listener's range walk; prosper now echoes exactly the guest-chosen tags
+
+The #180 open question ("how does real HW seed the listener's per-ring last-processed to the tag
+base?") is answered by static disassembly of the guest (all offsets eboot-relative):
+
+- **The listener-ctx CONSTRUCTOR (+0x22a0670, once-guarded at 0x95aed70, ctx = the eboot global
+  0x95aebd8) seeds everything itself**: it creates the APREventQueue ([ctx+0x18]), registers ids
+  `0x74fe + ring` for rings 0..5 on it (the six sSAUCCU1dv4 calls), and initializes each ring's
+  pair: token counter `[ctx+0xc0+ring*0x28] = 0x3e8` (1000) and listener last-processed
+  `[ctx+0xc8+ring*0x28] = 0x3e7` (999). The walk over the first tag event (cnt=1000) covers
+  exactly seq 1000 — there was never any library-side seeding to model.
+- **The batch submit (+0x22a02b0)** draws `token = (ring<<58) | [ctx+0xc0+ring*0x28]++`, passes it
+  to H896Pt-yB4I as the binding tag, stores it at `[slot+0x10]`, and inserts a
+  `{token -> completion callback}` entry into the hash at ctx+0x58 (128-byte entries, chain
+  sentinel -1). The handler (+0x229dcb0) completes the slot match AND invokes the hash callback
+  (that callback is what fires the FEvent the CreateGlobalShaderMap precache blocks on).
+- **The listener (+0x22740b0) stores `last := cnt` UNCONDITIONALLY after every event**
+  (+0x2274143), even when `cnt < last+1` (no walk). This is why the #180 tag-echo experiment still
+  faulted: prosper's own invented-counter events (registration catch-up replays, vWU direct-read
+  wakeups) carried cnt << 1000, walked nothing, but REGRESSED the guest's 999 seed — the next real
+  tag event then walked the gap seqs, and any walked seq with no slot match and no hash entry
+  takes the null-entry path (a 64-byte ymm swap against address 0x10, the +0x229df3e fault —
+  fatal on real HW too, so the guest guarantees dense counters from exactly 1000).
+- **Fix (now the default; the PROSPER_APR_TAG_ECHO / slot-echo experiments are retired):**
+  bound (H896) submits echo NOTHING into the out slots (they alias the completion record) and
+  post the binding tag verbatim, deferred ~2 ms, coalesced per ring to the highest counter
+  (kqueue "completed up to" semantics). Unbound submits keep returning prosper counter tokens
+  through the out slots and post NO event; vWU direct reads post NO event (live-verified: the
+  gdb-unwedged engine streamed the whole remaining load through vWU reads with no events).
+
+**Also fixed in the same session — a DOLL boot regression that masked all of the above** (came in
+with the master merge, first bad commit fe8e8d7 / issue #183, found by git bisect): the guest
+wedged single-threaded ~10 s into boot, self-deadlocked in k_mutex_lock (mutex `__owner` == the
+caller). UE4's PS5 lock wrapper (+0x24ca4b6, same shape inside the APR handler at +0x229dcf5)
+builds its own recursion on the FreeBSD self-lock contract:
+`err = mutex_lock(obj); if (err) /* EDEADLK: already mine */ skip-acquire; depth++;` — and DOLL
+creates those mutexes with `pthread_mutexattr_settype(type=4)` (ADAPTIVE_NP, live-captured via
+PROSPER_MUTEXLOG). FreeBSD libthr's `mutex_self_lock` returns EDEADLK for ERRORCHECK **and**
+ADAPTIVE_NP (adaptive = errorcheck + a spin heuristic); only NORMAL hard-deadlocks. #183 (after
+Kyty) mapped 4 -> host NORMAL, which self-deadlocks on glibc. Fixes in hle_kernel.cpp: settype
+type 4 -> host ERRORCHECK; a fresh mutexattr defaults to ERRORCHECK (FreeBSD attr default — the
+#183 change only covered the no-attr init path); the static ADAPTIVE sentinel (1) also maps to
+ERRORCHECK. Kyty is weighted DOWN here per policy: no title it runs exercises adaptive self-lock.
+
+**Measured result (ext4 fast path, 240-480 s runs):** the 90-read wall is GONE — 978 APR reads
+served, the guest's own tag counter advanced past 0x458 (112+ batches consumed through the
+listener), GlobalShaderMap loads, PreInit completes, the engine initializes VideoOut + the AGC
+RHI (VideoOutQueue equeue + AddFlipEvent), loads every plugin assetregistry.bin, submits its
+first real DCBs (`SubmitDcb #1: 85 dwords/13 packets`, `#2: 1436 dwords/232 packets` — EventWrite/
+WriteData/AcquireMem/ReleaseMem streams, 0 draws yet) and performs its first flip
+(`GpuFlip handle=0x1001 bufidx=0 mode=0x1 fliparg=0x1`). ctest 60/60; Messenger smoke renders
+3860 frames in 300 s.
+
+**Second wall in the same session — the IoStore append-loop spin — also SOLVED:** with
+completions flowing, the boot next parked its IoStore thread in a busy poll (the only running
+thread, inside k_ampr_getsize, guest RA +0x227e2eb). The guest's batch-append loop (+0x227e2c0)
+polls `GetSize(cb) - <used>(cb) > 0xff` (wrappers 0x59b5dd0/0x59b5e00) before appending the next
+command packet; GetSize (tZDDEo2tE5k) is the cb's fixed byte CAPACITY (carried by the batch cb's
+init in a5 = 0x720 — a different arg than the APR read-request flavor's a1), and the old global
+"last cb size" answer starved it to 0. k_ampr_init now records {cb -> capacity} for both init
+flavors and k_ampr_getsize answers per-cb; the spin cleared (the thread parks in eq_wait like the
+rest of the pool).
+
+**NEXT (the new frontier, diagnosed to the thread level):** after the first flip and the plugin
+assetregistry.bin loads, no further draws/flips arrive (480-600 s runs). Live state: the RHI-side
+thread cycles a WaitEqueue(VideoOutQueue) loop (ident=1, filter=-13, one event delivered per
+cycle — vblank pump, normal); every IoDispatcher/IoService/TaskGraph worker is parked in
+k_eq_wait/k_cond_wait; and the MAIN thread runs HOT (~70% cpu) in a lock-poll-unlock loop over
+shared state (sampled: scePthreadGetthreadid + glibc mutex futexes at high rate, FName-machinery
+frames on the stack, alternating lock words 0x10a0e4f120 / 0x200ff00628) — the classic UE4
+flush-async-loading shape: the game thread polls package-loading state that the idle IO threads
+never advance. The question for the next session is which completion/user-event the async-loading
+pipeline is missing (the IoDispatcher threads wait on their OWN user-event equeues, AddUserEvent
+id=-1 — force-posting those was already shown in #180 to wake them to empty queues). Also worth
+wiring: new unimplemented NIDs on this path — libSceAgc dbOlWdppb4o, qj7QZpgr9Uw, bbFueFP+J4k,
+xSAR0LTcRKM, w6Dj1VJt5qY; libSceVideoOut MTxxrOCeSig, U2JJtSqNKZI; plus the
+sceVideoOutGetOutputStatus struct fill (issue #82) which this boot now hits with a warning.
+
 ### The remaining 3 unnamed Ampr NIDs (issue #107, not on the crash path)
 
 `vWU-odnS+fU`, `sSAUCCU1dv4`, `GnxKOHEawhk`, `H896Pt-yB4I` still resist the generated

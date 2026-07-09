@@ -7,6 +7,7 @@
 #ifndef _WIN32
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>   // process_vm_readv (slot-echo scan, issue #180)
 #endif
 #include <cstdint>
 #include <cstdlib>
@@ -558,106 +559,101 @@ HLE(k_eq_getcount){
     return (uint64_t)n;
 }
 
-// --- APR (Ampr file-read engine) completion events — issue #115. ------------------------------
-// UE4's PS5 platform file layer runs an "FAPREventQueueListener" thread that blocks in
-// WaitEqueue(APREventQueue, evs, 15, ...) and decodes each event with sceKernelGetEventData():
-//   data = (ring_index << 58) | completion_counter      (live-disassembled at eboot+0x4022740b0:
-//   r15 = data >> 0x3a; cnt = bzhi(data, 0x3a); per-ring "last processed" at listener+0xc8+ring*40;
-//   for seq in last+1..cnt: handler(ctx, (ring<<58)|seq) — eboot+0x40229dcb0 matches the token
-//   against the tracking object's +0x10 slot, else a hash-map keyed by the full token.)
-// The token the engine stores at submit time comes OUT of the submit call (ASoW5WE-UPo writes it
-// through its two out-pointers; the vWU-odnS+fU direct read returns it). prosper's APR reads are
-// synchronous, so "submit" == "complete": we assign the token and immediately post the event.
+// --- APR (Ampr file-read engine) completion events — issues #115/#180/#208. -------------------
+// UE4's PS5 platform file layer (FAPRFileHandle / FAPREventQueueListener) drives batched APR reads
+// through a listener context that is an eboot GLOBAL (PPSA17942 eboot+0x95aebd8). The FULL contract
+// was recovered by static disassembly of the guest (issue #208; all offsets eboot-relative):
+//   - ctx CONSTRUCTOR (+0x22a0670, run once at first batch submit): creates the APREventQueue
+//     ([ctx+0x18]), registers ids 0x74fe+ring for rings 0..5 on it (the sSAUCCU1dv4 calls), and
+//     SEEDS the per-ring counters: token counter [ctx+0xc0+ring*0x28] = 0x3e8 (1000) and listener
+//     last-processed [ctx+0xc8+ring*0x28] = 0x3e7 (999). THE GUEST SEEDS ITS OWN RANGE WALK.
+//   - batch SUBMIT (+0x22a02b0): token = (ring<<58) | [ctx+0xc0+ring*0x28]++ — the guest-chosen
+//     completion token. It is passed to H896Pt-yB4I as the binding tag, stored in the per-ring
+//     tracked slot ([ctx+0xa8+ring*0x28] -> [slot+0x10]), and inserted into a hash map at ctx+0x58
+//     ({token -> completion callback}, 128-byte entries, chain sentinel -1).
+//   - LISTENER loop (+0x22740b0): data = (ring<<58)|cnt via sceKernelGetEventData; walks
+//     seq = last+1 ..= cnt calling the completion handler (+0x229dcb0) per seq, then stores
+//     last := cnt UNCONDITIONALLY (even when cnt < last+1 — a low counter REGRESSES the seed).
+//   - HANDLER (+0x229dcb0): matches token against [slot+0x10] (completes the cb + resubmits the
+//     next queued batch via ASoW5WE-UPo with ring_1b=ring+1), then looks the token up in the hash;
+//     a found entry is erased and its callback INVOKED (this is what fires the FEvent the blocked
+//     CreateGlobalShaderMap precache waits on). A walked seq with NO slot match and NO hash entry
+//     takes the null-entry path: a 64-byte ymm swap against address 0x10 (+0x229df3e) — FATAL on
+//     real HW too (address 0x10 is never mapped). The guest therefore GUARANTEES every walked seq
+//     has a tracked entry: counters are dense from 1000 and the walk starts there (seed 999).
+// CONSEQUENCES for prosper (the #180 tag-echo experiment's residual +0x229df3e fault was caused by
+// prosper itself):
+//   - The ONLY events we may post are exact guest-chosen H896 binding tags, one per bound submit.
+//   - NEVER post invented counters (pre-#208 catchup replays / vWU direct-read wakeups / unbound
+//     submit counters): cnt < 1000 does not walk but REGRESSES last-processed via the
+//     unconditional store, and the next real tag event then walks the gap seqs into the fatal
+//     miss path. Record-polled flows (mount-era submits, vWU direct reads, the ring-6/ring_1b=6
+//     sync channel) complete WITHOUT events — live-verified: the gdb-unwedged engine streamed the
+//     whole remaining load through vWU reads with no matching events in flight.
 // Event shape: guest code reads ONLY data (GetEventData) — ident/filter are never inspected — but
-// eq_post coalesces on (ident,filter), so ident carries the ring index to keep concurrent rings'
-// completions from replacing each other (per-ring coalescing to the HIGHEST counter is exactly the
-// kqueue/"completed up to" semantics the listener's range loop implements).
-// CONFIDENCE: HIGH on the data encoding + listener decode (disassembly); MED on registration arg
-// order (live capture: sSAUCCU1dv4(eq, id=0x7502, 0, 0, 0x43, 0), H896Pt-yB4I(ctx, eq, id, ...)).
+// eq_post coalesces on (ident,filter), so ident carries the ring to keep concurrent rings'
+// completions from replacing each other; the per-ring coalescing to the HIGHEST counter is exactly
+// the kqueue "completed up to" semantics the listener's range walk implements.
+// CONFIDENCE: HIGH — ctor seeding, walk bounds, unconditional last:=cnt store, handler match/hash/
+// null-entry paths all from static disassembly; tag-echo event consumption live-verified (#180).
 namespace {
     constexpr int16_t EVFILT_AMPR_MODELED = -24;   // guest never reads filter; distinct on purpose
     struct AprEqReg { uint64_t eq; int64_t id; };
     // Own mutex (NOT g_eq_mx): the post path calls eq_post/eq_find, which lock g_eq_mx themselves.
     std::mutex g_apr_mx;
-    std::vector<AprEqReg> g_apr_eq_regs;               // guarded by g_apr_mx
-    uint64_t g_apr_ring_seq[64]     = {};              // per-ring completion counters (guarded)
-    bool     g_apr_ring_catchup[64] = {};              // ring had a TRACKED pre-registration read
+    std::vector<AprEqReg> g_apr_eq_regs;               // guarded by g_apr_mx (registration log)
+    uint64_t g_apr_ring_seq[64] = {};                  // per-ring counters for prosper-issued tokens
+    uint64_t g_apr_tag_hwm[64] = {};                   // per-ring highest tag counter posted (guarded)
     void apr_post(const AprEqReg& r, unsigned ring, uint64_t token) {   // no APR lock held
         SceKEvent e{}; e.ident = r.id + (int64_t)ring; e.filter = EVFILT_AMPR_MODELED;
         e.data = (int64_t)token; e.udata = 0;
         eq_post(r.eq, e);
     }
 }
-// Assign the next completion token for `ring` (0-based, 6 bits). Called by the APR submit paths.
-// `tracked_catchup`: the caller's completion must survive a registration that happens AFTER the
-// submit (the vWU direct read fires 2 calls before sSAUCCU1dv4 registers the queue). Untracked
-// submissions (the mount-era synchronous ASoW flow, consumed by polling the completion record)
-// must NOT replay at registration: the listener's range loop would hand their seqs to the
-// completion handler, whose hash-miss path is not null-tolerant (live crash: phantom ring-5 seqs
-// 1..13 -> vmovups from 0x10 at eboot+0x229df3e). Their rings reset to 0 instead, so the first
-// post-registration submission is seq 1 — matching the listener's zero-initialized per-ring
-// "last processed" counter. CONFIDENCE: MED-HIGH (crash-verified both ways).
-uint64_t prosper_apr_next_token(unsigned ring, bool tracked_catchup) {
+// Post an EXACT guest-chosen completion token (the H896Pt-yB4I binding tag) to the binding's own
+// equeue — the completion signal for the bound/batched APR channel. Deferred ~2 ms so the guest
+// finishes installing its tracking slot/hash entry first (real DMA latency the submitter's few
+// bookkeeping instructions never race). The deferred thread posts the ring's HIGHEST tag counter
+// recorded at post time, not the captured token: two deferred posts can run out of order, and the
+// coalesced knote must never regress the "completed up to" counter (the listener walks
+// last+1..cnt, so the highest counter covers every pending batch on the ring).
+void prosper_eq_post_apr_token(uint64_t eq, int64_t id, uint64_t token) {
+    unsigned ring = (unsigned)(token >> 58) & 0x3f;
+    uint64_t cnt = token & ((1ull << 58) - 1);
+    {
+        std::lock_guard<std::mutex> lk(g_apr_mx);
+        if (cnt > g_apr_tag_hwm[ring]) g_apr_tag_hwm[ring] = cnt;
+    }
+    if (evlog()) fprintf(stderr, "[ev] AprTagComplete token=0x%llx (ring=%u) -> eq=0x%llx scheduled\n",
+                         (unsigned long long)token, ring, (unsigned long long)eq);
+    std::thread([eq, id, ring] {
+        struct timespec ts{ 0, 2000000 };   // 2 ms
+        nanosleep(&ts, nullptr);
+        uint64_t hwm;
+        { std::lock_guard<std::mutex> lk(g_apr_mx); hwm = g_apr_tag_hwm[ring]; }
+        AprEqReg r{ eq, id };
+        apr_post(r, ring, ((uint64_t)ring << 58) | hwm);
+    }).detach();
+}
+// Assign the next completion token for `ring` (0-based, 6 bits) — for UNBOUND submits only, whose
+// token the engine consumes through the ASoW out slots / completion record (record-polled; no
+// event is ever posted for these — see the block comment above).
+uint64_t prosper_apr_next_token(unsigned ring) {
     ring &= 0x3f;
     std::lock_guard<std::mutex> lk(g_apr_mx);
     uint64_t seq = ++g_apr_ring_seq[ring];
-    if (tracked_catchup && g_apr_eq_regs.empty()) g_apr_ring_catchup[ring] = true;
     return ((uint64_t)ring << 58) | (seq & ((1ull << 58) - 1));
 }
-// Post the completion event for `token`'s ring to every registered APR event queue — DEFERRED by
-// ~2 ms on a detached thread. Posting synchronously inside the submit loses the race the real
-// hardware never runs: the engine inserts its {token -> request} hash entry right AFTER the
-// submit call returns, and the listener's hash-MISS path is not tolerant (it copies from
-// entry 0 + 0x10 — the live eboot+0x229df3e fault). A real DMA read takes far longer than the
-// submitter's few bookkeeping instructions; the delay models that latency. The deferred post
-// reads the ring's counter AT POST TIME (not the captured token), so out-of-order wakeups can
-// never regress the coalesced event's "completed up to" counter. CONFIDENCE: MED (latency model;
-// the guest-visible contract — event data = (ring<<58)|counter after the tracking insert — is
-// crash-verified in both failure modes).
-namespace {
-void apr_schedule_post(unsigned ring) {
-    std::thread([ring] {
-        struct timespec ts{ 0, 2000000 };   // 2 ms
-        nanosleep(&ts, nullptr);
-        std::vector<AprEqReg> regs; uint64_t cur;
-        {
-            std::lock_guard<std::mutex> lk(g_apr_mx);
-            regs = g_apr_eq_regs;
-            cur  = g_apr_ring_seq[ring];
-        }
-        if (!cur) return;
-        uint64_t tok = ((uint64_t)ring << 58) | (cur & ((1ull << 58) - 1));
-        for (auto& r : regs) apr_post(r, ring, tok);
-        if (evlog()) fprintf(stderr, "[ev] AprComplete posted ring=%u upto=%llu -> %zu eq(s)\n",
-            ring, (unsigned long long)cur, regs.size());
-    }).detach();
-}
-}
-void prosper_eq_trigger_apr(uint64_t token) {
-    unsigned ring = (unsigned)(token >> 58) & 0x3f;
-    if (evlog()) fprintf(stderr, "[ev] AprComplete token=0x%llx (ring=%u seq=%llu) scheduled\n",
-        (unsigned long long)token, ring, (unsigned long long)(token & ((1ull << 58) - 1)));
-    apr_schedule_post(ring);
-}
-// Register an APR completion target. Tracked pre-registration completions (vWU direct reads) are
-// re-delivered so their listener wake-up isn't lost; untracked rings reset (see above).
+// Record an APR completion registration (sSAUCCU1dv4 / H896Pt-yB4I target queue). Registration is
+// bookkeeping only: NO catch-up replay, NO ring resets — pre-registration completions are consumed
+// by the guest via record polling, and replaying invented counters would regress the listener's
+// ctor-seeded per-ring last-processed (see the block comment above; the pre-#208 replay was the
+// root cause of the #180 range-walk fault).
 void prosper_eq_add_apr(uint64_t eq, int64_t id) {
-    bool pending[64] = {};
-    {
-        std::lock_guard<std::mutex> lk(g_apr_mx);
-        for (auto& r : g_apr_eq_regs) if (r.eq == eq && r.id == id) return;   // idempotent
-        bool first = g_apr_eq_regs.empty();
-        g_apr_eq_regs.push_back({ eq, id });
-        for (unsigned ring = 0; ring < 64; ring++) {
-            if (!g_apr_ring_seq[ring]) continue;
-            if (g_apr_ring_catchup[ring]) pending[ring] = true;
-            else if (first)               g_apr_ring_seq[ring] = 0;   // drop untracked history
-        }
-    }
-    // Deferred like every completion post (the engine may still be inserting its tracking entry
-    // for the pre-registration read when this registration call runs).
-    for (unsigned ring = 0; ring < 64; ring++)
-        if (pending[ring]) apr_schedule_post(ring);
+    std::lock_guard<std::mutex> lk(g_apr_mx);
+    for (auto& r : g_apr_eq_regs)
+        if (r.eq == eq && r.id == id) return;   // idempotent
+    g_apr_eq_regs.push_back({ eq, id });
 }
 
 // --- SceKernelEvent field accessors (Kyty EventQueue.cpp:318-378: plain field reads). The APR
