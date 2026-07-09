@@ -44,6 +44,7 @@ struct GpuState {
         uint64_t modifier = 0;
     };
     std::vector<Draw> draws;                             // one per DrawIndexAuto / DrawIndex
+    uint64_t dispatch_count = 0;                         // DispatchDirect packets seen (no execution yet)
 
     // Safety cap on an indirect register count (a malformed/huge count won't run away).
     static constexpr uint32_t kMaxRegsPerPacket = 4096;

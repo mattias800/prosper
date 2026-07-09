@@ -23,7 +23,7 @@ enum : uint32_t {
     R_DRAW_INDEX = 0x03, R_DRAW_INDEX_AUTO = 0x04, R_DRAW_RESET = 0x05, R_WAIT_FLIP_DONE = 0x06,
     R_SH_REGS_INDIRECT = 0x11, R_CX_REGS_INDIRECT = 0x12, R_UC_REGS_INDIRECT = 0x13,
     R_ACQUIRE_MEM = 0x14, R_WRITE_DATA = 0x15, R_WAIT_MEM_64 = 0x16, R_FLIP = 0x17,
-    R_RELEASE_MEM = 0x18, R_NUM = 0x40,
+    R_RELEASE_MEM = 0x18, R_DISPATCH_DIRECT = 0x1a, R_NUM = 0x40,
 };
 
 // The register set a Set*RegistersIndirect packet targets.
@@ -35,7 +35,8 @@ enum class RegClass { Cx, Sh, Uc };
 struct Pm4Command {
     enum class Kind {
         DrawReset, WaitFlipDone, SetShRegDirect, SetRegsIndirect, SetIndexType,
-        DrawIndex, DrawIndexAuto, EventWrite, AcquireMem, WriteData, WaitRegMem, Flip, ReleaseMem, Unknown,
+        DrawIndex, DrawIndexAuto, EventWrite, AcquireMem, WriteData, WaitRegMem, Flip, ReleaseMem,
+        DispatchDirect, Unknown,
     } kind = Kind::Unknown;
 
     uint32_t        header = 0;
@@ -48,6 +49,12 @@ struct Pm4Command {
     uint64_t regs_vaddr = 0;             // SetRegsIndirect: guest addr of the register array
     uint32_t index_count = 0;            // DrawIndexAuto / DrawIndex
     uint32_t index_size = 0;             // SetIndexType
+
+    // DispatchDirect (sceAgcDcbDispatchDirect -> R_DISPATCH_DIRECT, hle_agc.cpp
+    // agc_dcb_dispatch_direct). Payload: [0..2] = threadgroup counts x/y/z, [3..4] = 64-bit
+    // dispatch modifier (from the CS shader's specials block).
+    uint32_t tg_x = 0, tg_y = 0, tg_z = 0;   // DispatchDirect threadgroup counts
+    uint64_t dispatch_modifier = 0;          // DispatchDirect modifier bits
 
     // DrawIndex (sceAgcDcbDrawIndex -> R_DRAW_INDEX, laid out by hle_agc.cpp agc_dcb_draw_index).
     // Packet payload: [0]=index_count, [1..2]=index-buffer guest address (lo/hi), [3..4]=64-bit draw

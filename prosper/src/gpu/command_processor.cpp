@@ -205,6 +205,14 @@ void GpuState::apply(const Pm4Command& c) {
                             (unsigned long long)v, c.wm_func, (unsigned long long)r);
             }
             break;
+        case K::DispatchDirect:
+            // Compute dispatch (issue #213 — DOLL's UE4 compute prologue). Recorded for stats/
+            // diagnostics only: prosper has no compute execution path yet. The fence cluster the
+            // guest builds around each dispatch (label init + EOP write + wait) completes at fold
+            // time independently of the dispatch itself, so skipping the shader work cannot hang
+            // the stream — it only leaves compute-written buffers stale (surfaced by the counter).
+            dispatch_count++;
+            break;
         case K::Flip:
             // The GPU reaching the SetFlip packet IS the flip moment (synchronous fold): perform the
             // videoout flip so GetFlipStatus advances and the game's frame pacer sees its flipArg
