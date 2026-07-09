@@ -71,6 +71,25 @@ int main() {
         CHECK(bad == 0, "OpImageRead->OpImageWrite copied every RGBA texel bit-exact (src == dst)");
     }
 
+    // NON-multiple width (#131): 70 texels dispatch ceil(70/64)=2 workgroups = 128 invocations, so
+    // lanes 70..127 read AND write out of the image's range. With robustImageAccess (now enabled by
+    // the runner when the device offers it) OOB reads return zero and OOB writes are discarded —
+    // the copy of the real 70 texels must still be bit-exact and nothing may fault.
+    const uint32_t W2 = 70;
+    std::vector<uint32_t> src2(W2 * 4);
+    for (uint32_t i = 0; i < W2; i++) {
+        src2[i*4+0] = 0x10000000u + i;        src2[i*4+1] = 0x20000000u + i*3u + 1u;
+        src2[i*4+2] = 0x30000000u + i*11u+2u; src2[i*4+3] = 0x40000000u + i*17u + 3u;
+    }
+    std::vector<uint32_t> dst2 = prosper::test::run_image_copy(spv, W2, src2);
+    CHECK(dst2.size() == src2.size(), "non-multiple-width copy ran (OOB tail lanes tolerated)");
+    if (dst2.size() == src2.size()) {
+        uint32_t bad2 = 0;
+        for (uint32_t i = 0; i < W2 * 4; i++) if (dst2[i] != src2[i]) bad2++;
+        printf("  non-multiple width: mismatched components = %u / %u\n", bad2, W2*4);
+        CHECK(bad2 == 0, "70-texel copy bit-exact with a 128-invocation dispatch (grid-tail OOB safe)");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

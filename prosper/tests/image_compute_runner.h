@@ -6,6 +6,7 @@
 #pragma once
 #include <vulkan/vulkan.h>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 namespace prosper::test {
@@ -48,16 +49,28 @@ inline std::vector<uint32_t> run_image_copy(const std::vector<uint32_t>& spirv,
     // rather than UB. shaderStorageImageRead/WriteWithoutFormat: the module declares the matching
     // StorageImageReadWithoutFormat / WriteWithoutFormat capabilities (the image views carry no format
     // hint in the shader), so these features must be enabled for the SPIR-V to be accepted.
-    // NOTE on OOB image reads: the recompiler issues OpImageRead for all lanes (inactive lanes' values are
-    // discarded by write-back predication), relying on IMAGE ROBUSTNESS (robustImageAccess) for OOB→0 —
-    // the image analogue of robustBufferAccess. This test dispatches exactly `width` (a multiple of the 64
-    // workgroup) invocations, so NO lane's coordinate is out of range and the feature is not needed here;
-    // a runtime running real shaders on non-multiple image sizes must enable robustImageAccess.
     VkPhysicalDeviceFeatures feats{};
     feats.robustBufferAccess = VK_TRUE;
     feats.shaderStorageImageReadWithoutFormat = VK_TRUE;
     feats.shaderStorageImageWriteWithoutFormat = VK_TRUE;
     dci.pEnabledFeatures = &feats;
+    // robustImageAccess (VK_EXT_image_robustness; core in 1.3): the recompiled storage-image load
+    // path issues OpImageRead for ALL invocations — including EXEC-inactive/grid-tail lanes whose
+    // coordinates can be out of range — relying on OOB image reads returning zero (#131). Enable it
+    // whenever the device offers it (feature-query guarded, so a device without it still creates —
+    // then only exact-multiple dispatches are safe, which the fixed-width tests are).
+    VkPhysicalDeviceImageRobustnessFeaturesEXT irf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES_EXT};
+    const char* img_robust_ext[] = { "VK_EXT_image_robustness" };
+    { uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(phys, nullptr, &ne, nullptr);
+      std::vector<VkExtensionProperties> de(ne);
+      vkEnumerateDeviceExtensionProperties(phys, nullptr, &ne, de.data());
+      for (uint32_t i = 0; i < ne; i++) if (!strcmp(de[i].extensionName, "VK_EXT_image_robustness")) {
+          VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+          f2.pNext = &irf; vkGetPhysicalDeviceFeatures2(phys, &f2);
+          if (irf.robustImageAccess) { dci.pNext = &irf;
+              dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = img_robust_ext; }
+          break;
+      } }
     VkDevice dev = VK_NULL_HANDLE;
     if (vkCreateDevice(phys, &dci, nullptr, &dev) != VK_SUCCESS || !dev) { vkDestroyInstance(inst, nullptr); return out; }
     VkQueue queue; vkGetDeviceQueue(dev, qfi, 0, &queue);
