@@ -17,6 +17,7 @@
 #include "host/boot_program.hpp"       // boot_program (shared guest-boot path, also used by boot_trace)
 #include "host/exec_image.hpp"         // run_entry
 #include "loader/linker.hpp"           // Program
+#include "input/pad.hpp"               // keyboard -> libScePad (HostPadState / PadBackend)
 #ifdef PROSPER_HAVE_LIVE_RENDERER
 #include "live_renderer.hpp"           // shared DrawItem->Vulkan compositor (register_live_renderer)
 #endif
@@ -40,6 +41,7 @@
 #include <cmath>
 #include <chrono>
 #include <thread>
+#include <mutex>
 
 using namespace prosper;
 
@@ -269,6 +271,57 @@ void feed_test_pattern(uint32_t w, uint32_t h, uint64_t frame) {
     gpu::present_write_frame(px.data(), w, h);
 }
 
+// ---- keyboard -> virtual DualSense (pad 0) ----------------------------------------------------
+// A controller over WSL passthrough is flaky, so the app maps the keyboard onto the same
+// HostPadState the SDL gamepad backend fills. The event loop snapshots the current key state into
+// g_kb_state (main thread); the guest's scePadReadState reads it through this backend (guest thread).
+std::mutex g_kb_mx;
+prosper::input::HostPadState g_kb_state;
+
+struct KeyboardPad : prosper::input::PadBackend {
+    bool poll(int index, prosper::input::HostPadState& out) override {
+        if (index != 0) return false;                 // single virtual pad
+        std::lock_guard<std::mutex> lk(g_kb_mx);
+        out = g_kb_state;
+        return true;
+    }
+};
+KeyboardPad g_keyboard_pad;
+
+// Snapshot the current keyboard into g_kb_state. Call from the thread that pumps SDL events.
+void poll_keyboard() {
+    using namespace prosper::input;
+    const bool* k = SDL_GetKeyboardState(nullptr);
+    auto d = [&](SDL_Scancode s){ return k[s]; };
+    bool up    = d(SDL_SCANCODE_UP)   || d(SDL_SCANCODE_W);
+    bool down  = d(SDL_SCANCODE_DOWN) || d(SDL_SCANCODE_S);
+    bool left  = d(SDL_SCANCODE_LEFT) || d(SDL_SCANCODE_A);
+    bool right = d(SDL_SCANCODE_RIGHT)|| d(SDL_SCANCODE_D);
+    uint32_t b = 0;
+    if (up)    b |= SCE_PAD_BUTTON_UP;
+    if (down)  b |= SCE_PAD_BUTTON_DOWN;
+    if (left)  b |= SCE_PAD_BUTTON_LEFT;
+    if (right) b |= SCE_PAD_BUTTON_RIGHT;
+    if (d(SDL_SCANCODE_SPACE) || d(SDL_SCANCODE_J)) b |= SCE_PAD_BUTTON_CROSS;    // jump
+    if (d(SDL_SCANCODE_K))     b |= SCE_PAD_BUTTON_SQUARE;                        // attack
+    if (d(SDL_SCANCODE_L))     b |= SCE_PAD_BUTTON_CIRCLE;
+    if (d(SDL_SCANCODE_I))     b |= SCE_PAD_BUTTON_TRIANGLE;
+    if (d(SDL_SCANCODE_U))     b |= SCE_PAD_BUTTON_L1;
+    if (d(SDL_SCANCODE_O))     b |= SCE_PAD_BUTTON_R1;
+    if (d(SDL_SCANCODE_Y))     b |= SCE_PAD_BUTTON_L2;
+    if (d(SDL_SCANCODE_H))     b |= SCE_PAD_BUTTON_R2;
+    if (d(SDL_SCANCODE_RETURN) || d(SDL_SCANCODE_RETURN2)) b |= SCE_PAD_BUTTON_OPTIONS;   // menu/start
+    HostPadState st;
+    st.buttons = b;
+    st.left_x  = left ? 0x00 : (right ? 0xff : 0x80);   // also drive the left stick, for stick-only titles
+    st.left_y  = up   ? 0x00 : (down  ? 0xff : 0x80);
+    st.l2 = d(SDL_SCANCODE_Y) ? 255 : 0;
+    st.r2 = d(SDL_SCANCODE_H) ? 255 : 0;
+    st.connected = true;
+    std::lock_guard<std::mutex> lk(g_kb_mx);
+    g_kb_state = st;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -342,6 +395,11 @@ int main(int argc, char** argv) {
     fprintf(stderr, "[app] window up (%s). Close the window or press Esc to quit.\n",
             testPattern ? "test-pattern" : "waiting for guest frames");
 
+    // Keyboard controls (installed last, so it's the active pad even if the SDL gamepad backend ran).
+    prosper::input::pad_set_backend(&g_keyboard_pad);
+    fprintf(stderr, "[app] keyboard: WASD/Arrows=move  J/Space=Cross(jump)  K=Square(attack)  L=Circle  "
+                    "I=Triangle  U/O=L1/R1  Y/H=L2/R2  Enter=Options  Esc=quit\n");
+
     uint64_t shown = 0, lastCount = ~0ull, patFrame = 0;
     bool running = true;
     while (running && !prosper_stop_requested()) {
@@ -351,6 +409,7 @@ int main(int argc, char** argv) {
             else if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_ESCAPE) running = false;
         }
         if (!running) break;
+        poll_keyboard();   // snapshot key state for the guest's pad reads
 
         static const uint32_t kPatW = 1920, kPatH = 1080;
         if (testPattern) feed_test_pattern(kPatW, kPatH, patFrame++);
