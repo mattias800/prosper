@@ -16,6 +16,7 @@
 #include "gpu/gpu_execute.hpp"      // guest_readable (safe pointer probe for the diagnostic dumps)
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <mutex>
@@ -416,10 +417,28 @@ uint64_t glog_impl(const char* nid, void* ra,
         static bool dumped = false;
         if (!dumped && a2 > 0x100000ull) {
             dumped = true;
-            uint64_t sz = (a4 && a4 <= 0x10000) ? a4 : 0x200;   // a4 looks like a size; cap defensively
-            if (FILE* f = fopen("/mnt/c/Users/matti/repos/ps5ys/prosper/build-linux/shader0.bin", "wb")) {
+            // Size: prefer an explicit a4 count; else derive it from the shader's own s_endpgm
+            // terminator (RDNA2 SOPP 0xBF810000) instead of a fixed 0x200 fragment (#160). Scan is
+            // bounded so a bad/short mapping can't run away.
+            uint64_t sz;
+            if (a4 && a4 <= 0x10000) {
+                sz = a4;                                        // a4 is a plausible explicit byte count
+            } else {
+                const uint32_t* w = (const uint32_t*)(uintptr_t)a2;
+                const uint64_t cap = 0x4000 / 4;                // scan up to 16 KiB of dwords
+                uint64_t n = 0;
+                for (; n < cap; n++) if (w[n] == 0xBF810000u) { n++; break; }   // include the s_endpgm dword
+                sz = (n && n < cap) ? n * 4 : 0x2000;           // found -> exact end; else a generous window
+            }
+            // Path from PROSPER_AGCSHADER_OUT (default relative, so it works off this dev's machine);
+            // report an fopen failure instead of silently writing nothing (#160).
+            const char* out = getenv("PROSPER_AGCSHADER_OUT");
+            if (!out || !*out) out = "shader0.bin";
+            if (FILE* f = fopen(out, "wb")) {
                 fwrite((const void*)(uintptr_t)a2, 1, sz, f); fclose(f);
-                fprintf(stderr, "  [wrote shader0.bin: %llu bytes from a2]\n", (unsigned long long)sz);
+                fprintf(stderr, "  [wrote %s: %llu bytes from a2]\n", out, (unsigned long long)sz);
+            } else {
+                fprintf(stderr, "  [PROSPER_AGCSHADER: fopen('%s') failed: %s]\n", out, strerror(errno));
             }
         }
     }
