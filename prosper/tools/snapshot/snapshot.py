@@ -114,6 +114,39 @@ def capture(entry, run_log=None):
         proc = subprocess.Popen([bt_run, dump], env=env, stdout=logf, stderr=subprocess.STDOUT,
                                 preexec_fn=os.setsid)
         deadline = time.time() + timeout
+        settle = int(entry.get("settle", 0))
+        if settle > 0:
+            # SETTLE MODE: return once the render STABILIZES — the last `settle` frames all hash
+            # identical (a static/settled screen). This is deterministic across runs, unlike the
+            # timing-dependent N-th-draw-submit target (`frame`), which varies with boot threading.
+            seen, recent = {}, []
+            while time.time() < deadline:
+                exited = proc.poll() is not None
+                frames = sorted(f for f in os.listdir(tmp) if f.startswith("frame_") and f.endswith(".bmp"))
+                for i, f in enumerate(frames):
+                    if f in seen:
+                        continue
+                    if i == len(frames) - 1 and not exited:
+                        continue                         # newest frame may be mid-write; hash it next poll
+                    p = os.path.join(tmp, f)
+                    try:
+                        if os.path.getsize(p) <= 0:
+                            continue
+                        h, _ = pixel_hash(p)
+                    except OSError:
+                        continue
+                    seen[f] = h
+                    recent.append((p, h))
+                    if len(recent) >= settle and len({x[1] for x in recent[-settle:]}) == 1:
+                        dst = os.path.join(tmp, "captured.bmp")
+                        shutil.copyfile(p, dst)
+                        return dst, tmp
+                if exited:
+                    raise RuntimeError(f"boot_trace exited (code {proc.returncode}) before settling to "
+                                       f"{settle} stable frames (reached: {_last_frame(tmp)})")
+                time.sleep(0.3)
+            raise RuntimeError(f"timeout after {timeout}s waiting for {settle} stable frames "
+                               f"(reached: {_last_frame(tmp)})")
         last_size = -1
         while time.time() < deadline:
             if proc.poll() is not None and not os.path.exists(target):
@@ -166,15 +199,30 @@ def cmd_list(m, names):
 
 
 def cmd_update(m, names):
+    # Bless a NEW baseline hash — but only if the target is DETERMINISTIC. Capture twice and refuse to
+    # write the hash unless both captures agree; a baseline that isn't reproducible is worse than none
+    # (it fails `check` for every other agent/machine and trains people to ignore the guard). A target
+    # like "the N-th draw submit" (PROSPER_RENDER_EVERY=1) is inherently timing/threading-dependent on a
+    # threaded boot, so it will (correctly) be rejected here until the entry targets a settled/stable
+    # capture point. `--force` blesses a single capture anyway (escape hatch; not recommended).
+    force = "--force" in names
+    names = [n for n in names if n != "--force"]
     rc = 0
     for s in select(m, names):
         try:
-            bmp, tmp = capture(s)
-            h, dims = pixel_hash(bmp)
-            s["hash"] = h
-            s["dims"] = list(dims)
-            print(f"[update] {s['name']}: {dims[0]}x{dims[1]} hash={h[:16]}…")
-            _cleanup(tmp)
+            b1, t1 = capture(s); h1, dims = pixel_hash(b1); _cleanup(t1)
+            if force:
+                s["hash"] = h1; s["dims"] = list(dims)
+                print(f"[update] {s['name']}: {dims[0]}x{dims[1]} hash={h1[:16]}… (FORCED, unverified)")
+                continue
+            b2, t2 = capture(s); h2, _ = pixel_hash(b2); _cleanup(t2)
+            if h1 != h2:
+                print(f"[update] {s['name']}: REFUSED — non-deterministic ({h1[:12]} vs {h2[:12]}); "
+                      f"target a settled/stable frame (or --force to override)", file=sys.stderr)
+                rc = 1
+                continue
+            s["hash"] = h1; s["dims"] = list(dims)
+            print(f"[update] {s['name']}: {dims[0]}x{dims[1]} hash={h1[:16]}… (verified deterministic)")
         except Exception as e:
             print(f"[update] {s['name']}: ERROR {e}", file=sys.stderr)
             rc = 1
