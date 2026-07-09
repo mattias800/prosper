@@ -1792,6 +1792,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // Format of the fetched components. Untyped buffer_load_dword* is raw 32-bit (comp_bytes=4);
             // buffer_load_format_* takes the format from the resolved V# descriptor.
             DataFormat fmt = DataFormat::Uint32;   // untyped default: raw dwords
+            bool dyn_vfetch = false;   // set when the V# came from by_fetch_pc — a const-folded per-vertex
+                                       // attribute fetch, whose element address is exactly gl_VertexIndex*stride.
             if (is_format) {
                 // A format load reads a vertex/buffer attribute — it needs the V# descriptor for the
                 // binding, stride, and data format. Resolve SRSRC (src[1]) via provenance: an s_load
@@ -1804,6 +1806,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // PER-FETCH first: a reloaded SRSRC holds a different V# per attribute, so match this
                     // exact fetch instruction's pc; fall back to the SGPR (direct) then s_load SRT tag.
                     res = rt->by_fetch_pc(in.pc);
+                    if (res) dyn_vfetch = true;
                     if (!res) res = rt->by_sgpr_base_cls(in.src[1].value, ResourceClass::VertexBuffer);
                     if (!res) { auto it = rs.sreg_srt.find(in.src[1].value);
                         if (it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second); }
@@ -1854,10 +1857,25 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             if (packed && !is_half && norm == 0.0f) { ok = false; return true; }
             // Byte address of the element: idxen -> VADDR is an element index (×stride); offen -> VADDR
             // is a byte offset; plus the inst offset and SOFFSET. dword index = addr>>2.
-            uint32_t addr = b.uconst(offset);
-            if (idxen && stride) addr = b.ibin(Op_IAdd, addr, b.ibin(Op_IMul, val(in.src[0]), b.uconst(stride)));
-            else if (offen)      addr = b.ibin(Op_IAdd, addr, val(in.src[0]));
-            addr = b.ibin(Op_IAdd, addr, val(in.src[2]));              // SOFFSET
+            uint32_t addr;
+            // Const-folded per-vertex attribute fetch: the element address is exactly gl_VertexIndex*stride.
+            // (1) The NGG fetch-shader prologue that computes the element index isn't fully modeled and can
+            //     fold to a constant, so every vertex reads record 0 -> a degenerate single point that
+            //     rasterizes nothing (the whole scene stayed the blue clear).
+            // (2) The resolved V# base ALREADY includes this attribute's byte offset within the interleaved
+            //     record, so the shader's inst-offset + SOFFSET must NOT be added again — double-counting
+            //     pushes the read out of bounds (robustBufferAccess returns 0), the same degenerate collapse.
+            // So use gl_VertexIndex*stride and drop the shader's VADDR/offset/SOFFSET. Everything else keeps
+            // the faithful address (offen byte offsets, instanced / computed indices). CONFIDENCE: HIGH —
+            // makes PPSA01885 (Unity/IL2CPP) render its real geometry instead of a degenerate collapse.
+            if (dyn_vfetch && idxen && stride) {
+                addr = b.ibin(Op_IMul, b.load_vertex_index(), b.uconst(stride));
+            } else {
+                addr = b.uconst(offset);
+                if (idxen && stride) addr = b.ibin(Op_IAdd, addr, b.ibin(Op_IMul, val(in.src[0]), b.uconst(stride)));
+                else if (offen)      addr = b.ibin(Op_IAdd, addr, val(in.src[0]));
+                addr = b.ibin(Op_IAdd, addr, val(in.src[2]));          // SOFFSET
+            }
             uint32_t idx = b.ibin(Op_ShiftRightLogical, addr, b.uconst(2));
             if (is_store) {
                 // Store the VDATA VGPRs (in.dst..+n-1). Integer sub-dword formats (Uint8/Sint8/...) have
