@@ -475,6 +475,14 @@ namespace {
         return true;
     }
 
+    // NO stack-protector here: the canary lives at %fs:0x28, and this handler runs on whatever %fs the
+    // faulting GUEST thread had — under PROSPER_GUEST_FS that is the guest TP, whose [fs+0x28] is plain
+    // guest data. Sony libc's abort stub (libc.prx+0x48d0: `mov $stopcode, %fs:0x28 ; int $0x45`) even
+    // WRITES its stop code into exactly that slot right before trapping into this handler, and
+    // guest_fs_enter_host_for_signal() switches %fs mid-function — so a compiler-inserted canary check
+    // compares values read from two DIFFERENT TLS blocks and aborts the process with a spurious
+    // "*** stack smashing detected ***" (SIGABRT + core) instead of the clean _exit(90) report path.
+    __attribute__((no_stack_protector))
     void fault_handler(int sig, siginfo_t* si, void* uctx) {
         // Emulate AMD-only SSE4a bitfield ops (insertq/extrq) that #UD on Intel hosts, then resume.
         if (sig == SIGILL && try_emulate_sse4a((ucontext_t*)uctx)) return;

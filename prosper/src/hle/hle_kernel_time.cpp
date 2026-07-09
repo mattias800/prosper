@@ -425,25 +425,77 @@ void prosper_eq_add_vblank(uint64_t eq, int64_t ident, uint64_t udata) {
 void prosper_eq_add_eop(uint64_t eq, int64_t id, uint64_t udata) {
     std::lock_guard<std::mutex> lk(g_eq_mx); g_eop_regs.push_back({ eq, id, udata });
 }
-// Fire the registered EOP events — called when a submit completes (our fold is synchronous, so submit
-// == GPU pipe drain == the EOP interrupt moment). Posts TriggerEvent(ident=id, filter=GraphicsCore,
-// data=id, udata) to each registered equeue, matching shadPS4's IRQ handler. Inert if none registered.
-void prosper_eq_trigger_eop() {
-    // Deliver EVERY GPU-completion event as a DISTINCT equeue entry (coalesce=false). All EOP events share
-    // the same (ident, EVFILT_GRAPHICS_CORE), so coalescing collapses N submit-completions into ONE pending
-    // event — and the game's EOP handler posts a work-queue semaphore once per delivered completion, so a
-    // coalesced completion UNDER-posts the semaphore and its consumer deadlocks (GfxDevice work-queue
-    // eboot+0xb06ad2 / PreloadManager 0x18a83b5 / a worker). That was The Messenger's post-SaveData
-    // scene-activation stall (#234): with coalesce=false the scene activates and the intro cutscene plays;
-    // with the old coalescing it freezes on one frame. Same reason the APR channel (#210) is coalesce=false
-    // — a completion is a discrete count, never a level. PROSPER_EOP_COALESCE restores the old behavior.
-    static const bool coalesce = getenv("PROSPER_EOP_COALESCE") != nullptr;
-    std::vector<FlipReg> regs;
-    { std::lock_guard<std::mutex> lk(g_eq_mx); regs = g_eop_regs; }
-    for (auto& r : regs) {
-        SceKEvent e{}; e.ident = r.ident; e.filter = EVFILT_GRAPHICS_CORE; e.data = r.ident; e.udata = r.udata;
-        eq_post(r.eq, e, coalesce);
+// Fire the registered EOP events — called when a submit completes. Posts TriggerEvent(ident=id,
+// filter=GraphicsCore, data=id, udata) to each registered equeue, matching shadPS4's IRQ handler.
+// Inert if none registered.
+namespace {
+    // Actually post one EOP completion to every registered equeue (the worker below calls this).
+    void eop_post_now() {
+        // Deliver EVERY GPU-completion event as a DISTINCT equeue entry (coalesce=false). All EOP events
+        // share the same (ident, EVFILT_GRAPHICS_CORE), so coalescing collapses N submit-completions into
+        // ONE pending event — and the game's EOP handler posts a work-queue semaphore once per delivered
+        // completion, so a coalesced completion UNDER-posts the semaphore and its consumer deadlocks
+        // (GfxDevice work-queue eboot+0xb06ad2 / PreloadManager 0x18a83b5 / a worker). That was The
+        // Messenger's post-SaveData scene-activation stall (#234): with coalesce=false the scene activates
+        // and the intro cutscene plays. Same reason the APR channel (#210) is coalesce=false — a completion
+        // is a discrete count, never a level. PROSPER_EOP_COALESCE restores the old behavior.
+        static const bool coalesce = getenv("PROSPER_EOP_COALESCE") != nullptr;
+        std::vector<FlipReg> regs;
+        { std::lock_guard<std::mutex> lk(g_eq_mx); regs = g_eop_regs; }
+        for (auto& r : regs) {
+            SceKEvent e{}; e.ident = r.ident; e.filter = EVFILT_GRAPHICS_CORE; e.data = r.ident; e.udata = r.udata;
+            eq_post(r.eq, e, coalesce);
+        }
     }
+    // Deferred, ORDERED EOP delivery worker. On real hardware the EOP interrupt can only fire AFTER
+    // the submit call has returned — the GPU sees the command buffer when the driver rings the doorbell
+    // at the END of the submit — and the interrupt arrives micro/milliseconds later. prosper's fold is
+    // synchronous, so firing the kevent INSIDE the submit call violated that invariant: the guest's
+    // interrupt->cleanup chain (AgcInterruptThread -> AgcCleanupThread) could observe frame N complete
+    // BEFORE the AgcSubmissionThread finished frame N's own post-submit bookkeeping, and the cleanup
+    // raced the submitter's retired-allocation list. DOLL (UE4 PPSA17942) hit exactly that: an
+    // intermittent MallocBinned3 "Corruption Canary was 0x3, should be 0x1" LowLevelFatalError in the
+    // RHI's free-list loop (eboot+0x220bd50, GMalloc->Free over a retired-buffer array) -> libc abort
+    // (int $0x45, stop code 0xa002000b), killing ~half of boots between flips 200-2500 (issues
+    // #232/#241). Deferring only the EVENT (label/fence WRITES stay synchronous — they are data
+    // dependencies, not lifecycle signals) restores the real ordering: the submit returns first, then
+    // the completion interrupt fires ~1 ms later. A single FIFO worker preserves inter-submit order
+    // (#236 needs every completion delivered distinctly and in order). PROSPER_EOP_SYNC=1 restores the
+    // old synchronous delivery. CONFIDENCE: HIGH on the invariant (real EOP is post-submit by
+    // construction; Kyty's GraphicsRunDone/EOP also fires from the GPU thread after CommandProcessor
+    // execution, never inside the submit call).
+    // IMMORTAL (leaked) worker state: the worker thread is detached and outlives main, so this state
+    // must never run static destructors — a worker blocked in wait() on a destroyed condvar/mutex
+    // hangs process exit (test_equeue_events under ctest caught exactly that).
+    struct EopQueue { std::mutex mx; std::condition_variable cv; uint64_t pending = 0; };
+    EopQueue& eop_q() { static EopQueue* q = new EopQueue; return *q; }
+    std::atomic<bool> g_eop_worker_started{false};
+    void eop_worker() {
+        EopQueue& q = eop_q();
+        std::unique_lock<std::mutex> lk(q.mx);
+        for (;;) {
+            q.cv.wait(lk, [&] { return q.pending > 0; });
+            uint64_t n = q.pending;
+            q.pending = 0;
+            lk.unlock();
+            // Modeled GPU pipe-drain latency: long enough for the submitting guest thread to return
+            // from the submit import and finish its bookkeeping, short enough to not throttle the
+            // frame loop (same order as the APR channel's 2 ms modeled DMA latency). One sleep covers
+            // the whole burst; each queued completion is still posted DISTINCTLY and in order (#236).
+            struct timespec ts{ 0, 1000000 };   // 1 ms
+            nanosleep(&ts, nullptr);
+            while (n--) eop_post_now();
+            lk.lock();
+        }
+    }
+}
+void prosper_eq_trigger_eop() {
+    static const bool sync = getenv("PROSPER_EOP_SYNC") != nullptr;
+    if (sync) { eop_post_now(); return; }
+    if (!g_eop_worker_started.exchange(true)) std::thread(eop_worker).detach();
+    EopQueue& q = eop_q();
+    { std::lock_guard<std::mutex> lk(q.mx); q.pending++; }
+    q.cv.notify_one();
 }
 
 HLE(k_eq_create) {
@@ -652,14 +704,45 @@ void prosper_eq_post_apr_token(uint64_t eq, int64_t id, uint64_t token) {
     // counters, id 0 tags are request pointers in every capture); MED on the id-0 event shape
     // (ident=id=0 kept, guest consumes via GetEventData like the #208 listener).
     if (id == 0) {
+        // ORDERED delivery is load-bearing here (issue #232, the DOLL FlushAsyncLoading wall). The
+        // ptr-tag is the guest's BATCH object pointer, and the consumer (eboot+0x22aa7d0 ->
+        // batch-retire 0x227e8e0) retires its in-flight list FROM THE HEAD *up to* the tagged batch,
+        // decrementing the in-flight batch counter [disp+0x30] once per retired node. Submission
+        // order == list order, so an event delivered OUT of submission order over-retires: the walk
+        // for the earlier batch's late event no longer finds it and marches through batches that are
+        // still in flight, driving [disp+0x30] past zero. The tail-flush gate
+        // (`if ([disp+0x30] <= 1) flush()` at eboot+0x227e7d3, UNSIGNED compare) then never passes
+        // again, the final partial batch never submits, and the GameThread spins in
+        // FlushAsyncLoading forever (~16k gettid/s) while every IO thread idles — 0 scene draws.
+        // The old per-post detached threads (independent 2 ms sleeps) made cross-post ordering a
+        // scheduler coin toss exactly under IO bursts. One FIFO worker + one modeled-latency sleep
+        // per batch preserves submission order by construction. CONFIDENCE: HIGH (retire-walk
+        // semantics from static disassembly; the stall's log signature — final ReadFile appended,
+        // no H896/ASoW after it, all delivered events balanced — matches exactly).
         if (evlog()) fprintf(stderr, "[ev] AprPtrTagComplete tag=0x%llx -> eq=0x%llx scheduled\n",
                              (unsigned long long)token, (unsigned long long)eq);
-        std::thread([eq, id, token] {
-            struct timespec ts{ 0, 2000000 };   // 2 ms (same modeled DMA latency as the #208 path)
-            nanosleep(&ts, nullptr);
-            SceKEvent e{}; e.ident = id; e.filter = EVFILT_AMPR_MODELED; e.data = (int64_t)token;
-            eq_post(eq, e, /*coalesce=*/false);
+        struct PtrPost { uint64_t eq; uint64_t token; };
+        struct PtrQueue { std::mutex mx; std::condition_variable cv; std::deque<PtrPost> q; };
+        static PtrQueue* pq = new PtrQueue;   // immortal: the worker is detached and outlives exit
+        static std::atomic<bool> started{false};
+        if (!started.exchange(true)) std::thread([] {
+            std::unique_lock<std::mutex> lk(pq->mx);
+            for (;;) {
+                pq->cv.wait(lk, [] { return !pq->q.empty(); });
+                std::deque<PtrPost> batch;
+                batch.swap(pq->q);
+                lk.unlock();
+                struct timespec ts{ 0, 2000000 };   // 2 ms modeled DMA latency (as the #208 path)
+                nanosleep(&ts, nullptr);
+                for (auto& p : batch) {
+                    SceKEvent e{}; e.ident = 0; e.filter = EVFILT_AMPR_MODELED; e.data = (int64_t)p.token;
+                    eq_post(p.eq, e, /*coalesce=*/false);
+                }
+                lk.lock();
+            }
         }).detach();
+        { std::lock_guard<std::mutex> lk(pq->mx); pq->q.push_back({ eq, token }); }
+        pq->cv.notify_one();
         return;
     }
     unsigned ring = (unsigned)(token >> 58) & 0x3f;

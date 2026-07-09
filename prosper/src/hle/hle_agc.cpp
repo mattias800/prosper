@@ -687,13 +687,27 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
 // ABI (RE'd from the compiler-generated adapter thunk at eboot+0x58df3f0, which marshals DOLL's
 // internal call at eboot+0x220aace into the Sony import): the raw Dcb dword-stream address arrives as
 // stack arg8, which the guest-%fs swap stub forwards to fp[3] (the same slot ReleaseMem/WaitRegMem read
-// their 8th arg from). The dword count (arg9) is beyond the 2-arg forward window, so we fold with an
-// unknown length — decode_pm4 self-terminates at the first non-type-3 header. We validate that fp[3]
-// points at a real PM4 type-3 stream before folding, and if it doesn't, scan a0..a5 as a fallback;
-// anything that fails to validate is refused (no fold, logged once) rather than folding garbage.
-// CONFIDENCE: MED — the buffer address slot is pinned by the adapter disassembly + the missing-fence
-// symptom; the unknown-length fold relies on decode_pm4's type-3 termination (verified: the warmup
-// buffer is contiguous builder-emitted packets). Proven by the RenderThread advancing once folded.
+// their 8th arg from). The dword COUNT is stack arg9: the callsite loads the buffer-array entry
+// {addr @+0x00, dw_count32 @+0x10} (`mov 0x10(%rax,%r12,1),%r10d`) and the adapter pushes it as the
+// import's 9th arg (32-bit, matching Packet.dw_num on the primary UglJIZjGssM path).
+//
+// arg9 is beyond the swap stub's 2-arg re-push window, but the ORIGINAL guest stack frame is still
+// intact above the stub's pushes. Guest-path stub frame at handler entry ([rsp] up):
+//   ret-to-stub, arg7-copy, arg8-copy, saved-r11(guest fs), ret-to-guest, orig-arg7, orig-arg8, orig-arg9
+// i.e. with the handler's rbp frame: fp[2]=arg7, fp[3]=arg8, fp[4]=saved r11, fp[5]=ret-to-guest,
+// fp[6]=orig arg7, fp[7]=orig arg8, fp[8]=orig arg9. We take arg9 from fp[8] ONLY after validating the
+// frame shape (fp[7]==fp[3] — the re-pushed arg8 must equal the original — and fp[5] must return into
+// guest code): a mismatch means a different stub layout (host path / future stub change), and we fall
+// back to the self-terminating fold rather than trust a garbage count.
+//
+// WHY the exact count matters (#241 and the boot crash-zoo): the Dcb is carved from a live ring whose
+// STALE tail is still valid type-3 PM4 from previous frames. An unknown-length fold does not stop at
+// the logical end — it re-executes the stale packets, including stale WriteData/ReleaseMem fence writes
+// whose destination heap blocks the guest has since freed and reused. That scribbles 8-byte GPU values
+// into live allocator state (the deterministic 0x20015f00 free-list node of issue #241, the libc.prx
+// logger stack-smash) — intermittent because it depends on what got reallocated under the stale fences.
+// CONFIDENCE: HIGH on the arg9=count ABI (callsite + adapter disassembly agree, and the count matches
+// the primary path's Packet.dw_num field offset); the validated-frame walk falls back safely.
 HLE(agc_driver_submit_dcb_variant) {
     auto is_pm4 = [](uint64_t p) -> bool {
         if (p < 0x10000 || (p & 3)) return false;
@@ -714,7 +728,22 @@ HLE(agc_driver_submit_dcb_variant) {
                     (unsigned long long)fp[3], (unsigned long long)a0, (unsigned long long)a1);
         return 0;
     }
-    return submit_dcb_stream((const uint32_t*)(uintptr_t)cand, 0, "SubmitDcbFinal");
+    // Recover the true dword count (arg9) from the original guest frame, validated as described above.
+    // Guest code range for the return-address check: main image at 0x400000000 (see classify_addr).
+    uint32_t dw_num = 0;
+    if (cand == fp[3] && fp[7] == fp[3] &&
+        fp[5] >= 0x400000000ull && fp[5] < 0x500000000ull) {
+        uint64_t n = fp[8];
+        if (n && n <= 0x400000ull)                          // plausible: bounded by any real ring size
+            dw_num = (uint32_t)n;
+    }
+    if (!dw_num) {
+        static std::atomic<int> logged9{0};
+        if (logged9.fetch_add(1) < 4)
+            fprintf(stderr, "[agc] w1KFAHVqpaU: arg9 count unavailable (fp[5]=0x%llx fp[7]=0x%llx fp[8]=0x%llx) — self-terminating fold\n",
+                    (unsigned long long)fp[5], (unsigned long long)fp[7], (unsigned long long)fp[8]);
+    }
+    return submit_dcb_stream((const uint32_t*)(uintptr_t)cand, dw_num, "SubmitDcbFinal");
 }
 
 HLE(agc_driver_submit_dcb) {  // (const Packet* packet)

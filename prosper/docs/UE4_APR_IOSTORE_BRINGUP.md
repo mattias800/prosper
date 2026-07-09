@@ -935,3 +935,59 @@ on it? Probes added: `tools/dbg/slot232.py`, `w1k232.py`, `gw232.py`, `waketrace
 `unimpl232.py`, `gotwho.cpp`, `nid2got.cpp`, `run232{b..h}.sh`. Thread-name adoption
 (`pthread_setname_np` in `k_pthread_create`) now labels all guest threads in gdb/procfs — the probe
 that made the RenderThread identifiable.
+
+### SOLVED x3 (2026-07-09 late, issue #232 session 3): boot-killer crash zoo cleared (1/6 -> 5/6 stable boots); the GameThread wall is FlushAsyncLoading; the APR batch pipeline now drains clean
+
+Three verified fixes this session (all offsets eboot-relative unless noted):
+
+1. **The #241 free-list fault (0x2316a**, node 0x20015f00) was the w1KFAHVqpaU fold over-walking.**
+   The Dcb is carved from a live ring whose stale tail is still valid type-3 PM4 — an unknown-length
+   fold re-executes stale WriteData/ReleaseMem fence writes into heap blocks the guest has freed and
+   reused (8-byte GPU-address-shaped scribbles -> the deterministic 0x20015f00 free-list node; the
+   fault site 0x2316a20/0x2316b00 is Sony libc's per-thread TLS small-block cache, keyed off the
+   pthread key at 0x95fa764). The TRUE dword count IS passed by the guest: the callsite
+   (0x220aabf) loads {addr @+0x00, dw_count32 @+0x10} from the buffer array and the adapter thunk
+   (0x58df3f0) forwards it as the import's stack arg9. arg9 is beyond the swap stub's 2-arg re-push
+   window but the ORIGINAL guest frame is intact above the stub frame: handler fp[6/7/8] = orig
+   arg7/8/9 (validated fp[7]==fp[3] and fp[5] in guest code before trusting). Fold now uses the
+   exact count (`walk==arg9`, 0 fallbacks, 28039/9352/6325-dword folds observed).
+
+2. **The libc.prx+0x48e0 "hang-logger SIGSEGV" + "stack smashing detected" abort was TWO stacked
+   artifacts of one guest fatal.** The real event: UE4 LowLevelFatalError **"MallocBinned3
+   Corruption Canary was 0x3, should be 0x1"** (found formatted in the core's GErrorHist) raised
+   from the RHI's retired-buffer free loop (0x220bd50, GMalloc->Free over a buffer array) ->
+   Sony libc abort stub libc.prx+0x48d0: `mov $0xa002000b,%fs:0x28 ; int $0x45`. Root cause:
+   prosper fired the GPU EOP kevent INSIDE the submit call (synchronous fold), violating the real
+   invariant that the EOP interrupt arrives only AFTER submit returns (doorbell at end of submit)
+   — the guest's AgcInterruptThread->AgcCleanupThread chain raced the AgcSubmissionThread's own
+   post-submit bookkeeping and double-handled the retired-allocation list. Fix: a single ordered
+   FIFO worker delivers EOP kevents ~1 ms after the submit returns (label/fence WRITES stay
+   synchronous; #236 distinct+ordered semantics kept; PROSPER_EOP_SYNC=1 restores old behavior).
+   The "stack smashing" was OUR fault_handler's stack-protector: canary read from %fs:0x28 (the
+   very slot the guest abort stub just wrote) on the guest %fs, checked after the handler switched
+   to the host %fs -> spurious SIGABRT. fault_handler is now no_stack_protector.
+   Messenger verified unregressed with deferred EOP (1549 presented frames, 0 faults).
+
+3. **APR ptr-tag (id=0) completions now deliver in submission order.** The tag is the guest BATCH
+   pointer; the consumer retires its in-flight list FROM THE HEAD up to the tagged batch
+   (retire fn 0x227e8e0, in-flight count [disp+0x30]: incl on submit 0x227e565, decl per retired
+   node 0x227e92b; the tail-flush gate `[disp+0x30] <= 1` at 0x227e7d3 is an UNSIGNED compare).
+   The old per-post detached 2 ms threads made cross-post order a scheduler race. With the FIFO
+   worker the previously-never-submitted final partial batch now binds+submits+completes (live:
+   the deterministic tail read off=0x328600000 of pakchunk0-ps5.ucas gets its H896+ASoW+event,
+   and at the stall ALL THREE rotating batches (0x1200df4980/49f0/4a60, a +0x00-linked ring) are
+   free (+0x68=1) and empty (+0x8=0) — the APR channel fully drained, verified by live scan
+   `tools/dbg/scan_disp.py`).
+
+**The #232 wall itself (still standing, now precisely characterized):** the GameThread is a
+busy FlushAsyncLoading spin — `ProcessAsyncLoading` (0x25b2980, identified by its own
+"ProcessAsyncLoading" rodata xref at 0x25b2a89; ProcessLoadedPackages at 0x25a1877/0x25b32d4) in
+a tight IsInGameThread/GetCurrentThreadId loop, ~16k gettid syscalls/s, no sleeping, no IO.
+IoDispatcher/IoService/all workers idle in k_eq_wait/k_cond_wait. File activity ends after the
+localization/assetregistry scans + the .ucas streaming burst (~2500 reads); the LAST reads are
+deterministic across runs (pakchunk0-ps5.ucas off 0x328600000 / 0x353640000 / 0x353680000).
+The async package(s) being flushed wait on a NON-IO dependency that never fires. Next: identify
+what consumes the completed .ucas chunk data (decompression job? FEvent chain? the request
+records at the retry list disp+0x198?) and which signal the FlushAsyncLoading packages actually
+poll. SlateLoadingThr + CriManaDecodeTh exist (loading-screen + movie machinery live); DOLL is
+UE4's LEGACY EDL loader (FAsyncLoadingThread strings), not zenloader.
