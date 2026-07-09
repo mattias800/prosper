@@ -1739,7 +1739,20 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // model — reject rather than translate with the immediate alone (#149). Immediate-only loads
             // encode SOFFSET = SGPR_NULL (125). A negative signed immediate can't index a constant
             // buffer (dword index would wrap), so reject that too.
-            if (!(in.src[1].kind == OperandKind::Special && in.src[1].value == 125)) { ok = false; return true; }
+            if (!(in.src[1].kind == OperandKind::Special && in.src[1].value == 125)) {
+                // Register-offset SMEM (SGPR-computed byte offset). A DESCRIPTOR load (x4/x8 = V#/T#) with
+                // a computed offset is the bindless fetch's V#-table read: `s_load_dwordx4 s[8:11],s[24:25],
+                // vcc_hi`. The const-fold (resolve_dynamic_fetch -> by_fetch_pc) already resolves the fetch
+                // through that V#, so the SGPR result is unused in our per-invocation model — no-op it
+                // (placeholder 0) so the vertex shader still recompiles instead of the whole VS being
+                // rejected (the "mask=0xF draws never render" gap on PPSA01885). A register-offset DATA
+                // load (x1/x2) genuinely feeds computation we don't model -> still reject. CONFIDENCE: HIGH.
+                if (rt && (in.opcode == 0x2 || in.opcode == 0x3)) {
+                    for (uint32_t k = 0; k < n; k++) rs.sreg[in.dst.value + (int)k] = b.uconst(0);
+                    return true;
+                }
+                ok = false; return true;
+            }
             if ((int32_t)in.literal < 0) { ok = false; return true; }
             uint32_t base_idx = in.literal >> 2;    // immediate byte offset -> dword index
             // Descriptor provenance: pick which bound constant buffer via the resource table, routing this
@@ -1872,10 +1885,22 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // the gap) rather than silently mis-decode. Aligned iff: inst offset %4==0; stride %4==0
             // when idxen; no offen (a runtime per-lane byte offset is unprovable); SOFFSET is NULL/0.
             if (packed) {
-                bool soff_zero = (in.src[2].kind == OperandKind::Special && in.src[2].value == 125) ||
-                                 (in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0);
-                bool base_aligned = ((offset & 3u) == 0) && !offen &&
-                                    (!idxen || (stride & 3u) == 0) && soff_zero;
+                bool base_aligned;
+                if (dyn_vfetch) {
+                    // The dyn_vfetch address path (below) is exactly gl_VertexIndex*stride and DROPS the
+                    // shader's inst-offset / offen / SOFFSET — the resolved V# base already folds in this
+                    // attribute's in-record byte offset. So packed-component alignment depends ONLY on the
+                    // per-element stride being dword-aligned (vertex records are, and the V# base with
+                    // them). Requiring soff_zero here (as the general path does) wrongly rejected Unorm8×4
+                    // packed-color attributes whose fetch carries a register SOFFSET that dyn_vfetch drops
+                    // anyway — the "mask=0xF draws never render" gap on PPSA01885. CONFIDENCE: HIGH.
+                    base_aligned = !idxen || (stride & 3u) == 0;
+                } else {
+                    bool soff_zero = (in.src[2].kind == OperandKind::Special && in.src[2].value == 125) ||
+                                     (in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0);
+                    base_aligned = ((offset & 3u) == 0) && !offen &&
+                                   (!idxen || (stride & 3u) == 0) && soff_zero;
+                }
                 if (!base_aligned) { ok = false; return true; }
             }
             // Byte address of the element (#148): idxen -> a VADDR VGPR is an element index (×stride);
