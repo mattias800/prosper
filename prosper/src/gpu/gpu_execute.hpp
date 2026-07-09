@@ -12,6 +12,7 @@
 #include "render_state.hpp"        // extract_render_state / resolve_pipeline_state / ResolvedPipelineState
 #include "rdna2_to_spirv.hpp"      // recompile_vertex / recompile_fragment
 #include "shader_resources.hpp"    // ShaderResourceTable
+#include "agc_shader_layout.hpp"   // DecodedBufferDescriptor (DynFetch)
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -50,6 +51,15 @@ using RenderFn = std::function<std::vector<uint8_t>(const std::vector<DrawItem>&
 // (Linux; always-true on Windows), so callers can test a guest pointer without risking a SIGSEGV.
 // Implemented in gpu_executor.cpp; shared by the executor's const-eval and HLE diagnostic probes.
 bool guest_readable(uint64_t addr, uint32_t bytes);
+
+// One resolved bindless-dynamic vertex fetch from the wave-uniform scalar const-fold in
+// gpu_executor.cpp: the exact fetch instruction (pc), its SRSRC SGPR, and the V# live in that SGPR
+// at that instruction. Exposed (with resolve_dynamic_fetch) so the fold's scalar-ALU semantics are
+// unit-testable; production callers stay inside gpu_executor.cpp.
+struct DynFetch { uint32_t fetch_pc; int srsrc; DecodedBufferDescriptor desc; uint32_t desc_v3; };
+std::vector<DynFetch> resolve_dynamic_fetch(const uint32_t* code, size_t dwords,
+                                            const uint32_t* user_sgprs, uint32_t nsgpr,
+                                            uint32_t user_sgpr_base);
 
 // Build a shader stage's resource table from the folded GpuState: look up the registered shader header
 // by its bound code address, read its user-data SGPR block from the sh register file, decode the V#/T#/S#

@@ -76,8 +76,6 @@ bool guest_readable(uint64_t a, uint32_t n) {
 bool guest_readable(uint64_t, uint32_t) { return true; }
 #endif
 
-namespace {
-
 // --- Bindless-dynamic vertex-fetch resolution (const-fold the scalar setup) ---------------------------
 // This game's NGG vertex shader loads its vertex-buffer V# from a descriptor table at a RUNTIME-computed
 // offset (e.g. `s_load_dwordx4 s[8:11], s[24:25], vcc_hi` where `vcc_hi = (s64<<4)&0x1f0` and
@@ -89,10 +87,7 @@ namespace {
 // VertexBuffer keyed by sgpr_base so the recompiler's by_sgpr_base() resolves it. Uniform-scalar only: any
 // value that would depend on a VGPR/lane is left unknown (the op's dest becomes unknown), so we never
 // fabricate a per-lane-dependent descriptor. CONFIDENCE: MED (covers this game's fetch-shader shape).
-// One resolved vertex fetch: the exact fetch instruction (pc), its SRSRC SGPR, and the V# live in that
-// SGPR at that instruction. Emitted per-fetch so a reloaded SRSRC (one V# per attribute) doesn't collapse.
-struct DynFetch { uint32_t fetch_pc; int srsrc; DecodedBufferDescriptor desc; uint32_t desc_v3; };
-
+// External linkage (DynFetch + declaration in gpu_execute.hpp) so the fold is unit-testable.
 std::vector<DynFetch>
 resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_sgprs, uint32_t nsgpr,
                       uint32_t user_sgpr_base) {
@@ -160,12 +155,18 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         break;
                     case 0x29: {  // s_bfe_u64: dst[63:0] = bitfield of src0[63:0] (format patch reads a small field)
                         uint32_t off = c & 0x3f, wid = (c >> 16) & 0x7f, ahi = 0;
-                        // src0's high dword: the next SGPR of the pair, or 0 for a 32-bit inline/literal
-                        // constant (zero-extended). Only an SGPR operand may index val[value+1] — a
-                        // literal's `value` is not an SGPR number. And an UNTRACKED high dword must not
-                        // silently fold as 0: if the field reaches bits >= 32 the result is unknown.
-                        bool khi = (in.src[0].kind == OperandKind::SGPR) ? known(in.src[0].value + 1, ahi)
-                                                                         : (ahi = 0, true);
+                        // src0's high dword (RDNA2 ISA 64-bit scalar-operand rules, #155): the next SGPR
+                        // of the pair; SIGN-extension of an integer inline constant (-1..-16 read as a
+                        // 64-bit operand are all-ones in the high dword); or 0 only for a 32-bit literal
+                        // (zero-extended). Inline FLOAT constants read as 64-bit doubles (a different bit
+                        // pattern entirely) — srcval() already leaves those unknown, so they never reach
+                        // here. Only an SGPR operand may index val[value+1] — a literal's `value` is not
+                        // an SGPR number. And an UNTRACKED high dword must not silently fold as 0: if the
+                        // field reaches bits >= 32 the result is unknown.
+                        bool khi;
+                        if (in.src[0].kind == OperandKind::SGPR)           khi = known(in.src[0].value + 1, ahi);
+                        else if (in.src[0].kind == OperandKind::InlineInt) { ahi = in.src[0].value < 0 ? 0xFFFFFFFFu : 0u; khi = true; }
+                        else                                               { ahi = 0; khi = true; }   // 32-bit literal
                         if (!khi && wid != 0 && off + wid > 32) { ok = false; wrote_pair = true; break; }
                         uint64_t src64 = (uint64_t)a | ((uint64_t)ahi << 32);
                         uint64_t res = wid == 0 ? 0 : (wid >= 64 ? (src64 >> off) : ((src64 >> off) & (((uint64_t)1 << wid) - 1)));
@@ -279,6 +280,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     }
     return out;
 }
+
+namespace {
 
 // Give every resource its OWN descriptor binding, starting at `first` (0/1 reserved). The N-buffer model:
 // the shader reads several distinct constant buffers (Unity's per-draw transform, per-frame, …) + vertex

@@ -184,6 +184,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_rdna2_spirv_struct PRIVATE prosper_core)
   add_test(NAME rdna2_spirv_struct COMMAND test_rdna2_spirv_struct)
 
+  # Scalar const-fold interpreter behind bindless-dynamic vertex-fetch resolution (no Vulkan needed).
+  add_executable(test_dynfetch_fold tests/test_dynfetch_fold.cpp)
+  target_link_libraries(test_dynfetch_fold PRIVATE prosper_core)
+  add_test(NAME dynfetch_fold COMMAND test_dynfetch_fold)
+
   # shader_histo: data-driven recompiler-coverage report over the game's real embedded RDNA2 shaders.
   add_executable(shader_histo tools/shader_histo/shader_histo.cpp)
   target_link_libraries(shader_histo PRIVATE prosper_core)
