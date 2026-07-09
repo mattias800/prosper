@@ -307,7 +307,7 @@ HLE(s_savedata_mount3)  {
     const char* dirname = *(const char* const*)(m + 0x08);
     uint32_t mode = *(const uint32_t*)(m + 0x20);
     if (!dirname) return SAVE_DATA_ERR_PARAMETER;
-    bool create = (mode & 0x4) != 0;
+    bool create = (mode & 0x24) != 0;   // CREATE(4) | CREATE2(0x20, create-if-missing; live: mode 0x20 remount)
     if (!savedata0_mount(dirname, create)) {
         if (svclog()) fprintf(stderr, "[svc]   Mount3 dir='%s' mode=%#x -> NOT_FOUND\n", dirname, mode);
         return SAVE_DATA_ERR_NOT_FOUND;
