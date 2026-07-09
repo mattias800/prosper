@@ -44,6 +44,13 @@ int main() {
     // sync_on_address futex is registered by raw NID (no symbol name) — check it directly.
     if (Hle::lookup("Hc4CaR6JBL0") == nullptr) { printf("  [FAIL] sceKernelWaitOnAddress raw NID\n"); fails++; }
 
+    // __ctype_get_mb_cur_max returns the VALUE of MB_CUR_MAX (1 in the "C" locale we
+    // present), not a pointer to it — guest code sizes buffers as MB_CUR_MAX*n (#141).
+    if (HleFn fn = Hle::lookup(nid_hash("__ctype_get_mb_cur_max"))) {
+        uint64_t v = fn(0, 0, 0, 0, 0, 0);
+        if (v != 1) { printf("  [FAIL] __ctype_get_mb_cur_max returned %llu, want 1 (the value, not a pointer)\n", (unsigned long long)v); fails++; }
+    } else { printf("  [FAIL] not registered: __ctype_get_mb_cur_max\n"); fails++; }
+
     if (fails) { printf("== FAIL: %d function(s) not registered ==\n", fails); return 1; }
     printf("== PASS: all %zu checked HLE functions registered ==\n", sizeof(names)/sizeof(names[0]) + 1);
     return 0;
