@@ -46,6 +46,9 @@ struct BootResult {
 // Register the stack a guest thread runs on (main thread + workers we spawn), keyed by
 // its pthread id, so GC/thread code gets accurate bounds without pthread_getattr_np.
 void register_thread_stack(uint64_t tid, void* base, uint64_t size);
+// Remove a dead thread's entry. pthread ids are RECYCLED — a stale entry would serve the next
+// thread on the same id the old thread's bounds (#138). Called on every HLE thread-exit path.
+void unregister_thread_stack(uint64_t tid);
 // Arm the PROSPER_HWBP execute breakpoint on the calling (worker) thread (no-op unless
 // PROSPER_HWBP_ALLTHREADS is set). Lets off-main-thread execution of the target be observed.
 void arm_hwbp_this_thread();
