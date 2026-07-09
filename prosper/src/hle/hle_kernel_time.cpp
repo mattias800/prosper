@@ -35,7 +35,6 @@ namespace {
     using clk = std::chrono::steady_clock;
     clk::time_point g_start = clk::now();
     uint64_t ns_now() { return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - g_start).count(); }
-    std::atomic<uint64_t> g_module_handle{1};
 
     // --- Wall-clock anchor (#92). The host real-time clock is sampled ONCE, paired with the
     // monotonic ns_now() at the same instant; every wall-clock surface (CLOCK_REALTIME,
@@ -241,13 +240,19 @@ HLE(k_nanosleep){ if (a0) nanosleep((const struct timespec*)P(a0), a1 ? (struct 
 
 // --- assorted libkernel stubs ---
 HLE(k_ok)              { return 0; }                       // generic success no-op
-// sceKernelLoadStartModule(path, ...): the PRX are pre-linked into our address space, so
-// "loading" resolves the path to its linked module and returns a REAL handle — dlsym then
-// consults that module's own exports first (#147). An unknown path still gets the synthetic
-// success counter (that behavior is #146's scope) so optional plugins don't fail the boot.
+// sceKernelLoadStartModule(path, ...): the PRX are pre-linked into our address space, so "loading"
+// resolves the path to its linked module and returns a REAL handle — dlsym then consults that
+// module's own exports first (#147). A path NOT in the linked set previously got a fake
+// monotonically-increasing success handle while loading nothing (#146): the guest then believed the
+// load succeeded and called exports that resolved to ESRCH fallbacks / the wrong module instead of
+// getting the honest ENOENT. Return SCE_KERNEL_ERROR_ENOENT for a miss so the guest takes its
+// module-not-found path. Both current titles preload every PRX they use, so no real load misses.
 HLE(k_load_start_mod)  {
     if (uint64_t h = module_handle_for_path(a0 ? (const char*)P(a0) : nullptr)) return h;
-    return g_module_handle++;
+    if (getenv("PROSPER_MODLOG"))
+        fprintf(stderr, "[loadmod] '%s' not in the linked module set -> ENOENT\n",
+                a0 ? (const char*)P(a0) : "(null)");
+    return 0x80020002ull;   // SCE_KERNEL_ERROR_ENOENT (a non-preloaded PRX isn't present)
 }
 
 // _exit(status): terminate the process. Previously an unimplemented stub RETURNED 0, so libc's
