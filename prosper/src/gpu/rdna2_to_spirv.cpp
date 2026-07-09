@@ -987,7 +987,10 @@ struct ForwardIf {
 // per-vertex / per-pixel divergent-if the hardware runs. The 64-lane COMPUTE shell must NOT (its VCC is a
 // wave mask needing a wave-uniform reduce — test_recompile_coverage guards this), so it leaves allow_vcc
 // false and vcc branches fall through to straight-line (which rejects them).
-ForwardIf detect_forward_if(const std::vector<Rdna2Inst>& ins, bool allow_vcc) {
+// code/dwords: the raw stream, so a branch target past the first s_endpgm can be decoded and
+// verified to be a genuine early-out (see below) instead of blanket-clamped.
+ForwardIf detect_forward_if(const std::vector<Rdna2Inst>& ins, bool allow_vcc,
+                            const uint32_t* code, size_t dwords) {
     ForwardIf F; const Rdna2Inst* br = nullptr; int nbranch = 0; uint32_t end_pc = UINT32_MAX;
     for (const auto& in : ins) if (in.is_end) { end_pc = in.pc; break; }
     for (const auto& in : ins) {
@@ -1006,11 +1009,27 @@ ForwardIf detect_forward_if(const std::vector<Rdna2Inst>& ins, bool allow_vcc) {
     }
     if (nbranch != 1 || !br) return F;
     uint32_t tgt = branch_target(*br);
-    // Early-out: a forward branch to the instruction AFTER s_endpgm skips the rest of the shader. Clamp the
-    // merge to end_pc so the conditional block is [branch_pc+1, end_pc) (the skipped work) and s_endpgm is
-    // emitted normally after the merge — the exact "if (cond) { work } end" early-out shape.
+    // Early-out: a forward branch PAST s_endpgm skips the rest of the shader — but only if execution
+    // at the target immediately terminates. Decode from tgt and require the first non-s_nop
+    // instruction to be s_endpgm (the compiled early-out shape `s_cbranch L; work; s_endpgm;
+    // L: s_endpgm`). Anything else is REAL reachable code (an else-block) that the old blanket clamp
+    // silently discarded — valid SPIR-V, wrong semantics (#129) — so reject instead (the caller's
+    // straight-line fallback also rejects the branch, loudly). When verified, clamp the merge to
+    // end_pc so the conditional block is [branch_pc+1, end_pc) and s_endpgm is emitted after the merge.
     bool early = false;
-    if (tgt > end_pc && tgt != UINT32_MAX) { tgt = end_pc; early = true; }
+    if (tgt > end_pc && tgt != UINT32_MAX) {
+        if (!code || tgt >= dwords) return F;    // target outside the decode window: can't verify
+        std::vector<Rdna2Inst> tail;
+        rdna2_walk(code + tgt, dwords - tgt, tail);
+        bool ends_immediately = false;
+        for (const auto& ti : tail) {
+            if (ti.is_end) { ends_immediately = true; break; }
+            if (ti.fmt == Rdna2Format::SOPP && ti.opcode == 0x00) continue;   // s_nop padding
+            break;                               // real instruction at the target -> not an early-out
+        }
+        if (!ends_immediately) return F;
+        tgt = end_pc; early = true;
+    }
     if (tgt <= br->pc || tgt > end_pc) return F;                     // must be forward, within the stream
     F.found = true; F.branch_pc = br->pc; F.target_pc = tgt; F.early_out = (early || tgt == end_pc);
     F.on_scc0 = (br->opcode == 0x04 || br->opcode == 0x06);         // scc0/vccz: skip block when flag==0
@@ -1981,7 +2000,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
 bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt,
                bool allow_exec_update, bool allow_smem,
-               const std::function<bool(const Rdna2Inst&)>& exp_fn) {
+               const std::function<bool(const Rdna2Inst&)>& exp_fn,
+               const uint32_t* code = nullptr, size_t dwords = 0) {   // raw stream (forward-if target check)
     const CountedLoop L = detect_counted_loop(ins);
     size_t idx = 0;
     // Cross-lane wave ops (mbcnt) emit LDS + barriers, which are only valid at wave-uniform points — so
@@ -2068,7 +2088,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         }
         // 7. Post-loop body.
         if (!emit_range(L.exit_pc, UINT32_MAX)) return false;
-    } else if (const ForwardIf F = detect_forward_if(ins, /*allow_vcc*/!b.is_compute); F.found) {
+    } else if (const ForwardIf F = detect_forward_if(ins, /*allow_vcc*/!b.is_compute, code, dwords); F.found) {
         // Single structured uniform IF (forward s_cbranch_scc0/scc1): emit as OpSelectionMerge +
         // OpBranchConditional on the SCC bool, with an OpPhi per register written in the conditional
         // block that is live after the merge. Parallels the loop path's phi machinery. CONFIDENCE: MED —
@@ -2129,7 +2149,7 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
     for (uint32_t k = 0; k < num_inputs; k++) rs.vreg[(int)k] = b.load_input(k);
     // Compute kernels have no EXP output; reject if one appears.
     if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/true, /*allow_smem*/true,
-                   [](const Rdna2Inst&){ return false; })) return {};
+                   [](const Rdna2Inst&){ return false; }, code, dwords)) return {};
     auto it = rs.vreg.find((int)out_vgpr);
     uint32_t outbits = it == rs.vreg.end() ? b.uconst(0) : it->second;
     // If EXEC is still narrowed (a v_cmpx with no restore), masked-off lanes keep the output slot's prior
@@ -2152,7 +2172,7 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
     // back-edge + exit, and the forward-if branch) as handled, so coverage matches what actually recompiles
     // (previously the MSAA-resolve loop shaders 031-034 were mis-flagged "blocked" at their s_cbranch_scc0).
     const CountedLoop cL = detect_counted_loop(ins);
-    const ForwardIf   cF = detect_forward_if(ins, /*allow_vcc*/false);   // conservative diagnostic (compute-safe)
+    const ForwardIf   cF = detect_forward_if(ins, /*allow_vcc*/false, code, dwords);   // conservative diagnostic (compute-safe)
     auto cf_reconstructed = [&](const Rdna2Inst& i) {
         if (cL.found && (i.pc == cL.backedge_pc || i.pc == cL.exit_branch_pc)) return true;
         if (cF.found && i.pc == cF.branch_pc) return true;
@@ -2236,7 +2256,7 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords, co
     // cmpx is now ALLOWED (allow_exec_update=true): a fragment divergent-if (v_cmpx ... s_mov exec,saved)
     // is handled by EXEC predication like compute, and the export is guarded above. Memory ops need a
     // resource table. Loops (if any) are reconstructed by emit_body.
-    if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/true, /*allow_smem*/rt != nullptr, exp_fn)) return {};
+    if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/true, /*allow_smem*/rt != nullptr, exp_fn, code, dwords)) return {};
     if (!exported) return {};
     return b.finish();
 }
@@ -2270,7 +2290,7 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords, cons
         }
         return true;
     };
-    if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/false, /*allow_smem*/rt != nullptr, exp_fn)) return {};
+    if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/false, /*allow_smem*/rt != nullptr, exp_fn, code, dwords)) return {};
     if (!exported) return {};
     return b.finish();
 }
