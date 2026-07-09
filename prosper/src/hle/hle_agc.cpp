@@ -22,6 +22,7 @@
 #include <unordered_set>
 #include <vector>
 #include <mutex>
+#include <atomic>
 
 namespace prosper {
 
@@ -523,14 +524,25 @@ static_assert(offsetof(AgcShaderSpecialRegs, vgt_gs_out_prim_type) == 0x20, "spe
 
 // sceAgcGetDataPacketPayloadAddress (V++UgBtQhn0) — called from INSIDE eboot's static AGC code
 // (register-bank prepare, eboot+0x3af040 path, callsite +0x3af170): resolve a data packet built in
-// the Dcb to its payload address, which becomes the register bank. Kyty: *addr = cmd + 2 (2-dword
-// packet header), type must be 1. We accept other types with a log instead of aborting.
+// the Dcb to its payload address, which becomes the register bank the guest reads/writes through.
+// Kyty only reverse-engineered the TYPE-1 data packet: payload at cmd+2 (a 2-dword header). This
+// title also builds TYPE-0 data packets whose header size / payload offset were NEVER RE'd, so
+// cmd+2 is a best-effort guess for them — a wrong offset makes the returned bank alias the wrong
+// dwords and silently corrupts the register set (#140). Until the type-0 header is confirmed (RE the
+// eboot packet builder), surface any non-type-1 packet LOUDLY — once per type, UNCONDITIONALLY (not
+// GFXLOG-gated as before) — while keeping the cmd+2 best-effort so the register-bank prepare still
+// gets a usable pointer (erroring here would fail the eboot's static AGC init).
 HLE(agc_get_data_packet_payload) {  // (uint32_t** addr, uint32_t* cmd, int type)
     auto** addr = (uint32_t**)(uintptr_t)a0;
     auto*  cmd  = (uint32_t*)(uintptr_t)a1;
     if (!addr || !cmd) return kAgcErrInvalidArg;
-    if (a2 != 1 && getenv("PROSPER_GFXLOG"))
-        fprintf(stderr, "[agc] GetDataPacketPayloadAddress: unexpected type=%d\n", (int)a2);
+    if (a2 != 1) {
+        static std::atomic<uint32_t> logged_mask{0};
+        uint32_t bit = ((int)a2 >= 0 && (int)a2 < 31) ? (1u << (uint32_t)a2) : (1u << 31);
+        if (!(logged_mask.fetch_or(bit, std::memory_order_relaxed) & bit))
+            fprintf(stderr, "[agc] GetDataPacketPayloadAddress: UNCONFIRMED packet type=%d — payload "
+                    "offset assumed cmd+2 (only type-1 is RE'd; type-0 header unknown, #140)\n", (int)a2);
+    }
     *addr = cmd + 2;
     return 0;
 }
