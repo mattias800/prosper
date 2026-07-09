@@ -42,9 +42,13 @@ bool link_program(const std::vector<LinkInput>& inputs, uint64_t stub_base,
     for (size_t i = 0; i < out.mods.size(); i++) {
         const Module& m = *out.mods[i];
         uint64_t base = out.imgs[i].base;
+        Program::ModuleExports me; me.path = m.path;
         for (auto& s : m.symbols)
-            if (!s.is_import && !s.nid.empty() && s.value != 0)
+            if (!s.is_import && !s.nid.empty() && s.value != 0) {
                 exports.emplace(s.nid, base + s.value);
+                me.nids.emplace(s.nid, base + s.value);   // per-module view for handle-first dlsym (#147)
+            }
+        out.mod_exports.push_back(std::move(me));
     }
 
     // --- Pass 2: resolve every import. Cross-module export beats a stub slot. ---

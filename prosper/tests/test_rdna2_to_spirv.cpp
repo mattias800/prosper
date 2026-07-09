@@ -1333,6 +1333,41 @@ int main() {
     CHECK(gotS1.size()==N && badS1==0, "v_cvt_u32_f32 saturates (NaN/neg -> 0, >=2^32 -> UINT_MAX)");
     CHECK(gotS2.size()==N && badS2==0, "v_cvt_i32_f32 saturates (NaN -> 0, clamps to INT_MIN/INT_MAX)");
 
+    // Kernels X1..X3: SPECIAL operands read as ALU DATA (#134). VCC/EXEC live as per-lane bools in
+    // the per-invocation model (their 32-bit wave-mask value doesn't exist) and M0 isn't modeled —
+    // such reads previously computed with a silent 0; they must now REJECT. SGPR_NULL (field 125)
+    // is the one Special whose data value IS 0, and must keep recompiling. llvm-mc gfx1030 verified.
+    const uint32_t codeX1[] = { 0x4A02007Eu, 0xBF810000u };   // v_add_nc_u32 v1, exec_lo, v0
+    const uint32_t codeX2[] = { 0x4A02007Cu, 0xBF810000u };   // v_add_nc_u32 v1, m0, v0
+    const uint32_t codeX3[] = { 0x4A02007Du, 0xBF810000u };   // v_add_nc_u32 v1, null, v0
+    CHECK(recompile_valu(codeX1, 2, 1, 1).empty(), "kernel X1 (exec_lo read as ALU data) is REJECTED");
+    CHECK(recompile_valu(codeX2, 2, 1, 1).empty(), "kernel X2 (m0 read as ALU data) is REJECTED");
+    std::vector<uint32_t> spvX3 = recompile_valu(codeX3, 2, 1, /*out_vgpr*/1);
+    CHECK(!spvX3.empty(), "kernel X3 (null read as ALU data) still recompiles (null == 0)");
+    std::vector<float> inX(N);
+    for (uint32_t i = 0; i < N; i++) inX[i] = (float)i;
+    std::vector<float> gotX3 = prosper::test::run_compute(spvX3, inX, N, N);
+    uint32_t badX = 0;
+    for (uint32_t i = 0; i < N && gotX3.size() == N; i++) if (gotX3[i] != inX[i]) badX++;
+    printf("  kernelX3(null+v0) mismatches=%u (out[9]=%g expect %g)\n", badX,
+           gotX3.size()==N?gotX3[9]:-1, inX[9]);
+    CHECK(gotX3.size()==N && badX==0, "kernel X3 computes null(0) + a0 = a0");
+
+    // Kernel X4: VCC as plain scalar SCRATCH (the NGG-preamble pattern: a scalar write to vcc_lo
+    // then a data read of it). s_mov_b32 vcc_lo, 5 ; v_add_nc_u32 v1, vcc_lo, v0 => out = a0 + 5.
+    // The tracked write must be read back (not 0, not rejected).
+    const uint32_t codeX4[] = { 0xBEEA0385u, 0x4A02006Au, 0xBF810000u };
+    std::vector<uint32_t> spvX4 = recompile_valu(codeX4, 3, 1, /*out_vgpr*/1);
+    CHECK(!spvX4.empty(), "kernel X4 (scalar-written vcc_lo read as data) recompiles");
+    std::vector<float> gotX4 = prosper::test::run_compute(spvX4, inX, N, N);
+    uint32_t badX4 = 0;   // integer add on raw VGPR bits: out bits = bits(a0) + 5
+    for (uint32_t i = 0; i < N && gotX4.size() == N; i++) {
+        uint32_t gb; std::memcpy(&gb, &gotX4[i], 4);
+        if (gb != bits_of(inX[i]) + 5u) badX4++;
+    }
+    printf("  kernelX4(vcc scratch) mismatches=%u\n", badX4);
+    CHECK(gotX4.size()==N && badX4==0, "kernel X4 computes bits(a0) + vcc_lo(5) via the tracked scalar write");
+
     // Kernel O: VOP2 v_mul_f32 in SDWA form with OMOD ×2 output modifier. This was a #121 blocker —
     // PPSA02664's pixel shaders emit `v_mul_f32 v,v,v mul:2` (full-DWORD selects, omod=×2), which the
     // decoder rejected as an unhandled modifier, failing the whole PS. Now the ×2 is applied.

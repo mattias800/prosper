@@ -3,6 +3,7 @@
 #include "../src/gpu/shader_resources.hpp"
 #include <cstdint>
 #include <cstdio>
+#include <unordered_map>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -80,6 +81,27 @@ bool has_opcode(const std::vector<uint32_t>& spv, uint32_t opcode) {
         i += wc;
     }
     return false;
+}
+
+// The largest OpTypeArray length (resolved through its OpConstant) in the module — for LDS sizing
+// (#130), the Workgroup LDS array is the biggest array the compute shell declares.
+uint32_t max_array_length(const std::vector<uint32_t>& spv) {
+    enum : uint32_t { OpTypeArrayL = 28, OpConstantL = 43 };
+    if (spv.size() < 5) return 0;
+    std::unordered_map<uint32_t, uint32_t> const_val;   // result id -> u32 constant value
+    uint32_t best = 0;
+    for (size_t i = 5; i < spv.size();) {
+        uint32_t word = spv[i];
+        uint32_t op = word & 0xffffu, wc = word >> 16u;
+        if (wc == 0 || i + wc > spv.size()) break;
+        if (op == OpConstantL && wc >= 4) const_val[spv[i + 2]] = spv[i + 3];   // {type,result,value}
+        if (op == OpTypeArrayL && wc >= 4) {                                    // {result,elem,length-id}
+            auto it = const_val.find(spv[i + 3]);
+            if (it != const_val.end() && it->second > best) best = it->second;
+        }
+        i += wc;
+    }
+    return best;
 }
 
 } // namespace
@@ -211,6 +233,39 @@ int main() {
         return 1;
     }
     printf("  [ok]   fragment image_sample still uses OpImageSampleImplicitLod\n");
+
+    // LDS array is sized from the shader's real allocation (#130), not a hardcoded 16 KB. A compute
+    // kernel that uses ds_write/ds_read declares a Workgroup array; its length must be 4096 dwords
+    // (16 KB) by default and rise to the requested size (clamped to the RDNA2 64 KB / 16384-dword max)
+    // when lds_bytes is plumbed. code32 = lane i writes lds[i], barrier, reads lds[63-i].
+    const uint32_t code_lds[] = {
+        0x7e020f00u, 0x34040282u, 0x34060281u, 0x4a060681u, 0xd8340000u, 0x00000302u, 0xbf8a0000u,
+        0x4c0a02bfu, 0x340c0a82u, 0xd8d80000u, 0x07000006u, 0x7e000d07u, 0xbf810000u,
+    };
+    const size_t n_lds = sizeof(code_lds)/sizeof(code_lds[0]);
+    std::vector<uint32_t> lds_def = recompile_valu(code_lds, n_lds, 1, 0, nullptr);
+    std::vector<uint32_t> lds_32k = recompile_valu(code_lds, n_lds, 1, 0, nullptr, 32 * 1024);
+    std::vector<uint32_t> lds_big = recompile_valu(code_lds, n_lds, 1, 0, nullptr, 128 * 1024);   // > 64 KB
+    if (lds_def.empty() || lds_32k.empty() || lds_big.empty()) {
+        printf("  [FAIL] LDS kernel did not recompile\n");
+        return 1;
+    }
+    if (max_array_length(lds_def) != 4096u) {
+        printf("  [FAIL] default LDS array length = %u dwords, want 4096 (16 KB)\n", max_array_length(lds_def));
+        return 1;
+    }
+    printf("  [ok]   default LDS array is 4096 dwords (16 KB)\n");
+    if (max_array_length(lds_32k) != 8192u) {
+        printf("  [FAIL] lds_bytes=32K -> array length = %u dwords, want 8192\n", max_array_length(lds_32k));
+        return 1;
+    }
+    printf("  [ok]   lds_bytes=32 KB -> 8192-dword LDS array\n");
+    if (max_array_length(lds_big) != 16384u) {
+        printf("  [FAIL] lds_bytes=128K -> array length = %u dwords, want 16384 (clamped to 64 KB)\n",
+               max_array_length(lds_big));
+        return 1;
+    }
+    printf("  [ok]   lds_bytes>64 KB clamps to the RDNA2 max (16384 dwords)\n");
 
     printf("== PASS ==\n");
     return 0;

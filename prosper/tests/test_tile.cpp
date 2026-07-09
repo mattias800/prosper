@@ -91,6 +91,64 @@ int main() {
         CHECK(perm, "SW_4KB_S tiling is a bijective permutation (no texel dropped or duplicated)");
     }
 
+    // --- Per-bpp geometry (#119): a 4KB tile is a FIXED 4096 bytes, so its texel dims depend on
+    // bytes_per_texel (1 B -> 64x64, 2 B -> 64x32, 4 B -> 32x32). The old code hardcoded 4 B.
+    {
+        const uint32_t M = (uint32_t)TileMode::Sw4KbS;
+        CHECK(tiled_surface_bytes(1920, 1080, M) == (size_t)60 * 34 * 4096,
+              "32-bpp tile geometry unchanged (1920x1080 -> 60x34 tiles)");
+        CHECK(tiled_surface_bytes(100, 100, M, 0, 1) == (size_t)2 * 2 * 4096,
+              "8-bpp: 100x100 -> 2x2 tiles of 64x64 (NOT the 32-bpp 4x4)");
+        CHECK(tiled_surface_bytes(100, 100, M, 0, 2) == (size_t)2 * 4 * 4096,
+              "16-bpp: 100x100 -> 2x4 tiles of 64x32");
+        CHECK(tiled_elements_bytes(20, 20, 16, M) == (size_t)2 * 2 * 4096,
+              "16-byte elements (BC3 blocks): 20x20 -> 2x2 tiles of 16x16 (unchanged)");
+        CHECK(tiled_elements_bytes(40, 20, 8, M) == (size_t)2 * 2 * 4096,
+              "8-byte elements (BC1 blocks): 40x20 -> 2x2 tiles of 32x16 (was square-approximated)");
+    }
+
+    // Round-trip identity per element size (the shared indexer makes tile/detile exact inverses;
+    // this proves the per-bpp geometry is self-consistent incl. non-square 64x32 / 32x16 tiles).
+    {
+        const uint32_t M = (uint32_t)TileMode::Sw4KbS;
+        auto rt_bpe = [&](uint32_t w, uint32_t h, uint32_t bpe) -> bool {
+            std::vector<uint8_t> ref((size_t)w * h * bpe);
+            for (size_t i = 0; i < ref.size(); i++) ref[i] = (uint8_t)((i * 2654435761u) >> 13);
+            std::vector<uint8_t> tiled(tiled_surface_bytes(w, h, M, 0, bpe), 0);
+            tile_surface(tiled.data(), ref.data(), w, h, M, 0, bpe);
+            std::vector<uint8_t> back((size_t)w * h * bpe, 0);
+            detile_surface(back.data(), tiled.data(), w, h, M, 0, bpe);
+            return back == ref;
+        };
+        CHECK(rt_bpe(200, 130, 1), "round-trip 200x130 @ 1 B/texel (64x64 tiles, unaligned dims)");
+        CHECK(rt_bpe(130, 70, 2),  "round-trip 130x70 @ 2 B/texel (64x32 tiles)");
+        CHECK(rt_bpe(96, 64, 4),   "round-trip 96x64 @ 4 B/texel (explicit-bpt path == default)");
+        CHECK(rt_bpe(70, 40, 8),   "round-trip 70x40 @ 8 B/elem (32x16 tiles)");
+        CHECK(rt_bpe(40, 40, 16),  "round-trip 40x40 @ 16 B/elem (16x16 tiles)");
+    }
+
+    // Golden positions: the 32-bpp order must be BYTE-IDENTICAL to the shipped, pixel-verified
+    // layout (y0 in the low Morton bit: (0,1) -> element 1, (1,0) -> element 2), and the 8-bpp
+    // cross-tile step must be one whole 4KB tile.
+    {
+        const uint32_t M = (uint32_t)TileMode::Sw4KbS;
+        std::vector<uint8_t> lin32((size_t)64 * 32 * 4, 0);
+        for (uint32_t y = 0; y < 32; y++) for (uint32_t x = 0; x < 64; x++)
+            lin32[((size_t)y * 64 + x) * 4] = (uint8_t)(x ^ (y << 4) ^ 0x5A);
+        std::vector<uint8_t> t32(tiled_surface_bytes(64, 32, M), 0);
+        tile_surface(t32.data(), lin32.data(), 64, 32, M);
+        CHECK(t32[1 * 4] == lin32[((size_t)1 * 64 + 0) * 4], "32-bpp golden: texel (0,1) at element 1 (y0 low)");
+        CHECK(t32[2 * 4] == lin32[((size_t)0 * 64 + 1) * 4], "32-bpp golden: texel (1,0) at element 2");
+        CHECK(t32[4096]  == lin32[((size_t)0 * 64 + 32) * 4], "32-bpp golden: texel (32,0) starts tile 1 (byte 4096)");
+
+        std::vector<uint8_t> lin8((size_t)128 * 64, 0);
+        for (size_t i = 0; i < lin8.size(); i++) lin8[i] = (uint8_t)(i * 31 + 7);
+        std::vector<uint8_t> t8(tiled_surface_bytes(128, 64, M, 0, 1), 0);
+        tile_surface(t8.data(), lin8.data(), 128, 64, M, 0, 1);
+        CHECK(t8[1] == lin8[(size_t)1 * 128 + 0], "8-bpp golden: texel (0,1) at element 1 (same Morton order)");
+        CHECK(t8[4096] == lin8[(size_t)0 * 128 + 64], "8-bpp golden: texel (64,0) starts tile 1 (byte 4096, 64-wide tile)");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

@@ -70,10 +70,13 @@ HostPadState snapshot(int /*handle*/, const char* what) {
 } // namespace
 
 // scePadInit / scePadClose / effector no-ops -> OK.
-HLE(pad_ok) { return 0; }
+HLE(pad_ok) { if (padlog()) fprintf(stderr, "[pad] init/ok call\n"); return 0; }
 
 // scePadOpen(userId, type, index, param) -> positive handle.
-HLE(pad_open) { return (uint64_t)g_pad_handle.fetch_add(1); }
+HLE(pad_open) { int h = g_pad_handle.fetch_add(1);
+    if (padlog()) fprintf(stderr, "[pad] OPEN userId=%llu type=%llu index=%llu -> handle=%d\n",
+                          (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2, h);
+    return (uint64_t)h; }
 
 // scePadGetHandle(userId, type, index) -> handle (games that opened once may re-query it).
 HLE(pad_get_handle) { return 1; }
