@@ -23,7 +23,12 @@ enum : uint32_t {
     R_DRAW_INDEX = 0x03, R_DRAW_INDEX_AUTO = 0x04, R_DRAW_RESET = 0x05, R_WAIT_FLIP_DONE = 0x06,
     R_SH_REGS_INDIRECT = 0x11, R_CX_REGS_INDIRECT = 0x12, R_UC_REGS_INDIRECT = 0x13,
     R_ACQUIRE_MEM = 0x14, R_WRITE_DATA = 0x15, R_WAIT_MEM_64 = 0x16, R_FLIP = 0x17,
-    R_RELEASE_MEM = 0x18, R_DISPATCH_DIRECT = 0x1a, R_NUM = 0x40,
+    R_RELEASE_MEM = 0x18, R_DISPATCH_DIRECT = 0x1a,
+    // Gen5 indexed-draw state + draw (issue #232, DOLL/UE4 geometry path). These three builders
+    // (sceAgcDcbSetIndexBuffer / SetIndexCount / DrawIndexOffset) are the ONLY draw path UE4 uses;
+    // they were unimplemented->0 (no packet appended) so every scene draw was silently dropped.
+    R_INDEX_BASE = 0x1b, R_INDEX_COUNT = 0x1c, R_DRAW_INDEX_OFFSET = 0x1d,
+    R_NUM = 0x40,
 };
 
 // The register set a Set*RegistersIndirect packet targets.
@@ -36,7 +41,7 @@ struct Pm4Command {
     enum class Kind {
         DrawReset, WaitFlipDone, SetShRegDirect, SetRegsIndirect, SetIndexType,
         DrawIndex, DrawIndexAuto, EventWrite, AcquireMem, WriteData, WaitRegMem, Flip, ReleaseMem,
-        DispatchDirect, Unknown,
+        DispatchDirect, SetIndexBase, SetIndexCount, DrawIndexOffset, Unknown,
     } kind = Kind::Unknown;
 
     uint32_t        header = 0;
@@ -69,6 +74,13 @@ struct Pm4Command {
     uint64_t di_index_addr = 0;          // DrawIndex: guest address of the index buffer
     uint64_t di_modifier = 0;            // DrawIndex: raw 64-bit draw-modifier bits
     bool     di_valid = false;           // DrawIndex: payload was long enough to carry addr+modifier
+
+    // Gen5 indexed-draw state (issue #232). SetIndexBase: [0..1]=index buffer addr lo/hi.
+    // SetIndexCount: [0]=index count. DrawIndexOffset: [0]=start-index offset, [1]=draw index count
+    // (0 => use the SetIndexCount state). These carry no register state; GpuState::apply threads the
+    // bound base+count through to the emitted draw.
+    uint64_t ib_addr = 0;                // SetIndexBase: index buffer guest address
+    uint32_t index_offset = 0;           // DrawIndexOffset: first index (start location)
     uint32_t event_type = 0;             // EventWrite
     uint64_t event_addr = 0;             // EventWrite: destination address (0 = address-less sync event) (#132)
     uint32_t sh_reg_offset = 0, sh_reg_value = 0;  // SetShRegDirect (sh_reg_value = first value)

@@ -117,6 +117,24 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
                     if (npl >= 3) { c.tg_x = pl[0]; c.tg_y = pl[1]; c.tg_z = pl[2]; }
                     if (npl >= 5) c.dispatch_modifier = (uint64_t)pl[3] | ((uint64_t)pl[4] << 32);
                     break;
+                case R_INDEX_BASE:
+                    // sceAgcDcbSetIndexBuffer -> bind the index buffer base address. payload: [0..1]=addr.
+                    c.kind = K::SetIndexBase;
+                    if (npl >= 2) c.ib_addr = lo_hi(pl);
+                    break;
+                case R_INDEX_COUNT:
+                    // sceAgcDcbSetIndexCount -> set the bound index count. payload: [0]=count.
+                    c.kind = K::SetIndexCount;
+                    if (npl >= 1) c.index_count = pl[0];
+                    break;
+                case R_DRAW_INDEX_OFFSET:
+                    // sceAgcDcbDrawIndexOffset -> indexed draw from a start offset using the bound
+                    // index base + count. payload: [0]=start-index offset, [1]=explicit index count
+                    // (0 => use the SetIndexCount state, threaded in by GpuState::apply).
+                    c.kind = K::DrawIndexOffset;
+                    if (npl >= 1) c.index_offset = pl[0];
+                    if (npl >= 2) c.index_count  = pl[1];
+                    break;
                 case R_CX_REGS_INDIRECT:
                 case R_SH_REGS_INDIRECT:
                 case R_UC_REGS_INDIRECT:

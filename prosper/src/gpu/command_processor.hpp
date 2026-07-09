@@ -24,6 +24,11 @@ struct ShaderReg { uint32_t offset; uint32_t value; };
 struct GpuState {
     std::unordered_map<uint32_t, uint32_t> cx, sh, uc;   // register files by offset
     uint32_t index_type = 0;                             // last SetIndexType
+    // Gen5 indexed-draw binding state (issue #232, DOLL/UE4 geometry). SetIndexBuffer/SetIndexCount
+    // set these; DrawIndexOffset consumes them to emit an indexed Draw. Persist across draws within a
+    // submit (as on hardware) until re-set.
+    uint64_t index_base = 0;                             // last SetIndexBuffer address
+    uint32_t index_num  = 0;                             // last SetIndexCount
     // A draw + the register state AT THE DRAW. A submit changes shaders/mask/blend between its draws,
     // so the state a draw actually uses is the register values when its packet executes — NOT the
     // end-of-submit fold. `state` is a snapshot captured at the draw (shared between consecutive draws

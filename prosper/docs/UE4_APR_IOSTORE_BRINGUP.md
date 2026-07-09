@@ -1105,3 +1105,38 @@ Verification: ctest **63/63**; services RE'd from PS5 stub tables + guest disasm
 save flow verified end-to-end via PROSPER_SVCLOG + on-disk save files. Probes added:
 run232svc.sh, mount232.{gdb,sh}, soak232.sh, state232.py, runstate232.sh, gates232.py. New knob
 PROSPER_SVCLOG=1 (arg + page-guarded hexdump of the service family). Messenger smoke: see PR.
+
+### SOLVED (2026-07-10, issue #232): DOLL's scene geometry was dropped at THREE unimplemented Gen5 AGC draw builders — implementing them makes DOLL render its first scene geometry (up to 94 draws/submit; frames present)
+
+**The 6-session "the game never emits geometry / 0 DrawIndex" wall was a MISDIAGNOSIS.** DOLL's UE4 RHI
+submits ALL scene geometry through the Gen5 indexed-draw builder trio, every one of which was an
+`unimplemented -> 0` stub that appended **no packet** — so every draw was silently dropped *inside the
+HLE boundary*, before it ever reached the PM4 stream the histogram counts. That is why the histogram
+showed 0 DrawIndex despite the game running deep: the draws were destroyed one call below where anyone
+was looking. The trio (NIDs verified against `../PS5-3.20_Libs`; live-call counts via `dump_call_log`):
+
+- **`l4fM9K-Lyks` = sceAgcDcbSetIndexBuffer** — 5.46M calls/run
+- **`8N2tmT3jmC8` = sceAgcDcbSetIndexCount** — 5.46M calls/run
+- **`B+aG9DUnTKA` = sceAgcDcbDrawIndexOffset** — 5.46M calls/run
+
+**ABI RE'd from live capture (`PROSPER_GFXLOG` dumps a0..a3):**
+`setIndexBuffer(dcb, indexAddr=0x201d7c0000)`; `setIndexCount(dcb, 0xc350=50000)` (the index-buffer
+CAPACITY, not the per-draw count); `drawIndexOffset(dcb, startIndex, indexCount, modifier=0x40000000)`
+— the per-draw index count is arg2 (observed 3, 6, 0x24, 0xfa8, 0x2490, …), the start offset arg1.
+
+**Fix (correctness-first, CONFIDENCE MED on arg roles):** three new PM4 sub-ops (R_INDEX_BASE 0x1b /
+R_INDEX_COUNT 0x1c / R_DRAW_INDEX_OFFSET 0x1d, hle_agc.cpp), decoded (pm4_decode) into new Kinds
+`SetIndexBase`/`SetIndexCount`/`DrawIndexOffset`, and threaded through `GpuState` (new `index_base` /
+`index_num`) so DrawIndexOffset emits an indexed `Draw` (index_addr = base + offset·elemsize,
+index_count = arg2 or the bound count). Index element size comes from the existing SetIndexType snapshot.
+
+**Result (DOLL, live): first scene geometry renders.** 977+ DrawIndexOffset packets/steady-state,
+**up to 94 indexed draws per submit**, and with `PROSPER_RENDER=1` the executor resolves DOLL's real
+dynamic vertex-fetch descriptors (base=0x200a070000, **stride=40, num_records=50000** — real UE4 scene
+vertex streams) and **presents frames** before the synchronous-llvmpipe/GC stop-the-world tension ends
+the run (the documented render-vs-runtime cost, not a new bug). Some DOLL shaders still fail recompile
+(`skip draw: recompile failed`, unsupported RDNA2 ops) — that is the recompiler frontier, downstream of
+this fix, and is the next wall. **Messenger UNREGRESSED** (mandatory — shared GPU code): reaches its
+real scene (vcount=1044, 643×), 1015 frames presented, **0 faults**, 0 DrawIndexOffset (never uses the
+new path — the change is purely additive for it). ctest **63/63**. Probes added: flow232{,b,c}.py,
+thr232.py, frame232.sh, findstr232.sh, rostr2.sh, got232.sh, call232.sh, xref232.sh, smoke_msg232.sh.
