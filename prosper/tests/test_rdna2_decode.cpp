@@ -158,6 +158,23 @@ int main() {
     CHECK(decode_src_field(193).kind == OperandKind::InlineInt && decode_src_field(193).value == -1, "field 193 -> int -1");
     CHECK(decode_src_field(242).kind == OperandKind::InlineFloat && inline_float_value(242) == 1.0f, "field 242 -> float 1.0");
 
+    // SMEM SOFFSET + signed immediate (#149). Encodings from llvm-mc gfx1030.
+    //   imm:  s_buffer_load_dword s0, s[4:7], 0x10 -> SOFFSET=NULL(125), offset 0x10
+    //   reg:  s_buffer_load_dword s0, s[4:7], s8   -> SOFFSET=SGPR s8, offset 0
+    const uint32_t smem_imm[] = { 0xf4200002u, 0xfa000010u };
+    Rdna2Inst si = rdna2_decode_one(smem_imm, 2);
+    CHECK(si.fmt == Rdna2Format::SMEM && si.n_src == 2 && si.literal == 0x10u &&
+          si.src[1].kind == OperandKind::Special && si.src[1].value == 125,
+          "SMEM immediate: offset 0x10, SOFFSET decodes to NULL(125)");
+    const uint32_t smem_reg[] = { 0xf4200002u, 0x10000000u };
+    Rdna2Inst sr = rdna2_decode_one(smem_reg, 2);
+    CHECK(sr.fmt == Rdna2Format::SMEM && sr.literal == 0u && isS(sr.src[1], 8),
+          "SMEM register offset: SOFFSET decodes to SGPR s8 (was silently dropped)");
+    // Signed 21-bit immediate: a raw 0x1FFFF8 sign-extends to -8 (offset = -8 bytes).
+    const uint32_t smem_neg[] = { 0xf4000002u, 0xfa1ffff8u };
+    Rdna2Inst sn = rdna2_decode_one(smem_neg, 2);
+    CHECK((int32_t)sn.literal == -8, "SMEM 21-bit immediate is sign-extended (0x1ffff8 -> -8)");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
