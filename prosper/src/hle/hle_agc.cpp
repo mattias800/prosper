@@ -646,6 +646,77 @@ extern "C" void prosper_agc_submit_stats(uint64_t* submits, uint64_t* draws) {
     if (draws)   *draws   = (uint64_t)agc_gpu_state().draws.size();
 }
 
+// Fold one raw Dcb dword stream through the CommandProcessor, fire the GPU EOP completion events, and
+// (if a live renderer is wired and the submit produced draws) execute+present. Shared by the primary
+// submit path (sceAgcDriverSubmitDcb) and the DOLL warmup-submit variant (w1KFAHVqpaU) below.
+// `dw_num == 0` means "length unknown" — decode_pm4 self-terminates at the first non-type-3 dword, and
+// we cap the walk at kUnknownCap dwords as a runaway guard (a bounded ring can't legitimately exceed it).
+static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const char* who) {
+    if (!addr) return 0;
+    constexpr uint32_t kUnknownCap = 0x80000;   // 512 KiB of dwords — well past any real Dcb
+    uint32_t walk = dw_num ? dw_num : kUnknownCap;
+    agc_gpu_state().draws.clear();
+    size_t applied = gpu::run_command_buffer(addr, walk, agc_gpu_state());
+    g_submit_count++;
+    prosper_eq_trigger_eop();
+    static const unsigned render_every2 = [] {
+        const char* e = getenv("PROSPER_RENDER_EVERY"); long v = e ? atol(e) : 1; return v > 0 ? (unsigned)v : 1u; }();
+    static unsigned draw_submits2 = 0;
+    if (gpu::have_submit_renderer() && !agc_gpu_state().draws.empty() && (draw_submits2++ % render_every2) == 0) {
+        uint32_t w = gpu::present_width(), h = gpu::present_height();
+        static const uint32_t scale = [] {
+            const char* e = getenv("PROSPER_RENDER_SCALE"); long v = e ? atol(e) : 1; return v > 0 ? (uint32_t)v : 1u; }();
+        if (scale > 1) { w = (w / scale) & ~1u; h = (h / scale) & ~1u; if (!w) w = 2; if (!h) h = 2; }
+        gpu::execute_and_present(agc_gpu_state(), w, h);
+    }
+    if (getenv("PROSPER_GFXLOG"))
+        fprintf(stderr, "[agc] %s #%llu: %u dwords (walk=%u) -> %zu packets applied (draws: %zu, dispatches: %llu)\n",
+                who, (unsigned long long)g_submit_count, dw_num, walk, applied,
+                agc_gpu_state().draws.size(), (unsigned long long)agc_gpu_state().dispatch_count);
+    return 0;
+}
+
+// sceAgc submit variant (NID w1KFAHVqpaU) — DOLL's UE4 RHI submits its per-frame command buffers
+// through TWO driver entry points: intermediate buffers via sceAgcDriverSubmitDcb (UglJIZjGssM,
+// folded above) and the FINAL buffer of a SubmitCommandBuffers batch through THIS one (the guest's
+// SubmitCommandBuffers impl at eboot+0x220a9a0 loops the buffer array, calling the indirect submit for
+// buffers [0..n-2] and w1KFAHVqpaU for buffer n-1). Left unimplemented, the final buffer's GPU EOP
+// fences (ReleaseMem writes) never executed, so the label the RenderThread polls (eboot+0x221d6c2,
+// FRenderCommandFence/RHI frame-sync) stayed 0 forever and the GameThread timed out — the #232 wall.
+//
+// ABI (RE'd from the compiler-generated adapter thunk at eboot+0x58df3f0, which marshals DOLL's
+// internal call at eboot+0x220aace into the Sony import): the raw Dcb dword-stream address arrives as
+// stack arg8, which the guest-%fs swap stub forwards to fp[3] (the same slot ReleaseMem/WaitRegMem read
+// their 8th arg from). The dword count (arg9) is beyond the 2-arg forward window, so we fold with an
+// unknown length — decode_pm4 self-terminates at the first non-type-3 header. We validate that fp[3]
+// points at a real PM4 type-3 stream before folding, and if it doesn't, scan a0..a5 as a fallback;
+// anything that fails to validate is refused (no fold, logged once) rather than folding garbage.
+// CONFIDENCE: MED — the buffer address slot is pinned by the adapter disassembly + the missing-fence
+// symptom; the unknown-length fold relies on decode_pm4's type-3 termination (verified: the warmup
+// buffer is contiguous builder-emitted packets). Proven by the RenderThread advancing once folded.
+HLE(agc_driver_submit_dcb_variant) {
+    auto is_pm4 = [](uint64_t p) -> bool {
+        if (p < 0x10000 || (p & 3)) return false;
+        uint32_t h = *(const volatile uint32_t*)(uintptr_t)p;
+        return (h & 0xC0000000u) == 0xC0000000u;
+    };
+    volatile uint64_t* fp = (uint64_t*)__builtin_frame_address(0);
+    uint64_t cand = fp[3];                                  // arg8 = the Dcb stream address (adapter ABI)
+    if (!is_pm4(cand)) {                                    // fallback: scan the register args
+        const uint64_t regs[6] = { a0, a1, a2, a3, a4, a5 };
+        cand = 0;
+        for (uint64_t r : regs) if (is_pm4(r)) { cand = r; break; }
+    }
+    if (!cand) {
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) < 4)
+            fprintf(stderr, "[agc] w1KFAHVqpaU: no PM4 stream found (fp[3]=0x%llx a0=0x%llx a1=0x%llx) — submit refused\n",
+                    (unsigned long long)fp[3], (unsigned long long)a0, (unsigned long long)a1);
+        return 0;
+    }
+    return submit_dcb_stream((const uint32_t*)(uintptr_t)cand, 0, "SubmitDcbFinal");
+}
+
 HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     struct Packet { uint32_t* addr; uint32_t dw_num; uint8_t pad[4]; };
     const auto* p = (const Packet*)(uintptr_t)a0;
@@ -816,6 +887,7 @@ void register_agc_hle() {
     RN("WmAc2MEj6Io", agc_dcb_dma_data);        // sceAgcDcbDmaData — append DMA_DATA packet (#117)
     RN("YUeqkyT7mEQ", agc_dcb_set_flip);        // sceAgcDcbSetFlip (Kyty LibGraphicsDriver.cpp:98)
     RN("UglJIZjGssM", agc_driver_submit_dcb);   // sceAgcDriverSubmitDcb -> CommandProcessor replay
+    RN("w1KFAHVqpaU", agc_driver_submit_dcb_variant);  // final-buffer submit variant (#232, DOLL RHI batch)
     #undef RN
 }
 

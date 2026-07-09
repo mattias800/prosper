@@ -17,7 +17,7 @@ while kill -0 $PID 2>/dev/null; do
   if [ "$el" -ge 240 ]; then echo giveup; break; fi
 done
 kill -0 $PID 2>/dev/null || { echo DIED; tail -20 /root/d232f.log; exit 1; }
-gdb -p $PID -batch -x "$WT/tools/dbg/slot232.py" > /root/slot232.txt 2>&1
+timeout 60 gdb -p $PID -batch -x "$WT/tools/dbg/slot232.py" > /root/slot232.txt 2>&1
 grep -E "LOOP|VIRT|rbx\+|r13\+|slot trace" /root/slot232.txt
 kill -9 $PID 2>/dev/null
 echo RUN232F-DONE
