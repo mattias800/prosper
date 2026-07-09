@@ -194,10 +194,19 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             Gen5ImageFormatInfo fi;
             static bool warned[512] = {};                        // once per 9-bit format value
             if (!gen5_image_format(d.format, &fi)) {
-                if (!warned[d.format & 511u]) { warned[d.format & 511u] = true;
-                    fprintf(stderr, "[t#] UNMAPPED Gen5 IMG_FMT %u (%ux%u T#) -> skipping texture binding "
-                                    "(extend gen5_image_format)\n", d.format, d.width, d.height); }
-                continue;
+                // Unmapped IMG format. Under PROSPER_RTT, BIND it as RGBA8 anyway so the render-to-texture
+                // path can inject the pixels we rendered into this address (the composite that samples a
+                // scene color target uses an unmapped packed format, e.g. fmt=36 — skipping it means the
+                // RTT cache is never consulted and the frame stays black). Without RTT, keep skipping
+                // (a raw RGBA8 read of a real unmapped texture would sample garbage; #65).
+                if (!getenv("PROSPER_RTT")) {
+                    if (!warned[d.format & 511u]) { warned[d.format & 511u] = true;
+                        fprintf(stderr, "[t#] UNMAPPED Gen5 IMG_FMT %u (%ux%u T#) -> skipping texture binding "
+                                        "(extend gen5_image_format)\n", d.format, d.width, d.height); }
+                    continue;
+                }
+                fi.format = DataFormat::Unorm8; fi.num_components = 4; fi.bytes_per_block = 4;
+                fi.block_width = fi.block_height = 1;
             }
             // Block-compressed: BC1/BC2/BC3 are decoded to RGBA8 on upload (bc_decode). BC4/5/6/7 aren't
             // decoded yet, so keep skipping them (a raw RGBA8 binding would sample garbage + over-read).
