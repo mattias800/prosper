@@ -120,6 +120,16 @@ void set_unwind_modules(const UnwindModuleDesc* descs, size_t count);
 // returns the matching export address (e.g. into the loaded PSN.prx). Pointer must outlive the run.
 void set_module_exports(const std::unordered_map<std::string, uint64_t>* exports);
 
+// Per-module export registration (#147): one entry per linked module — its load path and its OWN
+// NID -> address table (Program::mod_exports). sceKernelLoadStartModule hands out a REAL handle
+// when the requested path names one of these (basename match), and sceKernelDlsym consults the
+// handle's module before the global first-definition-wins table. Table pointers must outlive the run.
+struct ModuleExportTable { std::string path; const std::unordered_map<std::string, uint64_t>* nids; };
+void set_module_export_tables(std::vector<ModuleExportTable> tables);
+// Handle for a guest load path naming a registered module (basename match), or 0 if unknown —
+// the caller (k_load_start_mod) then falls back to its synthetic success handle.
+uint64_t module_handle_for_path(const char* path);
+
 // Guest address of the main module's SCE_PROCPARAM segment. sceKernelGetProcParam returns this;
 // real libc reads its heap/malloc config (sceLibcParam) from it, so a correct value is required for
 // real libc.prx's heap to initialize. Set from the eboot's PT_SCE_PROCPARAM segment after mapping.
