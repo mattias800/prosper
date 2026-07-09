@@ -833,3 +833,105 @@ vtable object at eboot+0x2cc236a's `*0x20(%rax)` (break there, walk the interfac
 +0x2324190 double compare gates — likely a streaming-level / world-activation handshake, still on
 the FlushAsyncLoading -> TickAsyncLoading axis. Still 0 graphics draws (DrawIndex/DrawIndexAuto);
 the compute-only dispatch stream is UE4's persistent per-frame GPU setup, not scene geometry.
+
+### IDENTIFIED (2026-07-09, issue #232): the poll wall is UE4's FRenderCommandFence — the GameThread's GPU-hang watchdog; the RenderThread stalls in the libSceAgc submit ring-drain (intrinsic, intermittent)
+
+The #213/#231 "GameThread ~1 ms timed-poll" wall (eboot+0x2cc2340) is now positively identified by
+its own log strings (read out of eboot rodata; VA→file map is `off = 0x66e04d0 + (va − 0x669c000)`
+for the r-- segment, anchored on the `"Unknown"` FName at 0x82639c2):
+
+- 0x407e3b518 (UTF-16): **"GameThread timed out waiting for RenderThread after %.02f seconds"**
+- 0x407fe886a (UTF-16): **"GPU has hung or crashed!"**
+- 0x407e3b474 (UTF-16): **"Rendering thread exception:\r\n%s"**, and the CVar name **"r.GTSyncType"**.
+
+So eboot+0x2cc2340 is UE4's **`FRenderCommandFence::Wait` / GameThread↔RenderThread frame sync with
+the GPU-hang watchdog** (`GGameThreadWaitForRenderThreadTimeout`, 120 s — the loop's `vucomisd`
+compares elapsed vs a start+120.0 s deadline: start≈4.25 s, deadline≈124.25 s live). The poll
+`call *0x20(%rax)` is `FEvent::Wait(1 ms)` on the fence's completion event:
+- outer future obj vtable = eboot+0x8e38ee0; inner FEvent obj vtable = eboot+0x8e37ef8.
+- FEvent::Wait = eboot+0x22ea830 (reads triggered-state at `event+0x14`: 0=untriggered / 1=auto /
+  2=manual; waits on the guest pthread cond at `event+0x28`, mutex at `event+0x20`, via
+  `scePthreadCondTimedwait` → our `k_cond_timedwait`).
+- FEvent::Trigger = eboot+0x22f4cf0 (locks `event+0x20`, sets `event+0x14`=1/2, `cond_signal`
+  (0x6699490) / `cond_broadcast` (0x6699480) on `event+0x28` → our `k_cond_signal`/`broadcast`).
+The FEvent primitive itself is faithfully wired (ensure_cond/ensure_mutex CAS the guest slot to one
+host object; no signaler/waiter desync). **The completion genuinely never fires within 120 s → the
+guest then aborts through the warn path (eboot+0x2cc23dd) and SIGSEGVs in the libc.prx log formatter
+(rip=libc.prx+0x48e0) — a *secondary* crash in the hang logger, not the root cause.**
+
+**Root cause is the RenderThread/RHIThread, not the GameThread.** At the freeze (flips stop at
+~180–210; all-thread dump): GameThread(T1) parks in `k_cond_timedwait` on the fence FEvent cond;
+64 workers idle in `k_cond_wait`; the ONLY live event traffic is the VideoOut vblank pump
+(`WaitEqueue ident=1 filter=-13` ra=eboot+0x20001ac14) — **zero GPU-EOP kevents, zero
+TriggerUserEvent**. The RHIThread (T3) is deep in the **libSceAgc submit path**
+(eboot+0x59a49f2 → 0x59a6700 → 0x599f210 ring/pipe-progress lookup; helper eboot+0x58e0640 builds a
+kevent and calls a 0x66xxxxx sync thunk) — it is spin-sleeping in the submit **ring-drain / GPU-
+progress poll** that never advances, so the RenderThread waits on the RHIThread and the GameThread
+times out. i.e. the GPU submit ring fills and our executor never signals the submit-completion /
+ring read-pointer advance the guest's `sceAgcDcbSubmit` waits on.
+
+**It is intermittent** — the same build sails to 22 000+ flips on some runs, freezes ~188 on others
+— which fingerprints a **submit-completion / EOP-event delivery race** in the AGC executor, the same
+family as #208/#210/#231 (undelivered completion), now on the *steady-state per-frame* submit path.
+
+**The startup-movie hypothesis is DISPROVEN.** The freeze correlates in time with the opening
+cutscene (`doll/content/movies/cutscene/sms_opening_en.usm` opens ≈flip 186; only 3 media NIDs ever
+fire — `sceVideodec2QueryComputeMemoryInfo`=RnDibcGCPKw, `sceAjmInitialize`=dl+4eHSzUu4,
+`sceAjmModuleRegister`=Q3dyFuwGn64, all nid_hash-recovered), and 2 threads actively pace CRI-Atom
+audio in `audio2_ctx_push`. But **making every `.usm` fail its stat/access existence check (movie
+player sees them absent, all 7 incl. the opening cutscene refused) did NOT move the wall** — DOLL
+still froze at the identical FRenderCommandFence timeout + libc-logger SIGSEGV. The movie is a
+coincidental co-timing, not the cause.
+
+**Next session (the real fix):** instrument the libSceAgc submit ring model in the executor
+(prosper/src/gpu) — confirm each `sceAgcDcbSubmit` marks its ring range complete and advances the
+read-pointer / posts the submit-EOP the guest's ring-space poll (eboot+0x59a6700) reads, with no
+race under back-to-back compute-only submits. Reproduce with `tools/dbg/gwalk.sh` (freeze-detect +
+per-thread guest-RA walk) and compare the AGC submit/EOP path to the Messenger's (which drains
+cleanly). Fixing the ring-drain/EOP delivery should let the RenderThread complete the frame, fire
+the fence, and advance the GameThread into world activation + the first scene draws. Diagnostic
+gdb tooling added this session: `tools/dbg/poll_probe.{sh,gdb}`, `poll_deep.{sh,gdb}`,
+`stall_bt2.sh`, `gwalk.sh`.
+
+### SOLVED (2026-07-09, issue #232): the FRenderCommandFence wall was an UNFOLDED submit variant (w1KFAHVqpaU) — DOLL advances 178 → 284 flips past it
+
+Post-#236 (EOP coalesce=false), DOLL still parked: every thread idle except **RenderThread 1**,
+which spin-yielded in a timeout poll at **eboot+0x221d6c2** (`mov 0x30(%rbx),%rax ; cmpq $0,(%rax)`
+reached from eboot+0x3bf4862) waiting for a GPU **fence label to become nonzero**. Live probe
+(`tools/dbg/slot232.py`): the polled label = `*[obj+0x30]` = **0x1180f06760**, value stuck at 0.
+That label is the destination of a `ReleaseMem action=0x14 addr=0x1180f06760 data=0x1` the guest
+BUILT — but `EOP write [0x1180f0*]` count was **0**: the Dcb carrying those fences was never folded.
+
+**Root cause: DOLL's UE4 RHI submits through TWO driver entry points, and we only folded one.** The
+guest `SubmitCommandBuffers` impl (eboot+0x220a9a0) loops the buffer array, submitting buffers
+[0..n−2] via `sceAgcDriverSubmitDcb` (UglJIZjGssM — folded) and the **final** buffer (eboot+0x220aace)
+via **w1KFAHVqpaU**, which was unimplemented (returned 0). So every batch's final buffer — carrying
+the RenderThread's completion fences at 0x1180f0xxxx — was dropped on the floor; the label never went
+nonzero, the RenderThread never completed the frame, and the GameThread's 120 s watchdog fired.
+
+**Fix (committed, `hle_agc.cpp` `agc_driver_submit_dcb_variant`):** fold w1KFAHVqpaU's Dcb through the
+CommandProcessor and fire EOP, same as the primary path. ABI RE'd from the compiler adapter thunk
+(eboot+0x58df3f0) that marshals the internal call into the Sony import — the raw dword-stream address
+is stack **arg8**, forwarded by the guest-%fs swap stub to **fp[3]** (the slot ReleaseMem/WaitRegMem
+already read arg8 from). The dword count (arg9) is past the 2-arg forward window, so the fold relies on
+`decode_pm4`'s type-3 self-termination (observed bounded: 377–10386 packets, well under the
+512 Ki-dword runaway cap). The PM4 header is validated before folding (fallback: scan a0..a5; refuse +
+log otherwise) so a wrong pointer can never fold garbage.
+
+**Verified:** w1KFAHVqpaU now folds every frame; **2100 EOP writes land in the 0x1180f0 fence region**
+(was 0); the frame loop advances **178 → 284 flips** past the wall. ctest 63/63; Messenger unregressed
+(153 rendered frames to #980, 0 faults — it never calls this path). CONFIDENCE: MED (buffer-slot ABI +
+missing-fence symptom pinned; unknown-length fold empirically bounded, not ABI-confirmed).
+
+**NEW WALL (next session):** past the fence, DOLL hits a deeper **worker-thread fault at
+eboot+0x2316c91** — `mov (%rbx),%rcx` on a corrupt free-list node (`rbx≈0x20015f00`, a bad "next"
+pointer popped by `mov (%r8),%rbx` at +0x2316c85; this is a memory-pool/free-list alloc). Still **0
+scene DrawIndex/DrawIndexAuto** — the ~1500-packet-per-frame stream folded via w1KFAHVqpaU is still
+UE4's compute/setup work (dispatches climb to 3500+), not scene geometry. Open questions: (a) is the
+0x2316c91 free-list node corrupted by the unknown-length fold over-walking (lower the cap / widen the
+swap stub to forward arg9 = the true count and re-check), or is it an independent deeper init-race
+(the doc's "worker-thread face")? (b) what populates that pool, and does world/level activation gate
+on it? Probes added: `tools/dbg/slot232.py`, `w1k232.py`, `gw232.py`, `waketrace232.py`,
+`unimpl232.py`, `gotwho.cpp`, `nid2got.cpp`, `run232{b..h}.sh`. Thread-name adoption
+(`pthread_setname_np` in `k_pthread_create`) now labels all guest threads in gdb/procfs — the probe
+that made the RenderThread identifiable.
