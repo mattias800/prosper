@@ -159,6 +159,22 @@ HLE(pad_get_info) {
 // (standard device class, no extra capabilities). Conservative 0x20 write to avoid overrun.
 HLE(pad_ext_info) { if (a1) memset(PW(a1), 0, 0x20); return 0; }
 
+// scePadDeviceClassParseData(handle, const OrbisPadData* in, OrbisPadDeviceClassData* out) -> 0.
+// Parses a raw device-class HID report (steering wheels, guitars, etc.) into a structured form. A
+// standard DualSense carries NO device-class payload, so the correct answer is "no valid data": clear
+// the out's leading fields — deviceClass (u32 @0) = STANDARD/0 and bDataValid (bool @4) = false — so a
+// game's `if (out.bDataValid)` sees false rather than consuming uninitialized memory. Bounded 8-byte
+// write (never the full union) per the oversized-write lesson; cross-checked vs shadPS4 pad.cpp
+// (returns OK). CONFIDENCE: MED — normal input still flows through scePadRead.
+HLE(pad_class_parse) { if (a2) memset(PW(a2), 0, 8); return 0; }
+
+// scePadGetTriggerEffectState(handle, ScePadTriggerEffectState* out) -> 0. DualSense adaptive-trigger
+// feedback state. No reference layout (PS5-only; absent from shadPS4/Kyty) and The Messenger is a 2D
+// platformer that does not drive adaptive triggers, so report a neutral/zeroed state and succeed.
+// Bounded 8-byte clear at the out pointer avoids leaving garbage without risking an overrun of an
+// unknown-size struct. CONFIDENCE: LOW — arg/layout unverified; never called on this title.
+HLE(pad_trigger_state) { if (a1) memset(PW(a1), 0, 8); return 0; }
+
 void register_pad_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
     R("scePadInit", pad_ok);
@@ -178,6 +194,10 @@ void register_pad_hle() {
     R("scePadResetLightBar", pad_ok);
     R("scePadSetLightBar", pad_ok);
     R("scePadResetOrientation", pad_ok);
+    R("scePadSetVibrationMode", pad_ok);       // vibration-mode config (output) — accept, no-op
+    R("scePadSetTriggerEffect", pad_ok);       // DualSense adaptive-trigger effect (output) — accept, no-op
+    R("scePadDeviceClassParseData", pad_class_parse);   // raw device-class report -> "no valid data"
+    R("scePadGetTriggerEffectState", pad_trigger_state);// adaptive-trigger state -> zeroed/neutral
     #undef R
 }
 
