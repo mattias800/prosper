@@ -15,6 +15,7 @@
 #include <cstring>
 #include <algorithm>
 #include <vector>
+#include <set>
 #include <unordered_map>
 
 // Classify a guest address: 0 => not within a reserved/committed guest mapping (see hle_kernel_mem).
@@ -143,6 +144,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 size_t tbytes = prosper::gpu::tiled_surface_bytes(tw, th, r.tile_mode, 0, bpt);
                                 std::vector<uint8_t> traw(tbytes, 0);
                                 size_t got = safe_copy(traw.data(), r.gpu_addr, tbytes);
+                                // PROSPER_DUMP_RAWTILE (narrow path): the single/dual-channel RAW TILED bytes,
+                                // once per address, for offline 8-bpp de-swizzle sweeps (the SDF font atlas).
+                                if (getenv("PROSPER_DUMP_RAWTILE") && got >= nlin.size() && tw <= 2048 && th <= 1024) {
+                                    static std::set<uint64_t> nseen;
+                                    if (nseen.insert(r.gpu_addr).second) {
+                                        std::string dd = getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".";
+                                        char bn[512]; snprintf(bn, sizeof bn, "%s/narrowtile_%ux%u_b%u_%llx.bin",
+                                                               dd.c_str(), tw, th, bpt, (unsigned long long)r.gpu_addr);
+                                        if (FILE* bf = fopen(bn, "wb")) { fwrite(traw.data(), 1, traw.size(), bf); fclose(bf);
+                                            fprintf(stderr, "[render] narrow raw tiled -> %s (%zu, bpt=%u)\n", bn, traw.size(), bpt); fflush(stderr); }
+                                    }
+                                }
                                 if (got < nlin.size()) safe_copy(nlin.data(), r.gpu_addr, nlin.size());  // short backing -> linear fallback
                                 else prosper::gpu::detile_surface(nlin.data(), traw.data(), tw, th, r.tile_mode, 0, bpt);
                             } else {
@@ -197,11 +210,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 std::memcpy(tiled.data(), texstore.back().data(), std::min(nb, tiled_bytes));
                             // PROSPER_DUMP_RAWTILE: write the EXACT padded tiled bytes to a .bin (no lossy BMP
                             // round-trip) so the de-swizzle can be reversed offline against a known image (#101).
-                            if (getenv("PROSPER_DUMP_RAWTILE") && frame_no < 200) {
-                                std::string dd = getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".";
-                                char bn[512]; snprintf(bn, sizeof bn, "%s/tiled_f%04d_b%u_%ux%u.bin",
-                                                       dd.c_str(), (int)frame_no, r.binding, tw, th);
-                                if (FILE* bf = fopen(bn, "wb")) { fwrite(tiled.data(), 1, tiled.size(), bf); fclose(bf); }
+                            if (getenv("PROSPER_DUMP_RAWTILE") && (frame_no < 200 || (tw <= 2048 && th <= 1024))) {
+                                // Early frames by binding, PLUS small textures once per address (the font/UI
+                                // atlas can be sampled late — capture whenever first seen).
+                                static std::set<uint64_t> rawseen;
+                                bool small = tw <= 2048 && th <= 1024;
+                                if (!small || rawseen.insert(r.gpu_addr).second) {
+                                    std::string dd = getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".";
+                                    char bn[512];
+                                    if (small) snprintf(bn, sizeof bn, "%s/rawtile_%ux%u_%llx.bin", dd.c_str(), tw, th, (unsigned long long)r.gpu_addr);
+                                    else snprintf(bn, sizeof bn, "%s/tiled_f%04d_b%u_%ux%u.bin", dd.c_str(), (int)frame_no, r.binding, tw, th);
+                                    if (FILE* bf = fopen(bn, "wb")) { fwrite(tiled.data(), 1, tiled.size(), bf); fclose(bf); }
+                                }
                             }
                             prosper::gpu::detile_surface(texstore.back().data(), tiled.data(), tw, th, tmode, pitch);
                         }
@@ -215,7 +235,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         }
                         // PROSPER_DUMP_ATLAS: dump each SMALL sampled texture once per ADDRESS (find the caption
                         // font among same-size UI textures). Capped.
-                        if (getenv("PROSPER_DUMP_ATLAS") && !texstore.back().empty() && tw <= 1024 && th <= 512) {
+                        if (getenv("PROSPER_DUMP_ATLAS") && !texstore.back().empty() && tw <= 2048 && th <= 1024) {
                             static std::unordered_map<uint64_t,int> seen; static int ndumped = 0;
                             if (seen[r.gpu_addr]++ == 0 && ndumped++ < 60) {
                                 std::string d = getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".";

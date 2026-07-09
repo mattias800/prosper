@@ -21,27 +21,33 @@ inline void sw4kb_dims(uint32_t bpe, uint32_t& bx, uint32_t& by) {
     uint32_t bits = 0; while ((4096u >> bits) > bpe) bits++;   // log2(4096/bpe), bpe a power of two
     bx = (bits + 1) / 2; by = bits / 2;
 }
-// GFX10 SW_4KB_S element order within the tile. The lowest FOUR element-index bits are a 4x4
-// pixel sub-block [x0, x1, y0, y1] (both low X bits, then both low Y bits); above that the usual
-// interleaved (y,x) Morton pairs, and for non-square tiles the wider dimension's extra X bits on top.
-// The previous plain Y-low Morton ([y0,x0,y1,x1,...]) placed the wrong bits in the lowest positions,
-// which is invisible in flat regions but SERRATED every sprite/gradient EDGE of every tiled texture —
-// the cross-game "dither"/unreadable-text bug. This order is pixel-verified clean (crisp cel-shaded
-// edges + smooth gradients) against The Messenger's title art at 32-bpp; the same micro-pattern is
-// applied at every bpe (round-trip-symmetric — verify other bpe visually as surfaces surface). #118.
+// GFX10 SW_4KB_S element order within the tile. The order is BYTES-PER-ELEMENT-DEPENDENT (AMD's
+// standard-swizzle SW_PATTERN genuinely differs per bpp) — two orders are pixel-verified against The
+// Messenger's live surfaces, and both share the shape "a low block of L X-bits then L Y-bits, then
+// interleaved (y,x) Morton pairs above":
+//
+//   32-bpp (32x32 tile, bx=by=5): L=2 -> [x0,x1, y0,y1, y2,x2, y3,x3, y4,x4]           #118 (title art)
+//    8-bpp (64x64 tile, bx=by=6): L=4 -> [x0,x1,x2,x3, y0,y1,y2,y3, y4,x4, y5,x5]       (R8 font atlas)
+//
+// The previous code applied the 32-bpp L=2 pattern at EVERY bpe. That serrated edges at 32-bpp until
+// #118 fixed the low nibble, but at 8-bpp (the game's ONLY R8 surface — the 2048x1024 caption font
+// atlas) the L=2 pattern is badly wrong: it scrambles every 64x64 tile into an unreadable weave, so
+// the intro caption text renders as invisible/garbage. The 8-bpp order below is pixel-verified: it
+// resolves the atlas into a clean grid of readable Latin + CJK glyphs. CONFIDENCE: HIGH for bx=by=5
+// (32-bpp) and bx=by=6 (8-bpp) — both live-verified; the L=2 fallback covers 16-bpp/BC-block geometries
+// (bx=by=4, bx=5/by=4) which round-trip but have no game-observed instance to pixel-verify yet.
 inline uint32_t sw4kb_morton(uint32_t ix, uint32_t iy, uint32_t bx, uint32_t by) {
     uint32_t m = 0;
-    // low 4 bits: x0, x1, y0, y1  (a 4x4 sub-block; requires bx>=2 and by>=2, true for every real bpe)
-    m |= (ix & 1u) << 0;
-    m |= ((ix >> 1) & 1u) << 1;
-    m |= (iy & 1u) << 2;
-    m |= ((iy >> 1) & 1u) << 3;
-    for (uint32_t b = 2; b < by; b++) {
-        m |= ((iy >> b) & 1u) << (2 * b);
-        m |= ((ix >> b) & 1u) << (2 * b + 1);
+    // Low-block half-width L: 4 for the 64x64 (8-bpp) tile, else 2 (the #118-verified 32-bpp nibble).
+    const uint32_t L = (bx == 6 && by == 6) ? 4u : 2u;
+    uint32_t bit = 0;
+    for (uint32_t b = 0; b < L && b < bx; b++) m |= ((ix >> b) & 1u) << (bit++);   // low X bits
+    for (uint32_t b = 0; b < L && b < by; b++) m |= ((iy >> b) & 1u) << (bit++);   // low Y bits
+    for (uint32_t b = L; b < by; b++) {                                            // (y,x) Morton pairs
+        m |= ((iy >> b) & 1u) << (bit++);
+        if (b < bx) m |= ((ix >> b) & 1u) << (bit++);
     }
-    for (uint32_t b = by; b < bx; b++)
-        m |= ((ix >> b) & 1u) << (2 * by + (b - by));
+    for (uint32_t b = by; b < bx; b++) m |= ((ix >> b) & 1u) << (bit++);           // wider-dim extra X
     return m;
 }
 // Element (x,y) -> its linear element INDEX in the tiled surface: tiles laid out row-major over the
