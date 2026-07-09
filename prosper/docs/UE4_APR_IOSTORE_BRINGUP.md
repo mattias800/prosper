@@ -458,18 +458,57 @@ Follow-on fixes landed in the same change (each its own live-diagnosed wall):
   global made the handler read the file OFFSET from another thread's frame (wrong-offset reads
   served as "OK"). No TLS (issue #89 constraint respected).
 
-### NEW WALL: MallocBinned3 free-block canary corruption during the parallel content-load burst
+### SOLVED (2026-07-09, issue #161): the MB3 canary corruption was TWO guest VM spaces handed the
+### SAME reserved base — non-fixed sceKernelReserveVirtualRange must SEARCH, not echo the hint
 
-With loading fast and parallel, the boot dies ~10 s in, right after online init, spamming
-`LowLevelFatalError [Line: 186] MallocBinned3 Corruption Canary was 0xN, will be 0x1` (N varies
-run to run: 0x0, 0x2) until a SIGSEGV. Established so far: NOT a prosper page clobber (MEMLOG
-shows zero lazy-commit/batchmap overlaps, zero remaps, the #107 mirror is SKIPPED cleanly, and
-all 951 BatchMap ops in the window are plain op=0 commits — no unmaps); NOT caused by the RTC or
-timedwait fixes (A/B-verified: corruption persists with them unregistered, only the canary value
-changes). The phase is a burst of MallocBinned3 arena growth (hundreds of 64K batchmap commits)
-under multiple loading threads — candidates: guest-%fs TLS-cache interaction (MB3 per-thread
-caches under PROSPER_GUEST_FS), or a completion-delivery race making the engine free a block on
-two paths. Needs its own session with a HW write-watch on a corrupted free-block header.
+With loading fast and parallel, the boot died ~10 s in spamming
+`LowLevelFatalError [Line: 186] MallocBinned3 Corruption Canary was 0xN, will be 0x1` until a
+SIGSEGV. Both prior hypotheses (guest-%fs TLS caches for fresh loader threads; a
+completion-delivery double-free race) were WRONG. The proven chain (each step captured live
+under gdb):
+
+1. Line 186 is `FPoolInfoSmall::CheckCanary` inside MB3's GetOrCreatePoolInfo (eboot+0x230d900;
+   entries live in on-demand-committed 64K tables of 16384 4-byte records; fresh tables are
+   memset to `0x00020003`, canary bits = 3). At the first fatal the failing entry address was
+   **misaligned** (`rbx=0x20015f0011`, ≡1 mod 4) while the aligned table at 0x20015f0000 was
+   perfectly healthy — so the STORED TABLE POINTER was corrupt, not the table.
+2. The pointer array for size-class 0 lives at **0x1000000000** (the very base of guest VA);
+   slot 0 read `0x20015f0001` (real table + 1) and slot 1 read `0xffffffffffffffff`.
+3. A HW watchpoint on those two qwords caught the writer: **the guest's own MB3 block-of-blocks
+   bit tree** (`bts` loop at eboot+0x231c0b0..0x231c0ce) — its storage is ALSO based at
+   0x1000000000. Level-1 qword (base+8) filled bit-by-bit as pools 0..63 of class 0 were
+   allocated during the load burst; when it hit all-ones the tree propagated to its ROOT qword
+   (base+0): `Bits[0] |= 1` — flipping the low byte of the aliased table pointer. Two distinct
+   MB3 bookkeeping structures at one VA.
+4. Why they aliased: the MB3 ctor (eboot+0x230db50) carves the per-class metadata (ptr array +
+   2 bit trees, 3 × 64K per class) from a **64 MiB metadata VM space** that the guest reserves
+   with `sceKernelReserveVirtualRange(hint=0x1000000000, len=0x4000000, flags=0, align=0x4000)`
+   — AFTER having reserved the 512 GiB MB3 arena with
+   `(hint=0x1000000000, len=0x8000000000, flags=0, align=0x200000)`. **flags=0: neither call is
+   MAP_FIXED**, so the hint is only a search start (BSD/PS4/PS5 contract; shadPS4
+   MemoryManager::SearchFree). prosper treated every hinted reserve as fixed, and the #115
+   "re-reserve-of-own-range → OK" workaround blessed call 2 with the SAME base 0x1000000000 →
+   the metadata space overlapped the arena (whose granules the class-0 structures also landed
+   on), and the two suballocators handed out the same VAs.
+
+**Fix (`hle_kernel_mem.cpp`, `k_reserve_vrange`):** honor SCE_KERNEL_MAP_FIXED (0x10). Fixed →
+old behavior (incl. the #115 idempotent re-reserve of an own uncommitted range). Non-fixed with
+a hint → search upward from the hint with MAP_FIXED_NOREPLACE probes, skipping past tracked
+mappings (one step past the 512 GiB arena); len==0 → EINVAL; search exhaustion → ENOMEM. The
+metadata pool now lands at 0x9000000000 and the canary corruption is gone (0 canary lines over
+full runs; previously ~31k lines + SIGSEGV at ~10 s). CONFIDENCE: HIGH.
+
+**Post-fix frontier (measured):** the boot now survives the ENTIRE parallel content load with the
+AGC RHI threads live (AgcCleanup/AgcInterrupt/AgcSubmission + FAPREventQueueListener +
+IoDispatcher/IoService + full TaskGraph pools) and streams pakchunk0 continuously (256 KiB APR
+reads; ~845 MB consumed at the 7-minute mark — the pace is bounded by the WSL 9p mount, not by
+prosper). At ~9.5 minutes (PROSPER_GFXLOG run) the engine issued its FIRST real AGC driver work:
+`libSceAgc::23LRUSvYu1M` / `libSceAgc::BfBDZGbti7A` plus two AGC `ReleaseMem` end-of-pipe packets
+(`addr=0x2012..ffe0, data_sel=3`) right as the timeout expired. No crash, no fatal anywhere in
+between. NEXT: run past the load phase (longer wall clock, and/or cut pak IO latency — e.g. host
+page-cache warm-up or larger read batching) and follow the AGC submission stream into
+`execute_and_present` for the first UE4 draw (the same libSceAgc path The Messenger renders
+through).
 
 ### The remaining 3 unnamed Ampr NIDs (issue #107, not on the crash path)
 
