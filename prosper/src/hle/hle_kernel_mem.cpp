@@ -1063,9 +1063,11 @@ void register_kernel_mem_hle() {
 
 #else
 #include <atomic>
+#include <chrono>
 #include <climits>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <mutex>
 
 namespace prosper {
@@ -1083,7 +1085,25 @@ HLE(k_wait_on_address) {
     auto& raw = *(uint32_t*)(uintptr_t)a0;
     std::atomic_ref<uint32_t> addr(raw);
     uint32_t expected = (uint32_t)a1;
+    // Honor the guest timeout by default (#142) — the same fix the Linux futex path got (#139).
+    // Previously this global-cv fallback IGNORED the timeout arg and blocked FOREVER while
+    // *addr == expected, returning 0 (=signaled), so a Windows-build timed wait could never take its
+    // timeout branch. Parse *a2 as uint32 microseconds, wait to that deadline, and return SCE
+    // ETIMEDOUT on expiry. PROSPER_NO_WAIT_TIMEOUT restores infinite waits (parity with Linux).
+    // The 32-bit compare is a shared limitation with the Linux FUTEX_WAIT path (WaitOnAddress can
+    // wait on 1/2/4/8-byte values; only 4 is modeled) — unchanged here.
+    static const bool honor_timeout = getenv("PROSPER_NO_WAIT_TIMEOUT") == nullptr;
     std::unique_lock<std::mutex> lk(g_sync_mx);
+    if (a2 && honor_timeout) {
+        uint32_t us = *(volatile uint32_t*)(uintptr_t)a2;
+        if (us == 0) us = 1;   // 0 == "poll" -> a minimal wait so we re-check
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(us);
+        while (addr.load(std::memory_order_acquire) == expected)
+            if (g_sync_cv.wait_until(lk, deadline) == std::cv_status::timeout &&
+                addr.load(std::memory_order_acquire) == expected)
+                return 0x80020060ull;   // SCE_KERNEL_ERROR_ETIMEDOUT
+        return 0;
+    }
     while (addr.load(std::memory_order_acquire) == expected) g_sync_cv.wait(lk);
     return 0;
 }
