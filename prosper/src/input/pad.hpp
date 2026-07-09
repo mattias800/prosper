@@ -14,6 +14,8 @@
 // published Sony ScePadData; asserted byte-for-byte in pad.cpp. CONFIDENCE: HIGH (layout).
 #pragma once
 #include <cstdint>
+#include <string>
+#include <vector>
 
 namespace prosper::input {
 
@@ -131,6 +133,23 @@ constexpr uint8_t kPadTriggerButtonThreshold = 0x08;   // ~3% of full travel
 // Return the L2/R2 button bits for analog trigger values past the threshold (0 for both at rest).
 // Shared by every backend so the analog->digital rule lives in one unit-tested place.
 uint32_t pad_trigger_buttons(uint8_t l2, uint8_t r2);
+
+// ---- Scripted input (PROSPER_PAD_SCRIPT) — pure, unit-tested -----------------------------------
+// A timed button sequence lets a headless run drive menus with no host device (issue #163). These
+// three helpers are pure (no env, no clock) so the parse + time-eval logic is verifiable; the HLE
+// (hle_pad.cpp) supplies getenv + the wall clock and anchors t=0 to the first input poll.
+struct PadScriptEntry { double t_secs; uint32_t button_mask; };
+
+// Map a button name ("start"/"options"/"cross"/"x"/"up"/... case as written) to its SCE_PAD_BUTTON_*
+// bit; 0 if unknown. "start" and "options" both mean the PS5 Options button (the "Start" equivalent).
+uint32_t pad_button_by_name(const std::string& name);
+
+// Parse "<secs>:<btn>[+<btn>...][;<secs>:<btn>...]" into entries (e.g. "3:start;9:cross+up"). Entries
+// with no recognized button are dropped. Whitespace-tolerant only where the spec has none by design.
+std::vector<PadScriptEntry> parse_pad_script(const std::string& spec);
+
+// Buttons held at `elapsed_secs`: OR of every entry whose window [t, t+hold_secs) contains the time.
+uint32_t pad_script_buttons_at(const std::vector<PadScriptEntry>& script, double elapsed_secs, double hold_secs);
 
 // ---- Pluggable host backend (mirrors AudioSink / audio_set_sink) -------------------------------
 //

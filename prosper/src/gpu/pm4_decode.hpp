@@ -63,6 +63,7 @@ struct Pm4Command {
     uint64_t di_modifier = 0;            // DrawIndex: raw 64-bit draw-modifier bits
     bool     di_valid = false;           // DrawIndex: payload was long enough to carry addr+modifier
     uint32_t event_type = 0;             // EventWrite
+    uint64_t event_addr = 0;             // EventWrite: destination address (0 = address-less sync event) (#132)
     uint32_t sh_reg_offset = 0, sh_reg_value = 0;  // SetShRegDirect (sh_reg_value = first value)
     uint32_t sh_reg_count = 0;                 // SetShRegDirect: # of consecutive registers this packet sets
     const uint32_t* sh_reg_data = nullptr;     // SetShRegDirect: -> the value dwords (count of them) in-packet

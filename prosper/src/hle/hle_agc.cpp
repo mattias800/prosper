@@ -161,8 +161,15 @@ HLE(agc_dcb_dma_data) {  // (dcb, dst, cache_policy, flags, src, size_dw)
     return (uint64_t)(uintptr_t)cmd;
 }
 HLE(agc_dcb_event_write) {  // (buf, event_type, address)
-    uint32_t* cmd; if (!begin_packet(a0, 2, IT_EVENT_WRITE, 0, &cmd)) return 0;
-    cmd[1] = (uint32_t)(a1 & 0xffu); return (uint64_t)(uintptr_t)cmd;
+    // Widen the packet to carry the address (a2) like ReleaseMem (#132): an address-carrying
+    // EVENT_WRITE (the timestamp/label variant) writes a completion value there, and discarding it
+    // left a guest waiting on that label blocked forever. cmd[1]=event_type, cmd[2..3]=address lo/hi.
+    // An address-less event (a2=0, the pipeline-sync variants: partial-flush, cache-inval) stays a
+    // no-op in the CommandProcessor (event_addr==0), exactly as before.
+    uint32_t* cmd; if (!begin_packet(a0, 4, IT_EVENT_WRITE, 0, &cmd)) return 0;
+    cmd[1] = (uint32_t)(a1 & 0xffu);
+    cmd[2] = (uint32_t)(a2 & 0xffffffffu); cmd[3] = (uint32_t)(a2 >> 32u);
+    return (uint64_t)(uintptr_t)cmd;
 }
 HLE(agc_dcb_acquire_mem) {  // (buf, engine, cb_db_op, gcr_cntl, ...) — 8 dw
     uint32_t* cmd; if (!begin_packet(a0, 8, IT_NOP, R_ACQUIRE_MEM, &cmd)) return 0;

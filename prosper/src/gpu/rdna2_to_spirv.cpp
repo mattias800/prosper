@@ -1855,25 +1855,45 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // Integer sub-dword formats (Uint8/Sint8/Uint16/Sint16) aren't normalized floats and would
             // need an integer-attribute path; reject rather than mis-normalize.
             if (packed && !is_half && norm == 0.0f) { ok = false; return true; }
-            // Byte address of the element: idxen -> VADDR is an element index (×stride); offen -> VADDR
-            // is a byte offset; plus the inst offset and SOFFSET. dword index = addr>>2.
+            // Packed (sub-dword) components are extracted at STATIC byte offsets relative to a
+            // DWORD-ALIGNED element base — the low 2 bits of the address (addr&3) are dropped by the
+            // addr>>2 dword index and never folded into the bit extraction (#150). That is only correct
+            // when the element base is provably 4-byte aligned; otherwise a component (a half2 UV after
+            // a snorm16x3 normal, an unorm8 at a byte offset) decodes the wrong bits. A fully general
+            // fix needs a runtime bit position that can straddle dwords; until then, prove alignment
+            // from the address terms and REJECT the packed load/store when it can't be proven (surfacing
+            // the gap) rather than silently mis-decode. Aligned iff: inst offset %4==0; stride %4==0
+            // when idxen; no offen (a runtime per-lane byte offset is unprovable); SOFFSET is NULL/0.
+            if (packed) {
+                bool soff_zero = (in.src[2].kind == OperandKind::Special && in.src[2].value == 125) ||
+                                 (in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0);
+                bool base_aligned = ((offset & 3u) == 0) && !offen &&
+                                    (!idxen || (stride & 3u) == 0) && soff_zero;
+                if (!base_aligned) { ok = false; return true; }
+            }
+            // Byte address of the element (#148): idxen -> a VADDR VGPR is an element index (×stride);
+            // offen -> a per-lane byte offset; both terms ADD; when idxen AND offen are set VADDR is TWO
+            // consecutive VGPRs ([0]=index, [1]=byte offset). Plus the inst offset and SOFFSET.
             uint32_t addr;
-            // Const-folded per-vertex attribute fetch: the element address is exactly gl_VertexIndex*stride.
-            // (1) The NGG fetch-shader prologue that computes the element index isn't fully modeled and can
-            //     fold to a constant, so every vertex reads record 0 -> a degenerate single point that
-            //     rasterizes nothing (the whole scene stayed the blue clear).
-            // (2) The resolved V# base ALREADY includes this attribute's byte offset within the interleaved
-            //     record, so the shader's inst-offset + SOFFSET must NOT be added again — double-counting
-            //     pushes the read out of bounds (robustBufferAccess returns 0), the same degenerate collapse.
-            // So use gl_VertexIndex*stride and drop the shader's VADDR/offset/SOFFSET. Everything else keeps
-            // the faithful address (offen byte offsets, instanced / computed indices). CONFIDENCE: HIGH —
-            // makes PPSA01885 (Unity/IL2CPP) render its real geometry instead of a degenerate collapse.
+            // Const-folded per-vertex attribute fetch (#206): the element address is exactly
+            // gl_VertexIndex*stride. (1) The NGG fetch-shader prologue that computes the element index
+            // isn't fully modeled and folds to a constant, so every vertex would read record 0 -> a
+            // degenerate single point that rasterizes nothing (the whole scene stayed the blue clear).
+            // (2) The resolved V# base ALREADY includes this attribute's byte offset within the
+            // interleaved record, so the shader's inst-offset + SOFFSET must NOT be added again
+            // (double-counting pushes the read OOB -> robustBufferAccess 0, the same collapse). So use
+            // gl_VertexIndex*stride and drop the shader's VADDR/offset/SOFFSET; everything else keeps the
+            // faithful address (incl. #148's idxen+offen both-terms fix). CONFIDENCE: HIGH — makes
+            // PPSA01885 (Unity/IL2CPP) render real geometry instead of a degenerate collapse.
             if (dyn_vfetch && idxen && stride) {
                 addr = b.ibin(Op_IMul, b.load_vertex_index(), b.uconst(stride));
             } else {
                 addr = b.uconst(offset);
                 if (idxen && stride) addr = b.ibin(Op_IAdd, addr, b.ibin(Op_IMul, val(in.src[0]), b.uconst(stride)));
-                else if (offen)      addr = b.ibin(Op_IAdd, addr, val(in.src[0]));
+                if (offen) {
+                    Operand off_vgpr{ OperandKind::VGPR, idxen ? in.src[0].value + 1 : in.src[0].value };
+                    addr = b.ibin(Op_IAdd, addr, val(off_vgpr));
+                }
                 addr = b.ibin(Op_IAdd, addr, val(in.src[2]));          // SOFFSET
             }
             uint32_t idx = b.ibin(Op_ShiftRightLogical, addr, b.uconst(2));
