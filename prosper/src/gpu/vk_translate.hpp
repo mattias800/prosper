@@ -58,6 +58,26 @@ VkFormat vk_color_format(uint32_t format, uint32_t number_type, uint32_t comp_sw
 // (0=NEVER,1=LESS,2=EQUAL,3=LEQUAL,4=GREATER,5=NOTEQUAL,6=GEQUAL,7=ALWAYS), so the value maps 1:1.
 inline uint32_t vk_compare_op(uint32_t zfunc) { return zfunc & 0x7u; }
 
+// Map an RDNA2 DB_STENCIL_CONTROL stencil op (STENCIL_OP enum) to a VkStencilOp value. VkStencilOp:
+// KEEP=0,ZERO=1,REPLACE=2,INC_CLAMP=3,DEC_CLAMP=4,INVERT=5,INC_WRAP=6,DEC_WRAP=7. The RDNA2 enum has
+// three "replace-ish" codes (ONES/REPLACE_TEST/REPLACE_OP) that all realize as REPLACE here (a UI mask
+// writes the ref value). AND/OR/XOR/etc. (10..14) have no Vk equivalent -> KEEP.
+inline uint32_t vk_stencil_op(uint32_t op) {
+    switch (op & 0xFu) {
+        case 0:  return 0;   // KEEP
+        case 1:  return 1;   // ZERO
+        case 2:  return 2;   // ONES         -> REPLACE
+        case 3:  return 2;   // REPLACE_TEST -> REPLACE
+        case 4:  return 2;   // REPLACE_OP   -> REPLACE
+        case 5:  return 3;   // ADD_CLAMP    -> INCREMENT_AND_CLAMP
+        case 6:  return 4;   // SUB_CLAMP    -> DECREMENT_AND_CLAMP
+        case 7:  return 5;   // INVERT
+        case 8:  return 6;   // ADD_WRAP     -> INCREMENT_AND_WRAP
+        case 9:  return 7;   // SUB_WRAP     -> DECREMENT_AND_WRAP
+        default: return 0;   // AND/OR/XOR/NAND/NOR (no Vk equivalent) -> KEEP
+    }
+}
+
 // Map an RDNA2 CB_BLEND_CONTROL blend factor to a VkBlendFactor value (NOT identity — e.g. RDNA2
 // DstColor=8 -> VK DST_COLOR=4). Per Kyty GraphicsRender.cpp. Unknown -> ZERO.
 uint32_t vk_blend_factor(uint32_t rdna2_factor);

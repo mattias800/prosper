@@ -67,6 +67,10 @@ RenderState extract_render_state(const GpuState& st) {
 
     // Faithful raw state registers.
     rs.db_depth_control  = dc;
+    // Stencil op + ref/mask registers (absent -> 0; stencil_enable already gates whether they apply).
+    rs.db_stencil_control   = st.cx.count(P::DB_STENCIL_CONTROL)   ? rd(st.cx, P::DB_STENCIL_CONTROL)   : 0u;
+    rs.db_stencilrefmask    = st.cx.count(P::DB_STENCILREFMASK)    ? rd(st.cx, P::DB_STENCILREFMASK)    : 0u;
+    rs.db_stencilrefmask_bf = st.cx.count(P::DB_STENCILREFMASK_BF) ? rd(st.cx, P::DB_STENCILREFMASK_BF) : 0u;
     rs.cb_color_control  = rd(st.cx, P::CB_COLOR_CONTROL);
     rs.cb_blend0_control = bc;
     // CB_TARGET_MASK (per-MRT color write mask). The AGC driver defaults it to write-all when the game
@@ -98,6 +102,28 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
     ps.depth_test_enable  = rs.z_enable;
     ps.depth_write_enable = rs.z_write_enable;
     ps.depth_compare_op   = vk_compare_op(rs.zfunc);
+
+    // Stencil: compare func from DB_DEPTH_CONTROL (STENCILFUNC / _BF), ops from DB_STENCIL_CONTROL,
+    // ref/masks from DB_STENCILREFMASK[_BF]. [0]=front, [1]=back. Only meaningful when stencil_enable.
+    ps.stencil_enable = rs.stencil_enable;
+    if (rs.stencil_enable) {
+        const uint32_t dc2 = rs.db_depth_control, sc = rs.db_stencil_control;
+        const uint32_t rm = rs.db_stencilrefmask, rmb = rs.db_stencilrefmask_bf;
+        ps.stencil_compare_op[0]    = vk_compare_op(PM4_FIELD(dc2, DB_DEPTH_CONTROL, STENCILFUNC));
+        ps.stencil_compare_op[1]    = vk_compare_op(PM4_FIELD(dc2, DB_DEPTH_CONTROL, STENCILFUNC_BF));
+        ps.stencil_fail_op[0]       = vk_stencil_op(PM4_FIELD(sc, DB_STENCIL_CONTROL, STENCILFAIL));
+        ps.stencil_pass_op[0]       = vk_stencil_op(PM4_FIELD(sc, DB_STENCIL_CONTROL, STENCILZPASS));
+        ps.stencil_depth_fail_op[0] = vk_stencil_op(PM4_FIELD(sc, DB_STENCIL_CONTROL, STENCILZFAIL));
+        ps.stencil_fail_op[1]       = vk_stencil_op(PM4_FIELD(sc, DB_STENCIL_CONTROL, STENCILFAIL_BF));
+        ps.stencil_pass_op[1]       = vk_stencil_op(PM4_FIELD(sc, DB_STENCIL_CONTROL, STENCILZPASS_BF));
+        ps.stencil_depth_fail_op[1] = vk_stencil_op(PM4_FIELD(sc, DB_STENCIL_CONTROL, STENCILZFAIL_BF));
+        ps.stencil_ref[0]           = PM4_FIELD(rm,  DB_STENCILREFMASK,    STENCILTESTVAL);
+        ps.stencil_compare_mask[0]  = PM4_FIELD(rm,  DB_STENCILREFMASK,    STENCILMASK);
+        ps.stencil_write_mask[0]    = PM4_FIELD(rm,  DB_STENCILREFMASK,    STENCILWRITEMASK);
+        ps.stencil_ref[1]           = PM4_FIELD(rmb, DB_STENCILREFMASK_BF, STENCILTESTVAL_BF);
+        ps.stencil_compare_mask[1]  = PM4_FIELD(rmb, DB_STENCILREFMASK_BF, STENCILMASK_BF);
+        ps.stencil_write_mask[1]    = PM4_FIELD(rmb, DB_STENCILREFMASK_BF, STENCILWRITEMASK_BF);
+    }
 
     ps.blend_enable            = rs.blend_enable;
     ps.src_color_blend_factor  = vk_blend_factor(rs.color_src_blend);

@@ -45,6 +45,9 @@ struct RenderState {
 
     // Raw state registers — remaining bit layouts decoded by the Vulkan backend later (kept faithful).
     uint32_t db_depth_control  = 0;   // DB_DEPTH_CONTROL
+    uint32_t db_stencil_control   = 0;   // DB_STENCIL_CONTROL   (front/back stencil-fail / z-pass / z-fail ops)
+    uint32_t db_stencilrefmask    = 0;   // DB_STENCILREFMASK    (front ref / compare-mask / write-mask)
+    uint32_t db_stencilrefmask_bf = 0;   // DB_STENCILREFMASK_BF (back-face ref / compare-mask / write-mask)
     uint32_t cb_color_control  = 0;   // CB_COLOR_CONTROL
     uint32_t cb_blend0_control = 0;   // CB_BLEND0_CONTROL
     uint32_t cb_target_mask    = 0;   // CB_TARGET_MASK (per-MRT write mask)
@@ -71,6 +74,20 @@ struct ResolvedPipelineState {
     bool     depth_test_enable  = false;
     bool     depth_write_enable = false;
     uint32_t depth_compare_op  = 0;  // == VkCompareOp
+
+    // Stencil test state, resolved from DB_DEPTH_CONTROL (enable + STENCILFUNC) + DB_STENCIL_CONTROL
+    // (ops) + DB_STENCILREFMASK[_BF] (ref / compare-mask / write-mask). Index [0]=front, [1]=back.
+    // A UI mask (e.g. The Messenger's title shimmer) writes the stencil in one draw and tests it in the
+    // next — with these left off the mask draw is unmasked (#264). Values are the Vk* enumerators.
+    bool     stencil_enable          = false;
+    uint32_t stencil_compare_op[2]   = {7, 7};       // == VkCompareOp (7 = ALWAYS)
+    uint32_t stencil_fail_op[2]      = {0, 0};        // == VkStencilOp (0 = KEEP)
+    uint32_t stencil_pass_op[2]      = {0, 0};        // depth-pass op
+    uint32_t stencil_depth_fail_op[2]= {0, 0};
+    uint32_t stencil_ref[2]          = {0, 0};
+    uint32_t stencil_compare_mask[2] = {0xFF, 0xFF};
+    uint32_t stencil_write_mask[2]   = {0xFF, 0xFF};
+
     bool     blend_enable        = false;
     uint32_t src_color_blend_factor = 0;   // == VkBlendFactor
     uint32_t dst_color_blend_factor = 0;   // == VkBlendFactor
