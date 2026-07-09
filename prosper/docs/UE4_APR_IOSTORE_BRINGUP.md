@@ -833,3 +833,62 @@ vtable object at eboot+0x2cc236a's `*0x20(%rax)` (break there, walk the interfac
 +0x2324190 double compare gates — likely a streaming-level / world-activation handshake, still on
 the FlushAsyncLoading -> TickAsyncLoading axis. Still 0 graphics draws (DrawIndex/DrawIndexAuto);
 the compute-only dispatch stream is UE4's persistent per-frame GPU setup, not scene geometry.
+
+### IDENTIFIED (2026-07-09, issue #232): the poll wall is UE4's FRenderCommandFence — the GameThread's GPU-hang watchdog; the RenderThread stalls in the libSceAgc submit ring-drain (intrinsic, intermittent)
+
+The #213/#231 "GameThread ~1 ms timed-poll" wall (eboot+0x2cc2340) is now positively identified by
+its own log strings (read out of eboot rodata; VA→file map is `off = 0x66e04d0 + (va − 0x669c000)`
+for the r-- segment, anchored on the `"Unknown"` FName at 0x82639c2):
+
+- 0x407e3b518 (UTF-16): **"GameThread timed out waiting for RenderThread after %.02f seconds"**
+- 0x407fe886a (UTF-16): **"GPU has hung or crashed!"**
+- 0x407e3b474 (UTF-16): **"Rendering thread exception:\r\n%s"**, and the CVar name **"r.GTSyncType"**.
+
+So eboot+0x2cc2340 is UE4's **`FRenderCommandFence::Wait` / GameThread↔RenderThread frame sync with
+the GPU-hang watchdog** (`GGameThreadWaitForRenderThreadTimeout`, 120 s — the loop's `vucomisd`
+compares elapsed vs a start+120.0 s deadline: start≈4.25 s, deadline≈124.25 s live). The poll
+`call *0x20(%rax)` is `FEvent::Wait(1 ms)` on the fence's completion event:
+- outer future obj vtable = eboot+0x8e38ee0; inner FEvent obj vtable = eboot+0x8e37ef8.
+- FEvent::Wait = eboot+0x22ea830 (reads triggered-state at `event+0x14`: 0=untriggered / 1=auto /
+  2=manual; waits on the guest pthread cond at `event+0x28`, mutex at `event+0x20`, via
+  `scePthreadCondTimedwait` → our `k_cond_timedwait`).
+- FEvent::Trigger = eboot+0x22f4cf0 (locks `event+0x20`, sets `event+0x14`=1/2, `cond_signal`
+  (0x6699490) / `cond_broadcast` (0x6699480) on `event+0x28` → our `k_cond_signal`/`broadcast`).
+The FEvent primitive itself is faithfully wired (ensure_cond/ensure_mutex CAS the guest slot to one
+host object; no signaler/waiter desync). **The completion genuinely never fires within 120 s → the
+guest then aborts through the warn path (eboot+0x2cc23dd) and SIGSEGVs in the libc.prx log formatter
+(rip=libc.prx+0x48e0) — a *secondary* crash in the hang logger, not the root cause.**
+
+**Root cause is the RenderThread/RHIThread, not the GameThread.** At the freeze (flips stop at
+~180–210; all-thread dump): GameThread(T1) parks in `k_cond_timedwait` on the fence FEvent cond;
+64 workers idle in `k_cond_wait`; the ONLY live event traffic is the VideoOut vblank pump
+(`WaitEqueue ident=1 filter=-13` ra=eboot+0x20001ac14) — **zero GPU-EOP kevents, zero
+TriggerUserEvent**. The RHIThread (T3) is deep in the **libSceAgc submit path**
+(eboot+0x59a49f2 → 0x59a6700 → 0x599f210 ring/pipe-progress lookup; helper eboot+0x58e0640 builds a
+kevent and calls a 0x66xxxxx sync thunk) — it is spin-sleeping in the submit **ring-drain / GPU-
+progress poll** that never advances, so the RenderThread waits on the RHIThread and the GameThread
+times out. i.e. the GPU submit ring fills and our executor never signals the submit-completion /
+ring read-pointer advance the guest's `sceAgcDcbSubmit` waits on.
+
+**It is intermittent** — the same build sails to 22 000+ flips on some runs, freezes ~188 on others
+— which fingerprints a **submit-completion / EOP-event delivery race** in the AGC executor, the same
+family as #208/#210/#231 (undelivered completion), now on the *steady-state per-frame* submit path.
+
+**The startup-movie hypothesis is DISPROVEN.** The freeze correlates in time with the opening
+cutscene (`doll/content/movies/cutscene/sms_opening_en.usm` opens ≈flip 186; only 3 media NIDs ever
+fire — `sceVideodec2QueryComputeMemoryInfo`=RnDibcGCPKw, `sceAjmInitialize`=dl+4eHSzUu4,
+`sceAjmModuleRegister`=Q3dyFuwGn64, all nid_hash-recovered), and 2 threads actively pace CRI-Atom
+audio in `audio2_ctx_push`. But **making every `.usm` fail its stat/access existence check (movie
+player sees them absent, all 7 incl. the opening cutscene refused) did NOT move the wall** — DOLL
+still froze at the identical FRenderCommandFence timeout + libc-logger SIGSEGV. The movie is a
+coincidental co-timing, not the cause.
+
+**Next session (the real fix):** instrument the libSceAgc submit ring model in the executor
+(prosper/src/gpu) — confirm each `sceAgcDcbSubmit` marks its ring range complete and advances the
+read-pointer / posts the submit-EOP the guest's ring-space poll (eboot+0x59a6700) reads, with no
+race under back-to-back compute-only submits. Reproduce with `tools/dbg/gwalk.sh` (freeze-detect +
+per-thread guest-RA walk) and compare the AGC submit/EOP path to the Messenger's (which drains
+cleanly). Fixing the ring-drain/EOP delivery should let the RenderThread complete the frame, fire
+the fence, and advance the GameThread into world activation + the first scene draws. Diagnostic
+gdb tooling added this session: `tools/dbg/poll_probe.{sh,gdb}`, `poll_deep.{sh,gdb}`,
+`stall_bt2.sh`, `gwalk.sh`.
