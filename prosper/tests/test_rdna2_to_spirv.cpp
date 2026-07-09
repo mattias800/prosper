@@ -495,6 +495,14 @@ int main() {
     printf("  kernel24 mismatches=%u (out[5]=%g expect=%g)\n", bad24, got24.size()==N?got24[5]:-1, got24.size()==N?exp24[5]:-1);
     CHECK(got24.size()==N && bad24==0, "recompiled kernel 24 (unorm8x4 -> 4 normalized floats) correct");
 
+    // Kernel 24b (#150): the SAME unorm8x4 fetch but with a NON-dword-aligned inst offset (offset:2).
+    // The packed unpack extracts components at static byte offsets from a dword-aligned base and drops
+    // addr&3, so a non-aligned element base would decode the wrong bits — it must be REJECTED (the
+    // alignment can't be proven) rather than silently mis-decoded. Kernel 24 (offset 0) still succeeds.
+    const uint32_t code24b[] = { 0x7e000f00u, 0xe00c2002u, 0x80020100u, 0xbf810000u };
+    CHECK(recompile_valu(code24b, sizeof(code24b)/sizeof(code24b[0]), 1, /*out_vgpr*/1, &rt24).empty(),
+          "kernel 24b (packed unorm8x4 at a non-dword-aligned offset:2) is REJECTED (not mis-decoded)");
+
     // Kernel 25: SNORM16x2 vertex fetch — signed 16-bit fields, normalized /32767 and clamped to -1.0
     // (the SNORM rule: -32768 maps to -1.0, not -1.00003). out = v1 + 10*v2. y is fixed at -32768 to
     // exercise the clamp; x varies per lane to also prove correct sign-extension of the low field.

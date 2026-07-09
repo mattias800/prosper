@@ -1852,6 +1852,22 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // Integer sub-dword formats (Uint8/Sint8/Uint16/Sint16) aren't normalized floats and would
             // need an integer-attribute path; reject rather than mis-normalize.
             if (packed && !is_half && norm == 0.0f) { ok = false; return true; }
+            // Packed (sub-dword) components are extracted at STATIC byte offsets relative to a
+            // DWORD-ALIGNED element base — the low 2 bits of the address (addr&3) are dropped by the
+            // addr>>2 dword index and never folded into the bit extraction (#150). That is only correct
+            // when the element base is provably 4-byte aligned; otherwise a component (a half2 UV after
+            // a snorm16x3 normal, an unorm8 at a byte offset) decodes the wrong bits. A fully general
+            // fix needs a runtime bit position that can straddle dwords; until then, prove alignment
+            // from the address terms and REJECT the packed load/store when it can't be proven (surfacing
+            // the gap) rather than silently mis-decode. Aligned iff: inst offset %4==0; stride %4==0
+            // when idxen; no offen (a runtime per-lane byte offset is unprovable); SOFFSET is NULL/0.
+            if (packed) {
+                bool soff_zero = (in.src[2].kind == OperandKind::Special && in.src[2].value == 125) ||
+                                 (in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0);
+                bool base_aligned = ((offset & 3u) == 0) && !offen &&
+                                    (!idxen || (stride & 3u) == 0) && soff_zero;
+                if (!base_aligned) { ok = false; return true; }
+            }
             // Byte address of the element (#148): idxen -> a VADDR VGPR is an element index (×stride);
             // offen -> a VADDR VGPR is a per-lane byte offset; both terms ADD (were mutually exclusive,
             // silently dropping the byte offset when both were set). When idxen AND offen are set, VADDR
