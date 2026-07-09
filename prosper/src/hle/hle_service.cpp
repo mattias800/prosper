@@ -8,7 +8,11 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 #include <atomic>
+#ifdef __linux__
+#include <sys/mman.h>   // msync page-mapped probe in svc_log (diagnostic-only)
+#endif
 
 namespace prosper {
 
@@ -168,11 +172,202 @@ HLE(s_dialog_result)   { if (a0) memset(PW(a0), 0, 0x2C); return 0; }
 // CONFIDENCE: HIGH that failure beats success+garbage; LOW on the specific error constant.
 HLE(s_nptrophy2_unavailable) { return 0x80551500ull; }
 
+// ===== Issue #232: the Sony services DOLL's level-load flow polls (PlayGo / SaveData / =========
+// ===== NpTrophy2 lifecycle / Share). All NID<->name pairs verified against the PS5 3.20 ========
+// ===== library stub tables (PS5-3.20_Libs/libSce{PlayGo,SaveData.native,NpTrophy2,Share}.c). ===
+//
+// DOLL's game-side workers (DollLevelPreloader / SaveLoadUpdate / DLCDataUpdate / ShareUpdate)
+// gate the per-frame boot-flow state machine at eboot+0x5044740 on these services answering.
+// Bare unimpl->0 stubs returned SUCCESS with every out-param unfilled (the recurring
+// success+garbage-out bug class), so e.g. scePlayGoOpen "succeeded" without ever writing the
+// handle the game then queries loci with.
+
+// Diagnostic logging for this service family, gated on PROSPER_SVCLOG=1 (same pattern as
+// PROSPER_FILELOG/[file]). Dumps call args and a bounded hexdump of pointer-shaped args so the
+// PS5-only ABIs (sceSaveDataMount3/Prepare/Commit — no Kyty/shadPS4 reference exists) can be
+// pinned from live captures instead of guessed.
+namespace {
+bool svclog() { static int v = getenv("PROSPER_SVCLOG") ? 1 : 0; return v; }
+bool svc_ptrish(uint64_t v) { return v >= 0x10000 && v < 0x7fffffffffffull; }
+void svc_log(const char* fn, uint64_t a0, uint64_t a1, uint64_t a2,
+             uint64_t a3, uint64_t a4, uint64_t a5, int dump_words = 8) {
+    if (!svclog()) return;
+    fprintf(stderr, "[svc] %s(%#lx, %#lx, %#lx, %#lx, %#lx, %#lx)\n",
+            fn, (unsigned long)a0, (unsigned long)a1, (unsigned long)a2,
+            (unsigned long)a3, (unsigned long)a4, (unsigned long)a5);
+    const uint64_t args[6] = { a0, a1, a2, a3, a4, a5 };
+    for (int i = 0; i < 6; i++) {
+        if (!svc_ptrish(args[i])) continue;
+        // Never read across the arg's 4 KiB page end: an out-param can be a tiny heap block whose
+        // page neighbor is unmapped, and a diagnostic must not be able to fault the boot.
+        uint64_t page_left = 0x1000 - (args[i] & 0xfff);
+        int words = (int)(page_left / 8); if (words > dump_words) words = dump_words;
+#ifdef __linux__
+        // Integer-valued args can masquerade as pointers; probe the page is actually mapped
+        // (msync on an unmapped range fails ENOMEM) before dereferencing — a diagnostic must
+        // never be able to fault the boot.
+        if (msync((void*)(uintptr_t)(args[i] & ~0xfffull), 1, MS_ASYNC) != 0) continue;
+#endif
+        fprintf(stderr, "[svc]   a%d ->", i);
+        const uint64_t* q = (const uint64_t*)PW(args[i]);
+        for (int w = 0; w < words; w++) fprintf(stderr, " %016lx", (unsigned long)q[w]);
+        fprintf(stderr, "\n");
+    }
+}
+}
+
+// --- libScePlayGo: report ALL content installed and locus-local. --------------------------------
+// PS4-inherited API (identical exported names on PS5 3.20); shapes cross-checked against shadPS4
+// playgo.cpp + playgo_types.h and Kyty. A disc/fully-installed title is exactly this state on real
+// hardware, so "everything present" is the truthful answer for our complete dump.
+// Error space 0x80B2000x (shadPS4 playgo_types.h). CONFIDENCE: HIGH (two agreeing PS4 references,
+// PS4-inherited surface).
+static constexpr uint64_t PLAYGO_ERR_BAD_POINTER = 0x80B2000Aull;
+static constexpr uint64_t PLAYGO_ERR_BAD_SIZE    = 0x80B2000Bull;
+HLE(s_playgo_init)  { svc_log("scePlayGoInitialize", a0,a1,a2,a3,a4,a5); return 0; }
+HLE(s_playgo_term)  { return 0; }
+// scePlayGoOpen(u32* outHandle, const void* param): the handle the whole API is keyed on. The
+// unimpl stub's success-with-unfilled-handle left the game querying loci with garbage.
+HLE(s_playgo_open)  { svc_log("scePlayGoOpen", a0,a1,a2,a3,a4,a5);
+                      if (!a0) return PLAYGO_ERR_BAD_POINTER;
+                      *(uint32_t*)PW(a0) = 1; return 0; }
+HLE(s_playgo_close) { return 0; }
+// scePlayGoGetLocus(h, const u16* chunkIds, u32 n, s8* outLoci): every chunk is LOCAL_FAST (3).
+HLE(s_playgo_getlocus) { svc_log("scePlayGoGetLocus", a0,a1,a2,a3,a4,a5, 2);
+                         if (!a1 || !a3) return PLAYGO_ERR_BAD_POINTER;
+                         if (!(uint32_t)a2) return PLAYGO_ERR_BAD_SIZE;
+                         memset(PW(a3), 3 /*SCE_PLAYGO_LOCUS_LOCAL_FAST*/, (uint32_t)a2); return 0; }
+// scePlayGoGetProgress(h, chunkIds, n, OrbisPlayGoProgress* out): one struct {u64 progressSize;
+// u64 totalSize} summed over the queried chunks; fully-installed == progressSize==totalSize!=0.
+HLE(s_playgo_getprogress) { svc_log("scePlayGoGetProgress", a0,a1,a2,a3,a4,a5, 2);
+                            if (!a1 || !a3) return PLAYGO_ERR_BAD_POINTER;
+                            if (!(uint32_t)a2) return PLAYGO_ERR_BAD_SIZE;
+                            uint64_t* p = (uint64_t*)PW(a3);
+                            p[0] = p[1] = (uint64_t)(uint32_t)a2 << 20;  // 1 MiB/chunk, done==total
+                            return 0; }
+// scePlayGoGetToDoList(h, OrbisPlayGoToDo* list, u32 n, u32* outEntries): nothing left to install.
+HLE(s_playgo_gettodo) { if (!a3) return PLAYGO_ERR_BAD_POINTER; *(uint32_t*)PW(a3) = 0; return 0; }
+HLE(s_playgo_settodo) { return 0; }
+// scePlayGoGetChunkId(h, u16* list, u32 n, u32* outEntries): one chunk, id 0 (the minimal truthful
+// shape for a fully-local title; we don't parse playgo-chunk.dat).
+HLE(s_playgo_getchunkid) { if (!a3) return PLAYGO_ERR_BAD_POINTER;
+                           if (a1 && !(uint32_t)a2) return PLAYGO_ERR_BAD_SIZE;
+                           if (a1) { *(uint16_t*)PW(a1) = 0; *(uint32_t*)PW(a3) = 1; }
+                           else *(uint32_t*)PW(a3) = 1;
+                           return 0; }
+// scePlayGoGetEta(h, chunkIds, n, s64* outEta): everything installed -> 0 seconds.
+HLE(s_playgo_geteta) { if (!a1 || !a3) return PLAYGO_ERR_BAD_POINTER;
+                       if (!(uint32_t)a2) return PLAYGO_ERR_BAD_SIZE;
+                       *(int64_t*)PW(a3) = 0; return 0; }
+// scePlayGoGetInstallSpeed(h, s32* out): FULL (2) — nothing throttled.
+HLE(s_playgo_getspeed) { if (!a1) return PLAYGO_ERR_BAD_POINTER; *(int32_t*)PW(a1) = 2; return 0; }
+// scePlayGoGetLanguageMask(h, u64* out): all languages present. CONFIDENCE: MED (mask semantics
+// are per-language bits; all-ones = every language's chunks installed).
+HLE(s_playgo_getlang) { if (!a1) return PLAYGO_ERR_BAD_POINTER;
+                        *(uint64_t*)PW(a1) = ~0ull; return 0; }
+
+// --- libSceSaveData (PS5 "native" surface): report a clean FRESH console — no existing save. ----
+// DOLL calls Initialize3 -> CreateTransactionResource -> Mount3 -> Umount2 -> Prepare -> Commit
+// (live-captured first-seen order). Initialize3 is PS4-inherited (Kyty returns OK). Mount3 /
+// Prepare / Commit / CreateTransactionResource are PS5-only (present ONLY in the PS5 3.20
+// libSceSaveData native stub; no Kyty/shadPS4 implementation exists), so their exact structs are
+// unreferenced. Policy: a mount of a save that does not exist returns NOT_FOUND (0x809F0008 —
+// shadPS4 savedata_error.h; same 0x809F error facility on PS5) and writes NOTHING — the truthful
+// first-boot state on real hardware, which a shipped game must handle by proceeding to a fresh
+// game. This is strictly better than the previous unimpl->0 "mount succeeded" with a garbage
+// mount-result the game then reads paths from. Transaction bookkeeping calls succeed (they
+// allocate/tear down local resources only). CONFIDENCE: HIGH on Initialize3/NOT_FOUND semantics;
+// MED on Mount3's arg order (mount-desc in, result out — matches every PS4 Mount variant);
+// LOW on Prepare/Commit internals (no-op success; PROSPER_SVCLOG captures their real args).
+static constexpr uint64_t SAVE_DATA_ERR_PARAMETER = 0x809F0000ull;
+static constexpr uint64_t SAVE_DATA_ERR_NOT_FOUND = 0x809F0008ull;
+HLE(s_savedata_init3)   { svc_log("sceSaveDataInitialize3", a0,a1,a2,a3,a4,a5); return 0; }
+HLE(s_savedata_term)    { return 0; }
+HLE(s_savedata_txres)   { svc_log("sceSaveDataCreateTransactionResource", a0,a1,a2,a3,a4,a5); return 0; }
+HLE(s_savedata_txres_del) { return 0; }
+// sceSaveDataMount3(const Mount3* mount, MountResult* result). The mount desc layout is pinned
+// from DOLL's OWN wrapper (eboot+0x2251610 disassembly, matching the live capture):
+//   +0x00 u32 userId; +0x08 const char* dirName; +0x10 u64 blocks; +0x20 u32 mountMode;
+//   +0x28 u32 transactionResourceId  (the id returned by sceSaveDataCreateTransactionResource)
+// Live: dirName="Book", blocks 0x60 then 0x105, mode 1 (open-RO) then 5 (CREATE|RO).
+// mountMode bits are PS4-inherited: 1=RDONLY 2=RDWR 4=CREATE 8=DESTRUCT_OFF 16=COPY_ICON.
+// Behavior (real console semantics): open of a nonexistent save -> NOT_FOUND (fresh console;
+// the game handles it and retries with CREATE); CREATE makes the save dir and mounts it.
+// The 0x40-byte result is zeroed by the caller and fed to sceSaveDataPrepare(&{txId}, result);
+// we fill it with the PS4 MountResult shape (the only referenced layout): mountPoint char[16]
+// "/savedata0" @+0x00, requiredBlocks u64 @+0x10 = 0, mountStatus u32 @+0x1c (0=opened,
+// 1=created). hle_file translates /savedata0 to the mounted host dir.
+// CONFIDENCE: HIGH on the mount-desc layout + mode semantics (guest disasm + live capture +
+// PS4 references agree); MED on the result layout (PS4 shape; the PS5 field placement is
+// unproven — under live test which offsets the game actually reads).
+HLE(s_savedata_mount3)  {
+    svc_log("sceSaveDataMount3", a0,a1,a2,a3,a4,a5);
+    if (!a0 || !a1) return SAVE_DATA_ERR_PARAMETER;
+    const uint8_t* m = (const uint8_t*)PW(a0);
+    const char* dirname = *(const char* const*)(m + 0x08);
+    uint32_t mode = *(const uint32_t*)(m + 0x20);
+    if (!dirname) return SAVE_DATA_ERR_PARAMETER;
+    bool create = (mode & 0x24) != 0;   // CREATE(4) | CREATE2(0x20, create-if-missing; live: mode 0x20 remount)
+    if (!savedata0_mount(dirname, create)) {
+        if (svclog()) fprintf(stderr, "[svc]   Mount3 dir='%s' mode=%#x -> NOT_FOUND\n", dirname, mode);
+        return SAVE_DATA_ERR_NOT_FOUND;
+    }
+    uint8_t* r = (uint8_t*)PW(a1);
+    memset(r, 0, 0x40);
+    memcpy(r, "/savedata0", 11);
+    *(uint32_t*)(r + 0x1c) = create ? 1u : 0u;   // mountStatus: created vs opened
+    if (svclog()) fprintf(stderr, "[svc]   Mount3 dir='%s' mode=%#x -> OK (create=%d)\n", dirname, mode, (int)create);
+    return 0;
+}
+HLE(s_savedata_umount2) { svc_log("sceSaveDataUmount2", a0,a1,a2,a3,a4,a5); savedata0_umount(); return 0; }
+HLE(s_savedata_prepare) { svc_log("sceSaveDataPrepare", a0,a1,a2,a3,a4,a5); return 0; }
+HLE(s_savedata_commit)  { svc_log("sceSaveDataCommit", a0,a1,a2,a3,a4,a5); return 0; }
+// sceSaveDataDirNameSearch(const SearchCond* cond, SearchResult* result) — PS4-inherited contract,
+// pinned by DOLL's own callsite (eboot+0x224e920): cond {u32 userId@0; titleId*@8=0; dirName*@0x10=0;
+// key/order@0x18=0}, result {u32 hitNum@0; DirName* dirNames@8 (caller buffer, this+0x40);
+// u32 dirNamesNum@0x10=0x400; u32 setNum@0x14(1.7+)} — the guest stores hitNum to this+0x8040 as its
+// save count. Fresh console: 0 saves found, success (shadPS4 does exactly this when the save path
+// doesn't exist). CONFIDENCE: HIGH (guest callsite disassembly + shadPS4 agree).
+HLE(s_savedata_dirsearch) {
+    svc_log("sceSaveDataDirNameSearch", a0,a1,a2,a3,a4,a5);
+    if (!a1) return 0x809F0000ull;        // SAVE_DATA_ERROR_PARAMETER
+    uint32_t* res = (uint32_t*)PW(a1);
+    res[0] = 0;                            // hitNum = 0 (no existing saves)
+    res[5] = 0;                            // setNum (offset 0x14) = 0
+    return 0;
+}
+
+// --- libSceNpTrophy2 lifecycle: succeed with valid ids (trophy CONTENT stays unavailable). ------
+// PS4 NpTrophy ABI carried to Trophy2 (context/handle are small s32 ids written through arg0;
+// Kyty LibNpTrophy + shadPS4 np_trophy agree on the PS4 shape). The game's trophy worker needs
+// CreateContext/CreateHandle/RegisterContext to hand back usable ids so its bring-up completes;
+// the info queries (GetGameInfo/GetTrophyInfoArray) keep returning "unavailable" (see
+// s_nptrophy2_unavailable above) which the guest handles on a clean path. CONFIDENCE: MED.
+HLE(s_nptrophy2_createctx)    { svc_log("sceNpTrophy2CreateContext", a0,a1,a2,a3,a4,a5);
+                                if (a0) *(int32_t*)PW(a0) = 1; return 0; }
+HLE(s_nptrophy2_createhandle) { svc_log("sceNpTrophy2CreateHandle", a0,a1,a2,a3,a4,a5);
+                                if (a0) *(int32_t*)PW(a0) = 1; return 0; }
+HLE(s_nptrophy2_regctx)       { svc_log("sceNpTrophy2RegisterContext", a0,a1,a2,a3,a4,a5); return 0; }
+HLE(s_nptrophy2_ok)           { return 0; }
+
+// --- libSceShare: succeed; sharing features are simply unavailable headless. --------------------
+// Initialize + the SetContentParam/SetScreenshotOverlayImage setters carry no out-params the
+// guest reads; plain success lets the ShareUpdate worker finish its bring-up. CONFIDENCE: MED.
+HLE(s_share_ok) { return 0; }
+
+// --- libSceNpUniversalDataSystem (PS5 telemetry/activities): hand out ids, stay inert. ----------
+// PS5-only, no reference implementation; by symmetry with every Np Create* API the first arg of
+// CreateContext/CreateHandle is the out-id pointer (pointer-range-guarded so a wrong guess can't
+// fault). Offline console: everything else no-ops. CONFIDENCE: LOW (guarded).
+HLE(s_npuds_create) { svc_log("sceNpUniversalDataSystemCreate*", a0,a1,a2,a3,a4,a5);
+                      if (svc_ptrish(a0)) *(int32_t*)PW(a0) = 1; return 0; }
+HLE(s_npuds_ok)     { return 0; }
+
 void register_service_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
     // NpTrophy2: the config/info queries whose success-with-garbage-out crashed DOLL (see above).
     Hle::register_fn("4IzqhhUQ3nk", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetGameInfo");
-    Hle::register_fn("y3zHpdZO6ME", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetGameInfo-fill?");
+    Hle::register_fn("y3zHpdZO6ME", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetTrophyInfoArray");
     // user service
     R("sceUserServiceGetInitialUser", s_user_initial);
     R("sceUserServiceGetEvent", s_user_getevent);   // deliver the initial-user LOGIN event once
@@ -229,6 +424,52 @@ void register_service_hle() {
     R("sceSystemServiceGetStatus", s_syss_getstatus);
     // sceSystemServiceGetDisplaySafeAreaInfo (1n37q1Bvc5Y) — fill ratio=1.0 (see s_syss_safearea).
     Hle::register_fn("1n37q1Bvc5Y", (HleFn)s_syss_safearea, "sceSystemServiceGetDisplaySafeAreaInfo");
+
+    // ---- Issue #232 services (raw NIDs; every pair verified against the PS5 3.20 stub tables) ----
+    // libScePlayGo — everything installed & locus-local.
+    Hle::register_fn("ts6GlZOKRrE", (HleFn)s_playgo_init,        "scePlayGoInitialize");
+    Hle::register_fn("MPe0EeBGM-E", (HleFn)s_playgo_term,        "scePlayGoTerminate");
+    Hle::register_fn("M1Gma1ocrGE", (HleFn)s_playgo_open,        "scePlayGoOpen");
+    Hle::register_fn("Uco1I0dlDi8", (HleFn)s_playgo_close,       "scePlayGoClose");
+    Hle::register_fn("uWIYLFkkwqk", (HleFn)s_playgo_getlocus,    "scePlayGoGetLocus");
+    Hle::register_fn("-RJWNMK3fC8", (HleFn)s_playgo_getprogress, "scePlayGoGetProgress");
+    Hle::register_fn("Nn7zKwnA5q0", (HleFn)s_playgo_gettodo,     "scePlayGoGetToDoList");
+    Hle::register_fn("gUPGiOQ1tmQ", (HleFn)s_playgo_settodo,     "scePlayGoSetToDoList");
+    Hle::register_fn("73fF1MFU8hA", (HleFn)s_playgo_getchunkid,  "scePlayGoGetChunkId");
+    Hle::register_fn("v6EZ-YWRdMs", (HleFn)s_playgo_geteta,      "scePlayGoGetEta");
+    Hle::register_fn("rvBSfTimejE", (HleFn)s_playgo_getspeed,    "scePlayGoGetInstallSpeed");
+    Hle::register_fn("4AAcTU9R3XM", (HleFn)s_ok,                 "scePlayGoSetInstallSpeed");
+    Hle::register_fn("3OMbYZBaa50", (HleFn)s_playgo_getlang,     "scePlayGoGetLanguageMask");
+    Hle::register_fn("LosLlHOpNqQ", (HleFn)s_ok,                 "scePlayGoSetLanguageMask");
+    Hle::register_fn("-Q1-u1a7p0g", (HleFn)s_ok,                 "scePlayGoPrefetch");
+    // libSceSaveData (PS5 native surface) — fresh console: mount of a nonexistent save NOT_FOUND.
+    Hle::register_fn("TywrFKCoLGY", (HleFn)s_savedata_init3,     "sceSaveDataInitialize3");
+    Hle::register_fn("yKDy8S5yLA0", (HleFn)s_savedata_term,      "sceSaveDataTerminate");
+    Hle::register_fn("gjRZNnw0JPE", (HleFn)s_savedata_txres,     "sceSaveDataCreateTransactionResource");
+    Hle::register_fn("lJUQuaKqoKY", (HleFn)s_savedata_txres_del, "sceSaveDataDeleteTransactionResource");
+    Hle::register_fn("ZP4e7rlzOUk", (HleFn)s_savedata_mount3,    "sceSaveDataMount3");
+    Hle::register_fn("uW4vfTwMQVo", (HleFn)s_savedata_umount2,   "sceSaveDataUmount2");
+    Hle::register_fn("sDCBrmc61XU", (HleFn)s_savedata_prepare,   "sceSaveDataPrepare");
+    Hle::register_fn("ie7qhZ4X0Cc", (HleFn)s_savedata_commit,    "sceSaveDataCommit");
+    Hle::register_fn("dyIhnXq-0SM", (HleFn)s_savedata_dirsearch, "sceSaveDataDirNameSearch");
+    // libSceNpTrophy2 lifecycle — valid ids; content queries stay "unavailable" (above).
+    Hle::register_fn("Bagshr7OQ6Q", (HleFn)s_nptrophy2_createctx,    "sceNpTrophy2CreateContext");
+    Hle::register_fn("Gz1rmUZpROM", (HleFn)s_nptrophy2_createhandle, "sceNpTrophy2CreateHandle");
+    Hle::register_fn("bIDov3wBu5Q", (HleFn)s_nptrophy2_regctx,       "sceNpTrophy2RegisterContext");
+    Hle::register_fn("sUXGfNMalIo", (HleFn)s_nptrophy2_ok,           "sceNpTrophy2RegisterUnlockCallback");
+    Hle::register_fn("sysY2FHYff4", (HleFn)s_nptrophy2_ok,           "sceNpTrophy2DestroyContext");
+    Hle::register_fn("d8P11CI40KE", (HleFn)s_nptrophy2_ok,           "sceNpTrophy2DestroyHandle");
+    Hle::register_fn("fYapWA9xVmA", (HleFn)s_nptrophy2_ok,           "sceNpTrophy2AbortHandle");
+    // libSceShare — succeed; sharing simply unavailable headless.
+    Hle::register_fn("nBDD66kiFW8", (HleFn)s_share_ok, "sceShareInitialize");
+    Hle::register_fn("0IL1keINExQ", (HleFn)s_share_ok, "sceShareTerminate");
+    Hle::register_fn("ORspsWDXPps", (HleFn)s_share_ok, "sceShareSetContentParamForApplicationTitle");
+    Hle::register_fn("T64o-315wbg", (HleFn)s_share_ok, "sceShareSetScreenshotOverlayImage");
+    // libSceNpUniversalDataSystem — inert ids (guarded LOW-confidence out-writes).
+    Hle::register_fn("sjaobBgqeB4", (HleFn)s_npuds_ok,     "sceNpUniversalDataSystemInitialize");
+    Hle::register_fn("5zBnau1uIEo", (HleFn)s_npuds_create, "sceNpUniversalDataSystemCreateContext");
+    Hle::register_fn("hT0IAEvN+M0", (HleFn)s_npuds_create, "sceNpUniversalDataSystemCreateHandle");
+    Hle::register_fn("tpFJ8LIKvPw", (HleFn)s_npuds_ok,     "sceNpUniversalDataSystemRegisterContext");
     #undef R
 }
 

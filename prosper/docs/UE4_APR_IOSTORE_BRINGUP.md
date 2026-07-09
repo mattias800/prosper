@@ -1044,3 +1044,64 @@ the most likely to gate a "content ready -> start game" transition (a game waiti
 scePlayGo (report everything installed/locus-local) and sceSaveData (mount succeeds, empty) with real
 out-struct contracts, and trace the eboot+0x5044740 state machine's .data gate to the subsystem it
 polls.**
+
+### SESSION 5 (2026-07-10, issue #232): the PlayGo/SaveData/Trophy2/Share service contracts are implemented and the save flow now completes end-to-end — but still 0 DrawIndex; the "0x5044740 gate" hypothesis is DISPROVEN
+
+Implemented the real contracts for the services DOLL's boot flow calls (all NID<->name pairs
+verified against the PS5 3.20 library stub tables in `../PS5-3.20_Libs`; cross-checked shadPS4 +
+Kyty where the API is PS4-inherited):
+
+- **scePlayGo** — `Initialize`/`Open`/`GetLocus`/`GetProgress`/`GetToDoList`/`GetChunkId`/`GetEta`/
+  `GetInstallSpeed`/`GetLanguageMask`/`Close`/`Terminate`. Reports everything installed &
+  locus-local: `Open` writes handle=1 (was success+unfilled → the game queried loci with garbage);
+  `GetLocus` fills every entry LOCAL_FAST(3); `GetProgress` done==total; `GetToDoList` empty.
+  Live: **scePlayGoGetLocus is polled 1004×/run** — a per-chunk sweep (chunkIds 0x0001..0x03e7,
+  ~1000 chunks) that now answers "local" for all. CONFIDENCE HIGH (two PS4 references agree).
+- **sceSaveData (PS5 native surface)** — `Initialize3`/`CreateTransactionResource`/`Mount3`/
+  `Prepare`/`Commit`/`Umount2`/`DirNameSearch`/`Terminate`. The **Mount3 desc layout was RE'd from
+  DOLL's own wrapper** (eboot+0x2251610 disasm + live `PROSPER_SVCLOG` capture): `{u32 userId@0;
+  char* dirName@8; u64 blocks@0x10; u32 mode@0x20; u32 txResourceId@0x28}`. Real fresh-console
+  semantics: open-mode (mode&4==0) of a missing save → NOT_FOUND(0x809F0008); CREATE-mode
+  (mode 4 or 0x20) makes the host save dir and mounts guest **/savedata0** onto it (new hle_file
+  translation, PROSPER_SAVE0, default `/tmp/prosper-savedata0/<dirName>`). MountResult filled with
+  the PS4 shape (mountPoint "/savedata0"@0, requiredBlocks@0x10=0, mountStatus@0x1c). **Live: the
+  full flow now runs clean** — `Book` open→NOT_FOUND ×3, then CREATE→OK, remount(open)→OK,
+  Prepare, Commit, Umount2; the game writes `SystemSaveData999.dat`/`LanguageSaveData998.dat` into
+  the mounted dir. DirNameSearch (PS4 contract pinned by callsite eboot+0x224e920) → 0 hits (fresh).
+  CONFIDENCE: HIGH on mount-desc + mode semantics; MED on the MountResult field offsets (PS5
+  placement unproven; PROSPER_SVCLOG hexdumps the struct the guest reads for future verification).
+- **sceNpTrophy2 lifecycle** — `CreateContext`/`CreateHandle`/`RegisterContext` succeed with valid
+  ids (info queries stay "unavailable", the clean offline path). **sceShare** + **NpUniversalData
+  System** succeed inert. All confirmed firing once each and returning cleanly.
+
+**The "0x5044740 reads .data gates 0x9803460/0x9803470" hypothesis (sessions 4) is WRONG.** Static
+xref scan: every reference to 0x9803460/0x9803470 is *inside* fn 0x5044740 itself, wrapped in
+`__cxa_guard_acquire/release` (libc NIDs 3GPpjQdAMTw/9rAeANT2tyE, resolved via gotwho) around
+function-local **static double** init (frame-timing constants at 0x9603038/40/48, computed from
+`sceKernelReadTsc`). Live: both "gates" read **0x01 = the cxa-guard "initialized" flag**, not a
+game-state bool. So 0x5044740 is a per-frame **timing throttle** with lazy static init — NOT the
+level-activation gate. The services answering did not (and could not) "flip" it; it was always
+just a once-init guard.
+
+**The real remaining wall (precisely):** at steady state (13k+ flips, save flow complete), the
+game-side workers **DollLevelPreloader / SaveLoadUpdate / DLCDataUpdate / ShareUpdate are idle UE
+task-graph pool threads**, all parked in the same generic `scePthreadCondTimedwait` task-wait
+(eboot+0x2316b41→0x22a5fe0, the pool worker loop) — they are named for their typical task but are
+waiting for work to be **enqueued**, which never happens. FAsyncLoadingThread is drained (parked on
+its zenaphore 0x22ea954); IoDispatcher/IoService idle; RenderThread/RHIThread park in the AGC submit
+wait. Packet histogram unchanged: **0 DrawIndex, all DispatchDirect** (compute-only). So: the
+service layer the level-preload path depends on now answers correctly and the save/PlayGo/trophy
+bring-up completes, but **the game never enqueues the level-preload task** that would submit scene
+geometry. The gate is upstream of the services — in whatever game-flow condition decides "begin
+level load" (a menu/flow state machine advancing through `GameThread` vtable `*0x288` at
+eboot+0x5044775, or an online/NP-state or first-run condition). Next: trace the GameThread's
+`*0x288` state-advance object across frames to find which state it is stuck in and what predicate
+keeps it from transitioning to "load first level"; and audit the one-shot online init calls the
+flow makes right before settling (libSceNet/NetCtl/Http/Ssl/NpCppWebApi/NpWebApi2 all still
+unimpl→0 — a first-boot "check for update / entitlement" flow may spin on one of them, or on an
+sceNpState it reads as a wrong value).
+
+Verification: ctest **63/63**; services RE'd from PS5 stub tables + guest disasm (no fabrication);
+save flow verified end-to-end via PROSPER_SVCLOG + on-disk save files. Probes added:
+run232svc.sh, mount232.{gdb,sh}, soak232.sh, state232.py, runstate232.sh, gates232.py. New knob
+PROSPER_SVCLOG=1 (arg + page-guarded hexdump of the service family). Messenger smoke: see PR.
