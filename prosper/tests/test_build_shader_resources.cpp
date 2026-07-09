@@ -142,7 +142,8 @@ int main() {
     CHECK(t3.by_srt_offset(4 * 4) != nullptr, "constant buffers still present alongside vertex buffers");
     CHECK(t3.by_sgpr_base(99) == nullptr, "unknown sgpr_base -> null");
 
-    // --- textures: sharp[0] T#s carry their real format + byte size; BCn/unmapped are skipped (#65) ---
+    // --- textures: sharp[0] T#s carry their real format + byte size; BC1/2/3 are bound (decoded to RGBA8
+    // on upload, #121); BC4-7 + unmapped formats are still skipped (#65) ---
     {
         uint32_t tsgprs[32]; memset(tsgprs, 0, sizeof tsgprs);
         make_tsharp(&tsgprs[0],  0xD0000000ull, 1920, 1080, /*fmt*/56,  /*tile*/5, /*type 2D*/9);
@@ -166,7 +167,7 @@ int main() {
         tshdr.user_data = &tud;
 
         ShaderResourceTable tt = build_shader_resources(tshdr, tsgprs, 32);
-        CHECK(tt.resources.size() == 2, "BC1 + unmapped-format T#s skipped; 2 textures emitted");
+        CHECK(tt.resources.size() == 3, "fmt56 + fmt1 + BC1 emitted; unmapped fmt44 skipped (3 textures)");
 
         const ShaderResource* t0 = tt.by_sgpr_base(0);
         CHECK(t0 && t0->cls == ResourceClass::Texture, "fmt=56 texture emitted (title composite path)");
@@ -179,7 +180,10 @@ int main() {
               "fmt=1 -> Unorm8 x1 (R8, no longer assumed RGBA)");
         CHECK(t1 && t1->size == 2048u * 1024u, "fmt=1 size = w*h (was w*h*4, an 8 MB over-read of 2 MB)");
 
-        CHECK(tt.by_sgpr_base(16) == nullptr, "BC1 T# skipped (recognized, not yet sampleable)");
+        const ShaderResource* t2 = tt.by_sgpr_base(16);
+        CHECK(t2 && t2->format == DataFormat::Bc1, "BC1 T# now bound (decoded to RGBA8 on upload)");
+        CHECK(t2 && t2->size == ((256u + 3) / 4) * ((256u + 3) / 4) * 8u,
+              "BC1 size = ceil(w/4)*ceil(h/4)*8 (compressed block bytes, not w*h*4)");
         CHECK(tt.by_sgpr_base(24) == nullptr, "unmapped IMG_FMT T# skipped (no silent RGBA8)");
     }
 

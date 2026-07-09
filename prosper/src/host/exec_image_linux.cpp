@@ -1,6 +1,7 @@
 // exec_image_linux.cpp — Linux host backing + HLE stubs (M2/M3). Compiles to nothing
 // on non-Linux so the shared (mingw) build is unaffected.
 #include "exec_image.hpp"
+#include "sse4a.hpp"
 #include "../hle/nid.hpp"
 #include "../hle/dispatch.hpp"
 
@@ -412,7 +413,59 @@ namespace {
     // the canary on exactly this %fs-switching handler removes the false positive at its source (more
     // robust than copying the canary into every guest TCB, which is per-thread-fragile).
     __attribute__((no_stack_protector))
+    // AMD SSE4a (insertq/extrq) emulation. PS5 guest code is compiled for Zen2 (AMD) and emits SSE4a
+    // bitfield instructions that #UD (SIGILL) on Intel hosts. Decode the faulting instruction from the
+    // signal context, emulate it against the guest XMM registers, advance RIP, and let sigreturn resume.
+    // Register-operand forms only (the compiler-emitted ones) — returns false for anything else so the
+    // real fatal path still handles genuine SIGILLs. Async-signal-safe: touches only the ucontext and
+    // the mapped, executable instruction bytes at RIP.
+    //   INSERTQ (F2 0F 78 /r ib ib  and  F2 0F 79 /r): insert low `len` bits of src into dst at bit `idx`.
+    //   EXTRQ   (66 0F 78 /0 ib ib  and  66 0F 79 /r): extract `len` bits at `idx`, zero-extend into low 64.
+    // Control for the /78 imm forms is the two trailing imm8s; for the /79 reg forms it comes from the
+    // source xmm (EXTRQ: rm[13:0]; INSERTQ: rm[77:64]).  len==0 means 64. CONFIDENCE: HIGH (Intel SDM).
+    volatile unsigned long g_sse4a_emulated = 0;
+    bool try_emulate_sse4a(ucontext_t* uc) {
+        auto& g = uc->uc_mcontext.gregs;
+        uint64_t rip = (uint64_t)g[REG_RIP];
+        const uint8_t* p = (const uint8_t*)rip;
+        size_t i = 0;
+        uint8_t pfx = p[i];
+        if (pfx != 0xF2 && pfx != 0x66) return false;   // INSERTQ=F2, EXTRQ=66
+        i++;
+        uint8_t rex = 0;
+        if ((p[i] & 0xF0) == 0x40) rex = p[i++];
+        if (p[i++] != 0x0F) return false;
+        uint8_t op = p[i++];
+        if (op != 0x78 && op != 0x79) return false;
+        uint8_t modrm = p[i++];
+        if ((modrm >> 6) != 3) return false;            // register operands only
+        int reg = ((modrm >> 3) & 7) | ((rex & 4) ? 8 : 0);
+        int rm  = (modrm & 7)       | ((rex & 1) ? 8 : 0);
+        auto* fp = uc->uc_mcontext.fpregs;
+        if (!fp) return false;
+        auto lo  = [&](int n) { const uint32_t* e = fp->_xmm[n].element; return (uint64_t)e[0] | ((uint64_t)e[1] << 32); };
+        auto hi  = [&](int n) { const uint32_t* e = fp->_xmm[n].element; return (uint64_t)e[2] | ((uint64_t)e[3] << 32); };
+        auto set = [&](int n, uint64_t v) { uint32_t* e = fp->_xmm[n].element; e[0] = (uint32_t)v; e[1] = (uint32_t)(v >> 32); };
+        bool insertq = (pfx == 0xF2);
+        uint32_t len, idx;
+        if (op == 0x78)       { len = p[i++]; idx = p[i++]; }
+        else if (insertq)     { uint64_t c = hi(rm); len = (uint32_t)(c & 0x3f); idx = (uint32_t)((c >> 8) & 0x3f); }
+        else                  { uint64_t c = lo(rm); len = (uint32_t)(c & 0x3f); idx = (uint32_t)((c >> 8) & 0x3f); }
+        len &= 0x3f; idx &= 0x3f;                       // 6-bit fields; sse4a_* treat len==0 as 64
+        if (insertq)                                    // INSERTQ dst=reg, field source=rm
+            set(reg, sse4a_insertq(lo(reg), lo(rm), len, idx));
+        else {                                          // EXTRQ: imm form in-place on rm, reg form on reg
+            int dr = (op == 0x78) ? rm : reg;
+            set(dr, sse4a_extrq(lo(dr), len, idx));
+        }
+        g[REG_RIP] = (greg_t)(rip + i);
+        g_sse4a_emulated++;
+        return true;
+    }
+
     void fault_handler(int sig, siginfo_t* si, void* uctx) {
+        // Emulate AMD-only SSE4a bitfield ops (insertq/extrq) that #UD on Intel hosts, then resume.
+        if (sig == SIGILL && try_emulate_sse4a((ucontext_t*)uctx)) return;
         // PROSPER_HWBP race-free hardware breakpoint. The perf event is disabled while single-stepping,
         // so a SIGTRAP while g_hwbp_stepping is the step-completion (TF) -> re-enable + clear TF. Any
         // other SIGTRAP while armed is a HW-breakpoint hit -> log registers, then disable + single-step

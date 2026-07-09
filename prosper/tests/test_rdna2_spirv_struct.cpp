@@ -68,6 +68,20 @@ bool has_signed_i32_type(const std::vector<uint32_t>& spv) {
     return false;
 }
 
+// Whether the module contains an instruction with the given opcode.
+bool has_opcode(const std::vector<uint32_t>& spv, uint32_t opcode) {
+    if (spv.size() < 5) return false;
+    for (size_t i = 5; i < spv.size();) {
+        uint32_t word = spv[i];
+        uint32_t op = word & 0xffffu;
+        uint32_t wc = word >> 16u;
+        if (wc == 0 || i + wc > spv.size()) return false;
+        if (op == opcode) return true;
+        i += wc;
+    }
+    return false;
+}
+
 } // namespace
 
 int main() {
@@ -150,6 +164,53 @@ int main() {
         return 1;
     }
     printf("  [ok]   vertex fetch recompiles to valid SPIR-V with a resource table (binding 3)\n");
+
+    // image_sample LOD mode per execution model (#151): OpImageSampleImplicitLod is only legal in
+    // the Fragment execution model — the compute and vertex shells have no derivatives, so an
+    // image_sample there must lower to OpImageSampleExplicitLod (LOD 0) or spirv-val rejects the
+    // module and pipeline creation fails.
+    enum : uint32_t { OpImageSampleImplicitLod = 87, OpImageSampleExplicitLod = 88 };
+    ShaderResourceTable rt_tex;
+    { ShaderResource t{}; t.cls = ResourceClass::Texture; t.binding = 4; t.img_dim = 1; /*2D*/
+      t.width = 2; t.height = 2; t.sgpr_base = 8; rt_tex.resources.push_back(t); }
+
+    // Compute shell: v0,v1 = uv inputs; image_sample v[0:3], v[0:1], s[8:15], s[16:19] dmask:0xf dim:2D.
+    const uint32_t cs_sample[] = { 0xf0800f08u, 0x00820000u, 0xbf810000u };
+    std::vector<uint32_t> cspv = recompile_valu(cs_sample, sizeof(cs_sample)/sizeof(cs_sample[0]), 2, 0, &rt_tex);
+    if (cspv.empty() || cspv[0] != 0x07230203u) {
+        printf("  [FAIL] compute-shell image_sample did not recompile\n");
+        return 1;
+    }
+    if (has_opcode(cspv, OpImageSampleImplicitLod) || !has_opcode(cspv, OpImageSampleExplicitLod)) {
+        printf("  [FAIL] compute-shell image_sample emitted ImplicitLod (fragment-only) instead of ExplicitLod\n");
+        return 1;
+    }
+    printf("  [ok]   compute-shell image_sample lowers to OpImageSampleExplicitLod (LOD 0)\n");
+
+    // Vertex shell: image_sample then export the result as the position.
+    const uint32_t vs_sample[] = { 0xf0800f08u, 0x00820000u, 0xf80008cfu, 0x03020100u, 0xbf810000u };
+    std::vector<uint32_t> vsspv = recompile_vertex(vs_sample, sizeof(vs_sample)/sizeof(vs_sample[0]), &rt_tex);
+    if (vsspv.empty() || vsspv[0] != 0x07230203u) {
+        printf("  [FAIL] vertex-shell image_sample did not recompile\n");
+        return 1;
+    }
+    if (has_opcode(vsspv, OpImageSampleImplicitLod) || !has_opcode(vsspv, OpImageSampleExplicitLod)) {
+        printf("  [FAIL] vertex-shell image_sample emitted ImplicitLod (fragment-only) instead of ExplicitLod\n");
+        return 1;
+    }
+    printf("  [ok]   vertex-shell image_sample lowers to OpImageSampleExplicitLod (LOD 0)\n");
+
+    // Fragment shell must KEEP implicit LOD (derivative-based mip selection is the hardware behavior).
+    const uint32_t ps_sample[] = {
+        0x7e0002ffu, 0x3e800000u, 0x7e0202ffu, 0x3e800000u, 0xf0800f08u, 0x00820000u,
+        0xf800000fu, 0x03020100u, 0xbf810000u,
+    };
+    std::vector<uint32_t> pspv = recompile_fragment(ps_sample, sizeof(ps_sample)/sizeof(ps_sample[0]), &rt_tex);
+    if (pspv.empty() || !has_opcode(pspv, OpImageSampleImplicitLod)) {
+        printf("  [FAIL] fragment image_sample no longer uses OpImageSampleImplicitLod\n");
+        return 1;
+    }
+    printf("  [ok]   fragment image_sample still uses OpImageSampleImplicitLod\n");
 
     printf("== PASS ==\n");
     return 0;

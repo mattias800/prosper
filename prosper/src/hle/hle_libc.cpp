@@ -251,7 +251,9 @@ namespace {
 HLE(h_getpctype)  { build_ctype(); return (uint64_t)(uintptr_t)(g_ctype + 1); }
 HLE(h_getptolow)  { build_ctype(); return (uint64_t)(uintptr_t)(g_tolow + 1); }
 HLE(h_getptoup)   { build_ctype(); return (uint64_t)(uintptr_t)(g_toup + 1); }
-HLE(h_mbcurmax)   { static int one = 1; return (uint64_t)(uintptr_t)&one; }   // __ctype_get_mb_cur_max ptr/val
+// glibc contract: __ctype_get_mb_cur_max returns the VALUE of MB_CUR_MAX (size_t),
+// not a pointer. 1 in the "C" locale we present via setlocale.
+HLE(h_mbcurmax)   { return 1; }
 HLE(h_setlocale)  { static char c[] = "C"; return (uint64_t)(uintptr_t)c; }
 
 // C++/CRT lifecycle: we don't run global destructors, so registration is a no-op.
