@@ -120,6 +120,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_sync_on_address PRIVATE prosper_core)
   add_test(NAME sync_on_address COMMAND test_sync_on_address)
 
+  # Guest mutex TYPE semantics (#145): settype honored, Sony/FreeBSD ERRORCHECK default (incl.
+  # static-sentinel self-init), FreeBSD errno values (EDEADLK=11). Pure, no game dump needed.
+  add_executable(test_mutex_types tests/test_mutex_types.cpp)
+  target_link_libraries(test_mutex_types PRIVATE prosper_core)
+  add_test(NAME mutex_types COMMAND test_mutex_types)
+
   add_executable(test_agc_shader tests/test_agc_shader.cpp)
   target_link_libraries(test_agc_shader PRIVATE prosper_core)
   add_test(NAME agc_shader_create COMMAND test_agc_shader)
