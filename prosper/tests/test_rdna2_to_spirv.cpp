@@ -1249,6 +1249,53 @@ int main() {
     printf("  kernelN(v_nop) mismatches=%u (out[33]=%g expect=%g)\n", badN, gotN.size()==N?gotN[33]:-1, expN[33]);
     CHECK(gotN.size()==N && badN==0, "v_nop is transparent: out = (a0+a1)*a2 computed correctly");
 
+    // Kernels S1/S2: v_cvt_u32_f32 / v_cvt_i32_f32 SATURATION (#135). RDNA2 saturates the
+    // float->int converts (NaN -> 0, negative -> 0 for u32, out-of-range clamps to the type
+    // min/max); a bare OpConvertFToU/S is undefined out of range, so drivers returned garbage.
+    // Round-trip through v_cvt_f32_u32 / v_cvt_f32_i32 so the output buffer holds a comparable
+    // float. Encodings llvm-mc gfx1030 round-trip verified.
+    //   S1: v_cvt_u32_f32 v0,v0 | v_cvt_f32_u32 v0,v0 | s_endpgm
+    //   S2: v_cvt_i32_f32 v0,v0 | v_cvt_f32_i32 v0,v0 | s_endpgm
+    const uint32_t codeS1[] = { 0x7E000F00u, 0x7E000D00u, 0xBF810000u };
+    const uint32_t codeS2[] = { 0x7E001100u, 0x7E000B00u, 0xBF810000u };
+    std::vector<uint32_t> spvS1 = recompile_valu(codeS1, sizeof(codeS1)/sizeof(codeS1[0]), 1, 0);
+    std::vector<uint32_t> spvS2 = recompile_valu(codeS2, sizeof(codeS2)/sizeof(codeS2[0]), 1, 0);
+    CHECK(!spvS1.empty(), "recompiled kernel S1 (v_cvt_u32_f32 saturating) -> SPIR-V");
+    CHECK(!spvS2.empty(), "recompiled kernel S2 (v_cvt_i32_f32 saturating) -> SPIR-V");
+    const float satIn[] = { 3.7f, 0.0f, -0.5f, -5.5f, 255.9f, -1e10f, 1e10f, 4294967040.0f,
+                            2147483520.0f, std::nanf(""), INFINITY, -INFINITY };
+    const uint32_t NSAT = sizeof(satIn)/sizeof(satIn[0]);
+    auto sat_u32 = [](float x) -> uint32_t {
+        if (std::isnan(x)) return 0u;
+        if (x <= 0.0f) return 0u;
+        if (x >= 4294967296.0f) return 0xFFFFFFFFu;
+        return (uint32_t)x;
+    };
+    auto sat_i32 = [](float x) -> int32_t {
+        if (std::isnan(x)) return 0;
+        if (x <= -2147483648.0f) return INT32_MIN;
+        if (x >= 2147483648.0f) return INT32_MAX;
+        return (int32_t)x;
+    };
+    std::vector<float> inS(N), expS1(N), expS2(N);
+    for (uint32_t i = 0; i < N; i++) {
+        float a = satIn[i % NSAT];
+        inS[i] = a; expS1[i] = (float)sat_u32(a); expS2[i] = (float)sat_i32(a);
+    }
+    std::vector<float> gotS1 = prosper::test::run_compute(spvS1, inS, N, N);
+    std::vector<float> gotS2 = prosper::test::run_compute(spvS2, inS, N, N);
+    uint32_t badS1 = 0, badS2 = 0;
+    for (uint32_t i = 0; i < N && gotS1.size() == N; i++)
+        if (std::fabs(gotS1[i] - expS1[i]) > 1e-3f + 1e-6f*std::fabs(expS1[i])) badS1++;
+    for (uint32_t i = 0; i < N && gotS2.size() == N; i++)
+        if (std::fabs(gotS2[i] - expS2[i]) > 1e-3f + 1e-6f*std::fabs(expS2[i])) badS2++;
+    printf("  kernelS1(u32 sat) mismatches=%u (nan->%g, -5.5->%g, 1e10->%g expect 0,0,%g)\n", badS1,
+           gotS1.size()==N?gotS1[9]:-1, gotS1.size()==N?gotS1[3]:-1, gotS1.size()==N?gotS1[6]:-1, expS1[6]);
+    printf("  kernelS2(i32 sat) mismatches=%u (nan->%g, -1e10->%g, 1e10->%g expect 0,%g,%g)\n", badS2,
+           gotS2.size()==N?gotS2[9]:-1, gotS2.size()==N?gotS2[5]:-1, gotS2.size()==N?gotS2[6]:-1, expS2[5], expS2[6]);
+    CHECK(gotS1.size()==N && badS1==0, "v_cvt_u32_f32 saturates (NaN/neg -> 0, >=2^32 -> UINT_MAX)");
+    CHECK(gotS2.size()==N && badS2==0, "v_cvt_i32_f32 saturates (NaN -> 0, clamps to INT_MIN/INT_MAX)");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

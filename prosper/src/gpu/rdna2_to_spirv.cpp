@@ -129,7 +129,21 @@ struct SpirvCompute {
     uint32_t fext2(uint32_t inst, uint32_t a, uint32_t b) { uint32_t r = id(); putv(code, Op_ExtInst, {t_f32, r, glsl, inst, bcf(a), bcf(b)}); return bcu(r); }
     uint32_t frcp(uint32_t a) { uint32_t rf = id(); put(code, Op_FDiv, {t_f32, rf, fconstf(1.0f), bcf(a)}); return bcu(rf); }
     uint32_t cvt_u2f(uint32_t u) { uint32_t rf = id(); put(code, Op_ConvertUToF, {t_f32, rf, u}); return bcu(rf); }   // uint -> float bits
-    uint32_t cvt_f2u(uint32_t bits) { uint32_t r = id(); put(code, Op_ConvertFToU, {t_u32, r, bcf(bits)}); return r; }
+    // v_cvt_u32_f32 SATURATES: NaN -> 0, negative -> 0, >= 2^32 -> 0xFFFFFFFF. A bare OpConvertFToU
+    // has an undefined result out of range (#135), so clamp first. FMin/FMax are themselves
+    // NaN-undefined, so NaN is routed to 0 explicitly. 4294967040.0f (0x4F7FFFFF) is the largest
+    // float < 2^32 — the next float IS 2^32, so the clamp is exact for every in-range input;
+    // inputs >= 2^32 (incl. +inf) select UINT_MAX.
+    uint32_t cvt_f2u(uint32_t bits) {
+        uint32_t f = bcf(bits);
+        uint32_t nan = id();  put(code, Op_FUnordNotEqual, {t_bool, nan, f, f});   // true iff NaN
+        uint32_t safe = id(); put(code, Op_Select, {t_f32, safe, nan, fconstf(0.0f), f});
+        uint32_t lo = id();   putv(code, Op_ExtInst, {t_f32, lo, glsl, Glsl_FMax, safe, fconstf(0.0f)});
+        uint32_t cl = id();   putv(code, Op_ExtInst, {t_f32, cl, glsl, Glsl_FMin, lo, fconstf(4294967040.0f)});
+        uint32_t r = id();    put(code, Op_ConvertFToU, {t_u32, r, cl});
+        uint32_t big = id();  put(code, Op_FOrdGreaterThanEqual, {t_bool, big, f, fconstf(4294967296.0f)});
+        return sel(big, uconst(0xFFFFFFFFu), r);
+    }
     // Float ordered compare on bit-operands -> bool (for VCC). select() picks bits by a bool condition.
     uint32_t fcmp(uint32_t cmpop, uint32_t a, uint32_t b) { uint32_t r = id(); put(code, cmpop, {t_bool, r, bcf(a), bcf(b)}); return r; }
     uint32_t bfalse() { if (!bconst_false) { bconst_false = id(); put(types, Op_ConstantFalse, {t_bool, bconst_false}); } return bconst_false; }
@@ -184,7 +198,19 @@ struct SpirvCompute {
     }
     uint32_t sbin(uint32_t op, uint32_t a, uint32_t b) { uint32_t ri = id(); put(code, op, {t_i32, ri, bcs(a), bcs(b)}); return i2u(ri); }
     uint32_t sext2(uint32_t inst, uint32_t a, uint32_t b) { uint32_t ri = id(); putv(code, Op_ExtInst, {t_i32, ri, glsl, inst, bcs(a), bcs(b)}); return i2u(ri); }
-    uint32_t cvt_f2i(uint32_t bits) { uint32_t ri = id(); put(code, Op_ConvertFToS, {t_i32, ri, bcf(bits)}); return i2u(ri); }
+    // v_cvt_i32_f32 SATURATES: NaN -> 0, clamp to [INT_MIN, INT_MAX] (#135). 2147483520.0f
+    // (0x4EFFFFFF) is the largest float < 2^31, so the high clamp is exact in range and inputs
+    // >= 2^31 select INT_MAX; -2^31 is exactly representable, so the low clamp needs no select.
+    uint32_t cvt_f2i(uint32_t bits) {
+        uint32_t f = bcf(bits);
+        uint32_t nan = id();  put(code, Op_FUnordNotEqual, {t_bool, nan, f, f});   // true iff NaN
+        uint32_t safe = id(); put(code, Op_Select, {t_f32, safe, nan, fconstf(0.0f), f});
+        uint32_t hi = id();   putv(code, Op_ExtInst, {t_f32, hi, glsl, Glsl_FMin, safe, fconstf(2147483520.0f)});
+        uint32_t cl = id();   putv(code, Op_ExtInst, {t_f32, cl, glsl, Glsl_FMax, hi, fconstf(-2147483648.0f)});
+        uint32_t ri = id();   put(code, Op_ConvertFToS, {t_i32, ri, cl});
+        uint32_t big = id();  put(code, Op_FOrdGreaterThanEqual, {t_bool, big, f, fconstf(2147483648.0f)});
+        return sel(big, uconst(0x7FFFFFFFu), i2u(ri));
+    }
     uint32_t cvt_i2f(uint32_t bits) { uint32_t rf = id(); put(code, Op_ConvertSToF, {t_f32, rf, bcs(bits)}); return bcu(rf); }
     // Integer compares -> bool. scmp treats operands as signed, ucmp as unsigned.
     uint32_t scmp(uint32_t op, uint32_t a, uint32_t b) { uint32_t r = id(); put(code, op, {t_bool, r, bcs(a), bcs(b)}); return r; }
