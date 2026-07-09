@@ -494,11 +494,18 @@ struct SpirvCompute {
         put(code, Op_Label, {merge}); cur_block = merge;
     }
     // LDS (Local Data Share) — a workgroup-shared u32 array for compute ds_read/ds_write. Declared on
-    // first use. 4096 dwords (16 KB, the RDNA2 per-workgroup LDS size).
+    // first use, sized to `lds_dwords`. RDNA2's per-workgroup LDS MAX is 64 KB (16384 dwords); the real
+    // per-shader allocation is COMPUTE_PGM_RSRC2.LDS_SIZE. `lds_dwords` defaults to 4096 (16 KB) — a
+    // shader whose real allocation exceeds that would ds_read/write past the array (OOB Workgroup
+    // access, UB — NOT covered by robustBufferAccess), so recompile_valu raises it from the plumbed
+    // size when known (#130). Kept at 16 KB by default because it must also stay within the target
+    // device's VkPhysicalDeviceLimits::maxComputeSharedMemorySize (e.g. llvmpipe = 32 KB), so we can't
+    // just declare the full 64 KB unconditionally.
+    uint32_t lds_dwords = 4096;
     uint32_t lds_var = 0, t_ptr_wg_u32 = 0;
     void declare_lds() {
         if (lds_var) return;
-        uint32_t len = uconst(4096);
+        uint32_t len = uconst(lds_dwords);
         uint32_t t_arr = id();        put(types, Op_TypeArray, {t_arr, t_u32, len});
         uint32_t t_ptr_wg_arr = id(); put(types, Op_TypePointer, {t_ptr_wg_arr, SC_Workgroup, t_arr});
         lds_var = id();               put(types, Op_Variable, {t_ptr_wg_arr, lds_var, SC_Workgroup});
@@ -2179,10 +2186,16 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
 
 std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
                                      uint32_t num_inputs, uint32_t out_vgpr,
-                                     const ShaderResourceTable* rt) {
+                                     const ShaderResourceTable* rt, uint32_t lds_bytes) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
     SpirvCompute b;
+    // Size the LDS array from the shader's real allocation when known (#130): bytes -> dwords, at
+    // least the ds ops need, clamped to the RDNA2 64 KB (16384-dword) max. 0 keeps the 16 KB default.
+    if (lds_bytes) {
+        uint32_t dw = (lds_bytes + 3) / 4;
+        b.lds_dwords = dw > 16384u ? 16384u : (dw ? dw : 1u);
+    }
     b.begin(num_inputs ? num_inputs : 1);
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
     auto safe_branches = safe_execz_branches(ins);
