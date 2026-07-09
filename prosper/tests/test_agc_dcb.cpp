@@ -67,6 +67,22 @@ int main() {
     p_addr(rc, 0xAABBCCDD00112233ull, 0, 0, 0, 0);
     CHECK(cmd[2] == 0x00112233u && cmd[3] == 0xAABBCCDDu, "PatchSetAddress rewrote cmd[2]/cmd[3]");
 
+    // sceAgcGetDataPacketPayloadAddress (#140): resolves a data packet to its register-bank payload.
+    // Type 1 is the RE'd case (payload at cmd+2); type 0 is unconfirmed and returns cmd+2 best-effort
+    // (loud-once, not silent). Null out-ptr / null cmd -> invalid-arg. Verify the *addr contract.
+    auto getpayload = Hle::lookup("V++UgBtQhn0");
+    CHECK(getpayload != nullptr, "GetDataPacketPayloadAddress registered");
+    if (getpayload) {
+        uint32_t pkt[8]; uint32_t* out = nullptr;
+        CHECK(getpayload((uint64_t)(uintptr_t)&out, (uint64_t)(uintptr_t)pkt, /*type*/1, 0, 0, 0) == 0 &&
+              out == pkt + 2, "type 1: *addr = cmd+2, rc 0");
+        out = nullptr;
+        CHECK(getpayload((uint64_t)(uintptr_t)&out, (uint64_t)(uintptr_t)pkt, /*type*/0, 0, 0, 0) == 0 &&
+              out == pkt + 2, "type 0 (unconfirmed): *addr = cmd+2 best-effort, rc 0 (not aborted)");
+        CHECK(getpayload(0, (uint64_t)(uintptr_t)pkt, 1, 0, 0, 0) != 0, "null out-ptr -> invalid-arg");
+        CHECK(getpayload((uint64_t)(uintptr_t)&out, 0, 1, 0, 0, 0) != 0, "null cmd -> invalid-arg");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
