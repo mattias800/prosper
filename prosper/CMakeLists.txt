@@ -60,6 +60,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_hle_registered PRIVATE prosper_core)
   add_test(NAME hle_functions_registered COMMAND test_hle_registered)
 
+  # Cooperative stop signal (issue #164 P0): request_stop/stop_requested the frontend uses to wind
+  # the guest run-loop down on window-close. Pure, no deps.
+  add_executable(test_lifecycle tests/test_lifecycle.cpp)
+  target_link_libraries(test_lifecycle PRIVATE prosper_core)
+  add_test(NAME lifecycle_stop_signal COMMAND test_lifecycle)
+
   # va2foff resolution order (issue #113): DYNAMIC/PROCPARAM/TLS must never shadow
   # the PT_LOAD that truly maps a VA. Pure unit test — no game dump required.
   add_executable(test_va2foff tests/test_va2foff.cpp)
@@ -413,22 +419,32 @@ endif()
 # below just use the resulting SDL3::SDL3 target.
 option(PROSPER_AUDIO_SDL3 "Build the optional SDL3 audio frontend"   OFF)
 option(PROSPER_PAD_SDL3   "Build the optional SDL3 gamepad frontend" OFF)
-if((PROSPER_AUDIO_SDL3 OR PROSPER_PAD_SDL3) AND TARGET prosper_core AND NOT TARGET SDL3::SDL3)
+option(PROSPER_APP        "Build the prosper-app frontend (SDL3 window + Vulkan present)" OFF)
+if((PROSPER_AUDIO_SDL3 OR PROSPER_PAD_SDL3 OR PROSPER_APP) AND TARGET prosper_core AND NOT TARGET SDL3::SDL3)
   find_package(SDL3 QUIET CONFIG)
   if(NOT SDL3_FOUND)
-    message(STATUS "SDL3 not found — fetching release-3.2.30 (audio=${PROSPER_AUDIO_SDL3} pad=${PROSPER_PAD_SDL3})")
+    message(STATUS "SDL3 not found — fetching release-3.2.30 (audio=${PROSPER_AUDIO_SDL3} pad=${PROSPER_PAD_SDL3} app=${PROSPER_APP})")
     include(FetchContent)
     set(SDL_TEST OFF CACHE BOOL "" FORCE)
     set(SDL_TESTS OFF CACHE BOOL "" FORCE)
     set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(SDL_SHARED OFF CACHE BOOL "" FORCE)
     set(SDL_STATIC ON CACHE BOOL "" FORCE)
-    # No windowing system required (audio sink / controller state only). SDL_UNIX_CONSOLE_BUILD is
-    # SDL's documented "no windowing system" escape hatch; trim the subsystems we never use.
-    set(SDL_UNIX_CONSOLE_BUILD ON CACHE BOOL "" FORCE)
-    set(SDL_VIDEO OFF CACHE BOOL "" FORCE)
-    set(SDL_WAYLAND OFF CACHE BOOL "" FORCE)
-    set(SDL_X11 OFF CACHE BOOL "" FORCE)
+    # The window frontend (PROSPER_APP) needs a windowing system (Wayland/X11) for the Vulkan
+    # surface; audio/pad-only builds do not — use SDL's console (no-video) escape hatch there. This
+    # is the same "union of subsystems" logic as the joystick block below: enable VIDEO iff any
+    # enabled frontend needs a window.
+    if(PROSPER_APP)
+      set(SDL_UNIX_CONSOLE_BUILD OFF CACHE BOOL "" FORCE)
+      set(SDL_VIDEO   ON CACHE BOOL "" FORCE)
+      set(SDL_WAYLAND ON CACHE BOOL "" FORCE)
+      set(SDL_X11     ON CACHE BOOL "" FORCE)
+    else()
+      set(SDL_UNIX_CONSOLE_BUILD ON CACHE BOOL "" FORCE)
+      set(SDL_VIDEO   OFF CACHE BOOL "" FORCE)
+      set(SDL_WAYLAND OFF CACHE BOOL "" FORCE)
+      set(SDL_X11     OFF CACHE BOOL "" FORCE)
+    endif()
     set(SDL_RENDER OFF CACHE BOOL "" FORCE)
     set(SDL_GPU OFF CACHE BOOL "" FORCE)
     set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
@@ -451,6 +467,22 @@ if((PROSPER_AUDIO_SDL3 OR PROSPER_PAD_SDL3) AND TARGET prosper_core AND NOT TARG
       GIT_TAG release-3.2.30
       GIT_SHALLOW TRUE)
     FetchContent_MakeAvailable(SDL3)
+  endif()
+endif()
+
+# --- prosper-app: SDL3 window + Vulkan swapchain present frontend (issue #164 P0) -----------
+# Presents the frame prosper's renderer hands to the present layer (present_readback) in a real
+# window. A SEPARATE Vulkan context from the core's headless render device (docs/FRONTEND_APP.md);
+# frames cross as CPU pixels. Entirely outside prosper_core. Default OFF; needs SDL3 (video) + Vulkan.
+if(PROSPER_APP AND TARGET SDL3::SDL3)
+  find_package(Vulkan QUIET)
+  if(Vulkan_FOUND)
+    add_executable(prosper-app frontends/prosper-app/main.cpp)
+    target_include_directories(prosper-app PRIVATE src)
+    target_link_libraries(prosper-app PRIVATE prosper_core SDL3::SDL3 Vulkan::Vulkan)
+    message(STATUS "prosper-app frontend enabled (SDL3 window + Vulkan present)")
+  else()
+    message(WARNING "PROSPER_APP=ON but Vulkan not found — skipping prosper-app")
   endif()
 endif()
 
