@@ -19,6 +19,7 @@ namespace prosper::gpu {
 namespace {
 std::atomic<int>      g_front{-1};
 std::atomic<uint64_t> g_present_count{0};
+std::atomic<uint64_t> g_frame_seq{0};   // # of rendered frames handed in via present_write_frame
 
 // The rendered frame the back-half hands us (the "scanout" image). Guarded by a mutex because the
 // renderer thread writes it while guest threads / tests read it via present_readback.
@@ -36,7 +37,10 @@ void present_write_frame(const void* pixels, uint32_t w, uint32_t h) {
     std::memcpy(g_frame.data(), pixels, bytes);
     g_frame_w = w; g_frame_h = h;
     g_have_frame.store(true, std::memory_order_release);
+    g_frame_seq.fetch_add(1, std::memory_order_relaxed);
 }
+
+uint64_t present_frame_seq() { return g_frame_seq.load(std::memory_order_relaxed); }
 
 bool present_has_frame() { return g_have_frame.load(std::memory_order_acquire); }
 

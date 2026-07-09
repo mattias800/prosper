@@ -358,6 +358,17 @@ if(TARGET prosper_core)
       target_include_directories(prosper_live_renderer PUBLIC frontends/shared)
       target_link_libraries(boot_trace PRIVATE prosper_live_renderer)
 
+      # screenshot: run a game and capture a PNG every N frames (default 60) until M shots (default
+      # 30). Reuses boot_program + the shared live renderer; writes zlib-compressed PNGs (needs zlib).
+      find_package(ZLIB QUIET)
+      if(ZLIB_FOUND)
+        add_executable(screenshot tools/screenshot/screenshot.cpp)
+        target_include_directories(screenshot PRIVATE src)
+        target_link_libraries(screenshot PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan ZLIB::ZLIB)
+      else()
+        message(STATUS "zlib not found — skipping the screenshot tool")
+      endif()
+
       add_executable(test_vulkan_offscreen tests/test_vulkan_offscreen.cpp)
       target_link_libraries(test_vulkan_offscreen PRIVATE Vulkan::Vulkan)
       add_test(NAME vulkan_offscreen_clear COMMAND test_vulkan_offscreen)

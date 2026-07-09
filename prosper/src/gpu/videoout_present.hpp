@@ -30,7 +30,8 @@ void present_write_frame(const void* pixels, uint32_t w, uint32_t h);
 bool present_has_frame();
 
 int      present_front_index();   // currently-presented buffer index (-1 before the first flip)
-uint64_t present_count();         // total flips presented
+uint64_t present_count();         // total flips presented (guest-paced; can be far faster than render)
+uint64_t present_frame_seq();     // count of rendered frames handed in (present_write_frame calls)
 uint32_t present_width();
 uint32_t present_height();
 
