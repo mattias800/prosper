@@ -83,6 +83,20 @@ bool has_opcode(const std::vector<uint32_t>& spv, uint32_t opcode) {
     return false;
 }
 
+// Whether the module contains OpDecorate (71) with the given decoration (word[i+2]).
+bool has_decoration(const std::vector<uint32_t>& spv, uint32_t decoration) {
+    enum : uint32_t { OpDecorateL = 71 };
+    if (spv.size() < 5) return false;
+    for (size_t i = 5; i < spv.size();) {
+        uint32_t word = spv[i];
+        uint32_t op = word & 0xffffu, wc = word >> 16u;
+        if (wc == 0 || i + wc > spv.size()) return false;
+        if (op == OpDecorateL && wc >= 3 && spv[i + 2] == decoration) return true;
+        i += wc;
+    }
+    return false;
+}
+
 // The largest OpTypeArray length (resolved through its OpConstant) in the module — for LDS sizing
 // (#130), the Workgroup LDS array is the biggest array the compute shell declares.
 uint32_t max_array_length(const std::vector<uint32_t>& spv) {
@@ -266,6 +280,36 @@ int main() {
         return 1;
     }
     printf("  [ok]   lds_bytes>64 KB clamps to the RDNA2 max (16384 dwords)\n");
+
+    // v_interp_mov flat read (#152): an attribute read via v_interp_mov (a provoking-vertex / flat
+    // read) must decorate its FS Input varying Flat so the driver delivers the raw vertex value, not
+    // a smooth blend. An attribute read via BOTH v_interp_mov and v_interp_p2 is contradictory ->
+    // reject. Encodings llvm-mc gfx1030 verified. Dec_Flat = 14.
+    enum : uint32_t { OpDecorate = 71, DecFlat = 14 };
+    // Flat-only: v_interp_mov v3, p0, attr0.x ; exp mrt0 v3,v3,v3,v3 ; s_endpgm
+    const uint32_t ps_flat[] = { 0xc80e0002u, 0xf800000fu, 0x03030303u, 0xbf810000u };
+    std::vector<uint32_t> flat_spv = recompile_fragment(ps_flat, sizeof(ps_flat)/sizeof(ps_flat[0]));
+    if (flat_spv.empty() || !has_decoration(flat_spv, DecFlat)) {
+        printf("  [FAIL] v_interp_mov attribute is not decorated Flat (would smooth-interpolate a flat read)\n");
+        return 1;
+    }
+    printf("  [ok]   v_interp_mov attribute varying is decorated Flat\n");
+    // Smooth-only: v_interp_p1 + v_interp_p2 on attr0 ; exp mrt0 v4 -> NOT Flat.
+    const uint32_t ps_smooth[] = { 0xc8080000u, 0xc8110002u, 0xf800000fu, 0x04040404u, 0xbf810000u };
+    std::vector<uint32_t> smooth_spv = recompile_fragment(ps_smooth, sizeof(ps_smooth)/sizeof(ps_smooth[0]));
+    if (smooth_spv.empty() || has_decoration(smooth_spv, DecFlat)) {
+        printf("  [FAIL] a smooth-interpolated (v_interp_p2) attribute must NOT be decorated Flat\n");
+        return 1;
+    }
+    printf("  [ok]   v_interp_p2-only attribute stays smooth (no Flat decoration)\n");
+    // Mixed: attr0 read via BOTH v_interp_mov (flat) and v_interp_p2 (smooth) -> reject (can't be both).
+    const uint32_t ps_mixed[] = { 0xc80e0002u, 0xc8110002u, 0xf800000fu, 0x03030303u, 0xbf810000u };
+    std::vector<uint32_t> mixed_spv = recompile_fragment(ps_mixed, sizeof(ps_mixed)/sizeof(ps_mixed[0]));
+    if (!mixed_spv.empty()) {
+        printf("  [FAIL] an attribute read via BOTH v_interp_mov and v_interp_p2 must be REJECTED\n");
+        return 1;
+    }
+    printf("  [ok]   mixed flat+smooth read of one attribute is rejected\n");
 
     printf("== PASS ==\n");
     return 0;

@@ -58,7 +58,7 @@ enum : uint32_t {
     ImgFmt_Unknown=0,        // OpTypeImage "Image Format": Unknown (runtime view format; needs the caps above)
     ImgOp_Lod=2, ImgOp_Sample=0x40,   // ImageOperands bits: explicit LOD (Fetch on sampled img) / MSAA Sample index.
     SC_Workgroup=4, Scope_Workgroup=2, MemSem_WGAcqRel=0x108,   // LDS: Workgroup storage + barrier scope/semantics
-    Dec_Block=2, Dec_ArrayStride=6, Dec_BuiltIn=11, Dec_Location=30, Dec_Binding=33,
+    Dec_Block=2, Dec_ArrayStride=6, Dec_BuiltIn=11, Dec_Flat=14, Dec_Location=30, Dec_Binding=33,
     Dec_DescriptorSet=34, Dec_Offset=35,
     BI_Position=0, BI_LocalInvocationId=27, BI_GlobalInvocationId=28, BI_VertexIndex=42,
 };
@@ -747,12 +747,19 @@ struct SpirvCompute {
     // --- Interpolated I/O varyings: VS EXP PARAM_n (output) <-> FS v_interp attribute (input) ---
     std::unordered_map<uint32_t, uint32_t> in_varying, out_varying;
     uint32_t t_ptr_in_v4f = 0;
-    // FS: an Input vec4 at Location=attr, smooth-interpolated by the rasterizer (declared on first use).
+    // Attributes read via v_interp_mov (a raw per-vertex / provoking-vertex value, NOT rasterizer-
+    // interpolated) — their FS Input varying is decorated Flat so the driver delivers the provoking
+    // vertex value instead of a smooth blend of the three (#152). Populated by recompile_fragment's
+    // pre-scan; an attribute read via BOTH v_interp_mov (flat) and v_interp_p2 (smooth) is rejected
+    // there (a varying can't be both), so this set never contradicts a smooth read.
+    std::unordered_set<uint32_t> flat_attrs;
+    // FS: an Input vec4 at Location=attr, rasterizer-interpolated (or Flat if flat_attrs says so).
     uint32_t frag_input(uint32_t attr) {
         auto it = in_varying.find(attr); if (it != in_varying.end()) return it->second;
         if (!t_ptr_in_v4f) { t_ptr_in_v4f = id(); put(types, Op_TypePointer, {t_ptr_in_v4f, SC_Input, t_v4f}); }
         uint32_t v = id(); put(types, Op_Variable, {t_ptr_in_v4f, v, SC_Input});
         put(deco, Op_Decorate, {v, Dec_Location, attr});
+        if (flat_attrs.count(attr)) put(deco, Op_Decorate, {v, Dec_Flat});   // un-interpolated (v_interp_mov)
         in_varying[attr] = v; iface.push_back(v); return v;
     }
     // Read component `chan` (0..3) of interpolated attribute `attr` -> float bits (v_interp_p2 / mov).
@@ -2324,6 +2331,20 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords, co
 
     SpirvCompute b;
     b.begin_fragment(rt);
+    // Classify each interpolated attribute by HOW it's read (#152): v_interp_p2 (op 1) = smooth
+    // rasterizer interpolation; v_interp_mov (op 2) = a raw per-vertex / provoking-vertex value (a
+    // flat read). An attribute read only via v_interp_mov gets its Input varying decorated Flat so
+    // the driver delivers the provoking vertex value, not a blend of the three. An attribute read
+    // via BOTH is contradictory (a varying can't be smooth and flat at once) -> reject the shader.
+    { std::unordered_set<uint32_t> smooth_attr;
+      for (const auto& in : ins) {
+          if (in.is_end) break;
+          if (in.fmt != Rdna2Format::VINTRP) continue;
+          if (in.opcode == 1) smooth_attr.insert(in.vintrp_attr);        // v_interp_p2
+          else if (in.opcode == 2) b.flat_attrs.insert(in.vintrp_attr);  // v_interp_mov
+      }
+      for (uint32_t a : b.flat_attrs) if (smooth_attr.count(a)) return {};   // mixed smooth+flat: reject
+    }
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
     auto safe_branches = safe_execz_branches(ins);
     bool exported = false;
