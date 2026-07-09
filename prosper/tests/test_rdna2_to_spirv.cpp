@@ -1211,6 +1211,29 @@ int main() {
     printf("  kernel66 mismatches=%u (out[7]=%g expect=507)\n", bad66, got66.size()==N?got66[7]:-1);
     CHECK(got66.size()==N && bad66==0, "recompiled kernel 66 (raw load resolves SRSRC -> binding 3, not binding 2) correct");
 
+    // Kernel 66b: MUBUF idxen+offen — BOTH VADDR terms must apply (#148). v1=(uint)gid (index), v2=4
+    // (per-lane byte offset), buffer_load_dword v3, v[1:2], s[8:11] idxen offen, stride 8 -> addr =
+    // gid*8 + 4 => dword index 2*gid+1 => buf[2*gid+1]. The old code applied only the index term and
+    // silently dropped v2, reading buf[2*gid] instead. cvt in/out (the shell's inputs are float bits).
+    // Encodings llvm-mc gfx1030 verified.
+    const uint32_t code66b[] = {
+        0x7e020f00u, 0x7e040284u, 0xe0303000u, 0x80020301u, 0x7e060d03u, 0xbf810000u,
+    };
+    ShaderResourceTable rt66b;
+    { ShaderResource rb{}; rb.cls = ResourceClass::ConstantBuffer; rb.format = DataFormat::Float32;
+      rb.num_components = 1; rb.binding = 3; rb.stride = 8; rb.sgpr_base = 8; rt66b.resources.push_back(rb); }
+    std::vector<uint32_t> spv66b = recompile_valu(code66b, sizeof(code66b)/sizeof(code66b[0]), 1, /*out_vgpr*/3, &rt66b);
+    CHECK(!spv66b.empty(), "recompiled kernel 66b (MUBUF idxen+offen) -> SPIR-V");
+    std::vector<float> in66b(N); std::vector<uint32_t> decoy66b(2*N, 0xDEADu), buf66b(2*N);
+    for (uint32_t i = 0; i < N; i++)   in66b[i] = (float)i;
+    for (uint32_t i = 0; i < 2*N; i++) buf66b[i] = 500u + i;
+    std::vector<float> got66b = prosper::test::run_compute(spv66b, in66b, N, N, decoy66b, buf66b);
+    uint32_t bad66b = 0;
+    for (uint32_t i=0;i<N&&got66b.size()==N;i++) if (std::fabs(got66b[i]-(float)(500u + 2u*i + 1u))>1e-3f) bad66b++;
+    printf("  kernel66b mismatches=%u (out[3]=%g expect=%u)\n", bad66b,
+           got66b.size()==N?got66b[3]:-1, 500u + 2u*3u + 1u);
+    CHECK(got66b.size()==N && bad66b==0, "kernel 66b (idxen+offen): addr = idx*stride + byteoffset (both applied)");
+
     // Kernel 67: RAW MUBUF UNRESOLVABLE SRSRC -> REJECT (#91). Same code, but the table's only
     // resource lives at sgpr_base 4 — SRSRC s[8:11] resolves to nothing. With a table present the
     // recompiler must reject (empty SPIR-V), never silently fall back to binding 2.

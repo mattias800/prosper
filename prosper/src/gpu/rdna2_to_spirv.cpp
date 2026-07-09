@@ -1852,11 +1852,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // Integer sub-dword formats (Uint8/Sint8/Uint16/Sint16) aren't normalized floats and would
             // need an integer-attribute path; reject rather than mis-normalize.
             if (packed && !is_half && norm == 0.0f) { ok = false; return true; }
-            // Byte address of the element: idxen -> VADDR is an element index (×stride); offen -> VADDR
-            // is a byte offset; plus the inst offset and SOFFSET. dword index = addr>>2.
+            // Byte address of the element (#148): idxen -> a VADDR VGPR is an element index (×stride);
+            // offen -> a VADDR VGPR is a per-lane byte offset; both terms ADD (were mutually exclusive,
+            // silently dropping the byte offset when both were set). When idxen AND offen are set, VADDR
+            // is TWO consecutive VGPRs — [0] = index (in.src[0]), [1] = byte offset (in.src[0]+1). Plus
+            // the inst offset and SOFFSET. dword index = addr>>2.
             uint32_t addr = b.uconst(offset);
             if (idxen && stride) addr = b.ibin(Op_IAdd, addr, b.ibin(Op_IMul, val(in.src[0]), b.uconst(stride)));
-            else if (offen)      addr = b.ibin(Op_IAdd, addr, val(in.src[0]));
+            if (offen) {
+                Operand off_vgpr{ OperandKind::VGPR, idxen ? in.src[0].value + 1 : in.src[0].value };
+                addr = b.ibin(Op_IAdd, addr, val(off_vgpr));
+            }
             addr = b.ibin(Op_IAdd, addr, val(in.src[2]));              // SOFFSET
             uint32_t idx = b.ibin(Op_ShiftRightLogical, addr, b.uconst(2));
             if (is_store) {
