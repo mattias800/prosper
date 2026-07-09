@@ -498,6 +498,18 @@ mappings (one step past the 512 GiB arena); len==0 → EINVAL; search exhaustion
 metadata pool now lands at 0x9000000000 and the canary corruption is gone (0 canary lines over
 full runs; previously ~31k lines + SIGSEGV at ~10 s). CONFIDENCE: HIGH.
 
+**Post-fix frontier (measured):** the boot now survives the ENTIRE parallel content load with the
+AGC RHI threads live (AgcCleanup/AgcInterrupt/AgcSubmission + FAPREventQueueListener +
+IoDispatcher/IoService + full TaskGraph pools) and streams pakchunk0 continuously (256 KiB APR
+reads; ~845 MB consumed at the 7-minute mark — the pace is bounded by the WSL 9p mount, not by
+prosper). At ~9.5 minutes (PROSPER_GFXLOG run) the engine issued its FIRST real AGC driver work:
+`libSceAgc::23LRUSvYu1M` / `libSceAgc::BfBDZGbti7A` plus two AGC `ReleaseMem` end-of-pipe packets
+(`addr=0x2012..ffe0, data_sel=3`) right as the timeout expired. No crash, no fatal anywhere in
+between. NEXT: run past the load phase (longer wall clock, and/or cut pak IO latency — e.g. host
+page-cache warm-up or larger read batching) and follow the AGC submission stream into
+`execute_and_present` for the first UE4 draw (the same libSceAgc path The Messenger renders
+through).
+
 ### The remaining 3 unnamed Ampr NIDs (issue #107, not on the crash path)
 
 `vWU-odnS+fU`, `sSAUCCU1dv4`, `GnxKOHEawhk`, `H896Pt-yB4I` still resist the generated
