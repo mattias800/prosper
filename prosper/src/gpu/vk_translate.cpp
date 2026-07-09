@@ -1,5 +1,8 @@
 // vk_translate.cpp — see vk_translate.hpp.
 #include "vk_translate.hpp"
+#include <cstdio>
+#include <mutex>
+#include <set>
 
 namespace prosper::gpu {
 
@@ -18,15 +21,99 @@ VkTopology vk_topology(uint32_t prim_type) {
 }
 
 VkFormat vk_color_format(uint32_t format, uint32_t number_type, uint32_t comp_swap) {
-    // format 0xA = COLOR_8_8_8_8; number_type 0 = UNORM, 6 = SRGB; comp_swap 0 = standard (RGBA),
-    // 1 = alt (BGRA). (Kyty GraphicsRender.cpp RenderTextureFormat decode.)
-    if (format == 0xAu) {
-        const bool srgb = (number_type == 6u);
-        const bool bgra = (comp_swap == 1u);
-        if (!bgra) return srgb ? VkFormat::R8G8B8A8_SRGB : VkFormat::R8G8B8A8_UNORM;
-        else       return srgb ? VkFormat::B8G8R8A8_SRGB : VkFormat::B8G8R8A8_UNORM;
+    // CB_COLOR0_INFO enums (GCN/RDNA CB format table; Kyty exercises the 0xA/0x1 rows):
+    //   FORMAT: 1=COLOR_8, 2=COLOR_16, 3=COLOR_8_8, 4=COLOR_32, 5=COLOR_16_16, 7=COLOR_11_11_10,
+    //           9=COLOR_2_10_10_10, 0xA=COLOR_8_8_8_8, 0xB=COLOR_32_32, 0xC=COLOR_16_16_16_16,
+    //           0xE=COLOR_32_32_32_32, 0x10=COLOR_5_6_5
+    //   NUMBER_TYPE: 0=UNORM, 1=SNORM, 4=UINT, 5=SINT, 6=SRGB, 7=FLOAT
+    //   COMP_SWAP: 0=STD (RGBA order), 1=ALT (BGRA); 2/3 (REV forms) unmapped.
+    // CONFIDENCE: HIGH for 0xA (live-verified); MED for the ported rows (standard table, no live
+    // capture yet — an incorrect row renders wrong but cannot crash: the backend sees a real format).
+    const uint32_t nt = number_type, cs = comp_swap;
+    const bool std_swap = (cs == 0u), alt_swap = (cs == 1u);
+    switch (format) {
+        case 0x1u:   // COLOR_8
+            if (!std_swap) break;
+            switch (nt) { case 0: return VkFormat::R8_UNORM; case 1: return VkFormat::R8_SNORM;
+                          case 4: return VkFormat::R8_UINT;  case 5: return VkFormat::R8_SINT; }
+            break;
+        case 0x2u:   // COLOR_16
+            if (!std_swap) break;
+            switch (nt) { case 0: return VkFormat::R16_UNORM; case 1: return VkFormat::R16_SNORM;
+                          case 4: return VkFormat::R16_UINT;  case 5: return VkFormat::R16_SINT;
+                          case 7: return VkFormat::R16_SFLOAT; }
+            break;
+        case 0x3u:   // COLOR_8_8
+            if (!std_swap) break;
+            switch (nt) { case 0: return VkFormat::R8G8_UNORM; case 1: return VkFormat::R8G8_SNORM;
+                          case 4: return VkFormat::R8G8_UINT;  case 5: return VkFormat::R8G8_SINT; }
+            break;
+        case 0x4u:   // COLOR_32
+            if (!std_swap) break;
+            switch (nt) { case 4: return VkFormat::R32_UINT; case 5: return VkFormat::R32_SINT;
+                          case 7: return VkFormat::R32_SFLOAT; }
+            break;
+        case 0x5u:   // COLOR_16_16
+            if (!std_swap) break;
+            switch (nt) { case 0: return VkFormat::R16G16_UNORM; case 1: return VkFormat::R16G16_SNORM;
+                          case 4: return VkFormat::R16G16_UINT;  case 5: return VkFormat::R16G16_SINT;
+                          case 7: return VkFormat::R16G16_SFLOAT; }
+            break;
+        case 0x7u:   // COLOR_11_11_10 (float-only packed HDR target)
+            if (std_swap && nt == 7u) return VkFormat::B10G11R11_UFLOAT_PACK32;
+            break;
+        case 0x9u:   // COLOR_2_10_10_10
+            if (nt == 0u) return std_swap ? VkFormat::A2B10G10R10_UNORM_PACK32
+                        : alt_swap        ? VkFormat::A2R10G10B10_UNORM_PACK32 : VkFormat::Undefined;
+            if (nt == 4u) return std_swap ? VkFormat::A2B10G10R10_UINT_PACK32
+                        : alt_swap        ? VkFormat::A2R10G10B10_UINT_PACK32  : VkFormat::Undefined;
+            break;
+        case 0xAu:   // COLOR_8_8_8_8 (the live-verified row: RGBA/BGRA x UNORM/SRGB, + int variants)
+            if (std_swap) switch (nt) {
+                case 0: return VkFormat::R8G8B8A8_UNORM; case 1: return VkFormat::R8G8B8A8_SNORM;
+                case 4: return VkFormat::R8G8B8A8_UINT;  case 5: return VkFormat::R8G8B8A8_SINT;
+                case 6: return VkFormat::R8G8B8A8_SRGB;
+            }
+            if (alt_swap) switch (nt) {
+                case 0: return VkFormat::B8G8R8A8_UNORM; case 1: return VkFormat::B8G8R8A8_SNORM;
+                case 4: return VkFormat::B8G8R8A8_UINT;  case 5: return VkFormat::B8G8R8A8_SINT;
+                case 6: return VkFormat::B8G8R8A8_SRGB;
+            }
+            break;
+        case 0xBu:   // COLOR_32_32
+            if (!std_swap) break;
+            switch (nt) { case 4: return VkFormat::R32G32_UINT; case 5: return VkFormat::R32G32_SINT;
+                          case 7: return VkFormat::R32G32_SFLOAT; }
+            break;
+        case 0xCu:   // COLOR_16_16_16_16
+            if (!std_swap) break;
+            switch (nt) { case 0: return VkFormat::R16G16B16A16_UNORM; case 1: return VkFormat::R16G16B16A16_SNORM;
+                          case 4: return VkFormat::R16G16B16A16_UINT;  case 5: return VkFormat::R16G16B16A16_SINT;
+                          case 7: return VkFormat::R16G16B16A16_SFLOAT; }
+            break;
+        case 0xEu:   // COLOR_32_32_32_32
+            if (!std_swap) break;
+            switch (nt) { case 4: return VkFormat::R32G32B32A32_UINT; case 5: return VkFormat::R32G32B32A32_SINT;
+                          case 7: return VkFormat::R32G32B32A32_SFLOAT; }
+            break;
+        case 0x10u:  // COLOR_5_6_5
+            if (nt == 0u) return std_swap ? VkFormat::R5G6B5_UNORM_PACK16
+                        : alt_swap        ? VkFormat::B5G6R5_UNORM_PACK16 : VkFormat::Undefined;
+            break;
+        default: break;
     }
-    return VkFormat::Undefined;   // surface not yet mapped
+    // Unmapped triple: log ONCE per triple so a broken pipeline is diagnosable (it used to resolve
+    // to Undefined silently), without flooding a per-draw path.
+    static std::set<uint64_t> logged;
+    static std::mutex logged_mu;
+    uint64_t key = ((uint64_t)format << 32) | (nt << 8) | cs;
+    {
+        std::lock_guard<std::mutex> lk(logged_mu);
+        if (logged.insert(key).second)
+            fprintf(stderr, "[gpu] vk_color_format: unmapped CB surface format=0x%x number_type=%u "
+                            "comp_swap=%u -> Undefined\n", format, nt, cs);
+    }
+    return VkFormat::Undefined;
 }
 
 uint32_t vk_blend_factor(uint32_t f) {
