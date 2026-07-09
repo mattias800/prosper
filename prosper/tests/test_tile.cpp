@@ -127,9 +127,11 @@ int main() {
         CHECK(rt_bpe(40, 40, 16),  "round-trip 40x40 @ 16 B/elem (16x16 tiles)");
     }
 
-    // Golden positions: the 32-bpp order must be BYTE-IDENTICAL to the shipped, pixel-verified
-    // layout (y0 in the low Morton bit: (0,1) -> element 1, (1,0) -> element 2), and the 8-bpp
-    // cross-tile step must be one whole 4KB tile.
+    // Golden positions for the GFX10 SW_4KB_S element order (#118): the lowest four element bits are a
+    // 4x4 sub-block [x0, x1, y0, y1], so (1,0) -> element 1 (x0), (2,0) -> element 2 (x1), (0,1) ->
+    // element 4 (y0), (0,2) -> element 8 (y1). The previous order asserted (0,1)->1 / (1,0)->2 (plain
+    // y-low Morton), which serrated every edge of every tiled texture (pixel-verified WRONG vs The
+    // Messenger's title art). The 8-bpp cross-tile step is one whole 4KB tile.
     {
         const uint32_t M = (uint32_t)TileMode::Sw4KbS;
         std::vector<uint8_t> lin32((size_t)64 * 32 * 4, 0);
@@ -137,15 +139,17 @@ int main() {
             lin32[((size_t)y * 64 + x) * 4] = (uint8_t)(x ^ (y << 4) ^ 0x5A);
         std::vector<uint8_t> t32(tiled_surface_bytes(64, 32, M), 0);
         tile_surface(t32.data(), lin32.data(), 64, 32, M);
-        CHECK(t32[1 * 4] == lin32[((size_t)1 * 64 + 0) * 4], "32-bpp golden: texel (0,1) at element 1 (y0 low)");
-        CHECK(t32[2 * 4] == lin32[((size_t)0 * 64 + 1) * 4], "32-bpp golden: texel (1,0) at element 2");
+        CHECK(t32[1 * 4] == lin32[((size_t)0 * 64 + 1) * 4], "32-bpp golden: texel (1,0) at element 1 (x0 low)");
+        CHECK(t32[2 * 4] == lin32[((size_t)0 * 64 + 2) * 4], "32-bpp golden: texel (2,0) at element 2 (x1)");
+        CHECK(t32[4 * 4] == lin32[((size_t)1 * 64 + 0) * 4], "32-bpp golden: texel (0,1) at element 4 (y0 at bit 2)");
+        CHECK(t32[8 * 4] == lin32[((size_t)2 * 64 + 0) * 4], "32-bpp golden: texel (0,2) at element 8 (y1 at bit 3)");
         CHECK(t32[4096]  == lin32[((size_t)0 * 64 + 32) * 4], "32-bpp golden: texel (32,0) starts tile 1 (byte 4096)");
 
         std::vector<uint8_t> lin8((size_t)128 * 64, 0);
         for (size_t i = 0; i < lin8.size(); i++) lin8[i] = (uint8_t)(i * 31 + 7);
         std::vector<uint8_t> t8(tiled_surface_bytes(128, 64, M, 0, 1), 0);
         tile_surface(t8.data(), lin8.data(), 128, 64, M, 0, 1);
-        CHECK(t8[1] == lin8[(size_t)1 * 128 + 0], "8-bpp golden: texel (0,1) at element 1 (same Morton order)");
+        CHECK(t8[4] == lin8[(size_t)1 * 128 + 0], "8-bpp golden: texel (0,1) at element 4 (same [x0,x1,y0,y1] order)");
         CHECK(t8[4096] == lin8[(size_t)0 * 128 + 64], "8-bpp golden: texel (64,0) starts tile 1 (byte 4096, 64-wide tile)");
     }
 
