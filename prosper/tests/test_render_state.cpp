@@ -77,6 +77,20 @@ int main() {
     CHECK(vk_color_format(rs.color0_format, rs.color0_number_type, rs.color0_comp_swap)
               == VkFormat::B8G8R8A8_SRGB, "color format -> VK B8G8R8A8_SRGB");
     CHECK(vk_color_format(0x0Au, 0u, 0u) == VkFormat::R8G8B8A8_UNORM, "0xA/UNORM/RGBA -> R8G8B8A8_UNORM");
+    // #133: the non-8888 CB rows (standard GCN/RDNA format table; values == VkFormat enumerators).
+    CHECK(vk_color_format(0xCu, 7u, 0u) == VkFormat::R16G16B16A16_SFLOAT, "0xC/FLOAT -> R16G16B16A16_SFLOAT (97)");
+    CHECK(vk_color_format(0xCu, 0u, 0u) == VkFormat::R16G16B16A16_UNORM,  "0xC/UNORM -> R16G16B16A16_UNORM (91)");
+    CHECK(vk_color_format(0x9u, 0u, 0u) == VkFormat::A2B10G10R10_UNORM_PACK32, "0x9/UNORM/STD -> A2B10G10R10 (64)");
+    CHECK(vk_color_format(0x9u, 0u, 1u) == VkFormat::A2R10G10B10_UNORM_PACK32, "0x9/UNORM/ALT -> A2R10G10B10 (58)");
+    CHECK(vk_color_format(0x7u, 7u, 0u) == VkFormat::B10G11R11_UFLOAT_PACK32,  "0x7/FLOAT -> B10G11R11 (122)");
+    CHECK(vk_color_format(0x10u, 0u, 0u) == VkFormat::R5G6B5_UNORM_PACK16, "0x10/UNORM -> R5G6B5 (4)");
+    CHECK(vk_color_format(0x1u, 0u, 0u) == VkFormat::R8_UNORM,   "0x1/UNORM -> R8_UNORM (9, Kyty's R8Unorm row)");
+    CHECK(vk_color_format(0x4u, 7u, 0u) == VkFormat::R32_SFLOAT, "0x4/FLOAT -> R32_SFLOAT (100)");
+    CHECK(vk_color_format(0x5u, 7u, 0u) == VkFormat::R16G16_SFLOAT, "0x5/FLOAT -> R16G16_SFLOAT (83)");
+    CHECK(vk_color_format(0xAu, 4u, 1u) == VkFormat::B8G8R8A8_UINT, "0xA/UINT/ALT -> B8G8R8A8_UINT (48)");
+    // Still-unmapped triples resolve to Undefined (logged once), never a bogus format.
+    CHECK(vk_color_format(0x16u, 7u, 0u) == VkFormat::Undefined, "COLOR_X24_8_32 stays Undefined");
+    CHECK(vk_color_format(0xCu, 7u, 2u)  == VkFormat::Undefined, "REV comp_swap stays Undefined");
     CHECK(rs.prim_type == 0x04u, "prim_type = 4");
     CHECK(vk_topology(rs.prim_type) == VkTopology::TriangleList, "prim_type 4 -> VK TriangleList");
     CHECK(vk_topology(6) == VkTopology::TriangleStrip && vk_topology(1) == VkTopology::PointList,

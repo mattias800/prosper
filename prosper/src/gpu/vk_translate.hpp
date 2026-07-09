@@ -26,15 +26,32 @@ VkTopology vk_topology(uint32_t prim_type);
 // Selected values == VkFormat enumerators (VK_FORMAT_UNDEFINED == 0).
 enum class VkFormat : uint32_t {
     Undefined     = 0,
-    R8G8B8A8_UNORM = 37,
+    R5G6B5_UNORM_PACK16 = 4,
+    B5G6R5_UNORM_PACK16 = 5,
+    R8_UNORM  = 9,  R8_SNORM  = 10, R8_UINT  = 13, R8_SINT  = 14,
+    R8G8_UNORM = 16, R8G8_SNORM = 17, R8G8_UINT = 20, R8G8_SINT = 21,
+    R8G8B8A8_UNORM = 37, R8G8B8A8_SNORM = 38, R8G8B8A8_UINT = 41, R8G8B8A8_SINT = 42,
     R8G8B8A8_SRGB  = 43,
-    B8G8R8A8_UNORM = 44,
+    B8G8R8A8_UNORM = 44, B8G8R8A8_SNORM = 45, B8G8R8A8_UINT = 48, B8G8R8A8_SINT = 49,
     B8G8R8A8_SRGB  = 50,
+    A2R10G10B10_UNORM_PACK32 = 58, A2R10G10B10_UINT_PACK32 = 62,
+    A2B10G10R10_UNORM_PACK32 = 64, A2B10G10R10_UINT_PACK32 = 68,
+    R16_UNORM = 70, R16_SNORM = 71, R16_UINT = 74, R16_SINT = 75, R16_SFLOAT = 76,
+    R16G16_UNORM = 77, R16G16_SNORM = 78, R16G16_UINT = 81, R16G16_SINT = 82, R16G16_SFLOAT = 83,
+    R16G16B16A16_UNORM = 91, R16G16B16A16_SNORM = 92, R16G16B16A16_UINT = 95,
+    R16G16B16A16_SINT = 96, R16G16B16A16_SFLOAT = 97,
+    R32_UINT = 98, R32_SINT = 99, R32_SFLOAT = 100,
+    R32G32_UINT = 101, R32G32_SINT = 102, R32G32_SFLOAT = 103,
+    R32G32B32A32_UINT = 107, R32G32B32A32_SINT = 108, R32G32B32A32_SFLOAT = 109,
+    B10G11R11_UFLOAT_PACK32 = 122,
 };
 
-// Map a CB_COLOR surface (FORMAT, NUMBER_TYPE, COMP_SWAP) triple to a VkFormat. Follows Kyty's
-// GraphicsRender.cpp RenderTextureFormat decode; currently covers the 8_8_8_8 (format 0xA) surfaces
-// the target uses (RGBA/BGRA × UNORM/SRGB). Returns Undefined for not-yet-mapped surfaces.
+// Map a CB_COLOR surface (FORMAT, NUMBER_TYPE, COMP_SWAP) triple to a VkFormat, per the RDNA2
+// CB_COLOR0_INFO field enums (COLOR_8..COLOR_32_32_32_32 × UNORM/SNORM/UINT/SINT/SRGB/FLOAT ×
+// STD/ALT component swap). Kyty's RenderTextureFormat decode covers the 0xA/0x1 rows it runs;
+// the rest follow the standard GCN/RDNA CB format table. Returns Undefined for an unmapped
+// triple and logs it ONCE (previously every non-8888 target silently resolved to Undefined ->
+// undefined pipeline format, #133).
 VkFormat vk_color_format(uint32_t format, uint32_t number_type, uint32_t comp_swap);
 
 // RDNA2 DB_DEPTH_CONTROL.ZFUNC enumerates compare ops in the SAME order as VkCompareOp
