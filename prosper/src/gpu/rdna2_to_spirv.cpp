@@ -1792,6 +1792,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // Format of the fetched components. Untyped buffer_load_dword* is raw 32-bit (comp_bytes=4);
             // buffer_load_format_* takes the format from the resolved V# descriptor.
             DataFormat fmt = DataFormat::Uint32;   // untyped default: raw dwords
+            bool dyn_vfetch = false;   // set when the V# came from by_fetch_pc — a const-folded per-vertex
+                                       // attribute fetch, whose element address is exactly gl_VertexIndex*stride.
             if (is_format) {
                 // A format load reads a vertex/buffer attribute — it needs the V# descriptor for the
                 // binding, stride, and data format. Resolve SRSRC (src[1]) via provenance: an s_load
@@ -1804,6 +1806,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // PER-FETCH first: a reloaded SRSRC holds a different V# per attribute, so match this
                     // exact fetch instruction's pc; fall back to the SGPR (direct) then s_load SRT tag.
                     res = rt->by_fetch_pc(in.pc);
+                    if (res) dyn_vfetch = true;
                     if (!res) res = rt->by_sgpr_base_cls(in.src[1].value, ResourceClass::VertexBuffer);
                     if (!res) { auto it = rs.sreg_srt.find(in.src[1].value);
                         if (it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second); }
@@ -1869,17 +1872,30 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (!base_aligned) { ok = false; return true; }
             }
             // Byte address of the element (#148): idxen -> a VADDR VGPR is an element index (×stride);
-            // offen -> a VADDR VGPR is a per-lane byte offset; both terms ADD (were mutually exclusive,
-            // silently dropping the byte offset when both were set). When idxen AND offen are set, VADDR
-            // is TWO consecutive VGPRs — [0] = index (in.src[0]), [1] = byte offset (in.src[0]+1). Plus
-            // the inst offset and SOFFSET. dword index = addr>>2.
-            uint32_t addr = b.uconst(offset);
-            if (idxen && stride) addr = b.ibin(Op_IAdd, addr, b.ibin(Op_IMul, val(in.src[0]), b.uconst(stride)));
-            if (offen) {
-                Operand off_vgpr{ OperandKind::VGPR, idxen ? in.src[0].value + 1 : in.src[0].value };
-                addr = b.ibin(Op_IAdd, addr, val(off_vgpr));
+            // offen -> a per-lane byte offset; both terms ADD; when idxen AND offen are set VADDR is TWO
+            // consecutive VGPRs ([0]=index, [1]=byte offset). Plus the inst offset and SOFFSET.
+            uint32_t addr;
+            // Const-folded per-vertex attribute fetch (#206): the element address is exactly
+            // gl_VertexIndex*stride. (1) The NGG fetch-shader prologue that computes the element index
+            // isn't fully modeled and folds to a constant, so every vertex would read record 0 -> a
+            // degenerate single point that rasterizes nothing (the whole scene stayed the blue clear).
+            // (2) The resolved V# base ALREADY includes this attribute's byte offset within the
+            // interleaved record, so the shader's inst-offset + SOFFSET must NOT be added again
+            // (double-counting pushes the read OOB -> robustBufferAccess 0, the same collapse). So use
+            // gl_VertexIndex*stride and drop the shader's VADDR/offset/SOFFSET; everything else keeps the
+            // faithful address (incl. #148's idxen+offen both-terms fix). CONFIDENCE: HIGH — makes
+            // PPSA01885 (Unity/IL2CPP) render real geometry instead of a degenerate collapse.
+            if (dyn_vfetch && idxen && stride) {
+                addr = b.ibin(Op_IMul, b.load_vertex_index(), b.uconst(stride));
+            } else {
+                addr = b.uconst(offset);
+                if (idxen && stride) addr = b.ibin(Op_IAdd, addr, b.ibin(Op_IMul, val(in.src[0]), b.uconst(stride)));
+                if (offen) {
+                    Operand off_vgpr{ OperandKind::VGPR, idxen ? in.src[0].value + 1 : in.src[0].value };
+                    addr = b.ibin(Op_IAdd, addr, val(off_vgpr));
+                }
+                addr = b.ibin(Op_IAdd, addr, val(in.src[2]));          // SOFFSET
             }
-            addr = b.ibin(Op_IAdd, addr, val(in.src[2]));              // SOFFSET
             uint32_t idx = b.ibin(Op_ShiftRightLogical, addr, b.uconst(2));
             if (is_store) {
                 // Store the VDATA VGPRs (in.dst..+n-1). Integer sub-dword formats (Uint8/Sint8/...) have
