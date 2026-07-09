@@ -33,12 +33,15 @@ static bool eop_writes_disabled() {
     return off && off[0] == '1';
 }
 
-// A monotonic 64-bit "GPU clock" for RELEASE_MEM data_sel==3 (GpuClock64). Real hardware writes the GPU
-// timestamp; a strictly increasing counter has the property the game's poll needs (a later fence reads a
-// larger value). CONFIDENCE: MED — units differ from HW ticks, but monotonicity is what a >= poll checks.
-static uint64_t gpu_clock64() {
-    return (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count();
-}
+// A monotonic 64-bit "GPU clock" for RELEASE_MEM data_sel==3 (GpuClock64). On real hardware the GPU
+// EOP timestamp is the SAME counter the guest reads via sceKernelReadTsc (Kyty: GraphicsRender writes
+// KernelReadTsc() for the EOP timestamp; GetGpuCoreClockFrequency == GetTscFrequency), so we share
+// the guest TSC clock rather than a separate steady_clock (#156). It reports monotonic nanoseconds at
+// the 1 GHz that sceKernelGetTscFrequency advertises, so a guest that reads two fence timestamps and
+// divides the delta by the queried frequency gets real seconds — AND a GPU fence timestamp lies on the
+// same timeline as a CPU sceKernelReadTsc value (the old steady_clock had a disjoint epoch/period).
+extern "C" uint64_t prosper_guest_tsc_ns();   // hle_kernel_time.cpp — same source as sceKernelReadTsc
+static uint64_t gpu_clock64() { return prosper_guest_tsc_ns(); }
 
 // Honor a RELEASE_MEM / EVENT_WRITE_EOP completion write. data_sel (Kyty GraphicsCbReleaseMem allows {2,3};
 // shadPS4 DataSelect enum): 1=write 32-bit value, 2=write 64-bit value, 3=write 64-bit GPU clock. The write

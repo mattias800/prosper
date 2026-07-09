@@ -68,6 +68,15 @@ HLE(k_get_ptc_freq)   { return 1000000000ull; }            // counter is in ns -
 HLE(k_get_proc_time)  { return ns_now() / 1000; }          // microseconds
 HLE(k_read_tsc)       { return ns_now(); }
 HLE(k_tsc_freq)       { return 1000000000ull; }
+
+// The GPU EOP timestamp (RELEASE_MEM data_sel=3 / an address-carrying EVENT_WRITE) is, on real
+// hardware, the SAME counter the guest reads via sceKernelReadTsc (Kyty: GraphicsRender writes
+// KernelReadTsc() for the EOP timestamp; GetGpuCoreClockFrequency == GetTscFrequency). prosper
+// models that counter as this monotonic-ns clock at 1 GHz (k_tsc_freq). Exposed so the
+// CommandProcessor's gpu_clock64 shares the EXACT clock + epoch (#156) — previously it used a
+// separate steady_clock with a different epoch and an unspecified period, so a guest correlating a
+// GPU fence timestamp with a CPU sceKernelReadTsc value saw two disjoint timelines.
+extern "C" uint64_t prosper_guest_tsc_ns() { return ns_now(); }
 // sceKernelClockGettime / clock_gettime(clockid, struct timespec*). The PS5 inherits FreeBSD's
 // clockid numbering (shadPS4 time.h ORBIS_CLOCK_* == FreeBSD sys/time.h CLOCK_*; Kyty Pthread.cpp
 // KernelClockGettime agrees on 0=REALTIME, 4=MONOTONIC). Previously the id was IGNORED — every
