@@ -10,9 +10,15 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <thread>
+#include <vector>
+#ifndef _WIN32
+#include <sys/uio.h>
+#include <unistd.h>
+#endif
 
 namespace prosper {
 
@@ -209,6 +215,235 @@ HLE(audio_get_port_state) {
     return 0;
 }
 
+// ---- libSceAudioOut2 (PS5-only; no Kyty/shadPS4 reference exists) -----------------------
+// DOLL's CRI Atom (ADX) middleware drives audio through AudioOut2. The generic unimplemented
+// stub (return 0, out-params untouched) made CRI read an UNINITIALIZED context-memory size and
+// malloc/memset it: when the stack garbage happened to be unallocatable the main thread died in
+// libc memset(NULL) (RUN ENDED at libc.prx+0x10556, backtrace through the CRI region
+// eboot+0x5ff..0x605M) — the intermittent "1 flip then crash" of issue #213. NID identities
+// recovered by nid_hash brute force over the sce_stubs corpus: g2tViFIohHE=sceAudioOut2Initialize,
+// t5YrizufpQc=sceAudioOut2ContextResetParam, pDmme7Bgm6E=sceAudioOut2ContextQueryMemory.
+//
+// Contracts recovered by LIVE CAPTURE (PROSPER_AUDIO2LOG probe run, /tmp/draws_a2.log,
+// 2026-07-09) — this is a null-device backend in the sense of Wine's null audio driver: real
+// handle lifecycle + real-time pacing, no host audio device.
+//   sceAudioOut2ContextResetParam(param*)              param is 0x40 bytes (guest zero-fills
+//     0x00..0x3f then sets {+0:queue=8, +4:0x40, +8:0, +0xc:2, +0x10:grain=0x100, +0x14:1}).
+//   sceAudioOut2ContextQueryMemory(param*, size_t* out) out is the work-memory byte size the
+//     guest allocates and hands to ContextCreate (a1 = a0-8 on the create path, live).
+//   sceAudioOut2ContextCreate(param*, mem, memSize, Handle* out)
+//   sceAudioOut2UserCreate(userId, Handle* out)         (userId=0xff live)
+//   sceAudioOut2PortCreate(ctx, portParam*, Handle* out, ...)
+//   pump loop (dedicated CRI server thread, live): PortGetState(port, state*) ->
+//     PortSetAttributes(port, attr*, n) -> ContextAdvance(ctx) -> ContextPush(ctx, flag).
+// ContextPush paces one grain of wall-clock time (blocking-when-full HW semantics, same model
+// as RealtimeSilentSink) so the pump thread advances at real time instead of spinning.
+// CONFIDENCE: MED (arg positions + struct sizes live-verified; field meanings partly inferred;
+// PortGetState layout unknown -> zero-filled 0x20, marked LOW below).
+namespace {
+
+bool audio2log() {
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("PROSPER_AUDIO2LOG"); v = (e && *e && *e != '0') ? 1 : 0; }
+    return v == 1;
+}
+
+// Fault-safe guest-memory hexdump for live ABI capture (unmapped args must not crash the HLE).
+void a2_dump(const char* tag, uint64_t p, size_t n) {
+#ifndef _WIN32
+    if (!p) return;
+    std::vector<uint8_t> buf(n);
+    struct iovec l { buf.data(), n }, r { (void*)(uintptr_t)p, n };
+    ssize_t got = process_vm_readv(getpid(), &l, 1, &r, 1, 0);
+    if (got <= 0) { fprintf(stderr, "[audio2]   %s @0x%llx: <unreadable>\n", tag, (unsigned long long)p); return; }
+    fprintf(stderr, "[audio2]   %s @0x%llx:", tag, (unsigned long long)p);
+    for (ssize_t i = 0; i < got; i++) {
+        if ((i & 15) == 0) fprintf(stderr, "\n[audio2]     +%02zx ", (size_t)i);
+        fprintf(stderr, "%02x ", buf[i]);
+    }
+    fprintf(stderr, "\n");
+#else
+    (void)tag; (void)p; (void)n;
+#endif
+}
+
+void a2_log(const char* name, uint64_t a0, uint64_t a1, uint64_t a2,
+            uint64_t a3, uint64_t a4, uint64_t a5, void* ra) {
+    if (!audio2log()) return;
+    fprintf(stderr, "[audio2] %s(0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx) ra=eboot+0x%llx\n",
+            name, (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
+            (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)a5,
+            (unsigned long long)((uint64_t)ra - 0x400000000ull));
+}
+
+} // namespace
+
+#define A2LOG(name) a2_log(name, a0, a1, a2, a3, a4, a5, __builtin_return_address(0))
+
+// AudioOut2 handle space. Handles are opaque u64s the guest stores and passes back; tag them so
+// stray guest values are distinguishable in logs. One context + a few ports is all CRI uses.
+constexpr uint64_t kA2CtxTag  = 0xA2C0000000000000ull;
+constexpr uint64_t kA2UserTag = 0xA2D0000000000000ull;
+constexpr uint64_t kA2PortTag = 0xA2E0000000000000ull;
+
+struct A2Context {
+    bool     used = false;
+    uint32_t grain = 256;         // samples per Advance/Push cycle (param +0x10, live: 0x100)
+    // Real-time pacing state for ContextPush (blocking-when-full HW semantics).
+    std::chrono::steady_clock::time_point next{};
+};
+std::mutex g_a2_mx;
+A2Context  g_a2_ctx[4];
+uint32_t   g_a2_users = 0, g_a2_ports = 0;
+
+// Fault-safe u64 store to a guest out-pointer (same rationale as apr_write_guest_dst: a bad
+// pointer must fail the call, not SIGSEGV inside the HLE).
+bool a2_store_u64(uint64_t dst, uint64_t v) {
+#ifndef _WIN32
+    struct iovec l { &v, sizeof v }, r { (void*)(uintptr_t)dst, sizeof v };
+    return process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)sizeof v;
+#else
+    if (!dst) return false;
+    *(uint64_t*)(uintptr_t)dst = v; return true;
+#endif
+}
+bool a2_store_zeros(uint64_t dst, size_t n) {
+#ifndef _WIN32
+    std::vector<uint8_t> z(n, 0);
+    struct iovec l { z.data(), n }, r { (void*)(uintptr_t)dst, n };
+    return process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)n;
+#else
+    if (!dst) return false;
+    memset((void*)(uintptr_t)dst, 0, n); return true;
+#endif
+}
+
+constexpr uint64_t kA2ErrInvalid = (uint64_t)(int64_t)(int32_t)0x80260003;   // AudioOut error space
+
+// sceAudioOut2Initialize(void) -> 0. Idempotent success (same as sceAudioOutInit).
+HLE(audio2_initialize) { A2LOG("sceAudioOut2Initialize"); return 0; }
+
+// sceAudioOut2ContextResetParam(SceAudioOut2ContextParam* param) -> 0.
+// The param is 0x40 bytes (live: the create-path caller zero-fills exactly 0x00..0x3f before
+// setting fields). Reset = zero-fill; the guest overwrites every field it uses afterwards.
+HLE(audio2_ctx_reset_param) {
+    A2LOG("sceAudioOut2ContextResetParam");
+    if (!a2_store_zeros(a0, 0x40)) return kA2ErrInvalid;
+    return 0;
+}
+
+// sceAudioOut2ContextQueryMemory(const param*, size_t* outSize) -> 0.
+// Live: a1 is the out size the guest allocates and passes straight to ContextCreate as
+// (mem, memSize). The null backend needs no guest work memory; report a fixed 1 MiB so the
+// allocation is real and cheap (the value's only observable effect is that malloc succeeds —
+// the garbage value 0x244811c was allocated and accepted in the capture run).
+HLE(audio2_ctx_query_memory) {
+    A2LOG("sceAudioOut2ContextQueryMemory");
+    if (audio2log()) a2_dump("param", a0, 0x40);
+    if (!a2_store_u64(a1, 0x100000)) return kA2ErrInvalid;
+    return 0;
+}
+
+// sceAudioOut2ContextCreate(param*, mem, memSize, Handle* outCtx) -> 0.
+HLE(audio2_ctx_create) {
+    A2LOG("sceAudioOut2ContextCreate");
+    uint32_t grain = 256;
+#ifndef _WIN32
+    if (a0) {   // param +0x10 = samples per grain (live: 0x100)
+        uint32_t g = 0;
+        struct iovec l { &g, 4 }, r { (void*)(uintptr_t)(a0 + 0x10), 4 };
+        if (process_vm_readv(getpid(), &l, 1, &r, 1, 0) == 4 && g >= 64 && g <= 4096) grain = g;
+    }
+#endif
+    std::lock_guard<std::mutex> lk(g_a2_mx);
+    for (int i = 0; i < 4; i++) {
+        if (g_a2_ctx[i].used) continue;
+        g_a2_ctx[i] = A2Context{};
+        g_a2_ctx[i].used = true;
+        g_a2_ctx[i].grain = grain;
+        if (!a2_store_u64(a3, kA2CtxTag | (uint64_t)(i + 1))) { g_a2_ctx[i].used = false; return kA2ErrInvalid; }
+        return 0;
+    }
+    return kA2ErrInvalid;
+}
+HLE(audio2_ctx_destroy) {
+    A2LOG("sceAudioOut2ContextDestroy");
+    std::lock_guard<std::mutex> lk(g_a2_mx);
+    uint64_t idx = a0 & 0xff;
+    if ((a0 & ~0xffull) == kA2CtxTag && idx >= 1 && idx <= 4) g_a2_ctx[idx - 1] = A2Context{};
+    return 0;
+}
+
+// sceAudioOut2UserCreate(userId, Handle* out) -> 0. (live: userId=0xff)
+HLE(audio2_user_create) {
+    A2LOG("sceAudioOut2UserCreate");
+    std::lock_guard<std::mutex> lk(g_a2_mx);
+    if (!a2_store_u64(a1, kA2UserTag | (uint64_t)++g_a2_users)) return kA2ErrInvalid;
+    return 0;
+}
+HLE(audio2_user_destroy) { A2LOG("sceAudioOut2UserDestroy"); return 0; }
+
+// sceAudioOut2PortCreate(ctx, const portParam*, Handle* outPort, ...) -> 0.
+HLE(audio2_port_create) {
+    A2LOG("sceAudioOut2PortCreate");
+    std::lock_guard<std::mutex> lk(g_a2_mx);
+    if (!a2_store_u64(a2, kA2PortTag | (uint64_t)++g_a2_ports)) return kA2ErrInvalid;
+    return 0;
+}
+HLE(audio2_port_destroy) { A2LOG("sceAudioOut2PortDestroy"); return 0; }
+
+// sceAudioOut2PortGetState(port, State* out) -> 0. Layout unknown; the pump loop consumed a
+// zero-filled 0x20 in the capture run and kept cycling. CONFIDENCE: LOW (zero state = silent
+// port, no observed guest field reads yet — re-probe if CRI branches on it).
+HLE(audio2_port_get_state) {
+    A2LOG("sceAudioOut2PortGetState");
+    if (!a2_store_zeros(a1, 0x20)) return kA2ErrInvalid;
+    return 0;
+}
+HLE(audio2_port_set_attr) { A2LOG("sceAudioOut2PortSetAttributes"); return 0; }
+
+// sceAudioOut2ContextAdvance(ctx) -> 0. State advance only; the pacing lives in Push.
+HLE(audio2_ctx_advance) { A2LOG("sceAudioOut2ContextAdvance"); return 0; }
+
+// sceAudioOut2ContextPush(ctx, flag) -> 0. On hardware Push blocks while the output queue is
+// full; the null backend reproduces that as one grain of wall-clock pacing per call (same
+// model as RealtimeSilentSink) so CRI's server thread runs at real time, not a hot spin.
+HLE(audio2_ctx_push) {
+    A2LOG("sceAudioOut2ContextPush");
+    uint64_t idx = a0 & 0xff;
+    std::chrono::steady_clock::time_point target;
+    {
+        std::lock_guard<std::mutex> lk(g_a2_mx);
+        A2Context* c = ((a0 & ~0xffull) == kA2CtxTag && idx >= 1 && idx <= 4 && g_a2_ctx[idx - 1].used)
+                       ? &g_a2_ctx[idx - 1] : &g_a2_ctx[0];
+        uint32_t grain = c->grain ? c->grain : 256;
+        auto dur = std::chrono::nanoseconds((long long)grain * 1000000000LL / 48000);
+        auto now = std::chrono::steady_clock::now();
+        // (Re)sync if unset or far behind (post-stall) to avoid burst catch-up — same policy
+        // as RealtimeSilentSink::output.
+        if (c->next.time_since_epoch().count() == 0 || c->next < now - dur * 4) c->next = now;
+        c->next += dur;
+        target = c->next;
+    }
+    std::this_thread::sleep_until(target);   // pace outside the lock
+    return 0;
+}
+
+// Generic logging probes for the not-yet-exercised remainder of the surface.
+#define A2_PROBE(fn, str) HLE(fn) { A2LOG(str); return 0; }
+A2_PROBE(audio2_ctx_get_queue_level, "sceAudioOut2ContextGetQueueLevel")
+A2_PROBE(audio2_ctx_set_attr,    "sceAudioOut2ContextSetAttributes")
+A2_PROBE(audio2_ctx_bed_write,   "sceAudioOut2ContextBedWrite")
+A2_PROBE(audio2_port_register,   "sceAudioOut2PortRegister")
+A2_PROBE(audio2_port_unregister, "sceAudioOut2PortUnregister")
+A2_PROBE(audio2_get_system_state, "sceAudioOut2GetSystemState")
+A2_PROBE(audio2_get_speaker_info, "sceAudioOut2GetSpeakerInfo")
+A2_PROBE(audio2_mastering_init,  "sceAudioOut2MasteringInit")
+A2_PROBE(audio2_mastering_term,  "sceAudioOut2MasteringTerm")
+A2_PROBE(audio2_mastering_set_param, "sceAudioOut2MasteringSetParam")
+A2_PROBE(audio2_mastering_get_state, "sceAudioOut2MasteringGetState")
+#undef A2_PROBE
+
 void register_audio_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
     R("sceAudioOutInit", audio_init);
@@ -218,6 +453,31 @@ void register_audio_hle() {
     R("sceAudioOutSetVolume", audio_set_volume);
     R("sceAudioOutClose", audio_close);
     R("sceAudioOutGetPortState", audio_get_port_state);
+    // libSceAudioOut2 (PS5) — see the probe block above.
+    R("sceAudioOut2Initialize", audio2_initialize);
+    R("sceAudioOut2ContextResetParam", audio2_ctx_reset_param);
+    R("sceAudioOut2ContextQueryMemory", audio2_ctx_query_memory);
+    R("sceAudioOut2ContextCreate", audio2_ctx_create);
+    R("sceAudioOut2ContextDestroy", audio2_ctx_destroy);
+    R("sceAudioOut2ContextAdvance", audio2_ctx_advance);
+    R("sceAudioOut2ContextPush", audio2_ctx_push);
+    R("sceAudioOut2ContextGetQueueLevel", audio2_ctx_get_queue_level);
+    R("sceAudioOut2ContextSetAttributes", audio2_ctx_set_attr);
+    R("sceAudioOut2ContextBedWrite", audio2_ctx_bed_write);
+    R("sceAudioOut2UserCreate", audio2_user_create);
+    R("sceAudioOut2UserDestroy", audio2_user_destroy);
+    R("sceAudioOut2PortCreate", audio2_port_create);
+    R("sceAudioOut2PortDestroy", audio2_port_destroy);
+    R("sceAudioOut2PortGetState", audio2_port_get_state);
+    R("sceAudioOut2PortSetAttributes", audio2_port_set_attr);
+    R("sceAudioOut2PortRegister", audio2_port_register);
+    R("sceAudioOut2PortUnregister", audio2_port_unregister);
+    R("sceAudioOut2GetSystemState", audio2_get_system_state);
+    R("sceAudioOut2GetSpeakerInfo", audio2_get_speaker_info);
+    R("sceAudioOut2MasteringInit", audio2_mastering_init);
+    R("sceAudioOut2MasteringTerm", audio2_mastering_term);
+    R("sceAudioOut2MasteringSetParam", audio2_mastering_set_param);
+    R("sceAudioOut2MasteringGetState", audio2_mastering_get_state);
     #undef R
 }
 
