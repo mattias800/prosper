@@ -77,6 +77,25 @@ static void honor_eop_write(const Pm4Command& c) {
     wake_on_label(c.rel_addr);   // wake any sync_on_address futex waiter on this completion label
 }
 
+// Honor an address-carrying EVENT_WRITE (#132): the timestamp/label variant writes a completion
+// value to its address. Our GPU folds synchronously (submit == pipe drain), so by the time we
+// process this packet the event has "happened" — write a monotonic GPU clock (the value a timestamp
+// event carries) and wake any waiter, resolving the "a guest waiting on the label blocks forever"
+// case. Address-less events (event_addr == 0, the pipeline-sync variants: partial-flush, cache
+// inval) stay no-ops. CONFIDENCE: LOW on the value for the counter-sample event types
+// (ZPASS_DONE / streamout stats read a counter, not a timestamp) — but a defined monotonic write is
+// strictly better than the old discard (no write at all, which is what blocked the waiter). No title
+// currently exercises this (the Messenger fences via ReleaseMem/WriteData), so it's latent.
+static void honor_event_write(const Pm4Command& c) {
+    if (eop_writes_disabled() || !c.event_addr || (c.event_addr & 3)) return;
+    uint64_t v = gpu_clock64();
+    memcpy((void*)(uintptr_t)c.event_addr, &v, sizeof v);
+    if (getenv("PROSPER_GFXLOG"))
+        fprintf(stderr, "[agc]   EventWrite [0x%llx] event_type=%u -> clock 0x%llx\n",
+                (unsigned long long)c.event_addr, c.event_type, (unsigned long long)v);
+    wake_on_label(c.event_addr);   // wake any sync_on_address futex waiter on this completion label
+}
+
 // Honor a WRITE_DATA packet: copy the inline dwords to the destination address (same synchronous timing).
 static void honor_write_data(const Pm4Command& c) {
     if (eop_writes_disabled() || !c.wd_addr || (c.wd_addr & 3) || !c.wd_data || !c.wd_num) return;
@@ -153,6 +172,9 @@ void GpuState::apply(const Pm4Command& c) {
             break;
         case K::WriteData:
             honor_write_data(c);    // inline data write requested by the Dcb
+            break;
+        case K::EventWrite:
+            honor_event_write(c);   // address-carrying (timestamp/label) EVENT_WRITE completion (#132)
             break;
         case K::WaitRegMem:
             // Synchronous fold: by the time we process this packet the CPU-side producer has
