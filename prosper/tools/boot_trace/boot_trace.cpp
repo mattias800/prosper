@@ -4,6 +4,7 @@
 // tool. Linux only. Usage: boot_trace <dump-root>
 #include "loader/linker.hpp"
 #include "host/exec_image.hpp"
+#include "host/boot_program.hpp"          // shared guest-boot path (also used by prosper-app)
 #include "hle/dispatch.hpp"
 #include <cstdio>
 #include <string>
@@ -24,6 +25,7 @@
 #include "gpu/shader_resources.hpp"       // ShaderResourceTable / ResourceClass (bind the shaders' resources)
 #include "gpu/rdna2_to_spirv.hpp"         // recompile_fragment (diagnostic solid-color PS)
 #include "../../tests/render_runner.h"   // offscreen Vulkan backend (render_triangle_rgba) + dump_bmp
+#include "../../frontends/shared/live_renderer.hpp"   // shared live renderer (also used by prosper-app)
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -79,94 +81,25 @@ static uint64_t bof(uint64_t a) {
 int main(int argc, char** argv) {
     std::string d = (argc >= 2) ? argv[1] : "../../PPSA24651-app0";
     Program p; std::string e;
-    // libc.prx loaded last => its init_array runs first (deepest dependency), before eboot's entry.
-    // Experimental (branch libc-prx-integration): route eboot's 145 libc imports to the REAL Sony
-    // libc instead of our HLE. Cross-module export beats the HLE stub slot (see linker.cpp pass 2).
-    std::vector<LinkInput> in = {
-        { d + "/eboot.bin", EBOOT },
-        { d + "/Media/Modules/Il2cppUserAssemblies.prx", IL2CPP },
-        { d + "/Media/Modules/PS5Util.prx", PS5UTIL },
-        // Native PSN Unity plugin. Loading it as a guest module (its imports resolve to our HLE)
-        // makes its exports — PSN_PrxInitialize / PSN_PrxUpdate / UnityPluginLoad — reachable via
-        // sceKernelDlsym, so the managed PSN bootstrap (Unity.PSN.PS5.Main.Initialize) can start the
-        // async worker pool. Gate behind PROSPER_NO_PSN=1 to fall back to the 4-module boot.
-        { d + "/Media/Plugins/PSN.prx", PSN },
-        // Native SaveData Unity plugin — exports PrxSaveDataInitialize / PrxSaveDataMount / etc. The
-        // managed SaveData layer dlsym's these at startup to read the save slot (new-game vs. continue),
-        // which gates the transition from the loading screen into the intro. Same load path as PSN.prx.
-        { d + "/Media/Plugins/SaveData.prx", SAVEDATA },
-        { d + "/sce_module/libc.prx", LIBC },
-    };
-    if (getenv("PROSPER_NO_PSN"))
-        for (size_t i = in.size(); i-- > 0; )
-            if (in[i].path.find("PSN.prx") != std::string::npos ||
-                in[i].path.find("SaveData.prx") != std::string::npos) in.erase(in.begin() + (ptrdiff_t)i);
-    // Cross-title tolerance (docs/CROSS_ENGINE_UE4.md step 1, minimal form): drop dependent modules
-    // whose file doesn't exist in this dump — e.g. the UE4 title ships no Il2cpp/PS5Util, so it links
-    // eboot + libc.prx only. The eboot (index 0) is always kept; each module keeps its fixed base.
-    // For the primary target every file exists, so its link is byte-for-byte unchanged.
-    for (size_t i = in.size(); i-- > 1; ) {
-        if (FILE* f = fopen(in[i].path.c_str(), "rb")) fclose(f);
-        else { printf("skipping absent module: %s\n", in[i].path.c_str()); in.erase(in.begin() + (ptrdiff_t)i); }
-    }
-    if (!link_program(in, STUB, p, &e)) { printf("link failed: %s\n", e.c_str()); return 1; }
-    printf("linked %zu modules; %zu imports (%zu cross-module, %zu stub slots); %zu init fns\n",
-           p.mods.size(), p.total_imports, p.resolved_cross_module, p.slots.size(), p.init_fns.size());
-
-    // Let sceKernelDlsym resolve exported symbols by name against all loaded modules (e.g. the
-    // PSN.prx plugin's PSN_PrxInitialize / UnityPluginLoad), so Unity's native-plugin loader binds
-    // real export addresses instead of getting ESRCH.
-    set_module_exports(&p.exports);
-    // Per-module tables (#147): LoadStartModule hands out real handles for linked-module paths and
-    // dlsym consults the handle's module before the global first-definition-wins table.
-    { std::vector<ModuleExportTable> mt;
-      for (const auto& me : p.mod_exports) mt.push_back({ me.path, &me.nids });
-      set_module_export_tables(std::move(mt)); }
-
-    register_builtin_hle();
+    // Boot the title via the shared path (also used by prosper-app): link the fixed module set,
+    // map, TLS/unwind/procparam, stubs, trap handler, plugin ranges, and the dependent-module
+    // init_arrays. The lambda installs boot_trace's host frontends at the same point it always did
+    // — right after the built-in HLE is registered, before the images are mapped: sceAudioOut
+    // output to the host, and (gated by PROSPER_PAD) a controller backend (SDL3, else evdev).
+    if (!boot_program(d, p, &e, [&]{
 #ifdef PROSPER_AUDIO_SDL3
-    prosper::install_sdl3_audio_sink();   // route the guest's sceAudioOut output to the host via SDL3
+        prosper::install_sdl3_audio_sink();
 #endif
-    // Controller input, gated by PROSPER_PAD (default: core's neutral/disconnected pad, deterministic).
-    // Prefer the cross-platform SDL3 gamepad backend; fall back to the zero-dep Linux evdev reader.
-    if (getenv("PROSPER_PAD")) {
-        bool pad_ok = false; (void)pad_ok;
+        if (getenv("PROSPER_PAD")) {
+            bool pad_ok = false; (void)pad_ok;
 #ifdef PROSPER_PAD_SDL3
-        pad_ok = prosper::install_sdl3_pad_backend();
+            pad_ok = prosper::install_sdl3_pad_backend();
 #endif
 #ifdef PROSPER_PAD_EVDEV
-        if (!pad_ok) pad_ok = prosper::install_evdev_pad_backend();
+            if (!pad_ok) pad_ok = prosper::install_evdev_pad_backend();
 #endif
-    }
-    set_app0_root(d);
-    for (auto& img : p.imgs) if (!map_image(img, &e)) { printf("map failed: %s\n", e.c_str()); return 1; }
-    { std::vector<TlsModuleDesc> td; for (auto& t : p.tls_templates) td.push_back({t.init_va, t.filesz, t.memsz});
-      set_tls_modules(td.data(), td.size());      // enable __tls_get_addr for loaded modules (real libc.prx)
-      guest_tls_set_templates(td.data(), td.size()); }   // gated PROSPER_GUEST_FS: guest initial-exec %fs TLS
-    // C++ exception unwinding: give sceKernelGetModuleInfoForUnwind each module's .eh_frame_hdr + text seg.
-    { static std::vector<std::string> names; names.reserve(p.imgs.size());   // stable name storage
-      std::vector<UnwindModuleDesc> um;
-      for (size_t i = 0; i < p.imgs.size() && i < p.mods.size(); i++) {
-          auto& img = p.imgs[i]; auto& mod = *p.mods[i];
-          UnwindModuleDesc dd; dd.lo = img.base + img.min_vaddr; dd.hi = img.base + img.max_vaddr;
-          for (auto& s : mod.segments) if (s.type == 0x6474e550u) { dd.ehframe_hdr = img.base + s.vaddr; dd.ehframe_hdr_sz = s.memsz; }
-          if (!mod.loads.empty()) { dd.seg0 = img.base + mod.loads[0].vaddr; dd.seg0_sz = mod.loads[0].memsz; }
-          std::string nm = mod.path; auto sl = nm.find_last_of("/\\"); if (sl != std::string::npos) nm = nm.substr(sl + 1);
-          names.push_back(nm); dd.name = names.back().c_str(); um.push_back(dd);
-      }
-      set_unwind_modules(um.data(), um.size()); }
-    // sceKernelGetProcParam -> eboot's SCE_PROCPARAM (real libc reads its heap/malloc config here).
-    for (auto& s : p.mods[0]->segments)
-        if (s.type == PT_SCE_PROCPARAM) { set_proc_param(EBOOT + s.vaddr); break; }
-    if (!install_stubs(p.slots, p.stub_base, p.stub_size, &e)) { printf("stubs failed: %s\n", e.c_str()); return 1; }
-    install_trap_handler();
-    // PSN.prx / SaveData.prx are SCE native plugins whose user module_start validates a module-param
-    // descriptor {size=0x10, version=0x200, cb=NULL} and null-faults if started with (argc=0, argp=NULL)
-    // — the fault that left PSN unregistered ("PSN is an old version"). Register their guest ranges so
-    // run_guest_inits starts them with the real descriptor. Skipped when PROSPER_NO_PSN drops them.
-    if (!getenv("PROSPER_NO_PSN"))
-        set_module_start_param_ranges({ { PSN, SAVEDATA }, { SAVEDATA, LIBC } });
-    run_guest_inits(p.init_fns);
+        }
+    })) { printf("%s\n", e.c_str()); return 1; }
 
     // PROSPER_PATCH_RET=addr[,addr...]: write 0xC3 (ret) at each absolute guest address, neutralizing that
     // function (returns immediately, stack balanced). Bring-up diagnostic to bisect a crashing subsystem —
@@ -252,223 +185,13 @@ int main(int argc, char** argv) {
     }
 
 #ifdef PROSPER_HAVE_VULKAN
-    // PROSPER_RENDER=1: register the live Vulkan renderer so execute_and_present fires on every
-    // submitted Dcb with draws (Stage A of GPU_EXECUTOR_DESIGN.md, now live). Each rendered frame
-    // goes to the present path; the first few (and then every 60th) are also dumped as BMP
-    // screenshots under PROSPER_FRAME_DIR (default cwd). llvmpipe renders headless in WSL.
+    // PROSPER_RENDER=1: register the live Vulkan renderer (shared with prosper-app via
+    // frontends/shared/live_renderer) so execute_and_present composites every submitted Dcb with
+    // draws and hands the frame to the present path; periodic BMP screenshots go to PROSPER_FRAME_DIR
+    // (default cwd). llvmpipe renders headless in WSL.
     if (getenv("PROSPER_RENDER")) {
-        static std::atomic<int> frame_no{0};
-        static std::string fdir = getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".";
-        prosper::gpu::set_submit_renderer(
-            [](const std::vector<prosper::gpu::DrawItem>& items, uint32_t w, uint32_t h) -> std::vector<uint8_t> {
-                using RC = prosper::gpu::ResourceClass;
-                // PROSPER_RENDER_FIRST=<N>: skip the slow (~400x) Vulkan render for the first N GPU submits, so
-                // the game reaches a LATE scene (e.g. the level1 cutscene, which only starts submitting after
-                // ~5000 title-loop submits) at native speed before we begin rendering/dumping. Returning {}
-                // means "not rendered this submit". Without this, rendering from boot is far too slow to ever
-                // reach a post-loading-screen scene.
-                static std::atomic<int> g_submit_idx{0};
-                static int g_render_first = getenv("PROSPER_RENDER_FIRST") ? atoi(getenv("PROSPER_RENDER_FIRST")) : 0;
-                if (g_submit_idx++ < g_render_first) return {};
-                // Dump the FIRST item's recompiled SPIR-V (diagnostic; survives a mid-render crash).
-                if (getenv("PROSPER_SHADER_DUMP") && !items.empty()) {
-                    std::string d = getenv("PROSPER_SHADER_DUMP");
-                    if (FILE* f = fopen((d + "/frame_vs.spv").c_str(), "wb")) { fwrite(items[0].vs.data(), 4, items[0].vs.size(), f); fclose(f); }
-                    if (FILE* f = fopen((d + "/frame_fs.spv").c_str(), "wb")) { fwrite(items[0].fs.data(), 4, items[0].fs.size(), f); fclose(f); }
-                    fprintf(stderr, "[render] dumped SPIR-V vs=%zu fs=%zu dwords\n", items[0].vs.size(), items[0].fs.size()); fflush(stderr);
-                }
-                // Copy [a, a+n) into dst, but stop at the first 64KB block that is NOT within a reserved guest
-                // mapping (prosper_reserved_range_state == 0). A resource's declared size (e.g. a 2048x1024
-                // atlas = 8 MB) can run past its real committed backing; an unguarded memcpy then walks off
-                // the mapping and SIGSEGVs the render thread mid-copy — /dev/null-write "readable" can't catch
-                // it because /dev/null discards without faulting. Returns bytes copied; dst is pre-zeroed so a
-                // short copy just leaves a transparent/black tail (only the missing region degrades).
-                auto safe_copy = [](uint8_t* dst, uint64_t a, size_t n) -> size_t {
-                    const size_t PG = 0x10000;   // lazy-commit granularity (64 KB)
-                    size_t done = 0;
-                    while (done < n) {
-                        uint64_t cur = a + done;
-                        if (cur < 0x1000 || prosper_reserved_range_state(cur) == 0) break;
-                        size_t chunk = std::min(n - done, PG - (size_t)(cur & (PG - 1)));
-                        std::memcpy(dst + done, (const void*)(uintptr_t)cur, chunk);
-                        done += chunk;
-                    }
-                    return done;
-                };
-                static std::vector<std::vector<uint8_t>> texstore;  // keep every item's texture bytes alive
-                texstore.clear();
-                // Build one draw's set-tagged resources from its VS (set 0) + PS (set 1) tables — read the
-                // bytes from 1:1-mapped guest memory, detile textures. (Each constant/vertex buffer + texture
-                // gets its own binding; the recompiler declared a storage buffer / image sampler at each.)
-                auto build_R = [&](const prosper::gpu::ShaderResourceTable* vrt, const prosper::gpu::ShaderResourceTable* prt) {
-                  std::vector<prosper::test::FrameResource> R;
-                  auto add = [&](const prosper::gpu::ShaderResourceTable* t, uint32_t set){
-                    if (!t) return;
-                    for (auto& r : t->resources) {
-                        prosper::test::FrameResource fr; fr.binding = r.binding; fr.set = set;
-                        if (r.cls == RC::Texture || r.cls == RC::StorageImage) {
-                            uint32_t tw = r.width ? r.width : 4, th = r.height ? r.height : 4;
-                            size_t nb = (size_t)tw * th * 4;
-                            texstore.emplace_back(nb, 0x00);
-                            // Block-compressed (BC1/2/3): read the (possibly tiled) compressed blocks, block-
-                            // detile, and decode to RGBA8 in-place. The blocks are the tiled element (BC3 =
-                            // 16 bytes -> SW_4KB_S 16x16-block micro-tiles). #121.
-                            const uint32_t bcb = prosper::gpu::bc_block_bytes(r.format);
-                            if (bcb) {
-                                uint32_t bw = (tw + 3) / 4, bh = (th + 3) / 4;
-                                // The 4KB micro-tile's element dims now derive from bpe inside the
-                                // detiler (16-byte blocks -> 16x16, 8-byte -> 32x16, #119) — the old
-                                // caller-supplied square tile_side mis-shaped the 8-byte geometry.
-                                size_t comp_bytes = (size_t)bw * bh * bcb;
-                                std::vector<uint8_t> lin(comp_bytes, 0);
-                                bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) && !getenv("PROSPER_NODETILE");
-                                if (tiled) {
-                                    size_t tbytes = prosper::gpu::tiled_elements_bytes(bw, bh, bcb, r.tile_mode);
-                                    std::vector<uint8_t> traw(tbytes, 0);
-                                    safe_copy(traw.data(), r.gpu_addr, tbytes);
-                                    prosper::gpu::detile_elements(lin.data(), traw.data(), tbytes, bw, bh, bcb, r.tile_mode);
-                                } else {
-                                    safe_copy(lin.data(), r.gpu_addr, comp_bytes);
-                                }
-                                prosper::gpu::bc_decode_surface(texstore.back().data(), lin.data(), lin.size(), tw, th, r.format);
-                            } else {
-                                safe_copy(texstore.back().data(), r.gpu_addr, nb);
-                            }
-                            // PROSPER_DUMP_RAWTEX: write the raw tiled RGBA bytes (pre-detile) to a .bin for
-                            // offline swizzle experimentation.
-                            if (getenv("PROSPER_DUMP_RAWTEX") && !texstore.back().empty()) {
-                                std::string d = getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".";
-                                char fn[512]; snprintf(fn, sizeof fn, "%s/rawtex_%ux%u.bin", d.c_str(), tw, th);
-                                if (FILE* f = fopen(fn, "wb")) { fwrite(texstore.back().data(), 1, nb, f); fclose(f);
-                                    fprintf(stderr, "[render] dumped raw tiled bytes -> %s (%zu)\n", fn, nb); fflush(stderr); }
-                            }
-                            // PROSPER_TESTTEX: overwrite with a recognizable gradient/checker to prove the
-                            // sample path (the game's real render-target texture is empty until we execute
-                            // the scene draws that fill it).
-                            if (getenv("PROSPER_TESTTEX")) {
-                                for (uint32_t y = 0; y < th; y++) for (uint32_t x = 0; x < tw; x++) {
-                                    uint8_t* p = &texstore.back()[((size_t)y * tw + x) * 4];
-                                    bool ck = ((x / 64) ^ (y / 64)) & 1;
-                                    p[0] = (uint8_t)(255 * x / tw); p[1] = (uint8_t)(255 * y / th);
-                                    p[2] = ck ? 200 : 40; p[3] = 255;
-                                }
-                            }
-                            if (getenv("PROSPER_GFXLOG")) { const uint8_t* b = texstore.back().data();
-                                size_t nz = 0; for (size_t i = 0; i < nb && i < (1u<<16); i++) nz += (b[i] != 0);
-                                fprintf(stderr, "[render] tex binding=%u %ux%u first64k-nonzero=%zu\n", r.binding, tw, th, nz); }
-                            // AUTO-DETILE: de-swizzle a GPU-tiled sampled surface into the linear texstore,
-                            // driven by the T# tile_mode now threaded through the resource table (r.tile_mode).
-                            // PROSPER_DETILE forces it (for surfaces whose tiling we don't yet flag); PROSPER_NODETILE
-                            // disables it. Reads the PADDED tiled buffer (height rounded to whole 32-texel tile rows).
-                            bool auto_tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode);
-                            const char* dt = getenv("PROSPER_DETILE");
-                            // BC textures already block-detiled + decoded above; the 32-bpp detiler must not touch them.
-                            if (!bcb && !getenv("PROSPER_NODETILE") && (auto_tiled || (dt && atoi(dt) != 0))) {
-                                const uint32_t tmode = auto_tiled ? r.tile_mode : (uint32_t)prosper::gpu::TileMode::Sw4KbS;
-                                // PROSPER_PITCH: padded row pitch in texels for surfaces whose pitch > width.
-                                const uint32_t pitch = getenv("PROSPER_PITCH") ? (uint32_t)atoi(getenv("PROSPER_PITCH")) : 0;
-                                size_t tiled_bytes = prosper::gpu::tiled_surface_bytes(tw, th, tmode, pitch);
-                                std::vector<uint8_t> tiled(tiled_bytes, 0);
-                                size_t got = safe_copy(tiled.data(), r.gpu_addr, tiled_bytes);
-                                if (got < nb)
-                                    // The padded tiled buffer's tail (th rounded to whole 32-row tiles) runs
-                                    // past the real backing: fall back to the width*height linear bytes copied
-                                    // above rather than an all-zero buffer (which would BLANK the texture).
-                                    // Only the bottom tile-row degrades.
-                                    std::memcpy(tiled.data(), texstore.back().data(), std::min(nb, tiled_bytes));
-                                // PROSPER_DUMP_RAWTILE: write the EXACT padded tiled bytes to a .bin (no lossy BMP
-                                // round-trip) so the de-swizzle can be reversed offline against a known image (#101).
-                                if (getenv("PROSPER_DUMP_RAWTILE") && frame_no < 200) {
-                                    std::string dd = getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".";
-                                    char bn[512]; snprintf(bn, sizeof bn, "%s/tiled_f%04d_b%u_%ux%u.bin",
-                                                           dd.c_str(), (int)frame_no, r.binding, tw, th);
-                                    if (FILE* bf = fopen(bn, "wb")) { fwrite(tiled.data(), 1, tiled.size(), bf); fclose(bf); }
-                                }
-                                prosper::gpu::detile_surface(texstore.back().data(), tiled.data(), tw, th, tmode, pitch);
-                            }
-                            // PROSPER_DUMP_TEX: write the RAW texture memory (interpreted linearly) to a BMP,
-                            // bypassing the shader — reveals whether the render target is tiled (scrambled) or
-                            // linear (recognizable), and the tiling structure.
-                            if (getenv("PROSPER_DUMP_TEX") && !texstore.back().empty() && frame_no < 200) {
-                                std::string d = getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".";
-                                // Frame-numbered so a specific frame's texture (loading screen, cutscene) can be
-                                // recovered — a bare per-binding name overwrites every frame. Bounded to the first
-                                // 200 frames (loading + intro) so a long run doesn't fill the disk.
-                                char fn[512]; snprintf(fn, sizeof fn, "%s/rawtex_f%04d_b%u.bmp", d.c_str(), (int)frame_no, r.binding);
-                                prosper::test::dump_bmp(fn, texstore.back(), tw, th);
-                                fprintf(stderr, "[render] dumped raw texture -> %s\n", fn); fflush(stderr);
-                            }
-                            fr.tex_rgba = texstore.back().data(); fr.tw = tw; fr.th = th;
-                        } else {
-                            uint32_t nb = std::min(r.size ? r.size : 256u, 1u << 20) & ~3u;   // cap 1 MB, dword-aligned
-                            if (nb >= 4) {
-                                std::vector<uint8_t> tmp(nb, 0);
-                                if (safe_copy(tmp.data(), r.gpu_addr, nb) > 0)
-                                    fr.dwords.assign((const uint32_t*)tmp.data(), (const uint32_t*)(tmp.data() + nb));
-                            }
-                            if (fr.dwords.empty()) fr.dwords.assign(64, 0);
-                        }
-                        R.push_back(std::move(fr));
-                    }
-                  };
-                  add(vrt, 0); add(prt, 1);   // VS resources -> descriptor set 0, PS -> set 1
-                  return R;
-                };
-                // Diagnostic shader/state overrides (computed once, applied to EVERY draw item):
-                //   REFVS  -> a known-good fullscreen-triangle VS (isolates the game's real VS).
-                //   TESTPS -> a solid-magenta PS (isolates VS geometry from PS shading).
-                //   FS_SPV -> a caller-supplied PS SPIR-V (e.g. a UV visualizer).
-                //   NOPS   -> bypass the resolved pipeline state (default state).
-                #include "refvs.inc"
-                const bool refvs = getenv("PROSPER_RENDER_REFVS");
-                std::vector<uint32_t> refvs_spv(kRefVs, kRefVs + sizeof(kRefVs) / 4);
-                std::vector<uint32_t> ps_override;
-                if (getenv("PROSPER_RENDER_TESTPS")) {
-                    static const uint32_t kMagentaPs[] = {   // v0=1.0(R) v1=0.0(G) v2=1.0(B) v3=1.0(A); exp mrt0; endpgm
-                        0x7E0002F2u, 0x7E020280u, 0x7E0402F2u, 0x7E0602F2u, 0xF800180Fu, 0x03020100u, 0xBF810000u };
-                    ps_override = prosper::gpu::recompile_fragment(kMagentaPs, sizeof(kMagentaPs) / 4, nullptr);
-                }
-                if (const char* fsp = getenv("PROSPER_FS_SPV")) {
-                    if (FILE* f = fopen(fsp, "rb")) {
-                        fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
-                        std::vector<uint32_t> m((size_t)sz / 4);
-                        if (sz >= 20 && fread(m.data(), 4, m.size(), f) == m.size()) ps_override = std::move(m);
-                        fclose(f);
-                    }
-                }
-                const bool nops = getenv("PROSPER_RENDER_NOPS");
-                // Assemble the backend draws — one per realized DrawItem, each with its own resources +
-                // fixed-function state (or the diagnostic overrides above). render_draws_rgba composites
-                // them into ONE framebuffer.
-                std::vector<prosper::test::BackendDraw> bds;
-                for (const auto& it : items) {
-                    prosper::test::BackendDraw bd;
-                    bd.vs     = refvs ? refvs_spv : it.vs;
-                    bd.fs     = ps_override.empty() ? it.fs : ps_override;
-                    bd.vcount = refvs ? 3u : it.vertex_count;
-                    bd.ps     = nops ? nullptr : &it.ps;
-                    bd.R      = build_R(it.vrt.get(), it.prt.get());
-                    // Indexed draw: hand the executor-fetched index data to the backend (vkCmdDrawIndexed).
-                    // Skipped under REFVS — the reference VS is a 3-vertex non-indexed fullscreen triangle.
-                    if (!refvs) bd.indices = it.indices;
-                    if (getenv("PROSPER_GFXLOG")) fprintf(stderr,
-                        "[render] item %zu: %zu resources vcount=%u nidx=%zu topo=%u mask=0x%x blend=%d\n",
-                        bds.size(), bd.R.size(), bd.vcount, bd.indices.size(), it.ps.topology,
-                        it.ps.color_write_mask, (int)it.ps.blend_enable);
-                    bds.push_back(std::move(bd));
-                }
-                std::vector<uint8_t> px = prosper::test::render_draws_rgba(bds, w, h);
-                int n = frame_no++;
-                if (px.empty()) {
-                    fprintf(stderr, "[render] frame %d: Vulkan render FAILED (%ux%u)\n", n, w, h);
-                } else if (n < 60 || n % 10 == 0) {   // widened to capture the title fade-in progression
-                    char fn[512]; snprintf(fn, sizeof fn, "%s/frame_%04d.bmp", fdir.c_str(), n);
-                    prosper::test::dump_bmp(fn, px, w, h);
-                    fprintf(stderr, "[render] frame %d rendered (%ux%u) -> %s\n", n, w, h, fn);
-                }
-                return px;
-            });
-        fprintf(stderr, "[render] live Vulkan submit renderer registered (frames -> %s)\n", fdir.c_str());
+        std::string fdir = getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".";
+        prosper::frontend::register_live_renderer(fdir, /*dump_bmps=*/true);
     }
 #endif
 
