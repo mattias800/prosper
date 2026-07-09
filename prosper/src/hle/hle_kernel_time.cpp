@@ -429,11 +429,20 @@ void prosper_eq_add_eop(uint64_t eq, int64_t id, uint64_t udata) {
 // == GPU pipe drain == the EOP interrupt moment). Posts TriggerEvent(ident=id, filter=GraphicsCore,
 // data=id, udata) to each registered equeue, matching shadPS4's IRQ handler. Inert if none registered.
 void prosper_eq_trigger_eop() {
+    // Deliver EVERY GPU-completion event as a DISTINCT equeue entry (coalesce=false). All EOP events share
+    // the same (ident, EVFILT_GRAPHICS_CORE), so coalescing collapses N submit-completions into ONE pending
+    // event — and the game's EOP handler posts a work-queue semaphore once per delivered completion, so a
+    // coalesced completion UNDER-posts the semaphore and its consumer deadlocks (GfxDevice work-queue
+    // eboot+0xb06ad2 / PreloadManager 0x18a83b5 / a worker). That was The Messenger's post-SaveData
+    // scene-activation stall (#234): with coalesce=false the scene activates and the intro cutscene plays;
+    // with the old coalescing it freezes on one frame. Same reason the APR channel (#210) is coalesce=false
+    // — a completion is a discrete count, never a level. PROSPER_EOP_COALESCE restores the old behavior.
+    static const bool coalesce = getenv("PROSPER_EOP_COALESCE") != nullptr;
     std::vector<FlipReg> regs;
     { std::lock_guard<std::mutex> lk(g_eq_mx); regs = g_eop_regs; }
     for (auto& r : regs) {
         SceKEvent e{}; e.ident = r.ident; e.filter = EVFILT_GRAPHICS_CORE; e.data = r.ident; e.udata = r.udata;
-        eq_post(r.eq, e);
+        eq_post(r.eq, e, coalesce);
     }
 }
 
