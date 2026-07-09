@@ -112,10 +112,11 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         fprintf(stderr, "[rt] color0=0x%llx", (unsigned long long)rs.color0_base);
         if (prt) for (const auto& r : prt->resources)
             if (r.cls == ResourceClass::Texture)
-                fprintf(stderr, " tex=0x%llx(%ux%u)", (unsigned long long)r.gpu_addr, r.width, r.height);
+                fprintf(stderr, " tex=0x%llx(%ux%u f%u c%u)", (unsigned long long)r.gpu_addr, r.width, r.height,
+                        (unsigned)r.format, r.num_components);
         if (vrt) for (const auto& r : vrt->resources)
             if (r.cls == ResourceClass::Texture)
-                fprintf(stderr, " vtex=0x%llx(%ux%u)", (unsigned long long)r.gpu_addr, r.width, r.height);
+                fprintf(stderr, " vtex=0x%llx(%ux%u f%u)", (unsigned long long)r.gpu_addr, r.width, r.height, (unsigned)r.format);
         fprintf(stderr, "\n");
     }
     std::vector<uint32_t> vs = recompile_vertex((const uint32_t*)(uintptr_t)rs.es_addr, max_shader_dwords, vrt.get());

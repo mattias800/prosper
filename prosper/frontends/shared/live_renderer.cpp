@@ -84,6 +84,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         uint32_t tw = r.width ? r.width : 4, th = r.height ? r.height : 4;
                         size_t nb = (size_t)tw * th * 4;
                         texstore.emplace_back(nb, 0x00);
+                        // Real bytes-per-texel of the SAMPLED surface. Single/dual-channel textures (an R8
+                        // font/coverage atlas — this game's 2048x1024 c1 surface) are NOT 4 B/texel; reading
+                        // them as RGBA8 packs adjacent texels into one pixel and over-reads the allocation,
+                        // which is why glyph text rendered as solid white/black BLOCKS (#102). bpt drives a
+                        // narrow read+expand path below. StorageImage / unknown formats keep 4 B (bpt=0->4).
+                        uint32_t bpt = prosper::gpu::data_format_bytes(r.format) * (r.num_components ? r.num_components : 1);
+                        if (bpt == 0 || bpt > 4) bpt = 4;
+                        bool narrow_done = false;
                         // RTT (#167): if this texture's base is a color target we rendered into, inject those
                         // pixels (nearest-scaled to tw x th) instead of reading empty guest memory.
                         bool rtt_hit = false;
@@ -124,6 +132,28 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 safe_copy(lin.data(), r.gpu_addr, comp_bytes);
                             }
                             prosper::gpu::bc_decode_surface(texstore.back().data(), lin.data(), lin.size(), tw, th, r.format);
+                        } else if (bpt < 4) {
+                            // Narrow (single/dual-channel) surface: read at the REAL element size and detile
+                            // with the matching bpe geometry (1 B -> 64x64 micro-tiles, #119), then expand
+                            // each texel to grayscale RGBA8 (replicate to R,G,B,A) so the sampling shader
+                            // reads the coverage in ANY channel it uses (.r for a font atlas, .a for a mask).
+                            std::vector<uint8_t> nlin((size_t)tw * th * bpt, 0);
+                            bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) && !getenv("PROSPER_NODETILE");
+                            if (tiled) {
+                                size_t tbytes = prosper::gpu::tiled_surface_bytes(tw, th, r.tile_mode, 0, bpt);
+                                std::vector<uint8_t> traw(tbytes, 0);
+                                size_t got = safe_copy(traw.data(), r.gpu_addr, tbytes);
+                                if (got < nlin.size()) safe_copy(nlin.data(), r.gpu_addr, nlin.size());  // short backing -> linear fallback
+                                else prosper::gpu::detile_surface(nlin.data(), traw.data(), tw, th, r.tile_mode, 0, bpt);
+                            } else {
+                                safe_copy(nlin.data(), r.gpu_addr, nlin.size());
+                            }
+                            for (size_t t = 0; t < (size_t)tw * th; t++) {
+                                uint8_t v = nlin[t * bpt];   // first (coverage) channel
+                                uint8_t* p = &texstore.back()[t * 4];
+                                p[0] = p[1] = p[2] = p[3] = v;
+                            }
+                            narrow_done = true;   // already detiled+expanded; skip the 32-bpp auto-detile below
                         } else {
                             safe_copy(texstore.back().data(), r.gpu_addr, nb);
                         }
@@ -154,7 +184,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         bool auto_tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode);
                         const char* dt = getenv("PROSPER_DETILE");
                         // BC textures already block-detiled + decoded above; the 32-bpp detiler must not touch them.
-                        if (!rtt_hit && !bcb && !getenv("PROSPER_NODETILE") && (auto_tiled || (dt && atoi(dt) != 0))) {
+                        if (!rtt_hit && !bcb && !narrow_done && !getenv("PROSPER_NODETILE") && (auto_tiled || (dt && atoi(dt) != 0))) {
                             const uint32_t tmode = auto_tiled ? r.tile_mode : (uint32_t)prosper::gpu::TileMode::Sw4KbS;
                             const uint32_t pitch = getenv("PROSPER_PITCH") ? (uint32_t)atoi(getenv("PROSPER_PITCH")) : 0;
                             size_t tiled_bytes = prosper::gpu::tiled_surface_bytes(tw, th, tmode, pitch);
