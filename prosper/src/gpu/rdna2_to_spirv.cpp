@@ -309,21 +309,28 @@ struct SpirvCompute {
         tex_var[binding] = v;
     }
     // image_sample 2D: sample the combined sampler at `binding` with (u,v) float-BITS coords; fills
-    // out[0..3] with the RGBA result components as raw VGPR bits. Fragment stage (implicit LOD).
+    // out[0..3] with the RGBA result components as raw VGPR bits. Implicit LOD is only legal in the
+    // Fragment execution model (#151) — the compute/vertex shells have no derivatives, so there we
+    // sample at explicit LOD 0 (what a non-pixel-shader image_sample resolves to without gradients).
     void image_sample_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t out[4]) {
         uint32_t si    = id(); put(code, Op_Load, {t_sampled_image, si, tex_var[binding]});
         uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
-        uint32_t res   = id(); put(code, Op_ImageSampleImplicitLod, {t_v4f, res, si, coord});
+        uint32_t res   = id();
+        if (is_fragment) put(code, Op_ImageSampleImplicitLod, {t_v4f, res, si, coord});
+        else             put(code, Op_ImageSampleExplicitLod, {t_v4f, res, si, coord, ImgOp_Lod, fconstf(0.0f)});
         for (uint32_t c = 0; c < 4; c++) {
             uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, res, c}); out[c] = bcu(e);
         }
     }
-    // image_sample 3D: (u,v,w) float-BITS coords -> RGBA (implicit LOD). Uses the Dim_3D sampled image.
+    // image_sample 3D: (u,v,w) float-BITS coords -> RGBA. Uses the Dim_3D sampled image; same
+    // implicit-LOD-only-in-Fragment rule as image_sample_2d.
     void image_sample_3d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t w_bits, uint32_t out[4]) {
         uint32_t simg  = sampled_image_type(Dim_3D);
         uint32_t si    = id(); put(code, Op_Load, {simg, si, tex_var[binding]});
         uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v3f(), coord, bcf(u_bits), bcf(v_bits), bcf(w_bits)});
-        uint32_t res   = id(); put(code, Op_ImageSampleImplicitLod, {t_v4f, res, si, coord});
+        uint32_t res   = id();
+        if (is_fragment) put(code, Op_ImageSampleImplicitLod, {t_v4f, res, si, coord});
+        else             put(code, Op_ImageSampleExplicitLod, {t_v4f, res, si, coord, ImgOp_Lod, fconstf(0.0f)});
         for (uint32_t c = 0; c < 4; c++) {
             uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, res, c}); out[c] = bcu(e);
         }
