@@ -411,6 +411,15 @@ int main() {
     printf("  kernel20 mismatches=%u (out[0]=%g expect=50)\n", bad20, got20.size()==N?got20[0]:-1);
     CHECK(got20.size()==N && bad20==0, "recompiled kernel 20 (SMEM: cbuf[1]+cbuf[2] from constant buffer) correct");
 
+    // Kernel 20b (#149): a register-SOFFSET s_buffer_load must be REJECTED, not silently translated
+    // with the immediate alone (the register offset is unmodeled). s_buffer_load_dword s0, s[..], s8.
+    // Same first-load prefix as kernel 20 so the difference is purely the register SOFFSET.
+    const uint32_t code20b[] = {
+        0xf4000001u, 0xfa000004u, 0xf4200002u, 0x10000008u, 0x7e000c00u, 0xbf810000u,
+    };
+    CHECK(recompile_valu(code20b, sizeof(code20b)/sizeof(code20b[0]), 1, 0).empty(),
+          "kernel 20b (s_buffer_load with a register SOFFSET) is REJECTED (not silently mistranslated)");
+
     // Kernel 21: MUBUF per-lane buffer_load_dword (the vertex-fetch mechanism). v0=(uint)gid;
     // v0<<=2 (byte offset); buffer_load_dword v0, v0 offen -> cbuf[gid]; out=(float)cbuf[gid].
     const uint32_t code21[] = {

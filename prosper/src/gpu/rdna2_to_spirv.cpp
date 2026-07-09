@@ -1726,8 +1726,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x2: case 0xA: n = 4;  break;   // s_load_dwordx4   / s_buffer_load_dwordx4
                 case 0x3: case 0xB: n = 8;  break;   // s_load_dwordx8   / s_buffer_load_dwordx8
                 case 0x4: case 0xC: n = 16; break;   // s_load_dwordx16  / s_buffer_load_dwordx16
-                default: ok = false; return true;    // register-offset / stores / others not yet
+                default: ok = false; return true;    // stores / others not yet
             }
+            // Register SOFFSET (src[1] not the NULL sentinel) adds an SGPR-computed byte offset we don't
+            // model — reject rather than translate with the immediate alone (#149). Immediate-only loads
+            // encode SOFFSET = SGPR_NULL (125). A negative signed immediate can't index a constant
+            // buffer (dword index would wrap), so reject that too.
+            if (!(in.src[1].kind == OperandKind::Special && in.src[1].value == 125)) { ok = false; return true; }
+            if ((int32_t)in.literal < 0) { ok = false; return true; }
             uint32_t base_idx = in.literal >> 2;    // immediate byte offset -> dword index
             // Descriptor provenance: pick which bound constant buffer via the resource table, routing this
             // load to that buffer's OWN binding (N-buffer model) — so Unity's several constant buffers
