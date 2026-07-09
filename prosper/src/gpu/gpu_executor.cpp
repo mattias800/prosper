@@ -283,24 +283,32 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     return out;
 }
 
-namespace {
+namespace { constexpr uint32_t kPsBindingBase = 32; }
 
-// Give every resource its OWN descriptor binding, starting at `first` (0/1 reserved). The N-buffer model:
-// the shader reads several distinct constant buffers (Unity's per-draw transform, per-frame, …) + vertex
-// buffers + textures, and each must land at a separate binding so they don't collapse. The recompiler
-// declares a storage buffer (cbuf/vbuf) or image sampler (texture) at each binding and resolves an
-// s_buffer_load/image_sample to its resource's binding via provenance (by_sgpr_base / by_srt_offset).
+// Assign each resource its OWN descriptor binding, starting at `first` (0/1 reserved). The N-buffer
+// model: the shader reads several distinct constant buffers (Unity's per-draw transform, per-frame,
+// …) + vertex buffers + textures, and each must land at a separate binding so they don't collapse.
+// The recompiler declares a storage buffer (cbuf/vbuf) or image sampler (texture) at each binding and
+// resolves an s_buffer_load/image_sample to its resource's binding via provenance.
 //
-// The VS and PS tables are bound together in ONE descriptor set by the live renderer, so the two stages'
-// binding ranges MUST be disjoint: both stages numbering from 2 made the PS's small zero-filled cbuf land
-// on the SAME binding as the VS's cbuf holding the UV scale/offset (Unity _MainTex_ST) — the later
-// descriptor write won, the VS read zeros, and every vertex output uv = attr*0 + 0 (a constant, so the
-// whole triangle sampled one texel). VS keeps 2.., PS starts at kPsBindingBase.
-constexpr uint32_t kPsBindingBase = 32;
+// The VS and PS tables are bound together in ONE descriptor set by the live renderer, so the two
+// stages' binding ranges MUST be disjoint (VS keeps 2.., PS starts at kPsBindingBase). Within a
+// stage, constant/vertex BUFFERS are assigned first (from `first`), then TEXTURES / storage images —
+// but never on binding 2 or 3, which the recompiler's declare_cbufs always occupies with its two
+// hardwired storage-buffer cbufs (v_cbuf/v_cbuf1). A shader whose FIRST resource is a texture used to
+// land it on binding 2, declaring BOTH a combined image sampler AND that storage buffer at one
+// binding (two descriptor types -> layout-creation failure, the draw disappears) (#157). Buffers-
+// first keeps the common cbufs-first shaders' bindings byte-identical (cbufs 2/3, textures 4+).
+// External linkage (declared in gpu_execute.hpp) so the binding policy is unit-testable.
 void assign_convention_bindings(ShaderResourceTable& t, uint32_t first) {
     uint32_t next = first;
-    for (auto& r : t.resources) r.binding = next++;
-}
+    for (auto& r : t.resources)
+        if (r.cls == ResourceClass::ConstantBuffer || r.cls == ResourceClass::VertexBuffer)
+            r.binding = next++;
+    uint32_t tex_next = next > first + 2 ? next : first + 2;   // reserve the two hardwired cbuf slots
+    for (auto& r : t.resources)
+        if (r.cls != ResourceClass::ConstantBuffer && r.cls != ResourceClass::VertexBuffer)
+            r.binding = tex_next++;
 }
 
 std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps) {
