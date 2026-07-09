@@ -1727,14 +1727,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // (per-draw transform, per-frame, …) don't collapse onto one. For s_buffer_load, SBASE
             // (src[0]) is the V#: resolve it by an earlier s_load's SRT tag (indirect) or directly by its
             // user-data SGPR index (the V# was placed in SGPRs by the driver). Default binding 2.
-            uint32_t binding = 2;
+            uint32_t binding = 2; bool cbuf_resolved = false;
             if (rt) { const ShaderResource* res = nullptr;
                 auto it = rs.sreg_srt.find(in.src[0].value);
                 if (it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second);
                 // A scalar buffer load reads a CONSTANT buffer — resolve the SBASE SGPR to a constant
                 // buffer specifically (the same SGPR may also hold a vertex-buffer V# elsewhere).
                 if (!res) res = rt->by_sgpr_base_cls(in.src[0].value, ResourceClass::ConstantBuffer);
-                if (res) binding = res->binding; }
+                if (res) { binding = res->binding; cbuf_resolved = true; } }
+            if (getenv("PROSPER_CBUFLOG"))
+                fprintf(stderr, "[cbuf] s_buffer_load x%u src0=s%d off=0x%x(dw%u) -> binding=%u %s\n",
+                        n, in.src[0].value, in.literal, base_idx, binding, cbuf_resolved ? "resolved" : "DEFAULT-2");
             for (uint32_t k = 0; k < n; k++)
                 rs.sreg[in.dst.value + (int)k] = b.cbuf_load(b.uconst(base_idx + k), binding);
             // A wide scalar load is a descriptor fetch — tag its dest SGPRs with the SRT offset so a
