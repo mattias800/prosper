@@ -991,3 +991,56 @@ what consumes the completed .ucas chunk data (decompression job? FEvent chain? t
 records at the retry list disp+0x198?) and which signal the FlushAsyncLoading packages actually
 poll. SlateLoadingThr + CriManaDecodeTh exist (loading-screen + movie machinery live); DOLL is
 UE4's LEGACY EDL loader (FAsyncLoadingThread strings), not zenloader.
+
+### REFRAMED (2026-07-09 session 4, issue #232): the GameThread is NOT stuck in FlushAsyncLoading — it TICKS; the wall is genuine scene non-activation (0 DrawIndex, 1.66M DispatchDirect)
+
+Live-attach sampling at the steady-state stall (probes `boot232.sh`, `probe232w/x/y/z.py`,
+`cpu232.sh`; target left running via `setsid`, PID in /root/pid232.txt) **overturns the session-3
+"busy FlushAsyncLoading spin" characterization**:
+
+- **The GameThread reaches Tick and runs the engine frame loop indefinitely.** 33/40 RIP samples of
+  the guest main thread land in a **game-side frame-throttle**: a `do { pump(); } while (clock() <
+  start+target)` loop at **eboot+0x5044c01** (containing fn starts eboot+0x5044740, a per-frame state
+  tick taking a `this` object + calling vtable `*0x288`), whose pump path bottoms out in a
+  `scePthreadCondTimedwait` return at **eboot+0x248e556** (an `FEvent::Wait(1ms)`-style sleep). It is
+  NOT the 0x25b2980 ProcessAsyncLoading busy-spin — that function's entry never fires under a
+  163 s breakpoint, because the loader long since drained. The frame loop advances **58k+ GpuFlips**,
+  stable and unbounded.
+- **Async loading has fully DRAINED, not deadlocked.** The `FAsyncLoadingThread` (ALT, name
+  "FAsyncLoadingTh") is **parked on its zenaphore** (`k_cond_wait` via eboot+0x22ea954 ->
+  0x2316b00). Its loader object (recovered from the parked thread's regs/stack, plausibility-gated
+  on the counter layout): **QueuedPackagesCounter[+0x1b0]=0, ExistingAsyncPackagesCounter[+0x1b4]=0,
+  QueuedPackages.Num[+0x58]=0, pendingIoBytes[+0x5d8]=0, ExternalReadQueue[+0x138]->next=0**. Nothing
+  is queued or in flight. (The +0xd8 AsyncPackageLookup histogram is noise — the slot layout guess is
+  wrong for this build; the counters are the reliable signal and they are all zero.) IoDispatcher /
+  IoService / 64 PoolThreads all idle in k_eq_wait/k_cond_wait.
+- **0 draws is GENUINE, not a decoder miss.** Packet-kind histogram over a full boot log:
+  **1,662,586 DispatchDirect and ZERO DrawIndex / DrawIndexAuto** (plus SetRegsIndirect 23.6M,
+  SetShRegDirect 11.6M, EventWrite/AcquireMem/ReleaseMem/WaitRegMem/WriteData, 50k Flip). The game
+  submits only per-frame **compute**, never geometry. The recompiler/PM4 decoder is not dropping
+  draws — the guest never emits a draw packet.
+- **Movie / cutscene is NOT the gate (clean A/B).** New knob `PROSPER_DENY_SUBSTR=.usm` (hle_file
+  `translate()`) makes every `.usm` open/stat fail ENOENT. With all movies denied, DOLL runs the
+  identical frame loop — flips climb 2669 -> 6510, still 0 draws. Confirms (again, cf. session 1) the
+  opening cutscene is coincidental, not the blocker.
+- **Safe-area ratio was a real bug but NOT the draw gate.** `sceSystemServiceGetDisplaySafeAreaInfo`
+  (1n37q1Bvc5Y) was unimplemented -> returned SUCCESS with the out-struct `{float ratio; u8[128]}`
+  unfilled, so ratio read 0.0 (degenerate title-safe rect -> collapsed viewport was a plausible
+  cull-everything cause). Fixed to fill ratio=1.0 (shadPS4 contract). Verified: **still 0 draws**
+  (flips 6463) — so a zero safe-area was not what gated geometry. Kept as a correctness fix (same
+  success+unfilled-out-struct class as GetStatus/ParamGetString/TmpMount2).
+
+**So the #232 wall is: DOLL reaches a stable engine tick loop with async loading complete, but its
+game/world flow never activates a scene that submits geometry.** The per-frame state machine at
+eboot+0x5044740 (reads .data bool gates at 0x9803460/0x9803470, doubles at 0x9603030..48) is the
+game's own boot/flow tick; something it polls has not flipped to "enter gameplay/level visible".
+Threads named **DollLevelPreloa**(der), SaveLoadUpdate, DLCDataUpdate, ShareUpdate all sit in the
+same free-list wait (eboot+0x2316b41/0x2316d50) — game-side loader/update workers idle. Several NIDs
+the boot flow calls are still bare unimpl->0 stubs, now name-resolved (tools/dbg/nidguess.py):
+**scePlayGoInitialize (ts6GlZOKRrE), scePlayGoOpen (M1Gma1ocrGE), sceSaveDataInitialize3
+(TywrFKCoLGY), sceNpTrophy2CreateHandle/RegisterContext, sceShareInitialize** — PlayGo/SaveData are
+the most likely to gate a "content ready -> start game" transition (a game waiting on PlayGo locus =
+"chunk installed" or a SaveData mount result before it loads the first level). **Next: implement
+scePlayGo (report everything installed/locus-local) and sceSaveData (mount succeeds, empty) with real
+out-struct contracts, and trace the eboot+0x5044740 state machine's .data gate to the subsystem it
+polls.**

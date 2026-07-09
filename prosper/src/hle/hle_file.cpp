@@ -55,10 +55,37 @@ namespace {
         }
         return root;
     }
+    // PROSPER_DENY_SUBSTR: comma-separated substrings; any guest path containing one is
+    // redirected to a guaranteed-missing host path, so open/stat fail with ENOENT.
+    // Diagnostic knob (off by default) — used to A/B whether the title's boot flow gates on a
+    // file class we can't service yet (e.g. .usm movies through the stubbed CRI/AJM decoders).
+    bool deny_path(const std::string& guest) {
+        static std::vector<std::string> subs = [] {
+            std::vector<std::string> v;
+            if (const char* e = getenv("PROSPER_DENY_SUBSTR")) {
+                std::string s = e; size_t pos = 0;
+                while (pos <= s.size()) {
+                    size_t c = s.find(',', pos);
+                    if (c == std::string::npos) c = s.size();
+                    if (c > pos) v.push_back(s.substr(pos, c - pos));
+                    pos = c + 1;
+                }
+            }
+            return v;
+        }();
+        if (subs.empty()) return false;
+        for (const auto& sub : subs)
+            if (guest.find(sub) != std::string::npos) return true;
+        return false;
+    }
     std::string translate(const char* guest) {
         if (!guest) return {};
         std::string p = guest;
         if (g_app0.empty()) { if (const char* e = getenv("PROSPER_APP0")) g_app0 = e; }
+        if (deny_path(p)) {
+            if (filelog()) fprintf(stderr, "[file] DENIED (PROSPER_DENY_SUBSTR) '%s'\n", guest);
+            return "/prosper-denied" + p;
+        }
         // Map /app0[/...] -> <root>[/...], /temp0[/...] -> scratch dir; other paths as-is.
         std::string h = (p.rfind("/app0", 0) == 0)  ? g_app0 + p.substr(5)
                       : (p.rfind("/temp0", 0) == 0) ? temp0_root() + p.substr(6)

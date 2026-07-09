@@ -1,1 +1,6 @@
 build-linux/shader0.bin
+
+# render frame dumps — NEVER commit game imagery
+*.bmp
+frame_*.png
+frame_*.bmp

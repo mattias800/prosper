@@ -87,6 +87,25 @@ HLE(s_syss_getstatus) {
     return 0;
 }
 
+// sceSystemServiceGetDisplaySafeAreaInfo(SceSystemServiceDisplaySafeAreaInfo* info) — single-arg
+// call, out-struct is ARG 0: { float ratio; uint8_t reserved[128]; } (shadPS4 systemservice.h).
+// The default unimplemented stub returned 0 (SUCCESS) but left `ratio` uninitialized (typically 0.0
+// from a fresh guest heap block). A safe-area ratio of 0 makes UE4's PS5 viewport code compute a
+// DEGENERATE (zero-area) title-safe rect: the game scales its render/UI viewport by the ratio, and a
+// zero ratio collapses the visible region — nothing to rasterize, so the RHI submits setup/compute
+// but never geometry. Real hardware always reports ratio=1.0 for a display with overscan disabled
+// (the modern default); shadPS4 hard-codes 1.0f. Fill ratio=1.0 and zero the reserved tail.
+// CONFIDENCE: MED — struct + 1.0f contract confirmed against shadPS4; that a 0.0 ratio is what
+// gates DOLL's scene draws is a hypothesis under test, but returning success with an unfilled
+// out-struct is a bug regardless (same class as GetStatus / ParamGetString above).
+HLE(s_syss_safearea) {
+    auto* info = (uint8_t*)PW(a0);
+    if (!info) return 0x80A10003ull;   // SYSTEM_SERVICE_ERROR_PARAMETER
+    memset(info, 0, 0x84);             // sizeof {float + uint8_t[128]} = 132
+    *(float*)info = 1.0f;              // ratio = full display, no overscan inset
+    return 0;
+}
+
 // sceAppContentTemporaryDataMount2(option, SceAppContentMountPoint* mp) — mount the app's temp-data
 // area and write its guest path into mp. SceAppContentMountPoint = char data[16] (shadPS4
 // app_content.h; PS4/PS5 identical). shadPS4 writes exactly "/temp0\0" and returns 0. Our previous
@@ -208,6 +227,8 @@ void register_service_hle() {
     R("sceMsgDialogGetResult", s_dialog_result);
     R("sceSystemServiceHideSplashScreen", s_ok);
     R("sceSystemServiceGetStatus", s_syss_getstatus);
+    // sceSystemServiceGetDisplaySafeAreaInfo (1n37q1Bvc5Y) — fill ratio=1.0 (see s_syss_safearea).
+    Hle::register_fn("1n37q1Bvc5Y", (HleFn)s_syss_safearea, "sceSystemServiceGetDisplaySafeAreaInfo");
     #undef R
 }
 
