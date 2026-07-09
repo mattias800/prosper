@@ -190,6 +190,11 @@ namespace {
     // gc_desc@0x08, const char* name@0x10, const char* namespaze@0x18 }. So klass=[obj]; name=[[obj]+0x10].
     // Used to identify the managed type whose field is null at the deser/activation getter crash.
     bool g_hwbp_klass = false;
+    // Env flags used INSIDE the fault handler — latched at install time, never read via getenv() in the
+    // handler (getenv walks environ + isn't async-signal-safe; #159). Mirror g_hwbp_bufdump/klass above.
+    bool g_hwbp_fields = false;         // PROSPER_HWBP_FIELDS: dump rbx object fields + object-field class names
+    bool g_hwbp_obj = false;            // PROSPER_HWBP_OBJ: treat rdi as an il2cpp object at a method-entry bp
+    const char* g_hwbp_global = nullptr;// PROSPER_HWBP_GLOBAL=0xADDR: resolve the class name at a fixed guest global
     void hwbp_dump_ring(const char* why);   // fwd decl (defined after probe_readable)
     // Optional chained DATA write-watchpoint: on the first exec-bp hit, arm a HW write watch on
     // [rax + g_hwwatch_delta] (default rax-0x80, the thread-local device slot the ctor reads). Catches
@@ -226,8 +231,8 @@ namespace {
                     char h = *p; int nib; if (h>='0'&&h<='9') nib=h-'0'; else if (h>='a'&&h<='f') nib=h-'a'+10;
                     else { ok=false; return; } v=(v<<4)|nib; d++; } out=v; if(!d) ok=false; };
                 hx(s); if (*p=='-') { p++; hx(e); }
-                if (ok && addr >= s && addr < e) { write(2, pend, pn); write(2, line, (size_t)li);
-                    write(2, "\n", 1); close(fd); return; }
+                if (ok && addr >= s && addr < e) { syscall(SYS_write, 2,pend, pn); syscall(SYS_write, 2,line, (size_t)li);
+                    syscall(SYS_write, 2,"\n", 1); close(fd); return; }
                 li = 0;
             }
         }
@@ -241,7 +246,7 @@ namespace {
         int total = g_hwbp_ring_pos < HWBP_RING ? g_hwbp_ring_pos : HWBP_RING;
         int start = g_hwbp_ring_pos < HWBP_RING ? 0 : (g_hwbp_ring_pos % HWBP_RING);
         char hdr[96]; int hn = snprintf(hdr, sizeof hdr, "[hwbp-ring] dump (%s): last %d hits:\n", why, total);
-        write(2, hdr, hn);
+        syscall(SYS_write, 2,hdr, hn);
         unsigned long long prev_cur = 0;
         for (int i = 0; i < total; ++i) {
             const HwbpRingEnt& e = g_hwbp_ring[(start + i) % HWBP_RING];
@@ -252,7 +257,7 @@ namespace {
                 i, e.rip_off, e.cur, e.rax, e.r8, e.f8, e.f10, e.r14,
                 (e.cur == e.r8 || e.cur == e.f8) ? "<<< MATCH (skip fetch)" : "");
             (void)dcur;
-            write(2, lb, ln);
+            syscall(SYS_write, 2,lb, ln);
             prev_cur = e.cur;
         }
     }
@@ -264,7 +269,7 @@ namespace {
         char hdr[128]; int hn = snprintf(hdr, sizeof hdr,
             "[stepwin] dump (%s) after %ld steps: %d cursor advances, base=0x%llx:\n",
             why, g_stepwin_steps, total, (unsigned long long)g_stepwin_base);
-        write(2, hdr, hn);
+        syscall(SYS_write, 2,hdr, hn);
         unsigned long long prev = 0;
         for (int i = 0; i < total; ++i) {
             const StepEnt& e = g_stepwin_ring[(start + i) % STEPWIN_RING];
@@ -272,7 +277,7 @@ namespace {
             char lb[160];
             int ln = snprintf(lb, sizeof lb, "  [%3d] rip=eboot+0x%llx cur=0x%llx (off 0x%llx) delta=%+lld\n",
                 i, e.rip_off, e.cur, (unsigned long long)(e.cur - g_stepwin_base), d);
-            write(2, lb, ln);
+            syscall(SYS_write, 2,lb, ln);
             prev = e.cur;
         }
     }
@@ -465,7 +470,7 @@ namespace {
         // timed run reveals whether the SIGILL round-trip is the throughput wall. Diagnostic only.
         if (g_sse4a_stat && (g_sse4a_emulated & 0xFFFFF) == 0) {
             char b[64]; int n = snprintf(b, sizeof b, "[sse4a] %lu emulated\n", g_sse4a_emulated);
-            if (n > 0) { ssize_t w = write(2, b, (size_t)n); (void)w; }
+            if (n > 0) { ssize_t w = syscall(SYS_write, 2,b, (size_t)n); (void)w; }
         }
         return true;
     }
@@ -589,7 +594,7 @@ namespace {
                     if (k >= 2) { char b[128]; int n = snprintf(b, sizeof b, "[hwbp-str] %s=0x%llx -> \"%s\"\n", rn, (unsigned long long)p, s); syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */ }
                 };
                 char hdr[64]; int hn = snprintf(hdr, sizeof hdr, "[hwbp-str] hit @eboot+0x%llx:\n",
-                    (unsigned long long)((uint64_t)gr[REG_RIP] - 0x400000000ull)); write(2, hdr, hn);
+                    (unsigned long long)((uint64_t)gr[REG_RIP] - 0x400000000ull)); syscall(SYS_write, 2,hdr, hn);
                 pstr("rdi", (uint64_t)gr[REG_RDI]); pstr("rsi", (uint64_t)gr[REG_RSI]);
                 pstr("rdx", (uint64_t)gr[REG_RDX]); pstr("rcx", (uint64_t)gr[REG_RCX]);
                 pstr("r8",  (uint64_t)gr[REG_R8]);  pstr("r9",  (uint64_t)gr[REG_R9]);
@@ -613,7 +618,7 @@ namespace {
                 // PROSPER_HWBP_FIELDS=1: dump rbx's object fields [0x10..0x60] + the class name of any
                 // field that is itself an object — to tell "whole object uninitialized (all null)" from
                 // "one specific field null".
-                if (getenv("PROSPER_HWBP_FIELDS")) {
+                if (g_hwbp_fields) {
                     uint64_t o = (uint64_t)gr[REG_RBX];
                     if (probe_readable(o + 0x60)) {
                         char b[400]; int n = snprintf(b, sizeof b, "[hwbp-fields] rbx=0x%llx:", (unsigned long long)o);
@@ -636,7 +641,7 @@ namespace {
                                 if (c == 0) break; if (c < 0x20 || c > 0x7e) { k = 0; break; } s[k] = c; }
                             s[k] = 0;
                             if (k >= 2) { char fb[128]; int fn = snprintf(fb, sizeof fb,
-                                "[hwbp-field] +0x%llx -> %s\n", (unsigned long long)off, s); write(2, fb, fn); }
+                                "[hwbp-field] +0x%llx -> %s\n", (unsigned long long)off, s); syscall(SYS_write, 2,fb, fn); }
                         }
                     }
                 }
@@ -658,14 +663,14 @@ namespace {
                 pcname("rdi(class)", (uint64_t)gr[REG_RDI]);
                 // PROSPER_HWBP_GLOBAL=0xADDR: also resolve the class name stored at a fixed guest global
                 // (the getter loads its declaring class from [0x442302515]); guest mem is 1:1-mapped.
-                if (const char* g = getenv("PROSPER_HWBP_GLOBAL")) {
+                if (const char* g = g_hwbp_global) {
                     uint64_t ga = strtoull(g, nullptr, 0);
                     if (probe_readable(ga + 7)) pcname("global", *(const uint64_t*)ga);
                 }
             }
             // PROSPER_HWBP_OBJ=1: treat rdi as an il2cpp object (at a method-entry bp); print its class
             // name ([[rdi]+0x10]) and fields [rdi+0x00..+0x60], plus [rdi+0x40] chased as an object too.
-            if (getenv("PROSPER_HWBP_OBJ") && cond_ok) {
+            if (g_hwbp_obj && cond_ok) {
                 auto rd = [](uint64_t a) -> uint64_t { return probe_readable(a) ? *(const uint64_t*)a : 0; };
                 auto nm = [&](uint64_t klass, char* o, int cap) { o[0]=0; if(!probe_readable(klass+0x18)) return;
                     uint64_t p = rd(klass+0x10); int k=0; if(!probe_readable(p)){return;}
@@ -680,7 +685,7 @@ namespace {
                     (unsigned long long)rd(rdi+8),(unsigned long long)rd(rdi+0x10),(unsigned long long)rd(rdi+0x18),
                     (unsigned long long)rd(rdi+0x20),(unsigned long long)rd(rdi+0x28),(unsigned long long)rd(rdi+0x30),
                     (unsigned long long)rd(rdi+0x38),(unsigned long long)rd(rdi+0x48));
-                write(2, b, n);
+                syscall(SYS_write, 2,b, n);
             }
             if (cond_ok && g_hwbp_r15_on) {
                 // The matching read: dump the window around rax (the source pointer) + classify its mapping,
@@ -693,7 +698,7 @@ namespace {
                     "[hwbp] MATCH r15=0x%llx rax(src)=0x%llx rbx=0x%llx | [rax-16..+24]= %llx %llx %llx %llx %llx %llx\n",
                     (unsigned long long)r15, (unsigned long long)rax, (unsigned long long)rbx,
                     rd(rax-16), rd(rax-8), rd(rax), rd(rax+8), rd(rax+16), rd(rax+24));
-                write(2, b2, n2);
+                syscall(SYS_write, 2,b2, n2);
                 classify_addr(rax);
             }
             if (cond_ok && g_hwbp_count < g_hwbp_max) {
@@ -732,9 +737,9 @@ namespace {
                         uint64_t lo = node - 0x6000, hi = node + 0x6000;
                         if (probe_readable(lo) && probe_readable(hi - 1)) {
                             int fd = open("/tmp/prosper_ttnodes.bin", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                            if (fd >= 0) { (void)!write(fd, (const void*)lo, (size_t)(hi - lo)); close(fd);
+                            if (fd >= 0) { (void)!syscall(SYS_write, fd, (const void*)lo, (size_t)(hi - lo)); close(fd);
                                 char m2[96]; int mn = snprintf(m2, sizeof m2, "[ttnodes] dumped [0x%llx..0x%llx] base=0x%llx\n",
-                                    (unsigned long long)lo, (unsigned long long)hi, (unsigned long long)node); write(2, m2, mn); }
+                                    (unsigned long long)lo, (unsigned long long)hi, (unsigned long long)node); syscall(SYS_write, 2,m2, mn); }
                         }
                     }
                     char db[300];
@@ -743,7 +748,7 @@ namespace {
                         (int)g_hwbp_count, rd(crbp - 0xf0), rd(crbp - 0xe8), rd(crbp - 0xf8),
                         node, rd(node), rd(node + 8), rd(node + 0x10), rd(node + 0x18), rd(node + 0x20),
                         rd((uint64_t)gr[REG_RBX] + 0x38));
-                    write(2, db, dn);
+                    syscall(SYS_write, 2,db, dn);
                 }
                 // PROSPER_HWBP_BUFDUMP: write the reader window [base..end] to a per-hit file.
                 if (g_hwbp_bufdump) {
@@ -751,9 +756,9 @@ namespace {
                     if (end > base && end - base < 0x400000 && probe_readable(base) && probe_readable(end - 1)) {
                         char fn[64]; snprintf(fn, sizeof fn, "/tmp/prosper_buf_%d.bin", (int)g_hwbp_count);
                         int fd = open(fn, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                        if (fd >= 0) { (void)!write(fd, (const void*)base, (size_t)(end - base)); close(fd);
+                        if (fd >= 0) { (void)!syscall(SYS_write, fd, (const void*)base, (size_t)(end - base)); close(fd);
                             char m2[96]; int mn = snprintf(m2, sizeof m2, "[hwbp] bufdump #%d -> %s (%llu bytes)\n",
-                                (int)g_hwbp_count, fn, (unsigned long long)(end - base)); write(2, m2, mn); }
+                                (int)g_hwbp_count, fn, (unsigned long long)(end - base)); syscall(SYS_write, 2,m2, mn); }
                     }
                 }
             }
@@ -785,7 +790,7 @@ namespace {
                     "[stepwin] ENTER at driver hit #%d: base=0x%llx cur=0x%llx (off 0x%llx)\n",
                     (int)g_hwbp_count, (unsigned long long)g_stepwin_base, (unsigned long long)g_stepwin_prevcur,
                     (unsigned long long)(g_stepwin_prevcur - g_stepwin_base));
-                write(2, sb, sn);
+                syscall(SYS_write, 2,sb, sn);
                 uc->uc_mcontext.gregs[REG_EFL] |= 0x100ll;   // start single-stepping
                 guest_fs_restore_scoped(saved_fs);
                 return;
@@ -1053,7 +1058,7 @@ namespace {
                 rdb(g_fault_rip), rdb(g_fault_rip+1), rdb(g_fault_rip+2), rdb(g_fault_rip+3),
                 rdb(g_fault_rip+4), rdb(g_fault_rip+5), rdb(g_fault_rip+6), rdb(g_fault_rip+7),
                 (unsigned long long)(probe_readable(g_rsp) ? *(const uint64_t*)g_rsp : 0));
-            write(2, ib, m);
+            syscall(SYS_write, 2,ib, m);
             // If PROSPER_HWBP_NODE ring-capture is active, the crash node's typetree metadata is the tail.
             if (g_hwbp_node_on) hwbp_dump_ring("worker-fault");
         }
@@ -1285,6 +1290,9 @@ void install_trap_handler() {
         if (getenv("PROSPER_HWBP_DIVCAP")) g_hwbp_divcap = true;
         if (getenv("PROSPER_HWBP_STRDUMP")) g_hwbp_strdump = true;
         if (getenv("PROSPER_HWBP_KLASS")) g_hwbp_klass = true;
+        if (getenv("PROSPER_HWBP_FIELDS")) g_hwbp_fields = true;   // latch here (#159): handler must not getenv()
+        if (getenv("PROSPER_HWBP_OBJ")) g_hwbp_obj = true;
+        g_hwbp_global = getenv("PROSPER_HWBP_GLOBAL");             // may be null; handler null-checks
         if (getenv("PROSPER_HWBP_ALLTHREADS")) g_hwbp_allthreads = true;
         ensure_probe_pipe();
         g_hwbp_on = true;   // perf_event_open done in arm_hwbp() after the image is mapped
@@ -1354,11 +1362,11 @@ void arm_hwbp() {
 void arm_hwbp_this_thread() {
     if (getenv("PROSPER_HWBP_ARMLOG")) { char b[128]; int n = snprintf(b, sizeof b,
         "[hwbp] arm_this_thread tid=%ld on=%d all=%d addr=0x%llx tfd=%d\n", (long)syscall(SYS_gettid),
-        g_hwbp_on, g_hwbp_allthreads, (unsigned long long)g_hwbp_addr, t_hwbp_fd); write(2, b, n); }
+        g_hwbp_on, g_hwbp_allthreads, (unsigned long long)g_hwbp_addr, t_hwbp_fd); syscall(SYS_write, 2,b, n); }
     if (!g_hwbp_on || !g_hwbp_allthreads || !g_hwbp_addr || t_hwbp_fd >= 0) return;
     long fd = perf_bp_open(g_hwbp_addr, HW_BREAKPOINT_X);
     if (fd < 0) { char b[96]; int n = snprintf(b, sizeof b, "[hwbp] worker-arm FAILED tid=%ld errno=%d\n",
-        (long)syscall(SYS_gettid), errno); write(2, b, n); return; }
+        (long)syscall(SYS_gettid), errno); syscall(SYS_write, 2,b, n); return; }
     t_hwbp_fd = (int)fd;
     fcntl(t_hwbp_fd, F_SETFL, O_ASYNC);
     fcntl(t_hwbp_fd, F_SETSIG, SIGTRAP);
@@ -1367,7 +1375,7 @@ void arm_hwbp_this_thread() {
     ioctl(t_hwbp_fd, PERF_EVENT_IOC_ENABLE, 0);
     char b[128]; int n = snprintf(b, sizeof b, "[hwbp] armed on worker tid=%ld (fd=%d) for eboot+0x%llx\n",
         (long)syscall(SYS_gettid), t_hwbp_fd, (unsigned long long)(g_hwbp_addr - 0x400000000ull));
-    write(2, b, n);
+    syscall(SYS_write, 2,b, n);
 }
 
 uint64_t stub_addr(uint64_t idx) { return g_stub_base + idx * g_stub_size; }
