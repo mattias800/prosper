@@ -118,8 +118,29 @@ HLE(s_dialog_status)     { return (uint64_t)(unsigned)g_msgdialog_status.load();
 // exactly the f_fstat oversized-write class this file warns about.
 HLE(s_dialog_result)   { if (a0) memset(PW(a0), 0, 0x2C); return 0; }
 
+// --- libSceNpTrophy2 (PS5 trophy system) — the DOLL 34.6 GB OOM (issue #213 diagnosis). ---------
+// The guest's trophy bring-up (eboot+0xdbcb43..0xdbcc2e, gdb-captured live) calls
+// sceNpTrophy2GetGameInfo(ctx, handle, out*, 0) — NID 4IzqhhUQ3nk named via nid_hash brute force —
+// then grows TWO arrays from the out-struct's counts (u32 at out+0x4: 32-byte entries; a second
+// 0x520-byte-entry array) and calls a sibling (y3zHpdZO6ME, unnamed) to fill them. The generic
+// unimplemented stub returned 0 = SUCCESS with the out-struct UNWRITTEN, so the engine consumed
+// heap garbage as a trophy count: gdb-captured count 0x408bd000 -> a 34,644,492,288-byte TArray
+// grow ("Ran out of memory allocating 34644492288 bytes") — and when the garbage happened to be
+// allocatable-huge instead, the minutes-long zero-fill starved the RenderThread until UE's
+// "GameThread timed out waiting for RenderThread after 120.00 secs" watchdog killed the boot.
+// Without a trophy backend the honest answer is FAILURE: a negative return takes the caller's
+// clean invalid path (eboot+0xdbd239/0xdbd242: mark the trophy config unavailable, continue) —
+// exactly the state a real console reports with no signed-in user. Only the SIGN of the return is
+// consumed by this caller; the exact NpTrophy2 error space is unverified (no Kyty/shadPS4/stub
+// reference), so the value is chosen inside the documented SCE_NP_TROPHY (0x8055xxxx) range.
+// CONFIDENCE: HIGH that failure beats success+garbage; LOW on the specific error constant.
+HLE(s_nptrophy2_unavailable) { return 0x80551500ull; }
+
 void register_service_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
+    // NpTrophy2: the config/info queries whose success-with-garbage-out crashed DOLL (see above).
+    Hle::register_fn("4IzqhhUQ3nk", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetGameInfo");
+    Hle::register_fn("y3zHpdZO6ME", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetGameInfo-fill?");
     // user service
     R("sceUserServiceGetInitialUser", s_user_initial);
     R("sceUserServiceGetEvent", s_user_getevent);   // deliver the initial-user LOGIN event once

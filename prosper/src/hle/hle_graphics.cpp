@@ -360,20 +360,24 @@ HLE(g_vo_register_buffers2) {  // a0=handle a1=set_index a2=buffer_index_start a
 // advertise one mode (1080p60), so accept the configuration.
 HLE(g_vo_configure_output) { vo_argtrace("ConfigureOutput", a0,a1,a2,a3,a4,a5); return 0; }
 
-// sceVideoOutGetOutputStatus (utPrVdxio-8): (handle, status*). The out-struct layout has NO
-// reference anywhere (Kyty predates it, shadPS4 only stubs the name, neither SDK repo declares it),
-// so inventing field offsets would be worse than not writing — but returning success with an
-// UNWRITTEN out-struct silently hands the caller stale stack as a "valid" status (the harmful-stub
-// pattern). Until the layout is captured from a real call, the gap is at least LOUD: warn once per
-// boot, unconditionally. CONFIDENCE: LOW — success-without-write retained only because the current
-// title demonstrably tolerates it and a wrong guessed layout could smash its stack canary.
+// sceVideoOutGetOutputStatus (utPrVdxio-8): (handle, status*). The full out-struct layout has NO
+// reference (Kyty predates it, shadPS4 only stubs the name), but the ONE consumer in the wild is
+// now RE'd (issue #82; DOLL/PPSA17942 swapchain-init, eboot+0x2226fea..0x2227042, gdb-captured):
+// it reads a single u32 at status+0x04 and compares it to 2 — the ==2 branch (together with two
+// runtime capability checks) switches the display pipe to an HDR pixel format
+// (0x8100070400000000) — i.e. status+0x04 is the output's dynamic-range/colorimetry mode with
+// 2 = HDR. Previously we returned success with the struct UNWRITTEN, so the caller consumed
+// uninitialized stack (usually != 2 -> SDR by luck — the classic success+garbage-out hazard).
+// Write a defined 8-byte {u32 state=0, u32 mode=0} prefix: mode 0 selects the SDR path
+// deterministically, matching prosper's advertised SDR-only display. 8 bytes cannot overrun any
+// plausible real struct (the DOLL caller reserves 0x50 stack bytes for it). CONFIDENCE: MED on
+// field semantics (single consumer, unambiguous read), HIGH that a defined write beats garbage.
 HLE(g_vo_get_output_status) {
     vo_argtrace("GetOutputStatus", a0,a1,a2,a3,a4,a5);
-    static std::atomic<bool> warned{false};
-    if (!warned.exchange(true))
-        fprintf(stderr, "[vo] WARNING: sceVideoOutGetOutputStatus returns success WITHOUT filling the "
-                        "status struct (layout unknown — no Kyty/shadPS4/SDK reference); caller reads "
-                        "uninitialized memory. Capture the struct size to fix (issue #82).\n");
+    if (a1 > 0xffffull) {
+        *(uint32_t*)(uintptr_t)a1       = 0;   // +0x00: output state (0 = the boring/default state)
+        *(uint32_t*)(uintptr_t)(a1 + 4) = 0;   // +0x04: dynamic-range mode (2 = HDR; 0 = SDR)
+    }
     return 0;
 }
 
