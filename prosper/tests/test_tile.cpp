@@ -145,11 +145,22 @@ int main() {
         CHECK(t32[8 * 4] == lin32[((size_t)2 * 64 + 0) * 4], "32-bpp golden: texel (0,2) at element 8 (y1 at bit 3)");
         CHECK(t32[4096]  == lin32[((size_t)0 * 64 + 32) * 4], "32-bpp golden: texel (32,0) starts tile 1 (byte 4096)");
 
+        // 8-bpp uses a DIFFERENT within-tile order than 32-bpp (the 64x64 tile's SW_4KB_S order is
+        // pixel-verified against the game's 2048x1024 R8 caption-font atlas): the low EIGHT element bits
+        // are a 16x16 sub-block [x0,x1,x2,x3, y0,y1,y2,y3] (four low X bits, then four low Y bits), then
+        // (y,x) Morton pairs [y4,x4, y5,x5]. So (1,0)->1 (x0), (4,0)->4 (x2), (8,0)->8 (x3),
+        // (0,1)->16 (y0 at bit 4), (0,2)->32 (y1), (16,0)->512 (x4 at bit 9). The OLD code shared the
+        // 32-bpp [x0,x1,y0,y1] low nibble here, which scrambled every 64x64 tile into a weave.
         std::vector<uint8_t> lin8((size_t)128 * 64, 0);
         for (size_t i = 0; i < lin8.size(); i++) lin8[i] = (uint8_t)(i * 31 + 7);
         std::vector<uint8_t> t8(tiled_surface_bytes(128, 64, M, 0, 1), 0);
         tile_surface(t8.data(), lin8.data(), 128, 64, M, 0, 1);
-        CHECK(t8[4] == lin8[(size_t)1 * 128 + 0], "8-bpp golden: texel (0,1) at element 4 (same [x0,x1,y0,y1] order)");
+        CHECK(t8[1]    == lin8[(size_t)0 * 128 + 1],  "8-bpp golden: texel (1,0) at element 1 (x0)");
+        CHECK(t8[4]    == lin8[(size_t)0 * 128 + 4],  "8-bpp golden: texel (4,0) at element 4 (x2)");
+        CHECK(t8[8]    == lin8[(size_t)0 * 128 + 8],  "8-bpp golden: texel (8,0) at element 8 (x3)");
+        CHECK(t8[16]   == lin8[(size_t)1 * 128 + 0],  "8-bpp golden: texel (0,1) at element 16 (y0 at bit 4)");
+        CHECK(t8[32]   == lin8[(size_t)2 * 128 + 0],  "8-bpp golden: texel (0,2) at element 32 (y1 at bit 5)");
+        CHECK(t8[512]  == lin8[(size_t)0 * 128 + 16], "8-bpp golden: texel (16,0) at element 512 (x4 at bit 9)");
         CHECK(t8[4096] == lin8[(size_t)0 * 128 + 64], "8-bpp golden: texel (64,0) starts tile 1 (byte 4096, 64-wide tile)");
     }
 

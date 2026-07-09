@@ -47,13 +47,43 @@ The distinguishing feature vs a naive Morton is the **`[x0, x1, y0, y1]` low nib
 an interleaved 2×2 `[x0,y0,x1,y1]` or `[y0,x0,y1,x1]`. That single detail is what removes the edge
 serration; getting the higher pairs wrong instead *scrambles* the image (easy to reject visually).
 
-### Generalisation over bytes-per-element
+### The within-tile order is bytes-per-element-DEPENDENT
 
 A 4 KB tile is a fixed 4096 bytes, so its texel dimensions depend on bpe (1 B → 64×64, 2 B → 64×32,
-4 B → 32×32, 8 B → 32×16, 16 B → 16×16; see `sw4kb_dims`). The same low-nibble `[x0,x1,y0,y1]` micro-block
-+ Morton-pairs pattern is applied at every bpe. It is **round-trip-verified** at all bpe (tile∘detile =
-identity) and **pixel-verified** at 32 bpp; other bpe should be spot-checked visually as those surfaces
-surface (BC block textures, R8 atlases).
+4 B → 32×32, 8 B → 32×16, 16 B → 16×16; see `sw4kb_dims`). Crucially, the *within-tile element order is
+not the same at every bpe* — AMD's standard-swizzle `SW_PATTERN` genuinely differs per element size.
+Two orders are now **pixel-verified against The Messenger's live surfaces**:
+
+| bpe | tile | low block | full order (element bit → coord) |
+|-----|------|-----------|----------------------------------|
+| 4 B (RGBA8) | 32×32 | `[x0,x1, y0,y1]` (L=2) | `x0 x1 y0 y1 y2 x2 y3 x3 y4 x4` |
+| 1 B (R8)    | 64×64 | `[x0,x1,x2,x3, y0,y1,y2,y3]` (L=4) | `x0 x1 x2 x3 y0 y1 y2 y3 y4 x4 y5 x5` |
+
+Both share the shape **"a low block of L X-bits then L Y-bits, then interleaved `(y,x)` Morton pairs"**,
+but with **L = 2 at 32 bpp and L = 4 at 8 bpp** (`sw4kb_morton` selects L by tile geometry). The earlier
+version of this code applied the 32-bpp L=2 pattern at *every* bpe; that is correct at 32 bpp but at 8 bpp
+it scrambles every 64×64 tile into an **unreadable weave** — which is exactly why the intro **caption text
+was invisible**: the game's only R8 surface is the **2048×1024 caption/glyph font atlas** (a TextMeshPro-
+style atlas of Latin + CJK glyphs), sampled by a ~260-quad batched text mesh. With L=2 the atlas decoded to
+noise, so every glyph sampled garbage coverage and the text rendered as nothing. With **L=4 the atlas
+resolves into a clean grid of readable glyphs** and the caption renders. (#102 was therefore *two* bugs: the
+32-bpp low-nibble error #118, and this separate 8-bpp order.)
+
+It is **round-trip-verified** at all bpe (tile∘detile = identity) and **pixel-verified** at 32 bpp and
+8 bpp. The 16-bpp and BC-block geometries (64×32, 32×16, 16×16) fall back to the L=2 shape; they round-trip
+but have no game-observed instance to pixel-verify yet — spot-check visually as those surfaces surface.
+
+### How the 8-bpp order was found (the TV-minimisation trick)
+
+Guessing 8-bpp bit orders by hand failed (a dozen hand-picked orders + several tile geometries all stayed a
+weave). What cracked it: a **total-variation-minimising search** over within-tile bit permutations. A
+correct de-swizzle of *structured* data (glyphs) is spatially smooth, so the permutation that minimises
+Σ|Δpixel| over a content-rich crop is the right one. Hill-climbing (swap two bit-assignments, keep if TV
+drops) from a few seeds converged straight onto `[x0 x1 x2 x3 y0 y1 y2 y3 y4 x4 y5 x5]`, which rendered the
+atlas as readable Latin + CJK glyphs. The raw tiled R8 bytes were captured with `PROSPER_DUMP_RAWTILE`
+(extended to the narrow single-channel path in `live_renderer.cpp`) and the search run offline in NumPy.
+This trick works for any scrambled-but-structured surface where you lack the reference order — let
+smoothness pick the permutation, then confirm on a region with known content (here, the Latin glyph block).
 
 ## How it was derived (method, for reproducibility)
 
