@@ -3,9 +3,11 @@
 The OS-integration frontend: an SDL3 window + Vulkan swapchain that presents prosper's rendered
 frames. See `prosper/docs/FRONTEND_APP.md` for the design and issue #164 for the plan.
 
-**P0a (current):** the present pipeline only — it displays whatever frame `present_write_frame`
-hands the core's present layer. `--test-pattern` feeds a synthetic animated frame so you can verify
-the window + swapchain path without a game dump. P0b wires the actual guest boot in front of it.
+**Status:** the present pipeline + the shared guest boot are done. `--test-pattern` shows an animated
+frame (verifies window + swapchain). `--dump <app0>` boots the actual game via the shared
+`boot_program()` path. **Caveat:** the game won't appear on screen yet — nothing reaches the window
+until the composite renderer is registered (the render-frontier-owned `set_submit_renderer` lambda),
+which is the coordinated next step. See `prosper/docs/FRONTEND_APP.md`.
 
 ## Build
 

@@ -155,30 +155,38 @@ CI source of truth. Nothing the frontend adds gates a core test. A future *front
 wanted, should use an offscreen/hidden surface and stay out of the default `ctest` set (needs a real
 Vulkan device + display, which CI may lack).
 
-## P0b decision (open — needs a call before wiring the guest boot)
+## P0b status — boot via the shared `boot_program()` helper (option **(b)**, landed)
 
-P0a is deliberately decoupled from the guest boot. Wiring the boot (P0b) so the window shows the
-*game* faces a fork, because the boot glue (~150 lines: module bases, PSN/SaveData/libc.prx, TLS,
-unwind, procparam, plugin registration, `run_guest_inits`/`run_entry` + registering the live
-renderer) lives in `boot_trace`'s `main()` and is **actively evolving** (multi-title boot work):
-- **(a) Duplicate** the boot glue into the frontend — fast, no collision, but fragile and diverges
-  from `boot_trace` as the boot changes.
-- **(b) Extract a shared `boot_program()` helper** both `boot_trace` and the frontend call — the
-  clean answer, but it refactors the hot `boot_trace` and needs coordination with the workstreams
-  editing it.
+The chosen path was **(b): extract a shared `boot_program()` helper** both `boot_trace` and the
+frontend call, rather than duplicate the boot glue.
 
-Recommendation: **(b)**, sequenced as its own small refactor PR (extract the boot into a reusable
-tool-side helper without changing behavior), then the frontend calls it + registers the renderer +
-runs `run_entry` on a thread; on window-close the present loop already calls `prosper_request_stop()`.
-Until then P0a is usable standalone (`--test-pattern`) and against any external feeder of
-`present_write_frame`.
+- `src/host/boot_program.hpp/.cpp` (in `prosper_core`, Linux-only body): links the fixed module set
+  (honoring `PROSPER_NO_PSN`, dropping absent modules), registers the built-in HLE, maps images, sets
+  up TLS/unwind/procparam, installs the import stubs + trap handler, registers the PSN/SaveData
+  module-start ranges, and runs the dependent-module init_arrays. An `after_hle_registered` hook lets
+  a caller install host frontends (audio sink / pad backend) at the exact point `boot_trace` always
+  did. On success the caller registers its renderer and calls `run_entry`.
+- `boot_trace` migrated to call it (behavior-preserving; verified it still boots + renders).
+- `prosper-app` calls it too (`--dump <app0>`): the guest boots and runs on its own thread while the
+  window owns present.
+
+**Remaining for "show the game" — the composite renderer (render-frontier-owned):** booting is not
+enough. Nothing reaches the window until a live renderer is registered via `set_submit_renderer` —
+the ~350-line DrawItem→Vulkan lambda in `boot_trace` that composites each submit and calls
+`present_write_frame`. Verified empirically: `prosper-app --dump …` boots the game and opens the
+window but presents **0 frames** without it. That lambda is the render frontier's actively-evolving
+code, so registering/extracting it is a **coordinated next step with that workstream**, not a
+duplicate. Until then the app is fully functional via `--test-pattern` (and any external feeder of
+`present_write_frame`).
 
 ## Phased plan
 
-- **P0a — window + present** ✅ **done** (this PR): lifecycle hook, SDL3 window, Vulkan swapchain,
+- **P0a — window + present** ✅ **done**: lifecycle hook, SDL3 window, Vulkan swapchain,
   present-from-readback, `SDL_QUIT`/Esc→stop. Verified with `--test-pattern` (30 frames, clean exit)
   on WSLg + llvmpipe.
-- **P0b — guest boot** (next): show the actual game (see the decision above).
+- **P0b — shared boot** ✅ **done**: `boot_program()` helper; `boot_trace` + `prosper-app` both call
+  it; `prosper-app --dump <app0>` boots the game (window up). The one remaining piece to show the
+  game — registering the composite renderer — is the render-frontier-coordinated next step (above).
 - **P1 — audio**: land the SDL3 `AudioSink` (from `feat/audio-sdl3`). Result: sound.
 - **P2 — controllers**: SDL3 `GameController` `PadBackend`. Result: play it.
 - **P3 — polish**: resize, fullscreen, pause/quit UX, present-mode/latency tuning, packaging.

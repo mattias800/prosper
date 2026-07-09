@@ -14,6 +14,9 @@
 // THIS is a separate presentation device, and frames cross as CPU pixels via present_readback.
 #include "gpu/videoout_present.hpp"   // present_readback / present_write_frame / present_width/height/count
 #include "host/lifecycle.hpp"          // prosper_request_stop / prosper_stop_requested
+#include "host/boot_program.hpp"       // boot_program (shared guest-boot path, also used by boot_trace)
+#include "host/exec_image.hpp"         // run_entry
+#include "loader/linker.hpp"           // Program
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
@@ -261,10 +264,28 @@ void feed_test_pattern(uint32_t w, uint32_t h, uint64_t frame) {
 
 int main(int argc, char** argv) {
     bool testPattern = false; int exitAfter = 0; uint32_t winW = 1280, winH = 720;
+    std::string dump;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--test-pattern") testPattern = true;
-        else if (a == "--frames" && i + 1 < argc) exitAfter = atoi(argv[++i]);   // present N frames then exit 0 (CI/smoke)
+        else if (a == "--frames" && i + 1 < argc) exitAfter = atoi(argv[++i]);   // present N frames then exit (CI/smoke)
+        else if (a == "--dump" && i + 1 < argc) dump = argv[++i];                // boot the game at this app0 dir
+        else if (a[0] != '-' && dump.empty()) dump = a;                          // positional dump path
+    }
+
+    // Boot the game (unless test-pattern): the shared boot_program path sets the guest up, then the
+    // guest runs on its own thread while this thread owns the window + present. Reaching the frame
+    // loop needs PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct in the environment (same as
+    // boot_trace). NOTE: composite rendering (registering the live renderer) is the render-frontier-
+    // owned next step; without it the present layer shows the guest's raw scanout buffer.
+    std::thread guestThread;
+    if (!testPattern && !dump.empty()) {
+        static Program prog; std::string err;
+        if (!boot_program(dump, prog, &err)) { fprintf(stderr, "[app] boot failed: %s\n", err.c_str()); return 1; }
+        guestThread = std::thread([]{ run_entry(prog.imgs[0]); });   // runs the guest frame loop
+        fprintf(stderr, "[app] guest booted; presenting its frames.\n");
+    } else if (!testPattern) {
+        fprintf(stderr, "[app] no dump given and not --test-pattern; waiting for external present frames.\n");
     }
 
     if (!SDL_Init(SDL_INIT_VIDEO)) { fprintf(stderr, "[app] SDL_Init: %s\n", SDL_GetError()); return 1; }
@@ -337,10 +358,12 @@ int main(int argc, char** argv) {
         }
     }
 
-    prosper_request_stop();   // tell any guest run-loop (P0b) to wind down
+    prosper_request_stop();   // signal the guest run-loop to wind down at its next boundary
     fprintf(stderr, "[app] shutting down after %llu presented frame(s)\n", (unsigned long long)shown);
     vkDeviceWaitIdle(vk.device);
-    // (P0a leaves teardown to process exit; the resources are process-lifetime. P0b joins the guest thread here.)
+    // The guest runs guest code with no cooperative yield point yet (a flip-boundary stop check is a
+    // refinement), so we detach and let process exit reclaim it rather than block on a join.
+    if (guestThread.joinable()) guestThread.detach();
     SDL_DestroyWindow(win); SDL_Quit();
     return (exitAfter && (int)shown < exitAfter) ? 1 : 0;
 }

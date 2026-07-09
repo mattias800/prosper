@@ -4,6 +4,7 @@
 // tool. Linux only. Usage: boot_trace <dump-root>
 #include "loader/linker.hpp"
 #include "host/exec_image.hpp"
+#include "host/boot_program.hpp"          // shared guest-boot path (also used by prosper-app)
 #include "hle/dispatch.hpp"
 #include <cstdio>
 #include <string>
@@ -79,89 +80,25 @@ static uint64_t bof(uint64_t a) {
 int main(int argc, char** argv) {
     std::string d = (argc >= 2) ? argv[1] : "../../PPSA24651-app0";
     Program p; std::string e;
-    // libc.prx loaded last => its init_array runs first (deepest dependency), before eboot's entry.
-    // Experimental (branch libc-prx-integration): route eboot's 145 libc imports to the REAL Sony
-    // libc instead of our HLE. Cross-module export beats the HLE stub slot (see linker.cpp pass 2).
-    std::vector<LinkInput> in = {
-        { d + "/eboot.bin", EBOOT },
-        { d + "/Media/Modules/Il2cppUserAssemblies.prx", IL2CPP },
-        { d + "/Media/Modules/PS5Util.prx", PS5UTIL },
-        // Native PSN Unity plugin. Loading it as a guest module (its imports resolve to our HLE)
-        // makes its exports — PSN_PrxInitialize / PSN_PrxUpdate / UnityPluginLoad — reachable via
-        // sceKernelDlsym, so the managed PSN bootstrap (Unity.PSN.PS5.Main.Initialize) can start the
-        // async worker pool. Gate behind PROSPER_NO_PSN=1 to fall back to the 4-module boot.
-        { d + "/Media/Plugins/PSN.prx", PSN },
-        // Native SaveData Unity plugin — exports PrxSaveDataInitialize / PrxSaveDataMount / etc. The
-        // managed SaveData layer dlsym's these at startup to read the save slot (new-game vs. continue),
-        // which gates the transition from the loading screen into the intro. Same load path as PSN.prx.
-        { d + "/Media/Plugins/SaveData.prx", SAVEDATA },
-        { d + "/sce_module/libc.prx", LIBC },
-    };
-    if (getenv("PROSPER_NO_PSN"))
-        for (size_t i = in.size(); i-- > 0; )
-            if (in[i].path.find("PSN.prx") != std::string::npos ||
-                in[i].path.find("SaveData.prx") != std::string::npos) in.erase(in.begin() + (ptrdiff_t)i);
-    // Cross-title tolerance (docs/CROSS_ENGINE_UE4.md step 1, minimal form): drop dependent modules
-    // whose file doesn't exist in this dump — e.g. the UE4 title ships no Il2cpp/PS5Util, so it links
-    // eboot + libc.prx only. The eboot (index 0) is always kept; each module keeps its fixed base.
-    // For the primary target every file exists, so its link is byte-for-byte unchanged.
-    for (size_t i = in.size(); i-- > 1; ) {
-        if (FILE* f = fopen(in[i].path.c_str(), "rb")) fclose(f);
-        else { printf("skipping absent module: %s\n", in[i].path.c_str()); in.erase(in.begin() + (ptrdiff_t)i); }
-    }
-    if (!link_program(in, STUB, p, &e)) { printf("link failed: %s\n", e.c_str()); return 1; }
-    printf("linked %zu modules; %zu imports (%zu cross-module, %zu stub slots); %zu init fns\n",
-           p.mods.size(), p.total_imports, p.resolved_cross_module, p.slots.size(), p.init_fns.size());
-
-    // Let sceKernelDlsym resolve exported symbols by name against all loaded modules (e.g. the
-    // PSN.prx plugin's PSN_PrxInitialize / UnityPluginLoad), so Unity's native-plugin loader binds
-    // real export addresses instead of getting ESRCH.
-    set_module_exports(&p.exports);
-
-    register_builtin_hle();
+    // Boot the title via the shared path (also used by prosper-app): link the fixed module set,
+    // map, TLS/unwind/procparam, stubs, trap handler, plugin ranges, and the dependent-module
+    // init_arrays. The lambda installs boot_trace's host frontends at the same point it always did
+    // — right after the built-in HLE is registered, before the images are mapped: sceAudioOut
+    // output to the host, and (gated by PROSPER_PAD) a controller backend (SDL3, else evdev).
+    if (!boot_program(d, p, &e, [&]{
 #ifdef PROSPER_AUDIO_SDL3
-    prosper::install_sdl3_audio_sink();   // route the guest's sceAudioOut output to the host via SDL3
+        prosper::install_sdl3_audio_sink();
 #endif
-    // Controller input, gated by PROSPER_PAD (default: core's neutral/disconnected pad, deterministic).
-    // Prefer the cross-platform SDL3 gamepad backend; fall back to the zero-dep Linux evdev reader.
-    if (getenv("PROSPER_PAD")) {
-        bool pad_ok = false; (void)pad_ok;
+        if (getenv("PROSPER_PAD")) {
+            bool pad_ok = false; (void)pad_ok;
 #ifdef PROSPER_PAD_SDL3
-        pad_ok = prosper::install_sdl3_pad_backend();
+            pad_ok = prosper::install_sdl3_pad_backend();
 #endif
 #ifdef PROSPER_PAD_EVDEV
-        if (!pad_ok) pad_ok = prosper::install_evdev_pad_backend();
+            if (!pad_ok) pad_ok = prosper::install_evdev_pad_backend();
 #endif
-    }
-    set_app0_root(d);
-    for (auto& img : p.imgs) if (!map_image(img, &e)) { printf("map failed: %s\n", e.c_str()); return 1; }
-    { std::vector<TlsModuleDesc> td; for (auto& t : p.tls_templates) td.push_back({t.init_va, t.filesz, t.memsz});
-      set_tls_modules(td.data(), td.size());      // enable __tls_get_addr for loaded modules (real libc.prx)
-      guest_tls_set_templates(td.data(), td.size()); }   // gated PROSPER_GUEST_FS: guest initial-exec %fs TLS
-    // C++ exception unwinding: give sceKernelGetModuleInfoForUnwind each module's .eh_frame_hdr + text seg.
-    { static std::vector<std::string> names; names.reserve(p.imgs.size());   // stable name storage
-      std::vector<UnwindModuleDesc> um;
-      for (size_t i = 0; i < p.imgs.size() && i < p.mods.size(); i++) {
-          auto& img = p.imgs[i]; auto& mod = *p.mods[i];
-          UnwindModuleDesc dd; dd.lo = img.base + img.min_vaddr; dd.hi = img.base + img.max_vaddr;
-          for (auto& s : mod.segments) if (s.type == 0x6474e550u) { dd.ehframe_hdr = img.base + s.vaddr; dd.ehframe_hdr_sz = s.memsz; }
-          if (!mod.loads.empty()) { dd.seg0 = img.base + mod.loads[0].vaddr; dd.seg0_sz = mod.loads[0].memsz; }
-          std::string nm = mod.path; auto sl = nm.find_last_of("/\\"); if (sl != std::string::npos) nm = nm.substr(sl + 1);
-          names.push_back(nm); dd.name = names.back().c_str(); um.push_back(dd);
-      }
-      set_unwind_modules(um.data(), um.size()); }
-    // sceKernelGetProcParam -> eboot's SCE_PROCPARAM (real libc reads its heap/malloc config here).
-    for (auto& s : p.mods[0]->segments)
-        if (s.type == PT_SCE_PROCPARAM) { set_proc_param(EBOOT + s.vaddr); break; }
-    if (!install_stubs(p.slots, p.stub_base, p.stub_size, &e)) { printf("stubs failed: %s\n", e.c_str()); return 1; }
-    install_trap_handler();
-    // PSN.prx / SaveData.prx are SCE native plugins whose user module_start validates a module-param
-    // descriptor {size=0x10, version=0x200, cb=NULL} and null-faults if started with (argc=0, argp=NULL)
-    // — the fault that left PSN unregistered ("PSN is an old version"). Register their guest ranges so
-    // run_guest_inits starts them with the real descriptor. Skipped when PROSPER_NO_PSN drops them.
-    if (!getenv("PROSPER_NO_PSN"))
-        set_module_start_param_ranges({ { PSN, SAVEDATA }, { SAVEDATA, LIBC } });
-    run_guest_inits(p.init_fns);
+        }
+    })) { printf("%s\n", e.c_str()); return 1; }
 
     // PROSPER_PATCH_RET=addr[,addr...]: write 0xC3 (ret) at each absolute guest address, neutralizing that
     // function (returns immediately, stack balanced). Bring-up diagnostic to bisect a crashing subsystem —
