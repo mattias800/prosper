@@ -61,6 +61,11 @@ std::vector<DynFetch> resolve_dynamic_fetch(const uint32_t* code, size_t dwords,
                                             const uint32_t* user_sgprs, uint32_t nsgpr,
                                             uint32_t user_sgpr_base);
 
+// Assign each resource in `t` a descriptor binding from `first`: constant/vertex buffers first, then
+// textures / storage images — never on binding 2 or 3 (the recompiler's two hardwired cbufs) so a
+// texture-first shader can't collide two descriptor types at one binding (#157). Exposed for testing.
+void assign_convention_bindings(ShaderResourceTable& t, uint32_t first);
+
 // Build a shader stage's resource table from the folded GpuState: look up the registered shader header
 // by its bound code address, read its user-data SGPR block from the sh register file, decode the V#/T#/S#
 // descriptors, and assign bindings matching the recompiler+backend convention (constant buffer -> binding
