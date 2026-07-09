@@ -213,6 +213,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             prosper::test::dump_bmp(fn, texstore.back(), tw, th);
                             fprintf(stderr, "[render] dumped raw texture -> %s\n", fn); fflush(stderr);
                         }
+                        // PROSPER_DUMP_ATLAS: dump each SMALL sampled texture once per ADDRESS (find the caption
+                        // font among same-size UI textures). Capped.
+                        if (getenv("PROSPER_DUMP_ATLAS") && !texstore.back().empty() && tw <= 1024 && th <= 512) {
+                            static std::unordered_map<uint64_t,int> seen; static int ndumped = 0;
+                            if (seen[r.gpu_addr]++ == 0 && ndumped++ < 60) {
+                                std::string d = getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".";
+                                char fn[512]; snprintf(fn, sizeof fn, "%s/tex_%ux%u_%llx_c%u.bmp", d.c_str(), tw, th,
+                                                       (unsigned long long)r.gpu_addr, r.num_components);
+                                prosper::test::dump_bmp(fn, texstore.back(), tw, th);
+                            }
+                        }
                         fr.tex_rgba = texstore.back().data(); fr.tw = tw; fr.th = th;
                     } else {
                         uint32_t nb = std::min(r.size ? r.size : 256u, 1u << 20) & ~3u;   // cap 1 MB, dword-aligned
