@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <unordered_map>
 #include <optional>
 
 namespace prosper {
@@ -119,6 +120,11 @@ void bind_imports_to_stubs(const Module& m, LoadedImage& img,
 
 // Apply all relocations into img.mem. Symbol relocs use img.import_addr for imports
 // and the module's own symbol values for internal defs. Returns #applied.
-size_t apply_relocations(const Module& m, LoadedImage& img);
+// `tls_modid_by_nid` (optional) maps an exported symbol's NID to its defining module's TLS module
+// id, so a cross-module DTPMOD64 (a TLS reference imported from another module) resolves to the
+// RIGHT module's TLS block instead of this one's (#136). Null -> module-local resolution only
+// (correct for the common case; a cross-module TLS import is then logged unhandled).
+size_t apply_relocations(const Module& m, LoadedImage& img,
+                         const std::unordered_map<std::string, uint32_t>* tls_modid_by_nid = nullptr);
 
 } // namespace prosper

@@ -80,6 +80,12 @@ if(TARGET prosper_core)
     add_test(NAME guest_tls_align COMMAND test_guest_tls_align)
   endif()
 
+  # DTPMOD64 cross-module TLS resolution (#136): a TLS import resolves to the DEFINING module's
+  # tls_modid, not the relocating module's. Pure unit test (synthetic Module/LoadedImage).
+  add_executable(test_dtpmod_tls tests/test_dtpmod_tls.cpp)
+  target_link_libraries(test_dtpmod_tls PRIVATE prosper_core)
+  add_test(NAME dtpmod_tls_cross_module COMMAND test_dtpmod_tls)
+
   # AMD SSE4a INSERTQ/EXTRQ emulation (the SIGILL handler emulates these Zen2-only ops on Intel
   # hosts). Golden bit-math vectors — header-only, no game dump required.
   add_executable(test_sse4a tests/test_sse4a.cpp)
