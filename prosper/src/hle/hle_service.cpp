@@ -279,15 +279,63 @@ HLE(s_playgo_getlang) { if (!a1) return PLAYGO_ERR_BAD_POINTER;
 // allocate/tear down local resources only). CONFIDENCE: HIGH on Initialize3/NOT_FOUND semantics;
 // MED on Mount3's arg order (mount-desc in, result out — matches every PS4 Mount variant);
 // LOW on Prepare/Commit internals (no-op success; PROSPER_SVCLOG captures their real args).
+static constexpr uint64_t SAVE_DATA_ERR_PARAMETER = 0x809F0000ull;
 static constexpr uint64_t SAVE_DATA_ERR_NOT_FOUND = 0x809F0008ull;
 HLE(s_savedata_init3)   { svc_log("sceSaveDataInitialize3", a0,a1,a2,a3,a4,a5); return 0; }
 HLE(s_savedata_term)    { return 0; }
 HLE(s_savedata_txres)   { svc_log("sceSaveDataCreateTransactionResource", a0,a1,a2,a3,a4,a5); return 0; }
 HLE(s_savedata_txres_del) { return 0; }
-HLE(s_savedata_mount3)  { svc_log("sceSaveDataMount3", a0,a1,a2,a3,a4,a5); return SAVE_DATA_ERR_NOT_FOUND; }
-HLE(s_savedata_umount2) { svc_log("sceSaveDataUmount2", a0,a1,a2,a3,a4,a5); return 0; }
+// sceSaveDataMount3(const Mount3* mount, MountResult* result). The mount desc layout is pinned
+// from DOLL's OWN wrapper (eboot+0x2251610 disassembly, matching the live capture):
+//   +0x00 u32 userId; +0x08 const char* dirName; +0x10 u64 blocks; +0x20 u32 mountMode;
+//   +0x28 u32 transactionResourceId  (the id returned by sceSaveDataCreateTransactionResource)
+// Live: dirName="Book", blocks 0x60 then 0x105, mode 1 (open-RO) then 5 (CREATE|RO).
+// mountMode bits are PS4-inherited: 1=RDONLY 2=RDWR 4=CREATE 8=DESTRUCT_OFF 16=COPY_ICON.
+// Behavior (real console semantics): open of a nonexistent save -> NOT_FOUND (fresh console;
+// the game handles it and retries with CREATE); CREATE makes the save dir and mounts it.
+// The 0x40-byte result is zeroed by the caller and fed to sceSaveDataPrepare(&{txId}, result);
+// we fill it with the PS4 MountResult shape (the only referenced layout): mountPoint char[16]
+// "/savedata0" @+0x00, requiredBlocks u64 @+0x10 = 0, mountStatus u32 @+0x1c (0=opened,
+// 1=created). hle_file translates /savedata0 to the mounted host dir.
+// CONFIDENCE: HIGH on the mount-desc layout + mode semantics (guest disasm + live capture +
+// PS4 references agree); MED on the result layout (PS4 shape; the PS5 field placement is
+// unproven — under live test which offsets the game actually reads).
+HLE(s_savedata_mount3)  {
+    svc_log("sceSaveDataMount3", a0,a1,a2,a3,a4,a5);
+    if (!a0 || !a1) return SAVE_DATA_ERR_PARAMETER;
+    const uint8_t* m = (const uint8_t*)PW(a0);
+    const char* dirname = *(const char* const*)(m + 0x08);
+    uint32_t mode = *(const uint32_t*)(m + 0x20);
+    if (!dirname) return SAVE_DATA_ERR_PARAMETER;
+    bool create = (mode & 0x4) != 0;
+    if (!savedata0_mount(dirname, create)) {
+        if (svclog()) fprintf(stderr, "[svc]   Mount3 dir='%s' mode=%#x -> NOT_FOUND\n", dirname, mode);
+        return SAVE_DATA_ERR_NOT_FOUND;
+    }
+    uint8_t* r = (uint8_t*)PW(a1);
+    memset(r, 0, 0x40);
+    memcpy(r, "/savedata0", 11);
+    *(uint32_t*)(r + 0x1c) = create ? 1u : 0u;   // mountStatus: created vs opened
+    if (svclog()) fprintf(stderr, "[svc]   Mount3 dir='%s' mode=%#x -> OK (create=%d)\n", dirname, mode, (int)create);
+    return 0;
+}
+HLE(s_savedata_umount2) { svc_log("sceSaveDataUmount2", a0,a1,a2,a3,a4,a5); savedata0_umount(); return 0; }
 HLE(s_savedata_prepare) { svc_log("sceSaveDataPrepare", a0,a1,a2,a3,a4,a5); return 0; }
 HLE(s_savedata_commit)  { svc_log("sceSaveDataCommit", a0,a1,a2,a3,a4,a5); return 0; }
+// sceSaveDataDirNameSearch(const SearchCond* cond, SearchResult* result) — PS4-inherited contract,
+// pinned by DOLL's own callsite (eboot+0x224e920): cond {u32 userId@0; titleId*@8=0; dirName*@0x10=0;
+// key/order@0x18=0}, result {u32 hitNum@0; DirName* dirNames@8 (caller buffer, this+0x40);
+// u32 dirNamesNum@0x10=0x400; u32 setNum@0x14(1.7+)} — the guest stores hitNum to this+0x8040 as its
+// save count. Fresh console: 0 saves found, success (shadPS4 does exactly this when the save path
+// doesn't exist). CONFIDENCE: HIGH (guest callsite disassembly + shadPS4 agree).
+HLE(s_savedata_dirsearch) {
+    svc_log("sceSaveDataDirNameSearch", a0,a1,a2,a3,a4,a5);
+    if (!a1) return 0x809F0000ull;        // SAVE_DATA_ERROR_PARAMETER
+    uint32_t* res = (uint32_t*)PW(a1);
+    res[0] = 0;                            // hitNum = 0 (no existing saves)
+    res[5] = 0;                            // setNum (offset 0x14) = 0
+    return 0;
+}
 
 // --- libSceNpTrophy2 lifecycle: succeed with valid ids (trophy CONTENT stays unavailable). ------
 // PS4 NpTrophy ABI carried to Trophy2 (context/handle are small s32 ids written through arg0;
@@ -403,6 +451,7 @@ void register_service_hle() {
     Hle::register_fn("uW4vfTwMQVo", (HleFn)s_savedata_umount2,   "sceSaveDataUmount2");
     Hle::register_fn("sDCBrmc61XU", (HleFn)s_savedata_prepare,   "sceSaveDataPrepare");
     Hle::register_fn("ie7qhZ4X0Cc", (HleFn)s_savedata_commit,    "sceSaveDataCommit");
+    Hle::register_fn("dyIhnXq-0SM", (HleFn)s_savedata_dirsearch, "sceSaveDataDirNameSearch");
     // libSceNpTrophy2 lifecycle — valid ids; content queries stay "unavailable" (above).
     Hle::register_fn("Bagshr7OQ6Q", (HleFn)s_nptrophy2_createctx,    "sceNpTrophy2CreateContext");
     Hle::register_fn("Gz1rmUZpROM", (HleFn)s_nptrophy2_createhandle, "sceNpTrophy2CreateHandle");

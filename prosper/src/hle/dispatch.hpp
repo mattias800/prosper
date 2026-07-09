@@ -40,6 +40,10 @@ void register_kernel_hle();
 void register_file_hle();
 // Set the host directory backing the guest's "/app0" (the game data root).
 void set_app0_root(const std::string& root);
+// Mount/unmount the guest "/savedata0" area onto a host dir named by the save's dirName
+// (sceSaveDataMount3 HLE). create=true makes the dir; create=false fails if it doesn't exist.
+bool savedata0_mount(const char* dirname, bool create);
+void savedata0_umount();
 // PS5 system services (user/NP/mouse/appcontent/dialog); called by register_builtin_hle().
 void register_service_hle();
 // libScePad game-controller input (real host controller via input/pad.cpp); called by register_builtin_hle().

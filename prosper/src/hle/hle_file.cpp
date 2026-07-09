@@ -55,6 +55,25 @@ namespace {
         }
         return root;
     }
+    // Host directory backing guest "/savedata0" — the mounted save-data area that
+    // sceSaveDataMount3 (hle_service.cpp) reports to the game. One save dir is mounted at a
+    // time (DOLL's wrapper umounts id 0 before the next mount); the current mount's host dir
+    // is swapped in here. Root override: PROSPER_SAVE0.
+    std::mutex g_save0_mx;
+    std::string g_save0;   // host dir for the CURRENT /savedata0 mount ("" = nothing mounted)
+    std::string save0_base() {
+        static std::string base;
+        if (base.empty()) {
+            const char* e = getenv("PROSPER_SAVE0");
+            base = e ? e : "/tmp/prosper-savedata0";
+#ifdef _WIN32
+            _mkdir(base.c_str());
+#else
+            ::mkdir(base.c_str(), 0777);
+#endif
+        }
+        return base;
+    }
     // PROSPER_DENY_SUBSTR: comma-separated substrings; any guest path containing one is
     // redirected to a guaranteed-missing host path, so open/stat fail with ENOENT.
     // Diagnostic knob (off by default) — used to A/B whether the title's boot flow gates on a
@@ -86,9 +105,13 @@ namespace {
             if (filelog()) fprintf(stderr, "[file] DENIED (PROSPER_DENY_SUBSTR) '%s'\n", guest);
             return "/prosper-denied" + p;
         }
-        // Map /app0[/...] -> <root>[/...], /temp0[/...] -> scratch dir; other paths as-is.
-        std::string h = (p.rfind("/app0", 0) == 0)  ? g_app0 + p.substr(5)
-                      : (p.rfind("/temp0", 0) == 0) ? temp0_root() + p.substr(6)
+        // Map /app0[/...] -> <root>[/...], /temp0[/...] -> scratch dir,
+        // /savedata0[/...] -> the currently mounted save dir; other paths as-is.
+        std::string save0;
+        if (p.rfind("/savedata0", 0) == 0) { std::lock_guard<std::mutex> lk(g_save0_mx); save0 = g_save0; }
+        std::string h = (p.rfind("/app0", 0) == 0)       ? g_app0 + p.substr(5)
+                      : (p.rfind("/temp0", 0) == 0)      ? temp0_root() + p.substr(6)
+                      : !save0.empty()                   ? save0 + p.substr(10)
                       : p;
         if (filelog()) fprintf(stderr, "[file] open '%s' -> '%s'\n", guest, h.c_str());
         return h;
@@ -168,6 +191,28 @@ namespace {
 }
 
 void set_app0_root(const std::string& root) { g_app0 = root; }
+
+// Mount / unmount the guest "/savedata0" area onto a host dir named by the save's dirName
+// (sceSaveDataMount3 HLE, hle_service.cpp). create=true makes the host dir (CREATE-mode mount);
+// create=false requires it to already exist (open-mode) and fails otherwise ("no such save").
+// Returns true on success with /savedata0 translation active.
+bool savedata0_mount(const char* dirname, bool create) {
+    if (!dirname || !*dirname) return false;
+    std::string d = save0_base() + "/" + dirname;
+#ifdef _WIN32
+    if (create) _mkdir(d.c_str());
+    struct _stat st{};
+    if (_stat(d.c_str(), &st) != 0 || !(st.st_mode & _S_IFDIR)) return false;
+#else
+    if (create) ::mkdir(d.c_str(), 0777);
+    struct stat st{};
+    if (::stat(d.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) return false;
+#endif
+    std::lock_guard<std::mutex> lk(g_save0_mx);
+    g_save0 = d;
+    return true;
+}
+void savedata0_umount() { std::lock_guard<std::mutex> lk(g_save0_mx); g_save0.clear(); }
 
 // Translate a host (Linux) struct stat into the FreeBSD/Orbis SceKernelStat layout the
 // guest expects: 0x78 bytes, different field order. Writing the host layout (144 bytes,
