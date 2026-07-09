@@ -161,6 +161,18 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     // The cutscene submits ~66 draws/frame that resolve to mask==0; if that is a mis-decode (not a genuine
     // depth-only pass), rendering them reveals whether they are the cutscene content.
     if (ps.color_write_mask == 0) ps.color_write_mask = 0xf;
+    // PROSPER_DRAWDIAG: per-RENDERED-draw geometry/position/texture — to LOCATE specific draws (e.g. the
+    // cutscene caption text: small indexed quads, bottom viewport, blended, sampling a font atlas).
+    if (getenv("PROSPER_DRAWDIAG")) {
+        uint32_t ic = (draw && draw->indexed) ? draw->index_count : vcount_hint;
+        fprintf(stderr, "[draw] idx=%u vp=%d y=%.0f h=%.0f blend=%d cwm=0x%x es=0x%llx", ic,
+                ps.has_viewport, ps.viewport_y, ps.viewport_h, ps.blend_enable, ps.color_write_mask,
+                (unsigned long long)rs.es_addr);
+        if (prt) for (const auto& r : prt->resources)
+            if (r.cls == ResourceClass::Texture)
+                fprintf(stderr, " tex=0x%llx(%ux%u f%u)", (unsigned long long)r.gpu_addr, r.width, r.height, (unsigned)r.format);
+        fprintf(stderr, "\n");
+    }
     uint32_t vertex_count = vcount_hint ? vcount_hint : 3u;
     // The bound vertex buffer's record count (size/stride) — bounds an indexed draw's vertex range, and
     // for a NON-indexed draw is often the truer count: a draw record's index_count can be a low/stale
