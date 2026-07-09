@@ -151,12 +151,13 @@ HLE(k_mutex_init) {
     *(void**)a0 = m;
     return 0;
 }
-// The guest sees FreeBSD errno values; EBUSY(16)/EPERM(1)/EINVAL(22) coincide with Linux but
-// EDEADLK differs (FreeBSD 11, Linux 35) — an ERRORCHECK relock must report the FreeBSD value.
+// The guest sees FreeBSD errno values; EBUSY(16)/EPERM(1)/EINVAL(22) coincide with both Linux and
+// MinGW, but EDEADLK differs on every host (FreeBSD 11, Linux 35, MinGW/winpthreads 36) — an
+// ERRORCHECK relock must report the FreeBSD value. `EDEADLK` is the HOST's own constant, so the
+// comparison remaps whatever the host returns on ALL platforms (the Windows CI build hit exactly
+// this: winpthreads returned its EDEADLK=36 and the old __linux__-only guard left it unremapped).
 namespace { inline uint64_t fbsd_errno(int host) {
-#ifdef __linux__
     if (host == EDEADLK) return 11;
-#endif
     return (uint64_t)(unsigned)host;
 } }
 HLE(k_mutex_destroy) { if (a0 && !pt_static_sentinel(*(void**)a0)) { pthread_mutex_destroy((pthread_mutex_t*)*(void**)a0); free(*(void**)a0); } if (a0) *(void**)a0 = nullptr; return 0; }
