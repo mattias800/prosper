@@ -588,6 +588,69 @@ Boot recipe (fast): `cp -r` the dump to `/root/PPSA17942-app0` once, then
 PROSPER_EVLOG=1 PROSPER_AMPRLOG=1] ./build-linux/boot_trace /root/PPSA17942-app0` — reaches the
 stall (the current frontier) in ~15-80 s.
 
+### SOLVED (2026-07-09, issue #208): the APR completion contract is fully recovered — the GUEST
+### seeds the listener's range walk; prosper now echoes exactly the guest-chosen tags
+
+The #180 open question ("how does real HW seed the listener's per-ring last-processed to the tag
+base?") is answered by static disassembly of the guest (all offsets eboot-relative):
+
+- **The listener-ctx CONSTRUCTOR (+0x22a0670, once-guarded at 0x95aed70, ctx = the eboot global
+  0x95aebd8) seeds everything itself**: it creates the APREventQueue ([ctx+0x18]), registers ids
+  `0x74fe + ring` for rings 0..5 on it (the six sSAUCCU1dv4 calls), and initializes each ring's
+  pair: token counter `[ctx+0xc0+ring*0x28] = 0x3e8` (1000) and listener last-processed
+  `[ctx+0xc8+ring*0x28] = 0x3e7` (999). The walk over the first tag event (cnt=1000) covers
+  exactly seq 1000 — there was never any library-side seeding to model.
+- **The batch submit (+0x22a02b0)** draws `token = (ring<<58) | [ctx+0xc0+ring*0x28]++`, passes it
+  to H896Pt-yB4I as the binding tag, stores it at `[slot+0x10]`, and inserts a
+  `{token -> completion callback}` entry into the hash at ctx+0x58 (128-byte entries, chain
+  sentinel -1). The handler (+0x229dcb0) completes the slot match AND invokes the hash callback
+  (that callback is what fires the FEvent the CreateGlobalShaderMap precache blocks on).
+- **The listener (+0x22740b0) stores `last := cnt` UNCONDITIONALLY after every event**
+  (+0x2274143), even when `cnt < last+1` (no walk). This is why the #180 tag-echo experiment still
+  faulted: prosper's own invented-counter events (registration catch-up replays, vWU direct-read
+  wakeups) carried cnt << 1000, walked nothing, but REGRESSED the guest's 999 seed — the next real
+  tag event then walked the gap seqs, and any walked seq with no slot match and no hash entry
+  takes the null-entry path (a 64-byte ymm swap against address 0x10, the +0x229df3e fault —
+  fatal on real HW too, so the guest guarantees dense counters from exactly 1000).
+- **Fix (now the default; the PROSPER_APR_TAG_ECHO / slot-echo experiments are retired):**
+  bound (H896) submits echo NOTHING into the out slots (they alias the completion record) and
+  post the binding tag verbatim, deferred ~2 ms, coalesced per ring to the highest counter
+  (kqueue "completed up to" semantics). Unbound submits keep returning prosper counter tokens
+  through the out slots and post NO event; vWU direct reads post NO event (live-verified: the
+  gdb-unwedged engine streamed the whole remaining load through vWU reads with no events).
+
+**Also fixed in the same session — a DOLL boot regression that masked all of the above** (came in
+with the master merge, first bad commit fe8e8d7 / issue #183, found by git bisect): the guest
+wedged single-threaded ~10 s into boot, self-deadlocked in k_mutex_lock (mutex `__owner` == the
+caller). UE4's PS5 lock wrapper (+0x24ca4b6, same shape inside the APR handler at +0x229dcf5)
+builds its own recursion on the FreeBSD self-lock contract:
+`err = mutex_lock(obj); if (err) /* EDEADLK: already mine */ skip-acquire; depth++;` — and DOLL
+creates those mutexes with `pthread_mutexattr_settype(type=4)` (ADAPTIVE_NP, live-captured via
+PROSPER_MUTEXLOG). FreeBSD libthr's `mutex_self_lock` returns EDEADLK for ERRORCHECK **and**
+ADAPTIVE_NP (adaptive = errorcheck + a spin heuristic); only NORMAL hard-deadlocks. #183 (after
+Kyty) mapped 4 -> host NORMAL, which self-deadlocks on glibc. Fixes in hle_kernel.cpp: settype
+type 4 -> host ERRORCHECK; a fresh mutexattr defaults to ERRORCHECK (FreeBSD attr default — the
+#183 change only covered the no-attr init path); the static ADAPTIVE sentinel (1) also maps to
+ERRORCHECK. Kyty is weighted DOWN here per policy: no title it runs exercises adaptive self-lock.
+
+**Measured result (ext4 fast path, 240-480 s runs):** the 90-read wall is GONE — 978 APR reads
+served, the guest's own tag counter advanced past 0x458 (112+ batches consumed through the
+listener), GlobalShaderMap loads, PreInit completes, the engine initializes VideoOut + the AGC
+RHI (VideoOutQueue equeue + AddFlipEvent), loads every plugin assetregistry.bin, submits its
+first real DCBs (`SubmitDcb #1: 85 dwords/13 packets`, `#2: 1436 dwords/232 packets` — EventWrite/
+WriteData/AcquireMem/ReleaseMem streams, 0 draws yet) and performs its first flip
+(`GpuFlip handle=0x1001 bufidx=0 mode=0x1 fliparg=0x1`). ctest 60/60; Messenger smoke renders
+3860 frames in 300 s.
+
+**NEXT (the new frontier):** after the first flip the RHI thread settles into a
+WaitEqueue(VideoOutQueue) loop (ident=1, filter=-13, one event delivered per cycle) and no further
+draws/flips arrive over 480 s — the game thread is presumably parked post-registry (thread dump
+needed). New unimplemented NIDs on this path worth wiring next: libSceAgc dbOlWdppb4o,
+qj7QZpgr9Uw, bbFueFP+J4k, xSAR0LTcRKM, w6Dj1VJt5qY; libSceVideoOut MTxxrOCeSig, U2JJtSqNKZI; plus
+the sceVideoOutGetOutputStatus struct fill (issue #82) which this boot now hits with a warning.
+There is also a mount-era polling loop (GnxKOHEawhk + tZDDEo2tE5k(GetSize) spam under
+PROSPER_AMPRLOG) that the boot passes through but which merits a real implementation.
+
 ### The remaining 3 unnamed Ampr NIDs (issue #107, not on the crash path)
 
 `vWU-odnS+fU`, `sSAUCCU1dv4`, `GnxKOHEawhk`, `H896Pt-yB4I` still resist the generated

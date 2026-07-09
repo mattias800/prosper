@@ -663,24 +663,23 @@ HLE(k_ampr_getsize) {
 }
 HLE(k_ampr_x3) { return ampr_arglog("Qs1xtplKo0U", a0, a1, a2, a3, a4, a5); }
 HLE(k_ampr_x4) { return ampr_arglog("GuchCTefuZw", a0, a1, a2, a3, a4, a5); }
-// --- APR completion-event plumbing (issue #115: DOLL hangs in CreateGlobalShaderMap because its
-// FAPREventQueueListener never receives read-completion events). Live-captured contract:
-//   sSAUCCU1dv4(eq=APREventQueue, id=0x7502, 0, 0, 0x43, 0)      — register APR events on an equeue
-//   H896Pt-yB4I(cbCtx, eq, id=0x7502, 0x10000000000003e8, 0, 7)  — bind a command buffer to the eq
-//   ASoW5WE-UPo(cb, ring_1based, u64* out1, u64* out2)           — libkernel: SUBMIT the APR cb;
-//     the engine treats a nonzero return as an error (test eax,eax at eboot+0x4022a1d55) and the
-//     completion handler (eboot+0x40229dcb0) RESUBMITS the next queued cb with ring = (data>>58)+1,
-//     proving the ring argument is 1-based and the out slots carry the completion token the
-//     listener later matches ((ring<<58)|counter — see hle_kernel_time.cpp).
-// prosper's reads complete synchronously inside the builders, so submit == complete: assign the
-// token, publish it through the out slots, and fire the equeue event.
-// CONFIDENCE: HIGH on listener decode + 1-based ring (disassembly); MED on out-slot roles (both
-// receive the token — the tracking object stores whichever it uses).
-uint64_t prosper_apr_next_token(unsigned ring, bool tracked_catchup);   // hle_kernel_time.cpp
-void prosper_eq_trigger_apr(uint64_t token);                            // "
-void prosper_eq_add_apr(uint64_t eq, int64_t id, uint64_t ctx);         // "
-void prosper_apr_slot_scan_schedule();                                  // " (slot-echo, issue #180)
-void prosper_eq_post_apr_token(uint64_t eq, int64_t id, uint64_t token); // " (tag echo, issue #180)
+// --- APR completion-event plumbing (issues #115/#180/#208). Live-captured surface:
+//   sSAUCCU1dv4(eq=APREventQueue, id=0x74fe+ring, 0, 0, 0x43, 0)  — register APR ids on an equeue
+//     (called 6x, rings 0..5, by the guest listener-ctx ctor eboot+0x22a0670)
+//   H896Pt-yB4I(cbCtx, eq, id, tag=(ring<<58)|counter, 0, 7)      — bind a command buffer to the
+//     eq; the tag is the GUEST-CHOSEN completion token (counter from the ctor-seeded per-ring
+//     sequence starting at 1000)
+//   ASoW5WE-UPo(cb, ring_1based, u64* out1, u64* out2)            — libkernel: SUBMIT the APR cb;
+//     nonzero return = error (test eax,eax at eboot+0x22a1d55); the completion handler
+//     (eboot+0x229dcb0) resubmits the next queued cb with ring = (data>>58)+1 (1-based ring).
+// prosper's reads complete synchronously inside the builders, so submit == complete: for a bound
+// cb, post its H896 tag as the completion event (deferred); for an unbound cb, hand a counter
+// token through the out slots and post nothing (record-polled). Full contract write-up in
+// hle_kernel_time.cpp. CONFIDENCE: HIGH (static disassembly of the guest submit/listener/handler
+// + live tag-echo captures).
+uint64_t prosper_apr_next_token(unsigned ring);                          // hle_kernel_time.cpp
+void prosper_eq_add_apr(uint64_t eq, int64_t id);                        // "
+void prosper_eq_post_apr_token(uint64_t eq, int64_t id, uint64_t token); // " (tag echo, #208)
 namespace {
     // Command-buffer ctxs bound to the APR event queue via H896Pt-yB4I, with the binding's a3 TAG
     // and target equeue. The tag IS the guest-chosen completion token for that cb ((ring<<58)|n,
@@ -734,16 +733,16 @@ namespace {
         return it != g_apr_eventful.end() && it->second;
     }
 }
-HLE(k_apr_set_equeue) {          // sSAUCCU1dv4 (eq, id, 0, 0, listenerCtx, flags)
+HLE(k_apr_set_equeue) {          // sSAUCCU1dv4 (eq, id, 0, 0, 0x43, 0)
     ampr_arglog("sSAUCCU1dv4(SetEqueue)", a0, a1, a2, a3, a4, a5);
-    // a4 = the listener context object whose per-ring in-flight slots ([ctx+0xa8+ring*0x28]) the
-    // slot-echo scan reads (live captures: a heap object, same one across re-registrations).
-    if (a0) prosper_eq_add_apr(a0, (int64_t)a1, a4 > 0xffff ? a4 : 0);
+    // Called 6x by the guest listener-ctx ctor (eboot+0x22a0670) with id = 0x74fe + ring for
+    // rings 0..5, right after it creates its own equeue and seeds the per-ring counters.
+    if (a0) prosper_eq_add_apr(a0, (int64_t)a1);
     return 0;
 }
 HLE(k_apr_cb_set_equeue) {       // H896Pt-yB4I (cb, eq, id, tag, 0, flags)
     ampr_arglog("H896Pt-yB4I(CbSetEqueue)", a0, a1, a2, a3, a4, a5);
-    if (a1) prosper_eq_add_apr(a1, (int64_t)a2, 0);
+    if (a1) prosper_eq_add_apr(a1, (int64_t)a2);
     if (a0) {
         std::lock_guard<std::mutex> lk(g_apr_bound_mx);
         bool seen = false;
@@ -755,41 +754,29 @@ HLE(k_apr_cb_set_equeue) {       // H896Pt-yB4I (cb, eq, id, tag, 0, flags)
 }
 HLE(k_apr_submit) {              // libkernel ASoW5WE-UPo (cb, ring_1based, out1, out2)
     unsigned ring = a1 ? (unsigned)(a1 - 1) & 0x3f : 0;
-    // Completion-token contract (issue #180, established by live disassembly of the guest handler
-    // eboot+0x229dcb0 + the post-stall streaming captures):
-    //   - The guest TRACKS one in-flight cb per ring at [listenerCtx+0xa8+ring*0x28], expected
-    //     token at [slot+0x10]. Whatever token value the engine associates with the cb — the
-    //     H896Pt-yB4I binding tag for the streaming channel ((ring<<58)|0x3e8+n, guest-chosen), or
-    //     the value THIS call returns through its out slots for the ring-6 async-archive flow —
-    //     the completion event's data must equal it exactly.
-    //   - So: for an H896-bound cb, ECHO the binding tag through the out slots; otherwise hand out
-    //     our own per-ring counter token (the engine stores it verbatim when it tracks the read,
-    //     e.g. CreateGlobalShaderMap's blocking precache read — the #180 boot stall).
-    //   - Events are NOT posted from here with invented counters (a mismatched or slot-less event
-    //     faults the handler at +0x229dd21/+0x229df3e — crash-verified 2/2 both ways this
-    //     session). Instead the deferred SLOT-ECHO scan (hle_kernel_time.cpp) reads back the
-    //     guest's own tracking slots and posts exactly the expected tokens.
+    // Completion-token contract (issues #180/#208 — guest submit path eboot+0x22a02b0, handler
+    // +0x229dcb0, listener +0x22740b0, listener-ctx ctor +0x22a0670; full write-up in
+    // hle_kernel_time.cpp and docs/UE4_APR_IOSTORE_BRINGUP.md):
+    //   - H896-BOUND cb (the batched/streaming channel): the completion token IS the binding tag,
+    //     (ring<<58)|counter with the counter drawn from the guest's own per-ring sequence seeded
+    //     at 1000 ([ctx+0xc0+ring*0x28], ctor-initialized 0x3e8). The guest tracks it at
+    //     [slot+0x10] AND in a {token -> callback} hash; the listener's walk is ctor-seeded to
+    //     start exactly at 1000 (last-processed = 0x3e7). We post the tag VERBATIM (deferred) on
+    //     the binding's own equeue — nothing else. The out slots are NOT written: a2/a3 alias the
+    //     request's completion RECORD ({status@req+0x28, bytes@req+0x30}, already completed
+    //     {0,size} by ReadFile) — writing a token there marks the record FAILED (nonzero status,
+    //     checked at eboot+0x22738a5; live-verified "GEngineLoop.PreInit Failed!").
+    //   - UNBOUND cb (mount-era sync flow, ring_1b=6 async-archive flow): hand out our own
+    //     per-ring counter token through the out slots (the engine stores it verbatim where it
+    //     tracks the read) and post NO event — these flows are completion-record-polled, and any
+    //     invented-counter event would REGRESS the listener's ctor-seeded last-processed via its
+    //     unconditional last:=cnt store (+0x2274143), setting up the fatal +0x229df3e walk (the
+    //     #180 residual fault). CONFIDENCE: HIGH (static disassembly + live tag-echo runs).
     AprBoundCb bc{};
     const bool bound = apr_cb_bound(a0, &bc);
-    // PROSPER_APR_TAG_ECHO=1 (EXPERIMENTAL, issue #180 follow-up): model the guest-chosen-token
-    // contract instead of the #115 invented-counter one —
-    //   - a BOUND cb's token is its H896 tag; echo it (not a counter) and post the completion
-    //     event with the tag verbatim on the binding's own equeue;
-    //   - do NOT write the out slots for bound cbs: a2/a3 alias the request's completion RECORD
-    //     ({status@req+0x28, bytes@req+0x30}, already completed {0,size} by ReadFile) — writing a
-    //     token there marks the record FAILED (nonzero status = the "Apr read failure" encoding,
-    //     checked at eboot+0x22738a5) and turned the shader-map load into "GEngineLoop.PreInit
-    //     Failed!" (live run 12, 2026-07-09);
-    //   - additionally run the slot-echo scan (hle_kernel_time.cpp).
-    // Still OFF by default: the tag event's counter (base 0x3e8=1000) makes the listener range-
-    // walk seqs 1..1000, and with a non-empty tracking hash the walk's misses fall off the chain
-    // sentinel into the eboot+0x229df3e fault (live run 12). The missing piece is how real HW
-    // initializes the listener's per-ring last-processed to the tag base — likely visible in the
-    // listener loop disassembly (eboot+0x2274130..) — see docs/UE4_APR_IOSTORE_BRINGUP.md.
-    static const bool tag_echo = getenv("PROSPER_APR_TAG_ECHO") != nullptr;
-    uint64_t token = (tag_echo && bound && bc.tag) ? bc.tag
-                                                   : prosper_apr_next_token(ring, /*tracked_catchup=*/false);
-    if (!(tag_echo && bound)) {
+    const bool tag_echo = bound && bc.tag && bc.eq;
+    uint64_t token = tag_echo ? bc.tag : prosper_apr_next_token(ring);
+    if (!bound) {
         if (a2 > 0xffff) *(uint64_t*)(uintptr_t)a2 = token;
         if (a3 > 0xffff) *(uint64_t*)(uintptr_t)a3 = token;
     }
@@ -797,13 +784,7 @@ HLE(k_apr_submit) {              // libkernel ASoW5WE-UPo (cb, ring_1based, out1
                            (unsigned long long)a0, (unsigned long long)a1,
                            (unsigned long long)a2, (unsigned long long)a3, (unsigned long long)token,
                            bound ? " (bound)" : "", apr_req_eventful(a0) ? " (arg8-async)" : "");
-    if (tag_echo) {
-        if (bound && bc.tag && bc.eq) prosper_eq_post_apr_token(bc.eq, bc.id, bc.tag);
-        prosper_apr_slot_scan_schedule();
-    } else if (bound) {
-        // Pre-#180 behavior (default): bound submissions post a per-ring counter event.
-        prosper_eq_trigger_apr(token);
-    }
+    if (tag_echo) prosper_eq_post_apr_token(bc.eq, bc.id, bc.tag);
     return 0;
 }
 // Still-unnamed mount-time Ampr NID (state query?); arg-logging no-op under PROSPER_AMPRLOG.

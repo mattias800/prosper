@@ -840,16 +840,11 @@ HLE(f_apr_read_submit) {
 //   vWU-odnS+fU(fileId=8, dst=0x2002860000, size=0x107e3a, off=0x7adec90a, off, 5thArg=4)
 // — fileId 8 = pakchunk0-ps5.pak from APR resolve, and (off,size) is EXACTLY the engine's
 // GlobalShaderCache-SF_PS5.bin region inside that pak (size matched the reader global's recorded
-// file size 0x107e3a). No command buffer, no completion record: the read completes by posting a
-// completion token to the registered APREventQueue (see hle_kernel_time.cpp), where the
-// FAPREventQueueListener picks it up and signals the waiting FEvent. a3==a4 in the only capture;
-// a5 is modeled as the 1-based ring index like the ASoW5WE-UPo submit (the completion handler
-// proves 1-based for that path; if a5 turns out to be flags the hash-map fallback in the guest's
-// handler still matches the token). CONFIDENCE: HIGH on (id,dst,size,off) — verified against the
-// resolved file and the reader's recorded size; MED on a5-as-ring.
-uint64_t prosper_apr_next_token(unsigned ring, bool tracked_catchup);   // hle_kernel_time.cpp
-void prosper_eq_trigger_apr(uint64_t token);                            // "
-void prosper_apr_slot_scan_schedule();                                  // " (slot-echo, issue #180)
+// file size 0x107e3a). No command buffer, no completion record — and NO completion event (#208):
+// the guest consumes these reads without a listener event; only the H896-bound batch channel gets
+// events, carrying the guest-chosen binding tag (see hle_kernel_time.cpp for the full contract).
+// a3==a4 in the only capture. CONFIDENCE: HIGH on (id,dst,size,off) — verified against the
+// resolved file and the reader's recorded size.
 HLE(f_apr_read_direct) {
     uint64_t id = a0, dst = a1, size = a2, offset = a3;
     std::string host = prosper_apr_path_for_id((uint32_t)id);
@@ -876,11 +871,12 @@ HLE(f_apr_read_direct) {
                            (unsigned long long)id, host.c_str(), (unsigned long long)dst,
                            (unsigned long long)offset, (unsigned long long)size, ok ? "OK" : "FAIL");
     if (!ok) return 0x80020016ull;
-    unsigned ring = a5 ? (unsigned)(a5 - 1) & 0x3f : 0;
-    prosper_eq_trigger_apr(prosper_apr_next_token(ring, /*tracked_catchup=*/true));
-    // PROSPER_APR_TAG_ECHO experiment (issue #180): also echo any guest-tracked expected tokens
-    // (the direct read's own event above is a wakeup whose counter the engine may not track).
-    if (getenv("PROSPER_APR_TAG_ECHO")) prosper_apr_slot_scan_schedule();
+    // No completion event (issue #208). Direct reads are consumed by the guest WITHOUT a listener
+    // event (live-verified: the gdb-unwedged engine streamed the whole remaining load through
+    // these with no matching events in flight), and posting an invented counter would REGRESS the
+    // listener's ctor-seeded per-ring last-processed (unconditional last:=cnt store at
+    // eboot+0x2274143), setting up the fatal +0x229df3e range walk. Only exact H896 binding tags
+    // are ever posted (k_apr_submit -> prosper_eq_post_apr_token).
     return 0;
 }
 // APR completion-token plumbing (hle_kernel_time.cpp) — see the k_apr_submit block in
