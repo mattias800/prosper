@@ -41,6 +41,12 @@ struct DrawItem {
     // then IS the fetched index, which the recompiled VS uses for its storage-buffer vertex fetch);
     // empty -> plain vkCmdDraw(vertex_count).
     std::vector<uint32_t> indices;
+    // Render-to-texture (#167): the CB_COLOR0_BASE this draw renders INTO. The game renders its scene
+    // into a color target then samples that same address as a texture in a later composite pass; the
+    // live renderer caches each submit's rendered pixels under this address and injects them when a
+    // subsequent draw samples a texture at a matching base (otherwise the sample reads empty guest
+    // memory — the scene RT is never populated on the CPU side — and the frame is a black composite).
+    uint64_t color0_base = 0;
 };
 
 // The pluggable Vulkan backend: render the submit's draw items into one image and return W*H*4 RGBA8
@@ -202,6 +208,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     if (out.indices.empty() && vb_entries > vertex_count) vertex_count = vb_entries;
     out.vs = std::move(vs); out.fs = std::move(fs); out.ps = ps;
     out.vrt = std::move(vrt); out.prt = std::move(prt); out.vertex_count = vertex_count;
+    out.color0_base = rs.color0_base;   // render-to-texture: the target this draw writes into (#167)
     return true;
 }
 
