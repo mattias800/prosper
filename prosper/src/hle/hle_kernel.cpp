@@ -312,6 +312,23 @@ HLE(k_attr_init)        { if (a0) { auto* at = (pthread_attr_t*)calloc(1, sizeof
 HLE(k_attr_destroy)     { if (a0 && *(void**)a0) { pthread_attr_destroy((pthread_attr_t*)*(void**)a0); free(*(void**)a0); *(void**)a0 = nullptr; } return 0; }
 HLE(k_attr_setstacksize){ if (a0 && *(void**)a0 && a1 >= 16384) pthread_attr_setstacksize((pthread_attr_t*)*(void**)a0, a1); return 0; }
 HLE(k_attr_noop)        { return 0; }
+// scePthreadAttrSetdetachstate: store DETACHED/JOINABLE into the host attr so k_pthread_create (which
+// reads pthread_attr_getdetachstate and applies it, line ~465) actually honors a detached-thread request.
+// This was a no-op, so a thread the guest marked DETACHED was created JOINABLE and, never joined, leaked
+// its TCB/stack -> OOM under thread churn. Sony DETACHED=1/JOINABLE=0 map 1:1 to the host enum.
+HLE(k_attr_setdetachstate) {
+    if (!a0 || !*(void**)a0) return 0x16;   // EINVAL
+    pthread_attr_setdetachstate((pthread_attr_t*)*(void**)a0,
+                                a1 ? PTHREAD_CREATE_DETACHED : PTHREAD_CREATE_JOINABLE);
+    return 0;
+}
+HLE(k_attr_getdetachstate) {
+    if (!a0 || !*(void**)a0 || !a1) return 0x16;   // EINVAL (was MISSING -> left *state uninitialized)
+    int st = PTHREAD_CREATE_JOINABLE;
+    pthread_attr_getdetachstate((pthread_attr_t*)*(void**)a0, &st);
+    *(int*)(uintptr_t)a1 = (st == PTHREAD_CREATE_DETACHED) ? 1 : 0;
+    return 0;
+}
 
 // Query the CURRENT thread's real attributes into the caller's attr object (the GC needs
 // accurate stack bounds to scan roots; bad bounds make IL2CPP's GC init assert).
@@ -1086,7 +1103,8 @@ void register_kernel_hle() {
     R("scePthreadAttrSetinheritsched", k_attr_noop);
     R("scePthreadAttrSetschedpolicy", k_attr_noop);
     R("scePthreadAttrSetschedparam", k_attr_noop);
-    R("scePthreadAttrSetdetachstate", k_attr_noop);
+    R("scePthreadAttrSetdetachstate", k_attr_setdetachstate);   // was no-op -> detached threads leaked
+    R("scePthreadAttrGetdetachstate", k_attr_getdetachstate);   // was MISSING -> uninitialized *state
     R("scePthreadAttrGetschedparam", k_attr_getschedparam);
     R("scePthreadAttrGet", k_attr_get);
     R("scePthreadAttrGetstackaddr", k_attr_getstackaddr);
@@ -1127,7 +1145,8 @@ void register_kernel_hle() {
     R("pthread_condattr_init", k_condattr_init); R("pthread_condattr_destroy", k_condattr_destroy);
     R("pthread_attr_init", k_attr_init);      R("pthread_attr_destroy", k_attr_destroy);
     R("pthread_attr_setstacksize", k_attr_setstacksize);
-    R("pthread_attr_setdetachstate", k_attr_noop); R("pthread_attr_setinheritsched", k_attr_noop);
+    R("pthread_attr_setdetachstate", k_attr_setdetachstate); R("pthread_attr_getdetachstate", k_attr_getdetachstate);
+    R("pthread_attr_setinheritsched", k_attr_noop);
     R("pthread_attr_setschedpolicy", k_attr_noop);  R("pthread_attr_setschedparam", k_attr_noop);
     R("pthread_attr_getstacksize", k_attr_getstacksize);
     R("scePthreadAttrSetaffinity", k_attr_noop); R("pthread_setname_np", k_attr_noop);
