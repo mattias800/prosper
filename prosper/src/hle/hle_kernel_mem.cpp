@@ -1047,6 +1047,11 @@ void register_kernel_mem_hle() {
     R("sceKernelMapDirectMemory", k_map_dmem);
     R("sceKernelMapNamedDirectMemory", k_map_dmem);
     R("sceKernelMunmap", k_munmap);
+    // sceKernelReleaseFlexibleMemory(addr, len): same shape as munmap (unmap + untrack the flexible range).
+    // Was MISSING -> the stub returned success without releasing, so the range stayed mapped and its
+    // tracking entry lingered -> VirtualQuery / the fault-handler probe report a freed VA as live, and host
+    // VA leaks on churn. Reuse k_munmap (identical (addr, len) contract).
+    R("sceKernelReleaseFlexibleMemory", k_munmap);
     R("sceKernelMprotect", k_mprotect);
     R("sceKernelReleaseDirectMemory", k_release_dmem);
     R("sceKernelCheckedReleaseDirectMemory", k_release_dmem);
