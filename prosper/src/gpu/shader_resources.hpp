@@ -26,10 +26,10 @@ enum class DataFormat : uint32_t {
     Float32, Uint32, Sint32,
     Float16, Unorm16, Snorm16, Uint16, Sint16,
     Unorm8,  Snorm8,  Uint8,  Sint8,
-    // Block-compressed texture formats (4x4-texel blocks). RECOGNIZED by the Gen5 T# mapper
-    // (gen5_image_format) so a BCn texture sizes correctly and is skipped explicitly instead of
-    // binding as garbage RGBA8 (#65) — but no backend samples them yet. data_format_bytes()
-    // returns 0 for these (a per-COMPONENT byte size is meaningless for a block format; use
+    // Block-compressed texture formats (4x4-texel blocks). BC1/2/3/4/5/7 are decoded to RGBA8 on
+    // upload (bc_decode, #121/#290); BC6H (HDR) and the SNORM BC4/5 variants are recognized but
+    // still skipped (gen5_image_format flags them). data_format_bytes() returns 0 for these (a
+    // per-COMPONENT byte size is meaningless for a block format; use
     // Gen5ImageFormatInfo::bytes_per_block).
     Bc1, Bc2, Bc3, Bc4, Bc5, Bc6, Bc7,
     // 10/11-bit packed formats are added as the target needs them.
@@ -37,6 +37,10 @@ enum class DataFormat : uint32_t {
 
 // How many bytes one component of `format` occupies (0 for Unknown and block-compressed formats).
 uint32_t data_format_bytes(DataFormat f);
+
+// IEEE-754 binary16 -> binary32 (handles subnormals, +/-inf, NaN). Used by the texture upload path to
+// convert a sampled Float16 surface to the RGBA8 the backend uploads (#290). Pure + testable.
+float half_to_float(uint16_t h);
 
 enum class ResourceClass : uint32_t {
     ConstantBuffer,  // read by s_buffer_load_* (scalar, uniform across the wave)
