@@ -17,10 +17,10 @@ static int fails = 0;
 // A stand-in frontend: takes ownership of the dialog, stays RUNNING until the test advances it, and
 // reports USER_CANCELED with the entered (empty) text.
 struct MockUi : PlatformUi {
-    int status = 2 /*RUNNING*/, opens = 0, closes = 0, results = 0;
+    int status = 1 /*OrbisImeDialogStatus::Running*/, opens = 0, closes = 0, results = 0;
     uint64_t last_param = 0, last_extended = 0, last_result = 0;
     bool imeDialogOpen(uint64_t param, uint64_t extended) override {
-        opens++; last_param = param; last_extended = extended; status = 2; return true;
+        opens++; last_param = param; last_extended = extended; status = 1; return true;
     }
     int  imeDialogStatus() override { return status; }
     int  imeDialogResult(uint64_t result) override { results++; last_result = result;
@@ -54,7 +54,7 @@ int main() {
     set_platform_ui(nullptr);
     term(0,0,0,0,0,0);
     init(0,0,0,0,0,0);
-    CHECK(status(0,0,0,0,0,0) == 3, "headless: Init auto-completes to FINISHED(3)");
+    CHECK(status(0,0,0,0,0,0) == 2, "headless: Init auto-completes to ImeDialog Finished(2)");
     int32_t endStatus = 0x55;
     result((uint64_t)(uintptr_t)&endStatus, 0,0,0,0,0);
     CHECK(endStatus == 0, "headless: GetResult writes endStatus OK(0)");
@@ -66,9 +66,9 @@ int main() {
     init(0x1234 /*param*/, 0x5678 /*extended*/, 0,0,0,0);
     CHECK(ui.opens == 1 && ui.last_param == 0x1234 && ui.last_extended == 0x5678,
           "backend: Init forwards the guest param pointers to imeDialogOpen");
-    CHECK(status(0,0,0,0,0,0) == 2, "backend: status reflects the frontend (RUNNING while shown)");
-    ui.status = 3;   // the frontend finishes the dialog (user confirmed/cancelled)
-    CHECK(status(0,0,0,0,0,0) == 3, "backend: status follows the frontend to FINISHED");
+    CHECK(status(0,0,0,0,0,0) == 1, "backend: status reflects the frontend (ImeDialog Running=1 while shown)");
+    ui.status = 2;   // the frontend finishes the dialog (user confirmed/cancelled)
+    CHECK(status(0,0,0,0,0,0) == 2, "backend: status follows the frontend to ImeDialog Finished(2)");
     int32_t es = 0x55;
     result((uint64_t)(uintptr_t)&es, 0,0,0,0,0);
     CHECK(ui.results == 1 && ui.last_result == (uint64_t)(uintptr_t)&es,
@@ -80,7 +80,7 @@ int main() {
     // --- Unregister -> headless again (no dangling delegation to the freed backend). ---
     set_platform_ui(nullptr);
     init(0,0,0,0,0,0);
-    CHECK(status(0,0,0,0,0,0) == 3, "after unregister: back to headless auto-complete");
+    CHECK(status(0,0,0,0,0,0) == 2, "after unregister: back to headless auto-complete (Finished=2)");
     CHECK(ui.opens == 1, "after unregister: the old backend is no longer consulted");
 
     // --- MsgDialog: headless auto-dismiss vs backend delegation. ---

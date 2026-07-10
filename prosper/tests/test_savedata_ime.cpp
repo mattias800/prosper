@@ -41,7 +41,7 @@ int main() {
         ime_term(0,0,0,0,0,0);
         CHECK(ime_status(0,0,0,0,0,0) == 0, "ImeDialog status is NONE(0) before Init");
         ime_init(0,0,0,0,0,0);
-        CHECK(ime_status(0,0,0,0,0,0) == 3, "after Init -> FINISHED(3) so a poll loop exits (no keyboard UI)");
+        CHECK(ime_status(0,0,0,0,0,0) == 2, "after Init -> OrbisImeDialogStatus::Finished(2) so a poll loop exits");
         int32_t endStatus = (int32_t)0xDEAD;
         ime_result((uint64_t)(uintptr_t)&endStatus, 0, 0, 0, 0, 0);
         CHECK(endStatus == 0, "GetResult writes endStatus = OK(0)");
