@@ -222,8 +222,14 @@ struct SpirvCompute {
     uint32_t scmp(uint32_t op, uint32_t a, uint32_t b) { uint32_t r = id(); put(code, op, {t_bool, r, bcs(a), bcs(b)}); return r; }
     uint32_t ucmp(uint32_t op, uint32_t a, uint32_t b) { uint32_t r = id(); put(code, op, {t_bool, r, a, b}); return r; }
     // Bitfield extract (base, offset, count) -> bits. Unsigned and signed variants.
-    uint32_t bfe_u(uint32_t base, uint32_t off, uint32_t cnt) { uint32_t r = id(); put(code, Op_BitFieldUExtract, {t_u32, r, base, off, cnt}); return r; }
-    uint32_t bfe_s(uint32_t base, uint32_t off, uint32_t cnt) { uint32_t ri = id(); put(code, Op_BitFieldSExtract, {t_i32, ri, bcs(base), off, cnt}); return i2u(ri); }
+    // Clamp so Offset+Count <= 32 (#455). SPIR-V OpBitField*Extract is UNDEFINED when off+cnt exceeds
+    // the 32-bit operand width, but s_bfe's 7-bit width field (0..127) and v_bfe's off+cnt (up to 62)
+    // can exceed it. RDNA2 reads bits past the source MSB as 0 (unsigned) / sign (signed), i.e. the
+    // effective count is min(cnt, 32-off) — reproduce that instead of emitting UB (the constant-offset
+    // callers already satisfy off+cnt<=32, so the umin/isub fold to no-ops there).
+    uint32_t bfe_clamp_cnt(uint32_t offc, uint32_t cnt) { return uext2(Glsl_UMin, cnt, ibin(Op_ISub, uconst(32), offc)); }
+    uint32_t bfe_u(uint32_t base, uint32_t off, uint32_t cnt) { uint32_t offc = uext2(Glsl_UMin, off, uconst(32)); uint32_t r = id(); put(code, Op_BitFieldUExtract, {t_u32, r, base, offc, bfe_clamp_cnt(offc, cnt)}); return r; }
+    uint32_t bfe_s(uint32_t base, uint32_t off, uint32_t cnt) { uint32_t offc = uext2(Glsl_UMin, off, uconst(32)); uint32_t ri = id(); put(code, Op_BitFieldSExtract, {t_i32, ri, bcs(base), offc, bfe_clamp_cnt(offc, cnt)}); return i2u(ri); }
     // Lazily declared 64-bit uint (+ Int64 capability), for s_bfe_u64 etc. that operate on SGPR pairs.
     uint32_t t_u64_cache = 0; bool declared_int64 = false;
     uint32_t t_u64() { if (!t_u64_cache) { if (!declared_int64) { put(caps, Op_Capability, {Cap_Int64}); declared_int64 = true; }
