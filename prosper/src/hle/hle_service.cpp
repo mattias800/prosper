@@ -271,6 +271,20 @@ HLE(s_appcontent_tmpmount2) {
 // value games use to size caches/allocations.
 HLE(s_appcontent_tmpspace) { if (a1) *(uint64_t*)PW(a1) = 1048576ull; return 0; }
 
+// sceAppContentGetAddcontInfoList(serviceLabel, Info* list, u32 listNum, u32* hitNum): the add-content
+// (DLC) enumeration. The game first count-queries with list=NULL/num=0 and an out pointer in a3, then
+// grows a hitNum-sized array. Was MISSING -> the return-0 stub reported success while leaving *hitNum
+// (a3) uninitialized -> the engine sized an array from heap garbage = the 34 GB OOM / heap-overflow
+// class (cf. #213). This dump has no DLC, so the truthful answer is SUCCESS with hitNum=0 (matches the
+// sibling s_npent_addcont_list). CONFIDENCE: MED (no-DLC hitNum=0 is the retail answer; import inferred).
+HLE(s_appcontent_addcont_list) {
+    if (!svc_ptrish(a3)) return 0x80D90002ull;   // APP_CONTENT_ERROR_PARAMETER
+    *(uint32_t*)PW(a3) = 0;                       // hitNum = 0: no add-content installed
+    return 0;
+}
+// GetAddcontInfo / GetEntitlementKey / AddcontMount for an unknown label: no entitlement (offline, no DLC).
+HLE(s_appcontent_no_entitlement) { return 0x80D90007ull; }   // APP_CONTENT_ERROR_DRM_NO_ENTITLEMENT
+
 // sceSystemServiceParamGetString(paramId, char* buf, size_t bufSize): fetch a system string parameter
 // (e.g. the console/user nickname). The default unimplemented stub returned 0 (SUCCESS) but never wrote
 // the buffer, so the game read whatever uninitialized bytes were there as a "valid" string and derefed
@@ -949,6 +963,11 @@ void register_service_hle() {
     Hle::register_fn("buYbeLOGWmA", (HleFn)s_appcontent_tmpmount2, "sceAppContentTemporaryDataMount2");
     Hle::register_fn("SaKib2Ug0yI", (HleFn)s_appcontent_tmpspace, "sceAppContentTemporaryDataGetAvailableSpaceKb");
     Hle::register_fn("bcolXMmp6qQ", (HleFn)s_ok,                  "sceAppContentTemporaryDataUnmount");
+    // add-content (DLC) enumeration — no-DLC truth (hitNum=0 / no-entitlement), NOT garbage-count OOM (#213 class)
+    Hle::register_fn("xnd8BJzAxmk", (HleFn)s_appcontent_addcont_list,   "sceAppContentGetAddcontInfoList");
+    Hle::register_fn("m47juOmH0VE", (HleFn)s_appcontent_no_entitlement, "sceAppContentGetAddcontInfo");
+    Hle::register_fn("XTWR0UXvcgs", (HleFn)s_appcontent_no_entitlement, "sceAppContentGetEntitlementKey");
+    Hle::register_fn("VANhIWcqYak", (HleFn)s_appcontent_no_entitlement, "sceAppContentAddcontMount");
     R("sceCommonDialogInitialize", s_ok);
     R("sceSystemServiceParamGetInt", s_syss_param_int);   // language-aware (US English default), not blanket 0
     // sceSystemServiceParamGetString (SsC-m-S9JTA): write a valid empty string (not an unfilled buffer).
