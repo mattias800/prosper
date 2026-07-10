@@ -109,6 +109,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_ajm PRIVATE prosper_core)
   add_test(NAME ajm_hle COMMAND test_ajm)
 
+  add_executable(test_avplayer tests/test_avplayer.cpp)
+  target_link_libraries(test_avplayer PRIVATE prosper_core)
+  add_test(NAME avplayer_hle COMMAND test_avplayer)
+
   add_executable(test_equeue_events tests/test_equeue_events.cpp)
   target_link_libraries(test_equeue_events PRIVATE prosper_core)
   add_test(NAME equeue_events COMMAND test_equeue_events)

@@ -90,6 +90,13 @@ HLE(s_ok)             { return 0; }
 // NULL handle from a stubbed InitEx. No decode needed to progress; the game's while(IsActive) frame
 // loop simply doesn't run (or ends at once) and it moves on.
 HLE(s_avplayer_init)     { return g_handle.fetch_add(1); }   // non-NULL SceAvPlayerHandle
+// sceAvPlayerInitEx(const SceAvPlayerInitDataEx* data, SceAvPlayerHandle* out) has a DIFFERENT ABI from
+// sceAvPlayerInit: it returns an int32 ERROR CODE (0 = success) and writes the handle to the *out*
+// param — it does NOT return the handle. Registering it to s_avplayer_init (return-the-handle) makes the
+// game read a non-zero handle as an error code: The Messenger-family PS5VideoPlayback wrapper logs
+// "[PS5VideoPlayback] ERROR: sceAvPlayerInitEx() failed" and aborts the intro video (live-captured;
+// PPSA02664). Return 0 and write a valid non-NULL handle to a1. CONFIDENCE: HIGH (live guest error log).
+HLE(s_avplayer_initex)   { if (a1) *(uint64_t*)PW(a1) = g_handle.fetch_add(1); return 0; }
 HLE(s_avplayer_isactive) { return 0; }                       // 0 = not active -> stream done -> proceed
 // sceUserServiceGetGamePresets(userId, presets): MUST return success (0). The Unity engine's
 // per-controller connection check (eboot 0x14707e0, reached from the pad "reset" path 0x1470ca0)
@@ -940,7 +947,7 @@ void register_service_hle() {
     // libSceAvPlayer (#324): let a post-credits / intro video complete so the game reaches its scene.
     // Init/InitEx must return a non-NULL handle; IsActive must report finished; the rest succeed as no-ops.
     R("sceAvPlayerInit",           s_avplayer_init);
-    R("sceAvPlayerInitEx",         s_avplayer_init);
+    R("sceAvPlayerInitEx",         s_avplayer_initex);
     R("sceAvPlayerPostInit",       s_ok);
     R("sceAvPlayerSetLogCallback", s_ok);
     R("sceAvPlayerAddSource",      s_ok);
