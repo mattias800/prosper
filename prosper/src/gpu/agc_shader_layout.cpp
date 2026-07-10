@@ -142,17 +142,44 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
 
     uint32_t binding = 0;
 
+    // Extended User Data (EUD): descriptors whose offset_dw is beyond the user-SGPR block live in a guest
+    // memory spill area. Its base pointer sits in the user SGPR named by direct_resource_offset[5] (usage
+    // type 5) — confirmed against the shader's own `s_load_dwordx4 sX, s[EUD:EUD+1], <off>`. A sharp at
+    // offset_dw >= num_user_sgprs is at EUD_base + (offset_dw - num_user_sgprs)*4, and the shader loads it
+    // with exactly that immediate — so its recompiler provenance key (srt_offset) is (off-nsgpr)*4, which
+    // the s_load-tracked s_buffer_load resolves via by_srt_offset. This is why the game's TEXT was invisible:
+    // its pixel shader's colour constant buffers are EUD-resident (offset_dw 40/44) and were being skipped,
+    // so the text colour read as (0,0,0,0) = transparent black. #257.
+    uint64_t eud_base = 0;
+    if (const uint16_t* dro = ud->direct_resource_offset)
+        if (ud->direct_resource_count > 5 && dro[5] != 0xffff && (uint64_t)dro[5] + 2 <= num_user_sgprs) {
+            uint64_t p = (uint64_t)user_sgprs[dro[5]] | ((uint64_t)user_sgprs[dro[5] + 1] << 32);
+            if (p > 0x10000 && p < 0x0000800000000000ull) eud_base = p;   // plausible guest pointer
+        }
+    // Fetch a sharp's N descriptor dwords from either the SGPR block or the EUD; returns the srt_offset
+    // provenance key (or UINT32_MAX if unreadable). Keeps the in-SGPR path byte-identical.
+    auto load_sharp = [&](uint32_t off, uint32_t n, uint32_t* buf) -> uint32_t {
+        if ((uint64_t)off + n <= num_user_sgprs) {
+            for (uint32_t i = 0; i < n; i++) buf[i] = user_sgprs[off + i];
+            return off * 4;                                   // byte offset within user_data
+        }
+        if (!eud_base) return 0xFFFFFFFFu;
+        const uint32_t* src = (const uint32_t*)(uintptr_t)(eud_base + (uint64_t)(off - num_user_sgprs) * 4);
+        for (uint32_t i = 0; i < n; i++) buf[i] = src[i];
+        return (off - num_user_sgprs) * 4;                    // matches the shader's s_load immediate
+    };
+
     // Constant buffers: sharp_resource_offset[3] (storage-as-constant). Each slot's offset_dw points at
-    // a 4-dword V# in the user-data SGPR block. srt_offset = the descriptor's byte offset within
-    // user_data (offset_dw * 4) — the recompiler's provenance key.
+    // a 4-dword V# in the user-data SGPR block OR the EUD (see above).
     const AgcShaderSharp* cbufs = ud->sharp_resource_offset[3];
     if (cbufs) {
         for (uint16_t slot = 0; slot < ud->sharp_resource_count[3]; slot++) {
             const AgcShaderSharp& s = cbufs[slot];
             if (s.empty()) continue;
             uint32_t off = s.offset_dw();
-            if ((uint64_t)off + 4 > num_user_sgprs) continue;   // descriptor must fit in the SGPR block
-            DecodedBufferDescriptor d = decode_buffer_descriptor(&user_sgprs[off]);
+            uint32_t vv[4]; uint32_t srt = load_sharp(off, 4, vv);
+            if (srt == 0xFFFFFFFFu) continue;                 // unreadable (EUD absent / out of block)
+            DecodedBufferDescriptor d = decode_buffer_descriptor(vv);
             ShaderResource r;
             r.cls            = ResourceClass::ConstantBuffer;
             r.format         = d.format;
@@ -161,7 +188,7 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             r.gpu_addr       = d.base;
             r.size           = d.size_bytes;
             r.stride         = d.stride;
-            r.srt_offset     = off * 4;                 // byte offset within user_data (indirect path)
+            r.srt_offset     = srt;                     // byte offset within user_data / EUD (indirect path)
             r.sgpr_base      = user_sgpr_base + off;    // the shader SGPR holding this V# (s_buffer_load SBASE)
             table.resources.push_back(r);
         }
