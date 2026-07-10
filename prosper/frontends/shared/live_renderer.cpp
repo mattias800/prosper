@@ -365,12 +365,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 }
             }
             int n = frame_no++;
+            // PROSPER_DUMP_CONTENT=<min-nonzero-bytes>: dump ONLY frames whose framebuffer has at least
+            // that many nonzero bytes — catches the intermittent content submits the periodic dump misses.
+            size_t content_thr = 0; if (const char* c = getenv("PROSPER_DUMP_CONTENT")) content_thr = (size_t)atol(c);
+            size_t px_nz = 0; if (content_thr) for (size_t i = 0; i < px.size(); i++) px_nz += (px[i] != 0);
             if (px.empty()) {
                 fprintf(stderr, "[render] frame %d: Vulkan render FAILED (%ux%u)\n", n, w, h);
-            } else if (dump_bmps && (n < 60 || n % 10 == 0)) {   // periodic screenshots (headless verification only)
+            } else if (dump_bmps && ((content_thr && px_nz >= content_thr) || (!content_thr && (n < 60 || n % 10 == 0)))) {
                 char fn[512]; snprintf(fn, sizeof fn, "%s/frame_%04d.bmp", frame_dir.c_str(), n);
                 prosper::test::dump_bmp(fn, px, w, h);
-                fprintf(stderr, "[render] frame %d rendered (%ux%u) -> %s\n", n, w, h, fn);
+                fprintf(stderr, "[render] frame %d rendered (%ux%u) nz=%zu -> %s\n", n, w, h, px_nz, fn);
             }
             return px;
         });
