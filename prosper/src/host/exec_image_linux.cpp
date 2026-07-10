@@ -96,6 +96,16 @@ namespace {
     bool     g_watch_armed = false;
     bool     g_watch_stepping = false;
     volatile sig_atomic_t g_watch_hits = 0;
+    // #312 label-slot write watch (PROSPER_WATCH_LABEL=1): armed by the AGC fence builder on the
+    // first heap-resident 32-bit value-1 fence label; every write into the label's 0x20-byte block
+    // is logged with the writer's rip — distinguishing the game's allocator free-path (guest rip)
+    // from prosper's own fence writes (host rip), i.e. catching a write-after-free in the act.
+    uint64_t g_lwatch_slot = 0;
+    uint64_t g_lwatch_page = 0;
+    volatile sig_atomic_t g_lwatch_armed = 0;
+    bool     g_lwatch_stepping = false;
+    uint64_t g_lwatch_step_rip = 0;
+    volatile sig_atomic_t g_lwatch_hits = 0;
     // PROSPER_BP=0xOFFSET (guest image offset): int3 code-breakpoint that LOGS registers at each hit,
     // then steps over and re-arms. Diagnostic (never changes control flow). Used to enumerate the
     // GfxDevice drain (proved every category-{5,9,15,18,19} pipeline has a null [+0x140] companion).
@@ -392,6 +402,107 @@ namespace {
                     n = snprintf(b, sizeof b, "    %s[+0x%llx]@+0x%llx = <unmapped>\n", pfx,
                                  (unsigned long long)ps.pre[k], (unsigned long long)ps.off[k]);
                 syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
+            }
+        }
+    }
+
+    // GPU write-attribution ring scanner (src/gpu/command_processor.cpp). Weak: tools that link
+    // the host exec image without the gpu lib get a null and skip the scan.
+    extern "C" int prosper_gpu_write_ring_scan(uint64_t lo, uint64_t hi, char* out, size_t cap)
+        __attribute__((weak));
+
+    // Issue-#312 heap-corruption attribution dump, fired on the first PROSPER_NULL_PAGE hit (the
+    // deterministic precursor of DOLL's MallocBinned3 "Canary was 0x3" fatal: a read of address
+    // 0x1 at eboot+0x231012b — the game's free path following a corrupted free-block field).
+    // Dumps: the faulting instruction bytes, all GPRs, a 0x60-byte window of guest memory around
+    // every heap-pointer-looking register (the corrupted FFreeBlock header will be among them),
+    // and any recent GPU-performed writes (EOP/WRITE_DATA ring) near those addresses — the
+    // attribution question. Async-signal-safe: raw syscalls + probe_readable only.
+    void nullpage_deep_dump(ucontext_t* uc, uint64_t rip) {
+        char b[512]; int n;
+        // instruction bytes at rip (decode offline)
+        if (probe_readable(rip)) {
+            const uint8_t* p = (const uint8_t*)(uintptr_t)rip;
+            n = snprintf(b, sizeof b, "[nullpage]   insn @rip:"
+                         " %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                         p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15]);
+            syscall(SYS_write, 2, b, (size_t)n);
+        }
+        auto& g = uc->uc_mcontext.gregs;
+        const struct { const char* nm; uint64_t v; } regs[] = {
+            {"rax", (uint64_t)g[REG_RAX]}, {"rbx", (uint64_t)g[REG_RBX]},
+            {"rcx", (uint64_t)g[REG_RCX]}, {"rdx", (uint64_t)g[REG_RDX]},
+            {"rsi", (uint64_t)g[REG_RSI]}, {"rdi", (uint64_t)g[REG_RDI]},
+            {"rbp", (uint64_t)g[REG_RBP]}, {"rsp", (uint64_t)g[REG_RSP]},
+            {"r8 ", (uint64_t)g[REG_R8]},  {"r9 ", (uint64_t)g[REG_R9]},
+            {"r10", (uint64_t)g[REG_R10]}, {"r11", (uint64_t)g[REG_R11]},
+            {"r12", (uint64_t)g[REG_R12]}, {"r13", (uint64_t)g[REG_R13]},
+            {"r14", (uint64_t)g[REG_R14]}, {"r15", (uint64_t)g[REG_R15]},
+        };
+        n = 0;
+        for (int i = 0; i < 16; i++) {
+            n += snprintf(b + n, sizeof b - (size_t)n, "%s%s=0x%llx", (i % 4) ? " " : "[nullpage]   ",
+                          regs[i].nm, (unsigned long long)regs[i].v);
+            if (i % 4 == 3) { b[n++] = '\n'; syscall(SYS_write, 2, b, (size_t)n); n = 0; }
+        }
+        for (int i = 0; i < 16; i++) {
+            uint64_t v = regs[i].v;
+            if (v < 0x10000 || !probe_readable(v)) continue;
+            // rbp: the canary-walk keeps its locals at rbp-0x78..-0x48 (pool-table ptr, chain
+            // heads) — start the window at rbp-0x80 so they're captured.
+            uint64_t base = (v & ~0xfull) - (i == 6 /*rbp*/ ? 0x80 : 0x20);
+            if (!probe_readable(base)) base = v & ~0xfull;
+            int nw = (i == 6) ? 20 : 12;
+            n = snprintf(b, sizeof b, "[nullpage]   %s=0x%llx mem@0x%llx:", regs[i].nm,
+                         (unsigned long long)v, (unsigned long long)base);
+            for (int w = 0; w < nw; w++) {
+                uint64_t addr = base + (uint64_t)w * 8;
+                if (probe_readable(addr))
+                    n += snprintf(b + n, sizeof b - (size_t)n, " %016llx",
+                                  (unsigned long long)*(const uint64_t*)addr);
+                else
+                    n += snprintf(b + n, sizeof b - (size_t)n, " ????????????????");
+            }
+            n += snprintf(b + n, sizeof b - (size_t)n, "\n");
+            syscall(SYS_write, 2, b, (size_t)n);
+            // Corrupted-header hunt: the canary walk faulted following a NextFreeBlock == 0x1, so
+            // the stomped FFreeBlock header is a qword equal to 0x1 somewhere in the current slab
+            // (a 64 KiB-aligned guest-heap register, r13 in the observed walk). Scan the slab for
+            // qword==1 candidates, dump each header, and tight-match the GPU write ring at exactly
+            // that address — if the ring has a 4-byte value-1 write there, OUR ReleaseMem stomped it.
+            if (v >= 0x1000000000ull && v < 0x1200000000ull && (v & 0xffff) == 0) {
+                // Slab-wide ring scan first (the corrupted header may no longer read as ==1 by
+                // dump time — the walk pops nodes as it goes), then the qword==1 candidates.
+                if (prosper_gpu_write_ring_scan) {
+                    static char slab_out[16384];
+                    if (prosper_gpu_write_ring_scan(v, v + 0x10000, slab_out, sizeof slab_out) > 0)
+                        syscall(SYS_write, 2, slab_out, strlen(slab_out));
+                }
+                int hits = 0;
+                for (uint64_t o = 0; o < 0x10000 && hits < 24; o += 8) {
+                    uint64_t addr = v + o;
+                    if (!probe_readable(addr)) break;
+                    if (*(const uint64_t*)addr != 0x1ull) continue;
+                    hits++;
+                    const uint64_t* q = (const uint64_t*)(addr - 8);
+                    n = snprintf(b, sizeof b,
+                                 "[nullpage]   slab+0x%04llx qword==1 @0x%llx: [-8]=%016llx [0]=%016llx [+8]=%016llx [+10]=%016llx\n",
+                                 (unsigned long long)o, (unsigned long long)addr,
+                                 (unsigned long long)q[0], (unsigned long long)q[1],
+                                 (unsigned long long)q[2], (unsigned long long)q[3]);
+                    syscall(SYS_write, 2, b, (size_t)n);
+                    if (prosper_gpu_write_ring_scan) {
+                        static char hit_out[1024];
+                        if (prosper_gpu_write_ring_scan(addr - 8, addr + 16, hit_out, sizeof hit_out) > 0)
+                            syscall(SYS_write, 2, hit_out, strlen(hit_out));
+                    }
+                }
+            } else if (prosper_gpu_write_ring_scan) {
+                // recent GPU writes near this register's address (attribution ring, gpu lib; weak —
+                // tools that link exec_image without the gpu lib simply skip this)
+                static char ring_out[4096];
+                if (prosper_gpu_write_ring_scan(v - 0x100, v + 0x100, ring_out, sizeof ring_out) > 0)
+                    syscall(SYS_write, 2, ring_out, strlen(ring_out));
             }
         }
     }
@@ -860,6 +971,56 @@ namespace {
                 return;
             }
         }
+        // #312 label-slot watch: SIGTRAP after single-stepping a write to the watched label page —
+        // log the slot's post-write value, re-protect, keep watching.
+        if (sig == SIGTRAP && g_lwatch_stepping) {
+            auto* uc = (ucontext_t*)uctx;
+            uc->uc_mcontext.gregs[REG_EFL] &= ~0x100ll;   // clear TF
+            if (g_lwatch_step_rip) {   // the stepped write was inside the watched block: log post-value
+                char b[160];
+                int n = snprintf(b, sizeof b, "[lwatch]   -> slot now [0]=0x%llx [8]=0x%llx\n",
+                                 (unsigned long long)*(const uint64_t*)g_lwatch_slot,
+                                 (unsigned long long)*(const uint64_t*)(g_lwatch_slot + 8));
+                syscall(SYS_write, 2, b, (size_t)n);
+                g_lwatch_step_rip = 0;
+            }
+            if (g_lwatch_armed) mprotect((void*)g_lwatch_page, 0x1000, PROT_READ);
+            g_lwatch_stepping = false;
+            return;
+        }
+        // A write into the watched label page while armed: log writes that land in the label's
+        // 0x20-byte block (with pre-content + writer rip), then single-step past the write.
+        if (g_lwatch_armed && sig == SIGSEGV && si->si_addr) {
+            uint64_t fa = (uint64_t)si->si_addr;
+            auto* uc = (ucontext_t*)uctx;
+            if ((fa & ~(uint64_t)0xfff) == g_lwatch_page && (uc->uc_mcontext.gregs[REG_ERR] & 2)) {
+                uint64_t rip = (uint64_t)uc->uc_mcontext.gregs[REG_RIP];
+                g_lwatch_step_rip = 0;
+                if (fa >= g_lwatch_slot - 0x18 && fa < g_lwatch_slot + 0x20) {
+                    g_lwatch_hits = g_lwatch_hits + 1;
+                    char b[224];
+                    bool guest = rip >= 0x400000000ull && rip < 0x4c0000000ull;
+                    int n = snprintf(b, sizeof b,
+                        "[lwatch] #%d write fa=0x%llx rip=%s0x%llx tid=%ld pre[0]=0x%llx pre[8]=0x%llx\n",
+                        (int)g_lwatch_hits, (unsigned long long)fa,
+                        guest ? "eboot+" : "host:",
+                        (unsigned long long)(guest ? rip - 0x400000000ull : rip), cur_tid(),
+                        (unsigned long long)*(const uint64_t*)g_lwatch_slot,
+                        (unsigned long long)*(const uint64_t*)(g_lwatch_slot + 8));
+                    syscall(SYS_write, 2, b, (size_t)n);
+                    g_lwatch_step_rip = rip;
+                    if (g_lwatch_hits >= 400) {   // bounded: disarm after enough evidence
+                        mprotect((void*)g_lwatch_page, 0x1000, PROT_READ | PROT_WRITE);
+                        g_lwatch_armed = 0;
+                        return;
+                    }
+                }
+                mprotect((void*)g_lwatch_page, 0x1000, PROT_READ | PROT_WRITE);
+                uc->uc_mcontext.gregs[REG_EFL] |= 0x100ll;   // TF -> single-step the write
+                g_lwatch_stepping = true;
+                return;
+            }
+        }
         // Companion-slot write-watchpoint: SIGTRAP after single-stepping a write to the watched page —
         // re-arm (re-protect read-only) and clear the trap flag so we keep watching.
         if (sig == SIGTRAP && g_watch_stepping) {
@@ -1000,6 +1161,7 @@ namespace {
                                      (int)g_null_page_count, (unsigned long long)a,
                                      (unsigned long long)(rip - 0x400000000ull));
                     syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
+                    nullpage_deep_dump(uc, rip);   // issue-#312 attribution dump (registers + heap + GPU ring)
                     return;   // re-execute; the null read now sees zero
                 }
             }
@@ -1222,6 +1384,22 @@ bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
     return true;
 }
 
+// #312 label-slot write watch (PROSPER_WATCH_LABEL=1): called by the AGC fence builder with the
+// first heap-resident value-1 fence label address; protects the label's page and logs every write
+// into the label's block with the writer's rip (guest allocator free-path vs prosper fence write),
+// catching a write-after-free in the act. Diagnostic, one page, bounded to 400 logged hits.
+extern "C" void prosper_arm_label_watch(uint64_t addr) {
+    static const bool on = getenv("PROSPER_WATCH_LABEL") != nullptr;
+    if (!on || g_lwatch_armed || !addr) return;
+    g_lwatch_slot = addr;
+    g_lwatch_page = addr & ~(uint64_t)0xfff;
+    if (mprotect((void*)g_lwatch_page, 0x1000, PROT_READ) == 0) {
+        g_lwatch_armed = 1;
+        fprintf(stderr, "[lwatch] armed slot=0x%llx page=0x%llx\n",
+                (unsigned long long)addr, (unsigned long long)g_lwatch_page);
+    }
+}
+
 // Install a per-thread alternate signal stack so the fault handler can run even when the faulting
 // thread's own stack is exhausted (a guest stack overflow otherwise delivers SIGSEGV with no usable
 // stack -> the handler can't run -> the process cores uncatchably). Idempotent per thread. Worker
@@ -1253,7 +1431,7 @@ void install_trap_handler() {
     g_watch_companion = getenv("PROSPER_WATCH_COMPANION") != nullptr;
     if (const char* r = getenv("PROSPER_SKIP_RIP"))    g_skip_rip    = strtoull(r, nullptr, 0);
     if (const char* t = getenv("PROSPER_SKIP_TARGET")) g_skip_target = strtoull(t, nullptr, 0);
-    if (g_faultmem || g_skip_null_companion) ensure_probe_pipe();
+    if (g_faultmem || g_skip_null_companion || g_null_page) ensure_probe_pipe();
     // PROSPER_PEEK="r15:0x140,0x1a0;rbx:0x78,0x88;r15:*0x18+0x0" — N specs (';'), each reg:off[,off];
     // a '*pre+off' offset chases one pointer level ([[reg+pre]+off]). Parsed once (getenv unsafe at fault).
     if (const char* pk = getenv("PROSPER_PEEK")) {
@@ -1350,7 +1528,8 @@ void install_trap_handler() {
     sigaction(SIGSEGV, &sa, nullptr);
     sigaction(SIGBUS,  &sa, nullptr);
     sigaction(SIGILL,  &sa, nullptr);
-    if (g_watch_companion || g_bp_on || g_hwbp_on) sigaction(SIGTRAP, &sa, nullptr);   // single-step / breakpoint
+    if (g_watch_companion || g_bp_on || g_hwbp_on
+        || getenv("PROSPER_WATCH_LABEL")) sigaction(SIGTRAP, &sa, nullptr);   // single-step / breakpoint
 }
 
 // Write the 0xCC breakpoint into the (now-mapped) guest image. Call after the image load.

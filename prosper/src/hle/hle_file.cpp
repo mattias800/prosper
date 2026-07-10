@@ -12,6 +12,7 @@
 #include <cerrno>
 #include <string>
 #include <mutex>
+#include <atomic>        // sceKernelAio* submit-id/state table
 #include <map>
 #include <vector>
 #include <fcntl.h>
@@ -374,6 +375,89 @@ HLE(f_pwrite) { return (uint64_t)(int64_t)::pwrite((int)a0, P(a1), (size_t)a2, (
 HLE(f_pread)  { return (uint64_t)-1; }
 HLE(f_pwrite) { return (uint64_t)-1; }
 #endif
+
+// --- sceKernelAio* — the kernel async-IO command API (issue #312 suspect list). -----------------
+// PS4-inherited contract, reference shadPS4 core/libraries/kernel/aio.cpp (the PS5 3.20 libkernel
+// exports the IDENTICAL NID set — verified against ../PS5-3.20_Libs/libkernel.c). The kernel model
+// we implement (same as shadPS4): commands complete synchronously at submit — prosper's guest fds
+// ARE host fds, so each element performs a positioned read/write immediately; each request's
+// result out-struct {s64 returnValue; u32 state} is filled per element; *id receives a nonzero
+// submit id whose state Poll/Wait return; Delete/Cancel write their out-params and recycle the id.
+// The previous unimplemented stubs returned 0 WITHOUT writing *id, *state, or any result — the
+// guest (DOLL's SaveLoadUpdate worker submits its GameSaveData writes here; CRI FS submits movie
+// reads) then consumed uninitialized ids and poll states. DOLL calls the singular variants; the
+// plural/Multiple ones are registered to the same helpers where the ABI is element-wise.
+// AioSetParam is init-tuning (no out-params) -> honest success. CONFIDENCE: HIGH on the ABI
+// (shadPS4 + identical PS5 NIDs); MED on error constants (0x8002000e EFAULT, shadPS4's choice).
+namespace {
+constexpr uint64_t kAioErrFault = 0x8002000eull;             // SCE_KERNEL_ERROR_EFAULT
+enum : int32_t { kAioProcessing = 2, kAioCompleted = 3, kAioAborted = 4 };
+struct AioResult { int64_t return_value; uint32_t state; };
+struct AioReq { int64_t offset; int64_t nbyte; void* buf; AioResult* result; int32_t fd; };
+constexpr uint32_t kAioQueue = 512;                          // shadPS4 MAX_QUEUE
+std::atomic<int32_t> g_aio_state[kAioQueue];                 // id -> state (0 = never used)
+std::atomic<uint32_t> g_aio_next{1};
+uint64_t aio_submit(uint64_t reqs, int32_t n, bool is_write, uint64_t out_id) {
+    if (!reqs || !out_id) return kAioErrFault;
+    auto* req = (AioReq*)P(reqs);
+    uint32_t raw = g_aio_next.fetch_add(1) % kAioQueue;
+    if (!raw) raw = g_aio_next.fetch_add(1) % kAioQueue;     // id 0 is "no request"
+    int32_t id = (int32_t)raw;
+    g_aio_state[raw].store(kAioProcessing);
+    for (int32_t i = 0; i < n; i++) {
+        int64_t r;
+#ifndef _WIN32
+        r = is_write ? (int64_t)::pwrite(req[i].fd, req[i].buf, (size_t)req[i].nbyte, (off_t)req[i].offset)
+                     : read_full(req[i].fd, req[i].buf, (size_t)req[i].nbyte, true, (off_t)req[i].offset);
+#else
+        // Windows host (secondary): emulate positioned IO with lseek+read/write on the CRT fd.
+        long long prev = ::_lseeki64(req[i].fd, 0, SEEK_CUR);
+        ::_lseeki64(req[i].fd, req[i].offset, SEEK_SET);
+        r = is_write ? (int64_t)::_write(req[i].fd, req[i].buf, (unsigned)req[i].nbyte)
+                     : (int64_t)::_read(req[i].fd, req[i].buf, (unsigned)req[i].nbyte);
+        if (prev >= 0) ::_lseeki64(req[i].fd, prev, SEEK_SET);
+#endif
+        if (req[i].result) {
+            req[i].result->return_value = r;
+            req[i].result->state = (r < 0) ? kAioAborted : kAioCompleted;
+        }
+        if (filelog()) fprintf(stderr, "[file] aio-%s fd=%d off=0x%llx n=0x%llx -> %lld\n",
+                               is_write ? "write" : "read", req[i].fd,
+                               (unsigned long long)req[i].offset, (unsigned long long)req[i].nbyte,
+                               (long long)r);
+    }
+    g_aio_state[raw].store(kAioCompleted);
+    *(int32_t*)P(out_id) = id;
+    return 0;
+}
+}
+HLE(k_aio_init)         { return 0; }                        // InitializeImpl / InitializeParam / SetParam
+HLE(k_aio_submit_read)  { return aio_submit(a0, (int32_t)a1, false, a3); }   // (req[], n, prio, id*)
+HLE(k_aio_submit_write) { return aio_submit(a0, (int32_t)a1, true,  a3); }
+HLE(k_aio_wait)  {   // (id, s32* state, u32* usec) — everything completed at submit: report and return
+    if (!a1) return kAioErrFault;
+    *(int32_t*)P(a1) = g_aio_state[(uint32_t)a0 % kAioQueue].load();
+    return 0;
+}
+HLE(k_aio_poll)  {   // (id, s32* state)
+    if (!a1) return kAioErrFault;
+    *(int32_t*)P(a1) = g_aio_state[(uint32_t)a0 % kAioQueue].load();
+    return 0;
+}
+HLE(k_aio_delete) {  // (id, s32* ret)
+    if (!a1) return kAioErrFault;
+    g_aio_state[(uint32_t)a0 % kAioQueue].store(kAioAborted);
+    *(int32_t*)P(a1) = 0;
+    return 0;
+}
+HLE(k_aio_cancel) {  // (id, s32* state): nothing is in flight to cancel — report current/aborted
+    if (!a1) return kAioErrFault;
+    if (a0) { g_aio_state[(uint32_t)a0 % kAioQueue].store(kAioAborted);
+              *(int32_t*)P(a1) = kAioAborted; }
+    else    *(int32_t*)P(a1) = kAioProcessing;   // shadPS4: id 0 -> "processing"
+    return 0;
+}
+
 #ifndef _WIN32
 HLE(f_stat)  { std::string h = translate(CS(a0)); struct stat st; int r = ::stat(h.c_str(), &st); if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
 HLE(f_fstat) { struct stat st; int r = ::fstat((int)a0, &st); if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
@@ -979,6 +1063,17 @@ void register_file_hle() {
     R("rmdir", f_rmdir);          R("sceKernelRmdir", f_rmdir);
     R("unlink", f_unlink);        R("sceKernelUnlink", f_unlink);
     R("sceKernelGetdents", f_getdents); R("getdents", f_getdents);
+    // sceKernelAio* (issue #312): NIDs verified identical in shadPS4's PS4 registration table and
+    // the PS5 3.20 libkernel stub dump. Raw-NID registration (names not in our NidDb).
+    Hle::register_fn("vYU8P9Td2Zo", (HleFn)k_aio_init,         "sceKernelAioInitializeImpl");
+    Hle::register_fn("nu4a0-arQis", (HleFn)k_aio_init,         "sceKernelAioInitializeParam");
+    Hle::register_fn("9WK-vhNXimw", (HleFn)k_aio_init,         "sceKernelAioSetParam");
+    Hle::register_fn("HgX7+AORI58", (HleFn)k_aio_submit_read,  "sceKernelAioSubmitReadCommands");
+    Hle::register_fn("XQ8C8y+de+E", (HleFn)k_aio_submit_write, "sceKernelAioSubmitWriteCommands");
+    Hle::register_fn("KOF-oJbQVvc", (HleFn)k_aio_wait,         "sceKernelAioWaitRequest");
+    Hle::register_fn("2pOuoWoCxdk", (HleFn)k_aio_poll,         "sceKernelAioPollRequest");
+    Hle::register_fn("5TgME6AYty4", (HleFn)k_aio_delete,       "sceKernelAioDeleteRequest");
+    Hle::register_fn("fR521KIGgb8", (HleFn)k_aio_cancel,       "sceKernelAioCancelRequest");
     R("sceKernelAprResolveFilepathsToIdsAndFileSizes", f_apr_resolve);   // real APR resolve (was EINVAL)
     // libSceAmpr sceAmprAprCommandBufferReadFile (NID name recovered by brute-force). The Linux
     // entry is an asm shim that snapshots rsp so the handler can read the stack args (arg7 = file
