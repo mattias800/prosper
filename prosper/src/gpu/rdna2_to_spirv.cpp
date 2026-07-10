@@ -1921,12 +1921,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     rs.scc = b.bsel(k1, b.btrue(), k2); break;
                 }
                 // s_min/max (0x06 min_i32, 0x07 min_u32, 0x08 max_i32, 0x09 max_u32): SCC = "src0 was
-                // selected" (S0<S1 for min, S0>S1 for max — RDNA2 ISA). Round-trip llvm-mc gfx1010:
+                // selected". The RDNA2 ISA min/max SCC split is intentionally ASYMMETRIC so a min/max
+                // pair partitions ties consistently: S_MIN uses strict `S0 < S1`, S_MAX uses non-strict
+                // `S0 >= S1` (S_MAX_I32: D=(S0>=S1)?S0:S1, SCC=(S0>=S1)). Using strict `>` for max set
+                // SCC=0 on exact-equality operands where hardware sets 1 (#397) — D is unaffected (SMax
+                // returns the equal value either way), so it was purely an SCC-flag defect that could
+                // mis-step a downstream s_cbranch_scc/s_cselect on a tie. Round-trip llvm-mc gfx1010:
                 // 0x83000201/0x83800201/0x84000201/0x84800201. CONFIDENCE: HIGH.
-                case 0x06: rs.scc = b.scmp(Op_SLessThan, a, c);    d = b.sext2(Glsl_SMin, a, c); break;
-                case 0x07: rs.scc = b.ucmp(Op_ULessThan, a, c);    d = b.uext2(Glsl_UMin, a, c); break;
-                case 0x08: rs.scc = b.scmp(Op_SGreaterThan, a, c); d = b.sext2(Glsl_SMax, a, c); break;
-                case 0x09: rs.scc = b.ucmp(Op_UGreaterThan, a, c); d = b.uext2(Glsl_UMax, a, c); break;
+                case 0x06: rs.scc = b.scmp(Op_SLessThan, a, c);         d = b.sext2(Glsl_SMin, a, c); break;
+                case 0x07: rs.scc = b.ucmp(Op_ULessThan, a, c);         d = b.uext2(Glsl_UMin, a, c); break;
+                case 0x08: rs.scc = b.scmp(Op_SGreaterThanEqual, a, c); d = b.sext2(Glsl_SMax, a, c); break;
+                case 0x09: rs.scc = b.ucmp(Op_UGreaterThanEqual, a, c); d = b.uext2(Glsl_UMax, a, c); break;
                 case 0x0A: d = b.sel(rs.scc, a, c); break;           // s_cselect_b32: SCC ? src0 : src1
                 case 0x0E: d = b.ibin(Op_BitwiseAnd, a, c); scc_nz(d); break;   // s_and_b32
                 case 0x10: d = b.ibin(Op_BitwiseOr,  a, c); scc_nz(d); break;   // s_or_b32

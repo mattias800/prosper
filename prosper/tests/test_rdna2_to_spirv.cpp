@@ -1496,6 +1496,21 @@ int main() {
     }
     CHECK(gotT5.size()==N && badT5==0, "T5: s_min_u32(7,3)=3 + s_max_i32(-2,5)=5");
 
+    // Kernel T5b (#397): s_max SCC on a TIE. s_max_i32 s2,5,5 -> SCC=(5>=5)=1 per RDNA2 ISA (the
+    // asymmetric min/max split: min uses strict `<`, max uses non-strict `>=`). s_cselect_b32 s3 =
+    // SCC ? 11 : 4, then v1 = a0 + s3. Locks SCC=1 on equality: out bits = bits(a0) + 11. The old
+    // strict `>` set SCC=0 on the tie -> s3=4 -> bits(a0)+4, which this catches. (llvm-mc gfx1010.)
+    const uint32_t codeT5b[] = { 0x84028585u, 0x8503848bu, 0x4a020003u, 0xBF810000u };
+    std::vector<uint32_t> spvT5b = recompile_valu(codeT5b, sizeof(codeT5b)/4, 1, 1);
+    CHECK(!spvT5b.empty(), "recompiled T5b (s_max_i32 SCC on a tie + s_cselect) -> SPIR-V");
+    std::vector<float> gotT5b = prosper::test::run_compute(spvT5b, inX, N, N);
+    uint32_t badT5b = 0;
+    for (uint32_t i = 0; i < N && gotT5b.size() == N; i++) {
+        uint32_t gb; std::memcpy(&gb, &gotT5b[i], 4);
+        if (gb != bits_of(inX[i]) + 11u) badT5b++;
+    }
+    CHECK(gotT5b.size()==N && badT5b==0, "T5b: s_max_i32(5,5) sets SCC=1 (>=), s_cselect picks 11 not 4");
+
     // Kernel T6: s_add_u32 carry chain -> s_addc_u32. s0=-1+2 (carry SCC=1); s1=0+0+SCC=1.
     // out bits = bits(a0) + 1.
     const uint32_t codeT6[] = { 0x800082c1u, 0x82018080u, 0x4a020001u, 0xBF810000u };
