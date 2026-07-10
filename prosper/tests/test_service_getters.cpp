@@ -7,6 +7,7 @@
 #include "../src/hle/nid.hpp"
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
 
 using namespace prosper;
 
@@ -70,6 +71,65 @@ int main() {
             close(0,0,0,0,0,0);
             CHECK(status(0,0,0,0,0,0) == 0, "after Close -> back to NONE(0)");
         }
+    }
+
+    // SystemService / AppContent / NP getters: each must WRITE its out-param with the CORRECT value —
+    // returning success with an unfilled (or wrong-valued) out is the harmful-stub class whose downstream
+    // effects are hard to trace (a 0.0 safe-area ratio collapses the viewport; lang 0 localizes to
+    // Japanese; NP state SIGNED_IN would send an offline title into network flows). These handlers carry
+    // careful fixes but had no test locking them; this does.
+    {
+        // sceSystemServiceParamGetInt(paramId=LANG(1), int* out) -> en-US(1), not Japanese(0).
+        if (HleFn f = Hle::lookup(nid_hash("sceSystemServiceParamGetInt"))) {
+            int32_t out = (int32_t)0xDEAD; f(1 /*LANG*/, (uint64_t)(uintptr_t)&out, 0, 0, 0, 0);
+            CHECK(out == 1, "ParamGetInt(LANG) -> en-US(1), not the uninitialized/Japanese default");
+        } else CHECK(false, "sceSystemServiceParamGetInt registered");
+
+        // sceSystemServiceGetStatus(status*) -> fills 12 bytes, byte[6] (isCpuMode7CpuNormal)=1, and
+        // MUST NOT write past 12 (the oversized-write class — cf. the pad-overflow crash).
+        if (HleFn f = Hle::lookup(nid_hash("sceSystemServiceGetStatus"))) {
+            uint8_t buf[16]; memset(buf, 0xAB, sizeof buf);
+            f((uint64_t)(uintptr_t)buf, 0, 0, 0, 0, 0);
+            bool body_ok = true; for (int i = 0; i < 12; i++) if (buf[i] != (i == 6 ? 1 : 0)) body_ok = false;
+            CHECK(body_ok, "GetStatus fills 12 bytes (byte6=isCpuMode7CpuNormal=1, rest 0)");
+            CHECK(buf[12] == 0xAB && buf[15] == 0xAB, "GetStatus does NOT write past its 12-byte struct");
+        } else CHECK(false, "sceSystemServiceGetStatus registered");
+
+        // sceSystemServiceGetDisplaySafeAreaInfo(info*) -> ratio=1.0 (a 0.0 ratio collapses the viewport).
+        if (HleFn f = Hle::lookup("1n37q1Bvc5Y")) {
+            uint8_t buf[132]; memset(buf, 0xAB, sizeof buf);
+            f((uint64_t)(uintptr_t)buf, 0, 0, 0, 0, 0);
+            float ratio; memcpy(&ratio, buf, 4);
+            CHECK(ratio == 1.0f, "GetDisplaySafeAreaInfo -> ratio 1.0 (full display, no viewport collapse)");
+        } else CHECK(false, "sceSystemServiceGetDisplaySafeAreaInfo registered");
+
+        // sceAppContentTemporaryDataMount2(opt, char mp[16]) -> exactly "/temp0\0" (7 bytes), never 16.
+        if (HleFn f = Hle::lookup("buYbeLOGWmA")) {
+            char mp[16]; memset(mp, 0xAB, sizeof mp);
+            f(0, (uint64_t)(uintptr_t)mp, 0, 0, 0, 0);
+            CHECK(memcmp(mp, "/temp0\0", 7) == 0, "TemporaryDataMount2 writes \"/temp0\\0\" (game builds paths from it)");
+            CHECK((uint8_t)mp[7] == 0xAB, "TemporaryDataMount2 writes exactly 7 bytes, not the full 16");
+        } else CHECK(false, "sceAppContentTemporaryDataMount2 registered");
+
+        // sceAppContentTemporaryDataGetAvailableSpaceKb(mp, uint64_t* kb) -> nonzero free (1 GiB).
+        if (HleFn f = Hle::lookup("SaKib2Ug0yI")) {
+            uint64_t kb = 0xDEAD; f(0, (uint64_t)(uintptr_t)&kb, 0, 0, 0, 0);
+            CHECK(kb == 1048576ull, "TemporaryDataGetAvailableSpaceKb -> 1 GiB free (not uninitialized)");
+        } else CHECK(false, "sceAppContentTemporaryDataGetAvailableSpaceKb registered");
+
+        // sceNpGetState(userId, SceNpState* out) -> SIGNED_OUT(1). SIGNED_IN would push an offline title
+        // into network flows that never complete.
+        if (HleFn f = Hle::lookup(nid_hash("sceNpGetState"))) {
+            int32_t st = (int32_t)0xDEAD; f(1, (uint64_t)(uintptr_t)&st, 0, 0, 0, 0);
+            CHECK(st == 1, "sceNpGetState -> SIGNED_OUT(1), written (offline)");
+        } else CHECK(false, "sceNpGetState registered");
+
+        // sceNpGetAccountIdA(userId, uint64_t* out) -> signed-out error AND a written 0 (no stale id).
+        if (HleFn f = Hle::lookup(nid_hash("sceNpGetAccountIdA"))) {
+            uint64_t id = 0xDEAD; uint64_t r = f(1, (uint64_t)(uintptr_t)&id, 0, 0, 0, 0);
+            CHECK(r != 0, "sceNpGetAccountIdA -> signed-out error (not spurious success)");
+            CHECK(id == 0, "sceNpGetAccountIdA writes 0 to the account-id out (no uninitialized id)");
+        } else CHECK(false, "sceNpGetAccountIdA registered");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
