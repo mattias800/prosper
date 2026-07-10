@@ -94,6 +94,32 @@ int main() {
     }
     CHECK(spans_ok, "all packet lengths/payload spans are in-bounds");
 
+    // #401: sceAgcCbNop(dcb, 1) must NOT underflow the type-3 length field (num-2 == 0x3fff) and
+    // mis-frame the whole submit. A 1-dword pad is emitted as a PM4 TYPE-2 filler (0x80000000) that
+    // the decoder skips, so a real packet placed AFTER a 1-dword NOP still decodes — before the fix
+    // the malformed 0x4001-dword header swallowed or truncated everything after it.
+    {
+        auto nop = Hle::lookup("LtTouSCZjHM");   // sceAgcCbNop
+        CHECK(nop, "sceAgcCbNop registered");
+        uint32_t buf2[64]; memset(buf2, 0, sizeof buf2);
+        Dcb d2{}; d2.bottom = buf2; d2.top = buf2 + 64; d2.cursor_up = buf2; d2.cursor_down = buf2 + 64;
+        auto D2 = (uint64_t)(uintptr_t)&d2;
+        uint64_t np = nop(D2, /*num_dwords*/ 1, 0, 0, 0, 0);
+        CHECK(np && *(const uint32_t*)(uintptr_t)np == 0x80000000u,
+              "cb_nop(1) emits a 1-dword PM4 type-2 filler (0x80000000), not an underflowed type-3 header");
+        CHECK((size_t)(d2.cursor_up - d2.bottom) == 1, "cb_nop(1) advanced the cursor by exactly 1 dword");
+        draw(D2, /*index_count*/ 0x0055, 0, 0, 0, 0);   // a real packet AFTER the 1-dword NOP
+        std::vector<Pm4Command> ops2;
+        decode_pm4(buf2, 64, ops2);
+        CHECK(ops2.size() == 1 && ops2[0].kind == K::DrawIndexAuto && ops2[0].index_count == 0x0055,
+              "the type-2 filler is skipped and the draw after a 1-dword NOP still decodes (fold intact)");
+        // A normal multi-dword NOP still frames as one type-3 packet (regression guard).
+        uint32_t buf3[64]; memset(buf3, 0, sizeof buf3);
+        Dcb d3{}; d3.bottom = buf3; d3.top = buf3 + 64; d3.cursor_up = buf3; d3.cursor_down = buf3 + 64;
+        nop((uint64_t)(uintptr_t)&d3, /*num_dwords*/ 4, 0, 0, 0, 0);
+        CHECK((size_t)(d3.cursor_up - d3.bottom) == 4, "cb_nop(4) reserves 4 dwords (type-3 NOP unchanged)");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

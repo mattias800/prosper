@@ -20,7 +20,16 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
     size_t i = 0;
     while (i < dwords) {
         uint32_t h = buf[i];
-        if (!is_type3(h)) break;                       // not a packet -> stop (pad/garbage)
+        if (!is_type3(h)) {
+            // PM4 TYPE-2 (bits[31:30] == 0b10, e.g. 0x80000000) is a single-dword filler NOP — the CP
+            // skips it and keeps executing. sceAgcCbNop(dcb, 1) emits one (a 1-dword pad cannot be a
+            // type-3 packet, whose minimum is 2 dwords). Skip it and continue rather than ending the
+            // walk, so a 1-dword pad does not truncate the rest of the submit (#401). Any OTHER
+            // non-type-3 dword (type-0 register writes we never emit, zero padding, garbage) still
+            // ends the walk as before.
+            if ((h & 0xC0000000u) == 0x80000000u) { i += 1; continue; }
+            break;                                     // not a packet -> stop (pad/garbage)
+        }
         uint32_t len = hdr_len(h);
         if (len == 0 || i + len > dwords) break;        // truncated packet -> stop
 
