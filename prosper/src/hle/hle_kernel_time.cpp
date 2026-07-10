@@ -1002,12 +1002,12 @@ void register_kernel_time_hle() {
     R("sceSysmoduleIsLoaded", k_ok);
     R("sceKernelLoadStartModule", k_load_start_mod);
     R("sceKernelStopUnloadModule", k_ok);
-    // thread scheduling hints — safe no-ops
-    R("scePthreadSetaffinity", k_ok);
-    R("scePthreadGetaffinity", k_ok);
-    R("scePthreadSetprio", k_ok);
-    R("scePthreadGetprio", k_ok);
-    R("scePthreadSetschedparam", k_ok);
+    // Thread scheduling: Set*/Get* are registered in hle_kernel.cpp, where the Get* handlers FILL
+    // their out-params (affinity mask 0xff, priority 700) — a Get* that returns success without
+    // writing hands the caller uninitialized stack memory. register_kernel_time_hle() runs AFTER
+    // register_kernel_hle(), so re-registering scePthreadGet{affinity,prio} to a bare k_ok here
+    // (last-write-wins) SILENTLY re-broke exactly that fix. Only scePthreadRename is unique to this
+    // file; leave the scheduling functions to hle_kernel.cpp.
     R("scePthreadRename", k_ok);
     R("sceKernelUuidCreate", k_uuid_create);
     R("_exit", k_exit);
