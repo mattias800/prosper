@@ -8,7 +8,10 @@ namespace prosper::gpu {
 
 VkTopology vk_topology(uint32_t prim_type) {
     // RDNA2 VGT_DI_PRIMITIVE_TYPE (kPrimitiveType*): 1=point, 2=line list, 3=line strip,
-    // 4=triangle list, 5=triangle fan, 6=triangle strip.
+    // 4=triangle list, 5=triangle fan, 6=triangle strip. RectList(17)/QuadList(19) are the
+    // screen-space primitives drivers emit for full-screen passes / fast clears / resolves;
+    // Kyty (GraphicsRender.cpp) approximates them as TriangleStrip / TriangleFan — far closer
+    // than the old PointList fallback, which rasterized a full-screen effect as 3 stray points.
     switch (prim_type) {
         case 1:  return VkTopology::PointList;
         case 2:  return VkTopology::LineList;
@@ -16,8 +19,25 @@ VkTopology vk_topology(uint32_t prim_type) {
         case 4:  return VkTopology::TriangleList;
         case 5:  return VkTopology::TriangleFan;
         case 6:  return VkTopology::TriangleStrip;
-        default: return VkTopology::PointList;
+        case 17: return VkTopology::TriangleStrip;  // kPrimitiveTypeRectList (3-vertex screen rect ~ strip)
+        case 19: return VkTopology::TriangleFan;    // kPrimitiveTypeQuadList (~ fan)
+        default: break;
     }
+    // Everything else (Patch=9, adjacency LineListAdj=10..TriStripAdj=13, and any unknown value)
+    // falls back to PointList. NOTE: adjacency/patch topologies map 1:1 to Vulkan values but
+    // require a geometry- or tessellation-shader pipeline path prosper does not build yet — emitting
+    // them here would make vkCreateGraphicsPipelines fail (returns {} = nothing) rather than render.
+    // PointList at least produces visible output. Log the specific type ONCE so a silent
+    // points-fallback (which used to hide RectList) is diagnosable — matching vk_color_format.
+    static std::set<uint32_t> logged;
+    static std::mutex logged_mu;
+    {
+        std::lock_guard<std::mutex> lk(logged_mu);
+        if (logged.insert(prim_type).second)
+            fprintf(stderr, "[gpu] vk_topology: unmapped VGT_PRIMITIVE_TYPE=%u -> PointList "
+                            "(adjacency/patch need a GS/tessellation path)\n", prim_type);
+    }
+    return VkTopology::PointList;
 }
 
 VkFormat vk_color_format(uint32_t format, uint32_t number_type, uint32_t comp_swap) {
