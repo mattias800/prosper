@@ -69,6 +69,20 @@ renderer is wired in; the game's **real pixel shader recompiles to valid SPIR-V*
 
 ## How to work here
 
+- **Work in your OWN git worktree — the main checkout is shared.** Several agents (and the human)
+  run this repo concurrently, so the main working directory and its build dir are contended:
+  branch-switching, staging, or `cmake --build` there collides with whatever someone else is
+  mid-edit on (a `git checkout` in a dirty tree tangles the index; a shared `build-linux` races
+  object files). Before starting non-trivial work, create your own worktree and stay in it:
+  ```bash
+  git worktree add .claude/worktrees/<your-slug> -b <your-branch>   # isolated tree + branch
+  # build in a worktree-local build dir; pass -DGAME_DUMP=... (dump lives outside the worktree)
+  cmake -S prosper -B prosper/build-linux -DGAME_DUMP=/mnt/c/Users/matti/repos/ps5ys/PPSA24651-app0
+  ```
+  Never `cd` back to the main repo root to run git or builds. If you MUST touch the main checkout,
+  assume another agent is actively working there — check `git status` first and don't reset/stash/
+  switch branches under them (the stash stack is shared too — see the worktree note in the environment
+  preamble). Your worktree is auto-cleaned when its branch merges.
 - **Build/run in WSL Ubuntu-24.04 as root.** Build dir `prosper/build-linux` (Linux, primary),
   `prosper/build-win` (Windows/MinGW, secondary). Game dump at
   `/mnt/c/Users/matti/repos/ps5ys/PPSA24651-app0` (gitignored — **never commit it**).
