@@ -65,6 +65,10 @@ int main() {
     prosper::gpu::present_reset();
     prosper::gpu::present_write_frame(px.data(), W, H);
     CHECK(prosper::gpu::present_has_frame(), "present accepted the executor's frame");
+    // #399: the rendered-frame dims are reported separately from the display dims, so a scaled-render
+    // readback consumer (screenshot) can size its buffer correctly instead of dropping every frame.
+    CHECK(prosper::gpu::present_frame_width() == W && prosper::gpu::present_frame_height() == H,
+          "present_frame_width/height report the rendered frame's actual dims");
     std::vector<uint8_t> scan((size_t)W * H * 4, 0);
     size_t n = prosper::gpu::present_readback(scan.data(), scan.size());
     CHECK(n == px.size() && scan == px, "present_readback returns the executor's frame byte-for-byte");

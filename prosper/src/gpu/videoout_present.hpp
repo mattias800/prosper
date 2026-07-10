@@ -34,6 +34,11 @@ uint64_t present_count();         // total flips presented (guest-paced; can be 
 uint64_t present_frame_seq();     // count of rendered frames handed in (present_write_frame calls)
 uint32_t present_width();
 uint32_t present_height();
+// Dimensions of the rendered frame handed in via present_write_frame (0 if none). Differ from
+// present_width/height (the guest display dims) whenever the frame was rendered at a reduced size
+// (PROSPER_RENDER_SCALE); a readback consumer must size its buffer from these when non-zero (#399).
+uint32_t present_frame_width();
+uint32_t present_frame_height();
 
 // Copy the presented frame's pixels (width*height, 4 bytes/pixel) from the front buffer's guest
 // memory into `dst`. Returns bytes written, or 0 if there is no surface / no flip yet / dst too small.

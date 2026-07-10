@@ -154,7 +154,13 @@ int main(int argc, char** argv) {
                              : (gpu::present_frame_seq() >= next);
         if (gpu::present_has_frame() && due) {
             uint64_t at = gpu::present_frame_seq();
-            uint32_t w = gpu::present_width(), h = gpu::present_height();
+            // Size the buffer from the RENDERED frame's dims, not the guest display dims: under
+            // PROSPER_RENDER_SCALE the frame is smaller, and present_readback returns g_frame.size()
+            // (scaled). Using the display dims made buf.size() != readback bytes, so the exact-size
+            // guard below dropped EVERY screenshot silently (#399). Fall back to display dims only when
+            // no rendered frame is present (the raw-scanout path).
+            uint32_t fw = gpu::present_frame_width(), fh = gpu::present_frame_height();
+            uint32_t w = fw ? fw : gpu::present_width(), h = fh ? fh : gpu::present_height();
             if (w && h) {
                 buf.resize((size_t)w * h * 4);
                 if (gpu::present_readback(buf.data(), buf.size()) == buf.size()) {
