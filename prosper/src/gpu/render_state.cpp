@@ -118,6 +118,8 @@ RenderState extract_render_state(const GpuState& st) {
 
     // Faithful raw state registers.
     rs.db_depth_control  = dc;
+    // Rasterizer cull/front-face/polygon mode (#456). Absent -> 0 -> CULL_NONE/CCW/FILL (prior default).
+    rs.pa_su_sc_mode_cntl = rd(st.cx, P::PA_SU_SC_MODE_CNTL);
     // Stencil op + ref/mask registers (absent -> 0; stencil_enable already gates whether they apply).
     rs.db_stencil_control   = st.cx.count(P::DB_STENCIL_CONTROL)   ? rd(st.cx, P::DB_STENCIL_CONTROL)   : 0u;
     rs.db_stencilrefmask    = st.cx.count(P::DB_STENCILREFMASK)    ? rd(st.cx, P::DB_STENCILREFMASK)    : 0u;
@@ -245,6 +247,25 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
         if (rs.vport_zscale != 0.0f || rs.vport_zoffset != 0.0f) {
             ps.min_depth = std::clamp(rs.vport_zoffset, 0.0f, 1.0f);
             ps.max_depth = std::clamp(rs.vport_zoffset + rs.vport_zscale, 0.0f, 1.0f);
+        }
+    }
+
+    // Rasterizer cull/front-face/polygon mode from PA_SU_SC_MODE_CNTL (#456). CULL_FRONT[0]/CULL_BACK[1]
+    // -> VkCullModeFlags (FRONT_BIT=1, BACK_BIT=2). FACE[2]: 0 = CCW is front, 1 = CW is front -> the guest
+    // default (0) maps to VK_FRONT_FACE_COUNTER_CLOCKWISE, matching the negative-height flipped viewport
+    // that already renders correct-facing geometry. POLY_MODE[4:3]==0 -> FILL; otherwise the front-face
+    // PTYPE[7:5] (0=points,1=lines,2=triangles) selects VkPolygonMode (POINT=2, LINE=1, FILL=0).
+    const uint32_t su = rs.pa_su_sc_mode_cntl;
+    ps.cull_mode  = (PM4_FIELD(su, PA_SU_SC_MODE_CNTL, CULL_FRONT) ? 1u : 0u)
+                  | (PM4_FIELD(su, PA_SU_SC_MODE_CNTL, CULL_BACK)  ? 2u : 0u);
+    ps.front_face = PM4_FIELD(su, PA_SU_SC_MODE_CNTL, FACE) ? 0u /*VK CW*/ : 1u /*VK CCW*/;
+    if (PM4_FIELD(su, PA_SU_SC_MODE_CNTL, POLY_MODE) == 0u) {
+        ps.polygon_mode = 0u;   // FILL
+    } else {
+        switch (PM4_FIELD(su, PA_SU_SC_MODE_CNTL, POLYMODE_FRONT_PTYPE)) {
+            case 0u:  ps.polygon_mode = 2u; break;   // points -> VK_POLYGON_MODE_POINT
+            case 1u:  ps.polygon_mode = 1u; break;   // lines  -> VK_POLYGON_MODE_LINE
+            default:  ps.polygon_mode = 0u; break;   // triangles / other -> FILL
         }
     }
 
