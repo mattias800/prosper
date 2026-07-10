@@ -115,12 +115,25 @@ Two of the three walls were closed by #290:
   decode through `detile_elements` + `bc_decode_surface` into fully coherent cloud sprite atlases
   (TV ≈ 1.6). Still skipped: **BC6H** (fmt 179/180, HDR half-float — no decode) and **SNORM
   BC4/BC5** (fmt 176/178 — the UNORM8 upload can't carry signed samples).
-- **RT sampling — now the dominant wall**: rendered pixels live host-side in `g_rtt`
-  (`PROSPER_RTT` injection); they are never written back tiled to guest memory, so every draw
-  sampling an RT-mode (tm27) surface reads stale garbage — DOLL's presented frame is dominated by
-  its bloom chain (fmt 71 fp16 RTs, 960×540…240×135) and final composite (fmt 36 =
-  `10_11_11_FLOAT`, the UE4 R11G11B10F scene color, 3840×2160/1920×1080 — unmapped, skipped
-  without RTT) sampling those unwritten RTs. Verified from a live capture: the 480×270 fmt-71
-  "bloom" guest memory decodes to NaN/inf-laden speckle — correctly-decoded garbage input, not a
-  decode bug. Fixing this means RTT injection keyed to those targets (plus mapping fmt 36 for the
-  injection path), not the detiler.
+- **RT sampling — largely addressed (#294)**: rendered pixels live host-side in `g_rtt`
+  (`PROSPER_RTT` / `PROSPER_RTT_PERTARGET` injection). Previously fmt 36 (`10_11_11_FLOAT`, the
+  UE4 R11G11B10F scene color) was unmapped and dropped, and the layout-level RTT bind only checked
+  `PROSPER_RTT` — so a pertarget-only run skipped the fmt-36 T# entirely. Now:
+  - **fmt 36 is mapped** to `DataFormat::Float10_11_11` (3 comps, 4 B/texel) unconditionally in
+    `gen5_image_format`; the live_renderer unpacks the packed word to RGBA8 (`f11_to_float` /
+    `f10_to_float`, same NaN/clamp semantics as the fp16 path) for the non-RTT-hit case. Kept out
+    of `rdna2_buffer_format` (vertex fetch has no packed conversion). Unit-tested.
+  - **The RTT env gate is unified**: `agc_shader_layout`'s unmapped-format bind now accepts
+    `PROSPER_RTT_PERTARGET` too, matching `live_renderer`'s `rtt_on`.
+  - **Result** (live DOLL capture, `PROSPER_RTT_PERTARGET=1`): 0 `UNMAPPED` skips, the scene-color
+    fmt-36 targets (1920×1080 / 3840×2160) and the fp16 bloom chain (960×540…60×34) all resolve as
+    RTT **HITs** (497 fmt-20 scene-color HITs) — the composite samples real rendered pixels, not
+    NaN speckle. The `PROSPER_RTT=1` single-framebuffer flatten renders a coherent smooth
+    yellow-green radial bloom gradient (587 distinct colors) instead of striped garbage.
+  - **Remaining**: the presented frame is not yet a recognizable scene. Under pertarget, the
+    "present the last group" heuristic surfaces a solid-blue clear/UI pass; under single-FB the
+    output is a smooth bloom gradient with no scene geometry detail — i.e. the scene-color RT
+    carries coherent post-process content but the underlying scene draws don't yet write
+    recognizable geometry into it. Next wall is scene-geometry detail in the scene-color RT (and a
+    present-selection heuristic that picks the composite group, not the last small pass), not the
+    RT-sampling plumbing.

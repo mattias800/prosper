@@ -270,6 +270,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             }
                             prosper::gpu::detile_surface(texstore.back().data(), tiled.data(), tw, th, tmode, pitch);
                         }
+                        // Packed R11G11B10F (Gen5 IMG_FMT 36 -> DataFormat::Float10_11_11, #294): UE4's
+                        // scene-color RT format. The texel IS 4 bytes, so the generic read + auto-detile
+                        // above already produced linear packed words; unpack each to RGBA8 in place with
+                        // the same semantics as the fp16 path (NaN/neg -> 0, clamp [0,1], no alpha -> 255).
+                        if (!rtt_hit && r.format == prosper::gpu::DataFormat::Float10_11_11) {
+                            uint8_t* tp = texstore.back().data();
+                            for (size_t t = 0; t < (size_t)tw * th; t++) {
+                                uint32_t v; std::memcpy(&v, tp + t * 4, 4);
+                                const float fc[3] = { prosper::gpu::f11_to_float((uint16_t)(v & 0x7FFu)),
+                                                      prosper::gpu::f11_to_float((uint16_t)((v >> 11) & 0x7FFu)),
+                                                      prosper::gpu::f10_to_float((uint16_t)((v >> 22) & 0x3FFu)) };
+                                for (int c = 0; c < 3; c++)
+                                    tp[t * 4 + c] = (fc[c] != fc[c] || fc[c] <= 0.f) ? 0
+                                                  : (fc[c] >= 1.f ? 255 : (uint8_t)(fc[c] * 255.f + 0.5f));
+                                tp[t * 4 + 3] = 255;
+                            }
+                        }
                         // PROSPER_DUMP_TEX: write the RAW texture memory (interpreted linearly) to a BMP,
                         // bypassing the shader — reveals whether the render target is tiled or linear.
                         if (getenv("PROSPER_DUMP_TEX") && !texstore.back().empty() && frame_no < 200) {
