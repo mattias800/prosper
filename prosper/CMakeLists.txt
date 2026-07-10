@@ -103,6 +103,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_audio PRIVATE prosper_core)
   add_test(NAME audio_hle COMMAND test_audio)
 
+  # libSceAjm (#187): headless audio-decode lifecycle — handle out-params filled with valid values
+  # (context/instance/batch), inputs validated, batch reports complete. Pure, no game dump.
+  add_executable(test_ajm tests/test_ajm.cpp)
+  target_link_libraries(test_ajm PRIVATE prosper_core)
+  add_test(NAME ajm_hle COMMAND test_ajm)
+
   add_executable(test_equeue_events tests/test_equeue_events.cpp)
   target_link_libraries(test_equeue_events PRIVATE prosper_core)
   add_test(NAME equeue_events COMMAND test_equeue_events)

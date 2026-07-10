@@ -444,6 +444,57 @@ A2_PROBE(audio2_mastering_set_param, "sceAudioOut2MasteringSetParam")
 A2_PROBE(audio2_mastering_get_state, "sceAudioOut2MasteringGetState")
 #undef A2_PROBE
 
+// --- libSceAjm (Audio Job Manager — compressed-audio decode: ATRAC9/MP3/AAC) (#187) ---
+// PPSA02664 initializes AJM at startup. prosper does not decode compressed audio (the AudioOut path
+// already discards/plays raw PCM headlessly), so this is a faithful HEADLESS lifecycle: every handle
+// out-param (context / instance / batch id) is filled with a REAL opaque handle — never left as the
+// caller's garbage, the bug the generic stub caused — inputs are validated, and a submitted decode
+// batch reports "started" then "complete" so the guest's audio pipeline proceeds (producing silence,
+// exactly like AudioSink discarding). It does NOT run the decode jobs — real ATRAC9/MP3/AAC decoding
+// is a separate, large piece and isn't needed to boot. Signatures verified vs shadPS4
+// src/core/libraries/ajm/ajm.h; error codes from ajm_error.h. CONFIDENCE: HIGH (handle lifecycle);
+// the no-decode behavior is intentional, not a guess.
+namespace {
+    std::atomic<uint32_t> g_ajm_next{1};   // one non-zero counter for context/instance/batch handles
+    constexpr uint64_t AJM_ERR_INVALID_CONTEXT   = 0x80930002ull;
+    constexpr uint64_t AJM_ERR_INVALID_INSTANCE  = 0x80930003ull;
+    constexpr uint64_t AJM_ERR_INVALID_PARAMETER = 0x80930005ull;
+}
+// sceAjmInitialize(s64 reserved, u32* out_context): create a context. Filling out_context is the point.
+HLE(ajm_initialize) {
+    if (!a1) return AJM_ERR_INVALID_PARAMETER;
+    *(uint32_t*)P(a1) = g_ajm_next.fetch_add(1);
+    return 0;
+}
+HLE(ajm_finalize)         { return 0; }
+// sceAjmModuleRegister(u32 context, AjmCodecType codec, s64 reserved): register a codec on the context.
+HLE(ajm_module_register)  { return a0 ? 0 : AJM_ERR_INVALID_CONTEXT; }
+HLE(ajm_module_unregister){ return 0; }
+// sceAjmInstanceCreate(u32 context, codec, flags, u32* instance): a decoder instance handle.
+HLE(ajm_instance_create) {
+    if (!a0) return AJM_ERR_INVALID_CONTEXT;
+    if (!a3) return AJM_ERR_INVALID_PARAMETER;
+    *(uint32_t*)P(a3) = g_ajm_next.fetch_add(1);
+    return 0;
+}
+// sceAjmInstanceDestroy(u32 context, u32 instance).
+HLE(ajm_instance_destroy) {
+    if (!a0) return AJM_ERR_INVALID_CONTEXT;
+    if (!a1) return AJM_ERR_INVALID_INSTANCE;
+    return 0;
+}
+// sceAjmBatchStartBuffer(context, batch, size, prio, AjmBatchError* err, u32* out_batch_id): accept a
+// decode batch and report it started (out_batch_id filled). We don't run the jobs; BatchWait completes
+// it. The AjmBatchError out (a4) is left as the caller's value (its layout isn't needed for no-error).
+HLE(ajm_batch_start) {
+    if (!a0) return AJM_ERR_INVALID_CONTEXT;
+    if (!a5) return AJM_ERR_INVALID_PARAMETER;
+    *(uint32_t*)P(a5) = g_ajm_next.fetch_add(1);
+    return 0;
+}
+HLE(ajm_batch_wait)       { return a0 ? 0 : AJM_ERR_INVALID_CONTEXT; }   // batch completed
+HLE(ajm_batch_errordump)  { return 0; }
+
 void register_audio_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
     R("sceAudioOutInit", audio_init);
@@ -478,6 +529,12 @@ void register_audio_hle() {
     R("sceAudioOut2MasteringTerm", audio2_mastering_term);
     R("sceAudioOut2MasteringSetParam", audio2_mastering_set_param);
     R("sceAudioOut2MasteringGetState", audio2_mastering_get_state);
+    // libSceAjm (#187): headless decode-lifecycle (valid handles, no actual decode -> silence).
+    R("sceAjmInitialize", ajm_initialize);            R("sceAjmFinalize", ajm_finalize);
+    R("sceAjmModuleRegister", ajm_module_register);   R("sceAjmModuleUnregister", ajm_module_unregister);
+    R("sceAjmInstanceCreate", ajm_instance_create);   R("sceAjmInstanceDestroy", ajm_instance_destroy);
+    R("sceAjmBatchStartBuffer", ajm_batch_start);     R("sceAjmBatchWait", ajm_batch_wait);
+    R("sceAjmBatchErrorDump", ajm_batch_errordump);
     #undef R
 }
 
