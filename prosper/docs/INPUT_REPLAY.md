@@ -1,0 +1,64 @@
+# Input replay & checkpoints — reaching a game state to reproduce a bug
+
+## The problem
+
+Now that titles are becoming playable, a bug is often reported at a *state* — "the shop menu", "level 1 boss", "after the first save". To reproduce or observe it, an agent must **navigate the game to that point** and then apply the full debug arsenal (`PROSPER_GFXLOG`, `PROSPER_DRAWDIAG`, `PROSPER_HWBP`, `boot_trace`, `screenshot`, the app). Hand-driving a controller isn't an option for a headless agent.
+
+## Principle: replay is a *core* capability, not a tool feature
+
+Every debug tool drives **one core process** configured by env flags. So "reach this state" must also be a property of that core run — then it composes with everything for free:
+
+```bash
+PROSPER_PAD_SCRIPT=scripts/messenger/reach-shop.pad \
+PROSPER_GFXLOG=1 PROSPER_DRAWDIAG=1 PROSPER_HWBP=0x440012ab0 \
+  boot_trace <app0>          # or screenshot, or prosper-app to watch live
+```
+
+One env var gets the agent to the bug; their entire existing toolset is unchanged. **Do NOT bake replay into the screenshot tool** — it's a pad backend that every tool inherits.
+
+We already have the seed: **`PROSPER_PAD_SCRIPT` (#202)** — a scripted `PadBackend` in `hle_pad.cpp` / `pad.cpp`. We extend it; we don't reinvent it.
+
+## What exists today (`PROSPER_PAD_SCRIPT`, #202)
+
+- Format: `;`-separated `<seconds>:<button>[+button…]`, e.g. `3:start;9:start;16:cross;31:up+cross`.
+- Each entry holds its button(s) for `PROSPER_PAD_HOLD` ms (default 300) starting at `<seconds>`.
+- **Anchored to the first pad poll** (t=0 = "the game first read the controller" ≈ menu appeared) — robust to asset-load time.
+- Pad reports CONNECTED whenever a script is set. Parse + time-eval are pure and unit-tested in `pad.cpp`.
+
+Good bones. Two gaps for reaching deep states reliably: the clock is **wall-time**, and scripts are an env string (fine for a few presses, not for a long route).
+
+## Design
+
+### 1. Frame-anchored, file-loadable scripts (core)
+- **Anchor to game frames, not wall-time.** Keep the "first pad poll" origin (robust to load time), but measure progress in **flips since first poll** (game logic frames), not elapsed seconds. The Messenger is a fixed-timestep platformer, so wall-time drifts vs game frames on slow llvmpipe vs a fast GPU — frame anchoring makes `f300:cross` reproduce everywhere. Add an `f<frame>:` entry syntax alongside the existing `<seconds>:` (kept for back-compat).
+- **Load from a file.** `PROSPER_PAD_SCRIPT=@path` (or `PROSPER_PAD_SCRIPT_FILE=path`) reads a multi-line script file, so long routes live in the repo, not an env string.
+- **Richer input.** Per-entry hold length, analog stick directions, not just a 300 ms button tap.
+
+### 2. Record mode in `prosper-app`
+`prosper-app --dump <app0> --record <file>`: capture the human's keyboard/gamepad input **stamped by flip count**, writing a script file. This is how checkpoint scripts get *created* — play to the point once, get a reusable, committable route. (The app already snapshots keyboard state per frame; recording is writing that stream out, anchored to `present_count`.)
+
+### 3. Checkpoint library + agent docs
+- `prosper/scripts/<title>/reach-*.pad` — **tiny text files, no game imagery, safe to commit** (unlike golden frames). Named by the state they reach: `reach-title-menu.pad`, `reach-level1.pad`, …
+- An `AGENTS.md` note: *"to reproduce a bug at state X, prefix your tool with `PROSPER_PAD_SCRIPT=@scripts/<title>/reach-X.pad`."* A bug report then just cites the checkpoint.
+
+## The crux: determinism
+
+For a script to *reliably* land on the same state, the guest must be deterministic given the same input. Levers, in order of impact:
+1. **Frame-anchoring** (piece 1) — removes render-speed sensitivity. Biggest win.
+2. **Deterministic clock option** — derive guest time from frame count rather than the host wall clock, so time-seeded RNG / delta-time logic is reproducible. (Opt-in; may diverge from real behavior — mark CONFIDENCE.)
+3. **Verification guard** — a *checkpoint* = `(script + expected frame hash at its end)`. Re-running must reach the same hashed frame; if it stops, that's a **caught regression**. This is the **same comparison layer as the snapshot-regression harness (#248 / #227)** — checkpoints are deep-state snapshot tests, and should share that hashing/threshold code, not duplicate it.
+
+Determinism is iterative: frame-anchoring first, measure drift across repeated runs, then add the clock option / guard as needed.
+
+## Agent workflow this enables
+
+1. Bug reported "at the shop". Report cites `reach-shop.pad`.
+2. Agent runs their tool with `PROSPER_PAD_SCRIPT=@scripts/messenger/reach-shop.pad` + whatever debug flags — lands at the shop, observes the bug, keeps every existing tool.
+3. New checkpoint needed? Play there once with `prosper-app --record`, commit the `.pad`.
+4. Checkpoints double as regression coverage ("can we still reach level 3?") via the #248 harness.
+
+## Build order
+1. Design + this doc + tracking issue (agree frame-anchoring / clock decisions). ← here
+2. `prosper-app --record` (low-risk, immediately useful, in the frontend).
+3. Frame-anchor + file-load the core script (`pad.cpp` / `hle_pad.cpp`), keeping `<seconds>:` back-compat.
+4. Seed `scripts/messenger/` + the `AGENTS.md` note; wire checkpoint verification into #248.
