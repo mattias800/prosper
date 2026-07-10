@@ -205,6 +205,7 @@ namespace {
     // handler (getenv walks environ + isn't async-signal-safe; #159). Mirror g_hwbp_bufdump/klass above.
     bool g_hwbp_fields = false;         // PROSPER_HWBP_FIELDS: dump rbx object fields + object-field class names
     bool g_hwbp_obj = false;            // PROSPER_HWBP_OBJ: treat rdi as an il2cpp object at a method-entry bp
+    bool g_hwbp_args = false;           // PROSPER_HWBP_ARGS: print SysV arg registers (rdi/rsi/rdx/rcx/r8/r9) per hit
     const char* g_hwbp_global = nullptr;// PROSPER_HWBP_GLOBAL=0xADDR: resolve the class name at a fixed guest global
     void hwbp_dump_ring(const char* why);   // fwd decl (defined after probe_readable)
     // Optional chained DATA write-watchpoint: on the first exec-bp hit, arm a HW write watch on
@@ -797,6 +798,18 @@ namespace {
                     uint64_t ga = strtoull(g, nullptr, 0);
                     if (probe_readable(ga + 7)) pcname("global", *(const uint64_t*)ga);
                 }
+            }
+            // PROSPER_HWBP_ARGS=1: at a method-entry bp, print the SysV integer-arg registers
+            // (rdi/rsi/rdx/rcx/r8/r9) + the return address, so a call's arguments (e.g. an enum/mode
+            // in esi) are visible per hit without a gdb round-trip. Generic; composes with the count cap.
+            if (g_hwbp_args && cond_ok) {
+                char b[192]; int n = snprintf(b, sizeof b,
+                    "[hwbp-args] rdi=0x%llx rsi=0x%llx rdx=0x%llx rcx=0x%llx r8=0x%llx r9=0x%llx ret=eboot+0x%llx\n",
+                    (unsigned long long)gr[REG_RDI], (unsigned long long)gr[REG_RSI],
+                    (unsigned long long)gr[REG_RDX], (unsigned long long)gr[REG_RCX],
+                    (unsigned long long)gr[REG_R8], (unsigned long long)gr[REG_R9],
+                    (unsigned long long)(probe_readable((uint64_t)gr[REG_RSP]) ? (*(const uint64_t*)(uint64_t)gr[REG_RSP] - 0x400000000ull) : 0));
+                syscall(SYS_write, 2, b, (size_t)n);
             }
             // PROSPER_HWBP_OBJ=1: treat rdi as an il2cpp object (at a method-entry bp); print its class
             // name ([[rdi]+0x10]) and fields [rdi+0x00..+0x60], plus [rdi+0x40] chased as an object too.
@@ -1539,6 +1552,7 @@ void install_trap_handler() {
         if (getenv("PROSPER_HWBP_KLASS")) g_hwbp_klass = true;
         if (getenv("PROSPER_HWBP_FIELDS")) g_hwbp_fields = true;   // latch here (#159): handler must not getenv()
         if (getenv("PROSPER_HWBP_OBJ")) g_hwbp_obj = true;
+        if (getenv("PROSPER_HWBP_ARGS")) g_hwbp_args = true;
         g_hwbp_global = getenv("PROSPER_HWBP_GLOBAL");             // may be null; handler null-checks
         if (getenv("PROSPER_HWBP_ALLTHREADS")) g_hwbp_allthreads = true;
         ensure_probe_pipe();
