@@ -319,7 +319,21 @@ size_t apply_relocations(const Module& m, LoadedImage& img,
                 if (write64(va, sv + (uint64_t)r.addend)) applied++;
                 break;
             }
-            default: unhandled[r.type]++; break;
+            default: {
+                // Make an unhandled TLS relocation LOUD (once per type) even without
+                // PROSPER_RELOC_HISTO: a silently-skipped TLS reloc leaves the GOT slot 0, so the guest
+                // reads/writes thread-local storage at the wrong (often zero) offset and corrupts it
+                // INVISIBLY. The notable gap is TPOFF64 (18) — declared in module.hpp but with no case
+                // here (its correct value needs the guest static-TLS layout; types 19-23 are other TLS
+                // models). No current title emits these (verified), so this never fires today; when one
+                // does, it fails visibly instead of silently corrupting TLS. #338.
+                uint64_t& cnt = unhandled[r.type];
+                if (cnt == 0 && r.type >= 16 && r.type <= 23)
+                    fprintf(stderr, "[reloc] WARNING: unhandled TLS relocation type %u in %s — "
+                            "thread-local storage may be corrupted (issue #338)\n", r.type, m.path.c_str());
+                cnt++;
+                break;
+            }
         }
     }
     if (getenv("PROSPER_RELOC_HISTO")) {
