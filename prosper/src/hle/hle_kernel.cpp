@@ -494,6 +494,12 @@ HLE(k_pthread_create) {
     if (a0) *(uint64_t*)a0 = (uint64_t)tid;
     return 0;
 }
+// Plain POSIX pthread_create(thread, attr, start, arg) has only 4 args, so a4 (r8) is caller-indeterminate
+// scratch. k_pthread_create reads a4 as a thread-name pointer -- legitimate for scePthreadCreate /
+// pthread_create_name_np (5-arg), but for the 4-arg POSIX form a non-zero garbage a4 makes it strncpy from
+// a wild/unmapped address -> intermittent SIGSEGV (IL2CPP bdwgc's GC_pthread_create calls the 4-arg form).
+// Force name=null for the 4-arg entry point.
+HLE(k_pthread_create_noname) { return k_pthread_create(a0, a1, a2, a3, 0, 0); }
 HLE(k_pthread_join)   { void* rv = nullptr; pthread_join((pthread_t)a0, a1 ? &rv : nullptr); if (a1) *(void**)(uintptr_t)a1 = rv; return 0; }
 HLE(k_pthread_detach) { pthread_detach((pthread_t)a0); return 0; }
 HLE(k_pthread_exit)   {
@@ -1127,7 +1133,7 @@ void register_kernel_hle() {
     R("pthread_equal", k_pthread_equal);
     // POSIX pthread_* names. The guest's libc is FreeBSD-derived (pointer/opaque pthread
     // types), so these have the same semantics as our Sony handlers — alias them.
-    R("pthread_create", k_pthread_create);   R("pthread_join", k_pthread_join);
+    R("pthread_create", k_pthread_create_noname);   R("pthread_join", k_pthread_join);   // 4-arg: no name arg (a4=garbage r8)
     // libScePosix variant with a trailing name arg — same (tid*, attr, entry, arg, name) shape as
     // scePthreadCreate. Unimplemented-0 silently created NO thread (UE4's IO stack starves).
     R("pthread_create_name_np", k_pthread_create);
