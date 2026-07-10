@@ -40,6 +40,12 @@ void read_user_sgprs(const std::unordered_map<uint32_t, uint32_t>& sh, uint32_t 
 } // namespace (guest_readable below has external linkage — declared in gpu_execute.hpp, shared with
   // the HLE diagnostic probes that chase raw guest pointers)
 
+// PROSPER_DYNTRACE_FAIL support: while true, resolve_dynamic_fetch traces its walk and
+// build_stage_table dumps the user-data blocks, regardless of the PROSPER_DYNTRACE/RESDUMP
+// envs. Set (and cleared) by realize_draw_item's failure replay — the submit path is serialized
+// by the HLE submit mutex, so a plain global is safe there.
+bool g_dyntrace_force = false;
+
 // Readability probe (guest memory is 1:1-mapped, but a mis-decoded address could be unmapped),
 // so guarded derefs on the render/submit thread don't risk a SIGSEGV. NOTE: /dev/null does NOT
 // work for this — the kernel's null_write returns count without ever touching the source buffer,
@@ -96,7 +102,14 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
 
-    const bool trc = getenv("PROSPER_DYNTRACE") != nullptr;
+    // PROSPER_DYNTRACE traces the whole const-fold walk; PROSPER_DYNTRACE_ADDR=<hex code addr>
+    // narrows it to ONE shader (a full run otherwise traces every draw's walk — unusable volume).
+    // g_dyntrace_force: set by the PROSPER_DYNTRACE_FAIL failure-replay path (gpu_execute.hpp) so
+    // the walk of a shader that just FAILED to recompile is traced without knowing its address.
+    bool trc = g_dyntrace_force || getenv("PROSPER_DYNTRACE") != nullptr;
+    if (trc && !g_dyntrace_force)
+        if (const char* fa = getenv("PROSPER_DYNTRACE_ADDR"))
+            trc = strtoull(fa, nullptr, 16) == (uint64_t)(uintptr_t)code;
     std::unordered_map<int, uint32_t> val;                 // known concrete SGPR values (by SHADER SGPR #)
     std::unordered_map<int, std::array<uint32_t, 4>> descr; // SGPR -> the 4-dword V# it holds (load-time snapshot)
     // Descriptor-TABLE provenance (#294): for each snapshotted 4/8-dword s_load, the load's IMMEDIATE
@@ -303,14 +316,40 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                                          k2 = known(srsrc + 2, vv[2]), k3 = known(srsrc + 3, vv[3]);
                     bool patched = k0 && k1 && k2 && k3;
                     auto it = descr.find(srsrc);
-                    if (trc) fprintf(stderr, "[dyntrace] MUBUF fetch pc=%u op=0x%x SRSRC=s%d patched=%d (k=%d%d%d%d v3=0x%x) have_descr=%d\n",
-                                     in.pc, in.opcode, srsrc, patched, k0, k1, k2, k3, k3 ? vv[3] : 0, it != descr.end());
+                    // Fold the fetch's CONSTANT byte offset into the emitted V# base (#273 item 1, the
+                    // "solid banner" bug): the recompiler's per-fetch (by_fetch_pc) address model is
+                    // exactly gl_VertexIndex*stride from the resolved base — it assumes the attribute's
+                    // in-record byte offset is already IN the base. Unity-style fetch shaders satisfy
+                    // that by patching each attribute's V# base; DOLL's UE4 Slate VS instead uses ONE
+                    // un-patched V# and carries each attribute's offset in the MUBUF SOFFSET register
+                    // (+ the 12-bit inst offset). Without the fold, all four Slate attributes (pos, uv,
+                    // material-uv, color) read the position bytes -> the loading-banner widget rendered
+                    // as a solid bar. The walk knows the SOFFSET value (it computed it from the attr-spec
+                    // words), so add soffset+inst_offset to the descriptor base; an UNKNOWN soffset keeps
+                    // the un-offset base (previous behavior). CONFIDENCE: HIGH (fetch-time values traced
+                    // live; Messenger's fetches carry SOFFSET=0 so they are byte-identical).
+                    uint32_t soff = 0;
+                    if (!(in.src[2].kind == OperandKind::Special && in.src[2].value == 125))  // NULL -> 0
+                        if (!srcval(in.src[2], soff)) soff = 0;                               // unknown -> 0
+                    const uint32_t inst_off = in.literal & 0xFFFu;
+                    const uint32_t fetch_off = soff + inst_off;
+                    auto with_off = [&](DecodedBufferDescriptor d) {
+                        d.base += fetch_off;
+                        // size_bytes stays num_records*stride: the hardware bound is INDEX < num_records
+                        // (record granularity), so from the offset base the last record's attribute still
+                        // lies within (num_records-1)*stride + fetch_off + attr bytes — trimming the size
+                        // by fetch_off cut the LAST vertex's attribute off the upload (guarded reads made
+                        // it zeros -> a collapsed final vertex).
+                        return d;
+                    };
+                    if (trc) fprintf(stderr, "[dyntrace] MUBUF fetch pc=%u op=0x%x SRSRC=s%d patched=%d (k=%d%d%d%d v3=0x%x) have_descr=%d off=+0x%x\n",
+                                     in.pc, in.opcode, srsrc, patched, k0, k1, k2, k3, k3 ? vv[3] : 0, it != descr.end(), fetch_off);
                     // Per-fetch: record THIS fetch's live V# (the SRSRC SGPR is reloaded with a different V#
                     // per vertex attribute — position, uv, color…). Keyed by the fetch's pc so the recompiler
                     // resolves each buffer_load_format to the descriptor as loaded at that instruction.
-                    if (patched)          out.push_back({ in.pc, srsrc, decode_buffer_descriptor(vv), vv[3] });
+                    if (patched)          out.push_back({ in.pc, srsrc, with_off(decode_buffer_descriptor(vv)), vv[3] });
                     else if (it != descr.end())
-                        out.push_back({ in.pc, srsrc, decode_buffer_descriptor(it->second.data()), it->second[3] });
+                        out.push_back({ in.pc, srsrc, with_off(decode_buffer_descriptor(it->second.data())), it->second[3] });
                     else if (srsrc >= (int)user_sgpr_base && srsrc + 4 <= (int)(user_sgpr_base + nsgpr) &&
                              !reloaded.count(srsrc) && !reloaded.count(srsrc + 1) &&
                              !reloaded.count(srsrc + 2) && !reloaded.count(srsrc + 3)) {
@@ -331,7 +370,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         if (d.base > 0x10000 && d.size_bytes != 0 && d.size_bytes <= 0x10000000u) {
                             if (trc) fprintf(stderr, "[dyntrace]   MUBUF pc=%u seed-V# fallback SRSRC=s%d base=0x%llx\n",
                                              in.pc, srsrc, (unsigned long long)d.base);
-                            out.push_back({ in.pc, srsrc, d, sv[3], /*from_seed=*/true });
+                            out.push_back({ in.pc, srsrc, with_off(d), sv[3], /*from_seed=*/true });
                         }
                     }
                 }
@@ -396,12 +435,39 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
     if (is_ps) { bases[0] = P::SPI_SHADER_USER_DATA_PS_0; bases[1] = P::SPI_SHADER_USER_DATA_GS_0; bases[2] = P::SPI_SHADER_USER_DATA_VS_0; }
     else       { bases[0] = P::SPI_SHADER_USER_DATA_GS_0; bases[1] = P::SPI_SHADER_USER_DATA_VS_0; bases[2] = P::SPI_SHADER_USER_DATA_PS_0; }
 
+    // Per-shader user-data RANGE: the shader blob's "specials" block declares which DWORD range of
+    // the stage's USER_DATA register block holds this shader's SGPR-visible user data
+    // (user_data_range_start/end — the range SetSource programs; e.g. DOLL's UE4 Slate VS declares
+    // [0,8) matching its 8-dword {V#, ptr, ptr} block). Header sharp/direct offsets are relative to
+    // range_start, so seed the SGPR block from USER_DATA_<stage>_<range_start>. Every shader
+    // observed live (DOLL + Messenger) declares start=0, so this is currently behavior-identical —
+    // LATENT support for a start!=0 shader, guarded back to 0 on insane metadata.
+    // CONFIDENCE: LOW on start!=0 semantics (no live example yet); zero risk for start==0.
+    uint32_t range_start = 0;
+    if (hdr->specials && guest_readable((uint64_t)(uintptr_t)hdr->specials, sizeof(AgcShaderSpecials))) {
+        const uint32_t s = hdr->specials->user_data_range_start;
+        const uint32_t e = hdr->specials->user_data_range_end;
+        if (s < kUserSgprs && e > s && e <= 2 * kUserSgprs) range_start = s;
+        if (log && range_start) {   // once per shader: non-zero ranges are the rare/interesting case
+            static std::set<uint64_t> logged;
+            if (logged.insert(code_addr).second)
+                fprintf(stderr, "[agc] %s 0x%llx user_data_range=[%u,%u) -> seeding from USER_DATA_%u\n",
+                        is_ps ? "PS" : "VS", (unsigned long long)code_addr, s, e, range_start);
+        }
+    }
+
     // PROSPER_RESDUMP: raw dump of the user-data struct + SGPR block per base, so the EUD layout
     // (which sharps have offset_dw>=16, and where the EUD pointer sits) can be read empirically.
-    if (getenv("PROSPER_RESDUMP")) {
+    bool resdump = getenv("PROSPER_RESDUMP") != nullptr;
+    if (resdump)   // PROSPER_RESDUMP_ADDR=<hex code addr>: narrow the dump to one shader
+        if (const char* fa = getenv("PROSPER_RESDUMP_ADDR"))
+            resdump = strtoull(fa, nullptr, 16) == code_addr;
+    if (g_dyntrace_force) resdump = true;   // failure replay: always dump the failing stage's blocks
+    if (resdump) {
         const AgcShaderUserData* ud = hdr->user_data;
-        fprintf(stderr, "[resdump] %s code=0x%llx type=%u ud=%p\n", is_ps ? "PS" : "VS",
-                (unsigned long long)code_addr, hdr->type, (const void*)ud);
+        fprintf(stderr, "[resdump] %s code=0x%llx type=%u ud=%p range_start=%u (end=%u)\n",
+                is_ps ? "PS" : "VS", (unsigned long long)code_addr, hdr->type, (const void*)ud,
+                range_start, hdr->specials ? (uint32_t)hdr->specials->user_data_range_end : 0u);
         if (ud) {
             fprintf(stderr, "[resdump]   eud_size_dw=%u srt_size_dw=%u direct_count=%u sharp_counts={%u,%u,%u,%u}\n",
                     ud->eud_size_dw, ud->srt_size_dw, ud->direct_resource_count,
@@ -447,10 +513,10 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
     std::vector<DynFetch> dyn_vb;
     std::vector<SrtUse> srt_uses;
     if (is_ps) {
-        uint32_t sgprs[kUserSgprs]; read_user_sgprs(st.sh, bases[0], sgprs);
+        uint32_t sgprs[kUserSgprs]; read_user_sgprs(st.sh, bases[0] + range_start, sgprs);
         resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, 0x4000, sgprs, kUserSgprs, 0, &srt_uses);
     } else {
-        uint32_t sgprs[kUserSgprs]; read_user_sgprs(st.sh, bases[0], sgprs);
+        uint32_t sgprs[kUserSgprs]; read_user_sgprs(st.sh, bases[0] + range_start, sgprs);
         // NGG merged VS/GS: s0..s7 are system SGPRs, user data starts at s8 (confirmed by matching the
         // shader's s[8:11]/s[24:25] descriptor pointers to the register file at GS_0+offset).
         dyn_vb = resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, 0x4000, sgprs, kUserSgprs, 8, &srt_uses);
@@ -482,7 +548,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
     // (an s_buffer_load/image_sample's SBASE/SRSRC register) is in that shader-SGPR space.
     const uint32_t user_sgpr_base = is_ps ? 0u : 8u;
     for (uint32_t base : bases) {
-        uint32_t sgprs[kUserSgprs]; read_user_sgprs(st.sh, base, sgprs);
+        uint32_t sgprs[kUserSgprs]; read_user_sgprs(st.sh, base + range_start, sgprs);
         ShaderResourceTable t = build_shader_resources(*hdr, sgprs, kUserSgprs, user_sgpr_base);
         // Add the const-fold-resolved dynamic vertex buffers, keyed by their SRSRC SGPR so the
         // recompiler's by_sgpr_base() resolves each buffer_load_format. The V#'s data format is patched
