@@ -529,9 +529,16 @@ HLE(k_aio_cancel) {  // (id, s32* state): nothing is in flight to cancel — rep
 #ifndef _WIN32
 HLE(f_stat)  { std::string h = translate(CS(a0)); struct stat st; int r = ::stat(h.c_str(), &st); if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
 HLE(f_fstat) { struct stat st; int r = ::fstat((int)a0, &st); if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
+// lstat: was MISSING -> the return-0 stub reported success while leaving the caller's stat buffer as
+// uninitialized garbage (wrong file type/size). We have no symlinks in the dump, so ::lstat == ::stat, but
+// the key fix is WRITING the buffer. fsync: was fake-success; flush for real save durability.
+HLE(f_lstat) { std::string h = translate(CS(a0)); struct stat st; int r = ::lstat(h.c_str(), &st); if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
+HLE(f_fsync) { return (uint64_t)(int64_t)::fsync((int)a0); }
 #else
 HLE(f_stat)  { std::string h = translate(CS(a0)); struct _stat64 st; int r = ::_stat64(h.c_str(), &st); if (r == 0 && a1) to_sce_stat64(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
 HLE(f_fstat) { struct _stat64 st; int r = ::_fstat64((int)a0, &st); if (r == 0 && a1) to_sce_stat64(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
+HLE(f_lstat) { return f_stat(a0,a1,a2,a3,a4,a5); }
+HLE(f_fsync) { return 0; }
 #endif
 HLE(f_access){ std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::access(h.c_str(), (int)a1); }
 HLE(f_mkdir) { std::string h = translate(CS(a0));   // sceKernelMkdir(path, mode)
@@ -1135,6 +1142,8 @@ void register_file_hle() {
     R("sceKernelOpen", f_open);   R("sceKernelClose", f_close);  R("sceKernelRead", f_read);
     R("sceKernelWrite", f_write); R("sceKernelLseek", f_lseek);  R("sceKernelStat", f_stat);
     R("sceKernelFtruncate", f_ftruncate);   // real resize (was fake-success -> corrupt saves)
+    R("lstat", f_lstat);   R("sceKernelLstat", f_lstat);     // was MISSING -> uninitialized stat buffer
+    R("fsync", f_fsync);   R("sceKernelFsync", f_fsync);     // was fake-success -> no durability
     R("sceKernelTruncate", f_truncate);      // path-based sibling (same corruption class)
     R("sceKernelFstat", f_fstat);
     // Low-level POSIX wrappers with the internal leading-underscore names. Real libc.prx implements
