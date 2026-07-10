@@ -67,6 +67,9 @@ struct FrameResource {
     // SQ_TEX CLAMP enum (0=wrap, 1=mirror, 2=clamp-last-texel, 6/7=border).
     uint32_t mag_filter = 1, min_filter = 1, mip_filter = 0;
     uint32_t addr_uvw[3] = {2, 2, 2};
+    // T# DST_SEL channel swizzle (SQ_SEL per channel: 0=0,1=1,4=R,5=G,6=B,7=A). Default = identity
+    // (R,G,B,A) == a no-op VkComponentMapping, so tests that build FrameResources directly are unchanged.
+    uint32_t swizzle[4] = {4, 5, 6, 7};
     bool is_texture() const { return tex_rgba != nullptr; }
 };
 
@@ -348,6 +351,22 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     vkBindImageMemory(dev, v.timg[i], v.tmem[i], 0);
                     VkImageViewCreateInfo tvci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
                     tvci.image = v.timg[i]; tvci.viewType = VK_IMAGE_VIEW_TYPE_2D; tvci.format = VK_FORMAT_R8G8B8A8_UNORM;
+                    // T# DST_SEL channel remap (#261): map each SQ_SEL to a VkComponentSwizzle. Identity
+                    // (the default, and the narrow/font path) yields IDENTITY == a no-op. PROSPER_NO_SWIZZLE
+                    // forces identity for A/B testing against the pre-swizzle behavior.
+                    auto vkswz = [](uint32_t s) -> VkComponentSwizzle {
+                        switch (s) {
+                            case 0:  return VK_COMPONENT_SWIZZLE_ZERO;
+                            case 1:  return VK_COMPONENT_SWIZZLE_ONE;
+                            case 4:  return VK_COMPONENT_SWIZZLE_R;
+                            case 5:  return VK_COMPONENT_SWIZZLE_G;
+                            case 6:  return VK_COMPONENT_SWIZZLE_B;
+                            case 7:  return VK_COMPONENT_SWIZZLE_A;
+                            default: return VK_COMPONENT_SWIZZLE_IDENTITY;
+                        }
+                    };
+                    if (!getenv("PROSPER_NO_SWIZZLE"))
+                        tvci.components = {vkswz(r.swizzle[0]), vkswz(r.swizzle[1]), vkswz(r.swizzle[2]), vkswz(r.swizzle[3])};
                     tvci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}; vkCreateImageView(dev, &tvci, nullptr, &v.tview[i]);
                     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
                     // Honor the game's decoded S# (r.mag/min/mip_filter, r.addr_uvw) instead of a fixed

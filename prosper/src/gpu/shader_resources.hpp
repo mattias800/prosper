@@ -103,6 +103,12 @@ struct ShaderResource {
     uint32_t      min_filter        = 1;
     uint32_t      mip_filter        = 0;
     uint32_t      addr_uvw[3]       = {2, 2, 2};
+
+    // T# DST_SEL channel swizzle (SQ_SEL enum per channel: 0=0,1=1,4=R,5=G,6=B,7=A). Applied as a Vulkan
+    // component-mapping on the sampled view so a non-identity surface (e.g. BGRA order, or an alpha-only
+    // mask) reads correctly. Default = identity (R,G,B,A). NOT applied on the narrow R->RGBA replication
+    // path (that already broadcasts coverage to every channel).
+    uint32_t      swizzle[4]        = {4, 5, 6, 7};
 };
 
 // The set of resources a shader uses. The front-half builds it from the shader's user_data; the

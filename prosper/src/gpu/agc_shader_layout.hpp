@@ -66,6 +66,9 @@ struct DecodedImageDescriptor {
     uint32_t format = 0;      // Gen5 surface-format enum (fields[1] bits 20..28)
     uint32_t tile_mode = 0;   // 0 = linear
     uint8_t  type = 0;        // SQ_RSRC_IMG dim (8 = 2D, 9 = 2D_ARRAY, ...)
+    // DST_SEL_X/Y/Z/W channel swizzle (WORD3 [2:0]/[5:3]/[8:6]/[11:9]); SQ_SEL enum:
+    // 0=0, 1=1, 4=X(R), 5=Y(G), 6=Z(B), 7=W(A). Default = identity (R,G,B,A).
+    uint8_t  dst_sel[4] = {4, 5, 6, 7};
 };
 // Decode an 8-dword T# (RDNA2/Gen5 image resource). Pure; exposed for reuse + testing.
 DecodedImageDescriptor decode_image_descriptor(const uint32_t t[8]);
