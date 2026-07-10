@@ -181,9 +181,17 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             return off * 4;                                   // byte offset within user_data
         }
         if (!eud_base) return 0xFFFFFFFFu;
-        const uint32_t* src = (const uint32_t*)(uintptr_t)(eud_base + (uint64_t)(off - num_user_sgprs) * 4);
+        // Bounds-check the EUD read (#375): offset_dw is a 15-bit field (up to ~128 KB past eud_base),
+        // so an out-of-range cbuf slot would dereference unmapped guest memory and SIGSEGV the front-half
+        // build on EVERY draw that binds this shader. Reject unless the read fits the guest-declared EUD
+        // size AND is actually mapped — mirroring the guarded in-SGPR path above and the T# path below
+        // (which already calls guest_readable). eud_size_dw was decoded but never used to bound a read.
+        const uint64_t eoff = (uint64_t)(off - num_user_sgprs);
+        if (ud->eud_size_dw && eoff + n > ud->eud_size_dw) return 0xFFFFFFFFu;   // beyond declared EUD
+        if (!guest_readable(eud_base + eoff * 4, n * 4))    return 0xFFFFFFFFu;   // unmapped guest memory
+        const uint32_t* src = (const uint32_t*)(uintptr_t)(eud_base + eoff * 4);
         for (uint32_t i = 0; i < n; i++) buf[i] = src[i];
-        return (off - num_user_sgprs) * 4;                    // matches the shader's s_load immediate
+        return (uint32_t)(eoff * 4);                          // matches the shader's s_load immediate
     };
 
     // Constant buffers: sharp_resource_offset[3] (storage-as-constant). Each slot's offset_dw points at

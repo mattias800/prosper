@@ -136,6 +136,31 @@ int main() {
     ShaderResourceTable t2 = build_shader_resources(shdr, sgprs, 32);
     CHECK(t2.resources.size() == 1, "empty sharp slot (0x7fff) skipped");
 
+    // --- #375: EUD-resident cbuf reads are bounds-checked (no SIGSEGV on an out-of-range offset_dw) --
+    // An offset_dw >= num_user_sgprs lands in the guest EUD spill (base from direct_resource_offset[5]).
+    // The read must be rejected when it runs past the declared eud_size_dw, instead of dereferencing
+    // unmapped memory. Here: one in-bounds slot (eoff 0) resolves, one out-of-range slot is dropped.
+    {
+        uint32_t sg[32]; memset(sg, 0, sizeof sg);
+        uint32_t eud[4]; make_vsharp(eud, 0xD0000000ull, 0, 512, 22);   // a real readable 4-dword spill
+        uint64_t eud_ptr = (uint64_t)(uintptr_t)eud;
+        uint16_t dro5[16]; for (auto& x : dro5) x = 0xffff;
+        dro5[5] = 24; sg[24] = (uint32_t)eud_ptr; sg[25] = (uint32_t)(eud_ptr >> 32);   // EUD base pointer
+        AgcShaderSharp eud_cbufs[2];
+        eud_cbufs[0].bits = (uint16_t)(32 & 0x7fff);   // offset_dw 32 == num_user_sgprs -> EUD eoff 0 (in bounds)
+        eud_cbufs[1].bits = (uint16_t)(40 & 0x7fff);   // offset_dw 40 -> eoff 8, +4 = 12 > eud_size_dw 4 -> rejected
+        AgcShaderUserData eud_ud; memset(&eud_ud, 0, sizeof eud_ud);
+        eud_ud.direct_resource_offset = dro5; eud_ud.direct_resource_count = 16;
+        eud_ud.eud_size_dw = 4;                        // declared EUD size: 4 dwords
+        eud_ud.sharp_resource_offset[3] = eud_cbufs; eud_ud.sharp_resource_count[3] = 2;
+        AgcShaderHeader eud_sh; memset(&eud_sh, 0, sizeof eud_sh);
+        eud_sh.file_header = 0x34333231u; eud_sh.version = 0x18; eud_sh.type = 2; eud_sh.user_data = &eud_ud;
+        ShaderResourceTable te = build_shader_resources(eud_sh, sg, 32);
+        CHECK(te.resources.size() == 1, "#375: in-bounds EUD cbuf resolves; slot past eud_size_dw skipped (no SIGSEGV)");
+        const ShaderResource* re = te.by_srt_offset(0);   // EUD provenance key = eoff*4 = 0
+        CHECK(re && re->gpu_addr == 0xD0000000ull, "#375: in-bounds EUD cbuf decoded from the spill buffer");
+    }
+
     // --- vertex buffers: direct resource usage type 8 (V# inline in the user-data SGPRs) ------------
     // A 16-entry direct_resource_offset table; type 8 (vertex buffer) points at a V# at SGPR dword 20.
     uint16_t dro[16]; for (auto& x : dro) x = 0xffff;
