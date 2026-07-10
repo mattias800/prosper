@@ -967,12 +967,9 @@ void start_defer_watchdog() {
         for (;;) {
             struct timespec ts{ 0, 2000000 };   // 2 ms cadence
             nanosleep(&ts, nullptr);
-            int n;
-            {
-                std::lock_guard<std::mutex> lk(g_agc_state_mu);
-                n = gpu::flush_deferred_streams();
-            }
-            for (; n > 0; n--) prosper_eq_trigger_eop();
+            // EOP pulses fire at submit time (liveness); the flush only applies deferred writes.
+            std::lock_guard<std::mutex> lk(g_agc_state_mu);
+            gpu::flush_deferred_streams();
         }
     }).detach();
 }
@@ -989,15 +986,18 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
     uint32_t walk = dw_num ? dw_num : kUnknownCap;
     std::lock_guard<std::mutex> lk(g_agc_state_mu);   // serialize with the other submit entry (#278)
     // #312: flush any earlier stream paused on a WAIT_REG_MEM — this submit may be its producer.
-    for (int i = gpu::flush_deferred_streams(); i > 0; i--) prosper_eq_trigger_eop();
+    gpu::flush_deferred_streams();
     agc_gpu_state().draws.clear();
     size_t applied = gpu::run_command_buffer(addr, walk, agc_gpu_state());
     g_submit_count++;
-    // A fold that PAUSED on an unsatisfied wait has not completed — its EOP pulse fires when its
-    // deferred effects flush (one pulse per completed stream, owed by flush_deferred_streams).
-    if (!gpu::last_fold_deferred()) prosper_eq_trigger_eop();
-    else start_defer_watchdog();   // #312: a paused stream must flush even if no submit follows
-    for (int i = gpu::flush_deferred_streams(); i > 0; i--) prosper_eq_trigger_eop();
+    // #312 WAIT_DEFER liveness: the EOP pulse fires at every submit even when the fold paused on
+    // an unsatisfied barrier — withholding it starved the frame pacer and wedged every WAIT_DEFER
+    // run (submits stop, so the producer that would satisfy the barrier never arrives). Only the
+    // stream's MEMORY writes stay deferred; the watchdog flushes them the moment the barrier
+    // satisfies (or the 50 ms timeout degrades to the old proceed-loudly behavior).
+    prosper_eq_trigger_eop();
+    if (gpu::last_fold_deferred()) start_defer_watchdog();
+    gpu::flush_deferred_streams();
     static const unsigned render_every2 = [] {
         const char* e = getenv("PROSPER_RENDER_EVERY"); long v = e ? atol(e) : 1; return v > 0 ? (unsigned)v : 1u; }();
     static unsigned draw_submits2 = 0;
@@ -1099,16 +1099,17 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     // Clearing here (not after) keeps this submit's draws inspectable once the handler returns. (Ported
     // from PRs #31/#32.)
     // #312: flush any earlier stream paused on a WAIT_REG_MEM — this submit may be its producer.
-    for (int i = gpu::flush_deferred_streams(); i > 0; i--) prosper_eq_trigger_eop();
+    gpu::flush_deferred_streams();
     agc_gpu_state().draws.clear();
     size_t applied = gpu::run_command_buffer(p->addr, p->dw_num, agc_gpu_state());
     g_submit_count++;
     // The submit has "completed" (synchronous fold): fire any registered GPU EOP events. Inert unless the
     // game called sceGnmAddEqEvent (b0xyllnVY-I); the RELEASE_MEM label write already happened in apply().
-    // #312: a fold that PAUSED on an unsatisfied wait has not completed — its pulse fires at flush.
-    if (!gpu::last_fold_deferred()) prosper_eq_trigger_eop();
-    else start_defer_watchdog();   // #312: a paused stream must flush even if no submit follows
-    for (int i = gpu::flush_deferred_streams(); i > 0; i--) prosper_eq_trigger_eop();
+    // #312 WAIT_DEFER liveness: the pulse fires even for a fold paused on an unsatisfied barrier —
+    // only the stream's MEMORY writes stay deferred (see submit_dcb_stream).
+    prosper_eq_trigger_eop();
+    if (gpu::last_fold_deferred()) start_defer_watchdog();
+    gpu::flush_deferred_streams();
     // Stage A: if a live renderer has been registered (runtime binary wires a Vulkan device) and this
     // submit accumulated draws, execute the folded GpuState and present the frame. Inert (returns false)
     // on the pure-HLE path until a device is registered, so it never perturbs the existing boot behavior.

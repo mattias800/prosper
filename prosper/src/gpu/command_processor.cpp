@@ -738,12 +738,16 @@ void GpuState::apply(const Pm4Command& c) {
         case K::Flip:
             // The GPU reaching the SetFlip packet IS the flip moment: perform the videoout flip so
             // GetFlipStatus advances and the game's frame pacer sees its flipArg complete. Only for
-            // a fully-decoded payload — a short packet must not fabricate a flip. Behind an
-            // unsatisfied wait the flip defers with the other effects (#312); otherwise it rides
-            // the pipe-drain queue like every completion signal (a flip is a lifecycle signal —
-            // the game recycles display buffers on it — and must not be observable mid-submit).
+            // a fully-decoded payload — a short packet must not fabricate a flip.
+            //
+            // #312 WAIT_DEFER liveness: the flip is NOT held behind an unsatisfied barrier. Every
+            // WAIT_DEFER run that paused flips wedged the frame loop within seconds (the pacer
+            // starves and the guest stops submitting — including the producer that would satisfy
+            // the barrier). Withholding only the MEMORY writes (ReleaseMem/WriteData/DmaData) keeps
+            // the corruption-relevant ordering (never show a fence value ahead of its barrier)
+            // while the pacing signals flow; the failure direction becomes "label still reads 0 a
+            // little longer" — the safe side of the guest's consumption poll. CONFIDENCE: MED.
             if (!c.flip_valid) break;
-            if (g_fold_deferring) { defer_push(c); break; }
             if (eop_write_sync()) prosper_vo_flip_from_gpu(c.flip_handle, c.flip_bufidx, c.flip_mode, c.flip_arg);
             else pend_enqueue(c);
             break;
