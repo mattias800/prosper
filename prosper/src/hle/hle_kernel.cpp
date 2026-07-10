@@ -532,6 +532,27 @@ static timespec abs_deadline_us(uint64_t usec) {
     if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
     return ts;
 }
+// scePthreadMutexTimedlock(mutex, SceKernelUseconds usec): acquire with a RELATIVE microsecond timeout,
+// returning 0 only when actually locked. Was MISSING -> the generic stub returned 0 (= "lock held")
+// without taking the lock, so the guest ran its critical section unguarded (the heap/GC-corruption class
+// root-caused for null static locks). ETIMEDOUT -> FreeBSD 60 (fbsd_errno doesn't remap it).
+HLE(k_mutex_timedlock) {
+    auto* m = ensure_mutex(a0); if (!m) return 0x16;   // EINVAL
+    timespec dl = abs_deadline_us(a1);
+    int rc = pthread_mutex_timedlock(m, &dl);
+    return rc == ETIMEDOUT ? 60u : fbsd_errno(rc);
+}
+// scePthreadCondTimedwait(cond, mutex, SceKernelUseconds usec): the Sony 3rd arg is a RELATIVE µs scalar,
+// NOT an abstime pointer -> it must NOT be aliased to the POSIX k_cond_timedwait (which reads a2 as a
+// timespec*, so a small µs integer there derefs a bogus pointer). Was MISSING -> the stub returned 0
+// (= "woke"), so a timed cond-wait loop busy-spun (the same #115 class fixed for the POSIX variant).
+HLE(k_cond_timedwait_sce) {
+    auto* c = ensure_cond(a0); auto* m = ensure_mutex(a1);
+    if (!c || !m) return 0x16;                          // EINVAL
+    timespec dl = abs_deadline_us(a2);
+    int rc = pthread_cond_timedwait(c, m, &dl);
+    return rc == ETIMEDOUT ? 60u : (uint64_t)rc;        // FreeBSD ETIMEDOUT
+}
 HLE(k_ef_wait)    { // (ef, pattern, waitMode, resultPat*, SceKernelUseconds* timeout)
     // The timeout arg (a4) was previously IGNORED — a bounded guest wait blocked forever (the
     // same class of silent hang root-caused for wait_on_address, hle_kernel_mem.cpp). Sony
@@ -1019,6 +1040,7 @@ void register_kernel_hle() {
     R("scePthreadMutexDestroy", k_mutex_destroy);
     R("scePthreadMutexLock", k_mutex_lock);
     R("scePthreadMutexTrylock", k_mutex_trylock);
+    R("scePthreadMutexTimedlock", k_mutex_timedlock);   // was MISSING -> faked "locked" without locking
     R("scePthreadMutexUnlock", k_mutex_unlock);
     R("scePthreadCondattrInit", k_condattr_init);
     R("scePthreadCondattrDestroy", k_condattr_destroy);
@@ -1027,6 +1049,7 @@ void register_kernel_hle() {
     R("scePthreadCondSignal", k_cond_signal);
     R("scePthreadCondBroadcast", k_cond_broadcast);
     R("scePthreadCondWait", k_cond_wait);
+    R("scePthreadCondTimedwait", k_cond_timedwait_sce);   // Sony: relative µs, NOT the POSIX abstime form
     // read/write locks + once (Sony + POSIX names) — real host primitives (thread-safety fix).
     R("scePthreadRwlockInit", k_rwlock_init);        R("pthread_rwlock_init", k_rwlock_init);
     R("scePthreadRwlockDestroy", k_rwlock_destroy);  R("pthread_rwlock_destroy", k_rwlock_destroy);
