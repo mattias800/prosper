@@ -145,6 +145,33 @@ void GpuState::apply(const Pm4Command& c) {
             index_type = c.index_size;
             state_dirty_ = true;
             break;
+        case K::SetIndexBase:
+            index_base = c.ib_addr;   // bind index-buffer base (issue #232)
+            break;
+        case K::SetIndexCount:
+            index_num = c.index_count;   // bind index count (issue #232)
+            break;
+        case K::DrawIndexOffset: {
+            // Gen5 indexed draw (issue #232). Uses the bound index base + count; DrawIndexOffset's own
+            // count (c.index_count) overrides the SetIndexCount state when non-zero. The element size is
+            // the current SetIndexType (0=16-bit, 1=32-bit), captured in the per-draw snapshot.
+            if (state_dirty_ || !last_snapshot_) {
+                auto snap = std::make_shared<GpuState>();
+                snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
+                last_snapshot_ = std::move(snap);
+                state_dirty_ = false;
+            }
+            uint32_t elem = index_type ? 4u : 2u;
+            Draw d;
+            d.index_count = c.index_count ? c.index_count : index_num;
+            d.state = last_snapshot_;
+            if (index_base && d.index_count) {
+                d.indexed = true;
+                d.index_addr = index_base + (uint64_t)c.index_offset * elem;
+            }
+            draws.push_back(std::move(d));
+            break;
+        }
         case K::DrawIndexAuto:
         case K::DrawIndex: {
             // Snapshot the register state AT THE DRAW (shared with consecutive draws until a register

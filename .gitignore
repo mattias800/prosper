@@ -37,6 +37,9 @@ compile_commands.json
 .DS_Store
 Thumbs.db
 
-# Rendered screenshot artifacts (viewable locally, not committed)
+# Rendered screenshot artifacts (viewable locally, NEVER committed — game imagery). The renderer can
+# drop frame_*.bmp/.png into whatever cwd it runs from, including the repo root, so cover it here too.
 prosper/screenshots/
 *.spv
+*.bmp
+frame_*.png

@@ -37,7 +37,8 @@ constexpr uint32_t IT_NOP = 0x10, IT_INDEX_TYPE = 0x2A, IT_EVENT_WRITE = 0x46, I
 constexpr uint32_t R_DRAW_INDEX = 0x03, R_DRAW_INDEX_AUTO = 0x04, R_DRAW_RESET = 0x05, R_WAIT_FLIP_DONE = 0x06,
                    R_SH_REGS_INDIRECT = 0x11, R_CX_REGS_INDIRECT = 0x12, R_UC_REGS_INDIRECT = 0x13,
                    R_ACQUIRE_MEM = 0x14, R_WRITE_DATA = 0x15, R_WAIT_MEM_64 = 0x16, R_FLIP = 0x17,
-                   R_RELEASE_MEM = 0x18, R_DMA_DATA = 0x19, R_DISPATCH_DIRECT = 0x1a;
+                   R_RELEASE_MEM = 0x18, R_DMA_DATA = 0x19, R_DISPATCH_DIRECT = 0x1a,
+                   R_INDEX_BASE = 0x1b, R_INDEX_COUNT = 0x1c, R_DRAW_INDEX_OFFSET = 0x1d;
 constexpr uint32_t R_NUM = 0x40;
 inline uint32_t PM4(uint32_t len, uint32_t op, uint32_t r) {
     return 0xC0000000u | (((len - 2u) & 0x3fffu) << 16u) | ((op & 0xffu) << 8u) | ((r & (R_NUM - 1u)) << 2u);
@@ -137,6 +138,48 @@ HLE(agc_dcb_draw_index) {
     cmd[6] = 0;
     return (uint64_t)(uintptr_t)cmd;
 }
+// --- Gen5 indexed-draw builders (issue #232, DOLL/UE4 geometry path). ---------------------------
+// DOLL's UE4 RHI submits ALL scene geometry through THREE builders that were unimplemented->0 (no
+// packet appended), so every draw was silently dropped before the PM4 stream (0 DrawIndex in the
+// histogram despite 5.4M calls/run each). The Messenger uses DrawIndex/DrawIndexAuto instead, so it
+// never exercised this path. NIDs verified against the PS5 3.20 stub tables (../PS5-3.20_Libs):
+//   l4fM9K-Lyks = sceAgcDcbSetIndexBuffer, 8N2tmT3jmC8 = sceAgcDcbSetIndexCount,
+//   B+aG9DUnTKA = sceAgcDcbDrawIndexOffset.
+// ABI: Kyty has no Gen5 reference for these, so args are pinned by the sce::Agc DrawCommandBuffer
+// draw model + live capture (PROSPER_GFXLOG dumps a0..a3). setIndexBuffer(dcb, indexAddr);
+// setIndexCount(dcb, count); drawIndexOffset(dcb, startIndex[, count]). The bound base+count thread
+// through GpuState to the emitted indexed Draw (decoder R_INDEX_*; command_processor DrawIndexOffset).
+// CONFIDENCE: MED (arg roles from the AGC draw model + live values; refined by the GFXLOG capture).
+static std::atomic<uint64_t> g_ib_log{0};
+HLE(agc_dcb_set_index_buffer) {  // (dcb, indexBufferAddr)
+    if (getenv("PROSPER_GFXLOG") && g_ib_log.fetch_add(1) < 24)
+        fprintf(stderr, "[agc] SetIndexBuffer dcb=0x%llx addr=0x%llx a2=0x%llx\n",
+                (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2);
+    uint32_t* cmd; if (!begin_packet(a0, 3, IT_NOP, R_INDEX_BASE, &cmd)) return 0;
+    cmd[1] = (uint32_t)(a1 & 0xffffffffu); cmd[2] = (uint32_t)(a1 >> 32u);
+    return (uint64_t)(uintptr_t)cmd;
+}
+static std::atomic<uint64_t> g_ic_log{0};
+HLE(agc_dcb_set_index_count) {  // (dcb, indexCount)
+    if (getenv("PROSPER_GFXLOG") && g_ic_log.fetch_add(1) < 24)
+        fprintf(stderr, "[agc] SetIndexCount dcb=0x%llx count=0x%llx\n",
+                (unsigned long long)a0, (unsigned long long)a1);
+    uint32_t* cmd; if (!begin_packet(a0, 2, IT_NOP, R_INDEX_COUNT, &cmd)) return 0;
+    cmd[1] = (uint32_t)a1;
+    return (uint64_t)(uintptr_t)cmd;
+}
+static std::atomic<uint64_t> g_do_log{0};
+HLE(agc_dcb_draw_index_offset) {  // (dcb, startIndex[, indexCount])
+    if (getenv("PROSPER_GFXLOG") && g_do_log.fetch_add(1) < 24)
+        fprintf(stderr, "[agc] DrawIndexOffset dcb=0x%llx off=0x%llx a2=0x%llx a3=0x%llx\n",
+                (unsigned long long)a0, (unsigned long long)a1,
+                (unsigned long long)a2, (unsigned long long)a3);
+    uint32_t* cmd; if (!begin_packet(a0, 3, IT_NOP, R_DRAW_INDEX_OFFSET, &cmd)) return 0;
+    cmd[1] = (uint32_t)a1;
+    cmd[2] = (uint32_t)a2;   // explicit draw count if the builder passes one; 0 => use SetIndexCount
+    return (uint64_t)(uintptr_t)cmd;
+}
+
 // sceAgcSuspendPoint (NID h9z6+0hEydk, name via shadPS4) — the TRC R5089 GPU suspend point the
 // game forces in a loop ("Forcing call to sce::Agc::suspendPoint" spam). It has no out-params and
 // no game-visible state; on a devkit it just gives the system a safe suspend opportunity.
@@ -795,9 +838,9 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
         std::vector<gpu::Pm4Command> ops; gpu::decode_pm4(p->addr, p->dw_num, ops);
         static const char* kKindName[] = {"DrawReset","WaitFlipDone","SetShRegDirect","SetRegsIndirect",
             "SetIndexType","DrawIndex","DrawIndexAuto","EventWrite","AcquireMem","WriteData","WaitRegMem",
-            "Flip","ReleaseMem","DispatchDirect","Unknown"};
+            "Flip","ReleaseMem","DispatchDirect","SetIndexBase","SetIndexCount","DrawIndexOffset","Unknown"};
         for (auto& c : ops) {
-            uint32_t k = (uint32_t)c.kind; const char* nm = k < 15 ? kKindName[k] : "?";
+            uint32_t k = (uint32_t)c.kind; const char* nm = k < 18 ? kKindName[k] : "?";
             fprintf(stderr, "[agc]   pkt op=0x%02x r=0x%02x len=%u kind=%s pl0=0x%08x pl1=0x%08x pl2=0x%08x\n",
                     c.op, c.r, c.len, nm,
                     c.len > 1 ? c.payload[0] : 0, c.len > 2 ? c.payload[1] : 0, c.len > 3 ? c.payload[2] : 0);
@@ -895,6 +938,10 @@ void register_agc_hle() {
     RN("GIIW2J37e70", agc_dcb_set_index_size);
     RN("Yw0jKSqop+E", agc_dcb_draw_index_auto);
     RN("q88lQ+GP5Yk", agc_dcb_draw_index);      // sceAgcDcbDrawIndex (see handler comment)
+    // Gen5 indexed-draw path (issue #232, DOLL/UE4 geometry — was unimplemented->0, all draws dropped).
+    RN("l4fM9K-Lyks", agc_dcb_set_index_buffer); // sceAgcDcbSetIndexBuffer
+    RN("8N2tmT3jmC8", agc_dcb_set_index_count);  // sceAgcDcbSetIndexCount
+    RN("B+aG9DUnTKA", agc_dcb_draw_index_offset);// sceAgcDcbDrawIndexOffset
     RN("h9z6+0hEydk", agc_suspend_point);       // sceAgcSuspendPoint — no-op OK
     RN("aJf+j5yntiU", agc_dcb_event_write);
     RN("57labkp+rSQ", agc_dcb_acquire_mem);
