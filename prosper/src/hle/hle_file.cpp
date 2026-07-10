@@ -357,6 +357,16 @@ HLE(f_open)  { std::string h = translate(CS(a0)); int fd = (int)::open(h.c_str()
                if (fd >= 0) preadlog("open", (uint64_t)fd, 0, 0); return (uint64_t)(int64_t)fd; }
 HLE(f_close) { if (a0 < 3) { preadlog("close-lo-ignored", a0, 0, 0); return 0; }
                preadlog("close", a0, 0, 0); return (uint64_t)(int64_t)::close((int)a0); }
+// dup/dup2 were MISSING -> the return-0 stub handed back fd 0 (a valid-looking descriptor that is actually
+// stdin), so the guest read/closed stdin thinking it was its duplicate -> the fd-0 hazard this file guards
+// against elsewhere. Back with host dup/dup2; dup keeps the result above fd 2 (same as f_open).
+#ifndef _WIN32
+HLE(f_dup)  { int fd = ::dup((int)a0); while (fd >= 0 && fd < 3) { int n = fcntl(fd, F_DUPFD, 3); ::close(fd); fd = n; } return (uint64_t)(int64_t)fd; }
+HLE(f_dup2) { return (uint64_t)(int64_t)::dup2((int)a0, (int)a1); }
+#else
+HLE(f_dup)  { return (uint64_t)-1; }
+HLE(f_dup2) { return (uint64_t)-1; }
+#endif
 #ifndef _WIN32
 // FULL read: loop until `count` bytes are read (or EOF/error). POSIX read()/pread() may return FEWER
 // bytes than requested (a "short read") for a perfectly valid regular file — at internal buffer
@@ -1159,6 +1169,7 @@ void register_file_hle() {
     R("rmdir", f_rmdir);          R("sceKernelRmdir", f_rmdir);
     R("unlink", f_unlink);        R("sceKernelUnlink", f_unlink);
     R("rename", f_rename);        R("sceKernelRename", f_rename);   // real move (was fake-success -> lost atomic saves)
+    R("dup", f_dup);   R("sceKernelDup", f_dup);   R("dup2", f_dup2);   R("sceKernelDup2", f_dup2);   // were 0 = stdin
     R("sceKernelGetdents", f_getdents); R("getdents", f_getdents);
     // vectored IO + getdirentries — real host ops (were MISSING -> silent-EOF / empty-dir corruption trap)
     R("sceKernelReadv", f_readv);       R("readv", f_readv);
