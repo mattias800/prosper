@@ -137,6 +137,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_service_getters PRIVATE prosper_core)
   add_test(NAME service_getters COMMAND test_service_getters)
 
+  # PlatformUi hook (#347): the app frontend can service the guest's ImeDialog with real UI; with no
+  # backend registered the headless auto-complete default is unchanged. Pure, no game dump.
+  add_executable(test_platform_ui tests/test_platform_ui.cpp)
+  target_link_libraries(test_platform_ui PRIVATE prosper_core)
+  add_test(NAME platform_ui COMMAND test_platform_ui)
+
   # libSceImeDialog lifecycle + libSceSaveData memory API round-trip (#191): auto-completing dialog
   # (no hang) + a real per-(user,slot) Set->Get memory block with verified shadPS4 struct layouts.
   add_executable(test_savedata_ime tests/test_savedata_ime.cpp)

@@ -5,6 +5,7 @@
 // (Game-controller input — libScePad — moved to hle_pad.cpp with a real host backend.)
 #include "dispatch.hpp"
 #include "nid.hpp"
+#include "platform_ui.hpp"
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
@@ -272,12 +273,28 @@ HLE(s_dialog_result)   { if (a0) memset(PW(a0), 0, 0x2C); return 0; }
 // 2=RUNNING,3=FINISHED). CONFIDENCE: HIGH on the lifecycle (mirrors MsgDialog); MED on the exact
 // GetResult layout — we write only the 4-byte endStatus at offset 0 (the field the game branches on),
 // never more, so a wrong tail-field guess can't corrupt the caller's struct.
-namespace { std::atomic<int> g_imedialog_status{0 /*NONE*/}; }
-HLE(s_imedlg_init)   { g_imedialog_status.store(3 /*FINISHED — auto-complete, no keyboard UI*/); return 0; }
-HLE(s_imedlg_status) { return (uint64_t)(unsigned)g_imedialog_status.load(); }
-HLE(s_imedlg_result) { if (a0) *(int32_t*)PW(a0) = 0 /*SCE_IME_DIALOG_END_STATUS_OK*/; return 0; }
-HLE(s_imedlg_term)   { g_imedialog_status.store(0 /*NONE*/); return 0; }
-HLE(s_imedlg_abort)  { g_imedialog_status.store(0 /*NONE*/); return 0; }
+// A registered PlatformUi (the app frontend) gets first refusal on the dialog: if it takes it
+// (imeDialogOpen -> true), status/result/close route there so a real text field is shown; otherwise
+// the core auto-completes headlessly (below). `g_imedialog_backed` records which path Init chose so a
+// later poll/result/term goes to the same place. See platform_ui.hpp (#347).
+namespace { std::atomic<int> g_imedialog_status{0 /*NONE*/}; std::atomic<int> g_imedialog_backed{0}; }
+HLE(s_imedlg_init) {
+    if (auto* ui = platform_ui(); ui && ui->imeDialogOpen(a0, a1)) { g_imedialog_backed.store(1); return 0; }
+    g_imedialog_backed.store(0);
+    g_imedialog_status.store(3 /*FINISHED — auto-complete, no keyboard UI*/);
+    return 0;
+}
+HLE(s_imedlg_status) {
+    if (g_imedialog_backed.load()) { if (auto* ui = platform_ui()) return (uint64_t)(unsigned)ui->imeDialogStatus(); }
+    return (uint64_t)(unsigned)g_imedialog_status.load();
+}
+HLE(s_imedlg_result) {
+    if (g_imedialog_backed.load()) { if (auto* ui = platform_ui()) { (void)ui->imeDialogResult(a0); return 0; } }
+    if (a0) *(int32_t*)PW(a0) = 0 /*SCE_IME_DIALOG_END_STATUS_OK*/;
+    return 0;
+}
+HLE(s_imedlg_term)  { if (g_imedialog_backed.exchange(0)) { if (auto* ui = platform_ui()) ui->imeDialogClose(); } g_imedialog_status.store(0 /*NONE*/); return 0; }
+HLE(s_imedlg_abort) { if (g_imedialog_backed.exchange(0)) { if (auto* ui = platform_ui()) ui->imeDialogClose(); } g_imedialog_status.store(0 /*NONE*/); return 0; }
 
 // --- libSceNpTrophy2 (PS5 trophy system) — the DOLL 34.6 GB OOM (issue #213 diagnosis). ---------
 // The guest's trophy bring-up (eboot+0xdbcb43..0xdbcc2e, gdb-captured live) calls
