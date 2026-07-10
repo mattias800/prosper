@@ -119,6 +119,45 @@ int main() {
     printf("  image_sample_lz(0.75,0.25) center=(%u,%u,%u)\n", okLz?rgb[0]:0, okLz?rgb[1]:0, okLz?rgb[2]:0);
     CHECK(okLz && rgb[1] > 0x80 && rgb[0] < 0x40 && rgb[2] < 0x40, "image_sample_lz (explicit LOD 0) samples texel (1,0) = GREEN");
 
+    // image_sample_lz_o (#273 — DOLL FXAA): LOD-0 sample with a packed TEXEL offset in the first
+    // vaddr (x=+1 in bits[5:0], y=+1 in bits[13:8]). Sampling (0.25,0.25) with offset (+1,+1) must
+    // land on texel (1,1) = WHITE (the offset folds into the normalized coords via the level-0 size).
+    const uint32_t lzo[] = {
+        0x7e0002ffu, 0x00000101u, 0x7e0202ffu, 0x3e800000u, 0x7e0402ffu, 0x3e800000u,
+        0xf0dc0f08u, 0x00820000u, 0xf800080fu, 0x03020100u, 0xbf810000u,
+    };
+    std::vector<uint32_t> lzof = recompile_fragment(lzo, sizeof(lzo)/sizeof(lzo[0]), &rt);
+    bool okLzo = !lzof.empty() && lzof[0] == 0x07230203u;
+    CHECK(okLzo, "recompiled image_sample_lz_o PS -> SPIR-V");
+    if (okLzo) {
+        std::vector<uint8_t> px = prosper::test::render_triangle_rgba(vert, lzof, W, H, nullptr, nullptr, nullptr, &td);
+        okLzo = px.size() == (size_t)W*H*4;
+        if (okLzo) { const uint8_t* c = &px[((size_t)(H/2)*W + W/2)*4]; rgb[0]=c[0]; rgb[1]=c[1]; rgb[2]=c[2]; }
+        printf("  image_sample_lz_o(0.25,0.25,+1,+1) center=(%u,%u,%u)\n", okLzo?rgb[0]:0, okLzo?rgb[1]:0, okLzo?rgb[2]:0);
+        CHECK(okLzo && rgb[0] > 0x80 && rgb[1] > 0x80 && rgb[2] > 0x80,
+              "image_sample_lz_o offset (+1,+1) from texel (0,0) samples texel (1,1) = WHITE");
+    }
+
+    // image_gather4_lz_o (locks the #296 helper's operand-ID fix): gather the ALPHA channel (dmask
+    // 0x8) with a packed (+1,+1) offset — every texel's alpha is 255, so all four gathered values
+    // are 1.0 and the export is WHITE. (Before the fix the emitted OpBitFieldSExtract used raw
+    // integers 0/6/8 as operand IDs — an invalid module the driver rejects -> nothing renders.)
+    const uint32_t g4o[] = {
+        0x7e0002ffu, 0x00000101u, 0x7e0202ffu, 0x3e800000u, 0x7e0402ffu, 0x3e800000u,
+        0xf15c0808u, 0x00820400u, 0xf800000fu, 0x07060504u, 0xbf810000u,
+    };
+    std::vector<uint32_t> g4of = recompile_fragment(g4o, sizeof(g4o)/sizeof(g4o[0]), &rt);
+    bool okG4o = !g4of.empty() && g4of[0] == 0x07230203u;
+    CHECK(okG4o, "recompiled image_gather4_lz_o PS -> SPIR-V");
+    if (okG4o) {
+        std::vector<uint8_t> px = prosper::test::render_triangle_rgba(vert, g4of, W, H, nullptr, nullptr, nullptr, &td);
+        okG4o = px.size() == (size_t)W*H*4;
+        if (okG4o) { const uint8_t* c = &px[((size_t)(H/2)*W + W/2)*4]; rgb[0]=c[0]; rgb[1]=c[1]; rgb[2]=c[2]; }
+        printf("  image_gather4_lz_o alpha center=(%u,%u,%u)\n", okG4o?rgb[0]:0, okG4o?rgb[1]:0, okG4o?rgb[2]:0);
+        CHECK(okG4o && rgb[0] > 0x80 && rgb[1] > 0x80 && rgb[2] > 0x80,
+              "image_gather4_lz_o gathers alpha=1.0 x4 -> WHITE (valid module, offset decoded)");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

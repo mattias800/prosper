@@ -1606,6 +1606,203 @@ int main() {
     printf("  T12(pcrel table) mismatches=%u (out[2]=%g expect=%g)\n", badT12, gotT12.size()==N?gotT12[2]:-1, expT12[2]);
     CHECK(gotT12.size()==N && badT12==0, "T12: buffer_load through a getpc-built V# reads the embedded table");
 
+    // Kernel T13: UINT8x1 vertex fetch (#273 — DOLL's skinned scene VS bone-index attribute class).
+    // buffer_load_format_x of a Uint8 element delivers the RAW integer (no normalization) in the VGPR.
+    // v1=(uint)a0 (element idx); fetch; out=(float)(uint)v1. llvm-mc gfx1010:
+    //   v_cvt_u32_f32 v1,v0 | buffer_load_format_x v1, v1, s[8:11], 0 idxen | s_waitcnt | v_cvt_f32_u32 v0,v1
+    const uint32_t codeT13[] = { 0x7e020f00u, 0xe0002000u, 0x80020101u, 0xbf8c3f70u, 0x7e000d01u, 0xbf810000u };
+    ShaderResourceTable rtT13;
+    { ShaderResource vb{}; vb.cls = ResourceClass::VertexBuffer; vb.format = DataFormat::Uint8;
+      vb.num_components = 1; vb.binding = 3; vb.stride = 4; vb.sgpr_base = 8; rtT13.resources.push_back(vb); }
+    std::vector<uint32_t> spvT13 = recompile_valu(codeT13, sizeof(codeT13)/4, 1, 0, &rtT13);
+    CHECK(!spvT13.empty(), "recompiled T13 (buffer_load_format_x UINT8) -> SPIR-V");
+    std::vector<float> inT13(N), expT13(N); std::vector<uint32_t> vbufT13(N);
+    for (uint32_t i = 0; i < N; i++) { inT13[i] = (float)i; uint32_t bv = (7u * i + 3u) & 0xFFu;
+        vbufT13[i] = bv | 0xA5A5A500u;   // garbage in the upper bytes must NOT leak into the component
+        expT13[i] = (float)bv; }
+    std::vector<float> gotT13 = prosper::test::run_compute(spvT13, inT13, N, N, {}, vbufT13);
+    uint32_t badT13 = 0; for (uint32_t i=0;i<N&&gotT13.size()==N;i++) if (gotT13[i]!=expT13[i]) badT13++;
+    printf("  T13(uint8 fetch) mismatches=%u (out[5]=%g expect=%g)\n", badT13, gotT13.size()==N?gotT13[5]:-1, expT13[5]);
+    CHECK(gotT13.size()==N && badT13==0, "T13: Uint8 attribute delivers the raw zero-extended integer");
+
+    // Kernel T14: SINT8x1 vertex fetch — sign-extended integer. Same code; V# format Sint8; the
+    // final convert is v_cvt_f32_i32 so -1 (0xFF) comes back as -1.0.
+    const uint32_t codeT14[] = { 0x7e020f00u, 0xe0002000u, 0x80020101u, 0xbf8c3f70u, 0x7e000b01u, 0xbf810000u };
+    ShaderResourceTable rtT14;
+    { ShaderResource vb{}; vb.cls = ResourceClass::VertexBuffer; vb.format = DataFormat::Sint8;
+      vb.num_components = 1; vb.binding = 3; vb.stride = 4; vb.sgpr_base = 8; rtT14.resources.push_back(vb); }
+    std::vector<uint32_t> spvT14 = recompile_valu(codeT14, sizeof(codeT14)/4, 1, 0, &rtT14);
+    CHECK(!spvT14.empty(), "recompiled T14 (buffer_load_format_x SINT8) -> SPIR-V");
+    std::vector<float> inT14(N), expT14(N); std::vector<uint32_t> vbufT14(N);
+    for (uint32_t i = 0; i < N; i++) { inT14[i] = (float)i; int32_t sv = (int32_t)(i % 5) - 2;   // -2..2
+        vbufT14[i] = ((uint32_t)sv & 0xFFu) | 0x5A5A5A00u; expT14[i] = (float)sv; }
+    std::vector<float> gotT14 = prosper::test::run_compute(spvT14, inT14, N, N, {}, vbufT14);
+    uint32_t badT14 = 0; for (uint32_t i=0;i<N&&gotT14.size()==N;i++) if (gotT14[i]!=expT14[i]) badT14++;
+    printf("  T14(sint8 fetch) mismatches=%u (out[7]=%g expect=%g)\n", badT14, gotT14.size()==N?gotT14[7]:-1, expT14[7]);
+    CHECK(gotT14.size()==N && badT14==0, "T14: Sint8 attribute delivers the sign-extended integer");
+
+    // Kernel T15: REGISTER-SOFFSET s_buffer_load (#273 — DOLL's bloom-combine loop reads per-tap
+    // weights at a computed cbuf offset). s4 = 4*(uint)a0 (readfirstlane); s_buffer_load_dword
+    // s5, s[0:3], s4 offset:0x4 -> cbuf dword (4*u+4)>>2 = u+1; out=(float)s5. llvm-mc gfx1010.
+    const uint32_t codeT15[] = { 0x7e020f00u, 0x34020282u, 0x7e080501u,
+                                 0xf4200140u, 0x08000004u, 0xbf8cc07fu, 0x7e000c05u, 0xbf810000u };
+    std::vector<uint32_t> spvT15 = recompile_valu(codeT15, sizeof(codeT15)/4, 1, 0);
+    CHECK(!spvT15.empty(), "recompiled T15 (s_buffer_load with register SOFFSET) -> SPIR-V");
+    std::vector<uint32_t> cbufT15 = { 100u, 7u, 11u, 13u, 17u, 23u, 29u, 31u, 37u, 41u, 43u };
+    std::vector<float> inT15(8), expT15(8);
+    for (uint32_t i = 0; i < 8; i++) { inT15[i] = (float)i; expT15[i] = (float)cbufT15[i + 1]; }
+    std::vector<float> gotT15 = prosper::test::run_compute(spvT15, inT15, 8, 8, cbufT15);
+    uint32_t badT15 = 0; for (uint32_t i=0;i<8&&gotT15.size()==8;i++) if (gotT15[i]!=expT15[i]) badT15++;
+    printf("  T15(dyn s_buffer_load) mismatches=%u (out[2]=%g expect=%g)\n", badT15, gotT15.size()==8?gotT15[2]:-1, expT15[2]);
+    CHECK(gotT15.size()==8 && badT15==0, "T15: register-SOFFSET s_buffer_load indexes the cbuf dynamically");
+
+    // Kernel T16: v_movrels_b32 (#273 — DOLL UI/skinned VS: M0-relative VGPR read). m0 = (uint)a0
+    // (via v_readfirstlane m0); v2=10.0 v3=20.0 v4=30.0; v_movrels_b32 v0, v2 -> VGPR[2+m0].
+    const uint32_t codeT16[] = { 0x7e020f00u, 0x7ef80501u,
+                                 0x7e0402ffu, 0x41200000u, 0x7e0602ffu, 0x41a00000u, 0x7e0802ffu, 0x41f00000u,
+                                 0x7e008702u, 0xbf810000u };
+    std::vector<uint32_t> spvT16 = recompile_valu(codeT16, sizeof(codeT16)/4, 1, 0);
+    CHECK(!spvT16.empty(), "recompiled T16 (v_movrels_b32) -> SPIR-V");
+    std::vector<float> inT16(8), expT16(8);
+    const float relT16[3] = { 10.0f, 20.0f, 30.0f };
+    for (uint32_t i = 0; i < 8; i++) { inT16[i] = (float)(i % 3); expT16[i] = relT16[i % 3]; }
+    std::vector<float> gotT16 = prosper::test::run_compute(spvT16, inT16, 8, 8);
+    uint32_t badT16 = 0; for (uint32_t i=0;i<8&&gotT16.size()==8;i++) if (gotT16[i]!=expT16[i]) badT16++;
+    printf("  T16(v_movrels) mismatches=%u (out[4]=%g expect=%g)\n", badT16, gotT16.size()==8?gotT16[4]:-1, expT16[4]);
+    CHECK(gotT16.size()==8 && badT16==0, "T16: v_movrels_b32 reads VGPR[src0+M0] per invocation");
+
+    // Kernel T17: IF/ELSE-IF/ELSE CASCADE via common-merge s_branch arms (#273 — DOLL's color-grade
+    // PS shape: every arm's s_branch jumps to the SAME outer merge). u<2 -> +10; 2<=u<5 -> +20; else +30.
+    const uint32_t codeT17[] = {
+        0x7e020f00u, 0x7e080501u, 0xbf0a8204u, 0xbf840002u, 0x4a02028au, 0xbf820005u,
+        0xbf0a8504u, 0xbf840002u, 0x4a020294u, 0xbf820001u, 0x4a02029eu, 0x7e000d01u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spvT17 = recompile_valu(codeT17, sizeof(codeT17)/4, 1, 0);
+    CHECK(!spvT17.empty(), "recompiled T17 (if/else-if/else cascade, common merge) -> SPIR-V");
+    std::vector<float> inT17(8), expT17(8);
+    for (uint32_t i = 0; i < 8; i++) { inT17[i] = (float)i;
+        expT17[i] = (float)(i + (i < 2 ? 10u : i < 5 ? 20u : 30u)); }
+    std::vector<float> gotT17 = prosper::test::run_compute(spvT17, inT17, 8, 8);
+    uint32_t badT17 = 0; for (uint32_t i=0;i<8&&gotT17.size()==8;i++) if (gotT17[i]!=expT17[i]) badT17++;
+    printf("  T17(cascade) mismatches=%u (out[0]=%g out[3]=%g out[6]=%g expect 10/23/36)\n", badT17,
+           gotT17.size()==8?gotT17[0]:-1, gotT17.size()==8?gotT17[3]:-1, gotT17.size()==8?gotT17[6]:-1);
+    CHECK(gotT17.size()==8 && badT17==0, "T17: each cascade arm selects its own addend");
+
+    // Kernel T18: NESTED if/else INSIDE the outer then-arm, both arms' s_branch jumping to the
+    // OUTERMOST merge (DOLL ps_2086a60000's exact nesting). u<2 -> +10; 2<=u<4 -> +20; else +30.
+    const uint32_t codeT18[] = {
+        0x7e020f00u, 0x7e080501u, 0xbf0a8404u, 0xbf840006u, 0xbf0a8204u, 0xbf840002u,
+        0x4a02028au, 0xbf820003u, 0x4a020294u, 0xbf820001u, 0x4a02029eu, 0x7e000d01u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spvT18 = recompile_valu(codeT18, sizeof(codeT18)/4, 1, 0);
+    CHECK(!spvT18.empty(), "recompiled T18 (nested if/else, escaping merge to outer) -> SPIR-V");
+    std::vector<float> inT18(8), expT18(8);
+    for (uint32_t i = 0; i < 8; i++) { inT18[i] = (float)i;
+        expT18[i] = (float)(i + (i < 2 ? 10u : i < 4 ? 20u : 30u)); }
+    std::vector<float> gotT18 = prosper::test::run_compute(spvT18, inT18, 8, 8);
+    uint32_t badT18 = 0; for (uint32_t i=0;i<8&&gotT18.size()==8;i++) if (gotT18[i]!=expT18[i]) badT18++;
+    printf("  T18(nested cascade) mismatches=%u (out[1]=%g out[2]=%g out[5]=%g expect 11/22/35)\n", badT18,
+           gotT18.size()==8?gotT18[1]:-1, gotT18.size()==8?gotT18[2]:-1, gotT18.size()==8?gotT18[5]:-1);
+    CHECK(gotT18.size()==8 && badT18==0, "T18: nested arms + outer else each select their own addend");
+
+    // Kernel T19: READFIRSTLANE WATERFALL (#273 — DOLL's skinned scene VS bone-matrix indexing).
+    // remaining=exec; L: s4=readfirstlane(v1); v_cmpx_eq(s4,v1); m0=s4; v_movrels v5, v2;
+    // remaining &= ~exec; exec=remaining; s_cbranch_scc1 L; exec=-1. Per-invocation the loop runs
+    // once (my lane IS the first active lane of my own iteration), so the backward mask-SCC branch
+    // linearizes away. out = table[u] for u in 0..2 (table = v2..v4 = 5/7/9).
+    const uint32_t codeT19[] = {
+        0x7e020f00u, 0xbe86047eu, 0x7e0402ffu, 0x40a00000u, 0x7e0602ffu, 0x40e00000u,
+        0x7e0802ffu, 0x41100000u, 0x7e080501u, 0x7da40204u, 0xbefc0304u, 0x7e0a8702u,
+        0x8a867e06u, 0xbefe0406u, 0xbf85fff9u, 0xbefe04c1u, 0x7e000305u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spvT19 = recompile_valu(codeT19, sizeof(codeT19)/4, 1, 0);
+    CHECK(!spvT19.empty(), "recompiled T19 (readfirstlane waterfall + movrels) -> SPIR-V");
+    std::vector<float> inT19(8), expT19(8);
+    const float tabT19[3] = { 5.0f, 7.0f, 9.0f };
+    for (uint32_t i = 0; i < 8; i++) { inT19[i] = (float)(i % 3); expT19[i] = tabT19[i % 3]; }
+    std::vector<float> gotT19 = prosper::test::run_compute(spvT19, inT19, 8, 8);
+    uint32_t badT19 = 0; for (uint32_t i=0;i<8&&gotT19.size()==8;i++) if (gotT19[i]!=expT19[i]) badT19++;
+    printf("  T19(waterfall) mismatches=%u (out[5]=%g expect=%g)\n", badT19, gotT19.size()==8?gotT19[5]:-1, expT19[5]);
+    CHECK(gotT19.size()==8 && badT19==0, "T19: waterfall loop linearizes to a per-invocation once-through");
+
+    // Kernel T20: s_bitcmp1_b32 + s_cselect (#273 — DOLL's feature-flag test chain). u=(uint)a0;
+    // readfirstlane s4; s_bitcmp1_b32 s4, 1 (SCC = bit1); s_cselect_b32 s5, 100, 200; out=(float)s5.
+    // llvm-mc gfx1010: 0xbf0d8104 = s_bitcmp1_b32 s4, 1; 0x850580e4/0x8505e4... assembled below.
+    const uint32_t codeT20[] = {
+        0x7e020f00u,               // v_cvt_u32_f32 v1, v0
+        0x7e080501u,               // v_readfirstlane_b32 s4, v1
+        0xbf0d8104u,               // s_bitcmp1_b32 s4, 1
+        0x850580ffu, 0x00000064u,  // s_cselect_b32 s5, 0x64(100), 0        (scc ? 100 : 0)
+        0x7e000c05u,               // v_cvt_f32_u32 v0, s5
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvT20 = recompile_valu(codeT20, sizeof(codeT20)/4, 1, 0);
+    CHECK(!spvT20.empty(), "recompiled T20 (s_bitcmp1_b32 + s_cselect) -> SPIR-V");
+    std::vector<float> inT20(8), expT20(8);
+    for (uint32_t i = 0; i < 8; i++) { inT20[i] = (float)i; expT20[i] = (i & 2u) ? 100.0f : 0.0f; }
+    std::vector<float> gotT20 = prosper::test::run_compute(spvT20, inT20, 8, 8);
+    uint32_t badT20 = 0; for (uint32_t i=0;i<8&&gotT20.size()==8;i++) if (gotT20[i]!=expT20[i]) badT20++;
+    printf("  T20(bitcmp1) mismatches=%u (out[2]=%g expect=100)\n", badT20, gotT20.size()==8?gotT20[2]:-1);
+    CHECK(gotT20.size()==8 && badT20==0, "T20: s_bitcmp1_b32 sets SCC from the selected bit");
+
+    // Kernel T21: v_fma_mixlo_f16 / mixhi (#273 — DOLL's box-blur f16 packing). v1=(a0*2+3) via
+    // fma_mix_f32; then mixlo packs (a0+1) into v2's low half and mixhi packs (a0+2) into its high
+    // half; out = f16lo(v2) + f16hi(v2) = (a0+1)+(a0+2) recovered via unpack (v_cvt_f32_f16-free:
+    // just re-add via another fma_mix on unpacked halves is overkill — compare packed halves on CPU).
+    // Simpler: out = (float)(uint)v2, compared against the CPU-packed expected bits.
+    const uint32_t codeT21[] = {
+        0x7e020280u,               // v_mov_b32 v1, 0
+        0x7e040280u,               // v_mov_b32 v2, 0
+        0xcc210002u, 0x040600f2u,  // v_fma_mixlo_f16 v2, 1.0, v0, v1   (= a0 into lo half)
+        0xcc220002u, 0x040600f2u,  // v_fma_mixhi_f16 v2, 1.0, v0, v1   (= a0 into hi half)
+        0x7e000d02u,               // v_cvt_f32_u32 v0, v2  (raw packed bits -> float for compare)
+        0xbf810000u,
+    };
+    // (words llvm-mc-round-tripped: 0xcc210002/0xcc220002 + 0x040600f2 = mixlo/mixhi v2, 1.0, v0, v1)
+    std::vector<uint32_t> spvT21 = recompile_valu(codeT21, sizeof(codeT21)/4, 1, 0);
+    CHECK(!spvT21.empty(), "recompiled T21 (v_fma_mixlo/mixhi_f16) -> SPIR-V");
+    auto f2h = [](float f) -> uint32_t {   // float -> IEEE binary16 bits (round-to-nearest-even)
+        union { float f; uint32_t u; } c{f};
+        uint32_t s = (c.u >> 16) & 0x8000u; int32_t e = (int32_t)((c.u >> 23) & 0xFF) - 127 + 15;
+        uint32_t m = c.u & 0x7FFFFFu;
+        if (e <= 0) return s;                          // (test values stay normal; flush tiny to 0)
+        if (e >= 31) return s | 0x7C00u;
+        uint32_t h = s | ((uint32_t)e << 10) | (m >> 13);
+        if ((m & 0x1FFFu) > 0x1000u || (((m & 0x1FFFu) == 0x1000u) && (h & 1u))) h++;
+        return h;
+    };
+    std::vector<float> inT21(8), expT21(8);
+    for (uint32_t i = 0; i < 8; i++) { float a = (float)i * 0.25f; inT21[i] = a;
+        uint32_t packed = f2h(a) | (f2h(a) << 16); expT21[i] = (float)packed; }
+    std::vector<float> gotT21 = prosper::test::run_compute(spvT21, inT21, 8, 8);
+    uint32_t badT21 = 0; for (uint32_t i=0;i<8&&gotT21.size()==8;i++) if (gotT21[i]!=expT21[i]) badT21++;
+    printf("  T21(fma_mix pack) mismatches=%u (out[4]=%.0f expect=%.0f)\n", badT21,
+           gotT21.size()==8?gotT21[4]:-1, expT21[4]);
+    CHECK(gotT21.size()==8 && badT21==0, "T21: mixlo/mixhi pack f16 halves preserving the other half");
+
+    // Kernel T22: the DOLL box-blur f16 TAIL verbatim (#273): v0.lo = f16(a0) (fma_mixlo);
+    // v_mul_f16_sdwa v0, vcc_lo(=2.0h), v0 dst_sel:WORD_1 preserve (hi = 2*f16(a0), lo kept);
+    // v_mov_b32_sdwa v0, v0 dst_sel:WORD_0 preserve src0_sel:WORD_1 (lo = hi). out = packed bits.
+    const uint32_t codeT22[] = {
+        0x7e020280u,               // v_mov_b32 v1, 0
+        0xcc210000u, 0x040600f2u,  // v_fma_mixlo_f16 v0, 1.0, v0, v1
+        0xb06a4000u,               // s_movk_i32 vcc_lo, 0x4000 (f16 2.0)
+        0x6a0000f9u, 0x0686156au,  // v_mul_f16_sdwa v0, vcc_lo, v0 dst:WORD_1 preserve (live blur words)
+        0x7e0002f9u, 0x00051400u,  // v_mov_b32_sdwa v0, v0 dst:WORD_0 preserve src:WORD_1 (live)
+        0x7e000d00u,               // v_cvt_f32_u32 v0, v0
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvT22 = recompile_valu(codeT22, sizeof(codeT22)/4, 1, 0);
+    CHECK(!spvT22.empty(), "recompiled T22 (f16 SDWA WORD-select mul/mov tail) -> SPIR-V");
+    std::vector<float> inT22(8), expT22(8);
+    for (uint32_t i = 0; i < 8; i++) { float a = (float)i * 0.25f; inT22[i] = a;
+        uint32_t h2 = f2h(2.0f * a); expT22[i] = (float)(h2 | (h2 << 16)); }
+    std::vector<float> gotT22 = prosper::test::run_compute(spvT22, inT22, 8, 8);
+    uint32_t badT22 = 0; for (uint32_t i=0;i<8&&gotT22.size()==8;i++) if (gotT22[i]!=expT22[i]) badT22++;
+    printf("  T22(f16 sdwa words) mismatches=%u (out[3]=%.0f expect=%.0f)\n", badT22,
+           gotT22.size()==8?gotT22[3]:-1, expT22[3]);
+    CHECK(gotT22.size()==8 && badT22==0, "T22: WORD-dst f16 mul + WORD-to-WORD mov preserve halves exactly");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

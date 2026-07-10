@@ -36,8 +36,9 @@ enum : uint32_t {
     Op_BitReverse=204, Op_UConvert=113,
     Op_TypeImage=25, Op_TypeSampledImage=27, Op_SampledImage=86,
     Op_ImageSampleImplicitLod=87, Op_ImageSampleExplicitLod=88, Op_ImageFetch=95, Op_ImageGather=96, Op_Image=100,
-    Op_ImageRead=98, Op_ImageWrite=99,
+    Op_ImageRead=98, Op_ImageWrite=99, Op_ImageQuerySizeLod=103,
     Op_TypeArray=28, Op_ControlBarrier=224,
+    Op_DPdx=207, Op_DPdy=208,   // screen-space derivatives (Fragment; plain Shader capability)
     Op_Phi=245, Op_LoopMerge=246,
     Op_SelectionMerge=247, Op_Label=248, Op_Branch=249, Op_BranchConditional=250, Op_Kill=252, Op_Return=253,
 };
@@ -56,6 +57,7 @@ enum : uint32_t {
     Cap_ImageMSArray=48,                 // MS=1 AND Arrayed=1 image (2D_MSAA_ARRAY)
     Cap_StorageImageReadWithoutFormat=55, Cap_StorageImageWriteWithoutFormat=56,  // for Format=Unknown storage images
     Cap_ImageGatherExtended=25,          // dynamic (non-const) Offset image operand on OpImageGather
+    Cap_ImageQuery=50,                   // OpImageQuerySizeLod (the sample_*_o texel->UV offset fold)
     ImgOp_Offset=0x10,                   // ImageOperands bit: dynamic texel offset (needs ImageGatherExtended)
     Img_Sampled_Storage=2,   // OpTypeImage "Sampled" operand: 2 = used WITHOUT a sampler (read/write storage image)
     ImgFmt_Unknown=0,        // OpTypeImage "Image Format": Unknown (runtime view format; needs the caps above)
@@ -63,7 +65,7 @@ enum : uint32_t {
     SC_Workgroup=4, Scope_Workgroup=2, MemSem_WGAcqRel=0x108,   // LDS: Workgroup storage + barrier scope/semantics
     Dec_Block=2, Dec_ArrayStride=6, Dec_BuiltIn=11, Dec_Flat=14, Dec_Location=30, Dec_Binding=33,
     Dec_DescriptorSet=34, Dec_Offset=35,
-    BI_Position=0, BI_LocalInvocationId=27, BI_GlobalInvocationId=28, BI_VertexIndex=42,
+    BI_Position=0, BI_FragCoord=15, BI_LocalInvocationId=27, BI_GlobalInvocationId=28, BI_VertexIndex=42,
 };
 
 uint32_t fbits(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
@@ -292,6 +294,7 @@ struct SpirvCompute {
     uint32_t t_image = 0, t_sampled_image = 0;            // 2D (the common case; kept for existing callers)
     std::unordered_map<uint32_t, uint32_t> tex_var;       // binding -> combined-sampler OpVariable id
     std::unordered_map<uint32_t, uint32_t> tex_simg_dim;  // SPIR-V Dim -> OpTypeSampledImage id
+    std::unordered_map<uint32_t, uint32_t> tex_img_dim;   // SPIR-V Dim -> its OpTypeImage id (OpImage results)
     uint32_t t_v3f_cache = 0;
     uint32_t t_v3f() { if (!t_v3f_cache) { t_v3f_cache = id(); put(types, Op_TypeVector, {t_v3f_cache, t_f32, 3}); } return t_v3f_cache; }
     uint32_t sampled_image_type(uint32_t dim) {
@@ -299,7 +302,7 @@ struct SpirvCompute {
         uint32_t ti = id(); put(types, Op_TypeImage, {ti, t_f32, dim, 0, 0, 0, 1, 0});  // sampled f32, Sampled=1
         uint32_t si = id(); put(types, Op_TypeSampledImage, {si, ti});
         if (dim == Dim_2D) { t_image = ti; t_sampled_image = si; }
-        tex_simg_dim[dim] = si; return si;
+        tex_simg_dim[dim] = si; tex_img_dim[dim] = ti; return si;
     }
     // Declare (idempotently) a combined image+sampler of SPIR-V `dim` at descriptor-set 0, `binding`.
     void declare_texture(uint32_t binding, uint32_t dim = Dim_2D) {
@@ -396,12 +399,35 @@ struct SpirvCompute {
         if (!declared_gather_ext) { put(caps, Op_Capability, {Cap_ImageGatherExtended}); declared_gather_ext = true; }
         uint32_t si    = id(); put(code, Op_Load, {t_sampled_image, si, tex_var[binding]});
         uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
-        uint32_t ox    = bfe_s(off_bits, 0, 6), oy = bfe_s(off_bits, 8, 6);   // signed 6-bit texel offsets
+        // signed 6-bit texel offsets. NOTE: bfe_s takes SPIR-V IDs — raw integers here (the #296
+        // original) emitted OpBitFieldSExtract with invalid operand IDs; never caught live because
+        // the only gather4_lz_o user (DOLL's FXAA PS) still rejected upstream on its execz region.
+        uint32_t ox    = bfe_s(off_bits, uconst(0), uconst(6)), oy = bfe_s(off_bits, uconst(8), uconst(6));
         uint32_t offv  = id(); put(code, Op_CompositeConstruct, {t_v2i(), offv, bcs(ox), bcs(oy)});
         uint32_t res   = id(); put(code, Op_ImageGather, {t_v4f, res, si, coord, uconst(comp), ImgOp_Offset, offv});
         for (uint32_t c = 0; c < 4; c++) {
             uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, res, c}); out[c] = bcu(e);
         }
+    }
+    // image_sample_lz_o 2D: explicit-LOD-0 sample with the MIMG _o packed texel offset (x = bits[5:0],
+    // y = bits[13:8], signed 6-bit — same packing as gather4_lz_o). Vulkan forbids the dynamic Offset
+    // image operand on OpImageSample* (it is gather-only), so fold the texel offset into the
+    // NORMALIZED coordinate instead: u' = u + ox/width, v' = v + oy/height (exact — the hardware adds
+    // the integer offset to the unnormalized coordinate before filtering, and at LOD 0
+    // (u + ox/W)*W == u*W + ox). The level-0 size comes from OpImageQuerySizeLod (Cap ImageQuery).
+    bool declared_image_query = false;
+    void image_sample_lz_offset_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits,
+                                   uint32_t off_bits, uint32_t out[4]) {
+        if (!declared_image_query) { put(caps, Op_Capability, {Cap_ImageQuery}); declared_image_query = true; }
+        uint32_t si   = id(); put(code, Op_Load,  {t_sampled_image, si, tex_var[binding]});
+        uint32_t img  = id(); put(code, Op_Image, {t_image, img, si});
+        uint32_t size = id(); put(code, Op_ImageQuerySizeLod, {t_v2i(), size, img, uconst(0)});
+        uint32_t w_i  = id(); put(code, Op_CompositeExtract, {t_i32, w_i, size, 0});
+        uint32_t h_i  = id(); put(code, Op_CompositeExtract, {t_i32, h_i, size, 1});
+        uint32_t ox = bfe_s(off_bits, uconst(0), uconst(6)), oy = bfe_s(off_bits, uconst(8), uconst(6));   // signed 6-bit texel offsets
+        uint32_t du = fbin(Op_FDiv, cvt_i2f(ox), cvt_i2f(i2u(w_i)));
+        uint32_t dv = fbin(Op_FDiv, cvt_i2f(oy), cvt_i2f(i2u(h_i)));
+        image_sample_lod_2d(binding, fbin(Op_FAdd, u_bits, du), fbin(Op_FAdd, v_bits, dv), uconst(0), out);
     }
     // 2-component uint vector (integer texel coordinates for OpImageFetch).
     uint32_t t_v2u_cache = 0;
@@ -412,6 +438,22 @@ struct SpirvCompute {
         uint32_t si    = id(); put(code, Op_Load,  {t_sampled_image, si, tex_var[binding]});
         uint32_t img   = id(); put(code, Op_Image, {t_image, img, si});
         uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v2u(), coord, x_bits, y_bits});
+        uint32_t res   = id(); put(code, Op_ImageFetch, {t_v4f, res, img, coord, ImgOp_Lod, uconst(0)});
+        for (uint32_t c = 0; c < 4; c++) {
+            uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, res, c}); out[c] = bcu(e);
+        }
+    }
+
+    // image_load from a 3D texture (integer texel fetch through the combined sampler — DOLL's
+    // color-grade LUT, #273): OpImage strips the sampler; OpImageFetch with (x,y,z) integer coords.
+    uint32_t t_v3u_cache2 = 0;
+    uint32_t t_v3u_fetch() { if (!t_v3u_cache2) { t_v3u_cache2 = id(); put(types, Op_TypeVector, {t_v3u_cache2, t_u32, 3}); } return t_v3u_cache2; }
+    void image_fetch_3d(uint32_t binding, uint32_t x_bits, uint32_t y_bits, uint32_t z_bits, uint32_t out[4]) {
+        uint32_t simg  = sampled_image_type(Dim_3D);
+        uint32_t t_img3 = tex_img_dim[Dim_3D];   // OpImage's result type must be the pair's Image type
+        uint32_t si    = id(); put(code, Op_Load,  {simg, si, tex_var[binding]});
+        uint32_t img   = id(); put(code, Op_Image, {t_img3, img, si});
+        uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v3u_fetch(), coord, x_bits, y_bits, z_bits});
         uint32_t res   = id(); put(code, Op_ImageFetch, {t_v4f, res, img, coord, ImgOp_Lod, uconst(0)});
         for (uint32_t c = 0; c < 4; c++) {
             uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, res, c}); out[c] = bcu(e);
@@ -827,6 +869,46 @@ struct SpirvCompute {
         uint32_t vec = id(); put(code, Op_Load, {t_v4f, vec, v});
         uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, vec, chan}); return bcu(e);
     }
+    // FS: gl_FragCoord (BuiltIn 15), lazily declared — used by the DPP quad_perm lowering.
+    uint32_t v_fragcoord = 0;
+    uint32_t fragcoord_var() {
+        if (v_fragcoord) return v_fragcoord;
+        if (!t_ptr_in_v4f) { t_ptr_in_v4f = id(); put(types, Op_TypePointer, {t_ptr_in_v4f, SC_Input, t_v4f}); }
+        v_fragcoord = id(); put(types, Op_Variable, {t_ptr_in_v4f, v_fragcoord, SC_Input});
+        put(deco, Op_Decorate, {v_fragcoord, Dec_BuiltIn, BI_FragCoord});
+        iface.push_back(v_fragcoord); return v_fragcoord;
+    }
+    // DPP16 quad_perm (#273 — DOLL's manual ddx/ddy in its sharpen/AA PSs): the value of `x` at quad
+    // lane t = QP[my_lane] is reconstructed as x + (tx-px)·dPdx(x) + (ty-py)·dPdy(x), where (px,py) =
+    // (int(gl_FragCoord.xy) & 1) is this invocation's quad position and (tx,ty) = (t&1, t>>1). Exact
+    // for values linear within the 2x2 quad — the same assumption hardware derivatives make (the
+    // idiom's whole purpose IS ddx/ddy: e.g. `v_sub_f32_dpp v4, v2, v2@[0,0,2,2] qp[1,1,3,3]` =
+    // v2@(1,py) - v2@(0,py) = dPdxFine). Fragment-only. CONFIDENCE: MED (render-tested vs a known
+    // varying gradient).
+    uint32_t dpp_quad(uint32_t x_bits, uint32_t ctrl) {
+        uint32_t fc = id(); put(code, Op_Load, {t_v4f, fc, fragcoord_var()});
+        uint32_t fx = id(); put(code, Op_CompositeExtract, {t_f32, fx, fc, 0});
+        uint32_t fy = id(); put(code, Op_CompositeExtract, {t_f32, fy, fc, 1});
+        uint32_t pxu = id(); put(code, Op_ConvertFToU, {t_u32, pxu, fx});
+        uint32_t pyu = id(); put(code, Op_ConvertFToU, {t_u32, pyu, fy});
+        uint32_t px = ibin(Op_BitwiseAnd, pxu, uconst(1)), py = ibin(Op_BitwiseAnd, pyu, uconst(1));
+        uint32_t lane = ibin(Op_IAdd, px, ibin(Op_ShiftLeftLogical, py, uconst(1)));
+        uint32_t tsel = uconst((uint32_t)(ctrl & 3u));                 // QP[0] default; select QP[lane]
+        for (uint32_t k = 1; k < 4; k++)
+            tsel = sel(ucmp(Op_IEqual, lane, uconst(k)), uconst((ctrl >> (2 * k)) & 3u), tsel);
+        uint32_t tx = ibin(Op_BitwiseAnd, tsel, uconst(1)), ty = ibin(Op_ShiftRightLogical, tsel, uconst(1));
+        uint32_t xf = bcf(x_bits);
+        uint32_t dx = id(); put(code, Op_DPdx, {t_f32, dx, xf});
+        uint32_t dy = id(); put(code, Op_DPdy, {t_f32, dy, xf});
+        // (tx-px) and (ty-py) as floats (each in {-1,0,1}).
+        uint32_t dtx = id(); put(code, Op_ConvertSToF, {t_f32, dtx, bcs(ibin(Op_ISub, tx, px))});
+        uint32_t dty = id(); put(code, Op_ConvertSToF, {t_f32, dty, bcs(ibin(Op_ISub, ty, py))});
+        uint32_t r0 = id(); put(code, Op_FMul, {t_f32, r0, dtx, dx});
+        uint32_t r1 = id(); put(code, Op_FMul, {t_f32, r1, dty, dy});
+        uint32_t s0 = id(); put(code, Op_FAdd, {t_f32, s0, xf, r0});
+        uint32_t s1 = id(); put(code, Op_FAdd, {t_f32, s1, s0, r1});
+        return bcu(s1);
+    }
     // VS: an Output vec4 at Location=loc (EXP PARAM_loc); uses t_ptr_out_v4f from begin_vertex.
     uint32_t vtx_output(uint32_t loc) {
         auto it = out_varying.find(loc); if (it != out_varying.end()) return it->second;
@@ -1092,11 +1174,56 @@ std::unordered_set<uint32_t> mask_test_branches(const std::vector<Rdna2Inst>& in
                 bool mask_sop2 = prev->fmt == Rdna2Format::SOP2 &&
                     (prev->opcode == 0x0f || prev->opcode == 0x11 || prev->opcode == 0x13 || prev->opcode == 0x15);
                 bool mask_saveexec = prev->fmt == Rdna2Format::SOP1 && (prev->opcode == 0x24 || prev->opcode == 0x25);
-                if ((mask_sop2 || mask_saveexec) && prev->dst.kind == OperandKind::SGPR && prev->dst.value <= 105)
+                // The kill mask may live in a plain SGPR pair (s0..s105) OR in VCC itself — DOLL's
+                // alpha-cull PS does `s_andn2_b64 vcc, exec, vcc; s_cbranch_scc0 <null-export>` then
+                // `s_mov_b64 exec, vcc; export`. The SOP2 dst field decodes VCC_LO as SGPR 106, and
+                // emit_alu's mask ops route a 106/107 dst to rs.vcc, so the same linearization holds
+                // (the branch is a whole-wave early-out; per-invocation the export's OpKill covers it).
+                if ((mask_sop2 || mask_saveexec) && prev->dst.kind == OperandKind::SGPR && prev->dst.value <= 106)
                     out.insert(in.pc);
             }
         }
         prev = &in;
+    }
+    return out;
+}
+
+// WATERFALL loops (#273 — DOLL's skinned scene VS): the readfirstlane-uniformize idiom
+//   L: v_readfirstlane s4, vIDX ; v_cmpx_eq_u32 s4, vIDX ; s_mov m0, s4 ; v_movrels …
+//      s_andn2_b64 REMAIN, REMAIN, exec ; s_mov_b64 exec, REMAIN ; s_cbranch_scc1 L
+// iterates once per DISTINCT per-lane index, with EXEC selecting the matching lanes. In the
+// per-invocation model each lane's iteration IS its own: readfirstlane returns MY value, the cmpx
+// keeps me active, and the andn2 leaves MY remaining-mask empty — so the loop body runs EXACTLY
+// ONCE per invocation and the backward branch (whose SCC = "any lane remains", a cross-lane
+// reduction) is never taken. A BACKWARD s_cbranch_scc0/scc1 whose SCC was produced by a 64-bit
+// wave-mask op is therefore safe to DROP (linearize), exactly like the forward kill-mask branches.
+// The SCC producer may sit a few instructions back (the shape interposes `s_mov_b64 exec, REMAIN`,
+// which does not write SCC) — walk back over non-SCC-writing instructions to find it.
+// CONFIDENCE: MED — exec-diff kernel T19 locks the once-through semantics.
+std::unordered_set<uint32_t> waterfall_branches(const std::vector<Rdna2Inst>& ins) {
+    std::unordered_set<uint32_t> out;
+    for (size_t i = 0; i < ins.size(); i++) {
+        const Rdna2Inst& in = ins[i];
+        if (in.is_end) break;
+        if (in.fmt != Rdna2Format::SOPP || (in.opcode != 0x04 && in.opcode != 0x05) || in.simm16 >= 0)
+            continue;
+        // Walk back to the most recent SCC-writing instruction, skipping ops known not to touch SCC
+        // (scalar moves, all vector ALU incl. VOPC — it writes VCC/EXEC, not SCC — memory, hints).
+        for (size_t j = i; j-- > 0;) {
+            const Rdna2Inst& p = ins[j];
+            bool skip_ok =
+                (p.fmt == Rdna2Format::SOP1 && (p.opcode == 0x03 || p.opcode == 0x04)) ||   // s_mov_b32/b64
+                p.fmt == Rdna2Format::VOP1 || p.fmt == Rdna2Format::VOP2 || p.fmt == Rdna2Format::VOP3 ||
+                p.fmt == Rdna2Format::VOPC || p.fmt == Rdna2Format::MIMG || p.fmt == Rdna2Format::MUBUF ||
+                sopp_is_noop(p);
+            if (skip_ok) continue;
+            // The SCC producer: a 64-bit wave-mask logical op (s_and/or/xor/andn2_b64, SCC = result!=0).
+            if (p.fmt == Rdna2Format::SOP2 &&
+                (p.opcode == 0x0f || p.opcode == 0x11 || p.opcode == 0x13 || p.opcode == 0x15) &&
+                p.dst.kind == OperandKind::SGPR && p.dst.value <= 106)
+                out.insert(in.pc);
+            break;   // any other SCC producer (s_cmp etc.): a REAL loop condition — not a waterfall
+        }
     }
     return out;
 }
@@ -1157,9 +1284,19 @@ CountedLoop detect_counted_loop(const std::vector<Rdna2Inst>& ins) {
 struct ForwardIf {
     bool found = false;
     uint32_t branch_pc = 0, target_pc = 0;
-    bool on_scc0 = true;   // s_cbranch_scc0/vccz (branch taken == skip block when flag==0) vs scc1/vccnz
+    bool on_scc0 = true;   // s_cbranch_scc0/vccz/execz (branch taken == skip block when flag==0) vs scc1/vccnz
     bool on_vcc  = false;  // condition register: false = SCC, true = VCC (both are wave-uniform branches)
     bool early_out = false;// branch target was clamped to end_pc: the conditional block ENDS the shader
+    // Divergent-region if (#273): the branch is a forward s_cbranch_execz over an EXEC-narrowed block
+    // (v_cmpx … s_cbranch_execz — DOLL's FXAA PS). Per-invocation the condition is THIS lane's EXEC
+    // bool; the block may itself narrow/restore EXEC (saveexec idioms), so EXEC is phi'd at the merge.
+    bool on_exec = false;
+    // IF/ELSE (#273): the then-arm [branch_pc+1, sb_pc) is terminated by `s_branch merge_pc` at sb_pc
+    // (the instruction immediately before target_pc); the else-arm starts at target_pc and runs to
+    // merge_pc (or to the enclosing region's end when merge_pc is the shared OUTER merge — DOLL's
+    // color-grade if/else-if cascade, where every arm's s_branch jumps to the outermost merge).
+    bool has_else = false;
+    uint32_t sb_pc = 0, merge_pc = 0;
 };
 // allow_vcc: also accept a forward s_cbranch_vccz/vccnz. Only the per-invocation VS/FS shells set this —
 // there each SPIR-V invocation IS one lane, so branching on this lane's VCC bit (rs.vcc) is exactly the
@@ -1236,14 +1373,17 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
     std::vector<ForwardIf> out;
     uint32_t end_pc = UINT32_MAX;
     for (const auto& in : ins) if (in.is_end) { end_pc = in.pc; break; }
+    // Pass 1: collect the conditional branches (else-arm s_branch terminators are claimed in pass 2).
     for (const auto& in : ins) {
         if (in.is_end) break;
         if (in.fmt != Rdna2Format::SOPP) continue;
         switch (in.opcode) {
-            case 0x02: case 0x09: return {};                         // s_branch / execnz -> reject
-            case 0x08:                                               // execz: allowed ONLY when it's a
-                if (skip && skip->count(in.pc)) continue;            // safe-linearized predication branch
-                return {};                                           // (emit_alu no-ops it inside emit_range)
+            case 0x02: continue;                                     // s_branch: validated in pass 2
+            case 0x09: return {};                                    // execnz -> reject
+            case 0x08:                                               // execz: safe-linearized predication
+                if (skip && skip->count(in.pc)) continue;            // branch -> emit_alu no-ops it; else a
+                if (!allow_vcc) return {};                           // DIVERGENT-REGION if (per-invocation
+                break;                                               // stages only — compute has wave VCC/EXEC)
             case 0x06: case 0x07:                                    // vccz / vccnz
                 if (!allow_vcc) return {};
                 break;
@@ -1270,17 +1410,50 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
         if (tgt <= in.pc || tgt > end_pc) return {};                 // must be forward, within the stream
         ForwardIf F;
         F.found = true; F.branch_pc = in.pc; F.target_pc = tgt; F.early_out = (early || tgt == end_pc);
-        F.on_scc0 = (in.opcode == 0x04 || in.opcode == 0x06);
+        F.on_scc0 = (in.opcode == 0x04 || in.opcode == 0x06 || in.opcode == 0x08);
         F.on_vcc  = (in.opcode == 0x06 || in.opcode == 0x07);
+        F.on_exec = (in.opcode == 0x08);
+        // IF/ELSE detection: the instruction immediately preceding target_pc is a FORWARD s_branch —
+        // the then-arm's terminator jumping to the merge; the else-arm is [target_pc, merge). (Skip
+        // for early-outs: the arm ends the shader.)
+        if (!early && tgt != end_pc) {
+            for (const auto& sb : ins) {
+                if (sb.pc <= in.pc || sb.pc >= tgt) continue;
+                if (sb.fmt != Rdna2Format::SOPP || sb.opcode != 0x02) continue;
+                if (sb.pc + sb.len_dwords != tgt) continue;          // must be the arm's LAST instruction
+                if (sb.simm16 <= 0) return {};                       // backward else-jump: a loop, not an if
+                uint32_t lm = branch_target(sb);
+                if (lm <= tgt || lm > end_pc) return {};             // merge must be forward, in-stream
+                F.has_else = true; F.sb_pc = sb.pc; F.merge_pc = lm;
+                break;
+            }
+        }
         out.push_back(F);
     }
-    // Structural nesting check (branches are already in pc order): each new block must lie entirely
-    // inside the innermost still-open block, or start after it closed. Partial overlap -> reject.
+    // Pass 2: every s_branch in the stream must be a claimed else-arm terminator — any other
+    // unconditional branch is control flow this structurizer doesn't model.
+    for (const auto& in : ins) {
+        if (in.is_end) break;
+        if (in.fmt != Rdna2Format::SOPP || in.opcode != 0x02) continue;
+        bool claimed = false;
+        for (const auto& F : out) if (F.has_else && F.sb_pc == in.pc) { claimed = true; break; }
+        if (!claimed) return {};
+    }
+    // Structural nesting check (branches are already in pc order): each region must lie entirely
+    // inside the innermost still-open region, or start after it closed. A region spans to its merge
+    // (if/else) or target (plain if). EXCEPTION (the shared-outer-merge cascade): an if/else whose
+    // merge_pc escapes the innermost open region is accepted here and re-validated during emission
+    // (emit_structured requires the escaping merge to equal the enclosing merge chain's continuation,
+    // i.e. no instructions are skipped) — a violation rejects the shader there, fail-visible.
     std::vector<uint32_t> open;
     for (const auto& F : out) {
+        uint32_t span_end = F.has_else ? F.merge_pc : F.target_pc;
         while (!open.empty() && open.back() <= F.branch_pc) open.pop_back();
-        if (!open.empty() && F.target_pc > open.back()) return {};
-        open.push_back(F.target_pc);
+        if (!open.empty() && span_end > open.back()) {
+            if (!F.has_else) return {};                  // plain if escaping its region: not a tree
+            span_end = open.back();                      // cascade if/else: clamped to the enclosing
+        }                                                // region for nesting purposes (see above)
+        open.push_back(span_end);
     }
     return out;
 }
@@ -1297,7 +1470,7 @@ void loop_written_regs(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t 
             case Rdna2Format::VOP1:
                 if (in.opcode == 0x02) sregs.insert(in.dst.value);        // v_readfirstlane -> SGPR
                 else vregs.insert(in.dst.value); break;
-            case Rdna2Format::VOP2: case Rdna2Format::VOP3:
+            case Rdna2Format::VOP2: case Rdna2Format::VOP3: case Rdna2Format::VOP3P:
                 vregs.insert(in.dst.value); break;
             case Rdna2Format::DS:                                          // ds_read writes one VGPR
                 if (in.opcode == 0x36) vregs.insert(in.dst.value); break;
@@ -1337,12 +1510,13 @@ uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, const 
         case OperandKind::Literal:     return b.uconst(in.literal);
         case OperandKind::Special:
             if (o.value == 125) return b.uconst(0);   // SGPR_NULL: the one Special whose data value IS 0
-            // VCC_LO/HI (106/107) and ttmp0..15 (108..123) double as plain scalar SCRATCH in compiled
-            // code — the NGG preamble does `s_bfe_u32 vcc_lo, s3, ...` then reads vcc back as data.
-            // A scalar write lands in rs.sreg[o.value] (the DST field decodes as SGPR); read it back
-            // from there. Only an UNTRACKED read (a VOPC-produced mask, EXEC, M0, SCC) has no
-            // representable per-invocation data value.
-            if (o.value >= 106 && o.value <= 123) {
+            // VCC_LO/HI (106/107), ttmp0..15 (108..123) and M0 (124) double as plain scalar SCRATCH
+            // in compiled code — the NGG preamble does `s_bfe_u32 vcc_lo, s3, ...` then reads vcc
+            // back as data, and DOLL's skinned VS round-trips M0 (`s_mov m0, s4 … s_mov s36, m0`,
+            // #273). A scalar write lands in rs.sreg[o.value] (the DST field decodes as SGPR); read
+            // it back from there. Only an UNTRACKED read (a VOPC-produced mask, EXEC, SCC, or a
+            // never-written scratch) has no representable per-invocation data value.
+            if (o.value >= 106 && o.value <= 124) {
                 auto it = rs.sreg.find(o.value);
                 if (it != rs.sreg.end()) return it->second;
             }
@@ -1614,7 +1788,39 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
             return true;
         }
+        case Rdna2Format::VOP3P: {
+            // Mixed-precision FMA family, trivial form only (all sources full f32 — the decoder set
+            // has_modifier for any opsel/neg/clamp bits, rejected above). v_fma_mix_f32 (0x20):
+            // d = s0*s1+s2. v_fma_mixlo/hi_f16 (0x21/0x22): the f32 result converts to f16 into the
+            // LOW/HIGH half of d, PRESERVING the other half (DOLL's box-blur PS packs its result
+            // this way, #273). VERIFIED(round-trip llvm-mc gfx1010: 0xcc210000 0x041600f2 ->
+            // v_fma_mixlo_f16 v0, 1.0, v0, v5 — the live blur bytes).
+            if (in.opcode != 0x20 && in.opcode != 0x21 && in.opcode != 0x22) { ok = false; return true; }
+            uint32_t old_d = vreg_old(b, rs, in.dst.value);
+            uint32_t r = b.fbin(Op_FAdd, b.fbin(Op_FMul, val(in.src[0]), val(in.src[1])), val(in.src[2]));
+            uint32_t& d = rs.vreg[in.dst.value];
+            if (in.opcode == 0x20) d = r;
+            else if (in.opcode == 0x21)
+                d = b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0xFFFF0000u)), b.pack_half_lo(r));
+            else
+                d = b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0x0000FFFFu)),
+                           b.ibin(Op_ShiftLeftLogical, b.pack_half_lo(r), b.uconst(16)));
+            if (ok) predicate_write(b, rs, in.dst.value, old_d);
+            return true;
+        }
         case Rdna2Format::SOPC: {
+            // s_bitcmp0/1_b32 (0x0c/0x0d): SCC = bit (src0 >> (src1 & 31)) & 1, negated for bitcmp0.
+            // DOLL's scene PS tests feature-flag bits 0..3 of an s_buffer_load'd word with s_cselect
+            // chains (#273). VERIFIED(round-trip llvm-mc gfx1010: 0xbf0d8014 -> s_bitcmp1_b32 s20, 0;
+            // 0xbf0c8114 -> s_bitcmp0_b32 s20, 1 — NOT the u64 compares an opcode-table guess said).
+            if (in.opcode == 0x0c || in.opcode == 0x0d) {
+                uint32_t a = val(in.src[0]), c = val(in.src[1]);
+                uint32_t sh  = b.ibin(Op_BitwiseAnd, c, b.uconst(31));
+                uint32_t bit = b.ibin(Op_BitwiseAnd, b.ibin(Op_ShiftRightLogical, a, sh), b.uconst(1));
+                uint32_t nz  = b.ucmp(Op_INotEqual, bit, b.uconst(0));
+                rs.scc = (in.opcode == 0x0d) ? nz : b.bsel(nz, b.bfalse(), b.btrue());
+                return true;
+            }
             // Scalar compare -> SCC (read by s_cselect / s_cbranch_scc). eq/lg are bitwise (sign-agnostic);
             // the ordered compares are signed for i32 (0x02-0x05), unsigned for u32 (0x08-0x0b).
             uint32_t a = val(in.src[0]), c = val(in.src[1]);
@@ -1652,6 +1858,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
         }
         case Rdna2Format::VOP1: {
             uint32_t a = val(in.src[0]); uint32_t old_d = vreg_old(b, rs, in.dst.value);
+            // DPP16 quad_perm on src0 (#273): reconstruct the selected quad lane's value from
+            // screen-space derivatives (fragment-only; v_mov is the observed carrier — the manual
+            // ddx/ddy idiom). Other VOP1 ops with DPP stay rejected (derivatives of non-float moves
+            // have no meaning in this lowering).
+            if (in.has_dpp) {
+                if (!b.is_fragment || in.opcode != 0x01) { ok = false; return true; }
+                a = b.dpp_quad(a, in.dpp_ctrl);
+            }
             // SDWA float source modifiers on src0 (abs then neg) — only set on float ops by the assembler.
             if (in.src_abs[0]) a = b.fext1(Glsl_FAbs, a);
             if (in.src_neg[0]) a = b.fbin(Op_FSub, b.uconst(0), a);
@@ -1663,6 +1877,20 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rs.sreg[in.dst.value] = a; return true;
             }
             uint32_t& d = vreg[in.dst.value];
+            // WORD-select v_mov_b32_sdwa (#273): extract the selected 16-bit source half and insert it
+            // into the selected dest half, preserving the other (the f16 half-move; decode accepted
+            // only dst WORD_0/1 + PRESERVE with src DWORD/WORD_0/WORD_1).
+            if (in.opcode == 0x01 && in.sdwa_dst_sel != 6) {
+                uint32_t v = a;
+                if (in.sdwa_src0_sel == 5)      v = b.ibin(Op_ShiftRightLogical, a, b.uconst(16));
+                uint32_t v16 = b.ibin(Op_BitwiseAnd, v, b.uconst(0xFFFFu));
+                d = (in.sdwa_dst_sel == 4)
+                    ? b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0xFFFF0000u)), v16)
+                    : b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0x0000FFFFu)),
+                             b.ibin(Op_ShiftLeftLogical, v16, b.uconst(16)));
+                predicate_write(b, rs, in.dst.value, old_d);
+                return true;
+            }
             switch (in.opcode) {
                 case 0x00: return true;                              // v_nop — no-op (writes nothing; common
                                                                      // scheduling/hazard filler in real shaders)
@@ -1691,6 +1919,28 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x36: d = b.fext1(Glsl_Cos, b.fbin(Op_FMul, a, b.uconst(fbits(6.28318530717958647692f)))); break;
                 case 0x37: d = b.iun(Op_Not, a); break;               // v_not_b32
                 case 0x38: d = b.iun(Op_BitReverse, a); break;        // v_bfrev_b32
+                case 0x43: {   // v_movrels_b32: dst = VGPR[src0# + M0] (relative-indexed VGPR read)
+                    // M0 is written by plain scalar ALU (s_mov/s_or m0, … decode dst as SGPR 124), so
+                    // its per-invocation value lives in rs.sreg[124]. The source register NUMBER is
+                    // src0# + M0 — a runtime value — so lower to a bounded select chain over every
+                    // tracked VGPR at src0#+k (k = M0 candidate): dst = Σ sel(m0==k, vreg[src0+k]).
+                    // Matches the hardware contract for all in-range M0 (reading an unwritten VGPR is
+                    // undefined on HW too — those candidates read our 0 placeholder). An UNTRACKED M0
+                    // rejects, never silently indexes 0. VERIFIED(round-trip llvm-mc gfx1010:
+                    // 0x7e408706 → v_movrels_b32_e32 v32, v6; DOLL UI/skinned VS #273).
+                    auto m0it = rs.sreg.find(124);
+                    if (m0it == rs.sreg.end()) { ok = false; break; }
+                    uint32_t acc = b.uconst(0);
+                    const int base = in.src[0].value;
+                    for (const auto& kv : vreg) {
+                        if (kv.first < base || !kv.second) continue;   // (!kv.second: the dst slot the
+                                                                       // enclosing `vreg[dst]` may have
+                                                                       // default-inserted — no value yet)
+                        acc = b.sel(b.ucmp(Op_IEqual, m0it->second, b.uconst((uint32_t)(kv.first - base))),
+                                    kv.second, acc);
+                    }
+                    d = acc; break;
+                }
                 default: ok = false;
             }
             // SDWA output modifiers: OMOD scale (×2/×4/×0.5) then CLAMP saturate, on FLOAT-result
@@ -1711,6 +1961,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
         }
         case Rdna2Format::VOP2: {
             uint32_t a = val(in.src[0]), c = val(in.src[1]); uint32_t old_d = vreg_old(b, rs, in.dst.value);
+            // DPP16 quad_perm on src0 (#273): fragment-only, FLOAT ops only (add/sub/subrev/mul/min/
+            // max/mac — the manual-derivative idiom's carriers); anything else stays rejected.
+            if (in.has_dpp) {
+                const bool fop = in.opcode == 0x03 || in.opcode == 0x04 || in.opcode == 0x05 ||
+                                 in.opcode == 0x08 || in.opcode == 0x0F || in.opcode == 0x10 ||
+                                 in.opcode == 0x1F || in.opcode == 0x2B;
+                if (!b.is_fragment || !fop) { ok = false; return true; }
+                a = b.dpp_quad(a, in.dpp_ctrl);
+            }
             // SDWA float source modifiers (only ever set on float ops by the assembler): abs then neg.
             if (in.src_abs[0]) a = b.fext1(Glsl_FAbs, a);
             if (in.src_neg[0]) a = b.fbin(Op_FSub, b.uconst(0), a);
@@ -1771,6 +2030,24 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x20: case 0x2C: d = b.fbin(Op_FAdd, b.fbin(Op_FMul, a, b.uconst(in.literal)), c); break;  // v_madmk / v_fmamk
                 case 0x21: case 0x2D: d = b.fbin(Op_FAdd, b.fbin(Op_FMul, a, c), b.uconst(in.literal)); break;  // v_madak / v_fmaak
                 case 0x2F: d = b.pack_half2x16(a, c); break;          // v_cvt_pkrtz_f16_f32 (e32 form)
+                case 0x35: {   // v_mul_f16: 16-bit float multiply. Sources read their selected halves
+                    // (SDWA WORD_1 = high 16; DWORD/WORD_0 = low 16 — an f16 op reads bits[15:0]);
+                    // f16xf16 products are exact in f32, so multiply in f32 and round once to f16.
+                    // The 16-bit result inserts into the selected dest half PRESERVING the other
+                    // (dst_sel WORD_1 for the SDWA pack idiom; DWORD/WORD_0 = the plain e32 form's
+                    // "write [15:0], preserve [31:16]" gfx10 f16-VOP2 contract). #273 (DOLL box-blur).
+                    auto half_of = [&](uint32_t x, uint8_t s) {
+                        return s == 5 ? b.ibin(Op_ShiftRightLogical, x, b.uconst(16)) : x;
+                    };
+                    uint32_t p = b.fbin(Op_FMul, b.unpack_half(half_of(a, in.sdwa_src0_sel), 0),
+                                                 b.unpack_half(half_of(c, in.sdwa_src1_sel), 0));
+                    uint32_t r16 = b.pack_half_lo(p);
+                    d = (in.sdwa_dst_sel == 5)
+                        ? b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0x0000FFFFu)),
+                                 b.ibin(Op_ShiftLeftLogical, r16, b.uconst(16)))
+                        : b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0xFFFF0000u)), r16);
+                    break;
+                }
                 default: ok = false;
             }
             // SDWA output modifier: OMOD scale (×2/×4/×0.5) then CLAMP saturate, on FLOAT-result opcodes
@@ -2082,26 +2359,39 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x4: case 0xC: n = 16; break;   // s_load_dwordx16  / s_buffer_load_dwordx16
                 default: ok = false; return true;    // stores / others not yet
             }
-            // Register SOFFSET (src[1] not the NULL sentinel) adds an SGPR-computed byte offset we don't
-            // model — reject rather than translate with the immediate alone (#149). Immediate-only loads
-            // encode SOFFSET = SGPR_NULL (125). A negative signed immediate can't index a constant
-            // buffer (dword index would wrap), so reject that too.
-            if (!(in.src[1].kind == OperandKind::Special && in.src[1].value == 125)) {
-                // Register-offset SMEM (SGPR-computed byte offset). A DESCRIPTOR load (x4/x8 = V#/T#) with
-                // a computed offset is the bindless fetch's V#-table read: `s_load_dwordx4 s[8:11],s[24:25],
-                // vcc_hi`. The const-fold (resolve_dynamic_fetch -> by_fetch_pc) already resolves the fetch
-                // through that V#, so the SGPR result is unused in our per-invocation model — no-op it
-                // (placeholder 0) so the vertex shader still recompiles instead of the whole VS being
-                // rejected (the "mask=0xF draws never render" gap on PPSA01885). A register-offset DATA
-                // load (x1/x2) genuinely feeds computation we don't model -> still reject. CONFIDENCE: HIGH.
+            // SOFFSET handling. Immediate-only loads encode SOFFSET = SGPR_NULL (125). A register
+            // SOFFSET adds an SGPR-computed byte offset:
+            //  * a DESCRIPTOR s_load (x4/x8 = V#/T#) with a computed offset is the bindless fetch's
+            //    V#-table read (`s_load_dwordx4 s[8:11],s[24:25],vcc_hi`) — the const-fold
+            //    (resolve_dynamic_fetch -> by_fetch_pc) resolves the fetch through that V#, so the
+            //    SGPR result is unused per-invocation — no-op it (placeholder 0) so the VS still
+            //    recompiles (the "mask=0xF draws never render" gap on PPSA01885). CONFIDENCE: HIGH.
+            //  * an s_buffer_load (0x8..0xC) with a TRACKED scalar offset is a computed constant-
+            //    buffer read (DOLL's bloom-combine PS: per-tap weights at `vcc_lo = 16*(tap/2)`
+            //    inside its counted loop, #273) — model it as a DYNAMIC dword index into the
+            //    resolved cbuf binding: idx = (soffset + imm) >> 2. An UNTRACKED offset register
+            //    (a runtime user-SGPR we have no value for) still rejects — never fold as 0.
+            const bool soff_null = (in.src[1].kind == OperandKind::Special && in.src[1].value == 125);
+            uint32_t soff_bits = 0; bool soff_dyn = false;
+            if (!soff_null) {
                 if (rt && (in.opcode == 0x2 || in.opcode == 0x3)) {
                     for (uint32_t k = 0; k < n; k++) rs.sreg[in.dst.value + (int)k] = b.uconst(0);
                     return true;
                 }
-                ok = false; return true;
-            }
-            if ((int32_t)in.literal < 0) { ok = false; return true; }
-            uint32_t base_idx = in.literal >> 2;    // immediate byte offset -> dword index
+                bool tracked = false;
+                if (in.opcode >= 0x8 && in.opcode <= 0xC) {
+                    if (in.src[1].kind == OperandKind::SGPR ||
+                        (in.src[1].kind == OperandKind::Special && in.src[1].value >= 106 && in.src[1].value <= 123)) {
+                        auto it = rs.sreg.find(in.src[1].value);
+                        if (it != rs.sreg.end()) { soff_bits = it->second; tracked = true; }
+                    } else if (in.src[1].kind == OperandKind::InlineInt && in.src[1].value >= 0) {
+                        soff_bits = b.uconst((uint32_t)in.src[1].value); tracked = true;
+                    }
+                }
+                if (!tracked) { ok = false; return true; }
+                soff_dyn = true;
+            } else if ((int32_t)in.literal < 0) { ok = false; return true; }   // negative imm-only would wrap
+            uint32_t base_idx = soff_dyn ? 0 : in.literal >> 2;    // immediate byte offset -> dword index
             // Descriptor provenance: pick which bound constant buffer via the resource table, routing this
             // load to that buffer's OWN binding (N-buffer model) — so Unity's several constant buffers
             // (per-draw transform, per-frame, …) don't collapse onto one. For s_buffer_load, SBASE
@@ -2116,8 +2406,20 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (!res) res = rt->by_sgpr_base_cls(in.src[0].value, ResourceClass::ConstantBuffer);
                 if (res) { binding = res->binding; cbuf_resolved = true; } }
             if (getenv("PROSPER_CBUFLOG"))
-                fprintf(stderr, "[cbuf] s_buffer_load x%u src0=s%d off=0x%x(dw%u) -> binding=%u %s\n",
-                        n, in.src[0].value, in.literal, base_idx, binding, cbuf_resolved ? "resolved" : "DEFAULT-2");
+                fprintf(stderr, "[cbuf] s_buffer_load x%u src0=s%d off=0x%x(dw%u) dyn=%d -> binding=%u %s\n",
+                        n, in.src[0].value, in.literal, base_idx, (int)soff_dyn, binding,
+                        cbuf_resolved ? "resolved" : "DEFAULT-2");
+            if (soff_dyn) {
+                // Dynamic dword index: (soffset + signed imm) >> 2 (uint add == two's-complement add).
+                uint32_t idx0 = b.ibin(Op_ShiftRightLogical,
+                                       b.ibin(Op_IAdd, soff_bits, b.uconst(in.literal)), b.uconst(2));
+                for (uint32_t k = 0; k < n; k++) {
+                    uint32_t kidx = k ? b.ibin(Op_IAdd, idx0, b.uconst(k)) : idx0;
+                    rs.sreg[in.dst.value + (int)k] = b.cbuf_load(kidx, binding);
+                    rs.sreg_srt.erase(in.dst.value + (int)k);   // data load: drop any stale descriptor tag
+                }
+                return true;
+            }
             for (uint32_t k = 0; k < n; k++)
                 rs.sreg[in.dst.value + (int)k] = b.cbuf_load(b.uconst(base_idx + k), binding);
             // A wide scalar load is a descriptor fetch — tag its dest SGPRs with the SRT offset so a
@@ -2238,6 +2540,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             const bool packed = comp_bytes < 4;
             bool is_snorm = (fmt == DataFormat::Snorm8 || fmt == DataFormat::Snorm16);
             bool is_half  = (fmt == DataFormat::Float16);
+            // Integer sub-dword formats deliver the raw (un-normalized) INTEGER in the VGPR — the
+            // hardware's UINT/SINT format-load contract. DOLL's skinned scene VS fetches its bone
+            // indices as Uint8 x4 (stride 8, paired with Unorm8 weights); rejecting them dropped
+            // every scene-geometry draw (#273). Zero-/sign-extend the field; no normalization.
+            bool is_uint = (fmt == DataFormat::Uint8 || fmt == DataFormat::Uint16);
+            bool is_sint = (fmt == DataFormat::Sint8 || fmt == DataFormat::Sint16);
             float norm = 0.0f;
             switch (fmt) {
                 case DataFormat::Unorm8:  norm = 255.0f;   break;
@@ -2246,9 +2554,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case DataFormat::Snorm16: norm = 32767.0f; break;
                 default: break;
             }
-            // Integer sub-dword formats (Uint8/Sint8/Uint16/Sint16) aren't normalized floats and would
-            // need an integer-attribute path; reject rather than mis-normalize.
-            if (packed && !is_half && norm == 0.0f) { ok = false; return true; }
+            if (packed && !is_half && !is_uint && !is_sint && norm == 0.0f) { ok = false; return true; }
             // Packed (sub-dword) components are extracted at STATIC byte offsets relative to a
             // DWORD-ALIGNED element base — the low 2 bits of the address (addr&3) are dropped by the
             // addr>>2 dword index and never folded into the bit extraction (#150). That is only correct
@@ -2305,7 +2611,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             uint32_t idx = b.ibin(Op_ShiftRightLogical, addr, b.uconst(2));
             if (is_store) {
                 // Store the VDATA VGPRs (in.dst..+n-1). Integer sub-dword formats (Uint8/Sint8/...) have
-                // no packing path here -> reject rather than mis-store (packed && norm==0 was caught above).
+                // no packing path here -> reject rather than mis-store (loads extend them; stores don't pack).
+                if (packed && (is_uint || is_sint)) { ok = false; return true; }
                 auto vread = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
                 if (!packed) {
                     // Raw/Float32/Uint32: one dword per component.
@@ -2348,6 +2655,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     uint32_t did = drel ? b.ibin(Op_IAdd, idx, b.uconst(drel)) : idx;
                     uint32_t dw  = b.cbuf_load(did, binding);
                     value = is_half ? b.unpack_half(dw, boff ? 1u : 0u)
+                          : is_uint ? b.bfe_u(dw, b.uconst(boff), b.uconst(comp_bytes * 8))
+                          : is_sint ? b.bfe_s(dw, b.uconst(boff), b.uconst(comp_bytes * 8))
                                     : b.unpack_norm(dw, boff, comp_bytes * 8, is_snorm, norm);
                 }
                 rs.vreg[d] = value;
@@ -2434,9 +2743,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // v[4:7], [v0, v18, v19], ..." — coords follow the offset, matching image_sample_b's
             // modifier-first vaddr convention). DOLL's FXAA/upsample pass PS (#294).
             const bool is_gather_lz_o = (in.opcode == 0x57);
+            // image_sample_lz_o = 0x37 (LOD-0 sample with the _o packed-offset FIRST vaddr — llvm-mc
+            // gfx1010 round-trip on live DOLL FXAA bytes: 0xf0dc0808/0xf0dc080a "image_sample_lz_o";
+            // the offset-adjust folds into the normalized coords, see image_sample_lz_offset_2d).
+            const bool is_sample_lz_o = (in.opcode == 0x37);
             const bool dim2d = (in.mimg_dim == 1u), dim3d = (in.mimg_dim == 2u);
             if ((!is_sample && !is_load && !is_sample_l && !is_sample_lz && !is_sample_b && !is_gather_lz &&
-                 !is_gather_lz_o) || (!dim2d && !dim3d)) { ok = false; return true; }
+                 !is_gather_lz_o && !is_sample_lz_o) || (!dim2d && !dim3d)) { ok = false; return true; }
             if (res->cls != ResourceClass::Texture) { ok = false; return true; }
             // coords (normalized float for sample, integer texel for load). Non-NSA: consecutive from VADDR.
             // NSA (len>2): coord0 = VADDR, coord k>=1 = byte (k-1) of the extra address dwords words[2..3].
@@ -2446,11 +2759,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 uint32_t j = k - 1; return (int)((in.words[2 + j / 4] >> (8 * (j % 4))) & 0xFFu); };
             uint32_t out[4];
             if (dim3d) {
-                if (!is_sample && !is_sample_lz) { ok = false; return true; }   // 3D: implicit-LOD or LOD-0 sample
+                // 3D: implicit-LOD / LOD-0 sample, or an integer texel FETCH (image_load — DOLL's
+                // color-grade 3D LUT, #273).
+                if (!is_sample && !is_sample_lz && !is_load) { ok = false; return true; }
                 b.declare_texture(res->binding, Dim_3D);
-                if (is_sample) b.image_sample_3d(res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)), out);
-                else           b.image_sample_lod_3d(res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)),
-                                                     b.uconst(0), out);         // _lz: base level
+                if (is_sample)      b.image_sample_3d(res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)), out);
+                else if (is_load)   b.image_fetch_3d(res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)), out);
+                else                b.image_sample_lod_3d(res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)),
+                                                          b.uconst(0), out);   // _lz: base level
             } else if (is_gather_lz || is_gather_lz_o) {
                 // gather4 dmask selects ONE channel (must be a single bit); the result is always the
                 // four texels of that channel -> 4 consecutive VDATA VGPRs, gather order preserved.
@@ -2473,6 +2789,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 b.declare_texture(res->binding, Dim_2D);
                 if (is_sample_b) {      // vaddr order for _b: [bias, u, v]
                     b.image_sample_bias_2d(res->binding, vread(cvg(1)), vread(cvg(2)), vread(cvg(0)), out);
+                } else if (is_sample_lz_o) {   // vaddr order for _o: [packed offset, u, v]
+                    b.image_sample_lz_offset_2d(res->binding, vread(cvg(1)), vread(cvg(2)), vread(cvg(0)), out);
                 } else {
                     uint32_t cu = vread(cvg(0)), cv = vread(cvg(1));
                     if (is_sample)         b.image_sample_2d(res->binding, cu, cv, out);
@@ -2492,6 +2810,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             return true;
         }
         case Rdna2Format::DS: {
+            // ds_write_addtid_b32 (0xb0) in a GRAPHICS stage (#273): DOLL's scene PS writes one
+            // per-lane dword to LDS (addr = M0 + tid*4) and NEVER reads LDS back anywhere in the
+            // stream — a wave-scratch spill nothing in our per-invocation model can observe. No-op
+            // it in non-compute shells; any LDS READ in a graphics stage still rejects loudly below.
+            // VERIFIED(round-trip llvm-mc gfx1010: 0xdac00000/0x00000f00 -> ds_write_addtid_b32 v15).
+            if (!b.is_compute && in.opcode == 0xb0) return true;
             // LDS (workgroup shared memory), compute-only. ds_write_b32 (0x0d) / ds_read_b32 (0x36);
             // GDS and wider widths deferred. Byte address = ADDR VGPR + inst offset; dword index = >>2.
             if (!b.is_compute || (in.opcode != 0x0d && in.opcode != 0x36)) { ok = false; return true; }
@@ -2753,59 +3077,118 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         auto vget = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
         auto sget = [&](int r){ auto it = rs.sreg.find(r); return it == rs.sreg.end() ? b.uconst(0) : it->second; };
         size_t bi = 0;   // next unconsumed branch in Fs (pc order; recursion consumes nested ones)
-        std::function<bool(uint32_t, uint32_t)> emit_structured = [&](uint32_t lo, uint32_t hi) -> bool {
+        // `cont` = the pc control flows to after `hi` — the enclosing construct's merge chain. An
+        // if/else whose merge ESCAPES the current region (the shared-outer-merge cascade) is legal
+        // only when it targets exactly this continuation (no skipped instructions); anything else
+        // rejects, fail-visible. Divergent execz-ifs (#273) condition on THIS lane's EXEC bool and
+        // may enter/leave with EXEC narrowed — EXEC is phi'd across the merge like any other value.
+        // CONFIDENCE: MED — per-invocation lowering of wave-level branches; spirv-val + exec-diff
+        // kernels + the live-boot A/B gate it.
+        std::function<bool(uint32_t, uint32_t, uint32_t)> emit_structured =
+            [&](uint32_t lo, uint32_t hi, uint32_t cont) -> bool {
             for (;;) {
                 const uint32_t next_br = (bi < Fs.size() && Fs[bi].branch_pc < hi) ? Fs[bi].branch_pc : hi;
                 if (!emit_range(lo, next_br)) return false;
                 if (next_br == hi) return true;
                 const ForwardIf F = Fs[bi++];
-                if (rs.exec_narrowed) return false;         // uniform branch needs full EXEC; bail if narrowed
                 if (idx < ins.size() && ins[idx].pc == F.branch_pc) ++idx;   // skip the branch itself
-                std::set<int> ifv, ifs;
-                loop_written_regs(ins, F.branch_pc + 1, F.target_pc, ifv, ifs);
-                std::unordered_map<int,uint32_t> pre_v, pre_s;
-                for (int r : ifv) pre_v[r] = vget(r);
-                for (int r : ifs) pre_s[r] = sget(r);
-                uint32_t pre_scc = rs.scc, pre_vcc = rs.vcc;
-                const std::unordered_map<int,uint32_t> pre_bool = rs.sreg_bool;   // mask-domain snapshot
-                const uint32_t preblock = b.cur_block;      // block holding the OpBranchConditional (skip edge)
-                // scc0/vccz: branch (skip block) taken when the flag==0 → the block runs when flag!=0;
-                // scc1/vccnz are the inverse. The condition register is SCC or VCC (wave-uniform here).
-                uint32_t cond_reg  = F.on_vcc ? rs.vcc : rs.scc;
+                // scc0/vccz/execz: branch (skip block) taken when the flag==0 → the block runs when
+                // flag!=0; scc1/vccnz are the inverse. Condition = SCC/VCC/EXEC per-invocation bool.
+                uint32_t cond_reg  = F.on_exec ? rs.exec : (F.on_vcc ? rs.vcc : rs.scc);
                 uint32_t exec_cond = F.on_scc0 ? cond_reg : b.bsel(cond_reg, b.bfalse(), b.btrue());
-                uint32_t thenL = b.id(), mergeL = b.id();
-                b.emit_selmerge(mergeL); b.emit_condbranch(exec_cond, thenL, mergeL);
-                b.emit_label(thenL);
-                if (!emit_structured(F.branch_pc + 1, F.target_pc)) return false;   // recurse: nested ifs
-                // A block that narrows EXEC is unsafe to leave open into the merge — UNLESS it's an
-                // early-out block that ENDS the shader (only s_endpgm follows the merge, so post-merge
-                // phi values are never read). See the alpha-test discard shape.
-                if (rs.exec_narrowed && !F.early_out) return false;
-                const uint32_t thenEnd = b.cur_block;       // last block of the then-body (nested ifs move it)
-                std::unordered_map<int,uint32_t> then_v, then_s;
-                for (int r : ifv) then_v[r] = vget(r);
-                for (int r : ifs) then_s[r] = sget(r);
-                uint32_t then_scc = rs.scc, then_vcc = rs.vcc;
-                b.emit_branch(mergeL); b.emit_label(mergeL);
-                for (int r : ifv) rs.vreg[r] = b.emit_phi_2way(b.t_u32,  pre_v[r], preblock, then_v[r], thenEnd);
-                for (int r : ifs) rs.sreg[r] = b.emit_phi_2way(b.t_u32,  pre_s[r], preblock, then_s[r], thenEnd);
-                if (then_scc != pre_scc) rs.scc = b.emit_phi_2way(b.t_bool, pre_scc, preblock, then_scc, thenEnd);
-                if (then_vcc != pre_vcc) rs.vcc = b.emit_phi_2way(b.t_bool, pre_vcc, preblock, then_vcc, thenEnd);
-                // A saved MASK (sreg_bool) whose value CHANGED inside the block would not dominate the
-                // merge — phi it like SCC/VCC (a mask newly CREATED inside the block is left as-is,
-                // matching the previous single-if behavior; its post-merge use, if any, was already
-                // undominated before this path existed).
-                for (auto& kv : rs.sreg_bool) {
-                    auto p = pre_bool.find(kv.first);
-                    if (p != pre_bool.end() && p->second != kv.second) {
-                        kv.second = b.emit_phi_2way(b.t_bool, p->second, preblock, kv.second, thenEnd);
-                        rs.sreg_bool_narrowed[kv.first] = true;   // conservative: provenance now mixed
+                const uint32_t preblock = b.cur_block;      // block holding the OpBranchConditional
+                if (!F.has_else) {
+                    std::set<int> ifv, ifs;
+                    loop_written_regs(ins, F.branch_pc + 1, F.target_pc, ifv, ifs);
+                    std::unordered_map<int,uint32_t> pre_v, pre_s;
+                    for (int r : ifv) pre_v[r] = vget(r);
+                    for (int r : ifs) pre_s[r] = sget(r);
+                    uint32_t pre_scc = rs.scc, pre_vcc = rs.vcc, pre_exec = rs.exec;
+                    const bool pre_narrowed = rs.exec_narrowed;
+                    const std::unordered_map<int,uint32_t> pre_bool = rs.sreg_bool;   // mask-domain snapshot
+                    uint32_t thenL = b.id(), mergeL = b.id();
+                    b.emit_selmerge(mergeL); b.emit_condbranch(exec_cond, thenL, mergeL);
+                    b.emit_label(thenL);
+                    if (!emit_structured(F.branch_pc + 1, F.target_pc, F.target_pc)) return false;
+                    const uint32_t thenEnd = b.cur_block;   // last block of the then-body (nested ifs move it)
+                    std::unordered_map<int,uint32_t> then_v, then_s;
+                    for (int r : ifv) then_v[r] = vget(r);
+                    for (int r : ifs) then_s[r] = sget(r);
+                    uint32_t then_scc = rs.scc, then_vcc = rs.vcc, then_exec = rs.exec;
+                    const bool then_narrowed = rs.exec_narrowed;
+                    b.emit_branch(mergeL); b.emit_label(mergeL);
+                    for (int r : ifv) rs.vreg[r] = b.emit_phi_2way(b.t_u32,  pre_v[r], preblock, then_v[r], thenEnd);
+                    for (int r : ifs) rs.sreg[r] = b.emit_phi_2way(b.t_u32,  pre_s[r], preblock, then_s[r], thenEnd);
+                    if (then_scc != pre_scc) rs.scc = b.emit_phi_2way(b.t_bool, pre_scc, preblock, then_scc, thenEnd);
+                    if (then_vcc != pre_vcc) rs.vcc = b.emit_phi_2way(b.t_bool, pre_vcc, preblock, then_vcc, thenEnd);
+                    // EXEC changed inside the arm (saveexec / v_cmpx / restore): merge it like any value.
+                    // Narrowed-ness is sticky (either edge narrowed → post-merge writes stay predicated).
+                    if (then_exec != pre_exec) rs.exec = b.emit_phi_2way(b.t_bool, pre_exec, preblock, then_exec, thenEnd);
+                    rs.exec_narrowed = pre_narrowed || then_narrowed;
+                    // A saved MASK (sreg_bool) whose value CHANGED inside the block would not dominate the
+                    // merge — phi it like SCC/VCC (a mask newly CREATED inside the block is left as-is,
+                    // matching the previous single-if behavior; its post-merge use, if any, was already
+                    // undominated before this path existed).
+                    for (auto& kv : rs.sreg_bool) {
+                        auto p = pre_bool.find(kv.first);
+                        if (p != pre_bool.end() && p->second != kv.second) {
+                            kv.second = b.emit_phi_2way(b.t_bool, p->second, preblock, kv.second, thenEnd);
+                            rs.sreg_bool_narrowed[kv.first] = true;   // conservative: provenance now mixed
+                        }
                     }
+                    lo = F.target_pc;   // continue after the merge (further sequential ifs handled here)
+                } else {
+                    // IF/ELSE: then = [branch_pc+1, sb_pc) (its s_branch terminator is consumed);
+                    // else = [target_pc, merge). A merge escaping this region must be exactly the
+                    // enclosing continuation `cont` (the cascade shape) — the else-arm then runs to
+                    // `hi` and the merge coincides with the region end.
+                    uint32_t else_hi = F.merge_pc;
+                    if (F.merge_pc >= hi) {
+                        if (F.merge_pc != cont && F.merge_pc != hi) return false;
+                        else_hi = hi;
+                    }
+                    const RegState pre = rs;                // FULL snapshot: the else-arm re-runs from it
+                    std::set<int> wv, ws;                   // regs written in EITHER arm
+                    loop_written_regs(ins, F.branch_pc + 1, F.sb_pc, wv, ws);
+                    loop_written_regs(ins, F.target_pc, else_hi, wv, ws);
+                    uint32_t thenL = b.id(), elseL = b.id(), mergeL = b.id();
+                    b.emit_selmerge(mergeL); b.emit_condbranch(exec_cond, thenL, elseL);
+                    b.emit_label(thenL);
+                    if (!emit_structured(F.branch_pc + 1, F.sb_pc, F.merge_pc)) return false;
+                    if (idx < ins.size() && ins[idx].pc == F.sb_pc) ++idx;   // consume the arm's s_branch
+                    const uint32_t thenEnd = b.cur_block;
+                    std::unordered_map<int,uint32_t> then_v, then_s;
+                    for (int r : wv) then_v[r] = vget(r);
+                    for (int r : ws) then_s[r] = sget(r);
+                    uint32_t then_scc = rs.scc, then_vcc = rs.vcc, then_exec = rs.exec;
+                    const bool then_narrowed = rs.exec_narrowed;
+                    const std::unordered_map<int,uint32_t> then_bool = rs.sreg_bool;
+                    b.emit_branch(mergeL);
+                    rs = pre;                               // else-arm starts from the pre-branch state
+                    b.emit_label(elseL);
+                    if (!emit_structured(F.target_pc, else_hi, F.merge_pc)) return false;
+                    const uint32_t elseEnd = b.cur_block;
+                    b.emit_branch(mergeL); b.emit_label(mergeL);
+                    for (int r : wv) { uint32_t ev = vget(r);
+                        if (then_v[r] != ev) rs.vreg[r] = b.emit_phi_2way(b.t_u32, then_v[r], thenEnd, ev, elseEnd); }
+                    for (int r : ws) { uint32_t es = sget(r);
+                        if (then_s[r] != es) rs.sreg[r] = b.emit_phi_2way(b.t_u32, then_s[r], thenEnd, es, elseEnd); }
+                    if (then_scc != rs.scc) rs.scc = b.emit_phi_2way(b.t_bool, then_scc, thenEnd, rs.scc, elseEnd);
+                    if (then_vcc != rs.vcc) rs.vcc = b.emit_phi_2way(b.t_bool, then_vcc, thenEnd, rs.vcc, elseEnd);
+                    if (then_exec != rs.exec) rs.exec = b.emit_phi_2way(b.t_bool, then_exec, thenEnd, rs.exec, elseEnd);
+                    rs.exec_narrowed = then_narrowed || rs.exec_narrowed;
+                    for (auto& kv : rs.sreg_bool) {         // masks changed differently per arm -> phi
+                        auto t = then_bool.find(kv.first);
+                        if (t != then_bool.end() && t->second != kv.second) {
+                            kv.second = b.emit_phi_2way(b.t_bool, t->second, thenEnd, kv.second, elseEnd);
+                            rs.sreg_bool_narrowed[kv.first] = true;
+                        }
+                    }
+                    lo = else_hi;   // continue after the merge (== hi for the escaping-cascade shape)
                 }
-                lo = F.target_pc;   // continue after the merge (loop; further sequential ifs handled here)
             }
         };
-        if (!emit_structured(0, UINT32_MAX)) return false;
+        if (!emit_structured(0, UINT32_MAX, UINT32_MAX)) return false;
     } else {
         wave_ok = true;   // straight-line: barriers are wave-uniform, so cross-lane mbcnt is safe here
         if (!emit_range(0, UINT32_MAX)) return false;   // loop-free: straight-line, unchanged behavior
@@ -2829,6 +3212,7 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
     b.begin(num_inputs ? num_inputs : 1);
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
     auto safe_branches = safe_execz_branches(ins);
+    for (uint32_t wpc : waterfall_branches(ins)) safe_branches.insert(wpc);   // readfirstlane waterfalls (#273)
     for (uint32_t k = 0; k < num_inputs; k++) rs.vreg[(int)k] = b.load_input(k);
     // Compute kernels have no EXP output; reject if one appears.
     if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/true, /*allow_smem*/true,
@@ -2850,6 +3234,7 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
     SpirvCompute b; b.begin(1);
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
     auto safe_branches = safe_execz_branches(ins);
+    for (uint32_t wpc : waterfall_branches(ins)) safe_branches.insert(wpc);   // readfirstlane waterfalls (#273)
     // emit_alu is a per-instruction check and rejects control-flow branches, but the whole-stream emit_body
     // RECONSTRUCTS a counted loop and a forward uniform-if. Credit the branches emit_body consumes (loop
     // back-edge + exit, and the forward-if branch) as handled, so coverage matches what actually recompiles
@@ -2928,6 +3313,7 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords, co
     }
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
     auto safe_branches = safe_execz_branches(ins);
+    for (uint32_t wpc : waterfall_branches(ins)) safe_branches.insert(wpc);   // readfirstlane waterfalls (#273)
     // FRAGMENT-only: also linearize alpha-test / clip() kill-mask s_cbranch_scc0/scc1 early-outs (Unity
     // cutout + text draws). Merged into the same set so emit_alu drops the branch and detect_forward_if
     // skips it; the block's EXEC narrow + the export's OpKill do the per-invocation discard (#102). This is
@@ -2975,6 +3361,7 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords, cons
     b.begin_vertex(rt);
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
     auto safe_branches = safe_execz_branches(ins);
+    for (uint32_t wpc : waterfall_branches(ins)) safe_branches.insert(wpc);   // readfirstlane waterfalls (#273)
     // NGG vertex shaders (s_sendmsg GS_ALLOC_REQ present) carry the vertex index in v5, not v0, and wrap
     // the body in wave-packing plumbing (s_sendmsg / exp prim / s_lshr_b64 exec) that lowers to no-ops in
     // our per-invocation model. Detect NGG and bind the index to v5 as well.
