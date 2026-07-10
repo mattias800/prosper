@@ -131,6 +131,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_service_getters PRIVATE prosper_core)
   add_test(NAME service_getters COMMAND test_service_getters)
 
+  # libSceImeDialog lifecycle + libSceSaveData memory API round-trip (#191): auto-completing dialog
+  # (no hang) + a real per-(user,slot) Set->Get memory block with verified shadPS4 struct layouts.
+  add_executable(test_savedata_ime tests/test_savedata_ime.cpp)
+  target_link_libraries(test_savedata_ime PRIVATE prosper_core)
+  add_test(NAME savedata_ime COMMAND test_savedata_ime)
+
   # pthread scheduling getters fill their out-param (not a shadowing no-op): scePthreadGetprio/
   # Getaffinity must WRITE priority/mask, else the caller reads uninitialized stack (harmful-stub class).
   add_executable(test_pthread_sched_getters tests/test_pthread_sched_getters.cpp)
