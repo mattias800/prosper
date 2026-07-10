@@ -127,6 +127,27 @@ int main() {
     CHECK(vk_blend_factor(0x08u) == 4u, "RDNA2 DstColor(8) -> VK DST_COLOR(4) (non-identity)");
     CHECK(vk_blend_op(2u) == 3u, "RDNA2 comb Min(2) -> VK MIN(3) (non-identity)");
 
+    // #381: separate alpha blend. The extractor's rs (bit 29 clear) mirrors color into alpha on resolve;
+    // with SEPARATE_ALPHA_BLEND set, the alpha channel resolves from its OWN factors, independent of color.
+    CHECK(!rs.separate_alpha_blend, "SEPARATE_ALPHA_BLEND not set in the sample stream");
+    {
+        ResolvedPipelineState mirror = resolve_pipeline_state(rs);
+        CHECK(mirror.src_alpha_blend_factor == mirror.src_color_blend_factor &&
+              mirror.dst_alpha_blend_factor == mirror.dst_color_blend_factor &&
+              mirror.alpha_blend_op == mirror.color_blend_op,
+              "no SEPARATE_ALPHA_BLEND -> alpha factors mirror color");
+        RenderState sep = rs;
+        sep.separate_alpha_blend = true;
+        sep.alpha_src_blend = 1u;  // One
+        sep.alpha_dst_blend = 5u;  // OneMinusSrcAlpha
+        sep.alpha_comb_fcn  = 0u;  // Add
+        ResolvedPipelineState psep = resolve_pipeline_state(sep);
+        CHECK(psep.src_alpha_blend_factor == vk_blend_factor(1u) &&
+              psep.dst_alpha_blend_factor == vk_blend_factor(5u) &&
+              psep.src_alpha_blend_factor != psep.src_color_blend_factor,
+              "SEPARATE_ALPHA_BLEND -> alpha uses its own factors (One/OneMinusSrcAlpha), not color's");
+    }
+
     CHECK(rs.db_depth_control  == 0x00000046u, "db_depth_control raw preserved");
     CHECK(rs.cb_color_control  == 0x00CC0010u, "cb_color_control raw preserved");
     CHECK(rs.cb_target_mask    == 0x0000000Fu, "cb_target_mask raw preserved");
