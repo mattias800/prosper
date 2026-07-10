@@ -488,6 +488,13 @@ extern "C" void prosper_gpu_drain_completion_writes() {
 // deadlocks our synchronous fold — the re-pulse keeps the guest-observable protocol sound).
 namespace {
 bool wait_regmem_satisfied(const Pm4Command& c) {
+    // The label page can be unmapped/freed — a recycled command buffer referencing a prior generation's
+    // fence label, or a producer/consumer that freed the tracking block (the #312 freed-label class). A
+    // raw 8-byte read of a stale guest address is a host SEGV, so probe first and treat an unmapped label
+    // as NOT satisfied (the barrel-on default) — matching flush_deferred_streams(), which already guards
+    // its WAIT_REG_MEM re-check this way. The wm_addr&3 alignment gate at the call site does not catch an
+    // unmapped-but-aligned address. #380.
+    if (!guest_readable(c.wm_addr, sizeof(uint64_t))) return false;
     uint64_t mem = 0; memcpy(&mem, (const void*)(uintptr_t)c.wm_addr, sizeof mem);
     uint64_t v = mem & c.wm_mask, r = c.wm_ref;
     switch (c.wm_func) {           // PM4 WAIT_REG_MEM compare functions
