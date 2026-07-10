@@ -543,7 +543,13 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         b1.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b1.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b1);
     }
-    VkClearValue clear[2]{}; clear[0].color = {{0.0f, 0.0f, 1.0f, 1.0f}};   // blue
+    // Clear to BLACK — the game clears its color target to its CB fast-clear value, and this title's
+    // CB_COLOR0_CLEAR_WORD is 0 (black) for every target (verified with PROSPER_CLEARLOG, #309). Blue was
+    // a bring-up debug colour to make unrendered areas visible; keep it behind PROSPER_CLEAR_DEBUG.
+    // (A non-zero, format-decoded fast-clear colour is a future enhancement; this game clears to black.)
+    VkClearValue clear[2]{};
+    clear[0].color = getenv("PROSPER_CLEAR_DEBUG") ? VkClearColorValue{{0.0f, 0.0f, 1.0f, 1.0f}}
+                                                   : VkClearColorValue{{0.0f, 0.0f, 0.0f, 1.0f}};
     clear[1].depthStencil = {0.5f, 0};   // depth cleared to 0.5 (fragments at z=0.0 pass LESS, fail GREATER)
     VkRenderPassBeginInfo rpbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rpbi.renderPass = rp; rpbi.framebuffer = fb; rpbi.renderArea = {{0, 0}, {W, H}}; rpbi.clearValueCount = use_ds ? 2 : 1; rpbi.pClearValues = clear;

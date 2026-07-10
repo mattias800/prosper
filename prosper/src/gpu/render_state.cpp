@@ -4,6 +4,8 @@
 #include "vk_translate.hpp"
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
+#include <set>
 
 namespace prosper::gpu {
 
@@ -45,6 +47,17 @@ RenderState extract_render_state(const GpuState& st) {
     rs.color0_format           = PM4_FIELD(cinfo, CB_COLOR0_INFO, FORMAT);
     rs.color0_number_type      = PM4_FIELD(cinfo, CB_COLOR0_INFO, NUMBER_TYPE);
     rs.color0_comp_swap        = PM4_FIELD(cinfo, CB_COLOR0_INFO, COMP_SWAP);
+    // PROSPER_CLEARLOG: does the game program a CB fast-clear colour for this target, and in what format?
+    // (Investigation for the debug-blue clear -> real clear colour, #309.)
+    if (getenv("PROSPER_CLEARLOG")) {
+        uint32_t cw0 = rd(st.cx, P::CB_COLOR0_CLEAR_WORD0), cw1 = rd(st.cx, P::CB_COLOR0_CLEAR_WORD1);
+        static std::set<uint64_t> seen;
+        uint64_t key = ((uint64_t)cw0 << 32) | (rs.color0_base & 0xffffffffu);
+        if (seen.insert(key).second)
+            fprintf(stderr, "[clear] base=0x%llx fmt=%u numtype=%u swap=%u CLEAR_WORD0=0x%08x WORD1=0x%08x\n",
+                    (unsigned long long)rs.color0_base, rs.color0_format, rs.color0_number_type,
+                    rs.color0_comp_swap, cw0, cw1);
+    }
 
     // Primitive topology. VGT_PRIMITIVE_TYPE (0x242) is a UCONFIG register in RDNA2 (the game sets it via
     // a Uc-class SetRegsIndirect / CreatePrimState's uc[2]), NOT a context register — read it from st.uc.
