@@ -47,6 +47,15 @@ struct GpuState {
         bool     indexed = false;
         uint64_t index_addr = 0;
         uint64_t modifier = 0;
+        // Gen5 DrawIndexOffset provenance (#304): the index ELEMENT SIZE is never set by DOLL (no
+        // SetIndexSize / no VGT_INDEX_TYPE register), so index_type defaults to 16-bit — but DOLL's
+        // UE4 Slate/UMG quad index buffers are actually 32-bit. The executor auto-detects the real
+        // element size from buffer content and, for an offset draw, must recompute the address at the
+        // detected element size (index_base + index_offset*elem). Store the raw base + element offset
+        // so it can. (A DrawIndex carries an absolute index_addr instead; from_offset stays false.)
+        uint64_t index_base   = 0;
+        uint32_t index_offset = 0;
+        bool     from_offset  = false;
     };
     std::vector<Draw> draws;                             // one per DrawIndexAuto / DrawIndex
     uint64_t dispatch_count = 0;                         // DispatchDirect packets seen (no execution yet)

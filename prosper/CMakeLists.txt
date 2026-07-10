@@ -229,6 +229,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_dynfetch_fold PRIVATE prosper_core)
   add_test(NAME dynfetch_fold COMMAND test_dynfetch_fold)
 
+  # Unannounced-32-bit index-buffer fingerprint (#304 — DOLL's Slate/UMG quads). No Vulkan needed.
+  add_executable(test_index_size_detect tests/test_index_size_detect.cpp)
+  target_link_libraries(test_index_size_detect PRIVATE prosper_core)
+  add_test(NAME index_size_detect COMMAND test_index_size_detect)
+
   # shader_histo: data-driven recompiler-coverage report over the game's real embedded RDNA2 shaders.
   add_executable(shader_histo tools/shader_histo/shader_histo.cpp)
   target_link_libraries(shader_histo PRIVATE prosper_core)

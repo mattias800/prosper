@@ -183,6 +183,11 @@ void GpuState::apply(const Pm4Command& c) {
             if (index_base && d.index_count) {
                 d.indexed = true;
                 d.index_addr = index_base + (uint64_t)c.index_offset * elem;
+                // Preserve the raw base + element offset so the executor can recompute the address if
+                // it auto-detects a different element size (#304 — DOLL's 32-bit Slate index buffers).
+                d.index_base = index_base;
+                d.index_offset = c.index_offset;
+                d.from_offset = true;
             }
             draws.push_back(std::move(d));
             break;

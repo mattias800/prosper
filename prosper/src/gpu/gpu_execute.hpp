@@ -121,6 +121,28 @@ inline uint32_t index_elem_bytes(uint32_t index_type) {
     return index_type == 0 ? 2u : index_type == 1 ? 4u : 0u;
 }
 
+// Detect an UNANNOUNCED 32-bit index buffer (#304). DOLL's UE4 Slate/UMG quad index buffers are
+// 32-bit, but the title never calls sceAgcDcbSetIndexSize and programs no VGT_INDEX_TYPE register,
+// so index_type defaults to 16-bit — which misreads each 32-bit index as TWO 16-bit ones (the low
+// half = the real index, the high half = 0), collapsing a quad's [0,1,2,2,1,3] to a degenerate
+// [0,0,1,0,2,0]. The fingerprint is unmistakable and cheap: read the same buffer as 16-bit and as
+// 32-bit for `n` entries; a real 32-bit buffer has EVERY odd 16-bit word (the zero high halves) == 0
+// AND every 32-bit value small (< 0x10000) and not all-zero. Genuine 16-bit index buffers (DOLL's
+// scene/text meshes; every Messenger quad, e.g. [0,1,2,2,3,0]) have a non-zero odd word and are
+// rejected, so this never reinterprets a real 16-bit buffer. `p16` reads from the 16-bit (elem=2)
+// address; `p32` from the recomputed 32-bit address — for a DrawIndexOffset they differ, but both
+// land on a quad-periodic region so the fingerprint holds on either. CONFIDENCE: HIGH.
+inline bool index_buffer_is_unannounced_32bit(const uint16_t* p16, const uint32_t* p32, uint32_t n) {
+    if (n < 2) return false;                         // need at least one odd word to test
+    bool odd_zero = true, all_small = true, any_nonzero = false, has_odd = false;
+    for (uint32_t i = 0; i < n; i++) {
+        if (i & 1) { has_odd = true; if (p16[i] != 0) odd_zero = false; }
+        if (p32[i] >= 0x10000u) all_small = false;
+        if (p32[i] != 0) any_nonzero = true;
+    }
+    return has_odd && odd_zero && all_small && any_nonzero;
+}
+
 // Realize ONE draw of `ds` (a register snapshot or the folded state) into a DrawItem: recompile the
 // VS+PS, resolve fixed-function state, and — for an indexed draw — fetch the guest index buffer.
 // `draw` is the PM4 draw record (index count + indexed/index_addr); null means "no record" (hand-built
@@ -238,23 +260,46 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     // non-indexed draw of the hint count instead of reading garbage.
     static constexpr uint32_t kMaxIndices = 1u << 20;   // sanity cap (largest seen live: 0x61e)
     if (draw && draw->indexed && draw->index_addr && draw->index_count) {
-        const uint32_t esz = index_elem_bytes(ds.index_type);
+        uint32_t esz = index_elem_bytes(ds.index_type);
         uint32_t n = std::min(draw->index_count, kMaxIndices);
+        uint64_t index_addr = draw->index_addr;
+        // Auto-detect a 32-bit index buffer that the guest never announced (#304). DOLL's UE4 Slate/UMG
+        // quads use 32-bit index buffers but the title never calls sceAgcDcbSetIndexSize and sets no
+        // VGT_INDEX_TYPE register, so index_type defaults to 16-bit — misreading each 32-bit index as
+        // two 16-bit ones. The fingerprint is unmistakable: a 32-bit index buffer read as 16-bit has
+        // every ODD 16-bit word (the zero high half of a small index) == 0, while reading it as 32-bit
+        // yields small, valid indices. Genuine 16-bit buffers (DOLL's scene/text meshes, all of the
+        // Messenger's quads) have non-zero odd words and are left untouched. When detected, use the
+        // 32-bit element size AND recompute a DrawIndexOffset's address at that stride (index_base +
+        // index_offset*4) so it lands on the correct quad. CONFIDENCE: HIGH — the banner index buffer
+        // decodes to a clean [0,1,2,2,1,3] quad this way vs a degenerate [0,0,1,0,2,0] as 16-bit.
+        if (esz == 2 && n >= 2) {
+            uint64_t addr32 = draw->from_offset ? (draw->index_base + (uint64_t)draw->index_offset * 4u)
+                                                : draw->index_addr;
+            if (guest_readable(draw->index_addr, n * 2u) && guest_readable(addr32, n * 4u) &&
+                index_buffer_is_unannounced_32bit((const uint16_t*)(uintptr_t)draw->index_addr,
+                                                  (const uint32_t*)(uintptr_t)addr32, n)) {
+                esz = 4; index_addr = addr32;
+                if (log) fprintf(stderr, "[exec] indexed draw: auto-detected 32-bit index buffer "
+                                 "(unannounced) at 0x%llx (was 16-bit 0x%llx)\n",
+                                 (unsigned long long)addr32, (unsigned long long)draw->index_addr);
+            }
+        }
         if (esz == 0) {
             if (log) fprintf(stderr, "[exec] indexed draw: UNKNOWN index_type=%u — falling back to non-indexed\n",
                              ds.index_type);
-        } else if (!guest_readable(draw->index_addr, n * esz)) {
+        } else if (!guest_readable(index_addr, n * esz)) {
             if (log) fprintf(stderr, "[exec] indexed draw: index buffer 0x%llx (%u x %uB) unreadable — "
                              "falling back to non-indexed\n",
-                             (unsigned long long)draw->index_addr, n, esz);
+                             (unsigned long long)index_addr, n, esz);
         } else {
             out.indices.resize(n);
             uint32_t max_index = 0;
             if (esz == 2) {
-                const uint16_t* src = (const uint16_t*)(uintptr_t)draw->index_addr;
+                const uint16_t* src = (const uint16_t*)(uintptr_t)index_addr;
                 for (uint32_t i = 0; i < n; i++) { out.indices[i] = src[i]; max_index = std::max(max_index, out.indices[i]); }
             } else {
-                const uint32_t* src = (const uint32_t*)(uintptr_t)draw->index_addr;
+                const uint32_t* src = (const uint32_t*)(uintptr_t)index_addr;
                 for (uint32_t i = 0; i < n; i++) { out.indices[i] = src[i]; max_index = std::max(max_index, out.indices[i]); }
             }
             // Vertex count = the indexed range (max index + 1). The INDEX BUFFER is authoritative for how
