@@ -656,9 +656,28 @@ HLE(s_savedata_commit)  { svc_log("sceSaveDataCommit", a0,a1,a2,a3,a4,a5); retur
 HLE(s_savedata_dirsearch) {
     svc_log("sceSaveDataDirNameSearch", a0,a1,a2,a3,a4,a5);
     if (!a1) return 0x809F0000ull;        // SAVE_DATA_ERROR_PARAMETER
-    uint32_t* res = (uint32_t*)PW(a1);
-    res[0] = 0;                            // hitNum = 0 (no existing saves)
-    res[5] = 0;                            // setNum (offset 0x14) = 0
+    uint8_t* res = (uint8_t*)PW(a1);
+    // Enumerate the save dirs on disk so a prior session's saves show up in the load/continue list (#299).
+    // Was hard-coded to 0 hits, so persisted saves were invisible. Optional cond->dirName filter @cond+0x10.
+    const char* filter = nullptr;
+    if (a0) { uint64_t dnp = *(uint64_t*)((uint8_t*)PW(a0) + 0x10); if (dnp) filter = (const char*)PW(dnp); }
+    std::vector<std::string> dirs = savedata0_list_dirs();
+    uint32_t cap = *(uint32_t*)(res + 0x10);            // dirNamesNum (caller buffer capacity, entries)
+    if (cap > 0x400) cap = 0x400;                        // clamp to the documented buffer size
+    uint64_t buf = *(uint64_t*)(res + 0x08);            // DirName* dirNames (caller buffer)
+    uint32_t total = 0;
+    for (const std::string& name : dirs) {
+        if (filter && name != filter) continue;
+        if (buf && (!cap || total < cap)) {              // SceSaveDataDirName = char dirName[32]
+            char* entry = (char*)PW(buf) + (size_t)total * 32;
+            memset(entry, 0, 32);
+            strncpy(entry, name.c_str(), 31);
+        }
+        total++;
+    }
+    uint32_t hit = (cap && total > cap) ? cap : total;
+    *(uint32_t*)(res + 0x00) = hit;        // hitNum
+    *(uint32_t*)(res + 0x14) = hit;        // setNum
     return 0;
 }
 

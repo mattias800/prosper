@@ -20,6 +20,7 @@
 #ifndef _WIN32
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <dirent.h>      // opendir/readdir: savedata0_list_dirs (sceSaveDataDirNameSearch, #299)
 #include <sys/uio.h>     // process_vm_readv: fault-safe guest-memory reads for the APR diagnostics
 #include <sys/mman.h>    // PROSPER_APR_ALTDEST: prosper-owned guest read buffer
 #include <pthread.h>
@@ -214,6 +215,25 @@ bool savedata0_mount(const char* dirname, bool create) {
     return true;
 }
 void savedata0_umount() { std::lock_guard<std::mutex> lk(g_save0_mx); g_save0.clear(); }
+// List the save-dir names that exist under the host save root (each subdir is one save the guest created
+// via sceSaveDataMount3 create-mode). sceSaveDataDirNameSearch reports these so a prior session's saves
+// appear in the game's load/continue list (#299 — the saves persisted but were invisible).
+std::vector<std::string> savedata0_list_dirs() {
+    std::vector<std::string> out;
+#ifndef _WIN32
+    std::string base = save0_base();
+    if (DIR* dp = opendir(base.c_str())) {
+        while (struct dirent* de = readdir(dp)) {
+            if (de->d_name[0] == '.') continue;
+            struct stat st{};
+            if (::stat((base + "/" + de->d_name).c_str(), &st) == 0 && S_ISDIR(st.st_mode))
+                out.emplace_back(de->d_name);
+        }
+        closedir(dp);
+    }
+#endif   // Windows host is secondary; report no saves there.
+    return out;
+}
 
 // Translate a host (Linux) struct stat into the FreeBSD/Orbis SceKernelStat layout the
 // guest expects: 0x78 bytes, different field order. Writing the host layout (144 bytes,

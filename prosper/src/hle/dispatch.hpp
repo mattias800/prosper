@@ -63,6 +63,7 @@ void set_app0_root(const std::string& root);
 // (sceSaveDataMount3 HLE). create=true makes the dir; create=false fails if it doesn't exist.
 bool savedata0_mount(const char* dirname, bool create);
 void savedata0_umount();
+std::vector<std::string> savedata0_list_dirs();   // existing save dirs under the host save root (#299)
 // PS5 system services (user/NP/mouse/appcontent/dialog); called by register_builtin_hle().
 void register_service_hle();
 // libScePad game-controller input (real host controller via input/pad.cpp); called by register_builtin_hle().
