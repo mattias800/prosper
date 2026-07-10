@@ -13,6 +13,7 @@
 #include "rdna2_to_spirv.hpp"      // recompile_vertex / recompile_fragment
 #include "shader_resources.hpp"    // ShaderResourceTable
 #include "agc_shader_layout.hpp"   // DecodedBufferDescriptor (DynFetch)
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -63,10 +64,34 @@ bool guest_readable(uint64_t addr, uint32_t bytes);
 // gpu_executor.cpp: the exact fetch instruction (pc), its SRSRC SGPR, and the V# live in that SGPR
 // at that instruction. Exposed (with resolve_dynamic_fetch) so the fold's scalar-ALU semantics are
 // unit-testable; production callers stay inside gpu_executor.cpp.
-struct DynFetch { uint32_t fetch_pc; int srsrc; DecodedBufferDescriptor desc; uint32_t desc_v3; };
+struct DynFetch {
+    uint32_t fetch_pc; int srsrc; DecodedBufferDescriptor desc; uint32_t desc_v3;
+    // True when the V# came from the user-data SEED fallback (never s_loaded/patched-tracked). A
+    // seed entry must NOT shadow a metadata-described direct vertex buffer at the same SGPRs: the
+    // by_fetch_pc dyn path models the element address as gl_VertexIndex*stride (per-attribute
+    // patched V#s fold their in-record offset into the base), while a single direct V# needs the
+    // faithful VADDR/inst-offset address — shadowing it collapses every attribute onto offset 0.
+    bool from_seed = false;
+};
+
+// One descriptor-TABLE use recovered by the same const-fold (#294): UE4 shaders load their T#/S#/V#
+// descriptors with `s_load_dwordx4/x8 sN, s[ptr:ptr+1], <imm>` from a resource table whose pointer
+// sits in the user-data SGPRs, then consume them (image_sample SRSRC/SSAMP, s_buffer_load SBASE).
+// The recompiler tags such a load's dest SGPRs with the load IMMEDIATE (sreg_srt) and resolves the
+// consumer via by_srt_offset(imm) — so `key` here is exactly that immediate, and build_stage_table
+// turns each use into a ShaderResource with srt_offset = key.
+struct SrtUse {
+    int kind = 0;                    // 0 = texture (t8, + s4 sampler when resolved), 1 = constant buffer (v4)
+    uint32_t key = 0;                // the s_load immediate byte offset (== emit_alu's sreg_srt tag)
+    std::array<uint32_t, 8> t8{};    // T# dwords as loaded (kind 0)
+    std::array<uint32_t, 4> v4{};    // V# dwords as loaded (kind 1)
+    bool has_samp = false;
+    std::array<uint32_t, 4> s4{};    // paired S# dwords (kind 0, when the SSAMP load also resolved)
+};
 std::vector<DynFetch> resolve_dynamic_fetch(const uint32_t* code, size_t dwords,
                                             const uint32_t* user_sgprs, uint32_t nsgpr,
-                                            uint32_t user_sgpr_base);
+                                            uint32_t user_sgpr_base,
+                                            std::vector<SrtUse>* srt_uses = nullptr);
 
 // Assign each resource in `t` a descriptor binding from `first`: constant/vertex buffers first, then
 // textures / storage images — never on binding 2 or 3 (the recompiler's two hardwired cbufs) so a

@@ -7,6 +7,7 @@
 #include "gpu/bc_decode.hpp"            // BC1/2/3 block decompression -> RGBA8 (#121)
 #include "gpu/shader_resources.hpp"     // ShaderResourceTable / ResourceClass
 #include "gpu/rdna2_to_spirv.hpp"       // recompile_fragment (diagnostic solid-color PS)
+#include "gpu/videoout_present.hpp"     // present_front_index (flip-anchored present selection)
 #include "render_runner.h"              // offscreen Vulkan backend (render_draws_rgba) + dump_bmp
 
 #include <atomic>
@@ -20,6 +21,11 @@
 
 // Classify a guest address: 0 => not within a reserved/committed guest mapping (see hle_kernel_mem).
 extern "C" int prosper_reserved_range_state(uint64_t addr);
+// VideoOut scanout registry (hle_graphics.cpp) — which guest buffer the game most recently FLIPPED
+// to screen. The flip fires during the Dcb fold (agc_dcb_set_flip -> prosper_vo_flip_from_gpu),
+// BEFORE the submit's execute_and_present, so at render time these identify this frame's scanout VA.
+extern "C" int      prosper_vo_buffer_count();
+extern "C" uint64_t prosper_vo_buffer_addr(int i);
 
 namespace prosper::frontend {
 
@@ -402,14 +408,50 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     if (groups.find(k) == groups.end()) order.push_back(k);
                     groups[k].push_back(&it);
                 }
-                for (uint64_t base : order) {
-                    std::vector<uint8_t> gpx = prosper::test::render_draws_rgba(build_bds(groups[base]), w, h);
-                    if (base && !gpx.empty()) { RttSurf& s = g_rtt[base]; s.rgba = gpx; s.w = w; s.h = h; }
-                    if (getenv("PROSPER_RTTLOG")) { size_t nz=0; for (uint8_t b : gpx) nz += (b != 0);
-                        fprintf(stderr, "[rtt] group target=0x%llx (%zu draws) px_nonzero=%zu cache_size=%zu\n",
-                                (unsigned long long)base, groups[base].size(), nz, g_rtt.size()); }
-                    if (!gpx.empty()) px = std::move(gpx);                              // present the last non-empty group
+                // Flip-anchored present selection: the correct frame is whatever the guest FLIPS to
+                // screen, i.e. the RTT group whose color-target VA is a registered VideoOut buffer
+                // (preferring the CURRENT front buffer — the in-stream SetFlip fires during the Dcb
+                // fold, before this render, so present_front_index() is this frame's scanout choice).
+                const int      vo_n     = prosper_vo_buffer_count();
+                const int      vo_front = prosper::gpu::present_front_index();
+                const uint64_t front_va = vo_front >= 0 ? prosper_vo_buffer_addr(vo_front) : 0;
+                if (getenv("PROSPER_RTTLOG")) {
+                    fprintf(stderr, "[rtt] flip state: front=%d va=0x%llx of %d registered:",
+                            vo_front, (unsigned long long)front_va, vo_n);
+                    for (int i = 0; i < vo_n && i < 8; i++)
+                        fprintf(stderr, " [%d]=0x%llx", i, (unsigned long long)prosper_vo_buffer_addr(i));
+                    fprintf(stderr, "\n");
                 }
+                std::vector<uint8_t> px_front, px_vo;   // flip-matched / any-scanout-matched candidates
+                // Render-target persistence (default on; PROSPER_RTT_NOSEED reverts to per-pass blue
+                // clear): seed each group's framebuffer with the pixels last rendered into that SAME
+                // target VA, so a pass that draws into an already-written target (UE4's UI pass onto
+                // the backbuffer, incremental HUD updates) composites OVER the earlier content instead
+                // of starting from the diagnostic clear. Real RT memory persists exactly this way.
+                static const bool seed_rtt = getenv("PROSPER_RTT_NOSEED") == nullptr;
+                for (uint64_t base : order) {
+                    const uint8_t* seed = nullptr;
+                    if (seed_rtt && base) { auto sit = g_rtt.find(base);
+                        if (sit != g_rtt.end() && sit->second.w == w && sit->second.h == h &&
+                            sit->second.rgba.size() == (size_t)w * h * 4) seed = sit->second.rgba.data(); }
+                    std::vector<uint8_t> gpx = prosper::test::render_draws_rgba(build_bds(groups[base]), w, h, seed);
+                    if (base && !gpx.empty()) { RttSurf& s = g_rtt[base]; s.rgba = gpx; s.w = w; s.h = h; }
+                    bool is_vo = false;
+                    for (int i = 0; i < vo_n && !is_vo; i++) is_vo = base && base == prosper_vo_buffer_addr(i);
+                    if (getenv("PROSPER_RTTLOG")) { size_t nz=0; for (uint8_t b : gpx) nz += (b != 0);
+                        fprintf(stderr, "[rtt] group target=0x%llx (%zu draws) px_nonzero=%zu cache_size=%zu%s%s\n",
+                                (unsigned long long)base, groups[base].size(), nz, g_rtt.size(),
+                                is_vo ? " SCANOUT" : "", base && base == front_va ? " FRONT" : ""); }
+                    if (!gpx.empty()) {
+                        if (base && base == front_va) px_front = gpx;                   // the flipped buffer
+                        if (is_vo)                    px_vo    = gpx;                   // any registered scanout
+                        px = std::move(gpx);                                            // last non-empty (fallback)
+                    }
+                }
+                // Present priority: the flipped front buffer > any registered scanout target > the
+                // legacy "last group" fallback (unchanged behavior when no group targets a VO buffer).
+                if (!px_front.empty())   px = std::move(px_front);
+                else if (!px_vo.empty()) px = std::move(px_vo);
             } else {
                 // Single-framebuffer path: render_draws_rgba composites every draw into ONE framebuffer.
                 std::vector<const prosper::gpu::DrawItem*> all; all.reserve(items.size());

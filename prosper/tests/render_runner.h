@@ -105,7 +105,14 @@ struct BackendDraw {
     std::vector<uint32_t> indices;
 };
 
-inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& draws, uint32_t W, uint32_t H) {
+// `seed_rgba` (optional): W*H*4 RGBA8 pixels to PRELOAD the color attachment with before the draws
+// run (loadOp LOAD instead of the blue clear). This is real render-target memory semantics: a game
+// pass that draws into a target it (or an earlier submit) already rendered composites OVER that
+// content — without it every pass starts from the diagnostic blue clear, so cross-submit
+// accumulation (UE4's UI-onto-backbuffer after a separate composite submit) is lost. Null (the
+// default) keeps the blue-clear behavior byte-identical for every existing caller.
+inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& draws, uint32_t W, uint32_t H,
+                                              const uint8_t* seed_rgba = nullptr) {
     std::vector<uint8_t> out;
     if (draws.empty()) return out;
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO}; app.apiVersion = VK_API_VERSION_1_1;
@@ -176,7 +183,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     imgci.imageType = VK_IMAGE_TYPE_2D; imgci.format = FMT; imgci.extent = {W, H, 1};
     imgci.mipLevels = 1; imgci.arrayLayers = 1; imgci.samples = VK_SAMPLE_COUNT_1_BIT;
     imgci.tiling = VK_IMAGE_TILING_OPTIMAL;
-    imgci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    imgci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                  (seed_rgba ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0u);
     VkImage img; vkCreateImage(dev, &imgci, nullptr, &img);
     VkMemoryRequirements ir; vkGetImageMemoryRequirements(dev, img, &ir);
     VkMemoryAllocateInfo iai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
@@ -205,9 +213,13 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
 
     VkAttachmentDescription att[2]{};
     att[0].format = FMT; att[0].samples = VK_SAMPLE_COUNT_1_BIT;
-    att[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; att[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    // Seeded: the attachment already holds the preloaded pixels (uploaded before the pass below), so
+    // LOAD them instead of clearing, and declare the matching initial layout.
+    att[0].loadOp = seed_rgba ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
+    att[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     att[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; att[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    att[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED; att[0].finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    att[0].initialLayout = seed_rgba ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
+    att[0].finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     att[1].format = DFMT; att[1].samples = VK_SAMPLE_COUNT_1_BIT;
     att[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; att[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     // Clear the stencil at pass start when a mask uses it (so the mask draw defines the stenciled
@@ -488,6 +500,33 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     VkCommandBuffer cmd; vkAllocateCommandBuffers(dev, &cbai, &cmd);
     VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &cbbi);
+    // Preload the color attachment with the seed pixels (render-target persistence): staging upload +
+    // transition to COLOR_ATTACHMENT_OPTIMAL, matching att[0]'s LOAD/initialLayout above.
+    VkBuffer seedbuf = VK_NULL_HANDLE; VkDeviceMemory seedmem = VK_NULL_HANDLE;
+    if (seed_rgba) {
+        VkBufferCreateInfo sci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        sci.size = bytes; sci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        vkCreateBuffer(dev, &sci, nullptr, &seedbuf);
+        VkMemoryRequirements sr; vkGetBufferMemoryRequirements(dev, seedbuf, &sr);
+        VkMemoryAllocateInfo sai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; sai.allocationSize = sr.size;
+        sai.memoryTypeIndex = pick(sr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        vkAllocateMemory(dev, &sai, nullptr, &seedmem); vkBindBufferMemory(dev, seedbuf, seedmem, 0);
+        void* sp = nullptr; vkMapMemory(dev, seedmem, 0, bytes, 0, &sp);
+        memcpy(sp, seed_rgba, (size_t)bytes); vkUnmapMemory(dev, seedmem);
+        VkImageMemoryBarrier s0{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        s0.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; s0.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        s0.image = img; s0.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        s0.srcAccessMask = 0; s0.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &s0);
+        VkBufferImageCopy sc{}; sc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; sc.imageExtent = {W, H, 1};
+        vkCmdCopyBufferToImage(cmd, seedbuf, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &sc);
+        VkImageMemoryBarrier s1{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        s1.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; s1.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        s1.image = img; s1.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        s1.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        s1.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &s1);
+    }
     // Upload each draw's textures: UNDEFINED -> TRANSFER_DST, copy staging buffer, TRANSFER_DST -> SHADER_READ.
     for (auto& v : dv) for (size_t i = 0; i < v.R.size(); i++) {
         if (!v.R[i].is_texture()) continue;
@@ -561,6 +600,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             if (v.tstagemem[i])vkFreeMemory(dev, v.tstagemem[i], nullptr);
         }
     }
+    if (seedbuf) vkDestroyBuffer(dev, seedbuf, nullptr);
+    if (seedmem) vkFreeMemory(dev, seedmem, nullptr);
     vkDestroyBuffer(dev, rb, nullptr); vkFreeMemory(dev, bmem, nullptr);
     vkDestroyFramebuffer(dev, fb, nullptr); vkDestroyRenderPass(dev, rp, nullptr); vkDestroyImageView(dev, view, nullptr);
     vkDestroyImage(dev, img, nullptr); vkFreeMemory(dev, imem, nullptr);

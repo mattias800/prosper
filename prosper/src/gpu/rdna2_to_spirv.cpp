@@ -55,6 +55,8 @@ enum : uint32_t {
     Cap_StorageImageMultisample=27,      // MS=1 storage image (read/write a multisampled image)
     Cap_ImageMSArray=48,                 // MS=1 AND Arrayed=1 image (2D_MSAA_ARRAY)
     Cap_StorageImageReadWithoutFormat=55, Cap_StorageImageWriteWithoutFormat=56,  // for Format=Unknown storage images
+    Cap_ImageGatherExtended=25,          // dynamic (non-const) Offset image operand on OpImageGather
+    ImgOp_Offset=0x10,                   // ImageOperands bit: dynamic texel offset (needs ImageGatherExtended)
     Img_Sampled_Storage=2,   // OpTypeImage "Sampled" operand: 2 = used WITHOUT a sampler (read/write storage image)
     ImgFmt_Unknown=0,        // OpTypeImage "Image Format": Unknown (runtime view format; needs the caps above)
     ImgOp_Bias=1, ImgOp_Lod=2, ImgOp_Sample=0x40,   // ImageOperands bits: LOD bias / explicit LOD / MSAA Sample index.
@@ -377,6 +379,26 @@ struct SpirvCompute {
         uint32_t si    = id(); put(code, Op_Load, {t_sampled_image, si, tex_var[binding]});
         uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
         uint32_t res   = id(); put(code, Op_ImageGather, {t_v4f, res, si, coord, uconst(comp)});
+        for (uint32_t c = 0; c < 4; c++) {
+            uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, res, c}); out[c] = bcu(e);
+        }
+    }
+    // image_gather4_lz_o 2D: gather with the MIMG _o per-pixel OFFSET operand. The offset VGPR packs
+    // signed 6-bit TEXEL offsets (x = bits[5:0], y = bits[13:8] — AMD RDNA2 ISA "offset" packing, the
+    // same fields image_sample_*_o uses). SPIR-V's dynamic Offset image operand requires the
+    // ImageGatherExtended capability (the offset VGPR is not a compile-time constant in our SSA model,
+    // even though shaders typically v_mov an immediate into it).
+    bool declared_gather_ext = false;
+    uint32_t t_v2i_cache = 0;
+    uint32_t t_v2i() { if (!t_v2i_cache) { t_v2i_cache = id(); put(types, Op_TypeVector, {t_v2i_cache, t_i32, 2}); } return t_v2i_cache; }
+    void image_gather_offset_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t comp,
+                                uint32_t off_bits, uint32_t out[4]) {
+        if (!declared_gather_ext) { put(caps, Op_Capability, {Cap_ImageGatherExtended}); declared_gather_ext = true; }
+        uint32_t si    = id(); put(code, Op_Load, {t_sampled_image, si, tex_var[binding]});
+        uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
+        uint32_t ox    = bfe_s(off_bits, 0, 6), oy = bfe_s(off_bits, 8, 6);   // signed 6-bit texel offsets
+        uint32_t offv  = id(); put(code, Op_CompositeConstruct, {t_v2i(), offv, bcs(ox), bcs(oy)});
+        uint32_t res   = id(); put(code, Op_ImageGather, {t_v4f, res, si, coord, uconst(comp), ImgOp_Offset, offv});
         for (uint32_t c = 0; c < 4; c++) {
             uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, res, c}); out[c] = bcu(e);
         }
@@ -2407,9 +2429,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             const bool is_sample = (in.opcode == 0x20), is_load = (in.opcode == 0x00);
             const bool is_sample_l = (in.opcode == 0x24), is_sample_lz = (in.opcode == 0x27);
             const bool is_sample_b = (in.opcode == 0x25), is_gather_lz = (in.opcode == 0x47);
+            // image_gather4_lz_o = 0x57 (gather at base level with the _o packed-offset operand in the
+            // FIRST vaddr — llvm-mc gfx1030 round-trip on live DOLL bytes: 0xf15c0808 "image_gather4_lz_o
+            // v[4:7], [v0, v18, v19], ..." — coords follow the offset, matching image_sample_b's
+            // modifier-first vaddr convention). DOLL's FXAA/upsample pass PS (#294).
+            const bool is_gather_lz_o = (in.opcode == 0x57);
             const bool dim2d = (in.mimg_dim == 1u), dim3d = (in.mimg_dim == 2u);
-            if ((!is_sample && !is_load && !is_sample_l && !is_sample_lz && !is_sample_b && !is_gather_lz) ||
-                (!dim2d && !dim3d)) { ok = false; return true; }
+            if ((!is_sample && !is_load && !is_sample_l && !is_sample_lz && !is_sample_b && !is_gather_lz &&
+                 !is_gather_lz_o) || (!dim2d && !dim3d)) { ok = false; return true; }
             if (res->cls != ResourceClass::Texture) { ok = false; return true; }
             // coords (normalized float for sample, integer texel for load). Non-NSA: consecutive from VADDR.
             // NSA (len>2): coord0 = VADDR, coord k>=1 = byte (k-1) of the extra address dwords words[2..3].
@@ -2424,14 +2451,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (is_sample) b.image_sample_3d(res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)), out);
                 else           b.image_sample_lod_3d(res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)),
                                                      b.uconst(0), out);         // _lz: base level
-            } else if (is_gather_lz) {
+            } else if (is_gather_lz || is_gather_lz_o) {
                 // gather4 dmask selects ONE channel (must be a single bit); the result is always the
                 // four texels of that channel -> 4 consecutive VDATA VGPRs, gather order preserved.
                 uint32_t dm = in.mimg_dmask;
                 if (dm != 1u && dm != 2u && dm != 4u && dm != 8u) { ok = false; return true; }
                 uint32_t comp = dm == 1u ? 0u : dm == 2u ? 1u : dm == 4u ? 2u : 3u;
                 b.declare_texture(res->binding, Dim_2D);
-                b.image_gather_2d(res->binding, vread(cvg(0)), vread(cvg(1)), comp, out);
+                if (is_gather_lz_o)   // vaddr order for _o: [packed offset, u, v]
+                    b.image_gather_offset_2d(res->binding, vread(cvg(1)), vread(cvg(2)), comp, vread(cvg(0)), out);
+                else
+                    b.image_gather_2d(res->binding, vread(cvg(0)), vread(cvg(1)), comp, out);
                 int vd = in.dst.value;
                 for (uint32_t c = 0; c < 4; c++) {
                     uint32_t old = vreg_old(b, rs, vd + (int)c);

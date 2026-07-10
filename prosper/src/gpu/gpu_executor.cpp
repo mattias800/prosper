@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <set>
 #include <vector>
 #include <unordered_map>
 #ifndef _WIN32
@@ -90,7 +91,7 @@ bool guest_readable(uint64_t, uint32_t) { return true; }
 // External linkage (DynFetch + declaration in gpu_execute.hpp) so the fold is unit-testable.
 std::vector<DynFetch>
 resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_sgprs, uint32_t nsgpr,
-                      uint32_t user_sgpr_base) {
+                      uint32_t user_sgpr_base, std::vector<SrtUse>* srt_uses) {
     std::vector<DynFetch> out;
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
@@ -98,6 +99,16 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     const bool trc = getenv("PROSPER_DYNTRACE") != nullptr;
     std::unordered_map<int, uint32_t> val;                 // known concrete SGPR values (by SHADER SGPR #)
     std::unordered_map<int, std::array<uint32_t, 4>> descr; // SGPR -> the 4-dword V# it holds (load-time snapshot)
+    // Descriptor-TABLE provenance (#294): for each snapshotted 4/8-dword s_load, the load's IMMEDIATE
+    // byte offset — the recompiler's sreg_srt/by_srt_offset key. 0xFFFFFFFF = not provenance-usable
+    // (register-SOFFSET or negative-immediate load, which emit_alu doesn't tag).
+    std::unordered_map<int, uint32_t> descr_key;
+    std::unordered_map<int, std::array<uint32_t, 8>> descr8;  // SGPR -> 8-dword T# (load-time snapshot)
+    std::unordered_map<int, uint32_t> descr8_key;
+    // SGPRs overwritten by an s_load since seeding — the seed-V# MUBUF fallback below must not use a
+    // stale user-data snapshot once the register was RELOADED from memory (ALU patches deliberately
+    // don't count: descriptor snapshots are load-time semantics, pre-patch, like `descr`).
+    std::set<int> reloaded;
     int scc = -1;   // tracked SCC (-1 unknown): set by s_cmp_*, consumed by s_cselect (the format patch's tail)
     // The SPI loads the user-data block starting at shader SGPR `user_sgpr_base` (s0..s7 are NGG system
     // SGPRs). So user-data block index k lands in shader SGPR (user_sgpr_base + k).
@@ -220,6 +231,18 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 if (soff_field < 106) soff_ok = known((int)soff_field, soff_val);          // SGPR
                 else if (soff_field == 106 || soff_field == 107) soff_ok = known((int)soff_field, soff_val); // vcc lo/hi
                 else soff_val = 0;                                          // null/const-0 soffset
+                // Descriptor-table use (#294): an s_buffer_load's SBASE is a V# — if that V# was
+                // snapshotted from a table load, report it as a ConstantBuffer use keyed by its load
+                // immediate (matching the recompiler's sreg_srt tag). Recorded BEFORE the dest write
+                // below (SBASE and SDST ranges may overlap).
+                if (srt_uses && is_buffer) {
+                    auto dit = descr.find(sbase); auto kit = descr_key.find(sbase);
+                    if (dit != descr.end() && kit != descr_key.end() && kit->second != 0xFFFFFFFFu) {
+                        SrtUse u; u.kind = 1; u.key = kit->second; u.v4 = dit->second;
+                        srt_uses->push_back(u);
+                    }
+                }
+                for (uint32_t k = 0; k < n; k++) reloaded.insert(sdst + (int)k);   // dest now holds memory data
                 uint64_t base = 0; bool base_ok;
                 if (is_buffer) { uint32_t b0, b1; base_ok = known(sbase, b0) && known(sbase + 1, b1);
                                  base = ((uint64_t)b0 | ((uint64_t)b1 << 32)) & 0xFFFFFFFFFFFFull; }   // V#.Base48
@@ -237,9 +260,33 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                                                     for (uint32_t k = 0; k < n; k++) val.erase(sdst + (int)k); break; }
                 const uint32_t* mem = (const uint32_t*)(uintptr_t)addr;
                 for (uint32_t k = 0; k < n; k++) val[sdst + (int)k] = mem[k];
+                // Provenance key: the recompiler tags an IMMEDIATE-only descriptor load's dest SGPRs
+                // with the load immediate (sreg_srt = in.literal); register-SOFFSET / negative loads
+                // are not tagged, so mark those snapshots key-less.
+                const bool imm_only = (soff_field == 125) && (int32_t)in.literal >= 0;   // SGPR_NULL soffset
                 // A 4-dword load is a V# candidate — snapshot it now (before any later stride patch) so a
-                // vertex fetch using these SGPRs resolves to the descriptor as loaded.
-                if (n == 4) descr[sdst] = { mem[0], mem[1], mem[2], mem[3] };
+                // vertex fetch using these SGPRs resolves to the descriptor as loaded. An 8-dword load is
+                // a T# candidate (image_sample SRSRC), snapshotted the same way (#294).
+                if (n == 4) { descr[sdst] = { mem[0], mem[1], mem[2], mem[3] };
+                              // only s_load (not s_buffer_load) dests get the recompiler's sreg_srt tag
+                              descr_key[sdst] = (imm_only && !is_buffer) ? in.literal : 0xFFFFFFFFu; }
+                if (n == 8) { descr8[sdst] = { mem[0], mem[1], mem[2], mem[3], mem[4], mem[5], mem[6], mem[7] };
+                              descr8_key[sdst] = (imm_only && !is_buffer) ? in.literal : 0xFFFFFFFFu; }
+                break;
+            }
+            case Rdna2Format::MIMG: {
+                // Descriptor-table use (#294): an image op's SRSRC (src[1]) is an 8-dword T#; if it was
+                // snapshotted from a keyed table load, report it as a Texture use — with the paired
+                // SSAMP (src[2]) S# when that 4-dword load also resolved. VGPR-only dest: no SGPR state.
+                if (srt_uses) {
+                    auto tit = descr8.find(in.src[1].value); auto kit = descr8_key.find(in.src[1].value);
+                    if (tit != descr8.end() && kit != descr8_key.end() && kit->second != 0xFFFFFFFFu) {
+                        SrtUse u; u.kind = 0; u.key = kit->second; u.t8 = tit->second;
+                        auto sit = descr.find(in.src[2].value);
+                        if (sit != descr.end()) { u.has_samp = true; u.s4 = sit->second; }
+                        srt_uses->push_back(u);
+                    }
+                }
                 break;
             }
             case Rdna2Format::MUBUF: {
@@ -264,6 +311,29 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     if (patched)          out.push_back({ in.pc, srsrc, decode_buffer_descriptor(vv), vv[3] });
                     else if (it != descr.end())
                         out.push_back({ in.pc, srsrc, decode_buffer_descriptor(it->second.data()), it->second[3] });
+                    else if (srsrc >= (int)user_sgpr_base && srsrc + 4 <= (int)(user_sgpr_base + nsgpr) &&
+                             !reloaded.count(srsrc) && !reloaded.count(srsrc + 1) &&
+                             !reloaded.count(srsrc + 2) && !reloaded.count(srsrc + 3)) {
+                        // SEED fallback (#294): the SRSRC V# was placed directly in the user-data SGPRs
+                        // by the driver (never s_loaded — so no `descr` snapshot) and the shader's
+                        // stride/format patch left the CURRENT dwords partially unknown (its s_cselect
+                        // condition reads an NGG system SGPR we don't model). Use the SEED values — the
+                        // same load-time/pre-patch semantics as the `descr` fallback above. Refused if
+                        // any of the 4 SGPRs was RELOADED from memory since seeding (a stale seed then
+                        // no longer describes the register). DOLL's scene-geometry VS fetches resolve
+                        // through exactly this path. CONFIDENCE: MED (patch-ignoring, like `descr`).
+                        const uint32_t sv[4] = { user_sgprs[srsrc - (int)user_sgpr_base],
+                                                 user_sgprs[srsrc - (int)user_sgpr_base + 1],
+                                                 user_sgprs[srsrc - (int)user_sgpr_base + 2],
+                                                 user_sgprs[srsrc - (int)user_sgpr_base + 3] };
+                        DecodedBufferDescriptor d = decode_buffer_descriptor(sv);
+                        // Plausibility: only emit a real-looking V# (mirrors the direct-resource guard).
+                        if (d.base > 0x10000 && d.size_bytes != 0 && d.size_bytes <= 0x10000000u) {
+                            if (trc) fprintf(stderr, "[dyntrace]   MUBUF pc=%u seed-V# fallback SRSRC=s%d base=0x%llx\n",
+                                             in.pc, srsrc, (unsigned long long)d.base);
+                            out.push_back({ in.pc, srsrc, d, sv[3], /*from_seed=*/true });
+                        }
+                    }
                 }
                 break;
             }
@@ -370,12 +440,20 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
     // Bindless-dynamic vertex fetch (VS): const-fold the scalar setup to resolve each buffer_load_format's
     // V#, then emit it as a VertexBuffer keyed by its SRSRC SGPR so the recompiler's by_sgpr_base resolves
     // it. Only meaningful for the vertex stage (the PS has no vertex fetch).
+    // The SAME const-fold also recovers descriptor-TABLE uses for BOTH stages (#294): UE4 shaders
+    // s_load their T#/S#/V# descriptors from a table pointer in the user-data SGPRs and consume them
+    // via image_sample / s_buffer_load — srt_uses reports each with its load-immediate key, which
+    // becomes the resource's srt_offset (the recompiler's by_srt_offset provenance).
     std::vector<DynFetch> dyn_vb;
-    if (!is_ps) {
+    std::vector<SrtUse> srt_uses;
+    if (is_ps) {
+        uint32_t sgprs[kUserSgprs]; read_user_sgprs(st.sh, bases[0], sgprs);
+        resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, 0x4000, sgprs, kUserSgprs, 0, &srt_uses);
+    } else {
         uint32_t sgprs[kUserSgprs]; read_user_sgprs(st.sh, bases[0], sgprs);
         // NGG merged VS/GS: s0..s7 are system SGPRs, user data starts at s8 (confirmed by matching the
         // shader's s[8:11]/s[24:25] descriptor pointers to the register file at GS_0+offset).
-        dyn_vb = resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, 0x4000, sgprs, kUserSgprs, 8);
+        dyn_vb = resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, 0x4000, sgprs, kUserSgprs, 8, &srt_uses);
         if (getenv("PROSPER_GFXLOG") || getenv("PROSPER_RESDUMP")) {
             fprintf(stderr, "[dynvb] VS resolved %zu dynamic vertex-fetch descriptor(s):\n", dyn_vb.size());
             for (auto& kv : dyn_vb) {
@@ -412,6 +490,16 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
         // (a raw 32-bit-per-component fetch, correct for float attributes like positions).
         for (auto& kv : dyn_vb) {
             const auto& d = kv.desc;
+            // A SEED-fallback entry must not shadow a metadata-described DIRECT vertex buffer at the
+            // same SGPRs (see DynFetch::from_seed): the direct resource resolves the fetch through
+            // the faithful address path, which is the correct model for a single un-patched V#.
+            if (kv.from_seed) {
+                bool direct_exists = false;
+                for (const auto& r0 : t.resources)
+                    if (r0.cls == ResourceClass::VertexBuffer && r0.sgpr_base == (uint32_t)kv.srsrc)
+                        { direct_exists = true; break; }
+                if (direct_exists) continue;
+            }
             ShaderResource r;
             r.cls           = ResourceClass::VertexBuffer;
             r.format        = (d.format == DataFormat::Unknown) ? DataFormat::Float32 : d.format;
@@ -423,6 +511,81 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
             r.fetch_pc      = kv.fetch_pc;        // PER-FETCH provenance = the exact fetch instruction
             r.srt_offset    = 0xFFFFFFFFu;
             t.resources.push_back(r);
+        }
+        // Descriptor-TABLE resources (#294): one ShaderResource per distinct table use, keyed by the
+        // s_load immediate (srt_offset) so the recompiler's sreg_srt/by_srt_offset provenance resolves
+        // the consuming image_sample / s_buffer_load. Never shadow an existing resource at the same
+        // srt_offset (the EUD-sharp path may already have emitted it — first match wins in
+        // by_srt_offset, and two DIFFERENT tables reusing one immediate would be ambiguous anyway).
+        {
+            std::set<uint64_t> srt_seen;
+            for (const auto& u : srt_uses) {
+                uint64_t dk = ((uint64_t)(uint32_t)u.kind << 32) | u.key;
+                if (!srt_seen.insert(dk).second) continue;
+                bool clash = false;
+                for (const auto& r0 : t.resources) if (r0.srt_offset == u.key) { clash = true; break; }
+                if (clash) continue;
+                if (u.kind == 1) {                       // constant buffer (V#)
+                    DecodedBufferDescriptor d = decode_buffer_descriptor(u.v4.data());
+                    if (d.base <= 0x10000 || d.size_bytes == 0 || d.size_bytes > 0x10000000u) continue;
+                    ShaderResource r;
+                    r.cls = ResourceClass::ConstantBuffer;
+                    r.format = d.format; r.num_components = d.num_components ? d.num_components : 1;
+                    r.gpu_addr = d.base; r.size = d.size_bytes; r.stride = d.stride;
+                    r.srt_offset = u.key;
+                    if (log) fprintf(stderr, "[srt] %s cbuf key=0x%x base=0x%llx size=%u\n", is_ps ? "PS" : "VS",
+                                     u.key, (unsigned long long)d.base, d.size_bytes);
+                    t.resources.push_back(r);
+                } else {                                  // texture (T# [+ paired S#])
+                    DecodedImageDescriptor d = decode_image_descriptor(u.t8.data());
+                    if (d.base == 0 || d.width == 0 || d.height == 0 ||
+                        d.width > 16384 || d.height > 16384) continue;       // garbage/degenerate T#
+                    Gen5ImageFormatInfo fi;
+                    if (!gen5_image_format(d.format, &fi)) {
+                        // Same unmapped-format policy as build_shader_resources: bind as RGBA8 only
+                        // under RTT (so render-to-texture injection can supply the pixels), else skip.
+                        static const bool rtt_bind = getenv("PROSPER_RTT") != nullptr ||
+                                                     getenv("PROSPER_RTT_PERTARGET") != nullptr;
+                        if (!rtt_bind) continue;
+                        fi.format = DataFormat::Unorm8; fi.num_components = 4; fi.bytes_per_block = 4;
+                        fi.block_width = fi.block_height = 1; fi.srgb = false; fi.snorm = false;
+                    }
+                    const bool is_bcn = fi.block_width > 1;
+                    if (is_bcn && (fi.format == DataFormat::Bc6 || fi.snorm)) continue;   // decode not wired
+                    ShaderResource r;
+                    r.cls = ResourceClass::Texture;
+                    r.format = fi.format; r.num_components = fi.num_components;
+                    r.gpu_addr = d.base; r.width = d.width; r.height = d.height;
+                    r.tile_mode = d.tile_mode; r.srgb = fi.srgb;
+                    r.swizzle[0] = d.dst_sel[0]; r.swizzle[1] = d.dst_sel[1];
+                    r.swizzle[2] = d.dst_sel[2]; r.swizzle[3] = d.dst_sel[3];
+                    r.size = is_bcn ? (((d.width + 3) / 4) * ((d.height + 3) / 4) * fi.bytes_per_block)
+                                    : (d.width * d.height * fi.bytes_per_block);
+                    r.srt_offset = u.key;
+                    if (u.has_samp) {                     // paired S# (same SQ_IMG_SAMP decode as the sharp path)
+                        const uint32_t* sm = u.s4.data();
+                        r.mag_filter  = ((sm[2] >> 20) & 0x3u) ? 1u : 0u;
+                        r.min_filter  = ((sm[2] >> 22) & 0x3u) ? 1u : 0u;
+                        r.mip_filter  = ((sm[2] >> 26) & 0x3u) ? 1u : 0u;
+                        r.addr_uvw[0] = (sm[0] >> 0) & 0x7u;
+                        r.addr_uvw[1] = (sm[0] >> 3) & 0x7u;
+                        r.addr_uvw[2] = (sm[0] >> 6) & 0x7u;
+                        r.max_aniso_ratio    = (sm[0] >> 9)  & 0x7u;
+                        r.depth_compare_func = (sm[0] >> 12) & 0x7u;
+                        r.unnormalized       = (sm[0] >> 15) & 0x1u;
+                        r.min_lod            = (float)( sm[1]        & 0xFFFu) / 256.0f;
+                        r.max_lod            = (float)((sm[1] >> 12) & 0xFFFu) / 256.0f;
+                        int32_t bias14       = (int32_t)(sm[2] & 0x3FFFu);
+                        if (bias14 & 0x2000) bias14 -= 0x4000;
+                        r.lod_bias           = (float)bias14 / 256.0f;
+                        r.border_color_type  = (sm[3] >> 30) & 0x3u;
+                    }
+                    if (log) fprintf(stderr, "[srt] %s tex key=0x%x %ux%u fmt=%u base=0x%llx tile=%u samp=%d\n",
+                                     is_ps ? "PS" : "VS", u.key, d.width, d.height, d.format,
+                                     (unsigned long long)d.base, d.tile_mode, (int)u.has_samp);
+                    t.resources.push_back(r);
+                }
+            }
         }
         if (t.resources.empty()) continue;
         assign_convention_bindings(t, is_ps ? kPsBindingBase : 2u);

@@ -73,6 +73,67 @@ int main() {
     std::vector<DynFetch> f3 = resolve_dynamic_fetch(k3, sizeof(k3)/sizeof(k3[0]), nullptr, 0, 0);
     CHECK(f3.empty(), "s_bfe_u64 of an inline FLOAT does not fold (V# dword unknown -> fetch unresolved)");
 
+    // Kernel 4: SEED-V# fallback (#294). The V# sits directly in the user-data SGPRs (s[8:11] =
+    // user block index 0..3, user_sgpr_base 8) and an ALU patch makes one dword UNKNOWN (s_mov from
+    // an untracked SGPR — DOLL's format patch does this via an s_cselect on an NGG system SGPR).
+    // Neither 'patched' nor 'descr' resolves; the fetch must fall back to the SEED (load-time /
+    // pre-patch) descriptor. No s_load touches s[8:11], so the reloaded guard stays clear.
+    const uint32_t k4[] = {
+        0xBE8B0332u,                // s_mov_b32 s11, s50 (s50 unknown -> s11 unknown; ALU, not a reload)
+        0xE0002000u, 0x80020100u,   // buffer_load_format_x v1, v0, s[8:11], 0 idxen
+        0xBF810000u,                // s_endpgm
+    };
+    const uint32_t seed4[4] = { 0x00020000u, 0x00100000u, 64u, 0u };   // base=0x20000 stride=16 recs=64
+    std::vector<DynFetch> f4 = resolve_dynamic_fetch(k4, sizeof(k4)/sizeof(k4[0]), seed4, 4, 8);
+    CHECK(f4.size() == 1, "kernel 4 seed-V# fallback resolves the fetch");
+    CHECK(f4.size() == 1 && f4[0].desc.base == 0x20000ull && f4[0].desc.stride == 16u,
+          "kernel 4 fallback V# = the SEED (user-data) descriptor");
+
+    // Kernel 4b: same, but s11 was RELOADED from memory (s_load_dword) — the stale seed must NOT be
+    // used (the register no longer holds user data). The load's address is unknown (s[40:41]
+    // untracked), so the value is unknown too and the fetch must stay unresolved.
+    const uint32_t k4b[] = {
+        0xF40002D4u, 0xFA000000u,   // s_load_dword s11, s[40:41], 0x0 (unknown base -> s11 reloaded+unknown)
+        0xE0002000u, 0x80020100u,   // buffer_load_format_x v1, v0, s[8:11], 0 idxen
+        0xBF810000u,                // s_endpgm
+    };
+    std::vector<DynFetch> f4b = resolve_dynamic_fetch(k4b, sizeof(k4b)/sizeof(k4b[0]), seed4, 4, 8);
+    CHECK(f4b.empty(), "kernel 4b reloaded SGPR blocks the seed fallback (no fabricated V#)");
+
+    // Kernel 5: descriptor-TABLE uses (#294). s[8:9] = a pointer to a host-memory table; the shader
+    // s_loads an 8-dword T# (imm 0x40) + a 4-dword S#/V# (imm 0x80), consumes them via image_sample
+    // (SRSRC/SSAMP) and s_buffer_load (SBASE). Each use must be reported with the load immediate as
+    // its key and the dwords as loaded. (Encodings llvm-mc gfx1030 round-trip verified.)
+    static uint32_t table[64];
+    for (int i = 0; i < 64; i++) table[i] = 0xD0000000u + (uint32_t)i;
+    // The V# at +0x80 must be a READABLE buffer for the interpreter's s_buffer_load data read:
+    // point it back at `table` itself (num_records=256 bytes, stride 0).
+    uint64_t tbase = (uint64_t)(uintptr_t)table;
+    table[32] = (uint32_t)tbase; table[33] = (uint32_t)(tbase >> 32) & 0xFFFFu; table[34] = 256u; table[35] = 0u;
+    const uint32_t k5[] = {
+        0xF40C0304u, 0xFA000040u,   // s_load_dwordx8 s[12:19], s[8:9], 0x40
+        0xF4080504u, 0xFA000080u,   // s_load_dwordx4 s[20:23], s[8:9], 0x80
+        0xF0800F08u, 0x00A30000u,   // image_sample v[0:3], v[0:1], s[12:19], s[20:23] dmask:0xf 2D
+        0xF420060Au, 0xFA000010u,   // s_buffer_load_dword s24, s[20:23], 0x10
+        0xBF810000u,                // s_endpgm
+    };
+    uint32_t seed5[2] = { (uint32_t)tbase, (uint32_t)(tbase >> 32) };
+    std::vector<SrtUse> uses;
+    resolve_dynamic_fetch(k5, sizeof(k5)/sizeof(k5[0]), seed5, 2, 8, &uses);
+    bool have_tex = false, have_cbuf = false, tex_ok = false, samp_ok = false, cbuf_ok = false;
+    for (const auto& u : uses) {
+        if (u.kind == 0 && u.key == 0x40) { have_tex = true;
+            tex_ok  = (u.t8[0] == table[16] && u.t8[7] == table[23]);
+            samp_ok = (u.has_samp && u.s4[0] == table[32] && u.s4[3] == table[35]); }
+        if (u.kind == 1 && u.key == 0x80) { have_cbuf = true;
+            cbuf_ok = (u.v4[0] == table[32] && u.v4[2] == 256u); }
+    }
+    CHECK(have_tex,  "kernel 5 image_sample reports a Texture table-use keyed by the T# load imm");
+    CHECK(tex_ok,    "kernel 5 T# dwords match the table as loaded");
+    CHECK(samp_ok,   "kernel 5 paired SSAMP S# resolved alongside the T#");
+    CHECK(have_cbuf, "kernel 5 s_buffer_load reports a ConstantBuffer table-use keyed by the V# load imm");
+    CHECK(cbuf_ok,   "kernel 5 V# dwords match the table as loaded");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
