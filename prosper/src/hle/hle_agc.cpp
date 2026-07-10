@@ -23,6 +23,7 @@
 #include <vector>
 #include <mutex>
 #include <atomic>
+#include <chrono>
 
 namespace prosper {
 
@@ -694,6 +695,42 @@ std::mutex g_agc_state_mu;
 // via sceGnmAddEqEvent. Our fold is synchronous, so a completed SubmitDcb == the GPU pipe having drained.
 void prosper_eq_trigger_eop();
 
+// Total flips so far (hle_graphics.cpp) — part of the PROSPER_PROGRESS heartbeat below.
+extern "C" uint64_t prosper_vo_flip_count();
+
+namespace {
+// PROSPER_PROGRESS=<secs>: emit a one-line timestamped forward-progress heartbeat at most every
+// <secs> seconds, from the GPU submit path (both entry points). Purpose: long diagnostic runs need
+// a cheap progression signal (is the frame loop advancing? are draws/dispatches still growing?)
+// without PROSPER_GFXLOG's per-packet firehose (GBs over a 10-minute run). Called under
+// g_agc_state_mu. Additive, default-off. CONFIDENCE: HIGH (diagnostic only, no behavior change).
+uint64_t g_presents_cum = 0;   // frames handed to the present path (bumped at each render call site)
+void progress_heartbeat(size_t draws_last, uint64_t submits, uint64_t dispatches) {
+    static const long interval = [] {
+        const char* e = getenv("PROSPER_PROGRESS"); return e ? atol(e) : 0; }();
+    if (interval <= 0) return;
+    static uint64_t draws_cum = 0;
+    draws_cum += draws_last;
+    static const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    static std::chrono::steady_clock::time_point next = t0;
+    auto now = std::chrono::steady_clock::now();
+    if (now < next) return;
+    next = now + std::chrono::seconds(interval);
+    double t = std::chrono::duration<double>(now - t0).count();
+    fprintf(stderr, "[progress] t=%.1fs submits=%llu draws_last=%zu draws_cum=%llu dispatches=%llu flips=%llu presents=%llu\n",
+            t, (unsigned long long)submits, draws_last, (unsigned long long)draws_cum,
+            (unsigned long long)dispatches, (unsigned long long)prosper_vo_flip_count(),
+            (unsigned long long)g_presents_cum);
+    // PROSPER_PROGRESS_UNIMPL=1: with the heartbeat on, also dump the unimplemented-NID call-count
+    // table every ~12 heartbeats. Purpose: the first-seen unimpl log is deduped, so a guest POLLING
+    // an unimplemented call (the classic "waits on a wrong stub answer" stall) is invisible without
+    // the per-call counts — and a `timeout`-killed diagnostic run never reaches the exit dump.
+    static const bool dump_unimpl = getenv("PROSPER_PROGRESS_UNIMPL") != nullptr;
+    static unsigned hb = 0;
+    if (dump_unimpl && (hb++ % 12) == 0) dump_call_log(stderr);
+}
+}
+
 extern "C" void prosper_agc_submit_stats(uint64_t* submits, uint64_t* draws) {
     std::lock_guard<std::mutex> lk(g_agc_state_mu);
     if (submits) *submits = g_submit_count;
@@ -722,12 +759,14 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
         static const uint32_t scale = [] {
             const char* e = getenv("PROSPER_RENDER_SCALE"); long v = e ? atol(e) : 1; return v > 0 ? (uint32_t)v : 1u; }();
         if (scale > 1) { w = (w / scale) & ~1u; h = (h / scale) & ~1u; if (!w) w = 2; if (!h) h = 2; }
-        gpu::execute_and_present(agc_gpu_state(), w, h);
+        if (gpu::execute_and_present(agc_gpu_state(), w, h)) g_presents_cum++;
     }
     if (getenv("PROSPER_GFXLOG"))
         fprintf(stderr, "[agc] %s #%llu: %u dwords (walk=%u) -> %zu packets applied (draws: %zu, dispatches: %llu)\n",
                 who, (unsigned long long)g_submit_count, dw_num, walk, applied,
                 agc_gpu_state().draws.size(), (unsigned long long)agc_gpu_state().dispatch_count);
+    progress_heartbeat(agc_gpu_state().draws.size(), g_submit_count,
+                       (uint64_t)agc_gpu_state().dispatch_count);
     return 0;
 }
 
@@ -838,6 +877,7 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
             const char* e = getenv("PROSPER_RENDER_SCALE"); long v = e ? atol(e) : 1; return v > 0 ? (uint32_t)v : 1u; }();
         if (scale > 1) { w = (w / scale) & ~1u; h = (h / scale) & ~1u; if (!w) w = 2; if (!h) h = 2; }
         bool presented = gpu::execute_and_present(agc_gpu_state(), w, h);
+        if (presented) g_presents_cum++;
         if (presented && getenv("PROSPER_GFXLOG"))
             fprintf(stderr, "[agc] SubmitDcb #%llu: executed %zu draws -> presented %ux%u frame\n",
                     (unsigned long long)g_submit_count, agc_gpu_state().draws.size(), w, h);
@@ -859,6 +899,8 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
                     c.len > 1 ? c.payload[0] : 0, c.len > 2 ? c.payload[1] : 0, c.len > 3 ? c.payload[2] : 0);
         }
     }
+    progress_heartbeat(agc_gpu_state().draws.size(), g_submit_count,
+                       (uint64_t)agc_gpu_state().dispatch_count);
     return 0;
 }
 

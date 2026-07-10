@@ -191,6 +191,9 @@ namespace {
 }
 
 // Exposed for the back-half present path + tests: the registered display surface.
+// prosper_vo_flip_count: total flips so far (either flip path) — read by the PROSPER_PROGRESS
+// heartbeat in hle_agc.cpp as a cheap forward-progress signal for long diagnostic runs.
+extern "C" uint64_t prosper_vo_flip_count() { std::lock_guard<std::mutex> lk(g_flip_mx); return g_flip_count; }
 extern "C" int      prosper_vo_buffer_count()   { return g_display.buffer_num; }
 extern "C" uint32_t prosper_vo_display_width()  { return g_display.width; }
 extern "C" uint32_t prosper_vo_display_height() { return g_display.height; }
