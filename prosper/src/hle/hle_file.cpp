@@ -455,7 +455,7 @@ uint64_t aio_submit(uint64_t reqs, int32_t n, bool is_write, uint64_t out_id) {
     for (int32_t i = 0; i < n; i++) {
         int64_t r;
 #ifndef _WIN32
-        r = is_write ? (int64_t)::pwrite(req[i].fd, req[i].buf, (size_t)req[i].nbyte, (off_t)req[i].offset)
+        r = is_write ? write_full(req[i].fd, req[i].buf, (size_t)req[i].nbyte, true, (off_t)req[i].offset)
                      : read_full(req[i].fd, req[i].buf, (size_t)req[i].nbyte, true, (off_t)req[i].offset);
 #else
         // Windows host (secondary): emulate positioned IO with lseek+read/write on the CRT fd.
