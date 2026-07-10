@@ -350,6 +350,15 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     tai.memoryTypeIndex = pick(tr.memoryTypeBits, 0); vkAllocateMemory(dev, &tai, nullptr, &v.tmem[i]);
                     vkBindImageMemory(dev, v.timg[i], v.tmem[i], 0);
                     VkImageViewCreateInfo tvci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+                    // NOTE(#263): r.srgb carries whether the T# is a gamma-encoded (sRGB) surface, but we
+                    // deliberately keep the view UNORM. This whole renderer works in gamma/sRGB space
+                    // end-to-end (this target is UNORM, the frontend blit + swapchain are UNORM), with NO
+                    // linear->sRGB encode at present. Sampling an sRGB texture as UNORM passes its encoded
+                    // bytes straight through, which MATCHES real-hardware output for pass-through content.
+                    // Flipping this to VK_FORMAT_R8G8B8A8_SRGB would apply sRGB->linear on sample with no
+                    // matching encode on store -> linear values into a UNORM swapchain -> too dark. A
+                    // correct sRGB fix is a coordinated linear-working-space + output-encode change (see the
+                    // #263 discussion), NOT a per-view format flip. r.srgb is decoded now as groundwork.
                     tvci.image = v.timg[i]; tvci.viewType = VK_IMAGE_VIEW_TYPE_2D; tvci.format = VK_FORMAT_R8G8B8A8_UNORM;
                     // T# DST_SEL channel remap (#261): map each SQ_SEL to a VkComponentSwizzle. Identity
                     // (the default, and the narrow/font path) yields IDENTITY == a no-op. PROSPER_NO_SWIZZLE

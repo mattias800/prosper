@@ -234,6 +234,9 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             r.tile_mode     = d.tile_mode;          // so the renderer can auto-detile a GPU-tiled surface
             r.swizzle[0] = d.dst_sel[0]; r.swizzle[1] = d.dst_sel[1];
             r.swizzle[2] = d.dst_sel[2]; r.swizzle[3] = d.dst_sel[3];   // T# DST_SEL channel remap (#261)
+            r.srgb          = fi.srgb;              // gamma-encoded surface: sample with sRGB->linear (#263)
+            if (fi.srgb && getenv("PROSPER_GFXLOG"))
+                fprintf(stderr, "[t#] SRGB texture fmt=%u %ux%u (binding %u)\n", d.format, d.width, d.height, r.binding);
             // Backing byte size: block-compressed surfaces store one bytes_per_block unit per 4x4 block
             // (ceil dims); uncompressed store bytes_per_block per texel (fmt=56 -> *4).
             r.size          = is_bcn ? (((d.width + 3) / 4) * ((d.height + 3) / 4) * fi.bytes_per_block)
