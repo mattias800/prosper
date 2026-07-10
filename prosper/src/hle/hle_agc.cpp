@@ -89,6 +89,12 @@ struct AgcDcb {
 inline uint32_t* begin_packet(uint64_t buf, uint32_t n, uint32_t op, uint32_t r, uint32_t** out) {
     auto* dcb = (AgcDcb*)(uintptr_t)buf;
     if (!dcb) { *out = nullptr; return nullptr; }
+    // A type-3 PM4 packet's length is a 14-bit field encoded as (n-2), so a valid packet is 2..0x4001
+    // dwords. An out-of-range n wraps the length field and emits a header claiming a tiny packet for a
+    // physically huge one — mis-framing (truncating) the rest of the submit fold. This is the shared
+    // choke point for every builder, so guarding it here covers WriteData, CbNop and the SetShReg range
+    // at once (#450, the overflow sibling of #401's num==1 underflow). Reject rather than corrupt.
+    if (n < 2u || n > 0x4001u) { *out = nullptr; return nullptr; }
     uint32_t* cmd = dcb->allocate_dw(n);
     if (cmd) cmd[0] = PM4(n, op, r);
     *out = cmd;
@@ -479,8 +485,12 @@ HLE(agc_dcb_write_data) {  // sceAgcDcbWriteData(buf, dst, cache_policy, address
     // destination stale beyond dword 60 with no diagnostic. An accepted-but-large num cannot
     // overrun the ring: begin_packet -> allocate_dw() checks 5+num against available_dw() (with
     // the grow callback) and returns null on failure, which takes the `return 0` path below.
-    if (num > 0x3FFF) {
-        fprintf(stderr, "[agc] WriteData REJECTED num_dwords=%u (>PM4 max 0x3FFF — mis-decoded arg?)\n", num);
+    // The emitted packet is 5 + num dwords, and a type-3 PM4 packet is at most 0x4001 dwords (14-bit
+    // length field). Bound `num` against the PACKET limit, not the raw data count: num > 0x3FFC would
+    // make 5+num overflow the length field and mis-frame the submit (#450). begin_packet re-checks the
+    // same 0x4001 ceiling defensively, but reject early here with a clear diagnostic.
+    if (num > 0x3FFCu) {
+        fprintf(stderr, "[agc] WriteData REJECTED num_dwords=%u (5+num > PM4 max 0x4001 — mis-decoded arg?)\n", num);
         return 0;
     }
     if (getenv("PROSPER_GFXLOG")) fprintf(stderr, "[agc] WriteData dst=0x%llx addr=0x%llx num=%u src=%p\n",
