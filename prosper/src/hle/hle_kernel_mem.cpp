@@ -388,6 +388,13 @@ HLE(k_map_flexible) {
     return 0;
 }
 
+// sceKernelAvailableFlexibleMemorySize(size_t* sizeOut): report the available flexible-memory budget.
+// Was MISSING -> the return-0 stub left *sizeOut uninitialized, so the guest read garbage as its budget
+// (Unity/allocator sizing) -> either a wild over-commit or a refusal to allocate. We don't pool-account
+// flexible memory, so report the configured 512 MiB pool (shadPS4 parity); a later map that exceeds host
+// memory still fails cleanly with ENOMEM.
+HLE(k_avail_flexible) { if (!a0) return 0x80020016ull; *(uint64_t*)(uintptr_t)a0 = 512ull * 1024 * 1024; return 0; }
+
 // sceKernelAllocateDirectMemory(off_t start, off_t end, size_t len, size_t align, int memType, off_t* physOut)
 HLE(k_alloc_dmem) {   // (searchStart, searchEnd, len, alignment, memoryType, physAddrOut)
     uint64_t align = a3 ? a3 : 0x4000;
@@ -1028,6 +1035,7 @@ void register_kernel_mem_hle() {
     R("sceKernelReserveVirtualRange", k_reserve_vrange);
     R("sceKernelMapNamedFlexibleMemory", k_map_flexible);
     R("sceKernelMapFlexibleMemory", k_map_flexible);
+    R("sceKernelAvailableFlexibleMemorySize", k_avail_flexible);   // was MISSING -> uninitialized budget
     R("sceKernelAllocateDirectMemory", k_alloc_dmem);
     R("sceKernelAllocateMainDirectMemory", k_alloc_main_dmem);  // 4-arg signature (physOut at arg3)
     R("sceKernelMapDirectMemory", k_map_dmem);
