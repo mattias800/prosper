@@ -1566,6 +1566,21 @@ int main() {
     }
     CHECK(gotT7.size()==N && badT7==0, "T7: s_ashr_i32 sign-extends the shift");
 
+    // Kernel T7b (#455): v_bfe_u32 with offset+count > 32 must not emit UB. v_bfe_u32 v1, v0, 20, 16 has
+    // off=20, count=16 -> off+count = 36 > 32 (SPIR-V OpBitFieldUExtract is UNDEFINED there). RDNA2 reads
+    // bits past the MSB as 0, i.e. effective count = min(16, 32-20) = 12, so v1 = (v0 >> 20) & 0xFFF =
+    // v0 >> 20 (only 12 bits exist above bit 20). The clamp makes this well-defined.
+    const uint32_t codeT7b[] = { 0xd5480001u, 0x02412900u, 0xBF810000u };
+    std::vector<uint32_t> spvT7b = recompile_valu(codeT7b, sizeof(codeT7b)/4, 1, 1);
+    CHECK(!spvT7b.empty(), "recompiled T7b (v_bfe_u32 off+count>32) -> SPIR-V");
+    std::vector<float> gotT7b = prosper::test::run_compute(spvT7b, inX, N, N);
+    uint32_t badT7b = 0;
+    for (uint32_t i = 0; i < N && gotT7b.size() == N; i++) {
+        uint32_t gb; std::memcpy(&gb, &gotT7b[i], 4);
+        if (gb != (bits_of(inX[i]) >> 20)) badT7b++;
+    }
+    CHECK(gotT7b.size()==N && badT7b==0, "T7b: v_bfe_u32(v0,20,16) clamps count to 12 -> (v0>>20), not UB");
+
     // Kernel T8: s_mov_b64 as plain DATA-pair copy (not a wave mask): s2=9; s[0:1]=s[2:3];
     // out bits = bits(a0) + 9. Previously rejected (src not a recognizable mask).
     const uint32_t codeT8[] = { 0xbe820389u, 0xbe800402u, 0x4a020000u, 0xBF810000u };
