@@ -60,6 +60,15 @@ int main() {
               "IMG_FMT 173 -> BC3, 16 B per 4x4 block");
         CHECK(gen5_image_format(182, &fi) && fi.format == DataFormat::Bc7 && fi.srgb,
               "IMG_FMT 182 -> BC7 SRGB");
+        // #290: BC4/BC5 UNORM vs SNORM split — SNORM carries the snorm flag (upload keeps skipping it).
+        CHECK(gen5_image_format(175, &fi) && fi.format == DataFormat::Bc4 && fi.bytes_per_block == 8 &&
+              !fi.snorm, "IMG_FMT 175 -> BC4 UNORM (decodable)");
+        CHECK(gen5_image_format(176, &fi) && fi.format == DataFormat::Bc4 && fi.snorm,
+              "IMG_FMT 176 -> BC4 SNORM (flagged snorm, skip-only)");
+        CHECK(gen5_image_format(177, &fi) && fi.format == DataFormat::Bc5 && fi.bytes_per_block == 16 &&
+              !fi.snorm, "IMG_FMT 177 -> BC5 UNORM (decodable)");
+        CHECK(gen5_image_format(178, &fi) && fi.format == DataFormat::Bc5 && fi.snorm,
+              "IMG_FMT 178 -> BC5 SNORM (flagged snorm, skip-only)");
         CHECK(!gen5_image_format(0, &fi) && fi.format == DataFormat::Unknown, "IMG_FMT 0 (INVALID) unmapped");
         CHECK(!gen5_image_format(9, &fi), "IMG_FMT 9 (16_USCALED) unmapped -> false");
         CHECK(!gen5_image_format(44, &fi), "IMG_FMT 44 (10_10_10_2) unmapped -> false");
