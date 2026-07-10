@@ -137,6 +137,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_savedata_ime PRIVATE prosper_core)
   add_test(NAME savedata_ime COMMAND test_savedata_ime)
 
+  # libSceIme keyboard API (#186): reports a consistent "no keyboard connected" state (empty resource
+  # array + disconnected info, bounds-checked) so the per-frame input poll never reads garbage.
+  add_executable(test_ime_keyboard tests/test_ime_keyboard.cpp)
+  target_link_libraries(test_ime_keyboard PRIVATE prosper_core)
+  add_test(NAME ime_keyboard COMMAND test_ime_keyboard)
+
   # pthread scheduling getters fill their out-param (not a shadowing no-op): scePthreadGetprio/
   # Getaffinity must WRITE priority/mask, else the caller reads uninitialized stack (harmful-stub class).
   add_executable(test_pthread_sched_getters tests/test_pthread_sched_getters.cpp)

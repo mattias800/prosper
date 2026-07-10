@@ -136,6 +136,37 @@ HLE(s_open)           { return g_handle++; }                                 // 
 // mouse attached: zero one entry defensively, report 0 events.
 HLE(s_mouse_read)     { if (a1) memset(PW(a1), 0, 0x18); return 0; }
 
+// --- libSceIme keyboard API (#186) ---
+// PPSA02664 polls this every frame in its input loop. We have no physical PS5 keyboard, so we report a
+// consistent "no keyboard connected" state: Open/Update succeed, GetResourceId returns an empty
+// resource array (no keyboards), GetInfo reports a disconnected device — the game then uses controller
+// / on-screen input instead of waiting on a keyboard. Struct layouts + field offsets verified against
+// shadPS4 src/core/libraries/ime/ime_common.h; error codes from ime_error.h. Note sceImeKeyboardOpen
+// returns an Error (0 = SCE_OK), NOT a handle — so success is 0. CONFIDENCE: HIGH on the layouts; MED
+// on the device/status enum "disconnected" == 0.
+//   OrbisImeKeyboardResourceIdArray: user_id@0(s32) resource_id[5]@4(u32)                     size 24
+//   OrbisImeKeyboardInfo: user_id@0 device@4 type@8 repeat_delay@12 repeat_rate@16 status@20 rsv[12]@24  size 36
+HLE(s_ime_kbd_open) { svc_log("sceImeKeyboardOpen", a0,a1,a2,a3,a4,a5); return 0; }  // register handler; no events to deliver
+HLE(s_ime_update)   { svc_log("sceImeUpdate", a0,a1,a2,a3,a4,a5); return 0; }        // pump the queue: no events
+// sceImeKeyboardGetResourceId(userId, OrbisImeKeyboardResourceIdArray* out): report the user's keyboard
+// resource ids — none connected, so an all-zero id array (echoing the queried userId).
+HLE(s_ime_kbd_resid) {
+    svc_log("sceImeKeyboardGetResourceId", a0,a1,a2,a3,a4,a5);
+    if (!a1) return 0x80BC0031ull;   // ORBIS_IME_ERROR_INVALID_ADDRESS
+    uint8_t* p = (uint8_t*)PW(a1);
+    *(int32_t*)(p + 0) = (int32_t)a0;                         // user_id echoes the caller
+    for (int i = 0; i < 5; i++) *(uint32_t*)(p + 4 + i * 4) = 0;   // no keyboards connected
+    return 0;
+}
+// sceImeKeyboardGetInfo(resourceId, OrbisImeKeyboardInfo* info): a disconnected (no-device) info.
+HLE(s_ime_kbd_info) {
+    svc_log("sceImeKeyboardGetInfo", a0,a1,a2,a3,a4,a5);
+    if (!a1) return 0x80BC0031ull;   // ORBIS_IME_ERROR_INVALID_ADDRESS
+    memset(PW(a1), 0, 36);           // device=0 type=0 repeat=0 status=0(disconnected) reserved=0
+    *(int32_t*)PW(a1) = 1;           // user_id = default user (matches sceUserServiceGetInitialUser)
+    return 0;
+}
+
 // --- app content ---
 HLE(s_appcontent_int) { if (a1) *(int32_t*)PW(a1) = 0; return 0; }
 
@@ -863,6 +894,11 @@ void register_service_hle() {
     Hle::register_fn("gyTyVn+bXMw", (HleFn)s_imedlg_term,   "sceImeDialogTerm");
     Hle::register_fn("oBmw4xrmfKs", (HleFn)s_imedlg_abort,  "sceImeDialogAbort");
     R("sceSystemServiceHideSplashScreen", s_ok);
+    // libSceIme keyboard API (#186): no physical keyboard -> consistent "none connected" state. Raw NIDs.
+    Hle::register_fn("eaFXjfJv3xs", (HleFn)s_ime_kbd_open,  "sceImeKeyboardOpen");
+    Hle::register_fn("-4GCfYdNF1s", (HleFn)s_ime_update,    "sceImeUpdate");
+    Hle::register_fn("VkqLPArfFdc", (HleFn)s_ime_kbd_info,  "sceImeKeyboardGetInfo");
+    Hle::register_fn("dKadqZFgKKQ", (HleFn)s_ime_kbd_resid, "sceImeKeyboardGetResourceId");
     // libSceAvPlayer (#324): let a post-credits / intro video complete so the game reaches its scene.
     // Init/InitEx must return a non-NULL handle; IsActive must report finished; the rest succeed as no-ops.
     R("sceAvPlayerInit",           s_avplayer_init);
