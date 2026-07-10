@@ -529,6 +529,13 @@ HLE(f_unlink){ std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::
     unlink
 #endif
     (h.c_str()); }
+// sceKernelRename(from, to): move/rename a file. Was MISSING -> the return-0 stub faked success without
+// moving anything, breaking the near-universal atomic-save idiom (write "save.tmp", then rename it over
+// "save.dat"): the real save file was never produced/updated while the guest believed it saved. BOTH
+// paths go through the mount-path translation (a rename inside /savedata0 must not hit raw guest paths).
+// NID 52NcYU9+lEo, reached via libc.prx. ::rename is standard C (Windows + Linux).
+HLE(f_rename){ std::string from = translate(CS(a0)), to = translate(CS(a1));
+               return (uint64_t)(int64_t)::rename(from.c_str(), to.c_str()); }
 
 // --- APR (Async Page Read) file resolution -----------------------------------------------------
 // sceKernelAprResolveFilepathsToIdsAndFileSizes(const char** paths, int count, uint32_t* outIds,
@@ -1074,6 +1081,7 @@ void register_file_hle() {
     R("mkdir", f_mkdir);          R("sceKernelMkdir", f_mkdir);
     R("rmdir", f_rmdir);          R("sceKernelRmdir", f_rmdir);
     R("unlink", f_unlink);        R("sceKernelUnlink", f_unlink);
+    R("rename", f_rename);        R("sceKernelRename", f_rename);   // real move (was fake-success -> lost atomic saves)
     R("sceKernelGetdents", f_getdents); R("getdents", f_getdents);
     // sceKernelAio* (issue #312): NIDs verified identical in shadPS4's PS4 registration table and
     // the PS5 3.20 libkernel stub dump. Raw-NID registration (names not in our NidDb).
