@@ -231,15 +231,23 @@ int main() {
     // by_sgpr_base for an unrelated SGPR can't spuriously match its out-of-file index.
     {
         uint32_t sg[32]; memset(sg, 0, sizeof sg);
-        uint32_t eudt[8]; make_tsharp(eudt, 0xAB000000ull, 128, 128, /*fmt*/56, /*tile*/0, /*type 2D*/9);
-        uint64_t ep = (uint64_t)(uintptr_t)eudt;
+        // EUD spill: an 8-dword T# at eoff 0 + a paired 4-dword S# at eoff 8 (12 dwords total).
+        uint32_t eud[12]; memset(eud, 0, sizeof eud);
+        make_tsharp(&eud[0], 0xAB000000ull, 128, 128, /*fmt*/56, /*tile*/0, /*type 2D*/9);
+        // #451: the paired S# also spills to the EUD. Program POINT filter + addr (wrap,mirror,clamp) so
+        // it is distinguishable from the struct defaults (LINEAR + clamp). SQ_IMG_SAMP WORD0: CLAMP_X[2:0],
+        // CLAMP_Y[5:3], CLAMP_Z[8:6]; WORD2 filter bits are 0 -> point.
+        eud[8] = (0u << 0) | (1u << 3) | (2u << 6);   // addr_uvw = {0 wrap, 1 mirror, 2 clamp}
+        uint64_t ep = (uint64_t)(uintptr_t)eud;
         uint16_t dro5[16]; for (auto& x : dro5) x = 0xffff;
         dro5[5] = 24; sg[24] = (uint32_t)ep; sg[25] = (uint32_t)(ep >> 32);   // EUD base pointer
-        AgcShaderSharp et_sharp[1]; et_sharp[0].bits = (uint16_t)(32 & 0x7fff);   // offset_dw 32 -> EUD eoff 0
+        AgcShaderSharp et_sharp[1]; et_sharp[0].bits = (uint16_t)(32 & 0x7fff);   // T# offset_dw 32 -> eoff 0
+        AgcShaderSharp es_sharp[1]; es_sharp[0].bits = (uint16_t)(40 & 0x7fff);   // S# offset_dw 40 -> eoff 8
         AgcShaderUserData etud; memset(&etud, 0, sizeof etud);
         etud.direct_resource_offset = dro5; etud.direct_resource_count = 16;
-        etud.eud_size_dw = 8;
+        etud.eud_size_dw = 12;
         etud.sharp_resource_offset[0] = et_sharp; etud.sharp_resource_count[0] = 1;
+        etud.sharp_resource_offset[2] = es_sharp; etud.sharp_resource_count[2] = 1;   // paired sampler
         AgcShaderHeader etsh; memset(&etsh, 0, sizeof etsh);
         etsh.file_header = 0x34333231u; etsh.version = 0x18; etsh.type = 1; etsh.user_data = &etud;
         ShaderResourceTable et = build_shader_resources(etsh, sg, 32);
@@ -248,6 +256,11 @@ int main() {
         CHECK(etr && etr->cls == ResourceClass::Texture && etr->gpu_addr == 0xAB000000ull,
               "#382: EUD texture decoded from the spill buffer, resolvable by srt_offset");
         CHECK(etr && etr->sgpr_base == 0xFFFFFFFFu, "#382: EUD texture leaves sgpr_base invalid (INDIRECT provenance)");
+        // #451: the EUD-resident paired S# is decoded (not left at the LINEAR/clamp defaults).
+        CHECK(etr && etr->mag_filter == 0u && etr->min_filter == 0u,
+              "#451: EUD-resident sampler decoded -> POINT filter (not the default LINEAR)");
+        CHECK(etr && etr->addr_uvw[0] == 0u && etr->addr_uvw[1] == 1u && etr->addr_uvw[2] == 2u,
+              "#451: EUD-resident sampler addr modes decoded from the spill (not default clamp)");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }

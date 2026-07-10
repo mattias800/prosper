@@ -362,8 +362,15 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             if (const AgcShaderSharp* samps = ud->sharp_resource_offset[2]) {
                 if (slot < ud->sharp_resource_count[2] && !samps[slot].empty()) {
                     uint32_t soff = samps[slot].offset_dw();
-                    if ((uint64_t)soff + 4 <= num_user_sgprs) {
-                        const uint32_t* sm = &user_sgprs[soff];
+                    // The paired S# may live in the user-SGPR block OR spill to the EUD alongside its T#
+                    // (#451) — fetch it via the same bounds-checked load_sharp used for the T# above,
+                    // instead of indexing user_sgprs directly (which dropped EUD-resident samplers, so the
+                    // texture silently reverted to the default LINEAR/clamp sampler for exactly the
+                    // EUD-resident textures #257 added — a point/wrap sampler read as bilinear/clamped).
+                    // load_sharp copies verbatim from the SGPR block for the in-block case, byte-identical.
+                    uint32_t sm_buf[4];
+                    if (load_sharp(soff, 4, sm_buf) != 0xFFFFFFFFu) {
+                        const uint32_t* sm = sm_buf;
                         r.mag_filter  = ((sm[2] >> 20) & 0x3u) ? 1u : 0u;
                         r.min_filter  = ((sm[2] >> 22) & 0x3u) ? 1u : 0u;
                         r.mip_filter  = ((sm[2] >> 26) & 0x3u) ? 1u : 0u;
