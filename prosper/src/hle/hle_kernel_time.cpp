@@ -241,6 +241,14 @@ HLE(k_usleep)   { uint64_t us = a0; struct timespec ts{ (time_t)(us / 1000000), 
 HLE(k_sleep_s)  { struct timespec ts{ (time_t)a0, 0 }; nanosleep(&ts, nullptr); return 0; }
 HLE(k_nanosleep){ if (a0) nanosleep((const struct timespec*)P(a0), a1 ? (struct timespec*)P(a1) : nullptr); return 0; }
 
+// sceKernelGettimezone(struct timezone* tz) = { int tz_minuteswest; int tz_dsttime }. Was MISSING -> the
+// generic stub left the out-struct uninitialized (the #82/#190 uninit-out class). We present a UTC clock
+// (the RTC path uses timegm), so report {0, 0} deterministically.
+HLE(k_gettimezone) { if (a0) { int* tz = (int*)P(a0); tz[0] = 0; tz[1] = 0; } return 0; }
+// sceKernelClockGetres(clockid, struct timespec* res): our time source is nanosecond-resolution. Was
+// MISSING -> left *res uninitialized. Report 1 ns for every clock.
+HLE(k_clock_getres) { if (a1) { int64_t* r = (int64_t*)P(a1); r[0] = 0; r[1] = 1; } return 0; }
+
 // --- assorted libkernel stubs ---
 HLE(k_ok)              { return 0; }                       // generic success no-op
 // sceKernelLoadStartModule(path, ...): the PRX are pre-linked into our address space, so "loading"
@@ -999,7 +1007,10 @@ void register_kernel_time_hle() {
     R("sceKernelClockGettime", k_clock_gettime);
     R("sceKernelUsleep", k_usleep);   R("usleep", k_usleep);
     R("sceKernelSleep", k_sleep_s);   R("sleep", k_sleep_s);
-    R("sceKernelNanosleep", k_nanosleep);  R("nanosleep", k_nanosleep);
+    R("sceKernelNanosleep", k_nanosleep);  R("nanosleep", k_nanosleep);  R("_nanosleep", k_nanosleep);
+    R("sceKernelGettimezone", k_gettimezone);   // was MISSING -> uninitialized tz out-struct
+    R("sceKernelClockGetres", k_clock_getres);  R("clock_getres", k_clock_getres);
+    R("clock_settime", k_ok);   R("sceKernelClockSettime", k_ok);   // guest clock is read-only here
     R("clock_gettime", k_clock_gettime);
     R("sceKernelGettimeofday", k_gettimeofday);
     R("gettimeofday", k_gettimeofday);
