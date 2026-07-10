@@ -57,6 +57,35 @@ int main() {
     CHECK(rmax - rmin > 40, "the interpolated attribute forms a red GRADIENT across the viewport");
     CHECK(max_gb < 0x20, "green/blue stay ~0 (output is the interpolated attribute, not garbage)");
 
+    // DPP quad_perm as screen-space derivatives (#273 — DOLL's manual ddx/ddy idiom). The attribute
+    // attr0.x ramps linearly across the fullscreen triangle: PARAM0.x = vid with vertices
+    // (-1,-1),(3,-1),(-1,3), so u(x_ndc,y_ndc) = (x_ndc+1)/4 + 2*(y_ndc+1)/4 and per-pixel
+    // du/dx = 2/(4W) = 1/128 (W=64), du/dy = 4/(4H) = 1/64. The PS computes the exact live idiom
+    //   ddx: v4 = u@qp[0,0,2,2]; v4 = u@qp[1,1,3,3] - v4;  out = 128*ddx -> red == 255
+    //   ddy: v3 = u@qp[0,1,0,1]; v3 = u@qp[2,3,2,3] - v3;  out =  64*ddy -> red == 255
+    // (words llvm-mc-round-tripped; a broken lowering leaves red 0 or garbage).
+    auto dpp_ps_run = [&](std::initializer_list<uint32_t> body, const char* what) {
+        std::vector<uint32_t> ps2 = { 0xc8000000u, 0xc8010001u };
+        ps2.insert(ps2.end(), body);
+        const uint32_t tail[] = { 0x7e040280u, 0x7e0602f2u, 0xf800080fu, 0x03020200u, 0xbf810000u };
+        ps2.insert(ps2.end(), tail, tail + 5);
+        std::vector<uint32_t> f2 = recompile_fragment(ps2.data(), ps2.size());
+        if (f2.empty()) { printf("  [FAIL] %s: recompile rejected\n", what); fails++; return; }
+        std::vector<uint8_t> p2 = prosper::test::render_triangle_rgba(vert, f2, W, H);
+        if (p2.size() != (size_t)W * H * 4) { printf("  [FAIL] %s: render failed\n", what); fails++; return; }
+        const uint8_t* c = &p2[((size_t)(H/2) * W + W/2) * 4];
+        printf("  %s center=(%u,%u,%u)\n", what, c[0], c[1], c[2]);
+        CHECK(c[0] > 0xE0 && c[1] < 0x20 && c[2] < 0x20, what);
+    };
+    dpp_ps_run({ 0x7e0802fau, 0xff08a000u,   // v4 = u @ qp[0,0,2,2]
+                 0x080808fau, 0xff08f500u,   // v4 = u @ qp[1,1,3,3] - v4  (= ddx)
+                 0x100008ffu, 0x43000000u }, // v0 = 128 * ddx
+               "DPP ddx idiom reconstructs du/dx (red saturated)");
+    dpp_ps_run({ 0x7e0602fau, 0xff084400u,   // v3 = u @ qp[0,1,0,1]
+                 0x080606fau, 0xff08ee00u,   // v3 = u @ qp[2,3,2,3] - v3  (= ddy)
+                 0x100006ffu, 0x42800000u }, // v0 = 64 * ddy
+               "DPP ddy idiom reconstructs du/dy (red saturated)");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

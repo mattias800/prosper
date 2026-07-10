@@ -1725,6 +1725,84 @@ int main() {
     printf("  T19(waterfall) mismatches=%u (out[5]=%g expect=%g)\n", badT19, gotT19.size()==8?gotT19[5]:-1, expT19[5]);
     CHECK(gotT19.size()==8 && badT19==0, "T19: waterfall loop linearizes to a per-invocation once-through");
 
+    // Kernel T20: s_bitcmp1_b32 + s_cselect (#273 — DOLL's feature-flag test chain). u=(uint)a0;
+    // readfirstlane s4; s_bitcmp1_b32 s4, 1 (SCC = bit1); s_cselect_b32 s5, 100, 200; out=(float)s5.
+    // llvm-mc gfx1010: 0xbf0d8104 = s_bitcmp1_b32 s4, 1; 0x850580e4/0x8505e4... assembled below.
+    const uint32_t codeT20[] = {
+        0x7e020f00u,               // v_cvt_u32_f32 v1, v0
+        0x7e080501u,               // v_readfirstlane_b32 s4, v1
+        0xbf0d8104u,               // s_bitcmp1_b32 s4, 1
+        0x850580ffu, 0x00000064u,  // s_cselect_b32 s5, 0x64(100), 0        (scc ? 100 : 0)
+        0x7e000c05u,               // v_cvt_f32_u32 v0, s5
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvT20 = recompile_valu(codeT20, sizeof(codeT20)/4, 1, 0);
+    CHECK(!spvT20.empty(), "recompiled T20 (s_bitcmp1_b32 + s_cselect) -> SPIR-V");
+    std::vector<float> inT20(8), expT20(8);
+    for (uint32_t i = 0; i < 8; i++) { inT20[i] = (float)i; expT20[i] = (i & 2u) ? 100.0f : 0.0f; }
+    std::vector<float> gotT20 = prosper::test::run_compute(spvT20, inT20, 8, 8);
+    uint32_t badT20 = 0; for (uint32_t i=0;i<8&&gotT20.size()==8;i++) if (gotT20[i]!=expT20[i]) badT20++;
+    printf("  T20(bitcmp1) mismatches=%u (out[2]=%g expect=100)\n", badT20, gotT20.size()==8?gotT20[2]:-1);
+    CHECK(gotT20.size()==8 && badT20==0, "T20: s_bitcmp1_b32 sets SCC from the selected bit");
+
+    // Kernel T21: v_fma_mixlo_f16 / mixhi (#273 — DOLL's box-blur f16 packing). v1=(a0*2+3) via
+    // fma_mix_f32; then mixlo packs (a0+1) into v2's low half and mixhi packs (a0+2) into its high
+    // half; out = f16lo(v2) + f16hi(v2) = (a0+1)+(a0+2) recovered via unpack (v_cvt_f32_f16-free:
+    // just re-add via another fma_mix on unpacked halves is overkill — compare packed halves on CPU).
+    // Simpler: out = (float)(uint)v2, compared against the CPU-packed expected bits.
+    const uint32_t codeT21[] = {
+        0x7e020280u,               // v_mov_b32 v1, 0
+        0x7e040280u,               // v_mov_b32 v2, 0
+        0xcc210002u, 0x040600f2u,  // v_fma_mixlo_f16 v2, 1.0, v0, v1   (= a0 into lo half)
+        0xcc220002u, 0x040600f2u,  // v_fma_mixhi_f16 v2, 1.0, v0, v1   (= a0 into hi half)
+        0x7e000d02u,               // v_cvt_f32_u32 v0, v2  (raw packed bits -> float for compare)
+        0xbf810000u,
+    };
+    // (words llvm-mc-round-tripped: 0xcc210002/0xcc220002 + 0x040600f2 = mixlo/mixhi v2, 1.0, v0, v1)
+    std::vector<uint32_t> spvT21 = recompile_valu(codeT21, sizeof(codeT21)/4, 1, 0);
+    CHECK(!spvT21.empty(), "recompiled T21 (v_fma_mixlo/mixhi_f16) -> SPIR-V");
+    auto f2h = [](float f) -> uint32_t {   // float -> IEEE binary16 bits (round-to-nearest-even)
+        union { float f; uint32_t u; } c{f};
+        uint32_t s = (c.u >> 16) & 0x8000u; int32_t e = (int32_t)((c.u >> 23) & 0xFF) - 127 + 15;
+        uint32_t m = c.u & 0x7FFFFFu;
+        if (e <= 0) return s;                          // (test values stay normal; flush tiny to 0)
+        if (e >= 31) return s | 0x7C00u;
+        uint32_t h = s | ((uint32_t)e << 10) | (m >> 13);
+        if ((m & 0x1FFFu) > 0x1000u || (((m & 0x1FFFu) == 0x1000u) && (h & 1u))) h++;
+        return h;
+    };
+    std::vector<float> inT21(8), expT21(8);
+    for (uint32_t i = 0; i < 8; i++) { float a = (float)i * 0.25f; inT21[i] = a;
+        uint32_t packed = f2h(a) | (f2h(a) << 16); expT21[i] = (float)packed; }
+    std::vector<float> gotT21 = prosper::test::run_compute(spvT21, inT21, 8, 8);
+    uint32_t badT21 = 0; for (uint32_t i=0;i<8&&gotT21.size()==8;i++) if (gotT21[i]!=expT21[i]) badT21++;
+    printf("  T21(fma_mix pack) mismatches=%u (out[4]=%.0f expect=%.0f)\n", badT21,
+           gotT21.size()==8?gotT21[4]:-1, expT21[4]);
+    CHECK(gotT21.size()==8 && badT21==0, "T21: mixlo/mixhi pack f16 halves preserving the other half");
+
+    // Kernel T22: the DOLL box-blur f16 TAIL verbatim (#273): v0.lo = f16(a0) (fma_mixlo);
+    // v_mul_f16_sdwa v0, vcc_lo(=2.0h), v0 dst_sel:WORD_1 preserve (hi = 2*f16(a0), lo kept);
+    // v_mov_b32_sdwa v0, v0 dst_sel:WORD_0 preserve src0_sel:WORD_1 (lo = hi). out = packed bits.
+    const uint32_t codeT22[] = {
+        0x7e020280u,               // v_mov_b32 v1, 0
+        0xcc210000u, 0x040600f2u,  // v_fma_mixlo_f16 v0, 1.0, v0, v1
+        0xb06a4000u,               // s_movk_i32 vcc_lo, 0x4000 (f16 2.0)
+        0x6a0000f9u, 0x0686156au,  // v_mul_f16_sdwa v0, vcc_lo, v0 dst:WORD_1 preserve (live blur words)
+        0x7e0002f9u, 0x00051400u,  // v_mov_b32_sdwa v0, v0 dst:WORD_0 preserve src:WORD_1 (live)
+        0x7e000d00u,               // v_cvt_f32_u32 v0, v0
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spvT22 = recompile_valu(codeT22, sizeof(codeT22)/4, 1, 0);
+    CHECK(!spvT22.empty(), "recompiled T22 (f16 SDWA WORD-select mul/mov tail) -> SPIR-V");
+    std::vector<float> inT22(8), expT22(8);
+    for (uint32_t i = 0; i < 8; i++) { float a = (float)i * 0.25f; inT22[i] = a;
+        uint32_t h2 = f2h(2.0f * a); expT22[i] = (float)(h2 | (h2 << 16)); }
+    std::vector<float> gotT22 = prosper::test::run_compute(spvT22, inT22, 8, 8);
+    uint32_t badT22 = 0; for (uint32_t i=0;i<8&&gotT22.size()==8;i++) if (gotT22[i]!=expT22[i]) badT22++;
+    printf("  T22(f16 sdwa words) mismatches=%u (out[3]=%.0f expect=%.0f)\n", badT22,
+           gotT22.size()==8?gotT22[3]:-1, expT22[3]);
+    CHECK(gotT22.size()==8 && badT22==0, "T22: WORD-dst f16 mul + WORD-to-WORD mov preserve halves exactly");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

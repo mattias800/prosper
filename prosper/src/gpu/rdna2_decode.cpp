@@ -61,7 +61,22 @@ void decode_operands(Rdna2Inst& i) {
                 i.clamp = ((sd >> 13) & 1u) != 0; i.omod = (uint8_t)((sd >> 14) & 3u);
                 if (((sd >> 8) & 7u) == 6u && ((sd >> 16) & 7u) == 6u &&
                     !((sd >> 19) & 0x9u)) i.has_modifier = false;
-            } else { i.src[0] = decode_src_field(w & 0x1FFu); i.n_src = 1; }
+                // WORD-select v_mov_b32_sdwa (#273 — the f16 half-move idiom): dst WORD_0/1 with
+                // UNUSED_PRESERVE, src0 WORD_0/WORD_1/DWORD, no sext/neg/abs/clamp/omod. The
+                // recompiler inserts/extracts the 16-bit halves explicitly. (llvm-mc gfx1010:
+                // 0x7e0002f9 0x00051400 -> v_mov_b32_sdwa v0, v0 dst_sel:WORD_0
+                // dst_unused:UNUSED_PRESERVE src0_sel:WORD_1 — DOLL's box-blur tail.)
+                else if (((w >> 9) & 0xFFu) == 0x01u) {
+                    uint32_t dsel = (sd >> 8) & 7u, dun = (sd >> 11) & 3u, s0sel = (sd >> 16) & 7u;
+                    if ((dsel == 4u || dsel == 5u) && dun == 2u && (s0sel >= 4u && s0sel <= 6u) &&
+                        !((sd >> 19) & 0x9u) && !i.clamp && !i.omod && !i.src_neg[0] && !i.src_abs[0]) {
+                        i.sdwa_dst_sel = (uint8_t)dsel; i.sdwa_dst_unused = (uint8_t)dun;
+                        i.sdwa_src0_sel = (uint8_t)s0sel;
+                        i.has_modifier = false;
+                    }
+                }
+            } else if (i.has_dpp) { i.src[0] = vgpr(i.words[1]); i.n_src = 1; }   // DPP16: real SRC0 in dw1[7:0]
+            else { i.src[0] = decode_src_field(w & 0x1FFu); i.n_src = 1; }
             break;
         case Rdna2Format::VOP2:
             i.opcode = (w >> 25) & 0x3Fu; i.dst = vgpr(w >> 17);
@@ -83,6 +98,24 @@ void decode_operands(Rdna2Inst& i) {
                 if (((sd >> 8) & 7u) == 6u && ((sd >> 16) & 7u) == 6u && ((sd >> 24) & 7u) == 6u &&
                     !((sd >> 19) & 0x9u) && !((sd >> 27) & 0x9u))
                     i.has_modifier = false;
+                // WORD-dst v_mul_f16_sdwa (#273 — the f16 half-packing idiom): dst WORD_0/1 with
+                // UNUSED_PRESERVE, src sels WORD/DWORD, no sext/neg/abs/clamp/omod. (llvm-mc gfx1010:
+                // 0x6a0000f9 0x0686156a -> v_mul_f16_sdwa v0, vcc_lo, v0 dst_sel:WORD_1
+                // dst_unused:UNUSED_PRESERVE — DOLL's box-blur tail.)
+                else if (((w >> 25) & 0x3Fu) == 0x35u) {
+                    uint32_t dsel = (sd >> 8) & 7u, dun = (sd >> 11) & 3u;
+                    uint32_t s0sel = (sd >> 16) & 7u, s1sel = (sd >> 24) & 7u;
+                    if ((dsel == 4u || dsel == 5u) && dun == 2u &&
+                        (s0sel >= 4u && s0sel <= 6u) && (s1sel >= 4u && s1sel <= 6u) &&
+                        !((sd >> 19) & 0x9u) && !((sd >> 27) & 0x9u) && !i.clamp && !i.omod &&
+                        !i.src_neg[0] && !i.src_abs[0] && !i.src_neg[1] && !i.src_abs[1]) {
+                        i.sdwa_dst_sel = (uint8_t)dsel; i.sdwa_dst_unused = (uint8_t)dun;
+                        i.sdwa_src0_sel = (uint8_t)s0sel; i.sdwa_src1_sel = (uint8_t)s1sel;
+                        i.has_modifier = false;
+                    }
+                }
+            } else if (i.has_dpp) {   // DPP16: real SRC0 in dw1[7:0]; SRC1 stays the dword0 VGPR field
+                i.src[0] = vgpr(i.words[1]); i.src[1] = vgpr(w >> 9); i.n_src = 2;
             } else { i.src[0] = decode_src_field(w & 0x1FFu); i.src[1] = vgpr(w >> 9); i.n_src = 2; }
             break;
         case Rdna2Format::VOPC:
@@ -125,6 +158,19 @@ void decode_operands(Rdna2Inst& i) {
                 i.src_abs[0] = i.src_abs[1] = i.src_abs[2] = false;
                 i.clamp = false;
             }
+            break;
+        }
+        case Rdna2Format::VOP3P: {
+            // dword0: VDST[7:0], NEG_HI[10:8], OPSEL[13:11], OPSEL_HI2[14], CLAMP[15], OP[22:16].
+            // dword1: SRC0[8:0], SRC1[17:9], SRC2[26:18], OPSEL_HI[28:27], NEG[31:29]. Any modifier
+            // bit set (neg/neg_hi/opsel/clamp) keeps has_modifier so the recompiler rejects rather
+            // than miscomputes; the trivial form reads all three sources as full f32 (fma_mix).
+            const uint32_t d1 = i.words[1];
+            i.opcode = (w >> 16) & 0x7Fu; i.dst = vgpr(w);
+            i.src[0] = decode_src_field(d1 & 0x1FFu);
+            i.src[1] = decode_src_field((d1 >> 9) & 0x1FFu);
+            i.src[2] = decode_src_field((d1 >> 18) & 0x1FFu); i.n_src = 3;
+            if (((w >> 8) & 0xFFu) != 0u || ((d1 >> 27) & 0x1Fu) != 0u) i.has_modifier = true;
             break;
         }
         case Rdna2Format::SOP1:
@@ -254,6 +300,22 @@ Rdna2Inst rdna2_decode_one(const uint32_t* code, size_t max_dwords) {
             i.fmt = vf; i.has_modifier = true;
             i.len_dwords = (max_dwords >= 2) ? 2 : 1;
             if (max_dwords >= 2) i.words[1] = code[1];
+            // DPP16 (src0 == 0xFA) QUAD_PERM subset (#273): dword1 = SRC0[7:0], DPP_CTRL[16:8]
+            // (< 0x100 = quad_perm), FI[18], BC[19], src neg/abs [23:20], bank_mask[27:24],
+            // row_mask[31:28]. A full-quad permute (masks 0xf, no neg/abs/FI) is handleable — the
+            // recompiler reconstructs the lane value from screen-space derivatives. Anything else
+            // (row shifts/broadcasts, partial masks, modifiers) keeps has_modifier -> rejected.
+            // (Field layout verified against llvm-mc gfx1010 round-trips of DOLL's live words,
+            // e.g. 0x7e0802fa 0xff08a002 -> v_mov_b32_dpp v4, v2 quad_perm:[0,0,2,2]
+            // row_mask:0xf bank_mask:0xf bound_ctrl:1.)
+            if (src0 == 0xFAu && max_dwords >= 2 && vf != Rdna2Format::VOPC) {
+                const uint32_t d1 = code[1];
+                const uint32_t ctrl = (d1 >> 8) & 0x1FFu;
+                if (ctrl < 0x100u && ((d1 >> 28) & 0xFu) == 0xFu && ((d1 >> 24) & 0xFu) == 0xFu &&
+                    ((d1 >> 20) & 0xFu) == 0u && ((d1 >> 18) & 1u) == 0u) {
+                    i.has_modifier = false; i.has_dpp = true; i.dpp_ctrl = (uint16_t)ctrl;
+                }
+            }
         } else {
             // The four K-carrying VOP2 mul-adds embed a mandatory 32-bit literal K: v_madmk_f32 (0x20),
             // v_madak_f32 (0x21), v_fmamk_f32 (0x2C), v_fmaak_f32 (0x2D). Miss it and K mis-decodes as a
@@ -274,6 +336,22 @@ Rdna2Inst rdna2_decode_one(const uint32_t* code, size_t max_dwords) {
     } else {
         switch (w >> 26u) {
             case 0x32: i.fmt = Rdna2Format::VINTRP; i.len_dwords = 1; break;
+            case 0x33: {   // VOP3P (0xCC prefix): packed / mixed-precision 3-source VALU (v_fma_mix*).
+                // 2 dwords + a trailing literal when any 9-bit src field is 0xFF — the same literal
+                // rule as VOP3 (a mis-sized VOP3P desynced the whole stream walk into phantom
+                // branches, #273). Round-trip llvm-mc gfx1010: v_fma_mixlo_f16 v0,1.0,v0,v5 =
+                // 0xcc210000 0x041600f2.
+                i.fmt = Rdna2Format::VOP3P;
+                if (max_dwords >= 2) {
+                    i.words[1] = code[1];
+                    const uint32_t d1 = code[1];
+                    const bool lit = (d1 & 0x1FFu) == 0xFFu || ((d1 >> 9) & 0x1FFu) == 0xFFu ||
+                                     ((d1 >> 18) & 0x1FFu) == 0xFFu;
+                    if (lit && max_dwords >= 3) { i.has_literal = true; i.literal = code[2]; i.len_dwords = 3; }
+                    else i.len_dwords = 2;
+                } else i.len_dwords = 1;
+                break;
+            }
             case 0x34: case 0x35: {   // VOP3 (0x34 old-gen, 0x35 RDNA2)
                 // 2 dwords, plus a trailing 32-bit literal when any of the three 9-bit src operand
                 // fields in dword1 ([8:0], [17:9], [26:18]) is 0xFF (the literal marker) — e.g.

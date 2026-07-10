@@ -23,6 +23,7 @@ enum class Rdna2Format : uint8_t {
     VINTRP,                            // interpolation
     DS, MUBUF, MTBUF, MIMG, FLAT,      // LDS / buffer / image / flat memory
     EXP,                               // export (render target / position)
+    VOP3P,                             // packed/mixed-precision 3-operand VALU (v_fma_mix*, v_pk_*)
     Unknown,
 };
 
@@ -54,6 +55,16 @@ struct Rdna2Inst {
     bool        has_modifier = false;  // VOP SDWA/DPP form (2nd dword is a control word, not a literal);
                                        // decoded for correct length, but the recompiler rejects it
                                        // (sub-dword select / cross-lane semantics are not modeled)
+    // DPP16 QUAD_PERM (#273): a full-quad permute (ctrl < 0x100, row/bank masks 0xf, no neg/abs/FI) —
+    // the manual-ddx/ddy idiom. The recompiler lowers it via screen-space derivatives (fragment only);
+    // src[0] holds the REAL source VGPR (dword1[7:0]) and dpp_ctrl the 8-bit lane selector.
+    bool        has_dpp = false;
+    uint16_t    dpp_ctrl = 0;
+    // SDWA sub-word selects (#273): WORD_0/WORD_1 dst/src selects with UNUSED_PRESERVE — the f16
+    // half-packing idiom (DOLL's box-blur: `v_mul_f16_sdwa … dst_sel:WORD_1 preserve` then
+    // `v_mov_b32_sdwa … dst_sel:WORD_0 src0_sel:WORD_1`). 6 = DWORD (the default / no select);
+    // 4/5 = WORD_0/WORD_1. Only combos the recompiler models clear has_modifier.
+    uint8_t     sdwa_dst_sel = 6, sdwa_dst_unused = 0, sdwa_src0_sel = 6, sdwa_src1_sel = 6;
 
     // Decoded operands (filled for the ALU formats: SOP1/2/K, VOP1/2/C, VOP3). `opcode` is the
     // format-local opcode; `dst` the destination; `src[0..n_src-1]` the sources. simm16 holds the

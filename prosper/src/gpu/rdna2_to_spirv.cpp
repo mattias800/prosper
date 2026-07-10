@@ -38,6 +38,7 @@ enum : uint32_t {
     Op_ImageSampleImplicitLod=87, Op_ImageSampleExplicitLod=88, Op_ImageFetch=95, Op_ImageGather=96, Op_Image=100,
     Op_ImageRead=98, Op_ImageWrite=99, Op_ImageQuerySizeLod=103,
     Op_TypeArray=28, Op_ControlBarrier=224,
+    Op_DPdx=207, Op_DPdy=208,   // screen-space derivatives (Fragment; plain Shader capability)
     Op_Phi=245, Op_LoopMerge=246,
     Op_SelectionMerge=247, Op_Label=248, Op_Branch=249, Op_BranchConditional=250, Op_Kill=252, Op_Return=253,
 };
@@ -64,7 +65,7 @@ enum : uint32_t {
     SC_Workgroup=4, Scope_Workgroup=2, MemSem_WGAcqRel=0x108,   // LDS: Workgroup storage + barrier scope/semantics
     Dec_Block=2, Dec_ArrayStride=6, Dec_BuiltIn=11, Dec_Flat=14, Dec_Location=30, Dec_Binding=33,
     Dec_DescriptorSet=34, Dec_Offset=35,
-    BI_Position=0, BI_LocalInvocationId=27, BI_GlobalInvocationId=28, BI_VertexIndex=42,
+    BI_Position=0, BI_FragCoord=15, BI_LocalInvocationId=27, BI_GlobalInvocationId=28, BI_VertexIndex=42,
 };
 
 uint32_t fbits(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
@@ -868,6 +869,46 @@ struct SpirvCompute {
         uint32_t vec = id(); put(code, Op_Load, {t_v4f, vec, v});
         uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, vec, chan}); return bcu(e);
     }
+    // FS: gl_FragCoord (BuiltIn 15), lazily declared — used by the DPP quad_perm lowering.
+    uint32_t v_fragcoord = 0;
+    uint32_t fragcoord_var() {
+        if (v_fragcoord) return v_fragcoord;
+        if (!t_ptr_in_v4f) { t_ptr_in_v4f = id(); put(types, Op_TypePointer, {t_ptr_in_v4f, SC_Input, t_v4f}); }
+        v_fragcoord = id(); put(types, Op_Variable, {t_ptr_in_v4f, v_fragcoord, SC_Input});
+        put(deco, Op_Decorate, {v_fragcoord, Dec_BuiltIn, BI_FragCoord});
+        iface.push_back(v_fragcoord); return v_fragcoord;
+    }
+    // DPP16 quad_perm (#273 — DOLL's manual ddx/ddy in its sharpen/AA PSs): the value of `x` at quad
+    // lane t = QP[my_lane] is reconstructed as x + (tx-px)·dPdx(x) + (ty-py)·dPdy(x), where (px,py) =
+    // (int(gl_FragCoord.xy) & 1) is this invocation's quad position and (tx,ty) = (t&1, t>>1). Exact
+    // for values linear within the 2x2 quad — the same assumption hardware derivatives make (the
+    // idiom's whole purpose IS ddx/ddy: e.g. `v_sub_f32_dpp v4, v2, v2@[0,0,2,2] qp[1,1,3,3]` =
+    // v2@(1,py) - v2@(0,py) = dPdxFine). Fragment-only. CONFIDENCE: MED (render-tested vs a known
+    // varying gradient).
+    uint32_t dpp_quad(uint32_t x_bits, uint32_t ctrl) {
+        uint32_t fc = id(); put(code, Op_Load, {t_v4f, fc, fragcoord_var()});
+        uint32_t fx = id(); put(code, Op_CompositeExtract, {t_f32, fx, fc, 0});
+        uint32_t fy = id(); put(code, Op_CompositeExtract, {t_f32, fy, fc, 1});
+        uint32_t pxu = id(); put(code, Op_ConvertFToU, {t_u32, pxu, fx});
+        uint32_t pyu = id(); put(code, Op_ConvertFToU, {t_u32, pyu, fy});
+        uint32_t px = ibin(Op_BitwiseAnd, pxu, uconst(1)), py = ibin(Op_BitwiseAnd, pyu, uconst(1));
+        uint32_t lane = ibin(Op_IAdd, px, ibin(Op_ShiftLeftLogical, py, uconst(1)));
+        uint32_t tsel = uconst((uint32_t)(ctrl & 3u));                 // QP[0] default; select QP[lane]
+        for (uint32_t k = 1; k < 4; k++)
+            tsel = sel(ucmp(Op_IEqual, lane, uconst(k)), uconst((ctrl >> (2 * k)) & 3u), tsel);
+        uint32_t tx = ibin(Op_BitwiseAnd, tsel, uconst(1)), ty = ibin(Op_ShiftRightLogical, tsel, uconst(1));
+        uint32_t xf = bcf(x_bits);
+        uint32_t dx = id(); put(code, Op_DPdx, {t_f32, dx, xf});
+        uint32_t dy = id(); put(code, Op_DPdy, {t_f32, dy, xf});
+        // (tx-px) and (ty-py) as floats (each in {-1,0,1}).
+        uint32_t dtx = id(); put(code, Op_ConvertSToF, {t_f32, dtx, bcs(ibin(Op_ISub, tx, px))});
+        uint32_t dty = id(); put(code, Op_ConvertSToF, {t_f32, dty, bcs(ibin(Op_ISub, ty, py))});
+        uint32_t r0 = id(); put(code, Op_FMul, {t_f32, r0, dtx, dx});
+        uint32_t r1 = id(); put(code, Op_FMul, {t_f32, r1, dty, dy});
+        uint32_t s0 = id(); put(code, Op_FAdd, {t_f32, s0, xf, r0});
+        uint32_t s1 = id(); put(code, Op_FAdd, {t_f32, s1, s0, r1});
+        return bcu(s1);
+    }
     // VS: an Output vec4 at Location=loc (EXP PARAM_loc); uses t_ptr_out_v4f from begin_vertex.
     uint32_t vtx_output(uint32_t loc) {
         auto it = out_varying.find(loc); if (it != out_varying.end()) return it->second;
@@ -1429,7 +1470,7 @@ void loop_written_regs(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t 
             case Rdna2Format::VOP1:
                 if (in.opcode == 0x02) sregs.insert(in.dst.value);        // v_readfirstlane -> SGPR
                 else vregs.insert(in.dst.value); break;
-            case Rdna2Format::VOP2: case Rdna2Format::VOP3:
+            case Rdna2Format::VOP2: case Rdna2Format::VOP3: case Rdna2Format::VOP3P:
                 vregs.insert(in.dst.value); break;
             case Rdna2Format::DS:                                          // ds_read writes one VGPR
                 if (in.opcode == 0x36) vregs.insert(in.dst.value); break;
@@ -1747,7 +1788,39 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
             return true;
         }
+        case Rdna2Format::VOP3P: {
+            // Mixed-precision FMA family, trivial form only (all sources full f32 — the decoder set
+            // has_modifier for any opsel/neg/clamp bits, rejected above). v_fma_mix_f32 (0x20):
+            // d = s0*s1+s2. v_fma_mixlo/hi_f16 (0x21/0x22): the f32 result converts to f16 into the
+            // LOW/HIGH half of d, PRESERVING the other half (DOLL's box-blur PS packs its result
+            // this way, #273). VERIFIED(round-trip llvm-mc gfx1010: 0xcc210000 0x041600f2 ->
+            // v_fma_mixlo_f16 v0, 1.0, v0, v5 — the live blur bytes).
+            if (in.opcode != 0x20 && in.opcode != 0x21 && in.opcode != 0x22) { ok = false; return true; }
+            uint32_t old_d = vreg_old(b, rs, in.dst.value);
+            uint32_t r = b.fbin(Op_FAdd, b.fbin(Op_FMul, val(in.src[0]), val(in.src[1])), val(in.src[2]));
+            uint32_t& d = rs.vreg[in.dst.value];
+            if (in.opcode == 0x20) d = r;
+            else if (in.opcode == 0x21)
+                d = b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0xFFFF0000u)), b.pack_half_lo(r));
+            else
+                d = b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0x0000FFFFu)),
+                           b.ibin(Op_ShiftLeftLogical, b.pack_half_lo(r), b.uconst(16)));
+            if (ok) predicate_write(b, rs, in.dst.value, old_d);
+            return true;
+        }
         case Rdna2Format::SOPC: {
+            // s_bitcmp0/1_b32 (0x0c/0x0d): SCC = bit (src0 >> (src1 & 31)) & 1, negated for bitcmp0.
+            // DOLL's scene PS tests feature-flag bits 0..3 of an s_buffer_load'd word with s_cselect
+            // chains (#273). VERIFIED(round-trip llvm-mc gfx1010: 0xbf0d8014 -> s_bitcmp1_b32 s20, 0;
+            // 0xbf0c8114 -> s_bitcmp0_b32 s20, 1 — NOT the u64 compares an opcode-table guess said).
+            if (in.opcode == 0x0c || in.opcode == 0x0d) {
+                uint32_t a = val(in.src[0]), c = val(in.src[1]);
+                uint32_t sh  = b.ibin(Op_BitwiseAnd, c, b.uconst(31));
+                uint32_t bit = b.ibin(Op_BitwiseAnd, b.ibin(Op_ShiftRightLogical, a, sh), b.uconst(1));
+                uint32_t nz  = b.ucmp(Op_INotEqual, bit, b.uconst(0));
+                rs.scc = (in.opcode == 0x0d) ? nz : b.bsel(nz, b.bfalse(), b.btrue());
+                return true;
+            }
             // Scalar compare -> SCC (read by s_cselect / s_cbranch_scc). eq/lg are bitwise (sign-agnostic);
             // the ordered compares are signed for i32 (0x02-0x05), unsigned for u32 (0x08-0x0b).
             uint32_t a = val(in.src[0]), c = val(in.src[1]);
@@ -1785,6 +1858,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
         }
         case Rdna2Format::VOP1: {
             uint32_t a = val(in.src[0]); uint32_t old_d = vreg_old(b, rs, in.dst.value);
+            // DPP16 quad_perm on src0 (#273): reconstruct the selected quad lane's value from
+            // screen-space derivatives (fragment-only; v_mov is the observed carrier — the manual
+            // ddx/ddy idiom). Other VOP1 ops with DPP stay rejected (derivatives of non-float moves
+            // have no meaning in this lowering).
+            if (in.has_dpp) {
+                if (!b.is_fragment || in.opcode != 0x01) { ok = false; return true; }
+                a = b.dpp_quad(a, in.dpp_ctrl);
+            }
             // SDWA float source modifiers on src0 (abs then neg) — only set on float ops by the assembler.
             if (in.src_abs[0]) a = b.fext1(Glsl_FAbs, a);
             if (in.src_neg[0]) a = b.fbin(Op_FSub, b.uconst(0), a);
@@ -1796,6 +1877,20 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rs.sreg[in.dst.value] = a; return true;
             }
             uint32_t& d = vreg[in.dst.value];
+            // WORD-select v_mov_b32_sdwa (#273): extract the selected 16-bit source half and insert it
+            // into the selected dest half, preserving the other (the f16 half-move; decode accepted
+            // only dst WORD_0/1 + PRESERVE with src DWORD/WORD_0/WORD_1).
+            if (in.opcode == 0x01 && in.sdwa_dst_sel != 6) {
+                uint32_t v = a;
+                if (in.sdwa_src0_sel == 5)      v = b.ibin(Op_ShiftRightLogical, a, b.uconst(16));
+                uint32_t v16 = b.ibin(Op_BitwiseAnd, v, b.uconst(0xFFFFu));
+                d = (in.sdwa_dst_sel == 4)
+                    ? b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0xFFFF0000u)), v16)
+                    : b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0x0000FFFFu)),
+                             b.ibin(Op_ShiftLeftLogical, v16, b.uconst(16)));
+                predicate_write(b, rs, in.dst.value, old_d);
+                return true;
+            }
             switch (in.opcode) {
                 case 0x00: return true;                              // v_nop — no-op (writes nothing; common
                                                                      // scheduling/hazard filler in real shaders)
@@ -1866,6 +1961,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
         }
         case Rdna2Format::VOP2: {
             uint32_t a = val(in.src[0]), c = val(in.src[1]); uint32_t old_d = vreg_old(b, rs, in.dst.value);
+            // DPP16 quad_perm on src0 (#273): fragment-only, FLOAT ops only (add/sub/subrev/mul/min/
+            // max/mac — the manual-derivative idiom's carriers); anything else stays rejected.
+            if (in.has_dpp) {
+                const bool fop = in.opcode == 0x03 || in.opcode == 0x04 || in.opcode == 0x05 ||
+                                 in.opcode == 0x08 || in.opcode == 0x0F || in.opcode == 0x10 ||
+                                 in.opcode == 0x1F || in.opcode == 0x2B;
+                if (!b.is_fragment || !fop) { ok = false; return true; }
+                a = b.dpp_quad(a, in.dpp_ctrl);
+            }
             // SDWA float source modifiers (only ever set on float ops by the assembler): abs then neg.
             if (in.src_abs[0]) a = b.fext1(Glsl_FAbs, a);
             if (in.src_neg[0]) a = b.fbin(Op_FSub, b.uconst(0), a);
@@ -1926,6 +2030,24 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x20: case 0x2C: d = b.fbin(Op_FAdd, b.fbin(Op_FMul, a, b.uconst(in.literal)), c); break;  // v_madmk / v_fmamk
                 case 0x21: case 0x2D: d = b.fbin(Op_FAdd, b.fbin(Op_FMul, a, c), b.uconst(in.literal)); break;  // v_madak / v_fmaak
                 case 0x2F: d = b.pack_half2x16(a, c); break;          // v_cvt_pkrtz_f16_f32 (e32 form)
+                case 0x35: {   // v_mul_f16: 16-bit float multiply. Sources read their selected halves
+                    // (SDWA WORD_1 = high 16; DWORD/WORD_0 = low 16 — an f16 op reads bits[15:0]);
+                    // f16xf16 products are exact in f32, so multiply in f32 and round once to f16.
+                    // The 16-bit result inserts into the selected dest half PRESERVING the other
+                    // (dst_sel WORD_1 for the SDWA pack idiom; DWORD/WORD_0 = the plain e32 form's
+                    // "write [15:0], preserve [31:16]" gfx10 f16-VOP2 contract). #273 (DOLL box-blur).
+                    auto half_of = [&](uint32_t x, uint8_t s) {
+                        return s == 5 ? b.ibin(Op_ShiftRightLogical, x, b.uconst(16)) : x;
+                    };
+                    uint32_t p = b.fbin(Op_FMul, b.unpack_half(half_of(a, in.sdwa_src0_sel), 0),
+                                                 b.unpack_half(half_of(c, in.sdwa_src1_sel), 0));
+                    uint32_t r16 = b.pack_half_lo(p);
+                    d = (in.sdwa_dst_sel == 5)
+                        ? b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0x0000FFFFu)),
+                                 b.ibin(Op_ShiftLeftLogical, r16, b.uconst(16)))
+                        : b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0xFFFF0000u)), r16);
+                    break;
+                }
                 default: ok = false;
             }
             // SDWA output modifier: OMOD scale (×2/×4/×0.5) then CLAMP saturate, on FLOAT-result opcodes
@@ -2688,6 +2810,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             return true;
         }
         case Rdna2Format::DS: {
+            // ds_write_addtid_b32 (0xb0) in a GRAPHICS stage (#273): DOLL's scene PS writes one
+            // per-lane dword to LDS (addr = M0 + tid*4) and NEVER reads LDS back anywhere in the
+            // stream — a wave-scratch spill nothing in our per-invocation model can observe. No-op
+            // it in non-compute shells; any LDS READ in a graphics stage still rejects loudly below.
+            // VERIFIED(round-trip llvm-mc gfx1010: 0xdac00000/0x00000f00 -> ds_write_addtid_b32 v15).
+            if (!b.is_compute && in.opcode == 0xb0) return true;
             // LDS (workgroup shared memory), compute-only. ds_write_b32 (0x0d) / ds_read_b32 (0x36);
             // GDS and wider widths deferred. Byte address = ADDR VGPR + inst offset; dword index = >>2.
             if (!b.is_compute || (in.opcode != 0x0d && in.opcode != 0x36)) { ok = false; return true; }
