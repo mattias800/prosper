@@ -199,13 +199,18 @@ namespace {
         return n;
     }
 
+    // Map guest Orbis protection bits (READ=1, WRITE=2 [implies read], EXEC=4) to host PROT_* flags.
+    // prot 0 is SCE_KERNEL_PROT_NONE — a LEGITIMATE "no access" request (guard pages, reserved
+    // redzones), so it must map to PROT_NONE, not a default RW. Every caller passes the guest's real
+    // prot arg (never a "please default me" sentinel), so there is no case where 0 should mean RW; the
+    // old `if(!hp) hp = RW` fallback silently turned an explicit guard page into a writable one, so an
+    // overrun never faulted and allocator/stack tripwires never fired (#342).
     int host_prot(uint64_t p) {
         int hp = 0;
         if (p & 0x1) hp |= PROT_READ;
         if (p & 0x2) hp |= PROT_READ | PROT_WRITE;
         if (p & 0x4) hp |= PROT_EXEC;
-        if (!hp) hp = PROT_READ | PROT_WRITE;
-        return hp;
+        return hp;   // p == 0 -> PROT_NONE (no access), NOT read-write
     }
     uint64_t align_up(uint64_t v, uint64_t a) { return a ? (v + a - 1) & ~(a - 1) : v; }
     void* map_at(uint64_t hint, uint64_t len, int prot) {

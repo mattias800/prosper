@@ -227,6 +227,12 @@ if(TARGET prosper_core)
     add_executable(test_map_noreplace tests/test_map_noreplace.cpp)
     target_link_libraries(test_map_noreplace PRIVATE prosper_core)
     add_test(NAME map_noreplace COMMAND test_map_noreplace)
+
+    # A guest mprotect(prot=0) makes the page PROT_NONE, not a default RW (#342): guard pages must
+    # actually guard. Drives the real sceKernelMprotect + a SIGSEGV probe. Linux-only.
+    add_executable(test_prot_none tests/test_prot_none.cpp)
+    target_link_libraries(test_prot_none PRIVATE prosper_core)
+    add_test(NAME prot_none COMMAND test_prot_none)
   endif()
 
   # PM4 command-stream decoder (front of the CommandProcessor): decode a Dcb built by the AGC
