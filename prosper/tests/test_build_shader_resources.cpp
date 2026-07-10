@@ -69,6 +69,10 @@ int main() {
               !fi.snorm, "IMG_FMT 177 -> BC5 UNORM (decodable)");
         CHECK(gen5_image_format(178, &fi) && fi.format == DataFormat::Bc5 && fi.snorm,
               "IMG_FMT 178 -> BC5 SNORM (flagged snorm, skip-only)");
+        // #294: fmt 36 = 10_11_11_FLOAT (UE4 R11G11B10F scene color) — packed 4-byte texel, 3 comps.
+        CHECK(gen5_image_format(36, &fi) && fi.format == DataFormat::Float10_11_11 &&
+              fi.num_components == 3 && fi.bytes_per_block == 4 && fi.block_width == 1 && !fi.srgb,
+              "IMG_FMT 36 -> Float10_11_11 packed, 4 B/texel");
         CHECK(!gen5_image_format(0, &fi) && fi.format == DataFormat::Unknown, "IMG_FMT 0 (INVALID) unmapped");
         CHECK(!gen5_image_format(9, &fi), "IMG_FMT 9 (16_USCALED) unmapped -> false");
         CHECK(!gen5_image_format(44, &fi), "IMG_FMT 44 (10_10_10_2) unmapped -> false");

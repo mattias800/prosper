@@ -32,7 +32,13 @@ enum class DataFormat : uint32_t {
     // per-COMPONENT byte size is meaningless for a block format; use
     // Gen5ImageFormatInfo::bytes_per_block).
     Bc1, Bc2, Bc3, Bc4, Bc5, Bc6, Bc7,
-    // 10/11-bit packed formats are added as the target needs them.
+    // Packed 32-bit R11G11B10 unsigned-float (GFX10 IMG_FMT 36 "10_11_11_FLOAT", DX
+    // R11G11B10_FLOAT, VK B10G11R11_UFLOAT_PACK32): R = bits[10:0] (5e6m), G = bits[21:11]
+    // (5e6m), B = bits[31:22] (5e5m), no sign bits, no alpha. UE4's scene-color render-target
+    // format (#294). data_format_bytes() returns 0 (packed — per-component size is meaningless;
+    // the texel is 4 bytes, carried by Gen5ImageFormatInfo::bytes_per_block).
+    Float10_11_11,
+    // Other 10/11-bit packed formats are added as the target needs them.
 };
 
 // How many bytes one component of `format` occupies (0 for Unknown and block-compressed formats).
@@ -41,6 +47,13 @@ uint32_t data_format_bytes(DataFormat f);
 // IEEE-754 binary16 -> binary32 (handles subnormals, +/-inf, NaN). Used by the texture upload path to
 // convert a sampled Float16 surface to the RGBA8 the backend uploads (#290). Pure + testable.
 float half_to_float(uint16_t h);
+
+// Unsigned small-float components of a packed Float10_11_11 texel (#294). Both share binary16's
+// 5-bit exponent (bias 15) with a shortened mantissa (6 bits for the 11-bit R/G, 5 for the 10-bit B)
+// and NO sign bit — so a left-shift of the mantissa into a half's 10-bit field is an exact
+// widening (subnormals scale identically, inf/NaN preserved). Pure + testable.
+float f11_to_float(uint16_t v);   // low 11 bits used
+float f10_to_float(uint16_t v);   // low 10 bits used
 
 enum class ResourceClass : uint32_t {
     ConstantBuffer,  // read by s_buffer_load_* (scalar, uniform across the wave)

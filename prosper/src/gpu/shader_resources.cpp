@@ -38,6 +38,17 @@ float half_to_float(uint16_t h) {
     return f;
 }
 
+float f11_to_float(uint16_t v) {
+    // 5-bit exp (bias 15) + 6-bit mantissa, unsigned. Widen the mantissa into a half's 10-bit
+    // field: subnormal m/64*2^-14 == (m<<4)/1024*2^-14, normal/inf/NaN carry the exponent as-is.
+    return half_to_float((uint16_t)(((v & 0x7FFu) >> 6 << 10) | ((v & 0x3Fu) << 4)));
+}
+
+float f10_to_float(uint16_t v) {
+    // 5-bit exp (bias 15) + 5-bit mantissa, unsigned.
+    return half_to_float((uint16_t)(((v & 0x3FFu) >> 5 << 10) | ((v & 0x1Fu) << 5)));
+}
+
 const ShaderResource* ShaderResourceTable::by_srt_offset(uint32_t srt_offset) const {
     if (srt_offset == 0xFFFFFFFFu) return nullptr;
     for (const auto& r : resources) if (r.srt_offset == srt_offset) return &r;

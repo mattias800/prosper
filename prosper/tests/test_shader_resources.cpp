@@ -65,6 +65,21 @@ int main() {
     { float inf = half_to_float(0x7C00); CHECK(inf > 3.4e38f && inf == inf * 2, "half 0x7C00 = +inf"); }
     { float nan = half_to_float(0x7E01); CHECK(nan != nan, "half 0x7E01 = NaN"); }
 
+    // f11/f10 unsigned small floats (#294, packed R11G11B10F scene color): binary16 exponent
+    // (bias 15), shortened mantissa (6/5 bits), no sign.
+    CHECK(f11_to_float(0x3C0) == 1.0f && f10_to_float(0x1E0) == 1.0f, "f11 0x3C0 / f10 0x1E0 = 1.0");
+    CHECK(f11_to_float(0x380) == 0.5f && f10_to_float(0x1C0) == 0.5f, "f11 0x380 / f10 0x1C0 = 0.5");
+    CHECK(f11_to_float(0) == 0.0f && f10_to_float(0) == 0.0f, "f11/f10 0 = 0.0");
+    CHECK(f11_to_float(0x3E0) == 1.5f, "f11 0x3E0 = 1.5 (mantissa MSB)");
+    CHECK(f10_to_float(0x1F0) == 1.5f, "f10 0x1F0 = 1.5 (mantissa MSB)");
+    CHECK(f11_to_float(0x001) == half_to_float(0x0010), "f11 smallest subnormal == half m<<4 subnormal");
+    CHECK(f10_to_float(0x001) == half_to_float(0x0020), "f10 smallest subnormal == half m<<5 subnormal");
+    CHECK(f11_to_float(0x7BF) == 65024.0f, "f11 0x7BF = max finite (65024)");
+    { float inf = f11_to_float(0x7C0); CHECK(inf > 3.4e38f && inf == inf * 2, "f11 0x7C0 = +inf"); }
+    { float nan = f10_to_float(0x3E1); CHECK(nan != nan, "f10 0x3E1 = NaN"); }
+    CHECK(data_format_bytes(DataFormat::Float10_11_11) == 0,
+          "Float10_11_11 is packed: per-component bytes = 0 (texel size lives in bytes_per_block)");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
