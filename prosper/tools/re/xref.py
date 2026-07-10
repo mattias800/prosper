@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+# xref.py — cross-reference finder for an (unsymbolicated) PS5 module.
+#
+# PS5 eboot/PRX code is position-independent: internal references appear as
+#   - direct calls          e8 <rel32>
+#   - rip-relative lea/mov   REX.W/REX.WR  8d|8b  modrm(rip)  <disp32>
+#   - data pointers          absolute pointers stored in data, emitted as
+#                            R_X86_64_RELATIVE relocations (DT_RELA / DT_SCE_RELA)
+# so "grep for who references address X" is not a text search — it needs all three
+# decoded. Standard tools don't read the Sony (DT_SCE_*) relocation encoding, and
+# rip-relative refs never appear as literals at all. This tool builds a reverse
+# index over all three and answers "who references <addr>" and "what does the
+# function at <addr> reference".
+#
+# Input is a FLATTENED ELF (p_offset==p_vaddr) as produced by tools/il2cpp/prx_to_elf.py.
+# Runtime address = module_load_base + VA (e.g. eboot base 0x400000000).
+#
+# Usage:
+#   xref.py <module.elf> to   <hexaddr>     # who references this address
+#   xref.py <module.elf> from <hexaddr>     # what this function references (rip-lea/call, ~2KB window)
+#   xref.py <module.elf> reloc <hexaddr>    # data-pointer relocations targeting this address only
+
+import struct, sys
+from collections import defaultdict
+
+MODRM_RIP = {0x05, 0x0d, 0x15, 0x1d, 0x25, 0x2d, 0x35, 0x3d}   # mod=00, rm=101 (rip-rel), reg=any
+
+
+class Module:
+    def __init__(self, path):
+        self.raw = open(path, 'rb').read()
+        raw = self.raw
+        e_phoff, = struct.unpack_from('<Q', raw, 0x20)
+        phentsize, phnum = struct.unpack_from('<HH', raw, 0x36)
+        self.segs = []          # (va, foff, filesz, flags)
+        self.dyn_va = 0
+        for i in range(phnum):
+            t, fl, off, va, pa, fs, ms, al = struct.unpack_from('<IIQQQQQQ', raw, e_phoff + i * phentsize)
+            if t == 1:
+                self.segs.append((va, off, fs, fl))
+            elif t == 2:
+                self.dyn_va = va
+        self._build()
+
+    def foff(self, va):
+        for v, o, fs, fl in self.segs:
+            if v <= va < v + fs:
+                return o + (va - v)
+        return None
+
+    def va_at(self, fo):
+        for v, o, fs, fl in self.segs:
+            if o <= fo < o + fs:
+                return v + (fo - o)
+        return None
+
+    def func_start(self, va):
+        # nearest int3 (>=2x 0xcc) padding boundary at or before va
+        fo = self.foff(va)
+        if fo is None:
+            return va
+        p = fo
+        while p > fo - 0x4000 and p > 1:
+            if self.raw[p] == 0xcc and self.raw[p - 1] == 0xcc:
+                return self.va_at(p + 1) or va
+            p -= 1
+        return va
+
+    def _build(self):
+        raw = self.raw
+        self.data_xref = defaultdict(list)   # target VA -> [site VAs] (relocated data pointers)
+        self.code_xref = defaultdict(list)   # target VA -> [(site VA, kind)]  kind in {call, lea, mov}
+        # --- relocations (standard DT_RELA + Sony DT_SCE_RELA) ---
+        if self.dyn_va:
+            o = self.foff(self.dyn_va)
+            tags = {}
+            while o is not None:
+                tag, val = struct.unpack_from('<qQ', raw, o); o += 16
+                if tag == 0:
+                    break
+                tags.setdefault(tag, val)
+            for tv, sv in [(0x7, 0x8), (0x17, 0x2), (0x6100002f, 0x61000031), (0x61000029, 0x6100002d)]:
+                if tv in tags and sv in tags and self.foff(tags[tv]) is not None:
+                    base = self.foff(tags[tv])
+                    for i in range(tags[sv] // 24):
+                        r_off, r_info, r_add = struct.unpack_from('<QQq', raw, base + i * 24)
+                        if (r_info & 0xffffffff) == 8:   # R_X86_64_RELATIVE: target VA = addend
+                            self.data_xref[r_add].append(r_off)
+        # --- code scan: rip-relative lea/mov (REX.W 0x48 and REX.WR 0x4c) + e8 calls ---
+        for v, o, fs, fl in self.segs:
+            if not (fl & 1):
+                continue
+            d = raw[o:o + fs]
+            n = len(d)
+            for i in range(n - 7):
+                b = d[i]
+                if b in (0x48, 0x4c) and d[i + 1] in (0x8d, 0x8b) and d[i + 2] in MODRM_RIP:
+                    disp = struct.unpack_from('<i', d, i + 3)[0]
+                    site = v + i
+                    self.code_xref[site + 7 + disp].append((site, 'lea' if d[i + 1] == 0x8d else 'mov'))
+                elif b == 0xe8:
+                    disp = struct.unpack_from('<i', d, i + 1)[0]
+                    site = v + i
+                    self.code_xref[site + 5 + disp].append((site, 'call'))
+
+
+def main():
+    if len(sys.argv) < 4:
+        print(__doc__)
+        return 1
+    m = Module(sys.argv[1])
+    mode = sys.argv[2]
+    addr = int(sys.argv[3], 0)
+    if mode in ('to', 'reloc'):
+        drefs = m.data_xref.get(addr, [])
+        print(f"data-pointer relocations targeting 0x{addr:x}: {len(drefs)}")
+        for s in drefs[:32]:
+            print(f"   ptr stored at 0x{s:x}")
+        if mode == 'to':
+            crefs = m.code_xref.get(addr, [])
+            print(f"code references to 0x{addr:x}: {len(crefs)}")
+            for s, k in crefs[:32]:
+                print(f"   {k:4s} at 0x{s:x}  (in func 0x{m.func_start(s):x})")
+    elif mode == 'from':
+        start = m.func_start(addr)
+        print(f"references made by func 0x{start:x} (window from 0x{addr:x}):")
+        fo = m.foff(addr)
+        seen = set()
+        for tgt, sites in m.code_xref.items():
+            for s, k in sites:
+                if addr <= s < addr + 0x800 and tgt not in seen:
+                    seen.add(tgt)
+                    print(f"   {k:4s} -> 0x{tgt:x}")
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
