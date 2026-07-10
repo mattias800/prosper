@@ -166,6 +166,58 @@ int main() {
         CHECK(t8[4096] == lin8[(size_t)0 * 128 + 64], "8-bpp golden: texel (64,0) starts tile 1 (byte 4096, 64-wide tile)");
     }
 
+    // #379: golden within-tile order for the remaining element sizes 2/8/16 B — derived from the low
+    // (bx+by) bits of the authoritative kSw64kS pattern (docs/GFX10_SW_64KB_TILING.md: the 4KB order is
+    // the low-bit truncation of the 64KB order). The old L-generator was correct only at 1 B / 4 B; at
+    // 2/8/16 B it swapped the low X/Y pairs, scrambling every SW_4KB_S R16 / BC1/BC4 / BC2/3/5/6/7
+    // surface into a coherent-looking weave. Each element stores x in byte0 and y in byte1, so a checked
+    // element uniquely identifies its source texel and a mis-order cannot pass on a coincidental byte.
+    {
+        const uint32_t M = (uint32_t)TileMode::Sw4KbS;
+        auto fill = [](std::vector<uint8_t>& lin, uint32_t w, uint32_t h, uint32_t bpt) {
+            for (uint32_t y = 0; y < h; y++) for (uint32_t x = 0; x < w; x++) {
+                lin[((size_t)y * w + x) * bpt + 0] = (uint8_t)x;
+                lin[((size_t)y * w + x) * bpt + 1] = (uint8_t)y;
+            }
+        };
+        // The check: element `idx` (its byte0/byte1) equals source texel (x,y)'s byte0/byte1.
+        #define GOLD(t, lin, w, bpt, idx, tx, ty, msg) \
+            CHECK((t)[(size_t)(idx)*(bpt)+0] == (lin)[((size_t)(ty)*(w)+(tx))*(bpt)+0] && \
+                  (t)[(size_t)(idx)*(bpt)+1] == (lin)[((size_t)(ty)*(w)+(tx))*(bpt)+1], msg)
+
+        // 2 B/element (64x32 tile): order x0 x1 x2 y0 y1 y2 x3 y3 x4 y4 x5.
+        std::vector<uint8_t> lin2((size_t)128 * 64 * 2, 0); fill(lin2, 128, 64, 2);
+        std::vector<uint8_t> t2(tiled_surface_bytes(128, 64, M, 0, 2), 0);
+        tile_surface(t2.data(), lin2.data(), 128, 64, M, 0, 2);
+        GOLD(t2, lin2, 128, 2, 1,  1, 0, "2 B golden: texel (1,0) -> element 1 (x0 at bit 0)");
+        GOLD(t2, lin2, 128, 2, 2,  2, 0, "2 B golden: texel (2,0) -> element 2 (x1 at bit 1)");
+        GOLD(t2, lin2, 128, 2, 4,  4, 0, "2 B golden: texel (4,0) -> element 4 (x2 at bit 2)");
+        GOLD(t2, lin2, 128, 2, 8,  0, 1, "2 B golden: texel (0,1) -> element 8 (y0 at bit 3)");
+        GOLD(t2, lin2, 128, 2, 16, 0, 2, "2 B golden: texel (0,2) -> element 16 (y1 at bit 4)");
+
+        // 8 B/element (32x16 tile, BC1/BC4 blocks): order x0 y0 y1 x1 x2 y2 x3 y3 x4.
+        std::vector<uint8_t> lin8b((size_t)64 * 32 * 8, 0); fill(lin8b, 64, 32, 8);
+        std::vector<uint8_t> t8b(tiled_surface_bytes(64, 32, M, 0, 8), 0);
+        tile_surface(t8b.data(), lin8b.data(), 64, 32, M, 0, 8);
+        GOLD(t8b, lin8b, 64, 8, 1,  1, 0, "8 B golden: texel (1,0) -> element 1 (x0 at bit 0)");
+        GOLD(t8b, lin8b, 64, 8, 2,  0, 1, "8 B golden: texel (0,1) -> element 2 (y0 at bit 1)");
+        GOLD(t8b, lin8b, 64, 8, 4,  0, 2, "8 B golden: texel (0,2) -> element 4 (y1 at bit 2)");
+        GOLD(t8b, lin8b, 64, 8, 8,  2, 0, "8 B golden: texel (2,0) -> element 8 (x1 at bit 3)");
+        GOLD(t8b, lin8b, 64, 8, 16, 4, 0, "8 B golden: texel (4,0) -> element 16 (x2 at bit 4)");
+
+        // 16 B/element (16x16 tile, BC2/3/5/6/7 blocks): order y0 y1 x0 x1 y2 x2 y3 x3 — Y pair FIRST.
+        // The old code emitted the X pair first, swapping every non-(0,0) block in the micro-tile.
+        std::vector<uint8_t> lin16((size_t)32 * 32 * 16, 0); fill(lin16, 32, 32, 16);
+        std::vector<uint8_t> t16(tiled_surface_bytes(32, 32, M, 0, 16), 0);
+        tile_surface(t16.data(), lin16.data(), 32, 32, M, 0, 16);
+        GOLD(t16, lin16, 32, 16, 1,  0, 1, "16 B golden: texel (0,1) -> element 1 (y0 at bit 0)");
+        GOLD(t16, lin16, 32, 16, 2,  0, 2, "16 B golden: texel (0,2) -> element 2 (y1 at bit 1)");
+        GOLD(t16, lin16, 32, 16, 4,  1, 0, "16 B golden: texel (1,0) -> element 4 (x0 at bit 2)");
+        GOLD(t16, lin16, 32, 16, 8,  2, 0, "16 B golden: texel (2,0) -> element 8 (x1 at bit 3)");
+        GOLD(t16, lin16, 32, 16, 16, 0, 4, "16 B golden: texel (0,4) -> element 16 (y2 at bit 4)");
+        #undef GOLD
+    }
+
     // --- GFX10 64KB modes (#288): SW_64KB_S (tile_mode 9) and SW_64KB_R_X (tile_mode 27). ---
     CHECK(tile_mode_is_tiled((uint32_t)TileMode::Sw64KbS),  "tile_mode 9 (SW_64KB_S) is tiled");
     CHECK(tile_mode_is_tiled((uint32_t)TileMode::Sw64KbRX), "tile_mode 27 (SW_64KB_R_X) is tiled");
