@@ -4,6 +4,7 @@
 // Sync commits. Struct layouts mirror shadPS4 save_data/savedata.cpp (offsets asserted below).
 #include "../src/hle/dispatch.hpp"
 #include <cstdio>
+#include <cstdlib>   // setenv (test-private save dir)
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
@@ -30,6 +31,13 @@ static_assert(offsetof(Get2, data) == 8 && offsetof(Get2, slotId) == 32, "Get2")
 
 int main() {
     printf("== test_savedata_ime ==\n");
+    // Hermeticity: SaveDataMemory now persists a synced slot to PROSPER_SAVEDATA_DIR (#432), which
+    // survives across ctest runs -- so the "fresh slot" check below would see a PRIOR run's file. Point
+    // it at a test-private dir and clear that run's slot file so fresh/resume are deterministic.
+#ifndef _WIN32
+    setenv("PROSPER_SAVEDATA_DIR", "/tmp/prosper-savemem-selftest", 1);
+    remove("/tmp/prosper-savemem-selftest/savemem_1_0.bin");
+#endif
     register_builtin_hle();
 
     // ---- libSceImeDialog: auto-completing lifecycle ----
