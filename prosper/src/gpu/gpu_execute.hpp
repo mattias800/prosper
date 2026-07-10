@@ -335,6 +335,17 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             vertex_count = max_index + 1;
         }
     }
+    // A genuinely empty draw (vcount_hint == 0 — engines emit 0-vertex DrawIndexAuto/DrawIndexOffset as
+    // no-ops) that resolved NO indices above must render nothing, exactly as it does on hardware. Do NOT
+    // fall through: `vertex_count = vcount_hint ? vcount_hint : 3` already fabricated 3, and the
+    // vb_entries override below would then sweep the ENTIRE residual vertex pool (0..vb_entries-1) of
+    // whatever geometry the last-bound VB still holds — turning a no-op into a phantom triangle or a
+    // full-VB draw of stale geometry composited into the frame (#400). The vb_entries "truer count"
+    // override exists to correct a LOW/stale count, never to synthesize one for a zero-count draw.
+    if (vcount_hint == 0 && out.indices.empty()) {
+        if (log) fprintf(stderr, "[exec] skip draw: zero vertex count (no-op draw)\n");
+        return false;
+    }
     if (out.indices.empty() && vb_entries > vertex_count) vertex_count = vb_entries;
     // Bindless per-glyph vertex fetch (#257): the fetch-shader patches a SMALL per-glyph V# (num_records=4
     // = one glyph's 4 corners, size=304). But the draw indexes ALL vertices (gl_VertexIndex 0..N-1) out of
