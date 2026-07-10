@@ -79,6 +79,13 @@ HLE(s_user_getevent)  {
     return 0x80960007ull;   // SCE_USER_SERVICE_ERROR_NO_EVENT
 }
 HLE(s_ok)             { return 0; }
+// libSceAvPlayer (#324): a title can play an intro/title video via AvPlayer. We don't decode video;
+// implement just enough lifecycle that Init returns a VALID (non-NULL) handle and playback reports
+// finished immediately — so the game advances past the video into its scene instead of stalling on a
+// NULL handle from a stubbed InitEx. No decode needed to progress; the game's while(IsActive) frame
+// loop simply doesn't run (or ends at once) and it moves on.
+HLE(s_avplayer_init)     { return g_handle.fetch_add(1); }   // non-NULL SceAvPlayerHandle
+HLE(s_avplayer_isactive) { return 0; }                       // 0 = not active -> stream done -> proceed
 // sceUserServiceGetGamePresets(userId, presets): MUST return success (0). The Unity engine's
 // per-controller connection check (eboot 0x14707e0, reached from the pad "reset" path 0x1470ca0)
 // calls this and treats ANY non-zero user-service return as "controller invalid" — it then clears the
@@ -729,6 +736,20 @@ void register_service_hle() {
     R("sceMsgDialogGetStatus", s_dialog_status);
     R("sceMsgDialogGetResult", s_dialog_result);
     R("sceSystemServiceHideSplashScreen", s_ok);
+    // libSceAvPlayer (#324): let a post-credits / intro video complete so the game reaches its scene.
+    // Init/InitEx must return a non-NULL handle; IsActive must report finished; the rest succeed as no-ops.
+    R("sceAvPlayerInit",           s_avplayer_init);
+    R("sceAvPlayerInitEx",         s_avplayer_init);
+    R("sceAvPlayerPostInit",       s_ok);
+    R("sceAvPlayerSetLogCallback", s_ok);
+    R("sceAvPlayerAddSource",      s_ok);
+    R("sceAvPlayerAddSourceEx",    s_ok);
+    R("sceAvPlayerIsActive",       s_avplayer_isactive);
+    R("sceAvPlayerGetVideoData",   s_ok);   // 0 = no frame available (we don't decode) -> game skips it
+    R("sceAvPlayerGetVideoDataEx", s_ok);
+    R("sceAvPlayerGetAudioData",   s_ok);
+    R("sceAvPlayerStop",           s_ok);
+    R("sceAvPlayerClose",          s_ok);
     R("sceSystemServiceGetStatus", s_syss_getstatus);
     // sceSystemServiceGetDisplaySafeAreaInfo (1n37q1Bvc5Y) — fill ratio=1.0 (see s_syss_safearea).
     Hle::register_fn("1n37q1Bvc5Y", (HleFn)s_syss_safearea, "sceSystemServiceGetDisplaySafeAreaInfo");
