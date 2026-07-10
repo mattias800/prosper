@@ -376,6 +376,17 @@ HLE(f_pread)  { return (uint64_t)-1; }
 HLE(f_pwrite) { return (uint64_t)-1; }
 #endif
 
+// sceKernelFtruncate(fd, length): resize an open file. Was MISSING -> the return-0 stub faked success
+// without truncating, so the near-universal save idiom "overwrite with fewer bytes, then ftruncate to
+// drop the old tail" left stale trailing bytes -> a longer-than-expected, corrupt save on reload (and a
+// preallocate-by-ftruncate followed by mmap would SIGBUS). NID VW3TVZiM4-E is imported by the Messenger
+// eboot directly. Returns 0 / negative on failure.
+#ifndef _WIN32
+HLE(f_ftruncate) { return (uint64_t)(int64_t)::ftruncate((int)a0, (off_t)a1); }
+#else
+HLE(f_ftruncate) { return (uint64_t)-1; }
+#endif
+
 // --- sceKernelAio* — the kernel async-IO command API (issue #312 suspect list). -----------------
 // PS4-inherited contract, reference shadPS4 core/libraries/kernel/aio.cpp (the PS5 3.20 libkernel
 // exports the IDENTICAL NID set — verified against ../PS5-3.20_Libs/libkernel.c). The kernel model
@@ -1049,6 +1060,7 @@ void register_file_hle() {
     R("lseek", f_lseek);   R("stat", f_stat);     R("fstat", f_fstat);   R("access", f_access);
     R("sceKernelOpen", f_open);   R("sceKernelClose", f_close);  R("sceKernelRead", f_read);
     R("sceKernelWrite", f_write); R("sceKernelLseek", f_lseek);  R("sceKernelStat", f_stat);
+    R("sceKernelFtruncate", f_ftruncate);   // real resize (was fake-success -> corrupt saves)
     R("sceKernelFstat", f_fstat);
     // Low-level POSIX wrappers with the internal leading-underscore names. Real libc.prx implements
     // its stdio/file layer (fopen/fwrite/...) on top of these, so they MUST be real (were stubbed to
