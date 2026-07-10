@@ -3212,7 +3212,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     uint32_t cu = vread(cvg(0)), cv = vread(cvg(1));
                     if (is_sample)         b.image_sample_2d(res->binding, cu, cv, out);
                     else if (is_sample_lz) b.image_sample_lod_2d(res->binding, cu, cv, b.uconst(0), out);      // LOD 0
-                    else if (is_sample_l)  b.image_sample_lod_2d(res->binding, cu, cv, vread(cvg(2)), out);    // LOD = 3rd coord
+                    // Explicit-LOD sample: LOD is the coord AFTER the spatial (+ array) coords. Plain 2D
+                    // vaddr = [u, v, lod] -> cvg(2); 2D_ARRAY (dim 5) vaddr = [u, v, slice, lod] -> cvg(3).
+                    // The slice sits at cvg(2), so reading LOD from cvg(2) on a 2D_ARRAY took the array
+                    // index as the LOD (#373). (Slice itself is still dropped — 2D lowering, #325.)
+                    else if (is_sample_l)  b.image_sample_lod_2d(res->binding, cu, cv,
+                                                                 vread(cvg(in.mimg_dim == 5u ? 3 : 2)), out);
                     else                   b.image_fetch_2d (res->binding, cu, cv, out);
                 }
             }
