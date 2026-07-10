@@ -96,6 +96,13 @@ RenderState extract_render_state(const GpuState& st) {
     rs.z_write_enable = PM4_FIELD(dc, DB_DEPTH_CONTROL, Z_WRITE_ENABLE) != 0;
     rs.zfunc          = PM4_FIELD(dc, DB_DEPTH_CONTROL, ZFUNC);
 
+    // Depth/stencil clear values (DB_DEPTH_CLEAR = IEEE-754 float, DB_STENCIL_CLEAR = 8-bit). Present
+    // only when the game programmed them; the depth attachment's LOAD_OP_CLEAR must use the guest's
+    // value (not a fixed 0.5) or a standard depth test wrongly rejects fragments (#371).
+    rs.has_depth_clear     = st.cx.count(P::DB_DEPTH_CLEAR) != 0;
+    rs.depth_clear_value   = rs.has_depth_clear ? flt(rd(st.cx, P::DB_DEPTH_CLEAR)) : 1.0f;
+    rs.stencil_clear_value = PM4_FIELD(rd(st.cx, P::DB_STENCIL_CLEAR), DB_STENCIL_CLEAR, CLEAR);
+
     // Color blend state (decoded fields of CB_BLEND0_CONTROL).
     const uint32_t bc = rd(st.cx, P::CB_BLEND0_CONTROL);
     rs.blend_enable    = PM4_FIELD(bc, CB_BLEND0_CONTROL, ENABLE) != 0;
@@ -151,6 +158,17 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
     ps.depth_test_enable  = rs.z_enable;
     ps.depth_write_enable = rs.z_write_enable;
     ps.depth_compare_op   = vk_compare_op(rs.zfunc);
+    // Depth clear value (#371): use the guest's DB_DEPTH_CLEAR when programmed. Otherwise pick a default
+    // matching the resolved compare op — LESS/LESS_OR_EQUAL clear to 1.0 (far), GREATER/GREATER_OR_EQUAL
+    // (reversed-Z) clear to 0.0 (near) — the overwhelmingly common convention, and never a fixed 0.5
+    // (which discards every fragment on the wrong side of 0.5 under a standard depth test).
+    if (rs.has_depth_clear) {
+        ps.depth_clear_value = rs.depth_clear_value;
+    } else {
+        const uint32_t op = ps.depth_compare_op;   // VkCompareOp: LESS=1, LEQUAL=3, GREATER=4, GEQUAL=6
+        ps.depth_clear_value = (op == 4u || op == 6u) ? 0.0f : 1.0f;
+    }
+    ps.stencil_clear_value = rs.stencil_clear_value;
 
     // Stencil: compare func from DB_DEPTH_CONTROL (STENCILFUNC / _BF), ops from DB_STENCIL_CONTROL,
     // ref/masks from DB_STENCILREFMASK[_BF]. [0]=front, [1]=back. Only meaningful when stencil_enable.

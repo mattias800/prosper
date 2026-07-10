@@ -200,8 +200,18 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     // fixed attachment set); each draw's pipeline sets its own depthTest/Write/CompareOp. A frame with
     // no depth-using draw takes the color-only path unchanged.
     bool use_depth = false, use_stencil = false;
+    // Depth/stencil clear values for the render pass's LOAD_OP_CLEAR: take them from the first
+    // depth-testing draw's resolved state (#371). Resolve set depth_clear_value from the guest's
+    // DB_DEPTH_CLEAR, or a compare-op-appropriate default (1.0 for LESS, 0.0 for GREATER) — never the
+    // old fixed 0.5, which discarded far-half geometry under a standard LESS test.
+    float    depth_clear   = 1.0f;
+    uint32_t stencil_clear = 0;
+    bool     got_ds_clear  = false;
     for (const auto& d : draws) { if (d.ps && d.ps->depth_test_enable) use_depth = true;
-                                  if (d.ps && d.ps->stencil_enable)    use_stencil = true; }
+                                  if (d.ps && d.ps->stencil_enable)    use_stencil = true;
+                                  if (d.ps && (d.ps->depth_test_enable || d.ps->stencil_enable) && !got_ds_clear) {
+                                      depth_clear = d.ps->depth_clear_value;
+                                      stencil_clear = d.ps->stencil_clear_value; got_ds_clear = true; } }
     if (getenv("PROSPER_NO_DEPTH"))   use_depth = false;     // diag: isolate depth-test rejection
     if (getenv("PROSPER_NO_STENCIL")) use_stencil = false;   // diag: isolate stencil masking
     const bool use_ds = use_depth || use_stencil;
@@ -608,7 +618,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     if (clear_rgba && getenv("PROSPER_CLEAR_DEBUG") == nullptr)
         for (int i = 0; i < 4; i++) cc[i] = clear_rgba[i];
     VkClearValue clear[2]{}; clear[0].color = {{cc[0], cc[1], cc[2], cc[3]}};
-    clear[1].depthStencil = {0.5f, 0};   // depth cleared to 0.5 (fragments at z=0.0 pass LESS, fail GREATER)
+    clear[1].depthStencil = {depth_clear, stencil_clear};   // guest DB_DEPTH_CLEAR / compare-op default (#371)
     VkRenderPassBeginInfo rpbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rpbi.renderPass = rp; rpbi.framebuffer = fb; rpbi.renderArea = {{0, 0}, {W, H}}; rpbi.clearValueCount = use_ds ? 2 : 1; rpbi.pClearValues = clear;
     if (getenv("PROSPER_PIPELOG")) {   // diag: how many draws' pipelines built + will be recorded

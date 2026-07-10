@@ -117,6 +117,24 @@ int main() {
     CHECK(rs.zfunc == 4u, "zfunc = 4 (bits [6:4])");
     CHECK(vk_compare_op(rs.zfunc) == 4u, "zfunc 4 -> VkCompareOp GREATER (1:1)");
 
+    // #371: depth clear value. The sample stream programs no DB_DEPTH_CLEAR, so resolve defaults it by
+    // the compare op — 0.0 for GREATER (this stream), 1.0 for LESS — never a fixed 0.5. A programmed
+    // DB_DEPTH_CLEAR is used verbatim.
+    CHECK(!rs.has_depth_clear, "no DB_DEPTH_CLEAR programmed in the sample stream");
+    {
+        ResolvedPipelineState pd = resolve_pipeline_state(rs);
+        CHECK(pd.depth_compare_op == 4u && pd.depth_clear_value == 0.0f,
+              "no DB_DEPTH_CLEAR + GREATER -> depth clears to 0.0 (reversed-Z near), not 0.5");
+        RenderState less_rs = rs; less_rs.zfunc = 1u;   // LESS
+        CHECK(resolve_pipeline_state(less_rs).depth_clear_value == 1.0f,
+              "no DB_DEPTH_CLEAR + LESS -> depth clears to 1.0 (far), not 0.5");
+        RenderState prog = rs; prog.has_depth_clear = true; prog.depth_clear_value = 0.25f;
+        prog.stencil_clear_value = 7u;
+        ResolvedPipelineState pp = resolve_pipeline_state(prog);
+        CHECK(pp.depth_clear_value == 0.25f && pp.stencil_clear_value == 7u,
+              "programmed DB_DEPTH_CLEAR / DB_STENCIL_CLEAR used verbatim");
+    }
+
     // Decoded blend state + RDNA2->Vulkan factor/op mapping.
     CHECK(rs.blend_enable, "blend_enable = true (bit 30)");
     CHECK(rs.color_src_blend == 4u && vk_blend_factor(rs.color_src_blend) == 6u,

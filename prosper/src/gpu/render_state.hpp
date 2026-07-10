@@ -42,6 +42,13 @@ struct RenderState {
     bool     stencil_enable = false;
     uint32_t zfunc          = 0;      // compare op, 0..7 (RDNA2 order == VkCompareOp order)
 
+    // Depth/stencil CLEAR values (DB_DEPTH_CLEAR = float depth, DB_STENCIL_CLEAR = 8-bit stencil).
+    // has_depth_clear == the game PROGRAMMED DB_DEPTH_CLEAR (register present); otherwise resolve picks
+    // a compare-op-appropriate default (1.0 for LESS, 0.0 for GREATER) instead of a fixed 0.5 (#371).
+    bool     has_depth_clear     = false;
+    float    depth_clear_value   = 1.0f;
+    uint32_t stencil_clear_value = 0;
+
     // Color blend state for MRT 0, decoded from CB_BLEND0_CONTROL (RDNA2 factor/op enum values;
     // map to Vulkan with vk_blend_factor / vk_blend_op).
     bool     blend_enable    = false;
@@ -93,6 +100,12 @@ struct ResolvedPipelineState {
     bool     depth_test_enable  = false;
     bool     depth_write_enable = false;
     uint32_t depth_compare_op  = 0;  // == VkCompareOp
+    // Depth/stencil CLEAR value for VK_ATTACHMENT_LOAD_OP_CLEAR. Resolve sets depth_clear_value from the
+    // guest's DB_DEPTH_CLEAR when programmed, else a compare-op-appropriate default (1.0 for LESS/LEQUAL,
+    // 0.0 for GREATER/GEQUAL) — never a fixed 0.5, which wrongly rejects far-half geometry under a
+    // standard depth test (#371). stencil_clear_value from DB_STENCIL_CLEAR.
+    float    depth_clear_value   = 1.0f;
+    uint32_t stencil_clear_value = 0;
 
     // Stencil test state, resolved from DB_DEPTH_CONTROL (enable + STENCILFUNC) + DB_STENCIL_CONTROL
     // (ops) + DB_STENCILREFMASK[_BF] (ref / compare-mask / write-mask). Index [0]=front, [1]=back.
