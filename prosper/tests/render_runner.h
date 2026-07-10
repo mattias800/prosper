@@ -364,10 +364,23 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 s.compareOp   = (VkCompareOp)ps->stencil_compare_op[fb];
                 s.compareMask = ps->stencil_compare_mask[fb];
                 s.writeMask   = ps->stencil_write_mask[fb];
-                s.reference   = ps->stencil_ref[fb];
+                // AMD splits the stencil reference: STENCILTESTVAL is the COMPARE reference, but a REPLACE
+                // op writes STENCILOPVAL. Vulkan has one `reference` for both. When this draw REPLACEs
+                // (its whole purpose is to WRITE a mask value, and its compare is typically ALWAYS so the
+                // compare-ref is irrelevant), use STENCILOPVAL so the mask is written with the value the
+                // game intended — else a mask-write with TESTVAL=0/OPVAL=1 writes 0 and every later
+                // test==1 draw is wrongly culled (PPSA02664's whole UI vanished; #270).
+                const uint32_t REPLACE = 2;   // VK_STENCIL_OP_REPLACE
+                bool does_replace = (ps->stencil_pass_op[fb] == REPLACE || ps->stencil_fail_op[fb] == REPLACE ||
+                                     ps->stencil_depth_fail_op[fb] == REPLACE);
+                s.reference   = does_replace ? ps->stencil_op_val[fb] : ps->stencil_ref[fb];
                 return s;
             };
             dss.front = mkop(0); dss.back = mkop(1);
+            if (getenv("PROSPER_STENCILLOG"))
+                fprintf(stderr, "[stencil] front{cmp=%u ref=%u opval=%u cmask=0x%x wmask=0x%x fail=%u pass=%u zfail=%u} vkref=%u depth_test=%d\n",
+                        ps->stencil_compare_op[0], ps->stencil_ref[0], ps->stencil_op_val[0], ps->stencil_compare_mask[0], ps->stencil_write_mask[0],
+                        ps->stencil_fail_op[0], ps->stencil_pass_op[0], ps->stencil_depth_fail_op[0], dss.front.reference, (int)ps->depth_test_enable);
         }
         // Descriptor resources for this draw (two-set: VS=set0, PS=set1 — same layout as the single path).
         v.R = bd.R; auto& R = v.R;
