@@ -229,6 +229,58 @@ int main() {
         CHECK(std::memcmp(&tiled[65536 - 8], at(127, 63), bpe) == 0, "64KB_S 8B golden: element (127,63) is the block's last 8 bytes");
     }
 
+    // Golden positions for the GFX10 SW_64K_S pattern at 16 bpe (BC7/BC6/BC5 blocks) — the element
+    // size DOLL's loading-banner artwork uses (2688x448 / 1344x672 / 3400x1400 BC7 atlases, #304). The
+    // 16 offset bits above the 4 byte bits are [y0 y1 x0 x1 | y2 x2 y3 x3 | y4 x4 y5 x5] (kSw64kS[4]),
+    // i.e. element (0,1) -> byte 16 (y0 -> bit 4), (1,0) -> byte 64 (x0 -> bit 6), (2,0) -> byte 128,
+    // (0,2) -> byte 32, (0,4) -> byte 256, (4,0) -> byte 512, and (63,63) -> the block's last 16 bytes.
+    // A 64KB block at 16 bpe is 64x64 elements (a 256x256-texel BC7 region). This pins the 16-B within-
+    // block order that the offline #304 decode validated (the 2688x448 BC7 detiled coherently).
+    {
+        const uint32_t M = (uint32_t)TileMode::Sw64KbS;
+        const uint32_t ew = 64, eh = 64, bpe = 16;
+        std::vector<uint8_t> ref((size_t)ew * eh * bpe);
+        for (size_t i = 0; i < ref.size(); i++) ref[i] = (uint8_t)((i >> 4) * 97 + i);
+        std::vector<uint8_t> tiled(65536, 0);
+        tile_surface(tiled.data(), ref.data(), ew, eh, M, 0, bpe);
+        auto at = [&](uint32_t x, uint32_t y) { return &ref[((size_t)y * ew + x) * bpe]; };
+        CHECK(std::memcmp(&tiled[16],    at(0, 1),  bpe) == 0, "64KB_S 16B golden: element (0,1) at byte 16 (y0 -> bit 4)");
+        CHECK(std::memcmp(&tiled[32],    at(0, 2),  bpe) == 0, "64KB_S 16B golden: element (0,2) at byte 32 (y1 -> bit 5)");
+        CHECK(std::memcmp(&tiled[64],    at(1, 0),  bpe) == 0, "64KB_S 16B golden: element (1,0) at byte 64 (x0 -> bit 6)");
+        CHECK(std::memcmp(&tiled[128],   at(2, 0),  bpe) == 0, "64KB_S 16B golden: element (2,0) at byte 128 (x1 -> bit 7)");
+        CHECK(std::memcmp(&tiled[256],   at(0, 4),  bpe) == 0, "64KB_S 16B golden: element (0,4) at byte 256 (y2 -> bit 8)");
+        CHECK(std::memcmp(&tiled[512],   at(4, 0),  bpe) == 0, "64KB_S 16B golden: element (4,0) at byte 512 (x2 -> bit 9)");
+        CHECK(std::memcmp(&tiled[65536 - 16], at(63, 63), bpe) == 0, "64KB_S 16B golden: element (63,63) is the block's last 16 bytes");
+    }
+
+    // Block-unaligned MULTI-BLOCK-ROW addressing at 16 bpe — the exact case issue #304 flagged as
+    // untested: a 2688-wide BC7 is 672 blocks wide, and 672 is NOT a multiple of the 64-block macro
+    // width, so blocks_per_row = ceil(672/64) = 11 (a padded pitch). A wrong blocks_per_row (using the
+    // unpadded 672/64 = 10, or the byte pitch) shifts every block row by one macro block and produces
+    // the 1-px column stripes reported in #304. Here a 140-wide (block-unaligned: ceil(140/64) = 3),
+    // 70-tall (2 block rows) grid pins that the first element of block column 1 / block row 1 land at
+    // exactly one / blocks_per_row 64KB blocks. Offline this addressing decoded the banner coherently;
+    // the stripes were NOT here (they are a degenerate-vertex geometry bug, tracked under #273).
+    {
+        const uint32_t M = (uint32_t)TileMode::Sw64KbS;
+        const uint32_t ew = 140, eh = 70, bpe = 16;      // blocks_per_row=ceil(140/64)=3, block_rows=2
+        std::vector<uint8_t> ref((size_t)ew * eh * bpe);
+        for (size_t i = 0; i < ref.size(); i++) ref[i] = (uint8_t)((i >> 4) * 131 + i);
+        const size_t tbytes = tiled_elements_bytes(ew, eh, bpe, M);
+        CHECK(tbytes == (size_t)3 * 2 * 65536, "64KB_S 16B: 140x70 -> 3x2 blocks (blocks_per_row padded to 3)");
+        std::vector<uint8_t> tiled(tbytes, 0);
+        tile_surface(tiled.data(), ref.data(), ew, eh, M, 0, bpe);
+        auto at = [&](uint32_t x, uint32_t y) { return &ref[((size_t)y * ew + x) * bpe]; };
+        CHECK(std::memcmp(&tiled[65536],           at(64, 0), bpe) == 0, "64KB_S 16B multiblock: element (64,0) starts block 1 (byte 65536)");
+        CHECK(std::memcmp(&tiled[(size_t)2 * 65536], at(128, 0), bpe) == 0, "64KB_S 16B multiblock: element (128,0) starts block 2 (byte 131072)");
+        CHECK(std::memcmp(&tiled[(size_t)3 * 65536], at(0, 64), bpe) == 0, "64KB_S 16B multiblock: element (0,64) starts block row 1 (block 3 = blocks_per_row)");
+        CHECK(std::memcmp(&tiled[(size_t)3 * 65536 + 64], at(1, 64), bpe) == 0, "64KB_S 16B multiblock: element (1,64) at block 3 (block row 1) + within-block (1,0)=byte 64");
+        // Full round-trip over the block-unaligned surface (no texel dropped/duplicated across blocks).
+        std::vector<uint8_t> back((size_t)ew * eh * bpe, 0);
+        detile_elements(back.data(), tiled.data(), tbytes, ew, eh, bpe, M);
+        CHECK(back == ref, "64KB_S 16B multiblock: detile is the exact inverse over 140x70 (block-unaligned)");
+    }
+
     // SW_64KB_R_X pipe-XOR golden (default 16 pipes, 4 bpe): offset bits 8..11 are the pipe bits
     // x3^y3, x4^y4, x6^y5, x5^y6, then bits 12..15 are y3 x4 y6 x6 — so element (8,0) sets only
     // bit 8 (byte 256), (0,8) sets bits 8+12 (byte 4352), (8,8) cancels the bit-8 XOR leaving bit
