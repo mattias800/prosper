@@ -404,8 +404,12 @@ HLE(f_pwrite) { return (uint64_t)-1; }
 // eboot directly. Returns 0 / negative on failure.
 #ifndef _WIN32
 HLE(f_ftruncate) { return (uint64_t)(int64_t)::ftruncate((int)a0, (off_t)a1); }
+// sceKernelTruncate(path, length): the path-based sibling of ftruncate. Same fake-success -> stale-tail
+// corruption class (NID WlyEA-sLDf0, reached via libc.prx). Translate the path through the mount layer.
+HLE(f_truncate)  { std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::truncate(h.c_str(), (off_t)a1); }
 #else
 HLE(f_ftruncate) { return (uint64_t)-1; }
+HLE(f_truncate)  { return (uint64_t)-1; }
 #endif
 
 // --- sceKernelAio* — the kernel async-IO command API (issue #312 suspect list). -----------------
@@ -1089,6 +1093,7 @@ void register_file_hle() {
     R("sceKernelOpen", f_open);   R("sceKernelClose", f_close);  R("sceKernelRead", f_read);
     R("sceKernelWrite", f_write); R("sceKernelLseek", f_lseek);  R("sceKernelStat", f_stat);
     R("sceKernelFtruncate", f_ftruncate);   // real resize (was fake-success -> corrupt saves)
+    R("sceKernelTruncate", f_truncate);      // path-based sibling (same corruption class)
     R("sceKernelFstat", f_fstat);
     // Low-level POSIX wrappers with the internal leading-underscore names. Real libc.prx implements
     // its stdio/file layer (fopen/fwrite/...) on top of these, so they MUST be real (were stubbed to
