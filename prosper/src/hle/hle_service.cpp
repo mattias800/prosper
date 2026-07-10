@@ -77,6 +77,23 @@ HLE(s_mouse_read)     { if (a1) memset(PW(a1), 0, 0x18); return 0; }
 // --- app content ---
 HLE(s_appcontent_int) { if (a1) *(int32_t*)PW(a1) = 0; return 0; }
 
+// sceSystemServiceParamGetInt(SceSystemServiceParamId paramId, int32_t* value): a0=paramId, a1=value.
+// The system-settings a blanket-zero stub gives are mostly harmless, EXCEPT the LANGUAGE (paramId 1):
+// value 0 = SCE_SYSTEM_PARAM_LANG_JAPANESE, so games localise their UI/text to Japanese. Default to
+// US English (SCE_SYSTEM_PARAM_LANG_ENGLISH_US = 1) instead. Configurable via PROSPER_SYS_LANG, which
+// takes the Sony SCE_SYSTEM_PARAM_LANG_* enum (0=ja, 1=en-US, 2=fr, 4=de, 5=it, 9=ko, 18=en-GB, …).
+// Date/time-format params (2/3) default to the US convention (0 = MM/DD/YYYY, 12-hour).
+HLE(s_syss_param_int) {
+    int32_t paramId = (int32_t)a0;           // a0 = paramId, a1 = int32_t* value out (matches s_appcontent_int)
+    int32_t val = 0;
+    if (paramId == 1) {                      // SCE_SYSTEM_SERVICE_PARAM_ID_LANG
+        val = 1;                             // SCE_SYSTEM_PARAM_LANG_ENGLISH_US
+        if (const char* e = getenv("PROSPER_SYS_LANG")) val = (int32_t)strtol(e, nullptr, 0);
+    }
+    if (a1) *(int32_t*)PW(a1) = val;
+    return 0;
+}
+
 // sceSystemServiceGetStatus(SceSystemServiceStatus* status) — the out-struct is ARG 0 (single-arg
 // call). This was aliased to s_appcontent_int, which returned success while writing 4 bytes through
 // a1 — whatever stale value the caller left in RSI — and left the real status struct uninitialized.
@@ -410,7 +427,7 @@ void register_service_hle() {
     Hle::register_fn("SaKib2Ug0yI", (HleFn)s_appcontent_tmpspace, "sceAppContentTemporaryDataGetAvailableSpaceKb");
     Hle::register_fn("bcolXMmp6qQ", (HleFn)s_ok,                  "sceAppContentTemporaryDataUnmount");
     R("sceCommonDialogInitialize", s_ok);
-    R("sceSystemServiceParamGetInt", s_appcontent_int);
+    R("sceSystemServiceParamGetInt", s_syss_param_int);   // language-aware (US English default), not blanket 0
     // sceSystemServiceParamGetString (SsC-m-S9JTA): write a valid empty string (not an unfilled buffer).
     Hle::register_fn("SsC-m-S9JTA", (HleFn)s_param_string, "sceSystemServiceParamGetString");
     // message dialog: track the Initialize/Open/Close lifecycle (#144) — NONE/INITIALIZED before an
