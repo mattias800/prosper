@@ -387,6 +387,11 @@ HLE(k_map_flexible) {
          (unsigned long long)p, (unsigned long long)a1, (unsigned long long)a2, a4 ? (const char*)a4 : "");
     return 0;
 }
+// sceKernelMapFlexibleMemory(addr, len, prot, flags) has NO name arg (that is the separate Named variant),
+// so a4 (r8) is caller-indeterminate scratch -- k_map_flexible reads it as a name pointer and track()
+// strncpy's from it, so a non-zero garbage a4 dereferences a wild address. Force name=null for the
+// non-named entry point.
+HLE(k_map_flexible_noname) { return k_map_flexible(a0, a1, a2, a3, 0, 0); }
 
 // sceKernelAvailableFlexibleMemorySize(size_t* sizeOut): report the available flexible-memory budget.
 // Was MISSING -> the return-0 stub left *sizeOut uninitialized, so the guest read garbage as its budget
@@ -1035,7 +1040,7 @@ void register_kernel_mem_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
     R("sceKernelReserveVirtualRange", k_reserve_vrange);
     R("sceKernelMapNamedFlexibleMemory", k_map_flexible);
-    R("sceKernelMapFlexibleMemory", k_map_flexible);
+    R("sceKernelMapFlexibleMemory", k_map_flexible_noname);   // no name arg: a4 is garbage r8, don't deref it
     R("sceKernelAvailableFlexibleMemorySize", k_avail_flexible);   // was MISSING -> uninitialized budget
     R("sceKernelAllocateDirectMemory", k_alloc_dmem);
     R("sceKernelAllocateMainDirectMemory", k_alloc_main_dmem);  // 4-arg signature (physOut at arg3)
