@@ -589,7 +589,8 @@ HLE(k_wake_by_address) {
     return 0;
 }
 
-HLE(k_munmap)   { if (a0) { munmap((void*)a0, a1); untrack(a0, a1); } return 0; }
+HLE(k_munmap)   { if (!a1) return 0x80020016ull;   // EINVAL: a zero-length unmap (shadPS4 sceKernelMunmap)
+                  if (a0) { munmap((void*)a0, a1); untrack(a0, a1); } return 0; }
 HLE(k_mprotect) { if (a0) { mprotect((void*)a0, a1, host_prot(a2)); retrack_prot(a0, a1, host_prot(a2), "mprotect"); } return 0; }
 HLE(k_dmem_size){ return kDmemTotal; }   // 8 GiB pool (allocation failures enforce this bound)
 // sceKernelAvailableDirectMemorySize(searchStart, searchEnd, alignment, off_t* physAddrOut,
