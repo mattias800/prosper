@@ -26,6 +26,12 @@ struct RenderState {
     uint32_t color0_number_type = 0;   // CB_COLOR0_INFO.NUMBER_TYPE  (UNORM/SRGB/…)
     uint32_t color0_comp_swap   = 0;   // CB_COLOR0_INFO.COMP_SWAP    (channel order: RGBA/BGRA/…)
 
+    // CB fast-clear for MRT 0 (CB_COLOR0_CLEAR_WORD0/1 = 0x323/0x324). `has_clear` is true when the
+    // game PROGRAMMED the clear words (register present); the words hold the clear value in the
+    // target's pixel format, decoded to an RGBA float in resolve_pipeline_state (#309).
+    bool     color0_has_clear   = false;
+    uint32_t color0_clear_word0 = 0, color0_clear_word1 = 0;
+
     // Primitive topology (VGT_PRIMITIVE_TYPE.PRIM_TYPE).
     uint32_t prim_type = 0;
 
@@ -71,6 +77,13 @@ RenderState extract_render_state(const GpuState& st);
 struct ResolvedPipelineState {
     uint32_t topology         = 0;   // == VkPrimitiveTopology
     uint32_t color0_format    = 0;   // == VkFormat (0 = VK_FORMAT_UNDEFINED)
+
+    // Color-target clear value, decoded from CB_COLOR0_CLEAR_WORD0/1 per the surface format (#309).
+    // has_clear_color == the game programmed a fast-clear that we decoded; clear_color is RGBA in
+    // Vulkan order (float32[0]=R). When has_clear_color is false the backend clears to opaque black —
+    // NOT the old diagnostic blue, which now lives behind the PROSPER_CLEAR_DEBUG env in render_runner.
+    bool     has_clear_color  = false;
+    float    clear_color[4]   = {0.0f, 0.0f, 0.0f, 1.0f};
     bool     depth_test_enable  = false;
     bool     depth_write_enable = false;
     uint32_t depth_compare_op  = 0;  // == VkCompareOp

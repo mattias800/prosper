@@ -7,6 +7,7 @@
 #include "../src/gpu/render_state.hpp"
 #include "../src/gpu/vk_translate.hpp"
 #include "../src/gpu/pm4_registers.hpp"
+#include <cmath>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -18,6 +19,12 @@ namespace P = prosper::agc::Pm4;
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
                          else       { printf("  [ok]   %s\n", m); } } while (0)
+#define CHECK_NEAR(a, b, m) CHECK(std::fabs((a) - (b)) < 1e-4f, m)
+
+// Mirror of render_state.cpp's sRGB->linear (VkClearColorValue floats are linear for sRGB targets).
+static float srgb2lin(float c) {
+    return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+}
 
 struct Dcb { uint32_t* bottom; uint32_t* top; uint32_t* cursor_up; uint32_t* cursor_down;
              void* callback; void* user_data; uint32_t reserved_dw; uint32_t pad; };
@@ -47,6 +54,9 @@ int main() {
         // CB_BLEND0_CONTROL: ENABLE(bit30) | SRCBLEND=4/SrcAlpha | DESTBLEND=5/OneMinusSrcAlpha | COMB_FCN=0/Add
         { P::CB_BLEND0_CONTROL,  (1u << 30) | (4u << 0) | (5u << 8) | (0u << 5) },
         { P::CB_TARGET_MASK,     0x0000000Fu },
+        // CB fast-clear (#309): CLEAR_WORD0 holds one texel in the surface's 8_8_8_8 format.
+        { P::CB_COLOR0_CLEAR_WORD0, 0x11223344u },
+        { P::CB_COLOR0_CLEAR_WORD1, 0x00000000u },
     };
     // Shader-stage program addresses.
     ShaderReg sh_regs[] = {
@@ -116,6 +126,46 @@ int main() {
     CHECK(rs.db_depth_control  == 0x00000046u, "db_depth_control raw preserved");
     CHECK(rs.cb_color_control  == 0x00CC0010u, "cb_color_control raw preserved");
     CHECK(rs.cb_target_mask    == 0x0000000Fu, "cb_target_mask raw preserved");
+
+    // #309: CB fast-clear word extraction + format-aware decode in resolve_pipeline_state.
+    CHECK(rs.color0_has_clear, "color0_has_clear = true (CLEAR_WORD programmed)");
+    CHECK(rs.color0_clear_word0 == 0x11223344u, "color0_clear_word0 preserved");
+    {
+        // This target is ALT/BGRA + SRGB, so byte0=B, byte1=G, byte2=R, byte3=A, with RGB linearized.
+        ResolvedPipelineState ps = resolve_pipeline_state(rs);
+        CHECK(ps.has_clear_color, "resolve decodes the fast-clear color");
+        CHECK_NEAR(ps.clear_color[0], srgb2lin(0x22 / 255.0f), "clear R = byte2 (ALT swap), sRGB-linearized");
+        CHECK_NEAR(ps.clear_color[1], srgb2lin(0x33 / 255.0f), "clear G = byte1, sRGB-linearized");
+        CHECK_NEAR(ps.clear_color[2], srgb2lin(0x44 / 255.0f), "clear B = byte0 (ALT swap), sRGB-linearized");
+        CHECK_NEAR(ps.clear_color[3], 0x11 / 255.0f,           "clear A = byte3, linear (no sRGB on alpha)");
+    }
+    {
+        // STD/RGBA + UNORM: byte0=R, byte1=G, byte2=B, byte3=A, no sRGB — exact byte/255.
+        RenderState r2{};
+        r2.color0_format = 0xAu; r2.color0_number_type = 0u; r2.color0_comp_swap = 0u;
+        r2.color0_has_clear = true; r2.color0_clear_word0 = 0x11223344u;
+        ResolvedPipelineState p2 = resolve_pipeline_state(r2);
+        CHECK(p2.has_clear_color, "STD/UNORM fast-clear decodes");
+        CHECK_NEAR(p2.clear_color[0], 0x44 / 255.0f, "STD clear R = byte0");
+        CHECK_NEAR(p2.clear_color[1], 0x33 / 255.0f, "STD clear G = byte1");
+        CHECK_NEAR(p2.clear_color[2], 0x22 / 255.0f, "STD clear B = byte2");
+        CHECK_NEAR(p2.clear_color[3], 0x11 / 255.0f, "STD clear A = byte3");
+    }
+    {
+        // No fast-clear programmed -> has_clear_color false, default opaque black (never blue) (#309).
+        RenderState r3{}; r3.color0_format = 0xAu; r3.color0_has_clear = false;
+        ResolvedPipelineState p3 = resolve_pipeline_state(r3);
+        CHECK(!p3.has_clear_color, "no fast-clear -> has_clear_color false");
+        CHECK(p3.clear_color[0] == 0.0f && p3.clear_color[1] == 0.0f &&
+              p3.clear_color[2] == 0.0f && p3.clear_color[3] == 1.0f,
+              "no fast-clear -> default opaque-black clear color {0,0,0,1}");
+    }
+    {
+        // Unmapped format with a clear word set -> undecoded, falls back to black (not a bogus color).
+        RenderState r4{}; r4.color0_format = 0xCu; r4.color0_has_clear = true; r4.color0_clear_word0 = 0x11223344u;
+        ResolvedPipelineState p4 = resolve_pipeline_state(r4);
+        CHECK(!p4.has_clear_color, "unmapped format fast-clear -> has_clear_color false (black fallback)");
+    }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");

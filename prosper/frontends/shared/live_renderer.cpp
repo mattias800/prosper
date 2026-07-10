@@ -434,6 +434,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 }
                 return bds;
             };
+            // Clear color for a group: the game's decoded fast-clear taken from the group's first item's
+            // resolved pipeline state, or its default opaque black when no fast-clear was programmed.
+            // Passing this to render_draws_rgba replaces the old hardcoded debug blue on the live path
+            // (#309) — PROSPER_CLEAR_DEBUG still forces blue for spotting unrendered areas.
+            auto clear_for = [](const std::vector<const prosper::gpu::DrawItem*>& g) -> const float* {
+                return g.empty() ? nullptr : g.front()->ps.clear_color;
+            };
             std::vector<uint8_t> px;
             if (pertarget) {
                 // PER-TARGET RTT: a real frame is a sequence of passes, each rendering into a specific
@@ -479,7 +486,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     if (seed_rtt && base) { auto sit = g_rtt.find(base);
                         if (sit != g_rtt.end() && sit->second.w == w && sit->second.h == h &&
                             sit->second.rgba.size() == (size_t)w * h * 4) seed = sit->second.rgba.data(); }
-                    std::vector<uint8_t> gpx = prosper::test::render_draws_rgba(build_bds(groups[base]), w, h, seed);
+                    std::vector<uint8_t> gpx = prosper::test::render_draws_rgba(build_bds(groups[base]), w, h, seed, clear_for(groups[base]));
                     if (base && !gpx.empty()) { RttSurf& s = g_rtt[base]; s.rgba = gpx; s.w = w; s.h = h; }
                     bool is_vo = false;
                     for (int i = 0; i < vo_n && !is_vo; i++) is_vo = base && base == prosper_vo_buffer_addr(i);
@@ -513,7 +520,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 // Single-framebuffer path: render_draws_rgba composites every draw into ONE framebuffer.
                 std::vector<const prosper::gpu::DrawItem*> all; all.reserve(items.size());
                 for (const auto& it : items) all.push_back(&it);
-                px = prosper::test::render_draws_rgba(build_bds(all), w, h);
+                px = prosper::test::render_draws_rgba(build_bds(all), w, h, nullptr, clear_for(all));
                 // RTT (#167): cache these rendered pixels under this submit's render-target base, so a later
                 // composite pass that samples that address gets the scene we drew (not empty guest memory).
                 if (rtt_on && !px.empty()) {

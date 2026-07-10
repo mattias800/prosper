@@ -3,6 +3,7 @@
 #include "pm4_registers.hpp"
 #include "vk_translate.hpp"
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 namespace prosper::gpu {
@@ -28,6 +29,37 @@ float flt(uint32_t bits) {
     std::memcpy(&f, &bits, sizeof f);
     return f;
 }
+
+// sRGB (gamma-encoded) 8-bit sample -> linear [0,1]. VkClearColorValue's float channels are LINEAR
+// for an sRGB attachment (Vulkan re-encodes on store), so an sRGB fast-clear word must be linearized
+// here to round-trip to the exact stored byte. Identity at 0 and 1, so black/white are exact.
+float srgb_to_linear(float c) {
+    return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+}
+
+// Decode a CB fast-clear word into an RGBA float clear color (Vulkan order: out[0]=R). Returns false
+// for formats we do not decode yet, so the caller falls back to opaque black — the correct PS5
+// default and never worse than the old debug blue. CONFIDENCE: HIGH for 8_8_8_8 (the live-verified
+// Messenger / PPSA02664 target); the byte order matches vk_color_format's 0xA row (STD->R8G8B8A8,
+// ALT->B8G8R8A8) and the sRGB rows are linearized. Other formats: MED -> left to the black fallback.
+bool decode_clear_color(const RenderState& rs, float out[4]) {
+    if (!rs.color0_has_clear) return false;
+    const uint32_t w0 = rs.color0_clear_word0;
+    if (rs.color0_format == 0xAu) {  // COLOR_8_8_8_8
+        const float b0 = (w0 & 0xFFu) / 255.0f, b1 = ((w0 >> 8) & 0xFFu) / 255.0f,
+                    b2 = ((w0 >> 16) & 0xFFu) / 255.0f, b3 = ((w0 >> 24) & 0xFFu) / 255.0f;
+        float r, g, b, a = b3;                     // alpha is byte 3 for both swaps
+        if (rs.color0_comp_swap == 1u) { r = b2; g = b1; b = b0; }   // ALT: B8G8R8A8 (byte0=B)
+        else                            { r = b0; g = b1; b = b2; }  // STD: R8G8B8A8 (byte0=R)
+        const bool is_srgb = (rs.color0_number_type == 6u);
+        out[0] = is_srgb ? srgb_to_linear(r) : r;
+        out[1] = is_srgb ? srgb_to_linear(g) : g;
+        out[2] = is_srgb ? srgb_to_linear(b) : b;
+        out[3] = a;                                // alpha is always linear
+        return true;
+    }
+    return false;  // unmapped format -> caller uses opaque-black fallback
+}
 }  // namespace
 
 RenderState extract_render_state(const GpuState& st) {
@@ -45,6 +77,12 @@ RenderState extract_render_state(const GpuState& st) {
     rs.color0_format           = PM4_FIELD(cinfo, CB_COLOR0_INFO, FORMAT);
     rs.color0_number_type      = PM4_FIELD(cinfo, CB_COLOR0_INFO, NUMBER_TYPE);
     rs.color0_comp_swap        = PM4_FIELD(cinfo, CB_COLOR0_INFO, COMP_SWAP);
+
+    // CB fast-clear color (CB_COLOR0_CLEAR_WORD0/1). Present only when the game programs a fast-clear
+    // for MRT 0; the words carry the clear value in the target's pixel format (decoded in resolve).
+    rs.color0_has_clear   = st.cx.count(P::CB_COLOR0_CLEAR_WORD0) || st.cx.count(P::CB_COLOR0_CLEAR_WORD1);
+    rs.color0_clear_word0 = st.cx.count(P::CB_COLOR0_CLEAR_WORD0) ? rd(st.cx, P::CB_COLOR0_CLEAR_WORD0) : 0u;
+    rs.color0_clear_word1 = st.cx.count(P::CB_COLOR0_CLEAR_WORD1) ? rd(st.cx, P::CB_COLOR0_CLEAR_WORD1) : 0u;
 
     // Primitive topology. VGT_PRIMITIVE_TYPE (0x242) is a UCONFIG register in RDNA2 (the game sets it via
     // a Uc-class SetRegsIndirect / CreatePrimState's uc[2]), NOT a context register — read it from st.uc.
@@ -98,6 +136,11 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
     ps.topology      = static_cast<uint32_t>(vk_topology(rs.prim_type));
     ps.color0_format = static_cast<uint32_t>(
         vk_color_format(rs.color0_format, rs.color0_number_type, rs.color0_comp_swap));
+
+    // Fast-clear color: decode the CB_COLOR0_CLEAR_WORD when the game programmed one (#309). A
+    // decode miss (no fast-clear, or an unmapped format) leaves has_clear_color false and the
+    // default opaque-black clear_color, which the backend uses instead of the old debug blue.
+    ps.has_clear_color = decode_clear_color(rs, ps.clear_color);
 
     ps.depth_test_enable  = rs.z_enable;
     ps.depth_write_enable = rs.z_write_enable;
