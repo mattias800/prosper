@@ -178,7 +178,18 @@ HLE(h_atol)     { return (uint64_t)(int64_t)atol(CS(a0)); }
 // guest RNG routed through libc (procedural effects, shuffles, jitter, retry backoff) was degenerate.
 HLE(h_rand)     { return (uint64_t)(int64_t)rand(); }
 HLE(h_srand)    { srand((unsigned)a0); return 0; }
-HLE(h_rand_r)   { return (uint64_t)(int64_t)rand_r((unsigned*)P(a0)); }
+// rand_r is POSIX and absent on some MinGW toolchains (broke the Windows build, #488). Use the portable
+// glibc reference implementation so the reentrant PRNG is byte-identical to glibc's rand_r everywhere.
+static int prosper_rand_r(unsigned* seed) {
+    unsigned next = *seed;
+    int result;
+    next *= 1103515245u; next += 12345u; result  = (int)((next >> 16) & 0x7ffu);
+    next *= 1103515245u; next += 12345u; result <<= 10; result ^= (int)((next >> 16) & 0x3ffu);
+    next *= 1103515245u; next += 12345u; result <<= 10; result ^= (int)((next >> 16) & 0x3ffu);
+    *seed = next;
+    return result;
+}
+HLE(h_rand_r)   { return (uint64_t)(int64_t)prosper_rand_r((unsigned*)P(a0)); }
 // qsort: the comparator is a guest fn ptr; SysV ABI matches host, callable directly (cf. h_bsearch).
 HLE(h_qsort)    { qsort(P(a0), a1, a2, (int (*)(const void*, const void*))(uintptr_t)a3); return 0; }
 HLE(h_strdup)   { const char* s = CS(a0); size_t n = strlen(s) + 1; void* p = malloc(n); if (p) memcpy(p, s, n); return (uint64_t)(uintptr_t)p; }
