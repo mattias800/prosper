@@ -1,70 +1,84 @@
 # prosper
 
 **A user-space PlayStation 5 → PC compatibility layer.** Think *Proton/Wine, but for PS5*: prosper
-runs PS5 (Prospero) game binaries on Linux (primary) and Windows (bonus) by translating the
-console's OS, ABI, and (eventually) GPU calls to the host — **not** by emulating a CPU.
+runs PS5 (Prospero) game binaries on Linux (primary) and Windows (secondary) by reimplementing the
+console's OS, ABI, and GPU stack on the host — **not** by emulating a CPU.
 
-> ⚠️ **Early, experimental research project.** It does not run games to playable state yet. See
-> [Status](#status) for exactly how far it gets today.
+> ⚠️ **Experimental research project.** It is not a playable game runner yet, but it now boots real
+> retail titles deep into their engine's frame loop and **renders real frames** to a live Vulkan
+> backend. See [Status](#status) for exactly how far it gets today.
 
 ## Why no CPU emulation?
 
 The PS5 is an x86-64 (AMD Zen 2) machine, so guest game code runs **natively** on any modern PC.
-prosper is therefore shaped like Wine, not like an emulator: the hard work is
+prosper is therefore shaped like Wine, not like an emulator. The engineering is:
 
 - **Loading** Sony's `SELF`/`ELF` module format and linking multiple modules into one address space,
-- **HLE** (high-level emulation) of the PS5 system libraries (`libkernel`, `libc`, `libSceGnmDriver`/
-  `libSceAgc`, `libScePad`, …) by thunking to the host's real facilities (libc, pthreads, `mmap`,
-  `futex`, …),
+- **HLE** (high-level emulation) of the PS5 system libraries (`libkernel`, `libc`, `libSceAgc`,
+  `libScePad`, `libSceSaveData`, `libSceNp`, the dialog/IME libraries, …) by thunking to the host's
+  real facilities (libc, pthreads, `mmap`, `futex`, Vulkan, …),
 - **ABI translation** where the guest's FreeBSD/SysV conventions differ from the host, and
-- **Graphics translation** (the eventual end goal): PS5 **AGC** → Vulkan, including an RDNA2 shader
-  recompiler. This is the largest remaining piece and is now the **active frontier** (see Status).
+- **Graphics translation:** PS5 **AGC** command streams → Vulkan, including a from-scratch
+  **RDNA2 → SPIR-V shader recompiler** and the RDNA2 texture-tiling / block-compression decoders.
 
 Because the PS5 and Steam Deck / AMD Linux machines share the same RDNA2 GPU family, Linux is the
 natural primary target and the long-term dream is running on that hardware.
 
 ## Status
 
-The current bring-up target is a real Unity/IL2CPP title. Starting from its (user-supplied,
-**unencrypted-segment**) module set, prosper today:
+prosper boots **multiple real retail titles** across two engine families — Unity 2022 / IL2CPP
+(*The Messenger*, `PPSA24651`, the primary target) and Unreal Engine (`PPSA17942`) — from a
+user-supplied, **unencrypted-segment** dump. For the primary title it now boots *through* the engine
+and draws real geometry.
 
-**Boot & runtime (host-side OS/ABI/HLE):**
-- ✅ Parses `SELF`/`ELF`, builds a relocatable image, resolves Sony **NID**-hashed imports.
-- ✅ Links the game's modules together with a global export table + per-import HLE stubs.
-- ✅ Runs the Sony CRT, C++ global constructors, and `il2cpp` startup.
-- ✅ Implements enough `libkernel`/`libc` for real memory management (virtual + direct memory),
-  threads (pthreads, TLS, mutexes/conds, event flags, semaphores, `sync_on_address` futex),
-  time, file I/O (with `/app0` path translation), and locale/ctype.
-- ✅ Loads the game's C# metadata, spins up the full IL2CPP GC + worker thread pool, and boots
-  **through** IL2CPP init into Unity's `GfxDevice` bring-up (it loads *unity default resources*).
+**Boot & runtime (host-side OS / ABI / HLE):**
+- ✅ Parses `SELF`/`ELF`, builds a relocatable image, resolves Sony **NID**-hashed imports, links the
+  game's modules with a global export table + per-import HLE stubs, and runs the Sony CRT + C++ global
+  constructors.
+- ✅ Enough `libkernel`/`libc` for real memory management (virtual + direct + flexible memory, guard
+  pages), threads (pthreads, TLS, mutexes/conds, event flags, semaphores, `sync_on_address` futex),
+  scheduling, time, AIO + positioned file I/O (with `/app0` path translation), and locale/ctype.
+- ✅ Loads the C# metadata, spins up the full **IL2CPP GC + worker thread pool**, and boots through
+  IL2CPP init and Unity's `GfxDevice` bring-up into the running frame loop.
+- ✅ System services the game gates on: user/pad service, SaveData (real per-slot memory blocks),
+  AvPlayer / AJM lifecycle, common dialogs + IME (with an optional real SDL3 dialog frontend), NP /
+  online (honest signed-out), system-parameter (language) — implemented as faithful behaviors, not
+  success-returning stubs.
 
-**Graphics (AGC → Vulkan) — the active frontier:**
-- ✅ **AGC command frontend complete:** `sceAgcCreateShader` (relocates the embedded RDNA2 shader
-  ELFs, registers all 36 game shaders) and `sceAgcDriverSubmitDcb`. The boot clears the entire AGC
-  path with **zero unimplemented `libSceAgc` calls remaining**; a real submitted command buffer is
-  decoded (`Dcb` → PM4 packets) and folded into a GPU register-state (regression-locked by a test).
-- ✅ **RDNA2 → SPIR-V shader recompiler** (we recompile the GPU ISA, not emulate it). ~52 ALU ops
-  (scalar/vector/float/int/bitwise/convert/compare/select/bitfield/pack) **plus divergent control
-  flow** — EXEC-mask per-lane predication, `s_*saveexec`/`s_mov_b64 exec` save/restore, and forward
-  `s_cbranch_execz`-style branches (the real if-then idiom) — all proven by execution-differential
-  tests on real Vulkan. A coverage tool (`shader_histo`) reports **67% instruction coverage over the
-  game's 41 real embedded shaders**; the remaining wall is `SMEM` constant/descriptor loads (needs
-  the resource-binding model).
-- ✅ **GpuState → frame spine:** register-state → `render_state`/`vk_translate` →
-  `resolve_pipeline_state` → a real `VkGraphicsPipeline`, with topology/blend/depth/color-write-mask
-  all driven from the decoded registers and **verified by pixel readback**. Both recompiled vertex
-  and fragment shaders render offscreen.
-- 🚧 **Root cause of the current boot fault (found, fix in progress):** Unity's GPU-resource
-  *residency pass is completion-event-driven* — it runs when the game drains a GPU-completion event
-  from the AGC equeue. Our headless equeue never delivers one, so the pass never runs and pipeline
-  objects stay unprocessed (a null companion the engine later dereferences). The fix is to **deliver
-  a real completion event on submit/flip so the game's own pass runs** — *not* to fabricate residency.
-  Once it fires, real draws flow into the `GpuState → frame` spine above.
+**Graphics (AGC → Vulkan):**
+- ✅ **AGC command frontend:** `sceAgcCreateShader` (relocates the embedded RDNA2 shader ELFs) and the
+  submit path; a real submitted `Dcb` is decoded (→ PM4 packets) and folded into a GPU register-state,
+  with GPU-completion (EOP) events and DMA/fence writes delivered on the guest's own timeline
+  (regression-locked by tests).
+- ✅ **RDNA2 → SPIR-V shader recompiler** (we recompile the GPU ISA, not emulate it): full scalar/
+  vector ALU (float/int/bitwise/convert/compare/select/bitfield/pack), `SCC`, **divergent control
+  flow** (EXEC-mask predication, `saveexec`/restore, `execz` if-then and loop exits), `SMEM`
+  constant/descriptor loads, `MUBUF` vertex-fetch + load/store, `MIMG` `image_sample`/`_l`/`_lz`/
+  `image_load`, `LDS` + barriers, `EXP` render-target/position/param exports, and `VINTRP`
+  interpolation. Descriptors that spill into the **Extended User Data (EUD)** area are resolved. Every
+  emitted shader is strictly `spirv-val`-gated.
+- ✅ **Texture decode:** GFX10 `SW_4KB_S` / `SW_64KB_S` de-swizzle for all element sizes (1/2/4/8/16 B,
+  derived from the authoritative addrlib table) plus BC1–BC7 and BC6H block decompression, honoring
+  the T# format, `DST_SEL` channel swizzle, and the paired S# sampler (filter / wrap / anisotropy /
+  LOD / border).
+- ✅ **Frame spine → live renderer:** decoded register-state → `render_state` / `vk_translate` →
+  `resolve_pipeline_state` → real `VkGraphicsPipeline`s, with topology, blend (incl. separate-alpha),
+  depth, stencil, per-MRT color-write-mask, the game's real fast-clear color, and a render-to-texture
+  cache for multi-pass composites — all driven from the decoded registers and pixel-verified.
+- ✅ **The Messenger renders:** it plays its intro **cutscene** (dozens of distinct animating frames),
+  draws its **title screen with readable text**, accepts **gamepad input**, and progresses through
+  New-Game into **gameplay level loading**. Frames are asserted by a golden-image regression guard, not
+  eyeballed.
 
-Development is **agentic-first**: correctness is verified programmatically — 31 self-checking tests
+**Frontend:** `prosper-app` is a windowed player (SDL3 window + Vulkan present + audio sink +
+evdev/SDL3 controllers + real message/error/IME dialogs), sharing the same boot + render core as the
+headless `boot_trace`.
+
+Development is **agentic-first**: correctness is verified programmatically — **84 self-checking tests**
 under `ctest` (including a headless Vulkan/llvmpipe harness that runs recompiled shaders and asserts
-numeric/pixel results), cross-platform CI (Linux + Windows/MinGW), structured logs, and purpose-built
-tooling (`boot_trace`, `shader_histo` coverage, `PROSPER_PEEK`/`PROSPER_PIPETRACE`) — never by hand.
+numeric/pixel results, and per-opcode round-trip disassembly checks), a **golden-image snapshot guard**
+that boots a real title and pixel/content-asserts an exact frame, cross-platform CI (Linux +
+Windows/MinGW), structured logs, and purpose-built tracing tooling — never by hand.
 
 ## Legal / ethical
 
@@ -72,21 +86,25 @@ tooling (`boot_trace`, `shader_histo` coverage, `PROSPER_PEEK`/`PROSPER_PIPETRAC
   will be. You must supply your own legally-obtained dump.
 - prosper only works with **unencrypted** module segments; it contains **no** console decryption
   keys and performs no circumvention of Sony's cryptography.
-- This is an independent interoperability / research project, not affiliated with or endorsed by
-  Sony Interactive Entertainment.
+- Sony's library interfaces are reimplemented from published symbol/NID information, clean-room style,
+  the way Wine reimplements Win32.
+- This is an independent interoperability / preservation research project, not affiliated with or
+  endorsed by Sony Interactive Entertainment.
 
 ## Building (Linux)
 
-Requires a C++20 compiler, CMake, and Ninja.
+Requires a C++20 compiler, CMake, and Ninja. A Vulkan loader is needed for the graphics tests
+(the CI/headless path uses the `llvmpipe` software ICD).
 
 ```sh
 cd prosper
 cmake -G Ninja -B build-linux
 cmake --build build-linux
-ctest --test-dir build-linux
+ctest --test-dir build-linux          # 84 self-checking tests
 ```
 
-A static-linked Windows (mingw) build works for the host-agnostic parts as well.
+Add `-DPROSPER_APP=ON` to also build the windowed `prosper-app` frontend (fetches SDL3). A
+static-linked Windows (MinGW) build covers the host-agnostic parts as well.
 
 ## Repository layout
 
@@ -96,11 +114,12 @@ prosper/
   src/loader/     multi-module linker + global export table
   src/hle/        HLE of Sony libraries (libc, libkernel, AGC/graphics, services), NID hashing
   src/host/       host execution: image mapping, stubs, fault handling (Linux)
-  src/gpu/        AGC→Vulkan: PM4 decode, command processor, render state,
-                  vk_translate, and the RDNA2→SPIR-V shader recompiler
-  tools/          debug tooling (boot_trace, self_dump, shader_histo, imgdump, …)
+  src/gpu/        AGC→Vulkan: PM4 decode, command processor, render state, vk_translate,
+                  texture tiling + BC decode, and the RDNA2→SPIR-V shader recompiler
+  frontends/      shared boot+render core, the windowed prosper-app, SDL3 audio/dialog, controllers
+  tools/          boot_trace, self_dump, shader_histo, snapshot (golden-image guard), spv_validate, …
   tests/          unit + boot + Vulkan-execution tests (run under ctest)
-  docs/           ROADMAP.md, FINDINGS.md, GRAPHICS.md, VERIFICATION.md
+  docs/           ARCHITECTURE, ROADMAP, GRAPHICS, RENDER_LOOP, VERIFICATION, and per-frontier logs
 ```
 
 ## License
