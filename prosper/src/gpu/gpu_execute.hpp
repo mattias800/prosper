@@ -183,6 +183,9 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             if (FILE* f = fopen(fn, "wb")) { fwrite(vs.data(), 4, vs.size(), f); fclose(f); }
             snprintf(fn, sizeof fn, "%s/vs_%d_%llx.bin", dd, nd, (unsigned long long)rs.es_addr);
             if (FILE* f = fopen(fn, "wb")) { fwrite((const void*)(uintptr_t)rs.es_addr, 1, 4096, f); fclose(f); }
+            // Also dump the paired PS raw RDNA2 (the recompile-guard fixture needs both stages, #228).
+            snprintf(fn, sizeof fn, "%s/ps_%d_%llx.bin", dd, nd, (unsigned long long)rs.ps_addr);
+            if (FILE* f = fopen(fn, "wb")) { fwrite((const void*)(uintptr_t)rs.ps_addr, 1, 4096, f); fclose(f); }
             nd++;
         }
     }
