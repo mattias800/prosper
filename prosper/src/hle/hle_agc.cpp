@@ -24,6 +24,7 @@
 #include <mutex>
 #include <atomic>
 #include <chrono>
+#include <thread>
 
 #ifndef _WIN32
 // #312 label-slot write watch (exec_image_linux.cpp). Weak: tools that link the AGC HLE without

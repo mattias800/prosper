@@ -437,8 +437,13 @@ struct DeferredStream { std::vector<DeferItem> items; size_t next = 0; };
 std::vector<DeferredStream> g_deferred;   // FIFO; guarded by the caller's submit mutex
 bool     g_fold_deferring = false;        // current fold hit an unsatisfied wait
 uint64_t g_defer_streams = 0, g_defer_timeouts = 0;
-constexpr uint64_t kDeferTimeoutMs = 500;
+size_t   g_defer_items = 0;               // total queued items across streams (memory guard)
+// 50 ms: real producer fences satisfy the barrier within ~1 ms via the pend queue; anything
+// pending longer is a dependency we don't model — degrade fast instead of stalling the stream
+// half a second (the 500 ms value made a WAIT_DEFER boot crawl at 2 submits/s).
+constexpr uint64_t kDeferTimeoutMs = 50;
 constexpr size_t   kDeferMaxStreams = 256;   // runaway guard: force-flush oldest beyond this
+constexpr size_t   kDeferMaxItems = 200000;  // memory guard (#312 WAIT_DEFER OOM): force-flush
 
 void defer_push(const Pm4Command& c) {
     DeferItem it; it.cmd = c;
@@ -447,6 +452,7 @@ void defer_push(const Pm4Command& c) {
         it.cmd.wd_data = it.wd_copy.data();
     }
     g_deferred.back().items.push_back(std::move(it));
+    g_defer_items++;
 }
 void apply_effect(const Pm4Command& c) {
     using K = Pm4Command::Kind;
@@ -473,7 +479,7 @@ int flush_deferred_streams() {
     while (!g_deferred.empty()) {
         DeferredStream& s = g_deferred.front();
         bool blocked = false;
-        bool force = g_deferred.size() > kDeferMaxStreams;
+        bool force = g_deferred.size() > kDeferMaxStreams || g_defer_items > kDeferMaxItems;
         while (s.next < s.items.size()) {
             DeferItem& it = s.items[s.next];
             if (it.cmd.kind == Pm4Command::Kind::WaitRegMem) {
@@ -494,6 +500,7 @@ int flush_deferred_streams() {
             s.next++;
         }
         if (blocked) break;
+        g_defer_items -= s.items.size() < g_defer_items ? s.items.size() : g_defer_items;
         g_deferred.erase(g_deferred.begin());
         completed++;
     }
