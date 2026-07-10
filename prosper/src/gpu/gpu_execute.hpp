@@ -93,6 +93,12 @@ std::vector<DynFetch> resolve_dynamic_fetch(const uint32_t* code, size_t dwords,
                                             uint32_t user_sgpr_base,
                                             std::vector<SrtUse>* srt_uses = nullptr);
 
+// PROSPER_DYNTRACE_FAIL support (gpu_executor.cpp): while true, resolve_dynamic_fetch traces its
+// walk and build_stage_table dumps the user-data SGPR blocks. realize_draw_item sets it around a
+// replay of a FAILED vertex-stage resource build, so the diagnostic captures exactly the failing
+// draw without needing the shader's address up front (the UI draws it targets are rare/phase-bound).
+extern bool g_dyntrace_force;
+
 // Assign each resource in `t` a descriptor binding from `first`: constant/vertex buffers first, then
 // textures / storage images — never on binding 2 or 3 (the recompiler's two hardwired cbufs) so a
 // texture-first shader can't collide two descriptor types at one binding (#157). Exposed for testing.
@@ -159,6 +165,19 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         }
     }
     if (vs.empty() || fs.empty()) {
+        // PROSPER_DYNTRACE_FAIL=1: replay the FAILED vertex stage's resource build with the
+        // dynamic-fetch walk trace + user-data block dump forced on (once per distinct VS), so the
+        // failing draw's exact seeding/s_load chain is captured without knowing its address up front.
+        if (vs.empty() && getenv("PROSPER_DYNTRACE_FAIL")) {
+            static std::set<uint64_t> traced;
+            if (traced.insert(rs.es_addr).second) {
+                fprintf(stderr, "[dynfail] replaying VS 0x%llx resource build with trace:\n",
+                        (unsigned long long)rs.es_addr);
+                g_dyntrace_force = true;
+                (void)build_stage_table(ds, rs.es_addr, false);
+                g_dyntrace_force = false;
+            }
+        }
         if (log) {
             fprintf(stderr, "[exec] skip draw: recompile failed (vs=%zu fs=%zu; es=0x%llx ps=0x%llx)\n",
                     vs.size(), fs.size(), (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr);

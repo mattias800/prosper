@@ -40,6 +40,12 @@ void read_user_sgprs(const std::unordered_map<uint32_t, uint32_t>& sh, uint32_t 
 } // namespace (guest_readable below has external linkage — declared in gpu_execute.hpp, shared with
   // the HLE diagnostic probes that chase raw guest pointers)
 
+// PROSPER_DYNTRACE_FAIL support: while true, resolve_dynamic_fetch traces its walk and
+// build_stage_table dumps the user-data blocks, regardless of the PROSPER_DYNTRACE/RESDUMP
+// envs. Set (and cleared) by realize_draw_item's failure replay — the submit path is serialized
+// by the HLE submit mutex, so a plain global is safe there.
+bool g_dyntrace_force = false;
+
 // Readability probe (guest memory is 1:1-mapped, but a mis-decoded address could be unmapped),
 // so guarded derefs on the render/submit thread don't risk a SIGSEGV. NOTE: /dev/null does NOT
 // work for this — the kernel's null_write returns count without ever touching the source buffer,
@@ -96,7 +102,14 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
 
-    const bool trc = getenv("PROSPER_DYNTRACE") != nullptr;
+    // PROSPER_DYNTRACE traces the whole const-fold walk; PROSPER_DYNTRACE_ADDR=<hex code addr>
+    // narrows it to ONE shader (a full run otherwise traces every draw's walk — unusable volume).
+    // g_dyntrace_force: set by the PROSPER_DYNTRACE_FAIL failure-replay path (gpu_execute.hpp) so
+    // the walk of a shader that just FAILED to recompile is traced without knowing its address.
+    bool trc = g_dyntrace_force || getenv("PROSPER_DYNTRACE") != nullptr;
+    if (trc && !g_dyntrace_force)
+        if (const char* fa = getenv("PROSPER_DYNTRACE_ADDR"))
+            trc = strtoull(fa, nullptr, 16) == (uint64_t)(uintptr_t)code;
     std::unordered_map<int, uint32_t> val;                 // known concrete SGPR values (by SHADER SGPR #)
     std::unordered_map<int, std::array<uint32_t, 4>> descr; // SGPR -> the 4-dword V# it holds (load-time snapshot)
     // Descriptor-TABLE provenance (#294): for each snapshotted 4/8-dword s_load, the load's IMMEDIATE
@@ -398,7 +411,12 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
 
     // PROSPER_RESDUMP: raw dump of the user-data struct + SGPR block per base, so the EUD layout
     // (which sharps have offset_dw>=16, and where the EUD pointer sits) can be read empirically.
-    if (getenv("PROSPER_RESDUMP")) {
+    bool resdump = getenv("PROSPER_RESDUMP") != nullptr;
+    if (resdump)   // PROSPER_RESDUMP_ADDR=<hex code addr>: narrow the dump to one shader
+        if (const char* fa = getenv("PROSPER_RESDUMP_ADDR"))
+            resdump = strtoull(fa, nullptr, 16) == code_addr;
+    if (g_dyntrace_force) resdump = true;   // failure replay: always dump the failing stage's blocks
+    if (resdump) {
         const AgcShaderUserData* ud = hdr->user_data;
         fprintf(stderr, "[resdump] %s code=0x%llx type=%u ud=%p\n", is_ps ? "PS" : "VS",
                 (unsigned long long)code_addr, hdr->type, (const void*)ud);
