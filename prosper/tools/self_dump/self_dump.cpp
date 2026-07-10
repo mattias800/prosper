@@ -150,8 +150,13 @@ static const char* dtag_name(int64_t t) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 2) { fprintf(stderr, "usage: %s <file> [--symbols]\n", argv[0]); return 1; }
-    bool dump_syms = (argc >= 3 && strcmp(argv[2], "--symbols") == 0);
+    if (argc < 2) { fprintf(stderr, "usage: %s <file> [--symbols] [--extract <out.elf>]\n", argv[0]); return 1; }
+    bool dump_syms = false;
+    std::string extract_path;
+    for (int i = 2; i < argc; i++) {
+        if (!strcmp(argv[i], "--symbols")) dump_syms = true;
+        else if (!strcmp(argv[i], "--extract") && i + 1 < argc) extract_path = argv[++i];
+    }
     auto b = read_file(argv[1]);
 
     // -- SELF header --
@@ -229,6 +234,51 @@ int main(int argc, char** argv) {
     std::map<uint64_t, SelfSegment> data_seg_by_id;   // phdr index -> data segment
     if (is_self)
         for (auto& s : segs) if (s.flags & 0x800) data_seg_by_id[s.flags >> 20] = s;
+
+    // --extract <out.elf>: reconstruct a plain, loadable ELF so external tools that only understand a
+    // raw ELF (e.g. Il2CppDumper for a Unity/IL2CPP title's managed symbols) can read the module. We copy
+    // the inner ELF header + program headers verbatim, then place each LOAD segment's real bytes (which
+    // live in the matching SELF data segment) at its p_offset. The stripped section headers are zeroed
+    // (e_shoff/e_shnum/e_shstrndx) so tools don't chase a bogus e_shoff past EOF; e_type is normalized to
+    // ET_DYN. Only valid for UNENCRYPTED, UNCOMPRESSED segments (this repo's dumps) — asserted below.
+    if (!extract_path.empty()) {
+        for (auto& s : segs)
+            if ((s.flags & 0x800) && (((s.flags >> 3) & 1) || ((s.flags >> 1) & 1))) {
+                fprintf(stderr, "[extract] refusing: segment is compressed/encrypted (flags=0x%llx)\n",
+                        (unsigned long long)s.flags);
+                return 1;
+            }
+        size_t hdr_len = (size_t)eh.e_phoff + (size_t)eh.e_phnum * sizeof(Elf64_Phdr);
+        size_t out_size = hdr_len;
+        for (int i = 0; i < (int)phdrs.size(); i++) {
+            auto& p = phdrs[i];
+            if (data_seg_by_id.count(i) && p.p_filesz)
+                out_size = std::max(out_size, (size_t)(p.p_offset + p.p_filesz));
+        }
+        std::vector<uint8_t> out(out_size, 0);
+        memcpy(out.data(), b.data() + elf_base, std::min(hdr_len, b.size() - elf_base));  // ehdr + phdrs
+        // zero stripped section-header fields; normalize e_type to ET_DYN (3)
+        *(uint64_t*)(out.data() + 0x28) = 0;   // e_shoff
+        *(uint16_t*)(out.data() + 0x3c) = 0;   // e_shnum
+        *(uint16_t*)(out.data() + 0x3e) = 0;   // e_shstrndx
+        *(uint16_t*)(out.data() + 0x10) = 3;   // e_type = ET_DYN
+        int placed = 0;
+        for (int i = 0; i < (int)phdrs.size(); i++) {
+            auto& p = phdrs[i];
+            if (!data_seg_by_id.count(i) || !p.p_filesz) continue;
+            auto& s = data_seg_by_id[i];
+            size_t n = std::min<uint64_t>(s.file_size, p.p_filesz);
+            if (s.file_offset + n <= b.size() && p.p_offset + n <= out.size()) {
+                memcpy(out.data() + p.p_offset, b.data() + s.file_offset, n);
+                placed++;
+            }
+        }
+        FILE* of = fopen(extract_path.c_str(), "wb");
+        if (!of) { fprintf(stderr, "[extract] cannot write %s\n", extract_path.c_str()); return 1; }
+        fwrite(out.data(), 1, out.size(), of); fclose(of);
+        printf("[extract] wrote %s: %zu bytes, %d LOAD segments placed (phnum=%u)\n",
+               extract_path.c_str(), out.size(), placed, eh.e_phnum);
+    }
     for (int i = 0; i < (int)phdrs.size(); i++) {
         auto& p = phdrs[i];
         if (p.p_filesz == 0) continue;
