@@ -325,9 +325,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     // Skipped under REFVS — the reference VS is a 3-vertex non-indexed fullscreen triangle.
                     if (!refvs) bd.indices = it.indices;
                     if (getenv("PROSPER_GFXLOG")) fprintf(stderr,
-                        "[render] item %zu: %zu resources vcount=%u nidx=%zu topo=%u mask=0x%x blend=%d\n",
+                        "[render] item %zu: %zu resources vcount=%u nidx=%zu topo=%u mask=0x%x blend=%d src=%u dst=%u op=%u\n",
                         bds.size(), bd.R.size(), bd.vcount, bd.indices.size(), it.ps.topology,
-                        it.ps.color_write_mask, (int)it.ps.blend_enable);
+                        it.ps.color_write_mask, (int)it.ps.blend_enable,
+                        it.ps.src_color_blend_factor, it.ps.dst_color_blend_factor, it.ps.color_blend_op);
                     bds.push_back(std::move(bd));
                 }
                 return bds;
