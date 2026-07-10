@@ -10,6 +10,7 @@
 #include <cstdarg>
 #include <cctype>
 #include <cmath>
+#include <cwchar>
 #include <cerrno>
 #include <atomic>
 #include <mutex>
@@ -148,6 +149,25 @@ HLE(h_bcmp)    { return (uint64_t)(int64_t)memcmp(CP(a0), CP(a1), a2); }   // bc
 HLE(h_bsearch) { // (key, base, nmemb, size, compar) — compar is a guest fn ptr; SysV ABI matches host
     return (uint64_t)(uintptr_t)bsearch(CP(a0), CP(a1), a2, a3,
                                         (int (*)(const void*, const void*))(uintptr_t)a4); }
+// --- integer conversion, sort, tokenize, wide/scan. All confirmed target imports that were MISSING
+// (routed to the return-0 stub) -> returned 0/garbage and left endptr/output args unwritten on parsing
+// paths (localization, save/config, gameplay data). Plain host thunks; guest pointers are identity-mapped
+// so endptr and buffers pass through directly. (strtod/strtof return in XMM -> native thunks, below.) ---
+HLE(h_strtol)   { return (uint64_t)(int64_t)strtol(CS(a0), (char**)P(a1), (int)a2); }
+HLE(h_strtoll)  { return (uint64_t)(int64_t)strtoll(CS(a0), (char**)P(a1), (int)a2); }
+HLE(h_strtoul)  { return (uint64_t)strtoul(CS(a0), (char**)P(a1), (int)a2); }
+HLE(h_strtoull) { return (uint64_t)strtoull(CS(a0), (char**)P(a1), (int)a2); }
+HLE(h_atoi)     { return (uint64_t)(int64_t)atoi(CS(a0)); }
+HLE(h_atol)     { return (uint64_t)(int64_t)atol(CS(a0)); }
+// qsort: the comparator is a guest fn ptr; SysV ABI matches host, callable directly (cf. h_bsearch).
+HLE(h_qsort)    { qsort(P(a0), a1, a2, (int (*)(const void*, const void*))(uintptr_t)a3); return 0; }
+HLE(h_strdup)   { const char* s = CS(a0); size_t n = strlen(s) + 1; void* p = malloc(n); if (p) memcpy(p, s, n); return (uint64_t)(uintptr_t)p; }
+HLE(h_strtok)   { return (uint64_t)(uintptr_t)strtok((char*)P(a0), CS(a1)); }
+HLE(h_strspn)   { return (uint64_t)strspn(CS(a0), CS(a1)); }
+HLE(h_strcspn)  { return (uint64_t)strcspn(CS(a0), CS(a1)); }
+HLE(h_strpbrk)  { return (uint64_t)(uintptr_t)strpbrk(CS(a0), CS(a1)); }
+HLE(h_wcslen)   { return (uint64_t)wcslen((const wchar_t*)P(a0)); }   // host wchar_t is 32-bit == PS5/FreeBSD ABI
+HLE(h_vsscanf)  { va_list ap; if (a2) memcpy(&ap, P(a2), sizeof(va_list)); return (uint64_t)(int64_t)vsscanf(CS(a0), CS(a1), ap); }
 // _init_env / malloc_stats_fast: legitimately no-ops here (no PS5 process env vars; no malloc stats
 // sink). Registered so they resolve as real, intentional no-ops rather than logged "unimplemented".
 HLE(h_init_env)         { return 0; }
@@ -196,6 +216,11 @@ static double m_cosh(double x){return cosh(x);}   static float m_coshf(float x){
 static double m_tanh(double x){return tanh(x);}   static float m_tanhf(float x){return tanhf(x);}
 static double m_log1p(double x){return log1p(x);} static float m_log1pf(float x){return log1pf(x);}
 static double m_expm1(double x){return expm1(x);} static float m_expm1f(float x){return expm1f(x);}
+// strtod/strtof return a double/float in XMM0 (which the return-0 stub never set -> garbage float for
+// every text-parsed number). Native-signature thunks land the result in the right register; endptr is a
+// guest pointer, passed through. (Also fixes float.Parse / Atof / JSON numeric fields across all titles.)
+static double m_strtod(const char* s, char** e){ return strtod(s, e); }
+static float  m_strtof(const char* s, char** e){ return strtof(s, e); }
 
 HLE(h_vsnprintf) { va_list ap; if (a3) memcpy(&ap, P(a3), sizeof(va_list)); return (uint64_t)(int64_t)vsnprintf((char*)P(a0), (size_t)a1, (const char*)P(a2), ap); }
 HLE(h_vsprintf)  { va_list ap; if (a2) memcpy(&ap, P(a2), sizeof(va_list)); return (uint64_t)(int64_t)vsprintf((char*)P(a0), (const char*)P(a1), ap); }
@@ -220,6 +245,14 @@ static uint64_t h_sprintf(void* buf, const char* fmt, ...) {
 }
 static uint64_t h_printf(const char* fmt, ...) {
     va_list ap; va_start(ap, fmt); int r = vprintf(fmt, ap); va_end(ap);
+    return (uint64_t)(int64_t)r;
+}
+// sscanf: a REAL variadic host thunk (like the *printf family) — the import stub tail-jumps with the
+// guest's full SysV frame so va_start captures every arg. Output pointer args are guest pointers
+// (identity-mapped), so vsscanf writes through them directly. MISSING before -> returned 0 leaving ALL
+// output args uninitialized (the guest consumed uninit memory as parsed values).
+static uint64_t h_sscanf(const char* s, const char* fmt, ...) {
+    va_list ap; va_start(ap, fmt); int r = vsscanf(s, fmt, ap); va_end(ap);
     return (uint64_t)(int64_t)r;
 }
 HLE(h_puts)      { int r = fputs((const char*)P(a0), stdout); fputc('\n', stdout); return (uint64_t)(int64_t)r; }
@@ -396,7 +429,16 @@ void register_builtin_hle() {
     R("setjmp", prosper_setjmp);   R("_setjmp", prosper_setjmp);   R("sigsetjmp", prosper_setjmp);
     R("longjmp", prosper_longjmp); R("_longjmp", prosper_longjmp);  R("siglongjmp", prosper_longjmp);
     // byte ops / search / env
-    R("bcmp", h_bcmp);   R("bsearch", h_bsearch);
+    R("bcmp", h_bcmp);   R("bsearch", h_bsearch);   R("qsort", h_qsort);
+    // conversion / tokenize / wide / scan (were MISSING -> 0/garbage on parsing paths; confirmed imports)
+    R("strtol", h_strtol);   R("strtoll", h_strtoll);
+    R("strtoul", h_strtoul); R("strtoull", h_strtoull);
+    R("strtod", m_strtod);   R("strtof", m_strtof);
+    R("atoi", h_atoi);       R("atol", h_atol);
+    R("strdup", h_strdup);   R("strtok", h_strtok);
+    R("strspn", h_strspn);   R("strcspn", h_strcspn);   R("strpbrk", h_strpbrk);
+    R("wcslen", h_wcslen);
+    R("sscanf", h_sscanf);   R("vsscanf", h_vsscanf);
     R("_init_env", h_init_env);   R("malloc_stats_fast", h_malloc_stats_fast);
     R("__error", h_errno_location);  R("__errno_location", h_errno_location);  R("___errno", h_errno_location);
     // math (real host thunks; float args in XMM survive the tail-jump stub)
