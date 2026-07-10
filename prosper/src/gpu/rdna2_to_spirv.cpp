@@ -2366,12 +2366,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // instead of VCC — track it in sreg_bool so a later v_cndmask_b32_e64 / s_cselect can read it.
             // Otherwise it writes VCC; keep VCC's narrowed-state in sync (106/107 = VCC_LO/HI).
             if (ok) {
-                if (in.dst.kind == OperandKind::SGPR && in.dst.value <= 105) {
+                if (is_cmpx) {
+                    // v_cmpx writes EXEC ONLY on gfx10 (EXEC &= cmp) — it has NO VCC/SGPR destination.
+                    // The old shared handler fell into the `else` and set vcc = cmp for cmpx too,
+                    // clobbering a VCC value kept live ACROSS the cmpx, so a later v_cndmask/s_cbranch_vccz/
+                    // v_add_co_ci reading VCC got the compare mask instead of the real predicate (#464).
+                    rs.exec = b.land(rs.exec, cmp); rs.exec_narrowed = true;
+                } else if (in.dst.kind == OperandKind::SGPR && in.dst.value <= 105) {
                     rs.sreg_bool[in.dst.value] = cmp; rs.sreg_bool_narrowed[in.dst.value] = true;
                 } else {
                     vcc = cmp; rs.sreg_bool_narrowed[106] = true; rs.sreg_bool_narrowed[107] = true;
                 }
-                if (is_cmpx) { rs.exec = b.land(rs.exec, cmp); rs.exec_narrowed = true; }
             }
             return true;
         }

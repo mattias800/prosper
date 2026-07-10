@@ -1526,6 +1526,21 @@ int main() {
     }
     CHECK(gotT5c.size()==N && badT5c==0, "T5c: s_mul_hi_i32(-1,0x10000)=0xFFFFFFFF (signed high mul)");
 
+    // Kernel T5d (#464): v_cmpx must NOT clobber VCC (gfx10: cmpx writes EXEC only). Keep a VCC value
+    // live ACROSS a cmpx and read it via v_cndmask. v_cmp_lt_u32 vcc,v0,v0 = FALSE (a live predicate);
+    // v_cmpx_eq_u32 v0,v0 leaves EXEC on (v0==v0) and must PRESERVE vcc; v_cndmask v1,v0,v2,vcc then
+    // selects v0 (vcc FALSE) — the old code set vcc=cmpx result (TRUE) -> selected v2 = v0+5. Out = a0.
+    const uint32_t codeT5d[] = { 0x7d820100u, 0x7da40100u, 0x4a040085u, 0x02020500u, 0xBF810000u };
+    std::vector<uint32_t> spvT5d = recompile_valu(codeT5d, sizeof(codeT5d)/4, 1, 1);
+    CHECK(!spvT5d.empty(), "recompiled T5d (v_cmpx VCC preservation) -> SPIR-V");
+    std::vector<float> gotT5d = prosper::test::run_compute(spvT5d, inX, N, N);
+    uint32_t badT5d = 0;
+    for (uint32_t i = 0; i < N && gotT5d.size() == N; i++) {
+        uint32_t gb; std::memcpy(&gb, &gotT5d[i], 4);
+        if (gb != bits_of(inX[i])) badT5d++;
+    }
+    CHECK(gotT5d.size()==N && badT5d==0, "T5d: v_cmpx preserves VCC (cndmask reads the v_cmp result, not cmpx)");
+
     // Kernel T6: s_add_u32 carry chain -> s_addc_u32. s0=-1+2 (carry SCC=1); s1=0+0+SCC=1.
     // out bits = bits(a0) + 1.
     const uint32_t codeT6[] = { 0x800082c1u, 0x82018080u, 0x4a020001u, 0xBF810000u };
