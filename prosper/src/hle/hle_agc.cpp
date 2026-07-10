@@ -39,7 +39,8 @@ constexpr uint32_t R_DRAW_INDEX = 0x03, R_DRAW_INDEX_AUTO = 0x04, R_DRAW_RESET =
                    R_SH_REGS_INDIRECT = 0x11, R_CX_REGS_INDIRECT = 0x12, R_UC_REGS_INDIRECT = 0x13,
                    R_ACQUIRE_MEM = 0x14, R_WRITE_DATA = 0x15, R_WAIT_MEM_64 = 0x16, R_FLIP = 0x17,
                    R_RELEASE_MEM = 0x18, R_DMA_DATA = 0x19, R_DISPATCH_DIRECT = 0x1a,
-                   R_INDEX_BASE = 0x1b, R_INDEX_COUNT = 0x1c, R_DRAW_INDEX_OFFSET = 0x1d;
+                   R_INDEX_BASE = 0x1b, R_INDEX_COUNT = 0x1c, R_DRAW_INDEX_OFFSET = 0x1d,
+                   R_JUMP = 0x1e, R_SET_PRED = 0x1f;
 constexpr uint32_t R_NUM = 0x40;
 inline uint32_t PM4(uint32_t len, uint32_t op, uint32_t r) {
     return 0xC0000000u | (((len - 2u) & 0x3fffu) << 16u) | ((op & 0xffu) << 8u) | ((r & (R_NUM - 1u)) << 2u);
@@ -80,6 +81,19 @@ inline uint32_t* begin_packet(uint64_t buf, uint32_t n, uint32_t op, uint32_t r,
     if (cmd) cmd[0] = PM4(n, op, r);
     *out = cmd;
     return cmd;
+}
+
+// Verify a to-be-patched packet's own header sub-op before writing — a mismatch means the RE
+// drifted, so log loudly (once) and refuse to corrupt the stream. Shared by the sync-packet
+// address patchers (#213/#222) and SetPacketPredication (#319).
+inline bool patch_check(uint32_t* cmd, uint32_t want_r, const char* who) {
+    uint32_t r = (cmd[0] >> 2) & (R_NUM - 1u), op = (cmd[0] >> 8) & 0xffu;
+    if (op == IT_NOP && r == want_r) return true;
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 8)
+        fprintf(stderr, "[agc] %s: header 0x%08x is not the expected packet (op=0x%x r=0x%x want r=0x%x) — patch refused\n",
+                who, cmd[0], op, r, want_r);
+    return false;
 }
 
 }  // namespace
@@ -181,6 +195,70 @@ HLE(agc_dcb_draw_index_offset) {  // (dcb, startIndex[, indexCount])
     return (uint64_t)(uintptr_t)cmd;
 }
 
+// --- Command-buffer call (Jump) + GPU predication (issue #319, the DOLL untextured-title cause). --
+//
+// DOLL's UE4 RHI records its per-frame BACKBUFFER COMPOSITE (the fullscreen-triangle pass that
+// writes the textured scene into the VideoOut scanout buffer) NOT inline in the main Dcb, but in
+// small side segments invoked via sceAgcDcbJump under sceAgcDcbSetPredication windows:
+//
+//   sceAgcDcbSetPredication(dcb, 1, 3, 1, condAddr)   <- begin window, 64-bit condition at condAddr
+//   pkt = sceAgcDcbJump(dcb, 0, 0, target, ndw)       <- call `ndw` dwords at `target`
+//   sceAgcSetPacketPredication(pkt, ...)              <- mark that jump packet as predicated
+//   sceAgcDcbSetPredication(dcb, 1, 0, 1, 0)          <- end window
+//
+// Live capture (PROSPER_PREDLOG, title steady state): 8 such clusters per frame — the SAME two
+// composite segments (one per scanout buffer 0x8fc0000000/0x8fc2000000) each invoked at 4 points
+// with 4 distinct conditions; every segment is exactly `ndw` dwords of Set*RegsIndirect (full
+// render state: CB_COLOR0_BASE = the scanout buffer, 3840x2160 viewport, ES PGM) + DrawIndexAuto(3)
+// (a fullscreen triangle), with NO jump-back packet, and the parent stream continues after the
+// cluster — so Jump is a CALL-WITH-LENGTH, not a goto. With these three calls unimplemented
+// (return 0, no packet), the composite never executed and the presented backbuffer only ever held
+// the direct-to-scanout UI rectangle draws — the #319 "untextured title".
+//
+// No Kyty/shadPS4 reference exists for these Gen5 calls; the ABI below is pinned by the live
+// capture (arg roles consistent over 100k+ calls/run). CONFIDENCE: HIGH on (a3=target, a4=dword
+// count) and (a4=condition address begin / 0 end) — the dword count equals the decoded segment
+// length exactly, and the condition addresses are re-recorded per frame from a descending
+// per-frame allocation. CONFIDENCE: MED on the remaining flag args (recorded raw in the packet).
+HLE(agc_dcb_jump) {  // sceAgcDcbJump(dcb, ?, ?, target_addr, num_dw)
+    if (getenv("PROSPER_PREDLOG")) {
+        static std::atomic<uint64_t> n{0};
+        uint64_t k = n.fetch_add(1);
+        if (k < 32 || (k % 4096) == 0)
+            fprintf(stderr, "[pred] DcbJump #%llu dcb=0x%llx target=0x%llx ndw=0x%llx a1=0x%llx a2=0x%llx\n",
+                    (unsigned long long)k, (unsigned long long)a0, (unsigned long long)a3,
+                    (unsigned long long)a4, (unsigned long long)a1, (unsigned long long)a2);
+    }
+    uint32_t* cmd; if (!begin_packet(a0, 5, IT_NOP, R_JUMP, &cmd)) return 0;
+    cmd[1] = (uint32_t)(a3 & 0xffffffffu); cmd[2] = (uint32_t)(a3 >> 32u);
+    cmd[3] = (uint32_t)a4;
+    cmd[4] = 0;   // predicated flag — set by sceAgcSetPacketPredication on this returned packet
+    return (uint64_t)(uintptr_t)cmd;
+}
+HLE(agc_dcb_set_predication) {  // sceAgcDcbSetPredication(dcb, 1, op, 1, cond_addr) / (dcb, 1, 0, 1, 0)=end
+    if (getenv("PROSPER_PREDLOG")) {
+        static std::atomic<uint64_t> n{0};
+        uint64_t k = n.fetch_add(1);
+        if (k < 32 || (k % 4096) == 0)
+            fprintf(stderr, "[pred] DcbSetPredication #%llu dcb=0x%llx cond=0x%llx op=0x%llx a1=0x%llx a3=0x%llx\n",
+                    (unsigned long long)k, (unsigned long long)a0, (unsigned long long)a4,
+                    (unsigned long long)a2, (unsigned long long)a1, (unsigned long long)a3);
+    }
+    uint32_t* cmd; if (!begin_packet(a0, 4, IT_NOP, R_SET_PRED, &cmd)) return 0;
+    cmd[1] = (uint32_t)(a4 & 0xffffffffu); cmd[2] = (uint32_t)(a4 >> 32u);
+    cmd[3] = (uint32_t)a2;
+    return (uint64_t)(uintptr_t)cmd;
+}
+HLE(agc_set_packet_predication) {  // sceAgcSetPacketPredication(packet, ...)
+    // Marks an already-built packet as participating in the enclosing predication window. For our
+    // R_JUMP encoding that is payload[3] (cmd[4]). Header-verified like the other packet patchers —
+    // a different packet kind means the RE drifted, so refuse loudly rather than corrupt the stream.
+    auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
+    if (!patch_check(cmd, R_JUMP, "SetPacketPredication")) return 0;
+    cmd[4] = 1;
+    return 0;
+}
+
 // sceAgcSuspendPoint (NID h9z6+0hEydk, name via shadPS4) — the TRC R5089 GPU suspend point the
 // game forces in a loop ("Forcing call to sce::Agc::suspendPoint" spam). It has no out-params and
 // no game-visible state; on a devkit it just gives the system a safe suspend opportunity.
@@ -199,6 +277,15 @@ HLE(agc_cb_nop) {  // (dcb, num_dwords, ...)
 // address, a5 = size in dwords, a1 = dst (0 here, patched later via DmaDataPatchSetDstAddressOrOffset).
 // Custom R_DMA_DATA payload: [1..2]=dst lo/hi, [3..4]=src lo/hi, [5]=size_dw, [6]=flags. Return ptr.
 HLE(agc_dcb_dma_data) {  // (dcb, dst, cache_policy, flags, src, size_dw)
+    // #319 probe: is DmaData part of the per-frame render stream (a GPU-side copy we never execute)?
+    static std::atomic<uint64_t> g_dma_n{0};
+    if (getenv("PROSPER_PREDLOG")) {
+        uint64_t k = g_dma_n.fetch_add(1);
+        if (k < 48 || (k % 4096) == 0)
+            fprintf(stderr, "[pred] DcbDmaData #%llu dst=0x%llx src=0x%llx size_dw=0x%llx flags=0x%llx\n",
+                    (unsigned long long)k, (unsigned long long)a1, (unsigned long long)a4,
+                    (unsigned long long)a5, (unsigned long long)a3);
+    }
     uint32_t* cmd; if (!begin_packet(a0, 7, IT_NOP, R_DMA_DATA, &cmd)) return 0;
     cmd[1] = (uint32_t)(a1 & 0xffffffffu); cmd[2] = (uint32_t)(a1 >> 32u);
     cmd[3] = (uint32_t)(a4 & 0xffffffffu); cmd[4] = (uint32_t)(a4 >> 32u);
@@ -932,17 +1019,6 @@ HLE(agc_patch_add_registers) {  // (cmd, num_regs): cmd[1] += num_regs
 // the packet's own header sub-op before writing — a mismatch means the RE drifted, so it logs
 // loudly (once) and refuses to corrupt the stream. CONFIDENCE: HIGH (disassembly + live capture
 // + offset arithmetic all agree).
-namespace {
-inline bool patch_check(uint32_t* cmd, uint32_t want_r, const char* who) {
-    uint32_t r = (cmd[0] >> 2) & (R_NUM - 1u), op = (cmd[0] >> 8) & 0xffu;
-    if (op == IT_NOP && r == want_r) return true;
-    static std::atomic<int> logged{0};
-    if (logged.fetch_add(1) < 8)
-        fprintf(stderr, "[agc] %s: header 0x%08x is not the expected packet (op=0x%x r=0x%x want r=0x%x) — patch refused\n",
-                who, cmd[0], op, r, want_r);
-    return false;
-}
-}
 HLE(agc_patch_write_data_addr) {  // fPSCdQxgpSw (cmd, address): WriteData payload [1..2] = address
     auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
     if (!patch_check(cmd, R_WRITE_DATA, "WriteDataPatchAddress")) return 0;
@@ -998,6 +1074,10 @@ void register_agc_hle() {
     RN("8N2tmT3jmC8", agc_dcb_set_index_count);  // sceAgcDcbSetIndexCount
     RN("B+aG9DUnTKA", agc_dcb_draw_index_offset);// sceAgcDcbDrawIndexOffset
     RN("h9z6+0hEydk", agc_suspend_point);       // sceAgcSuspendPoint — no-op OK
+    // Command-buffer call + GPU predication (#319 — the DOLL backbuffer-composite path).
+    RN("xSAR0LTcRKM", agc_dcb_jump);               // sceAgcDcbJump (call-with-length)
+    RN("bbFueFP+J4k", agc_dcb_set_predication);    // sceAgcDcbSetPredication (window begin/end)
+    RN("w6Dj1VJt5qY", agc_set_packet_predication); // sceAgcSetPacketPredication (mark jump packet)
     RN("aJf+j5yntiU", agc_dcb_event_write);
     RN("57labkp+rSQ", agc_dcb_acquire_mem);
     RN("wr23dPKyWc0", agc_cb_release_mem);

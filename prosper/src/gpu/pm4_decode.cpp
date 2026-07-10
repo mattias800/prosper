@@ -135,6 +135,27 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
                     if (npl >= 1) c.index_offset = pl[0];
                     if (npl >= 2) c.index_count  = pl[1];
                     break;
+                case R_JUMP:
+                    // sceAgcDcbJump (#319): call-with-length of a side command segment.
+                    // payload: [0..1]=target addr lo/hi, [2]=dword count, [3]=predicated flag.
+                    c.kind = K::Jump;
+                    if (npl >= 4) {
+                        c.jump_addr   = lo_hi(pl);
+                        c.jump_dwords = pl[2];
+                        c.jump_pred   = pl[3];
+                        c.jump_valid  = true;
+                    }
+                    break;
+                case R_SET_PRED:
+                    // sceAgcDcbSetPredication (#319): begin/end a predication window.
+                    // payload: [0..1]=condition addr lo/hi (0 = end), [2]=raw op.
+                    c.kind = K::SetPredication;
+                    if (npl >= 3) {
+                        c.pred_addr  = lo_hi(pl);
+                        c.pred_op    = pl[2];
+                        c.pred_valid = true;
+                    }
+                    break;
                 case R_CX_REGS_INDIRECT:
                 case R_SH_REGS_INDIRECT:
                 case R_UC_REGS_INDIRECT:

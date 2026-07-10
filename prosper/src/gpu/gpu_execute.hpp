@@ -204,16 +204,19 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             }
         }
         if (log) {
-            fprintf(stderr, "[exec] skip draw: recompile failed (vs=%zu fs=%zu; es=0x%llx ps=0x%llx)\n",
-                    vs.size(), fs.size(), (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr);
+            fprintf(stderr, "[exec] skip draw: recompile failed (vs=%zu fs=%zu; es=0x%llx ps=0x%llx color0=0x%llx)\n",
+                    vs.size(), fs.size(), (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr,
+                    (unsigned long long)rs.color0_base);
             for (auto [tag, addr] : {std::pair{"vs", rs.es_addr}, std::pair{"ps", rs.ps_addr}}) {
                 RecompileCoverage c = recompile_coverage((const uint32_t*)(uintptr_t)addr, max_shader_dwords);
                 fprintf(stderr, "[exec]   %s coverage: total=%u alu=%u exp=%u tabledep=%u unsupported=%u "
                                 "first_bad fmt=%d op=0x%x\n", tag, c.total, c.alu, c.exports,
                         c.table_dependent, c.unsupported, c.first_bad_fmt, c.first_bad_op);
                 if (const char* dd = getenv("PROSPER_SHADER_DUMP")) {
+                    // 64 KB: a large UE4 post-process PS (~1500 instrs) far exceeds the old 4 KB
+                    // window, which truncated the very control-flow tail the reject is about (#319).
                     char fn[512]; snprintf(fn, sizeof fn, "%s/exec_%s_%llx.bin", dd, tag, (unsigned long long)addr);
-                    if (FILE* f = fopen(fn, "wb")) { fwrite((const void*)(uintptr_t)addr, 1, 4096, f); fclose(f); }
+                    if (FILE* f = fopen(fn, "wb")) { fwrite((const void*)(uintptr_t)addr, 1, 0x10000, f); fclose(f); }
                 }
             }
         }
@@ -421,7 +424,10 @@ inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn&
                                              uint32_t max_shader_dwords = 0x10000,
                                              float vp_scale_x = 1.0f, float vp_scale_y = 1.0f) {
     if (st.draws.empty() || !render) return {};              // nothing to render (e.g. a state-only submit)
-    const bool log = getenv("PROSPER_GFXLOG") != nullptr;    // bail-point visibility (why no frame?)
+    // PROSPER_EXECLOG: just the per-draw bail-point/skip logs, without PROSPER_GFXLOG's per-packet
+    // firehose (which is GBs over a minutes-long run) — for "which draws skip and why" surveys (#319).
+    const bool log = getenv("PROSPER_GFXLOG") != nullptr ||
+                     getenv("PROSPER_EXECLOG") != nullptr;   // bail-point visibility (why no frame?)
     // Render each draw from its OWN register snapshot when the submit has MULTIPLE draws — a real
     // multi-geometry scene (the game's in-game/cutscene submits carry 8-11 distinct draws with per-draw
     // shaders/textures/blends). Folding those to just the last draw drops the rest and the frame comes out

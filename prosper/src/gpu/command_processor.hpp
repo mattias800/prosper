@@ -60,6 +60,13 @@ struct GpuState {
     std::vector<Draw> draws;                             // one per DrawIndexAuto / DrawIndex
     uint64_t dispatch_count = 0;                         // DispatchDirect packets seen (no execution yet)
 
+    // GPU predication window (#319): the 64-bit condition address the last SetPredication opened
+    // (0 = no window). A packet-predicated Jump inside the window is executed/skipped on the
+    // condition value read at fold time. Cleared by the end form (addr == 0).
+    uint64_t pred_cond_addr = 0;
+    // Jump recursion depth (a jump target could itself contain a jump; bounded to stop a cycle).
+    uint32_t jump_depth = 0;
+
     // Safety cap on an indirect register count (a malformed/huge count won't run away).
     static constexpr uint32_t kMaxRegsPerPacket = 4096;
 
