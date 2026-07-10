@@ -97,7 +97,8 @@ struct ResolvedPipelineState {
     uint32_t stencil_fail_op[2]      = {0, 0};        // == VkStencilOp (0 = KEEP)
     uint32_t stencil_pass_op[2]      = {0, 0};        // depth-pass op
     uint32_t stencil_depth_fail_op[2]= {0, 0};
-    uint32_t stencil_ref[2]          = {0, 0};
+    uint32_t stencil_ref[2]          = {0, 0};        // STENCILTESTVAL — the COMPARE reference
+    uint32_t stencil_op_val[2]       = {0, 0};        // STENCILOPVAL — the value written by a REPLACE op
     uint32_t stencil_compare_mask[2] = {0xFF, 0xFF};
     uint32_t stencil_write_mask[2]   = {0xFF, 0xFF};
 
