@@ -150,7 +150,16 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     if (in.src[0].kind == OperandKind::Literal ? (v = in.literal, true) : srcval(in.src[0], v))
                         val[in.dst.value] = v;
                     else val.erase(in.dst.value);
-                } else if (in.dst.kind == OperandKind::SGPR) { val.erase(in.dst.value); }
+                } else if (in.dst.kind == OperandKind::SGPR) {
+                    // Not the modeled s_mov_b32 -> the dest is unknown. Erase the PAIR: 64-bit SOP1 ops
+                    // (s_mov_b64, s_getpc_b64, s_and/or/xor/not_b64, s_*_saveexec_b64, …) write
+                    // S[dst:dst+1], so leaving a stale "known" val[dst+1] let a later instruction fold a
+                    // confidently-wrong 64-bit base/offset -> a wrong V#/T# read from the wrong guest
+                    // address (#460). Over-erasing dst+1 for a 32-bit SOP1 only loses a fold opportunity
+                    // (never fabricates a value) — matching the SOP2 s_bfe_u64 pair-erase.
+                    val.erase(in.dst.value);
+                    val.erase(in.dst.value + 1);
+                }
                 // Several SOP1 ops write SCC (s_abs_i32, s_not_b32, s_and_saveexec_*, …). Only the moves
                 // (s_mov_b32 0x03 / s_mov_b64 0x04) are known not to — anything else invalidates the
                 // tracked SCC, or a later s_cselect folds with a stale compare result.
