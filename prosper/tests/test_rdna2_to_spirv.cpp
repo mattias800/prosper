@@ -1511,6 +1511,21 @@ int main() {
     }
     CHECK(gotT5b.size()==N && badT5b==0, "T5b: s_max_i32(5,5) sets SCC=1 (>=), s_cselect picks 11 not 4");
 
+    // Kernel T5c (#462): s_mul_hi_i32 is gfx10 SOP2 opcode 0x36 (was mapped to the invalid 0x37, so the
+    // handler was dead and the op rejected -> shader dropped). s1=0x10000; s_mul_hi_i32 s2,-1,s1 = the
+    // SIGNED high dword of (-1 * 0x10000) = high of 0xFFFFFFFFFFFF0000 = 0xFFFFFFFF (unsigned mul_hi would
+    // be 0x0000FFFF — so this also pins the SIGNED semantics). v1 = a0 + 0xFFFFFFFF (= a0 - 1).
+    const uint32_t codeT5c[] = { 0xbe8103ffu, 0x00010000u, 0x9b0201c1u, 0x4a020002u, 0xBF810000u };
+    std::vector<uint32_t> spvT5c = recompile_valu(codeT5c, sizeof(codeT5c)/4, 1, 1);
+    CHECK(!spvT5c.empty(), "recompiled T5c (s_mul_hi_i32 opcode 0x36) -> SPIR-V (was rejected as 0x37)");
+    std::vector<float> gotT5c = prosper::test::run_compute(spvT5c, inX, N, N);
+    uint32_t badT5c = 0;
+    for (uint32_t i = 0; i < N && gotT5c.size() == N; i++) {
+        uint32_t gb; std::memcpy(&gb, &gotT5c[i], 4);
+        if (gb != bits_of(inX[i]) + 0xFFFFFFFFu) badT5c++;
+    }
+    CHECK(gotT5c.size()==N && badT5c==0, "T5c: s_mul_hi_i32(-1,0x10000)=0xFFFFFFFF (signed high mul)");
+
     // Kernel T6: s_add_u32 carry chain -> s_addc_u32. s0=-1+2 (carry SCC=1); s1=0+0+SCC=1.
     // out bits = bits(a0) + 1.
     const uint32_t codeT6[] = { 0x800082c1u, 0x82018080u, 0x4a020001u, 0xBF810000u };
