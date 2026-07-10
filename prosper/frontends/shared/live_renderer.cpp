@@ -92,7 +92,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     prosper::test::FrameResource fr; fr.binding = r.binding; fr.set = set;
                     if (r.cls == RC::Texture || r.cls == RC::StorageImage) {
                         uint32_t tw = r.width ? r.width : 4, th = r.height ? r.height : 4;
-                        size_t nb = (size_t)tw * th * 4;
+                        const bool is_cube = r.img_dim == 3u;   // CUBE: six faces stacked vertically (#273)
+                        size_t nb = (size_t)tw * th * 4 * (is_cube ? 6u : 1u);
                         texstore.emplace_back(nb, 0x00);
                         // PROSPER_TEXCOMMIT: log, once per texture base, how much of the sampled surface is
                         // COMMITTED guest memory (the same reserved_range_state safe_copy stops at). If the
@@ -153,11 +154,49 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                         (unsigned long long)r.gpu_addr, tw, th, (unsigned)r.format,
                                         rtt_hit ? "HIT" : "miss", g_rtt.size());
                         }
+                        // CUBE texture (#273 — DOLL's title reflection probes / skybox): six faces,
+                        // each an independently-tiled w x h surface, laid out face-major at
+                        // gpu_addr + f*face_stride; decode each into rows [f*th, (f+1)*th) of the
+                        // stacked w x 6h image the cube-sample lowering addresses. BCn faces block-
+                        // detile + decode; anything else reads 4 B/texel with the surface detiler.
+                        // CONFIDENCE: MED on the face stride (padded tiled footprint) — visually
+                        // validated; a wrong stride garbles faces 1..5, it cannot crash (safe_copy).
+                        bool cube_done = false;
+                        if (is_cube && !rtt_hit) {
+                            const uint32_t cb = prosper::gpu::bc_block_bytes(r.format);
+                            const bool ctiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) && !getenv("PROSPER_NODETILE");
+                            for (uint32_t fface = 0; fface < 6; fface++) {
+                                uint8_t* slice = texstore.back().data() + (size_t)fface * tw * th * 4;
+                                if (cb) {
+                                    uint32_t bw = (tw + 3) / 4, bh = (th + 3) / 4;
+                                    size_t comp = (size_t)bw * bh * cb;
+                                    size_t stride = ctiled ? prosper::gpu::tiled_elements_bytes(bw, bh, cb, r.tile_mode) : comp;
+                                    std::vector<uint8_t> lin(comp, 0);
+                                    if (ctiled) {
+                                        std::vector<uint8_t> traw(stride, 0);
+                                        safe_copy(traw.data(), r.gpu_addr + (uint64_t)fface * stride, stride);
+                                        prosper::gpu::detile_elements(lin.data(), traw.data(), stride, bw, bh, cb, r.tile_mode);
+                                    } else safe_copy(lin.data(), r.gpu_addr + (uint64_t)fface * stride, comp);
+                                    std::vector<uint8_t> face((size_t)tw * th * 4, 0);
+                                    prosper::gpu::bc_decode_surface(face.data(), lin.data(), lin.size(), tw, th, r.format);
+                                    std::memcpy(slice, face.data(), face.size());
+                                } else {
+                                    size_t fb = (size_t)tw * th * 4;
+                                    size_t stride = ctiled ? prosper::gpu::tiled_surface_bytes(tw, th, r.tile_mode, 0) : fb;
+                                    if (ctiled) {
+                                        std::vector<uint8_t> traw(stride, 0);
+                                        safe_copy(traw.data(), r.gpu_addr + (uint64_t)fface * stride, stride);
+                                        prosper::gpu::detile_surface(slice, traw.data(), tw, th, r.tile_mode, 0);
+                                    } else safe_copy(slice, r.gpu_addr + (uint64_t)fface * stride, fb);
+                                }
+                            }
+                            cube_done = true;
+                        }
                         // Block-compressed (BC1/2/3): read the (possibly tiled) compressed blocks, block-
                         // detile, and decode to RGBA8 in-place. The blocks are the tiled element (BC3 =
                         // 16 bytes -> SW_4KB_S 16x16-block micro-tiles). #121.
-                        const uint32_t bcb = rtt_hit ? 0u : prosper::gpu::bc_block_bytes(r.format);
-                        if (rtt_hit) { /* pixels already injected from the RTT cache */ }
+                        const uint32_t bcb = (rtt_hit || cube_done) ? 0u : prosper::gpu::bc_block_bytes(r.format);
+                        if (rtt_hit || cube_done) { /* pixels already injected/stacked above */ }
                         else if (bcb) {
                             uint32_t bw = (tw + 3) / 4, bh = (th + 3) / 4;
                             // Block-detile: tiled_elements_bytes/detile_elements now derive the 4KB
@@ -275,7 +314,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         bool auto_tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode);
                         const char* dt = getenv("PROSPER_DETILE");
                         // BC textures already block-detiled + decoded above; the 32-bpp detiler must not touch them.
-                        if (!rtt_hit && !bcb && !narrow_done && !f16_done && !getenv("PROSPER_NODETILE") && (auto_tiled || (dt && atoi(dt) != 0))) {
+                        if (!rtt_hit && !cube_done && !bcb && !narrow_done && !f16_done && !getenv("PROSPER_NODETILE") && (auto_tiled || (dt && atoi(dt) != 0))) {
                             const uint32_t tmode = auto_tiled ? r.tile_mode : (uint32_t)prosper::gpu::TileMode::Sw4KbS;
                             const uint32_t pitch = getenv("PROSPER_PITCH") ? (uint32_t)atoi(getenv("PROSPER_PITCH")) : 0;
                             size_t tiled_bytes = prosper::gpu::tiled_surface_bytes(tw, th, tmode, pitch);
@@ -339,7 +378,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 prosper::test::dump_bmp(fn, texstore.back(), tw, th);
                             }
                         }
-                        fr.tex_rgba = texstore.back().data(); fr.tw = tw; fr.th = th;
+                        fr.tex_rgba = texstore.back().data(); fr.tw = tw; fr.th = cube_done ? th * 6u : th;
                         // Carry the decoded S# sampler state (filter/wrap/mip) so the pipeline samples the
                         // way the game asked instead of a fixed LINEAR/clamp sampler (#<sampler-fix>).
                         fr.mag_filter = r.mag_filter; fr.min_filter = r.min_filter; fr.mip_filter = r.mip_filter;

@@ -124,7 +124,9 @@ bool gen5_image_format(uint32_t fmt, Gen5ImageFormatInfo* out) {
         case 176: bcn(DataFormat::Bc4, 1,  8, false, true);       break; // BC4_SNORM (skip-only: signed)
         case 177: bcn(DataFormat::Bc5, 2, 16);                    break; // BC5_UNORM
         case 178: bcn(DataFormat::Bc5, 2, 16, false, true);       break; // BC5_SNORM (skip-only: signed)
-        case 179: case 180: bcn(DataFormat::Bc6, 3, 16); break; // BC6_UFLOAT/_SFLOAT (decode not wired)
+        case 179: bcn(DataFormat::Bc6, 3, 16);              break; // BC6H_UFLOAT (decoded, #273)
+        case 180: bcn(DataFormat::Bc6, 3, 16, false, true); break; // BC6H_SFLOAT (snorm flag = signed;
+                                                                   // still skipped: no live example)
         case 181: bcn(DataFormat::Bc7, 4, 16);        break;   // BC7_UNORM
         case 182: bcn(DataFormat::Bc7, 4, 16, true);  break;   // BC7_SRGB
         default: break;                                         // unmapped -> false
@@ -296,15 +298,16 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                 fi.format = DataFormat::Unorm8; fi.num_components = 4; fi.bytes_per_block = 4;
                 fi.block_width = fi.block_height = 1;
             }
-            // Block-compressed: BC1/2/3/4/5/7 are decoded to RGBA8 on upload (bc_decode, #290). Still
-            // skipped: BC6H (HDR half-float — no decode wired) and the SNORM BC4/BC5 variants (the
-            // UNORM8 upload can't carry signed samples; a remapped decode would be numerically wrong).
+            // Block-compressed: BC1/2/3/4/5/7 AND BC6H_UF16 are decoded to RGBA8 on upload
+            // (bc_decode, #290/#273 — BC6H clamps >1.0 HDR energy like the fp16 path). Still
+            // skipped: SIGNED variants (BC4/BC5 SNORM, BC6H SF16 — the UNORM8 upload can't carry
+            // signed samples; a remapped decode would be numerically wrong).
             const bool is_bcn = fi.block_width > 1;
-            if (is_bcn && (fi.format == DataFormat::Bc6 || fi.snorm)) {
+            if (is_bcn && fi.snorm) {
                 if (!warned[d.format & 511u]) { warned[d.format & 511u] = true;
                     fprintf(stderr, "[t#] Gen5 IMG_FMT %u is %s (%ux%u T#) -> decode not "
                                     "wired; skipping texture binding\n", d.format,
-                            fi.format == DataFormat::Bc6 ? "BC6H (HDR)" : "SNORM BCn",
+                            fi.format == DataFormat::Bc6 ? "BC6H SF16" : "SNORM BCn",
                             d.width, d.height); }
                 continue;
             }
@@ -319,6 +322,10 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             r.tile_mode     = d.tile_mode;          // so the renderer can auto-detile a GPU-tiled surface
             r.swizzle[0] = d.dst_sel[0]; r.swizzle[1] = d.dst_sel[1];
             r.swizzle[2] = d.dst_sel[2]; r.swizzle[3] = d.dst_sel[3];   // T# DST_SEL channel remap (#261)
+            // T# TYPE -> the MIMG dim convention (GFX10 SQ_RSRC_IMG: 8=1D, 9=2D, 10=3D, 11=CUBE,
+            // 12=1D_ARRAY, 13=2D_ARRAY). A CUBE resource (img_dim 3) uploads as six faces stacked
+            // vertically in one 2D image (#273); everything else keeps the 2D default.
+            r.img_dim       = d.type == 11 ? 3u : d.type == 10 ? 2u : d.type == 13 ? 5u : 1u;
             r.srgb          = fi.srgb;              // gamma-encoded surface: sample with sRGB->linear (#263)
             if (fi.srgb && getenv("PROSPER_GFXLOG"))
                 fprintf(stderr, "[t#] SRGB texture fmt=%u %ux%u (binding %u)\n", d.format, d.width, d.height, r.binding);

@@ -1745,6 +1745,26 @@ int main() {
     printf("  T20(bitcmp1) mismatches=%u (out[2]=%g expect=100)\n", badT20, gotT20.size()==8?gotT20[2]:-1);
     CHECK(gotT20.size()==8 && badT20==0, "T20: s_bitcmp1_b32 sets SCC from the selected bit");
 
+    // Kernel T23: v_cube{id,sc,tc,ma}_f32 (#273 — DOLL's reflection-probe cube math). Direction
+    // (x,y,z) = (1.0, 0.5, -2.0): |z| is the major axis and z<0, so per the GL cube table
+    // id=5, sc=-x=-1, tc=-y=-0.5, ma=2z=-4. out = id*100 + sc*10 + tc + ma/1024
+    //     = 500 - 10 - 0.5 - 0.00390625 = 489.4961. (Assembled by llvm-mc gfx1030.)
+    const uint32_t codeT23[] = {
+        0x7E0202F2u, 0x7E0402F0u, 0x7E0602F5u, 0xD5440004u, 0x040E0501u, 0xD5450005u,
+        0x040E0501u, 0xD5460006u, 0x040E0501u, 0xD5470007u, 0x040E0501u, 0x100808FFu,
+        0x42C80000u, 0x100A0AFFu, 0x41200000u, 0x06080B04u, 0x06080D04u, 0x100E0EFFu,
+        0x3A800000u, 0x06000F04u, 0xBF810000u,
+    };
+    std::vector<uint32_t> spvT23 = recompile_valu(codeT23, sizeof(codeT23)/sizeof(codeT23[0]), 1, 0);
+    CHECK(!spvT23.empty(), "recompiled kernel T23 (v_cube* ops) -> SPIR-V");
+    std::vector<float> inT23(8, 0.f);
+    std::vector<float> gotT23 = prosper::test::run_compute(spvT23, inT23, 8, 8);
+    uint32_t badT23 = 0;
+    for (uint32_t i = 0; i < 8 && gotT23.size() == 8; i++)
+        if (std::fabs(gotT23[i] - 489.4961f) > 1e-2f) badT23++;
+    printf("  kernelT23 mismatches=%u (out[0]=%g expect=489.4961)\n", badT23, gotT23.size()==8?gotT23[0]:-1);
+    CHECK(gotT23.size()==8 && badT23==0, "T23: cube id/sc/tc/ma match the GL major-axis table");
+
     // Kernel T21: v_fma_mixlo_f16 / mixhi (#273 — DOLL's box-blur f16 packing). v1=(a0*2+3) via
     // fma_mix_f32; then mixlo packs (a0+1) into v2's low half and mixhi packs (a0+2) into its high
     // half; out = f16lo(v2) + f16hi(v2) = (a0+1)+(a0+2) recovered via unpack (v_cvt_f32_f16-free:
