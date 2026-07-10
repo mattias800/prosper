@@ -33,13 +33,27 @@ struct AgcShaderUserData {
     uint16_t        sharp_resource_count[4];     // +0x2e
 };
 
+// The shader "specials" block (Kyty Shader.h:947; pointed to by header +0x28) — only the user-data
+// range. user_data_range_start/end give the DWORD range within the stage's SPI_SHADER_USER_DATA_*
+// register block that this shader's SGPR-visible user data occupies (e.g. DOLL's UE4 Slate VS
+// declares [0,8) for its {V#, ptr, ptr} block). Every shader observed live declares start=0; the
+// executor honors a non-zero start as latent support (guarded).
+struct AgcShaderSpecials {
+    uint8_t  pad[0x14];
+    uint16_t user_data_range_start;   // +0x14 (dwords, relative to USER_DATA_<stage>_0)
+    uint16_t user_data_range_end;     // +0x16
+};
+
 // The SDK shader header (Kyty Shader.h:974) — only the fields the resource builder needs.
 struct AgcShaderHeader {
     uint32_t           file_header;   // +0x00 '1234'
     uint32_t           version;       // +0x04
     AgcShaderUserData* user_data;     // +0x08
     const void*        code;          // +0x10
-    uint8_t            pad[0x5a - 0x18];
+    const void*        cx_registers;  // +0x18
+    const void*        sh_registers;  // +0x20
+    const AgcShaderSpecials* specials;// +0x28
+    uint8_t            pad[0x5a - 0x30];
     uint8_t            type;          // +0x5a (2=VS/ES, 1=PS, 0=CS)
 };
 

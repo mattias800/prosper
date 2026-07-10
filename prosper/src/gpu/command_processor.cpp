@@ -119,9 +119,9 @@ void GpuState::apply(const Pm4Command& c) {
                        : (c.reg_class == RegClass::Sh) ? sh : uc;
             if (getenv("PROSPER_RESDUMP")) {
                 const char* cn = c.reg_class == RegClass::Cx ? "Cx" : c.reg_class == RegClass::Sh ? "Sh" : "Uc";
-                fprintf(stderr, "[regindir] class=%s num=%u vaddr=0x%llx first pairs:", cn, c.num_regs,
+                fprintf(stderr, "[regindir] class=%s num=%u vaddr=0x%llx pairs:", cn, c.num_regs,
                         (unsigned long long)c.regs_vaddr);
-                for (uint32_t i = 0; i < c.num_regs && i < 6; i++)
+                for (uint32_t i = 0; i < c.num_regs && i < 40; i++)
                     fprintf(stderr, " (off=0x%x val=0x%x)", regs[i].offset, regs[i].value);
                 fprintf(stderr, "\n");
             }
@@ -133,6 +133,15 @@ void GpuState::apply(const Pm4Command& c) {
             // SET_SH_REG writes a consecutive RANGE (the driver uploads the whole user-data SGPR block
             // this way). Write every value, not just the first — else all descriptors past the range's
             // first register are silently dropped (which left the shaders' V#/T# SGPRs empty).
+            if (getenv("PROSPER_RESDUMP")) {
+                fprintf(stderr, "[shdirect] off=0x%x count=%u vals:", c.sh_reg_offset,
+                        c.sh_reg_data ? c.sh_reg_count : 1u);
+                if (c.sh_reg_data && c.sh_reg_count)
+                    for (uint32_t k = 0; k < c.sh_reg_count && k < 40; k++)
+                        fprintf(stderr, " 0x%x", c.sh_reg_data[k]);
+                else fprintf(stderr, " 0x%x", c.sh_reg_value);
+                fprintf(stderr, "\n");
+            }
             if (c.sh_reg_data && c.sh_reg_count) {
                 for (uint32_t k = 0; k < c.sh_reg_count && c.sh_reg_count <= kMaxRegsPerPacket; k++)
                     sh[c.sh_reg_offset + k] = c.sh_reg_data[k];
@@ -155,6 +164,12 @@ void GpuState::apply(const Pm4Command& c) {
             // Gen5 indexed draw (issue #232). Uses the bound index base + count; DrawIndexOffset's own
             // count (c.index_count) overrides the SetIndexCount state when non-zero. The element size is
             // the current SetIndexType (0=16-bit, 1=32-bit), captured in the per-draw snapshot.
+            if (getenv("PROSPER_RESDUMP")) {   // draw-vs-bind association diagnostic (#273)
+                auto rd = [&](uint32_t off) { auto it = sh.find(off); return it == sh.end() ? 0u : it->second; };
+                fprintf(stderr, "[drawpkt] idx#%zu es=0x%08x count=%u dirty=%d ud=[%08x %08x %08x %08x | %08x %08x %08x %08x]\n",
+                        draws.size(), rd(0xc8), c.index_count ? c.index_count : index_num, (int)state_dirty_,
+                        rd(0x8c), rd(0x8d), rd(0x8e), rd(0x8f), rd(0x90), rd(0x91), rd(0x92), rd(0x93));
+            }
             if (state_dirty_ || !last_snapshot_) {
                 auto snap = std::make_shared<GpuState>();
                 snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;

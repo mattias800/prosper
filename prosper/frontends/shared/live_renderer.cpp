@@ -442,6 +442,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         fprintf(stderr, "[rtt] group target=0x%llx (%zu draws) px_nonzero=%zu cache_size=%zu%s%s\n",
                                 (unsigned long long)base, groups[base].size(), nz, g_rtt.size(),
                                 is_vo ? " SCANOUT" : "", base && base == front_va ? " FRONT" : ""); }
+                    // PROSPER_DUMP_RTGROUPS=<min-nonzero-bytes>: dump each per-target group's rendered
+                    // pixels (rtgrp_<base>_<frame>.bmp in PROSPER_FRAME_DIR) — to inspect an intermediate
+                    // pass (e.g. the UI/banner RT) instead of only the presented composite. Diagnostic.
+                    if (const char* rg = getenv("PROSPER_DUMP_RTGROUPS"); rg && !gpx.empty()) {
+                        size_t nz = 0; for (uint8_t b : gpx) nz += (b != 0);
+                        if (nz >= (size_t)atol(rg)) {
+                            const char* dd = getenv("PROSPER_FRAME_DIR");
+                            char fn[512]; snprintf(fn, sizeof fn, "%s/rtgrp_%llx_%04d.bmp",
+                                                   dd ? dd : ".", (unsigned long long)base, frame_no.load());
+                            prosper::test::dump_bmp(fn, gpx, w, h);
+                        }
+                    }
                     if (!gpx.empty()) {
                         if (base && base == front_va) px_front = gpx;                   // the flipped buffer
                         if (is_vo)                    px_vo    = gpx;                   // any registered scanout
