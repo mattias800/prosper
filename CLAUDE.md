@@ -83,6 +83,12 @@ renderer is wired in; the game's **real pixel shader recompiles to valid SPIR-V*
   assume another agent is actively working there — check `git status` first and don't reset/stash/
   switch branches under them (the stash stack is shared too — see the worktree note in the environment
   preamble). Your worktree is auto-cleaned when its branch merges.
+- **On a Windows host, run git through PowerShell (Windows git), not WSL.** The repo lives on the
+  Windows filesystem (`C:\...` = `/mnt/c/...`), and worktrees created from Windows store a
+  Windows-path gitdir link (`gitdir: C:/Users/.../.git/worktrees/<name>`). WSL's git can't resolve
+  that path — it mangles it to `/mnt/c/.../C:/Users/...` and dies with `fatal: not a git repository`.
+  So drive **git** (fetch/checkout/commit/push/worktree/status) from **PowerShell**, and use **WSL
+  only for cmake/build/run**. Don't mix the two on one repo (it also avoids CRLF/filemode index churn).
 - **Build/run in WSL Ubuntu-24.04 as root.** Build dir `prosper/build-linux` (Linux, primary),
   `prosper/build-win` (Windows/MinGW, secondary). Game dump at
   `/mnt/c/Users/matti/repos/ps5ys/PPSA24651-app0` (gitignored — **never commit it**).
