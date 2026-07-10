@@ -287,14 +287,15 @@ HLE(s_dialog_result) {
     return 0;
 }
 
-// --- libSceImeDialog (on-screen text-entry dialog) — same common-dialog lifecycle as MsgDialog
-// (#191). We have no keyboard UI, so the dialog auto-completes: Init -> FINISHED(3) immediately, so
-// the game's "poll GetStatus until != RUNNING" loop exits at once instead of hanging on a dialog
-// that never appears; GetResult reports endStatus = OK/ENTER with the (unchanged/empty) input buffer;
-// Term/Abort return to NONE. Status enum is the shared SceCommonDialogStatus (0=NONE,1=INITIALIZED,
-// 2=RUNNING,3=FINISHED). CONFIDENCE: HIGH on the lifecycle (mirrors MsgDialog); MED on the exact
-// GetResult layout — we write only the 4-byte endStatus at offset 0 (the field the game branches on),
-// never more, so a wrong tail-field guess can't corrupt the caller's struct.
+// --- libSceImeDialog (on-screen text-entry dialog) (#191). We have no keyboard UI, so the dialog
+// auto-completes: Init -> FINISHED immediately, so the game's "poll GetStatus until Finished" loop
+// exits at once instead of hanging on a dialog that never appears; GetResult reports endStatus =
+// OK/ENTER with the (unchanged/empty) input buffer; Term/Abort return to NONE.
+// IMPORTANT: sceImeDialogGetStatus returns the IME-dialog's OWN enum (OrbisImeDialogStatus: NONE=0,
+// RUNNING=1, FINISHED=2) — NOT the 4-value SceCommonDialogStatus that MsgDialog/ErrorDialog use
+// (…RUNNING=2, FINISHED=3). Verified in shadPS4 ime_dialog.cpp. Returning 3 here made a game's poll
+// loop never see Finished(2). We write only the 4-byte endStatus at GetResult offset 0 (the field the
+// game branches on), never more, so a wrong tail-field guess can't corrupt the caller's struct.
 // A registered PlatformUi (the app frontend) gets first refusal on the dialog: if it takes it
 // (imeDialogOpen -> true), status/result/close route there so a real text field is shown; otherwise
 // the core auto-completes headlessly (below). `g_imedialog_backed` records which path Init chose so a
@@ -303,7 +304,7 @@ namespace { std::atomic<int> g_imedialog_status{0 /*NONE*/}; std::atomic<int> g_
 HLE(s_imedlg_init) {
     if (auto* ui = platform_ui(); ui && ui->imeDialogOpen(a0, a1)) { g_imedialog_backed.store(1); return 0; }
     g_imedialog_backed.store(0);
-    g_imedialog_status.store(3 /*FINISHED — auto-complete, no keyboard UI*/);
+    g_imedialog_status.store(2 /*OrbisImeDialogStatus::Finished — auto-complete, no keyboard UI*/);
     return 0;
 }
 HLE(s_imedlg_status) {

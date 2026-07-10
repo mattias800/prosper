@@ -25,9 +25,11 @@ struct PlatformUi {
     // (OrbisImeDialogParam* and the extended param, as guest addresses). Return true to OWN the dialog
     // — the core then routes status/result/close here; return false to let the core auto-complete it.
     virtual bool imeDialogOpen(uint64_t param, uint64_t extended) { (void)param; (void)extended; return false; }
-    // The dialog's current status, polled by the guest until it is no longer RUNNING(2). Runs on the
-    // guest's polling thread; the frontend advances the real UI on its own thread.
-    virtual int  imeDialogStatus() { return 3 /*FINISHED*/; }
+    // The dialog's current status (OrbisImeDialogStatus: NONE=0, RUNNING=1, FINISHED=2 — the IME
+    // dialog's OWN enum, NOT the 4-value common-dialog status MsgDialog uses), polled by the guest
+    // until it reads FINISHED(2). Runs on the guest's polling thread; the frontend advances the real
+    // UI on its own thread.
+    virtual int  imeDialogStatus() { return 2 /*OrbisImeDialogStatus::Finished*/; }
     // Write the outcome into the guest OrbisImeDialogResult* `result` (the endStatus, plus any entered
     // text into the input buffer the guest supplied at Init) and return the endStatus (0=OK,1=CANCELED).
     virtual int  imeDialogResult(uint64_t result) { (void)result; return 0; }
