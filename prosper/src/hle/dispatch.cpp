@@ -5,7 +5,11 @@
 namespace prosper {
 
 namespace {
-    struct Reg { HleFn fn; std::string name; };
+    // `placeholder` marks a deliberately-overridable registration (e.g. hle_graphics' per-NID glog
+    // tracing thunks, which a real handler in hle_agc is EXPECTED to replace later). Overwriting a
+    // placeholder is intended and not flagged; overwriting a REAL handler with a different fn is the
+    // accidental-shadow class (#330) that register_fn records.
+    struct Reg { HleFn fn; std::string name; bool placeholder = false; };
     std::unordered_map<std::string, Reg>& registry() {
         static std::unordered_map<std::string, Reg> r; return r;
     }
@@ -29,9 +33,30 @@ void dispatch_set_progress(volatile int* counter) { g_progress = counter; }
 
 void (*g_hwwatch_hook)(uint64_t) = nullptr;   // set by the Linux exec harness (perf HW watchpoints)
 
+namespace { std::vector<ShadowedReg>& shadow_list() { static std::vector<ShadowedReg> s; return s; } }
+
 void Hle::register_fn(const std::string& nid, HleFn fn, const char* name) {
-    registry()[nid] = { fn, name ? name : "" };
+    auto& reg = registry();
+    auto it = reg.find(nid);
+    // A second registration of the same NID with a DIFFERENT handler silently shadows the first
+    // (last-write-wins). Record it so a test can flag the real-impl-shadowed-by-stub class (#330) —
+    // UNLESS the existing entry is a deliberately-overridable placeholder (that override is intended).
+    // A re-registration with the SAME fn (harmless dedup) is not recorded.
+    if (it != reg.end() && it->second.fn != fn && !it->second.placeholder)
+        shadow_list().push_back({ nid, it->second.name, name ? name : "" });
+    reg[nid] = { fn, name ? name : "", false };
 }
+void Hle::register_placeholder(const std::string& nid, HleFn fn, const char* name) {
+    // Same as register_fn but marks the entry overridable, so a later real handler replacing it is
+    // not flagged as an accidental shadow. Does NOT itself overwrite a real (non-placeholder) entry
+    // silently: if one already exists with a different fn, that's still recorded.
+    auto& reg = registry();
+    auto it = reg.find(nid);
+    if (it != reg.end() && it->second.fn != fn && !it->second.placeholder)
+        shadow_list().push_back({ nid, it->second.name, name ? name : "" });
+    reg[nid] = { fn, name ? name : "", true };
+}
+const std::vector<ShadowedReg>& Hle::shadowed_registrations() { return shadow_list(); }
 HleFn Hle::lookup(const std::string& nid) {
     auto it = registry().find(nid);
     return it == registry().end() ? nullptr : it->second.fn;

@@ -60,6 +60,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_hle_registered PRIVATE prosper_core)
   add_test(NAME hle_functions_registered COMMAND test_hle_registered)
 
+  # No NID registered twice with a DIFFERENT handler (the #330 shadow class): a later register_*()
+  # silently overwriting a real impl with a stub returns garbage to the guest. Pure, no game dump.
+  add_executable(test_hle_no_shadow tests/test_hle_no_shadow.cpp)
+  target_link_libraries(test_hle_no_shadow PRIVATE prosper_core)
+  add_test(NAME hle_no_shadow COMMAND test_hle_no_shadow)
+
   # Cooperative stop signal (issue #164 P0): request_stop/stop_requested the frontend uses to wind
   # the guest run-loop down on window-close. Pure, no deps.
   add_executable(test_lifecycle tests/test_lifecycle.cpp)

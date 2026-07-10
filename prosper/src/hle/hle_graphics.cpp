@@ -561,7 +561,9 @@ __attribute__((noinline)) uint64_t glog_thunk(uint64_t a0, uint64_t a1, uint64_t
 }
 template <size_t... Is>
 void register_agc_tracers(std::index_sequence<Is...>) {
-    (Hle::register_fn(kAgcNids[Is], (HleFn)&glog_thunk<Is>, kAgcNids[Is]), ...);
+    // Placeholders: hle_agc registers the REAL handlers for the implemented subset later and is meant
+    // to override these tracing thunks — so mark them overridable and that override is not a shadow.
+    (Hle::register_placeholder(kAgcNids[Is], (HleFn)&glog_thunk<Is>, kAgcNids[Is]), ...);
 }
 }
 
