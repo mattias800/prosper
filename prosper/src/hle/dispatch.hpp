@@ -20,12 +20,31 @@ using HleFn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uin
 // is the stub slot number; the trap logger names calls via this table.
 struct ImportSlot { std::string lib, nid; };
 
+// One case where register_fn OVERWROTE an already-registered NID with a DIFFERENT handler.
+// Registration is last-write-wins with no warning, so whichever register_*() runs last silently
+// takes the NID — and if the loser was a real implementation and the winner a naive stub, the guest
+// gets the stub (e.g. #330: a Get* that no longer wrote its out-param). Recorded at registration time
+// so the winner/loser reflect the true runtime order, not a static guess.
+struct ShadowedReg {
+    std::string nid;          // the collided key
+    std::string prev_name;    // display name of the registration that was overwritten
+    std::string new_name;     // display name of the registration that won
+};
+
 // Registry of implemented functions, keyed by NID.
 class Hle {
 public:
     static void  register_fn(const std::string& nid, HleFn fn, const char* name);
+    // Like register_fn, but marks the entry as a deliberately-overridable placeholder (a diagnostic/
+    // tracing thunk that a real handler is expected to replace later). A subsequent register_fn that
+    // overwrites a placeholder is NOT flagged as a shadow — that override is the intent.
+    static void  register_placeholder(const std::string& nid, HleFn fn, const char* name);
     static HleFn lookup(const std::string& nid);          // nullptr if unimplemented
     static const char* name_of(const std::string& nid);   // registered display name or ""
+    // Every NID that was registered 2+ times with DIFFERING handlers, in registration order. Empty
+    // is the healthy state; a non-empty list is the #330 double-registration-shadow class and must be
+    // reviewed (the winner is the LAST registration). Populated as register_fn runs.
+    static const std::vector<ShadowedReg>& shadowed_registrations();
 };
 
 // Wire the unimplemented-call logger to the global stub-slot table + name DB.
