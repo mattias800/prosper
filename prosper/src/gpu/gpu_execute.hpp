@@ -82,11 +82,19 @@ struct DynFetch {
 // turns each use into a ShaderResource with srt_offset = key.
 struct SrtUse {
     int kind = 0;                    // 0 = texture (t8, + s4 sampler when resolved), 1 = constant buffer (v4)
-    uint32_t key = 0;                // the s_load immediate byte offset (== emit_alu's sreg_srt tag)
+    uint32_t key = 0;                // the s_load immediate byte offset (== emit_alu's sreg_srt tag);
+                                     // 0xFFFFFFFF = key-less (register-SOFFSET / negative-imm load — the
+                                     // recompiler then resolves the use by its instruction pc instead)
     std::array<uint32_t, 8> t8{};    // T# dwords as loaded (kind 0)
     std::array<uint32_t, 4> v4{};    // V# dwords as loaded (kind 1)
     bool has_samp = false;
     std::array<uint32_t, 4> s4{};    // paired S# dwords (kind 0, when the SSAMP load also resolved)
+    // PER-USE pc provenance (#273 — DOLL's title-composite image_sample_b): the pc of the consuming
+    // image op. The load-immediate key model breaks when the same immediate appears against two
+    // different table pointers (a key-0 EUD sharp colliding with a key-0 table T#) or when the load
+    // has no usable key; keying the TEXTURE use by its exact instruction (ShaderResource::fetch_pc,
+    // the same per-instruction provenance the vertex fetches use) is unambiguous.
+    uint32_t use_pc = 0xFFFFFFFFu;   // kind 0 only (cbufs keep the key model)
 };
 std::vector<DynFetch> resolve_dynamic_fetch(const uint32_t* code, size_t dwords,
                                             const uint32_t* user_sgprs, uint32_t nsgpr,
@@ -200,6 +208,17 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                         (unsigned long long)rs.es_addr);
                 g_dyntrace_force = true;
                 (void)build_stage_table(ds, rs.es_addr, false);
+                g_dyntrace_force = false;
+            }
+        }
+        // Same replay for a FAILED pixel stage (#273 — the PS-side descriptor-resolution walls).
+        if (fs.empty() && getenv("PROSPER_DYNTRACE_FAIL")) {
+            static std::set<uint64_t> traced_ps;
+            if (traced_ps.insert(rs.ps_addr).second) {
+                fprintf(stderr, "[dynfail] replaying PS 0x%llx resource build with trace:\n",
+                        (unsigned long long)rs.ps_addr);
+                g_dyntrace_force = true;
+                (void)build_stage_table(ds, rs.ps_addr, true);
                 g_dyntrace_force = false;
             }
         }

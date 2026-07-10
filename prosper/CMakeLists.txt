@@ -103,6 +103,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_audio PRIVATE prosper_core)
   add_test(NAME audio_hle COMMAND test_audio)
 
+  # libSceAjm (#187): headless audio-decode lifecycle — handle out-params filled with valid values
+  # (context/instance/batch), inputs validated, batch reports complete. Pure, no game dump.
+  add_executable(test_ajm tests/test_ajm.cpp)
+  target_link_libraries(test_ajm PRIVATE prosper_core)
+  add_test(NAME ajm_hle COMMAND test_ajm)
+
   add_executable(test_equeue_events tests/test_equeue_events.cpp)
   target_link_libraries(test_equeue_events PRIVATE prosper_core)
   add_test(NAME equeue_events COMMAND test_equeue_events)
@@ -130,6 +136,30 @@ if(TARGET prosper_core)
   add_executable(test_service_getters tests/test_service_getters.cpp)
   target_link_libraries(test_service_getters PRIVATE prosper_core)
   add_test(NAME service_getters COMMAND test_service_getters)
+
+  # PlatformUi hook (#347): the app frontend can service the guest's ImeDialog with real UI; with no
+  # backend registered the headless auto-complete default is unchanged. Pure, no game dump.
+  add_executable(test_platform_ui tests/test_platform_ui.cpp)
+  target_link_libraries(test_platform_ui PRIVATE prosper_core)
+  add_test(NAME platform_ui COMMAND test_platform_ui)
+
+  # SDL3 dialog frontend's guest-struct parsing (#347): pure, SDL-free, so it runs in normal CI even
+  # though the SDL_ShowMessageBox glue is display-only. Verifies the MsgDialog/ErrorDialog layouts.
+  add_executable(test_dialog_helpers frontends/dialog_sdl3/test_dialog_helpers.cpp
+                                     frontends/dialog_sdl3/dialog_helpers.cpp)
+  add_test(NAME dialog_helpers COMMAND test_dialog_helpers)
+
+  # libSceImeDialog lifecycle + libSceSaveData memory API round-trip (#191): auto-completing dialog
+  # (no hang) + a real per-(user,slot) Set->Get memory block with verified shadPS4 struct layouts.
+  add_executable(test_savedata_ime tests/test_savedata_ime.cpp)
+  target_link_libraries(test_savedata_ime PRIVATE prosper_core)
+  add_test(NAME savedata_ime COMMAND test_savedata_ime)
+
+  # libSceIme keyboard API (#186): reports a consistent "no keyboard connected" state (empty resource
+  # array + disconnected info, bounds-checked) so the per-frame input poll never reads garbage.
+  add_executable(test_ime_keyboard tests/test_ime_keyboard.cpp)
+  target_link_libraries(test_ime_keyboard PRIVATE prosper_core)
+  add_test(NAME ime_keyboard COMMAND test_ime_keyboard)
 
   # pthread scheduling getters fill their out-param (not a shadowing no-op): scePthreadGetprio/
   # Getaffinity must WRITE priority/mask, else the caller reads uninitialized stack (harmful-stub class).
@@ -588,6 +618,15 @@ if(PROSPER_APP AND TARGET SDL3::SDL3)
       target_link_libraries(prosper-app PRIVATE prosper_live_renderer)
       target_compile_definitions(prosper-app PRIVATE PROSPER_HAVE_LIVE_RENDERER=1)
     endif()
+    # SDL3 dialog frontend (#347): real SDL_ShowMessageBox for the guest's MsgDialog/ErrorDialog via
+    # the PlatformUi hook. The layout parsing (dialog_helpers) is pure + unit-tested (see below); this
+    # module adds the SDL glue and needs SDL3 video (already required by prosper-app).
+    add_library(prosper_dialog_sdl3 STATIC
+                frontends/dialog_sdl3/platform_ui_sdl3.cpp frontends/dialog_sdl3/dialog_helpers.cpp)
+    target_include_directories(prosper_dialog_sdl3 PUBLIC frontends/dialog_sdl3 src)
+    target_link_libraries(prosper_dialog_sdl3 PUBLIC prosper_core SDL3::SDL3)
+    target_link_libraries(prosper-app PRIVATE prosper_dialog_sdl3)
+    target_compile_definitions(prosper-app PRIVATE PROSPER_HAVE_DIALOG_SDL3=1)
     message(STATUS "prosper-app frontend enabled (SDL3 window + Vulkan present)")
   else()
     message(WARNING "PROSPER_APP=ON but Vulkan not found — skipping prosper-app")

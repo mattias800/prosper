@@ -149,6 +149,24 @@ int main(int argc, char** argv) {
     { const uint32_t c[] = {0x7e020280u,0x7e0002f2u,0x7c2200f0u,0xbf880002u,0xbe8503f2u,0x7e020205u,
                             0x7e040205u,0xf800180fu,0x01010101u,0xbf810000u};
       dump(dir, "fragment_execz_if", recompile_fragment(c, sizeof(c)/4, nullptr)); }
+    // Fragment: DIVERGENT execz-exit loop with a nested execz if in the body (#273 — the DOLL
+    // title post-process accumulation shape; test_recompiled_fragment executes it).
+    { const uint32_t c[] = {0x7E020284u,0xBE800380u,0x7E040280u,0x7E060280u,0x7E080282u,0x7E0A02F2u,
+                            0xBE82047Eu,0x7DA20200u,0xBF88000Au,0xBE84047Eu,0x7DA20800u,0xBF880002u,
+                            0x060404FFu,0x3E800000u,0xBEFE0404u,0x060606FFu,0x3E800000u,0x81008100u,
+                            0xBF82FFF4u,0xBEFE0402u,0xF800180Fu,0x05020302u,0xBF810000u};
+      dump(dir, "fragment_divergent_loop", recompile_fragment(c, sizeof(c)/4, nullptr)); }
+    // Fragment: EXECNZ-back-edge loop with a mid-body vccz break (#273 — the scalar-indexed unroll).
+    { const uint32_t c[] = {0xBE82047Eu,0xBE800380u,0xBE810383u,0x7E040280u,0x7E0A02F2u,0xBF880009u,
+                            0xBF0A0100u,0x8584807Eu,0xBEEA0404u,0xBEFE0404u,0xBF860004u,0x060404FFu,
+                            0x3E800000u,0x81008100u,0xBF89FFF6u,0xBEFE0402u,0xF800180Fu,0x05020202u,
+                            0xBF810000u};
+      dump(dir, "fragment_execnz_loop", recompile_fragment(c, sizeof(c)/4, nullptr)); }
+    // Fragment: v_writelane/v_readlane scalar-spill slots (#273).
+    { const uint32_t c[] = {0xBE8503FFu,0x3E800000u,0xBE8603F2u,0xD761000Au,0x00010605u,0xD761000Au,
+                            0x00010E06u,0xD7600007u,0x0001070Au,0xD7600008u,0x00010F0Au,0x7E000207u,
+                            0x7E020208u,0xF800180Fu,0x01000100u,0xBF810000u};
+      dump(dir, "fragment_lane_slots", recompile_fragment(c, sizeof(c)/4, nullptr)); }
 
     if (fails) { printf("== FAIL: %d shader(s) failed recompile/validation ==\n", fails); return 1; }
     printf("== PASS%s ==\n", have_val ? " (all modules pass spirv-val)" : " (recompiled; spirv-val not found)");

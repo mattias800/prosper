@@ -320,7 +320,7 @@ HLE(k_reserve_vrange) {
                 MLOG("reserve hint=0x%llx re-reserve-of-own-range -> OK\n", (unsigned long long)hint);
                 return 0;
             }
-            MLOG("reserve FIXED hint=0x%llx FAILED\n", (unsigned long long)hint); return 0x16;
+            MLOG("reserve FIXED hint=0x%llx FAILED\n", (unsigned long long)hint); return 0x8002000cull; // ENOMEM
         }
         if (a0) *(uint64_t*)a0 = (uint64_t)p;
         track((uint64_t)p, a1, 0, false, "reserved");
@@ -359,7 +359,7 @@ HLE(k_reserve_vrange) {
     // Over-map by `align`, then trim the head/tail slack to yield an aligned span.
     uint64_t total = a1 + align;
     void* raw = mmap(nullptr, total, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (raw == MAP_FAILED) { MLOG("reserve len=0x%llx FAILED\n", (unsigned long long)a1); return 0x16; }
+    if (raw == MAP_FAILED) { MLOG("reserve len=0x%llx FAILED\n", (unsigned long long)a1); return 0x8002000cull; } // ENOMEM
     uint64_t base = align_up((uint64_t)raw, align);
     if (base > (uint64_t)raw) munmap(raw, base - (uint64_t)raw);
     uint64_t used_end = base + a1, raw_end = (uint64_t)raw + total;
@@ -375,7 +375,7 @@ HLE(k_reserve_vrange) {
 HLE(k_map_flexible) {
     uint64_t hint = a0 ? *(uint64_t*)a0 : 0;
     void* p = map_at(hint, a1, host_prot(a2));
-    if (!p) { MLOG("mapflexible hint=0x%llx len=0x%llx FAILED\n", (unsigned long long)hint, (unsigned long long)a1); return 0x16; }
+    if (!p) { MLOG("mapflexible hint=0x%llx len=0x%llx FAILED\n", (unsigned long long)hint, (unsigned long long)a1); return 0x8002000cull; } // ENOMEM
     if (a0) *(uint64_t*)a0 = (uint64_t)p;
     track((uint64_t)p, a1, host_prot(a2), true, a4 ? (const char*)a4 : "flexible");
     MLOG("mapflexible -> 0x%llx len=0x%llx prot=0x%llx name=%s\n",
@@ -421,7 +421,7 @@ HLE(k_alloc_main_dmem) {
 // sceKernelDirectMemoryQuery(off_t offset, int flags, SceKernelDirectMemoryQueryInfo* info, size_t infoSize)
 //   info: 0x00 off_t start; 0x08 off_t end; 0x10 i32 memoryType. flags&1 = find next.
 HLE(k_direct_memory_query) {
-    if (!a2) return 0x16;
+    if (!a2) return 0x80020016ull;   // EINVAL (null out-param)
     uint8_t* info = (uint8_t*)a2;
     uint64_t sz = a3 ? (a3 > 0x18 ? 0x18 : a3) : 0x18;
     memset(info, 0, sz);
@@ -445,7 +445,7 @@ HLE(k_direct_memory_query) {
 HLE(k_map_dmem) {
     uint64_t hint = a0 ? *(uint64_t*)a0 : 0;
     void* p = map_phys_at(hint, a1, host_prot(a2), a4);
-    if (!p) { MLOG("map_dmem hint=0x%llx len=0x%llx FAILED\n", (unsigned long long)hint, (unsigned long long)a1); return 0x16; }
+    if (!p) { MLOG("map_dmem hint=0x%llx len=0x%llx FAILED\n", (unsigned long long)hint, (unsigned long long)a1); return 0x8002000cull; } // ENOMEM
     if (a0) *(uint64_t*)a0 = (uint64_t)p;
     track((uint64_t)p, a1, host_prot(a2), true, "direct");
     MLOG("map_dmem -> 0x%llx len=0x%llx phys=0x%llx prot=0x%llx\n",
@@ -456,7 +456,7 @@ HLE(k_map_dmem) {
 // sceKernelVirtualQuery(const void* addr, int flags, SceKernelVirtualQueryInfo* info, size_t infoSize)
 //   0x00 start; 0x08 end; 0x10 offset; 0x18 i32 prot; 0x1C i32 memType; 0x20 u32 flags; 0x24 name[32]
 HLE(k_virtual_query) {
-    if (!a2) return 0x16;
+    if (!a2) return 0x80020016ull;   // EINVAL (null out-param)
     uint8_t* info = (uint8_t*)a2;
     uint64_t sz = a3 ? (a3 > 0x48 ? 0x48 : a3) : 0x48;
     memset(info, 0, sz);

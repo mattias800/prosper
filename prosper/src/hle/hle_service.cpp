@@ -5,11 +5,16 @@
 // (Game-controller input — libScePad — moved to hle_pad.cpp with a real host backend.)
 #include "dispatch.hpp"
 #include "nid.hpp"
+#include "platform_ui.hpp"
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <atomic>
+#include <algorithm>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 #ifdef __linux__
 #include <sys/mman.h>   // msync page-mapped probe in svc_log (diagnostic-only)
 #endif
@@ -132,6 +137,37 @@ HLE(s_open)           { return g_handle++; }                                 // 
 // mouse attached: zero one entry defensively, report 0 events.
 HLE(s_mouse_read)     { if (a1) memset(PW(a1), 0, 0x18); return 0; }
 
+// --- libSceIme keyboard API (#186) ---
+// PPSA02664 polls this every frame in its input loop. We have no physical PS5 keyboard, so we report a
+// consistent "no keyboard connected" state: Open/Update succeed, GetResourceId returns an empty
+// resource array (no keyboards), GetInfo reports a disconnected device — the game then uses controller
+// / on-screen input instead of waiting on a keyboard. Struct layouts + field offsets verified against
+// shadPS4 src/core/libraries/ime/ime_common.h; error codes from ime_error.h. Note sceImeKeyboardOpen
+// returns an Error (0 = SCE_OK), NOT a handle — so success is 0. CONFIDENCE: HIGH on the layouts; MED
+// on the device/status enum "disconnected" == 0.
+//   OrbisImeKeyboardResourceIdArray: user_id@0(s32) resource_id[5]@4(u32)                     size 24
+//   OrbisImeKeyboardInfo: user_id@0 device@4 type@8 repeat_delay@12 repeat_rate@16 status@20 rsv[12]@24  size 36
+HLE(s_ime_kbd_open) { svc_log("sceImeKeyboardOpen", a0,a1,a2,a3,a4,a5); return 0; }  // register handler; no events to deliver
+HLE(s_ime_update)   { svc_log("sceImeUpdate", a0,a1,a2,a3,a4,a5); return 0; }        // pump the queue: no events
+// sceImeKeyboardGetResourceId(userId, OrbisImeKeyboardResourceIdArray* out): report the user's keyboard
+// resource ids — none connected, so an all-zero id array (echoing the queried userId).
+HLE(s_ime_kbd_resid) {
+    svc_log("sceImeKeyboardGetResourceId", a0,a1,a2,a3,a4,a5);
+    if (!a1) return 0x80BC0031ull;   // ORBIS_IME_ERROR_INVALID_ADDRESS
+    uint8_t* p = (uint8_t*)PW(a1);
+    *(int32_t*)(p + 0) = (int32_t)a0;                         // user_id echoes the caller
+    for (int i = 0; i < 5; i++) *(uint32_t*)(p + 4 + i * 4) = 0;   // no keyboards connected
+    return 0;
+}
+// sceImeKeyboardGetInfo(resourceId, OrbisImeKeyboardInfo* info): a disconnected (no-device) info.
+HLE(s_ime_kbd_info) {
+    svc_log("sceImeKeyboardGetInfo", a0,a1,a2,a3,a4,a5);
+    if (!a1) return 0x80BC0031ull;   // ORBIS_IME_ERROR_INVALID_ADDRESS
+    memset(PW(a1), 0, 36);           // device=0 type=0 repeat=0 status=0(disconnected) reserved=0
+    *(int32_t*)PW(a1) = 1;           // user_id = default user (matches sceUserServiceGetInitialUser)
+    return 0;
+}
+
 // --- app content ---
 HLE(s_appcontent_int) { if (a1) *(int32_t*)PW(a1) = 0; return 0; }
 
@@ -218,16 +254,62 @@ HLE(s_param_string)   { if (a1 && a2) ((char*)PW(a1))[0] = '\0'; return 0; }
 // Initialize -> INITIALIZED, Open -> auto-dismiss to FINISHED (headless: no interactive UI, so the
 // game's "wait until dismissed" loop still exits immediately), Close/Terminate -> back to NONE.
 // GetResult -> zeroed struct = OK/no button pressed.
-namespace { std::atomic<int> g_msgdialog_status{0 /*NONE*/}; }
-HLE(s_dialog_initialize) { g_msgdialog_status.store(1 /*INITIALIZED*/); return 0; }
-HLE(s_dialog_open)       { g_msgdialog_status.store(3 /*FINISHED (auto-dismiss)*/); return 0; }
-HLE(s_dialog_close)      { g_msgdialog_status.store(0 /*NONE*/); return 0; }
-HLE(s_dialog_terminate)  { g_msgdialog_status.store(0 /*NONE*/); return 0; }
-HLE(s_dialog_status)     { return (uint64_t)(unsigned)g_msgdialog_status.load(); }
+// A registered PlatformUi gets first refusal at Open; if it takes the dialog, status/result/close
+// route there (real message box). Otherwise the core auto-dismisses headlessly. `g_msgdialog_backed`
+// records which path Open chose. See platform_ui.hpp (#347).
+namespace { std::atomic<int> g_msgdialog_status{0 /*NONE*/}; std::atomic<int> g_msgdialog_backed{0}; }
+HLE(s_dialog_initialize) { g_msgdialog_backed.store(0); g_msgdialog_status.store(1 /*INITIALIZED*/); return 0; }
+HLE(s_dialog_open) {
+    if (auto* ui = platform_ui(); ui && ui->msgDialogOpen(a0)) { g_msgdialog_backed.store(1); return 0; }
+    g_msgdialog_backed.store(0);
+    g_msgdialog_status.store(3 /*FINISHED (auto-dismiss)*/);
+    return 0;
+}
+HLE(s_dialog_close)      { if (g_msgdialog_backed.exchange(0)) { if (auto* ui = platform_ui()) ui->msgDialogClose(); } g_msgdialog_status.store(0 /*NONE*/); return 0; }
+HLE(s_dialog_terminate)  { if (g_msgdialog_backed.exchange(0)) { if (auto* ui = platform_ui()) ui->msgDialogClose(); } g_msgdialog_status.store(0 /*NONE*/); return 0; }
+HLE(s_dialog_status) {
+    if (g_msgdialog_backed.load()) { if (auto* ui = platform_ui()) return (uint64_t)(unsigned)ui->msgDialogStatus(); }
+    return (uint64_t)(unsigned)g_msgdialog_status.load();
+}
 // SceMsgDialogResult = { u32 mode; u32 result; u32 buttonId; char reserved[32] } = 0x2C bytes
 // (shadPS4 msgdialog_ui.h DialogResult). Was memset(0x30) — 4 bytes PAST the caller's struct,
 // exactly the f_fstat oversized-write class this file warns about.
-HLE(s_dialog_result)   { if (a0) memset(PW(a0), 0, 0x2C); return 0; }
+HLE(s_dialog_result) {
+    if (g_msgdialog_backed.load()) { if (auto* ui = platform_ui()) { (void)ui->msgDialogResult(a0); return 0; } }
+    if (a0) memset(PW(a0), 0, 0x2C);
+    return 0;
+}
+
+// --- libSceImeDialog (on-screen text-entry dialog) — same common-dialog lifecycle as MsgDialog
+// (#191). We have no keyboard UI, so the dialog auto-completes: Init -> FINISHED(3) immediately, so
+// the game's "poll GetStatus until != RUNNING" loop exits at once instead of hanging on a dialog
+// that never appears; GetResult reports endStatus = OK/ENTER with the (unchanged/empty) input buffer;
+// Term/Abort return to NONE. Status enum is the shared SceCommonDialogStatus (0=NONE,1=INITIALIZED,
+// 2=RUNNING,3=FINISHED). CONFIDENCE: HIGH on the lifecycle (mirrors MsgDialog); MED on the exact
+// GetResult layout — we write only the 4-byte endStatus at offset 0 (the field the game branches on),
+// never more, so a wrong tail-field guess can't corrupt the caller's struct.
+// A registered PlatformUi (the app frontend) gets first refusal on the dialog: if it takes it
+// (imeDialogOpen -> true), status/result/close route there so a real text field is shown; otherwise
+// the core auto-completes headlessly (below). `g_imedialog_backed` records which path Init chose so a
+// later poll/result/term goes to the same place. See platform_ui.hpp (#347).
+namespace { std::atomic<int> g_imedialog_status{0 /*NONE*/}; std::atomic<int> g_imedialog_backed{0}; }
+HLE(s_imedlg_init) {
+    if (auto* ui = platform_ui(); ui && ui->imeDialogOpen(a0, a1)) { g_imedialog_backed.store(1); return 0; }
+    g_imedialog_backed.store(0);
+    g_imedialog_status.store(3 /*FINISHED — auto-complete, no keyboard UI*/);
+    return 0;
+}
+HLE(s_imedlg_status) {
+    if (g_imedialog_backed.load()) { if (auto* ui = platform_ui()) return (uint64_t)(unsigned)ui->imeDialogStatus(); }
+    return (uint64_t)(unsigned)g_imedialog_status.load();
+}
+HLE(s_imedlg_result) {
+    if (g_imedialog_backed.load()) { if (auto* ui = platform_ui()) { (void)ui->imeDialogResult(a0); return 0; } }
+    if (a0) *(int32_t*)PW(a0) = 0 /*SCE_IME_DIALOG_END_STATUS_OK*/;
+    return 0;
+}
+HLE(s_imedlg_term)  { if (g_imedialog_backed.exchange(0)) { if (auto* ui = platform_ui()) ui->imeDialogClose(); } g_imedialog_status.store(0 /*NONE*/); return 0; }
+HLE(s_imedlg_abort) { if (g_imedialog_backed.exchange(0)) { if (auto* ui = platform_ui()) ui->imeDialogClose(); } g_imedialog_status.store(0 /*NONE*/); return 0; }
 
 // --- libSceNpTrophy2 (PS5 trophy system) — the DOLL 34.6 GB OOM (issue #213 diagnosis). ---------
 // The guest's trophy bring-up (eboot+0xdbcb43..0xdbcc2e, gdb-captured live) calls
@@ -326,6 +408,108 @@ HLE(s_savedata_init3)   { svc_log("sceSaveDataInitialize3", a0,a1,a2,a3,a4,a5); 
 HLE(s_savedata_term)    { return 0; }
 HLE(s_savedata_txres)   { svc_log("sceSaveDataCreateTransactionResource", a0,a1,a2,a3,a4,a5); return 0; }
 HLE(s_savedata_txres_del) { return 0; }
+
+// --- libSceSaveData "save-data memory" API (#191). A per-(user,slot) fixed-size memory block the
+// managed SaveData layer reads/writes by offset and syncs to storage; on PS5 this is how a title
+// keeps a small always-resident save (settings/progress). We back each slot with a host-memory
+// block: Setup allocates it, Set copies guest->block, Get copies block->guest, Sync commits. Struct
+// layouts + field offsets verified against shadPS4 save_data/savedata.cpp; error codes from
+// savedata_error.h. CONFIDENCE: HIGH on the happy-path round-trip (the contract a title depends on).
+//   OrbisSaveDataMemoryData:  buf@0(ptr) bufSize@8(u64) offset@16(s64)               size 64
+//   OrbisSaveDataMemorySetup2: option@0 userId@4 memorySize@8 iconMemorySize@16
+//                              initParam@24 initIcon@32 slotId@40                    size 64
+//   OrbisSaveDataMemorySet2:  userId@0 [pad@4] data@8(ptr) param@16 icon@24 dataNum@32 slotId@36
+//   OrbisSaveDataMemoryGet2:  userId@0 [pad@4] data@8(ptr) param@16 icon@24 slotId@32
+namespace {
+    std::mutex g_savemem_mx;
+    std::unordered_map<uint64_t, std::vector<uint8_t>> g_savemem;   // key = (userId<<32)|slotId
+    uint64_t savemem_key(int32_t userId, uint32_t slotId) {
+        return ((uint64_t)(uint32_t)userId << 32) | slotId;
+    }
+    template <class T> T ld(uint64_t base, size_t off) {   // read a guest struct field at byte offset
+        T v; memcpy(&v, (const uint8_t*)PW(base) + off, sizeof(T)); return v;
+    }
+    constexpr uint64_t SD_ERR_PARAMETER      = 0x809F0000ull;
+    constexpr uint64_t SD_ERR_MEMORY_NOTREADY = 0x809F0012ull;   // Set/Get before a successful Setup
+}
+// sceSaveDataSetupSaveDataMemory2(setup*, result*): allocate/grow the slot's block to memorySize
+// (zero-filling new bytes, preserving any bytes already there this session). result->existedMemorySize
+// (@0) = the size the block had before — the game uses it to tell first-run from resume.
+HLE(s_savemem_setup) {
+    svc_log("sceSaveDataSetupSaveDataMemory2", a0,a1,a2,a3,a4,a5);
+    if (!a0) return SD_ERR_PARAMETER;
+    int32_t  userId  = ld<int32_t>(a0, 4);
+    uint64_t memSize = ld<uint64_t>(a0, 8);
+    uint32_t slotId  = ld<uint32_t>(a0, 40);
+    uint64_t existed = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_savemem_mx);
+        auto& buf = g_savemem[savemem_key(userId, slotId)];
+        existed = buf.size();
+        if (memSize > buf.size()) buf.resize(memSize, 0);          // grow only; never drop live data
+    }
+    if (a1) *(uint64_t*)PW(a1) = existed;                          // result->existedMemorySize
+    return 0;
+}
+// sceSaveDataSetSaveDataMemory2(set*): copy each of dataNum {buf,bufSize,offset} descriptors from
+// guest memory into the slot's block at its offset (bounds-clamped — never write past the block).
+HLE(s_savemem_set) {
+    svc_log("sceSaveDataSetSaveDataMemory2", a0,a1,a2,a3,a4,a5);
+    if (!a0) return SD_ERR_PARAMETER;
+    int32_t  userId  = ld<int32_t>(a0, 0);
+    uint64_t dataPtr = ld<uint64_t>(a0, 8);
+    uint32_t dataNum = ld<uint32_t>(a0, 32);
+    uint32_t slotId  = ld<uint32_t>(a0, 36);
+    std::lock_guard<std::mutex> lk(g_savemem_mx);
+    auto it = g_savemem.find(savemem_key(userId, slotId));
+    if (it == g_savemem.end()) return SD_ERR_MEMORY_NOTREADY;      // Setup not called for this slot
+    auto& buf = it->second;
+    for (uint32_t i = 0; i < dataNum && dataPtr; i++) {
+        uint64_t d     = dataPtr + (uint64_t)i * 64;               // sizeof(OrbisSaveDataMemoryData)
+        uint64_t gbuf  = ld<uint64_t>(d, 0);
+        uint64_t gsize = ld<uint64_t>(d, 8);
+        int64_t  off   = ld<int64_t>(d, 16);
+        if (!gbuf || off < 0 || (uint64_t)off >= buf.size()) continue;
+        uint64_t n = std::min<uint64_t>(gsize, buf.size() - (uint64_t)off);
+        memcpy(buf.data() + off, PW(gbuf), n);
+    }
+    return 0;
+}
+// sceSaveDataGetSaveDataMemory2(get*): copy from the slot's block into the single {buf,bufSize,offset}
+// descriptor (Get2 has no dataNum — one descriptor), bounds-clamped.
+HLE(s_savemem_get) {
+    svc_log("sceSaveDataGetSaveDataMemory2", a0,a1,a2,a3,a4,a5);
+    if (!a0) return SD_ERR_PARAMETER;
+    int32_t  userId  = ld<int32_t>(a0, 0);
+    uint64_t dataPtr = ld<uint64_t>(a0, 8);
+    uint32_t slotId  = ld<uint32_t>(a0, 32);
+    std::lock_guard<std::mutex> lk(g_savemem_mx);
+    auto it = g_savemem.find(savemem_key(userId, slotId));
+    if (it == g_savemem.end()) return SD_ERR_MEMORY_NOTREADY;
+    auto& buf = it->second;
+    if (dataPtr) {
+        uint64_t gbuf  = ld<uint64_t>(dataPtr, 0);
+        uint64_t gsize = ld<uint64_t>(dataPtr, 8);
+        int64_t  off   = ld<int64_t>(dataPtr, 16);
+        if (gbuf && off >= 0 && (uint64_t)off < buf.size()) {
+            uint64_t n = std::min<uint64_t>(gsize, buf.size() - (uint64_t)off);
+            memcpy(PW(gbuf), buf.data() + off, n);
+        }
+    }
+    return 0;
+}
+// sceSaveDataSyncSaveDataMemory(sync*): commit the slot's block. The block is process-resident here,
+// so a session's Set is already visible to a later Get (cross-restart disk persistence is a separate
+// concern) — validate the slot exists and report success.
+HLE(s_savemem_sync) {
+    svc_log("sceSaveDataSyncSaveDataMemory", a0,a1,a2,a3,a4,a5);
+    if (!a0) return SD_ERR_PARAMETER;
+    int32_t  userId = ld<int32_t>(a0, 0);
+    uint32_t slotId = ld<uint32_t>(a0, 4);
+    std::lock_guard<std::mutex> lk(g_savemem_mx);
+    if (g_savemem.find(savemem_key(userId, slotId)) == g_savemem.end()) return SD_ERR_MEMORY_NOTREADY;
+    return 0;
+}
 // sceSaveDataMount3(const Mount3* mount, MountResult* result). The mount desc layout is pinned
 // from DOLL's OWN wrapper (eboot+0x2251610 disassembly, matching the live capture):
 //   +0x00 u32 userId; +0x08 const char* dirName; +0x10 u64 blocks; +0x20 u32 mountMode;
@@ -581,18 +765,24 @@ extern "C" uint64_t s_np_check_cb_c(uint64_t, uint64_t, uint64_t, uint64_t, uint
 // { s32 size; s32 errorCode; s32 userId; s32 reserved } (shadPS4 error_dialog.cpp Param); the
 // errorCode is printed unconditionally — a one-shot, high-value diagnostic of WHAT the game
 // thinks failed. CONFIDENCE: HIGH (shadPS4 implements this exact lifecycle).
-namespace { std::atomic<int> g_errdialog_status{0 /*NONE*/}; }
-HLE(s_errdialog_init)   { g_errdialog_status.store(1 /*INITIALIZED*/); return 0; }
+namespace { std::atomic<int> g_errdialog_status{0 /*NONE*/}; std::atomic<int> g_errdialog_backed{0}; }
+HLE(s_errdialog_init)   { g_errdialog_backed.store(0); g_errdialog_status.store(1 /*INITIALIZED*/); return 0; }
 HLE(s_errdialog_open)   {
+    // Offer the error dialog to a registered PlatformUi first (a real message box); else auto-dismiss.
+    if (auto* ui = platform_ui(); ui && ui->errorDialogOpen(a0)) { g_errdialog_backed.store(1); return 0; }
+    g_errdialog_backed.store(0);
     uint32_t code = 0;
     if (svc_ptrish(a0)) code = *(const uint32_t*)((const char*)PW(a0) + 4);
     fprintf(stderr, "[svc] sceErrorDialogOpen(errorCode=%#x) -> auto-dismiss FINISHED\n", code);
     g_errdialog_status.store(3 /*FINISHED (auto-dismiss)*/);
     return 0;
 }
-HLE(s_errdialog_close)  { g_errdialog_status.store(3 /*FINISHED*/); return 0; }
-HLE(s_errdialog_term)   { g_errdialog_status.store(0 /*NONE*/);     return 0; }
-HLE(s_errdialog_status) { return (uint64_t)(unsigned)g_errdialog_status.load(); }
+HLE(s_errdialog_close)  { if (g_errdialog_backed.exchange(0)) { if (auto* ui = platform_ui()) ui->errorDialogClose(); } g_errdialog_status.store(3 /*FINISHED*/); return 0; }
+HLE(s_errdialog_term)   { if (g_errdialog_backed.exchange(0)) { if (auto* ui = platform_ui()) ui->errorDialogClose(); } g_errdialog_status.store(0 /*NONE*/); return 0; }
+HLE(s_errdialog_status) {
+    if (g_errdialog_backed.load()) { if (auto* ui = platform_ui()) return (uint64_t)(unsigned)ui->errorDialogStatus(); }
+    return (uint64_t)(unsigned)g_errdialog_status.load();
+}
 
 // --- libSceNpEntitlementAccess / libSceGameUpdate: observability first. -------------------------
 // PS5-only surfaces with NO reference implementation (absent from Kyty and shadPS4); the PS5 3.20
@@ -735,7 +925,18 @@ void register_service_hle() {
     R("sceMsgDialogUpdateStatus", s_dialog_status);
     R("sceMsgDialogGetStatus", s_dialog_status);
     R("sceMsgDialogGetResult", s_dialog_result);
+    // libSceImeDialog (#191): auto-completing text-entry dialog (no keyboard UI). Raw NIDs.
+    Hle::register_fn("NUeBrN7hzf0", (HleFn)s_imedlg_init,   "sceImeDialogInit");
+    Hle::register_fn("IADmD4tScBY", (HleFn)s_imedlg_status, "sceImeDialogGetStatus");
+    Hle::register_fn("x01jxu+vxlc", (HleFn)s_imedlg_result, "sceImeDialogGetResult");
+    Hle::register_fn("gyTyVn+bXMw", (HleFn)s_imedlg_term,   "sceImeDialogTerm");
+    Hle::register_fn("oBmw4xrmfKs", (HleFn)s_imedlg_abort,  "sceImeDialogAbort");
     R("sceSystemServiceHideSplashScreen", s_ok);
+    // libSceIme keyboard API (#186): no physical keyboard -> consistent "none connected" state. Raw NIDs.
+    Hle::register_fn("eaFXjfJv3xs", (HleFn)s_ime_kbd_open,  "sceImeKeyboardOpen");
+    Hle::register_fn("-4GCfYdNF1s", (HleFn)s_ime_update,    "sceImeUpdate");
+    Hle::register_fn("VkqLPArfFdc", (HleFn)s_ime_kbd_info,  "sceImeKeyboardGetInfo");
+    Hle::register_fn("dKadqZFgKKQ", (HleFn)s_ime_kbd_resid, "sceImeKeyboardGetResourceId");
     // libSceAvPlayer (#324): let a post-credits / intro video complete so the game reaches its scene.
     // Init/InitEx must return a non-NULL handle; IsActive must report finished; the rest succeed as no-ops.
     R("sceAvPlayerInit",           s_avplayer_init);
@@ -773,6 +974,11 @@ void register_service_hle() {
     Hle::register_fn("-Q1-u1a7p0g", (HleFn)s_ok,                 "scePlayGoPrefetch");
     // libSceSaveData (PS5 native surface) — fresh console: mount of a nonexistent save NOT_FOUND.
     Hle::register_fn("TywrFKCoLGY", (HleFn)s_savedata_init3,     "sceSaveDataInitialize3");
+    // libSceSaveData "save-data memory" API (#191): a real per-(user,slot) memory block round-trip.
+    Hle::register_fn("oQySEUfgXRA", (HleFn)s_savemem_setup, "sceSaveDataSetupSaveDataMemory2");
+    Hle::register_fn("cduy9v4YmT4", (HleFn)s_savemem_set,   "sceSaveDataSetSaveDataMemory2");
+    Hle::register_fn("QwOO7vegnV8", (HleFn)s_savemem_get,   "sceSaveDataGetSaveDataMemory2");
+    Hle::register_fn("wiT9jeC7xPw", (HleFn)s_savemem_sync,  "sceSaveDataSyncSaveDataMemory");
     Hle::register_fn("yKDy8S5yLA0", (HleFn)s_savedata_term,      "sceSaveDataTerminate");
     Hle::register_fn("gjRZNnw0JPE", (HleFn)s_savedata_txres,     "sceSaveDataCreateTransactionResource");
     Hle::register_fn("lJUQuaKqoKY", (HleFn)s_savedata_txres_del, "sceSaveDataDeleteTransactionResource");

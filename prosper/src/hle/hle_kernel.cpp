@@ -644,6 +644,8 @@ HLE(k_sema_poll)   { auto* s = (Sema*)(uintptr_t)a0; if (!s) return 0; int64_t n
 // ANY thrown C++ exception was fatal. Now we fill the real info from the loaded modules' program headers.
 namespace {
     std::vector<UnwindModuleDesc> g_unwind_mods;
+    std::mutex g_unwind_mx;   // guards g_unwind_mods: set_unwind_modules (assign, may realloc) can run on a
+                              // runtime module load while a worker is unwinding here (#344).
     // Decode the eh_frame pointer out of an .eh_frame_hdr. Layout: [0]=version(1), [1]=eh_frame_ptr_enc,
     // [2]=fde_count_enc, [3]=table_enc, [4..]=eh_frame_ptr (encoded). The common encoding is 0x1B
     // (DW_EH_PE_pcrel|sdata4): a signed 32-bit offset from the field's own address.
@@ -668,9 +670,13 @@ namespace {
 HLE(k_get_module_info_for_unwind) {   // (VAddr addr, int flags, ModuleInfoForUnwind* info)
     uint8_t* info = (uint8_t*)(uintptr_t)a2;
     if (!info) return 0x80020016;                      // SCE_KERNEL_ERROR_EINVAL
-    const UnwindModuleDesc* m = nullptr;
-    for (auto& d : g_unwind_mods) if (a0 >= d.lo && a0 < d.hi) { m = &d; break; }
-    if (!m) return 0x80020003;                         // SCE_KERNEL_ERROR_ESRCH: addr not in any module
+    UnwindModuleDesc found{};
+    { std::lock_guard<std::mutex> lk(g_unwind_mx);
+      const UnwindModuleDesc* hit = nullptr;
+      for (auto& d : g_unwind_mods) if (a0 >= d.lo && a0 < d.hi) { hit = &d; break; }
+      if (!hit) return 0x80020003;                     // SCE_KERNEL_ERROR_ESRCH: addr not in any module
+      found = *hit; }   // copy out under the lock — the vector may be reassigned after we unlock (#344)
+    const UnwindModuleDesc* m = &found;
     char* nm = (char*)(info + 0x08);
     const char* src = m->name ? m->name : "";
     size_t n = 0; for (; src[n] && n < 255; n++) nm[n] = src[n]; nm[n] = 0;
@@ -688,7 +694,9 @@ HLE(k_get_module_info_for_unwind) {   // (VAddr addr, int flags, ModuleInfoForUn
                 (unsigned long long)eh, (unsigned long long)m->seg0);
     return 0;
 }
-void set_unwind_modules(const UnwindModuleDesc* d, size_t c) { g_unwind_mods.assign(d, d + c); }
+void set_unwind_modules(const UnwindModuleDesc* d, size_t c) {
+    std::lock_guard<std::mutex> lk(g_unwind_mx); g_unwind_mods.assign(d, d + c);
+}
 
 // ---- Async exception delivery = the IL2CPP GC's stop-the-world thread suspension ----
 // The runtime installs a handler (sceKernelInstallExceptionHandler) for exception type 0x1e,
@@ -925,6 +933,8 @@ HLE(k_dlsym) {   // sceKernelDlsym(SceKernelModule handle, const char* name, voi
 // the main exe's initial-exec TLS, which the current boot already tolerates).
 namespace {
 std::vector<TlsModuleDesc> g_tls_mods;
+std::mutex g_tls_mods_mx;   // guards g_tls_mods: a runtime sceKernelLoadStartModule re-runs set_tls_modules
+                            // (assign, may realloc) while a worker is in k_tls_get_addr (#344).
 // Per-thread DTV (thread -> module id -> TLS block). MUST NOT use a host `thread_local`: guest threads
 // run under the GUEST %fs, and host thread_local storage is %fs-relative, so it ALIASES guest memory —
 // reads come back as garbage (an unordered_map whose bucket_count reads 0 → `hash % 0` → SIGFPE).
@@ -953,7 +963,7 @@ size_t tls_dtv_thread_count() {   // test/diagnostic introspection: threads with
     return g_dtv.size();
 }
 void set_tls_modules(const TlsModuleDesc* descs, size_t count) {
-    g_tls_mods.assign(descs, descs + count);
+    { std::lock_guard<std::mutex> lk(g_tls_mods_mx); g_tls_mods.assign(descs, descs + count); }
     if (getenv("PROSPER_TLSLOG"))
         for (size_t i = 0; i < count; i++)
             fprintf(stderr, "[tls] module %zu: init_va=0x%llx filesz=0x%llx memsz=0x%llx\n", i,
@@ -971,11 +981,12 @@ HLE(k_tls_get_addr) {   // __tls_get_addr(tls_index* ti): ti[0]=module id, ti[1]
       if (it != dtv.end()) return (uint64_t)(uintptr_t)it->second + off;
     }
     size_t memsz = 64, filesz = 0; uint64_t init_va = 0;
-    if (modid < g_tls_mods.size()) {
-        memsz  = g_tls_mods[modid].memsz ? g_tls_mods[modid].memsz : 64;
-        filesz = g_tls_mods[modid].filesz;
-        init_va = g_tls_mods[modid].init_va;
-    }
+    { std::lock_guard<std::mutex> lk(g_tls_mods_mx);   // #344: safe vs a concurrent set_tls_modules realloc
+      if (modid < g_tls_mods.size()) {
+          memsz  = g_tls_mods[modid].memsz ? g_tls_mods[modid].memsz : 64;
+          filesz = g_tls_mods[modid].filesz;
+          init_va = g_tls_mods[modid].init_va;
+      } }
     void* blk = calloc(1, memsz);   // zero-init (tbss), then copy the tdata image
     if (init_va && filesz) memcpy(blk, (const void*)(uintptr_t)init_va, filesz);
     { std::lock_guard<std::mutex> lk(g_dtv_mx); g_dtv[tid][modid] = blk; }
