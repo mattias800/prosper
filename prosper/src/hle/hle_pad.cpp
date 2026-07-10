@@ -129,6 +129,10 @@ HLE(pad_open) { int h = g_pad_handle.fetch_add(1);
 // scePadGetHandle(userId, type, index) -> handle (games that opened once may re-query it).
 HLE(pad_get_handle) { return 1; }
 
+// scePadIsValidHandle(handle) -> nonzero if the handle is an open pad. Was MISSING -> returned 0, which a
+// caller reads as "invalid". Our handles start at 1, so report valid for any positive handle.
+HLE(pad_is_valid_handle) { return a0 >= 1 ? 1 : 0; }
+
 // scePadReadState(handle, ScePadData* out) -> 0 on success. One current snapshot.
 HLE(pad_read_state) {
     if (!a1) return 0;
@@ -182,6 +186,8 @@ void register_pad_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
     R("scePadInit", pad_ok);
     R("scePadOpen", pad_open);
+    R("scePadOpenExt", pad_open);              // was MISSING -> returned 0 (read as a valid handle 0 / error)
+    R("scePadIsValidHandle", pad_is_valid_handle);   // was MISSING -> 0 = "invalid"
     R("scePadClose", pad_ok);
     R("scePadGetHandle", pad_get_handle);
     R("scePadGetControllerInformation", pad_get_info);
