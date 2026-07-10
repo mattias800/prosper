@@ -146,6 +146,18 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
                         c.jump_valid  = true;
                     }
                     break;
+                case R_DMA_DATA:
+                    // sceAgcDcbDmaData / sceAgcAcbDmaData (#312): CP-DMA. payload: [0..1]=dst lo/hi,
+                    // [2..3]=srcOrImm lo/hi, [4]=numBytes, [5]=sels (see agc_dcb_dma_data).
+                    c.kind = K::DmaData;
+                    if (npl >= 6) {
+                        c.dd_dst   = lo_hi(pl);
+                        c.dd_src   = lo_hi(pl + 2);
+                        c.dd_bytes = pl[4];
+                        c.dd_sels  = pl[5];
+                        c.dd_valid = true;
+                    }
+                    break;
                 case R_SET_PRED:
                     // sceAgcDcbSetPredication (#319): begin/end a predication window.
                     // payload: [0..1]=condition addr lo/hi (0 = end), [2]=raw op.

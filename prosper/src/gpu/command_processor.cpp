@@ -61,6 +61,12 @@ struct GpuWriteRec { uint64_t addr; uint64_t value; uint64_t pkt; uint32_t seq; 
 constexpr uint32_t kWriteRingSize = 16384;              // power of two
 GpuWriteRec g_write_ring[kWriteRingSize];
 std::atomic<uint32_t> g_write_seq{0};
+// Coarse monotonic ms since process start (diagnostic timestamps for the #312 fence journal).
+uint64_t now_ms() {
+    static const auto t0 = std::chrono::steady_clock::now();
+    return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+}
 // `pkt` = the guest address of the PM4 packet that requested the write (c.payload-1). The stale-
 // vs-live discriminator: a STALE ring-tail packet re-executed across frames has the SAME pkt
 // address in every record; a legitimately re-recorded per-frame write moves with the ring.
@@ -73,7 +79,7 @@ uint64_t pkt_addr(const Pm4Command& c) { return c.payload ? (uint64_t)(uintptr_t
 }
 // Scan the ring for writes intersecting [lo, hi); format up to `max` matches into out (NUL-
 // terminated). Async-signal-safe: no locks, no allocation, tolerates racy ring slots. kind:
-// 1=RELEASE_MEM 2=EVENT_WRITE 3=WRITE_DATA.
+// 1=RELEASE_MEM 2=EVENT_WRITE 3=WRITE_DATA 4=DMA_DATA.
 extern "C" int prosper_gpu_write_ring_scan(uint64_t lo, uint64_t hi, char* out, size_t cap) {
     size_t off = 0; int found = 0;
     uint32_t seq_now = g_write_seq.load(std::memory_order_relaxed);
@@ -90,6 +96,63 @@ extern "C" int prosper_gpu_write_ring_scan(uint64_t lo, uint64_t hi, char* out, 
     }
     if (off < cap) out[off] = 0;
     return found;
+}
+
+// --- #312 fence BUILD journal: the timing-vs-wrong-target discriminator. -------------------------
+// The AGC builders/patchers record, per fence packet (keyed by the packet's guest address):
+// the target label address the GUEST passed, the 8 bytes the target held AT BUILD TIME, and a
+// build timestamp. When honor_eop_write later catches a fence write landing over pointer-like
+// (freed-heap-header-shaped) memory, the journal answers: (a) did the packet's target change
+// between build and fold (packet mutated/mis-decoded => wrong-target), (b) was the target ALREADY
+// freed-looking when the guest built the fence (stale guest structure), or (c) was it clean at
+// build and freed in the build->write window (ordering: our write lands after the guest's free)?
+// Direct-mapped by packet address — collisions just replace (diagnostic-grade).
+namespace {
+struct FenceBuildRec { uint64_t pkt, addr, pre; uint64_t t_ms; };
+constexpr uint32_t kJournalSize = 65536;                // power of two
+FenceBuildRec g_fence_journal[kJournalSize];
+inline uint32_t journal_slot(uint64_t pkt) { return (uint32_t)((pkt >> 2) * 2654435761u) & (kJournalSize - 1); }
+}
+extern "C" void prosper_fence_journal_record(uint64_t pkt, uint64_t addr) {
+    if (!pkt) return;
+    uint64_t pre = 0;
+    if (addr >= 0x10000 && !(addr & 3)) memcpy(&pre, (const void*)(uintptr_t)addr, sizeof pre);
+    FenceBuildRec& r = g_fence_journal[journal_slot(pkt)];
+    r.pkt = pkt; r.addr = addr; r.pre = pre; r.t_ms = now_ms();
+}
+extern "C" int prosper_fence_journal_lookup(uint64_t pkt, uint64_t* addr, uint64_t* pre, uint64_t* t_ms) {
+    if (!pkt) return 0;
+    const FenceBuildRec& r = g_fence_journal[journal_slot(pkt)];
+    if (r.pkt != pkt) return 0;
+    *addr = r.addr; *pre = r.pre; *t_ms = r.t_ms;
+    return 1;
+}
+
+// #312: "pointer-like" pre-content — a freed MallocBinned3 block header holds heap pointers into
+// the 512 GiB arena (0x1000000000) or the allocator-metadata pools (0x2000000000 region, where the
+// FPoolInfo tables live — e.g. the 0x20015f0000 pool-info table of #161/#241).
+static bool ptr_like(uint64_t v) {
+    return (v >= 0x1000000000ull && v < 0x1200000000ull) ||
+           (v >= 0x2000000000ull && v < 0x2100000000ull);
+}
+// #312: report one suspicious fence write with its build-journal verdict. kindtag: "REL1" etc.
+static void report_suspect_write(const char* kindtag, uint64_t addr, uint64_t value, uint64_t pre,
+                                 uint64_t pkt) {
+    // Skip the first 10 s: boot-time label-array allocations carry benign freelist residue that
+    // burned the whole report budget at t=3.4 s in every run; the corruption class is mid-burst.
+    if (now_ms() < 10000) return;
+    static std::atomic<int> n{0};
+    if (n.fetch_add(1) >= 96) return;
+    uint64_t baddr = 0, bpre = 0, bt = 0;
+    int have = prosper_fence_journal_lookup(pkt, &baddr, &bpre, &bt);
+    fprintf(stderr, "[agc] SUSPECT-%s [0x%llx] pre=0x%llx value=0x%llx pkt=0x%llx t=%llums | "
+                    "journal:%s built@%llums(age=%lldms) built-addr=0x%llx%s pre@build=0x%llx%s\n",
+            kindtag, (unsigned long long)addr, (unsigned long long)pre, (unsigned long long)value,
+            (unsigned long long)pkt, (unsigned long long)now_ms(),
+            have ? "" : " MISS", (unsigned long long)bt,
+            have ? (long long)(now_ms() - bt) : -1,
+            (unsigned long long)baddr, (have && baddr != addr) ? " TARGET-CHANGED" : "",
+            (unsigned long long)bpre, (have && ptr_like(bpre)) ? " STALE-AT-BUILD" : "");
 }
 
 // Honor a RELEASE_MEM / EVENT_WRITE_EOP completion write. data_sel (Kyty GraphicsCbReleaseMem allows {2,3};
@@ -111,16 +174,15 @@ static void honor_eop_write(const Pm4Command& c) {
                   // #312 stomp-catcher: a live fence label holds small ints/timestamps; a freed
                   // MallocBinned3 FFreeBlock header holds heap POINTERS. Pointer-like pre-content
                   // means this fence write is landing in freed (or reused) memory — log it in the
-                  // act, with the packet address for attribution. Diagnostic only, always-on
-                  // (one 8-byte read per fence write), bounded to 64 reports.
+                  // act, with the packet address + the build-journal verdict (timing vs wrong-
+                  // target). A fence TARGET inside the allocator-metadata region (0x20xxxxxxxx,
+                  // the FPoolInfo tables) is suspect regardless of content. Diagnostic, bounded.
+                  // (Run-1 finding: legit fence labels DO live in the 0x20xxxxxxxx region — a
+                  // target-region trigger caught only benign fences and burned the report cap.
+                  // Trigger on pointer-like PRE-CONTENT only.)
                   uint64_t pre = 0; memcpy(&pre, dst, sizeof pre);
-                  if (pre >= 0x1000000000ull && pre < 0x1200000000ull) {
-                      static std::atomic<int> n{0};
-                      if (n.fetch_add(1) < 64)
-                          fprintf(stderr, "[agc] EOP-WRITE-OVER-POINTER [0x%llx] pre=0x%llx value=0x%llx pkt=0x%llx\n",
-                                  (unsigned long long)c.rel_addr, (unsigned long long)pre,
-                                  (unsigned long long)c.rel_value, (unsigned long long)pkt_addr(c));
-                  }
+                  if (ptr_like(pre))
+                      report_suspect_write("REL1", c.rel_addr, c.rel_value, pre, pkt_addr(c));
                   uint32_t v = (uint32_t)c.rel_value; memcpy(dst, &v, sizeof v);
                   ring_record(c.rel_addr, v, 4, 1, pkt_addr(c)); break; }
         case 2: { if (!c.rel_value_valid) return;
@@ -165,9 +227,61 @@ static void honor_event_write(const Pm4Command& c) {
     wake_on_label(c.event_addr);   // wake any sync_on_address futex waiter on this completion label
 }
 
+// Honor a DMA_DATA packet's memory effect (issue #312 — the MallocBinned3 heap-corruption root
+// cause). DOLL's RHIThread emits DmaData(srcOrImm=0, dst=<per-chunk fence label>, 4 bytes) per
+// translated segment: the GPU-side INIT (label := 0) of the consumed-marker protocol whose
+// completion leg is ReleaseMem(label <- 1). We previously DROPPED every DMA_DATA packet, so the
+// LIFO-recycled label kept the previous generation's 1 and the guest's consumption poll freed the
+// label while fences to it were still in flight (full evidence chain: hle_agc agc_dcb_dma_data).
+// Execution is deliberately GATED to the immediate-fill form (srcOrImm is a 32-bit value, PM4
+// CP-DMA src_sel=DATA semantics: the value is replicated across the destination). DOLL uses two
+// instances of it: the 4-byte per-segment label init above, and 64 KiB zero-fills of freshly
+// allocated 64 KiB-aligned command-stream CHUNKS (whose boundary headers hold the label pointers
+// the consumed-marker emitter reads — a recycled chunk with a stale header is the same stomp).
+// General CP-DMA copies (real src addresses / GDS) stay unexecuted with a bounded log, as before.
+// CONFIDENCE: HIGH on the init form (three-callsite ABI + live page-watch protocol capture);
+// MED on the large-fill form (same selectors + src=0 + fresh-buffer destinations).
+static void honor_dma_data(const Pm4Command& c) {
+    if (eop_writes_disabled() || !c.dd_valid) return;
+    constexpr uint32_t kMaxFill = 0x1000000;   // 16 MiB — far past any observed fill
+    // dst >= 0x10000: a small dst is a GDS offset (unmodeled), and the PROSPER_NULL_PAGE
+    // read-only zero page would otherwise pass guest_readable() and SEGV the memset.
+    bool imm_form = c.dd_bytes >= 1 && c.dd_bytes <= kMaxFill &&
+                    c.dd_dst >= 0x10000 && !(c.dd_dst & 3) && c.dd_src <= 0xffffffffull;
+    if (!imm_form || !guest_readable(c.dd_dst, c.dd_bytes)) {
+        // Not the immediate-fill form we model (or unmapped dst) — log so the gap stays visible.
+        static std::atomic<int> n{0};
+        if (n.fetch_add(1) < 24)
+            fprintf(stderr, "[agc] DMA_DATA not executed (unmodeled form): dst=0x%llx src=0x%llx bytes=%u sels=0x%x\n",
+                    (unsigned long long)c.dd_dst, (unsigned long long)c.dd_src, c.dd_bytes, c.dd_sels);
+        return;
+    }
+    uint32_t v32 = (uint32_t)c.dd_src;
+    uint8_t* dst = (uint8_t*)(uintptr_t)c.dd_dst;
+    if (v32 == 0) {
+        memset(dst, 0, c.dd_bytes);
+    } else {
+        uint32_t i = 0;
+        for (; i + 4 <= c.dd_bytes; i += 4) memcpy(dst + i, &v32, 4);
+        if (i < c.dd_bytes) memcpy(dst + i, &v32, c.dd_bytes - i);
+    }
+    ring_record(c.dd_dst, c.dd_src, (uint8_t)(c.dd_bytes > 255 ? 255 : c.dd_bytes), 4, pkt_addr(c));
+    if (getenv("PROSPER_GFXLOG"))
+        fprintf(stderr, "[agc]   DmaData [0x%llx] := 0x%x (%u bytes)\n",
+                (unsigned long long)c.dd_dst, v32, c.dd_bytes);
+    wake_on_label(c.dd_dst);
+}
+
 // Honor a WRITE_DATA packet: copy the inline dwords to the destination address (same synchronous timing).
 static void honor_write_data(const Pm4Command& c) {
     if (eop_writes_disabled() || !c.wd_addr || (c.wd_addr & 3) || !c.wd_data || !c.wd_num) return;
+    // #312 stomp-catcher (same as the ReleaseMem one): a small label-init WriteData landing over
+    // pointer-like memory, or targeting the allocator-metadata region, is a suspect stomp.
+    if (c.wd_num <= 4) {
+        uint64_t pre = 0; memcpy(&pre, (const void*)(uintptr_t)c.wd_addr, sizeof pre);
+        if (ptr_like(pre))
+            report_suspect_write("WDATA", c.wd_addr, c.wd_data[0], pre, pkt_addr(c));
+    }
     memcpy((void*)(uintptr_t)c.wd_addr, c.wd_data, (size_t)c.wd_num * 4);
     ring_record(c.wd_addr, c.wd_data[0], (uint8_t)(c.wd_num * 4 > 255 ? 255 : c.wd_num * 4), 3, pkt_addr(c));
     if (getenv("PROSPER_GFXLOG"))
@@ -323,8 +437,13 @@ struct DeferredStream { std::vector<DeferItem> items; size_t next = 0; };
 std::vector<DeferredStream> g_deferred;   // FIFO; guarded by the caller's submit mutex
 bool     g_fold_deferring = false;        // current fold hit an unsatisfied wait
 uint64_t g_defer_streams = 0, g_defer_timeouts = 0;
-constexpr uint64_t kDeferTimeoutMs = 500;
+size_t   g_defer_items = 0;               // total queued items across streams (memory guard)
+// 50 ms: real producer fences satisfy the barrier within ~1 ms via the pend queue; anything
+// pending longer is a dependency we don't model — degrade fast instead of stalling the stream
+// half a second (the 500 ms value made a WAIT_DEFER boot crawl at 2 submits/s).
+constexpr uint64_t kDeferTimeoutMs = 50;
 constexpr size_t   kDeferMaxStreams = 256;   // runaway guard: force-flush oldest beyond this
+constexpr size_t   kDeferMaxItems = 200000;  // memory guard (#312 WAIT_DEFER OOM): force-flush
 
 void defer_push(const Pm4Command& c) {
     DeferItem it; it.cmd = c;
@@ -333,6 +452,7 @@ void defer_push(const Pm4Command& c) {
         it.cmd.wd_data = it.wd_copy.data();
     }
     g_deferred.back().items.push_back(std::move(it));
+    g_defer_items++;
 }
 void apply_effect(const Pm4Command& c) {
     using K = Pm4Command::Kind;
@@ -340,6 +460,7 @@ void apply_effect(const Pm4Command& c) {
         case K::ReleaseMem: honor_eop_write(c); break;
         case K::EventWrite: honor_event_write(c); break;
         case K::WriteData:  honor_write_data(c); break;
+        case K::DmaData:    honor_dma_data(c); break;
         case K::Flip:       if (c.flip_valid) prosper_vo_flip_from_gpu(c.flip_handle, c.flip_bufidx,
                                                                        c.flip_mode, c.flip_arg); break;
         default: break;
@@ -358,7 +479,7 @@ int flush_deferred_streams() {
     while (!g_deferred.empty()) {
         DeferredStream& s = g_deferred.front();
         bool blocked = false;
-        bool force = g_deferred.size() > kDeferMaxStreams;
+        bool force = g_deferred.size() > kDeferMaxStreams || g_defer_items > kDeferMaxItems;
         while (s.next < s.items.size()) {
             DeferItem& it = s.items[s.next];
             if (it.cmd.kind == Pm4Command::Kind::WaitRegMem) {
@@ -379,6 +500,7 @@ int flush_deferred_streams() {
             s.next++;
         }
         if (blocked) break;
+        g_defer_items -= s.items.size() < g_defer_items ? s.items.size() : g_defer_items;
         g_deferred.erase(g_deferred.begin());
         completed++;
     }
@@ -509,6 +631,14 @@ void GpuState::apply(const Pm4Command& c) {
             if (g_fold_deferring) { defer_push(c); break; }
             if (eop_write_sync()) honor_event_write(c); else pend_enqueue(c);
             break;
+        case K::DmaData:
+            // CP-DMA memory effect (#312: the per-segment fence-label INIT). Rides the same FIFO
+            // as the other guest-visible writes: stream order between a generation's ReleaseMem
+            // (label <- 1) and the NEXT generation's DmaData (label := 0) at the same recycled
+            // address is exactly what the guest's consumption poll depends on.
+            if (g_fold_deferring) { defer_push(c); break; }
+            if (eop_write_sync()) honor_dma_data(c); else pend_enqueue(c);
+            break;
         case K::WaitRegMem:
             // Real WAIT_REG_MEM semantics (#312): an unsatisfied wait PAUSES this queue — the
             // stream's remaining memory effects are deferred until the condition holds (flushed
@@ -530,10 +660,16 @@ void GpuState::apply(const Pm4Command& c) {
                     static const bool defer_on = [] {
                         const char* e = getenv("PROSPER_WAIT_DEFER");
                         return e && strtol(e, nullptr, 0) != 0; }();
-                    fprintf(stderr, "[agc] WaitRegMem NOT satisfied at fold time: [0x%llx]&0x%llx = 0x%llx, func=%u ref=0x%llx — %s\n",
+                    // #312 discriminator: build-journal age + freed-heap-shaped label content.
+                    uint64_t baddr = 0, bpre = 0, bt = 0;
+                    int have = prosper_fence_journal_lookup(pkt_addr(c), &baddr, &bpre, &bt);
+                    fprintf(stderr, "[agc] WaitRegMem NOT satisfied at fold time: [0x%llx]&0x%llx = 0x%llx, func=%u ref=0x%llx — %s | built@%llums(age=%lldms)%s pre@build=0x%llx%s\n",
                             (unsigned long long)c.wm_addr, (unsigned long long)c.wm_mask,
                             (unsigned long long)(mem & c.wm_mask), c.wm_func, (unsigned long long)c.wm_ref,
-                            defer_on ? "pausing queue (deferred effects)" : "dependency violated");
+                            defer_on ? "pausing queue (deferred effects)" : "dependency violated",
+                            (unsigned long long)bt, have ? (long long)(now_ms() - bt) : -1,
+                            (have && baddr != c.wm_addr) ? " TARGET-CHANGED" : "",
+                            (unsigned long long)bpre, ptr_like(mem) ? " CONTENT-PTR-LIKE(freed?)" : "");
                     if (defer_on) {
                         g_fold_deferring = true;
                         g_defer_streams++;
@@ -602,12 +738,16 @@ void GpuState::apply(const Pm4Command& c) {
         case K::Flip:
             // The GPU reaching the SetFlip packet IS the flip moment: perform the videoout flip so
             // GetFlipStatus advances and the game's frame pacer sees its flipArg complete. Only for
-            // a fully-decoded payload — a short packet must not fabricate a flip. Behind an
-            // unsatisfied wait the flip defers with the other effects (#312); otherwise it rides
-            // the pipe-drain queue like every completion signal (a flip is a lifecycle signal —
-            // the game recycles display buffers on it — and must not be observable mid-submit).
+            // a fully-decoded payload — a short packet must not fabricate a flip.
+            //
+            // #312 WAIT_DEFER liveness: the flip is NOT held behind an unsatisfied barrier. Every
+            // WAIT_DEFER run that paused flips wedged the frame loop within seconds (the pacer
+            // starves and the guest stops submitting — including the producer that would satisfy
+            // the barrier). Withholding only the MEMORY writes (ReleaseMem/WriteData/DmaData) keeps
+            // the corruption-relevant ordering (never show a fence value ahead of its barrier)
+            // while the pacing signals flow; the failure direction becomes "label still reads 0 a
+            // little longer" — the safe side of the guest's consumption poll. CONFIDENCE: MED.
             if (!c.flip_valid) break;
-            if (g_fold_deferring) { defer_push(c); break; }
             if (eop_write_sync()) prosper_vo_flip_from_gpu(c.flip_handle, c.flip_bufidx, c.flip_mode, c.flip_arg);
             else pend_enqueue(c);
             break;

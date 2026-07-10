@@ -24,12 +24,18 @@
 #include <mutex>
 #include <atomic>
 #include <chrono>
+#include <thread>
 
 #ifndef _WIN32
 // #312 label-slot write watch (exec_image_linux.cpp). Weak: tools that link the AGC HLE without
 // the Linux host exec image simply skip the arm.
 extern "C" void prosper_arm_label_watch(uint64_t addr) __attribute__((weak));
+extern "C" void prosper_arm_label_watch_force(uint64_t addr) __attribute__((weak));
 #endif
+// #312 fence BUILD journal (command_processor.cpp): records, per fence packet, the guest-passed
+// target + the target's content at build time + a timestamp — the timing-vs-wrong-target
+// discriminator consulted by the stomp catcher when a fence write lands over freed heap.
+extern "C" void prosper_fence_journal_record(uint64_t pkt, uint64_t addr);
 
 namespace prosper {
 
@@ -279,24 +285,84 @@ HLE(agc_cb_nop) {  // (dcb, num_dwords, ...)
     for (uint32_t i = 1; i < num; i++) cmd[i] = 0;
     return (uint64_t)(uintptr_t)cmd;
 }
-// sceAgcDcbDmaData (WmAc2MEj6Io) — append a DMA_DATA packet; observed args (live capture): a4 = src
-// address, a5 = size in dwords, a1 = dst (0 here, patched later via DmaDataPatchSetDstAddressOrOffset).
-// Custom R_DMA_DATA payload: [1..2]=dst lo/hi, [3..4]=src lo/hi, [5]=size_dw, [6]=flags. Return ptr.
-HLE(agc_dcb_dma_data) {  // (dcb, dst, cache_policy, flags, src, size_dw)
-    // #319 probe: is DmaData part of the per-frame render stream (a GPU-side copy we never execute)?
+// sceAgcDcbDmaData (WmAc2MEj6Io) — append a CP-DMA packet (issue #312, the MallocBinned3 heap-
+// corruption root cause). ABI RE-pinned from three eboot callsites (disassembly, this branch):
+//   sceAgcDcbDmaData(dcb, srcAddressOrOffsetOrImmediate, srcSel?, dstSel?, dstAddressOrOffset,
+//                    <sel/policy>, stack7, stack8, stack9=numBytes, ..., stack12=isBlocking)
+// Evidence for the roles:
+//  - eboot+0x221ad2d..6c: GMalloc->Malloc(size) result (+ running offset) is passed in A4 and the
+//    packet fills it — a freshly-allocated buffer can only be a DESTINATION, so a4 = dst.
+//  - the patcher family names are sceAgcDmaDataPatchSetDstAddressOrOffset (patches [1..2] below)
+//    and sceAgcDmaDataPatchSetSrcAddressOrOffsetOrIMMEDIATE — src can be an immediate value.
+//  - eboot+0x2212384 / 0x220d31e (the RHIThread translate loop's per-segment consumed-marker
+//    emitters): DmaData(src=0, sels=3/3, dst=<chunk fence label>, stack9=4 bytes, blocking) right
+//    before ReleaseMem(label <- 1, data_sel=1). This is the GPU-side LABEL INIT (label := 0): the
+//    guest never CPU-initializes these labels (live page-watch capture), and the labels are LIFO-
+//    recycled heap blocks — without the init, the guest's consumption poll reads the STALE 1 of the
+//    previous generation at the same address, "retires" the segment instantly, frees the label while
+//    this generation's fence packets are still in flight, and our (faithful) value-1 fence writes
+//    then land in freed MallocBinned3 memory — the #312 "Canary was 0x3, should be 0x1" /
+//    "free an unrecognized block 0x1000000001" / 0x20015f00 freelist-pop fatals.
+// numBytes is stack arg9 — beyond the swap stub's 2-arg re-push window, recovered from the intact
+// original guest frame exactly like agc_driver_submit_dcb_variant's arg9 (validated: the re-pushed
+// args must match the originals and the return address must be guest text; on mismatch numBytes
+// stays 0 and the CommandProcessor skips the packet with a loud log — the pre-fix behavior).
+// Custom R_DMA_DATA payload: [1..2]=dst lo/hi, [3..4]=srcOrImm lo/hi, [5]=numBytes, [6]=sels.
+// CONFIDENCE: HIGH on a4=dst/a1=srcOrImm (malloc-destination callsite + patcher names + protocol);
+// MED on the selector args (recorded raw; the executor only honors the small-immediate form).
+HLE(agc_dcb_dma_data) {  // (dcb, srcOrImm, srcSel?, dstSel?, dst, sel/policy, ..., stack9=numBytes)
+    volatile uint64_t* fp = (uint64_t*)__builtin_frame_address(0);
+    uint64_t num_bytes = 0;
+    if (fp[6] == fp[2] && fp[7] == fp[3] &&
+        fp[5] >= 0x400000000ull && fp[5] < 0x500000000ull) {
+        uint64_t n = fp[8];                       // original stack arg9 = byte count
+        if (n && n <= 0x10000000ull) num_bytes = n;
+    }
     static std::atomic<uint64_t> g_dma_n{0};
-    if (getenv("PROSPER_PREDLOG")) {
+    if (getenv("PROSPER_PREDLOG") || getenv("PROSPER_GFXLOG")) {
         uint64_t k = g_dma_n.fetch_add(1);
         if (k < 48 || (k % 4096) == 0)
-            fprintf(stderr, "[pred] DcbDmaData #%llu dst=0x%llx src=0x%llx size_dw=0x%llx flags=0x%llx\n",
-                    (unsigned long long)k, (unsigned long long)a1, (unsigned long long)a4,
-                    (unsigned long long)a5, (unsigned long long)a3);
+            fprintf(stderr, "[pred] DcbDmaData #%llu dst=0x%llx srcOrImm=0x%llx bytes=0x%llx sels=0x%llx/0x%llx\n",
+                    (unsigned long long)k, (unsigned long long)a4, (unsigned long long)a1,
+                    (unsigned long long)num_bytes, (unsigned long long)a2, (unsigned long long)a3);
     }
     uint32_t* cmd; if (!begin_packet(a0, 7, IT_NOP, R_DMA_DATA, &cmd)) return 0;
-    cmd[1] = (uint32_t)(a1 & 0xffffffffu); cmd[2] = (uint32_t)(a1 >> 32u);
-    cmd[3] = (uint32_t)(a4 & 0xffffffffu); cmd[4] = (uint32_t)(a4 >> 32u);
-    cmd[5] = (uint32_t)a5; cmd[6] = (uint32_t)a3;
+    cmd[1] = (uint32_t)(a4 & 0xffffffffu); cmd[2] = (uint32_t)(a4 >> 32u);
+    cmd[3] = (uint32_t)(a1 & 0xffffffffu); cmd[4] = (uint32_t)(a1 >> 32u);
+    cmd[5] = (uint32_t)num_bytes;
+    cmd[6] = (uint32_t)((a2 & 0xffu) | ((a3 & 0xffu) << 8));
     return (uint64_t)(uintptr_t)cmd;
+}
+// sceAgcAcbDmaData (-RnpfpxIhec) — the async-compute-queue sibling. Same operation, shifted ABI
+// (RE'd from the Acb consumed-marker emitter at eboot+0x220d31e, which pairs it with the same
+// sceAgcCbReleaseMem(label<-1): (acb, srcSel?=3, dstSel?=3, dst=label, 2, 3, stack7=srcOrImm=0,
+// stack8=numBytes=4). srcOrImm/numBytes are stack args 7/8 = fp[2]/fp[3], INSIDE the swap stub's
+// forwarded window. CONFIDENCE: MED (single callsite; the executor gate limits the blast radius).
+HLE(agc_acb_dma_data) {  // (acb, srcSel?, dstSel?, dst, ?, ?, stack7=srcOrImm, stack8=numBytes)
+    volatile uint64_t* fp = (uint64_t*)__builtin_frame_address(0);
+    uint64_t src_imm = fp[2], num_bytes = fp[3];
+    if (num_bytes > 0x10000000ull) num_bytes = 0;
+    uint32_t* cmd; if (!begin_packet(a0, 7, IT_NOP, R_DMA_DATA, &cmd)) return 0;
+    cmd[1] = (uint32_t)(a3 & 0xffffffffu); cmd[2] = (uint32_t)(a3 >> 32u);
+    cmd[3] = (uint32_t)(src_imm & 0xffffffffu); cmd[4] = (uint32_t)(src_imm >> 32u);
+    cmd[5] = (uint32_t)num_bytes;
+    cmd[6] = (uint32_t)((a1 & 0xffu) | ((a2 & 0xffu) << 8));
+    return (uint64_t)(uintptr_t)cmd;
+}
+// sceAgcDmaDataPatchSetDstAddressOrOffset (IxYiarKlXxM) / ...SetSrcAddressOrOffsetOrImmediate
+// (cdDRpqcFGbU): patch a built DMA_DATA packet's dst / src field (same patch-placeholder pattern
+// as the #213 sync-packet address patchers; header-verified before writing).
+HLE(agc_patch_dma_data_dst) {  // (cmd, address)
+    auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
+    if (!patch_check(cmd, R_DMA_DATA, "DmaDataPatchSetDst")) return 0;
+    cmd[1] = (uint32_t)(a1 & 0xffffffffu); cmd[2] = (uint32_t)(a1 >> 32u);
+    return 0;
+}
+HLE(agc_patch_dma_data_src) {  // (cmd, addressOrImmediate)
+    auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
+    if (!patch_check(cmd, R_DMA_DATA, "DmaDataPatchSetSrc")) return 0;
+    cmd[3] = (uint32_t)(a1 & 0xffffffffu); cmd[4] = (uint32_t)(a1 >> 32u);
+    return 0;
 }
 HLE(agc_dcb_event_write) {  // (buf, event_type, address)
     // Widen the packet to carry the address (a2) like ReleaseMem (#132): an address-carrying
@@ -333,8 +399,27 @@ HLE(agc_cb_release_mem) {  // sceAgcCbReleaseMem(buf, action, gcr_cntl, dst, cac
 #ifndef _WIN32
         // #312 label watch (PROSPER_WATCH_LABEL=1): watch the first heap-resident fence label's
         // block for the game's allocator free-path writing over it while cbs still signal it.
-        if (prosper_arm_label_watch && a5 >= 0x1000000000ull && a5 < 0x1200000000ull)
+        // Under PROSPER_WATCH_ABS the passed address is ignored (fixed slot) — call unconditionally
+        // so the arm retries until the fixed slot's page is mapped.
+        if (prosper_arm_label_watch &&
+            (getenv("PROSPER_WATCH_ABS") || (a5 >= 0x1000000000ull && a5 < 0x1200000000ull)))
             prosper_arm_label_watch(a5);
+#ifndef _WIN32
+        // PROSPER_WATCH_HOT=N (#312): arm the page watch on the Nth fence BUILD targeting the
+        // same heap-resident label — a long-lived hot label is exactly the population that later
+        // gets freed by the guest while still being fenced (the corruption class). Catches the
+        // allocator's free-path writes over it WITH call stacks (see lwatch).
+        static const long hot_n = [] { const char* e = getenv("PROSPER_WATCH_HOT");
+                                       return e ? atol(e) : 0; }();
+        if (hot_n > 0 && prosper_arm_label_watch_force && a5 >= 0x1000000000ull && a5 < 0x1200000000ull) {
+            constexpr uint32_t kHotSize = 8192;                     // direct-mapped addr -> count
+            static uint64_t hot_addr[kHotSize];
+            static uint32_t hot_cnt[kHotSize];
+            uint32_t s = (uint32_t)((a5 >> 4) * 2654435761u) & (kHotSize - 1);
+            if (hot_addr[s] != a5) { hot_addr[s] = a5; hot_cnt[s] = 0; }
+            if (++hot_cnt[s] == (uint32_t)hot_n) prosper_arm_label_watch_force(a5);
+        }
+#endif
 #endif
         static std::atomic<int> seen_n{0};
         static uint64_t seen_ra[16];
@@ -369,6 +454,7 @@ HLE(agc_cb_release_mem) {  // sceAgcCbReleaseMem(buf, action, gcr_cntl, dst, cac
     cmd[3] = (uint32_t)data_sel;
     cmd[4] = (uint32_t)(data & 0xffffffffu); cmd[5] = (uint32_t)(data >> 32u);
     cmd[6] = (uint32_t)a1;
+    if (data_sel == 1) prosper_fence_journal_record((uint64_t)(uintptr_t)cmd, a5);   // #312 discriminator
     return (uint64_t)(uintptr_t)cmd;
 }
 HLE(agc_dcb_write_data) {  // sceAgcDcbWriteData(buf, dst, cache_policy, address_or_offset, data*, num_dwords, …)
@@ -393,6 +479,7 @@ HLE(agc_dcb_write_data) {  // sceAgcDcbWriteData(buf, dst, cache_policy, address
     cmd[2] = (uint32_t)(a3 & 0xffffffffu); cmd[3] = (uint32_t)(a3 >> 32u);
     cmd[4] = num;
     if (src) for (uint32_t i = 0; i < num; i++) cmd[5 + i] = src[i];
+    if (num <= 4) prosper_fence_journal_record((uint64_t)(uintptr_t)cmd, a3);   // #312 discriminator
     return (uint64_t)(uintptr_t)cmd;
 }
 HLE(agc_dcb_wait_reg_mem) {  // sceAgcDcbWaitRegMem(buf, size, compare_func, op, cache_policy, address, reference, mask, poll_cycles)
@@ -415,6 +502,7 @@ HLE(agc_dcb_wait_reg_mem) {  // sceAgcDcbWaitRegMem(buf, size, compare_func, op,
     cmd[5] = (uint32_t)(reference & 0xffffffffu); cmd[6] = (uint32_t)(reference >> 32u);
     cmd[7] = (uint32_t)a2;                        // compare_function
     cmd[8] = 0;                                   // poll interval hint (arg9 not forwarded; unused by our fold)
+    prosper_fence_journal_record((uint64_t)(uintptr_t)cmd, a5);   // #312 discriminator (wait leg)
     return (uint64_t)(uintptr_t)cmd;
 }
 HLE(agc_dcb_set_flip) {  // (buf, video_out_handle, display_buffer_index, flip_mode, flip_arg) — 6 dw
@@ -864,6 +952,29 @@ extern "C" void prosper_agc_submit_stats(uint64_t* submits, uint64_t* draws) {
     if (draws)   *draws   = (uint64_t)agc_gpu_state().draws.size();
 }
 
+namespace {
+// PROSPER_WAIT_DEFER watchdog (#312): deferred streams were only re-checked at SUBSEQUENT submits,
+// but a guest that waits for a deferred stream's EOP before submitting again deadlocks (observed:
+// boot wedged at submit #1 under WAIT_DEFER). A 2 ms ticker re-runs the flush (same submit mutex),
+// firing the owed EOP pulse the moment a paused stream's condition satisfies (typically via the
+// pend-queue completion writes) or its timeout expires. Started lazily on the first deferred fold;
+// inert unless PROSPER_WAIT_DEFER=1 ever pauses a stream.
+void start_defer_watchdog() {
+    static std::atomic<bool> started{false};
+    bool expect = false;
+    if (!started.compare_exchange_strong(expect, true)) return;
+    std::thread([] {
+        for (;;) {
+            struct timespec ts{ 0, 2000000 };   // 2 ms cadence
+            nanosleep(&ts, nullptr);
+            // EOP pulses fire at submit time (liveness); the flush only applies deferred writes.
+            std::lock_guard<std::mutex> lk(g_agc_state_mu);
+            gpu::flush_deferred_streams();
+        }
+    }).detach();
+}
+}
+
 // Fold one raw Dcb dword stream through the CommandProcessor, fire the GPU EOP completion events, and
 // (if a live renderer is wired and the submit produced draws) execute+present. Shared by the primary
 // submit path (sceAgcDriverSubmitDcb) and the DOLL warmup-submit variant (w1KFAHVqpaU) below.
@@ -875,14 +986,18 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
     uint32_t walk = dw_num ? dw_num : kUnknownCap;
     std::lock_guard<std::mutex> lk(g_agc_state_mu);   // serialize with the other submit entry (#278)
     // #312: flush any earlier stream paused on a WAIT_REG_MEM — this submit may be its producer.
-    for (int i = gpu::flush_deferred_streams(); i > 0; i--) prosper_eq_trigger_eop();
+    gpu::flush_deferred_streams();
     agc_gpu_state().draws.clear();
     size_t applied = gpu::run_command_buffer(addr, walk, agc_gpu_state());
     g_submit_count++;
-    // A fold that PAUSED on an unsatisfied wait has not completed — its EOP pulse fires when its
-    // deferred effects flush (one pulse per completed stream, owed by flush_deferred_streams).
-    if (!gpu::last_fold_deferred()) prosper_eq_trigger_eop();
-    for (int i = gpu::flush_deferred_streams(); i > 0; i--) prosper_eq_trigger_eop();
+    // #312 WAIT_DEFER liveness: the EOP pulse fires at every submit even when the fold paused on
+    // an unsatisfied barrier — withholding it starved the frame pacer and wedged every WAIT_DEFER
+    // run (submits stop, so the producer that would satisfy the barrier never arrives). Only the
+    // stream's MEMORY writes stay deferred; the watchdog flushes them the moment the barrier
+    // satisfies (or the 50 ms timeout degrades to the old proceed-loudly behavior).
+    prosper_eq_trigger_eop();
+    if (gpu::last_fold_deferred()) start_defer_watchdog();
+    gpu::flush_deferred_streams();
     static const unsigned render_every2 = [] {
         const char* e = getenv("PROSPER_RENDER_EVERY"); long v = e ? atol(e) : 1; return v > 0 ? (unsigned)v : 1u; }();
     static unsigned draw_submits2 = 0;
@@ -984,15 +1099,17 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     // Clearing here (not after) keeps this submit's draws inspectable once the handler returns. (Ported
     // from PRs #31/#32.)
     // #312: flush any earlier stream paused on a WAIT_REG_MEM — this submit may be its producer.
-    for (int i = gpu::flush_deferred_streams(); i > 0; i--) prosper_eq_trigger_eop();
+    gpu::flush_deferred_streams();
     agc_gpu_state().draws.clear();
     size_t applied = gpu::run_command_buffer(p->addr, p->dw_num, agc_gpu_state());
     g_submit_count++;
     // The submit has "completed" (synchronous fold): fire any registered GPU EOP events. Inert unless the
     // game called sceGnmAddEqEvent (b0xyllnVY-I); the RELEASE_MEM label write already happened in apply().
-    // #312: a fold that PAUSED on an unsatisfied wait has not completed — its pulse fires at flush.
-    if (!gpu::last_fold_deferred()) prosper_eq_trigger_eop();
-    for (int i = gpu::flush_deferred_streams(); i > 0; i--) prosper_eq_trigger_eop();
+    // #312 WAIT_DEFER liveness: the pulse fires even for a fold paused on an unsatisfied barrier —
+    // only the stream's MEMORY writes stay deferred (see submit_dcb_stream).
+    prosper_eq_trigger_eop();
+    if (gpu::last_fold_deferred()) start_defer_watchdog();
+    gpu::flush_deferred_streams();
     // Stage A: if a live renderer has been registered (runtime binary wires a Vulkan device) and this
     // submit accumulated draws, execute the folded GpuState and present the frame. Inert (returns false)
     // on the pure-HLE path until a device is registered, so it never perturbs the existing boot behavior.
@@ -1029,9 +1146,10 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
         std::vector<gpu::Pm4Command> ops; gpu::decode_pm4(p->addr, p->dw_num, ops);
         static const char* kKindName[] = {"DrawReset","WaitFlipDone","SetShRegDirect","SetRegsIndirect",
             "SetIndexType","DrawIndex","DrawIndexAuto","EventWrite","AcquireMem","WriteData","WaitRegMem",
-            "Flip","ReleaseMem","DispatchDirect","SetIndexBase","SetIndexCount","DrawIndexOffset","Unknown"};
+            "Flip","ReleaseMem","DispatchDirect","SetIndexBase","SetIndexCount","DrawIndexOffset",
+            "Jump","SetPredication","DmaData","Unknown"};
         for (auto& c : ops) {
-            uint32_t k = (uint32_t)c.kind; const char* nm = k < 18 ? kKindName[k] : "?";
+            uint32_t k = (uint32_t)c.kind; const char* nm = k < 21 ? kKindName[k] : "?";
             fprintf(stderr, "[agc]   pkt op=0x%02x r=0x%02x len=%u kind=%s pl0=0x%08x pl1=0x%08x pl2=0x%08x\n",
                     c.op, c.r, c.len, nm,
                     c.len > 1 ? c.payload[0] : 0, c.len > 2 ? c.payload[1] : 0, c.len > 3 ? c.payload[2] : 0);
@@ -1074,18 +1192,21 @@ HLE(agc_patch_write_data_addr) {  // fPSCdQxgpSw (cmd, address): WriteData paylo
     auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
     if (!patch_check(cmd, R_WRITE_DATA, "WriteDataPatchAddress")) return 0;
     cmd[2] = (uint32_t)(a1 & 0xffffffffu); cmd[3] = (uint32_t)(a1 >> 32u);
+    prosper_fence_journal_record((uint64_t)(uintptr_t)cmd, a1);   // #312: target set post-build
     return 0;
 }
 HLE(agc_patch_wait_reg_mem_addr) {  // 3KDcnM3lrcU (cmd, address): WaitRegMem payload [0..1] = address
     auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
     if (!patch_check(cmd, R_WAIT_MEM_64, "WaitRegMemPatchAddress")) return 0;
     cmd[1] = (uint32_t)(a1 & 0xffffffffu); cmd[2] = (uint32_t)(a1 >> 32u);
+    prosper_fence_journal_record((uint64_t)(uintptr_t)cmd, a1);   // #312: target set post-build
     return 0;
 }
 HLE(agc_patch_release_mem_addr) {  // 0fWWK5uG9rQ (cmd, address): ReleaseMem payload [0..1] = address
     auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
     if (!patch_check(cmd, R_RELEASE_MEM, "ReleaseMemPatchAddress")) return 0;
     cmd[1] = (uint32_t)(a1 & 0xffffffffu); cmd[2] = (uint32_t)(a1 >> 32u);
+    prosper_fence_journal_record((uint64_t)(uintptr_t)cmd, a1);   // #312: target set post-build
     return 0;
 }
 
@@ -1146,7 +1267,10 @@ void register_agc_hle() {
     RN("3KDcnM3lrcU", agc_patch_wait_reg_mem_addr);  // WaitRegMem packet: set label address
     RN("0fWWK5uG9rQ", agc_patch_release_mem_addr);   // ReleaseMem packet: set label address
     RN("k3GhuSNmBLU", agc_dcb_dispatch_direct);      // sceAgcDcbDispatchDirect (tg_x, tg_y, tg_z, mod)
-    RN("WmAc2MEj6Io", agc_dcb_dma_data);        // sceAgcDcbDmaData — append DMA_DATA packet (#117)
+    RN("WmAc2MEj6Io", agc_dcb_dma_data);        // sceAgcDcbDmaData — append DMA_DATA packet (#117/#312)
+    RN("-RnpfpxIhec", agc_acb_dma_data);        // sceAgcAcbDmaData — async-compute sibling (#312)
+    RN("IxYiarKlXxM", agc_patch_dma_data_dst);  // sceAgcDmaDataPatchSetDstAddressOrOffset
+    RN("cdDRpqcFGbU", agc_patch_dma_data_src);  // sceAgcDmaDataPatchSetSrcAddressOrOffsetOrImmediate
     RN("YUeqkyT7mEQ", agc_dcb_set_flip);        // sceAgcDcbSetFlip (Kyty LibGraphicsDriver.cpp:98)
     RN("UglJIZjGssM", agc_driver_submit_dcb);   // sceAgcDriverSubmitDcb -> CommandProcessor replay
     RN("w1KFAHVqpaU", agc_driver_submit_dcb_variant);  // final-buffer submit variant (#232, DOLL RHI batch)
