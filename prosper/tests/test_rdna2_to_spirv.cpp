@@ -1426,6 +1426,186 @@ int main() {
     printf("  kernelO(omod:2) mismatches=%u (out[20]=%g expect=%g)\n", badO, gotO.size()==N?gotO[20]:-1, expO[20]);
     CHECK(gotO.size()==N && badO==0, "v_mul_f32 SDWA omod:2 doubles the product: out = (a0*a1)*2");
 
+    // ---- #273 kernels: ops surfaced by DOLL's failing shaders (all llvm-mc gfx1010 verified) ----
+
+    // Kernel T1: v_sin_f32 / v_cos_f32 — RDNA trig input is in REVOLUTIONS (sin/cos of 2π·src).
+    // out = sin(2π·a0) + cos(2π·a1).
+    const uint32_t codeT1[] = { 0x7e006b00u, 0x7e026d01u, 0x06000300u, 0xBF810000u };
+    std::vector<uint32_t> spvT1 = recompile_valu(codeT1, sizeof(codeT1)/4, 2, 0);
+    CHECK(!spvT1.empty(), "recompiled T1 (v_sin/v_cos) -> SPIR-V");
+    std::vector<float> inT1(N * 2), expT1(N);
+    for (uint32_t i = 0; i < N; i++) {
+        float a0 = (float)i * 0.01f - 0.5f, a1 = (float)i * 0.02f;
+        inT1[i*2+0] = a0; inT1[i*2+1] = a1;
+        expT1[i] = std::sin(6.2831853f * a0) + std::cos(6.2831853f * a1);
+    }
+    std::vector<float> gotT1 = prosper::test::run_compute(spvT1, inT1, N, N);
+    uint32_t badT1 = 0; for (uint32_t i=0;i<N&&gotT1.size()==N;i++) if (std::fabs(gotT1[i]-expT1[i])>2e-3f) badT1++;
+    printf("  T1(sin/cos) mismatches=%u (out[30]=%g expect=%g)\n", badT1, gotT1.size()==N?gotT1[30]:-1, expT1[30]);
+    CHECK(gotT1.size()==N && badT1==0, "T1: v_sin/v_cos compute sin/cos(2π·x)");
+
+    // Kernel T2: v_subrev_f32 (e32) — out = a1 - a0.
+    const uint32_t codeT2[] = { 0x0a000300u, 0xBF810000u };
+    std::vector<uint32_t> spvT2 = recompile_valu(codeT2, sizeof(codeT2)/4, 2, 0);
+    CHECK(!spvT2.empty(), "recompiled T2 (v_subrev_f32) -> SPIR-V");
+    std::vector<float> inT2(N * 2), expT2(N);
+    for (uint32_t i = 0; i < N; i++) { float a0=(float)i*0.5f, a1=100.0f-(float)i;
+        inT2[i*2+0]=a0; inT2[i*2+1]=a1; expT2[i]=a1-a0; }
+    std::vector<float> gotT2 = prosper::test::run_compute(spvT2, inT2, N, N);
+    uint32_t badT2 = 0; for (uint32_t i=0;i<N&&gotT2.size()==N;i++) if (std::fabs(gotT2[i]-expT2[i])>1e-3f) badT2++;
+    CHECK(gotT2.size()==N && badT2==0, "T2: v_subrev_f32 computes src1 - src0");
+
+    // Kernel T3: v_min3_f32 + v_max3_f32 — out = min3(a0,a1,a2) + max3(a0,a1,a2).
+    const uint32_t codeT3[] = { 0xd5510003u, 0x040a0300u, 0xd5540004u, 0x040a0300u, 0x06000903u, 0xBF810000u };
+    std::vector<uint32_t> spvT3 = recompile_valu(codeT3, sizeof(codeT3)/4, 3, 0);
+    CHECK(!spvT3.empty(), "recompiled T3 (v_min3/v_max3_f32) -> SPIR-V");
+    std::vector<float> inT3(N * 3), expT3(N);
+    for (uint32_t i = 0; i < N; i++) {
+        float a0=(float)i*0.3f-10.0f, a1=5.0f-(float)i*0.1f, a2=(float)(i%9);
+        inT3[i*3+0]=a0; inT3[i*3+1]=a1; inT3[i*3+2]=a2;
+        expT3[i] = std::fmin(std::fmin(a0,a1),a2) + std::fmax(std::fmax(a0,a1),a2);
+    }
+    std::vector<float> gotT3 = prosper::test::run_compute(spvT3, inT3, N, N);
+    uint32_t badT3 = 0; for (uint32_t i=0;i<N&&gotT3.size()==N;i++) if (std::fabs(gotT3[i]-expT3[i])>1e-3f) badT3++;
+    CHECK(gotT3.size()==N && badT3==0, "T3: v_min3/v_max3_f32 compute 3-way min+max");
+
+    // Kernel T4: v_cvt_pk_u16_u32 — u=(uint)a0; out bits = min(u,0xFFFF) | min(u+1,0xFFFF)<<16.
+    const uint32_t codeT4[] = { 0x7e000f00u, 0x4a020081u, 0xd76a0001u, 0x00020300u, 0xBF810000u };
+    std::vector<uint32_t> spvT4 = recompile_valu(codeT4, sizeof(codeT4)/4, 1, /*out_vgpr*/1);
+    CHECK(!spvT4.empty(), "recompiled T4 (v_cvt_pk_u16_u32) -> SPIR-V");
+    std::vector<float> inT4(N);
+    for (uint32_t i = 0; i < N; i++) inT4[i] = (float)(i * 3);
+    std::vector<float> gotT4 = prosper::test::run_compute(spvT4, inT4, N, N);
+    uint32_t badT4 = 0;
+    for (uint32_t i = 0; i < N && gotT4.size() == N; i++) {
+        uint32_t gb; std::memcpy(&gb, &gotT4[i], 4);
+        uint32_t u = i * 3;
+        if (gb != ((u & 0xFFFFu) | ((u + 1u) << 16))) badT4++;
+    }
+    CHECK(gotT4.size()==N && badT4==0, "T4: v_cvt_pk_u16_u32 packs saturated u16 halves");
+
+    // Kernel T5: s_min_u32 (SCC=s0<s1) + s_max_i32 (SCC=s0>s1) — out bits = bits(a0) + 3 + 5.
+    const uint32_t codeT5[] = { 0x83818387u, 0x840285c2u, 0x4a020001u, 0x4a020202u, 0xBF810000u };
+    std::vector<uint32_t> spvT5 = recompile_valu(codeT5, sizeof(codeT5)/4, 1, 1);
+    CHECK(!spvT5.empty(), "recompiled T5 (s_min_u32/s_max_i32) -> SPIR-V");
+    std::vector<float> gotT5 = prosper::test::run_compute(spvT5, inX, N, N);
+    uint32_t badT5 = 0;
+    for (uint32_t i = 0; i < N && gotT5.size() == N; i++) {
+        uint32_t gb; std::memcpy(&gb, &gotT5[i], 4);
+        if (gb != bits_of(inX[i]) + 8u) badT5++;
+    }
+    CHECK(gotT5.size()==N && badT5==0, "T5: s_min_u32(7,3)=3 + s_max_i32(-2,5)=5");
+
+    // Kernel T6: s_add_u32 carry chain -> s_addc_u32. s0=-1+2 (carry SCC=1); s1=0+0+SCC=1.
+    // out bits = bits(a0) + 1.
+    const uint32_t codeT6[] = { 0x800082c1u, 0x82018080u, 0x4a020001u, 0xBF810000u };
+    std::vector<uint32_t> spvT6 = recompile_valu(codeT6, sizeof(codeT6)/4, 1, 1);
+    CHECK(!spvT6.empty(), "recompiled T6 (s_addc_u32) -> SPIR-V");
+    std::vector<float> gotT6 = prosper::test::run_compute(spvT6, inX, N, N);
+    uint32_t badT6 = 0;
+    for (uint32_t i = 0; i < N && gotT6.size() == N; i++) {
+        uint32_t gb; std::memcpy(&gb, &gotT6[i], 4);
+        if (gb != bits_of(inX[i]) + 1u) badT6++;
+    }
+    CHECK(gotT6.size()==N && badT6==0, "T6: s_addc_u32 adds the carry from s_add_u32");
+
+    // Kernel T7: s_ashr_i32 — s1 = (-8) >> 2 (arithmetic) = -2; out bits = bits(a0) + 0xFFFFFFFE.
+    const uint32_t codeT7[] = { 0xbe8003c8u, 0x91018200u, 0x4a020001u, 0xBF810000u };
+    std::vector<uint32_t> spvT7 = recompile_valu(codeT7, sizeof(codeT7)/4, 1, 1);
+    CHECK(!spvT7.empty(), "recompiled T7 (s_ashr_i32) -> SPIR-V");
+    std::vector<float> gotT7 = prosper::test::run_compute(spvT7, inX, N, N);
+    uint32_t badT7 = 0;
+    for (uint32_t i = 0; i < N && gotT7.size() == N; i++) {
+        uint32_t gb; std::memcpy(&gb, &gotT7[i], 4);
+        if (gb != bits_of(inX[i]) + 0xFFFFFFFEu) badT7++;
+    }
+    CHECK(gotT7.size()==N && badT7==0, "T7: s_ashr_i32 sign-extends the shift");
+
+    // Kernel T8: s_mov_b64 as plain DATA-pair copy (not a wave mask): s2=9; s[0:1]=s[2:3];
+    // out bits = bits(a0) + 9. Previously rejected (src not a recognizable mask).
+    const uint32_t codeT8[] = { 0xbe820389u, 0xbe800402u, 0x4a020000u, 0xBF810000u };
+    std::vector<uint32_t> spvT8 = recompile_valu(codeT8, sizeof(codeT8)/4, 1, 1);
+    CHECK(!spvT8.empty(), "recompiled T8 (s_mov_b64 data-pair copy) -> SPIR-V");
+    std::vector<float> gotT8 = prosper::test::run_compute(spvT8, inX, N, N);
+    uint32_t badT8 = 0;
+    for (uint32_t i = 0; i < N && gotT8.size() == N; i++) {
+        uint32_t gb; std::memcpy(&gb, &gotT8[i], 4);
+        if (gb != bits_of(inX[i]) + 9u) badT8++;
+    }
+    CHECK(gotT8.size()==N && badT8==0, "T8: s_mov_b64 copies a plain scalar pair");
+
+    // Kernel T9: TWO SEQUENTIAL forward uniform ifs (the DOLL color-grade PS shape, #273).
+    // u=(uint)a0; scc=(3<5)=1 -> if1 RUNS (+10,+20); scc=(3<2)=0 -> if2 SKIPPED (+40).
+    // out = (float)(u + 30). Previously rejected (single-forward-if only).
+    const uint32_t codeT9[] = {
+        0x7e020f00u, 0xbe800383u, 0xbf0a8500u, 0xbf840002u, 0x4a02028au, 0x4a020294u,
+        0xbf0a8200u, 0xbf840001u, 0x4a0202a8u, 0x7e000d01u, 0xBF810000u,
+    };
+    std::vector<uint32_t> spvT9 = recompile_valu(codeT9, sizeof(codeT9)/4, 1, 0);
+    CHECK(!spvT9.empty(), "recompiled T9 (two sequential forward ifs) -> SPIR-V");
+    std::vector<float> inT9(N), expT9(N);
+    for (uint32_t i = 0; i < N; i++) { inT9[i] = (float)i; expT9[i] = (float)(i + 30); }
+    std::vector<float> gotT9 = prosper::test::run_compute(spvT9, inT9, N, N);
+    uint32_t badT9 = 0; for (uint32_t i=0;i<N&&gotT9.size()==N;i++) if (gotT9[i]!=expT9[i]) badT9++;
+    printf("  T9(2 seq ifs) mismatches=%u (out[5]=%g expect=%g)\n", badT9, gotT9.size()==N?gotT9[5]:-1, expT9[5]);
+    CHECK(gotT9.size()==N && badT9==0, "T9: taken-if adds 10+20, skipped-if omits 40");
+
+    // Kernel T10: NESTED forward uniform ifs (outer runs, inner skipped): u += 1 only.
+    const uint32_t codeT10[] = {
+        0x7e020f00u, 0xbe800383u, 0xbf0a8500u, 0xbf840004u, 0x4a020281u, 0xbf088700u,
+        0xbf840001u, 0x4a020282u, 0x7e000d01u, 0xBF810000u,
+    };
+    std::vector<uint32_t> spvT10 = recompile_valu(codeT10, sizeof(codeT10)/4, 1, 0);
+    CHECK(!spvT10.empty(), "recompiled T10 (nested forward ifs) -> SPIR-V");
+    std::vector<float> gotT10 = prosper::test::run_compute(spvT10, inT9, N, N);
+    uint32_t badT10 = 0; for (uint32_t i=0;i<N&&gotT10.size()==N;i++) if (gotT10[i]!=(float)(i+1)) badT10++;
+    printf("  T10(nested ifs) mismatches=%u (out[5]=%g expect=%g)\n", badT10, gotT10.size()==N?gotT10[5]:-1, (float)(5+1));
+    CHECK(gotT10.size()==N && badT10==0, "T10: outer if runs (+1), nested inner if skipped (+2 omitted)");
+
+    // Kernel T11: VOPC SDWA with an ABS source modifier — |a0| > a1 ? 1.0 : 0.0. Previously the
+    // decoder kept has_modifier for VOPC neg/abs and the whole compare rejected.
+    const uint32_t codeT11[] = { 0x7c0802f9u, 0x06260000u, 0xd5010000u, 0x01a9e480u, 0xBF810000u };
+    std::vector<uint32_t> spvT11 = recompile_valu(codeT11, sizeof(codeT11)/4, 2, 0);
+    CHECK(!spvT11.empty(), "recompiled T11 (VOPC SDWA |abs| modifier) -> SPIR-V");
+    std::vector<float> inT11(N * 2), expT11(N);
+    for (uint32_t i = 0; i < N; i++) {
+        float a0 = (float)i - 60.0f, a1 = 30.0f;
+        inT11[i*2+0] = a0; inT11[i*2+1] = a1; expT11[i] = std::fabs(a0) > a1 ? 1.0f : 0.0f;
+    }
+    std::vector<float> gotT11 = prosper::test::run_compute(spvT11, inT11, N, N);
+    uint32_t badT11 = 0; for (uint32_t i=0;i<N&&gotT11.size()==N;i++) if (gotT11[i]!=expT11[i]) badT11++;
+    CHECK(gotT11.size()==N && badT11==0, "T11: v_cmp_gt_f32_sdwa applies |src0| before comparing");
+
+    // Kernel T12: PC-RELATIVE EMBEDDED TABLE (#273 — DOLL's dither PS idiom). The shader builds a
+    // V# with s_getpc_b64 + adds and buffer_loads from a constant table appended AFTER s_endpgm in
+    // the code blob. The recompiler folds the load to a compile-time lookup.
+    //   getpc s[4:5]; s4+=48; addc s5; s6=16(num_records); s7=cfg; u=(uint)a0; byteoff=u*4;
+    //   buffer_load_dword v1, v1, s[4:7], 0 offen  -> table[u]; out=(float)v1.
+    // Table at byte 52 of the blob = 48 bytes past the getpc-return (byte 4). llvm-mc gfx1010.
+    const uint32_t codeT12[] = {
+        0xbe841f00u,               // s_getpc_b64 s[4:5]
+        0x800404b0u,               // s_add_u32 s4, 48, s4
+        0x82050580u,               // s_addc_u32 s5, 0, s5
+        0xbe860390u,               // s_mov_b32 s6, 16
+        0xbe8703ffu, 0x10005004u,  // s_mov_b32 s7, 0x10005004
+        0x7e020f00u,               // v_cvt_u32_f32 v1, v0
+        0x34020282u,               // v_lshlrev_b32 v1, 2, v1
+        0xe0301000u, 0x80010101u,  // buffer_load_dword v1, v1, s[4:7], 0 offen
+        0xbf8c3f70u,               // s_waitcnt vmcnt(0)
+        0x7e000d01u,               // v_cvt_f32_u32 v0, v1
+        0xBF810000u,               // s_endpgm
+        7u, 11u, 13u, 17u,         // the embedded table (16 bytes)
+    };
+    std::vector<uint32_t> spvT12 = recompile_valu(codeT12, sizeof(codeT12)/4, 1, 0);
+    CHECK(!spvT12.empty(), "recompiled T12 (s_getpc_b64 embedded-table load) -> SPIR-V");
+    std::vector<float> inT12(N), expT12(N);
+    const uint32_t tabT12[4] = {7u, 11u, 13u, 17u};
+    for (uint32_t i = 0; i < N; i++) { inT12[i] = (float)(i % 4); expT12[i] = (float)tabT12[i % 4]; }
+    std::vector<float> gotT12 = prosper::test::run_compute(spvT12, inT12, N, N);
+    uint32_t badT12 = 0; for (uint32_t i=0;i<N&&gotT12.size()==N;i++) if (gotT12[i]!=expT12[i]) badT12++;
+    printf("  T12(pcrel table) mismatches=%u (out[2]=%g expect=%g)\n", badT12, gotT12.size()==N?gotT12[2]:-1, expT12[2]);
+    CHECK(gotT12.size()==N && badT12==0, "T12: buffer_load through a getpc-built V# reads the embedded table");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

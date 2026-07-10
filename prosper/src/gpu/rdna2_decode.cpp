@@ -53,12 +53,14 @@ void decode_operands(Rdna2Inst& i) {
                 const uint32_t sd = i.words[1];
                 i.src[0] = ((sd >> 23) & 1u) ? decode_src_field(sd & 0xFFu) : vgpr(sd & 0xFFu);  // S0 -> scalar
                 i.n_src = 1;
-                // "Trivial-or-modifier-only" SDWA: DWORD(6) sels, no clamp/omod, no sext/reserved — but
-                // src0 neg@20/abs@21 are read + applied by the recompiler (like VOP3). Any real sub-dword
-                // select or sext keeps has_modifier and is rejected.
+                // "Trivial-or-modifier-only" SDWA: DWORD(6) sels, no sext/reserved — src0 neg@20/abs@21
+                // AND the output modifiers CLAMP@13 / OMOD@[15:14] are read + applied by the recompiler
+                // (like VOP2/VOP3; DOLL VS: `v_exp_f32_sdwa v0, v0 clamp`). Any real sub-dword select
+                // or sext keeps has_modifier and is rejected.
                 i.src_neg[0] = ((sd >> 20) & 1u) != 0; i.src_abs[0] = ((sd >> 21) & 1u) != 0;
+                i.clamp = ((sd >> 13) & 1u) != 0; i.omod = (uint8_t)((sd >> 14) & 3u);
                 if (((sd >> 8) & 7u) == 6u && ((sd >> 16) & 7u) == 6u &&
-                    !((sd >> 13) & 1u) && !((sd >> 14) & 3u) && !((sd >> 19) & 0x9u)) i.has_modifier = false;
+                    !((sd >> 19) & 0x9u)) i.has_modifier = false;
             } else { i.src[0] = decode_src_field(w & 0x1FFu); i.n_src = 1; }
             break;
         case Rdna2Format::VOP2:
@@ -92,10 +94,14 @@ void decode_operands(Rdna2Inst& i) {
                 i.n_src = 2;
                 // SDWAB: bit15 = SD (write the SDST SGPR pair instead of VCC), bits[14:8] = SDST index.
                 if ((sd >> 15) & 1u) i.dst = sgpr((sd >> 8) & 0x7Fu);
-                // VOPC SDWA has NO dst_sel/clamp/omod (byte1 holds SDST/SD, not a VGPR dst_sel); trivial
-                // iff both source selects are DWORD and no source modifiers.
+                // VOPC SDWA has NO dst_sel/clamp/omod (byte1 holds SDST/SD, not a VGPR dst_sel). Source
+                // float modifiers src0 neg@20/abs@21, src1 neg@28/abs@29 are read + applied by the
+                // recompiler (like VOP2/VOP3 — DOLL: `v_cmp_gt_f32_sdwa vcc_lo, |v5|, s4`); trivial iff
+                // both source selects are DWORD and no SEXT(19/27)/reserved(22/30) bits.
+                i.src_neg[0] = ((sd >> 20) & 1u) != 0; i.src_abs[0] = ((sd >> 21) & 1u) != 0;
+                i.src_neg[1] = ((sd >> 28) & 1u) != 0; i.src_abs[1] = ((sd >> 29) & 1u) != 0;
                 if (((sd >> 16) & 7u) == 6u && ((sd >> 24) & 7u) == 6u &&
-                    !((sd >> 19) & 0xFu) && !((sd >> 27) & 0xFu))
+                    !((sd >> 19) & 0x9u) && !((sd >> 27) & 0x9u))
                     i.has_modifier = false;
             } else { i.src[0] = decode_src_field(w & 0x1FFu); i.src[1] = vgpr(w >> 9); i.n_src = 2; }
             break;

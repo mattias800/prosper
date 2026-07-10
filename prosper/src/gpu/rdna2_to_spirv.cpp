@@ -35,14 +35,15 @@ enum : uint32_t {
     Op_BitwiseXor=198, Op_BitwiseAnd=199, Op_Not=200, Op_BitFieldSExtract=202, Op_BitFieldUExtract=203,
     Op_BitReverse=204, Op_UConvert=113,
     Op_TypeImage=25, Op_TypeSampledImage=27, Op_SampledImage=86,
-    Op_ImageSampleImplicitLod=87, Op_ImageSampleExplicitLod=88, Op_ImageFetch=95, Op_Image=100,
+    Op_ImageSampleImplicitLod=87, Op_ImageSampleExplicitLod=88, Op_ImageFetch=95, Op_ImageGather=96, Op_Image=100,
     Op_ImageRead=98, Op_ImageWrite=99,
     Op_TypeArray=28, Op_ControlBarrier=224,
     Op_Phi=245, Op_LoopMerge=246,
     Op_SelectionMerge=247, Op_Label=248, Op_Branch=249, Op_BranchConditional=250, Op_Kill=252, Op_Return=253,
 };
 // GLSL.std.450 extended-instruction numbers.
-enum : uint32_t { Glsl_FAbs=4, Glsl_RoundEven=2, Glsl_Trunc=3, Glsl_Floor=8, Glsl_Ceil=9, Glsl_Fract=10, Glsl_Exp2=29, Glsl_Log2=30,
+enum : uint32_t { Glsl_FAbs=4, Glsl_RoundEven=2, Glsl_Trunc=3, Glsl_Floor=8, Glsl_Ceil=9, Glsl_Fract=10, Glsl_Sin=13, Glsl_Cos=14,
+                  Glsl_Exp2=29, Glsl_Log2=30,
                   Glsl_Sqrt=31, Glsl_InverseSqrt=32, Glsl_FMin=37, Glsl_UMin=38, Glsl_SMin=39, Glsl_FMax=40,
                   Glsl_UMax=41, Glsl_SMax=42, Glsl_PackHalf2x16=58, Glsl_UnpackHalf2x16=62 };
 enum : uint32_t {
@@ -56,7 +57,7 @@ enum : uint32_t {
     Cap_StorageImageReadWithoutFormat=55, Cap_StorageImageWriteWithoutFormat=56,  // for Format=Unknown storage images
     Img_Sampled_Storage=2,   // OpTypeImage "Sampled" operand: 2 = used WITHOUT a sampler (read/write storage image)
     ImgFmt_Unknown=0,        // OpTypeImage "Image Format": Unknown (runtime view format; needs the caps above)
-    ImgOp_Lod=2, ImgOp_Sample=0x40,   // ImageOperands bits: explicit LOD (Fetch on sampled img) / MSAA Sample index.
+    ImgOp_Bias=1, ImgOp_Lod=2, ImgOp_Sample=0x40,   // ImageOperands bits: LOD bias / explicit LOD / MSAA Sample index.
     SC_Workgroup=4, Scope_Workgroup=2, MemSem_WGAcqRel=0x108,   // LDS: Workgroup storage + barrier scope/semantics
     Dec_Block=2, Dec_ArrayStride=6, Dec_BuiltIn=11, Dec_Flat=14, Dec_Location=30, Dec_Binding=33,
     Dec_DescriptorSet=34, Dec_Offset=35,
@@ -340,6 +341,42 @@ struct SpirvCompute {
         uint32_t si    = id(); put(code, Op_Load, {t_sampled_image, si, tex_var[binding]});
         uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
         uint32_t res   = id(); put(code, Op_ImageSampleExplicitLod, {t_v4f, res, si, coord, ImgOp_Lod, bcf(lod_bits)});
+        for (uint32_t c = 0; c < 4; c++) {
+            uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, res, c}); out[c] = bcu(e);
+        }
+    }
+    // image_sample_lz from a 3D texture: explicit LOD (usually 0) on a (u,v,w) coord. Stage-agnostic.
+    void image_sample_lod_3d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t w_bits,
+                             uint32_t lod_bits, uint32_t out[4]) {
+        uint32_t simg  = sampled_image_type(Dim_3D);
+        uint32_t si    = id(); put(code, Op_Load, {simg, si, tex_var[binding]});
+        uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v3f(), coord, bcf(u_bits), bcf(v_bits), bcf(w_bits)});
+        uint32_t res   = id(); put(code, Op_ImageSampleExplicitLod, {t_v4f, res, si, coord, ImgOp_Lod, bcf(lod_bits)});
+        for (uint32_t c = 0; c < 4; c++) {
+            uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, res, c}); out[c] = bcu(e);
+        }
+    }
+    // image_sample_b 2D: implicit-LOD sample with an LOD BIAS (bias_bits float). Bias only means
+    // anything with implicit LOD (fragment derivatives); outside the fragment stage the op resolves
+    // like the other samples there — explicit LOD 0 (bias dropped, matching image_sample_2d's rule).
+    void image_sample_bias_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t bias_bits, uint32_t out[4]) {
+        uint32_t si    = id(); put(code, Op_Load, {t_sampled_image, si, tex_var[binding]});
+        uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
+        uint32_t res   = id();
+        if (is_fragment) put(code, Op_ImageSampleImplicitLod, {t_v4f, res, si, coord, ImgOp_Bias, bcf(bias_bits)});
+        else             put(code, Op_ImageSampleExplicitLod, {t_v4f, res, si, coord, ImgOp_Lod, fconstf(0.0f)});
+        for (uint32_t c = 0; c < 4; c++) {
+            uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, res, c}); out[c] = bcu(e);
+        }
+    }
+    // image_gather4_lz 2D: OpImageGather of component `comp` (0..3) — the 2x2 footprint's four texels
+    // of one channel, in the DX/GL gather order ((0,1),(1,1),(1,0),(0,0)), which the AMD gather4
+    // result order matches. Gather always samples the base level (== the _lz behavior). out[0..3] =
+    // the four gathered values as raw bits.
+    void image_gather_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t comp, uint32_t out[4]) {
+        uint32_t si    = id(); put(code, Op_Load, {t_sampled_image, si, tex_var[binding]});
+        uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
+        uint32_t res   = id(); put(code, Op_ImageGather, {t_v4f, res, si, coord, uconst(comp)});
         for (uint32_t c = 0; c < 4; c++) {
             uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, res, c}); out[c] = bcu(e);
         }
@@ -808,6 +845,10 @@ struct RegState {
     uint32_t scc = 0;          // scalar condition code (bool); set by s_cmp_*/SCC-writing SOP2, read by s_cselect
     uint32_t exec = 0;         // per-lane execution mask (bool); v_cmpx narrows it, output store honors it
     bool exec_narrowed = false; // true once EXEC is narrowed below all-lanes-on (so VGPR writes predicate)
+    // PC-relative EMBEDDED TABLES (#273): mubuf pc -> the table's dwords, resolved by
+    // detect_pcrel_tables (an s_getpc_b64-derived V# whose num_records is a known constant). The
+    // shader BLOB carries the table; the recompiler folds it into a compile-time constant lookup.
+    std::unordered_map<uint32_t, std::vector<uint32_t>> mubuf_pcrel_tables;
 };
 
 // Predicate a just-computed VGPR write against EXEC: under a narrowed mask, inactive lanes keep their
@@ -843,23 +884,73 @@ bool sopp_is_noop(const Rdna2Inst& in) {
 // descriptor source) we give up and report NOT-dead. Checking value ∈ {R, R-1} covers both a 32-bit read
 // of R and a 64-bit pair whose low half is R-1. (RE-TAG: divergent-block scalar liveness.)
 inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t target, int R) {
+    // A "dead by redefinition at pc P" claim is only sound if execution cannot ENTER the region
+    // (target, P] from a branch elsewhere (which would skip the redef and reach a later read).
+    auto entered_between = [&](uint32_t upto) -> bool {
+        for (const auto& br : ins) {
+            if (br.fmt != Rdna2Format::SOPP || sopp_is_noop(br)) continue;
+            if (br.opcode < 0x02 || br.opcode > 0x09 || br.opcode == 0x03) continue;   // branches only
+            uint32_t t = br.pc + br.len_dwords + (uint32_t)(int32_t)br.simm16;
+            if (t > target && t <= upto) return true;
+        }
+        return false;
+    };
     for (const auto& in : ins) {
         if (in.pc < target) continue;
         if (in.is_end) return true;                        // never read past here -> dead
+        // VCC (R = 106/107) has IMPLICIT readers the operand scan can't see: the e32 VOP2 carry /
+        // cndmask ops (0x01, 0x28-0x2A) and the vccz/vccnz branches. Flag those as reads up front so
+        // the redef checks below are sound for VCC too (which the s_mov carve-out excludes, but the
+        // SMEM carve-out needs — compilers love `s_buffer_load_dword vcc_lo, …` scratch loads).
+        if (R == 106 || R == 107) {
+            if (in.fmt == Rdna2Format::VOP2 &&
+                (in.opcode == 0x01 || (in.opcode >= 0x28 && in.opcode <= 0x2A))) return false;
+            if (in.fmt == Rdna2Format::SOPP && (in.opcode == 0x06 || in.opcode == 0x07)) return false;
+        }
         switch (in.fmt) {
             // SOPK is intentionally EXCLUDED: several SOPK ops (s_addk/s_mulk/s_cmovk/s_cmpk) READ or
             // read-modify-write their "dst" via the implicit SIMM16, but decode with n_src==0 — so the
             // read-scan below can't see the read and the dst-match would falsely report a redefinition.
+            case Rdna2Format::SOPP:
+                // Hint/sync SOPPs read and write nothing — scan through them (s_waitcnt is ubiquitous
+                // after the merge). Branches (and anything else) invalidate the LINEAR scan — a skipped
+                // redefinition would make the dead claim unsound — so bail conservatively.
+                if (sopp_is_noop(in)) break;
+                return false;
+            case Rdna2Format::SMEM: {
+                // s_load/s_buffer_load: reads the SBASE pair (src[0], 2 regs) + SOFFSET (src[1]);
+                // redefines N consecutive dst SGPRs. Anything not a plain load -> bail.
+                uint32_t n = 0;
+                switch (in.opcode) {
+                    case 0x0: case 0x8: n = 1;  break;   case 0x1: case 0x9: n = 2;  break;
+                    case 0x2: case 0xA: n = 4;  break;   case 0x3: case 0xB: n = 8;  break;
+                    case 0x4: case 0xC: n = 16; break;
+                    default: return false;
+                }
+                if (in.src[0].value == R || in.src[0].value + 1 == R) return false;         // SBASE read
+                if ((in.src[1].kind == OperandKind::SGPR || in.src[1].kind == OperandKind::Special) &&
+                    in.src[1].value == R) return false;                                     // SOFFSET read
+                if (R >= in.dst.value && R < in.dst.value + (int)n) return !entered_between(in.pc);  // redefined
+                break;
+            }
             case Rdna2Format::SOP1: case Rdna2Format::SOP2: case Rdna2Format::SOPC:
             case Rdna2Format::VOP1: case Rdna2Format::VOP2: case Rdna2Format::VOP3: case Rdna2Format::VOPC:
             case Rdna2Format::EXP:   // EXP data sources are all VGPRs — it can never read an SGPR
                 for (int k = 0; k < in.n_src; k++)
-                    if (in.src[k].kind == OperandKind::SGPR &&
+                    if ((in.src[k].kind == OperandKind::SGPR || in.src[k].kind == OperandKind::Special) &&
                         (in.src[k].value == R || in.src[k].value == R - 1)) return false;   // read before redef -> live
-                // A redefinition kills R only if it's a plain numbered SGPR dst (s0..s105). EXEC/VCC/M0
-                // (106/107/124/126/127) also decode as SGPR-kind here but are read implicitly, never as an
-                // SGPR operand — the scan can't observe their reads, so we must not treat them as redefs.
-                if (in.dst.kind == OperandKind::SGPR && in.dst.value == R && R <= 105) return true;
+                // A VOP3B carry-out (sdst) is a 64-bit mask write — reads none of R beyond its sources.
+                if (in.sdst.kind == OperandKind::SGPR &&
+                    (in.sdst.value == R || in.sdst.value + 1 == R)) return !entered_between(in.pc);   // redefined (pair)
+                // A VOPC e32 compare writes the whole VCC pair — kills both halves.
+                if (in.fmt == Rdna2Format::VOPC &&
+                    (in.dst.value == 106 || in.dst.value == 107) && (R == 106 || R == 107))
+                    return !entered_between(in.pc);
+                // A redefinition kills R for a plain numbered SGPR dst (s0..s105) — and now also for
+                // VCC_LO/HI (106/107), whose implicit readers are enumerated above. EXEC/M0
+                // (124/126/127) still can't be proven dead (implicit reads everywhere).
+                if (in.dst.kind == OperandKind::SGPR && in.dst.value == R && R <= 107)
+                    return !entered_between(in.pc);
                 break;
             default:
                 return false;   // memory/branch/interp/unknown: can't bound reads of R -> assume live
@@ -927,6 +1018,25 @@ std::unordered_set<uint32_t> safe_execz_branches(const std::vector<Rdna2Inst>& i
                 const int hi = in.dst.value + (b64 ? 1 : 0);
                 if (hi <= 105 && sgpr_dead_at_merge(ins, target, in.dst.value) &&
                     (!b64 || sgpr_dead_at_merge(ins, target, in.dst.value + 1))) continue;
+            }
+            // A scalar LOAD (s_load/s_buffer_load) inside the block is likewise safe iff every SGPR it
+            // writes is DEAD at the merge: the load itself is wave-uniform and fault-free, and a result
+            // overwritten before any read is never observed by post-merge code. This is the divergent
+            // lighting/fog block's `s_buffer_load_dwordx2 vcc, …` scratch-load shape (DOLL VS, #273);
+            // sgpr_dead_at_merge understands VCC's implicit readers, so vcc-targeted loads qualify.
+            if (in.fmt == Rdna2Format::SMEM) {
+                uint32_t n = 0;
+                switch (in.opcode) {
+                    case 0x0: case 0x8: n = 1;  break;   case 0x1: case 0x9: n = 2;  break;
+                    case 0x2: case 0xA: n = 4;  break;   case 0x3: case 0xB: n = 8;  break;
+                    case 0x4: case 0xC: n = 16; break;   default: break;
+                }
+                if (n) {
+                    bool all_dead = true;
+                    for (uint32_t k = 0; k < n && all_dead; k++)
+                        all_dead = sgpr_dead_at_merge(ins, target, in.dst.value + (int)k);
+                    if (all_dead) continue;
+                }
             }
             ok = false;
             break;
@@ -1087,6 +1197,72 @@ ForwardIf detect_forward_if(const std::vector<Rdna2Inst>& ins, bool allow_vcc,
     return F;
 }
 
+// MULTIPLE structured uniform IFs — the generalization of detect_forward_if to N forward
+// s_cbranch_scc*/vcc* branches that form a properly-NESTED (or disjoint sequential) region tree.
+// Real shaders routinely carry several sequential uniform ifs (DOLL's color-grade PS: two
+// `s_cbranch_vccz` blocks) or a nested guard (`vccz L1; …; vccz L2` with L2 < L1). Same per-branch
+// validity rules as detect_forward_if (forward target inside the stream, or a VERIFIED early-out
+// clamped to s_endpgm; scc branches in `skip` are alpha-test kill-masks handled by linearization);
+// plus a structural check: blocks must nest or be disjoint — a partial overlap (branch into the
+// middle of another block) is not an if-tree and rejects. Returns branches in pc order; empty =
+// no/unsupported control flow (the caller falls back to straight-line, which rejects loudly at the
+// branch). s_branch / execz / execnz still reject wholesale, exactly like detect_forward_if.
+// CONFIDENCE: HIGH on the structure (guarded by the phi machinery shared with the single-if path).
+std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, bool allow_vcc,
+                                          const uint32_t* code, size_t dwords,
+                                          const std::unordered_set<uint32_t>* skip = nullptr) {
+    std::vector<ForwardIf> out;
+    uint32_t end_pc = UINT32_MAX;
+    for (const auto& in : ins) if (in.is_end) { end_pc = in.pc; break; }
+    for (const auto& in : ins) {
+        if (in.is_end) break;
+        if (in.fmt != Rdna2Format::SOPP) continue;
+        switch (in.opcode) {
+            case 0x02: case 0x09: return {};                         // s_branch / execnz -> reject
+            case 0x08:                                               // execz: allowed ONLY when it's a
+                if (skip && skip->count(in.pc)) continue;            // safe-linearized predication branch
+                return {};                                           // (emit_alu no-ops it inside emit_range)
+            case 0x06: case 0x07:                                    // vccz / vccnz
+                if (!allow_vcc) return {};
+                break;
+            case 0x04: case 0x05:                                    // scc0 / scc1
+                if (skip && skip->count(in.pc)) continue;            // kill-mask branch: linearized, not an if
+                break;
+            default: continue;                                       // hints
+        }
+        uint32_t tgt = branch_target(in);
+        bool early = false;
+        if (tgt > end_pc && tgt != UINT32_MAX) {                     // possible early-out past s_endpgm:
+            if (!code || tgt >= dwords) return {};                   // verify the target terminates (see
+            std::vector<Rdna2Inst> tail;                             // detect_forward_if for the rationale)
+            rdna2_walk(code + tgt, dwords - tgt, tail);
+            bool ends_immediately = false;
+            for (const auto& ti : tail) {
+                if (ti.is_end) { ends_immediately = true; break; }
+                if (ti.fmt == Rdna2Format::SOPP && ti.opcode == 0x00) continue;
+                break;
+            }
+            if (!ends_immediately) return {};
+            tgt = end_pc; early = true;
+        }
+        if (tgt <= in.pc || tgt > end_pc) return {};                 // must be forward, within the stream
+        ForwardIf F;
+        F.found = true; F.branch_pc = in.pc; F.target_pc = tgt; F.early_out = (early || tgt == end_pc);
+        F.on_scc0 = (in.opcode == 0x04 || in.opcode == 0x06);
+        F.on_vcc  = (in.opcode == 0x06 || in.opcode == 0x07);
+        out.push_back(F);
+    }
+    // Structural nesting check (branches are already in pc order): each new block must lie entirely
+    // inside the innermost still-open block, or start after it closed. Partial overlap -> reject.
+    std::vector<uint32_t> open;
+    for (const auto& F : out) {
+        while (!open.empty() && open.back() <= F.branch_pc) open.pop_back();
+        if (!open.empty() && F.target_pc > open.back()) return {};
+        open.push_back(F.target_pc);
+    }
+    return out;
+}
+
 // Registers WRITTEN in the pc range [lo, hi): candidates for an OpPhi at the loop header. Over-
 // approximation is safe (an extra phi for a non-carried value merges equal values). Mirrors emit_alu's
 // write targets, INCLUDING multi-register writes (MIMG dmask -> N consecutive VGPRs, SMEM -> N SGPRs) so
@@ -1105,7 +1281,7 @@ void loop_written_regs(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t 
                 if (in.opcode == 0x36) vregs.insert(in.dst.value); break;
             case Rdna2Format::MUBUF: {                                     // load_format/load: N consecutive VGPRs
                 uint32_t n = 1; switch (in.opcode) { case 0x1: case 0x5: case 0xD: n=2; break;
-                    case 0x2: case 0x6: n=3; break; case 0x3: case 0x7: case 0xE: n=4; break; }
+                    case 0x2: case 0x6: case 0xF: n=3; break; case 0x3: case 0x7: case 0xE: n=4; break; }
                 for (uint32_t k = 0; k < n; k++) vregs.insert(in.dst.value + (int)k); break;
             }
             case Rdna2Format::MIMG: {                                      // image_load: one VGPR per dmask bit
@@ -1222,10 +1398,45 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                             rs.exec = b.btrue(); rs.exec_narrowed = false;   // exec = all lanes on
                         } else { uint32_t m = src_mask(in.src[0]); if (!m) ok = false;
                                  else { rs.exec = m; rs.exec_narrowed = saved_narrowed(in.src[0]); } }
-                    } else {                                // s_mov_b64 sDST, <mask> : save a mask
-                        uint32_t m = src_mask(in.src[0]); if (!m) ok = false;
-                        else { rs.sreg_bool[in.dst.value] = m;
-                               rs.sreg_bool_narrowed[in.dst.value] = is_exec(in.src[0]) ? rs.exec_narrowed : saved_narrowed(in.src[0]); }
+                    } else {                                // s_mov_b64 sDST, <mask-or-data> : save a mask / copy a pair
+                        uint32_t m = src_mask(in.src[0]);
+                        if (m) { rs.sreg_bool[in.dst.value] = m;
+                                 rs.sreg_bool_narrowed[in.dst.value] = is_exec(in.src[0]) ? rs.exec_narrowed : saved_narrowed(in.src[0]); }
+                        // s_mov_b64 ALSO moves a plain 64-bit VALUE (a descriptor pair, a scratch pair,
+                        // an inline constant) — compilers use it to shuffle T#/V# halves and constants,
+                        // not just wave masks. Copy the data SSA + descriptor provenance (sreg_srt) for
+                        // both halves so a later ALU read / buffer op resolves; an untracked source half
+                        // clears the stale dest entry rather than aliasing old data. Mask save (above)
+                        // and data copy coexist: reads pick their own domain. CONFIDENCE: HIGH.
+                        bool data_copied = false;
+                        if (in.src[0].kind == OperandKind::SGPR ||
+                            (in.src[0].kind == OperandKind::Special && in.src[0].value >= 106 && in.src[0].value <= 123)) {
+                            for (int k = 0; k < 2; k++) {
+                                int s = in.src[0].value + k, dr = in.dst.value + k;
+                                auto it = rs.sreg.find(s);
+                                if (it != rs.sreg.end()) rs.sreg[dr] = it->second; else rs.sreg.erase(dr);
+                                auto jt = rs.sreg_srt.find(s);
+                                if (jt != rs.sreg_srt.end()) rs.sreg_srt[dr] = jt->second; else rs.sreg_srt.erase(dr);
+                            }
+                            data_copied = true;
+                        } else if (in.src[0].kind == OperandKind::InlineInt) {   // 64-bit sign-extended constant
+                            rs.sreg[in.dst.value]     = b.uconst((uint32_t)in.src[0].value);
+                            rs.sreg[in.dst.value + 1] = b.uconst(in.src[0].value < 0 ? 0xFFFFFFFFu : 0u);
+                            rs.sreg_srt.erase(in.dst.value); rs.sreg_srt.erase(in.dst.value + 1);
+                            data_copied = true;
+                        } else if (in.src[0].kind == OperandKind::Literal) {
+                            // 32-bit literal on a B64 move: zero-extended (the f64 high-placement rule is
+                            // for double operands only; integer/untyped b64 literals zero-extend).
+                            // CONFIDENCE: MED (matches llvm-mc's value validation for s_mov_b64 literals).
+                            rs.sreg[in.dst.value]     = b.uconst(in.literal);
+                            rs.sreg[in.dst.value + 1] = b.uconst(0);
+                            rs.sreg_srt.erase(in.dst.value); rs.sreg_srt.erase(in.dst.value + 1);
+                            data_copied = true;
+                        }
+                        if (data_copied && !m) {   // data-only move: drop any stale saved-mask alias
+                            rs.sreg_bool.erase(in.dst.value); rs.sreg_bool_narrowed.erase(in.dst.value);
+                        }
+                        if (!m && !data_copied) ok = false;
                     }
                 } else {                                    // s_and/or_saveexec_b64 sDST, src
                     rs.sreg_bool[in.dst.value] = rs.exec;   // save current EXEC to the dest SGPR pair
@@ -1234,6 +1445,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (!m) ok = false;
                     else { rs.exec = (in.opcode == 0x24) ? b.land(rs.exec, m) : b.lor(rs.exec, m);
                            rs.exec_narrowed = true; }
+                }
+                return true;
+            }
+            if (in.opcode == 0x1f) {   // s_getpc_b64
+                // Accepted ONLY when the pcrel pre-pass FOLDED an embedded-table load from this
+                // shader (rs.mubuf_pcrel_tables non-empty) — the pair then only feeds that folded
+                // chain. Otherwise the PC would flow into unmodeled address math: keep rejecting.
+                if (rs.mubuf_pcrel_tables.empty()) { ok = false; return true; }
+                for (int k = 0; k < 2; k++) {
+                    rs.sreg.erase(in.dst.value + k); rs.sreg_srt.erase(in.dst.value + k);
                 }
                 return true;
             }
@@ -1309,6 +1530,23 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                              uint32_t o = b.ibin(Op_BitwiseAnd, b.ibin(Op_BitwiseXor, a, c),
                                                                b.ibin(Op_BitwiseXor, a, d));
                              rs.scc = b.ucmp(Op_INotEqual, b.ibin(Op_ShiftRightLogical, o, b.uconst(31)), b.uconst(0)); break; }
+                case 0x04: {   // s_addc_u32: dst = src0 + src1 + SCC(carry-in); SCC = carry-out. The high
+                               // half of a 64-bit add (pairs with s_add_u32's SCC). Round-trip llvm-mc
+                               // gfx1010: 0x82252580 → s_addc_u32 s37, 0, s37. CONFIDENCE: HIGH.
+                    uint32_t cin = b.sel(rs.scc, b.uconst(1), b.uconst(0));
+                    uint32_t s1 = b.ibin(Op_IAdd, a, c);
+                    uint32_t k1 = b.ucmp(Op_ULessThan, s1, a);        // wrap in a+c
+                    d = b.ibin(Op_IAdd, s1, cin);
+                    uint32_t k2 = b.ucmp(Op_ULessThan, d, s1);        // wrap in +cin
+                    rs.scc = b.bsel(k1, b.btrue(), k2); break;
+                }
+                // s_min/max (0x06 min_i32, 0x07 min_u32, 0x08 max_i32, 0x09 max_u32): SCC = "src0 was
+                // selected" (S0<S1 for min, S0>S1 for max — RDNA2 ISA). Round-trip llvm-mc gfx1010:
+                // 0x83000201/0x83800201/0x84000201/0x84800201. CONFIDENCE: HIGH.
+                case 0x06: rs.scc = b.scmp(Op_SLessThan, a, c);    d = b.sext2(Glsl_SMin, a, c); break;
+                case 0x07: rs.scc = b.ucmp(Op_ULessThan, a, c);    d = b.uext2(Glsl_UMin, a, c); break;
+                case 0x08: rs.scc = b.scmp(Op_SGreaterThan, a, c); d = b.sext2(Glsl_SMax, a, c); break;
+                case 0x09: rs.scc = b.ucmp(Op_UGreaterThan, a, c); d = b.uext2(Glsl_UMax, a, c); break;
                 case 0x0A: d = b.sel(rs.scc, a, c); break;           // s_cselect_b32: SCC ? src0 : src1
                 case 0x0E: d = b.ibin(Op_BitwiseAnd, a, c); scc_nz(d); break;   // s_and_b32
                 case 0x10: d = b.ibin(Op_BitwiseOr,  a, c); scc_nz(d); break;   // s_or_b32
@@ -1321,6 +1559,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                              d = b.ibin(Op_ShiftLeftLogical, mask, sh); break; }       // no SCC write
                 case 0x20: { uint32_t sh = b.ibin(Op_BitwiseAnd, c, b.uconst(31));   // s_lshr_b32
                              d = b.ibin(Op_ShiftRightLogical, a, sh); scc_nz(d); break; }  // dst = src0 >> (src1 & 31)
+                case 0x22: { uint32_t sh = b.ibin(Op_BitwiseAnd, c, b.uconst(31));   // s_ashr_i32
+                             d = b.sbin(Op_ShiftRightArithmetic, a, sh); scc_nz(d); break; }  // dst = src0 >>a (src1 & 31)
                 case 0x21:   // s_lshr_b64 — only the NGG wave-packing form (dst = EXEC) is modeled: it sets
                              // EXEC to the count of active vertices/primitives in the wave. A per-invocation
                              // SPIR-V shader has no wave to pack (each invocation is one vertex), so leave
@@ -1420,9 +1660,29 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x2B: d = b.frcp(a); break;                      // v_rcp_iflag_f32 (~= v_rcp_f32)
                 case 0x2E: d = b.fext1(Glsl_InverseSqrt, a); break;   // v_rsq_f32
                 case 0x33: d = b.fext1(Glsl_Sqrt, a); break;          // v_sqrt_f32
+                // v_sin_f32 (0x35) / v_cos_f32 (0x36): the RDNA trig input is in REVOLUTIONS (units of
+                // 2π radians) — the compiler pre-multiplies by 1/2π (0.15915494) before these, so
+                // d = sin/cos(2π·src). VERIFIED(round-trip llvm-mc gfx1010: 0x7e026b02/0x7e026d02 →
+                // v_sin/cos_f32; DOLL's dither PS does exactly `v_mul 0.15915494, x` → `v_cos`).
+                // CONFIDENCE: HIGH (RDNA2 ISA V_SIN_F32: D = sin(S0 * 2π)).
+                case 0x35: d = b.fext1(Glsl_Sin, b.fbin(Op_FMul, a, b.uconst(fbits(6.28318530717958647692f)))); break;
+                case 0x36: d = b.fext1(Glsl_Cos, b.fbin(Op_FMul, a, b.uconst(fbits(6.28318530717958647692f)))); break;
                 case 0x37: d = b.iun(Op_Not, a); break;               // v_not_b32
                 case 0x38: d = b.iun(Op_BitReverse, a); break;        // v_bfrev_b32
                 default: ok = false;
+            }
+            // SDWA output modifiers: OMOD scale (×2/×4/×0.5) then CLAMP saturate, on FLOAT-result
+            // opcodes only (mirrors the VOP2/VOP3 fresult path; DOLL VS: `v_exp_f32_sdwa … clamp`).
+            // A modifier on a non-float-result op would silently drop — reject loudly instead.
+            if (ok && (in.omod || in.clamp)) switch (in.opcode) {
+                case 0x05: case 0x06: case 0x20: case 0x21: case 0x22: case 0x23: case 0x24:
+                case 0x25: case 0x27: case 0x2A: case 0x2B: case 0x2E: case 0x33: case 0x35: case 0x36:
+                    if      (in.omod == 1) d = b.fbin(Op_FMul, d, b.uconst(fbits(2.0f)));
+                    else if (in.omod == 2) d = b.fbin(Op_FMul, d, b.uconst(fbits(4.0f)));
+                    else if (in.omod == 3) d = b.fbin(Op_FMul, d, b.uconst(fbits(0.5f)));
+                    if (in.clamp) d = b.fext2(Glsl_FMax, b.fext2(Glsl_FMin, d, b.uconst(fbits(1.0f))), b.uconst(fbits(0.0f)));
+                    break;
+                default: ok = false; break;
             }
             if (ok) predicate_write(b, rs, in.dst.value, old_d);
             return true;
@@ -1439,6 +1699,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x01: d = b.sel(vcc, c, a); break;               // v_cndmask_b32: dst = vcc ? src1 : src0
                 case 0x03: d = b.fbin(Op_FAdd, a, c); break;          // v_add_f32
                 case 0x04: d = b.fbin(Op_FSub, a, c); break;          // v_sub_f32
+                case 0x05: d = b.fbin(Op_FSub, c, a); break;          // v_subrev_f32 (src1 - src0; e32 form of
+                                                                      // VOP3 0x105 — round-trip llvm-mc gfx1010 0x0a020702)
                 case 0x08: d = b.fbin(Op_FMul, a, c); break;          // v_mul_f32
                 case 0x0F: d = b.fext2(Glsl_FMin, a, c); break;       // v_min_f32
                 case 0x10: d = b.fext2(Glsl_FMax, a, c); break;       // v_max_f32
@@ -1492,7 +1754,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // SDWA output modifier: OMOD scale (×2/×4/×0.5) then CLAMP saturate, on FLOAT-result opcodes
             // only (int ops never carry omod). Mirrors the VOP3 fresult path; a no-op when omod/clamp unset.
             if (ok && (in.omod || in.clamp)) switch (in.opcode) {
-                case 0x03: case 0x04: case 0x08: case 0x0F: case 0x10:
+                case 0x03: case 0x04: case 0x05: case 0x08: case 0x0F: case 0x10:
                 case 0x1F: case 0x2B: case 0x20: case 0x2C: case 0x21: case 0x2D:
                     if      (in.omod == 1) d = b.fbin(Op_FMul, d, b.uconst(fbits(2.0f)));
                     else if (in.omod == 2) d = b.fbin(Op_FMul, d, b.uconst(fbits(4.0f)));
@@ -1511,6 +1773,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
         }
         case Rdna2Format::VOPC: {                                     // v_cmp_* -> VCC; v_cmpx_* also -> EXEC
             uint32_t a = val(in.src[0]), c = val(in.src[1]);
+            // Float source modifiers (abs then neg — hardware order), set only on FLOAT compares by the
+            // assembler (VOP3-encoded e64 or SDWA forms; e.g. DOLL's `v_cmp_gt_f32_sdwa vcc, |v5|, s4`).
+            if (in.src_abs[0]) a = b.fext1(Glsl_FAbs, a);
+            if (in.src_neg[0]) a = b.fbin(Op_FSub, b.uconst(0), a);
+            if (in.src_abs[1]) c = b.fext1(Glsl_FAbs, c);
+            if (in.src_neg[1]) c = b.fbin(Op_FSub, b.uconst(0), c);
             // v_cmpx_* shares each type's compare set at base+0x10 (f32 0x10-0x1f, i32 0x90-0x9f,
             // u32 0xd0-0xdf); it writes EXEC in addition to VCC. Map to the base compare, then narrow.
             uint32_t op = in.opcode;
@@ -1598,6 +1866,18 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 uint32_t s0 = fv(0), s1 = fv(1), s2 = fv(2);
                 uint32_t mn = b.fext2(Glsl_FMin, s0, s1), mx = b.fext2(Glsl_FMax, s0, s1);
                 vreg[in.dst.value] = fresult(b.fext2(Glsl_FMax, mn, b.fext2(Glsl_FMin, mx, s2)));
+            } else if (in.opcode == 0x151 || in.opcode == 0x154) {    // v_min3_f32 / v_max3_f32
+                // min/max of three floats (DOLL's AA-clamp PS). VERIFIED(round-trip llvm-mc gfx1010:
+                // VOP3 0x151 = v_min3_f32, 0x154 = v_max3_f32 — 0xd551…/0xd554…). CONFIDENCE: HIGH.
+                uint32_t op = in.opcode == 0x151 ? (uint32_t)Glsl_FMin : (uint32_t)Glsl_FMax;
+                vreg[in.dst.value] = fresult(b.fext2(op, b.fext2(op, fv(0), fv(1)), fv(2)));
+            } else if (in.opcode == 0x36A) {                          // v_cvt_pk_u16_u32
+                // Pack two u32 into u16 halves with UNSIGNED SATURATION: lo = min(s0,0xFFFF),
+                // hi = min(s1,0xFFFF); dst = lo | hi<<16. VERIFIED(round-trip llvm-mc gfx1010:
+                // VOP3 0x36a — 0xd76a…). CONFIDENCE: HIGH.
+                uint32_t lo = b.uext2(Glsl_UMin, val(in.src[0]), b.uconst(0xFFFFu));
+                uint32_t hi = b.uext2(Glsl_UMin, val(in.src[1]), b.uconst(0xFFFFu));
+                vreg[in.dst.value] = b.ibin(Op_BitwiseOr, lo, b.ibin(Op_ShiftLeftLogical, hi, b.uconst(16)));
             } else if (in.opcode == 0x143) {                          // v_mad_u32_u24 = (s0&0xFFFFFF)*(s1&0xFFFFFF)+s2
                 uint32_t m24 = b.uconst(0xFFFFFF);
                 uint32_t p = b.ibin(Op_IMul, b.ibin(Op_BitwiseAnd, val(in.src[0]), m24),
@@ -1836,6 +2116,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0xC: n = 1; break;                     // buffer_load_dword
                 case 0xD: n = 2; break;                     // buffer_load_dwordx2
                 case 0xE: n = 4; break;                     // buffer_load_dwordx4
+                case 0xF: n = 3; break;                     // buffer_load_dwordx3 (round-trip llvm-mc gfx1010:
+                                                            // 0xe03c… op 0x0F — x3 sorts AFTER x4 in this ISA)
                 case 0x0: n = 1; is_format = true; break;   // buffer_load_format_x  (vertex fetch)
                 case 0x1: n = 2; is_format = true; break;   // buffer_load_format_xy
                 case 0x2: n = 3; is_format = true; break;   // buffer_load_format_xyz
@@ -1851,6 +2133,31 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
             uint32_t offset = in.literal & 0xFFFu;
             bool offen = (in.literal >> 12) & 1u, idxen = (in.literal >> 13) & 1u;
+            // PC-relative EMBEDDED TABLE (#273): this load's V# was built from s_getpc_b64 and the
+            // table bytes live inside the shader blob — detect_pcrel_tables already copied them out.
+            // Fold to a compile-time constant lookup: dword index = (inst offset + offen VADDR) >> 2;
+            // out-of-range indexes read 0 (the hardware's OOB contract for a bounded V#).
+            if (!is_format && !is_store) {
+                auto pt = rs.mubuf_pcrel_tables.find(in.pc);
+                if (pt != rs.mubuf_pcrel_tables.end()) {
+                    const std::vector<uint32_t>& tab = pt->second;
+                    uint32_t addr = b.uconst(offset);
+                    if (offen) { Operand ov{OperandKind::VGPR, in.src[0].value};
+                                 addr = b.ibin(Op_IAdd, addr, val(ov)); }
+                    uint32_t idx = b.ibin(Op_ShiftRightLogical, addr, b.uconst(2));
+                    for (uint32_t k = 0; k < n; k++) {
+                        int d = in.dst.value + (int)k;
+                        uint32_t old = vreg_old(b, rs, d);
+                        uint32_t kidx = k ? b.ibin(Op_IAdd, idx, b.uconst(k)) : idx;
+                        uint32_t acc = b.uconst(0);   // OOB -> 0
+                        for (uint32_t t = 0; t < (uint32_t)tab.size(); t++)
+                            acc = b.sel(b.ucmp(Op_IEqual, kidx, b.uconst(t)), b.uconst(tab[t]), acc);
+                        rs.vreg[d] = acc;
+                        predicate_write(b, rs, d, old);
+                    }
+                    return true;
+                }
+            }
             uint32_t binding = 2, stride = 0;   // overwritten by SRSRC resolution below whenever a resource
                                                 // table is present (format AND raw ops); the binding-2 default
                                                 // survives only on the table-less offline path (see below)
@@ -2090,14 +2397,19 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 return true;
             }
 
-            // --- Sampled-texture path: image_sample* (0x20/0x24/0x27) / image_load (0x00). 2D (any LOD
-            // variant) or 3D (implicit-LOD sample only); NSA allowed (coords gathered below).
-            // image_sample = 0x20 (implicit-LOD), image_sample_l = 0x24 (explicit LOD in 3rd coord),
-            // image_sample_lz = 0x27 (LOD 0), image_load = 0x00 (integer texel fetch).
+            // --- Sampled-texture path: image_sample* (0x20/0x24/0x25/0x27) / image_gather4_lz (0x47) /
+            // image_load (0x00). 2D (any LOD variant) or 3D (implicit-LOD or LOD-0 sample); NSA allowed
+            // (coords gathered below). image_sample = 0x20 (implicit-LOD), image_sample_l = 0x24
+            // (explicit LOD in last coord), image_sample_b = 0x25 (implicit-LOD + BIAS in FIRST vaddr),
+            // image_sample_lz = 0x27 (LOD 0), image_gather4_lz = 0x47 (2x2 single-channel gather,
+            // base level), image_load = 0x00 (integer texel fetch). Opcodes round-trip-verified
+            // via llvm-mc gfx1010 (#273).
             const bool is_sample = (in.opcode == 0x20), is_load = (in.opcode == 0x00);
             const bool is_sample_l = (in.opcode == 0x24), is_sample_lz = (in.opcode == 0x27);
+            const bool is_sample_b = (in.opcode == 0x25), is_gather_lz = (in.opcode == 0x47);
             const bool dim2d = (in.mimg_dim == 1u), dim3d = (in.mimg_dim == 2u);
-            if ((!is_sample && !is_load && !is_sample_l && !is_sample_lz) || (!dim2d && !dim3d)) { ok = false; return true; }
+            if ((!is_sample && !is_load && !is_sample_l && !is_sample_lz && !is_sample_b && !is_gather_lz) ||
+                (!dim2d && !dim3d)) { ok = false; return true; }
             if (res->cls != ResourceClass::Texture) { ok = false; return true; }
             // coords (normalized float for sample, integer texel for load). Non-NSA: consecutive from VADDR.
             // NSA (len>2): coord0 = VADDR, coord k>=1 = byte (k-1) of the extra address dwords words[2..3].
@@ -2107,16 +2419,37 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 uint32_t j = k - 1; return (int)((in.words[2 + j / 4] >> (8 * (j % 4))) & 0xFFu); };
             uint32_t out[4];
             if (dim3d) {
-                if (!is_sample) { ok = false; return true; }   // only implicit-LOD sample from a 3D texture for now
+                if (!is_sample && !is_sample_lz) { ok = false; return true; }   // 3D: implicit-LOD or LOD-0 sample
                 b.declare_texture(res->binding, Dim_3D);
-                b.image_sample_3d(res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)), out);
+                if (is_sample) b.image_sample_3d(res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)), out);
+                else           b.image_sample_lod_3d(res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)),
+                                                     b.uconst(0), out);         // _lz: base level
+            } else if (is_gather_lz) {
+                // gather4 dmask selects ONE channel (must be a single bit); the result is always the
+                // four texels of that channel -> 4 consecutive VDATA VGPRs, gather order preserved.
+                uint32_t dm = in.mimg_dmask;
+                if (dm != 1u && dm != 2u && dm != 4u && dm != 8u) { ok = false; return true; }
+                uint32_t comp = dm == 1u ? 0u : dm == 2u ? 1u : dm == 4u ? 2u : 3u;
+                b.declare_texture(res->binding, Dim_2D);
+                b.image_gather_2d(res->binding, vread(cvg(0)), vread(cvg(1)), comp, out);
+                int vd = in.dst.value;
+                for (uint32_t c = 0; c < 4; c++) {
+                    uint32_t old = vreg_old(b, rs, vd + (int)c);
+                    rs.vreg[vd + (int)c] = out[c];
+                    predicate_write(b, rs, vd + (int)c, old);
+                }
+                return true;
             } else {
                 b.declare_texture(res->binding, Dim_2D);
-                uint32_t cu = vread(cvg(0)), cv = vread(cvg(1));
-                if (is_sample)         b.image_sample_2d(res->binding, cu, cv, out);
-                else if (is_sample_lz) b.image_sample_lod_2d(res->binding, cu, cv, b.uconst(0), out);      // LOD 0
-                else if (is_sample_l)  b.image_sample_lod_2d(res->binding, cu, cv, vread(cvg(2)), out);    // LOD = 3rd coord
-                else                   b.image_fetch_2d (res->binding, cu, cv, out);
+                if (is_sample_b) {      // vaddr order for _b: [bias, u, v]
+                    b.image_sample_bias_2d(res->binding, vread(cvg(1)), vread(cvg(2)), vread(cvg(0)), out);
+                } else {
+                    uint32_t cu = vread(cvg(0)), cv = vread(cvg(1));
+                    if (is_sample)         b.image_sample_2d(res->binding, cu, cv, out);
+                    else if (is_sample_lz) b.image_sample_lod_2d(res->binding, cu, cv, b.uconst(0), out);      // LOD 0
+                    else if (is_sample_l)  b.image_sample_lod_2d(res->binding, cu, cv, vread(cvg(2)), out);    // LOD = 3rd coord
+                    else                   b.image_fetch_2d (res->binding, cu, cv, out);
+                }
             }
             // dmask selects which result components are written to consecutive VDATA VGPRs (LSB=R first).
             int vd = in.dst.value, w = 0;
@@ -2160,6 +2493,125 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
     }
 }
 
+// PC-relative EMBEDDED-TABLE detection (#273). Compilers put small constant lookup tables (a 4x4
+// ordered-dither matrix, etc.) directly after the shader code and address them with an inline-built
+// V#: `s_getpc_b64 s[a:a+1]; s_add_u32 sa, <off>, sa; s_addc_u32 sa+1, 0, sa+1; s_mov_b32 sa+2,
+// <num_records>; s_mov_b32 sa+3, <cfg>; buffer_load_dwordx4 v, v, s[a:a+3], 0 offen`. The table
+// BYTES are inside the code blob we are recompiling, so the load can be folded to a compile-time
+// constant lookup. This pass does forward constant propagation over the LINEAR stream (facts are
+// killed on any other write; a fact is only used when no branch target enters between its def and
+// the load) and returns: mubuf pc -> the table's dwords copied out of the blob.
+// CONFIDENCE: MED-HIGH — exact for the compiler idiom (verified against DOLL's dither PS); every
+// guard failure falls back to the old reject.
+std::unordered_map<uint32_t, std::vector<uint32_t>> detect_pcrel_tables(
+        const std::vector<Rdna2Inst>& ins, const uint32_t* code, size_t dwords) {
+    std::unordered_map<uint32_t, std::vector<uint32_t>> out;
+    std::unordered_map<int, uint64_t> pcoff;   // reg -> byte offset into the code blob (pair LO half)
+    std::unordered_set<int> pchi;              // regs holding the matching HI half
+    std::unordered_map<int, uint32_t> kconst;  // reg -> compile-time constant (s_mov_b32 literal/inline)
+    std::unordered_map<int, uint32_t> fact_pc; // reg -> pc where its current fact was established
+    std::vector<uint32_t> br_targets;          // all branch targets (for the entry-soundness check)
+    for (const auto& in : ins) {
+        if (in.is_end) break;
+        if (in.fmt == Rdna2Format::SOPP && !sopp_is_noop(in) &&
+            in.opcode >= 0x02 && in.opcode <= 0x09 && in.opcode != 0x03)
+            br_targets.push_back(in.pc + in.len_dwords + (uint32_t)(int32_t)in.simm16);
+    }
+    auto kill = [&](int r) { pcoff.erase(r); pchi.erase(r); kconst.erase(r); fact_pc.erase(r); };
+    auto imm_of = [&](const Operand& o, const Rdna2Inst& in, uint32_t* v) -> bool {
+        if (o.kind == OperandKind::Literal)   { *v = in.literal; return true; }
+        if (o.kind == OperandKind::InlineInt) { *v = (uint32_t)o.value; return true; }
+        if (o.kind == OperandKind::SGPR)      { auto it = kconst.find(o.value);
+                                                if (it != kconst.end()) { *v = it->second; return true; } }
+        return false;
+    };
+    for (const auto& in : ins) {
+        if (in.is_end) break;
+        switch (in.fmt) {
+            case Rdna2Format::SOP1:
+                kill(in.dst.value);
+                if (in.opcode == 0x1f) {                     // s_getpc_b64: pair = address of NEXT inst
+                    kill(in.dst.value + 1);
+                    pcoff[in.dst.value] = (uint64_t)(in.pc + in.len_dwords) * 4u;
+                    pchi.insert(in.dst.value + 1);
+                    fact_pc[in.dst.value] = in.pc; fact_pc[in.dst.value + 1] = in.pc;
+                } else if (in.opcode == 0x03) {              // s_mov_b32 <const>
+                    uint32_t v;
+                    if (imm_of(in.src[0], in, &v)) { kconst[in.dst.value] = v; fact_pc[in.dst.value] = in.pc; }
+                } else if (in.opcode == 0x04) {              // s_mov_b64 (pair write)
+                    kill(in.dst.value + 1);
+                }
+                break;
+            case Rdna2Format::SOP2: {
+                int d = in.dst.value;
+                if (in.opcode == 0x00) {                     // s_add_u32: pcrel-lo + immediate
+                    uint32_t imm; uint64_t base; bool got = false;
+                    if (in.src[0].kind == OperandKind::SGPR && pcoff.count(in.src[0].value) &&
+                        imm_of(in.src[1], in, &imm)) { base = pcoff[in.src[0].value]; got = true; }
+                    else if (in.src[1].kind == OperandKind::SGPR && pcoff.count(in.src[1].value) &&
+                             imm_of(in.src[0], in, &imm)) { base = pcoff[in.src[1].value]; got = true; }
+                    kill(d);
+                    if (got) { pcoff[d] = base + imm; fact_pc[d] = in.pc; }
+                } else if (in.opcode == 0x04) {              // s_addc_u32: pcrel-hi + 0 (+carry; a real
+                    // carry needs the lo word to wrap over a <4 KB offset — not a shader-blob shape)
+                    uint32_t imm;
+                    bool hi_ok = (in.src[0].kind == OperandKind::SGPR && pchi.count(in.src[0].value) &&
+                                  imm_of(in.src[1], in, &imm) && imm == 0) ||
+                                 (in.src[1].kind == OperandKind::SGPR && pchi.count(in.src[1].value) &&
+                                  imm_of(in.src[0], in, &imm) && imm == 0);
+                    kill(d);
+                    if (hi_ok) { pchi.insert(d); fact_pc[d] = in.pc; }
+                } else {
+                    kill(d);
+                    if (in.opcode == 0x29) kill(d + 1);      // s_bfe_u64 writes a pair
+                }
+                break;
+            }
+            case Rdna2Format::SOPK: kill(in.dst.value); break;
+            case Rdna2Format::SMEM: {
+                uint32_t n = 1;
+                switch (in.opcode) { case 0x1: case 0x9: n=2; break; case 0x2: case 0xA: n=4; break;
+                    case 0x3: case 0xB: n=8; break; case 0x4: case 0xC: n=16; break; default: break; }
+                for (uint32_t k = 0; k < n; k++) kill(in.dst.value + (int)k);
+                break;
+            }
+            case Rdna2Format::VOP1:
+                if (in.opcode == 0x02) kill(in.dst.value);   // v_readfirstlane -> SGPR
+                break;
+            case Rdna2Format::VOPC:
+                if (in.dst.kind == OperandKind::SGPR && in.dst.value <= 105)
+                    { kill(in.dst.value); kill(in.dst.value + 1); }   // e64 compare -> SGPR pair
+                break;
+            case Rdna2Format::VOP3:
+                if (in.sdst.kind == OperandKind::SGPR) { kill(in.sdst.value); kill(in.sdst.value + 1); }
+                break;
+            case Rdna2Format::MUBUF: {
+                if (in.opcode < 0xCu || in.opcode > 0xFu) break;   // raw loads only
+                const int sb = in.src[1].value;                    // SRSRC base SGPR of the V# quad
+                if (!pcoff.count(sb) || !pchi.count(sb + 1) || !kconst.count(sb + 2)) break;
+                const uint32_t nrec = kconst[sb + 2];              // V# word2 = num_records (bytes here)
+                const bool offen = (in.literal >> 12) & 1u, idxen = (in.literal >> 13) & 1u;
+                const bool soff0 = (in.src[2].kind == OperandKind::Special && in.src[2].value == 125) ||
+                                   (in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0);
+                const uint64_t off = pcoff[sb];
+                // Entry soundness: no branch may enter between the newest contributing fact and here.
+                uint32_t newest = 0;
+                for (int r : {sb, sb + 1, sb + 2}) { auto it = fact_pc.find(r); if (it != fact_pc.end() && it->second > newest) newest = it->second; }
+                bool entered = false;
+                for (uint32_t t : br_targets) if (t > newest && t <= in.pc) { entered = true; break; }
+                if (entered) break;
+                if (idxen || !soff0 || (off & 3u) || (nrec & 3u) || nrec == 0 || nrec > 1024 ||
+                    off / 4 + nrec / 4 > dwords) break;            // unprovable / out of window -> reject
+                out[in.pc] = std::vector<uint32_t>(code + off / 4, code + off / 4 + nrec / 4);
+                (void)offen;                                       // offen just adds the runtime index
+                break;
+            }
+            default: break;   // formats that don't write SGPRs
+        }
+    }
+    return out;
+}
+
 // Emit the instruction body (shared by every stage). Handles a single recognized COUNTED loop as a real
 // structured SPIR-V loop (OpLoopMerge + OpPhi for loop-carried registers); loop-FREE streams walk straight
 // through, byte-identical to the pre-loop-feature behavior. `exp_fn` handles an EXP instruction per stage
@@ -2170,6 +2622,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                bool allow_exec_update, bool allow_smem,
                const std::function<bool(const Rdna2Inst&)>& exp_fn,
                const uint32_t* code = nullptr, size_t dwords = 0) {   // raw stream (forward-if target check)
+    // Fold PC-relative embedded-table loads (s_getpc_b64-built V#s) before the walk — emit_alu's
+    // MUBUF/SOP1 handlers consult rs.mubuf_pcrel_tables (#273).
+    if (code) rs.mubuf_pcrel_tables = detect_pcrel_tables(ins, code, dwords);
     const CountedLoop L = detect_counted_loop(ins);
     size_t idx = 0;
     // Cross-lane wave ops (mbcnt) emit LDS + barriers, which are only valid at wave-uniform points — so
@@ -2256,47 +2711,71 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         }
         // 7. Post-loop body.
         if (!emit_range(L.exit_pc, UINT32_MAX)) return false;
-    } else if (const ForwardIf F = detect_forward_if(ins, /*allow_vcc*/!b.is_compute, code, dwords, &safe); F.found) {
-        // Single structured uniform IF (forward s_cbranch_scc0/scc1): emit as OpSelectionMerge +
-        // OpBranchConditional on the SCC bool, with an OpPhi per register written in the conditional
-        // block that is live after the merge. Parallels the loop path's phi machinery. CONFIDENCE: MED —
-        // covers the single non-nested forward uniform-if; guarded by the 43-test suite + exec-diff.
+    } else if (const std::vector<ForwardIf> Fs = detect_forward_ifs(ins, /*allow_vcc*/!b.is_compute, code, dwords, &safe); !Fs.empty()) {
+        // Structured uniform IFs (forward s_cbranch_scc*/vcc*), possibly SEQUENTIAL and/or NESTED
+        // (detect_forward_ifs verified the region tree). Each if emits as OpSelectionMerge +
+        // OpBranchConditional on the SCC/VCC bool, with an OpPhi per register written in the
+        // conditional block that is live after the merge — the same phi machinery as the original
+        // single-if path (which this generalizes 1:1: a single if takes exactly the old shape).
+        // Recursion handles nesting: the then-block emitter re-enters for inner branches.
+        // CONFIDENCE: MED-HIGH — guarded by the test suite + exec-diff; DOLL's two-vccz color-grade
+        // PS and nested-vccz lighting PS are the motivating real shaders (#273).
         auto vget = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
         auto sget = [&](int r){ auto it = rs.sreg.find(r); return it == rs.sreg.end() ? b.uconst(0) : it->second; };
-        if (!emit_range(0, F.branch_pc)) return false;
-        if (rs.exec_narrowed) return false;                 // uniform branch needs full EXEC; bail if narrowed
-        if (idx < ins.size() && ins[idx].pc == F.branch_pc) ++idx;   // skip the scc branch itself
-        std::set<int> ifv, ifs;
-        loop_written_regs(ins, F.branch_pc + 1, F.target_pc, ifv, ifs);
-        std::unordered_map<int,uint32_t> pre_v, pre_s;
-        for (int r : ifv) pre_v[r] = vget(r);
-        for (int r : ifs) pre_s[r] = sget(r);
-        uint32_t pre_scc = rs.scc, pre_vcc = rs.vcc;
-        const uint32_t preblock = b.cur_block;              // block holding the OpBranchConditional (skip edge)
-        // scc0/vccz: branch (skip block) taken when the flag==0 → the block runs when flag!=0; scc1/vccnz
-        // are the inverse. The condition register is SCC or VCC (both scalar/wave-uniform for these branches).
-        uint32_t cond_reg  = F.on_vcc ? rs.vcc : rs.scc;
-        uint32_t exec_cond = F.on_scc0 ? cond_reg : b.bsel(cond_reg, b.bfalse(), b.btrue());
-        uint32_t thenL = b.id(), mergeL = b.id();
-        b.emit_selmerge(mergeL); b.emit_condbranch(exec_cond, thenL, mergeL);
-        b.emit_label(thenL);
-        if (!emit_range(F.branch_pc + 1, F.target_pc)) return false;
-        // A block that narrows EXEC is unsafe to leave open into the merge — UNLESS it's an early-out block
-        // that ENDS the shader (only s_endpgm follows the merge, so the post-merge phi values are never
-        // read). The alpha-test discard PS lands here: it exports (lowered to OpKill+export) then restores
-        // EXEC to the survivor mask just before s_endpgm — that trailing narrow is harmless.
-        if (rs.exec_narrowed && !F.early_out) return false;
-        const uint32_t thenEnd = b.cur_block;               // single block (no inner branches) → == thenL
-        std::unordered_map<int,uint32_t> then_v, then_s;
-        for (int r : ifv) then_v[r] = vget(r);
-        for (int r : ifs) then_s[r] = sget(r);
-        uint32_t then_scc = rs.scc, then_vcc = rs.vcc;
-        b.emit_branch(mergeL); b.emit_label(mergeL);
-        for (int r : ifv) rs.vreg[r] = b.emit_phi_2way(b.t_u32,  pre_v[r], preblock, then_v[r], thenEnd);
-        for (int r : ifs) rs.sreg[r] = b.emit_phi_2way(b.t_u32,  pre_s[r], preblock, then_s[r], thenEnd);
-        if (then_scc != pre_scc) rs.scc = b.emit_phi_2way(b.t_bool, pre_scc, preblock, then_scc, thenEnd);
-        if (then_vcc != pre_vcc) rs.vcc = b.emit_phi_2way(b.t_bool, pre_vcc, preblock, then_vcc, thenEnd);
-        if (!emit_range(F.target_pc, UINT32_MAX)) return false;
+        size_t bi = 0;   // next unconsumed branch in Fs (pc order; recursion consumes nested ones)
+        std::function<bool(uint32_t, uint32_t)> emit_structured = [&](uint32_t lo, uint32_t hi) -> bool {
+            for (;;) {
+                const uint32_t next_br = (bi < Fs.size() && Fs[bi].branch_pc < hi) ? Fs[bi].branch_pc : hi;
+                if (!emit_range(lo, next_br)) return false;
+                if (next_br == hi) return true;
+                const ForwardIf F = Fs[bi++];
+                if (rs.exec_narrowed) return false;         // uniform branch needs full EXEC; bail if narrowed
+                if (idx < ins.size() && ins[idx].pc == F.branch_pc) ++idx;   // skip the branch itself
+                std::set<int> ifv, ifs;
+                loop_written_regs(ins, F.branch_pc + 1, F.target_pc, ifv, ifs);
+                std::unordered_map<int,uint32_t> pre_v, pre_s;
+                for (int r : ifv) pre_v[r] = vget(r);
+                for (int r : ifs) pre_s[r] = sget(r);
+                uint32_t pre_scc = rs.scc, pre_vcc = rs.vcc;
+                const std::unordered_map<int,uint32_t> pre_bool = rs.sreg_bool;   // mask-domain snapshot
+                const uint32_t preblock = b.cur_block;      // block holding the OpBranchConditional (skip edge)
+                // scc0/vccz: branch (skip block) taken when the flag==0 → the block runs when flag!=0;
+                // scc1/vccnz are the inverse. The condition register is SCC or VCC (wave-uniform here).
+                uint32_t cond_reg  = F.on_vcc ? rs.vcc : rs.scc;
+                uint32_t exec_cond = F.on_scc0 ? cond_reg : b.bsel(cond_reg, b.bfalse(), b.btrue());
+                uint32_t thenL = b.id(), mergeL = b.id();
+                b.emit_selmerge(mergeL); b.emit_condbranch(exec_cond, thenL, mergeL);
+                b.emit_label(thenL);
+                if (!emit_structured(F.branch_pc + 1, F.target_pc)) return false;   // recurse: nested ifs
+                // A block that narrows EXEC is unsafe to leave open into the merge — UNLESS it's an
+                // early-out block that ENDS the shader (only s_endpgm follows the merge, so post-merge
+                // phi values are never read). See the alpha-test discard shape.
+                if (rs.exec_narrowed && !F.early_out) return false;
+                const uint32_t thenEnd = b.cur_block;       // last block of the then-body (nested ifs move it)
+                std::unordered_map<int,uint32_t> then_v, then_s;
+                for (int r : ifv) then_v[r] = vget(r);
+                for (int r : ifs) then_s[r] = sget(r);
+                uint32_t then_scc = rs.scc, then_vcc = rs.vcc;
+                b.emit_branch(mergeL); b.emit_label(mergeL);
+                for (int r : ifv) rs.vreg[r] = b.emit_phi_2way(b.t_u32,  pre_v[r], preblock, then_v[r], thenEnd);
+                for (int r : ifs) rs.sreg[r] = b.emit_phi_2way(b.t_u32,  pre_s[r], preblock, then_s[r], thenEnd);
+                if (then_scc != pre_scc) rs.scc = b.emit_phi_2way(b.t_bool, pre_scc, preblock, then_scc, thenEnd);
+                if (then_vcc != pre_vcc) rs.vcc = b.emit_phi_2way(b.t_bool, pre_vcc, preblock, then_vcc, thenEnd);
+                // A saved MASK (sreg_bool) whose value CHANGED inside the block would not dominate the
+                // merge — phi it like SCC/VCC (a mask newly CREATED inside the block is left as-is,
+                // matching the previous single-if behavior; its post-merge use, if any, was already
+                // undominated before this path existed).
+                for (auto& kv : rs.sreg_bool) {
+                    auto p = pre_bool.find(kv.first);
+                    if (p != pre_bool.end() && p->second != kv.second) {
+                        kv.second = b.emit_phi_2way(b.t_bool, p->second, preblock, kv.second, thenEnd);
+                        rs.sreg_bool_narrowed[kv.first] = true;   // conservative: provenance now mixed
+                    }
+                }
+                lo = F.target_pc;   // continue after the merge (loop; further sequential ifs handled here)
+            }
+        };
+        if (!emit_structured(0, UINT32_MAX)) return false;
     } else {
         wave_ok = true;   // straight-line: barriers are wave-uniform, so cross-lane mbcnt is safe here
         if (!emit_range(0, UINT32_MAX)) return false;   // loop-free: straight-line, unchanged behavior
@@ -2346,10 +2825,10 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
     // back-edge + exit, and the forward-if branch) as handled, so coverage matches what actually recompiles
     // (previously the MSAA-resolve loop shaders 031-034 were mis-flagged "blocked" at their s_cbranch_scc0).
     const CountedLoop cL = detect_counted_loop(ins);
-    const ForwardIf   cF = detect_forward_if(ins, /*allow_vcc*/false, code, dwords);   // conservative diagnostic (compute-safe)
+    const std::vector<ForwardIf> cFs = detect_forward_ifs(ins, /*allow_vcc*/false, code, dwords);   // conservative diagnostic (compute-safe)
     auto cf_reconstructed = [&](const Rdna2Inst& i) {
         if (cL.found && (i.pc == cL.backedge_pc || i.pc == cL.exit_branch_pc)) return true;
-        if (cF.found && i.pc == cF.branch_pc) return true;
+        for (const auto& F : cFs) if (i.pc == F.branch_pc) return true;
         return false;
     };
 
@@ -2375,12 +2854,14 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
                     const bool st_dim = i.mimg_dim <= 2u || i.mimg_dim == 4u || i.mimg_dim == 5u;
                     if (i.opcode == 0x00u) return st_dim || i.mimg_dim == 6u || i.mimg_dim == 7u;   // image_load (+ 2D_MSAA[_ARRAY])
                     if (i.opcode == 0x08u) return st_dim;                       // image_store (no per-sample MSAA store)
-                    // sample*: 2D (NSA ok); plus implicit-LOD image_sample (0x20) from a 3D texture.
-                    if (i.opcode == 0x20u) return i.mimg_dim == 1u || i.mimg_dim == 2u;
-                    if (i.opcode == 0x24u || i.opcode == 0x27u) return i.mimg_dim == 1u;
+                    // sample*: 2D (NSA ok); plus implicit-LOD image_sample (0x20) / LOD-0 image_sample_lz
+                    // (0x27) from a 3D texture; sample_b (0x25) and gather4_lz (0x47) are 2D.
+                    if (i.opcode == 0x20u || i.opcode == 0x27u) return i.mimg_dim == 1u || i.mimg_dim == 2u;
+                    if (i.opcode == 0x24u || i.opcode == 0x25u || i.opcode == 0x47u) return i.mimg_dim == 1u;
                     return false;
                 }
-                case Rdna2Format::MUBUF:  return i.opcode <= 0x07u;   // buffer_load/store_format_* (need the V#)
+                case Rdna2Format::MUBUF:  return i.opcode <= 0x07u ||                    // load/store_format_*
+                                                 (i.opcode >= 0x0Cu && i.opcode <= 0x0Fu);  // load_dword/x2/x4/x3 (need the V#)
                 case Rdna2Format::VINTRP: return true;               // handled in the fragment shell
                 default: return false;
             }
@@ -2476,6 +2957,12 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords, cons
     bool exported = false;
     auto exp_fn = [&](const Rdna2Inst& in) -> bool {         // EXP POS0..3 -> gl_Position; PARAM -> varyings
         bool eok = true;   // a Special (wave-mask) source has no data value — reject, don't export 0 (#134)
+        // v_cmpx is now allowed in the vertex shell (allow_exec_update=true below): a divergent block
+        // (v_cmpx … s_mov_b64 exec, saved — DOLL's per-vertex lighting/fog attenuation) predicates its
+        // VGPR writes like compute. A vertex MUST still export from full EXEC — the compiled shape
+        // always restores EXEC before its pos/param exports; if one ever arrives narrowed, reject
+        // (fail-visibly) rather than export possibly-inactive-lane values.
+        if (rs.exec_narrowed && (in.exp_target >= 32 || (in.exp_target >= 12 && in.exp_target <= 15))) return false;
         if (in.exp_target >= 12 && in.exp_target <= 15 && !exported) {
             b.export_position(operand_bits(b, rs, in, in.src[0], &eok), operand_bits(b, rs, in, in.src[1], &eok),
                               operand_bits(b, rs, in, in.src[2], &eok), operand_bits(b, rs, in, in.src[3], &eok));
@@ -2486,7 +2973,7 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords, cons
         }
         return eok;
     };
-    if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/false, /*allow_smem*/rt != nullptr, exp_fn, code, dwords)) return {};
+    if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/true, /*allow_smem*/rt != nullptr, exp_fn, code, dwords)) return {};
     if (!exported) return {};
     return b.finish();
 }
