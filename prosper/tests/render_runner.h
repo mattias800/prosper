@@ -414,7 +414,15 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 lb[i] = {}; lb[i].binding = r.binding; lb[i].descriptorCount = 1;
                 if (r.is_texture()) {
                     n_sampler++;
-                    lb[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; lb[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+                    lb[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                    // A set-0 texture belongs to the VERTEX shader (build_R tags VS resources into set 0,
+                    // PS into set 1). stageFlags must include every stage that reads the binding, so a
+                    // vertex texture fetch (displacement/heightmap, GPU vertex animation) needs
+                    // VERTEX_BIT — a fragment-only hardcode made set-0 textures invisible to the VS,
+                    // yielding undefined samples / a validation error (#376). Match the storage-buffer path.
+                    lb[i].stageFlags = (r.set == 0)
+                        ? (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)
+                        : VK_SHADER_STAGE_FRAGMENT_BIT;
                     VkImageCreateInfo tci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
                     tci.imageType = VK_IMAGE_TYPE_2D; tci.format = VK_FORMAT_R8G8B8A8_UNORM; tci.extent = {r.tw, r.th, 1};
                     tci.mipLevels = 1; tci.arrayLayers = 1; tci.samples = VK_SAMPLE_COUNT_1_BIT; tci.tiling = VK_IMAGE_TILING_OPTIMAL;
