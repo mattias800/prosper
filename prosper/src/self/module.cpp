@@ -262,9 +262,17 @@ size_t apply_relocations(const Module& m, LoadedImage& img,
         return 0;
     };
     std::unordered_map<uint32_t, uint64_t> histo, unhandled;
+    // PROSPER_GOT_NID=<image-relative GOT vaddr>: log which import NID fills that slot. Used to map a
+    // PLT stub (jmp *GOT) seen in a disassembly/crash back to its Sony symbol (e.g. #283).
+    uint64_t want_got = 0;
+    if (const char* g = getenv("PROSPER_GOT_NID")) want_got = strtoull(g, nullptr, 0);
     for (auto& r : m.relocs) {
         uint64_t va = img.base + r.offset;
         histo[r.type]++;
+        if (want_got && r.offset == want_got && r.sym < m.symbols.size())
+            fprintf(stderr, "[got-nid] GOT reloc @0x%llx (loaded 0x%llx) type=%u -> import '%s'\n",
+                    (unsigned long long)r.offset, (unsigned long long)va, r.type,
+                    m.symbols[r.sym].nid.c_str());
         switch (r.type) {
             case R_X86_64_RELATIVE:  if (write64(va, img.base + (uint64_t)r.addend)) applied++; break;
             case R_X86_64_64:        if (write64(va, sym_addr(r.sym) + (uint64_t)r.addend)) applied++; break;
