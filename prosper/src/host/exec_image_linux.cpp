@@ -59,6 +59,7 @@ namespace {
     // trustworthy way to inspect deep crashes (e.g. the null std::ctype facet at eboot+0x3b5ea6).
     bool g_faultmem = false;
     bool g_faultlog = false;
+    bool g_fatal_trap = false;                 // PROSPER_FATAL_TRAP: SIGTRAP (core/gdb stop) at the real fatal fault
     // Probe pipe for probe_readable() below — a pipe write imports the source pages (EFAULT on
     // unmapped memory) where a /dev/null write does not. O_NONBLOCK so a full pipe can never
     // block the fault handler; drained after every probe.
@@ -1055,6 +1056,14 @@ namespace {
             if (g_base && g_fault_rip == g_base + foff) { g[REG_RAX] = 0; g[REG_RIP] = g_base + roff; return; }
         }
         dump_fault_mem();   // no-op unless PROSPER_FAULTMEM is set
+        // PROSPER_FATAL_TRAP=1: re-raise the fatal fault as a default-action SIGTRAP HERE, with the
+        // faulting thread's full context intact — under gdb this stops at the real fault (instead of
+        // the process racing on to siglongjmp/_exit), and bare it dumps a core with EVERY thread's
+        // stack (the cross-thread evidence a data-race diagnosis needs). Diagnostic only.
+        if (g_fatal_trap) {
+            signal(SIGTRAP, SIG_DFL);
+            syscall(SYS_tgkill, (pid_t)syscall(SYS_getpid), (pid_t)cur_tid(), SIGTRAP);
+        }
         // Dump the HWBP ring on the recoverable (armed/main-thread) crash too — the deser fault is kind=2.
         if (g_hwbp_node_on && !g_hwbp_ring_dumped) { uint64_t sfs = guest_fs_to_host_scoped();
             hwbp_dump_ring("recover"); guest_fs_restore_scoped(sfs); }
@@ -1238,6 +1247,7 @@ void install_trap_handler() {
         arm_hwwatch(addr);
     };
     g_faultlog = getenv("PROSPER_FAULTLOG") != nullptr;
+    g_fatal_trap = getenv("PROSPER_FATAL_TRAP") != nullptr;   // latched (getenv is not signal-safe)
     g_skip_null_companion = getenv("PROSPER_SKIP_NULL_COMPANION") != nullptr;
     g_null_page = getenv("PROSPER_NULL_PAGE") != nullptr;
     g_watch_companion = getenv("PROSPER_WATCH_COMPANION") != nullptr;

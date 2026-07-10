@@ -678,6 +678,16 @@ HLE(agc_create_interpolant_mapping) {  // (ShaderRegister regs[32], const Shader
 namespace {
 gpu::GpuState& agc_gpu_state() { static gpu::GpuState st; return st; }
 uint64_t g_submit_count = 0;
+// Serializes every access to the shared GpuState (fold + render + stats). DOLL's UE4 RHI submits
+// from TWO guest threads concurrently (core-proven, issue #278: one thread inside
+// agc_driver_submit_dcb -> execute_and_present -> extract_render_state reading st.cx/sh/uc while
+// another is inside agc_driver_submit_dcb_variant -> run_command_buffer writing them). An
+// unordered_map rehash under a lock-free reader tears bucket pointers -> #GP with si_addr=0 (the
+// "rip=0 / writer 0x0" steady-state crash that ended runs as the scene began). The real driver
+// serializes ring submission internally — concurrent guest submits are legal and processed one at
+// a time — so one mutex over the whole submit path IS the real contract, not a workaround.
+// CONFIDENCE: HIGH (root cause proven by a two-thread core dump; contract matches driver behavior).
+std::mutex g_agc_state_mu;
 }
 
 // EOP completion signaling (hle_kernel_time.cpp): fire the GPU end-of-pipe events the game registered
@@ -685,6 +695,7 @@ uint64_t g_submit_count = 0;
 void prosper_eq_trigger_eop();
 
 extern "C" void prosper_agc_submit_stats(uint64_t* submits, uint64_t* draws) {
+    std::lock_guard<std::mutex> lk(g_agc_state_mu);
     if (submits) *submits = g_submit_count;
     if (draws)   *draws   = (uint64_t)agc_gpu_state().draws.size();
 }
@@ -698,6 +709,7 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
     if (!addr) return 0;
     constexpr uint32_t kUnknownCap = 0x80000;   // 512 KiB of dwords — well past any real Dcb
     uint32_t walk = dw_num ? dw_num : kUnknownCap;
+    std::lock_guard<std::mutex> lk(g_agc_state_mu);   // serialize with the other submit entry (#278)
     agc_gpu_state().draws.clear();
     size_t applied = gpu::run_command_buffer(addr, walk, agc_gpu_state());
     g_submit_count++;
@@ -793,6 +805,7 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     struct Packet { uint32_t* addr; uint32_t dw_num; uint8_t pad[4]; };
     const auto* p = (const Packet*)(uintptr_t)a0;
     if (!p || !p->addr || !p->dw_num) return kAgcErrInvalidArg;
+    std::lock_guard<std::mutex> lk(g_agc_state_mu);   // serialize with submit_dcb_stream/w1KFAHVqpaU (#278)
     // Reset the per-submit draw list BEFORE folding this Dcb. The folded GpuState is process-lifetime and
     // its register files (cx/sh/uc) persist across submits (as on real hardware), but its `draws` vector
     // must NOT accumulate — otherwise it grows unbounded and every later frame re-renders stale geometry.
