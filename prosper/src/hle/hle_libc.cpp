@@ -116,6 +116,17 @@ HLE(h_strlcat) {
     if (dl < n) { size_t c = sl < n - dl - 1 ? sl : n - dl - 1; memcpy(d + dl, s, c); d[dl + c] = 0; }
     return dl + sl;
 }
+// C11 Annex-K bounded functions (errno_t return; 0 == success), arg order (dst, dstsz, src[, n]). These
+// were MISSING -> the return-0 stub reported SUCCESS without copying, leaving the destination stale/
+// uninitialized -> silent data corruption far from the call site. Real, bounds-checked impls that never
+// write past dstsz (ERANGE=34 on overflow, zeroing the dst for the mem* forms per Annex-K).
+HLE(h_memcpy_s)  { size_t ds=a1,n=a3; if (n>ds) { memset(P(a0),0,ds); return 34; } memcpy(P(a0),CP(a2),n); return 0; }
+HLE(h_memmove_s) { size_t ds=a1,n=a3; if (n>ds) { memset(P(a0),0,ds); return 34; } memmove(P(a0),CP(a2),n); return 0; }
+HLE(h_memset_s)  { size_t ds=a1,n=a3; size_t c=n<ds?n:ds; memset(P(a0),(int)a2,c); return n>ds?34:0; }
+HLE(h_strcpy_s)  { char* d=(char*)P(a0); const char* s=CS(a2); size_t ds=a1,i=0; if (ds){ while(i<ds-1&&s[i]){d[i]=s[i];i++;} d[i]=0; } return 0; }
+HLE(h_strncpy_s) { char* d=(char*)P(a0); const char* s=CS(a2); size_t ds=a1,n=a3,lim=(ds?ds-1:0); if(n<lim)lim=n; size_t i=0; if (ds){ while(i<lim&&s[i]){d[i]=s[i];i++;} d[i]=0; } return 0; }
+HLE(h_strcat_s)  { char* d=(char*)P(a0); const char* s=CS(a2); size_t ds=a1,dl=strnlen(d,ds),i=0; if (dl<ds){ while(dl+i<ds-1&&s[i]){d[dl+i]=s[i];i++;} d[dl+i]=0; } return 0; }
+HLE(h_strncat_s) { char* d=(char*)P(a0); const char* s=CS(a2); size_t ds=a1,n=a3,dl=strnlen(d,ds),i=0; if (dl<ds){ while(dl+i<ds-1&&i<n&&s[i]){d[dl+i]=s[i];i++;} d[dl+i]=0; } return 0; }
 
 HLE(h_malloc)  { return (uint64_t)(uintptr_t)malloc(a0); }
 HLE(h_calloc)  { return (uint64_t)(uintptr_t)calloc(a0, a1); }
@@ -401,6 +412,10 @@ void register_builtin_hle() {
     R("strcat", h_strcat);   R("strncat", h_strncat);
     R("strchr", h_strchr);   R("strrchr", h_strrchr); R("strstr", h_strstr);
     R("strlcpy", h_strlcpy); R("strlcat", h_strlcat);
+    // Annex-K bounded (secure-CRT) variants — were MISSING -> return-0 stub = "success" without copying
+    R("memcpy_s", h_memcpy_s);   R("memmove_s", h_memmove_s);   R("memset_s", h_memset_s);
+    R("strcpy_s", h_strcpy_s);   R("strncpy_s", h_strncpy_s);
+    R("strcat_s", h_strcat_s);   R("strncat_s", h_strncat_s);
     R("malloc", h_malloc);   R("calloc", h_calloc);   R("realloc", h_realloc); R("free", h_free);
     R("memalign", h_memalign); R("posix_memalign", h_posix_memalign); R("aligned_alloc", h_aligned_alloc);
     // operator new / new[] (+ nothrow), and aligned variants
@@ -417,6 +432,7 @@ void register_builtin_hle() {
     // stdio
     R("vsnprintf", h_vsnprintf); R("vsprintf", h_vsprintf);
     R("snprintf", h_snprintf);   R("sprintf", h_sprintf);   R("snprintf_s", h_snprintf);
+    R("sprintf_s", h_snprintf);   // Annex-K sprintf_s(s, n, fmt, ...) has a size arg -> bounded snprintf, NOT sprintf
     R("printf", h_printf);       R("puts", h_puts);
     R("putchar", h_putchar);     R("fputs", h_fputs);
     // locale / ctype
