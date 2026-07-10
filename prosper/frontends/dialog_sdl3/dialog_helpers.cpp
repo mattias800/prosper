@@ -49,4 +49,73 @@ uint32_t read_error_code(uint64_t param) {
     return code;
 }
 
+// --- ImeDialog text entry ---
+
+void utf8_append_cp(std::string& s, uint32_t cp) {
+    if (cp < 0x80) {
+        s += (char)cp;
+    } else if (cp < 0x800) {
+        s += (char)(0xC0 | (cp >> 6)); s += (char)(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        s += (char)(0xE0 | (cp >> 12)); s += (char)(0x80 | ((cp >> 6) & 0x3F)); s += (char)(0x80 | (cp & 0x3F));
+    } else {
+        s += (char)(0xF0 | (cp >> 18)); s += (char)(0x80 | ((cp >> 12) & 0x3F));
+        s += (char)(0x80 | ((cp >> 6) & 0x3F)); s += (char)(0x80 | (cp & 0x3F));
+    }
+}
+
+std::string u16_to_utf8(uint64_t u16ptr) {
+    std::string out;
+    if (!u16ptr) return out;
+    const uint16_t* u = (const uint16_t*)(uintptr_t)u16ptr;
+    const uint32_t CAP = 4096;   // guard a non-terminated guest string from a runaway read
+    for (uint32_t i = 0; i < CAP && u[i]; ) {
+        uint32_t cp = u[i++];
+        if (cp >= 0xD800 && cp <= 0xDBFF && i < CAP && u[i] >= 0xDC00 && u[i] <= 0xDFFF)
+            cp = 0x10000 + ((cp - 0xD800) << 10) + (u[i++] - 0xDC00);   // surrogate pair
+        utf8_append_cp(out, cp);
+    }
+    return out;
+}
+
+ImeRequest read_ime_request(uint64_t param) {
+    ImeRequest r{0, 0, {}, {}};
+    if (!param) return r;
+    std::memcpy(&r.max_text_length, (const void*)(uintptr_t)(param + 36), 4);
+    std::memcpy(&r.input_buffer,    (const void*)(uintptr_t)(param + 40), 8);
+    uint64_t titlep = 0;
+    std::memcpy(&titlep, (const void*)(uintptr_t)(param + 72), 8);
+    r.title   = u16_to_utf8(titlep);
+    r.initial = u16_to_utf8(r.input_buffer);
+    return r;
+}
+
+uint32_t write_ime_text(uint64_t input_buffer, uint32_t max_len, const std::string& utf8) {
+    if (!input_buffer) return 0;
+    uint16_t* out = (uint16_t*)(uintptr_t)input_buffer;
+    uint32_t n = 0;                                   // UTF-16 code units written (excl. NUL)
+    for (size_t i = 0; i < utf8.size() && n < max_len; ) {
+        unsigned char c = (unsigned char)utf8[i];
+        uint32_t cp; int len;
+        if (c < 0x80)              { cp = c;                 len = 1; }
+        else if ((c >> 5) == 0x6)  { cp = c & 0x1F;          len = 2; }
+        else if ((c >> 4) == 0xE)  { cp = c & 0x0F;          len = 3; }
+        else if ((c >> 3) == 0x1E) { cp = c & 0x07;          len = 4; }
+        else                       { i++;                    continue; }   // stray continuation byte
+        if (i + (size_t)len > utf8.size()) break;
+        for (int k = 1; k < len; k++) cp = (cp << 6) | ((unsigned char)utf8[i + k] & 0x3F);
+        i += len;
+        if (cp < 0x10000) {
+            out[n++] = (uint16_t)cp;
+        } else {                                       // encode as a UTF-16 surrogate pair
+            if (n + 2 > max_len) break;
+            cp -= 0x10000;
+            out[n++] = (uint16_t)(0xD800 | (cp >> 10));
+            out[n++] = (uint16_t)(0xDC00 | (cp & 0x3FF));
+        }
+    }
+    out[n] = 0;   // NUL-terminate (Sony input buffer is sized max_text_length + 1)
+    return n;
+}
+
 } // namespace prosper
