@@ -61,7 +61,7 @@ int main() {
          (uint64_t)(uintptr_t)&tcap, 0);
     CHECK(tout == 1, "WaitEqueue returned the timer event");
     CHECK(tev.ident == 1234, "timer event ident == 1234");
-    CHECK(tev.filter == -7, "timer event filter == EVFILT_TIMER (-7)");
+    CHECK(tev.filter == -15, "HR-timer event filter == EVFILT_HRTIMER (-15)");
 
     // --- GPU EOP event (sceGnmAddEqEvent, NID b0xyllnVY-I): register id=0x40 (GfxEop) on the equeue,
     //     then a completed SubmitDcb must fire it — our fold is synchronous, so submit == pipe drain. ---
