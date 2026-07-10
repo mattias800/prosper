@@ -14,8 +14,9 @@
 namespace prosper::gpu {
 
 // AGC/GFX10 T# tile_mode values we recognize. 0 = linear (no swizzle). 5 = SW_4KB_S (the RGBA render
-// target). Others fall through to a linear copy for now (add as the target needs them).
-enum class TileMode : uint32_t { Linear = 0, Sw4KbS = 5 };
+// target). 9 = SW_64KB_S (standard 64KB, DOLL's material textures) and 27 = SW_64KB_R_X (render-target
+// 64KB with pipe XOR, DOLL's RT/post composites) — #288. Others fall through to a linear copy for now.
+enum class TileMode : uint32_t { Linear = 0, Sw4KbS = 5, Sw64KbS = 9, Sw64KbRX = 27 };
 
 // True if `tile_mode` denotes a swizzled layout that detile_surface will de-swizzle.
 bool tile_mode_is_tiled(uint32_t tile_mode);

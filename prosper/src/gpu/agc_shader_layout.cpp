@@ -5,6 +5,10 @@
 
 namespace prosper::gpu {
 
+// Guest-memory readability probe (defined in gpu_executor.cpp, same lib) — used by the gated
+// PROSPER_DUMP_TILERAW diagnostic to avoid a SIGSEGV on a mis-decoded texture base.
+bool guest_readable(uint64_t addr, uint32_t bytes);
+
 // RDNA2 (GFX10/PS5) V# dword3 carries a COMBINED 7-bit FORMAT at bits[18:12] — NOT the separate GCN/PS4
 // NFMT[14:12]/DFMT[18:15] split (reading that on a PS5 V# yields garbage fields, so every descriptor came
 // out DataFormat::Unknown and fell back to Float32 downstream — e.g. a UNORM8 vertex color 0xffffffff
@@ -208,6 +212,44 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             DecodedImageDescriptor d = decode_image_descriptor(&user_sgprs[off]);
             if (d.base == 0 || d.width == 0 || d.height == 0 ||
                 d.width > 16384 || d.height > 16384) continue;  // skip a garbage/degenerate T#
+            // PROSPER_DUMP_TILERAW (issue #282 derivation): dump the raw guest texel bytes of a tiled
+            // texture once per address, so its GPU tile swizzle can be reversed offline (coherence
+            // scoring). Fires at T#-decode time (every draw's stage build), so it captures textures even
+            // on runs whose intermittent content never reaches the render backend. Guest memory is
+            // 1:1-mapped; the size is the tiled element footprint (BCn: (w/4)*(h/4)*block_bytes).
+            if (getenv("PROSPER_DUMP_TILERAW") && d.base > 0x10000 && d.tile_mode != 0) {
+                static bool tseen[1u << 12] = {};                  // dedupe by low base bits
+                uint32_t key = (uint32_t)((d.base >> 12) & 0xfffu);
+                if (!tseen[key]) {
+                    Gen5ImageFormatInfo tf;
+                    bool done = true;                              // default: mark seen (don't retry)
+                    if (gen5_image_format(d.format, &tf)) {
+                        uint32_t bpb = tf.bytes_per_block, bw = tf.block_width, bh = tf.block_height;
+                        size_t nb = (size_t)((d.width + bw - 1) / bw) * ((d.height + bh - 1) / bh) * bpb;
+                        if (nb && nb <= (32u << 20) && guest_readable(d.base, (uint32_t)nb)) {
+                            // Only mark seen once the surface has CONTENT: a render target sampled
+                            // before anything drew into it dumps all-zero and (deduped) would never
+                            // be re-captured — keep retrying until nonzero bytes appear (#288).
+                            const uint8_t* pb8 = (const uint8_t*)(uintptr_t)d.base;
+                            size_t probe = nb < 65536 ? nb : 65536;
+                            bool has_content = false;
+                            for (size_t i = 0; i < probe; i += 64) if (pb8[i]) { has_content = true; break; }
+                            done = has_content;
+                            if (has_content) {
+                                const char* dd = getenv("PROSPER_FRAME_DIR"); char fn[512];
+                                snprintf(fn, sizeof fn, "%s/tileraw_%ux%u_bpb%u_tm%u_fmt%u_%llx.bin",
+                                         dd ? dd : ".", d.width, d.height, bpb, d.tile_mode, d.format,
+                                         (unsigned long long)d.base);
+                                if (FILE* bf = fopen(fn, "wb")) {
+                                    fwrite((const void*)(uintptr_t)d.base, 1, nb, bf); fclose(bf);
+                                    fprintf(stderr, "[tileraw] %s (%zu)\n", fn, nb);
+                                }
+                            }
+                        }
+                    }
+                    tseen[key] = done;
+                }
+            }
             if (getenv("PROSPER_GFXLOG")) {
                 const uint32_t* t = &user_sgprs[off];
                 fprintf(stderr, "[t#] %ux%u base=0x%llx tile_mode=%u type=%u fmt=%u swz=%u,%u,%u,%u | raw: %08x %08x %08x %08x %08x %08x %08x %08x\n",
