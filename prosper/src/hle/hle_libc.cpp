@@ -129,6 +129,10 @@ HLE(h_memalign) {
     return (uint64_t)(uintptr_t)aligned_alloc_portable(al, a1);
 }
 HLE(h_posix_memalign) {
+    // POSIX: EINVAL if the alignment isn't a power of two AND a multiple of sizeof(void*); ENOMEM only on
+    // an actual allocation failure. We returned ENOMEM for the bad-alignment case too, so a guest that
+    // branches on errno==EINVAL (validating its own request) took the wrong path.
+    if (a1 < sizeof(void*) || (a1 & (a1 - 1))) return 22;   // EINVAL
     void* p = aligned_alloc_portable(a1, a2);
     if (!p) return 12; // ENOMEM
     *(void**)P(a0) = p;
