@@ -925,17 +925,23 @@ void GpuState::apply(const Pm4Command& c) {
                     static std::atomic<int> logged{0};
                     int ln = logged.fetch_add(1);
                     if (ln < 40 || (ln & 1023) == 0) {
-                        uint64_t mem = 0; memcpy(&mem, (const void*)(uintptr_t)c.wm_addr, sizeof mem);
+                        // wait_regmem_satisfied() returns false for an UNMAPPED label too (#380), so this
+                        // "not satisfied" diagnostic is reached with a stale/freed label whose page may be
+                        // gone — a raw 8-byte read then SEGVs, the exact crash #380 fixed but via the log
+                        // path #380 did not cover (#448). Read only when mapped; report UNMAPPED otherwise.
+                        bool label_readable = guest_readable(c.wm_addr, 8);
+                        uint64_t mem = 0; if (label_readable) memcpy(&mem, (const void*)(uintptr_t)c.wm_addr, sizeof mem);
                         // #312 discriminator: build-journal age + freed-heap-shaped label content.
                         uint64_t baddr = 0, bpre = 0, bt = 0;
                         int have = prosper_fence_journal_lookup(pkt_addr(c), &baddr, &bpre, &bt);
-                        fprintf(stderr, "[agc] WaitRegMem #%d NOT satisfied at fold time: [0x%llx]&0x%llx = 0x%llx, func=%u ref=0x%llx — %s | built@%llums(age=%lldms)%s pre@build=0x%llx%s\n",
+                        fprintf(stderr, "[agc] WaitRegMem #%d NOT satisfied at fold time: [0x%llx]&0x%llx = 0x%llx, func=%u ref=0x%llx — %s | built@%llums(age=%lldms)%s pre@build=0x%llx%s%s\n",
                                 ln, (unsigned long long)c.wm_addr, (unsigned long long)c.wm_mask,
                                 (unsigned long long)(mem & c.wm_mask), c.wm_func, (unsigned long long)c.wm_ref,
                                 defer_enabled() ? "pausing queue (deferred effects)" : "dependency violated",
                                 (unsigned long long)bt, have ? (long long)(now_ms() - bt) : -1,
                                 (have && baddr != c.wm_addr) ? " TARGET-CHANGED" : "",
-                                (unsigned long long)bpre, ptr_like(mem) ? " CONTENT-PTR-LIKE(freed?)" : "");
+                                (unsigned long long)bpre, ptr_like(mem) ? " CONTENT-PTR-LIKE(freed?)" : "",
+                                label_readable ? "" : " LABEL-UNMAPPED");
                     }
                     if (defer_enabled()) {
                         g_fold_deferring = true;
