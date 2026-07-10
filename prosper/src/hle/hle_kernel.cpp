@@ -93,6 +93,18 @@ HLE(k_mutexattr_settype) {
     pthread_mutexattr_settype((pthread_mutexattr_t*)*(void**)a0, host);
     return 0;
 }
+// scePthreadMutexattrGettype: the read-back inverse of settype. Was MISSING -> the generic stub
+// returned 0 while leaving the caller's `int* type` (a1) unwritten, so the guest read stack garbage as
+// the mutex type (the harmful-Get-stub class the affinity/sched paths already guard against). Translate
+// host type -> Sony (ERRORCHECK->1, RECURSIVE->2, NORMAL->3), the inverse of k_mutexattr_settype above.
+HLE(k_mutexattr_gettype) {
+    if (!a0 || !*(void**)a0 || !a1) return 0x16;   // EINVAL
+    int host = PTHREAD_MUTEX_NORMAL;
+    pthread_mutexattr_gettype((pthread_mutexattr_t*)*(void**)a0, &host);
+    int sony = (host == PTHREAD_MUTEX_ERRORCHECK) ? 1 : (host == PTHREAD_MUTEX_RECURSIVE) ? 2 : 3;
+    *(int*)(uintptr_t)a1 = sony;
+    return 0;
+}
 HLE(k_mutexattr_setprotocol) { return 0; }
 
 // __stack_chk_fail (Ou3iL1abvng): the guest's -fstack-protector epilogue jumps here when its stack
@@ -1033,6 +1045,7 @@ void register_kernel_hle() {
     R("sceKernelIsStack", k_is_stack);
     R("scePthreadMutexattrInit", k_mutexattr_init);
     R("scePthreadMutexattrSettype", k_mutexattr_settype);
+    R("scePthreadMutexattrGettype", k_mutexattr_gettype);   // was MISSING -> left *type uninitialized
     R("scePthreadMutexattrSetprotocol", k_mutexattr_setprotocol);
     R("scePthreadMutexattrSetpshared", k_mutexattr_setpshared);
     R("scePthreadMutexattrDestroy", k_mutexattr_destroy);
