@@ -951,6 +951,32 @@ extern "C" void prosper_agc_submit_stats(uint64_t* submits, uint64_t* draws) {
     if (draws)   *draws   = (uint64_t)agc_gpu_state().draws.size();
 }
 
+namespace {
+// PROSPER_WAIT_DEFER watchdog (#312): deferred streams were only re-checked at SUBSEQUENT submits,
+// but a guest that waits for a deferred stream's EOP before submitting again deadlocks (observed:
+// boot wedged at submit #1 under WAIT_DEFER). A 2 ms ticker re-runs the flush (same submit mutex),
+// firing the owed EOP pulse the moment a paused stream's condition satisfies (typically via the
+// pend-queue completion writes) or its timeout expires. Started lazily on the first deferred fold;
+// inert unless PROSPER_WAIT_DEFER=1 ever pauses a stream.
+void start_defer_watchdog() {
+    static std::atomic<bool> started{false};
+    bool expect = false;
+    if (!started.compare_exchange_strong(expect, true)) return;
+    std::thread([] {
+        for (;;) {
+            struct timespec ts{ 0, 2000000 };   // 2 ms cadence
+            nanosleep(&ts, nullptr);
+            int n;
+            {
+                std::lock_guard<std::mutex> lk(g_agc_state_mu);
+                n = gpu::flush_deferred_streams();
+            }
+            for (; n > 0; n--) prosper_eq_trigger_eop();
+        }
+    }).detach();
+}
+}
+
 // Fold one raw Dcb dword stream through the CommandProcessor, fire the GPU EOP completion events, and
 // (if a live renderer is wired and the submit produced draws) execute+present. Shared by the primary
 // submit path (sceAgcDriverSubmitDcb) and the DOLL warmup-submit variant (w1KFAHVqpaU) below.
@@ -969,6 +995,7 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
     // A fold that PAUSED on an unsatisfied wait has not completed — its EOP pulse fires when its
     // deferred effects flush (one pulse per completed stream, owed by flush_deferred_streams).
     if (!gpu::last_fold_deferred()) prosper_eq_trigger_eop();
+    else start_defer_watchdog();   // #312: a paused stream must flush even if no submit follows
     for (int i = gpu::flush_deferred_streams(); i > 0; i--) prosper_eq_trigger_eop();
     static const unsigned render_every2 = [] {
         const char* e = getenv("PROSPER_RENDER_EVERY"); long v = e ? atol(e) : 1; return v > 0 ? (unsigned)v : 1u; }();
@@ -1079,6 +1106,7 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     // game called sceGnmAddEqEvent (b0xyllnVY-I); the RELEASE_MEM label write already happened in apply().
     // #312: a fold that PAUSED on an unsatisfied wait has not completed — its pulse fires at flush.
     if (!gpu::last_fold_deferred()) prosper_eq_trigger_eop();
+    else start_defer_watchdog();   // #312: a paused stream must flush even if no submit follows
     for (int i = gpu::flush_deferred_streams(); i > 0; i--) prosper_eq_trigger_eop();
     // Stage A: if a live renderer has been registered (runtime binary wires a Vulkan device) and this
     // submit accumulated draws, execute the folded GpuState and present the frame. Inert (returns false)

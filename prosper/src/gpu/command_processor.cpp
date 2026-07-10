@@ -138,6 +138,9 @@ static bool ptr_like(uint64_t v) {
 // #312: report one suspicious fence write with its build-journal verdict. kindtag: "REL1" etc.
 static void report_suspect_write(const char* kindtag, uint64_t addr, uint64_t value, uint64_t pre,
                                  uint64_t pkt) {
+    // Skip the first 10 s: boot-time label-array allocations carry benign freelist residue that
+    // burned the whole report budget at t=3.4 s in every run; the corruption class is mid-burst.
+    if (now_ms() < 10000) return;
     static std::atomic<int> n{0};
     if (n.fetch_add(1) >= 96) return;
     uint64_t baddr = 0, bpre = 0, bt = 0;
@@ -241,8 +244,10 @@ static void honor_event_write(const Pm4Command& c) {
 static void honor_dma_data(const Pm4Command& c) {
     if (eop_writes_disabled() || !c.dd_valid) return;
     constexpr uint32_t kMaxFill = 0x1000000;   // 16 MiB — far past any observed fill
+    // dst >= 0x10000: a small dst is a GDS offset (unmodeled), and the PROSPER_NULL_PAGE
+    // read-only zero page would otherwise pass guest_readable() and SEGV the memset.
     bool imm_form = c.dd_bytes >= 1 && c.dd_bytes <= kMaxFill &&
-                    c.dd_dst && !(c.dd_dst & 3) && c.dd_src <= 0xffffffffull;
+                    c.dd_dst >= 0x10000 && !(c.dd_dst & 3) && c.dd_src <= 0xffffffffull;
     if (!imm_form || !guest_readable(c.dd_dst, c.dd_bytes)) {
         // Not the immediate-fill form we model (or unmapped dst) — log so the gap stays visible.
         static std::atomic<int> n{0};
