@@ -120,62 +120,76 @@ struct BackendDraw {
 // so their behavior is byte-identical. The live renderer passes the game's decoded fast-clear color
 // (or opaque black when none), so real frames no longer start from blue (#309). PROSPER_CLEAR_DEBUG
 // forces the blue back on regardless, so unrendered areas can still be spotted during development.
+// Persistent Vulkan context. Creating a fresh instance+device PER render_draws_rgba call dominated
+// wall-clock — every submit paid full device init — which made a many-draw frame (real gameplay is
+// hundreds of draws/submit) impossibly slow and blocked headless scene investigation (#320). Create the
+// instance/physical-device/device/queue ONCE (lazy, thread-safe static init) and reuse it across every
+// call; per-call resources (images/pipelines/descriptors/command buffer/fence/pool) are still created and
+// freed per call. The context intentionally leaks at process exit — fine for a headless/diagnostic tool.
+struct RenderVkCtx {
+    VkInstance inst = VK_NULL_HANDLE; VkPhysicalDevice phys = VK_NULL_HANDLE;
+    VkDevice dev = VK_NULL_HANDLE; VkQueue queue = VK_NULL_HANDLE; uint32_t qfi = UINT32_MAX;
+    bool aniso_enabled = false; float max_aniso_limit = 1.0f; bool ok = false;
+};
+inline const RenderVkCtx& render_vk_ctx() {
+    static RenderVkCtx c = [] {
+        RenderVkCtx r;
+        VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO}; app.apiVersion = VK_API_VERSION_1_1;
+        VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; ici.pApplicationInfo = &app;
+        if (vkCreateInstance(&ici, nullptr, &r.inst) != VK_SUCCESS || !r.inst) return r;
+        uint32_t nd = 0; vkEnumeratePhysicalDevices(r.inst, &nd, nullptr);
+        if (!nd) return r;
+        std::vector<VkPhysicalDevice> devs(nd); vkEnumeratePhysicalDevices(r.inst, &nd, devs.data());
+        r.phys = devs[0];
+        uint32_t nqf = 0; vkGetPhysicalDeviceQueueFamilyProperties(r.phys, &nqf, nullptr);
+        std::vector<VkQueueFamilyProperties> qf(nqf); vkGetPhysicalDeviceQueueFamilyProperties(r.phys, &nqf, qf.data());
+        for (uint32_t i = 0; i < nqf; i++) if (qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) { r.qfi = i; break; }
+        if (r.qfi == UINT32_MAX) return r;
+        float prio = 1.0f;
+        VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+        qci.queueFamilyIndex = r.qfi; qci.queueCount = 1; qci.pQueuePriorities = &prio;
+        VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+        dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
+        // robustBufferAccess: OOB storage-buffer accesses are well-defined (predicated ops on
+        // narrowed-EXEC lanes can't fault).
+        VkPhysicalDeviceFeatures feats{}; feats.robustBufferAccess = VK_TRUE; dci.pEnabledFeatures = &feats;
+        // samplerAnisotropy (#275): enable only if advertised; maxSamplerAnisotropy is the clamp ceiling.
+        VkPhysicalDeviceFeatures supported{}; vkGetPhysicalDeviceFeatures(r.phys, &supported);
+        VkPhysicalDeviceProperties phys_props{}; vkGetPhysicalDeviceProperties(r.phys, &phys_props);
+        r.aniso_enabled = supported.samplerAnisotropy;
+        r.max_aniso_limit = phys_props.limits.maxSamplerAnisotropy;
+        if (r.aniso_enabled) feats.samplerAnisotropy = VK_TRUE;
+        // robustImageAccess (VK_EXT_image_robustness): OpImageRead OOB must return zero (#131). Guarded.
+        VkPhysicalDeviceImageRobustnessFeaturesEXT irf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES_EXT};
+        const char* img_robust_ext[] = { "VK_EXT_image_robustness" };
+        { uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(r.phys, nullptr, &ne, nullptr);
+          std::vector<VkExtensionProperties> de(ne);
+          vkEnumerateDeviceExtensionProperties(r.phys, nullptr, &ne, de.data());
+          for (uint32_t i = 0; i < ne; i++) if (!strcmp(de[i].extensionName, "VK_EXT_image_robustness")) {
+              VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+              f2.pNext = &irf; vkGetPhysicalDeviceFeatures2(r.phys, &f2);
+              if (irf.robustImageAccess) { dci.pNext = &irf;
+                  dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = img_robust_ext; }
+              break;
+          } }
+        if (vkCreateDevice(r.phys, &dci, nullptr, &r.dev) != VK_SUCCESS || !r.dev) return r;
+        vkGetDeviceQueue(r.dev, r.qfi, 0, &r.queue);
+        r.ok = true;
+        return r;
+    }();
+    return c;
+}
+
 inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& draws, uint32_t W, uint32_t H,
                                               const uint8_t* seed_rgba = nullptr,
                                               const float* clear_rgba = nullptr) {
     std::vector<uint8_t> out;
     if (draws.empty()) return out;
-    VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO}; app.apiVersion = VK_API_VERSION_1_1;
-    VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; ici.pApplicationInfo = &app;
-    VkInstance inst = VK_NULL_HANDLE;
-    if (vkCreateInstance(&ici, nullptr, &inst) != VK_SUCCESS || !inst) return out;
-    uint32_t nd = 0; vkEnumeratePhysicalDevices(inst, &nd, nullptr);
-    if (!nd) { vkDestroyInstance(inst, nullptr); return out; }
-    std::vector<VkPhysicalDevice> devs(nd); vkEnumeratePhysicalDevices(inst, &nd, devs.data());
-    VkPhysicalDevice phys = devs[0];
-    uint32_t nqf = 0; vkGetPhysicalDeviceQueueFamilyProperties(phys, &nqf, nullptr);
-    std::vector<VkQueueFamilyProperties> qf(nqf); vkGetPhysicalDeviceQueueFamilyProperties(phys, &nqf, qf.data());
-    uint32_t qfi = UINT32_MAX;
-    for (uint32_t i = 0; i < nqf; i++) if (qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) { qfi = i; break; }
-    if (qfi == UINT32_MAX) { vkDestroyInstance(inst, nullptr); return out; }
-    float prio = 1.0f;
-    VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
-    qci.queueFamilyIndex = qfi; qci.queueCount = 1; qci.pQueuePriorities = &prio;
-    VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
-    dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
-    // robustBufferAccess: out-of-range storage-buffer accesses are well-defined, so a predicated memory
-    // op run by an inactive lane (narrowed EXEC) can't fault.
-    VkPhysicalDeviceFeatures feats{}; feats.robustBufferAccess = VK_TRUE; dci.pEnabledFeatures = &feats;
-    // samplerAnisotropy (#275): the game's S# can request anisotropic filtering (max_aniso_ratio > 0).
-    // Enable the feature only when the physical device advertises it (a headless/software device may
-    // not) — otherwise sampler creation with anisotropyEnable would be invalid usage. maxSamplerAnisotropy
-    // is the device's ceiling; we clamp the requested ratio to it at sampler-build time.
-    VkPhysicalDeviceFeatures supported{}; vkGetPhysicalDeviceFeatures(phys, &supported);
-    VkPhysicalDeviceProperties phys_props{}; vkGetPhysicalDeviceProperties(phys, &phys_props);
-    const bool  aniso_enabled = supported.samplerAnisotropy;
-    const float max_aniso_limit = phys_props.limits.maxSamplerAnisotropy;
-    if (aniso_enabled) feats.samplerAnisotropy = VK_TRUE;
-    // robustImageAccess (VK_EXT_image_robustness; core in 1.3): the recompiled storage-image load
-    // path issues OpImageRead for ALL invocations — including EXEC-inactive lanes whose coordinates
-    // can be out of range — relying on OOB image reads returning zero (#131). This is the LIVE
-    // render backend (boot_trace registers render_draws_rgba as the submit renderer), so real game
-    // shaders run here on non-multiple image sizes. Feature-query guarded: a device without it
-    // still creates (visibly logged risk is preferable to failing device creation outright).
-    VkPhysicalDeviceImageRobustnessFeaturesEXT irf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES_EXT};
-    const char* img_robust_ext[] = { "VK_EXT_image_robustness" };
-    { uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(phys, nullptr, &ne, nullptr);
-      std::vector<VkExtensionProperties> de(ne);
-      vkEnumerateDeviceExtensionProperties(phys, nullptr, &ne, de.data());
-      for (uint32_t i = 0; i < ne; i++) if (!strcmp(de[i].extensionName, "VK_EXT_image_robustness")) {
-          VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-          f2.pNext = &irf; vkGetPhysicalDeviceFeatures2(phys, &f2);
-          if (irf.robustImageAccess) { dci.pNext = &irf;
-              dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = img_robust_ext; }
-          break;
-      } }
-    VkDevice dev = VK_NULL_HANDLE;
-    if (vkCreateDevice(phys, &dci, nullptr, &dev) != VK_SUCCESS || !dev) { vkDestroyInstance(inst, nullptr); return out; }
-    VkQueue queue; vkGetDeviceQueue(dev, qfi, 0, &queue);
+    const RenderVkCtx& ctx = render_vk_ctx();
+    if (!ctx.ok) return out;
+    VkInstance inst = ctx.inst; (void)inst; VkPhysicalDevice phys = ctx.phys;
+    VkDevice dev = ctx.dev; VkQueue queue = ctx.queue; uint32_t qfi = ctx.qfi;
+    const bool aniso_enabled = ctx.aniso_enabled; const float max_aniso_limit = ctx.max_aniso_limit;
     VkPhysicalDeviceMemoryProperties memp; vkGetPhysicalDeviceMemoryProperties(phys, &memp);
     auto pick = [&](uint32_t bits, VkMemoryPropertyFlags want) -> uint32_t {
         for (uint32_t i = 0; i < memp.memoryTypeCount; i++)
@@ -640,7 +654,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     vkDestroyFramebuffer(dev, fb, nullptr); vkDestroyRenderPass(dev, rp, nullptr); vkDestroyImageView(dev, view, nullptr);
     vkDestroyImage(dev, img, nullptr); vkFreeMemory(dev, imem, nullptr);
     if (use_depth) { vkDestroyImageView(dev, dview, nullptr); vkDestroyImage(dev, dimg, nullptr); vkFreeMemory(dev, dmem, nullptr); }
-    vkDestroyDevice(dev, nullptr); vkDestroyInstance(inst, nullptr);
+    // NB: dev/instance are the persistent RenderVkCtx — do NOT destroy them here (reused across calls).
     return out;
 }
 
