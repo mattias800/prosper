@@ -58,6 +58,18 @@ int main() {
     CHECK(e.unsupported == 0,
           "a narrowed EXEC branch to s_endpgm over a dead scalar write is linearized (guard-to-end shape)");
 
+    // #325: a 2D_ARRAY (SQ_RSRC_IMG_2D_ARRAY, DIM=5) image_sample is now accepted — handled as its base
+    // 2D slice (array index dropped) — instead of rejecting the whole shader (previously DIM!=1&&!=2 was
+    // truly-unsupported, silently skipping the draw). Same bytes as the 2D image_sample (0xF0800F08) with
+    // DIM (dword0 bits[5:3]) = 5 -> 0xF0800F28. It is `table_dependent` (needs a resource table), NOT
+    // `unsupported`, so a real recompile (with the T#) proceeds.
+    const uint32_t arr_sample[] = { 0xF0800F28u, 0x00A30000u, 0xBF810000u };
+    RecompileCoverage f = recompile_coverage(arr_sample, sizeof(arr_sample)/sizeof(arr_sample[0]));
+    printf("  2d_array-sample: total=%u table_dependent=%u unsupported=%u first_bad_fmt=%d\n",
+           f.total, f.table_dependent, f.unsupported, f.first_bad_fmt);
+    CHECK(f.unsupported == 0 && f.table_dependent >= 1 && f.first_bad_fmt < 0,
+          "#325: a 2D_ARRAY image_sample is recompilable-in-context (base slice), not unsupported");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

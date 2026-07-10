@@ -2747,7 +2747,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // gfx1010 round-trip on live DOLL FXAA bytes: 0xf0dc0808/0xf0dc080a "image_sample_lz_o";
             // the offset-adjust folds into the normalized coords, see image_sample_lz_offset_2d).
             const bool is_sample_lz_o = (in.opcode == 0x37);
-            const bool dim2d = (in.mimg_dim == 1u), dim3d = (in.mimg_dim == 2u);
+            // 2D_ARRAY (dim=5) is sampled here as its base 2D slice: the (u,v) coords are read as usual and
+            // the array-index coord is dropped, so the shader RECOMPILES instead of being rejected (previously
+            // dim!=1&&dim!=2 -> ok=false, silently SKIPPING the whole draw — real content loss, #325). Correct
+            // for single-layer arrays (e.g. Unity's default textures, which are 4x4x1); a multi-layer array is
+            // sampled at slice 0, a documented limitation pending full VK_IMAGE_VIEW_TYPE_2D_ARRAY support.
+            const bool dim2d = (in.mimg_dim == 1u || in.mimg_dim == 5u), dim3d = (in.mimg_dim == 2u);
+            if (in.mimg_dim == 5u && getenv("PROSPER_GFXLOG"))
+                fprintf(stderr, "[recompile] 2D_ARRAY image_sample -> sampled as base slice 0 (array index dropped; #325)\n");
             if ((!is_sample && !is_load && !is_sample_l && !is_sample_lz && !is_sample_b && !is_gather_lz &&
                  !is_gather_lz_o && !is_sample_lz_o) || (!dim2d && !dim3d)) { ok = false; return true; }
             if (res->cls != ResourceClass::Texture) { ok = false; return true; }
@@ -3270,9 +3277,11 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
                     if (i.opcode == 0x00u) return st_dim || i.mimg_dim == 6u || i.mimg_dim == 7u;   // image_load (+ 2D_MSAA[_ARRAY])
                     if (i.opcode == 0x08u) return st_dim;                       // image_store (no per-sample MSAA store)
                     // sample*: 2D (NSA ok); plus implicit-LOD image_sample (0x20) / LOD-0 image_sample_lz
-                    // (0x27) from a 3D texture; sample_b (0x25) and gather4_lz (0x47) are 2D.
-                    if (i.opcode == 0x20u || i.opcode == 0x27u) return i.mimg_dim == 1u || i.mimg_dim == 2u;
-                    if (i.opcode == 0x24u || i.opcode == 0x25u || i.opcode == 0x47u) return i.mimg_dim == 1u;
+                    // (0x27) from a 3D texture; sample_b (0x25) and gather4_lz (0x47) are 2D. 2D_ARRAY (dim 5)
+                    // is accepted for all sample paths and handled as its base 2D slice (array index dropped,
+                    // #325) — so array-sampling draws recompile+render instead of being skipped.
+                    if (i.opcode == 0x20u || i.opcode == 0x27u) return i.mimg_dim == 1u || i.mimg_dim == 2u || i.mimg_dim == 5u;
+                    if (i.opcode == 0x24u || i.opcode == 0x25u || i.opcode == 0x47u) return i.mimg_dim == 1u || i.mimg_dim == 5u;
                     return false;
                 }
                 case Rdna2Format::MUBUF:  return i.opcode <= 0x07u ||                    // load/store_format_*
