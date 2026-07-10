@@ -9,6 +9,7 @@
 #include "nid.hpp"
 #include "../host/exec_image.hpp"
 #include <pthread.h>
+#include <semaphore.h>   // scePthreadSem* -> host sem_t
 #include <cerrno>
 #include <cctype>
 #include <cstdio>
@@ -183,6 +184,13 @@ namespace {
             return rw;
         pthread_rwlock_destroy(rw); free(rw);
         return (pthread_rwlock_t*)cur;
+    }
+    // scePthreadSem*: read the sem_t created by scePthreadSemInit (no static SEM_INITIALIZER, so no lazy
+    // self-init -- Init is the sole creator). Returns null if the guest never called Init.
+    sem_t* ensure_sem(uint64_t slot_addr) {
+        if (!slot_addr) return nullptr;
+        void* cur = __atomic_load_n((void**)(uintptr_t)slot_addr, __ATOMIC_ACQUIRE);
+        return pt_static_sentinel(cur) ? nullptr : (sem_t*)cur;
     }
 }
 // scePthreadMutexInit(mutex_slot, attr_slot, name) / pthread_mutex_init(mutex_slot, attr_slot):
@@ -603,6 +611,17 @@ HLE(k_rwlock_timedwrlock) {
     int rc = pthread_rwlock_timedwrlock(rw, &dl);
     return rc == ETIMEDOUT ? 60u : (uint64_t)rc;
 }
+// scePthreadSem* -- POSIX-style counting semaphores (DISTINCT from sceKernelCreateSema). Were MISSING ->
+// the generic stub returned 0: SemInit created nothing, SemWait returned immediately (never blocked),
+// SemGetvalue left *value uninitialized -> a producer/consumer or gate built on these got NO
+// synchronization (the silent-unsync / UAF class). Back them with host sem_t.
+HLE(k_sem_init)      { if (!a0) return 0x16; auto* s = (sem_t*)calloc(1, sizeof(sem_t)); sem_init(s, 0, (unsigned)a2); *(void**)(uintptr_t)a0 = s; return 0; }
+HLE(k_sem_wait)      { auto* s = ensure_sem(a0); if (!s) return 0x16; return sem_wait(s) == 0 ? 0 : (uint64_t)(unsigned)errno; }
+HLE(k_sem_trywait)   { auto* s = ensure_sem(a0); if (!s) return 0x16; return sem_trywait(s) == 0 ? 0 : (uint64_t)(unsigned)errno; }
+HLE(k_sem_timedwait) { auto* s = ensure_sem(a0); if (!s) return 0x16; timespec dl = abs_deadline_us(a1); int rc = sem_timedwait(s, &dl); return rc == 0 ? 0 : (errno == ETIMEDOUT ? 60u : (uint64_t)(unsigned)errno); }
+HLE(k_sem_post)      { auto* s = ensure_sem(a0); if (!s) return 0x16; sem_post(s); return 0; }
+HLE(k_sem_getvalue)  { auto* s = ensure_sem(a0); if (!s) return 0x16; int v = 0; sem_getvalue(s, &v); if (a1) *(int*)(uintptr_t)a1 = v; return 0; }
+HLE(k_sem_destroy)   { if (a0) { void** slot = (void**)(uintptr_t)a0; if (!pt_static_sentinel(*slot)) { sem_destroy((sem_t*)*slot); free(*slot); *slot = nullptr; } } return 0; }
 HLE(k_ef_wait)    { // (ef, pattern, waitMode, resultPat*, SceKernelUseconds* timeout)
     // The timeout arg (a4) was previously IGNORED — a bounded guest wait blocked forever (the
     // same class of silent hang root-caused for wait_on_address, hle_kernel_mem.cpp). Sony
@@ -1111,6 +1130,11 @@ void register_kernel_hle() {
     R("scePthreadRwlockTrywrlock", k_rwlock_trywrlock);
     R("scePthreadRwlockTimedrdlock", k_rwlock_timedrdlock);   // were MISSING -> faked "locked" without locking
     R("scePthreadRwlockTimedwrlock", k_rwlock_timedwrlock);
+    // scePthreadSem* counting semaphores (were MISSING -> SemWait never blocked)
+    R("scePthreadSemInit", k_sem_init);         R("scePthreadSemDestroy", k_sem_destroy);
+    R("scePthreadSemWait", k_sem_wait);         R("scePthreadSemTrywait", k_sem_trywait);
+    R("scePthreadSemTimedwait", k_sem_timedwait); R("scePthreadSemPost", k_sem_post);
+    R("scePthreadSemGetvalue", k_sem_getvalue);
     R("scePthreadOnce", k_pthread_once);             R("pthread_once", k_pthread_once);
     R("scePthreadSelf", k_pthread_self);
     R("scePthreadEqual", k_pthread_equal);
