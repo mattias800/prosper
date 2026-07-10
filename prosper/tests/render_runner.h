@@ -200,18 +200,23 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     // fixed attachment set); each draw's pipeline sets its own depthTest/Write/CompareOp. A frame with
     // no depth-using draw takes the color-only path unchanged.
     bool use_depth = false, use_stencil = false;
-    // Depth/stencil clear values for the render pass's LOAD_OP_CLEAR: take them from the first
-    // depth-testing draw's resolved state (#371). Resolve set depth_clear_value from the guest's
-    // DB_DEPTH_CLEAR, or a compare-op-appropriate default (1.0 for LESS, 0.0 for GREATER) — never the
-    // old fixed 0.5, which discarded far-half geometry under a standard LESS test.
+    // Depth/stencil clear values for the render pass's LOAD_OP_CLEAR (#371). Resolve set
+    // depth_clear_value from the guest's DB_DEPTH_CLEAR, or a compare-op-appropriate default (1.0 for
+    // LESS, 0.0 for GREATER) — never the old fixed 0.5. Latch the depth clear from the first DEPTH-testing
+    // draw and the stencil clear from the first STENCIL-testing draw INDEPENDENTLY: coupling them (one
+    // latch off the first depth-OR-stencil draw) let a stencil-only first draw — e.g. the title-shimmer
+    // stencil prime with depth off — force depth_clear to that draw's default 1.0, so a later reverse-Z
+    // (GREATER) draw in the same submit cleared to 1.0 and rejected every fragment (#457).
     float    depth_clear   = 1.0f;
     uint32_t stencil_clear = 0;
-    bool     got_ds_clear  = false;
-    for (const auto& d : draws) { if (d.ps && d.ps->depth_test_enable) use_depth = true;
-                                  if (d.ps && d.ps->stencil_enable)    use_stencil = true;
-                                  if (d.ps && (d.ps->depth_test_enable || d.ps->stencil_enable) && !got_ds_clear) {
-                                      depth_clear = d.ps->depth_clear_value;
-                                      stencil_clear = d.ps->stencil_clear_value; got_ds_clear = true; } }
+    bool     got_depth_clear = false, got_stencil_clear = false;
+    for (const auto& d : draws) {
+        if (!d.ps) continue;
+        if (d.ps->depth_test_enable) { use_depth = true;
+            if (!got_depth_clear) { depth_clear = d.ps->depth_clear_value; got_depth_clear = true; } }
+        if (d.ps->stencil_enable) { use_stencil = true;
+            if (!got_stencil_clear) { stencil_clear = d.ps->stencil_clear_value; got_stencil_clear = true; } }
+    }
     if (getenv("PROSPER_NO_DEPTH"))   use_depth = false;     // diag: isolate depth-test rejection
     if (getenv("PROSPER_NO_STENCIL")) use_stencil = false;   // diag: isolate stencil masking
     const bool use_ds = use_depth || use_stencil;
