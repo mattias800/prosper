@@ -194,6 +194,24 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
         ps.stencil_op_val[1]        = PM4_FIELD(rmb, DB_STENCILREFMASK_BF, STENCILOPVAL_BF);
         ps.stencil_compare_mask[1]  = PM4_FIELD(rmb, DB_STENCILREFMASK_BF, STENCILMASK_BF);
         ps.stencil_write_mask[1]    = PM4_FIELD(rmb, DB_STENCILREFMASK_BF, STENCILWRITEMASK_BF);
+        // #466: ONES(2)/REPLACE_TEST(3)/REPLACE_OP(4) all resolve to VK REPLACE but write DIFFERENT
+        // values — ONES writes the constant 0xFF, REPLACE_TEST writes STENCILTESTVAL, REPLACE_OP writes
+        // STENCILOPVAL. The backend feeds stencil_op_val as the Vk REPLACE `reference` (does_replace path),
+        // so set it to what the face's replace op actually writes. Vulkan has ONE reference per face, so a
+        // face mixing replace variants can't be fully represented — precedence ONES > REPLACE_TEST (the
+        // common case is a single replace op per face, e.g. an ALWAYS-compare stencil-prime that writes
+        // 0xFF). Runs BEFORE the #377 back-face mirror so a mirrored back inherits the corrected value.
+        const uint32_t raw_ops[2][3] = {
+            { PM4_FIELD(sc, DB_STENCIL_CONTROL, STENCILFAIL),    PM4_FIELD(sc, DB_STENCIL_CONTROL, STENCILZPASS),    PM4_FIELD(sc, DB_STENCIL_CONTROL, STENCILZFAIL) },
+            { PM4_FIELD(sc, DB_STENCIL_CONTROL, STENCILFAIL_BF), PM4_FIELD(sc, DB_STENCIL_CONTROL, STENCILZPASS_BF), PM4_FIELD(sc, DB_STENCIL_CONTROL, STENCILZFAIL_BF) },
+        };
+        for (int fb = 0; fb < 2; fb++) {
+            bool ones = false, rtest = false;
+            for (int k = 0; k < 3; k++) { uint32_t o = raw_ops[fb][k] & 0xFu; if (o == 2u) ones = true; else if (o == 3u) rtest = true; }
+            if (ones)       ps.stencil_op_val[fb] = 0xFFu;                // ONES writes the constant 0xFF
+            else if (rtest) ps.stencil_op_val[fb] = ps.stencil_ref[fb];  // REPLACE_TEST writes STENCILTESTVAL
+            // else REPLACE_OP (or no replace): keep STENCILOPVAL, already set.
+        }
         // DB_DEPTH_CONTROL.BACKFACE_ENABLE == 0 means the FRONT state applies to BOTH faces (the _BF
         // registers are ignored). Sourcing back from _BF regardless left back faces with the
         // unprogrammed _BF defaults — STENCILFUNC_BF=0 -> VK_COMPARE_OP_NEVER, dropping every back
