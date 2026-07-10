@@ -377,7 +377,13 @@ namespace {
         // different request tags in data, and replacing one loses a completion forever.
         if (coalesce)
             for (auto& q : s->ready)
-                if (q.ident == e.ident && q.filter == e.filter) { q = e; s->cv.notify_all(); return; }
+                if (q.ident == e.ident && q.filter == e.filter) {
+                    // Timer / HR-timer (filter -7 / -15): ACCUMULATE expirations across coalesced fires so
+                    // the delivered event carries expirations-since-last-read (kqueue EVFILT_TIMER). Other
+                    // filters keep replace-in-place (vblank/flip: the newest event wins).
+                    int64_t data = (e.filter == -7 || e.filter == -15) ? q.data + e.data : e.data;
+                    q = e; q.data = data; s->cv.notify_all(); return;
+                }
         // Distinct (ident, filter) pairs are few; the cap is a leak guard only. If it ever fires,
         // shed the OLDEST event — never the just-posted one.
         if (s->ready.size() >= 64) s->ready.pop_front();
@@ -857,11 +863,14 @@ static void post_after(uint64_t eq, int64_t id, uint64_t udata, uint64_t usec, i
     }
     std::thread([eq, id, udata, usec, filter, periodic, cancelled]{
         struct timespec ts{ (time_t)(usec / 1000000), (long)((usec % 1000000) * 1000) };
-        int64_t count = 0;
         do {
             nanosleep(&ts, nullptr);
             if (cancelled->load()) break;
-            SceKEvent e{}; e.ident = id; e.filter = filter; e.data = ++count; e.udata = udata;
+            // One expiration per fire. eq_post ACCUMULATES coalesced timer expirations, so the delivered
+            // event carries expirations-since-last-read (kqueue EVFILT_TIMER semantics) and delivery clears
+            // it -- previously data was a cumulative running total (++count), so a guest that accumulates
+            // timer.data (a common fixed-timestep pattern) over-counted without bound after any missed tick.
+            SceKEvent e{}; e.ident = id; e.filter = filter; e.data = 1; e.udata = udata;
             eq_post(eq, e);
         } while (periodic && !cancelled->load());
         // forget the registration once we stop firing (only if it is still OUR token, not a re-arm's)
