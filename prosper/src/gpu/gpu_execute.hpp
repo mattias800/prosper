@@ -64,7 +64,15 @@ bool guest_readable(uint64_t addr, uint32_t bytes);
 // gpu_executor.cpp: the exact fetch instruction (pc), its SRSRC SGPR, and the V# live in that SGPR
 // at that instruction. Exposed (with resolve_dynamic_fetch) so the fold's scalar-ALU semantics are
 // unit-testable; production callers stay inside gpu_executor.cpp.
-struct DynFetch { uint32_t fetch_pc; int srsrc; DecodedBufferDescriptor desc; uint32_t desc_v3; };
+struct DynFetch {
+    uint32_t fetch_pc; int srsrc; DecodedBufferDescriptor desc; uint32_t desc_v3;
+    // True when the V# came from the user-data SEED fallback (never s_loaded/patched-tracked). A
+    // seed entry must NOT shadow a metadata-described direct vertex buffer at the same SGPRs: the
+    // by_fetch_pc dyn path models the element address as gl_VertexIndex*stride (per-attribute
+    // patched V#s fold their in-record offset into the base), while a single direct V# needs the
+    // faithful VADDR/inst-offset address — shadowing it collapses every attribute onto offset 0.
+    bool from_seed = false;
+};
 
 // One descriptor-TABLE use recovered by the same const-fold (#294): UE4 shaders load their T#/S#/V#
 // descriptors with `s_load_dwordx4/x8 sN, s[ptr:ptr+1], <imm>` from a resource table whose pointer

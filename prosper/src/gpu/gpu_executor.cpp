@@ -331,7 +331,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         if (d.base > 0x10000 && d.size_bytes != 0 && d.size_bytes <= 0x10000000u) {
                             if (trc) fprintf(stderr, "[dyntrace]   MUBUF pc=%u seed-V# fallback SRSRC=s%d base=0x%llx\n",
                                              in.pc, srsrc, (unsigned long long)d.base);
-                            out.push_back({ in.pc, srsrc, d, sv[3] });
+                            out.push_back({ in.pc, srsrc, d, sv[3], /*from_seed=*/true });
                         }
                     }
                 }
@@ -490,6 +490,16 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
         // (a raw 32-bit-per-component fetch, correct for float attributes like positions).
         for (auto& kv : dyn_vb) {
             const auto& d = kv.desc;
+            // A SEED-fallback entry must not shadow a metadata-described DIRECT vertex buffer at the
+            // same SGPRs (see DynFetch::from_seed): the direct resource resolves the fetch through
+            // the faithful address path, which is the correct model for a single un-patched V#.
+            if (kv.from_seed) {
+                bool direct_exists = false;
+                for (const auto& r0 : t.resources)
+                    if (r0.cls == ResourceClass::VertexBuffer && r0.sgpr_base == (uint32_t)kv.srsrc)
+                        { direct_exists = true; break; }
+                if (direct_exists) continue;
+            }
             ShaderResource r;
             r.cls           = ResourceClass::VertexBuffer;
             r.format        = (d.format == DataFormat::Unknown) ? DataFormat::Float32 : d.format;
