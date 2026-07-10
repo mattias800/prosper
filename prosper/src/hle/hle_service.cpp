@@ -212,7 +212,11 @@ HLE(s_ime_kbd_info) {
 }
 
 // --- app content ---
-HLE(s_appcontent_int) { if (a1) *(int32_t*)PW(a1) = 0; return 0; }
+// sceAppContentAppParamGetInt(paramId, int32_t* value): paramId 0 = SKU_FLAG, whose only valid values are
+// TRIAL=1 / FULL=3 (there is NO 0). Writing 0 for it made the SKU check indeterminate -> a game testing
+// `sku == FULL` drops into trial/demo mode (locked content, "buy full game" gating). Report FULL for a
+// legally-owned title; other params (USER_DEFINED_PARAM_1..4) stay 0 absent a param.sfo read.
+HLE(s_appcontent_int) { if (a1) *(int32_t*)PW(a1) = ((int32_t)a0 == 0) ? 3 : 0; return 0; }
 
 // sceSystemServiceParamGetInt(SceSystemServiceParamId paramId, int32_t* value): a0=paramId, a1=value.
 // The system-settings a blanket-zero stub gives are mostly harmless, EXCEPT the LANGUAGE (paramId 1):
