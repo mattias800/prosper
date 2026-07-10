@@ -174,6 +174,11 @@ HLE(h_strtoul)  { return (uint64_t)strtoul(CS(a0), (char**)P(a1), (int)a2); }
 HLE(h_strtoull) { return (uint64_t)strtoull(CS(a0), (char**)P(a1), (int)a2); }
 HLE(h_atoi)     { return (uint64_t)(int64_t)atoi(CS(a0)); }
 HLE(h_atol)     { return (uint64_t)(int64_t)atol(CS(a0)); }
+// rand/srand/rand_r were MISSING -> the return-0 stub made rand() a constant 0 and srand() a no-op, so any
+// guest RNG routed through libc (procedural effects, shuffles, jitter, retry backoff) was degenerate.
+HLE(h_rand)     { return (uint64_t)(int64_t)rand(); }
+HLE(h_srand)    { srand((unsigned)a0); return 0; }
+HLE(h_rand_r)   { return (uint64_t)(int64_t)rand_r((unsigned*)P(a0)); }
 // qsort: the comparator is a guest fn ptr; SysV ABI matches host, callable directly (cf. h_bsearch).
 HLE(h_qsort)    { qsort(P(a0), a1, a2, (int (*)(const void*, const void*))(uintptr_t)a3); return 0; }
 HLE(h_strdup)   { const char* s = CS(a0); size_t n = strlen(s) + 1; void* p = malloc(n); if (p) memcpy(p, s, n); return (uint64_t)(uintptr_t)p; }
@@ -455,6 +460,7 @@ void register_builtin_hle() {
     R("strtoul", h_strtoul); R("strtoull", h_strtoull);
     R("strtod", m_strtod);   R("strtof", m_strtof);
     R("atoi", h_atoi);       R("atol", h_atol);
+    R("rand", h_rand);       R("srand", h_srand);       R("rand_r", h_rand_r);   // were MISSING -> rand()==0
     R("strdup", h_strdup);   R("strtok", h_strtok);
     R("strspn", h_strspn);   R("strcspn", h_strcspn);   R("strpbrk", h_strpbrk);
     R("wcslen", h_wcslen);
