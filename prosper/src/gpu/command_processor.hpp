@@ -87,14 +87,28 @@ private:
 // Decode `dwords` dwords at `buf` and apply every op to `st`. Returns the number of packets applied.
 size_t run_command_buffer(const uint32_t* buf, size_t dwords, GpuState& st);
 
-// WAIT_REG_MEM queue-pause support (issue #312 — see the block comment in command_processor.cpp).
-// last_fold_deferred(): the most recent run_command_buffer hit an unsatisfied wait, so its
-// remaining memory effects (and its EOP equeue pulse) are pending in the deferred FIFO.
-// flush_deferred_streams(): re-check the FIFO (call at every submit, under the same submit mutex
-// as run_command_buffer); returns how many deferred streams COMPLETED — the caller owes one EOP
-// equeue pulse per completed stream.
+// WAIT_REG_MEM barrier model, OPT-IN via PROSPER_WAIT_DEFER=1 (issue #312 — see the block
+// comment in command_processor.cpp, including the measured verdict on why it is not default:
+// it eliminates the canary-152 wait-ordering corruption class but a second, order-independent
+// injection remains and deferral latency makes DOLL menu-drive runs die earlier overall).
+// last_fold_deferred(): the most recent top-level run_command_buffer hit an unsatisfied wait, so
+// its remaining memory effects are gated behind that barrier in a deferred stream.
+// deferred_pending(): one or more deferred streams still hold gated effects — the caller must
+// ensure a re-check cadence exists (hle_agc's 2 ms watchdog) so a satisfied/timed-out barrier
+// releases even if the guest never submits again.
+// flush_deferred_streams(): release the queue's gated tail in strict submission order (call at
+// every submit, under the same submit mutex as run_command_buffer); returns how many streams
+// fully completed, and re-fires the EOP equeue pulse when any did.
 bool last_fold_deferred();
+bool deferred_pending();
 int  flush_deferred_streams();
+// submit_completion_pulse(): fire the submit's GPU-EOP equeue pulse — immediately when no gated
+// writes are pending, else OWED and delivered when the gated tail drains (the hardware contract:
+// the EOP interrupt fires only after everything before it in the ring executed; pulsing earlier
+// lets the guest's completion scan free label blocks our gated writes then stomp — see the
+// visibility-contract block in command_processor.cpp). Call instead of prosper_eq_trigger_eop
+// from the submit paths, under the submit mutex.
+void submit_completion_pulse();
 
 } // namespace prosper::gpu
 

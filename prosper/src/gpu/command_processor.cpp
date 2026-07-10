@@ -7,6 +7,13 @@
 // flip does. The game's frame pacer polls that status for its submitted flipArg; a dropped in-stream
 // flip stalls the frame loop at one rendered frame.
 extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx, uint32_t flip_mode, int64_t flip_arg);
+// hle_kernel_time.cpp: fire the GPU EOP equeue events the game registered via sceGnmAddEqEvent.
+// The submit paths pulse at submit time; flush_deferred_streams pulses AGAIN when a deferred
+// stream's gated writes finally land (#312 barrier model) — an equeue waiter that consumed the
+// submit-time pulse, checked its still-gated label and went back to sleep would otherwise never
+// be woken (wake_on_label only wakes sync_on_address futex waiters, not equeue waiters; observed
+// live as DOLL's "GameThread timed out waiting for RenderThread after 120.00 secs" wedge).
+namespace prosper { void prosper_eq_trigger_eop(); }
 #include <cstdlib>
 #include <cstdint>
 #include <cstdio>
@@ -14,6 +21,7 @@ extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx, uint32
 #include <chrono>
 #include <atomic>
 #include <deque>
+#include <unordered_set>
 #include <condition_variable>
 #include <thread>
 
@@ -314,9 +322,8 @@ static void honor_write_data(const Pm4Command& c) {
 //   - the EOP-event worker drains before posting (an event must never overtake its data writes).
 // PROSPER_EOP_WRITE_SYNC=1 restores the old synchronous writes (A/B lever + fallback).
 // CONFIDENCE: HIGH on the invariant (completion is post-submit by construction on real HW; Kyty
-// writes fences from its GPU thread, never inside the submit call); MED that this closes ALL of
-// #312 (the cross-queue wait-ordering approximation remains, gated separately behind
-// PROSPER_WAIT_DEFER).
+// writes fences from its GPU thread, never inside the submit call). The cross-queue wait ordering
+// is handled by the WAIT_REG_MEM barrier model below (opt-in, PROSPER_WAIT_DEFER=1).
 namespace {
 bool eop_write_sync() {
     static const bool v = [] { const char* e = getenv("PROSPER_EOP_WRITE_SYNC");
@@ -334,16 +341,29 @@ struct PendQueue {
     std::condition_variable cv;
     std::deque<PendWrite> q;
     bool worker_started = false;
+    int  inflight = 0;    // items popped but whose write hasn't landed yet (see drain)
 };
 PendQueue& pend_q() { static PendQueue* p = new PendQueue; return *p; }
 void apply_effect(const Pm4Command& c);   // fwd (defined with the WAIT_DEFER machinery below)
+// Drain returns only when every pending write has LANDED — including one a concurrent drainer
+// popped and is mid-applying (the in-flight window). Without that wait, a caller could observe an
+// empty queue and proceed to apply a LATER same-address write (a released #312 gated item) that
+// overtakes the in-flight one — the exact per-address inversion the barrier model exists to stop.
 void pend_drain_locked(PendQueue& p, std::unique_lock<std::mutex>& lk) {
-    while (!p.q.empty()) {
-        PendWrite w = std::move(p.q.front());
-        p.q.pop_front();
-        lk.unlock();                     // the write itself never needs the queue lock
-        apply_effect(w.cmd);
-        lk.lock();
+    for (;;) {
+        if (!p.q.empty()) {
+            PendWrite w = std::move(p.q.front());
+            p.q.pop_front();
+            p.inflight++;
+            lk.unlock();                 // the write itself never needs the queue lock
+            apply_effect(w.cmd);
+            lk.lock();
+            p.inflight--;
+            if (p.inflight == 0) p.cv.notify_all();
+            continue;
+        }
+        if (p.inflight == 0) break;
+        p.cv.wait(lk);                   // another drainer is mid-apply — wait for it to land
     }
 }
 void pend_worker() {
@@ -382,33 +402,90 @@ extern "C" void prosper_gpu_drain_completion_writes() {
     pend_drain_locked(p, lk);
 }
 
-// --- WAIT_REG_MEM queue-pause semantics (issue #312 heap-corruption root cause). -----------------
+// --- WAIT_REG_MEM per-queue barrier model (issue #312 heap-corruption root cause). ---------------
 //
-// On real hardware WAIT_REG_MEM BLOCKS the queue until its condition holds; packets after it —
+// On real hardware WAIT_REG_MEM BLOCKS its queue until its condition holds; packets after it —
 // including the RELEASE_MEM fence the game polls — execute only once the dependency is satisfied.
-// Our fold is synchronous at submit time, and DOLL's UE4 RHI submits from two guest threads, so a
-// consumer Dcb (wait label==1, then EOP fence write) routinely arrives BEFORE its producer (the
-// Dcb whose RELEASE_MEM writes that label). The old fold logged "dependency violated" and barreled
-// on: the consumer's fence completed early, the game freed the heap block holding the transient
-// semaphore label, and the producer's later RELEASE_MEM value-1 write landed on the freed
-// MallocBinned3 FFreeBlock header — the "Canary was 0x3, should be 0x1" / "free an unrecognized
-// block 0x1000000001" fatals (a 4-byte 0x1 stomp over NextFreeBlock; attributed live by the GPU
-// write-ring: 13 ReleaseMem value-1 writes at exactly the corrupted qword's address).
+// Other queues keep running while one is paused. Our fold is synchronous at submit time, and
+// DOLL's UE4 RHI submits from two guest threads, so a consumer Dcb (wait label==1, then EOP fence
+// write) routinely arrives BEFORE its producer (the Dcb whose RELEASE_MEM writes that label). The
+// old fold logged "dependency violated" and barreled on: the consumer's fence completed early, the
+// game freed the heap block holding the transient semaphore label, and the producer's later
+// RELEASE_MEM value-1 write landed on the freed MallocBinned3 FFreeBlock header — the "Canary was
+// 0x3, should be 0x1" / "free an unrecognized block 0x1000000001" fatals (a 4-byte 0x1 stomp over
+// NextFreeBlock; attributed live by the GPU write-ring: 13 ReleaseMem value-1 writes at exactly
+// the corrupted qword's address). A/B evidence (issue #312): every run that honored the barrier
+// ordering (PROSPER_WAIT_DEFER=1, 5/5) had ZERO corruption fatals; default runs stomped at
+// t=40-150 s.
 //
-// Honest semantics with a synchronous fold: when a fold hits an UNSATISFIED wait, the rest of that
-// stream's guest-visible memory effects (ReleaseMem / EVENT_WRITE / WRITE_DATA / Flip and any
-// further waits) are DEFERRED in order. Deferred streams are flushed FIFO at every subsequent
-// submit (the producer's own fold is what satisfies the barrier; a CPU-written label is re-checked
-// at the same points), and the submit's EOP equeue pulse fires only when its stream fully flushes.
-// Draws/register state still fold immediately — they touch no guest memory, so they cannot corrupt
-// (worst case is the same rendering-order approximation as before). Liveness: a barrier pending
-// longer than kDeferTimeoutMs falls back to the old proceed-with-loud-log behavior, so a genuinely
-// never-written label (or a producer we fail to model) degrades to today's state instead of
-// wedging the queue. All of this runs under the caller's submit mutex (hle_agc g_agc_state_mu).
-// CONFIDENCE: HIGH on the mechanism + the wait semantics; MED on cross-stream write ordering while
-// a stream is deferred (independent queues on real HW run concurrently, so a later submit's
-// effects landing before a paused stream's tail matches hardware; same-queue back-to-back submits
-// would be reordered, which hardware forbids — accepted, logged, and bounded by the timeout).
+// VERDICT AFTER LIVE MEASUREMENT (2026-07-10, ~20 instrumented DOLL menu-drive runs, same build
+// A/B): the model is OPT-IN (PROSPER_WAIT_DEFER=1), not default. What the A/B showed:
+//   - Model ON eliminates the headline "MallocBinned3 Corruption Canary was 0x3" (Line 152)
+//     fatal: 0/6 model runs vs 2/2 barrel-on runs at t~70 s — the class the wait-ordering
+//     violation genuinely seeds.
+//   - BUT a SECOND, wait-order-INDEPENDENT corruption leg remains and dominates: a burst of ~96
+//     ReleaseMem(value=1) writes at t~10 s landing on labels whose qword reads 0x1000000000
+//     (producing the exact "free an unrecognized block 0x1000000001" fatal + the 0x20015f00
+//     pool-metadata-read crashes). It appears in EVERY config — barrel-on, full deferral with
+//     ZERO timeouts, PROSPER_NO_JUMP=1, and PROSPER_EOP_WRITE_SYNC=1 (labels are ptr-valued
+//     already AT FENCE BUILD TIME) — so no ordering/timing model of honest writes can remove it.
+//   - Under the burst, model-ON runs die EARLIER (t=15-45 s, worker-fault/free-unrecognized
+//     family) than barrel-on (t~70 s, canary) — deferral latency shifts guest timing into the
+//     already-injected corruption sooner. Net: defaulting ON buys no gameplay and costs run
+//     length, so the default stays barrel-on until the injection leg is found.
+//   - The historical "5/5 PROSPER_WAIT_DEFER=1 runs have zero corruption" evidence (issue #312)
+//     is CONFOUNDED: every one of those runs lost liveness within a minute (semi-frozen guest =
+//     no content-load burst = no corruption window). This session's liveness-correct model
+//     dissolves that isolation.
+//
+// The model (opt-in via PROSPER_WAIT_DEFER=1; default = the old barrel-on behavior):
+//   - prosper models ONE submission queue today: both driver entry points (sceAgcDriverSubmitDcb
+//     and the w1KFAHVqpaU final-submit variant) feed the same guest gfx ring — the guest's own
+//     SubmitCommandBuffers batch splits its buffer array across BOTH (RE'd at eboot+0x220a9a0),
+//     so they are one stream and MUST keep mutual order. Compute rides the same Dcb
+//     (DISPATCH_DIRECT inline). The only cross-queue producers are guest CPU label writes, which
+//     are never gated by us.
+//   - When a fold hits an UNSATISFIED wait, ITS stream pauses: the wait and this stream's
+//     remaining guest-visible memory effects (ReleaseMem / EVENT_WRITE / WRITE_DATA / DMA_DATA,
+//     and further waits) defer IN ORDER behind the barrier.
+//   - PER-ADDRESS ORDERING DOMAINS for later submits: while gated items are pending, a NEW fold's
+//     memory effect defers (in ring order, behind everything already gated) IFF it touches an
+//     address that already has a gated pending write — per-address write order is exactly what
+//     the guest's consumed-marker protocol observes (DmaData label:=0 / ReleaseMem label<-1 /
+//     poll==1 / free / realloc at the same recycled address), and letting a later write overtake
+//     a gated one at the same label swaps fence generations and re-seeds the #312 stomp (measured:
+//     run with full independence stomped with ZERO timeouts). Effects to untouched addresses FLOW
+//     — gating them recreated a CPU<->GPU circular stall (guest polls fence F gated behind barrier
+//     W; the guest write that would satisfy W happens after F's poll -> 1 s timeout cascade,
+//     measured as an early-boot wedge + violation stomps).
+//   - The gated tail releases in STRICT submission order (one FIFO), so every gated write lands
+//     in ring order; it is re-checked at every subsequent submit and by hle_agc's 2 ms watchdog
+//     ticker; the front barrier releases the moment it reads satisfied (a pend-queue fence write
+//     from an earlier submit, a flowing later fence, or a CPU-written label — real producers
+//     measured up to ~216 ms under load). Later same-queue writes to an awaited address are NOT
+//     gated by the wait itself: WAIT_REG_MEM polls memory, so a later write satisfying an earlier
+//     blocked wait matches hardware (the producer is another engine/queue/CPU from the ring's
+//     point of view).
+//   - NEVER gated (liveness, measured: gating these wedged every naive-pause run): draws/register
+//     state (touch no guest memory) and the in-stream Flip (the frame pacer; on real HW the flip
+//     engine signals independently). The submit's EOP equeue PULSE follows the hardware
+//     visibility contract instead: immediate when no gated writes are pending, otherwise OWED and
+//     delivered when the tail drains — see submit_completion_pulse below (pulsing while gated
+//     writes were pending let the guest's completion scan free live label blocks: stomps with
+//     ZERO ordering violations, measured; withholding without ever re-firing wedged the
+//     RenderThread, also measured).
+//   - Liveness backstop: a barrier pending longer than defer_timeout_ms() (PROSPER_WAIT_TIMEOUT_MS,
+//     default 1000) falls back to the old proceed-with-loud-log behavior, so a genuinely
+//     never-written label (or a producer we fail to model) degrades to the pre-#312 state instead
+//     of wedging the queue. Every timeout is a dependency violation — the corruption mechanism —
+//     so the default is generous (50 ms measurably re-seeded the fatal via real-but-slow
+//     producers).
+// All of this runs under the caller's submit mutex (hle_agc g_agc_state_mu).
+// CONFIDENCE: HIGH on the wait semantics (Kyty/shadPS4 both block the queue's execution thread
+// until the condition holds — deferral-in-order is the synchronous-fold equivalent) and on the
+// single-queue strict-FIFO ordering (it is what the ring guarantees on hardware); MED on the
+// never-gated flip/EOP-pulse liveness exceptions (hardware would order them too, but gating them
+// deadlocks our synchronous fold — the re-pulse keeps the guest-observable protocol sound).
 namespace {
 bool wait_regmem_satisfied(const Pm4Command& c) {
     uint64_t mem = 0; memcpy(&mem, (const void*)(uintptr_t)c.wm_addr, sizeof mem);
@@ -434,23 +511,105 @@ struct DeferItem {
     uint64_t first_blocked_ms = 0;     // barrier only: when it was first found unsatisfied
 };
 struct DeferredStream { std::vector<DeferItem> items; size_t next = 0; };
-std::vector<DeferredStream> g_deferred;   // FIFO; guarded by the caller's submit mutex
+std::vector<DeferredStream> g_deferred;   // paused queue tails; guarded by the caller's submit mutex
 bool     g_fold_deferring = false;        // current fold hit an unsatisfied wait
 uint64_t g_defer_streams = 0, g_defer_timeouts = 0;
 size_t   g_defer_items = 0;               // total queued items across streams (memory guard)
-// 50 ms: real producer fences satisfy the barrier within ~1 ms via the pend queue; anything
-// pending longer is a dependency we don't model — degrade fast instead of stalling the stream
-// half a second (the 500 ms value made a WAIT_DEFER boot crawl at 2 submits/s).
-constexpr uint64_t kDeferTimeoutMs = 50;
+// 1000 ms default. The timeout is the CORRUPTION knob, not a perf knob: every timeout is a
+// dependency violation (the pre-#312 corruption mechanism), so it must be rare — and under
+// per-stream independence a blocked stream stalls nothing but itself (EOP pulses, flips and all
+// other streams flow), so a generous value costs only latency on a genuinely-unmodeled
+// dependency. Measured on DOLL's menu content-load burst: at 50 ms the burst produced 8 timeouts
+// and the MallocBinned3 fatal returned (late producers — the guest CPU writes some of these
+// labels itself under heavy load); satisfied barriers otherwise cluster near ~1 ms via the pend
+// queue. Tunable via PROSPER_WAIT_TIMEOUT_MS.
+uint64_t defer_timeout_ms() {
+    static const uint64_t v = [] {
+        const char* e = getenv("PROSPER_WAIT_TIMEOUT_MS");
+        long n = e ? strtol(e, nullptr, 0) : 0;
+        return n > 0 ? (uint64_t)n : 1000ull; }();
+    return v;
+}
 constexpr size_t   kDeferMaxStreams = 256;   // runaway guard: force-flush oldest beyond this
 constexpr size_t   kDeferMaxItems = 200000;  // memory guard (#312 WAIT_DEFER OOM): force-flush
 
+// Opt-in gate for the whole model (PROSPER_WAIT_DEFER=1). Default OFF = the pre-#312 barrel-on
+// behavior — see the measured verdict in the model block above for why this is not (yet) the
+// default: the model is semantically right and kills the canary-152 class, but the remaining
+// wait-order-independent injection makes deferral a net loss for DOLL run length today.
+bool defer_enabled() {
+    static const bool v = [] {
+        const char* e = getenv("PROSPER_WAIT_DEFER");
+        return e && strtol(e, nullptr, 0) != 0; }();
+    return v;
+}
+
+// --- Per-address ordering domains: which guest addresses currently have a GATED pending write.
+// Small writes (fence labels — the protocol-critical case) index by 8-byte granule in a hash set;
+// large fills (the 64 KiB DmaData chunk zero-fills) go in a range list. Entries accumulate while
+// the queue tail is non-empty and are cleared when it fully drains: a partial drain can leave
+// STALE entries, which only OVER-gates (an extra write joins the ordered tail — safe, order is
+// still exact; the tail drains within the watchdog cadence anyway).
+std::unordered_set<uint64_t> g_gated_granules;                 // addr >> 3
+std::vector<std::pair<uint64_t, uint64_t>> g_gated_ranges;     // [lo, hi)
+// The guest-memory span a command writes (0 bytes = writes nothing we track).
+void effect_span(const Pm4Command& c, uint64_t* addr, uint64_t* bytes) {
+    using K = Pm4Command::Kind;
+    switch (c.kind) {
+        case K::ReleaseMem: *addr = c.rel_addr;   *bytes = 8; break;
+        case K::EventWrite: *addr = c.event_addr; *bytes = 8; break;
+        case K::WriteData:  *addr = c.wd_addr;    *bytes = (uint64_t)c.wd_num * 4; break;
+        case K::DmaData:    *addr = c.dd_dst;     *bytes = c.dd_bytes; break;
+        default:            *addr = 0;            *bytes = 0; break;
+    }
+}
+void gated_register(const Pm4Command& c) {
+    uint64_t a = 0, n = 0;
+    effect_span(c, &a, &n);
+    if (!a || !n) return;
+    if (n <= 32) {
+        for (uint64_t g = a >> 3; g <= ((a + n - 1) >> 3); g++) g_gated_granules.insert(g);
+    } else {
+        g_gated_ranges.emplace_back(a, a + n);
+    }
+}
+bool addr_gated(uint64_t a, uint64_t n) {
+    if (!a || !n) return false;
+    if (!g_gated_granules.empty())
+        for (uint64_t g = a >> 3; g <= ((a + n - 1) >> 3); g++)
+            if (g_gated_granules.count(g)) return true;
+    for (const auto& r : g_gated_ranges)
+        if (a < r.second && r.first < a + n) return true;
+    return false;
+}
+bool effect_gated(const Pm4Command& c) {
+    uint64_t a = 0, n = 0;
+    effect_span(c, &a, &n);
+    return addr_gated(a, n);
+}
+
+// Should this command join the gated tail? Yes when its own fold is paused (everything downstream
+// of the fold's unsatisfied wait keeps stream order), or when it writes into an address domain
+// that already has a gated pending write (per-address ring order across folds).
+bool defer_gate(const Pm4Command& c) {
+    if (g_fold_deferring) return true;
+    if (g_deferred.empty()) return false;
+    return effect_gated(c);
+}
+
+bool g_fold_stream_open = false;   // current top-level fold already opened its deferred stream
 void defer_push(const Pm4Command& c) {
+    if (!g_fold_stream_open) {     // one deferred stream per fold that defers anything
+        g_deferred.emplace_back();
+        g_fold_stream_open = true;
+        g_defer_streams++;
+    }
     DeferItem it; it.cmd = c;
     if (c.kind == Pm4Command::Kind::WriteData && c.wd_data && c.wd_num) {
         it.wd_copy.assign(c.wd_data, c.wd_data + c.wd_num);   // cb memory may be recycled before flush
         it.cmd.wd_data = it.wd_copy.data();
     }
+    gated_register(it.cmd);
     g_deferred.back().items.push_back(std::move(it));
     g_defer_items++;
 }
@@ -466,43 +625,134 @@ void apply_effect(const Pm4Command& c) {
         default: break;
     }
 }
+// The guest-memory span a deferred effect writes (0 = none / self-guarded). A deferred effect can
+// be released tens of ms after its fold; guard against the guest having unmapped the target in the
+// window (MallocBinned3 decommits pool pages) — the fold-time path writes "immediately" and never
+// needed this. honor_dma_data() range-checks itself.
+uint64_t effect_target(const Pm4Command& c, uint32_t* bytes) {
+    using K = Pm4Command::Kind;
+    switch (c.kind) {
+        case K::ReleaseMem: *bytes = 8; return c.rel_addr;
+        case K::EventWrite: *bytes = 8; return c.event_addr;
+        case K::WriteData:  *bytes = c.wd_num * 4; return c.wd_addr;
+        default: *bytes = 0; return 0;
+    }
+}
+void apply_deferred_effect(const Pm4Command& c) {
+    uint32_t bytes = 0;
+    uint64_t t = effect_target(c, &bytes);
+    if (t && bytes && !guest_readable(t, bytes)) {
+        static std::atomic<int> n{0};
+        if (n.fetch_add(1) < 24)
+            fprintf(stderr, "[agc] deferred effect target unmapped — write SKIPPED: kind=%u addr=0x%llx bytes=%u\n",
+                    (unsigned)c.kind, (unsigned long long)t, bytes);
+        return;
+    }
+    apply_effect(c);
+}
 } // namespace
 
 bool last_fold_deferred() { return g_fold_deferring; }
+bool deferred_pending()   { return !g_deferred.empty(); }
 
-// Flush deferred streams FIFO. Returns how many streams COMPLETED (the caller owes one EOP equeue
-// pulse per completed stream). A stream whose next barrier is still unsatisfied blocks the flush
-// (strict FIFO among deferred effects) unless it has been pending > kDeferTimeoutMs, in which case
-// it proceeds with the pre-#312 "dependency violated" loud log.
+// --- EOP pulse visibility contract (#312, the decisive leg). -------------------------------------
+// On real hardware the EOP interrupt for a submission fires only after EVERYTHING before it in
+// the ring has executed — the guest's completion scan (AgcInterrupt -> cleanup, label sweeps,
+// frame-end label batch-free at eboot+0x220bd50) relies on it: when the interrupt arrives, every
+// fence write of that frame is visible. Firing the pulse while gated tail writes are still
+// pending lets the scan observe a half-retired frame, free live label blocks, and take the stomp
+// when the gated write lands — corruption WITHOUT any ordering violation among the writes
+// themselves (observed live: stomps with zero DEFER timeouts). So: a submit's pulse fires
+// immediately only when the gated tail is empty; otherwise it is OWED and fires when the tail
+// fully drains (flush below). Liveness: flips flow regardless, the 2 ms watchdog drains the tail
+// the moment its front barrier satisfies, and the timeout bounds a genuinely-stuck barrier.
+// CONFIDENCE: HIGH on the hardware contract (ring-ordered interrupt), MED that pulse-on-full-
+// drain (vs per-stream) is the right granularity — it only errs later, the safe direction.
+namespace { uint64_t g_owed_pulses = 0; }
+void submit_completion_pulse() {
+    if (!g_deferred.empty()) { g_owed_pulses++; return; }
+    prosper_eq_trigger_eop();
+}
+
+// Release deferred streams (call at every submit and from hle_agc's watchdog ticker, under the
+// submit mutex). STRICT QUEUE FIFO (#312): the deferred streams are the paused tail of prosper's
+// single submission queue — items apply strictly in submission order, and the front stream's
+// blocked barrier holds everything behind it (exactly the ring order hardware guarantees;
+// releasing later streams around a blocked one was measured to re-seed the corruption). A barrier
+// pending > defer_timeout_ms() proceeds with the pre-#312 "dependency violated" loud log (liveness
+// backstop). Returns how many streams fully completed.
 int flush_deferred_streams() {
+    if (g_deferred.empty()) return 0;
+    // Intra-queue order: PRE-pause writes ride the 1 ms pipe-drain queue while gated writes are
+    // applied here directly. Drain first so a released tail never overtakes its own head — and so
+    // a producer fence still sitting in the pend queue is visible to the barrier checks below.
+    prosper_gpu_drain_completion_writes();
     int completed = 0;
-    while (!g_deferred.empty()) {
-        DeferredStream& s = g_deferred.front();
+    for (size_t si = 0; si < g_deferred.size(); ) {
+        DeferredStream& s = g_deferred[si];
         bool blocked = false;
         bool force = g_deferred.size() > kDeferMaxStreams || g_defer_items > kDeferMaxItems;
         while (s.next < s.items.size()) {
             DeferItem& it = s.items[s.next];
             if (it.cmd.kind == Pm4Command::Kind::WaitRegMem) {
-                if (!wait_regmem_satisfied(it.cmd)) {
+                // The label page can be unmapped by the time we re-check (freed mid-defer):
+                // treat as never-satisfiable and take the timeout path immediately.
+                bool readable = guest_readable(it.cmd.wm_addr, 8);
+                if (readable && it.first_blocked_ms && wait_regmem_satisfied(it.cmd)) {
+                    // Barrier-latency telemetry (bounded): how long do REAL producers take? This
+                    // is the data the timeout default is tuned against.
+                    uint64_t waited = defer_now_ms() - it.first_blocked_ms;
+                    if (waited > 20) {
+                        static std::atomic<int> n{0};
+                        int ln = n.fetch_add(1);
+                        if (ln < 32 || (ln & 511) == 0)
+                            fprintf(stderr, "[agc] WaitRegMem satisfied after %llums blocked: [0x%llx] ref=0x%llx\n",
+                                    (unsigned long long)waited, (unsigned long long)it.cmd.wm_addr,
+                                    (unsigned long long)it.cmd.wm_ref);
+                    }
+                }
+                if (!readable || !wait_regmem_satisfied(it.cmd)) {
                     uint64_t now = defer_now_ms();
                     if (!it.first_blocked_ms) it.first_blocked_ms = now;
-                    if (!force && now - it.first_blocked_ms < kDeferTimeoutMs) { blocked = true; break; }
+                    if (readable && !force && now - it.first_blocked_ms < defer_timeout_ms()) {
+                        blocked = true; break;
+                    }
                     g_defer_timeouts++;
-                    fprintf(stderr, "[agc] WaitRegMem DEFER TIMEOUT after %llums: [0x%llx]&0x%llx func=%u ref=0x%llx — dependency violated (proceeding)\n",
-                            (unsigned long long)(now - it.first_blocked_ms),
-                            (unsigned long long)it.cmd.wm_addr, (unsigned long long)it.cmd.wm_mask,
-                            it.cmd.wm_func, (unsigned long long)it.cmd.wm_ref);
+                    static std::atomic<int> logged{0};
+                    int ln = logged.fetch_add(1);
+                    if (ln < 64 || (ln & 255) == 0)
+                        fprintf(stderr, "[agc] WaitRegMem DEFER TIMEOUT #%llu after %llums: [0x%llx]&0x%llx func=%u ref=0x%llx%s — dependency violated (proceeding)\n",
+                                (unsigned long long)g_defer_timeouts,
+                                (unsigned long long)(now - it.first_blocked_ms),
+                                (unsigned long long)it.cmd.wm_addr, (unsigned long long)it.cmd.wm_mask,
+                                it.cmd.wm_func, (unsigned long long)it.cmd.wm_ref,
+                                readable ? "" : " (label UNMAPPED)");
                 }
                 s.next++;
                 continue;
             }
-            apply_effect(it.cmd);
+            apply_deferred_effect(it.cmd);
             s.next++;
         }
-        if (blocked) break;
+        if (blocked) break;   // strict FIFO: the front barrier holds the whole gated tail
         g_defer_items -= s.items.size() < g_defer_items ? s.items.size() : g_defer_items;
-        g_deferred.erase(g_deferred.begin());
+        g_deferred.erase(g_deferred.begin() + si);
         completed++;
+    }
+    if (g_deferred.empty()) {
+        // Address-domain index entries are added per gated item and only cleared here, on full
+        // drain (a partial drain leaves stale entries that merely over-gate — see the index note).
+        g_gated_granules.clear();
+        g_gated_ranges.clear();
+        // The tail is fully visible again: deliver every owed EOP pulse (one per submit whose
+        // pulse was withheld while gated writes were pending — see submit_completion_pulse).
+        // Distinct pulses, not coalesced (#236: a lost completion is a lost semaphore). This is
+        // also the re-pulse that wakes an equeue waiter which consumed an earlier pulse and found
+        // its label still gated (DOLL's "GameThread timed out waiting for RenderThread" wedge).
+        uint64_t owed = g_owed_pulses;
+        g_owed_pulses = 0;
+        if (!owed && completed > 0) owed = 1;   // deferral began before any pulse was owed
+        while (owed--) prosper_eq_trigger_eop();
     }
     return completed;
 }
@@ -616,19 +866,20 @@ void GpuState::apply(const Pm4Command& c) {
             break;
         }
         case K::ReleaseMem:
-            // EOP completion label write. Once this stream hit an unsatisfied wait, the write is
-            // deferred behind that barrier (see the #312 block above) — completing the fence
-            // early is what let the game free live label memory. Otherwise it goes through the
-            // pipe-drain queue: completion becomes guest-visible only after the submit returns.
-            if (g_fold_deferring) { defer_push(c); break; }
+            // EOP completion label write. While the queue is paused (this fold hit an unsatisfied
+            // wait, or an earlier submit's gated tail is still pending), the write queues behind
+            // the barrier IN RING ORDER (see the #312 block above) — completing a fence early is
+            // what let the game free live label memory. Otherwise it goes through the pipe-drain
+            // queue: completion becomes guest-visible only after the submit returns.
+            if (defer_gate(c)) { defer_push(c); break; }
             if (eop_write_sync()) honor_eop_write(c); else pend_enqueue(c);
             break;
         case K::WriteData:
-            if (g_fold_deferring) { defer_push(c); break; }
+            if (defer_gate(c)) { defer_push(c); break; }
             if (eop_write_sync()) honor_write_data(c); else pend_enqueue(c);
             break;
         case K::EventWrite:
-            if (g_fold_deferring) { defer_push(c); break; }
+            if (defer_gate(c)) { defer_push(c); break; }
             if (eop_write_sync()) honor_event_write(c); else pend_enqueue(c);
             break;
         case K::DmaData:
@@ -636,7 +887,7 @@ void GpuState::apply(const Pm4Command& c) {
             // as the other guest-visible writes: stream order between a generation's ReleaseMem
             // (label <- 1) and the NEXT generation's DmaData (label := 0) at the same recycled
             // address is exactly what the guest's consumption poll depends on.
-            if (g_fold_deferring) { defer_push(c); break; }
+            if (defer_gate(c)) { defer_push(c); break; }
             if (eop_write_sync()) honor_dma_data(c); else pend_enqueue(c);
             break;
         case K::WaitRegMem:
@@ -645,37 +896,43 @@ void GpuState::apply(const Pm4Command& c) {
             // at subsequent submits by flush_deferred_streams; loud timeout fallback preserves
             // liveness). A satisfied wait is a no-op, as before.
             if (c.wm_valid && c.wm_addr && !(c.wm_addr & 3)) {
-                if (g_fold_deferring) { defer_push(c); break; }   // ordered behind the first barrier
+                // Own fold already paused — the wait keeps stream order. OR: the awaited address
+                // has a GATED PENDING WRITE (an earlier-in-ring write it must observe): evaluating
+                // now against the stale value could wrong-satisfy — join the tail in ring order.
+                // (The rest of this fold's effects then gate too: stream order.)
+                if (g_fold_deferring || (!g_deferred.empty() && addr_gated(c.wm_addr, 8))) {
+                    g_fold_deferring = true;
+                    defer_push(c);
+                    break;
+                }
                 // A prior submit's fence write may still sit in the pipe-drain queue — a consumer's
                 // wait must see it (data dependency): drain before evaluating.
                 prosper_gpu_drain_completion_writes();
                 if (!wait_regmem_satisfied(c)) {
-                    uint64_t mem = 0; memcpy(&mem, (const void*)(uintptr_t)c.wm_addr, sizeof mem);
-                    // PROSPER_WAIT_DEFER=1 (experimental): pause the queue — defer the stream's
-                    // remaining memory effects until the condition holds. Default OFF: label
-                    // slots are recycled with residue frequently equal to the awaited value, so
-                    // value-based gating cannot distinguish a satisfied wait from stale residue
-                    // (measured live: enabling it moved the #312 fatal EARLIER). Kept for
-                    // experiments while the real per-queue model is built.
-                    static const bool defer_on = [] {
-                        const char* e = getenv("PROSPER_WAIT_DEFER");
-                        return e && strtol(e, nullptr, 0) != 0; }();
-                    // #312 discriminator: build-journal age + freed-heap-shaped label content.
-                    uint64_t baddr = 0, bpre = 0, bt = 0;
-                    int have = prosper_fence_journal_lookup(pkt_addr(c), &baddr, &bpre, &bt);
-                    fprintf(stderr, "[agc] WaitRegMem NOT satisfied at fold time: [0x%llx]&0x%llx = 0x%llx, func=%u ref=0x%llx — %s | built@%llums(age=%lldms)%s pre@build=0x%llx%s\n",
-                            (unsigned long long)c.wm_addr, (unsigned long long)c.wm_mask,
-                            (unsigned long long)(mem & c.wm_mask), c.wm_func, (unsigned long long)c.wm_ref,
-                            defer_on ? "pausing queue (deferred effects)" : "dependency violated",
-                            (unsigned long long)bt, have ? (long long)(now_ms() - bt) : -1,
-                            (have && baddr != c.wm_addr) ? " TARGET-CHANGED" : "",
-                            (unsigned long long)bpre, ptr_like(mem) ? " CONTENT-PTR-LIKE(freed?)" : "");
-                    if (defer_on) {
+                    // Barrier model (#312), opt-in via PROSPER_WAIT_DEFER=1: pause the queue —
+                    // everything downstream defers until the condition holds (see the model
+                    // block above, including the measured verdict on why this is not default).
+                    // Default: the old barrel-on ("dependency violated") behavior.
+                    // Bounded diagnostic (an unsatisfied wait is now NORMAL, handled state — and
+                    // under the content-load burst it fires thousands of times a minute).
+                    static std::atomic<int> logged{0};
+                    int ln = logged.fetch_add(1);
+                    if (ln < 40 || (ln & 1023) == 0) {
+                        uint64_t mem = 0; memcpy(&mem, (const void*)(uintptr_t)c.wm_addr, sizeof mem);
+                        // #312 discriminator: build-journal age + freed-heap-shaped label content.
+                        uint64_t baddr = 0, bpre = 0, bt = 0;
+                        int have = prosper_fence_journal_lookup(pkt_addr(c), &baddr, &bpre, &bt);
+                        fprintf(stderr, "[agc] WaitRegMem #%d NOT satisfied at fold time: [0x%llx]&0x%llx = 0x%llx, func=%u ref=0x%llx — %s | built@%llums(age=%lldms)%s pre@build=0x%llx%s\n",
+                                ln, (unsigned long long)c.wm_addr, (unsigned long long)c.wm_mask,
+                                (unsigned long long)(mem & c.wm_mask), c.wm_func, (unsigned long long)c.wm_ref,
+                                defer_enabled() ? "pausing queue (deferred effects)" : "dependency violated",
+                                (unsigned long long)bt, have ? (long long)(now_ms() - bt) : -1,
+                                (have && baddr != c.wm_addr) ? " TARGET-CHANGED" : "",
+                                (unsigned long long)bpre, ptr_like(mem) ? " CONTENT-PTR-LIKE(freed?)" : "");
+                    }
+                    if (defer_enabled()) {
                         g_fold_deferring = true;
-                        g_defer_streams++;
-                        g_deferred.emplace_back();
-                        DeferItem it; it.cmd = c; it.first_blocked_ms = defer_now_ms();
-                        g_deferred.back().items.push_back(std::move(it));
+                        defer_push(c);
                     }
                 }
             }
@@ -757,7 +1014,14 @@ void GpuState::apply(const Pm4Command& c) {
 }
 
 size_t run_command_buffer(const uint32_t* buf, size_t dwords, GpuState& st) {
-    g_fold_deferring = false;   // each stream starts unpaused (#312 queue-pause state is per-fold)
+    // Each TOP-LEVEL stream starts a fresh fold state (#312: the pause flag and the lazily-opened
+    // deferred stream are per-fold). A Jump recursion must NOT reset them: the jump target
+    // executes INSIDE the paused stream, and resetting mid-stream both un-gated the parent's
+    // remaining effects (ordering break) and made last_fold_deferred() read false at submit end,
+    // so hle_agc never started the release watchdog — the observed WAIT_DEFER wedge with zero
+    // DEFER-TIMEOUT logs (a deferred stream nobody ever re-checked while the guest CPU-polled one
+    // of its labels).
+    if (st.jump_depth == 0) { g_fold_deferring = false; g_fold_stream_open = false; }
     std::vector<Pm4Command> ops;
     decode_pm4(buf, dwords, ops);
     for (const auto& c : ops) st.apply(c);

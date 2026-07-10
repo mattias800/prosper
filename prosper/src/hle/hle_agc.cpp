@@ -953,12 +953,12 @@ extern "C" void prosper_agc_submit_stats(uint64_t* submits, uint64_t* draws) {
 }
 
 namespace {
-// PROSPER_WAIT_DEFER watchdog (#312): deferred streams were only re-checked at SUBSEQUENT submits,
-// but a guest that waits for a deferred stream's EOP before submitting again deadlocks (observed:
-// boot wedged at submit #1 under WAIT_DEFER). A 2 ms ticker re-runs the flush (same submit mutex),
-// firing the owed EOP pulse the moment a paused stream's condition satisfies (typically via the
-// pend-queue completion writes) or its timeout expires. Started lazily on the first deferred fold;
-// inert unless PROSPER_WAIT_DEFER=1 ever pauses a stream.
+// Barrier-model release watchdog (#312): deferred streams were only re-checked at SUBSEQUENT
+// submits, but a guest that CPU-polls a deferred stream's label before submitting again deadlocks
+// (observed: boot wedged at submit #1 under the first WAIT_DEFER experiment). A 2 ms ticker
+// re-runs the flush (same submit mutex), releasing a paused stream's gated writes the moment its
+// condition satisfies (typically via the pend-queue completion writes) or its timeout expires.
+// Started lazily the first time a deferred stream exists; inert while no stream is paused.
 void start_defer_watchdog() {
     static std::atomic<bool> started{false};
     bool expect = false;
@@ -990,14 +990,17 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
     agc_gpu_state().draws.clear();
     size_t applied = gpu::run_command_buffer(addr, walk, agc_gpu_state());
     g_submit_count++;
-    // #312 WAIT_DEFER liveness: the EOP pulse fires at every submit even when the fold paused on
-    // an unsatisfied barrier — withholding it starved the frame pacer and wedged every WAIT_DEFER
-    // run (submits stop, so the producer that would satisfy the barrier never arrives). Only the
-    // stream's MEMORY writes stay deferred; the watchdog flushes them the moment the barrier
-    // satisfies (or the 50 ms timeout degrades to the old proceed-loudly behavior).
-    prosper_eq_trigger_eop();
-    if (gpu::last_fold_deferred()) start_defer_watchdog();
+    // #312 EOP visibility contract: the pulse fires immediately only when no gated writes are
+    // pending; otherwise it is OWED and delivered when the tail drains (the guest's completion
+    // scan must never observe a half-retired frame — see command_processor.cpp). The flip and the
+    // pipe-drain writes still flow, and the watchdog + timeout bound the delay, so the pacer
+    // stays alive (the naive always-pulse variant let the scan free live labels; the naive
+    // never-pulse variant starved the pacer — both measured).
     gpu::flush_deferred_streams();
+    gpu::submit_completion_pulse();
+    // Watchdog keys off PENDING streams, not just this fold: streams can outlive their fold (and
+    // the Jump-recursion flag reset once hid a deferring fold entirely — the wedge class).
+    if (gpu::deferred_pending()) start_defer_watchdog();
     static const unsigned render_every2 = [] {
         const char* e = getenv("PROSPER_RENDER_EVERY"); long v = e ? atol(e) : 1; return v > 0 ? (unsigned)v : 1u; }();
     static unsigned draw_submits2 = 0;
@@ -1105,11 +1108,11 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     g_submit_count++;
     // The submit has "completed" (synchronous fold): fire any registered GPU EOP events. Inert unless the
     // game called sceGnmAddEqEvent (b0xyllnVY-I); the RELEASE_MEM label write already happened in apply().
-    // #312 WAIT_DEFER liveness: the pulse fires even for a fold paused on an unsatisfied barrier —
-    // only the stream's MEMORY writes stay deferred (see submit_dcb_stream).
-    prosper_eq_trigger_eop();
-    if (gpu::last_fold_deferred()) start_defer_watchdog();
+    // #312 EOP visibility contract: pulse only when no gated writes are pending, else owed until
+    // the tail drains (see submit_dcb_stream / command_processor.cpp).
     gpu::flush_deferred_streams();
+    gpu::submit_completion_pulse();
+    if (gpu::deferred_pending()) start_defer_watchdog();
     // Stage A: if a live renderer has been registered (runtime binary wires a Vulkan device) and this
     // submit accumulated draws, execute the folded GpuState and present the frame. Inert (returns false)
     // on the pure-HLE path until a device is registered, so it never perturbs the existing boot behavior.

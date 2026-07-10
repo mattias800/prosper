@@ -245,6 +245,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_eop_write PRIVATE prosper_core)
   add_test(NAME eop_write COMMAND test_eop_write)
 
+  # #312 per-queue WAIT_REG_MEM barrier model: unsatisfied waits gate downstream memory effects,
+  # streams release independently, jumps don't un-gate, timeout backstop preserves liveness.
+  add_executable(test_wait_barrier tests/test_wait_barrier.cpp)
+  target_link_libraries(test_wait_barrier PRIVATE prosper_core)
+  add_test(NAME wait_barrier COMMAND test_wait_barrier)
+
   # Render-state extraction: fold a stream into a GpuState, then interpret RDNA2 registers.
   add_executable(test_render_state tests/test_render_state.cpp)
   target_link_libraries(test_render_state PRIVATE prosper_core)
