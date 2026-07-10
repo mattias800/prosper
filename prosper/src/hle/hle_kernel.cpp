@@ -192,6 +192,12 @@ namespace {
         void* cur = __atomic_load_n((void**)(uintptr_t)slot_addr, __ATOMIC_ACQUIRE);
         return pt_static_sentinel(cur) ? nullptr : (sem_t*)cur;
     }
+    // scePthreadBarrier*: read the pthread_barrier_t created by BarrierInit (Init is the sole creator).
+    pthread_barrier_t* ensure_barrier(uint64_t slot_addr) {
+        if (!slot_addr) return nullptr;
+        void* cur = __atomic_load_n((void**)(uintptr_t)slot_addr, __ATOMIC_ACQUIRE);
+        return pt_static_sentinel(cur) ? nullptr : (pthread_barrier_t*)cur;
+    }
 }
 // scePthreadMutexInit(mutex_slot, attr_slot, name) / pthread_mutex_init(mutex_slot, attr_slot):
 // honor the caller's attr (type set via k_mutexattr_settype); no attr means Sony's default,
@@ -622,6 +628,13 @@ HLE(k_sem_timedwait) { auto* s = ensure_sem(a0); if (!s) return 0x16; timespec d
 HLE(k_sem_post)      { auto* s = ensure_sem(a0); if (!s) return 0x16; sem_post(s); return 0; }
 HLE(k_sem_getvalue)  { auto* s = ensure_sem(a0); if (!s) return 0x16; int v = 0; sem_getvalue(s, &v); if (a1) *(int*)(uintptr_t)a1 = v; return 0; }
 HLE(k_sem_destroy)   { if (a0) { void** slot = (void**)(uintptr_t)a0; if (!pt_static_sentinel(*slot)) { sem_destroy((sem_t*)*slot); free(*slot); *slot = nullptr; } } return 0; }
+// scePthreadBarrier* -- were MISSING -> the generic stub returned 0, so BarrierWait let every thread sail
+// past a rendezvous before its peers arrived: the barrier's downstream invariant (all-arrived) is false ->
+// reads of not-yet-produced data (the async-load race class). Back with host pthread_barrier_t; the serial
+// thread gets -1 (PTHREAD_BARRIER_SERIAL_THREAD, FreeBSD's value), the rest 0. Barrierattr are no-ops.
+HLE(k_barrier_init)    { if (!a0 || a2 == 0) return 0x16; auto* b = (pthread_barrier_t*)calloc(1, sizeof(pthread_barrier_t)); pthread_barrier_init(b, nullptr, (unsigned)a2); *(void**)(uintptr_t)a0 = b; return 0; }
+HLE(k_barrier_wait)    { auto* b = ensure_barrier(a0); if (!b) return 0x16; int rc = pthread_barrier_wait(b); return rc == PTHREAD_BARRIER_SERIAL_THREAD ? (uint64_t)(int64_t)-1 : (uint64_t)(unsigned)rc; }
+HLE(k_barrier_destroy) { if (a0) { void** slot = (void**)(uintptr_t)a0; if (!pt_static_sentinel(*slot)) { pthread_barrier_destroy((pthread_barrier_t*)*slot); free(*slot); *slot = nullptr; } } return 0; }
 HLE(k_ef_wait)    { // (ef, pattern, waitMode, resultPat*, SceKernelUseconds* timeout)
     // The timeout arg (a4) was previously IGNORED — a bounded guest wait blocked forever (the
     // same class of silent hang root-caused for wait_on_address, hle_kernel_mem.cpp). Sony
@@ -1135,6 +1148,11 @@ void register_kernel_hle() {
     R("scePthreadSemWait", k_sem_wait);         R("scePthreadSemTrywait", k_sem_trywait);
     R("scePthreadSemTimedwait", k_sem_timedwait); R("scePthreadSemPost", k_sem_post);
     R("scePthreadSemGetvalue", k_sem_getvalue);
+    // scePthreadBarrier* (were MISSING -> BarrierWait let threads pass a false rendezvous)
+    R("scePthreadBarrierInit", k_barrier_init);   R("scePthreadBarrierWait", k_barrier_wait);
+    R("scePthreadBarrierDestroy", k_barrier_destroy);
+    R("scePthreadBarrierattrInit", k_attr_noop);  R("scePthreadBarrierattrDestroy", k_attr_noop);
+    R("scePthreadBarrierattrSetpshared", k_attr_noop);
     R("scePthreadOnce", k_pthread_once);             R("pthread_once", k_pthread_once);
     R("scePthreadSelf", k_pthread_self);
     R("scePthreadEqual", k_pthread_equal);
