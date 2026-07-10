@@ -235,7 +235,10 @@ HLE(k_rtc_get_tick) {   // (const SceRtcDateTime* dt, SceRtcTick* tick)
 
 // real sleeps so timed wait loops actually yield the CPU (and advance real time)
 HLE(k_usleep)   { uint64_t us = a0; struct timespec ts{ (time_t)(us / 1000000), (long)((us % 1000000) * 1000) }; nanosleep(&ts, nullptr); return 0; }
-HLE(k_sleep_s)  { struct timespec ts{ (time_t)a0, 0 }; nanosleep(&ts, nullptr); return (uint64_t)a0; }
+// POSIX sleep() returns the number of seconds LEFT unslept (0 on full completion), not the input.
+// Returning the input breaks the canonical resume idiom `while ((left = sleep(left))) ;` into an
+// infinite busy-sleep. We always sleep the full duration, so return 0 (Kyty KernelSleep returns OK/0).
+HLE(k_sleep_s)  { struct timespec ts{ (time_t)a0, 0 }; nanosleep(&ts, nullptr); return 0; }
 HLE(k_nanosleep){ if (a0) nanosleep((const struct timespec*)P(a0), a1 ? (struct timespec*)P(a1) : nullptr); return 0; }
 
 // --- assorted libkernel stubs ---
