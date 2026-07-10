@@ -597,6 +597,12 @@ HLE(k_wake_by_address) {
 HLE(k_munmap)   { if (!a1) return 0x80020016ull;   // EINVAL: a zero-length unmap (shadPS4 sceKernelMunmap)
                   if (a0) { munmap((void*)a0, a1); untrack(a0, a1); } return 0; }
 HLE(k_mprotect) { if (a0) { mprotect((void*)a0, a1, host_prot(a2)); retrack_prot(a0, a1, host_prot(a2), "mprotect"); } return 0; }
+// sceKernelMtypeprotect(addr, size, mtype, prot): apply the CPU protection (arg a3) then set the direct-
+// memory type (a2). Was MISSING -> the stub returned success without applying EITHER, so a later access
+// under the wrong protection faults (write to a still-RO page / exec of a still-NX page) -- the same class
+// as the batch-map TYPE_PROTECT op. We don't track memoryType yet, so apply the protection (the load-
+// bearing half). NOTE prot is arg a3 here, not a2.
+HLE(k_mtypeprotect) { if (a0) { mprotect((void*)a0, a1, host_prot(a3)); retrack_prot(a0, a1, host_prot(a3), "mtypeprotect"); } return 0; }
 HLE(k_dmem_size){ return kDmemTotal; }   // 8 GiB pool (allocation failures enforce this bound)
 // sceKernelAvailableDirectMemorySize(searchStart, searchEnd, alignment, off_t* physAddrOut,
 // size_t* sizeOut) — report the LARGEST free aligned direct-memory block in [searchStart, searchEnd).
@@ -1053,6 +1059,7 @@ void register_kernel_mem_hle() {
     // VA leaks on churn. Reuse k_munmap (identical (addr, len) contract).
     R("sceKernelReleaseFlexibleMemory", k_munmap);
     R("sceKernelMprotect", k_mprotect);
+    R("sceKernelMtypeprotect", k_mtypeprotect);   // was MISSING -> silently dropped the protection change
     R("sceKernelReleaseDirectMemory", k_release_dmem);
     R("sceKernelCheckedReleaseDirectMemory", k_release_dmem);
     R("sceKernelBatchMap", k_batch_map);
