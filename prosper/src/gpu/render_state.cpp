@@ -102,6 +102,12 @@ RenderState extract_render_state(const GpuState& st) {
     rs.color_src_blend = PM4_FIELD(bc, CB_BLEND0_CONTROL, COLOR_SRCBLEND);
     rs.color_dst_blend = PM4_FIELD(bc, CB_BLEND0_CONTROL, COLOR_DESTBLEND);
     rs.color_comb_fcn  = PM4_FIELD(bc, CB_BLEND0_CONTROL, COLOR_COMB_FCN);
+    // Separate alpha blend (#381): the alpha channel has its own factors/op when SEPARATE_ALPHA_BLEND
+    // is set (a common UI/premultiplied pattern: color SrcAlpha/OneMinusSrcAlpha but alpha One/OneMinus).
+    rs.separate_alpha_blend = PM4_FIELD(bc, CB_BLEND0_CONTROL, SEPARATE_ALPHA_BLEND) != 0;
+    rs.alpha_src_blend = PM4_FIELD(bc, CB_BLEND0_CONTROL, ALPHA_SRCBLEND);
+    rs.alpha_dst_blend = PM4_FIELD(bc, CB_BLEND0_CONTROL, ALPHA_DESTBLEND);
+    rs.alpha_comb_fcn  = PM4_FIELD(bc, CB_BLEND0_CONTROL, ALPHA_COMB_FCN);
 
     // Faithful raw state registers.
     rs.db_depth_control  = dc;
@@ -188,6 +194,19 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
     ps.src_color_blend_factor  = vk_blend_factor(rs.color_src_blend);
     ps.dst_color_blend_factor  = vk_blend_factor(rs.color_dst_blend);
     ps.color_blend_op          = vk_blend_op(rs.color_comb_fcn);
+    // Alpha blend factors/op (#381): use the separate ALPHA_* fields when SEPARATE_ALPHA_BLEND is set,
+    // else mirror the color factors (RDNA2 behavior — Kyty GraphicsRender). The backend reads these
+    // directly, so it no longer has to reuse the color factors for the alpha channel (which corrupted
+    // stored dst-alpha on any target later read back — RTT composites, alpha-test/text layers).
+    if (rs.separate_alpha_blend) {
+        ps.src_alpha_blend_factor = vk_blend_factor(rs.alpha_src_blend);
+        ps.dst_alpha_blend_factor = vk_blend_factor(rs.alpha_dst_blend);
+        ps.alpha_blend_op         = vk_blend_op(rs.alpha_comb_fcn);
+    } else {
+        ps.src_alpha_blend_factor = ps.src_color_blend_factor;
+        ps.dst_alpha_blend_factor = ps.dst_color_blend_factor;
+        ps.alpha_blend_op         = ps.color_blend_op;
+    }
 
     // CB_TARGET_MASK holds a 4-bit write mask per MRT; MRT0 is bits [3:0]. RDNA2's R/G/B/A bit order
     // matches VkColorComponentFlags (R=1,G=2,B=4,A=8), so the nibble maps 1:1.

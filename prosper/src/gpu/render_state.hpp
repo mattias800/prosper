@@ -48,6 +48,12 @@ struct RenderState {
     uint32_t color_src_blend = 0;     // COLOR_SRCBLEND
     uint32_t color_dst_blend = 0;     // COLOR_DESTBLEND
     uint32_t color_comb_fcn  = 0;     // COLOR_COMB_FCN (blend op)
+    // Separate alpha-channel blend (CB_BLEND0_CONTROL.SEPARATE_ALPHA_BLEND @29): when set, the alpha
+    // channel blends with its OWN factors/op; when clear, alpha mirrors the color factors (#381).
+    bool     separate_alpha_blend = false;
+    uint32_t alpha_src_blend  = 0;    // ALPHA_SRCBLEND  (@16)
+    uint32_t alpha_dst_blend  = 0;    // ALPHA_DESTBLEND (@24)
+    uint32_t alpha_comb_fcn   = 0;    // ALPHA_COMB_FCN  (@21)
 
     // Raw state registers — remaining bit layouts decoded by the Vulkan backend later (kept faithful).
     uint32_t db_depth_control  = 0;   // DB_DEPTH_CONTROL
@@ -106,6 +112,12 @@ struct ResolvedPipelineState {
     uint32_t src_color_blend_factor = 0;   // == VkBlendFactor
     uint32_t dst_color_blend_factor = 0;   // == VkBlendFactor
     uint32_t color_blend_op         = 0;   // == VkBlendOp
+    // Alpha-channel blend factors/op (== VkBlendFactor/VkBlendOp). Resolve sets these from the separate
+    // ALPHA_* fields when SEPARATE_ALPHA_BLEND is set, else mirrors the color factors — so the backend
+    // can always read ps->*_alpha_* directly instead of guessing (#381).
+    uint32_t src_alpha_blend_factor = 0;   // == VkBlendFactor
+    uint32_t dst_alpha_blend_factor = 0;   // == VkBlendFactor
+    uint32_t alpha_blend_op         = 0;   // == VkBlendOp
     uint32_t color_write_mask       = 0xF; // == VkColorComponentFlags (RGBA); MRT0 nibble of CB_TARGET_MASK
 
     // Guest viewport as a Vulkan viewport rect. `has_viewport` is false when the guest never programmed

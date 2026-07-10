@@ -339,9 +339,12 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             cba.srcColorBlendFactor = (VkBlendFactor)ps->src_color_blend_factor;
             cba.dstColorBlendFactor = (VkBlendFactor)ps->dst_color_blend_factor;
             cba.colorBlendOp        = (VkBlendOp)ps->color_blend_op;
-            cba.srcAlphaBlendFactor = (VkBlendFactor)ps->src_color_blend_factor;   // mirror color for alpha
-            cba.dstAlphaBlendFactor = (VkBlendFactor)ps->dst_color_blend_factor;
-            cba.alphaBlendOp        = (VkBlendOp)ps->color_blend_op;
+            // Alpha channel uses its OWN resolved factors (#381): resolve set these from the separate
+            // ALPHA_* blend fields when SEPARATE_ALPHA_BLEND was programmed, else it already mirrored the
+            // color factors — so this is correct in both cases without guessing here.
+            cba.srcAlphaBlendFactor = (VkBlendFactor)ps->src_alpha_blend_factor;
+            cba.dstAlphaBlendFactor = (VkBlendFactor)ps->dst_alpha_blend_factor;
+            cba.alphaBlendOp        = (VkBlendOp)ps->alpha_blend_op;
         }
         VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
         cb.attachmentCount = 1; cb.pAttachments = &cba;
