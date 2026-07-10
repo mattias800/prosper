@@ -27,6 +27,9 @@
 #ifdef PROSPER_PAD_SDL3
 #include "pad_sdl3.hpp"                // install_sdl3_pad_backend (route a host controller to libScePad)
 #endif
+#ifdef PROSPER_HAVE_DIALOG_SDL3
+#include "dialog_sdl3.hpp"             // install_sdl3_platform_ui (real SDL message boxes for dialogs)
+#endif
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
@@ -357,6 +360,10 @@ int main(int argc, char** argv) {
 #endif
 #ifdef PROSPER_PAD_SDL3
             if (prosper::install_sdl3_pad_backend()) fprintf(stderr, "[app] controller backend installed.\n");
+#endif
+#ifdef PROSPER_HAVE_DIALOG_SDL3
+            prosper::install_sdl3_platform_ui();   // real SDL message boxes for MsgDialog/ErrorDialog (#347)
+            fprintf(stderr, "[app] dialog backend installed.\n");
 #endif
         };
         if (!boot_program(dump, prog, &err, install_backends)) { fprintf(stderr, "[app] boot failed: %s\n", err.c_str()); return 1; }
