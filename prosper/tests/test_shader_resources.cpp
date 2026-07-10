@@ -54,6 +54,17 @@ int main() {
     CHECK(t.by_sgpr_base(0x99) == nullptr && t.by_sgpr_base(0xFFFFFFFFu) == nullptr,
           "unknown / not-SGPR-keyed resolves to null");
 
+    // half_to_float (#290 fp16 texture upload): exact IEEE binary16 decode incl. subnormals/inf/NaN.
+    CHECK(half_to_float(0x3C00) == 1.0f && half_to_float(0xBC00) == -1.0f, "half 0x3C00/0xBC00 = +/-1.0");
+    CHECK(half_to_float(0x3800) == 0.5f, "half 0x3800 = 0.5 (mid-gray magnitude, not saturated)");
+    CHECK(half_to_float(0x0000) == 0.0f && half_to_float(0x8000) == 0.0f, "half +/-0 = 0.0");
+    CHECK(half_to_float(0x4248) == 3.140625f, "half 0x4248 = 3.140625 (pi to half precision)");
+    CHECK(half_to_float(0x7BFF) == 65504.0f, "half 0x7BFF = 65504 (max finite)");
+    CHECK(half_to_float(0x0001) == 5.9604644775390625e-8f, "half 0x0001 = smallest subnormal");
+    CHECK(half_to_float(0x03FF) == 6.0975551605224609375e-5f, "half 0x03FF = largest subnormal");
+    { float inf = half_to_float(0x7C00); CHECK(inf > 3.4e38f && inf == inf * 2, "half 0x7C00 = +inf"); }
+    { float nan = half_to_float(0x7E01); CHECK(nan != nan, "half 0x7E01 = NaN"); }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

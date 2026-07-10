@@ -104,12 +104,23 @@ modes + addrlib golden byte positions). Refs: #288 (this work), #282 (the refram
 
 ## Remaining texture walls after #288 (NOT tiling)
 
-Even with correct 64KB detiling, DOLL's presented frame keeps noise/black regions because:
-- **fp16 textures upload as RGBA8**: `live_renderer.cpp` clamps `bpt > 4` to 4, so fmt 71
-  (Float16×4), 13/14 (Float16) sample as garbage confetti regardless of detile — needs an
-  fp16→RGBA8 (or native-format) upload path.
-- **BC4/BC5/BC6/BC7 bindings are skipped** (`agc_shader_layout.cpp` policy: decode not wired) —
-  fmt 175/177/179/181/182 draws drop; a large share of DOLL's mode-9 materials are BC7 (fmt 182).
-- **RT sampling**: rendered pixels live host-side in `g_rtt` (`PROSPER_RTT` injection); they are
-  never written back tiled to guest memory, so composites sampling an RT need PROSPER_RTT, not
-  the detiler.
+Two of the three walls were closed by #290:
+- ~~fp16 textures upload as RGBA8~~ **FIXED (#290)**: fp16 surfaces (fmt 71 Float16×4, 29, 13) are
+  now read at the real bytes-per-texel, detiled with the real element size, and converted
+  half→UNORM8 (exact binary16 decode, unit-tested; values clamp to [0,1] — native
+  `R16G16B16A16_SFLOAT` upload for HDR >1.0 energy is a documented follow-up).
+- ~~BC4/BC5/BC7 bindings are skipped~~ **FIXED (#290)**: full BC4/BC5/BC7 decoders in
+  `bc_decode.cpp`, fuzz-validated byte-exact vs texture2ddecoder (4000 BC7 blocks covering all 8
+  modes + 1000 each BC4/BC5). Live DOLL BC7_SRGB atlases (fmt 182, 1024×1024 / 2048×1024, mode 9)
+  decode through `detile_elements` + `bc_decode_surface` into fully coherent cloud sprite atlases
+  (TV ≈ 1.6). Still skipped: **BC6H** (fmt 179/180, HDR half-float — no decode) and **SNORM
+  BC4/BC5** (fmt 176/178 — the UNORM8 upload can't carry signed samples).
+- **RT sampling — now the dominant wall**: rendered pixels live host-side in `g_rtt`
+  (`PROSPER_RTT` injection); they are never written back tiled to guest memory, so every draw
+  sampling an RT-mode (tm27) surface reads stale garbage — DOLL's presented frame is dominated by
+  its bloom chain (fmt 71 fp16 RTs, 960×540…240×135) and final composite (fmt 36 =
+  `10_11_11_FLOAT`, the UE4 R11G11B10F scene color, 3840×2160/1920×1080 — unmapped, skipped
+  without RTT) sampling those unwritten RTs. Verified from a live capture: the 480×270 fmt-71
+  "bloom" guest memory decodes to NaN/inf-laden speckle — correctly-decoded garbage input, not a
+  decode bug. Fixing this means RTT injection keyed to those targets (plus mapping fmt 36 for the
+  injection path), not the detiler.

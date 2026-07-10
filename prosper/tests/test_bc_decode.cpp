@@ -82,6 +82,117 @@ int main() {
         CHECK(out[7] == 255, "BC3 texel1 alpha index0 -> a0 = 255");
     }
 
+    // --- BC4: single-channel ramp (a0>a1 -> 6 interpolants); hardware channel rule (R,0,0,255) ---
+    {
+        uint8_t blk[8] = {0};
+        blk[0] = 255; blk[1] = 0;   // e0=255, e1=0 (e0>e1 -> 6-interpolant ramp)
+        // 3-bit indices: t0=0 (=e0), t1=1 (=e1), t2=2 (=(6*e0+e1)/7), rest 0
+        uint64_t bits = (1ull << 3) | (2ull << 6);
+        for (int i = 0; i < 6; i++) blk[2 + i] = (uint8_t)(bits >> (i * 8));
+        uint8_t out[4 * 4 * 4];
+        bool ok = bc_decode_surface(out, blk, sizeof blk, 4, 4, DataFormat::Bc4);
+        CHECK(ok, "BC4 decode returns true");
+        CHECK(out[0] == 255 && out[1] == 0 && out[2] == 0 && out[3] == 255, "BC4 t0 idx0 -> (255,0,0,255)");
+        CHECK(out[4] == 0, "BC4 t1 idx1 -> e1 = 0");
+        CHECK(out[8] == (uint8_t)((6 * 255 + 1 * 0) / 7), "BC4 t2 idx2 -> (6*e0+e1)/7 = 218");
+    }
+
+    // --- BC5: two independent channel blocks -> (R,G,0,255) ---
+    {
+        uint8_t blk[16] = {0};
+        blk[0] = 200; blk[1] = 100;  // R channel: e0=200 (idx0 everywhere)
+        blk[8] = 40;  blk[9] = 10;   // G channel: e0=40
+        uint8_t out[4 * 4 * 4];
+        bool ok = bc_decode_surface(out, blk, sizeof blk, 4, 4, DataFormat::Bc5);
+        CHECK(ok, "BC5 decode returns true");
+        CHECK(out[0] == 200 && out[1] == 40 && out[2] == 0 && out[3] == 255, "BC5 -> (R,G,0,255) = (200,40,0,255)");
+    }
+
+    // --- BC7 ---
+    // Bit-writer mirroring the decoder's little-endian stream, to build spec-exact blocks.
+    struct BitW {
+        uint8_t b[16]; uint32_t pos;
+        BitW() : pos(0) { std::memset(b, 0, sizeof b); }
+        void put(uint32_t v, uint32_t n) {
+            for (uint32_t i = 0; i < n; i++, pos++)
+                if ((v >> i) & 1u) b[pos >> 3] |= (uint8_t)(1u << (pos & 7));
+        }
+    };
+
+    // Mode 5 solid color: rotation=0, both endpoints equal, all indices 0.
+    // 7-bit color 0x40 expands to (0x40<<1) | (0x80>>8) = 0x81; alpha is 8-bit literal.
+    {
+        BitW w;
+        w.put(0x20, 6);            // mode 5: five 0 bits then the 1 (LSB-first -> value 0b100000)
+        w.put(0, 2);               // rotation
+        for (int i = 0; i < 2; i++) w.put(0x40, 7);   // R endpoints
+        for (int i = 0; i < 2; i++) w.put(0x40, 7);   // G
+        for (int i = 0; i < 2; i++) w.put(0x40, 7);   // B
+        for (int i = 0; i < 2; i++) w.put(0xC3, 8);   // A endpoints (literal 8-bit)
+        // color indices: anchor texel0 = 1 bit, texels 1..15 = 2 bits, all zero
+        // alpha indices: same widths, all zero -> stream is already zero; nothing to put.
+        uint8_t out[4 * 4 * 4];
+        bool ok = bc_decode_surface(out, w.b, sizeof w.b, 4, 4, DataFormat::Bc7);
+        CHECK(ok, "BC7 decode returns true");
+        bool solid = true;
+        for (int t = 0; t < 16; t++) {
+            const uint8_t* px = out + t * 4;
+            if (px[0] != 0x81 || px[1] != 0x81 || px[2] != 0x81 || px[3] != 0xC3) solid = false;
+        }
+        CHECK(solid, "BC7 mode5 solid: every texel = (0x81,0x81,0x81,0xC3)");
+    }
+
+    // Mode 6 interpolation: ep0 = 0 (p=0), ep1 = 0xFF (raw 0x7F, p=1); texel1 index 8 -> weight 34.
+    {
+        BitW w;
+        w.put(0x40, 7);            // mode 6: six 0 bits then the 1
+        for (int c = 0; c < 4; c++) { w.put(0x00, 7); w.put(0x7F, 7); }  // RGBA endpoint pairs? NO:
+        // ^ WRONG order — endpoints are grouped per channel: e0.r, e1.r, then e0.g, e1.g, ... For
+        //   this block e0.* = 0 and e1.* = 0x7F for every channel, so the grouped order writes the
+        //   same bits either way (0, 0x7F repeated 4x). Kept simple on purpose.
+        w.put(0, 1); w.put(1, 1);  // p-bits: e0 -> 0, e1 -> 1  => e1 = (0x7F<<1)|1 = 0xFF
+        w.put(0, 3);               // texel0 (anchor) 3-bit index = 0
+        w.put(8, 4);               // texel1 4-bit index = 8 -> aWeight4[8] = 34
+        uint8_t out[4 * 4 * 4];
+        bc_decode_surface(out, w.b, sizeof w.b, 4, 4, DataFormat::Bc7);
+        CHECK(out[0] == 0 && out[3] == 0, "BC7 mode6 t0 idx0 -> endpoint0 (0, alpha 0)");
+        uint8_t expect = (uint8_t)((0 * (64 - 34) + 255 * 34 + 32) >> 6);   // = 135
+        CHECK(out[4] == expect && out[5] == expect && out[6] == expect && out[7] == expect,
+              "BC7 mode6 t1 idx8 -> (255*34+32)>>6 = 135 in all channels");
+    }
+
+    // Mode 1 two-subset, partition 0 (left 2 columns subset 0, right 2 subset 1): subset0 = red,
+    // subset1 = blue, all indices 0. 6-bit endpoints + shared p-bit per subset.
+    {
+        BitW w;
+        w.put(0x02, 2);            // mode 1: one 0 bit then the 1
+        w.put(0, 6);               // partition 0
+        // R endpoints for e0..e3 (subset0 e0,e1 then subset1 e0,e1): red -> 0x3F,0x3F,0,0
+        w.put(0x3F, 6); w.put(0x3F, 6); w.put(0x00, 6); w.put(0x00, 6);
+        // G: all 0
+        for (int i = 0; i < 4; i++) w.put(0x00, 6);
+        // B: 0,0,0x3F,0x3F
+        w.put(0x00, 6); w.put(0x00, 6); w.put(0x3F, 6); w.put(0x3F, 6);
+        w.put(0, 1); w.put(0, 1);  // shared p-bits 0: 0x3F -> 7-bit 0x7E -> expands to 0xFD; 0 stays 0
+        // indices: 3-bit, anchors (texel0 subset0, texel15 subset1 for partition 0) 2-bit; all zero.
+        uint8_t out[4 * 4 * 4];
+        bc_decode_surface(out, w.b, sizeof w.b, 4, 4, DataFormat::Bc7);
+        CHECK(out[0] == 0xFD && out[1] == 0 && out[2] == 0 && out[3] == 255, "BC7 mode1 texel(0,0) = red-ish 0xFD (subset 0)");
+        const uint8_t* pr = out + 3 * 4;   // texel (0,3): right column -> subset 1
+        CHECK(pr[0] == 0 && pr[1] == 0 && pr[2] == 0xFD && pr[3] == 255, "BC7 mode1 texel(0,3) = blue-ish 0xFD (subset 1)");
+    }
+
+    // Reserved mode (all 8 mode bits zero) -> transparent black, no crash.
+    {
+        uint8_t blk[16] = {0};
+        uint8_t out[4 * 4 * 4];
+        std::memset(out, 0xAA, sizeof out);
+        bc_decode_surface(out, blk, sizeof blk, 4, 4, DataFormat::Bc7);
+        CHECK(out[0] == 0 && out[3] == 0, "BC7 reserved mode -> transparent black");
+    }
+
+    CHECK(!bc_decode_surface(nullptr, nullptr, 0, 0, 0, DataFormat::Bc6), "BC6H still unsupported -> false");
+
     // --- larger surface: 8x8 BC1, second block a distinct solid color; verify block placement ---
     {
         const uint32_t W = 8, H = 8;                 // 2x2 blocks

@@ -93,9 +93,9 @@ bool gen5_image_format(uint32_t fmt, Gen5ImageFormatInfo* out) {
     auto plain = [&](DataFormat f, uint32_t n, bool srgb = false) {
         fi.format = f; fi.num_components = n; fi.bytes_per_block = data_format_bytes(f) * n; fi.srgb = srgb;
     };
-    auto bcn = [&](DataFormat f, uint32_t n, uint32_t bpb, bool srgb = false) {
+    auto bcn = [&](DataFormat f, uint32_t n, uint32_t bpb, bool srgb = false, bool snorm = false) {
         fi.format = f; fi.num_components = n; fi.bytes_per_block = bpb;
-        fi.block_width = fi.block_height = 4; fi.srgb = srgb;
+        fi.block_width = fi.block_height = 4; fi.srgb = srgb; fi.snorm = snorm;
     };
     if (fmt >= 1 && fmt <= 77) {                 // shared with the V# buffer-format numbering
         DataFormat f = DataFormat::Unknown; uint32_t n = 0;
@@ -111,9 +111,11 @@ bool gen5_image_format(uint32_t fmt, Gen5ImageFormatInfo* out) {
         case 172: bcn(DataFormat::Bc2, 4, 16, true);  break;   // BC2_SRGB
         case 173: bcn(DataFormat::Bc3, 4, 16);        break;   // BC3_UNORM
         case 174: bcn(DataFormat::Bc3, 4, 16, true);  break;   // BC3_SRGB
-        case 175: case 176: bcn(DataFormat::Bc4, 1,  8); break; // BC4_UNORM/_SNORM (snorm not modeled
-        case 177: case 178: bcn(DataFormat::Bc5, 2, 16); break; // BC5_UNORM/_SNORM  yet — skip-only)
-        case 179: case 180: bcn(DataFormat::Bc6, 3, 16); break; // BC6_UFLOAT/_SFLOAT
+        case 175: bcn(DataFormat::Bc4, 1,  8);                    break; // BC4_UNORM
+        case 176: bcn(DataFormat::Bc4, 1,  8, false, true);       break; // BC4_SNORM (skip-only: signed)
+        case 177: bcn(DataFormat::Bc5, 2, 16);                    break; // BC5_UNORM
+        case 178: bcn(DataFormat::Bc5, 2, 16, false, true);       break; // BC5_SNORM (skip-only: signed)
+        case 179: case 180: bcn(DataFormat::Bc6, 3, 16); break; // BC6_UFLOAT/_SFLOAT (decode not wired)
         case 181: bcn(DataFormat::Bc7, 4, 16);        break;   // BC7_UNORM
         case 182: bcn(DataFormat::Bc7, 4, 16, true);  break;   // BC7_SRGB
         default: break;                                         // unmapped -> false
@@ -282,14 +284,16 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                 fi.format = DataFormat::Unorm8; fi.num_components = 4; fi.bytes_per_block = 4;
                 fi.block_width = fi.block_height = 1;
             }
-            // Block-compressed: BC1/BC2/BC3 are decoded to RGBA8 on upload (bc_decode). BC4/5/6/7 aren't
-            // decoded yet, so keep skipping them (a raw RGBA8 binding would sample garbage + over-read).
+            // Block-compressed: BC1/2/3/4/5/7 are decoded to RGBA8 on upload (bc_decode, #290). Still
+            // skipped: BC6H (HDR half-float — no decode wired) and the SNORM BC4/BC5 variants (the
+            // UNORM8 upload can't carry signed samples; a remapped decode would be numerically wrong).
             const bool is_bcn = fi.block_width > 1;
-            if (is_bcn && fi.format != DataFormat::Bc1 && fi.format != DataFormat::Bc2 &&
-                          fi.format != DataFormat::Bc3) {
+            if (is_bcn && (fi.format == DataFormat::Bc6 || fi.snorm)) {
                 if (!warned[d.format & 511u]) { warned[d.format & 511u] = true;
-                    fprintf(stderr, "[t#] Gen5 IMG_FMT %u is block-compressed BC4-7 (%ux%u T#) -> decode not "
-                                    "wired; skipping texture binding\n", d.format, d.width, d.height); }
+                    fprintf(stderr, "[t#] Gen5 IMG_FMT %u is %s (%ux%u T#) -> decode not "
+                                    "wired; skipping texture binding\n", d.format,
+                            fi.format == DataFormat::Bc6 ? "BC6H (HDR)" : "SNORM BCn",
+                            d.width, d.height); }
                 continue;
             }
             ShaderResource r;

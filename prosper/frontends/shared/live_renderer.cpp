@@ -94,8 +94,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // which is why glyph text rendered as solid white/black BLOCKS (#102). bpt drives a
                         // narrow read+expand path below. StorageImage / unknown formats keep 4 B (bpt=0->4).
                         uint32_t bpt = prosper::gpu::data_format_bytes(r.format) * (r.num_components ? r.num_components : 1);
-                        if (bpt == 0 || bpt > 4) bpt = 4;
+                        // fp16 surfaces (fmt 71 Float16x4 = 8 B/texel, 29 = 4 B, 13 = 2 B) get a real
+                        // half->UNORM8 conversion path below; everything else unknown/oversized keeps
+                        // the legacy RGBA8 read (bpt=4).
+                        const bool f16 = r.format == prosper::gpu::DataFormat::Float16 &&
+                                         (bpt == 2 || bpt == 4 || bpt == 8);
+                        if (bpt == 0 || (bpt > 4 && !f16)) bpt = 4;
                         bool narrow_done = false;
+                        bool f16_done = false;
                         // RTT (#167): if this texture's base is a color target we rendered into, inject those
                         // pixels (nearest-scaled to tw x th) instead of reading empty guest memory.
                         bool rtt_hit = false;
@@ -136,6 +142,42 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 safe_copy(lin.data(), r.gpu_addr, comp_bytes);
                             }
                             prosper::gpu::bc_decode_surface(texstore.back().data(), lin.data(), lin.size(), tw, th, r.format);
+                        } else if (f16) {
+                            // fp16 texture (#290 wall 1): read at the REAL bytes-per-texel and detile
+                            // with the REAL element size — the old clamp read an 8-B/texel Float16x4
+                            // surface at 4 B AND detiled it with bpe=4 against 8-B tiled elements, so
+                            // the result was doubly wrong ("confetti" regions, e.g. DOLL's 960x540 /
+                            // 480x270 bloom-chain buffers). Convert half->UNORM8 on upload: the backend
+                            // uploads RGBA8 only (the whole render path is 8-bit gamma space — see the
+                            // #263 note in render_runner), so HDR values above 1.0 clamp to 255.
+                            // Missing components read (0,0,0,1) per the hardware rule; the T# DST_SEL
+                            // swizzle still applies. CONFIDENCE: MED — the half decode is exact and
+                            // unit-tested, but the [0,1] clamp loses >1.0 bloom energy (native
+                            // VK_FORMAT_R16G16B16A16_SFLOAT upload is the documented follow-up).
+                            const uint32_t nc = bpt / 2;                    // fp16 components per texel
+                            std::vector<uint8_t> hlin((size_t)tw * th * bpt, 0);
+                            bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) && !getenv("PROSPER_NODETILE");
+                            if (tiled) {
+                                size_t tbytes = prosper::gpu::tiled_surface_bytes(tw, th, r.tile_mode, 0, bpt);
+                                std::vector<uint8_t> traw(tbytes, 0);
+                                size_t got = safe_copy(traw.data(), r.gpu_addr, tbytes);
+                                if (got < hlin.size()) safe_copy(hlin.data(), r.gpu_addr, hlin.size());  // short backing -> linear fallback
+                                else prosper::gpu::detile_surface(hlin.data(), traw.data(), tw, th, r.tile_mode, 0, bpt);
+                            } else {
+                                safe_copy(hlin.data(), r.gpu_addr, hlin.size());
+                            }
+                            for (size_t t = 0; t < (size_t)tw * th; t++) {
+                                uint8_t* p = &texstore.back()[t * 4];
+                                for (uint32_t c = 0; c < 4; c++) {
+                                    if (c < nc) {
+                                        uint16_t hv; std::memcpy(&hv, &hlin[t * bpt + c * 2], 2);
+                                        float f = prosper::gpu::half_to_float(hv);
+                                        p[c] = (f != f || f <= 0.f) ? 0                     // NaN/neg -> 0
+                                             : (f >= 1.f ? 255 : (uint8_t)(f * 255.f + 0.5f));
+                                    } else p[c] = (c == 3) ? 255 : 0;       // absent: (.,0,0,1)
+                                }
+                            }
+                            f16_done = true;   // read+detiled at the real element size already
                         } else if (bpt < 4) {
                             // Narrow (single/dual-channel) surface: read at the REAL element size and detile
                             // with the matching bpe geometry (1 B -> 64x64 micro-tiles, #119), then expand
@@ -200,7 +242,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         bool auto_tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode);
                         const char* dt = getenv("PROSPER_DETILE");
                         // BC textures already block-detiled + decoded above; the 32-bpp detiler must not touch them.
-                        if (!rtt_hit && !bcb && !narrow_done && !getenv("PROSPER_NODETILE") && (auto_tiled || (dt && atoi(dt) != 0))) {
+                        if (!rtt_hit && !bcb && !narrow_done && !f16_done && !getenv("PROSPER_NODETILE") && (auto_tiled || (dt && atoi(dt) != 0))) {
                             const uint32_t tmode = auto_tiled ? r.tile_mode : (uint32_t)prosper::gpu::TileMode::Sw4KbS;
                             const uint32_t pitch = getenv("PROSPER_PITCH") ? (uint32_t)atoi(getenv("PROSPER_PITCH")) : 0;
                             size_t tiled_bytes = prosper::gpu::tiled_surface_bytes(tw, th, tmode, pitch);

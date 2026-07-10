@@ -83,6 +83,9 @@ struct Gen5ImageFormatInfo {
     uint32_t   block_width = 1, block_height = 1;
     bool       srgb = false;   // gamma-encoded variant (sampling it as UNORM is a gamma error only,
                                // not garbage — the numbering distinguishes e.g. 56 vs 130)
+    bool       snorm = false;  // signed-normalized BCn variant (BC4/BC5_SNORM, fmt 176/178): the
+                               // UNORM8 upload path can't carry signed samples, so callers keep
+                               // skipping these (the UNORM decode would be numerically wrong).
 };
 // Map a T#'s 9-bit Gen5 IMG_FMT value to format info. Returns false (out left Unknown/zero) for
 // values not in the table — callers must not assume RGBA8 for those (#65). Pure; exposed for testing.
