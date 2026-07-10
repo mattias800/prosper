@@ -1581,6 +1581,20 @@ int main() {
     }
     CHECK(gotT7b.size()==N && badT7b==0, "T7b: v_bfe_u32(v0,20,16) clamps count to 12 -> (v0>>20), not UB");
 
+    // Kernel T7c (#452): v_cvt_pkrtz_f16_f32 is round-toward-ZERO -> an f32 above the f16 range saturates
+    // to the max finite f16 (65504 = 0x7BFF), NOT +Inf (0x7C00) as PackHalf2x16's round-to-nearest-even
+    // would give. s0 = 100000.0f (0x47c35000, > 65504); v1 = pkrtz(s0, 0) -> low f16 0x7BFF, high 0.
+    const uint32_t codeT7c[] = { 0xbe8003ffu, 0x47c35000u, 0xd52f0001u, 0x00010000u, 0xBF810000u };
+    std::vector<uint32_t> spvT7c = recompile_valu(codeT7c, sizeof(codeT7c)/4, 1, 1);
+    CHECK(!spvT7c.empty(), "recompiled T7c (v_cvt_pkrtz overflow) -> SPIR-V");
+    std::vector<float> gotT7c = prosper::test::run_compute(spvT7c, inX, N, N);
+    uint32_t badT7c = 0;
+    for (uint32_t i = 0; i < N && gotT7c.size() == N; i++) {
+        uint32_t gb; std::memcpy(&gb, &gotT7c[i], 4);
+        if (gb != 0x00007BFFu) badT7c++;
+    }
+    CHECK(gotT7c.size()==N && badT7c==0, "T7c: pkrtz(100000) saturates to max-finite f16 0x7BFF, not Inf 0x7C00");
+
     // Kernel T8: s_mov_b64 as plain DATA-pair copy (not a wave mask): s2=9; s[0:1]=s[2:3];
     // out bits = bits(a0) + 9. Previously rejected (src not a recognizable mask).
     const uint32_t codeT8[] = { 0xbe820389u, 0xbe800402u, 0x4a020000u, 0xBF810000u };
