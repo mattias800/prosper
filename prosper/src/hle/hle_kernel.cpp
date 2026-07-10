@@ -94,6 +94,21 @@ HLE(k_mutexattr_settype) {
     return 0;
 }
 HLE(k_mutexattr_setprotocol) { return 0; }
+
+// __stack_chk_fail (Ou3iL1abvng): the guest's -fstack-protector epilogue jumps here when its stack
+// canary check fails; the [[noreturn]] contract lets the compiler place a trailing UD2, so our old
+// blanket "return 0" stub fell into that UD2 -> SIGILL crash on the New Game path (#163-progress). Log
+// the current guest canary at %fs:0x28: a normal high-entropy value (low byte 0x00) => the TLS is fine
+// and a real stack overflow corrupted the on-stack copy; 0 / a weird value => a guest-TCB canary
+// divergence. Still returns (the crash is unavoidable here) — this is diagnostic-only for now.
+HLE(k_stack_chk_fail) {
+    uint64_t c = 0;
+    __asm__ volatile ("movq %%fs:0x28, %0" : "=r"(c));
+    static int n = 0;
+    if (n++ < 4) fprintf(stderr, "[stackchk] __stack_chk_fail: guest canary @fs:0x28 = 0x%016llx\n",
+                         (unsigned long long)c);
+    return 0;
+}
 HLE(k_mutexattr_setpshared)  { return 0; }
 HLE(k_mutexattr_destroy)     { if (a0 && *(void**)a0) { free(*(void**)a0); *(void**)a0 = nullptr; } return 0; }
 
@@ -1013,6 +1028,7 @@ void register_kernel_hle() {
     R("scePthreadSelf", k_pthread_self);
     R("scePthreadEqual", k_pthread_equal);
     R("scePthreadYield", k_pthread_yield);
+    R("__stack_chk_fail", k_stack_chk_fail);   // diagnostic: log the guest canary on a canary-check failure
     R("scePthreadCreate", k_pthread_create);
     R("scePthreadJoin", k_pthread_join);
     R("scePthreadDetach", k_pthread_detach);
