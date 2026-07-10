@@ -884,6 +884,85 @@ HLE(k_add_timer_event) {   // (eq, id, usec, udata) — coarse timer, same one-s
     return 0;
 }
 
+// --- libkernel/libScePosix signal + time-conversion surface (#190) ---
+// PPSA02664 calls these; previously all fell to the generic unimplemented stub (return 0), which for
+// the time-convert pair left the caller's out-param uninitialized (cf. #82 — garbage time_t out).
+
+// Host UTC offset (seconds EAST of UTC) and DST flag for a given unix time, portably. The convert
+// functions below approximate the offset by running the HOST timezone over the input instant — the
+// same approach shadPS4 takes; it is exact except within the ~1 h wall-clock ambiguity of a DST
+// transition, which no title depends on. CONFIDENCE: HIGH for the offset itself.
+static void host_local_offset(time_t t, long& gmtoff_sec, int& isdst) {
+    struct tm lt{};
+#ifdef _WIN32
+    localtime_s(&lt, &t);
+    // Windows struct tm has no tm_gmtoff: reinterpret the local wall values as UTC and diff. The
+    // isdst flag from localtime_s drives the DST-seconds field below.
+    time_t as_utc = _mkgmtime64(&lt);
+    gmtoff_sec = (long)(as_utc - t);
+    isdst = lt.tm_isdst;
+#else
+    localtime_r(&t, &lt);
+    gmtoff_sec = lt.tm_gmtoff;
+    isdst = lt.tm_isdst;
+#endif
+}
+
+// OrbisTimesec out-struct written by both convert functions: { s64 t; u32 west_sec; u32 dst_sec }
+// (shadPS4 time_management OrbisTimesec). `west_sec` is seconds WEST of UTC (= -gmtoff); `dst_sec` is
+// the DST correction in seconds. CONFIDENCE: MED on the struct's field semantics; the primary
+// converted-time out-param (filled first, and what callers actually read) is HIGH.
+static void fill_timesec(void* p, int64_t converted, long gmtoff_sec, int isdst) {
+    uint8_t* b = (uint8_t*)p;
+    int64_t  t = converted;             memcpy(b + 0, &t, 8);
+    uint32_t west = (uint32_t)(-gmtoff_sec); memcpy(b + 8, &west, 4);
+    uint32_t dst  = (uint32_t)(isdst > 0 ? 3600 : 0); memcpy(b + 12, &dst, 4);
+}
+
+// sceKernelConvertUtcToLocaltime(time_t utc, time_t* local_out, OrbisTimesec* st, u64* dst_sec).
+// local = utc + gmtoff. CONFIDENCE: MED-HIGH (shadPS4 prototype; primary out-param HIGH).
+HLE(k_convert_utc_to_local) {
+    time_t utc = (time_t)(int64_t)a0;
+    long gmtoff; int isdst; host_local_offset(utc, gmtoff, isdst);
+    int64_t local = (int64_t)utc + (int64_t)gmtoff;
+    if (a1) *(int64_t*)P(a1) = local;
+    if (a2) fill_timesec(P(a2), local, gmtoff, isdst);
+    if (a3) *(uint64_t*)P(a3) = (uint64_t)(isdst > 0 ? 3600 : 0);
+    return 0;
+}
+
+// sceKernelConvertLocaltimeToUtc(time_t local, u64 unk, time_t* utc_out, OrbisTimesec* st, u64* dst).
+// utc = local - gmtoff. The 2nd arg is an unused/opaque u64 in the shadPS4 prototype, so the UTC
+// result is at a2. CONFIDENCE: MED (prototype incl. the a1 gap; primary out-param HIGH).
+HLE(k_convert_local_to_utc) {
+    time_t local = (time_t)(int64_t)a0;
+    long gmtoff; int isdst; host_local_offset(local, gmtoff, isdst);
+    int64_t utc = (int64_t)local - (int64_t)gmtoff;
+    if (a2) *(int64_t*)P(a2) = utc;
+    if (a3) fill_timesec(P(a3), utc, gmtoff, isdst);
+    if (a4) *(uint64_t*)P(a4) = (uint64_t)(isdst > 0 ? 3600 : 0);
+    return 0;
+}
+
+// pthread_setcancelstate(int state, int* old_state) — Orbis enum 0=ENABLE, 1=DISABLE (Kyty
+// PthreadSetcancelstate). prosper never cancels guest threads, so cancellation is a no-op; we validate
+// the state, report the POSIX default ENABLE(0) as the previous state, and return OK. (No per-thread
+// tracking: a host thread_local here pulls TLS-init machinery into the runtime that perturbs the
+// guest-%fs handling enough to break the Messenger boot — and the tracked value is unobservable since
+// nothing is ever cancelled.) CONFIDENCE: HIGH.
+HLE(k_pthread_setcancelstate) {
+    int state = (int)a0;
+    if (state != 0 && state != 1) return 0x80020016ull;   // EINVAL
+    if (a1) *(int*)P(a1) = 0;                              // previous state = ENABLE (default)
+    return 0;
+}
+
+// Signal machinery we do not model (guest runs natively; no guest-directed POSIX signals). Explicit
+// no-ops so they resolve here instead of the unimplemented logger. _sigprocmask's callers pass a null
+// oldset in the boot path; returning 0 (success, mask unchanged) is the correct no-op. CONFIDENCE: HIGH.
+HLE(k_sigprocmask_noop)    { return 0; }
+HLE(k_is_signal_return)    { return 0; }   // "is this frame a signal return?" — never, for us
+
 void register_kernel_time_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
     R("sceKernelCreateEqueue", k_eq_create);   R("sceKernelDeleteEqueue", k_eq_delete);
@@ -942,6 +1021,12 @@ void register_kernel_time_hle() {
     R("_Mtx_destroy", m_mtx_destroy);
     R("_Cnd_init", m_cnd_init);   R("_Cnd_signal", m_cnd_signal); R("_Cnd_broadcast", m_cnd_broadcast);
     R("_Cnd_wait", m_cnd_wait);   R("_Cnd_destroy", m_cnd_destroy);
+    // libkernel/libScePosix signal + time-conversion surface (#190)
+    R("sceKernelConvertUtcToLocaltime", k_convert_utc_to_local);
+    R("sceKernelConvertLocaltimeToUtc", k_convert_local_to_utc);
+    R("pthread_setcancelstate", k_pthread_setcancelstate);
+    R("_sigprocmask", k_sigprocmask_noop);
+    R("_is_signal_return", k_is_signal_return);
     #undef R
 }
 

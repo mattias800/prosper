@@ -213,6 +213,12 @@ if(TARGET prosper_core)
       PROSPER_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
   add_test(NAME messenger_recompile_guard COMMAND test_messenger_recompile_guard)
 
+  # libkernel/libScePosix signal + time-conversion surface (#190): NID match, registration, and real
+  # behavior (UTC<->localtime round-trip fills its out-param; pthread_setcancelstate old-state + EINVAL).
+  add_executable(test_kernel_signal_time tests/test_kernel_signal_time.cpp)
+  target_link_libraries(test_kernel_signal_time PRIVATE prosper_core)
+  add_test(NAME kernel_signal_time COMMAND test_kernel_signal_time)
+
   # Pipeline-state resolution: RenderState (RDNA2 enums) -> Vulkan-ready pipeline state (pure, no Vulkan).
   add_executable(test_pipeline_state tests/test_pipeline_state.cpp)
   target_link_libraries(test_pipeline_state PRIVATE prosper_core)
