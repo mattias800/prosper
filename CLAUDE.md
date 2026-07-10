@@ -51,7 +51,11 @@ prosper/
   src/gpu/         AGC->Vulkan: PM4 decode, command processor, render state, vk_translate,
                    resource layer, RDNA2->SPIR-V recompiler
   tools/           self_dump, boot_trace, shader_histo, imgdump, spv_validate,
-                   snapshot (golden-image rendering regression guard — see tools/AGENTS.md)
+                   snapshot (golden-image rendering regression guard — see tools/AGENTS.md),
+                   il2cpp/ (prx_to_elf.py + resolve.py: flatten a SELF -> plain ELF for Il2CppDumper
+                   managed-symbol recovery), re/xref.py (cross-reference finder for unsymbolicated
+                   PS5 modules: "who references address X" over calls + rip-relative refs + Sony
+                   relocations, which objdump/readelf can't decode)
   tests/           unit + boot + Vulkan-execution tests (ctest)
 ```
 
@@ -102,6 +106,17 @@ renderer is wired in; the game's **real pixel shader recompiles to valid SPIR-V*
   (recompiler, AGC decode, render state, detile, executor/present), run the golden-image guard
   `python3 tools/snapshot/snapshot.py check` (local-only, boots a real game and pixel-hashes an exact
   frame vs a stored baseline — see `tools/snapshot/AGENTS.md`).
+- **Build tools — don't avoid them.** This project is a long reverse-engineering effort, and getting
+  progressively more complicated games running will keep demanding new instrumentation. When you hit a
+  question the existing tools can't answer — "who references this address in the unsymbolicated eboot?",
+  "what managed method is at this PC?", "which draw wrote this pixel?", "what does this guest struct look
+  like at runtime?" — **write the tool** rather than hand-grinding it once and moving on. The payoff is
+  compounding: a good tool turns hours of manual disassembly into a lookup and pays off on every future
+  title. Prefer a small, documented, committed tool (in `tools/`, or a gated `PROSPER_*` diagnostic in the
+  emulator) over a throwaway script, and reuse what exists first (`self_dump`, `boot_trace`, `PROSPER_HWBP`/
+  `HWWATCH`/`PEEK`/`FAULTMEM`, `tools/il2cpp/prx_to_elf.py` + Il2CppDumper, `tools/re/xref.py`, the snapshot
+  guard) — the RE toolbox is the force multiplier, so grow it deliberately, verify it on a known answer,
+  and land it so the next agent (and the next game) inherits it.
 - **Reaching the running frame loop** needs two gated switches (off by default, so the default boot stays
   stable): `PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct`. Add `PROSPER_RENDER=1` to run the
   live renderer, `PROSPER_GFXLOG=1` for graphics diagnostics.
