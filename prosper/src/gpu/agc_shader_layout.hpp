@@ -79,7 +79,9 @@ struct DecodedImageDescriptor {
     uint32_t width = 0, height = 0;
     uint32_t format = 0;      // Gen5 surface-format enum (fields[1] bits 20..28)
     uint32_t tile_mode = 0;   // 0 = linear
-    uint8_t  type = 0;        // SQ_RSRC_IMG dim (8 = 2D, 9 = 2D_ARRAY, ...)
+    uint8_t  type = 0;        // SQ_RSRC_IMG dim (GFX10: 8=1D, 9=2D, 10=3D, 11=CUBE, 12=1D_ARRAY, 13=2D_ARRAY).
+                              // NB: 9 = plain 2D (already handled); 2D_ARRAY is 13 — the decode code in
+                              // agc_shader_layout.cpp / gpu_executor.cpp uses these correct values (#378).
     // DST_SEL_X/Y/Z/W channel swizzle (WORD3 [2:0]/[5:3]/[8:6]/[11:9]); SQ_SEL enum:
     // 0=0, 1=1, 4=X(R), 5=Y(G), 6=Z(B), 7=W(A). Default = identity (R,G,B,A).
     uint8_t  dst_sel[4] = {4, 5, 6, 7};
