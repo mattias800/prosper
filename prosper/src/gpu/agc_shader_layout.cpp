@@ -322,6 +322,10 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             r.tile_mode     = d.tile_mode;          // so the renderer can auto-detile a GPU-tiled surface
             r.swizzle[0] = d.dst_sel[0]; r.swizzle[1] = d.dst_sel[1];
             r.swizzle[2] = d.dst_sel[2]; r.swizzle[3] = d.dst_sel[3];   // T# DST_SEL channel remap (#261)
+            // T# TYPE -> the MIMG dim convention (GFX10 SQ_RSRC_IMG: 8=1D, 9=2D, 10=3D, 11=CUBE,
+            // 12=1D_ARRAY, 13=2D_ARRAY). A CUBE resource (img_dim 3) uploads as six faces stacked
+            // vertically in one 2D image (#273); everything else keeps the 2D default.
+            r.img_dim       = d.type == 11 ? 3u : d.type == 10 ? 2u : d.type == 13 ? 5u : 1u;
             r.srgb          = fi.srgb;              // gamma-encoded surface: sample with sRGB->linear (#263)
             if (fi.srgb && getenv("PROSPER_GFXLOG"))
                 fprintf(stderr, "[t#] SRGB texture fmt=%u %ux%u (binding %u)\n", d.format, d.width, d.height, r.binding);

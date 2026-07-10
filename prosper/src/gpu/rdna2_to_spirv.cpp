@@ -3130,8 +3130,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // the offset-adjust folds into the normalized coords, see image_sample_lz_offset_2d).
             const bool is_sample_lz_o = (in.opcode == 0x37);
             const bool dim2d = (in.mimg_dim == 1u), dim3d = (in.mimg_dim == 2u);
+            const bool dimcube = (in.mimg_dim == 3u);
             if ((!is_sample && !is_load && !is_sample_l && !is_sample_lz && !is_sample_b && !is_gather_lz &&
-                 !is_gather_lz_o && !is_sample_lz_o) || (!dim2d && !dim3d)) { ok = false; return true; }
+                 !is_gather_lz_o && !is_sample_lz_o) || (!dim2d && !dim3d && !dimcube)) { ok = false; return true; }
             if (res->cls != ResourceClass::Texture) { ok = false; return true; }
             // coords (normalized float for sample, integer texel for load). Non-NSA: consecutive from VADDR.
             // NSA (len>2): coord0 = VADDR, coord k>=1 = byte (k-1) of the extra address dwords words[2..3].
@@ -3140,7 +3141,29 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             auto cvg = [&](uint32_t k) -> int { if (!nsa || k == 0) return va + (nsa ? 0 : (int)k);
                 uint32_t j = k - 1; return (int)((in.words[2 + j / 4] >> (8 * (j % 4))) & 0xFFu); };
             uint32_t out[4];
-            if (dim3d) {
+            if (dimcube) {
+                // CUBE sample (#273 — DOLL's title post PSes sample their reflection probes /
+                // skybox with `image_sample_l ..., dim:CUBE`). The compiled coords are the standard
+                // AMD cube-processed form (Mesa ac_prepare_cube_coords): vaddr = { sc*rcp(|ma|)+1.5,
+                // tc*rcp(|ma|)+1.5, face_id [, lod] } — face coords centered at 1.5 (span [1,2]),
+                // face id an integral float from v_cubeid. Our texture backend uploads the cube as
+                // SIX FACES STACKED VERTICALLY in one 2D image (w x 6h — see the live_renderer cube
+                // path), so the sample lowers to a plain 2D sample at u = x-1, v = (face + clamp
+                // (y-1)) / 6 at base LOD (mips aren't uploaded; a >0 LOD clamps to the one level).
+                // The in-face clamp stops bilinear bleed across face seams. CONFIDENCE: MED — the
+                // coordinate convention is Mesa-verified; face memory layout is validated visually.
+                if (!is_sample && !is_sample_l && !is_sample_lz && !is_sample_b) { ok = false; return true; }
+                const uint32_t ci = is_sample_b ? 1u : 0u;              // _b: bias occupies vaddr0
+                uint32_t x = vread(cvg(ci)), y = vread(cvg(ci + 1)), fid = vread(cvg(ci + 2));
+                const uint32_t one = b.uconst(fbits(1.0f)), zero = b.uconst(fbits(0.0f));
+                uint32_t uf = b.fbin(Op_FSub, x, one);
+                uint32_t vf = b.fext2(Glsl_FMax, b.fext2(Glsl_FMin, b.fbin(Op_FSub, y, one), one), zero);
+                uint32_t layer = b.fext1(Glsl_RoundEven,
+                                     b.fext2(Glsl_FMax, b.fext2(Glsl_FMin, fid, b.uconst(fbits(5.0f))), zero));
+                uint32_t v6 = b.fbin(Op_FMul, b.fbin(Op_FAdd, layer, vf), b.uconst(fbits(1.0f / 6.0f)));
+                b.declare_texture(res->binding, Dim_2D);
+                b.image_sample_lod_2d(res->binding, uf, v6, b.uconst(0), out);
+            } else if (dim3d) {
                 // 3D: implicit-LOD / LOD-0 sample, or an integer texel FETCH (image_load — DOLL's
                 // color-grade 3D LUT, #273).
                 if (!is_sample && !is_sample_lz && !is_load) { ok = false; return true; }

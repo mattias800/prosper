@@ -692,6 +692,9 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     r.format = fi.format; r.num_components = fi.num_components;
                     r.gpu_addr = d.base; r.width = d.width; r.height = d.height;
                     r.tile_mode = d.tile_mode; r.srgb = fi.srgb;
+                    // T# TYPE -> MIMG dim (GFX10: 9=2D, 10=3D, 11=CUBE, 13=2D_ARRAY); a cube
+                    // uploads as six vertically-stacked faces (#273 — see agc_shader_layout).
+                    r.img_dim = d.type == 11 ? 3u : d.type == 10 ? 2u : d.type == 13 ? 5u : 1u;
                     r.swizzle[0] = d.dst_sel[0]; r.swizzle[1] = d.dst_sel[1];
                     r.swizzle[2] = d.dst_sel[2]; r.swizzle[3] = d.dst_sel[3];
                     r.size = is_bcn ? (((d.width + 3) / 4) * ((d.height + 3) / 4) * fi.bytes_per_block)
