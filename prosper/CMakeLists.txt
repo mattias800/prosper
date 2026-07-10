@@ -143,6 +143,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_platform_ui PRIVATE prosper_core)
   add_test(NAME platform_ui COMMAND test_platform_ui)
 
+  # SDL3 dialog frontend's guest-struct parsing (#347): pure, SDL-free, so it runs in normal CI even
+  # though the SDL_ShowMessageBox glue is display-only. Verifies the MsgDialog/ErrorDialog layouts.
+  add_executable(test_dialog_helpers frontends/dialog_sdl3/test_dialog_helpers.cpp
+                                     frontends/dialog_sdl3/dialog_helpers.cpp)
+  add_test(NAME dialog_helpers COMMAND test_dialog_helpers)
+
   # libSceImeDialog lifecycle + libSceSaveData memory API round-trip (#191): auto-completing dialog
   # (no hang) + a real per-(user,slot) Set->Get memory block with verified shadPS4 struct layouts.
   add_executable(test_savedata_ime tests/test_savedata_ime.cpp)
@@ -606,6 +612,15 @@ if(PROSPER_APP AND TARGET SDL3::SDL3)
       target_link_libraries(prosper-app PRIVATE prosper_live_renderer)
       target_compile_definitions(prosper-app PRIVATE PROSPER_HAVE_LIVE_RENDERER=1)
     endif()
+    # SDL3 dialog frontend (#347): real SDL_ShowMessageBox for the guest's MsgDialog/ErrorDialog via
+    # the PlatformUi hook. The layout parsing (dialog_helpers) is pure + unit-tested (see below); this
+    # module adds the SDL glue and needs SDL3 video (already required by prosper-app).
+    add_library(prosper_dialog_sdl3 STATIC
+                frontends/dialog_sdl3/platform_ui_sdl3.cpp frontends/dialog_sdl3/dialog_helpers.cpp)
+    target_include_directories(prosper_dialog_sdl3 PUBLIC frontends/dialog_sdl3 src)
+    target_link_libraries(prosper_dialog_sdl3 PUBLIC prosper_core SDL3::SDL3)
+    target_link_libraries(prosper-app PRIVATE prosper_dialog_sdl3)
+    target_compile_definitions(prosper-app PRIVATE PROSPER_HAVE_DIALOG_SDL3=1)
     message(STATUS "prosper-app frontend enabled (SDL3 window + Vulkan present)")
   else()
     message(WARNING "PROSPER_APP=ON but Vulkan not found — skipping prosper-app")
