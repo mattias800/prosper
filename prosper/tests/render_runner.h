@@ -67,6 +67,10 @@ struct FrameResource {
     // SQ_TEX CLAMP enum (0=wrap, 1=mirror, 2=clamp-last-texel, 6/7=border).
     uint32_t mag_filter = 1, min_filter = 1, mip_filter = 0;
     uint32_t addr_uvw[3] = {2, 2, 2};
+    // Remaining S# sampler fields (#262). Defaults reproduce the current Vulkan sampler exactly (border
+    // transparent-black, LOD 0..0, no bias), so FrameResources built directly by tests are byte-identical.
+    uint32_t border_color_type = 0;
+    float    min_lod = 0.0f, max_lod = 0.0f, lod_bias = 0.0f;
     // T# DST_SEL channel swizzle (SQ_SEL per channel: 0=0,1=1,4=R,5=G,6=B,7=A). Default = identity
     // (R,G,B,A) == a no-op VkComponentMapping, so tests that build FrameResources directly are unchanged.
     uint32_t swizzle[4] = {4, 5, 6, 7};
@@ -395,6 +399,21 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     sci.addressModeU = vkaddr(r.addr_uvw[0]);
                     sci.addressModeV = vkaddr(r.addr_uvw[1]);
                     sci.addressModeW = vkaddr(r.addr_uvw[2]);
+                    // Remaining S# fields (#262), applied where valid on this color combined-image-sampler.
+                    // Defaults (border 0 / LOD 0,0 / bias 0) reproduce the previous fixed sampler exactly.
+                    //   border color: only bites with CLAMP_TO_BORDER wrap. 3 = register/custom (needs
+                    //     VK_EXT_custom_border_color); fall back to opaque-black.
+                    //   LOD min/max/bias: honored; harmless with our single uploaded mip.
+                    // NOT applied here (need machinery the current path lacks — decoded under GFXLOG only):
+                    //   anisotropy (needs the samplerAnisotropy device feature), depth_compare_func (needs a
+                    //   depth/shadow sampler over a depth image), unnormalized coords (strict validity rules).
+                    switch (r.border_color_type) {
+                        case 1:  sci.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK; break;
+                        case 2:  sci.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE; break;
+                        case 3:  sci.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK; break;   // custom unsupported
+                        default: sci.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK; break;
+                    }
+                    sci.minLod = r.min_lod; sci.maxLod = r.max_lod; sci.mipLodBias = r.lod_bias;
                     vkCreateSampler(dev, &sci, nullptr, &v.tsamp[i]);
                     VkDeviceSize tbytes = (VkDeviceSize)r.tw * r.th * 4;
                     VkBufferCreateInfo stci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; stci.size = tbytes; stci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;

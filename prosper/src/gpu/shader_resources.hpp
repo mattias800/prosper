@@ -105,6 +105,29 @@ struct ShaderResource {
     uint32_t      mip_filter        = 0;
     uint32_t      addr_uvw[3]       = {2, 2, 2};
 
+    // Remaining SQ_IMG_SAMP fields (#262). Defaults reproduce the current Vulkan sampler exactly, so a
+    // texture whose S# we cannot resolve — and every render test that fills a ShaderResource directly —
+    // is byte-identical. Applied where valid on the current color combined-image-sampler path; the three
+    // that need extra machinery (depth-compare, unnormalized, anisotropy) are decoded but NOT applied yet
+    // (see the render-runner sampler site for why each is gated).
+    //   border_color_type:  WORD3[31:30] SQ_TEX_BORDER_COLOR (0=transparent-black,1=opaque-black,
+    //                       2=opaque-white,3=register/custom). Only affects CLAMP_TO_BORDER wrap.
+    //   min_lod/max_lod:    WORD1 [11:0]/[23:12], unsigned u4.8 (raw/256.0). LOD clamp.
+    //   lod_bias:           WORD2 [13:0], signed s5.8 (sign-extended raw/256.0). mip LOD bias.
+    //   max_aniso_ratio:    WORD0 [11:9] enum (maxAnisotropy = 1<<ratio). NEEDS the samplerAnisotropy
+    //                       device feature — decoded only.
+    //   depth_compare_func: WORD0 [14:12] SQ compare enum for shadow/PCF samplers. NEEDS a depth/shadow
+    //                       sampling path (our images are color UNORM) — decoded only.
+    //   unnormalized:       WORD0 [15] FORCE_UNNORMALIZED. NEEDS strict validity (no mips, equal filters,
+    //                       clamp addressing, minLod=maxLod=0) — decoded only.
+    uint32_t      border_color_type = 0;
+    float         min_lod           = 0.0f;
+    float         max_lod           = 0.0f;
+    float         lod_bias          = 0.0f;
+    uint32_t      max_aniso_ratio   = 0;
+    uint32_t      depth_compare_func = 0;
+    uint32_t      unnormalized      = 0;
+
     // T# DST_SEL channel swizzle (SQ_SEL enum per channel: 0=0,1=1,4=R,5=G,6=B,7=A). Applied as a Vulkan
     // component-mapping on the sampled view so a non-identity surface (e.g. BGRA order, or an alpha-only
     // mask) reads correctly. Default = identity (R,G,B,A). NOT applied on the narrow R->RGBA replication

@@ -260,10 +260,27 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                         r.addr_uvw[0] = (sm[0] >> 0) & 0x7u;
                         r.addr_uvw[1] = (sm[0] >> 3) & 0x7u;
                         r.addr_uvw[2] = (sm[0] >> 6) & 0x7u;
+                        // Remaining SQ_IMG_SAMP fields (#262). WORD0: MAX_ANISO_RATIO[11:9],
+                        // DEPTH_COMPARE_FUNC[14:12], FORCE_UNNORMALIZED[15]. WORD1: MIN_LOD[11:0],
+                        // MAX_LOD[23:12] (u4.8). WORD2: LOD_BIAS[13:0] (s5.8, signed). WORD3:
+                        // BORDER_COLOR_TYPE[31:30]. CONFIDENCE: HIGH (standard GCN/RDNA2 SQ_IMG_SAMP layout).
+                        r.max_aniso_ratio    = (sm[0] >> 9)  & 0x7u;
+                        r.depth_compare_func = (sm[0] >> 12) & 0x7u;
+                        r.unnormalized       = (sm[0] >> 15) & 0x1u;
+                        r.min_lod            = (float)( sm[1]        & 0xFFFu) / 256.0f;
+                        r.max_lod            = (float)((sm[1] >> 12) & 0xFFFu) / 256.0f;
+                        int32_t bias14       = (int32_t)(sm[2] & 0x3FFFu);
+                        if (bias14 & 0x2000) bias14 -= 0x4000;           // sign-extend the 14-bit s5.8
+                        r.lod_bias           = (float)bias14 / 256.0f;
+                        r.border_color_type  = (sm[3] >> 30) & 0x3u;
                         if (getenv("PROSPER_GFXLOG"))
-                            fprintf(stderr, "[s#] slot%u mag=%u min=%u mip=%u addr=%u,%u,%u | raw %08x %08x %08x %08x\n",
+                            fprintf(stderr, "[s#] slot%u mag=%u min=%u mip=%u addr=%u,%u,%u | aniso=%u cmp=%u unnorm=%u "
+                                    "lod=[%.3f,%.3f] bias=%.3f border=%u | raw %08x %08x %08x %08x\n",
                                     slot, r.mag_filter, r.min_filter, r.mip_filter,
-                                    r.addr_uvw[0], r.addr_uvw[1], r.addr_uvw[2], sm[0], sm[1], sm[2], sm[3]);
+                                    r.addr_uvw[0], r.addr_uvw[1], r.addr_uvw[2],
+                                    r.max_aniso_ratio, r.depth_compare_func, r.unnormalized,
+                                    r.min_lod, r.max_lod, r.lod_bias, r.border_color_type,
+                                    sm[0], sm[1], sm[2], sm[3]);
                     }
                 }
             }
