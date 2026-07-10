@@ -380,8 +380,93 @@ HLE(s_npuds_create) { svc_log("sceNpUniversalDataSystemCreate*", a0,a1,a2,a3,a4,
                       if (svc_ptrish(a0)) *(int32_t*)PW(a0) = 1; return 0; }
 HLE(s_npuds_ok)     { return 0; }
 
+// --- libSceNetCtl state-callback delivery — GATED EXPERIMENT (PROSPER_NETCTL_CB=1) --------------
+// Diagnostic for the DOLL loading-screen stall (docs/DOLL_LOADING_PROGRESSION.md): DOLL registers
+// a NetCtl state callback once at boot (sceNetCtlRegisterCallback) and then pumps
+// sceNetCtlCheckCallback EXACTLY once per frame forever (14,191 calls in a 240 s run — the
+// per-frame call-count signature). On real hardware CheckCallback invokes the registered callback
+// on the calling thread with the current state — an offline console still delivers an immediate
+// DISCONNECTED — and the boot flow proceeds down its offline path. Our unimplemented stubs never
+// deliver ANY state, so the game can never finish its network/update check step.
+//
+// This experiment implements the minimal real contract: Register records {func,arg} and writes the
+// callback id; CheckCallback invokes the callback ONCE with SCE_NET_CTL_EVENT_TYPE_DISCONNECTED
+// (PS4-inherited constant = 1; identical export names on PS5 3.20 — CONFIDENCE MED on the PS5
+// value). The callback is guest code: under PROSPER_GUEST_FS the HLE runs on the HOST %fs (the
+// import swap-stub switched), so the guest callback must run with the GUEST %fs restored or its
+// TLS accesses (UE MallocBinned caches!) read host TLS garbage. The swap-stub saves the guest fs
+// base in its frame (push r11), so an asm entry shim (the f_apr_read_submit_entry pattern) hands
+// the handler its entry %rsp: [rsp]=ret-to-stub, [+8/+0x10]=re-pushed args7/8, [+0x18]=guest fs,
+// [+0x20]=guest RA. A [rsp] outside the stub region [0x6_0000_0000,0x7_0000_0000) means the
+// host-context tail-jmp path (no swap happened) — call the callback on the current fs.
+// Registration is gated on the env var so the default boot is bit-identical. CONFIDENCE: HIGH on
+// the mechanism, MED on the event constant.
+#ifndef _WIN32
+namespace {
+std::atomic<uint64_t> g_netctl_cb_fn{0};
+std::atomic<uint64_t> g_netctl_cb_arg{0};
+std::atomic<int>      g_netctl_cb_delivered{0};
+inline uint64_t netctl_rd_fsbase() { uint64_t v; __asm__ volatile("rdfsbase %0" : "=r"(v)); return v; }
+inline void     netctl_wr_fsbase(uint64_t v) { __asm__ volatile("wrfsbase %0" : : "r"(v)); }
+}
+HLE(s_netctl_register_cb) {   // (func, arg, int* cid)
+    svc_log("sceNetCtlRegisterCallback", a0,a1,a2,a3,a4,a5);
+    g_netctl_cb_fn.store(a0);
+    g_netctl_cb_arg.store(a1);
+    if (svc_ptrish(a2)) *(int32_t*)PW(a2) = 1;   // callback id (Kyty Network.cpp NetCtlRegisterCallback)
+    return 0;
+}
+// sceNetCtlGetState(int* state): 0 = DISCONNECTED (Kyty Network.cpp:1398 writes exactly this).
+// Run-7 live capture: the game calls this for the FIRST time immediately after the DISCONNECTED
+// callback delivery — the unimplemented success+garbage-out answer is what re-wedged the flow.
+HLE(s_netctl_getstate) {
+    svc_log("sceNetCtlGetState", a0,a1,a2,a3,a4,a5);
+    if (svc_ptrish(a0)) *(int32_t*)PW(a0) = 0;   // SCE_NET_CTL_STATE_DISCONNECTED
+    return 0;
+}
+extern "C" uint64_t s_netctl_check_cb_c(uint64_t a0, uint64_t a1, uint64_t a2,
+                                        uint64_t a3, uint64_t a4, uint64_t a5,
+                                        uint64_t entry_rsp);
+asm(".text\n"
+    ".globl s_netctl_check_cb_entry\n"
+    ".type s_netctl_check_cb_entry,@function\n"
+    "s_netctl_check_cb_entry:\n"
+    "  movq %rsp, %rax\n"
+    "  pushq %rax\n"
+    "  call s_netctl_check_cb_c\n"
+    "  addq $8, %rsp\n"
+    "  ret\n");
+extern "C" void s_netctl_check_cb_entry();
+extern "C" uint64_t s_netctl_check_cb_c(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                                        uint64_t entry_rsp) {
+    uint64_t fn = g_netctl_cb_fn.load();
+    if (!fn || g_netctl_cb_delivered.exchange(1)) return 0;   // deliver the initial state exactly once
+    uint64_t shim_ret = entry_rsp ? *(uint64_t*)entry_rsp : 0;
+    uint64_t guest_fs = 0;
+    if (shim_ret >= 0x600000000ull && shim_ret < 0x700000000ull)
+        guest_fs = *(uint64_t*)(entry_rsp + 0x18);            // the swap-stub's saved r11
+    uint64_t host_fs = 0;
+    if (guest_fs) { host_fs = netctl_rd_fsbase(); netctl_wr_fsbase(guest_fs); }
+    ((void (*)(int, void*))(uintptr_t)fn)(1 /*SCE_NET_CTL_EVENT_TYPE_DISCONNECTED*/,
+                                          (void*)(uintptr_t)g_netctl_cb_arg.load());
+    if (guest_fs) netctl_wr_fsbase(host_fs);
+    fprintf(stderr, "[svc] NetCtl state callback DELIVERED (eventType=DISCONNECTED, guest_fs=%d)\n",
+            guest_fs ? 1 : 0);
+    return 0;
+}
+#endif
+
 void register_service_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
+#ifndef _WIN32
+    // NetCtl state delivery experiment (see block comment above). Default OFF: without the env the
+    // NIDs stay unimplemented (their current behavior).
+    if (getenv("PROSPER_NETCTL_CB")) {
+        R("sceNetCtlRegisterCallback", s_netctl_register_cb);      // UJ+Z7Q+4ck0
+        R("sceNetCtlCheckCallback",    s_netctl_check_cb_entry);   // iQw3iQPhvUQ
+        R("sceNetCtlGetState",         s_netctl_getstate);         // uBPlr0lbuiI
+    }
+#endif
     // NpTrophy2: the config/info queries whose success-with-garbage-out crashed DOLL (see above).
     Hle::register_fn("4IzqhhUQ3nk", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetGameInfo");
     Hle::register_fn("y3zHpdZO6ME", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetTrophyInfoArray");

@@ -6,7 +6,7 @@ WT=/mnt/c/Users/matti/repos/ps5ys/.claude/worktrees/agent-aa922b2bc59375888
 cp -f "$WT/prosper/build-linux/boot_trace" /root/bt_diag
 BT=/root/bt_diag
 DUMP=/root/PPSA17942-app0
-DUR=${DUR:-420}
+DUR=${DUR:-180}
 LOG=/root/doll_r3.log
 SAMP=/root/doll_r3.samples
 rm -f "$LOG" "$SAMP"
