@@ -168,6 +168,20 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
         ps.stencil_op_val[1]        = PM4_FIELD(rmb, DB_STENCILREFMASK_BF, STENCILOPVAL_BF);
         ps.stencil_compare_mask[1]  = PM4_FIELD(rmb, DB_STENCILREFMASK_BF, STENCILMASK_BF);
         ps.stencil_write_mask[1]    = PM4_FIELD(rmb, DB_STENCILREFMASK_BF, STENCILWRITEMASK_BF);
+        // DB_DEPTH_CONTROL.BACKFACE_ENABLE == 0 means the FRONT state applies to BOTH faces (the _BF
+        // registers are ignored). Sourcing back from _BF regardless left back faces with the
+        // unprogrammed _BF defaults — STENCILFUNC_BF=0 -> VK_COMPARE_OP_NEVER, dropping every back
+        // face out of a two-sided stencil pass. Match RDNA2 (Kyty GraphicsRender: else back = front). #377
+        if (PM4_FIELD(dc2, DB_DEPTH_CONTROL, BACKFACE_ENABLE) == 0) {
+            ps.stencil_compare_op[1]    = ps.stencil_compare_op[0];
+            ps.stencil_fail_op[1]       = ps.stencil_fail_op[0];
+            ps.stencil_pass_op[1]       = ps.stencil_pass_op[0];
+            ps.stencil_depth_fail_op[1] = ps.stencil_depth_fail_op[0];
+            ps.stencil_ref[1]           = ps.stencil_ref[0];
+            ps.stencil_op_val[1]        = ps.stencil_op_val[0];
+            ps.stencil_compare_mask[1]  = ps.stencil_compare_mask[0];
+            ps.stencil_write_mask[1]    = ps.stencil_write_mask[0];
+        }
     }
 
     ps.blend_enable            = rs.blend_enable;

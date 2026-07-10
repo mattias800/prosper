@@ -167,6 +167,26 @@ int main() {
         CHECK(!p4.has_clear_color, "unmapped format fast-clear -> has_clear_color false (black fallback)");
     }
 
+    // #377: DB_DEPTH_CONTROL.BACKFACE_ENABLE=0 -> front stencil state applies to BOTH faces. Back must
+    // NOT read the (unprogrammed) _BF regs, which would give STENCILFUNC_BF=0 -> NEVER and drop back faces.
+    {
+        RenderState s{};
+        s.stencil_enable    = true;
+        s.db_depth_control  = (1u << 0) | (4u << 8);   // STENCIL_ENABLE | STENCILFUNC=GREATER(4), BACKFACE_ENABLE=0
+        s.db_stencil_control = 0x2;                     // some front op; _BF fields left 0
+        s.db_stencilrefmask  = 0x1234;                 // front ref/mask; _BF left 0
+        ResolvedPipelineState p = resolve_pipeline_state(s);
+        CHECK(p.stencil_compare_op[0] == 4u, "front stencil func = GREATER(4)");
+        CHECK(p.stencil_compare_op[1] == p.stencil_compare_op[0],
+              "BACKFACE_ENABLE=0: back stencil func mirrors front (not NEVER from unprogrammed _BF)");
+        CHECK(p.stencil_ref[1] == p.stencil_ref[0] && p.stencil_compare_mask[1] == p.stencil_compare_mask[0],
+              "BACKFACE_ENABLE=0: back ref/mask mirror front");
+        s.db_depth_control |= (1u << 7);               // BACKFACE_ENABLE=1 -> back independent (from _BF=0 -> NEVER)
+        ResolvedPipelineState p2 = resolve_pipeline_state(s);
+        CHECK(p2.stencil_compare_op[1] != p2.stencil_compare_op[0],
+              "BACKFACE_ENABLE=1: back stencil is independent from front (_BF sourced)");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
