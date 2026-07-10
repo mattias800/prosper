@@ -8,7 +8,9 @@
 // Standard S3TC/BPTC decode (Khronos data-format spec §18-19, MS D3D11 §19.5): a 4x4-texel block is
 // 8 bytes (BC1/BC4) or 16 bytes (BC2/BC3/BC5/BC6/BC7). Implemented: BC1/BC2/BC3 (Messenger UI/text),
 // BC4/BC5 (single/dual-channel ramps) and BC7 (mode-switched; DOLL's material atlases) — #290.
-// BC6H (HDR half-float) is NOT decoded yet; bc_decode_surface returns false for it.
+// BC6H UF16 (HDR half-float; DOLL's title skybox/probes, #273) decodes too — then CLAMPS to
+// UNORM8, losing >1.0 energy like the fp16-surface path. SIGNED variants (BC4/5 SNORM, BC6H SF16)
+// stay skipped upstream.
 #pragma once
 #include <cstdint>
 #include "shader_resources.hpp"

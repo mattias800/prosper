@@ -74,6 +74,16 @@ void decode_operands(Rdna2Inst& i) {
                         i.sdwa_src0_sel = (uint8_t)s0sel;
                         i.has_modifier = false;
                     }
+                    // BYTE-select move (#273 — byte unpack): dst DWORD + UNUSED_PAD, src0 BYTE_0..3,
+                    // no sext/neg/abs/clamp/omod. The recompiler zero-extends the selected byte.
+                    // (llvm-mc gfx1030: 0x7e0c02f9 0x0000060f -> v_mov_b32_sdwa v6, v15
+                    // dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0.)
+                    else if (dsel == 6u && dun == 0u && s0sel <= 3u &&
+                             !((sd >> 19) & 0x9u) && !i.clamp && !i.omod && !i.src_neg[0] && !i.src_abs[0]) {
+                        i.sdwa_dst_sel = (uint8_t)dsel; i.sdwa_dst_unused = (uint8_t)dun;
+                        i.sdwa_src0_sel = (uint8_t)s0sel;
+                        i.has_modifier = false;
+                    }
                 }
             } else if (i.has_dpp) { i.src[0] = vgpr(i.words[1]); i.n_src = 1; }   // DPP16: real SRC0 in dw1[7:0]
             else { i.src[0] = decode_src_field(w & 0x1FFu); i.n_src = 1; }
@@ -170,7 +180,22 @@ void decode_operands(Rdna2Inst& i) {
             i.src[0] = decode_src_field(d1 & 0x1FFu);
             i.src[1] = decode_src_field((d1 >> 9) & 0x1FFu);
             i.src[2] = decode_src_field((d1 >> 18) & 0x1FFu); i.n_src = 3;
-            if (((w >> 8) & 0xFFu) != 0u || ((d1 >> 27) & 0x1Fu) != 0u) i.has_modifier = true;
+            // v_fma_mix_f32/mixlo/mixhi (0x20-0x22): every modifier bit is MODELED (#273) —
+            // OPSEL_HI[k] selects an f16-half read (which half via OPSEL[k]), NEG negates, NEG_HI
+            // is ABS for the mix family, CLAMP saturates. (llvm-mc gfx1030 round-trip on the live
+            // DOLL bytes: 0xcc200044 0x9a02170b = v_fma_mix_f32 v68, v11, v11, neg(0)
+            // op_sel_hi:[1,1,0].) Other VOP3P ops (v_pk_*, per-half packed semantics) still reject
+            // on any modifier bit.
+            if (i.opcode >= 0x20 && i.opcode <= 0x22) {
+                const uint32_t neg = (d1 >> 29) & 7u, neg_hi = (w >> 8) & 7u;
+                for (int k = 0; k < 3; k++) {
+                    i.src_neg[k] = ((neg >> k) & 1u) != 0;
+                    i.src_abs[k] = ((neg_hi >> k) & 1u) != 0;
+                }
+                i.vop3p_opsel    = (uint8_t)((w >> 11) & 7u);
+                i.vop3p_opsel_hi = (uint8_t)((((d1 >> 27) & 3u)) | (((w >> 14) & 1u) << 2));
+                i.clamp = ((w >> 15) & 1u) != 0;
+            } else if (((w >> 8) & 0xFFu) != 0u || ((d1 >> 27) & 0x1Fu) != 0u) i.has_modifier = true;
             break;
         }
         case Rdna2Format::SOP1:

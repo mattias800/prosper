@@ -960,6 +960,12 @@ struct RegState {
     // scalar: vgpr -> lane -> SSA id. A vgpr used as a spill array must never be read as ordinary
     // per-lane data — operand_bits rejects that (fail-visible), keeping the model honest.
     std::unordered_map<int, std::unordered_map<int, uint32_t>> vgpr_lane_slots;
+    // LDS ADDTID per-lane spill slots (#273 — DOLL's title post PSes): `s_movk m0, K;
+    // ds_write_addtid_b32 vN` spills THIS lane's vN to LDS[M0 + offset + tid*4], and the matching
+    // `ds_read_addtid_b32` reloads it. Per-invocation the slot is one value, keyed by the M0 SSA id
+    // + the instruction offset (uconst is interned, so equal constant M0s share one id). A read of a
+    // never-written slot rejects (fail-visible).
+    std::unordered_map<uint64_t, uint32_t> lds_addtid;
 };
 
 // Predicate a just-computed VGPR write against EXEC: under a narrowed mask, inactive lanes keep their
@@ -1643,7 +1649,7 @@ void loop_written_regs(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t 
                 if (in.opcode == 0x360) sregs.insert(in.dst.value);       // v_readlane -> SGPR
                 else vregs.insert(in.dst.value); break;                   // (writelane: slots, not SSA)
             case Rdna2Format::DS:                                          // ds_read writes one VGPR
-                if (in.opcode == 0x36) vregs.insert(in.dst.value); break;
+                if (in.opcode == 0x36 || in.opcode == 0xb1) vregs.insert(in.dst.value); break;
             case Rdna2Format::MUBUF: {                                     // load_format/load: N consecutive VGPRs
                 uint32_t n = 1; switch (in.opcode) { case 0x1: case 0x5: case 0xD: n=2; break;
                     case 0x2: case 0x6: case 0xF: n=3; break; case 0x3: case 0x7: case 0xE: n=4; break; }
@@ -1975,7 +1981,21 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // v_fma_mixlo_f16 v0, 1.0, v0, v5 — the live blur bytes).
             if (in.opcode != 0x20 && in.opcode != 0x21 && in.opcode != 0x22) { ok = false; return true; }
             uint32_t old_d = vreg_old(b, rs, in.dst.value);
-            uint32_t r = b.fbin(Op_FAdd, b.fbin(Op_FMul, val(in.src[0]), val(in.src[1])), val(in.src[2]));
+            // Per-source mix resolve (#273): OPSEL_HI[k] -> f16 half (OPSEL[k]: 0=lo,1=hi) converted
+            // to f32; else full f32. An inline constant is already a full-width value, so the half
+            // select is a no-op for it (hardware reads the f16-converted constant — same value).
+            // NEG_HI = abs, NEG = negate (abs first, hardware order).
+            auto mixv = [&](int k) -> uint32_t {
+                uint32_t v = val(in.src[k]);
+                const bool half = (in.vop3p_opsel_hi >> k) & 1u;
+                if (half && in.src[k].kind != OperandKind::InlineFloat && in.src[k].kind != OperandKind::InlineInt)
+                    v = b.unpack_half(v, (in.vop3p_opsel >> k) & 1u);
+                if (in.src_abs[k]) v = b.fext1(Glsl_FAbs, v);
+                if (in.src_neg[k]) v = b.fbin(Op_FSub, b.uconst(0), v);
+                return v;
+            };
+            uint32_t r = b.fbin(Op_FAdd, b.fbin(Op_FMul, mixv(0), mixv(1)), mixv(2));
+            if (in.clamp) r = b.fext2(Glsl_FMax, b.fext2(Glsl_FMin, r, b.uconst(fbits(1.0f))), b.uconst(fbits(0.0f)));
             uint32_t& d = rs.vreg[in.dst.value];
             if (in.opcode == 0x20) d = r;
             else if (in.opcode == 0x21)
@@ -2069,6 +2089,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 predicate_write(b, rs, in.dst.value, old_d);
                 return true;
             }
+            // BYTE-select v_mov_b32_sdwa (#273 — DOLL's title post PSes unpack a packed dword:
+            // `v_mov_b32_sdwa v6, v15 src0_sel:BYTE_0`): dst is the whole dword (UNUSED_PAD), so the
+            // result is the selected byte zero-extended.
+            if (in.opcode == 0x01 && in.sdwa_dst_sel == 6 && in.sdwa_src0_sel <= 3) {
+                d = b.bfe_u(a, b.uconst(8u * in.sdwa_src0_sel), b.uconst(8));
+                predicate_write(b, rs, in.dst.value, old_d);
+                return true;
+            }
             switch (in.opcode) {
                 case 0x00: return true;                              // v_nop — no-op (writes nothing; common
                                                                      // scheduling/hazard filler in real shaders)
@@ -2077,6 +2105,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x06: d = b.cvt_u2f(a); break;                   // v_cvt_f32_u32
                 case 0x07: d = b.cvt_f2u(a); break;                   // v_cvt_u32_f32
                 case 0x08: d = b.cvt_f2i(a); break;                   // v_cvt_i32_f32
+                // f16<->f32 converts (#273 — DOLL's title post PSes carry f16 intermediates):
+                // v_cvt_f16_f32 packs into the LOW half (high bits zero); v_cvt_f32_f16 unpacks the
+                // low half. VERIFIED(round-trip llvm-mc gfx1030: 0x0a/0x0b).
+                case 0x0A: d = b.pack_half_lo(a); break;              // v_cvt_f16_f32
+                case 0x0B: d = b.unpack_half(a, 0); break;            // v_cvt_f32_f16
                 case 0x20: d = b.fext1(Glsl_Fract, a); break;         // v_fract_f32
                 case 0x21: d = b.fext1(Glsl_Trunc, a); break;         // v_trunc_f32
                 case 0x22: d = b.fext1(Glsl_Ceil, a); break;          // v_ceil_f32
@@ -2125,7 +2158,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // opcodes only (mirrors the VOP2/VOP3 fresult path; DOLL VS: `v_exp_f32_sdwa … clamp`).
             // A modifier on a non-float-result op would silently drop — reject loudly instead.
             if (ok && (in.omod || in.clamp)) switch (in.opcode) {
-                case 0x05: case 0x06: case 0x20: case 0x21: case 0x22: case 0x23: case 0x24:
+                case 0x05: case 0x06: case 0x0B: case 0x20: case 0x21: case 0x22: case 0x23: case 0x24:
                 case 0x25: case 0x27: case 0x2A: case 0x2B: case 0x2E: case 0x33: case 0x35: case 0x36:
                     if      (in.omod == 1) d = b.fbin(Op_FMul, d, b.uconst(fbits(2.0f)));
                     else if (in.omod == 2) d = b.fbin(Op_FMul, d, b.uconst(fbits(4.0f)));
@@ -2249,7 +2282,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             return true;
         }
         case Rdna2Format::VOPC: {                                     // v_cmp_* -> VCC; v_cmpx_* also -> EXEC
-            uint32_t a = val(in.src[0]), c = val(in.src[1]);
+            const uint32_t ra = val(in.src[0]), rc = val(in.src[1]);  // raw bits (f16 compares re-derive)
+            uint32_t a = ra, c = rc;
             // Float source modifiers (abs then neg — hardware order), set only on FLOAT compares by the
             // assembler (VOP3-encoded e64 or SDWA forms; e.g. DOLL's `v_cmp_gt_f32_sdwa vcc, |v5|, s4`).
             if (in.src_abs[0]) a = b.fext1(Glsl_FAbs, a);
@@ -2290,6 +2324,33 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0xC4: cmp = b.ucmp(Op_UGreaterThan, a, c); break;         // v_cmp_gt_u32
                 case 0xC5: cmp = b.ucmp(Op_INotEqual, a, c); break;            // v_cmp_ne_u32
                 case 0xC6: cmp = b.ucmp(Op_UGreaterThanEqual, a, c); break;    // v_cmp_ge_u32
+                // f16 compares (0xC8-0xCF; cmpx at +0x10 = 0xD8-0xDF folds here too — DOLL's title
+                // post PSes: `v_cmp_lt_f16_sdwa s6, 0, v7`). VERIFIED(round-trip llvm-mc gfx1030:
+                // v_cmp_lt/eq/le/gt/lg/ge_f16 = VOPC 0xC9-0xCE). The f16 value lives in the source's
+                // LOW half — unpack to f32 and compare there (exact: f16 order-embeds into f32); an
+                // inline FLOAT constant is already an f32 value, so it is used directly. abs/neg
+                // modifiers are applied after conversion (equivalent, conversion is monotone/exact).
+                case 0xC9: case 0xCA: case 0xCB: case 0xCC: case 0xCD: case 0xCE: {
+                    auto f16v = [&](int k, uint32_t raw) -> uint32_t {
+                        uint32_t v = (in.src[k].kind == OperandKind::InlineFloat ||
+                                      in.src[k].kind == OperandKind::InlineInt)
+                                         ? raw                       // inline: already a full-width value
+                                         : b.unpack_half(raw, 0);    // register/literal: f16 in the low half
+                        if (in.src_abs[k]) v = b.fext1(Glsl_FAbs, v);
+                        if (in.src_neg[k]) v = b.fbin(Op_FSub, b.uconst(0), v);
+                        return v;
+                    };
+                    uint32_t ha = f16v(0, ra), hc = f16v(1, rc);
+                    switch (eff) {
+                        case 0xC9: cmp = b.fcmp(Op_FOrdLessThan, ha, hc); break;          // v_cmp_lt_f16
+                        case 0xCA: cmp = b.fcmp(Op_FOrdEqual, ha, hc); break;             // v_cmp_eq_f16
+                        case 0xCB: cmp = b.fcmp(Op_FOrdLessThanEqual, ha, hc); break;     // v_cmp_le_f16
+                        case 0xCC: cmp = b.fcmp(Op_FOrdGreaterThan, ha, hc); break;       // v_cmp_gt_f16
+                        case 0xCD: cmp = b.fcmp(Op_FOrdNotEqual, ha, hc); break;          // v_cmp_lg_f16
+                        default:   cmp = b.fcmp(Op_FOrdGreaterThanEqual, ha, hc); break;  // v_cmp_ge_f16
+                    }
+                    break;
+                }
                 default: ok = false;
             }
             // A compare result is a per-lane mask. The e64/SDWAB form can target an SGPR pair (SDST)
@@ -2380,6 +2441,48 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 uint32_t lo = b.uext2(Glsl_UMin, val(in.src[0]), b.uconst(0xFFFFu));
                 uint32_t hi = b.uext2(Glsl_UMin, val(in.src[1]), b.uconst(0xFFFFu));
                 vreg[in.dst.value] = b.ibin(Op_BitwiseOr, lo, b.ibin(Op_ShiftLeftLogical, hi, b.uconst(16)));
+            } else if (in.opcode >= 0x144 && in.opcode <= 0x147) {
+                // Cubemap coordinate ops (#273 — DOLL's title post PSes' reflection-probe math):
+                // v_cubeid_f32 (0x144) face id, v_cubesc_f32 (0x145) S numerator, v_cubetc_f32
+                // (0x146) T numerator, v_cubema_f32 (0x147) 2*major-axis. Src order (x, y, z);
+                // face-major selection per the AMD ISA / GL cubemap convention:
+                //   |z|>=|x| && |z|>=|y| : id = z<0?5:4  sc = z<0?-x:x  tc = -y      ma = 2z
+                //   else |y|>=|x|        : id = y<0?3:2  sc = x         tc = z<0.. = y<0?-z...
+                //   (see per-op emission below)
+                // VERIFIED(round-trip llvm-mc gfx1030: 0xd544-0xd547). Execution-tested (kernel in
+                // test_rdna2_to_spirv) against the GL major-axis table. CONFIDENCE: MED.
+                uint32_t x = fv(0), y = fv(1), z = fv(2);
+                uint32_t ax = b.fext1(Glsl_FAbs, x), ay = b.fext1(Glsl_FAbs, y), az = b.fext1(Glsl_FAbs, z);
+                uint32_t zmaj = b.land(b.fcmp(Op_FOrdGreaterThanEqual, az, ax),
+                                       b.fcmp(Op_FOrdGreaterThanEqual, az, ay));
+                uint32_t ymaj = b.fcmp(Op_FOrdGreaterThanEqual, ay, ax);      // (only used when !zmaj)
+                uint32_t zneg = b.fcmp(Op_FOrdLessThan, z, b.uconst(0));
+                uint32_t yneg = b.fcmp(Op_FOrdLessThan, y, b.uconst(0));
+                uint32_t xneg = b.fcmp(Op_FOrdLessThan, x, b.uconst(0));
+                auto fneg = [&](uint32_t v) { return b.fbin(Op_FSub, b.uconst(0), v); };
+                uint32_t r2;
+                switch (in.opcode) {
+                    case 0x144: {   // face id: z-major 4/5, y-major 2/3, x-major 0/1 (negative = +1)
+                        uint32_t idz = b.sel(zneg, b.uconst(fbits(5.0f)), b.uconst(fbits(4.0f)));
+                        uint32_t idy = b.sel(yneg, b.uconst(fbits(3.0f)), b.uconst(fbits(2.0f)));
+                        uint32_t idx2 = b.sel(xneg, b.uconst(fbits(1.0f)), b.uconst(fbits(0.0f)));
+                        r2 = b.sel(zmaj, idz, b.sel(ymaj, idy, idx2)); break;
+                    }
+                    case 0x145: {   // sc: z-major: z<0 ? -x : x; y-major: x; x-major: x<0 ? z : -z
+                        uint32_t scz = b.sel(zneg, fneg(x), x);
+                        uint32_t scx = b.sel(xneg, z, fneg(z));
+                        r2 = b.sel(zmaj, scz, b.sel(ymaj, x, scx)); break;
+                    }
+                    case 0x146: {   // tc: z-major: -y; y-major: y<0 ? -z : z; x-major: -y
+                        uint32_t tcy = b.sel(yneg, fneg(z), z);
+                        r2 = b.sel(zmaj, fneg(y), b.sel(ymaj, tcy, fneg(y))); break;
+                    }
+                    default: {      // 0x147 ma: 2 * major axis (signed)
+                        uint32_t maj = b.sel(zmaj, z, b.sel(ymaj, y, x));
+                        r2 = b.fbin(Op_FMul, b.uconst(fbits(2.0f)), maj); break;
+                    }
+                }
+                vreg[in.dst.value] = fresult(r2);
             } else if (in.opcode == 0x143) {                          // v_mad_u32_u24 = (s0&0xFFFFFF)*(s1&0xFFFFFF)+s2
                 uint32_t m24 = b.uconst(0xFFFFFF);
                 uint32_t p = b.ibin(Op_IMul, b.ibin(Op_BitwiseAnd, val(in.src[0]), m24),
@@ -2704,11 +2807,21 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (rt) {
                     // PER-FETCH first: a reloaded SRSRC holds a different V# per attribute, so match this
                     // exact fetch instruction's pc; fall back to the SGPR (direct) then s_load SRT tag.
+                    // Only a VERTEX-buffer pc entry implies the vertex-index address model — a pc-keyed
+                    // CONSTANT/structured buffer (a PS's per-lane table fetch, #273) keeps the faithful
+                    // VADDR*stride+offset address below.
                     res = rt->by_fetch_pc(in.pc);
-                    if (res) dyn_vfetch = true;
+                    if (res) dyn_vfetch = (res->cls == ResourceClass::VertexBuffer);
                     if (!res) res = rt->by_sgpr_base_cls(in.src[1].value, ResourceClass::VertexBuffer);
                     if (!res) { auto it = rs.sreg_srt.find(in.src[1].value);
                         if (it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second); }
+                    // DIRECT user-data V# of any class (#273 — DOLL's title post PSes format-fetch
+                    // through a V# the metadata labels a CONSTANT buffer sharp at s[24:27]): the class
+                    // label doesn't change the descriptor's fields. Only when the SGPR was never
+                    // REWRITTEN in-shader (no rs.sreg entry) — a reloaded register no longer holds the
+                    // seed-time sharp, and trusting it would fetch through a stale descriptor.
+                    if (!res && rs.sreg.find(in.src[1].value) == rs.sreg.end())
+                        res = rt->by_sgpr_base(in.src[1].value);
                 }
                 if (!res) {
                     if (getenv("PROSPER_DBG")) {   // which provenance step failed for this format load
@@ -2782,6 +2895,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // from the address terms and REJECT the packed load/store when it can't be proven (surfacing
             // the gap) rather than silently mis-decode. Aligned iff: inst offset %4==0; stride %4==0
             // when idxen; no offen (a runtime per-lane byte offset is unprovable); SOFFSET is NULL/0.
+            bool dyn_half = false;   // 16-bit element at a runtime dword half (stride-2 buffers, #273)
             if (packed) {
                 bool base_aligned;
                 if (dyn_vfetch) {
@@ -2800,10 +2914,22 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                    (!idxen || (stride & 3u) == 0) && soff_zero;
                 }
                 if (!base_aligned) {
-                    if (getenv("PROSPER_DBG"))
-                        fprintf(stderr, "[mubuf-unaligned] pc=%u fmt=%u off=%u offen=%d idxen=%d stride=%u\n",
-                                in.pc, (unsigned)fmt, offset, (int)offen, (int)idxen, stride);
-                    ok = false; return true;
+                    // HALFWORD-ALIGNED single-component 16-bit load (#273 — DOLL's title post PSes
+                    // fetch from a STRIDE-2 uint16 table: `buffer_load_format_x v, vIDX, V#` with
+                    // stride 2). The element sits at a RUNTIME dword half — bit offset (addr&2)*8 —
+                    // which never straddles a dword, so extract it dynamically instead of rejecting.
+                    // Provable iff every address term is 2-aligned and there is no per-lane byte
+                    // offset (offen). Loads only (the packed store path still rejects sub-dword ints).
+                    bool soff_zero = (in.src[2].kind == OperandKind::Special && in.src[2].value == 125) ||
+                                     (in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0);
+                    dyn_half = !is_store && n == 1 && comp_bytes == 2 && !offen && !dyn_vfetch &&
+                               (offset & 1u) == 0 && (!idxen || (stride & 1u) == 0) && soff_zero;
+                    if (!dyn_half) {
+                        if (getenv("PROSPER_DBG"))
+                            fprintf(stderr, "[mubuf-unaligned] pc=%u fmt=%u off=%u offen=%d idxen=%d stride=%u\n",
+                                    in.pc, (unsigned)fmt, offset, (int)offen, (int)idxen, stride);
+                        ok = false; return true;
+                    }
                 }
             }
             // Byte address of the element (#148): idxen -> a VADDR VGPR is an element index (×stride);
@@ -2871,6 +2997,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (!packed) {
                     uint32_t kidx = k ? b.ibin(Op_IAdd, idx, b.uconst(k)) : idx;
                     value = b.cbuf_load(kidx, binding);                  // raw 32-bit component
+                } else if (dyn_half) {
+                    // Runtime dword half (n==1, 16-bit element, 2-aligned address): shift the loaded
+                    // dword right by (addr&2)*8 and decode the 16-bit field at bit 0.
+                    uint32_t dw   = b.cbuf_load(idx, binding);
+                    uint32_t boff = b.ibin(Op_ShiftLeftLogical, b.ibin(Op_BitwiseAnd, addr, b.uconst(2)), b.uconst(3));
+                    uint32_t dws  = b.ibin(Op_ShiftRightLogical, dw, boff);
+                    value = is_half ? b.unpack_half(dws, 0)
+                          : is_uint ? b.bfe_u(dws, b.uconst(0), b.uconst(16))
+                          : is_sint ? b.bfe_s(dws, b.uconst(0), b.uconst(16))
+                                    : b.unpack_norm(dws, 0, 16, is_snorm, norm);
                 } else {
                     // Component k lives at byte k*comp_bytes within the element: pick its dword + field.
                     uint32_t byte_off = k * comp_bytes;
@@ -3056,12 +3192,33 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             return true;
         }
         case Rdna2Format::DS: {
-            // ds_write_addtid_b32 (0xb0) in a GRAPHICS stage (#273): DOLL's scene PS writes one
-            // per-lane dword to LDS (addr = M0 + tid*4) and NEVER reads LDS back anywhere in the
-            // stream — a wave-scratch spill nothing in our per-invocation model can observe. No-op
-            // it in non-compute shells; any LDS READ in a graphics stage still rejects loudly below.
-            // VERIFIED(round-trip llvm-mc gfx1010: 0xdac00000/0x00000f00 -> ds_write_addtid_b32 v15).
-            if (!b.is_compute && in.opcode == 0xb0) return true;
+            // ds_write_addtid_b32 (0xb0) / ds_read_addtid_b32 (0xb1) in a GRAPHICS stage (#273):
+            // a per-lane VGPR spill through LDS (addr = M0 + offset + tid*4) — DOLL's title post
+            // PSes spill v15 before their accumulation loop and reload it after. Per-invocation the
+            // slot is ONE value: track it in rs.lds_addtid keyed by (M0 SSA id, inst offset); the
+            // matching read returns the spilled SSA value. A write with UNTRACKED M0 still no-ops
+            // (nothing in this model can observe it) but poisons nothing; a read with untracked M0
+            // or a never-written slot rejects loudly. VERIFIED(round-trip llvm-mc gfx1010:
+            // 0xdac00000/0x00000f00 -> ds_write_addtid_b32 v15; llvm-mc gfx1030:
+            // 0xdac40000/0x0f000000 -> ds_read_addtid_b32 v15).
+            if (!b.is_compute && (in.opcode == 0xb0 || in.opcode == 0xb1)) {
+                auto m0 = rs.sreg.find(124);
+                if (in.opcode == 0xb0) {
+                    if (m0 != rs.sreg.end()) {
+                        auto vr = rs.vreg.find(in.src[1].value);
+                        rs.lds_addtid[((uint64_t)m0->second << 32) | in.literal] =
+                            vr != rs.vreg.end() ? vr->second : b.uconst(0);
+                    }
+                    return true;   // spill: unobservable beyond the tracked slot
+                }
+                if (m0 == rs.sreg.end()) { ok = false; return true; }
+                auto slot = rs.lds_addtid.find(((uint64_t)m0->second << 32) | in.literal);
+                if (slot == rs.lds_addtid.end()) { ok = false; return true; }
+                uint32_t old = vreg_old(b, rs, in.dst.value);
+                rs.vreg[in.dst.value] = slot->second;
+                predicate_write(b, rs, in.dst.value, old);
+                return true;
+            }
             // LDS (workgroup shared memory), compute-only. ds_write_b32 (0x0d) / ds_read_b32 (0x36);
             // GDS and wider widths deferred. Byte address = ADDR VGPR + inst offset; dword index = >>2.
             if (!b.is_compute || (in.opcode != 0x0d && in.opcode != 0x36)) { ok = false; return true; }

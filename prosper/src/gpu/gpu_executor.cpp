@@ -320,8 +320,14 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 if (srt_uses && (in.opcode <= 3 || (in.opcode >= 0x0C && in.opcode <= 0x0F))) {
                     int srsrc = in.src[1].value;
                     auto dit = descr.find(srsrc); auto kit = descr_key.find(srsrc);
-                    if (dit != descr.end() && kit != descr_key.end() && kit->second != 0xFFFFFFFFu) {
-                        SrtUse u; u.kind = 1; u.key = kit->second; u.v4 = dit->second;
+                    if (dit != descr.end()) {
+                        // Key-less snapshots (an s_buffer_load-fetched V# — a structured-buffer
+                        // descriptor stored INSIDE a constant buffer, DOLL's title post PSes) carry
+                        // the consuming instruction's pc instead; the recompiler resolves those via
+                        // ShaderResource::fetch_pc with the faithful (non-vertex-index) address path.
+                        SrtUse u; u.kind = 1; u.v4 = dit->second;
+                        u.key = kit != descr_key.end() ? kit->second : 0xFFFFFFFFu;
+                        u.use_pc = in.pc;
                         srt_uses->push_back(u);
                     }
                 }
@@ -608,26 +614,43 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
         {
             std::set<uint64_t> srt_seen;
             for (const auto& u : srt_uses) {
-                // Dedupe: a cbuf use per key (the s_buffer_load resolves by key); a texture use per
-                // CONSUMING INSTRUCTION (#273 — several image ops may share one key, or have none).
-                // Distinct namespaces: kind-0 pc keys must never collide with kind-1 byte-offset keys.
-                uint64_t dk = u.kind == 0 ? (0x8000000000000000ull | u.use_pc)
-                                          : ((uint64_t)(uint32_t)u.kind << 32) | u.key;
+                // Dedupe: a KEYED cbuf use per key (the s_buffer_load resolves by key); texture and
+                // key-less buffer uses per CONSUMING INSTRUCTION (#273 — several image ops may share
+                // one key, or have none; a key-less V# fetch resolves by its pc).
+                // Distinct namespaces: pc keys must never collide with byte-offset keys.
+                uint64_t dk = (u.kind == 0 || u.key == 0xFFFFFFFFu)
+                                  ? (0x8000000000000000ull | ((uint64_t)(uint32_t)u.kind << 32) | u.use_pc)
+                                  : ((uint64_t)(uint32_t)u.kind << 32) | u.key;
                 if (!srt_seen.insert(dk).second) continue;
                 bool clash = u.key == 0xFFFFFFFFu;       // key-less: never resolvable by srt_offset
                 if (!clash)
                     for (const auto& r0 : t.resources) if (r0.srt_offset == u.key) { clash = true; break; }
-                if (u.kind == 1 && clash) continue;      // ambiguous cbuf key: keep the existing resource
-                if (u.kind == 1) {                       // constant buffer (V#)
+                if (u.kind == 1) {                       // constant buffer / structured-buffer V#
                     DecodedBufferDescriptor d = decode_buffer_descriptor(u.v4.data());
                     if (d.base <= 0x10000 || d.size_bytes == 0 || d.size_bytes > 0x10000000u) continue;
+                    // A keyed use whose key already resolves keeps the existing resource; a key-less
+                    // (or key-clashed) use still needs a pc-provenance entry — piggyback the pc onto
+                    // an existing resource describing the SAME buffer, else create one (#273).
+                    if (clash) {
+                        bool piggybacked = false;
+                        for (auto& r0 : t.resources)
+                            if ((r0.cls == ResourceClass::ConstantBuffer || r0.cls == ResourceClass::VertexBuffer) &&
+                                r0.gpu_addr == d.base && r0.size == d.size_bytes) {
+                                if (r0.fetch_pc == 0xFFFFFFFFu && r0.cls == ResourceClass::ConstantBuffer)
+                                    r0.fetch_pc = u.use_pc;
+                                piggybacked = r0.fetch_pc == u.use_pc || r0.cls == ResourceClass::VertexBuffer;
+                                if (piggybacked) break;
+                            }
+                        if (piggybacked) continue;
+                    }
                     ShaderResource r;
                     r.cls = ResourceClass::ConstantBuffer;
                     r.format = d.format; r.num_components = d.num_components ? d.num_components : 1;
                     r.gpu_addr = d.base; r.size = d.size_bytes; r.stride = d.stride;
-                    r.srt_offset = u.key;
-                    if (log) fprintf(stderr, "[srt] %s cbuf key=0x%x base=0x%llx size=%u\n", is_ps ? "PS" : "VS",
-                                     u.key, (unsigned long long)d.base, d.size_bytes);
+                    r.srt_offset = clash ? 0xFFFFFFFFu : u.key;
+                    if (clash) r.fetch_pc = u.use_pc;    // pc-only provenance (key-less/collided V#)
+                    if (log) fprintf(stderr, "[srt] %s cbuf key=0x%x pc=%u base=0x%llx size=%u\n", is_ps ? "PS" : "VS",
+                                     u.key, u.use_pc, (unsigned long long)d.base, d.size_bytes);
                     t.resources.push_back(r);
                 } else {                                  // texture (T# [+ paired S#])
                     DecodedImageDescriptor d = decode_image_descriptor(u.t8.data());
@@ -638,19 +661,19 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     if (d.base == 0 || d.width == 0 || d.height == 0 ||
                         d.width > 16384 || d.height > 16384) continue;       // garbage/degenerate T#
                     // A previous use already produced a resource for this SAME surface (same T# base +
-                    // extent): don't duplicate the binding/upload — just give it this use's pc
-                    // provenance if it has none yet (#273). Uses with a valid unclashed key still
-                    // resolve by key regardless.
+                    // extent): don't duplicate the binding/upload — give it this use's pc provenance
+                    // if it has none yet (#273). If it already carries a DIFFERENT use's pc, fall
+                    // through and create a second resource for this pc (fetch_pc holds one pc; a
+                    // sample whose pc has no mapping would stay unresolved).
                     {
-                        bool piggybacked = false;
+                        bool mapped = false;
                         for (auto& r0 : t.resources)
                             if (r0.cls == ResourceClass::Texture && r0.gpu_addr == d.base &&
                                 r0.width == d.width && r0.height == d.height) {
-                                if (r0.fetch_pc == 0xFFFFFFFFu) r0.fetch_pc = u.use_pc;
-                                piggybacked = true;
-                                break;
+                                if (r0.fetch_pc == 0xFFFFFFFFu) { r0.fetch_pc = u.use_pc; mapped = true; break; }
+                                if (r0.fetch_pc == u.use_pc)    { mapped = true; break; }
                             }
-                        if (piggybacked) continue;
+                        if (mapped) continue;
                     }
                     Gen5ImageFormatInfo fi;
                     if (!gen5_image_format(d.format, &fi)) {
@@ -663,7 +686,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                         fi.block_width = fi.block_height = 1; fi.srgb = false; fi.snorm = false;
                     }
                     const bool is_bcn = fi.block_width > 1;
-                    if (is_bcn && (fi.format == DataFormat::Bc6 || fi.snorm)) continue;   // decode not wired
+                    if (is_bcn && fi.snorm) continue;   // signed BCn (SNORM / BC6H SF16): decode not wired
                     ShaderResource r;
                     r.cls = ResourceClass::Texture;
                     r.format = fi.format; r.num_components = fi.num_components;

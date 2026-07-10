@@ -191,7 +191,29 @@ int main() {
         CHECK(out[0] == 0 && out[3] == 0, "BC7 reserved mode -> transparent black");
     }
 
-    CHECK(!bc_decode_surface(nullptr, nullptr, 0, 0, 0, DataFormat::Bc6), "BC6H still unsupported -> false");
+    // --- BC6H (UF16) -> clamped RGBA8 (#273) ---
+    {
+        // All-zero block: mode 0 (2-subset 10.555), every endpoint/index 0 -> RGB 0, alpha 255.
+        uint8_t blk[16]; std::memset(blk, 0, sizeof blk);
+        uint8_t out[4 * 4 * 4];
+        CHECK(bc_decode_surface(out, blk, sizeof blk, 4, 4, DataFormat::Bc6), "BC6H surface decodes (UF16 wired)");
+        CHECK(out[0] == 0 && out[1] == 0 && out[2] == 0 && out[3] == 255, "BC6H zero block -> opaque black");
+    }
+    {
+        // Mode 11 (5-bit mode 00011: one subset, direct 10-bit endpoints, no delta). Constant-color
+        // block: rw=511, gw=0, bw=100, endpoint1/indices all 0 -> every texel = endpoint 0.
+        // Expected per the spec math: R unq = ((511<<16)+0x8000)>>10 = 32736, finish (x*31)>>6 =
+        // 15856 = half 0x3DF0 ~ 1.48 -> clamps to 255; G = 0; B: ((100<<16)+0x8000)>>10 = 6432 ->
+        // 3115 = half 0x0C2B ~ 0.0004 -> 0. So (255, 0, 0, 255).
+        uint8_t blk[16]; std::memset(blk, 0, sizeof blk);
+        const uint64_t low = 3ull | (511ull << 5) | (100ull << 25);   // mode(5b) rw(10b) gw(10b) bw(10b...)
+        std::memcpy(blk, &low, 8);
+        uint8_t out[4 * 4 * 4];
+        bc_decode_surface(out, blk, sizeof blk, 4, 4, DataFormat::Bc6);
+        const uint8_t* p5 = out + ((size_t)1 * 4 + 1) * 4;   // interior texel, same expectation
+        CHECK(out[0] == 255 && out[1] == 0 && out[2] == 0 && out[3] == 255, "BC6H mode-11 endpoint0 -> (255,0,0,255)");
+        CHECK(p5[0] == 255 && p5[1] == 0 && p5[2] == 0, "BC6H mode-11 constant across the block");
+    }
 
     // --- larger surface: 8x8 BC1, second block a distinct solid color; verify block placement ---
     {
