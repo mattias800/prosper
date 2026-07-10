@@ -15,6 +15,12 @@
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+#include <string>
+#ifdef _WIN32
+#include <direct.h>     // _mkdir (SaveDataMemory persistence dir)
+#else
+#include <sys/stat.h>   // mkdir
+#endif
 #ifdef __linux__
 #include <sys/mman.h>   // msync page-mapped probe in svc_log (diagnostic-only)
 #endif
@@ -478,6 +484,40 @@ namespace {
     uint64_t savemem_key(int32_t userId, uint32_t slotId) {
         return ((uint64_t)(uint32_t)userId << 32) | slotId;
     }
+    // Host file backing one SaveDataMemory slot, so a save survives a process restart (the API is the
+    // ENTIRE save path for the Unity titles — no file Mount — so without this every relaunch looks like
+    // a fresh console and the game restarts from scratch; likely root of #299). Dir: PROSPER_SAVEDATA_DIR
+    // (default /tmp/prosper-savedata-mem), one file per (userId, slotId).
+    std::string savemem_path(int32_t userId, uint32_t slotId) {
+        static const std::string base = [] {
+            const char* e = getenv("PROSPER_SAVEDATA_DIR");
+            std::string b = e ? e : "/tmp/prosper-savedata-mem";
+#ifdef _WIN32
+            _mkdir(b.c_str());
+#else
+            mkdir(b.c_str(), 0777);
+#endif
+            return b;
+        }();
+        char name[64];
+        snprintf(name, sizeof name, "/savemem_%d_%u.bin", (int)userId, (unsigned)slotId);
+        return base + name;
+    }
+    std::vector<uint8_t> savemem_load(int32_t userId, uint32_t slotId) {
+        std::vector<uint8_t> v;
+        if (FILE* f = fopen(savemem_path(userId, slotId).c_str(), "rb")) {
+            fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+            if (n > 0) { v.resize((size_t)n); if (fread(v.data(), 1, (size_t)n, f) != (size_t)n) v.clear(); }
+            fclose(f);
+        }
+        return v;
+    }
+    void savemem_store(int32_t userId, uint32_t slotId, const std::vector<uint8_t>& buf) {
+        if (FILE* f = fopen(savemem_path(userId, slotId).c_str(), "wb")) {
+            if (!buf.empty()) fwrite(buf.data(), 1, buf.size(), f);
+            fclose(f);
+        }
+    }
     template <class T> T ld(uint64_t base, size_t off) {   // read a guest struct field at byte offset
         T v; memcpy(&v, (const uint8_t*)PW(base) + off, sizeof(T)); return v;
     }
@@ -497,7 +537,8 @@ HLE(s_savemem_setup) {
     {
         std::lock_guard<std::mutex> lk(g_savemem_mx);
         auto& buf = g_savemem[savemem_key(userId, slotId)];
-        existed = buf.size();
+        if (buf.empty()) buf = savemem_load(userId, slotId);       // reload a prior session's save from disk
+        existed = buf.size();                                       // -> existedMemorySize is truthful across restarts
         if (memSize > buf.size()) buf.resize(memSize, 0);          // grow only; never drop live data
     }
     if (a1) *(uint64_t*)PW(a1) = existed;                          // result->existedMemorySize
@@ -550,16 +591,18 @@ HLE(s_savemem_get) {
     }
     return 0;
 }
-// sceSaveDataSyncSaveDataMemory(sync*): commit the slot's block. The block is process-resident here,
-// so a session's Set is already visible to a later Get (cross-restart disk persistence is a separate
-// concern) — validate the slot exists and report success.
+// sceSaveDataSyncSaveDataMemory(sync*): commit the slot's block. A session's Set is already visible to a
+// later Get in-process; Sync additionally writes the block to a host file (savemem_store), so the save
+// survives a process restart — Setup reloads it next launch, making existedMemorySize truthful.
 HLE(s_savemem_sync) {
     svc_log("sceSaveDataSyncSaveDataMemory", a0,a1,a2,a3,a4,a5);
     if (!a0) return SD_ERR_PARAMETER;
     int32_t  userId = ld<int32_t>(a0, 0);
     uint32_t slotId = ld<uint32_t>(a0, 4);
     std::lock_guard<std::mutex> lk(g_savemem_mx);
-    if (g_savemem.find(savemem_key(userId, slotId)) == g_savemem.end()) return SD_ERR_MEMORY_NOTREADY;
+    auto it = g_savemem.find(savemem_key(userId, slotId));
+    if (it == g_savemem.end()) return SD_ERR_MEMORY_NOTREADY;
+    savemem_store(userId, slotId, it->second);   // Sync commits the slot to disk (survives restart)
     return 0;
 }
 // sceSaveDataMount3(const Mount3* mount, MountResult* result). The mount desc layout is pinned
