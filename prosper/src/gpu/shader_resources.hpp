@@ -90,6 +90,7 @@ struct ShaderResource {
     uint32_t      width             = 0;
     uint32_t      height            = 0;
     uint32_t      tile_mode         = 0;                  // T# GFX10 TileMode; drives auto-detile of a sampled surface
+    bool          srgb              = false;              // T# is a gamma-encoded (sRGB) surface — sample with sRGB->linear (#263)
     uint32_t      sampler_sgpr_base = 0xFFFFFFFFu;
 
     // Sampler state decoded from the PAIRED S# (Texture only). The backend previously hardcoded a
