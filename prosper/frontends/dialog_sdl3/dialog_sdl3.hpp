@@ -15,4 +15,9 @@ bool install_sdl3_platform_ui();
 // Uninstall (restore the headless default).
 void shutdown_sdl3_platform_ui();
 
+// Pump pending interactive UI on the MAIN thread — call once per frame from the app's event/present
+// loop. The ImeDialog text-entry modal (SDL windowing is main-thread only) runs here; MsgDialog/
+// ErrorDialog use SDL_ShowMessageBox directly and don't need it. Safe to call when nothing is pending.
+void sdl_platform_ui_pump();
+
 } // namespace prosper

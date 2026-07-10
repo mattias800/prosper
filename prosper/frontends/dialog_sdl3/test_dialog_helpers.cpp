@@ -56,6 +56,40 @@ int main() {
     CHECK(read_error_code((uint64_t)(uintptr_t)ep) == 0x80AABBCC, "read_error_code: errorCode @4");
     CHECK(read_error_code(0) == 0, "read_error_code(NULL) -> 0 (no deref)");
 
+    // --- ImeDialog: read_ime_request from a synthetic OrbisImeDialogParam (96 bytes) ---
+    {
+        char16_t title[] = u"Enter name";
+        char16_t inbuf[32]; inbuf[0] = u'H'; inbuf[1] = u'i'; inbuf[2] = 0;
+        uint8_t iparam[96] = {};
+        uint32_t maxlen = 16;                    std::memcpy(iparam + 36, &maxlen, 4);   // max_text_length @36
+        uint64_t ibp = (uint64_t)(uintptr_t)inbuf; std::memcpy(iparam + 40, &ibp, 8);    // input_text_buffer @40
+        uint64_t tp  = (uint64_t)(uintptr_t)title; std::memcpy(iparam + 72, &tp, 8);     // title @72
+        ImeRequest r = read_ime_request((uint64_t)(uintptr_t)iparam);
+        CHECK(r.max_text_length == 16, "read_ime_request: max_text_length @36");
+        CHECK(r.input_buffer == ibp, "read_ime_request: input_text_buffer @40");
+        CHECK(r.title == "Enter name", "read_ime_request: title @72 (UTF-16 -> UTF-8)");
+        CHECK(r.initial == "Hi", "read_ime_request: initial text read from the input buffer");
+    }
+
+    // write_ime_text: bounded, NUL-terminated, never overruns max_len (+ the NUL slot).
+    {
+        char16_t buf[8]; for (auto& c : buf) c = 0xAAAA;
+        uint32_t n = write_ime_text((uint64_t)(uintptr_t)buf, 5, "Hello");
+        CHECK(n == 5 && buf[0] == u'H' && buf[4] == u'o' && buf[5] == 0, "write_ime_text: 'Hello' -> 5 units + NUL");
+        for (auto& c : buf) c = 0xAAAA;
+        n = write_ime_text((uint64_t)(uintptr_t)buf, 3, "Hello");
+        CHECK(n == 3 && buf[3] == 0 && buf[4] == 0xAAAA, "write_ime_text: clamps to max_len (no overrun past max_len+NUL)");
+        for (auto& c : buf) c = 0xAAAA;
+        n = write_ime_text((uint64_t)(uintptr_t)buf, 7, "caf\xC3\xA9");   // "café" (é = U+00E9)
+        CHECK(n == 4 && buf[3] == 0x00E9 && buf[4] == 0, "write_ime_text: multibyte UTF-8 é -> one UTF-16 unit");
+    }
+
+    // UTF-16 surrogate pair round-trips (U+1F600 grinning face).
+    {
+        char16_t emoji[] = { 0xD83D, 0xDE00, 0 };
+        CHECK(u16_to_utf8((uint64_t)(uintptr_t)emoji) == "\xF0\x9F\x98\x80", "u16_to_utf8: surrogate pair -> 4-byte UTF-8");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

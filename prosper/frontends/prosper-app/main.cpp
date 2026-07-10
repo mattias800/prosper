@@ -417,6 +417,9 @@ int main(int argc, char** argv) {
         }
         if (!running) break;
         poll_keyboard();   // snapshot key state for the guest's pad reads
+#ifdef PROSPER_HAVE_DIALOG_SDL3
+        prosper::sdl_platform_ui_pump();   // run a pending ImeDialog text-entry modal on this (main) thread
+#endif
 
         static const uint32_t kPatW = 1920, kPatH = 1080;
         if (testPattern) feed_test_pattern(kPatW, kPatH, patFrame++);
