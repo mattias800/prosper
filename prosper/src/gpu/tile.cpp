@@ -15,44 +15,55 @@ bool tile_mode_is_tiled(uint32_t tile_mode) {
 }
 
 namespace {
+// One addrlib swizzle-pattern entry: the (x-mask, y-mask) coordinate bits an offset bit is built from.
+// Defined here (and the SW_64K_S table forward-declared) so sw4kb_morton below can derive the 4KB order
+// from the low bits of the SAME authoritative 64KB pattern (#379); both are defined together lower down.
+struct PatBit { uint16_t x, y; };
+extern const PatBit kSw64kS[5][16];
+
 // 4KB standard-swizzle micro-tile geometry for bpe-byte elements: a tile is a FIXED 4096 bytes,
 // so it holds 4096/bpe elements, arranged 2^bx wide x 2^by tall with bx >= by (wide-before-tall):
 //   1 B -> 64x64,  2 B -> 64x32,  4 B -> 32x32,  8 B -> 32x16,  16 B -> 16x16.
 // The old code hardcoded 4 bytes/element (32x32 geometry) everywhere, so any 8/16-bpp surface
 // detiled with the wrong tile dimensions — every texel mis-ordered (#119).
-// CONFIDENCE: HIGH for 4 B (live pixel-verified) and 16 B (BC3, llvmpipe re-tile verified);
-// MED for the rest (standard 4KB-tile arithmetic; verify vs a real surface via PROSPER_DUMP_RAWTILE).
+// CONFIDENCE: HIGH — sw4kb_dims is pure 4KB-tile arithmetic and sw4kb_morton now derives the within-
+// tile order from the authoritative addrlib SW_64KB_S table (#379), which reproduces the 1 B / 4 B
+// pixel-verified orders exactly, so all five element sizes share one validated source of truth.
 inline void sw4kb_dims(uint32_t bpe, uint32_t& bx, uint32_t& by) {
     uint32_t bits = 0; while ((4096u >> bits) > bpe) bits++;   // log2(4096/bpe), bpe a power of two
     bx = (bits + 1) / 2; by = bits / 2;
 }
 // GFX10 SW_4KB_S element order within the tile. The order is BYTES-PER-ELEMENT-DEPENDENT (AMD's
-// standard-swizzle SW_PATTERN genuinely differs per bpp) — two orders are pixel-verified against The
-// Messenger's live surfaces, and both share the shape "a low block of L X-bits then L Y-bits, then
-// interleaved (y,x) Morton pairs above":
+// standard-swizzle SW_PATTERN genuinely differs per bpp). The 4KB order is exactly the LOW-BIT
+// TRUNCATION of the authoritative addrlib SW_64KB_S pattern (docs/GFX10_SW_64KB_TILING.md), so we
+// derive it from the SAME in-file kSw64kS table used by the 64KB detiler rather than an ad-hoc
+// generator — one source of truth, correct at every element size.
 //
-//   32-bpp (32x32 tile, bx=by=5): L=2 -> [x0,x1, y0,y1, y2,x2, y3,x3, y4,x4]           #118 (title art)
-//    8-bpp (64x64 tile, bx=by=6): L=4 -> [x0,x1,x2,x3, y0,y1,y2,y3, y4,x4, y5,x5]       (R8 font atlas)
-//
-// The previous code applied the 32-bpp L=2 pattern at EVERY bpe. That serrated edges at 32-bpp until
-// #118 fixed the low nibble, but at 8-bpp (the game's ONLY R8 surface — the 2048x1024 caption font
-// atlas) the L=2 pattern is badly wrong: it scrambles every 64x64 tile into an unreadable weave, so
-// the intro caption text renders as invisible/garbage. The 8-bpp order below is pixel-verified: it
-// resolves the atlas into a clean grid of readable Latin + CJK glyphs. CONFIDENCE: HIGH for bx=by=5
-// (32-bpp) and bx=by=6 (8-bpp) — both live-verified; the L=2 fallback covers 16-bpp/BC-block geometries
-// (bx=by=4, bx=5/by=4) which round-trip but have no game-observed instance to pixel-verify yet.
+// kSw64kS[elem_log2][k] gives, for byte-offset bit k of the 64KB block, the single element-coordinate
+// bit (x-mask or y-mask) it carries. The first elem_log2 entries are the within-element byte bits
+// ({0,0}); the next (bx+by) entries are this 4KB tile's element-index bits, low->high. So element
+// index bit e reads pattern entry [elem_log2 + e], whose set x/y mask names the coordinate bit that
+// lands at output bit e. This reproduces all five ground-truth orders (both derivations in #379 agree,
+// and the two pixel-verified cases — 32-bpp #118 and 8-bpp R8 font atlas — come out identical):
+//   1 B  (64x64): x0 x1 x2 x3 y0 y1 y2 y3 y4 x4 y5 x5
+//   2 B  (64x32): x0 x1 x2 y0 y1 y2 x3 y3 x4 y4 x5
+//   4 B  (32x32): x0 x1 y0 y1 y2 x2 y3 x3 y4 x4
+//   8 B  (32x16): x0 y0 y1 x1 x2 y2 x3 y3 x4
+//   16 B (16x16): y0 y1 x0 x1 y2 x2 y3 x3
+// The prior L-generator was correct only at 1 B and 4 B; it swapped the low X/Y pairs at 2/8/16 B,
+// scrambling any SW_4KB_S BC1/BC4 (8 B) / BC2/3/5/6/7 (16 B) / R16 (2 B) surface into a coherent weave
+// (the #118/#102 failure class at those bpe). #379.
 inline uint32_t sw4kb_morton(uint32_t ix, uint32_t iy, uint32_t bx, uint32_t by) {
+    const uint32_t bits = bx + by;            // log2(elements per 4KB tile) = log2(4096/bpe)
+    const uint32_t elem_log2 = 12u - bits;    // 4096 == 2^12, bpe == 2^elem_log2 -> bits == 12 - elem_log2
     uint32_t m = 0;
-    // Low-block half-width L: 4 for the 64x64 (8-bpp) tile, else 2 (the #118-verified 32-bpp nibble).
-    const uint32_t L = (bx == 6 && by == 6) ? 4u : 2u;
-    uint32_t bit = 0;
-    for (uint32_t b = 0; b < L && b < bx; b++) m |= ((ix >> b) & 1u) << (bit++);   // low X bits
-    for (uint32_t b = 0; b < L && b < by; b++) m |= ((iy >> b) & 1u) << (bit++);   // low Y bits
-    for (uint32_t b = L; b < by; b++) {                                            // (y,x) Morton pairs
-        m |= ((iy >> b) & 1u) << (bit++);
-        if (b < bx) m |= ((ix >> b) & 1u) << (bit++);
+    for (uint32_t e = 0; e < bits; e++) {
+        const PatBit& pb = kSw64kS[elem_log2][elem_log2 + e];
+        if (pb.x) { uint32_t b = 0; while (!((pb.x >> b) & 1u)) b++; m |= ((ix >> b) & 1u) << e; }
+        else if (pb.y) { uint32_t b = 0; while (!((pb.y >> b) & 1u)) b++; m |= ((iy >> b) & 1u) << e; }
+        // pb == {0,0} cannot occur in a standard-swizzle element-addressing bit; if it ever did, that
+        // output bit stays 0 (a benign degenerate) rather than looping forever on a zero mask.
     }
-    for (uint32_t b = by; b < bx; b++) m |= ((ix >> b) & 1u) << (bit++);           // wider-dim extra X
     return m;
 }
 // Element (x,y) -> its linear element INDEX in the tiled surface: tiles laid out row-major over the
@@ -111,10 +122,9 @@ size_t sw4kb_tiled_bytes(uint32_t ew, uint32_t eh, uint32_t pitch, uint32_t bpe)
 // the pattern depends on the GPU's pipe count, which for PS5 is fixed hardware but not publicly
 // documented — see sw64kb_rx_pipes_log2 below. CONFIDENCE: MED for R_X (equation exact per addrlib,
 // pipe-count parameter selected empirically).
-struct PatBit { uint16_t x, y; };
-
 // SW_64K_S: one 16-bit pattern per element size (identical for every pipe count / RB+ in addrlib).
-static const PatBit kSw64kS[5][16] = {
+// (PatBit is declared up top; sw4kb_morton truncates this table for the 4KB order — #379.)
+const PatBit kSw64kS[5][16] = {
     { {0x0001,0x0000}, {0x0002,0x0000}, {0x0004,0x0000}, {0x0008,0x0000}, {0x0000,0x0001}, {0x0000,0x0002}, {0x0000,0x0004}, {0x0000,0x0008}, {0x0000,0x0010}, {0x0010,0x0000}, {0x0000,0x0020}, {0x0020,0x0000}, {0x0000,0x0040}, {0x0040,0x0000}, {0x0000,0x0080}, {0x0080,0x0000} },  // 1 bpe
     { {0x0000,0x0000}, {0x0001,0x0000}, {0x0002,0x0000}, {0x0004,0x0000}, {0x0000,0x0001}, {0x0000,0x0002}, {0x0000,0x0004}, {0x0008,0x0000}, {0x0000,0x0008}, {0x0010,0x0000}, {0x0000,0x0010}, {0x0020,0x0000}, {0x0000,0x0020}, {0x0040,0x0000}, {0x0000,0x0040}, {0x0080,0x0000} },  // 2 bpe
     { {0x0000,0x0000}, {0x0000,0x0000}, {0x0001,0x0000}, {0x0002,0x0000}, {0x0000,0x0001}, {0x0000,0x0002}, {0x0000,0x0004}, {0x0004,0x0000}, {0x0000,0x0008}, {0x0008,0x0000}, {0x0000,0x0010}, {0x0010,0x0000}, {0x0000,0x0020}, {0x0020,0x0000}, {0x0000,0x0040}, {0x0040,0x0000} },  // 4 bpe
