@@ -588,6 +588,21 @@ HLE(k_cond_timedwait_sce) {
     int rc = pthread_cond_timedwait(c, m, &dl);
     return rc == ETIMEDOUT ? 60u : (uint64_t)rc;        // FreeBSD ETIMEDOUT
 }
+// scePthreadRwlockTimedrd/wrlock(rwlock, SceKernelUseconds usec): acquire with a RELATIVE µs timeout.
+// Were MISSING -> the generic stub returned 0 (= "lock held") without taking the lock, so the guest ran
+// its critical section unguarded (the same silent-unsync / heap-race class as k_mutex_timedlock above).
+HLE(k_rwlock_timedrdlock) {
+    auto* rw = ensure_rwlock(a0); if (!rw) return 0x16;   // EINVAL
+    timespec dl = abs_deadline_us(a1);
+    int rc = pthread_rwlock_timedrdlock(rw, &dl);
+    return rc == ETIMEDOUT ? 60u : (uint64_t)rc;
+}
+HLE(k_rwlock_timedwrlock) {
+    auto* rw = ensure_rwlock(a0); if (!rw) return 0x16;   // EINVAL
+    timespec dl = abs_deadline_us(a1);
+    int rc = pthread_rwlock_timedwrlock(rw, &dl);
+    return rc == ETIMEDOUT ? 60u : (uint64_t)rc;
+}
 HLE(k_ef_wait)    { // (ef, pattern, waitMode, resultPat*, SceKernelUseconds* timeout)
     // The timeout arg (a4) was previously IGNORED — a bounded guest wait blocked forever (the
     // same class of silent hang root-caused for wait_on_address, hle_kernel_mem.cpp). Sony
@@ -1094,6 +1109,8 @@ void register_kernel_hle() {
     R("scePthreadRwlockUnlock", k_rwlock_unlock);    R("pthread_rwlock_unlock", k_rwlock_unlock);
     R("scePthreadRwlockTryrdlock", k_rwlock_tryrdlock);
     R("scePthreadRwlockTrywrlock", k_rwlock_trywrlock);
+    R("scePthreadRwlockTimedrdlock", k_rwlock_timedrdlock);   // were MISSING -> faked "locked" without locking
+    R("scePthreadRwlockTimedwrlock", k_rwlock_timedwrlock);
     R("scePthreadOnce", k_pthread_once);             R("pthread_once", k_pthread_once);
     R("scePthreadSelf", k_pthread_self);
     R("scePthreadEqual", k_pthread_equal);
