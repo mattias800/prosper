@@ -333,6 +333,18 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             // to it would drop every glyph but the first (#257). The VB is grown below to span this range;
             // a truly-unmapped tail still degrades safely (safe_copy stops at the mapping edge -> zero).
             vertex_count = max_index + 1;
+            // Sanity-cap the VALUE-derived vertex range (#461). kMaxIndices already caps the index COUNT,
+            // but a single garbage/torn 32-bit index VALUE — an announced 32-bit index buffer skips the
+            // <0x10000 fingerprint, and the index buffer is read from guest memory another thread may be
+            // freeing/rewriting — would inflate vertex_count to hundreds of millions and force a multi-GB
+            // VB upload (OOM / llvmpipe stall / crash on the submit thread). A real single-draw mesh is far
+            // below this ceiling; anything above it is garbage, so clamp (this only shrinks a garbage draw,
+            // never a legitimate one; the VB-grow below is 64-bit-safe + capped regardless).
+            if (vertex_count > kMaxIndices) {
+                if (log) fprintf(stderr, "[exec] indexed draw: max_index %u exceeds sanity cap %u — clamped "
+                                 "(garbage/torn indices?)\n", max_index, kMaxIndices);
+                vertex_count = kMaxIndices;
+            }
         }
     }
     // A genuinely empty draw (vcount_hint == 0 — engines emit 0-vertex DrawIndexAuto/DrawIndexOffset as
@@ -355,8 +367,13 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     // gl_VertexIndex reads the real per-vertex data. (Correct in general: a VB must span the drawn range.)
     if (vrt) for (auto& r : vrt->resources)
         if (r.cls == ResourceClass::VertexBuffer && r.stride) {
-            uint32_t need = vertex_count * r.stride;
-            if (r.size < need) r.size = need;
+            // 64-bit to avoid a uint32 overflow (vertex_count up to 1M x a 14-bit stride overflows 32-bit),
+            // and cap the grown size to the same 256 MB plausibility ceiling the V# decode uses — a VB this
+            // large is never real, and an unbounded r.size drives a multi-GB upload (#461). Vertices past
+            // the real backing degrade safely (safe_copy stops at the mapping edge -> robust-0).
+            uint64_t need = (uint64_t)vertex_count * r.stride;
+            if (need > 0x10000000ull) need = 0x10000000ull;   // 256 MB cap
+            if ((uint64_t)r.size < need) r.size = (uint32_t)need;
         }
     // PROSPER_CAPTION_DIAG: for the caption text mesh (a draw whose PS samples the 2048x1024 R8 font
     // atlas), dump everything needed to see WHY its geometry collapses — vertex count, the bound vertex

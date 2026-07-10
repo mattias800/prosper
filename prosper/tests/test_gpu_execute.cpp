@@ -130,6 +130,22 @@ int main() {
         CHECK(made3 && it3.vertex_count == 3u, "non-zero vertex-count draw still realizes");
     }
 
+    // #461: an indexed draw whose fetched index buffer contains a garbage-large value (an announced
+    // 32-bit index buffer, or a torn read of concurrently-freed guest memory) must NOT inflate
+    // vertex_count / the VB upload unboundedly (OOM guard). realize_draw_item clamps vertex_count to the
+    // index-count ceiling (1<<20) instead of max_index+1 = ~0x0F000001.
+    {
+        static const uint32_t kBigIdx[3] = { 0u, 1u, 0x0F000000u };   // one garbage/huge 32-bit index
+        GpuState sbig = st;
+        sbig.index_type = 1;   // 32-bit (announced -> the <0x10000 fingerprint is not run)
+        GpuState::Draw db; db.index_count = 3; db.indexed = true; db.index_addr = (uint64_t)(uintptr_t)kBigIdx;
+        sbig.draws.clear(); sbig.draws.push_back(db);
+        DrawItem itb;
+        bool madeb = realize_draw_item(sbig, &sbig.draws[0], sbig.draws[0].index_count, 0x10000u, /*log*/false, itb);
+        CHECK(madeb && itb.vertex_count == (1u << 20),
+              "#461: garbage-large index clamps vertex_count to the 1<<20 ceiling (no multi-GB VB)");
+    }
+
     // The live-submit registry path — exactly what agc_driver_submit_dcb drives once a device is wired.
     CHECK(!have_submit_renderer(), "no live renderer registered by default (game path stays inert)");
     CHECK(!execute_and_present(st, W, H), "execute_and_present is a no-op with no renderer registered");
