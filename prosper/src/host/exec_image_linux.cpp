@@ -102,6 +102,7 @@ namespace {
     // from prosper's own fence writes (host rip), i.e. catching a write-after-free in the act.
     uint64_t g_lwatch_slot = 0;
     uint64_t g_lwatch_page = 0;
+    int      g_lwatch_max  = 400;   // PROSPER_WATCH_MAX (latched at arm time; getenv is not signal-safe)
     volatile sig_atomic_t g_lwatch_armed = 0;
     bool     g_lwatch_stepping = false;
     uint64_t g_lwatch_step_rip = 0;
@@ -998,18 +999,34 @@ namespace {
                 g_lwatch_step_rip = 0;
                 if (fa >= g_lwatch_slot - 0x18 && fa < g_lwatch_slot + 0x20) {
                     g_lwatch_hits = g_lwatch_hits + 1;
-                    char b[224];
+                    char b[512];
                     bool guest = rip >= 0x400000000ull && rip < 0x4c0000000ull;
                     int n = snprintf(b, sizeof b,
-                        "[lwatch] #%d write fa=0x%llx rip=%s0x%llx tid=%ld pre[0]=0x%llx pre[8]=0x%llx\n",
+                        "[lwatch] #%d write fa=0x%llx rip=%s0x%llx tid=%ld pre[0]=0x%llx pre[8]=0x%llx",
                         (int)g_lwatch_hits, (unsigned long long)fa,
                         guest ? "eboot+" : "host:",
                         (unsigned long long)(guest ? rip - 0x400000000ull : rip), cur_tid(),
                         (unsigned long long)*(const uint64_t*)g_lwatch_slot,
                         (unsigned long long)*(const uint64_t*)(g_lwatch_slot + 8));
+                    // #312: call-stack capture — scan the writer's stack for eboot-text return
+                    // addresses (up to 8), so the guest free/alloc path above the raw write is
+                    // identifiable (async-signal-safe: bounded reads of the faulting thread's
+                    // own stack).
+                    uint64_t rsp = (uint64_t)uc->uc_mcontext.gregs[REG_RSP];
+                    int found = 0;
+                    for (uint64_t o = 0; o < 0x400 && found < 8 && n < (int)sizeof b - 24; o += 8) {
+                        if (!probe_readable(rsp + o)) break;
+                        uint64_t v = *(const uint64_t*)(rsp + o);
+                        if (v >= 0x400000000ull && v < 0x40a000000ull) {
+                            n += snprintf(b + n, sizeof b - (size_t)n, " s:%llx",
+                                          (unsigned long long)(v - 0x400000000ull));
+                            found++;
+                        }
+                    }
+                    if (n < (int)sizeof b - 1) b[n++] = '\n';
                     syscall(SYS_write, 2, b, (size_t)n);
                     g_lwatch_step_rip = rip;
-                    if (g_lwatch_hits >= 400) {   // bounded: disarm after enough evidence
+                    if (g_lwatch_hits >= g_lwatch_max) {   // bounded: disarm after enough evidence
                         mprotect((void*)g_lwatch_page, 0x1000, PROT_READ | PROT_WRITE);
                         g_lwatch_armed = 0;
                         return;
@@ -1251,6 +1268,10 @@ namespace {
                 rdb(g_fault_rip+4), rdb(g_fault_rip+5), rdb(g_fault_rip+6), rdb(g_fault_rip+7),
                 (unsigned long long)(probe_readable(g_rsp) ? *(const uint64_t*)g_rsp : 0));
             syscall(SYS_write, 2,ib, m);
+            // #312: full register + heap-window + GPU-write-ring dump at the worker fault too (the
+            // MallocBinned3 freelist-pop faults — e.g. rcx=0x20015f00 at eboot+0x2316acf — land here,
+            // not on the nullpage path). Reuses the async-signal-safe nullpage attribution dump.
+            nullpage_deep_dump(uc, g_fault_rip);
             // If PROSPER_HWBP_NODE ring-capture is active, the crash node's typetree metadata is the tail.
             if (g_hwbp_node_on) hwbp_dump_ring("worker-fault");
         }
@@ -1388,16 +1409,34 @@ bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
 // first heap-resident value-1 fence label address; protects the label's page and logs every write
 // into the label's block with the writer's rip (guest allocator free-path vs prosper fence write),
 // catching a write-after-free in the act. Diagnostic, one page, bounded to 400 logged hits.
-extern "C" void prosper_arm_label_watch(uint64_t addr) {
-    static const bool on = getenv("PROSPER_WATCH_LABEL") != nullptr;
-    if (!on || g_lwatch_armed || !addr) return;
+// Arm the watch on `addr` unconditionally (shared body). Used by the env-gated wrapper below and
+// by the PROSPER_WATCH_HOT trigger (hle_agc), which picks its own slot.
+extern "C" void prosper_arm_label_watch_force(uint64_t addr) {
+    if (g_lwatch_armed || !addr) return;
+    if (const char* mx = getenv("PROSPER_WATCH_MAX")) {
+        long v = atol(mx); if (v > 0) g_lwatch_max = (int)v;
+    }
     g_lwatch_slot = addr;
     g_lwatch_page = addr & ~(uint64_t)0xfff;
     if (mprotect((void*)g_lwatch_page, 0x1000, PROT_READ) == 0) {
         g_lwatch_armed = 1;
-        fprintf(stderr, "[lwatch] armed slot=0x%llx page=0x%llx\n",
-                (unsigned long long)addr, (unsigned long long)g_lwatch_page);
+        fprintf(stderr, "[lwatch] armed slot=0x%llx page=0x%llx max=%d\n",
+                (unsigned long long)addr, (unsigned long long)g_lwatch_page, g_lwatch_max);
     }
+}
+extern "C" void prosper_arm_label_watch(uint64_t addr) {
+    static const bool on = getenv("PROSPER_WATCH_LABEL") != nullptr;
+    // PROSPER_WATCH_ABS=0xADDR (#312): watch a FIXED slot (e.g. the MallocBinned3 pool free-list
+    // head found by the fault deep-dump) instead of the first fence label. The arm is retried on
+    // every builder call until the slot's page is actually mapped (the pool region appears later
+    // in boot than the first fence). Catches EVERY writer process-wide (guest or host) — the
+    // definitive attribution for the 0x20015f00 head stomp.
+    static const uint64_t abs_slot = [] { const char* e = getenv("PROSPER_WATCH_ABS");
+                                          return e ? strtoull(e, nullptr, 0) : 0ull; }();
+    if (g_lwatch_armed) return;
+    if (abs_slot) addr = abs_slot;
+    else if (!on || !addr) return;
+    prosper_arm_label_watch_force(addr);
 }
 
 // Install a per-thread alternate signal stack so the fault handler can run even when the faulting
@@ -1529,7 +1568,9 @@ void install_trap_handler() {
     sigaction(SIGBUS,  &sa, nullptr);
     sigaction(SIGILL,  &sa, nullptr);
     if (g_watch_companion || g_bp_on || g_hwbp_on
-        || getenv("PROSPER_WATCH_LABEL")) sigaction(SIGTRAP, &sa, nullptr);   // single-step / breakpoint
+        || getenv("PROSPER_WATCH_LABEL")
+        || getenv("PROSPER_WATCH_ABS")
+        || getenv("PROSPER_WATCH_HOT")) sigaction(SIGTRAP, &sa, nullptr);   // single-step / breakpoint
 }
 
 // Write the 0xCC breakpoint into the (now-mapped) guest image. Call after the image load.

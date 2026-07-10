@@ -29,7 +29,12 @@
 // #312 label-slot write watch (exec_image_linux.cpp). Weak: tools that link the AGC HLE without
 // the Linux host exec image simply skip the arm.
 extern "C" void prosper_arm_label_watch(uint64_t addr) __attribute__((weak));
+extern "C" void prosper_arm_label_watch_force(uint64_t addr) __attribute__((weak));
 #endif
+// #312 fence BUILD journal (command_processor.cpp): records, per fence packet, the guest-passed
+// target + the target's content at build time + a timestamp — the timing-vs-wrong-target
+// discriminator consulted by the stomp catcher when a fence write lands over freed heap.
+extern "C" void prosper_fence_journal_record(uint64_t pkt, uint64_t addr);
 
 namespace prosper {
 
@@ -333,8 +338,27 @@ HLE(agc_cb_release_mem) {  // sceAgcCbReleaseMem(buf, action, gcr_cntl, dst, cac
 #ifndef _WIN32
         // #312 label watch (PROSPER_WATCH_LABEL=1): watch the first heap-resident fence label's
         // block for the game's allocator free-path writing over it while cbs still signal it.
-        if (prosper_arm_label_watch && a5 >= 0x1000000000ull && a5 < 0x1200000000ull)
+        // Under PROSPER_WATCH_ABS the passed address is ignored (fixed slot) — call unconditionally
+        // so the arm retries until the fixed slot's page is mapped.
+        if (prosper_arm_label_watch &&
+            (getenv("PROSPER_WATCH_ABS") || (a5 >= 0x1000000000ull && a5 < 0x1200000000ull)))
             prosper_arm_label_watch(a5);
+#ifndef _WIN32
+        // PROSPER_WATCH_HOT=N (#312): arm the page watch on the Nth fence BUILD targeting the
+        // same heap-resident label — a long-lived hot label is exactly the population that later
+        // gets freed by the guest while still being fenced (the corruption class). Catches the
+        // allocator's free-path writes over it WITH call stacks (see lwatch).
+        static const long hot_n = [] { const char* e = getenv("PROSPER_WATCH_HOT");
+                                       return e ? atol(e) : 0; }();
+        if (hot_n > 0 && prosper_arm_label_watch_force && a5 >= 0x1000000000ull && a5 < 0x1200000000ull) {
+            constexpr uint32_t kHotSize = 8192;                     // direct-mapped addr -> count
+            static uint64_t hot_addr[kHotSize];
+            static uint32_t hot_cnt[kHotSize];
+            uint32_t s = (uint32_t)((a5 >> 4) * 2654435761u) & (kHotSize - 1);
+            if (hot_addr[s] != a5) { hot_addr[s] = a5; hot_cnt[s] = 0; }
+            if (++hot_cnt[s] == (uint32_t)hot_n) prosper_arm_label_watch_force(a5);
+        }
+#endif
 #endif
         static std::atomic<int> seen_n{0};
         static uint64_t seen_ra[16];
@@ -369,6 +393,7 @@ HLE(agc_cb_release_mem) {  // sceAgcCbReleaseMem(buf, action, gcr_cntl, dst, cac
     cmd[3] = (uint32_t)data_sel;
     cmd[4] = (uint32_t)(data & 0xffffffffu); cmd[5] = (uint32_t)(data >> 32u);
     cmd[6] = (uint32_t)a1;
+    if (data_sel == 1) prosper_fence_journal_record((uint64_t)(uintptr_t)cmd, a5);   // #312 discriminator
     return (uint64_t)(uintptr_t)cmd;
 }
 HLE(agc_dcb_write_data) {  // sceAgcDcbWriteData(buf, dst, cache_policy, address_or_offset, data*, num_dwords, …)
@@ -393,6 +418,7 @@ HLE(agc_dcb_write_data) {  // sceAgcDcbWriteData(buf, dst, cache_policy, address
     cmd[2] = (uint32_t)(a3 & 0xffffffffu); cmd[3] = (uint32_t)(a3 >> 32u);
     cmd[4] = num;
     if (src) for (uint32_t i = 0; i < num; i++) cmd[5 + i] = src[i];
+    if (num <= 4) prosper_fence_journal_record((uint64_t)(uintptr_t)cmd, a3);   // #312 discriminator
     return (uint64_t)(uintptr_t)cmd;
 }
 HLE(agc_dcb_wait_reg_mem) {  // sceAgcDcbWaitRegMem(buf, size, compare_func, op, cache_policy, address, reference, mask, poll_cycles)
@@ -415,6 +441,7 @@ HLE(agc_dcb_wait_reg_mem) {  // sceAgcDcbWaitRegMem(buf, size, compare_func, op,
     cmd[5] = (uint32_t)(reference & 0xffffffffu); cmd[6] = (uint32_t)(reference >> 32u);
     cmd[7] = (uint32_t)a2;                        // compare_function
     cmd[8] = 0;                                   // poll interval hint (arg9 not forwarded; unused by our fold)
+    prosper_fence_journal_record((uint64_t)(uintptr_t)cmd, a5);   // #312 discriminator (wait leg)
     return (uint64_t)(uintptr_t)cmd;
 }
 HLE(agc_dcb_set_flip) {  // (buf, video_out_handle, display_buffer_index, flip_mode, flip_arg) — 6 dw
@@ -1074,18 +1101,21 @@ HLE(agc_patch_write_data_addr) {  // fPSCdQxgpSw (cmd, address): WriteData paylo
     auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
     if (!patch_check(cmd, R_WRITE_DATA, "WriteDataPatchAddress")) return 0;
     cmd[2] = (uint32_t)(a1 & 0xffffffffu); cmd[3] = (uint32_t)(a1 >> 32u);
+    prosper_fence_journal_record((uint64_t)(uintptr_t)cmd, a1);   // #312: target set post-build
     return 0;
 }
 HLE(agc_patch_wait_reg_mem_addr) {  // 3KDcnM3lrcU (cmd, address): WaitRegMem payload [0..1] = address
     auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
     if (!patch_check(cmd, R_WAIT_MEM_64, "WaitRegMemPatchAddress")) return 0;
     cmd[1] = (uint32_t)(a1 & 0xffffffffu); cmd[2] = (uint32_t)(a1 >> 32u);
+    prosper_fence_journal_record((uint64_t)(uintptr_t)cmd, a1);   // #312: target set post-build
     return 0;
 }
 HLE(agc_patch_release_mem_addr) {  // 0fWWK5uG9rQ (cmd, address): ReleaseMem payload [0..1] = address
     auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
     if (!patch_check(cmd, R_RELEASE_MEM, "ReleaseMemPatchAddress")) return 0;
     cmd[1] = (uint32_t)(a1 & 0xffffffffu); cmd[2] = (uint32_t)(a1 >> 32u);
+    prosper_fence_journal_record((uint64_t)(uintptr_t)cmd, a1);   // #312: target set post-build
     return 0;
 }
 

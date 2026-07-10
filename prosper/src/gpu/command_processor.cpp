@@ -61,6 +61,12 @@ struct GpuWriteRec { uint64_t addr; uint64_t value; uint64_t pkt; uint32_t seq; 
 constexpr uint32_t kWriteRingSize = 16384;              // power of two
 GpuWriteRec g_write_ring[kWriteRingSize];
 std::atomic<uint32_t> g_write_seq{0};
+// Coarse monotonic ms since process start (diagnostic timestamps for the #312 fence journal).
+uint64_t now_ms() {
+    static const auto t0 = std::chrono::steady_clock::now();
+    return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+}
 // `pkt` = the guest address of the PM4 packet that requested the write (c.payload-1). The stale-
 // vs-live discriminator: a STALE ring-tail packet re-executed across frames has the SAME pkt
 // address in every record; a legitimately re-recorded per-frame write moves with the ring.
@@ -92,6 +98,60 @@ extern "C" int prosper_gpu_write_ring_scan(uint64_t lo, uint64_t hi, char* out, 
     return found;
 }
 
+// --- #312 fence BUILD journal: the timing-vs-wrong-target discriminator. -------------------------
+// The AGC builders/patchers record, per fence packet (keyed by the packet's guest address):
+// the target label address the GUEST passed, the 8 bytes the target held AT BUILD TIME, and a
+// build timestamp. When honor_eop_write later catches a fence write landing over pointer-like
+// (freed-heap-header-shaped) memory, the journal answers: (a) did the packet's target change
+// between build and fold (packet mutated/mis-decoded => wrong-target), (b) was the target ALREADY
+// freed-looking when the guest built the fence (stale guest structure), or (c) was it clean at
+// build and freed in the build->write window (ordering: our write lands after the guest's free)?
+// Direct-mapped by packet address — collisions just replace (diagnostic-grade).
+namespace {
+struct FenceBuildRec { uint64_t pkt, addr, pre; uint64_t t_ms; };
+constexpr uint32_t kJournalSize = 65536;                // power of two
+FenceBuildRec g_fence_journal[kJournalSize];
+inline uint32_t journal_slot(uint64_t pkt) { return (uint32_t)((pkt >> 2) * 2654435761u) & (kJournalSize - 1); }
+}
+extern "C" void prosper_fence_journal_record(uint64_t pkt, uint64_t addr) {
+    if (!pkt) return;
+    uint64_t pre = 0;
+    if (addr >= 0x10000 && !(addr & 3)) memcpy(&pre, (const void*)(uintptr_t)addr, sizeof pre);
+    FenceBuildRec& r = g_fence_journal[journal_slot(pkt)];
+    r.pkt = pkt; r.addr = addr; r.pre = pre; r.t_ms = now_ms();
+}
+extern "C" int prosper_fence_journal_lookup(uint64_t pkt, uint64_t* addr, uint64_t* pre, uint64_t* t_ms) {
+    if (!pkt) return 0;
+    const FenceBuildRec& r = g_fence_journal[journal_slot(pkt)];
+    if (r.pkt != pkt) return 0;
+    *addr = r.addr; *pre = r.pre; *t_ms = r.t_ms;
+    return 1;
+}
+
+// #312: "pointer-like" pre-content — a freed MallocBinned3 block header holds heap pointers into
+// the 512 GiB arena (0x1000000000) or the allocator-metadata pools (0x2000000000 region, where the
+// FPoolInfo tables live — e.g. the 0x20015f0000 pool-info table of #161/#241).
+static bool ptr_like(uint64_t v) {
+    return (v >= 0x1000000000ull && v < 0x1200000000ull) ||
+           (v >= 0x2000000000ull && v < 0x2100000000ull);
+}
+// #312: report one suspicious fence write with its build-journal verdict. kindtag: "REL1" etc.
+static void report_suspect_write(const char* kindtag, uint64_t addr, uint64_t value, uint64_t pre,
+                                 uint64_t pkt) {
+    static std::atomic<int> n{0};
+    if (n.fetch_add(1) >= 96) return;
+    uint64_t baddr = 0, bpre = 0, bt = 0;
+    int have = prosper_fence_journal_lookup(pkt, &baddr, &bpre, &bt);
+    fprintf(stderr, "[agc] SUSPECT-%s [0x%llx] pre=0x%llx value=0x%llx pkt=0x%llx t=%llums | "
+                    "journal:%s built@%llums(age=%lldms) built-addr=0x%llx%s pre@build=0x%llx%s\n",
+            kindtag, (unsigned long long)addr, (unsigned long long)pre, (unsigned long long)value,
+            (unsigned long long)pkt, (unsigned long long)now_ms(),
+            have ? "" : " MISS", (unsigned long long)bt,
+            have ? (long long)(now_ms() - bt) : -1,
+            (unsigned long long)baddr, (have && baddr != addr) ? " TARGET-CHANGED" : "",
+            (unsigned long long)bpre, (have && ptr_like(bpre)) ? " STALE-AT-BUILD" : "");
+}
+
 // Honor a RELEASE_MEM / EVENT_WRITE_EOP completion write. data_sel (Kyty GraphicsCbReleaseMem allows {2,3};
 // shadPS4 DataSelect enum): 1=write 32-bit value, 2=write 64-bit value, 3=write 64-bit GPU clock. The write
 // uses memcpy so an only-4-byte-aligned 64-bit label is handled portably. CONFIDENCE: HIGH — address,
@@ -111,16 +171,15 @@ static void honor_eop_write(const Pm4Command& c) {
                   // #312 stomp-catcher: a live fence label holds small ints/timestamps; a freed
                   // MallocBinned3 FFreeBlock header holds heap POINTERS. Pointer-like pre-content
                   // means this fence write is landing in freed (or reused) memory — log it in the
-                  // act, with the packet address for attribution. Diagnostic only, always-on
-                  // (one 8-byte read per fence write), bounded to 64 reports.
+                  // act, with the packet address + the build-journal verdict (timing vs wrong-
+                  // target). A fence TARGET inside the allocator-metadata region (0x20xxxxxxxx,
+                  // the FPoolInfo tables) is suspect regardless of content. Diagnostic, bounded.
+                  // (Run-1 finding: legit fence labels DO live in the 0x20xxxxxxxx region — a
+                  // target-region trigger caught only benign fences and burned the report cap.
+                  // Trigger on pointer-like PRE-CONTENT only.)
                   uint64_t pre = 0; memcpy(&pre, dst, sizeof pre);
-                  if (pre >= 0x1000000000ull && pre < 0x1200000000ull) {
-                      static std::atomic<int> n{0};
-                      if (n.fetch_add(1) < 64)
-                          fprintf(stderr, "[agc] EOP-WRITE-OVER-POINTER [0x%llx] pre=0x%llx value=0x%llx pkt=0x%llx\n",
-                                  (unsigned long long)c.rel_addr, (unsigned long long)pre,
-                                  (unsigned long long)c.rel_value, (unsigned long long)pkt_addr(c));
-                  }
+                  if (ptr_like(pre))
+                      report_suspect_write("REL1", c.rel_addr, c.rel_value, pre, pkt_addr(c));
                   uint32_t v = (uint32_t)c.rel_value; memcpy(dst, &v, sizeof v);
                   ring_record(c.rel_addr, v, 4, 1, pkt_addr(c)); break; }
         case 2: { if (!c.rel_value_valid) return;
@@ -168,6 +227,13 @@ static void honor_event_write(const Pm4Command& c) {
 // Honor a WRITE_DATA packet: copy the inline dwords to the destination address (same synchronous timing).
 static void honor_write_data(const Pm4Command& c) {
     if (eop_writes_disabled() || !c.wd_addr || (c.wd_addr & 3) || !c.wd_data || !c.wd_num) return;
+    // #312 stomp-catcher (same as the ReleaseMem one): a small label-init WriteData landing over
+    // pointer-like memory, or targeting the allocator-metadata region, is a suspect stomp.
+    if (c.wd_num <= 4) {
+        uint64_t pre = 0; memcpy(&pre, (const void*)(uintptr_t)c.wd_addr, sizeof pre);
+        if (ptr_like(pre))
+            report_suspect_write("WDATA", c.wd_addr, c.wd_data[0], pre, pkt_addr(c));
+    }
     memcpy((void*)(uintptr_t)c.wd_addr, c.wd_data, (size_t)c.wd_num * 4);
     ring_record(c.wd_addr, c.wd_data[0], (uint8_t)(c.wd_num * 4 > 255 ? 255 : c.wd_num * 4), 3, pkt_addr(c));
     if (getenv("PROSPER_GFXLOG"))
@@ -530,10 +596,16 @@ void GpuState::apply(const Pm4Command& c) {
                     static const bool defer_on = [] {
                         const char* e = getenv("PROSPER_WAIT_DEFER");
                         return e && strtol(e, nullptr, 0) != 0; }();
-                    fprintf(stderr, "[agc] WaitRegMem NOT satisfied at fold time: [0x%llx]&0x%llx = 0x%llx, func=%u ref=0x%llx — %s\n",
+                    // #312 discriminator: build-journal age + freed-heap-shaped label content.
+                    uint64_t baddr = 0, bpre = 0, bt = 0;
+                    int have = prosper_fence_journal_lookup(pkt_addr(c), &baddr, &bpre, &bt);
+                    fprintf(stderr, "[agc] WaitRegMem NOT satisfied at fold time: [0x%llx]&0x%llx = 0x%llx, func=%u ref=0x%llx — %s | built@%llums(age=%lldms)%s pre@build=0x%llx%s\n",
                             (unsigned long long)c.wm_addr, (unsigned long long)c.wm_mask,
                             (unsigned long long)(mem & c.wm_mask), c.wm_func, (unsigned long long)c.wm_ref,
-                            defer_on ? "pausing queue (deferred effects)" : "dependency violated");
+                            defer_on ? "pausing queue (deferred effects)" : "dependency violated",
+                            (unsigned long long)bt, have ? (long long)(now_ms() - bt) : -1,
+                            (have && baddr != c.wm_addr) ? " TARGET-CHANGED" : "",
+                            (unsigned long long)bpre, ptr_like(mem) ? " CONTENT-PTR-LIKE(freed?)" : "");
                     if (defer_on) {
                         g_fold_deferring = true;
                         g_defer_streams++;
