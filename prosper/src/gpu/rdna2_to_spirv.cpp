@@ -845,6 +845,10 @@ struct RegState {
     uint32_t scc = 0;          // scalar condition code (bool); set by s_cmp_*/SCC-writing SOP2, read by s_cselect
     uint32_t exec = 0;         // per-lane execution mask (bool); v_cmpx narrows it, output store honors it
     bool exec_narrowed = false; // true once EXEC is narrowed below all-lanes-on (so VGPR writes predicate)
+    // PC-relative EMBEDDED TABLES (#273): mubuf pc -> the table's dwords, resolved by
+    // detect_pcrel_tables (an s_getpc_b64-derived V# whose num_records is a known constant). The
+    // shader BLOB carries the table; the recompiler folds it into a compile-time constant lookup.
+    std::unordered_map<uint32_t, std::vector<uint32_t>> mubuf_pcrel_tables;
 };
 
 // Predicate a just-computed VGPR write against EXEC: under a narrowed mask, inactive lanes keep their
@@ -1214,7 +1218,10 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
         if (in.is_end) break;
         if (in.fmt != Rdna2Format::SOPP) continue;
         switch (in.opcode) {
-            case 0x02: case 0x08: case 0x09: return {};              // s_branch / execz / execnz -> reject
+            case 0x02: case 0x09: return {};                         // s_branch / execnz -> reject
+            case 0x08:                                               // execz: allowed ONLY when it's a
+                if (skip && skip->count(in.pc)) continue;            // safe-linearized predication branch
+                return {};                                           // (emit_alu no-ops it inside emit_range)
             case 0x06: case 0x07:                                    // vccz / vccnz
                 if (!allow_vcc) return {};
                 break;
@@ -1417,6 +1424,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                             rs.sreg[in.dst.value + 1] = b.uconst(in.src[0].value < 0 ? 0xFFFFFFFFu : 0u);
                             rs.sreg_srt.erase(in.dst.value); rs.sreg_srt.erase(in.dst.value + 1);
                             data_copied = true;
+                        } else if (in.src[0].kind == OperandKind::Literal) {
+                            // 32-bit literal on a B64 move: zero-extended (the f64 high-placement rule is
+                            // for double operands only; integer/untyped b64 literals zero-extend).
+                            // CONFIDENCE: MED (matches llvm-mc's value validation for s_mov_b64 literals).
+                            rs.sreg[in.dst.value]     = b.uconst(in.literal);
+                            rs.sreg[in.dst.value + 1] = b.uconst(0);
+                            rs.sreg_srt.erase(in.dst.value); rs.sreg_srt.erase(in.dst.value + 1);
+                            data_copied = true;
                         }
                         if (data_copied && !m) {   // data-only move: drop any stale saved-mask alias
                             rs.sreg_bool.erase(in.dst.value); rs.sreg_bool_narrowed.erase(in.dst.value);
@@ -1430,6 +1445,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (!m) ok = false;
                     else { rs.exec = (in.opcode == 0x24) ? b.land(rs.exec, m) : b.lor(rs.exec, m);
                            rs.exec_narrowed = true; }
+                }
+                return true;
+            }
+            if (in.opcode == 0x1f) {   // s_getpc_b64
+                // Accepted ONLY when the pcrel pre-pass FOLDED an embedded-table load from this
+                // shader (rs.mubuf_pcrel_tables non-empty) — the pair then only feeds that folded
+                // chain. Otherwise the PC would flow into unmodeled address math: keep rejecting.
+                if (rs.mubuf_pcrel_tables.empty()) { ok = false; return true; }
+                for (int k = 0; k < 2; k++) {
+                    rs.sreg.erase(in.dst.value + k); rs.sreg_srt.erase(in.dst.value + k);
                 }
                 return true;
             }
@@ -1645,6 +1670,19 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x37: d = b.iun(Op_Not, a); break;               // v_not_b32
                 case 0x38: d = b.iun(Op_BitReverse, a); break;        // v_bfrev_b32
                 default: ok = false;
+            }
+            // SDWA output modifiers: OMOD scale (×2/×4/×0.5) then CLAMP saturate, on FLOAT-result
+            // opcodes only (mirrors the VOP2/VOP3 fresult path; DOLL VS: `v_exp_f32_sdwa … clamp`).
+            // A modifier on a non-float-result op would silently drop — reject loudly instead.
+            if (ok && (in.omod || in.clamp)) switch (in.opcode) {
+                case 0x05: case 0x06: case 0x20: case 0x21: case 0x22: case 0x23: case 0x24:
+                case 0x25: case 0x27: case 0x2A: case 0x2B: case 0x2E: case 0x33: case 0x35: case 0x36:
+                    if      (in.omod == 1) d = b.fbin(Op_FMul, d, b.uconst(fbits(2.0f)));
+                    else if (in.omod == 2) d = b.fbin(Op_FMul, d, b.uconst(fbits(4.0f)));
+                    else if (in.omod == 3) d = b.fbin(Op_FMul, d, b.uconst(fbits(0.5f)));
+                    if (in.clamp) d = b.fext2(Glsl_FMax, b.fext2(Glsl_FMin, d, b.uconst(fbits(1.0f))), b.uconst(fbits(0.0f)));
+                    break;
+                default: ok = false; break;
             }
             if (ok) predicate_write(b, rs, in.dst.value, old_d);
             return true;
@@ -2095,6 +2133,31 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
             uint32_t offset = in.literal & 0xFFFu;
             bool offen = (in.literal >> 12) & 1u, idxen = (in.literal >> 13) & 1u;
+            // PC-relative EMBEDDED TABLE (#273): this load's V# was built from s_getpc_b64 and the
+            // table bytes live inside the shader blob — detect_pcrel_tables already copied them out.
+            // Fold to a compile-time constant lookup: dword index = (inst offset + offen VADDR) >> 2;
+            // out-of-range indexes read 0 (the hardware's OOB contract for a bounded V#).
+            if (!is_format && !is_store) {
+                auto pt = rs.mubuf_pcrel_tables.find(in.pc);
+                if (pt != rs.mubuf_pcrel_tables.end()) {
+                    const std::vector<uint32_t>& tab = pt->second;
+                    uint32_t addr = b.uconst(offset);
+                    if (offen) { Operand ov{OperandKind::VGPR, in.src[0].value};
+                                 addr = b.ibin(Op_IAdd, addr, val(ov)); }
+                    uint32_t idx = b.ibin(Op_ShiftRightLogical, addr, b.uconst(2));
+                    for (uint32_t k = 0; k < n; k++) {
+                        int d = in.dst.value + (int)k;
+                        uint32_t old = vreg_old(b, rs, d);
+                        uint32_t kidx = k ? b.ibin(Op_IAdd, idx, b.uconst(k)) : idx;
+                        uint32_t acc = b.uconst(0);   // OOB -> 0
+                        for (uint32_t t = 0; t < (uint32_t)tab.size(); t++)
+                            acc = b.sel(b.ucmp(Op_IEqual, kidx, b.uconst(t)), b.uconst(tab[t]), acc);
+                        rs.vreg[d] = acc;
+                        predicate_write(b, rs, d, old);
+                    }
+                    return true;
+                }
+            }
             uint32_t binding = 2, stride = 0;   // overwritten by SRSRC resolution below whenever a resource
                                                 // table is present (format AND raw ops); the binding-2 default
                                                 // survives only on the table-less offline path (see below)
@@ -2430,6 +2493,125 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
     }
 }
 
+// PC-relative EMBEDDED-TABLE detection (#273). Compilers put small constant lookup tables (a 4x4
+// ordered-dither matrix, etc.) directly after the shader code and address them with an inline-built
+// V#: `s_getpc_b64 s[a:a+1]; s_add_u32 sa, <off>, sa; s_addc_u32 sa+1, 0, sa+1; s_mov_b32 sa+2,
+// <num_records>; s_mov_b32 sa+3, <cfg>; buffer_load_dwordx4 v, v, s[a:a+3], 0 offen`. The table
+// BYTES are inside the code blob we are recompiling, so the load can be folded to a compile-time
+// constant lookup. This pass does forward constant propagation over the LINEAR stream (facts are
+// killed on any other write; a fact is only used when no branch target enters between its def and
+// the load) and returns: mubuf pc -> the table's dwords copied out of the blob.
+// CONFIDENCE: MED-HIGH — exact for the compiler idiom (verified against DOLL's dither PS); every
+// guard failure falls back to the old reject.
+std::unordered_map<uint32_t, std::vector<uint32_t>> detect_pcrel_tables(
+        const std::vector<Rdna2Inst>& ins, const uint32_t* code, size_t dwords) {
+    std::unordered_map<uint32_t, std::vector<uint32_t>> out;
+    std::unordered_map<int, uint64_t> pcoff;   // reg -> byte offset into the code blob (pair LO half)
+    std::unordered_set<int> pchi;              // regs holding the matching HI half
+    std::unordered_map<int, uint32_t> kconst;  // reg -> compile-time constant (s_mov_b32 literal/inline)
+    std::unordered_map<int, uint32_t> fact_pc; // reg -> pc where its current fact was established
+    std::vector<uint32_t> br_targets;          // all branch targets (for the entry-soundness check)
+    for (const auto& in : ins) {
+        if (in.is_end) break;
+        if (in.fmt == Rdna2Format::SOPP && !sopp_is_noop(in) &&
+            in.opcode >= 0x02 && in.opcode <= 0x09 && in.opcode != 0x03)
+            br_targets.push_back(in.pc + in.len_dwords + (uint32_t)(int32_t)in.simm16);
+    }
+    auto kill = [&](int r) { pcoff.erase(r); pchi.erase(r); kconst.erase(r); fact_pc.erase(r); };
+    auto imm_of = [&](const Operand& o, const Rdna2Inst& in, uint32_t* v) -> bool {
+        if (o.kind == OperandKind::Literal)   { *v = in.literal; return true; }
+        if (o.kind == OperandKind::InlineInt) { *v = (uint32_t)o.value; return true; }
+        if (o.kind == OperandKind::SGPR)      { auto it = kconst.find(o.value);
+                                                if (it != kconst.end()) { *v = it->second; return true; } }
+        return false;
+    };
+    for (const auto& in : ins) {
+        if (in.is_end) break;
+        switch (in.fmt) {
+            case Rdna2Format::SOP1:
+                kill(in.dst.value);
+                if (in.opcode == 0x1f) {                     // s_getpc_b64: pair = address of NEXT inst
+                    kill(in.dst.value + 1);
+                    pcoff[in.dst.value] = (uint64_t)(in.pc + in.len_dwords) * 4u;
+                    pchi.insert(in.dst.value + 1);
+                    fact_pc[in.dst.value] = in.pc; fact_pc[in.dst.value + 1] = in.pc;
+                } else if (in.opcode == 0x03) {              // s_mov_b32 <const>
+                    uint32_t v;
+                    if (imm_of(in.src[0], in, &v)) { kconst[in.dst.value] = v; fact_pc[in.dst.value] = in.pc; }
+                } else if (in.opcode == 0x04) {              // s_mov_b64 (pair write)
+                    kill(in.dst.value + 1);
+                }
+                break;
+            case Rdna2Format::SOP2: {
+                int d = in.dst.value;
+                if (in.opcode == 0x00) {                     // s_add_u32: pcrel-lo + immediate
+                    uint32_t imm; uint64_t base; bool got = false;
+                    if (in.src[0].kind == OperandKind::SGPR && pcoff.count(in.src[0].value) &&
+                        imm_of(in.src[1], in, &imm)) { base = pcoff[in.src[0].value]; got = true; }
+                    else if (in.src[1].kind == OperandKind::SGPR && pcoff.count(in.src[1].value) &&
+                             imm_of(in.src[0], in, &imm)) { base = pcoff[in.src[1].value]; got = true; }
+                    kill(d);
+                    if (got) { pcoff[d] = base + imm; fact_pc[d] = in.pc; }
+                } else if (in.opcode == 0x04) {              // s_addc_u32: pcrel-hi + 0 (+carry; a real
+                    // carry needs the lo word to wrap over a <4 KB offset — not a shader-blob shape)
+                    uint32_t imm;
+                    bool hi_ok = (in.src[0].kind == OperandKind::SGPR && pchi.count(in.src[0].value) &&
+                                  imm_of(in.src[1], in, &imm) && imm == 0) ||
+                                 (in.src[1].kind == OperandKind::SGPR && pchi.count(in.src[1].value) &&
+                                  imm_of(in.src[0], in, &imm) && imm == 0);
+                    kill(d);
+                    if (hi_ok) { pchi.insert(d); fact_pc[d] = in.pc; }
+                } else {
+                    kill(d);
+                    if (in.opcode == 0x29) kill(d + 1);      // s_bfe_u64 writes a pair
+                }
+                break;
+            }
+            case Rdna2Format::SOPK: kill(in.dst.value); break;
+            case Rdna2Format::SMEM: {
+                uint32_t n = 1;
+                switch (in.opcode) { case 0x1: case 0x9: n=2; break; case 0x2: case 0xA: n=4; break;
+                    case 0x3: case 0xB: n=8; break; case 0x4: case 0xC: n=16; break; default: break; }
+                for (uint32_t k = 0; k < n; k++) kill(in.dst.value + (int)k);
+                break;
+            }
+            case Rdna2Format::VOP1:
+                if (in.opcode == 0x02) kill(in.dst.value);   // v_readfirstlane -> SGPR
+                break;
+            case Rdna2Format::VOPC:
+                if (in.dst.kind == OperandKind::SGPR && in.dst.value <= 105)
+                    { kill(in.dst.value); kill(in.dst.value + 1); }   // e64 compare -> SGPR pair
+                break;
+            case Rdna2Format::VOP3:
+                if (in.sdst.kind == OperandKind::SGPR) { kill(in.sdst.value); kill(in.sdst.value + 1); }
+                break;
+            case Rdna2Format::MUBUF: {
+                if (in.opcode < 0xCu || in.opcode > 0xFu) break;   // raw loads only
+                const int sb = in.src[1].value;                    // SRSRC base SGPR of the V# quad
+                if (!pcoff.count(sb) || !pchi.count(sb + 1) || !kconst.count(sb + 2)) break;
+                const uint32_t nrec = kconst[sb + 2];              // V# word2 = num_records (bytes here)
+                const bool offen = (in.literal >> 12) & 1u, idxen = (in.literal >> 13) & 1u;
+                const bool soff0 = (in.src[2].kind == OperandKind::Special && in.src[2].value == 125) ||
+                                   (in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0);
+                const uint64_t off = pcoff[sb];
+                // Entry soundness: no branch may enter between the newest contributing fact and here.
+                uint32_t newest = 0;
+                for (int r : {sb, sb + 1, sb + 2}) { auto it = fact_pc.find(r); if (it != fact_pc.end() && it->second > newest) newest = it->second; }
+                bool entered = false;
+                for (uint32_t t : br_targets) if (t > newest && t <= in.pc) { entered = true; break; }
+                if (entered) break;
+                if (idxen || !soff0 || (off & 3u) || (nrec & 3u) || nrec == 0 || nrec > 1024 ||
+                    off / 4 + nrec / 4 > dwords) break;            // unprovable / out of window -> reject
+                out[in.pc] = std::vector<uint32_t>(code + off / 4, code + off / 4 + nrec / 4);
+                (void)offen;                                       // offen just adds the runtime index
+                break;
+            }
+            default: break;   // formats that don't write SGPRs
+        }
+    }
+    return out;
+}
+
 // Emit the instruction body (shared by every stage). Handles a single recognized COUNTED loop as a real
 // structured SPIR-V loop (OpLoopMerge + OpPhi for loop-carried registers); loop-FREE streams walk straight
 // through, byte-identical to the pre-loop-feature behavior. `exp_fn` handles an EXP instruction per stage
@@ -2440,6 +2622,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                bool allow_exec_update, bool allow_smem,
                const std::function<bool(const Rdna2Inst&)>& exp_fn,
                const uint32_t* code = nullptr, size_t dwords = 0) {   // raw stream (forward-if target check)
+    // Fold PC-relative embedded-table loads (s_getpc_b64-built V#s) before the walk — emit_alu's
+    // MUBUF/SOP1 handlers consult rs.mubuf_pcrel_tables (#273).
+    if (code) rs.mubuf_pcrel_tables = detect_pcrel_tables(ins, code, dwords);
     const CountedLoop L = detect_counted_loop(ins);
     size_t idx = 0;
     // Cross-lane wave ops (mbcnt) emit LDS + barriers, which are only valid at wave-uniform points — so

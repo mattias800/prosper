@@ -1576,6 +1576,36 @@ int main() {
     uint32_t badT11 = 0; for (uint32_t i=0;i<N&&gotT11.size()==N;i++) if (gotT11[i]!=expT11[i]) badT11++;
     CHECK(gotT11.size()==N && badT11==0, "T11: v_cmp_gt_f32_sdwa applies |src0| before comparing");
 
+    // Kernel T12: PC-RELATIVE EMBEDDED TABLE (#273 — DOLL's dither PS idiom). The shader builds a
+    // V# with s_getpc_b64 + adds and buffer_loads from a constant table appended AFTER s_endpgm in
+    // the code blob. The recompiler folds the load to a compile-time lookup.
+    //   getpc s[4:5]; s4+=48; addc s5; s6=16(num_records); s7=cfg; u=(uint)a0; byteoff=u*4;
+    //   buffer_load_dword v1, v1, s[4:7], 0 offen  -> table[u]; out=(float)v1.
+    // Table at byte 52 of the blob = 48 bytes past the getpc-return (byte 4). llvm-mc gfx1010.
+    const uint32_t codeT12[] = {
+        0xbe841f00u,               // s_getpc_b64 s[4:5]
+        0x800404b0u,               // s_add_u32 s4, 48, s4
+        0x82050580u,               // s_addc_u32 s5, 0, s5
+        0xbe860390u,               // s_mov_b32 s6, 16
+        0xbe8703ffu, 0x10005004u,  // s_mov_b32 s7, 0x10005004
+        0x7e020f00u,               // v_cvt_u32_f32 v1, v0
+        0x34020282u,               // v_lshlrev_b32 v1, 2, v1
+        0xe0301000u, 0x80010101u,  // buffer_load_dword v1, v1, s[4:7], 0 offen
+        0xbf8c3f70u,               // s_waitcnt vmcnt(0)
+        0x7e000d01u,               // v_cvt_f32_u32 v0, v1
+        0xBF810000u,               // s_endpgm
+        7u, 11u, 13u, 17u,         // the embedded table (16 bytes)
+    };
+    std::vector<uint32_t> spvT12 = recompile_valu(codeT12, sizeof(codeT12)/4, 1, 0);
+    CHECK(!spvT12.empty(), "recompiled T12 (s_getpc_b64 embedded-table load) -> SPIR-V");
+    std::vector<float> inT12(N), expT12(N);
+    const uint32_t tabT12[4] = {7u, 11u, 13u, 17u};
+    for (uint32_t i = 0; i < N; i++) { inT12[i] = (float)(i % 4); expT12[i] = (float)tabT12[i % 4]; }
+    std::vector<float> gotT12 = prosper::test::run_compute(spvT12, inT12, N, N);
+    uint32_t badT12 = 0; for (uint32_t i=0;i<N&&gotT12.size()==N;i++) if (gotT12[i]!=expT12[i]) badT12++;
+    printf("  T12(pcrel table) mismatches=%u (out[2]=%g expect=%g)\n", badT12, gotT12.size()==N?gotT12[2]:-1, expT12[2]);
+    CHECK(gotT12.size()==N && badT12==0, "T12: buffer_load through a getpc-built V# reads the embedded table");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
