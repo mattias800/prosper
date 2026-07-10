@@ -215,6 +215,11 @@ HLE(s_syss_param_int) {
     if (paramId == 1) {                      // SCE_SYSTEM_SERVICE_PARAM_ID_LANG
         val = 1;                             // SCE_SYSTEM_PARAM_LANG_ENGLISH_US
         if (const char* e = getenv("PROSPER_SYS_LANG")) val = (int32_t)strtol(e, nullptr, 0);
+    } else if (paramId == 1000) {            // SCE_SYSTEM_SERVICE_PARAM_ID_ENTER_BUTTON_ASSIGN
+        // Cross = confirm (Western default). Previously fell through to val=0 = Circle, which inverts
+        // ✕/○ confirm/cancel and on-screen button prompts relative to the en-US locale we present.
+        val = 1;                             // Cross (shadPS4 default; Circle=0)
+        if (const char* e = getenv("PROSPER_ENTER_BUTTON")) val = (int32_t)strtol(e, nullptr, 0);
     }
     if (a1) *(int32_t*)PW(a1) = val;
     return 0;
