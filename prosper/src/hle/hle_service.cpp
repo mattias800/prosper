@@ -83,6 +83,13 @@ HLE(s_user_getevent)  {
     if (a0 && delivered.exchange(1) == 0) { int32_t* ev = (int32_t*)PW(a0); ev[0] = 0; ev[1] = 1; return 0; }
     return 0x80960007ull;   // SCE_USER_SERVICE_ERROR_NO_EVENT
 }
+// sceSystemServiceReceiveEvent(SceSystemServiceEvent* ev): the system event stream (resume, launch-app,
+// entitlement-update, share-menu, ...). Unregistered, it fell to the return-0 stub = "an event was
+// received" while leaving the 8196-byte out-struct (4-byte eventType + 8192-byte union) uninitialized ->
+// the guest dispatched on a garbage eventType (same harmful class as s_user_getevent above; imported by
+// both Unity targets). The truthful idle answer is NO_EVENT with nothing written. shadPS4
+// systemservice.cpp: NO_EVENT = 0x80A10004, PARAMETER (ev==NULL) = 0x80A10003.
+HLE(s_sysservice_receiveevent) { if (!a0) return 0x80A10003ull; return 0x80A10004ull; }
 HLE(s_ok)             { return 0; }
 // libSceAvPlayer (#324): a title can play an intro/title video via AvPlayer. We don't decode video;
 // implement just enough lifecycle that Init returns a VALID (non-NULL) handle and playback reports
@@ -973,6 +980,7 @@ void register_service_hle() {
     R("sceAvPlayerStop",           s_ok);
     R("sceAvPlayerClose",          s_ok);
     R("sceSystemServiceGetStatus", s_syss_getstatus);
+    R("sceSystemServiceReceiveEvent", s_sysservice_receiveevent);   // NO_EVENT, don't leave the struct garbage
     // sceSystemServiceGetDisplaySafeAreaInfo (1n37q1Bvc5Y) — fill ratio=1.0 (see s_syss_safearea).
     Hle::register_fn("1n37q1Bvc5Y", (HleFn)s_syss_safearea, "sceSystemServiceGetDisplaySafeAreaInfo");
 
