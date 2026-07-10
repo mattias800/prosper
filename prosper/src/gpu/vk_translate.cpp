@@ -79,9 +79,13 @@ VkFormat vk_color_format(uint32_t format, uint32_t number_type, uint32_t comp_sw
                           case 4: return VkFormat::R16G16_UINT;  case 5: return VkFormat::R16G16_SINT;
                           case 7: return VkFormat::R16G16_SFLOAT; }
             break;
-        case 0x7u:   // COLOR_11_11_10 (float-only packed HDR target)
+        case 0x6u:   // COLOR_10_11_11 — the ALIAS of COLOR_11_11_10 (0x7). shadPS4 canonicalizes 0x7->0x6
+        case 0x7u:   // COLOR_11_11_10 (float-only packed HDR target). Both codes resolve to R11G11B10F;
+                     // only 0x7 was handled, so a guest HDR/bloom target programming FORMAT=6 (the
+                     // canonical code) fell through to Undefined and its whole pass was dropped (#465).
             if (std_swap && nt == 7u) return VkFormat::B10G11R11_UFLOAT_PACK32;
             break;
+        case 0x8u:   // COLOR_10_10_10_2 — the ALIAS of COLOR_2_10_10_10 (0x9). shadPS4 canonicalizes 0x8->0x9.
         case 0x9u:   // COLOR_2_10_10_10
             if (nt == 0u) return std_swap ? VkFormat::A2B10G10R10_UNORM_PACK32
                         : alt_swap        ? VkFormat::A2R10G10B10_UNORM_PACK32 : VkFormat::Undefined;

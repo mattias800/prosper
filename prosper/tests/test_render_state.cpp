@@ -93,6 +93,11 @@ int main() {
     CHECK(vk_color_format(0x9u, 0u, 0u) == VkFormat::A2B10G10R10_UNORM_PACK32, "0x9/UNORM/STD -> A2B10G10R10 (64)");
     CHECK(vk_color_format(0x9u, 0u, 1u) == VkFormat::A2R10G10B10_UNORM_PACK32, "0x9/UNORM/ALT -> A2R10G10B10 (58)");
     CHECK(vk_color_format(0x7u, 7u, 0u) == VkFormat::B10G11R11_UFLOAT_PACK32,  "0x7/FLOAT -> B10G11R11 (122)");
+    // #465: the aliased packed codes 0x6 (COLOR_10_11_11) and 0x8 (COLOR_10_10_10_2) resolve to the same
+    // formats as 0x7 / 0x9 (shadPS4 canonicalizes 0x7->0x6, 0x8->0x9). Previously they fell to Undefined.
+    CHECK(vk_color_format(0x6u, 7u, 0u) == VkFormat::B10G11R11_UFLOAT_PACK32, "0x6 (alias of 0x7)/FLOAT -> B10G11R11");
+    CHECK(vk_color_format(0x8u, 0u, 0u) == VkFormat::A2B10G10R10_UNORM_PACK32, "0x8 (alias of 0x9)/UNORM/STD -> A2B10G10R10");
+    CHECK(vk_color_format(0x8u, 0u, 1u) == VkFormat::A2R10G10B10_UNORM_PACK32, "0x8 (alias of 0x9)/UNORM/ALT -> A2R10G10B10");
     CHECK(vk_color_format(0x10u, 0u, 0u) == VkFormat::R5G6B5_UNORM_PACK16, "0x10/UNORM -> R5G6B5 (4)");
     CHECK(vk_color_format(0x1u, 0u, 0u) == VkFormat::R8_UNORM,   "0x1/UNORM -> R8_UNORM (9, Kyty's R8Unorm row)");
     CHECK(vk_color_format(0x4u, 7u, 0u) == VkFormat::R32_SFLOAT, "0x4/FLOAT -> R32_SFLOAT (100)");
