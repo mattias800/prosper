@@ -25,6 +25,14 @@ static uint32_t PM4(uint32_t len, uint32_t op, uint32_t r) {
     return 0xC0000000u | (((len - 2u) & 0x3fffu) << 16u) | ((op & 0xffu) << 8u) | ((r & (R_NUM - 1u)) << 2u);
 }
 
+// Fold + drain: completion writes ride the modeled pipe-drain queue (#312) and become
+// guest-visible at a drain point — tests assert the guest-visible (post-drain) state.
+static size_t run_cb(const uint32_t* buf, size_t dwords, GpuState& st) {
+    size_t n = run_command_buffer(buf, dwords, st);
+    prosper_gpu_drain_completion_writes();
+    return n;
+}
+
 int main() {
     printf("== test_eop_write ==\n");
 
@@ -40,7 +48,7 @@ int main() {
         buf[4] = 0xF00DBEEFu; buf[5] = 0x12345678u;   // value = 0x12345678F00DBEEF
         buf[6] = 0x04;                                // event action
         GpuState st;
-        size_t n = run_command_buffer(buf, 7, st);
+        size_t n = run_cb(buf, 7, st);
         CHECK(n == 1, "RELEASE_MEM decoded as one packet");
         CHECK(label == 0x12345678F00DBEEFull, "RELEASE_MEM (data_sel=2) wrote the 64-bit fence value to the label");
     }
@@ -55,7 +63,7 @@ int main() {
         buf[3] = 1;                                   // data_sel = Data32Low
         buf[4] = 0x0000CAFEu; buf[5] = 0;
         buf[6] = 0x04;
-        GpuState st; run_command_buffer(buf, 7, st);
+        GpuState st; run_cb(buf, 7, st);
         CHECK((label & 0xffffffffu) == 0x0000CAFEu, "RELEASE_MEM (data_sel=1) wrote the low 32 bits");
         CHECK((label >> 32) == 0xAAAAAAAAu, "RELEASE_MEM (data_sel=1) left the upper 32 bits untouched");
     }
@@ -70,7 +78,7 @@ int main() {
         };
         uint32_t b1[7], b2[7];
         build(b1, (uint64_t)(uintptr_t)&l1); build(b2, (uint64_t)(uintptr_t)&l2);
-        GpuState st; run_command_buffer(b1, 7, st); run_command_buffer(b2, 7, st);
+        GpuState st; run_cb(b1, 7, st); run_cb(b2, 7, st);
         CHECK(l1 != 0 && l2 >= l1, "RELEASE_MEM (data_sel=3) wrote a monotonic non-zero GPU clock");
     }
 
@@ -86,7 +94,7 @@ int main() {
         buf[1] = (uint32_t)(addr & 0xffffffffu); buf[2] = (uint32_t)(addr >> 32);
         buf[3] = 3; buf[4] = 0; buf[5] = 0; buf[6] = 0x04;
         uint64_t before = prosper_guest_tsc_ns();
-        GpuState st; run_command_buffer(buf, 7, st);
+        GpuState st; run_cb(buf, 7, st);
         uint64_t after = prosper_guest_tsc_ns();
         CHECK(label >= before && label <= after,
               "data_sel=3 fence lies on the sceKernelReadTsc timeline (shared guest TSC, not steady_clock)");
@@ -102,7 +110,7 @@ int main() {
         buf[2] = (uint32_t)(addr & 0xffffffffu); buf[3] = (uint32_t)(addr >> 32);
         buf[4] = 3;                                   // num_dwords
         buf[5] = 0x11111111u; buf[6] = 0x22222222u; buf[7] = 0x33333333u;
-        GpuState st; run_command_buffer(buf, 8, st);
+        GpuState st; run_cb(buf, 8, st);
         CHECK(target[0] == 0x11111111u && target[1] == 0x22222222u && target[2] == 0x33333333u,
               "WRITE_DATA copied all 3 inline dwords to the destination");
     }
@@ -116,7 +124,7 @@ int main() {
         buf[1] = 0; buf[2] = (uint32_t)(addr & 0xffffffffu); buf[3] = (uint32_t)(addr >> 32);
         buf[4] = 99;                                  // lies: claims 99 dwords, only 2 present (buf[5],buf[6])
         buf[5] = 0xDEADu; buf[6] = 0xBEEFu;
-        GpuState st; run_command_buffer(buf, 7, st);
+        GpuState st; run_cb(buf, 7, st);
         CHECK(target[0] == 0xDEADu && target[1] == 0xBEEFu && target[2] == 0 && target[3] == 0,
               "WRITE_DATA clamped num_dwords to what the packet actually holds");
     }
@@ -131,7 +139,7 @@ int main() {
         buf[0] = PM4(4, IT_EVENT_WRITE, 0);
         buf[1] = 0x14;                                // some event_type
         buf[2] = (uint32_t)(addr & 0xffffffffu); buf[3] = (uint32_t)(addr >> 32);
-        GpuState st; run_command_buffer(buf, 4, st);
+        GpuState st; run_cb(buf, 4, st);
         CHECK(label != 0, "address-carrying EVENT_WRITE wrote a completion value to the label (was dropped)");
     }
     // An address-LESS EVENT_WRITE (event_addr == 0, a pipeline-sync event) must remain a no-op.
@@ -140,7 +148,7 @@ int main() {
         buf[0] = PM4(4, IT_EVENT_WRITE, 0);
         buf[1] = 0x16; buf[2] = 0; buf[3] = 0;        // no address
         GpuState st;
-        size_t n = run_command_buffer(buf, 4, st);    // must not fault / write anywhere
+        size_t n = run_cb(buf, 4, st);    // must not fault / write anywhere
         CHECK(n == 1, "address-less EVENT_WRITE decodes and is a harmless no-op");
     }
 

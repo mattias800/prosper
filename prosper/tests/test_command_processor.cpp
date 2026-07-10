@@ -22,6 +22,14 @@ struct Dcb {   // mirror of hle_agc.cpp's AgcDcb
     void* callback; void* user_data; uint32_t reserved_dw; uint32_t pad;
 };
 
+// Fold + drain: completion writes ride the modeled pipe-drain queue (#312) and become
+// guest-visible at a drain point — tests assert the guest-visible (post-drain) state.
+static size_t run_cb(const uint32_t* buf, size_t dwords, GpuState& st) {
+    size_t n = run_command_buffer(buf, dwords, st);
+    prosper_gpu_drain_completion_writes();
+    return n;
+}
+
 int main() {
     printf("== test_command_processor ==\n");
     register_builtin_hle();
@@ -53,7 +61,7 @@ int main() {
     draw(D, 0x0006, 0, 0, 0, 0);
 
     GpuState st;
-    size_t n = run_command_buffer(buffer, 256, st);
+    size_t n = run_cb(buffer, 256, st);
     printf("  applied %zu packets\n", n);
 
     // Cx register file: the three offsets set to their values.
@@ -85,7 +93,7 @@ int main() {
         pkt[1] = 0x100u;                                        // start register offset
         for (uint32_t k = 0; k < 5; k++) pkt[2 + k] = 0xD0000000u + k;
         GpuState s2;
-        run_command_buffer(pkt, 1 + M, s2);
+        run_cb(pkt, 1 + M, s2);
         CHECK(s2.sh.size() == 5, "SET_SH_REG range set all 5 registers (not just the first)");
         bool all = true;
         for (uint32_t k = 0; k < 5; k++) all &= (s2.sh.count(0x100u + k) && s2.sh[0x100u + k] == 0xD0000000u + k);
@@ -107,7 +115,7 @@ int main() {
             Dcb fd{}; fd.bottom = fbuf; fd.top = fbuf + 64; fd.cursor_up = fbuf; fd.cursor_down = fbuf + 64;
             setflip((uint64_t)(uintptr_t)&fd, 0x1001, 1, 2, 0x1234567890abcdefull, 0);
             GpuState s3;
-            run_command_buffer(fbuf, 64, s3);
+            run_cb(fbuf, 64, s3);
             flipstatus(0x1001, (uint64_t)(uintptr_t)st_after, 0, 0, 0, 0);
             uint64_t cnt_b = *(uint64_t*)(st_before + 0x00), cnt_a = *(uint64_t*)(st_after + 0x00);
             int64_t  arg_a = *(int64_t*)(st_after + 0x18);
@@ -132,7 +140,7 @@ int main() {
             idx(ID, /*index_size*/ 2, 0, 0, 0, 0);              // 16-bit indices
             drawi(ID, /*index_count*/ 6, (uint64_t)(uintptr_t)indices, /*modifier*/ 0x40000000ull, 0, 0);
             GpuState s5;
-            run_command_buffer(ibuf, 64, s5);
+            run_cb(ibuf, 64, s5);
             CHECK(s5.draws.size() == 1, "DrawIndex recorded one draw");
             if (s5.draws.size() == 1) {
                 const auto& d = s5.draws[0];
@@ -153,15 +161,15 @@ int main() {
         auto set_sh = [&](uint32_t off, uint32_t val, GpuState& s) {
             pkt[0] = 0xC0000000u | (1u << 16) | (0x76u << 8);   // SET_SH_REG, 2 payload dwords
             pkt[1] = off; pkt[2] = val;
-            run_command_buffer(pkt, 3, s);
+            run_cb(pkt, 3, s);
         };
         uint32_t draw_pkt[3] = { 0xC0000000u | (1u << 16) | (0x10u << 8) | (0x04u << 2), 6, 0 };
         GpuState s4;
         set_sh(0x42, 0xAAAA, s4);
-        run_command_buffer(draw_pkt, 3, s4);                    // draw 0 under 0xAAAA
-        run_command_buffer(draw_pkt, 3, s4);                    // draw 1: no writes since draw 0
+        run_cb(draw_pkt, 3, s4);                    // draw 0 under 0xAAAA
+        run_cb(draw_pkt, 3, s4);                    // draw 1: no writes since draw 0
         set_sh(0x42, 0xBBBB, s4);
-        run_command_buffer(draw_pkt, 3, s4);                    // draw 2 under 0xBBBB
+        run_cb(draw_pkt, 3, s4);                    // draw 2 under 0xBBBB
         CHECK(s4.draws.size() == 3 && s4.draws[0].state && s4.draws[2].state, "3 draws with snapshots");
         if (s4.draws.size() == 3 && s4.draws[0].state && s4.draws[2].state) {
             CHECK(s4.draws[0].state->sh.at(0x42) == 0xAAAA, "draw 0 snapshot holds the value AT the draw");

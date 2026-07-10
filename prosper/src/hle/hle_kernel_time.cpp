@@ -428,9 +428,14 @@ void prosper_eq_add_eop(uint64_t eq, int64_t id, uint64_t udata) {
 // Fire the registered EOP events — called when a submit completes. Posts TriggerEvent(ident=id,
 // filter=GraphicsCore, data=id, udata) to each registered equeue, matching shadPS4's IRQ handler.
 // Inert if none registered.
+// GPU pipe-drain completion-write drain (src/gpu/command_processor.cpp, #312): an EOP EVENT must
+// never overtake its submit's fence/label WRITES — drain the write queue before posting. Weak so
+// binaries that link the kernel HLE without the gpu lib still link.
+extern "C" void prosper_gpu_drain_completion_writes() __attribute__((weak));
 namespace {
     // Actually post one EOP completion to every registered equeue (the worker below calls this).
     void eop_post_now() {
+        if (prosper_gpu_drain_completion_writes) prosper_gpu_drain_completion_writes();
         // Deliver EVERY GPU-completion event as a DISTINCT equeue entry (coalesce=false). All EOP events
         // share the same (ident, EVFILT_GRAPHICS_CORE), so coalescing collapses N submit-completions into
         // ONE pending event — and the game's EOP handler posts a work-queue semaphore once per delivered
@@ -1002,12 +1007,12 @@ void register_kernel_time_hle() {
     R("sceSysmoduleIsLoaded", k_ok);
     R("sceKernelLoadStartModule", k_load_start_mod);
     R("sceKernelStopUnloadModule", k_ok);
-    // thread scheduling hints — safe no-ops
-    R("scePthreadSetaffinity", k_ok);
-    R("scePthreadGetaffinity", k_ok);
-    R("scePthreadSetprio", k_ok);
-    R("scePthreadGetprio", k_ok);
-    R("scePthreadSetschedparam", k_ok);
+    // Thread scheduling: Set*/Get* are registered in hle_kernel.cpp, where the Get* handlers FILL
+    // their out-params (affinity mask 0xff, priority 700) — a Get* that returns success without
+    // writing hands the caller uninitialized stack memory. register_kernel_time_hle() runs AFTER
+    // register_kernel_hle(), so re-registering scePthreadGet{affinity,prio} to a bare k_ok here
+    // (last-write-wins) SILENTLY re-broke exactly that fix. Only scePthreadRename is unique to this
+    // file; leave the scheduling functions to hle_kernel.cpp.
     R("scePthreadRename", k_ok);
     R("sceKernelUuidCreate", k_uuid_create);
     R("_exit", k_exit);

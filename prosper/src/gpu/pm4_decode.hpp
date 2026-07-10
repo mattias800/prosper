@@ -23,7 +23,7 @@ enum : uint32_t {
     R_DRAW_INDEX = 0x03, R_DRAW_INDEX_AUTO = 0x04, R_DRAW_RESET = 0x05, R_WAIT_FLIP_DONE = 0x06,
     R_SH_REGS_INDIRECT = 0x11, R_CX_REGS_INDIRECT = 0x12, R_UC_REGS_INDIRECT = 0x13,
     R_ACQUIRE_MEM = 0x14, R_WRITE_DATA = 0x15, R_WAIT_MEM_64 = 0x16, R_FLIP = 0x17,
-    R_RELEASE_MEM = 0x18, R_DISPATCH_DIRECT = 0x1a,
+    R_RELEASE_MEM = 0x18, R_DMA_DATA = 0x19, R_DISPATCH_DIRECT = 0x1a,
     // Gen5 indexed-draw state + draw (issue #232, DOLL/UE4 geometry path). These three builders
     // (sceAgcDcbSetIndexBuffer / SetIndexCount / DrawIndexOffset) are the ONLY draw path UE4 uses;
     // they were unimplemented->0 (no packet appended) so every scene draw was silently dropped.
@@ -48,7 +48,8 @@ struct Pm4Command {
     enum class Kind {
         DrawReset, WaitFlipDone, SetShRegDirect, SetRegsIndirect, SetIndexType,
         DrawIndex, DrawIndexAuto, EventWrite, AcquireMem, WriteData, WaitRegMem, Flip, ReleaseMem,
-        DispatchDirect, SetIndexBase, SetIndexCount, DrawIndexOffset, Jump, SetPredication, Unknown,
+        DispatchDirect, SetIndexBase, SetIndexCount, DrawIndexOffset, Jump, SetPredication,
+        DmaData, Unknown,
     } kind = Kind::Unknown;
 
     uint32_t        header = 0;
@@ -140,6 +141,20 @@ struct Pm4Command {
     uint64_t pred_addr = 0;              // SetPredication: 64-bit condition address (0 = window end)
     uint32_t pred_op = 0;                // SetPredication: raw op field
     bool     pred_valid = false;         // SetPredication: payload carried the operands
+
+    // DmaData (sceAgcDcbDmaData / sceAgcAcbDmaData -> R_DMA_DATA; issue #312). The CP-DMA engine
+    // packet. ABI re-pinned from three eboot callsites (see agc_dcb_dma_data): a1 = source address
+    // OR immediate value (the patcher family is named sceAgcDmaDataPatchSetSrcAddressOrOffsetOr-
+    // IMMEDIATE), a4 = DESTINATION address (a callsite passes a freshly-malloc'd buffer there),
+    // stack arg9 = byte count. DOLL's RHI translate loop emits DmaData(src=0, dst=<per-chunk fence
+    // label>, 4 bytes) per segment — the GPU-side label INIT (label := 0) of the consumed-marker
+    // protocol whose completion leg is ReleaseMem(label <- 1). Packet payload:
+    // [0..1]=dst lo/hi, [2..3]=srcOrImm lo/hi, [4]=numBytes, [5]=sels (a2 | a3<<8).
+    uint64_t dd_dst = 0;                 // DmaData: destination address
+    uint64_t dd_src = 0;                 // DmaData: source address OR immediate value
+    uint32_t dd_bytes = 0;               // DmaData: byte count (0 = unrecovered -> not executed)
+    uint32_t dd_sels = 0;                // DmaData: raw selector args (a2 | a3<<8)
+    bool     dd_valid = false;           // DmaData: payload carried the full operand set
 
     uint32_t flip_handle = 0;            // Flip: sceVideoOut handle
     int32_t  flip_bufidx = -1;           // Flip: display buffer index (-1 = not decoded)

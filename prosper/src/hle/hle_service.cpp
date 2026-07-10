@@ -10,6 +10,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <atomic>
+#include <algorithm>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 #ifdef __linux__
 #include <sys/mman.h>   // msync page-mapped probe in svc_log (diagnostic-only)
 #endif
@@ -229,6 +233,21 @@ HLE(s_dialog_status)     { return (uint64_t)(unsigned)g_msgdialog_status.load();
 // exactly the f_fstat oversized-write class this file warns about.
 HLE(s_dialog_result)   { if (a0) memset(PW(a0), 0, 0x2C); return 0; }
 
+// --- libSceImeDialog (on-screen text-entry dialog) — same common-dialog lifecycle as MsgDialog
+// (#191). We have no keyboard UI, so the dialog auto-completes: Init -> FINISHED(3) immediately, so
+// the game's "poll GetStatus until != RUNNING" loop exits at once instead of hanging on a dialog
+// that never appears; GetResult reports endStatus = OK/ENTER with the (unchanged/empty) input buffer;
+// Term/Abort return to NONE. Status enum is the shared SceCommonDialogStatus (0=NONE,1=INITIALIZED,
+// 2=RUNNING,3=FINISHED). CONFIDENCE: HIGH on the lifecycle (mirrors MsgDialog); MED on the exact
+// GetResult layout — we write only the 4-byte endStatus at offset 0 (the field the game branches on),
+// never more, so a wrong tail-field guess can't corrupt the caller's struct.
+namespace { std::atomic<int> g_imedialog_status{0 /*NONE*/}; }
+HLE(s_imedlg_init)   { g_imedialog_status.store(3 /*FINISHED — auto-complete, no keyboard UI*/); return 0; }
+HLE(s_imedlg_status) { return (uint64_t)(unsigned)g_imedialog_status.load(); }
+HLE(s_imedlg_result) { if (a0) *(int32_t*)PW(a0) = 0 /*SCE_IME_DIALOG_END_STATUS_OK*/; return 0; }
+HLE(s_imedlg_term)   { g_imedialog_status.store(0 /*NONE*/); return 0; }
+HLE(s_imedlg_abort)  { g_imedialog_status.store(0 /*NONE*/); return 0; }
+
 // --- libSceNpTrophy2 (PS5 trophy system) — the DOLL 34.6 GB OOM (issue #213 diagnosis). ---------
 // The guest's trophy bring-up (eboot+0xdbcb43..0xdbcc2e, gdb-captured live) calls
 // sceNpTrophy2GetGameInfo(ctx, handle, out*, 0) — NID 4IzqhhUQ3nk named via nid_hash brute force —
@@ -326,6 +345,108 @@ HLE(s_savedata_init3)   { svc_log("sceSaveDataInitialize3", a0,a1,a2,a3,a4,a5); 
 HLE(s_savedata_term)    { return 0; }
 HLE(s_savedata_txres)   { svc_log("sceSaveDataCreateTransactionResource", a0,a1,a2,a3,a4,a5); return 0; }
 HLE(s_savedata_txres_del) { return 0; }
+
+// --- libSceSaveData "save-data memory" API (#191). A per-(user,slot) fixed-size memory block the
+// managed SaveData layer reads/writes by offset and syncs to storage; on PS5 this is how a title
+// keeps a small always-resident save (settings/progress). We back each slot with a host-memory
+// block: Setup allocates it, Set copies guest->block, Get copies block->guest, Sync commits. Struct
+// layouts + field offsets verified against shadPS4 save_data/savedata.cpp; error codes from
+// savedata_error.h. CONFIDENCE: HIGH on the happy-path round-trip (the contract a title depends on).
+//   OrbisSaveDataMemoryData:  buf@0(ptr) bufSize@8(u64) offset@16(s64)               size 64
+//   OrbisSaveDataMemorySetup2: option@0 userId@4 memorySize@8 iconMemorySize@16
+//                              initParam@24 initIcon@32 slotId@40                    size 64
+//   OrbisSaveDataMemorySet2:  userId@0 [pad@4] data@8(ptr) param@16 icon@24 dataNum@32 slotId@36
+//   OrbisSaveDataMemoryGet2:  userId@0 [pad@4] data@8(ptr) param@16 icon@24 slotId@32
+namespace {
+    std::mutex g_savemem_mx;
+    std::unordered_map<uint64_t, std::vector<uint8_t>> g_savemem;   // key = (userId<<32)|slotId
+    uint64_t savemem_key(int32_t userId, uint32_t slotId) {
+        return ((uint64_t)(uint32_t)userId << 32) | slotId;
+    }
+    template <class T> T ld(uint64_t base, size_t off) {   // read a guest struct field at byte offset
+        T v; memcpy(&v, (const uint8_t*)PW(base) + off, sizeof(T)); return v;
+    }
+    constexpr uint64_t SD_ERR_PARAMETER      = 0x809F0000ull;
+    constexpr uint64_t SD_ERR_MEMORY_NOTREADY = 0x809F0012ull;   // Set/Get before a successful Setup
+}
+// sceSaveDataSetupSaveDataMemory2(setup*, result*): allocate/grow the slot's block to memorySize
+// (zero-filling new bytes, preserving any bytes already there this session). result->existedMemorySize
+// (@0) = the size the block had before — the game uses it to tell first-run from resume.
+HLE(s_savemem_setup) {
+    svc_log("sceSaveDataSetupSaveDataMemory2", a0,a1,a2,a3,a4,a5);
+    if (!a0) return SD_ERR_PARAMETER;
+    int32_t  userId  = ld<int32_t>(a0, 4);
+    uint64_t memSize = ld<uint64_t>(a0, 8);
+    uint32_t slotId  = ld<uint32_t>(a0, 40);
+    uint64_t existed = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_savemem_mx);
+        auto& buf = g_savemem[savemem_key(userId, slotId)];
+        existed = buf.size();
+        if (memSize > buf.size()) buf.resize(memSize, 0);          // grow only; never drop live data
+    }
+    if (a1) *(uint64_t*)PW(a1) = existed;                          // result->existedMemorySize
+    return 0;
+}
+// sceSaveDataSetSaveDataMemory2(set*): copy each of dataNum {buf,bufSize,offset} descriptors from
+// guest memory into the slot's block at its offset (bounds-clamped — never write past the block).
+HLE(s_savemem_set) {
+    svc_log("sceSaveDataSetSaveDataMemory2", a0,a1,a2,a3,a4,a5);
+    if (!a0) return SD_ERR_PARAMETER;
+    int32_t  userId  = ld<int32_t>(a0, 0);
+    uint64_t dataPtr = ld<uint64_t>(a0, 8);
+    uint32_t dataNum = ld<uint32_t>(a0, 32);
+    uint32_t slotId  = ld<uint32_t>(a0, 36);
+    std::lock_guard<std::mutex> lk(g_savemem_mx);
+    auto it = g_savemem.find(savemem_key(userId, slotId));
+    if (it == g_savemem.end()) return SD_ERR_MEMORY_NOTREADY;      // Setup not called for this slot
+    auto& buf = it->second;
+    for (uint32_t i = 0; i < dataNum && dataPtr; i++) {
+        uint64_t d     = dataPtr + (uint64_t)i * 64;               // sizeof(OrbisSaveDataMemoryData)
+        uint64_t gbuf  = ld<uint64_t>(d, 0);
+        uint64_t gsize = ld<uint64_t>(d, 8);
+        int64_t  off   = ld<int64_t>(d, 16);
+        if (!gbuf || off < 0 || (uint64_t)off >= buf.size()) continue;
+        uint64_t n = std::min<uint64_t>(gsize, buf.size() - (uint64_t)off);
+        memcpy(buf.data() + off, PW(gbuf), n);
+    }
+    return 0;
+}
+// sceSaveDataGetSaveDataMemory2(get*): copy from the slot's block into the single {buf,bufSize,offset}
+// descriptor (Get2 has no dataNum — one descriptor), bounds-clamped.
+HLE(s_savemem_get) {
+    svc_log("sceSaveDataGetSaveDataMemory2", a0,a1,a2,a3,a4,a5);
+    if (!a0) return SD_ERR_PARAMETER;
+    int32_t  userId  = ld<int32_t>(a0, 0);
+    uint64_t dataPtr = ld<uint64_t>(a0, 8);
+    uint32_t slotId  = ld<uint32_t>(a0, 32);
+    std::lock_guard<std::mutex> lk(g_savemem_mx);
+    auto it = g_savemem.find(savemem_key(userId, slotId));
+    if (it == g_savemem.end()) return SD_ERR_MEMORY_NOTREADY;
+    auto& buf = it->second;
+    if (dataPtr) {
+        uint64_t gbuf  = ld<uint64_t>(dataPtr, 0);
+        uint64_t gsize = ld<uint64_t>(dataPtr, 8);
+        int64_t  off   = ld<int64_t>(dataPtr, 16);
+        if (gbuf && off >= 0 && (uint64_t)off < buf.size()) {
+            uint64_t n = std::min<uint64_t>(gsize, buf.size() - (uint64_t)off);
+            memcpy(PW(gbuf), buf.data() + off, n);
+        }
+    }
+    return 0;
+}
+// sceSaveDataSyncSaveDataMemory(sync*): commit the slot's block. The block is process-resident here,
+// so a session's Set is already visible to a later Get (cross-restart disk persistence is a separate
+// concern) — validate the slot exists and report success.
+HLE(s_savemem_sync) {
+    svc_log("sceSaveDataSyncSaveDataMemory", a0,a1,a2,a3,a4,a5);
+    if (!a0) return SD_ERR_PARAMETER;
+    int32_t  userId = ld<int32_t>(a0, 0);
+    uint32_t slotId = ld<uint32_t>(a0, 4);
+    std::lock_guard<std::mutex> lk(g_savemem_mx);
+    if (g_savemem.find(savemem_key(userId, slotId)) == g_savemem.end()) return SD_ERR_MEMORY_NOTREADY;
+    return 0;
+}
 // sceSaveDataMount3(const Mount3* mount, MountResult* result). The mount desc layout is pinned
 // from DOLL's OWN wrapper (eboot+0x2251610 disassembly, matching the live capture):
 //   +0x00 u32 userId; +0x08 const char* dirName; +0x10 u64 blocks; +0x20 u32 mountMode;
@@ -735,6 +856,12 @@ void register_service_hle() {
     R("sceMsgDialogUpdateStatus", s_dialog_status);
     R("sceMsgDialogGetStatus", s_dialog_status);
     R("sceMsgDialogGetResult", s_dialog_result);
+    // libSceImeDialog (#191): auto-completing text-entry dialog (no keyboard UI). Raw NIDs.
+    Hle::register_fn("NUeBrN7hzf0", (HleFn)s_imedlg_init,   "sceImeDialogInit");
+    Hle::register_fn("IADmD4tScBY", (HleFn)s_imedlg_status, "sceImeDialogGetStatus");
+    Hle::register_fn("x01jxu+vxlc", (HleFn)s_imedlg_result, "sceImeDialogGetResult");
+    Hle::register_fn("gyTyVn+bXMw", (HleFn)s_imedlg_term,   "sceImeDialogTerm");
+    Hle::register_fn("oBmw4xrmfKs", (HleFn)s_imedlg_abort,  "sceImeDialogAbort");
     R("sceSystemServiceHideSplashScreen", s_ok);
     // libSceAvPlayer (#324): let a post-credits / intro video complete so the game reaches its scene.
     // Init/InitEx must return a non-NULL handle; IsActive must report finished; the rest succeed as no-ops.
@@ -773,6 +900,11 @@ void register_service_hle() {
     Hle::register_fn("-Q1-u1a7p0g", (HleFn)s_ok,                 "scePlayGoPrefetch");
     // libSceSaveData (PS5 native surface) — fresh console: mount of a nonexistent save NOT_FOUND.
     Hle::register_fn("TywrFKCoLGY", (HleFn)s_savedata_init3,     "sceSaveDataInitialize3");
+    // libSceSaveData "save-data memory" API (#191): a real per-(user,slot) memory block round-trip.
+    Hle::register_fn("oQySEUfgXRA", (HleFn)s_savemem_setup, "sceSaveDataSetupSaveDataMemory2");
+    Hle::register_fn("cduy9v4YmT4", (HleFn)s_savemem_set,   "sceSaveDataSetSaveDataMemory2");
+    Hle::register_fn("QwOO7vegnV8", (HleFn)s_savemem_get,   "sceSaveDataGetSaveDataMemory2");
+    Hle::register_fn("wiT9jeC7xPw", (HleFn)s_savemem_sync,  "sceSaveDataSyncSaveDataMemory");
     Hle::register_fn("yKDy8S5yLA0", (HleFn)s_savedata_term,      "sceSaveDataTerminate");
     Hle::register_fn("gjRZNnw0JPE", (HleFn)s_savedata_txres,     "sceSaveDataCreateTransactionResource");
     Hle::register_fn("lJUQuaKqoKY", (HleFn)s_savedata_txres_del, "sceSaveDataDeleteTransactionResource");

@@ -60,6 +60,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_hle_registered PRIVATE prosper_core)
   add_test(NAME hle_functions_registered COMMAND test_hle_registered)
 
+  # No NID registered twice with a DIFFERENT handler (the #330 shadow class): a later register_*()
+  # silently overwriting a real impl with a stub returns garbage to the guest. Pure, no game dump.
+  add_executable(test_hle_no_shadow tests/test_hle_no_shadow.cpp)
+  target_link_libraries(test_hle_no_shadow PRIVATE prosper_core)
+  add_test(NAME hle_no_shadow COMMAND test_hle_no_shadow)
+
   # Cooperative stop signal (issue #164 P0): request_stop/stop_requested the frontend uses to wind
   # the guest run-loop down on window-close. Pure, no deps.
   add_executable(test_lifecycle tests/test_lifecycle.cpp)
@@ -124,6 +130,18 @@ if(TARGET prosper_core)
   add_executable(test_service_getters tests/test_service_getters.cpp)
   target_link_libraries(test_service_getters PRIVATE prosper_core)
   add_test(NAME service_getters COMMAND test_service_getters)
+
+  # libSceImeDialog lifecycle + libSceSaveData memory API round-trip (#191): auto-completing dialog
+  # (no hang) + a real per-(user,slot) Set->Get memory block with verified shadPS4 struct layouts.
+  add_executable(test_savedata_ime tests/test_savedata_ime.cpp)
+  target_link_libraries(test_savedata_ime PRIVATE prosper_core)
+  add_test(NAME savedata_ime COMMAND test_savedata_ime)
+
+  # pthread scheduling getters fill their out-param (not a shadowing no-op): scePthreadGetprio/
+  # Getaffinity must WRITE priority/mask, else the caller reads uninitialized stack (harmful-stub class).
+  add_executable(test_pthread_sched_getters tests/test_pthread_sched_getters.cpp)
+  target_link_libraries(test_pthread_sched_getters PRIVATE prosper_core)
+  add_test(NAME pthread_sched_getters COMMAND test_pthread_sched_getters)
 
   # libScePad controller input: ScePadData layout + HostPadState mapping + HLE fill contract (pure).
   add_executable(test_pad tests/test_pad.cpp)
