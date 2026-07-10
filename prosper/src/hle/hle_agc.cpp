@@ -990,13 +990,14 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
     agc_gpu_state().draws.clear();
     size_t applied = gpu::run_command_buffer(addr, walk, agc_gpu_state());
     g_submit_count++;
-    // #312 barrier-model liveness: the EOP pulse fires at every submit even when the fold paused on
-    // an unsatisfied barrier — withholding it starved the frame pacer and wedged every naive-pause
-    // run (submits stop, so the producer that would satisfy the barrier never arrives). Only the
-    // stream's MEMORY writes stay deferred; the watchdog flushes them the moment the barrier
-    // satisfies (or the bounded timeout degrades to the old proceed-loudly behavior).
-    prosper_eq_trigger_eop();
+    // #312 EOP visibility contract: the pulse fires immediately only when no gated writes are
+    // pending; otherwise it is OWED and delivered when the tail drains (the guest's completion
+    // scan must never observe a half-retired frame — see command_processor.cpp). The flip and the
+    // pipe-drain writes still flow, and the watchdog + timeout bound the delay, so the pacer
+    // stays alive (the naive always-pulse variant let the scan free live labels; the naive
+    // never-pulse variant starved the pacer — both measured).
     gpu::flush_deferred_streams();
+    gpu::submit_completion_pulse();
     // Watchdog keys off PENDING streams, not just this fold: streams can outlive their fold (and
     // the Jump-recursion flag reset once hid a deferring fold entirely — the wedge class).
     if (gpu::deferred_pending()) start_defer_watchdog();
@@ -1107,10 +1108,10 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     g_submit_count++;
     // The submit has "completed" (synchronous fold): fire any registered GPU EOP events. Inert unless the
     // game called sceGnmAddEqEvent (b0xyllnVY-I); the RELEASE_MEM label write already happened in apply().
-    // #312 barrier-model liveness: the pulse fires even for a fold paused on an unsatisfied barrier —
-    // only the stream's MEMORY writes stay deferred (see submit_dcb_stream).
-    prosper_eq_trigger_eop();
+    // #312 EOP visibility contract: pulse only when no gated writes are pending, else owed until
+    // the tail drains (see submit_dcb_stream / command_processor.cpp).
     gpu::flush_deferred_streams();
+    gpu::submit_completion_pulse();
     if (gpu::deferred_pending()) start_defer_watchdog();
     // Stage A: if a live renderer has been registered (runtime binary wires a Vulkan device) and this
     // submit accumulated draws, execute the folded GpuState and present the frame. Inert (returns false)

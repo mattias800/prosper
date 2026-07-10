@@ -1,12 +1,16 @@
-// test_wait_barrier — the #312 per-queue WAIT_REG_MEM barrier model (command_processor.cpp).
+// test_wait_barrier — the #312 WAIT_REG_MEM barrier model (command_processor.cpp).
 //
-// Semantics under test (default configuration — the model is ON by default):
+// Semantics under test (with the model enabled — PROSPER_WAIT_DEFER=1, set below; the model is
+// opt-in, see the verdict block in command_processor.cpp):
 //   1. An UNSATISFIED WaitRegMem gates the stream's DOWNSTREAM memory effects (they must not become
 //      guest-visible until the condition holds) — the exact ordering whose violation stomped
 //      MallocBinned3 free-block headers in DOLL's menu content-load burst.
 //   2. Effects UPSTREAM of the barrier still flush promptly (the guest CPU polls those labels).
-//   3. Releasing is per-queue INDEPENDENT: a blocked stream never head-of-line blocks another
-//      deferred stream whose own condition is satisfied.
+//   3. PER-ADDRESS ORDERING DOMAINS: while gated writes are pending, a LATER submit's effect to
+//      the SAME address joins the gated tail in ring order (overtaking swaps fence generations at
+//      recycled labels — the #312 stomp), and a later WAIT on a gated address evaluates in ring
+//      order (after the gated writes it must observe) — but effects to untouched addresses FLOW
+//      (gating them created a CPU<->GPU circular stall, an early-boot wedge measured live).
 //   4. A Jump executed inside a paused stream must NOT un-gate the parent's remaining effects
 //      (the recursive fold once reset the pause flag — the WAIT_DEFER wedge/ordering bug), and the
 //      jump target's own memory effects are gated too.
@@ -58,11 +62,14 @@ static size_t run_cb(const uint32_t* buf, size_t dwords, GpuState& st) {
 }
 
 int main() {
-    // A generous release timeout so the gating assertions below are not raced by the liveness
-    // backstop (test 5 sleeps past it deliberately). Must be set before the first fold caches it.
+    // Enable the (opt-in) model, and set a generous release timeout so the gating assertions
+    // below are not raced by the liveness backstop (test 5 sleeps past it deliberately). Both
+    // must be set before the first fold caches them.
 #ifdef _WIN32
+    _putenv_s("PROSPER_WAIT_DEFER", "1");
     _putenv_s("PROSPER_WAIT_TIMEOUT_MS", "400");
 #else
+    setenv("PROSPER_WAIT_DEFER", "1", 1);
     setenv("PROSPER_WAIT_TIMEOUT_MS", "400", 1);
 #endif
     printf("== test_wait_barrier ==\n");
@@ -89,27 +96,35 @@ int main() {
         CHECK(!deferred_pending(), "stream completed and left the deferred queue");
     }
 
-    // 3: per-queue independence — two paused streams; the SECOND stream's condition satisfies
-    // first, and its write must release even though an older stream is still blocked.
+    // 3: per-address ordering domains — while L has a gated pending write:
+    //    - a later submit's write to L joins the tail (ring order; final value = LAST write),
+    //    - a later submit's WAIT on L evaluates in ring order (sees the gated writes),
+    //    - a later submit's write to an UNRELATED address flows immediately (no circular stall).
     {
-        volatile uint64_t cond1 = 0, cond2 = 0;
-        uint64_t l1 = 0, l2 = 0;
-        uint32_t s1[8 + 7], s2[8 + 7];
+        volatile uint64_t cond1 = 0;
+        uint64_t L = 0, M = 0, N = 0;
+        uint32_t s1[8 + 7], s2[7], s3[7], s4[8 + 7];
         emit_wait_eq(s1, (uint64_t)(uintptr_t)&cond1, 1);
-        emit_release(s1 + 8, (uint64_t)(uintptr_t)&l1, 1);
-        emit_wait_eq(s2, (uint64_t)(uintptr_t)&cond2, 1);
-        emit_release(s2 + 8, (uint64_t)(uintptr_t)&l2, 1);
+        emit_release(s1 + 8, (uint64_t)(uintptr_t)&L, 1);   // gated: L <- 1
+        emit_release(s2, (uint64_t)(uintptr_t)&L, 2);       // later write to L: must NOT overtake
+        emit_release(s3, (uint64_t)(uintptr_t)&M, 1);       // unrelated address: must FLOW
+        emit_wait_eq(s4, (uint64_t)(uintptr_t)&L, 2);       // wait on gated L: ring order (sees L=2)
+        emit_release(s4 + 8, (uint64_t)(uintptr_t)&N, 1);
         GpuState st;
         run_cb(s1, 15, st);
-        run_cb(s2, 15, st);
-        cond2 = 1;                                   // ONLY the younger stream's producer arrives
+        run_cb(s2, 7, st);
+        run_cb(s3, 7, st);
+        run_cb(s4, 15, st);
         flush_deferred_streams();
-        CHECK(l2 == 1, "younger stream released independently (no head-of-line blocking)");
-        CHECK(l1 == 0, "older blocked stream stays gated");
-        CHECK(deferred_pending(), "older stream still pending");
-        cond1 = 1;
+        CHECK(L == 0, "gated-address writes stay gated (no overtake)");
+        CHECK(M == 1, "unrelated-address write flowed immediately");
+        CHECK(N == 0, "stream behind a gated-address wait stays gated");
+        CHECK(deferred_pending(), "tail pending");
+        cond1 = 1;                                   // front producer arrives -> tail drains in order
         flush_deferred_streams();
-        CHECK(l1 == 1 && !deferred_pending(), "older stream released once its own condition held");
+        CHECK(L == 2, "same-address writes landed in ring order (final = later write)");
+        CHECK(N == 1, "gated-address wait evaluated in ring order and released its stream");
+        CHECK(!deferred_pending(), "queue fully drained");
     }
 
     // 4: a Jump inside a paused stream — the jump target's ReleaseMem must be gated with the
