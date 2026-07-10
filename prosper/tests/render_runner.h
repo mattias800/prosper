@@ -111,8 +111,14 @@ struct BackendDraw {
 // content — without it every pass starts from the diagnostic blue clear, so cross-submit
 // accumulation (UE4's UI-onto-backbuffer after a separate composite submit) is lost. Null (the
 // default) keeps the blue-clear behavior byte-identical for every existing caller.
+// `clear_rgba` (optional): 4 floats (RGBA, Vulkan order) to clear the color attachment to when no
+// seed is supplied. Null keeps the legacy diagnostic blue — every test harness caller passes null,
+// so their behavior is byte-identical. The live renderer passes the game's decoded fast-clear color
+// (or opaque black when none), so real frames no longer start from blue (#309). PROSPER_CLEAR_DEBUG
+// forces the blue back on regardless, so unrendered areas can still be spotted during development.
 inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& draws, uint32_t W, uint32_t H,
-                                              const uint8_t* seed_rgba = nullptr) {
+                                              const uint8_t* seed_rgba = nullptr,
+                                              const float* clear_rgba = nullptr) {
     std::vector<uint8_t> out;
     if (draws.empty()) return out;
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO}; app.apiVersion = VK_API_VERSION_1_1;
@@ -543,7 +549,12 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         b1.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b1.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b1);
     }
-    VkClearValue clear[2]{}; clear[0].color = {{0.0f, 0.0f, 1.0f, 1.0f}};   // blue
+    // Clear color: the caller's clear_rgba (game fast-clear / black on the live path), else the
+    // legacy diagnostic blue. PROSPER_CLEAR_DEBUG forces blue back on even when a color is passed.
+    float cc[4] = {0.0f, 0.0f, 1.0f, 1.0f};   // diagnostic blue
+    if (clear_rgba && getenv("PROSPER_CLEAR_DEBUG") == nullptr)
+        for (int i = 0; i < 4; i++) cc[i] = clear_rgba[i];
+    VkClearValue clear[2]{}; clear[0].color = {{cc[0], cc[1], cc[2], cc[3]}};
     clear[1].depthStencil = {0.5f, 0};   // depth cleared to 0.5 (fragments at z=0.0 pass LESS, fail GREATER)
     VkRenderPassBeginInfo rpbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rpbi.renderPass = rp; rpbi.framebuffer = fb; rpbi.renderArea = {{0, 0}, {W, H}}; rpbi.clearValueCount = use_ds ? 2 : 1; rpbi.pClearValues = clear;
