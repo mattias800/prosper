@@ -118,6 +118,23 @@ int main() {
         Dcb d3{}; d3.bottom = buf3; d3.top = buf3 + 64; d3.cursor_up = buf3; d3.cursor_down = buf3 + 64;
         nop((uint64_t)(uintptr_t)&d3, /*num_dwords*/ 4, 0, 0, 0, 0);
         CHECK((size_t)(d3.cursor_up - d3.bottom) == 4, "cb_nop(4) reserves 4 dwords (type-3 NOP unchanged)");
+
+        // #450: begin_packet rejects an OVER-LENGTH packet (n > 0x4001) at the shared choke point rather
+        // than wrapping the 14-bit length field into a header claiming a tiny packet. cb_nop(0x4002) must
+        // emit nothing (return 0) and not advance the cursor — the overflow sibling of #401's underflow.
+        uint32_t buf4[64]; memset(buf4, 0, sizeof buf4);
+        Dcb d4{}; d4.bottom = buf4; d4.top = buf4 + 64; d4.cursor_up = buf4; d4.cursor_down = buf4 + 64;
+        uint64_t big = nop((uint64_t)(uintptr_t)&d4, /*num_dwords*/ 0x4002, 0, 0, 0, 0);
+        CHECK(big == 0 && d4.cursor_up == d4.bottom, "cb_nop(0x4002) rejected (packet > 0x4001, no cursor advance)");
+
+        // #450: sceAgcDcbWriteData bounds num against the 5-dword packet overhead — num=0x3FFF (5+num =
+        // 0x4004 > 0x4001) must be REJECTED, not emit a wrapped header that truncates the submit.
+        auto wd = Hle::lookup("i1jyy49AjXU");   // sceAgcDcbWriteData
+        CHECK(wd, "sceAgcDcbWriteData registered");
+        uint32_t buf5[64]; memset(buf5, 0, sizeof buf5);
+        Dcb d5{}; d5.bottom = buf5; d5.top = buf5 + 64; d5.cursor_up = buf5; d5.cursor_down = buf5 + 64;
+        uint64_t wr = wd((uint64_t)(uintptr_t)&d5, /*dst*/0, /*policy*/0, /*addr*/0, /*data*/0, /*num*/0x3FFF);
+        CHECK(wr == 0 && d5.cursor_up == d5.bottom, "WriteData(num=0x3FFF) rejected (5+num overflows the length field)");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
