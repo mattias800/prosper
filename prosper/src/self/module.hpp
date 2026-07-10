@@ -113,6 +113,11 @@ struct LoadedImage {
 // Build a flat image from a parsed module at guest base `base`.
 LoadedImage build_image(const Module& m, uint64_t base);
 
+// The phdr-index key a SELF data segment maps to: bits [31:20] of its flags, masked to 12 bits (the
+// SCE self-segment id). Higher flag bits must be masked off or the data-segment map is keyed wrong.
+// Exposed for testing; see module.cpp / issue #339.
+uint64_t self_segment_key(uint64_t flags);
+
 // Bind each import to a synthetic stub address: stub_base + index*stub_size.
 // (At M2 these become real logging-trap stubs.) Records into img.import_addr.
 void bind_imports_to_stubs(const Module& m, LoadedImage& img,

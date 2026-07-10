@@ -78,6 +78,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_va2foff PRIVATE prosper_core)
   add_test(NAME va2foff_load_priority COMMAND test_va2foff)
 
+  # SELF data-segment key masks flag bits >= 32 (#339): the SCE segment id is bits [31:20]; without
+  # the mask a data segment keys the map wrong and every phdr lookup misses. Pure, no game dump.
+  add_executable(test_self_segment_key tests/test_self_segment_key.cpp)
+  target_link_libraries(test_self_segment_key PRIVATE prosper_core)
+  add_test(NAME self_segment_key COMMAND test_self_segment_key)
+
   # Guest static-TLS Variant II layout uses each module's real PT_TLS p_align (#143). The layout
   # code is Linux-only (guest %fs), so gate the test on it too.
   if(UNIX AND NOT APPLE)
