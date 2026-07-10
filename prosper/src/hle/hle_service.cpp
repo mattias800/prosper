@@ -254,16 +254,31 @@ HLE(s_param_string)   { if (a1 && a2) ((char*)PW(a1))[0] = '\0'; return 0; }
 // Initialize -> INITIALIZED, Open -> auto-dismiss to FINISHED (headless: no interactive UI, so the
 // game's "wait until dismissed" loop still exits immediately), Close/Terminate -> back to NONE.
 // GetResult -> zeroed struct = OK/no button pressed.
-namespace { std::atomic<int> g_msgdialog_status{0 /*NONE*/}; }
-HLE(s_dialog_initialize) { g_msgdialog_status.store(1 /*INITIALIZED*/); return 0; }
-HLE(s_dialog_open)       { g_msgdialog_status.store(3 /*FINISHED (auto-dismiss)*/); return 0; }
-HLE(s_dialog_close)      { g_msgdialog_status.store(0 /*NONE*/); return 0; }
-HLE(s_dialog_terminate)  { g_msgdialog_status.store(0 /*NONE*/); return 0; }
-HLE(s_dialog_status)     { return (uint64_t)(unsigned)g_msgdialog_status.load(); }
+// A registered PlatformUi gets first refusal at Open; if it takes the dialog, status/result/close
+// route there (real message box). Otherwise the core auto-dismisses headlessly. `g_msgdialog_backed`
+// records which path Open chose. See platform_ui.hpp (#347).
+namespace { std::atomic<int> g_msgdialog_status{0 /*NONE*/}; std::atomic<int> g_msgdialog_backed{0}; }
+HLE(s_dialog_initialize) { g_msgdialog_backed.store(0); g_msgdialog_status.store(1 /*INITIALIZED*/); return 0; }
+HLE(s_dialog_open) {
+    if (auto* ui = platform_ui(); ui && ui->msgDialogOpen(a0)) { g_msgdialog_backed.store(1); return 0; }
+    g_msgdialog_backed.store(0);
+    g_msgdialog_status.store(3 /*FINISHED (auto-dismiss)*/);
+    return 0;
+}
+HLE(s_dialog_close)      { if (g_msgdialog_backed.exchange(0)) { if (auto* ui = platform_ui()) ui->msgDialogClose(); } g_msgdialog_status.store(0 /*NONE*/); return 0; }
+HLE(s_dialog_terminate)  { if (g_msgdialog_backed.exchange(0)) { if (auto* ui = platform_ui()) ui->msgDialogClose(); } g_msgdialog_status.store(0 /*NONE*/); return 0; }
+HLE(s_dialog_status) {
+    if (g_msgdialog_backed.load()) { if (auto* ui = platform_ui()) return (uint64_t)(unsigned)ui->msgDialogStatus(); }
+    return (uint64_t)(unsigned)g_msgdialog_status.load();
+}
 // SceMsgDialogResult = { u32 mode; u32 result; u32 buttonId; char reserved[32] } = 0x2C bytes
 // (shadPS4 msgdialog_ui.h DialogResult). Was memset(0x30) — 4 bytes PAST the caller's struct,
 // exactly the f_fstat oversized-write class this file warns about.
-HLE(s_dialog_result)   { if (a0) memset(PW(a0), 0, 0x2C); return 0; }
+HLE(s_dialog_result) {
+    if (g_msgdialog_backed.load()) { if (auto* ui = platform_ui()) { (void)ui->msgDialogResult(a0); return 0; } }
+    if (a0) memset(PW(a0), 0, 0x2C);
+    return 0;
+}
 
 // --- libSceImeDialog (on-screen text-entry dialog) — same common-dialog lifecycle as MsgDialog
 // (#191). We have no keyboard UI, so the dialog auto-completes: Init -> FINISHED(3) immediately, so
@@ -750,18 +765,24 @@ extern "C" uint64_t s_np_check_cb_c(uint64_t, uint64_t, uint64_t, uint64_t, uint
 // { s32 size; s32 errorCode; s32 userId; s32 reserved } (shadPS4 error_dialog.cpp Param); the
 // errorCode is printed unconditionally — a one-shot, high-value diagnostic of WHAT the game
 // thinks failed. CONFIDENCE: HIGH (shadPS4 implements this exact lifecycle).
-namespace { std::atomic<int> g_errdialog_status{0 /*NONE*/}; }
-HLE(s_errdialog_init)   { g_errdialog_status.store(1 /*INITIALIZED*/); return 0; }
+namespace { std::atomic<int> g_errdialog_status{0 /*NONE*/}; std::atomic<int> g_errdialog_backed{0}; }
+HLE(s_errdialog_init)   { g_errdialog_backed.store(0); g_errdialog_status.store(1 /*INITIALIZED*/); return 0; }
 HLE(s_errdialog_open)   {
+    // Offer the error dialog to a registered PlatformUi first (a real message box); else auto-dismiss.
+    if (auto* ui = platform_ui(); ui && ui->errorDialogOpen(a0)) { g_errdialog_backed.store(1); return 0; }
+    g_errdialog_backed.store(0);
     uint32_t code = 0;
     if (svc_ptrish(a0)) code = *(const uint32_t*)((const char*)PW(a0) + 4);
     fprintf(stderr, "[svc] sceErrorDialogOpen(errorCode=%#x) -> auto-dismiss FINISHED\n", code);
     g_errdialog_status.store(3 /*FINISHED (auto-dismiss)*/);
     return 0;
 }
-HLE(s_errdialog_close)  { g_errdialog_status.store(3 /*FINISHED*/); return 0; }
-HLE(s_errdialog_term)   { g_errdialog_status.store(0 /*NONE*/);     return 0; }
-HLE(s_errdialog_status) { return (uint64_t)(unsigned)g_errdialog_status.load(); }
+HLE(s_errdialog_close)  { if (g_errdialog_backed.exchange(0)) { if (auto* ui = platform_ui()) ui->errorDialogClose(); } g_errdialog_status.store(3 /*FINISHED*/); return 0; }
+HLE(s_errdialog_term)   { if (g_errdialog_backed.exchange(0)) { if (auto* ui = platform_ui()) ui->errorDialogClose(); } g_errdialog_status.store(0 /*NONE*/); return 0; }
+HLE(s_errdialog_status) {
+    if (g_errdialog_backed.load()) { if (auto* ui = platform_ui()) return (uint64_t)(unsigned)ui->errorDialogStatus(); }
+    return (uint64_t)(unsigned)g_errdialog_status.load();
+}
 
 // --- libSceNpEntitlementAccess / libSceGameUpdate: observability first. -------------------------
 // PS5-only surfaces with NO reference implementation (absent from Kyty and shadPS4); the PS5 3.20
