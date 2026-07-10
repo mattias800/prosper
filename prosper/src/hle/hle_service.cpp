@@ -600,6 +600,54 @@ HLE(s_errdialog_status) { return (uint64_t)(unsigned)g_errdialog_status.load(); 
 HLE(s_npent_init)      { svc_log("sceNpEntitlementAccessInitialize", a0,a1,a2,a3,a4,a5); return 0; }
 HLE(s_gameupdate_init) { svc_log("sceGameUpdateInitialize",          a0,a1,a2,a3,a4,a5); return 0; }
 HLE(s_gameupdate_term) { svc_log("sceGameUpdateTerminate",           a0,a1,a2,a3,a4,a5); return 0; }
+// The entitlement follow-ups DOLL's main menu fires once the flow is unblocked (live-captured
+// after the #306 gate fell). ABI pinned from the live capture (r8):
+//   GetAddcontEntitlementInfoList(SceNpServiceLabel serviceLabel, Info* list, u32 listNum,
+//                                 u32* hitNum)
+// — the game first count-queries with list=NULL/num=0 and an out pointer in a3, then calls again
+// with a 4-entry buffer (its four addcont slots). Matches the documented PS4 signature 1:1.
+// This dump has NO additional content installed and no signed-in user, so the truthful console
+// answer is SUCCESS with hitNum=0 (DLC entitlement lookups work offline from local state; there
+// simply are none). CONFIDENCE: HIGH on the shape (live-pinned + PS4 doc agree), MED on hitNum=0
+// being the exact retail no-DLC answer.
+HLE(s_npent_addcont_list) {
+    svc_log("sceNpEntitlementAccessGetAddcontEntitlementInfoList", a0,a1,a2,a3,a4,a5);
+    if (svc_ptrish(a3)) *(uint32_t*)PW(a3) = 0;   // hitNum = 0: no addcont entitlements
+    return 0;
+}
+// GetEntitlementKey(serviceLabel, const Label* label, Key* out) — live capture: retried 4x with
+// identical args (the garbage-consuming retry signature). With no entitlement to derive a key
+// from, honest FAILURE beats success+garbage-key; the exact NpEntitlementAccess errno space is
+// unreferenced, so the generic Np signed-out error is used (only the sign is consumed by a clean
+// caller). With hitNum=0 above the game should no longer ask at all. CONFIDENCE: LOW on the
+// error constant, HIGH that failure is the truthful state.
+HLE(s_npent_getkey) {
+    svc_log("sceNpEntitlementAccessGetEntitlementKey", a0,a1,a2,a3,a4,a5);
+    return NP_ERR_SIGNED_OUT;
+}
+
+// sceSaveDataTransferringMount (PS5-only, live-captured x4 in DOLL's save-slot menu): mount a
+// PS4-era save for transfer/import. We have no PS4 save to transfer — the truthful fresh-console
+// answer is NOT_FOUND with the result untouched. The previous success+garbage made the game read
+// an EMPTY mount-point string out of the unwritten result and open '/GameSaveData245.dat' (no
+// mount prefix) at filesystem root — observed live. CONFIDENCE: MED on semantics (same 0x809F
+// facility + NOT_FOUND as Mount3 of a nonexistent save), LOW on the exact arg layout (nothing is
+// written, so no layout is assumed; PROSPER_SVCLOG captures it).
+HLE(s_savedata_transfermount) {
+    svc_log("sceSaveDataTransferringMount", a0,a1,a2,a3,a4,a5);
+    return SAVE_DATA_ERR_NOT_FOUND;
+}
+
+// sceSystemServiceGetNoticeScreenSkipFlag(bool* flag) — polled from DOLL's front-end menu.
+// PS5-only (no reference). Live capture pinned the out-pointer to an ODD stack address
+// (0x...ff307), so the flag is a single byte (bool), NOT an int32 — a 4-byte write would clobber
+// 3 adjacent stack bytes. 0 = "no skip" is the inert default a retail console with no
+// notice-screen state reports. CONFIDENCE: MED (byte-sized out pinned live; value semantics LOW).
+HLE(s_syss_noticeskip) {
+    svc_log("sceSystemServiceGetNoticeScreenSkipFlag", a0,a1,a2,a3,a4,a5);
+    if (svc_ptrish(a0)) *(uint8_t*)PW(a0) = 0;
+    return 0;
+}
 
 void register_service_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
@@ -740,6 +788,12 @@ void register_service_hle() {
     Hle::register_fn("jO8DM8oyego", (HleFn)s_npent_init,      "sceNpEntitlementAccessInitialize");
     Hle::register_fn("YJtKLttI9fM", (HleFn)s_gameupdate_init, "sceGameUpdateInitialize");
     Hle::register_fn("NSH-C-OmoNI", (HleFn)s_gameupdate_term, "sceGameUpdateTerminate");
+    // Post-gate follow-ups (fire from DOLL's now-reachable main menu; NIDs from PS5 3.20 tables).
+    Hle::register_fn("TFyU+KFBv54", (HleFn)s_npent_addcont_list,
+                     "sceNpEntitlementAccessGetAddcontEntitlementInfoList");
+    Hle::register_fn("5LiMEPuW0DQ", (HleFn)s_npent_getkey, "sceNpEntitlementAccessGetEntitlementKey");
+    Hle::register_fn("WAzWTZm1H+I", (HleFn)s_savedata_transfermount, "sceSaveDataTransferringMount");
+    Hle::register_fn("3RQ5aQfnstU", (HleFn)s_syss_noticeskip, "sceSystemServiceGetNoticeScreenSkipFlag");
     // libSceNpUniversalDataSystem — inert ids (guarded LOW-confidence out-writes).
     Hle::register_fn("sjaobBgqeB4", (HleFn)s_npuds_ok,     "sceNpUniversalDataSystemInitialize");
     Hle::register_fn("5zBnau1uIEo", (HleFn)s_npuds_create, "sceNpUniversalDataSystemCreateContext");
