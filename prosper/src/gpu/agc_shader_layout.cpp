@@ -213,8 +213,16 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             r.gpu_addr       = d.base;
             r.size           = d.size_bytes;
             r.stride         = d.stride;
-            r.srt_offset     = srt;                     // byte offset within user_data / EUD (indirect path)
-            r.sgpr_base      = user_sgpr_base + off;    // the shader SGPR holding this V# (s_buffer_load SBASE)
+            // Provenance, mirroring the #382 texture fix (#453). An IN-SGPR cbuf resolves DIRECTLY —
+            // the recompiler matches its s_buffer_load SBASE to sgpr_base (by_sgpr_base_cls); its V# is
+            // never s_loaded, so SBASE carries no sreg_srt tag and by_srt_offset is never consulted for
+            // it. Setting BOTH keys made the in-SGPR key (off*4) collide with an EUD cbuf at the same
+            // spill offset (eoff*4) under by_srt_offset (first-match-wins) -> wrong uniform block bound.
+            // So set ONLY the applicable key: EUD -> srt_offset (INDIRECT, == the s_load immediate),
+            // in-SGPR -> sgpr_base (DIRECT); null the other so a stray lookup can't false-match.
+            const bool cbuf_in_eud = (uint64_t)off + 4 > num_user_sgprs;
+            r.srt_offset = cbuf_in_eud ? srt : 0xFFFFFFFFu;
+            r.sgpr_base  = cbuf_in_eud ? 0xFFFFFFFFu : (user_sgpr_base + off);
             table.resources.push_back(r);
         }
     }

@@ -122,14 +122,18 @@ int main() {
     ShaderResourceTable t = build_shader_resources(shdr, sgprs, 32);
     CHECK(t.resources.size() == 2, "built 2 constant-buffer resources");
 
-    const ShaderResource* r0 = t.by_srt_offset(4 * 4);   // provenance key = offset_dw*4 bytes
-    const ShaderResource* r1 = t.by_srt_offset(12 * 4);
-    CHECK(r0 && r0->cls == ResourceClass::ConstantBuffer, "cbuf0 resolvable by srt_offset");
+    // In-SGPR cbufs resolve by DIRECT provenance (the s_buffer_load SBASE SGPR), NOT by srt_offset:
+    // their V# is never s_loaded, so the recompiler matches sgpr_base via by_sgpr_base_cls (#453).
+    const ShaderResource* r0 = t.by_sgpr_base(4);    // cbuf0 V# at user-SGPR dword 4 (user_sgpr_base 0)
+    const ShaderResource* r1 = t.by_sgpr_base(12);   // cbuf1 V# at dword 12
+    CHECK(r0 && r0->cls == ResourceClass::ConstantBuffer, "cbuf0 resolvable by sgpr_base (in-SGPR = DIRECT)");
     CHECK(r0 && r0->gpu_addr == 0xA0000000ull && r0->size == 256, "cbuf0 base+size decoded");
     CHECK(r1 && r1->gpu_addr == 0xB0000000ull && r1->size == 1024, "cbuf1 base+size decoded");
     CHECK(r0 && r1 && r0->binding != r1->binding, "distinct bindings assigned");
     CHECK(t.by_binding(r0 ? r0->binding : 999) == r0, "resolvable by binding");
-    CHECK(t.by_srt_offset(0x999) == nullptr, "unknown srt_offset -> null");
+    CHECK(r0 && r0->srt_offset == 0xFFFFFFFFu,
+          "#453: in-SGPR cbuf leaves srt_offset UNSET (can't false-match an EUD cbuf at the same spill offset)");
+    CHECK(t.by_sgpr_base(99) == nullptr, "unknown sgpr_base -> null");
 
     // An empty slot (0x7fff) is skipped.
     cbuf_sharps[1].bits = 0x7fff;
@@ -177,7 +181,7 @@ int main() {
     CHECK(vb && vb->format == DataFormat::Float32 && vb->num_components == 3, "vbuf format Float32 x3");
     CHECK(vb && vb->gpu_addr == 0xC0000000ull && vb->stride == 12 && vb->size == 90 * 12, "vbuf base/stride/size");
     CHECK(vb && vb->srt_offset == 0xFFFFFFFFu, "DIRECT vbuf leaves srt_offset unset");
-    CHECK(t3.by_srt_offset(4 * 4) != nullptr, "constant buffers still present alongside vertex buffers");
+    CHECK(t3.by_sgpr_base(4) != nullptr, "constant buffers still present alongside vertex buffers");
     CHECK(t3.by_sgpr_base(99) == nullptr, "unknown sgpr_base -> null");
 
     // --- textures: sharp[0] T#s carry their real format + byte size; BC1/2/3 are bound (decoded to RGBA8
