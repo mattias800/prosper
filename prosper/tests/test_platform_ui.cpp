@@ -4,6 +4,7 @@
 // backend -> Init/Status/Result/Close route to it (a real dialog's timing + outcome).
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/platform_ui.hpp"
+#include "../src/hle/nid.hpp"
 #include <cstdio>
 #include <cstdint>
 
@@ -25,6 +26,19 @@ struct MockUi : PlatformUi {
     int  imeDialogResult(uint64_t result) override { results++; last_result = result;
         if (result) *(int32_t*)result = 1 /*USER_CANCELED*/; return 1; }
     void imeDialogClose() override { closes++; status = 0; }
+
+    // MsgDialog
+    int msg_status = 2, msg_opens = 0, msg_closes = 0, msg_results = 0; uint64_t msg_last_param = 0;
+    bool msgDialogOpen(uint64_t param) override { msg_opens++; msg_last_param = param; msg_status = 2; return true; }
+    int  msgDialogStatus() override { return msg_status; }
+    int  msgDialogResult(uint64_t result) override { msg_results++; if (result) *(uint32_t*)(result + 8) = 2 /*buttonId*/; return 2; }
+    void msgDialogClose() override { msg_closes++; msg_status = 0; }
+
+    // ErrorDialog
+    int err_status = 2, err_opens = 0, err_closes = 0; uint64_t err_last_param = 0;
+    bool errorDialogOpen(uint64_t param) override { err_opens++; err_last_param = param; err_status = 2; return true; }
+    int  errorDialogStatus() override { return err_status; }
+    void errorDialogClose() override { err_closes++; err_status = 0; }
 };
 
 int main() {
@@ -68,6 +82,43 @@ int main() {
     init(0,0,0,0,0,0);
     CHECK(status(0,0,0,0,0,0) == 3, "after unregister: back to headless auto-complete");
     CHECK(ui.opens == 1, "after unregister: the old backend is no longer consulted");
+
+    // --- MsgDialog: headless auto-dismiss vs backend delegation. ---
+    HleFn m_init = Hle::lookup(nid_hash("sceMsgDialogInitialize")), m_open = Hle::lookup(nid_hash("sceMsgDialogOpen")),
+          m_status = Hle::lookup(nid_hash("sceMsgDialogGetStatus")), m_result = Hle::lookup(nid_hash("sceMsgDialogGetResult")),
+          m_close = Hle::lookup(nid_hash("sceMsgDialogClose"));
+    CHECK(m_init && m_open && m_status && m_result && m_close, "MsgDialog handlers registered");
+    if (m_init && m_open) {
+        set_platform_ui(nullptr);
+        m_init(0,0,0,0,0,0); m_open(0,0,0,0,0,0);
+        CHECK(m_status(0,0,0,0,0,0) == 3, "MsgDialog headless: Open auto-dismisses to FINISHED");
+        m_close(0,0,0,0,0,0);
+        set_platform_ui(&ui);
+        m_init(0,0,0,0,0,0); m_open(0xAAAA,0,0,0,0,0);
+        CHECK(ui.msg_opens == 1 && ui.msg_last_param == 0xAAAA, "MsgDialog backend: Open forwards the param");
+        CHECK(m_status(0,0,0,0,0,0) == 2, "MsgDialog backend: status follows the frontend (RUNNING)");
+        uint32_t mres[3] = {0,0,0};
+        m_result((uint64_t)(uintptr_t)mres, 0,0,0,0,0);
+        CHECK(ui.msg_results == 1 && mres[2] == 2, "MsgDialog backend: GetResult writes the frontend's buttonId");
+        m_close(0,0,0,0,0,0);
+        CHECK(ui.msg_closes == 1, "MsgDialog backend: Close routes to msgDialogClose");
+    }
+
+    // --- ErrorDialog: headless auto-dismiss vs backend delegation. ---
+    HleFn e_init = Hle::lookup("I88KChlynSs"), e_open = Hle::lookup("M2ZF-ClLhgY"),
+          e_status = Hle::lookup("t2FvHRXzgqk"), e_term = Hle::lookup("9XAxK2PMwk8");
+    CHECK(e_init && e_open && e_status, "ErrorDialog handlers registered");
+    if (e_init && e_open) {
+        set_platform_ui(nullptr);
+        e_init(0,0,0,0,0,0); e_open(0,0,0,0,0,0);
+        CHECK(e_status(0,0,0,0,0,0) == 3, "ErrorDialog headless: Open auto-dismisses to FINISHED");
+        set_platform_ui(&ui);
+        e_init(0,0,0,0,0,0); e_open(0xBBBB,0,0,0,0,0);
+        CHECK(ui.err_opens == 1 && ui.err_last_param == 0xBBBB, "ErrorDialog backend: Open forwards the param");
+        CHECK(e_status(0,0,0,0,0,0) == 2, "ErrorDialog backend: status follows the frontend (RUNNING)");
+        if (e_term) { e_term(0,0,0,0,0,0); CHECK(ui.err_closes == 1, "ErrorDialog backend: Term routes to errorDialogClose"); }
+    }
+    set_platform_ui(nullptr);
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");

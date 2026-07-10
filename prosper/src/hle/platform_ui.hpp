@@ -33,6 +33,22 @@ struct PlatformUi {
     virtual int  imeDialogResult(uint64_t result) { (void)result; return 0; }
     // Tear down / abort the dialog (guest called Term or Abort).
     virtual void imeDialogClose() {}
+
+    // --- libSceMsgDialog (message dialog: text + buttons: OK/YES-NO/progress) ---
+    // Show a message dialog. `param` is the guest sceMsgDialogOpen argument (SceMsgDialogParam*, opaque
+    // guest address). Return true to OWN it; false -> the core auto-dismisses headlessly.
+    virtual bool msgDialogOpen(uint64_t param) { (void)param; return false; }
+    virtual int  msgDialogStatus() { return 3 /*FINISHED*/; }
+    // Write the guest SceMsgDialogResult* `result` (mode / result / buttonId) and return the buttonId.
+    virtual int  msgDialogResult(uint64_t result) { (void)result; return 0; }
+    virtual void msgDialogClose() {}
+
+    // --- libSceErrorDialog (single-button error message; no result struct) ---
+    // Show an error dialog. `param` is the guest sceErrorDialogOpen argument (opaque). Return true to
+    // OWN it; false -> the core auto-dismisses headlessly (and logs the errorCode).
+    virtual bool errorDialogOpen(uint64_t param) { (void)param; return false; }
+    virtual int  errorDialogStatus() { return 3 /*FINISHED*/; }
+    virtual void errorDialogClose() {}
 };
 
 // The registered backend, or nullptr when headless. The frontend calls set_platform_ui once at startup
