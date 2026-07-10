@@ -640,6 +640,85 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     for (VkDeviceSize i = 0; i < bytes; i++) out[i] = ((const uint8_t*)mp)[i];
     vkUnmapMemory(dev, bmem);
 
+    // PROSPER_DRAW_ISO + PROSPER_ISO_AT="x,y": per-draw kill isolation (generalizes the #240 title harness
+    // to any submit / any target pixel). On the FIRST submit whose rendered pixel at (x,y) is lit
+    // (non-background), re-render THIS exact submit once per killed-draw index and report which draw lights
+    // that pixel — the kill index that turns (x,y) dark is the culprit. Reuses the built pipelines/
+    // descriptors; a fresh clear each pass. Env-gated, no default behavior. Used to locate a stray primitive
+    // such as the #298 menu focus-ring sliver. Dumps iso_kill_<k>.bmp to PROSPER_FRAME_DIR.
+    if (getenv("PROSPER_DRAW_ISO") && getenv("PROSPER_ISO_AT")) {
+        static bool iso_done = false;
+        int tx = -1, ty = -1; sscanf(getenv("PROSPER_ISO_AT"), "%d,%d", &tx, &ty);
+        // Optional PROSPER_ISO_RGB="r,g,b" (+ PROSPER_ISO_TOL, default 45): the target submit is the first
+        // whose pixel at (x,y) matches that color within tol — robust against an earlier full-screen submit
+        // (e.g. the intro cutscene) that merely lights the pixel a different color. Unset -> any non-background.
+        int wr = -1, wg = 0, wb = 0, tol = getenv("PROSPER_ISO_TOL") ? atoi(getenv("PROSPER_ISO_TOL")) : 45;
+        if (getenv("PROSPER_ISO_RGB")) sscanf(getenv("PROSPER_ISO_RGB"), "%d,%d,%d", &wr, &wg, &wb);
+        auto lit_at = [&](const std::vector<uint8_t>& buf) -> bool {
+            if (tx < 0 || ty < 0 || (uint32_t)tx >= W || (uint32_t)ty >= H) return false;
+            const uint8_t* p = &buf[((size_t)ty * W + tx) * 4];
+            if (wr >= 0) return abs((int)p[0]-wr) <= tol && abs((int)p[1]-wg) <= tol && abs((int)p[2]-wb) <= tol;
+            return p[0] > 40 || p[1] > 40 || p[2] > 40;
+        };
+        // Optional second reference pixel: reported alongside the target so we can tell whether the culprit
+        // draw ALSO paints a legit element (e.g. the active focus ring) or only the stray pixel.
+        int rx = -1, ry = -1; if (getenv("PROSPER_ISO_AT2")) sscanf(getenv("PROSPER_ISO_AT2"), "%d,%d", &rx, &ry);
+        if (!iso_done && lit_at(out)) {
+            iso_done = true;
+            const char* fd = getenv("PROSPER_FRAME_DIR"); std::string dir = fd ? fd : ".";
+            fprintf(stderr, "[iso] submit lights (%d,%d): %zu draws; re-rendering per killed draw\n", tx, ty, dv.size());
+            // Characterize every draw in the target submit (blend/write-mask/viewport/textures/vertex count).
+            for (size_t di = 0; di < dv.size(); di++) {
+                const prosper::gpu::ResolvedPipelineState* ps = draws[di].ps; DV& v = dv[di];
+                fprintf(stderr, "[iso]  draw#%zu %s cnt=%u", di, v.ok ? "OK" : "SKIP", v.icount ? v.icount : v.vcount);
+                if (ps) fprintf(stderr, " blend=%d src=%u dst=%u cwm=0x%x vp_y=%.0f vp_h=%.0f depth=%d/%d",
+                                (int)ps->blend_enable, ps->src_color_blend_factor, ps->dst_color_blend_factor,
+                                ps->color_write_mask, ps->viewport_y, ps->viewport_h,
+                                (int)ps->depth_test_enable, (int)ps->depth_write_enable);
+                int nt = 0; for (auto& r : v.R) if (r.is_texture()) { fprintf(stderr, " tex%d=%ux%u", nt, r.tw, r.th); nt++; }
+                fprintf(stderr, "\n");
+            }
+            VkBufferImageCopy cp2{}; cp2.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; cp2.imageExtent = {W, H, 1};
+            for (int kk = -1; kk < (int)dv.size(); kk++) {
+                VkCommandBuffer c2; VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+                ai.commandPool = pool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1;
+                vkAllocateCommandBuffers(dev, &ai, &c2); vkBeginCommandBuffer(c2, &cbbi);
+                vkCmdBeginRenderPass(c2, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+                for (size_t di = 0; di < dv.size(); di++) { auto& v = dv[di]; if (!v.ok) continue; if ((int)di == kk) continue;
+                    vkCmdBindPipeline(c2, VK_PIPELINE_BIND_POINT_GRAPHICS, v.pipe);
+                    if (v.use_desc) vkCmdBindDescriptorSets(c2, VK_PIPELINE_BIND_POINT_GRAPHICS, v.layout, 0, v.n_sets, v.dsets.data(), 0, nullptr);
+                    if (v.icount) { vkCmdBindIndexBuffer(c2, v.ibuf, 0, VK_INDEX_TYPE_UINT32); vkCmdDrawIndexed(c2, v.icount, 1, 0, 0, 0); }
+                    else vkCmdDraw(c2, v.vcount, 1, 0, 0);
+                }
+                vkCmdEndRenderPass(c2);
+                vkCmdCopyImageToBuffer(c2, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb, 1, &cp2);
+                vkEndCommandBuffer(c2); vkResetFences(dev, 1, &fence);
+                VkSubmitInfo si2{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si2.commandBufferCount = 1; si2.pCommandBuffers = &c2;
+                vkQueueSubmit(queue, 1, &si2, fence); vkWaitForFences(dev, 1, &fence, VK_TRUE, 5ull * 1000 * 1000 * 1000);
+                std::vector<uint8_t> px(bytes); void* m2 = nullptr; vkMapMemory(dev, bmem, 0, bytes, 0, &m2);
+                for (VkDeviceSize i = 0; i < bytes; i++) px[i] = ((const uint8_t*)m2)[i]; vkUnmapMemory(dev, bmem);
+                const uint8_t* tp = &px[((size_t)ty * W + tx) * 4];
+                bool lit = tp[0] > 40 || tp[1] > 40 || tp[2] > 40;
+                // Total gold pixels (ring color) in the frame: if killing a draw drops this only by the
+                // sliver's ~size, that draw paints ONLY the sliver; a large drop means it also paints the ring.
+                size_t gold_n = 0;
+                for (size_t q = 0; q < (size_t)W * H; q++) { const uint8_t* g = &px[q * 4];
+                    if (g[0] > 140 && g[1] > 100 && g[2] < 90 && (int)g[0] - (int)g[2] > 60) gold_n++; }
+                char ref[96] = "";
+                if (rx >= 0 && ry >= 0 && (uint32_t)rx < W && (uint32_t)ry < H) {
+                    const uint8_t* rp = &px[((size_t)ry * W + rx) * 4];
+                    snprintf(ref, sizeof ref, "  ref(%d,%d)=%u,%u,%u %s", rx, ry, rp[0], rp[1], rp[2],
+                             (rp[0] > 40 || rp[1] > 40 || rp[2] > 40) ? "lit" : "DARK");
+                }
+                fprintf(stderr, "[iso]  kill=%d -> (%d,%d) rgb=%u,%u,%u %s  gold_px=%zu%s\n", kk, tx, ty, tp[0], tp[1], tp[2],
+                        lit ? "LIT" : "dark <<< THIS DRAW paints the pixel", gold_n, ref);
+                char fn[512]; snprintf(fn, sizeof fn, "%s/iso_kill_%d.bmp", dir.c_str(), kk); dump_bmp(fn, px, W, H);
+                vkFreeCommandBuffers(dev, pool, 1, &c2);
+            }
+            fprintf(stderr, "[iso] done: the kill index marked 'dark' is the draw painting (%d,%d)\n", tx, ty);
+        }
+    }
+
     vkDestroyFence(dev, fence, nullptr); vkDestroyCommandPool(dev, pool, nullptr);
     for (auto& v : dv) {   // per-draw objects
         if (v.pipe)   vkDestroyPipeline(dev, v.pipe, nullptr);
