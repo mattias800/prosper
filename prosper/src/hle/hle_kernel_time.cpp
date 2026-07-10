@@ -807,8 +807,9 @@ HLE(k_get_event_error)   { return 0; }
 // a trigger (or timer expiry) posts a matching SceKernelEvent so WaitEqueue returns it. FreeBSD-style
 // negative filter ids: EVFILT_USER=-11, EVFILT_TIMER=-7 (PS5 SCE_KERNEL_EVFILT_* match FreeBSD). ---
 namespace {
-    constexpr int16_t EVFILT_USER  = -11;
-    constexpr int16_t EVFILT_TIMER = -7;
+    constexpr int16_t EVFILT_USER    = -11;
+    constexpr int16_t EVFILT_TIMER   = -7;
+    constexpr int16_t EVFILT_HRTIMER = -15;   // Sony-specific: HR timers deliver a distinct filter
     // (UserReg / g_user_regs are declared above, before the vblank pump.)
 }
 HLE(k_add_user_event) {   // (eq, id, udata?) — register a user event source on the equeue
@@ -832,7 +833,12 @@ HLE(k_trigger_user_event) {   // (eq, id, udata) — fire the user event: post i
 // the sleep, so sceKernelDelete(HR)TimerEvent / DeleteEqueue really stop a pending timer (previously
 // Delete* were no-ops — a "cancelled" timer still fired, delivering a phantom event whose udata the
 // guest may have freed). Posting through eq_post's shared_ptr lookup is safe even if the queue died.
-static void post_after(uint64_t eq, int64_t id, uint64_t udata, uint64_t usec, int16_t filter) {
+// Post an EVFILT_(HR)TIMER event to the equeue after `usec` microseconds. `periodic` timers re-arm and
+// keep firing every `usec` until cancelled (sceKernelAddTimerEvent — matches FreeBSD kqueue EVFILT_TIMER,
+// which repeats by default); one-shot timers fire once (sceKernelAddHRTimerEvent). The delivered event's
+// `data` carries the running expiration count (kqueue semantics), NOT the interval. Timers are CANCELLABLE
+// (#67): registration stores a token in g_timers; the thread re-checks it, so Delete*/DeleteEqueue stop it.
+static void post_after(uint64_t eq, int64_t id, uint64_t udata, uint64_t usec, int16_t filter, bool periodic) {
     auto cancelled = std::make_shared<std::atomic<bool>>(false);
     {
         std::lock_guard<std::mutex> lk(g_eq_mx);
@@ -841,17 +847,19 @@ static void post_after(uint64_t eq, int64_t id, uint64_t udata, uint64_t usec, i
         if (it != g_timers.end()) it->second.cancelled->store(true);   // re-arm replaces the pending shot
         g_timers[key] = TimerTok{ cancelled };
     }
-    std::thread([eq, id, udata, usec, filter, cancelled]{
+    std::thread([eq, id, udata, usec, filter, periodic, cancelled]{
         struct timespec ts{ (time_t)(usec / 1000000), (long)((usec % 1000000) * 1000) };
-        nanosleep(&ts, nullptr);
-        if (cancelled->load()) return;
-        {   // one-shot: forget the registration (only if it is still OUR token, not a re-arm's)
-            std::lock_guard<std::mutex> lk(g_eq_mx);
-            auto it = g_timers.find(std::make_pair(eq, id));
-            if (it != g_timers.end() && it->second.cancelled == cancelled) g_timers.erase(it);
-        }
-        SceKEvent e{}; e.ident = id; e.filter = filter; e.data = (int64_t)usec; e.udata = udata;
-        eq_post(eq, e);
+        int64_t count = 0;
+        do {
+            nanosleep(&ts, nullptr);
+            if (cancelled->load()) break;
+            SceKEvent e{}; e.ident = id; e.filter = filter; e.data = ++count; e.udata = udata;
+            eq_post(eq, e);
+        } while (periodic && !cancelled->load());
+        // forget the registration once we stop firing (only if it is still OUR token, not a re-arm's)
+        std::lock_guard<std::mutex> lk(g_eq_mx);
+        auto it = g_timers.find(std::make_pair(eq, id));
+        if (it != g_timers.end() && it->second.cancelled == cancelled) g_timers.erase(it);
     }).detach();
 }
 // Cancel a pending one-shot timer registered for (eq, id). Shared by both Delete*TimerEvent names.
@@ -879,14 +887,14 @@ HLE(k_add_hrtimer_event) {   // (eq, id, SceKernelTimespec* ts, udata) — orbis
     uint64_t usec = 1000;
     if (a2) { const int64_t* ts = (const int64_t*)P(a2);   // { tv_sec, tv_nsec }
               usec = (uint64_t)ts[0] * 1000000ull + (uint64_t)ts[1] / 1000ull; if (!usec) usec = 1000; }
-    post_after(a0, (int64_t)a1, a3, usec, EVFILT_TIMER);
+    post_after(a0, (int64_t)a1, a3, usec, EVFILT_HRTIMER, /*periodic=*/false);   // HR timer is one-shot
     if (evlog()) fprintf(stderr, "[ev] AddHRTimerEvent eq=0x%llx id=%lld usec=%llu\n",
         (unsigned long long)a0, (long long)a1, (unsigned long long)usec);
     return 0;
 }
 HLE(k_add_timer_event) {   // (eq, id, usec, udata) — coarse timer, same one-shot post
     uint64_t usec = a2 ? a2 : 1000;
-    post_after(a0, (int64_t)a1, a3, usec, EVFILT_TIMER);
+    post_after(a0, (int64_t)a1, a3, usec, EVFILT_TIMER, /*periodic=*/true);   // coarse timer repeats
     if (evlog()) fprintf(stderr, "[ev] AddTimerEvent eq=0x%llx id=%lld usec=%llu\n",
         (unsigned long long)a0, (long long)a1, (unsigned long long)usec);
     return 0;
