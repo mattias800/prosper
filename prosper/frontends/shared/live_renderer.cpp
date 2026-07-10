@@ -94,6 +94,33 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         uint32_t tw = r.width ? r.width : 4, th = r.height ? r.height : 4;
                         size_t nb = (size_t)tw * th * 4;
                         texstore.emplace_back(nb, 0x00);
+                        // PROSPER_TEXCOMMIT: log, once per texture base, how much of the sampled surface is
+                        // COMMITTED guest memory (the same reserved_range_state safe_copy stops at). If the
+                        // level's backgrounds read ~0% committed, they're GPU-DMA'd pages the CPU never
+                        // touched, so we read zeros -> the scene samples black (#300 black-gameplay probe).
+                        if (getenv("PROSPER_TEXCOMMIT")) {
+                            const size_t PG = 0x10000; size_t committed = 0;
+                            for (uint64_t a = r.gpu_addr; a < r.gpu_addr + nb; a += PG)
+                                if (a >= 0x1000 && prosper_reserved_range_state(a) != 0) committed += PG;
+                            static std::set<uint64_t> tcseen;
+                            if (tcseen.insert(r.gpu_addr).second) {
+                                // Also sample the first 8 dwords and count non-zero bytes over the whole
+                                // surface: zero content => the texture was allocated but never filled (a
+                                // GPU-side upload/copy we don't execute); non-zero => it's a decode/tiling
+                                // problem. tile_mode tells tiled vs linear.
+                                uint32_t w0[8] = {0}; size_t nzb = 0;
+                                if (committed) {
+                                    const uint8_t* p = (const uint8_t*)(uintptr_t)r.gpu_addr;
+                                    for (int i = 0; i < 8; i++) w0[i] = ((const uint32_t*)p)[i];
+                                    for (size_t i = 0; i < nb; i += 997) nzb += (p[i] != 0);   // sparse scan
+                                }
+                                fprintf(stderr, "[texcommit] tex 0x%llx %ux%u f%u tile=%u nb=%zu committed=%zu%% "
+                                        "nz~%zu/%zu first=%08x %08x %08x %08x\n",
+                                        (unsigned long long)r.gpu_addr, tw, th, (unsigned)r.format, r.tile_mode, nb,
+                                        nb ? (size_t)(100 * committed / nb) : 100, nzb, nb/997,
+                                        w0[0], w0[1], w0[2], w0[3]);
+                            }
+                        }
                         // Real bytes-per-texel of the SAMPLED surface. Single/dual-channel textures (an R8
                         // font/coverage atlas — this game's 2048x1024 c1 surface) are NOT 4 B/texel; reading
                         // them as RGBA8 packs adjacent texels into one pixel and over-reads the allocation,
@@ -326,6 +353,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // channel — keep it identity so the font/mask path (#102/#256) is untouched.
                         if (narrow_done) { fr.swizzle[0]=4; fr.swizzle[1]=5; fr.swizzle[2]=6; fr.swizzle[3]=7; }
                         else { for (int k=0;k<4;k++) fr.swizzle[k] = r.swizzle[k]; }
+                        // PROSPER_ALPHA1: force the sampled alpha to constant 1 (opaque). Diagnostic for a
+                        // black scene whose textures decode to real RGB but composite to nothing — if the
+                        // level appears with this, the alpha channel (decode or DST_SEL swizzle) is the bug (#300).
+                        if (getenv("PROSPER_ALPHA1")) fr.swizzle[3] = 1;
                     } else {
                         uint32_t nb = std::min(r.size ? r.size : 256u, 1u << 20) & ~3u;   // cap 1 MB, dword-aligned
                         if (nb >= 4) {
@@ -334,6 +365,20 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 fr.dwords.assign((const uint32_t*)tmp.data(), (const uint32_t*)(tmp.data() + nb));
                         }
                         if (fr.dwords.empty()) fr.dwords.assign(64, 0);
+                        // PROSPER_CBLOG: log each constant buffer's first 4 dwords as floats, once per
+                        // address. If a scene draw's color/tint CB is (0,0,0,0), the PS outputs black
+                        // regardless of the (correctly-decoded) texture — the #300 black-scene suspect.
+                        if (getenv("PROSPER_CBLOG") && r.cls == RC::ConstantBuffer) {
+                            static std::set<uint64_t> cbseen;
+                            if (cbseen.insert(r.gpu_addr).second) {
+                                const float* fp = (const float*)fr.dwords.data();
+                                size_t n = fr.dwords.size();
+                                fprintf(stderr, "[cb] bind=%u addr=0x%llx size=%u dw=%08x %08x %08x %08x  f=%.3f %.3f %.3f %.3f\n",
+                                        r.binding, (unsigned long long)r.gpu_addr, (unsigned)r.size,
+                                        n>0?fr.dwords[0]:0, n>1?fr.dwords[1]:0, n>2?fr.dwords[2]:0, n>3?fr.dwords[3]:0,
+                                        n>0?fp[0]:0.f, n>1?fp[1]:0.f, n>2?fp[2]:0.f, n>3?fp[3]:0.f);
+                            }
+                        }
                     }
                     R.push_back(std::move(fr));
                 }
