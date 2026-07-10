@@ -194,12 +194,17 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             Gen5ImageFormatInfo fi;
             static bool warned[512] = {};                        // once per 9-bit format value
             if (!gen5_image_format(d.format, &fi)) {
-                // Unmapped IMG format. Under PROSPER_RTT, BIND it as RGBA8 anyway so the render-to-texture
-                // path can inject the pixels we rendered into this address (the composite that samples a
-                // scene color target uses an unmapped packed format, e.g. fmt=36 — skipping it means the
-                // RTT cache is never consulted and the frame stays black). Without RTT, keep skipping
-                // (a raw RGBA8 read of a real unmapped texture would sample garbage; #65).
-                if (!getenv("PROSPER_RTT")) {
+                // Unmapped IMG format. Under RTT, BIND it as RGBA8 anyway so the render-to-texture path
+                // can inject the pixels we rendered into this address (the composite that samples a scene
+                // color target uses an unmapped packed format — e.g. fmt=36 = GFX10 10_11_11_FLOAT, the
+                // title's 1920x1080 HDR scene-color RT — so skipping it means the RTT cache is never
+                // consulted and the frame stays black). PROSPER_RTT_PERTARGET is a superset RTT mode (it
+                // renders+caches each color target separately), so it must trigger this same binding —
+                // otherwise per-target enables injection but never binds the scene-color texture to inject
+                // INTO, and HIT stays 0. Without any RTT mode, keep skipping (a raw RGBA8 read of a real
+                // unmapped packed texture samples garbage; #65). The RGBA8 read is still wrong for a
+                // non-cached fmt=36 sample — real 10_11_11 unpack is a TODO (#270); injection overrides it.
+                if (!getenv("PROSPER_RTT") && !getenv("PROSPER_RTT_PERTARGET")) {
                     if (!warned[d.format & 511u]) { warned[d.format & 511u] = true;
                         fprintf(stderr, "[t#] UNMAPPED Gen5 IMG_FMT %u (%ux%u T#) -> skipping texture binding "
                                         "(extend gen5_image_format)\n", d.format, d.width, d.height); }
