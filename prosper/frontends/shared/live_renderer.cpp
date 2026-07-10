@@ -345,9 +345,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         fr.mag_filter = r.mag_filter; fr.min_filter = r.min_filter; fr.mip_filter = r.mip_filter;
                         fr.addr_uvw[0] = r.addr_uvw[0]; fr.addr_uvw[1] = r.addr_uvw[1]; fr.addr_uvw[2] = r.addr_uvw[2];
                         // Remaining S# sampler fields (#262): border color + LOD clamp/bias (applied where
-                        // valid; the decode-only aniso/compare/unnorm stay on ShaderResource).
+                        // valid; the decode-only compare/unnorm stay on ShaderResource).
                         fr.border_color_type = r.border_color_type;
                         fr.min_lod = r.min_lod; fr.max_lod = r.max_lod; fr.lod_bias = r.lod_bias;
+                        // Anisotropy ratio (#275): applied in render_runner.h when the device supports the
+                        // samplerAnisotropy feature and filtering is linear. The Messenger decodes ratio 0
+                        // (isotropic) so this is a no-op for it; carries correct behavior for titles that
+                        // request anisotropic filtering.
+                        fr.max_aniso_ratio = r.max_aniso_ratio;
                         // T# DST_SEL channel remap (#261): apply only to REAL-RGBA texels. The narrow
                         // R->RGBA replication path (narrow_done) already broadcasts coverage to every
                         // channel — keep it identity so the font/mask path (#102/#256) is untouched.

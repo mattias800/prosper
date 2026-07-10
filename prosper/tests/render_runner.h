@@ -48,7 +48,8 @@ inline bool dump_bmp(const char* path, const std::vector<uint8_t>& px, uint32_t 
 
 // A texture to bind for a recompiled shader's image_sample: `rgba` points to w*h*4 RGBA8 bytes,
 // bound as a COMBINED_IMAGE_SAMPLER (nearest filter, clamp) at descriptor-set 0, `binding`.
-struct TexDesc { uint32_t binding; uint32_t w; uint32_t h; const uint8_t* rgba; };
+struct TexDesc { uint32_t binding; uint32_t w; uint32_t h; const uint8_t* rgba;
+                 uint32_t max_aniso_ratio = 0; };   // #275: S# anisotropy ratio (0 = isotropic)
 
 // One resource for the general N-binding path (render_triangle_rgba's `gres`): either a storage buffer
 // (dwords non-empty, tex_rgba null) or a combined image sampler (tex_rgba set) at `binding`. Lets a
@@ -71,6 +72,9 @@ struct FrameResource {
     // transparent-black, LOD 0..0, no bias), so FrameResources built directly by tests are byte-identical.
     uint32_t border_color_type = 0;
     float    min_lod = 0.0f, max_lod = 0.0f, lod_bias = 0.0f;
+    // Anisotropy ratio (S# WORD0[11:9]; maxAnisotropy = 1<<ratio). 0 = isotropic (the default) -> the
+    // sampler is byte-identical to before, so tests building FrameResources directly are unaffected (#275).
+    uint32_t max_aniso_ratio = 0;
     // T# DST_SEL channel swizzle (SQ_SEL per channel: 0=0,1=1,4=R,5=G,6=B,7=A). Default = identity
     // (R,G,B,A) == a no-op VkComponentMapping, so tests that build FrameResources directly are unchanged.
     uint32_t swizzle[4] = {4, 5, 6, 7};
@@ -142,6 +146,15 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     // robustBufferAccess: out-of-range storage-buffer accesses are well-defined, so a predicated memory
     // op run by an inactive lane (narrowed EXEC) can't fault.
     VkPhysicalDeviceFeatures feats{}; feats.robustBufferAccess = VK_TRUE; dci.pEnabledFeatures = &feats;
+    // samplerAnisotropy (#275): the game's S# can request anisotropic filtering (max_aniso_ratio > 0).
+    // Enable the feature only when the physical device advertises it (a headless/software device may
+    // not) — otherwise sampler creation with anisotropyEnable would be invalid usage. maxSamplerAnisotropy
+    // is the device's ceiling; we clamp the requested ratio to it at sampler-build time.
+    VkPhysicalDeviceFeatures supported{}; vkGetPhysicalDeviceFeatures(phys, &supported);
+    VkPhysicalDeviceProperties phys_props{}; vkGetPhysicalDeviceProperties(phys, &phys_props);
+    const bool  aniso_enabled = supported.samplerAnisotropy;
+    const float max_aniso_limit = phys_props.limits.maxSamplerAnisotropy;
+    if (aniso_enabled) feats.samplerAnisotropy = VK_TRUE;
     // robustImageAccess (VK_EXT_image_robustness; core in 1.3): the recompiled storage-image load
     // path issues OpImageRead for ALL invocations — including EXEC-inactive lanes whose coordinates
     // can be out of range — relying on OOB image reads returning zero (#131). This is the LIVE
@@ -422,9 +435,19 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     //   border color: only bites with CLAMP_TO_BORDER wrap. 3 = register/custom (needs
                     //     VK_EXT_custom_border_color); fall back to opaque-black.
                     //   LOD min/max/bias: honored; harmless with our single uploaded mip.
+                    // Anisotropy (#275): applied when the S# requests a ratio, the device feature is
+                    // enabled, and filtering is linear (Vulkan requires anisotropyEnable only with linear
+                    // mag/min filters). maxAnisotropy = 1<<ratio, clamped to the device ceiling. ratio 0
+                    // (isotropic) leaves anisotropyEnable false -> the sampler is unchanged.
+                    if (r.max_aniso_ratio > 0 && aniso_enabled &&
+                        sci.magFilter == VK_FILTER_LINEAR && sci.minFilter == VK_FILTER_LINEAR) {
+                        sci.anisotropyEnable = VK_TRUE;
+                        float want = (float)(1u << r.max_aniso_ratio);
+                        sci.maxAnisotropy = want < max_aniso_limit ? want : max_aniso_limit;
+                    }
                     // NOT applied here (need machinery the current path lacks — decoded under GFXLOG only):
-                    //   anisotropy (needs the samplerAnisotropy device feature), depth_compare_func (needs a
-                    //   depth/shadow sampler over a depth image), unnormalized coords (strict validity rules).
+                    //   depth_compare_func (needs a depth/shadow sampler over a depth image),
+                    //   unnormalized coords (strict validity rules + recompiler coord semantics).
                     switch (r.border_color_type) {
                         case 1:  sci.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK; break;
                         case 2:  sci.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE; break;
@@ -640,7 +663,7 @@ inline std::vector<uint8_t> render_triangle_rgba(const std::vector<uint32_t>& ve
             FrameResource b2; b2.binding = 2; b2.set = s2; if (cbuf) b2.dwords = *cbuf; d.R.push_back(std::move(b2));
             FrameResource b3; b3.binding = 3; b3.set = s2; if (vbuf) b3.dwords = *vbuf; d.R.push_back(std::move(b3));
         }
-        if (tex) { FrameResource t; t.binding = tex->binding; t.set = 1; t.tex_rgba = tex->rgba; t.tw = tex->w; t.th = tex->h; d.R.push_back(std::move(t)); }
+        if (tex) { FrameResource t; t.binding = tex->binding; t.set = 1; t.tex_rgba = tex->rgba; t.tw = tex->w; t.th = tex->h; t.max_aniso_ratio = tex->max_aniso_ratio; d.R.push_back(std::move(t)); }
     }
     return render_draws_rgba({std::move(d)}, W, H);
 }

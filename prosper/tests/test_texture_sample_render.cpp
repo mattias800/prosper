@@ -81,6 +81,26 @@ int main() {
     printf("  (0.25,0.75) center=(%u,%u,%u)\n", ok2?rgb[0]:0, ok2?rgb[1]:0, ok2?rgb[2]:0);
     CHECK(ok2 && rgb[2] > 0x80 && rgb[0] < 0x40 && rgb[1] < 0x40, "sampling texel (0,1) yields BLUE (proves v routing)");
 
+    // #275: anisotropy applied. A sampler built with max_aniso_ratio > 0 (here 4 -> 16x) must create
+    // validly and still sample correctly — the fullscreen quad isn't minified, so aniso changes nothing
+    // about the result, but a broken apply (invalid usage / wrong sampler) would blank the frame or move
+    // the texel. Same (0.75,0.25) -> texel (1,0) = GREEN check, now through the anisotropic sampler.
+    {
+        prosper::test::TexDesc td_a{ /*binding*/4, /*w*/2, /*h*/2, texels, /*max_aniso_ratio*/4u };
+        std::vector<uint32_t> ps(ps_template, ps_template + sizeof(ps_template)/sizeof(ps_template[0]));
+        ps[1] = C075; ps[3] = C025;
+        std::vector<uint32_t> frag = recompile_fragment(ps.data(), ps.size(), &rt);
+        bool okA = !frag.empty() && frag[0] == 0x07230203u;
+        if (okA) {
+            std::vector<uint8_t> px = prosper::test::render_triangle_rgba(vert, frag, W, H, nullptr, nullptr, nullptr, &td_a);
+            okA = px.size() == (size_t)W*H*4;
+            if (okA) { const uint8_t* c = &px[((size_t)(H/2)*W + W/2)*4]; rgb[0]=c[0]; rgb[1]=c[1]; rgb[2]=c[2]; }
+        }
+        printf("  aniso(16x) (0.75,0.25) center=(%u,%u,%u)\n", okA?rgb[0]:0, okA?rgb[1]:0, okA?rgb[2]:0);
+        CHECK(okA && rgb[1] > 0x80 && rgb[0] < 0x40 && rgb[2] < 0x40,
+              "anisotropic sampler (ratio 4/16x) still samples texel (1,0) = GREEN (valid apply)");
+    }
+
     // image_load (integer texel fetch, no sampler): x,y = inline-int coords into v0,v1; image_load
     // v[0:3], v[0:1], s[8:15]; exp mrt0. Coord (x,y) directly indexes the texel — no filtering.
     const uint32_t il_template[] = {
