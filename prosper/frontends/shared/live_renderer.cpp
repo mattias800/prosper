@@ -225,7 +225,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     it.ps.color_write_mask, (int)it.ps.blend_enable);
                 bds.push_back(std::move(bd));
             }
-            std::vector<uint8_t> px = prosper::test::render_draws_rgba(bds, w, h);
+            // Clear color (#367): the game's decoded fast-clear from the first draw's resolved state,
+            // else the ResolvedPipelineState default (opaque black) — never the diagnostic blue on the
+            // live path (that stays gated behind PROSPER_CLEAR_DEBUG inside render_draws_rgba). This
+            // re-connects the resolved clear color (#309) that a later live_renderer refactor unwired,
+            // so a real frame's un-drawn areas are the game's clear, not blue.
+            const float* clear_rgba = items.empty() ? nullptr : items.front().ps.clear_color;
+            std::vector<uint8_t> px = prosper::test::render_draws_rgba(bds, w, h, /*seed*/nullptr, clear_rgba);
             int n = frame_no++;
             if (px.empty()) {
                 fprintf(stderr, "[render] frame %d: Vulkan render FAILED (%ux%u)\n", n, w, h);
