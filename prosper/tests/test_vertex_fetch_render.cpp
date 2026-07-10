@@ -67,6 +67,27 @@ int main() {
     printf("  center=(%u,%u,%u,%u)  green samples %u/%u\n", c[0],c[1],c[2],c[3], green, total);
     CHECK(green == total, "every sampled pixel is GREEN (VS fetched real positions from the vertex buffer)");
 
+    // #368: format default-fill. This VS uses buffer_load_format_XYZW (4 components) against the SAME
+    // Float32 x2 vertex buffer, and exports the FETCHED z,w directly (no hardcoded v3=0/v4=1.0). The V#
+    // only provides x,y — so the recompiler must default z=0.0 and W=1.0, NOT read the next vertex's
+    // bytes. With the correct W=1.0 the clip-space triangle covers the viewport (green everywhere); the
+    // old code read w from adjacent memory (next vertex / robust-0), collapsing the triangle.
+    const uint32_t vs4[] = {
+        0xe00c2000u, 0x80020100u,   // buffer_load_format_xyzw v[1:4], v0, s[8:11], 0 idxen
+        0xf80008cfu, 0x04030201u,   // exp pos0 v1, v2, v3, v4 done  (uses the FETCHED z=v3, w=v4)
+        0xbf810000u,                // s_endpgm
+    };
+    std::vector<uint32_t> vert4 = recompile_vertex(vs4, sizeof(vs4)/sizeof(vs4[0]), &rt);
+    CHECK(!vert4.empty() && vert4[0] == 0x07230203u, "recompiled xyzw-fetch VS -> SPIR-V");
+    if (!vert4.empty()) {
+        std::vector<uint8_t> px4 = prosper::test::render_triangle_rgba(vert4, frag, W, H, nullptr, &vbuf);
+        uint32_t g4 = 0, t4 = 0;
+        auto isGreen4 = [&](uint32_t x, uint32_t y) { const uint8_t* p = &px4[((size_t)y*W+x)*4];
+                                                      return p[1] > 0x80 && p[0] < 0x40 && p[2] < 0x40; };
+        for (uint32_t y : ys) for (uint32_t x : xs) { t4++; if (px4.size() == px.size() && isGreen4(x, y)) g4++; }
+        CHECK(g4 == t4, "#368: xyzw fetch of a 2-comp attribute defaults W=1.0 (not adjacent memory) -> green");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
