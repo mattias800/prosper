@@ -153,8 +153,9 @@ int main() {
     batch[1] = { 999,          0, PTR(pb.data()) };        // invalid handle -> skipped
     batch[2] = { (int32_t)hb, 0, PTR(pb.data()) };
     int64_t tot = call("sceAudioOutOutputs", PTR(batch), 3);
-    CHECK(tot == 128 + 128);                              // two valid entries
-    CHECK(sink.outs.size() == 2);
+    CHECK(tot == 128);                                    // ONE grain (the shared slice), not the sum over
+                                                          // ports (Kyty/shadPS4 both return a single grain)
+    CHECK(sink.outs.size() == 2);                         // ...but both valid entries are still forwarded
 
     // --- restore the default sink so we don't dangle a stack pointer -------------------------
     audio_reset();

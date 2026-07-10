@@ -162,15 +162,18 @@ HLE(audio_outputs) {
     const auto* arr = (const OutParam*)P(a0);
     int num = (int)a1;
     if (!arr || num <= 0) return 0;
-    uint64_t total = 0;
+    // sceAudioOutOutputs writes the SAME time-slice to N ports in parallel; the return is samples-per-
+    // channel of that slice (one grain), NOT the additive sum over ports. Returning the sum made a guest
+    // using the count as a sample-clock over-count by N x (Kyty/shadPS4 both return a single port's grain).
+    uint64_t grain = 0; bool have = false;
     for (int i = 0; i < num; i++) {
         AudioPortInfo info; bool ok;
         { std::lock_guard<std::mutex> lk(g_mx); Port* p = port_of(arr[i].handle); ok = (p != nullptr); if (ok) info = p->info; }
         if (!ok) continue;
         if (arr[i].ptr) { if (auto* s = audio_sink()) s->output(arr[i].handle, P(arr[i].ptr), info.grain); }
-        total += info.grain;
+        if (!have) { grain = info.grain; have = true; }
     }
-    return total;
+    return grain;
 }
 
 // sceAudioOutSetVolume(handle, flag(channel mask), int vol[]) -> 0 or negative error.
