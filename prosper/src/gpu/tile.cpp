@@ -3,7 +3,10 @@
 #include "tile.hpp"
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
 #include <algorithm>
+#include <mutex>
+#include <set>
 #include <vector>
 
 namespace prosper::gpu {
@@ -12,6 +15,23 @@ bool tile_mode_is_tiled(uint32_t tile_mode) {
     return tile_mode == (uint32_t)TileMode::Sw4KbS ||
            tile_mode == (uint32_t)TileMode::Sw64KbS ||
            tile_mode == (uint32_t)TileMode::Sw64KbRX;
+}
+
+// One-time diagnostic when a NON-ZERO (tiled) tile_mode is not one of the swizzles we de-swizzle
+// (Sw4KbS=5 / Sw64KbS=9 / Sw64KbRX=27): the caller then copies the surface VERBATIM as if linear, so
+// it samples as a scrambled swizzle-weave. Other GFX10 modes a PS5 T# can legally carry — SW_256B_*,
+// SW_4KB_D/*_X, SW_64KB_S_T/D_T, the SW_64KB_Z/D depth/displayable families, SW_VAR_* — all land here.
+// Log once per unrecognized mode under PROSPER_GFXLOG so this silent linear-fallback is observable
+// instead of masquerading as a correct linear copy (#383). No-op for mode 0 (genuinely linear).
+static void warn_unhandled_tile_mode(uint32_t tile_mode, uint32_t w, uint32_t h) {
+    if (tile_mode == 0 || tile_mode_is_tiled(tile_mode) || !getenv("PROSPER_GFXLOG")) return;
+    static std::set<uint32_t> seen;
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lk(mu);
+    if (seen.insert(tile_mode).second)
+        fprintf(stderr, "[tile] UNHANDLED GFX10 tile_mode=%u (%ux%u) -> copied as LINEAR; surface will "
+                        "sample SCRAMBLED (only Sw4KbS=5/Sw64KbS=9/Sw64KbRX=27 are de-swizzled)\n",
+                        tile_mode, w, h);
 }
 
 namespace {
@@ -288,7 +308,8 @@ size_t tiled_surface_bytes(uint32_t width, uint32_t height, uint32_t tile_mode, 
 
 void detile_surface(uint8_t* dst, const uint8_t* src, uint32_t width, uint32_t height,
                     uint32_t tile_mode, uint32_t pitch, uint32_t bytes_per_texel) {
-    if (!tile_mode_is_tiled(tile_mode)) { std::memcpy(dst, src, (size_t)width * height * bytes_per_texel); return; }
+    if (!tile_mode_is_tiled(tile_mode)) { warn_unhandled_tile_mode(tile_mode, width, height);
+                                          std::memcpy(dst, src, (size_t)width * height * bytes_per_texel); return; }
     if (is_64kb_mode(tile_mode)) {
         sw64kb_copy<false>(dst, src, width, height, pitch, bytes_per_texel,
                            sw64kb_tiled_bytes(width, height, pitch, bytes_per_texel), tile_mode);
@@ -338,6 +359,7 @@ size_t tiled_elements_bytes(uint32_t ew, uint32_t eh, uint32_t bpe, uint32_t til
 void detile_elements(uint8_t* dst, const uint8_t* src, size_t src_bytes,
                      uint32_t ew, uint32_t eh, uint32_t bpe, uint32_t tile_mode) {
     if (!tile_mode_is_tiled(tile_mode) || bpe == 0) {
+        if (bpe != 0) warn_unhandled_tile_mode(tile_mode, ew, eh);   // bpe==0 is a caller error, not a mode gap
         size_t n = std::min(src_bytes, (size_t)ew * eh * bpe);
         std::memcpy(dst, src, n);
         if (n < (size_t)ew * eh * bpe) std::memset(dst + n, 0, (size_t)ew * eh * bpe - n);
