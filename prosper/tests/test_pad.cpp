@@ -29,7 +29,10 @@ int main() {
     CHECK(offsetof(ScePadData, connected) == 0x4c, "connected @ 0x4c");
     CHECK(offsetof(ScePadData, timestamp) == 0x50, "timestamp @ 0x50");
     CHECK(offsetof(ScePadData, connected_count) == 0x68, "connected_count @ 0x68");
-    CHECK(sizeof(ScePadControllerInformation) == 32, "sizeof(ScePadControllerInformation) == 32");
+    // Sony's real ScePadControllerInformation is 0x1c = 28 bytes (deviceClass@0x10 + reserve[8]),
+    // matched by shadPS4/Kyty AND by the live guest, whose compiler placed its stack canary exactly
+    // 0x1c after the struct. A 32-byte struct overran that 28-byte buffer -> canary crash (#283).
+    CHECK(sizeof(ScePadControllerInformation) == 28, "sizeof(ScePadControllerInformation) == 28");
     CHECK(offsetof(ScePadControllerInformation, device_class) == 0x10, "device_class @ 0x10");
 
     // (2) Neutral state -> centered sticks, zero buttons, released triggers, identity orientation.

@@ -25,7 +25,7 @@ static_assert(offsetof(ScePadData, ext_unit_id)        == 0x58, "ext_unit_id");
 static_assert(offsetof(ScePadData, connected_count)    == 0x68, "connected_count");
 static_assert(offsetof(ScePadData, device_unique_data) == 0x6c, "device_unique_data");
 
-static_assert(sizeof(ScePadControllerInformation) == 32, "ScePadControllerInformation must be 32 bytes");
+static_assert(sizeof(ScePadControllerInformation) == 28, "ScePadControllerInformation must be 28 bytes (Sony reserve[8], #283)");
 static_assert(offsetof(ScePadControllerInformation, device_class) == 0x10, "device_class");
 
 uint8_t pad_axis_u8(int raw, int min, int max) {
