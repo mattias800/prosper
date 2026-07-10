@@ -114,6 +114,18 @@ int main() {
     std::vector<uint8_t> pxu = execute_gpustate(sti, backend_idx);
     CHECK(pxu == px, "unknown index_type falls back to a non-indexed draw of the hint count");
 
+    // #400: a zero-vertex-count non-indexed draw is a hardware no-op. realize_draw_item must SKIP it
+    // (return false), not fabricate a phantom triangle (the vcount default was 3) nor sweep the residual
+    // vertex pool. A positive count still realizes — the guard is specific to zero, not a regression.
+    {
+        DrawItem it0;
+        bool made0 = realize_draw_item(st, nullptr, /*vcount_hint*/0u, 0x10000u, /*log*/false, it0);
+        CHECK(!made0, "zero vertex-count draw is skipped (no phantom triangle / VB sweep)");
+        DrawItem it3;
+        bool made3 = realize_draw_item(st, nullptr, /*vcount_hint*/3u, 0x10000u, /*log*/false, it3);
+        CHECK(made3 && it3.vertex_count == 3u, "non-zero vertex-count draw still realizes");
+    }
+
     // The live-submit registry path — exactly what agc_driver_submit_dcb drives once a device is wired.
     CHECK(!have_submit_renderer(), "no live renderer registered by default (game path stays inert)");
     CHECK(!execute_and_present(st, W, H), "execute_and_present is a no-op with no renderer registered");
