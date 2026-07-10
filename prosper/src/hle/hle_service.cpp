@@ -142,6 +142,11 @@ HLE(s_np_country)     { if (a1) memset(PW(a1), 0, 4); return 0; }
 // sceNpGetOnlineId(userId, SceNpOnlineId* out): the signed-out error, out untouched (shadPS4
 // np_manager.cpp:618). The unimplemented success+garbage here is what faked the sign-in.
 HLE(s_np_getonlineid) { svc_log("sceNpGetOnlineId", a0,a1,a2,a3,a4,a5); return NP_ERR_SIGNED_OUT; }
+// sceNpGetNpId(userId, SceNpId* out): the signed-out error, out untouched (shadPS4 np_manager.cpp) — the
+// most common identity getter. Was MISSING -> the return-0 stub told the guest a valid online identity
+// existed (a garbage ~40-byte SceNpId), pushing it onto online/entitlement branches that dead-end. This
+// was a direct hole in the #306 signed-out fix (the sibling getters below were done, this one wasn't).
+HLE(s_np_getnpid)     { svc_log("sceNpGetNpId", a0,a1,a2,a3,a4,a5); return NP_ERR_SIGNED_OUT; }
 
 // --- mouse (report a device that exists but has no input; pad -> hle_pad.cpp real backend) ---
 HLE(s_open)           { return g_handle++; }                                 // sceMouseOpen -> handle
@@ -922,6 +927,8 @@ void register_service_hle() {
     R("sceNpGetAccountIdA", s_np_accountid);
     R("sceNpGetAccountCountryA", s_np_country);
     Hle::register_fn("XDncXQIJUSk", (HleFn)s_np_getonlineid, "sceNpGetOnlineId");
+    Hle::register_fn("p-o74CnoNzY", (HleFn)s_np_getnpid,   "sceNpGetNpId");       // was MISSING -> faked identity
+    Hle::register_fn("a8R9-75u4iM", (HleFn)s_np_accountid, "sceNpGetAccountId");  // non-A variant: zero id + SIGNED_OUT
     R("sceNpRegisterStateCallback", s_ok);
 #ifndef _WIN32
     // sceNpCheckCallback pumps the registered A-callbacks (SIGNED_OUT delivered once, guest %fs).
