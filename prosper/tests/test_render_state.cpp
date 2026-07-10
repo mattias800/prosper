@@ -153,6 +153,29 @@ int main() {
         CHECK(resolve_pipeline_state(r2).polygon_mode == 1u, "POLY_MODE lines -> VK_POLYGON_MODE_LINE(1)");
     }
 
+    // #466: the three "replace-ish" stencil ops (ONES=2, REPLACE_TEST=3, REPLACE_OP=4) all resolve to
+    // VK REPLACE but write DIFFERENT values via the backend's stencil_op_val reference. Build a stencil
+    // state (ALWAYS compare, one pass op) and check the resolved op-val picks the right source.
+    {
+        RenderState s{};
+        s.stencil_enable = true;
+        s.db_depth_control = (1u << 0) | (7u << 8);   // STENCIL_ENABLE | STENCILFUNC=ALWAYS(7), BACKFACE_ENABLE=0
+        s.db_stencilrefmask = (0x33u << 24) | 0x22u;  // STENCILOPVAL=0x33, STENCILTESTVAL=0x22
+        s.db_stencil_control = (2u << 4);             // STENCILZPASS = ONES(2)
+        CHECK(resolve_pipeline_state(s).stencil_op_val[0] == 0xFFu,
+              "#466: ONES stencil op writes the constant 0xFF (not STENCILOPVAL)");
+        s.db_stencil_control = (3u << 4);             // STENCILZPASS = REPLACE_TEST(3)
+        CHECK(resolve_pipeline_state(s).stencil_op_val[0] == 0x22u,
+              "#466: REPLACE_TEST writes STENCILTESTVAL (0x22)");
+        s.db_stencil_control = (4u << 4);             // STENCILZPASS = REPLACE_OP(4)
+        CHECK(resolve_pipeline_state(s).stencil_op_val[0] == 0x33u,
+              "#466: REPLACE_OP writes STENCILOPVAL (0x33), unchanged");
+        // Back face mirrors front (BACKFACE_ENABLE=0) — ONES 0xFF propagates to the back op-val too.
+        s.db_stencil_control = (2u << 4);
+        CHECK(resolve_pipeline_state(s).stencil_op_val[1] == 0xFFu,
+              "#466: mirrored back face inherits the ONES 0xFF write value");
+    }
+
     // Decoded blend state + RDNA2->Vulkan factor/op mapping.
     CHECK(rs.blend_enable, "blend_enable = true (bit 30)");
     CHECK(rs.color_src_blend == 4u && vk_blend_factor(rs.color_src_blend) == 6u,
