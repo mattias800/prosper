@@ -259,10 +259,22 @@ struct SpirvCompute {
     // Lazily declared 2-float vector type (types are emitted as a block before code, so on-demand is safe).
     uint32_t t_v2f_cache = 0;
     uint32_t t_v2f() { if (!t_v2f_cache) { t_v2f_cache = id(); put(types, Op_TypeVector, {t_v2f_cache, t_f32, 2}); } return t_v2f_cache; }
-    // v_cvt_pkrtz_f16_f32: pack src0->low f16, src1->high f16 of a 32-bit result (raw VGPR bits).
+    // pack two f32 (raw VGPR bits) into a dword of two f16 halves (src0->low, src1->high). Uses SPIR-V
+    // PackHalf2x16, which is round-to-nearest-even — correct for the RTE store path (pack_half_lo).
     uint32_t pack_half2x16(uint32_t a, uint32_t b) {
         uint32_t vec = id(); put(code, Op_CompositeConstruct, {t_v2f(), vec, bcf(a), bcf(b)});
         uint32_t r = id(); putv(code, Op_ExtInst, {t_u32, r, glsl, Glsl_PackHalf2x16, vec}); return r;
+    }
+    // v_cvt_pkrtz_f16_f32 is round-toward-ZERO. PackHalf2x16 is round-to-nearest-even — within range that
+    // differs by <=1 ULP (accepted), but at the f16 OVERFLOW boundary RTE yields +/-Inf where RTZ clamps
+    // to the max finite f16 (+/-65504). Clamp each source to [-65504, 65504] before packing so an HDR
+    // value above the f16 range becomes 65504 (matching RTZ's saturate) instead of an Inf/NaN that then
+    // propagates through blending/compositing (#452). The RTE store path (pack_half_lo) is unaffected.
+    uint32_t pack_half2x16_rtz(uint32_t a, uint32_t b) {
+        const uint32_t hi = bcu(fconstf(65504.0f)), lo = bcu(fconstf(-65504.0f));
+        uint32_t ca = fext2(Glsl_FMax, fext2(Glsl_FMin, a, hi), lo);
+        uint32_t cb = fext2(Glsl_FMax, fext2(Glsl_FMin, b, hi), lo);
+        return pack_half2x16(ca, cb);
     }
     // Vertex-attribute unpacking (buffer_load_format_* with a packed data format). Each returns the
     // component as raw float VGPR bits, matching how the hardware presents a format load to the shader.
@@ -2255,7 +2267,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // madak/fmaak = src0*src1 + K. (mad vs fma differ only in fused rounding — immaterial here.)
                 case 0x20: case 0x2C: d = b.fbin(Op_FAdd, b.fbin(Op_FMul, a, b.uconst(in.literal)), c); break;  // v_madmk / v_fmamk
                 case 0x21: case 0x2D: d = b.fbin(Op_FAdd, b.fbin(Op_FMul, a, c), b.uconst(in.literal)); break;  // v_madak / v_fmaak
-                case 0x2F: d = b.pack_half2x16(a, c); break;          // v_cvt_pkrtz_f16_f32 (e32 form)
+                case 0x2F: d = b.pack_half2x16_rtz(a, c); break;      // v_cvt_pkrtz_f16_f32 (e32 form): RTZ clamp (#452)
                 case 0x35: {   // v_mul_f16: 16-bit float multiply. Sources read their selected halves
                     // (SDWA WORD_1 = high 16; DWORD/WORD_0 = low 16 — an f16 op reads bits[15:0]);
                     // f16xf16 products are exact in f32, so multiply in f32 and round once to f16.
@@ -2590,7 +2602,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (active) vreg[in.dst.value] = b.mbcnt(active, val(in.src[1]), in.opcode == 0x365);
                 else ok = false;
             } else if (in.opcode == 0x12F) {                          // v_cvt_pkrtz_f16_f32 = pack(s0->lo, s1->hi)
-                vreg[in.dst.value] = b.pack_half2x16(fv(0), fv(1));    // float sources honor neg/abs modifiers
+                vreg[in.dst.value] = b.pack_half2x16_rtz(fv(0), fv(1)); // v_cvt_pkrtz VOP3: RTZ clamp (#452)
             } else if (in.opcode == 0x103) {                          // v_add_f32 (VOP3 form)
                 vreg[in.dst.value] = fresult(b.fbin(Op_FAdd, fv(0), fv(1)));
             } else if (in.opcode == 0x104) {                          // v_sub_f32 (VOP3 form) = s0 - s1
