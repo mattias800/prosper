@@ -22,6 +22,40 @@ namespace prosper {
 
 namespace { std::atomic<uint64_t> g_handle{1}; }
 
+// Diagnostic logging for the Sony service families in this file, gated on PROSPER_SVCLOG=1 (same
+// pattern as PROSPER_FILELOG/[file]). Dumps call args and a bounded hexdump of pointer-shaped args
+// so PS5-only ABIs with no Kyty/shadPS4 reference can be pinned from live captures instead of
+// guessed.
+namespace {
+bool svclog() { static int v = getenv("PROSPER_SVCLOG") ? 1 : 0; return v; }
+bool svc_ptrish(uint64_t v) { return v >= 0x10000 && v < 0x7fffffffffffull; }
+void svc_log(const char* fn, uint64_t a0, uint64_t a1, uint64_t a2,
+             uint64_t a3, uint64_t a4, uint64_t a5, int dump_words = 8) {
+    if (!svclog()) return;
+    fprintf(stderr, "[svc] %s(%#lx, %#lx, %#lx, %#lx, %#lx, %#lx)\n",
+            fn, (unsigned long)a0, (unsigned long)a1, (unsigned long)a2,
+            (unsigned long)a3, (unsigned long)a4, (unsigned long)a5);
+    const uint64_t args[6] = { a0, a1, a2, a3, a4, a5 };
+    for (int i = 0; i < 6; i++) {
+        if (!svc_ptrish(args[i])) continue;
+        // Never read across the arg's 4 KiB page end: an out-param can be a tiny heap block whose
+        // page neighbor is unmapped, and a diagnostic must not be able to fault the boot.
+        uint64_t page_left = 0x1000 - (args[i] & 0xfff);
+        int words = (int)(page_left / 8); if (words > dump_words) words = dump_words;
+#ifdef __linux__
+        // Integer-valued args can masquerade as pointers; probe the page is actually mapped
+        // (msync on an unmapped range fails ENOMEM) before dereferencing — a diagnostic must
+        // never be able to fault the boot.
+        if (msync((void*)(uintptr_t)(args[i] & ~0xfffull), 1, MS_ASYNC) != 0) continue;
+#endif
+        fprintf(stderr, "[svc]   a%d ->", i);
+        const uint64_t* q = (const uint64_t*)PW(args[i]);
+        for (int w = 0; w < words; w++) fprintf(stderr, " %016lx", (unsigned long)q[w]);
+        fprintf(stderr, "\n");
+    }
+}
+}
+
 // --- user service ---
 HLE(s_user_initial)   { if (a0) *(int32_t*)PW(a0) = 1; return 0; }           // GetInitialUser -> userId 1
 HLE(s_user_idlist)    { if (a0) { int32_t* p = (int32_t*)PW(a0); p[0] = 1; for (int i = 1; i < 4; i++) p[i] = -1; } return 0; }
@@ -60,11 +94,28 @@ HLE(s_gamepresets) {
     return 0;
 }
 
-// --- NP / online (single-player: report signed-out / unreachable, success) ---
+// --- NP / online: an honest OFFLINE, SIGNED-OUT console (#306). --------------------------------
+// The DOLL front-end boot flow stalls at UE4's InstallBundleManager PatchCheck because the Np
+// sign-in queries returned success-with-garbage-out: "success" from sceNpGetOnlineId told the
+// game a user IS signed in, pushing its patch/entitlement check onto online branches that then
+// wait forever on fake Http/WebApi handles (docs/DOLL_LOADING_PROGRESSION.md §3). A real console
+// with no PSN sign-in answers these with SCE_NP_ERROR_SIGNED_OUT so the flow resolves to its
+// offline path (UE4 PatchCheck -> NoLoggedInUser).
+// Error space verified against shadPS4 np_error.h (PS4-inherited; identical export names+NIDs in
+// the PS5 3.20 libSceNpManager stub table). SIGNED_OUT = 0x80550006. CONFIDENCE: HIGH on the PS4
+// semantic (shadPS4 returns exactly this from sceNpGetOnlineId/sceNpGetAccountIdA when no user is
+// signed in), MED that the PS5 errno value is unchanged (same 0x8055 Np facility, same API).
+static constexpr uint64_t NP_ERR_SIGNED_OUT = 0x80550006ull;   // SCE_NP_ERROR_SIGNED_OUT
 HLE(s_np_state)       { if (a1) *(int32_t*)PW(a1) = 1; return 0; }           // SCE_NP_STATE_SIGNED_OUT
 HLE(s_np_reach)       { if (a1) *(int32_t*)PW(a1) = 0; return 0; }
-HLE(s_np_accountid)   { if (a1) *(uint64_t*)PW(a1) = 0; return 0; }
+// sceNpGetAccountIdA(userId, u64* accountId): signed-out consoles zero the id AND return the
+// signed-out error (shadPS4 np_manager.cpp:579 does exactly this). The previous success+0 was
+// contradictory garbage ("you have a user; their account id is 0").
+HLE(s_np_accountid)   { if (a1) *(uint64_t*)PW(a1) = 0; return NP_ERR_SIGNED_OUT; }
 HLE(s_np_country)     { if (a1) memset(PW(a1), 0, 4); return 0; }
+// sceNpGetOnlineId(userId, SceNpOnlineId* out): the signed-out error, out untouched (shadPS4
+// np_manager.cpp:618). The unimplemented success+garbage here is what faked the sign-in.
+HLE(s_np_getonlineid) { svc_log("sceNpGetOnlineId", a0,a1,a2,a3,a4,a5); return NP_ERR_SIGNED_OUT; }
 
 // --- mouse (report a device that exists but has no input; pad -> hle_pad.cpp real backend) ---
 HLE(s_open)           { return g_handle++; }                                 // sceMouseOpen -> handle
@@ -198,40 +249,6 @@ HLE(s_nptrophy2_unavailable) { return 0x80551500ull; }
 // Bare unimpl->0 stubs returned SUCCESS with every out-param unfilled (the recurring
 // success+garbage-out bug class), so e.g. scePlayGoOpen "succeeded" without ever writing the
 // handle the game then queries loci with.
-
-// Diagnostic logging for this service family, gated on PROSPER_SVCLOG=1 (same pattern as
-// PROSPER_FILELOG/[file]). Dumps call args and a bounded hexdump of pointer-shaped args so the
-// PS5-only ABIs (sceSaveDataMount3/Prepare/Commit — no Kyty/shadPS4 reference exists) can be
-// pinned from live captures instead of guessed.
-namespace {
-bool svclog() { static int v = getenv("PROSPER_SVCLOG") ? 1 : 0; return v; }
-bool svc_ptrish(uint64_t v) { return v >= 0x10000 && v < 0x7fffffffffffull; }
-void svc_log(const char* fn, uint64_t a0, uint64_t a1, uint64_t a2,
-             uint64_t a3, uint64_t a4, uint64_t a5, int dump_words = 8) {
-    if (!svclog()) return;
-    fprintf(stderr, "[svc] %s(%#lx, %#lx, %#lx, %#lx, %#lx, %#lx)\n",
-            fn, (unsigned long)a0, (unsigned long)a1, (unsigned long)a2,
-            (unsigned long)a3, (unsigned long)a4, (unsigned long)a5);
-    const uint64_t args[6] = { a0, a1, a2, a3, a4, a5 };
-    for (int i = 0; i < 6; i++) {
-        if (!svc_ptrish(args[i])) continue;
-        // Never read across the arg's 4 KiB page end: an out-param can be a tiny heap block whose
-        // page neighbor is unmapped, and a diagnostic must not be able to fault the boot.
-        uint64_t page_left = 0x1000 - (args[i] & 0xfff);
-        int words = (int)(page_left / 8); if (words > dump_words) words = dump_words;
-#ifdef __linux__
-        // Integer-valued args can masquerade as pointers; probe the page is actually mapped
-        // (msync on an unmapped range fails ENOMEM) before dereferencing — a diagnostic must
-        // never be able to fault the boot.
-        if (msync((void*)(uintptr_t)(args[i] & ~0xfffull), 1, MS_ASYNC) != 0) continue;
-#endif
-        fprintf(stderr, "[svc]   a%d ->", i);
-        const uint64_t* q = (const uint64_t*)PW(args[i]);
-        for (int w = 0; w < words; w++) fprintf(stderr, " %016lx", (unsigned long)q[w]);
-        fprintf(stderr, "\n");
-    }
-}
-}
 
 // --- libScePlayGo: report ALL content installed and locus-local. --------------------------------
 // PS4-inherited API (identical exported names on PS5 3.20); shapes cross-checked against shadPS4
@@ -380,34 +397,59 @@ HLE(s_npuds_create) { svc_log("sceNpUniversalDataSystemCreate*", a0,a1,a2,a3,a4,
                       if (svc_ptrish(a0)) *(int32_t*)PW(a0) = 1; return 0; }
 HLE(s_npuds_ok)     { return 0; }
 
-// --- libSceNetCtl state-callback delivery — GATED EXPERIMENT (PROSPER_NETCTL_CB=1) --------------
-// Diagnostic for the DOLL loading-screen stall (docs/DOLL_LOADING_PROGRESSION.md): DOLL registers
-// a NetCtl state callback once at boot (sceNetCtlRegisterCallback) and then pumps
-// sceNetCtlCheckCallback EXACTLY once per frame forever (14,191 calls in a 240 s run — the
-// per-frame call-count signature). On real hardware CheckCallback invokes the registered callback
-// on the calling thread with the current state — an offline console still delivers an immediate
-// DISCONNECTED — and the boot flow proceeds down its offline path. Our unimplemented stubs never
-// deliver ANY state, so the game can never finish its network/update check step.
-//
-// This experiment implements the minimal real contract: Register records {func,arg} and writes the
-// callback id; CheckCallback invokes the callback ONCE with SCE_NET_CTL_EVENT_TYPE_DISCONNECTED
-// (PS4-inherited constant = 1; identical export names on PS5 3.20 — CONFIDENCE MED on the PS5
-// value). The callback is guest code: under PROSPER_GUEST_FS the HLE runs on the HOST %fs (the
+// ===== Issue #306: honest OFFLINE console for the online/update/entitlement boot chain. =========
+// DOLL's UE4 front-end runs a patch/entitlement check before the title screen; every subsystem in
+// that chain answered success-with-garbage, so the check could neither succeed nor FAIL — the flow
+// waited forever (docs/DOLL_LOADING_PROGRESSION.md). The blocks below give the chain the answers a
+// real, network-disconnected, signed-out console gives.
+
+// --- Guest-callback delivery discipline (shared by NetCtl + Np state callbacks). ----------------
+// A registered callback is guest code: under PROSPER_GUEST_FS the HLE runs on the HOST %fs (the
 // import swap-stub switched), so the guest callback must run with the GUEST %fs restored or its
 // TLS accesses (UE MallocBinned caches!) read host TLS garbage. The swap-stub saves the guest fs
 // base in its frame (push r11), so an asm entry shim (the f_apr_read_submit_entry pattern) hands
 // the handler its entry %rsp: [rsp]=ret-to-stub, [+8/+0x10]=re-pushed args7/8, [+0x18]=guest fs,
 // [+0x20]=guest RA. A [rsp] outside the stub region [0x6_0000_0000,0x7_0000_0000) means the
 // host-context tail-jmp path (no swap happened) — call the callback on the current fs.
-// Registration is gated on the env var so the default boot is bit-identical. CONFIDENCE: HIGH on
-// the mechanism, MED on the event constant.
+// Mechanism proven live by the PROSPER_NETCTL_CB experiment (run 7/9: delivered + consumed
+// cleanly, no crash). CONFIDENCE: HIGH.
+#ifndef _WIN32
+namespace {
+inline uint64_t cb_rd_fsbase() { uint64_t v; __asm__ volatile("rdfsbase %0" : "=r"(v)); return v; }
+inline void     cb_wr_fsbase(uint64_t v) { __asm__ volatile("wrfsbase %0" : : "r"(v)); }
+// The guest %fs base saved by the import swap-stub, or 0 if the call came in on a host context.
+inline uint64_t cb_guest_fs(uint64_t entry_rsp) {
+    uint64_t shim_ret = entry_rsp ? *(uint64_t*)entry_rsp : 0;
+    if (shim_ret >= 0x600000000ull && shim_ret < 0x700000000ull)
+        return *(uint64_t*)(entry_rsp + 0x18);                // the swap-stub's saved r11
+    return 0;
+}
+// RAII: run the enclosed guest callback on the guest %fs (no-op when guest_fs==0).
+struct CbGuestFsScope {
+    uint64_t saved = 0, active = 0;
+    explicit CbGuestFsScope(uint64_t guest_fs) {
+        if (guest_fs) { saved = cb_rd_fsbase(); cb_wr_fsbase(guest_fs); active = guest_fs; }
+    }
+    ~CbGuestFsScope() { if (active) cb_wr_fsbase(saved); }
+};
+}
+#endif
+
+// --- libSceNetCtl: a network-DISCONNECTED console (default ON since #306). ----------------------
+// DOLL registers a NetCtl state callback once at boot (sceNetCtlRegisterCallback) and then pumps
+// sceNetCtlCheckCallback EXACTLY once per frame forever (14,191 calls in a 240 s run). On real
+// hardware CheckCallback invokes the registered callback on the calling thread with the current
+// state — an offline console still delivers an immediate DISCONNECTED. Register records {func,arg}
+// and writes the callback id (Kyty Network.cpp NetCtlRegisterCallback); CheckCallback invokes the
+// callback ONCE with SCE_NET_CTL_EVENT_TYPE_DISCONNECTED (PS4-inherited constant = 1; identical
+// export names+NIDs on PS5 3.20 — CONFIDENCE MED on the PS5 value). Was the gated experiment
+// PROSPER_NETCTL_CB=1; proven correct+consumed live (DOLL run 7/9), now default ON.
+// PROSPER_NETCTL_CB=0 restores the old unimplemented behavior.
 #ifndef _WIN32
 namespace {
 std::atomic<uint64_t> g_netctl_cb_fn{0};
 std::atomic<uint64_t> g_netctl_cb_arg{0};
 std::atomic<int>      g_netctl_cb_delivered{0};
-inline uint64_t netctl_rd_fsbase() { uint64_t v; __asm__ volatile("rdfsbase %0" : "=r"(v)); return v; }
-inline void     netctl_wr_fsbase(uint64_t v) { __asm__ volatile("wrfsbase %0" : : "r"(v)); }
 }
 HLE(s_netctl_register_cb) {   // (func, arg, int* cid)
     svc_log("sceNetCtlRegisterCallback", a0,a1,a2,a3,a4,a5);
@@ -441,32 +483,187 @@ extern "C" uint64_t s_netctl_check_cb_c(uint64_t, uint64_t, uint64_t, uint64_t, 
                                         uint64_t entry_rsp) {
     uint64_t fn = g_netctl_cb_fn.load();
     if (!fn || g_netctl_cb_delivered.exchange(1)) return 0;   // deliver the initial state exactly once
-    uint64_t shim_ret = entry_rsp ? *(uint64_t*)entry_rsp : 0;
-    uint64_t guest_fs = 0;
-    if (shim_ret >= 0x600000000ull && shim_ret < 0x700000000ull)
-        guest_fs = *(uint64_t*)(entry_rsp + 0x18);            // the swap-stub's saved r11
-    uint64_t host_fs = 0;
-    if (guest_fs) { host_fs = netctl_rd_fsbase(); netctl_wr_fsbase(guest_fs); }
-    ((void (*)(int, void*))(uintptr_t)fn)(1 /*SCE_NET_CTL_EVENT_TYPE_DISCONNECTED*/,
-                                          (void*)(uintptr_t)g_netctl_cb_arg.load());
-    if (guest_fs) netctl_wr_fsbase(host_fs);
+    uint64_t gfs = cb_guest_fs(entry_rsp);
+    {
+        CbGuestFsScope fs(gfs);
+        ((void (*)(int, void*))(uintptr_t)fn)(1 /*SCE_NET_CTL_EVENT_TYPE_DISCONNECTED*/,
+                                              (void*)(uintptr_t)g_netctl_cb_arg.load());
+    }
+    // NOTE: log only AFTER the scope restored the host %fs — host libc (fprintf) reads %fs-based
+    // TLS and crashes on the guest %fs (learned the hard way: NULL+0x308 fault in libc).
     fprintf(stderr, "[svc] NetCtl state callback DELIVERED (eventType=DISCONNECTED, guest_fs=%d)\n",
-            guest_fs ? 1 : 0);
+            gfs ? 1 : 0);
+    return 0;
+}
+#endif
+// sceNetCtlGetInfo(int code, SceNetCtlInfo* info): a console with no network connection answers
+// NOT_CONNECTED for the connection-dependent info codes and writes nothing (shadPS4 netctl.cpp:163
+// returns ORBIS_NET_CTL_ERROR_NOT_CONNECTED = 0x80412108 for ALL codes when disconnected; Kyty
+// only implements the connected path). PS4-inherited surface, identical export on PS5 3.20
+// (obuxdTiwkF8). Works on all platforms (no callback machinery). CONFIDENCE: HIGH on semantics,
+// MED on the PS5 errno value (same 0x8041 NetCtl facility).
+HLE(s_netctl_getinfo) {
+    svc_log("sceNetCtlGetInfo", a0,a1,a2,a3,a4,a5);
+    return 0x80412108ull;   // SCE_NET_CTL_ERROR_NOT_CONNECTED
+}
+
+// --- libSceNpManager state callback: deliver SIGNED_OUT once (#306). ----------------------------
+// DOLL registers its Np sign-in state callback via sceNpRegisterStateCallbackA and pumps
+// sceNpCheckCallback. shadPS4 (offline mode) queues exactly one SIGNED_OUT event for the initial
+// user and delivers it inside sceNpCheckCallback on the pumping thread; we mirror that. Callback-A
+// prototype (shadPS4 np_manager.h): void cb(s32 userId, s32 state, void* userdata); state
+// SIGNED_OUT = 1 (Unknown=0, SignedOut=1, SignedIn=2 — Kyty + shadPS4 agree). Register returns the
+// positive callback id (shadPS4 RegisterStateCallbackA returns slot+1). CONFIDENCE: HIGH on the
+// contract (two agreeing PS4 references, PS4-inherited surface; PS5 3.20 exports the same names).
+#ifndef _WIN32
+namespace {
+struct NpStateCbSlot { std::atomic<uint64_t> fn{0}, arg{0}; std::atomic<int> delivered{0}; };
+NpStateCbSlot     g_np_state_cbs[4];
+std::atomic<int>  g_np_state_cb_n{0};
+}
+HLE(s_np_register_state_cbA) {   // (SceNpStateCallbackA func, void* userdata) -> callback id
+    svc_log("sceNpRegisterStateCallbackA", a0,a1,a2,a3,a4,a5);
+    if (!a0) return 0x80550003ull;   // SCE_NP_ERROR_INVALID_ARGUMENT
+    int i = g_np_state_cb_n.fetch_add(1);
+    if (i >= 4) { g_np_state_cb_n.store(4); return 0x8055001Dull; }  // SCE_NP_ERROR_CALLBACK_MAX
+    g_np_state_cbs[i].arg.store(a1);
+    g_np_state_cbs[i].fn.store(a0);
+    return (uint64_t)(i + 1);
+}
+extern "C" uint64_t s_np_check_cb_c(uint64_t a0, uint64_t a1, uint64_t a2,
+                                    uint64_t a3, uint64_t a4, uint64_t a5,
+                                    uint64_t entry_rsp);
+asm(".text\n"
+    ".globl s_np_check_cb_entry\n"
+    ".type s_np_check_cb_entry,@function\n"
+    "s_np_check_cb_entry:\n"
+    "  movq %rsp, %rax\n"
+    "  pushq %rax\n"
+    "  call s_np_check_cb_c\n"
+    "  addq $8, %rsp\n"
+    "  ret\n");
+extern "C" void s_np_check_cb_entry();
+extern "C" uint64_t s_np_check_cb_c(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                                    uint64_t entry_rsp) {
+    int n = g_np_state_cb_n.load(); if (n > 4) n = 4;
+    uint64_t gfs = cb_guest_fs(entry_rsp);
+    for (int i = 0; i < n; i++) {
+        uint64_t fn = g_np_state_cbs[i].fn.load();
+        if (!fn || g_np_state_cbs[i].delivered.exchange(1)) continue;
+        {
+            CbGuestFsScope fs(gfs);
+            ((void (*)(int32_t, int32_t, void*))(uintptr_t)fn)(
+                1 /*initial userId (sceUserServiceGetInitialUser)*/, 1 /*SCE_NP_STATE_SIGNED_OUT*/,
+                (void*)(uintptr_t)g_np_state_cbs[i].arg.load());
+        }
+        // Log only on the restored host %fs (fprintf on the guest %fs faults in libc TLS).
+        fprintf(stderr, "[svc] Np state callback DELIVERED (userId=1, state=SIGNED_OUT, guest_fs=%d)\n",
+                gfs ? 1 : 0);
+    }
     return 0;
 }
 #endif
 
+// --- libSceErrorDialog: the real Initialize/Open/Close lifecycle (auto-dismiss, headless). ------
+// Status enum shared with CommonDialog: NONE=0, INITIALIZED=1, RUNNING=2, FINISHED=3 (shadPS4
+// commondialog.h + error_dialog.cpp; PS4-inherited, identical export NIDs on PS5 3.20).
+// GetStatus/UpdateStatus RETURN the status value directly (not an out-param). DOLL pumps
+// sceErrorDialogUpdateStatus once per frame from boot (housekeeping); if the honest offline chain
+// makes it Open the "could not download patch data" dialog, auto-dismiss to FINISHED so the flow's
+// "wait until dismissed" loop exits — the MsgDialog precedent (#144). Open's param is
+// { s32 size; s32 errorCode; s32 userId; s32 reserved } (shadPS4 error_dialog.cpp Param); the
+// errorCode is printed unconditionally — a one-shot, high-value diagnostic of WHAT the game
+// thinks failed. CONFIDENCE: HIGH (shadPS4 implements this exact lifecycle).
+namespace { std::atomic<int> g_errdialog_status{0 /*NONE*/}; }
+HLE(s_errdialog_init)   { g_errdialog_status.store(1 /*INITIALIZED*/); return 0; }
+HLE(s_errdialog_open)   {
+    uint32_t code = 0;
+    if (svc_ptrish(a0)) code = *(const uint32_t*)((const char*)PW(a0) + 4);
+    fprintf(stderr, "[svc] sceErrorDialogOpen(errorCode=%#x) -> auto-dismiss FINISHED\n", code);
+    g_errdialog_status.store(3 /*FINISHED (auto-dismiss)*/);
+    return 0;
+}
+HLE(s_errdialog_close)  { g_errdialog_status.store(3 /*FINISHED*/); return 0; }
+HLE(s_errdialog_term)   { g_errdialog_status.store(0 /*NONE*/);     return 0; }
+HLE(s_errdialog_status) { return (uint64_t)(unsigned)g_errdialog_status.load(); }
+
+// --- libSceNpEntitlementAccess / libSceGameUpdate: observability first. -------------------------
+// PS5-only surfaces with NO reference implementation (absent from Kyty and shadPS4); the PS5 3.20
+// stub tables give names+NIDs only. DOLL calls sceNpEntitlementAccessInitialize (retried 3x) and
+// sceGameUpdateInitialize once, then never the follow-ups (CreateRequest/Check) — so before
+// inventing contracts, capture the REAL args live (PROSPER_SVCLOG=1) and keep the return the same
+// success the unimplemented path produced (a real console's local library init succeeds offline
+// too). The follow-up calls stay UNIMPLEMENTED deliberately: if the honest Np/NetCtl answers
+// unblock the flow into them, they surface in the PROSPER_PROGRESS_UNIMPL dump and get pinned from
+// their live args before being given behavior. CONFIDENCE: MED (init-succeeds is the real-console
+// offline behavior; arg shapes intentionally not guessed).
+HLE(s_npent_init)      { svc_log("sceNpEntitlementAccessInitialize", a0,a1,a2,a3,a4,a5); return 0; }
+HLE(s_gameupdate_init) { svc_log("sceGameUpdateInitialize",          a0,a1,a2,a3,a4,a5); return 0; }
+HLE(s_gameupdate_term) { svc_log("sceGameUpdateTerminate",           a0,a1,a2,a3,a4,a5); return 0; }
+// The entitlement follow-ups DOLL's main menu fires once the flow is unblocked (live-captured
+// after the #306 gate fell). ABI pinned from the live capture (r8):
+//   GetAddcontEntitlementInfoList(SceNpServiceLabel serviceLabel, Info* list, u32 listNum,
+//                                 u32* hitNum)
+// — the game first count-queries with list=NULL/num=0 and an out pointer in a3, then calls again
+// with a 4-entry buffer (its four addcont slots). Matches the documented PS4 signature 1:1.
+// This dump has NO additional content installed and no signed-in user, so the truthful console
+// answer is SUCCESS with hitNum=0 (DLC entitlement lookups work offline from local state; there
+// simply are none). CONFIDENCE: HIGH on the shape (live-pinned + PS4 doc agree), MED on hitNum=0
+// being the exact retail no-DLC answer.
+HLE(s_npent_addcont_list) {
+    svc_log("sceNpEntitlementAccessGetAddcontEntitlementInfoList", a0,a1,a2,a3,a4,a5);
+    if (svc_ptrish(a3)) *(uint32_t*)PW(a3) = 0;   // hitNum = 0: no addcont entitlements
+    return 0;
+}
+// GetEntitlementKey(serviceLabel, const Label* label, Key* out) — live capture: retried 4x with
+// identical args (the garbage-consuming retry signature). With no entitlement to derive a key
+// from, honest FAILURE beats success+garbage-key; the exact NpEntitlementAccess errno space is
+// unreferenced, so the generic Np signed-out error is used (only the sign is consumed by a clean
+// caller). With hitNum=0 above the game should no longer ask at all. CONFIDENCE: LOW on the
+// error constant, HIGH that failure is the truthful state.
+HLE(s_npent_getkey) {
+    svc_log("sceNpEntitlementAccessGetEntitlementKey", a0,a1,a2,a3,a4,a5);
+    return NP_ERR_SIGNED_OUT;
+}
+
+// sceSaveDataTransferringMount (PS5-only, live-captured x4 in DOLL's save-slot menu): mount a
+// PS4-era save for transfer/import. We have no PS4 save to transfer — the truthful fresh-console
+// answer is NOT_FOUND with the result untouched. The previous success+garbage made the game read
+// an EMPTY mount-point string out of the unwritten result and open '/GameSaveData245.dat' (no
+// mount prefix) at filesystem root — observed live. CONFIDENCE: MED on semantics (same 0x809F
+// facility + NOT_FOUND as Mount3 of a nonexistent save), LOW on the exact arg layout (nothing is
+// written, so no layout is assumed; PROSPER_SVCLOG captures it).
+HLE(s_savedata_transfermount) {
+    svc_log("sceSaveDataTransferringMount", a0,a1,a2,a3,a4,a5);
+    return SAVE_DATA_ERR_NOT_FOUND;
+}
+
+// sceSystemServiceGetNoticeScreenSkipFlag(bool* flag) — polled from DOLL's front-end menu.
+// PS5-only (no reference). Live capture pinned the out-pointer to an ODD stack address
+// (0x...ff307), so the flag is a single byte (bool), NOT an int32 — a 4-byte write would clobber
+// 3 adjacent stack bytes. 0 = "no skip" is the inert default a retail console with no
+// notice-screen state reports. CONFIDENCE: MED (byte-sized out pinned live; value semantics LOW).
+HLE(s_syss_noticeskip) {
+    svc_log("sceSystemServiceGetNoticeScreenSkipFlag", a0,a1,a2,a3,a4,a5);
+    if (svc_ptrish(a0)) *(uint8_t*)PW(a0) = 0;
+    return 0;
+}
+
 void register_service_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
 #ifndef _WIN32
-    // NetCtl state delivery experiment (see block comment above). Default OFF: without the env the
-    // NIDs stay unimplemented (their current behavior).
-    if (getenv("PROSPER_NETCTL_CB")) {
-        R("sceNetCtlRegisterCallback", s_netctl_register_cb);      // UJ+Z7Q+4ck0
-        R("sceNetCtlCheckCallback",    s_netctl_check_cb_entry);   // iQw3iQPhvUQ
-        R("sceNetCtlGetState",         s_netctl_getstate);         // uBPlr0lbuiI
+    // NetCtl offline-console state delivery — default ON since #306 (see block comment above).
+    // PROSPER_NETCTL_CB=0 restores the previous unimplemented behavior.
+    {
+        const char* e = getenv("PROSPER_NETCTL_CB");
+        if (!e || strtol(e, nullptr, 0) != 0) {
+            R("sceNetCtlRegisterCallback", s_netctl_register_cb);      // UJ+Z7Q+4ck0
+            R("sceNetCtlCheckCallback",    s_netctl_check_cb_entry);   // iQw3iQPhvUQ
+            R("sceNetCtlGetState",         s_netctl_getstate);         // uBPlr0lbuiI
+        }
     }
 #endif
+    Hle::register_fn("obuxdTiwkF8", (HleFn)s_netctl_getinfo, "sceNetCtlGetInfo");  // NOT_CONNECTED
     // NpTrophy2: the config/info queries whose success-with-garbage-out crashed DOLL (see above).
     Hle::register_fn("4IzqhhUQ3nk", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetGameInfo");
     Hle::register_fn("y3zHpdZO6ME", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetTrophyInfoArray");
@@ -493,13 +690,22 @@ void register_service_hle() {
     Hle::register_fn("-sD02mFDBh4", (HleFn)s_gamepresets, "sceUserServiceGetGamePresets");
     R("sceUserServiceInitialize", s_ok);
     R("sceUserServiceTerminate", s_ok);
-    // NP
+    // NP — an honest signed-out console (#306). NIDs verified against the PS5 3.20
+    // libSceNpManager stub table AND shadPS4's PS4 registrations (identical).
     R("sceNpGetState", s_np_state);
     R("sceNpGetNpReachabilityState", s_np_reach);
     R("sceNpGetAccountIdA", s_np_accountid);
     R("sceNpGetAccountCountryA", s_np_country);
-    R("sceNpCheckCallback", s_ok);
+    Hle::register_fn("XDncXQIJUSk", (HleFn)s_np_getonlineid, "sceNpGetOnlineId");
     R("sceNpRegisterStateCallback", s_ok);
+#ifndef _WIN32
+    // sceNpCheckCallback pumps the registered A-callbacks (SIGNED_OUT delivered once, guest %fs).
+    Hle::register_fn("3Zl8BePTh9Y", (HleFn)s_np_check_cb_entry,      "sceNpCheckCallback");
+    Hle::register_fn("qQJfO8HAiaY", (HleFn)s_np_register_state_cbA,  "sceNpRegisterStateCallbackA");
+    Hle::register_fn("M3wFXbYQtAA", (HleFn)s_ok,                     "sceNpUnregisterStateCallbackA");
+#else
+    R("sceNpCheckCallback", s_ok);
+#endif
     // pad -> hle_pad.cpp (register_pad_hle). mouse:
     R("sceMouseInit", s_ok);
     R("sceMouseOpen", s_open);
@@ -567,6 +773,27 @@ void register_service_hle() {
     Hle::register_fn("0IL1keINExQ", (HleFn)s_share_ok, "sceShareTerminate");
     Hle::register_fn("ORspsWDXPps", (HleFn)s_share_ok, "sceShareSetContentParamForApplicationTitle");
     Hle::register_fn("T64o-315wbg", (HleFn)s_share_ok, "sceShareSetScreenshotOverlayImage");
+    // libSceErrorDialog — real lifecycle, auto-dismiss (#306). NIDs from the PS5 3.20 stub table
+    // (identical to shadPS4's PS4 registrations).
+    Hle::register_fn("I88KChlynSs", (HleFn)s_errdialog_init,   "sceErrorDialogInitialize");
+    Hle::register_fn("M2ZF-ClLhgY", (HleFn)s_errdialog_open,   "sceErrorDialogOpen");
+    Hle::register_fn("jrpnVQfJYgQ", (HleFn)s_errdialog_open,   "sceErrorDialogOpenDetail");
+    Hle::register_fn("wktCiyWoDTI", (HleFn)s_errdialog_open,   "sceErrorDialogOpenWithReport");
+    Hle::register_fn("ekXHb1kDBl0", (HleFn)s_errdialog_close,  "sceErrorDialogClose");
+    Hle::register_fn("9XAxK2PMwk8", (HleFn)s_errdialog_term,   "sceErrorDialogTerminate");
+    Hle::register_fn("t2FvHRXzgqk", (HleFn)s_errdialog_status, "sceErrorDialogGetStatus");
+    Hle::register_fn("WWiGuh9XfgQ", (HleFn)s_errdialog_status, "sceErrorDialogUpdateStatus");
+    // libSceNpEntitlementAccess / libSceGameUpdate — observability (svc_log) with the real-console
+    // "local init succeeds offline" return; follow-ups deliberately left unimplemented (see above).
+    Hle::register_fn("jO8DM8oyego", (HleFn)s_npent_init,      "sceNpEntitlementAccessInitialize");
+    Hle::register_fn("YJtKLttI9fM", (HleFn)s_gameupdate_init, "sceGameUpdateInitialize");
+    Hle::register_fn("NSH-C-OmoNI", (HleFn)s_gameupdate_term, "sceGameUpdateTerminate");
+    // Post-gate follow-ups (fire from DOLL's now-reachable main menu; NIDs from PS5 3.20 tables).
+    Hle::register_fn("TFyU+KFBv54", (HleFn)s_npent_addcont_list,
+                     "sceNpEntitlementAccessGetAddcontEntitlementInfoList");
+    Hle::register_fn("5LiMEPuW0DQ", (HleFn)s_npent_getkey, "sceNpEntitlementAccessGetEntitlementKey");
+    Hle::register_fn("WAzWTZm1H+I", (HleFn)s_savedata_transfermount, "sceSaveDataTransferringMount");
+    Hle::register_fn("3RQ5aQfnstU", (HleFn)s_syss_noticeskip, "sceSystemServiceGetNoticeScreenSkipFlag");
     // libSceNpUniversalDataSystem — inert ids (guarded LOW-confidence out-writes).
     Hle::register_fn("sjaobBgqeB4", (HleFn)s_npuds_ok,     "sceNpUniversalDataSystemInitialize");
     Hle::register_fn("5zBnau1uIEo", (HleFn)s_npuds_create, "sceNpUniversalDataSystemCreateContext");

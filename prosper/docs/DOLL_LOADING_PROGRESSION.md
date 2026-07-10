@@ -1,6 +1,25 @@
 # DOLL (PPSA17942, "Dragon Quest VII Reimagined") — why it never leaves the loading screen
 
-**Verdict: STALLED — a correctness wall, not llvmpipe slowness.** The game reaches a fully-alive,
+> **RESOLVED 2026-07-10 (issue #306, branch `fix/issue-306-frontend-progression`).** The gate was
+> exactly the §8 Lead-A hypothesis: the online init chain's success-with-garbage-out. Making the
+> chain answer as an honest OFFLINE, SIGNED-OUT console (`hle_service.cpp`) drops the wall:
+> `sceNpGetOnlineId` → `SCE_NP_ERROR_SIGNED_OUT` (0x80550006), Np state callback delivers
+> SIGNED_OUT once via `sceNpCheckCallback`, NetCtl DISCONNECTED delivery default-on,
+> `sceNetCtlGetInfo` → NOT_CONNECTED, ErrorDialog real lifecycle. **The instant the Np SIGNED_OUT
+> state lands, the front-end resumes: title-screen assets stream in (T_Title_Clouds_*),
+> pakchunk1/2 open, a ~1,000-chunk PlayGo locus sweep runs, the system+language save is created
+> and committed (`SystemSaveData999.dat`, `LanguageSaveData998.dat`), Videodec2/Ajm init fires,
+> and the game reaches an INTERACTIVE title screen** — a `PROSPER_PAD_SCRIPT` drive navigates
+> title → save-slot menu (reads `GameSaveData*.dat` through `/savedata0`) → a content-load burst
+> (~930 pak reads) → a much richer screen (draws/frame 100 → 356). The per-frame
+> `sceErrorDialogUpdateStatus`/`sceNetCtlCheckCallback` pumps and the `sceGameUpdateCreateRequest`
+> follow-ups never re-appear — the flow took its offline path (no patch check attempted, exactly
+> like a disconnected retail console). **Next gate:** a MallocBinned3 heap-corruption fatal
+> (`Canary was 0x3, should be 0x1`) during the menu-driven content load, present in every
+> input-driven run including pre-#306-fix builds — tracked separately. The sections below are the
+> original diagnosis, kept for the method.
+
+**Verdict (2026-07-10, original diagnosis): STALLED — a correctness wall, not llvmpipe slowness.** The game reaches a fully-alive,
 60 fps engine steady state within ~6 seconds of boot (all asset IO complete), renders its
 `DOLLLoadingScreen` UMG widget forever, and never advances its boot flow. Wall-clock speed is not
 a factor: with the renderer OFF the guest experiences a full 60 fps for 7+ minutes of game time
