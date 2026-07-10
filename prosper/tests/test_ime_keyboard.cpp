@@ -3,12 +3,21 @@
 // info) rather than leaving the caller's structs uninitialized. Struct layouts mirror shadPS4
 // src/core/libraries/ime/ime_common.h (offsets asserted below).
 #include "../src/hle/dispatch.hpp"
+#include "../src/hle/platform_ui.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
 
 using namespace prosper;
+
+// A stand-in frontend that reports one connected keyboard (id 42) via the PlatformUi hook (#347).
+struct KbdUi : PlatformUi {
+    int keyboardResourceIds(int32_t /*userId*/, uint32_t* out, int max) override {
+        if (max >= 1 && out) { out[0] = 42; return 1; }
+        return 0;
+    }
+};
 
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
@@ -51,6 +60,23 @@ int main() {
     // Null out-pointer -> INVALID_ADDRESS, never a wild write.
     CHECK(resid(1, 0, 0, 0, 0, 0) == 0x80BC0031ull, "GetResourceId(NULL) -> INVALID_ADDRESS");
     CHECK(info(1, 0, 0, 0, 0, 0) == 0x80BC0031ull, "GetInfo(NULL) -> INVALID_ADDRESS");
+
+    // --- PlatformUi hook (#347): a registered frontend that reports a keyboard flips presence on. ---
+    KbdUi kbd; set_platform_ui(&kbd);
+    KbdResIds ids2; memset(&ids2, 0xAB, sizeof ids2);
+    resid(1, (uint64_t)(uintptr_t)&ids2, 0, 0, 0, 0);
+    CHECK(ids2.user_id == 1 && ids2.resource_id[0] == 42 && ids2.resource_id[1] == 0,
+          "backend: GetResourceId reports the frontend's keyboard (id 42) then zeros");
+    uint8_t buf2[40]; memset(buf2, 0xAB, sizeof buf2);
+    info(42 /*the reported id*/, (uint64_t)(uintptr_t)buf2, 0, 0, 0, 0);
+    KbdInfo* ki2 = (KbdInfo*)buf2;
+    CHECK(ki2->device == 1 && ki2->status == 1, "backend: GetInfo reports a CONNECTED keyboard (device/status = 1)");
+    CHECK(buf2[36] == 0xAB, "backend: GetInfo still bounded to 36 bytes");
+    set_platform_ui(nullptr);
+    // Back to headless: presence off again.
+    KbdResIds ids3; memset(&ids3, 0xAB, sizeof ids3);
+    resid(1, (uint64_t)(uintptr_t)&ids3, 0, 0, 0, 0);
+    CHECK(ids3.resource_id[0] == 0, "after unregister: GetResourceId reports no keyboards again");
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");

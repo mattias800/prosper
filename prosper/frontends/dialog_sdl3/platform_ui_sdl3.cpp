@@ -62,6 +62,14 @@ struct SdlPlatformUi : PlatformUi {
 
     // imeDialog* left as the base default (returns false) -> the core's headless auto-complete, since a
     // text-entry field is not a message box (a custom SDL text UI is a separate follow-up).
+
+    // Ime keyboard presence: a windowed session runs on a host with a keyboard, so report one (#347).
+    // This makes sceImeKeyboardGetResourceId/GetInfo report a connected keyboard, enabling a title's
+    // keyboard-input option. (Delivering the raw key events to the guest handler is a further step.)
+    int keyboardResourceIds(int32_t /*userId*/, uint32_t* outIds, int max) override {
+        if (max >= 1 && outIds) { outIds[0] = 1; return 1; }
+        return 0;
+    }
 };
 
 SdlPlatformUi g_sdl_ui;

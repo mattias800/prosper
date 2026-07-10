@@ -51,6 +51,15 @@ struct PlatformUi {
     virtual bool errorDialogOpen(uint64_t param) { (void)param; return false; }
     virtual int  errorDialogStatus() { return 3 /*FINISHED*/; }
     virtual void errorDialogClose() {}
+
+    // --- libSceIme keyboard device presence ---
+    // Fill up to `max` connected keyboard resource ids for `userId` into `outIds`, and return the
+    // count. The headless default is 0 (no keyboard); a windowed frontend with a host keyboard reports
+    // its own (a resource id must be non-zero). sceImeKeyboardGetResourceId/GetInfo consult this so a
+    // title enables keyboard input only when a real keyboard is present.
+    virtual int keyboardResourceIds(int32_t userId, uint32_t* outIds, int max) {
+        (void)userId; (void)outIds; (void)max; return 0;
+    }
 };
 
 // The registered backend, or nullptr when headless. The frontend calls set_platform_ui once at startup

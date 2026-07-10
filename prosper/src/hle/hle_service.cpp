@@ -157,21 +157,34 @@ HLE(s_mouse_read)     { if (a1) memset(PW(a1), 0, 0x18); return 0; }
 HLE(s_ime_kbd_open) { svc_log("sceImeKeyboardOpen", a0,a1,a2,a3,a4,a5); return 0; }  // register handler; no events to deliver
 HLE(s_ime_update)   { svc_log("sceImeUpdate", a0,a1,a2,a3,a4,a5); return 0; }        // pump the queue: no events
 // sceImeKeyboardGetResourceId(userId, OrbisImeKeyboardResourceIdArray* out): report the user's keyboard
-// resource ids — none connected, so an all-zero id array (echoing the queried userId).
+// resource ids. Headless -> none (all-zero). A registered PlatformUi (a windowed frontend with a host
+// keyboard) reports its own ids, so a title enables keyboard input (#347).
 HLE(s_ime_kbd_resid) {
     svc_log("sceImeKeyboardGetResourceId", a0,a1,a2,a3,a4,a5);
     if (!a1) return 0x80BC0031ull;   // ORBIS_IME_ERROR_INVALID_ADDRESS
     uint8_t* p = (uint8_t*)PW(a1);
     *(int32_t*)(p + 0) = (int32_t)a0;                         // user_id echoes the caller
-    for (int i = 0; i < 5; i++) *(uint32_t*)(p + 4 + i * 4) = 0;   // no keyboards connected
+    uint32_t ids[5] = {0, 0, 0, 0, 0};
+    int n = 0;
+    if (auto* ui = platform_ui()) n = ui->keyboardResourceIds((int32_t)a0, ids, 5);
+    if (n < 0) n = 0; if (n > 5) n = 5;
+    for (int i = 0; i < 5; i++) *(uint32_t*)(p + 4 + i * 4) = (i < n) ? ids[i] : 0;
     return 0;
 }
-// sceImeKeyboardGetInfo(resourceId, OrbisImeKeyboardInfo* info): a disconnected (no-device) info.
+// sceImeKeyboardGetInfo(resourceId, OrbisImeKeyboardInfo* info): connected device info when a frontend
+// reports a keyboard, else a disconnected (no-device) info.
 HLE(s_ime_kbd_info) {
     svc_log("sceImeKeyboardGetInfo", a0,a1,a2,a3,a4,a5);
     if (!a1) return 0x80BC0031ull;   // ORBIS_IME_ERROR_INVALID_ADDRESS
-    memset(PW(a1), 0, 36);           // device=0 type=0 repeat=0 status=0(disconnected) reserved=0
-    *(int32_t*)PW(a1) = 1;           // user_id = default user (matches sceUserServiceGetInitialUser)
+    memset(PW(a1), 0, 36);           // default: device=0 type=0 repeat=0 status=0(disconnected)
+    uint8_t* p = (uint8_t*)PW(a1);
+    *(int32_t*)(p + 0) = 1;          // user_id = default user (matches sceUserServiceGetInitialUser)
+    bool connected = false;
+    if (auto* ui = platform_ui()) { uint32_t ids[5]; connected = ui->keyboardResourceIds(1, ids, 5) > 0; }
+    if (connected) {
+        *(uint32_t*)(p + 4)  = 1;    // device  = 1 (a keyboard is present)
+        *(uint32_t*)(p + 20) = 1;    // status  = 1 (connected)
+    }
     return 0;
 }
 
