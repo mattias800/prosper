@@ -111,8 +111,10 @@ struct ScePadControllerInformation {
     uint8_t  connected;                     // 0x0c (bool)
     uint8_t  info_pad[3];                    // 0x0d (align device_class to 4)
     int32_t  device_class;                  // 0x10
-    uint8_t  reserve[12];                    // 0x14
-};                                          // 0x20 = 32 bytes
+    uint8_t  reserve[8];                     // 0x14
+};                                          // 0x1c = 28 bytes (Sony's real size — reserve[8], NOT [12];
+                                            // a 32-byte struct overran the game's 28-byte stack buffer
+                                            // into its stack canary -> __stack_chk_fail crash, #283)
 
 // ---- Pure mapping (no hardware, no globals) ---------------------------------------------------
 
