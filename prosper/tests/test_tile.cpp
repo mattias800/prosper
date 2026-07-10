@@ -229,9 +229,10 @@ int main() {
         CHECK(std::memcmp(&tiled[65536 - 8], at(127, 63), bpe) == 0, "64KB_S 8B golden: element (127,63) is the block's last 8 bytes");
     }
 
-    // SW_64KB_R_X pipe-XOR golden (default 8 pipes, 4 bpe): offset bits 8..10 are x3^y3, x4^y4, x5^y5
-    // and bit 11 is x3 — so element (8,0) sets bits 8+11 (byte 2304), (0,8) sets only bit 8 (byte 256),
-    // and (8,8) cancels the XOR leaving only bit 11 (byte 2048). This pins the pipe-rotation wiring.
+    // SW_64KB_R_X pipe-XOR golden (default 16 pipes, 4 bpe): offset bits 8..11 are the pipe bits
+    // x3^y3, x4^y4, x6^y5, x5^y6, then bits 12..15 are y3 x4 y6 x6 — so element (8,0) sets only
+    // bit 8 (byte 256), (0,8) sets bits 8+12 (byte 4352), (8,8) cancels the bit-8 XOR leaving bit
+    // 12 (byte 4096), and (16,0) sets bits 9+13 (byte 8704). This pins the pipe-rotation wiring.
     if (!getenv("PROSPER_RX_PIPES")) {
         const uint32_t M = (uint32_t)TileMode::Sw64KbRX;
         const uint32_t ew = 128, eh = 128, bpe = 4;
@@ -240,9 +241,10 @@ int main() {
         std::vector<uint8_t> tiled(65536, 0);
         tile_surface(tiled.data(), ref.data(), ew, eh, M, 0, bpe);
         auto at = [&](uint32_t x, uint32_t y) { return &ref[((size_t)y * ew + x) * bpe]; };
-        CHECK(std::memcmp(&tiled[2304], at(8, 0), bpe) == 0, "64KB_R_X 4B golden: element (8,0) at byte 2304 (x3 -> bits 8^11)");
-        CHECK(std::memcmp(&tiled[256],  at(0, 8), bpe) == 0, "64KB_R_X 4B golden: element (0,8) at byte 256 (y3 -> bit 8)");
-        CHECK(std::memcmp(&tiled[2048], at(8, 8), bpe) == 0, "64KB_R_X 4B golden: element (8,8) at byte 2048 (pipe XOR cancels)");
+        CHECK(std::memcmp(&tiled[256],  at(8, 0),  bpe) == 0, "64KB_R_X 4B golden: element (8,0) at byte 256 (x3 -> bit 8)");
+        CHECK(std::memcmp(&tiled[4352], at(0, 8),  bpe) == 0, "64KB_R_X 4B golden: element (0,8) at byte 4352 (y3 -> bits 8+12)");
+        CHECK(std::memcmp(&tiled[4096], at(8, 8),  bpe) == 0, "64KB_R_X 4B golden: element (8,8) at byte 4096 (pipe XOR cancels)");
+        CHECK(std::memcmp(&tiled[8704], at(16, 0), bpe) == 0, "64KB_R_X 4B golden: element (16,0) at byte 8704 (x4 -> bits 9+13)");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }

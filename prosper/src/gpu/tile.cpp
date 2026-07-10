@@ -188,13 +188,16 @@ inline void sw64kb_dims(uint32_t elem_log2, uint32_t& bw, uint32_t& bh) {
     bw = w[elem_log2]; bh = h[elem_log2];
 }
 
-// PS5's pipe count for the R_X pattern. Not publicly documented for Oberon; default 8 pipes was
-// selected empirically (live DOLL frame comparison across all 7 variants; PROSPER_RX_PIPES=<n>
-// overrides for diagnosis). CONFIDENCE: MED.
+// PS5's pipe count for the R_X pattern. Not publicly documented for Oberon; default 16 pipes by
+// hardware analogy (Oberon is Navi10-class: 36-40 CU, 256-bit GDDR6, 64 ROPs / 16 RBs, and
+// Navi10's GB_ADDR_CONFIG is 16 pipes). Captured mode-27 surfaces are all speckle/checkerboard
+// content on which every pipe variant scores identically (TV, mip-consistency, autocorrelation) —
+// re-pin via PROSPER_RX_PIPES=<n> A/B when a smooth authored mode-27 surface appears.
+// CONFIDENCE: MED (equation exact per addrlib; only this parameter is analogy-based).
 inline uint32_t sw64kb_rx_pipes_log2() {
     static int cached = -1;
     if (cached < 0) {
-        cached = 3;                                            // 8 pipes
+        cached = 4;                                            // 16 pipes
         if (const char* e = std::getenv("PROSPER_RX_PIPES")) {
             int n = atoi(e);
             int lg = 0; while ((1 << lg) < n && lg < 6) lg++;
