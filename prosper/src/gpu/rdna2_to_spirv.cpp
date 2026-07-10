@@ -1956,7 +1956,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x26: d = b.ibin(Op_IMul, a, c); break;         // s_mul_i32 (low 32 bits; no SCC)
                 case 0x31: d = b.ibin(Op_IAdd, b.ibin(Op_ShiftLeftLogical, a, b.uconst(4)), c); break;  // s_lshl4_add_u32 = (src0<<4)+src1
                 case 0x35: d = b.umul_hi(a, c); break;               // s_mul_hi_u32 (high 32 bits; no SCC)
-                case 0x37: d = b.smul_hi(a, c); break;               // s_mul_hi_i32 (high 32 bits; no SCC)
+                case 0x36: d = b.smul_hi(a, c); break;               // s_mul_hi_i32 (high 32 bits; no SCC).
+                                                                     // gfx10 SOP2 opcode is 0x36 (llvm-mc:
+                                                                     // 0x9b000201>>23&0x7f); 0x37 was WRONG
+                                                                     // (invalid encoding), so the handler was
+                                                                     // dead and s_mul_hi_i32 got rejected. #462
                 case 0x27: {                                         // s_bfe_u32: offset=src1[4:0], width=src1[22:16]
                     uint32_t off = b.ibin(Op_BitwiseAnd, c, b.uconst(0x1f));
                     uint32_t width = b.ibin(Op_BitwiseAnd, b.ibin(Op_ShiftRightLogical, c, b.uconst(16)), b.uconst(0x7f));
