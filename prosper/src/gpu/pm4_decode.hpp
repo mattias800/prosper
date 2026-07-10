@@ -28,6 +28,13 @@ enum : uint32_t {
     // (sceAgcDcbSetIndexBuffer / SetIndexCount / DrawIndexOffset) are the ONLY draw path UE4 uses;
     // they were unimplemented->0 (no packet appended) so every scene draw was silently dropped.
     R_INDEX_BASE = 0x1b, R_INDEX_COUNT = 0x1c, R_DRAW_INDEX_OFFSET = 0x1d,
+    // Command-buffer call + GPU predication (issue #319, DOLL/UE4 backbuffer composite).
+    // sceAgcDcbJump appends R_JUMP = "execute `jump_dwords` dwords at `jump_addr`, then resume"
+    // (a call-with-length: live capture shows each target segment is exactly the passed size with
+    // no jump-back packet, and the parent stream continues after — so the CP must return).
+    // sceAgcDcbSetPredication appends R_SET_PRED = "begin (addr!=0) / end (addr==0) a predication
+    // window over the following packets, condition = the 64-bit value at addr".
+    R_JUMP = 0x1e, R_SET_PRED = 0x1f,
     R_NUM = 0x40,
 };
 
@@ -41,7 +48,7 @@ struct Pm4Command {
     enum class Kind {
         DrawReset, WaitFlipDone, SetShRegDirect, SetRegsIndirect, SetIndexType,
         DrawIndex, DrawIndexAuto, EventWrite, AcquireMem, WriteData, WaitRegMem, Flip, ReleaseMem,
-        DispatchDirect, SetIndexBase, SetIndexCount, DrawIndexOffset, Unknown,
+        DispatchDirect, SetIndexBase, SetIndexCount, DrawIndexOffset, Jump, SetPredication, Unknown,
     } kind = Kind::Unknown;
 
     uint32_t        header = 0;
@@ -119,6 +126,21 @@ struct Pm4Command {
     // display_buffer_index, flip_mode, flip_arg). Packet payload: [0]=videoout handle, [1]=display
     // buffer index, [2]=flip mode, [3..4]=64-bit flipArg. The GPU processing this packet IS the flip
     // moment: it must advance the videoout flip status (count/flipArg/currentBuffer) the game polls.
+    // Jump (sceAgcDcbJump -> R_JUMP, hle_agc.cpp agc_dcb_jump; #319). Payload: [0..1]=target
+    // address lo/hi, [2]=segment dword count, [3]=predicated flag (set by sceAgcSetPacketPredication
+    // patching the built packet). The CommandProcessor folds the target segment inline (call-with-
+    // length), gated by the active predication window when the flag is set.
+    uint64_t jump_addr = 0;              // Jump: target segment guest address
+    uint32_t jump_dwords = 0;            // Jump: segment length in dwords
+    uint32_t jump_pred = 0;              // Jump: 1 = packet-predicated (participates in the window)
+    bool     jump_valid = false;         // Jump: payload carried the full operand set
+
+    // SetPredication (sceAgcDcbSetPredication -> R_SET_PRED; #319). Payload: [0..1]=condition
+    // address lo/hi (0 = end the window), [2]=raw predication op (live capture: 3 on begin, 0 on end).
+    uint64_t pred_addr = 0;              // SetPredication: 64-bit condition address (0 = window end)
+    uint32_t pred_op = 0;                // SetPredication: raw op field
+    bool     pred_valid = false;         // SetPredication: payload carried the operands
+
     uint32_t flip_handle = 0;            // Flip: sceVideoOut handle
     int32_t  flip_bufidx = -1;           // Flip: display buffer index (-1 = not decoded)
     uint32_t flip_mode = 0;              // Flip: flip mode

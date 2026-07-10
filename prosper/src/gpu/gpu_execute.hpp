@@ -418,7 +418,10 @@ inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn&
                                              uint32_t max_shader_dwords = 0x10000,
                                              float vp_scale_x = 1.0f, float vp_scale_y = 1.0f) {
     if (st.draws.empty() || !render) return {};              // nothing to render (e.g. a state-only submit)
-    const bool log = getenv("PROSPER_GFXLOG") != nullptr;    // bail-point visibility (why no frame?)
+    // PROSPER_EXECLOG: just the per-draw bail-point/skip logs, without PROSPER_GFXLOG's per-packet
+    // firehose (which is GBs over a minutes-long run) — for "which draws skip and why" surveys (#319).
+    const bool log = getenv("PROSPER_GFXLOG") != nullptr ||
+                     getenv("PROSPER_EXECLOG") != nullptr;   // bail-point visibility (why no frame?)
     // Render each draw from its OWN register snapshot when the submit has MULTIPLE draws — a real
     // multi-geometry scene (the game's in-game/cutscene submits carry 8-11 distinct draws with per-draw
     // shaders/textures/blends). Folding those to just the last draw drops the rest and the frame comes out

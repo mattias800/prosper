@@ -15,6 +15,10 @@ extern "C" void prosper_vo_flip_from_gpu(uint32_t handle, int32_t bufidx, uint32
 
 namespace prosper::gpu {
 
+// Readability probe (gpu_executor.cpp, declared in gpu_execute.hpp): page-granular check that a
+// guest range is mapped, so the Jump fold below never walks an unmapped segment address.
+bool guest_readable(uint64_t addr, uint32_t bytes);
+
 // Wake any thread blocked in sync_on_address (a futex) on `addr`. A GPU completion label write only
 // changes memory; a futex waiter does NOT wake on a value change — it needs an explicit FUTEX_WAKE. The
 // game's render/producer threads sync_on_address on the very labels the GPU writes via RELEASE_MEM /
@@ -260,6 +264,53 @@ void GpuState::apply(const Pm4Command& c) {
             // the stream — it only leaves compute-written buffers stale (surfaced by the counter).
             dispatch_count++;
             break;
+        case K::SetPredication:
+            // Begin/end a GPU predication window (#319). The begin form carries the condition
+            // address; the end form carries 0. A short-decoded packet conservatively ENDS the
+            // window (never leaves a stale condition gating later jumps).
+            pred_cond_addr = c.pred_valid ? c.pred_addr : 0;
+            break;
+        case K::Jump: {
+            // sceAgcDcbJump (#319): execute `jump_dwords` dwords at `jump_addr`, then resume
+            // (call-with-length — live capture shows the target segment is exactly the passed
+            // size, no jump-back packet, and the parent stream continues after the jump).
+            //
+            // Predication: a packet-predicated jump (jump_pred, set by sceAgcSetPacketPredication)
+            // inside an open SetPredication window executes only when the 64-bit condition reads 0
+            // at fold time. POLARITY (CONFIDENCE: MED, empirically pinned on DOLL's title): the
+            // predicated jump segments are the game's per-frame backbuffer composite draws — a
+            // title frame REQUIRES the composite every frame on real hardware, and the condition
+            // memory reads 0 throughout the title steady state, so 0 must mean "execute" here
+            // ("skip when non-zero", matching PM4 SET_PREDICATION's draw-discard-on-set model).
+            if (!c.jump_valid || !c.jump_addr || (c.jump_addr & 3) || !c.jump_dwords) break;
+            // PROSPER_NO_JUMP=1: diagnostic A/B — reproduce the pre-#319 behavior (jump ignored).
+            static const bool no_jump = [] { const char* e = getenv("PROSPER_NO_JUMP"); return e && e[0] == '1'; }();
+            if (no_jump) break;
+            constexpr uint32_t kMaxJumpDwords = 0x40000;   // 1 MiB of dwords — far past any real segment
+            constexpr uint32_t kMaxJumpDepth  = 8;
+            if (c.jump_dwords > kMaxJumpDwords || jump_depth >= kMaxJumpDepth) break;
+            bool skip = false;
+            uint64_t cond = 0;
+            if (c.jump_pred && pred_cond_addr && !(pred_cond_addr & 7) &&
+                guest_readable(pred_cond_addr, 8)) {
+                memcpy(&cond, (const void*)(uintptr_t)pred_cond_addr, sizeof cond);
+                skip = (cond != 0);
+            }
+            if (getenv("PROSPER_PREDLOG")) {
+                static int logged = 0;
+                if (logged++ < 96)
+                    fprintf(stderr, "[pred] fold Jump target=0x%llx ndw=%u pred=%u cond@0x%llx=0x%llx -> %s\n",
+                            (unsigned long long)c.jump_addr, c.jump_dwords, c.jump_pred,
+                            (unsigned long long)pred_cond_addr, (unsigned long long)cond,
+                            skip ? "SKIP" : "EXEC");
+            }
+            if (skip) break;
+            if (!guest_readable(c.jump_addr, c.jump_dwords * 4)) break;   // whole segment must be mapped
+            jump_depth++;
+            run_command_buffer((const uint32_t*)(uintptr_t)c.jump_addr, c.jump_dwords, *this);
+            jump_depth--;
+            break;
+        }
         case K::Flip:
             // The GPU reaching the SetFlip packet IS the flip moment (synchronous fold): perform the
             // videoout flip so GetFlipStatus advances and the game's frame pacer sees its flipArg
