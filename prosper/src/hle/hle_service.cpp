@@ -144,7 +144,10 @@ HLE(s_np_reach)       { if (a1) *(int32_t*)PW(a1) = 0; return 0; }
 // signed-out error (shadPS4 np_manager.cpp:579 does exactly this). The previous success+0 was
 // contradictory garbage ("you have a user; their account id is 0").
 HLE(s_np_accountid)   { if (a1) *(uint64_t*)PW(a1) = 0; return NP_ERR_SIGNED_OUT; }
-HLE(s_np_country)     { if (a1) memset(PW(a1), 0, 4); return 0; }
+// sceNpGetAccountCountryA: signed-out, out-struct untouched (matching the sibling getters). Was returning
+// SUCCESS with a zeroed country code -> the guest reads a blank as a valid region key and takes an
+// age/region/store path (the #306 success-masks-offline wedge) instead of the clean offline branch.
+HLE(s_np_country)     { return NP_ERR_SIGNED_OUT; }
 // sceNpGetOnlineId(userId, SceNpOnlineId* out): the signed-out error, out untouched (shadPS4
 // np_manager.cpp:618). The unimplemented success+garbage here is what faked the sign-in.
 HLE(s_np_getonlineid) { svc_log("sceNpGetOnlineId", a0,a1,a2,a3,a4,a5); return NP_ERR_SIGNED_OUT; }
@@ -649,6 +652,16 @@ HLE(s_savedata_mount3)  {
     return 0;
 }
 HLE(s_savedata_umount2) { svc_log("sceSaveDataUmount2", a0,a1,a2,a3,a4,a5); savedata0_umount(); return 0; }
+// sceSaveDataGetMountInfo(mp, OrbisSaveDataMountInfo* info = { u64 blocks; u64 freeBlocks; u8 rsv[32] }, 48
+// bytes): was MISSING -> success with garbage free-space, so a title sizing its save against freeBlocks
+// could abort ("disk full") or corrupt its math. Report a generous, consistent size (256K blocks free).
+HLE(s_savedata_mountinfo) {
+    svc_log("sceSaveDataGetMountInfo", a0,a1,a2,a3,a4,a5);
+    if (!a1) return 0x809F0000ull;   // SAVE_DATA_ERROR_PARAMETER
+    uint8_t* i = (uint8_t*)PW(a1); memset(i, 0, 48);
+    *(uint64_t*)(i + 0) = 0x40000; *(uint64_t*)(i + 8) = 0x40000;   // blocks / freeBlocks
+    return 0;
+}
 HLE(s_savedata_prepare) { svc_log("sceSaveDataPrepare", a0,a1,a2,a3,a4,a5); return 0; }
 HLE(s_savedata_commit)  { svc_log("sceSaveDataCommit", a0,a1,a2,a3,a4,a5); return 0; }
 // sceSaveDataDirNameSearch(const SearchCond* cond, SearchResult* result) — PS4-inherited contract,
@@ -989,6 +1002,7 @@ void register_service_hle() {
     Hle::register_fn("y3zHpdZO6ME", (HleFn)s_nptrophy2_unavailable, "sceNpTrophy2GetTrophyInfoArray");
     // user service
     R("sceUserServiceGetInitialUser", s_user_initial);
+    Hle::register_fn("eNb53LQJmIM", (HleFn)s_user_initial, "sceUserServiceGetForegroundUser");  // was MISSING -> garbage userId
     R("sceUserServiceGetEvent", s_user_getevent);   // deliver the initial-user LOGIN event once
     R("sceUserServiceGetLoginUserIdList", s_user_idlist);
     R("sceUserServiceGetUserName", s_user_name);
@@ -1041,6 +1055,7 @@ void register_service_hle() {
     // temp-data mount: raw NIDs (names not in our NidDb). Unmount = OK (nothing to tear down).
     Hle::register_fn("buYbeLOGWmA", (HleFn)s_appcontent_tmpmount2, "sceAppContentTemporaryDataMount2");
     Hle::register_fn("SaKib2Ug0yI", (HleFn)s_appcontent_tmpspace, "sceAppContentTemporaryDataGetAvailableSpaceKb");
+    Hle::register_fn("Gl6w5i0JokY", (HleFn)s_appcontent_tmpspace, "sceAppContentDownloadDataGetAvailableSpaceKb");  // was MISSING -> garbage KB
     Hle::register_fn("bcolXMmp6qQ", (HleFn)s_ok,                  "sceAppContentTemporaryDataUnmount");
     // add-content (DLC) enumeration — no-DLC truth (hitNum=0 / no-entitlement), NOT garbage-count OOM (#213 class)
     Hle::register_fn("xnd8BJzAxmk", (HleFn)s_appcontent_addcont_list,   "sceAppContentGetAddcontInfoList");
@@ -1122,6 +1137,7 @@ void register_service_hle() {
     Hle::register_fn("sDCBrmc61XU", (HleFn)s_savedata_prepare,   "sceSaveDataPrepare");
     Hle::register_fn("ie7qhZ4X0Cc", (HleFn)s_savedata_commit,    "sceSaveDataCommit");
     Hle::register_fn("dyIhnXq-0SM", (HleFn)s_savedata_dirsearch, "sceSaveDataDirNameSearch");
+    Hle::register_fn("65VH0Qaaz6s", (HleFn)s_savedata_mountinfo, "sceSaveDataGetMountInfo");  // was MISSING -> garbage free-space
     // libSceNpTrophy2 lifecycle — valid ids; content queries stay "unavailable" (above).
     Hle::register_fn("Bagshr7OQ6Q", (HleFn)s_nptrophy2_createctx,    "sceNpTrophy2CreateContext");
     Hle::register_fn("Gz1rmUZpROM", (HleFn)s_nptrophy2_createhandle, "sceNpTrophy2CreateHandle");
