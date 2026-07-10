@@ -70,6 +70,10 @@ struct RenderState {
     uint32_t cb_color_control  = 0;   // CB_COLOR_CONTROL
     uint32_t cb_blend0_control = 0;   // CB_BLEND0_CONTROL
     uint32_t cb_target_mask    = 0;   // CB_TARGET_MASK (per-MRT write mask)
+    // Rasterizer cull/front-face/polygon mode (PA_SU_SC_MODE_CNTL). An ABSENT register reads 0, which
+    // decodes to CULL_NONE + CCW-front + FILL — exactly the prior hardcoded default, so nothing changes
+    // for a guest that never programs it. Decoded in resolve to Vk enums (#456).
+    uint32_t pa_su_sc_mode_cntl = 0;
 
     // Viewport 0 transform (PA_CL_VPORT_{X,Y,Z}{SCALE,OFFSET} — IEEE-754 floats stored in the context
     // registers; 0 when the guest never set them). Hardware applies screen = offset + scale * ndc, with
@@ -140,6 +144,16 @@ struct ResolvedPipelineState {
     bool  has_viewport = false;
     float viewport_x = 0, viewport_y = 0, viewport_w = 0, viewport_h = 0;
     float min_depth = 0.0f, max_depth = 1.0f;
+
+    // Rasterizer state resolved from PA_SU_SC_MODE_CNTL (#456). Values == the Vulkan enumerators, so the
+    // backend drops them straight in. Defaults reproduce the prior hardcode (no cull, CCW front, fill),
+    // so a draw that never programs the register — and every test building a ResolvedPipelineState
+    // directly — is byte-identical. cull_mode == VkCullModeFlags (0=NONE,1=FRONT,2=BACK,3=FRONT_AND_BACK);
+    // front_face == VkFrontFace (0=CW,1=CCW); polygon_mode == VkPolygonMode (0=FILL,1=LINE,2=POINT).
+    uint32_t cull_mode    = 0;   // VK_CULL_MODE_NONE
+    uint32_t front_face   = 1;   // VK_FRONT_FACE_COUNTER_CLOCKWISE (guest FACE=0 default; matches the
+                                 // negative-height flipped viewport that already renders correct-facing geometry)
+    uint32_t polygon_mode = 0;   // VK_POLYGON_MODE_FILL
 };
 
 // Translate a RenderState's RDNA2 register semantics into Vulkan-ready pipeline state (pure).

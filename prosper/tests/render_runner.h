@@ -344,6 +344,15 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         vpst.viewportCount = 1; vpst.pViewports = &vp; vpst.scissorCount = 1; vpst.pScissors = &sc;
         VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
         rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
+        // Honor the guest's PA_SU_SC_MODE_CNTL cull/front-face/polygon mode (#456). Resolve encodes these
+        // as the Vk enumerators; an absent register resolves to the same NONE/CCW/FILL default above, so
+        // the null-ps (test) path and any draw that never programs it are byte-identical. PROSPER_NO_CULL
+        // forces CULL_NONE back on (diag escape hatch, matching PROSPER_NO_DEPTH/NO_STENCIL/NO_BLEND) —
+        // if honoring the guest cull ever culls the wrong faces on a live render (a winding/Y-flip edge),
+        // this isolates it without a rebuild.
+        if (ps) { rs.cullMode  = getenv("PROSPER_NO_CULL") ? VK_CULL_MODE_NONE : (VkCullModeFlags)ps->cull_mode;
+                  rs.frontFace = (VkFrontFace)ps->front_face;
+                  rs.polygonMode = (VkPolygonMode)ps->polygon_mode; }
         VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
         ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
         VkPipelineColorBlendAttachmentState cba{}; cba.colorWriteMask = 0xF;
