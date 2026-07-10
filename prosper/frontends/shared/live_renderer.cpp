@@ -47,7 +47,24 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             // reach a post-loading-screen scene.
             static std::atomic<int> g_submit_idx{0};
             static int g_render_first = getenv("PROSPER_RENDER_FIRST") ? atoi(getenv("PROSPER_RENDER_FIRST")) : 0;
-            if (g_submit_idx++ < g_render_first) return {};
+            int g_this_submit = g_submit_idx++;
+            // PROSPER_FIND_CONTENT: at NATIVE speed (before the slow render), scan this submit's PS textures
+            // for a real content atlas (large sampled texture, not the 4x4/17x1 defaults) and log the submit
+            // index. Pinpoints which submit shows the 2D content (e.g. the credits) so RENDER_FIRST can be
+            // aimed there — the render is too slow to sweep blindly for a timing-shifted content window.
+            if (getenv("PROSPER_FIND_CONTENT")) {
+                for (const auto& it : items) {
+                    const auto* t = it.prt.get();
+                    if (!t) continue;
+                    for (const auto& r : t->resources)
+                        if ((r.cls == RC::Texture || r.cls == RC::StorageImage) && r.width >= 700 && r.height >= 100) {
+                            fprintf(stderr, "[find] submit %d has content tex %ux%u addr=0x%llx\n",
+                                    g_this_submit, r.width, r.height, (unsigned long long)r.gpu_addr);
+                            break;
+                        }
+                }
+            }
+            if (g_this_submit < g_render_first) return {};
             // Dump the FIRST item's recompiled SPIR-V (diagnostic; survives a mid-render crash).
             if (getenv("PROSPER_SHADER_DUMP") && !items.empty()) {
                 std::string d = getenv("PROSPER_SHADER_DUMP");
@@ -334,13 +351,27 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     if (groups.find(k) == groups.end()) order.push_back(k);
                     groups[k].push_back(&it);
                 }
+                // Which group to PRESENT? The scanned-out frame is the COMPOSITOR pass — the one that draws
+                // the real content (sprites/UI) over the background — NOT necessarily the last-submitted
+                // group, which is often a single-draw solid background/clear fill of a different buffer.
+                // Presenting "last" makes the visible frame flip between content and the bg fill depending
+                // on submission order (the intermittent-content problem). PROSPER_RTT_PRESENT_MAXDRAWS
+                // instead presents the group with the most draws (a compositor blends many sprites; a fill
+                // is one fullscreen draw) — a stable choice. Ties keep the later group.
+                static const bool present_maxdraws = getenv("PROSPER_RTT_PRESENT_MAXDRAWS") != nullptr;
+                size_t best_draws = 0;
                 for (uint64_t base : order) {
                     std::vector<uint8_t> gpx = prosper::test::render_draws_rgba(build_bds(groups[base]), w, h);
                     if (base && !gpx.empty()) { RttSurf& s = g_rtt[base]; s.rgba = gpx; s.w = w; s.h = h; }
                     if (getenv("PROSPER_RTTLOG")) { size_t nz=0; for (uint8_t b : gpx) nz += (b != 0);
                         fprintf(stderr, "[rtt] group target=0x%llx (%zu draws) px_nonzero=%zu cache_size=%zu\n",
                                 (unsigned long long)base, groups[base].size(), nz, g_rtt.size()); }
-                    if (!gpx.empty()) px = std::move(gpx);                              // present the last non-empty group
+                    if (!gpx.empty()) {
+                        if (!present_maxdraws) px = std::move(gpx);                     // last non-empty group
+                        else if (groups[base].size() >= best_draws) {                   // compositor = most draws
+                            best_draws = groups[base].size(); px = std::move(gpx);
+                        }
+                    }
                 }
             } else {
                 // Single-framebuffer path: render_draws_rgba composites every draw into ONE framebuffer.
@@ -360,12 +391,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 }
             }
             int n = frame_no++;
+            // PROSPER_DUMP_CONTENT=<min-green-px>: dump ONLY frames whose GREEN channel is active in at
+            // least that many pixels. The debug clear colour is pure blue (green==0 everywhere), so a
+            // green-active threshold discriminates real content (skin, text AA, coloured logos) from the
+            // blue clear — catching the intermittent content frames the periodic policy misses.
+            // PROSPER_DUMP_CONTENT=<min-nonzero-bytes>: dump ONLY frames with at least that many nonzero
+            // bytes. The blue clear alone is ~259198 nonzero at 480x270; real composited content pushes it
+            // higher, so a threshold just above the clear baseline (e.g. 260000) captures the intermittent
+            // content frames and skips the pure-clear ones.
+            size_t nz_thr = 0; if (const char* c = getenv("PROSPER_DUMP_CONTENT")) nz_thr = (size_t)atol(c);
+            size_t nz = 0; if (nz_thr) for (size_t i = 0; i < px.size(); i++) nz += (px[i] != 0);
             if (px.empty()) {
                 fprintf(stderr, "[render] frame %d: Vulkan render FAILED (%ux%u)\n", n, w, h);
-            } else if (dump_bmps && (n < 60 || n % 10 == 0)) {   // periodic screenshots (headless verification only)
+            } else if (dump_bmps && ((nz_thr && nz >= nz_thr) ||
+                                     (!nz_thr && (n < 60 || n % 10 == 0)))) {
                 char fn[512]; snprintf(fn, sizeof fn, "%s/frame_%04d.bmp", frame_dir.c_str(), n);
                 prosper::test::dump_bmp(fn, px, w, h);
-                fprintf(stderr, "[render] frame %d rendered (%ux%u) -> %s\n", n, w, h, fn);
+                fprintf(stderr, "[render] frame %d rendered (%ux%u) nz=%zu -> %s\n", n, w, h, nz, fn);
             }
             return px;
         });
