@@ -243,7 +243,13 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 uint32_t soff_val = 0; bool soff_ok = true;
                 if (soff_field < 106) soff_ok = known((int)soff_field, soff_val);          // SGPR
                 else if (soff_field == 106 || soff_field == 107) soff_ok = known((int)soff_field, soff_val); // vcc lo/hi
-                else soff_val = 0;                                          // null/const-0 soffset
+                else if (soff_field == 125) soff_val = 0;                   // SGPR_NULL -> const-0 offset (ok)
+                else soff_ok = false;                                       // m0(124)/exec(126,127)/reserved:
+                                                                            // untracked -> mark UNKNOWN, not 0. The
+                                                                            // old `else soff_val=0` claimed ok=true
+                                                                            // for these, snapshotting a descriptor
+                                                                            // from base+imm+0 instead of +m0/exec
+                                                                            // -> wrong V#/T#, silently (#398).
                 // Descriptor-table use (#294): an s_buffer_load's SBASE is a V# — if that V# was
                 // snapshotted from a table load, report it as a ConstantBuffer use keyed by its load
                 // immediate (matching the recompiler's sreg_srt tag). Recorded BEFORE the dest write
@@ -356,9 +362,11 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     // words), so add soffset+inst_offset to the descriptor base; an UNKNOWN soffset keeps
                     // the un-offset base (previous behavior). CONFIDENCE: HIGH (fetch-time values traced
                     // live; Messenger's fetches carry SOFFSET=0 so they are byte-identical).
-                    uint32_t soff = 0;
-                    if (!(in.src[2].kind == OperandKind::Special && in.src[2].value == 125))  // NULL -> 0
-                        if (!srcval(in.src[2], soff)) soff = 0;                               // unknown -> 0
+                    uint32_t soff = 0; bool soff_known = true;
+                    if (in.src[2].kind == OperandKind::Special && in.src[2].value == 125)     // SGPR_NULL -> 0
+                        soff = 0;
+                    else if (!srcval(in.src[2], soff))
+                        soff_known = false;                          // real but untracked SOFFSET (#398) — see below
                     const uint32_t inst_off = in.literal & 0xFFFu;
                     const uint32_t fetch_off = soff + inst_off;
                     auto with_off = [&](DecodedBufferDescriptor d) {
@@ -370,8 +378,16 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         // it zeros -> a collapsed final vertex).
                         return d;
                     };
-                    if (trc) fprintf(stderr, "[dyntrace] MUBUF fetch pc=%u op=0x%x SRSRC=s%d patched=%d (k=%d%d%d%d v3=0x%x) have_descr=%d off=+0x%x\n",
-                                     in.pc, in.opcode, srsrc, patched, k0, k1, k2, k3, k3 ? vv[3] : 0, it != descr.end(), fetch_off);
+                    if (trc) fprintf(stderr, "[dyntrace] MUBUF fetch pc=%u op=0x%x SRSRC=s%d patched=%d (k=%d%d%d%d v3=0x%x) have_descr=%d off=+0x%x soff_known=%d\n",
+                                     in.pc, in.opcode, srsrc, patched, k0, k1, k2, k3, k3 ? vv[3] : 0, it != descr.end(), fetch_off, (int)soff_known);
+                    // A real (non-NULL) SOFFSET the fold cannot resolve would silently collapse fetch_off's
+                    // in-record component to 0 — every attribute reads base+inst_off (the "solid banner"
+                    // collapse this fold was written to fix) or a wrong descriptor address. Leave the fetch
+                    // UNRESOLVED (a loud recompile-coverage miss) rather than fabricating offset 0 (#398).
+                    if (!soff_known) {
+                        if (trc) fprintf(stderr, "[dyntrace]   MUBUF pc=%u SOFFSET untracked -> fetch left unresolved (not folded to 0)\n", in.pc);
+                        break;
+                    }
                     // Per-fetch: record THIS fetch's live V# (the SRSRC SGPR is reloaded with a different V#
                     // per vertex attribute — position, uv, color…). Keyed by the fetch's pc so the recompiler
                     // resolves each buffer_load_format to the descriptor as loaded at that instruction.
