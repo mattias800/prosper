@@ -284,24 +284,84 @@ HLE(agc_cb_nop) {  // (dcb, num_dwords, ...)
     for (uint32_t i = 1; i < num; i++) cmd[i] = 0;
     return (uint64_t)(uintptr_t)cmd;
 }
-// sceAgcDcbDmaData (WmAc2MEj6Io) — append a DMA_DATA packet; observed args (live capture): a4 = src
-// address, a5 = size in dwords, a1 = dst (0 here, patched later via DmaDataPatchSetDstAddressOrOffset).
-// Custom R_DMA_DATA payload: [1..2]=dst lo/hi, [3..4]=src lo/hi, [5]=size_dw, [6]=flags. Return ptr.
-HLE(agc_dcb_dma_data) {  // (dcb, dst, cache_policy, flags, src, size_dw)
-    // #319 probe: is DmaData part of the per-frame render stream (a GPU-side copy we never execute)?
+// sceAgcDcbDmaData (WmAc2MEj6Io) — append a CP-DMA packet (issue #312, the MallocBinned3 heap-
+// corruption root cause). ABI RE-pinned from three eboot callsites (disassembly, this branch):
+//   sceAgcDcbDmaData(dcb, srcAddressOrOffsetOrImmediate, srcSel?, dstSel?, dstAddressOrOffset,
+//                    <sel/policy>, stack7, stack8, stack9=numBytes, ..., stack12=isBlocking)
+// Evidence for the roles:
+//  - eboot+0x221ad2d..6c: GMalloc->Malloc(size) result (+ running offset) is passed in A4 and the
+//    packet fills it — a freshly-allocated buffer can only be a DESTINATION, so a4 = dst.
+//  - the patcher family names are sceAgcDmaDataPatchSetDstAddressOrOffset (patches [1..2] below)
+//    and sceAgcDmaDataPatchSetSrcAddressOrOffsetOrIMMEDIATE — src can be an immediate value.
+//  - eboot+0x2212384 / 0x220d31e (the RHIThread translate loop's per-segment consumed-marker
+//    emitters): DmaData(src=0, sels=3/3, dst=<chunk fence label>, stack9=4 bytes, blocking) right
+//    before ReleaseMem(label <- 1, data_sel=1). This is the GPU-side LABEL INIT (label := 0): the
+//    guest never CPU-initializes these labels (live page-watch capture), and the labels are LIFO-
+//    recycled heap blocks — without the init, the guest's consumption poll reads the STALE 1 of the
+//    previous generation at the same address, "retires" the segment instantly, frees the label while
+//    this generation's fence packets are still in flight, and our (faithful) value-1 fence writes
+//    then land in freed MallocBinned3 memory — the #312 "Canary was 0x3, should be 0x1" /
+//    "free an unrecognized block 0x1000000001" / 0x20015f00 freelist-pop fatals.
+// numBytes is stack arg9 — beyond the swap stub's 2-arg re-push window, recovered from the intact
+// original guest frame exactly like agc_driver_submit_dcb_variant's arg9 (validated: the re-pushed
+// args must match the originals and the return address must be guest text; on mismatch numBytes
+// stays 0 and the CommandProcessor skips the packet with a loud log — the pre-fix behavior).
+// Custom R_DMA_DATA payload: [1..2]=dst lo/hi, [3..4]=srcOrImm lo/hi, [5]=numBytes, [6]=sels.
+// CONFIDENCE: HIGH on a4=dst/a1=srcOrImm (malloc-destination callsite + patcher names + protocol);
+// MED on the selector args (recorded raw; the executor only honors the small-immediate form).
+HLE(agc_dcb_dma_data) {  // (dcb, srcOrImm, srcSel?, dstSel?, dst, sel/policy, ..., stack9=numBytes)
+    volatile uint64_t* fp = (uint64_t*)__builtin_frame_address(0);
+    uint64_t num_bytes = 0;
+    if (fp[6] == fp[2] && fp[7] == fp[3] &&
+        fp[5] >= 0x400000000ull && fp[5] < 0x500000000ull) {
+        uint64_t n = fp[8];                       // original stack arg9 = byte count
+        if (n && n <= 0x10000000ull) num_bytes = n;
+    }
     static std::atomic<uint64_t> g_dma_n{0};
-    if (getenv("PROSPER_PREDLOG")) {
+    if (getenv("PROSPER_PREDLOG") || getenv("PROSPER_GFXLOG")) {
         uint64_t k = g_dma_n.fetch_add(1);
         if (k < 48 || (k % 4096) == 0)
-            fprintf(stderr, "[pred] DcbDmaData #%llu dst=0x%llx src=0x%llx size_dw=0x%llx flags=0x%llx\n",
-                    (unsigned long long)k, (unsigned long long)a1, (unsigned long long)a4,
-                    (unsigned long long)a5, (unsigned long long)a3);
+            fprintf(stderr, "[pred] DcbDmaData #%llu dst=0x%llx srcOrImm=0x%llx bytes=0x%llx sels=0x%llx/0x%llx\n",
+                    (unsigned long long)k, (unsigned long long)a4, (unsigned long long)a1,
+                    (unsigned long long)num_bytes, (unsigned long long)a2, (unsigned long long)a3);
     }
     uint32_t* cmd; if (!begin_packet(a0, 7, IT_NOP, R_DMA_DATA, &cmd)) return 0;
-    cmd[1] = (uint32_t)(a1 & 0xffffffffu); cmd[2] = (uint32_t)(a1 >> 32u);
-    cmd[3] = (uint32_t)(a4 & 0xffffffffu); cmd[4] = (uint32_t)(a4 >> 32u);
-    cmd[5] = (uint32_t)a5; cmd[6] = (uint32_t)a3;
+    cmd[1] = (uint32_t)(a4 & 0xffffffffu); cmd[2] = (uint32_t)(a4 >> 32u);
+    cmd[3] = (uint32_t)(a1 & 0xffffffffu); cmd[4] = (uint32_t)(a1 >> 32u);
+    cmd[5] = (uint32_t)num_bytes;
+    cmd[6] = (uint32_t)((a2 & 0xffu) | ((a3 & 0xffu) << 8));
     return (uint64_t)(uintptr_t)cmd;
+}
+// sceAgcAcbDmaData (-RnpfpxIhec) — the async-compute-queue sibling. Same operation, shifted ABI
+// (RE'd from the Acb consumed-marker emitter at eboot+0x220d31e, which pairs it with the same
+// sceAgcCbReleaseMem(label<-1): (acb, srcSel?=3, dstSel?=3, dst=label, 2, 3, stack7=srcOrImm=0,
+// stack8=numBytes=4). srcOrImm/numBytes are stack args 7/8 = fp[2]/fp[3], INSIDE the swap stub's
+// forwarded window. CONFIDENCE: MED (single callsite; the executor gate limits the blast radius).
+HLE(agc_acb_dma_data) {  // (acb, srcSel?, dstSel?, dst, ?, ?, stack7=srcOrImm, stack8=numBytes)
+    volatile uint64_t* fp = (uint64_t*)__builtin_frame_address(0);
+    uint64_t src_imm = fp[2], num_bytes = fp[3];
+    if (num_bytes > 0x10000000ull) num_bytes = 0;
+    uint32_t* cmd; if (!begin_packet(a0, 7, IT_NOP, R_DMA_DATA, &cmd)) return 0;
+    cmd[1] = (uint32_t)(a3 & 0xffffffffu); cmd[2] = (uint32_t)(a3 >> 32u);
+    cmd[3] = (uint32_t)(src_imm & 0xffffffffu); cmd[4] = (uint32_t)(src_imm >> 32u);
+    cmd[5] = (uint32_t)num_bytes;
+    cmd[6] = (uint32_t)((a1 & 0xffu) | ((a2 & 0xffu) << 8));
+    return (uint64_t)(uintptr_t)cmd;
+}
+// sceAgcDmaDataPatchSetDstAddressOrOffset (IxYiarKlXxM) / ...SetSrcAddressOrOffsetOrImmediate
+// (cdDRpqcFGbU): patch a built DMA_DATA packet's dst / src field (same patch-placeholder pattern
+// as the #213 sync-packet address patchers; header-verified before writing).
+HLE(agc_patch_dma_data_dst) {  // (cmd, address)
+    auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
+    if (!patch_check(cmd, R_DMA_DATA, "DmaDataPatchSetDst")) return 0;
+    cmd[1] = (uint32_t)(a1 & 0xffffffffu); cmd[2] = (uint32_t)(a1 >> 32u);
+    return 0;
+}
+HLE(agc_patch_dma_data_src) {  // (cmd, addressOrImmediate)
+    auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
+    if (!patch_check(cmd, R_DMA_DATA, "DmaDataPatchSetSrc")) return 0;
+    cmd[3] = (uint32_t)(a1 & 0xffffffffu); cmd[4] = (uint32_t)(a1 >> 32u);
+    return 0;
 }
 HLE(agc_dcb_event_write) {  // (buf, event_type, address)
     // Widen the packet to carry the address (a2) like ReleaseMem (#132): an address-carrying
@@ -1056,9 +1116,10 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
         std::vector<gpu::Pm4Command> ops; gpu::decode_pm4(p->addr, p->dw_num, ops);
         static const char* kKindName[] = {"DrawReset","WaitFlipDone","SetShRegDirect","SetRegsIndirect",
             "SetIndexType","DrawIndex","DrawIndexAuto","EventWrite","AcquireMem","WriteData","WaitRegMem",
-            "Flip","ReleaseMem","DispatchDirect","SetIndexBase","SetIndexCount","DrawIndexOffset","Unknown"};
+            "Flip","ReleaseMem","DispatchDirect","SetIndexBase","SetIndexCount","DrawIndexOffset",
+            "Jump","SetPredication","DmaData","Unknown"};
         for (auto& c : ops) {
-            uint32_t k = (uint32_t)c.kind; const char* nm = k < 18 ? kKindName[k] : "?";
+            uint32_t k = (uint32_t)c.kind; const char* nm = k < 21 ? kKindName[k] : "?";
             fprintf(stderr, "[agc]   pkt op=0x%02x r=0x%02x len=%u kind=%s pl0=0x%08x pl1=0x%08x pl2=0x%08x\n",
                     c.op, c.r, c.len, nm,
                     c.len > 1 ? c.payload[0] : 0, c.len > 2 ? c.payload[1] : 0, c.len > 3 ? c.payload[2] : 0);
@@ -1176,7 +1237,10 @@ void register_agc_hle() {
     RN("3KDcnM3lrcU", agc_patch_wait_reg_mem_addr);  // WaitRegMem packet: set label address
     RN("0fWWK5uG9rQ", agc_patch_release_mem_addr);   // ReleaseMem packet: set label address
     RN("k3GhuSNmBLU", agc_dcb_dispatch_direct);      // sceAgcDcbDispatchDirect (tg_x, tg_y, tg_z, mod)
-    RN("WmAc2MEj6Io", agc_dcb_dma_data);        // sceAgcDcbDmaData — append DMA_DATA packet (#117)
+    RN("WmAc2MEj6Io", agc_dcb_dma_data);        // sceAgcDcbDmaData — append DMA_DATA packet (#117/#312)
+    RN("-RnpfpxIhec", agc_acb_dma_data);        // sceAgcAcbDmaData — async-compute sibling (#312)
+    RN("IxYiarKlXxM", agc_patch_dma_data_dst);  // sceAgcDmaDataPatchSetDstAddressOrOffset
+    RN("cdDRpqcFGbU", agc_patch_dma_data_src);  // sceAgcDmaDataPatchSetSrcAddressOrOffsetOrImmediate
     RN("YUeqkyT7mEQ", agc_dcb_set_flip);        // sceAgcDcbSetFlip (Kyty LibGraphicsDriver.cpp:98)
     RN("UglJIZjGssM", agc_driver_submit_dcb);   // sceAgcDriverSubmitDcb -> CommandProcessor replay
     RN("w1KFAHVqpaU", agc_driver_submit_dcb_variant);  // final-buffer submit variant (#232, DOLL RHI batch)

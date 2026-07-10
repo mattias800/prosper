@@ -79,7 +79,7 @@ uint64_t pkt_addr(const Pm4Command& c) { return c.payload ? (uint64_t)(uintptr_t
 }
 // Scan the ring for writes intersecting [lo, hi); format up to `max` matches into out (NUL-
 // terminated). Async-signal-safe: no locks, no allocation, tolerates racy ring slots. kind:
-// 1=RELEASE_MEM 2=EVENT_WRITE 3=WRITE_DATA.
+// 1=RELEASE_MEM 2=EVENT_WRITE 3=WRITE_DATA 4=DMA_DATA.
 extern "C" int prosper_gpu_write_ring_scan(uint64_t lo, uint64_t hi, char* out, size_t cap) {
     size_t off = 0; int found = 0;
     uint32_t seq_now = g_write_seq.load(std::memory_order_relaxed);
@@ -222,6 +222,49 @@ static void honor_event_write(const Pm4Command& c) {
         fprintf(stderr, "[agc]   EventWrite [0x%llx] event_type=%u -> clock 0x%llx\n",
                 (unsigned long long)c.event_addr, c.event_type, (unsigned long long)v);
     wake_on_label(c.event_addr);   // wake any sync_on_address futex waiter on this completion label
+}
+
+// Honor a DMA_DATA packet's memory effect (issue #312 — the MallocBinned3 heap-corruption root
+// cause). DOLL's RHIThread emits DmaData(srcOrImm=0, dst=<per-chunk fence label>, 4 bytes) per
+// translated segment: the GPU-side INIT (label := 0) of the consumed-marker protocol whose
+// completion leg is ReleaseMem(label <- 1). We previously DROPPED every DMA_DATA packet, so the
+// LIFO-recycled label kept the previous generation's 1 and the guest's consumption poll freed the
+// label while fences to it were still in flight (full evidence chain: hle_agc agc_dcb_dma_data).
+// Execution is deliberately GATED to the immediate-fill form (srcOrImm is a 32-bit value, PM4
+// CP-DMA src_sel=DATA semantics: the value is replicated across the destination). DOLL uses two
+// instances of it: the 4-byte per-segment label init above, and 64 KiB zero-fills of freshly
+// allocated 64 KiB-aligned command-stream CHUNKS (whose boundary headers hold the label pointers
+// the consumed-marker emitter reads — a recycled chunk with a stale header is the same stomp).
+// General CP-DMA copies (real src addresses / GDS) stay unexecuted with a bounded log, as before.
+// CONFIDENCE: HIGH on the init form (three-callsite ABI + live page-watch protocol capture);
+// MED on the large-fill form (same selectors + src=0 + fresh-buffer destinations).
+static void honor_dma_data(const Pm4Command& c) {
+    if (eop_writes_disabled() || !c.dd_valid) return;
+    constexpr uint32_t kMaxFill = 0x1000000;   // 16 MiB — far past any observed fill
+    bool imm_form = c.dd_bytes >= 1 && c.dd_bytes <= kMaxFill &&
+                    c.dd_dst && !(c.dd_dst & 3) && c.dd_src <= 0xffffffffull;
+    if (!imm_form || !guest_readable(c.dd_dst, c.dd_bytes)) {
+        // Not the immediate-fill form we model (or unmapped dst) — log so the gap stays visible.
+        static std::atomic<int> n{0};
+        if (n.fetch_add(1) < 24)
+            fprintf(stderr, "[agc] DMA_DATA not executed (unmodeled form): dst=0x%llx src=0x%llx bytes=%u sels=0x%x\n",
+                    (unsigned long long)c.dd_dst, (unsigned long long)c.dd_src, c.dd_bytes, c.dd_sels);
+        return;
+    }
+    uint32_t v32 = (uint32_t)c.dd_src;
+    uint8_t* dst = (uint8_t*)(uintptr_t)c.dd_dst;
+    if (v32 == 0) {
+        memset(dst, 0, c.dd_bytes);
+    } else {
+        uint32_t i = 0;
+        for (; i + 4 <= c.dd_bytes; i += 4) memcpy(dst + i, &v32, 4);
+        if (i < c.dd_bytes) memcpy(dst + i, &v32, c.dd_bytes - i);
+    }
+    ring_record(c.dd_dst, c.dd_src, (uint8_t)(c.dd_bytes > 255 ? 255 : c.dd_bytes), 4, pkt_addr(c));
+    if (getenv("PROSPER_GFXLOG"))
+        fprintf(stderr, "[agc]   DmaData [0x%llx] := 0x%x (%u bytes)\n",
+                (unsigned long long)c.dd_dst, v32, c.dd_bytes);
+    wake_on_label(c.dd_dst);
 }
 
 // Honor a WRITE_DATA packet: copy the inline dwords to the destination address (same synchronous timing).
@@ -406,6 +449,7 @@ void apply_effect(const Pm4Command& c) {
         case K::ReleaseMem: honor_eop_write(c); break;
         case K::EventWrite: honor_event_write(c); break;
         case K::WriteData:  honor_write_data(c); break;
+        case K::DmaData:    honor_dma_data(c); break;
         case K::Flip:       if (c.flip_valid) prosper_vo_flip_from_gpu(c.flip_handle, c.flip_bufidx,
                                                                        c.flip_mode, c.flip_arg); break;
         default: break;
@@ -574,6 +618,14 @@ void GpuState::apply(const Pm4Command& c) {
         case K::EventWrite:
             if (g_fold_deferring) { defer_push(c); break; }
             if (eop_write_sync()) honor_event_write(c); else pend_enqueue(c);
+            break;
+        case K::DmaData:
+            // CP-DMA memory effect (#312: the per-segment fence-label INIT). Rides the same FIFO
+            // as the other guest-visible writes: stream order between a generation's ReleaseMem
+            // (label <- 1) and the NEXT generation's DmaData (label := 0) at the same recycled
+            // address is exactly what the guest's consumption poll depends on.
+            if (g_fold_deferring) { defer_push(c); break; }
+            if (eop_write_sync()) honor_dma_data(c); else pend_enqueue(c);
             break;
         case K::WaitRegMem:
             // Real WAIT_REG_MEM semantics (#312): an unsatisfied wait PAUSES this queue — the
