@@ -69,6 +69,13 @@ int      present_front_index() { return g_front.load(std::memory_order_relaxed);
 uint64_t present_count()       { return g_present_count.load(std::memory_order_relaxed); }
 uint32_t present_width()       { return prosper_vo_display_width(); }
 uint32_t present_height()      { return prosper_vo_display_height(); }
+// Dimensions of the RENDERED frame handed in via present_write_frame (0 if none present). Distinct from
+// present_width/height (the guest DISPLAY dims): under PROSPER_RENDER_SCALE the rendered frame is smaller
+// than the display, so a readback consumer (screenshot) must size its buffer from THESE when a rendered
+// frame exists — else present_readback returns g_frame.size() != display*4 and the exact-size guard drops
+// every frame silently (#399). Fall back to present_width/height only on the raw-scanout path.
+uint32_t present_frame_width()  { std::lock_guard<std::mutex> lk(g_frame_mx); return g_frame_w; }
+uint32_t present_frame_height() { std::lock_guard<std::mutex> lk(g_frame_mx); return g_frame_h; }
 
 size_t present_readback(void* dst, size_t dst_cap) {
     if (!dst) return 0;
@@ -98,6 +105,7 @@ void present_reset() {
     g_present_count.store(0, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lk(g_frame_mx);
     g_frame.clear(); g_frame_w = g_frame_h = 0;
+    g_frame_seq.store(0, std::memory_order_relaxed);   // #399: reset the rendered-frame counter too
     g_have_frame.store(false, std::memory_order_release);
 }
 
