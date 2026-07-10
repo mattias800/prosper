@@ -281,6 +281,18 @@ HLE(agc_suspend_point) { return 0; }
 // sceAgcCbNop (LtTouSCZjHM) — append a1 padding dwords as a single NOP packet; return its pointer.
 HLE(agc_cb_nop) {  // (dcb, num_dwords, ...)
     uint32_t num = (uint32_t)a1; if (!a0 || !num) return 0;
+    // A type-3 NOP packet is at minimum 2 dwords (header + >=1 body). PM4() encodes the length as
+    // (num-2), so num==1 would UNDERFLOW the 14-bit length field to 0x3fff — a header claiming ~0x4001
+    // dwords for a physically 1-dword packet, which mis-frames (drops or truncates) the entire rest of
+    // the submit fold (#401). A genuine 1-dword pad is a PM4 TYPE-2 filler NOP (0x80000000), which the
+    // CP / our decoder now skips as a single dword — emit that instead of a malformed type-3 header.
+    if (num == 1) {
+        auto* dcb = (AgcDcb*)(uintptr_t)a0;
+        uint32_t* cmd = dcb->allocate_dw(1);
+        if (!cmd) return 0;
+        cmd[0] = 0x80000000u;   // PM4 type-2 single-dword NOP filler
+        return (uint64_t)(uintptr_t)cmd;
+    }
     uint32_t* cmd; if (!begin_packet(a0, num, IT_NOP, 0, &cmd)) return 0;
     for (uint32_t i = 1; i < num; i++) cmd[i] = 0;
     return (uint64_t)(uintptr_t)cmd;
