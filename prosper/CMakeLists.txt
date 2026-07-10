@@ -204,6 +204,15 @@ if(TARGET prosper_core)
   target_link_libraries(test_render_state PRIVATE prosper_core)
   add_test(NAME render_state_extract COMMAND test_render_state)
 
+  # Messenger recompile guard (#228): committed real Messenger VS/PS RDNA2 binaries must keep
+  # recompiling — a recompiler change that re-rejects one of their instructions (the #199/#201
+  # blue-screen class) fails here instead of shipping. Pure (no Vulkan); needs no game dump.
+  add_executable(test_messenger_recompile_guard tests/test_messenger_recompile_guard.cpp)
+  target_link_libraries(test_messenger_recompile_guard PRIVATE prosper_core)
+  target_compile_definitions(test_messenger_recompile_guard PRIVATE
+      PROSPER_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
+  add_test(NAME messenger_recompile_guard COMMAND test_messenger_recompile_guard)
+
   # Pipeline-state resolution: RenderState (RDNA2 enums) -> Vulkan-ready pipeline state (pure, no Vulkan).
   add_executable(test_pipeline_state tests/test_pipeline_state.cpp)
   target_link_libraries(test_pipeline_state PRIVATE prosper_core)
