@@ -229,8 +229,15 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             const AgcShaderSharp& s = texs[slot];
             if (s.empty()) continue;
             uint32_t off = s.offset_dw();
-            if ((uint64_t)off + 8 > num_user_sgprs) continue;   // T# (8 dwords) must fit in the block
-            DecodedImageDescriptor d = decode_image_descriptor(&user_sgprs[off]);
+            // A T# may live in the user-SGPR block OR spill into the EUD, exactly like the cbuf path
+            // (#257/#382) — the old hard `continue` for off+8 > num_user_sgprs silently DROPPED any
+            // EUD-resident texture, so its sampling draw rendered untextured. Fetch the 8 dwords via
+            // load_sharp (bounds-checked; copies verbatim from the SGPR block for the in-block case, so
+            // that path stays byte-identical) and decode from that buffer.
+            uint32_t tv[8]; uint32_t tsrt = load_sharp(off, 8, tv);
+            if (tsrt == 0xFFFFFFFFu) continue;                  // out of block / EUD absent / unreadable
+            const bool tex_in_eud = (uint64_t)off + 8 > num_user_sgprs;
+            DecodedImageDescriptor d = decode_image_descriptor(tv);
             if (d.base == 0 || d.width == 0 || d.height == 0 ||
                 d.width > 16384 || d.height > 16384) continue;  // skip a garbage/degenerate T#
             // PROSPER_DUMP_TILERAW (issue #282 derivation): dump the raw guest texel bytes of a tiled
@@ -272,7 +279,7 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                 }
             }
             if (getenv("PROSPER_GFXLOG")) {
-                const uint32_t* t = &user_sgprs[off];
+                const uint32_t* t = tv;   // the fetched T# (SGPR block or EUD spill)
                 fprintf(stderr, "[t#] %ux%u base=0x%llx tile_mode=%u type=%u fmt=%u swz=%u,%u,%u,%u | raw: %08x %08x %08x %08x %08x %08x %08x %08x\n",
                         d.width, d.height, (unsigned long long)d.base, d.tile_mode, d.type, d.format,
                         d.dst_sel[0], d.dst_sel[1], d.dst_sel[2], d.dst_sel[3],
@@ -341,8 +348,11 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             // (ceil dims); uncompressed store bytes_per_block per texel (fmt=56 -> *4).
             r.size          = is_bcn ? (((d.width + 3) / 4) * ((d.height + 3) / 4) * fi.bytes_per_block)
                                      : (d.width * d.height * fi.bytes_per_block);
-            r.sgpr_base     = user_sgpr_base + off;  // DIRECT provenance key (image_sample SRSRC SGPR)
-            r.srt_offset    = 0xFFFFFFFFu;
+            // SGPR-resident T#: DIRECT provenance (image_sample SRSRC SGPR). EUD-resident T#: INDIRECT
+            // (the s_load immediate = tsrt), and sgpr_base must be invalid so a stray by_sgpr_base for an
+            // unrelated op reading that (bogus, out-of-file) SGPR number can't spuriously match it (#382).
+            r.sgpr_base     = tex_in_eud ? 0xFFFFFFFFu : (user_sgpr_base + off);
+            r.srt_offset    = tex_in_eud ? tsrt : 0xFFFFFFFFu;
             // Paired sampler S# (sharp[2], same slot): decode its filter + wrap modes so the backend
             // samples the way the game asked (point vs bilinear, wrap vs clamp), instead of a hardcoded
             // LINEAR/clamp. 4-dword SQ_IMG_SAMP: WORD0 has CLAMP_X/Y/Z (bits [2:0]/[5:3]/[8:6]); WORD2

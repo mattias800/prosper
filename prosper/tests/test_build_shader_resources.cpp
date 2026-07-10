@@ -225,6 +225,31 @@ int main() {
         CHECK(tt.by_sgpr_base(24) == nullptr, "unmapped IMG_FMT T# skipped (no silent RGBA8)");
     }
 
+    // #382: an EUD-resident texture (T# spilled beyond the user-SGPR block) must be emitted, mirroring
+    // the cbuf EUD path — the old hard `continue` dropped it, so the sampling draw rendered untextured.
+    // Provenance is INDIRECT (srt_offset = the s_load immediate); sgpr_base is invalid so a stray
+    // by_sgpr_base for an unrelated SGPR can't spuriously match its out-of-file index.
+    {
+        uint32_t sg[32]; memset(sg, 0, sizeof sg);
+        uint32_t eudt[8]; make_tsharp(eudt, 0xAB000000ull, 128, 128, /*fmt*/56, /*tile*/0, /*type 2D*/9);
+        uint64_t ep = (uint64_t)(uintptr_t)eudt;
+        uint16_t dro5[16]; for (auto& x : dro5) x = 0xffff;
+        dro5[5] = 24; sg[24] = (uint32_t)ep; sg[25] = (uint32_t)(ep >> 32);   // EUD base pointer
+        AgcShaderSharp et_sharp[1]; et_sharp[0].bits = (uint16_t)(32 & 0x7fff);   // offset_dw 32 -> EUD eoff 0
+        AgcShaderUserData etud; memset(&etud, 0, sizeof etud);
+        etud.direct_resource_offset = dro5; etud.direct_resource_count = 16;
+        etud.eud_size_dw = 8;
+        etud.sharp_resource_offset[0] = et_sharp; etud.sharp_resource_count[0] = 1;
+        AgcShaderHeader etsh; memset(&etsh, 0, sizeof etsh);
+        etsh.file_header = 0x34333231u; etsh.version = 0x18; etsh.type = 1; etsh.user_data = &etud;
+        ShaderResourceTable et = build_shader_resources(etsh, sg, 32);
+        CHECK(et.resources.size() == 1, "#382: EUD-resident texture is emitted (not dropped)");
+        const ShaderResource* etr = et.by_srt_offset(0);   // EUD provenance key = eoff*4 = 0
+        CHECK(etr && etr->cls == ResourceClass::Texture && etr->gpu_addr == 0xAB000000ull,
+              "#382: EUD texture decoded from the spill buffer, resolvable by srt_offset");
+        CHECK(etr && etr->sgpr_base == 0xFFFFFFFFu, "#382: EUD texture leaves sgpr_base invalid (INDIRECT provenance)");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
