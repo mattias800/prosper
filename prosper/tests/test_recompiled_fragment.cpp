@@ -100,6 +100,81 @@ int main() {
         }
     }
 
+    // DIVERGENT EXECZ-EXIT LOOP (#273 — DOLL's title post-process accumulation PS shape).
+    //   header: v_cmpx_lt_u32 s0, v1 (per-lane trip bound); s_cbranch_execz EXIT;
+    //   body:   a NESTED execz if (saveexec + v_cmpx s0<2 + restore) adding 0.25 to v2 (red/blue),
+    //           an unconditional 0.25 add to v3 (green), s0++; s_branch header (backward).
+    //   EXIT:   restore exec; export (v2, v3, v2, 1.0).
+    // 4 iterations, inner if true for the first 2 => color (0.5, 1.0, 0.5, 1.0).
+    // (Assembled by llvm-mc gfx1030 from labeled source; encodings are the assembler's own.)
+    {
+        const uint32_t ps[] = {
+            0x7E020284u, 0xBE800380u, 0x7E040280u, 0x7E060280u, 0x7E080282u, 0x7E0A02F2u,
+            0xBE82047Eu, 0x7DA20200u, 0xBF88000Au, 0xBE84047Eu, 0x7DA20800u, 0xBF880002u,
+            0x060404FFu, 0x3E800000u, 0xBEFE0404u, 0x060606FFu, 0x3E800000u, 0x81008100u,
+            0xBF82FFF4u, 0xBEFE0402u, 0xF800180Fu, 0x05020302u, 0xBF810000u,
+        };
+        std::vector<uint32_t> frg = recompile_fragment(ps, sizeof(ps)/sizeof(ps[0]));
+        CHECK(!frg.empty(), "recompiled divergent execz-exit LOOP PS -> SPIR-V");
+        if (!frg.empty()) {
+            std::vector<uint8_t> px2 = prosper::test::render_triangle_rgba(vert, frg, W, H);
+            CHECK(px2.size() == (size_t)W*H*4, "rendered the divergent-loop PS");
+            if (px2.size() == (size_t)W*H*4) {
+                const uint8_t* cc = &px2[((size_t)(H/2) * W + W/2) * 4];
+                printf("  divloop center=(%u,%u,%u,%u) expect ~(128,255,128,255)\n", cc[0],cc[1],cc[2],cc[3]);
+                CHECK(cc[1] > 0xF0 && cc[0] > 0x70 && cc[0] < 0x90 && cc[2] > 0x70 && cc[2] < 0x90,
+                      "divergent loop: 4 iterations, nested if 2 -> (0.5, 1.0, 0.5)");
+            }
+        }
+    }
+
+    // EXECNZ-back-edge loop with a mid-body vccz BREAK (#273 — DOLL's scalar-indexed unroll shape):
+    //   LOOP: s_cbranch_execz EXIT (header exit); s_cmp_lt_u32 s0,s1; s_cselect_b64 s[4:5],exec,0;
+    //         vcc=exec=s[4:5]; s_cbranch_vccz EXIT (break); v2 += 0.25; s0++; s_cbranch_execnz LOOP.
+    // 3 iterations add 0.25 => gray (0.75, 0.75, 0.75, 1.0).
+    {
+        const uint32_t ps[] = {
+            0xBE82047Eu, 0xBE800380u, 0xBE810383u, 0x7E040280u, 0x7E0A02F2u, 0xBF880009u,
+            0xBF0A0100u, 0x8584807Eu, 0xBEEA0404u, 0xBEFE0404u, 0xBF860004u, 0x060404FFu,
+            0x3E800000u, 0x81008100u, 0xBF89FFF6u, 0xBEFE0402u, 0xF800180Fu, 0x05020202u,
+            0xBF810000u,
+        };
+        std::vector<uint32_t> frg = recompile_fragment(ps, sizeof(ps)/sizeof(ps[0]));
+        CHECK(!frg.empty(), "recompiled execnz-backedge loop + vccz break PS -> SPIR-V");
+        if (!frg.empty()) {
+            std::vector<uint8_t> px2 = prosper::test::render_triangle_rgba(vert, frg, W, H);
+            CHECK(px2.size() == (size_t)W*H*4, "rendered the execnz-loop PS");
+            if (px2.size() == (size_t)W*H*4) {
+                const uint8_t* cc = &px2[((size_t)(H/2) * W + W/2) * 4];
+                printf("  execnz loop center=(%u,%u,%u,%u) expect ~(191,191,191,255)\n", cc[0],cc[1],cc[2],cc[3]);
+                CHECK(cc[0] > 0xA8 && cc[0] < 0xD8 && cc[1] > 0xA8 && cc[1] < 0xD8,
+                      "execnz loop + break: exactly 3 iterations -> 0.75 gray");
+            }
+        }
+    }
+
+    // SCALAR-SPILL lane slots (#273): v_writelane_b32 packs two scalars into v10's lanes 3/7 and
+    // v_readlane_b32 restores them; export uses the round-tripped values -> (0.25, 1.0, 0.25, 1.0).
+    {
+        const uint32_t ps[] = {
+            0xBE8503FFu, 0x3E800000u, 0xBE8603F2u, 0xD761000Au, 0x00010605u, 0xD761000Au,
+            0x00010E06u, 0xD7600007u, 0x0001070Au, 0xD7600008u, 0x00010F0Au, 0x7E000207u,
+            0x7E020208u, 0xF800180Fu, 0x01000100u, 0xBF810000u,
+        };
+        std::vector<uint32_t> frg = recompile_fragment(ps, sizeof(ps)/sizeof(ps[0]));
+        CHECK(!frg.empty(), "recompiled writelane/readlane scalar-spill PS -> SPIR-V");
+        if (!frg.empty()) {
+            std::vector<uint8_t> px2 = prosper::test::render_triangle_rgba(vert, frg, W, H);
+            CHECK(px2.size() == (size_t)W*H*4, "rendered the lane-slot PS");
+            if (px2.size() == (size_t)W*H*4) {
+                const uint8_t* cc = &px2[((size_t)(H/2) * W + W/2) * 4];
+                printf("  laneslot center=(%u,%u,%u,%u) expect ~(64,255,64,255)\n", cc[0],cc[1],cc[2],cc[3]);
+                CHECK(cc[1] > 0xF0 && cc[0] > 0x30 && cc[0] < 0x50,
+                      "writelane/readlane: slots round-trip (0.25, 1.0)");
+            }
+        }
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

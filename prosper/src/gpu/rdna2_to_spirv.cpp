@@ -2,6 +2,7 @@
 #include "rdna2_to_spirv.hpp"
 #include "rdna2_decode.hpp"
 #include "shader_resources.hpp"
+#include <algorithm>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -953,6 +954,12 @@ struct RegState {
     // detect_pcrel_tables (an s_getpc_b64-derived V# whose num_records is a known constant). The
     // shader BLOB carries the table; the recompiler folds it into a compile-time constant lookup.
     std::unordered_map<uint32_t, std::vector<uint32_t>> mubuf_pcrel_tables;
+    // SCALAR-SPILL VGPR (#273 — DOLL's big post PS): the compiler packs excess wave-uniform scalars
+    // into one VGPR's lanes via `v_writelane_b32 vN, sX, <const lane>` and reads them back with
+    // `v_readlane_b32 sY, vN, <const lane>`. Per-invocation each (vgpr, lane) slot is just a named
+    // scalar: vgpr -> lane -> SSA id. A vgpr used as a spill array must never be read as ordinary
+    // per-lane data — operand_bits rejects that (fail-visible), keeping the model honest.
+    std::unordered_map<int, std::unordered_map<int, uint32_t>> vgpr_lane_slots;
 };
 
 // Predicate a just-computed VGPR write against EXEC: under a narrowed mask, inactive lanes keep their
@@ -1275,6 +1282,125 @@ CountedLoop detect_counted_loop(const std::vector<Rdna2Inst>& ins) {
     return L;
 }
 
+// DIVERGENT EXECZ-EXIT LOOPS (#273 — DOLL's post-process accumulation PSes, the title-composite
+// content producers). The compiled shape:
+//     header: <exec recompute: v_cmpx_.. counter,bound  |  v_cmp..;s_andn2_b64 exec,exec,vcc>
+//             s_cbranch_execz EXIT                      ; leave when no lane remains
+//     body:   ... (nested forward-execz if regions, saveexec/restore, scalar counter++) ...
+//             s_branch header                           ; backward unconditional back-edge
+//     EXIT:   s_mov_b64 exec, <saved>
+// Per-invocation semantics: THIS lane iterates while its EXEC bit (rs.exec, a bool) holds after the
+// header recompute — the canonical `while (cond) body` divergent loop. Hardware keeps the whole wave
+// looping until EVERY lane's bit clears, but a cleared lane's vector writes are masked from then on,
+// so exiting the lane immediately at its own EXECZ is value-identical for everything it can observe
+// EXCEPT scalar state advanced by the extra wave iterations (a loop counter read after the loop
+// would show the wave's MAX trip count, not this lane's) — compiled code consumes such counters
+// inside the loop, so this is the standard per-invocation approximation. CONFIDENCE: MED, gated by
+// spirv-val + execution kernels + the live-boot A/B.
+//
+// A second flavor (DOLL's scalar-indexed unroll): the back-edge is a backward s_cbranch_EXECNZ and
+// the header IS the execz exit (empty condition region); the body may carry an extra forward
+// vccz/execz BREAK to the exit. A break lowers as a plain forward IF over the remainder of the body
+// (skip-to-backedge): the broken lane's EXEC bit is already clear (the compiled break condition
+// mirrors the exec recompute), so the next header check exits it — we REQUIRE the execnz back-edge
+// (exec-governed continue) for any loop carrying breaks, which makes that reasoning structural.
+struct DivLoop {
+    uint32_t header_pc = 0;        // back-edge target; condition region = [header_pc, exit_branch_pc)
+    uint32_t exit_branch_pc = 0;   // the canonical forward s_cbranch_execz whose target is exit_pc
+    uint32_t backedge_pc = 0;      // backward s_branch (unconditional) or s_cbranch_execnz
+    uint32_t exit_pc = 0;          // backedge_pc + its length (first pc after the loop)
+    std::vector<uint32_t> break_pcs;   // extra forward vccz/execz -> exit_pc (lowered as body ifs)
+};
+
+// Returns the loops in header-pc order, or {} when any backward branch doesn't fit the shape (the
+// caller then rejects the stream loudly, exactly as before this feature). `safe` carries the
+// linearized branches (waterfalls etc.) which are not loop back-edges.
+std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>& ins,
+                                            const std::unordered_set<uint32_t>& safe) {
+    std::vector<DivLoop> out;
+    uint32_t end_pc = UINT32_MAX;
+    for (const auto& in : ins) if (in.is_end) { end_pc = in.pc; break; }
+    // Pass 1: each backward s_branch / s_cbranch_execnz is a candidate back-edge.
+    std::vector<bool> backedge_execnz;
+    for (const auto& in : ins) {
+        if (in.is_end) break;
+        if (in.fmt != Rdna2Format::SOPP) continue;
+        if ((in.opcode != 0x02 && in.opcode != 0x09) || in.simm16 >= 0) continue;
+        if (safe.count(in.pc)) continue;
+        DivLoop L;
+        L.header_pc = branch_target(in);
+        L.backedge_pc = in.pc;
+        L.exit_pc = in.pc + in.len_dwords;
+        if (L.header_pc >= L.backedge_pc || L.exit_pc > end_pc) return {};
+        bool hdr_ok = false;
+        for (const auto& h : ins) { if (h.pc == L.header_pc) { hdr_ok = true; break; } if (h.pc > L.header_pc) break; }
+        if (!hdr_ok) return {};
+        out.push_back(L);
+        backedge_execnz.push_back(in.opcode == 0x09);
+    }
+    if (out.empty()) return out;
+    // Loops must be strictly DISJOINT and in order (nested loops are not modeled). Backward branches
+    // appear in pc order, so headers must too — and each loop must end before the next begins.
+    for (size_t i = 1; i < out.size(); i++)
+        if (out[i].header_pc < out[i - 1].exit_pc) return {};
+    // Pass 2: validate each loop's interior branches and find the canonical exit + breaks.
+    for (size_t li = 0; li < out.size(); li++) {
+        DivLoop& L = out[li];
+        const bool execnz = backedge_execnz[li];
+        for (const auto& in : ins) {
+            if (in.is_end || in.pc >= L.backedge_pc) break;
+            if (in.pc < L.header_pc || in.fmt != Rdna2Format::SOPP) continue;
+            switch (in.opcode) {
+                case 0x02: case 0x04: case 0x05: case 0x06: case 0x07: case 0x08: case 0x09: break;
+                default: continue;   // hints
+            }
+            if (in.simm16 < 0) return {};                       // second back-edge inside -> nested loop
+            if (safe.count(in.pc)) continue;                    // linearized (kill-mask / safe-execz)
+            uint32_t tgt = branch_target(in);
+            if (in.opcode == 0x02) {                            // forward s_branch: an else-arm terminator
+                if (tgt > L.backedge_pc) return {};             // may not leave the body
+                continue;                                       // (validated by detect_forward_ifs)
+            }
+            if (tgt > L.exit_pc) return {};                     // conditional jumping past the loop
+            if (tgt == L.exit_pc) {                             // an exit test
+                if (!L.exit_branch_pc) {                        // first one = the canonical exit
+                    if (in.opcode != 0x08) return {};           // must be execz -> EXIT
+                    L.exit_branch_pc = in.pc;
+                } else {                                        // later ones = breaks
+                    if (in.opcode != 0x06 && in.opcode != 0x08) return {};  // vccz/execz only
+                    if (!execnz) return {};                     // breaks need the exec-governed back-edge
+                    L.break_pcs.push_back(in.pc);
+                }
+            }
+            // (tgt <= backedge_pc: an interior forward if — validated by detect_forward_ifs.)
+        }
+        if (!L.exit_branch_pc) return {};                       // no exit test: not this shape
+        // The canonical exit must be the FIRST branch in the loop, so the condition region
+        // [header, exit_branch) is branch-free (it is emitted straight-line).
+        for (const auto& in : ins) {
+            if (in.pc >= L.exit_branch_pc) break;
+            if (in.pc < L.header_pc || in.fmt != Rdna2Format::SOPP) continue;
+            if (in.opcode >= 0x02 && in.opcode <= 0x09 && in.opcode != 0x03 && !safe.count(in.pc)) return {};
+        }
+        // The execnz flavor's unconditional-continue lowering requires the header check to
+        // immediately re-test EXEC (empty condition region) — see the shape comment.
+        if (execnz && L.exit_branch_pc != L.header_pc) return {};
+    }
+    // Pass 3: no branch from OUTSIDE a loop may target its interior (an unstructured entry edge).
+    for (const auto& in : ins) {
+        if (in.is_end) break;
+        if (in.fmt != Rdna2Format::SOPP) continue;
+        if (in.opcode < 0x02 || in.opcode > 0x09 || in.opcode == 0x03) continue;
+        uint32_t tgt = branch_target(in);
+        for (const auto& L : out) {
+            const bool inside_br = in.pc >= L.header_pc && in.pc <= L.backedge_pc;
+            const bool inside_tgt = tgt > L.header_pc && tgt < L.exit_pc;
+            if (!inside_br && inside_tgt) return {};
+        }
+    }
+    return out;
+}
+
 // A single structured uniform IF: exactly ONE control-flow branch in the whole stream, and it is a
 // FORWARD s_cbranch_scc0/scc1 (a scalar-uniform conditional — all lanes take the same path). The
 // conditional block is [branch_pc+1, target_pc). Anything more (any s_branch/vcc/execz/execnz branch,
@@ -1369,33 +1495,61 @@ ForwardIf detect_forward_if(const std::vector<Rdna2Inst>& ins, bool allow_vcc,
 // CONFIDENCE: HIGH on the structure (guarded by the phi machinery shared with the single-if path).
 std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, bool allow_vcc,
                                           const uint32_t* code, size_t dwords,
-                                          const std::unordered_set<uint32_t>* skip = nullptr) {
+                                          const std::unordered_set<uint32_t>* skip = nullptr,
+                                          const std::vector<DivLoop>* loops = nullptr,
+                                          bool* rejected = nullptr) {
     std::vector<ForwardIf> out;
+    if (rejected) *rejected = false;
+    auto reject = [&]() -> std::vector<ForwardIf> { if (rejected) *rejected = true; return {}; };
     uint32_t end_pc = UINT32_MAX;
     for (const auto& in : ins) if (in.is_end) { end_pc = in.pc; break; }
+    // Loop-claimed pcs (#273): back-edges + canonical exits are consumed by the loop emitter; a break
+    // lowers as a forward if over the remainder of its loop's body (target clamped to the back-edge).
+    auto loop_backedge = [&](uint32_t pc) { if (loops) for (const auto& L : *loops) if (L.backedge_pc == pc) return true; return false; };
+    auto loop_exit     = [&](uint32_t pc) { if (loops) for (const auto& L : *loops) if (L.exit_branch_pc == pc) return true; return false; };
+    auto loop_break    = [&](uint32_t pc) -> const DivLoop* {
+        if (loops) for (const auto& L : *loops)
+            for (uint32_t bp : L.break_pcs) if (bp == pc) return &L;
+        return nullptr;
+    };
     // Pass 1: collect the conditional branches (else-arm s_branch terminators are claimed in pass 2).
     for (const auto& in : ins) {
         if (in.is_end) break;
         if (in.fmt != Rdna2Format::SOPP) continue;
         switch (in.opcode) {
             case 0x02: continue;                                     // s_branch: validated in pass 2
-            case 0x09: return {};                                    // execnz -> reject
+            case 0x09:                                               // execnz: only as a loop back-edge
+                if (loop_backedge(in.pc)) continue;
+                return reject();
             case 0x08:                                               // execz: safe-linearized predication
                 if (skip && skip->count(in.pc)) continue;            // branch -> emit_alu no-ops it; else a
-                if (!allow_vcc) return {};                           // DIVERGENT-REGION if (per-invocation
-                break;                                               // stages only — compute has wave VCC/EXEC)
+                if (loop_exit(in.pc)) continue;                      // loop exit test: the loop emitter's
+                if (!allow_vcc) return reject();                     // OpBranchConditional consumes it
+                break;                                               // DIVERGENT-REGION if (per-invocation
+                                                                     // stages only — compute has wave VCC/EXEC)
             case 0x06: case 0x07:                                    // vccz / vccnz
-                if (!allow_vcc) return {};
+                if (!allow_vcc) return reject();
                 break;
             case 0x04: case 0x05:                                    // scc0 / scc1
                 if (skip && skip->count(in.pc)) continue;            // kill-mask branch: linearized, not an if
                 break;
             default: continue;                                       // hints
         }
+        // A loop BREAK (validated vccz/execz -> exit_pc inside an execnz-back-edge loop): a plain
+        // forward if skipping the REST of the body — the exec-governed continue then exits the lane.
+        if (const DivLoop* L = loop_break(in.pc)) {
+            ForwardIf F;
+            F.found = true; F.branch_pc = in.pc; F.target_pc = L->backedge_pc;
+            F.on_scc0 = true;                                        // vccz/execz: skip block when flag==0
+            F.on_vcc  = (in.opcode == 0x06);
+            F.on_exec = (in.opcode == 0x08);
+            out.push_back(F);
+            continue;
+        }
         uint32_t tgt = branch_target(in);
         bool early = false;
         if (tgt > end_pc && tgt != UINT32_MAX) {                     // possible early-out past s_endpgm:
-            if (!code || tgt >= dwords) return {};                   // verify the target terminates (see
+            if (!code || tgt >= dwords) return reject();             // verify the target terminates (see
             std::vector<Rdna2Inst> tail;                             // detect_forward_if for the rationale)
             rdna2_walk(code + tgt, dwords - tgt, tail);
             bool ends_immediately = false;
@@ -1404,10 +1558,10 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
                 if (ti.fmt == Rdna2Format::SOPP && ti.opcode == 0x00) continue;
                 break;
             }
-            if (!ends_immediately) return {};
+            if (!ends_immediately) return reject();
             tgt = end_pc; early = true;
         }
-        if (tgt <= in.pc || tgt > end_pc) return {};                 // must be forward, within the stream
+        if (tgt <= in.pc || tgt > end_pc) return reject();           // must be forward, within the stream
         ForwardIf F;
         F.found = true; F.branch_pc = in.pc; F.target_pc = tgt; F.early_out = (early || tgt == end_pc);
         F.on_scc0 = (in.opcode == 0x04 || in.opcode == 0x06 || in.opcode == 0x08);
@@ -1421,39 +1575,52 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
                 if (sb.pc <= in.pc || sb.pc >= tgt) continue;
                 if (sb.fmt != Rdna2Format::SOPP || sb.opcode != 0x02) continue;
                 if (sb.pc + sb.len_dwords != tgt) continue;          // must be the arm's LAST instruction
-                if (sb.simm16 <= 0) return {};                       // backward else-jump: a loop, not an if
+                if (loop_backedge(sb.pc)) continue;                  // a loop's back-edge, not an else-jump
+                if (sb.simm16 <= 0) return reject();                 // backward else-jump: a loop, not an if
                 uint32_t lm = branch_target(sb);
-                if (lm <= tgt || lm > end_pc) return {};             // merge must be forward, in-stream
+                if (lm <= tgt || lm > end_pc) return reject();       // merge must be forward, in-stream
                 F.has_else = true; F.sb_pc = sb.pc; F.merge_pc = lm;
                 break;
             }
         }
         out.push_back(F);
     }
-    // Pass 2: every s_branch in the stream must be a claimed else-arm terminator — any other
-    // unconditional branch is control flow this structurizer doesn't model.
+    // Pass 2: every s_branch in the stream must be a claimed else-arm terminator or a loop back-edge —
+    // any other unconditional branch is control flow this structurizer doesn't model.
     for (const auto& in : ins) {
         if (in.is_end) break;
         if (in.fmt != Rdna2Format::SOPP || in.opcode != 0x02) continue;
+        if (loop_backedge(in.pc)) continue;
         bool claimed = false;
         for (const auto& F : out) if (F.has_else && F.sb_pc == in.pc) { claimed = true; break; }
-        if (!claimed) return {};
+        if (!claimed) return reject();
     }
     // Structural nesting check (branches are already in pc order): each region must lie entirely
     // inside the innermost still-open region, or start after it closed. A region spans to its merge
-    // (if/else) or target (plain if). EXCEPTION (the shared-outer-merge cascade): an if/else whose
-    // merge_pc escapes the innermost open region is accepted here and re-validated during emission
-    // (emit_structured requires the escaping merge to equal the enclosing merge chain's continuation,
-    // i.e. no instructions are skipped) — a violation rejects the shader there, fail-visible.
+    // (if/else) or target (plain if); a LOOP is an opaque region [header_pc, exit_pc) that must nest
+    // strictly. EXCEPTION (the shared-outer-merge cascade): an if/else whose merge_pc escapes the
+    // innermost open region is accepted here and re-validated during emission (emit_structured
+    // requires the escaping merge to equal the enclosing merge chain's continuation, i.e. no
+    // instructions are skipped) — a violation rejects the shader there, fail-visible.
     std::vector<uint32_t> open;
-    for (const auto& F : out) {
-        uint32_t span_end = F.has_else ? F.merge_pc : F.target_pc;
-        while (!open.empty() && open.back() <= F.branch_pc) open.pop_back();
-        if (!open.empty() && span_end > open.back()) {
-            if (!F.has_else) return {};                  // plain if escaping its region: not a tree
-            span_end = open.back();                      // cascade if/else: clamped to the enclosing
-        }                                                // region for nesting purposes (see above)
-        open.push_back(span_end);
+    {
+        size_t fi = 0, li = 0;
+        const size_t nl = loops ? loops->size() : 0;
+        while (fi < out.size() || li < nl) {
+            const bool take_loop = li < nl &&
+                (fi >= out.size() || (*loops)[li].header_pc < out[fi].branch_pc);
+            const uint32_t start = take_loop ? (*loops)[li].header_pc : out[fi].branch_pc;
+            uint32_t span_end    = take_loop ? (*loops)[li].exit_pc
+                                 : (out[fi].has_else ? out[fi].merge_pc : out[fi].target_pc);
+            const bool clampable = !take_loop && out[fi].has_else;
+            while (!open.empty() && open.back() <= start) open.pop_back();
+            if (!open.empty() && span_end > open.back()) {
+                if (!clampable) return reject();         // plain if / loop escaping its region: not a tree
+                span_end = open.back();                  // cascade if/else: clamped to the enclosing
+            }                                            // region for nesting purposes (see above)
+            open.push_back(span_end);
+            if (take_loop) li++; else fi++;
+        }
     }
     return out;
 }
@@ -1470,8 +1637,11 @@ void loop_written_regs(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t 
             case Rdna2Format::VOP1:
                 if (in.opcode == 0x02) sregs.insert(in.dst.value);        // v_readfirstlane -> SGPR
                 else vregs.insert(in.dst.value); break;
-            case Rdna2Format::VOP2: case Rdna2Format::VOP3: case Rdna2Format::VOP3P:
+            case Rdna2Format::VOP2: case Rdna2Format::VOP3P:
                 vregs.insert(in.dst.value); break;
+            case Rdna2Format::VOP3:
+                if (in.opcode == 0x360) sregs.insert(in.dst.value);       // v_readlane -> SGPR
+                else vregs.insert(in.dst.value); break;                   // (writelane: slots, not SSA)
             case Rdna2Format::DS:                                          // ds_read writes one VGPR
                 if (in.opcode == 0x36) vregs.insert(in.dst.value); break;
             case Rdna2Format::MUBUF: {                                     // load_format/load: N consecutive VGPRs
@@ -1503,7 +1673,10 @@ void loop_written_regs(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t 
 // garbage (#134); now it rejects, matching the SDWA/DPP reject-rather-than-miscompute discipline.
 uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, const Operand& o, bool* ok = nullptr) {
     switch (o.kind) {
-        case OperandKind::VGPR: { auto it = rs.vreg.find(o.value); return it == rs.vreg.end() ? b.uconst(0) : it->second; }
+        case OperandKind::VGPR: {
+            // A scalar-spill vgpr (v_writelane slots) has no per-lane data value — reject, don't read 0.
+            if (rs.vgpr_lane_slots.count(o.value)) { if (ok) *ok = false; return b.uconst(0); }
+            auto it = rs.vreg.find(o.value); return it == rs.vreg.end() ? b.uconst(0) : it->second; }
         case OperandKind::SGPR: { auto it = rs.sreg.find(o.value); return it == rs.sreg.end() ? b.uconst(0) : it->second; }
         case OperandKind::InlineInt:   return b.uconst((uint32_t)o.value);
         case OperandKind::InlineFloat: return b.uconst(fbits(inline_float_value((uint32_t)o.value)));
@@ -1597,7 +1770,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     } else {                                // s_mov_b64 sDST, <mask-or-data> : save a mask / copy a pair
                         uint32_t m = src_mask(in.src[0]);
                         if (m) { rs.sreg_bool[in.dst.value] = m;
-                                 rs.sreg_bool_narrowed[in.dst.value] = is_exec(in.src[0]) ? rs.exec_narrowed : saved_narrowed(in.src[0]); }
+                                 rs.sreg_bool_narrowed[in.dst.value] = is_exec(in.src[0]) ? rs.exec_narrowed : saved_narrowed(in.src[0]);
+                                 // A move INTO VCC is a VCC write (DOLL's scalar-indexed unroll does
+                                 // `s_mov_b64 vcc, s[4:5]` before its vccz break, #273): the branch reads
+                                 // rs.vcc, so it must be updated too — sreg_bool[106] alone left the
+                                 // branch on a stale VCC. (The SOP2 mask ops already special-case 106.)
+                                 if (in.dst.value == 106) rs.vcc = m; }
                         // s_mov_b64 ALSO moves a plain 64-bit VALUE (a descriptor pair, a scratch pair,
                         // an inline constant) — compilers use it to shuffle T#/V# halves and constants,
                         // not just wave masks. Copy the data SSA + descriptor provenance (sreg_srt) for
@@ -2128,6 +2306,31 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             return true;
         }
         case Rdna2Format::VOP3: {
+            // SCALAR-SPILL lane slots (#273): v_writelane_b32 (0x361) / v_readlane_b32 (0x360) with a
+            // COMPILE-TIME lane index — the pack-scalars-into-a-VGPR's-lanes idiom (DOLL's big post PS
+            // spills 19 s_buffer_load results into v36 and reads them back). Per-invocation each
+            // (vgpr, lane) is a named wave-uniform scalar; a dynamic lane index (a real cross-lane
+            // read) still rejects. Neither op is EXEC-predicated on hardware, so no predicate_write.
+            // VERIFIED(round-trip llvm-mc gfx1030: 0xd761 v_writelane_b32 / 0xd760 v_readlane_b32).
+            if (in.opcode == 0x361) {                                 // v_writelane_b32 vDST, sSRC, lane
+                if (in.src[1].kind != OperandKind::InlineInt || in.src[1].value < 0 || in.src[1].value > 63) {
+                    ok = false; return true;
+                }
+                rs.vgpr_lane_slots[in.dst.value][in.src[1].value] = val(in.src[0]);
+                return true;
+            }
+            if (in.opcode == 0x360) {                                 // v_readlane_b32 sDST, vSRC, lane
+                if (in.src[1].kind != OperandKind::InlineInt || in.src[1].value < 0 || in.src[1].value > 63) {
+                    ok = false; return true;
+                }
+                auto vit = rs.vgpr_lane_slots.find(in.src[0].value);
+                if (vit == rs.vgpr_lane_slots.end()) { ok = false; return true; }   // not a spill array
+                auto sit = vit->second.find(in.src[1].value);
+                if (sit == vit->second.end()) { ok = false; return true; }          // slot never written
+                rs.sreg[in.dst.value] = sit->second;   // dst field is the SGPR number (like readfirstlane)
+                rs.sreg_srt.erase(in.dst.value);
+                return true;
+            }
             uint32_t old_d = vreg_old(b, rs, in.dst.value);
             // Float source with its VOP3 modifiers applied: OpFAbs then OpFNegate (hardware order neg(abs(x))).
             // Returns raw bits (fbin/fext re-bitcast), so it's a drop-in for val() in the FLOAT ops only —
@@ -2507,7 +2710,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (!res) { auto it = rs.sreg_srt.find(in.src[1].value);
                         if (it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second); }
                 }
-                if (!res) { ok = false; return true; }
+                if (!res) {
+                    if (getenv("PROSPER_DBG")) {   // which provenance step failed for this format load
+                        auto it = rs.sreg_srt.find(in.src[1].value);
+                        fprintf(stderr, "[mubuf-unresolved] pc=%u srsrc=s%d srt_tag=%s0x%x key_res=%s (%zu res)\n",
+                                in.pc, in.src[1].value, it != rs.sreg_srt.end() ? "" : "NONE ",
+                                it != rs.sreg_srt.end() ? it->second : 0u,
+                                it != rs.sreg_srt.end() && rt->by_srt_offset(it->second) ? "yes" : "null",
+                                rt->resources.size());
+                    }
+                    ok = false; return true;
+                }
                 binding = res->binding;
                 stride = res->stride;
                 fmt = res->format;
@@ -2554,7 +2767,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case DataFormat::Snorm16: norm = 32767.0f; break;
                 default: break;
             }
-            if (packed && !is_half && !is_uint && !is_sint && norm == 0.0f) { ok = false; return true; }
+            if (packed && !is_half && !is_uint && !is_sint && norm == 0.0f) {
+                if (getenv("PROSPER_DBG"))
+                    fprintf(stderr, "[mubuf-badfmt] pc=%u fmt=%u comp_bytes=%u stride=%u n=%u\n",
+                            in.pc, (unsigned)fmt, comp_bytes, stride, n);
+                ok = false; return true;
+            }
             // Packed (sub-dword) components are extracted at STATIC byte offsets relative to a
             // DWORD-ALIGNED element base — the low 2 bits of the address (addr&3) are dropped by the
             // addr>>2 dword index and never folded into the bit extraction (#150). That is only correct
@@ -2581,7 +2799,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     base_aligned = ((offset & 3u) == 0) && !offen &&
                                    (!idxen || (stride & 3u) == 0) && soff_zero;
                 }
-                if (!base_aligned) { ok = false; return true; }
+                if (!base_aligned) {
+                    if (getenv("PROSPER_DBG"))
+                        fprintf(stderr, "[mubuf-unaligned] pc=%u fmt=%u off=%u offen=%d idxen=%d stride=%u\n",
+                                in.pc, (unsigned)fmt, offset, (int)offen, (int)idxen, stride);
+                    ok = false; return true;
+                }
             }
             // Byte address of the element (#148): idxen -> a VADDR VGPR is an element index (×stride);
             // offen -> a per-lane byte offset; both terms ADD; when idxen AND offen are set VADDR is TWO
@@ -2677,6 +2900,29 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             { auto it = rs.sreg_srt.find(in.src[1].value);
               if (it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second);
               if (!res) res = rt->by_sgpr_base(in.src[1].value); }
+            // PER-USE pc provenance fallback (#273 — DOLL's title-composite image_sample_b): the
+            // executor's const-fold walk snapshots the T# each image op consumes and keys it by the
+            // INSTRUCTION pc (ShaderResource::fetch_pc). Used when the key/SGPR chains found nothing,
+            // or found a NON-image resource — the load-immediate key model collides when two different
+            // tables reuse one immediate (a key-0 EUD sharp vs the key-0 table T# here).
+            if (!res || (res->cls != ResourceClass::Texture && res->cls != ResourceClass::StorageImage)) {
+                if (const ShaderResource* pr = rt->by_fetch_pc(in.pc);
+                    pr && (pr->cls == ResourceClass::Texture || pr->cls == ResourceClass::StorageImage))
+                    res = pr;
+            }
+            if ((!res || (res->cls != ResourceClass::Texture && res->cls != ResourceClass::StorageImage))
+                && getenv("PROSPER_DBG")) {
+                // Resolution-failure diagnostic: which provenance step failed for this image op.
+                auto it = rs.sreg_srt.find(in.src[1].value);
+                const ShaderResource* pk = it != rs.sreg_srt.end() ? rt->by_srt_offset(it->second) : nullptr;
+                const ShaderResource* pp = rt->by_fetch_pc(in.pc);
+                fprintf(stderr, "[mimg-unresolved] pc=%u srsrc=s%d srt_tag=%s0x%x key_res=%s pc_res=%s (%zu res)\n",
+                        in.pc, in.src[1].value, it != rs.sreg_srt.end() ? "" : "NONE ",
+                        it != rs.sreg_srt.end() ? it->second : 0u,
+                        pk ? (pk->cls == ResourceClass::Texture ? "tex" : "other-cls") : "null",
+                        pp ? (pp->cls == ResourceClass::Texture ? "tex" : "other-cls") : "null",
+                        rt->resources.size());
+            }
             if (!res) { ok = false; return true; }
 
             // --- Storage-image path: image_load (0x00) / image_store (0x08), no sampler, any dim ---
@@ -3065,7 +3311,24 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         }
         // 7. Post-loop body.
         if (!emit_range(L.exit_pc, UINT32_MAX)) return false;
-    } else if (const std::vector<ForwardIf> Fs = detect_forward_ifs(ins, /*allow_vcc*/!b.is_compute, code, dwords, &safe); !Fs.empty()) {
+    } else if (std::vector<DivLoop> Ls; true) {
+        // DIVERGENT execz-exit loops (#273) + structured uniform/divergent IFs. Loops are detected
+        // for the per-invocation stages only (fragment/vertex — the compute shell keeps its
+        // wave-level VCC/EXEC contract); each is emitted as a real structured SPIR-V loop
+        // (OpLoopMerge + header OpPhi per carried register/mask) whose per-lane condition is THIS
+        // lane's EXEC bool after the header's exec recompute. The IF machinery is unchanged and
+        // recurses INTO loop bodies (their nested forward-execz regions).
+        if (!b.is_compute) Ls = detect_divergent_loops(ins, safe);
+        bool cf_rejected = false;
+        const std::vector<ForwardIf> Fs = detect_forward_ifs(ins, /*allow_vcc*/!b.is_compute, code, dwords, &safe,
+                                                             Ls.empty() ? nullptr : &Ls, &cf_rejected);
+        if (cf_rejected) Ls.clear();   // unmodeled CF somewhere: fall through to straight-line (loud reject)
+        if (Fs.empty() && Ls.empty()) {
+            wave_ok = true;   // straight-line: barriers are wave-uniform, so cross-lane mbcnt is safe here
+            if (!emit_range(0, UINT32_MAX)) return false;   // loop-free: straight-line, unchanged behavior
+            (void)safe_branches;
+            return true;
+        }
         // Structured uniform IFs (forward s_cbranch_scc*/vcc*), possibly SEQUENTIAL and/or NESTED
         // (detect_forward_ifs verified the region tree). Each if emits as OpSelectionMerge +
         // OpBranchConditional on the SCC/VCC bool, with an OpPhi per register written in the
@@ -3077,6 +3340,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         auto vget = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
         auto sget = [&](int r){ auto it = rs.sreg.find(r); return it == rs.sreg.end() ? b.uconst(0) : it->second; };
         size_t bi = 0;   // next unconsumed branch in Fs (pc order; recursion consumes nested ones)
+        size_t li = 0;   // next unconsumed loop in Ls (pc order)
         // `cont` = the pc control flows to after `hi` — the enclosing construct's merge chain. An
         // if/else whose merge ESCAPES the current region (the shared-outer-merge cascade) is legal
         // only when it targets exactly this continuation (no skipped instructions); anything else
@@ -3084,10 +3348,100 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // may enter/leave with EXEC narrowed — EXEC is phi'd across the merge like any other value.
         // CONFIDENCE: MED — per-invocation lowering of wave-level branches; spirv-val + exec-diff
         // kernels + the live-boot A/B gate it.
-        std::function<bool(uint32_t, uint32_t, uint32_t)> emit_structured =
+        std::function<bool(uint32_t, uint32_t, uint32_t)> emit_structured;
+        // Emit one DIVERGENT execz-exit loop (#273) as a structured SPIR-V loop. Same block shape as
+        // the counted-loop path (hdr -> chk -> body -> cont -> hdr, exit chk->merge) with three
+        // differences: (1) the loop condition is THIS lane's EXEC bool after the header's exec
+        // recompute (v_cmpx / s_andn2 exec) — continue while set, exit at execz; (2) the body is
+        // emitted RECURSIVELY (nested forward-execz if regions live inside it); (3) per-lane MASKS
+        // (VCC/EXEC/saved sreg_bool pairs) are loop-carried too, so each gets a header phi. At the
+        // merge, a register written in the condition region keeps its exit-iteration (chk) value —
+        // it dominates the merge — while body-written state takes the header phi (its value when the
+        // exiting check ran); masks CREATED inside the loop are dropped at the merge (an SSA id from
+        // inside the body does not dominate it — a later read then rejects loudly instead of
+        // emitting invalid SPIR-V). CONFIDENCE: MED (per-invocation lowering of a wave-level loop;
+        // spirv-val + execution kernels + the live-boot A/B gate it).
+        std::function<bool(const DivLoop&)> emit_divloop = [&](const DivLoop& L) -> bool {
+            std::set<int> cv, cs, condv, conds;
+            loop_written_regs(ins, L.header_pc, L.backedge_pc, cv, cs);
+            loop_written_regs(ins, L.header_pc, L.exit_branch_pc, condv, conds);
+            const uint32_t preheader = b.cur_block;
+            const uint32_t hdr = b.id(), chk = b.id(), body = b.id(), cont = b.id(), merge = b.id();
+            b.emit_branch(hdr); b.emit_label(hdr);
+            struct PhiRec { int reg; int dom; uint32_t phi; size_t patch; };  // dom: 0=vreg,1=sreg,2=scc,3=vcc,4=exec,5=mask
+            std::vector<PhiRec> phis;
+            for (int r : cv) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, vget(r), preheader, p); rs.vreg[r] = ph; phis.push_back({r, 0, ph, p}); }
+            for (int r : cs) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, sget(r), preheader, p); rs.sreg[r] = ph; phis.push_back({r, 1, ph, p}); }
+            { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.scc, preheader, p); rs.scc = ph; phis.push_back({0, 2, ph, p}); }
+            { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.vcc, preheader, p); rs.vcc = ph; phis.push_back({0, 3, ph, p}); }
+            { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.exec, preheader, p); rs.exec = ph; phis.push_back({0, 4, ph, p}); }
+            std::vector<int> mask_keys;                        // saved masks live at entry: loop-carried bools
+            for (auto& kv : rs.sreg_bool) mask_keys.push_back(kv.first);
+            std::sort(mask_keys.begin(), mask_keys.end());     // deterministic emission order
+            for (int k : mask_keys) { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.sreg_bool[k], preheader, p); rs.sreg_bool[k] = ph; phis.push_back({k, 5, ph, p}); }
+            b.emit_loopmerge(merge, cont); b.emit_branch(chk); b.emit_label(chk);
+            // Inside the loop EXEC is the per-lane loop condition — vector writes must predicate.
+            rs.exec_narrowed = true;
+            // Condition region [header, exit_branch): branch-free (validated), straight-line.
+            if (!emit_range(L.header_pc, L.exit_branch_pc)) return false;
+            // chk-end snapshots: the exit path flows THROUGH this block, so these dominate the merge.
+            std::unordered_map<int, uint32_t> condv_val, conds_val;
+            for (int r : condv) condv_val[r] = vget(r);
+            for (int r : conds) conds_val[r] = sget(r);
+            const uint32_t exec_chk = rs.exec, vcc_chk = rs.vcc, scc_chk = rs.scc;
+            const std::unordered_map<int, uint32_t> bool_chk = rs.sreg_bool;
+            b.emit_condbranch(rs.exec, body, merge);           // execz exit: continue while EXEC bit set
+            while (idx < ins.size() && ins[idx].pc < L.exit_branch_pc) ++idx;
+            if (idx < ins.size() && ins[idx].pc == L.exit_branch_pc) ++idx;   // consume the exit branch
+            b.emit_label(body);
+            // Body (recursive: nested if regions + breaks); ends just before the back-edge.
+            if (!emit_structured(L.exit_branch_pc + 1, L.backedge_pc, L.backedge_pc)) return false;
+            if (idx < ins.size() && ins[idx].pc == L.backedge_pc) ++idx;      // consume the back-edge
+            b.emit_branch(cont); b.emit_label(cont);
+            for (auto& pr : phis) {
+                uint32_t nv = pr.dom == 0 ? vget(pr.reg)
+                            : pr.dom == 1 ? sget(pr.reg)
+                            : pr.dom == 2 ? rs.scc
+                            : pr.dom == 3 ? rs.vcc
+                            : pr.dom == 4 ? rs.exec
+                            : (rs.sreg_bool.count(pr.reg) ? rs.sreg_bool[pr.reg] : pr.phi);
+                b.patch_phi(pr.patch, nv, cont);
+            }
+            b.emit_branch(hdr);
+            b.emit_label(merge);
+            for (auto& pr : phis) {
+                if (pr.dom == 0)      rs.vreg[pr.reg] = condv.count(pr.reg) ? condv_val[pr.reg] : pr.phi;
+                else if (pr.dom == 1) rs.sreg[pr.reg] = conds.count(pr.reg) ? conds_val[pr.reg] : pr.phi;
+                else if (pr.dom == 2) rs.scc = scc_chk;    // flags/masks: the chk (exit-iteration) value
+                else if (pr.dom == 3) rs.vcc = vcc_chk;    // dominates the merge and is exact (the phi is
+                else if (pr.dom == 4) rs.exec = exec_chk;  // the pre-recompute value)
+                else { auto itc = bool_chk.find(pr.reg);
+                       rs.sreg_bool[pr.reg] = itc != bool_chk.end() ? itc->second : pr.phi; }
+            }
+            // Masks CREATED inside the loop: their ids do not dominate the merge — drop them.
+            for (auto it = rs.sreg_bool.begin(); it != rs.sreg_bool.end();) {
+                if (!std::binary_search(mask_keys.begin(), mask_keys.end(), it->first)) {
+                    rs.sreg_bool_narrowed.erase(it->first);
+                    it = rs.sreg_bool.erase(it);
+                } else ++it;
+            }
+            // Post-loop, this lane's EXEC bool is the (false) chk value until the compiled restore
+            // (`s_mov_b64 exec, <saved>`) — keep writes predicated.
+            rs.exec_narrowed = true;
+            return true;
+        };
+        emit_structured =
             [&](uint32_t lo, uint32_t hi, uint32_t cont) -> bool {
             for (;;) {
                 const uint32_t next_br = (bi < Fs.size() && Fs[bi].branch_pc < hi) ? Fs[bi].branch_pc : hi;
+                const uint32_t next_lp = (li < Ls.size() && Ls[li].header_pc < hi) ? Ls[li].header_pc : hi;
+                if (next_lp < next_br) {                     // a loop begins before the next if
+                    if (!emit_range(lo, next_lp)) return false;
+                    const DivLoop& L = Ls[li++];
+                    if (!emit_divloop(L)) return false;
+                    lo = L.exit_pc;
+                    continue;
+                }
                 if (!emit_range(lo, next_br)) return false;
                 if (next_br == hi) return true;
                 const ForwardIf F = Fs[bi++];
@@ -3189,9 +3543,6 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             }
         };
         if (!emit_structured(0, UINT32_MAX, UINT32_MAX)) return false;
-    } else {
-        wave_ok = true;   // straight-line: barriers are wave-uniform, so cross-lane mbcnt is safe here
-        if (!emit_range(0, UINT32_MAX)) return false;   // loop-free: straight-line, unchanged behavior
     }
     (void)safe_branches;
     return true;

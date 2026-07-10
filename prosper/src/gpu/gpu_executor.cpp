@@ -289,12 +289,21 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
             }
             case Rdna2Format::MIMG: {
                 // Descriptor-table use (#294): an image op's SRSRC (src[1]) is an 8-dword T#; if it was
-                // snapshotted from a keyed table load, report it as a Texture use — with the paired
-                // SSAMP (src[2]) S# when that 4-dword load also resolved. VGPR-only dest: no SGPR state.
+                // snapshotted from a table load, report it as a Texture use — with the paired SSAMP
+                // (src[2]) S# when that 4-dword load also resolved. VGPR-only dest: no SGPR state.
+                // Key-less snapshots (register-SOFFSET loads) are reported too (#273): the use carries
+                // its instruction pc, which the recompiler resolves via ShaderResource::fetch_pc when
+                // the immediate-key model fails or collides.
                 if (srt_uses) {
                     auto tit = descr8.find(in.src[1].value); auto kit = descr8_key.find(in.src[1].value);
-                    if (tit != descr8.end() && kit != descr8_key.end() && kit->second != 0xFFFFFFFFu) {
-                        SrtUse u; u.kind = 0; u.key = kit->second; u.t8 = tit->second;
+                    if (trc) fprintf(stderr, "[dyntrace] MIMG pc=%u srsrc=s%d ssamp=s%d have_t8=%d key=0x%x t8[0]=0x%x\n",
+                                     in.pc, in.src[1].value, in.src[2].value, tit != descr8.end(),
+                                     kit != descr8_key.end() ? kit->second : 0xEEEEEEEEu,
+                                     tit != descr8.end() ? tit->second[0] : 0u);
+                    if (tit != descr8.end()) {
+                        SrtUse u; u.kind = 0; u.t8 = tit->second;
+                        u.key = kit != descr8_key.end() ? kit->second : 0xFFFFFFFFu;
+                        u.use_pc = in.pc;
                         auto sit = descr.find(in.src[2].value);
                         if (sit != descr.end()) { u.has_samp = true; u.s4 = sit->second; }
                         srt_uses->push_back(u);
@@ -303,6 +312,19 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 break;
             }
             case Rdna2Format::MUBUF: {
+                // Descriptor-table V# use (#273 — the title post-chain PSes' per-lane structured-buffer
+                // fetches): a buffer_load_format_* / buffer_load_dword* whose SRSRC V# was s_loaded from
+                // a keyed table slot. Report it as a kind-1 (buffer) use so the consuming instruction
+                // resolves via its sreg_srt tag -> by_srt_offset — the same key model the s_buffer_loads
+                // use. (The VS vertex-fetch path below is unchanged: by_fetch_pc still wins there.)
+                if (srt_uses && (in.opcode <= 3 || (in.opcode >= 0x0C && in.opcode <= 0x0F))) {
+                    int srsrc = in.src[1].value;
+                    auto dit = descr.find(srsrc); auto kit = descr_key.find(srsrc);
+                    if (dit != descr.end() && kit != descr_key.end() && kit->second != 0xFFFFFFFFu) {
+                        SrtUse u; u.kind = 1; u.key = kit->second; u.v4 = dit->second;
+                        srt_uses->push_back(u);
+                    }
+                }
                 // buffer_load_format_* (vertex fetch): opcodes 0..3. Resolve the SRSRC (src[1]) SGPR to the
                 // V# most-recently loaded into it.
                 if (in.opcode <= 3) {
@@ -586,11 +608,16 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
         {
             std::set<uint64_t> srt_seen;
             for (const auto& u : srt_uses) {
-                uint64_t dk = ((uint64_t)(uint32_t)u.kind << 32) | u.key;
+                // Dedupe: a cbuf use per key (the s_buffer_load resolves by key); a texture use per
+                // CONSUMING INSTRUCTION (#273 — several image ops may share one key, or have none).
+                // Distinct namespaces: kind-0 pc keys must never collide with kind-1 byte-offset keys.
+                uint64_t dk = u.kind == 0 ? (0x8000000000000000ull | u.use_pc)
+                                          : ((uint64_t)(uint32_t)u.kind << 32) | u.key;
                 if (!srt_seen.insert(dk).second) continue;
-                bool clash = false;
-                for (const auto& r0 : t.resources) if (r0.srt_offset == u.key) { clash = true; break; }
-                if (clash) continue;
+                bool clash = u.key == 0xFFFFFFFFu;       // key-less: never resolvable by srt_offset
+                if (!clash)
+                    for (const auto& r0 : t.resources) if (r0.srt_offset == u.key) { clash = true; break; }
+                if (u.kind == 1 && clash) continue;      // ambiguous cbuf key: keep the existing resource
                 if (u.kind == 1) {                       // constant buffer (V#)
                     DecodedBufferDescriptor d = decode_buffer_descriptor(u.v4.data());
                     if (d.base <= 0x10000 || d.size_bytes == 0 || d.size_bytes > 0x10000000u) continue;
@@ -604,8 +631,27 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     t.resources.push_back(r);
                 } else {                                  // texture (T# [+ paired S#])
                     DecodedImageDescriptor d = decode_image_descriptor(u.t8.data());
+                    if (g_dyntrace_force)
+                        fprintf(stderr, "[dynfail] tex use pc=%u key=0x%x base=0x%llx %ux%u fmt=%u tile=%u\n",
+                                u.use_pc, u.key, (unsigned long long)d.base, d.width, d.height,
+                                d.format, d.tile_mode);
                     if (d.base == 0 || d.width == 0 || d.height == 0 ||
                         d.width > 16384 || d.height > 16384) continue;       // garbage/degenerate T#
+                    // A previous use already produced a resource for this SAME surface (same T# base +
+                    // extent): don't duplicate the binding/upload — just give it this use's pc
+                    // provenance if it has none yet (#273). Uses with a valid unclashed key still
+                    // resolve by key regardless.
+                    {
+                        bool piggybacked = false;
+                        for (auto& r0 : t.resources)
+                            if (r0.cls == ResourceClass::Texture && r0.gpu_addr == d.base &&
+                                r0.width == d.width && r0.height == d.height) {
+                                if (r0.fetch_pc == 0xFFFFFFFFu) r0.fetch_pc = u.use_pc;
+                                piggybacked = true;
+                                break;
+                            }
+                        if (piggybacked) continue;
+                    }
                     Gen5ImageFormatInfo fi;
                     if (!gen5_image_format(d.format, &fi)) {
                         // Same unmapped-format policy as build_shader_resources: bind as RGBA8 only
@@ -627,7 +673,8 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     r.swizzle[2] = d.dst_sel[2]; r.swizzle[3] = d.dst_sel[3];
                     r.size = is_bcn ? (((d.width + 3) / 4) * ((d.height + 3) / 4) * fi.bytes_per_block)
                                     : (d.width * d.height * fi.bytes_per_block);
-                    r.srt_offset = u.key;
+                    r.srt_offset = clash ? 0xFFFFFFFFu : u.key;   // ambiguous/absent key: pc-only provenance
+                    r.fetch_pc   = u.use_pc;                       // per-instruction provenance (#273)
                     if (u.has_samp) {                     // paired S# (same SQ_IMG_SAMP decode as the sharp path)
                         const uint32_t* sm = u.s4.data();
                         r.mag_filter  = ((sm[2] >> 20) & 0x3u) ? 1u : 0u;
