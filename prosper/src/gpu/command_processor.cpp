@@ -345,6 +345,7 @@ struct PendQueue {
 };
 PendQueue& pend_q() { static PendQueue* p = new PendQueue; return *p; }
 void apply_effect(const Pm4Command& c);   // fwd (defined with the WAIT_DEFER machinery below)
+void apply_deferred_effect(const Pm4Command& c);   // fwd: apply_effect + a guest_readable guard (#449)
 // Drain returns only when every pending write has LANDED — including one a concurrent drainer
 // popped and is mid-applying (the in-flight window). Without that wait, a caller could observe an
 // empty queue and proceed to apply a LATER same-address write (a released #312 gated item) that
@@ -356,7 +357,12 @@ void pend_drain_locked(PendQueue& p, std::unique_lock<std::mutex>& lk) {
             p.q.pop_front();
             p.inflight++;
             lk.unlock();                 // the write itself never needs the queue lock
-            apply_effect(w.cmd);
+            // Guard the target's mappedness (#449): the pend queue applies completion writes ~1 ms after
+            // enqueue (the pipe-drain window), during which the guest may have freed+decommitted the
+            // label page (MallocBinned3, #312). apply_deferred_effect probes guest_readable before the
+            // raw memcpy — without it an unmapped label SIGSEGVs here, exactly the case the deferred-
+            // stream path already survives (this pend path releases asynchronously too, so it needs it).
+            apply_deferred_effect(w.cmd);
             lk.lock();
             p.inflight--;
             if (p.inflight == 0) p.cv.notify_all();
