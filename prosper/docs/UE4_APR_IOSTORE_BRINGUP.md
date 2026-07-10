@@ -1140,3 +1140,75 @@ this fix, and is the next wall. **Messenger UNREGRESSED** (mandatory — shared 
 real scene (vcount=1044, 643×), 1015 frames presented, **0 faults**, 0 DrawIndexOffset (never uses the
 new path — the change is purely additive for it). ctest **63/63**. Probes added: flow232{,b,c}.py,
 thr232.py, frame232.sh, findstr232.sh, rostr2.sh, got232.sh, call232.sh, xref232.sh, smoke_msg232.sh.
+
+### REFRAMED (2026-07-10, issue #282): DOLL's noise is NOT unresolved descriptors — the descriptors resolve; the wall is 64KB-tile-mode texture DETILING (SW_64KB_S / SW_64KB_R_X)
+
+Issue #282 was scoped as "T#/S#/V# descriptors don't resolve (pointer-chained EUD/SRT) → draws bind
+garbage → noise." A full live investigation on `fix/issue-282-eud-descriptors` (the branch that already
+carries #232 draw builders + #273 recompiler + #276 EUD descriptors + #278 submit-race) shows that
+**premise is now largely obsolete**: DOLL's descriptors ALREADY resolve to real resources. What remains
+is a **texture-tiling** problem, one layer below descriptor resolution.
+
+**Evidence — descriptors resolve (PROSPER_GFXLOG `[restab]`/`[t#]`/`[dynvb]`, full 300 s boot):**
+- **Constant buffers** decode to real guest addresses + sizes (e.g. `cls=0 binding=34 addr=0x1280e74220
+  size=720`, matrices readable).
+- **Textures (T#)** decode to real dims + real Gen5 IMG_FMTs: `fmt=170` (BC1_SRGB), `fmt=175` (BC4),
+  `fmt=182` (BC7_SRGB), `fmt=71` (Float16×4), `fmt=13` (Float16), at real sizes (512×256, 1024×1024,
+  2048×2048, 1920×1080, …) with plausible bases in the `0x20xxxxxxxx` texture heap.
+- **Vertex buffers** resolve via the existing dynamic-fetch const-fold (`resolve_dynamic_fetch`) across a
+  healthy range: `num_records` = 6, 8, 96, 200, 887, … up to **49992 / 50000** (real UE4 scene streams),
+  stride 4/8/12/32/40. The fetch chain (`s_load_dwordx4` from a user-data-SGPR table pointer) is followed
+  correctly. So the "pointer-chained V# unresolved" hypothesis does not hold for the current branch.
+
+**Evidence — the noise is tiled textures read as linear (frame BMP, `PROSPER_DUMP_CONTENT`):** a captured
+content frame (3840×2160) is a full-screen **repeating RGB block-weave** with a few black rectangles — the
+textbook signature of a GPU-tiled surface sampled as if linear (geometry lands in the right screen regions;
+the *texel content* is scrambled). It is NOT scattered geometry (positions are fine) and NOT a black frame
+(draws execute + sample).
+
+**Root cause — the detiler only knows SW_4KB_S (tile_mode 5); DOLL's textures are 64KB-tiled.**
+`prosper::gpu::tile_mode_is_tiled` (src/gpu/tile.cpp) returns true ONLY for `tile_mode == 5`
+(`TileMode::Sw4KbS`, the one mode The Messenger uses). Tile-mode histogram over a full DOLL boot
+(`[t#] tile_mode=` counts):
+
+| tile_mode | GFX10 swizzle          | count  | detiled? |
+|-----------|------------------------|--------|----------|
+| 0         | LINEAR                 | 11861  | n/a (linear) |
+| 27        | SW_64KB_R_X (RT)       | 10665  | **NO → noise** |
+| 9         | SW_64KB_S (standard)   |  9118  | **NO → noise** |
+| 1         | SW_256B_S              |   780  | NO |
+| 5         | SW_4KB_S               |   767  | yes |
+| 24        | SW_64KB_Z_X (depth)    |   321  | NO |
+
+So ~58% of DOLL's sampled textures use the two unhandled 64KB modes (9 and 27), and every one of them is
+memcpy'd as linear → scrambled → the composite is noise. Mode 27 (SW_64KB_R_X) is the render-target
+swizzle (the fullscreen post/deferred composites); mode 9 (SW_64KB_S) is regular material textures
+(BC1/BC4/BC7).
+
+**Derivation attempt (offline, coherence scoring) — 64KB_S is NOT a flat x/y bit-interleave.** Added a
+gated diagnostic `PROSPER_DUMP_TILERAW` (src/gpu/agc_shader_layout.cpp) that dumps a tiled texture's raw
+guest texel bytes at T#-decode time (fires every draw's stage build, so it captures textures even on the
+intermittent boots whose content never reaches the render backend — 75 textures captured in one 120 s
+run). For a 512×256 BC1 (exactly one 64KB tile = 128×64 blocks × 8 B) and a content-rich 512×512 BC1
+(2 stacked tiles), a brute-force over all 1716 order-preserving interleavings of the 7 X-bits + 6 Y-bits,
+scored by decoded-image local coherence (Σ|Δ neighbour|, low = smooth), found **no decisive winner**: the
+best candidate improves coherence only ~4% over row-major and, rendered, is **still noise** (only the
+top-left micro-tile is roughly coherent). Conclusion: unlike SW_4KB_S — which this codebase models well
+enough with a flat Morton (`sw4kb_morton`) — **SW_64KB_S/_R_X need the real GFX10 addrlib swizzle equation**
+(256 B micro-tile hierarchy + the "S"/"R_X" macro pattern; "_X" adds a pipe/bank XOR), not a bit-interleave.
+Kyty is **not** a reference here (it is GCN/PS4 tiling, per CLAUDE.md). This is a bounded but genuine
+graphics-RE task, tracked as **#288**; shipping a guessed detiler would violate correctness-first
+(it would produce different-but-still-wrong pixels).
+
+**Also observed (separate wall, downstream): ~6120 draws/run `recompile failed`, ALL vertex-shader**, with
+coverage `first_bad fmt=5(SMEM) op=0x2(s_load_dwordx4)` — but that coverage is computed with `rt=nullptr`
+(a static probe), so it flags the register-offset descriptor load that the *real* path (`rt != null`)
+no-ops; the true drops are the remaining unsupported RDNA2 ops (`unsupported=2..14` in the same coverage).
+That is the **recompiler frontier (#273 continuation)**, not descriptor resolution — those draws are
+*dropped*, so they subtract geometry but do not create the noise.
+
+**Net for #282:** the descriptor-resolution work it asked for is effectively already done; the real work is
+split to (a) **#288 — 64KB tile-mode detiling** (the noise) and (b) **#273 — recompiler frontier** (dropped
+draws). New diagnostic landed: `PROSPER_DUMP_TILERAW` (reusable for the #288 derivation). Messenger
+unaffected (mode 5 only; the diagnostic is gated + additive). CONFIDENCE: HIGH on the reframing (live
+frame + tile-mode histogram + descriptor dumps); the detiler itself is deliberately NOT shipped.
