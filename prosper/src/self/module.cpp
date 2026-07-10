@@ -10,6 +10,13 @@ namespace prosper {
 template<class T> static T rd(const std::vector<uint8_t>& b, size_t off) {
     T v{}; if (off + sizeof(T) <= b.size()) memcpy(&v, b.data() + off, sizeof(T)); return v;
 }
+// The SCE self-segment id (the phdr index a data segment maps to) is bits [31:20] of the segment
+// flags — 12 bits; higher bits hold other block/property info and MUST be masked off. Without the
+// mask, a data segment with any flag bit >= 32 keys the data-segment map by a garbage index, so every
+// phdr lookup misses and every segment silently falls back to `elf_base + p_offset` (mapping garbage
+// bytes — the fatal-but-silent failure the load() comment warns about). Matches Kyty Elf.cpp:270. #339
+uint64_t self_segment_key(uint64_t flags) { return (flags >> 20) & 0xFFFu; }
+
 static int b64val(const std::string& s) {
     static const char* B = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-";
     int v = 0; for (char c : s) { const char* p = strchr(B, c); if (!p) return -1; v = v * 64 + (int)(p - B); }
@@ -74,7 +81,7 @@ std::optional<Module> Module::load(const std::string& path, std::string* err) {
     if (sh.magic == 0x1D3D154F || sh.magic == 0xEEF51454) {
         for (int i = 0; i < sh.num_segments; i++) {
             auto s = rd<SelfSegment>(m.file, 0x20 + i * sizeof(SelfSegment));
-            if (s.flags & 0x800) data_seg[s.flags >> 20] = s;
+            if (s.flags & 0x800) data_seg[self_segment_key(s.flags)] = s;
         }
         m.elf_base = 0x20 + (size_t)sh.num_segments * sizeof(SelfSegment);
     }
