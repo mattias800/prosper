@@ -153,6 +153,11 @@ HLE(s_np_getonlineid) { svc_log("sceNpGetOnlineId", a0,a1,a2,a3,a4,a5); return N
 // existed (a garbage ~40-byte SceNpId), pushing it onto online/entitlement branches that dead-end. This
 // was a direct hole in the #306 signed-out fix (the sibling getters below were done, this one wasn't).
 HLE(s_np_getnpid)     { svc_log("sceNpGetNpId", a0,a1,a2,a3,a4,a5); return NP_ERR_SIGNED_OUT; }
+// sceNpCheckNpAvailability / ...A / CheckNpReachability: an honest signed-out console. Were MISSING -> the
+// return-0 stub answered "PSN is available", pushing the guest onto online branches that then wait forever
+// (the #306 wedge class). NOTE: the async poll/request pairing (sceNpPollAsync / CreateAsyncRequest) is
+// deliberately left for a follow-up -- its exact completion flow needs a live PROSPER_SVCLOG capture.
+HLE(s_np_check_avail) { svc_log("sceNpCheckNpAvailability", a0,a1,a2,a3,a4,a5); return NP_ERR_SIGNED_OUT; }
 
 // --- mouse (report a device that exists but has no input; pad -> hle_pad.cpp real backend) ---
 HLE(s_open)           { return g_handle++; }                                 // sceMouseOpen -> handle
@@ -990,6 +995,9 @@ void register_service_hle() {
     R("sceNpGetAccountCountryA", s_np_country);
     Hle::register_fn("XDncXQIJUSk", (HleFn)s_np_getonlineid, "sceNpGetOnlineId");
     Hle::register_fn("p-o74CnoNzY", (HleFn)s_np_getnpid,   "sceNpGetNpId");       // was MISSING -> faked identity
+    Hle::register_fn("2rsFmlGWleQ", (HleFn)s_np_check_avail, "sceNpCheckNpAvailability");   // was MISSING -> faked "available"
+    Hle::register_fn("8Z2Jc5GvGDI", (HleFn)s_np_check_avail, "sceNpCheckNpAvailabilityA");
+    Hle::register_fn("KfGZg2y73oM", (HleFn)s_np_check_avail, "sceNpCheckNpReachability");
     Hle::register_fn("a8R9-75u4iM", (HleFn)s_np_accountid, "sceNpGetAccountId");  // non-A variant: zero id + SIGNED_OUT
     R("sceNpRegisterStateCallback", s_ok);
 #ifndef _WIN32
@@ -1017,6 +1025,7 @@ void register_service_hle() {
     Hle::register_fn("XTWR0UXvcgs", (HleFn)s_appcontent_no_entitlement, "sceAppContentGetEntitlementKey");
     Hle::register_fn("VANhIWcqYak", (HleFn)s_appcontent_no_entitlement, "sceAppContentAddcontMount");
     R("sceCommonDialogInitialize", s_ok);
+    R("sceCommonDialogIsUsed", s_ok);   // 0 = not in use (our dialogs auto-dismiss) - intentional, not an unimpl log
     R("sceSystemServiceParamGetInt", s_syss_param_int);   // language-aware (US English default), not blanket 0
     // sceSystemServiceParamGetString (SsC-m-S9JTA): write a valid empty string (not an unfilled buffer).
     Hle::register_fn("SsC-m-S9JTA", (HleFn)s_param_string, "sceSystemServiceParamGetString");
