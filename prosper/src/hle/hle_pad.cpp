@@ -156,8 +156,11 @@ HLE(pad_get_info) {
 }
 
 // scePadDeviceClassGetExtendedInformation(handle, out*) -> 0. Report a zeroed extended-info block
-// (standard device class, no extra capabilities). Conservative 0x20 write to avoid overrun.
-HLE(pad_ext_info) { if (a1) memset(PW(a1), 0, 0x20); return 0; }
+// (standard device class, no extra capabilities). OrbisPadDeviceClassExtendedInformation is exactly
+// 20 bytes (0x14): deviceClass(4) + reserved[4](4) + a 12-byte classData union (shadPS4 pad.h). Writing
+// 0x20 overran a guest-stack-allocated struct by 12 bytes → stack-canary smash (the #283 class); write
+// only the real 0x14 (under-writing is safe, over-writing is not — same lesson as pad_parse below).
+HLE(pad_ext_info) { if (a1) memset(PW(a1), 0, 0x14); return 0; }
 
 // scePadDeviceClassParseData(handle, const OrbisPadData* in, OrbisPadDeviceClassData* out) -> 0.
 // Parses a raw device-class HID report (steering wheels, guitars, etc.) into a structured form. A
