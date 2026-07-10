@@ -2799,6 +2799,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // Format of the fetched components. Untyped buffer_load_dword* is raw 32-bit (comp_bytes=4);
             // buffer_load_format_* takes the format from the resolved V# descriptor.
             DataFormat fmt = DataFormat::Uint32;   // untyped default: raw dwords
+            uint32_t fmt_ncomp = 0;    // the V#'s real component count (format loads only); 0 = don't default-fill
             bool dyn_vfetch = false;   // set when the V# came from by_fetch_pc — a const-folded per-vertex
                                        // attribute fetch, whose element address is exactly gl_VertexIndex*stride.
             if (is_format) {
@@ -2842,6 +2843,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 binding = res->binding;
                 stride = res->stride;
                 fmt = res->format;
+                fmt_ncomp = res->num_components;   // for the format default-fill below (#368)
             } else if (rt) {
                 // RAW (untyped) MUBUF with a resource table: resolve SRSRC (src[1]) exactly like the
                 // format path — a raw buffer op targets whatever buffer its V# describes, NOT a fixed
@@ -2995,11 +2997,24 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 return true;
             }
+            // Integer-typed format? Its absent-component default for W/A is integer 1, not float 1.0.
+            const bool fmt_is_int = (fmt == DataFormat::Uint8  || fmt == DataFormat::Uint16 || fmt == DataFormat::Uint32 ||
+                                     fmt == DataFormat::Sint8  || fmt == DataFormat::Sint16 || fmt == DataFormat::Sint32);
             for (uint32_t k = 0; k < n; k++) {
                 int d = in.dst.value + (int)k;
                 uint32_t old = vreg_old(b, rs, d);
                 uint32_t value;
-                if (!packed) {
+                // Format default-fill (#368): BUFFER_LOAD_FORMAT_* returns only the components the V#'s
+                // format defines; a component the OPCODE requests beyond that (e.g. _xyzw against a
+                // 32_32_32 position, or _xyz against a 32_32 UV) is filled with the standard vector
+                // default — 0 for G/B/Z, 1 for A/W — NOT read from adjacent memory (which yielded the
+                // next vertex's bytes, or robust-0 at the buffer tail, so a vec4 read of a vec3 attribute
+                // got W = garbage/0 instead of 1.0 -> broken transforms). Only for format loads with a
+                // known component count; untyped raw MUBUF loads keep every opcode component.
+                if (is_format && fmt_ncomp && k >= fmt_ncomp) {
+                    uint32_t one = fmt_is_int ? 1u : 0x3f800000u;   // integer 1 vs float 1.0 (raw bits)
+                    value = b.uconst(k == 3 ? one : 0u);            // W/A -> 1, G/B/Z -> 0
+                } else if (!packed) {
                     uint32_t kidx = k ? b.ibin(Op_IAdd, idx, b.uconst(k)) : idx;
                     value = b.cbuf_load(kidx, binding);                  // raw 32-bit component
                 } else if (dyn_half) {
