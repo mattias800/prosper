@@ -33,7 +33,10 @@ namespace { struct RttSurf { std::vector<uint8_t> rgba; uint32_t w = 0, h = 0; }
 void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
     static std::atomic<int> frame_no{0};
     static std::unordered_map<uint64_t, RttSurf> g_rtt;   // render-to-texture cache (#167)
-    static const bool rtt_on = getenv("PROSPER_RTT") != nullptr;
+    // PROSPER_RTT_PERTARGET renders each distinct CB_COLOR0_BASE into its OWN framebuffer (below) and
+    // implies RTT injection — a group can only sample an earlier group if the injection path is live.
+    static const bool pertarget = getenv("PROSPER_RTT_PERTARGET") != nullptr;
+    static const bool rtt_on = getenv("PROSPER_RTT") != nullptr || pertarget;
     prosper::gpu::set_submit_renderer(
         [frame_dir, dump_bmps](const std::vector<prosper::gpu::DrawItem>& items, uint32_t w, uint32_t h) -> std::vector<uint8_t> {
             using RC = prosper::gpu::ResourceClass;
@@ -292,37 +295,74 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 }
             }
             const bool nops = getenv("PROSPER_RENDER_NOPS");
-            // Assemble the backend draws — one per realized DrawItem, each with its own resources +
-            // fixed-function state (or the diagnostic overrides above). render_draws_rgba composites
-            // them into ONE framebuffer.
-            std::vector<prosper::test::BackendDraw> bds;
-            for (const auto& it : items) {
-                prosper::test::BackendDraw bd;
-                bd.vs     = refvs ? refvs_spv : it.vs;
-                bd.fs     = ps_override.empty() ? it.fs : ps_override;
-                bd.vcount = refvs ? 3u : it.vertex_count;
-                bd.ps     = nops ? nullptr : &it.ps;
-                bd.R      = build_R(it.vrt.get(), it.prt.get());
-                // Indexed draw: hand the executor-fetched index data to the backend (vkCmdDrawIndexed).
-                // Skipped under REFVS — the reference VS is a 3-vertex non-indexed fullscreen triangle.
-                if (!refvs) bd.indices = it.indices;
-                if (getenv("PROSPER_GFXLOG")) fprintf(stderr,
-                    "[render] item %zu: %zu resources vcount=%u nidx=%zu topo=%u mask=0x%x blend=%d\n",
-                    bds.size(), bd.R.size(), bd.vcount, bd.indices.size(), it.ps.topology,
-                    it.ps.color_write_mask, (int)it.ps.blend_enable);
-                bds.push_back(std::move(bd));
-            }
-            std::vector<uint8_t> px = prosper::test::render_draws_rgba(bds, w, h);
-            // RTT (#167): cache these rendered pixels under this submit's render-target base, so a later
-            // composite pass that samples that address gets the scene we drew (not empty guest memory).
-            if (rtt_on && !px.empty()) {
-                uint64_t tgt = 0;
-                for (const auto& it : items) if (it.color0_base) { tgt = it.color0_base; break; }
-                if (tgt) { RttSurf& s = g_rtt[tgt]; s.rgba = px; s.w = w; s.h = h; }
-                if (getenv("PROSPER_RTTLOG")) { size_t nz=0; for(size_t i=0;i<px.size();i++) nz+=(px[i]!=0);
-                    fprintf(stderr, "[rtt] store target=0x%llx (%zu items, color0s:", (unsigned long long)tgt, items.size());
-                    for (const auto& it : items) fprintf(stderr, " 0x%llx", (unsigned long long)it.color0_base);
-                    fprintf(stderr, ") px_nonzero=%zu cache_size=%zu\n", nz, g_rtt.size()); }
+            // Assemble backend draws for a subset of the submit's items — one BackendDraw per realized
+            // DrawItem with its own resources + fixed-function state (or the diagnostic overrides above).
+            // build_R reads the CURRENT g_rtt, so calling this AFTER an earlier target-group has been
+            // rendered+stored lets the later group sample that group's pixels (a HIT, not empty memory).
+            auto build_bds = [&](const std::vector<const prosper::gpu::DrawItem*>& group) {
+                std::vector<prosper::test::BackendDraw> bds;
+                for (const auto* itp : group) {
+                    const auto& it = *itp;
+                    prosper::test::BackendDraw bd;
+                    bd.vs     = refvs ? refvs_spv : it.vs;
+                    bd.fs     = ps_override.empty() ? it.fs : ps_override;
+                    bd.vcount = refvs ? 3u : it.vertex_count;
+                    bd.ps     = nops ? nullptr : &it.ps;
+                    bd.R      = build_R(it.vrt.get(), it.prt.get());
+                    // Indexed draw: hand the executor-fetched index data to the backend (vkCmdDrawIndexed).
+                    // Skipped under REFVS — the reference VS is a 3-vertex non-indexed fullscreen triangle.
+                    if (!refvs) bd.indices = it.indices;
+                    if (getenv("PROSPER_GFXLOG")) fprintf(stderr,
+                        "[render] item %zu: %zu resources vcount=%u nidx=%zu topo=%u mask=0x%x blend=%d\n",
+                        bds.size(), bd.R.size(), bd.vcount, bd.indices.size(), it.ps.topology,
+                        it.ps.color_write_mask, (int)it.ps.blend_enable);
+                    bds.push_back(std::move(bd));
+                }
+                return bds;
+            };
+            std::vector<uint8_t> px;
+            if (pertarget) {
+                // PER-TARGET RTT: a real frame is a sequence of passes, each rendering into a specific
+                // color target (CB_COLOR0_BASE), and a final composite pass SAMPLES the earlier targets.
+                // The single-framebuffer path below flattens ALL draws into one image and caches it under
+                // only the FIRST item's base — so a draw that targets a different base never gets cached
+                // under its OWN address, and a later composite that samples that address misses -> black.
+                // Here we group items by color0_base (first-appearance order), render each group into its
+                // own framebuffer, and cache each under its base. Because groups render in order and
+                // build_bds re-reads g_rtt, a composite group that samples a scene group rendered earlier
+                // THIS submit now hits — closing the intra-submit multi-pass gap (and cross-submit too,
+                // since g_rtt persists). The final (last) group's pixels — the composite — are presented.
+                std::vector<uint64_t> order;                                            // distinct bases, in order
+                std::unordered_map<uint64_t, std::vector<const prosper::gpu::DrawItem*>> groups;
+                for (const auto& it : items) {
+                    uint64_t k = it.color0_base;                                        // 0 => no declared target
+                    if (groups.find(k) == groups.end()) order.push_back(k);
+                    groups[k].push_back(&it);
+                }
+                for (uint64_t base : order) {
+                    std::vector<uint8_t> gpx = prosper::test::render_draws_rgba(build_bds(groups[base]), w, h);
+                    if (base && !gpx.empty()) { RttSurf& s = g_rtt[base]; s.rgba = gpx; s.w = w; s.h = h; }
+                    if (getenv("PROSPER_RTTLOG")) { size_t nz=0; for (uint8_t b : gpx) nz += (b != 0);
+                        fprintf(stderr, "[rtt] group target=0x%llx (%zu draws) px_nonzero=%zu cache_size=%zu\n",
+                                (unsigned long long)base, groups[base].size(), nz, g_rtt.size()); }
+                    if (!gpx.empty()) px = std::move(gpx);                              // present the last non-empty group
+                }
+            } else {
+                // Single-framebuffer path: render_draws_rgba composites every draw into ONE framebuffer.
+                std::vector<const prosper::gpu::DrawItem*> all; all.reserve(items.size());
+                for (const auto& it : items) all.push_back(&it);
+                px = prosper::test::render_draws_rgba(build_bds(all), w, h);
+                // RTT (#167): cache these rendered pixels under this submit's render-target base, so a later
+                // composite pass that samples that address gets the scene we drew (not empty guest memory).
+                if (rtt_on && !px.empty()) {
+                    uint64_t tgt = 0;
+                    for (const auto& it : items) if (it.color0_base) { tgt = it.color0_base; break; }
+                    if (tgt) { RttSurf& s = g_rtt[tgt]; s.rgba = px; s.w = w; s.h = h; }
+                    if (getenv("PROSPER_RTTLOG")) { size_t nz=0; for(size_t i=0;i<px.size();i++) nz+=(px[i]!=0);
+                        fprintf(stderr, "[rtt] store target=0x%llx (%zu items, color0s:", (unsigned long long)tgt, items.size());
+                        for (const auto& it : items) fprintf(stderr, " 0x%llx", (unsigned long long)it.color0_base);
+                        fprintf(stderr, ") px_nonzero=%zu cache_size=%zu\n", nz, g_rtt.size()); }
+                }
             }
             int n = frame_no++;
             if (px.empty()) {
