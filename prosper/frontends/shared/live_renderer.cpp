@@ -167,6 +167,19 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             fprintf(stderr, "[render] dumped raw texture -> %s\n", fn); fflush(stderr);
                         }
                         fr.tex_rgba = texstore.back().data(); fr.tw = tw; fr.th = th;
+                        // Propagate the decoded S# sampler state + T# DST_SEL swizzle onto the frame
+                        // resource (#369). Without this every live texture falls back to the
+                        // FrameResource defaults (LINEAR + clamp-to-edge + identity swizzle), which
+                        // blurs point-sampled pixel-art, ignores the game's real wrap modes, and drops
+                        // channel remaps (e.g. an alpha-only mask or BGRA surface). The S# fields were
+                        // decoded upstream in shader_resources but never reached the backend sampler.
+                        fr.mag_filter = r.mag_filter; fr.min_filter = r.min_filter; fr.mip_filter = r.mip_filter;
+                        fr.addr_uvw[0] = r.addr_uvw[0]; fr.addr_uvw[1] = r.addr_uvw[1]; fr.addr_uvw[2] = r.addr_uvw[2];
+                        fr.border_color_type = r.border_color_type;
+                        fr.min_lod = r.min_lod; fr.max_lod = r.max_lod; fr.lod_bias = r.lod_bias;
+                        fr.max_aniso_ratio = r.max_aniso_ratio;
+                        fr.swizzle[0] = r.swizzle[0]; fr.swizzle[1] = r.swizzle[1];
+                        fr.swizzle[2] = r.swizzle[2]; fr.swizzle[3] = r.swizzle[3];
                     } else {
                         uint32_t nb = std::min(r.size ? r.size : 256u, 1u << 20) & ~3u;   // cap 1 MB, dword-aligned
                         if (nb >= 4) {
