@@ -92,10 +92,14 @@ void decode_operands(Rdna2Inst& i) {
                 i.n_src = 2;
                 // SDWAB: bit15 = SD (write the SDST SGPR pair instead of VCC), bits[14:8] = SDST index.
                 if ((sd >> 15) & 1u) i.dst = sgpr((sd >> 8) & 0x7Fu);
-                // VOPC SDWA has NO dst_sel/clamp/omod (byte1 holds SDST/SD, not a VGPR dst_sel); trivial
-                // iff both source selects are DWORD and no source modifiers.
+                // VOPC SDWA has NO dst_sel/clamp/omod (byte1 holds SDST/SD, not a VGPR dst_sel). Source
+                // float modifiers src0 neg@20/abs@21, src1 neg@28/abs@29 are read + applied by the
+                // recompiler (like VOP2/VOP3 — DOLL: `v_cmp_gt_f32_sdwa vcc_lo, |v5|, s4`); trivial iff
+                // both source selects are DWORD and no SEXT(19/27)/reserved(22/30) bits.
+                i.src_neg[0] = ((sd >> 20) & 1u) != 0; i.src_abs[0] = ((sd >> 21) & 1u) != 0;
+                i.src_neg[1] = ((sd >> 28) & 1u) != 0; i.src_abs[1] = ((sd >> 29) & 1u) != 0;
                 if (((sd >> 16) & 7u) == 6u && ((sd >> 24) & 7u) == 6u &&
-                    !((sd >> 19) & 0xFu) && !((sd >> 27) & 0xFu))
+                    !((sd >> 19) & 0x9u) && !((sd >> 27) & 0x9u))
                     i.has_modifier = false;
             } else { i.src[0] = decode_src_field(w & 0x1FFu); i.src[1] = vgpr(w >> 9); i.n_src = 2; }
             break;
