@@ -117,6 +117,39 @@ int main(int argc, char** argv) {
     { const uint32_t c[] = {0x7E0202FFu,0x80000000u,0xD56A0002u,0x00020301u,0x7E000D02u,0xBF810000u};
       dump(dir, "compute_mul_hi", recompile_valu(c, sizeof(c)/4, 1, 0)); }
 
+    // --- #273 additions (DOLL recompiler frontier) ---
+    // Fragment: 3D image_load (integer LUT fetch through the combined sampler; OpImage+OpImageFetch).
+    { const uint32_t c[] = {0x7e000280u,0x7e020280u,0x7e040280u,0xf0001f10u,0x00020000u,
+                            0xf800000fu,0x03020100u,0xbf810000u};
+      ShaderResourceTable rt; ShaderResource t{}; t.cls=ResourceClass::Texture; t.binding=4; t.img_dim=2;
+      t.width=16; t.height=16; t.sgpr_base=8; rt.resources.push_back(t);
+      dump(dir, "fragment_load_3d", recompile_fragment(c, sizeof(c)/4, &rt)); }
+    // Fragment: image_sample_lz_o (packed texel offset folded into normalized coords; ImageQuery).
+    { const uint32_t c[] = {0x7e0002ffu,0x00000101u,0x7e0202f0u,0x7e0402f0u,0xf0dc0f08u,0x00820000u,
+                            0xf800000fu,0x03020100u,0xbf810000u};
+      ShaderResourceTable rt; ShaderResource t{}; t.cls=ResourceClass::Texture; t.binding=4; t.img_dim=1;
+      t.width=2; t.height=2; t.sgpr_base=8; rt.resources.push_back(t);
+      dump(dir, "fragment_sample_lz_o", recompile_fragment(c, sizeof(c)/4, &rt)); }
+    // Fragment: image_gather4_lz_o (dynamic gather offset; ImageGatherExtended — locks the operand-ID fix).
+    { const uint32_t c[] = {0x7e0002ffu,0x00000101u,0x7e0202f0u,0x7e0402f0u,0xf15c0808u,0x00820400u,
+                            0xf800000fu,0x07060504u,0xbf810000u};
+      ShaderResourceTable rt; ShaderResource t{}; t.cls=ResourceClass::Texture; t.binding=4; t.img_dim=1;
+      t.width=2; t.height=2; t.sgpr_base=8; rt.resources.push_back(t);
+      dump(dir, "fragment_gather4_lz_o", recompile_fragment(c, sizeof(c)/4, &rt)); }
+    // Compute: if/else-if/else cascade with common-merge s_branch arms (kernel T17's stream).
+    { const uint32_t c[] = {0x7e020f00u,0x7e080501u,0xbf0a8204u,0xbf840002u,0x4a02028au,0xbf820005u,
+                            0xbf0a8504u,0xbf840002u,0x4a020294u,0xbf820001u,0x4a02029eu,0x7e000d01u,0xbf810000u};
+      dump(dir, "compute_cascade_ifelse", recompile_valu(c, sizeof(c)/4, 1, 0)); }
+    // Compute: readfirstlane waterfall + v_movrels (kernel T19's stream).
+    { const uint32_t c[] = {0x7e020f00u,0xbe86047eu,0x7e0402ffu,0x40a00000u,0x7e0602ffu,0x40e00000u,
+                            0x7e0802ffu,0x41100000u,0x7e080501u,0x7da40204u,0xbefc0304u,0x7e0a8702u,
+                            0x8a867e06u,0xbefe0406u,0xbf85fff9u,0xbefe04c1u,0x7e000305u,0xbf810000u};
+      dump(dir, "compute_waterfall_movrels", recompile_valu(c, sizeof(c)/4, 1, 0)); }
+    // Fragment: divergent execz region (v_cmpx + s_cbranch_execz over a scalar-writing block).
+    { const uint32_t c[] = {0x7e020280u,0x7e0002f2u,0x7c2200f0u,0xbf880002u,0xbe8503f2u,0x7e020205u,
+                            0x7e040205u,0xf800180fu,0x01010101u,0xbf810000u};
+      dump(dir, "fragment_execz_if", recompile_fragment(c, sizeof(c)/4, nullptr)); }
+
     if (fails) { printf("== FAIL: %d shader(s) failed recompile/validation ==\n", fails); return 1; }
     printf("== PASS%s ==\n", have_val ? " (all modules pass spirv-val)" : " (recompiled; spirv-val not found)");
     return 0;
