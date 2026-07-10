@@ -392,9 +392,21 @@ HLE(f_lseek) { if (fdlog_on() && ((int)a2 != SEEK_CUR || a1 != 0)) preadlog("lse
 #ifndef _WIN32
 HLE(f_pread)  { preadlog("pread", a0, a3, a2); return (uint64_t)read_full((int)a0, P(a1), (size_t)a2, true, (off_t)a3); }
 HLE(f_pwrite) { return (uint64_t)write_full((int)a0, P(a1), (size_t)a2, true, (off_t)a3); }
+// Vectored IO — OrbisKernelIovec == host iovec { void* iov_base; size_t iov_len }, and guest pointers are
+// identity-mapped, so the guest iovec array and its buffers pass straight to host (p)readv/(p)writev.
+// These were MISSING -> the return-0 stub read as "0 bytes" (silent EOF for readv/preadv) / "0 written",
+// a corruption trap for any module that uses them (e.g. UE4's IO stack).
+HLE(f_readv)  { return (uint64_t)(int64_t)::readv((int)a0, (const struct iovec*)P(a1), (int)a2); }
+HLE(f_writev) { return (uint64_t)(int64_t)::writev((int)a0, (const struct iovec*)P(a1), (int)a2); }
+HLE(f_preadv) { return (uint64_t)(int64_t)::preadv((int)a0, (const struct iovec*)P(a1), (int)a2, (off_t)a3); }
+HLE(f_pwritev){ return (uint64_t)(int64_t)::pwritev((int)a0, (const struct iovec*)P(a1), (int)a2, (off_t)a3); }
 #else
 HLE(f_pread)  { return (uint64_t)-1; }
 HLE(f_pwrite) { return (uint64_t)-1; }
+HLE(f_readv)  { return (uint64_t)-1; }
+HLE(f_writev) { return (uint64_t)-1; }
+HLE(f_preadv) { return (uint64_t)-1; }
+HLE(f_pwritev){ return (uint64_t)-1; }
 #endif
 
 // sceKernelFtruncate(fd, length): resize an open file. Was MISSING -> the return-0 stub faked success
@@ -544,8 +556,18 @@ HLE(f_getdents) {
     }
     return (uint64_t)w;
 }
+// sceKernelGetdirentries(fd, buf, nbytes, long* basep): like getdents but also writes the pre-call
+// directory offset to *basep. Was MISSING -> returned 0 = "empty directory". Delegate to f_getdents and
+// stamp basep with the cursor position captured before the read.
+HLE(f_getdirentries) {
+    off_t base = ::lseek((int)a0, 0, SEEK_CUR);
+    uint64_t r = f_getdents(a0, a1, a2, 0, 0, 0);
+    if (a3) *(int64_t*)P(a3) = (int64_t)base;
+    return r;
+}
 #else
 HLE(f_getdents) { return 0; }
+HLE(f_getdirentries) { return 0; }
 #endif
 HLE(f_unlink){ std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::
 #ifdef _WIN32
@@ -1109,6 +1131,12 @@ void register_file_hle() {
     R("unlink", f_unlink);        R("sceKernelUnlink", f_unlink);
     R("rename", f_rename);        R("sceKernelRename", f_rename);   // real move (was fake-success -> lost atomic saves)
     R("sceKernelGetdents", f_getdents); R("getdents", f_getdents);
+    // vectored IO + getdirentries — real host ops (were MISSING -> silent-EOF / empty-dir corruption trap)
+    R("sceKernelReadv", f_readv);       R("readv", f_readv);
+    R("sceKernelWritev", f_writev);     R("writev", f_writev);
+    R("sceKernelPreadv", f_preadv);     R("preadv", f_preadv);
+    R("sceKernelPwritev", f_pwritev);   R("pwritev", f_pwritev);
+    R("sceKernelGetdirentries", f_getdirentries); R("getdirentries", f_getdirentries);
     // sceKernelAio* (issue #312): NIDs verified identical in shadPS4's PS4 registration table and
     // the PS5 3.20 libkernel stub dump. Raw-NID registration (names not in our NidDb).
     Hle::register_fn("vYU8P9Td2Zo", (HleFn)k_aio_init,         "sceKernelAioInitializeImpl");
