@@ -25,6 +25,12 @@
 #include <atomic>
 #include <chrono>
 
+#ifndef _WIN32
+// #312 label-slot write watch (exec_image_linux.cpp). Weak: tools that link the AGC HLE without
+// the Linux host exec image simply skip the arm.
+extern "C" void prosper_arm_label_watch(uint64_t addr) __attribute__((weak));
+#endif
+
 namespace prosper {
 
 #define HLE(name) static uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
@@ -320,6 +326,40 @@ HLE(agc_cb_release_mem) {  // sceAgcCbReleaseMem(buf, action, gcr_cntl, dst, cac
         fprintf(stderr, "[agc] ReleaseMem action=0x%llx dst=0x%llx addr=0x%llx data_sel=0x%llx data=0x%llx\n",
             (unsigned long long)a1,(unsigned long long)a3,(unsigned long long)a5,
             (unsigned long long)data_sel,(unsigned long long)data);
+    // #312 attribution probe: the heap-corrupting writes are 32-bit value-1 fences into 0x20-
+    // stride label arrays. Log each DISTINCT guest callsite that builds one (first eboot-range
+    // return address on the stack), so the owning guest subsystem can be disassembled. Bounded.
+    if (data_sel == 1 && data == 1) {
+#ifndef _WIN32
+        // #312 label watch (PROSPER_WATCH_LABEL=1): watch the first heap-resident fence label's
+        // block for the game's allocator free-path writing over it while cbs still signal it.
+        if (prosper_arm_label_watch && a5 >= 0x1000000000ull && a5 < 0x1200000000ull)
+            prosper_arm_label_watch(a5);
+#endif
+        static std::atomic<int> seen_n{0};
+        static uint64_t seen_ra[16];
+        uint64_t ra = 0, ra2 = 0, ra3 = 0;
+        for (int i = 1; i < 96; i++) {
+            uint64_t v = fp[i];
+            if (v >= 0x400000000ull && v < 0x4c0000000ull) {
+                if (!ra) ra = v; else if (!ra2) ra2 = v; else { ra3 = v; break; }
+            }
+        }
+        uint64_t key = ra2 ? ra2 : ra;
+        if (key) {
+            bool logged = false;
+            int n = seen_n.load();
+            for (int i = 0; i < n && i < 16; i++) if (seen_ra[i] == key) { logged = true; break; }
+            if (!logged && n < 16) {
+                seen_ra[seen_n.fetch_add(1) & 15] = key;
+                fprintf(stderr, "[agc] fence1-builder ra=eboot+0x%llx ra2=eboot+0x%llx ra3=eboot+0x%llx addr=0x%llx action=0x%llx\n",
+                        (unsigned long long)(ra - 0x400000000ull),
+                        (unsigned long long)(ra2 ? ra2 - 0x400000000ull : 0),
+                        (unsigned long long)(ra3 ? ra3 - 0x400000000ull : 0),
+                        (unsigned long long)a5, (unsigned long long)a1);
+            }
+        }
+    }
     // EOP fence: stash the label address (a5), the data_sel, the full 64-bit value, and the event action
     // into the packet so the CommandProcessor performs the completion write at SUBMIT time (correct
     // end-of-pipe timing — our GPU folds synchronously, so submit == pipe drain). CONFIDENCE: HIGH — the
@@ -834,10 +874,15 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
     constexpr uint32_t kUnknownCap = 0x80000;   // 512 KiB of dwords — well past any real Dcb
     uint32_t walk = dw_num ? dw_num : kUnknownCap;
     std::lock_guard<std::mutex> lk(g_agc_state_mu);   // serialize with the other submit entry (#278)
+    // #312: flush any earlier stream paused on a WAIT_REG_MEM — this submit may be its producer.
+    for (int i = gpu::flush_deferred_streams(); i > 0; i--) prosper_eq_trigger_eop();
     agc_gpu_state().draws.clear();
     size_t applied = gpu::run_command_buffer(addr, walk, agc_gpu_state());
     g_submit_count++;
-    prosper_eq_trigger_eop();
+    // A fold that PAUSED on an unsatisfied wait has not completed — its EOP pulse fires when its
+    // deferred effects flush (one pulse per completed stream, owed by flush_deferred_streams).
+    if (!gpu::last_fold_deferred()) prosper_eq_trigger_eop();
+    for (int i = gpu::flush_deferred_streams(); i > 0; i--) prosper_eq_trigger_eop();
     static const unsigned render_every2 = [] {
         const char* e = getenv("PROSPER_RENDER_EVERY"); long v = e ? atol(e) : 1; return v > 0 ? (unsigned)v : 1u; }();
     static unsigned draw_submits2 = 0;
@@ -846,6 +891,7 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
         static const uint32_t scale = [] {
             const char* e = getenv("PROSPER_RENDER_SCALE"); long v = e ? atol(e) : 1; return v > 0 ? (uint32_t)v : 1u; }();
         if (scale > 1) { w = (w / scale) & ~1u; h = (h / scale) & ~1u; if (!w) w = 2; if (!h) h = 2; }
+        prosper_gpu_drain_completion_writes();   // renderer reads WRITE_DATA-uploaded guest memory (#312)
         if (gpu::execute_and_present(agc_gpu_state(), w, h)) g_presents_cum++;
     }
     if (getenv("PROSPER_GFXLOG"))
@@ -937,12 +983,16 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     // must NOT accumulate — otherwise it grows unbounded and every later frame re-renders stale geometry.
     // Clearing here (not after) keeps this submit's draws inspectable once the handler returns. (Ported
     // from PRs #31/#32.)
+    // #312: flush any earlier stream paused on a WAIT_REG_MEM — this submit may be its producer.
+    for (int i = gpu::flush_deferred_streams(); i > 0; i--) prosper_eq_trigger_eop();
     agc_gpu_state().draws.clear();
     size_t applied = gpu::run_command_buffer(p->addr, p->dw_num, agc_gpu_state());
     g_submit_count++;
     // The submit has "completed" (synchronous fold): fire any registered GPU EOP events. Inert unless the
     // game called sceGnmAddEqEvent (b0xyllnVY-I); the RELEASE_MEM label write already happened in apply().
-    prosper_eq_trigger_eop();
+    // #312: a fold that PAUSED on an unsatisfied wait has not completed — its pulse fires at flush.
+    if (!gpu::last_fold_deferred()) prosper_eq_trigger_eop();
+    for (int i = gpu::flush_deferred_streams(); i > 0; i--) prosper_eq_trigger_eop();
     // Stage A: if a live renderer has been registered (runtime binary wires a Vulkan device) and this
     // submit accumulated draws, execute the folded GpuState and present the frame. Inert (returns false)
     // on the pure-HLE path until a device is registered, so it never perturbs the existing boot behavior.
@@ -963,6 +1013,7 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
         static const uint32_t scale = [] {
             const char* e = getenv("PROSPER_RENDER_SCALE"); long v = e ? atol(e) : 1; return v > 0 ? (uint32_t)v : 1u; }();
         if (scale > 1) { w = (w / scale) & ~1u; h = (h / scale) & ~1u; if (!w) w = 2; if (!h) h = 2; }
+        prosper_gpu_drain_completion_writes();   // renderer reads WRITE_DATA-uploaded guest memory (#312)
         bool presented = gpu::execute_and_present(agc_gpu_state(), w, h);
         if (presented) g_presents_cum++;
         if (presented && getenv("PROSPER_GFXLOG"))

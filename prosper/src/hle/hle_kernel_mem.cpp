@@ -981,6 +981,11 @@ HLE(k_batch_map) {
         uint64_t len   = *(const uint64_t*)(e + 0x10);
         uint8_t  prot  = e[0x18];
         int32_t  op    = *(const int32_t*)(e + 0x1c);
+        // Per-entry phys trace (#312 alias hunt): log map/unmap WITH the phys offset so an offline
+        // pass can prove/disprove two live VAs aliasing one phys range through the shared memfd.
+        MLOG("bm op=%d va=0x%llx phys=0x%llx len=0x%llx prot=0x%x\n",
+             op, (unsigned long long)start, (unsigned long long)phys,
+             (unsigned long long)len, prot);
         bool ok = true;
         switch (op) {
             case 0: {                               // MAP_DIRECT: phys-backed (aliasing preserved)

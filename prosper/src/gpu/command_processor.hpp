@@ -87,4 +87,22 @@ private:
 // Decode `dwords` dwords at `buf` and apply every op to `st`. Returns the number of packets applied.
 size_t run_command_buffer(const uint32_t* buf, size_t dwords, GpuState& st);
 
+// WAIT_REG_MEM queue-pause support (issue #312 — see the block comment in command_processor.cpp).
+// last_fold_deferred(): the most recent run_command_buffer hit an unsatisfied wait, so its
+// remaining memory effects (and its EOP equeue pulse) are pending in the deferred FIFO.
+// flush_deferred_streams(): re-check the FIFO (call at every submit, under the same submit mutex
+// as run_command_buffer); returns how many deferred streams COMPLETED — the caller owes one EOP
+// equeue pulse per completed stream.
+bool last_fold_deferred();
+int  flush_deferred_streams();
+
+} // namespace prosper::gpu
+
+// Apply every pending pipe-drain completion write NOW, in submission order (#312 — see the
+// deferred-completion-write block in command_processor.cpp). Callable from C (the EOP-event
+// worker in hle_kernel_time.cpp binds it weakly).
+extern "C" void prosper_gpu_drain_completion_writes();
+
+namespace prosper::gpu {
+
 } // namespace prosper::gpu
