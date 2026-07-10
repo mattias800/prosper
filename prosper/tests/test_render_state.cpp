@@ -105,6 +105,10 @@ int main() {
     CHECK(vk_topology(rs.prim_type) == VkTopology::TriangleList, "prim_type 4 -> VK TriangleList");
     CHECK(vk_topology(6) == VkTopology::TriangleStrip && vk_topology(1) == VkTopology::PointList,
           "topology map: 6 -> TriangleStrip, 1 -> PointList");
+    // #384: RectList/QuadList are the screen-space primitives full-screen passes emit; they must not
+    // collapse to PointList (3 stray points instead of a covered target). Kyty's strip/fan approximation.
+    CHECK(vk_topology(17) == VkTopology::TriangleStrip, "prim_type 17 (RectList) -> TriangleStrip");
+    CHECK(vk_topology(19) == VkTopology::TriangleFan,   "prim_type 19 (QuadList) -> TriangleFan");
 
     // Decoded DB_DEPTH_CONTROL fields (value 0x46).
     CHECK(rs.z_enable, "z_enable = true (bit 1)");
