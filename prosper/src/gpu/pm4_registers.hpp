@@ -61,32 +61,12 @@ constexpr uint32_t IT_WAIT_ON_CE_COUNTER        = 0x86;
 constexpr uint32_t IT_WAIT_ON_DE_COUNTER_DIFF   = 0x88;
 constexpr uint32_t IT_DISPATCH_DRAW_PREAMBLE    = 0x8C;
 constexpr uint32_t IT_DISPATCH_DRAW             = 0x8D;
-constexpr uint32_t R_ZERO             = 0x00;
-constexpr uint32_t R_VS               = 0x01;
-constexpr uint32_t R_PS               = 0x02;
-constexpr uint32_t R_DRAW_INDEX       = 0x03;
-constexpr uint32_t R_DRAW_INDEX_AUTO  = 0x04;
-constexpr uint32_t R_DRAW_RESET       = 0x05;
-constexpr uint32_t R_WAIT_FLIP_DONE   = 0x06;
-constexpr uint32_t R_CS               = 0x07;
-constexpr uint32_t R_DISPATCH_DIRECT  = 0x08;
-constexpr uint32_t R_DISPATCH_RESET   = 0x09;
-constexpr uint32_t R_WAIT_MEM_32      = 0x0A;
-constexpr uint32_t R_PUSH_MARKER      = 0x0B;
-constexpr uint32_t R_POP_MARKER       = 0x0C;
-constexpr uint32_t R_VS_EMBEDDED      = 0x0D;
-constexpr uint32_t R_PS_EMBEDDED      = 0x0E;
-constexpr uint32_t R_VS_UPDATE        = 0x0F;
-constexpr uint32_t R_PS_UPDATE        = 0x10;
-constexpr uint32_t R_SH_REGS_INDIRECT = 0x11;
-constexpr uint32_t R_CX_REGS_INDIRECT = 0x12;
-constexpr uint32_t R_UC_REGS_INDIRECT = 0x13;
-constexpr uint32_t R_ACQUIRE_MEM      = 0x14;
-constexpr uint32_t R_WRITE_DATA       = 0x15;
-constexpr uint32_t R_WAIT_MEM_64      = 0x16;
-constexpr uint32_t R_FLIP             = 0x17;
-constexpr uint32_t R_RELEASE_MEM      = 0x18;
-constexpr uint32_t R_NUM = 0x3F + 1;
+// NOTE: the custom IT_NOP sub-opcode enum (R_*) is NOT defined here. It was a vendored copy of Kyty's
+// GNM-era set that DIVERGED from the values prosper actually encodes/decodes (e.g. R_DISPATCH_DIRECT was
+// 0x08 vs the real 0x1a, and DMA_DATA/INDEX_BASE/INDEX_COUNT/DRAW_INDEX_OFFSET/JUMP/SET_PRED were
+// missing). The block was dead (no consumer) and a latent foot-gun, so it was removed to keep ONE source
+// of truth: the authoritative R_* mapping lives in pm4_decode.hpp (mirrored by the encoder hle_agc.cpp).
+// Include pm4_decode.hpp for the sub-op constants; this header owns only the hardware register offsets. (#385)
 constexpr uint32_t DB_RENDER_CONTROL                                = 0x0;
 constexpr uint32_t DB_RENDER_CONTROL_DEPTH_CLEAR_ENABLE_SHIFT       = 0;
 constexpr uint32_t DB_RENDER_CONTROL_DEPTH_CLEAR_ENABLE_MASK        = 0x1;
