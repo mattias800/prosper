@@ -7,7 +7,7 @@ FIRST=${1:-1}; COUNT=${2:-1}; shift 2 2>/dev/null
 SCRIPT="15:cross;20:start;25:cross;30:start;35:cross;40:cross;45:start;50:cross;60:cross;70:start;80:cross;90:cross;100:cross;110:cross"
 for n in $(seq "$FIRST" $((FIRST + COUNT - 1))); do
   LOG=/root/doll312_p${n}.log
-  timeout 160 env PROSPER_GUEST_FS=1 PROSPER_NULL_PAGE=1 PROSPER_FILELOG=1 PROSPER_PROGRESS=10 \
+  timeout 130 env PROSPER_GUEST_FS=1 PROSPER_NULL_PAGE=1 PROSPER_PROGRESS=10 \
     "PROSPER_PAD_SCRIPT=${SCRIPT}" "$@" ./build-linux/boot_trace /root/PPSA17942-app0 > "$LOG" 2>&1
   RC=$?
   POOL=$(grep -c "POOLSHIFT" "$LOG")
