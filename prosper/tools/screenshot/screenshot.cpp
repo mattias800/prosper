@@ -152,14 +152,18 @@ int main(int argc, char** argv) {
         }
         bool due = time_mode ? (std::chrono::duration<double>(now - last_cap).count() >= seconds)
                              : (gpu::present_frame_seq() >= next);
-        if (gpu::present_has_frame() && due) {
+        const bool rendered = gpu::present_has_frame();
+        const bool raw_scanout = gpu::present_front_index() >= 0 &&
+                                 gpu::present_width() > 0 && gpu::present_height() > 0;
+        if ((rendered || raw_scanout) && due) {
             uint64_t at = gpu::present_frame_seq();
             // Size the buffer from the RENDERED frame's dims, not the guest display dims: under
             // PROSPER_RENDER_SCALE the frame is smaller, and present_readback returns g_frame.size()
             // (scaled). Using the display dims made buf.size() != readback bytes, so the exact-size
             // guard below dropped EVERY screenshot silently (#399). Fall back to display dims only when
             // no rendered frame is present (the raw-scanout path).
-            uint32_t fw = gpu::present_frame_width(), fh = gpu::present_frame_height();
+            uint32_t fw = rendered ? gpu::present_frame_width() : 0;
+            uint32_t fh = rendered ? gpu::present_frame_height() : 0;
             uint32_t w = fw ? fw : gpu::present_width(), h = fh ? fh : gpu::present_height();
             if (w && h) {
                 buf.resize((size_t)w * h * 4);
