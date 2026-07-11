@@ -7,6 +7,10 @@ Reuses the shared boot path (`boot_program`) and the shared live renderer (`fron
 the game boots and composites exactly as `boot_trace` / `prosper-app` do — this tool just samples the
 present layer periodically and writes PNGs.
 
+Readback prefers the latest composited renderer frame. Before one exists, a flipped guest display
+buffer is captured through the present layer's raw-scanout fallback, so the tool records real black or
+partial early output instead of waiting indefinitely for a Vulkan draw.
+
 ## Build
 
 Built automatically wherever Vulkan + zlib are available (same block as `boot_trace`):
