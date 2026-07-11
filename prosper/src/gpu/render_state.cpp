@@ -78,6 +78,13 @@ RenderState extract_render_state(const GpuState& st) {
     rs.color0_number_type      = PM4_FIELD(cinfo, CB_COLOR0_INFO, NUMBER_TYPE);
     rs.color0_comp_swap        = PM4_FIELD(cinfo, CB_COLOR0_INFO, COMP_SWAP);
 
+    auto color_attrib2 = st.cx.find(P::CB_COLOR0_ATTRIB2);
+    if (color_attrib2 != st.cx.end()) {
+        rs.color0_has_extent = true;
+        rs.color0_width  = PM4_FIELD(color_attrib2->second, CB_COLOR0_ATTRIB2, MIP0_WIDTH) + 1u;
+        rs.color0_height = PM4_FIELD(color_attrib2->second, CB_COLOR0_ATTRIB2, MIP0_HEIGHT) + 1u;
+    }
+
     // CB fast-clear color (CB_COLOR0_CLEAR_WORD0/1). Present only when the game programs a fast-clear
     // for MRT 0; the words carry the clear value in the target's pixel format (decoded in resolve).
     rs.color0_has_clear   = st.cx.count(P::CB_COLOR0_CLEAR_WORD0) || st.cx.count(P::CB_COLOR0_CLEAR_WORD1);

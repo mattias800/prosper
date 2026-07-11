@@ -703,8 +703,8 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     }
                     Gen5ImageFormatInfo fi;
                     if (!gen5_image_format(d.format, &fi)) {
-                        // Same unmapped-format policy as build_shader_resources: bind as RGBA8 only
-                        // under RTT (so render-to-texture injection can supply the pixels), else skip.
+                        // Same policy as build_shader_resources: the normal per-target renderer can
+                        // bind this as RGBA8 for RTT injection; legacy single-target mode skips it.
                         static const bool rtt_bind = getenv("PROSPER_RTT") != nullptr ||
                                                      getenv("PROSPER_RTT_PERTARGET") != nullptr;
                         if (!rtt_bind) continue;
@@ -785,6 +785,175 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
     if (log) fprintf(stderr, "[restab] %s code=0x%llx -> no resources in any user-data base\n",
                      is_ps ? "PS" : "VS", (unsigned long long)code_addr);
     return nullptr;
+}
+
+void diagnose_compute_dispatches(const GpuState& st, uint64_t submit_no) {
+    const char* enabled = getenv("PROSPER_COMPUTELOG");
+    const char* dim_env = getenv("PROSPER_COMPUTELOG_DIM");
+    if ((!enabled || !*enabled) && (!dim_env || !*dim_env)) return;
+
+    uint32_t want_w = 0, want_h = 0;
+    if (dim_env && *dim_env && sscanf(dim_env, "%ux%u", &want_w, &want_h) != 2) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr, "[compute] invalid PROSPER_COMPUTELOG_DIM='%s' (expected WxH)\n", dim_env);
+        }
+        want_w = want_h = 0;
+    }
+
+    namespace P = prosper::agc::Pm4;
+    auto rd = [](const std::unordered_map<uint32_t, uint32_t>& regs, uint32_t off) {
+        auto it = regs.find(off); return it == regs.end() ? 0u : it->second;
+    };
+    auto pgm_addr = [&](const GpuState& ds) {
+        uint32_t lo = rd(ds.sh, P::COMPUTE_PGM_LO), hi = rd(ds.sh, P::COMPUTE_PGM_HI);
+        return (static_cast<uint64_t>(lo) << 8) | (static_cast<uint64_t>(hi & 0xffu) << 40);
+    };
+
+    size_t matched = 0;
+    for (size_t i = 0; i < st.dispatches.size(); ++i) {
+        const auto& d = st.dispatches[i];
+        const GpuState& ds = d.state ? *d.state : st;
+        const uint64_t code_addr = pgm_addr(ds);
+        const auto* hdr = static_cast<const AgcShaderHeader*>(prosper_agc_shader_header_for_code(code_addr));
+
+        uint32_t range_start = 0;
+        if (hdr && hdr->specials && guest_readable((uint64_t)(uintptr_t)hdr->specials,
+                                                   sizeof(AgcShaderSpecials))) {
+            uint32_t s = hdr->specials->user_data_range_start;
+            uint32_t e = hdr->specials->user_data_range_end;
+            if (s < kUserSgprs && e > s && e <= 2 * kUserSgprs) range_start = s;
+        }
+
+        ShaderResourceTable table;
+        if (hdr) {
+            uint32_t sgprs[kUserSgprs];
+            read_user_sgprs(ds.sh, P::COMPUTE_USER_DATA_0 + range_start, sgprs);
+            table = build_shader_resources(*hdr, sgprs, kUserSgprs, 0);
+            assign_convention_bindings(table, 2);
+        }
+
+        bool dim_match = !want_w || !want_h;
+        if (!dim_match) {
+            for (const auto& r : table.resources)
+                if (r.width == want_w && r.height == want_h) { dim_match = true; break; }
+        }
+        if (!dim_match) continue;
+        matched++;
+
+        uint64_t code_hash = 1469598103934665603ull;
+        if (code_addr && guest_readable(code_addr, 4096)) {
+            const uint8_t* p = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(code_addr));
+            for (size_t n = 0; n < 4096; ++n) { code_hash ^= p[n]; code_hash *= 1099511628211ull; }
+        } else {
+            code_hash = 0;
+        }
+        fprintf(stderr,
+                "[compute] submit=%llu dispatch=%zu groups=%ux%ux%u modifier=0x%llx "
+                "code=0x%llx hash4k=%016llx header=%s resources=%zu\n",
+                (unsigned long long)submit_no, i, d.tg_x, d.tg_y, d.tg_z,
+                (unsigned long long)d.modifier, (unsigned long long)code_addr,
+                (unsigned long long)code_hash, hdr ? "yes" : "no", table.resources.size());
+        for (const auto& r : table.resources) {
+            fprintf(stderr,
+                    "[compute]   cls=%u binding=%u addr=0x%llx size=%u dims=%ux%u "
+                    "fmt=%u comps=%u tile=%u sgpr=%u srt=0x%x\n",
+                    (unsigned)r.cls, r.binding, (unsigned long long)r.gpu_addr, r.size,
+                    r.width, r.height, (unsigned)r.format, r.num_components, r.tile_mode,
+                    r.sgpr_base, r.srt_offset);
+        }
+    }
+
+    if (want_w && want_h && !st.dispatches.empty() && matched == 0 && enabled && enabled[0] == 'a') {
+        fprintf(stderr, "[compute] submit=%llu dispatches=%zu: no resource matched %ux%u\n",
+                (unsigned long long)submit_no, st.dispatches.size(), want_w, want_h);
+    }
+}
+
+void diagnose_resource_provenance(const GpuState& st, uint64_t submit_no) {
+    const char* dim_env = getenv("PROSPER_PROVENANCE_DIM");
+    if (!dim_env || !*dim_env) return;
+
+    uint32_t want_w = 0, want_h = 0;
+    if (sscanf(dim_env, "%ux%u", &want_w, &want_h) != 2 || !want_w || !want_h) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr, "[provenance] invalid PROSPER_PROVENANCE_DIM='%s' (expected WxH)\n", dim_env);
+        }
+        return;
+    }
+    const size_t min_draws = [] {
+        const char* e = getenv("PROSPER_PROVENANCE_MIN_DRAWS");
+        return e ? static_cast<size_t>(strtoull(e, nullptr, 0)) : size_t{0};
+    }();
+
+    struct ColorWrite {
+        uint64_t submit = 0;
+        uint64_t draw_submit = 0;
+        size_t draw = 0;
+        uint64_t vs = 0, ps = 0;
+        uint32_t width = 0, height = 0;
+        GpuState::Draw draw_record{};
+    };
+    static std::unordered_map<uint64_t, ColorWrite> last_color_write;
+    static uint64_t draw_submit_ordinal = 0;
+    const uint64_t this_draw_submit = st.draws.empty() ? draw_submit_ordinal : draw_submit_ordinal++;
+
+    const bool inspect_consumers = st.draws.size() >= min_draws;
+    for (size_t i = 0; i < st.draws.size(); ++i) {
+        const GpuState& ds = st.draws[i].state ? *st.draws[i].state : st;
+        const RenderState rs = extract_render_state(ds);
+
+        // Query before recording this draw's target: a feedback draw should resolve to the preceding
+        // writer, not identify itself as its own producer.
+        if (inspect_consumers && rs.ps_addr) {
+            auto prt = build_stage_table(ds, rs.ps_addr, true);
+            if (prt) for (const auto& r : prt->resources) {
+                if (r.width != want_w || r.height != want_h) continue;
+                auto it = last_color_write.find(r.gpu_addr);
+                if (it == last_color_write.end()) {
+                    fprintf(stderr,
+                            "[provenance] consumer submit=%llu draw=%zu ps=0x%llx samples "
+                            "addr=0x%llx dims=%ux%u draw_submit=%llu: no prior color-target write\n",
+                            (unsigned long long)submit_no, i, (unsigned long long)rs.ps_addr,
+                            (unsigned long long)r.gpu_addr, r.width, r.height,
+                            (unsigned long long)this_draw_submit);
+                } else {
+                    const ColorWrite& w = it->second;
+                    fprintf(stderr,
+                            "[provenance] consumer submit=%llu draw=%zu ps=0x%llx samples "
+                            "addr=0x%llx dims=%ux%u draw_submit=%llu: last color write submit=%llu "
+                            "draw_submit=%llu draw=%zu target_extent=%ux%u "
+                            "vs=0x%llx ps=0x%llx\n",
+                            (unsigned long long)submit_no, i, (unsigned long long)rs.ps_addr,
+                            (unsigned long long)r.gpu_addr, r.width, r.height,
+                            (unsigned long long)this_draw_submit, (unsigned long long)w.submit,
+                            (unsigned long long)w.draw_submit, w.draw, w.width, w.height,
+                            (unsigned long long)w.vs, (unsigned long long)w.ps);
+                    static std::set<uint64_t> probed;
+                    if (probed.insert(r.gpu_addr).second && w.draw_record.state) {
+                        DrawItem producer;
+                        bool realized = realize_draw_item(*w.draw_record.state, &w.draw_record,
+                                                         w.draw_record.index_count, 0x10000, true, producer);
+                        fprintf(stderr,
+                                "[provenance] producer-realize addr=0x%llx result=%s extent=%ux%u "
+                                "items-target=0x%llx\n",
+                                (unsigned long long)r.gpu_addr, realized ? "success" : "dropped",
+                                producer.color0_width, producer.color0_height,
+                                (unsigned long long)producer.color0_base);
+                    }
+                }
+            }
+        }
+
+        if (rs.color0_base)
+            last_color_write[rs.color0_base] = {
+                submit_no, this_draw_submit, i, rs.es_addr, rs.ps_addr,
+                rs.color0_width, rs.color0_height, st.draws[i]
+            };
+    }
 }
 
 void set_submit_renderer(LiveRenderFn fn) { g_live = std::move(fn); }

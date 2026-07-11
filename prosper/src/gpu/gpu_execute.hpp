@@ -49,6 +49,7 @@ struct DrawItem {
     // subsequent draw samples a texture at a matching base (otherwise the sample reads empty guest
     // memory — the scene RT is never populated on the CPU side — and the frame is a black composite).
     uint64_t color0_base = 0;
+    uint32_t color0_width = 0, color0_height = 0;
 };
 
 // The pluggable Vulkan backend: render the submit's draw items into one image and return W*H*4 RGBA8
@@ -118,6 +119,16 @@ void assign_convention_bindings(ShaderResourceTable& t, uint32_t first);
 // 2, vertex buffer -> binding 3, textures -> binding 4+). Returns null if the stage has no shader header
 // or no resources. Implemented in gpu_executor.cpp (needs the AGC registry + descriptor decode).
 std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps);
+
+// PROSPER_COMPUTELOG diagnostic: resolve every skipped DispatchDirect packet's compute shader and
+// AGC resource table from its retained register snapshot. PROSPER_COMPUTELOG_DIM=WxH restricts output
+// to dispatches referencing an image of that size (for example the Messenger 1024x32 grading LUT).
+void diagnose_compute_dispatches(const GpuState& st, uint64_t submit_no);
+
+// PROSPER_PROVENANCE_DIM=WxH: retain color-target address history across submits, then inspect
+// sampled images of that size and report the most recent draw that wrote the same guest address.
+// PROSPER_PROVENANCE_MIN_DRAWS=N limits expensive descriptor resolution to large target submits.
+void diagnose_resource_provenance(const GpuState& st, uint64_t submit_no);
 
 // Byte size of one index element for a GpuState::index_type (the last SetIndexType value).
 // 0 -> 16-bit, 1 -> 32-bit, exactly Kyty's index_type_and_size switch (GraphicsRender.cpp:4724) and
@@ -453,6 +464,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     out.vs = std::move(vs); out.fs = std::move(fs); out.ps = ps;
     out.vrt = std::move(vrt); out.prt = std::move(prt); out.vertex_count = vertex_count;
     out.color0_base = rs.color0_base;   // render-to-texture: the target this draw writes into (#167)
+    out.color0_width = rs.color0_width; out.color0_height = rs.color0_height; // per-target extent (#526)
     return true;
 }
 
