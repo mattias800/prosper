@@ -430,8 +430,20 @@ const char* const kAgcNids[] = {
     "k3GhuSNmBLU",   // fires once just before "unity default resources" load; not in Kyty — RE via args
     "WmAc2MEj6Io",   // sceAgcDcbDmaData (shadPS4 aerolib) — OVERRIDDEN by agc_dcb_dma_data (real appender, #117)
     "IxYiarKlXxM",   // sceAgcDmaDataPatchSetDstAddressOrOffset — observe-only (packet now gets valid ptrs, #117)
+    // Dead Cells resource-registration startup path (#539). These trace entries preserve the original
+    // six arguments, which the generic unimplemented stub cannot do because it replaces a0 with the
+    // import index. The max-name-length query is overridden by its real handler in hle_agc.
+    "AOLcoIkQDgM",   // sceAgcDriverQueryResourceRegistrationUserMemoryRequirements
+    "F0Y42t-3e18",   // sceAgcDriverInitResourceRegistration
+    "U9ueyEhSkF4",   // sceAgcDriverRegisterDefaultOwner (shadPS4 symbol map)
+    "X-Nm5KLREeg",   // sceAgcDriverRegisterOwner
+    "W5z4eZrjEas",   // sceAgcDriverRegisterResource
+    "F0ZXt5q0ZTA",   // sceAgcDriverGetDefaultOwner (shadPS4 symbol map)
+    "uJziRsODk1c",   // sceAgcDriverGetResourceRegistrationMaxNameLength (overridden in hle_agc)
 };
+constexpr size_t kDefaultAgcNidCount = 32;
 constexpr size_t kAgcNidCount = sizeof(kAgcNids) / sizeof(kAgcNids[0]);
+static_assert(kAgcNidCount == kDefaultAgcNidCount + 7);
 
 uint64_t glog_impl(const char* nid, void* ra,
                    uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
@@ -559,11 +571,12 @@ __attribute__((noinline)) uint64_t glog_thunk(uint64_t a0, uint64_t a1, uint64_t
                                               uint64_t a3, uint64_t a4, uint64_t a5) {
     return glog_impl(kAgcNids[I], __builtin_return_address(0), a0, a1, a2, a3, a4, a5);
 }
-template <size_t... Is>
+template <size_t Offset, size_t... Is>
 void register_agc_tracers(std::index_sequence<Is...>) {
     // Placeholders: hle_agc registers the REAL handlers for the implemented subset later and is meant
     // to override these tracing thunks — so mark them overridable and that override is not a shadow.
-    (Hle::register_placeholder(kAgcNids[Is], (HleFn)&glog_thunk<Is>, kAgcNids[Is]), ...);
+    (Hle::register_placeholder(kAgcNids[Offset + Is], (HleFn)&glog_thunk<Offset + Is>,
+                               kAgcNids[Offset + Is]), ...);
 }
 }
 
@@ -574,7 +587,12 @@ void register_graphics_hle() {
     RN("2JtWUUiYBXs", g_agc_regdefs);       // GraphicsGetRegisterDefaults2       -> g_reg_defaults1
     RN("wRbq6ZjNop4", g_agc_regdefs_int);   // GraphicsGetRegisterDefaults2Internal -> g_reg_defaults2
     // All traced libSceAgc/AgcDriver NIDs → per-NID logging thunks (still return 0; observable only).
-    register_agc_tracers(std::make_index_sequence<kAgcNidCount>{});
+    register_agc_tracers<0>(std::make_index_sequence<kDefaultAgcNidCount>{});
+    // Extra resource-registration tracing changes the generic unimplemented-stub scheduling enough to
+    // suppress Dead Cells' intermittent startup failure (#539), so it must be explicitly diagnostic.
+    if (getenv("PROSPER_AGC_REG_TRACE"))
+        register_agc_tracers<kDefaultAgcNidCount>(
+            std::make_index_sequence<kAgcNidCount - kDefaultAgcNidCount>{});
     // Override the +kSrjIVxKFE tracer with the real register-context constructor (must come AFTER the
     // tracer registration above so it wins; registry is last-write-wins per NID).
     RN("+kSrjIVxKFE", g_agc_ctx_init);      // AGC register-context init (installs classify table)

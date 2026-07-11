@@ -37,8 +37,18 @@ int main() {
     auto setidx = Hle::lookup("GIIW2J37e70");   // GraphicsDcbSetIndexSize
     auto draw   = Hle::lookup("Yw0jKSqop+E");   // GraphicsDcbDrawIndexAuto
     auto submit = Hle::lookup("UglJIZjGssM");   // GraphicsDriverSubmitDcb
-    CHECK(reset && setcx && setidx && draw && submit, "AGC Dcb + submit functions registered");
-    if (!(reset && setcx && setidx && draw && submit)) { printf("== FAIL ==\n"); return 1; }
+    auto maxname = Hle::lookup("uJziRsODk1c");   // sceAgcDriverGetResourceRegistrationMaxNameLength
+    CHECK(reset && setcx && setidx && draw && submit && maxname,
+          "AGC Dcb, submit, and resource-registration functions registered");
+    if (!(reset && setcx && setidx && draw && submit && maxname)) { printf("== FAIL ==\n"); return 1; }
+
+    uint32_t max_name_length = 0xdeadbeefu;
+    CHECK(maxname((uint64_t)(uintptr_t)&max_name_length, 0, 0, 0, 0, 0) == 0,
+          "resource-registration max-name query returned OK");
+    CHECK(max_name_length == 0xfc,
+          "resource-registration max-name query initialized the poisoned output");
+    CHECK((int64_t)maxname(0, 0, 0, 0, 0, 0) < 0,
+          "resource-registration max-name query rejects a null output");
 
     // Baseline stats (other tests in-process may have submitted; measure deltas).
     uint64_t s0 = 0, d0 = 0; prosper_agc_submit_stats(&s0, &d0);
