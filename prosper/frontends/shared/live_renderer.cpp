@@ -539,6 +539,57 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
               add(vrt, 0); add(prt, 1);   // VS resources -> descriptor set 0, PS -> set 1
               return R;
             };
+            // Poison mode keeps the draw running while making invalid bindings visually/numerically
+            // unmistakable: magenta/cyan texels for images and NaN-like dwords for buffers. Missing,
+            // duplicate, wrong-type, and undersized bindings are replaced from the reflected manifest.
+            auto poison_R = [](std::vector<prosper::test::FrameResource>& resources,
+                               const std::vector<uint32_t>& spirv,
+                               const prosper::gpu::ShaderResourceTable* table,
+                               uint32_t set, prosper::gpu::SpirvShaderStage stage) {
+                const char* mode = getenv("PROSPER_DESCRIPTOR_VALIDATE");
+                if (!mode || strcmp(mode, "poison")) return;
+                auto report = prosper::gpu::validate_spirv_descriptor_interface(spirv, table, set, stage, false);
+                static const uint8_t poison_tex[16] = {
+                    255, 0, 255, 255,   0, 255, 255, 255,
+                    0, 255, 255, 255,   255, 0, 255, 255,
+                };
+                for (const auto& d : report.descriptors) {
+                    bool invalid = false;
+                    for (const auto& issue : report.issues)
+                        if (issue.error && issue.binding == d.binding) { invalid = true; break; }
+                    if (!invalid) continue;
+                    auto first = std::find_if(resources.begin(), resources.end(), [&](const auto& r) {
+                        return r.set == set && r.binding == d.binding;
+                    });
+                    size_t count = 0;
+                    for (const auto& r : resources) if (r.set == set && r.binding == d.binding) ++count;
+                    const bool wants_buffer = d.kind == prosper::gpu::SpirvDescriptorKind::StorageBuffer;
+                    const uint64_t available = first == resources.end() ? 0 :
+                        (first->is_texture() ? (uint64_t)first->tw * first->th * 4 : first->dwords.size() * 4);
+                    const bool wrong_type = first != resources.end() && (first->is_texture() == wants_buffer);
+                    const bool undersized = wants_buffer && available < std::max<uint64_t>(d.required_bytes, 4);
+                    resources.erase(std::remove_if(resources.begin(), resources.end(), [&](const auto& r) {
+                        return r.set == set && r.binding == d.binding;
+                    }), resources.end());
+                    prosper::test::FrameResource replacement;
+                    replacement.set = set; replacement.binding = d.binding;
+                    if (wants_buffer) {
+                        size_t words = static_cast<size_t>((std::max<uint64_t>(d.required_bytes, 16) + 3) / 4);
+                        words = std::min<size_t>(words, 1u << 18); // same 1 MiB upload ceiling as build_R
+                        replacement.dwords.assign(words, 0x7FC0CDCDu);
+                    } else {
+                        replacement.tex_rgba = poison_tex; replacement.tw = 2; replacement.th = 2;
+                        replacement.mag_filter = replacement.min_filter = 0;
+                    }
+                    fprintf(stderr, "[descriptor] poison set=%u binding=%u type=%s reason=%s%s%s%s\n",
+                            set, d.binding, prosper::gpu::spirv_descriptor_kind_name(d.kind),
+                            count == 0 ? "missing" : "",
+                            count > 1 ? "duplicate" : "",
+                            wrong_type ? "wrong-type" : "",
+                            undersized ? "undersized" : "");
+                    resources.push_back(std::move(replacement));
+                }
+            };
             // Diagnostic shader/state overrides (computed once, applied to EVERY draw item):
             //   REFVS  -> a known-good fullscreen-triangle VS (isolates the game's real VS).
             //   TESTPS -> a solid-magenta PS (isolates VS geometry from PS shading).
@@ -576,6 +627,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     bd.vcount = refvs ? 3u : it.vertex_count;
                     bd.ps     = nops ? nullptr : &it.ps;
                     bd.R      = build_R(it.vrt.get(), it.prt.get());
+                    if (!prosper::gpu::validate_runtime_descriptor_contract(
+                            "VS/backend", bd.vs, it.vrt.get(), 0, prosper::gpu::SpirvShaderStage::Vertex) ||
+                        !prosper::gpu::validate_runtime_descriptor_contract(
+                            "PS/backend", bd.fs, it.prt.get(), 1, prosper::gpu::SpirvShaderStage::Fragment))
+                        continue;
+                    poison_R(bd.R, bd.vs, it.vrt.get(), 0, prosper::gpu::SpirvShaderStage::Vertex);
+                    poison_R(bd.R, bd.fs, it.prt.get(), 1, prosper::gpu::SpirvShaderStage::Fragment);
                     // Indexed draw: hand the executor-fetched index data to the backend (vkCmdDrawIndexed).
                     // Skipped under REFVS — the reference VS is a 3-vertex non-indexed fullscreen triangle.
                     if (!refvs) bd.indices = it.indices;

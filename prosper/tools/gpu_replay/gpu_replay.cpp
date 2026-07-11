@@ -20,7 +20,7 @@ bool set_environment(const std::string& name, const std::string& value) {
 }
 
 void usage(const char* argv0) {
-    std::fprintf(stderr, "usage: %s [--inspect|--inspect-only] [--draw N[:M]] "
+    std::fprintf(stderr, "usage: %s [--inspect|--inspect-only|--validate] [--draw N[:M]] "
                          "[--dump-resource DRAW:vs|ps:BINDING PATH] [--allow-mismatch] "
                          "[--dump-shader DRAW:vs|fs PATH] "
                          "<capture.prgcap> [output.bmp]\n", argv0);
@@ -103,15 +103,58 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
     }
 }
 
+bool validate_frame(const prosper::gpu::GpuReplayFrame& replay) {
+    bool valid = true;
+    for (size_t i = 0; i < replay.items.size(); ++i) {
+        const auto& d = replay.items[i];
+        struct StageInput {
+            const char* name;
+            const std::vector<uint32_t>* spirv;
+            const prosper::gpu::ShaderResourceTable* table;
+            uint32_t set;
+            prosper::gpu::SpirvShaderStage stage;
+        } stages[] = {
+            {"VS", &d.vs, d.vrt.get(), 0, prosper::gpu::SpirvShaderStage::Vertex},
+            {"PS", &d.fs, d.prt.get(), 1, prosper::gpu::SpirvShaderStage::Fragment},
+        };
+        for (const auto& s : stages) {
+            auto report = prosper::gpu::validate_spirv_descriptor_interface(
+                *s.spirv, s.table, s.set, s.stage, true);
+            std::printf("draw[%zu] %s descriptors=%zu runtime=%zu result=%s\n", i, s.name,
+                        report.descriptors.size(), s.table ? s.table->resources.size() : 0,
+                        report.ok() ? "accept" : "reject");
+            for (const auto& binding : report.descriptors)
+                std::printf("  set=%u binding=%u type=%s required=%llu%s\n",
+                            binding.set, binding.binding,
+                            prosper::gpu::spirv_descriptor_kind_name(binding.kind),
+                            static_cast<unsigned long long>(binding.required_bytes),
+                            binding.dynamic_access ? "+dynamic" : "");
+            for (const auto& issue : report.issues) {
+                std::printf("  %s %s set=%u binding=%u expected=%s actual=%s required=%llu available=%llu\n",
+                            issue.error ? "ERROR" : "warn",
+                            prosper::gpu::descriptor_issue_name(issue.code), issue.set, issue.binding,
+                            prosper::gpu::spirv_descriptor_kind_name(issue.expected),
+                            prosper::gpu::spirv_descriptor_kind_name(issue.actual),
+                            static_cast<unsigned long long>(issue.required_bytes),
+                            static_cast<unsigned long long>(issue.available_bytes));
+                valid &= !issue.error;
+            }
+        }
+    }
+    return valid;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
-    bool inspect = false, inspect_only = false, allow_mismatch = false; int draw_first = -1, draw_last = -1;
+    bool inspect = false, inspect_only = false, validate_only = false, allow_mismatch = false;
+    int draw_first = -1, draw_last = -1;
     std::string dump_spec, dump_path, shader_spec, shader_path;
     std::vector<const char*> positional;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--inspect") inspect = true;
         else if (std::string(argv[i]) == "--inspect-only") inspect = inspect_only = true;
+        else if (std::string(argv[i]) == "--validate") validate_only = true;
         else if (std::string(argv[i]) == "--allow-mismatch") allow_mismatch = true;
         else if (std::string(argv[i]) == "--draw" && i + 1 < argc) {
             std::string range = argv[++i]; size_t colon = range.find(':');
@@ -196,6 +239,7 @@ int main(int argc, char** argv) {
                  m.revision.c_str(), m.title_id.c_str(), static_cast<unsigned long long>(m.submit_index),
                  m.width, m.height, replay.items.size(), replay.blobs.size());
     if (inspect) inspect_frame(replay);
+    if (validate_only) return validate_frame(replay) ? 0 : 1;
     if (inspect_only) return 0;
     prosper::frontend::register_live_renderer(".", false);
     std::vector<uint8_t> pixels = prosper::gpu::render_submit_items(replay.items, m.width, m.height);

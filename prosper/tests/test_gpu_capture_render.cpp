@@ -3,6 +3,7 @@
 #include "../frontends/shared/live_renderer.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -11,6 +12,14 @@ using namespace prosper::gpu;
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); ++fails; } \
                          else std::printf("  [ok]   %s\n", m); } while (0)
+
+static void set_descriptor_mode(const char* value) {
+#ifdef _WIN32
+    _putenv_s("PROSPER_DESCRIPTOR_VALIDATE", value);
+#else
+    setenv("PROSPER_DESCRIPTOR_VALIDATE", value, 1);
+#endif
+}
 
 int main() {
     std::printf("== test_gpu_capture_render ==\n");
@@ -85,6 +94,24 @@ int main() {
         const uint8_t* center = &chained[(8u * 16u + 8u) * 4];
         CHECK(center[0] > 0xC0 && center[1] < 0x40 && center[2] < 0x40,
               "later pass samples pixels cached from the 32x2 producer target");
+    }
+
+    DrawItem missing_texture = replay.items[0];
+    missing_texture.prt = std::make_shared<ShaderResourceTable>();
+    missing_texture.color0_base = 0x500000;
+    missing_texture.color0_width = 8;
+    missing_texture.color0_height = 8;
+    set_descriptor_mode("poison");
+    std::vector<uint8_t> poisoned = render_submit_items({missing_texture}, W, H);
+    set_descriptor_mode("off");
+    CHECK(poisoned.size() == static_cast<size_t>(8) * 8 * 4,
+          "poison mode keeps a missing-descriptor draw executable at its target extent");
+    if (poisoned.size() == static_cast<size_t>(8) * 8 * 4) {
+        size_t rgb_nonblack = 0;
+        for (size_t i = 0; i < poisoned.size(); i += 4)
+            rgb_nonblack += poisoned[i] || poisoned[i + 1] || poisoned[i + 2];
+        CHECK(rgb_nonblack == 64,
+              "missing sampled image receives a full-surface nonblack poison texture instead of zero");
     }
 
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }

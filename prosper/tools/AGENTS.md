@@ -55,6 +55,11 @@ offscreen target dimensions.
 
 Use `gpu_replay --inspect-only` to print fixed-function state, native color-target dimensions, resource
 hashes, explicit clear intent, guest depth/stencil surface identities, and raw stencil-op provenance.
+Use `gpu_replay --validate` to reflect every draw's statically used VS/PS descriptor interface and validate it
+against the captured runtime resource tables without initializing Vulkan. It exits nonzero for malformed SPIR-V,
+stage/set mismatches, missing or duplicate bindings, wrong descriptor classes, or statically provable undersized
+buffers. The same gate is available live as `PROSPER_DESCRIPTOR_VALIDATE=warn|strict|poison|all`; strict rejects
+invalid draws, poison substitutes conspicuous resources, and all also prints valid manifests.
 `--draw N:M` replays an
 inclusive contiguous draw range, which is useful for rendering one pass without its downstream
 composite/scanout draws; a single `--draw N` remains supported.
