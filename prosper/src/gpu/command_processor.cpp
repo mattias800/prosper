@@ -252,17 +252,27 @@ bool label_is_consumed_marker(uint64_t addr) {
 // Strictly correct: a freed block satisfies no live WaitRegMem==value consumer (its content is not
 // `value`, or the guest already consumed the value and freed it). CONFIDENCE: MED-HIGH.
 // Returns the freed-manifestation category (for verification logging), or 0 if the label looks live.
-//   1 = Case A, pointer-shaped freed FFreeBlock next-pointer (the #505/#510 family)
-//   2 = Case A, NON-pointer freed content — a canary / size / count field (the "Canary 0x3" residual)
-//   3 = Case B, content 0 but protocol shows a stale/duplicate fence to a consumed+freed block
+//   2 = the fence's LOW DWORD (the 4 bytes the guest polls) is neither the DmaData-init'd 0 nor the
+//       fence value — a freed/reused FFreeBlock header field (canary / size / count) sits there. This
+//       is the "Canary 0x3" residual that value-SHAPE (ptr_like) guards miss. A live consumed-marker
+//       label's low dword is ONLY ever 0 or the fence value, so this cannot be a live label. NOTE: we
+//       key on the LOW DWORD, not the qword — the high dword of a live 4-byte-fence label is malloc
+//       residue (e.g. pre=0x1_00000000, low dword 0 = a LIVE init'd label; suppressing on the qword
+//       wrongly killed those and crashed boot). The ptr_like next-pointer cases (#505 REL1-LIVE, #510
+//       forge, which have low dword 0 or a real pointer half) are handled by the guards below.
+//   3 = LOW DWORD is 0 (looks like a freshly init'd LIVE label) BUT the tracked protocol counters
+//       show NO pending un-signaled DmaData init (rel_exec_n >= dma_exec_n): this is a stale/
+//       duplicate fence to a block the guest already consumed + freed + LIFO-recycled, whose
+//       FFreeBlock next-pointer reads NULL — writing the fence value would forge NextFreeBlock==0x1
+//       (the eboot+0x231012b deref-0x1 fatal / "Canary 0x3"). Content is INDISTINGUISHABLE from a
+//       live label here (both read low dword 0), so ONLY the lifecycle counters resolve it — this is
+//       the guest-free-state track the residual needs. A live fence always has its paired init
+//       pending (dma_exec_n > rel_exec_n) at this point, so it is never suppressed.
 int label_freed_marker_kind(uint64_t addr, uint64_t pre, uint64_t value) {
     uint32_t lo = (uint32_t)pre;
-    if (pre != 0 && lo != (uint32_t)value && pre != value) {             // Case A
-        bool ptr = (pre >= 0x1000000000ull && pre < 0x1200000000ull) ||
-                   (pre >= 0x2000000000ull && pre < 0x2100000000ull);
-        return ptr ? 1 : 2;
-    }
-    if (pre == 0) {                                                       // Case B
+    uint32_t vlo = (uint32_t)value;
+    if (lo != 0 && lo != vlo) return 2;                                  // Case A'
+    if (lo == 0 && vlo != 0) {                                           // Case B (free-state track)
         LabelHist& h = label_hist_slot(addr);
         uint32_t dx = h.dma_exec_n.load(std::memory_order_relaxed);
         uint32_t rx = h.rel_exec_n.load(std::memory_order_relaxed);
@@ -382,13 +392,23 @@ static bool forge_guard() {
                                return !e || strtol(e, nullptr, 0) != 0; }();   // default ON
     return v;
 }
-// #312 CLOSE gate (default ON; PROSPER_REL1_WAF_GUARD=0 restores the session-10 behavior for A/B).
-// The label free-state write-after-free guard — see label_is_freed_marker. This is the residual
-// closer over #505/#510's value-shape guards: it keys on TRACKED free state, so it also catches the
-// freed manifestations whose content is not pointer-shaped (the "Canary was 0x3" family).
+// #312 label free-state write-after-free guard — see label_freed_marker_kind. Default OFF
+// (PROSPER_REL1_WAF_GUARD=1 to arm). RATIONALE (session-11 A/B, ~30 menu-drive runs): this guard is
+// STRICTLY-CORRECT — every write it suppresses is a genuine write-after-free into an MB3
+// consumed-marker label the guest already freed — but it does NOT close #312, because the DOMINANT
+// residual is undetectable from the GPU side: the guest frees the 0x20 label block while BOTH its
+// DmaData(:=0) init AND its ReleaseMem(<-1) fence are still in flight, so our init writes 0 to the
+// freed block's next-pointer field (making it read exactly like a freshly-init'd LIVE label, low
+// dword 0) AND bumps dma_exec_n (making the protocol counters read as a live pending fence). Neither
+// content nor tracked counters can separate that freed block from a live label — only the guest's
+// actual FREELIST MEMBERSHIP can, and cheaply hooking the MB3 free-push is infeasible (it is far too
+// hot to trap without destroying the repro's timing). So the guard ships OFF: the default boot stays
+// at the proven #505/#510 state, and this remains armed A/B instrumentation for the freelist-
+// membership approach the close ultimately needs. CONFIDENCE: HIGH on the mechanism + why it can't
+// be resolved GPU-side (definitive per-write capture, session 10-11).
 static bool waf_guard() {
     static const bool v = [] { const char* e = getenv("PROSPER_REL1_WAF_GUARD");
-                               return !e || strtol(e, nullptr, 0) != 0; }();   // default ON
+                               return e && strtol(e, nullptr, 0) != 0; }();   // default OFF
     return v;
 }
 // #312 CLOSE: bounded log of a suppressed write-after-free. PER-CATEGORY caps so a rare non-pointer
@@ -470,12 +490,11 @@ static void honor_eop_write(const Pm4Command& c) {
                   // target-region trigger caught only benign fences and burned the report cap.
                   // Trigger on pointer-like PRE-CONTENT only.)
                   uint64_t pre = 0; memcpy(&pre, dst, sizeof pre);
-                  // #312 CLOSE — label free-state write-after-free guard (the residual closer). Runs
-                  // FIRST, before the value-shape guards below: it keys on tracked lifecycle state and
-                  // subsumes both #505's REL1-LIVE and #510's forge cases while ALSO catching the
-                  // non-pointer freed manifestation (the "Canary was 0x3" fatal). Suppress the write
-                  // and record NO rel_exec (a suppressed fence must not advance the signal counter, or
-                  // Case B would mis-count the next generation). CONFIDENCE: MED-HIGH.
+                  // #312 — label free-state write-after-free guard (default OFF; A/B instrumentation,
+                  // see waf_guard). Keys on tracked lifecycle state; suppresses genuine WAFs but does
+                  // NOT close the gate (the dominant residual is GPU-side-undetectable — see waf_guard).
+                  // Records NO rel_exec (a suppressed fence must not advance the signal counter, or
+                  // Case B would mis-count the next generation).
                   if (int cat; waf_guard() && label_is_consumed_marker(c.rel_addr) &&
                       (cat = label_freed_marker_kind(c.rel_addr, pre, c.rel_value)) != 0) {
                       waf_report("REL1", c.rel_addr, pre, c.rel_value, cat);
