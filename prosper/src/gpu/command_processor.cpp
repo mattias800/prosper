@@ -222,6 +222,14 @@ int label_rel_overlap(uint64_t addr) {
     uint32_t dx = h.dma_exec_n.load(std::memory_order_relaxed);
     return (int)(db - dx);
 }
+// #312: is this address part of DOLL's DmaData(:=0)+ReleaseMem(<-1) consumed-marker protocol? A
+// plain fence label (Messenger's ReleaseMem/WriteData targets) has NO DmaData-init history, so this
+// gates the REL1-stomp guard to the exact population that carries the corruption — never a title
+// whose fences are simple EOP labels. (label_hist_slot resets on hash collision, so a false 0 only
+// forgoes the guard on one write; the protocol re-arms it on the address's next DmaData build.)
+bool label_is_consumed_marker(uint64_t addr) {
+    return label_hist_slot(addr).dma_built_n.load(std::memory_order_relaxed) > 0;
+}
 // Format the event ring for a suspect report, oldest first. b=built x=exec, aux in hex.
 void label_hist_report(uint64_t addr, char* out, size_t cap) {
     static const char* nm[] = {"?", "dmaB", "relB", "waitB", "dmaX", "relX", "dmaSKIP"};
@@ -280,6 +288,17 @@ static void report_suspect_write(const char* kindtag, uint64_t addr, uint64_t va
             (unsigned long long)bpre, (have && ptr_like(bpre)) ? " STALE-AT-BUILD" : "", hist);
 }
 
+// #312 the WHERE fix (default ON; PROSPER_REL1_STOMP_GUARD=0 restores the old barrel-through for
+// A/B). When a data_sel==1 fence write would land on a live MallocBinned3 freelist/pool block —
+// captured live as REL1-LIVE: the destination qword is a heap pointer (ptr_like) whose low dword is
+// a real pointer half, not 0 (init'd) or 1 (signaled) — the paired DmaData init never ran and the
+// guest already freed the recycled label back to the allocator. Writing our 4-byte 1 over +0 forges
+// 0x10000000_00000001 (or a 0x2001... pool pointer) — the exact #312 fatal family. Suppress it.
+static bool rel1_stomp_guard() {
+    static const bool v = [] { const char* e = getenv("PROSPER_REL1_STOMP_GUARD");
+                               return !e || strtol(e, nullptr, 0) != 0; }();   // default ON
+    return v;
+}
 // Honor a RELEASE_MEM / EVENT_WRITE_EOP completion write. data_sel (Kyty GraphicsCbReleaseMem allows {2,3};
 // shadPS4 DataSelect enum): 1=write 32-bit value, 2=write 64-bit value, 3=write 64-bit GPU clock. The write
 // uses memcpy so an only-4-byte-aligned 64-bit label is handled portably. CONFIDENCE: HIGH — address,
@@ -314,8 +333,22 @@ static void honor_eop_write(const Pm4Command& c) {
                   //   low==1 && high!=0 -> REL1-NOINIT: recycled label re-fenced without its DmaData.
                   uint32_t pre_low = (uint32_t)pre;
                   if (pre_low != 0) {
-                      if (ptr_like(pre) && pre_low != 1)
+                      if (ptr_like(pre) && pre_low != 1) {
                           report_suspect_write("REL1-LIVE", c.rel_addr, c.rel_value, pre, pkt_addr(c));
+                          // #312 FIX (the WHERE leg): dst holds a live MallocBinned3 freelist/pool
+                          // next-pointer, not an initialized consumed-marker label — its paired
+                          // DmaData(:=0) init never landed (a valid label reads low-dword 0 here).
+                          // The guest already freed this recycled 0x20 block, so no WaitRegMem==1
+                          // consumer can be satisfied by it anyway (the pointer's low dword != 1);
+                          // performing the 4-byte value-1 write would forge 0x10000000_00000001 and
+                          // corrupt the freelist — the exact #312 fatal. Suppress it. Gated to the
+                          // consumed-marker population so plain fence labels (Messenger) are never
+                          // affected. CONFIDENCE: HIGH (mechanism captured live, sessions 2-5).
+                          if (rel1_stomp_guard() && label_is_consumed_marker(c.rel_addr)) {
+                              label_hist_rel_exec(c.rel_addr, pre);   // ring visibility; write skipped
+                              return;
+                          }
+                      }
                       else if (pre_low == 1 && (pre >> 32))
                           report_suspect_write("REL1-NOINIT", c.rel_addr, c.rel_value, pre, pkt_addr(c));
                   }
@@ -335,6 +368,18 @@ static void honor_eop_write(const Pm4Command& c) {
                   ring_record(c.rel_addr, v, 4, 1, pkt_addr(c));
                   label_hist_rel_exec(c.rel_addr, pre); break; }
         case 2: { if (!c.rel_value_valid) return;
+                  // #312: the same freelist-stomp guard as the 32-bit path. An 8-byte value-1 fence
+                  // over a live consumed-marker freelist node overwrites BOTH the next-pointer dwords
+                  // (observed live: 8-byte kind=1 writes to a hot recycled label preceding a canary
+                  // fatal). Skip when the target still holds a live heap pointer (its DmaData init
+                  // never landed) — see honor case 1. CONFIDENCE: HIGH.
+                  uint64_t pre = 0; memcpy(&pre, dst, sizeof pre);
+                  if (rel1_stomp_guard() && ptr_like(pre) && (uint32_t)pre != 0 &&
+                      pre != c.rel_value && label_is_consumed_marker(c.rel_addr)) {
+                      report_suspect_write("REL2-LIVE", c.rel_addr, c.rel_value, pre, pkt_addr(c));
+                      label_hist_rel_exec(c.rel_addr, pre);   // ring visibility; write skipped
+                      return;
+                  }
                   uint64_t v = c.rel_value;           memcpy(dst, &v, sizeof v);
                   ring_record(c.rel_addr, v, 8, 1, pkt_addr(c)); break; }
         case 3: { uint64_t v = gpu_clock64();         memcpy(dst, &v, sizeof v);
