@@ -107,6 +107,20 @@ namespace {
     bool     g_lwatch_stepping = false;
     uint64_t g_lwatch_step_rip = 0;
     volatile sig_atomic_t g_lwatch_hits = 0;
+    // #312 value-triggered mode (PROSPER_WATCH_SHIFT=1): instead of logging every write into the
+    // watched block (drowns in benign MB3 alloc/free traffic and disarms before the rare stomp),
+    // single-step SILENTLY and only emit a record when a write leaves a BYTE-SHIFTED pool pointer
+    // (top 32 bits zero, (v<<8) inside the FPoolInfo region [0x2000000000,0x2100000000)) at the
+    // faulting address — the primary #312 corruptor's signature (0x20015f0000 stored as 0x20015f00).
+    // Never disarms on benign writes, so it survives the whole content-load burst to catch the store.
+    bool     g_lwatch_shift = false;         // latched at arm time
+    uint64_t g_lwatch_fa = 0;                // faulting store address captured on SIGSEGV
+    uint64_t g_lwatch_stk[8] = {0};          // guest-RA call stack captured on SIGSEGV
+    int      g_lwatch_stkn = 0;
+    static inline bool lwatch_is_pool_shift(uint64_t v) {
+        return (v >> 32) == 0 && ((v << 8) >= 0x2000000000ull && (v << 8) < 0x2100000000ull);
+    }
+    bool g_bp_shift = false;   // PROSPER_BP_SHIFT=1: only log a BP hit when rsi is a pool-shifted ptr
     // PROSPER_BP=0xOFFSET (guest image offset): int3 code-breakpoint that LOGS registers at each hit,
     // then steps over and re-arms. Diagnostic (never changes control flow). Used to enumerate the
     // GfxDevice drain (proved every category-{5,9,15,18,19} pipeline has a null [+0x140] companion).
@@ -962,20 +976,48 @@ namespace {
             uint64_t rip = (uint64_t)uc->uc_mcontext.gregs[REG_RIP];
             if (rip == g_bp_addr + 1) {
                 uint64_t r15 = (uint64_t)uc->uc_mcontext.gregs[REG_R15];
-                if (g_bp_count < g_bp_max) {
+                auto& gr0 = uc->uc_mcontext.gregs;
+                // PROSPER_BP_SHIFT=1 (#312): only log when the store source rsi is a byte-shifted pool
+                // pointer (the primary corruptor's value). Filters the freelist push/pop hot path down
+                // to just the corrupting event, so timing is barely perturbed and the log is decisive.
+                bool bp_pass = !g_bp_shift ||
+                    lwatch_is_pool_shift((uint64_t)gr0[REG_RSI]) ||
+                    lwatch_is_pool_shift((uint64_t)gr0[REG_R10]) ||
+                    lwatch_is_pool_shift((uint64_t)gr0[REG_RAX]) ||
+                    lwatch_is_pool_shift((uint64_t)gr0[REG_RDX]) ||
+                    lwatch_is_pool_shift((uint64_t)gr0[REG_RCX]);
+                if (bp_pass && g_bp_count < g_bp_max) {
                     g_bp_count = g_bp_count + 1;
                     auto rd = [](uint64_t a) -> unsigned long long {
                         return probe_readable(a) ? (unsigned long long)*(const uint64_t*)a : 0xBADBADull; };
                     auto& gr = uc->uc_mcontext.gregs;
                     uint64_t rdi = (uint64_t)gr[REG_RDI], rsi = (uint64_t)gr[REG_RSI];
                     uint64_t rax = (uint64_t)gr[REG_RAX], r14 = (uint64_t)gr[REG_R14];
-                    char b[320];
+                    uint64_t rcx = (uint64_t)gr[REG_RCX];
+                    uint64_t r10 = (uint64_t)gr[REG_R10], rdx = (uint64_t)gr[REG_RDX];
+                    uint64_t r8 = (uint64_t)gr[REG_R8];
+                    char b[512];
                     int n = snprintf(b, sizeof b,
-                        "[bp] #%d rdi=0x%llx rsi=0x%llx rax=0x%llx r14=0x%llx r15=0x%llx [rdi]=0x%llx [rdi+0x1e4c]=0x%llx tid=%ld\n",
-                        (int)g_bp_count, (unsigned long long)rdi, (unsigned long long)rsi,
-                        (unsigned long long)rax, (unsigned long long)r14, (unsigned long long)r15,
-                        rd(rdi), (unsigned long long)(probe_readable(rdi+0x1e4c) ? *(const uint32_t*)(rdi+0x1e4c) : 0xBADBAD),
+                        "[bp] #%d rsi=0x%llx r10=0x%llx rdx=0x%llx rcx=0x%llx r8=0x%llx rax=0x%llx rdi=0x%llx r14=0x%llx r15=0x%llx [rdi]=0x%llx [rdi+0x1e4c]=0x%llx tid=%ld",
+                        (int)g_bp_count, (unsigned long long)rsi, (unsigned long long)r10,
+                        (unsigned long long)rdx, (unsigned long long)rcx, (unsigned long long)r8,
+                        (unsigned long long)rax, (unsigned long long)rdi, (unsigned long long)r14,
+                        (unsigned long long)r15, rd(rdi),
+                        (unsigned long long)(probe_readable(rdi + 0x1e4c) ? *(const uint32_t*)(rdi + 0x1e4c) : 0xBADBAD),
                         cur_tid());
+                    // Caller stack: first guest-text return addresses (who called free with this ptr).
+                    uint64_t rsp = (uint64_t)gr[REG_RSP];
+                    int found = 0;
+                    for (uint64_t o = 0; o < 0x200 && found < 8 && n < (int)sizeof b - 24; o += 8) {
+                        if (!probe_readable(rsp + o)) break;
+                        uint64_t v = *(const uint64_t*)(rsp + o);
+                        if (v >= 0x400000000ull && v < 0x40a000000ull) {
+                            n += snprintf(b + n, sizeof b - (size_t)n, " s:%llx",
+                                          (unsigned long long)(v - 0x400000000ull));
+                            found++;
+                        }
+                    }
+                    if (n < (int)sizeof b - 1) b[n++] = '\n';
                     syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
                 }
                 bp_write_byte(g_bp_addr, g_bp_orig);              // restore real instruction
@@ -990,6 +1032,36 @@ namespace {
         if (sig == SIGTRAP && g_lwatch_stepping) {
             auto* uc = (ucontext_t*)uctx;
             uc->uc_mcontext.gregs[REG_EFL] &= ~0x100ll;   // clear TF
+            if (g_lwatch_shift) {
+                // Value-triggered: only report if the just-completed store left a byte-shifted pool
+                // pointer at the faulting address (the primary #312 corruptor). Silent otherwise.
+                uint64_t v = probe_readable(g_lwatch_fa) ? *(const uint64_t*)g_lwatch_fa : 0;
+                if (lwatch_is_pool_shift(v)) {
+                    g_lwatch_hits = g_lwatch_hits + 1;
+                    char b[512];
+                    bool guest = g_lwatch_step_rip >= 0x400000000ull && g_lwatch_step_rip < 0x4c0000000ull;
+                    int n = snprintf(b, sizeof b,
+                        "[lwatch] SHIFT-STOMP fa=0x%llx val=0x%llx (<<8=0x%llx) rip=%s0x%llx tid=%ld",
+                        (unsigned long long)g_lwatch_fa, (unsigned long long)v,
+                        (unsigned long long)(v << 8), guest ? "eboot+" : "host:",
+                        (unsigned long long)(guest ? g_lwatch_step_rip - 0x400000000ull : g_lwatch_step_rip),
+                        cur_tid());
+                    for (int i = 0; i < g_lwatch_stkn && n < (int)sizeof b - 24; i++)
+                        n += snprintf(b + n, sizeof b - (size_t)n, " s:%llx",
+                                      (unsigned long long)(g_lwatch_stk[i] - 0x400000000ull));
+                    if (n < (int)sizeof b - 1) b[n++] = '\n';
+                    syscall(SYS_write, 2, b, (size_t)n);
+                    if (g_lwatch_hits >= g_lwatch_max) {   // caught enough — disarm, leave page RW
+                        mprotect((void*)g_lwatch_page, 0x1000, PROT_READ | PROT_WRITE);
+                        g_lwatch_armed = 0; g_lwatch_stepping = false; g_lwatch_step_rip = 0;
+                        return;
+                    }
+                }
+                g_lwatch_step_rip = 0;
+                if (g_lwatch_armed) mprotect((void*)g_lwatch_page, 0x1000, PROT_READ);
+                g_lwatch_stepping = false;
+                return;
+            }
             if (g_lwatch_step_rip) {   // the stepped write was inside the watched block: log post-value
                 char b[160];
                 int n = snprintf(b, sizeof b, "[lwatch]   -> slot now [0]=0x%llx [8]=0x%llx\n",
@@ -1010,6 +1082,24 @@ namespace {
             if ((fa & ~(uint64_t)0xfff) == g_lwatch_page && (uc->uc_mcontext.gregs[REG_ERR] & 2)) {
                 uint64_t rip = (uint64_t)uc->uc_mcontext.gregs[REG_RIP];
                 g_lwatch_step_rip = 0;
+                if (g_lwatch_shift) {
+                    // Value-triggered: capture writer + stack silently now, decide at SIGTRAP whether
+                    // the store produced the byte-shifted pool pointer. Watch the whole page (any
+                    // write) so the corruptor is caught wherever in the FPoolInfo page it lands.
+                    g_lwatch_fa = fa;
+                    g_lwatch_step_rip = rip;
+                    uint64_t rsp = (uint64_t)uc->uc_mcontext.gregs[REG_RSP];
+                    g_lwatch_stkn = 0;
+                    for (uint64_t o = 0; o < 0x400 && g_lwatch_stkn < 8; o += 8) {
+                        if (!probe_readable(rsp + o)) break;
+                        uint64_t v = *(const uint64_t*)(rsp + o);
+                        if (v >= 0x400000000ull && v < 0x40a000000ull) g_lwatch_stk[g_lwatch_stkn++] = v;
+                    }
+                    mprotect((void*)g_lwatch_page, 0x1000, PROT_READ | PROT_WRITE);
+                    uc->uc_mcontext.gregs[REG_EFL] |= 0x100ll;   // TF -> single-step the write
+                    g_lwatch_stepping = true;
+                    return;
+                }
                 if (fa >= g_lwatch_slot - 0x18 && fa < g_lwatch_slot + 0x20) {
                     g_lwatch_hits = g_lwatch_hits + 1;
                     char b[512];
@@ -1429,12 +1519,14 @@ extern "C" void prosper_arm_label_watch_force(uint64_t addr) {
     if (const char* mx = getenv("PROSPER_WATCH_MAX")) {
         long v = atol(mx); if (v > 0) g_lwatch_max = (int)v;
     }
+    g_lwatch_shift = getenv("PROSPER_WATCH_SHIFT") != nullptr;
     g_lwatch_slot = addr;
     g_lwatch_page = addr & ~(uint64_t)0xfff;
     if (mprotect((void*)g_lwatch_page, 0x1000, PROT_READ) == 0) {
         g_lwatch_armed = 1;
-        fprintf(stderr, "[lwatch] armed slot=0x%llx page=0x%llx max=%d\n",
-                (unsigned long long)addr, (unsigned long long)g_lwatch_page, g_lwatch_max);
+        fprintf(stderr, "[lwatch] armed slot=0x%llx page=0x%llx max=%d shift=%d\n",
+                (unsigned long long)addr, (unsigned long long)g_lwatch_page, g_lwatch_max,
+                g_lwatch_shift ? 1 : 0);
     }
 }
 extern "C" void prosper_arm_label_watch(uint64_t addr) {
@@ -1483,6 +1575,7 @@ void install_trap_handler() {
     g_watch_companion = getenv("PROSPER_WATCH_COMPANION") != nullptr;
     if (const char* r = getenv("PROSPER_SKIP_RIP"))    g_skip_rip    = strtoull(r, nullptr, 0);
     if (const char* t = getenv("PROSPER_SKIP_TARGET")) g_skip_target = strtoull(t, nullptr, 0);
+    g_bp_shift = getenv("PROSPER_BP_SHIFT") != nullptr;
     if (g_faultmem || g_skip_null_companion || g_null_page) ensure_probe_pipe();
     // PROSPER_PEEK="r15:0x140,0x1a0;rbx:0x78,0x88;r15:*0x18+0x0" — N specs (';'), each reg:off[,off];
     // a '*pre+off' offset chases one pointer level ([[reg+pre]+off]). Parsed once (getenv unsafe at fault).
