@@ -306,6 +306,42 @@ static void poolshift_check(const char* kind, uint64_t dst, uint64_t bytes, uint
         }
     }
 }
+// #312 (session-10 capture): the ROOT corruptor forges a freelist next-pointer. A per-thread MB3
+// pool cache head was caught being written 0x20015f00 by the guest allocator's own freelist POP
+// (eboot+0x2316ad2) — propagating an already-corrupt chain whose old head was 0x1000000001. That
+// 0x1000000001 = 0x1000000000 | 1, i.e. a live freelist next-pointer 0x1000000000 (a 64 KiB-aligned
+// block, low dword ZERO) whose low dword was overwritten with our 4-byte fence value 1. The pop then
+// misaligned-reads *(0x1000000001) = the adjacent block's pool pointer 0x20015f0000 shifted one byte
+// = 0x20015f00 (the "byte-shift" is a READ ARTIFACT, not an off-by-one store — this overturns the
+// session-8 theory and unifies all three fatal signatures into ONE root write). The existing
+// REL1-LIVE guard (case 1) MISSES this because it requires pre_low != 0; a 0x1000000000-shaped
+// pointer has pre_low == 0. forges_freelist_ptr() detects that missed case.
+static inline bool forges_freelist_ptr(uint64_t pre, uint64_t width, uint64_t value) {
+    if (!ptr_like(pre)) return false;        // dst must currently hold a heap/pool pointer
+    if ((uint32_t)pre != 0) return false;    // low dword already nonzero -> the REL1-LIVE guard covers it
+    if (width >= 8) return false;            // a full-width write replaces the whole qword (no forge)
+    return (uint32_t)value != 0;             // our sub-qword write makes the low dword nonzero -> pre|value
+}
+// Log-only tripwire (PROSPER_FORGE_TRIP=1): report a GPU write that forges a freelist pointer, with
+// the packet builder callsite — deciding host(GPU)-vs-guest for the root write. Default OFF (no-op).
+static void forge_trip(const char* kind, uint64_t dst, uint64_t pre, uint64_t value, uint64_t width, uint64_t pkt) {
+    static const bool on = getenv("PROSPER_FORGE_TRIP") != nullptr;
+    if (!on || !forges_freelist_ptr(pre, width, value)) return;
+    static std::atomic<int> n{0};
+    if (n.fetch_add(1) < 64)
+        fprintf(stderr, "[agc] FORGE-STOMP kind=%s dst=0x%llx pre=0x%llx val=0x%llx -> 0x%llx pkt=eboot+0x%llx t=%llums\n",
+                kind, (unsigned long long)dst, (unsigned long long)pre, (unsigned long long)value,
+                (unsigned long long)(pre | (value & 0xffffffffull)), (unsigned long long)pkt,
+                (unsigned long long)now_ms());
+}
+// #312 ROOT fix gate (default ON; PROSPER_REL1_FORGE_GUARD=0 for A/B baseline). Suppress a fence
+// write that would forge a freelist next-pointer (see forges_freelist_ptr), gated to the consumed-
+// marker label population so plain fence labels (Messenger) are untouched.
+static bool forge_guard() {
+    static const bool v = [] { const char* e = getenv("PROSPER_REL1_FORGE_GUARD");
+                               return !e || strtol(e, nullptr, 0) != 0; }();   // default ON
+    return v;
+}
 // #312: report one suspicious fence write with its build-journal verdict. kindtag: "REL1" etc.
 //
 // RUN-2026-07-10 FINDING (this instrumentation's own history): the historical "~96 pointer-valued
@@ -400,6 +436,22 @@ static void honor_eop_write(const Pm4Command& c) {
                       }
                       else if (pre_low == 1 && (pre >> 32))
                           report_suspect_write("REL1-NOINIT", c.rel_addr, c.rel_value, pre, pkt_addr(c));
+                  }
+                  // #312 ROOT (session-10): the missed case — pre is a freelist next-pointer with a
+                  // ZERO low dword (0x1000000000-shaped). The pre_low!=0 branch above never sees it,
+                  // so the value-1 write below would forge pre|1 (0x1000000001) and seed the crash.
+                  else if (forges_freelist_ptr(pre, 4, c.rel_value)) {
+                      forge_trip("REL1", c.rel_addr, pre, c.rel_value, 4, pkt_addr(c));
+                      // No consumed-marker gate here (unlike REL1-LIVE): pre == a 0x1000000000-shaped
+                      // freelist next-pointer only ever occurs on a FREED/recycled MB3 block — a live
+                      // fence label (Messenger or DOLL) holds 0 / a small fence value there, never a
+                      // 64 KiB-aligned heap pointer. So this is always a write-after-free; suppressing
+                      // it can never re-block a live WaitRegMem==1 consumer. CONFIDENCE: HIGH.
+                      if (forge_guard()) {
+                          report_suspect_write("REL1-FORGE", c.rel_addr, c.rel_value, pre, pkt_addr(c));
+                          label_hist_rel_exec(c.rel_addr, pre);   // ring visibility; write skipped
+                          return;
+                      }
                   }
                   // In-flight overlap: a second init+fence pair to this label is already built but
                   // not executed — two fence generations in the pipe together (see label_rel_overlap).
@@ -505,6 +557,7 @@ static void honor_dma_data(const Pm4Command& c) {
     uint32_t v32 = (uint32_t)c.dd_src;
     uint8_t* dst = (uint8_t*)(uintptr_t)c.dd_dst;
     uint64_t pre_dma = peek_qword(c.dd_dst);   // #312: pre-content for the label event ring
+    forge_trip("DMA", c.dd_dst, pre_dma, v32, 4, pkt_addr(c));   // #312 session-10 tripwire (log-only)
     if (v32 == 0) {
         memset(dst, 0, c.dd_bytes);
     } else {
@@ -530,6 +583,7 @@ static void honor_write_data(const Pm4Command& c) {
         uint64_t pre = 0; memcpy(&pre, (const void*)(uintptr_t)c.wd_addr, sizeof pre);
         if (ptr_like(pre))
             report_suspect_write("WDATA", c.wd_addr, c.wd_data[0], pre, pkt_addr(c));
+        forge_trip("WDATA", c.wd_addr, pre, c.wd_data[0], 4, pkt_addr(c));   // #312 session-10 tripwire
     }
     memcpy((void*)(uintptr_t)c.wd_addr, c.wd_data, (size_t)c.wd_num * 4);
     ring_record(c.wd_addr, c.wd_data[0], (uint8_t)(c.wd_num * 4 > 255 ? 255 : c.wd_num * 4), 3, pkt_addr(c));

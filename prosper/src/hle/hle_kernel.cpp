@@ -539,8 +539,19 @@ HLE(k_key_create) {
     return 0;
 }
 HLE(k_key_delete)    { pthread_key_delete((pthread_key_t)a0); return 0; }
-HLE(k_getspecific)   { return (uint64_t)(uintptr_t)pthread_getspecific((pthread_key_t)a0); }
-HLE(k_setspecific)   { return (uint64_t)(int64_t)pthread_setspecific((pthread_key_t)a0, (void*)(uintptr_t)a1); }
+HLE(k_getspecific)   {
+    uint64_t rv = (uint64_t)(uintptr_t)pthread_getspecific((pthread_key_t)a0);
+    // #312: the MallocBinned3 per-thread free-block cache base is fetched via getspecific; arm a
+    // per-thread head watch on it the moment this (owning) thread receives it (no-op unless armed).
+    if (g_mb3_arm_hook && rv) g_mb3_arm_hook(rv);
+    return rv;
+}
+HLE(k_setspecific)   {
+    // #312: catch the cache the instant it is FIRST installed (base passed to setspecific), which is
+    // right after allocation — before any head store — the earliest "descriptor established" moment.
+    if (g_mb3_arm_hook && a1) g_mb3_arm_hook(a1);
+    return (uint64_t)(int64_t)pthread_setspecific((pthread_key_t)a0, (void*)(uintptr_t)a1);
+}
 
 // --- event flags (SceKernelEventFlag): a bit pattern with wait/set/clear ---
 namespace {

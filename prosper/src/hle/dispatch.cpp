@@ -32,6 +32,7 @@ namespace {
 void dispatch_set_progress(volatile int* counter) { g_progress = counter; }
 
 void (*g_hwwatch_hook)(uint64_t) = nullptr;   // set by the Linux exec harness (perf HW watchpoints)
+void (*g_mb3_arm_hook)(uint64_t) = nullptr;   // #312: set by the Linux exec harness (PROSPER_MB3WATCH)
 
 namespace { std::vector<ShadowedReg>& shadow_list() { static std::vector<ShadowedReg> s; return s; } }
 

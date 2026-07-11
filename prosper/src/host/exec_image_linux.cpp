@@ -23,6 +23,7 @@
 #include <cerrno>
 #include <map>
 #include <mutex>
+#include <atomic>
 
 namespace prosper {
 
@@ -320,6 +321,59 @@ namespace {
         ioctl(g_hwwatch_fd, PERF_EVENT_IOC_ENABLE, 0);
         int n = snprintf(b, sizeof b, "[hwwatch] armed W-watch at 0x%llx (fd=%d)\n",
                          (unsigned long long)addr, g_hwwatch_fd); syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
+    }
+    // ---- #312 per-thread MallocBinned3 pool-descriptor HEAD watch (PROSPER_MB3WATCH) -----------
+    // The per-run corruptor stomps poolArray[idx].head (struct +0x20, size-class idx=1) of the MB3
+    // per-THREAD free-block cache. That cache's base is the return of pthread_getspecific(key) /
+    // the value passed to pthread_setspecific(key,base) — BOTH prosper HLE calls (k_getspecific /
+    // k_setspecific), so we learn the per-run base in-process. Sessions 1-9's fixed / process-wide
+    // page watches lost the discover-then-arm race: the base varies per run AND the corrupting store
+    // fires on a WORKER thread whose per-thread hardware debug registers a main-thread watch never
+    // observes. Here each guest thread, the instant IT is handed its own cache base (in HLE, on host
+    // %fs), arms a hardware WRITE-watch on base+0x20 on ITS OWN thread — before any store — so the
+    // corrupting write (host or guest) traps on the owning thread with its RIP captured. One HW-DR
+    // per thread (well under the 4/thread limit). A global fd->addr table lets the SIGTRAP handler
+    // attribute a hit without a %fs-fragile thread_local. Default OFF (strict no-op unless armed).
+    bool             g_mb3w_on = false;      // PROSPER_MB3WATCH
+    int              g_mb3w_off = 0x20;      // PROSPER_MB3WATCH_OFF (head slot; idx=1 -> 0x20)
+    int              g_mb3w_nslots = 1;      // PROSPER_MB3WATCH_N (consecutive 0x20-stride slots/thread)
+    struct Mb3W { int fd; uint64_t addr; };
+    Mb3W             g_mb3w[64];
+    unsigned char    g_mb3w_seen[64] = {0};   // per-slot benign-write log budget (see handler)
+    std::atomic<int> g_mb3w_cnt{0};
+    int mb3w_match(int fd) {
+        int n = g_mb3w_cnt.load(std::memory_order_acquire);
+        for (int i = 0; i < n && i < 64; i++) if (g_mb3w[i].fd == fd) return i;
+        return -1;
+    }
+    // Arm on the CURRENT (calling guest) thread. Called from HLE (host %fs) so glibc is safe, but we
+    // use raw syscalls throughout to keep the code identical to the handler's constraints.
+    void mb3w_arm_current_thread(uint64_t base) {
+        if (!g_mb3w_on || !base) return;
+        for (int s = 0; s < g_mb3w_nslots; s++) {
+            uint64_t addr = base + (uint64_t)g_mb3w_off + (uint64_t)s * 0x20ull;
+            int n = g_mb3w_cnt.load(std::memory_order_acquire);
+            bool dup = false;
+            for (int i = 0; i < n && i < 64; i++) if (g_mb3w[i].addr == addr) { dup = true; break; }
+            if (dup || n >= 64) continue;
+            long fd = perf_bp_open(addr, HW_BREAKPOINT_W);
+            if (fd < 0) { char b[128]; int k = snprintf(b, sizeof b,
+                "[mb3watch] arm FAILED addr=0x%llx tid=%ld errno=%d\n",
+                (unsigned long long)addr, cur_tid(), errno);
+                syscall(SYS_write, 2, b, (size_t)k); continue; }
+            fcntl((int)fd, F_SETFL, O_ASYNC);
+            fcntl((int)fd, F_SETSIG, SIGTRAP);
+            struct f_owner_ex ow; ow.type = F_OWNER_TID; ow.pid = (pid_t)syscall(SYS_gettid);
+            fcntl((int)fd, F_SETOWN_EX, &ow);
+            ioctl((int)fd, PERF_EVENT_IOC_ENABLE, 0);
+            int slot = g_mb3w_cnt.fetch_add(1, std::memory_order_acq_rel);
+            if (slot < 64) { g_mb3w[slot].addr = addr; g_mb3w[slot].fd = (int)fd; }
+            char b[176]; int k = snprintf(b, sizeof b,
+                "[mb3watch] ARMED head watch @0x%llx (base=0x%llx off=0x%x) fd=%ld tid=%ld slot=%d\n",
+                (unsigned long long)addr, (unsigned long long)base, g_mb3w_off,
+                fd, cur_tid(), slot);
+            syscall(SYS_write, 2, b, (size_t)k);
+        }
     }
     // PROSPER_PEEK dumps offsets off registers at fault time. Supports N specs separated by ';',
     // each "reg:off,off,..."; an offset may be prefixed '*' to chase one pointer level first
@@ -622,6 +676,66 @@ namespace {
             for (int k = 0; k < 16 && n < (int)sizeof b - 4; k++) n += snprintf(b + n, sizeof b - n, " %02x", p[k]);
             if (n < (int)sizeof b - 1) b[n++] = '\n';
             ssize_t w = syscall(SYS_write, 2, b, (size_t)n); (void)w;
+        }
+        // #312 per-thread MB3 head watch: a hardware WRITE-watch on a poolArray head slot fired.
+        // Write-watchpoints trap AFTER the store, so RIP already points past it — just log the
+        // writer RIP + the value now in the slot and return (the watch stays armed for the next
+        // write). A byte-shifted pool pointer (0x20015f0000 stored as 0x20015f00) IS the corruptor;
+        // dump its full register + guest-stack context. Raw syscalls only (may run on a guest-%fs
+        // worker); globals + fd table, no thread_local.
+        if (sig == SIGTRAP && g_mb3w_cnt.load(std::memory_order_acquire) > 0) {
+            int mi = mb3w_match(si->si_fd);
+            if (mi >= 0) {
+                auto& gr2 = ((ucontext_t*)uctx)->uc_mcontext.gregs;
+                uint64_t addr = g_mb3w[mi].addr;
+                unsigned long long v = *(volatile uint64_t*)addr;
+                uint64_t wr = (uint64_t)gr2[REG_RIP];
+                bool in_eboot = (wr >= 0x400000000ull && wr < 0x420000000ull);
+                bool shifted = lwatch_is_pool_shift(v);
+                // base+0x20 is a HOT free-list head (every idx-1 malloc/free touches it), so logging
+                // every benign write floods I/O and stalls the run before the t~60s corruption burst.
+                // Log only the corruptor (a byte-shifted pool pointer) + the first couple of hits per
+                // slot (confirmation that the watch is live). g_mb3w_hits packs a per-slot small count.
+                if (!shifted && g_mb3w[mi].fd >= 0) {
+                    if (g_mb3w_seen[mi] >= 3) return;   // silent steady-state
+                    g_mb3w_seen[mi]++;
+                }
+                char b[256]; int n = snprintf(b, sizeof b,
+                    "[mb3watch] WRITE [0x%llx]=0x%llx by rip=%s0x%llx tid=%ld%s\n",
+                    (unsigned long long)addr, v, in_eboot ? "eboot+" : "host:",
+                    (unsigned long long)(in_eboot ? wr - 0x400000000ull : wr), cur_tid(),
+                    shifted ? "  <<<<< POOLSHIFT CORRUPTOR" : "");
+                syscall(SYS_write, 2, b, (size_t)n);
+                if (!in_eboot) classify_addr(wr);
+                if (shifted) {
+                    char rb[420]; int rn = snprintf(rb, sizeof rb,
+                        "[mb3watch]   regs rax=0x%llx rbx=0x%llx rcx=0x%llx rdx=0x%llx rsi=0x%llx "
+                        "rdi=0x%llx r8=0x%llx r9=0x%llx r10=0x%llx r11=0x%llx rbp=0x%llx rsp=0x%llx\n",
+                        (unsigned long long)gr2[REG_RAX], (unsigned long long)gr2[REG_RBX],
+                        (unsigned long long)gr2[REG_RCX], (unsigned long long)gr2[REG_RDX],
+                        (unsigned long long)gr2[REG_RSI], (unsigned long long)gr2[REG_RDI],
+                        (unsigned long long)gr2[REG_R8],  (unsigned long long)gr2[REG_R9],
+                        (unsigned long long)gr2[REG_R10], (unsigned long long)gr2[REG_R11],
+                        (unsigned long long)gr2[REG_RBP], (unsigned long long)gr2[REG_RSP]);
+                    syscall(SYS_write, 2, rb, (size_t)rn);
+                    // Guest call stack: scan [rsp, rsp+0x200) for eboot-range return addresses.
+                    uint64_t rsp = (uint64_t)gr2[REG_RSP];
+                    char sb[320]; int sn = snprintf(sb, sizeof sb, "[mb3watch]   guest-stack:");
+                    int found = 0;
+                    for (uint64_t p = rsp; p < rsp + 0x200 && found < 10; p += 8) {
+                        if (!probe_readable(p)) break;
+                        uint64_t ra = *(const uint64_t*)p;
+                        if (ra >= 0x400000000ull && ra < 0x420000000ull) {
+                            sn += snprintf(sb + sn, sizeof sb - sn, " eboot+0x%llx",
+                                           (unsigned long long)(ra - 0x400000000ull));
+                            found++;
+                        }
+                    }
+                    sn += snprintf(sb + sn, sizeof sb - sn, "\n");
+                    syscall(SYS_write, 2, sb, (size_t)sn);
+                }
+                return;
+            }
         }
         // PROSPER_HWBP race-free hardware breakpoint. The perf event is disabled while single-stepping,
         // so a SIGTRAP while g_hwbp_stepping is the step-completion (TF) -> re-enable + clear TF. Any
@@ -1576,6 +1690,19 @@ void install_trap_handler() {
     if (const char* r = getenv("PROSPER_SKIP_RIP"))    g_skip_rip    = strtoull(r, nullptr, 0);
     if (const char* t = getenv("PROSPER_SKIP_TARGET")) g_skip_target = strtoull(t, nullptr, 0);
     g_bp_shift = getenv("PROSPER_BP_SHIFT") != nullptr;
+    // #312 per-thread MB3 head watch: expose an HLE-side arm hook. k_getspecific/k_setspecific call
+    // through it with the per-thread cache base the instant it is handed to the guest; we arm a HW
+    // write-watch on base+0x20 on the OWNING thread, before any store. Region-filtered to the MB3
+    // FPoolInfo/cache range [0x2000000000,0x2100000000) so only real MB3 caches are watched.
+    g_mb3w_on = getenv("PROSPER_MB3WATCH") != nullptr;
+    if (const char* o = getenv("PROSPER_MB3WATCH_OFF")) g_mb3w_off = (int)strtol(o, nullptr, 0);
+    if (const char* n = getenv("PROSPER_MB3WATCH_N"))   g_mb3w_nslots = (int)strtol(n, nullptr, 0);
+    if (g_mb3w_on) {
+        g_mb3_arm_hook = [](uint64_t base) {
+            if (base < 0x2000000000ull || base >= 0x2100000000ull) return;   // MB3 pool-region only
+            mb3w_arm_current_thread(base);
+        };
+    }
     if (g_faultmem || g_skip_null_companion || g_null_page) ensure_probe_pipe();
     // PROSPER_PEEK="r15:0x140,0x1a0;rbx:0x78,0x88;r15:*0x18+0x0" — N specs (';'), each reg:off[,off];
     // a '*pre+off' offset chases one pointer level ([[reg+pre]+off]). Parsed once (getenv unsafe at fault).
@@ -1677,6 +1804,7 @@ void install_trap_handler() {
     if (g_watch_companion || g_bp_on || g_hwbp_on
         || getenv("PROSPER_WATCH_LABEL")
         || getenv("PROSPER_WATCH_ABS")
+        || getenv("PROSPER_MB3WATCH")
         || getenv("PROSPER_WATCH_HOT")) sigaction(SIGTRAP, &sa, nullptr);   // single-step / breakpoint
 }
 
