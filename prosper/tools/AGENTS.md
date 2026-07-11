@@ -23,6 +23,11 @@ the shipped runtime. Build them from `build-linux/` like everything else.
 Verification here is agentic-first (see `docs/VERIFICATION.md`): prefer a
 programmatic check (ctest exit code, `spirv-val`, a snapshot hash) over eyeballing.
 
+To drive any runner through a longer input route, set
+`PROSPER_PAD_SCRIPT=@scripts/<title>/reach-<state>.pad`. Route files use the same
+seconds/flip syntax as inline scripts, accept one entry per line, `#` comments,
+and explicit ranges such as `f300-340:cross`. See `docs/INPUT_REPLAY.md`.
+
 Capture one draw-carrying renderer invocation with:
 
 ```bash

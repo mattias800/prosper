@@ -1,11 +1,12 @@
 # Input replay & checkpoints — reaching a game state to reproduce a bug
 
-> **Status (2026-07-11): inline frame anchoring and the opt-in deterministic clock have landed.**
+> **Status (2026-07-12): frame anchoring, file-loaded routes, and the opt-in deterministic clock have landed.**
 > Current master supports inline `PROSPER_PAD_SCRIPT` entries anchored as `fN:`/`fA-B:` and
 > `PROSPER_DET_CLOCK=1` (fixed `1/PROSPER_DET_FPS`, default 60, per flip). Before the first flip the
 > monotonic clock follows host time so initialization can progress; afterward it intentionally pauses
-> between flips. Realtime/RTC clocks remain tied to host time. File-loaded routes, recording, checked-in
-> scripts, and pad-read screenshot checkpoints remain open in #302. The original design follows.
+> between flips. Realtime/RTC clocks remain tied to host time. `PROSPER_PAD_SCRIPT=@path` loads newline-
+> separated routes with comments and explicit time/flip ranges. Recording, checked-in verified scripts,
+> and pad-read screenshot checkpoints remain open in #302. The original design follows.
 
 ## The problem
 
@@ -36,9 +37,9 @@ Good bones. Two gaps for reaching deep states reliably: the clock is **wall-time
 
 ## Design
 
-### 1. Frame-anchored, file-loadable scripts (core)
+### 1. Frame-anchored, file-loadable scripts (core) - implemented
 - **Anchor to game frames, not wall-time.** Keep the "first pad poll" origin (robust to load time), but measure progress in **flips since first poll** (game logic frames), not elapsed seconds. The Messenger is a fixed-timestep platformer, so wall-time drifts vs game frames on slow llvmpipe vs a fast GPU — frame anchoring makes `f300:cross` reproduce everywhere. Add an `f<frame>:` entry syntax alongside the existing `<seconds>:` (kept for back-compat).
-- **Load from a file.** `PROSPER_PAD_SCRIPT=@path` (or `PROSPER_PAD_SCRIPT_FILE=path`) reads a multi-line script file, so long routes live in the repo, not an env string.
+- **Load from a file.** `PROSPER_PAD_SCRIPT=@path` reads a multi-line script file, so long routes live in the repo, not an env string.
 - **Richer input.** Per-entry hold length, analog stick directions, not just a 300 ms button tap.
 
 ### 2. Record mode in `prosper-app`

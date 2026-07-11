@@ -10,6 +10,9 @@
 #include <cstdint>
 #include <cstring>
 #include <cstddef>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 
 using namespace prosper;
 using namespace prosper::input;
@@ -173,6 +176,32 @@ int main() {
               "frame: at window end (exclusive) -> released");
         CHECK(pad_script_buttons_at(fs, 5.1, hold, /*no frame info*/-1, fhold) == SCE_PAD_BUTTON_OPTIONS,
               "frame: seconds entry still fires with frame_count=-1; frame entry does not");
+
+        // File syntax: newlines/comments, explicit time/frame ranges, and @path loading.
+        auto ranges = parse_pad_script("# checkpoint\n f10-20:cross # hold\n3-4.5:up+cross\n");
+        CHECK(ranges.size() == 2, "route: comments/newlines parse two entries");
+        CHECK(ranges[0].frame_anchored && ranges[0].t_secs == 10.0 && ranges[0].end == 20.0,
+              "route: frame range preserves exclusive end");
+        CHECK(!ranges[1].frame_anchored && ranges[1].t_secs == 3.0 && ranges[1].end == 4.5,
+              "route: time range preserves exclusive end");
+        CHECK(pad_script_buttons_at(ranges, 0.0, hold, 19, fhold) == SCE_PAD_BUTTON_CROSS,
+              "route: frame range active before explicit end");
+        CHECK(pad_script_buttons_at(ranges, 0.0, hold, 20, fhold) == 0,
+              "route: frame range ends exclusively");
+        CHECK(pad_script_buttons_at(ranges, 4.4, hold, -1, fhold) ==
+              (SCE_PAD_BUTTON_UP | SCE_PAD_BUTTON_CROSS), "route: time range active");
+
+        const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
+        const auto route_path = std::filesystem::temp_directory_path() /
+                                ("prosper_test_pad_route_" + std::to_string(unique) + ".pad");
+        { std::ofstream route(route_path); route << "# loaded route\nf7-12:options\n"; }
+        std::string route_error;
+        auto loaded = load_pad_script("@" + route_path.string(), &route_error);
+        CHECK(route_error.empty() && loaded.size() == 1 && loaded[0].frame_anchored && loaded[0].end == 12.0,
+              "route: @path loads and parses a file");
+        std::filesystem::remove(route_path);
+        auto missing = load_pad_script("@/this/prosper/route/does/not/exist.pad", &route_error);
+        CHECK(missing.empty() && !route_error.empty(), "route: missing @path reports an error");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
