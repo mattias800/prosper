@@ -224,6 +224,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         if (d.ps->stencil_enable) { use_stencil = true;
             if (!got_stencil_clear) { stencil_clear = d.ps->stencil_clear_value; got_stencil_clear = true; } }
     }
+    if (const char* v = getenv("PROSPER_STENCIL_CLEAR"))
+        stencil_clear = static_cast<uint32_t>(strtoul(v, nullptr, 0)) & 0xFFu;
     if (getenv("PROSPER_NO_DEPTH"))   use_depth = false;     // diag: isolate depth-test rejection
     if (getenv("PROSPER_NO_STENCIL")) use_stencil = false;   // diag: isolate stencil masking
     const bool use_ds = use_depth || use_stencil;
@@ -408,6 +410,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 bool does_replace = (ps->stencil_pass_op[fb] == REPLACE || ps->stencil_fail_op[fb] == REPLACE ||
                                      ps->stencil_depth_fail_op[fb] == REPLACE);
                 s.reference   = does_replace ? ps->stencil_op_val[fb] : ps->stencil_ref[fb];
+                if (does_replace && s.compareOp == VK_COMPARE_OP_ALWAYS)
+                    if (const char* v = getenv("PROSPER_STENCIL_REPLACE"))
+                        s.reference = static_cast<uint32_t>(strtoul(v, nullptr, 0)) & 0xFFu;
                 return s;
             };
             dss.front = mkop(0); dss.back = mkop(1);

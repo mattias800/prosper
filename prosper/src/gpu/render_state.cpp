@@ -100,8 +100,21 @@ RenderState extract_render_state(const GpuState& st) {
     // only when the game programmed them; the depth attachment's LOAD_OP_CLEAR must use the guest's
     // value (not a fixed 0.5) or a standard depth test wrongly rejects fragments (#371).
     rs.has_depth_clear     = st.cx.count(P::DB_DEPTH_CLEAR) != 0;
+    rs.has_stencil_clear   = st.cx.count(P::DB_STENCIL_CLEAR) != 0;
     rs.depth_clear_value   = rs.has_depth_clear ? flt(rd(st.cx, P::DB_DEPTH_CLEAR)) : 1.0f;
     rs.stencil_clear_value = PM4_FIELD(rd(st.cx, P::DB_STENCIL_CLEAR), DB_STENCIL_CLEAR, CLEAR);
+    rs.db_render_control   = rd(st.cx, P::DB_RENDER_CONTROL);
+    rs.depth_clear_enable = PM4_FIELD(rs.db_render_control, DB_RENDER_CONTROL, DEPTH_CLEAR_ENABLE) != 0;
+    rs.stencil_clear_enable = PM4_FIELD(rs.db_render_control, DB_RENDER_CONTROL, STENCIL_CLEAR_ENABLE) != 0;
+    rs.depth_read_base = addr_of(rd(st.cx, P::DB_Z_READ_BASE), rd(st.cx, P::DB_Z_READ_BASE_HI));
+    rs.depth_write_base = addr_of(rd(st.cx, P::DB_Z_WRITE_BASE), rd(st.cx, P::DB_Z_WRITE_BASE_HI));
+    rs.stencil_read_base = addr_of(rd(st.cx, P::DB_STENCIL_READ_BASE), rd(st.cx, P::DB_STENCIL_READ_BASE_HI));
+    rs.stencil_write_base = addr_of(rd(st.cx, P::DB_STENCIL_WRITE_BASE), rd(st.cx, P::DB_STENCIL_WRITE_BASE_HI));
+    rs.db_shader_control = rd(st.cx, P::DB_SHADER_CONTROL);
+    rs.stencil_test_val_export_enable =
+        PM4_FIELD(rs.db_shader_control, DB_SHADER_CONTROL, STENCIL_TEST_VAL_EXPORT_ENABLE) != 0;
+    rs.stencil_op_val_export_enable =
+        PM4_FIELD(rs.db_shader_control, DB_SHADER_CONTROL, STENCIL_OP_VAL_EXPORT_ENABLE) != 0;
 
     // Color blend state (decoded fields of CB_BLEND0_CONTROL).
     const uint32_t bc = rd(st.cx, P::CB_BLEND0_CONTROL);
@@ -171,6 +184,18 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
         ps.depth_clear_value = (op == 4u || op == 6u) ? 0.0f : 1.0f;
     }
     ps.stencil_clear_value = rs.stencil_clear_value;
+    ps.has_depth_clear = rs.has_depth_clear;
+    ps.has_stencil_clear = rs.has_stencil_clear;
+    ps.db_render_control = rs.db_render_control;
+    ps.depth_clear_enable = rs.depth_clear_enable;
+    ps.stencil_clear_enable = rs.stencil_clear_enable;
+    ps.depth_read_base = rs.depth_read_base;
+    ps.depth_write_base = rs.depth_write_base;
+    ps.stencil_read_base = rs.stencil_read_base;
+    ps.stencil_write_base = rs.stencil_write_base;
+    ps.db_shader_control = rs.db_shader_control;
+    ps.stencil_test_val_export_enable = rs.stencil_test_val_export_enable;
+    ps.stencil_op_val_export_enable = rs.stencil_op_val_export_enable;
 
     // Stencil: compare func from DB_DEPTH_CONTROL (STENCILFUNC / _BF), ops from DB_STENCIL_CONTROL,
     // ref/masks from DB_STENCILREFMASK[_BF]. [0]=front, [1]=back. Only meaningful when stencil_enable.
@@ -205,6 +230,8 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
             { PM4_FIELD(sc, DB_STENCIL_CONTROL, STENCILFAIL),    PM4_FIELD(sc, DB_STENCIL_CONTROL, STENCILZPASS),    PM4_FIELD(sc, DB_STENCIL_CONTROL, STENCILZFAIL) },
             { PM4_FIELD(sc, DB_STENCIL_CONTROL, STENCILFAIL_BF), PM4_FIELD(sc, DB_STENCIL_CONTROL, STENCILZPASS_BF), PM4_FIELD(sc, DB_STENCIL_CONTROL, STENCILZFAIL_BF) },
         };
+        for (int fb = 0; fb < 2; fb++)
+            for (int k = 0; k < 3; k++) ps.raw_stencil_op[fb][k] = raw_ops[fb][k] & 0xFu;
         for (int fb = 0; fb < 2; fb++) {
             bool ones = false, rtest = false;
             for (int k = 0; k < 3; k++) { uint32_t o = raw_ops[fb][k] & 0xFu; if (o == 2u) ones = true; else if (o == 3u) rtest = true; }

@@ -1,5 +1,11 @@
 # NEXT STEP — bindless-dynamic vertex fetch → the first real game frame
 
+> **SUPERSEDED (2026-07-11).** This document describes an old state where the Messenger vertex shader
+> did not recompile. Dynamic vertex-fetch resolution, per-PC descriptor provenance, and the associated
+> resource plumbing have since landed. Do not use the TL;DR, reproduction output, or expected result
+> below as current status. Start from `MESSENGER_BLACK_RENDER.md` and GitHub issues #299, #300, #514,
+> and #515. The remainder is retained as implementation history.
+>
 > **Project context (read `../../CLAUDE.md` first).** prosper is a **PS5→PC compatibility layer** —
 > "Wine/Proton for PS5" — that runs a **legally-owned** game natively by reimplementing Sony's published
 > library ABI and translating the console's GPU commands + RDNA2 shaders to Vulkan/SPIR-V. This is

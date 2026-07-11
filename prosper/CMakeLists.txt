@@ -26,6 +26,12 @@ if(PROSPER_SRC)
   add_library(prosper_core STATIC ${PROSPER_SRC})
   target_include_directories(prosper_core PUBLIC src)
   target_compile_definitions(prosper_core PRIVATE PROSPER_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+  execute_process(COMMAND git rev-parse --verify HEAD WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/.."
+                  OUTPUT_VARIABLE PROSPER_GIT_REVISION OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  if(NOT PROSPER_GIT_REVISION)
+    set(PROSPER_GIT_REVISION "unknown")
+  endif()
+  target_compile_definitions(prosper_core PRIVATE PROSPER_GIT_REVISION="${PROSPER_GIT_REVISION}")
   find_package(Threads REQUIRED)
   target_link_libraries(prosper_core PUBLIC Threads::Threads)
 endif()
@@ -336,6 +342,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_shader_resources PRIVATE prosper_core)
   add_test(NAME shader_resource_contract COMMAND test_shader_resources)
 
+  # Versioned realized-draw capture: explicit round-trip, overlapping-resource alias preservation,
+  # owned replay backing, and corrupt/truncated input rejection. Pure; no Vulkan or game dump.
+  add_executable(test_gpu_capture tests/test_gpu_capture.cpp)
+  target_link_libraries(test_gpu_capture PRIVATE prosper_core)
+  add_test(NAME gpu_capture_roundtrip COMMAND test_gpu_capture)
+
   # Front-half resource-table builder + V# descriptor decode (agc_shader_layout.cpp): shader user_data
   # + user-data SGPRs -> ShaderResourceTable (constant buffers, stage 1). Pure/cross-platform.
   add_executable(test_build_shader_resources tests/test_build_shader_resources.cpp)
@@ -441,6 +453,19 @@ if(TARGET prosper_core)
       target_link_libraries(prosper_live_renderer PUBLIC prosper_core Vulkan::Vulkan)
       target_include_directories(prosper_live_renderer PUBLIC frontends/shared)
       target_link_libraries(boot_trace PRIVATE prosper_live_renderer)
+
+      # Local-only realized-submit replayer (#514): no guest boot, reads a versioned capture whose game
+      # data remains gitignored, renders it through the same live backend, and checks the captured hash.
+      add_executable(gpu_replay tools/gpu_replay/gpu_replay.cpp)
+      target_include_directories(gpu_replay PRIVATE src tests)
+      target_link_libraries(gpu_replay PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
+
+      # Capture -> serialize -> owned replay backing -> SAME live renderer -> pixels. This specifically
+      # proves replay textures do not dereference the captured guest VA and still sample exact bytes.
+      add_executable(test_gpu_capture_render tests/test_gpu_capture_render.cpp)
+      target_include_directories(test_gpu_capture_render PRIVATE src tests tools/boot_trace)
+      target_link_libraries(test_gpu_capture_render PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
+      add_test(NAME gpu_capture_render_replay COMMAND test_gpu_capture_render)
 
       # screenshot: run a game and capture a PNG every N frames (default 60) until M shots (default
       # 30). Reuses boot_program + the shared live renderer; writes zlib-compressed PNGs (needs zlib).

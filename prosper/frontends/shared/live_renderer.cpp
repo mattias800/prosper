@@ -102,6 +102,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 if (!t) return;
                 for (auto& r : t->resources) {
                     prosper::test::FrameResource fr; fr.binding = r.binding; fr.set = set;
+                    // Captured replays preserve the logical guest address for RT identity but provide
+                    // owned bytes here. Production resources leave host_data null and use guest memory.
+                    auto copy_resource = [&](uint8_t* dst, uint64_t addr, size_t n) -> size_t {
+                        if (!r.host_data) return safe_copy(dst, addr, n);
+                        if (addr < r.gpu_addr) return 0;
+                        uint64_t off = addr - r.gpu_addr;
+                        if (off >= r.host_data_size) return 0;
+                        size_t take = static_cast<size_t>(std::min<uint64_t>(n, r.host_data_size - off));
+                        std::memcpy(dst, r.host_data + off, take);
+                        return take;
+                    };
                     if (r.cls == RC::Texture || r.cls == RC::StorageImage) {
                         uint32_t tw = r.width ? r.width : 4, th = r.height ? r.height : 4;
                         const bool is_cube = r.img_dim == 3u;   // CUBE: six faces stacked vertically (#273)
@@ -186,9 +197,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                     std::vector<uint8_t> lin(comp, 0);
                                     if (ctiled) {
                                         std::vector<uint8_t> traw(stride, 0);
-                                        safe_copy(traw.data(), r.gpu_addr + (uint64_t)fface * stride, stride);
+                                        copy_resource(traw.data(), r.gpu_addr + (uint64_t)fface * stride, stride);
                                         prosper::gpu::detile_elements(lin.data(), traw.data(), stride, bw, bh, cb, r.tile_mode);
-                                    } else safe_copy(lin.data(), r.gpu_addr + (uint64_t)fface * stride, comp);
+                                    } else copy_resource(lin.data(), r.gpu_addr + (uint64_t)fface * stride, comp);
                                     std::vector<uint8_t> face((size_t)tw * th * 4, 0);
                                     prosper::gpu::bc_decode_surface(face.data(), lin.data(), lin.size(), tw, th, r.format);
                                     std::memcpy(slice, face.data(), face.size());
@@ -197,9 +208,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                     size_t stride = ctiled ? prosper::gpu::tiled_surface_bytes(tw, th, r.tile_mode, 0) : fb;
                                     if (ctiled) {
                                         std::vector<uint8_t> traw(stride, 0);
-                                        safe_copy(traw.data(), r.gpu_addr + (uint64_t)fface * stride, stride);
+                                        copy_resource(traw.data(), r.gpu_addr + (uint64_t)fface * stride, stride);
                                         prosper::gpu::detile_surface(slice, traw.data(), tw, th, r.tile_mode, 0);
-                                    } else safe_copy(slice, r.gpu_addr + (uint64_t)fface * stride, fb);
+                                    } else copy_resource(slice, r.gpu_addr + (uint64_t)fface * stride, fb);
                                 }
                             }
                             cube_done = true;
@@ -220,10 +231,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             if (tiled) {
                                 size_t tbytes = prosper::gpu::tiled_elements_bytes(bw, bh, bcb, r.tile_mode);
                                 std::vector<uint8_t> traw(tbytes, 0);
-                                safe_copy(traw.data(), r.gpu_addr, tbytes);
+                                copy_resource(traw.data(), r.gpu_addr, tbytes);
                                 prosper::gpu::detile_elements(lin.data(), traw.data(), tbytes, bw, bh, bcb, r.tile_mode);
                             } else {
-                                safe_copy(lin.data(), r.gpu_addr, comp_bytes);
+                                copy_resource(lin.data(), r.gpu_addr, comp_bytes);
                             }
                             prosper::gpu::bc_decode_surface(texstore.back().data(), lin.data(), lin.size(), tw, th, r.format);
                         } else if (f16) {
@@ -244,11 +255,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             if (tiled) {
                                 size_t tbytes = prosper::gpu::tiled_surface_bytes(tw, th, r.tile_mode, 0, bpt);
                                 std::vector<uint8_t> traw(tbytes, 0);
-                                size_t got = safe_copy(traw.data(), r.gpu_addr, tbytes);
-                                if (got < hlin.size()) safe_copy(hlin.data(), r.gpu_addr, hlin.size());  // short backing -> linear fallback
+                                size_t got = copy_resource(traw.data(), r.gpu_addr, tbytes);
+                                if (got < hlin.size()) copy_resource(hlin.data(), r.gpu_addr, hlin.size());  // short backing -> linear fallback
                                 else prosper::gpu::detile_surface(hlin.data(), traw.data(), tw, th, r.tile_mode, 0, bpt);
                             } else {
-                                safe_copy(hlin.data(), r.gpu_addr, hlin.size());
+                                copy_resource(hlin.data(), r.gpu_addr, hlin.size());
                             }
                             for (size_t t = 0; t < (size_t)tw * th; t++) {
                                 uint8_t* p = &texstore.back()[t * 4];
@@ -272,7 +283,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             if (tiled) {
                                 size_t tbytes = prosper::gpu::tiled_surface_bytes(tw, th, r.tile_mode, 0, bpt);
                                 std::vector<uint8_t> traw(tbytes, 0);
-                                size_t got = safe_copy(traw.data(), r.gpu_addr, tbytes);
+                                size_t got = copy_resource(traw.data(), r.gpu_addr, tbytes);
                                 // PROSPER_DUMP_RAWTILE (narrow path): the single/dual-channel RAW TILED bytes,
                                 // once per address, for offline 8-bpp de-swizzle sweeps (the SDF font atlas).
                                 if (getenv("PROSPER_DUMP_RAWTILE") && got >= nlin.size() && tw <= 2048 && th <= 1024) {
@@ -285,10 +296,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                             fprintf(stderr, "[render] narrow raw tiled -> %s (%zu, bpt=%u)\n", bn, traw.size(), bpt); fflush(stderr); }
                                     }
                                 }
-                                if (got < nlin.size()) safe_copy(nlin.data(), r.gpu_addr, nlin.size());  // short backing -> linear fallback
+                                if (got < nlin.size()) copy_resource(nlin.data(), r.gpu_addr, nlin.size());  // short backing -> linear fallback
                                 else prosper::gpu::detile_surface(nlin.data(), traw.data(), tw, th, r.tile_mode, 0, bpt);
                             } else {
-                                safe_copy(nlin.data(), r.gpu_addr, nlin.size());
+                                copy_resource(nlin.data(), r.gpu_addr, nlin.size());
                             }
                             for (size_t t = 0; t < (size_t)tw * th; t++) {
                                 uint8_t v = nlin[t * bpt];   // first (coverage) channel
@@ -297,7 +308,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             }
                             narrow_done = true;   // already detiled+expanded; skip the 32-bpp auto-detile below
                         } else {
-                            safe_copy(texstore.back().data(), r.gpu_addr, nb);
+                            copy_resource(texstore.back().data(), r.gpu_addr, nb);
                         }
                         // PROSPER_DUMP_RAWTEX: write the raw tiled RGBA bytes (pre-detile) to a .bin for
                         // offline swizzle experimentation.
@@ -331,7 +342,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             const uint32_t pitch = getenv("PROSPER_PITCH") ? (uint32_t)atoi(getenv("PROSPER_PITCH")) : 0;
                             size_t tiled_bytes = prosper::gpu::tiled_surface_bytes(tw, th, tmode, pitch);
                             std::vector<uint8_t> tiled(tiled_bytes, 0);
-                            size_t got = safe_copy(tiled.data(), r.gpu_addr, tiled_bytes);
+                            size_t got = copy_resource(tiled.data(), r.gpu_addr, tiled_bytes);
                             if (got < nb)
                                 // The padded tiled buffer's tail (th rounded to whole 32-row tiles) runs past
                                 // the real backing: fall back to the width*height linear bytes copied above
@@ -417,7 +428,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         uint32_t nb = std::min(r.size ? r.size : 256u, 1u << 20) & ~3u;   // cap 1 MB, dword-aligned
                         if (nb >= 4) {
                             std::vector<uint8_t> tmp(nb, 0);
-                            if (safe_copy(tmp.data(), r.gpu_addr, nb) > 0)
+                            if (copy_resource(tmp.data(), r.gpu_addr, nb) > 0)
                                 fr.dwords.assign((const uint32_t*)tmp.data(), (const uint32_t*)(tmp.data() + nb));
                         }
                         if (fr.dwords.empty()) fr.dwords.assign(64, 0);

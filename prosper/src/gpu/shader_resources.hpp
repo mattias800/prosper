@@ -150,6 +150,12 @@ struct ShaderResource {
     // mask) reads correctly. Default = identity (R,G,B,A). NOT applied on the narrow R->RGBA replication
     // path (that already broadcasts coverage to every channel).
     uint32_t      swizzle[4]        = {4, 5, 6, 7};
+
+    // Replay-only backing. `gpu_addr` remains the captured logical guest address so render-target
+    // identity/alias checks stay faithful; the live renderer reads from host_data when non-null.
+    // Production resource tables leave both fields zero and continue reading 1:1 guest memory.
+    const uint8_t* host_data        = nullptr;
+    uint64_t       host_data_size   = 0;
 };
 
 // The set of resources a shader uses. The front-half builds it from the shader's user_data; the
