@@ -43,10 +43,10 @@ and resource-producer provenance (#524) established this causal chain:
    calls, eight distinct native texture pointers, and the corresponding live descriptor addresses all change.
    That transition eventually produces the expected colored scene before the grading pass erases it.
 
-The black first-level root cause is therefore a missing shader instruction plus loss of per-target dimensions,
-not depth, a stuck palette fade, compute LUT baking, or detiling of the 256x16 palette. The real fix is currently
-validated on local branch `fix/issue-522-post-pass`; #522 should close only after the implementation merges and
-a clean build repeats the route without diagnostic force-render flags.
+The black first-level root cause was therefore a missing shader instruction plus loss of per-target dimensions,
+not depth, a stuck palette fade, compute LUT baking, or detiling of the 256x16 palette. The fix merged as #528
+(`e5fce22`) after a clean exact-route run without the identity-LUT substitution: the LUT, grading output, and
+selected VideoOut front buffer remained nonblack across consecutive flips. #300 and #522 are closed.
 
 The old bindless vertex-fetch frontier is solved, and `NEXT_STEP_VERTEX_FETCH.md` is historical. Earlier
 #300 claims about texture decode, alpha, transform collapse, render-target propagation, and a missing
@@ -66,17 +66,17 @@ Every new finding posted to #300 or #522 must include:
 A diagnostic override proves only the boundary it changes. Call something a root cause only when a real fix
 changes the same failing replay/live state and a regression fails before and passes after it.
 
-## Required merge validation
+## Completed merge validation
 
-Before closing #522:
+The #528 merge gate completed all of the following:
 
-1. Run the focused recompiler, command-processor, render-state, and capture tests plus the full CTest suite.
-2. Repeat the exact saved gameplay route from a clean build with no `PROSPER_TESTLUT32` override. The targeted
+1. Ran the focused recompiler, command-processor, render-state, and capture tests plus the full CTest suite.
+2. Repeated the exact saved gameplay route from a clean build with no `PROSPER_TESTLUT32` override. The targeted
    `PROSPER_RENDER_RESOURCE_DIM=1024x32` run is valid producer/consumer proof, but normal gameplay must not depend
    on that diagnostic selection flag.
-3. Confirm the front buffer, not only an intermediate target, contains the landscape for multiple consecutive
-   flips. Record the revision, route, environment, and representative RGB-nonblack counts on #522.
-4. Keep the identity-LUT override and retained provenance tools diagnostic-only. They are useful for future
+3. Confirmed the front buffer, not only an intermediate target, contains the landscape for multiple consecutive
+   flips; the revision, route, environment, and representative RGB-nonblack counts are recorded on #522.
+4. Kept the identity-LUT override and retained provenance tools diagnostic-only. They are useful for future
    first-bad-contract investigations but are not part of normal title behavior.
 
 ## Tooling
@@ -90,10 +90,13 @@ dumping, and shader dumping for offline work. Captures contain game data and rem
 
 ### Strict shader/resource contract (#515)
 
-Validate the descriptor interface declared by generated SPIR-V against the runtime `ShaderResourceTable`:
-set/binding, descriptor class, stage visibility, guest address, byte range, stride, format, and statically
-known accessed offsets. Strict diagnostic mode must reject missing, ambiguous, wrong-type, or undersized
-resources before Vulkan robust-buffer behavior silently turns them into zeros.
+`PROSPER_DESCRIPTOR_VALIDATE=warn` reflects the statically used SPIR-V descriptor interface and reports
+set/binding, descriptor class, stage visibility, runtime provenance, and provable buffer ranges.
+`PROSPER_DESCRIPTOR_VALIDATE=strict` rejects malformed, missing, ambiguous, wrong-type, or undersized bindings
+before Vulkan submission. `poison` continues with NaN-like buffers or magenta/cyan textures at invalid bindings.
+Use `gpu_replay --validate CAPTURE.prgcap` for the same deterministic check without creating Vulkan objects.
+An all-zero address/size buffer descriptor is an intentional hardware null/zero-read binding, distinct from an
+absent table entry. Graphics storage images remain a separate backend limitation tracked by #374.
 
 ### Resource producer provenance (#524)
 

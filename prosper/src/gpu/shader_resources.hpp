@@ -13,6 +13,7 @@
 // and the staged implementation plan.
 #pragma once
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace prosper::gpu {
@@ -180,5 +181,77 @@ struct ShaderResourceTable {
     // Resolve by assigned Vulkan binding (the pipeline's lookup); nullptr if none.
     const ShaderResource* by_binding(uint32_t binding) const;
 };
+
+// Descriptor interface reflected from generated SPIR-V. This deliberately models only descriptor
+// classes emitted by prosper's recompiler; I/O variables and inactive declarations are excluded.
+enum class SpirvDescriptorKind : uint32_t {
+    Unknown,
+    StorageBuffer,
+    CombinedImageSampler,
+    StorageImage,
+};
+
+enum class SpirvShaderStage : uint32_t {
+    Vertex = 0,
+    Fragment = 4,
+    Compute = 5,
+    Unknown = 0xFFFFFFFFu,
+};
+
+struct SpirvDescriptorBinding {
+    uint32_t variable_id = 0;
+    uint32_t set = 0;
+    uint32_t binding = 0;
+    SpirvDescriptorKind kind = SpirvDescriptorKind::Unknown;
+    SpirvShaderStage stage = SpirvShaderStage::Unknown;
+    // Minimum byte range proven by constant access-chain indices. `dynamic_access` means a larger
+    // runtime range may be addressed, so validation cannot derive an upper bound from SPIR-V alone.
+    uint64_t required_bytes = 0;
+    bool dynamic_access = false;
+};
+
+enum class DescriptorIssueCode : uint32_t {
+    MalformedSpirv,
+    StageMismatch,
+    SetMismatch,
+    MissingBinding,
+    DuplicateBinding,
+    WrongType,
+    InvalidAddress,
+    InvalidBufferMetadata,
+    InvalidImageMetadata,
+    UndersizedBuffer,
+    UnusedRuntimeBinding,
+};
+
+struct DescriptorValidationIssue {
+    DescriptorIssueCode code = DescriptorIssueCode::MalformedSpirv;
+    bool error = true;
+    uint32_t set = 0;
+    uint32_t binding = 0;
+    SpirvDescriptorKind expected = SpirvDescriptorKind::Unknown;
+    SpirvDescriptorKind actual = SpirvDescriptorKind::Unknown;
+    uint64_t required_bytes = 0;
+    uint64_t available_bytes = 0;
+};
+
+struct DescriptorValidationReport {
+    std::vector<SpirvDescriptorBinding> descriptors;
+    std::vector<DescriptorValidationIssue> issues;
+    bool ok() const;
+};
+
+// Reflect the statically-used descriptor interface and validate it against one stage's runtime
+// table. `expected_set`/`expected_stage` catch stage visibility mistakes (VS=set 0, PS=set 1).
+// Unused runtime resources are warnings; every other issue rejects strict mode.
+DescriptorValidationReport validate_spirv_descriptor_interface(
+    const std::vector<uint32_t>& spirv,
+    const ShaderResourceTable* runtime,
+    uint32_t expected_set,
+    SpirvShaderStage expected_stage,
+    bool report_unused = true);
+
+const char* spirv_descriptor_kind_name(SpirvDescriptorKind kind);
+const char* descriptor_issue_name(DescriptorIssueCode code);
 
 } // namespace prosper::gpu

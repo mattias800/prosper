@@ -79,20 +79,18 @@ V#/T#/S# resources resolve on current master. Do **not** start from `NEXT_STEP_V
 retained as a historical bring-up record.
 
 The save-game list is visible (#299 closed), and retaining color-disabled depth/stencil passes (#520) recovers
-the first level's source scene. The black gameplay root cause is now proven locally on `fix/issue-522-post-pass`:
+the first level's source scene. The black gameplay root cause was fixed on master by #528 (`e5fce22`):
 the direct 1024x32 RGBA16F grading-LUT producer was skipped because the recompiler lacked
 `V_CVT_OFF_F32_I4`, while the live renderer also treated its offscreen target as a VideoOut-sized surface.
 Resource-producer history (#524) identified the exact writer; implementing the opcode and decoding
 `CB_COLOR0_ATTRIB2` target dimensions (#526/#527) produces the real LUT, preserves it through the original
 grading shader, and yields a visible first-level front buffer without diagnostic resource substitution.
 
-Until that branch merges, use `prosper/docs/MESSENGER_BLACK_RENDER.md` for the exact evidence and validation
-route. After merge, the immediate frontier returns to ordinary gameplay progression: run the same saved route
-without diagnostics, identify the next first-bad contract, and file a narrowly scoped issue with a retained
-capture or provenance trace.
-
-Strict generated-SPIR-V/runtime-resource validation remains #515. Do not restart the superseded depth,
-vertex-fetch, geometry, palette, or tiling hypotheses without contradictory new evidence.
+The immediate frontier is ordinary gameplay progression: run the saved route without diagnostic substitutions,
+identify the next first-bad contract, and file a narrowly scoped issue with a retained capture or provenance
+trace. `PROSPER_DESCRIPTOR_VALIDATE=strict|poison` and `gpu_replay --validate` provide the shader/resource
+contract gate tracked by #515. Do not restart the superseded depth, vertex-fetch, geometry, palette, or tiling
+hypotheses without contradictory new evidence.
 
 ## How to work here
 

@@ -130,6 +130,15 @@ void diagnose_compute_dispatches(const GpuState& st, uint64_t submit_no);
 // PROSPER_PROVENANCE_MIN_DRAWS=N limits expensive descriptor resolution to large target submits.
 void diagnose_resource_provenance(const GpuState& st, uint64_t submit_no);
 
+// PROSPER_DESCRIPTOR_VALIDATE=warn|strict|poison. Reflect the generated stage module and compare
+// every statically-used descriptor with its runtime table before Vulkan sees the draw. Strict rejects
+// errors; warn and poison report and continue (the live backend applies poison substitutions).
+bool validate_runtime_descriptor_contract(const char* stage_name,
+                                           const std::vector<uint32_t>& spirv,
+                                           const ShaderResourceTable* runtime,
+                                           uint32_t expected_set,
+                                           SpirvShaderStage expected_stage);
+
 // Byte size of one index element for a GpuState::index_type (the last SetIndexType value).
 // 0 -> 16-bit, 1 -> 32-bit, exactly Kyty's index_type_and_size switch (GraphicsRender.cpp:4724) and
 // the hardware VGT_INDEX_TYPE encoding; 0 is also the reset default, matching this title, which never
@@ -250,6 +259,14 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                 }
             }
         }
+        return false;
+    }
+    if (!validate_runtime_descriptor_contract("VS", vs, vrt.get(), 0, SpirvShaderStage::Vertex) ||
+        !validate_runtime_descriptor_contract("PS", fs, prt.get(), 1, SpirvShaderStage::Fragment)) {
+        if (log) fprintf(stderr, "[exec] skip draw: strict descriptor contract failed "
+                                "(es=0x%llx ps=0x%llx color0=0x%llx)\n",
+                         (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr,
+                         (unsigned long long)rs.color0_base);
         return false;
     }
     ResolvedPipelineState ps = resolve_pipeline_state(rs);
