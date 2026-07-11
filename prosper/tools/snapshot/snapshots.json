@@ -8,6 +8,21 @@
       "env": {},
       "min_colors": 5000,
       "_note": "Content-metric guard (min_colors): The Messenger's boot render isn't pixel-deterministic across runs (exact hashing AND a single settled frame both flake — the stable screen varies run-to-run). So `check` runs the whole boot and takes the RICHEST frame's distinct-color count — robust to per-frame variance, but still catches the regression that matters: a rejected/dropped shader (the #199/#201/#239 class) collapses every frame to the debug clear (~1 color), while a real render peaks in the tens of thousands (observed ~34k-137k once the scene/cutscene renders). 5000 is a wide margin below that and far above any blue-clear."
+    },
+    {
+      "name": "dead-cells-splash",
+      "dump": "PPSA15552-app0",
+      "scale": 4,
+      "timeout": 20,
+      "frame": 0,
+      "env": {
+        "PROSPER_RENDER_DELAY_MS": "3000"
+      },
+      "hash": "8429fedd427b63d9330e6dc2357699a3d22fd1c0a7b664f873c83955cb8420d0",
+      "dims": [
+        960,
+        540
+      ]
     }
   ]
 }
