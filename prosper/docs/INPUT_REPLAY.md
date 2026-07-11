@@ -1,11 +1,11 @@
 # Input replay & checkpoints — reaching a game state to reproduce a bug
 
-> **Status (2026-07-11): design plus inline frame anchoring landed; the rest remains open in #302.**
-> Current master supports inline `PROSPER_PAD_SCRIPT` entries anchored as `fN:`/`fA-B:`. PR #301 merged
-> only this design document; later branch commits for `@file` routes, recording, checked-in scripts,
-> `PROSPER_DET_CLOCK`, and pad-read screenshot checkpoints did not merge. Issue comments reporting those
-> steps as landed describe `feat/input-replay`, not current master. Re-verify and land them as focused
-> current-master changes before using them as a reproducibility guarantee. The original design follows.
+> **Status (2026-07-11): inline frame anchoring and the opt-in deterministic clock have landed.**
+> Current master supports inline `PROSPER_PAD_SCRIPT` entries anchored as `fN:`/`fA-B:` and
+> `PROSPER_DET_CLOCK=1` (fixed `1/PROSPER_DET_FPS`, default 60, per flip). Before the first flip the
+> monotonic clock follows host time so initialization can progress; afterward it intentionally pauses
+> between flips. Realtime/RTC clocks remain tied to host time. File-loaded routes, recording, checked-in
+> scripts, and pad-read screenshot checkpoints remain open in #302. The original design follows.
 
 ## The problem
 

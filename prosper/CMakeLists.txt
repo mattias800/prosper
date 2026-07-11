@@ -147,6 +147,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_wall_clock PRIVATE prosper_core)
   add_test(NAME wall_clock COMMAND test_wall_clock)
 
+  # Opt-in flip-paced monotonic clock (#240): exact frame steps, thread-safe first-flip anchor,
+  # and no coupling into CLOCK_REALTIME while virtual time is paused between flips.
+  add_executable(test_det_clock tests/test_det_clock.cpp)
+  target_link_libraries(test_det_clock PRIVATE prosper_core)
+  add_test(NAME det_clock COMMAND test_det_clock)
+
   # UserService/libkernel startup stubs (HLE audit): getters write deterministic defaults; the
   # libkernel registration/hook calls resolve to benign OK no-ops.
   add_executable(test_service_getters tests/test_service_getters.cpp)

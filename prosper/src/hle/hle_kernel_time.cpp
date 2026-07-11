@@ -36,25 +36,53 @@ extern "C" uint64_t prosper_vo_flip_count();
 namespace {
     using clk = std::chrono::steady_clock;
     clk::time_point g_start = clk::now();
-    // PROSPER_DET_CLOCK: derive the guest monotonic clock from the flip (presented-frame) count instead of
-    // the host wall clock, so per-frame deltaTime is a fixed 1/fps regardless of how long a frame's host
-    // work took. This (a) makes time-seeded/frame-delta game logic REPRODUCIBLE across runs (deterministic
-    // input replay for deep routes), and (b) removes the huge first-frame/scene-load deltaTime that makes a
-    // one-shot title animation (the #240 shimmer sweep) jump straight to its end. To keep wait-for-time
-    // loops progressing before the first flip, fall back to (and never regress below) real monotonic time.
-    // Opt-in; may diverge from real timing. CONFIDENCE: MED.
-    uint64_t real_ns() { return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - g_start).count(); }
-    std::atomic<uint64_t> g_flip_base_ns{0};   // real time captured at the first flip (flip-time origin)
-    std::atomic<bool>     g_flip_based{false};
+    uint64_t real_ns() {
+        return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - g_start).count();
+    }
+
+    // PROSPER_DET_CLOCK: derive the guest MONOTONIC clock from the flip count instead of host elapsed
+    // time, so per-frame deltaTime is fixed regardless of host render cost. Wall-clock/RTC surfaces keep
+    // using real_ns(): deterministic gameplay time must not freeze the calendar clock between flips.
+    // Before the first flip, real time keeps time-gated initialization moving. After it, monotonic time
+    // intentionally pauses between flips; callers using it for timeouts therefore opt into that behavior.
+    // CONFIDENCE: MED.
+    struct DetClockState {
+        std::mutex mutex;
+        bool anchored = false;
+        uint64_t anchor_ns = 0;
+        uint64_t anchor_flip = 0;
+        uint64_t last_ns = 0;
+    };
+    DetClockState g_det_clock;
+
+    uint64_t det_clock_fps() {
+        static const uint64_t fps = [] {
+            const char* value = getenv("PROSPER_DET_FPS");
+            if (!value || !*value) return 60ull;
+            char* end = nullptr;
+            uint64_t parsed = std::strtoull(value, &end, 10);
+            return end != value && *end == '\0' && parsed > 0 && parsed <= 1000000ull ? parsed : 60ull;
+        }();
+        return fps;
+    }
+
     uint64_t ns_now() {
         static const bool det = getenv("PROSPER_DET_CLOCK") != nullptr;
-        static const uint64_t fps = [] { const char* e = getenv("PROSPER_DET_FPS"); uint64_t f = e ? (uint64_t)atoll(e) : 60; return f ? f : 60; }();
         uint64_t mono = real_ns();
         if (!det) return mono;
         uint64_t flip = prosper_vo_flip_count();
-        if (flip == 0) return mono;                              // pre-render: real time so time-gated init progresses
-        if (!g_flip_based.exchange(true)) g_flip_base_ns.store(mono);   // anchor flip-time to real time at the first flip (monotonic seam)
-        return g_flip_base_ns.load() + flip * (1000000000ull / fps);    // flip-paced: fixed 1/fps per frame -> no first-frame overshoot, deterministic
+        std::lock_guard<std::mutex> lock(g_det_clock.mutex);
+        if (!g_det_clock.anchored) {
+            if (flip == 0) return mono;
+            g_det_clock.anchored = true;
+            g_det_clock.anchor_ns = mono;
+            g_det_clock.anchor_flip = flip;
+            g_det_clock.last_ns = mono;
+        }
+        const uint64_t delta_flips = flip >= g_det_clock.anchor_flip ? flip - g_det_clock.anchor_flip : 0;
+        const uint64_t current = g_det_clock.anchor_ns + delta_flips * (1000000000ull / det_clock_fps());
+        g_det_clock.last_ns = std::max(g_det_clock.last_ns, current);
+        return g_det_clock.last_ns;
     }
 
     // --- Wall-clock anchor (#92). The host real-time clock is sampled ONCE, paired with the
@@ -67,7 +95,7 @@ namespace {
     struct WallAnchor { uint64_t base_us; uint64_t mono_ns; };
     const WallAnchor& wall_anchor() {
         static const WallAnchor a = [] {
-            uint64_t mono = ns_now();
+            uint64_t mono = real_ns();
             uint64_t us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
                               std::chrono::system_clock::now().time_since_epoch()).count();
             return WallAnchor{ us, mono };
@@ -76,7 +104,7 @@ namespace {
     }
     uint64_t wall_now_us() {   // microseconds since the unix epoch, monotonically advancing
         const WallAnchor& a = wall_anchor();
-        return a.base_us + (ns_now() - a.mono_ns) / 1000ull;
+        return a.base_us + (real_ns() - a.mono_ns) / 1000ull;
     }
     // RTC epoch: SceRtcTick counts microseconds since 0001-01-01 00:00:00 UTC; the unix epoch is
     // 62135596800 s after it (the documented Orbis RTC convention, also shadPS4 UNIX_EPOCH_TICKS).
