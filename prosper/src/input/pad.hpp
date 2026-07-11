@@ -144,20 +144,31 @@ uint32_t pad_trigger_buttons(uint8_t l2, uint8_t r2);
 // first poll). Frame-anchoring is boot-speed-invariant: `f300:cross` fires at the same game state on a
 // fast GPU and slow llvmpipe, where a wall-clock `10:cross` would drift — essential for deterministic
 // menu-reach across builds (bisect/regression repro). See #302.
-struct PadScriptEntry { double t_secs; uint32_t button_mask; bool frame_anchored = false; };
+struct PadScriptEntry {
+    double t_secs;
+    uint32_t button_mask;
+    bool frame_anchored = false;
+    double end = 0.0;  // exclusive explicit range end; 0 uses the configured default hold
+};
 
 // Map a button name ("start"/"options"/"cross"/"x"/"up"/... case as written) to its SCE_PAD_BUTTON_*
 // bit; 0 if unknown. "start" and "options" both mean the PS5 Options button (the "Start" equivalent).
 uint32_t pad_button_by_name(const std::string& name);
 
-// Parse "<secs>:<btn>[+<btn>...][;...]" into entries (e.g. "3:start;9:cross+up"). An entry whose time
-// token starts with 'f' is FRAME-anchored: "f300:cross" fires at flip 300 since the first poll. Entries
-// with no recognized button are dropped. Whitespace-tolerant only where the spec has none by design.
+// Parse ';'- or newline-separated entries. An entry whose time token starts with 'f' is
+// FRAME-anchored: "f300:cross" fires at flip 300 since the first poll. Both anchors accept explicit
+// ranges ("3-4.5:cross", "f300-340:cross"); '#' starts a comment. Malformed entries and entries with
+// no recognized button are dropped.
 std::vector<PadScriptEntry> parse_pad_script(const std::string& spec);
+
+// Parse an inline script, or load and parse one from disk when `source` starts with '@'. Relative
+// paths use the process working directory. Returns an empty vector and describes file I/O errors.
+std::vector<PadScriptEntry> load_pad_script(const std::string& source, std::string* error = nullptr);
 
 // Buttons held now: OR of every entry whose window contains the current time. A seconds-anchored entry
 // matches [t, t+hold_secs) against `elapsed_secs`; a frame-anchored entry matches [f, f+frame_hold)
 // against `frame_count` (pass -1 when no frame count is available -> frame entries never fire).
+// An explicit range uses its exclusive `end`; point entries use hold_secs/frame_hold.
 uint32_t pad_script_buttons_at(const std::vector<PadScriptEntry>& script, double elapsed_secs, double hold_secs,
                                int64_t frame_count = -1, int64_t frame_hold = 8);
 

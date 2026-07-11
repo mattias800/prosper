@@ -7,6 +7,9 @@
 #include <cstring>
 #include <cstdlib>
 #include <atomic>
+#include <cmath>
+#include <fstream>
+#include <sstream>
 
 namespace prosper::input {
 
@@ -123,27 +126,66 @@ std::vector<PadScriptEntry> parse_pad_script(const std::string& spec) {
     std::vector<PadScriptEntry> v;
     size_t i = 0;
     while (i < spec.size()) {
-        size_t semi = spec.find(';', i);
-        std::string tok = spec.substr(i, semi == std::string::npos ? std::string::npos : semi - i);
-        i = (semi == std::string::npos) ? spec.size() : semi + 1;
+        size_t sep = spec.find_first_of(";\n", i);
+        std::string tok = spec.substr(i, sep == std::string::npos ? std::string::npos : sep - i);
+        i = (sep == std::string::npos) ? spec.size() : sep + 1;
+        if (size_t comment = tok.find('#'); comment != std::string::npos) tok.erase(comment);
+        auto trim = [](std::string s) {
+            const size_t first = s.find_first_not_of(" \t\r\f\v");
+            if (first == std::string::npos) return std::string{};
+            return s.substr(first, s.find_last_not_of(" \t\r\f\v") - first + 1);
+        };
+        tok = trim(tok);
+        if (tok.empty()) continue;
         size_t colon = tok.find(':');
         if (colon == std::string::npos) continue;
-        std::string head = tok.substr(0, colon);
+        std::string head = trim(tok.substr(0, colon));
         // A leading 'f' marks a FRAME-anchored entry ("f300:cross" -> flip 300); else it's seconds.
         bool frame_anchored = (!head.empty() && (head[0] == 'f' || head[0] == 'F'));
-        double t = atof(frame_anchored ? head.c_str() + 1 : head.c_str());
+        std::string window = frame_anchored ? head.substr(1) : head;
+        size_t dash = window.find('-', 1);
+        auto parse_number = [](const std::string& text, double& out) {
+            char* end = nullptr;
+            const double value = strtod(text.c_str(), &end);
+            if (end == text.c_str() || *end != '\0' || value < 0.0 || !std::isfinite(value)) return false;
+            out = value;
+            return true;
+        };
+        double start = 0.0, end = 0.0;
+        if (!parse_number(trim(window.substr(0, dash)), start)) continue;
+        if (dash != std::string::npos) {
+            if (!parse_number(trim(window.substr(dash + 1)), end) || end <= start) continue;
+        }
         std::string btns = tok.substr(colon + 1);
         uint32_t mask = 0;
         size_t j = 0;
         while (j < btns.size()) {                       // '+'-separated buttons pressed together
             size_t plus = btns.find('+', j);
-            std::string one = btns.substr(j, plus == std::string::npos ? std::string::npos : plus - j);
+            std::string one = trim(btns.substr(j, plus == std::string::npos ? std::string::npos : plus - j));
             j = (plus == std::string::npos) ? btns.size() : plus + 1;
             mask |= pad_button_by_name(one);
         }
-        if (mask) v.push_back({t, mask, frame_anchored});
+        if (mask) v.push_back({start, mask, frame_anchored, end});
     }
     return v;
+}
+
+std::vector<PadScriptEntry> load_pad_script(const std::string& source, std::string* error) {
+    if (error) error->clear();
+    if (source.empty() || source[0] != '@') return parse_pad_script(source);
+    const std::string path = source.substr(1);
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        if (error) *error = path.empty() ? "route path is empty" : "cannot open route file: " + path;
+        return {};
+    }
+    std::ostringstream contents;
+    contents << file.rdbuf();
+    if (file.bad()) {
+        if (error) *error = "cannot read route file: " + path;
+        return {};
+    }
+    return parse_pad_script(contents.str());
 }
 
 uint32_t pad_script_buttons_at(const std::vector<PadScriptEntry>& script, double elapsed_secs, double hold_secs,
@@ -152,9 +194,11 @@ uint32_t pad_script_buttons_at(const std::vector<PadScriptEntry>& script, double
     for (const auto& e : script) {
         if (e.frame_anchored) {
             int64_t f = (int64_t)e.t_secs;   // frame number lives in t_secs for frame-anchored entries
-            if (frame_count >= 0 && frame_count >= f && frame_count < f + frame_hold) mask |= e.button_mask;
+            int64_t end = e.end > e.t_secs ? (int64_t)e.end : f + frame_hold;
+            if (frame_count >= 0 && frame_count >= f && frame_count < end) mask |= e.button_mask;
         } else {
-            if (elapsed_secs >= e.t_secs && elapsed_secs < e.t_secs + hold_secs) mask |= e.button_mask;
+            double end = e.end > e.t_secs ? e.end : e.t_secs + hold_secs;
+            if (elapsed_secs >= e.t_secs && elapsed_secs < end) mask |= e.button_mask;
         }
     }
     return mask;

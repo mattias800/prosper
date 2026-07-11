@@ -57,8 +57,10 @@ uint64_t now_us() {
 // --- PROSPER_PAD_SCRIPT: hardware-free timed button sequence -------------------------------------
 // Drives a scripted controller so a headless run can navigate menus (e.g. the title→menu→save→name
 // flow in issue #163) with no host device. Format: a ';'-separated list of "<seconds>:<button>[+..]"
-// entries, e.g. "3:start;9:start;16:cross;24:cross;31:up+cross". Each entry presses its button(s)
-// for PROSPER_PAD_HOLD ms (default 300) starting at <seconds>. When a script is set the pad reports
+// entries, e.g. "3:start;9:start;16:cross;24:cross;31:up+cross". Prefix with '@' to load a route
+// file; files may use newlines, comments, and explicit ranges such as "f300-340:cross". Time points
+// use PROSPER_PAD_HOLD ms (default 300); flip points use PROSPER_PAD_FRAME_HOLD (default 8). When a
+// script is set the pad reports
 // CONNECTED for the whole run (a menu that gates on a controller sees one).
 //
 // Timing is anchored to the FIRST input poll, not process start: the game only reads the pad once it
@@ -68,7 +70,11 @@ uint64_t now_us() {
 const std::vector<PadScriptEntry>& pad_script() {
     static const std::vector<PadScriptEntry> script = [] {
         const char* env = getenv("PROSPER_PAD_SCRIPT");
-        return env ? parse_pad_script(env) : std::vector<PadScriptEntry>{};
+        if (!env) return std::vector<PadScriptEntry>{};
+        std::string error;
+        auto loaded = load_pad_script(env, &error);
+        if (!error.empty()) fprintf(stderr, "[pad] PROSPER_PAD_SCRIPT: %s\n", error.c_str());
+        return loaded;
     }();
     return script;
 }
