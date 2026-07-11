@@ -67,6 +67,51 @@ int main() {
         }
     }
 
+    // A guest depth/stencil surface survives renderer calls. The first call writes stencil=2 with no
+    // color; the second call LOADs the same guest-identified attachment and an EQUAL-2 draw turns green.
+    // A different identity starts cleared and fails, while an explicit clear on the persisted identity
+    // also rejects the reader. This is the cross-submit contract used by Messenger's level masks (#518).
+    {
+        ResolvedPipelineState writer = opaque;
+        writer.color_write_mask = 0;
+        writer.stencil_enable = true;
+        writer.stencil_compare_op[0] = writer.stencil_compare_op[1] = 7; // ALWAYS
+        writer.stencil_pass_op[0] = writer.stencil_pass_op[1] = 2;       // REPLACE
+        writer.stencil_op_val[0] = writer.stencil_op_val[1] = 2;
+        writer.stencil_write_mask[0] = writer.stencil_write_mask[1] = 0xff;
+        writer.stencil_read_base = writer.stencil_write_base = 0x11110000;
+
+        ResolvedPipelineState reader = opaque;
+        reader.stencil_enable = true;
+        reader.stencil_compare_op[0] = reader.stencil_compare_op[1] = 2; // EQUAL
+        reader.stencil_ref[0] = reader.stencil_ref[1] = 2;
+        reader.stencil_compare_mask[0] = reader.stencil_compare_mask[1] = 0xff;
+        reader.stencil_read_base = reader.stencil_write_base = 0x11110000;
+
+        prosper::test::BackendDraw w; w.vs = vs; w.fs = red; w.ps = &writer; w.vcount = 3;
+        prosper::test::BackendDraw r; r.vs = vs; r.fs = green; r.ps = &reader; r.vcount = 3;
+        (void)prosper::test::render_draws_rgba({w}, W, H, nullptr, nullptr, true);
+        std::vector<uint8_t> loaded = prosper::test::render_draws_rgba({r}, W, H, nullptr, nullptr, true);
+        const uint8_t* lc = center(loaded);
+        CHECK(lc && lc[1] > 0xC0 && lc[0] < 0x40,
+              "persistent guest DS identity LOADs stencil written by an earlier renderer call");
+
+        ResolvedPipelineState fresh = reader;
+        fresh.stencil_read_base = fresh.stencil_write_base = 0x22220000;
+        prosper::test::BackendDraw f = r; f.ps = &fresh;
+        std::vector<uint8_t> rejected = prosper::test::render_draws_rgba({f}, W, H, nullptr, nullptr, true);
+        const uint8_t* fc = center(rejected);
+        CHECK(fc && fc[1] < 0x80, "new guest DS identity starts cleared and rejects EQUAL-2");
+
+        ResolvedPipelineState cleared = reader;
+        cleared.stencil_clear_enable = true;
+        cleared.stencil_clear_value = 0;
+        prosper::test::BackendDraw c = r; c.ps = &cleared;
+        std::vector<uint8_t> after_clear = prosper::test::render_draws_rgba({c}, W, H, nullptr, nullptr, true);
+        const uint8_t* cc = center(after_clear);
+        CHECK(cc && cc[1] < 0x80, "explicit guest stencil clear executes in order before the draw");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
 #include <vector>
 
 namespace prosper::test {
@@ -182,7 +183,8 @@ inline const RenderVkCtx& render_vk_ctx() {
 
 inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& draws, uint32_t W, uint32_t H,
                                               const uint8_t* seed_rgba = nullptr,
-                                              const float* clear_rgba = nullptr) {
+                                              const float* clear_rgba = nullptr,
+                                              bool persist_depth_stencil = false) {
     std::vector<uint8_t> out;
     if (draws.empty()) return out;
     const RenderVkCtx& ctx = render_vk_ctx();
@@ -200,19 +202,16 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     // fixed attachment set); each draw's pipeline sets its own depthTest/Write/CompareOp. A frame with
     // no depth-using draw takes the color-only path unchanged.
     bool use_depth = false, use_stencil = false;
-    // Depth/stencil clear values for the render pass's LOAD_OP_CLEAR (#371). Resolve set
-    // depth_clear_value from the guest's DB_DEPTH_CLEAR, or a compare-op-appropriate default (1.0 for
-    // LESS, 0.0 for GREATER) — never the old fixed 0.5. Latch the depth clear from the first DEPTH-testing
-    // draw and the stencil clear from the first STENCIL-testing draw INDEPENDENTLY: coupling them (one
-    // latch off the first depth-OR-stencil draw) let a stencil-only first draw — e.g. the title-shimmer
-    // stencil prime with depth off — force depth_clear to that draw's default 1.0, so a later reverse-Z
-    // (GREATER) draw in the same submit cleared to 1.0 and rejected every fragment (#457).
+    // Initial values for a newly-created depth/stencil attachment (#371). Existing guest-identified
+    // surfaces LOAD their contents below, and explicit DB_RENDER_CONTROL clears execute in draw order.
+    // Latch depth and stencil independently: coupling them let a stencil-only first draw force the
+    // wrong reverse-Z depth initial value for a later draw (#457).
     float    depth_clear   = 1.0f;
     uint32_t stencil_clear = 0;
     bool     got_depth_clear = false, got_stencil_clear = false;
     for (const auto& d : draws) {
         if (!d.ps) continue;
-        if (d.ps->depth_test_enable) { use_depth = true;
+        if (d.ps->depth_test_enable || d.ps->depth_clear_enable) { use_depth = true;
             // An ALWAYS-compare draw passes regardless of the depth clear, so it must NOT dictate it.
             // The Messenger menu primes depth with an ALWAYS+write draw (its compare-op default clear is
             // 1.0), then draws the real UI with GEQUAL (default clear 0.0). Latching 1.0 off the ALWAYS
@@ -221,8 +220,10 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             if (!got_depth_clear && d.ps->depth_compare_op != VK_COMPARE_OP_ALWAYS
                                  && d.ps->depth_compare_op != VK_COMPARE_OP_NEVER) {
                 depth_clear = d.ps->depth_clear_value; got_depth_clear = true; } }
-        if (d.ps->stencil_enable) { use_stencil = true;
-            if (!got_stencil_clear) { stencil_clear = d.ps->stencil_clear_value; got_stencil_clear = true; } }
+        if (d.ps->stencil_enable || d.ps->stencil_clear_enable) { use_stencil = true;
+            if (!got_stencil_clear) {
+                stencil_clear = d.ps->stencil_clear_value; got_stencil_clear = true;
+            } }
     }
     if (const char* v = getenv("PROSPER_STENCIL_CLEAR"))
         stencil_clear = static_cast<uint32_t>(strtoul(v, nullptr, 0)) & 0xFFu;
@@ -232,9 +233,48 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     // Use a stencil-capable depth format ONLY when a draw actually uses stencil (a UI mask). The
     // depth-only path keeps the original D32 depth-only format + aspect, so existing render tests are
     // byte-identical (#264).
-    const VkFormat DFMT = use_stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT;
-    const VkImageAspectFlags DASPECT = VK_IMAGE_ASPECT_DEPTH_BIT | (use_stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
+    const prosper::gpu::ResolvedPipelineState* identity = nullptr;
+    for (const auto& d : draws)
+        if (d.ps && (d.ps->depth_test_enable || d.ps->stencil_enable ||
+                     d.ps->depth_clear_enable || d.ps->stencil_clear_enable)) { identity = d.ps; break; }
+    const bool has_ds_identity = identity && (identity->depth_read_base || identity->depth_write_base ||
+                                               identity->stencil_read_base || identity->stencil_write_base);
+    const bool persistent_ds = persist_depth_stencil && use_ds && has_ds_identity;
+    // A persistent attachment must keep a stable format even across a depth-only call between stencil
+    // users. Nonzero stencil identity means this guest surface owns a stencil plane.
+    const bool format_has_stencil = use_stencil || (persistent_ds &&
+        (identity->stencil_read_base || identity->stencil_write_base));
+    const VkFormat DFMT = format_has_stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT;
+    const VkImageAspectFlags DASPECT = VK_IMAGE_ASPECT_DEPTH_BIT |
+                                       (format_has_stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
     VkImage dimg = VK_NULL_HANDLE; VkDeviceMemory dmem = VK_NULL_HANDLE; VkImageView dview = VK_NULL_HANDLE;
+    bool ds_was_initialized = false;
+    struct DsKey {
+        uint64_t dr, dw, sr, sw; uint32_t w, h, fmt;
+        bool operator==(const DsKey& o) const {
+            return dr == o.dr && dw == o.dw && sr == o.sr && sw == o.sw &&
+                   w == o.w && h == o.h && fmt == o.fmt;
+        }
+    };
+    struct DsKeyHash {
+        size_t operator()(const DsKey& k) const {
+            size_t h = 1469598103934665603ull;
+            auto mix = [&](uint64_t v) { h ^= (size_t)v; h *= 1099511628211ull; };
+            mix(k.dr); mix(k.dw); mix(k.sr); mix(k.sw); mix(k.w); mix(k.h); mix(k.fmt); return h;
+        }
+    };
+    struct DsImage { VkImage image = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE;
+                     VkImageView view = VK_NULL_HANDLE; bool initialized = false; };
+    static std::unordered_map<DsKey, DsImage, DsKeyHash> ds_cache;
+    DsImage* cached_ds = nullptr;
+    DsKey ds_key{};
+    if (persistent_ds) {
+        ds_key = {identity->depth_read_base, identity->depth_write_base,
+                  identity->stencil_read_base, identity->stencil_write_base, W, H, (uint32_t)DFMT};
+        cached_ds = &ds_cache[ds_key];
+        dimg = cached_ds->image; dmem = cached_ds->memory; dview = cached_ds->view;
+        ds_was_initialized = cached_ds->initialized;
+    }
 
     VkImageCreateInfo imgci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     imgci.imageType = VK_IMAGE_TYPE_2D; imgci.format = FMT; imgci.extent = {W, H, 1};
@@ -252,7 +292,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     ivci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     VkImageView view; vkCreateImageView(dev, &ivci, nullptr, &view);
 
-    if (use_ds) {
+    if (use_ds && !dimg) {
         VkImageCreateInfo dci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         dci.imageType = VK_IMAGE_TYPE_2D; dci.format = DFMT; dci.extent = {W, H, 1};
         dci.mipLevels = 1; dci.arrayLayers = 1; dci.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -266,6 +306,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         dvci.image = dimg; dvci.viewType = VK_IMAGE_VIEW_TYPE_2D; dvci.format = DFMT;
         dvci.subresourceRange = {DASPECT, 0, 1, 0, 1};
         vkCreateImageView(dev, &dvci, nullptr, &dview);
+        if (cached_ds) { cached_ds->image = dimg; cached_ds->memory = dmem; cached_ds->view = dview; }
     }
 
     VkAttachmentDescription att[2]{};
@@ -278,12 +319,19 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     att[0].initialLayout = seed_rgba ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
     att[0].finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     att[1].format = DFMT; att[1].samples = VK_SAMPLE_COUNT_1_BIT;
-    att[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; att[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    // Clear the stencil at pass start when a mask uses it (so the mask draw defines the stenciled
-    // region from 0); within the pass the stencil persists across draws, so store-op can be DONT_CARE.
-    att[1].stencilLoadOp = use_stencil ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    att[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    att[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED; att[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    // A guest-identified DS surface survives calls. New attachments get a defined initial value;
+    // existing ones LOAD. Explicit DB_RENDER_CONTROL clears execute at their draw below, preserving
+    // command order instead of being promoted to an unconditional pass-start clear (#518).
+    att[1].loadOp = ds_was_initialized ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
+    att[1].storeOp = persistent_ds ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att[1].stencilLoadOp = format_has_stencil
+        ? (ds_was_initialized ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR)
+        : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att[1].stencilStoreOp = (persistent_ds && format_has_stencil)
+        ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att[1].initialLayout = ds_was_initialized ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                                               : VK_IMAGE_LAYOUT_UNDEFINED;
+    att[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     VkAttachmentReference ar{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
     VkAttachmentReference dar{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
     VkSubpassDescription sub{}; sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
@@ -670,7 +718,18 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     }
     // ONE render pass (cleared once): record every realized draw with its own pipeline + descriptors.
     vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
-    for (auto& v : dv) {
+    for (size_t di = 0; di < dv.size(); di++) {
+        auto& v = dv[di];
+        const auto* ps = draws[di].ps;
+        if (use_ds && ps && (ps->depth_clear_enable || ps->stencil_clear_enable)) {
+            VkClearAttachment dsc{};
+            if (ps->depth_clear_enable) dsc.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
+            if (ps->stencil_clear_enable && format_has_stencil)
+                dsc.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+            dsc.clearValue.depthStencil = {ps->depth_clear_value, ps->stencil_clear_value};
+            VkClearRect rect{{{0, 0}, {W, H}}, 0, 1};
+            if (dsc.aspectMask) vkCmdClearAttachments(cmd, 1, &dsc, 1, &rect);
+        }
         if (!v.ok) continue;
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v.pipe);
         if (v.use_desc) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v.layout, 0, v.n_sets, v.dsets.data(), 0, nullptr);
@@ -688,6 +747,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
     VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VkFence fence; vkCreateFence(dev, &fci, nullptr, &fence);
     vkQueueSubmit(queue, 1, &si, fence); vkWaitForFences(dev, 1, &fence, VK_TRUE, 5ull * 1000 * 1000 * 1000);
+    if (cached_ds) cached_ds->initialized = true;
 
     out.resize(bytes);
     void* mp = nullptr; vkMapMemory(dev, bmem, 0, bytes, 0, &mp);
@@ -799,7 +859,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     vkDestroyBuffer(dev, rb, nullptr); vkFreeMemory(dev, bmem, nullptr);
     vkDestroyFramebuffer(dev, fb, nullptr); vkDestroyRenderPass(dev, rp, nullptr); vkDestroyImageView(dev, view, nullptr);
     vkDestroyImage(dev, img, nullptr); vkFreeMemory(dev, imem, nullptr);
-    if (use_depth) { vkDestroyImageView(dev, dview, nullptr); vkDestroyImage(dev, dimg, nullptr); vkFreeMemory(dev, dmem, nullptr); }
+    if (use_ds && !cached_ds) {
+        vkDestroyImageView(dev, dview, nullptr); vkDestroyImage(dev, dimg, nullptr); vkFreeMemory(dev, dmem, nullptr);
+    }
     // NB: dev/instance are the persistent RenderVkCtx — do NOT destroy them here (reused across calls).
     return out;
 }
