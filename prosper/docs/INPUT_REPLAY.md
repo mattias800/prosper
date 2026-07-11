@@ -7,8 +7,9 @@
 > between flips. Realtime/RTC clocks remain tied to host time. `PROSPER_PAD_SCRIPT=@path` loads newline-
 > separated routes with comments and explicit time/flip ranges. `PROSPER_PAD_RECORD=path` records the
 > final button stream on that same flip axis; `prosper-app --record path` exposes it interactively.
-> Checked-in verified scripts and pad-read screenshot checkpoints remain open in #302. The original
-> design follows.
+> The first checked-in route, `scripts/messenger/reach-intro-story.pad`, repeatedly reaches the opening
+> story but still has small narration-phase drift. Deeper routes and a precise pad-read screenshot
+> checkpoint axis remain open in #302. The original design follows.
 
 ## The problem
 
@@ -50,6 +51,9 @@ Good bones. Two gaps for reaching deep states reliably: the clock is **wall-time
 ### 3. Checkpoint library + agent docs
 - `prosper/scripts/<title>/reach-*.pad` — **tiny text files, no game imagery, safe to commit** (unlike golden frames). Named by the state they reach: `reach-title-menu.pad`, `reach-level1.pad`, …
 - An `AGENTS.md` note: *"to reproduce a bug at state X, prefix your tool with `PROSPER_PAD_SCRIPT=@scripts/<title>/reach-X.pad`."* A bug report then just cites the checkpoint.
+
+The library is seeded with `scripts/messenger/reach-intro-story.pad`. It is a coarse route: repeated
+runs reach the named story state, while exact narration-frame verification remains step 4 work.
 
 ## The crux: determinism
 
