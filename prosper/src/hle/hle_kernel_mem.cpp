@@ -256,14 +256,35 @@ namespace {
         if (fd >= 0 && phys < kDmemBase + kDmemTotal && sz)
             fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, (off_t)phys, (off_t)sz);
     }
+    // Reserve an anonymous span whose returned base satisfies `align`. Linux mmap only promises
+    // host-page alignment, while Orbis direct-memory callers can require larger alignment.
+    void* reserve_aligned(uint64_t len, uint64_t align) {
+        const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+        if (align < page) align = page;
+        if ((align & (align - 1)) != 0 || len > UINT64_MAX - align) return nullptr;
+        void* raw = mmap(nullptr, len + align, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (raw == MAP_FAILED) return nullptr;
+        uint64_t raw_base = (uint64_t)raw;
+        uint64_t base = align_up(raw_base, align);
+        if (base > raw_base) munmap(raw, base - raw_base);
+        uint64_t used_end = base + len, raw_end = raw_base + len + align;
+        if (raw_end > used_end) munmap((void*)used_end, raw_end - used_end);
+        return (void*)base;
+    }
+
     // Map `len` bytes of the phys pool at `hint` (0 = anywhere). Falls back to anonymous memory
-    // if the memfd is unavailable (still boots; loses aliasing).
-    void* map_phys_at(uint64_t hint, uint64_t len, int prot, uint64_t phys) {
+    // if the memfd is unavailable (still boots; loses aliasing). A zero-hint mapping honors the
+    // caller's requested VA alignment; the old host-page-aligned mmap violated that ABI contract.
+    void* map_phys_at(uint64_t hint, uint64_t len, int prot, uint64_t phys, uint64_t align = 0) {
         int fd = dmem_fd();
         if (fd >= 0 && phys < kDmemBase + kDmemTotal) {
             if (!hint) {
-                void* p = mmap(nullptr, len, prot, MAP_SHARED, fd, (off_t)phys);
-                if (p != MAP_FAILED) return p;
+                void* reserved = reserve_aligned(len, align ? align : 0x4000);
+                if (reserved) {
+                    void* p = mmap(reserved, len, prot, MAP_SHARED | MAP_FIXED, fd, (off_t)phys);
+                    if (p != MAP_FAILED) return p;
+                    munmap(reserved, len);
+                }
             } else {
                 // Same no-clobber discipline as map_at (#137): NOREPLACE first, MAP_FIXED replace
                 // only over our own uncommitted reservation, else refuse rather than destroy a live
@@ -278,7 +299,12 @@ namespace {
                 }
             }
         }
-        return map_at(hint, len, prot);
+        if (hint) return map_at(hint, len, prot);
+        void* reserved = reserve_aligned(len, align ? align : 0x4000);
+        if (!reserved) return nullptr;
+        void* p = mmap(reserved, len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        if (p == MAP_FAILED) { munmap(reserved, len); return nullptr; }
+        return p;
     }
 }
 
@@ -461,12 +487,13 @@ HLE(k_direct_memory_query) {
 // sceKernelMapDirectMemory(void** addrInOut, size_t len, int prot, int flags, off_t phys, size_t align)
 HLE(k_map_dmem) {
     uint64_t hint = a0 ? *(uint64_t*)a0 : 0;
-    void* p = map_phys_at(hint, a1, host_prot(a2), a4);
+    void* p = map_phys_at(hint, a1, host_prot(a2), a4, a5);
     if (!p) { MLOG("map_dmem hint=0x%llx len=0x%llx FAILED\n", (unsigned long long)hint, (unsigned long long)a1); return 0x8002000cull; } // ENOMEM
     if (a0) *(uint64_t*)a0 = (uint64_t)p;
     track((uint64_t)p, a1, host_prot(a2), true, "direct");
-    MLOG("map_dmem -> 0x%llx len=0x%llx phys=0x%llx prot=0x%llx\n",
-         (unsigned long long)p, (unsigned long long)a1, (unsigned long long)a4, (unsigned long long)a2);
+    MLOG("map_dmem -> 0x%llx len=0x%llx phys=0x%llx prot=0x%llx align=0x%llx\n",
+         (unsigned long long)p, (unsigned long long)a1, (unsigned long long)a4,
+         (unsigned long long)a2, (unsigned long long)a5);
     return 0;
 }
 
@@ -1047,6 +1074,8 @@ void register_kernel_mem_hle() {
     R("sceKernelReserveVirtualRange", k_reserve_vrange);
     R("sceKernelMapNamedFlexibleMemory", k_map_flexible);
     R("sceKernelMapFlexibleMemory", k_map_flexible_noname);   // no name arg: a4 is garbage r8, don't deref it
+    Hle::register_fn("4h6F1LLbTiw", (HleFn)k_map_flexible_noname,
+                     "sceKernelMapFlexibleMemoryInternal");
     R("sceKernelAvailableFlexibleMemorySize", k_avail_flexible);   // was MISSING -> uninitialized budget
     R("sceKernelAllocateDirectMemory", k_alloc_dmem);
     R("sceKernelAllocateMainDirectMemory", k_alloc_main_dmem);  // 4-arg signature (physOut at arg3)

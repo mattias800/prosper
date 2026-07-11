@@ -326,6 +326,20 @@ HLE(k_attr_init)        { if (a0) { auto* at = (pthread_attr_t*)calloc(1, sizeof
 HLE(k_attr_destroy)     { if (a0 && *(void**)a0) { pthread_attr_destroy((pthread_attr_t*)*(void**)a0); free(*(void**)a0); *(void**)a0 = nullptr; } return 0; }
 HLE(k_attr_setstacksize){ if (a0 && *(void**)a0 && a1 >= 16384) pthread_attr_setstacksize((pthread_attr_t*)*(void**)a0, a1); return 0; }
 HLE(k_attr_noop)        { return 0; }
+
+// sceKernelGetSanitizerMallocReplaceExternal returns the process replacement table, even when no
+// sanitizer callbacks are installed. Returning nullptr made runtimes dereference null while checking
+// the table (Dead Cells reads +0x18 during module initialization). Layout is shared by Kyty/SharpEmu:
+// one size qword followed by 13 function pointers.
+struct SanitizerMallocReplace {
+    uint64_t size = sizeof(SanitizerMallocReplace);
+    uint64_t callbacks[13]{};
+};
+static_assert(sizeof(SanitizerMallocReplace) == 0x70);
+HLE(k_get_sanitizer_malloc_replace) {
+    static SanitizerMallocReplace table;
+    return (uint64_t)(uintptr_t)&table;
+}
 // scePthreadAttrSetdetachstate: store DETACHED/JOINABLE into the host attr so k_pthread_create (which
 // reads pthread_attr_getdetachstate and applies it, line ~465) actually honors a detached-thread request.
 // This was a no-op, so a thread the guest marked DETACHED was created JOINABLE and, never joined, leaked
@@ -1254,6 +1268,8 @@ void register_kernel_hle() {
     Hle::register_fn("WhCc1w3EhSI", (HleFn)k_attr_noop, "sceKernelSetThreadAtexitReport");
     Hle::register_fn("p5EcQeEeJAE", (HleFn)k_attr_noop, "sceKernelRtldSetApplicationHeapAPI");
     Hle::register_fn("bnZxYgAFeA0", (HleFn)k_attr_noop, "sceKernelGetSanitizerNewReplaceExternal");
+    Hle::register_fn("py6L8jiVAN8", (HleFn)k_get_sanitizer_malloc_replace,
+                     "sceKernelGetSanitizerMallocReplaceExternal");
     Hle::register_fn("DGMG3JshrZU", (HleFn)k_attr_noop, "sceKernelSetVirtualRangeName");
     #undef R
     register_kernel_mem_hle();    // virtual/direct memory

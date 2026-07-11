@@ -35,12 +35,17 @@ int main() {
     printf("== test_prot_none ==\n");
     register_builtin_hle();
     auto flexible = Hle::lookup(nid_hash("sceKernelMapFlexibleMemory"));
+    auto flexible_internal = Hle::lookup("4h6F1LLbTiw");
     auto mprotect_fn = Hle::lookup(nid_hash("sceKernelMprotect"));
-    CHECK(flexible && mprotect_fn, "map/mprotect HLE registered");
-    if (!(flexible && mprotect_fn)) { printf("== FAIL ==\n"); return 1; }
+    CHECK(flexible && flexible_internal && mprotect_fn, "map/internal-map/mprotect HLE registered");
+    if (!(flexible && flexible_internal && mprotect_fn)) { printf("== FAIL ==\n"); return 1; }
 
     auto U = [](const void* p) { return (uint64_t)(uintptr_t)p; };
     const uint64_t LEN = 0x10000;
+
+    uint64_t internal_va = 0;
+    CHECK(flexible_internal(U(&internal_va), LEN, 0x2 /*RW*/, 0, 0, 0) == 0 && internal_va,
+          "MapFlexibleMemoryInternal aliases the non-named flexible mapper");
 
     // Commit a RW page and confirm it is writable.
     uint64_t va = 0;
