@@ -31,10 +31,31 @@ namespace prosper {
                                        uint64_t a3, uint64_t a4, uint64_t a5)
 #define P(x) ((void*)(uintptr_t)(x))
 
+extern "C" uint64_t prosper_vo_flip_count();
+
 namespace {
     using clk = std::chrono::steady_clock;
     clk::time_point g_start = clk::now();
-    uint64_t ns_now() { return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - g_start).count(); }
+    // PROSPER_DET_CLOCK: derive the guest monotonic clock from the flip (presented-frame) count instead of
+    // the host wall clock, so per-frame deltaTime is a fixed 1/fps regardless of how long a frame's host
+    // work took. This (a) makes time-seeded/frame-delta game logic REPRODUCIBLE across runs (deterministic
+    // input replay for deep routes), and (b) removes the huge first-frame/scene-load deltaTime that makes a
+    // one-shot title animation (the #240 shimmer sweep) jump straight to its end. To keep wait-for-time
+    // loops progressing before the first flip, fall back to (and never regress below) real monotonic time.
+    // Opt-in; may diverge from real timing. CONFIDENCE: MED.
+    uint64_t real_ns() { return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - g_start).count(); }
+    std::atomic<uint64_t> g_flip_base_ns{0};   // real time captured at the first flip (flip-time origin)
+    std::atomic<bool>     g_flip_based{false};
+    uint64_t ns_now() {
+        static const bool det = getenv("PROSPER_DET_CLOCK") != nullptr;
+        static const uint64_t fps = [] { const char* e = getenv("PROSPER_DET_FPS"); uint64_t f = e ? (uint64_t)atoll(e) : 60; return f ? f : 60; }();
+        uint64_t mono = real_ns();
+        if (!det) return mono;
+        uint64_t flip = prosper_vo_flip_count();
+        if (flip == 0) return mono;                              // pre-render: real time so time-gated init progresses
+        if (!g_flip_based.exchange(true)) g_flip_base_ns.store(mono);   // anchor flip-time to real time at the first flip (monotonic seam)
+        return g_flip_base_ns.load() + flip * (1000000000ull / fps);    // flip-paced: fixed 1/fps per frame -> no first-frame overshoot, deterministic
+    }
 
     // --- Wall-clock anchor (#92). The host real-time clock is sampled ONCE, paired with the
     // monotonic ns_now() at the same instant; every wall-clock surface (CLOCK_REALTIME,
