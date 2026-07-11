@@ -131,5 +131,6 @@ pre-blend fragment output, and final attachment output in a standard report. Exi
 Do not start another depth/stencil, vertex-fetch, palette-fade, compute, tiling, or whole-stack rewrite from the
 historical #300 comments. The producer, missing opcode, target extent, consumer, and front-buffer result are now
 connected by one live trace. Preserve that chain as the regression boundary and use the same provenance-first
-method for the next title failure. Active work has moved to Dead Cells startup stability (#539), reusable
-checkpoints/snapshots (#302/#248), and then existing 3D Unity/Unreal workloads.
+method for the next title failure. Dead Cells startup is stable and its Evil Empire splash is captured
+(#539/#545 closed); active work has moved to practical software-render progression capture (#549), reusable
+checkpoints/snapshots (#302/#248), late offline-service contracts (#552), and existing 3D Unity/Unreal workloads.

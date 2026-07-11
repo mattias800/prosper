@@ -35,10 +35,15 @@ presented, framebuffer CRC == golden" is. Each change adds the check that proves
   live/replay hashes and per-draw/resource isolation; #515 provides reflected SPIR-V/runtime descriptor
   validation in live and offline replay paths. Producer provenance, normal screenshot capture, and the local
   content-metric snapshot guard complete the current first-bad-contract workflow.
-- **Immediate milestone:** stabilize *Dead Cells* startup around AGC resource registration (#539), turning
-  the work into reusable structured HLE-call/output tracing and a repeated-startup gate. Then finish input
-  checkpoints and multi-title snapshots (#302/#248) before using an existing Unity/Unreal 3D workload to
-  expand graphics coverage. UE4's current measured shader rejection boundary is descriptor provenance (#485).
+- **Dead Cells cross-title milestone:** #544 fixes the poisoned AGC resource-name limit that caused intermittent
+  startup stack exhaustion; 30/30 repeated starts pass. Its exercised NGS2 lifecycle now supplies initialized
+  sizes, handles, voice state, geometry state, and silent PCM (#554), and POSIX `getpid` is nonzero (#553).
+  A revision-locked late render window reaches the Evil Empire splash. #545 is closed: rendering every 4K
+  submit synchronously through llvmpipe made a ~13,000-submit startup look stalled for minutes.
+- **Immediate milestone:** make progression capture/checkpointing practical without hand-guessing submit windows
+  (#549/#302), expand multi-title snapshot coverage (#248), and implement the newly reached honest-offline NP and
+  SaveData contracts (#552). Then use the same capture/replay and descriptor-validation workflow on existing
+  Unity/Unreal 3D workloads. UE4's measured shader rejection boundary remains descriptor provenance (#485).
 
 ## Historical status (2026-07-05) - retained for the milestone log
 

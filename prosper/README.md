@@ -33,10 +33,15 @@ possible without console keys. Dumps are user-supplied and gitignored.
 - ✅ **Graphics investigation tooling:** versioned live GPU capture/replay (`.prgcap`), per-draw/resource
   inspection and isolation, strict reflected SPIR-V/runtime descriptor validation, render-target producer
   provenance, normal screenshot capture, and a local content-metric snapshot guard.
-- 🚧 **Active frontiers:** stabilize *Dead Cells* graphics startup (#539), finish reusable input
-  checkpoints and multi-title snapshot coverage (#302/#248), then apply the capture/replay and contract
-  tools to the existing Unity and Unreal 3D workloads. UE4's first measured GPU blocker is unresolved
-  image/vertex descriptor provenance (#485), not an assumed missing instruction class.
+- ✅ **Dead Cells reaches its publisher splash:** the intermittent AGC startup crash is fixed (#544),
+  repeated startup is stable, and its exercised NGS2 audio lifecycle now returns real sizes, handles,
+  state, and silent output (#554). A late render-window capture reaches the Evil Empire splash; the earlier
+  apparent loading stall was synchronous 4K llvmpipe slowdown (#545), not a guest deadlock.
+- 🚧 **Active frontiers:** make progression capture practical on software Vulkan (#549), finish reusable
+  input checkpoints and multi-title snapshots (#302/#248), complete newly reached offline service contracts
+  (#552), then apply capture/replay and descriptor validation to existing Unity and Unreal 3D workloads.
+  UE4's first measured GPU blocker is unresolved image/vertex descriptor provenance (#485), not an assumed
+  missing instruction class.
 
 The completed Messenger black-render investigation and reusable evidence boundary are recorded in
 [`docs/MESSENGER_BLACK_RENDER.md`](docs/MESSENGER_BLACK_RENDER.md). Current work is tracked in GitHub
