@@ -138,6 +138,15 @@ int main() {
         CHECK(pad_button_by_name("x")       == SCE_PAD_BUTTON_CROSS,   "name: x -> CROSS");
         CHECK(pad_button_by_name("up")      == SCE_PAD_BUTTON_UP,      "name: up -> UP");
         CHECK(pad_button_by_name("nonsense")== 0,                      "name: unknown -> 0");
+        CHECK(pad_button_names(SCE_PAD_BUTTON_OPTIONS) == "options", "names: options is canonical");
+        CHECK(pad_button_names(SCE_PAD_BUTTON_UP | SCE_PAD_BUTTON_CROSS) == "up+cross",
+              "names: stable combined-button order");
+        CHECK(pad_button_names(0).empty(), "names: neutral mask is empty");
+        auto round_trip = parse_pad_script("f0:" +
+            pad_button_names(SCE_PAD_BUTTON_LEFT | SCE_PAD_BUTTON_SQUARE | SCE_PAD_BUTTON_R1));
+        CHECK(round_trip.size() == 1 && round_trip[0].button_mask ==
+              (SCE_PAD_BUTTON_LEFT | SCE_PAD_BUTTON_SQUARE | SCE_PAD_BUTTON_R1),
+              "names: recorded text round-trips through parser");
 
         auto s = parse_pad_script("3:start;9.5:cross;16:up+cross");
         CHECK(s.size() == 3, "parse: 3 entries");

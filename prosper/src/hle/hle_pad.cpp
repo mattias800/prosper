@@ -15,11 +15,17 @@
 #include "dispatch.hpp"
 #include "nid.hpp"
 #include "../input/pad.hpp"
+#include <algorithm>
+#include <cerrno>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <atomic>
 #include <chrono>
+#include <filesystem>
+#include <limits>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -94,16 +100,25 @@ std::atomic<uint64_t> g_pad_t0_us{0};
 // prosper_vo_flip_count() is the guest's presented-frame counter (hle_graphics.cpp), boot-speed-
 // invariant — unlike wall-clock it lands the same input on the same game state across builds (#302).
 extern "C" uint64_t prosper_vo_flip_count();
-std::atomic<uint64_t> g_pad_flip0{0};
-std::atomic<bool>     g_pad_flip0_set{false};
+std::atomic<uint64_t> g_pad_flip0{std::numeric_limits<uint64_t>::max()};
 
 int64_t pad_frame_hold() {   // how many flips to hold a frame-anchored press (default 8)
     static const int64_t h = [] { const char* e = getenv("PROSPER_PAD_FRAME_HOLD"); return e ? (int64_t)atoll(e) : 8; }();
     return h;
 }
 
+int64_t pad_frame_now() {
+    const uint64_t flips = prosper_vo_flip_count();
+    uint64_t base = g_pad_flip0.load(std::memory_order_relaxed);
+    if (base == std::numeric_limits<uint64_t>::max()) {
+        g_pad_flip0.compare_exchange_strong(base, flips, std::memory_order_relaxed);
+        base = g_pad_flip0.load(std::memory_order_relaxed);
+    }
+    return flips >= base ? (int64_t)(flips - base) : 0;
+}
+
 // Overlay any active scripted press onto `s`. Returns true if a script is driving the pad.
-bool apply_pad_script(HostPadState& s) {
+bool apply_pad_script(HostPadState& s, int64_t frame) {
     const auto& script = pad_script();
     if (script.empty()) return false;
     s.connected = true;                                     // a controller is present for the whole run
@@ -113,12 +128,54 @@ bool apply_pad_script(HostPadState& s) {
         if (g_pad_t0_us.compare_exchange_strong(expect, now)) t0 = now; else t0 = expect;
     }
     double elapsed = (now_us() - t0) / 1e6;
-    // Frame count = flips since the first poll (anchor the flip baseline on that same first poll).
-    uint64_t flips = prosper_vo_flip_count();
-    if (!g_pad_flip0_set.exchange(true)) g_pad_flip0.store(flips, std::memory_order_relaxed);
-    int64_t frame = (int64_t)(flips - g_pad_flip0.load(std::memory_order_relaxed));
     s.buttons |= pad_script_buttons_at(script, elapsed, pad_hold_secs(), frame, pad_frame_hold());
     return true;
+}
+
+// Record the final button stream as explicit flip ranges. Completed intervals are flushed immediately;
+// only a button still held when a process is force-killed can be absent from the route tail.
+void pad_record(int64_t frame, uint32_t buttons) {
+    static const char* output = getenv("PROSPER_PAD_RECORD");
+    if (!output || !*output) return;
+    struct Recorder {
+        std::mutex mutex;
+        bool initialized = false;
+        FILE* file = nullptr;
+        uint32_t previous = 0;
+        int64_t start = 0;
+    };
+    static Recorder recorder;
+    std::lock_guard<std::mutex> lock(recorder.mutex);
+    if (!recorder.initialized) {
+        recorder.initialized = true;
+        std::filesystem::path path(output);
+        std::error_code ec;
+        if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path(), ec);
+        if (ec) {
+            fprintf(stderr, "[pad] PROSPER_PAD_RECORD: cannot create '%s': %s\n",
+                    path.parent_path().string().c_str(), ec.message().c_str());
+        } else if ((recorder.file = fopen(output, "w"))) {
+            fprintf(recorder.file,
+                    "# recorded PROSPER_PAD_SCRIPT route; fN is display flips since first pad poll\n");
+            fflush(recorder.file);
+            fprintf(stderr, "[pad] recording input route -> %s\n", output);
+        } else {
+            fprintf(stderr, "[pad] PROSPER_PAD_RECORD: cannot open '%s': %s\n",
+                    output, strerror(errno));
+        }
+    }
+    if (!recorder.file || buttons == recorder.previous) return;
+    if (recorder.previous) {
+        const int64_t end = std::max(frame, recorder.start + 1);
+        const std::string names = pad_button_names(recorder.previous);
+        if (!names.empty()) {
+            fprintf(recorder.file, "f%lld-%lld:%s\n", (long long)recorder.start,
+                    (long long)end, names.c_str());
+            fflush(recorder.file);
+        }
+    }
+    recorder.previous = buttons;
+    recorder.start = frame;
 }
 
 // Snapshot the controller for a given pad handle via the installed backend. With no host frontend
@@ -132,7 +189,9 @@ HostPadState snapshot(int /*handle*/, const char* what) {
         s.connected = true;
         s.buttons  |= SCE_PAD_BUTTON_CROSS;
     }
-    apply_pad_script(s);
+    const int64_t frame = pad_frame_now();
+    apply_pad_script(s, frame);
+    pad_record(frame, s.buttons);
     padlog_once(what, &s);
     return s;
 }

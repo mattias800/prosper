@@ -43,6 +43,9 @@ Esc or closing the window quits.
 - `--dump <app0>` — boot and display the PS5 title at this app0 directory (positional path also works).
 - `--test-pattern` — feed a synthetic animated frame through the real present path (no guest).
 - `--frames N` — present N frames then exit 0 (non-interactive smoke; exit 1 if it couldn't).
+- `--record PATH` — record the final controller stream to a replayable `PROSPER_PAD_SCRIPT` route.
+  Missing parent directories are created; release the last held button before stopping so its interval
+  is closed and flushed.
 
 ## Notes
 

@@ -1,12 +1,14 @@
 # Input replay & checkpoints — reaching a game state to reproduce a bug
 
-> **Status (2026-07-12): frame anchoring, file-loaded routes, and the opt-in deterministic clock have landed.**
+> **Status (2026-07-12): frame anchoring, route loading/recording, and the opt-in deterministic clock have landed.**
 > Current master supports inline `PROSPER_PAD_SCRIPT` entries anchored as `fN:`/`fA-B:` and
 > `PROSPER_DET_CLOCK=1` (fixed `1/PROSPER_DET_FPS`, default 60, per flip). Before the first flip the
 > monotonic clock follows host time so initialization can progress; afterward it intentionally pauses
 > between flips. Realtime/RTC clocks remain tied to host time. `PROSPER_PAD_SCRIPT=@path` loads newline-
-> separated routes with comments and explicit time/flip ranges. Recording, checked-in verified scripts,
-> and pad-read screenshot checkpoints remain open in #302. The original design follows.
+> separated routes with comments and explicit time/flip ranges. `PROSPER_PAD_RECORD=path` records the
+> final button stream on that same flip axis; `prosper-app --record path` exposes it interactively.
+> Checked-in verified scripts and pad-read screenshot checkpoints remain open in #302. The original
+> design follows.
 
 ## The problem
 
@@ -42,7 +44,7 @@ Good bones. Two gaps for reaching deep states reliably: the clock is **wall-time
 - **Load from a file.** `PROSPER_PAD_SCRIPT=@path` reads a multi-line script file, so long routes live in the repo, not an env string.
 - **Richer input.** Per-entry hold length, analog stick directions, not just a 300 ms button tap.
 
-### 2. Record mode in `prosper-app`
+### 2. Record mode in `prosper-app` - implemented
 `prosper-app --dump <app0> --record <file>`: capture the human's keyboard/gamepad input **stamped by flip count**, writing a script file. This is how checkpoint scripts get *created* — play to the point once, get a reusable, committable route. (The app already snapshots keyboard state per frame; recording is writing that stream out, anchored to `present_count`.)
 
 ### 3. Checkpoint library + agent docs
