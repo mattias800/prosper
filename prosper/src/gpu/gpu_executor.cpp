@@ -787,6 +787,58 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
     return nullptr;
 }
 
+bool validate_runtime_descriptor_contract(const char* stage_name,
+                                           const std::vector<uint32_t>& spirv,
+                                           const ShaderResourceTable* runtime,
+                                           uint32_t expected_set,
+                                           SpirvShaderStage expected_stage) {
+    const char* mode = getenv("PROSPER_DESCRIPTOR_VALIDATE");
+    if (!mode || !*mode || !strcmp(mode, "off") || !strcmp(mode, "0")) return true;
+
+    DescriptorValidationReport report = validate_spirv_descriptor_interface(
+        spirv, runtime, expected_set, expected_stage, true);
+    const bool verbose = !strcmp(mode, "all");
+    if (!report.issues.empty() || verbose) {
+        uint64_t hash = 1469598103934665603ull;
+        for (uint32_t word : spirv) { hash ^= word; hash *= 1099511628211ull; }
+        static std::set<uint64_t> logged;
+        uint64_t key = hash ^ (static_cast<uint64_t>(expected_set) << 56);
+        auto mix = [&](uint64_t value) { key ^= value; key *= 1099511628211ull; };
+        for (const auto& issue : report.issues) {
+            mix(static_cast<uint32_t>(issue.code)); mix(issue.binding); mix(issue.set);
+            mix(static_cast<uint32_t>(issue.actual));
+            // Contract errors with different proven ranges are distinct. Warning-only unused
+            // resources are not: their guest address/size can change every draw and must not flood
+            // a long diagnostic run with the same module/binding warning.
+            if (issue.error) { mix(issue.required_bytes); mix(issue.available_bytes); }
+        }
+        if (logged.insert(key).second) {
+            fprintf(stderr, "[descriptor] %s module=%016llx used=%zu runtime=%zu result=%s mode=%s\n",
+                    stage_name, (unsigned long long)hash, report.descriptors.size(),
+                    runtime ? runtime->resources.size() : 0, report.ok() ? "accept" : "reject", mode);
+            for (const auto& d : report.descriptors)
+                fprintf(stderr, "[descriptor]   set=%u binding=%u type=%s required=%llu%s\n",
+                        d.set, d.binding, spirv_descriptor_kind_name(d.kind),
+                        (unsigned long long)d.required_bytes, d.dynamic_access ? "+dynamic" : "");
+            for (const auto& issue : report.issues)
+                fprintf(stderr, "[descriptor]   %s: %s set=%u binding=%u expected=%s actual=%s "
+                                "required=%llu available=%llu\n",
+                        issue.error ? "ERROR" : "warn", descriptor_issue_name(issue.code),
+                        issue.set, issue.binding, spirv_descriptor_kind_name(issue.expected),
+                        spirv_descriptor_kind_name(issue.actual),
+                        (unsigned long long)issue.required_bytes,
+                        (unsigned long long)issue.available_bytes);
+            if (runtime) for (const auto& r : runtime->resources)
+                fprintf(stderr, "[descriptor]   runtime binding=%u cls=%u addr=0x%llx size=%u "
+                                "stride=%u fmt=%u comps=%u srt=0x%x sgpr=%u pc=%u\n",
+                        r.binding, (unsigned)r.cls, (unsigned long long)r.gpu_addr, r.size,
+                        r.stride, (unsigned)r.format, r.num_components,
+                        r.srt_offset, r.sgpr_base, r.fetch_pc);
+        }
+    }
+    return strcmp(mode, "strict") != 0 || report.ok();
+}
+
 void diagnose_compute_dispatches(const GpuState& st, uint64_t submit_no) {
     const char* enabled = getenv("PROSPER_COMPUTELOG");
     const char* dim_env = getenv("PROSPER_COMPUTELOG_DIM");

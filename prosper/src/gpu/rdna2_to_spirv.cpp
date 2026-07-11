@@ -740,7 +740,7 @@ struct SpirvCompute {
     uint32_t land(uint32_t a, uint32_t b_) { uint32_t r = id(); put(code, Op_LogicalAnd, {t_bool, r, a, b_}); return r; }
     uint32_t lor(uint32_t a, uint32_t b_)  { uint32_t r = id(); put(code, Op_LogicalOr,  {t_bool, r, a, b_}); return r; }
 
-    void begin(uint32_t input_stride) {
+    void begin(uint32_t input_stride, const ShaderResourceTable* rt = nullptr) {
         stride = input_stride;
         t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_i32 = id(); t_v3u = id(); t_bool = id();
         t_v4f = id();   // vec4<float>: needed by the sampled-texture path (image_sample) in a compute shader
@@ -779,7 +779,7 @@ struct SpirvCompute {
         put(types, Op_Variable, {t_ptr_sb_struct, v_in, SC_StorageBuffer});
         put(types, Op_Variable, {t_ptr_sb_struct, v_out, SC_StorageBuffer});
         put(types, Op_TypePointer, {t_ptr_sb_f32, SC_StorageBuffer, t_f32});
-        declare_cbufs();   // scalar-memory constant/vertex buffers (bindings 2 & 3)
+        declare_cbufs(rt); // scalar-memory buffers, including table-assigned bindings beyond 2/3
         put(code, Op_Function, {t_void, f_main, FC_None, t_fn});
         put(code, Op_Label, {lbl}); cur_block = lbl;
         uint32_t ld = id(); put(code, Op_Load, {t_v3u, ld, v_gid});
@@ -2756,6 +2756,19 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 fprintf(stderr, "[cbuf] s_buffer_load x%u src0=s%d off=0x%x(dw%u) dyn=%d -> binding=%u %s\n",
                         n, in.src[0].value, in.literal, base_idx, (int)soff_dyn, binding,
                         cbuf_resolved ? "resolved" : "DEFAULT-2");
+            // Immediate s_load_dwordx4/x8 is the same descriptor-table fetch as the dynamic form
+            // handled above. When the front-half table already decoded that V#/T#/S#, its raw words
+            // are provenance only: emitting loads from fallback binding 2 creates a statically-used
+            // descriptor the runtime table does not contain (#515). Preserve the SRT tag and use
+            // placeholders, exactly like the dynamic descriptor-fetch path. A genuinely resolved
+            // constant-buffer resource still executes the load below.
+            if (rt && !cbuf_resolved && (in.opcode == 0x2 || in.opcode == 0x3)) {
+                for (uint32_t k = 0; k < n; ++k) {
+                    rs.sreg[in.dst.value + (int)k] = b.uconst(0);
+                    rs.sreg_srt[in.dst.value + (int)k] = in.literal;
+                }
+                return true;
+            }
             if (soff_dyn) {
                 // Dynamic dword index: (soffset + signed imm) >> 2 (uint add == two's-complement add).
                 uint32_t idx0 = b.ibin(Op_ShiftRightLogical,
@@ -3808,7 +3821,7 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
         uint32_t dw = (lds_bytes + 3) / 4;
         b.lds_dwords = dw > 16384u ? 16384u : (dw ? dw : 1u);
     }
-    b.begin(num_inputs ? num_inputs : 1);
+    b.begin(num_inputs ? num_inputs : 1, rt);
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
     auto safe_branches = safe_execz_branches(ins);
     for (uint32_t wpc : waterfall_branches(ins)) safe_branches.insert(wpc);   // readfirstlane waterfalls (#273)

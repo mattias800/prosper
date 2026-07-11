@@ -453,6 +453,25 @@ int main() {
     printf("  kernel22 mismatches=%u (out[0]=%g expect=320: cbuf0[1]=20 + cbuf1[1]=300)\n", bad22, got22.size()==N?got22[0]:-1);
     CHECK(got22.size()==N && bad22==0, "recompiled kernel 22 (provenance routes s_buffer_loads to bindings 2 & 3) correct");
 
+    // #515: a stage whose decoded resources start at 32/33 must not retain dead fallback-binding-2
+    // loads for the preceding raw descriptor fetches. Those s_load_dwordx4 results are provenance;
+    // the actual s_buffer_load data operations below resolve to the table's high bindings.
+    ShaderResourceTable rt22hi;
+    rt22hi.resources.push_back({ResourceClass::ConstantBuffer, DataFormat::Float32, 1, 32, 0, 96, 0, 0x20});
+    rt22hi.resources.push_back({ResourceClass::ConstantBuffer, DataFormat::Float32, 1, 33, 0, 96, 0, 0x40});
+    std::vector<uint32_t> spv22hi = recompile_valu(code22, sizeof(code22)/sizeof(code22[0]), 1, 0, &rt22hi);
+    auto manifest22hi = validate_spirv_descriptor_interface(
+        spv22hi, &rt22hi, 0, SpirvShaderStage::Compute, false);
+    bool has2 = false, has32 = false, has33 = false;
+    for (const auto& d : manifest22hi.descriptors) {
+        printf("  kernel22hi manifest: set=%u binding=%u type=%s required=%llu%s\n",
+               d.set, d.binding, spirv_descriptor_kind_name(d.kind),
+               (unsigned long long)d.required_bytes, d.dynamic_access ? "+dynamic" : "");
+        has2 |= d.binding == 2; has32 |= d.binding == 32; has33 |= d.binding == 33;
+    }
+    CHECK(!spv22hi.empty() && !has2 && has32 && has33,
+          "#515: decoded descriptor fetches add no dead binding-2 contract; data loads use 32/33");
+
     // Kernel 23: buffer_load_format_x FLOAT32 VERTEX FETCH (stage 2 — the real-VS mechanism). v0=(uint)
     // gid (element index); buffer_load_format_x v1, v0, s[8:11] idxen fetches vbuf[gid]; out=v1. The V#
     // descriptor is DIRECT (in user-data SGPR s8) -> resolved via sgpr_base -> VertexBuffer binding 3,
