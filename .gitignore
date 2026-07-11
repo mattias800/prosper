@@ -12,6 +12,7 @@
 *.sprx
 *.self
 eboot.bin
+*.prgcap
 
 # ---- Build output ----
 /prosper/build/
