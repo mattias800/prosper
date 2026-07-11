@@ -6,9 +6,10 @@ Not a CPU emulator: the PS5 is x86-64, so guest code runs **natively**. `prosper
 operating system (FreeBSD-derived), the library ABI (Sony NID-linked modules), and the GPU
 (AGC → Vulkan) underneath the unmodified game binary.
 
-**Primary title:** `PPSA24651` — *The Messenger* (Unity 2022 / IL2CPP). Also exercised: `PPSA02664`
-(Unity/IL2CPP) and `PPSA17942` (Unreal Engine). Their SELF segments are unencrypted, which is what
-makes the project possible without console keys. Dumps are user-supplied and gitignored.
+**Primary title:** `PPSA24651` — *The Messenger* (Unity 2022 / IL2CPP). Also exercised:
+`PPSA02664` (Unity/IL2CPP), `PPSA17942` (Unreal Engine), `PPSA13579` (*Blasphemous 2*), and
+`PPSA15552` (*Dead Cells*). Their SELF segments are unencrypted, which is what makes the project
+possible without console keys. Dumps are user-supplied and gitignored.
 
 ## Status
 - ✅ **M0–M1 — Recon, tooling & loader.** Format cracked; SELF/ELF → relocatable image → multi-module
@@ -25,16 +26,22 @@ makes the project possible without console keys. Dumps are user-supplied and git
   GFX10 `SW_4KB_S`/`SW_64KB_S` de-swizzle for all element sizes + BC1–7/BC6H, T# format + `DST_SEL`
   swizzle + paired S# sampler. Frame spine → `resolve_pipeline_state` → real `VkGraphicsPipeline`s
   with blend (incl. separate-alpha)/depth/stencil/write-mask/fast-clear + a render-to-texture cache.
-- ✅ **The Messenger renders:** intro cutscene (dozens of distinct animating frames), title screen with
-  readable text, working gamepad input, and progression into gameplay level loading — all asserted by
-  a golden-image snapshot guard.
-- 🚧 **Active frontiers:** revision-locked capture/replay of the black Messenger gameplay frame,
-  strict shader/resource-interface validation, independent diagnosis of the missing save list, broader
-  shader coverage, and the Unreal title's title-screen composite.
+- ✅ **The Messenger renders through gameplay:** intro, title, menus, save list, and the complete first
+  level render at native 1920×1080 with working scripted gamepad progression. The LUT producer,
+  foreground culling, and cross-call depth/stencil lifecycle fixes are regression-covered by Vulkan
+  tests and the real-game snapshot guard.
+- ✅ **Graphics investigation tooling:** versioned live GPU capture/replay (`.prgcap`), per-draw/resource
+  inspection and isolation, strict reflected SPIR-V/runtime descriptor validation, render-target producer
+  provenance, normal screenshot capture, and a local content-metric snapshot guard.
+- 🚧 **Active frontiers:** stabilize *Dead Cells* graphics startup (#539), finish reusable input
+  checkpoints and multi-title snapshot coverage (#302/#248), then apply the capture/replay and contract
+  tools to the existing Unity and Unreal 3D workloads. UE4's first measured GPU blocker is unresolved
+  image/vertex descriptor provenance (#485), not an assumed missing instruction class.
 
-The current Messenger frontier is revision-locked capture/replay of the black gameplay frame, strict
-shader/resource-interface validation, and an independent trace of the save-list failure. See
-[`docs/MESSENGER_BLACK_RENDER.md`](docs/MESSENGER_BLACK_RENDER.md).
+The completed Messenger black-render investigation and reusable evidence boundary are recorded in
+[`docs/MESSENGER_BLACK_RENDER.md`](docs/MESSENGER_BLACK_RENDER.md). Current work is tracked in GitHub
+issues; title failures should produce a reproducible route/capture and a narrowly scoped issue rather
+than a moving-revision hypothesis log.
 
 See [`docs/ROADMAP.md`](docs/ROADMAP.md), [`docs/GRAPHICS.md`](docs/GRAPHICS.md),
 [`docs/RENDER_LOOP.md`](docs/RENDER_LOOP.md), and [`docs/VERIFICATION.md`](docs/VERIFICATION.md)
@@ -51,7 +58,7 @@ prosper/
   src/gpu/         AGC→Vulkan: PM4 decode, command processor, render state, vk_translate,
                    texture tiling + BC decode, RDNA2→SPIR-V recompiler
   frontends/       shared boot+render core, windowed prosper-app, SDL3 audio/dialog, controllers
-  tools/           self_dump, boot_trace, shader_histo, snapshot (golden-image guard), spv_validate
+  tools/           self_dump, boot_trace, shader_histo, screenshot, snapshot, gpu_replay, spv_validate
   tests/           unit + boot + Vulkan-execution tests (ctest)
   CMakeLists.txt
 ```
@@ -60,7 +67,7 @@ prosper/
 ```
 cmake -S . -B build -G Ninja
 cmake --build build
-ctest --test-dir build          # 84 self-checking tests
+ctest --test-dir build          # 85 self-checking tests
 ```
 Add `-DPROSPER_APP=ON` for the windowed `prosper-app` frontend (fetches SDL3). Or a tool directly:
 ```

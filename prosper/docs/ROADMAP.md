@@ -26,15 +26,19 @@ presented, framebuffer CRC == golden" is. Each change adds the check that proves
 
 ## Current status (2026-07-11) - at a glance
 
-- **Messenger renders through gameplay submission:** the former GfxDevice, draw-submission, and
-  bindless vertex-fetch blockers are solved. The intro, title, and menu render; a real multi-pass
-  gameplay frame is submitted, but its scene content remains black. The save-game list is also missing.
-- **No current-master root cause is established:** #300 accumulated contradictory diagnoses on changing
-  revisions, and the former missing binding-9 vertex-color resource was later observed populated while
-  the level remained black. #299 has not been independently traced, so SaveData/HLE remains plausible.
-- **Immediate milestone:** create an immutable local GPU frame capture/replay, then strictly validate the
-  generated SPIR-V descriptor interface against runtime resources. Canonical evidence and next steps are
-  in `docs/MESSENGER_BLACK_RENDER.md` and GitHub issues #299, #300, #514, and #515.
+- **Messenger reaches and renders the first level:** intro, title, menus, save list, dialogue, player,
+  background, foreground tree/terrain, water, and structures render at native 1920×1080. The causal fixes
+  are the grading-LUT producer/target extent (#528), Vulkan front-face translation (#534), and independent
+  depth/stencil aspect validity in the persistent guest-surface cache (#541). The full-resolution route was
+  user-confirmed against the hardware reference; #299, #300, #522, #530, and #540 are closed.
+- **The investigation tools are operational:** #514 provides versioned live GPU capture/replay with exact
+  live/replay hashes and per-draw/resource isolation; #515 provides reflected SPIR-V/runtime descriptor
+  validation in live and offline replay paths. Producer provenance, normal screenshot capture, and the local
+  content-metric snapshot guard complete the current first-bad-contract workflow.
+- **Immediate milestone:** stabilize *Dead Cells* startup around AGC resource registration (#539), turning
+  the work into reusable structured HLE-call/output tracing and a repeated-startup gate. Then finish input
+  checkpoints and multi-title snapshots (#302/#248) before using an existing Unity/Unreal 3D workload to
+  expand graphics coverage. UE4's current measured shader rejection boundary is descriptor provenance (#485).
 
 ## Historical status (2026-07-05) - retained for the milestone log
 
