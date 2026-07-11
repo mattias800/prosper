@@ -140,18 +140,26 @@ uint32_t pad_trigger_buttons(uint8_t l2, uint8_t r2);
 // A timed button sequence lets a headless run drive menus with no host device (issue #163). These
 // three helpers are pure (no env, no clock) so the parse + time-eval logic is verifiable; the HLE
 // (hle_pad.cpp) supplies getenv + the wall clock and anchors t=0 to the first input poll.
-struct PadScriptEntry { double t_secs; uint32_t button_mask; };
+// t_secs holds a wall-clock time (default) OR, when frame_anchored, a FRAME NUMBER (flips since the
+// first poll). Frame-anchoring is boot-speed-invariant: `f300:cross` fires at the same game state on a
+// fast GPU and slow llvmpipe, where a wall-clock `10:cross` would drift — essential for deterministic
+// menu-reach across builds (bisect/regression repro). See #302.
+struct PadScriptEntry { double t_secs; uint32_t button_mask; bool frame_anchored = false; };
 
 // Map a button name ("start"/"options"/"cross"/"x"/"up"/... case as written) to its SCE_PAD_BUTTON_*
 // bit; 0 if unknown. "start" and "options" both mean the PS5 Options button (the "Start" equivalent).
 uint32_t pad_button_by_name(const std::string& name);
 
-// Parse "<secs>:<btn>[+<btn>...][;<secs>:<btn>...]" into entries (e.g. "3:start;9:cross+up"). Entries
+// Parse "<secs>:<btn>[+<btn>...][;...]" into entries (e.g. "3:start;9:cross+up"). An entry whose time
+// token starts with 'f' is FRAME-anchored: "f300:cross" fires at flip 300 since the first poll. Entries
 // with no recognized button are dropped. Whitespace-tolerant only where the spec has none by design.
 std::vector<PadScriptEntry> parse_pad_script(const std::string& spec);
 
-// Buttons held at `elapsed_secs`: OR of every entry whose window [t, t+hold_secs) contains the time.
-uint32_t pad_script_buttons_at(const std::vector<PadScriptEntry>& script, double elapsed_secs, double hold_secs);
+// Buttons held now: OR of every entry whose window contains the current time. A seconds-anchored entry
+// matches [t, t+hold_secs) against `elapsed_secs`; a frame-anchored entry matches [f, f+frame_hold)
+// against `frame_count` (pass -1 when no frame count is available -> frame entries never fire).
+uint32_t pad_script_buttons_at(const std::vector<PadScriptEntry>& script, double elapsed_secs, double hold_secs,
+                               int64_t frame_count = -1, int64_t frame_hold = 8);
 
 // ---- Pluggable host backend (mirrors AudioSink / audio_set_sink) -------------------------------
 //

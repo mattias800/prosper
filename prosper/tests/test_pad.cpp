@@ -154,6 +154,25 @@ int main() {
         CHECK(pad_script_buttons_at(s, 3.30, hold) == 0,                      "eval: at window end (exclusive) -> released");
         CHECK(pad_script_buttons_at(s, 16.1, hold) == (SCE_PAD_BUTTON_UP | SCE_PAD_BUTTON_CROSS), "eval: combined press");
         CHECK(parse_pad_script("").empty(), "parse: empty spec -> no entries");
+
+        // Frame-anchored entries (#302): "f<N>:" fires at flip N, not wall-clock second N.
+        auto fs = parse_pad_script("f300:cross;5:start");
+        CHECK(fs.size() == 2, "frame: 2 entries");
+        CHECK(fs[0].frame_anchored && fs[0].t_secs == 300.0 && fs[0].button_mask == SCE_PAD_BUTTON_CROSS,
+              "frame: 'f300:cross' parses frame-anchored at 300");
+        CHECK(!fs[1].frame_anchored && fs[1].t_secs == 5.0, "frame: '5:start' stays seconds-anchored");
+        // Frame entry ignores wall-clock, fires in [f, f+frame_hold); seconds entry ignores frame_count.
+        const int64_t fhold = 8;
+        CHECK(pad_script_buttons_at(fs, /*secs*/999.0, hold, /*frame*/299, fhold) == 0,
+              "frame: before flip window (even far in wall-time) -> none");
+        CHECK(pad_script_buttons_at(fs, 999.0, hold, 300, fhold) == SCE_PAD_BUTTON_CROSS,
+              "frame: at flip 300 -> pressed");
+        CHECK(pad_script_buttons_at(fs, 999.0, hold, 307, fhold) == SCE_PAD_BUTTON_CROSS,
+              "frame: within [300,308) -> pressed");
+        CHECK(pad_script_buttons_at(fs, 999.0, hold, 308, fhold) == 0,
+              "frame: at window end (exclusive) -> released");
+        CHECK(pad_script_buttons_at(fs, 5.1, hold, /*no frame info*/-1, fhold) == SCE_PAD_BUTTON_OPTIONS,
+              "frame: seconds entry still fires with frame_count=-1; frame entry does not");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }

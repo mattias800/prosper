@@ -84,6 +84,18 @@ double pad_hold_secs() {
 // t0 (us) of the first poll; 0 until set. steady_clock so it matches now_us().
 std::atomic<uint64_t> g_pad_t0_us{0};
 
+// Frame anchor: the flip count at the first poll, so `f<N>:` entries measure flips-since-first-poll.
+// prosper_vo_flip_count() is the guest's presented-frame counter (hle_graphics.cpp), boot-speed-
+// invariant — unlike wall-clock it lands the same input on the same game state across builds (#302).
+extern "C" uint64_t prosper_vo_flip_count();
+std::atomic<uint64_t> g_pad_flip0{0};
+std::atomic<bool>     g_pad_flip0_set{false};
+
+int64_t pad_frame_hold() {   // how many flips to hold a frame-anchored press (default 8)
+    static const int64_t h = [] { const char* e = getenv("PROSPER_PAD_FRAME_HOLD"); return e ? (int64_t)atoll(e) : 8; }();
+    return h;
+}
+
 // Overlay any active scripted press onto `s`. Returns true if a script is driving the pad.
 bool apply_pad_script(HostPadState& s) {
     const auto& script = pad_script();
@@ -95,7 +107,11 @@ bool apply_pad_script(HostPadState& s) {
         if (g_pad_t0_us.compare_exchange_strong(expect, now)) t0 = now; else t0 = expect;
     }
     double elapsed = (now_us() - t0) / 1e6;
-    s.buttons |= pad_script_buttons_at(script, elapsed, pad_hold_secs());
+    // Frame count = flips since the first poll (anchor the flip baseline on that same first poll).
+    uint64_t flips = prosper_vo_flip_count();
+    if (!g_pad_flip0_set.exchange(true)) g_pad_flip0.store(flips, std::memory_order_relaxed);
+    int64_t frame = (int64_t)(flips - g_pad_flip0.load(std::memory_order_relaxed));
+    s.buttons |= pad_script_buttons_at(script, elapsed, pad_hold_secs(), frame, pad_frame_hold());
     return true;
 }
 
