@@ -1897,6 +1897,26 @@ int main() {
            gotT22.size()==8?gotT22[3]:-1, expT22[3]);
     CHECK(gotT22.size()==8 && badT22==0, "T22: WORD-dst f16 mul + WORD-to-WORD mov preserve halves exactly");
 
+    // Kernel T24: v_cvt_off_f32_i4 (#527). The low nibble is a signed i4 [-8,7],
+    // converted to f32 and scaled by 1/16. Exercise every nibble, including both signs.
+    const uint32_t codeT24[] = { 0x7e001d00u, 0xbf810000u };
+    std::vector<uint32_t> spvT24 = recompile_valu(codeT24, sizeof(codeT24)/4, 1, 0);
+    CHECK(!spvT24.empty(), "recompiled T24 (v_cvt_off_f32_i4) -> SPIR-V");
+    std::vector<float> inT24(16), expT24(16);
+    for (uint32_t i = 0; i < 16; ++i) {
+        uint32_t raw = i; std::memcpy(&inT24[i], &raw, sizeof raw);
+        int32_t s4 = (i & 8u) ? (int32_t)i - 16 : (int32_t)i;
+        expT24[i] = (float)s4 * 0.0625f;
+    }
+    std::vector<float> gotT24 = prosper::test::run_compute(spvT24, inT24, 16, 16);
+    uint32_t badT24 = 0;
+    for (uint32_t i = 0; i < 16 && gotT24.size() == 16; ++i)
+        if (gotT24[i] != expT24[i]) badT24++;
+    printf("  T24(i4 offset convert) mismatches=%u (nibble 7=%g, 8=%g)\n", badT24,
+           gotT24.size()==16?gotT24[7]:-9.f, gotT24.size()==16?gotT24[8]:-9.f);
+    CHECK(gotT24.size()==16 && badT24==0,
+          "T24: signed i4 values convert to f32 multiples of 1/16 exactly");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

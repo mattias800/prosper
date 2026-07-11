@@ -6,6 +6,7 @@
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
 #include "../src/gpu/command_processor.hpp"
+#include "../src/gpu/pm4_registers.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -39,8 +40,9 @@ int main() {
     auto setcx = Hle::lookup("ZvwO9euwYzc");   // SetCxRegistersIndirect
     auto setsh = Hle::lookup("-HOOCn0JY48");   // SetShRegistersIndirect
     auto draw  = Hle::lookup("Yw0jKSqop+E");   // DrawIndexAuto
-    CHECK(reset && idx && setcx && setsh && draw, "AGC Dcb builders registered");
-    if (!(reset && idx && setcx && setsh && draw)) { printf("== FAIL ==\n"); return 1; }
+    auto dispatch = Hle::lookup("k3GhuSNmBLU"); // DispatchDirect
+    CHECK(reset && idx && setcx && setsh && draw && dispatch, "AGC Dcb builders registered");
+    if (!(reset && idx && setcx && setsh && draw && dispatch)) { printf("== FAIL ==\n"); return 1; }
 
     uint32_t buffer[256];
     memset(buffer, 0, sizeof buffer);
@@ -177,6 +179,41 @@ int main() {
             CHECK(s4.draws[2].state->sh.at(0x42) == 0xBBBB, "draw 2 snapshot holds the updated value");
             CHECK(s4.sh.at(0x42) == 0xBBBB, "folded end state is the last write");
             CHECK(&s4.state_at_draw(0) == s4.draws[0].state.get(), "state_at_draw returns the snapshot");
+        }
+    }
+
+    // Compute is not executed yet, but each DispatchDirect must retain its exact register state so
+    // producer-provenance diagnostics can resolve the bound shader and resources (#524).
+    {
+        namespace P = prosper::agc::Pm4;
+        uint32_t cbuf[128]; memset(cbuf, 0, sizeof cbuf);
+        Dcb cd{}; cd.bottom = cbuf; cd.top = cbuf + 128; cd.cursor_up = cbuf; cd.cursor_down = cbuf + 128;
+        auto CD = (uint64_t)(uintptr_t)&cd;
+        ShaderReg cregs0[2] = {
+            {P::COMPUTE_PGM_LO, 0x00123456u},
+            {P::COMPUTE_USER_DATA_0 + 3, 0xAAAA1111u},
+        };
+        ShaderReg cregs1[1] = {{P::COMPUTE_USER_DATA_0 + 3, 0xBBBB2222u}};
+        reset(CD, 0x3ff, 0, 0, 0, 0);
+        setsh(CD, (uint64_t)(uintptr_t)cregs0, 2, 0, 0, 0);
+        dispatch(CD, 32, 4, 1, 0x1122334455667788ull, 0);
+        setsh(CD, (uint64_t)(uintptr_t)cregs1, 1, 0, 0, 0);
+        dispatch(CD, 8, 2, 3, 0x8877665544332211ull, 0);
+        GpuState cs;
+        run_cb(cbuf, 128, cs);
+        CHECK(cs.dispatch_count == 2 && cs.dispatches.size() == 2,
+              "2 compute dispatches counted and retained");
+        if (cs.dispatches.size() == 2) {
+            CHECK(cs.dispatches[0].tg_x == 32 && cs.dispatches[0].tg_y == 4 && cs.dispatches[0].tg_z == 1,
+                  "dispatch 0 threadgroup counts retained");
+            CHECK(cs.dispatches[0].modifier == 0x1122334455667788ull,
+                  "dispatch 0 modifier retained");
+            CHECK(cs.dispatches[0].state &&
+                  cs.dispatches[0].state->sh.at(P::COMPUTE_USER_DATA_0 + 3) == 0xAAAA1111u,
+                  "dispatch 0 snapshot retains pre-update compute user data");
+            CHECK(cs.dispatches[1].state &&
+                  cs.dispatches[1].state->sh.at(P::COMPUTE_USER_DATA_0 + 3) == 0xBBBB2222u,
+                  "dispatch 1 snapshot retains updated compute user data");
         }
     }
 

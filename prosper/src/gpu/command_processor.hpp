@@ -58,7 +58,16 @@ struct GpuState {
         bool     from_offset  = false;
     };
     std::vector<Draw> draws;                             // one per DrawIndexAuto / DrawIndex
-    uint64_t dispatch_count = 0;                         // DispatchDirect packets seen (no execution yet)
+    // Compute dispatch + register state AT the packet. Compute is not executed yet, but retaining
+    // the state makes skipped-producer provenance inspectable instead of reducing every dispatch
+    // to one process-lifetime counter (#524).
+    struct Dispatch {
+        uint32_t tg_x = 0, tg_y = 0, tg_z = 0;
+        uint64_t modifier = 0;
+        std::shared_ptr<const GpuState> state;
+    };
+    std::vector<Dispatch> dispatches;                     // current submit's DispatchDirect packets
+    uint64_t dispatch_count = 0;                          // process-lifetime DispatchDirect count
 
     // GPU predication window (#319): the 64-bit condition address the last SetPredication opened
     // (0 = no window). A packet-predicated Jump inside the window is executed/skipped on the

@@ -64,6 +64,7 @@ int main() {
         // CB fast-clear (#309): CLEAR_WORD0 holds one texel in the surface's 8_8_8_8 format.
         { P::CB_COLOR0_CLEAR_WORD0, 0x11223344u },
         { P::CB_COLOR0_CLEAR_WORD1, 0x00000000u },
+        { P::CB_COLOR0_ATTRIB2, ((1024u - 1u) << 14) | (32u - 1u) },
     };
     // Shader-stage program addresses.
     ShaderReg sh_regs[] = {
@@ -91,6 +92,8 @@ int main() {
     CHECK(rs.color0_format == 0x0Au, "color0_format = 0x0A (FORMAT field)");
     CHECK(rs.color0_number_type == 6u, "color0_number_type = 6 (SRGB)");
     CHECK(rs.color0_comp_swap == 1u, "color0_comp_swap = 1 (BGRA)");
+    CHECK(rs.color0_has_extent && rs.color0_width == 1024 && rs.color0_height == 32,
+          "CB_COLOR0_ATTRIB2 dimension-minus-one fields decode to 1024x32");
     CHECK(vk_color_format(rs.color0_format, rs.color0_number_type, rs.color0_comp_swap)
               == VkFormat::B8G8R8A8_SRGB, "color format -> VK B8G8R8A8_SRGB");
     CHECK(vk_color_format(0x0Au, 0u, 0u) == VkFormat::R8G8B8A8_UNORM, "0xA/UNORM/RGBA -> R8G8B8A8_UNORM");

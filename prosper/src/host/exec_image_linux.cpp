@@ -157,12 +157,41 @@ namespace {
     // (e.g. an async-loader worker) which a main-thread-only bp misses. Per-thread fd + stepping state.
     bool                 g_hwbp_allthreads = false;
     thread_local int     t_hwbp_fd = -1;       // this thread's own bp fd (main thread mirrors g_hwbp_fd)
-    thread_local bool    t_hwbp_stepping = false;
+    // Signal handlers can run while the guest owns %fs, so C++ thread_local state is not usable there.
+    // Publish perf fds by kernel tid before enabling them; the handler then finds its own step state
+    // without touching host TLS. Fixed storage also keeps lookup allocation/lock-free in the handler.
+    static constexpr int HWBP_THREAD_MAX = 512;
+    struct HwbpThreadState {
+        volatile long tid;
+        volatile sig_atomic_t fd;
+        volatile sig_atomic_t stepping;
+    };
+    HwbpThreadState g_hwbp_threads[HWBP_THREAD_MAX] = {};
+    volatile int g_hwbp_thread_count = 0;
+    HwbpThreadState* hwbp_thread_state(long tid) {
+        const int count = __atomic_load_n(&g_hwbp_thread_count, __ATOMIC_ACQUIRE);
+        for (int i = 0; i < count && i < HWBP_THREAD_MAX; ++i) {
+            if (__atomic_load_n(&g_hwbp_threads[i].tid, __ATOMIC_ACQUIRE) == tid)
+                return &g_hwbp_threads[i];
+        }
+        return nullptr;
+    }
+    bool hwbp_register_thread(long tid, int fd) {
+        const int slot = __atomic_fetch_add(&g_hwbp_thread_count, 1, __ATOMIC_ACQ_REL);
+        if (slot >= HWBP_THREAD_MAX) return false;
+        g_hwbp_threads[slot].fd = fd;
+        g_hwbp_threads[slot].stepping = 0;
+        __atomic_store_n(&g_hwbp_threads[slot].tid, tid, __ATOMIC_RELEASE);
+        return true;
+    }
     // PROSPER_HWBP_R15=<hex>: only LOG when r15 == this value (a condition, evaluated in-process = no gdb
     // round-trip). When matched, also dump a window of memory around rax + classify rax's mapping. Built to
     // catch the one deserializer read that produces a garbage std::string length without the gdb-bp overhead
     // that times out on hot addresses. r15 is used because it carries the read length at eboot+0x7e40e1.
     uint64_t g_hwbp_r15 = 0; bool g_hwbp_r15_on = false;
+    // PROSPER_HWBP_RET=<absolute VA>: only log calls whose stack return address matches. This isolates
+    // one caller of a hot shared function while still stepping/rearming silently for all other hits.
+    uint64_t g_hwbp_ret = 0; bool g_hwbp_ret_on = false;
     // PROSPER_HWBP_RAXMIN=<hex>: only LOG when rax >= this (a cursor-range gate). Lets a trace of a hot
     // shared reader isolate one buffer/context (e.g. the 16 MB shader pool at 0x7ffefc…) out of thousands
     // of unrelated small-string reads, so the log + the max-count apply to the context of interest.
@@ -744,6 +773,7 @@ namespace {
         // safe on hot/multi-threaded functions.
         if (sig == SIGTRAP && ((g_hwbp_on && g_hwbp_fd >= 0) || g_hwwatch_fd >= 0)) {
             auto* uc = (ucontext_t*)uctx;
+            HwbpThreadState* hwbp_state = hwbp_thread_state(cur_tid());
             // Step-window: continuous single-step from driver hit N to the next driver hit. On each step,
             // find the live read cursor (a GP reg pointing inside [base,end]) and ring-log advances.
             if (g_stepwin_active && si->si_code == TRAP_TRACE) {
@@ -774,10 +804,15 @@ namespace {
                 }
                 return;
             }
-            if ((t_hwbp_stepping || g_hwbp_stepping) && si->si_code == TRAP_TRACE) {
-                ioctl(t_hwbp_fd >= 0 ? t_hwbp_fd : g_hwbp_fd, PERF_EVENT_IOC_ENABLE, 0);
+            // perf's asynchronous SIGTRAP delivery does not reliably preserve TRAP_TRACE for the
+            // TF completion on every host/kernel combination. The perf event is disabled while this
+            // state is set, so the next trap is the single-step completion by construction.
+            if ((hwbp_state && hwbp_state->stepping) || g_hwbp_stepping) {
+                const int fd = hwbp_state ? hwbp_state->fd : g_hwbp_fd;
+                ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
                 uc->uc_mcontext.gregs[REG_EFL] &= ~0x100ll;
-                t_hwbp_stepping = false; g_hwbp_stepping = false;
+                if (hwbp_state) hwbp_state->stepping = 0;
+                g_hwbp_stepping = false;
                 return;
             }
             // Chained DATA write-watchpoint hit (a write to the watched slot completed): log the writer
@@ -808,7 +843,10 @@ namespace {
             // This handler returns to the guest, which may be on the guest %fs — swap to host %fs for the
             // host-libc logging below, restore before returning. No-op off the guest-fs path.
             uint64_t saved_fs = guest_fs_to_host_scoped();
-            bool cond_ok = (!g_hwbp_r15_on || (r15 == g_hwbp_r15)) && (rax >= g_hwbp_raxmin);
+            const uint64_t rsp = (uint64_t)gr[REG_RSP];
+            const uint64_t ret = probe_readable(rsp + 7) ? *(const uint64_t*)rsp : 0;
+            bool cond_ok = (!g_hwbp_r15_on || (r15 == g_hwbp_r15)) &&
+                           (!g_hwbp_ret_on || (ret == g_hwbp_ret)) && (rax >= g_hwbp_raxmin);
             // PROSPER_HWBP_ANOM ring trace: push every gated hit; when a read yields a value >= the
             // anomaly threshold, dump the ring (the cursor walk into the over-read) exactly once.
             if (g_hwbp_anom_on && cond_ok && !g_hwbp_ring_dumped) {
@@ -928,13 +966,21 @@ namespace {
                 }
             }
             // PROSPER_HWBP_ARGS=1: at a method-entry bp, print the SysV integer-arg registers
-            // (rdi/rsi/rdx/rcx/r8/r9) + the return address, so a call's arguments (e.g. an enum/mode
-            // in esi) are visible per hit without a gdb round-trip. Generic; composes with the count cap.
+            // (rdi/rsi/rdx/rcx/r8/r9), guarded [rdi+0x10]/[rdx+0x10], and the return address, so a
+            // call's arguments (and UnityEngine.Object m_CachedPtr values) are visible per hit without
+            // a gdb round-trip. Generic; composes with the count cap.
             if (g_hwbp_args && cond_ok) {
-                char b[192]; int n = snprintf(b, sizeof b,
-                    "[hwbp-args] rdi=0x%llx rsi=0x%llx rdx=0x%llx rcx=0x%llx r8=0x%llx r9=0x%llx ret=eboot+0x%llx\n",
-                    (unsigned long long)gr[REG_RDI], (unsigned long long)gr[REG_RSI],
-                    (unsigned long long)gr[REG_RDX], (unsigned long long)gr[REG_RCX],
+                auto arg_field = [](uint64_t p) -> uint64_t {
+                    return probe_readable(p + 0x17) ? *(const uint64_t*)(p + 0x10) : 0;
+                };
+                char b[256]; int n = snprintf(b, sizeof b,
+                    "[hwbp-args] rdi=0x%llx [+10]=0x%llx rsi=0x%llx rdx=0x%llx [+10]=0x%llx rcx=0x%llx r8=0x%llx r9=0x%llx ret=eboot+0x%llx\n",
+                    (unsigned long long)gr[REG_RDI],
+                    (unsigned long long)arg_field((uint64_t)gr[REG_RDI]),
+                    (unsigned long long)gr[REG_RSI],
+                    (unsigned long long)gr[REG_RDX],
+                    (unsigned long long)arg_field((uint64_t)gr[REG_RDX]),
+                    (unsigned long long)gr[REG_RCX],
                     (unsigned long long)gr[REG_R8], (unsigned long long)gr[REG_R9],
                     (unsigned long long)(probe_readable((uint64_t)gr[REG_RSP]) ? (*(const uint64_t*)(uint64_t)gr[REG_RSP] - 0x400000000ull) : 0));
                 syscall(SYS_write, 2, b, (size_t)n);
@@ -1046,7 +1092,9 @@ namespace {
                 else if (!strcmp(r,"rbp")) base = (uint64_t)gr[REG_RBP];
                 arm_hwwatch(base + (uint64_t)g_hwwatch_delta);
             }
-            ioctl(t_hwbp_fd >= 0 ? t_hwbp_fd : g_hwbp_fd, PERF_EVENT_IOC_DISABLE, 0);   // disable so we can step off the bp address
+            const int hit_fd = hwbp_state ? hwbp_state->fd :
+                               (si->si_fd >= 0 ? si->si_fd : g_hwbp_fd);
+            ioctl(hit_fd, PERF_EVENT_IOC_DISABLE, 0);   // disable so we can step off the bp address
             // Step-window ENTRY: on the Nth driver hit, begin continuous single-stepping (bp stays disabled;
             // the window ends when we single-step back to the driver = next hit). Buffer range is [base,
             // base+0x20000) — the reader's own end grows across the window, so use a generous span.
@@ -1070,7 +1118,7 @@ namespace {
             // can be 0 to suppress the per-hit log yet keep the bp live feeding the ring until it dumps).
             if (g_hwbp_count < g_hwbp_max || ((g_hwbp_anom_on || g_hwbp_node_on) && !g_hwbp_ring_dumped)) {
                 uc->uc_mcontext.gregs[REG_EFL] |= 0x100ll;
-                if (t_hwbp_fd >= 0) t_hwbp_stepping = true; else g_hwbp_stepping = true;
+                if (hwbp_state) hwbp_state->stepping = 1; else g_hwbp_stepping = true;
             }                                              // else: leave disabled (one-and-done at the cap)
             guest_fs_restore_scoped(saved_fs);             // back to guest %fs before returning to guest code
             return;
@@ -1761,6 +1809,7 @@ void install_trap_handler() {
         g_hwbp_addr = 0x400000000ull + strtoull(hb, nullptr, 0);
         if (const char* m = getenv("PROSPER_HWBP_MAX")) g_hwbp_max = (int)strtoul(m, nullptr, 0);
         if (const char* c = getenv("PROSPER_HWBP_R15")) { g_hwbp_r15 = strtoull(c, nullptr, 0); g_hwbp_r15_on = true; }
+        if (const char* c = getenv("PROSPER_HWBP_RET")) { g_hwbp_ret = strtoull(c, nullptr, 0); g_hwbp_ret_on = true; }
         if (const char* c = getenv("PROSPER_HWBP_RAXMIN")) g_hwbp_raxmin = strtoull(c, nullptr, 0);
         if (const char* c = getenv("PROSPER_HWBP_ANOM")) { g_hwbp_anom = strtoull(c, nullptr, 0); g_hwbp_anom_on = true; }
         if (getenv("PROSPER_HWBP_NODE")) g_hwbp_node_on = true;
@@ -1835,6 +1884,12 @@ void arm_hwbp() {
     fcntl(g_hwbp_fd, F_SETSIG, SIGTRAP);
     struct f_owner_ex ow; ow.type = F_OWNER_TID; ow.pid = (pid_t)syscall(SYS_gettid);
     fcntl(g_hwbp_fd, F_SETOWN_EX, &ow);
+    if (!hwbp_register_thread(ow.pid, g_hwbp_fd)) {
+        int n = snprintf(b, sizeof b, "[hwbp] thread-state table full for tid=%ld - HW bp disabled\n",
+                         (long)ow.pid);
+        syscall(SYS_write, 2, b, (size_t)n);
+        close(g_hwbp_fd); g_hwbp_fd = -1; g_hwbp_on = false; return;
+    }
     ioctl(g_hwbp_fd, PERF_EVENT_IOC_ENABLE, 0);
     t_hwbp_fd = g_hwbp_fd;   // main thread uses the same fd for its per-thread stepping state
     int n = snprintf(b, sizeof b, "[hwbp] armed HW execute bp at eboot+0x%llx (fd=%d tid=%ld)\n",
@@ -1857,6 +1912,12 @@ void arm_hwbp_this_thread() {
     fcntl(t_hwbp_fd, F_SETSIG, SIGTRAP);
     struct f_owner_ex ow; ow.type = F_OWNER_TID; ow.pid = (pid_t)syscall(SYS_gettid);
     fcntl(t_hwbp_fd, F_SETOWN_EX, &ow);
+    if (!hwbp_register_thread(ow.pid, t_hwbp_fd)) {
+        char b[112]; int n = snprintf(b, sizeof b,
+            "[hwbp] thread-state table full for worker tid=%ld - not armed\n", (long)ow.pid);
+        syscall(SYS_write, 2, b, n);
+        close(t_hwbp_fd); t_hwbp_fd = -1; return;
+    }
     ioctl(t_hwbp_fd, PERF_EVENT_IOC_ENABLE, 0);
     char b[128]; int n = snprintf(b, sizeof b, "[hwbp] armed on worker tid=%ld (fd=%d) for eboot+0x%llx\n",
         (long)syscall(SYS_gettid), t_hwbp_fd, (unsigned long long)(g_hwbp_addr - 0x400000000ull));

@@ -59,6 +59,34 @@ int main() {
               "replay samples captured red texel from owned backing");
     }
 
+    // A non-VideoOut producer must render at CB_COLOR0_ATTRIB2's extent, be cached under its
+    // target address, and feed a later pass. Before #526 both passes used the global 64x64 extent.
+    DrawItem producer = replay.items[0];
+    producer.color0_base = 0x300000;
+    producer.color0_width = 32;
+    producer.color0_height = 2;
+
+    DrawItem consumer = replay.items[0];
+    consumer.color0_base = 0x400000;
+    consumer.color0_width = 16;
+    consumer.color0_height = 16;
+    auto consumer_rt = std::make_shared<ShaderResourceTable>(*consumer.prt);
+    consumer_rt->resources[0].gpu_addr = producer.color0_base;
+    consumer_rt->resources[0].width = producer.color0_width;
+    consumer_rt->resources[0].height = producer.color0_height;
+    consumer_rt->resources[0].host_data = nullptr;
+    consumer_rt->resources[0].host_data_size = 0;
+    consumer.prt = std::move(consumer_rt);
+
+    std::vector<uint8_t> chained = render_submit_items({producer, consumer}, W, H);
+    CHECK(chained.size() == static_cast<size_t>(16) * 16 * 4,
+          "per-target chain returns the last pass at its declared 16x16 extent");
+    if (chained.size() == static_cast<size_t>(16) * 16 * 4) {
+        const uint8_t* center = &chained[(8u * 16u + 8u) * 4];
+        CHECK(center[0] > 0xC0 && center[1] < 0x40 && center[2] < 0x40,
+              "later pass samples pixels cached from the 32x2 producer target");
+    }
+
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
     std::printf("== PASS ==\n"); return 0;
 }

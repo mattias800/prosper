@@ -1368,6 +1368,13 @@ void GpuState::apply(const Pm4Command& c) {
             // guest builds around each dispatch (label init + EOP write + wait) completes at fold
             // time independently of the dispatch itself, so skipping the shader work cannot hang
             // the stream — it only leaves compute-written buffers stale (surfaced by the counter).
+            if (state_dirty_ || !last_snapshot_) {
+                auto snap = std::make_shared<GpuState>();
+                snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
+                last_snapshot_ = std::move(snap);
+                state_dirty_ = false;
+            }
+            dispatches.push_back({c.tg_x, c.tg_y, c.tg_z, c.dispatch_modifier, last_snapshot_});
             dispatch_count++;
             break;
         case K::SetPredication:

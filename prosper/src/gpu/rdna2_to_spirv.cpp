@@ -2137,6 +2137,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // low half. VERIFIED(round-trip llvm-mc gfx1030: 0x0a/0x0b).
                 case 0x0A: d = b.pack_half_lo(a); break;              // v_cvt_f16_f32
                 case 0x0B: d = b.unpack_half(a, 0); break;            // v_cvt_f32_f16
+                // v_cvt_off_f32_i4: sign-extend the low 4-bit integer and scale by 1/16.
+                // AMD RDNA2 ISA: "4-bit signed int to 32-bit float"; LLVM's intrinsic
+                // contract specifies result = 0.0625f * src_i4. This is the only opcode
+                // that blocked The Messenger's 1024x32 grading-LUT producer (#527).
+                case 0x0E:
+                    d = b.fbin(Op_FMul,
+                               b.cvt_i2f(b.bfe_s(a, b.uconst(0), b.uconst(4))),
+                               b.uconst(fbits(0.0625f)));
+                    break;
                 case 0x20: d = b.fext1(Glsl_Fract, a); break;         // v_fract_f32
                 case 0x21: d = b.fext1(Glsl_Trunc, a); break;         // v_trunc_f32
                 case 0x22: d = b.fext1(Glsl_Ceil, a); break;          // v_ceil_f32
@@ -2185,7 +2194,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // opcodes only (mirrors the VOP2/VOP3 fresult path; DOLL VS: `v_exp_f32_sdwa … clamp`).
             // A modifier on a non-float-result op would silently drop — reject loudly instead.
             if (ok && (in.omod || in.clamp)) switch (in.opcode) {
-                case 0x05: case 0x06: case 0x0B: case 0x20: case 0x21: case 0x22: case 0x23: case 0x24:
+                case 0x05: case 0x06: case 0x0B: case 0x0E: case 0x20: case 0x21: case 0x22: case 0x23: case 0x24:
                 case 0x25: case 0x27: case 0x2A: case 0x2B: case 0x2E: case 0x33: case 0x35: case 0x36:
                     if      (in.omod == 1) d = b.fbin(Op_FMul, d, b.uconst(fbits(2.0f)));
                     else if (in.omod == 2) d = b.fbin(Op_FMul, d, b.uconst(fbits(4.0f)));

@@ -70,6 +70,11 @@ int main() {
     CHECK(f.unsupported == 0 && f.table_dependent >= 1 && f.first_bad_fmt < 0,
           "#325: a 2D_ARRAY image_sample is recompilable-in-context (base slice), not unsupported");
 
+    const uint32_t cvt_i4[] = { 0x7e001d00u, 0xBF810000u }; // v_cvt_off_f32_i4 v0,v0
+    RecompileCoverage g = recompile_coverage(cvt_i4, sizeof(cvt_i4)/sizeof(cvt_i4[0]));
+    CHECK(g.total == 1 && g.alu == 1 && g.unsupported == 0,
+          "#527: v_cvt_off_f32_i4 is covered by the VOP1 recompiler");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

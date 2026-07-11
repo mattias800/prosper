@@ -26,6 +26,11 @@ struct RenderState {
     uint32_t color0_number_type = 0;   // CB_COLOR0_INFO.NUMBER_TYPE  (UNORM/SRGB/…)
     uint32_t color0_comp_swap   = 0;   // CB_COLOR0_INFO.COMP_SWAP    (channel order: RGBA/BGRA/…)
 
+    // Gen5 target extent from CB_COLOR0_ATTRIB2. Fields store dimension-1. This is independent
+    // of VideoOut and of the viewport: Unity's grading LUT is a 1024x32 render target (#526).
+    bool     color0_has_extent = false;
+    uint32_t color0_width = 0, color0_height = 0;
+
     // CB fast-clear for MRT 0 (CB_COLOR0_CLEAR_WORD0/1 = 0x323/0x324). `has_clear` is true when the
     // game PROGRAMMED the clear words (register present); the words hold the clear value in the
     // target's pixel format, decoded to an RGBA float in resolve_pipeline_state (#309).
