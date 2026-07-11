@@ -32,10 +32,11 @@ screenshot <app0-dir> [--every N] [--count M] [--out DIR] [--timeout SECS]
 | `--every N` | 60 | Rendered frames between screenshots |
 | `--seconds S` | — | Wall-clock seconds between screenshots (overrides `--every`; e.g. `--seconds 1` = one per second) |
 | `--count M` | 30 | Number of screenshots, then exit |
-| `--out DIR` | `.` | Output directory |
+| `--out DIR` | `.` | Output directory; missing directories and parents are created |
 | `--timeout S` | 900 | Give up after S seconds if the game isn't rendering enough (0 = no limit) |
 
 Only the game is required; everything else has a sane default.
+Directory-creation and PNG write failures include the failing path and operating-system error.
 
 **"Frames" = rendered frames** (composited images handed to the present layer), *not* guest flips —
 the guest flips far faster than llvmpipe renders, so counting flips would bunch every shot into the

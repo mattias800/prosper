@@ -29,7 +29,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <cerrno>
+#include <filesystem>
 #include <string>
+#include <system_error>
 #include <vector>
 #include <thread>
 #include <chrono>
@@ -52,7 +55,8 @@ void put_chunk(FILE* f, const char* type, const uint8_t* data, size_t len) {
 }
 
 // Write w*h RGBA8 as an 8-bit RGBA PNG (filter None per row, zlib-compressed IDAT).
-bool write_png(const char* path, const uint8_t* rgba, uint32_t w, uint32_t h) {
+bool write_png(const char* path, const uint8_t* rgba, uint32_t w, uint32_t h,
+               std::string& error) {
     std::vector<uint8_t> raw;
     raw.reserve((size_t)h * (1 + (size_t)w * 4));
     for (uint32_t y = 0; y < h; y++) {
@@ -61,10 +65,17 @@ bool write_png(const char* path, const uint8_t* rgba, uint32_t w, uint32_t h) {
     }
     uLongf clen = compressBound((uLong)raw.size());
     std::vector<uint8_t> comp(clen);
-    if (compress2(comp.data(), &clen, raw.data(), (uLong)raw.size(), Z_BEST_SPEED) != Z_OK) return false;
+    const int zrc = compress2(comp.data(), &clen, raw.data(), (uLong)raw.size(), Z_BEST_SPEED);
+    if (zrc != Z_OK) {
+        error = "zlib compress2 failed (" + std::to_string(zrc) + ")";
+        return false;
+    }
 
     FILE* f = fopen(path, "wb");
-    if (!f) return false;
+    if (!f) {
+        error = std::string("open failed: ") + strerror(errno);
+        return false;
+    }
     static const uint8_t sig[8] = { 137, 80, 78, 71, 13, 10, 26, 10 };
     fwrite(sig, 1, 8, f);
     uint8_t ihdr[13] = {
@@ -76,7 +87,15 @@ bool write_png(const char* path, const uint8_t* rgba, uint32_t w, uint32_t h) {
     put_chunk(f, "IHDR", ihdr, 13);
     put_chunk(f, "IDAT", comp.data(), clen);
     put_chunk(f, "IEND", nullptr, 0);
-    fclose(f);
+    if (ferror(f)) {
+        error = std::string("write failed: ") + strerror(errno);
+        fclose(f);
+        return false;
+    }
+    if (fclose(f) != 0) {
+        error = std::string("close failed: ") + strerror(errno);
+        return false;
+    }
     return true;
 }
 
@@ -120,6 +139,14 @@ int main(int argc, char** argv) {
     // Sane render-frontier defaults (don't override if the caller set them for another title).
     setenv("PROSPER_GUEST_FS",   "1", 0);
     setenv("PROSPER_GUEST_ARGS", "-force-gfx-direct", 0);
+
+    std::error_code out_ec;
+    std::filesystem::create_directories(out, out_ec);
+    if (out_ec) {
+        fprintf(stderr, "screenshot: cannot create output directory '%s': %s\n",
+                out.c_str(), out_ec.message().c_str());
+        return 1;
+    }
 
     // Register the shared live renderer (feeds the present layer; no BMP spam), then boot + run the
     // guest on its own thread while this thread samples the present layer.
@@ -170,12 +197,13 @@ int main(int argc, char** argv) {
                 if (gpu::present_readback(buf.data(), buf.size()) == buf.size()) {
                     char fn[1024];
                     snprintf(fn, sizeof fn, "%s/%s_%s_%0*d.png", out.c_str(), code.c_str(), ts, pad, saved);
-                    if (write_png(fn, buf.data(), w, h)) {
+                    std::string png_error;
+                    if (write_png(fn, buf.data(), w, h, png_error)) {
                         fprintf(stderr, "[shot] %d/%d  %s  (frame %llu, %.1fs)\n",
                                 saved + 1, count, fn, (unsigned long long)at, el);
                         saved++;
                     } else {
-                        fprintf(stderr, "[shot] PNG write failed: %s\n", fn);
+                        fprintf(stderr, "[shot] PNG write failed: %s: %s\n", fn, png_error.c_str());
                     }
                     if (time_mode) last_cap = now; else next = at + (uint64_t)every;
                 }
