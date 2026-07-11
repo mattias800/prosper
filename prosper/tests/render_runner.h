@@ -213,7 +213,14 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     for (const auto& d : draws) {
         if (!d.ps) continue;
         if (d.ps->depth_test_enable) { use_depth = true;
-            if (!got_depth_clear) { depth_clear = d.ps->depth_clear_value; got_depth_clear = true; } }
+            // An ALWAYS-compare draw passes regardless of the depth clear, so it must NOT dictate it.
+            // The Messenger menu primes depth with an ALWAYS+write draw (its compare-op default clear is
+            // 1.0), then draws the real UI with GEQUAL (default clear 0.0). Latching 1.0 off the ALWAYS
+            // draw made every GEQUAL fragment fail (z >= 1.0) -> the whole menu went black (#508). Latch
+            // the clear from the first draw whose compare actually depends on it (skip ALWAYS/NEVER).
+            if (!got_depth_clear && d.ps->depth_compare_op != VK_COMPARE_OP_ALWAYS
+                                 && d.ps->depth_compare_op != VK_COMPARE_OP_NEVER) {
+                depth_clear = d.ps->depth_clear_value; got_depth_clear = true; } }
         if (d.ps->stencil_enable) { use_stencil = true;
             if (!got_stencil_clear) { stencil_clear = d.ps->stencil_clear_value; got_stencil_clear = true; } }
     }
