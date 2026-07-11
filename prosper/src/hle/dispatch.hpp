@@ -175,4 +175,12 @@ void reset_call_log();
 // register-context sub-object fields. One watch at a time; extra calls are ignored.
 extern void (*g_hwwatch_hook)(uint64_t addr);
 
+// #312 diagnostic hook: arm a per-thread hardware write-watch on a MallocBinned3 per-thread
+// pool-descriptor cache base (base+0x20 = size-class idx=1 head — the corruptor's target) the
+// instant the guest is handed that base via pthread_get/setspecific. Set by the Linux exec harness
+// under PROSPER_MB3WATCH; null elsewhere. Arms on the CALLING (owning) guest thread so the watch is
+// on the right per-thread debug registers, before any corrupting store. HLE calls through it (when
+// non-null) from k_getspecific/k_setspecific.
+extern void (*g_mb3_arm_hook)(uint64_t base);
+
 } // namespace prosper
