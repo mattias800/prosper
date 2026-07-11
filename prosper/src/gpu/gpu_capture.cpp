@@ -19,7 +19,7 @@ namespace prosper::gpu {
 namespace {
 
 constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 2;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -98,9 +98,14 @@ void write_pipeline(Writer& w, const ResolvedPipelineState& p) {
     w.u32(p.alpha_blend_op); w.u32(p.color_write_mask); w.u8(p.has_viewport);
     w.f32(p.viewport_x); w.f32(p.viewport_y); w.f32(p.viewport_w); w.f32(p.viewport_h);
     w.f32(p.min_depth); w.f32(p.max_depth); w.u32(p.cull_mode); w.u32(p.front_face); w.u32(p.polygon_mode);
+    w.u8(p.has_depth_clear); w.u8(p.has_stencil_clear); w.u32(p.db_render_control);
+    w.u8(p.depth_clear_enable); w.u8(p.stencil_clear_enable);
+    w.u64(p.depth_read_base); w.u64(p.depth_write_base); w.u64(p.stencil_read_base); w.u64(p.stencil_write_base);
+    for (const auto& face : p.raw_stencil_op) for (auto v : face) w.u32(v);
+    w.u32(p.db_shader_control); w.u8(p.stencil_test_val_export_enable); w.u8(p.stencil_op_val_export_enable);
 }
 
-bool read_pipeline(Reader& r, ResolvedPipelineState& p) {
+bool read_pipeline(Reader& r, ResolvedPipelineState& p, uint32_t version) {
     uint8_t b;
     if (!r.u32(p.topology) || !r.u32(p.color0_format) || !r.u8(b)) return false; p.has_clear_color = b != 0;
     for (float& v : p.clear_color) if (!r.f32(v)) return false;
@@ -121,9 +126,20 @@ bool read_pipeline(Reader& r, ResolvedPipelineState& p) {
         !r.u32(p.src_alpha_blend_factor) || !r.u32(p.dst_alpha_blend_factor) || !r.u32(p.alpha_blend_op) ||
         !r.u32(p.color_write_mask) || !r.u8(b)) return false;
     p.has_viewport = b != 0;
-    return r.f32(p.viewport_x) && r.f32(p.viewport_y) && r.f32(p.viewport_w) && r.f32(p.viewport_h) &&
-           r.f32(p.min_depth) && r.f32(p.max_depth) && r.u32(p.cull_mode) && r.u32(p.front_face) &&
-           r.u32(p.polygon_mode);
+    if (!(r.f32(p.viewport_x) && r.f32(p.viewport_y) && r.f32(p.viewport_w) && r.f32(p.viewport_h) &&
+          r.f32(p.min_depth) && r.f32(p.max_depth) && r.u32(p.cull_mode) && r.u32(p.front_face) &&
+          r.u32(p.polygon_mode))) return false;
+    if (version < 2) return true;
+    if (!r.u8(b)) return false; p.has_depth_clear = b != 0;
+    if (!r.u8(b) || !r.u32(p.db_render_control)) return false; p.has_stencil_clear = b != 0;
+    if (!r.u8(b)) return false; p.depth_clear_enable = b != 0;
+    if (!r.u8(b)) return false; p.stencil_clear_enable = b != 0;
+    if (!r.u64(p.depth_read_base) || !r.u64(p.depth_write_base) || !r.u64(p.stencil_read_base) ||
+        !r.u64(p.stencil_write_base)) return false;
+    for (auto& face : p.raw_stencil_op) for (auto& v : face) if (!r.u32(v)) return false;
+    if (!r.u32(p.db_shader_control) || !r.u8(b)) return false; p.stencil_test_val_export_enable = b != 0;
+    if (!r.u8(b)) return false; p.stencil_op_val_export_enable = b != 0;
+    return true;
 }
 
 void write_resource(Writer& w, const GpuCapturedResource& c) {
@@ -310,7 +326,7 @@ bool read_gpu_capture(const std::string& path, GpuCaptureFile& c, std::string& e
         error = "cannot read capture file"; return false;
     }
     Reader r{bytes.data(), bytes.size(), &error}; char magic[8]; uint32_t version, endian;
-    if (!r.take(magic, 8) || std::memcmp(magic, kMagic, 8) || !r.u32(version) || version != kVersion ||
+    if (!r.take(magic, 8) || std::memcmp(magic, kMagic, 8) || !r.u32(version) || version < 1 || version > kVersion ||
         !r.u32(endian) || endian != kEndian) { error = "unsupported capture header"; return false; }
     auto& m = c.metadata;
     if (!r.u32(m.width) || !r.u32(m.height) || !r.u64(m.submit_index) || !r.string(m.revision) ||
@@ -329,7 +345,7 @@ bool read_gpu_capture(const std::string& path, GpuCaptureFile& c, std::string& e
     uint32_t nd; if (!r.u32(nd) || !nd || nd > kMaxDraws) { error = "invalid draw count"; return false; }
     c.draws.resize(nd);
     for (auto& d : c.draws) {
-        if (!r.words(d.vs) || !r.words(d.fs) || !read_pipeline(r, d.ps) || !read_table(r, d.vrt) ||
+        if (!r.words(d.vs) || !r.words(d.fs) || !read_pipeline(r, d.ps, version) || !read_table(r, d.vrt) ||
             !read_table(r, d.prt) || !r.u32(d.vertex_count) || !r.words(d.indices) || !r.u64(d.color0_base)) return false;
     }
     if (r.left) { error = "capture has trailing data"; return false; }

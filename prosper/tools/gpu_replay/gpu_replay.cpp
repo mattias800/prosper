@@ -20,7 +20,7 @@ bool set_environment(const std::string& name, const std::string& value) {
 }
 
 void usage(const char* argv0) {
-    std::fprintf(stderr, "usage: %s [--inspect|--inspect-only] [--draw N] [--allow-mismatch] "
+    std::fprintf(stderr, "usage: %s [--inspect|--inspect-only] [--draw N[:M]] [--allow-mismatch] "
                          "<capture.prgcap> [output.bmp]\n", argv0);
 }
 
@@ -73,6 +73,18 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
                     d.ps.stencil_ref[0], d.ps.stencil_ref[1], d.ps.stencil_op_val[0], d.ps.stencil_op_val[1],
                     d.ps.stencil_compare_mask[0], d.ps.stencil_compare_mask[1],
                     d.ps.stencil_write_mask[0], d.ps.stencil_write_mask[1]);
+        std::printf("  ds rc=%08x clear=%d/%d programmed=%d/%d base z=%016llx/%016llx s=%016llx/%016llx "
+                    "rawops=%u,%u,%u/%u,%u,%u shaderctl=%08x stexport=%d/%d\n",
+                    d.ps.db_render_control, d.ps.depth_clear_enable, d.ps.stencil_clear_enable,
+                    d.ps.has_depth_clear, d.ps.has_stencil_clear,
+                    static_cast<unsigned long long>(d.ps.depth_read_base),
+                    static_cast<unsigned long long>(d.ps.depth_write_base),
+                    static_cast<unsigned long long>(d.ps.stencil_read_base),
+                    static_cast<unsigned long long>(d.ps.stencil_write_base),
+                    d.ps.raw_stencil_op[0][0], d.ps.raw_stencil_op[0][1], d.ps.raw_stencil_op[0][2],
+                    d.ps.raw_stencil_op[1][0], d.ps.raw_stencil_op[1][1], d.ps.raw_stencil_op[1][2],
+                    d.ps.db_shader_control, d.ps.stencil_test_val_export_enable,
+                    d.ps.stencil_op_val_export_enable);
         inspect_table("VS", d.vrt.get()); inspect_table("PS", d.prt.get());
     }
 }
@@ -80,13 +92,17 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
 } // namespace
 
 int main(int argc, char** argv) {
-    bool inspect = false, inspect_only = false, allow_mismatch = false; int draw_index = -1;
+    bool inspect = false, inspect_only = false, allow_mismatch = false; int draw_first = -1, draw_last = -1;
     std::vector<const char*> positional;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--inspect") inspect = true;
         else if (std::string(argv[i]) == "--inspect-only") inspect = inspect_only = true;
         else if (std::string(argv[i]) == "--allow-mismatch") allow_mismatch = true;
-        else if (std::string(argv[i]) == "--draw" && i + 1 < argc) draw_index = std::atoi(argv[++i]);
+        else if (std::string(argv[i]) == "--draw" && i + 1 < argc) {
+            std::string range = argv[++i]; size_t colon = range.find(':');
+            draw_first = std::atoi(range.c_str());
+            draw_last = colon == std::string::npos ? draw_first : std::atoi(range.c_str() + colon + 1);
+        }
         else positional.push_back(argv[i]);
     }
     if (positional.empty() || positional.size() > 2) { usage(argv[0]); return 2; }
@@ -105,13 +121,14 @@ int main(int argc, char** argv) {
     if (!prosper::gpu::materialize_gpu_replay(capture, replay, error)) {
         std::fprintf(stderr, "gpu_replay: cannot materialize: %s\n", error.c_str()); return 2;
     }
-    if (draw_index >= 0) {
-        if (static_cast<size_t>(draw_index) >= replay.items.size()) {
-            std::fprintf(stderr, "gpu_replay: draw index %d is out of range\n", draw_index); return 2;
+    if (draw_first >= 0) {
+        if (draw_last < draw_first || static_cast<size_t>(draw_last) >= replay.items.size()) {
+            std::fprintf(stderr, "gpu_replay: draw range %d:%d is out of range\n", draw_first, draw_last); return 2;
         }
-        prosper::gpu::DrawItem selected = std::move(replay.items[draw_index]); replay.items.clear();
-        replay.items.push_back(std::move(selected)); allow_mismatch = true;
-        std::fprintf(stderr, "[gpureplay] selected original draw %d\n", draw_index);
+        std::vector<prosper::gpu::DrawItem> selected;
+        for (int i = draw_first; i <= draw_last; ++i) selected.push_back(std::move(replay.items[i]));
+        replay.items = std::move(selected); allow_mismatch = true;
+        std::fprintf(stderr, "[gpureplay] selected original draws %d:%d\n", draw_first, draw_last);
     }
     const auto& m = replay.metadata;
     std::fprintf(stderr, "[gpureplay] rev=%s title=%s submit=%llu %ux%u draws=%zu blobs=%zu\n",

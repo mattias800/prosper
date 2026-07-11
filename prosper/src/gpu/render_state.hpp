@@ -46,8 +46,19 @@ struct RenderState {
     // has_depth_clear == the game PROGRAMMED DB_DEPTH_CLEAR (register present); otherwise resolve picks
     // a compare-op-appropriate default (1.0 for LESS, 0.0 for GREATER) instead of a fixed 0.5 (#371).
     bool     has_depth_clear     = false;
+    bool     has_stencil_clear   = false;
     float    depth_clear_value   = 1.0f;
     uint32_t stencil_clear_value = 0;
+
+    // Guest depth/stencil attachment identity and explicit clear intent. These are distinct from
+    // enabling the tests: DB_RENDER_CONTROL requests a hardware clear, while the *_BASE registers
+    // identify contents that must survive color-target changes and later submits (#518).
+    uint32_t db_render_control = 0;
+    bool depth_clear_enable = false, stencil_clear_enable = false;
+    uint64_t depth_read_base = 0, depth_write_base = 0;
+    uint64_t stencil_read_base = 0, stencil_write_base = 0;
+    uint32_t db_shader_control = 0;
+    bool stencil_test_val_export_enable = false, stencil_op_val_export_enable = false;
 
     // Color blend state for MRT 0, decoded from CB_BLEND0_CONTROL (RDNA2 factor/op enum values;
     // map to Vulkan with vk_blend_factor / vk_blend_op).
@@ -110,6 +121,13 @@ struct ResolvedPipelineState {
     // standard depth test (#371). stencil_clear_value from DB_STENCIL_CLEAR.
     float    depth_clear_value   = 1.0f;
     uint32_t stencil_clear_value = 0;
+    bool     has_depth_clear = false, has_stencil_clear = false;
+    uint32_t db_render_control = 0;
+    bool     depth_clear_enable = false, stencil_clear_enable = false;
+    uint64_t depth_read_base = 0, depth_write_base = 0;
+    uint64_t stencil_read_base = 0, stencil_write_base = 0;
+    uint32_t db_shader_control = 0;
+    bool stencil_test_val_export_enable = false, stencil_op_val_export_enable = false;
 
     // Stencil test state, resolved from DB_DEPTH_CONTROL (enable + STENCILFUNC) + DB_STENCIL_CONTROL
     // (ops) + DB_STENCILREFMASK[_BF] (ref / compare-mask / write-mask). Index [0]=front, [1]=back.
@@ -124,6 +142,7 @@ struct ResolvedPipelineState {
     uint32_t stencil_op_val[2]       = {0, 0};        // STENCILOPVAL — the value written by a REPLACE op
     uint32_t stencil_compare_mask[2] = {0xFF, 0xFF};
     uint32_t stencil_write_mask[2]   = {0xFF, 0xFF};
+    uint32_t raw_stencil_op[2][3]    = {{0, 0, 0}, {0, 0, 0}}; // fail, z-pass, z-fail
 
     bool     blend_enable        = false;
     uint32_t src_color_blend_factor = 0;   // == VkBlendFactor
@@ -155,6 +174,18 @@ struct ResolvedPipelineState {
                                  // negative-height flipped viewport that already renders correct-facing geometry)
     uint32_t polygon_mode = 0;   // VK_POLYGON_MODE_FILL
 };
+
+// A color-disabled draw must still execute when it can change the depth/stencil attachment consumed
+// by later draws. KEEP-only stencil tests without a depth write have no attachment side effect.
+inline bool has_depth_stencil_side_effect(const ResolvedPipelineState& ps) {
+    if (ps.depth_write_enable || ps.depth_clear_enable || ps.stencil_clear_enable) return true;
+    if (!ps.stencil_enable) return false;
+    for (int fb = 0; fb < 2; ++fb)
+        if (ps.stencil_write_mask[fb] != 0 &&
+            (ps.stencil_fail_op[fb] != 0 || ps.stencil_pass_op[fb] != 0 || ps.stencil_depth_fail_op[fb] != 0))
+            return true;
+    return false;
+}
 
 // Translate a RenderState's RDNA2 register semantics into Vulkan-ready pipeline state (pure).
 ResolvedPipelineState resolve_pipeline_state(const RenderState& rs);

@@ -32,6 +32,10 @@ int main() {
     draw.vertex_count = 6; draw.indices = {0, 1, 2, 2, 3, 0}; draw.color0_base = 0x2000;
     draw.ps.topology = 3; draw.ps.color0_format = 37; draw.ps.blend_enable = true;
     draw.ps.has_viewport = true; draw.ps.viewport_w = 1920; draw.ps.viewport_h = -1080;
+    draw.ps.db_render_control = 2; draw.ps.stencil_clear_enable = true;
+    draw.ps.has_stencil_clear = true; draw.ps.stencil_clear_value = 3;
+    draw.ps.stencil_read_base = 0x12345000; draw.ps.raw_stencil_op[0][1] = 4;
+    draw.ps.db_shader_control = 2; draw.ps.stencil_test_val_export_enable = true;
 
     GpuCaptureMetadata meta; meta.width = 480; meta.height = 270; meta.submit_index = 42;
     meta.revision = "deadbeef"; meta.title_id = "PPSA24651"; meta.input_route = "@reach-level.pad";
@@ -56,6 +60,12 @@ int main() {
           loaded.draws.size() == 1 && loaded.draws[0].indices.size() == 6, "metadata and draw data round-trip");
     CHECK(loaded.draws[0].ps.viewport_h == -1080 && loaded.draws[0].ps.blend_enable,
           "fixed-function pipeline state round-trips explicitly");
+    CHECK(loaded.draws[0].ps.db_render_control == 2 && loaded.draws[0].ps.stencil_clear_enable &&
+          loaded.draws[0].ps.has_stencil_clear && loaded.draws[0].ps.stencil_clear_value == 3 &&
+          loaded.draws[0].ps.stencil_read_base == 0x12345000 &&
+          loaded.draws[0].ps.raw_stencil_op[0][1] == 4 && loaded.draws[0].ps.db_shader_control == 2 &&
+          loaded.draws[0].ps.stencil_test_val_export_enable,
+          "clear intent, DS identity, and raw stencil-op provenance round-trip");
 
     GpuReplayFrame replay;
     CHECK(materialize_gpu_replay(loaded, replay, error), "capture materializes owned replay draw items");
