@@ -39,6 +39,11 @@ sampling. Aim the live run near the target first; the capture itself writes once
 Set `PROSPER_CAPTURE_REVISION` explicitly in WSL worktrees: WSL Git cannot resolve their Windows-path
 gitdir links, so the build-time fallback revision is `unknown` there.
 
+Use `gpu_replay --inspect-only` to print fixed-function state, resource hashes, explicit clear intent,
+guest depth/stencil surface identities, and raw stencil-op provenance. `--draw N:M` replays an
+inclusive contiguous draw range, which is useful for rendering one pass without its downstream
+composite/scanout draws; a single `--draw N` remains supported.
+
 For a differential replay, `PROSPER_STENCIL_CLEAR=<0..255>` overrides the initial stencil attachment
 value and `PROSPER_STENCIL_REPLACE=<0..255>` overrides the replacement reference of an
 ALWAYS+REPLACE stencil-prime draw. These are diagnostic controls only; they do not change guest-state

@@ -50,6 +50,13 @@ int main() {
         { P::CB_COLOR0_INFO,     (0x0Au << 2) | (6u << 8) | (1u << 11) },
         // DB_DEPTH_CONTROL: Z_ENABLE(bit1)|Z_WRITE_ENABLE(bit2)|ZFUNC=4(bits[6:4]) = 0x46
         { P::DB_DEPTH_CONTROL,   0x00000046u },
+        { P::DB_RENDER_CONTROL,  0x00000002u }, // explicit stencil clear
+        { P::DB_SHADER_CONTROL,  0x00000006u }, // shader exports stencil test/op values
+        { P::DB_STENCIL_CLEAR,   0x00000003u },
+        { P::DB_Z_READ_BASE,     0x00200000u }, { P::DB_Z_READ_BASE_HI, 0x00000021u },
+        { P::DB_Z_WRITE_BASE,    0x00210000u }, { P::DB_Z_WRITE_BASE_HI, 0x00000021u },
+        { P::DB_STENCIL_READ_BASE,  0x00220000u }, { P::DB_STENCIL_READ_BASE_HI,  0x00000021u },
+        { P::DB_STENCIL_WRITE_BASE, 0x00230000u }, { P::DB_STENCIL_WRITE_BASE_HI, 0x00000021u },
         { P::CB_COLOR_CONTROL,   0x00CC0010u },
         // CB_BLEND0_CONTROL: ENABLE(bit30) | SRCBLEND=4/SrcAlpha | DESTBLEND=5/OneMinusSrcAlpha | COMB_FCN=0/Add
         { P::CB_BLEND0_CONTROL,  (1u << 30) | (4u << 0) | (5u << 8) | (0u << 5) },
@@ -121,6 +128,17 @@ int main() {
     CHECK(!rs.stencil_enable, "stencil_enable = false (bit 0)");
     CHECK(rs.zfunc == 4u, "zfunc = 4 (bits [6:4])");
     CHECK(vk_compare_op(rs.zfunc) == 4u, "zfunc 4 -> VkCompareOp GREATER (1:1)");
+    CHECK(!rs.depth_clear_enable && rs.stencil_clear_enable && rs.db_render_control == 2u,
+          "DB_RENDER_CONTROL clear intent is extracted independently");
+    CHECK(rs.has_stencil_clear && rs.stencil_clear_value == 3u,
+          "programmed DB_STENCIL_CLEAR is distinguished from absent/default zero");
+    CHECK(rs.stencil_test_val_export_enable && rs.stencil_op_val_export_enable &&
+          rs.db_shader_control == 6u, "DB_SHADER_CONTROL stencil-export intent is extracted");
+    CHECK(rs.depth_read_base == rdna2_addr(0x00200000u, 0x21u) &&
+          rs.depth_write_base == rdna2_addr(0x00210000u, 0x21u) &&
+          rs.stencil_read_base == rdna2_addr(0x00220000u, 0x21u) &&
+          rs.stencil_write_base == rdna2_addr(0x00230000u, 0x21u),
+          "guest depth/stencil read/write surface identities are extracted");
 
     // #371: depth clear value. The sample stream programs no DB_DEPTH_CLEAR, so resolve defaults it by
     // the compare op — 0.0 for GREATER (this stream), 1.0 for LESS — never a fixed 0.5. A programmed
@@ -130,6 +148,11 @@ int main() {
         ResolvedPipelineState pd = resolve_pipeline_state(rs);
         CHECK(pd.depth_compare_op == 4u && pd.depth_clear_value == 0.0f,
               "no DB_DEPTH_CLEAR + GREATER -> depth clears to 0.0 (reversed-Z near), not 0.5");
+        CHECK(pd.stencil_clear_enable && pd.stencil_clear_value == 3u &&
+              pd.stencil_write_base == rs.stencil_write_base,
+              "resolved state preserves stencil clear intent/value/surface identity");
+        CHECK(pd.stencil_test_val_export_enable && pd.stencil_op_val_export_enable,
+              "resolved state preserves fragment shader stencil-export intent");
         RenderState less_rs = rs; less_rs.zfunc = 1u;   // LESS
         CHECK(resolve_pipeline_state(less_rs).depth_clear_value == 1.0f,
               "no DB_DEPTH_CLEAR + LESS -> depth clears to 1.0 (far), not 0.5");
@@ -179,6 +202,20 @@ int main() {
         s.db_stencil_control = (2u << 4);
         CHECK(resolve_pipeline_state(s).stencil_op_val[1] == 0xFFu,
               "#466: mirrored back face inherits the ONES 0xFF write value");
+    }
+
+    // #520: color-disabled draws are retained only when they change depth/stencil state.
+    {
+        ResolvedPipelineState p{}; p.color_write_mask = 0;
+        CHECK(!has_depth_stencil_side_effect(p), "color-disabled state with no DS writes is a true no-op");
+        p.depth_write_enable = true;
+        CHECK(has_depth_stencil_side_effect(p), "color-disabled depth write must execute");
+        p.depth_write_enable = false; p.stencil_enable = true; p.stencil_pass_op[0] = 2;
+        CHECK(has_depth_stencil_side_effect(p), "color-disabled stencil REPLACE must execute");
+        p.stencil_pass_op[0] = 0;
+        CHECK(!has_depth_stencil_side_effect(p), "KEEP-only stencil test has no attachment side effect");
+        p.stencil_clear_enable = true;
+        CHECK(has_depth_stencil_side_effect(p), "explicit stencil clear must execute without color writes");
     }
 
     // Decoded blend state + RDNA2->Vulkan factor/op mapping.

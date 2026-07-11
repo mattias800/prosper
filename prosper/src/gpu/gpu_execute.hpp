@@ -155,7 +155,7 @@ inline bool index_buffer_is_unannounced_32bit(const uint16_t* p16, const uint32_
 // VS+PS, resolve fixed-function state, and — for an indexed draw — fetch the guest index buffer.
 // `draw` is the PM4 draw record (index count + indexed/index_addr); null means "no record" (hand-built
 // states) and renders vcount_hint vertices non-indexed. Returns false (and leaves `out` untouched) if
-// the draw is a no-op (no PGM bound, recompile failed, or color_write_mask==0). Shared by the default
+// the draw is a no-op (no PGM bound, recompile failed, or no color/depth/stencil effect). Shared by the default
 // (folded-state, one item) and PROSPER_PERDRAW (per-draw) paths so their per-draw handling is identical.
 inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcount_hint,
                               uint32_t max_shader_dwords, bool log, DrawItem& out) {
@@ -242,17 +242,20 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         return false;
     }
     ResolvedPipelineState ps = resolve_pipeline_state(rs);
-    // Skip a draw with no color writes: it contributes no pixels, so recording it (and, in the single-item
-    // case, presenting its bare clear) would just overwrite the last real frame (an art/clear flicker).
-    if (ps.color_write_mask == 0 && !getenv("PROSPER_FORCE_COLORWRITE")) {
-        if (log) fprintf(stderr, "[exec] skip draw: color_write_mask==0 (no-op) cb_target_mask=0x%x cb_color_control=0x%x color0_fmt=%u\n",
+    // Color-disabled draws are not necessarily no-ops. Depth prepasses and stencil mask writers
+    // deliberately set CB_TARGET_MASK=0, then later color draws consume their DS result. Dropping
+    // those writers made The Messenger clear stencil to 0 and then test for bits 1/2 that could never
+    // be produced (#520). Skip only when the draw has no observable color OR depth/stencil effect.
+    const bool ds_effect = has_depth_stencil_side_effect(ps);
+    if (ps.color_write_mask == 0 && !ds_effect && !getenv("PROSPER_FORCE_COLORWRITE")) {
+        if (log) fprintf(stderr, "[exec] skip draw: no color/depth/stencil effect cb_target_mask=0x%x cb_color_control=0x%x color0_fmt=%u\n",
                          rs.cb_target_mask, rs.cb_color_control, ps.color0_format);
         return false;
     }
     // PROSPER_FORCE_COLORWRITE: diagnostic — render color_write_mask==0 draws anyway (force mask to RGBA).
     // The cutscene submits ~66 draws/frame that resolve to mask==0; if that is a mis-decode (not a genuine
     // depth-only pass), rendering them reveals whether they are the cutscene content.
-    if (ps.color_write_mask == 0) ps.color_write_mask = 0xf;
+    if (ps.color_write_mask == 0 && getenv("PROSPER_FORCE_COLORWRITE")) ps.color_write_mask = 0xf;
     // PROSPER_DRAWDIAG: per-RENDERED-draw geometry/position/texture — to LOCATE specific draws (e.g. the
     // cutscene caption text: small indexed quads, bottom viewport, blended, sampling a font atlas).
     if (getenv("PROSPER_DRAWDIAG")) {
