@@ -8,6 +8,9 @@
 #include "../src/hle/nid.hpp"
 #include <cstdio>
 #include <cstdint>
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
 
 using namespace prosper;
 
@@ -33,9 +36,10 @@ int main() {
 
     auto avail   = Hle::lookup(nid_hash("sceKernelAvailableDirectMemorySize"));
     auto alloc   = Hle::lookup(nid_hash("sceKernelAllocateDirectMemory"));
+    auto map     = Hle::lookup(nid_hash("sceKernelMapDirectMemory"));
     auto release = Hle::lookup(nid_hash("sceKernelReleaseDirectMemory"));
-    CHECK(avail && alloc && release, "dmem fns registered");
-    if (!(avail && alloc && release)) { printf("== FAIL ==\n"); return 1; }
+    CHECK(avail && alloc && map && release, "dmem fns registered");
+    if (!(avail && alloc && map && release)) { printf("== FAIL ==\n"); return 1; }
 
     // Fresh pool: the largest free block is the whole pool, and BOTH out-params are written.
     uint64_t phys = 0xdead, size = 0xdead;
@@ -98,6 +102,19 @@ int main() {
         uint64_t rr = alloc(wlo, wlo + 0x1000 /*window < 0x100000 request*/, 0x100000, 0x4000, 0,
                             (uint64_t)(uintptr_t)&p);
         CHECK((uint32_t)rr == 0x8002000Cu, "allocate with too-small window -> ENOMEM (no out-of-window fallback)");
+    }
+
+    // A zero-hint direct mapping must honor its explicit VA alignment. Linux mmap only promises
+    // 4 KiB, which made HashLink reject a mapping requested at 64 KiB alignment during startup.
+    {
+        uint64_t p = 0, va = 0;
+        uint64_t rr = alloc(0, kEnd, 0x10000, 0x10000, 0, (uint64_t)(uintptr_t)&p);
+        CHECK(rr == 0, "allocate 64KiB-aligned direct page succeeds");
+        rr = map((uint64_t)(uintptr_t)&va, 0x10000, 0x2 /*RW*/, 0, p, 0x10000);
+        CHECK(rr == 0 && va && (va & 0xffff) == 0,
+              "map direct memory honors requested 64KiB VA alignment");
+        if (va) munmap((void*)(uintptr_t)va, 0x10000);
+        if (p) release(p, 0x10000, 0, 0, 0, 0);
     }
 
     if (fails) { printf("== FAIL: %d check(s) ==\n", fails); return 1; }

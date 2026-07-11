@@ -49,6 +49,24 @@ int main() {
         if (fn) CHECK(fn(0, 0, 0, 0, 0, 0) == 0, nid);
     }
 
+    // Sanitizer malloc replacement query returns a real empty table, not nullptr. Runtimes inspect
+    // callback slots even when no sanitizer is active (Dead Cells reads slot +0x18 during startup).
+    {
+        HleFn fn = Hle::lookup("py6L8jiVAN8");
+        CHECK(fn != nullptr, "sceKernelGetSanitizerMallocReplaceExternal registered");
+        if (fn) {
+            uint64_t addr = fn(0, 0, 0, 0, 0, 0);
+            CHECK(addr != 0, "sanitizer malloc replacement table is non-null");
+            if (addr) {
+                const uint64_t* table = (const uint64_t*)(uintptr_t)addr;
+                CHECK(table[0] == 0x70, "sanitizer malloc replacement table reports size 0x70");
+                bool empty = true;
+                for (int i = 1; i < 14; ++i) empty &= table[i] == 0;
+                CHECK(empty, "sanitizer malloc replacement callbacks default to null");
+            }
+        }
+    }
+
     // Message-dialog lifecycle (#144): GetStatus must report NONE before an Open (the old handler
     // returned FINISHED unconditionally, so a guest guarding on GetStatus saw "done" at the wrong
     // stage). Transitions: Initialize -> INITIALIZED(1); Open -> FINISHED(3, auto-dismiss); Close ->
