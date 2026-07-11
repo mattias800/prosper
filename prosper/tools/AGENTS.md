@@ -14,8 +14,32 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   (find file offsets for offline disassembly).
 - **`shader_histo/`** — histogram RDNA2 opcodes across a title's shaders.
 - **`imgdump/`** — decode/dump a guest texture to an image for inspection.
+- **`gpu_replay/`** — replay a local `PROSPER_GPU_CAPTURE` realized-submit capsule through the same
+  Vulkan backend without booting the guest. Capsules include game shaders/resources, use `.prgcap`,
+  are gitignored, and must never be committed. The tool exits non-zero on output-hash mismatch.
 - **`spv_validate/`** — `spirv-val` wrapper for recompiled SPIR-V.
 - **`niddiag/`, `fetch_niddb.sh`** — NID (Sony symbol hash) resolution helpers.
 
 Verification here is agentic-first (see `docs/VERIFICATION.md`): prefer a
 programmatic check (ctest exit code, `spirv-val`, a snapshot hash) over eyeballing.
+
+Capture one draw-carrying renderer invocation with:
+
+```bash
+PROSPER_GPU_CAPTURE=/tmp/messenger-level.prgcap PROSPER_GPU_CAPTURE_AT=0 \
+  PROSPER_GPU_CAPTURE_MIN_DRAWS=30 \
+  PROSPER_CAPTURE_REVISION=$(git rev-parse HEAD) \
+  PROSPER_CAPTURE_TITLE=PPSA24651 <normal boot_trace command>
+./build-linux/gpu_replay /tmp/messenger-level.prgcap /tmp/replayed.bmp
+```
+
+`PROSPER_GPU_CAPTURE_MIN_DRAWS`/`MAX_DRAWS` filter by realized item count; `PROSPER_GPU_CAPTURE_AT`
+counts matching invocations that reach the registered renderer, after the normal `RENDER_EVERY`
+sampling. Aim the live run near the target first; the capture itself writes once.
+Set `PROSPER_CAPTURE_REVISION` explicitly in WSL worktrees: WSL Git cannot resolve their Windows-path
+gitdir links, so the build-time fallback revision is `unknown` there.
+
+For a differential replay, `PROSPER_STENCIL_CLEAR=<0..255>` overrides the initial stencil attachment
+value and `PROSPER_STENCIL_REPLACE=<0..255>` overrides the replacement reference of an
+ALWAYS+REPLACE stencil-prime draw. These are diagnostic controls only; they do not change guest-state
+extraction or the default render path.

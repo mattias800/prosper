@@ -5,6 +5,7 @@
 // pure. No Vulkan here — the backend is a std::function injected by whoever owns a device (the runtime
 // binary at startup, or a test via render_runner.h), so prosper_core links this without Vulkan.
 #include "gpu_execute.hpp"
+#include "gpu_capture.hpp"
 #include "videoout_present.hpp"   // present_write_frame
 #include "agc_shader_layout.hpp"  // AgcShaderHeader + build_shader_resources
 #include "pm4_registers.hpp"      // SPI_SHADER_USER_DATA_* offsets
@@ -788,6 +789,10 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
 
 void set_submit_renderer(LiveRenderFn fn) { g_live = std::move(fn); }
 bool have_submit_renderer()               { return static_cast<bool>(g_live); }
+std::vector<uint8_t> render_submit_items(const std::vector<DrawItem>& items,
+                                         uint32_t width, uint32_t height) {
+    return g_live ? g_live(items, width, height) : std::vector<uint8_t>{};
+}
 
 bool execute_and_present(const GpuState& st, uint32_t width, uint32_t height) {
     if (!g_live || st.draws.empty() || !width || !height) return false;
@@ -800,7 +805,16 @@ bool execute_and_present(const GpuState& st, uint32_t width, uint32_t height) {
     float sx = fw ? (float)width  / (float)fw : 1.0f;
     float sy = fh ? (float)height / (float)fh : 1.0f;
     std::vector<uint8_t> px = execute_gpustate(st,
-        [&](const std::vector<DrawItem>& items) { return g_live(items, width, height); },
+        [&](const std::vector<DrawItem>& items) {
+            auto pending = begin_requested_gpu_capture(items, width, height);
+            std::vector<uint8_t> rendered = g_live(items, width, height);
+            if (pending) {
+                std::string error;
+                if (!finish_requested_gpu_capture(std::move(pending), rendered, error))
+                    std::fprintf(stderr, "[gpucap] write failed: %s\n", error.c_str());
+            }
+            return rendered;
+        },
         0x10000, sx, sy);
     if (px.size() != static_cast<size_t>(width) * height * 4) return false;   // recompile/render failed
     present_write_frame(px.data(), width, height);

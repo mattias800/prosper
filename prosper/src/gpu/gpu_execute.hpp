@@ -533,6 +533,11 @@ using LiveRenderFn = std::function<std::vector<uint8_t>(const std::vector<DrawIt
 void set_submit_renderer(LiveRenderFn fn);
 bool have_submit_renderer();
 
+// Invoke the registered live backend directly with already-realized draws. Used by the local capture
+// replayer; normal guest execution enters through execute_and_present(). Returns {} when unregistered.
+std::vector<uint8_t> render_submit_items(const std::vector<DrawItem>& items,
+                                         uint32_t width, uint32_t height);
+
 // Render a folded GpuState at (width,height) via the registered live renderer and hand the frame to the
 // present path (present_write_frame). Returns true iff a frame was produced and presented. A no-op
 // returning false when there is no renderer registered or the state has no draws — so it is inert on the
