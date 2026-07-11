@@ -498,6 +498,230 @@ HLE(ajm_batch_start) {
 HLE(ajm_batch_wait)       { return a0 ? 0 : AJM_ERR_INVALID_CONTEXT; }   // batch completed
 HLE(ajm_batch_errordump)  { return 0; }
 
+// --- libSceNgs2 silent lifecycle ---------------------------------------------------------------
+// Dead Cells is the first title to exercise NGS2. PROSPER_NGS2_TRACE preserves and logs all six
+// guest arguments for this PS5 surface; normal execution uses the same handlers without logging.
+namespace {
+
+bool ngs2_trace_enabled() {
+    const char* e = getenv("PROSPER_NGS2_TRACE");
+    return e && *e && *e != '0';
+}
+
+void ngs2_trace_call(const char* name, std::atomic<uint64_t>& calls,
+                     uint64_t a0, uint64_t a1, uint64_t a2,
+                     uint64_t a3, uint64_t a4, uint64_t a5) {
+    const uint64_t n = calls.fetch_add(1) + 1;
+    if (ngs2_trace_enabled() && (n <= 8 || (n & (n - 1)) == 0)) {
+        fprintf(stderr, "[ngs2] %s #%llu (0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx)\n",
+                name, (unsigned long long)n,
+                (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
+                (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)a5);
+    }
+}
+
+constexpr uint64_t kNgs2SystemTag = 0x4e47533253000000ull; // "NGS2S"
+constexpr uint64_t kNgs2RackTag   = 0x4e47533252000000ull; // "NGS2R"
+constexpr uint64_t kNgs2VoiceTag  = 0x4e47533256000000ull; // "NGS2V"
+constexpr uint64_t kNgs2TagMask   = 0xffffffffffffff00ull;
+constexpr uint64_t kNgs2VoiceMask = 0xffffffffff000000ull;
+constexpr uint64_t kNgs2ErrInvalidOut    = (uint64_t)(int64_t)(int32_t)0x804a0053;
+constexpr uint64_t kNgs2ErrInvalidSystem = (uint64_t)(int64_t)(int32_t)0x804a0230;
+constexpr uint64_t kNgs2ErrInvalidRack   = (uint64_t)(int64_t)(int32_t)0x804a0261;
+constexpr uint64_t kNgs2ErrInvalidVoice  = (uint64_t)(int64_t)(int32_t)0x804a0302;
+
+struct Ngs2RackState {
+    bool used = false;
+    uint64_t system = 0;
+    uint32_t rack_id = 0;
+    uint32_t max_voices = 64;
+};
+
+std::mutex g_ngs2_mx;
+bool g_ngs2_systems[4]{};
+Ngs2RackState g_ngs2_racks[32];
+std::mutex g_ngs2_zero_mx;
+std::vector<uint8_t> g_ngs2_zeros;
+
+bool ngs2_read_u32(uint64_t src, uint32_t& value) {
+#ifndef _WIN32
+    struct iovec l { &value, sizeof value }, r { (void*)(uintptr_t)src, sizeof value };
+    return src && process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t)sizeof value;
+#else
+    if (!src) return false;
+    value = *(const uint32_t*)(uintptr_t)src;
+    return true;
+#endif
+}
+
+bool ngs2_read_bytes(uint64_t src, void* dst, size_t size) {
+#ifndef _WIN32
+    struct iovec l { dst, size }, r { (void*)(uintptr_t)src, size };
+    return src && process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t)size;
+#else
+    if (!src) return false;
+    memcpy(dst, (const void*)(uintptr_t)src, size);
+    return true;
+#endif
+}
+
+bool ngs2_zero_bytes(uint64_t dst, size_t size) {
+#ifndef _WIN32
+    // Do not use thread_local here: guest execution swaps %fs, and adding host TLS to prosper_core
+    // perturbs Messenger before its first syscall. Process-global zero storage is sufficient because
+    // NGS2 rendering is serialized by its audio thread; the lock also makes that contract explicit.
+    std::lock_guard<std::mutex> lock(g_ngs2_zero_mx);
+    if (g_ngs2_zeros.size() < size) g_ngs2_zeros.resize(size, 0);
+    struct iovec l { g_ngs2_zeros.data(), size }, r { (void*)(uintptr_t)dst, size };
+    return dst && process_vm_writev(getpid(), &l, 1, &r, 1, 0) == (ssize_t)size;
+#else
+    if (!dst) return false;
+    memset((void*)(uintptr_t)dst, 0, size);
+    return true;
+#endif
+}
+
+uint32_t ngs2_max_voices(uint64_t option) {
+    uint32_t voices = 0;
+    // SceNgs2RackOption: size[8], name[16], flags, maxGrainSamples, maxVoices.
+    if (option) ngs2_read_u32(option + 0x20, voices);
+    return voices ? voices : 64;
+}
+
+bool ngs2_valid_system(uint64_t handle) {
+    const uint64_t slot = handle & 0xff;
+    return (handle & kNgs2TagMask) == kNgs2SystemTag && slot >= 1 && slot <= 4 &&
+           g_ngs2_systems[slot - 1];
+}
+
+Ngs2RackState* ngs2_rack(uint64_t handle) {
+    const uint64_t slot = handle & 0xff;
+    if ((handle & kNgs2TagMask) != kNgs2RackTag || slot < 1 || slot > 32) return nullptr;
+    Ngs2RackState& rack = g_ngs2_racks[slot - 1];
+    return rack.used ? &rack : nullptr;
+}
+
+} // namespace
+
+#define NGS2_LOG(label) do { static std::atomic<uint64_t> calls{0}; \
+    ngs2_trace_call(label, calls, a0, a1, a2, a3, a4, a5); } while (0)
+
+// NGS2 is implemented as a silent backend: the guest still receives real buffer requirements and
+// opaque lifecycle handles, while SystemRender produces silence. Layouts/prototypes agree between
+// the 3.20 export table, Kyty, shadPS4, and the Dead Cells live trace above. CONFIDENCE: HIGH on
+// argument/output positions and handle flow; MED on the deliberately private work-buffer sizes.
+HLE(ngs2_system_query_buffer) {
+    NGS2_LOG("sceNgs2SystemQueryBufferSize");
+    if (!a1 || !a2_store_zeros(a1, 0x40) || !a2_store_u64(a1 + 8, 0x1000))
+        return kNgs2ErrInvalidOut;
+    return 0;
+}
+
+HLE(ngs2_system_create) {
+    NGS2_LOG("sceNgs2SystemCreate");
+    if (!a1 || !a2) return kNgs2ErrInvalidOut;
+    std::lock_guard<std::mutex> lock(g_ngs2_mx);
+    for (uint64_t i = 0; i < 4; ++i) {
+        if (g_ngs2_systems[i]) continue;
+        g_ngs2_systems[i] = true;
+        if (!a2_store_u64(a2, kNgs2SystemTag | (i + 1))) {
+            g_ngs2_systems[i] = false;
+            return kNgs2ErrInvalidOut;
+        }
+        return 0;
+    }
+    return kNgs2ErrInvalidSystem;
+}
+
+HLE(ngs2_rack_query_buffer) {
+    NGS2_LOG("sceNgs2RackQueryBufferSize");
+    const uint64_t size = 0x1000ull + (uint64_t)ngs2_max_voices(a1) * 0x40ull;
+    if (!a2 || !a2_store_zeros(a2, 0x40) || !a2_store_u64(a2 + 8, size))
+        return kNgs2ErrInvalidOut;
+    return 0;
+}
+
+HLE(ngs2_rack_create) {
+    NGS2_LOG("sceNgs2RackCreate");
+    if (!a3 || !a4) return kNgs2ErrInvalidOut;
+    std::lock_guard<std::mutex> lock(g_ngs2_mx);
+    if (!ngs2_valid_system(a0)) return kNgs2ErrInvalidSystem;
+    for (uint64_t i = 0; i < 32; ++i) {
+        if (g_ngs2_racks[i].used) continue;
+        g_ngs2_racks[i] = {true, a0, (uint32_t)a1, ngs2_max_voices(a2)};
+        if (!a2_store_u64(a4, kNgs2RackTag | (i + 1))) {
+            g_ngs2_racks[i] = {};
+            return kNgs2ErrInvalidOut;
+        }
+        return 0;
+    }
+    return kNgs2ErrInvalidRack;
+}
+
+HLE(ngs2_rack_get_voice) {
+    NGS2_LOG("sceNgs2RackGetVoiceHandle");
+    if (!a2) return kNgs2ErrInvalidOut;
+    std::lock_guard<std::mutex> lock(g_ngs2_mx);
+    Ngs2RackState* rack = ngs2_rack(a0);
+    if (!rack) return kNgs2ErrInvalidRack;
+    if (a1 >= rack->max_voices || a1 > 0xff) return kNgs2ErrInvalidVoice;
+    const uint64_t rack_slot = a0 & 0xff;
+    return a2_store_u64(a2, kNgs2VoiceTag | (rack_slot << 8) | a1) ? 0 : kNgs2ErrInvalidOut;
+}
+
+HLE(ngs2_voice_control) {
+    NGS2_LOG("sceNgs2VoiceControl");
+    return (a0 & kNgs2VoiceMask) == kNgs2VoiceTag ? 0 : kNgs2ErrInvalidVoice;
+}
+
+HLE(ngs2_voice_run_commands) {
+    NGS2_LOG("sceNgs2VoiceRunCommands");
+    return (a0 & kNgs2VoiceMask) == kNgs2VoiceTag ? 0 : kNgs2ErrInvalidVoice;
+}
+
+HLE(ngs2_voice_get_state) {
+    NGS2_LOG("sceNgs2VoiceGetState");
+    if ((a0 & kNgs2VoiceMask) != kNgs2VoiceTag) return kNgs2ErrInvalidVoice;
+    // An inert backend has no active decoder: zero stateFlags means Empty. Dead Cells requests the
+    // sampler extension, so clear the caller-declared payload as Kyty does before filling it.
+    if (!a1 || !a2 || a2 > 0x1000 || !a2_store_zeros(a1, (size_t)a2)) return kNgs2ErrInvalidOut;
+    return 0;
+}
+
+HLE(ngs2_geom_reset_source) {
+    NGS2_LOG("sceNgs2GeomResetSourceParam");
+    return a0 && a2_store_zeros(a0, 0xa8) ? 0 : kNgs2ErrInvalidOut;
+}
+
+HLE(ngs2_system_render) {
+    NGS2_LOG("sceNgs2SystemRender");
+    {
+        std::lock_guard<std::mutex> lock(g_ngs2_mx);
+        if (!ngs2_valid_system(a0)) return kNgs2ErrInvalidSystem;
+    }
+    struct RenderBufferInfo { uint64_t buffer, size; uint32_t waveform_type, channels; };
+    if (!a1 || a2 == 0 || a2 > 16) return kNgs2ErrInvalidOut;
+    for (uint64_t i = 0; i < a2; ++i) {
+        RenderBufferInfo info{};
+        if (!ngs2_read_bytes(a1 + i * sizeof(info), &info, sizeof(info)) ||
+            !info.buffer || info.size > 64ull * 1024 * 1024 || !ngs2_zero_bytes(info.buffer, (size_t)info.size))
+            return kNgs2ErrInvalidOut;
+    }
+    return 0;
+}
+
+HLE(ngs2_geom_reset_listener) {
+    NGS2_LOG("sceNgs2GeomResetListenerParam");
+    return a0 && a2_store_zeros(a0, 0xa0) ? 0 : kNgs2ErrInvalidOut;
+}
+
+HLE(ngs2_geom_calc_listener) {
+    NGS2_LOG("sceNgs2GeomCalcListener");
+    return a0 && a1 && a2_store_zeros(a1, 0x60) ? 0 : kNgs2ErrInvalidOut;
+}
+
+#undef NGS2_LOG
+
 void register_audio_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
     R("sceAudioOutInit", audio_init);
@@ -538,6 +762,18 @@ void register_audio_hle() {
     R("sceAjmInstanceCreate", ajm_instance_create);   R("sceAjmInstanceDestroy", ajm_instance_destroy);
     R("sceAjmBatchStartBuffer", ajm_batch_start);     R("sceAjmBatchWait", ajm_batch_wait);
     R("sceAjmBatchErrorDump", ajm_batch_errordump);
+    Hle::register_fn("pgFAiLR5qT4", ngs2_system_query_buffer, "sceNgs2SystemQueryBufferSize");
+    Hle::register_fn("koBbCMvOKWw", ngs2_system_create, "sceNgs2SystemCreate");
+    Hle::register_fn("0eFLVCfWVds", ngs2_rack_query_buffer, "sceNgs2RackQueryBufferSize");
+    Hle::register_fn("cLV4aiT9JpA", ngs2_rack_create, "sceNgs2RackCreate");
+    Hle::register_fn("MwmHz8pAdAo", ngs2_rack_get_voice, "sceNgs2RackGetVoiceHandle");
+    Hle::register_fn("uu94irFOGpA", ngs2_voice_control, "sceNgs2VoiceControl");
+    Hle::register_fn("AbYvTOZ8Pts", ngs2_voice_run_commands, "sceNgs2VoiceRunCommands");
+    Hle::register_fn("-TOuuAQ-buE", ngs2_voice_get_state, "sceNgs2VoiceGetState");
+    Hle::register_fn("0lbbayqDNoE", ngs2_geom_reset_source, "sceNgs2GeomResetSourceParam");
+    Hle::register_fn("i0VnXM-C9fc", ngs2_system_render, "sceNgs2SystemRender");
+    Hle::register_fn("7Lcfo8SmpsU", ngs2_geom_reset_listener, "sceNgs2GeomResetListenerParam");
+    Hle::register_fn("1WsleK-MTkE", ngs2_geom_calc_listener, "sceNgs2GeomCalcListener");
     #undef R
 }
 

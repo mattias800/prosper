@@ -1,4 +1,4 @@
-// test_audio — behavioral test for the sceAudioOut HLE (hle_audio.cpp) via a capturing sink.
+// test_audio — behavioral tests for the sceAudioOut and NGS2 HLEs in hle_audio.cpp.
 //
 // Agentic-first: no device, no PATH/DLL setup. Installs a fake AudioSink, drives the real HLE
 // entrypoints through the dispatch table (so registration + arg decoding + forwarding are all
@@ -49,6 +49,12 @@ static int64_t call(const char* n, uint64_t a0 = 0, uint64_t a1 = 0, uint64_t a2
                     uint64_t a3 = 0, uint64_t a4 = 0, uint64_t a5 = 0) {
     HleFn f = FN(n);
     if (!f) { printf("  [FAIL] not registered: %s\n", n); fails++; return -999; }
+    return (int64_t)f(a0, a1, a2, a3, a4, a5);
+}
+static int64_t call_raw(const char* nid, uint64_t a0 = 0, uint64_t a1 = 0, uint64_t a2 = 0,
+                        uint64_t a3 = 0, uint64_t a4 = 0, uint64_t a5 = 0) {
+    HleFn f = Hle::lookup(nid);
+    if (!f) { printf("  [FAIL] raw NID not registered: %s\n", nid); fails++; return -999; }
     return (int64_t)f(a0, a1, a2, a3, a4, a5);
 }
 static uint64_t PTR(const void* p) { return (uint64_t)(uintptr_t)p; }
@@ -157,10 +163,67 @@ int main() {
                                                           // ports (Kyty/shadPS4 both return a single grain)
     CHECK(sink.outs.size() == 2);                         // ...but both valid entries are still forwarded
 
+    // --- 10. libSceNgs2 silent lifecycle: sizes, handles, state, and render output -------------
+    struct BufferInfo { uint64_t host_buffer, host_buffer_size, reserved[5], user_data; };
+    struct RackOption {
+        uint64_t size; char name[16]; uint32_t flags, max_grain, max_voices,
+            max_delay, max_matrices, max_ports, reserved[20];
+    };
+    struct RenderInfo { uint64_t buffer, size; uint32_t waveform_type, channels; };
+
+    BufferInfo sys_info; memset(&sys_info, 0xEE, sizeof sys_info);
+    CHECK(call_raw("pgFAiLR5qT4", 0, PTR(&sys_info)) == 0); // SystemQueryBufferSize
+    CHECK(sys_info.host_buffer == 0);
+    CHECK(sys_info.host_buffer_size == 0x1000);
+    CHECK(sys_info.reserved[0] == 0 && sys_info.user_data == 0);
+    std::vector<uint8_t> sys_work(sys_info.host_buffer_size, 0);
+    sys_info.host_buffer = PTR(sys_work.data());
+    uint64_t system = 0xDEADBEEFDEADBEEFull;
+    CHECK(call_raw("koBbCMvOKWw", 0, PTR(&sys_info), PTR(&system)) == 0); // SystemCreate
+    CHECK(system != 0 && system != 0xDEADBEEFDEADBEEFull);
+
+    RackOption rack_opt{}; rack_opt.size = sizeof rack_opt; rack_opt.max_voices = 2;
+    memcpy(rack_opt.name, "test", 5);
+    BufferInfo rack_info; memset(&rack_info, 0xDD, sizeof rack_info);
+    CHECK(call_raw("0eFLVCfWVds", 0x2001, PTR(&rack_opt), PTR(&rack_info)) == 0);
+    CHECK(rack_info.host_buffer == 0 && rack_info.host_buffer_size >= 0x1000);
+    std::vector<uint8_t> rack_work(rack_info.host_buffer_size, 0);
+    rack_info.host_buffer = PTR(rack_work.data());
+    uint64_t rack = 0xDEADBEEFDEADBEEFull;
+    CHECK(call_raw("cLV4aiT9JpA", system, 0x2001, PTR(&rack_opt), PTR(&rack_info), PTR(&rack)) == 0);
+    CHECK(rack != 0 && rack != 0xDEADBEEFDEADBEEFull);
+
+    uint64_t voice = 0xDEADBEEFDEADBEEFull;
+    CHECK(call_raw("MwmHz8pAdAo", rack, 1, PTR(&voice)) == 0);
+    CHECK(voice != 0 && voice != 0xDEADBEEFDEADBEEFull);
+    uint64_t invalid_voice = 0xDEADBEEFDEADBEEFull;
+    CHECK((int32_t)call_raw("MwmHz8pAdAo", rack, 2, PTR(&invalid_voice)) == (int32_t)0x804A0302);
+    CHECK(invalid_voice == 0xDEADBEEFDEADBEEFull);
+
+    uint8_t voice_state[0x30]; memset(voice_state, 0xCC, sizeof voice_state);
+    CHECK(call_raw("-TOuuAQ-buE", voice, PTR(voice_state), sizeof voice_state) == 0);
+    for (uint8_t b : voice_state) CHECK(b == 0);           // inert voice = Empty
+
+    uint8_t ngs_pcm[256]; memset(ngs_pcm, 0xA5, sizeof ngs_pcm);
+    RenderInfo render{PTR(ngs_pcm), sizeof ngs_pcm, 0, 2};
+    CHECK(call_raw("i0VnXM-C9fc", system, PTR(&render), 1) == 0);
+    for (uint8_t b : ngs_pcm) CHECK(b == 0);               // silent backend produces silence
+    CHECK((int32_t)call_raw("i0VnXM-C9fc", 0, PTR(&render), 1) == (int32_t)0x804A0230);
+
+    uint8_t source[0xA8], listener[0xA0], listener_work[0x60];
+    memset(source, 0xBB, sizeof source); memset(listener, 0xBB, sizeof listener);
+    memset(listener_work, 0xBB, sizeof listener_work);
+    CHECK(call_raw("0lbbayqDNoE", PTR(source)) == 0);
+    CHECK(call_raw("7Lcfo8SmpsU", PTR(listener)) == 0);
+    CHECK(call_raw("1WsleK-MTkE", PTR(listener), PTR(listener_work), 0) == 0);
+    for (uint8_t b : source) CHECK(b == 0);
+    for (uint8_t b : listener) CHECK(b == 0);
+    for (uint8_t b : listener_work) CHECK(b == 0);
+
     // --- restore the default sink so we don't dangle a stack pointer -------------------------
     audio_reset();
 
     if (fails) { printf("== FAIL: %d check(s) failed ==\n", fails); return 1; }
-    printf("== PASS: sceAudioOut HLE (format/open/output/volume/state/close/batch/errors) ==\n");
+    printf("== PASS: sceAudioOut + NGS2 HLE lifecycle/output/error contracts ==\n");
     return 0;
 }
