@@ -442,7 +442,12 @@ static void honor_eop_write(const Pm4Command& c) {
                   // so the value-1 write below would forge pre|1 (0x1000000001) and seed the crash.
                   else if (forges_freelist_ptr(pre, 4, c.rel_value)) {
                       forge_trip("REL1", c.rel_addr, pre, c.rel_value, 4, pkt_addr(c));
-                      if (forge_guard() && label_is_consumed_marker(c.rel_addr)) {
+                      // No consumed-marker gate here (unlike REL1-LIVE): pre == a 0x1000000000-shaped
+                      // freelist next-pointer only ever occurs on a FREED/recycled MB3 block — a live
+                      // fence label (Messenger or DOLL) holds 0 / a small fence value there, never a
+                      // 64 KiB-aligned heap pointer. So this is always a write-after-free; suppressing
+                      // it can never re-block a live WaitRegMem==1 consumer. CONFIDENCE: HIGH.
+                      if (forge_guard()) {
                           report_suspect_write("REL1-FORGE", c.rel_addr, c.rel_value, pre, pkt_addr(c));
                           label_hist_rel_exec(c.rel_addr, pre);   // ring visibility; write skipped
                           return;
