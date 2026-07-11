@@ -11,6 +11,7 @@
 #include "render_runner.h"              // offscreen Vulkan backend (render_draws_rgba) + dump_bmp
 
 #include <atomic>
+#include <chrono>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -65,6 +66,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             // reach a post-loading-screen scene.
             static std::atomic<int> g_submit_idx{0};
             static int g_render_first = getenv("PROSPER_RENDER_FIRST") ? atoi(getenv("PROSPER_RENDER_FIRST")) : 0;
+            // PROSPER_RENDER_DELAY_MS=<N>: wall-clock warmup for titles whose useful scene begins after
+            // a variable number of submits. The guest and command decoder keep running at native speed;
+            // only the synchronous Vulkan work is skipped. The clock starts at the first GPU submit.
+            static const int64_t g_render_delay_ms = getenv("PROSPER_RENDER_DELAY_MS")
+                ? std::max<int64_t>(0, atoll(getenv("PROSPER_RENDER_DELAY_MS"))) : 0;
+            static const auto g_render_delay_start = std::chrono::steady_clock::now();
+            static std::atomic<bool> g_render_delay_announced{false};
             // PROSPER_RENDER_LAST=<N>: stop rendering after submit N (default: unbounded). Bounds the render
             // window so a diagnostic slice at a late stall (RENDER_FIRST..RENDER_LAST) does not accumulate
             // unbounded RTT/GPU resources across tens of thousands of submits (which OOM-kills the process).
@@ -107,9 +115,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     }
             }
             // A one-time offscreen producer may occur before a much later consumer render window.
-            // Render that target even before RENDER_FIRST so its RTT cache entry survives skipped
-            // intermediate submits (#526).
-            if (g_this_submit < g_render_first && !force_target) return {};
+            // Render that target even before the warmup ends so its RTT cache entry survives skipped
+            // intermediate submits (#526). Submit-count and wall-clock gates are additive.
+            const int64_t elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - g_render_delay_start).count();
+            const bool before_delay = elapsed_ms < g_render_delay_ms;
+            if (!before_delay && g_render_delay_ms > 0 &&
+                !g_render_delay_announced.exchange(true, std::memory_order_relaxed)) {
+                fprintf(stderr, "[render] wall-clock warmup complete after %lld ms at submit %d\n",
+                        (long long)elapsed_ms, g_this_submit);
+            }
+            if ((g_this_submit < g_render_first || before_delay) && !force_target) return {};
             // Dump the FIRST item's recompiled SPIR-V (diagnostic; survives a mid-render crash).
             if (getenv("PROSPER_SHADER_DUMP") && !items.empty()) {
                 std::string d = getenv("PROSPER_SHADER_DUMP");

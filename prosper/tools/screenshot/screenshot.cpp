@@ -2,17 +2,20 @@
 //
 // Reuses the shared boot path (boot_program) and the shared live renderer (frontends/shared), so the
 // game boots and composites exactly as boot_trace / prosper-app do; this tool just samples the
-// present layer (present_readback) periodically and writes PNGs. Frames are counted as display flips
-// (present_count). Files are named <titleCode>_<runTimestamp>_<index>.png so every screenshot from
+// present layer (present_readback) periodically and writes PNGs. Frames are counted as rendered frames
+// (present_frame_seq). Files are named <titleCode>_<runTimestamp>_<index>.png so every screenshot from
 // one run shares a prefix and sorts together in a folder of many runs.
 //
 //   screenshot <app0-dir> [--every N] [--count M] [--out DIR] [--timeout SECS]
+//              [--warmup-seconds S] [--warmup-submits N]
 //     <app0-dir>   REQUIRED. The game dump root (e.g. .../PPSA24651-app0). Title code = its basename
 //                  with a trailing "-app0" stripped.
-//     --every N    frames (flips) between screenshots        (default 60)
+//     --every N    rendered frames between screenshots       (default 60)
 //     --count M    number of screenshots to take, then exit  (default 30)
 //     --out DIR    output directory                          (default ".")
-//     --timeout S  give up after S seconds if the game isn't flipping enough (default 900; 0 = none)
+//     --timeout S  give up after S seconds if the game isn't rendering enough (default 900; 0 = none)
+//     --warmup-seconds S  skip Vulkan rendering for S seconds before capture
+//     --warmup-submits N  skip Vulkan rendering before submit N
 //
 // Reaching a rendering frame loop needs the guest switches the render frontier documents; this tool
 // defaults PROSPER_GUEST_FS=1 and PROSPER_GUEST_ARGS=-force-gfx-direct (Unity/Messenger recipe) if
@@ -25,6 +28,9 @@
 #include "live_renderer.hpp"           // register_live_renderer (frontends/shared)
 
 #include <zlib.h>
+#include <algorithm>
+#include <climits>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -42,6 +48,24 @@
 using namespace prosper;
 
 namespace {
+
+bool parse_nonnegative_double(const char* text, double& value) {
+    char* end = nullptr;
+    errno = 0;
+    const double parsed = strtod(text, &end);
+    if (errno || end == text || *end != '\0' || parsed < 0.0 || !std::isfinite(parsed)) return false;
+    value = parsed;
+    return true;
+}
+
+bool parse_nonnegative_int(const char* text, int& value) {
+    char* end = nullptr;
+    errno = 0;
+    const long parsed = strtol(text, &end, 10);
+    if (errno || end == text || *end != '\0' || parsed < 0 || parsed > INT_MAX) return false;
+    value = static_cast<int>(parsed);
+    return true;
+}
 
 void put_chunk(FILE* f, const char* type, const uint8_t* data, size_t len) {
     uint8_t hdr[4] = { (uint8_t)(len >> 24), (uint8_t)(len >> 16), (uint8_t)(len >> 8), (uint8_t)len };
@@ -105,6 +129,9 @@ int main(int argc, char** argv) {
     std::string dump, out = ".";
     int every = 60, count = 30, timeout = 900;
     double seconds = 0.0;   // >0 => capture every N wall-clock seconds instead of every N rendered frames
+    double warmup_seconds = -1.0;  // <0 => preserve the environment; explicit values override it
+    int warmup_submits = -1;
+    bool warmup_seconds_set = false, warmup_submits_set = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if      (a == "--every"   && i + 1 < argc) every = atoi(argv[++i]);
@@ -112,11 +139,25 @@ int main(int argc, char** argv) {
         else if (a == "--count"   && i + 1 < argc) count = atoi(argv[++i]);
         else if (a == "--out"     && i + 1 < argc) out   = argv[++i];
         else if (a == "--timeout" && i + 1 < argc) timeout = atoi(argv[++i]);
+        else if (a == "--warmup-seconds" && i + 1 < argc) {
+            warmup_seconds_set = true;
+            if (!parse_nonnegative_double(argv[++i], warmup_seconds)) {
+                fprintf(stderr, "screenshot: --warmup-seconds requires a non-negative number\n");
+                return 2;
+            }
+        }
+        else if (a == "--warmup-submits" && i + 1 < argc) {
+            warmup_submits_set = true;
+            if (!parse_nonnegative_int(argv[++i], warmup_submits)) {
+                fprintf(stderr, "screenshot: --warmup-submits requires a non-negative integer\n");
+                return 2;
+            }
+        }
         else if (!a.empty() && a[0] != '-' && dump.empty()) dump = a;
         else { fprintf(stderr, "screenshot: unknown/duplicate arg '%s'\n", a.c_str()); return 2; }
     }
     if (dump.empty()) {
-        fprintf(stderr, "usage: screenshot <app0-dir> [--every N=60 | --seconds S] [--count M=30] [--out DIR] [--timeout SECS]\n");
+        fprintf(stderr, "usage: screenshot <app0-dir> [--every N=60 | --seconds S] [--count M=30] [--out DIR] [--timeout SECS] [--warmup-seconds S] [--warmup-submits N]\n");
         return 2;
     }
     if (every < 1) every = 1;
@@ -139,6 +180,23 @@ int main(int argc, char** argv) {
     // Sane render-frontier defaults (don't override if the caller set them for another title).
     setenv("PROSPER_GUEST_FS",   "1", 0);
     setenv("PROSPER_GUEST_ARGS", "-force-gfx-direct", 0);
+    if (warmup_seconds_set) {
+        char delay_ms[32];
+        snprintf(delay_ms, sizeof delay_ms, "%lld",
+                 (long long)(warmup_seconds * 1000.0 + 0.5));
+        setenv("PROSPER_RENDER_DELAY_MS", delay_ms, 1);
+    }
+    if (warmup_submits_set) {
+        char first_submit[32];
+        snprintf(first_submit, sizeof first_submit, "%d", warmup_submits);
+        setenv("PROSPER_RENDER_FIRST", first_submit, 1);
+    }
+
+    const int64_t render_delay_ms = getenv("PROSPER_RENDER_DELAY_MS")
+        ? std::max<int64_t>(0, atoll(getenv("PROSPER_RENDER_DELAY_MS"))) : 0;
+    const int render_first = getenv("PROSPER_RENDER_FIRST")
+        ? std::max(0, atoi(getenv("PROSPER_RENDER_FIRST"))) : 0;
+    const bool warming_up = render_delay_ms > 0 || render_first > 0;
 
     std::error_code out_ec;
     std::filesystem::create_directories(out, out_ec);
@@ -163,6 +221,9 @@ int main(int argc, char** argv) {
     else
         fprintf(stderr, "[shot] %s: %d screenshots, every %d frames -> %s/%s_%s_*.png\n",
                 code.c_str(), count, every, out.c_str(), code.c_str(), ts);
+    if (warming_up)
+        fprintf(stderr, "[shot] warmup: %lld ms, %d submits; raw scanout suppressed until rendering begins\n",
+                (long long)render_delay_ms, render_first);
 
     std::vector<uint8_t> buf;
     int saved = 0;
@@ -180,7 +241,7 @@ int main(int argc, char** argv) {
         bool due = time_mode ? (std::chrono::duration<double>(now - last_cap).count() >= seconds)
                              : (gpu::present_frame_seq() >= next);
         const bool rendered = gpu::present_has_frame();
-        const bool raw_scanout = gpu::present_front_index() >= 0 &&
+        const bool raw_scanout = !warming_up && gpu::present_front_index() >= 0 &&
                                  gpu::present_width() > 0 && gpu::present_height() > 0;
         if ((rendered || raw_scanout) && due) {
             uint64_t at = gpu::present_frame_seq();

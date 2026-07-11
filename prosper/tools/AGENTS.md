@@ -49,6 +49,10 @@ This preserves a one-time producer in the RTT cache while still skipping an expe
 late consumer.
 `PROSPER_RENDER_RESOURCE_DIM=WxH` likewise executes submits that sample a matching image, allowing a
 producer/consumer A/B without rendering every unrelated submit between them.
+`PROSPER_RENDER_DELAY_MS=N` skips synchronous Vulkan work for N milliseconds from the first submit while
+the guest and command decoder advance. The `screenshot` frontend exposes this as `--warmup-seconds`, plus
+`--warmup-submits` for `PROSPER_RENDER_FIRST`; use wall-clock warmup for progression captures and the exact
+submit gate for repeatable renderer investigations.
 Per-target RTT is the normal renderer path. `PROSPER_RTT_SINGLE_TARGET=1` restores the obsolete flattened
 single-framebuffer compositor only for diagnostic comparison; it cannot represent real post chains or
 offscreen target dimensions.
