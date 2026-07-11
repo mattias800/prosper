@@ -92,9 +92,15 @@ Two later fixes complete the hardware-oracle composition and restore boot progre
 cannot poison the intro's reverse-Z depth plane. A clean scripted route produced 180 native 1920×1080 frames,
 and the user confirmed the first-level graphics match the hardware reference. #530 and #540 are closed.
 
-The immediate frontier is cross-title breadth plus repeatable tooling: stabilize *Dead Cells* AGC startup
-(#539), finish reusable input checkpoints and multi-title snapshots (#302/#248), then apply `.prgcap` replay
-and strict descriptor validation to an existing 3D Unity/Unreal workload.
+Cross-title breadth has advanced: *Dead Cells* now starts reliably after the AGC resource-name fix (#544), its
+exercised NGS2 lifecycle returns initialized sizes/handles/state and silent output (#554), and a late render
+window reaches the Evil Empire splash. #545 was software-render throughput, not a guest deadlock: synchronous
+3840×2160 llvmpipe rendering stretches its ~13,000-submit startup into minutes.
+
+The immediate frontier is repeatable, practical progression tooling: address the software-render capture policy
+(#549), finish input checkpoints and multi-title snapshots (#302/#248), complete the newly reached offline
+service contracts (#552), then apply `.prgcap` replay and strict descriptor validation to existing 3D Unity/Unreal
+workloads.
 `PROSPER_DESCRIPTOR_VALIDATE=strict|poison` and `gpu_replay --validate` are landed capabilities from #515.
 Do not restart the superseded
 Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without contradictory new evidence.
