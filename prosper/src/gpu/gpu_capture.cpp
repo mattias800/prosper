@@ -19,7 +19,7 @@ namespace prosper::gpu {
 namespace {
 
 constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
-constexpr uint32_t kVersion = 2;
+constexpr uint32_t kVersion = 3;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -285,6 +285,7 @@ bool capture_draw_items(const std::vector<DrawItem>& items, const GpuCaptureMeta
     for (const auto& d : items) {
         GpuCapturedDraw c; c.vs = d.vs; c.fs = d.fs; c.ps = d.ps; c.vertex_count = d.vertex_count;
         c.indices = d.indices; c.color0_base = d.color0_base;
+        c.color0_width = d.color0_width; c.color0_height = d.color0_height;
         if (!capture_table(d.vrt.get(), intervals, c.vrt, error) || !capture_table(d.prt.get(), intervals, c.prt, error)) return false;
         out.draws.push_back(std::move(c));
     }
@@ -304,6 +305,7 @@ bool write_gpu_capture(const std::string& path, const GpuCaptureFile& c, std::st
     for (const auto& d : c.draws) {
         w.words(d.vs); w.words(d.fs); write_pipeline(w, d.ps); write_table(w, d.vrt); write_table(w, d.prt);
         w.u32(d.vertex_count); w.words(d.indices); w.u64(d.color0_base);
+        w.u32(d.color0_width); w.u32(d.color0_height);
     }
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     std::filesystem::path target(path), temp = target; temp += ".tmp";
@@ -347,6 +349,7 @@ bool read_gpu_capture(const std::string& path, GpuCaptureFile& c, std::string& e
     for (auto& d : c.draws) {
         if (!r.words(d.vs) || !r.words(d.fs) || !read_pipeline(r, d.ps, version) || !read_table(r, d.vrt) ||
             !read_table(r, d.prt) || !r.u32(d.vertex_count) || !r.words(d.indices) || !r.u64(d.color0_base)) return false;
+        if (version >= 3 && (!r.u32(d.color0_width) || !r.u32(d.color0_height))) return false;
     }
     if (r.left) { error = "capture has trailing data"; return false; }
     return true;
@@ -377,6 +380,7 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
     for (const auto& x : c.draws) {
         DrawItem d; d.vs = x.vs; d.fs = x.fs; d.ps = x.ps; d.vertex_count = x.vertex_count;
         d.indices = x.indices; d.color0_base = x.color0_base;
+        d.color0_width = x.color0_width; d.color0_height = x.color0_height;
         if (!table(x.vrt, d.vrt) || !table(x.prt, d.prt)) return false;
         out.items.push_back(std::move(d));
     }
@@ -386,6 +390,11 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
 std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(const std::vector<DrawItem>& items,
                                                                uint32_t width, uint32_t height) {
     const char* path = std::getenv("PROSPER_GPU_CAPTURE"); if (!path || !*path) return {};
+    static std::atomic<uint64_t> invocation_sequence{0};
+    const uint64_t invocation = invocation_sequence.fetch_add(1);
+    uint64_t after = 0;
+    if (const char* v = std::getenv("PROSPER_GPU_CAPTURE_AFTER")) after = std::strtoull(v, nullptr, 0);
+    if (invocation < after) return {};
     uint64_t min_draws = 0, max_draws = std::numeric_limits<uint64_t>::max();
     if (const char* v = std::getenv("PROSPER_GPU_CAPTURE_MIN_DRAWS")) min_draws = std::strtoull(v, nullptr, 0);
     if (const char* v = std::getenv("PROSPER_GPU_CAPTURE_MAX_DRAWS")) max_draws = std::strtoull(v, nullptr, 0);
@@ -411,7 +420,9 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(const std::vector
         "PROSPER_NO_DEPTH", "PROSPER_NO_STENCIL", "PROSPER_STENCIL_CLEAR", "PROSPER_STENCIL_REPLACE",
         "PROSPER_NO_SWIZZLE", "PROSPER_NODETILE",
         "PROSPER_PITCH", "PROSPER_RENDER_NOPS", "PROSPER_RENDER_REFVS", "PROSPER_RENDER_TESTPS",
-        "PROSPER_RTT", "PROSPER_RTT_NOSEED", "PROSPER_RTT_PERTARGET", "PROSPER_TESTTEX"
+        "PROSPER_RTT", "PROSPER_RTT_NOSEED", "PROSPER_RTT_PERTARGET", "PROSPER_RTT_SINGLE_TARGET",
+        "PROSPER_TESTTEX",
+        "PROSPER_TESTLUT", "PROSPER_TESTLUT32"
     };
     for (const char* name : render_env) if (const char* value = std::getenv(name)) m.renderer_env.emplace_back(name, value);
     auto reader = [](uint64_t addr, uint8_t* dst, size_t bytes) -> size_t {
@@ -427,8 +438,9 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(const std::vector
     if (!capture_draw_items(items, m, reader, pending->capture, error)) {
         std::fprintf(stderr, "[gpucap] capture failed: %s\n", error.c_str()); return {};
     }
-    std::fprintf(stderr, "[gpucap] captured submit %llu: %zu draws, %zu blobs -> %s\n",
-                 static_cast<unsigned long long>(current), items.size(), pending->capture.blobs.size(), path);
+    std::fprintf(stderr, "[gpucap] captured match %llu at invocation %llu: %zu draws, %zu blobs -> %s\n",
+                 static_cast<unsigned long long>(current), static_cast<unsigned long long>(invocation),
+                 items.size(), pending->capture.blobs.size(), path);
     return pending;
 }
 

@@ -304,12 +304,9 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             Gen5ImageFormatInfo fi;
             static bool warned[512] = {};                        // once per 9-bit format value
             if (!gen5_image_format(d.format, &fi)) {
-                // Unmapped IMG format. Under RTT (PROSPER_RTT or PROSPER_RTT_PERTARGET — the
-                // per-target mode IMPLIES injection, matching live_renderer's rtt_on gate; a
-                // pertarget-only run previously skipped these T#s at layout level, #294), BIND it
-                // as RGBA8 anyway so the render-to-texture path can inject the pixels we rendered
-                // into this address. Without RTT, keep skipping (a raw RGBA8 read of a real
-                // unmapped texture would sample garbage; #65).
+                // The normal per-target renderer can supply an unmapped image through RTT injection,
+                // so bind it as RGBA8. The legacy single-target diagnostic keeps the old skip policy;
+                // a raw RGBA8 read of an unknown guest format would sample garbage (#65/#294).
                 static const bool rtt_bind = getenv("PROSPER_RTT") != nullptr ||
                                              getenv("PROSPER_RTT_PERTARGET") != nullptr;
                 if (!rtt_bind) {

@@ -1,94 +1,116 @@
 # Messenger black-render investigation
 
-This is the canonical status for two visible Messenger failures:
-
-- GitHub #300: the first gameplay level submits frames but its scene content is black.
-- GitHub #299: the save-game list is not visible.
-
-GitHub issues track what remains and own live findings. This document defines what evidence is current,
-which conclusions are obsolete, and how the next investigation must be run. Update it when a finding
-changes the investigation boundary; put run-by-run detail on the relevant issue.
+This is the canonical status for the Messenger gameplay-render failure (#300 / #522).
+The formerly invisible save-game list (#299) is visible on current master and that issue is closed.
+GitHub issues own live findings; this document records the current evidence boundary and next experiment.
 
 ## Current conclusion (2026-07-11)
 
-There is **no verified current-master root cause** for either symptom.
+Immutable capture/replay (#514), the color-disabled depth/stencil-pass fix (#520, merged as `376a801`),
+and resource-producer provenance (#524) established this causal chain:
 
-The old project frontier, "the vertex shader cannot recompile because bindless vertex fetch is unresolved",
-is solved. Dynamic fetch const-folding, per-instruction resource provenance, EUD descriptor recovery, and
-both shader stages now execute. `NEXT_STEP_VERTEX_FETCH.md` is a historical implementation record.
+1. The retained current-master capsule contains 46 draws. Replaying draws 0:30 produces the real first-level
+   landscape with 56,036 RGB-nonblack pixels (BMP SHA-256 prefix `f821d2c28aac4cb8`). Geometry, vertex fetch,
+   asset textures, depth/stencil masking, and scene render-target population are working for this frame.
+2. Full-screen post draw 31 consumes that healthy 1920x1080 scene RT at PS binding 34, a white 1x1 RGBA8
+   texture at binding 35, and a 1024x32 RGBA16F texture at binding 36. The last resource's captured backing
+   has only 6 nonzero bytes out of 524,288 (hash `4384046b4840fbaa`). The draw produces zero RGB-nonblack
+   pixels, and downstream composition preserves the black result.
+3. Binding 32 contains `(1/1024, 1/32, 31, 1)`. The fragment shader (SPIR-V hash `1ad0babe1990d5c0`)
+   samples binding 36 at adjacent blue slices and interpolates. Together with the texture dimensions, this
+   identifies binding 36 as a flattened 32x32x32 color-grading LUT.
+4. `PROSPER_TESTLUT32=1` replaces only that decoded resource with an identity 32-cubed LUT. Replaying through
+   draw 31 then restores the complete landscape through the original post shader: all 57,600 output pixels
+   have nonzero RGB, output hash `f962051005b617ef`, and BMP SHA-256
+   `fdfc5d0f2fc208403be1be86c483d94622ec1d19cbb2594b65711b4f8a71fb75`. This proves the source RT,
+   fullscreen geometry, descriptor sampling, 1x1 input, and grading shader are operational.
+5. Retained color-target history finds the direct writer of that 1024x32 resource in the same submit: raw
+   draw 40, immediately before the grading consumer. Re-realizing the producer reports one unsupported pixel
+   instruction, VOP1 opcode `0x0e`, `V_CVT_OFF_F32_I4`. The compute-producer hypothesis is falsified for this
+   resource: retained per-dispatch state contains no matching direct 1024x32 image.
+6. The producer also exposes a second renderer contract error. Its `CB_COLOR0_ATTRIB2` declares 1024x32, but
+   the live renderer previously gave every target the scaled VideoOut extent. Decoding and carrying the native
+   target dimensions lets small lookup surfaces render at their actual resolution while large scene/scanout
+   surfaces retain the configured render scale.
+7. Implementing `V_CVT_OFF_F32_I4` (signed low nibble to f32, scaled by 1/16) and the target-extent fix makes
+   the unmodified producer write 32,734/32,768 RGB-nonblack LUT texels. The original grading consumer hits that
+   cached target and produces 56,008/57,600 RGB-nonblack scene pixels. The selected VideoOut front buffer then
+   contains roughly 37,100-37,500 nonblack pixels and visibly shows the first-level landscape and dialogue UI.
+   No `PROSPER_TESTLUT32` or other synthetic resource override is active.
+8. The earlier 256x16 pixel-art palette is a transitional pass, not the persistent failing shader. A repaired
+   hardware-breakpoint trace (#525) observes `PaletteSwapImageEffect.FadeBlackToGameCoroutine.MoveNext`
+   progress through all eight entries and complete. Managed `Material.SetTexture`, its native `SetTextureImpl`
+   calls, eight distinct native texture pointers, and the corresponding live descriptor addresses all change.
+   That transition eventually produces the expected colored scene before the grading pass erases it.
 
-#300 contains useful measurements, but it also contains mutually incompatible conclusions: texture decode,
-alpha, transform collapse, render-target propagation, and a missing vertex-color binding were each called
-the root cause and later overturned. Those tests were run while the graphics stack changed quickly. They
-cannot be combined into one proof unless repeated on the same commit with the same captured frame.
+The black first-level root cause is therefore a missing shader instruction plus loss of per-target dimensions,
+not depth, a stuck palette fade, compute LUT baking, or detiling of the 256x16 palette. The real fix is currently
+validated on local branch `fix/issue-522-post-pass`; #522 should close only after the implementation merges and
+a clean build repeats the route without diagnostic force-render flags.
 
-The newest focused diagnostic, `772c44a` on `origin/fix/messenger-vertex-color-binding`, found that the
-previously absent binding-9 color vertex buffer had become present with real packed-white data after the
-EUD/resource fixes. The level was still black. That commit is based on `9b5bf27`, 27 commits behind
-`origin/master` at the time of this update, so it narrows history but is not current-master verification.
-
-#299 has only a shared-root hypothesis. It has not been shown whether the save-list rows are absent from
-Unity's draw stream, dropped during realization, or rendered with bad inputs. SaveData persistence and
-filesystem behavior changed recently (#389, #392), and the diagnostic run above reported flaky save-mount
-behavior. Treat #299 as an independent HLE/UI investigation until a capture proves otherwise.
+The old bindless vertex-fetch frontier is solved, and `NEXT_STEP_VERTEX_FETCH.md` is historical. Earlier
+#300 claims about texture decode, alpha, transform collapse, render-target propagation, and a missing
+vertex-color binding were made on changing revisions and were later overturned. Do not combine them into a
+new proof without reproducing them against the retained capsule or a fully recorded current-master run.
 
 ## Evidence policy
 
-Every new finding posted to #299 or #300 must include:
+Every new finding posted to #300 or #522 must include:
 
 - exact git commit and whether local changes were present;
-- title dump ID, savedata directory/seed, input route, and relevant environment flags;
+- title dump ID, savedata directory/seed, exact input route, and relevant environment flags;
 - pad-read, flip, submit, pass, and draw identifiers as applicable;
-- hashes of shader code, resolved resource table, referenced input bytes, and output image/pass;
+- hashes of shader code, resource table, referenced bytes, and output image/pass;
 - the observation, the narrower conclusion it supports, and alternatives it does not distinguish.
 
-Avoid "definitive" or "root cause" until a proposed fix changes the failing replay and a regression test
-fails before the fix and passes after it. A diagnostic override proves only the boundary it directly changes.
+A diagnostic override proves only the boundary it changes. Call something a root cause only when a real fix
+changes the same failing replay/live state and a regression fails before and passes after it.
 
-## Required baseline
+## Required merge validation
 
-Re-establish both symptoms independently on `origin/master`:
+Before closing #522:
 
-1. Use a unique, explicitly recorded `PROSPER_SAVEDATA_DIR` and state whether it starts empty or seeded.
-2. Record the exact inline, frame-anchored `PROSPER_PAD_SCRIPT` value. File-loaded routes are not on
-   current master yet; do not cite a branch-only `scripts/<title>/reach-*.pad` path as the input.
-3. Do not rely on `PROSPER_DET_CLOCK` or pad-read screenshot checkpoints; #302 confirmed those later
-   implementations did not merge with PR #301.
-4. Detect the reached state with a semantic/content metric, not elapsed time or one screenshot hash.
-5. Repeat until the success rate and any alternate states are quantified.
+1. Run the focused recompiler, command-processor, render-state, and capture tests plus the full CTest suite.
+2. Repeat the exact saved gameplay route from a clean build with no `PROSPER_TESTLUT32` override. The targeted
+   `PROSPER_RENDER_RESOURCE_DIM=1024x32` run is valid producer/consumer proof, but normal gameplay must not depend
+   on that diagnostic selection flag.
+3. Confirm the front buffer, not only an intermediate target, contains the landscape for multiple consecutive
+   flips. Record the revision, route, environment, and representative RGB-nonblack counts on #522.
+4. Keep the identity-LUT override and retained provenance tools diagnostic-only. They are useful for future
+   first-bad-contract investigations but are not part of normal title behavior.
 
-Do not begin another graphics hypothesis cycle until this baseline is reliable enough to identify the same
-failing submit/pass across runs. If savedata or guest state prevents that, fix the reproducer first.
+## Tooling
 
-## Tooling milestones
+### Immutable GPU capture/replay (#514, complete)
 
-### 1. Immutable GPU capture/replay (#514)
+`.prgcap` v3 records ordered draws, target transitions, native target dimensions, shaders, resource tables,
+and owned backing bytes,
+then reproduces the live hash without Unity. Use `gpu_replay --inspect-only`, draw-range isolation, resource
+dumping, and shader dumping for offline work. Captures contain game data and remain gitignored.
 
-Capture a failing draw-carrying frame locally: ordered draws, render-target transitions, decoded GPU state,
-shader code, resource tables, referenced VB/CB/texture bytes, initial RT state, and alias/dependency metadata.
-Replay it without loading Unity and require live-versus-replay state and output hashes to match. Captures
-contain game data and remain gitignored; only minimized synthetic fixtures may be committed.
-
-This converts a multi-minute, nondeterministic boot experiment into a revision-locked test that runs in
-seconds and can be bisected, probed, and compared.
-
-### 2. Strict shader/resource contract (#515)
+### Strict shader/resource contract (#515)
 
 Validate the descriptor interface declared by generated SPIR-V against the runtime `ShaderResourceTable`:
 set/binding, descriptor class, stage visibility, guest address, byte range, stride, format, and statically
-known accessed offsets. Diagnostic mode must reject missing, ambiguous, wrong-type, or undersized resources
-before Vulkan robust-buffer behavior silently turns them into zeros.
+known accessed offsets. Strict diagnostic mode must reject missing, ambiguous, wrong-type, or undersized
+resources before Vulkan robust-buffer behavior silently turns them into zeros.
 
-### 3. Structured per-draw probes
+### Resource producer provenance (#524)
+
+`PROSPER_PROVENANCE_DIM=WxH` retains matching color-target writers across submits and reports the last writer
+when a draw samples a matching image. `PROSPER_COMPUTELOG[_DIM]` records dispatch program/resource state. These
+tools found Messenger's direct raw-draw producer and falsified the compute hypothesis; extend the same structured
+history to DMA/COPY/WRITE and CPU-visible operations as future titles require.
+
+### Structured per-draw probes
 
 On a replayed draw, expose vertex position/color/UV, raw texture samples, constant-buffer factors,
 pre-blend fragment output, and final attachment output in a standard report. Existing switches such as
-`PROSPER_RENDER_TESTPS`, `PROSPER_TESTTEX`, `PROSPER_CBUFLOG`, and draw isolation are useful primitives;
-the goal is one repeatable probe rather than another collection of live-only A/B runs.
+`PROSPER_RENDER_TESTPS`, `PROSPER_TESTTEX`, `PROSPER_CBUFLOG`, and draw isolation are useful primitives.
 
 ## Decision boundary
 
-Do not start a persistent render-target-manager rewrite, another whole-stack audit, or an HLE workaround
-based only on the historical #300 comments. Let the current baseline and immutable replay identify the
-first bad contract. Once identified, implement the real behavior, derive a synthetic regression where
-possible, then add a late-state local snapshot/checkpoint guard for the repaired Messenger path.
+Do not start another depth/stencil, vertex-fetch, palette-fade, compute, tiling, or whole-stack rewrite from the
+historical #300 comments. The producer, missing opcode, target extent, consumer, and front-buffer result are now
+connected by one live trace. Preserve that chain as the regression boundary and use the same provenance-first
+method for the next title failure.
