@@ -4,9 +4,10 @@ Real-game rendering regression guard. Run this whenever a change can affect
 rendered output: RDNA2-to-SPIR-V recompilation, AGC/PM4 decoding, render state,
 texture detiling, or executor/present behavior.
 
-The current Messenger guard records the richest frame's distinct-color count
-across the boot. This catches a render collapsed to a clear while tolerating the
-title's run-to-run frame variance.
+The Messenger guard records the richest frame's distinct-color count across the
+boot. The Dead Cells guard uses an exact first-frame hash after a wall-clock
+renderer warmup. Together they exercise both supported guard modes across two
+titles.
 
 ## Run It
 
@@ -14,6 +15,7 @@ title's run-to-run frame variance.
 # From prosper/, with build-linux/boot_trace built for the change.
 python3 tools/snapshot/snapshot.py check
 python3 tools/snapshot/snapshot.py check messenger-scene
+python3 tools/snapshot/snapshot.py check dead-cells-splash
 ```
 
 On failure, the screenshot and boot log are written to

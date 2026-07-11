@@ -13,6 +13,7 @@ CI. Only hashes or content thresholds live in `snapshots.json`.
 # From prosper/, after building build-linux/boot_trace.
 python3 tools/snapshot/snapshot.py check
 python3 tools/snapshot/snapshot.py check messenger-scene
+python3 tools/snapshot/snapshot.py check dead-cells-splash
 ```
 
 On failure, `check` writes the screenshot and boot log to
@@ -25,6 +26,14 @@ On failure, `check` writes the screenshot and boot log to
   guard uses this mode and tolerates frame timing variance.
 - `frame` plus `hash`: compare one targeted draw-submit frame exactly. Run
   `verify <name>` before establishing its baseline with `update <name>`.
+
+## Current Matrix
+
+- `messenger-scene`: run-level content guard because the threaded boot does not
+  choose a stable exact frame.
+- `dead-cells-splash`: exact first frame after a three-second renderer warmup.
+  The warmup advances the submit-heavy startup without synchronous llvmpipe
+  rendering; repeated captures are pixel-identical at 960x540.
 
 ## Adding A Snapshot
 
