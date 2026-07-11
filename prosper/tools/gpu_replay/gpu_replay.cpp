@@ -68,12 +68,13 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
     for (size_t i = 0; i < replay.items.size(); ++i) {
         const auto& d = replay.items[i];
         std::printf("draw[%zu] target=%016llx extent=%ux%u vcount=%u indices=%zu topo=%u fmt=%u cwm=%x "
-                    "depth=%d/%d/%u stencil=%d blend=%d viewport=%d %.1f,%.1f %.1fx%.1f "
+                    "depth=%d/%d/%u stencil=%d blend=%d raster=%u/%u/%u viewport=%d %.1f,%.1f %.1fx%.1f "
                     "vs=%zu/%016llx fs=%zu/%016llx\n",
                     i, static_cast<unsigned long long>(d.color0_base), d.color0_width, d.color0_height,
                     d.vertex_count, d.indices.size(),
                     d.ps.topology, d.ps.color0_format, d.ps.color_write_mask, d.ps.depth_test_enable,
                     d.ps.depth_write_enable, d.ps.depth_compare_op, d.ps.stencil_enable, d.ps.blend_enable,
+                    d.ps.cull_mode, d.ps.front_face, d.ps.polygon_mode,
                     d.ps.has_viewport, d.ps.viewport_x, d.ps.viewport_y, d.ps.viewport_w, d.ps.viewport_h,
                     d.vs.size(), static_cast<unsigned long long>(prosper::gpu::gpu_capture_hash(
                         reinterpret_cast<const uint8_t*>(d.vs.data()), d.vs.size() * 4)),

@@ -404,11 +404,13 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         // Honor the guest's PA_SU_SC_MODE_CNTL cull/front-face/polygon mode (#456). Resolve encodes these
         // as the Vk enumerators; an absent register resolves to the same NONE/CCW/FILL default above, so
         // the null-ps (test) path and any draw that never programs it are byte-identical. PROSPER_NO_CULL
-        // forces CULL_NONE back on (diag escape hatch, matching PROSPER_NO_DEPTH/NO_STENCIL/NO_BLEND) —
-        // if honoring the guest cull ever culls the wrong faces on a live render (a winding/Y-flip edge),
-        // this isolates it without a rebuild.
+        // forces CULL_NONE back on; PROSPER_FLIP_FRONT_FACE preserves culling and toggles only winding.
+        // Together they isolate a cull-mode problem from a front-face translation problem without a rebuild.
         if (ps) { rs.cullMode  = getenv("PROSPER_NO_CULL") ? VK_CULL_MODE_NONE : (VkCullModeFlags)ps->cull_mode;
-                  rs.frontFace = (VkFrontFace)ps->front_face;
+                  rs.frontFace = getenv("PROSPER_FLIP_FRONT_FACE")
+                      ? (ps->front_face == VK_FRONT_FACE_CLOCKWISE ? VK_FRONT_FACE_COUNTER_CLOCKWISE
+                                                                  : VK_FRONT_FACE_CLOCKWISE)
+                      : (VkFrontFace)ps->front_face;
                   rs.polygonMode = (VkPolygonMode)ps->polygon_mode; }
         VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
         ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
