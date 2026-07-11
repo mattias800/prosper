@@ -36,6 +36,11 @@ extern "C" void prosper_arm_label_watch_force(uint64_t addr) __attribute__((weak
 // target + the target's content at build time + a timestamp — the timing-vs-wrong-target
 // discriminator consulted by the stomp catcher when a fence write lands over freed heap.
 extern "C" void prosper_fence_journal_record(uint64_t pkt, uint64_t addr);
+// #312 per-label protocol history (command_processor.cpp): build-side notes for the consumed-marker
+// legs (DmaData init / ReleaseMem fence / WaitRegMem poll), keyed by label address.
+extern "C" void prosper_label_hist_dma_built(uint64_t addr, uint64_t cb, uint32_t src, uint8_t builder);
+extern "C" void prosper_label_hist_rel_built(uint64_t addr, uint64_t cb);
+extern "C" void prosper_label_hist_wait_built(uint64_t addr, uint64_t cb);
 
 namespace prosper {
 
@@ -349,6 +354,7 @@ HLE(agc_dcb_dma_data) {  // (dcb, srcOrImm, srcSel?, dstSel?, dst, sel/policy, .
     cmd[3] = (uint32_t)(a1 & 0xffffffffu); cmd[4] = (uint32_t)(a1 >> 32u);
     cmd[5] = (uint32_t)num_bytes;
     cmd[6] = (uint32_t)((a2 & 0xffu) | ((a3 & 0xffu) << 8));
+    if (num_bytes <= 8) prosper_label_hist_dma_built(a4, a0, (uint32_t)a1, 1);   // #312 (label-init form)
     return (uint64_t)(uintptr_t)cmd;
 }
 // sceAgcAcbDmaData (-RnpfpxIhec) — the async-compute-queue sibling. Same operation, shifted ABI
@@ -365,6 +371,7 @@ HLE(agc_acb_dma_data) {  // (acb, srcSel?, dstSel?, dst, ?, ?, stack7=srcOrImm, 
     cmd[3] = (uint32_t)(src_imm & 0xffffffffu); cmd[4] = (uint32_t)(src_imm >> 32u);
     cmd[5] = (uint32_t)num_bytes;
     cmd[6] = (uint32_t)((a1 & 0xffu) | ((a2 & 0xffu) << 8));
+    if (num_bytes <= 8) prosper_label_hist_dma_built(a3, a0, (uint32_t)src_imm, 2);   // #312
     return (uint64_t)(uintptr_t)cmd;
 }
 // sceAgcDmaDataPatchSetDstAddressOrOffset (IxYiarKlXxM) / ...SetSrcAddressOrOffsetOrImmediate
@@ -472,7 +479,10 @@ HLE(agc_cb_release_mem) {  // sceAgcCbReleaseMem(buf, action, gcr_cntl, dst, cac
     cmd[3] = (uint32_t)data_sel;
     cmd[4] = (uint32_t)(data & 0xffffffffu); cmd[5] = (uint32_t)(data >> 32u);
     cmd[6] = (uint32_t)a1;
-    if (data_sel == 1) prosper_fence_journal_record((uint64_t)(uintptr_t)cmd, a5);   // #312 discriminator
+    if (data_sel == 1) {
+        prosper_fence_journal_record((uint64_t)(uintptr_t)cmd, a5);   // #312 discriminator
+        prosper_label_hist_rel_built(a5, a0);                         // #312 protocol history
+    }
     return (uint64_t)(uintptr_t)cmd;
 }
 HLE(agc_dcb_write_data) {  // sceAgcDcbWriteData(buf, dst, cache_policy, address_or_offset, data*, num_dwords, …)
@@ -525,6 +535,7 @@ HLE(agc_dcb_wait_reg_mem) {  // sceAgcDcbWaitRegMem(buf, size, compare_func, op,
     cmd[7] = (uint32_t)a2;                        // compare_function
     cmd[8] = 0;                                   // poll interval hint (arg9 not forwarded; unused by our fold)
     prosper_fence_journal_record((uint64_t)(uintptr_t)cmd, a5);   // #312 discriminator (wait leg)
+    prosper_label_hist_wait_built(a5, a0);                        // #312 protocol history
     return (uint64_t)(uintptr_t)cmd;
 }
 HLE(agc_dcb_set_flip) {  // (buf, video_out_handle, display_buffer_index, flip_mode, flip_arg) — 6 dw

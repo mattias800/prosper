@@ -136,6 +136,120 @@ extern "C" int prosper_fence_journal_lookup(uint64_t pkt, uint64_t* addr, uint64
     return 1;
 }
 
+// --- #312 per-label protocol history: the "missing init leg" discriminator. ----------------------
+// The consumed-marker protocol per 64 KiB command chunk is (RE'd, eboot+0x22122bd / 0x220d2d2):
+//   DmaData(label := 0, 4B)  ...  ReleaseMem(label <- 1, dsel=1)   — same cb, stream-ordered,
+// where label = an UNINITIALIZED Malloc(0x20) block (malloc residue = an MB3 freelist pointer is
+// EXPECTED at fence-build time; the GPU DmaData is the only initializer). So a pointer-valued label
+// at WRITE time means exactly one of: (a) the init DmaData never built, (b) built but not executed
+// (skipped/deferred/other-queue), or (c) executed but the guest re-pointered the block afterwards
+// (freed/re-linked => our fence is late or unexpected). This table answers which, per address.
+namespace {
+// Event types for the per-label ring. Build events fire in the AGC builder HLEs (guest thread);
+// exec events fire in the honor_* paths (fold thread / pend worker).
+enum : uint8_t { LE_DMA_BUILT = 1, LE_REL_BUILT, LE_WAIT_BUILT, LE_DMA_EXEC, LE_REL_EXEC, LE_DMA_SKIP };
+struct LabelEvent {
+    uint8_t  type;
+    uint32_t fold;        // g_fold_seq at event time (exec events; builds carry it too for context)
+    uint64_t t_ms;
+    uint64_t aux;         // builds: packet addr; execs: pre-content qword at the label
+};
+struct LabelHist {
+    uint64_t addr;
+    std::atomic<uint32_t> n;              // total events (ring index)
+    std::atomic<uint32_t> dma_built_n, dma_exec_n, rel_built_n, rel_exec_n;   // overlap counters
+    LabelEvent ev[16];                    // last 16 events
+};
+constexpr uint32_t kLabelHistSize = 16384;            // power of two
+LabelHist g_label_hist[kLabelHistSize];
+std::atomic<uint32_t> g_fold_seq{0};                  // top-level fold counter (submit streams)
+inline LabelHist& label_hist_slot(uint64_t addr) {
+    LabelHist& h = g_label_hist[(uint32_t)((addr >> 2) * 2654435761u) & (kLabelHistSize - 1)];
+    if (h.addr != addr) {                              // collision/new: reset (diagnostic-grade)
+        h.addr = addr; h.n.store(0, std::memory_order_relaxed);
+        h.dma_built_n = h.dma_exec_n = h.rel_built_n = h.rel_exec_n = 0;
+        memset(h.ev, 0, sizeof h.ev);
+    }
+    return h;
+}
+void label_hist_event(uint64_t addr, uint8_t type, uint64_t aux) {
+    if (!addr) return;
+    LabelHist& h = label_hist_slot(addr);
+    uint32_t i = h.n.fetch_add(1, std::memory_order_relaxed);
+    LabelEvent& e = h.ev[i & 15];
+    e.type = type; e.t_ms = now_ms(); e.aux = aux;
+    e.fold = g_fold_seq.load(std::memory_order_relaxed);
+}
+}
+extern "C" void prosper_label_hist_dma_built(uint64_t addr, uint64_t cb, uint32_t /*src*/, uint8_t builder) {
+    if (!addr) return;
+    label_hist_slot(addr).dma_built_n.fetch_add(1, std::memory_order_relaxed);
+    label_hist_event(addr, LE_DMA_BUILT, cb | builder);   // cb object ptr | 1=Dcb 2=Acb (cb is 8-aligned)
+}
+extern "C" void prosper_label_hist_rel_built(uint64_t addr, uint64_t cb) {
+    if (!addr) return;
+    label_hist_slot(addr).rel_built_n.fetch_add(1, std::memory_order_relaxed);
+    label_hist_event(addr, LE_REL_BUILT, cb);
+}
+extern "C" void prosper_label_hist_wait_built(uint64_t addr, uint64_t cb) {
+    label_hist_event(addr, LE_WAIT_BUILT, cb);
+}
+// Dump a label's event ring outside the suspect path (WaitRegMem violations — #312).
+extern "C" void prosper_label_hist_dump(uint64_t addr, char* out, unsigned cap);
+namespace {
+uint64_t peek_qword(uint64_t addr) {
+    uint64_t v = 0;
+    if (addr >= 0x10000 && !(addr & 3)) memcpy(&v, (const void*)(uintptr_t)addr, sizeof v);
+    return v;
+}
+void label_hist_dma_exec(uint64_t addr, uint64_t pre) {
+    label_hist_slot(addr).dma_exec_n.fetch_add(1, std::memory_order_relaxed);
+    label_hist_event(addr, LE_DMA_EXEC, pre);
+}
+void label_hist_dma_skip(uint64_t addr)               { label_hist_event(addr, LE_DMA_SKIP, 0); }
+void label_hist_rel_exec(uint64_t addr, uint64_t pre) {
+    label_hist_slot(addr).rel_exec_n.fetch_add(1, std::memory_order_relaxed);
+    label_hist_event(addr, LE_REL_EXEC, pre);
+}
+// #312 in-flight-overlap probe: at REL1 exec time, a SECOND init/fence pair already built for the
+// same label (built-execed >= 2 pending, counting this one) means two fence generations were in
+// flight together — the guest may free the label on the FIRST 1 while the second pair is still
+// queued, and the late pair then stomps the freed block (bundle-next := 1 -> the exact
+// free(0x1000000001) / NextFreeBlock==0x1 / canary fatal family). Returns pending inits.
+int label_rel_overlap(uint64_t addr) {
+    LabelHist& h = label_hist_slot(addr);
+    uint32_t db = h.dma_built_n.load(std::memory_order_relaxed);
+    uint32_t dx = h.dma_exec_n.load(std::memory_order_relaxed);
+    return (int)(db - dx);
+}
+// #312: is this address part of DOLL's DmaData(:=0)+ReleaseMem(<-1) consumed-marker protocol? A
+// plain fence label (Messenger's ReleaseMem/WriteData targets) has NO DmaData-init history, so this
+// gates the REL1-stomp guard to the exact population that carries the corruption — never a title
+// whose fences are simple EOP labels. (label_hist_slot resets on hash collision, so a false 0 only
+// forgoes the guard on one write; the protocol re-arms it on the address's next DmaData build.)
+bool label_is_consumed_marker(uint64_t addr) {
+    return label_hist_slot(addr).dma_built_n.load(std::memory_order_relaxed) > 0;
+}
+// Format the event ring for a suspect report, oldest first. b=built x=exec, aux in hex.
+void label_hist_report(uint64_t addr, char* out, size_t cap) {
+    static const char* nm[] = {"?", "dmaB", "relB", "waitB", "dmaX", "relX", "dmaSKIP"};
+    const LabelHist& h = label_hist_slot(addr);
+    uint32_t n = h.n.load(std::memory_order_relaxed);
+    uint32_t first = n > 16 ? n - 16 : 0;
+    size_t off = (size_t)snprintf(out, cap, "events(total=%u):", n);
+    for (uint32_t i = first; i < n && off + 48 < cap; i++) {
+        const LabelEvent& e = h.ev[i & 15];
+        int m = snprintf(out + off, cap - off, " %s@%llu/f%u:0x%llx",
+                         e.type <= 6 ? nm[e.type] : "?", (unsigned long long)e.t_ms, e.fold,
+                         (unsigned long long)e.aux);
+        if (m > 0) off += (size_t)m;
+    }
+}
+}
+extern "C" void prosper_label_hist_dump(uint64_t addr, char* out, unsigned cap) {
+    label_hist_report(addr, out, cap);
+}
+
 // #312: "pointer-like" pre-content — a freed MallocBinned3 block header holds heap pointers into
 // the 512 GiB arena (0x1000000000) or the allocator-metadata pools (0x2000000000 region, where the
 // FPoolInfo tables live — e.g. the 0x20015f0000 pool-info table of #161/#241).
@@ -144,25 +258,47 @@ static bool ptr_like(uint64_t v) {
            (v >= 0x2000000000ull && v < 0x2100000000ull);
 }
 // #312: report one suspicious fence write with its build-journal verdict. kindtag: "REL1" etc.
+//
+// RUN-2026-07-10 FINDING (this instrumentation's own history): the historical "~96 pointer-valued
+// labels in a burst at t~10 s" was a FALSE-POSITIVE artifact. Per the consumed-marker protocol the
+// label legitimately holds a DEAD chain pointer (0x10xxxxxxxx) at build time (the guest flattens
+// its pending-label list into an array BEFORE emitting, so the intrusive next pointers are dead);
+// our in-stream DmaData(label := 0, 4B) then zeroes the LOW dword, leaving the qword reading
+// exactly 0x1000000000 (stale high half) at ReleaseMem time — ptr_like() matched that benign
+// composite, and the 10 s gate + 96-line budget made it look like a t~10 s burst (label-history
+// proof: dma built==exec, rel built==exec, same fold, every time, in CLEAN runs too). The REAL
+// anomaly class is a fence write finding a NONZERO LOW DWORD pointer at write time: the init leg
+// did not land before us (missing/misordered) or the block was reused/re-linked (we are late).
 static void report_suspect_write(const char* kindtag, uint64_t addr, uint64_t value, uint64_t pre,
                                  uint64_t pkt) {
-    // Skip the first 10 s: boot-time label-array allocations carry benign freelist residue that
-    // burned the whole report budget at t=3.4 s in every run; the corruption class is mid-burst.
-    if (now_ms() < 10000) return;
+    // Skip the first 2 s (module-load churn); the protocol is steady-state by then.
+    if (now_ms() < 2000) return;
     static std::atomic<int> n{0};
-    if (n.fetch_add(1) >= 96) return;
+    if (n.fetch_add(1) >= 192) return;
     uint64_t baddr = 0, bpre = 0, bt = 0;
     int have = prosper_fence_journal_lookup(pkt, &baddr, &bpre, &bt);
+    char hist[512]; label_hist_report(addr, hist, sizeof hist);
     fprintf(stderr, "[agc] SUSPECT-%s [0x%llx] pre=0x%llx value=0x%llx pkt=0x%llx t=%llums | "
-                    "journal:%s built@%llums(age=%lldms) built-addr=0x%llx%s pre@build=0x%llx%s\n",
+                    "journal:%s built@%llums(age=%lldms) built-addr=0x%llx%s pre@build=0x%llx%s | %s\n",
             kindtag, (unsigned long long)addr, (unsigned long long)pre, (unsigned long long)value,
             (unsigned long long)pkt, (unsigned long long)now_ms(),
             have ? "" : " MISS", (unsigned long long)bt,
             have ? (long long)(now_ms() - bt) : -1,
             (unsigned long long)baddr, (have && baddr != addr) ? " TARGET-CHANGED" : "",
-            (unsigned long long)bpre, (have && ptr_like(bpre)) ? " STALE-AT-BUILD" : "");
+            (unsigned long long)bpre, (have && ptr_like(bpre)) ? " STALE-AT-BUILD" : "", hist);
 }
 
+// #312 the WHERE fix (default ON; PROSPER_REL1_STOMP_GUARD=0 restores the old barrel-through for
+// A/B). When a data_sel==1 fence write would land on a live MallocBinned3 freelist/pool block —
+// captured live as REL1-LIVE: the destination qword is a heap pointer (ptr_like) whose low dword is
+// a real pointer half, not 0 (init'd) or 1 (signaled) — the paired DmaData init never ran and the
+// guest already freed the recycled label back to the allocator. Writing our 4-byte 1 over +0 forges
+// 0x10000000_00000001 (or a 0x2001... pool pointer) — the exact #312 fatal family. Suppress it.
+static bool rel1_stomp_guard() {
+    static const bool v = [] { const char* e = getenv("PROSPER_REL1_STOMP_GUARD");
+                               return !e || strtol(e, nullptr, 0) != 0; }();   // default ON
+    return v;
+}
 // Honor a RELEASE_MEM / EVENT_WRITE_EOP completion write. data_sel (Kyty GraphicsCbReleaseMem allows {2,3};
 // shadPS4 DataSelect enum): 1=write 32-bit value, 2=write 64-bit value, 3=write 64-bit GPU clock. The write
 // uses memcpy so an only-4-byte-aligned 64-bit label is handled portably. CONFIDENCE: HIGH — address,
@@ -189,11 +325,61 @@ static void honor_eop_write(const Pm4Command& c) {
                   // target-region trigger caught only benign fences and burned the report cap.
                   // Trigger on pointer-like PRE-CONTENT only.)
                   uint64_t pre = 0; memcpy(&pre, dst, sizeof pre);
-                  if (ptr_like(pre))
-                      report_suspect_write("REL1", c.rel_addr, c.rel_value, pre, pkt_addr(c));
+                  // Post-init state (low dword 0 or an already-signaled 1 from OUR OWN just-landed
+                  // write... no: low==1 means the previous generation's fence value survived with
+                  // NO re-init between — the init leg missed. Classify (see the finding above):
+                  //   low==0            -> benign post-init composite; not reported.
+                  //   ptr_like, low!=0  -> REL1-LIVE: a real pointer at write time (stomp-in-the-act).
+                  //   low==1 && high!=0 -> REL1-NOINIT: recycled label re-fenced without its DmaData.
+                  uint32_t pre_low = (uint32_t)pre;
+                  if (pre_low != 0) {
+                      if (ptr_like(pre) && pre_low != 1) {
+                          report_suspect_write("REL1-LIVE", c.rel_addr, c.rel_value, pre, pkt_addr(c));
+                          // #312 FIX (the WHERE leg): dst holds a live MallocBinned3 freelist/pool
+                          // next-pointer, not an initialized consumed-marker label — its paired
+                          // DmaData(:=0) init never landed (a valid label reads low-dword 0 here).
+                          // The guest already freed this recycled 0x20 block, so no WaitRegMem==1
+                          // consumer can be satisfied by it anyway (the pointer's low dword != 1);
+                          // performing the 4-byte value-1 write would forge 0x10000000_00000001 and
+                          // corrupt the freelist — the exact #312 fatal. Suppress it. Gated to the
+                          // consumed-marker population so plain fence labels (Messenger) are never
+                          // affected. CONFIDENCE: HIGH (mechanism captured live, sessions 2-5).
+                          if (rel1_stomp_guard() && label_is_consumed_marker(c.rel_addr)) {
+                              label_hist_rel_exec(c.rel_addr, pre);   // ring visibility; write skipped
+                              return;
+                          }
+                      }
+                      else if (pre_low == 1 && (pre >> 32))
+                          report_suspect_write("REL1-NOINIT", c.rel_addr, c.rel_value, pre, pkt_addr(c));
+                  }
+                  // In-flight overlap: a second init+fence pair to this label is already built but
+                  // not executed — two fence generations in the pipe together (see label_rel_overlap).
+                  // Content-independent: catches the late-pair stomp class even when pre reads 0.
+                  if (int ov = label_rel_overlap(c.rel_addr); ov >= 1) {
+                      static std::atomic<int> novl{0};
+                      if (now_ms() >= 2000 && novl.fetch_add(1) < 64) {
+                          char hist[512]; label_hist_report(c.rel_addr, hist, sizeof hist);
+                          fprintf(stderr, "[agc] SUSPECT-REL1-OVERLAP [0x%llx] pending-inits=%d pre=0x%llx t=%llums | %s\n",
+                                  (unsigned long long)c.rel_addr, ov, (unsigned long long)pre,
+                                  (unsigned long long)now_ms(), hist);
+                      }
+                  }
                   uint32_t v = (uint32_t)c.rel_value; memcpy(dst, &v, sizeof v);
-                  ring_record(c.rel_addr, v, 4, 1, pkt_addr(c)); break; }
+                  ring_record(c.rel_addr, v, 4, 1, pkt_addr(c));
+                  label_hist_rel_exec(c.rel_addr, pre); break; }
         case 2: { if (!c.rel_value_valid) return;
+                  // #312: the same freelist-stomp guard as the 32-bit path. An 8-byte value-1 fence
+                  // over a live consumed-marker freelist node overwrites BOTH the next-pointer dwords
+                  // (observed live: 8-byte kind=1 writes to a hot recycled label preceding a canary
+                  // fatal). Skip when the target still holds a live heap pointer (its DmaData init
+                  // never landed) — see honor case 1. CONFIDENCE: HIGH.
+                  uint64_t pre = 0; memcpy(&pre, dst, sizeof pre);
+                  if (rel1_stomp_guard() && ptr_like(pre) && (uint32_t)pre != 0 &&
+                      pre != c.rel_value && label_is_consumed_marker(c.rel_addr)) {
+                      report_suspect_write("REL2-LIVE", c.rel_addr, c.rel_value, pre, pkt_addr(c));
+                      label_hist_rel_exec(c.rel_addr, pre);   // ring visibility; write skipped
+                      return;
+                  }
                   uint64_t v = c.rel_value;           memcpy(dst, &v, sizeof v);
                   ring_record(c.rel_addr, v, 8, 1, pkt_addr(c)); break; }
         case 3: { uint64_t v = gpu_clock64();         memcpy(dst, &v, sizeof v);
@@ -258,6 +444,7 @@ static void honor_dma_data(const Pm4Command& c) {
                     c.dd_dst >= 0x10000 && !(c.dd_dst & 3) && c.dd_src <= 0xffffffffull;
     if (!imm_form || !guest_readable(c.dd_dst, c.dd_bytes)) {
         // Not the immediate-fill form we model (or unmapped dst) — log so the gap stays visible.
+        label_hist_dma_skip(c.dd_dst);   // #312: a skipped init leaves the label pointer-valued
         static std::atomic<int> n{0};
         if (n.fetch_add(1) < 24)
             fprintf(stderr, "[agc] DMA_DATA not executed (unmodeled form): dst=0x%llx src=0x%llx bytes=%u sels=0x%x\n",
@@ -266,6 +453,7 @@ static void honor_dma_data(const Pm4Command& c) {
     }
     uint32_t v32 = (uint32_t)c.dd_src;
     uint8_t* dst = (uint8_t*)(uintptr_t)c.dd_dst;
+    uint64_t pre_dma = peek_qword(c.dd_dst);   // #312: pre-content for the label event ring
     if (v32 == 0) {
         memset(dst, 0, c.dd_bytes);
     } else {
@@ -274,6 +462,7 @@ static void honor_dma_data(const Pm4Command& c) {
         if (i < c.dd_bytes) memcpy(dst + i, &v32, c.dd_bytes - i);
     }
     ring_record(c.dd_dst, c.dd_src, (uint8_t)(c.dd_bytes > 255 ? 255 : c.dd_bytes), 4, pkt_addr(c));
+    if (c.dd_bytes <= 8) label_hist_dma_exec(c.dd_dst, pre_dma);   // #312 protocol history
     if (getenv("PROSPER_GFXLOG"))
         fprintf(stderr, "[agc]   DmaData [0x%llx] := 0x%x (%u bytes)\n",
                 (unsigned long long)c.dd_dst, v32, c.dd_bytes);
@@ -346,30 +535,43 @@ struct PendQueue {
 PendQueue& pend_q() { static PendQueue* p = new PendQueue; return *p; }
 void apply_effect(const Pm4Command& c);   // fwd (defined with the WAIT_DEFER machinery below)
 void apply_deferred_effect(const Pm4Command& c);   // fwd: apply_effect + a guest_readable guard (#449)
-// Drain returns only when every pending write has LANDED — including one a concurrent drainer
-// popped and is mid-applying (the in-flight window). Without that wait, a caller could observe an
-// empty queue and proceed to apply a LATER same-address write (a released #312 gated item) that
-// overtakes the in-flight one — the exact per-address inversion the barrier model exists to stop.
+// Drain returns only when every pending write has LANDED, and writes land STRICTLY IN QUEUE ORDER.
+//
+// #312 ROOT CAUSE (2026-07-10, label-event-ring attribution): the previous loop popped the NEXT
+// item while another drainer was still mid-apply on the PREVIOUS one (it only waited when the
+// queue was already empty). The pend queue is drained concurrently by the pend worker, the EOP-
+// event worker, and the submit thread's WaitRegMem/renderer drains — so the guest's paired
+//   DmaData(label := 0)  ->  ReleaseMem(label <- 1)
+// consumed-marker writes (adjacent, same address) were routinely applied by TWO threads in
+// PARALLEL with no ordering: the fence 1 became guest-visible before/interleaved-with its own
+// init (captured live: SUSPECT-REL1-LIVE with the paired dmaX in the same millisecond reading the
+// SAME pre-content, or the dma still queued). The guest's completion poll then freed + reused the
+// 0x20-byte label block while our other write was still in flight, and the late 4-byte write
+// landed in the block's NEXT OWNER — the MallocBinned3 "Canary was 0x3" / "free an unrecognized
+// block 0x1000000001" / pool-metadata corruption family. Fix: never begin item k+1 until item k
+// has LANDED — one write in flight globally, FIFO order == landing order. The writes are 4/8-byte
+// memcpys; serializing them costs nothing measurable. CONFIDENCE: HIGH (mechanism captured live;
+// the suspect class vanishes with this fix).
 void pend_drain_locked(PendQueue& p, std::unique_lock<std::mutex>& lk) {
     for (;;) {
-        if (!p.q.empty()) {
-            PendWrite w = std::move(p.q.front());
-            p.q.pop_front();
-            p.inflight++;
-            lk.unlock();                 // the write itself never needs the queue lock
-            // Guard the target's mappedness (#449): the pend queue applies completion writes ~1 ms after
-            // enqueue (the pipe-drain window), during which the guest may have freed+decommitted the
-            // label page (MallocBinned3, #312). apply_deferred_effect probes guest_readable before the
-            // raw memcpy — without it an unmapped label SIGSEGVs here, exactly the case the deferred-
-            // stream path already survives (this pend path releases asynchronously too, so it needs it).
-            apply_deferred_effect(w.cmd);
-            lk.lock();
-            p.inflight--;
-            if (p.inflight == 0) p.cv.notify_all();
+        if (p.inflight > 0) {            // another drainer is mid-apply: WAIT — never overtake it
+            p.cv.wait(lk);
             continue;
         }
-        if (p.inflight == 0) break;
-        p.cv.wait(lk);                   // another drainer is mid-apply — wait for it to land
+        if (p.q.empty()) break;
+        PendWrite w = std::move(p.q.front());
+        p.q.pop_front();
+        p.inflight++;
+        lk.unlock();                     // the write itself never needs the queue lock
+        // Guard the target's mappedness (#449/#483): the pend queue applies completion writes ~1 ms
+        // after enqueue (the pipe-drain window), during which the guest may have freed+decommitted
+        // the label page (MallocBinned3, #312). apply_deferred_effect probes guest_readable before
+        // the raw memcpy — without it an unmapped label SIGSEGVs here, exactly the case the deferred-
+        // stream path already survives (this pend path releases asynchronously too, so it needs it).
+        apply_deferred_effect(w.cmd);
+        lk.lock();
+        p.inflight--;
+        p.cv.notify_all();               // wake both drain waiters and the pend worker
     }
 }
 void pend_worker() {
@@ -396,7 +598,7 @@ void pend_enqueue(const Pm4Command& c) {
         if (!p.worker_started) { p.worker_started = true; std::thread(pend_worker).detach(); }
         p.q.push_back(std::move(w));
     }
-    p.cv.notify_one();
+    p.cv.notify_all();   // notify_one could wake a drain waiter instead of the pend worker
 }
 } // namespace
 
@@ -940,14 +1142,15 @@ void GpuState::apply(const Pm4Command& c) {
                         // #312 discriminator: build-journal age + freed-heap-shaped label content.
                         uint64_t baddr = 0, bpre = 0, bt = 0;
                         int have = prosper_fence_journal_lookup(pkt_addr(c), &baddr, &bpre, &bt);
-                        fprintf(stderr, "[agc] WaitRegMem #%d NOT satisfied at fold time: [0x%llx]&0x%llx = 0x%llx, func=%u ref=0x%llx — %s | built@%llums(age=%lldms)%s pre@build=0x%llx%s%s\n",
+                        char hist[512]; label_hist_report(c.wm_addr, hist, sizeof hist);
+                        fprintf(stderr, "[agc] WaitRegMem #%d NOT satisfied at fold time: [0x%llx]&0x%llx = 0x%llx, func=%u ref=0x%llx — %s | built@%llums(age=%lldms)%s pre@build=0x%llx%s%s | %s\n",
                                 ln, (unsigned long long)c.wm_addr, (unsigned long long)c.wm_mask,
                                 (unsigned long long)(mem & c.wm_mask), c.wm_func, (unsigned long long)c.wm_ref,
                                 defer_enabled() ? "pausing queue (deferred effects)" : "dependency violated",
                                 (unsigned long long)bt, have ? (long long)(now_ms() - bt) : -1,
                                 (have && baddr != c.wm_addr) ? " TARGET-CHANGED" : "",
                                 (unsigned long long)bpre, ptr_like(mem) ? " CONTENT-PTR-LIKE(freed?)" : "",
-                                label_readable ? "" : " LABEL-UNMAPPED");
+                                label_readable ? "" : " LABEL-UNMAPPED", hist);
                     }
                     if (defer_enabled()) {
                         g_fold_deferring = true;
@@ -1040,7 +1243,10 @@ size_t run_command_buffer(const uint32_t* buf, size_t dwords, GpuState& st) {
     // so hle_agc never started the release watchdog — the observed WAIT_DEFER wedge with zero
     // DEFER-TIMEOUT logs (a deferred stream nobody ever re-checked while the guest CPU-polled one
     // of its labels).
-    if (st.jump_depth == 0) { g_fold_deferring = false; g_fold_stream_open = false; }
+    if (st.jump_depth == 0) {
+        g_fold_deferring = false; g_fold_stream_open = false;
+        g_fold_seq.fetch_add(1, std::memory_order_relaxed);   // #312 label-history fold id
+    }
     std::vector<Pm4Command> ops;
     decode_pm4(buf, dwords, ops);
     for (const auto& c : ops) st.apply(c);
