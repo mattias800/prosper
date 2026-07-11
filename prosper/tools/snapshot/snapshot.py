@@ -273,8 +273,12 @@ def select(m, names):
 
 def cmd_list(m, names):
     for s in m["snapshots"]:
-        print(f"  {s['name']:<28} dump={s['dump']} frame={s['frame']} "
-              f"hash={'set' if s.get('hash') else 'MISSING'}")
+        if "min_colors" in s:
+            mode = f"min_colors={s['min_colors']}"
+        else:
+            mode = (f"frame={s.get('frame', 'MISSING')} "
+                    f"hash={'set' if s.get('hash') else 'MISSING'}")
+        print(f"  {s['name']:<28} dump={s['dump']} {mode}")
 
 
 def cmd_update(m, names):
