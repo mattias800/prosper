@@ -27,6 +27,8 @@ To drive any runner through a longer input route, set
 `PROSPER_PAD_SCRIPT=@scripts/<title>/reach-<state>.pad`. Route files use the same
 seconds/flip syntax as inline scripts, accept one entry per line, `#` comments,
 and explicit ranges such as `f300-340:cross`. See `docs/INPUT_REPLAY.md`.
+Set `PROSPER_PAD_RECORD=<path>` on any runner, or use `prosper-app --record <path>`, to capture the
+final controller stream in that format. Completed button intervals are flushed immediately.
 
 Capture one draw-carrying renderer invocation with:
 

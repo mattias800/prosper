@@ -335,6 +335,7 @@ int main(int argc, char** argv) {
         if (a == "--test-pattern") testPattern = true;
         else if (a == "--frames" && i + 1 < argc) exitAfter = atoi(argv[++i]);   // present N frames then exit (CI/smoke)
         else if (a == "--dump" && i + 1 < argc) dump = argv[++i];                // boot the game at this app0 dir
+        else if (a == "--record" && i + 1 < argc) setenv("PROSPER_PAD_RECORD", argv[++i], 1);
         else if (a[0] != '-' && dump.empty()) dump = a;                          // positional dump path
     }
 

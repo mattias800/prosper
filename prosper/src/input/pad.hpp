@@ -155,6 +155,10 @@ struct PadScriptEntry {
 // bit; 0 if unknown. "start" and "options" both mean the PS5 Options button (the "Start" equivalent).
 uint32_t pad_button_by_name(const std::string& name);
 
+// Canonical '+'-joined names for a button mask. The output round-trips through the parser and uses a
+// stable order so recorded routes have deterministic text.
+std::string pad_button_names(uint32_t mask);
+
 // Parse ';'- or newline-separated entries. An entry whose time token starts with 'f' is
 // FRAME-anchored: "f300:cross" fires at flip 300 since the first poll. Both anchors accept explicit
 // ranges ("3-4.5:cross", "f300-340:cross"); '#' starts a comment. Malformed entries and entries with

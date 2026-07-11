@@ -122,6 +122,26 @@ uint32_t pad_button_by_name(const std::string& n) {
     return 0;
 }
 
+std::string pad_button_names(uint32_t mask) {
+    static constexpr struct { uint32_t bit; const char* name; } names[] = {
+        {SCE_PAD_BUTTON_UP, "up"}, {SCE_PAD_BUTTON_DOWN, "down"},
+        {SCE_PAD_BUTTON_LEFT, "left"}, {SCE_PAD_BUTTON_RIGHT, "right"},
+        {SCE_PAD_BUTTON_CROSS, "cross"}, {SCE_PAD_BUTTON_CIRCLE, "circle"},
+        {SCE_PAD_BUTTON_SQUARE, "square"}, {SCE_PAD_BUTTON_TRIANGLE, "triangle"},
+        {SCE_PAD_BUTTON_L1, "l1"}, {SCE_PAD_BUTTON_R1, "r1"},
+        {SCE_PAD_BUTTON_L2, "l2"}, {SCE_PAD_BUTTON_R2, "r2"},
+        {SCE_PAD_BUTTON_L3, "l3"}, {SCE_PAD_BUTTON_R3, "r3"},
+        {SCE_PAD_BUTTON_OPTIONS, "options"},
+    };
+    std::string result;
+    for (const auto& name : names) {
+        if (!(mask & name.bit)) continue;
+        if (!result.empty()) result += '+';
+        result += name.name;
+    }
+    return result;
+}
+
 std::vector<PadScriptEntry> parse_pad_script(const std::string& spec) {
     std::vector<PadScriptEntry> v;
     size_t i = 0;
