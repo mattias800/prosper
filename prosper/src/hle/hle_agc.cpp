@@ -1252,6 +1252,19 @@ HLE(agc_patch_release_mem_addr) {  // 0fWWK5uG9rQ (cmd, address): ReleaseMem pay
     return 0;
 }
 
+// sceAgcDriverGetResourceRegistrationMaxNameLength. Dead Cells asks for this before formatting
+// every resource name into a dynamic stack buffer. The generic success stub left *out untouched;
+// stale stack data became a multi-gigabyte alloca and faulted at eboot+0x172cebd (#539). Its
+// registration configuration passes 0xfc as the maximum, matching the driver-visible limit here.
+// The error value is inherited from the PS4 resource-registration ABI; PS5 retains the API family.
+// CONFIDENCE: HIGH on the pointer/output contract and 0xfc value (live caller + core), MED on error.
+HLE(agc_driver_get_resource_registration_max_name_length) {
+    if (!a0)
+        return (uint64_t)(int64_t)(int32_t)0x80D19013u;
+    *(uint32_t*)(uintptr_t)a0 = 0xfcu;
+    return 0;
+}
+
 // sceAgcDcbDispatchDirect (NID k3GhuSNmBLU) — compute dispatch. RE'd from the guest wrapper
 // eboot+0x220ede0: it reserves Dcb space from the bound CS shader's scratch needs, reads the
 // shader's specials->dispatch_modifier (eboot+0x5999750 = [[sub0.shader]+0x28]+0x10) and calls
@@ -1271,6 +1284,7 @@ HLE(agc_dcb_dispatch_direct) {  // (buf, tg_x, tg_y, tg_z, modifier)
 void register_agc_hle() {
     #define RN(nid, fn) Hle::register_fn(nid, (HleFn)(fn), nid)
     RN("f3dg2CSgRKY", agc_create_shader);   // sceAgcCreateShader — populates the shader registry
+    RN("uJziRsODk1c", agc_driver_get_resource_registration_max_name_length);
     RN("V++UgBtQhn0", agc_get_data_packet_payload);          // data packet -> register-bank payload
     RN("n2fD4A+pb+g", agc_cb_set_sh_register_range_direct);  // SET_SH_REG range packet
     RN("D9sr1xGUriE", agc_create_prim_state);                // prim registers from gs specials
