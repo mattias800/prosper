@@ -759,7 +759,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         if (sit != g_rtt.end() && sit->second.w == gw && sit->second.h == gh &&
                             sit->second.rgba.size() == (size_t)gw * gh * 4) seed = sit->second.rgba.data(); }
                     std::vector<uint8_t> gpx = prosper::test::render_draws_rgba(
-                        build_bds(render_pass), gw, gh, seed, clear_for(render_pass));
+                        build_bds(render_pass), gw, gh, seed, clear_for(render_pass), true);
                     if (base && !gpx.empty()) { RttSurf& s = g_rtt[base]; s.rgba = gpx; s.w = gw; s.h = gh; }
                     bool is_vo = false;
                     for (int i = 0; i < vo_n && !is_vo; i++) is_vo = base && base == prosper_vo_buffer_addr(i);
@@ -816,7 +816,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 // Single-framebuffer path: render_draws_rgba composites every draw into ONE framebuffer.
                 std::vector<const prosper::gpu::DrawItem*> all; all.reserve(items.size());
                 for (const auto& it : items) all.push_back(&it);
-                px = prosper::test::render_draws_rgba(build_bds(all), w, h, nullptr, clear_for(all));
+                px = prosper::test::render_draws_rgba(build_bds(all), w, h, nullptr, clear_for(all), true);
                 // RTT (#167): cache these rendered pixels under this submit's render-target base, so a later
                 // composite pass that samples that address gets the scene we drew (not empty guest memory).
                 if (rtt_on && !px.empty()) {
