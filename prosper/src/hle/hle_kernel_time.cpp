@@ -289,6 +289,10 @@ HLE(k_usleep)   { uint64_t us = a0; struct timespec ts{ (time_t)(us / 1000000), 
 // infinite busy-sleep. We always sleep the full duration, so return 0 (Kyty KernelSleep returns OK/0).
 HLE(k_sleep_s)  { struct timespec ts{ (time_t)a0, 0 }; nanosleep(&ts, nullptr); return 0; }
 HLE(k_nanosleep){ if (a0) nanosleep((const struct timespec*)P(a0), a1 ? (struct timespec*)P(a1) : nullptr); return 0; }
+// Guest-visible process id. Keep it stable across host runs and distinct from the kernel's
+// special pid 0; shadPS4 uses the same 0xBAD1 compatibility pid. Returning generic-stub success
+// (zero) violates POSIX and can collapse per-process paths/ownership keys. CONFIDENCE: HIGH.
+HLE(k_getpid)   { return 0xbad1; }
 
 // sceKernelGettimezone(struct timezone* tz) = { int tz_minuteswest; int tz_dsttime }. Was MISSING -> the
 // generic stub left the out-struct uninitialized (the #82/#190 uninit-out class). We present a UTC clock
@@ -1066,6 +1070,7 @@ void register_kernel_time_hle() {
     R("sceKernelUsleep", k_usleep);   R("usleep", k_usleep);
     R("sceKernelSleep", k_sleep_s);   R("sleep", k_sleep_s);
     R("sceKernelNanosleep", k_nanosleep);  R("nanosleep", k_nanosleep);  R("_nanosleep", k_nanosleep);
+    R("getpid", k_getpid);
     R("sceKernelGettimezone", k_gettimezone);   // was MISSING -> uninitialized tz out-struct
     R("sceKernelClockGetres", k_clock_getres);  R("clock_getres", k_clock_getres);
     R("clock_settime", k_ok);   R("sceKernelClockSettime", k_ok);   // guest clock is read-only here

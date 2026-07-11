@@ -31,6 +31,7 @@ int main() {
         "sceKernelIsStack", "scePthreadGetschedparam",
         // time / event queues
         "sceKernelClockGettime", "sceKernelUsleep", "sceKernelCreateEqueue", "sceKernelWaitEqueue",
+        "getpid",
         // services / dialogs
         "sceUserServiceGetInitialUser", "scePadOpen", "sceMsgDialogUpdateStatus",
         "sceSystemServiceHideSplashScreen",
@@ -50,6 +51,11 @@ int main() {
         uint64_t v = fn(0, 0, 0, 0, 0, 0);
         if (v != 1) { printf("  [FAIL] __ctype_get_mb_cur_max returned %llu, want 1 (the value, not a pointer)\n", (unsigned long long)v); fails++; }
     } else { printf("  [FAIL] not registered: __ctype_get_mb_cur_max\n"); fails++; }
+
+    if (HleFn fn = Hle::lookup(nid_hash("getpid"))) {
+        uint64_t v = fn(0, 0, 0, 0, 0, 0);
+        if (v == 0) { printf("  [FAIL] getpid returned kernel-special pid 0\n"); fails++; }
+    } else { printf("  [FAIL] not registered: getpid\n"); fails++; }
 
     if (fails) { printf("== FAIL: %d function(s) not registered ==\n", fails); return 1; }
     printf("== PASS: all %zu checked HLE functions registered ==\n", sizeof(names)/sizeof(names[0]) + 1);
