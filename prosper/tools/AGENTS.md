@@ -55,6 +55,10 @@ offscreen target dimensions.
 
 Use `gpu_replay --inspect-only` to print fixed-function state, native color-target dimensions, resource
 hashes, explicit clear intent, guest depth/stencil surface identities, and raw stencil-op provenance.
+The draw header also reports raster state as `raster=cull/front-face/polygon-mode`, using Vulkan enum
+values. `PROSPER_NO_CULL=1` disables culling; `PROSPER_FLIP_FRONT_FACE=1` preserves the cull mode and
+toggles only the resolved winding convention. The latter is useful for isolating `PA_SU_SC_MODE_CNTL`
+translation without the overdraw introduced by disabling culling entirely.
 Use `gpu_replay --validate` to reflect every draw's statically used VS/PS descriptor interface and validate it
 against the captured runtime resource tables without initializing Vulkan. It exits nonzero for malformed SPIR-V,
 stage/set mismatches, missing or duplicate bindings, wrong descriptor classes, or statically provable undersized

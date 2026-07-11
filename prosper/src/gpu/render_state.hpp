@@ -173,10 +173,9 @@ struct ResolvedPipelineState {
     // backend drops them straight in. Defaults reproduce the prior hardcode (no cull, CCW front, fill),
     // so a draw that never programs the register — and every test building a ResolvedPipelineState
     // directly — is byte-identical. cull_mode == VkCullModeFlags (0=NONE,1=FRONT,2=BACK,3=FRONT_AND_BACK);
-    // front_face == VkFrontFace (0=CW,1=CCW); polygon_mode == VkPolygonMode (0=FILL,1=LINE,2=POINT).
+    // front_face == VkFrontFace (0=CCW,1=CW); polygon_mode == VkPolygonMode (0=FILL,1=LINE,2=POINT).
     uint32_t cull_mode    = 0;   // VK_CULL_MODE_NONE
-    uint32_t front_face   = 1;   // VK_FRONT_FACE_COUNTER_CLOCKWISE (guest FACE=0 default; matches the
-                                 // negative-height flipped viewport that already renders correct-facing geometry)
+    uint32_t front_face   = 0;   // VK_FRONT_FACE_COUNTER_CLOCKWISE / guest FACE=0
     uint32_t polygon_mode = 0;   // VK_POLYGON_MODE_FILL
 };
 

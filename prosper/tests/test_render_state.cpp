@@ -167,11 +167,11 @@ int main() {
     }
 
     // #456: PA_SU_SC_MODE_CNTL -> cull/front-face/polygon-mode. Absent (the sample stream) -> the prior
-    // hardcode: CULL_NONE(0) / CCW-front(1) / FILL(0). Programmed fields resolve to the Vk enumerators.
+    // hardcode: CULL_NONE(0) / CCW-front(0) / FILL(0). Programmed fields resolve to the Vk enumerators.
     CHECK(rs.pa_su_sc_mode_cntl == 0u, "no PA_SU_SC_MODE_CNTL in the sample stream");
     {
         ResolvedPipelineState pd = resolve_pipeline_state(rs);
-        CHECK(pd.cull_mode == 0u && pd.front_face == 1u && pd.polygon_mode == 0u,
+        CHECK(pd.cull_mode == 0u && pd.front_face == 0u && pd.polygon_mode == 0u,
               "absent PA_SU_SC_MODE_CNTL -> CULL_NONE + CCW + FILL (prior default preserved)");
         RenderState r2 = rs;
         r2.pa_su_sc_mode_cntl = (1u << 1);   // CULL_BACK
@@ -179,7 +179,7 @@ int main() {
         r2.pa_su_sc_mode_cntl = (1u << 0) | (1u << 1);   // CULL_FRONT | CULL_BACK
         CHECK(resolve_pipeline_state(r2).cull_mode == 3u, "CULL_FRONT|CULL_BACK -> FRONT_AND_BACK(3)");
         r2.pa_su_sc_mode_cntl = (1u << 2);   // FACE = 1 (CW is front)
-        CHECK(resolve_pipeline_state(r2).front_face == 0u, "FACE=1 -> VkFrontFace CLOCKWISE(0)");
+        CHECK(resolve_pipeline_state(r2).front_face == 1u, "FACE=1 -> VkFrontFace CLOCKWISE(1)");
         r2.pa_su_sc_mode_cntl = (1u << 3) | (1u << 5);   // POLY_MODE enabled + FRONT_PTYPE=1 (lines)
         CHECK(resolve_pipeline_state(r2).polygon_mode == 1u, "POLY_MODE lines -> VK_POLYGON_MODE_LINE(1)");
     }
