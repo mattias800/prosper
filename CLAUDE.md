@@ -86,11 +86,18 @@ Resource-producer history (#524) identified the exact writer; implementing the o
 `CB_COLOR0_ATTRIB2` target dimensions (#526/#527) produces the real LUT, preserves it through the original
 grading shader, and yields a visible first-level front buffer without diagnostic resource substitution.
 
-The immediate frontier is ordinary gameplay progression: run the saved route without diagnostic substitutions,
-identify the next first-bad contract, and file a narrowly scoped issue with a retained capture or provenance
-trace. `PROSPER_DESCRIPTOR_VALIDATE=strict|poison` and `gpu_replay --validate` provide the shader/resource
-contract gate tracked by #515. Do not restart the superseded depth, vertex-fetch, geometry, palette, or tiling
-hypotheses without contradictory new evidence.
+Two later fixes complete the hardware-oracle composition and restore boot progression: #534 corrects reversed
+`VkFrontFace` enum translation, recovering the foreground tree, terrain/platforms, waterline, and structures;
+#541 tracks depth and stencil validity independently in persistent D32S8 surfaces, so stencil-only logo use
+cannot poison the intro's reverse-Z depth plane. A clean scripted route produced 180 native 1920×1080 frames,
+and the user confirmed the first-level graphics match the hardware reference. #530 and #540 are closed.
+
+The immediate frontier is cross-title breadth plus repeatable tooling: stabilize *Dead Cells* AGC startup
+(#539), finish reusable input checkpoints and multi-title snapshots (#302/#248), then apply `.prgcap` replay
+and strict descriptor validation to an existing 3D Unity/Unreal workload.
+`PROSPER_DESCRIPTOR_VALIDATE=strict|poison` and `gpu_replay --validate` are landed capabilities from #515.
+Do not restart the superseded
+Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without contradictory new evidence.
 
 ## How to work here
 
@@ -119,7 +126,7 @@ hypotheses without contradictory new evidence.
   `/mnt/c/Users/matti/repos/ps5ys/PPSA24651-app0` (gitignored — **never commit it**).
   ```bash
   cd /mnt/c/Users/matti/repos/ps5ys/prosper/build-linux
-  cmake --build . -j8 && ctest        # 45/45 expected green on Linux
+  cmake --build . -j8 && ctest        # 85/85 expected green on Linux
   ```
 - **Verification is agentic-first / programmatic** (`docs/VERIFICATION.md`): ctest exit code is truth;
   shaders are `spirv-val`-gated; rendered frames are pixel/CRC-asserted or dumped to BMP. No manual

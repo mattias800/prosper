@@ -1,8 +1,9 @@
 # Messenger black-render investigation
 
-This is the canonical status for the Messenger gameplay-render failure (#300 / #522).
-The formerly invisible save-game list (#299) is visible on current master and that issue is closed.
-GitHub issues own live findings; this document records the current evidence boundary and next experiment.
+This is the canonical completed record for the Messenger gameplay-render failure (#300 / #522).
+The formerly invisible save-game list (#299), missing foreground (#530), and boot-to-intro regression (#540)
+are fixed and closed. GitHub issues own live findings; this document preserves the evidence boundary that
+connected each visible failure to a specific replay, renderer contract, and regression.
 
 ## Current conclusion (2026-07-11)
 
@@ -43,10 +44,24 @@ and resource-producer provenance (#524) established this causal chain:
    calls, eight distinct native texture pointers, and the corresponding live descriptor addresses all change.
    That transition eventually produces the expected colored scene before the grading pass erases it.
 
-The black first-level root cause was therefore a missing shader instruction plus loss of per-target dimensions,
+The original black first-level root cause was therefore a missing shader instruction plus loss of per-target dimensions,
 not depth, a stuck palette fade, compute LUT baking, or detiling of the 256x16 palette. The fix merged as #528
 (`e5fce22`) after a clean exact-route run without the identity-LUT substitution: the LUT, grading output, and
 selected VideoOut front buffer remained nonblack across consecutive flips. #300 and #522 are closed.
+
+The hardware oracle then exposed two independent follow-up defects hidden by the black frame. #534
+(`3941533`) fixes reversed Vulkan front-face enum values; retaining culling with the corrected winding restores
+the foreground canopy/tree, rock slopes, player platform, waterline structures, and right-side terrain that
+were absent from the first visible frame. #541 (`ded4a60`) separates persistent D32S8 layout initialization
+from logical depth and stencil validity; earlier stencil-only `ALWAYS`/read-only use no longer makes untouched
+depth contents valid, so the later intro `GEQUAL` draw initializes reverse-Z depth correctly instead of loading
+the logo fallback and rendering black.
+
+Final validation used a fresh save, the recorded gamepad route, no rendering substitutions, and 180 normal
+screenshots at one-second intervals at native 1920×1080. The sequence covers startup through the first-level
+dialogue with the full hardware-reference composition, and the user confirmed the graphics look correct.
+#530 and #540 are closed. Timing of the fade remains an observation, not a diagnosed emulator defect: the
+screenshot tool samples the current buffer on wall time and can repeat frames under synchronous rendering.
 
 The old bindless vertex-fetch frontier is solved, and `NEXT_STEP_VERTEX_FETCH.md` is historical. Earlier
 #300 claims about texture decode, alpha, transform collapse, render-target propagation, and a missing
@@ -116,4 +131,5 @@ pre-blend fragment output, and final attachment output in a standard report. Exi
 Do not start another depth/stencil, vertex-fetch, palette-fade, compute, tiling, or whole-stack rewrite from the
 historical #300 comments. The producer, missing opcode, target extent, consumer, and front-buffer result are now
 connected by one live trace. Preserve that chain as the regression boundary and use the same provenance-first
-method for the next title failure.
+method for the next title failure. Active work has moved to Dead Cells startup stability (#539), reusable
+checkpoints/snapshots (#302/#248), and then existing 3D Unity/Unreal workloads.
