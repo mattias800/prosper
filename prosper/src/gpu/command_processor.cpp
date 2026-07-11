@@ -257,6 +257,55 @@ static bool ptr_like(uint64_t v) {
     return (v >= 0x1000000000ull && v < 0x1200000000ull) ||
            (v >= 0x2000000000ull && v < 0x2100000000ull);
 }
+// #312 POOLSHIFT tripwire: the dominant residual crash reads a BYTE-SHIFTED pool-info pointer
+// (`0x20015f00` == `0x20015f0000 >> 8`) at eboot+0x2316c91. A qword is "byte-shifted pool ptr" when
+// its top 32 bits are 0 and (v<<8) lands in the FPoolInfo metadata region [0x2000000000,0x2100000000)
+// — i.e. an 8-byte pool pointer written one byte too LOW (aligned read drops the low byte). This
+// catches ANY GPU-path write that CREATES that shape in the act, with the packet builder callsite.
+static inline bool is_byteshift_poolptr(uint64_t v) {
+    if (v >> 32) return false;                 // must fit in low 32 bits (top byte(s) were dropped)
+    if (v < 0x100000) return false;            // ignore tiny ints
+    uint64_t s = v << 8;
+    return s >= 0x2000000000ull && s < 0x2100000000ull;
+}
+// A full (unshifted) pool-info pointer as a WRITE PAYLOAD is itself anomalous for a GPU fence/label
+// write (fence values are small ints / timestamps), so flag that too.
+static inline bool is_poolinfo_ptr(uint64_t v) {
+    return v >= 0x2000000000ull && v < 0x2100000000ull;
+}
+// Scan the just-written span [dst-8, dst+bytes+8) for a byte-shifted pool pointer and log the GPU
+// writer (kind + dst + packet builder addr) if found. Bounded; small writes only (the label/pointer
+// writes — large fills are memset-0). `payload` is the value the packet wrote (for payload flagging).
+static void poolshift_check(const char* kind, uint64_t dst, uint64_t bytes, uint64_t payload, uint64_t pkt) {
+    // Gated OFF by default (PROSPER_POOLSHIFT=1 to arm): the per-write span scan adds cost to every
+    // fence/label write, so keep it out of the Messenger/default path. It found ZERO hits across
+    // many DOLL crashing runs — decisive evidence the GPU write path never creates the byte-shifted
+    // 0x20015f00 pool pointer — so it stays as diagnostic-only instrumentation for the next session.
+    static const bool on = getenv("PROSPER_POOLSHIFT") != nullptr;
+    if (!on) return;
+    static std::atomic<int> n{0};
+    if (n.load(std::memory_order_relaxed) >= 128) return;
+    if (is_byteshift_poolptr(payload) || is_poolinfo_ptr(payload)) {
+        if (n.fetch_add(1) < 128)
+            fprintf(stderr, "[agc] POOLSHIFT-PAYLOAD kind=%s dst=0x%llx bytes=%llu payload=0x%llx pkt=eboot+0x%llx t=%llums\n",
+                    kind, (unsigned long long)dst, (unsigned long long)bytes,
+                    (unsigned long long)payload, (unsigned long long)pkt, (unsigned long long)now_ms());
+    }
+    if (bytes > 256) return;                    // cap the scan (label/pointer writes are small)
+    uint64_t lo = (dst >= 8 ? dst - 8 : dst) & ~7ull;
+    uint64_t hi = dst + bytes + 8;
+    for (uint64_t a = lo; a < hi; a += 8) {
+        uint64_t q = peek_qword(a);
+        if (is_byteshift_poolptr(q)) {
+            bool inspan = (a + 7 >= dst) && (a < dst + bytes);   // did THIS write touch these bytes?
+            if (n.fetch_add(1) < 128)
+                fprintf(stderr, "[agc] POOLSHIFT-STOMP kind=%s @0x%llx=0x%llx (<<8=0x%llx) dst=0x%llx bytes=%llu inspan=%d payload=0x%llx pkt=eboot+0x%llx t=%llums\n",
+                        kind, (unsigned long long)a, (unsigned long long)q, (unsigned long long)(q << 8),
+                        (unsigned long long)dst, (unsigned long long)bytes, inspan,
+                        (unsigned long long)payload, (unsigned long long)pkt, (unsigned long long)now_ms());
+        }
+    }
+}
 // #312: report one suspicious fence write with its build-journal verdict. kindtag: "REL1" etc.
 //
 // RUN-2026-07-10 FINDING (this instrumentation's own history): the historical "~96 pointer-valued
@@ -366,6 +415,7 @@ static void honor_eop_write(const Pm4Command& c) {
                   }
                   uint32_t v = (uint32_t)c.rel_value; memcpy(dst, &v, sizeof v);
                   ring_record(c.rel_addr, v, 4, 1, pkt_addr(c));
+                  poolshift_check("REL1", c.rel_addr, 4, c.rel_value, pkt_addr(c));
                   label_hist_rel_exec(c.rel_addr, pre); break; }
         case 2: { if (!c.rel_value_valid) return;
                   // #312: the same freelist-stomp guard as the 32-bit path. An 8-byte value-1 fence
@@ -381,7 +431,8 @@ static void honor_eop_write(const Pm4Command& c) {
                       return;
                   }
                   uint64_t v = c.rel_value;           memcpy(dst, &v, sizeof v);
-                  ring_record(c.rel_addr, v, 8, 1, pkt_addr(c)); break; }
+                  ring_record(c.rel_addr, v, 8, 1, pkt_addr(c));
+                  poolshift_check("REL2", c.rel_addr, 8, c.rel_value, pkt_addr(c)); break; }
         case 3: { uint64_t v = gpu_clock64();         memcpy(dst, &v, sizeof v);
                   ring_record(c.rel_addr, v, 8, 1, pkt_addr(c)); break; }
         // Unknown selector: LOG AND SKIP. The old default wrote the 64-bit value for ANY
@@ -462,6 +513,7 @@ static void honor_dma_data(const Pm4Command& c) {
         if (i < c.dd_bytes) memcpy(dst + i, &v32, c.dd_bytes - i);
     }
     ring_record(c.dd_dst, c.dd_src, (uint8_t)(c.dd_bytes > 255 ? 255 : c.dd_bytes), 4, pkt_addr(c));
+    poolshift_check("DMA", c.dd_dst, c.dd_bytes, c.dd_src, pkt_addr(c));
     if (c.dd_bytes <= 8) label_hist_dma_exec(c.dd_dst, pre_dma);   // #312 protocol history
     if (getenv("PROSPER_GFXLOG"))
         fprintf(stderr, "[agc]   DmaData [0x%llx] := 0x%x (%u bytes)\n",
@@ -481,6 +533,7 @@ static void honor_write_data(const Pm4Command& c) {
     }
     memcpy((void*)(uintptr_t)c.wd_addr, c.wd_data, (size_t)c.wd_num * 4);
     ring_record(c.wd_addr, c.wd_data[0], (uint8_t)(c.wd_num * 4 > 255 ? 255 : c.wd_num * 4), 3, pkt_addr(c));
+    poolshift_check("WDATA", c.wd_addr, (uint64_t)c.wd_num * 4, c.wd_num ? c.wd_data[0] : 0, pkt_addr(c));
     if (getenv("PROSPER_GFXLOG"))
         fprintf(stderr, "[agc]   WriteData [0x%llx] %u dwords (first=0x%08x)\n",
                 (unsigned long long)c.wd_addr, c.wd_num, c.wd_data[0]);
