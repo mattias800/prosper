@@ -248,7 +248,15 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     const VkImageAspectFlags DASPECT = VK_IMAGE_ASPECT_DEPTH_BIT |
                                        (format_has_stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
     VkImage dimg = VK_NULL_HANDLE; VkDeviceMemory dmem = VK_NULL_HANDLE; VkImageView dview = VK_NULL_HANDLE;
-    bool ds_was_initialized = false;
+    bool ds_layout_initialized = false;
+    bool depth_was_valid = false, stencil_was_valid = false;
+    bool depth_used_meaningfully = false;
+    for (const auto& d : draws) {
+        if (!d.ps) continue;
+        depth_used_meaningfully |= d.ps->depth_clear_enable || d.ps->depth_write_enable ||
+            (d.ps->depth_test_enable && d.ps->depth_compare_op != VK_COMPARE_OP_ALWAYS &&
+                                        d.ps->depth_compare_op != VK_COMPARE_OP_NEVER);
+    }
     struct DsKey {
         uint64_t dr, dw, sr, sw; uint32_t w, h, fmt;
         bool operator==(const DsKey& o) const {
@@ -263,8 +271,14 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             mix(k.dr); mix(k.dw); mix(k.sr); mix(k.sw); mix(k.w); mix(k.h); mix(k.fmt); return h;
         }
     };
-    struct DsImage { VkImage image = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE;
-                     VkImageView view = VK_NULL_HANDLE; bool initialized = false; };
+    struct DsImage {
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;
+        bool layout_initialized = false;
+        bool depth_valid = false;
+        bool stencil_valid = false;
+    };
     static std::unordered_map<DsKey, DsImage, DsKeyHash> ds_cache;
     DsImage* cached_ds = nullptr;
     DsKey ds_key{};
@@ -273,7 +287,42 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                   identity->stencil_read_base, identity->stencil_write_base, W, H, (uint32_t)DFMT};
         cached_ds = &ds_cache[ds_key];
         dimg = cached_ds->image; dmem = cached_ds->memory; dview = cached_ds->view;
-        ds_was_initialized = cached_ds->initialized;
+        ds_layout_initialized = cached_ds->layout_initialized;
+        depth_was_valid = cached_ds->depth_valid;
+        stencil_was_valid = cached_ds->stencil_valid;
+    }
+    if (getenv("PROSPER_DSLOG")) {
+        static uint64_t call_id = 0;
+        const uint64_t id = ++call_id;
+        fprintf(stderr,
+                "[ds] call=%llu size=%ux%u draws=%zu use=%d/%d persistent=%d valid=%d/%d/%d "
+                "key=%llx/%llx/%llx/%llx fmt=%u initial=%g/%u\n",
+                (unsigned long long)id, W, H, draws.size(), (int)use_depth, (int)use_stencil,
+                (int)persistent_ds, (int)ds_layout_initialized,
+                (int)depth_was_valid, (int)stencil_was_valid,
+                (unsigned long long)ds_key.dr, (unsigned long long)ds_key.dw,
+                (unsigned long long)ds_key.sr, (unsigned long long)ds_key.sw,
+                ds_key.fmt, depth_clear, stencil_clear);
+        for (size_t i = 0; i < draws.size(); ++i) {
+            const auto* ps = draws[i].ps;
+            if (!ps) {
+                fprintf(stderr, "[ds] call=%llu draw=%zu state=none\n",
+                        (unsigned long long)id, i);
+                continue;
+            }
+            fprintf(stderr,
+                    "[ds] call=%llu draw=%zu bases=%llx/%llx/%llx/%llx "
+                    "depth=%d/%d/op%u clear=%d/%g stencil=%d clear=%d/%u\n",
+                    (unsigned long long)id, i,
+                    (unsigned long long)ps->depth_read_base,
+                    (unsigned long long)ps->depth_write_base,
+                    (unsigned long long)ps->stencil_read_base,
+                    (unsigned long long)ps->stencil_write_base,
+                    (int)ps->depth_test_enable, (int)ps->depth_write_enable,
+                    ps->depth_compare_op, (int)ps->depth_clear_enable, ps->depth_clear_value,
+                    (int)ps->stencil_enable, (int)ps->stencil_clear_enable,
+                    ps->stencil_clear_value);
+        }
     }
 
     VkImageCreateInfo imgci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -322,15 +371,18 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     // A guest-identified DS surface survives calls. New attachments get a defined initial value;
     // existing ones LOAD. Explicit DB_RENDER_CONTROL clears execute at their draw below, preserving
     // command order instead of being promoted to an unconditional pass-start clear (#518).
-    att[1].loadOp = ds_was_initialized ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
+    // Depth and stencil have independent guest lifetimes even when Vulkan stores them in one D32S8
+    // image. Using stencil must not make an untouched depth plane valid: Unity can stencil-prime a
+    // surface under an ALWAYS, read-only depth test and only later use reverse-Z depth (#540).
+    att[1].loadOp = depth_was_valid ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
     att[1].storeOp = persistent_ds ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
     att[1].stencilLoadOp = format_has_stencil
-        ? (ds_was_initialized ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR)
+        ? (stencil_was_valid ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR)
         : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     att[1].stencilStoreOp = (persistent_ds && format_has_stencil)
         ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    att[1].initialLayout = ds_was_initialized ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
-                                               : VK_IMAGE_LAYOUT_UNDEFINED;
+    att[1].initialLayout = ds_layout_initialized ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                                                  : VK_IMAGE_LAYOUT_UNDEFINED;
     att[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     VkAttachmentReference ar{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
     VkAttachmentReference dar{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
@@ -749,7 +801,11 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
     VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VkFence fence; vkCreateFence(dev, &fci, nullptr, &fence);
     vkQueueSubmit(queue, 1, &si, fence); vkWaitForFences(dev, 1, &fence, VK_TRUE, 5ull * 1000 * 1000 * 1000);
-    if (cached_ds) cached_ds->initialized = true;
+    if (cached_ds) {
+        cached_ds->layout_initialized = true;
+        cached_ds->depth_valid |= use_depth && depth_used_meaningfully;
+        cached_ds->stencil_valid |= use_stencil;
+    }
 
     out.resize(bytes);
     void* mp = nullptr; vkMapMemory(dev, bmem, 0, bytes, 0, &mp);

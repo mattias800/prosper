@@ -112,6 +112,40 @@ int main() {
         CHECK(cc && cc[1] < 0x80, "explicit guest stencil clear executes in order before the draw");
     }
 
+    // Initializing one aspect of a combined D32S8 image must not make the other aspect valid. Unity
+    // first uses this surface for stencil while depth is ALWAYS and read-only, then changes to GEQUAL.
+    // The later draw must initialize the still-unused depth plane from its reverse-Z clear value (0),
+    // rather than LOADing the depth fallback (1) used while only stencil contents mattered (#540).
+    {
+        ResolvedPipelineState stencil_first = opaque;
+        stencil_first.color_write_mask = 0;
+        stencil_first.depth_test_enable = true;
+        stencil_first.depth_compare_op = 7; // ALWAYS
+        stencil_first.depth_clear_value = 1.0f;
+        stencil_first.depth_read_base = stencil_first.depth_write_base = 0x33330000;
+        stencil_first.stencil_enable = true;
+        stencil_first.stencil_compare_op[0] = stencil_first.stencil_compare_op[1] = 7; // ALWAYS
+        stencil_first.stencil_pass_op[0] = stencil_first.stencil_pass_op[1] = 2;       // REPLACE
+        stencil_first.stencil_op_val[0] = stencil_first.stencil_op_val[1] = 1;
+        stencil_first.stencil_read_base = stencil_first.stencil_write_base = 0x44440000;
+
+        ResolvedPipelineState depth_later = opaque;
+        depth_later.depth_test_enable = true;
+        depth_later.depth_compare_op = 6; // GEQUAL
+        depth_later.depth_clear_value = 0.0f;
+        depth_later.depth_read_base = depth_later.depth_write_base = 0x33330000;
+        depth_later.stencil_read_base = depth_later.stencil_write_base = 0x44440000;
+
+        prosper::test::BackendDraw s; s.vs = vs; s.fs = red; s.ps = &stencil_first; s.vcount = 3;
+        prosper::test::BackendDraw d; d.vs = vs; d.fs = green; d.ps = &depth_later; d.vcount = 3;
+        (void)prosper::test::render_draws_rgba({s}, W, H, nullptr, nullptr, true);
+        std::vector<uint8_t> initialized =
+            prosper::test::render_draws_rgba({d}, W, H, nullptr, nullptr, true);
+        const uint8_t* c = center(initialized);
+        CHECK(c && c[1] > 0xC0 && c[0] < 0x40,
+              "stencil-only initialization does not poison a later reverse-Z depth plane");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
