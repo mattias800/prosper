@@ -128,7 +128,10 @@ std::vector<PadScriptEntry> parse_pad_script(const std::string& spec) {
         i = (semi == std::string::npos) ? spec.size() : semi + 1;
         size_t colon = tok.find(':');
         if (colon == std::string::npos) continue;
-        double t = atof(tok.substr(0, colon).c_str());
+        std::string head = tok.substr(0, colon);
+        // A leading 'f' marks a FRAME-anchored entry ("f300:cross" -> flip 300); else it's seconds.
+        bool frame_anchored = (!head.empty() && (head[0] == 'f' || head[0] == 'F'));
+        double t = atof(frame_anchored ? head.c_str() + 1 : head.c_str());
         std::string btns = tok.substr(colon + 1);
         uint32_t mask = 0;
         size_t j = 0;
@@ -138,15 +141,22 @@ std::vector<PadScriptEntry> parse_pad_script(const std::string& spec) {
             j = (plus == std::string::npos) ? btns.size() : plus + 1;
             mask |= pad_button_by_name(one);
         }
-        if (mask) v.push_back({t, mask});
+        if (mask) v.push_back({t, mask, frame_anchored});
     }
     return v;
 }
 
-uint32_t pad_script_buttons_at(const std::vector<PadScriptEntry>& script, double elapsed_secs, double hold_secs) {
+uint32_t pad_script_buttons_at(const std::vector<PadScriptEntry>& script, double elapsed_secs, double hold_secs,
+                               int64_t frame_count, int64_t frame_hold) {
     uint32_t mask = 0;
-    for (const auto& e : script)
-        if (elapsed_secs >= e.t_secs && elapsed_secs < e.t_secs + hold_secs) mask |= e.button_mask;
+    for (const auto& e : script) {
+        if (e.frame_anchored) {
+            int64_t f = (int64_t)e.t_secs;   // frame number lives in t_secs for frame-anchored entries
+            if (frame_count >= 0 && frame_count >= f && frame_count < f + frame_hold) mask |= e.button_mask;
+        } else {
+            if (elapsed_secs >= e.t_secs && elapsed_secs < e.t_secs + hold_secs) mask |= e.button_mask;
+        }
+    }
     return mask;
 }
 
