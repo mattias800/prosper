@@ -1,5 +1,12 @@
 # Input replay & checkpoints — reaching a game state to reproduce a bug
 
+> **Status (2026-07-11): design plus inline frame anchoring landed; the rest remains open in #302.**
+> Current master supports inline `PROSPER_PAD_SCRIPT` entries anchored as `fN:`/`fA-B:`. PR #301 merged
+> only this design document; later branch commits for `@file` routes, recording, checked-in scripts,
+> `PROSPER_DET_CLOCK`, and pad-read screenshot checkpoints did not merge. Issue comments reporting those
+> steps as landed describe `feat/input-replay`, not current master. Re-verify and land them as focused
+> current-master changes before using them as a reproducibility guarantee. The original design follows.
+
 ## The problem
 
 Now that titles are becoming playable, a bug is often reported at a *state* — "the shop menu", "level 1 boss", "after the first save". To reproduce or observe it, an agent must **navigate the game to that point** and then apply the full debug arsenal (`PROSPER_GFXLOG`, `PROSPER_DRAWDIAG`, `PROSPER_HWBP`, `boot_trace`, `screenshot`, the app). Hand-driving a controller isn't an option for a headless agent.

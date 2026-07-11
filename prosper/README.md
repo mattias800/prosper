@@ -28,8 +28,13 @@ makes the project possible without console keys. Dumps are user-supplied and git
 - ✅ **The Messenger renders:** intro cutscene (dozens of distinct animating frames), title screen with
   readable text, working gamepad input, and progression into gameplay level loading — all asserted by
   a golden-image snapshot guard.
-- 🚧 **Active frontiers:** full multi-pass scene compositing for the 3D gameplay view, broader shader
-  coverage, and the Unreal title's title-screen composite (see `docs/`).
+- 🚧 **Active frontiers:** revision-locked capture/replay of the black Messenger gameplay frame,
+  strict shader/resource-interface validation, independent diagnosis of the missing save list, broader
+  shader coverage, and the Unreal title's title-screen composite.
+
+The current Messenger frontier is revision-locked capture/replay of the black gameplay frame, strict
+shader/resource-interface validation, and an independent trace of the save-list failure. See
+[`docs/MESSENGER_BLACK_RENDER.md`](docs/MESSENGER_BLACK_RENDER.md).
 
 See [`docs/ROADMAP.md`](docs/ROADMAP.md), [`docs/GRAPHICS.md`](docs/GRAPHICS.md),
 [`docs/RENDER_LOOP.md`](docs/RENDER_LOOP.md), and [`docs/VERIFICATION.md`](docs/VERIFICATION.md)

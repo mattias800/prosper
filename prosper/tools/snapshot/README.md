@@ -1,44 +1,38 @@
-# Rendering snapshot tests (golden-image, run locally)
+# Rendering Regression Snapshots
 
-Catches rendering regressions in real games: a change that blanks a title, breaks
-a shader recompile, or mis-decodes a texture flips a stored pixel hash. Any agent
-can run it before/after a change.
+This local tool catches real-game rendering regressions. A snapshot can use an
+exact frame hash, or a run-level content metric for titles whose threaded boots
+do not land on a deterministic frame.
 
-**Local only — never CI.** The game dumps are gitignored and must not be
-committed, so this can't run in CI. Only the small pixel **hashes** live in the
-repo (`snapshots.json`) — a hash is a checksum, not game imagery.
+Game dumps and screenshots are local and gitignored, so this does not run in
+CI. Only hashes or content thresholds live in `snapshots.json`.
 
 ## Run
 
 ```bash
-# from prosper/ (build boot_trace first: build-linux/boot_trace)
-python3 tools/snapshot/snapshot.py check           # all snapshots; exit 1 on any diff
-python3 tools/snapshot/snapshot.py check messenger-title
-python3 tools/snapshot/snapshot.py update           # (re)capture baselines after an INTENDED change
-python3 tools/snapshot/snapshot.py verify           # capture twice; confirm a frame is deterministic
-python3 tools/snapshot/snapshot.py list
+# From prosper/, after building build-linux/boot_trace.
+python3 tools/snapshot/snapshot.py check
+python3 tools/snapshot/snapshot.py check messenger-scene
 ```
 
-On a mismatch, `check` writes the offending screenshot + boot log to
-`tools/snapshot/failures/<name>.{bmp,log}` and returns non-zero. Convert the BMP
-to PNG to eyeball it (`python3 -c 'from PIL import Image; Image.open("x.bmp").save("x.png")'`).
+On failure, `check` writes the screenshot and boot log to
+`tools/snapshot/failures/<name>.{bmp,log}` and exits nonzero.
 
-## How it targets a frame
+## Guard Modes
 
-`RENDER_EVERY=1` renders every draw-carrying submit, so `frame_<F>.bmp` is the
-F-th draw submit's render. Pick **F in a stable-content window** — a static
-title/menu loop re-renders the same composite each submit, so its hash is stable.
-Always `verify` a new snapshot's frame before trusting its baseline; if it's
-NON-DETERMINISTIC, move F later (or to a more static screen). Only F ≤ 59 (or
-multiples of 10) are dumped by the renderer.
+- `min_colors`: run for the configured timeout and require the richest rendered
+  frame to reach a distinct-color threshold. The current `messenger-scene`
+  guard uses this mode and tolerates frame timing variance.
+- `frame` plus `hash`: compare one targeted draw-submit frame exactly. Run
+  `verify <name>` before establishing its baseline with `update <name>`.
 
-## Adding a snapshot
+## Adding A Snapshot
 
-Add an entry to `snapshots.json` (`name`, `dump` = the `*-app0` dir under
-`PROSPER_GAME_ROOT`, `frame`, `scale`, optional per-title `env`), then
-`verify` it, then `update` to store the baseline hash.
+Add an entry to `snapshots.json` with `name`, `dump`, `scale`, `timeout`, optional
+per-title `env`, and either a justified `min_colors` threshold or a verified
+`frame`/`hash` baseline.
 
-## Env
+## Environment
 
-- `PROSPER_GAME_ROOT`  — dir holding the `*-app0` dumps (default `/mnt/c/Users/matti/repos/ps5ys`)
-- `PROSPER_BOOT_TRACE` — boot_trace path (default `<prosper>/build-linux/boot_trace`)
+- `PROSPER_GAME_ROOT`: directory holding `*-app0` dumps; defaults to the repo.
+- `PROSPER_BOOT_TRACE`: boot_trace path; defaults to `build-linux/boot_trace`.

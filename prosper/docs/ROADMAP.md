@@ -24,9 +24,21 @@ presented, framebuffer CRC == golden" is. Each change adds the check that proves
 
 ---
 
-## Current status (2026-07-05) — at a glance
+## Current status (2026-07-11) - at a glance
 
-*(The milestone log below is a historical, append-only record; this section is the current truth.)*
+- **Messenger renders through gameplay submission:** the former GfxDevice, draw-submission, and
+  bindless vertex-fetch blockers are solved. The intro, title, and menu render; a real multi-pass
+  gameplay frame is submitted, but its scene content remains black. The save-game list is also missing.
+- **No current-master root cause is established:** #300 accumulated contradictory diagnoses on changing
+  revisions, and the former missing binding-9 vertex-color resource was later observed populated while
+  the level remained black. #299 has not been independently traced, so SaveData/HLE remains plausible.
+- **Immediate milestone:** create an immutable local GPU frame capture/replay, then strictly validate the
+  generated SPIR-V descriptor interface against runtime resources. Canonical evidence and next steps are
+  in `docs/MESSENGER_BLACK_RENDER.md` and GitHub issues #299, #300, #514, and #515.
+
+## Historical status (2026-07-05) - retained for the milestone log
+
+*(The milestone log below is a historical, append-only record. Claims in it are not current status.)*
 
 - ✅ **M0–M3 done:** loader (SELF/ELF → relocatable image → multi-module link → NID binding), host
   execution (mmap + import-trap dispatch), and enough libkernel/libc/services that the game boots

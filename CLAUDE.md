@@ -60,16 +60,34 @@ prosper/
 ```
 
 Key docs to orient: `prosper/README.md` (status), `prosper/docs/ROADMAP.md`, `prosper/docs/GRAPHICS.md`,
-`prosper/docs/RENDER_LOOP.md` (the active render frontier log), and
-`prosper/docs/NEXT_STEP_EUD_DESCRIPTORS.md` (the current, precisely-scoped next task).
+`prosper/docs/RENDER_LOOP.md` (the historical render bring-up log), and
+`prosper/docs/MESSENGER_BLACK_RENDER.md` (the current, revisioned Messenger investigation status).
 
-## Current frontier (2026-07)
+## Historical frontier (superseded 2026-07-11)
 
 The game **boots through IL2CPP into Unity's frame loop and submits real GPU draws.** A live Vulkan
 renderer is wired in; the game's **real pixel shader recompiles to valid SPIR-V** and its real descriptors
 + 1920×1080 sampled texture decode correctly. The **one** remaining step to the first rendered frame is
 **bindless-dynamic vertex-fetch resolution** for the vertex shader — fully specified in
-`prosper/docs/NEXT_STEP_VERTEX_FETCH.md`. Start there.
+`prosper/docs/NEXT_STEP_VERTEX_FETCH.md`. This paragraph is historical only.
+
+## Current frontier (2026-07-11)
+
+The game now **boots through IL2CPP, renders its intro/title/menu, and reaches gameplay with real GPU
+draws.** The old bindless vertex-fetch frontier is complete: both shader stages recompile and dynamic
+V#/T#/S# resources resolve on current master. Do **not** start from `NEXT_STEP_VERTEX_FETCH.md`; it is
+retained as a historical bring-up record.
+
+The first gameplay level and the save-game list are still black/missing, but there is no verified
+current-master root cause. The immediate frontier is reproducible diagnosis:
+
+1. Re-establish #299 (save list) and #300 (gameplay) independently with controlled input, savedata,
+   revision, and environment.
+2. Capture the failing GPU submit/frame into a local immutable capsule and replay it without Unity boot.
+3. Validate the generated SPIR-V descriptor interface strictly against runtime resources.
+
+Start with `prosper/docs/MESSENGER_BLACK_RENDER.md` and its linked GitHub issues. Treat claims from old
+captures as historical unless reproduced on the revision under test.
 
 ## How to work here
 
