@@ -146,6 +146,32 @@ int main() {
             CHECK(mismatch < (size_t)W * H / 50, "flipped viewport == default render mirrored vertically");
             CHECK(self_mismatch > (size_t)W * H / 50, "triangle is vertically asymmetric (test not vacuous)");
         }
+
+        // AMD FACE and VkFrontFace use the same numeric convention (0=CCW, 1=CW). The negative-height
+        // viewport mirrors the image without requiring a second semantic inversion here: this clip-CCW
+        // triangle remains front-facing for FACE=0. This catches the reversed VkFrontFace constants that
+        // hid Messenger's foreground while exercising the exact flipped-viewport pipeline combination.
+        st.cx[P::PA_SU_SC_MODE_CNTL] = (1u << 1);   // CULL_BACK, FACE=0 (CCW front)
+        ResolvedPipelineState ccw_front = resolve_pipeline_state(extract_render_state(st));
+        CHECK(ccw_front.cull_mode == 2u && ccw_front.front_face == 0u,
+              "CULL_BACK + FACE=0 resolves to Vulkan BACK + CCW");
+        std::vector<uint8_t> img_ccw = render_triangle_rgba(vert, frag, W, H, &ccw_front);
+        if (img_ccw.size() == (size_t)W*H*4) {
+            const uint8_t* p = &img_ccw[center];
+            CHECK(p[0] > 128 && p[2] < 128,
+                  "negative viewport + FACE=0 retains the CCW triangle");
+        } else { CHECK(false, "FACE=0 cull render produced a frame"); }
+
+        st.cx[P::PA_SU_SC_MODE_CNTL] = (1u << 1) | (1u << 2); // CULL_BACK, FACE=1 (CW front)
+        ResolvedPipelineState cw_front = resolve_pipeline_state(extract_render_state(st));
+        CHECK(cw_front.cull_mode == 2u && cw_front.front_face == 1u,
+              "CULL_BACK + FACE=1 resolves to Vulkan BACK + CW");
+        std::vector<uint8_t> img_cw = render_triangle_rgba(vert, frag, W, H, &cw_front);
+        if (img_cw.size() == (size_t)W*H*4) {
+            const uint8_t* p = &img_cw[center];
+            CHECK(p[2] > 128 && p[0] < 128,
+                  "negative viewport + FACE=1 culls the CCW triangle");
+        } else { CHECK(false, "FACE=1 cull render produced a frame"); }
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
