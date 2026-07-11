@@ -24,6 +24,7 @@ cmake --build build --target screenshot
 
 ```
 screenshot <app0-dir> [--every N] [--count M] [--out DIR] [--timeout SECS]
+           [--warmup-seconds S] [--warmup-submits N]
 ```
 
 | Option | Default | Meaning |
@@ -34,9 +35,17 @@ screenshot <app0-dir> [--every N] [--count M] [--out DIR] [--timeout SECS]
 | `--count M` | 30 | Number of screenshots, then exit |
 | `--out DIR` | `.` | Output directory; missing directories and parents are created |
 | `--timeout S` | 900 | Give up after S seconds if the game isn't rendering enough (0 = no limit) |
+| `--warmup-seconds S` | 0 | Advance the guest for S seconds without synchronous Vulkan rendering |
+| `--warmup-submits N` | 0 | Advance without rendering until GPU submit N |
 
 Only the game is required; everything else has a sane default.
 Directory-creation and PNG write failures include the failing path and operating-system error.
+
+Warmup is useful when llvmpipe makes a frame-counted startup take minutes. The guest and GPU command
+decoder continue at native speed while Vulkan work is skipped; normal screenshots begin once rendering
+does. During warmup, the raw-scanout fallback is suppressed so the output folder does not fill with
+misleading loading frames. The two warmup gates are additive when both are supplied. `--timeout` covers
+the entire run, including warmup.
 
 **"Frames" = rendered frames** (composited images handed to the present layer), *not* guest flips —
 the guest flips far faster than llvmpipe renders, so counting flips would bunch every shot into the
@@ -66,4 +75,7 @@ PROSPER_GUEST_ARGS= PROSPER_NULL_PAGE=1 screenshot /path/PPSA01885-app0
 ```bash
 # 30 shots, one every 60 rendered frames, into ./shots
 screenshot /mnt/c/.../PPSA24651-app0 --out shots
+
+# Skip Dead Cells' submit-heavy startup, then capture ten normal frames one second apart.
+screenshot /mnt/c/.../PPSA15552-app0 --warmup-seconds 3 --seconds 1 --count 10 --out shots
 ```
