@@ -78,6 +78,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
     prosper::gpu::set_submit_renderer(
         [frame_dir, dump_bmps](const std::vector<prosper::gpu::DrawItem>& items, uint32_t w, uint32_t h) -> std::vector<uint8_t> {
             using RC = prosper::gpu::ResourceClass;
+            const prosper::gpu::LiveRenderPhase phase = prosper::gpu::live_render_phase();
             // PROSPER_RENDER_FIRST=<N>: skip the slow (~400x) Vulkan render for the first N GPU submits, so
             // the game reaches a LATE scene (e.g. the level1 cutscene, which only starts submitting after
             // ~5000 title-loop submits) at native speed before we begin rendering/dumping. Returning {}
@@ -96,12 +97,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             // window so a diagnostic slice at a late stall (RENDER_FIRST..RENDER_LAST) does not accumulate
             // unbounded RTT/GPU resources across tens of thousands of submits (which OOM-kills the process).
             static int g_render_last = getenv("PROSPER_RENDER_LAST") ? atoi(getenv("PROSPER_RENDER_LAST")) : INT_MAX;
-            int g_this_submit = g_submit_idx++;
+            static thread_local int g_this_submit = -1;
+            if (phase.first_span || g_this_submit < 0) g_this_submit = g_submit_idx++;
             if (g_this_submit > g_render_last) return {};
             // PROSPER_SUBMITLOG: print the GPU-submit index periodically (at native speed, before the slow
             // render) so it can be correlated with guest-side log lines (e.g. a MsgDialog wait) to find the
             // exact submit at which a scene appears — for aiming PROSPER_RENDER_FIRST at it.
-            if (getenv("PROSPER_SUBMITLOG") && (g_this_submit % 1000 == 0))
+            if (phase.first_span && getenv("PROSPER_SUBMITLOG") && (g_this_submit % 1000 == 0))
                 fprintf(stderr, "[submit] index=%d (%zu draw items)\n", g_this_submit, items.size());
             if (const char* sd = getenv("PROSPER_SUBMITLOG_DIM")) {
                 uint32_t sw = 0, sh = 0;
@@ -864,6 +866,27 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         fprintf(stderr, ") px_nonzero=%zu cache_size=%zu\n", nz, g_rtt.size()); }
                 }
             }
+            // Ordered submits may invoke this callback for several graphics spans separated by
+            // compute dispatches. Intermediate spans only update g_rtt. At the final span, recover
+            // the flipped scanout from that persistent cache even when it was rendered earlier in
+            // the transaction, and advance frame/dump state exactly once.
+            if (phase.final_span && pertarget) {
+                auto cached_scanout = [&](uint64_t addr) -> const RttSurf* {
+                    auto it = g_rtt.find(addr);
+                    if (it == g_rtt.end() || it->second.w != w || it->second.h != h ||
+                        it->second.rgba.size() != (size_t)w * h * 4) return nullptr;
+                    return &it->second;
+                };
+                const int front = prosper::gpu::present_front_index();
+                const RttSurf* scanout = front >= 0
+                    ? cached_scanout(prosper_vo_buffer_addr(front)) : nullptr;
+                if (!scanout) {
+                    for (int i = 0; i < prosper_vo_buffer_count(); ++i)
+                        if ((scanout = cached_scanout(prosper_vo_buffer_addr(i)))) break;
+                }
+                if (scanout) px = scanout->rgba;
+            }
+            if (!phase.final_span) return px;
             int n = frame_no++;
             // PROSPER_DUMP_CONTENT=<min-nonzero-bytes>: dump ONLY frames whose framebuffer has at least
             // that many nonzero bytes — catches the intermittent content submits the periodic dump misses.

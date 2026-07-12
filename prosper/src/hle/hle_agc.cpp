@@ -1045,6 +1045,46 @@ void start_defer_watchdog() {
 }
 }
 
+static bool execute_submit_work(gpu::GpuState& st, uint64_t submit_no, unsigned& draw_submits) {
+    static const unsigned render_every = [] {
+        const char* e = getenv("PROSPER_RENDER_EVERY");
+        long v = e ? atol(e) : 1;
+        return v > 0 ? (unsigned)v : 1u;
+    }();
+    const bool render = gpu::have_submit_renderer() && !st.draws.empty() &&
+                        (draw_submits++ % render_every) == 0;
+    if (!render) {
+        if (gpu::have_submit_compute() && !st.dispatches.empty() &&
+            !gpu::execute_compute_dispatches(st, submit_no) && getenv("PROSPER_COMPUTELOG"))
+            fprintf(stderr, "[compute] submit #%llu produced no executable work\n",
+                    (unsigned long long)submit_no);
+        return false;
+    }
+
+    uint32_t w = gpu::present_width(), h = gpu::present_height();
+    static const uint32_t scale = [] {
+        const char* e = getenv("PROSPER_RENDER_SCALE");
+        long v = e ? atol(e) : 1;
+        return v > 0 ? (uint32_t)v : 1u;
+    }();
+    if (scale > 1) {
+        w = (w / scale) & ~1u;
+        h = (h / scale) & ~1u;
+        if (!w) w = 2;
+        if (!h) h = 2;
+    }
+    // Draw spans and dispatches are synchronous. Drain packet writes before the renderer reads guest
+    // resources, then retire completion only after the ordered mixed timeline has finished.
+    gpu::flush_deferred_streams();
+    prosper_gpu_drain_completion_writes();
+    const bool presented = gpu::execute_ordered_and_present(st, w, h, submit_no);
+    if (presented) g_presents_cum++;
+    if (presented && getenv("PROSPER_GFXLOG"))
+        fprintf(stderr, "[agc] SubmitDcb #%llu: executed %zu draws -> presented %ux%u frame\n",
+                (unsigned long long)submit_no, st.draws.size(), w, h);
+    return presented;
+}
+
 // Fold one raw Dcb dword stream through the CommandProcessor, fire the GPU EOP completion events, and
 // (if a live renderer is wired and the submit produced draws) execute+present. Shared by the primary
 // submit path (sceAgcDriverSubmitDcb) and the DOLL warmup-submit variant (w1KFAHVqpaU) below.
@@ -1062,10 +1102,8 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
     size_t applied = gpu::run_command_buffer(addr, walk, agc_gpu_state());
     g_submit_count++;
     gpu::diagnose_compute_dispatches(agc_gpu_state(), g_submit_count);
-    if (gpu::have_submit_compute() && !agc_gpu_state().dispatches.empty() &&
-        !gpu::execute_compute_dispatches(agc_gpu_state(), g_submit_count) && getenv("PROSPER_COMPUTELOG"))
-        fprintf(stderr, "[compute] submit #%llu produced no executable work\n",
-                (unsigned long long)g_submit_count);
+    static unsigned draw_submits2 = 0;
+    execute_submit_work(agc_gpu_state(), g_submit_count, draw_submits2);
     gpu::diagnose_resource_provenance(agc_gpu_state(), g_submit_count);
     // #312 EOP visibility contract: the pulse fires immediately only when no gated writes are
     // pending; otherwise it is OWED and delivered when the tail drains (the guest's completion
@@ -1078,17 +1116,6 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
     // Watchdog keys off PENDING streams, not just this fold: streams can outlive their fold (and
     // the Jump-recursion flag reset once hid a deferring fold entirely — the wedge class).
     if (gpu::deferred_pending()) start_defer_watchdog();
-    static const unsigned render_every2 = [] {
-        const char* e = getenv("PROSPER_RENDER_EVERY"); long v = e ? atol(e) : 1; return v > 0 ? (unsigned)v : 1u; }();
-    static unsigned draw_submits2 = 0;
-    if (gpu::have_submit_renderer() && !agc_gpu_state().draws.empty() && (draw_submits2++ % render_every2) == 0) {
-        uint32_t w = gpu::present_width(), h = gpu::present_height();
-        static const uint32_t scale = [] {
-            const char* e = getenv("PROSPER_RENDER_SCALE"); long v = e ? atol(e) : 1; return v > 0 ? (uint32_t)v : 1u; }();
-        if (scale > 1) { w = (w / scale) & ~1u; h = (h / scale) & ~1u; if (!w) w = 2; if (!h) h = 2; }
-        prosper_gpu_drain_completion_writes();   // renderer reads WRITE_DATA-uploaded guest memory (#312)
-        if (gpu::execute_and_present(agc_gpu_state(), w, h)) g_presents_cum++;
-    }
     if (getenv("PROSPER_GFXLOG"))
         fprintf(stderr, "[agc] %s #%llu: %u dwords (walk=%u) -> %zu packets applied (draws: %zu, dispatches: %llu)\n",
                 who, (unsigned long long)g_submit_count, dw_num, walk, applied,
@@ -1185,10 +1212,8 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     size_t applied = gpu::run_command_buffer(p->addr, p->dw_num, agc_gpu_state());
     g_submit_count++;
     gpu::diagnose_compute_dispatches(agc_gpu_state(), g_submit_count);
-    if (gpu::have_submit_compute() && !agc_gpu_state().dispatches.empty() &&
-        !gpu::execute_compute_dispatches(agc_gpu_state(), g_submit_count) && getenv("PROSPER_COMPUTELOG"))
-        fprintf(stderr, "[compute] submit #%llu produced no executable work\n",
-                (unsigned long long)g_submit_count);
+    static unsigned draw_submits = 0;
+    execute_submit_work(agc_gpu_state(), g_submit_count, draw_submits);
     gpu::diagnose_resource_provenance(agc_gpu_state(), g_submit_count);
     // The submit has "completed" (synchronous fold): fire any registered GPU EOP events. Inert unless the
     // game called sceGnmAddEqEvent (b0xyllnVY-I); the RELEASE_MEM label write already happened in apply().
@@ -1197,33 +1222,6 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     gpu::flush_deferred_streams();
     gpu::submit_completion_pulse();
     if (gpu::deferred_pending()) start_defer_watchdog();
-    // Stage A: if a live renderer has been registered (runtime binary wires a Vulkan device) and this
-    // submit accumulated draws, execute the folded GpuState and present the frame. Inert (returns false)
-    // on the pure-HLE path until a device is registered, so it never perturbs the existing boot behavior.
-    // PROSPER_RENDER_EVERY=K: render only every Kth draw-carrying submit (default 1). Under llvmpipe a
-    // 1080p render is ~10-20 s and execute_and_present is SYNCHRONOUS here, throttling the frame loop to
-    // a crawl — so a distant scene (the cutscene, thousands of frames in) would take hours. Sampling
-    // keeps the game running near full speed while still producing periodic frames of the live scene.
-    static const unsigned render_every = [] {
-        const char* e = getenv("PROSPER_RENDER_EVERY"); long v = e ? atol(e) : 1; return v > 0 ? (unsigned)v : 1u; }();
-    static unsigned draw_submits = 0;
-    if (gpu::have_submit_renderer() && !agc_gpu_state().draws.empty() && (draw_submits++ % render_every) == 0) {
-        uint32_t w = gpu::present_width(), h = gpu::present_height();
-        // PROSPER_RENDER_SCALE=N: render at 1/N resolution. execute_and_present is SYNCHRONOUS on the
-        // guest submit thread; a full 1080p llvmpipe render blocks it ~15 s, and while it is blocked in
-        // host Vulkan the guest GC's stop-the-world can't get its ack -> the collection races and aborts
-        // ("Unexpected state"), so the game crashes long before reaching a distant scene. A 1/4 render
-        // (~1 s) shrinks that window enough to run deep into the cutscene while still capturing a frame.
-        static const uint32_t scale = [] {
-            const char* e = getenv("PROSPER_RENDER_SCALE"); long v = e ? atol(e) : 1; return v > 0 ? (uint32_t)v : 1u; }();
-        if (scale > 1) { w = (w / scale) & ~1u; h = (h / scale) & ~1u; if (!w) w = 2; if (!h) h = 2; }
-        prosper_gpu_drain_completion_writes();   // renderer reads WRITE_DATA-uploaded guest memory (#312)
-        bool presented = gpu::execute_and_present(agc_gpu_state(), w, h);
-        if (presented) g_presents_cum++;
-        if (presented && getenv("PROSPER_GFXLOG"))
-            fprintf(stderr, "[agc] SubmitDcb #%llu: executed %zu draws -> presented %ux%u frame\n",
-                    (unsigned long long)g_submit_count, agc_gpu_state().draws.size(), w, h);
-    }
     if (getenv("PROSPER_GFXLOG")) {
         fprintf(stderr, "[agc] SubmitDcb #%llu: %u dwords -> %zu packets applied (draws so far: %zu, dispatches total: %llu)\n",
                 (unsigned long long)g_submit_count, p->dw_num, applied, agc_gpu_state().draws.size(),

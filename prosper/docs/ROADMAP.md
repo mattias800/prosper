@@ -40,10 +40,12 @@ presented, framebuffer CRC == golden" is. Each change adds the check that proves
   the first bad composition at draw 18; its missing 642x362 input has no prior color-target writer. The corrected
   dispatch thread/local/group contract (#580), `sceAgcCbSetShRegistersDirect`, and compute direct type-1 V#
   decoding (#574) now execute a valid registered fill program against real guest buffers before submit completion
-  (#576). Range provenance proves one submit orders a 642x362 consumer, dispatch 5's fill, then another consumer;
-  prosper currently batches the fill before both draws.
-- **Immediate milestone:** interleave compute and graphics by retained PM4 order (#584), then rerun the Dead Cells
-  route/capsule (#566). Separately, resolve the seeded replay hash mismatch (#569) and animation-sensitive splash
+  (#576). Range provenance proved one submit orders a 642x362 consumer, dispatch 5's fill, then another consumer.
+  Graphics spans and compute now execute by that retained PM4 order (#584); the first gameplay frame changes, but
+  subsequent frames still settle to the prior overbright composition.
+- **Immediate milestone:** isolate the remaining settled Dead Cells composition defect (#586), including live
+  per-consumer resource versions and dark/overbright captures. Separately, resolve the seeded replay hash
+  mismatch (#569) and animation-sensitive splash
   snapshot (#573), while continuing the same capture/replay workflow across Unity and Unreal targets.
 
 ## Historical status (2026-07-05) - retained for the milestone log

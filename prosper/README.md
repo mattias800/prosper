@@ -37,9 +37,9 @@ possible without console keys. Dumps are user-supplied and gitignored.
   into the first playable scene. HUD and some composition render, but the world is mostly white (#566).
   Version-4 GPU captures seed temporal render targets for faithful offline isolation (#568); one residual
   live/replay hash mismatch remains (#569). Dispatch thread counts and derived workgroup dimensions,
-  compute program binding, and the title's direct type-1 buffer resource now execute correctly (#580/#576).
-- 🚧 **Active frontiers:** range provenance identifies Dead Cells' missing 642x362 color writer as a
-  compute-buffer fill between two consumers. Interleave compute and graphics by retained PM4 order (#584),
+  compute program binding, direct type-1 buffers, and mixed graphics/compute PM4 order now execute correctly
+  (#580/#576/#584).
+- 🚧 **Active frontiers:** diagnose Dead Cells' settled overbright composition after the ordering fix (#586),
   stabilize the animation-sensitive exact splash guard (#573), and continue cross-title capture/replay and
   descriptor-validation work. UE4's measured GPU boundary remains tracked separately under its area issues.
 

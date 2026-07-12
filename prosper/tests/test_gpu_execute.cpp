@@ -77,6 +77,51 @@ int main() {
     GpuState empty; empty.draws.clear();
     CHECK(execute_gpustate(empty, backend).empty(), "a draw-less GpuState renders no frame (state-only submit)");
 
+    // #584: graphics and compute are one PM4 timeline. The planner must retain the asymmetric
+    // draw-before-dispatch-before-draw dependency that exposed Dead Cells' future buffer read.
+    {
+        GpuState mixed;
+        GpuState::Draw before, after;
+        before.command_order = 100;
+        after.command_order = 300;
+        mixed.draws = {before, after};
+        GpuState::Dispatch dispatch;
+        dispatch.command_order = 200;
+        mixed.dispatches.push_back(dispatch);
+        auto operations = plan_submit_operations(mixed);
+        CHECK(operations.size() == 3 &&
+              operations[0].kind == SubmitOperationKind::Draw && operations[0].index == 0 &&
+              operations[1].kind == SubmitOperationKind::Dispatch && operations[1].index == 0 &&
+              operations[2].kind == SubmitOperationKind::Draw && operations[2].index == 1,
+              "mixed submit planner retains draw-compute-draw PM4 order");
+
+        uint32_t aliased_value = 7;
+        std::vector<uint32_t> observed;
+        std::vector<LiveRenderPhase> phases;
+        DrawItem first, second;
+        first.draw_index = 0;
+        second.draw_index = 1;
+        ComputeItem fill;
+        fill.dispatch_index = 0;
+        LiveRenderFn observe = [&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
+            for (size_t i = 0; i < items.size(); ++i) observed.push_back(aliased_value);
+            phases.push_back(live_render_phase());
+            return std::vector<uint8_t>(4, static_cast<uint8_t>(aliased_value));
+        };
+        LiveComputeFn mutate = [&](const std::vector<ComputeItem>&) {
+            aliased_value = 9;
+            return true;
+        };
+        OrderedSubmitResult ordered = execute_ordered_items(
+            operations, {first, second}, {fill}, observe, mutate, 1, 1);
+        CHECK(observed == std::vector<uint32_t>({7, 9}),
+              "ordered executor exposes pre-compute bytes to draw 0 and post-compute bytes to draw 1");
+        CHECK(ordered.compute_executed && ordered.render_spans == 2 && phases.size() == 2 &&
+              phases[0].first_span && !phases[0].final_span &&
+              !phases[1].first_span && phases[1].final_span,
+              "ordered executor brackets one submit across two graphics spans");
+    }
+
     // --- Indexed draws through the executor (issue #64) -------------------------------------------------
     // realize_draw_item fetches a REAL 16-bit guest index buffer (index_type 0, the SetIndexType reset
     // default this title relies on) and the backend renders it with vkCmdDrawIndexed — gl_VertexIndex is

@@ -19,5 +19,5 @@ PROSPER_PAD_SCRIPT=@scripts/dead-cells/reach-first-gameplay.pad \
 
 The long renderer warmup makes this route practical under llvmpipe, but it can
 skip one-time GPU producers. The current post-warmup gameplay image is tracked
-in issue #566 and must not be used as a golden visual checkpoint until that
-warmup artifact has been separated from genuine renderer behavior.
+in issues #566/#586 and must not be used as a golden visual checkpoint until
+the warmup artifact has been separated from genuine renderer behavior.

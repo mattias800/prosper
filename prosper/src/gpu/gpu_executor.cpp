@@ -32,6 +32,7 @@ namespace prosper::gpu {
 namespace {
 LiveRenderFn g_live;   // empty until the runtime/test registers a device-backed renderer
 LiveComputeFn g_compute;   // synchronous compute backend, registered with the live Vulkan frontend
+thread_local LiveRenderPhase g_live_phase;
 
 // Read a 32-dword user-data SGPR block from a stage's register file. `base` = the stage's
 // SPI_SHADER_USER_DATA_*_0 register offset; absent registers read as 0. 32 (not 16) because NGG merged
@@ -871,8 +872,8 @@ ComputeLaunchDimensions resolve_compute_launch(const GpuState::Dispatch& d) {
     return out;
 }
 
-bool execute_compute_dispatches(const GpuState& st, uint64_t submit_no) {
-    if (!g_compute || st.dispatches.empty()) return false;
+std::vector<ComputeItem> realize_compute_dispatches(const GpuState& st, uint64_t submit_no) {
+    if (st.dispatches.empty()) return {};
     namespace P = prosper::agc::Pm4;
     auto rd = [](const std::unordered_map<uint32_t, uint32_t>& regs, uint32_t off) {
         auto it = regs.find(off);
@@ -959,8 +960,13 @@ bool execute_compute_dispatches(const GpuState& st, uint64_t submit_no) {
         }
         items.push_back(std::move(item));
     }
-    if (items.empty()) return false;
-    return g_compute(items);
+    return items;
+}
+
+bool execute_compute_dispatches(const GpuState& st, uint64_t submit_no) {
+    if (!g_compute) return false;
+    std::vector<ComputeItem> items = realize_compute_dispatches(st, submit_no);
+    return !items.empty() && g_compute(items);
 }
 
 void diagnose_compute_dispatches(const GpuState& st, uint64_t submit_no) {
@@ -1214,13 +1220,113 @@ void diagnose_resource_provenance(const GpuState& st, uint64_t submit_no) {
     }
 }
 
+std::vector<SubmitOperation> plan_submit_operations(const GpuState& st) {
+    std::vector<SubmitOperation> operations;
+    operations.reserve(st.draws.size() + st.dispatches.size());
+    for (size_t i = 0; i < st.draws.size(); ++i)
+        operations.push_back({SubmitOperationKind::Draw, i, st.draws[i].command_order});
+    for (size_t i = 0; i < st.dispatches.size(); ++i)
+        operations.push_back({SubmitOperationKind::Dispatch, i, st.dispatches[i].command_order});
+    std::stable_sort(operations.begin(), operations.end(), [](const auto& a, const auto& b) {
+        return a.command_order < b.command_order;
+    });
+    return operations;
+}
+
+OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& operations,
+                                          const std::vector<DrawItem>& draws,
+                                          const std::vector<ComputeItem>& computes,
+                                          const LiveRenderFn& render,
+                                          const LiveComputeFn& compute,
+                                          uint32_t width, uint32_t height) {
+    std::unordered_map<size_t, size_t> draw_by_index, compute_by_index;
+    for (size_t i = 0; i < draws.size(); ++i) draw_by_index[draws[i].draw_index] = i;
+    for (size_t i = 0; i < computes.size(); ++i)
+        compute_by_index[static_cast<size_t>(computes[i].dispatch_index)] = i;
+
+    struct ExecutableOperation { SubmitOperationKind kind; size_t item; };
+    std::vector<ExecutableOperation> executable;
+    for (const auto& operation : operations) {
+        if (operation.kind == SubmitOperationKind::Draw) {
+            auto it = draw_by_index.find(operation.index);
+            if (it != draw_by_index.end()) executable.push_back({operation.kind, it->second});
+        } else {
+            auto it = compute_by_index.find(operation.index);
+            if (it != compute_by_index.end()) executable.push_back({operation.kind, it->second});
+        }
+    }
+
+    size_t total_spans = 0;
+    bool in_draw_span = false;
+    for (const auto& operation : executable) {
+        if (operation.kind == SubmitOperationKind::Draw) {
+            if (!in_draw_span) ++total_spans;
+            in_draw_span = true;
+        } else {
+            in_draw_span = false;
+        }
+    }
+
+    OrderedSubmitResult result;
+    std::vector<DrawItem> span;
+    auto flush_span = [&] {
+        if (span.empty() || !render) return;
+        LiveRenderPhase saved = g_live_phase;
+        g_live_phase = {result.render_spans == 0, result.render_spans + 1 == total_spans};
+        std::vector<uint8_t> rendered = render(span, width, height);
+        g_live_phase = saved;
+        if (!rendered.empty()) result.pixels = std::move(rendered);
+        span.clear();
+        ++result.render_spans;
+    };
+    for (const auto& operation : executable) {
+        if (operation.kind == SubmitOperationKind::Draw) {
+            span.push_back(draws[operation.item]);
+        } else {
+            flush_span();
+            result.compute_executed |= compute && compute({computes[operation.item]});
+        }
+    }
+    flush_span();
+    return result;
+}
+
 void set_submit_renderer(LiveRenderFn fn) { g_live = std::move(fn); }
 bool have_submit_renderer()               { return static_cast<bool>(g_live); }
 void set_submit_compute(LiveComputeFn fn) { g_compute = std::move(fn); }
 bool have_submit_compute()                { return static_cast<bool>(g_compute); }
+LiveRenderPhase live_render_phase()       { return g_live_phase; }
 std::vector<uint8_t> render_submit_items(const std::vector<DrawItem>& items,
                                          uint32_t width, uint32_t height) {
     return g_live ? g_live(items, width, height) : std::vector<uint8_t>{};
+}
+
+bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t height,
+                                 uint64_t submit_no) {
+    if ((!g_live && !g_compute) || (st.draws.empty() && st.dispatches.empty())) return false;
+    uint32_t fw = present_width(), fh = present_height();
+    float sx = fw ? (float)width / (float)fw : 1.0f;
+    float sy = fh ? (float)height / (float)fh : 1.0f;
+    std::vector<DrawItem> draws = g_live && width && height
+        ? realize_gpustate_draws(st, 0x10000, sx, sy) : std::vector<DrawItem>{};
+    std::vector<ComputeItem> computes = g_compute
+        ? realize_compute_dispatches(st, submit_no) : std::vector<ComputeItem>{};
+
+    OrderedSubmitResult result = execute_ordered_items(
+        plan_submit_operations(st), draws, computes, g_live, g_compute, width, height);
+    std::vector<uint8_t>& px = result.pixels;
+
+    if (!draws.empty()) {
+        auto pending = begin_requested_gpu_capture(draws, width, height);
+        if (pending) {
+            std::string error;
+            if (!finish_requested_gpu_capture(std::move(pending), px, error))
+                std::fprintf(stderr, "[gpucap] write failed: %s\n", error.c_str());
+        }
+    }
+    if (px.size() != static_cast<size_t>(width) * height * 4) return false;
+    present_write_frame(px.data(), width, height);
+    return true;
 }
 
 bool execute_and_present(const GpuState& st, uint32_t width, uint32_t height) {
