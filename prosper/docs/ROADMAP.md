@@ -24,7 +24,7 @@ presented, framebuffer CRC == golden" is. Each change adds the check that proves
 
 ---
 
-## Current status (2026-07-11) - at a glance
+## Current status (2026-07-12) - at a glance
 
 - **Messenger reaches and renders the first level:** intro, title, menus, save list, dialogue, player,
   background, foreground tree/terrain, water, and structures render at native 1920×1080. The causal fixes
@@ -35,15 +35,15 @@ presented, framebuffer CRC == golden" is. Each change adds the check that proves
   live/replay hashes and per-draw/resource isolation; #515 provides reflected SPIR-V/runtime descriptor
   validation in live and offline replay paths. Producer provenance, normal screenshot capture, and the local
   content-metric snapshot guard complete the current first-bad-contract workflow.
-- **Dead Cells cross-title milestone:** #544 fixes the poisoned AGC resource-name limit that caused intermittent
-  startup stack exhaustion; 30/30 repeated starts pass. Its exercised NGS2 lifecycle now supplies initialized
-  sizes, handles, voice state, geometry state, and silent PCM (#554), and POSIX `getpid` is nonzero (#553).
-  A revision-locked late render window reaches the Evil Empire splash. #545 is closed: rendering every 4K
-  submit synchronously through llvmpipe made a ~13,000-submit startup look stalled for minutes.
-- **Immediate milestone:** make progression capture/checkpointing practical without hand-guessing submit windows
-  (#549/#302), expand multi-title snapshot coverage (#248), and implement the newly reached honest-offline NP and
-  SaveData contracts (#552). Then use the same capture/replay and descriptor-validation workflow on existing
-  Unity/Unreal 3D workloads. UE4's measured shader rejection boundary remains descriptor provenance (#485).
+- **Dead Cells cross-title milestone:** deterministic routing now reaches gameplay. HUD and partial composition
+  render, but the world is mostly white (#566). Version-4 captures seed temporal render targets (#568) and isolate
+  the first bad composition at draw 18; its missing 642x362 input has no prior color-target writer. The corrected
+  dispatch ABI (#571), `sceAgcCbSetShRegistersDirect`, and compute direct type-1 V# decoding (#574) now recover a
+  valid registered program and one real buffer resource for every exercised startup dispatch.
+- **Immediate milestone:** execute retained compute dispatches and order their writes before downstream consumers
+  (#576), then extend provenance to identify compute/DMA/CPU writers and test whether Dead Cells' missing surface
+  is compute-produced. Separately, resolve the seeded replay hash mismatch (#569) and animation-sensitive splash
+  snapshot (#573), while continuing the same capture/replay workflow across Unity and Unreal targets.
 
 ## Historical status (2026-07-05) - retained for the milestone log
 
