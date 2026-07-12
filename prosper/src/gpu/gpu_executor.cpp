@@ -943,6 +943,37 @@ std::vector<ComputeItem> realize_compute_dispatches(const GpuState& st, uint64_t
         item.submit_no = submit_no;
         item.command_order = dispatch.command_order;
         if (item.spirv.empty()) {
+            // PROSPER_DYNTRACE_FAIL=1: replay the FAILED compute program's resource build with the
+            // const-fold walk trace + user-data dump forced on (once per distinct program) — the
+            // compute analog of the graphics VS/PS fail-replay (gpu_execute.hpp). Compute dispatches
+            // only run build_shader_resources (the DIRECT front-half table) and NEVER the const-fold
+            // resolve_dynamic_fetch that graphics stages use, so a bindless storage-image U# / T#
+            // (image_store SRSRC, image_sample) can't be recovered by pc-provenance for a dispatch.
+            // This trace reveals whether the failing dispatch's descriptors ARE const-fold-resolvable
+            // (i.e. loaded via a foldable s_load chain) — the ground truth for #590 before extending
+            // the compute resource build. Read-only: it does not change what the executor binds.
+            if (getenv("PROSPER_DYNTRACE_FAIL")) {
+                static std::set<uint64_t> traced_cs;
+                if (traced_cs.insert(code_addr).second) {
+                    std::fprintf(stderr, "[dynfail] replaying COMPUTE 0x%llx resource build with trace:\n",
+                                 (unsigned long long)code_addr);
+                    std::fprintf(stderr, "[dynfail]   compute user-data SGPRs (s0..s%u):\n", kUserSgprs - 1);
+                    for (uint32_t i = 0; i < kUserSgprs; i += 4)
+                        std::fprintf(stderr, "[dynfail]     s%-2u: %08x %08x %08x %08x\n", i,
+                                     sgprs[i], sgprs[i + 1], sgprs[i + 2], sgprs[i + 3]);
+                    std::vector<SrtUse> cs_uses;
+                    g_dyntrace_force = true;
+                    resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, 0x4000,
+                                          sgprs, kUserSgprs, 0, &cs_uses);
+                    g_dyntrace_force = false;
+                    std::fprintf(stderr, "[dynfail]   const-fold recovered %zu descriptor use(s):\n",
+                                 cs_uses.size());
+                    for (const auto& u : cs_uses)
+                        std::fprintf(stderr, "[dynfail]     %s key=0x%x use_pc=%u dw0=0x%x\n",
+                                     u.kind == 0 ? "TEX/IMG(t8)" : "BUF(v4)", u.key, u.use_pc,
+                                     u.kind == 0 ? u.t8[0] : u.v4[0]);
+                }
+            }
             static std::set<uint64_t> logged;
             if (logged.insert(code_addr).second)
                 std::fprintf(stderr, "[compute] skip unsupported program 0x%llx\n",
