@@ -75,19 +75,25 @@ warmup, set `PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT=N` and
 `PROSPER_GPU_TIMELINE_CAPTURE=<path>.prgcap` on a second run. Version-2 detail records link the capsule;
 version-5 capsules deduplicate content-addressed shader/resource versions and retain mixed draw/dispatch
 order plus explicit unrealized operations. Selection is intentionally bounded to the consumer and an optional
-immediate predecessor; automatic recursive cross-submit producer closure remains #595.
-Timeline version 3 retains lightweight graphics-target summaries for the previous 64 submits when a
-detailed capture is requested. `PROSPER_GPU_TIMELINE_HISTORY=N` raises that bounded window to at most
-4096. Producer records resolve temporal image leaves to the latest overlapping prior submit/draw/PM4
-order, or state `unresolved`; they intentionally do not retain delayed pointers to mutable guest bytes.
+immediate predecessor. Explicit-depth `.prgbundle` capture provides bounded recursive cross-submit closure;
+automatic present-to-producer selection remains #595.
+Timeline version 4 retains a sliding graphics-target window plus full-run aggregate lifetime metadata when a
+detailed capture is requested. `PROSPER_GPU_TIMELINE_HISTORY=N` raises the sliding window to at most 65536.
+Producer records identify the latest overlapping prior submit/draw/PM4 order, earliest observed graphics
+writer, write/submit counts, truncation, and raw first-writer clear/target state. Raw clear registers are
+provenance, not proof of an implicit hardware clear. The timeline intentionally retains no delayed pointers
+to mutable guest bytes.
 Set `PROSPER_GPU_TIMELINE_CAPTURE_PREDECESSOR=<path>.prgcap` to snapshot exact submit `N-1` at producer
 time alongside selected submit `N`. Replay the pair with `gpu_replay --prepend producer consumer output`.
 This is a one-level probe; graph the producer and recurse when it also reads a temporal version.
 For bounded recursion, add `PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE=<path>.prgbundle`,
-`PROSPER_GPU_TIMELINE_CAPTURE_DEPTH=2..16`, and optionally
+`PROSPER_GPU_TIMELINE_CAPTURE_DEPTH=2..2048`, and optionally
 `PROSPER_GPU_TIMELINE_CAPTURE_MAX_UNIQUE_MB=64..4096` (default 1024). `gpu_replay --bundle bundle output`
 executes the ordered window and classifies each temporal frontier as included, seeded, or depth-bounded.
 Bundles use content-defined chunks so shifted capture metadata does not defeat cross-submit deduplication.
+`PROSPER_GPU_TIMELINE_CAPTURE_TARGET_DIM=WxH` restricts predecessor captures to draws targeting that extent;
+it is a size diagnostic, not a dependency proof. `gpu_replay --bundle-zero-boundary` supplies transparent
+pixels to the oldest unseeded temporal leaves for an explicit A/B test and labels the synthetic seeds.
 Per-target RTT is the normal renderer path. `PROSPER_RTT_SINGLE_TARGET=1` restores the obsolete flattened
 single-framebuffer compositor only for diagnostic comparison; it cannot represent real post chains or
 offscreen target dimensions.

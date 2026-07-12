@@ -26,7 +26,7 @@ bool set_environment(const std::string& name, const std::string& value) {
 void usage(const char* argv0) {
     std::fprintf(stderr, "usage: %s [--inspect|--inspect-only|--validate|--graph] "
                          "[--graph-json PATH] [--draw N[:M]] "
-                         "[--bundle capture.prgbundle] "
+                         "[--bundle capture.prgbundle] [--bundle-zero-boundary] "
                          "[--prepend producer.prgcap] "
                          "[--dump-resource DRAW:vs|ps:BINDING PATH] [--allow-mismatch] "
                          "[--dump-shader DRAW:vs|fs PATH] "
@@ -291,7 +291,7 @@ bool ranges_overlap(uint64_t a, uint64_t as, uint64_t b, uint64_t bs) {
     return a < range_end(b, bs) && b < range_end(a, as);
 }
 
-int replay_bundle(const std::string& path, const char* output_path) {
+int replay_bundle(const std::string& path, const char* output_path, bool zero_boundary) {
     prosper::gpu::GpuCaptureBundle bundle;
     std::string error;
     if (!prosper::gpu::read_gpu_capture_bundle(path, bundle, error)) {
@@ -344,6 +344,36 @@ int replay_bundle(const std::string& path, const char* output_path) {
                          static_cast<unsigned long long>(capture.metadata.submit_index), error.c_str());
             return 2;
         }
+        std::vector<uint64_t> diagnostic_zero_seeds;
+        if (i == 0 && zero_boundary) {
+            for (const auto& leaf : graph.external_leaves) {
+                if (leaf.first_future_writer == UINT32_MAX || !leaf.access.addr ||
+                    !leaf.access.width || !leaf.access.height ||
+                    (leaf.access.resource_class != prosper::gpu::ResourceClass::Texture &&
+                     leaf.access.resource_class != prosper::gpu::ResourceClass::StorageImage) ||
+                    std::any_of(replay.rtt_seeds.begin(), replay.rtt_seeds.end(), [&](const auto& seed) {
+                        return seed.guest_addr == leaf.access.addr;
+                    })) continue;
+                prosper::gpu::GpuCaptureRttSeed seed;
+                seed.guest_addr = leaf.access.addr;
+                seed.width = leaf.access.width; seed.height = leaf.access.height;
+                const uint64_t seed_bytes = static_cast<uint64_t>(seed.width) * seed.height * 4;
+                constexpr uint64_t kMaxDiagnosticSeedBytes = 1ull << 30;
+                if (seed_bytes > kMaxDiagnosticSeedBytes || seed_bytes > SIZE_MAX) {
+                    std::fprintf(stderr,
+                                 "[gpureplay] skip oversized diagnostic zero seed addr=%016llx "
+                                 "dims=%ux%u bytes=%llu\n",
+                                 static_cast<unsigned long long>(seed.guest_addr), seed.width, seed.height,
+                                 static_cast<unsigned long long>(seed_bytes));
+                    continue;
+                }
+                seed.rgba.resize(static_cast<size_t>(seed_bytes), 0);
+                replay.rtt_seeds.push_back(std::move(seed));
+                diagnostic_zero_seeds.push_back(leaf.access.addr);
+            }
+            std::fprintf(stderr, "[gpureplay] diagnostic zero-boundary seeds=%zu\n",
+                         diagnostic_zero_seeds.size());
+        }
         for (const auto& leaf : graph.external_leaves) {
             if (leaf.first_future_writer == UINT32_MAX ||
                 (leaf.access.resource_class != prosper::gpu::ResourceClass::Texture &&
@@ -359,7 +389,10 @@ int replay_bundle(const std::string& path, const char* output_path) {
             if (producer != prior_targets.rend()) {
                 stop = "included-producer"; producer_submit = producer->submit; ++temporal_resolved;
             } else if (seed != replay.rtt_seeds.end()) {
-                stop = "initialized-seed"; ++temporal_seeded;
+                stop = std::find(diagnostic_zero_seeds.begin(), diagnostic_zero_seeds.end(),
+                                 leaf.access.addr) != diagnostic_zero_seeds.end()
+                    ? "diagnostic-zero-seed" : "initialized-seed";
+                ++temporal_seeded;
             } else {
                 if (i == 0) ++temporal_bounded;
                 else ++temporal_unresolved;
@@ -416,7 +449,7 @@ int replay_bundle(const std::string& path, const char* output_path) {
 
 int main(int argc, char** argv) {
     bool inspect = false, inspect_only = false, validate_only = false, allow_mismatch = false;
-    bool graph_only = false;
+    bool graph_only = false, bundle_zero_boundary = false;
     int draw_first = -1, draw_last = -1;
     std::string dump_spec, dump_path, shader_spec, shader_path, graph_json_path, prepend_path, bundle_path;
     std::vector<const char*> positional;
@@ -430,6 +463,7 @@ int main(int argc, char** argv) {
         }
         else if (std::string(argv[i]) == "--allow-mismatch") allow_mismatch = true;
         else if (std::string(argv[i]) == "--bundle" && i + 1 < argc) bundle_path = argv[++i];
+        else if (std::string(argv[i]) == "--bundle-zero-boundary") bundle_zero_boundary = true;
         else if (std::string(argv[i]) == "--prepend" && i + 1 < argc) prepend_path = argv[++i];
         else if (std::string(argv[i]) == "--draw" && i + 1 < argc) {
             std::string range = argv[++i]; size_t colon = range.find(':');
@@ -449,8 +483,10 @@ int main(int argc, char** argv) {
             draw_first >= 0 || !dump_spec.empty() || !shader_spec.empty() || !prepend_path.empty()) {
             usage(argv[0]); return 2;
         }
-        return replay_bundle(bundle_path, positional.empty() ? nullptr : positional[0]);
+        return replay_bundle(bundle_path, positional.empty() ? nullptr : positional[0],
+                             bundle_zero_boundary);
     }
+    if (bundle_zero_boundary) { usage(argv[0]); return 2; }
     if (positional.empty() || positional.size() > 2) { usage(argv[0]); return 2; }
     prosper::gpu::GpuCaptureFile capture; std::string error;
     if (!prosper::gpu::read_gpu_capture(positional[0], capture, error)) {

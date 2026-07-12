@@ -452,6 +452,36 @@ bool capture_gpustate_submit(const GpuState& state, uint64_t submit_no,
                                 reader, out, error, g_rtt_seed_reader);
 }
 
+bool capture_gpustate_target_submit(const GpuState& state, uint64_t submit_no,
+                                    uint32_t width, uint32_t height,
+                                    uint32_t target_width, uint32_t target_height,
+                                    const GpuCaptureMetadata& metadata,
+                                    GpuCaptureFile& out, std::string& error) {
+    std::vector<DrawItem> draws = realize_gpustate_draws(state);
+    draws.erase(std::remove_if(draws.begin(), draws.end(), [&](const DrawItem& draw) {
+        return draw.color0_width != target_width || draw.color0_height != target_height;
+    }), draws.end());
+    std::vector<SubmitOperation> operations;
+    operations.reserve(draws.size());
+    for (const auto& draw : draws)
+        operations.push_back({SubmitOperationKind::Draw, static_cast<size_t>(draw.draw_index),
+                              draw.command_order});
+    auto reader = [](uint64_t addr, uint8_t* dst, size_t bytes) -> size_t {
+        size_t done = 0;
+        constexpr size_t chunk_max = 0x10000;
+        while (done < bytes) {
+            const size_t n = std::min(bytes - done, chunk_max);
+            if (!guest_readable(addr + done, static_cast<uint32_t>(n))) break;
+            std::memcpy(dst + done, reinterpret_cast<const void*>(uintptr_t(addr + done)), n);
+            done += n;
+        }
+        return done;
+    };
+    GpuCaptureMetadata actual = metadata;
+    actual.width = width; actual.height = height; actual.submit_index = submit_no;
+    return capture_submit_items(draws, {}, operations, actual, reader, out, error, g_rtt_seed_reader);
+}
+
 bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes, std::string& error) {
     error.clear(); Writer w; w.raw(kMagic, sizeof(kMagic)); w.u32(kVersion); w.u32(kEndian);
     w.u32(c.metadata.width); w.u32(c.metadata.height); w.u64(c.metadata.submit_index);

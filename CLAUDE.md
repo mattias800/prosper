@@ -113,13 +113,16 @@ The current tooling frontier is deterministic offline capture rather than longer
 Native-speed `.prgtl` indexes retain every submit/present boundary, and an exact-submit selector can materialize
 immutable, content-deduplicated graphics/compute state plus mixed PM4 order into a version-5 `.prgcap` (#594).
 `gpu_replay --graph` / `--graph-json` now resolve in-submit versions and temporal read-before-write leaves (#600;
-full workflow: `prosper/tools/gpu_replay/README.md`). Timeline version 3 resolves those leaves against bounded
+full workflow: `prosper/tools/gpu_replay/README.md`). Timeline version 4 resolves those leaves against bounded
 same-run target history. Ordered `.prgbundle` windows now capture producer-time submits with content-defined
 cross-submit deduplication and replay them through one persistent renderer (#603). Dead Cells depth 16 resolves
 all 30 internal temporal edges in submits 18735..18750 while storing 2.883 GiB logical data in 166.3 MiB, but
-the earliest submit still has two unseeded 642x362 leaves. Find/capture their initialization version rather than
-increasing depth blindly or adding a dimension fallback (#595/#586). Addresses and operation ordinals are
-run-local. The stale exact Dead Cells snapshot baseline is
+the earliest submit still has two unseeded 642x362 leaves. Full-run aggregation places their first observed
+graphics writers around submit 17,400 and records roughly 1,200-1,350 writes before the selected submit (#604).
+A transparent-zero boundary A/B yields the exact unseeded hash, so zero initialization is not the missing state.
+Target-extent filtering still captures about 150 MiB per submit because large static textures repeat. Build
+exact shared-resource reuse for long bundles instead of brute-forcing depth or adding a dimension fallback.
+Addresses and operation ordinals are run-local. The stale exact Dead Cells snapshot baseline is
 tracked separately in #596 and must not be silently updated.
 `PROSPER_PROVENANCE_DIM=WxH` reports overlapping color, compute, DMA_DATA, and WRITE_DATA writers with
 submit/item/PM4 ordinals.

@@ -19,6 +19,7 @@
 #include <fstream>
 #include <limits>
 #include <mutex>
+#include <unordered_map>
 #include <utility>
 
 namespace prosper::gpu {
@@ -26,7 +27,7 @@ namespace {
 
 constexpr uint8_t kFileMagic[8] = {'P', 'R', 'G', 'T', 'L', 'N', '\0', '\0'};
 constexpr uint8_t kRecordMagic[4] = {'T', 'L', 'R', 'C'};
-constexpr uint32_t kVersion = 3;
+constexpr uint32_t kVersion = 4;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint32_t kMaxPayloadBytes = 1u << 20;
 constexpr uint32_t kFlushInterval = 256;
@@ -214,6 +215,8 @@ struct RuntimeDetailRequest {
     std::string bundle_path;
     uint32_t bundle_depth = 0;
     uint64_t bundle_max_unique_bytes = 1ull << 30;
+    uint32_t bundle_target_width = 0;
+    uint32_t bundle_target_height = 0;
     uint64_t submit_no = 0;
     bool valid = false;
     std::atomic<bool> claimed{false};
@@ -244,8 +247,8 @@ struct RuntimeDetailRequest {
             if (const char* depth = std::getenv("PROSPER_GPU_TIMELINE_CAPTURE_DEPTH")) {
                 char* depth_end = nullptr;
                 const uint64_t value = std::strtoull(depth, &depth_end, 0);
-                if (!depth_end || *depth_end || value < 2 || value > 16) {
-                    std::fprintf(stderr, "[timeline] capture bundle depth must be 2..16\n");
+                if (!depth_end || *depth_end || value < 2 || value > 2048) {
+                    std::fprintf(stderr, "[timeline] capture bundle depth must be 2..2048\n");
                     bundle_path.clear(); bundle_depth = 0;
                 } else {
                     bundle_depth = static_cast<uint32_t>(value);
@@ -259,6 +262,16 @@ struct RuntimeDetailRequest {
                     bundle_path.clear(); bundle_depth = 0;
                 } else {
                     bundle_max_unique_bytes = value << 20;
+                }
+            }
+            if (const char* dimensions = std::getenv("PROSPER_GPU_TIMELINE_CAPTURE_TARGET_DIM")) {
+                unsigned width = 0, height = 0; char tail = 0;
+                if (std::sscanf(dimensions, "%ux%u%c", &width, &height, &tail) != 2 ||
+                    !width || !height) {
+                    std::fprintf(stderr, "[timeline] capture target dimension must be WxH\n");
+                    bundle_path.clear(); bundle_depth = 0;
+                } else {
+                    bundle_target_width = width; bundle_target_height = height;
                 }
             }
         }
@@ -280,24 +293,64 @@ struct RuntimeTargetWrite {
     uint64_t size = 0;
     uint32_t width = 0;
     uint32_t height = 0;
+    bool color_has_clear = false;
+    uint32_t color_clear_word0 = 0;
+    uint32_t color_clear_word1 = 0;
+    uint32_t color_control = 0;
+    uint32_t target_mask = 0;
+    uint32_t color_format = 0;
+};
+
+struct RuntimeTargetLifetime {
+    const RuntimeTargetWrite* first = nullptr;
+    const RuntimeTargetWrite* last = nullptr;
+    uint64_t write_count = 0;
+    uint64_t submit_count = 0;
+};
+
+struct RuntimeTargetKey {
+    uint64_t addr = 0;
+    uint64_t size = 0;
+    bool operator==(const RuntimeTargetKey& other) const {
+        return addr == other.addr && size == other.size;
+    }
+};
+
+struct RuntimeTargetKeyHash {
+    size_t operator()(const RuntimeTargetKey& key) const {
+        return static_cast<size_t>(key.addr ^ (key.addr >> 32) ^ key.size ^ (key.size >> 32));
+    }
+};
+
+struct RuntimeTargetAggregate {
+    RuntimeTargetWrite first;
+    RuntimeTargetWrite last;
+    uint64_t write_count = 0;
+    uint64_t submit_count = 0;
+    uint64_t last_counted_submit = 0;
 };
 
 struct RuntimeProducerHistory {
     std::deque<std::vector<RuntimeTargetWrite>> submits;
     size_t capacity = 64;
     bool enabled = false;
+    uint64_t first_submit_no = 0;
+    uint64_t dropped_submits = 0;
+    std::unordered_map<RuntimeTargetKey, RuntimeTargetAggregate, RuntimeTargetKeyHash> lifetimes;
+    bool lifetime_truncated = false;
 
     RuntimeProducerHistory() {
         enabled = runtime_detail_request().valid;
         if (const char* value = std::getenv("PROSPER_GPU_TIMELINE_HISTORY")) {
             char* end = nullptr;
             const uint64_t parsed = std::strtoull(value, &end, 0);
-            if (end && !*end && parsed) capacity = static_cast<size_t>(std::min<uint64_t>(parsed, 4096));
+            if (end && !*end && parsed) capacity = static_cast<size_t>(std::min<uint64_t>(parsed, 65536));
         }
     }
 
     void remember(const GpuState& state, uint64_t submit_no) {
         if (!enabled) return;
+        if (!first_submit_no) first_submit_no = submit_no;
         std::vector<RuntimeTargetWrite> writes;
         writes.reserve(state.draws.size());
         for (size_t i = 0; i < state.draws.size(); ++i) {
@@ -305,10 +358,34 @@ struct RuntimeProducerHistory {
             if (!rs.color0_base || !rs.color0_width || !rs.color0_height) continue;
             writes.push_back({submit_no, i, state.draws[i].command_order, rs.color0_base,
                               static_cast<uint64_t>(rs.color0_width) * rs.color0_height * 4,
-                              rs.color0_width, rs.color0_height});
+                              rs.color0_width, rs.color0_height, rs.color0_has_clear,
+                              rs.color0_clear_word0, rs.color0_clear_word1, rs.cb_color_control,
+                              rs.cb_target_mask, rs.color0_format});
+            const RuntimeTargetWrite& write = writes.back();
+            const RuntimeTargetKey key{write.addr, write.size};
+            auto found = lifetimes.find(key);
+            if (found == lifetimes.end()) {
+                if (lifetimes.size() >= 65536) {
+                    lifetime_truncated = true;
+                } else {
+                    RuntimeTargetAggregate aggregate;
+                    aggregate.first = aggregate.last = write;
+                    aggregate.write_count = aggregate.submit_count = 1;
+                    aggregate.last_counted_submit = submit_no;
+                    lifetimes.emplace(key, std::move(aggregate));
+                }
+            } else {
+                RuntimeTargetAggregate& aggregate = found->second;
+                aggregate.last = write;
+                ++aggregate.write_count;
+                if (aggregate.last_counted_submit != submit_no) {
+                    ++aggregate.submit_count;
+                    aggregate.last_counted_submit = submit_no;
+                }
+            }
         }
         submits.push_back(std::move(writes));
-        while (submits.size() > capacity) submits.pop_front();
+        while (submits.size() > capacity) { submits.pop_front(); ++dropped_submits; }
     }
 
     const RuntimeTargetWrite* latest_overlap(uint64_t addr, uint64_t size) const {
@@ -320,6 +397,31 @@ struct RuntimeProducerHistory {
                 if (addr < end(write->addr, write->size) && write->addr < end(addr, size))
                     return &*write;
         return nullptr;
+    }
+
+    RuntimeTargetLifetime lifetime_overlap(uint64_t addr, uint64_t size) const {
+        auto end = [](uint64_t base, uint64_t bytes) {
+            return bytes > UINT64_MAX - base ? UINT64_MAX : base + bytes;
+        };
+        RuntimeTargetLifetime lifetime;
+        for (const auto& [key, aggregate] : lifetimes) {
+            if (addr >= end(key.addr, key.size) || key.addr >= end(addr, size)) continue;
+            if (!lifetime.first || aggregate.first.submit_no < lifetime.first->submit_no ||
+                (aggregate.first.submit_no == lifetime.first->submit_no &&
+                 aggregate.first.command_order < lifetime.first->command_order))
+                lifetime.first = &aggregate.first;
+            if (!lifetime.last || aggregate.last.submit_no > lifetime.last->submit_no ||
+                (aggregate.last.submit_no == lifetime.last->submit_no &&
+                 aggregate.last.command_order > lifetime.last->command_order))
+                lifetime.last = &aggregate.last;
+            lifetime.write_count += aggregate.write_count;
+            lifetime.submit_count += aggregate.submit_count;
+        }
+        return lifetime;
+    }
+
+    uint64_t window_first_submit_no() const {
+        return first_submit_no ? first_submit_no + dropped_submits : 0;
     }
 };
 
@@ -530,6 +632,22 @@ bool GpuTimelineWriter::append_producer(const GpuTimelineProducer& producer, std
     payload.u64(producer.producer_target_addr);
     payload.u32(producer.producer_width);
     payload.u32(producer.producer_height);
+    payload.u32(static_cast<uint32_t>(producer.first_writer_kind));
+    payload.u64(producer.history_first_submit_no);
+    payload.u64(producer.history_first_draw_index);
+    payload.u64(producer.history_first_command_order);
+    payload.u64(producer.history_write_count);
+    payload.u64(producer.history_submit_count);
+    payload.u64(producer.history_window_first_submit_no);
+    payload.u32(producer.lifetime_truncated ? 1u : 0u);
+    payload.u32(producer.history_window_truncated ? 1u : 0u);
+    payload.u32(producer.first_color_has_clear ? 1u : 0u);
+    payload.u32(producer.first_color_clear_word0);
+    payload.u32(producer.first_color_clear_word1);
+    payload.u32(producer.first_color_control);
+    payload.u32(producer.first_color_control_mode);
+    payload.u32(producer.first_target_mask);
+    payload.u32(producer.first_color_format);
     return impl_->append(RecordType::Producer, payload, error);
 }
 
@@ -688,19 +806,42 @@ bool read_gpu_timeline(const std::string& path, GpuTimelineFile& timeline, std::
             GpuTimelineProducer producer;
             producer.sequence = sequence;
             producer.elapsed_ns = elapsed_ns;
-            uint32_t resolved = 0;
+            uint32_t resolved = 0, writer_kind = 0, lifetime_truncated = 0;
+            uint32_t window_truncated = 0, has_clear = 0;
             if (!p.u64(producer.consumer_submit_no) || !p.u32(producer.consumer_operation) ||
                 !p.u32(producer.future_writer_operation) || !p.u64(producer.resource_addr) ||
                 !p.u64(producer.resource_size) || !p.u32(producer.resource_width) ||
                 !p.u32(producer.resource_height) || !p.u32(resolved) ||
                 !p.u64(producer.producer_submit_no) || !p.u64(producer.producer_draw_index) ||
                 !p.u64(producer.producer_command_order) || !p.u64(producer.producer_target_addr) ||
-                !p.u32(producer.producer_width) || !p.u32(producer.producer_height) || p.left ||
+                !p.u32(producer.producer_width) || !p.u32(producer.producer_height) ||
                 resolved > 1) {
                 error = "invalid timeline producer record";
                 return false;
             }
             producer.resolved = resolved != 0;
+            if (version >= 4) {
+                if (!p.u32(writer_kind) || writer_kind > static_cast<uint32_t>(GpuTimelineWriterKind::WriteData) ||
+                    !p.u64(producer.history_first_submit_no) ||
+                    !p.u64(producer.history_first_draw_index) ||
+                    !p.u64(producer.history_first_command_order) ||
+                    !p.u64(producer.history_write_count) || !p.u64(producer.history_submit_count) ||
+                    !p.u64(producer.history_window_first_submit_no) || !p.u32(lifetime_truncated) ||
+                    !p.u32(window_truncated) ||
+                    !p.u32(has_clear) || !p.u32(producer.first_color_clear_word0) ||
+                    !p.u32(producer.first_color_clear_word1) || !p.u32(producer.first_color_control) ||
+                    !p.u32(producer.first_color_control_mode) || !p.u32(producer.first_target_mask) ||
+                    !p.u32(producer.first_color_format) || lifetime_truncated > 1 ||
+                    window_truncated > 1 || has_clear > 1) {
+                    error = "invalid timeline producer lifetime record";
+                    return false;
+                }
+                producer.first_writer_kind = static_cast<GpuTimelineWriterKind>(writer_kind);
+                producer.lifetime_truncated = lifetime_truncated != 0;
+                producer.history_window_truncated = window_truncated != 0;
+                producer.first_color_has_clear = has_clear != 0;
+            }
+            if (p.left) { error = "invalid timeline producer record size"; return false; }
             timeline.producers.push_back(std::move(producer));
         } else {
             error = "unknown timeline record type " + std::to_string(type_raw);
@@ -768,8 +909,13 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
         submit_no < request.submit_no) {
         GpuCaptureFile predecessor;
         const GpuCaptureMetadata metadata = runtime_capture_metadata(submit_no);
-        if (!capture_gpustate_submit(state, submit_no, metadata.width, metadata.height,
-                                     metadata, predecessor, error) ||
+        const bool captured = request.bundle_target_width
+            ? capture_gpustate_target_submit(state, submit_no, metadata.width, metadata.height,
+                                             request.bundle_target_width, request.bundle_target_height,
+                                             metadata, predecessor, error)
+            : capture_gpustate_submit(state, submit_no, metadata.width, metadata.height,
+                                      metadata, predecessor, error);
+        if (!captured ||
             !append_runtime_capture_bundle(predecessor, request.bundle_max_unique_bytes, error)) {
             runtime_capture_bundle().failed = !runtime_capture_bundle().budget_exhausted;
             std::fprintf(stderr, "[timeline] bundle submit %llu capture failed: %s\n",
@@ -782,7 +928,10 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
                 history.remember(state, submit_no);
                 return;
             }
-            log_capture_detail(detail);
+            const uint64_t offset = submit_no - bundle_first;
+            if (request.bundle_depth <= 64 || !offset || !(offset % 100) ||
+                submit_no + 1 == request.submit_no)
+                log_capture_detail(detail);
         }
     }
     if (request.valid && !request.predecessor_path.empty() && request.submit_no > 1 &&
@@ -835,7 +984,30 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
             producer.resource_size = leaf.access.size;
             producer.resource_width = leaf.access.width;
             producer.resource_height = leaf.access.height;
-            if (const RuntimeTargetWrite* match = history.latest_overlap(leaf.access.addr, leaf.access.size)) {
+            const RuntimeTargetLifetime lifetime = history.lifetime_overlap(
+                leaf.access.addr, leaf.access.size);
+            producer.history_window_first_submit_no = history.window_first_submit_no();
+            producer.lifetime_truncated = history.lifetime_truncated;
+            producer.history_window_truncated = history.dropped_submits != 0;
+            producer.history_write_count = lifetime.write_count;
+            producer.history_submit_count = lifetime.submit_count;
+            if (lifetime.first) {
+                producer.first_writer_kind = GpuTimelineWriterKind::Graphics;
+                producer.history_first_submit_no = lifetime.first->submit_no;
+                producer.history_first_draw_index = lifetime.first->draw_index;
+                producer.history_first_command_order = lifetime.first->command_order;
+                producer.first_color_has_clear = lifetime.first->color_has_clear;
+                producer.first_color_clear_word0 = lifetime.first->color_clear_word0;
+                producer.first_color_clear_word1 = lifetime.first->color_clear_word1;
+                producer.first_color_control = lifetime.first->color_control;
+                producer.first_color_control_mode =
+                    (lifetime.first->color_control >> 4) & 0x7u;
+                producer.first_target_mask = lifetime.first->target_mask;
+                producer.first_color_format = lifetime.first->color_format;
+            }
+            const RuntimeTargetWrite* match = lifetime.last
+                ? lifetime.last : history.latest_overlap(leaf.access.addr, leaf.access.size);
+            if (match) {
                 producer.resolved = true;
                 producer.producer_submit_no = match->submit_no;
                 producer.producer_draw_index = match->draw_index;
@@ -860,6 +1032,19 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
                              static_cast<unsigned long long>(producer.producer_command_order),
                              static_cast<unsigned long long>(producer.producer_target_addr),
                              producer.producer_width, producer.producer_height);
+            if (lifetime.first)
+                std::fprintf(stderr, " lifetime=%llu..%llu submits=%llu writes=%llu "
+                                     "lifetime-truncated=%s window-truncated=%s "
+                                     "first-clear=%s mode=%u mask=0x%x fmt=%u",
+                             static_cast<unsigned long long>(producer.history_first_submit_no),
+                             static_cast<unsigned long long>(producer.producer_submit_no),
+                             static_cast<unsigned long long>(producer.history_submit_count),
+                             static_cast<unsigned long long>(producer.history_write_count),
+                             producer.lifetime_truncated ? "yes" : "no",
+                             producer.history_window_truncated ? "yes" : "no",
+                             producer.first_color_has_clear ? "programmed" : "absent",
+                             producer.first_color_control_mode, producer.first_target_mask,
+                             producer.first_color_format);
             std::fprintf(stderr, "\n");
         }
     } else {

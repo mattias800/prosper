@@ -72,10 +72,16 @@ variables are set.
 
 ## Current boundary
 
-Version 3 remains backward-compatible with version-1 and version-2 indexes. When detailed capture is
+Version 4 remains backward-compatible with version-1 through version-3 indexes. For every selected temporal
+image leaf it adds an online full-run target lifetime: earliest/latest graphics writer, matching writes and
+submits, retained-window start, independent lifetime/window truncation flags, and the earliest writer's raw
+clear words, color-control mode, target mask, and format. Lifetime aggregation is keyed by target range, so
+memory scales with distinct surfaces rather than draw count.
+
+Version 3 added bounded latest-writer history. When detailed capture is
 enabled, it retains lightweight target-writer summaries for the previous 64 submits and records the
 latest same-run writer identity for every temporal image leaf in the selected capsule. Set
-`PROSPER_GPU_TIMELINE_HISTORY=N` to change that bounded window (maximum 4096). A producer record includes
+`PROSPER_GPU_TIMELINE_HISTORY=N` to change that bounded window (maximum 65536). A producer record includes
 the consumer submit/operation/range, the in-submit future writer, and either the matched prior graphics
 submit/draw/PM4 order/target extent or an explicit unresolved result.
 
@@ -100,8 +106,13 @@ producer time in the same run and links both capsules with ordinary detail recor
 one-level closure probe; if the predecessor graph has temporal leaves, capture must recurse further.
 
 For a recursive probe, `PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE=<path>` captures the selected submit and
-`PROSPER_GPU_TIMELINE_CAPTURE_DEPTH=N` contiguous submits ending there (2..16). Captures are serialized at
+`PROSPER_GPU_TIMELINE_CAPTURE_DEPTH=N` contiguous submits ending there (2..2048). Captures are serialized at
 producer time and folded immediately into content-defined, checksummed chunks; no retained `GpuState` or
 standalone predecessor files are used. `PROSPER_GPU_TIMELINE_CAPTURE_MAX_UNIQUE_MB=N` bounds unique chunk
 data to 64..4096 MiB (default 1024) and aborts bundle installation if exhausted. The selected standalone
 `.prgcap` remains the graph/oracle reference and is currently required with the bundle.
+
+`PROSPER_GPU_TIMELINE_CAPTURE_TARGET_DIM=WxH` restricts predecessor bundle submits to graphics draws for
+matching target extents while leaving the selected consumer complete. This is a capture-volume diagnostic,
+not renderer substitution. It may still be expensive when relevant passes reference large shared assets;
+unique-byte budget enforcement remains authoritative.

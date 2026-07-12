@@ -59,6 +59,15 @@ int main() {
     producer.producer_submit_no = 9; producer.producer_draw_index = 13;
     producer.producer_command_order = 380; producer.producer_target_addr = 0x700000;
     producer.producer_width = 642; producer.producer_height = 362;
+    producer.first_writer_kind = GpuTimelineWriterKind::Graphics;
+    producer.history_first_submit_no = 2; producer.history_first_draw_index = 7;
+    producer.history_first_command_order = 80; producer.history_write_count = 31;
+    producer.history_submit_count = 8; producer.history_window_first_submit_no = 1;
+    producer.lifetime_truncated = true; producer.history_window_truncated = true;
+    producer.first_color_has_clear = true; producer.first_color_clear_word0 = 0x11223344;
+    producer.first_color_clear_word1 = 0x55667788; producer.first_color_control = 0x60;
+    producer.first_color_control_mode = 6; producer.first_target_mask = 0xf;
+    producer.first_color_format = 10;
     CHECK(writer.append_producer(producer, error), "writer appends a prior-producer identity");
     GpuTimelineSubmit second = first;
     second.submit_no = 11; second.draw_count = 4; second.dispatch_count = 0;
@@ -72,7 +81,7 @@ int main() {
           timeline.metadata.title_id == metadata.title_id &&
           timeline.metadata.input_route == metadata.input_route,
           "metadata round-trips");
-    CHECK(timeline.version == 3 && timeline.submits.size() == 2 && timeline.presents.size() == 1 &&
+    CHECK(timeline.version == 4 && timeline.submits.size() == 2 && timeline.presents.size() == 1 &&
           timeline.details.size() == 1 && timeline.producers.size() == 1,
           "version and record counts round-trip");
     CHECK(timeline.submits[0].sequence == 1 && timeline.presents[0].sequence == 2 &&
@@ -90,7 +99,14 @@ int main() {
     CHECK(timeline.producers[0].resolved && timeline.producers[0].consumer_operation == 19 &&
           timeline.producers[0].producer_submit_no == 9 &&
           timeline.producers[0].producer_command_order == 380 &&
-          timeline.producers[0].resource_width == 642,
+          timeline.producers[0].resource_width == 642 &&
+          timeline.producers[0].history_first_submit_no == 2 &&
+          timeline.producers[0].history_write_count == 31 &&
+          timeline.producers[0].first_writer_kind == GpuTimelineWriterKind::Graphics &&
+          timeline.producers[0].lifetime_truncated &&
+          timeline.producers[0].history_window_truncated &&
+          timeline.producers[0].first_color_has_clear &&
+          timeline.producers[0].first_color_clear_word1 == 0x55667788,
           "prior-producer resource and writer identities round-trip");
 
     std::ifstream input(good, std::ios::binary);
