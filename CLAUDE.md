@@ -120,8 +120,12 @@ all 30 internal temporal edges in submits 18735..18750 while storing 2.883 GiB l
 the earliest submit still has two unseeded 642x362 leaves. Full-run aggregation places their first observed
 graphics writers around submit 17,400 and records roughly 1,200-1,350 writes before the selected submit (#604).
 A transparent-zero boundary A/B yields the exact unseeded hash, so zero initialization is not the missing state.
-Target-extent filtering still captures about 150 MiB per submit because large static textures repeat. Build
-exact shared-resource reuse for long bundles instead of brute-forcing depth or adding a dimension fallback.
+Bundle v2 (#606) now uses fault-safe bulk guest reads plus an exact shared-resource chunk dictionary: a fixed
+1,200-submit full-state run folded 122.97 GiB into 301.1 MiB in 169.4 seconds. Semantic endpoints, rolling
+windows, successful-only exit, final compaction, and `gpu_replay --bundle-tail` prevent timing drift and replay
+holes. A compact two-submit closure resolves both 642x362 edges with no bounded leaves, but its 80-draw endpoint
+is the opening vignette rather than gameplay. Define a stable playable checkpoint and isolate the first bad
+composition under #608 instead of guessing another submit ordinal.
 Addresses and operation ordinals are run-local. The stale exact Dead Cells snapshot baseline is
 tracked separately in #596 and must not be silently updated.
 `PROSPER_PROVENANCE_DIM=WxH` reports overlapping color, compute, DMA_DATA, and WRITE_DATA writers with

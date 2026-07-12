@@ -71,13 +71,14 @@ accepts scripted gamepad input, and renders the first level.
 - 🚧 **Dead Cells reaches gameplay:** deterministic input routing passes its splash and menus into the
   first playable scene. Graphics and compute now execute by retained PM4 order (#584), fixing a proven
   future-read. The formerly overbright screenshot was traced to a diagnostic warmup skipping temporal RTT
-  producers; producer-preserving runs render real opening geometry, with a practical late checkpoint next (#586).
+  producers. Versioned offline bundles now retain long, exact cross-submit resource history and replay a
+  minimized closure; a stable semantic checkpoint for the first playable composition remains #608.
 
 **Frontend:** `prosper-app` is a windowed player (SDL3 window + Vulkan present + audio sink +
 evdev/SDL3 controllers + real message/error/IME dialogs), sharing the same boot + render core as the
 headless `boot_trace`.
 
-Development is **agentic-first**: correctness is verified programmatically — **87 self-checking tests**
+Development is **agentic-first**: correctness is verified programmatically — **91 self-checking tests**
 under `ctest` (including a headless Vulkan/llvmpipe harness that runs recompiled shaders and asserts
 numeric/pixel results, and per-opcode round-trip disassembly checks), a **golden-image snapshot guard**
 that boots a real title and pixel/content-asserts an exact frame, cross-platform CI (Linux +

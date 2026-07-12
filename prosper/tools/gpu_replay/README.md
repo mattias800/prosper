@@ -21,6 +21,8 @@ Create a capsule with the native-speed workflow in
 ./build-linux/gpu_replay /tmp/submit.prgcap /tmp/replay.bmp
 ./build-linux/gpu_replay --prepend /tmp/producer.prgcap /tmp/consumer.prgcap /tmp/closure.bmp
 ./build-linux/gpu_replay --bundle /tmp/window.prgbundle /tmp/closure.bmp
+./build-linux/gpu_replay --bundle /tmp/window.prgbundle --bundle-tail 2 /tmp/tail.bmp
+./build-linux/gpu_replay --bundle /tmp/window.prgbundle --bundle-compact /tmp/compact.prgbundle
 ./build-linux/gpu_replay --bundle /tmp/window.prgbundle --bundle-zero-boundary /tmp/zero-ab.bmp
 ```
 
@@ -76,6 +78,14 @@ The summary reports logical versus unique bytes, per-submit output hashes, and e
 A successful replay with `configured-bound` is an explicitly partial closure, not a faithful pixel oracle.
 Bundle files use `.prgbundle`, contain title-derived data, are gitignored, and must not be committed.
 
+`--bundle-tail N` replays only the latest `N` manifests while retaining the bundle's exact shared resource
+dictionary. Use it when lifetime evidence proves that earlier submits cannot be target producers; the first
+replayed submit becomes the explicit configured boundary and its graph must still be inspected for leaves.
+
+`--bundle-compact PATH` writes a validated copy containing only resources and chunks reachable from retained
+submit manifests. It is useful after a rolling semantic capture; with no image output argument, compaction
+exits without initializing Vulkan. Combine it with `--bundle-tail N` to write a compact suffix bundle.
+
 `--bundle-zero-boundary` is an A/B diagnostic. It supplies transparent RGBA pixels for unseeded temporal
 image leaves at the oldest bundled submit, labels them `diagnostic-zero-seed`, and leaves the bundle unchanged.
 It can disprove stale guest backing versus zero initialization as the cause of a mismatch, but it is not a
@@ -97,7 +107,13 @@ between the dark and overbright failure. Supplying transparent zero to those two
 the same final hash (`62a46f15efa52a26`) as unseeded replay, so stale guest backing versus transparent
 initialization is not the cause in this window.
 
-Capturing only 642x362-target predecessor draws still costs about 150 MiB per submit because repeated static
-fragment resources include 64, 32, and 16 MiB textures. A 1,200-submit brute-force bundle is therefore not a
-practical next step. The next tooling boundary is an exact shared-resource dictionary or equivalently proven
-unchanged-resource reuse across submits; mutable versions must never be reused from address identity alone.
+Bundle v2 stores exact resource versions in a global content-defined chunk dictionary. On a fixed 1,200-submit
+full-state run it folded 122.97 GiB of logical capture data into 301.1 MiB in 169.4 seconds. Reuse is proven by
+hash plus byte equality; mutable versions are never reused from address identity. Linux capture reads use
+fault-safe `process_vm_readv` rather than per-page pipe probes.
+
+A timing-independent semantic run retained a rolling 1,400-submit window and selected run-local submit 23,350.
+The two 642x362 surfaces first appear one submit earlier. Compacting to that exact two-submit suffix stores
+142.6 MiB; replay resolves both temporal edges with zero seeded, bounded, or unresolved leaves and finishes at
+hash `112e7db0001791cc`. The image is the dark opening vignette with `HOLD Skip`, not playable gameplay, so
+extent plus 80 draws is still too broad. #608 tracks a stable playable checkpoint and first bad composition.

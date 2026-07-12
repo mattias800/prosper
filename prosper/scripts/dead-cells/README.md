@@ -16,6 +16,9 @@ PROSPER_PAD_SCRIPT=@scripts/dead-cells/reach-first-gameplay.pad \
   roots on current master and reaches the controllable Jump tutorial. The
   route is wall-clock anchored because Dead Cells submits tens of thousands of
   loading flips before the menu.
+- `reach-first-gameplay-capture.pad`: uses the same menu input but holds Circle from
+  28 through 300 seconds. Use it when synchronous timeline/bundle capture begins during
+  level loading; the ordinary six-second hold can expire while capture stalls GPU progress.
 
 The long renderer warmup makes this route practical under llvmpipe, but it can
 skip temporal GPU producers. The former post-warmup fullscreen-white image was

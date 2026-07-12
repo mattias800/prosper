@@ -44,6 +44,9 @@ PROSPER_GPU_TIMELINE_CAPTURE=/tmp/dead-cells-submit-18420.prgcap \
 PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE=/tmp/dead-cells-depth16.prgbundle \
 PROSPER_GPU_TIMELINE_CAPTURE_DEPTH=16 \
 PROSPER_GPU_TIMELINE_CAPTURE_MAX_UNIQUE_MB=1024 \
+PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM=642x362 \
+PROSPER_GPU_TIMELINE_CAPTURE_MIN_DRAWS=80 \
+PROSPER_GPU_TIMELINE_EXIT_AFTER_CAPTURE=1 \
   ./build-linux/boot_trace /path/to/PPSA15552-app0
 
 ./build-linux/gpu_replay --bundle /tmp/dead-cells-depth16.prgbundle /tmp/closure.bmp
@@ -106,9 +109,11 @@ producer time in the same run and links both capsules with ordinary detail recor
 one-level closure probe; if the predecessor graph has temporal leaves, capture must recurse further.
 
 For a recursive probe, `PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE=<path>` captures the selected submit and
-`PROSPER_GPU_TIMELINE_CAPTURE_DEPTH=N` contiguous submits ending there (2..2048). Captures are serialized at
-producer time and folded immediately into content-defined, checksummed chunks; no retained `GpuState` or
-standalone predecessor files are used. `PROSPER_GPU_TIMELINE_CAPTURE_MAX_UNIQUE_MB=N` bounds unique chunk
+`PROSPER_GPU_TIMELINE_CAPTURE_DEPTH=N` contiguous submits ending there (2..4096). Bundle v2 captures at
+producer time and stores small submit manifests plus exact resource versions in a global content-defined,
+checksummed chunk dictionary; no retained `GpuState` or standalone predecessor files are used. Equal content
+is reused only after byte comparison, never from guest address identity. Version-1 bundles remain readable.
+`PROSPER_GPU_TIMELINE_CAPTURE_MAX_UNIQUE_MB=N` bounds unique chunk
 data to 64..4096 MiB (default 1024) and aborts bundle installation if exhausted. The selected standalone
 `.prgcap` remains the graph/oracle reference and is currently required with the bundle.
 
@@ -116,3 +121,16 @@ data to 64..4096 MiB (default 1024) and aborts bundle installation if exhausted.
 matching target extents while leaving the selected consumer complete. This is a capture-volume diagnostic,
 not renderer substitution. It may still be expensive when relevant passes reference large shared assets;
 unique-byte budget enforcement remains authoritative.
+
+`PROSPER_GPU_TIMELINE_EXIT_AFTER_CAPTURE=1` terminates the process only after the selected standalone
+capsule and any requested bundle have been installed successfully. Use it for long captures instead of a
+wall-clock timeout; capture failure or budget exhaustion leaves the process running for diagnostics.
+
+`PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM=WxH` changes the configured submit into a lower endpoint
+bound: the first later submit with a draw targeting that extent is selected. Optionally require a semantic
+draw count with `PROSPER_GPU_TIMELINE_CAPTURE_MIN_DRAWS=N`. This keeps a long synchronous capture from
+selecting the wrong scene when it perturbs wall-clock pacing. A requested bundle still begins at
+`CAPTURE_SUBMIT - CAPTURE_DEPTH + 1`; if the endpoint moves beyond that window, predecessor manifests roll
+forward so the final bundle contains exactly the latest requested depth. The dictionary may retain content
+seen by evicted manifests during capture, and the unique-byte budget remains authoritative. Finalization
+compacts unreachable dictionary entries before installing the bundle.
