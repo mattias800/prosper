@@ -1062,11 +1062,11 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
     size_t applied = gpu::run_command_buffer(addr, walk, agc_gpu_state());
     g_submit_count++;
     gpu::diagnose_compute_dispatches(agc_gpu_state(), g_submit_count);
-    gpu::diagnose_resource_provenance(agc_gpu_state(), g_submit_count);
     if (gpu::have_submit_compute() && !agc_gpu_state().dispatches.empty() &&
-        !gpu::execute_compute_dispatches(agc_gpu_state()) && getenv("PROSPER_COMPUTELOG"))
+        !gpu::execute_compute_dispatches(agc_gpu_state(), g_submit_count) && getenv("PROSPER_COMPUTELOG"))
         fprintf(stderr, "[compute] submit #%llu produced no executable work\n",
                 (unsigned long long)g_submit_count);
+    gpu::diagnose_resource_provenance(agc_gpu_state(), g_submit_count);
     // #312 EOP visibility contract: the pulse fires immediately only when no gated writes are
     // pending; otherwise it is OWED and delivered when the tail drains (the guest's completion
     // scan must never observe a half-retired frame — see command_processor.cpp). The flip and the
@@ -1185,11 +1185,11 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     size_t applied = gpu::run_command_buffer(p->addr, p->dw_num, agc_gpu_state());
     g_submit_count++;
     gpu::diagnose_compute_dispatches(agc_gpu_state(), g_submit_count);
-    gpu::diagnose_resource_provenance(agc_gpu_state(), g_submit_count);
     if (gpu::have_submit_compute() && !agc_gpu_state().dispatches.empty() &&
-        !gpu::execute_compute_dispatches(agc_gpu_state()) && getenv("PROSPER_COMPUTELOG"))
+        !gpu::execute_compute_dispatches(agc_gpu_state(), g_submit_count) && getenv("PROSPER_COMPUTELOG"))
         fprintf(stderr, "[compute] submit #%llu produced no executable work\n",
                 (unsigned long long)g_submit_count);
+    gpu::diagnose_resource_provenance(agc_gpu_state(), g_submit_count);
     // The submit has "completed" (synchronous fold): fire any registered GPU EOP events. Inert unless the
     // game called sceGnmAddEqEvent (b0xyllnVY-I); the RELEASE_MEM label write already happened in apply().
     // #312 EOP visibility contract: pulse only when no gated writes are pending, else owed until

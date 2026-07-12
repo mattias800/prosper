@@ -56,6 +56,7 @@ struct GpuState {
         uint64_t index_base   = 0;
         uint32_t index_offset = 0;
         bool     from_offset  = false;
+        uint64_t command_order = 0;
     };
     std::vector<Draw> draws;                             // one per DrawIndexAuto / DrawIndex
     // Compute dispatch + register state AT the packet. Compute is not executed yet, but retaining
@@ -65,9 +66,11 @@ struct GpuState {
         uint32_t threads_x = 0, threads_y = 0, threads_z = 0;
         uint64_t modifier = 0;
         std::shared_ptr<const GpuState> state;
+        uint64_t command_order = 0;
     };
     std::vector<Dispatch> dispatches;                     // current submit's DispatchDirect packets
     uint64_t dispatch_count = 0;                          // process-lifetime DispatchDirect count
+    uint64_t command_order = 0;                           // process-lifetime applied PM4 ordinal
 
     // GPU predication window (#319): the 64-bit condition address the last SetPredication opened
     // (0 = no window). A packet-predicated Jump inside the window is executed/skipped on the

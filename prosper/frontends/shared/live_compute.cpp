@@ -2,6 +2,7 @@
 
 #include "gpu/gpu_execute.hpp"
 #include "gpu/shader_resources.hpp"
+#include "gpu/writer_provenance.hpp"
 
 #include <vulkan/vulkan.h>
 
@@ -274,13 +275,20 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
             std::memcpy(guest, result, buffer.resource->size);
             vkUnmapMemory(ctx.device, buffer.memory);
+            if (writer_provenance_enabled())
+                record_guest_write(GuestWriterKind::ComputeBuffer,
+                                   buffer.resource->gpu_addr, buffer.resource->size,
+                                   item.submit_no, item.dispatch_index,
+                                   item.command_order, item.code_addr);
         }
         if (!readback_ok) break;
         ok = true;
     } while (false);
 
     if (trace)
-        std::fprintf(stderr, "[compute] execute code=0x%llx groups=%ux%ux%u buffers=%zu result=%s\n",
+        std::fprintf(stderr, "[compute] execute submit=%llu dispatch=%llu code=0x%llx "
+                     "groups=%ux%ux%u buffers=%zu result=%s\n",
+                     (unsigned long long)item.submit_no, (unsigned long long)item.dispatch_index,
                      (unsigned long long)item.code_addr, item.launch.groups_x, item.launch.groups_y,
                      item.launch.groups_z, buffers.size(), ok ? "ok" : "failed");
     if (trace) {
@@ -288,10 +296,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (!buffer.resource) continue;
             std::fprintf(stderr,
                          "[compute]   writeback binding=%u addr=0x%llx size=%u changed=%llu "
-                         "hash=%016llx->%016llx\n",
+                         "hash=%016llx->%016llx first=%08x,%08x,%08x,%08x\n",
                          buffer.resource->binding, (unsigned long long)buffer.resource->gpu_addr,
                          buffer.resource->size, (unsigned long long)buffer.changed_bytes,
-                         (unsigned long long)buffer.before_hash, (unsigned long long)buffer.after_hash);
+                         (unsigned long long)buffer.before_hash, (unsigned long long)buffer.after_hash,
+                         buffer.resource->size >= 4 ? ((const uint32_t*)(uintptr_t)buffer.resource->gpu_addr)[0] : 0,
+                         buffer.resource->size >= 8 ? ((const uint32_t*)(uintptr_t)buffer.resource->gpu_addr)[1] : 0,
+                         buffer.resource->size >= 12 ? ((const uint32_t*)(uintptr_t)buffer.resource->gpu_addr)[2] : 0,
+                         buffer.resource->size >= 16 ? ((const uint32_t*)(uintptr_t)buffer.resource->gpu_addr)[3] : 0);
         }
     }
     cleanup();

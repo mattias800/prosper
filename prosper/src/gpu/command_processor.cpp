@@ -1,5 +1,6 @@
 // command_processor.cpp — see command_processor.hpp.
 #include "command_processor.hpp"
+#include "writer_provenance.hpp"
 #include "hle/sync_futex.hpp"   // wake_label_waiters (shared with sceKernelWaitOnAddress's futex)
 
 // hle_graphics.cpp: perform the videoout flip for an in-stream SetFlip packet — advances the flip
@@ -667,6 +668,9 @@ static void honor_dma_data(const Pm4Command& c) {
     if (getenv("PROSPER_GFXLOG"))
         fprintf(stderr, "[agc]   DmaData [0x%llx] := 0x%x (%u bytes)\n",
                 (unsigned long long)c.dd_dst, v32, c.dd_bytes);
+    if (writer_provenance_enabled() && c.dd_bytes >= 256)
+        record_guest_write(GuestWriterKind::DmaData, c.dd_dst, c.dd_bytes,
+                           0, 0, c.stream_order, pkt_addr(c));
     wake_on_label(c.dd_dst);
 }
 
@@ -687,6 +691,10 @@ static void honor_write_data(const Pm4Command& c) {
     if (getenv("PROSPER_GFXLOG"))
         fprintf(stderr, "[agc]   WriteData [0x%llx] %u dwords (first=0x%08x)\n",
                 (unsigned long long)c.wd_addr, c.wd_num, c.wd_data[0]);
+    if (writer_provenance_enabled() && c.wd_num >= 64)
+        record_guest_write(GuestWriterKind::WriteData, c.wd_addr,
+                           static_cast<uint64_t>(c.wd_num) * 4, 0, 0,
+                           c.stream_order, pkt_addr(c));
     wake_on_label(c.wd_addr);   // wake any sync_on_address futex waiter on this written label
 }
 
@@ -1177,6 +1185,7 @@ int flush_deferred_streams() {
 
 void GpuState::apply(const Pm4Command& c) {
     using K = Pm4Command::Kind;
+    command_order = c.stream_order ? c.stream_order : command_order + 1;
     switch (c.kind) {
         case K::SetRegsIndirect: {
             if (c.regs_vaddr == 0 || c.num_regs == 0 || c.num_regs > kMaxRegsPerPacket) return;
@@ -1256,6 +1265,7 @@ void GpuState::apply(const Pm4Command& c) {
                 d.from_offset = true;
             }
             draws.push_back(std::move(d));
+            draws.back().command_order = command_order;
             break;
         }
         case K::DrawIndexAuto:
@@ -1281,6 +1291,7 @@ void GpuState::apply(const Pm4Command& c) {
                 d.modifier = c.di_modifier;
             }
             draws.push_back(std::move(d));
+            draws.back().command_order = command_order;
             break;
         }
         case K::ReleaseMem:
@@ -1372,7 +1383,8 @@ void GpuState::apply(const Pm4Command& c) {
                 last_snapshot_ = std::move(snap);
                 state_dirty_ = false;
             }
-            dispatches.push_back({c.threads_x, c.threads_y, c.threads_z, c.dispatch_modifier, last_snapshot_});
+            dispatches.push_back({c.threads_x, c.threads_y, c.threads_z,
+                                  c.dispatch_modifier, last_snapshot_, command_order});
             dispatch_count++;
             break;
         case K::SetPredication:
@@ -1457,7 +1469,10 @@ size_t run_command_buffer(const uint32_t* buf, size_t dwords, GpuState& st) {
     }
     std::vector<Pm4Command> ops;
     decode_pm4(buf, dwords, ops);
-    for (const auto& c : ops) st.apply(c);
+    for (auto& c : ops) {
+        c.stream_order = st.command_order + 1;
+        st.apply(c);
+    }
     return ops.size();
 }
 

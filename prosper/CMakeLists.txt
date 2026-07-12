@@ -366,6 +366,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_convention_bindings PRIVATE prosper_core)
   add_test(NAME convention_bindings COMMAND test_convention_bindings)
 
+  add_executable(test_writer_provenance tests/test_writer_provenance.cpp)
+  target_link_libraries(test_writer_provenance PRIVATE prosper_core)
+  add_test(NAME writer_provenance_ranges COMMAND test_writer_provenance)
+
   # M2+: real memory mapping, trap, boot, and the boot-trace debug tool (Linux only).
   if(UNIX AND NOT APPLE)
     add_executable(boot_trace tools/boot_trace/boot_trace.cpp)

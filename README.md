@@ -70,14 +70,14 @@ accepts scripted gamepad input, and renders the first level.
   A scripted gamepad route produced a full-resolution sequence that was confirmed against PS5 hardware.
 - 🚧 **Dead Cells reaches gameplay:** deterministic input routing passes its splash and menus into the
   first playable scene. HUD and some composition are alive, but the world is mostly white. Capture/replay
-  isolated the first bad composition input. Its real buffer compute kernel now executes in stream order and
-  writes guest memory, but this does not recover the missing 642x362 scene input (#566, #576).
+  isolated the first bad composition input. Range provenance now identifies its 642x362 backing as a real
+  compute-filled buffer and exposes a draw-compute-draw ordering violation in the executor (#566, #584).
 
 **Frontend:** `prosper-app` is a windowed player (SDL3 window + Vulkan present + audio sink +
 evdev/SDL3 controllers + real message/error/IME dialogs), sharing the same boot + render core as the
 headless `boot_trace`.
 
-Development is **agentic-first**: correctness is verified programmatically — **86 self-checking tests**
+Development is **agentic-first**: correctness is verified programmatically — **87 self-checking tests**
 under `ctest` (including a headless Vulkan/llvmpipe harness that runs recompiled shaders and asserts
 numeric/pixel results, and per-opcode round-trip disassembly checks), a **golden-image snapshot guard**
 that boots a real title and pixel/content-asserts an exact frame, cross-platform CI (Linux +
@@ -103,7 +103,7 @@ Requires a C++20 compiler, CMake, and Ninja. A Vulkan loader is needed for the g
 cd prosper
 cmake -G Ninja -B build-linux
 cmake --build build-linux
-ctest --test-dir build-linux          # 86 self-checking tests
+ctest --test-dir build-linux          # 87 self-checking tests
 ```
 
 Add `-DPROSPER_APP=ON` to also build the windowed `prosper-app` frontend (fetches SDL3). A

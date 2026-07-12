@@ -11,6 +11,7 @@
 #include "pm4_registers.hpp"      // SPI_SHADER_USER_DATA_* offsets
 #include "rdna2_decode.hpp"       // rdna2_walk (for the vertex-fetch const-eval)
 #include "rdna2_to_spirv.hpp"     // recompile_compute
+#include "writer_provenance.hpp"
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -870,7 +871,7 @@ ComputeLaunchDimensions resolve_compute_launch(const GpuState::Dispatch& d) {
     return out;
 }
 
-bool execute_compute_dispatches(const GpuState& st) {
+bool execute_compute_dispatches(const GpuState& st, uint64_t submit_no) {
     if (!g_compute || st.dispatches.empty()) return false;
     namespace P = prosper::agc::Pm4;
     auto rd = [](const std::unordered_map<uint32_t, uint32_t>& regs, uint32_t off) {
@@ -880,7 +881,8 @@ bool execute_compute_dispatches(const GpuState& st) {
 
     std::vector<ComputeItem> items;
     items.reserve(st.dispatches.size());
-    for (const auto& dispatch : st.dispatches) {
+    for (size_t dispatch_index = 0; dispatch_index < st.dispatches.size(); dispatch_index++) {
+        const auto& dispatch = st.dispatches[dispatch_index];
         const GpuState& ds = dispatch.state ? *dispatch.state : st;
         const uint64_t code_addr = (static_cast<uint64_t>(rd(ds.sh, P::COMPUTE_PGM_LO)) << 8) |
                                    (static_cast<uint64_t>(rd(ds.sh, P::COMPUTE_PGM_HI) & 0xffu) << 40);
@@ -936,6 +938,9 @@ bool execute_compute_dispatches(const GpuState& st) {
         item.resources = std::move(table);
         item.launch = launch;
         item.code_addr = code_addr;
+        item.dispatch_index = dispatch_index;
+        item.submit_no = submit_no;
+        item.command_order = dispatch.command_order;
         if (item.spirv.empty()) {
             static std::set<uint64_t> logged;
             if (logged.insert(code_addr).second)
@@ -1111,6 +1116,7 @@ void diagnose_resource_provenance(const GpuState& st, uint64_t submit_no) {
         GpuState::Draw draw_record{};
     };
     static std::unordered_map<uint64_t, ColorWrite> last_color_write;
+    static std::set<uint64_t> recorded_color_ranges;
     static uint64_t draw_submit_ordinal = 0;
     const uint64_t this_draw_submit = st.draws.empty() ? draw_submit_ordinal : draw_submit_ordinal++;
 
@@ -1125,24 +1131,53 @@ void diagnose_resource_provenance(const GpuState& st, uint64_t submit_no) {
             auto prt = build_stage_table(ds, rs.ps_addr, true);
             if (prt) for (const auto& r : prt->resources) {
                 if (r.width != want_w || r.height != want_h) continue;
+                const uint64_t resource_size = r.size ? r.size :
+                    static_cast<uint64_t>(r.width) * r.height * 4;
+                auto writer = last_guest_write_overlap(r.gpu_addr, resource_size);
+                if (writer) {
+                    fprintf(stderr,
+                            "[provenance]   latest-recorded-overlap kind=%s seq=%llu "
+                            "range=[0x%llx,+0x%llx) "
+                            "submit=%llu item=%llu order=%llu identity=0x%llx dims=%ux%u\n",
+                            guest_writer_kind_name(writer->kind),
+                            (unsigned long long)writer->sequence,
+                            (unsigned long long)writer->addr,
+                            (unsigned long long)writer->size,
+                            (unsigned long long)writer->submit,
+                            (unsigned long long)writer->item,
+                            (unsigned long long)writer->order,
+                            (unsigned long long)writer->identity,
+                            writer->width, writer->height);
+                } else {
+                    fprintf(stderr,
+                            "[provenance]   no recorded color/compute/DMA/WRITE_DATA overlap for "
+                            "[0x%llx,+0x%llx)\n",
+                            (unsigned long long)r.gpu_addr,
+                            (unsigned long long)resource_size);
+                }
                 auto it = last_color_write.find(r.gpu_addr);
                 if (it == last_color_write.end()) {
                     fprintf(stderr,
                             "[provenance] consumer submit=%llu draw=%zu ps=0x%llx samples "
-                            "addr=0x%llx dims=%ux%u draw_submit=%llu: no prior color-target write\n",
+                            "addr=0x%llx dims=%ux%u draw_submit=%llu order=%llu: "
+                            "no prior color-target write\n",
                             (unsigned long long)submit_no, i, (unsigned long long)rs.ps_addr,
                             (unsigned long long)r.gpu_addr, r.width, r.height,
-                            (unsigned long long)this_draw_submit);
+                            (unsigned long long)this_draw_submit,
+                            (unsigned long long)st.draws[i].command_order);
                 } else {
                     const ColorWrite& w = it->second;
                     fprintf(stderr,
                             "[provenance] consumer submit=%llu draw=%zu ps=0x%llx samples "
-                            "addr=0x%llx dims=%ux%u draw_submit=%llu: last color write submit=%llu "
+                            "addr=0x%llx dims=%ux%u draw_submit=%llu order=%llu: "
+                            "last color write submit=%llu "
                             "draw_submit=%llu draw=%zu target_extent=%ux%u "
                             "vs=0x%llx ps=0x%llx\n",
                             (unsigned long long)submit_no, i, (unsigned long long)rs.ps_addr,
                             (unsigned long long)r.gpu_addr, r.width, r.height,
-                            (unsigned long long)this_draw_submit, (unsigned long long)w.submit,
+                            (unsigned long long)this_draw_submit,
+                            (unsigned long long)st.draws[i].command_order,
+                            (unsigned long long)w.submit,
                             (unsigned long long)w.draw_submit, w.draw, w.width, w.height,
                             (unsigned long long)w.vs, (unsigned long long)w.ps);
                     static std::set<uint64_t> probed;
@@ -1161,11 +1196,21 @@ void diagnose_resource_provenance(const GpuState& st, uint64_t submit_no) {
             }
         }
 
-        if (rs.color0_base)
+        if (rs.color0_base) {
             last_color_write[rs.color0_base] = {
                 submit_no, this_draw_submit, i, rs.es_addr, rs.ps_addr,
                 rs.color0_width, rs.color0_height, st.draws[i]
             };
+            // The exact-address map above retains every latest color writer. The generic overlap
+            // history needs only one representative event per target range; recording every draw
+            // adds millions of mutex/hash operations during Dead Cells' submit-heavy startup.
+            if (recorded_color_ranges.insert(rs.color0_base).second) {
+                const uint64_t bytes = static_cast<uint64_t>(rs.color0_width) * rs.color0_height * 4;
+                record_guest_write(GuestWriterKind::ColorTarget, rs.color0_base, bytes,
+                                   submit_no, i, st.draws[i].command_order, rs.ps_addr,
+                                   rs.color0_width, rs.color0_height);
+            }
+        }
     }
 }
 
