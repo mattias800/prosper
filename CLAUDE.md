@@ -99,12 +99,12 @@ window reaches the Evil Empire splash. #545 was software-render throughput, not 
 
 Dead Cells now has a deterministic route through splash/menu into gameplay. HUD and partial composition render,
 but the world is mostly white (#566). Version-4 `.prgcap` captures seed temporal RTT inputs (#568) and isolate the
-first bad composition at draw 18; one 642x362 input has no prior color-target writer. The dispatch ABI (#571),
-`sceAgcCbSetShRegistersDirect`, and compute direct type-1 V# binding (#574) recover a real compute program and
-buffer resource. The immediate frontier is actual compute execution (#576): dispatches are still retained for
-diagnostics only, so compute-produced memory/images remain stale. Use writer provenance to prove ownership of the
-missing surface rather than assuming compute is causal. The residual seeded replay mismatch (#569) and the
-animation-sensitive exact splash guard (#573) remain separate tooling issues.
+first bad composition at draw 18; one 642x362 input has no prior color-target writer. The kernel-derived dispatch
+thread/local/group contract (#580), `sceAgcCbSetShRegistersDirect`, and compute direct type-1 V# binding (#574)
+recover a real compute program and buffer resource. The immediate frontier is actual compute execution (#576):
+dispatches are still retained for diagnostics only, so compute-produced memory/images remain stale. Use writer
+provenance to prove ownership of the missing surface rather than assuming compute is causal. The residual seeded
+replay mismatch (#569) and the animation-sensitive exact splash guard (#573) remain separate tooling issues.
 `PROSPER_DESCRIPTOR_VALIDATE=strict|poison` and `gpu_replay --validate` are landed capabilities from #515.
 Do not restart the superseded
 Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without contradictory new evidence.

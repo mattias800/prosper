@@ -125,6 +125,17 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
 // to dispatches referencing an image of that size (for example the Messenger 1024x32 grading LUT).
 void diagnose_compute_dispatches(const GpuState& st, uint64_t submit_no);
 
+struct ComputeLaunchDimensions {
+    uint32_t threads_x = 0, threads_y = 0, threads_z = 0;
+    uint32_t local_x = 1, local_y = 1, local_z = 1;
+    uint32_t groups_x = 0, groups_y = 0, groups_z = 0;
+};
+
+// Convert sceAgcCbDispatch's API thread counts into hardware/Vulkan workgroup counts using the
+// dispatch's retained COMPUTE_NUM_THREAD_* register snapshot. Zero local-size registers fall back
+// to one so malformed/incomplete state never divides by zero.
+ComputeLaunchDimensions resolve_compute_launch(const GpuState::Dispatch& dispatch);
+
 // PROSPER_PROVENANCE_DIM=WxH: retain color-target address history across submits, then inspect
 // sampled images of that size and report the most recent draw that wrote the same guest address.
 // PROSPER_PROVENANCE_MIN_DRAWS=N limits expensive descriptor resolution to large target submits.

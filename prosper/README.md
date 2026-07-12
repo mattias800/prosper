@@ -36,8 +36,8 @@ possible without console keys. Dumps are user-supplied and gitignored.
 - ✅ **Dead Cells reaches gameplay reproducibly:** a deterministic input route passes the splash and menus
   into the first playable scene. HUD and some composition render, but the world is mostly white (#566).
   Version-4 GPU captures seed temporal render targets for faithful offline isolation (#568); one residual
-  live/replay hash mismatch remains (#569). Dispatch dimensions, compute program binding, and the title's
-  direct type-1 buffer resource now decode correctly (#571/#574).
+  live/replay hash mismatch remains (#569). Dispatch thread counts and derived workgroup dimensions,
+  compute program binding, and the title's direct type-1 buffer resource now decode correctly (#580/#574).
 - 🚧 **Active frontiers:** execute retained compute dispatches in stream order (#576), then use compute
   writer provenance to determine whether the missing 642x362 Dead Cells composition input is compute-owned.
   Stabilize the animation-sensitive exact splash guard (#573) and continue cross-title capture/replay and

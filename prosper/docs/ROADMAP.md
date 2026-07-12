@@ -38,8 +38,9 @@ presented, framebuffer CRC == golden" is. Each change adds the check that proves
 - **Dead Cells cross-title milestone:** deterministic routing now reaches gameplay. HUD and partial composition
   render, but the world is mostly white (#566). Version-4 captures seed temporal render targets (#568) and isolate
   the first bad composition at draw 18; its missing 642x362 input has no prior color-target writer. The corrected
-  dispatch ABI (#571), `sceAgcCbSetShRegistersDirect`, and compute direct type-1 V# decoding (#574) now recover a
-  valid registered program and one real buffer resource for every exercised startup dispatch.
+  dispatch thread/local/group contract (#580), `sceAgcCbSetShRegistersDirect`, and compute direct type-1 V#
+  decoding (#574) now recover a valid registered program and one real buffer resource for every exercised
+  startup dispatch.
 - **Immediate milestone:** execute retained compute dispatches and order their writes before downstream consumers
   (#576), then extend provenance to identify compute/DMA/CPU writers and test whether Dead Cells' missing surface
   is compute-produced. Separately, resolve the seeded replay hash mismatch (#569) and animation-sensitive splash

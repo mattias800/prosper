@@ -6,6 +6,7 @@
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
 #include "../src/gpu/command_processor.hpp"
+#include "../src/gpu/gpu_execute.hpp"
 #include "../src/gpu/pm4_registers.hpp"
 #include <cstdio>
 #include <cstdint>
@@ -196,24 +197,35 @@ int main() {
         ShaderReg cregs1[1] = {{P::COMPUTE_USER_DATA_0 + 3, 0xBBBB2222u}};
         reset(CD, 0x3ff, 0, 0, 0, 0);
         setsh(CD, (uint64_t)(uintptr_t)cregs0, 2, 0, 0, 0);
-        dispatch(CD, 0x1122334455667788ull, 32, 4, 1, 0);
+        ShaderReg thread_regs[3] = {
+            {P::COMPUTE_NUM_THREAD_X, 64}, {P::COMPUTE_NUM_THREAD_Y, 2}, {P::COMPUTE_NUM_THREAD_Z, 1},
+        };
+        setsh(CD, (uint64_t)(uintptr_t)thread_regs, 3, 0, 0, 0);
+        dispatch(CD, 130, 5, 3, 0x1122334455667788ull, 0);
         setsh(CD, (uint64_t)(uintptr_t)cregs1, 1, 0, 0, 0);
-        dispatch(CD, 0x8877665544332211ull, 8, 2, 3, 0);
+        dispatch(CD, 8, 2, 3, 0x8877665544332211ull, 0);
         GpuState cs;
         run_cb(cbuf, 128, cs);
         CHECK(cs.dispatch_count == 2 && cs.dispatches.size() == 2,
               "2 compute dispatches counted and retained");
         if (cs.dispatches.size() == 2) {
-            CHECK(cs.dispatches[0].tg_x == 32 && cs.dispatches[0].tg_y == 4 && cs.dispatches[0].tg_z == 1,
-                  "dispatch 0 threadgroup counts retained");
+            CHECK(cs.dispatches[0].threads_x == 130 && cs.dispatches[0].threads_y == 5 &&
+                  cs.dispatches[0].threads_z == 3, "dispatch 0 retains API thread counts");
             CHECK(cs.dispatches[0].modifier == 0x1122334455667788ull,
                   "dispatch 0 modifier retained");
+            auto launch = resolve_compute_launch(cs.dispatches[0]);
+            CHECK(launch.local_x == 64 && launch.local_y == 2 && launch.local_z == 1,
+                  "dispatch launch resolves local size from retained registers");
+            CHECK(launch.groups_x == 3 && launch.groups_y == 3 && launch.groups_z == 3,
+                  "dispatch launch ceil-divides non-divisible thread counts");
             CHECK(cs.dispatches[0].state &&
                   cs.dispatches[0].state->sh.at(P::COMPUTE_USER_DATA_0 + 3) == 0xAAAA1111u,
                   "dispatch 0 snapshot retains pre-update compute user data");
             CHECK(cs.dispatches[1].state &&
                   cs.dispatches[1].state->sh.at(P::COMPUTE_USER_DATA_0 + 3) == 0xBBBB2222u,
                   "dispatch 1 snapshot retains updated compute user data");
+            CHECK(cs.dispatches[1].threads_x == 8 && cs.dispatches[1].threads_y == 2 &&
+                  cs.dispatches[1].threads_z == 3, "dispatch 1 asymmetric thread counts retained");
         }
     }
 

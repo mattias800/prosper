@@ -122,8 +122,8 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
                     break;
                 case R_DISPATCH_DIRECT:
                     c.kind = K::DispatchDirect;
-                    // payload: [0..2]=threadgroups x/y/z, [3..4]=64-bit dispatch modifier.
-                    if (npl >= 3) { c.tg_x = pl[0]; c.tg_y = pl[1]; c.tg_z = pl[2]; }
+                    // Custom HLE payload: [0..2]=thread counts x/y/z, [3..4]=64-bit modifier.
+                    if (npl >= 3) { c.threads_x = pl[0]; c.threads_y = pl[1]; c.threads_z = pl[2]; }
                     if (npl >= 5) c.dispatch_modifier = (uint64_t)pl[3] | ((uint64_t)pl[4] << 32);
                     break;
                 case R_INDEX_BASE:
