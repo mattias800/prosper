@@ -646,6 +646,7 @@ LiveRenderPhase live_render_phase();
 // replayer; normal guest execution enters through execute_and_present(). Returns {} when unregistered.
 std::vector<uint8_t> render_submit_items(const std::vector<DrawItem>& items,
                                          uint32_t width, uint32_t height);
+bool execute_compute_items(const std::vector<ComputeItem>& items);
 
 // Render a folded GpuState at (width,height) via the registered live renderer and hand the frame to the
 // present path (present_write_frame). Returns true iff a frame was produced and presented. A no-op

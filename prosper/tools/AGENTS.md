@@ -69,14 +69,19 @@ the guest and command decoder advance. The `screenshot` frontend exposes this as
 submit gate for repeatable renderer investigations.
 `PROSPER_GPU_TIMELINE=<path>.prgtl` records every folded submit before renderer sampling plus every
 VideoOut flip. `gpu_timeline <path> [--records]` inspects the checksummed index offline. Recording is
-independent of `PROSPER_RENDER_EVERY`; version 1 is semantic metadata, not yet a renderable resource capture.
+independent of `PROSPER_RENDER_EVERY`. To materialize one exact indexed submit without rendering the
+warmup, set `PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT=N` and
+`PROSPER_GPU_TIMELINE_CAPTURE=<path>.prgcap` on a second run. Version-2 detail records link the capsule;
+version-5 capsules deduplicate content-addressed shader/resource versions and retain mixed draw/dispatch
+order plus explicit unrealized operations. Selection is intentionally bounded to one submit; automatic
+cross-submit producer closure remains #595.
 Per-target RTT is the normal renderer path. `PROSPER_RTT_SINGLE_TARGET=1` restores the obsolete flattened
 single-framebuffer compositor only for diagnostic comparison; it cannot represent real post chains or
 offscreen target dimensions.
 
 Use `gpu_replay --inspect-only` to print fixed-function state, native color-target dimensions, resource
 hashes, explicit clear intent, guest depth/stencil surface identities, and raw stencil-op provenance.
-Version-4 capsules also print and restore temporal RTT seeds: exact host-rendered surfaces sampled by the
+Version-4+ capsules also print and restore temporal RTT seeds: exact host-rendered surfaces sampled by the
 captured submit whose producer ran in an earlier submit. This keeps replay from silently substituting stale
 guest-memory bytes for renderer-owned history; older capsules remain readable and report zero seeds.
 The draw header also reports raster state as `raster=cull/front-face/polygon-mode`, using Vulkan enum

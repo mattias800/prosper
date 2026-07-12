@@ -41,10 +41,28 @@ struct GpuTimelinePresent {
     uint32_t height = 0;
 };
 
+struct GpuTimelineDetail {
+    uint64_t sequence = 0;
+    uint64_t elapsed_ns = 0;
+    uint64_t submit_no = 0;
+    std::string capture_path;
+    uint32_t semantic_draw_count = 0;
+    uint32_t semantic_dispatch_count = 0;
+    uint32_t realized_draw_count = 0;
+    uint32_t realized_dispatch_count = 0;
+    uint32_t operation_count = 0;
+    uint32_t missing_operation_count = 0;
+    uint32_t shader_version_count = 0;
+    uint32_t resource_version_count = 0;
+    uint64_t resource_bytes = 0;
+};
+
 struct GpuTimelineFile {
+    uint32_t version = 0;
     GpuTimelineMetadata metadata;
     std::vector<GpuTimelineSubmit> submits;
     std::vector<GpuTimelinePresent> presents;
+    std::vector<GpuTimelineDetail> details;
     bool truncated_tail = false;
 };
 
@@ -58,6 +76,7 @@ public:
     bool open(const std::string& path, const GpuTimelineMetadata& metadata, std::string& error);
     bool append_submit(const GpuTimelineSubmit& submit, std::string& error);
     bool append_present(const GpuTimelinePresent& present, std::string& error);
+    bool append_detail(const GpuTimelineDetail& detail, std::string& error);
     bool flush(std::string& error);
     void close();
 

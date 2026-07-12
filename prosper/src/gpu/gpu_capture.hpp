@@ -26,7 +26,13 @@ struct GpuCaptureMetadata {
 struct GpuCaptureBlob {
     uint64_t guest_addr = 0;
     uint64_t bytes_read = 0;
+    uint64_t content_hash = 0;
     std::vector<uint8_t> bytes;
+};
+
+struct GpuCaptureShaderVersion {
+    uint64_t content_hash = 0;
+    std::vector<uint32_t> words;
 };
 
 struct GpuCapturedResource {
@@ -50,6 +56,25 @@ struct GpuCapturedDraw {
     std::vector<uint32_t> indices;
     uint64_t color0_base = 0;
     uint32_t color0_width = 0, color0_height = 0;
+    uint64_t draw_index = 0;
+    uint64_t command_order = 0;
+};
+
+struct GpuCapturedCompute {
+    std::vector<uint32_t> spirv;
+    GpuCapturedTable resources;
+    ComputeLaunchDimensions launch;
+    uint64_t code_addr = 0;
+    uint64_t dispatch_index = 0;
+    uint64_t submit_no = 0;
+    uint64_t command_order = 0;
+};
+
+struct GpuCapturedOperation {
+    SubmitOperationKind kind = SubmitOperationKind::Draw;
+    uint64_t source_index = 0;
+    uint64_t command_order = 0;
+    bool realized = false;
 };
 
 // Host-rendered pixels retained across submits. The HLE renderer does not write these pixels back to
@@ -65,8 +90,12 @@ struct GpuCaptureRttSeed {
 struct GpuCaptureFile {
     GpuCaptureMetadata metadata;
     std::vector<GpuCaptureBlob> blobs;
+    std::vector<GpuCaptureShaderVersion> shader_versions;
     std::vector<GpuCaptureRttSeed> rtt_seeds;
     std::vector<GpuCapturedDraw> draws;
+    std::vector<GpuCapturedCompute> computes;
+    std::vector<GpuCapturedOperation> operations;
+    bool expected_output_valid = false;
     uint64_t expected_output_hash = 0;
     uint64_t expected_output_bytes = 0;
 };
@@ -79,14 +108,33 @@ using CaptureRttSeedReader = std::function<bool(uint64_t guest_addr, GpuCaptureR
 bool capture_draw_items(const std::vector<DrawItem>& items, const GpuCaptureMetadata& metadata,
                         const CaptureMemoryReader& reader, GpuCaptureFile& out, std::string& error,
                         const CaptureRttSeedReader& rtt_reader = {});
+bool capture_submit_items(const std::vector<DrawItem>& draws,
+                          const std::vector<ComputeItem>& computes,
+                          const std::vector<SubmitOperation>& operations,
+                          const GpuCaptureMetadata& metadata,
+                          const CaptureMemoryReader& reader, GpuCaptureFile& out,
+                          std::string& error, const CaptureRttSeedReader& rtt_reader = {});
+bool capture_gpustate_submit(const GpuState& state, uint64_t submit_no,
+                             uint32_t width, uint32_t height,
+                             const GpuCaptureMetadata& metadata,
+                             GpuCaptureFile& out, std::string& error);
 bool write_gpu_capture(const std::string& path, const GpuCaptureFile& capture, std::string& error);
 bool read_gpu_capture(const std::string& path, GpuCaptureFile& capture, std::string& error);
 
 struct GpuReplayFrame {
+    struct ResourceInstance {
+        uint64_t guest_addr = 0;
+        uint32_t blob_index = 0xFFFFFFFFu;
+        std::vector<uint8_t> bytes;
+    };
     GpuCaptureMetadata metadata;
     std::vector<GpuCaptureBlob> blobs;
+    std::vector<ResourceInstance> resource_instances;
     std::vector<GpuCaptureRttSeed> rtt_seeds;
     std::vector<DrawItem> items;
+    std::vector<ComputeItem> computes;
+    std::vector<GpuCapturedOperation> operations;
+    bool expected_output_valid = false;
     uint64_t expected_output_hash = 0;
     uint64_t expected_output_bytes = 0;
 };

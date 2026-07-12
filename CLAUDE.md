@@ -108,6 +108,13 @@ warmup artifact: the 35-second render delay skipped a 642x362 RTT producer, then
 4's raw all-`0xFF` backing and cached it indefinitely. `PROSPER_RENDER_TARGET_DIM=642x362` preserves the real
 opening vignette/level geometry; #586 now tracks a practical late checkpoint with that history intact. The
 residual seeded replay mismatch (#569) and animation-sensitive exact splash guard (#573) remain separate issues.
+
+The current tooling frontier is deterministic offline capture rather than longer live-render windows.
+Native-speed `.prgtl` indexes retain every submit/present boundary, and an exact-submit selector can materialize
+immutable, content-deduplicated graphics/compute state plus mixed PM4 order into a version-5 `.prgcap` (#594).
+Use that path to isolate the Dead Cells gameplay consumer, then implement automatic earlier-producer dependency
+closure (#595/#586). The stale exact Dead Cells snapshot baseline is tracked separately in #596 and must not be
+silently updated.
 `PROSPER_PROVENANCE_DIM=WxH` reports overlapping color, compute, DMA_DATA, and WRITE_DATA writers with
 submit/item/PM4 ordinals.
 `PROSPER_RESOURCE_HASH_DIM=WxH` correlates raw and sampled hashes with those writers at each live draw;

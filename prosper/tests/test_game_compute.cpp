@@ -90,6 +90,21 @@ int main() {
     }
     CHECK(all_filled, "all 130 records are filled across three workgroups");
 
+    std::vector<uint32_t> replay_owned(records * 4, 0xdddddddd);
+    ShaderResource replay_buffer = buffer;
+    replay_buffer.gpu_addr = 1; // Deliberately unreadable: replay must never dereference this identity.
+    replay_buffer.host_data = reinterpret_cast<uint8_t*>(replay_owned.data());
+    replay_buffer.host_data_size = replay_owned.size() * sizeof(uint32_t);
+    item.resources = std::make_shared<ShaderResourceTable>();
+    item.resources->resources.push_back(replay_buffer);
+    CHECK(prosper::frontend::execute_live_compute_items({item}),
+          "production compute backend executes against replay-owned bytes");
+    bool replay_filled = true;
+    for (uint32_t record = 0; record < records && replay_filled; ++record)
+        for (uint32_t component = 0; component < 4; ++component)
+            replay_filled &= replay_owned[record * 4 + component] == expected[component];
+    CHECK(replay_filled, "compute writeback updates owned backing for a later replay operation");
+
     if (fails) {
         std::printf("== FAIL: %d ==\n", fails);
         return 1;

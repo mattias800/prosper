@@ -152,10 +152,10 @@ struct ShaderResource {
     // path (that already broadcasts coverage to every channel).
     uint32_t      swizzle[4]        = {4, 5, 6, 7};
 
-    // Replay-only backing. `gpu_addr` remains the captured logical guest address so render-target
-    // identity/alias checks stay faithful; the live renderer reads from host_data when non-null.
-    // Production resource tables leave both fields zero and continue reading 1:1 guest memory.
-    const uint8_t* host_data        = nullptr;
+    // Replay-only owned backing. `gpu_addr` remains the captured logical guest address so render-target
+    // identity/alias checks stay faithful. Graphics reads from host_data; compute may update it before a
+    // later operation consumes the same version. Production tables leave both fields zero and use guest memory.
+    uint8_t*       host_data        = nullptr;
     uint64_t       host_data_size   = 0;
 };
 

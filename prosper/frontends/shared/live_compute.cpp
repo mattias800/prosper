@@ -151,13 +151,19 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (buffer.memory) vkFreeMemory(ctx.device, buffer.memory, nullptr);
         }
     };
+    auto resource_bytes = [](const ShaderResource* resource) -> uint8_t* {
+        if (resource->host_data && resource->host_data_size >= resource->size)
+            return resource->host_data;
+        return reinterpret_cast<uint8_t*>(uintptr_t(resource->gpu_addr));
+    };
 
     do {
         std::vector<VkDescriptorSetLayoutBinding> layout_bindings(descriptors.size());
         for (size_t i = 0; i < descriptors.size(); i++) {
             const ShaderResource* resource = item.resources->by_binding(descriptors[i].binding);
             if (!resource || !resource->size ||
-                !guest_readable(resource->gpu_addr, resource->size)) break;
+                ((!resource->host_data || resource->host_data_size < resource->size) &&
+                 !guest_readable(resource->gpu_addr, resource->size))) break;
             buffers[i].resource = resource;
             VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
             bci.size = resource->size;
@@ -174,9 +180,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (vkBindBufferMemory(ctx.device, buffers[i].buffer, buffers[i].memory, 0) != VK_SUCCESS) break;
             void* mapped = nullptr;
             if (vkMapMemory(ctx.device, buffers[i].memory, 0, resource->size, 0, &mapped) != VK_SUCCESS) break;
-            const void* guest = (const void*)(uintptr_t)resource->gpu_addr;
-            if (trace) buffers[i].before_hash = fnv1a(guest, resource->size);
-            std::memcpy(mapped, guest, resource->size);
+            const uint8_t* source = resource_bytes(resource);
+            if (trace) buffers[i].before_hash = fnv1a(source, resource->size);
+            std::memcpy(mapped, source, resource->size);
             vkUnmapMemory(ctx.device, buffers[i].memory);
 
             layout_bindings[i].binding = descriptors[i].binding;
@@ -266,16 +272,16 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 readback_ok = false;
                 break;
             }
-            auto* guest = (uint8_t*)(uintptr_t)buffer.resource->gpu_addr;
+            uint8_t* destination = resource_bytes(buffer.resource);
             const auto* result = static_cast<const uint8_t*>(mapped);
             if (trace) {
                 buffer.after_hash = fnv1a(result, buffer.resource->size);
                 for (uint32_t i = 0; i < buffer.resource->size; i++)
-                    buffer.changed_bytes += guest[i] != result[i];
+                    buffer.changed_bytes += destination[i] != result[i];
             }
-            std::memcpy(guest, result, buffer.resource->size);
+            std::memcpy(destination, result, buffer.resource->size);
             vkUnmapMemory(ctx.device, buffer.memory);
-            if (writer_provenance_enabled())
+            if (!buffer.resource->host_data && writer_provenance_enabled())
                 record_guest_write(GuestWriterKind::ComputeBuffer,
                                    buffer.resource->gpu_addr, buffer.resource->size,
                                    item.submit_no, item.dispatch_index,
@@ -294,16 +300,17 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     if (trace) {
         for (const auto& buffer : buffers) {
             if (!buffer.resource) continue;
+            const uint8_t* bytes = resource_bytes(buffer.resource);
             std::fprintf(stderr,
                          "[compute]   writeback binding=%u addr=0x%llx size=%u changed=%llu "
                          "hash=%016llx->%016llx first=%08x,%08x,%08x,%08x\n",
                          buffer.resource->binding, (unsigned long long)buffer.resource->gpu_addr,
                          buffer.resource->size, (unsigned long long)buffer.changed_bytes,
                          (unsigned long long)buffer.before_hash, (unsigned long long)buffer.after_hash,
-                         buffer.resource->size >= 4 ? ((const uint32_t*)(uintptr_t)buffer.resource->gpu_addr)[0] : 0,
-                         buffer.resource->size >= 8 ? ((const uint32_t*)(uintptr_t)buffer.resource->gpu_addr)[1] : 0,
-                         buffer.resource->size >= 12 ? ((const uint32_t*)(uintptr_t)buffer.resource->gpu_addr)[2] : 0,
-                         buffer.resource->size >= 16 ? ((const uint32_t*)(uintptr_t)buffer.resource->gpu_addr)[3] : 0);
+                         buffer.resource->size >= 4 ? reinterpret_cast<const uint32_t*>(bytes)[0] : 0,
+                         buffer.resource->size >= 8 ? reinterpret_cast<const uint32_t*>(bytes)[1] : 0,
+                         buffer.resource->size >= 12 ? reinterpret_cast<const uint32_t*>(bytes)[2] : 0,
+                         buffer.resource->size >= 16 ? reinterpret_cast<const uint32_t*>(bytes)[3] : 0);
         }
     }
     cleanup();

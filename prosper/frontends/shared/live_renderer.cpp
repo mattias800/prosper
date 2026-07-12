@@ -55,7 +55,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
     }
     static std::atomic<int> frame_no{0};
     static std::unordered_map<uint64_t, RttSurf> g_rtt;   // render-to-texture cache (#167)
-    if (getenv("PROSPER_GPU_CAPTURE"))
+    if (getenv("PROSPER_GPU_CAPTURE") || getenv("PROSPER_GPU_TIMELINE_CAPTURE"))
         prosper::gpu::set_gpu_capture_rtt_seed_reader([](uint64_t addr, prosper::gpu::GpuCaptureRttSeed& seed) {
             auto it = g_rtt.find(addr); if (it == g_rtt.end()) return false;
             seed.guest_addr = addr; seed.width = it->second.w; seed.height = it->second.h;
