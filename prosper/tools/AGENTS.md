@@ -17,6 +17,9 @@ the shipped runtime. Build them from `build-linux/` like everything else.
 - **`gpu_replay/`** — replay a local `PROSPER_GPU_CAPTURE` realized-submit capsule through the same
   Vulkan backend without booting the guest. Capsules include game shaders/resources, use `.prgcap`,
   are gitignored, and must never be committed. The tool exits non-zero on output-hash mismatch.
+- **`gpu_timeline/`** — inspect a native-speed `.prgtl` submit/present index recorded with
+  `PROSPER_GPU_TIMELINE=<path>`. It does not invoke Vulkan; use it to locate progression and producer
+  windows before making an expensive realized `.prgcap`. Timeline files are gitignored and local-only.
 - **`spv_validate/`** — `spirv-val` wrapper for recompiled SPIR-V.
 - **`niddiag/`, `fetch_niddb.sh`** — NID (Sony symbol hash) resolution helpers.
 
@@ -64,6 +67,9 @@ rerenders matching target passes by prefix and logs per-draw hashes plus dark/wh
 the guest and command decoder advance. The `screenshot` frontend exposes this as `--warmup-seconds`, plus
 `--warmup-submits` for `PROSPER_RENDER_FIRST`; use wall-clock warmup for progression captures and the exact
 submit gate for repeatable renderer investigations.
+`PROSPER_GPU_TIMELINE=<path>.prgtl` records every folded submit before renderer sampling plus every
+VideoOut flip. `gpu_timeline <path> [--records]` inspects the checksummed index offline. Recording is
+independent of `PROSPER_RENDER_EVERY`; version 1 is semantic metadata, not yet a renderable resource capture.
 Per-target RTT is the normal renderer path. `PROSPER_RTT_SINGLE_TARGET=1` restores the obsolete flattened
 single-framebuffer compositor only for diagnostic comparison; it cannot represent real post chains or
 offscreen target dimensions.

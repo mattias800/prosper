@@ -25,6 +25,7 @@
 #include "host/boot_program.hpp"       // boot_program
 #include "host/exec_image.hpp"         // run_entry
 #include "gpu/videoout_present.hpp"    // present_count / present_readback / present_width/height
+#include "gpu/gpu_timeline.hpp"
 #include "live_renderer.hpp"           // register_live_renderer (frontends/shared)
 #include "capture_manifest.hpp"
 
@@ -457,5 +458,6 @@ int main(int argc, char** argv) {
     fprintf(stderr, "[shot] done: %d screenshot(s) in %s; distinct=%llu max-stale=%.1fs status=%s\n",
             saved, out.c_str(), (unsigned long long)tracker.distinct_source_frames(),
             tracker.max_stale_seconds(), exit_code ? "FAILED" : "ok");
+    gpu::close_gpu_timeline();
     _exit(exit_code);   // the guest thread is detached and running guest code; don't block on teardown
 }

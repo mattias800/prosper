@@ -360,6 +360,15 @@ if(TARGET prosper_core)
   target_link_libraries(test_gpu_capture PRIVATE prosper_core)
   add_test(NAME gpu_capture_roundtrip COMMAND test_gpu_capture)
 
+  # Native-speed append-only submit/present timeline: portable framing, checksums, and truncated-tail
+  # recovery are pure and must not depend on Vulkan or a game dump.
+  add_executable(test_gpu_timeline tests/test_gpu_timeline.cpp)
+  target_link_libraries(test_gpu_timeline PRIVATE prosper_core)
+  add_test(NAME gpu_timeline_roundtrip COMMAND test_gpu_timeline)
+
+  add_executable(gpu_timeline tools/gpu_timeline/gpu_timeline.cpp)
+  target_link_libraries(gpu_timeline PRIVATE prosper_core)
+
   # Front-half resource-table builder + V# descriptor decode (agc_shader_layout.cpp): shader user_data
   # + user-data SGPRs -> ShaderResourceTable (constant buffers, stage 1). Pure/cross-platform.
   add_executable(test_build_shader_resources tests/test_build_shader_resources.cpp)

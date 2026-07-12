@@ -13,6 +13,7 @@
 *.self
 eboot.bin
 *.prgcap
+*.prgtl
 
 # ---- Build output ----
 /prosper/build/
