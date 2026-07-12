@@ -100,6 +100,42 @@ size_t present_readback(void* dst, size_t dst_cap) {
     return bytes;
 }
 
+bool present_snapshot(PresentSnapshot& out) {
+    out = {};
+    // frame_seq is incremented while holding this mutex, after the pixels and dimensions are
+    // installed, so the copied bytes and identity describe the same renderer publication.
+    if (g_have_frame.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lk(g_frame_mx);
+        if (g_frame.empty() || !g_frame_w || !g_frame_h) return false;
+        out.source = PresentSource::Rendered;
+        out.frame_seq = g_frame_seq.load(std::memory_order_relaxed);
+        out.source_seq = out.frame_seq;
+        out.present_count = g_present_count.load(std::memory_order_relaxed);
+        out.front_index = g_front.load(std::memory_order_relaxed);
+        out.width = g_frame_w;
+        out.height = g_frame_h;
+        out.rgba = g_frame;
+        return true;
+    }
+
+    const int front = g_front.load(std::memory_order_relaxed);
+    if (front < 0) return false;
+    const uint64_t addr = prosper_vo_buffer_addr(front);
+    const uint32_t w = prosper_vo_display_width(), h = prosper_vo_display_height();
+    if (!addr || !w || !h) return false;
+    const size_t bytes = static_cast<size_t>(w) * h * 4;
+    out.source = PresentSource::RawScanout;
+    out.present_count = g_present_count.load(std::memory_order_relaxed);
+    out.source_seq = out.present_count;
+    out.frame_seq = g_frame_seq.load(std::memory_order_relaxed);
+    out.front_index = front;
+    out.width = w;
+    out.height = h;
+    out.rgba.resize(bytes);
+    std::memcpy(out.rgba.data(), reinterpret_cast<const void*>(static_cast<uintptr_t>(addr)), bytes);
+    return true;
+}
+
 void present_reset() {
     g_front.store(-1, std::memory_order_relaxed);
     g_present_count.store(0, std::memory_order_relaxed);

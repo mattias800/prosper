@@ -13,8 +13,25 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
+#include <vector>
 
 namespace prosper::gpu {
+
+enum class PresentSource : uint8_t { None, Rendered, RawScanout };
+
+// One internally consistent readback plus the counters that identify it. The older query/readback
+// calls remain for lightweight consumers, but tools that persist evidence should use this snapshot:
+// querying frame_seq and pixels separately can race a renderer write and mislabel the saved image.
+struct PresentSnapshot {
+    PresentSource source = PresentSource::None;
+    uint64_t source_seq = 0;      // rendered-frame sequence, or guest flip count for raw scanout
+    uint64_t frame_seq = 0;
+    uint64_t present_count = 0;
+    int front_index = -1;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::vector<uint8_t> rgba;
+};
 
 // Present the display buffer `buffer_index` (from sceVideoOutSubmitFlip). Records it as the front
 // buffer and bumps the present counter. `flip_arg` is the guest's flip label (echoed in flip status).
@@ -43,6 +60,10 @@ uint32_t present_frame_height();
 // Copy the presented frame's pixels (width*height, 4 bytes/pixel) from the front buffer's guest
 // memory into `dst`. Returns bytes written, or 0 if there is no surface / no flip yet / dst too small.
 size_t present_readback(void* dst, size_t dst_cap);
+
+// Copy the best available frame and its identity as one observation. Prefers a rendered frame and
+// falls back to the raw guest scanout. Returns false before either source is available.
+bool present_snapshot(PresentSnapshot& out);
 
 void present_reset();             // tests: clear front/count
 
