@@ -59,6 +59,11 @@ int main() {
           replay.items[0].prt->resources[0].host_data_size == texture.size(),
           "replay keeps logical VA and exposes exact host backing size");
 
+#ifdef _WIN32
+    _putenv_s("PROSPER_GPU_REPLAY_RTT_SEEDS", "1");
+#else
+    setenv("PROSPER_GPU_REPLAY_RTT_SEEDS", "1", 1);
+#endif
     prosper::frontend::register_live_renderer(".", false);
     std::vector<uint8_t> pixels = render_submit_items(replay.items, W, H);
     CHECK(pixels.size() == static_cast<size_t>(W) * H * 4, "replayed draw renders through live backend");
@@ -94,6 +99,34 @@ int main() {
         const uint8_t* center = &chained[(8u * 16u + 8u) * 4];
         CHECK(center[0] > 0xC0 && center[1] < 0x40 && center[2] < 0x40,
               "later pass samples pixels cached from the 32x2 producer target");
+    }
+
+    // A captured consumer may depend on a producer from an earlier submit. Restore its serialized
+    // host RTT surface before replaying draw zero; guest memory has no copy of these rendered pixels.
+    GpuCaptureRttSeed temporal_seed;
+    temporal_seed.guest_addr = 0x600000; temporal_seed.width = 2; temporal_seed.height = 2;
+    temporal_seed.rgba = {
+        255, 0, 0, 255, 255, 0, 0, 255,
+        255, 0, 0, 255, 255, 0, 0, 255,
+    };
+    CHECK(restore_gpu_replay_rtt_seeds({temporal_seed}, error),
+          "replay restores a producer surface captured from an earlier submit");
+    DrawItem temporal_consumer = replay.items[0];
+    temporal_consumer.color0_base = 0x700000;
+    temporal_consumer.color0_width = 8; temporal_consumer.color0_height = 8;
+    auto temporal_rt = std::make_shared<ShaderResourceTable>(*temporal_consumer.prt);
+    temporal_rt->resources[0].gpu_addr = temporal_seed.guest_addr;
+    temporal_rt->resources[0].width = temporal_seed.width;
+    temporal_rt->resources[0].height = temporal_seed.height;
+    temporal_rt->resources[0].host_data = nullptr;
+    temporal_rt->resources[0].host_data_size = 0;
+    temporal_consumer.prt = std::move(temporal_rt);
+    std::vector<uint8_t> temporal = render_submit_items({temporal_consumer}, W, H);
+    CHECK(temporal.size() == 8u * 8u * 4u, "temporal consumer renders at its native target extent");
+    if (temporal.size() == 8u * 8u * 4u) {
+        const uint8_t* center = &temporal[(4u * 8u + 4u) * 4];
+        CHECK(center[0] > 0xC0 && center[1] < 0x40 && center[2] < 0x40,
+              "temporal consumer samples restored host RTT pixels, not guest-memory fallback");
     }
 
     DrawItem missing_texture = replay.items[0];

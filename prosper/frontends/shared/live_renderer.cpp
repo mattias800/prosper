@@ -3,6 +3,7 @@
 #include "live_renderer.hpp"
 
 #include "gpu/gpu_execute.hpp"          // DrawItem, set_submit_renderer
+#include "gpu/gpu_capture.hpp"          // temporal RTT capture/replay seeds
 #include "gpu/tile.hpp"                 // detile_surface / tiled_surface_bytes / detile_elements
 #include "gpu/bc_decode.hpp"            // BC1/2/3 block decompression -> RGBA8 (#121)
 #include "gpu/shader_resources.hpp"     // ShaderResourceTable / ResourceClass
@@ -51,6 +52,22 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
     }
     static std::atomic<int> frame_no{0};
     static std::unordered_map<uint64_t, RttSurf> g_rtt;   // render-to-texture cache (#167)
+    if (getenv("PROSPER_GPU_CAPTURE"))
+        prosper::gpu::set_gpu_capture_rtt_seed_reader([](uint64_t addr, prosper::gpu::GpuCaptureRttSeed& seed) {
+            auto it = g_rtt.find(addr); if (it == g_rtt.end()) return false;
+            seed.guest_addr = addr; seed.width = it->second.w; seed.height = it->second.h;
+            seed.rgba = it->second.rgba; return true;
+        });
+    if (getenv("PROSPER_GPU_REPLAY_RTT_SEEDS"))
+        prosper::gpu::set_gpu_replay_rtt_seed_writer([](const prosper::gpu::GpuCaptureRttSeed& seed, std::string& error) {
+            const uint64_t expected = static_cast<uint64_t>(seed.width) * seed.height * 4;
+            if (!seed.guest_addr || !seed.width || !seed.height || expected != seed.rgba.size()) {
+                error = "invalid temporal RTT seed"; return false;
+            }
+            RttSurf& surface = g_rtt[seed.guest_addr];
+            surface.w = seed.width; surface.h = seed.height; surface.rgba = seed.rgba;
+            return true;
+        });
     // A real command stream renders each CB_COLOR0_BASE into its own surface. Keep the old flattened
     // compositor only as a diagnostic fallback; it cannot preserve post chains or target extents.
     static const bool pertarget = getenv("PROSPER_RTT_PERTARGET") != nullptr ||
