@@ -1331,6 +1331,9 @@ std::vector<uint8_t> render_submit_items(const std::vector<DrawItem>& items,
                                          uint32_t width, uint32_t height) {
     return g_live ? g_live(items, width, height) : std::vector<uint8_t>{};
 }
+bool execute_compute_items(const std::vector<ComputeItem>& items) {
+    return g_compute && !items.empty() && g_compute(items);
+}
 
 bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t height,
                                  uint64_t submit_no) {

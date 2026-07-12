@@ -185,10 +185,11 @@ Turn the file into a resident, relocated guest image in host memory.
   exception handler, thread-stack queries, `setjmp`, `dlsym`.
 - [x] GC thread-stack queries (`scePthreadAttrGet`/`Getstackaddr`/`Getstacksize`) via
       `pthread_getattr_np` (real bounds for IL2CPP's GC root scanning).
-- [ ] **Current frontier — graphics required.** IL2CPP aborts during internal-call resolution
+- [x] **Historical 2025 frontier — graphics required.** IL2CPP aborted during internal-call resolution
       on `UnityEngine.GL::Internal_SetRTSimple_Injected` (SetRenderTarget) at `Il2cpp+0x110ea`.
       The rendering icalls are registered when the engine's **graphics device initializes**, so
-      the boot now genuinely needs the GPU path. This is the transition to M4/M5.
+      this established that the boot genuinely needed the GPU path. M4 now runs through gameplay;
+      see the status summary in `README.md` and current GitHub issues for the active frontier.
 ### M3.5 — Threading correctness (in progress)
 - [x] **GC "unknown thread" fixed**: `pthread_equal` was unregistered (POSIX name) so the GC's
       thread-table search never matched. Root cause found via gdb (empty thread table → the

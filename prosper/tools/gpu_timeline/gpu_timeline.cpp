@@ -32,11 +32,11 @@ int main(int argc, char** argv) {
     }
     for (const auto& present : timeline.presents) last_ns = std::max(last_ns, present.elapsed_ns);
     const double seconds = static_cast<double>(last_ns) / 1e9;
-    std::printf("timeline version=1 revision=%s title=%s route=%s\n",
-                timeline.metadata.revision.c_str(), timeline.metadata.title_id.c_str(),
+    std::printf("timeline version=%u revision=%s title=%s route=%s\n",
+                timeline.version, timeline.metadata.revision.c_str(), timeline.metadata.title_id.c_str(),
                 timeline.metadata.input_route.c_str());
-    std::printf("duration=%.3fs submits=%zu presents=%zu draws=%llu dispatches=%llu truncated_tail=%s\n",
-                seconds, timeline.submits.size(), timeline.presents.size(),
+    std::printf("duration=%.3fs submits=%zu presents=%zu details=%zu draws=%llu dispatches=%llu truncated_tail=%s\n",
+                seconds, timeline.submits.size(), timeline.presents.size(), timeline.details.size(),
                 static_cast<unsigned long long>(draws), static_cast<unsigned long long>(dispatches),
                 timeline.truncated_tail ? "yes" : "no");
     if (seconds > 0)
@@ -45,14 +45,23 @@ int main(int argc, char** argv) {
     for (const auto& [extent, count] : target_extents)
         std::printf("target %ux%u submits=%llu\n", extent.first, extent.second,
                     static_cast<unsigned long long>(count));
+    for (const auto& detail : timeline.details)
+        std::printf("detail submit=%llu realized=%u/%u draws %u/%u dispatches operations=%u missing=%u "
+                    "versions=%u shaders/%u resources bytes=%llu capture=%s\n",
+                    static_cast<unsigned long long>(detail.submit_no), detail.realized_draw_count,
+                    detail.semantic_draw_count, detail.realized_dispatch_count,
+                    detail.semantic_dispatch_count, detail.operation_count,
+                    detail.missing_operation_count, detail.shader_version_count,
+                    detail.resource_version_count, static_cast<unsigned long long>(detail.resource_bytes),
+                    detail.capture_path.c_str());
 
     if (argc == 3) {
-        size_t si = 0, pi = 0;
-        while (si < timeline.submits.size() || pi < timeline.presents.size()) {
-            const bool take_submit = pi == timeline.presents.size() ||
-                (si < timeline.submits.size() &&
-                 timeline.submits[si].sequence < timeline.presents[pi].sequence);
-            if (take_submit) {
+        size_t si = 0, pi = 0, di = 0;
+        while (si < timeline.submits.size() || pi < timeline.presents.size() || di < timeline.details.size()) {
+            const uint64_t ss = si < timeline.submits.size() ? timeline.submits[si].sequence : UINT64_MAX;
+            const uint64_t ps = pi < timeline.presents.size() ? timeline.presents[pi].sequence : UINT64_MAX;
+            const uint64_t ds = di < timeline.details.size() ? timeline.details[di].sequence : UINT64_MAX;
+            if (ss <= ps && ss <= ds) {
                 const auto& s = timeline.submits[si++];
                 std::printf("%llu %.6f submit=%llu draws=%u dispatches=%u order=%llu..%llu "
                             "target=%016llx/%ux%u\n",
@@ -62,13 +71,23 @@ int main(int argc, char** argv) {
                             static_cast<unsigned long long>(s.last_command_order),
                             static_cast<unsigned long long>(s.color0_base),
                             s.color0_width, s.color0_height);
-            } else {
+            } else if (ps <= ds) {
                 const auto& p = timeline.presents[pi++];
                 std::printf("%llu %.6f present=%llu latest-submit=%llu buffer=%d flip-arg=%lld extent=%ux%u\n",
                             static_cast<unsigned long long>(p.sequence), p.elapsed_ns / 1e9,
                             static_cast<unsigned long long>(p.present_count),
                             static_cast<unsigned long long>(p.latest_submit_no), p.buffer_index,
                             static_cast<long long>(p.flip_arg), p.width, p.height);
+            } else {
+                const auto& d = timeline.details[di++];
+                std::printf("%llu %.6f detail-submit=%llu realized=%u/%u+%u/%u operations=%u missing=%u "
+                            "versions=%u/%u bytes=%llu capture=%s\n",
+                            static_cast<unsigned long long>(d.sequence), d.elapsed_ns / 1e9,
+                            static_cast<unsigned long long>(d.submit_no), d.realized_draw_count,
+                            d.semantic_draw_count, d.realized_dispatch_count, d.semantic_dispatch_count,
+                            d.operation_count, d.missing_operation_count, d.shader_version_count,
+                            d.resource_version_count, static_cast<unsigned long long>(d.resource_bytes),
+                            d.capture_path.c_str());
             }
         }
     }

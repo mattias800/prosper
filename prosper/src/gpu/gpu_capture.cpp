@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <unordered_set>
 #include <utility>
 
@@ -20,12 +21,14 @@ namespace prosper::gpu {
 namespace {
 
 constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
-constexpr uint32_t kVersion = 4;
+constexpr uint32_t kVersion = 5;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
 constexpr uint64_t kMaxTotalBlobBytes = 3ull << 30;
 constexpr uint32_t kMaxDraws = 65536;
+constexpr uint32_t kMaxComputes = 65536;
+constexpr uint32_t kMaxOperations = 131072;
 constexpr uint32_t kMaxResources = 65536;
 constexpr uint32_t kMaxShaderWords = 16u << 20;
 constexpr uint32_t kMaxStringBytes = 1u << 20;
@@ -215,9 +218,15 @@ uint64_t resource_footprint(const ShaderResource& r) {
     return std::max(result, decoded);
 }
 
-struct Interval { uint64_t begin, end; };
+struct Interval {
+    uint64_t begin = 0;
+    uint64_t end = 0;
+    uint32_t blob_index = 0xFFFFFFFFu;
+};
 
-bool collect_intervals(const std::vector<DrawItem>& items, std::vector<Interval>& intervals, std::string& error) {
+bool collect_intervals(const std::vector<DrawItem>& draws,
+                       const std::vector<ComputeItem>& computes,
+                       std::vector<Interval>& intervals, std::string& error) {
     uint64_t total = 0;
     auto add_table = [&](const ShaderResourceTable* t) -> bool {
         if (!t) return true;
@@ -231,7 +240,8 @@ bool collect_intervals(const std::vector<DrawItem>& items, std::vector<Interval>
         }
         return true;
     };
-    for (const auto& d : items) if (!add_table(d.vrt.get()) || !add_table(d.prt.get())) return false;
+    for (const auto& d : draws) if (!add_table(d.vrt.get()) || !add_table(d.prt.get())) return false;
+    for (const auto& c : computes) if (!add_table(c.resources.get())) return false;
     std::sort(intervals.begin(), intervals.end(), [](auto a, auto b) { return a.begin < b.begin; });
     std::vector<Interval> merged;
     for (auto x : intervals) {
@@ -258,7 +268,7 @@ bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& 
                 return x.begin <= r.gpu_addr && r.gpu_addr + n <= x.end;
             });
             if (it == intervals.end()) { error = "resource was not assigned to a capture blob"; return false; }
-            c.blob_index = static_cast<uint32_t>(it - intervals.begin()); c.blob_offset = r.gpu_addr - it->begin;
+            c.blob_index = it->blob_index; c.blob_offset = r.gpu_addr - it->begin;
         }
         dst.resources.push_back(std::move(c));
     }
@@ -279,6 +289,36 @@ bool validate_rtt_seed(const GpuCaptureRttSeed& seed, std::string& error) {
     return true;
 }
 
+uint64_t shader_hash(const std::vector<uint32_t>& words) {
+    return gpu_capture_hash(reinterpret_cast<const uint8_t*>(words.data()),
+                            words.size() * sizeof(uint32_t));
+}
+
+void collect_shader_versions(GpuCaptureFile& capture) {
+    capture.shader_versions.clear();
+    auto add = [&](const std::vector<uint32_t>& words) {
+        const uint64_t hash = shader_hash(words);
+        auto it = std::find_if(capture.shader_versions.begin(), capture.shader_versions.end(),
+            [&](const auto& version) { return version.content_hash == hash && version.words == words; });
+        if (it == capture.shader_versions.end())
+            capture.shader_versions.push_back({hash, words});
+    };
+    for (const auto& draw : capture.draws) {
+        add(draw.vs);
+        add(draw.fs);
+    }
+    for (const auto& compute : capture.computes) add(compute.spirv);
+}
+
+uint32_t shader_version_index(const std::vector<GpuCaptureShaderVersion>& versions,
+                              const std::vector<uint32_t>& words) {
+    const uint64_t hash = shader_hash(words);
+    auto it = std::find_if(versions.begin(), versions.end(), [&](const auto& version) {
+        return version.content_hash == hash && version.words == words;
+    });
+    return it == versions.end() ? 0xFFFFFFFFu : static_cast<uint32_t>(it - versions.begin());
+}
+
 } // namespace
 
 uint64_t gpu_capture_hash(const uint8_t* data, size_t size) {
@@ -290,23 +330,73 @@ uint64_t gpu_capture_hash(const uint8_t* data, size_t size) {
 bool capture_draw_items(const std::vector<DrawItem>& items, const GpuCaptureMetadata& metadata,
                         const CaptureMemoryReader& reader, GpuCaptureFile& out, std::string& error,
                         const CaptureRttSeedReader& rtt_reader) {
+    if (items.empty()) { error = "capture must contain at least one draw"; return false; }
+    std::vector<SubmitOperation> operations;
+    operations.reserve(items.size());
+    for (size_t i = 0; i < items.size(); ++i)
+        operations.push_back({SubmitOperationKind::Draw, static_cast<size_t>(items[i].draw_index),
+                              items[i].command_order});
+    return capture_submit_items(items, {}, operations, metadata, reader, out, error, rtt_reader);
+}
+
+bool capture_submit_items(const std::vector<DrawItem>& draws,
+                          const std::vector<ComputeItem>& computes,
+                          const std::vector<SubmitOperation>& operations,
+                          const GpuCaptureMetadata& metadata,
+                          const CaptureMemoryReader& reader, GpuCaptureFile& out,
+                          std::string& error, const CaptureRttSeedReader& rtt_reader) {
     error.clear(); out = {}; out.metadata = metadata;
-    if (items.empty() || items.size() > kMaxDraws) { error = "capture must contain 1..65536 draws"; return false; }
+    if (draws.size() > kMaxDraws || computes.size() > kMaxComputes ||
+        operations.size() > kMaxOperations) {
+        error = "capture item or operation count is invalid";
+        return false;
+    }
     if (!reader) { error = "capture memory reader is missing"; return false; }
     std::vector<Interval> intervals;
-    if (!collect_intervals(items, intervals, error)) return false;
-    for (auto x : intervals) {
+    if (!collect_intervals(draws, computes, intervals, error)) return false;
+    for (auto& x : intervals) {
         GpuCaptureBlob b; b.guest_addr = x.begin; b.bytes.resize(static_cast<size_t>(x.end - x.begin), 0);
         b.bytes_read = std::min<uint64_t>(reader(x.begin, b.bytes.data(), b.bytes.size()), b.bytes.size());
-        out.blobs.push_back(std::move(b));
+        b.content_hash = gpu_capture_hash(b.bytes);
+        auto existing = std::find_if(out.blobs.begin(), out.blobs.end(), [&](const auto& candidate) {
+            return candidate.content_hash == b.content_hash && candidate.bytes == b.bytes;
+        });
+        if (existing == out.blobs.end()) {
+            x.blob_index = static_cast<uint32_t>(out.blobs.size());
+            out.blobs.push_back(std::move(b));
+        } else {
+            x.blob_index = static_cast<uint32_t>(existing - out.blobs.begin());
+        }
     }
-    for (const auto& d : items) {
+    for (const auto& d : draws) {
         GpuCapturedDraw c; c.vs = d.vs; c.fs = d.fs; c.ps = d.ps; c.vertex_count = d.vertex_count;
         c.indices = d.indices; c.color0_base = d.color0_base;
         c.color0_width = d.color0_width; c.color0_height = d.color0_height;
+        c.draw_index = d.draw_index; c.command_order = d.command_order;
         if (!capture_table(d.vrt.get(), intervals, c.vrt, error) || !capture_table(d.prt.get(), intervals, c.prt, error)) return false;
         out.draws.push_back(std::move(c));
     }
+    for (const auto& compute : computes) {
+        GpuCapturedCompute c;
+        c.spirv = compute.spirv;
+        c.launch = compute.launch;
+        c.code_addr = compute.code_addr;
+        c.dispatch_index = compute.dispatch_index;
+        c.submit_no = compute.submit_no;
+        c.command_order = compute.command_order;
+        if (!capture_table(compute.resources.get(), intervals, c.resources, error)) return false;
+        out.computes.push_back(std::move(c));
+    }
+    std::unordered_set<uint64_t> realized_draws, realized_computes;
+    for (const auto& draw : out.draws) realized_draws.insert(draw.draw_index);
+    for (const auto& compute : out.computes) realized_computes.insert(compute.dispatch_index);
+    for (const auto& operation : operations) {
+        const bool realized = operation.kind == SubmitOperationKind::Draw
+            ? realized_draws.count(operation.index) != 0
+            : realized_computes.count(operation.index) != 0;
+        out.operations.push_back({operation.kind, operation.index, operation.command_order, realized});
+    }
+    collect_shader_versions(out);
     if (rtt_reader) {
         std::vector<uint64_t> candidates;
         auto add_table = [&](const ShaderResourceTable* table) {
@@ -315,10 +405,11 @@ bool capture_draw_items(const std::vector<DrawItem>& items, const GpuCaptureMeta
                 if ((r.cls == ResourceClass::Texture || r.cls == ResourceClass::StorageImage) && r.gpu_addr)
                     candidates.push_back(r.gpu_addr);
         };
-        for (const auto& item : items) {
+        for (const auto& item : draws) {
             add_table(item.vrt.get()); add_table(item.prt.get());
             if (item.color0_base) candidates.push_back(item.color0_base);
         }
+        for (const auto& item : computes) add_table(item.resources.get());
         std::sort(candidates.begin(), candidates.end());
         candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
         uint64_t total = 0;
@@ -336,15 +427,44 @@ bool capture_draw_items(const std::vector<DrawItem>& items, const GpuCaptureMeta
     return true;
 }
 
+bool capture_gpustate_submit(const GpuState& state, uint64_t submit_no,
+                             uint32_t width, uint32_t height,
+                             const GpuCaptureMetadata& metadata,
+                             GpuCaptureFile& out, std::string& error) {
+    std::vector<DrawItem> draws = realize_gpustate_draws(state);
+    std::vector<ComputeItem> computes = realize_compute_dispatches(state, submit_no);
+    auto reader = [](uint64_t addr, uint8_t* dst, size_t bytes) -> size_t {
+        size_t done = 0;
+        constexpr size_t chunk_max = 0x10000;
+        while (done < bytes) {
+            const size_t n = std::min(bytes - done, chunk_max);
+            if (!guest_readable(addr + done, static_cast<uint32_t>(n))) break;
+            std::memcpy(dst + done, reinterpret_cast<const void*>(uintptr_t(addr + done)), n);
+            done += n;
+        }
+        return done;
+    };
+    GpuCaptureMetadata actual = metadata;
+    actual.width = width;
+    actual.height = height;
+    actual.submit_index = submit_no;
+    return capture_submit_items(draws, computes, plan_submit_operations(state), actual,
+                                reader, out, error, g_rtt_seed_reader);
+}
+
 bool write_gpu_capture(const std::string& path, const GpuCaptureFile& c, std::string& error) {
     error.clear(); Writer w; w.raw(kMagic, sizeof(kMagic)); w.u32(kVersion); w.u32(kEndian);
     w.u32(c.metadata.width); w.u32(c.metadata.height); w.u64(c.metadata.submit_index);
     w.string(c.metadata.revision); w.string(c.metadata.title_id); w.string(c.metadata.input_route); w.string(c.metadata.savedata_dir);
     w.u32(static_cast<uint32_t>(c.metadata.renderer_env.size()));
     for (const auto& [name, value] : c.metadata.renderer_env) { w.string(name); w.string(value); }
-    w.u64(c.expected_output_hash); w.u64(c.expected_output_bytes);
+    w.u8(c.expected_output_valid); w.u64(c.expected_output_hash); w.u64(c.expected_output_bytes);
     w.u32(static_cast<uint32_t>(c.blobs.size()));
-    for (const auto& b : c.blobs) { w.u64(b.guest_addr); w.u64(b.bytes_read); w.bytes(b.bytes); }
+    for (const auto& b : c.blobs) {
+        const uint64_t hash = gpu_capture_hash(b.bytes);
+        if (b.content_hash && b.content_hash != hash) { error = "capture blob content hash mismatch"; return false; }
+        w.u64(b.guest_addr); w.u64(b.bytes_read); w.u64(hash); w.bytes(b.bytes);
+    }
     if (c.rtt_seeds.size() > kMaxResources) { error = "invalid RTT seed count"; return false; }
     uint64_t seed_total = 0; std::unordered_set<uint64_t> seed_addresses;
     w.u32(static_cast<uint32_t>(c.rtt_seeds.size()));
@@ -357,11 +477,55 @@ bool write_gpu_capture(const std::string& path, const GpuCaptureFile& c, std::st
         seed_total += seed.rgba.size();
         w.u64(seed.guest_addr); w.u32(seed.width); w.u32(seed.height); w.bytes(seed.rgba);
     }
+    std::vector<GpuCaptureShaderVersion> versions = c.shader_versions;
+    auto add_shader = [&](const std::vector<uint32_t>& words) {
+        const uint64_t hash = shader_hash(words);
+        auto it = std::find_if(versions.begin(), versions.end(), [&](const auto& version) {
+            return version.content_hash == hash && version.words == words;
+        });
+        if (it == versions.end()) versions.push_back({hash, words});
+    };
+    for (const auto& d : c.draws) { add_shader(d.vs); add_shader(d.fs); }
+    for (const auto& compute : c.computes) add_shader(compute.spirv);
+    if (versions.size() > kMaxResources) { error = "invalid shader-version count"; return false; }
+    w.u32(static_cast<uint32_t>(versions.size()));
+    for (const auto& version : versions) {
+        const uint64_t hash = shader_hash(version.words);
+        if (version.content_hash && version.content_hash != hash) {
+            error = "capture shader content hash mismatch"; return false;
+        }
+        w.u64(hash); w.words(version.words);
+    }
+    if (c.draws.size() > kMaxDraws) { error = "invalid draw count"; return false; }
     w.u32(static_cast<uint32_t>(c.draws.size()));
     for (const auto& d : c.draws) {
-        w.words(d.vs); w.words(d.fs); write_pipeline(w, d.ps); write_table(w, d.vrt); write_table(w, d.prt);
+        const uint32_t vs_index = shader_version_index(versions, d.vs);
+        const uint32_t fs_index = shader_version_index(versions, d.fs);
+        if (vs_index == 0xFFFFFFFFu || fs_index == 0xFFFFFFFFu) {
+            error = "draw shader is missing from the version table"; return false;
+        }
+        w.u32(vs_index); w.u32(fs_index); write_pipeline(w, d.ps); write_table(w, d.vrt); write_table(w, d.prt);
         w.u32(d.vertex_count); w.words(d.indices); w.u64(d.color0_base);
         w.u32(d.color0_width); w.u32(d.color0_height);
+        w.u64(d.draw_index); w.u64(d.command_order);
+    }
+    if (c.computes.size() > kMaxComputes) { error = "invalid compute count"; return false; }
+    w.u32(static_cast<uint32_t>(c.computes.size()));
+    for (const auto& compute : c.computes) {
+        const uint32_t shader_index = shader_version_index(versions, compute.spirv);
+        if (shader_index == 0xFFFFFFFFu) { error = "compute shader is missing from the version table"; return false; }
+        w.u32(shader_index); write_table(w, compute.resources);
+        w.u32(compute.launch.threads_x); w.u32(compute.launch.threads_y); w.u32(compute.launch.threads_z);
+        w.u32(compute.launch.local_x); w.u32(compute.launch.local_y); w.u32(compute.launch.local_z);
+        w.u32(compute.launch.groups_x); w.u32(compute.launch.groups_y); w.u32(compute.launch.groups_z);
+        w.u64(compute.code_addr); w.u64(compute.dispatch_index); w.u64(compute.submit_no);
+        w.u64(compute.command_order);
+    }
+    if (c.operations.size() > kMaxOperations) { error = "invalid operation count"; return false; }
+    w.u32(static_cast<uint32_t>(c.operations.size()));
+    for (const auto& operation : c.operations) {
+        w.u8(static_cast<uint8_t>(operation.kind)); w.u64(operation.source_index);
+        w.u64(operation.command_order); w.u8(operation.realized);
     }
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     std::filesystem::path target(path), temp = target; temp += ".tmp";
@@ -392,12 +556,23 @@ bool read_gpu_capture(const std::string& path, GpuCaptureFile& c, std::string& e
     uint32_t ne; if (!r.u32(ne) || ne > 256) { error = "invalid renderer environment count"; return false; }
     m.renderer_env.resize(ne);
     for (auto& [name, value] : m.renderer_env) if (!r.string(name) || !r.string(value)) return false;
+    if (version >= 5) {
+        uint8_t valid = 0;
+        if (!r.u8(valid)) return false;
+        c.expected_output_valid = valid != 0;
+    } else {
+        c.expected_output_valid = true;
+    }
     if (!r.u64(c.expected_output_hash) || !r.u64(c.expected_output_bytes)) return false;
     uint32_t nb; if (!r.u32(nb) || nb > kMaxResources) { error = "invalid blob count"; return false; }
     uint64_t total = 0; c.blobs.resize(nb);
     for (auto& b : c.blobs) {
-        if (!r.u64(b.guest_addr) || !r.u64(b.bytes_read) || !r.bytes(b.bytes)) return false;
+        if (!r.u64(b.guest_addr) || !r.u64(b.bytes_read) ||
+            (version >= 5 && !r.u64(b.content_hash)) || !r.bytes(b.bytes)) return false;
         if (b.bytes_read > b.bytes.size() || total > kMaxTotalBlobBytes - b.bytes.size()) { error = "invalid blob metadata"; return false; }
+        const uint64_t actual_hash = gpu_capture_hash(b.bytes);
+        if (version >= 5 && b.content_hash != actual_hash) { error = "capture blob content hash mismatch"; return false; }
+        b.content_hash = actual_hash;
         total += b.bytes.size();
     }
     if (version >= 4) {
@@ -414,12 +589,65 @@ bool read_gpu_capture(const std::string& path, GpuCaptureFile& c, std::string& e
             seed_total += seed.rgba.size();
         }
     }
-    uint32_t nd; if (!r.u32(nd) || !nd || nd > kMaxDraws) { error = "invalid draw count"; return false; }
+    if (version >= 5) {
+        uint32_t ns = 0;
+        if (!r.u32(ns) || ns > kMaxResources) { error = "invalid shader-version count"; return false; }
+        c.shader_versions.resize(ns);
+        for (auto& shader : c.shader_versions) {
+            if (!r.u64(shader.content_hash) || !r.words(shader.words)) return false;
+            if (shader.content_hash != shader_hash(shader.words)) {
+                error = "capture shader content hash mismatch"; return false;
+            }
+        }
+    }
+    uint32_t nd; if (!r.u32(nd) || nd > kMaxDraws || (version < 5 && !nd)) { error = "invalid draw count"; return false; }
     c.draws.resize(nd);
     for (auto& d : c.draws) {
-        if (!r.words(d.vs) || !r.words(d.fs) || !read_pipeline(r, d.ps, version) || !read_table(r, d.vrt) ||
+        if (version >= 5) {
+            uint32_t vs_index = 0, fs_index = 0;
+            if (!r.u32(vs_index) || !r.u32(fs_index) || vs_index >= c.shader_versions.size() ||
+                fs_index >= c.shader_versions.size()) { error = "invalid draw shader-version index"; return false; }
+            d.vs = c.shader_versions[vs_index].words;
+            d.fs = c.shader_versions[fs_index].words;
+        } else if (!r.words(d.vs) || !r.words(d.fs)) return false;
+        if (!read_pipeline(r, d.ps, version) || !read_table(r, d.vrt) ||
             !read_table(r, d.prt) || !r.u32(d.vertex_count) || !r.words(d.indices) || !r.u64(d.color0_base)) return false;
         if (version >= 3 && (!r.u32(d.color0_width) || !r.u32(d.color0_height))) return false;
+        if (version >= 5 && (!r.u64(d.draw_index) || !r.u64(d.command_order))) return false;
+    }
+    if (version >= 5) {
+        uint32_t nc = 0;
+        if (!r.u32(nc) || nc > kMaxComputes) { error = "invalid compute count"; return false; }
+        c.computes.resize(nc);
+        for (auto& compute : c.computes) {
+            uint32_t shader_index = 0;
+            if (!r.u32(shader_index) || shader_index >= c.shader_versions.size()) {
+                error = "invalid compute shader-version index"; return false;
+            }
+            compute.spirv = c.shader_versions[shader_index].words;
+            if (!read_table(r, compute.resources) ||
+                !r.u32(compute.launch.threads_x) || !r.u32(compute.launch.threads_y) || !r.u32(compute.launch.threads_z) ||
+                !r.u32(compute.launch.local_x) || !r.u32(compute.launch.local_y) || !r.u32(compute.launch.local_z) ||
+                !r.u32(compute.launch.groups_x) || !r.u32(compute.launch.groups_y) || !r.u32(compute.launch.groups_z) ||
+                !r.u64(compute.code_addr) || !r.u64(compute.dispatch_index) || !r.u64(compute.submit_no) ||
+                !r.u64(compute.command_order)) return false;
+        }
+        uint32_t no = 0;
+        if (!r.u32(no) || no > kMaxOperations) { error = "invalid operation count"; return false; }
+        c.operations.resize(no);
+        for (auto& operation : c.operations) {
+            uint8_t kind = 0, realized = 0;
+            if (!r.u8(kind) || kind > static_cast<uint8_t>(SubmitOperationKind::Dispatch) ||
+                !r.u64(operation.source_index) || !r.u64(operation.command_order) || !r.u8(realized)) return false;
+            operation.kind = static_cast<SubmitOperationKind>(kind);
+            operation.realized = realized != 0;
+        }
+    } else {
+        collect_shader_versions(c);
+        for (size_t i = 0; i < c.draws.size(); ++i) {
+            c.draws[i].draw_index = i;
+            c.operations.push_back({SubmitOperationKind::Draw, i, c.draws[i].command_order, true});
+        }
     }
     if (r.left) { error = "capture has trailing data"; return false; }
     return true;
@@ -427,7 +655,15 @@ bool read_gpu_capture(const std::string& path, GpuCaptureFile& c, std::string& e
 
 bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::string& error) {
     error.clear(); out = {}; out.metadata = c.metadata; out.blobs = c.blobs; out.rtt_seeds = c.rtt_seeds;
+    out.expected_output_valid = c.expected_output_valid;
     out.expected_output_hash = c.expected_output_hash; out.expected_output_bytes = c.expected_output_bytes;
+    size_t resource_reference_count = 0;
+    for (const auto& draw : c.draws)
+        resource_reference_count += draw.vrt.resources.size() + draw.prt.resources.size();
+    for (const auto& compute : c.computes)
+        resource_reference_count += compute.resources.resources.size();
+    out.resource_instances.reserve(resource_reference_count);
+    std::map<std::pair<uint32_t, uint64_t>, size_t> instance_by_version_and_base;
     auto table = [&](const GpuCapturedTable& src, std::shared_ptr<ShaderResourceTable>& dst) -> bool {
         if (!src.present) { dst.reset(); return src.resources.empty(); }
         dst = std::make_shared<ShaderResourceTable>();
@@ -437,10 +673,17 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
                 if (x.blob_index >= out.blobs.size() || x.blob_offset > out.blobs[x.blob_index].bytes.size()) {
                     error = "resource references an invalid capture blob"; return false;
                 }
-                auto& b = out.blobs[x.blob_index].bytes;
+                const auto& b = out.blobs[x.blob_index].bytes;
                 uint64_t need = resource_footprint(r);
                 if (need > b.size() - x.blob_offset) { error = "resource footprint exceeds capture blob"; return false; }
-                r.host_data = b.data() + x.blob_offset; r.host_data_size = need;
+                if (x.blob_offset > r.gpu_addr) { error = "resource blob offset exceeds its logical address"; return false; }
+                const uint64_t logical_base = r.gpu_addr - x.blob_offset;
+                const auto key = std::make_pair(x.blob_index, logical_base);
+                auto [it, inserted] = instance_by_version_and_base.emplace(key, out.resource_instances.size());
+                if (inserted)
+                    out.resource_instances.push_back({logical_base, x.blob_index, b});
+                auto& instance = out.resource_instances[it->second].bytes;
+                r.host_data = instance.data() + x.blob_offset; r.host_data_size = need;
             }
             dst->resources.push_back(r);
         }
@@ -451,9 +694,23 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         DrawItem d; d.vs = x.vs; d.fs = x.fs; d.ps = x.ps; d.vertex_count = x.vertex_count;
         d.indices = x.indices; d.color0_base = x.color0_base;
         d.color0_width = x.color0_width; d.color0_height = x.color0_height;
+        d.draw_index = x.draw_index; d.command_order = x.command_order;
         if (!table(x.vrt, d.vrt) || !table(x.prt, d.prt)) return false;
         out.items.push_back(std::move(d));
     }
+    out.computes.reserve(c.computes.size());
+    for (const auto& x : c.computes) {
+        ComputeItem compute;
+        compute.spirv = x.spirv;
+        compute.launch = x.launch;
+        compute.code_addr = x.code_addr;
+        compute.dispatch_index = x.dispatch_index;
+        compute.submit_no = x.submit_no;
+        compute.command_order = x.command_order;
+        if (!table(x.resources, compute.resources)) return false;
+        out.computes.push_back(std::move(compute));
+    }
+    out.operations = c.operations;
     return true;
 }
 
@@ -530,6 +787,7 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(const std::vector
 bool finish_requested_gpu_capture(std::unique_ptr<PendingGpuCapture> pending,
                                   const std::vector<uint8_t>& output, std::string& error) {
     if (!pending) return true;
+    pending->capture.expected_output_valid = true;
     pending->capture.expected_output_bytes = output.size(); pending->capture.expected_output_hash = gpu_capture_hash(output);
     if (!write_gpu_capture(pending->path, pending->capture, error)) return false;
     std::fprintf(stderr, "[gpucap] wrote %s output_bytes=%zu hash=%016llx\n", pending->path.c_str(), output.size(),

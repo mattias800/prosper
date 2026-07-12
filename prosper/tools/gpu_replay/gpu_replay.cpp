@@ -114,6 +114,27 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
         inspect_table("VS", d.vrt.get(), replay.rtt_seeds);
         inspect_table("PS", d.prt.get(), replay.rtt_seeds);
     }
+    for (size_t i = 0; i < replay.computes.size(); ++i) {
+        const auto& c = replay.computes[i];
+        std::printf("compute[%zu] source=%llu order=%llu code=%016llx groups=%ux%ux%u local=%ux%ux%u "
+                    "shader=%zu/%016llx\n",
+                    i, static_cast<unsigned long long>(c.dispatch_index),
+                    static_cast<unsigned long long>(c.command_order),
+                    static_cast<unsigned long long>(c.code_addr), c.launch.groups_x,
+                    c.launch.groups_y, c.launch.groups_z, c.launch.local_x, c.launch.local_y,
+                    c.launch.local_z, c.spirv.size(),
+                    static_cast<unsigned long long>(prosper::gpu::gpu_capture_hash(
+                        reinterpret_cast<const uint8_t*>(c.spirv.data()), c.spirv.size() * 4)));
+        inspect_table("CS", c.resources.get(), replay.rtt_seeds);
+    }
+    for (size_t i = 0; i < replay.operations.size(); ++i) {
+        const auto& operation = replay.operations[i];
+        std::printf("operation[%zu] %s source=%llu order=%llu realized=%s\n", i,
+                    operation.kind == prosper::gpu::SubmitOperationKind::Draw ? "draw" : "dispatch",
+                    static_cast<unsigned long long>(operation.source_index),
+                    static_cast<unsigned long long>(operation.command_order),
+                    operation.realized ? "yes" : "no");
+    }
 }
 
 bool validate_frame(const prosper::gpu::GpuReplayFrame& replay) {
@@ -248,9 +269,12 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[gpureplay] selected original draws %d:%d\n", draw_first, draw_last);
     }
     const auto& m = replay.metadata;
-    std::fprintf(stderr, "[gpureplay] rev=%s title=%s submit=%llu %ux%u draws=%zu blobs=%zu RTT-seeds=%zu\n",
+    std::fprintf(stderr, "[gpureplay] rev=%s title=%s submit=%llu %ux%u draws=%zu computes=%zu "
+                         "operations=%zu shaders=%zu blobs=%zu RTT-seeds=%zu oracle=%s\n",
                  m.revision.c_str(), m.title_id.c_str(), static_cast<unsigned long long>(m.submit_index),
-                 m.width, m.height, replay.items.size(), replay.blobs.size(), replay.rtt_seeds.size());
+                 m.width, m.height, replay.items.size(), replay.computes.size(), replay.operations.size(),
+                 capture.shader_versions.size(), replay.blobs.size(), replay.rtt_seeds.size(),
+                 replay.expected_output_valid ? "yes" : "no");
     if (inspect) inspect_frame(replay);
     if (validate_only) return validate_frame(replay) ? 0 : 1;
     if (inspect_only) return 0;
@@ -259,7 +283,24 @@ int main(int argc, char** argv) {
     if (!prosper::gpu::restore_gpu_replay_rtt_seeds(replay.rtt_seeds, error)) {
         std::fprintf(stderr, "gpu_replay: cannot restore RTT seeds: %s\n", error.c_str()); return 2;
     }
-    std::vector<uint8_t> pixels = prosper::gpu::render_submit_items(replay.items, m.width, m.height);
+    std::vector<prosper::gpu::SubmitOperation> operations;
+    for (const auto& operation : replay.operations)
+        if (operation.realized)
+            operations.push_back({operation.kind, static_cast<size_t>(operation.source_index),
+                                  operation.command_order});
+    std::vector<uint8_t> pixels;
+    if (operations.empty() || draw_first >= 0) {
+        pixels = prosper::gpu::render_submit_items(replay.items, m.width, m.height);
+    } else {
+        auto result = prosper::gpu::execute_ordered_items(
+            operations, replay.items, replay.computes,
+            [](const auto& items, uint32_t width, uint32_t height) {
+                return prosper::gpu::render_submit_items(items, width, height);
+            },
+            [](const auto& items) { return prosper::gpu::execute_compute_items(items); },
+            m.width, m.height);
+        pixels = std::move(result.pixels);
+    }
     uint64_t hash = prosper::gpu::gpu_capture_hash(pixels);
     std::fprintf(stderr, "[gpureplay] output_bytes=%zu hash=%016llx expected_bytes=%llu expected_hash=%016llx\n",
                  pixels.size(), static_cast<unsigned long long>(hash),
@@ -268,7 +309,8 @@ int main(int argc, char** argv) {
     if (positional.size() == 2 && !pixels.empty() && !prosper::test::dump_bmp(positional[1], pixels, m.width, m.height)) {
         std::fprintf(stderr, "gpu_replay: cannot write %s\n", positional[1]); return 2;
     }
-    if (!allow_mismatch && (pixels.size() != replay.expected_output_bytes || hash != replay.expected_output_hash)) {
+    if (!allow_mismatch && replay.expected_output_valid &&
+        (pixels.size() != replay.expected_output_bytes || hash != replay.expected_output_hash)) {
         std::fprintf(stderr, "gpu_replay: output mismatch\n"); return 1;
     }
     return 0;

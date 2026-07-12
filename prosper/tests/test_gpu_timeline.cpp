@@ -43,6 +43,13 @@ int main() {
     present.present_count = 7; present.latest_submit_no = 10; present.buffer_index = 2;
     present.flip_arg = -5; present.width = 1920; present.height = 1080;
     CHECK(writer.append_present(present, error), "writer appends a present record");
+    GpuTimelineDetail detail;
+    detail.submit_no = 10; detail.capture_path = "/tmp/dead-cells-submit-10.prgcap";
+    detail.semantic_draw_count = 3; detail.semantic_dispatch_count = 1;
+    detail.realized_draw_count = 2; detail.realized_dispatch_count = 1;
+    detail.operation_count = 4; detail.missing_operation_count = 1;
+    detail.shader_version_count = 5; detail.resource_version_count = 3; detail.resource_bytes = 4096;
+    CHECK(writer.append_detail(detail, error), "writer appends a detailed-capture link");
     GpuTimelineSubmit second = first;
     second.submit_no = 11; second.draw_count = 4; second.dispatch_count = 0;
     CHECK(writer.append_submit(second, error), "writer appends a second submit record");
@@ -55,15 +62,19 @@ int main() {
           timeline.metadata.title_id == metadata.title_id &&
           timeline.metadata.input_route == metadata.input_route,
           "metadata round-trips");
-    CHECK(timeline.submits.size() == 2 && timeline.presents.size() == 1,
-          "submit and present counts round-trip");
+    CHECK(timeline.version == 2 && timeline.submits.size() == 2 && timeline.presents.size() == 1 &&
+          timeline.details.size() == 1, "version and record counts round-trip");
     CHECK(timeline.submits[0].sequence == 1 && timeline.presents[0].sequence == 2 &&
-          timeline.submits[1].sequence == 3, "global record ordering round-trips");
+          timeline.details[0].sequence == 3 && timeline.submits[1].sequence == 4,
+          "global record ordering round-trips");
     CHECK(timeline.submits[0].color0_base == 0x12340000 &&
           timeline.submits[0].color0_width == 642 && timeline.submits[0].color0_height == 362,
           "target identity and extent round-trip");
     CHECK(timeline.presents[0].buffer_index == 2 && timeline.presents[0].flip_arg == -5,
           "signed present fields round-trip");
+    CHECK(timeline.details[0].submit_no == 10 && timeline.details[0].missing_operation_count == 1 &&
+          timeline.details[0].shader_version_count == 5 && timeline.details[0].resource_bytes == 4096,
+          "detailed-capture identity and version statistics round-trip");
 
     std::ifstream input(good, std::ios::binary);
     std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(input)), {});
@@ -72,7 +83,8 @@ int main() {
     CHECK(write_bytes(truncated, truncated_bytes), "created a truncated-tail fixture");
     GpuTimelineFile partial;
     CHECK(read_gpu_timeline(truncated, partial, error), "reader recovers complete records from a truncated tail");
-    CHECK(partial.truncated_tail && partial.submits.size() == 1 && partial.presents.size() == 1,
+    CHECK(partial.truncated_tail && partial.submits.size() == 1 && partial.presents.size() == 1 &&
+          partial.details.size() == 1,
           "truncated final submit is ignored explicitly");
 
     std::vector<uint8_t> corrupt_bytes = bytes;
@@ -84,12 +96,17 @@ int main() {
           "reader rejects corruption instead of treating it as truncation");
 
     const auto runtime = base.string() + "-runtime.prgtl";
+    const auto runtime_capture = base.string() + "-submit-42.prgcap";
 #ifdef _WIN32
     _putenv_s("PROSPER_GPU_TIMELINE", runtime.c_str());
     _putenv_s("PROSPER_CAPTURE_TITLE", "runtime-title");
+    _putenv_s("PROSPER_GPU_TIMELINE_CAPTURE", runtime_capture.c_str());
+    _putenv_s("PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT", "42");
 #else
     setenv("PROSPER_GPU_TIMELINE", runtime.c_str(), 1);
     setenv("PROSPER_CAPTURE_TITLE", "runtime-title", 1);
+    setenv("PROSPER_GPU_TIMELINE_CAPTURE", runtime_capture.c_str(), 1);
+    setenv("PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT", "42", 1);
 #endif
     begin_gpu_timeline_submit(42);
     record_gpu_timeline_present(9, 1, 77, 1920, 1080); // a PM4 flip can precede submit completion
@@ -102,12 +119,34 @@ int main() {
     CHECK(runtime_timeline.presents.size() == 1 && runtime_timeline.submits.size() == 1 &&
           runtime_timeline.presents[0].latest_submit_no == 42,
           "a flip during folding is associated with its active submit");
+    CHECK(runtime_timeline.details.size() == 1 && runtime_timeline.details[0].submit_no == 42 &&
+          runtime_timeline.details[0].capture_path == runtime_capture &&
+          std::filesystem::exists(runtime_capture),
+          "exact submit selection writes and links one bounded detail capsule");
+
+    const auto compat_v2 = base.string() + "-compat-v2.prgtl";
+    GpuTimelineWriter compat_writer;
+    CHECK(compat_writer.open(compat_v2, metadata, error) && compat_writer.append_submit(first, error),
+          "created a detail-free compatibility timeline");
+    compat_writer.close();
+    std::ifstream compat_input(compat_v2, std::ios::binary);
+    std::vector<uint8_t> version1_bytes((std::istreambuf_iterator<char>(compat_input)), {});
+    version1_bytes[8] = 1; version1_bytes[9] = version1_bytes[10] = version1_bytes[11] = 0;
+    const auto version1 = base.string() + "-version1.prgtl";
+    CHECK(write_bytes(version1, version1_bytes), "created a version-1 compatibility fixture");
+    GpuTimelineFile version1_timeline;
+    CHECK(read_gpu_timeline(version1, version1_timeline, error) && version1_timeline.version == 1 &&
+          version1_timeline.submits.size() == 1,
+          "reader remains backward-compatible with version-1 semantic timelines");
 
     std::error_code ec;
     std::filesystem::remove(good, ec);
     std::filesystem::remove(truncated, ec);
     std::filesystem::remove(corrupt, ec);
     std::filesystem::remove(runtime, ec);
+    std::filesystem::remove(runtime_capture, ec);
+    std::filesystem::remove(compat_v2, ec);
+    std::filesystem::remove(version1, ec);
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
     std::printf("== PASS ==\n");
     return 0;
