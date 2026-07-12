@@ -57,6 +57,14 @@ struct GpuTimelineDetail {
     uint64_t resource_bytes = 0;
 };
 
+enum class GpuTimelineWriterKind : uint32_t {
+    Unknown = 0,
+    Graphics = 1,
+    Compute = 2,
+    DmaData = 3,
+    WriteData = 4,
+};
+
 struct GpuTimelineProducer {
     uint64_t sequence = 0;
     uint64_t elapsed_ns = 0;
@@ -74,6 +82,22 @@ struct GpuTimelineProducer {
     uint64_t producer_target_addr = 0;
     uint32_t producer_width = 0;
     uint32_t producer_height = 0;
+    GpuTimelineWriterKind first_writer_kind = GpuTimelineWriterKind::Unknown;
+    uint64_t history_first_submit_no = 0;
+    uint64_t history_first_draw_index = 0;
+    uint64_t history_first_command_order = 0;
+    uint64_t history_write_count = 0;
+    uint64_t history_submit_count = 0;
+    uint64_t history_window_first_submit_no = 0;
+    bool lifetime_truncated = false;
+    bool history_window_truncated = false;
+    bool first_color_has_clear = false;
+    uint32_t first_color_clear_word0 = 0;
+    uint32_t first_color_clear_word1 = 0;
+    uint32_t first_color_control = 0;
+    uint32_t first_color_control_mode = 0;
+    uint32_t first_target_mask = 0;
+    uint32_t first_color_format = 0;
 };
 
 struct GpuTimelineFile {

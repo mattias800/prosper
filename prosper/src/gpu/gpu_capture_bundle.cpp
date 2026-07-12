@@ -14,7 +14,7 @@ constexpr uint8_t kMagic[8] = {'P', 'R', 'G', 'B', 'N', 'D', 'L', '\0'};
 constexpr uint32_t kVersion = 1;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint32_t kMaxChunks = 1u << 20;
-constexpr uint32_t kMaxSubmits = 64;
+constexpr uint32_t kMaxSubmits = 2048;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 
 struct Writer {

@@ -21,6 +21,7 @@ Create a capsule with the native-speed workflow in
 ./build-linux/gpu_replay /tmp/submit.prgcap /tmp/replay.bmp
 ./build-linux/gpu_replay --prepend /tmp/producer.prgcap /tmp/consumer.prgcap /tmp/closure.bmp
 ./build-linux/gpu_replay --bundle /tmp/window.prgbundle /tmp/closure.bmp
+./build-linux/gpu_replay --bundle /tmp/window.prgbundle --bundle-zero-boundary /tmp/zero-ab.bmp
 ```
 
 ## Reading graph output
@@ -75,15 +76,28 @@ The summary reports logical versus unique bytes, per-submit output hashes, and e
 A successful replay with `configured-bound` is an explicitly partial closure, not a faithful pixel oracle.
 Bundle files use `.prgbundle`, contain title-derived data, are gitignored, and must not be committed.
 
+`--bundle-zero-boundary` is an A/B diagnostic. It supplies transparent RGBA pixels for unseeded temporal
+image leaves at the oldest bundled submit, labels them `diagnostic-zero-seed`, and leaves the bundle unchanged.
+It can disprove stale guest backing versus zero initialization as the cause of a mismatch, but it is not a
+faithful replacement for the missing producer history.
+
 ## Current Dead Cells reference
 
-The #594/#595 gameplay capsule at submit 18,750 has two external 642x362 temporal versions. A timeline-v3
-run resolved both to submit 18,749: draw 45 / PM4 order 9,436,927 and draw 41 / PM4 order 9,436,871. The
-resource addresses and even semantic operation ordinals are run-local observations, not title constants.
-Recompute them from each new capsule and timeline; never hardcode them into renderer behavior.
+The #594/#595 gameplay capsule at submit 18,750 has two external 642x362 temporal versions. Timeline-v4
+full-run aggregation shows that both surfaces begin around submit 17,400 in current runs and are rewritten
+about 1,200-1,350 times before the selected submit. Their first observed graphics writers have programmed
+clear state, color mode 0, target mask `0xf`, and color format 10. These are raw register observations, not
+proof that hardware performed an implicit clear. Resource addresses, submit numbers, and semantic operation
+ordinals vary between runs; recompute them and never hardcode them into renderer behavior.
 
 A same-run depth-16 bundle for submits 18,735..18,750 resolved all 30 internal temporal edges and reported
 exactly two 642x362 leaves at the configured lower bound. Content-defined dedup stored 2.883 GiB of logical
 capsules in 166.3 MiB (5.8%). No initialized RTT seed appeared in that window, and even/odd depths alternate
-between the dark and overbright failure. The tool is working; faithful Dead Cells closure still requires the
-earlier initialization version rather than an arbitrary depth or title-specific fallback.
+between the dark and overbright failure. Supplying transparent zero to those two lower-bound leaves produces
+the same final hash (`62a46f15efa52a26`) as unseeded replay, so stale guest backing versus transparent
+initialization is not the cause in this window.
+
+Capturing only 642x362-target predecessor draws still costs about 150 MiB per submit because repeated static
+fragment resources include 64, 32, and 16 MiB textures. A 1,200-submit brute-force bundle is therefore not a
+practical next step. The next tooling boundary is an exact shared-resource dictionary or equivalently proven
+unchanged-resource reuse across submits; mutable versions must never be reused from address identity alone.
