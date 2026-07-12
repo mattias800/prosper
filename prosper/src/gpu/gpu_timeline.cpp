@@ -1,6 +1,7 @@
 #include "gpu_timeline.hpp"
 
 #include "gpu_capture.hpp"
+#include "gpu_dependency_graph.hpp"
 #include "render_state.hpp"
 #include "videoout_present.hpp"
 
@@ -12,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -23,12 +25,12 @@ namespace {
 
 constexpr uint8_t kFileMagic[8] = {'P', 'R', 'G', 'T', 'L', 'N', '\0', '\0'};
 constexpr uint8_t kRecordMagic[4] = {'T', 'L', 'R', 'C'};
-constexpr uint32_t kVersion = 2;
+constexpr uint32_t kVersion = 3;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint32_t kMaxPayloadBytes = 1u << 20;
 constexpr uint32_t kFlushInterval = 256;
 
-enum class RecordType : uint32_t { Metadata = 1, Submit = 2, Present = 3, Detail = 4 };
+enum class RecordType : uint32_t { Metadata = 1, Submit = 2, Present = 3, Detail = 4, Producer = 5 };
 
 struct Bytes {
     std::vector<uint8_t> data;
@@ -238,6 +240,62 @@ RuntimeDetailRequest& runtime_detail_request() {
     return request;
 }
 
+struct RuntimeTargetWrite {
+    uint64_t submit_no = 0;
+    uint64_t draw_index = 0;
+    uint64_t command_order = 0;
+    uint64_t addr = 0;
+    uint64_t size = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+};
+
+struct RuntimeProducerHistory {
+    std::deque<std::vector<RuntimeTargetWrite>> submits;
+    size_t capacity = 64;
+    bool enabled = false;
+
+    RuntimeProducerHistory() {
+        enabled = runtime_detail_request().valid;
+        if (const char* value = std::getenv("PROSPER_GPU_TIMELINE_HISTORY")) {
+            char* end = nullptr;
+            const uint64_t parsed = std::strtoull(value, &end, 0);
+            if (end && !*end && parsed) capacity = static_cast<size_t>(std::min<uint64_t>(parsed, 4096));
+        }
+    }
+
+    void remember(const GpuState& state, uint64_t submit_no) {
+        if (!enabled) return;
+        std::vector<RuntimeTargetWrite> writes;
+        writes.reserve(state.draws.size());
+        for (size_t i = 0; i < state.draws.size(); ++i) {
+            const RenderState rs = extract_render_state(state.state_at_draw(i));
+            if (!rs.color0_base || !rs.color0_width || !rs.color0_height) continue;
+            writes.push_back({submit_no, i, state.draws[i].command_order, rs.color0_base,
+                              static_cast<uint64_t>(rs.color0_width) * rs.color0_height * 4,
+                              rs.color0_width, rs.color0_height});
+        }
+        submits.push_back(std::move(writes));
+        while (submits.size() > capacity) submits.pop_front();
+    }
+
+    const RuntimeTargetWrite* latest_overlap(uint64_t addr, uint64_t size) const {
+        auto end = [](uint64_t base, uint64_t bytes) {
+            return bytes > UINT64_MAX - base ? UINT64_MAX : base + bytes;
+        };
+        for (auto submit = submits.rbegin(); submit != submits.rend(); ++submit)
+            for (auto write = submit->rbegin(); write != submit->rend(); ++write)
+                if (addr < end(write->addr, write->size) && write->addr < end(addr, size))
+                    return &*write;
+        return nullptr;
+    }
+};
+
+RuntimeProducerHistory& runtime_producer_history() {
+    static RuntimeProducerHistory history;
+    return history;
+}
+
 } // namespace
 
 struct GpuTimelineWriter::Impl {
@@ -348,6 +406,25 @@ bool GpuTimelineWriter::append_detail(const GpuTimelineDetail& detail, std::stri
     payload.u32(detail.resource_version_count);
     payload.u64(detail.resource_bytes);
     return impl_->append(RecordType::Detail, payload, error);
+}
+
+bool GpuTimelineWriter::append_producer(const GpuTimelineProducer& producer, std::string& error) {
+    Bytes payload;
+    payload.u64(producer.consumer_submit_no);
+    payload.u32(producer.consumer_operation);
+    payload.u32(producer.future_writer_operation);
+    payload.u64(producer.resource_addr);
+    payload.u64(producer.resource_size);
+    payload.u32(producer.resource_width);
+    payload.u32(producer.resource_height);
+    payload.u32(producer.resolved ? 1u : 0u);
+    payload.u64(producer.producer_submit_no);
+    payload.u64(producer.producer_draw_index);
+    payload.u64(producer.producer_command_order);
+    payload.u64(producer.producer_target_addr);
+    payload.u32(producer.producer_width);
+    payload.u32(producer.producer_height);
+    return impl_->append(RecordType::Producer, payload, error);
 }
 
 bool GpuTimelineWriter::flush(std::string& error) {
@@ -501,6 +578,24 @@ bool read_gpu_timeline(const std::string& path, GpuTimelineFile& timeline, std::
                 return false;
             }
             timeline.details.push_back(std::move(detail));
+        } else if (type == RecordType::Producer && version >= 3) {
+            GpuTimelineProducer producer;
+            producer.sequence = sequence;
+            producer.elapsed_ns = elapsed_ns;
+            uint32_t resolved = 0;
+            if (!p.u64(producer.consumer_submit_no) || !p.u32(producer.consumer_operation) ||
+                !p.u32(producer.future_writer_operation) || !p.u64(producer.resource_addr) ||
+                !p.u64(producer.resource_size) || !p.u32(producer.resource_width) ||
+                !p.u32(producer.resource_height) || !p.u32(resolved) ||
+                !p.u64(producer.producer_submit_no) || !p.u64(producer.producer_draw_index) ||
+                !p.u64(producer.producer_command_order) || !p.u64(producer.producer_target_addr) ||
+                !p.u32(producer.producer_width) || !p.u32(producer.producer_height) || p.left ||
+                resolved > 1) {
+                error = "invalid timeline producer record";
+                return false;
+            }
+            producer.resolved = resolved != 0;
+            timeline.producers.push_back(std::move(producer));
         } else {
             error = "unknown timeline record type " + std::to_string(type_raw);
             return false;
@@ -558,7 +653,11 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
     }
 
     RuntimeDetailRequest& request = runtime_detail_request();
-    if (!request.valid || request.submit_no != submit_no || request.claimed.exchange(true)) return;
+    RuntimeProducerHistory& history = runtime_producer_history();
+    if (!request.valid || request.submit_no != submit_no || request.claimed.exchange(true)) {
+        history.remember(state, submit_no);
+        return;
+    }
     GpuCaptureMetadata metadata;
     metadata.width = present_width();
     metadata.height = present_height();
@@ -579,7 +678,56 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
         !write_gpu_capture(request.path, capture, error)) {
         std::fprintf(stderr, "[timeline] submit %llu detailed capture failed: %s\n",
                      static_cast<unsigned long long>(submit_no), error.c_str());
+        history.remember(state, submit_no);
         return;
+    }
+    GpuReplayFrame replay;
+    GpuDependencyGraph graph;
+    if (materialize_gpu_replay(capture, replay, error) &&
+        build_gpu_dependency_graph(replay, graph, error)) {
+        for (const auto& leaf : graph.external_leaves) {
+            if (leaf.first_future_writer == UINT32_MAX) continue;
+            if (leaf.access.resource_class != ResourceClass::Texture &&
+                leaf.access.resource_class != ResourceClass::StorageImage) continue;
+            GpuTimelineProducer producer;
+            producer.consumer_submit_no = submit_no;
+            producer.consumer_operation = leaf.consumer_operations.front();
+            producer.future_writer_operation = leaf.first_future_writer;
+            producer.resource_addr = leaf.access.addr;
+            producer.resource_size = leaf.access.size;
+            producer.resource_width = leaf.access.width;
+            producer.resource_height = leaf.access.height;
+            if (const RuntimeTargetWrite* match = history.latest_overlap(leaf.access.addr, leaf.access.size)) {
+                producer.resolved = true;
+                producer.producer_submit_no = match->submit_no;
+                producer.producer_draw_index = match->draw_index;
+                producer.producer_command_order = match->command_order;
+                producer.producer_target_addr = match->addr;
+                producer.producer_width = match->width;
+                producer.producer_height = match->height;
+            }
+            if (!writer->append_producer(producer, error)) {
+                runtime_recorder().mark_failed(error);
+                history.remember(state, submit_no);
+                return;
+            }
+            std::fprintf(stderr, "[timeline] temporal resource 0x%llx/%ux%u op=%u -> %s",
+                         static_cast<unsigned long long>(producer.resource_addr),
+                         producer.resource_width, producer.resource_height,
+                         producer.consumer_operation, producer.resolved ? "producer" : "unresolved");
+            if (producer.resolved)
+                std::fprintf(stderr, " submit=%llu draw=%llu order=%llu target=0x%llx/%ux%u",
+                             static_cast<unsigned long long>(producer.producer_submit_no),
+                             static_cast<unsigned long long>(producer.producer_draw_index),
+                             static_cast<unsigned long long>(producer.producer_command_order),
+                             static_cast<unsigned long long>(producer.producer_target_addr),
+                             producer.producer_width, producer.producer_height);
+            std::fprintf(stderr, "\n");
+        }
+    } else {
+        std::fprintf(stderr, "[timeline] dependency graph failed for submit %llu: %s\n",
+                     static_cast<unsigned long long>(submit_no), error.c_str());
+        error.clear();
     }
     GpuTimelineDetail detail;
     detail.submit_no = submit_no;
@@ -597,6 +745,7 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
     for (const auto& blob : capture.blobs) detail.resource_bytes += blob.bytes.size();
     if (!writer->append_detail(detail, error)) {
         runtime_recorder().mark_failed(error);
+        history.remember(state, submit_no);
         return;
     }
     std::fprintf(stderr, "[timeline] captured submit %llu: draws=%u/%u dispatches=%u/%u "
@@ -606,6 +755,7 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
                  detail.semantic_dispatch_count, detail.shader_version_count,
                  detail.resource_version_count, static_cast<unsigned long long>(detail.resource_bytes),
                  request.path.c_str());
+    history.remember(state, submit_no);
 }
 
 void record_gpu_timeline_present(uint64_t present_count, int buffer_index, int64_t flip_arg,

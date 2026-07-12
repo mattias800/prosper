@@ -17,6 +17,7 @@ the shipped runtime. Build them from `build-linux/` like everything else.
 - **`gpu_replay/`** — replay a local `PROSPER_GPU_CAPTURE` realized-submit capsule through the same
   Vulkan backend without booting the guest. Capsules include game shaders/resources, use `.prgcap`,
   are gitignored, and must never be committed. The tool exits non-zero on output-hash mismatch.
+  See `gpu_replay/README.md` for inspection, validation, dependency graphs, oracle semantics, and extraction.
 - **`gpu_timeline/`** — inspect a native-speed `.prgtl` submit/present index recorded with
   `PROSPER_GPU_TIMELINE=<path>`. It does not invoke Vulkan; use it to locate progression and producer
   windows before making an expensive realized `.prgcap`. Timeline files are gitignored and local-only.
@@ -75,6 +76,10 @@ warmup, set `PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT=N` and
 version-5 capsules deduplicate content-addressed shader/resource versions and retain mixed draw/dispatch
 order plus explicit unrealized operations. Selection is intentionally bounded to one submit; automatic
 cross-submit producer closure remains #595.
+Timeline version 3 retains lightweight graphics-target summaries for the previous 64 submits when a
+detailed capture is requested. `PROSPER_GPU_TIMELINE_HISTORY=N` raises that bounded window to at most
+4096. Producer records resolve temporal image leaves to the latest overlapping prior submit/draw/PM4
+order, or state `unresolved`; they intentionally do not retain delayed pointers to mutable guest bytes.
 Per-target RTT is the normal renderer path. `PROSPER_RTT_SINGLE_TARGET=1` restores the obsolete flattened
 single-framebuffer compositor only for diagnostic comparison; it cannot represent real post chains or
 offscreen target dimensions.

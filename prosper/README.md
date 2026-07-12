@@ -44,10 +44,10 @@ possible without console keys. Dumps are user-supplied and gitignored.
   live/replay hash mismatch remains (#569). Dispatch thread counts and derived workgroup dimensions,
   compute program binding, direct type-1 buffers, and mixed graphics/compute PM4 order now execute correctly
   (#580/#576/#584).
-- 🚧 **Active frontiers:** use the selected-submit timeline/capsule path to prove the Dead Cells gameplay
-  consumer offline (#594), then derive its earlier 642×362 producer dependency automatically (#595/#586).
-  The stale exact Dead Cells snapshot baseline is tracked separately in #596. UE4's measured GPU boundary
-  remains tracked under its area issues.
+- 🚧 **Active frontiers:** retain and replay producer-time state/bytes from Dead Cells submit 18749 for the
+  two temporal 642×362 versions consumed by submit 18750 (#595/#586). Exact-submit capture, selected-submit
+  graphing, and same-run producer identity are complete; recursive capsule closure is not. The stale exact Dead Cells
+  snapshot baseline is tracked separately in #596. UE4's measured GPU boundary remains under its area issues.
 
 The completed Messenger black-render investigation and reusable evidence boundary are recorded in
 [`docs/MESSENGER_BLACK_RENDER.md`](docs/MESSENGER_BLACK_RENDER.md). Current work is tracked in GitHub
