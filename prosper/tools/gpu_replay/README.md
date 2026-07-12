@@ -20,6 +20,7 @@ Create a capsule with the native-speed workflow in
 ./build-linux/gpu_replay --graph-json /tmp/graph.json /tmp/submit.prgcap
 ./build-linux/gpu_replay /tmp/submit.prgcap /tmp/replay.bmp
 ./build-linux/gpu_replay --prepend /tmp/producer.prgcap /tmp/consumer.prgcap /tmp/closure.bmp
+./build-linux/gpu_replay --bundle /tmp/window.prgbundle /tmp/closure.bmp
 ```
 
 ## Reading graph output
@@ -61,6 +62,19 @@ restored. The tool rejects a predecessor whose submit number is not earlier. A c
 consumer sampled the retained producer output, but it does not prove faithful closure: graph the predecessor
 and continue if it also has temporal leaves.
 
+`--bundle` reconstructs each captured submit through the normal version-5 validator, executes them in
+ascending order through one renderer instance, and releases each materialized submit before the next.
+The summary reports logical versus unique bytes, per-submit output hashes, and every temporal image leaf:
+
+- `stop=included-producer` names the earlier bundled submit whose target overlaps the leaf.
+- `stop=initialized-seed` means serialized RTT pixels establish the version without another submit.
+- `stop=configured-bound` means the earliest bundled submit still needs older history.
+- `stop=unresolved-producer` means a later submit has no overlapping earlier bundled target; a contiguous
+  bundle should not produce this and the capture/replay evidence is incomplete.
+
+A successful replay with `configured-bound` is an explicitly partial closure, not a faithful pixel oracle.
+Bundle files use `.prgbundle`, contain title-derived data, are gitignored, and must not be committed.
+
 ## Current Dead Cells reference
 
 The #594/#595 gameplay capsule at submit 18,750 has two external 642x362 temporal versions. A timeline-v3
@@ -68,7 +82,8 @@ run resolved both to submit 18,749: draw 45 / PM4 order 9,436,927 and draw 41 / 
 resource addresses and even semantic operation ordinals are run-local observations, not title constants.
 Recompute them from each new capsule and timeline; never hardcode them into renderer behavior.
 
-A same-run producer/consumer capture showed that prepending submit 18,749 changes the overbright consumer in
-the expected regions, but those regions become black. Submit 18,749 has the same two temporal read-before-write
-leaves, so this is positive closure evidence rather than a final image fix. Recursive predecessor capture is
-the next #595 step.
+A same-run depth-16 bundle for submits 18,735..18,750 resolved all 30 internal temporal edges and reported
+exactly two 642x362 leaves at the configured lower bound. Content-defined dedup stored 2.883 GiB of logical
+capsules in 166.3 MiB (5.8%). No initialized RTT seed appeared in that window, and even/odd depths alternate
+between the dark and overbright failure. The tool is working; faithful Dead Cells closure still requires the
+earlier initialization version rather than an arbitrary depth or title-specific fallback.

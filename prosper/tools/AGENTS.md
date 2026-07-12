@@ -83,6 +83,11 @@ order, or state `unresolved`; they intentionally do not retain delayed pointers 
 Set `PROSPER_GPU_TIMELINE_CAPTURE_PREDECESSOR=<path>.prgcap` to snapshot exact submit `N-1` at producer
 time alongside selected submit `N`. Replay the pair with `gpu_replay --prepend producer consumer output`.
 This is a one-level probe; graph the producer and recurse when it also reads a temporal version.
+For bounded recursion, add `PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE=<path>.prgbundle`,
+`PROSPER_GPU_TIMELINE_CAPTURE_DEPTH=2..16`, and optionally
+`PROSPER_GPU_TIMELINE_CAPTURE_MAX_UNIQUE_MB=64..4096` (default 1024). `gpu_replay --bundle bundle output`
+executes the ordered window and classifies each temporal frontier as included, seeded, or depth-bounded.
+Bundles use content-defined chunks so shifted capture metadata does not defeat cross-submit deduplication.
 Per-target RTT is the normal renderer path. `PROSPER_RTT_SINGLE_TARGET=1` restores the obsolete flattened
 single-framebuffer compositor only for diagnostic comparison; it cannot represent real post chains or
 offscreen target dimensions.

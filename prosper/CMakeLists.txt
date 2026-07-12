@@ -360,6 +360,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_gpu_capture PRIVATE prosper_core)
   add_test(NAME gpu_capture_roundtrip COMMAND test_gpu_capture)
 
+  add_executable(test_gpu_capture_bundle tests/test_gpu_capture_bundle.cpp)
+  target_link_libraries(test_gpu_capture_bundle PRIVATE prosper_core)
+  add_test(NAME gpu_capture_bundle_roundtrip COMMAND test_gpu_capture_bundle)
+
   # Native-speed append-only submit/present timeline: portable framing, checksums, and truncated-tail
   # recovery are pure and must not depend on Vulkan or a game dump.
   add_executable(test_gpu_timeline tests/test_gpu_timeline.cpp)

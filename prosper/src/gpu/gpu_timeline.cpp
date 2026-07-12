@@ -1,6 +1,7 @@
 #include "gpu_timeline.hpp"
 
 #include "gpu_capture.hpp"
+#include "gpu_capture_bundle.hpp"
 #include "gpu_dependency_graph.hpp"
 #include "render_state.hpp"
 #include "videoout_present.hpp"
@@ -210,6 +211,9 @@ RuntimeRecorder& runtime_recorder() {
 struct RuntimeDetailRequest {
     std::string path;
     std::string predecessor_path;
+    std::string bundle_path;
+    uint32_t bundle_depth = 0;
+    uint64_t bundle_max_unique_bytes = 1ull << 30;
     uint64_t submit_no = 0;
     bool valid = false;
     std::atomic<bool> claimed{false};
@@ -234,6 +238,30 @@ struct RuntimeDetailRequest {
         path = path_env;
         if (const char* predecessor = std::getenv("PROSPER_GPU_TIMELINE_CAPTURE_PREDECESSOR"))
             predecessor_path = predecessor;
+        if (const char* bundle = std::getenv("PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE")) {
+            bundle_path = bundle;
+            bundle_depth = 2;
+            if (const char* depth = std::getenv("PROSPER_GPU_TIMELINE_CAPTURE_DEPTH")) {
+                char* depth_end = nullptr;
+                const uint64_t value = std::strtoull(depth, &depth_end, 0);
+                if (!depth_end || *depth_end || value < 2 || value > 16) {
+                    std::fprintf(stderr, "[timeline] capture bundle depth must be 2..16\n");
+                    bundle_path.clear(); bundle_depth = 0;
+                } else {
+                    bundle_depth = static_cast<uint32_t>(value);
+                }
+            }
+            if (const char* budget = std::getenv("PROSPER_GPU_TIMELINE_CAPTURE_MAX_UNIQUE_MB")) {
+                char* budget_end = nullptr;
+                const uint64_t value = std::strtoull(budget, &budget_end, 0);
+                if (!budget_end || *budget_end || value < 64 || value > 4096) {
+                    std::fprintf(stderr, "[timeline] capture bundle budget must be 64..4096 MiB\n");
+                    bundle_path.clear(); bundle_depth = 0;
+                } else {
+                    bundle_max_unique_bytes = value << 20;
+                }
+            }
+        }
         submit_no = parsed;
         valid = true;
     }
@@ -298,6 +326,34 @@ struct RuntimeProducerHistory {
 RuntimeProducerHistory& runtime_producer_history() {
     static RuntimeProducerHistory history;
     return history;
+}
+
+struct RuntimeCaptureBundle {
+    GpuCaptureBundle bundle;
+    bool budget_exhausted = false;
+    bool failed = false;
+};
+
+RuntimeCaptureBundle& runtime_capture_bundle() {
+    static RuntimeCaptureBundle state;
+    return state;
+}
+
+bool append_runtime_capture_bundle(const GpuCaptureFile& capture, uint64_t max_unique_bytes,
+                                   std::string& error) {
+    RuntimeCaptureBundle& state = runtime_capture_bundle();
+    if (state.budget_exhausted) { error = "capture bundle unique-byte budget was already exhausted"; return false; }
+    const size_t chunks = state.bundle.chunks.size();
+    const size_t hashes = state.bundle.chunk_hashes.size();
+    const size_t submits = state.bundle.submits.size();
+    const uint64_t logical = state.bundle.logical_bytes;
+    if (!append_gpu_capture_bundle(state.bundle, capture, error)) return false;
+    if (gpu_capture_bundle_unique_bytes(state.bundle) <= max_unique_bytes) return true;
+    state.bundle.chunks.resize(chunks); state.bundle.chunk_hashes.resize(hashes);
+    state.bundle.submits.resize(submits); state.bundle.logical_bytes = logical;
+    state.budget_exhausted = true;
+    error = "capture bundle exceeded its unique-byte budget";
+    return false;
 }
 
 GpuCaptureMetadata runtime_capture_metadata(uint64_t submit_no) {
@@ -704,6 +760,31 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
 
     RuntimeDetailRequest& request = runtime_detail_request();
     RuntimeProducerHistory& history = runtime_producer_history();
+    const uint64_t bundle_first = request.bundle_depth > request.submit_no
+        ? 1 : request.submit_no - request.bundle_depth + 1;
+    if (request.valid && !request.bundle_path.empty() &&
+        !runtime_capture_bundle().budget_exhausted && !runtime_capture_bundle().failed &&
+        submit_no >= bundle_first &&
+        submit_no < request.submit_no) {
+        GpuCaptureFile predecessor;
+        const GpuCaptureMetadata metadata = runtime_capture_metadata(submit_no);
+        if (!capture_gpustate_submit(state, submit_no, metadata.width, metadata.height,
+                                     metadata, predecessor, error) ||
+            !append_runtime_capture_bundle(predecessor, request.bundle_max_unique_bytes, error)) {
+            runtime_capture_bundle().failed = !runtime_capture_bundle().budget_exhausted;
+            std::fprintf(stderr, "[timeline] bundle submit %llu capture failed: %s\n",
+                         static_cast<unsigned long long>(submit_no), error.c_str());
+        } else {
+            const std::string identity = request.bundle_path + "#submit=" + std::to_string(submit_no);
+            const GpuTimelineDetail detail = capture_detail(submit, identity, predecessor);
+            if (!writer->append_detail(detail, error)) {
+                runtime_recorder().mark_failed(error);
+                history.remember(state, submit_no);
+                return;
+            }
+            log_capture_detail(detail);
+        }
+    }
     if (request.valid && !request.predecessor_path.empty() && request.submit_no > 1 &&
         submit_no == request.submit_no - 1 && !request.predecessor_claimed.exchange(true)) {
         GpuCaptureFile predecessor;
@@ -785,6 +866,28 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
         std::fprintf(stderr, "[timeline] dependency graph failed for submit %llu: %s\n",
                      static_cast<unsigned long long>(submit_no), error.c_str());
         error.clear();
+    }
+    if (!request.bundle_path.empty()) {
+        RuntimeCaptureBundle& state = runtime_capture_bundle();
+        GpuCaptureBundle& bundle = state.bundle;
+        if (state.failed) {
+            error = "capture bundle has a failed or missing predecessor submit";
+        } else if (state.budget_exhausted) {
+            error = "capture bundle unique-byte budget was exhausted before the selected submit";
+        }
+        if (state.failed || state.budget_exhausted || !append_runtime_capture_bundle(
+                capture, request.bundle_max_unique_bytes, error) ||
+            !write_gpu_capture_bundle(request.bundle_path, bundle, error)) {
+            std::fprintf(stderr, "[timeline] capture bundle write failed: %s\n", error.c_str());
+        } else {
+            const uint64_t unique_bytes = gpu_capture_bundle_unique_bytes(bundle);
+            std::fprintf(stderr, "[timeline] capture bundle submits=%zu logical=%llu unique=%llu "
+                                 "ratio=%.3f -> %s\n",
+                         bundle.submits.size(), static_cast<unsigned long long>(bundle.logical_bytes),
+                         static_cast<unsigned long long>(unique_bytes),
+                         bundle.logical_bytes ? static_cast<double>(unique_bytes) / bundle.logical_bytes : 0.0,
+                         request.bundle_path.c_str());
+        }
     }
     const GpuTimelineDetail detail = capture_detail(submit, request.path, capture);
     if (!writer->append_detail(detail, error)) {
