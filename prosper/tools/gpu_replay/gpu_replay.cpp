@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -24,9 +25,30 @@ bool set_environment(const std::string& name, const std::string& value) {
 void usage(const char* argv0) {
     std::fprintf(stderr, "usage: %s [--inspect|--inspect-only|--validate|--graph] "
                          "[--graph-json PATH] [--draw N[:M]] "
+                         "[--prepend producer.prgcap] "
                          "[--dump-resource DRAW:vs|ps:BINDING PATH] [--allow-mismatch] "
                          "[--dump-shader DRAW:vs|fs PATH] "
                          "<capture.prgcap> [output.bmp]\n", argv0);
+}
+
+std::vector<uint8_t> execute_frame(const prosper::gpu::GpuReplayFrame& replay,
+                                   bool draws_only = false) {
+    std::vector<prosper::gpu::SubmitOperation> operations;
+    for (const auto& operation : replay.operations)
+        if (operation.realized)
+            operations.push_back({operation.kind, static_cast<size_t>(operation.source_index),
+                                  operation.command_order});
+    if (operations.empty() || draws_only)
+        return prosper::gpu::render_submit_items(
+            replay.items, replay.metadata.width, replay.metadata.height);
+    auto result = prosper::gpu::execute_ordered_items(
+        operations, replay.items, replay.computes,
+        [](const auto& items, uint32_t width, uint32_t height) {
+            return prosper::gpu::render_submit_items(items, width, height);
+        },
+        [](const auto& items) { return prosper::gpu::execute_compute_items(items); },
+        replay.metadata.width, replay.metadata.height);
+    return std::move(result.pixels);
 }
 
 const char* class_name(prosper::gpu::ResourceClass c);
@@ -259,7 +281,7 @@ int main(int argc, char** argv) {
     bool inspect = false, inspect_only = false, validate_only = false, allow_mismatch = false;
     bool graph_only = false;
     int draw_first = -1, draw_last = -1;
-    std::string dump_spec, dump_path, shader_spec, shader_path, graph_json_path;
+    std::string dump_spec, dump_path, shader_spec, shader_path, graph_json_path, prepend_path;
     std::vector<const char*> positional;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--inspect") inspect = true;
@@ -270,6 +292,7 @@ int main(int argc, char** argv) {
             graph_only = true; graph_json_path = argv[++i];
         }
         else if (std::string(argv[i]) == "--allow-mismatch") allow_mismatch = true;
+        else if (std::string(argv[i]) == "--prepend" && i + 1 < argc) prepend_path = argv[++i];
         else if (std::string(argv[i]) == "--draw" && i + 1 < argc) {
             std::string range = argv[++i]; size_t colon = range.find(':');
             draw_first = std::atoi(range.c_str());
@@ -298,6 +321,18 @@ int main(int argc, char** argv) {
     prosper::gpu::GpuReplayFrame replay;
     if (!prosper::gpu::materialize_gpu_replay(capture, replay, error)) {
         std::fprintf(stderr, "gpu_replay: cannot materialize: %s\n", error.c_str()); return 2;
+    }
+    prosper::gpu::GpuCaptureFile prepend_capture;
+    prosper::gpu::GpuReplayFrame prepend;
+    if (!prepend_path.empty() &&
+        (!prosper::gpu::read_gpu_capture(prepend_path, prepend_capture, error) ||
+         !prosper::gpu::materialize_gpu_replay(prepend_capture, prepend, error))) {
+        std::fprintf(stderr, "gpu_replay: cannot load predecessor %s: %s\n",
+                     prepend_path.c_str(), error.c_str()); return 2;
+    }
+    if (!prepend_path.empty() && prepend.metadata.submit_index >= replay.metadata.submit_index) {
+        std::fprintf(stderr, "gpu_replay: predecessor submit must be earlier than consumer submit\n");
+        return 2;
     }
     if (graph_only) {
         prosper::gpu::GpuDependencyGraph graph;
@@ -369,29 +404,32 @@ int main(int argc, char** argv) {
     if (inspect) inspect_frame(replay);
     if (validate_only) return validate_frame(replay) ? 0 : 1;
     if (inspect_only) return 0;
-    if (!replay.rtt_seeds.empty()) set_environment("PROSPER_GPU_REPLAY_RTT_SEEDS", "1");
+    if (!replay.rtt_seeds.empty() || !prepend.rtt_seeds.empty())
+        set_environment("PROSPER_GPU_REPLAY_RTT_SEEDS", "1");
     prosper::frontend::register_live_renderer(".", false);
-    if (!prosper::gpu::restore_gpu_replay_rtt_seeds(replay.rtt_seeds, error)) {
+    std::unordered_set<uint64_t> predecessor_targets;
+    if (!prepend_path.empty()) {
+        if (!prosper::gpu::restore_gpu_replay_rtt_seeds(prepend.rtt_seeds, error)) {
+            std::fprintf(stderr, "gpu_replay: cannot restore predecessor RTT seeds: %s\n",
+                         error.c_str());
+            return 2;
+        }
+        std::vector<uint8_t> predecessor_pixels = execute_frame(prepend);
+        for (const auto& draw : prepend.items)
+            if (draw.color0_base) predecessor_targets.insert(draw.color0_base);
+        std::fprintf(stderr, "[gpureplay] prepended submit=%llu operations=%zu targets=%zu "
+                             "output_bytes=%zu hash=%016llx\n",
+                     static_cast<unsigned long long>(prepend.metadata.submit_index),
+                     prepend.operations.size(), predecessor_targets.size(), predecessor_pixels.size(),
+                     static_cast<unsigned long long>(prosper::gpu::gpu_capture_hash(predecessor_pixels)));
+    }
+    std::vector<prosper::gpu::GpuCaptureRttSeed> consumer_seeds;
+    for (const auto& seed : replay.rtt_seeds)
+        if (!predecessor_targets.count(seed.guest_addr)) consumer_seeds.push_back(seed);
+    if (!prosper::gpu::restore_gpu_replay_rtt_seeds(consumer_seeds, error)) {
         std::fprintf(stderr, "gpu_replay: cannot restore RTT seeds: %s\n", error.c_str()); return 2;
     }
-    std::vector<prosper::gpu::SubmitOperation> operations;
-    for (const auto& operation : replay.operations)
-        if (operation.realized)
-            operations.push_back({operation.kind, static_cast<size_t>(operation.source_index),
-                                  operation.command_order});
-    std::vector<uint8_t> pixels;
-    if (operations.empty() || draw_first >= 0) {
-        pixels = prosper::gpu::render_submit_items(replay.items, m.width, m.height);
-    } else {
-        auto result = prosper::gpu::execute_ordered_items(
-            operations, replay.items, replay.computes,
-            [](const auto& items, uint32_t width, uint32_t height) {
-                return prosper::gpu::render_submit_items(items, width, height);
-            },
-            [](const auto& items) { return prosper::gpu::execute_compute_items(items); },
-            m.width, m.height);
-        pixels = std::move(result.pixels);
-    }
+    std::vector<uint8_t> pixels = execute_frame(replay, draw_first >= 0);
     uint64_t hash = prosper::gpu::gpu_capture_hash(pixels);
     std::fprintf(stderr, "[gpureplay] output_bytes=%zu hash=%016llx expected_bytes=%llu expected_hash=%016llx\n",
                  pixels.size(), static_cast<unsigned long long>(hash),

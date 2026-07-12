@@ -113,17 +113,24 @@ int main() {
 
     const auto runtime = base.string() + "-runtime.prgtl";
     const auto runtime_capture = base.string() + "-submit-42.prgcap";
+    const auto predecessor_capture = base.string() + "-submit-41.prgcap";
 #ifdef _WIN32
     _putenv_s("PROSPER_GPU_TIMELINE", runtime.c_str());
     _putenv_s("PROSPER_CAPTURE_TITLE", "runtime-title");
     _putenv_s("PROSPER_GPU_TIMELINE_CAPTURE", runtime_capture.c_str());
     _putenv_s("PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT", "42");
+    _putenv_s("PROSPER_GPU_TIMELINE_CAPTURE_PREDECESSOR", predecessor_capture.c_str());
 #else
     setenv("PROSPER_GPU_TIMELINE", runtime.c_str(), 1);
     setenv("PROSPER_CAPTURE_TITLE", "runtime-title", 1);
     setenv("PROSPER_GPU_TIMELINE_CAPTURE", runtime_capture.c_str(), 1);
     setenv("PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT", "42", 1);
+    setenv("PROSPER_GPU_TIMELINE_CAPTURE_PREDECESSOR", predecessor_capture.c_str(), 1);
 #endif
+    GpuState predecessor_state;
+    predecessor_state.command_order = 120;
+    begin_gpu_timeline_submit(41);
+    record_gpu_timeline_submit(predecessor_state, 41);
     begin_gpu_timeline_submit(42);
     record_gpu_timeline_present(9, 1, 77, 1920, 1080); // a PM4 flip can precede submit completion
     GpuState runtime_state;
@@ -132,13 +139,15 @@ int main() {
     close_gpu_timeline();
     GpuTimelineFile runtime_timeline;
     CHECK(read_gpu_timeline(runtime, runtime_timeline, error), "runtime hooks produce an inspectable timeline");
-    CHECK(runtime_timeline.presents.size() == 1 && runtime_timeline.submits.size() == 1 &&
+    CHECK(runtime_timeline.presents.size() == 1 && runtime_timeline.submits.size() == 2 &&
           runtime_timeline.presents[0].latest_submit_no == 42,
           "a flip during folding is associated with its active submit");
-    CHECK(runtime_timeline.details.size() == 1 && runtime_timeline.details[0].submit_no == 42 &&
-          runtime_timeline.details[0].capture_path == runtime_capture &&
-          std::filesystem::exists(runtime_capture),
-          "exact submit selection writes and links one bounded detail capsule");
+    CHECK(runtime_timeline.details.size() == 2 && runtime_timeline.details[0].submit_no == 41 &&
+          runtime_timeline.details[0].capture_path == predecessor_capture &&
+          runtime_timeline.details[1].submit_no == 42 &&
+          runtime_timeline.details[1].capture_path == runtime_capture &&
+          std::filesystem::exists(predecessor_capture) && std::filesystem::exists(runtime_capture),
+          "exact submit selection writes and links producer-time predecessor and consumer capsules");
 
     const auto compat_v2 = base.string() + "-compat-v2.prgtl";
     GpuTimelineWriter compat_writer;
@@ -161,6 +170,7 @@ int main() {
     std::filesystem::remove(corrupt, ec);
     std::filesystem::remove(runtime, ec);
     std::filesystem::remove(runtime_capture, ec);
+    std::filesystem::remove(predecessor_capture, ec);
     std::filesystem::remove(compat_v2, ec);
     std::filesystem::remove(version1, ec);
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }

@@ -19,6 +19,7 @@ Create a capsule with the native-speed workflow in
 ./build-linux/gpu_replay --graph /tmp/submit.prgcap
 ./build-linux/gpu_replay --graph-json /tmp/graph.json /tmp/submit.prgcap
 ./build-linux/gpu_replay /tmp/submit.prgcap /tmp/replay.bmp
+./build-linux/gpu_replay --prepend /tmp/producer.prgcap /tmp/consumer.prgcap /tmp/closure.bmp
 ```
 
 ## Reading graph output
@@ -54,9 +55,20 @@ expected hash. `--allow-mismatch` is for an intentional differential such as `--
 interchangeable when dispatches or unrealized operations are present. Replay restores serialized render-target
 seeds before operation zero and uses owned resource memory; it must not dereference original guest mappings.
 
+`--prepend` materializes and executes one earlier capsule in the same renderer instance before the consumer.
+Its rendered targets take precedence over consumer RTT seeds at matching addresses; unrelated seeds are still
+restored. The tool rejects a predecessor whose submit number is not earlier. A changed image proves that the
+consumer sampled the retained producer output, but it does not prove faithful closure: graph the predecessor
+and continue if it also has temporal leaves.
+
 ## Current Dead Cells reference
 
 The #594/#595 gameplay capsule at submit 18,750 has two external 642x362 temporal versions. A timeline-v3
 run resolved both to submit 18,749: draw 45 / PM4 order 9,436,927 and draw 41 / PM4 order 9,436,871. The
 resource addresses and even semantic operation ordinals are run-local observations, not title constants.
 Recompute them from each new capsule and timeline; never hardcode them into renderer behavior.
+
+A same-run producer/consumer capture showed that prepending submit 18,749 changes the overbright consumer in
+the expected regions, but those regions become black. Submit 18,749 has the same two temporal read-before-write
+leaves, so this is positive closure evidence rather than a final image fix. Recursive predecessor capture is
+the next #595 step.

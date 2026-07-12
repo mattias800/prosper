@@ -17,12 +17,13 @@ PROSPER_PAD_SCRIPT=@scripts/dead-cells/reach-first-gameplay.pad \
 ./build-linux/gpu_timeline /tmp/dead-cells.prgtl --records
 ```
 
-Capture one submit found in that index:
+Capture a selected submit and, optionally, its immediate predecessor from the same run:
 
 ```bash
 PROSPER_GPU_TIMELINE=/tmp/dead-cells-detail.prgtl \
 PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT=18420 \
 PROSPER_GPU_TIMELINE_CAPTURE=/tmp/dead-cells-submit-18420.prgcap \
+PROSPER_GPU_TIMELINE_CAPTURE_PREDECESSOR=/tmp/dead-cells-submit-18419.prgcap \
   ./build-linux/boot_trace /path/to/PPSA15552-app0
 
 ./build-linux/gpu_timeline /tmp/dead-cells-detail.prgtl --records
@@ -30,6 +31,8 @@ PROSPER_GPU_TIMELINE_CAPTURE=/tmp/dead-cells-submit-18420.prgcap \
 ./build-linux/gpu_replay --graph /tmp/dead-cells-submit-18420.prgcap
 ./build-linux/gpu_replay --graph-json /tmp/dead-cells-graph.json /tmp/dead-cells-submit-18420.prgcap
 ./build-linux/gpu_replay /tmp/dead-cells-submit-18420.prgcap /tmp/replay.bmp
+./build-linux/gpu_replay --prepend /tmp/dead-cells-submit-18419.prgcap \
+  /tmp/dead-cells-submit-18420.prgcap /tmp/replay-with-producer.bmp
 ```
 
 See [`../gpu_replay/README.md`](../gpu_replay/README.md) for graph interpretation, pixel-oracle
@@ -78,4 +81,6 @@ needs the earlier version of the same logical surface.
 
 Producer identity records do not contain producer-time resource bytes. Retaining an old `GpuState` and
 materializing it after the selected submit would read mutable guest memory too late and create false
-evidence; bounded producer-time snapshotting remains the next #595 step.
+evidence. `PROSPER_GPU_TIMELINE_CAPTURE_PREDECESSOR=<path>` instead captures exactly submit `N-1` at
+producer time in the same run and links both capsules with ordinary detail records. It is deliberately a
+one-level closure probe; if the predecessor graph has temporal leaves, capture must recurse further.

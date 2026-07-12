@@ -101,6 +101,16 @@ int main() {
               "later pass samples pixels cached from the 32x2 producer target");
     }
 
+    render_submit_items({producer}, W, H);
+    std::vector<uint8_t> cross_submit = render_submit_items({consumer}, W, H);
+    CHECK(cross_submit.size() == static_cast<size_t>(16) * 16 * 4,
+          "renderer retains a producer target across separate replay submits");
+    if (cross_submit.size() == static_cast<size_t>(16) * 16 * 4) {
+        const uint8_t* center = &cross_submit[(8u * 16u + 8u) * 4];
+        CHECK(center[0] > 0xC0 && center[1] < 0x40 && center[2] < 0x40,
+              "later replay submit samples the retained producer target");
+    }
+
     // A captured consumer may depend on a producer from an earlier submit. Restore its serialized
     // host RTT surface before replaying draw zero; guest memory has no copy of these rendered pixels.
     GpuCaptureRttSeed temporal_seed;

@@ -209,9 +209,11 @@ RuntimeRecorder& runtime_recorder() {
 
 struct RuntimeDetailRequest {
     std::string path;
+    std::string predecessor_path;
     uint64_t submit_no = 0;
     bool valid = false;
     std::atomic<bool> claimed{false};
+    std::atomic<bool> predecessor_claimed{false};
 
     RuntimeDetailRequest() {
         const char* path_env = std::getenv("PROSPER_GPU_TIMELINE_CAPTURE");
@@ -230,6 +232,8 @@ struct RuntimeDetailRequest {
             return;
         }
         path = path_env;
+        if (const char* predecessor = std::getenv("PROSPER_GPU_TIMELINE_CAPTURE_PREDECESSOR"))
+            predecessor_path = predecessor;
         submit_no = parsed;
         valid = true;
     }
@@ -294,6 +298,52 @@ struct RuntimeProducerHistory {
 RuntimeProducerHistory& runtime_producer_history() {
     static RuntimeProducerHistory history;
     return history;
+}
+
+GpuCaptureMetadata runtime_capture_metadata(uint64_t submit_no) {
+    GpuCaptureMetadata metadata;
+    metadata.width = present_width();
+    metadata.height = present_height();
+    metadata.submit_index = submit_no;
+#ifdef PROSPER_GIT_REVISION
+    metadata.revision = PROSPER_GIT_REVISION;
+#else
+    metadata.revision = "unknown";
+#endif
+    if (const char* revision = std::getenv("PROSPER_CAPTURE_REVISION")) metadata.revision = revision;
+    metadata.title_id = env_or_empty("PROSPER_CAPTURE_TITLE");
+    metadata.input_route = env_or_empty("PROSPER_PAD_SCRIPT");
+    metadata.savedata_dir = env_or_empty("PROSPER_SAVEDATA_DIR");
+    return metadata;
+}
+
+GpuTimelineDetail capture_detail(const GpuTimelineSubmit& submit, const std::string& path,
+                                 const GpuCaptureFile& capture) {
+    GpuTimelineDetail detail;
+    detail.submit_no = submit.submit_no;
+    detail.capture_path = path;
+    detail.semantic_draw_count = submit.draw_count;
+    detail.semantic_dispatch_count = submit.dispatch_count;
+    detail.realized_draw_count = static_cast<uint32_t>(capture.draws.size());
+    detail.realized_dispatch_count = static_cast<uint32_t>(capture.computes.size());
+    detail.operation_count = static_cast<uint32_t>(capture.operations.size());
+    detail.missing_operation_count = static_cast<uint32_t>(std::count_if(
+        capture.operations.begin(), capture.operations.end(),
+        [](const auto& operation) { return !operation.realized; }));
+    detail.shader_version_count = static_cast<uint32_t>(capture.shader_versions.size());
+    detail.resource_version_count = static_cast<uint32_t>(capture.blobs.size());
+    for (const auto& blob : capture.blobs) detail.resource_bytes += blob.bytes.size();
+    return detail;
+}
+
+void log_capture_detail(const GpuTimelineDetail& detail) {
+    std::fprintf(stderr, "[timeline] captured submit %llu: draws=%u/%u dispatches=%u/%u "
+                         "versions=%u shaders/%u resources (%llu bytes) -> %s\n",
+                 static_cast<unsigned long long>(detail.submit_no), detail.realized_draw_count,
+                 detail.semantic_draw_count, detail.realized_dispatch_count,
+                 detail.semantic_dispatch_count, detail.shader_version_count,
+                 detail.resource_version_count, static_cast<unsigned long long>(detail.resource_bytes),
+                 detail.capture_path.c_str());
 }
 
 } // namespace
@@ -654,23 +704,30 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
 
     RuntimeDetailRequest& request = runtime_detail_request();
     RuntimeProducerHistory& history = runtime_producer_history();
+    if (request.valid && !request.predecessor_path.empty() && request.submit_no > 1 &&
+        submit_no == request.submit_no - 1 && !request.predecessor_claimed.exchange(true)) {
+        GpuCaptureFile predecessor;
+        const GpuCaptureMetadata metadata = runtime_capture_metadata(submit_no);
+        if (!capture_gpustate_submit(state, submit_no, metadata.width, metadata.height,
+                                     metadata, predecessor, error) ||
+            !write_gpu_capture(request.predecessor_path, predecessor, error)) {
+            std::fprintf(stderr, "[timeline] predecessor submit %llu capture failed: %s\n",
+                         static_cast<unsigned long long>(submit_no), error.c_str());
+        } else {
+            const GpuTimelineDetail detail = capture_detail(submit, request.predecessor_path, predecessor);
+            if (!writer->append_detail(detail, error)) {
+                runtime_recorder().mark_failed(error);
+                history.remember(state, submit_no);
+                return;
+            }
+            log_capture_detail(detail);
+        }
+    }
     if (!request.valid || request.submit_no != submit_no || request.claimed.exchange(true)) {
         history.remember(state, submit_no);
         return;
     }
-    GpuCaptureMetadata metadata;
-    metadata.width = present_width();
-    metadata.height = present_height();
-    metadata.submit_index = submit_no;
-#ifdef PROSPER_GIT_REVISION
-    metadata.revision = PROSPER_GIT_REVISION;
-#else
-    metadata.revision = "unknown";
-#endif
-    if (const char* revision = std::getenv("PROSPER_CAPTURE_REVISION")) metadata.revision = revision;
-    metadata.title_id = env_or_empty("PROSPER_CAPTURE_TITLE");
-    metadata.input_route = env_or_empty("PROSPER_PAD_SCRIPT");
-    metadata.savedata_dir = env_or_empty("PROSPER_SAVEDATA_DIR");
+    const GpuCaptureMetadata metadata = runtime_capture_metadata(submit_no);
 
     GpuCaptureFile capture;
     if (!capture_gpustate_submit(state, submit_no, metadata.width, metadata.height,
@@ -729,32 +786,13 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
                      static_cast<unsigned long long>(submit_no), error.c_str());
         error.clear();
     }
-    GpuTimelineDetail detail;
-    detail.submit_no = submit_no;
-    detail.capture_path = request.path;
-    detail.semantic_draw_count = submit.draw_count;
-    detail.semantic_dispatch_count = submit.dispatch_count;
-    detail.realized_draw_count = static_cast<uint32_t>(capture.draws.size());
-    detail.realized_dispatch_count = static_cast<uint32_t>(capture.computes.size());
-    detail.operation_count = static_cast<uint32_t>(capture.operations.size());
-    detail.missing_operation_count = static_cast<uint32_t>(std::count_if(
-        capture.operations.begin(), capture.operations.end(),
-        [](const auto& operation) { return !operation.realized; }));
-    detail.shader_version_count = static_cast<uint32_t>(capture.shader_versions.size());
-    detail.resource_version_count = static_cast<uint32_t>(capture.blobs.size());
-    for (const auto& blob : capture.blobs) detail.resource_bytes += blob.bytes.size();
+    const GpuTimelineDetail detail = capture_detail(submit, request.path, capture);
     if (!writer->append_detail(detail, error)) {
         runtime_recorder().mark_failed(error);
         history.remember(state, submit_no);
         return;
     }
-    std::fprintf(stderr, "[timeline] captured submit %llu: draws=%u/%u dispatches=%u/%u "
-                         "versions=%u shaders/%u resources (%llu bytes) -> %s\n",
-                 static_cast<unsigned long long>(submit_no), detail.realized_draw_count,
-                 detail.semantic_draw_count, detail.realized_dispatch_count,
-                 detail.semantic_dispatch_count, detail.shader_version_count,
-                 detail.resource_version_count, static_cast<unsigned long long>(detail.resource_bytes),
-                 request.path.c_str());
+    log_capture_detail(detail);
     history.remember(state, submit_no);
 }
 

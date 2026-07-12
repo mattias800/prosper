@@ -114,9 +114,11 @@ Native-speed `.prgtl` indexes retain every submit/present boundary, and an exact
 immutable, content-deduplicated graphics/compute state plus mixed PM4 order into a version-5 `.prgcap` (#594).
 `gpu_replay --graph` / `--graph-json` now resolve in-submit versions and temporal read-before-write leaves (#600;
 full workflow: `prosper/tools/gpu_replay/README.md`). Timeline version 3 resolves those leaves against bounded
-same-run target history. The Dead Cells submit-18750 run found both 642x362 producers in submit 18749, at draws
-45 and 41 (PM4 orders 9436927 and 9436871). Addresses are run-local. Snapshot those producer-time bytes and
-recurse rather than adding a dimension override (#595/#586). The stale exact Dead Cells snapshot baseline is
+same-run target history. A same-run producer-time capsule for Dead Cells submit 18749 can now be prepended to
+submit 18750. It changes the expected overbright regions to black, proving the consumer uses those outputs, but
+the producer graph reads the same two 642x362 temporal versions before rewriting them. Implement an ordered
+recursive predecessor window rather than adding a dimension override (#595/#586). Addresses and operation
+ordinals are run-local. The stale exact Dead Cells snapshot baseline is
 tracked separately in #596 and must not be silently updated.
 `PROSPER_PROVENANCE_DIM=WxH` reports overlapping color, compute, DMA_DATA, and WRITE_DATA writers with
 submit/item/PM4 ordinals.
