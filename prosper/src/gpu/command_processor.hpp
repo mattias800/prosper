@@ -62,7 +62,7 @@ struct GpuState {
     // the state makes skipped-producer provenance inspectable instead of reducing every dispatch
     // to one process-lifetime counter (#524).
     struct Dispatch {
-        uint32_t tg_x = 0, tg_y = 0, tg_z = 0;
+        uint32_t threads_x = 0, threads_y = 0, threads_z = 0;
         uint64_t modifier = 0;
         std::shared_ptr<const GpuState> state;
     };

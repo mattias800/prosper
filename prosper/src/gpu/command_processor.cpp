@@ -1374,7 +1374,7 @@ void GpuState::apply(const Pm4Command& c) {
                 last_snapshot_ = std::move(snap);
                 state_dirty_ = false;
             }
-            dispatches.push_back({c.tg_x, c.tg_y, c.tg_z, c.dispatch_modifier, last_snapshot_});
+            dispatches.push_back({c.threads_x, c.threads_y, c.threads_z, c.dispatch_modifier, last_snapshot_});
             dispatch_count++;
             break;
         case K::SetPredication:

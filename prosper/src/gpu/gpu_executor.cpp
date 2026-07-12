@@ -839,6 +839,35 @@ bool validate_runtime_descriptor_contract(const char* stage_name,
     return strcmp(mode, "strict") != 0 || report.ok();
 }
 
+ComputeLaunchDimensions resolve_compute_launch(const GpuState::Dispatch& d) {
+    namespace P = prosper::agc::Pm4;
+    ComputeLaunchDimensions out;
+    out.threads_x = d.threads_x;
+    out.threads_y = d.threads_y;
+    out.threads_z = d.threads_z;
+    const GpuState* ds = d.state.get();
+    auto reg = [&](uint32_t off) {
+        if (!ds) {
+            return 0u;
+        }
+        auto it = ds->sh.find(off);
+        return it == ds->sh.end() ? 0u : it->second;
+    };
+    out.local_x = reg(P::COMPUTE_NUM_THREAD_X);
+    out.local_y = reg(P::COMPUTE_NUM_THREAD_Y);
+    out.local_z = reg(P::COMPUTE_NUM_THREAD_Z);
+    if (!out.local_x) out.local_x = 1;
+    if (!out.local_y) out.local_y = 1;
+    if (!out.local_z) out.local_z = 1;
+    auto groups = [](uint32_t threads, uint32_t local) {
+        return threads ? 1u + (threads - 1u) / local : 0u;
+    };
+    out.groups_x = groups(out.threads_x, out.local_x);
+    out.groups_y = groups(out.threads_y, out.local_y);
+    out.groups_z = groups(out.threads_z, out.local_z);
+    return out;
+}
+
 void diagnose_compute_dispatches(const GpuState& st, uint64_t submit_no) {
     const char* enabled = getenv("PROSPER_COMPUTELOG");
     const char* dim_env = getenv("PROSPER_COMPUTELOG_DIM");
@@ -867,6 +896,7 @@ void diagnose_compute_dispatches(const GpuState& st, uint64_t submit_no) {
     for (size_t i = 0; i < st.dispatches.size(); ++i) {
         const auto& d = st.dispatches[i];
         const GpuState& ds = d.state ? *d.state : st;
+        const ComputeLaunchDimensions launch = resolve_compute_launch(d);
         const uint64_t code_addr = pgm_addr(ds);
         const auto* hdr = static_cast<const AgcShaderHeader*>(prosper_agc_shader_header_for_code(code_addr));
 
@@ -939,9 +969,13 @@ void diagnose_compute_dispatches(const GpuState& st, uint64_t submit_no) {
             code_hash = 0;
         }
         fprintf(stderr,
-                "[compute] submit=%llu dispatch=%zu groups=%ux%ux%u modifier=0x%llx "
+                "[compute] submit=%llu dispatch=%zu threads=%ux%ux%u local=%ux%ux%u "
+                "groups=%ux%ux%u modifier=0x%llx "
                 "code=0x%llx hash4k=%016llx header=%s resources=%zu\n",
-                (unsigned long long)submit_no, i, d.tg_x, d.tg_y, d.tg_z,
+                (unsigned long long)submit_no, i,
+                launch.threads_x, launch.threads_y, launch.threads_z,
+                launch.local_x, launch.local_y, launch.local_z,
+                launch.groups_x, launch.groups_y, launch.groups_z,
                 (unsigned long long)d.modifier, (unsigned long long)code_addr,
                 (unsigned long long)code_hash, hdr ? "yes" : "no", table.resources.size());
         for (const auto& r : table.resources) {
