@@ -57,12 +57,32 @@ struct GpuTimelineDetail {
     uint64_t resource_bytes = 0;
 };
 
+struct GpuTimelineProducer {
+    uint64_t sequence = 0;
+    uint64_t elapsed_ns = 0;
+    uint64_t consumer_submit_no = 0;
+    uint32_t consumer_operation = 0;
+    uint32_t future_writer_operation = UINT32_MAX;
+    uint64_t resource_addr = 0;
+    uint64_t resource_size = 0;
+    uint32_t resource_width = 0;
+    uint32_t resource_height = 0;
+    bool resolved = false;
+    uint64_t producer_submit_no = 0;
+    uint64_t producer_draw_index = 0;
+    uint64_t producer_command_order = 0;
+    uint64_t producer_target_addr = 0;
+    uint32_t producer_width = 0;
+    uint32_t producer_height = 0;
+};
+
 struct GpuTimelineFile {
     uint32_t version = 0;
     GpuTimelineMetadata metadata;
     std::vector<GpuTimelineSubmit> submits;
     std::vector<GpuTimelinePresent> presents;
     std::vector<GpuTimelineDetail> details;
+    std::vector<GpuTimelineProducer> producers;
     bool truncated_tail = false;
 };
 
@@ -77,6 +97,7 @@ public:
     bool append_submit(const GpuTimelineSubmit& submit, std::string& error);
     bool append_present(const GpuTimelinePresent& present, std::string& error);
     bool append_detail(const GpuTimelineDetail& detail, std::string& error);
+    bool append_producer(const GpuTimelineProducer& producer, std::string& error);
     bool flush(std::string& error);
     void close();
 

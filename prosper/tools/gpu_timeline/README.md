@@ -32,9 +32,12 @@ PROSPER_GPU_TIMELINE_CAPTURE=/tmp/dead-cells-submit-18420.prgcap \
 ./build-linux/gpu_replay /tmp/dead-cells-submit-18420.prgcap /tmp/replay.bmp
 ```
 
+See [`../gpu_replay/README.md`](../gpu_replay/README.md) for graph interpretation, pixel-oracle
+semantics, draw isolation, resource/shader extraction, and the distinction between draw and operation indices.
+
 The summary reports duration, submit/present/draw/dispatch counts, rates, target extents, and whether
 an incomplete final record was discarded. `--records` prints the globally ordered submit/present
-index. Version-2 detail records link the selected submit to its `.prgcap` and report semantic versus
+index. Version-2+ detail records link the selected submit to its `.prgcap` and report semantic versus
 realized draw/dispatch counts, missing operations, unique shader/resource versions, and resource bytes.
 Run metadata includes the revision, title, and input route when the corresponding capture environment
 variables are set.
@@ -52,8 +55,15 @@ variables are set.
 
 ## Current boundary
 
-Version 2 retains backward support for version-1 semantic indexes and adds exactly one bounded detailed
-submit per run. The linked version-5 `.prgcap` contains content-hashed/deduplicated shaders and resource
+Version 3 remains backward-compatible with version-1 and version-2 indexes. When detailed capture is
+enabled, it retains lightweight target-writer summaries for the previous 64 submits and records the
+latest same-run writer identity for every temporal image leaf in the selected capsule. Set
+`PROSPER_GPU_TIMELINE_HISTORY=N` to change that bounded window (maximum 4096). A producer record includes
+the consumer submit/operation/range, the in-submit future writer, and either the matched prior graphics
+submit/draw/PM4 order/target extent or an explicit unresolved result.
+
+Version 2 added exactly one bounded detailed submit per run. The linked version-5 `.prgcap` contains
+content-hashed/deduplicated shaders and resource
 bytes, graphics and compute items, and the original mixed PM4 operation order. An operation whose shader
 cannot be realized stays in the manifest with `realized=no`; inspection never silently treats a partial
 submit as complete. A timeline-selected capsule has no live-output hash oracle unless the renderer also
@@ -65,3 +75,7 @@ pull earlier producer submits. Automatic present-to-producer dependency closure 
 `gpu_replay --graph` resolves dependencies inside the selected submit and reports the remaining external
 versions; a `future-writer` on an external leaf is the characteristic temporal read-before-write case that
 needs the earlier version of the same logical surface.
+
+Producer identity records do not contain producer-time resource bytes. Retaining an old `GpuState` and
+materializing it after the selected submit would read mutable guest memory too late and create false
+evidence; bounded producer-time snapshotting remains the next #595 step.

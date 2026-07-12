@@ -50,6 +50,15 @@ int main() {
     detail.operation_count = 4; detail.missing_operation_count = 1;
     detail.shader_version_count = 5; detail.resource_version_count = 3; detail.resource_bytes = 4096;
     CHECK(writer.append_detail(detail, error), "writer appends a detailed-capture link");
+    GpuTimelineProducer producer;
+    producer.consumer_submit_no = 10; producer.consumer_operation = 19;
+    producer.future_writer_operation = 28; producer.resource_addr = 0x700000;
+    producer.resource_size = 642ull * 362 * 4; producer.resource_width = 642;
+    producer.resource_height = 362; producer.resolved = true;
+    producer.producer_submit_no = 9; producer.producer_draw_index = 13;
+    producer.producer_command_order = 380; producer.producer_target_addr = 0x700000;
+    producer.producer_width = 642; producer.producer_height = 362;
+    CHECK(writer.append_producer(producer, error), "writer appends a prior-producer identity");
     GpuTimelineSubmit second = first;
     second.submit_no = 11; second.draw_count = 4; second.dispatch_count = 0;
     CHECK(writer.append_submit(second, error), "writer appends a second submit record");
@@ -62,10 +71,12 @@ int main() {
           timeline.metadata.title_id == metadata.title_id &&
           timeline.metadata.input_route == metadata.input_route,
           "metadata round-trips");
-    CHECK(timeline.version == 2 && timeline.submits.size() == 2 && timeline.presents.size() == 1 &&
-          timeline.details.size() == 1, "version and record counts round-trip");
+    CHECK(timeline.version == 3 && timeline.submits.size() == 2 && timeline.presents.size() == 1 &&
+          timeline.details.size() == 1 && timeline.producers.size() == 1,
+          "version and record counts round-trip");
     CHECK(timeline.submits[0].sequence == 1 && timeline.presents[0].sequence == 2 &&
-          timeline.details[0].sequence == 3 && timeline.submits[1].sequence == 4,
+          timeline.details[0].sequence == 3 && timeline.producers[0].sequence == 4 &&
+          timeline.submits[1].sequence == 5,
           "global record ordering round-trips");
     CHECK(timeline.submits[0].color0_base == 0x12340000 &&
           timeline.submits[0].color0_width == 642 && timeline.submits[0].color0_height == 362,
@@ -75,6 +86,11 @@ int main() {
     CHECK(timeline.details[0].submit_no == 10 && timeline.details[0].missing_operation_count == 1 &&
           timeline.details[0].shader_version_count == 5 && timeline.details[0].resource_bytes == 4096,
           "detailed-capture identity and version statistics round-trip");
+    CHECK(timeline.producers[0].resolved && timeline.producers[0].consumer_operation == 19 &&
+          timeline.producers[0].producer_submit_no == 9 &&
+          timeline.producers[0].producer_command_order == 380 &&
+          timeline.producers[0].resource_width == 642,
+          "prior-producer resource and writer identities round-trip");
 
     std::ifstream input(good, std::ios::binary);
     std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(input)), {});
@@ -84,7 +100,7 @@ int main() {
     GpuTimelineFile partial;
     CHECK(read_gpu_timeline(truncated, partial, error), "reader recovers complete records from a truncated tail");
     CHECK(partial.truncated_tail && partial.submits.size() == 1 && partial.presents.size() == 1 &&
-          partial.details.size() == 1,
+          partial.details.size() == 1 && partial.producers.size() == 1,
           "truncated final submit is ignored explicitly");
 
     std::vector<uint8_t> corrupt_bytes = bytes;
