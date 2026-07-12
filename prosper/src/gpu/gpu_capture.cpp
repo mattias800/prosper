@@ -13,13 +13,14 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <unordered_set>
 #include <utility>
 
 namespace prosper::gpu {
 namespace {
 
 constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
-constexpr uint32_t kVersion = 3;
+constexpr uint32_t kVersion = 4;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -28,6 +29,10 @@ constexpr uint32_t kMaxDraws = 65536;
 constexpr uint32_t kMaxResources = 65536;
 constexpr uint32_t kMaxShaderWords = 16u << 20;
 constexpr uint32_t kMaxStringBytes = 1u << 20;
+constexpr uint64_t kMaxTotalRttSeedBytes = 1ull << 30;
+
+CaptureRttSeedReader g_rtt_seed_reader;
+ReplayRttSeedWriter g_rtt_seed_writer;
 
 struct Writer {
     std::vector<uint8_t> data;
@@ -262,6 +267,18 @@ bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& 
 
 const char* env_or_empty(const char* name) { const char* v = std::getenv(name); return v ? v : ""; }
 
+bool validate_rtt_seed(const GpuCaptureRttSeed& seed, std::string& error) {
+    if (!seed.guest_addr || !seed.width || !seed.height) {
+        error = "RTT seed has an invalid address or extent"; return false;
+    }
+    const uint64_t pixels = checked_mul(seed.width, seed.height);
+    const uint64_t bytes = checked_mul(pixels, 4);
+    if (bytes > kMaxBlobBytes || bytes != seed.rgba.size()) {
+        error = "RTT seed byte count does not match its RGBA extent"; return false;
+    }
+    return true;
+}
+
 } // namespace
 
 uint64_t gpu_capture_hash(const uint8_t* data, size_t size) {
@@ -271,7 +288,8 @@ uint64_t gpu_capture_hash(const uint8_t* data, size_t size) {
 }
 
 bool capture_draw_items(const std::vector<DrawItem>& items, const GpuCaptureMetadata& metadata,
-                        const CaptureMemoryReader& reader, GpuCaptureFile& out, std::string& error) {
+                        const CaptureMemoryReader& reader, GpuCaptureFile& out, std::string& error,
+                        const CaptureRttSeedReader& rtt_reader) {
     error.clear(); out = {}; out.metadata = metadata;
     if (items.empty() || items.size() > kMaxDraws) { error = "capture must contain 1..65536 draws"; return false; }
     if (!reader) { error = "capture memory reader is missing"; return false; }
@@ -289,6 +307,32 @@ bool capture_draw_items(const std::vector<DrawItem>& items, const GpuCaptureMeta
         if (!capture_table(d.vrt.get(), intervals, c.vrt, error) || !capture_table(d.prt.get(), intervals, c.prt, error)) return false;
         out.draws.push_back(std::move(c));
     }
+    if (rtt_reader) {
+        std::vector<uint64_t> candidates;
+        auto add_table = [&](const ShaderResourceTable* table) {
+            if (!table) return;
+            for (const auto& r : table->resources)
+                if ((r.cls == ResourceClass::Texture || r.cls == ResourceClass::StorageImage) && r.gpu_addr)
+                    candidates.push_back(r.gpu_addr);
+        };
+        for (const auto& item : items) {
+            add_table(item.vrt.get()); add_table(item.prt.get());
+            if (item.color0_base) candidates.push_back(item.color0_base);
+        }
+        std::sort(candidates.begin(), candidates.end());
+        candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+        uint64_t total = 0;
+        for (uint64_t addr : candidates) {
+            GpuCaptureRttSeed seed;
+            if (!rtt_reader(addr, seed)) continue;
+            if (seed.guest_addr != addr) { error = "RTT seed reader returned the wrong guest address"; return false; }
+            if (!validate_rtt_seed(seed, error)) return false;
+            if (total > kMaxTotalRttSeedBytes - seed.rgba.size()) {
+                error = "capture RTT seed data exceeds 1 GiB"; return false;
+            }
+            total += seed.rgba.size(); out.rtt_seeds.push_back(std::move(seed));
+        }
+    }
     return true;
 }
 
@@ -301,6 +345,18 @@ bool write_gpu_capture(const std::string& path, const GpuCaptureFile& c, std::st
     w.u64(c.expected_output_hash); w.u64(c.expected_output_bytes);
     w.u32(static_cast<uint32_t>(c.blobs.size()));
     for (const auto& b : c.blobs) { w.u64(b.guest_addr); w.u64(b.bytes_read); w.bytes(b.bytes); }
+    if (c.rtt_seeds.size() > kMaxResources) { error = "invalid RTT seed count"; return false; }
+    uint64_t seed_total = 0; std::unordered_set<uint64_t> seed_addresses;
+    w.u32(static_cast<uint32_t>(c.rtt_seeds.size()));
+    for (const auto& seed : c.rtt_seeds) {
+        if (!validate_rtt_seed(seed, error)) return false;
+        if (!seed_addresses.insert(seed.guest_addr).second) { error = "duplicate RTT seed address"; return false; }
+        if (seed_total > kMaxTotalRttSeedBytes - seed.rgba.size()) {
+            error = "capture RTT seed data exceeds 1 GiB"; return false;
+        }
+        seed_total += seed.rgba.size();
+        w.u64(seed.guest_addr); w.u32(seed.width); w.u32(seed.height); w.bytes(seed.rgba);
+    }
     w.u32(static_cast<uint32_t>(c.draws.size()));
     for (const auto& d : c.draws) {
         w.words(d.vs); w.words(d.fs); write_pipeline(w, d.ps); write_table(w, d.vrt); write_table(w, d.prt);
@@ -344,6 +400,20 @@ bool read_gpu_capture(const std::string& path, GpuCaptureFile& c, std::string& e
         if (b.bytes_read > b.bytes.size() || total > kMaxTotalBlobBytes - b.bytes.size()) { error = "invalid blob metadata"; return false; }
         total += b.bytes.size();
     }
+    if (version >= 4) {
+        uint32_t ns; if (!r.u32(ns) || ns > kMaxResources) { error = "invalid RTT seed count"; return false; }
+        uint64_t seed_total = 0; c.rtt_seeds.resize(ns);
+        std::unordered_set<uint64_t> addresses;
+        for (auto& seed : c.rtt_seeds) {
+            if (!r.u64(seed.guest_addr) || !r.u32(seed.width) || !r.u32(seed.height) || !r.bytes(seed.rgba)) return false;
+            if (!validate_rtt_seed(seed, error)) return false;
+            if (!addresses.insert(seed.guest_addr).second) { error = "duplicate RTT seed address"; return false; }
+            if (seed_total > kMaxTotalRttSeedBytes - seed.rgba.size()) {
+                error = "capture RTT seed data exceeds 1 GiB"; return false;
+            }
+            seed_total += seed.rgba.size();
+        }
+    }
     uint32_t nd; if (!r.u32(nd) || !nd || nd > kMaxDraws) { error = "invalid draw count"; return false; }
     c.draws.resize(nd);
     for (auto& d : c.draws) {
@@ -356,7 +426,7 @@ bool read_gpu_capture(const std::string& path, GpuCaptureFile& c, std::string& e
 }
 
 bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::string& error) {
-    error.clear(); out = {}; out.metadata = c.metadata; out.blobs = c.blobs;
+    error.clear(); out = {}; out.metadata = c.metadata; out.blobs = c.blobs; out.rtt_seeds = c.rtt_seeds;
     out.expected_output_hash = c.expected_output_hash; out.expected_output_bytes = c.expected_output_bytes;
     auto table = [&](const GpuCapturedTable& src, std::shared_ptr<ShaderResourceTable>& dst) -> bool {
         if (!src.present) { dst.reset(); return src.resources.empty(); }
@@ -383,6 +453,18 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         d.color0_width = x.color0_width; d.color0_height = x.color0_height;
         if (!table(x.vrt, d.vrt) || !table(x.prt, d.prt)) return false;
         out.items.push_back(std::move(d));
+    }
+    return true;
+}
+
+void set_gpu_capture_rtt_seed_reader(CaptureRttSeedReader reader) { g_rtt_seed_reader = std::move(reader); }
+void set_gpu_replay_rtt_seed_writer(ReplayRttSeedWriter writer) { g_rtt_seed_writer = std::move(writer); }
+
+bool restore_gpu_replay_rtt_seeds(const std::vector<GpuCaptureRttSeed>& seeds, std::string& error) {
+    error.clear();
+    if (!seeds.empty() && !g_rtt_seed_writer) { error = "live renderer has no RTT seed writer"; return false; }
+    for (const auto& seed : seeds) {
+        if (!validate_rtt_seed(seed, error) || !g_rtt_seed_writer(seed, error)) return false;
     }
     return true;
 }
@@ -436,12 +518,12 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(const std::vector
         return done;
     };
     std::string error;
-    if (!capture_draw_items(items, m, reader, pending->capture, error)) {
+    if (!capture_draw_items(items, m, reader, pending->capture, error, g_rtt_seed_reader)) {
         std::fprintf(stderr, "[gpucap] capture failed: %s\n", error.c_str()); return {};
     }
-    std::fprintf(stderr, "[gpucap] captured match %llu at invocation %llu: %zu draws, %zu blobs -> %s\n",
+    std::fprintf(stderr, "[gpucap] captured match %llu at invocation %llu: %zu draws, %zu blobs, %zu RTT seeds -> %s\n",
                  static_cast<unsigned long long>(current), static_cast<unsigned long long>(invocation),
-                 items.size(), pending->capture.blobs.size(), path);
+                 items.size(), pending->capture.blobs.size(), pending->capture.rtt_seeds.size(), path);
     return pending;
 }
 

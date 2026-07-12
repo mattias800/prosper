@@ -3,6 +3,7 @@
 #include "live_renderer.hpp"
 #include "render_runner.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -35,7 +36,8 @@ const char* class_name(prosper::gpu::ResourceClass c) {
     return "?";
 }
 
-void inspect_table(const char* stage, const prosper::gpu::ShaderResourceTable* table) {
+void inspect_table(const char* stage, const prosper::gpu::ShaderResourceTable* table,
+                   const std::vector<prosper::gpu::GpuCaptureRttSeed>& seeds) {
     if (!table) { std::printf("  %s: none\n", stage); return; }
     for (const auto& r : table->resources) {
         size_t nz = 0; uint32_t first = 0;
@@ -44,16 +46,19 @@ void inspect_table(const char* stage, const prosper::gpu::ShaderResourceTable* t
             if (r.host_data_size >= 4) std::memcpy(&first, r.host_data, 4);
         }
         uint64_t hash = r.host_data ? prosper::gpu::gpu_capture_hash(r.host_data, static_cast<size_t>(r.host_data_size)) : 0;
+        const bool temporal_seed = std::any_of(seeds.begin(), seeds.end(), [&](const auto& seed) {
+            return seed.guest_addr == r.gpu_addr;
+        });
         std::printf("  %s %-7s b=%u addr=%016llx bytes=%llu nz=%zu hash=%016llx first=%08x "
                     "fmt=%u nc=%u stride=%u %ux%u tile=%u addr=%u%u%u swz=%u%u%u%u filt=%u/%u/%u "
-                    "srt=%08x sgpr=%08x pc=%08x\n",
+                    "srt=%08x sgpr=%08x pc=%08x%s\n",
                     stage, class_name(r.cls), r.binding, static_cast<unsigned long long>(r.gpu_addr),
                     static_cast<unsigned long long>(r.host_data_size), nz, static_cast<unsigned long long>(hash), first,
                     static_cast<unsigned>(r.format), r.num_components, r.stride, r.width, r.height, r.tile_mode,
                     r.addr_uvw[0], r.addr_uvw[1], r.addr_uvw[2],
                     r.swizzle[0], r.swizzle[1], r.swizzle[2], r.swizzle[3],
                     r.mag_filter, r.min_filter, r.mip_filter,
-                    r.srt_offset, r.sgpr_base, r.fetch_pc);
+                    r.srt_offset, r.sgpr_base, r.fetch_pc, temporal_seed ? " temporal-RTT-seed" : "");
         if (r.host_data && r.host_data_size >= 16 &&
             (r.cls == prosper::gpu::ResourceClass::ConstantBuffer ||
              r.cls == prosper::gpu::ResourceClass::VertexBuffer)) {
@@ -65,6 +70,12 @@ void inspect_table(const char* stage, const prosper::gpu::ShaderResourceTable* t
 }
 
 void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
+    for (const auto& seed : replay.rtt_seeds) {
+        const uint64_t hash = prosper::gpu::gpu_capture_hash(seed.rgba);
+        std::printf("rtt-seed addr=%016llx extent=%ux%u bytes=%zu hash=%016llx\n",
+                    static_cast<unsigned long long>(seed.guest_addr), seed.width, seed.height,
+                    seed.rgba.size(), static_cast<unsigned long long>(hash));
+    }
     for (size_t i = 0; i < replay.items.size(); ++i) {
         const auto& d = replay.items[i];
         std::printf("draw[%zu] target=%016llx extent=%ux%u vcount=%u indices=%zu topo=%u fmt=%u cwm=%x "
@@ -100,7 +111,8 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
                     d.ps.raw_stencil_op[1][0], d.ps.raw_stencil_op[1][1], d.ps.raw_stencil_op[1][2],
                     d.ps.db_shader_control, d.ps.stencil_test_val_export_enable,
                     d.ps.stencil_op_val_export_enable);
-        inspect_table("VS", d.vrt.get()); inspect_table("PS", d.prt.get());
+        inspect_table("VS", d.vrt.get(), replay.rtt_seeds);
+        inspect_table("PS", d.prt.get(), replay.rtt_seeds);
     }
 }
 
@@ -236,13 +248,17 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[gpureplay] selected original draws %d:%d\n", draw_first, draw_last);
     }
     const auto& m = replay.metadata;
-    std::fprintf(stderr, "[gpureplay] rev=%s title=%s submit=%llu %ux%u draws=%zu blobs=%zu\n",
+    std::fprintf(stderr, "[gpureplay] rev=%s title=%s submit=%llu %ux%u draws=%zu blobs=%zu RTT-seeds=%zu\n",
                  m.revision.c_str(), m.title_id.c_str(), static_cast<unsigned long long>(m.submit_index),
-                 m.width, m.height, replay.items.size(), replay.blobs.size());
+                 m.width, m.height, replay.items.size(), replay.blobs.size(), replay.rtt_seeds.size());
     if (inspect) inspect_frame(replay);
     if (validate_only) return validate_frame(replay) ? 0 : 1;
     if (inspect_only) return 0;
+    if (!replay.rtt_seeds.empty()) set_environment("PROSPER_GPU_REPLAY_RTT_SEEDS", "1");
     prosper::frontend::register_live_renderer(".", false);
+    if (!prosper::gpu::restore_gpu_replay_rtt_seeds(replay.rtt_seeds, error)) {
+        std::fprintf(stderr, "gpu_replay: cannot restore RTT seeds: %s\n", error.c_str()); return 2;
+    }
     std::vector<uint8_t> pixels = prosper::gpu::render_submit_items(replay.items, m.width, m.height);
     uint64_t hash = prosper::gpu::gpu_capture_hash(pixels);
     std::fprintf(stderr, "[gpureplay] output_bytes=%zu hash=%016llx expected_bytes=%llu expected_hash=%016llx\n",

@@ -52,9 +52,20 @@ struct GpuCapturedDraw {
     uint32_t color0_width = 0, color0_height = 0;
 };
 
+// Host-rendered pixels retained across submits. The HLE renderer does not write these pixels back to
+// guest memory, so a standalone replay must seed its RTT cache explicitly to reproduce consumers whose
+// producer was in an earlier submit.
+struct GpuCaptureRttSeed {
+    uint64_t guest_addr = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::vector<uint8_t> rgba;
+};
+
 struct GpuCaptureFile {
     GpuCaptureMetadata metadata;
     std::vector<GpuCaptureBlob> blobs;
+    std::vector<GpuCaptureRttSeed> rtt_seeds;
     std::vector<GpuCapturedDraw> draws;
     uint64_t expected_output_hash = 0;
     uint64_t expected_output_bytes = 0;
@@ -63,21 +74,32 @@ struct GpuCaptureFile {
 // Reader returns the number of bytes copied. The capture zero-fills the unread suffix, matching the
 // live renderer's guarded-copy behavior for partially committed guest resources.
 using CaptureMemoryReader = std::function<size_t(uint64_t guest_addr, uint8_t* dst, size_t bytes)>;
+using CaptureRttSeedReader = std::function<bool(uint64_t guest_addr, GpuCaptureRttSeed& seed)>;
 
 bool capture_draw_items(const std::vector<DrawItem>& items, const GpuCaptureMetadata& metadata,
-                        const CaptureMemoryReader& reader, GpuCaptureFile& out, std::string& error);
+                        const CaptureMemoryReader& reader, GpuCaptureFile& out, std::string& error,
+                        const CaptureRttSeedReader& rtt_reader = {});
 bool write_gpu_capture(const std::string& path, const GpuCaptureFile& capture, std::string& error);
 bool read_gpu_capture(const std::string& path, GpuCaptureFile& capture, std::string& error);
 
 struct GpuReplayFrame {
     GpuCaptureMetadata metadata;
     std::vector<GpuCaptureBlob> blobs;
+    std::vector<GpuCaptureRttSeed> rtt_seeds;
     std::vector<DrawItem> items;
     uint64_t expected_output_hash = 0;
     uint64_t expected_output_bytes = 0;
 };
 
 bool materialize_gpu_replay(const GpuCaptureFile& capture, GpuReplayFrame& replay, std::string& error);
+
+// The Vulkan frontend owns the RTT cache and registers these hooks when its renderer is installed.
+// Capture queries only addresses referenced by the selected submit; replay restores the serialized
+// surfaces before draw zero.
+using ReplayRttSeedWriter = std::function<bool(const GpuCaptureRttSeed& seed, std::string& error)>;
+void set_gpu_capture_rtt_seed_reader(CaptureRttSeedReader reader);
+void set_gpu_replay_rtt_seed_writer(ReplayRttSeedWriter writer);
+bool restore_gpu_replay_rtt_seeds(const std::vector<GpuCaptureRttSeed>& seeds, std::string& error);
 uint64_t gpu_capture_hash(const uint8_t* data, size_t size);
 inline uint64_t gpu_capture_hash(const std::vector<uint8_t>& data) {
     return gpu_capture_hash(data.data(), data.size());

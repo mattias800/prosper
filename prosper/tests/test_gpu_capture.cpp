@@ -43,16 +43,30 @@ int main() {
     meta.savedata_dir = "/tmp/prosper-test-save";
     meta.renderer_env = {{"PROSPER_RTT_PERTARGET", "1"}, {"PROSPER_NO_CULL", "1"}};
     GpuCaptureFile captured; std::string error;
-    CHECK(capture_draw_items({draw}, meta, reader, captured, error), "capture realized draw succeeds");
+    const std::vector<uint8_t> temporal_rgba = {
+        255, 0, 0, 255, 0, 255, 0, 255,
+        0, 0, 255, 255, 255, 255, 255, 255,
+    };
+    auto rtt_reader = [&](uint64_t addr, GpuCaptureRttSeed& seed) {
+        if (addr != draw.color0_base) return false;
+        seed.guest_addr = addr; seed.width = 2; seed.height = 2; seed.rgba = temporal_rgba; return true;
+    };
+    CHECK(capture_draw_items({draw}, meta, reader, captured, error, rtt_reader), "capture realized draw succeeds");
     CHECK(captured.blobs.size() == 1 && captured.blobs[0].guest_addr == 0x1000 && captured.blobs[0].bytes.size() == 24,
           "overlapping resource ranges merge into one alias-preserving blob");
     CHECK(captured.blobs[0].bytes_read == 24 && captured.blobs[0].bytes[8] == memory[8],
           "capture records readable byte count and resource contents");
     CHECK(captured.draws[0].vrt.resources[0].blob_index == captured.draws[0].vrt.resources[1].blob_index &&
           captured.draws[0].vrt.resources[1].blob_offset == 8, "resource references preserve overlap offsets");
+    CHECK(captured.rtt_seeds.size() == 1 && captured.rtt_seeds[0].guest_addr == draw.color0_base &&
+          captured.rtt_seeds[0].rgba == temporal_rgba,
+          "capture stores referenced temporal RTT pixels separately from guest memory");
     captured.expected_output_hash = 0x1122334455667788ull; captured.expected_output_bytes = 480ull * 270 * 4;
 
     auto path = std::filesystem::temp_directory_path() / "prosper_gpu_capture_test.prgcap";
+    GpuCaptureFile duplicate_seed = captured; duplicate_seed.rtt_seeds.push_back(captured.rtt_seeds[0]);
+    CHECK(!write_gpu_capture(path.string(), duplicate_seed, error) && error == "duplicate RTT seed address",
+          "writer rejects duplicate temporal RTT seed addresses");
     CHECK(write_gpu_capture(path.string(), captured, error), "versioned capture writes atomically");
     GpuCaptureFile loaded;
     CHECK(read_gpu_capture(path.string(), loaded, error), "versioned capture reads back");
@@ -63,6 +77,8 @@ int main() {
           "fixed-function pipeline state round-trips explicitly");
     CHECK(loaded.draws[0].color0_width == 1024 && loaded.draws[0].color0_height == 32,
           "per-target extent round-trips");
+    CHECK(loaded.rtt_seeds.size() == 1 && loaded.rtt_seeds[0].width == 2 &&
+          loaded.rtt_seeds[0].rgba == temporal_rgba, "temporal RTT seed round-trips");
     CHECK(loaded.draws[0].ps.db_render_control == 2 && loaded.draws[0].ps.stencil_clear_enable &&
           loaded.draws[0].ps.has_stencil_clear && loaded.draws[0].ps.stencil_clear_value == 3 &&
           loaded.draws[0].ps.stencil_read_base == 0x12345000 &&
@@ -77,6 +93,8 @@ int main() {
     CHECK(rr[0].host_data && rr[1].host_data == rr[0].host_data + 8 && rr[1].host_data[0] == memory[8],
           "replay resources point into shared owned backing at captured offsets");
     CHECK(replay.expected_output_hash == captured.expected_output_hash, "expected render hash round-trips");
+    CHECK(replay.rtt_seeds.size() == 1 && replay.rtt_seeds[0].guest_addr == draw.color0_base,
+          "materialized replay owns temporal RTT seed pixels");
 
     auto truncated = path; truncated += ".truncated";
     std::filesystem::copy_file(path, truncated, std::filesystem::copy_options::overwrite_existing);
