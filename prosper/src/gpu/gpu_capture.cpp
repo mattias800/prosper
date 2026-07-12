@@ -452,7 +452,7 @@ bool capture_gpustate_submit(const GpuState& state, uint64_t submit_no,
                                 reader, out, error, g_rtt_seed_reader);
 }
 
-bool write_gpu_capture(const std::string& path, const GpuCaptureFile& c, std::string& error) {
+bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes, std::string& error) {
     error.clear(); Writer w; w.raw(kMagic, sizeof(kMagic)); w.u32(kVersion); w.u32(kEndian);
     w.u32(c.metadata.width); w.u32(c.metadata.height); w.u64(c.metadata.submit_index);
     w.string(c.metadata.revision); w.string(c.metadata.title_id); w.string(c.metadata.input_route); w.string(c.metadata.savedata_dir);
@@ -528,10 +528,17 @@ bool write_gpu_capture(const std::string& path, const GpuCaptureFile& c, std::st
         w.u64(operation.command_order); w.u8(operation.realized);
     }
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
+    bytes = std::move(w.data);
+    return true;
+}
+
+bool write_gpu_capture(const std::string& path, const GpuCaptureFile& c, std::string& error) {
+    std::vector<uint8_t> bytes;
+    if (!serialize_gpu_capture(c, bytes, error)) return false;
     std::filesystem::path target(path), temp = target; temp += ".tmp";
     std::error_code ec; if (target.has_parent_path()) std::filesystem::create_directories(target.parent_path(), ec);
     std::ofstream f(temp, std::ios::binary | std::ios::trunc);
-    if (!f || !f.write(reinterpret_cast<const char*>(w.data.data()), static_cast<std::streamsize>(w.data.size()))) {
+    if (!f || !f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()))) {
         error = "cannot write capture temporary file"; return false;
     }
     f.close(); std::filesystem::rename(temp, target, ec);
@@ -541,12 +548,17 @@ bool write_gpu_capture(const std::string& path, const GpuCaptureFile& c, std::st
 }
 
 bool read_gpu_capture(const std::string& path, GpuCaptureFile& c, std::string& error) {
-    error.clear(); c = {}; std::error_code ec; uint64_t size = std::filesystem::file_size(path, ec);
+    error.clear(); std::error_code ec; uint64_t size = std::filesystem::file_size(path, ec);
     if (ec || size > kMaxFileBytes || size > std::numeric_limits<size_t>::max()) { error = "invalid capture file size"; return false; }
     std::vector<uint8_t> bytes(static_cast<size_t>(size)); std::ifstream f(path, std::ios::binary);
     if (!f || !f.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()))) {
         error = "cannot read capture file"; return false;
     }
+    return deserialize_gpu_capture(bytes, c, error);
+}
+
+bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& c, std::string& error) {
+    error.clear(); c = {};
     Reader r{bytes.data(), bytes.size(), &error}; char magic[8]; uint32_t version, endian;
     if (!r.take(magic, 8) || std::memcmp(magic, kMagic, 8) || !r.u32(version) || version < 1 || version > kVersion ||
         !r.u32(endian) || endian != kEndian) { error = "unsupported capture header"; return false; }

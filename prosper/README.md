@@ -44,9 +44,9 @@ possible without console keys. Dumps are user-supplied and gitignored.
   live/replay hash mismatch remains (#569). Dispatch thread counts and derived workgroup dimensions,
   compute program binding, direct type-1 buffers, and mixed graphics/compute PM4 order now execute correctly
   (#580/#576/#584).
-- 🚧 **Active frontiers:** extend the proven one-level Dead Cells producer/consumer replay into an ordered
-  recursive predecessor window for the two temporal 642×362 versions (#595/#586). Exact-submit capture,
-  graphing, same-run producer identity, and producer-time `N-1` replay are complete; recursive closure is not.
+- 🚧 **Active frontiers:** locate and retain the initialization version for Dead Cells' two temporal 642×362
+  surfaces (#595/#586). Ordered depth-16 bundles now resolve every later producer edge with 94.2% cross-submit
+  deduplication (#603), but the earliest included submit remains explicitly depth-bounded with no RTT seed.
   The stale exact Dead Cells
   snapshot baseline is tracked separately in #596. UE4's measured GPU boundary remains under its area issues.
 

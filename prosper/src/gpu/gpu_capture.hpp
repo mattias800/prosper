@@ -118,6 +118,10 @@ bool capture_gpustate_submit(const GpuState& state, uint64_t submit_no,
                              uint32_t width, uint32_t height,
                              const GpuCaptureMetadata& metadata,
                              GpuCaptureFile& out, std::string& error);
+bool serialize_gpu_capture(const GpuCaptureFile& capture, std::vector<uint8_t>& bytes,
+                           std::string& error);
+bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& capture,
+                             std::string& error);
 bool write_gpu_capture(const std::string& path, const GpuCaptureFile& capture, std::string& error);
 bool read_gpu_capture(const std::string& path, GpuCaptureFile& capture, std::string& error);
 

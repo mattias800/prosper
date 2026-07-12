@@ -1,4 +1,5 @@
 #include "gpu/gpu_capture.hpp"
+#include "gpu/gpu_capture_bundle.hpp"
 #include "gpu/gpu_dependency_graph.hpp"
 #include "gpu/gpu_execute.hpp"
 #include "live_renderer.hpp"
@@ -25,6 +26,7 @@ bool set_environment(const std::string& name, const std::string& value) {
 void usage(const char* argv0) {
     std::fprintf(stderr, "usage: %s [--inspect|--inspect-only|--validate|--graph] "
                          "[--graph-json PATH] [--draw N[:M]] "
+                         "[--bundle capture.prgbundle] "
                          "[--prepend producer.prgcap] "
                          "[--dump-resource DRAW:vs|ps:BINDING PATH] [--allow-mismatch] "
                          "[--dump-shader DRAW:vs|fs PATH] "
@@ -275,13 +277,148 @@ bool validate_frame(const prosper::gpu::GpuReplayFrame& replay) {
     return valid;
 }
 
+struct BundleTarget {
+    uint64_t addr = 0;
+    uint64_t size = 0;
+    uint64_t submit = 0;
+};
+
+uint64_t range_end(uint64_t addr, uint64_t size) {
+    return size > UINT64_MAX - addr ? UINT64_MAX : addr + size;
+}
+
+bool ranges_overlap(uint64_t a, uint64_t as, uint64_t b, uint64_t bs) {
+    return a < range_end(b, bs) && b < range_end(a, as);
+}
+
+int replay_bundle(const std::string& path, const char* output_path) {
+    prosper::gpu::GpuCaptureBundle bundle;
+    std::string error;
+    if (!prosper::gpu::read_gpu_capture_bundle(path, bundle, error)) {
+        std::fprintf(stderr, "gpu_replay: cannot read bundle: %s\n", error.c_str()); return 2;
+    }
+    const uint64_t unique_bytes = prosper::gpu::gpu_capture_bundle_unique_bytes(bundle);
+    std::fprintf(stderr, "[gpureplay] bundle submits=%zu logical=%llu unique=%llu ratio=%.3f chunks=%zu\n",
+                 bundle.submits.size(), static_cast<unsigned long long>(bundle.logical_bytes),
+                 static_cast<unsigned long long>(unique_bytes),
+                 bundle.logical_bytes ? static_cast<double>(unique_bytes) / bundle.logical_bytes : 0.0,
+                 bundle.chunks.size());
+
+    prosper::gpu::GpuCaptureFile final_capture;
+    if (!prosper::gpu::materialize_gpu_capture_bundle_submit(
+            bundle, bundle.submits.size() - 1, final_capture, error)) {
+        std::fprintf(stderr, "gpu_replay: cannot reconstruct final submit: %s\n", error.c_str()); return 2;
+    }
+    const prosper::gpu::GpuCaptureMetadata final_metadata = final_capture.metadata;
+    const bool expected_output_valid = final_capture.expected_output_valid;
+    const uint64_t expected_output_bytes = final_capture.expected_output_bytes;
+    const uint64_t expected_output_hash = final_capture.expected_output_hash;
+    for (const auto& [name, value] : final_capture.metadata.renderer_env)
+        if (!set_environment(name, value)) {
+            std::fprintf(stderr, "gpu_replay: cannot set %s\n", name.c_str()); return 2;
+        }
+    set_environment("PROSPER_RENDER_FIRST", "0");
+    set_environment("PROSPER_RENDER_LAST", "2147483647");
+    set_environment("PROSPER_GPU_REPLAY_RTT_SEEDS", "1");
+    prosper::frontend::register_live_renderer(".", false);
+    final_capture = {};
+
+    std::vector<BundleTarget> prior_targets;
+    std::vector<uint8_t> final_pixels;
+    uint64_t temporal_resolved = 0, temporal_seeded = 0, temporal_bounded = 0, temporal_unresolved = 0;
+    for (size_t i = 0; i < bundle.submits.size(); ++i) {
+        prosper::gpu::GpuCaptureFile capture;
+        if (!prosper::gpu::materialize_gpu_capture_bundle_submit(bundle, i, capture, error)) {
+            std::fprintf(stderr, "gpu_replay: cannot reconstruct bundle submit %zu: %s\n",
+                         i, error.c_str()); return 2;
+        }
+        prosper::gpu::GpuReplayFrame replay;
+        if (!prosper::gpu::materialize_gpu_replay(capture, replay, error)) {
+            std::fprintf(stderr, "gpu_replay: cannot materialize bundle submit %llu: %s\n",
+                         static_cast<unsigned long long>(capture.metadata.submit_index), error.c_str());
+            return 2;
+        }
+        prosper::gpu::GpuDependencyGraph graph;
+        if (!prosper::gpu::build_gpu_dependency_graph(replay, graph, error)) {
+            std::fprintf(stderr, "gpu_replay: cannot graph bundle submit %llu: %s\n",
+                         static_cast<unsigned long long>(capture.metadata.submit_index), error.c_str());
+            return 2;
+        }
+        for (const auto& leaf : graph.external_leaves) {
+            if (leaf.first_future_writer == UINT32_MAX ||
+                (leaf.access.resource_class != prosper::gpu::ResourceClass::Texture &&
+                 leaf.access.resource_class != prosper::gpu::ResourceClass::StorageImage)) continue;
+            auto seed = std::find_if(replay.rtt_seeds.begin(), replay.rtt_seeds.end(),
+                [&](const auto& candidate) { return candidate.guest_addr == leaf.access.addr; });
+            auto producer = std::find_if(prior_targets.rbegin(), prior_targets.rend(),
+                [&](const auto& target) {
+                    return ranges_overlap(leaf.access.addr, leaf.access.size, target.addr, target.size);
+                });
+            const char* stop = i == 0 ? "configured-bound" : "unresolved-producer";
+            uint64_t producer_submit = 0;
+            if (producer != prior_targets.rend()) {
+                stop = "included-producer"; producer_submit = producer->submit; ++temporal_resolved;
+            } else if (seed != replay.rtt_seeds.end()) {
+                stop = "initialized-seed"; ++temporal_seeded;
+            } else {
+                if (i == 0) ++temporal_bounded;
+                else ++temporal_unresolved;
+            }
+            std::fprintf(stderr, "[gpureplay] frontier submit=%llu op=%u addr=%016llx dims=%ux%u "
+                                 "stop=%s producer=%llu\n",
+                         static_cast<unsigned long long>(capture.metadata.submit_index),
+                         leaf.consumer_operations.front(),
+                         static_cast<unsigned long long>(leaf.access.addr),
+                         leaf.access.width, leaf.access.height, stop,
+                         static_cast<unsigned long long>(producer_submit));
+        }
+
+        std::vector<prosper::gpu::GpuCaptureRttSeed> seeds;
+        for (const auto& seed : replay.rtt_seeds)
+            if (std::none_of(prior_targets.begin(), prior_targets.end(), [&](const auto& target) {
+                    return target.addr == seed.guest_addr;
+                })) seeds.push_back(seed);
+        if (!prosper::gpu::restore_gpu_replay_rtt_seeds(seeds, error)) {
+            std::fprintf(stderr, "gpu_replay: cannot restore bundle RTT seeds: %s\n", error.c_str());
+            return 2;
+        }
+        final_pixels = execute_frame(replay);
+        for (const auto& draw : replay.items)
+            if (draw.color0_base && draw.color0_width && draw.color0_height)
+                prior_targets.push_back({draw.color0_base,
+                    static_cast<uint64_t>(draw.color0_width) * draw.color0_height * 4,
+                    capture.metadata.submit_index});
+        std::fprintf(stderr, "[gpureplay] bundle-submit=%llu operations=%zu output_bytes=%zu hash=%016llx\n",
+                     static_cast<unsigned long long>(capture.metadata.submit_index),
+                     replay.operations.size(), final_pixels.size(),
+                     static_cast<unsigned long long>(prosper::gpu::gpu_capture_hash(final_pixels)));
+    }
+    std::fprintf(stderr, "[gpureplay] closure temporal-resolved=%llu seeded=%llu bounded=%llu "
+                         "unresolved=%llu\n",
+                 static_cast<unsigned long long>(temporal_resolved),
+                 static_cast<unsigned long long>(temporal_seeded),
+                 static_cast<unsigned long long>(temporal_bounded),
+                 static_cast<unsigned long long>(temporal_unresolved));
+    if (output_path && !final_pixels.empty() &&
+        !prosper::test::dump_bmp(output_path, final_pixels,
+                                 final_metadata.width, final_metadata.height)) {
+        std::fprintf(stderr, "gpu_replay: cannot write %s\n", output_path); return 2;
+    }
+    if (expected_output_valid &&
+        (final_pixels.size() != expected_output_bytes ||
+         prosper::gpu::gpu_capture_hash(final_pixels) != expected_output_hash)) {
+        std::fprintf(stderr, "gpu_replay: bundle output mismatch\n"); return 1;
+    }
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     bool inspect = false, inspect_only = false, validate_only = false, allow_mismatch = false;
     bool graph_only = false;
     int draw_first = -1, draw_last = -1;
-    std::string dump_spec, dump_path, shader_spec, shader_path, graph_json_path, prepend_path;
+    std::string dump_spec, dump_path, shader_spec, shader_path, graph_json_path, prepend_path, bundle_path;
     std::vector<const char*> positional;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--inspect") inspect = true;
@@ -292,6 +429,7 @@ int main(int argc, char** argv) {
             graph_only = true; graph_json_path = argv[++i];
         }
         else if (std::string(argv[i]) == "--allow-mismatch") allow_mismatch = true;
+        else if (std::string(argv[i]) == "--bundle" && i + 1 < argc) bundle_path = argv[++i];
         else if (std::string(argv[i]) == "--prepend" && i + 1 < argc) prepend_path = argv[++i];
         else if (std::string(argv[i]) == "--draw" && i + 1 < argc) {
             std::string range = argv[++i]; size_t colon = range.find(':');
@@ -305,6 +443,13 @@ int main(int argc, char** argv) {
             shader_spec = argv[++i]; shader_path = argv[++i];
         }
         else positional.push_back(argv[i]);
+    }
+    if (!bundle_path.empty()) {
+        if (positional.size() > 1 || inspect || inspect_only || validate_only || graph_only ||
+            draw_first >= 0 || !dump_spec.empty() || !shader_spec.empty() || !prepend_path.empty()) {
+            usage(argv[0]); return 2;
+        }
+        return replay_bundle(bundle_path, positional.empty() ? nullptr : positional[0]);
     }
     if (positional.empty() || positional.size() > 2) { usage(argv[0]); return 2; }
     prosper::gpu::GpuCaptureFile capture; std::string error;

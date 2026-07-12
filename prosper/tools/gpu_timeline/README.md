@@ -35,6 +35,20 @@ PROSPER_GPU_TIMELINE_CAPTURE_PREDECESSOR=/tmp/dead-cells-submit-18419.prgcap \
   /tmp/dead-cells-submit-18420.prgcap /tmp/replay-with-producer.bmp
 ```
 
+Capture a bounded ordered window directly into one deduplicated bundle:
+
+```bash
+PROSPER_GPU_TIMELINE=/tmp/dead-cells-bundle.prgtl \
+PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT=18420 \
+PROSPER_GPU_TIMELINE_CAPTURE=/tmp/dead-cells-submit-18420.prgcap \
+PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE=/tmp/dead-cells-depth16.prgbundle \
+PROSPER_GPU_TIMELINE_CAPTURE_DEPTH=16 \
+PROSPER_GPU_TIMELINE_CAPTURE_MAX_UNIQUE_MB=1024 \
+  ./build-linux/boot_trace /path/to/PPSA15552-app0
+
+./build-linux/gpu_replay --bundle /tmp/dead-cells-depth16.prgbundle /tmp/closure.bmp
+```
+
 See [`../gpu_replay/README.md`](../gpu_replay/README.md) for graph interpretation, pixel-oracle
 semantics, draw isolation, resource/shader extraction, and the distinction between draw and operation indices.
 
@@ -84,3 +98,10 @@ materializing it after the selected submit would read mutable guest memory too l
 evidence. `PROSPER_GPU_TIMELINE_CAPTURE_PREDECESSOR=<path>` instead captures exactly submit `N-1` at
 producer time in the same run and links both capsules with ordinary detail records. It is deliberately a
 one-level closure probe; if the predecessor graph has temporal leaves, capture must recurse further.
+
+For a recursive probe, `PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE=<path>` captures the selected submit and
+`PROSPER_GPU_TIMELINE_CAPTURE_DEPTH=N` contiguous submits ending there (2..16). Captures are serialized at
+producer time and folded immediately into content-defined, checksummed chunks; no retained `GpuState` or
+standalone predecessor files are used. `PROSPER_GPU_TIMELINE_CAPTURE_MAX_UNIQUE_MB=N` bounds unique chunk
+data to 64..4096 MiB (default 1024) and aborts bundle installation if exhausted. The selected standalone
+`.prgcap` remains the graph/oracle reference and is currently required with the bundle.
