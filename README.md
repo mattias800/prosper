@@ -4,9 +4,9 @@
 runs PS5 (Prospero) game binaries on Linux (primary) and Windows (secondary) by reimplementing the
 console's OS, ABI, and GPU stack on the host — **not** by emulating a CPU.
 
-> ⚠️ **Experimental research project.** It is not a playable game runner yet, but it now boots real
-> retail titles deep into their engine's frame loop and **renders real frames** to a live Vulkan
-> backend. See [Status](#status) for exactly how far it gets today.
+> ⚠️ **Experimental research project.** It is not a general-purpose game runner yet. The primary
+> title now reaches a hardware-verified first level, while other retail titles expose substantial
+> compatibility gaps. See [Status](#status) for exactly how far each target gets today.
 
 ## Why no CPU emulation?
 
@@ -28,8 +28,8 @@ natural primary target and the long-term dream is running on that hardware.
 
 prosper boots **multiple real retail titles** across two engine families — Unity 2022 / IL2CPP
 (*The Messenger*, `PPSA24651`, the primary target) and Unreal Engine (`PPSA17942`) — from a
-user-supplied, **unencrypted-segment** dump. For the primary title it now boots *through* the engine
-and draws real geometry.
+user-supplied, **unencrypted-segment** dump. For the primary title it now boots *through* the engine,
+accepts scripted gamepad input, and renders the first level.
 
 **Boot & runtime (host-side OS / ABI / HLE):**
 - ✅ Parses `SELF`/`ELF`, builds a relocatable image, resolves Sony **NID**-hashed imports, links the
@@ -65,16 +65,19 @@ and draws real geometry.
   `resolve_pipeline_state` → real `VkGraphicsPipeline`s, with topology, blend (incl. separate-alpha),
   depth, stencil, per-MRT color-write-mask, the game's real fast-clear color, and a render-to-texture
   cache for multi-pass composites — all driven from the decoded registers and pixel-verified.
-- ✅ **The Messenger renders:** it plays its intro **cutscene** (dozens of distinct animating frames),
-  draws its **title screen with readable text**, accepts **gamepad input**, and progresses through
-  New-Game into **gameplay level loading**. Frames are asserted by a golden-image regression guard, not
-  eyeballed.
+- ✅ **The Messenger reaches gameplay:** intro, title, menus, save list, dialogue, player, terrain,
+  water, structures, and foreground composition render through the first level at native 1920x1080.
+  A scripted gamepad route produced a full-resolution sequence that was confirmed against PS5 hardware.
+- 🚧 **Dead Cells reaches gameplay:** deterministic input routing passes its splash and menus into the
+  first playable scene. HUD and some composition are alive, but the world is mostly white. Capture/replay
+  isolated the first bad composition input; compute program and resource binding now resolve, while actual
+  `DispatchDirect` shader execution remains missing (#566, #576).
 
 **Frontend:** `prosper-app` is a windowed player (SDL3 window + Vulkan present + audio sink +
 evdev/SDL3 controllers + real message/error/IME dialogs), sharing the same boot + render core as the
 headless `boot_trace`.
 
-Development is **agentic-first**: correctness is verified programmatically — **84 self-checking tests**
+Development is **agentic-first**: correctness is verified programmatically — **85 self-checking tests**
 under `ctest` (including a headless Vulkan/llvmpipe harness that runs recompiled shaders and asserts
 numeric/pixel results, and per-opcode round-trip disassembly checks), a **golden-image snapshot guard**
 that boots a real title and pixel/content-asserts an exact frame, cross-platform CI (Linux +
@@ -100,7 +103,7 @@ Requires a C++20 compiler, CMake, and Ninja. A Vulkan loader is needed for the g
 cd prosper
 cmake -G Ninja -B build-linux
 cmake --build build-linux
-ctest --test-dir build-linux          # 84 self-checking tests
+ctest --test-dir build-linux          # 85 self-checking tests
 ```
 
 Add `-DPROSPER_APP=ON` to also build the windowed `prosper-app` frontend (fetches SDL3). A
