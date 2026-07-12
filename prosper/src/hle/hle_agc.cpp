@@ -1063,6 +1063,10 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
     g_submit_count++;
     gpu::diagnose_compute_dispatches(agc_gpu_state(), g_submit_count);
     gpu::diagnose_resource_provenance(agc_gpu_state(), g_submit_count);
+    if (gpu::have_submit_compute() && !agc_gpu_state().dispatches.empty() &&
+        !gpu::execute_compute_dispatches(agc_gpu_state()) && getenv("PROSPER_COMPUTELOG"))
+        fprintf(stderr, "[compute] submit #%llu produced no executable work\n",
+                (unsigned long long)g_submit_count);
     // #312 EOP visibility contract: the pulse fires immediately only when no gated writes are
     // pending; otherwise it is OWED and delivered when the tail drains (the guest's completion
     // scan must never observe a half-retired frame — see command_processor.cpp). The flip and the
@@ -1182,6 +1186,10 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     g_submit_count++;
     gpu::diagnose_compute_dispatches(agc_gpu_state(), g_submit_count);
     gpu::diagnose_resource_provenance(agc_gpu_state(), g_submit_count);
+    if (gpu::have_submit_compute() && !agc_gpu_state().dispatches.empty() &&
+        !gpu::execute_compute_dispatches(agc_gpu_state()) && getenv("PROSPER_COMPUTELOG"))
+        fprintf(stderr, "[compute] submit #%llu produced no executable work\n",
+                (unsigned long long)g_submit_count);
     // The submit has "completed" (synchronous fold): fire any registered GPU EOP events. Inert unless the
     // game called sceGnmAddEqEvent (b0xyllnVY-I); the RELEASE_MEM label write already happened in apply().
     // #312 EOP visibility contract: pulse only when no gated writes are pending, else owed until
@@ -1310,10 +1318,8 @@ HLE(agc_driver_get_resource_registration_max_name_length) {
 // modifier. Preserve thread counts here; the executor derives ceil(threads/local_size) groups
 // from the retained register snapshot (#580). Kyty's Gen4 GraphicsDispatchDirect is a differently
 // named API and is not an oracle for this Gen5 builder. DOLL's first real frame issues ~535 of
-// these (UE4's compute
-// prologue: GPUScene build, clears, culling) before any graphics draw. Appending the packet keeps
-// the stream faithful; the CommandProcessor records it (no compute execution yet — that is a later
-// milestone; the fence cluster around each dispatch completes at fold time regardless).
+// these (UE4's compute prologue: GPUScene build, clears, culling) before any graphics draw. Appending
+// the packet keeps the stream faithful; the CommandProcessor retains it for ordered submit execution.
 // CONFIDENCE: HIGH (PS5 symbol table + live kernel disassembly, register state, and descriptor sizes).
 HLE(agc_cb_dispatch) {  // (buf, thread_count_x, thread_count_y, thread_count_z, dispatch_modifier)
     uint32_t* cmd; if (!begin_packet(a0, 6, IT_NOP, R_DISPATCH_DIRECT, &cmd)) return 0;

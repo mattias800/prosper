@@ -37,10 +37,10 @@ possible without console keys. Dumps are user-supplied and gitignored.
   into the first playable scene. HUD and some composition render, but the world is mostly white (#566).
   Version-4 GPU captures seed temporal render targets for faithful offline isolation (#568); one residual
   live/replay hash mismatch remains (#569). Dispatch thread counts and derived workgroup dimensions,
-  compute program binding, and the title's direct type-1 buffer resource now decode correctly (#580/#574).
-- 🚧 **Active frontiers:** execute retained compute dispatches in stream order (#576), then use compute
-  writer provenance to determine whether the missing 642x362 Dead Cells composition input is compute-owned.
-  Stabilize the animation-sensitive exact splash guard (#573) and continue cross-title capture/replay and
+  compute program binding, and the title's direct type-1 buffer resource now execute correctly (#580/#576).
+- 🚧 **Active frontiers:** identify the actual producer of Dead Cells' missing 642x362 composition input;
+  buffer compute execution does not recover it (#566). Add storage-image compute and compute-writer provenance,
+  stabilize the animation-sensitive exact splash guard (#573), and continue cross-title capture/replay and
   descriptor-validation work. UE4's measured GPU boundary remains tracked separately under its area issues.
 
 The completed Messenger black-render investigation and reusable evidence boundary are recorded in
@@ -72,7 +72,7 @@ prosper/
 ```
 cmake -S . -B build -G Ninja
 cmake --build build
-ctest --test-dir build          # 85 self-checking tests
+ctest --test-dir build          # 86 self-checking tests
 ```
 Add `-DPROSPER_APP=ON` for the windowed `prosper-app` frontend (fetches SDL3). Or a tool directly:
 ```

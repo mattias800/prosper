@@ -10,6 +10,7 @@
 #include "agc_shader_layout.hpp"  // AgcShaderHeader + build_shader_resources
 #include "pm4_registers.hpp"      // SPI_SHADER_USER_DATA_* offsets
 #include "rdna2_decode.hpp"       // rdna2_walk (for the vertex-fetch const-eval)
+#include "rdna2_to_spirv.hpp"     // recompile_compute
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -29,6 +30,7 @@ extern "C" const void* prosper_agc_shader_header_for_code(uint64_t code_addr);
 namespace prosper::gpu {
 namespace {
 LiveRenderFn g_live;   // empty until the runtime/test registers a device-backed renderer
+LiveComputeFn g_compute;   // synchronous compute backend, registered with the live Vulkan frontend
 
 // Read a 32-dword user-data SGPR block from a stage's register file. `base` = the stage's
 // SPI_SHADER_USER_DATA_*_0 register offset; absent registers read as 0. 32 (not 16) because NGG merged
@@ -868,6 +870,94 @@ ComputeLaunchDimensions resolve_compute_launch(const GpuState::Dispatch& d) {
     return out;
 }
 
+bool execute_compute_dispatches(const GpuState& st) {
+    if (!g_compute || st.dispatches.empty()) return false;
+    namespace P = prosper::agc::Pm4;
+    auto rd = [](const std::unordered_map<uint32_t, uint32_t>& regs, uint32_t off) {
+        auto it = regs.find(off);
+        return it == regs.end() ? 0u : it->second;
+    };
+
+    std::vector<ComputeItem> items;
+    items.reserve(st.dispatches.size());
+    for (const auto& dispatch : st.dispatches) {
+        const GpuState& ds = dispatch.state ? *dispatch.state : st;
+        const uint64_t code_addr = (static_cast<uint64_t>(rd(ds.sh, P::COMPUTE_PGM_LO)) << 8) |
+                                   (static_cast<uint64_t>(rd(ds.sh, P::COMPUTE_PGM_HI) & 0xffu) << 40);
+        const auto* header = static_cast<const AgcShaderHeader*>(
+            prosper_agc_shader_header_for_code(code_addr));
+        if (!header || !code_addr || !guest_readable(code_addr, sizeof(uint32_t))) {
+            static std::set<uint64_t> logged;
+            if (logged.insert(code_addr).second)
+                std::fprintf(stderr, "[compute] skip unregistered/unreadable program 0x%llx\n",
+                             (unsigned long long)code_addr);
+            continue;
+        }
+
+        uint32_t range_start = 0;
+        if (header->specials && guest_readable((uint64_t)(uintptr_t)header->specials,
+                                               sizeof(AgcShaderSpecials))) {
+            const uint32_t start = header->specials->user_data_range_start;
+            const uint32_t end = header->specials->user_data_range_end;
+            if (start < kUserSgprs && end > start && end <= 2 * kUserSgprs) range_start = start;
+        }
+        uint32_t sgprs[kUserSgprs] = {};
+        read_user_sgprs(ds.sh, P::COMPUTE_USER_DATA_0 + range_start, sgprs);
+        auto table = std::make_shared<ShaderResourceTable>(
+            build_shader_resources(*header, sgprs, kUserSgprs, 0));
+        assign_convention_bindings(*table, 2);
+
+        const uint32_t rsrc2 = rd(ds.sh, P::COMPUTE_PGM_RSRC2);
+        auto field = [&](uint32_t shift, uint32_t mask) { return (rsrc2 >> shift) & mask; };
+        ComputeShaderConfig config;
+        const uint32_t user_count = field(P::COMPUTE_PGM_RSRC2_USER_SGPR_SHIFT,
+                                          P::COMPUTE_PGM_RSRC2_USER_SGPR_MASK);
+        config.user_sgprs.assign(sgprs, sgprs + std::min(user_count, kUserSgprs));
+        const ComputeLaunchDimensions launch = resolve_compute_launch(dispatch);
+        config.local_x = launch.local_x;
+        config.local_y = launch.local_y;
+        config.local_z = launch.local_z;
+        config.tgid_x_en = field(P::COMPUTE_PGM_RSRC2_TGID_X_EN_SHIFT,
+                                 P::COMPUTE_PGM_RSRC2_TGID_X_EN_MASK) != 0;
+        config.tgid_y_en = field(P::COMPUTE_PGM_RSRC2_TGID_Y_EN_SHIFT,
+                                 P::COMPUTE_PGM_RSRC2_TGID_Y_EN_MASK) != 0;
+        config.tgid_z_en = field(P::COMPUTE_PGM_RSRC2_TGID_Z_EN_SHIFT,
+                                 P::COMPUTE_PGM_RSRC2_TGID_Z_EN_MASK) != 0;
+        config.tg_size_en = field(P::COMPUTE_PGM_RSRC2_TG_SIZE_EN_SHIFT,
+                                  P::COMPUTE_PGM_RSRC2_TG_SIZE_EN_MASK) != 0;
+        config.tidig_comp_cnt = field(P::COMPUTE_PGM_RSRC2_TIDIG_COMP_CNT_SHIFT,
+                                      P::COMPUTE_PGM_RSRC2_TIDIG_COMP_CNT_MASK);
+        config.lds_bytes = field(P::COMPUTE_PGM_RSRC2_LDS_SIZE_SHIFT,
+                                 P::COMPUTE_PGM_RSRC2_LDS_SIZE_MASK) * 512u;
+
+        ComputeItem item;
+        item.spirv = recompile_compute((const uint32_t*)(uintptr_t)code_addr, 0x10000,
+                                       table.get(), config);
+        item.resources = std::move(table);
+        item.launch = launch;
+        item.code_addr = code_addr;
+        if (item.spirv.empty()) {
+            static std::set<uint64_t> logged;
+            if (logged.insert(code_addr).second)
+                std::fprintf(stderr, "[compute] skip unsupported program 0x%llx\n",
+                             (unsigned long long)code_addr);
+            continue;
+        }
+        const DescriptorValidationReport report = validate_spirv_descriptor_interface(
+            item.spirv, item.resources.get(), 0, SpirvShaderStage::Compute, false);
+        if (!report.ok()) {
+            static std::set<uint64_t> logged;
+            if (logged.insert(code_addr).second)
+                std::fprintf(stderr, "[compute] skip invalid descriptor contract for program 0x%llx\n",
+                             (unsigned long long)code_addr);
+            continue;
+        }
+        items.push_back(std::move(item));
+    }
+    if (items.empty()) return false;
+    return g_compute(items);
+}
+
 void diagnose_compute_dispatches(const GpuState& st, uint64_t submit_no) {
     const char* enabled = getenv("PROSPER_COMPUTELOG");
     const char* dim_env = getenv("PROSPER_COMPUTELOG_DIM");
@@ -1081,6 +1171,8 @@ void diagnose_resource_provenance(const GpuState& st, uint64_t submit_no) {
 
 void set_submit_renderer(LiveRenderFn fn) { g_live = std::move(fn); }
 bool have_submit_renderer()               { return static_cast<bool>(g_live); }
+void set_submit_compute(LiveComputeFn fn) { g_compute = std::move(fn); }
+bool have_submit_compute()                { return static_cast<bool>(g_compute); }
 std::vector<uint8_t> render_submit_items(const std::vector<DrawItem>& items,
                                          uint32_t width, uint32_t height) {
     return g_live ? g_live(items, width, height) : std::vector<uint8_t>{};

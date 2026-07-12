@@ -26,6 +26,7 @@
 #include "gpu/rdna2_to_spirv.hpp"         // recompile_fragment (diagnostic solid-color PS)
 #include "../../tests/render_runner.h"   // offscreen Vulkan backend (render_triangle_rgba) + dump_bmp
 #include "../../frontends/shared/live_renderer.hpp"   // shared live renderer (also used by prosper-app)
+#include "../../frontends/shared/live_compute.hpp"    // synchronous AGC compute execution
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -185,6 +186,8 @@ int main(int argc, char** argv) {
     }
 
 #ifdef PROSPER_HAVE_VULKAN
+    // Compute is part of command submission even when frame rendering/dumping is disabled.
+    prosper::frontend::register_live_compute();
     // PROSPER_RENDER=1: register the live Vulkan renderer (shared with prosper-app via
     // frontends/shared/live_renderer) so execute_and_present composites every submitted Dcb with
     // draws and hands the frame to the present path; periodic BMP screenshots go to PROSPER_FRAME_DIR

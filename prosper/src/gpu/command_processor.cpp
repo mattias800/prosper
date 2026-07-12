@@ -1363,11 +1363,9 @@ void GpuState::apply(const Pm4Command& c) {
             }
             break;
         case K::DispatchDirect:
-            // Compute dispatch (issue #213 — DOLL's UE4 compute prologue). Recorded for stats/
-            // diagnostics only: prosper has no compute execution path yet. The fence cluster the
-            // guest builds around each dispatch (label init + EOP write + wait) completes at fold
-            // time independently of the dispatch itself, so skipping the shader work cannot hang
-            // the stream — it only leaves compute-written buffers stale (surfaced by the counter).
+            // Retain the dispatch and its exact register snapshot. The submit executor recompiles
+            // supported compute programs and runs them in this vector's stream order before exposing
+            // completion; unsupported programs remain visible in diagnostics (#576).
             if (state_dirty_ || !last_snapshot_) {
                 auto snap = std::make_shared<GpuState>();
                 snap->cx = cx; snap->sh = sh; snap->uc = uc; snap->index_type = index_type;
