@@ -415,9 +415,15 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
     // buffer, 10 = vertex attrib; direct_resource_offset is indexed by usage type and the value is the
     // SGPR index where that V# sits (0xffff = absent). We emit a VertexBuffer keyed by sgpr_base so
     // the recompiler resolves each buffer_load_format_*'s SRSRC directly (no in-shader s_load).
+    // Dead Cells compute shaders use direct type 1 for an inline V# at COMPUTE_USER_DATA_0
+    // (live descriptor: 16-byte stride, 0x1fe000 records, plausible Base48). Model it as a
+    // ConstantBuffer-class resource: both that class and VertexBuffer lower to a Vulkan storage
+    // buffer, while ConstantBuffer also lets scalar buffer loads resolve by their direct SBASE.
+    // Restrict this Gen5 observation to compute shaders; other stages have no exercised contract.
     if (const uint16_t* dro = ud->direct_resource_offset) {
         for (uint16_t type = 0; type < ud->direct_resource_count; type++) {
-            if (type != 8 && type != 10) continue;              // vertex buffer / vertex attrib
+            const bool compute_buffer = shdr.type == 0 && type == 1;
+            if (!compute_buffer && type != 8 && type != 10) continue;
             uint32_t reg = dro[type];
             if (reg == 0xffff) continue;
             if ((uint64_t)reg + 4 > num_user_sgprs) continue;   // V# (4 dwords) must fit in the block
@@ -430,8 +436,8 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             // for shaders that DO place the V# inline.)
             if (d.base == 0 || d.size_bytes == 0 || d.size_bytes > 0x10000000u) continue;
             ShaderResource r;
-            r.cls            = ResourceClass::VertexBuffer;
-            r.format         = d.format;          // Float32 for this game (dfmt {4,11,13,14}, nfmt 7)
+            r.cls            = compute_buffer ? ResourceClass::ConstantBuffer : ResourceClass::VertexBuffer;
+            r.format         = d.format;
             r.num_components  = d.num_components;
             r.binding        = binding++;
             r.gpu_addr       = d.base;

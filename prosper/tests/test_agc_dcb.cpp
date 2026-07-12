@@ -24,7 +24,9 @@ struct Dcb {
 static uint32_t PM4(uint32_t len, uint32_t op, uint32_t r) {
     return 0xC0000000u | (((len - 2u) & 0x3fffu) << 16u) | ((op & 0xffu) << 8u) | ((r & 0x3fu) << 2u);
 }
-constexpr uint32_t IT_NOP = 0x10, R_DRAW_RESET = 0x05, R_CX_REGS_INDIRECT = 0x12;
+constexpr uint32_t IT_NOP = 0x10, IT_SET_SH_REG = 0x76, R_DRAW_RESET = 0x05, R_CX_REGS_INDIRECT = 0x12;
+
+struct ShaderRegister { uint32_t offset, value; };
 
 int main() {
     printf("== test_agc_dcb ==\n");
@@ -84,6 +86,40 @@ int main() {
               out == nullptr, "unknown type: invalid-arg and out pointer remains untouched");
         CHECK(getpayload(0, (uint64_t)(uintptr_t)pkt, 1, 0, 0, 0) != 0, "null out-ptr -> invalid-arg");
         CHECK(getpayload((uint64_t)(uintptr_t)&out, 0, 1, 0, 0, 0) != 0, "null cmd -> invalid-arg");
+    }
+
+    // sceAgcCbSetShRegistersDirect (#574): group adjacent offsets, but preserve caller order and
+    // split gaps into separate packets so every {offset,value} pair reaches the SH register file.
+    auto setshdirect = Hle::lookup("UZbQjYAwwXM");
+    CHECK(setshdirect != nullptr, "SetShRegistersDirect registered");
+    if (setshdirect) {
+        ShaderRegister sh[] = {
+            {0x20c, 0x11111111u}, {0x20d, 0x22222222u},
+            {0x212, 0x33333333u}, {0x100, 0x44444444u}, {0x101, 0x55555555u},
+        };
+        uint32_t* before = dcb.cursor_up;
+        uint64_t first_addr = setshdirect(D, (uint64_t)(uintptr_t)sh, 5, 0, 0, 0);
+        auto* first = (uint32_t*)(uintptr_t)first_addr;
+        CHECK(first == before, "SetShRegistersDirect returns the first emitted packet");
+        CHECK(first[0] == PM4(4, IT_SET_SH_REG, 0) && first[1] == 0x20c &&
+              first[2] == 0x11111111u && first[3] == 0x22222222u,
+              "first consecutive SH-register run emitted as one packet");
+        auto* second = first + 4;
+        CHECK(second[0] == PM4(3, IT_SET_SH_REG, 0) && second[1] == 0x212 &&
+              second[2] == 0x33333333u, "register gap starts a new SH packet");
+        auto* third = second + 3;
+        CHECK(third[0] == PM4(4, IT_SET_SH_REG, 0) && third[1] == 0x100 &&
+              third[2] == 0x44444444u && third[3] == 0x55555555u,
+              "out-of-order consecutive run preserves caller order");
+        CHECK(dcb.cursor_up == before + 11, "SetShRegistersDirect advances by all packet dwords");
+
+        before = dcb.cursor_up;
+        CHECK(setshdirect(D, 0, 5, 0, 0, 0) == 0 && dcb.cursor_up == before,
+              "null register array rejected without allocating");
+        CHECK(setshdirect(D, (uint64_t)(uintptr_t)sh, 0, 0, 0, 0) == 0 && dcb.cursor_up == before,
+              "zero register count rejected without allocating");
+        CHECK(setshdirect(D, (uint64_t)(uintptr_t)sh, 4097, 0, 0, 0) == 0 && dcb.cursor_up == before,
+              "oversized register count rejected without allocating");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }

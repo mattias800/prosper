@@ -852,6 +852,46 @@ HLE(agc_cb_set_sh_register_range_direct) {  // (buf, offset, values, num_values)
     return (uint64_t)(uintptr_t)cmd;
 }
 
+// sceAgcCbSetShRegistersDirect (UZbQjYAwwXM) -- append a set of non-contiguous SH registers.
+// Live Dead Cells imports this immediately before its compute dispatch stream; dropping the call
+// leaves COMPUTE_PGM_* and compute user-data at zero. The ABI is (Dcb*, ShaderRegister*, count),
+// where each entry is {offset,value}. Preserve caller order and combine only adjacent consecutive
+// offsets, so duplicate/out-of-order writes retain their original semantics.
+HLE(agc_cb_set_sh_registers_direct) {
+    auto* regs = (const AgcShaderRegister*)(uintptr_t)a1;
+    const uint32_t count = (uint32_t)a2;
+    if (!a0 || !regs || !count || count > 4096) return 0;
+
+    if (getenv("PROSPER_GFXLOG")) {
+        static std::atomic<uint32_t> logged{0};
+        const uint32_t n = logged.fetch_add(1, std::memory_order_relaxed);
+        if (n < 16) {
+            fprintf(stderr, "[agc] SetShRegistersDirect dcb=0x%llx regs=%p count=%u:",
+                    (unsigned long long)a0, (const void*)regs, count);
+            for (uint32_t i = 0; i < count && i < 24; ++i)
+                fprintf(stderr, " (off=0x%x val=0x%x)", regs[i].offset, regs[i].value);
+            if (count > 24) fprintf(stderr, " ...");
+            fprintf(stderr, "\n");
+        }
+    }
+
+    uint32_t* first = nullptr;
+    uint32_t start = 0;
+    while (start < count) {
+        uint32_t end = start + 1;
+        while (end < count && regs[end].offset == regs[end - 1].offset + 1) ++end;
+
+        const uint32_t run_count = end - start;
+        uint32_t* cmd = nullptr;
+        if (!begin_packet(a0, run_count + 2, IT_SET_SH_REG, 0, &cmd)) return 0;
+        if (!first) first = cmd;
+        cmd[1] = regs[start].offset;
+        for (uint32_t i = 0; i < run_count; ++i) cmd[2 + i] = regs[start + i].value;
+        start = end;
+    }
+    return (uint64_t)(uintptr_t)first;
+}
+
 // sceAgcCreatePrimState (D9sr1xGUriE) — derive the primitive-pipeline registers from the bound
 // geometry shader's "specials" block. Kyty hard-asserts hs==null and exact register offsets; we
 // copy the specials through and log deviations instead (tessellation would arrive via hs).
@@ -1286,6 +1326,7 @@ void register_agc_hle() {
     RN("uJziRsODk1c", agc_driver_get_resource_registration_max_name_length);
     RN("V++UgBtQhn0", agc_get_data_packet_payload);          // data packet -> register-bank payload
     RN("n2fD4A+pb+g", agc_cb_set_sh_register_range_direct);  // SET_SH_REG range packet
+    RN("UZbQjYAwwXM", agc_cb_set_sh_registers_direct);       // non-contiguous SET_SH_REG packets
     RN("D9sr1xGUriE", agc_create_prim_state);                // prim registers from gs specials
     RN("HV4j+E0MBHE", agc_create_interpolant_mapping);       // SPI_PS_INPUT_CNTL_* wiring
     RN("TRO721eVt4g", agc_dcb_reset_queue);

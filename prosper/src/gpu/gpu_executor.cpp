@@ -879,11 +879,48 @@ void diagnose_compute_dispatches(const GpuState& st, uint64_t submit_no) {
         }
 
         ShaderResourceTable table;
+        uint32_t sgprs[kUserSgprs] = {};
         if (hdr) {
-            uint32_t sgprs[kUserSgprs];
             read_user_sgprs(ds.sh, P::COMPUTE_USER_DATA_0 + range_start, sgprs);
             table = build_shader_resources(*hdr, sgprs, kUserSgprs, 0);
             assign_convention_bindings(table, 2);
+        }
+
+        // A compute shader can carry only an inline direct type-1 V# and no sharp descriptors. Dump
+        // its metadata and bound SGPRs once per program if resource decoding still returns empty.
+        // This turns the next unsupported layout into a reproducible decode problem instead of
+        // another blind `resources=0` investigation.
+        if (hdr && table.resources.empty() && enabled && *enabled) {
+            static std::set<uint64_t> logged_empty;
+            if (logged_empty.insert(code_addr).second) {
+                const AgcShaderUserData* ud = hdr->user_data;
+                fprintf(stderr, "[compute] empty-resource metadata code=0x%llx type=%u ud=%p",
+                        (unsigned long long)code_addr, hdr->type, (const void*)ud);
+                if (ud) {
+                    fprintf(stderr, " eud=%u srt=%u direct_count=%u sharp={%u,%u,%u,%u}",
+                            ud->eud_size_dw, ud->srt_size_dw, ud->direct_resource_count,
+                            ud->sharp_resource_count[0], ud->sharp_resource_count[1],
+                            ud->sharp_resource_count[2], ud->sharp_resource_count[3]);
+                }
+                fprintf(stderr, "\n[compute]   user_sgprs:");
+                for (uint32_t s = 0; s < kUserSgprs; ++s) fprintf(stderr, " %08x", sgprs[s]);
+                fprintf(stderr, "\n");
+
+                if (ud && ud->direct_resource_offset && ud->direct_resource_count) {
+                    fprintf(stderr, "[compute]   direct offsets:");
+                    for (uint16_t t = 0; t < ud->direct_resource_count && t < 16; ++t)
+                        fprintf(stderr, " [%u]=%u", t, ud->direct_resource_offset[t]);
+                    fprintf(stderr, "\n");
+                    const uint32_t reg = ud->direct_resource_count > 1 ? ud->direct_resource_offset[1] : 0xffffu;
+                    if (reg != 0xffffu && reg + 4 <= kUserSgprs) {
+                        const DecodedBufferDescriptor d = decode_buffer_descriptor(&sgprs[reg]);
+                        fprintf(stderr, "[compute]   type1 V# reg=%u base=0x%llx stride=%u records=%u "
+                                        "size=%u fmt=%u comps=%u\n",
+                                reg, (unsigned long long)d.base, d.stride, d.num_records, d.size_bytes,
+                                (unsigned)d.format, d.num_components);
+                    }
+                }
+            }
         }
 
         bool dim_match = !want_w || !want_h;

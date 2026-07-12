@@ -184,6 +184,29 @@ int main() {
     CHECK(t3.by_sgpr_base(4) != nullptr, "constant buffers still present alongside vertex buffers");
     CHECK(t3.by_sgpr_base(99) == nullptr, "unknown sgpr_base -> null");
 
+    // --- Dead Cells compute direct resource: type 1 points at an inline V# in user SGPRs (#574). --
+    {
+        uint32_t csgprs[32]; memset(csgprs, 0, sizeof csgprs);
+        make_vsharp(&csgprs[0], 0x74B4A8240000ull, 16, 0x1fe000, /*fmt*/75);
+        uint16_t cdro[11]; for (auto& x : cdro) x = 0xffff;
+        cdro[1] = 0;
+        AgcShaderUserData cud; memset(&cud, 0, sizeof cud);
+        cud.direct_resource_offset = cdro; cud.direct_resource_count = 11; cud.srt_size_dw = 8;
+        AgcShaderHeader csh; memset(&csh, 0, sizeof csh);
+        csh.file_header = 0x34333231u; csh.version = 0x18; csh.type = 0; csh.user_data = &cud;
+
+        ShaderResourceTable ct = build_shader_resources(csh, csgprs, 32);
+        const ShaderResource* cb = ct.by_sgpr_base(0);
+        CHECK(cb && cb->cls == ResourceClass::ConstantBuffer,
+              "compute type-1 direct V# emitted as a storage-buffer-backed resource");
+        CHECK(cb && cb->gpu_addr == 0x74B4A8240000ull && cb->stride == 16 &&
+              cb->size == 0x1fe0000, "compute direct V# base/stride/size decoded from live-shaped data");
+
+        csh.type = 1;
+        CHECK(build_shader_resources(csh, csgprs, 32).resources.empty(),
+              "type-1 direct resource is not guessed for unobserved non-compute stages");
+    }
+
     // --- textures: sharp[0] T#s carry their real format + byte size; BC1/2/3 are bound (decoded to RGBA8
     // on upload, #121); BC4-7 + unmapped formats are still skipped (#65) ---
     {
