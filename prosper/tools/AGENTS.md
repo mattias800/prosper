@@ -87,13 +87,23 @@ Set `PROSPER_GPU_TIMELINE_CAPTURE_PREDECESSOR=<path>.prgcap` to snapshot exact s
 time alongside selected submit `N`. Replay the pair with `gpu_replay --prepend producer consumer output`.
 This is a one-level probe; graph the producer and recurse when it also reads a temporal version.
 For bounded recursion, add `PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE=<path>.prgbundle`,
-`PROSPER_GPU_TIMELINE_CAPTURE_DEPTH=2..2048`, and optionally
+`PROSPER_GPU_TIMELINE_CAPTURE_DEPTH=2..4096`, and optionally
 `PROSPER_GPU_TIMELINE_CAPTURE_MAX_UNIQUE_MB=64..4096` (default 1024). `gpu_replay --bundle bundle output`
 executes the ordered window and classifies each temporal frontier as included, seeded, or depth-bounded.
 Bundles use content-defined chunks so shifted capture metadata does not defeat cross-submit deduplication.
 `PROSPER_GPU_TIMELINE_CAPTURE_TARGET_DIM=WxH` restricts predecessor captures to draws targeting that extent;
 it is a size diagnostic, not a dependency proof. `gpu_replay --bundle-zero-boundary` supplies transparent
 pixels to the oldest unseeded temporal leaves for an explicit A/B test and labels the synthetic seeds.
+`gpu_replay --bundle-tail N` skips older manifests without changing dictionary content; use it only when
+lifetime evidence proves the suffix contains the target's beginning, then inspect its lower-bound frontier.
+`gpu_replay --bundle-compact PATH` removes dictionary resources/chunks unreachable from retained rolling
+manifests and exits without Vulkan when no image output path is supplied.
+Set `PROSPER_GPU_TIMELINE_EXIT_AFTER_CAPTURE=1` for long unattended runs; it exits only after the selected
+capsule and requested bundle are installed, never on capture failure or budget exhaustion.
+For timing-sensitive routes, `PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM=WxH` selects the first matching
+submit at or after `CAPTURE_SUBMIT`; `PROSPER_GPU_TIMELINE_CAPTURE_MIN_DRAWS=N` can reject loading passes.
+When the endpoint moves, predecessor manifests roll forward so the final bundle retains the latest requested
+depth; dictionary bytes observed by evicted manifests still count against the unique-byte budget.
 Per-target RTT is the normal renderer path. `PROSPER_RTT_SINGLE_TARGET=1` restores the obsolete flattened
 single-framebuffer compositor only for diagnostic comparison; it cannot represent real post chains or
 offscreen target dimensions.

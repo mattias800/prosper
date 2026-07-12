@@ -26,7 +26,8 @@ bool set_environment(const std::string& name, const std::string& value) {
 void usage(const char* argv0) {
     std::fprintf(stderr, "usage: %s [--inspect|--inspect-only|--validate|--graph] "
                          "[--graph-json PATH] [--draw N[:M]] "
-                         "[--bundle capture.prgbundle] [--bundle-zero-boundary] "
+                         "[--bundle capture.prgbundle] [--bundle-tail N] [--bundle-compact PATH] "
+                         "[--bundle-zero-boundary] "
                          "[--prepend producer.prgcap] "
                          "[--dump-resource DRAW:vs|ps:BINDING PATH] [--allow-mismatch] "
                          "[--dump-shader DRAW:vs|fs PATH] "
@@ -291,18 +292,55 @@ bool ranges_overlap(uint64_t a, uint64_t as, uint64_t b, uint64_t bs) {
     return a < range_end(b, bs) && b < range_end(a, as);
 }
 
-int replay_bundle(const std::string& path, const char* output_path, bool zero_boundary) {
+int replay_bundle(const std::string& path, const char* output_path, bool zero_boundary,
+                  size_t tail_count, const std::string& compact_path) {
     prosper::gpu::GpuCaptureBundle bundle;
     std::string error;
     if (!prosper::gpu::read_gpu_capture_bundle(path, bundle, error)) {
         std::fprintf(stderr, "gpu_replay: cannot read bundle: %s\n", error.c_str()); return 2;
     }
     const uint64_t unique_bytes = prosper::gpu::gpu_capture_bundle_unique_bytes(bundle);
-    std::fprintf(stderr, "[gpureplay] bundle submits=%zu logical=%llu unique=%llu ratio=%.3f chunks=%zu\n",
+    const auto stats = prosper::gpu::gpu_capture_bundle_stats(bundle);
+    size_t first_submit_index = tail_count && tail_count < bundle.submits.size()
+        ? bundle.submits.size() - tail_count : 0;
+    std::fprintf(stderr, "[gpureplay] bundle v%u submits=%zu logical=%llu unique=%llu ratio=%.3f "
+                         "chunks=%zu resources=%zu refs=%llu exact-reuse=%llu "
+                         "resource-logical=%llu resource-unique=%llu manifest-unique=%llu\n",
+                 bundle.version,
                  bundle.submits.size(), static_cast<unsigned long long>(bundle.logical_bytes),
                  static_cast<unsigned long long>(unique_bytes),
                  bundle.logical_bytes ? static_cast<double>(unique_bytes) / bundle.logical_bytes : 0.0,
-                 bundle.chunks.size());
+                 bundle.chunks.size(), bundle.resources.size(),
+                 static_cast<unsigned long long>(stats.resource_reference_count),
+                 static_cast<unsigned long long>(stats.exact_reuse_count),
+                 static_cast<unsigned long long>(stats.resource_logical_bytes),
+                 static_cast<unsigned long long>(stats.resource_unique_bytes),
+                 static_cast<unsigned long long>(stats.manifest_unique_bytes));
+    if (first_submit_index)
+        std::fprintf(stderr, "[gpureplay] replaying tail submits=%zu range=%llu..%llu\n",
+                     bundle.submits.size() - first_submit_index,
+                     static_cast<unsigned long long>(bundle.submits[first_submit_index].submit_index),
+                     static_cast<unsigned long long>(bundle.submits.back().submit_index));
+    if (!compact_path.empty()) {
+        const uint64_t before = prosper::gpu::gpu_capture_bundle_unique_bytes(bundle);
+        if (first_submit_index) {
+            bundle.submits.erase(bundle.submits.begin(), bundle.submits.begin() + first_submit_index);
+            bundle.logical_bytes = 0;
+            for (const auto& submit : bundle.submits) bundle.logical_bytes += submit.logical_bytes;
+            first_submit_index = 0;
+        }
+        if (!prosper::gpu::compact_gpu_capture_bundle(bundle, error) ||
+            !prosper::gpu::write_gpu_capture_bundle(compact_path, bundle, error)) {
+            std::fprintf(stderr, "gpu_replay: cannot compact bundle: %s\n", error.c_str());
+            return 2;
+        }
+        const uint64_t after = prosper::gpu::gpu_capture_bundle_unique_bytes(bundle);
+        std::fprintf(stderr, "[gpureplay] compacted unique=%llu -> %llu resources=%zu chunks=%zu -> %s\n",
+                     static_cast<unsigned long long>(before),
+                     static_cast<unsigned long long>(after), bundle.resources.size(),
+                     bundle.chunks.size(), compact_path.c_str());
+        if (!output_path) return 0;
+    }
 
     prosper::gpu::GpuCaptureFile final_capture;
     if (!prosper::gpu::materialize_gpu_capture_bundle_submit(
@@ -326,7 +364,7 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
     std::vector<BundleTarget> prior_targets;
     std::vector<uint8_t> final_pixels;
     uint64_t temporal_resolved = 0, temporal_seeded = 0, temporal_bounded = 0, temporal_unresolved = 0;
-    for (size_t i = 0; i < bundle.submits.size(); ++i) {
+    for (size_t i = first_submit_index; i < bundle.submits.size(); ++i) {
         prosper::gpu::GpuCaptureFile capture;
         if (!prosper::gpu::materialize_gpu_capture_bundle_submit(bundle, i, capture, error)) {
             std::fprintf(stderr, "gpu_replay: cannot reconstruct bundle submit %zu: %s\n",
@@ -345,7 +383,7 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
             return 2;
         }
         std::vector<uint64_t> diagnostic_zero_seeds;
-        if (i == 0 && zero_boundary) {
+        if (i == first_submit_index && zero_boundary) {
             for (const auto& leaf : graph.external_leaves) {
                 if (leaf.first_future_writer == UINT32_MAX || !leaf.access.addr ||
                     !leaf.access.width || !leaf.access.height ||
@@ -384,7 +422,7 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
                 [&](const auto& target) {
                     return ranges_overlap(leaf.access.addr, leaf.access.size, target.addr, target.size);
                 });
-            const char* stop = i == 0 ? "configured-bound" : "unresolved-producer";
+            const char* stop = i == first_submit_index ? "configured-bound" : "unresolved-producer";
             uint64_t producer_submit = 0;
             if (producer != prior_targets.rend()) {
                 stop = "included-producer"; producer_submit = producer->submit; ++temporal_resolved;
@@ -394,7 +432,7 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
                     ? "diagnostic-zero-seed" : "initialized-seed";
                 ++temporal_seeded;
             } else {
-                if (i == 0) ++temporal_bounded;
+                if (i == first_submit_index) ++temporal_bounded;
                 else ++temporal_unresolved;
             }
             std::fprintf(stderr, "[gpureplay] frontier submit=%llu op=%u addr=%016llx dims=%ux%u "
@@ -450,8 +488,10 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
 int main(int argc, char** argv) {
     bool inspect = false, inspect_only = false, validate_only = false, allow_mismatch = false;
     bool graph_only = false, bundle_zero_boundary = false;
+    size_t bundle_tail = 0;
     int draw_first = -1, draw_last = -1;
-    std::string dump_spec, dump_path, shader_spec, shader_path, graph_json_path, prepend_path, bundle_path;
+    std::string dump_spec, dump_path, shader_spec, shader_path, graph_json_path, prepend_path;
+    std::string bundle_path, bundle_compact_path;
     std::vector<const char*> positional;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--inspect") inspect = true;
@@ -464,6 +504,14 @@ int main(int argc, char** argv) {
         else if (std::string(argv[i]) == "--allow-mismatch") allow_mismatch = true;
         else if (std::string(argv[i]) == "--bundle" && i + 1 < argc) bundle_path = argv[++i];
         else if (std::string(argv[i]) == "--bundle-zero-boundary") bundle_zero_boundary = true;
+        else if (std::string(argv[i]) == "--bundle-compact" && i + 1 < argc)
+            bundle_compact_path = argv[++i];
+        else if (std::string(argv[i]) == "--bundle-tail" && i + 1 < argc) {
+            char* end = nullptr;
+            const unsigned long long value = std::strtoull(argv[++i], &end, 0);
+            if (!end || *end || !value || value > SIZE_MAX) { usage(argv[0]); return 2; }
+            bundle_tail = static_cast<size_t>(value);
+        }
         else if (std::string(argv[i]) == "--prepend" && i + 1 < argc) prepend_path = argv[++i];
         else if (std::string(argv[i]) == "--draw" && i + 1 < argc) {
             std::string range = argv[++i]; size_t colon = range.find(':');
@@ -484,9 +532,11 @@ int main(int argc, char** argv) {
             usage(argv[0]); return 2;
         }
         return replay_bundle(bundle_path, positional.empty() ? nullptr : positional[0],
-                             bundle_zero_boundary);
+                             bundle_zero_boundary, bundle_tail, bundle_compact_path);
     }
-    if (bundle_zero_boundary) { usage(argv[0]); return 2; }
+    if (bundle_zero_boundary || bundle_tail || !bundle_compact_path.empty()) {
+        usage(argv[0]); return 2;
+    }
     if (positional.empty() || positional.size() > 2) { usage(argv[0]); return 2; }
     prosper::gpu::GpuCaptureFile capture; std::string error;
     if (!prosper::gpu::read_gpu_capture(positional[0], capture, error)) {

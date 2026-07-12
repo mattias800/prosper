@@ -1,0 +1,7 @@
+# Dead Cells (PPSA15552): capture-safe variant of reach-first-gameplay.pad.
+# Long synchronous GPU bundle captures begin during level loading, so keep Circle
+# held until after the capture window instead of relying on the normal 28-34s hold.
+11:cross
+14:cross
+17:cross
+28-300:circle

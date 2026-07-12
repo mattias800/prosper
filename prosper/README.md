@@ -44,12 +44,11 @@ possible without console keys. Dumps are user-supplied and gitignored.
   live/replay hash mismatch remains (#569). Dispatch thread counts and derived workgroup dimensions,
   compute program binding, direct type-1 buffers, and mixed graphics/compute PM4 order now execute correctly
   (#580/#576/#584).
-- 🚧 **Active frontiers:** retain the long history for Dead Cells' two temporal 642×362 surfaces
-  (#595/#586/#604). Timeline-v4 aggregation places their first observed graphics writers around submit 17,400,
-  roughly 1,200-1,350 writes before the selected gameplay submit. A transparent-zero lower-bound A/B produces
-  the exact unseeded replay hash, ruling out stale backing versus zero initialization in the depth-16 window.
-  Extent-filtered captures still cost about 150 MiB per submit due to repeated large static textures, so the
-  next tooling boundary is exact shared-resource reuse across a long bundle rather than brute-force capture.
+- 🚧 **Active frontiers:** bundle v2 makes long Dead Cells history practical with exact shared-resource
+  chunks, rolling semantic endpoints, final compaction, and suffix replay (#606). A fixed 1,200-submit full-state
+  run reduced 122.97 GiB logical data to 301.1 MiB. A compact exact two-submit closure resolves both temporal
+  642×362 edges without bounded leaves, but the first 80-draw semantic endpoint is the opening vignette rather
+  than playable gameplay. #608 tracks a stable playable checkpoint and the first bad world-composition draw.
   The stale exact Dead Cells
   snapshot baseline is tracked separately in #596. UE4's measured GPU boundary remains under its area issues.
 

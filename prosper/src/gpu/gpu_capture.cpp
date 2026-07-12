@@ -1,3 +1,9 @@
+#ifndef _WIN32
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#endif
+
 #include "gpu_capture.hpp"
 
 #include "bc_decode.hpp"
@@ -16,6 +22,11 @@
 #include <map>
 #include <unordered_set>
 #include <utility>
+
+#ifdef __linux__
+#include <sys/uio.h>
+#include <unistd.h>
+#endif
 
 namespace prosper::gpu {
 namespace {
@@ -36,6 +47,31 @@ constexpr uint64_t kMaxTotalRttSeedBytes = 1ull << 30;
 
 CaptureRttSeedReader g_rtt_seed_reader;
 ReplayRttSeedWriter g_rtt_seed_writer;
+
+size_t read_capture_guest_memory(uint64_t addr, uint8_t* dst, size_t bytes) {
+#ifdef __linux__
+    size_t done = 0;
+    while (done < bytes) {
+        iovec local{dst + done, bytes - done};
+        iovec remote{reinterpret_cast<void*>(static_cast<uintptr_t>(addr + done)), bytes - done};
+        const ssize_t read = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+        if (read < 0 && errno == EINTR) continue;
+        if (read <= 0) break;
+        done += static_cast<size_t>(read);
+    }
+    return done;
+#else
+    size_t done = 0;
+    constexpr size_t chunk_max = 0x10000;
+    while (done < bytes) {
+        const size_t n = std::min(bytes - done, chunk_max);
+        if (!guest_readable(addr + done, static_cast<uint32_t>(n))) break;
+        std::memcpy(dst + done, reinterpret_cast<const void*>(static_cast<uintptr_t>(addr + done)), n);
+        done += n;
+    }
+    return done;
+#endif
+}
 
 struct Writer {
     std::vector<uint8_t> data;
@@ -433,23 +469,12 @@ bool capture_gpustate_submit(const GpuState& state, uint64_t submit_no,
                              GpuCaptureFile& out, std::string& error) {
     std::vector<DrawItem> draws = realize_gpustate_draws(state);
     std::vector<ComputeItem> computes = realize_compute_dispatches(state, submit_no);
-    auto reader = [](uint64_t addr, uint8_t* dst, size_t bytes) -> size_t {
-        size_t done = 0;
-        constexpr size_t chunk_max = 0x10000;
-        while (done < bytes) {
-            const size_t n = std::min(bytes - done, chunk_max);
-            if (!guest_readable(addr + done, static_cast<uint32_t>(n))) break;
-            std::memcpy(dst + done, reinterpret_cast<const void*>(uintptr_t(addr + done)), n);
-            done += n;
-        }
-        return done;
-    };
     GpuCaptureMetadata actual = metadata;
     actual.width = width;
     actual.height = height;
     actual.submit_index = submit_no;
     return capture_submit_items(draws, computes, plan_submit_operations(state), actual,
-                                reader, out, error, g_rtt_seed_reader);
+                                read_capture_guest_memory, out, error, g_rtt_seed_reader);
 }
 
 bool capture_gpustate_target_submit(const GpuState& state, uint64_t submit_no,
@@ -466,20 +491,10 @@ bool capture_gpustate_target_submit(const GpuState& state, uint64_t submit_no,
     for (const auto& draw : draws)
         operations.push_back({SubmitOperationKind::Draw, static_cast<size_t>(draw.draw_index),
                               draw.command_order});
-    auto reader = [](uint64_t addr, uint8_t* dst, size_t bytes) -> size_t {
-        size_t done = 0;
-        constexpr size_t chunk_max = 0x10000;
-        while (done < bytes) {
-            const size_t n = std::min(bytes - done, chunk_max);
-            if (!guest_readable(addr + done, static_cast<uint32_t>(n))) break;
-            std::memcpy(dst + done, reinterpret_cast<const void*>(uintptr_t(addr + done)), n);
-            done += n;
-        }
-        return done;
-    };
     GpuCaptureMetadata actual = metadata;
     actual.width = width; actual.height = height; actual.submit_index = submit_no;
-    return capture_submit_items(draws, {}, operations, actual, reader, out, error, g_rtt_seed_reader);
+    return capture_submit_items(draws, {}, operations, actual, read_capture_guest_memory,
+                                out, error, g_rtt_seed_reader);
 }
 
 bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes, std::string& error) {
@@ -807,17 +822,9 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(const std::vector
         "PROSPER_TESTLUT", "PROSPER_TESTLUT32"
     };
     for (const char* name : render_env) if (const char* value = std::getenv(name)) m.renderer_env.emplace_back(name, value);
-    auto reader = [](uint64_t addr, uint8_t* dst, size_t bytes) -> size_t {
-        size_t done = 0; constexpr size_t chunk_max = 0x10000;
-        while (done < bytes) {
-            size_t n = std::min(bytes - done, chunk_max);
-            if (!guest_readable(addr + done, static_cast<uint32_t>(n))) break;
-            std::memcpy(dst + done, reinterpret_cast<const void*>(uintptr_t(addr + done)), n); done += n;
-        }
-        return done;
-    };
     std::string error;
-    if (!capture_draw_items(items, m, reader, pending->capture, error, g_rtt_seed_reader)) {
+    if (!capture_draw_items(items, m, read_capture_guest_memory,
+                            pending->capture, error, g_rtt_seed_reader)) {
         std::fprintf(stderr, "[gpucap] capture failed: %s\n", error.c_str()); return {};
     }
     std::fprintf(stderr, "[gpucap] captured match %llu at invocation %llu: %zu draws, %zu blobs, %zu RTT seeds -> %s\n",
