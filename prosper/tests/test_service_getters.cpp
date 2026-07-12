@@ -150,6 +150,70 @@ int main() {
         } else CHECK(false, "sceNpGetAccountIdA registered");
     }
 
+    // Dead Cells late-startup services (#552): opaque UDS objects must be non-null, and the
+    // synchronous SaveData backend must expose one completion event per unmount instead of
+    // reporting success with an untouched type-0 event.
+    {
+        auto create_event = Hle::lookup("p+GcLqwpL9M");
+        auto set_string   = Hle::lookup("MfDb+4Nln64");
+        auto post_event   = Hle::lookup("CzkKf7ahIyU");
+        auto destroy_event= Hle::lookup("wG+84pnNIuo");
+        CHECK(create_event && set_string && post_event && destroy_event,
+              "NpUniversalDataSystem event lifecycle registered");
+        if (create_event && set_string && post_event && destroy_event) {
+            uint64_t event = 0, properties = 0;
+            uint64_t r = create_event((uint64_t)(uintptr_t)"ActivityStart", 0,
+                                      (uint64_t)(uintptr_t)&event,
+                                      (uint64_t)(uintptr_t)&properties, 0, 0);
+            CHECK(r == 0, "CreateEvent succeeds for valid output pointers");
+            CHECK(event != 0 && properties != 0 && event != properties,
+                  "CreateEvent writes distinct non-null opaque objects");
+            CHECK(set_string(properties, (uint64_t)(uintptr_t)"activityId",
+                             (uint64_t)(uintptr_t)"MainQuest", 0, 0, 0) == 0,
+                  "EventPropertyObjectSetString accepts the returned object");
+            CHECK(post_event(1, 1, event, 1, 0, 0) == 0,
+                  "PostEvent accepts the returned event");
+            CHECK(destroy_event(event, 0, 0, 0, 0, 0) == 0,
+                  "DestroyEvent accepts the returned event");
+        }
+
+        auto umount = Hle::lookup("uW4vfTwMQVo");
+        auto get_event = Hle::lookup("j8xKtiFj0SY");
+        CHECK(umount && get_event, "SaveData unmount event lifecycle registered");
+        if (umount && get_event) {
+            uint8_t event[112]; memset(event, 0xAB, sizeof event);
+            CHECK(get_event(0, (uint64_t)(uintptr_t)event, 0, 0, 0, 0) == 0x809F0018ull,
+                  "GetEventResult with no completion -> NO_EVENT");
+            umount(0, 0, 0, 0, 0, 0);
+            CHECK(get_event(0, (uint64_t)(uintptr_t)event, 0, 0, 0, 0) == 0,
+                  "GetEventResult consumes the queued unmount completion");
+            CHECK(*(uint32_t*)(event + 0) == 1, "SaveData completion type -> UMOUNT_BACKUP(1)");
+            CHECK(*(int32_t*)(event + 4) == 0 && *(int32_t*)(event + 8) == 1,
+                  "SaveData completion reports success for initial user");
+            bool empty_tail = true; for (size_t i = 12; i < 104; ++i) empty_tail &= event[i] == 0;
+            CHECK(empty_tail, "GetEventResult zeroes the empty title, dir name, and reserved tail");
+            CHECK(event[104] == 0xAB && event[111] == 0xAB,
+                  "GetEventResult writes exactly the 104-byte event struct");
+            CHECK(get_event(0, (uint64_t)(uintptr_t)event, 0, 0, 0, 0) == 0x809F0018ull,
+                  "GetEventResult completion is one-shot");
+        }
+
+        if (HleFn entitlement = Hle::lookup("xddD23+8TfQ")) {
+            uint8_t info[32]; memset(info, 0xAB, sizeof info);
+            CHECK(entitlement(0, (uint64_t)(uintptr_t)"DEADCELLSBASESEED",
+                              (uint64_t)(uintptr_t)info, 0, 0, 0) != 0,
+                  "unknown addcont entitlement fails cleanly while signed out");
+            bool untouched = true; for (uint8_t b : info) untouched &= b == 0xAB;
+            CHECK(untouched, "failed entitlement query leaves output untouched");
+        } else CHECK(false, "sceNpEntitlementAccessGetAddcontEntitlementInfo registered");
+
+        if (HleFn game_intent = Hle::lookup("m87BHxt-H60")) {
+            uint64_t init[5] = {0x28, 0, 0, 0, 0};
+            CHECK(game_intent((uint64_t)(uintptr_t)init, 0, 0, 0, 0, 0) == 0,
+                  "sceNpGameIntentInitialize accepts the 0x28-byte inert init struct");
+        } else CHECK(false, "sceNpGameIntentInitialize registered");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

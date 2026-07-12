@@ -474,6 +474,8 @@ HLE(s_playgo_getlang) { if (!a1) return PLAYGO_ERR_BAD_POINTER;
 // LOW on Prepare/Commit internals (no-op success; PROSPER_SVCLOG captures their real args).
 static constexpr uint64_t SAVE_DATA_ERR_PARAMETER = 0x809F0000ull;
 static constexpr uint64_t SAVE_DATA_ERR_NOT_FOUND = 0x809F0008ull;
+static constexpr uint64_t SAVE_DATA_ERR_NO_EVENT = 0x809F0018ull;
+namespace { std::atomic<unsigned> g_savedata_umount_events{0}; }
 HLE(s_savedata_init3)   { svc_log("sceSaveDataInitialize3", a0,a1,a2,a3,a4,a5); return 0; }
 HLE(s_savedata_term)    { return 0; }
 HLE(s_savedata_txres)   { svc_log("sceSaveDataCreateTransactionResource", a0,a1,a2,a3,a4,a5); return 0; }
@@ -651,7 +653,12 @@ HLE(s_savedata_mount3)  {
     if (svclog()) fprintf(stderr, "[svc]   Mount3 dir='%s' mode=%#x -> OK (create=%d)\n", dirname, mode, (int)create);
     return 0;
 }
-HLE(s_savedata_umount2) { svc_log("sceSaveDataUmount2", a0,a1,a2,a3,a4,a5); savedata0_umount(); return 0; }
+HLE(s_savedata_umount2) {
+    svc_log("sceSaveDataUmount2", a0,a1,a2,a3,a4,a5);
+    savedata0_umount();
+    g_savedata_umount_events.fetch_add(1, std::memory_order_release);
+    return 0;
+}
 // sceSaveDataGetMountInfo(mp, OrbisSaveDataMountInfo* info = { u64 blocks; u64 freeBlocks; u8 rsv[32] }, 48
 // bytes): was MISSING -> success with garbage free-space, so a title sizing its save against freeBlocks
 // could abort ("disk full") or corrupt its math. Report a generous, consistent size (256K blocks free).
@@ -664,6 +671,29 @@ HLE(s_savedata_mountinfo) {
 }
 HLE(s_savedata_prepare) { svc_log("sceSaveDataPrepare", a0,a1,a2,a3,a4,a5); return 0; }
 HLE(s_savedata_commit)  { svc_log("sceSaveDataCommit", a0,a1,a2,a3,a4,a5); return 0; }
+// sceSaveDataGetEventResult(eventParam, event): PS4 and PS5 share this NID and two-argument shape.
+// Our file operations complete synchronously, but Umount2 still queues the completion event a title
+// uses to finish its save job. Return one UMOUNT_BACKUP event per unmount, then NO_EVENT. Returning
+// generic success with an untouched event made Dead Cells consume a fabricated type-0 completion.
+// Event: { u32 type; s32 errorCode; s32 userId; u32 pad; titleId[16]; dirName[32]; reserved[40] },
+// 104 bytes. CONFIDENCE: HIGH on signature/error/type/size (Dead Cells zeroes exactly 104 bytes and
+// the identical PS4 NID/API defines that layout), MED on the PS5 tail field names.
+HLE(s_savedata_get_event) {
+    svc_log("sceSaveDataGetEventResult", a0,a1,a2,a3,a4,a5);
+    if (!a1) return SAVE_DATA_ERR_PARAMETER;
+    unsigned pending = g_savedata_umount_events.load(std::memory_order_acquire);
+    while (pending) {
+        if (g_savedata_umount_events.compare_exchange_weak(
+                pending, pending - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            uint8_t* event = (uint8_t*)PW(a1);
+            memset(event, 0, 104);
+            *(uint32_t*)(event + 0) = 1;  // SCE_SAVE_DATA_EVENT_TYPE_UMOUNT_BACKUP
+            *(int32_t*)(event + 8) = 1;  // initial user
+            return 0;
+        }
+    }
+    return SAVE_DATA_ERR_NO_EVENT;
+}
 // sceSaveDataDirNameSearch(const SearchCond* cond, SearchResult* result) — PS4-inherited contract,
 // pinned by DOLL's own callsite (eboot+0x224e920): cond {u32 userId@0; titleId*@8=0; dirName*@0x10=0;
 // key/order@0x18=0}, result {u32 hitNum@0; DirName* dirNames@8 (caller buffer, this+0x40);
@@ -723,6 +753,36 @@ HLE(s_share_ok) { return 0; }
 HLE(s_npuds_create) { svc_log("sceNpUniversalDataSystemCreate*", a0,a1,a2,a3,a4,a5);
                       if (svc_ptrish(a0)) *(int32_t*)PW(a0) = 1; return 0; }
 HLE(s_npuds_ok)     { return 0; }
+// Dead Cells' wrappers pin CreateEvent(name, reserved, Event**, PropertyObject**) and pass both
+// returned opaque objects to the setter/post/destroy family. They are never dereferenced by the
+// guest. Allocate stable non-null ids and keep the offline telemetry sink inert.
+HLE(s_npuds_create_event) {
+    svc_log("sceNpUniversalDataSystemCreateEvent", a0,a1,a2,a3,a4,a5);
+    if (!svc_ptrish(a2) || !svc_ptrish(a3)) return 0x80550003ull; // NP invalid argument
+    *(uint64_t*)PW(a2) = g_handle.fetch_add(1);
+    *(uint64_t*)PW(a3) = g_handle.fetch_add(1);
+    return 0;
+}
+HLE(s_npuds_post_event) {
+    svc_log("sceNpUniversalDataSystemPostEvent", a0,a1,a2,a3,a4,a5);
+    return 0;
+}
+HLE(s_npuds_destroy_event) {
+    svc_log("sceNpUniversalDataSystemDestroyEvent", a0,a1,a2,a3,a4,a5);
+    return 0;
+}
+HLE(s_npuds_object_set_string) {
+    svc_log("sceNpUniversalDataSystemEventPropertyObjectSetString", a0,a1,a2,a3,a4,a5);
+    return 0;
+}
+HLE(s_gameintent_init) {
+    svc_log("sceNpGameIntentInitialize", a0,a1,a2,a3,a4,a5);
+    return 0;
+}
+HLE(s_npent_addcont_info) {
+    svc_log("sceNpEntitlementAccessGetAddcontEntitlementInfo", a0,a1,a2,a3,a4,a5);
+    return NP_ERR_SIGNED_OUT;
+}
 
 // ===== Issue #306: honest OFFLINE console for the online/update/entitlement boot chain. =========
 // DOLL's UE4 front-end runs a patch/entitlement check before the title screen; every subsystem in
@@ -1138,6 +1198,7 @@ void register_service_hle() {
     Hle::register_fn("ie7qhZ4X0Cc", (HleFn)s_savedata_commit,    "sceSaveDataCommit");
     Hle::register_fn("dyIhnXq-0SM", (HleFn)s_savedata_dirsearch, "sceSaveDataDirNameSearch");
     Hle::register_fn("65VH0Qaaz6s", (HleFn)s_savedata_mountinfo, "sceSaveDataGetMountInfo");  // was MISSING -> garbage free-space
+    Hle::register_fn("j8xKtiFj0SY", (HleFn)s_savedata_get_event, "sceSaveDataGetEventResult");
     // libSceNpTrophy2 lifecycle — valid ids; content queries stay "unavailable" (above).
     Hle::register_fn("Bagshr7OQ6Q", (HleFn)s_nptrophy2_createctx,    "sceNpTrophy2CreateContext");
     Hle::register_fn("Gz1rmUZpROM", (HleFn)s_nptrophy2_createhandle, "sceNpTrophy2CreateHandle");
@@ -1177,6 +1238,18 @@ void register_service_hle() {
     Hle::register_fn("5zBnau1uIEo", (HleFn)s_npuds_create, "sceNpUniversalDataSystemCreateContext");
     Hle::register_fn("hT0IAEvN+M0", (HleFn)s_npuds_create, "sceNpUniversalDataSystemCreateHandle");
     Hle::register_fn("tpFJ8LIKvPw", (HleFn)s_npuds_ok,     "sceNpUniversalDataSystemRegisterContext");
+    Hle::register_fn("p+GcLqwpL9M", (HleFn)s_npuds_create_event,
+                     "sceNpUniversalDataSystemCreateEvent");
+    Hle::register_fn("CzkKf7ahIyU", (HleFn)s_npuds_post_event,
+                     "sceNpUniversalDataSystemPostEvent");
+    Hle::register_fn("wG+84pnNIuo", (HleFn)s_npuds_destroy_event,
+                     "sceNpUniversalDataSystemDestroyEvent");
+    Hle::register_fn("MfDb+4Nln64", (HleFn)s_npuds_object_set_string,
+                     "sceNpUniversalDataSystemEventPropertyObjectSetString");
+    Hle::register_fn("m87BHxt-H60", (HleFn)s_gameintent_init,
+                     "sceNpGameIntentInitialize");
+    Hle::register_fn("xddD23+8TfQ", (HleFn)s_npent_addcont_info,
+                     "sceNpEntitlementAccessGetAddcontEntitlementInfo");
     #undef R
 }
 
