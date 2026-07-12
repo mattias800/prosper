@@ -1,0 +1,7 @@
+# Dead Cells (PPSA15552): start slot 1 and skip the Prisoners' Quarters opening.
+# Seconds are measured from the first pad poll. Repeated Cross presses tolerate
+# first-boot/save-load timing; holding Circle skips the opening once it appears.
+11:cross
+14:cross
+17:cross
+28-34:circle
