@@ -67,6 +67,11 @@ int main() {
     flip(0x1001, 2, 0, 0, 0, 0);
     gpu::present_readback(out.data(), out.size());
     CHECK(out[0] == 0x44 && out[100] == 0x44, "readback reflects updated framebuffer memory");
+    gpu::PresentSnapshot raw_snap;
+    CHECK(gpu::present_snapshot(raw_snap), "raw present snapshot is available before rendering");
+    CHECK(raw_snap.source == gpu::PresentSource::RawScanout && raw_snap.front_index == 2 &&
+          raw_snap.width == W && raw_snap.height == H && raw_snap.rgba[0] == 0x44,
+          "raw snapshot identifies and copies the selected guest scanout");
 
     // Out-of-range flip index leaves the front buffer unchanged (but still counts as a flip).
     flip(0x1001, 99, 0, 0, 0, 0);
@@ -83,6 +88,12 @@ int main() {
     size_t rb = gpu::present_readback(out.data(), out.size());
     CHECK(rb == FB_BYTES, "readback returns the rendered frame size");
     CHECK(memcmp(out.data(), rendered.data(), FB_BYTES) == 0, "readback returns the exact rendered pixels");
+    gpu::PresentSnapshot snap;
+    CHECK(gpu::present_snapshot(snap), "atomic present snapshot is available");
+    CHECK(snap.source == gpu::PresentSource::Rendered && snap.source_seq == gpu::present_frame_seq(),
+          "snapshot identifies the rendered publication");
+    CHECK(snap.width == W && snap.height == H && snap.rgba == rendered,
+          "snapshot metadata and pixels describe the same frame");
     // The rendered frame wins over the raw guest buffer even across flips.
     flip(0x1001, 0, 0, 0, 0, 0);
     gpu::present_readback(out.data(), out.size());

@@ -78,6 +78,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_lifecycle PRIVATE prosper_core)
   add_test(NAME lifecycle_stop_signal COMMAND test_lifecycle)
 
+  # Screenshot evidence classification/JSON is pure and must remain testable without Vulkan or a dump.
+  add_executable(test_capture_manifest tests/test_capture_manifest.cpp
+                                       tools/screenshot/capture_manifest.cpp)
+  target_include_directories(test_capture_manifest PRIVATE tools/screenshot)
+  add_test(NAME capture_manifest COMMAND test_capture_manifest)
+
   # va2foff resolution order (issue #113): DYNAMIC/PROCPARAM/TLS must never shadow
   # the PT_LOAD that truly maps a VA. Pure unit test — no game dump required.
   add_executable(test_va2foff tests/test_va2foff.cpp)
@@ -482,8 +488,9 @@ if(TARGET prosper_core)
       # 30). Reuses boot_program + the shared live renderer; writes zlib-compressed PNGs (needs zlib).
       find_package(ZLIB QUIET)
       if(ZLIB_FOUND)
-        add_executable(screenshot tools/screenshot/screenshot.cpp)
-        target_include_directories(screenshot PRIVATE src)
+        add_executable(screenshot tools/screenshot/screenshot.cpp
+                                  tools/screenshot/capture_manifest.cpp)
+        target_include_directories(screenshot PRIVATE src tools/screenshot)
         target_link_libraries(screenshot PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan ZLIB::ZLIB)
       else()
         message(STATUS "zlib not found — skipping the screenshot tool")
