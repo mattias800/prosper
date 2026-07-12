@@ -81,6 +81,11 @@ offscreen target dimensions.
 
 Use `gpu_replay --inspect-only` to print fixed-function state, native color-target dimensions, resource
 hashes, explicit clear intent, guest depth/stencil surface identities, and raw stencil-op provenance.
+Use `gpu_replay --graph <capture.prgcap>` to resolve captured resource reads to the latest overlapping
+earlier draw/dispatch writer in mixed PM4 order. External versions are deduplicated by logical range and
+list every consumer; `future-writer=N` identifies a temporal read-before-write whose prior-submit version
+is required. `--graph-json <path> <capture.prgcap>` emits the same closure frontier as structured JSON.
+The graph is selected-submit scope: external leaves still require cross-submit producer capture (#595).
 Version-4+ capsules also print and restore temporal RTT seeds: exact host-rendered surfaces sampled by the
 captured submit whose producer ran in an earlier submit. This keeps replay from silently substituting stale
 guest-memory bytes for renderer-owned history; older capsules remain readable and report zero seeds.

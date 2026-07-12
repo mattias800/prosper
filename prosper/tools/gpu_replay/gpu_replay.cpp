@@ -1,4 +1,5 @@
 #include "gpu/gpu_capture.hpp"
+#include "gpu/gpu_dependency_graph.hpp"
 #include "gpu/gpu_execute.hpp"
 #include "live_renderer.hpp"
 #include "render_runner.h"
@@ -21,10 +22,84 @@ bool set_environment(const std::string& name, const std::string& value) {
 }
 
 void usage(const char* argv0) {
-    std::fprintf(stderr, "usage: %s [--inspect|--inspect-only|--validate] [--draw N[:M]] "
+    std::fprintf(stderr, "usage: %s [--inspect|--inspect-only|--validate|--graph] "
+                         "[--graph-json PATH] [--draw N[:M]] "
                          "[--dump-resource DRAW:vs|ps:BINDING PATH] [--allow-mismatch] "
                          "[--dump-shader DRAW:vs|fs PATH] "
                          "<capture.prgcap> [output.bmp]\n", argv0);
+}
+
+const char* class_name(prosper::gpu::ResourceClass c);
+
+void print_graph(const prosper::gpu::GpuDependencyGraph& graph) {
+    std::printf("dependency-graph operations=%zu edges=%zu external-leaves=%zu\n",
+                graph.nodes.size(), graph.edges.size(), graph.external_leaves.size());
+    for (const auto& node : graph.nodes)
+        if (!node.realized)
+            std::printf("missing operation=%u kind=%s source=%llu order=%llu\n",
+                        node.operation_index,
+                        node.kind == prosper::gpu::SubmitOperationKind::Draw ? "draw" : "dispatch",
+                        static_cast<unsigned long long>(node.source_index),
+                        static_cast<unsigned long long>(node.command_order));
+    for (const auto& edge : graph.edges)
+        std::printf("edge producer=%u consumer=%u stage=%s binding=%u addr=%016llx bytes=%llu dims=%ux%u\n",
+                    edge.producer_operation, edge.consumer_operation, edge.access.stage.c_str(),
+                    edge.access.binding, static_cast<unsigned long long>(edge.access.addr),
+                    static_cast<unsigned long long>(edge.access.size), edge.access.width, edge.access.height);
+    for (const auto& leaf : graph.external_leaves)
+        std::printf("external consumers=%zu first=%u future-writer=%lld stage=%s binding=%u class=%s "
+                    "addr=%016llx bytes=%llu dims=%ux%u\n",
+                    leaf.consumer_operations.size(), leaf.consumer_operations.front(),
+                    leaf.first_future_writer == UINT32_MAX ? -1ll : static_cast<long long>(leaf.first_future_writer),
+                    leaf.access.stage.c_str(), leaf.access.binding,
+                    class_name(leaf.access.resource_class),
+                    static_cast<unsigned long long>(leaf.access.addr),
+                    static_cast<unsigned long long>(leaf.access.size), leaf.access.width, leaf.access.height);
+}
+
+bool write_graph_json(const std::string& path, const prosper::gpu::GpuDependencyGraph& graph) {
+    FILE* file = std::fopen(path.c_str(), "wb");
+    if (!file) return false;
+    std::fprintf(file, "{\n  \"operation_count\": %zu,\n  \"nodes\": [\n", graph.nodes.size());
+    for (size_t i = 0; i < graph.nodes.size(); ++i) {
+        const auto& node = graph.nodes[i];
+        std::fprintf(file, "    {\"operation\":%u,\"kind\":\"%s\",\"source\":%llu,"
+                           "\"order\":%llu,\"realized\":%s}%s\n",
+                     node.operation_index,
+                     node.kind == prosper::gpu::SubmitOperationKind::Draw ? "draw" : "dispatch",
+                     static_cast<unsigned long long>(node.source_index),
+                     static_cast<unsigned long long>(node.command_order),
+                     node.realized ? "true" : "false", i + 1 == graph.nodes.size() ? "" : ",");
+    }
+    std::fprintf(file, "  ],\n  \"edges\": [\n");
+    for (size_t i = 0; i < graph.edges.size(); ++i) {
+        const auto& edge = graph.edges[i];
+        std::fprintf(file, "    {\"producer\":%u,\"consumer\":%u,\"stage\":\"%s\","
+                           "\"binding\":%u,\"addr\":%llu,\"bytes\":%llu,\"width\":%u,\"height\":%u}%s\n",
+                     edge.producer_operation, edge.consumer_operation, edge.access.stage.c_str(),
+                     edge.access.binding, static_cast<unsigned long long>(edge.access.addr),
+                     static_cast<unsigned long long>(edge.access.size), edge.access.width,
+                     edge.access.height, i + 1 == graph.edges.size() ? "" : ",");
+    }
+    std::fprintf(file, "  ],\n  \"external_leaves\": [\n");
+    for (size_t i = 0; i < graph.external_leaves.size(); ++i) {
+        const auto& leaf = graph.external_leaves[i];
+        std::fprintf(file, "    {\"consumers\":[");
+        for (size_t c = 0; c < leaf.consumer_operations.size(); ++c)
+            std::fprintf(file, "%s%u", c ? "," : "", leaf.consumer_operations[c]);
+        if (leaf.first_future_writer == UINT32_MAX) std::fprintf(file, "],\"future_writer\":null");
+        else std::fprintf(file, "],\"future_writer\":%u", leaf.first_future_writer);
+        std::fprintf(file, ",\"stage\":\"%s\",\"binding\":%u,"
+                           "\"class\":\"%s\",\"addr\":%llu,\"bytes\":%llu,"
+                           "\"width\":%u,\"height\":%u}%s\n",
+                     leaf.access.stage.c_str(), leaf.access.binding,
+                     class_name(leaf.access.resource_class),
+                     static_cast<unsigned long long>(leaf.access.addr),
+                     static_cast<unsigned long long>(leaf.access.size), leaf.access.width,
+                     leaf.access.height, i + 1 == graph.external_leaves.size() ? "" : ",");
+    }
+    std::fprintf(file, "  ]\n}\n");
+    return std::fclose(file) == 0;
 }
 
 const char* class_name(prosper::gpu::ResourceClass c) {
@@ -182,13 +257,18 @@ bool validate_frame(const prosper::gpu::GpuReplayFrame& replay) {
 
 int main(int argc, char** argv) {
     bool inspect = false, inspect_only = false, validate_only = false, allow_mismatch = false;
+    bool graph_only = false;
     int draw_first = -1, draw_last = -1;
-    std::string dump_spec, dump_path, shader_spec, shader_path;
+    std::string dump_spec, dump_path, shader_spec, shader_path, graph_json_path;
     std::vector<const char*> positional;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--inspect") inspect = true;
         else if (std::string(argv[i]) == "--inspect-only") inspect = inspect_only = true;
         else if (std::string(argv[i]) == "--validate") validate_only = true;
+        else if (std::string(argv[i]) == "--graph") graph_only = true;
+        else if (std::string(argv[i]) == "--graph-json" && i + 1 < argc) {
+            graph_only = true; graph_json_path = argv[++i];
+        }
         else if (std::string(argv[i]) == "--allow-mismatch") allow_mismatch = true;
         else if (std::string(argv[i]) == "--draw" && i + 1 < argc) {
             std::string range = argv[++i]; size_t colon = range.find(':');
@@ -218,6 +298,17 @@ int main(int argc, char** argv) {
     prosper::gpu::GpuReplayFrame replay;
     if (!prosper::gpu::materialize_gpu_replay(capture, replay, error)) {
         std::fprintf(stderr, "gpu_replay: cannot materialize: %s\n", error.c_str()); return 2;
+    }
+    if (graph_only) {
+        prosper::gpu::GpuDependencyGraph graph;
+        if (!prosper::gpu::build_gpu_dependency_graph(replay, graph, error)) {
+            std::fprintf(stderr, "gpu_replay: cannot build dependency graph: %s\n", error.c_str()); return 2;
+        }
+        if (graph_json_path.empty()) print_graph(graph);
+        else if (!write_graph_json(graph_json_path, graph)) {
+            std::fprintf(stderr, "gpu_replay: cannot write graph JSON %s\n", graph_json_path.c_str()); return 2;
+        }
+        return 0;
     }
     if (!dump_spec.empty()) {
         size_t c1 = dump_spec.find(':'), c2 = c1 == std::string::npos ? c1 : dump_spec.find(':', c1 + 1);
