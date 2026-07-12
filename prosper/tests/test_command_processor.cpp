@@ -196,9 +196,9 @@ int main() {
         ShaderReg cregs1[1] = {{P::COMPUTE_USER_DATA_0 + 3, 0xBBBB2222u}};
         reset(CD, 0x3ff, 0, 0, 0, 0);
         setsh(CD, (uint64_t)(uintptr_t)cregs0, 2, 0, 0, 0);
-        dispatch(CD, 32, 4, 1, 0x1122334455667788ull, 0);
+        dispatch(CD, 0x1122334455667788ull, 32, 4, 1, 0);
         setsh(CD, (uint64_t)(uintptr_t)cregs1, 1, 0, 0, 0);
-        dispatch(CD, 8, 2, 3, 0x8877665544332211ull, 0);
+        dispatch(CD, 0x8877665544332211ull, 8, 2, 3, 0);
         GpuState cs;
         run_cb(cbuf, 128, cs);
         CHECK(cs.dispatch_count == 2 && cs.dispatches.size() == 2,

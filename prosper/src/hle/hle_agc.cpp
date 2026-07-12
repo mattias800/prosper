@@ -1265,19 +1265,21 @@ HLE(agc_driver_get_resource_registration_max_name_length) {
     return 0;
 }
 
-// sceAgcDcbDispatchDirect (NID k3GhuSNmBLU) — compute dispatch. RE'd from the guest wrapper
-// eboot+0x220ede0: it reserves Dcb space from the bound CS shader's scratch needs, reads the
-// shader's specials->dispatch_modifier (eboot+0x5999750 = [[sub0.shader]+0x28]+0x10) and calls
-// this import as (dcb, tg_x, tg_y, tg_z, modifier). Kyty's Gen4 GraphicsDispatchDirect carries the
-// same (x, y, z, mode) operand set. DOLL's first real frame issues ~535 of these (UE4's compute
+// sceAgcCbDispatch (NID k3GhuSNmBLU) — compute dispatch.
+// The authoritative PS5 3.20 export name is sceAgcCbDispatch, and its ABI is
+// (dcb, dispatch_modifier, tg_x, tg_y, tg_z). Dead Cells provides decisive asymmetric evidence:
+// calls (2088960,1,1,33) and (7168,1,1,1) become plausible 1x1x33 / 1x1x1 dispatches only with
+// a1 as the modifier; the old interpretation produced impossible multi-million-workgroup X
+// dimensions (#571). Kyty's Gen4 GraphicsDispatchDirect is a differently named API and is not an
+// oracle for this Gen5 builder. DOLL's first real frame issues ~535 of these (UE4's compute
 // prologue: GPUScene build, clears, culling) before any graphics draw. Appending the packet keeps
 // the stream faithful; the CommandProcessor records it (no compute execution yet — that is a later
 // milestone; the fence cluster around each dispatch completes at fold time regardless).
-// CONFIDENCE: HIGH on (dcb,x,y,z) (disassembly), MED on a4=modifier (from specials, unexecuted).
-HLE(agc_dcb_dispatch_direct) {  // (buf, tg_x, tg_y, tg_z, modifier)
+// CONFIDENCE: HIGH (PS5 symbol table + exercised Dead Cells argument constraints).
+HLE(agc_cb_dispatch) {  // (buf, dispatch_modifier, tg_x, tg_y, tg_z)
     uint32_t* cmd; if (!begin_packet(a0, 6, IT_NOP, R_DISPATCH_DIRECT, &cmd)) return 0;
-    cmd[1] = (uint32_t)a1; cmd[2] = (uint32_t)a2; cmd[3] = (uint32_t)a3;
-    cmd[4] = (uint32_t)(a4 & 0xffffffffu); cmd[5] = (uint32_t)(a4 >> 32u);
+    cmd[1] = (uint32_t)a2; cmd[2] = (uint32_t)a3; cmd[3] = (uint32_t)a4;
+    cmd[4] = (uint32_t)(a1 & 0xffffffffu); cmd[5] = (uint32_t)(a1 >> 32u);
     return (uint64_t)(uintptr_t)cmd;
 }
 
@@ -1322,7 +1324,7 @@ void register_agc_hle() {
     RN("fPSCdQxgpSw", agc_patch_write_data_addr);    // WriteData packet: set destination address
     RN("3KDcnM3lrcU", agc_patch_wait_reg_mem_addr);  // WaitRegMem packet: set label address
     RN("0fWWK5uG9rQ", agc_patch_release_mem_addr);   // ReleaseMem packet: set label address
-    RN("k3GhuSNmBLU", agc_dcb_dispatch_direct);      // sceAgcDcbDispatchDirect (tg_x, tg_y, tg_z, mod)
+    RN("k3GhuSNmBLU", agc_cb_dispatch);              // sceAgcCbDispatch (modifier, tg_x, tg_y, tg_z)
     RN("WmAc2MEj6Io", agc_dcb_dma_data);        // sceAgcDcbDmaData — append DMA_DATA packet (#117/#312)
     RN("-RnpfpxIhec", agc_acb_dma_data);        // sceAgcAcbDmaData — async-compute sibling (#312)
     RN("IxYiarKlXxM", agc_patch_dma_data_dst);  // sceAgcDmaDataPatchSetDstAddressOrOffset
