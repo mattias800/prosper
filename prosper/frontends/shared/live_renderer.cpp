@@ -4,6 +4,7 @@
 #include "live_compute.hpp"
 
 #include "gpu/gpu_execute.hpp"          // DrawItem, set_submit_renderer
+#include "gpu/writer_provenance.hpp"
 #include "gpu/gpu_capture.hpp"          // temporal RTT capture/replay seeds
 #include "gpu/tile.hpp"                 // detile_surface / tiled_surface_bytes / detile_elements
 #include "gpu/bc_decode.hpp"            // BC1/2/3 block decompression -> RGBA8 (#121)
@@ -174,10 +175,22 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             };
             static std::vector<std::vector<uint8_t>> texstore;  // keep every item's texture bytes alive
             texstore.clear();
+            uint32_t resource_hash_w = 0, resource_hash_h = 0;
+            if (const char* dim = getenv("PROSPER_RESOURCE_HASH_DIM"))
+                if (sscanf(dim, "%ux%u", &resource_hash_w, &resource_hash_h) != 2)
+                    resource_hash_w = resource_hash_h = 0;
+            uint32_t target_step_w = 0, target_step_h = 0;
+            if (const char* dim = getenv("PROSPER_TARGET_STEP_HASH_DIM"))
+                if (sscanf(dim, "%ux%u", &target_step_w, &target_step_h) != 2)
+                    target_step_w = target_step_h = 0;
+            const size_t target_step_min_draws = getenv("PROSPER_TARGET_STEP_HASH_MIN_DRAWS")
+                ? std::max<long>(2, atol(getenv("PROSPER_TARGET_STEP_HASH_MIN_DRAWS"))) : 2;
             // Build one draw's set-tagged resources from its VS (set 0) + PS (set 1) tables — read the
             // bytes from 1:1-mapped guest memory, detile textures. (Each constant/vertex buffer + texture
             // gets its own binding; the recompiler declared a storage buffer / image sampler at each.)
-            auto build_R = [&](const prosper::gpu::ShaderResourceTable* vrt, const prosper::gpu::ShaderResourceTable* prt) {
+            auto build_R = [&](const prosper::gpu::DrawItem& draw,
+                               const prosper::gpu::ShaderResourceTable* vrt,
+                               const prosper::gpu::ShaderResourceTable* prt) {
               std::vector<prosper::test::FrameResource> R;
               auto add = [&](const prosper::gpu::ShaderResourceTable* t, uint32_t set){
                 if (!t) return;
@@ -452,6 +465,44 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 tp[t * 4 + 3] = 255;
                             }
                         }
+                        // Focused per-consumer version probe (#586). Hash both the raw guest backing
+                        // and the final decoded/RTT-injected pixels so a live draw identifies whether
+                        // divergence precedes format conversion or enters through renderer-owned state.
+                        if (resource_hash_w == tw && resource_hash_h == th) {
+                            const size_t raw_size = std::min<size_t>(
+                                r.size ? r.size : (size_t)tw * th * 4, 64u << 20);
+                            std::vector<uint8_t> raw(raw_size, 0);
+                            const size_t raw_got = copy_resource(raw.data(), r.gpu_addr, raw.size());
+                            auto fnv = [](const uint8_t* data, size_t size) {
+                                uint64_t hash = 1469598103934665603ull;
+                                for (size_t i = 0; i < size; ++i) {
+                                    hash ^= data[i];
+                                    hash *= 1099511628211ull;
+                                }
+                                return hash;
+                            };
+                            const uint64_t raw_hash = fnv(raw.data(), raw_got);
+                            const uint64_t sample_hash = fnv(texstore.back().data(), texstore.back().size());
+                            const auto writer = prosper::gpu::last_guest_write_overlap(
+                                r.gpu_addr, raw_size);
+                            fprintf(stderr,
+                                    "[resource-version] render-submit=%llu draw=%llu order=%llu set=%u bind=%u "
+                                    "addr=0x%llx dims=%ux%u class=%u fmt=%u tile=%u rtt=%d "
+                                    "raw=%zu/%zu:%016llx sample=%zu:%016llx "
+                                    "writer=%s/%llu/%llu/%llu/0x%llx\n",
+                                    (unsigned long long)g_this_submit,
+                                    (unsigned long long)draw.draw_index,
+                                    (unsigned long long)draw.command_order,
+                                    set, r.binding, (unsigned long long)r.gpu_addr, tw, th,
+                                    (unsigned)r.cls, (unsigned)r.format, r.tile_mode, (int)rtt_hit,
+                                    raw_got, raw_size, (unsigned long long)raw_hash,
+                                    texstore.back().size(), (unsigned long long)sample_hash,
+                                    writer ? prosper::gpu::guest_writer_kind_name(writer->kind) : "none",
+                                    (unsigned long long)(writer ? writer->submit : 0),
+                                    (unsigned long long)(writer ? writer->item : 0),
+                                    (unsigned long long)(writer ? writer->order : 0),
+                                    (unsigned long long)(writer ? writer->identity : 0));
+                        }
                         // PROSPER_PALETTELOG: compact identity/provenance trace for Unity's 256x16
                         // palette textures. Unlike GFXLOG this is cheap enough for a focused render
                         // window and reveals both descriptor-address and decoded-content changes.
@@ -663,7 +714,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     bd.fs     = ps_override.empty() ? it.fs : ps_override;
                     bd.vcount = refvs ? 3u : it.vertex_count;
                     bd.ps     = nops ? nullptr : &it.ps;
-                    bd.R      = build_R(it.vrt.get(), it.prt.get());
+                    bd.R      = build_R(it, it.vrt.get(), it.prt.get());
                     if (!prosper::gpu::validate_runtime_descriptor_contract(
                             "VS/backend", bd.vs, it.vrt.get(), 0, prosper::gpu::SpirvShaderStage::Vertex) ||
                         !prosper::gpu::validate_runtime_descriptor_contract(
@@ -798,6 +849,80 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     std::vector<uint8_t> gpx = prosper::test::render_draws_rgba(
                         build_bds(render_pass), gw, gh, seed, clear_for(render_pass), true);
                     if (base && !gpx.empty()) { RttSurf& s = g_rtt[base]; s.rgba = gpx; s.w = gw; s.h = gh; }
+                    if (native_w == resource_hash_w && native_h == resource_hash_h && !gpx.empty()) {
+                        uint64_t hash = 1469598103934665603ull;
+                        for (uint8_t byte : gpx) {
+                            hash ^= byte;
+                            hash *= 1099511628211ull;
+                        }
+                        const auto* first = render_pass.empty() ? nullptr : render_pass.front();
+                        const auto* last = render_pass.empty() ? nullptr : render_pass.back();
+                        fprintf(stderr,
+                                "[target-version] render-submit=%llu target=0x%llx dims=%ux%u "
+                                "draws=%llu-%llu orders=%llu-%llu seed=%d clear=%d "
+                                "rgba=%.3f,%.3f,%.3f,%.3f hash=%016llx\n",
+                                (unsigned long long)g_this_submit,
+                                (unsigned long long)base, native_w, native_h,
+                                (unsigned long long)(first ? first->draw_index : 0),
+                                (unsigned long long)(last ? last->draw_index : 0),
+                                (unsigned long long)(first ? first->command_order : 0),
+                                (unsigned long long)(last ? last->command_order : 0),
+                                seed != nullptr, first ? (int)first->ps.has_clear_color : 0,
+                                first ? first->ps.clear_color[0] : 0.0f,
+                                first ? first->ps.clear_color[1] : 0.0f,
+                                first ? first->ps.clear_color[2] : 0.0f,
+                                first ? first->ps.clear_color[3] : 0.0f,
+                                (unsigned long long)hash);
+                    }
+                    if (native_w == target_step_w && native_h == target_step_h &&
+                        render_pass.size() >= target_step_min_draws) {
+                        for (size_t k = 1; k <= render_pass.size(); ++k) {
+                            std::vector<const prosper::gpu::DrawItem*> prefix(
+                                render_pass.begin(), render_pass.begin() + k);
+                            texstore.clear();
+                            std::vector<uint8_t> step = prosper::test::render_draws_rgba(
+                                build_bds(prefix), gw, gh, seed, clear_for(prefix), true);
+                            uint64_t hash = 1469598103934665603ull;
+                            for (uint8_t byte : step) {
+                                hash ^= byte;
+                                hash *= 1099511628211ull;
+                            }
+                            size_t dark = 0, near_white = 0;
+                            uint64_t rgb_sum = 0;
+                            for (size_t p = 0; p + 3 < step.size(); p += 4) {
+                                const uint8_t r = step[p], g = step[p + 1], b = step[p + 2];
+                                dark += std::max({r, g, b}) < 64;
+                                near_white += std::min({r, g, b}) > 240;
+                                rgb_sum += r + g + b;
+                            }
+                            const double mean_rgb = step.empty() ? 0.0 :
+                                (double)rgb_sum / ((step.size() / 4) * 3);
+                            const auto* draw = prefix.back();
+                            auto spirv_hash = [](const std::vector<uint32_t>& words) {
+                                uint64_t hash = 1469598103934665603ull;
+                                const uint8_t* bytes = reinterpret_cast<const uint8_t*>(words.data());
+                                for (size_t i = 0; i < words.size() * sizeof(uint32_t); ++i) {
+                                    hash ^= bytes[i];
+                                    hash *= 1099511628211ull;
+                                }
+                                return hash;
+                            };
+                            fprintf(stderr,
+                                    "[target-step] render-submit=%llu target=0x%llx step=%zu/%zu "
+                                    "draw=%llu order=%llu vs=%016llx ps=%016llx mask=0x%x "
+                                    "blend=%d/%u/%u hash=%016llx dark=%zu white=%zu mean=%.2f\n",
+                                    (unsigned long long)g_this_submit,
+                                    (unsigned long long)base, k, render_pass.size(),
+                                    (unsigned long long)draw->draw_index,
+                                    (unsigned long long)draw->command_order,
+                                    (unsigned long long)spirv_hash(draw->vs),
+                                    (unsigned long long)spirv_hash(draw->fs),
+                                    draw->ps.color_write_mask, (int)draw->ps.blend_enable,
+                                    draw->ps.src_color_blend_factor,
+                                    draw->ps.dst_color_blend_factor,
+                                    (unsigned long long)hash, dark, near_white, mean_rgb);
+                        }
+                    }
                     bool is_vo = false;
                     for (int i = 0; i < vo_n && !is_vo; i++) is_vo = base && base == prosper_vo_buffer_addr(i);
                     if (getenv("PROSPER_RTTLOG")) {

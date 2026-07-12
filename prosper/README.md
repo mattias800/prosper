@@ -39,7 +39,7 @@ possible without console keys. Dumps are user-supplied and gitignored.
   live/replay hash mismatch remains (#569). Dispatch thread counts and derived workgroup dimensions,
   compute program binding, direct type-1 buffers, and mixed graphics/compute PM4 order now execute correctly
   (#580/#576/#584).
-- 🚧 **Active frontiers:** diagnose Dead Cells' settled overbright composition after the ordering fix (#586),
+- 🚧 **Active frontiers:** build a practical producer-preserving Dead Cells gameplay checkpoint (#586),
   stabilize the animation-sensitive exact splash guard (#573), and continue cross-title capture/replay and
   descriptor-validation work. UE4's measured GPU boundary remains tracked separately under its area issues.
 

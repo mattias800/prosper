@@ -42,9 +42,10 @@ Only the game is required; everything else has a sane default.
 Directory-creation and PNG write failures include the failing path and operating-system error.
 
 Warmup is useful when llvmpipe makes a frame-counted startup take minutes. The guest and GPU command
-decoder continue at native speed while Vulkan work is skipped; normal screenshots begin once rendering
-does. During warmup, the raw-scanout fallback is suppressed so the output folder does not fill with
-misleading loading frames. The two warmup gates are additive when both are supplied. `--timeout` covers
+decoder continue at native speed while Vulkan work is skipped; normal screenshots begin once warmup
+ends. During warmup, both rendered frames and the raw-scanout fallback are suppressed from capture, so
+diagnostic target/resource overrides can preserve producers without saving early frames (#588). The two
+warmup gates are additive when both are supplied. `--timeout` covers
 the entire run, including warmup.
 
 **"Frames" = rendered frames** (composited images handed to the present layer), *not* guest flips —

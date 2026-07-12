@@ -222,7 +222,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[shot] %s: %d screenshots, every %d frames -> %s/%s_%s_*.png\n",
                 code.c_str(), count, every, out.c_str(), code.c_str(), ts);
     if (warming_up)
-        fprintf(stderr, "[shot] warmup: %lld ms, %d submits; raw scanout suppressed until rendering begins\n",
+        fprintf(stderr, "[shot] warmup: %lld ms, %d submits; capture suppressed until warmup ends\n",
                 (long long)render_delay_ms, render_first);
 
     std::vector<uint8_t> buf;
@@ -241,9 +241,12 @@ int main(int argc, char** argv) {
         bool due = time_mode ? (std::chrono::duration<double>(now - last_cap).count() >= seconds)
                              : (gpu::present_frame_seq() >= next);
         const bool rendered = gpu::present_has_frame();
-        const bool raw_scanout = !warming_up && gpu::present_front_index() >= 0 &&
+        const bool wall_warmup_done = el * 1000.0 >= (double)render_delay_ms;
+        const bool rendered_capture = rendered && wall_warmup_done;
+        const bool raw_scanout = wall_warmup_done && render_first == 0 &&
+                                 gpu::present_front_index() >= 0 &&
                                  gpu::present_width() > 0 && gpu::present_height() > 0;
-        if ((rendered || raw_scanout) && due) {
+        if ((rendered_capture || raw_scanout) && due) {
             uint64_t at = gpu::present_frame_seq();
             // Size the buffer from the RENDERED frame's dims, not the guest display dims: under
             // PROSPER_RENDER_SCALE the frame is smaller, and present_readback returns g_frame.size()
