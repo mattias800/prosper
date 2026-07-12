@@ -70,8 +70,8 @@ accepts scripted gamepad input, and renders the first level.
   A scripted gamepad route produced a full-resolution sequence that was confirmed against PS5 hardware.
 - 🚧 **Dead Cells reaches gameplay:** deterministic input routing passes its splash and menus into the
   first playable scene. HUD and some composition are alive, but the world is mostly white. Capture/replay
-  isolated the first bad composition input. Range provenance now identifies its 642x362 backing as a real
-  compute-filled buffer and exposes a draw-compute-draw ordering violation in the executor (#566, #584).
+  isolated the first bad composition input. Graphics and compute now execute by retained PM4 order (#584),
+  fixing a proven future-read; the settled overbright composition remains under investigation (#566, #586).
 
 **Frontend:** `prosper-app` is a windowed player (SDL3 window + Vulkan present + audio sink +
 evdev/SDL3 controllers + real message/error/IME dialogs), sharing the same boot + render core as the

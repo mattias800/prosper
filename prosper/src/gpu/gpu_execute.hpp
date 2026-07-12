@@ -50,6 +50,8 @@ struct DrawItem {
     // memory — the scene RT is never populated on the CPU side — and the frame is a black composite).
     uint64_t color0_base = 0;
     uint32_t color0_width = 0, color0_height = 0;
+    uint64_t draw_index = 0;
+    uint64_t command_order = 0;
 };
 
 // The pluggable Vulkan backend: render the submit's draw items into one image and return W*H*4 RGBA8
@@ -152,7 +154,17 @@ using LiveComputeFn = std::function<bool(const std::vector<ComputeItem>& items)>
 // dispatch from its state snapshot and invokes the backend in stream order.
 void set_submit_compute(LiveComputeFn fn);
 bool have_submit_compute();
+std::vector<ComputeItem> realize_compute_dispatches(const GpuState& st,
+                                                     uint64_t submit_no = 0);
 bool execute_compute_dispatches(const GpuState& st, uint64_t submit_no = 0);
+
+enum class SubmitOperationKind : uint8_t { Draw, Dispatch };
+struct SubmitOperation {
+    SubmitOperationKind kind = SubmitOperationKind::Draw;
+    size_t index = 0;
+    uint64_t command_order = 0;
+};
+std::vector<SubmitOperation> plan_submit_operations(const GpuState& st);
 
 // PROSPER_PROVENANCE_DIM=WxH: inspect sampled images of that size and report overlapping
 // color, compute, DMA_DATA, and WRITE_DATA events with both observation and PM4 ordering.
@@ -528,10 +540,11 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
 // full present-resolution pixels; when we render into a reduced-resolution framebuffer (PROSPER_RENDER_SCALE)
 // the viewport must shrink by the same ratio, or a full-res viewport into a small framebuffer clips the
 // image to its bottom-left corner. Default 1.0 (full-res / tests: no change).
-inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn& render,
-                                             uint32_t max_shader_dwords = 0x10000,
-                                             float vp_scale_x = 1.0f, float vp_scale_y = 1.0f) {
-    if (st.draws.empty() || !render) return {};              // nothing to render (e.g. a state-only submit)
+inline std::vector<DrawItem> realize_gpustate_draws(const GpuState& st,
+                                                    uint32_t max_shader_dwords = 0x10000,
+                                                    float vp_scale_x = 1.0f,
+                                                    float vp_scale_y = 1.0f) {
+    if (st.draws.empty()) return {};
     // PROSPER_EXECLOG: just the per-draw bail-point/skip logs, without PROSPER_GFXLOG's per-packet
     // firehose (which is GBs over a minutes-long run) — for "which draws skip and why" surveys (#319).
     const bool log = getenv("PROSPER_GFXLOG") != nullptr ||
@@ -545,21 +558,28 @@ inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn&
     // CONFIDENCE: MED — verified multi-draw scenes render their content per-draw vs. a blank clear folded.
     static const bool force_perdraw = getenv("PROSPER_PERDRAW") != nullptr;
     static const bool force_folded  = getenv("PROSPER_FOLDED") != nullptr;
-    const bool perdraw = force_perdraw || (!force_folded && st.draws.size() > 1);
+    const bool perdraw = force_perdraw ||
+                         (!force_folded && (st.draws.size() > 1 || !st.dispatches.empty()));
     std::vector<DrawItem> items;
     if (perdraw) {
         for (size_t i = 0; i < st.draws.size(); i++) {
             DrawItem it;
             if (realize_draw_item(st.state_at_draw(i), &st.draws[i], st.draws[i].index_count,
-                                  max_shader_dwords, log, it))
+                                  max_shader_dwords, log, it)) {
+                it.draw_index = i;
+                it.command_order = st.draws[i].command_order;
                 items.push_back(std::move(it));
+            }
         }
     } else {
         // Default: render the submit's last draw from the folded end state as a single item.
         DrawItem it;
         const GpuState::Draw& last = st.draws.back();
-        if (realize_draw_item(st, &last, last.index_count, max_shader_dwords, log, it))
+        if (realize_draw_item(st, &last, last.index_count, max_shader_dwords, log, it)) {
+            it.draw_index = st.draws.size() - 1;
+            it.command_order = last.command_order;
             items.push_back(std::move(it));
+        }
     }
     if (getenv("PROSPER_DRAWLOG")) { fprintf(stderr, "[exec] draws=%zu perdraw=%d -> %zu item(s): raw index_counts=[",
         st.draws.size(), (int)perdraw, items.size());
@@ -579,6 +599,16 @@ inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn&
                 it.ps.viewport_y *= vp_scale_y; it.ps.viewport_h *= vp_scale_y;
             }
     if (log) fprintf(stderr, "[exec] rendering %zu draw item(s) (of %zu draws)\n", items.size(), st.draws.size());
+    return items;
+}
+
+inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn& render,
+                                             uint32_t max_shader_dwords = 0x10000,
+                                             float vp_scale_x = 1.0f, float vp_scale_y = 1.0f) {
+    if (!render) return {};
+    std::vector<DrawItem> items = realize_gpustate_draws(
+        st, max_shader_dwords, vp_scale_x, vp_scale_y);
+    if (items.empty()) return {};
     return render(items);
 }
 
@@ -590,9 +620,27 @@ inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn&
 using LiveRenderFn = std::function<std::vector<uint8_t>(const std::vector<DrawItem>& items,
                                                         uint32_t width, uint32_t height)>;
 
+struct OrderedSubmitResult {
+    std::vector<uint8_t> pixels;
+    size_t render_spans = 0;
+    bool compute_executed = false;
+};
+OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& operations,
+                                          const std::vector<DrawItem>& draws,
+                                          const std::vector<ComputeItem>& computes,
+                                          const LiveRenderFn& render,
+                                          const LiveComputeFn& compute,
+                                          uint32_t width, uint32_t height);
+
 // Register (or clear, with {}) the live render backend that agc_driver_submit_dcb uses on each submit.
 void set_submit_renderer(LiveRenderFn fn);
 bool have_submit_renderer();
+
+struct LiveRenderPhase {
+    bool first_span = true;
+    bool final_span = true;
+};
+LiveRenderPhase live_render_phase();
 
 // Invoke the registered live backend directly with already-realized draws. Used by the local capture
 // replayer; normal guest execution enters through execute_and_present(). Returns {} when unregistered.
@@ -604,5 +652,10 @@ std::vector<uint8_t> render_submit_items(const std::vector<DrawItem>& items,
 // returning false when there is no renderer registered or the state has no draws — so it is inert on the
 // game path until the runtime wires a device, yet fully exercised by tests. Stage A of GPU_EXECUTOR_DESIGN.
 bool execute_and_present(const GpuState& st, uint32_t width, uint32_t height);
+
+// Execute retained graphics and compute work in PM4 order. Graphics spans share the frontend's
+// persistent render-target cache, and only the final span is handed to the present path.
+bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t height,
+                                 uint64_t submit_no = 0);
 
 } // namespace prosper::gpu
