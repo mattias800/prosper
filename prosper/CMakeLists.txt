@@ -366,6 +366,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_gpu_timeline PRIVATE prosper_core)
   add_test(NAME gpu_timeline_roundtrip COMMAND test_gpu_timeline)
 
+  add_executable(test_gpu_dependency_graph tests/test_gpu_dependency_graph.cpp)
+  target_link_libraries(test_gpu_dependency_graph PRIVATE prosper_core)
+  add_test(NAME gpu_dependency_graph COMMAND test_gpu_dependency_graph)
+
   add_executable(gpu_timeline tools/gpu_timeline/gpu_timeline.cpp)
   target_link_libraries(gpu_timeline PRIVATE prosper_core)
 

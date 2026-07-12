@@ -27,6 +27,8 @@ PROSPER_GPU_TIMELINE_CAPTURE=/tmp/dead-cells-submit-18420.prgcap \
 
 ./build-linux/gpu_timeline /tmp/dead-cells-detail.prgtl --records
 ./build-linux/gpu_replay --inspect-only /tmp/dead-cells-submit-18420.prgcap
+./build-linux/gpu_replay --graph /tmp/dead-cells-submit-18420.prgcap
+./build-linux/gpu_replay --graph-json /tmp/dead-cells-graph.json /tmp/dead-cells-submit-18420.prgcap
 ./build-linux/gpu_replay /tmp/dead-cells-submit-18420.prgcap /tmp/replay.bmp
 ```
 
@@ -60,3 +62,6 @@ produced one; replay reports `oracle=no` and renders without pretending an expec
 The capture is selected by exact submit number, not yet by route checkpoint or present. It contains the
 selected submit and temporal RTT surfaces currently resident in the renderer, but does not automatically
 pull earlier producer submits. Automatic present-to-producer dependency closure is tracked by #595.
+`gpu_replay --graph` resolves dependencies inside the selected submit and reports the remaining external
+versions; a `future-writer` on an external leaf is the characteristic temporal read-before-write case that
+needs the earlier version of the same logical surface.

@@ -35,6 +35,8 @@ possible without console keys. Dumps are user-supplied and gitignored.
   provenance, normal screenshot capture, and a local content-metric snapshot guard. Native-speed `.prgtl`
   submit/present indexes can select one exact submit before renderer sampling and materialize immutable,
   content-deduplicated graphics/compute state plus mixed operation order for offline replay (#594).
+  Offline dependency graphs resolve in-submit resource versions and identify deduplicated prior-submit
+  leaves, including temporal read-before-write surfaces, without invoking Vulkan (#595).
 - ✅ **Dead Cells reaches gameplay reproducibly:** a deterministic input route passes the splash and menus
   into the first playable scene. HUD and some composition render, but the world is mostly white (#566).
   Version-5 GPU captures seed temporal render targets and retain content-addressed resource versions for
@@ -77,7 +79,7 @@ prosper/
 ```
 cmake -S . -B build -G Ninja
 cmake --build build
-ctest --test-dir build          # 89 self-checking tests
+ctest --test-dir build          # 90 self-checking tests
 ```
 Add `-DPROSPER_APP=ON` for the windowed `prosper-app` frontend (fetches SDL3). Or a tool directly:
 ```
