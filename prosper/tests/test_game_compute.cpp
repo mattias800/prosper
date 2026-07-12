@@ -69,6 +69,9 @@ int main() {
     item.launch.local_y = item.launch.local_z = 1;
     item.launch.groups_y = item.launch.groups_z = 1;
     item.code_addr = 0x401aec200;
+    item.dispatch_index = 7;
+    item.submit_no = 11;
+    item.command_order = 70;
     CHECK(prosper::frontend::execute_live_compute_items({item}),
           "production live backend executes the game kernel");
     CHECK(result.size() == records * 4, "compute resource retains its declared size");

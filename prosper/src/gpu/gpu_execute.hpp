@@ -141,6 +141,9 @@ struct ComputeItem {
     std::shared_ptr<ShaderResourceTable> resources;
     ComputeLaunchDimensions launch;
     uint64_t code_addr = 0;
+    uint64_t dispatch_index = 0;
+    uint64_t submit_no = 0;
+    uint64_t command_order = 0;
 };
 
 using LiveComputeFn = std::function<bool(const std::vector<ComputeItem>& items)>;
@@ -149,10 +152,10 @@ using LiveComputeFn = std::function<bool(const std::vector<ComputeItem>& items)>
 // dispatch from its state snapshot and invokes the backend in stream order.
 void set_submit_compute(LiveComputeFn fn);
 bool have_submit_compute();
-bool execute_compute_dispatches(const GpuState& st);
+bool execute_compute_dispatches(const GpuState& st, uint64_t submit_no = 0);
 
-// PROSPER_PROVENANCE_DIM=WxH: retain color-target address history across submits, then inspect
-// sampled images of that size and report the most recent draw that wrote the same guest address.
+// PROSPER_PROVENANCE_DIM=WxH: inspect sampled images of that size and report overlapping
+// color, compute, DMA_DATA, and WRITE_DATA events with both observation and PM4 ordering.
 // PROSPER_PROVENANCE_MIN_DRAWS=N limits expensive descriptor resolution to large target submits.
 void diagnose_resource_provenance(const GpuState& st, uint64_t submit_no);
 

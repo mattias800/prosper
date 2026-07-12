@@ -52,6 +52,7 @@ struct Pm4Command {
         DmaData, Unknown,
     } kind = Kind::Unknown;
 
+    uint64_t stream_order = 0;          // assigned before apply and retained by deferred effects
     uint32_t        header = 0;
     uint32_t        op = 0, r = 0, len = 0;   // op, sub-op, total dwords (incl. header)
     const uint32_t* payload = nullptr;        // points at header+1 (len-1 dwords)

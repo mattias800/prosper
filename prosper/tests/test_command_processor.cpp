@@ -226,6 +226,9 @@ int main() {
                   "dispatch 1 snapshot retains updated compute user data");
             CHECK(cs.dispatches[1].threads_x == 8 && cs.dispatches[1].threads_y == 2 &&
                   cs.dispatches[1].threads_z == 3, "dispatch 1 asymmetric thread counts retained");
+            CHECK(cs.dispatches[0].command_order > 0 &&
+                  cs.dispatches[0].command_order < cs.dispatches[1].command_order,
+                  "dispatches retain monotonic PM4 stream order");
         }
     }
 
