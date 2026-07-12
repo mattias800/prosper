@@ -66,7 +66,8 @@ enum : uint32_t {
     SC_Workgroup=4, Scope_Workgroup=2, MemSem_WGAcqRel=0x108,   // LDS: Workgroup storage + barrier scope/semantics
     Dec_Block=2, Dec_ArrayStride=6, Dec_BuiltIn=11, Dec_Flat=14, Dec_Location=30, Dec_Binding=33,
     Dec_DescriptorSet=34, Dec_Offset=35,
-    BI_Position=0, BI_FragCoord=15, BI_LocalInvocationId=27, BI_GlobalInvocationId=28, BI_VertexIndex=42,
+    BI_Position=0, BI_FragCoord=15, BI_WorkgroupId=26, BI_LocalInvocationId=27,
+    BI_GlobalInvocationId=28, BI_VertexIndex=42,
 };
 
 uint32_t fbits(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
@@ -80,7 +81,8 @@ struct SpirvCompute {
     uint32_t stride = 1;
     // fixed ids (set in begin()):
     uint32_t t_void=0, t_fn=0, t_f32=0, t_u32=0, t_i32=0, t_v3u=0, t_bool=0, t_ptr_sb_f32=0;
-    uint32_t v_gid=0, v_in=0, v_out=0, gidx=0, f_main=0, glsl=0, bconst_false=0;
+    uint32_t v_gid=0, v_groupid=0, v_in=0, v_out=0, gidx=0, f_main=0, glsl=0, bconst_false=0;
+    uint32_t groupid[3] = {0, 0, 0}, localid_comp[3] = {0, 0, 0};
     uint32_t v_cbuf=0, v_cbuf1=0, t_ptr_sb_u32=0;   // scalar-memory constant buffers (bindings 2 and 3)
     std::map<uint32_t, uint32_t> cbuf_var;          // binding -> storage-buffer var (N-buffer model; 2/3 map to v_cbuf/v_cbuf1)
     bool     is_fragment=0;                          // true in the fragment shell (gates VINTRP interp)
@@ -740,11 +742,12 @@ struct SpirvCompute {
     uint32_t land(uint32_t a, uint32_t b_) { uint32_t r = id(); put(code, Op_LogicalAnd, {t_bool, r, a, b_}); return r; }
     uint32_t lor(uint32_t a, uint32_t b_)  { uint32_t r = id(); put(code, Op_LogicalOr,  {t_bool, r, a, b_}); return r; }
 
-    void begin(uint32_t input_stride, const ShaderResourceTable* rt = nullptr) {
+    void begin(uint32_t input_stride, const ShaderResourceTable* rt = nullptr,
+               uint32_t local_x = 64, uint32_t local_y = 1, uint32_t local_z = 1) {
         stride = input_stride;
         t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_i32 = id(); t_v3u = id(); t_bool = id();
         t_v4f = id();   // vec4<float>: needed by the sampled-texture path (image_sample) in a compute shader
-        uint32_t t_ptr_in_v3u = id(); v_gid = id(); v_localid = id();
+        uint32_t t_ptr_in_v3u = id(); v_gid = id(); v_groupid = id(); v_localid = id();
         uint32_t t_rta = id(), t_struct = id(), t_ptr_sb_struct = id();
         v_in = id(); v_out = id(); t_ptr_sb_f32 = id();
         f_main = id(); uint32_t lbl = id(); glsl = id();
@@ -753,9 +756,10 @@ struct SpirvCompute {
         { std::vector<uint32_t> o{glsl}; pstr(o, "GLSL.std.450"); putv(extimp, Op_ExtInstImport, o); }
         put(mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
         is_compute = true;
-        exec_model = Exec_GLCompute; iface = {v_gid, v_localid};   // EntryPoint deferred to finish()
-        put(exec, Op_ExecutionMode, {f_main, EM_LocalSize, 64, 1, 1});
+        exec_model = Exec_GLCompute; iface = {v_gid, v_groupid, v_localid};   // EntryPoint deferred to finish()
+        put(exec, Op_ExecutionMode, {f_main, EM_LocalSize, local_x, local_y, local_z});
         put(deco, Op_Decorate, {v_gid, Dec_BuiltIn, BI_GlobalInvocationId});
+        put(deco, Op_Decorate, {v_groupid, Dec_BuiltIn, BI_WorkgroupId});
         put(deco, Op_Decorate, {v_localid, Dec_BuiltIn, BI_LocalInvocationId});   // wave lane index (.x)
         put(deco, Op_Decorate, {t_rta, Dec_ArrayStride, 4});
         put(deco, Op_MemberDecorate, {t_struct, 0, Dec_Offset, 0});
@@ -772,6 +776,7 @@ struct SpirvCompute {
         put(types, Op_TypeBool, {t_bool});
         put(types, Op_TypePointer, {t_ptr_in_v3u, SC_Input, t_v3u});
         put(types, Op_Variable, {t_ptr_in_v3u, v_gid, SC_Input});
+        put(types, Op_Variable, {t_ptr_in_v3u, v_groupid, SC_Input});
         put(types, Op_Variable, {t_ptr_in_v3u, v_localid, SC_Input});
         put(types, Op_TypeRuntimeArray, {t_rta, t_f32});
         put(types, Op_TypeStruct, {t_struct, t_rta});
@@ -785,7 +790,16 @@ struct SpirvCompute {
         uint32_t ld = id(); put(code, Op_Load, {t_v3u, ld, v_gid});
         gidx = id(); put(code, Op_CompositeExtract, {t_u32, gidx, ld, 0});
         uint32_t ldl = id(); put(code, Op_Load, {t_v3u, ldl, v_localid});
-        localid = id(); put(code, Op_CompositeExtract, {t_u32, localid, ldl, 0});   // wave lane index
+        for (uint32_t c = 0; c < 3; c++) {
+            localid_comp[c] = id();
+            put(code, Op_CompositeExtract, {t_u32, localid_comp[c], ldl, c});
+        }
+        localid = localid_comp[0];   // wave lane index
+        uint32_t ldg = id(); put(code, Op_Load, {t_v3u, ldg, v_groupid});
+        for (uint32_t c = 0; c < 3; c++) {
+            groupid[c] = id();
+            put(code, Op_CompositeExtract, {t_u32, groupid[c], ldg, c});
+        }
     }
     // --- Fragment-shader shell: a location-0 vec4 color output; EXP MRT0 stores to it. ---
     uint32_t t_v4f = 0, v_color = 0;
@@ -3835,6 +3849,61 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
     // value; if it was restored to all-lanes-on, every lane stores.
     if (!rs.exec_narrowed) b.store_output(outbits);
     else                   b.store_output_pred(outbits, rs.exec);
+    return b.finish();
+}
+
+std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
+                                        const ShaderResourceTable* rt,
+                                        const ComputeShaderConfig& config) {
+    std::vector<Rdna2Inst> ins;
+    rdna2_walk(code, dwords, ins);
+    SpirvCompute b;
+    if (config.lds_bytes) {
+        uint32_t dw = (config.lds_bytes + 3) / 4;
+        b.lds_dwords = std::min(16384u, std::max(1u, dw));
+    }
+    const uint32_t local_x = std::max(1u, config.local_x);
+    const uint32_t local_y = std::max(1u, config.local_y);
+    const uint32_t local_z = std::max(1u, config.local_z);
+    b.begin(1, rt, local_x, local_y, local_z);
+
+    RegState rs;
+    rs.vcc = b.bfalse();
+    rs.scc = b.bfalse();
+    rs.exec = b.btrue();
+    // Inline descriptors are represented by the resource table, not scalar SSA values. Leaving
+    // their SGPR range absent also preserves the existing direct-provenance rule: a format MUBUF may
+    // fall back to by_sgpr_base only while its SRSRC has not been overwritten by shader code.
+    std::set<uint32_t> descriptor_sgprs;
+    if (rt) {
+        for (const auto& resource : rt->resources) {
+            if (resource.srt_offset != 0xFFFFFFFFu || resource.sgpr_base == 0xFFFFFFFFu) continue;
+            uint32_t words = (resource.cls == ResourceClass::Texture ||
+                              resource.cls == ResourceClass::StorageImage) ? 8u : 4u;
+            for (uint32_t word = 0; word < words; word++)
+                descriptor_sgprs.insert(resource.sgpr_base + word);
+        }
+    }
+    for (size_t i = 0; i < config.user_sgprs.size(); i++)
+        if (!descriptor_sgprs.count(static_cast<uint32_t>(i)))
+            rs.sreg[static_cast<int>(i)] = b.uconst(config.user_sgprs[i]);
+
+    rs.vreg[0] = b.localid_comp[0];
+    if (config.tidig_comp_cnt >= 1) rs.vreg[1] = b.localid_comp[1];
+    if (config.tidig_comp_cnt >= 2) rs.vreg[2] = b.localid_comp[2];
+
+    int system_sgpr = static_cast<int>(config.user_sgprs.size());
+    if (config.tgid_x_en) rs.sreg[system_sgpr++] = b.groupid[0];
+    if (config.tgid_y_en) rs.sreg[system_sgpr++] = b.groupid[1];
+    if (config.tgid_z_en) rs.sreg[system_sgpr++] = b.groupid[2];
+    if (config.tg_size_en)
+        rs.sreg[system_sgpr] = b.uconst(local_x * local_y * local_z);
+
+    auto safe_branches = safe_execz_branches(ins);
+    for (uint32_t wpc : waterfall_branches(ins)) safe_branches.insert(wpc);
+    if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/true,
+                   /*allow_smem*/true, [](const Rdna2Inst&) { return false; }, code, dwords))
+        return {};
     return b.finish();
 }
 

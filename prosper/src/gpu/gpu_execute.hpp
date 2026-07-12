@@ -136,6 +136,21 @@ struct ComputeLaunchDimensions {
 // to one so malformed/incomplete state never divides by zero.
 ComputeLaunchDimensions resolve_compute_launch(const GpuState::Dispatch& dispatch);
 
+struct ComputeItem {
+    std::vector<uint32_t> spirv;
+    std::shared_ptr<ShaderResourceTable> resources;
+    ComputeLaunchDimensions launch;
+    uint64_t code_addr = 0;
+};
+
+using LiveComputeFn = std::function<bool(const std::vector<ComputeItem>& items)>;
+
+// Register the synchronous live compute backend. execute_compute_dispatches realizes every retained
+// dispatch from its state snapshot and invokes the backend in stream order.
+void set_submit_compute(LiveComputeFn fn);
+bool have_submit_compute();
+bool execute_compute_dispatches(const GpuState& st);
+
 // PROSPER_PROVENANCE_DIM=WxH: retain color-target address history across submits, then inspect
 // sampled images of that size and report the most recent draw that wrote the same guest address.
 // PROSPER_PROVENANCE_MIN_DRAWS=N limits expensive descriptor resolution to large target submits.

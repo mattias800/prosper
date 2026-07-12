@@ -454,7 +454,8 @@ if(TARGET prosper_core)
       # Shared live renderer (frontends/shared): the DrawItem->Vulkan compositor, factored out of
       # boot_trace so BOTH boot_trace and prosper-app register the SAME renderer instead of
       # duplicating it. Needs render_runner.h (tests/) and refvs.inc (tools/boot_trace/).
-      add_library(prosper_live_renderer STATIC frontends/shared/live_renderer.cpp)
+      add_library(prosper_live_renderer STATIC frontends/shared/live_renderer.cpp
+                                               frontends/shared/live_compute.cpp)
       target_include_directories(prosper_live_renderer PRIVATE src tests tools/boot_trace)
       target_link_libraries(prosper_live_renderer PUBLIC prosper_core Vulkan::Vulkan)
       target_include_directories(prosper_live_renderer PUBLIC frontends/shared)
@@ -499,6 +500,11 @@ if(TARGET prosper_core)
       add_executable(test_compute_exec tests/test_compute_exec.cpp)
       target_link_libraries(test_compute_exec PRIVATE Vulkan::Vulkan)
       add_test(NAME compute_exec_differential COMMAND test_compute_exec)
+
+      # Execute a real game kernel with its user/system-register ABI and resource table.
+      add_executable(test_game_compute tests/test_game_compute.cpp)
+      target_link_libraries(test_game_compute PRIVATE prosper_live_renderer)
+      add_test(NAME game_compute_exec COMMAND test_game_compute)
 
       # Prove our own SPIR-V emitter produces valid, correct, runnable SPIR-V (execution-differential).
       add_executable(test_spirv_builder tests/test_spirv_builder.cpp)

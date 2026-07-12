@@ -29,6 +29,24 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
                                      uint32_t num_inputs, uint32_t out_vgpr,
                                      const ShaderResourceTable* rt = nullptr, uint32_t lds_bytes = 0);
 
+// Register and launch state for a real compute program. User SGPR values are baked into the module
+// for one retained dispatch; enabled system SGPRs follow them in hardware order. TIDIG_COMP_CNT
+// controls whether local IDs seed v0 only (0), v0-v1 (1), or v0-v2 (2+).
+struct ComputeShaderConfig {
+    std::vector<uint32_t> user_sgprs;
+    uint32_t local_x = 64, local_y = 1, local_z = 1;
+    uint32_t tidig_comp_cnt = 0;
+    bool tgid_x_en = false, tgid_y_en = false, tgid_z_en = false;
+    bool tg_size_en = false;
+    uint32_t lds_bytes = 0;
+};
+
+// Translate a game compute program without the synthetic binding-0 input / binding-1 output used by
+// recompile_valu. Memory effects come only from the program's actual resource operations.
+std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
+                                        const ShaderResourceTable* rt,
+                                        const ComputeShaderConfig& config);
+
 // Recompile a pixel/fragment shader to a fragment SPIR-V module: run the VALU, and on EXP to an MRT
 // target write vec4(src0..3) to the location-0 color output. Returns {} if unsupported / no export.
 // An optional ShaderResourceTable enables memory ops (SMEM/MUBUF) with resolved bindings.

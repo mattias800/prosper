@@ -1,6 +1,7 @@
 // live_renderer.cpp — see live_renderer.hpp. Extracted from boot_trace's PROSPER_RENDER lambda
 // (behavior-preserving); Vulkan-backed, so this unit links Vulkan::Vulkan.
 #include "live_renderer.hpp"
+#include "live_compute.hpp"
 
 #include "gpu/gpu_execute.hpp"          // DrawItem, set_submit_renderer
 #include "gpu/gpu_capture.hpp"          // temporal RTT capture/replay seeds
@@ -40,6 +41,7 @@ namespace prosper::frontend {
 namespace { struct RttSurf { std::vector<uint8_t> rgba; uint32_t w = 0, h = 0; }; }
 
 void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
+    register_live_compute();
     // Resource tables are built before the submit reaches this callback. Publish the renderer's
     // default mode now so unmapped render-target descriptors remain available for RTT injection.
     // Outside a registered renderer, resource decoding retains its strict unknown-format policy.

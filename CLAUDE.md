@@ -101,10 +101,10 @@ Dead Cells now has a deterministic route through splash/menu into gameplay. HUD 
 but the world is mostly white (#566). Version-4 `.prgcap` captures seed temporal RTT inputs (#568) and isolate the
 first bad composition at draw 18; one 642x362 input has no prior color-target writer. The kernel-derived dispatch
 thread/local/group contract (#580), `sceAgcCbSetShRegistersDirect`, and compute direct type-1 V# binding (#574)
-recover a real compute program and buffer resource. The immediate frontier is actual compute execution (#576):
-dispatches are still retained for diagnostics only, so compute-produced memory/images remain stale. Use writer
-provenance to prove ownership of the missing surface rather than assuming compute is causal. The residual seeded
-replay mismatch (#569) and the animation-sensitive exact splash guard (#573) remain separate tooling issues.
+now execute the real fill kernel against guest buffers before submit completion (#576). The gameplay route remains
+mostly white, proving this buffer compute was not the missing 642x362 producer. The immediate frontier is writer
+provenance and storage-image compute, without assuming compute owns that surface (#566). The residual seeded replay
+mismatch (#569) and the animation-sensitive exact splash guard (#573) remain separate tooling issues.
 `PROSPER_DESCRIPTOR_VALIDATE=strict|poison` and `gpu_replay --validate` are landed capabilities from #515.
 Do not restart the superseded
 Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without contradictory new evidence.
@@ -136,7 +136,7 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   `/mnt/c/Users/matti/repos/ps5ys/PPSA24651-app0` (gitignored — **never commit it**).
   ```bash
   cd /mnt/c/Users/matti/repos/ps5ys/prosper/build-linux
-  cmake --build . -j8 && ctest        # 85/85 expected green on Linux
+  cmake --build . -j8 && ctest        # 86/86 expected green on Linux
   ```
 - **Verification is agentic-first / programmatic** (`docs/VERIFICATION.md`): ctest exit code is truth;
   shaders are `spirv-val`-gated; rendered frames are pixel/CRC-asserted or dumped to BMP. No manual
