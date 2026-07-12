@@ -13,6 +13,7 @@
 #include "gpu/command_processor.hpp"
 #include "gpu/pm4_decode.hpp"
 #include "gpu/gpu_execute.hpp"
+#include "gpu/gpu_timeline.hpp"
 #include "gpu/videoout_present.hpp"
 #include <cstdint>
 #include <cstdio>
@@ -1046,6 +1047,9 @@ void start_defer_watchdog() {
 }
 
 static bool execute_submit_work(gpu::GpuState& st, uint64_t submit_no, unsigned& draw_submits) {
+    // Native-speed semantic capture happens before renderer sampling. PROSPER_RENDER_EVERY and
+    // warmup may skip Vulkan work, but must not erase submit/present history from the timeline.
+    gpu::record_gpu_timeline_submit(st, submit_no);
     static const unsigned render_every = [] {
         const char* e = getenv("PROSPER_RENDER_EVERY");
         long v = e ? atol(e) : 1;
@@ -1099,6 +1103,7 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
     gpu::flush_deferred_streams();
     agc_gpu_state().draws.clear();
     agc_gpu_state().dispatches.clear();
+    gpu::begin_gpu_timeline_submit(g_submit_count + 1);
     size_t applied = gpu::run_command_buffer(addr, walk, agc_gpu_state());
     g_submit_count++;
     gpu::diagnose_compute_dispatches(agc_gpu_state(), g_submit_count);
@@ -1209,6 +1214,7 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     gpu::flush_deferred_streams();
     agc_gpu_state().draws.clear();
     agc_gpu_state().dispatches.clear();
+    gpu::begin_gpu_timeline_submit(g_submit_count + 1);
     size_t applied = gpu::run_command_buffer(p->addr, p->dw_num, agc_gpu_state());
     g_submit_count++;
     gpu::diagnose_compute_dispatches(agc_gpu_state(), g_submit_count);
