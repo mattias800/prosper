@@ -41,10 +41,11 @@ presented, framebuffer CRC == golden" is. Each change adds the check that proves
   dispatch thread/local/group contract (#580), `sceAgcCbSetShRegistersDirect`, and compute direct type-1 V#
   decoding (#574) now execute a valid registered fill program against real guest buffers before submit completion
   (#576). Range provenance proved one submit orders a 642x362 consumer, dispatch 5's fill, then another consumer.
-  Graphics spans and compute now execute by that retained PM4 order (#584); the first gameplay frame changes, but
-  subsequent frames still settle to the prior overbright composition.
-- **Immediate milestone:** isolate the remaining settled Dead Cells composition defect (#586), including live
-  per-consumer resource versions and dark/overbright captures. Separately, resolve the seeded replay hash
+  Graphics spans and compute now execute by that retained PM4 order (#584). Per-consumer hashes and target-prefix
+  metrics proved the later overbright screenshot was a warmup artifact: a skipped temporal RTT fell back to an
+  all-`0xFF` compute backing, then the bad copy persisted. Preserving the 642x362 producers renders real geometry.
+- **Immediate milestone:** build a practical late Dead Cells checkpoint with required RTT history intact (#586).
+  Separately, resolve the seeded replay hash
   mismatch (#569) and animation-sensitive splash
   snapshot (#573), while continuing the same capture/replay workflow across Unity and Unreal targets.
 

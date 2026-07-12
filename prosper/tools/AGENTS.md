@@ -56,6 +56,10 @@ This preserves a one-time producer in the RTT cache while still skipping an expe
 late consumer.
 `PROSPER_RENDER_RESOURCE_DIM=WxH` likewise executes submits that sample a matching image, allowing a
 producer/consumer A/B without rendering every unrelated submit between them.
+`PROSPER_RESOURCE_HASH_DIM=WxH` logs each matching sampled resource's raw guest hash, decoded/sample
+hash, RTT-hit state, last compute/DMA writer, draw index, and PM4 order. `PROSPER_TARGET_STEP_HASH_DIM`
+rerenders matching target passes by prefix and logs per-draw hashes plus dark/white/mean metrics;
+`PROSPER_TARGET_STEP_HASH_MIN_DRAWS=N` bounds that intentionally expensive bisect.
 `PROSPER_RENDER_DELAY_MS=N` skips synchronous Vulkan work for N milliseconds from the first submit while
 the guest and command decoder advance. The `screenshot` frontend exposes this as `--warmup-seconds`, plus
 `--warmup-submits` for `PROSPER_RENDER_FIRST`; use wall-clock warmup for progression captures and the exact

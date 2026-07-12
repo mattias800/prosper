@@ -103,11 +103,16 @@ first bad composition at draw 18; one 642x362 input has no prior color-target wr
 thread/local/group contract (#580), `sceAgcCbSetShRegistersDirect`, and compute direct type-1 V# binding (#574)
 now execute the real fill kernel against guest buffers before submit completion (#576). Range provenance proved
 draw 19 consumes one backing, dispatch 5 fills it, then draw 31 consumes it again in one submit. Graphics spans and
-compute now execute by retained PM4 order (#584), fixing that future-read and changing the first gameplay frame;
-the scene still settles to the overbright composition tracked by #586. The residual seeded replay mismatch (#569)
-and animation-sensitive exact splash guard (#573) remain separate tooling issues.
+compute now execute by retained PM4 order (#584), fixing that future-read. The later overbright screenshot was a
+warmup artifact: the 35-second render delay skipped a 642x362 RTT producer, then a replace-copy sampled dispatch
+4's raw all-`0xFF` backing and cached it indefinitely. `PROSPER_RENDER_TARGET_DIM=642x362` preserves the real
+opening vignette/level geometry; #586 now tracks a practical late checkpoint with that history intact. The
+residual seeded replay mismatch (#569) and animation-sensitive exact splash guard (#573) remain separate issues.
 `PROSPER_PROVENANCE_DIM=WxH` reports overlapping color, compute, DMA_DATA, and WRITE_DATA writers with
 submit/item/PM4 ordinals.
+`PROSPER_RESOURCE_HASH_DIM=WxH` correlates raw and sampled hashes with those writers at each live draw;
+`PROSPER_TARGET_STEP_HASH_DIM=WxH` plus `PROSPER_TARGET_STEP_HASH_MIN_DRAWS=N` prefix-bisects a target
+pass using content metrics without writing per-draw images.
 `PROSPER_DESCRIPTOR_VALIDATE=strict|poison` and `gpu_replay --validate` are landed capabilities from #515.
 Do not restart the superseded
 Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without contradictory new evidence.

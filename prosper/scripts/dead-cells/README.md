@@ -18,6 +18,8 @@ PROSPER_PAD_SCRIPT=@scripts/dead-cells/reach-first-gameplay.pad \
   loading flips before the menu.
 
 The long renderer warmup makes this route practical under llvmpipe, but it can
-skip one-time GPU producers. The current post-warmup gameplay image is tracked
-in issues #566/#586 and must not be used as a golden visual checkpoint until
-the warmup artifact has been separated from genuine renderer behavior.
+skip temporal GPU producers. The former post-warmup fullscreen-white image was
+caused by that skip and is not normal renderer output (#586). For graphics
+investigation, add `PROSPER_RENDER_TARGET_DIM=642x362` to preserve the level's
+RTT chain; this is much slower and currently remains in the opening vignette at
+the 35-second checkpoint. Do not use the fast route as a visual golden guard.
