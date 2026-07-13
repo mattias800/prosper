@@ -2,7 +2,7 @@
 // (behavior-preserving); the guest-execution substrate is Linux-only, so guard the whole body.
 #include "boot_program.hpp"
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
 #include "host/exec_image.hpp"
 #include "hle/dispatch.hpp"
 #include "self/module.hpp"     // PT_SCE_PROCPARAM

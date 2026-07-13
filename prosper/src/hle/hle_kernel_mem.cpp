@@ -7,13 +7,16 @@
 #include "nid.hpp"
 #include "sync_futex.hpp"   // shared futex wake + waiter registration (also used by the GPU's label wake)
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
+#include "../host/posix_shim.hpp"
 #include <sys/mman.h>
 #include <sys/syscall.h>
-#include <linux/futex.h>
 #include <unistd.h>
-#include <fcntl.h>          // fallocate
+#include <fcntl.h>
+#ifdef __linux__
+#include <linux/futex.h>
 #include <linux/falloc.h>  // FALLOC_FL_PUNCH_HOLE / FALLOC_FL_KEEP_SIZE
+#endif
 #include <climits>
 #include <cerrno>
 #include <ctime>
@@ -222,7 +225,7 @@ namespace {
         // is already there; only if the occupant is entirely our own uncommitted reservation do we
         // replace it with MAP_FIXED (the guest is committing a range it reserved). A hint that
         // overlaps a committed mapping or an untracked host mapping fails instead of destroying it.
-        void* p = mmap((void*)hint, len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        void* p = prosper_mmap_noreplace((void*)hint, len, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (p != MAP_FAILED) return p;
         if (range_is_free_reservation(hint, len)) {
             p = mmap((void*)hint, len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
@@ -239,7 +242,7 @@ namespace {
     // the file is sparse, so unused ranges cost nothing.
     int dmem_fd() {
         static int fd = [] {
-            int f = (int)syscall(SYS_memfd_create, "prosper-dmem", 1 /*MFD_CLOEXEC*/);
+            int f = prosper_memfd_create("prosper-dmem");
             if (f >= 0 && ftruncate(f, (off_t)(kDmemBase + kDmemTotal)) != 0) { close(f); f = -1; }
             return f;
         }();
@@ -253,8 +256,15 @@ namespace {
     // the console's fresh-page-zeroed semantics).
     void dmem_zero(uint64_t phys, uint64_t sz) {
         int fd = dmem_fd();
-        if (fd >= 0 && phys < kDmemBase + kDmemTotal && sz)
-            fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, (off_t)phys, (off_t)sz);
+        if (fd < 0 || phys >= kDmemBase + kDmemTotal || !sz) return;
+#ifdef __linux__
+        fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, (off_t)phys, (off_t)sz);
+#else
+        // Darwin shm has no hole punching; zero the range through a scratch mapping. Loses
+        // sparseness but preserves the guest-visible fresh-pages-read-zero contract.
+        void* z = mmap(nullptr, sz, PROT_WRITE, MAP_SHARED, fd, (off_t)phys);
+        if (z != MAP_FAILED) { memset(z, 0, sz); munmap(z, sz); }
+#endif
     }
     // Reserve an anonymous span whose returned base satisfies `align`. Linux mmap only promises
     // host-page alignment, while Orbis direct-memory callers can require larger alignment.
@@ -289,7 +299,7 @@ namespace {
                 // Same no-clobber discipline as map_at (#137): NOREPLACE first, MAP_FIXED replace
                 // only over our own uncommitted reservation, else refuse rather than destroy a live
                 // (committed / untracked) mapping — the exact clobber class of issues #88 / #107.
-                void* p = mmap((void*)hint, len, prot, MAP_SHARED | MAP_FIXED_NOREPLACE, fd, (off_t)phys);
+                void* p = prosper_mmap_noreplace((void*)hint, len, prot, MAP_SHARED, fd, (off_t)phys);
                 if (p != MAP_FAILED) return p;
                 if (range_is_free_reservation(hint, len)) {
                     p = mmap((void*)hint, len, prot, MAP_SHARED | MAP_FIXED, fd, (off_t)phys);
@@ -336,7 +346,7 @@ HLE(k_reserve_vrange) {
          (unsigned long long)a3);
     if (!a1) return 0x80020016ull;         // SCE_KERNEL_ERROR_EINVAL (len 0; shadPS4 rejects too)
     if (hint && fixed) {
-        void* p = mmap((void*)hint, a1, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        void* p = prosper_mmap_noreplace((void*)hint, a1, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (p == MAP_FAILED) {
             // The FIXED hint region is already mapped. If it's ALREADY one of OUR reservations
             // (uncommitted), the guest is re-claiming its own recorded range — idempotent success
@@ -366,7 +376,7 @@ HLE(k_reserve_vrange) {
         uint64_t cand = align_up(hint, align);
         const uint64_t kSearchLimit = 0x40000000000ull;   // 4 TiB — far above any guest range
         while (cand < kSearchLimit) {
-            void* p = mmap((void*)cand, a1, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+            void* p = prosper_mmap_noreplace((void*)cand, a1, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             if (p != MAP_FAILED) {
                 if (a0) *(uint64_t*)a0 = (uint64_t)p;
                 track((uint64_t)p, a1, 0, false, "reserved");
@@ -579,15 +589,15 @@ HLE(k_wait_on_address) {
         ts.tv_sec = punch_secs; ts.tv_nsec = 0; pts = &ts;   // bound this otherwise-infinite wait
     }
     if (synclog()) fprintf(stderr, "[sync] T%ld WAIT.enter  addr=0x%llx *addr=0x%x exp=0x%llx timo_us=%lld caller=eboot+0x%llx\n",
-                           (long)syscall(SYS_gettid), (unsigned long long)a0, *(uint32_t*)a0,
+                           (long)prosper_gettid(), (unsigned long long)a0, *(uint32_t*)a0,
                            (unsigned long long)a1, pts ? (long long)(ts.tv_sec*1000000 + ts.tv_nsec/1000) : -1,
                            (unsigned long long)goff);
     futex_wait_enter();   // registers this waiter so GPU-side label wakes know someone is blocked
-    long r = syscall(SYS_futex, (uint32_t*)a0, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, (uint32_t)a1, pts, nullptr, 0);
+    long r = prosper_futex_wait((uint32_t*)a0, (uint32_t)a1, pts);
     int e = errno;
     futex_wait_exit();
     if (synclog()) fprintf(stderr, "[sync] T%ld WAIT.exit   addr=0x%llx r=%ld errno=%d\n",
-                           (long)syscall(SYS_gettid), (unsigned long long)a0, r, r < 0 ? e : 0);
+                           (long)prosper_gettid(), (unsigned long long)a0, r, r < 0 ? e : 0);
     // Return the RIGHT status to the guest. Previously we always returned 0 (=woken/success), so on a
     // timeout the guest believed its semaphore was signaled → it consumed a resource that was never
     // produced → phantom item → crash in the exception unwinder. On a futex timeout, report the Sony
@@ -601,7 +611,7 @@ HLE(k_wait_on_address) {
             *(volatile uint32_t*)(uintptr_t)a0 = (uint32_t)a1 + 1;
             futex_wake(a0, INT_MAX);
             fprintf(stderr, "[punch] T%ld addr=0x%llx exp=0x%llx -> fabricated signal (ra=eboot+0x%llx, budget=%d)\n",
-                    (long)syscall(SYS_gettid), (unsigned long long)a0, (unsigned long long)a1,
+                    (long)prosper_gettid(), (unsigned long long)a0, (unsigned long long)a1,
                     (unsigned long long)(gra - 0x400000000ull), punch_budget.load());
             return 0;
         }
@@ -616,7 +626,7 @@ HLE(k_wake_by_address) {
     if (synclog()) {
         uint64_t wgoff = ((uint64_t*)__builtin_frame_address(0))[1] - 0x400000000ull;
         fprintf(stderr, "[sync] T%ld WAKE       addr=0x%llx *addr=0x%x n=%d caller=eboot+0x%llx\n",
-                (long)syscall(SYS_gettid), (unsigned long long)a0, *(uint32_t*)a0, n, (unsigned long long)wgoff);
+                (long)prosper_gettid(), (unsigned long long)a0, *(uint32_t*)a0, n, (unsigned long long)wgoff);
     }
     return 0;
 }
@@ -968,7 +978,7 @@ HLE(k_ampr_push_map) {
             // proven by MEMLOG: page 0x11e0df0000 appears as both [lazy-commit] heap and ampr
             // mirror; the mirror map is strictly later, so it clobbers the live page).
             unsigned char vec;
-            bool mirror_live = (mincore((void*)(uintptr_t)mirror, 1, &vec) == 0);
+            bool mirror_live = (prosper_mincore((void*)(uintptr_t)mirror, 1, &vec) == 0);
             void* q = nullptr;
             if (mirror_live) {
                 MLOG("ampr push-map va=0x%llx mirror=0x%llx SKIPPED (target is live guest memory — "

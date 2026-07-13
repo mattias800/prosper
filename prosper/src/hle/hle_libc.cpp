@@ -26,13 +26,19 @@
 // are exactly the guest caller's), setjmp entered here sees the caller's true context. We
 // save only the SysV callee-saved set + rsp + return address (64 bytes) — well within the
 // guest's FreeBSD jmp_buf — and never touch the signal mask (matched pair, self-consistent).
-#if defined(__linux__) && defined(__x86_64__)
+#if (defined(__linux__) || defined(__APPLE__)) && defined(__x86_64__)
 extern "C" uint64_t prosper_setjmp(void*);
 extern "C" void     prosper_longjmp(void*, uint64_t);
+// Mach-O C symbols carry a leading underscore; ELF ones don't.
+#ifdef __APPLE__
+#define PSJ(x) "_" x
+#else
+#define PSJ(x) x
+#endif
 __asm__(
     ".text\n"
-    ".globl prosper_setjmp\n.p2align 4\n"
-    "prosper_setjmp:\n"
+    ".globl " PSJ("prosper_setjmp") "\n.p2align 4\n"
+    PSJ("prosper_setjmp") ":\n"
     "    movq (%rsp), %rax\n"        // guest return address (stub jmp'd here, so [rsp]=caller ret)
     "    movq %rbx,  0(%rdi)\n"
     "    movq %rbp,  8(%rdi)\n"
@@ -45,8 +51,8 @@ __asm__(
     "    movq %rax, 56(%rdi)\n"
     "    xorl %eax, %eax\n"           // first return: 0
     "    ret\n"
-    ".globl prosper_longjmp\n.p2align 4\n"
-    "prosper_longjmp:\n"
+    ".globl " PSJ("prosper_longjmp") "\n.p2align 4\n"
+    PSJ("prosper_longjmp") ":\n"
     "    movq  0(%rdi), %rbx\n"
     "    movq  8(%rdi), %rbp\n"
     "    movq 16(%rdi), %r12\n"

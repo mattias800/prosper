@@ -19,6 +19,7 @@
 #include <sys/uio.h>
 #include <unistd.h>
 #endif
+#include "../host/posix_shim.hpp"   // Darwin: process_vm_readv/writev
 
 namespace prosper {
 

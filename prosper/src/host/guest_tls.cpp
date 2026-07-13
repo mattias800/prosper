@@ -10,7 +10,7 @@
 // pointer per Variant II, and run guest code with %fs = guest TP. HLE handlers (which use host libc/TLS)
 // swap %fs back to the host TCB for the duration of the call — done in the emitted import stubs
 // (exec_image_linux.cpp), which read the stashed host %fs from [guestTP + GUEST_TCB_HOSTFS_OFF].
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
 #include "../hle/dispatch.hpp"
 #include <cstdint>
 #include <cstdlib>
@@ -42,6 +42,16 @@ static constexpr uint32_t TCB_MAGIC       = 0x50524F53u;  // "PROS" — marks OU
 
 void guest_tls_set_templates(const TlsModuleDesc* descs, size_t count) {
     g_enabled = getenv("PROSPER_GUEST_FS") != nullptr;
+#ifdef __APPLE__
+    // Rosetta 2 does not implement rdfsbase/wrfsbase (verified: SIGILL on an M2, macOS 26) and
+    // Darwin has no fsbase API, so guest initial-exec %fs TLS cannot be enabled on this host yet.
+    // The default (host-%fs-aliasing) boot path is unaffected. See docs/PORTING.md.
+    if (g_enabled) {
+        fprintf(stderr, "[guest-tls] PROSPER_GUEST_FS is not supported on macOS (Rosetta lacks "
+                        "wrfsbase); continuing with it DISABLED\n");
+        g_enabled = false;
+    }
+#endif
     g_mods.assign(descs, descs + count);
     // x86-64 Variant II static-TLS layout (glibc _dl_determine_tlsoffset, TLS_TCB_AT_TP): each
     // module's block sits BELOW the thread pointer at a distance rounded to that module's REAL
@@ -112,6 +122,9 @@ uint64_t guest_tls_activate_thread() {
 // area) and simply won't match the magic. NOT used by the GC RT-signal handler, which must KEEP the guest
 // %fs to run the guest's own exception handler. Safe to call unconditionally.
 void guest_fs_enter_host_for_signal() {
+#ifdef __APPLE__
+    return;   // guest-fs is force-disabled on Darwin, and rdfsbase itself SIGILLs under Rosetta
+#endif
     uint64_t fs = rd_fsbase();
     if (fs && *(volatile uint32_t*)(fs + MAGIC_OFF) == TCB_MAGIC)
         wr_fsbase(*(volatile uint64_t*)(fs + HOSTFS_OFF));
@@ -121,6 +134,9 @@ void guest_fs_enter_host_for_signal() {
 // host %fs for the handler's host-libc calls and return the previous (guest) fs so the caller can restore
 // it before returning to guest code. Returns 0 if not on a guest TCB (nothing to restore).
 uint64_t guest_fs_to_host_scoped() {
+#ifdef __APPLE__
+    return 0;   // see guest_fs_enter_host_for_signal
+#endif
     uint64_t fs = rd_fsbase();
     if (fs && *(volatile uint32_t*)(fs + MAGIC_OFF) == TCB_MAGIC) {
         wr_fsbase(*(volatile uint64_t*)(fs + HOSTFS_OFF));
