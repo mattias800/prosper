@@ -4216,8 +4216,21 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords, co
     // skips it; the block's EXEC narrow + the export's OpKill do the per-invocation discard (#102). This is
     // NOT added for the vertex/compute shells (their scc branches are real uniform-ifs / NGG culling).
     for (uint32_t pc : mask_test_branches(ins)) safe_branches.insert(pc);
+    // Which color MRT feeds Vulkan color attachment 0? By the hardware convention MRT0 -> color0, and
+    // prosper binds a single color attachment (color0), so the fragment's one Location-0 output must carry
+    // MRT0's export. Multi-render-target shaders (Dead Cells' world/G-buffer passes) emit their exports in
+    // DESCENDING target order (MRT3, MRT2, MRT1, MRT0), so the old "first EXP with target<=7 wins" wrote a
+    // non-color plane (MRT3) into color0 — the world rendered as that grayscale G-buffer channel instead of
+    // the colored albedo (#566, exact R=G=B / chroma 0). Select the LOWEST-numbered color MRT (MRT0 when
+    // present); single-MRT shaders (target 0 only) are unchanged.
+    uint32_t color_mrt = 0xFFFFFFFFu;
+    for (const auto& in : ins) {
+        if (in.is_end) break;
+        if (in.fmt == Rdna2Format::EXP && in.exp_target <= 7 && in.exp_target < color_mrt)
+            color_mrt = in.exp_target;
+    }
     bool exported = false;
-    auto exp_fn = [&](const Rdna2Inst& in) -> bool {         // EXP MRT0..7 -> the color output
+    auto exp_fn = [&](const Rdna2Inst& in) -> bool {         // EXP MRTn -> the color0 output
         // An export while EXEC is narrowed (lanes killed by an alpha test / v_cmpx and not restored to
         // all-on) must not write the inactive lanes. Lower it to a real fragment discard: OpKill the lanes
         // whose EXEC bit is false, then export from the survivors under full EXEC. This is exactly the
@@ -4225,7 +4238,7 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords, co
         // exec,saved -> shade -> export): the surviving lanes are the ones that passed the test. (When EXEC
         // was never narrowed this is a no-op — the common sRGB/tonemap restore-then-export path.)
         if (rs.exec_narrowed) { b.discard_unless(rs.exec); rs.exec = b.btrue(); rs.exec_narrowed = false; }
-        if (in.exp_target <= 7 && !exported) {
+        if (in.exp_target == color_mrt && !exported) {
             bool eok = true;   // a Special (wave-mask) source has no data value — reject, don't export 0 (#134)
             if (in.exp_compr) {
                 // COMPR: the 4 channels are two f16x2 pairs — src[0] holds (r,g), src[1] holds (b,a).

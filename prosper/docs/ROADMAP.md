@@ -35,9 +35,10 @@ presented, framebuffer CRC == golden" is. Each change adds the check that proves
   live/replay hashes and per-draw/resource isolation; #515 provides reflected SPIR-V/runtime descriptor
   validation in live and offline replay paths. Producer provenance, normal screenshot capture, and the local
   content-metric snapshot guard complete the current first-bad-contract workflow.
-- **Dead Cells cross-title milestone:** deterministic routing now reaches gameplay. HUD and partial composition
-  render, but the world is mostly white (#566). Version-4 captures seed temporal render targets (#568) and isolate
-  the first bad composition at draw 18; its missing 642x362 input has no prior color-target writer. The corrected
+- **Dead Cells cross-title milestone:** deterministic routing now reaches gameplay. The initial mostly-white world
+  in #566 was a diagnostic warmup artifact, not the current renderer output. Version-4 captures seeded temporal
+  render targets (#568) and originally isolated that artifact at draw 18, where a 642x362 input lacked its prior
+  renderer-owned color-target version. The corrected
   dispatch thread/local/group contract (#580), `sceAgcCbSetShRegistersDirect`, and compute direct type-1 V#
   decoding (#574) now execute a valid registered fill program against real guest buffers before submit completion
   (#576). Range provenance proved one submit orders a 642x362 consumer, dispatch 5's fill, then another consumer.

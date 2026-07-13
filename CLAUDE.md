@@ -61,7 +61,8 @@ prosper/
 
 Key docs to orient: `prosper/README.md` (status), `prosper/docs/ROADMAP.md`, `prosper/docs/GRAPHICS.md`,
 `prosper/docs/RENDER_LOOP.md` (the historical render bring-up log), and
-`prosper/docs/MESSENGER_BLACK_RENDER.md` (the current, revisioned Messenger investigation status).
+`prosper/docs/MESSENGER_BLACK_RENDER.md` (the revisioned Messenger investigation status). The current
+Dead Cells graphics handoff and exact reproduction recipe are in `prosper/docs/DEAD_CELLS_STATUS.md`.
 
 ## Historical frontier (superseded 2026-07-11)
 
