@@ -296,6 +296,56 @@ This is exactly the hard sub-problem flagged above for both Windows and macOS. P
 accesses** — the fault handler already decodes instructions at fault sites (SSE4a), so
 trap-and-emulate of `%fs:` operands is in-house technology.
 
+## Windows port status (2026-07-13) — foundation landed on `port/windows-core`, boot NOT yet verified
+
+Developed and compile-verified from the macOS machine via the MinGW-w64 cross-compiler (same GCC
+family CI uses), so every compile/link error is caught locally; **runtime is unverified** — no
+Windows machine and no game dump in CI. This is deliberately a *foundation + handoff*, per the plan's
+"native Windows port" step. A Windows-based agent should pick up from the runtime items below.
+
+**What is done (compiles + links, in CI):**
+- **`exec_image_win.cpp`** — the Win32 sibling of `exec_image_linux.cpp` implementing the full
+  `exec_image.hpp` contract: fixed-address guest mapping (`VirtualAlloc` at the guest bases), import
+  stub region, a **Vectored Exception Handler** (VEH) fault handler with SSE4a `INSERTQ`/`EXTRQ`
+  emulation over `CONTEXT.Xmm*`, lazy-ish recovery via a Rip-redirect to a `longjmp` trampoline,
+  `run_entry` (SysV crt0 stack + `jmp`), `run_guest_inits`, the thread-stack registry, and
+  `VirtualQuery`-based region classification. Linux-only diagnostics (perf_event HWBP/HWWATCH, int3
+  `PROSPER_BP`, PEEK/DUMPAT) are intentionally absent.
+- **The SysV⇄MS-x64 ABI boundary** is done in the emitted stub trampoline, NOT via
+  `__attribute__((sysv_abi))` on handlers. The attribute route was tried and **abandoned**: on MinGW
+  it conflicts with SEH-based C++ exception unwinding (`.seh_handlerdata used outside of .seh_proc
+  block`) and cannot be applied to 537 STL-using handlers. Instead `emit_impl` emits a trampoline that
+  converts the guest's SysV integer args (`rdi rsi rdx rcx r8 r9`) to MS x64 (`rcx rdx r8 r9`,
+  `[rsp+0x20]`, `[rsp+0x28]`, +32B shadow, 16-aligned call) before calling the handler, which stays a
+  plain MS-x64 C++ function. Byte encoding disassembly-verified; the register-move ordering is
+  clobber-safe by construction. `PROSPER_SYSV_ABI` (dispatch.hpp) is now an empty documented marker.
+- `guest_tls.cpp` Windows path (guest `%fs` TLS hard-disabled), `boot_program.cpp` enabled on Windows,
+  `boot_trace` built on Windows (no evdev/Vulkan), CI `Windows MinGW` job builds the whole boot path.
+
+**What is left (runtime work, needs a Windows host):**
+1. **Validate/repair the ABI trampoline at runtime.** Integer args are converted; **XMM/float args are
+   not** (e.g. some libc formatters, `printf`-family) — add float-arg conversion if a title needs it.
+   Confirm the shadow-space/alignment and callee-saved handling against real guest→HLE calls.
+2. **Port the direct/flexible-memory HLE.** `hle_kernel_mem.cpp` is still `__linux__`/`__APPLE__`-only
+   (mmap/memfd/futex); Windows gets only the tiny fallback `register_kernel_mem_hle`. The guest's
+   `sceKernelMapDirectMemory`/`MapFlexibleMemory`/`Mprotect` need `VirtualAlloc`/`VirtualProtect` +
+   `CreateFileMapping`/`MapViewOfFile3` for the CPU/GPU-aliased dmem dual mapping. This is the biggest
+   remaining chunk and is required before the guest can allocate memory.
+3. **Guest `%fs` TLS** — the same wall as macOS (see above). Windows gives user mode no reliable FS
+   base; trap/patch the guest `%fs:` accesses (shadPS4 precedent). Until then guest initial-exec TLS
+   reads the host TEB and is wrong.
+4. **VEH recovery hardening** — recovery resumes `longjmp` on the faulting thread's current stack; a
+   stack-overflow fault needs a guard-page/dedicated-stack story (Linux uses `sigaltstack`).
+5. **Audit the 103 `(HleFn)`-cast handlers** — almost all cast targets are `HLE()`-defined handlers
+   and so route correctly through the trampoline, but confirm none are raw host functions relying on
+   host-ABI arg passing.
+
+**Reproducing the local compile loop (macOS → Windows):** `brew install mingw-w64`, then
+`cmake -S prosper -B build-win -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc
+-DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ -DCMAKE_SYSTEM_NAME=Windows
+-DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE` and `cmake --build build-win`. A Windows agent builds
+natively under MSYS2/UCRT64 exactly as the CI `Windows MinGW` job does.
+
 ## Proposed sequence
 
 1. **Spikes (hours each, no commitment):**

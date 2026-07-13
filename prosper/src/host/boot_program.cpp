@@ -1,8 +1,9 @@
 // boot_program.cpp — see boot_program.hpp. Extracted verbatim from boot_trace's boot sequence
-// (behavior-preserving); the guest-execution substrate is Linux-only, so guard the whole body.
+// (behavior-preserving); backed by whichever exec_image_<os> substrate the platform provides
+// (Linux/macOS: exec_image_linux.cpp; Windows: exec_image_win.cpp).
 #include "boot_program.hpp"
 
-#if defined(__linux__) || defined(__APPLE__)
+#if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
 #include "host/exec_image.hpp"
 #include "hle/dispatch.hpp"
 #include "self/module.hpp"     // PT_SCE_PROCPARAM
@@ -103,10 +104,10 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
 
 } // namespace prosper
 
-#else  // non-Linux: the guest-execution substrate doesn't exist.
+#else  // no guest-execution substrate for this platform.
 namespace prosper {
 bool boot_program(const std::string&, Program&, std::string* err, const std::function<void()>&) {
-    if (err) *err = "boot_program is Linux-only"; return false;
+    if (err) *err = "boot_program: no guest-execution substrate for this platform"; return false;
 }
 } // namespace prosper
 #endif

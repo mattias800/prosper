@@ -397,6 +397,14 @@ if(TARGET prosper_core)
   target_link_libraries(test_writer_provenance PRIVATE prosper_core)
   add_test(NAME writer_provenance_ranges COMMAND test_writer_provenance)
 
+  # Windows guest-execution substrate (exec_image_win.cpp): build boot_trace so the whole boot path
+  # links (proves the substrate + SysV-ABI HLE boundary resolve). No evdev/Vulkan here. The guest boot
+  # itself is not yet verified on Windows — see docs/PORTING.md "Windows".
+  if(WIN32)
+    add_executable(boot_trace tools/boot_trace/boot_trace.cpp)
+    target_link_libraries(boot_trace PRIVATE prosper_core)
+  endif()
+
   # M2+: real memory mapping, trap, boot, and the boot-trace debug tool (Linux + macOS/Rosetta).
   if(UNIX)
     add_executable(boot_trace tools/boot_trace/boot_trace.cpp)

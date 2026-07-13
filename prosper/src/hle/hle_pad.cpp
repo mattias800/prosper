@@ -33,7 +33,7 @@ namespace prosper {
 
 using namespace prosper::input;
 
-#define HLE(name) static uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
+#define HLE(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
                                        uint64_t a3, uint64_t a4, uint64_t a5)
 #define PW(x) ((void*)(uintptr_t)(x))
 

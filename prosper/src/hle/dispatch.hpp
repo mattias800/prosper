@@ -13,8 +13,23 @@
 
 namespace prosper {
 
+// Guest↔host calling-convention boundary. The guest is always System V AMD64 (PS5/FreeBSD ABI).
+// On Linux/macOS the host is *also* SysV, so an HLE handler is a plain C function the guest calls
+// directly. On Windows the host ABI is Microsoft x64, so every function the guest calls directly —
+// the HLE handlers and any host callback the guest invokes — MUST be tagged SysV, or the six
+// integer args (guest: rdi/rsi/rdx/rcx/r8/r9) are read from the wrong registers (MS: rcx/rdx/r8/r9
+// + stack). PROSPER_SYSV_ABI is that tag: `__attribute__((sysv_abi))` on Windows, empty elsewhere.
+// See docs/PORTING.md "Windows". NOTE: we do NOT tag handlers `__attribute__((sysv_abi))` on
+// Windows — that conflicts with SEH-based C++ exception unwinding in MinGW ("`.seh_handlerdata`
+// used outside of `.seh_proc` block"), and 537 STL-using handlers can't all drop exceptions.
+// Instead the guest↔host ABI conversion is done in the emitted import-stub trampoline
+// (exec_image_win.cpp emit_impl/emit_unimpl), so every handler stays a plain host function.
+// PROSPER_SYSV_ABI is therefore empty on all platforms today; it is kept as the single documented
+// marker of the boundary in case a future toolchain makes the attribute viable.
+#define PROSPER_SYSV_ABI
+
 // Generic HLE handler signature (up to 6 integer/pointer args, SysV).
-using HleFn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+using HleFn = PROSPER_SYSV_ABI uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 
 // One unresolved import across the whole linked program (deduped by NID). Its index
 // is the stub slot number; the trap logger names calls via this table.

@@ -49,7 +49,7 @@ namespace { bool sclog() { static int v = getenv("PROSPER_SYNCLOG") ? 1 : 0; ret
 
 namespace prosper {
 
-#define HLE(name) static uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
+#define HLE(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
                                        uint64_t a3, uint64_t a4, uint64_t a5)
 
 // --- mutex attributes (opaque; we back with host pthread_mutexattr_t) ---

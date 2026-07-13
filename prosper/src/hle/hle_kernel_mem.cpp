@@ -33,7 +33,7 @@
 
 namespace prosper {
 
-#define HLE(name) static uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
+#define HLE(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
                                        uint64_t a3, uint64_t a4, uint64_t a5)
 
 namespace {
@@ -1147,7 +1147,7 @@ void register_kernel_mem_hle() {
 
 namespace prosper {
 
-#define HLE(name) static uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
+#define HLE(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
                                        uint64_t a3, uint64_t a4, uint64_t a5)
 
 namespace {

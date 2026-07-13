@@ -154,4 +154,23 @@ uint64_t guest_tls_module_below(uint32_t modid) { return modid < g_below.size() 
 uint64_t guest_tls_total_below() { return g_total_below; }
 
 } // namespace prosper
+
+#elif defined(_WIN32)
+// Windows: guest initial-exec %fs TLS is unsupported (no fsbase API; a separate frontier tracked in
+// docs/PORTING.md). The gate is hard-off, so these are no-ops that keep boot_program/hle_kernel
+// linking. Guest %fs-relative static TLS therefore reads the host TEB — wrong, and the same class of
+// wall as macOS; solving it (trap/patch %fs) is the next Windows step.
+#include "../hle/dispatch.hpp"
+#include <cstdint>
+#include <cstddef>
+namespace prosper {
+void guest_tls_set_templates(const TlsModuleDesc*, size_t) {}
+bool guest_tls_enabled() { return false; }
+uint64_t guest_tls_activate_thread() { return 0; }
+void guest_fs_enter_host_for_signal() {}
+uint64_t guest_fs_to_host_scoped() { return 0; }
+void guest_fs_restore_scoped(uint64_t) {}
+uint64_t guest_tls_module_below(uint32_t) { return 0; }
+uint64_t guest_tls_total_below() { return 0; }
+} // namespace prosper
 #endif
