@@ -330,8 +330,8 @@ bool append_gpu_capture_bundle(GpuCaptureBundle& bundle, const GpuCaptureFile& c
     return true;
 }
 
-bool materialize_gpu_capture_bundle_submit(const GpuCaptureBundle& bundle, size_t submit_index,
-                                           GpuCaptureFile& capture, std::string& error) {
+bool materialize_gpu_capture_bundle_manifest(const GpuCaptureBundle& bundle, size_t submit_index,
+                                             GpuCaptureFile& capture, std::string& error) {
     error.clear();
     if (submit_index >= bundle.submits.size()) { error = "bundle submit index is out of range"; return false; }
     const auto& submit = bundle.submits[submit_index];
@@ -349,6 +349,16 @@ bool materialize_gpu_capture_bundle_submit(const GpuCaptureBundle& bundle, size_
     }
     if (bytes.size() != serialized_bytes) { error = "bundle submit is truncated"; return false; }
     if (!deserialize_gpu_capture(bytes, capture, error)) return false;
+    if (capture.metadata.submit_index != submit.submit_index) {
+        error = "bundle submit identity mismatch"; return false;
+    }
+    return true;
+}
+
+bool materialize_gpu_capture_bundle_submit(const GpuCaptureBundle& bundle, size_t submit_index,
+                                           GpuCaptureFile& capture, std::string& error) {
+    if (!materialize_gpu_capture_bundle_manifest(bundle, submit_index, capture, error)) return false;
+    const auto& submit = bundle.submits[submit_index];
     if (bundle.version >= 2) {
         if (capture.blobs.size() != submit.blob_resource_indices.size() ||
             capture.blobs.size() != submit.blob_bytes_read.size()) {
@@ -394,9 +404,6 @@ bool materialize_gpu_capture_bundle_submit(const GpuCaptureBundle& bundle, size_
             error = "bundle submit logical size mismatch";
             return false;
         }
-    }
-    if (capture.metadata.submit_index != submit.submit_index) {
-        error = "bundle submit identity mismatch"; return false;
     }
     return true;
 }

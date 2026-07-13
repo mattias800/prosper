@@ -1,5 +1,6 @@
 #include "../src/gpu/gpu_timeline.hpp"
 #include "../src/gpu/gpu_capture_bundle.hpp"
+#include "../src/gpu/pm4_registers.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -140,6 +141,7 @@ int main() {
     _putenv_s("PROSPER_GPU_TIMELINE_CAPTURE_PREDECESSOR", predecessor_capture.c_str());
     _putenv_s("PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE", bundle_capture.c_str());
     _putenv_s("PROSPER_GPU_TIMELINE_CAPTURE_DEPTH", "2");
+    _putenv_s("PROSPER_GPU_TIMELINE_CAPTURE_START_TARGET_DIM", "642x362");
 #else
     setenv("PROSPER_GPU_TIMELINE", runtime.c_str(), 1);
     setenv("PROSPER_CAPTURE_TITLE", "runtime-title", 1);
@@ -148,8 +150,15 @@ int main() {
     setenv("PROSPER_GPU_TIMELINE_CAPTURE_PREDECESSOR", predecessor_capture.c_str(), 1);
     setenv("PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE", bundle_capture.c_str(), 1);
     setenv("PROSPER_GPU_TIMELINE_CAPTURE_DEPTH", "2", 1);
+    setenv("PROSPER_GPU_TIMELINE_CAPTURE_START_TARGET_DIM", "642x362", 1);
 #endif
+    GpuState prestart_state;
+    begin_gpu_timeline_submit(40);
+    record_gpu_timeline_submit(prestart_state, 40);
     GpuState predecessor_state;
+    predecessor_state.cx[prosper::agc::Pm4::CB_COLOR0_ATTRIB2] =
+        ((642u - 1u) << 14) | (362u - 1u);
+    predecessor_state.draws.push_back({3});
     predecessor_state.command_order = 120;
     begin_gpu_timeline_submit(41);
     record_gpu_timeline_submit(predecessor_state, 41);
@@ -161,7 +170,7 @@ int main() {
     close_gpu_timeline();
     GpuTimelineFile runtime_timeline;
     CHECK(read_gpu_timeline(runtime, runtime_timeline, error), "runtime hooks produce an inspectable timeline");
-    CHECK(runtime_timeline.presents.size() == 1 && runtime_timeline.submits.size() == 2 &&
+    CHECK(runtime_timeline.presents.size() == 1 && runtime_timeline.submits.size() == 3 &&
           runtime_timeline.presents[0].latest_submit_no == 42,
           "a flip during folding is associated with its active submit");
     CHECK(runtime_timeline.details.size() == 3 && runtime_timeline.details[0].submit_no == 41 &&
@@ -176,6 +185,8 @@ int main() {
           runtime_bundle.submits.size() == 2 && runtime_bundle.submits[0].submit_index == 41 &&
           runtime_bundle.submits[1].submit_index == 42,
           "exact submit selection writes an ordered same-run capture bundle");
+    CHECK(runtime_bundle.submits.front().submit_index == 41,
+          "bundle start target excludes earlier nonmatching submits and includes the first writer");
 
     const auto compat_v2 = base.string() + "-compat-v2.prgtl";
     GpuTimelineWriter compat_writer;

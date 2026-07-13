@@ -1,5 +1,6 @@
 // command_processor.cpp — see command_processor.hpp.
 #include "command_processor.hpp"
+#include "pm4_registers.hpp"
 #include "writer_provenance.hpp"
 #include "hle/sync_futex.hpp"   // wake_label_waiters (shared with sceKernelWaitOnAddress's futex)
 
@@ -1200,7 +1201,17 @@ void GpuState::apply(const Pm4Command& c) {
                     fprintf(stderr, " (off=0x%x val=0x%x)", regs[i].offset, regs[i].value);
                 fprintf(stderr, "\n");
             }
-            for (uint32_t i = 0; i < c.num_regs; i++) file[regs[i].offset] = regs[i].value;
+            for (uint32_t i = 0; i < c.num_regs; i++) {
+                file[regs[i].offset] = regs[i].value;
+                if (c.reg_class == RegClass::Cx &&
+                    regs[i].offset == prosper::agc::Pm4::DB_RENDER_CONTROL &&
+                    (regs[i].value & 0x3u) &&
+                    getenv("PROSPER_DS_CLEARLOG"))
+                    fprintf(stderr,
+                            "[ds-clear-reg] order=%llu value=%08x depth=%u stencil=%u\n",
+                            (unsigned long long)command_order, regs[i].value,
+                            regs[i].value & 1u, (regs[i].value >> 1) & 1u);
+            }
             state_dirty_ = true;   // register state changed -> the next draw needs a fresh snapshot
             break;
         }

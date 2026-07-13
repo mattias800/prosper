@@ -284,9 +284,21 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             }
         }
         if (log) {
-            fprintf(stderr, "[exec] skip draw: recompile failed (vs=%zu fs=%zu; es=0x%llx ps=0x%llx color0=0x%llx)\n",
-                    vs.size(), fs.size(), (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr,
-                    (unsigned long long)rs.color0_base);
+            fprintf(stderr, "[exec] skip draw: recompile failed (vs=%zu fs=%zu; order=%llu "
+                            "es=0x%llx ps=0x%llx color0=0x%llx/%ux%u "
+                            "depth=%d/%d/op%u clear=%d/%g base=0x%llx/0x%llx "
+                            "stencil=%d clear=%d/%u base=0x%llx/0x%llx)\n",
+                    vs.size(), fs.size(),
+                    (unsigned long long)(draw ? draw->command_order : 0),
+                    (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr,
+                    (unsigned long long)rs.color0_base, rs.color0_width, rs.color0_height,
+                    (int)rs.z_enable, (int)rs.z_write_enable, rs.zfunc,
+                    (int)rs.depth_clear_enable, rs.depth_clear_value,
+                    (unsigned long long)rs.depth_read_base,
+                    (unsigned long long)rs.depth_write_base,
+                    (int)rs.stencil_enable, (int)rs.stencil_clear_enable, rs.stencil_clear_value,
+                    (unsigned long long)rs.stencil_read_base,
+                    (unsigned long long)rs.stencil_write_base);
             for (auto [tag, addr] : {std::pair{"vs", rs.es_addr}, std::pair{"ps", rs.ps_addr}}) {
                 RecompileCoverage c = recompile_coverage((const uint32_t*)(uintptr_t)addr, max_shader_dwords);
                 fprintf(stderr, "[exec]   %s coverage: total=%u alu=%u exp=%u tabledep=%u unsupported=%u "

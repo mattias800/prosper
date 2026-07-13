@@ -55,12 +55,24 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
     }
     static std::atomic<int> frame_no{0};
     static std::unordered_map<uint64_t, RttSurf> g_rtt;   // render-to-texture cache (#167)
-    if (getenv("PROSPER_GPU_CAPTURE") || getenv("PROSPER_GPU_TIMELINE_CAPTURE"))
+    if (getenv("PROSPER_GPU_CAPTURE") || getenv("PROSPER_GPU_TIMELINE_CAPTURE") ||
+        getenv("PROSPER_GPU_REPLAY_EXPORT_RTT")) {
         prosper::gpu::set_gpu_capture_rtt_seed_reader([](uint64_t addr, prosper::gpu::GpuCaptureRttSeed& seed) {
             auto it = g_rtt.find(addr); if (it == g_rtt.end()) return false;
             seed.guest_addr = addr; seed.width = it->second.w; seed.height = it->second.h;
             seed.rgba = it->second.rgba; return true;
         });
+        prosper::gpu::set_gpu_capture_rtt_seed_snapshot_reader(
+            [](std::vector<prosper::gpu::GpuCaptureRttSeed>& seeds, std::string&) {
+                seeds.reserve(g_rtt.size());
+                for (const auto& [addr, surface] : g_rtt) {
+                    prosper::gpu::GpuCaptureRttSeed seed;
+                    seed.guest_addr = addr; seed.width = surface.w; seed.height = surface.h;
+                    seed.rgba = surface.rgba; seeds.push_back(std::move(seed));
+                }
+                return true;
+            });
+    }
     if (getenv("PROSPER_GPU_REPLAY_RTT_SEEDS"))
         prosper::gpu::set_gpu_replay_rtt_seed_writer([](const prosper::gpu::GpuCaptureRttSeed& seed, std::string& error) {
             const uint64_t expected = static_cast<uint64_t>(seed.width) * seed.height * 4;

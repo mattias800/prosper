@@ -78,11 +78,16 @@ int main() {
     GpuCaptureBundle loaded;
     CHECK(read_gpu_capture_bundle(path.string(), loaded, error), "checksummed bundle reads");
     GpuCaptureFile restored_first, restored_second;
+    GpuCaptureFile second_manifest;
     CHECK(materialize_gpu_capture_bundle_submit(loaded, 0, restored_first, error) &&
           materialize_gpu_capture_bundle_submit(loaded, 1, restored_second, error) &&
           restored_second.metadata.submit_index == 42 && restored_second.blobs.size() == 1 &&
           restored_second.blobs[0].guest_addr == 0x200000 && restored_second.blobs[0].bytes == blob.bytes,
           "bundle reconstructs an exact validated capture");
+    CHECK(materialize_gpu_capture_bundle_manifest(loaded, 1, second_manifest, error) &&
+          second_manifest.metadata.submit_index == 42 && second_manifest.blobs.size() == 1 &&
+          second_manifest.blobs[0].bytes.empty() && second_manifest.draws.size() == restored_second.draws.size(),
+          "manifest-only materialization exposes submit state without resource payload reconstruction");
     restored_first.blobs[0].bytes[0] ^= 0xff;
     CHECK(restored_second.blobs[0].bytes == blob.bytes,
           "materialized submits own independent mutable resource bytes");

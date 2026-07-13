@@ -48,6 +48,8 @@ struct GpuCaptureBundleStats {
 
 bool append_gpu_capture_bundle(GpuCaptureBundle& bundle, const GpuCaptureFile& capture,
                                std::string& error);
+bool materialize_gpu_capture_bundle_manifest(const GpuCaptureBundle& bundle, size_t submit_index,
+                                             GpuCaptureFile& capture, std::string& error);
 bool materialize_gpu_capture_bundle_submit(const GpuCaptureBundle& bundle, size_t submit_index,
                                            GpuCaptureFile& capture, std::string& error);
 bool compact_gpu_capture_bundle(GpuCaptureBundle& bundle, std::string& error);

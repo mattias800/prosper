@@ -97,8 +97,8 @@ exercised NGS2 lifecycle returns initialized sizes/handles/state and silent outp
 window reaches the Evil Empire splash. #545 was software-render throughput, not a guest deadlock: synchronous
 3840×2160 llvmpipe rendering stretches its ~13,000-submit startup into minutes.
 
-Dead Cells now has a deterministic route through splash/menu into gameplay. HUD and partial composition render,
-but the world is mostly white (#566). Version-4 `.prgcap` captures seed temporal RTT inputs (#568) and isolate the
+Dead Cells now has a deterministic route through splash/menu into gameplay. HUD and partial composition render.
+Version-4 `.prgcap` captures seed temporal RTT inputs (#568) and isolates the
 first bad composition at draw 18; one 642x362 input has no prior color-target writer. The kernel-derived dispatch
 thread/local/group contract (#580), `sceAgcCbSetShRegistersDirect`, and compute direct type-1 V# binding (#574)
 now execute the real fill kernel against guest buffers before submit completion (#576). Range provenance proved
@@ -107,7 +107,10 @@ compute now execute by retained PM4 order (#584), fixing that future-read. The l
 warmup artifact: the 35-second render delay skipped a 642x362 RTT producer, then a replace-copy sampled dispatch
 4's raw all-`0xFF` backing and cached it indefinitely. `PROSPER_RENDER_TARGET_DIM=642x362` preserves the real
 opening vignette/level geometry; #586 now tracks a practical late checkpoint with that history intact. The
-residual seeded replay mismatch (#569) and animation-sensitive exact splash guard (#573) remain separate issues.
+residual seeded replay mismatch (#569) is persistent depth/stencil state outside color RTT seeds: the faithful
+playable closure reuses one 642x362 depth surface across all 883 submits with LESS_OR_EQUAL writes/tests and no
+captured clears, so stale depth rejects most world geometry (#611). The animation-sensitive exact splash guard
+(#573) remains separate.
 
 The current tooling frontier is deterministic offline capture rather than longer live-render windows.
 Native-speed `.prgtl` indexes retain every submit/present boundary, and an exact-submit selector can materialize
@@ -124,8 +127,15 @@ Bundle v2 (#606) now uses fault-safe bulk guest reads plus an exact shared-resou
 1,200-submit full-state run folded 122.97 GiB into 301.1 MiB in 169.4 seconds. Semantic endpoints, rolling
 windows, successful-only exit, final compaction, and `gpu_replay --bundle-tail` prevent timing drift and replay
 holes. A compact two-submit closure resolves both 642x362 edges with no bounded leaves, but its 80-draw endpoint
-is the opening vignette rather than gameplay. Define a stable playable checkpoint and isolate the first bad
-composition under #608 instead of guessing another submit ordinal.
+is the opening vignette rather than gameplay. #608 now identifies the controllable Jump tutorial without a
+submit ordinal: require exactly 90 semantic draws and the 738x420 target at semantic draw index 79..81. Target
+extent or total draw count alone also selects cinematic/transition frames and must not be used as the oracle.
+Use this checkpoint to isolate the first bad composition.
+The faithful playable bundle spans submits 18,165..19,047, stores 158.94 GiB logical state in 739 MiB, resolves
+all 1,764 temporal image dependencies, and renders hash `5759c125812154dc`. A fresh-depth final replay instead
+renders `71b84bdfae53933c`; `gpu_replay --bundle-find-ds ADDR` scans manifest-only DS use in seconds and proves
+the shared surface has no clear intent. Do not treat `--bundle-final-capsule` as exact until its standalone hash
+matches: it snapshots color RTT state, not live Vulkan depth/stencil images.
 Addresses and operation ordinals are run-local. The stale exact Dead Cells snapshot baseline is
 tracked separately in #596 and must not be silently updated.
 `PROSPER_PROVENANCE_DIM=WxH` reports overlapping color, compute, DMA_DATA, and WRITE_DATA writers with
