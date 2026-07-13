@@ -62,7 +62,7 @@ prosper/
 Key docs to orient: `prosper/README.md` (status), `prosper/docs/ROADMAP.md`, `prosper/docs/GRAPHICS.md`,
 `prosper/docs/RENDER_LOOP.md` (the historical render bring-up log), and
 `prosper/docs/MESSENGER_BLACK_RENDER.md` (the revisioned Messenger investigation status). The current
-Dead Cells graphics handoff and exact reproduction recipe are in `prosper/docs/DEAD_CELLS_STATUS.md`.
+Dead Cells graphics status and exact regression recipe are in `prosper/docs/DEAD_CELLS_STATUS.md`.
 
 ## Historical frontier (superseded 2026-07-11)
 
@@ -72,7 +72,7 @@ renderer is wired in; the game's **real pixel shader recompiles to valid SPIR-V*
 **bindless-dynamic vertex-fetch resolution** for the vertex shader — fully specified in
 `prosper/docs/NEXT_STEP_VERTEX_FETCH.md`. This paragraph is historical only.
 
-## Current frontier (2026-07-12)
+## Current frontier (2026-07-13)
 
 The game now **boots through IL2CPP, renders its intro/title/menu, and reaches gameplay with real GPU
 draws.** The old bindless vertex-fetch frontier is complete: both shader stages recompile and dynamic
@@ -98,9 +98,9 @@ exercised NGS2 lifecycle returns initialized sizes/handles/state and silent outp
 window reaches the Evil Empire splash. #545 was software-render throughput, not a guest deadlock: synchronous
 3840×2160 llvmpipe rendering stretches its ~13,000-submit startup into minutes.
 
-Dead Cells now has a deterministic route through splash/menu into gameplay. HUD and partial composition render.
-Version-4 `.prgcap` captures seed temporal RTT inputs (#568) and isolates the
-first bad composition at draw 18; one 642x362 input has no prior color-target writer. The kernel-derived dispatch
+Dead Cells now has a deterministic route through splash/menu into full-color gameplay.
+Version-4 `.prgcap` captures seeded temporal RTT inputs (#568) historically isolated the earlier warmup artifact
+at draw 18; one 642x362 input had no prior color-target writer. The kernel-derived dispatch
 thread/local/group contract (#580), `sceAgcCbSetShRegistersDirect`, and compute direct type-1 V# binding (#574)
 now execute the real fill kernel against guest buffers before submit completion (#576). Range provenance proved
 draw 19 consumes one backing, dispatch 5 fills it, then draw 31 consumes it again in one submit. Graphics spans and
@@ -135,7 +135,7 @@ is the opening vignette rather than gameplay. The preserved #608 playable bundle
 and the 738x420 target at draw 79..81. Current routes use 91..93 draws, exactly 8 dispatches, and the 738x420
 target at draw 80..82; two independent timelines selected only sustained gameplay from about 29.5 seconds onward.
 Target extent or total draw count alone also selects cinematic/transition frames and must not be used as the
-oracle. Use this checkpoint to isolate the first bad composition.
+oracle. This checkpoint established the stable offline baseline used to isolate the composition defects.
 The faithful playable bundle spans submits 18,165..19,047, stores 158.94 GiB logical state in 739 MiB, and
 resolves all 1,764 temporal image dependencies. Its pre-#611/#615 historical hash was `5759c125812154dc`; do
 not use that old absolute hash as a current renderer oracle. A two-submit color-bounded replay remains
@@ -161,6 +161,14 @@ semantic draws. Capture v7 (#618) retains a failed stage fault-safely through `s
 content-deduplicates it, and records exact coverage/opcode/PC, decoded pipeline/launch state, and
 resource/descriptor summaries. Start with `gpu_replay --inspect-only`; extract a raw stage with
 `--dump-failed-shader FAILURE:STAGE PATH` instead of rerunning the title.
+
+The remaining Dead Cells color defect was fixed by #626. Its world shaders emit color exports in descending
+MRT3..MRT0 order; the single-attachment recompiler incorrectly used the first export, presenting a grayscale
+G-buffer plane as color0. Selecting MRT0 restores the full-color Prisoners' Quarters composition. The same PR
+also exposes the directly placed destination V# for a format-copy compute shader, taking the current checkpoint
+from seven to eight realized dispatches. #566 is closed. Use `prosper/docs/DEAD_CELLS_STATUS.md` for the current
+route and regression workflow rather than restarting the completed composition localization.
+
 `--bundle-final-capsule` snapshots both color RTT state and exact valid planes from persistent Vulkan
 depth/stencil images into capture v8 (#569). Capture v8 reads v1-v7 artifacts; pre-v7 failed-operation diagnostics
 report unavailable and pre-v8 captures contain no invented DS seeds. Timeline v6 reads timeline v1-v5

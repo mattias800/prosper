@@ -68,23 +68,15 @@ accepts scripted gamepad input, and renders the first level.
 - ✅ **The Messenger reaches gameplay:** intro, title, menus, save list, dialogue, player, terrain,
   water, structures, and foreground composition render through the first level at native 1920x1080.
   A scripted gamepad route produced a full-resolution sequence that was confirmed against PS5 hardware.
-- 🚧 **Dead Cells reaches gameplay:** deterministic input routing passes its splash and menus into the
-  first playable scene. Graphics and compute now execute by retained PM4 order (#584), fixing a proven
-  future-read. The formerly overbright screenshot was traced to a diagnostic warmup skipping temporal RTT
-  producers. Versioned offline bundles now retain long, exact cross-submit resource history and replay a
-  minimized closure. The preserved #608 bundle used exactly 90 semantic draws with the 738x420 pass at draw
-  79..81. Current routes use 91..93 draws, exactly 8 dispatches, and that pass at draw 80..82. Timeline v6
-  discovers and validates this checkpoint offline without depending on run-local submit ordinals (#594). The
-  faithful 883-submit replay isolated the missing-world symptom to a persistent 642x362 depth surface.
-  Timeline-v5 backing hashes and
-  writer provenance then found the real clear boundary: a supported compute kernel fills the surface's
-  32 KiB HTILE allocation with `0xfffffff0` before drawing. Guest GPU writes now invalidate overlapping
-  cached Vulkan depth images, restoring the rejected gameplay layers in a routed live A/B (#611). The four
-  remaining scene draws used uniform VCCZ-exit light loops; the fragment/vertex recompiler now proves that
-  narrow wave-uniform shape, emits structured loops, and realizes every sampled gameplay draw (#615).
-  Capture v8 snapshots exact persistent Vulkan depth/stencil planes alongside temporal color targets, turning
-  the final composition into a standalone, hash-checked replay checkpoint (#569). The current evidence boundary,
-  reproduction recipe, and remaining work are in [`prosper/docs/DEAD_CELLS_STATUS.md`](prosper/docs/DEAD_CELLS_STATUS.md).
+- ✅ **Dead Cells reaches full-color gameplay:** deterministic input routing passes the splash and menus into
+  the controllable Prisoners' Quarters scene. Graphics and compute execute in retained PM4 order (#584), guest
+  compute writes invalidate overlapping depth-cache state (#611), and the remaining lighting loops recompile
+  through a narrowly proved wave-uniform form (#615). The final grayscale-world defect was MRT selection: the
+  shaders export MRT3..MRT0, while the single-attachment backend previously used the first export. MRT0 now feeds
+  color attachment 0 (#626), restoring the colored atlas, lighting, player, terrain, effects, and HUD. Capture v8
+  preserves the complete color/depth checkpoint and source-image oracle for fast standalone regression replay
+  (#569). The exact route and reproduction workflow are in
+  [`prosper/docs/DEAD_CELLS_STATUS.md`](prosper/docs/DEAD_CELLS_STATUS.md).
 
 **Frontend:** `prosper-app` is a windowed player (SDL3 window + Vulkan present + audio sink +
 evdev/SDL3 controllers + real message/error/IME dialogs), sharing the same boot + render core as the
