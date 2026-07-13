@@ -30,6 +30,58 @@
 #include <string>
 #include <vector>
 
+// Host→guest SysV call trampoline. The guest is System V AMD64; the host is Microsoft x64. On
+// Linux/macOS a GuestInitFn is tagged __attribute__((sysv_abi)) so the compiler marshals the call,
+// but on Windows that attribute breaks MinGW SEH unwinding and PROSPER_SYSV_ABI is empty — so a
+// plain C call `((GuestInitFn)f)(argc, argp)` passes args in the MS x64 registers (rcx/rdx) while
+// the guest reads the SysV registers (rdi/rsi). The guest then acts on garbage argc/argp and jumps
+// wild (observed: a module_start crash landing in host data). This shim moves argc→rdi, argp→rsi
+// (SysV) and calls the guest, saving the MS x64 callee-saved registers the SysV callee is free to
+// clobber (rsi, rdi, and xmm6–xmm15); rbx/rbp/r12–r15 are callee-saved in both ABIs. Returns the
+// guest's rax. run_entry does the equivalent inline (it jmp's and never returns); this is the
+// call-and-return path used for the init/module_start functions.
+extern "C" uint64_t prosper_call_guest_sysv(uint64_t fn, uint64_t argc, uint64_t argp);
+__asm__(
+    ".text\n"
+    ".p2align 4\n"
+    ".globl prosper_call_guest_sysv\n"
+    "prosper_call_guest_sysv:\n"
+    "    pushq %rbp\n"
+    "    movq  %rsp, %rbp\n"
+    "    pushq %rsi\n"
+    "    pushq %rdi\n"
+    "    subq  $176, %rsp\n"           // 10*16 for xmm6-15 (+16 slack); keeps rsp 16-aligned at the call
+    "    movaps %xmm6,    0(%rsp)\n"
+    "    movaps %xmm7,   16(%rsp)\n"
+    "    movaps %xmm8,   32(%rsp)\n"
+    "    movaps %xmm9,   48(%rsp)\n"
+    "    movaps %xmm10,  64(%rsp)\n"
+    "    movaps %xmm11,  80(%rsp)\n"
+    "    movaps %xmm12,  96(%rsp)\n"
+    "    movaps %xmm13, 112(%rsp)\n"
+    "    movaps %xmm14, 128(%rsp)\n"
+    "    movaps %xmm15, 144(%rsp)\n"
+    "    movq  %rcx, %rax\n"           // MS x64: rcx=fn, rdx=argc, r8=argp
+    "    movq  %rdx, %rdi\n"           // argc -> SysV arg0
+    "    movq  %r8,  %rsi\n"           // argp -> SysV arg1
+    "    callq *%rax\n"
+    "    movaps    0(%rsp), %xmm6\n"
+    "    movaps   16(%rsp), %xmm7\n"
+    "    movaps   32(%rsp), %xmm8\n"
+    "    movaps   48(%rsp), %xmm9\n"
+    "    movaps   64(%rsp), %xmm10\n"
+    "    movaps   80(%rsp), %xmm11\n"
+    "    movaps   96(%rsp), %xmm12\n"
+    "    movaps  112(%rsp), %xmm13\n"
+    "    movaps  128(%rsp), %xmm14\n"
+    "    movaps  144(%rsp), %xmm15\n"
+    "    addq  $176, %rsp\n"
+    "    popq  %rdi\n"
+    "    popq  %rsi\n"
+    "    popq  %rbp\n"
+    "    retq\n"
+);
+
 namespace prosper {
 
 // A guest function pointer: called by host code (init arrays, entry) but obeys the guest's SysV ABI.
@@ -43,7 +95,16 @@ namespace {
     // run_entry / run_guest_inits (see the VEH). thread_local is correct: the VEH runs on the
     // faulting thread. Keyed implicitly by being thread_local (no tid needed, unlike the Linux path
     // which must dodge a guest %fs — Windows has no guest %fs swap).
-    thread_local jmp_buf     t_jb;
+    //
+    // We use __builtin_setjmp/__builtin_longjmp, NOT the CRT setjmp/longjmp. On Windows x64 the CRT
+    // longjmp performs a full SEH stack UNWIND (RtlUnwindEx) from the longjmp site back to the setjmp
+    // frame. Our recovery longjmps ACROSS a guest frame and the hand-written prosper_call_guest_sysv
+    // trampoline — neither has Windows .pdata/.xdata unwind info — so RtlUnwindEx walks into frames it
+    // cannot describe and blows the stack (STATUS_STACK_OVERFLOW 0xC00000FD) instead of recovering.
+    // The __builtin_* pair restores only rsp/rbp/rip (no unwind), which is exactly right for crossing
+    // foreign frames — the same simple-register-restore behavior the Linux longjmp has. The buffer is
+    // GCC's fixed 5-word layout.
+    thread_local void*       t_jb[5];
     thread_local volatile int t_armed = 0;
 
     // Fault state latched by the VEH for the BootResult / init-fault report (single-threaded boot use).
@@ -156,7 +217,7 @@ namespace {
         return true;
     }
 
-    __attribute__((noinline)) void veh_recover() { longjmp(t_jb, 1); }   // runs on the faulting thread
+    __attribute__((noinline)) void veh_recover() { __builtin_longjmp(t_jb, 1); }   // runs on the faulting thread
 
     LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
         CONTEXT* c = ep->ContextRecord;
@@ -267,7 +328,7 @@ size_t run_guest_inits(const std::vector<uint64_t>& fns) {
         uint64_t argc = 0, argp = 0;
         for (auto& r : g_modstart_param_ranges)
             if (f >= r.first && f < r.second) { argc = 0x10; argp = (uint64_t)&g_modstart_desc; break; }
-        if (setjmp(t_jb) == 0) { ((GuestInitFn)(uintptr_t)f)(argc, argp); ok++; }
+        if (__builtin_setjmp(t_jb) == 0) { prosper_call_guest_sysv(f, argc, argp); ok++; }
         t_armed = 0;
         if (g_trap_kind) {
             fprintf(stderr, "[prosper] init fn 0x%llx faulted (%s); continuing\n",
@@ -334,8 +395,21 @@ BootResult run_entry(const LoadedImage& img) {
     memcpy((void*)(uintptr_t)top, vecv.data(), vecsz);
     uint64_t sp = top, rdi = sp, rsi = 0;
 
+    // Describe the switched guest stack in the TEB. We `mov %rsp` to `stk` below, but Windows still
+    // thinks the thread's stack is the original host-thread stack (NT_TIB.StackBase/StackLimit). When
+    // a guest fault (e.g. the SSE4a INSERTQ/EXTRQ trap) dispatches, ntdll's KiUserExceptionDispatcher
+    // compares the (guest) rsp against the (host) StackLimit, decides the stack is exhausted, and
+    // raises STATUS_STACK_OVERFLOW (0xC00000FD) instead of delivering the exception to our VEH — so the
+    // very first trap after boot killed the process. Point the TEB at the real guest stack for the
+    // duration of guest execution; restore it on the recovery path (back on the host stack). This is
+    // the standard requirement for running on a manually-allocated stack on Windows.
+    NT_TIB* tib = (NT_TIB*)NtCurrentTeb();
+    void* teb_save_base = tib->StackBase, *teb_save_limit = tib->StackLimit;
+
     g_trap_kind = 0; g_fault_addr = 0; g_fault_rip = 0; t_armed = 1;
-    if (setjmp(t_jb) == 0) {
+    if (__builtin_setjmp(t_jb) == 0) {
+        tib->StackBase  = (void*)((uintptr_t)stk + STK);   // high end (grows down toward StackLimit)
+        tib->StackLimit = stk;                             // low end of the committed guest stack
         register uint64_t e  asm("rax") = img.entry;
         register uint64_t s  asm("r8")  = sp;
         register uint64_t d  asm("r9")  = rdi;
@@ -346,12 +420,13 @@ BootResult run_entry(const LoadedImage& img) {
             : : "r"(e), "r"(s), "r"(d), "r"(si) : "memory");
         r.kind = 0; r.detail = "entry returned";
     } else {
+        tib->StackBase = teb_save_base; tib->StackLimit = teb_save_limit;   // back on the host stack
         r.kind = g_trap_kind; r.detail = trap_detail();
         r.fault_addr = g_fault_addr; r.fault_rip = g_fault_rip;
         r.rbp = g_rbp; r.rsp = g_rsp; r.rax = g_rax; r.rdi = g_rdi;
         r.rsi = g_rsi; r.rdx = g_rdx; r.rbx = g_rbx;
         t_armed = 1;
-        if (setjmp(t_jb) == 0) {
+        if (__builtin_setjmp(t_jb) == 0) {
             uint64_t bp = g_rbp;
             for (int i = 0; i < 24 && bp > 0x10000; i++) {
                 if (!addr_readable(bp) || !addr_readable(bp + 8)) break;
