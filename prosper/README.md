@@ -36,7 +36,9 @@ possible without console keys. Dumps are user-supplied and gitignored.
   submit/present indexes can select one exact submit before renderer sampling and materialize immutable,
   content-deduplicated graphics/compute state plus mixed operation order for offline replay (#594).
   Offline dependency graphs resolve in-submit resource versions and identify deduplicated prior-submit
-  leaves, including temporal read-before-write surfaces, without invoking Vulkan (#595).
+  leaves, including temporal read-before-write surfaces, without invoking Vulkan (#595). Capture v7 retains
+  bounded, content-addressed raw RDNA2 and exact opcode/PC/state diagnostics for unrealized draws/dispatches;
+  `gpu_replay` can inspect and extract the failed stage without rerunning the title (#618).
 - ✅ **Dead Cells reaches gameplay reproducibly:** a deterministic input route passes the splash and menus
   into the first playable scene. The persistent-depth rejection is fixed: timeline-v5 backing hashes and
   compute writer provenance identify Unity's 32 KiB HTILE fill as the per-frame fast clear, and overlapping
@@ -46,7 +48,7 @@ possible without console keys. Dumps are user-supplied and gitignored.
   structurizer now accepts that shape only when each compare operand has a proved wave-uniform reaching
   definition; varying bounds and the compute wave-mask form still reject. Current routed gameplay submits
   realize every semantic draw (#615).
-  Version-6 GPU captures seed temporal render targets, retain complete depth-surface programming, and keep
+  Version-7 GPU captures seed temporal render targets, retain complete depth-surface programming, and keep
   content-addressed resource versions for
   faithful offline isolation (#568/#594); one residual
   live/replay hash mismatch remains (#569). Dispatch thread counts and derived workgroup dimensions,
@@ -63,8 +65,7 @@ possible without console keys. Dumps are user-supplied and gitignored.
   The faithful 883-submit closure resolves 1,764 temporal image dependencies and established the stale-depth
   failure. The draw stream has no `DB_RENDER_CONTROL` clear because hardware observes the compute-written
   HTILE metadata instead; #611 implements that missing cache boundary. #569 still tracks exact depth/stencil
-  checkpoint serialization. #618 tracks capture-side failed-operation diagnostics so the next unsupported
-  shader can be reduced offline without another live title run. The nondeterministic exact-frame Dead Cells
+  checkpoint serialization. The nondeterministic exact-frame Dead Cells
   snapshot guard is tracked separately in #596. UE4's measured GPU boundary remains under its area issues.
 
 The completed Messenger black-render investigation and reusable evidence boundary are recorded in

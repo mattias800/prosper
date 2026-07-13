@@ -107,11 +107,12 @@ latest same-run writer identity for every temporal image leaf in the selected ca
 the consumer submit/operation/range, the in-submit future writer, and either the matched prior graphics
 submit/draw/PM4 order/target extent or an explicit unresolved result.
 
-Version 2 added exactly one bounded detailed submit per run. The linked version-6 `.prgcap` contains
+Version 2 added exactly one bounded detailed submit per run. The linked version-7 `.prgcap` contains
 content-hashed/deduplicated shaders and resource
 bytes, graphics and compute items, complete raw depth-surface programming, and the original mixed PM4 operation
 order. An operation whose shader
-cannot be realized stays in the manifest with `realized=no`; inspection never silently treats a partial
+cannot be realized stays in the manifest with `realized=no`; capture v7 also retains its bounded raw shader,
+stage coverage, first rejected opcode/PC, decoded state, and failure reason. Inspection never silently treats a partial
 submit as complete. A timeline-selected capsule has no live-output hash oracle unless the renderer also
 produced one; replay reports `oracle=no` and renders without pretending an expected pixel hash exists.
 

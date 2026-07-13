@@ -62,7 +62,23 @@ expected hash. `--allow-mismatch` is for an intentional differential such as `--
 ./build-linux/gpu_replay --dump-shader 18:fs /tmp/fragment.spv /tmp/submit.prgcap
 ./build-linux/gpu_replay --dump-compute 0 /tmp/compute.spv /tmp/submit.prgcap
 ./build-linux/gpu_replay --dump-compute-resource 0:2 /tmp/storage.bin /tmp/submit.prgcap
+./build-linux/gpu_replay --dump-failed-shader 0:1 /tmp/failed-fragment.bin /tmp/submit.prgcap
 ```
+
+### Failed operations
+
+Capture v7 retains bounded diagnostics for draws and dispatches that semantic PM4 ordering contains but the
+executor cannot realize. `--inspect-only` prints the failure reason, decoded target/pipeline or compute-launch
+state, every referenced stage address, resource-table presence/count, descriptor issues, recompile coverage,
+and the first rejected opcode/format at its exact dword PC. It also prints the raw RDNA2 content hash, byte
+count, and whether the retained stream reached `s_endpgm`.
+
+`--dump-failed-shader FAILURE:STAGE PATH` writes that raw stream for `shader_inspect` or a focused recompiler
+fixture. Both indices are the zero-based values printed by `--inspect-only`; they are not draw indices. Each raw
+stage is fault-safely read once, content-deduplicated, capped at 64 KiB, and stopped at the first decoded
+`s_endpgm`/unknown instruction or the cap. Total failed-stage data is capped at 64 MiB, diagnostics cannot
+outnumber semantic operations, and every reference/hash is validated while reading. Captures v1-v6 remain
+readable and print `failure-diagnostics: unavailable (capture predates v7)` rather than inventing evidence.
 
 Compute selectors use the realized compute index printed by `--inspect-only`. The resource selector is
 `COMPUTE:BINDING`; it writes the captured pre-dispatch storage-buffer bytes, while `--dump-compute` writes
@@ -87,7 +103,7 @@ restored. The tool rejects a predecessor whose submit number is not earlier. A c
 consumer sampled the retained producer output, but it does not prove faithful closure: graph the predecessor
 and continue if it also has temporal leaves.
 
-`--bundle` reconstructs each captured submit through the normal version-6 validator, executes them in
+`--bundle` reconstructs each captured submit through the normal version-7 validator, executes them in
 ascending order through one renderer instance, and releases each materialized submit before the next.
 The summary reports logical versus unique bytes, per-submit output hashes, and every temporal image leaf:
 
