@@ -3,14 +3,12 @@
 // The Windows sibling of exec_image_linux.cpp. It implements the same exec_image.hpp contract with
 // Win32 primitives instead of POSIX: VirtualAlloc for fixed-address guest mappings, a Vectored
 // Exception Handler (VEH) instead of a SIGSEGV/SIGILL handler, and CONTEXT register access instead
-// of ucontext. The guest is System V AMD64; the host is Microsoft x64 — the guest↔HLE boundary is
-// bridged by PROSPER_SYSV_ABI (dispatch.hpp), and host→guest calls here go through SysV-typed
-// function pointers.
+// of ucontext. The guest is System V AMD64; the host is Microsoft x64. Emitted import stubs marshal
+// guest calls into the host ABI, and prosper_call_guest_sysv marshals host calls into the guest ABI.
 //
-// STATUS (2026-07-13): compile/link-complete and CI-built, but the guest boot is NOT yet verified on
-// Windows. Known remaining work is tracked in docs/PORTING.md "Windows": the direct/flexible memory
-// HLE (hle_kernel_mem.cpp) is still POSIX-only, guest %fs TLS is unsolved (same wall as macOS), the
-// (HleFn)-cast handler ABI audit, and runtime validation of VEH recovery. Diagnostics that depend on
+// STATUS (2026-07-13): runtime-verified through a multi-threaded headless frame-loop boot. Remaining
+// work is tracked in docs/PORTING.md "Windows": wire the Vulkan renderer, preserve physical-memory
+// aliasing, cover float/XMM import arguments, and harden VEH recovery. Diagnostics that depend on
 // Linux perf_event / ptrace (PROSPER_HWBP/HWWATCH/BP/PEEK/DUMPAT) are intentionally absent here.
 #ifdef _WIN32
 
