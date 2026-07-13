@@ -5,6 +5,7 @@
 #include "gpu_dependency_graph.hpp"
 #include "render_state.hpp"
 #include "videoout_present.hpp"
+#include "writer_provenance.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -17,17 +18,24 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <mutex>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
+
+#ifdef __linux__
+#include <sys/uio.h>
+#include <unistd.h>
+#endif
 
 namespace prosper::gpu {
 namespace {
 
 constexpr uint8_t kFileMagic[8] = {'P', 'R', 'G', 'T', 'L', 'N', '\0', '\0'};
 constexpr uint8_t kRecordMagic[4] = {'T', 'L', 'R', 'C'};
-constexpr uint32_t kVersion = 4;
+constexpr uint32_t kVersion = 5;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint32_t kMaxPayloadBytes = 1u << 20;
 constexpr uint32_t kFlushInterval = 256;
@@ -537,6 +545,48 @@ bool runtime_capture_endpoint_matches(const RuntimeDetailRequest& request,
     return false;
 }
 
+bool same_depth_surface(const GpuTimelineDepthSurface& a, const GpuTimelineDepthSurface& b) {
+    return std::tie(a.depth_read_base, a.depth_write_base,
+                    a.stencil_read_base, a.stencil_write_base, a.htile_data_base,
+                    a.db_depth_view, a.db_render_override, a.db_render_override2,
+                    a.db_depth_size_xy, a.db_dfsm_control, a.db_depth_info,
+                    a.db_z_info, a.db_stencil_info, a.db_depth_size, a.db_depth_slice,
+                    a.db_htile_surface, a.db_rmi_l2_cache_control,
+                    a.target_width, a.target_height) ==
+           std::tie(b.depth_read_base, b.depth_write_base,
+                    b.stencil_read_base, b.stencil_write_base, b.htile_data_base,
+                    b.db_depth_view, b.db_render_override, b.db_render_override2,
+                    b.db_depth_size_xy, b.db_dfsm_control, b.db_depth_info,
+                    b.db_z_info, b.db_stencil_info, b.db_depth_size, b.db_depth_slice,
+                    b.db_htile_surface, b.db_rmi_l2_cache_control,
+                    b.target_width, b.target_height);
+}
+
+bool hash_guest_backing(uint64_t addr, uint64_t size, uint64_t& hash) {
+    constexpr uint64_t kMaxHashBytes = 64ull << 20;
+    if (!addr || !size || size > kMaxHashBytes || size > UINT32_MAX) return false;
+    std::vector<uint8_t> bytes(static_cast<size_t>(size));
+#ifdef __linux__
+    size_t done = 0;
+    while (done < bytes.size()) {
+        iovec local{bytes.data() + done, bytes.size() - done};
+        iovec remote{reinterpret_cast<void*>(static_cast<uintptr_t>(addr + done)),
+                     bytes.size() - done};
+        ssize_t copied;
+        do {
+            copied = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+        } while (copied < 0 && errno == EINTR);
+        if (copied <= 0) return false;
+        done += static_cast<size_t>(copied);
+    }
+#else
+    if (!guest_readable(addr, static_cast<uint32_t>(size))) return false;
+    std::memcpy(bytes.data(), reinterpret_cast<const void*>(static_cast<uintptr_t>(addr)), bytes.size());
+#endif
+    hash = gpu_capture_hash(bytes);
+    return true;
+}
+
 bool runtime_submit_has_target(const GpuState& state, uint32_t width, uint32_t height) {
     if (!width || !height) return false;
     for (size_t i = 0; i < state.draws.size(); ++i) {
@@ -703,6 +753,10 @@ bool GpuTimelineWriter::open(const std::string& path, const GpuTimelineMetadata&
 }
 
 bool GpuTimelineWriter::append_submit(const GpuTimelineSubmit& submit, std::string& error) {
+    if (submit.depth_surfaces.size() > 65536) {
+        error = "timeline submit has too many depth surfaces";
+        return false;
+    }
     Bytes payload;
     payload.u64(submit.submit_no);
     payload.u64(submit.process_command_order);
@@ -713,6 +767,31 @@ bool GpuTimelineWriter::append_submit(const GpuTimelineSubmit& submit, std::stri
     payload.u32(submit.dispatch_count);
     payload.u32(submit.color0_width);
     payload.u32(submit.color0_height);
+    // Keep an empty v5 submit byte-identical to v1-v4 so small compatibility fixtures and producers
+    // that do not use depth remain simple. A non-empty tail is explicitly version-gated on read.
+    if (!submit.depth_surfaces.empty()) {
+        payload.u32(static_cast<uint32_t>(submit.depth_surfaces.size()));
+        for (const auto& ds : submit.depth_surfaces) {
+            payload.u64(ds.depth_read_base); payload.u64(ds.depth_write_base);
+            payload.u64(ds.stencil_read_base); payload.u64(ds.stencil_write_base);
+            payload.u64(ds.htile_data_base);
+            payload.u32(ds.db_depth_view); payload.u32(ds.db_render_override);
+            payload.u32(ds.db_render_override2); payload.u32(ds.db_depth_size_xy);
+            payload.u32(ds.db_dfsm_control); payload.u32(ds.db_depth_info);
+            payload.u32(ds.db_z_info); payload.u32(ds.db_stencil_info);
+            payload.u32(ds.db_depth_size); payload.u32(ds.db_depth_slice);
+            payload.u32(ds.db_htile_surface); payload.u32(ds.db_rmi_l2_cache_control);
+            payload.u32(ds.target_width); payload.u32(ds.target_height);
+            payload.u32(ds.draw_count); payload.u32(ds.depth_test_count);
+            payload.u32(ds.depth_write_count); payload.u32(ds.clear_count);
+            payload.u32(ds.compare_mask);
+            payload.u32(ds.backing_hash_mask); payload.u64(ds.depth_backing_hash);
+            payload.u64(ds.stencil_backing_hash); payload.u64(ds.htile_backing_hash);
+            payload.u32(ds.backing_writer_kind); payload.u64(ds.backing_writer_sequence);
+            payload.u64(ds.backing_writer_addr); payload.u64(ds.backing_writer_size);
+            payload.u64(ds.backing_writer_order); payload.u64(ds.backing_writer_identity);
+        }
+    }
     return impl_->append(RecordType::Submit, payload, error);
 }
 
@@ -895,8 +974,42 @@ bool read_gpu_timeline(const std::string& path, GpuTimelineFile& timeline, std::
                 !p.u64(submit.first_command_order) || !p.u64(submit.last_command_order) ||
                 !p.u64(submit.color0_base) || !p.u32(submit.draw_count) ||
                 !p.u32(submit.dispatch_count) || !p.u32(submit.color0_width) ||
-                !p.u32(submit.color0_height) || p.left) {
+                !p.u32(submit.color0_height)) {
                 error = "invalid timeline submit record";
+                return false;
+            }
+            if (version >= 5 && p.left) {
+                uint32_t surface_count = 0;
+                if (!p.u32(surface_count) || surface_count > 65536) {
+                    error = "invalid timeline depth-surface count";
+                    return false;
+                }
+                submit.depth_surfaces.resize(surface_count);
+                for (auto& ds : submit.depth_surfaces) {
+                    if (!p.u64(ds.depth_read_base) || !p.u64(ds.depth_write_base) ||
+                        !p.u64(ds.stencil_read_base) || !p.u64(ds.stencil_write_base) ||
+                        !p.u64(ds.htile_data_base) || !p.u32(ds.db_depth_view) ||
+                        !p.u32(ds.db_render_override) || !p.u32(ds.db_render_override2) ||
+                        !p.u32(ds.db_depth_size_xy) || !p.u32(ds.db_dfsm_control) ||
+                        !p.u32(ds.db_depth_info) || !p.u32(ds.db_z_info) ||
+                        !p.u32(ds.db_stencil_info) || !p.u32(ds.db_depth_size) ||
+                        !p.u32(ds.db_depth_slice) || !p.u32(ds.db_htile_surface) ||
+                        !p.u32(ds.db_rmi_l2_cache_control) || !p.u32(ds.target_width) ||
+                        !p.u32(ds.target_height) || !p.u32(ds.draw_count) ||
+                        !p.u32(ds.depth_test_count) || !p.u32(ds.depth_write_count) ||
+                        !p.u32(ds.clear_count) || !p.u32(ds.compare_mask) ||
+                        !p.u32(ds.backing_hash_mask) || !p.u64(ds.depth_backing_hash) ||
+                        !p.u64(ds.stencil_backing_hash) || !p.u64(ds.htile_backing_hash) ||
+                        !p.u32(ds.backing_writer_kind) || !p.u64(ds.backing_writer_sequence) ||
+                        !p.u64(ds.backing_writer_addr) || !p.u64(ds.backing_writer_size) ||
+                        !p.u64(ds.backing_writer_order) || !p.u64(ds.backing_writer_identity)) {
+                        error = "invalid timeline depth-surface record";
+                        return false;
+                    }
+                }
+            }
+            if (p.left) {
+                error = "invalid timeline submit record size";
                 return false;
             }
             timeline.submits.push_back(submit);
@@ -1007,6 +1120,81 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
     for (const auto& draw : state.draws) {
         submit.first_command_order = std::min(submit.first_command_order, draw.command_order);
         submit.last_command_order = std::max(submit.last_command_order, draw.command_order);
+        const RenderState rs = extract_render_state(draw.state ? *draw.state : state);
+        if (!rs.z_enable && !rs.z_write_enable && !rs.stencil_enable &&
+            !rs.depth_clear_enable && !rs.stencil_clear_enable)
+            continue;
+        GpuTimelineDepthSurface candidate;
+        candidate.depth_read_base = rs.depth_read_base;
+        candidate.depth_write_base = rs.depth_write_base;
+        candidate.stencil_read_base = rs.stencil_read_base;
+        candidate.stencil_write_base = rs.stencil_write_base;
+        candidate.htile_data_base = rs.htile_data_base;
+        candidate.db_depth_view = rs.db_depth_view;
+        candidate.db_render_override = rs.db_render_override;
+        candidate.db_render_override2 = rs.db_render_override2;
+        candidate.db_depth_size_xy = rs.db_depth_size_xy;
+        candidate.db_dfsm_control = rs.db_dfsm_control;
+        candidate.db_depth_info = rs.db_depth_info;
+        candidate.db_z_info = rs.db_z_info;
+        candidate.db_stencil_info = rs.db_stencil_info;
+        candidate.db_depth_size = rs.db_depth_size;
+        candidate.db_depth_slice = rs.db_depth_slice;
+        candidate.db_htile_surface = rs.db_htile_surface;
+        candidate.db_rmi_l2_cache_control = rs.db_rmi_l2_cache_control;
+        candidate.target_width = rs.color0_width;
+        candidate.target_height = rs.color0_height;
+        auto found = std::find_if(submit.depth_surfaces.begin(), submit.depth_surfaces.end(),
+            [&](const auto& existing) { return same_depth_surface(existing, candidate); });
+        if (found == submit.depth_surfaces.end()) {
+            static const std::pair<uint32_t, uint32_t> hash_dimensions = [] {
+                uint32_t width = 0, height = 0;
+                const char* value = std::getenv("PROSPER_GPU_TIMELINE_DEPTH_HASH_DIM");
+                if (!value || std::sscanf(value, "%ux%u", &width, &height) != 2)
+                    width = height = 0;
+                return std::pair{width, height};
+            }();
+            if (candidate.target_width == hash_dimensions.first &&
+                candidate.target_height == hash_dimensions.second) {
+                const uint64_t pixels = static_cast<uint64_t>(candidate.target_width) *
+                                        candidate.target_height;
+                if (hash_guest_backing(candidate.depth_read_base, pixels * 4,
+                                       candidate.depth_backing_hash))
+                    candidate.backing_hash_mask |= 1u;
+                if (hash_guest_backing(candidate.stencil_read_base, pixels,
+                                       candidate.stencil_backing_hash))
+                    candidate.backing_hash_mask |= 2u;
+                // One HTILE dword summarizes an 8x8 depth block; guest allocations are 64 KiB
+                // aligned/padded. Do not infer its size from the next plane address: allocations can
+                // be non-contiguous, and hashing the gap produced a false "HTILE changed" signal.
+                const uint64_t blocks = static_cast<uint64_t>((candidate.target_width + 7u) / 8u) *
+                                        ((candidate.target_height + 7u) / 8u);
+                const uint64_t htile_bytes = (blocks * 4u + 0xffffu) & ~0xffffull;
+                if (hash_guest_backing(candidate.htile_data_base, htile_bytes,
+                                       candidate.htile_backing_hash))
+                    candidate.backing_hash_mask |= 4u;
+                auto consider_writer = [&](uint64_t addr, uint64_t size) {
+                    const auto writer = last_guest_write_overlap(addr, size);
+                    if (!writer || writer->sequence <= candidate.backing_writer_sequence) return;
+                    candidate.backing_writer_kind = static_cast<uint32_t>(writer->kind) + 1u;
+                    candidate.backing_writer_sequence = writer->sequence;
+                    candidate.backing_writer_addr = writer->addr;
+                    candidate.backing_writer_size = writer->size;
+                    candidate.backing_writer_order = writer->order;
+                    candidate.backing_writer_identity = writer->identity;
+                };
+                consider_writer(candidate.depth_read_base, pixels * 4);
+                consider_writer(candidate.stencil_read_base, pixels);
+                consider_writer(candidate.htile_data_base, htile_bytes);
+            }
+            submit.depth_surfaces.push_back(candidate);
+            found = std::prev(submit.depth_surfaces.end());
+        }
+        ++found->draw_count;
+        found->depth_test_count += rs.z_enable;
+        found->depth_write_count += rs.z_write_enable;
+        found->clear_count += rs.depth_clear_enable || rs.stencil_clear_enable;
+        if (rs.z_enable && rs.zfunc < 32) found->compare_mask |= 1u << rs.zfunc;
     }
     for (const auto& dispatch : state.dispatches) {
         submit.first_command_order = std::min(submit.first_command_order, dispatch.command_order);

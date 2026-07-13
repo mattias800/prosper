@@ -73,16 +73,21 @@ VideoOut flip. `gpu_timeline <path> [--records]` inspects the checksummed index 
 independent of `PROSPER_RENDER_EVERY`. To materialize one exact indexed submit without rendering the
 warmup, set `PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT=N` and
 `PROSPER_GPU_TIMELINE_CAPTURE=<path>.prgcap` on a second run. Version-2 detail records link the capsule;
-version-5 capsules deduplicate content-addressed shader/resource versions and retain mixed draw/dispatch
-order plus explicit unrealized operations. Selection is intentionally bounded to the consumer and an optional
+version-6 capsules deduplicate content-addressed shader/resource versions, retain complete raw depth-surface
+programming, and preserve mixed draw/dispatch order plus explicit unrealized operations. Selection is
+intentionally bounded to the consumer and an optional
 immediate predecessor. Explicit-depth `.prgbundle` capture provides bounded recursive cross-submit closure;
 automatic present-to-producer selection remains #595.
-Timeline version 4 retains a sliding graphics-target window plus full-run aggregate lifetime metadata when a
+Timeline version 5 retains a sliding graphics-target window plus full-run aggregate lifetime metadata when a
 detailed capture is requested. `PROSPER_GPU_TIMELINE_HISTORY=N` raises the sliding window to at most 65536.
 Producer records identify the latest overlapping prior submit/draw/PM4 order, earliest observed graphics
 writer, write/submit counts, truncation, and raw first-writer clear/target state. Raw clear registers are
 provenance, not proof of an implicit hardware clear. The timeline intentionally retains no delayed pointers
 to mutable guest bytes.
+Every v5 submit also records distinct DS plane/HTILE identities, raw view/format/size programming, target
+extents, and test/write/clear counts. `gpu_timeline FILE --depth-summary [WxH]` groups their full lifetimes.
+For a focused run, `PROSPER_GPU_TIMELINE_DEPTH_HASH_DIM=WxH` adds guest depth/stencil/HTILE hashes and latest
+overlapping writer provenance without realizing general resources; use it before attempting a full bundle.
 Set `PROSPER_GPU_TIMELINE_CAPTURE_PREDECESSOR=<path>.prgcap` to snapshot exact submit `N-1` at producer
 time alongside selected submit `N`. Replay the pair with `gpu_replay --prepend producer consumer output`.
 This is a one-level probe; graph the producer and recurse when it also reads a temporal version.
@@ -107,6 +112,9 @@ are not serialized yet (#569/#611), so complete color seeds do not guarantee equ
 work without replaying the bundle.
 `gpu_replay --bundle-find-ds ADDR` scans compact manifests for guest depth/stencil use, writes, clears, compare
 ops, and target extents without reconstructing resource payloads or invoking Vulkan.
+`gpu_replay --bundle-ds-summary` groups every DS-active draw by complete captured identity/programming and
+reports lifetime transitions manifest-only. Use `--legacy-htile-before-stencil` only for the preserved pre-v6
+Dead Cells bundle whose allocation relationship is independently proven; current captures store real HTILE.
 `gpu_replay --through-operation N` preserves the inclusive mixed graphics/compute prefix and is the preferred
 final-composition bisect after a seeded capsule has matched the full bundle hash.
 `gpu_replay --bundle-compact PATH` removes dictionary resources/chunks unreachable from retained rolling
@@ -152,13 +160,16 @@ composite/scanout draws; a single `--draw N` remains supported.
 `--dump-resource DRAW:vs|ps:BINDING PATH` writes one captured resource's exact backing bytes for
 external numeric/image inspection without dereferencing the original guest address.
 `--dump-shader DRAW:vs|fs PATH` writes the captured SPIR-V module for validation/disassembly.
+`--dump-compute N PATH` writes one realized compute SPIR-V module, and
+`--dump-compute-resource N:BINDING PATH` writes its exact pre-dispatch storage-buffer bytes.
 
-For skipped-compute producer provenance, `PROSPER_COMPUTELOG=1` records each `DispatchDirect` packet's
+For compute producer provenance, `PROSPER_COMPUTELOG=1` records each `DispatchDirect` packet's
 threadgroup counts, compute-program address/hash, and AGC-resolved resources from the register state at
 that exact packet. Add `PROSPER_COMPUTELOG_DIM=WxH` to emit only dispatches referencing an image with
 those dimensions (for example `1024x32` for Messenger's grading LUT). `PROSPER_COMPUTELOG=all` also
-prints a per-submit no-match line while a dimension filter is active. Compute remains unexecuted; this
-trace identifies work and resource contracts that the HLE currently skips.
+prints a per-submit no-match line while a dimension filter is active. Supported compute executes through
+Vulkan in retained PM4 order. `PROSPER_COMPUTELOG_CODE=0x...` and `PROSPER_COMPUTELOG_SIZE=N` restrict
+writeback before/after hashes to a matching program and/or storage-buffer size during long live runs.
 
 `PROSPER_PROVENANCE_DIM=WxH` retains every decoded `CB_COLOR0_BASE` write across submits, then reports
 the last matching writer whenever a draw samples an image of that size. Descriptor resolution can be

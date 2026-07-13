@@ -57,6 +57,14 @@ int main() {
         { P::DB_Z_WRITE_BASE,    0x00210000u }, { P::DB_Z_WRITE_BASE_HI, 0x00000021u },
         { P::DB_STENCIL_READ_BASE,  0x00220000u }, { P::DB_STENCIL_READ_BASE_HI,  0x00000021u },
         { P::DB_STENCIL_WRITE_BASE, 0x00230000u }, { P::DB_STENCIL_WRITE_BASE_HI, 0x00000021u },
+        { P::DB_DEPTH_VIEW, 0x04002001u },
+        { P::DB_RENDER_OVERRIDE, 0x00000011u }, { P::DB_RENDER_OVERRIDE2, 0x00000022u },
+        { P::DB_HTILE_DATA_BASE, 0x00240000u }, { P::DB_HTILE_DATA_BASE_HI, 0x00000021u },
+        { P::DB_DEPTH_SIZE_XY, 0x01230234u }, { P::DB_DFSM_CONTROL, 0x00000033u },
+        { P::DB_DEPTH_INFO, 0x00000044u }, { P::DB_Z_INFO, 0x00000055u },
+        { P::DB_STENCIL_INFO, 0x00000066u }, { P::DB_DEPTH_SIZE, 0x00000077u },
+        { P::DB_DEPTH_SLICE, 0x00000088u }, { P::DB_HTILE_SURFACE, 0x00000099u },
+        { P::DB_RMI_L2_CACHE_CONTROL, 0x000000AAu },
         { P::CB_COLOR_CONTROL,   0x00CC0010u },
         // CB_BLEND0_CONTROL: ENABLE(bit30) | SRCBLEND=4/SrcAlpha | DESTBLEND=5/OneMinusSrcAlpha | COMB_FCN=0/Add
         { P::CB_BLEND0_CONTROL,  (1u << 30) | (4u << 0) | (5u << 8) | (0u << 5) },
@@ -142,6 +150,10 @@ int main() {
           rs.stencil_read_base == rdna2_addr(0x00220000u, 0x21u) &&
           rs.stencil_write_base == rdna2_addr(0x00230000u, 0x21u),
           "guest depth/stencil read/write surface identities are extracted");
+    CHECK(rs.db_depth_view == 0x04002001u && rs.htile_data_base == rdna2_addr(0x00240000u, 0x21u) &&
+          rs.db_depth_size_xy == 0x01230234u && rs.db_z_info == 0x55u &&
+          rs.db_stencil_info == 0x66u && rs.db_htile_surface == 0x99u,
+          "depth view, HTILE, format, and extent programming is retained");
 
     // #371: depth clear value. The sample stream programs no DB_DEPTH_CLEAR, so resolve defaults it by
     // the compare op — 0.0 for GREATER (this stream), 1.0 for LESS — never a fixed 0.5. A programmed
@@ -156,6 +168,11 @@ int main() {
               "resolved state preserves stencil clear intent/value/surface identity");
         CHECK(pd.stencil_test_val_export_enable && pd.stencil_op_val_export_enable,
               "resolved state preserves fragment shader stencil-export intent");
+        CHECK(pd.db_depth_view == rs.db_depth_view && pd.htile_data_base == rs.htile_data_base &&
+              pd.db_depth_info == rs.db_depth_info && pd.db_depth_size == rs.db_depth_size &&
+              pd.db_depth_slice == rs.db_depth_slice &&
+              pd.db_rmi_l2_cache_control == rs.db_rmi_l2_cache_control,
+              "resolved state preserves complete depth-surface programming");
         RenderState less_rs = rs; less_rs.zfunc = 1u;   // LESS
         CHECK(resolve_pipeline_state(less_rs).depth_clear_value == 1.0f,
               "no DB_DEPTH_CLEAR + LESS -> depth clears to 1.0 (far), not 0.5");

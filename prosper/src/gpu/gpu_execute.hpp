@@ -150,6 +150,13 @@ struct ComputeItem {
 
 using LiveComputeFn = std::function<bool(const std::vector<ComputeItem>& items)>;
 
+// Guest GPU writes can change backing memory represented by a persistent host-side image. Backends
+// register one observer so guest-memory-producing backends can invalidate overlapping cached surfaces
+// without making prosper_core depend on Vulkan.
+using GuestGpuWriteObserver = std::function<void(uint64_t addr, uint64_t size)>;
+void set_guest_gpu_write_observer(GuestGpuWriteObserver observer);
+void notify_guest_gpu_write(uint64_t addr, uint64_t size);
+
 // Register the synchronous live compute backend. execute_compute_dispatches realizes every retained
 // dispatch from its state snapshot and invokes the backend in stream order.
 void set_submit_compute(LiveComputeFn fn);

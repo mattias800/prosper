@@ -16,6 +16,7 @@ PROSPER_PAD_SCRIPT=@scripts/dead-cells/reach-first-gameplay.pad \
 
 ./build-linux/gpu_timeline /tmp/dead-cells.prgtl
 ./build-linux/gpu_timeline /tmp/dead-cells.prgtl --records
+./build-linux/gpu_timeline /tmp/dead-cells.prgtl --depth-summary 642x362
 ```
 
 Capture a selected submit and, optionally, its immediate predecessor from the same run:
@@ -81,7 +82,19 @@ variables are set.
 
 ## Current boundary
 
-Version 4 remains backward-compatible with version-1 through version-3 indexes. For every selected temporal
+Version 5 remains backward-compatible with version-1 through version-4 indexes. Every submit now retains a
+compact manifest of distinct depth/stencil surfaces without realizing shaders or copying general resources:
+plane and HTILE bases, raw view/format/size/override programming, target extent, draw/test/write/clear counts,
+and compare-op coverage. `gpu_timeline FILE --depth-summary [WxH]` groups complete lifetimes and reports raw
+programming transitions. This is the fast first check for a stale persistent DS cache identity.
+
+Set `PROSPER_GPU_TIMELINE_DEPTH_HASH_DIM=WxH` only for a focused native run. Matching submits hash the readable
+guest depth, stencil, and padded HTILE spans and record the latest overlapping graphics/compute/DMA/WRITE_DATA
+writer. The summary reports distinct backing versions and transitions; unlike a full `.prgcap`, it does not copy
+every shader/resource payload. This mode enabled writer provenance automatically and identified Dead Cells'
+exact HTILE fill without the multi-minute full-bundle capture attempted first.
+
+Version 4 added full-run temporal-image lifetime metadata. For every selected temporal
 image leaf it adds an online full-run target lifetime: earliest/latest graphics writer, matching writes and
 submits, retained-window start, independent lifetime/window truncation flags, and the earliest writer's raw
 clear words, color-control mode, target mask, and format. Lifetime aggregation is keyed by target range, so
@@ -94,9 +107,10 @@ latest same-run writer identity for every temporal image leaf in the selected ca
 the consumer submit/operation/range, the in-submit future writer, and either the matched prior graphics
 submit/draw/PM4 order/target extent or an explicit unresolved result.
 
-Version 2 added exactly one bounded detailed submit per run. The linked version-5 `.prgcap` contains
+Version 2 added exactly one bounded detailed submit per run. The linked version-6 `.prgcap` contains
 content-hashed/deduplicated shaders and resource
-bytes, graphics and compute items, and the original mixed PM4 operation order. An operation whose shader
+bytes, graphics and compute items, complete raw depth-surface programming, and the original mixed PM4 operation
+order. An operation whose shader
 cannot be realized stays in the manifest with `realized=no`; inspection never silently treats a partial
 submit as complete. A timeline-selected capsule has no live-output hash oracle unless the renderer also
 produced one; replay reports `oracle=no` and renders without pretending an expected pixel hash exists.

@@ -181,6 +181,73 @@ inline const RenderVkCtx& render_vk_ctx() {
     return c;
 }
 
+struct PersistentDsKey {
+    uint64_t dr = 0, dw = 0, sr = 0, sw = 0, htile = 0;
+    uint32_t w = 0, h = 0, fmt = 0;
+    bool operator==(const PersistentDsKey& o) const {
+        return dr == o.dr && dw == o.dw && sr == o.sr && sw == o.sw && htile == o.htile &&
+               w == o.w && h == o.h && fmt == o.fmt;
+    }
+};
+
+struct PersistentDsKeyHash {
+    size_t operator()(const PersistentDsKey& k) const {
+        size_t hash = 1469598103934665603ull;
+        auto mix = [&](uint64_t v) { hash ^= static_cast<size_t>(v); hash *= 1099511628211ull; };
+        mix(k.dr); mix(k.dw); mix(k.sr); mix(k.sw); mix(k.htile);
+        mix(k.w); mix(k.h); mix(k.fmt);
+        return hash;
+    }
+};
+
+struct PersistentDsImage {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    bool layout_initialized = false;
+    bool depth_valid = false;
+    bool stencil_valid = false;
+};
+
+inline std::unordered_map<PersistentDsKey, PersistentDsImage, PersistentDsKeyHash>&
+persistent_ds_cache() {
+    static std::unordered_map<PersistentDsKey, PersistentDsImage, PersistentDsKeyHash> cache;
+    return cache;
+}
+
+inline bool guest_ranges_overlap(uint64_t a, uint64_t a_size, uint64_t b, uint64_t b_size) {
+    if (!a || !a_size || !b || !b_size) return false;
+    return a < b + b_size && b < a + a_size;
+}
+
+// The host image is deliberately detached from guest tiled depth/stencil memory. A guest-side GPU
+// write to any plane base therefore makes the cached Vulkan contents stale. HTILE fast clears are
+// especially important: Unity fills the metadata allocation without emitting DB_RENDER_CONTROL clear
+// bits, and hardware treats the surface as cleared on its next use (#611).
+inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size) {
+    if (!addr || !size) return 0;
+    size_t invalidated = 0;
+    for (auto& [key, image] : persistent_ds_cache()) {
+        const uint64_t depth_size = static_cast<uint64_t>(key.w) * key.h * 4;
+        const uint64_t stencil_size = static_cast<uint64_t>(key.w) * key.h;
+        const uint64_t htile_blocks = static_cast<uint64_t>((key.w + 7) / 8) *
+                                      ((key.h + 7) / 8);
+        const uint64_t htile_size = (htile_blocks * 4 + 0x7fff) & ~0x7fffull;
+        if (!guest_ranges_overlap(addr, size, key.dr, depth_size) &&
+            !guest_ranges_overlap(addr, size, key.dw, depth_size) &&
+            !guest_ranges_overlap(addr, size, key.sr, stencil_size) &&
+            !guest_ranges_overlap(addr, size, key.sw, stencil_size) &&
+            !guest_ranges_overlap(addr, size, key.htile, htile_size)) continue;
+        image.depth_valid = false;
+        image.stencil_valid = false;
+        ++invalidated;
+    }
+    if (invalidated && getenv("PROSPER_DSLOG"))
+        fprintf(stderr, "[ds] guest-write addr=%llx size=%llu invalidated=%zu\n",
+                (unsigned long long)addr, (unsigned long long)size, invalidated);
+    return invalidated;
+}
+
 inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& draws, uint32_t W, uint32_t H,
                                               const uint8_t* seed_rgba = nullptr,
                                               const float* clear_rgba = nullptr,
@@ -257,35 +324,20 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             (d.ps->depth_test_enable && d.ps->depth_compare_op != VK_COMPARE_OP_ALWAYS &&
                                         d.ps->depth_compare_op != VK_COMPARE_OP_NEVER);
     }
-    struct DsKey {
-        uint64_t dr, dw, sr, sw; uint32_t w, h, fmt;
-        bool operator==(const DsKey& o) const {
-            return dr == o.dr && dw == o.dw && sr == o.sr && sw == o.sw &&
-                   w == o.w && h == o.h && fmt == o.fmt;
-        }
-    };
-    struct DsKeyHash {
-        size_t operator()(const DsKey& k) const {
-            size_t h = 1469598103934665603ull;
-            auto mix = [&](uint64_t v) { h ^= (size_t)v; h *= 1099511628211ull; };
-            mix(k.dr); mix(k.dw); mix(k.sr); mix(k.sw); mix(k.w); mix(k.h); mix(k.fmt); return h;
-        }
-    };
-    struct DsImage {
-        VkImage image = VK_NULL_HANDLE;
-        VkDeviceMemory memory = VK_NULL_HANDLE;
-        VkImageView view = VK_NULL_HANDLE;
-        bool layout_initialized = false;
-        bool depth_valid = false;
-        bool stencil_valid = false;
-    };
-    static std::unordered_map<DsKey, DsImage, DsKeyHash> ds_cache;
-    DsImage* cached_ds = nullptr;
-    DsKey ds_key{};
+    PersistentDsImage* cached_ds = nullptr;
+    PersistentDsKey ds_key{};
     if (persistent_ds) {
+        uint64_t htile_identity = identity->htile_data_base;
+        // Captures through v5 did not serialize DB_HTILE_DATA_BASE. The explicit replay migration
+        // switch recovers one preserved artifact whose manifest proves Unity allocated HTILE in the
+        // 64 KiB block immediately before stencil. Never infer this layout for live/current state.
+        if (!htile_identity && getenv("PROSPER_GPU_REPLAY_LEGACY_HTILE_BEFORE_STENCIL") &&
+            identity->stencil_read_base >= 0x10000)
+            htile_identity = identity->stencil_read_base - 0x10000;
         ds_key = {identity->depth_read_base, identity->depth_write_base,
-                  identity->stencil_read_base, identity->stencil_write_base, W, H, (uint32_t)DFMT};
-        cached_ds = &ds_cache[ds_key];
+                  identity->stencil_read_base, identity->stencil_write_base,
+                  htile_identity, W, H, (uint32_t)DFMT};
+        cached_ds = &persistent_ds_cache()[ds_key];
         dimg = cached_ds->image; dmem = cached_ds->memory; dview = cached_ds->view;
         ds_layout_initialized = cached_ds->layout_initialized;
         depth_was_valid = cached_ds->depth_valid;
@@ -296,13 +348,13 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         const uint64_t id = ++call_id;
         fprintf(stderr,
                 "[ds] call=%llu size=%ux%u draws=%zu use=%d/%d persistent=%d valid=%d/%d/%d "
-                "key=%llx/%llx/%llx/%llx fmt=%u initial=%g/%u\n",
+                "key=%llx/%llx/%llx/%llx htile=%llx fmt=%u initial=%g/%u\n",
                 (unsigned long long)id, W, H, draws.size(), (int)use_depth, (int)use_stencil,
                 (int)persistent_ds, (int)ds_layout_initialized,
                 (int)depth_was_valid, (int)stencil_was_valid,
                 (unsigned long long)ds_key.dr, (unsigned long long)ds_key.dw,
                 (unsigned long long)ds_key.sr, (unsigned long long)ds_key.sw,
-                ds_key.fmt, depth_clear, stencil_clear);
+                (unsigned long long)ds_key.htile, ds_key.fmt, depth_clear, stencil_clear);
         for (size_t i = 0; i < draws.size(); ++i) {
             const auto* ps = draws[i].ps;
             if (!ps) {
@@ -312,7 +364,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             }
             fprintf(stderr,
                     "[ds] call=%llu draw=%zu bases=%llx/%llx/%llx/%llx "
-                    "depth=%d/%d/op%u clear=%d/%g stencil=%d clear=%d/%u\n",
+                    "depth=%d/%d/op%u clear=%d/%g stencil=%d clear=%d/%u "
+                    "view=%08x htile=%llx hsurf=%08x info=%08x/%08x/%08x "
+                    "size=%08x/%08x/%08x\n",
                     (unsigned long long)id, i,
                     (unsigned long long)ps->depth_read_base,
                     (unsigned long long)ps->depth_write_base,
@@ -321,7 +375,10 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     (int)ps->depth_test_enable, (int)ps->depth_write_enable,
                     ps->depth_compare_op, (int)ps->depth_clear_enable, ps->depth_clear_value,
                     (int)ps->stencil_enable, (int)ps->stencil_clear_enable,
-                    ps->stencil_clear_value);
+                    ps->stencil_clear_value, ps->db_depth_view,
+                    (unsigned long long)ps->htile_data_base, ps->db_htile_surface,
+                    ps->db_depth_info, ps->db_z_info, ps->db_stencil_info,
+                    ps->db_depth_size_xy, ps->db_depth_size, ps->db_depth_slice);
         }
     }
 

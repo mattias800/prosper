@@ -32,7 +32,7 @@ namespace prosper::gpu {
 namespace {
 
 constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
-constexpr uint32_t kVersion = 5;
+constexpr uint32_t kVersion = 6;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -148,6 +148,11 @@ void write_pipeline(Writer& w, const ResolvedPipelineState& p) {
     w.u64(p.depth_read_base); w.u64(p.depth_write_base); w.u64(p.stencil_read_base); w.u64(p.stencil_write_base);
     for (const auto& face : p.raw_stencil_op) for (auto v : face) w.u32(v);
     w.u32(p.db_shader_control); w.u8(p.stencil_test_val_export_enable); w.u8(p.stencil_op_val_export_enable);
+    w.u32(p.db_depth_view); w.u32(p.db_render_override); w.u32(p.db_render_override2);
+    w.u64(p.htile_data_base); w.u32(p.db_depth_size_xy); w.u32(p.db_dfsm_control);
+    w.u32(p.db_depth_info); w.u32(p.db_z_info); w.u32(p.db_stencil_info);
+    w.u32(p.db_depth_size); w.u32(p.db_depth_slice); w.u32(p.db_htile_surface);
+    w.u32(p.db_rmi_l2_cache_control);
 }
 
 bool read_pipeline(Reader& r, ResolvedPipelineState& p, uint32_t version) {
@@ -184,6 +189,12 @@ bool read_pipeline(Reader& r, ResolvedPipelineState& p, uint32_t version) {
     for (auto& face : p.raw_stencil_op) for (auto& v : face) if (!r.u32(v)) return false;
     if (!r.u32(p.db_shader_control) || !r.u8(b)) return false; p.stencil_test_val_export_enable = b != 0;
     if (!r.u8(b)) return false; p.stencil_op_val_export_enable = b != 0;
+    if (version < 6) return true;
+    if (!r.u32(p.db_depth_view) || !r.u32(p.db_render_override) || !r.u32(p.db_render_override2) ||
+        !r.u64(p.htile_data_base) || !r.u32(p.db_depth_size_xy) || !r.u32(p.db_dfsm_control) ||
+        !r.u32(p.db_depth_info) || !r.u32(p.db_z_info) || !r.u32(p.db_stencil_info) ||
+        !r.u32(p.db_depth_size) || !r.u32(p.db_depth_slice) || !r.u32(p.db_htile_surface) ||
+        !r.u32(p.db_rmi_l2_cache_control)) return false;
     return true;
 }
 
