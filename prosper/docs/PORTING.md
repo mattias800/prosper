@@ -296,12 +296,50 @@ This is exactly the hard sub-problem flagged above for both Windows and macOS. P
 accesses** — the fault handler already decodes instructions at fault sites (SSE4a), so
 trap-and-emulate of `%fs:` operands is in-house technology.
 
-## Windows port status (2026-07-13) — foundation landed on `port/windows-core`, boot NOT yet verified
+## Windows port status (2026-07-13) — the guest now BOOTS through module init into guest code
 
-Developed and compile-verified from the macOS machine via the MinGW-w64 cross-compiler (same GCC
-family CI uses), so every compile/link error is caught locally; **runtime is unverified** — no
-Windows machine and no game dump in CI. This is deliberately a *foundation + handoff*, per the plan's
-"native Windows port" step. A Windows-based agent should pick up from the runtime items below.
+The foundation (below) was compile-verified via MinGW-w64; since then a **Windows host has
+runtime-verified the boot**. The guest now links its modules, runs its module-init functions,
+reaches the real entry point, and executes deep guest code — stopping only at the confirmed
+**guest `%fs` TLS wall** (details below). `boot_trace.exe` goes from "crash at the first init fn"
+to a full `RUN ENDED` report. Three runtime bugs were fixed to get here (commits on
+`port/windows-core`):
+
+- **Direct/flexible-memory HLE ported to Win32** (`hle_kernel_mem.cpp` `#else` block). The pool
+  bookkeeping + VA tracker are copied verbatim from POSIX; mappings are backed by private
+  `VirtualAlloc`/`VirtualProtect`/`VirtualFree`. Phys-offset aliasing is NOT preserved (Win32 view
+  granularity is 64 KiB vs the guest's 16 KiB) — fine for Unity/IL2CPP (Messenger), a follow-up for
+  UE4 MallocBinned3. The guest now allocates + maps its pools.
+- **Host→guest SysV call trampoline** (`prosper_call_guest_sysv`). `run_guest_inits` called the guest
+  init fns with a plain C call, which on Windows uses the MS x64 ABI (args in rcx/rdx) while the guest
+  reads SysV (rdi/rsi) — the `module_start` got a garbage `argp` and jumped wild. The asm shim marshals
+  argc→rdi/argp→rsi and preserves the MS callee-saved regs the SysV callee may clobber (rsi/rdi/xmm6-15).
+- **VEH recovery uses `__builtin_setjmp`/`__builtin_longjmp`, not the CRT pair.** The CRT `longjmp`
+  does a full SEH unwind (`RtlUnwindEx`) from the fault site back to `setjmp`, which cannot traverse
+  the guest frame or the hand-written trampoline (no `.pdata`/`.xdata`) → `STATUS_STACK_OVERFLOW`
+  instead of recovery. The `__builtin_*` pair restores rsp/rbp/rip with no unwind (matching Linux).
+  Also: `run_entry` now points `NT_TIB.StackBase/StackLimit` at the switched guest stack during guest
+  execution so exception dispatch on that stack doesn't spuriously report stack exhaustion.
+
+### The Windows frontier: guest `%fs` TLS (confirmed + de-risked)
+
+Boot stops at `eboot+0x808f35`: `mov %fs:0x0,%rax` (a TLS self-pointer load) faulting at
+`addr=0x0`, with **zero Sony imports called yet** — the classic uninitialized-TLS signature. Guest
+`%fs` base is 0 on Windows, so `fs:`-relative reads resolve to low linear addresses.
+
+An FS-base persistence probe (spike 1b) settled the strategy: **user-mode `rdfsbase`/`wrfsbase` work**
+(CR4.FSGSBASE is enabled on Win10 1709+), and immediately after `wrfsbase` the guest TCB reads back
+correctly — **but Windows resets the FS base to 0 across any kernel transition** (a `Sleep(50)` in the
+probe zeroed it). It restores the per-thread FS base from a kernel-saved value on every context
+switch/syscall, and `wrfsbase` doesn't update that saved copy, so "set once and leave it" is unviable.
+
+Viable design (no per-HLE-call swap needed — the *host* uses `%gs`, only the *guest* uses `%fs`, so
+they don't collide, unlike Linux): **set the guest TCB via `wrfsbase` on each guest entry/thread
+start, and in the VEH re-apply `wrfsbase(guest_tcb)` and retry (CONTINUE_EXECUTION, no rip advance)
+whenever an `fs`-prefixed instruction faults with the base reset.** That costs one fault only after a
+kernel transition that lands between two guest `fs` accesses — not per access — so it's cheap. Needs:
+per-thread guest-TCB tracking, a Windows `guest_tls.cpp` TCB setup path, entry `wrfsbase`, and an
+fs-prefix decoder in the VEH (a guard against re-fault loops on genuine null derefs).
 
 **What is done (compiles + links, in CI):**
 - **`exec_image_win.cpp`** — the Win32 sibling of `exec_image_linux.cpp` implementing the full
@@ -322,20 +360,20 @@ Windows machine and no game dump in CI. This is deliberately a *foundation + han
 - `guest_tls.cpp` Windows path (guest `%fs` TLS hard-disabled), `boot_program.cpp` enabled on Windows,
   `boot_trace` built on Windows (no evdev/Vulkan), CI `Windows MinGW` job builds the whole boot path.
 
-**What is left (runtime work, needs a Windows host):**
-1. **Validate/repair the ABI trampoline at runtime.** Integer args are converted; **XMM/float args are
-   not** (e.g. some libc formatters, `printf`-family) — add float-arg conversion if a title needs it.
-   Confirm the shadow-space/alignment and callee-saved handling against real guest→HLE calls.
-2. **Port the direct/flexible-memory HLE.** `hle_kernel_mem.cpp` is still `__linux__`/`__APPLE__`-only
-   (mmap/memfd/futex); Windows gets only the tiny fallback `register_kernel_mem_hle`. The guest's
-   `sceKernelMapDirectMemory`/`MapFlexibleMemory`/`Mprotect` need `VirtualAlloc`/`VirtualProtect` +
-   `CreateFileMapping`/`MapViewOfFile3` for the CPU/GPU-aliased dmem dual mapping. This is the biggest
-   remaining chunk and is required before the guest can allocate memory.
-3. **Guest `%fs` TLS** — the same wall as macOS (see above). Windows gives user mode no reliable FS
-   base; trap/patch the guest `%fs:` accesses (shadPS4 precedent). Until then guest initial-exec TLS
-   reads the host TEB and is wrong.
-4. **VEH recovery hardening** — recovery resumes `longjmp` on the faulting thread's current stack; a
-   stack-overflow fault needs a guard-page/dedicated-stack story (Linux uses `sigaltstack`).
+**What is left (runtime work, on a Windows host):**
+1. **Guest `%fs` TLS — the current blocker.** See "The Windows frontier" above: implement the
+   entry-`wrfsbase` + VEH-retry design. This is the one thing between here and the same
+   HLE-completeness boot depth as Linux.
+2. ~~Port the direct/flexible-memory HLE~~ — **DONE** (private-`VirtualAlloc` port; phys-aliasing
+   deferred for UE4).
+3. **Validate/repair the guest→HLE ABI trampoline for XMM/float args.** Integer args are converted
+   and now runtime-exercised through init; **XMM/float args are still not converted** (e.g. some libc
+   formatters / `printf`-family) — add float-arg conversion when a title needs it.
+4. **VEH recovery hardening for stack-overflow faults** — recovery resumes on the faulting thread's
+   current stack; a true stack-overflow fault still needs a guard-page/dedicated-stack story (Linux
+   uses `sigaltstack`). The `__builtin_longjmp` change fixed the cross-frame-unwind crash; this is the
+   separate genuine-overflow case. Also: `PROSPER_CRASHPEEK` faults on Windows (the IL2CPP klass
+   walker needs the same `guest_readable` guards the Linux path has).
 5. **Audit the 103 `(HleFn)`-cast handlers** — almost all cast targets are `HLE()`-defined handlers
    and so route correctly through the trampoline, but confirm none are raw host functions relying on
    host-ABI arg passing.
