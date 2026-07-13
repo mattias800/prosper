@@ -6,8 +6,10 @@
 #include "../src/gpu/rdna2_to_spirv.hpp"
 #include "render_runner.h"
 #include "spirv_triangle.h"     // kTriVertSpv: placeholder vertex shader (positions)
+#include <algorithm>
 #include <cstdio>
 #include <cstdint>
+#include <iterator>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -126,6 +128,45 @@ int main() {
                       "divergent loop: 4 iterations, nested if 2 -> (0.5, 1.0, 0.5)");
             }
         }
+    }
+
+    // VCCZ-EXIT LOOP (#615 - Dead Cells' per-pixel light accumulation shape).
+    // VCC is this fragment invocation's loop predicate: for (s0=0; s0<v1=4; ++s0) v0 += 0.25.
+    // The hardware branch exits when the wave VCC mask is empty. Here the bound is a constant moved
+    // into every lane, so VCC is provably uniform and the per-invocation branch is exact. The
+    // unconditional back-edge and carried scalar/vector values lower through OpLoopMerge + OpPhi.
+    {
+        const uint32_t ps[] = {
+            0xBE800380u, 0x7E000280u, 0x7E020284u, 0x7E0602F2u,
+            0x7D020200u, 0xBF860004u, 0x060000FFu, 0x3E800000u,
+            0x81008100u, 0xBF82FFFAu, 0x7E020300u, 0x7E040300u,
+            0xF800080Fu, 0x03020100u, 0xBF810000u,
+        };
+        std::vector<uint32_t> frg = recompile_fragment(ps, sizeof(ps)/sizeof(ps[0]));
+        CHECK(!frg.empty(), "recompiled VCCZ-exit light-accumulation LOOP PS -> SPIR-V");
+        if (!frg.empty()) {
+            std::vector<uint8_t> px2 = prosper::test::render_triangle_rgba(vert, frg, W, H);
+            CHECK(px2.size() == (size_t)W*H*4, "rendered the VCCZ-exit loop PS");
+            if (px2.size() == (size_t)W*H*4) {
+                const uint8_t* cc = &px2[((size_t)(H/2) * W + W/2) * 4];
+                printf("  vccz loop center=(%u,%u,%u,%u) expect white\n", cc[0],cc[1],cc[2],cc[3]);
+                CHECK(cc[0] > 0xF0 && cc[1] > 0xF0 && cc[2] > 0xF0,
+                      "VCCZ loop: exactly 4 iterations of 0.25 -> 1.0 white");
+            }
+        }
+
+        uint32_t varying_ps[sizeof(ps)/sizeof(ps[0])];
+        std::copy(std::begin(ps), std::end(ps), varying_ps);
+        varying_ps[2] = 0x7E020302u;  // v_mov_b32 v1,v2: a lane-varying/unproven loop bound
+        CHECK(recompile_fragment(varying_ps, sizeof(varying_ps)/sizeof(varying_ps[0])).empty(),
+              "a varying-VCC loop remains rejected (wave-empty branch is not lane-local)");
+
+        uint32_t exec_mutating_ps[sizeof(ps)/sizeof(ps[0])];
+        std::copy(std::begin(ps), std::end(ps), exec_mutating_ps);
+        exec_mutating_ps[3] = 0xBEFE04C1u;  // s_mov_b64 exec,-1 between the bound definition and compare
+        CHECK(recompile_fragment(exec_mutating_ps,
+                                 sizeof(exec_mutating_ps)/sizeof(exec_mutating_ps[0])).empty(),
+              "a VCC loop with intervening EXEC mutation remains rejected");
     }
 
     // EXECNZ-back-edge loop with a mid-body vccz BREAK (#273 — DOLL's scalar-indexed unroll shape):

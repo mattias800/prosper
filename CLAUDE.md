@@ -141,10 +141,19 @@ provenance, which found compute program `0x401aec200` filling the exact 32 KiB H
 DS entries become invalid so the next use follows the existing compare-derived clear path. A routed live A/B
 restores the foreground/platform/HUD layers that remain black with invalidation disabled. The explicit
 `--legacy-htile-before-stencil` switch supplies the omitted HTILE identity only for the preserved pre-v6 bundle.
+The four repeated Dead Cells fragment failures were canonical VCCZ-exit light-accumulation loops. #615 adds a
+stage-specific proof: every VOPC input must be scalar/inline/literal or have a nearest overlapping VGPR
+definition from an unmodified uniform VOP1 move/conversion. Only then can the wave-empty VCC test lower to a
+per-invocation structured loop; varying bounds and compute remain fail-visible. `shader_inspect` decodes raw
+`PROSPER_SHADER_DUMP` files with exact dword PCs and branch targets. Current live gameplay samples realize all
+semantic draws; #618 tracks retaining the failed shader/state in future capsules.
 Do not treat `--bundle-final-capsule` as an exact DS checkpoint: it snapshots color RTT state, not live Vulkan
 depth/stencil images (#569). Capture v6 and timeline v5 remain backward-compatible with old local artifacts.
-Addresses and operation ordinals are run-local. The stale exact Dead Cells snapshot baseline is
-tracked separately in #596 and must not be silently updated.
+Addresses and operation ordinals are run-local. The #608 `90 draws + 738x420 at draw 79..81` conjunction is
+also historical: a fresh 2026-07-13 route reached sustained 90-91-draw gameplay submits but did not match it.
+Recalibrate the semantic selector under #594 before a new exact capture. The Dead Cells splash guard alternates
+between hashes `8429fedd427b...` and `891a80fc9178...` on one unchanged build; replace that nondeterministic
+exact-frame contract under #596 rather than silently choosing or re-blessing either hash.
 `PROSPER_PROVENANCE_DIM=WxH` reports overlapping color, compute, DMA_DATA, and WRITE_DATA writers with
 submit/item/PM4 ordinals.
 `PROSPER_RESOURCE_HASH_DIM=WxH` correlates raw and sampled hashes with those writers at each live draw;

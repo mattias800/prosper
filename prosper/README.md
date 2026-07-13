@@ -42,6 +42,10 @@ possible without console keys. Dumps are user-supplied and gitignored.
   compute writer provenance identify Unity's 32 KiB HTILE fill as the per-frame fast clear, and overlapping
   guest GPU writes now invalidate the detached Vulkan depth cache (#611). A routed live A/B restores the
   foreground/platform/HUD layers that remained black without invalidation.
+  Four repeated fragment failures were uniform VCCZ-exit light-accumulation loops. The stage-specific
+  structurizer now accepts that shape only when each compare operand has a proved wave-uniform reaching
+  definition; varying bounds and the compute wave-mask form still reject. Current routed gameplay submits
+  realize every semantic draw (#615).
   Version-6 GPU captures seed temporal render targets, retain complete depth-surface programming, and keep
   content-addressed resource versions for
   faithful offline isolation (#568/#594); one residual
@@ -52,14 +56,16 @@ possible without console keys. Dumps are user-supplied and gitignored.
   chunks, rolling semantic endpoints, final compaction, and suffix replay (#606). A fixed 1,200-submit full-state
   run reduced 122.97 GiB logical data to 301.1 MiB. A compact exact two-submit closure resolves both temporal
   642×362 edges without bounded leaves, but the first 80-draw semantic endpoint is the opening vignette rather
-  than playable gameplay. #608 now selects the controllable Jump tutorial by combining an exact 90-draw submit
-  with the 738x420 pass at semantic draw 79..81, and tracks its exact history and first bad composition.
+  than playable gameplay. #608 selected the controllable Jump tutorial by combining an exact 90-draw submit
+  with the 738x420 pass at semantic draw 79..81, and tracked its exact history and first bad composition. That
+  exact conjunction is now a preserved-capture recipe: current fresh routes reach sustained gameplay but no
+  longer match it, so selector recalibration remains under #594.
   The faithful 883-submit closure resolves 1,764 temporal image dependencies and established the stale-depth
   failure. The draw stream has no `DB_RENDER_CONTROL` clear because hardware observes the compute-written
   HTILE metadata instead; #611 implements that missing cache boundary. #569 still tracks exact depth/stencil
-  checkpoint serialization, and #615 tracks four fragment control-flow failures at the playable endpoint.
-  The stale exact Dead Cells
-  snapshot baseline is tracked separately in #596. UE4's measured GPU boundary remains under its area issues.
+  checkpoint serialization. #618 tracks capture-side failed-operation diagnostics so the next unsupported
+  shader can be reduced offline without another live title run. The nondeterministic exact-frame Dead Cells
+  snapshot guard is tracked separately in #596. UE4's measured GPU boundary remains under its area issues.
 
 The completed Messenger black-render investigation and reusable evidence boundary are recorded in
 [`docs/MESSENGER_BLACK_RENDER.md`](docs/MESSENGER_BLACK_RENDER.md). Current work is tracked in GitHub

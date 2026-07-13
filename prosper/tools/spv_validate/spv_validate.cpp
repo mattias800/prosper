@@ -156,6 +156,12 @@ int main(int argc, char** argv) {
                             0x060404FFu,0x3E800000u,0xBEFE0404u,0x060606FFu,0x3E800000u,0x81008100u,
                             0xBF82FFF4u,0xBEFE0402u,0xF800180Fu,0x05020302u,0xBF810000u};
       dump(dir, "fragment_divergent_loop", recompile_fragment(c, sizeof(c)/4, nullptr)); }
+    // Fragment: uniform VCCZ-exit light-accumulation loop (#615, Dead Cells). The compare's VGPR
+    // bound is moved from an inline uniform value, making the wave-empty VCC branch structurizable.
+    { const uint32_t c[] = {0xBE800380u,0x7E000280u,0x7E020284u,0x7E0602F2u,0x7D020200u,
+                            0xBF860004u,0x060000FFu,0x3E800000u,0x81008100u,0xBF82FFFAu,
+                            0x7E020300u,0x7E040300u,0xF800080Fu,0x03020100u,0xBF810000u};
+      dump(dir, "fragment_uniform_vcc_loop", recompile_fragment(c, sizeof(c)/4, nullptr)); }
     // Fragment: EXECNZ-back-edge loop with a mid-body vccz break (#273 — the scalar-indexed unroll).
     { const uint32_t c[] = {0xBE82047Eu,0xBE800380u,0xBE810383u,0x7E040280u,0x7E0A02F2u,0xBF880009u,
                             0xBF0A0100u,0x8584807Eu,0xBEEA0404u,0xBEFE0404u,0xBF860004u,0x060404FFu,

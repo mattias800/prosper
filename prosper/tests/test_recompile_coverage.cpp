@@ -37,6 +37,15 @@ int main() {
     CHECK(recompile_valu(vcc_branch, sizeof(vcc_branch)/sizeof(vcc_branch[0]), 2, 3).empty(),
           "the production recompiler rejects the unsafe forward VCC branch");
 
+    // A VCCZ-exit loop is valid in vertex/fragment stages where one SPIR-V invocation models one
+    // hardware lane (#615), but not in the 64-lane compute shell: compute VCC needs a wave reduction.
+    const uint32_t compute_vcc_loop[] = {
+        0xBE800380u, 0x7E000280u, 0x7E020284u, 0x7D020200u, 0xBF860004u,
+        0x060000FFu, 0x3E800000u, 0x81008100u, 0xBF82FFFAu, 0xBF810000u,
+    };
+    CHECK(recompile_valu(compute_vcc_loop, sizeof(compute_vcc_loop)/sizeof(compute_vcc_loop[0]), 0, 0).empty(),
+          "a VCCZ-exit loop remains rejected by the compute shell (wave-mask condition)");
+
     // A forward s_cbranch_execz that REJOINS LIVE CODE is only safe to linearize when its skipped block
     // is EXEC-predicated VGPR writes. Here the block is a scalar write (s_mov_b32 s0,1) and the branch
     // target is a live use of s0 (v_mov_b32 v0,s0) — the scalar write is NOT dead, so linearizing would

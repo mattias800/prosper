@@ -49,10 +49,12 @@ presented, framebuffer CRC == golden" is. Each change adds the check that proves
   with `0xfffffff0` before every scene pass. Timeline-v5 depth backing hashes/writer provenance found the exact
   writer, and guest GPU writes now invalidate overlapping persistent DS cache entries (#611). A routed live A/B
   restores the layers rejected without that boundary.
-- **Immediate milestone:** finish the remaining Dead Cells composition gaps using the same semantic checkpoint.
-  Implement the four repeated fragment control-flow failures (#615), resolve exact depth/stencil checkpointing (#569),
-  and refresh the stale animation-sensitive snapshot (#596/#573). Keep extending the workflow across Unity and
-  Unreal targets rather than returning to long unstructured live traces.
+  The four remaining fragment failures were uniform VCCZ-exit light loops; narrowly proved vertex/fragment
+  structurization now restores them while varying and compute-wave forms still reject (#615).
+- **Immediate milestone:** refresh the now-stale Dead Cells semantic checkpoint under #594, resolve exact
+  depth/stencil checkpointing (#569), retain bounded failed-operation diagnostics in captures (#618), and replace
+  the nondeterministic animation-sensitive exact snapshot (#596/#573). Keep extending the workflow across Unity
+  and Unreal targets rather than returning to long unstructured live traces.
 
 ## Historical status (2026-07-05) - retained for the milestone log
 

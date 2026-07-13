@@ -27,10 +27,10 @@ investigation, add `PROSPER_RENDER_TARGET_DIM=642x362` to preserve the level's
 RTT chain; this is much slower and currently remains in the opening vignette at
 the 35-second checkpoint. Do not use the fast route as a visual golden guard.
 
-## Playable semantic checkpoint
+## Historical playable semantic checkpoint (#608)
 
-Do not select the first 738x420 target: it also occurs in the skippable opening. The validated Jump-tutorial
-endpoint combines all of these predicates:
+Do not select the first 738x420 target: it also occurs in the skippable opening. The preserved #608
+Jump-tutorial capture used all of these predicates:
 
 ```bash
 PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM=738x420 \
@@ -39,9 +39,16 @@ PROSPER_GPU_TIMELINE_CAPTURE_MIN_DRAWS=90 \
 PROSPER_GPU_TIMELINE_CAPTURE_MAX_DRAWS=90
 ```
 
-The draw index is zero-based in the raw semantic sequence. Fresh native-speed runs selected different submit
-numbers but replayed the same controllable scene with 86 realized draws, seven realized dispatches, the Jump
-prompt, and the full HUD. Nearby cinematic and transition captures are explicitly outside this conjunction.
+The draw index is zero-based in the raw semantic sequence. Those #608 runs selected different submit numbers
+but replayed the same controllable scene with 86 realized draws, seven realized dispatches, the Jump prompt,
+and the full HUD. Nearby cinematic and transition captures were outside this conjunction.
+
+This is no longer a guaranteed current selector. A 2026-07-13 fresh route after #611 reached sustained
+gameplay submits with 90-91 semantic draws, eight dispatches, and the 642x362 scene-depth family, but did not
+match `738x420 @ draw 79..81` plus exactly 90 draws during a bounded 90-second run. Treat the conjunction as
+a preserved-capture recipe only. Record a native-speed `.prgtl`, confirm gameplay from its submit/depth
+sequence, and derive a new exact conjunction before starting an expensive capsule or bundle. Refreshing that
+route-independent checkpoint remains under #594.
 
 The faithful playable reference on #608 retained 883 submits and renders hash
 `5759c125812154dc`. A final-submit replay with fresh depth renders `71b84bdfae53933c` instead. Use
@@ -50,5 +57,8 @@ reconstructing resource payloads or invoking Vulkan. Timeline-v5 `--depth-summar
 capture with `PROSPER_GPU_TIMELINE_DEPTH_HASH_DIM=642x362`, found that the stable surface backing changed via
 compute: program `0x401aec200` fills the 32 KiB HTILE block with `0xfffffff0` before the scene draws. #611 now
 invalidates overlapping persistent Vulkan depth/stencil images on guest GPU writes, restoring the rejected
-layers. The 35-second screenshot warmup still skips color RTT history and therefore remains an overbright
-progression diagnostic, not a color-correct gameplay oracle.
+layers. Dead Cells' four repeated fragment failures were uniform VCCZ-exit light loops; #615 adds a narrowly
+proved fragment/vertex structurization path and current gameplay submits realize every semantic draw. Use
+`shader_inspect` for raw `PROSPER_SHADER_DUMP` binaries; capture-side retention of unrealized shader diagnostics
+is tracked in #618. The 35-second screenshot warmup still skips color RTT history and therefore remains an
+overbright progression diagnostic, not a color-correct gameplay oracle.

@@ -13,6 +13,9 @@ the shipped runtime. Build them from `build-linux/` like everything else.
 - **`self_dump/`** — parse a SELF/ELF and print its segment/program-header map
   (find file offsets for offline disassembly).
 - **`shader_histo/`** — histogram RDNA2 opcodes across a title's shaders.
+- **`shader_inspect/`** — decode one raw `PROSPER_SHADER_DUMP` binary offline. It prints bounded
+  instruction PCs, operands, raw words, signed branch immediates, and resolved branch targets so a
+  failed shader's CFG can be mapped without hand-counting variable-length instructions.
 - **`imgdump/`** — decode/dump a guest texture to an image for inspection.
 - **`gpu_replay/`** — replay a local `PROSPER_GPU_CAPTURE` realized-submit capsule through the same
   Vulkan backend without booting the guest. Capsules include game shaders/resources, use `.prgcap`,
