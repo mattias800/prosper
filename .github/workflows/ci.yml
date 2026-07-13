@@ -87,3 +87,33 @@ jobs:
       - name: Test
         shell: msys2 {0}
         run: ctest --test-dir prosper/build-ci --output-on-failure
+
+  macos:
+    name: macOS (x86_64 / Rosetta 2)
+    runs-on: macos-latest
+
+    # GitHub's macos-latest runners are Apple Silicon (arm64). prosper has no ARM CPU backend — it
+    # runs the guest's x86-64 code natively — so the whole app is built x86_64 (CMAKE_OSX_ARCHITECTURES)
+    # and its tests run under Rosetta 2, exactly the supported macOS configuration (see docs/PORTING.md).
+    # This exercises the Darwin guest-execution substrate (src/host/posix_shim.hpp), not just a compile.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        # Rosetta 2 is not preinstalled on arm64 runners; it's needed to RUN the x86_64 ctest binaries
+        # (building them is a normal cross-arch target and needs no translation).
+        run: |
+          brew install ninja
+          softwareupdate --install-rosetta --agree-to-license
+
+      - name: Configure
+        # Vulkan is disabled (Homebrew's loader is arm64-only; the headless core + substrate tests
+        # don't need it — MoltenVK is a later frontier). x86_64 target, run under Rosetta.
+        run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE
+
+      - name: Build
+        run: cmake --build prosper/build-ci
+
+      - name: Test
+        run: ctest --test-dir prosper/build-ci --output-on-failure
