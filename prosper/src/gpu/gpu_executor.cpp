@@ -1025,9 +1025,28 @@ std::vector<ComputeItem> realize_compute_dispatches(
                 }
             }
             static std::set<uint64_t> logged;
-            if (logged.insert(code_addr).second)
+            if (logged.insert(code_addr).second) {
                 std::fprintf(stderr, "[compute] skip unsupported program 0x%llx\n",
                              (unsigned long long)code_addr);
+                // PROSPER_SHADER_DUMP=<dir>: write the failed COMPUTE program's raw bytes for offline
+                // shader_inspect, mirroring the graphics VS/PS dump (gpu_execute.hpp). The graphics
+                // path was the only dumper, so a failing dispatch's CFG could not be mapped offline.
+                // Bounded like the graphics dump (64 KB covers the largest observed shaders); shrink
+                // to the readable prefix instead of faulting on a short final mapping.
+                if (const char* dd = getenv("PROSPER_SHADER_DUMP")) {
+                    size_t n = 0x10000;
+                    while (n >= 0x1000 && !guest_readable(code_addr, (uint32_t)n)) n >>= 1;
+                    if (n >= 0x1000) {
+                        char fn[512];
+                        snprintf(fn, sizeof fn, "%s/exec_cs_%llx.bin", dd,
+                                 (unsigned long long)code_addr);
+                        if (FILE* f = fopen(fn, "wb")) {
+                            fwrite((const void*)(uintptr_t)code_addr, 1, n, f);
+                            fclose(f);
+                        }
+                    }
+                }
+            }
             continue;
         }
         const DescriptorValidationReport report = validate_spirv_descriptor_interface(
