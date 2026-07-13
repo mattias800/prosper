@@ -38,14 +38,38 @@ int main() {
     CHECK(recompile_valu(vcc_branch, sizeof(vcc_branch)/sizeof(vcc_branch[0]), 2, 3).empty(),
           "the production recompiler rejects the unsafe forward VCC branch");
 
-    // A VCCZ-exit loop is valid in vertex/fragment stages where one SPIR-V invocation models one
-    // hardware lane (#615), but not in the 64-lane compute shell: compute VCC needs a wave reduction.
+    // A PROVEN-UNIFORM VCCZ-exit loop now structurizes in the compute shell too (#590, extending
+    // #615): the uniformity proof is data-provenance-based — the compare reads s0 (scalar) and v1,
+    // whose nearest definition is `v_mov_b32 v1, 4` (an unmodified uniform VOP1 move from an inline
+    // scalar) — so every lane's compare bool is identical and the wave-empty vccz exit lowers to
+    // this invocation's bool, exactly as in the fragment shell. Body must be barrier/LDS/cross-lane
+    // free (guards below).
     const uint32_t compute_vcc_loop[] = {
         0xBE800380u, 0x7E000280u, 0x7E020284u, 0x7D020200u, 0xBF860004u,
         0x060000FFu, 0x3E800000u, 0x81008100u, 0xBF82FFFAu, 0xBF810000u,
     };
-    CHECK(recompile_valu(compute_vcc_loop, sizeof(compute_vcc_loop)/sizeof(compute_vcc_loop[0]), 0, 0).empty(),
-          "a VCCZ-exit loop remains rejected by the compute shell (wave-mask condition)");
+    CHECK(!recompile_valu(compute_vcc_loop, sizeof(compute_vcc_loop)/sizeof(compute_vcc_loop[0]), 0, 0).empty(),
+          "a proven-uniform VCCZ-exit loop structurizes in the compute shell (#590)");
+    // The SAME loop with v1 defined from a VGPR (`v_mov_b32 v1, v0`) fails the uniform-VOP1-from-
+    // scalar proof clause: the compare can no longer be proven wave-uniform, so compute still
+    // rejects it loudly (a varying trip count needs a real wave reduction).
+    const uint32_t compute_vcc_loop_varying[] = {
+        0xBE800380u, 0x7E000280u, 0x7E020300u, 0x7D020200u, 0xBF860004u,
+        0x060000FFu, 0x3E800000u, 0x81008100u, 0xBF82FFFAu, 0xBF810000u,
+    };
+    CHECK(recompile_valu(compute_vcc_loop_varying,
+                         sizeof(compute_vcc_loop_varying)/sizeof(compute_vcc_loop_varying[0]), 0, 0).empty(),
+          "a VCCZ-exit loop whose compare reads a varying VGPR still rejects in the compute shell");
+    // An s_barrier INSIDE the loop body also rejects: the uniformity proof is per-WAVE, and a
+    // barrier inside a loop whose trip count could differ across the workgroup's waves would be
+    // workgroup-divergent control flow (UB).
+    const uint32_t compute_vcc_loop_barrier[] = {
+        0xBE800380u, 0x7E000280u, 0x7E020284u, 0x7D020200u, 0xBF860005u,
+        0x060000FFu, 0x3E800000u, 0x81008100u, 0xBF8A0000u, 0xBF82FFF9u, 0xBF810000u,
+    };
+    CHECK(recompile_valu(compute_vcc_loop_barrier,
+                         sizeof(compute_vcc_loop_barrier)/sizeof(compute_vcc_loop_barrier[0]), 0, 0).empty(),
+          "a uniform VCCZ-exit loop containing s_barrier still rejects in the compute shell");
 
     // A forward s_cbranch_execz that REJOINS LIVE CODE is only safe to linearize when its skipped block
     // is EXEC-predicated VGPR writes. Here the block is a scalar write (s_mov_b32 s0,1) and the branch

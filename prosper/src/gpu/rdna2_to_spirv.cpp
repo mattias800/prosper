@@ -3695,7 +3695,37 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // (OpLoopMerge + header OpPhi per carried register/mask) whose per-lane condition is THIS
         // lane's EXEC bool after the header's exec recompute. The IF machinery is unchanged and
         // recurses INTO loop bodies (their nested forward-execz regions).
-        if (!b.is_compute) Ls = detect_divergent_loops(ins, safe);
+        Ls = detect_divergent_loops(ins, safe);
+        if (b.is_compute) {
+            // Compute VCC-exit loops (#590, extending #615): the fragment-stage uniformity proof is
+            // data-provenance-based, not stage-based — vcc_exit_is_wave_uniform accepts a compare only
+            // when every input is scalar/inline/literal or a VGPR whose nearest definition is an
+            // unmodified uniform VOP1 move from a scalar. With that proven, every lane's compare bool
+            // is identical, so the wave-empty vccz exit lowers to THIS invocation's !cond exactly as
+            // in the fragment shell (tid-derived/varying inputs fail the proof and keep rejecting).
+            // Two compute-specific guards, both conservative:
+            //   * accept ONLY Condition::Vcc loops (the detector sets it only under the uniform proof;
+            //     per-lane Exec-condition loops stay graphics-only until a compute case is observed);
+            //   * the body must be barrier/LDS/cross-lane-free — the proof is per-WAVE, and a barrier
+            //     inside a loop whose trip count could differ across the workgroup's waves would be
+            //     workgroup-divergent control flow (UB). DOLL's blocked light/fill kernels are
+            //     straight-line bodies, so nothing observed is lost. CONFIDENCE: MED-HIGH (shared
+            //     emit machinery; spirv-val + coverage tests + Messenger guard gate it).
+            bool compute_ok = !Ls.empty();
+            for (const auto& L : Ls) {
+                if (!compute_ok) break;
+                if (L.condition != DivLoop::Condition::Vcc) { compute_ok = false; break; }
+                for (const auto& in : ins) {
+                    if (in.is_end || in.pc >= L.exit_pc) break;
+                    if (in.pc < L.header_pc) continue;
+                    if (in.fmt == Rdna2Format::DS ||
+                        (in.fmt == Rdna2Format::SOPP && in.opcode == 0x0a) ||
+                        (in.fmt == Rdna2Format::VOP3 &&
+                         (in.opcode == 0x365 || in.opcode == 0x366))) { compute_ok = false; break; }
+                }
+            }
+            if (!compute_ok) Ls.clear();   // unchanged behavior: the branch reaches emit_alu -> loud reject
+        }
         bool cf_rejected = false;
         const std::vector<ForwardIf> Fs = detect_forward_ifs(ins, /*allow_vcc*/!b.is_compute, code, dwords, &safe,
                                                              Ls.empty() ? nullptr : &Ls, &cf_rejected);
