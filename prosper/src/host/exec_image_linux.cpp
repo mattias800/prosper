@@ -1914,6 +1914,15 @@ void install_trap_handler() {
     // exact "fatal signal 11, no output" we see mid-load). On the alt stack the worker-thread fault
     // path (which does NOT siglongjmp) can print the faulting RIP. Gated so the default boot's
     // main-thread siglongjmp recovery is unchanged. CONFIDENCE: HIGH (mechanism).
+    // On macOS the alt stack is MANDATORY, not diagnostic: a guest fault whose access is on the
+    // faulting thread's own stack (a bad indirect branch into the stack, a stack overflow) cannot
+    // push a signal frame onto that same stack, so without SA_ONSTACK the kernel force-kills the
+    // process with no handler entry (the "SIGSEGV, no output" we first saw). The Darwin recovery
+    // path siglongjmps out of the handler, which is safe from the alt stack (no glibc
+    // %fs-guarded ____longjmp_chk to trip, unlike Linux — that is why it stays opt-in there).
+#ifdef __APPLE__
+    sa.sa_flags |= SA_ONSTACK;
+#endif
     if (getenv("PROSPER_FAULT_ONSTACK")) sa.sa_flags |= SA_ONSTACK;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, nullptr);
