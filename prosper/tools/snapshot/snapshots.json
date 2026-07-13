@@ -14,15 +14,11 @@
       "dump": "PPSA15552-app0",
       "scale": 4,
       "timeout": 20,
-      "frame": 0,
       "env": {
         "PROSPER_RENDER_DELAY_MS": "3000"
       },
-      "hash": "8429fedd427b63d9330e6dc2357699a3d22fd1c0a7b664f873c83955cb8420d0",
-      "dims": [
-        960,
-        540
-      ]
+      "min_colors": 1500,
+      "_note": "Run-level splash content guard. Frame 0 after the 3-second render delay is timing-dependent: unchanged builds select multiple valid static/animated states (including hashes 8429fedd..., 891a80fc..., and a9e41a6b...). Preserved failures and three fresh runs show valid rich states at 1650-1698 distinct colors, while later transition frames are only about 325-339. Requiring the richest startup frame to reach 1500 accepts all observed valid splash phases without blessing one animation frame, while still rejecting partial transitions and clear-only rendering."
     }
   ]
 }

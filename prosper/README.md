@@ -65,8 +65,9 @@ possible without console keys. Dumps are user-supplied and gitignored.
   The faithful 883-submit closure resolves 1,764 temporal image dependencies and established the stale-depth
   failure. The draw stream has no `DB_RENDER_CONTROL` clear because hardware observes the compute-written
   HTILE metadata instead; #611 implements that missing cache boundary. #569 still tracks exact depth/stencil
-  checkpoint serialization. The nondeterministic exact-frame Dead Cells
-  snapshot guard is tracked separately in #596. UE4's measured GPU boundary remains under its area issues.
+  checkpoint serialization. The Dead Cells splash guard now checks the richest frame in its startup window against
+  a measured content threshold, avoiding its nondeterministic animation frame. UE4's measured GPU boundary remains
+  under its area issues.
 
 The completed Messenger black-render investigation and reusable evidence boundary are recorded in
 [`docs/MESSENGER_BLACK_RENDER.md`](docs/MESSENGER_BLACK_RENDER.md). Current work is tracked in GitHub

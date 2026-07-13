@@ -4,10 +4,9 @@ Real-game rendering regression guard. Run this whenever a change can affect
 rendered output: RDNA2-to-SPIR-V recompilation, AGC/PM4 decoding, render state,
 texture detiling, or executor/present behavior.
 
-The Messenger guard records the richest frame's distinct-color count across the
-boot. The Dead Cells guard uses an exact first-frame hash after a wall-clock
-renderer warmup. Together they exercise both supported guard modes across two
-titles.
+The Messenger and Dead Cells guards record the richest frame's distinct-color
+count across their configured windows. Both titles have threaded/timing-sensitive
+boots whose exact rendered frame is not a stable contract.
 
 ## Run It
 
@@ -36,7 +35,11 @@ python3 -c 'from PIL import Image; Image.open("x.bmp").save("x.png")'
 
 - `min_colors`: run the full configured timeout, inspect every dumped frame,
   and require the richest frame to meet the threshold. `messenger-scene` uses
-  this because exact frame hashes are not stable across threaded boots.
+  this because exact frame hashes are not stable across threaded boots. The
+  Dead Cells splash uses the same mode because one unchanged build selects
+  multiple valid static/animated splash hashes after its renderer warmup. Use
+  `verify <name>` to require two full runs to meet the threshold at equal
+  dimensions.
 - `frame` plus `hash`: target one draw-submit frame. Use `verify <name>` before
   trusting a new exact baseline, then `update <name>` after an intentional pixel
   change.

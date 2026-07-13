@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Golden-image snapshot tester for prosper's game rendering.
+"""Local snapshot tester for prosper's game rendering.
 
-Runs a game through boot_trace, captures an EXACT rendered frame, hashes its
-pixels, and compares against a stored baseline. On a mismatch it saves the
-offending screenshot and exits non-zero — snapshot testing for the renderer, so
+Runs a game through boot_trace and checks either an exact rendered-frame hash or
+a run-level content threshold. On a mismatch it saves the offending screenshot
+and exits non-zero — snapshot testing for the renderer, so
 any agent can catch a rendering regression (e.g. a recompiler change that blanks
 a title) before it ships.
 
@@ -21,10 +21,11 @@ Env overrides:
   PROSPER_GAME_ROOT   dir holding the <dump> subdirs   (default: /mnt/c/Users/matti/repos/ps5ys)
   PROSPER_BOOT_TRACE  path to the boot_trace binary    (default: <prosper>/build-linux/boot_trace)
 
-A frame is targeted by RENDER_EVERY=1 (render every draw submit) + `frame`=F, so
-frame_<F>.bmp is the F-th draw submit's render. Pick F in a STABLE-content window
-(a static title/menu loop renders the same composite every submit → same hash);
-use `verify` to confirm F is deterministic before trusting a baseline.
+Exact mode targets a frame with RENDER_EVERY=1 plus `frame`=F, so frame_<F>.bmp
+is the F-th draw submit's render. Pick F in a stable-content window and use
+`verify` before trusting a baseline. Content mode uses `min_colors` and checks the
+richest frame over the complete configured window when threaded timing makes no
+single frame a stable contract.
 """
 import sys, os, json, time, hashlib, struct, subprocess, tempfile, shutil, signal
 
@@ -325,6 +326,17 @@ def cmd_verify(m, names):
     rc = 0
     for s in select(m, names):
         try:
+            if s.get("min_colors"):
+                threshold = int(s["min_colors"])
+                b1, n1, dims1, t1 = capture_richest(s); _cleanup(t1)
+                b2, n2, dims2, t2 = capture_richest(s); _cleanup(t2)
+                ok = n1 >= threshold and n2 >= threshold and dims1 == dims2
+                print(f"[verify] {s['name']}: {'CONTENT-STABLE' if ok else 'UNSTABLE'} "
+                      f"({n1} vs {n2} colors, min={threshold}, "
+                      f"dims={dims1[0]}x{dims1[1]}/{dims2[0]}x{dims2[1]})")
+                if not ok:
+                    rc = 1
+                continue
             b1, t1 = capture(s); h1, _ = pixel_hash(b1); _cleanup(t1)
             b2, t2 = capture(s); h2, _ = pixel_hash(b2); _cleanup(t2)
             ok = h1 == h2
