@@ -24,7 +24,9 @@ struct Dcb {
 static uint32_t PM4(uint32_t len, uint32_t op, uint32_t r) {
     return 0xC0000000u | (((len - 2u) & 0x3fffu) << 16u) | ((op & 0xffu) << 8u) | ((r & 0x3fu) << 2u);
 }
-constexpr uint32_t IT_NOP = 0x10, IT_SET_SH_REG = 0x76, R_DRAW_RESET = 0x05, R_CX_REGS_INDIRECT = 0x12;
+constexpr uint32_t IT_NOP = 0x10, IT_NUM_INSTANCES = 0x2F, IT_SET_SH_REG = 0x76,
+                   R_DRAW_RESET = 0x05, R_PUSH_MARKER = 0x0b, R_POP_MARKER = 0x0c,
+                   R_CX_REGS_INDIRECT = 0x12;
 
 struct ShaderRegister { uint32_t offset, value; };
 
@@ -120,6 +122,32 @@ int main() {
               "zero register count rejected without allocating");
         CHECK(setshdirect(D, (uint64_t)(uintptr_t)sh, 4097, 0, 0, 0) == 0 && dcb.cursor_up == before,
               "oversized register count rejected without allocating");
+    }
+
+    // The authoritative PS5 symbol map identifies these NIDs as DCB marker/instance builders.
+    // PushMarker used to clear live state through the obsolete g_agc_ctx_init workaround (#641).
+    auto pushmarker = Hle::lookup("+kSrjIVxKFE");
+    auto popmarker = Hle::lookup("H7uZqCoNuWk");
+    auto setinstances = Hle::lookup("tSBxhAPyytQ");
+    CHECK(pushmarker && popmarker && setinstances, "marker and instance Dcb functions registered");
+    if (pushmarker && popmarker && setinstances) {
+        uint32_t* before = dcb.cursor_up;
+        const char marker[] = "Blasphemous 2 landing";
+        uint32_t marker_payload_dw = (uint32_t)((sizeof marker + 3u) / 4u);
+        uint64_t pushed = pushmarker(D, (uint64_t)(uintptr_t)marker, 0, 0, 0, 0);
+        auto* push = (uint32_t*)(uintptr_t)pushed;
+        CHECK(push == before, "PushMarker returns the allocated packet");
+        CHECK(push[0] == PM4(1 + marker_payload_dw, IT_NOP, R_PUSH_MARKER),
+              "PushMarker emits a correctly sized R_PUSH_MARKER packet");
+        CHECK(strcmp((const char*)(push + 1), marker) == 0, "PushMarker copies the NUL-terminated label");
+
+        auto* pop = (uint32_t*)(uintptr_t)popmarker(D, 0, 0, 0, 0, 0);
+        CHECK(pop == push + 1 + marker_payload_dw && pop[0] == PM4(2, IT_NOP, R_POP_MARKER),
+              "PopMarker appends R_POP_MARKER after the label packet");
+
+        auto* instances = (uint32_t*)(uintptr_t)setinstances(D, 3, 0, 0, 0, 0);
+        CHECK(instances == pop + 2 && instances[0] == PM4(2, IT_NUM_INSTANCES, 0) && instances[1] == 3,
+              "SetNumInstances appends the native IT_NUM_INSTANCES packet");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }

@@ -65,6 +65,11 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
             switch (c.r) {
                 case R_DRAW_RESET:    c.kind = K::DrawReset;    break;
                 case R_WAIT_FLIP_DONE:c.kind = K::WaitFlipDone; break;
+                case R_PUSH_MARKER:
+                    c.kind = K::PushMarker;
+                    c.marker_label = npl ? reinterpret_cast<const char*>(pl) : "";
+                    break;
+                case R_POP_MARKER:    c.kind = K::PopMarker;    break;
                 case R_ACQUIRE_MEM:   c.kind = K::AcquireMem;   break;
                 case R_WRITE_DATA:
                     c.kind = K::WriteData;

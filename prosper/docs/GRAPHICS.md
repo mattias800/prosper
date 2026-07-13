@@ -368,7 +368,16 @@ layouts verified against this title, not assumed from Kyty.
 Tooling added: `build-linux/imgdump <module> <out.img>` dumps a module's flat image for offline
 `objdump -D -b binary -m i386:x86-64` disassembly (how the registry writer was found).
 
-## (Historical) THE BOOT BLOCKER (located 2026-07): `+kSrjIVxKFE` = AGC context init
+## (Historical, disproved by #641) `+kSrjIVxKFE` context-init theory
+
+> **Correction (2026-07-13):** the authoritative PS5 3.20 symbol map identifies
+> `+kSrjIVxKFE` as `sceAgcDcbPushMarker`, not a register-context constructor. Its first argument is
+> a live DCB and its second argument is the marker label. The temporary `g_agc_ctx_init` handler
+> described below corrupted that DCB by clearing three 0x70-byte regions on every marker. Removing
+> it and emitting a correctly framed marker packet lets Blasphemous 2 render its studio logos and
+> title and continue through the EULA. See #641 and `docs/AGC_TRACE.md`. The following section is
+> retained only as the reasoning trail that produced the obsolete workaround; none of its
+> conclusions about the import's identity or ownership are current.
 
 The boot faults at `eboot+0x3b5ea6` inside a GPU register-setting routine. Full chain, traced under gdb:
 
@@ -386,7 +395,7 @@ The boot faults at `eboot+0x3b5ea6` inside a GPU register-setting routine. Full 
   table.subarray[sel][key] : 0x7fff`, where the table has 16-bit `limit[sel]` at `+0x2e` and
   `subarray*[sel]` at `+0x08`. With `table==NULL` it reads `[0x30]` → SIGSEGV at addr `0x30`.
 
-**Fix = implement `+kSrjIVxKFE` as the real AGC register-context constructor**: allocate the two
+**Disproved proposed fix:** implement `+kSrjIVxKFE` as an AGC register-context constructor: allocate the two
 register banks, install `[context+0x10]`/`[context+0x18]`, and install a valid classify table at
 `[context+0x08]` mapping (register-set selector, SDK register index) → hardware slot. The register
 offsets for that mapping are exactly the data now vendored in `agc_reg_defaults.cpp` (the ported
@@ -399,9 +408,10 @@ classifier is hit exactly once, not thousands of times — and NOT the `GetRegis
 wiring real RegisterDefaults did not move the fault, confirming the context table is installed by
 `+kSrjIVxKFE`, not read from `GetRegisterDefaults2` here.)
 
-### Context object model (as reverse-engineered)
+### Obsolete context-object interpretation
 
-`+kSrjIVxKFE(context)` is the constructor for the register context embedded at **device+0x48**. The
+The investigation incorrectly interpreted `+kSrjIVxKFE(context)` as the constructor for the register
+context embedded at **device+0x48**. The
 context holds an array of **0x70-byte register-set sub-objects at context+0x38** (index 0..2 = the
 cx/sh/uc sets): the setter thunks (`eboot+0x3a7aa0/0x3a7b20/0x3a7b60`) and getters all compute
 `sub[sel] = (context+0x38) + sel*0x70` (`eboot+0x3b0210`: `rax = rdi + sel*0x70`). Each sub-object:
@@ -410,14 +420,15 @@ cx/sh/uc sets): the setter thunks (`eboot+0x3a7aa0/0x3a7b20/0x3a7b60`) and gette
 - `[sub+0x10]`/`[sub+0x18]` → the two register-bank output buffers
 - `[sub+0x32]` (u16), `[sub+0x68]` (flags byte)
 
-### STAGE 1 done (2026-07): empty classify tables unblock the register-set loops
+### Historical Stage 1 workaround (removed by #641)
 
-`+kSrjIVxKFE` is now implemented (hle_graphics.cpp) to install a zeroed classify table into each
+`+kSrjIVxKFE` was temporarily implemented in `hle_graphics.cpp` to install a zeroed classify table into each
 sub-object's `[sub+0x08]`. With all per-selector limits = 0 the classifier returns `0x7fff` for every
 register, so the register-set loops skip every write and never touch the null banks. **Result: the
 fault moved from `eboot+0x3b5ea6` to `eboot+0x3b1562`** — a getter that derefs `[sub[0]+0x00]`
-(still null) → `[null+0x28]`. This proves the diagnosis: `+kSrjIVxKFE` is the correct place to build
-the context.
+(still null) → `[null+0x28]`. At the time this appeared to confirm the theory, but #641 proved that
+the handler merely changed live DCB contents and moved the symptom; it was never a valid context
+initialization boundary.
 
 ### Deeper mechanism (RE'd 2026-07-04) — the "source" object supersedes the direct-table stopgap
 

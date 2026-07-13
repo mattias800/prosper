@@ -787,9 +787,13 @@ Building on the stable frame loop (#213), four distinct walls between "empty pre
 path). The game now runs 200+ flips / 470+ compute dispatches, deep into post-load engine init
 (trophy, error-dialog, telemetry subsystems), with 0 faults and 0 OOM.
 
-1. **The #222 EUD-ring fault (eboot+0x59949e4) was the FIRST scene-draw prep crash, not a race.**
-   `+kSrjIVxKFE` (the AGC register-context ctor) is called repeatedly on LIVE contexts (a per-
-   frame/post-bind reset; DOLL even builds contexts on the stack), not once at device init. The
+1. **Historical #222 EUD-ring workaround, removed by #641.**
+   The original investigation misidentified `+kSrjIVxKFE` as an AGC register-context constructor.
+   The PS5 3.20 symbol map proves it is `sceAgcDcbPushMarker`; repeated calls were marker appends to
+   live DCBs, not per-frame/post-bind context resets. The old handler's clearing of three 0x70-byte
+   regions merely corrupted command-buffer state and moved faults between titles. #641 removes it
+   and emits a real marker packet. The remaining paragraph records the obsolete workaround's
+   mechanics, not a current ABI contract. The
    guest's SetSource (eboot+0x5994620) EARLY-OUTS when [sub+0x00] still equals the shader being
    bound; a full bind derives +0x34/+0x38/+0x3c/+0x40/+0x44 from the SAME user_data descriptor,
    so +0x44!=0 always implies direct-table[10]!=0xffff. Our Stage-1 ctor overwrote ONLY [sub+0x08]
@@ -799,6 +803,7 @@ path). The game now runs 200+ flips / 470+ compute dispatches, deep into post-lo
    0xffff*4 - 0x80 = 0x3ff7c (the exact captured fault addr). Fix: model the ctor as the guest's
    own sub-reset (eboot+0x59945e0) — zero [sub+0x00..0x47] + the +0x60/+0x68 cached bank & flags,
    preserve the +0x48/+0x50 allocator pointers & +0x58 mode byte, install the empty descriptor.
+   That workaround is no longer present.
 
 2. **The per-draw fence cluster was never wired.** The guest fence builder (eboot+0x59a1780)
    allocates a label inside a Dcb NOP data packet, pre-builds WriteData/ReleaseMem/WaitRegMem with
