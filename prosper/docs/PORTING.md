@@ -321,25 +321,36 @@ to a full `RUN ENDED` report. Three runtime bugs were fixed to get here (commits
   Also: `run_entry` now points `NT_TIB.StackBase/StackLimit` at the switched guest stack during guest
   execution so exception dispatch on that stack doesn't spuriously report stack exhaustion.
 
-### The Windows frontier: guest `%fs` TLS (confirmed + de-risked)
+### Guest `%fs` TLS — SOLVED (FSGSBASE + VEH re-apply)
 
-Boot stops at `eboot+0x808f35`: `mov %fs:0x0,%rax` (a TLS self-pointer load) faulting at
-`addr=0x0`, with **zero Sony imports called yet** — the classic uninitialized-TLS signature. Guest
-`%fs` base is 0 on Windows, so `fs:`-relative reads resolve to low linear addresses.
+Was: boot stopped at `eboot+0x808f35` (`mov %fs:0x0,%rax` faulting at `addr=0x0`, zero Sony imports
+called) — uninitialized guest initial-exec TLS, guest `%fs` base 0 on Windows. An FS-base probe
+settled the strategy: **user-mode `rdfsbase`/`wrfsbase` work** (CR4.FSGSBASE, Win10 1709+), but
+**Windows resets the user FS base to 0 on every kernel transition** (a `Sleep()` zeroed it; it
+restores the thread's kernel-saved base and `wrfsbase` doesn't update that copy), so "set once" is
+impossible. Unlike Linux, the *host* uses `%gs` and only the *guest* uses `%fs`, so no per-HLE-call
+swap is needed.
 
-An FS-base persistence probe (spike 1b) settled the strategy: **user-mode `rdfsbase`/`wrfsbase` work**
-(CR4.FSGSBASE is enabled on Win10 1709+), and immediately after `wrfsbase` the guest TCB reads back
-correctly — **but Windows resets the FS base to 0 across any kernel transition** (a `Sleep(50)` in the
-probe zeroed it). It restores the per-thread FS base from a kernel-saved value on every context
-switch/syscall, and `wrfsbase` doesn't update that saved copy, so "set once and leave it" is unviable.
+Implemented: a real Windows `guest_tls.cpp` TCB (Variant-II layout, `VirtualAlloc`-backed, self-ptr +
+magic + guest canary), `wrfsbase(TP)` on each guest entry/thread start, and a VEH hook that re-applies
+`wrfsbase(TP)` and retries whenever an `fs`-prefixed instruction faults with the base drifted (one
+fault per kernel-transition boundary, not per access; a loop guard only re-applies when the base
+actually changed). `PROSPER_NO_GUEST_FS=1` reverts to the old wall, confirming this is the enabler.
+Result: boot advances far past the wall into deep guest code.
 
-Viable design (no per-HLE-call swap needed — the *host* uses `%gs`, only the *guest* uses `%fs`, so
-they don't collide, unlike Linux): **set the guest TCB via `wrfsbase` on each guest entry/thread
-start, and in the VEH re-apply `wrfsbase(guest_tcb)` and retry (CONTINUE_EXECUTION, no rip advance)
-whenever an `fs`-prefixed instruction faults with the base reset.** That costs one fault only after a
-kernel transition that lands between two guest `fs` accesses — not per access — so it's cheap. Needs:
-per-thread guest-TCB tracking, a Windows `guest_tls.cpp` TCB setup path, entry `wrfsbase`, and an
-fs-prefix decoder in the VEH (a guard against re-fault loops on genuine null derefs).
+### The Windows frontier: a deep, nondeterministic guest crash
+
+With `%fs` TLS in, boot reaches a much deeper guest crash — `eboot+0x17968cd`, a 9-frame guest
+backtrace, faulting on a **high mapped guest address** (not null), and it is **nondeterministic**
+(some runs `RUN ENDED` cleanly, some hard-fault / trip the Windows heap check). Prime suspects, in
+order: (1) the **deferred phys-aliasing** in the memory HLE — the guest may map one phys offset at two
+VAs expecting shared bytes, but Win32 gives it two private `VirtualAlloc` buffers, so writes through
+one VA aren't seen through the other; (2) **ASLR** — guest `VirtualAlloc` bases vary per run, so a
+guest assumption about layout would fault differently each time (a fixed-base reservation would make
+runs reproducible); (3) an HLE behavior only now reached. Next step: make the guest mapping
+deterministic (fixed base) to get a reproducible crash, then decide whether phys-aliasing must be
+implemented (the 64 KiB-granularity `CreateFileMapping`/`MapViewOfFile3` section approach) for this
+title.
 
 **What is done (compiles + links, in CI):**
 - **`exec_image_win.cpp`** — the Win32 sibling of `exec_image_linux.cpp` implementing the full
@@ -357,24 +368,26 @@ fs-prefix decoder in the VEH (a guard against re-fault loops on genuine null der
   `[rsp+0x20]`, `[rsp+0x28]`, +32B shadow, 16-aligned call) before calling the handler, which stays a
   plain MS-x64 C++ function. Byte encoding disassembly-verified; the register-move ordering is
   clobber-safe by construction. `PROSPER_SYSV_ABI` (dispatch.hpp) is now an empty documented marker.
-- `guest_tls.cpp` Windows path (guest `%fs` TLS hard-disabled), `boot_program.cpp` enabled on Windows,
-  `boot_trace` built on Windows (no evdev/Vulkan), CI `Windows MinGW` job builds the whole boot path.
+- `guest_tls.cpp` Windows path (guest `%fs` TLS now IMPLEMENTED via FSGSBASE — see above),
+  `boot_program.cpp` enabled on Windows, `boot_trace` built on Windows (no evdev/Vulkan), CI
+  `Windows MinGW` job builds the whole boot path.
 
 **What is left (runtime work, on a Windows host):**
-1. **Guest `%fs` TLS — the current blocker.** See "The Windows frontier" above: implement the
-   entry-`wrfsbase` + VEH-retry design. This is the one thing between here and the same
-   HLE-completeness boot depth as Linux.
+1. **The deep nondeterministic guest crash — the current blocker.** See "The Windows frontier" above:
+   make guest mappings deterministic (fixed base) for a reproducible crash, then likely implement
+   phys-aliasing in the memory HLE (`CreateFileMapping`/`MapViewOfFile3`, 64 KiB granularity).
 2. ~~Port the direct/flexible-memory HLE~~ — **DONE** (private-`VirtualAlloc` port; phys-aliasing
-   deferred for UE4).
-3. **Validate/repair the guest→HLE ABI trampoline for XMM/float args.** Integer args are converted
+   deferred — now a prime suspect for item 1).
+3. ~~Guest `%fs` TLS~~ — **DONE** (FSGSBASE + VEH re-apply; see above).
+4. **Validate/repair the guest→HLE ABI trampoline for XMM/float args.** Integer args are converted
    and now runtime-exercised through init; **XMM/float args are still not converted** (e.g. some libc
    formatters / `printf`-family) — add float-arg conversion when a title needs it.
-4. **VEH recovery hardening for stack-overflow faults** — recovery resumes on the faulting thread's
+5. **VEH recovery hardening for stack-overflow faults** — recovery resumes on the faulting thread's
    current stack; a true stack-overflow fault still needs a guard-page/dedicated-stack story (Linux
    uses `sigaltstack`). The `__builtin_longjmp` change fixed the cross-frame-unwind crash; this is the
    separate genuine-overflow case. Also: `PROSPER_CRASHPEEK` faults on Windows (the IL2CPP klass
    walker needs the same `guest_readable` guards the Linux path has).
-5. **Audit the 103 `(HleFn)`-cast handlers** — almost all cast targets are `HLE()`-defined handlers
+6. **Audit the 103 `(HleFn)`-cast handlers** — almost all cast targets are `HLE()`-defined handlers
    and so route correctly through the trampoline, but confirm none are raw host functions relying on
    host-ABI arg passing.
 
