@@ -337,6 +337,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         SrtUse u; u.kind = 0; u.t8 = tit->second;
                         u.key = kit != descr8_key.end() ? kit->second : 0xFFFFFFFFu;
                         u.use_pc = in.pc;
+                        u.is_store = in.opcode == 0x08;   // image_store: a STORAGE-image use (#590)
                         auto sit = descr.find(in.src[2].value);
                         if (sit != descr.end()) { u.has_samp = true; u.s4 = sit->second; }
                         srt_uses->push_back(u);
@@ -957,6 +958,96 @@ std::vector<ComputeItem> realize_compute_dispatches(
         read_user_sgprs(ds.sh, P::COMPUTE_USER_DATA_0 + range_start, sgprs);
         auto table = std::make_shared<ShaderResourceTable>(
             build_shader_resources(*header, sgprs, kUserSgprs, 0));
+        // Descriptor-TABLE uses (#590, mirroring the graphics fold in build_stage_table): UE4 compute
+        // kernels s_load their V#/T# descriptors from tables pointed to by the user-data SGPRs and
+        // consume them via s_buffer_load / image ops. build_shader_resources only sees the DIRECT
+        // sharp/user-data layout, so those table descriptors were thrown away — the const-fold walk
+        // recovers them here with the same keyed (srt_offset) / per-use (fetch_pc) provenance the
+        // recompiler resolves. Compute-specific delta: an image_store use becomes a STORAGE image
+        // (the recompiler's storage path requires ResourceClass::StorageImage), a sampled use a
+        // Texture. Never shadow an existing resource at the same srt_offset (first-match-wins).
+        {
+            std::vector<SrtUse> srt_uses;
+            resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, 0x4000,
+                                  sgprs, kUserSgprs, /*user_sgpr_base*/0, &srt_uses);
+            std::set<uint64_t> srt_seen;
+            for (const auto& u : srt_uses) {
+                // Dedupe: keyed cbuf uses per key; texture/storage and key-less uses per consuming pc
+                // (distinct namespaces so pc keys never collide with byte-offset keys).
+                uint64_t dk = (u.kind == 0 || u.key == 0xFFFFFFFFu)
+                                  ? (0x8000000000000000ull | ((uint64_t)(uint32_t)u.kind << 32) | u.use_pc)
+                                  : ((uint64_t)(uint32_t)u.kind << 32) | u.key;
+                if (!srt_seen.insert(dk).second) continue;
+                bool clash = u.key == 0xFFFFFFFFu;
+                if (!clash)
+                    for (const auto& r0 : table->resources)
+                        if (r0.srt_offset == u.key) { clash = true; break; }
+                if (u.kind == 1) {                       // constant/structured-buffer V#
+                    DecodedBufferDescriptor d = decode_buffer_descriptor(u.v4.data());
+                    if (d.base <= 0x10000 || d.size_bytes == 0 || d.size_bytes > 0x10000000u) continue;
+                    if (clash) {
+                        bool piggybacked = false;
+                        for (auto& r0 : table->resources)
+                            if (r0.cls == ResourceClass::ConstantBuffer &&
+                                r0.gpu_addr == d.base && r0.size == d.size_bytes) {
+                                if (r0.fetch_pc == 0xFFFFFFFFu) r0.fetch_pc = u.use_pc;
+                                piggybacked = r0.fetch_pc == u.use_pc;
+                                if (piggybacked) break;
+                            }
+                        if (piggybacked) continue;
+                    }
+                    ShaderResource r;
+                    r.cls = ResourceClass::ConstantBuffer;
+                    r.format = d.format; r.num_components = d.num_components ? d.num_components : 1;
+                    r.gpu_addr = d.base; r.size = d.size_bytes; r.stride = d.stride;
+                    r.srt_offset = clash ? 0xFFFFFFFFu : u.key;
+                    if (clash) r.fetch_pc = u.use_pc;    // pc-only provenance (key-less/collided V#)
+                    table->resources.push_back(r);
+                } else {                                  // T# — storage image (store) or sampled texture
+                    DecodedImageDescriptor d = decode_image_descriptor(u.t8.data());
+                    if (d.base == 0 || d.width == 0 || d.height == 0 ||
+                        d.width > 16384 || d.height > 16384) continue;   // garbage/degenerate T#
+                    {
+                        bool mapped = false;
+                        for (auto& r0 : table->resources)
+                            if ((r0.cls == ResourceClass::Texture || r0.cls == ResourceClass::StorageImage) &&
+                                r0.gpu_addr == d.base && r0.width == d.width && r0.height == d.height) {
+                                if (r0.fetch_pc == 0xFFFFFFFFu) { r0.fetch_pc = u.use_pc; mapped = true; break; }
+                                if (r0.fetch_pc == u.use_pc)    { mapped = true; break; }
+                            }
+                        if (mapped) continue;
+                    }
+                    Gen5ImageFormatInfo fi;
+                    const bool mapped_fmt = gen5_image_format(d.format, &fi);
+                    // Storage images move texels bit-exact (uint view; format lives in the T#), so an
+                    // unmapped IMG_FMT is acceptable THERE with a 4-byte-texel assumption only when the
+                    // format is genuinely unknown; sampled textures keep the strict policy (skip when
+                    // unmapped — a wrong RGBA8 read samples garbage).
+                    if (!mapped_fmt && !u.is_store) continue;
+                    if (mapped_fmt && fi.block_width > 1 && fi.snorm) continue;   // signed BCn: not wired
+                    ShaderResource r;
+                    r.cls = u.is_store ? ResourceClass::StorageImage : ResourceClass::Texture;
+                    if (mapped_fmt) {
+                        r.format = fi.format; r.num_components = fi.num_components;
+                        const bool is_bcn = fi.block_width > 1;
+                        r.size = is_bcn ? (((d.width + 3) / 4) * ((d.height + 3) / 4) * fi.bytes_per_block)
+                                        : (d.width * d.height * fi.bytes_per_block);
+                        r.srgb = fi.srgb;
+                    } else {
+                        r.format = DataFormat::Unorm8; r.num_components = 4;
+                        r.size = d.width * d.height * 4;
+                    }
+                    r.gpu_addr = d.base; r.width = d.width; r.height = d.height;
+                    r.tile_mode = d.tile_mode;
+                    r.img_dim = d.type == 11 ? 3u : d.type == 10 ? 2u : d.type == 13 ? 5u : 1u;
+                    r.swizzle[0] = d.dst_sel[0]; r.swizzle[1] = d.dst_sel[1];
+                    r.swizzle[2] = d.dst_sel[2]; r.swizzle[3] = d.dst_sel[3];
+                    r.srt_offset = clash ? 0xFFFFFFFFu : u.key;
+                    r.fetch_pc = u.use_pc;               // per-use pc provenance (the image op)
+                    table->resources.push_back(r);
+                }
+            }
+        }
         assign_convention_bindings(*table, 2);
 
         const uint32_t rsrc2 = rd(ds.sh, P::COMPUTE_PGM_RSRC2);
@@ -1058,6 +1149,28 @@ std::vector<ComputeItem> realize_compute_dispatches(
                 std::fprintf(stderr, "[compute] skip invalid descriptor contract for program 0x%llx\n",
                              (unsigned long long)code_addr);
             continue;
+        }
+        // The live compute backend binds STORAGE BUFFERS only (live_compute.cpp). A program whose
+        // reflected interface needs a storage image / sampled texture now RECOMPILES (the #590 fold
+        // above resolves its descriptors), but executing it would fail at bind time — and one failing
+        // item aborts the whole batch in execute_live_compute_items, skipping dispatches that ran
+        // before this change. Gate it here, loudly and once per program, until the backend grows the
+        // STORAGE_IMAGE path; this line is the measure of exactly what that backend work unblocks.
+        {
+            bool backend_bindable = true;
+            SpirvDescriptorKind blocked = SpirvDescriptorKind::Unknown;
+            for (const auto& d : report.descriptors)
+                if (d.kind != SpirvDescriptorKind::StorageBuffer) {
+                    backend_bindable = false; blocked = d.kind; break;
+                }
+            if (!backend_bindable) {
+                static std::set<uint64_t> logged;
+                if (logged.insert(code_addr).second)
+                    std::fprintf(stderr, "[compute] program 0x%llx recompiles but needs a %s binding "
+                                         "the backend cannot execute yet (#590)\n",
+                                 (unsigned long long)code_addr, spirv_descriptor_kind_name(blocked));
+                continue;
+            }
         }
         items.push_back(std::move(item));
     }

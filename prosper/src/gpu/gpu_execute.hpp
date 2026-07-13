@@ -100,6 +100,10 @@ struct SrtUse {
     // has no usable key; keying the TEXTURE use by its exact instruction (ShaderResource::fetch_pc,
     // the same per-instruction provenance the vertex fetches use) is unambiguous.
     uint32_t use_pc = 0xFFFFFFFFu;   // kind 0 only (cbufs keep the key model)
+    // The consuming image op WRITES the image (image_store — MIMG op 0x8): the resource must be a
+    // STORAGE image, not a sampled texture (#590 — the recompiler's storage path requires
+    // ResourceClass::StorageImage). Only meaningful for kind 0.
+    bool is_store = false;
 };
 std::vector<DynFetch> resolve_dynamic_fetch(const uint32_t* code, size_t dwords,
                                             const uint32_t* user_sgprs, uint32_t nsgpr,
