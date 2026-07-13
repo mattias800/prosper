@@ -235,9 +235,32 @@ Vulkan 1.1 and reads a game dump.
 
 ---
 
+## Tooling portability
+
+The debugging toolbox (`tools/`, see `tools/AGENTS.md`) splits cleanly:
+
+- **Pure file/Vulkan tools — portable now, no substrate needed:** `gpu_replay`, `gpu_timeline`,
+  `self_dump`, `shader_histo`, `imgdump`, `spv_validate`, `niddiag`, `il2cpp/`, `re/xref.py`.
+  None of them execute guest code. In particular **`gpu_replay` replays `.prgcap`/`.prgbundle`
+  capsules through the full Vulkan backend without booting the guest**, and exits non-zero on
+  output-hash mismatch — so an **arm64-native macOS build of `gpu_replay` against MoltenVK,
+  replaying captures made on Linux**, is the cheapest possible pathfinder for the entire GPU
+  stack on Apple (recompiled SPIR-V, descriptors, RTT, and the robustBufferAccess caveat),
+  before any Rosetta or substrate work. This should precede the Rosetta spike.
+- **Substrate-bound:** `boot_trace` (ports with `exec_image_<os>`), the `snapshot` golden-image
+  guard (boots a real title — once boot works on a platform, pixel-hash regression verification
+  comes along for free), and the `PROSPER_*` runtime diagnostics (all portable except the
+  `perf_event`-based `PROSPER_HWBP`/`HWWATCH`; the software-watch and `int3` paths cover other
+  OSes).
+- **Deliberately Linux-only:** `pad_evdev` (SDL3 pads elsewhere) and the gdb-based `tools/dbg/`
+  scripts.
+
 ## Proposed sequence
 
 1. **Spikes (hours each, no commitment):**
+   0. Build `gpu_replay` + `render_runner` arm64-native on macOS against MoltenVK and replay a
+      Linux-made `.prgcap` — validates the whole GPU stack on Apple with zero substrate work
+      (see *Tooling portability*).
    a. On this M2 MacBook: a 100-line x86_64 Darwin probe under Rosetta — `MAP_FIXED` at
       `0x400000000`, RWX anon map + self-modifying jump, `wrfsbase`/`rdfsbase`, catchable
       SIGILL on `INSERTQ`, `os_sync_wait_on_address`. This answers every macOS unknown at once.
