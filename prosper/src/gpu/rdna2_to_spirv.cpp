@@ -1403,13 +1403,52 @@ bool instruction_may_change_exec(const Rdna2Inst& in) {
 //   v_cvt_i32_f32 vBOUND, sBOUND; ...; v_cmp_* vcc, sCOUNTER, vBOUND; s_cbranch_vccz EXIT
 // so every active lane makes the same comparison. Keep the proof deliberately local and reject a
 // varying/unresolved VGPR bound rather than silently changing wave semantics.
+// True when `in` provably cannot overwrite VCC — used by vcc_exit_is_wave_uniform's compare-finding
+// walk (#590) to look past instructions scheduled between the VOPC and its consuming branch (real
+// UE4 compute kernels hoist ~15 unrelated ALU ops in between). Anything not provably safe stops the
+// walk conservatively: VOPC itself (the implicit dst), the VOP2 carry-chain ops (v_*_co_ci_u32,
+// 0x28-0x2a), VOP3 windows that may carry a scalar dest (VOPC-as-VOP3 sdst at 0x000-0x13f, VOP3B
+// carry-out / v_readlane at 0x300+ — the decoder does not expose their sdst), and any scalar or
+// SMEM write whose dest range could cover SGPR 106/107 (the shaders use s106/s107 as scratch).
+static bool cannot_write_vcc(const Rdna2Inst& in) {
+    auto sgpr_dst_misses_vcc = [&](uint32_t n_dwords) {
+        if (in.dst.kind != OperandKind::SGPR && in.dst.kind != OperandKind::Special) return true;
+        const int lo = in.dst.value, hi = in.dst.value + (int)n_dwords - 1;
+        return hi < 106 || lo > 107;
+    };
+    switch (in.fmt) {
+        case Rdna2Format::VOP1:
+        case Rdna2Format::VINTRP:
+        case Rdna2Format::MUBUF: case Rdna2Format::MTBUF: case Rdna2Format::MIMG:
+        case Rdna2Format::DS:    case Rdna2Format::FLAT:
+        case Rdna2Format::EXP:                                     // VGPR/memory dsts only
+        case Rdna2Format::SOPP:                                    // branches/hints/waitcnt: no dst
+        case Rdna2Format::SOPC:  return true;                      // writes SCC only
+        case Rdna2Format::VOP2:  return in.opcode < 0x28 || in.opcode > 0x2a;
+        case Rdna2Format::VOP3P: return true;                      // packed VALU: VGPR dst, no carry
+        case Rdna2Format::VOP3:  return in.opcode >= 0x140 && in.opcode < 0x300 &&
+                                        sgpr_dst_misses_vcc(1);    // plain-VALU window only
+        case Rdna2Format::SOP1: case Rdna2Format::SOP2: case Rdna2Format::SOPK:
+            return sgpr_dst_misses_vcc(2);                         // conservative 64-bit pair
+        case Rdna2Format::SMEM: {
+            uint32_t n = 0;
+            switch (in.opcode & 7) { case 0: n = 1; break; case 1: n = 2; break; case 2: n = 4; break;
+                                     case 3: n = 8; break; case 4: n = 16; break; default: return false; }
+            return sgpr_dst_misses_vcc(n);
+        }
+        default: return false;                                     // VOPC / unknown: stops the walk
+    }
+}
+
 bool vcc_exit_is_wave_uniform(const std::vector<Rdna2Inst>& ins, uint32_t branch_pc) {
     const Rdna2Inst* compare = nullptr;
     for (auto it = ins.rbegin(); it != ins.rend(); ++it) {
         if (it->pc >= branch_pc) continue;
         if (sopp_is_noop(*it)) continue;
-        compare = &*it;
-        break;
+        if (it->fmt == Rdna2Format::VOPC) { compare = &*it; break; }
+        if (cannot_write_vcc(*it)) continue;   // (#590) look past provably-VCC-preserving instrs —
+        break;                                 // VCC's value is frozen at the compare; only a real
+                                               // rewrite between compare and branch invalidates it
     }
     if (!compare || compare->fmt != Rdna2Format::VOPC || vopc_is_cmpx(compare->opcode)) return false;
 
@@ -1642,7 +1681,8 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
                                           const uint32_t* code, size_t dwords,
                                           const std::unordered_set<uint32_t>* skip = nullptr,
                                           const std::vector<DivLoop>* loops = nullptr,
-                                          bool* rejected = nullptr) {
+                                          bool* rejected = nullptr,
+                                          bool uniform_vcc_compute = false) {
     std::vector<ForwardIf> out;
     if (rejected) *rejected = false;
     auto reject = [&]() -> std::vector<ForwardIf> { if (rejected) *rejected = true; return {}; };
@@ -1661,6 +1701,9 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
     for (const auto& in : ins) {
         if (in.is_end) break;
         if (in.fmt != Rdna2Format::SOPP) continue;
+        // Set when a compute vccz/vccnz if is accepted via the #590 uniformity proof — its region is
+        // then required to be barrier/LDS/cross-lane free (checked after the target/merge is known).
+        bool compute_uniform_vcc = false;
         switch (in.opcode) {
             case 0x02: continue;                                     // s_branch: validated in pass 2
             case 0x09:                                               // execnz: only as a loop back-edge
@@ -1674,7 +1717,16 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
                                                                      // stages only — compute has wave VCC/EXEC)
             case 0x06: case 0x07:                                    // vccz / vccnz
                 if (loop_exit(in.pc)) continue;                      // canonical loop condition: loop emitter owns it
-                if (!allow_vcc) return reject();
+                if (!allow_vcc) {
+                    // Compute (#590, extending #615): accept the forward VCC if ONLY under the same
+                    // uniformity proof as the VCC-exit loops — every compare input scalar/inline or a
+                    // uniform-VOP1-from-scalar VGPR, and no possible VCC rewrite between compare and
+                    // branch (cannot_write_vcc walk). Every lane's bool is then identical, so the
+                    // wave-empty vccz test lowers to this invocation's bool. Varying compares keep
+                    // rejecting loudly (per-invocation lowering of a varying wave test is wrong).
+                    if (!uniform_vcc_compute || !vcc_exit_is_wave_uniform(ins, in.pc)) return reject();
+                    compute_uniform_vcc = true;
+                }
                 break;
             case 0x04: case 0x05:                                    // scc0 / scc1
                 if (skip && skip->count(in.pc)) continue;            // kill-mask branch: linearized, not an if
@@ -1683,6 +1735,9 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
         }
         // A loop BREAK (validated vccz/execz -> exit_pc inside an execnz-back-edge loop): a plain
         // forward if skipping the REST of the body — the exec-governed continue then exits the lane.
+        // A compute-uniform-accepted vcc branch can never be a break (compute loops require the
+        // s_branch back-edge Vcc shape, which has no breaks) — reject the combination defensively.
+        if (compute_uniform_vcc && loop_break(in.pc)) return reject();
         if (const DivLoop* L = loop_break(in.pc)) {
             ForwardIf F;
             F.found = true; F.branch_pc = in.pc; F.target_pc = L->backedge_pc;
@@ -1727,6 +1782,21 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
                 if (lm <= tgt || lm > end_pc) return reject();       // merge must be forward, in-stream
                 F.has_else = true; F.sb_pc = sb.pc; F.merge_pc = lm;
                 break;
+            }
+        }
+        if (compute_uniform_vcc) {
+            // (#590) the uniformity proof is per-WAVE: reject when the guarded region contains a
+            // barrier / LDS / cross-lane op (mirroring the compute loop-body guard — a barrier under
+            // control flow whose condition could differ across the workgroup's waves would be
+            // workgroup-divergent, UB).
+            const uint32_t region_end = F.has_else ? F.merge_pc : F.target_pc;
+            for (const auto& r : ins) {
+                if (r.is_end || r.pc >= region_end) break;
+                if (r.pc <= in.pc) continue;
+                if (r.fmt == Rdna2Format::DS ||
+                    (r.fmt == Rdna2Format::SOPP && r.opcode == 0x0a) ||
+                    (r.fmt == Rdna2Format::VOP3 &&
+                     (r.opcode == 0x365 || r.opcode == 0x366))) return reject();
             }
         }
         out.push_back(F);
@@ -3728,7 +3798,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         }
         bool cf_rejected = false;
         const std::vector<ForwardIf> Fs = detect_forward_ifs(ins, /*allow_vcc*/!b.is_compute, code, dwords, &safe,
-                                                             Ls.empty() ? nullptr : &Ls, &cf_rejected);
+                                                             Ls.empty() ? nullptr : &Ls, &cf_rejected,
+                                                             /*uniform_vcc_compute*/b.is_compute);
         if (cf_rejected) Ls.clear();   // unmodeled CF somewhere: fall through to straight-line (loud reject)
         if (Fs.empty() && Ls.empty()) {
             wave_ok = true;   // straight-line: barriers are wave-uniform, so cross-lane mbcnt is safe here
@@ -4058,7 +4129,9 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
     // back-edge + exit, and the forward-if branch) as handled, so coverage matches what actually recompiles
     // (previously the MSAA-resolve loop shaders 031-034 were mis-flagged "blocked" at their s_cbranch_scc0).
     const CountedLoop cL = detect_counted_loop(ins);
-    const std::vector<ForwardIf> cFs = detect_forward_ifs(ins, /*allow_vcc*/false, code, dwords);   // conservative diagnostic (compute-safe)
+    const std::vector<ForwardIf> cFs = detect_forward_ifs(ins, /*allow_vcc*/false, code, dwords,
+                                                          nullptr, nullptr, nullptr,
+                                                          /*uniform_vcc_compute*/true);   // matches the compute shell (#590)
     auto cf_reconstructed = [&](const Rdna2Inst& i) {
         if (cL.found && (i.pc == cL.backedge_pc || i.pc == cL.exit_branch_pc)) return true;
         for (const auto& F : cFs) if (i.pc == F.branch_pc) return true;

@@ -71,6 +71,50 @@ int main() {
                          sizeof(compute_vcc_loop_barrier)/sizeof(compute_vcc_loop_barrier[0]), 0, 0).empty(),
           "a uniform VCCZ-exit loop containing s_barrier still rejects in the compute shell");
 
+    // A FORWARD vccz if with the same proven-uniform compare also structurizes in compute (#590 —
+    // DOLL's blocked lighting/fill kernels are forward vccz if/else trees, not loops). Same shape as
+    // the loop fixture minus the back-edge: compare, skip-two-dwords vccz to s_endpgm (early-out).
+    const uint32_t compute_vcc_if[] = {
+        0xBE800380u, 0x7E000280u, 0x7E020284u, 0x7D020200u, 0xBF860002u,
+        0x060000FFu, 0x3E800000u, 0xBF810000u,
+    };
+    CHECK(!recompile_valu(compute_vcc_if, sizeof(compute_vcc_if)/sizeof(compute_vcc_if[0]), 0, 0).empty(),
+          "a proven-uniform forward vccz if structurizes in the compute shell (#590)");
+    // Varying compare (v1 <- v_mov from a VGPR): still rejects.
+    const uint32_t compute_vcc_if_varying[] = {
+        0xBE800380u, 0x7E000280u, 0x7E020300u, 0x7D020200u, 0xBF860002u,
+        0x060000FFu, 0x3E800000u, 0xBF810000u,
+    };
+    CHECK(recompile_valu(compute_vcc_if_varying,
+                         sizeof(compute_vcc_if_varying)/sizeof(compute_vcc_if_varying[0]), 0, 0).empty(),
+          "a forward vccz if with a varying compare still rejects in the compute shell");
+    // s_barrier inside the guarded region: still rejects (workgroup-divergence hazard).
+    const uint32_t compute_vcc_if_barrier[] = {
+        0xBE800380u, 0x7E000280u, 0x7E020284u, 0x7D020200u, 0xBF860003u,
+        0x060000FFu, 0x3E800000u, 0xBF8A0000u, 0xBF810000u,
+    };
+    CHECK(recompile_valu(compute_vcc_if_barrier,
+                         sizeof(compute_vcc_if_barrier)/sizeof(compute_vcc_if_barrier[0]), 0, 0).empty(),
+          "a uniform forward vccz if containing s_barrier still rejects in the compute shell");
+    // The compare-finding walk looks past instructions that provably cannot rewrite VCC (real UE4
+    // kernels schedule unrelated ALU between compare and branch): same uniform if with two plain
+    // VALU ops (v_mov v2,1 ; v_mov v3,2) hoisted between the compare and the branch.
+    const uint32_t compute_vcc_if_hoisted[] = {
+        0xBE800380u, 0x7E000280u, 0x7E020284u, 0x7D020200u, 0x7E040281u, 0x7E060282u,
+        0xBF860002u, 0x060000FFu, 0x3E800000u, 0xBF810000u,
+    };
+    CHECK(!recompile_valu(compute_vcc_if_hoisted,
+                          sizeof(compute_vcc_if_hoisted)/sizeof(compute_vcc_if_hoisted[0]), 0, 0).empty(),
+          "the uniformity proof looks past VCC-preserving instructions between compare and branch");
+    // But an intervening write that COULD hit VCC (s_mov_b32 s106, 0) stops the walk: reject.
+    const uint32_t compute_vcc_if_clobber[] = {
+        0xBE800380u, 0x7E000280u, 0x7E020284u, 0x7D020200u, 0xBEEA0380u,
+        0xBF860002u, 0x060000FFu, 0x3E800000u, 0xBF810000u,
+    };
+    CHECK(recompile_valu(compute_vcc_if_clobber,
+                         sizeof(compute_vcc_if_clobber)/sizeof(compute_vcc_if_clobber[0]), 0, 0).empty(),
+          "an intervening write to s106 (VCC) between compare and branch stops the proof");
+
     // A forward s_cbranch_execz that REJOINS LIVE CODE is only safe to linearize when its skipped block
     // is EXEC-predicated VGPR writes. Here the block is a scalar write (s_mov_b32 s0,1) and the branch
     // target is a live use of s0 (v_mov_b32 v0,s0) — the scalar write is NOT dead, so linearizing would
