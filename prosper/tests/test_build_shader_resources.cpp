@@ -207,6 +207,43 @@ int main() {
               "type-1 direct resource is not guessed for unobserved non-compute stages");
     }
 
+    // --- #566: additional directly-placed compute buffers (store-destination V# not in metadata). ---
+    // A Gen5 format-copy compute (Dead Cells) places TWO buffer V#s straight in the user-SGPR block —
+    // load source at reg0, store destination at reg4 — but its resource-usage metadata declares only the
+    // FIRST (direct_resource_offset type 1 -> reg 0). The store's SRSRC (s4) therefore had no resource and
+    // the whole dispatch was rejected/dropped, losing a scene-composition pass. build_shader_resources
+    // now also exposes plausible buffer V#s found directly in the user-SGPR block (keyed by sgpr_base),
+    // while the same plausibility guard filters leftover non-descriptor SGPRs, and the scan is compute-only.
+    {
+        uint32_t csgprs[32]; memset(csgprs, 0, sizeof csgprs);
+        make_vsharp(&csgprs[0], 0x74BA456E0000ull, 4, 393216, /*fmt*/2);   // src (declared via type 1)
+        make_vsharp(&csgprs[4], 0x74BA2F3E0000ull, 4, 393216, /*fmt*/2);   // dst (NOT declared anywhere)
+        make_vsharp(&csgprs[12], 0x50000000ull,    4, 0x8000000, /*fmt*/2);// 512 MB -> implausible, filtered
+        // reg8 + reg16..28 stay zero -> base 0 -> filtered.
+        uint16_t cdro[11]; for (auto& x : cdro) x = 0xffff;
+        cdro[1] = 0;                                                       // declare ONLY reg0
+        AgcShaderUserData cud; memset(&cud, 0, sizeof cud);
+        cud.direct_resource_offset = cdro; cud.direct_resource_count = 11;
+        AgcShaderHeader csh; memset(&csh, 0, sizeof csh);
+        csh.file_header = 0x34333231u; csh.version = 0x18; csh.type = 0; csh.user_data = &cud;
+
+        ShaderResourceTable ct = build_shader_resources(csh, csgprs, 32);
+        const ShaderResource* src = ct.by_sgpr_base(0);
+        const ShaderResource* dst = ct.by_sgpr_base(4);
+        CHECK(src && src->gpu_addr == 0x74BA456E0000ull, "#566: declared compute source buffer at sgpr 0");
+        CHECK(dst && dst->cls == ResourceClass::ConstantBuffer && dst->gpu_addr == 0x74BA2F3E0000ull,
+              "#566: undeclared compute store-dest V# at sgpr 4 exposed (store SRSRC now resolves)");
+        CHECK(dst && dst->size == 393216u * 4u && dst->stride == 4, "#566: dest V# base/size/stride decoded");
+        CHECK(ct.by_sgpr_base(8) == nullptr, "#566: leftover base-0 SGPR slot not emitted");
+        CHECK(ct.by_sgpr_base(12) == nullptr, "#566: >256 MB implausible V# filtered (no stale-SGPR binding)");
+        int at0 = 0; for (const auto& r : ct.resources) if (r.sgpr_base == 0) at0++;
+        CHECK(at0 == 1, "#566: declared source buffer emitted exactly once (scan dedups the type-1 slot)");
+
+        csh.type = 1;   // PS: the additional-buffer scan is compute-only.
+        CHECK(build_shader_resources(csh, csgprs, 32).by_sgpr_base(4) == nullptr,
+              "#566: additional directly-placed-buffer scan does not run for non-compute stages");
+    }
+
     // --- textures: sharp[0] T#s carry their real format + byte size; BC1/2/3 are bound (decoded to RGBA8
     // on upload, #121); BC4-7 + unmapped formats are still skipped (#65) ---
     {
