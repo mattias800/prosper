@@ -21,13 +21,17 @@ static sigjmp_buf g_jmp;
 static volatile sig_atomic_t g_faulted;
 static void on_segv(int) { g_faulted = 1; siglongjmp(g_jmp, 1); }
 
-// Returns true if READING *p faulted (i.e. the page is not readable).
+// Returns true if READING *p faulted (i.e. the page is not readable). Catch SIGBUS alongside
+// SIGSEGV: Darwin delivers PROT_NONE access as SIGBUS where Linux uses SIGSEGV (the emulator's
+// real fault handler likewise registers both).
 static bool read_faults(const volatile uint32_t* p) {
-    struct sigaction sa{}, old{}; sa.sa_handler = on_segv; sigemptyset(&sa.sa_mask);
-    sigaction(SIGSEGV, &sa, &old);
+    struct sigaction sa{}, old_segv{}, old_bus{}; sa.sa_handler = on_segv; sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &old_segv);
+    sigaction(SIGBUS, &sa, &old_bus);
     g_faulted = 0;
     if (sigsetjmp(g_jmp, 1) == 0) { volatile uint32_t v = *p; (void)v; }
-    sigaction(SIGSEGV, &old, nullptr);
+    sigaction(SIGSEGV, &old_segv, nullptr);
+    sigaction(SIGBUS, &old_bus, nullptr);
     return g_faulted != 0;
 }
 

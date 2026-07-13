@@ -13,6 +13,7 @@
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <signal.h>   // kill(): not pulled in transitively on Darwin
 #include <ctime>
 
 using namespace prosper;
