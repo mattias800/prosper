@@ -3,14 +3,12 @@
 // The Windows sibling of exec_image_linux.cpp. It implements the same exec_image.hpp contract with
 // Win32 primitives instead of POSIX: VirtualAlloc for fixed-address guest mappings, a Vectored
 // Exception Handler (VEH) instead of a SIGSEGV/SIGILL handler, and CONTEXT register access instead
-// of ucontext. The guest is System V AMD64; the host is Microsoft x64 — the guest↔HLE boundary is
-// bridged by PROSPER_SYSV_ABI (dispatch.hpp), and host→guest calls here go through SysV-typed
-// function pointers.
+// of ucontext. The guest is System V AMD64; the host is Microsoft x64. Emitted import stubs marshal
+// guest calls into the host ABI, and prosper_call_guest_sysv marshals host calls into the guest ABI.
 //
-// STATUS (2026-07-13): compile/link-complete and CI-built, but the guest boot is NOT yet verified on
-// Windows. Known remaining work is tracked in docs/PORTING.md "Windows": the direct/flexible memory
-// HLE (hle_kernel_mem.cpp) is still POSIX-only, guest %fs TLS is unsolved (same wall as macOS), the
-// (HleFn)-cast handler ABI audit, and runtime validation of VEH recovery. Diagnostics that depend on
+// STATUS (2026-07-13): runtime-verified through a multi-threaded headless frame-loop boot. Remaining
+// work is tracked in docs/PORTING.md "Windows": wire the Vulkan renderer, preserve physical-memory
+// aliasing, cover float/XMM import arguments, and harden VEH recovery. Diagnostics that depend on
 // Linux perf_event / ptrace (PROSPER_HWBP/HWWATCH/BP/PEEK/DUMPAT) are intentionally absent here.
 #ifdef _WIN32
 
@@ -245,15 +243,17 @@ namespace {
         // Lazy-commit inside a guest-RESERVED range — parity with the Linux SIGSEGV handler. The guest
         // reserves a virtual range then touches pages it believes committed (its binned allocator relies
         // on a commit protocol real HW satisfies but our HLE doesn't fully replicate). If the faulting
-        // read/write address is one the memory HLE tracks as reserved-but-uncommitted, commit the 64 KiB
-        // page and retry. Gated to tracked-reserved addresses (state 1) and non-execute accesses
+        // read/write address is one the memory HLE tracks as reserved-but-uncommitted, commit the 16 KiB
+        // guest page and retry. Windows reservations can be only one guest page long; committing a
+        // 64 KiB allocation-granularity span would cross that reservation and fail with ERROR_INVALID_ADDRESS.
+        // Gated to tracked-reserved addresses (state 1) and non-execute accesses
         // (ExceptionInformation[0]!=8) so a genuine wild access / bad instruction fetch still faults.
         if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2 &&
             ep->ExceptionRecord->ExceptionInformation[0] != 8) {
             uint64_t a = (uint64_t)ep->ExceptionRecord->ExceptionInformation[1];
             if (a >= 0x1000000000ull && prosper_reserved_range_state(a) == 1) {
-                void* page = (void*)(uintptr_t)(a & ~(uint64_t)0xffff);
-                if (VirtualAlloc(page, 0x10000, MEM_COMMIT, PAGE_READWRITE))
+                void* page = (void*)(uintptr_t)(a & ~(uint64_t)0x3fff);
+                if (VirtualAlloc(page, 0x4000, MEM_COMMIT, PAGE_READWRITE))
                     return EXCEPTION_CONTINUE_EXECUTION;   // re-execute against the now-committed page
             }
         }
