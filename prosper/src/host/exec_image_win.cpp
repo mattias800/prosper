@@ -170,6 +170,20 @@ namespace {
                  | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY;
         return (mbi.Protect & ok) != 0 && !(mbi.Protect & PAGE_GUARD);
     }
+    // Does the instruction at p carry an %fs segment-override prefix (0x64)? Scans the legacy
+    // prefixes and REX; stops at the opcode. Used to tell a drifted-guest-%fs fault (Windows zeroed
+    // the FS base at a kernel transition) apart from a genuine fault, so we only retry fs accesses.
+    bool insn_is_fs_relative(const uint8_t* p) {
+        for (int i = 0; i < 8; i++) {
+            uint8_t b = p[i];
+            if (b == 0x64) return true;                               // fs override
+            if (b==0x66||b==0x67||b==0xF0||b==0xF2||b==0xF3||         // opnd/addr size, lock, rep
+                b==0x2E||b==0x36||b==0x3E||b==0x26||b==0x65) continue; // other segment overrides
+            if ((b & 0xF0) == 0x40) continue;                        // REX
+            return false;                                            // opcode reached; no fs prefix
+        }
+        return false;
+    }
     void dump_fault_bytes(uint64_t start, int n) {
         for (int i = 0; i < n; i++) {
             uint64_t a = start + i;
@@ -223,6 +237,14 @@ namespace {
         CONTEXT* c = ep->ContextRecord;
         DWORD code = ep->ExceptionRecord->ExceptionCode;
         if (code == EXCEPTION_ILLEGAL_INSTRUCTION && try_emulate_sse4a(c))
+            return EXCEPTION_CONTINUE_EXECUTION;
+        // Guest %fs base drift: Windows zeroes the user FS base on every kernel transition, so a
+        // guest fs-relative TLS access can fault at a low linear address after a context switch /
+        // syscall even though the guest TCB is fine. If the faulting instruction is fs-relative and
+        // our guest TP just needs re-applying, do so and retry — costing one fault per kernel-transition
+        // boundary, not per access. Runs BEFORE the t_armed gate so guest worker threads get it too.
+        if (code == EXCEPTION_ACCESS_VIOLATION && addr_readable(c->Rip) &&
+            insn_is_fs_relative((const uint8_t*)(uintptr_t)c->Rip) && guest_fs_reapply())
             return EXCEPTION_CONTINUE_EXECUTION;
         if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
             code != EXCEPTION_IN_PAGE_ERROR && code != EXCEPTION_PRIV_INSTRUCTION &&
@@ -322,6 +344,7 @@ void set_module_start_param_ranges(const std::vector<std::pair<uint64_t, uint64_
 }
 
 size_t run_guest_inits(const std::vector<uint64_t>& fns) {
+    guest_tls_activate_thread();   // give this (main) thread its guest %fs TCB before running guest code
     size_t ok = 0;
     for (uint64_t f : fns) {
         g_trap_kind = 0; t_armed = 1;
@@ -410,6 +433,8 @@ BootResult run_entry(const LoadedImage& img) {
     if (__builtin_setjmp(t_jb) == 0) {
         tib->StackBase  = (void*)((uintptr_t)stk + STK);   // high end (grows down toward StackLimit)
         tib->StackLimit = stk;                             // low end of the committed guest stack
+        guest_tls_activate_thread();   // (re-)apply this thread's guest %fs base immediately before entry
+                                       // (idempotent; no syscall on the re-apply path, so fs survives to the jmp)
         register uint64_t e  asm("rax") = img.entry;
         register uint64_t s  asm("r8")  = sp;
         register uint64_t d  asm("r9")  = rdi;

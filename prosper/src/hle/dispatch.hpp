@@ -142,6 +142,14 @@ uint64_t guest_tls_activate_thread();   // per guest thread at entry; returns gu
 void guest_fs_enter_host_for_signal();  // crash-signal-handler entry: swap guest %fs -> host %fs (no-op if not guest TCB)
 uint64_t guest_fs_to_host_scoped();     // diagnostic handler (returns to guest): swap to host %fs, return prev fs
 void guest_fs_restore_scoped(uint64_t prev_fs);  // restore the fs returned by guest_fs_to_host_scoped
+// This thread's guest TP (0 if guest-fs not active on it). On Windows the fault handler queries this
+// to detect a drifted FS base (Windows zeroes the user FS base on every kernel transition).
+uint64_t guest_fs_current_tp();
+// If guest-fs is active on this thread and the live FS base has drifted from the guest TP, re-apply
+// wrfsbase(guest TP) and return true; else false. The Windows VEH calls this to transparently retry a
+// faulting guest %fs access after the OS reset the base. Returns false when the base is already
+// correct (so a genuine fault at an fs-relative insn is NOT retried forever). No-op → false on Linux.
+bool guest_fs_reapply();
 // Diagnostic (test): the Variant II static-TLS distance below the thread pointer for module id
 // `modid`, and the total below TP — verifies the per-module PT_TLS p_align layout (#143). Linux-only.
 uint64_t guest_tls_module_below(uint32_t modid);
