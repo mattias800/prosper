@@ -62,6 +62,14 @@ struct RenderState {
     bool depth_clear_enable = false, stencil_clear_enable = false;
     uint64_t depth_read_base = 0, depth_write_base = 0;
     uint64_t stencil_read_base = 0, stencil_write_base = 0;
+    // Raw guest depth-surface programming retained for cache-lifetime diagnostics (#611). The four
+    // plane bases alone do not distinguish mip/slice views, HTILE metadata, or a re-described backing.
+    uint32_t db_depth_view = 0, db_render_override = 0, db_render_override2 = 0;
+    uint64_t htile_data_base = 0;
+    uint32_t db_depth_size_xy = 0, db_dfsm_control = 0, db_depth_info = 0;
+    uint32_t db_z_info = 0, db_stencil_info = 0;
+    uint32_t db_depth_size = 0, db_depth_slice = 0;
+    uint32_t db_htile_surface = 0, db_rmi_l2_cache_control = 0;
     uint32_t db_shader_control = 0;
     bool stencil_test_val_export_enable = false, stencil_op_val_export_enable = false;
 
@@ -131,6 +139,12 @@ struct ResolvedPipelineState {
     bool     depth_clear_enable = false, stencil_clear_enable = false;
     uint64_t depth_read_base = 0, depth_write_base = 0;
     uint64_t stencil_read_base = 0, stencil_write_base = 0;
+    uint32_t db_depth_view = 0, db_render_override = 0, db_render_override2 = 0;
+    uint64_t htile_data_base = 0;
+    uint32_t db_depth_size_xy = 0, db_dfsm_control = 0, db_depth_info = 0;
+    uint32_t db_z_info = 0, db_stencil_info = 0;
+    uint32_t db_depth_size = 0, db_depth_slice = 0;
+    uint32_t db_htile_surface = 0, db_rmi_l2_cache_control = 0;
     uint32_t db_shader_control = 0;
     bool stencil_test_val_export_enable = false, stencil_op_val_export_enable = false;
 

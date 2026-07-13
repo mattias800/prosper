@@ -40,6 +40,21 @@ int main() {
     first.submit_no = 10; first.process_command_order = 400; first.first_command_order = 390;
     first.last_command_order = 400; first.color0_base = 0x12340000; first.draw_count = 3;
     first.dispatch_count = 1; first.color0_width = 642; first.color0_height = 362;
+    GpuTimelineDepthSurface first_depth;
+    first_depth.depth_read_base = first_depth.depth_write_base = 0x700000;
+    first_depth.stencil_read_base = first_depth.stencil_write_base = 0x830000;
+    first_depth.htile_data_base = 0x820000; first_depth.db_depth_view = 0x11;
+    first_depth.db_depth_size_xy = 0x01690281; first_depth.db_z_info = 0xa0000003;
+    first_depth.db_stencil_info = 0x20000001; first_depth.target_width = 642;
+    first_depth.target_height = 362; first_depth.draw_count = 3;
+    first_depth.depth_test_count = 3; first_depth.depth_write_count = 2;
+    first_depth.compare_mask = 1u << 3;
+    first_depth.backing_hash_mask = 7; first_depth.depth_backing_hash = 0x1111;
+    first_depth.stencil_backing_hash = 0x2222; first_depth.htile_backing_hash = 0x3333;
+    first_depth.backing_writer_kind = 3; first_depth.backing_writer_sequence = 9;
+    first_depth.backing_writer_addr = 0x820000; first_depth.backing_writer_size = 0x10000;
+    first_depth.backing_writer_order = 380; first_depth.backing_writer_identity = 0xabcdef;
+    first.depth_surfaces.push_back(first_depth);
     CHECK(writer.append_submit(first, error), "writer appends a submit record");
     GpuTimelinePresent present;
     present.present_count = 7; present.latest_submit_no = 10; present.buffer_index = 2;
@@ -82,7 +97,7 @@ int main() {
           timeline.metadata.title_id == metadata.title_id &&
           timeline.metadata.input_route == metadata.input_route,
           "metadata round-trips");
-    CHECK(timeline.version == 4 && timeline.submits.size() == 2 && timeline.presents.size() == 1 &&
+    CHECK(timeline.version == 5 && timeline.submits.size() == 2 && timeline.presents.size() == 1 &&
           timeline.details.size() == 1 && timeline.producers.size() == 1,
           "version and record counts round-trip");
     CHECK(timeline.submits[0].sequence == 1 && timeline.presents[0].sequence == 2 &&
@@ -92,6 +107,15 @@ int main() {
     CHECK(timeline.submits[0].color0_base == 0x12340000 &&
           timeline.submits[0].color0_width == 642 && timeline.submits[0].color0_height == 362,
           "target identity and extent round-trip");
+    CHECK(timeline.submits[0].depth_surfaces.size() == 1 &&
+          timeline.submits[0].depth_surfaces[0].htile_data_base == 0x820000 &&
+          timeline.submits[0].depth_surfaces[0].db_depth_size_xy == 0x01690281 &&
+          timeline.submits[0].depth_surfaces[0].depth_write_count == 2 &&
+          timeline.submits[0].depth_surfaces[0].backing_hash_mask == 7 &&
+          timeline.submits[0].depth_surfaces[0].htile_backing_hash == 0x3333 &&
+          timeline.submits[0].depth_surfaces[0].backing_writer_sequence == 9 &&
+          timeline.submits[0].depth_surfaces[0].backing_writer_identity == 0xabcdef,
+          "native timeline depth identity, HTILE programming, and use counts round-trip");
     CHECK(timeline.presents[0].buffer_index == 2 && timeline.presents[0].flip_arg == -5,
           "signed present fields round-trip");
     CHECK(timeline.details[0].submit_no == 10 && timeline.details[0].missing_operation_count == 1 &&
@@ -158,6 +182,11 @@ int main() {
     GpuState predecessor_state;
     predecessor_state.cx[prosper::agc::Pm4::CB_COLOR0_ATTRIB2] =
         ((642u - 1u) << 14) | (362u - 1u);
+    predecessor_state.cx[prosper::agc::Pm4::DB_DEPTH_CONTROL] = 0x36;
+    predecessor_state.cx[prosper::agc::Pm4::DB_Z_READ_BASE] = 0x7000;
+    predecessor_state.cx[prosper::agc::Pm4::DB_Z_WRITE_BASE] = 0x7000;
+    predecessor_state.cx[prosper::agc::Pm4::DB_HTILE_DATA_BASE] = 0x8200;
+    predecessor_state.cx[prosper::agc::Pm4::DB_DEPTH_SIZE_XY] = 0x01690281;
     predecessor_state.draws.push_back({3});
     predecessor_state.command_order = 120;
     begin_gpu_timeline_submit(41);
@@ -173,6 +202,11 @@ int main() {
     CHECK(runtime_timeline.presents.size() == 1 && runtime_timeline.submits.size() == 3 &&
           runtime_timeline.presents[0].latest_submit_no == 42,
           "a flip during folding is associated with its active submit");
+    CHECK(runtime_timeline.submits[1].depth_surfaces.size() == 1 &&
+          runtime_timeline.submits[1].depth_surfaces[0].depth_read_base == 0x700000 &&
+          runtime_timeline.submits[1].depth_surfaces[0].htile_data_base == 0x820000 &&
+          runtime_timeline.submits[1].depth_surfaces[0].depth_test_count == 1,
+          "runtime timeline extracts compact DS programming without realizing resources");
     CHECK(runtime_timeline.details.size() == 3 && runtime_timeline.details[0].submit_no == 41 &&
           runtime_timeline.details[0].capture_path.find(bundle_capture + "#submit=41") == 0 &&
           runtime_timeline.details[1].capture_path == predecessor_capture &&
@@ -190,7 +224,8 @@ int main() {
 
     const auto compat_v2 = base.string() + "-compat-v2.prgtl";
     GpuTimelineWriter compat_writer;
-    CHECK(compat_writer.open(compat_v2, metadata, error) && compat_writer.append_submit(first, error),
+    GpuTimelineSubmit legacy_first = first; legacy_first.depth_surfaces.clear();
+    CHECK(compat_writer.open(compat_v2, metadata, error) && compat_writer.append_submit(legacy_first, error),
           "created a detail-free compatibility timeline");
     compat_writer.close();
     std::ifstream compat_input(compat_v2, std::ios::binary);

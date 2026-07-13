@@ -9,7 +9,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <set>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -32,11 +35,14 @@ void usage(const char* argv0) {
                          "[--bundle-intermediate-through-target WxH] "
                          "[--bundle-final-capsule PATH] "
                          "[--bundle-extract-submit N PATH] "
+                         "[--bundle-ds-summary] "
                          "[--bundle-find-ds ADDR] "
                          "[--bundle-zero-boundary] "
                          "[--prepend producer.prgcap] "
                          "[--dump-resource DRAW:vs|ps:BINDING PATH] [--allow-mismatch] "
-                         "[--dump-shader DRAW:vs|fs PATH] "
+                         "[--dump-shader DRAW:vs|fs PATH] [--dump-compute N PATH] "
+                         "[--dump-compute-resource N:BINDING PATH] "
+                         "[--legacy-htile-before-stencil] "
                          "<capture.prgcap> [output.bmp]\n", argv0);
 }
 
@@ -222,6 +228,14 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
                     d.ps.raw_stencil_op[1][0], d.ps.raw_stencil_op[1][1], d.ps.raw_stencil_op[1][2],
                     d.ps.db_shader_control, d.ps.stencil_test_val_export_enable,
                     d.ps.stencil_op_val_export_enable);
+        std::printf("  ds-surface view=%08x override=%08x/%08x htile=%016llx hsurface=%08x "
+                    "size-xy=%08x depth-size=%08x slice=%08x info=%08x z=%08x s=%08x "
+                    "dfsm=%08x rmi=%08x\n",
+                    d.ps.db_depth_view, d.ps.db_render_override, d.ps.db_render_override2,
+                    static_cast<unsigned long long>(d.ps.htile_data_base), d.ps.db_htile_surface,
+                    d.ps.db_depth_size_xy, d.ps.db_depth_size, d.ps.db_depth_slice,
+                    d.ps.db_depth_info, d.ps.db_z_info, d.ps.db_stencil_info,
+                    d.ps.db_dfsm_control, d.ps.db_rmi_l2_cache_control);
         inspect_table("VS", d.vrt.get(), replay.rtt_seeds);
         inspect_table("PS", d.prt.get(), replay.rtt_seeds);
     }
@@ -303,12 +317,195 @@ bool ranges_overlap(uint64_t a, uint64_t as, uint64_t b, uint64_t bs) {
     return a < range_end(b, bs) && b < range_end(a, as);
 }
 
+struct BundleDsIdentity {
+    uint64_t depth_read = 0, depth_write = 0;
+    uint64_t stencil_read = 0, stencil_write = 0;
+
+    bool operator<(const BundleDsIdentity& other) const {
+        return std::tie(depth_read, depth_write, stencil_read, stencil_write) <
+               std::tie(other.depth_read, other.depth_write,
+                        other.stencil_read, other.stencil_write);
+    }
+    bool operator==(const BundleDsIdentity& other) const {
+        return depth_read == other.depth_read && depth_write == other.depth_write &&
+               stencil_read == other.stencil_read && stencil_write == other.stencil_write;
+    }
+};
+
+BundleDsIdentity ds_identity(const prosper::gpu::ResolvedPipelineState& ps) {
+    return {ps.depth_read_base, ps.depth_write_base,
+            ps.stencil_read_base, ps.stencil_write_base};
+}
+
+bool uses_depth_stencil(const prosper::gpu::ResolvedPipelineState& ps) {
+    return ps.depth_test_enable || ps.depth_write_enable || ps.stencil_enable ||
+           ps.depth_clear_enable || ps.stencil_clear_enable;
+}
+
+struct BundleDsProgramming {
+    uint32_t view = 0, render_override = 0, render_override2 = 0;
+    uint64_t htile = 0;
+    uint32_t size_xy = 0, dfsm = 0, depth_info = 0, z_info = 0, stencil_info = 0;
+    uint32_t depth_size = 0, depth_slice = 0, htile_surface = 0, rmi = 0;
+
+    bool operator<(const BundleDsProgramming& other) const {
+        return std::tie(view, render_override, render_override2, htile, size_xy, dfsm,
+                        depth_info, z_info, stencil_info, depth_size, depth_slice,
+                        htile_surface, rmi) <
+               std::tie(other.view, other.render_override, other.render_override2, other.htile,
+                        other.size_xy, other.dfsm, other.depth_info, other.z_info,
+                        other.stencil_info, other.depth_size, other.depth_slice,
+                        other.htile_surface, other.rmi);
+    }
+    bool operator==(const BundleDsProgramming& other) const {
+        return !(*this < other) && !(other < *this);
+    }
+};
+
+BundleDsProgramming ds_programming(const prosper::gpu::ResolvedPipelineState& ps) {
+    return {ps.db_depth_view, ps.db_render_override, ps.db_render_override2,
+            ps.htile_data_base, ps.db_depth_size_xy, ps.db_dfsm_control,
+            ps.db_depth_info, ps.db_z_info, ps.db_stencil_info,
+            ps.db_depth_size, ps.db_depth_slice, ps.db_htile_surface,
+            ps.db_rmi_l2_cache_control};
+}
+
+int summarize_bundle_ds(const prosper::gpu::GpuCaptureBundle& bundle,
+                        size_t first_submit_index, std::string& error) {
+    struct Stats {
+        uint64_t first_submit = UINT64_MAX, last_submit = 0;
+        size_t submits = 0, passes = 0, draws = 0;
+        size_t tests = 0, writes = 0, clears = 0;
+        uint32_t compare_mask = 0;
+        std::set<std::pair<uint32_t, uint32_t>> targets;
+        std::set<BundleDsProgramming> programming;
+    };
+    std::map<BundleDsIdentity, Stats> totals;
+    std::map<uint64_t, BundleDsIdentity> previous_by_target;
+    std::map<uint64_t, BundleDsProgramming> previous_programming_by_target;
+    size_t ds_submits = 0, ds_passes = 0, mixed_passes = 0;
+    size_t anonymous_passes = 0, cache_key_transitions = 0, programming_transitions = 0;
+
+    for (size_t i = first_submit_index; i < bundle.submits.size(); ++i) {
+        prosper::gpu::GpuCaptureFile manifest;
+        if (!prosper::gpu::materialize_gpu_capture_bundle_manifest(bundle, i, manifest, error)) {
+            std::fprintf(stderr, "gpu_replay: cannot reconstruct bundle manifest %zu: %s\n",
+                         i, error.c_str());
+            return 2;
+        }
+        std::set<BundleDsIdentity> submit_identities;
+        bool submit_uses_ds = false;
+        size_t pass_begin = 0;
+        while (pass_begin < manifest.draws.size()) {
+            const uint64_t target = manifest.draws[pass_begin].color0_base;
+            size_t pass_end = pass_begin + 1;
+            while (pass_end < manifest.draws.size() &&
+                   manifest.draws[pass_end].color0_base == target)
+                ++pass_end;
+
+            std::set<BundleDsIdentity> pass_identities;
+            BundleDsIdentity selected_identity{};
+            BundleDsProgramming selected_programming{};
+            bool have_selected_identity = false;
+            for (size_t draw_index = pass_begin; draw_index < pass_end; ++draw_index) {
+                const auto& draw = manifest.draws[draw_index];
+                const auto& ps = draw.ps;
+                if (!uses_depth_stencil(ps)) continue;
+                submit_uses_ds = true;
+                const BundleDsIdentity identity = ds_identity(ps);
+                if (!have_selected_identity) {
+                    selected_identity = identity;
+                    selected_programming = ds_programming(ps);
+                    have_selected_identity = true;
+                }
+                pass_identities.insert(identity);
+                submit_identities.insert(identity);
+                Stats& stats = totals[identity];
+                stats.first_submit = std::min(stats.first_submit, manifest.metadata.submit_index);
+                stats.last_submit = std::max(stats.last_submit, manifest.metadata.submit_index);
+                ++stats.draws;
+                stats.tests += ps.depth_test_enable;
+                stats.writes += ps.depth_write_enable;
+                stats.clears += ps.depth_clear_enable || ps.stencil_clear_enable;
+                if (ps.depth_test_enable && ps.depth_compare_op < 32)
+                    stats.compare_mask |= 1u << ps.depth_compare_op;
+                stats.targets.insert({draw.color0_width, draw.color0_height});
+                stats.programming.insert(ds_programming(ps));
+            }
+            if (!pass_identities.empty()) {
+                ++ds_passes;
+                for (const auto& identity : pass_identities) ++totals[identity].passes;
+                if (pass_identities.size() > 1) {
+                    ++mixed_passes;
+                    std::printf("ds-mixed-submit=%llu target=%016llx extent=%ux%u identities=%zu\n",
+                                static_cast<unsigned long long>(manifest.metadata.submit_index),
+                                static_cast<unsigned long long>(target),
+                                manifest.draws[pass_begin].color0_width,
+                                manifest.draws[pass_begin].color0_height,
+                                pass_identities.size());
+                }
+                if (selected_identity == BundleDsIdentity{}) ++anonymous_passes;
+                auto previous = previous_by_target.find(target);
+                if (previous != previous_by_target.end() &&
+                    !(previous->second == selected_identity))
+                    ++cache_key_transitions;
+                previous_by_target[target] = selected_identity;
+                auto previous_programming = previous_programming_by_target.find(target);
+                if (previous_programming != previous_programming_by_target.end() &&
+                    !(previous_programming->second == selected_programming))
+                    ++programming_transitions;
+                previous_programming_by_target[target] = selected_programming;
+            }
+            pass_begin = pass_end;
+        }
+        if (submit_uses_ds) ++ds_submits;
+        for (const auto& identity : submit_identities) ++totals[identity].submits;
+    }
+
+    for (const auto& [identity, stats] : totals) {
+        const auto first_target = stats.targets.empty()
+            ? std::pair<uint32_t, uint32_t>{0, 0} : *stats.targets.begin();
+        std::printf("ds-identity z=%016llx/%016llx s=%016llx/%016llx "
+                    "submits=%zu passes=%zu draws=%zu first=%llu last=%llu "
+                    "tests=%zu writes=%zu clears=%zu compare-mask=%08x "
+                    "targets=%zu first-target=%ux%u programming=%zu\n",
+                    static_cast<unsigned long long>(identity.depth_read),
+                    static_cast<unsigned long long>(identity.depth_write),
+                    static_cast<unsigned long long>(identity.stencil_read),
+                    static_cast<unsigned long long>(identity.stencil_write),
+                    stats.submits, stats.passes, stats.draws,
+                    static_cast<unsigned long long>(stats.first_submit),
+                    static_cast<unsigned long long>(stats.last_submit),
+                    stats.tests, stats.writes, stats.clears, stats.compare_mask,
+                    stats.targets.size(), first_target.first, first_target.second,
+                    stats.programming.size());
+        if (stats.programming.size() > 1) {
+            for (const auto& p : stats.programming)
+                std::printf("  ds-programming view=%08x override=%08x/%08x htile=%016llx "
+                            "hsurface=%08x size=%08x/%08x/%08x info=%08x/%08x/%08x "
+                            "dfsm=%08x rmi=%08x\n",
+                            p.view, p.render_override, p.render_override2,
+                            static_cast<unsigned long long>(p.htile), p.htile_surface,
+                            p.size_xy, p.depth_size, p.depth_slice,
+                            p.depth_info, p.z_info, p.stencil_info, p.dfsm, p.rmi);
+        }
+    }
+    std::fprintf(stderr,
+                 "[gpureplay] DS summary submits=%zu/%zu passes=%zu identities=%zu "
+                 "mixed-passes=%zu anonymous-passes=%zu target-key-transitions=%zu "
+                 "programming-transitions=%zu\n",
+                 ds_submits, bundle.submits.size() - first_submit_index, ds_passes,
+                 totals.size(), mixed_passes, anonymous_passes, cache_key_transitions,
+                 programming_transitions);
+    return totals.empty() ? 1 : 0;
+}
+
 int replay_bundle(const std::string& path, const char* output_path, bool zero_boundary,
                   size_t tail_count, const std::string& compact_path,
                   uint32_t intermediate_target_width, uint32_t intermediate_target_height,
                   const std::string& final_capsule_path,
                   uint64_t extract_submit_no, const std::string& extract_submit_path,
-                  uint64_t find_ds_addr) {
+                  uint64_t find_ds_addr, bool ds_summary) {
     prosper::gpu::GpuCaptureBundle bundle;
     std::string error;
     if (!prosper::gpu::read_gpu_capture_bundle(path, bundle, error)) {
@@ -331,6 +528,7 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
                  static_cast<unsigned long long>(stats.resource_logical_bytes),
                  static_cast<unsigned long long>(stats.resource_unique_bytes),
                  static_cast<unsigned long long>(stats.manifest_unique_bytes));
+    if (ds_summary) return summarize_bundle_ds(bundle, first_submit_index, error);
     if (find_ds_addr) {
         size_t matching_submits = 0;
         for (size_t i = first_submit_index; i < bundle.submits.size(); ++i) {
@@ -658,12 +856,16 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
 
 int main(int argc, char** argv) {
     bool inspect = false, inspect_only = false, validate_only = false, allow_mismatch = false;
-    bool graph_only = false, bundle_zero_boundary = false;
+    bool graph_only = false, bundle_zero_boundary = false, bundle_ds_summary = false;
+    bool legacy_htile_before_stencil = false;
     size_t bundle_tail = 0;
     uint32_t bundle_intermediate_target_width = 0, bundle_intermediate_target_height = 0;
     int draw_first = -1, draw_last = -1;
     int through_operation = -1;
-    std::string dump_spec, dump_path, shader_spec, shader_path, graph_json_path, prepend_path;
+    std::string dump_spec, dump_path, shader_spec, shader_path;
+    std::string compute_shader_spec, compute_shader_path;
+    std::string compute_resource_spec, compute_resource_path;
+    std::string graph_json_path, prepend_path;
     std::string bundle_path, bundle_compact_path;
     std::string bundle_final_capsule_path;
     std::string bundle_extract_submit_path;
@@ -679,8 +881,11 @@ int main(int argc, char** argv) {
             graph_only = true; graph_json_path = argv[++i];
         }
         else if (std::string(argv[i]) == "--allow-mismatch") allow_mismatch = true;
+        else if (std::string(argv[i]) == "--legacy-htile-before-stencil")
+            legacy_htile_before_stencil = true;
         else if (std::string(argv[i]) == "--bundle" && i + 1 < argc) bundle_path = argv[++i];
         else if (std::string(argv[i]) == "--bundle-zero-boundary") bundle_zero_boundary = true;
+        else if (std::string(argv[i]) == "--bundle-ds-summary") bundle_ds_summary = true;
         else if (std::string(argv[i]) == "--bundle-compact" && i + 1 < argc)
             bundle_compact_path = argv[++i];
         else if (std::string(argv[i]) == "--bundle-tail" && i + 1 < argc) {
@@ -727,12 +932,22 @@ int main(int argc, char** argv) {
         else if (std::string(argv[i]) == "--dump-shader" && i + 2 < argc) {
             shader_spec = argv[++i]; shader_path = argv[++i];
         }
+        else if (std::string(argv[i]) == "--dump-compute" && i + 2 < argc) {
+            compute_shader_spec = argv[++i]; compute_shader_path = argv[++i];
+        }
+        else if (std::string(argv[i]) == "--dump-compute-resource" && i + 2 < argc) {
+            compute_resource_spec = argv[++i]; compute_resource_path = argv[++i];
+        }
         else positional.push_back(argv[i]);
     }
+    if (legacy_htile_before_stencil)
+        set_environment("PROSPER_GPU_REPLAY_LEGACY_HTILE_BEFORE_STENCIL", "1");
     if (!bundle_path.empty()) {
+        if (bundle_ds_summary && bundle_find_ds_addr) { usage(argv[0]); return 2; }
         if (positional.size() > 1 || inspect || inspect_only || validate_only || graph_only ||
             draw_first >= 0 || through_operation >= 0 || !dump_spec.empty() ||
-            !shader_spec.empty() || !prepend_path.empty()) {
+            !shader_spec.empty() || !compute_shader_spec.empty() ||
+            !compute_resource_spec.empty() || !prepend_path.empty()) {
             usage(argv[0]); return 2;
         }
         return replay_bundle(bundle_path, positional.empty() ? nullptr : positional[0],
@@ -742,11 +957,12 @@ int main(int argc, char** argv) {
                              bundle_final_capsule_path,
                              bundle_extract_submit_no,
                              bundle_extract_submit_path,
-                             bundle_find_ds_addr);
+                             bundle_find_ds_addr,
+                             bundle_ds_summary);
     }
     if (bundle_zero_boundary || bundle_tail || !bundle_compact_path.empty() ||
         bundle_intermediate_target_width || !bundle_final_capsule_path.empty() ||
-        !bundle_extract_submit_path.empty() || bundle_find_ds_addr) {
+        !bundle_extract_submit_path.empty() || bundle_find_ds_addr || bundle_ds_summary) {
         usage(argv[0]); return 2;
     }
     if (positional.empty() || positional.size() > 2) { usage(argv[0]); return 2; }
@@ -828,6 +1044,66 @@ int main(int argc, char** argv) {
         std::fclose(f);
         std::fprintf(stderr, "[gpureplay] dumped %s (%zu bytes) to %s\n", shader_spec.c_str(), bytes,
                      shader_path.c_str());
+    }
+    if (!compute_shader_spec.empty()) {
+        char* end = nullptr;
+        const long index = std::strtol(compute_shader_spec.c_str(), &end, 0);
+        if (!end || *end || index < 0 || static_cast<size_t>(index) >= replay.computes.size()) {
+            std::fprintf(stderr, "gpu_replay: invalid compute selector %s\n",
+                         compute_shader_spec.c_str());
+            return 2;
+        }
+        const auto& words = replay.computes[static_cast<size_t>(index)].spirv;
+        FILE* f = std::fopen(compute_shader_path.c_str(), "wb");
+        const size_t bytes = words.size() * sizeof(uint32_t);
+        if (!f || std::fwrite(words.data(), 1, bytes, f) != bytes) {
+            if (f) std::fclose(f);
+            std::fprintf(stderr, "gpu_replay: cannot write %s\n", compute_shader_path.c_str());
+            return 2;
+        }
+        std::fclose(f);
+        std::fprintf(stderr, "[gpureplay] dumped compute %ld (%zu bytes) to %s\n",
+                     index, bytes, compute_shader_path.c_str());
+    }
+    if (!compute_resource_spec.empty()) {
+        const size_t colon = compute_resource_spec.find(':');
+        char* index_end = nullptr;
+        const long index = std::strtol(compute_resource_spec.c_str(), &index_end, 0);
+        char* binding_end = nullptr;
+        const long binding = colon == std::string::npos ? -1 :
+            std::strtol(compute_resource_spec.c_str() + colon + 1, &binding_end, 0);
+        if (colon == std::string::npos || index_end != compute_resource_spec.c_str() + colon ||
+            !binding_end || *binding_end || index < 0 || binding < 0 ||
+            static_cast<size_t>(index) >= replay.computes.size()) {
+            std::fprintf(stderr, "gpu_replay: invalid compute resource selector %s\n",
+                         compute_resource_spec.c_str());
+            return 2;
+        }
+        const auto& compute = replay.computes[static_cast<size_t>(index)];
+        const prosper::gpu::ShaderResource* found = nullptr;
+        if (compute.resources)
+            for (const auto& resource : compute.resources->resources)
+                if (resource.binding == static_cast<uint32_t>(binding)) {
+                    found = &resource;
+                    break;
+                }
+        if (!found || !found->host_data) {
+            std::fprintf(stderr, "gpu_replay: compute resource %s not found or has no captured bytes\n",
+                         compute_resource_spec.c_str());
+            return 2;
+        }
+        FILE* f = std::fopen(compute_resource_path.c_str(), "wb");
+        if (!f || std::fwrite(found->host_data, 1, static_cast<size_t>(found->host_data_size), f) !=
+                      found->host_data_size) {
+            if (f) std::fclose(f);
+            std::fprintf(stderr, "gpu_replay: cannot write %s\n", compute_resource_path.c_str());
+            return 2;
+        }
+        std::fclose(f);
+        std::fprintf(stderr, "[gpureplay] dumped compute resource %s (%llu bytes) to %s\n",
+                     compute_resource_spec.c_str(),
+                     static_cast<unsigned long long>(found->host_data_size),
+                     compute_resource_path.c_str());
     }
     if (draw_first >= 0) {
         if (draw_last < draw_first || static_cast<size_t>(draw_last) >= replay.items.size()) {

@@ -38,6 +38,11 @@ int main() {
     draw.ps.has_stencil_clear = true; draw.ps.stencil_clear_value = 3;
     draw.ps.stencil_read_base = 0x12345000; draw.ps.raw_stencil_op[0][1] = 4;
     draw.ps.db_shader_control = 2; draw.ps.stencil_test_val_export_enable = true;
+    draw.ps.db_depth_view = 0x04002001; draw.ps.htile_data_base = 0x12389000;
+    draw.ps.db_depth_size_xy = 0x01230234; draw.ps.db_depth_info = 0x44;
+    draw.ps.db_z_info = 0x55; draw.ps.db_stencil_info = 0x66;
+    draw.ps.db_depth_size = 0x77; draw.ps.db_depth_slice = 0x88;
+    draw.ps.db_htile_surface = 0x99;
 
     GpuCaptureMetadata meta; meta.width = 480; meta.height = 270; meta.submit_index = 42;
     meta.revision = "deadbeef"; meta.title_id = "PPSA24651"; meta.input_route = "@reach-level.pad";
@@ -93,8 +98,12 @@ int main() {
           loaded.draws[0].ps.has_stencil_clear && loaded.draws[0].ps.stencil_clear_value == 3 &&
           loaded.draws[0].ps.stencil_read_base == 0x12345000 &&
           loaded.draws[0].ps.raw_stencil_op[0][1] == 4 && loaded.draws[0].ps.db_shader_control == 2 &&
-          loaded.draws[0].ps.stencil_test_val_export_enable,
-          "clear intent, DS identity, and raw stencil-op provenance round-trip");
+          loaded.draws[0].ps.stencil_test_val_export_enable &&
+          loaded.draws[0].ps.db_depth_view == 0x04002001 &&
+          loaded.draws[0].ps.htile_data_base == 0x12389000 &&
+          loaded.draws[0].ps.db_depth_size_xy == 0x01230234 &&
+          loaded.draws[0].ps.db_htile_surface == 0x99,
+          "clear intent, DS identity/programming, and raw stencil-op provenance round-trip");
 
     GpuReplayFrame replay;
     CHECK(materialize_gpu_replay(loaded, replay, error), "capture materializes owned replay draw items");

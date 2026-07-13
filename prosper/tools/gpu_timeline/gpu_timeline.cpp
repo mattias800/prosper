@@ -4,7 +4,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <set>
 #include <string>
+#include <tuple>
 #include <utility>
 
 using namespace prosper::gpu;
@@ -19,9 +21,147 @@ const char* writer_kind_name(GpuTimelineWriterKind kind) {
     }
 }
 
+struct DepthKey {
+    GpuTimelineDepthSurface ds;
+    bool operator<(const DepthKey& other) const {
+        const auto& a = ds; const auto& b = other.ds;
+        return std::tie(a.depth_read_base, a.depth_write_base,
+                        a.stencil_read_base, a.stencil_write_base, a.htile_data_base,
+                        a.db_depth_view, a.db_render_override, a.db_render_override2,
+                        a.db_depth_size_xy, a.db_dfsm_control, a.db_depth_info,
+                        a.db_z_info, a.db_stencil_info, a.db_depth_size, a.db_depth_slice,
+                        a.db_htile_surface, a.db_rmi_l2_cache_control,
+                        a.target_width, a.target_height) <
+               std::tie(b.depth_read_base, b.depth_write_base,
+                        b.stencil_read_base, b.stencil_write_base, b.htile_data_base,
+                        b.db_depth_view, b.db_render_override, b.db_render_override2,
+                        b.db_depth_size_xy, b.db_dfsm_control, b.db_depth_info,
+                        b.db_z_info, b.db_stencil_info, b.db_depth_size, b.db_depth_slice,
+                        b.db_htile_surface, b.db_rmi_l2_cache_control,
+                        b.target_width, b.target_height);
+    }
+};
+
+struct DepthBaseKey {
+    uint64_t dr = 0, dw = 0, sr = 0, sw = 0;
+    uint32_t width = 0, height = 0;
+    bool operator<(const DepthBaseKey& other) const {
+        return std::tie(dr, dw, sr, sw, width, height) <
+               std::tie(other.dr, other.dw, other.sr, other.sw,
+                        other.width, other.height);
+    }
+};
+
+int print_depth_summary(const GpuTimelineFile& timeline, uint32_t filter_width,
+                        uint32_t filter_height) {
+    struct Stats {
+        uint64_t first_submit = UINT64_MAX, last_submit = 0;
+        uint64_t submits = 0, draws = 0, tests = 0, writes = 0, clears = 0;
+        uint32_t compare_mask = 0;
+        std::set<std::tuple<uint32_t, uint64_t, uint64_t, uint64_t>> backing_versions;
+        GpuTimelineDepthSurface latest_writer;
+    };
+    std::map<DepthKey, Stats> totals;
+    std::map<DepthBaseKey, DepthKey> previous;
+    std::map<DepthKey, std::tuple<uint32_t, uint64_t, uint64_t, uint64_t>> previous_backing;
+    uint64_t transitions = 0, backing_transitions = 0;
+    for (const auto& submit : timeline.submits) {
+        for (const auto& ds : submit.depth_surfaces) {
+            if (filter_width && (ds.target_width != filter_width || ds.target_height != filter_height))
+                continue;
+            DepthKey key{ds};
+            Stats& stats = totals[key];
+            stats.first_submit = std::min(stats.first_submit, submit.submit_no);
+            stats.last_submit = std::max(stats.last_submit, submit.submit_no);
+            ++stats.submits;
+            stats.draws += ds.draw_count;
+            stats.tests += ds.depth_test_count;
+            stats.writes += ds.depth_write_count;
+            stats.clears += ds.clear_count;
+            stats.compare_mask |= ds.compare_mask;
+            const auto backing = std::tuple{ds.backing_hash_mask, ds.depth_backing_hash,
+                                            ds.stencil_backing_hash, ds.htile_backing_hash};
+            if (ds.backing_hash_mask) {
+                stats.backing_versions.insert(backing);
+                auto prior_backing = previous_backing.find(key);
+                if (prior_backing != previous_backing.end() && prior_backing->second != backing)
+                    ++backing_transitions;
+                previous_backing[key] = backing;
+            }
+            if (ds.backing_writer_sequence > stats.latest_writer.backing_writer_sequence)
+                stats.latest_writer = ds;
+            DepthBaseKey base{ds.depth_read_base, ds.depth_write_base,
+                              ds.stencil_read_base, ds.stencil_write_base,
+                              ds.target_width, ds.target_height};
+            auto prior = previous.find(base);
+            if (prior != previous.end() && (prior->second < key || key < prior->second)) ++transitions;
+            previous[base] = key;
+        }
+    }
+    for (const auto& [key, stats] : totals) {
+        const auto& ds = key.ds;
+        std::printf("depth z=%016llx/%016llx s=%016llx/%016llx htile=%016llx "
+                    "target=%ux%u submits=%llu first=%llu last=%llu draws=%llu "
+                    "tests=%llu writes=%llu clears=%llu compare-mask=%08x "
+                    "view=%08x override=%08x/%08x size=%08x/%08x/%08x "
+                    "info=%08x/%08x/%08x hsurface=%08x dfsm=%08x rmi=%08x\n",
+                    static_cast<unsigned long long>(ds.depth_read_base),
+                    static_cast<unsigned long long>(ds.depth_write_base),
+                    static_cast<unsigned long long>(ds.stencil_read_base),
+                    static_cast<unsigned long long>(ds.stencil_write_base),
+                    static_cast<unsigned long long>(ds.htile_data_base),
+                    ds.target_width, ds.target_height,
+                    static_cast<unsigned long long>(stats.submits),
+                    static_cast<unsigned long long>(stats.first_submit),
+                    static_cast<unsigned long long>(stats.last_submit),
+                    static_cast<unsigned long long>(stats.draws),
+                    static_cast<unsigned long long>(stats.tests),
+                    static_cast<unsigned long long>(stats.writes),
+                    static_cast<unsigned long long>(stats.clears), stats.compare_mask,
+                    ds.db_depth_view, ds.db_render_override, ds.db_render_override2,
+                    ds.db_depth_size_xy, ds.db_depth_size, ds.db_depth_slice,
+                    ds.db_depth_info, ds.db_z_info, ds.db_stencil_info,
+                    ds.db_htile_surface, ds.db_dfsm_control, ds.db_rmi_l2_cache_control);
+        if (!stats.backing_versions.empty()) {
+            const auto& [mask, depth, stencil, htile] = *stats.backing_versions.begin();
+            std::printf("  backing versions=%zu mask=%x first=%016llx/%016llx/%016llx\n",
+                        stats.backing_versions.size(), mask,
+                        static_cast<unsigned long long>(depth),
+                        static_cast<unsigned long long>(stencil),
+                        static_cast<unsigned long long>(htile));
+        }
+        if (stats.latest_writer.backing_writer_sequence) {
+            const auto& writer = stats.latest_writer;
+            std::printf("  writer kind=%s sequence=%llu range=%016llx/+%llx order=%llu identity=%016llx\n",
+                        writer_kind_name(static_cast<GpuTimelineWriterKind>(writer.backing_writer_kind)),
+                        static_cast<unsigned long long>(writer.backing_writer_sequence),
+                        static_cast<unsigned long long>(writer.backing_writer_addr),
+                        static_cast<unsigned long long>(writer.backing_writer_size),
+                        static_cast<unsigned long long>(writer.backing_writer_order),
+                        static_cast<unsigned long long>(writer.backing_writer_identity));
+        }
+    }
+    std::fprintf(stderr, "gpu_timeline: depth-summary surfaces=%zu base-identities=%zu "
+                         "transitions=%llu backing-transitions=%llu%s\n",
+                 totals.size(), previous.size(), static_cast<unsigned long long>(transitions),
+                 static_cast<unsigned long long>(backing_transitions),
+                 timeline.version < 5 ? " (timeline predates v5 depth metadata)" : "");
+    return totals.empty() ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
-    if (argc < 2 || argc > 3 || (argc == 3 && std::string(argv[2]) != "--records")) {
-        std::fprintf(stderr, "usage: gpu_timeline <capture.prgtl> [--records]\n");
+    const bool records = argc == 3 && std::string(argv[2]) == "--records";
+    const bool depth_summary = argc >= 3 && std::string(argv[2]) == "--depth-summary";
+    uint32_t depth_width = 0, depth_height = 0;
+    if (depth_summary && argc == 4) {
+        unsigned width = 0, height = 0; char tail = 0;
+        if (std::sscanf(argv[3], "%ux%u%c", &width, &height, &tail) == 2 && width && height) {
+            depth_width = width; depth_height = height;
+        }
+    }
+    if (argc < 2 || argc > 4 || (argc == 3 && !records && !depth_summary) ||
+        (argc == 4 && (!depth_summary || !depth_width))) {
+        std::fprintf(stderr, "usage: gpu_timeline <capture.prgtl> [--records|--depth-summary [WxH]]\n");
         return 2;
     }
     GpuTimelineFile timeline;
@@ -30,6 +170,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "gpu_timeline: %s: %s\n", argv[1], error.c_str());
         return 1;
     }
+    if (depth_summary) return print_depth_summary(timeline, depth_width, depth_height);
 
     uint64_t last_ns = 0, draws = 0, dispatches = 0;
     std::map<std::pair<uint32_t, uint32_t>, uint64_t> target_extents;
@@ -98,7 +239,7 @@ int main(int argc, char** argv) {
                     producer.first_color_control_mode, producer.first_target_mask,
                     producer.first_color_format);
 
-    if (argc == 3) {
+    if (records) {
         size_t si = 0, pi = 0, di = 0, xi = 0;
         while (si < timeline.submits.size() || pi < timeline.presents.size() ||
                di < timeline.details.size() || xi < timeline.producers.size()) {
@@ -116,6 +257,34 @@ int main(int argc, char** argv) {
                             static_cast<unsigned long long>(s.last_command_order),
                             static_cast<unsigned long long>(s.color0_base),
                             s.color0_width, s.color0_height);
+                for (const auto& depth : s.depth_surfaces)
+                    std::printf("  depth z=%016llx/%016llx s=%016llx/%016llx htile=%016llx "
+                                "target=%ux%u draws=%u tests=%u writes=%u clears=%u compare-mask=%08x\n",
+                                static_cast<unsigned long long>(depth.depth_read_base),
+                                static_cast<unsigned long long>(depth.depth_write_base),
+                                static_cast<unsigned long long>(depth.stencil_read_base),
+                                static_cast<unsigned long long>(depth.stencil_write_base),
+                                static_cast<unsigned long long>(depth.htile_data_base),
+                                depth.target_width, depth.target_height, depth.draw_count,
+                                depth.depth_test_count, depth.depth_write_count,
+                                depth.clear_count, depth.compare_mask);
+                for (const auto& depth : s.depth_surfaces)
+                    if (depth.backing_hash_mask)
+                        std::printf("    backing mask=%x hash=%016llx/%016llx/%016llx\n",
+                                    depth.backing_hash_mask,
+                                    static_cast<unsigned long long>(depth.depth_backing_hash),
+                                    static_cast<unsigned long long>(depth.stencil_backing_hash),
+                                    static_cast<unsigned long long>(depth.htile_backing_hash));
+                for (const auto& depth : s.depth_surfaces)
+                    if (depth.backing_writer_sequence)
+                        std::printf("    writer kind=%s sequence=%llu range=%016llx/+%llx "
+                                    "order=%llu identity=%016llx\n",
+                                    writer_kind_name(static_cast<GpuTimelineWriterKind>(depth.backing_writer_kind)),
+                                    static_cast<unsigned long long>(depth.backing_writer_sequence),
+                                    static_cast<unsigned long long>(depth.backing_writer_addr),
+                                    static_cast<unsigned long long>(depth.backing_writer_size),
+                                    static_cast<unsigned long long>(depth.backing_writer_order),
+                                    static_cast<unsigned long long>(depth.backing_writer_identity));
             } else if (ps <= ds && ps <= xs) {
                 const auto& p = timeline.presents[pi++];
                 std::printf("%llu %.6f present=%llu latest-submit=%llu buffer=%d flip-arg=%lld extent=%ux%u\n",

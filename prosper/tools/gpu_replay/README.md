@@ -60,7 +60,15 @@ expected hash. `--allow-mismatch` is for an intentional differential such as `--
 ./build-linux/gpu_replay --through-operation 52 /tmp/submit.prgcap /tmp/prefix.bmp
 ./build-linux/gpu_replay --dump-resource 18:ps:34 /tmp/texture.bin /tmp/submit.prgcap
 ./build-linux/gpu_replay --dump-shader 18:fs /tmp/fragment.spv /tmp/submit.prgcap
+./build-linux/gpu_replay --dump-compute 0 /tmp/compute.spv /tmp/submit.prgcap
+./build-linux/gpu_replay --dump-compute-resource 0:2 /tmp/storage.bin /tmp/submit.prgcap
 ```
+
+Compute selectors use the realized compute index printed by `--inspect-only`. The resource selector is
+`COMPUTE:BINDING`; it writes the captured pre-dispatch storage-buffer bytes, while `--dump-compute` writes
+the exact specialized SPIR-V executed by replay. For a long live run, `PROSPER_COMPUTELOG_CODE=0x...` and
+`PROSPER_COMPUTELOG_SIZE=N` restrict before/after hash diagnostics to dispatches matching the configured
+program address and storage-buffer byte size. Either filter may be used alone.
 
 `--draw` uses realized draw indices, while graphs use mixed semantic operation indices. They are not
 interchangeable when dispatches or unrealized operations are present. Replay restores serialized render-target
@@ -79,7 +87,7 @@ restored. The tool rejects a predecessor whose submit number is not earlier. A c
 consumer sampled the retained producer output, but it does not prove faithful closure: graph the predecessor
 and continue if it also has temporal leaves.
 
-`--bundle` reconstructs each captured submit through the normal version-5 validator, executes them in
+`--bundle` reconstructs each captured submit through the normal version-6 validator, executes them in
 ascending order through one renderer instance, and releases each materialized submit before the next.
 The summary reports logical versus unique bytes, per-submit output hashes, and every temporal image leaf:
 
@@ -117,6 +125,19 @@ read or write bases match `ADDR`, including draw range, target extent, depth-tes
 and compare-op bitmask. It does not reconstruct resource payloads or initialize Vulkan. Use it to establish a
 guest DS surface's lifetime before expanding a replay window or changing cache behavior.
 
+`--bundle-ds-summary` scans every depth/stencil-active draw and groups it by the renderer's current guest
+identity tuple (depth read/write plus stencil read/write bases). It reports lifetime, target extents,
+test/write/clear totals, mixed-identity passes, anonymous passes, and identity transitions for each color
+target. The query is manifest-only and can be combined with `--bundle-tail N`. Use it before changing cache
+identity or invalidation rules: a mixed pass proves the one-attachment backend is collapsing state, while a
+stable identity with no clear keeps the investigation focused on backing-memory/HTILE lifetime.
+
+`--legacy-htile-before-stencil` is an explicit migration diagnostic for the preserved pre-v6 Dead Cells
+closure. Capture v5 did not serialize `DB_HTILE_DATA_BASE`; that run's allocations and later v6 captures
+prove its HTILE block is exactly 64 KiB before stencil. The switch supplies only that missing cache identity
+so compute-write invalidation can be A/B tested against the immutable closure. Current captures retain the
+real register and must not use this layout inference.
+
 `--bundle-compact PATH` writes a validated copy containing only resources and chunks reachable from retained
 submit manifests. It is useful after a rolling semantic capture; with no image output argument, compaction
 exits without initializing Vulkan. Combine it with `--bundle-tail N` to write a compact suffix bundle.
@@ -132,8 +153,12 @@ The #608 playable closure selects exactly 90 semantic draws with the 738x420 pas
 submits 18,165..19,047 represent 158.94 GiB logically and 739 MiB uniquely. Replay resolves 1,764 temporal image
 dependencies with zero bounded/unresolved leaves and renders hash `5759c125812154dc`. A complete-color-cache
 final capsule renders `71b84bdfae53933c` because it begins with fresh depth. Manifest scanning shows the same
-642x362 depth address in all 883 submits, always with LESS_OR_EQUAL tests/writes and never a clear. This is the
-#611 depth-lifetime bug and #569 checkpoint gap; it is not evidence for another color RTT producer.
+642x362 depth address in all 883 submits, always with LESS_OR_EQUAL tests/writes and never a draw/register
+clear. Timeline-v5 backing hashes and writer provenance resolve the missing boundary: supported compute program
+`0x401aec200` fills the exact 32 KiB HTILE allocation with `0xfffffff0` before the scene draw span. The live
+backend now invalidates overlapping persistent DS entries on guest GPU writeback (#611); a routed A/B restores
+the layers that stayed black with invalidation disabled. #569 remains the exact DS checkpoint gap, not another
+color RTT producer.
 
 The #594/#595 gameplay capsule at submit 18,750 has two external 642x362 temporal versions. Timeline-v4
 full-run aggregation shows that both surfaces begin around submit 17,400 in current runs and are rewritten

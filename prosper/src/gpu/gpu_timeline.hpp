@@ -16,6 +16,30 @@ struct GpuTimelineMetadata {
     std::string input_route;
 };
 
+// Compact per-submit depth/stencil programming. This is intentionally metadata-only: it lets a
+// native-speed timeline prove surface/view/HTILE lifetime without snapshotting hundreds of MiB of
+// shader resources for every submit (#611).
+struct GpuTimelineDepthSurface {
+    uint64_t depth_read_base = 0, depth_write_base = 0;
+    uint64_t stencil_read_base = 0, stencil_write_base = 0;
+    uint64_t htile_data_base = 0;
+    uint32_t db_depth_view = 0, db_render_override = 0, db_render_override2 = 0;
+    uint32_t db_depth_size_xy = 0, db_dfsm_control = 0, db_depth_info = 0;
+    uint32_t db_z_info = 0, db_stencil_info = 0;
+    uint32_t db_depth_size = 0, db_depth_slice = 0;
+    uint32_t db_htile_surface = 0, db_rmi_l2_cache_control = 0;
+    uint32_t target_width = 0, target_height = 0;
+    uint32_t draw_count = 0, depth_test_count = 0, depth_write_count = 0, clear_count = 0;
+    uint32_t compare_mask = 0;
+    // Optional raw guest-backing hashes, enabled only for PROSPER_GPU_TIMELINE_DEPTH_HASH_DIM=WxH.
+    // Bit 0/1/2 identifies valid depth/stencil/HTILE hashes respectively.
+    uint32_t backing_hash_mask = 0;
+    uint64_t depth_backing_hash = 0, stencil_backing_hash = 0, htile_backing_hash = 0;
+    uint32_t backing_writer_kind = 0; // 0 none, otherwise GpuTimelineWriterKind
+    uint64_t backing_writer_sequence = 0, backing_writer_addr = 0, backing_writer_size = 0;
+    uint64_t backing_writer_order = 0, backing_writer_identity = 0;
+};
+
 struct GpuTimelineSubmit {
     uint64_t sequence = 0;
     uint64_t elapsed_ns = 0;
@@ -28,6 +52,7 @@ struct GpuTimelineSubmit {
     uint32_t dispatch_count = 0;
     uint32_t color0_width = 0;
     uint32_t color0_height = 0;
+    std::vector<GpuTimelineDepthSurface> depth_surfaces;
 };
 
 struct GpuTimelinePresent {
