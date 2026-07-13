@@ -72,12 +72,15 @@ accepts scripted gamepad input, and renders the first level.
   first playable scene. Graphics and compute now execute by retained PM4 order (#584), fixing a proven
   future-read. The formerly overbright screenshot was traced to a diagnostic warmup skipping temporal RTT
   producers. Versioned offline bundles now retain long, exact cross-submit resource history and replay a
-  minimized closure. #608 now defines a run-local semantic checkpoint for the controllable Jump tutorial:
-  exactly 90 semantic draws with the 738x420 pass at draw index 79..81. Its faithful 883-submit replay
-  isolated the missing-world symptom to a persistent 642x362 depth surface. Timeline-v5 backing hashes and
+  minimized closure. #608 preserved a run-local semantic checkpoint for the controllable Jump tutorial:
+  exactly 90 semantic draws with the 738x420 pass at draw index 79..81. That conjunction is historical and
+  no longer matches current fresh routes; route-independent selector refresh remains under #594. Its faithful
+  883-submit replay isolated the missing-world symptom to a persistent 642x362 depth surface. Timeline-v5 backing hashes and
   writer provenance then found the real clear boundary: a supported compute kernel fills the surface's
   32 KiB HTILE allocation with `0xfffffff0` before drawing. Guest GPU writes now invalidate overlapping
-  cached Vulkan depth images, restoring the rejected gameplay layers in a routed live A/B (#611).
+  cached Vulkan depth images, restoring the rejected gameplay layers in a routed live A/B (#611). The four
+  remaining scene draws used uniform VCCZ-exit light loops; the fragment/vertex recompiler now proves that
+  narrow wave-uniform shape, emits structured loops, and realizes every sampled gameplay draw (#615).
 
 **Frontend:** `prosper-app` is a windowed player (SDL3 window + Vulkan present + audio sink +
 evdev/SDL3 controllers + real message/error/IME dialogs), sharing the same boot + render core as the

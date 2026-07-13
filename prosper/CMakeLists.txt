@@ -335,6 +335,10 @@ if(TARGET prosper_core)
   add_executable(shader_histo tools/shader_histo/shader_histo.cpp)
   target_link_libraries(shader_histo PRIVATE prosper_core)
 
+  # shader_inspect: bounded offline decode/CFG listing for raw PROSPER_SHADER_DUMP binaries.
+  add_executable(shader_inspect tools/shader_inspect/shader_inspect.cpp)
+  target_link_libraries(shader_inspect PRIVATE prosper_core)
+
   # spv_validate: recompile one shader from every path and run spirv-val on each — a strict-validation
   # gate (the render tests only prove llvmpipe accepts them; llvmpipe is lenient). No Vulkan needed;
   # skips validation gracefully if spirv-val is not on PATH (still checks recompilation succeeds).
