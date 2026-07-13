@@ -12,6 +12,12 @@
 //   - pthread_barrier_*  remapped to a generation-counted mutex+cond barrier
 //   - pthread_sigqueue   degraded to pthread_kill (sigval payload dropped — warns once; see note)
 //   - prosper_mincore    signature-portable mincore wrapper (Darwin takes char*, Linux unsigned char*)
+//
+// Windows has no guest-execution substrate yet, and every symbol here is consumed only from
+// POSIX-guarded code (exec_image_linux.cpp is __linux__/__APPLE__-only; hle_file.cpp's
+// prosper_mincore use is inside #ifndef _WIN32). The whole header is therefore POSIX-only — on
+// Windows it must expand to nothing, since <sys/mman.h> does not exist under MinGW.
+#ifndef _WIN32
 
 #include <sys/mman.h>
 #include <fcntl.h>
@@ -370,4 +376,6 @@ static inline void prosper_futex_wake(uint32_t* addr, bool all) {
     syscall(SYS_futex, addr, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, all ? INT32_MAX : 1, nullptr, nullptr, 0);
 }
 #endif
-#endif // !_WIN32
+#endif // !_WIN32 (substrate primitives)
+
+#endif // !_WIN32 (whole header: POSIX-only, no-op under MinGW)
