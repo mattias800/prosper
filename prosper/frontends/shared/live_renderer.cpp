@@ -81,6 +81,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 return true;
             });
     }
+    // The compute backend must not sample a surface whose CURRENT pixels live in this renderer's
+    // RTT cache (raw guest memory is then empty/stale — the Dead Cells 642x362 lesson): publish the
+    // exact-match target query it skips on (#590). Same keying as the RTT injection below.
+    prosper::gpu::set_live_target_query([](uint64_t addr) { return g_rtt.count(addr) != 0; });
     if (getenv("PROSPER_GPU_CAPTURE") || getenv("PROSPER_GPU_TIMELINE_CAPTURE") ||
         getenv("PROSPER_GPU_REPLAY_EXPORT_DS"))
         prosper::gpu::set_gpu_capture_ds_seed_snapshot_reader(

@@ -1509,6 +1509,13 @@ void set_submit_renderer(LiveRenderFn fn) { g_live = std::move(fn); }
 bool have_submit_renderer()               { return static_cast<bool>(g_live); }
 void set_submit_compute(LiveComputeFn fn) { g_compute = std::move(fn); }
 bool have_submit_compute()                { return static_cast<bool>(g_compute); }
+
+static LiveTargetQueryFn g_live_target_query;   // registered by the live renderer (#590)
+void set_live_target_query(LiveTargetQueryFn fn) { g_live_target_query = std::move(fn); }
+bool is_live_render_target(uint64_t gpu_addr) {
+    return g_live_target_query && g_live_target_query(gpu_addr);
+}
+
 void set_guest_gpu_write_observer(GuestGpuWriteObserver observer) {
     g_guest_gpu_write_observer = std::move(observer);
 }

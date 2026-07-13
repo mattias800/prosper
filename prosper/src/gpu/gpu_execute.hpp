@@ -213,6 +213,14 @@ void notify_guest_gpu_write(uint64_t addr, uint64_t size);
 // dispatch from its state snapshot and invokes the backend in stream order.
 void set_submit_compute(LiveComputeFn fn);
 bool have_submit_compute();
+
+// Live render-target query (#590): the compute backend must not read a sampled input from raw guest
+// memory when the LIVE RENDERER owns that surface's current pixels (an RTT color target — raw memory
+// is then empty/stale, the Dead Cells 642x362 lesson). The live renderer registers this; the compute
+// backend skips such dispatches loudly. Cross-device RTT sharing is the follow-up.
+using LiveTargetQueryFn = std::function<bool(uint64_t gpu_addr)>;
+void set_live_target_query(LiveTargetQueryFn fn);
+bool is_live_render_target(uint64_t gpu_addr);
 std::vector<ComputeItem> realize_compute_dispatches(const GpuState& st,
                                                      uint64_t submit_no = 0,
                                                      std::vector<OperationRealizationFailure>* failures = nullptr);
