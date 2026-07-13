@@ -29,6 +29,7 @@
 #include <direct.h>
 #include <io.h>
 #endif
+#include "../host/posix_shim.hpp"   // Darwin: process_vm_*, pthread_getattr_np, st_*tim, prosper_mincore
 
 namespace prosper {
 
@@ -569,6 +570,42 @@ HLE(f_rmdir) { std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::rm
 // enumerates its pak directory with this during IO-stack init.
 HLE(f_getdents) {
     if (!a1 || a2 < 32) return 0x80020016ull;   // EINVAL
+#ifdef __APPLE__
+    // Darwin has no getdents-on-fd (getdirentries is unavailable with 64-bit inodes). Keep the
+    // per-fd kernel cursor by caching one DIR* per directory fd (fdopendir owns a dup, so the
+    // guest's fd number stays valid); seekdir puts back the first entry that doesn't fit.
+    // CONFIDENCE: MED — a guest that closes the fd and gets the number reused for a different
+    // directory would see a stale cursor; not exercised by current titles.
+    static std::mutex dirmx; static std::map<int, DIR*> dirs;
+    DIR* dp = nullptr;
+    { std::lock_guard<std::mutex> lk(dirmx);
+      auto it = dirs.find((int)a0);
+      if (it != dirs.end()) dp = it->second;
+      else {
+          int d2 = dup((int)a0);
+          dp = d2 >= 0 ? fdopendir(d2) : nullptr;
+          if (!dp) { if (d2 >= 0) ::close(d2); return 0x80020000ull | (uint64_t)(errno & 0xff); }
+          dirs[(int)a0] = dp;
+      } }
+    uint8_t* out = (uint8_t*)P(a1);
+    size_t w = 0;
+    for (;;) {
+        long pos = telldir(dp);
+        struct dirent* d = readdir(dp);
+        if (!d) break;
+        size_t namlen = d->d_namlen;
+        size_t rec = (8 + namlen + 1 + 3) & ~(size_t)3;   // 4-byte header + name + NUL, 4-aligned
+        if (w + rec > a2) { seekdir(dp, pos); break; }    // didn't fit: rewind so nothing is lost
+        uint8_t* r = out + w;
+        *(uint32_t*)(r + 0) = (uint32_t)d->d_ino;
+        *(uint16_t*)(r + 4) = (uint16_t)rec;
+        r[6] = d->d_type;
+        r[7] = (uint8_t)namlen;
+        memcpy(r + 8, d->d_name, namlen + 1);
+        w += rec;
+    }
+    return (uint64_t)w;
+#else
     struct LinuxDirent64 { uint64_t ino; int64_t off; uint16_t reclen; uint8_t type; char name[]; };
     uint8_t tmp[4096];
     size_t want = a2 < sizeof tmp ? (size_t)a2 : sizeof tmp;
@@ -592,6 +629,7 @@ HLE(f_getdents) {
         o += d->reclen;
     }
     return (uint64_t)w;
+#endif
 }
 // sceKernelGetdirentries(fd, buf, nbytes, long* basep): like getdents but also writes the pre-call
 // directory offset to *basep. Was MISSING -> returned 0 = "empty directory". Delegate to f_getdents and
@@ -781,15 +819,7 @@ extern "C" int prosper_reserved_range_state(uint64_t addr);
 extern "C" uint64_t f_apr_read_submit_c(uint64_t a0, uint64_t a1, uint64_t a2,
                                         uint64_t a3, uint64_t a4, uint64_t a5,
                                         uint64_t entry_rsp);
-asm(".text\n"
-    ".globl f_apr_read_submit_entry\n"
-    ".type f_apr_read_submit_entry,@function\n"
-    "f_apr_read_submit_entry:\n"
-    "  movq %rsp, %rax\n"
-    "  pushq %rax\n"
-    "  call f_apr_read_submit_c\n"
-    "  addq $8, %rsp\n"
-    "  ret\n");
+PROSPER_ASM_TRAMPOLINE(f_apr_read_submit_entry, f_apr_read_submit_c)
 extern "C" void f_apr_read_submit_entry();
 // Fetch the Nth stack argument (0-based: arg7 is n=0) of the in-flight ReadFile call.
 // Both stub paths land the forwarded/natural stack args at [entry_rsp+8] (layout note above).
@@ -831,7 +861,7 @@ static bool apr_write_guest_dst(uint64_t dst, void* buf, uint64_t size) {
     bool committed = false;
     for (uint64_t p = dst & ~0xffffull; p < dst + size; p += 0x10000) {
         unsigned char vec;
-        if (mincore((void*)(uintptr_t)p, 1, &vec) != 0 &&
+        if (prosper_mincore((void*)(uintptr_t)p, 1, &vec) != 0 &&
             prosper_reserved_range_state(p) == 1 &&
             mmap((void*)(uintptr_t)p, 0x10000, PROT_READ | PROT_WRITE,
                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == (void*)(uintptr_t)p)

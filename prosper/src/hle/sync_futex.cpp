@@ -2,10 +2,10 @@
 #include "sync_futex.hpp"
 #include <atomic>
 #include <climits>
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 #include <unistd.h>
 #include <sys/syscall.h>
-#include <linux/futex.h>
+#include "../host/posix_shim.hpp"
 #endif
 
 namespace prosper {
@@ -15,9 +15,9 @@ void futex_wait_enter() { g_waiters.fetch_add(1, std::memory_order_seq_cst); }
 void futex_wait_exit()  { g_waiters.fetch_sub(1, std::memory_order_seq_cst); }
 
 void futex_wake(uint64_t addr, int n) {
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
     if (!addr) return;
-    syscall(SYS_futex, (uint32_t*)(uintptr_t)addr, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, n, nullptr, nullptr, 0);
+    prosper_futex_wake((uint32_t*)(uintptr_t)addr, n > 1);
 #else
     (void)addr; (void)n;
 #endif

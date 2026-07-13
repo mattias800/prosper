@@ -67,8 +67,20 @@ static int g_probe_pipe[2] = {-1, -1};
 // the multi-threaded HLE pointer probes: an unguarded `if (fd < 0) pipe2(...)` lazy init let two
 // first-callers each pipe2 into the array — a torn pair (write-end of pipe B, read-end of pipe A)
 // never drains, fills, and EAGAINs: VALID memory reported unreadable, silently. (PR #61 review.)
+static bool make_probe_pipe() {
+#ifdef __linux__
+    return pipe2(g_probe_pipe, O_CLOEXEC | O_NONBLOCK) == 0;
+#else   // Darwin/BSD: no pipe2 — pipe + fcntl (still inside the once-only magic static, so no race)
+    if (pipe(g_probe_pipe) != 0) return false;
+    for (int fd : g_probe_pipe) {
+        if (fcntl(fd, F_SETFD, FD_CLOEXEC) != 0) return false;
+        if (fcntl(fd, F_SETFL, O_NONBLOCK) != 0) return false;
+    }
+    return true;
+#endif
+}
 static bool probe_pipe_ok() {
-    static const bool ok = pipe2(g_probe_pipe, O_CLOEXEC | O_NONBLOCK) == 0;
+    static const bool ok = make_probe_pipe();
     return ok;
 }
 static bool probe_byte(uint64_t a) {

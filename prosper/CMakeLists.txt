@@ -98,7 +98,7 @@ if(TARGET prosper_core)
 
   # Guest static-TLS Variant II layout uses each module's real PT_TLS p_align (#143). The layout
   # code is Linux-only (guest %fs), so gate the test on it too.
-  if(UNIX AND NOT APPLE)
+  if(UNIX)
     add_executable(test_guest_tls_align tests/test_guest_tls_align.cpp)
     target_link_libraries(test_guest_tls_align PRIVATE prosper_core)
     add_test(NAME guest_tls_align COMMAND test_guest_tls_align)
@@ -247,7 +247,7 @@ if(TARGET prosper_core)
 
   # Hinted map must not clobber a live mapping (#137): MAP_FIXED_NOREPLACE unless the hint is our
   # own uncommitted reservation. Drives the real map HLE handlers. Linux-only (mmap semantics).
-  if(UNIX AND NOT APPLE)
+  if(UNIX)
     add_executable(test_map_noreplace tests/test_map_noreplace.cpp)
     target_link_libraries(test_map_noreplace PRIVATE prosper_core)
     add_test(NAME map_noreplace COMMAND test_map_noreplace)
@@ -397,18 +397,20 @@ if(TARGET prosper_core)
   target_link_libraries(test_writer_provenance PRIVATE prosper_core)
   add_test(NAME writer_provenance_ranges COMMAND test_writer_provenance)
 
-  # M2+: real memory mapping, trap, boot, and the boot-trace debug tool (Linux only).
-  if(UNIX AND NOT APPLE)
+  # M2+: real memory mapping, trap, boot, and the boot-trace debug tool (Linux + macOS/Rosetta).
+  if(UNIX)
     add_executable(boot_trace tools/boot_trace/boot_trace.cpp)
     target_link_libraries(boot_trace PRIVATE prosper_core)
 
-    # Zero-dependency Linux evdev gamepad frontend (outside prosper_core). Always available on Linux;
-    # boot_trace installs it (gated by PROSPER_PAD) when the SDL3 gamepad frontend isn't built.
-    add_library(prosper_pad_evdev STATIC frontends/pad_evdev/pad_evdev.cpp)
-    target_include_directories(prosper_pad_evdev PUBLIC frontends/pad_evdev src)
-    target_link_libraries(prosper_pad_evdev PUBLIC prosper_core)
-    target_link_libraries(boot_trace PRIVATE prosper_pad_evdev)
-    target_compile_definitions(boot_trace PRIVATE PROSPER_PAD_EVDEV=1)
+    if(NOT APPLE)
+      # Zero-dependency Linux evdev gamepad frontend (outside prosper_core). Always available on Linux;
+      # boot_trace installs it (gated by PROSPER_PAD) when the SDL3 gamepad frontend isn't built.
+      add_library(prosper_pad_evdev STATIC frontends/pad_evdev/pad_evdev.cpp)
+      target_include_directories(prosper_pad_evdev PUBLIC frontends/pad_evdev src)
+      target_link_libraries(prosper_pad_evdev PUBLIC prosper_core)
+      target_link_libraries(boot_trace PRIVATE prosper_pad_evdev)
+      target_compile_definitions(boot_trace PRIVATE PROSPER_PAD_EVDEV=1)
+    endif()
 
     add_executable(imgdump tools/imgdump/imgdump.cpp)
     target_link_libraries(imgdump PRIVATE prosper_core)

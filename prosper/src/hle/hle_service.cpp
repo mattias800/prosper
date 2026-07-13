@@ -6,6 +6,7 @@
 #include "dispatch.hpp"
 #include "nid.hpp"
 #include "platform_ui.hpp"
+#include "../host/posix_shim.hpp"   // PROSPER_ASM_TRAMPOLINE (Mach-O/ELF global-asm portability)
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
@@ -856,15 +857,7 @@ HLE(s_netctl_getstate) {
 extern "C" uint64_t s_netctl_check_cb_c(uint64_t a0, uint64_t a1, uint64_t a2,
                                         uint64_t a3, uint64_t a4, uint64_t a5,
                                         uint64_t entry_rsp);
-asm(".text\n"
-    ".globl s_netctl_check_cb_entry\n"
-    ".type s_netctl_check_cb_entry,@function\n"
-    "s_netctl_check_cb_entry:\n"
-    "  movq %rsp, %rax\n"
-    "  pushq %rax\n"
-    "  call s_netctl_check_cb_c\n"
-    "  addq $8, %rsp\n"
-    "  ret\n");
+PROSPER_ASM_TRAMPOLINE(s_netctl_check_cb_entry, s_netctl_check_cb_c)
 extern "C" void s_netctl_check_cb_entry();
 extern "C" uint64_t s_netctl_check_cb_c(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
                                         uint64_t entry_rsp) {
@@ -920,15 +913,7 @@ HLE(s_np_register_state_cbA) {   // (SceNpStateCallbackA func, void* userdata) -
 extern "C" uint64_t s_np_check_cb_c(uint64_t a0, uint64_t a1, uint64_t a2,
                                     uint64_t a3, uint64_t a4, uint64_t a5,
                                     uint64_t entry_rsp);
-asm(".text\n"
-    ".globl s_np_check_cb_entry\n"
-    ".type s_np_check_cb_entry,@function\n"
-    "s_np_check_cb_entry:\n"
-    "  movq %rsp, %rax\n"
-    "  pushq %rax\n"
-    "  call s_np_check_cb_c\n"
-    "  addq $8, %rsp\n"
-    "  ret\n");
+PROSPER_ASM_TRAMPOLINE(s_np_check_cb_entry, s_np_check_cb_c)
 extern "C" void s_np_check_cb_entry();
 extern "C" uint64_t s_np_check_cb_c(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
                                     uint64_t entry_rsp) {

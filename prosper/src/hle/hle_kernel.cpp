@@ -10,6 +10,7 @@
 #include "../host/exec_image.hpp"
 #include <pthread.h>
 #include <semaphore.h>   // scePthreadSem* -> host sem_t
+#include "../host/posix_shim.hpp"   // Darwin: sem/barrier/timedlock/getattr_np/sigqueue compat
 #include <cerrno>
 #include <cctype>
 #include <cstdio>
@@ -21,19 +22,21 @@
 #include <thread>
 #include <atomic>
 #include <condition_variable>
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <signal.h>
+#ifdef __linux__
 #include <ucontext.h>
+#endif
 #endif
 
 namespace prosper {
 namespace { bool sclog() { static int v = getenv("PROSPER_SYNCLOG") ? 1 : 0; return v; }
     long sctid() {
-#ifdef __linux__
-        return (long)syscall(SYS_gettid);
+#if defined(__linux__) || defined(__APPLE__)
+        return (long)prosper_gettid();
 #else
         return 0;
 #endif
@@ -365,7 +368,7 @@ HLE(k_attr_get) {
     // thread's attributes. a0 = thread handle (== the host pthread_t we store), a1 = attr handle.
     // (Bug fixed: the attr is arg1, not arg0 — reading arg0 left the real attr empty, so the GC's
     // GC_get_stack_base got a 0 stack base -> "Bad stack base in GC_register_my_thread".)
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
     if (a1 && *(void**)a1) {
         auto* at = (pthread_attr_t*)*(void**)a1;
         void* base = nullptr; size_t sz = 0;
@@ -434,7 +437,7 @@ HLE(k_getprio)            { // scePthreadGetprio(thread, int* prio)
 // 8 MiB per exited thread. The trampoline still TRACKS the bounds (via pthread_getattr_np, keyed
 // by our tid) so GC/thread-stack queries stay accurate, and unregisters them on exit — pthread
 // ids are recycled, so a stale entry would serve the next thread the dead thread's bounds.
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
 namespace {
 struct ThreadStart { void* (*entry)(void*); void* arg; char name[16]; };
 // Runs first on the new thread: register our own stack (keyed by our tid) BEFORE any guest code,
@@ -456,7 +459,11 @@ void* thread_trampoline(void* p) {
     // thread name so debugger/procfs views (gdb, /proc/PID/task/*/comm) show the engine's own
     // role names (GameThread, RenderThread, RHIThread, ...) instead of the binary name. Kernel
     // limit is 15 chars + NUL; host libc call, so it must run on the host %fs (we are).
+#ifdef __APPLE__
+    if (ts->name[0]) pthread_setname_np(ts->name);   // Darwin can only name the CURRENT thread (which this is)
+#else
     if (ts->name[0]) pthread_setname_np(pthread_self(), ts->name);
+#endif
     auto entry = ts->entry; void* arg = ts->arg; free(ts);   // all host libc — MUST run on the host %fs
     // gated (PROSPER_GUEST_FS): give this guest worker its own guest TCB + static TLS and switch %fs to it
     // as the LAST host action before entering guest code (so guest initial-exec TLS — incl. libc.prx's
@@ -488,7 +495,7 @@ HLE(k_pthread_create) {
         fprintf(stderr, "[thread] create entry=0x%llx arg=0x%llx name=%s\n",
                 (unsigned long long)a2, (unsigned long long)a3, a4 ? (const char*)(uintptr_t)a4 : "");
     pthread_t tid;
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
     // Stack size: honor the guest attr's stacksize (previously ignored — everything got a fixed
     // 8 MiB), floored at 1 MiB because our HLE + host libc frames run deeper than Sony's runtime
     // would on the same stack. No attr (or no explicit size) keeps the 8 MiB default.
@@ -536,7 +543,7 @@ HLE(k_pthread_exit)   {
     // registration (#138 — pthread ids recycle). HLE handlers run under the HOST %fs (the import
     // stubs swap), so the host libc below is safe. No-op for threads that never touched either.
     tls_dtv_purge_current_thread();
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
     unregister_thread_stack((uint64_t)pthread_self());
 #endif
     pthread_exit((void*)(uintptr_t)a0);
@@ -843,17 +850,42 @@ bool g_exc_log = false;               // set once (outside signal ctx) from PROS
 // PROSPER_SYNCLOG. Read once (getenv is not signal-safe).
 bool g_exc_log2 = false;
 volatile int* g_exc_counter = nullptr; // optional fork-safe raise counter (tests)
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
 int  g_exc_sig = -1;
+#ifdef __APPLE__
+// Darwin has no pthread_sigqueue / RT-signal payload, so the exception TYPE travels through a
+// small async-signal-safe pending table keyed by the target pthread instead of si_value. A raise
+// claims a slot with CAS before pthread_kill; the handler (on the target thread) takes it back.
+// GC suspend/resume raises are sequential per target, so 16 slots is generous.
+struct ExcPending { std::atomic<uint64_t> tid{0}; std::atomic<int> type{0}; };
+ExcPending g_exc_pending[16];
+bool exc_pending_put(uint64_t tid, int type) {
+    for (auto& s : g_exc_pending) {
+        uint64_t z = 0;
+        if (s.tid.compare_exchange_strong(z, tid)) { s.type.store(type); return true; }
+    }
+    return false;
+}
+int exc_pending_take(uint64_t tid) {
+    for (auto& s : g_exc_pending)
+        if (s.tid.load() == tid) { int t = s.type.load(); s.tid.store(0); return t; }
+    return -1;
+}
+#endif
 void exc_delivery_handler(int, siginfo_t* si, void* uc_) {
+#ifdef __APPLE__
+    (void)si;
+    int type = exc_pending_take((uint64_t)pthread_self());   // pthread_self reads %gs TSD, never %fs
+#else
     int type = si->si_value.sival_int;
+#endif
     if (type < 0 || type >= 128 || !g_exc_handlers[type]) {
         if (g_exc_log2) {   // a suspend request that silently does NOTHING = an unstopped thread
             // %fs-safe: this handler can interrupt guest code running on the GUEST %fs, where host
             // libc TLS (locale, stack canary) reads garbage — swap to host %fs for the logging.
             uint64_t sfs = guest_fs_to_host_scoped();
             char b[96]; int n = snprintf(b, sizeof b, "[exc2] DROPPED type=%d tid=%ld (no handler)\n",
-                                         type, (long)syscall(SYS_gettid));
+                                         type, (long)prosper_gettid());
             (void)!write(2, b, n);
             guest_fs_restore_scoped(sfs);
         }
@@ -862,27 +894,27 @@ void exc_delivery_handler(int, siginfo_t* si, void* uc_) {
     if (g_exc_log2) {
         // Log the interrupted context: rip (classified guest module+off / host) and whether the
         // thread was on the guest or host %fs at interrupt time. %fs-safe (scoped host swap).
-        uint64_t irip = (uint64_t)((ucontext_t*)uc_)->uc_mcontext.gregs[REG_RIP];
+        uint64_t irip = (uint64_t)PROSPER_GREGS((ucontext_t*)uc_)[REG_RIP];
         uint64_t sfs = guest_fs_to_host_scoped();
         const char* fss = sfs ? "guest" : "host";
         char b[160]; int n;
         if (irip >= 0x400000000ull && irip < 0x420000000ull)
             n = snprintf(b, sizeof b, "[exc2] ENTER tid=%ld type=%d fs=%s rip=eboot+0x%llx\n",
-                         (long)syscall(SYS_gettid), type, fss, (unsigned long long)(irip - 0x400000000ull));
+                         (long)prosper_gettid(), type, fss, (unsigned long long)(irip - 0x400000000ull));
         else if (irip >= 0x440000000ull && irip < 0x443000000ull)
             n = snprintf(b, sizeof b, "[exc2] ENTER tid=%ld type=%d fs=%s rip=il2cpp+0x%llx\n",
-                         (long)syscall(SYS_gettid), type, fss, (unsigned long long)(irip - 0x440000000ull));
+                         (long)prosper_gettid(), type, fss, (unsigned long long)(irip - 0x440000000ull));
         else if (irip >= 0x500000000ull && irip < 0x501000000ull)
             n = snprintf(b, sizeof b, "[exc2] ENTER tid=%ld type=%d fs=%s rip=libc+0x%llx\n",
-                         (long)syscall(SYS_gettid), type, fss, (unsigned long long)(irip - 0x500000000ull));
+                         (long)prosper_gettid(), type, fss, (unsigned long long)(irip - 0x500000000ull));
         else
             n = snprintf(b, sizeof b, "[exc2] ENTER tid=%ld type=%d fs=%s rip=host:0x%llx\n",
-                         (long)syscall(SYS_gettid), type, fss, (unsigned long long)irip);
+                         (long)prosper_gettid(), type, fss, (unsigned long long)irip);
         (void)!write(2, b, n);
         guest_fs_restore_scoped(sfs);
     }
     auto* uc = (ucontext_t*)uc_;
-    greg_t* g = uc->uc_mcontext.gregs;
+    auto g = PROSPER_GREGS(uc);
     // FreeBSD amd64 mcontext_t: rdi@0x08 rsi@0x10 rdx@0x18 rcx@0x20 r8@0x28 r9@0x30 rax@0x38
     // rbx@0x40 rbp@0x48 r10@0x50 r11@0x58 r12@0x60 r13@0x68 r14@0x70 r15@0x78 rip@0xA0 rsp@0xB8
     // NOT `static __thread`: guest threads run under a GUEST %fs, so a host thread_local resolves into
@@ -913,7 +945,7 @@ void exc_delivery_handler(int, siginfo_t* si, void* uc_) {
     if (g_exc_log2) {
         uint64_t sfs = guest_fs_to_host_scoped();   // %fs-safe logging (see ENTER)
         char b[96]; int n = snprintf(b, sizeof b, "[exc2] RESUME tid=%ld type=%d\n",
-                                     (long)syscall(SYS_gettid), type);
+                                     (long)prosper_gettid(), type);
         (void)!write(2, b, n);
         guest_fs_restore_scoped(sfs);
     }
@@ -922,7 +954,11 @@ void ensure_exc_sig() {
     if (g_exc_sig != -1) return;
     g_exc_log = getenv("PROSPER_SYNCLOG") != nullptr;
     g_exc_log2 = getenv("PROSPER_EXCLOG") != nullptr;
+#ifdef __APPLE__
+    g_exc_sig = SIGUSR2;                         // no RT signals on Darwin; SIGUSR2 is otherwise unused here
+#else
     g_exc_sig = SIGRTMIN + 4;                    // free RT signal (not our SIGSEGV/ILL/BUS)
+#endif
     struct sigaction sa; memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = exc_delivery_handler;
     // SA_ONSTACK: run on the per-thread sigaltstack (installed for the main thread and every worker in
@@ -955,10 +991,15 @@ HLE(k_raise_exception) {       // (targetThread /*host pthread_t*/, exceptionTyp
     if (getenv("PROSPER_SYNCLOG"))
         fprintf(stderr, "[exc] T%ld raise target=0x%llx type=0x%llx\n",
                 sctid(), (unsigned long long)a0, (unsigned long long)a1);
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
     if (a0 && a1 < 128 && g_exc_handlers[a1]) {
+#ifdef __APPLE__
+        int qr = exc_pending_put((uint64_t)a0, (int)a1) ? pthread_kill((pthread_t)a0, g_exc_sig)
+                                                        : EAGAIN;   // pending table full
+#else
         union sigval sv; sv.sival_int = (int)a1;
         int qr = pthread_sigqueue((pthread_t)a0, g_exc_sig, sv);
+#endif
         if (g_exc_log2)
             fprintf(stderr, "[exc2] RAISE by tid=%ld target=0x%llx type=0x%llx sigqueue=%d\n",
                     sctid(), (unsigned long long)a0, (unsigned long long)a1, qr);
@@ -974,7 +1015,7 @@ HLE(k_raise_exception) {       // (targetThread /*host pthread_t*/, exceptionTyp
 void set_exc_raise_counter(volatile int* counter) { g_exc_counter = counter; }
 
 HLE(k_is_stack) {   // sceKernelIsStack(void* addr): is addr within the current thread's stack?
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
     void* base = nullptr; size_t sz = 0;
     if (guest_stack_for_current_thread(&base, &sz) &&
         a0 >= (uint64_t)(uintptr_t)base && a0 < (uint64_t)(uintptr_t)base + sz)

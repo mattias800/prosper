@@ -27,9 +27,10 @@
 #include <unordered_set>
 #include <utility>
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
 #include <sys/uio.h>
 #include <unistd.h>
+#include "../host/posix_shim.hpp"
 #endif
 
 namespace prosper::gpu {
@@ -56,7 +57,7 @@ CaptureRttSeedSnapshotReader g_rtt_seed_snapshot_reader;
 ReplayRttSeedWriter g_rtt_seed_writer;
 
 size_t read_capture_guest_memory(uint64_t addr, uint8_t* dst, size_t bytes) {
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
     size_t done = 0;
     while (done < bytes) {
         iovec local{dst + done, bytes - done};

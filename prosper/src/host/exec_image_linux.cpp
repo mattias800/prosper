@@ -5,7 +5,8 @@
 #include "../hle/nid.hpp"
 #include "../hle/dispatch.hpp"
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
+#include "posix_shim.hpp"
 #include <sys/mman.h>
 #include <signal.h>
 #include <setjmp.h>
@@ -14,8 +15,10 @@
 #include <sys/syscall.h>
 #include <sys/ioctl.h>
 #include <fcntl.h>
+#ifdef __linux__
 #include <linux/perf_event.h>
 #include <linux/hw_breakpoint.h>
+#endif
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -24,6 +27,27 @@
 #include <map>
 #include <mutex>
 #include <atomic>
+
+// Darwin mcontext/perf compatibility (PROSPER_GREGS / PROSPER_REG_ERR / PROSPER_SI_FD, the
+// HW_BREAKPOINT_*/F_SETSIG constants, and mach headers) lives in posix_shim.hpp — shared with the
+// guest-exception delivery handler in hle_kernel.cpp.
+#ifdef __APPLE__
+// Hardware break/watchpoints are a Linux perf_event capability with no Darwin userland
+// equivalent (and Rosetta exposes no x86 debug registers anyway). perf_bp_open below returns
+// -1/ENOTSUP, so every PROSPER_HWBP/HWWATCH arm attempt takes its existing "arm FAILED" path and
+// the software-watch (mprotect) + int3 diagnostics remain the macOS toolset. These constants only
+// keep the never-reached call sites compiling; the fds involved are always -1 here.
+enum { HW_BREAKPOINT_X = 4, HW_BREAKPOINT_W = 2, HW_BREAKPOINT_LEN_8 = 8 };
+enum { PERF_EVENT_IOC_ENABLE = 0x2400, PERF_EVENT_IOC_DISABLE = 0x2401 };
+enum { F_OWNER_TID = 0 };
+struct f_owner_ex { int type; pid_t pid; };
+#ifndef F_SETSIG
+#define F_SETSIG    -1000   // unknown fcntl cmd -> EINVAL; only ever issued on fd=-1 (EBADF)
+#endif
+#ifndef F_SETOWN_EX
+#define F_SETOWN_EX -1001
+#endif
+#endif
 
 namespace prosper {
 
@@ -44,7 +68,7 @@ namespace {
     // Plain globals + gettid sidestep %fs entirely.
     sigjmp_buf g_jb;
     volatile long g_armed_tid = 0;               // kernel tid that armed g_jb, 0 = none
-    inline long cur_tid() { return (long)syscall(SYS_gettid); }
+    inline long cur_tid() { return (long)prosper_gettid(); }
     volatile sig_atomic_t g_trap_kind = 0;   // 0 none, 2 SEGV/BUS, 3 ILL
     volatile int          g_trap_sig = 0;
     void*    g_fault_addr = nullptr;
@@ -68,8 +92,18 @@ namespace {
     // pattern could tear the fd pair under two concurrent first-calls (PR #61 review). Called
     // only from install-time paths (never from the signal handler itself), so the guard's
     // internal locking is safe here.
+    bool make_probe_pipe() {
+#ifdef __linux__
+        return pipe2(g_probe_pipe, O_CLOEXEC | O_NONBLOCK) == 0;
+#else   // Darwin: no pipe2; pipe + fcntl inside the same once-only guard, so no torn-pair race
+        if (pipe(g_probe_pipe) != 0) return false;
+        for (int fd : g_probe_pipe)
+            if (fcntl(fd, F_SETFD, FD_CLOEXEC) != 0 || fcntl(fd, F_SETFL, O_NONBLOCK) != 0) return false;
+        return true;
+#endif
+    }
     void ensure_probe_pipe() {
-        static const bool ok = pipe2(g_probe_pipe, O_CLOEXEC | O_NONBLOCK) == 0;
+        static const bool ok = make_probe_pipe();
         if (!ok) g_probe_pipe[0] = g_probe_pipe[1] = -1;
     }
     // DIAGNOSTIC (PROSPER_SKIP_NULL_COMPANION, default off): at the Unity GfxDevice pipeline reader
@@ -262,16 +296,42 @@ namespace {
     uint64_t g_hwwatch_addr = 0;
     volatile sig_atomic_t g_hwwatch_count = 0;
     long perf_bp_open(uint64_t addr, uint32_t bp_type) {
+#ifdef __linux__
         struct perf_event_attr pe; memset(&pe, 0, sizeof pe);
         pe.type = PERF_TYPE_BREAKPOINT; pe.size = sizeof pe;
         pe.bp_type = bp_type; pe.bp_addr = addr;
         pe.bp_len = (bp_type == HW_BREAKPOINT_X) ? sizeof(long) : (uint64_t)HW_BREAKPOINT_LEN_8;
         pe.sample_period = 1; pe.disabled = 1; pe.exclude_kernel = 1; pe.exclude_hv = 1;
         return syscall(SYS_perf_event_open, &pe, 0, -1, -1, 0UL);
+#else
+        (void)addr; (void)bp_type; errno = ENOTSUP; return -1;   // see the Darwin compat note above
+#endif
     }
     // Async-safe-ish: write the /proc/self/maps line containing `addr` to stderr (identifies the module
     // that a writer RIP belongs to). Fixed buffers, no malloc; open/read/write are signal-safe.
     void classify_addr(uint64_t addr) {
+#ifdef __APPLE__
+        // No /proc on Darwin: report the containing mach VM region (bounds + prot). mach_vm_region
+        // is a plain trap — no malloc, async-safe enough for this diagnostic path.
+        mach_vm_address_t ra = addr; mach_vm_size_t rs = 0;
+        vm_region_basic_info_data_64_t info; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        char b[160]; int n;
+        if (mach_vm_region(mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64,
+                           (vm_region_info_t)&info, &cnt, &obj) == KERN_SUCCESS && addr >= ra) {
+            if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
+            n = snprintf(b, sizeof b, "[hwwatch]   writer 0x%llx is in: 0x%llx-0x%llx %c%c%c\n",
+                         (unsigned long long)addr, (unsigned long long)ra, (unsigned long long)(ra + rs),
+                         (info.protection & VM_PROT_READ) ? 'r' : '-',
+                         (info.protection & VM_PROT_WRITE) ? 'w' : '-',
+                         (info.protection & VM_PROT_EXECUTE) ? 'x' : '-');
+        } else {
+            n = snprintf(b, sizeof b, "[hwwatch]   writer 0x%llx: no containing region\n",
+                         (unsigned long long)addr);
+        }
+        if (n > 0) { ssize_t w = write(2, b, (size_t)n); (void)w; }
+        return;
+#else
         int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
         if (fd < 0) return;
         char buf[8192]; ssize_t got; char line[512]; size_t li = 0;
@@ -293,6 +353,7 @@ namespace {
             }
         }
         close(fd);
+#endif
     }
     // Dump the HWBP ring (oldest->newest) once. Prints reader fields (cur/[cur]/rax) for anom traces and
     // typetree-node fields (r8/[r8+8]/[r8+0x10]/r14) for node traces. Signal-safe (fixed buffers, write()).
@@ -345,7 +406,7 @@ namespace {
         g_hwwatch_fd = (int)fd; g_hwwatch_addr = addr;
         fcntl(g_hwwatch_fd, F_SETFL, O_ASYNC);
         fcntl(g_hwwatch_fd, F_SETSIG, SIGTRAP);
-        struct f_owner_ex ow; ow.type = F_OWNER_TID; ow.pid = (pid_t)syscall(SYS_gettid);
+        struct f_owner_ex ow; ow.type = F_OWNER_TID; ow.pid = (pid_t)prosper_gettid();
         fcntl(g_hwwatch_fd, F_SETOWN_EX, &ow);
         ioctl(g_hwwatch_fd, PERF_EVENT_IOC_ENABLE, 0);
         int n = snprintf(b, sizeof b, "[hwwatch] armed W-watch at 0x%llx (fd=%d)\n",
@@ -392,7 +453,7 @@ namespace {
                 syscall(SYS_write, 2, b, (size_t)k); continue; }
             fcntl((int)fd, F_SETFL, O_ASYNC);
             fcntl((int)fd, F_SETSIG, SIGTRAP);
-            struct f_owner_ex ow; ow.type = F_OWNER_TID; ow.pid = (pid_t)syscall(SYS_gettid);
+            struct f_owner_ex ow; ow.type = F_OWNER_TID; ow.pid = (pid_t)prosper_gettid();
             fcntl((int)fd, F_SETOWN_EX, &ow);
             ioctl((int)fd, PERF_EVENT_IOC_ENABLE, 0);
             int slot = g_mb3w_cnt.fetch_add(1, std::memory_order_acq_rel);
@@ -527,7 +588,7 @@ namespace {
                          p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15]);
             syscall(SYS_write, 2, b, (size_t)n);
         }
-        auto& g = uc->uc_mcontext.gregs;
+        auto g = PROSPER_GREGS(uc);
         const struct { const char* nm; uint64_t v; } regs[] = {
             {"rax", (uint64_t)g[REG_RAX]}, {"rbx", (uint64_t)g[REG_RBX]},
             {"rcx", (uint64_t)g[REG_RCX]}, {"rdx", (uint64_t)g[REG_RDX]},
@@ -641,7 +702,7 @@ namespace {
     volatile unsigned long g_sse4a_emulated = 0;
     const bool g_sse4a_stat = getenv("PROSPER_SSE4A_STAT") != nullptr;
     bool try_emulate_sse4a(ucontext_t* uc) {
-        auto& g = uc->uc_mcontext.gregs;
+        auto g = PROSPER_GREGS(uc);
         uint64_t rip = (uint64_t)g[REG_RIP];
         const uint8_t* p = (const uint8_t*)rip;
         size_t i = 0;
@@ -657,11 +718,19 @@ namespace {
         if ((modrm >> 6) != 3) return false;            // register operands only
         int reg = ((modrm >> 3) & 7) | ((rex & 4) ? 8 : 0);
         int rm  = (modrm & 7)       | ((rex & 1) ? 8 : 0);
+#ifdef __APPLE__
+        // Darwin keeps the xmm registers as 16 contiguous _STRUCT_XMM_REG fields in the mcontext's
+        // float state; index off __fpu_xmm0.
+        if (!uc->uc_mcontext) return false;
+        auto xmm = [&](int n) { return (uint32_t*)(&uc->uc_mcontext->__fs.__fpu_xmm0 + n); };
+#else
         auto* fp = uc->uc_mcontext.fpregs;
         if (!fp) return false;
-        auto lo  = [&](int n) { const uint32_t* e = fp->_xmm[n].element; return (uint64_t)e[0] | ((uint64_t)e[1] << 32); };
-        auto hi  = [&](int n) { const uint32_t* e = fp->_xmm[n].element; return (uint64_t)e[2] | ((uint64_t)e[3] << 32); };
-        auto set = [&](int n, uint64_t v) { uint32_t* e = fp->_xmm[n].element; e[0] = (uint32_t)v; e[1] = (uint32_t)(v >> 32); };
+        auto xmm = [&](int n) { return (uint32_t*)fp->_xmm[n].element; };
+#endif
+        auto lo  = [&](int n) { const uint32_t* e = xmm(n); return (uint64_t)e[0] | ((uint64_t)e[1] << 32); };
+        auto hi  = [&](int n) { const uint32_t* e = xmm(n); return (uint64_t)e[2] | ((uint64_t)e[3] << 32); };
+        auto set = [&](int n, uint64_t v) { uint32_t* e = xmm(n); e[0] = (uint32_t)v; e[1] = (uint32_t)(v >> 32); };
         bool insertq = (pfx == 0xF2);
         uint32_t len, idx;
         if (op == 0x78)       { len = p[i++]; idx = p[i++]; }
@@ -699,7 +768,7 @@ namespace {
         // A SIGILL we did NOT emulate: log the faulting instruction bytes so the offending opcode can be
         // identified (another AMD-only ISA extension, or a decode miss in try_emulate_sse4a). #163-progress.
         if (sig == SIGILL) {
-            uint64_t rip = (uint64_t)((ucontext_t*)uctx)->uc_mcontext.gregs[REG_RIP];
+            uint64_t rip = (uint64_t)PROSPER_GREGS((ucontext_t*)uctx)[REG_RIP];
             const uint8_t* p = (const uint8_t*)rip;
             char b[96]; int n = snprintf(b, sizeof b, "[sigill] rip=0x%llx bytes:", (unsigned long long)rip);
             for (int k = 0; k < 16 && n < (int)sizeof b - 4; k++) n += snprintf(b + n, sizeof b - n, " %02x", p[k]);
@@ -713,9 +782,9 @@ namespace {
         // dump its full register + guest-stack context. Raw syscalls only (may run on a guest-%fs
         // worker); globals + fd table, no thread_local.
         if (sig == SIGTRAP && g_mb3w_cnt.load(std::memory_order_acquire) > 0) {
-            int mi = mb3w_match(si->si_fd);
+            int mi = mb3w_match(PROSPER_SI_FD(si));
             if (mi >= 0) {
-                auto& gr2 = ((ucontext_t*)uctx)->uc_mcontext.gregs;
+                auto gr2 = PROSPER_GREGS((ucontext_t*)uctx);
                 uint64_t addr = g_mb3w[mi].addr;
                 unsigned long long v = *(volatile uint64_t*)addr;
                 uint64_t wr = (uint64_t)gr2[REG_RIP];
@@ -777,7 +846,7 @@ namespace {
             // Step-window: continuous single-step from driver hit N to the next driver hit. On each step,
             // find the live read cursor (a GP reg pointing inside [base,end]) and ring-log advances.
             if (g_stepwin_active && si->si_code == TRAP_TRACE) {
-                auto& gs = uc->uc_mcontext.gregs;
+                auto gs = PROSPER_GREGS(uc);
                 uint64_t rip = (uint64_t)gs[REG_RIP];
                 g_stepwin_steps++;
                 static const int idx[] = { REG_RAX,REG_RBX,REG_RCX,REG_RDX,REG_RSI,REG_RDI,REG_R8,
@@ -810,15 +879,15 @@ namespace {
             if ((hwbp_state && hwbp_state->stepping) || g_hwbp_stepping) {
                 const int fd = hwbp_state ? hwbp_state->fd : g_hwbp_fd;
                 ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
-                uc->uc_mcontext.gregs[REG_EFL] &= ~0x100ll;
+                PROSPER_GREGS(uc)[REG_EFL] &= ~0x100ll;
                 if (hwbp_state) hwbp_state->stepping = 0;
                 g_hwbp_stepping = false;
                 return;
             }
             // Chained DATA write-watchpoint hit (a write to the watched slot completed): log the writer
             // RIP + the value just stored. Write-watchpoints trap AFTER the store, so no step is needed.
-            if (g_hwwatch_fd >= 0 && si->si_fd == g_hwwatch_fd) {
-                auto& gr2 = uc->uc_mcontext.gregs;
+            if (g_hwwatch_fd >= 0 && PROSPER_SI_FD(si) == g_hwwatch_fd) {
+                auto gr2 = PROSPER_GREGS(uc);
                 unsigned long long v = 0; { auto p=(volatile uint64_t*)g_hwwatch_addr; v=*p; }
                 // Always log an ANOMALOUS store (not a plausible guest heap pointer 0x1000000000..
                 // 0x1720000000, and nonzero) even past the count cap — this is how a corrupt value
@@ -837,7 +906,7 @@ namespace {
                 }
                 return;
             }
-            auto& gr = uc->uc_mcontext.gregs;
+            auto gr = PROSPER_GREGS(uc);
             uint64_t rdi = (uint64_t)gr[REG_RDI], rsi = (uint64_t)gr[REG_RSI];
             uint64_t rax = (uint64_t)gr[REG_RAX], r14 = (uint64_t)gr[REG_R14], r15 = (uint64_t)gr[REG_R15];
             // This handler returns to the guest, which may be on the guest %fs — swap to host %fs for the
@@ -1093,7 +1162,7 @@ namespace {
                 arm_hwwatch(base + (uint64_t)g_hwwatch_delta);
             }
             const int hit_fd = hwbp_state ? hwbp_state->fd :
-                               (si->si_fd >= 0 ? si->si_fd : g_hwbp_fd);
+                               (PROSPER_SI_FD(si) >= 0 ? PROSPER_SI_FD(si) : g_hwbp_fd);
             ioctl(hit_fd, PERF_EVENT_IOC_DISABLE, 0);   // disable so we can step off the bp address
             // Step-window ENTRY: on the Nth driver hit, begin continuous single-stepping (bp stays disabled;
             // the window ends when we single-step back to the driver = next hit). Buffer range is [base,
@@ -1110,14 +1179,14 @@ namespace {
                     (int)g_hwbp_count, (unsigned long long)g_stepwin_base, (unsigned long long)g_stepwin_prevcur,
                     (unsigned long long)(g_stepwin_prevcur - g_stepwin_base));
                 syscall(SYS_write, 2,sb, sn);
-                uc->uc_mcontext.gregs[REG_EFL] |= 0x100ll;   // start single-stepping
+                PROSPER_GREGS(uc)[REG_EFL] |= 0x100ll;   // start single-stepping
                 guest_fs_restore_scoped(saved_fs);
                 return;
             }
             // Stay armed while logging OR while the anomaly-ring trace is still hunting (PROSPER_HWBP_MAX
             // can be 0 to suppress the per-hit log yet keep the bp live feeding the ring until it dumps).
             if (g_hwbp_count < g_hwbp_max || ((g_hwbp_anom_on || g_hwbp_node_on) && !g_hwbp_ring_dumped)) {
-                uc->uc_mcontext.gregs[REG_EFL] |= 0x100ll;
+                PROSPER_GREGS(uc)[REG_EFL] |= 0x100ll;
                 if (hwbp_state) hwbp_state->stepping = 1; else g_hwbp_stepping = true;
             }                                              // else: leave disabled (one-and-done at the cap)
             guest_fs_restore_scoped(saved_fs);             // back to guest %fs before returning to guest code
@@ -1131,14 +1200,14 @@ namespace {
             auto* uc = (ucontext_t*)uctx;
             if (g_bp_stepping) {
                 bp_write_byte(g_bp_addr, 0xCC);
-                uc->uc_mcontext.gregs[REG_EFL] &= ~0x100ll;   // clear TF
+                PROSPER_GREGS(uc)[REG_EFL] &= ~0x100ll;   // clear TF
                 g_bp_stepping = false;
                 return;
             }
-            uint64_t rip = (uint64_t)uc->uc_mcontext.gregs[REG_RIP];
+            uint64_t rip = (uint64_t)PROSPER_GREGS(uc)[REG_RIP];
             if (rip == g_bp_addr + 1) {
-                uint64_t r15 = (uint64_t)uc->uc_mcontext.gregs[REG_R15];
-                auto& gr0 = uc->uc_mcontext.gregs;
+                uint64_t r15 = (uint64_t)PROSPER_GREGS(uc)[REG_R15];
+                auto gr0 = PROSPER_GREGS(uc);
                 // PROSPER_BP_SHIFT=1 (#312): only log when the store source rsi is a byte-shifted pool
                 // pointer (the primary corruptor's value). Filters the freelist push/pop hot path down
                 // to just the corrupting event, so timing is barely perturbed and the log is decisive.
@@ -1152,7 +1221,7 @@ namespace {
                     g_bp_count = g_bp_count + 1;
                     auto rd = [](uint64_t a) -> unsigned long long {
                         return probe_readable(a) ? (unsigned long long)*(const uint64_t*)a : 0xBADBADull; };
-                    auto& gr = uc->uc_mcontext.gregs;
+                    auto gr = PROSPER_GREGS(uc);
                     uint64_t rdi = (uint64_t)gr[REG_RDI], rsi = (uint64_t)gr[REG_RSI];
                     uint64_t rax = (uint64_t)gr[REG_RAX], r14 = (uint64_t)gr[REG_R14];
                     uint64_t rcx = (uint64_t)gr[REG_RCX];
@@ -1183,8 +1252,8 @@ namespace {
                     syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
                 }
                 bp_write_byte(g_bp_addr, g_bp_orig);              // restore real instruction
-                uc->uc_mcontext.gregs[REG_RIP] = (greg_t)g_bp_addr;  // re-execute it
-                uc->uc_mcontext.gregs[REG_EFL] |= 0x100ll;        // single-step (TF)
+                PROSPER_GREGS(uc)[REG_RIP] = (greg_t)g_bp_addr;  // re-execute it
+                PROSPER_GREGS(uc)[REG_EFL] |= 0x100ll;        // single-step (TF)
                 g_bp_stepping = true;
                 return;
             }
@@ -1193,7 +1262,7 @@ namespace {
         // log the slot's post-write value, re-protect, keep watching.
         if (sig == SIGTRAP && g_lwatch_stepping) {
             auto* uc = (ucontext_t*)uctx;
-            uc->uc_mcontext.gregs[REG_EFL] &= ~0x100ll;   // clear TF
+            PROSPER_GREGS(uc)[REG_EFL] &= ~0x100ll;   // clear TF
             if (g_lwatch_shift) {
                 // Value-triggered: only report if the just-completed store left a byte-shifted pool
                 // pointer at the faulting address (the primary #312 corruptor). Silent otherwise.
@@ -1241,8 +1310,8 @@ namespace {
         if (g_lwatch_armed && sig == SIGSEGV && si->si_addr) {
             uint64_t fa = (uint64_t)si->si_addr;
             auto* uc = (ucontext_t*)uctx;
-            if ((fa & ~(uint64_t)0xfff) == g_lwatch_page && (uc->uc_mcontext.gregs[REG_ERR] & 2)) {
-                uint64_t rip = (uint64_t)uc->uc_mcontext.gregs[REG_RIP];
+            if ((fa & ~(uint64_t)0xfff) == g_lwatch_page && (PROSPER_REG_ERR(uc) & 2)) {
+                uint64_t rip = (uint64_t)PROSPER_GREGS(uc)[REG_RIP];
                 g_lwatch_step_rip = 0;
                 if (g_lwatch_shift) {
                     // Value-triggered: capture writer + stack silently now, decide at SIGTRAP whether
@@ -1250,7 +1319,7 @@ namespace {
                     // write) so the corruptor is caught wherever in the FPoolInfo page it lands.
                     g_lwatch_fa = fa;
                     g_lwatch_step_rip = rip;
-                    uint64_t rsp = (uint64_t)uc->uc_mcontext.gregs[REG_RSP];
+                    uint64_t rsp = (uint64_t)PROSPER_GREGS(uc)[REG_RSP];
                     g_lwatch_stkn = 0;
                     for (uint64_t o = 0; o < 0x400 && g_lwatch_stkn < 8; o += 8) {
                         if (!probe_readable(rsp + o)) break;
@@ -1258,7 +1327,7 @@ namespace {
                         if (v >= 0x400000000ull && v < 0x40a000000ull) g_lwatch_stk[g_lwatch_stkn++] = v;
                     }
                     mprotect((void*)g_lwatch_page, 0x1000, PROT_READ | PROT_WRITE);
-                    uc->uc_mcontext.gregs[REG_EFL] |= 0x100ll;   // TF -> single-step the write
+                    PROSPER_GREGS(uc)[REG_EFL] |= 0x100ll;   // TF -> single-step the write
                     g_lwatch_stepping = true;
                     return;
                 }
@@ -1277,7 +1346,7 @@ namespace {
                     // addresses (up to 8), so the guest free/alloc path above the raw write is
                     // identifiable (async-signal-safe: bounded reads of the faulting thread's
                     // own stack).
-                    uint64_t rsp = (uint64_t)uc->uc_mcontext.gregs[REG_RSP];
+                    uint64_t rsp = (uint64_t)PROSPER_GREGS(uc)[REG_RSP];
                     int found = 0;
                     for (uint64_t o = 0; o < 0x400 && found < 8 && n < (int)sizeof b - 24; o += 8) {
                         if (!probe_readable(rsp + o)) break;
@@ -1298,7 +1367,7 @@ namespace {
                     }
                 }
                 mprotect((void*)g_lwatch_page, 0x1000, PROT_READ | PROT_WRITE);
-                uc->uc_mcontext.gregs[REG_EFL] |= 0x100ll;   // TF -> single-step the write
+                PROSPER_GREGS(uc)[REG_EFL] |= 0x100ll;   // TF -> single-step the write
                 g_lwatch_stepping = true;
                 return;
             }
@@ -1307,7 +1376,7 @@ namespace {
         // re-arm (re-protect read-only) and clear the trap flag so we keep watching.
         if (sig == SIGTRAP && g_watch_stepping) {
             auto* uc = (ucontext_t*)uctx;
-            uc->uc_mcontext.gregs[REG_EFL] &= ~0x100ll;   // clear TF
+            PROSPER_GREGS(uc)[REG_EFL] &= ~0x100ll;   // clear TF
             // Post-write: log the slot's new value + the object's type tag [r15+0] (0x2b if it's still
             // the same live object; changed => the memory was freed and reused, so the write is churn).
             unsigned long long slot = *(const uint64_t*)g_watch_addr;
@@ -1322,8 +1391,8 @@ namespace {
         // Arm the watchpoint on the first companion read (rip == the reader deref, slot still null).
         if (g_watch_companion && sig == SIGSEGV && !g_watch_armed) {
             auto* uc = (ucontext_t*)uctx;
-            if ((uint64_t)uc->uc_mcontext.gregs[REG_RIP] == g_skip_rip) {
-                uint64_t r15 = (uint64_t)uc->uc_mcontext.gregs[REG_R15];
+            if ((uint64_t)PROSPER_GREGS(uc)[REG_RIP] == g_skip_rip) {
+                uint64_t r15 = (uint64_t)PROSPER_GREGS(uc)[REG_R15];
                 g_watch_addr = r15 + 0x140;
                 g_watch_page = g_watch_addr & ~(uint64_t)0xfff;
                 if (mprotect((void*)g_watch_page, 0x1000, PROT_READ) == 0) {
@@ -1334,7 +1403,7 @@ namespace {
                     syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
                 }
                 // Skip this (null) read so the boot proceeds; the slot's page is now watched.
-                uc->uc_mcontext.gregs[REG_RIP] = (greg_t)g_skip_target;
+                PROSPER_GREGS(uc)[REG_RIP] = (greg_t)g_skip_target;
                 return;
             }
         }
@@ -1343,18 +1412,18 @@ namespace {
         if (g_watch_armed && sig == SIGSEGV && si->si_addr) {
             uint64_t fa = (uint64_t)si->si_addr;
             auto* uc = (ucontext_t*)uctx;
-            if ((fa & ~(uint64_t)0xfff) == g_watch_page && (uc->uc_mcontext.gregs[REG_ERR] & 2)) {
+            if ((fa & ~(uint64_t)0xfff) == g_watch_page && (PROSPER_REG_ERR(uc) & 2)) {
                 if (fa >= g_watch_addr && fa < g_watch_addr + 8) {
                     g_watch_hits = g_watch_hits + 1;
                     char b[160];
                     int n = snprintf(b, sizeof b, "[watch] WRITE to companion slot 0x%llx from rip=0x%llx writer-tid=%ld (hit #%d)\n",
                                      (unsigned long long)fa,
-                                     (unsigned long long)uc->uc_mcontext.gregs[REG_RIP], cur_tid(),
+                                     (unsigned long long)PROSPER_GREGS(uc)[REG_RIP], cur_tid(),
                                      (int)g_watch_hits);
                     syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
                 }
                 mprotect((void*)g_watch_page, 0x1000, PROT_READ | PROT_WRITE);
-                uc->uc_mcontext.gregs[REG_EFL] |= 0x100ll;   // set TF -> single-step the write
+                PROSPER_GREGS(uc)[REG_EFL] |= 0x100ll;   // set TF -> single-step the write
                 g_watch_stepping = true;
                 return;
             }
@@ -1362,8 +1431,8 @@ namespace {
         // Repeated companion reads (later reader passes): skip them too so the boot keeps running.
         if (g_watch_armed && sig == SIGSEGV) {
             auto* uc = (ucontext_t*)uctx;
-            if ((uint64_t)uc->uc_mcontext.gregs[REG_RIP] == g_skip_rip) {
-                uc->uc_mcontext.gregs[REG_RIP] = (greg_t)g_skip_target;
+            if ((uint64_t)PROSPER_GREGS(uc)[REG_RIP] == g_skip_rip) {
+                PROSPER_GREGS(uc)[REG_RIP] = (greg_t)g_skip_target;
                 return;
             }
         }
@@ -1383,7 +1452,7 @@ namespace {
                 char b[128]; auto* uc2 = (ucontext_t*)uctx;
                 int n = snprintf(b, sizeof b, "[lazy-commit] %s page=0x%llx rip=0x%llx\n",
                                  ok ? "mapped" : "MMAP-FAILED", (unsigned long long)(uint64_t)(uintptr_t)page,
-                                 (unsigned long long)uc2->uc_mcontext.gregs[REG_RIP]);
+                                 (unsigned long long)PROSPER_GREGS(uc2)[REG_RIP]);
                 // RAW syscall, NOT glibc write(): this handler can run on a thread whose %fs is the
                 // GUEST TCB (PROSPER_GUEST_FS), and glibc write()'s cancellation prologue reads the
                 // TCB through %fs — a nested SIGSEGV inside the handler killed the process (the UE4
@@ -1404,7 +1473,7 @@ namespace {
         //    same address forever (infinite fault loop) instead of a clean fault report.
         if (sig == SIGSEGV && si->si_addr && si->si_code == SEGV_MAPERR) {
             uint64_t a = (uint64_t)si->si_addr;
-            uint64_t rip = (uint64_t)((ucontext_t*)uctx)->uc_mcontext.gregs[REG_RIP];
+            uint64_t rip = (uint64_t)PROSPER_GREGS((ucontext_t*)uctx)[REG_RIP];
             if (a >= GPU_VA_LO && a < GPU_VA_HI && a != rip) {
                 void* page = (void*)(a & ~(uint64_t)0xfff);
                 bool ok = mmap(page, 0x1000, PROT_READ | PROT_WRITE,
@@ -1428,7 +1497,7 @@ namespace {
         if (g_null_page && sig == SIGSEGV) {
             uint64_t a = (uint64_t)si->si_addr;
             auto* uc = (ucontext_t*)uctx;
-            uint64_t rip = (uint64_t)uc->uc_mcontext.gregs[REG_RIP];
+            uint64_t rip = (uint64_t)PROSPER_GREGS(uc)[REG_RIP];
             // Only a DATA READ from low memory is backable. An instruction fetch at null (a==rip, i.e.
             // a call/jmp through a null pointer) or a fault on an already-backed page (a null WRITE)
             // must NOT be re-backed — those are the real chain endpoints; let them terminate + report.
@@ -1452,9 +1521,9 @@ namespace {
         // the null [obj+0x140] deref to its own skip label, logging each object's state.
         if (g_skip_null_companion && sig == SIGSEGV) {
             auto* uc = (ucontext_t*)uctx;
-            uint64_t rip = (uint64_t)uc->uc_mcontext.gregs[REG_RIP];
+            uint64_t rip = (uint64_t)PROSPER_GREGS(uc)[REG_RIP];
             if (rip == g_skip_rip) {
-                uint64_t r15 = (uint64_t)uc->uc_mcontext.gregs[REG_R15];
+                uint64_t r15 = (uint64_t)PROSPER_GREGS(uc)[REG_R15];
                 g_skip_count = g_skip_count + 1;
                 auto rd = [](uint64_t a) -> unsigned long long {
                     return probe_readable(a) ? (unsigned long long)*(const uint64_t*)a : 0xBADBADull;
@@ -1466,7 +1535,7 @@ namespace {
                     (int)g_skip_count, (unsigned long long)r15, rd(r15+0xc0), rd(r15+0xe0),
                     rd(r15+0x138), rd(r15+0x140), rd(r15+0x1a0), (unsigned long long)g_skip_target);
                 syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
-                uc->uc_mcontext.gregs[REG_RIP] = (greg_t)g_skip_target;
+                PROSPER_GREGS(uc)[REG_RIP] = (greg_t)g_skip_target;
                 return;   // re-execute from the reader's skip label
             }
         }
@@ -1478,13 +1547,13 @@ namespace {
         if (g_faultlog) {
             char b[128]; auto* uc = (ucontext_t*)uctx;
             int n = snprintf(b, sizeof b, "[fault] sig=%d addr=%p rip=0x%llx armed=%d tid=%ld\n",
-                             sig, si->si_addr, (unsigned long long)uc->uc_mcontext.gregs[REG_RIP],
+                             sig, si->si_addr, (unsigned long long)PROSPER_GREGS(uc)[REG_RIP],
                              (int)(g_armed_tid && cur_tid() == g_armed_tid), cur_tid());
             syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
         }
         g_fault_addr = si->si_addr;
         auto* uc = (ucontext_t*)uctx;
-        auto& g = uc->uc_mcontext.gregs;
+        auto g = PROSPER_GREGS(uc);
         g_fault_rip = (uint64_t)g[REG_RIP];
         g_rbp = (uint64_t)g[REG_RBP]; g_rsp = (uint64_t)g[REG_RSP];
         g_rax = (uint64_t)g[REG_RAX]; g_rdi = (uint64_t)g[REG_RDI];
@@ -1621,8 +1690,8 @@ bool map_image(const LoadedImage& img, std::string* err) {
     void* want = (void*)(img.base + img.min_vaddr);
     size_t sz  = img.mem.size();
     // RWX for bring-up; per-segment W^X is a later refinement (shared LOAD pages).
-    void* got = mmap(want, sz, PROT_READ | PROT_WRITE | PROT_EXEC,
-                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    void* got = prosper_mmap_noreplace(want, sz, PROT_READ | PROT_WRITE | PROT_EXEC,
+                                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (got == MAP_FAILED || got != want) return fail("mmap image at guest base failed");
     memcpy(got, img.mem.data(), sz);
     if (!g_base) g_base = img.base;   // main image, for fault-offset reporting
@@ -1643,8 +1712,8 @@ bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
     if (n == 0) { g_stub_base = stub_base; g_stub_size = stub_size; g_nstubs = 0; return true; }
     uint64_t region = page_up(n * stub_size);
     void* want = (void*)stub_base;
-    void* got = mmap(want, region, PROT_READ | PROT_WRITE | PROT_EXEC,
-                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    void* got = prosper_mmap_noreplace(want, region, PROT_READ | PROT_WRITE | PROT_EXEC,
+                                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (got == MAP_FAILED || got != want) return fail("mmap stub region failed");
 
     bool swap = guest_tls_enabled();   // gated: emit the %fs swap stubs so HLE handlers run on the host TCB
@@ -1845,6 +1914,15 @@ void install_trap_handler() {
     // exact "fatal signal 11, no output" we see mid-load). On the alt stack the worker-thread fault
     // path (which does NOT siglongjmp) can print the faulting RIP. Gated so the default boot's
     // main-thread siglongjmp recovery is unchanged. CONFIDENCE: HIGH (mechanism).
+    // On macOS the alt stack is MANDATORY, not diagnostic: a guest fault whose access is on the
+    // faulting thread's own stack (a bad indirect branch into the stack, a stack overflow) cannot
+    // push a signal frame onto that same stack, so without SA_ONSTACK the kernel force-kills the
+    // process with no handler entry (the "SIGSEGV, no output" we first saw). The Darwin recovery
+    // path siglongjmps out of the handler, which is safe from the alt stack (no glibc
+    // %fs-guarded ____longjmp_chk to trip, unlike Linux — that is why it stays opt-in there).
+#ifdef __APPLE__
+    sa.sa_flags |= SA_ONSTACK;
+#endif
     if (getenv("PROSPER_FAULT_ONSTACK")) sa.sa_flags |= SA_ONSTACK;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, nullptr);
@@ -1882,7 +1960,7 @@ void arm_hwbp() {
     g_hwbp_fd = (int)fd;
     fcntl(g_hwbp_fd, F_SETFL, O_ASYNC);
     fcntl(g_hwbp_fd, F_SETSIG, SIGTRAP);
-    struct f_owner_ex ow; ow.type = F_OWNER_TID; ow.pid = (pid_t)syscall(SYS_gettid);
+    struct f_owner_ex ow; ow.type = F_OWNER_TID; ow.pid = (pid_t)prosper_gettid();
     fcntl(g_hwbp_fd, F_SETOWN_EX, &ow);
     if (!hwbp_register_thread(ow.pid, g_hwbp_fd)) {
         int n = snprintf(b, sizeof b, "[hwbp] thread-state table full for tid=%ld - HW bp disabled\n",
@@ -1893,7 +1971,7 @@ void arm_hwbp() {
     ioctl(g_hwbp_fd, PERF_EVENT_IOC_ENABLE, 0);
     t_hwbp_fd = g_hwbp_fd;   // main thread uses the same fd for its per-thread stepping state
     int n = snprintf(b, sizeof b, "[hwbp] armed HW execute bp at eboot+0x%llx (fd=%d tid=%ld)\n",
-                     (unsigned long long)(g_hwbp_addr - 0x400000000ull), g_hwbp_fd, (long)syscall(SYS_gettid));
+                     (unsigned long long)(g_hwbp_addr - 0x400000000ull), g_hwbp_fd, (long)prosper_gettid());
     syscall(SYS_write, 2, b, (size_t)n);   /* raw: glibc write() reads the TCB via %fs (guest-fs unsafe in this handler) */
 }
 
@@ -1901,16 +1979,16 @@ void arm_hwbp() {
 // owns its own perf fd + SIGTRAP delivery, so off-main-thread execution of the target is observed too.
 void arm_hwbp_this_thread() {
     if (getenv("PROSPER_HWBP_ARMLOG")) { char b[128]; int n = snprintf(b, sizeof b,
-        "[hwbp] arm_this_thread tid=%ld on=%d all=%d addr=0x%llx tfd=%d\n", (long)syscall(SYS_gettid),
+        "[hwbp] arm_this_thread tid=%ld on=%d all=%d addr=0x%llx tfd=%d\n", (long)prosper_gettid(),
         g_hwbp_on, g_hwbp_allthreads, (unsigned long long)g_hwbp_addr, t_hwbp_fd); syscall(SYS_write, 2,b, n); }
     if (!g_hwbp_on || !g_hwbp_allthreads || !g_hwbp_addr || t_hwbp_fd >= 0) return;
     long fd = perf_bp_open(g_hwbp_addr, HW_BREAKPOINT_X);
     if (fd < 0) { char b[96]; int n = snprintf(b, sizeof b, "[hwbp] worker-arm FAILED tid=%ld errno=%d\n",
-        (long)syscall(SYS_gettid), errno); syscall(SYS_write, 2,b, n); return; }
+        (long)prosper_gettid(), errno); syscall(SYS_write, 2,b, n); return; }
     t_hwbp_fd = (int)fd;
     fcntl(t_hwbp_fd, F_SETFL, O_ASYNC);
     fcntl(t_hwbp_fd, F_SETSIG, SIGTRAP);
-    struct f_owner_ex ow; ow.type = F_OWNER_TID; ow.pid = (pid_t)syscall(SYS_gettid);
+    struct f_owner_ex ow; ow.type = F_OWNER_TID; ow.pid = (pid_t)prosper_gettid();
     fcntl(t_hwbp_fd, F_SETOWN_EX, &ow);
     if (!hwbp_register_thread(ow.pid, t_hwbp_fd)) {
         char b[112]; int n = snprintf(b, sizeof b,
@@ -1920,7 +1998,7 @@ void arm_hwbp_this_thread() {
     }
     ioctl(t_hwbp_fd, PERF_EVENT_IOC_ENABLE, 0);
     char b[128]; int n = snprintf(b, sizeof b, "[hwbp] armed on worker tid=%ld (fd=%d) for eboot+0x%llx\n",
-        (long)syscall(SYS_gettid), t_hwbp_fd, (unsigned long long)(g_hwbp_addr - 0x400000000ull));
+        (long)prosper_gettid(), t_hwbp_fd, (unsigned long long)(g_hwbp_addr - 0x400000000ull));
     syscall(SYS_write, 2,b, n);
 }
 
@@ -1965,6 +2043,22 @@ void set_module_start_param_ranges(const std::vector<std::pair<uint64_t, uint64_
 
 // Find the /proc/self/maps region containing `addr`: [s,e) and its "rwxp" perms. False if unmapped.
 static bool region_of(uint64_t addr, uint64_t& s, uint64_t& e, char perms[5]) {
+#ifdef __APPLE__
+    // mach_vm_region: first region at or after `addr` (containing it when mapped).
+    mach_vm_address_t ra = addr; mach_vm_size_t rs = 0;
+    vm_region_basic_info_data_64_t info; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t obj = MACH_PORT_NULL;
+    if (mach_vm_region(mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64,
+                       (vm_region_info_t)&info, &cnt, &obj) != KERN_SUCCESS) return false;
+    if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
+    if (addr < ra || addr >= ra + rs) return false;   // gap: addr itself is unmapped
+    s = ra; e = ra + rs;
+    perms[0] = (info.protection & VM_PROT_READ)    ? 'r' : '-';
+    perms[1] = (info.protection & VM_PROT_WRITE)   ? 'w' : '-';
+    perms[2] = (info.protection & VM_PROT_EXECUTE) ? 'x' : '-';
+    perms[3] = 'p'; perms[4] = 0;
+    return true;
+#else
     FILE* mf = fopen("/proc/self/maps", "re");
     if (!mf) return false;
     char line[512];
@@ -1975,6 +2069,7 @@ static bool region_of(uint64_t addr, uint64_t& s, uint64_t& e, char perms[5]) {
     }
     fclose(mf);
     return false;
+#endif
 }
 
 // Print the `n` bytes at [start, start+n) for the init-fault report WITHOUT risking a second,

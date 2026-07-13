@@ -10,6 +10,7 @@
 #pragma once
 #include "command_processor.hpp"   // GpuState
 #include "render_state.hpp"        // extract_render_state / resolve_pipeline_state / ResolvedPipelineState
+#include <cstring>                 // memcpy: aliasing-safe index-buffer fingerprint loads
 #include "rdna2_to_spirv.hpp"      // recompile_vertex / recompile_fragment
 #include "shader_resources.hpp"    // ShaderResourceTable
 #include "agc_shader_layout.hpp"   // DecodedBufferDescriptor (DynFetch)
@@ -252,10 +253,19 @@ inline uint32_t index_elem_bytes(uint32_t index_type) {
 inline bool index_buffer_is_unannounced_32bit(const uint16_t* p16, const uint32_t* p32, uint32_t n) {
     if (n < 2) return false;                         // need at least one odd word to test
     bool odd_zero = true, all_small = true, any_nonzero = false, has_odd = false;
+    // memcpy loads, NOT typed derefs: p16/p32 view the SAME guest bytes, and reading one object
+    // through both element types is strict-aliasing UB — Apple Clang 21 at -O2 proved it and
+    // compiled the caller into ud2 (found by the macOS port; Linux GCC happened to tolerate it).
+    // Fixed-size memcpy compiles to the same single loads without the aliasing assumption.
     for (uint32_t i = 0; i < n; i++) {
-        if (i & 1) { has_odd = true; if (p16[i] != 0) odd_zero = false; }
-        if (p32[i] >= 0x10000u) all_small = false;
-        if (p32[i] != 0) any_nonzero = true;
+        if (i & 1) {
+            has_odd = true;
+            uint16_t w; memcpy(&w, (const char*)p16 + 2u * i, 2);
+            if (w != 0) odd_zero = false;
+        }
+        uint32_t d; memcpy(&d, (const char*)p32 + 4u * i, 4);
+        if (d >= 0x10000u) all_small = false;
+        if (d != 0) any_nonzero = true;
     }
     return has_odd && odd_zero && all_small && any_nonzero;
 }
