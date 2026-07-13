@@ -486,6 +486,25 @@ void* thread_trampoline(void* p) {
     return rv;
 }
 }
+#elif defined(_WIN32)
+namespace {
+// Windows guest-thread trampoline. The bare `pthread_create(entry, arg)` the Windows path used
+// before had two fatal bugs: (1) winpthreads calls `entry(arg)` with the MS x64 ABI (arg in rcx),
+// but the guest entry is System V (reads rdi) — so the worker got a garbage arg and crashed on a
+// null-derived pointer; (2) it never ran guest_tls_activate_thread(), so the worker had no guest
+// %fs TCB and its initial-exec TLS was wrong. This trampoline fixes both: activate the guest %fs
+// TCB, then call the guest entry through the SysV marshalling shim, and purge DTV on exit.
+struct WinThreadStart { uint64_t entry; void* arg; };
+extern "C" uint64_t prosper_call_guest_sysv(uint64_t fn, uint64_t a0, uint64_t a1);
+void* win_thread_trampoline(void* p) {
+    auto* ts = (WinThreadStart*)p;
+    uint64_t entry = ts->entry; void* arg = ts->arg; free(ts);   // host libc: run on host %fs (before activate)
+    guest_tls_activate_thread();   // this worker's guest %fs TCB (FSGSBASE); no-op if the gate is off
+    void* rv = entry ? (void*)(uintptr_t)prosper_call_guest_sysv(entry, (uint64_t)(uintptr_t)arg, 0) : nullptr;
+    tls_dtv_purge_current_thread();
+    return rv;
+}
+}
 #endif
 
 HLE(k_pthread_create) {
@@ -522,9 +541,14 @@ HLE(k_pthread_create) {
     pthread_attr_destroy(&la);
     if (r) { free(ts); return (uint64_t)r; }
 #else
+    // Windows: route through win_thread_trampoline so the guest entry is called with the SysV ABI and
+    // gets its guest %fs TCB — a bare pthread_create(entry, arg) mis-passes the arg (MS x64 vs SysV) and
+    // skips TLS activation, crashing the worker on a null-derived pointer.
     pthread_attr_t* at = (a1 && *(void**)a1) ? (pthread_attr_t*)*(void**)a1 : nullptr;
-    int r = pthread_create(&tid, at, entry, arg);
-    if (r) return (uint64_t)r;
+    auto* ts = (WinThreadStart*)malloc(sizeof(WinThreadStart));
+    ts->entry = (uint64_t)(uintptr_t)entry; ts->arg = arg;
+    int r = pthread_create(&tid, at, win_thread_trampoline, ts);
+    if (r) { free(ts); return (uint64_t)r; }
 #endif
     if (a0) *(uint64_t*)a0 = (uint64_t)tid;
     return 0;
