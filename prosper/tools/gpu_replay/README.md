@@ -22,6 +22,12 @@ Create a capsule with the native-speed workflow in
 ./build-linux/gpu_replay --prepend /tmp/producer.prgcap /tmp/consumer.prgcap /tmp/closure.bmp
 ./build-linux/gpu_replay --bundle /tmp/window.prgbundle /tmp/closure.bmp
 ./build-linux/gpu_replay --bundle /tmp/window.prgbundle --bundle-tail 2 /tmp/tail.bmp
+./build-linux/gpu_replay --bundle /tmp/window.prgbundle \
+  --bundle-intermediate-through-target 642x362 /tmp/closure.bmp
+./build-linux/gpu_replay --bundle /tmp/window.prgbundle \
+  --bundle-final-capsule /tmp/final-seeded.prgcap /tmp/closure.bmp
+./build-linux/gpu_replay --bundle /tmp/window.prgbundle \
+  --bundle-extract-submit 19046 /tmp/submit-19046.prgcap
 ./build-linux/gpu_replay --bundle /tmp/window.prgbundle --bundle-compact /tmp/compact.prgbundle
 ./build-linux/gpu_replay --bundle /tmp/window.prgbundle --bundle-zero-boundary /tmp/zero-ab.bmp
 ```
@@ -51,6 +57,7 @@ expected hash. `--allow-mismatch` is for an intentional differential such as `--
 
 ```bash
 ./build-linux/gpu_replay --draw 12:18 /tmp/submit.prgcap /tmp/pass.bmp
+./build-linux/gpu_replay --through-operation 52 /tmp/submit.prgcap /tmp/prefix.bmp
 ./build-linux/gpu_replay --dump-resource 18:ps:34 /tmp/texture.bin /tmp/submit.prgcap
 ./build-linux/gpu_replay --dump-shader 18:fs /tmp/fragment.spv /tmp/submit.prgcap
 ```
@@ -58,6 +65,13 @@ expected hash. `--allow-mismatch` is for an intentional differential such as `--
 `--draw` uses realized draw indices, while graphs use mixed semantic operation indices. They are not
 interchangeable when dispatches or unrealized operations are present. Replay restores serialized render-target
 seeds before operation zero and uses owned resource memory; it must not dereference original guest mappings.
+Bundle operation sources are semantic draw IDs and may contain holes; tooling must resolve them through each
+realized item's `draw_index`, never treat them as offsets into the compact draw vector.
+
+`--through-operation N` executes the inclusive mixed graphics/compute prefix `0..N`, preserving operation
+order and all earlier work. Prefix output uses the last executed draw target's native dimensions. Use it with
+a hash-verified seeded final capsule for fast composition bisection; unlike `--draw`, it does not discard
+compute dispatches or earlier draws.
 
 `--prepend` materializes and executes one earlier capsule in the same renderer instance before the consumer.
 Its rendered targets take precedence over consumer RTT seeds at matching addresses; unrelated seeds are still
@@ -82,6 +96,27 @@ Bundle files use `.prgbundle`, contain title-derived data, are gitignored, and m
 dictionary. Use it when lifetime evidence proves that earlier submits cannot be target producers; the first
 replayed submit becomes the explicit configured boundary and its graph must still be inspected for leaves.
 
+`--bundle-intermediate-through-target WxH` stops each non-final submit after its last realized draw to that
+target extent. It avoids rendering later presentation/UI passes when timeline and dependency evidence proves
+that only the named target family crosses submit boundaries. The final submit remains complete. Replay aborts
+if an included temporal image leaf has another extent or an intermediate submit has no matching draw. This is
+an evidence-gated optimization, not automatic dependency closure.
+
+`--bundle-final-capsule PATH` snapshots the complete live color RTT cache before executing the final submit
+and writes it as seeds in a standalone capsule. Its standalone output must match the bundle's final hash before
+using it for fast `--draw`, resource, or shader experiments. Export validates every surface and fails when a
+required temporal surface is absent; it never substitutes zero pixels. The capsule does not yet serialize live
+Vulkan depth/stencil images (#569/#611), so a hash mismatch can remain even when every color seed is exact.
+
+`--bundle-extract-submit N PATH` materializes one run-local submit manifest as a normal capsule and exits
+without Vulkan when no image output is requested. Use it to inspect, graph, or validate the exact predecessor
+whose frontier or cache behavior is in question.
+
+`--bundle-find-ds ADDR` scans only the compact submit manifests and reports every submit whose depth/stencil
+read or write bases match `ADDR`, including draw range, target extent, depth-test/write counts, clear count,
+and compare-op bitmask. It does not reconstruct resource payloads or initialize Vulkan. Use it to establish a
+guest DS surface's lifetime before expanding a replay window or changing cache behavior.
+
 `--bundle-compact PATH` writes a validated copy containing only resources and chunks reachable from retained
 submit manifests. It is useful after a rolling semantic capture; with no image output argument, compaction
 exits without initializing Vulkan. Combine it with `--bundle-tail N` to write a compact suffix bundle.
@@ -92,6 +127,13 @@ It can disprove stale guest backing versus zero initialization as the cause of a
 faithful replacement for the missing producer history.
 
 ## Current Dead Cells reference
+
+The #608 playable closure selects exactly 90 semantic draws with the 738x420 pass at draw 79..81. Its retained
+submits 18,165..19,047 represent 158.94 GiB logically and 739 MiB uniquely. Replay resolves 1,764 temporal image
+dependencies with zero bounded/unresolved leaves and renders hash `5759c125812154dc`. A complete-color-cache
+final capsule renders `71b84bdfae53933c` because it begins with fresh depth. Manifest scanning shows the same
+642x362 depth address in all 883 submits, always with LESS_OR_EQUAL tests/writes and never a clear. This is the
+#611 depth-lifetime bug and #569 checkpoint gap; it is not evidence for another color RTT producer.
 
 The #594/#595 gameplay capsule at submit 18,750 has two external 642x362 temporal versions. Timeline-v4
 full-run aggregation shows that both surfaces begin around submit 17,400 in current runs and are rewritten

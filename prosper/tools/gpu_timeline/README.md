@@ -2,8 +2,9 @@
 
 `PROSPER_GPU_TIMELINE=<path>.prgtl` records the guest's folded GPU-submit and VideoOut-present
 boundaries without registering or invoking the Vulkan renderer. Use the cheap semantic index to find
-the exact submit of interest, then select that stable submit number in a second run to create one
-immutable replay capsule. Vulkan warmup and renderer sampling do not control the selection.
+the scene shape of interest, then select it with target, draw-count, and draw-index predicates to create one
+immutable replay capsule. Submit numbers are run-local. Vulkan warmup and renderer sampling do not control
+the selection.
 
 ```bash
 PROSPER_GUEST_FS=1 \
@@ -38,18 +39,23 @@ PROSPER_GPU_TIMELINE_CAPTURE_PREDECESSOR=/tmp/dead-cells-submit-18419.prgcap \
 Capture a bounded ordered window directly into one deduplicated bundle:
 
 ```bash
-PROSPER_GPU_TIMELINE=/tmp/dead-cells-bundle.prgtl \
-PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT=18420 \
-PROSPER_GPU_TIMELINE_CAPTURE=/tmp/dead-cells-submit-18420.prgcap \
-PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE=/tmp/dead-cells-depth16.prgbundle \
-PROSPER_GPU_TIMELINE_CAPTURE_DEPTH=16 \
+PROSPER_GPU_TIMELINE=/tmp/dead-cells-gameplay.prgtl \
+PROSPER_PAD_SCRIPT=@scripts/dead-cells/reach-first-gameplay-capture.pad \
+PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT=1 \
+PROSPER_GPU_TIMELINE_CAPTURE=/tmp/dead-cells-gameplay.prgcap \
+PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE=/tmp/dead-cells-gameplay.prgbundle \
+PROSPER_GPU_TIMELINE_CAPTURE_DEPTH=1000 \
 PROSPER_GPU_TIMELINE_CAPTURE_MAX_UNIQUE_MB=1024 \
-PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM=642x362 \
-PROSPER_GPU_TIMELINE_CAPTURE_MIN_DRAWS=80 \
+PROSPER_GPU_TIMELINE_CAPTURE_START_TARGET_DIM=642x362 \
+PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM=738x420 \
+PROSPER_GPU_TIMELINE_CAPTURE_TARGET_DRAW_INDEX=79:81 \
+PROSPER_GPU_TIMELINE_CAPTURE_MIN_DRAWS=90 \
+PROSPER_GPU_TIMELINE_CAPTURE_MAX_DRAWS=90 \
 PROSPER_GPU_TIMELINE_EXIT_AFTER_CAPTURE=1 \
   ./build-linux/boot_trace /path/to/PPSA15552-app0
 
-./build-linux/gpu_replay --bundle /tmp/dead-cells-depth16.prgbundle /tmp/closure.bmp
+./build-linux/gpu_replay --bundle /tmp/dead-cells-gameplay.prgbundle \
+  --bundle-intermediate-through-target 642x362 /tmp/closure.bmp
 ```
 
 See [`../gpu_replay/README.md`](../gpu_replay/README.md) for graph interpretation, pixel-oracle
@@ -122,15 +128,25 @@ matching target extents while leaving the selected consumer complete. This is a 
 not renderer substitution. It may still be expensive when relevant passes reference large shared assets;
 unique-byte budget enforcement remains authoritative.
 
+`PROSPER_GPU_TIMELINE_CAPTURE_START_TARGET_DIM=WxH` delays predecessor bundle capture until the first submit
+that writes a target with that extent. Use it when native-speed lifetime evidence identifies the beginning of
+the relevant surface family; earlier submits remain in the timeline but do not perturb progression or consume
+bundle budget. The matching start submit is included.
+
 `PROSPER_GPU_TIMELINE_EXIT_AFTER_CAPTURE=1` terminates the process only after the selected standalone
 capsule and any requested bundle have been installed successfully. Use it for long captures instead of a
 wall-clock timeout; capture failure or budget exhaustion leaves the process running for diagnostics.
 
 `PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM=WxH` changes the configured submit into a lower endpoint
 bound: the first later submit with a draw targeting that extent is selected. Optionally require a semantic
-draw count with `PROSPER_GPU_TIMELINE_CAPTURE_MIN_DRAWS=N`. This keeps a long synchronous capture from
+draw-count window with `PROSPER_GPU_TIMELINE_CAPTURE_MIN_DRAWS=N` and
+`PROSPER_GPU_TIMELINE_CAPTURE_MAX_DRAWS=N`. This keeps a long synchronous capture from
 selecting the wrong scene when it perturbs wall-clock pacing. A requested bundle still begins at
 `CAPTURE_SUBMIT - CAPTURE_DEPTH + 1`; if the endpoint moves beyond that window, predecessor manifests roll
 forward so the final bundle contains exactly the latest requested depth. The dictionary may retain content
 seen by evicted manifests during capture, and the unique-byte budget remains authoritative. Finalization
 compacts unreachable dictionary entries before installing the bundle.
+
+`PROSPER_GPU_TIMELINE_CAPTURE_TARGET_DRAW_INDEX=MIN:MAX` restricts the matching target to a zero-based
+semantic draw-index window. Establish the range across multiple desired captures and nearby negative samples;
+realized replay indices can differ when earlier semantic draws are unrealized.

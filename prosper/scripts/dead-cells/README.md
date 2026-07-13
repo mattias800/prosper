@@ -26,3 +26,25 @@ caused by that skip and is not normal renderer output (#586). For graphics
 investigation, add `PROSPER_RENDER_TARGET_DIM=642x362` to preserve the level's
 RTT chain; this is much slower and currently remains in the opening vignette at
 the 35-second checkpoint. Do not use the fast route as a visual golden guard.
+
+## Playable semantic checkpoint
+
+Do not select the first 738x420 target: it also occurs in the skippable opening. The validated Jump-tutorial
+endpoint combines all of these predicates:
+
+```bash
+PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM=738x420 \
+PROSPER_GPU_TIMELINE_CAPTURE_TARGET_DRAW_INDEX=79:81 \
+PROSPER_GPU_TIMELINE_CAPTURE_MIN_DRAWS=90 \
+PROSPER_GPU_TIMELINE_CAPTURE_MAX_DRAWS=90
+```
+
+The draw index is zero-based in the raw semantic sequence. Fresh native-speed runs selected different submit
+numbers but replayed the same controllable scene with 86 realized draws, seven realized dispatches, the Jump
+prompt, and the full HUD. Nearby cinematic and transition captures are explicitly outside this conjunction.
+
+The faithful playable reference on #608 retained 883 submits and renders hash
+`5759c125812154dc`. A final-submit replay with fresh depth renders `71b84bdfae53933c` instead. Use
+`gpu_replay --bundle-find-ds ADDR` to scan a bundle's depth/stencil identity, tests, writes, clears, and
+target extents without reconstructing resource payloads or invoking Vulkan. #611 tracks the observed
+642x362 depth surface reused throughout the closure with no captured clear.

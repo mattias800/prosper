@@ -104,6 +104,8 @@ struct GpuCaptureFile {
 // live renderer's guarded-copy behavior for partially committed guest resources.
 using CaptureMemoryReader = std::function<size_t(uint64_t guest_addr, uint8_t* dst, size_t bytes)>;
 using CaptureRttSeedReader = std::function<bool(uint64_t guest_addr, GpuCaptureRttSeed& seed)>;
+using CaptureRttSeedSnapshotReader =
+    std::function<bool(std::vector<GpuCaptureRttSeed>& seeds, std::string& error)>;
 
 bool capture_draw_items(const std::vector<DrawItem>& items, const GpuCaptureMetadata& metadata,
                         const CaptureMemoryReader& reader, GpuCaptureFile& out, std::string& error,
@@ -155,6 +157,9 @@ bool materialize_gpu_replay(const GpuCaptureFile& capture, GpuReplayFrame& repla
 // surfaces before draw zero.
 using ReplayRttSeedWriter = std::function<bool(const GpuCaptureRttSeed& seed, std::string& error)>;
 void set_gpu_capture_rtt_seed_reader(CaptureRttSeedReader reader);
+bool read_gpu_capture_rtt_seed(uint64_t guest_addr, GpuCaptureRttSeed& seed, std::string& error);
+void set_gpu_capture_rtt_seed_snapshot_reader(CaptureRttSeedSnapshotReader reader);
+bool read_all_gpu_capture_rtt_seeds(std::vector<GpuCaptureRttSeed>& seeds, std::string& error);
 void set_gpu_replay_rtt_seed_writer(ReplayRttSeedWriter writer);
 bool restore_gpu_replay_rtt_seeds(const std::vector<GpuCaptureRttSeed>& seeds, std::string& error);
 uint64_t gpu_capture_hash(const uint8_t* data, size_t size);

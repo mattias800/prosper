@@ -72,7 +72,10 @@ accepts scripted gamepad input, and renders the first level.
   first playable scene. Graphics and compute now execute by retained PM4 order (#584), fixing a proven
   future-read. The formerly overbright screenshot was traced to a diagnostic warmup skipping temporal RTT
   producers. Versioned offline bundles now retain long, exact cross-submit resource history and replay a
-  minimized closure; a stable semantic checkpoint for the first playable composition remains #608.
+  minimized closure. #608 now defines a run-local semantic checkpoint for the controllable Jump tutorial:
+  exactly 90 semantic draws with the 738x420 pass at draw index 79..81. Its faithful 883-submit replay
+  isolates the remaining missing-world symptom to a persistent 642x362 depth surface that is never cleared
+  in the captured draw/register stream (#611), rather than another missing color RTT.
 
 **Frontend:** `prosper-app` is a windowed player (SDL3 window + Vulkan present + audio sink +
 evdev/SDL3 controllers + real message/error/IME dialogs), sharing the same boot + render core as the

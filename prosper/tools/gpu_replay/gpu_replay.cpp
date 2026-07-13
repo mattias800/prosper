@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -26,7 +27,12 @@ bool set_environment(const std::string& name, const std::string& value) {
 void usage(const char* argv0) {
     std::fprintf(stderr, "usage: %s [--inspect|--inspect-only|--validate|--graph] "
                          "[--graph-json PATH] [--draw N[:M]] "
+                         "[--through-operation N] "
                          "[--bundle capture.prgbundle] [--bundle-tail N] [--bundle-compact PATH] "
+                         "[--bundle-intermediate-through-target WxH] "
+                         "[--bundle-final-capsule PATH] "
+                         "[--bundle-extract-submit N PATH] "
+                         "[--bundle-find-ds ADDR] "
                          "[--bundle-zero-boundary] "
                          "[--prepend producer.prgcap] "
                          "[--dump-resource DRAW:vs|ps:BINDING PATH] [--allow-mismatch] "
@@ -35,15 +41,20 @@ void usage(const char* argv0) {
 }
 
 std::vector<uint8_t> execute_frame(const prosper::gpu::GpuReplayFrame& replay,
-                                   bool draws_only = false) {
+                                   bool draws_only = false,
+                                   size_t operation_limit = SIZE_MAX) {
     std::vector<prosper::gpu::SubmitOperation> operations;
-    for (const auto& operation : replay.operations)
+    const size_t count = std::min(operation_limit, replay.operations.size());
+    for (size_t i = 0; i < count; ++i) {
+        const auto& operation = replay.operations[i];
         if (operation.realized)
             operations.push_back({operation.kind, static_cast<size_t>(operation.source_index),
                                   operation.command_order});
-    if (operations.empty() || draws_only)
+    }
+    if (draws_only || replay.operations.empty())
         return prosper::gpu::render_submit_items(
             replay.items, replay.metadata.width, replay.metadata.height);
+    if (operations.empty()) return {};
     auto result = prosper::gpu::execute_ordered_items(
         operations, replay.items, replay.computes,
         [](const auto& items, uint32_t width, uint32_t height) {
@@ -293,7 +304,11 @@ bool ranges_overlap(uint64_t a, uint64_t as, uint64_t b, uint64_t bs) {
 }
 
 int replay_bundle(const std::string& path, const char* output_path, bool zero_boundary,
-                  size_t tail_count, const std::string& compact_path) {
+                  size_t tail_count, const std::string& compact_path,
+                  uint32_t intermediate_target_width, uint32_t intermediate_target_height,
+                  const std::string& final_capsule_path,
+                  uint64_t extract_submit_no, const std::string& extract_submit_path,
+                  uint64_t find_ds_addr) {
     prosper::gpu::GpuCaptureBundle bundle;
     std::string error;
     if (!prosper::gpu::read_gpu_capture_bundle(path, bundle, error)) {
@@ -316,6 +331,48 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
                  static_cast<unsigned long long>(stats.resource_logical_bytes),
                  static_cast<unsigned long long>(stats.resource_unique_bytes),
                  static_cast<unsigned long long>(stats.manifest_unique_bytes));
+    if (find_ds_addr) {
+        size_t matching_submits = 0;
+        for (size_t i = first_submit_index; i < bundle.submits.size(); ++i) {
+            prosper::gpu::GpuCaptureFile manifest;
+            if (!prosper::gpu::materialize_gpu_capture_bundle_manifest(bundle, i, manifest, error)) {
+                std::fprintf(stderr, "gpu_replay: cannot reconstruct bundle manifest %zu: %s\n",
+                             i, error.c_str());
+                return 2;
+            }
+            size_t matches = 0, tests = 0, writes = 0, clears = 0;
+            uint32_t compare_mask = 0, width = 0, height = 0;
+            uint64_t first_draw = UINT64_MAX, last_draw = 0;
+            for (const auto& draw : manifest.draws) {
+                const auto& ps = draw.ps;
+                if (ps.depth_read_base != find_ds_addr && ps.depth_write_base != find_ds_addr &&
+                    ps.stencil_read_base != find_ds_addr && ps.stencil_write_base != find_ds_addr)
+                    continue;
+                ++matches;
+                tests += ps.depth_test_enable;
+                writes += ps.depth_write_enable;
+                clears += ps.depth_clear_enable || ps.stencil_clear_enable;
+                if (ps.depth_test_enable && ps.depth_compare_op < 32)
+                    compare_mask |= 1u << ps.depth_compare_op;
+                if (first_draw == UINT64_MAX) {
+                    first_draw = draw.draw_index; width = draw.color0_width; height = draw.color0_height;
+                }
+                last_draw = draw.draw_index;
+            }
+            if (!matches) continue;
+            ++matching_submits;
+            std::printf("ds-submit=%llu draws=%zu first=%llu last=%llu target=%ux%u "
+                        "tests=%zu writes=%zu clears=%zu compare-mask=%08x\n",
+                        static_cast<unsigned long long>(manifest.metadata.submit_index), matches,
+                        static_cast<unsigned long long>(first_draw),
+                        static_cast<unsigned long long>(last_draw), width, height,
+                        tests, writes, clears, compare_mask);
+        }
+        std::fprintf(stderr, "[gpureplay] DS address %016llx matched %zu/%zu submits\n",
+                     static_cast<unsigned long long>(find_ds_addr), matching_submits,
+                     bundle.submits.size() - first_submit_index);
+        return matching_submits ? 0 : 1;
+    }
     if (first_submit_index)
         std::fprintf(stderr, "[gpureplay] replaying tail submits=%zu range=%llu..%llu\n",
                      bundle.submits.size() - first_submit_index,
@@ -339,7 +396,26 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
                      static_cast<unsigned long long>(before),
                      static_cast<unsigned long long>(after), bundle.resources.size(),
                      bundle.chunks.size(), compact_path.c_str());
-        if (!output_path) return 0;
+        if (!output_path && final_capsule_path.empty() && extract_submit_path.empty()) return 0;
+    }
+    if (!extract_submit_path.empty()) {
+        const auto manifest = std::find_if(bundle.submits.begin(), bundle.submits.end(),
+            [&](const auto& submit) { return submit.submit_index == extract_submit_no; });
+        if (manifest == bundle.submits.end()) {
+            std::fprintf(stderr, "gpu_replay: bundle has no submit %llu\n",
+                         static_cast<unsigned long long>(extract_submit_no));
+            return 2;
+        }
+        prosper::gpu::GpuCaptureFile extracted;
+        const size_t index = static_cast<size_t>(manifest - bundle.submits.begin());
+        if (!prosper::gpu::materialize_gpu_capture_bundle_submit(bundle, index, extracted, error) ||
+            !prosper::gpu::write_gpu_capture(extract_submit_path, extracted, error)) {
+            std::fprintf(stderr, "gpu_replay: cannot extract bundle submit: %s\n", error.c_str());
+            return 2;
+        }
+        std::fprintf(stderr, "[gpureplay] extracted submit=%llu -> %s\n",
+                     static_cast<unsigned long long>(extract_submit_no), extract_submit_path.c_str());
+        if (!output_path && final_capsule_path.empty()) return 0;
     }
 
     prosper::gpu::GpuCaptureFile final_capture;
@@ -358,6 +434,7 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
     set_environment("PROSPER_RENDER_FIRST", "0");
     set_environment("PROSPER_RENDER_LAST", "2147483647");
     set_environment("PROSPER_GPU_REPLAY_RTT_SEEDS", "1");
+    if (!final_capsule_path.empty()) set_environment("PROSPER_GPU_REPLAY_EXPORT_RTT", "1");
     prosper::frontend::register_live_renderer(".", false);
     final_capture = {};
 
@@ -381,6 +458,47 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
             std::fprintf(stderr, "gpu_replay: cannot graph bundle submit %llu: %s\n",
                          static_cast<unsigned long long>(capture.metadata.submit_index), error.c_str());
             return 2;
+        }
+        // Operation sources are semantic draw IDs; unrealized draws leave holes in the compact item vector.
+        std::unordered_map<uint64_t, size_t> draw_item_by_index;
+        for (size_t item_index = 0; item_index < replay.items.size(); ++item_index)
+            draw_item_by_index[replay.items[item_index].draw_index] = item_index;
+        size_t operation_limit = replay.operations.size();
+        if (i + 1 < bundle.submits.size() && intermediate_target_width) {
+            operation_limit = 0;
+            for (size_t operation_index = 0; operation_index < replay.operations.size(); ++operation_index) {
+                const auto& operation = replay.operations[operation_index];
+                if (!operation.realized ||
+                    operation.kind != prosper::gpu::SubmitOperationKind::Draw) continue;
+                const auto item = draw_item_by_index.find(operation.source_index);
+                if (item == draw_item_by_index.end()) continue;
+                const auto& draw = replay.items[item->second];
+                if (draw.color0_width == intermediate_target_width &&
+                    draw.color0_height == intermediate_target_height)
+                    operation_limit = operation_index + 1;
+            }
+            if (!operation_limit) {
+                std::fprintf(stderr,
+                             "gpu_replay: bundle submit %llu has no realized %ux%u target\n",
+                             static_cast<unsigned long long>(capture.metadata.submit_index),
+                             intermediate_target_width, intermediate_target_height);
+                return 2;
+            }
+            for (const auto& leaf : graph.external_leaves) {
+                if (leaf.first_future_writer == UINT32_MAX ||
+                    leaf.consumer_operations.front() >= operation_limit ||
+                    (leaf.access.resource_class != prosper::gpu::ResourceClass::Texture &&
+                     leaf.access.resource_class != prosper::gpu::ResourceClass::StorageImage) ||
+                    (leaf.access.width == intermediate_target_width &&
+                     leaf.access.height == intermediate_target_height)) continue;
+                std::fprintf(stderr,
+                             "gpu_replay: refusing intermediate truncation at submit %llu: "
+                             "temporal leaf op=%u is %ux%u, not %ux%u\n",
+                             static_cast<unsigned long long>(capture.metadata.submit_index),
+                             leaf.consumer_operations.front(), leaf.access.width, leaf.access.height,
+                             intermediate_target_width, intermediate_target_height);
+                return 2;
+            }
         }
         std::vector<uint64_t> diagnostic_zero_seeds;
         if (i == first_submit_index && zero_boundary) {
@@ -449,19 +567,72 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
             if (std::none_of(prior_targets.begin(), prior_targets.end(), [&](const auto& target) {
                     return target.addr == seed.guest_addr;
                 })) seeds.push_back(seed);
+        if (i + 1 == bundle.submits.size() && !final_capsule_path.empty()) {
+            std::unordered_set<uint64_t> required;
+            for (const auto& leaf : graph.external_leaves) {
+                if (leaf.first_future_writer == UINT32_MAX ||
+                    (leaf.access.resource_class != prosper::gpu::ResourceClass::Texture &&
+                     leaf.access.resource_class != prosper::gpu::ResourceClass::StorageImage)) continue;
+                required.insert(leaf.access.addr);
+            }
+            std::vector<prosper::gpu::GpuCaptureRttSeed> snapshot;
+            if (!prosper::gpu::read_all_gpu_capture_rtt_seeds(snapshot, error)) {
+                std::fprintf(stderr, "gpu_replay: cannot snapshot final RTT cache: %s\n",
+                             error.c_str());
+                return 2;
+            }
+            size_t exported = 0, refreshed = 0;
+            for (auto& seed : snapshot) {
+                const uint64_t addr = seed.guest_addr;
+                auto existing = std::find_if(capture.rtt_seeds.begin(), capture.rtt_seeds.end(),
+                    [&](const auto& candidate) { return candidate.guest_addr == addr; });
+                if (existing == capture.rtt_seeds.end()) {
+                    capture.rtt_seeds.push_back(std::move(seed));
+                    ++exported;
+                } else {
+                    *existing = std::move(seed);
+                    ++refreshed;
+                }
+            }
+            for (uint64_t addr : required)
+                if (std::none_of(capture.rtt_seeds.begin(), capture.rtt_seeds.end(),
+                    [&](const auto& seed) { return seed.guest_addr == addr; })) {
+                    std::fprintf(stderr,
+                                 "gpu_replay: final RTT snapshot lacks required temporal seed %016llx\n",
+                                 static_cast<unsigned long long>(addr));
+                    return 2;
+                }
+            if (!prosper::gpu::write_gpu_capture(final_capsule_path, capture, error)) {
+                std::fprintf(stderr, "gpu_replay: cannot write final seeded capsule: %s\n",
+                             error.c_str());
+                return 2;
+            }
+            std::fprintf(stderr,
+                         "[gpureplay] exported final seeded capsule cache-surfaces=%zu required=%zu "
+                         "new-seeds=%zu refreshed=%zu total-seeds=%zu -> %s\n",
+                         snapshot.size(), required.size(), exported, refreshed, capture.rtt_seeds.size(),
+                         final_capsule_path.c_str());
+        }
         if (!prosper::gpu::restore_gpu_replay_rtt_seeds(seeds, error)) {
             std::fprintf(stderr, "gpu_replay: cannot restore bundle RTT seeds: %s\n", error.c_str());
             return 2;
         }
-        final_pixels = execute_frame(replay);
-        for (const auto& draw : replay.items)
+        final_pixels = execute_frame(replay, false, operation_limit);
+        for (size_t operation_index = 0; operation_index < operation_limit; ++operation_index) {
+            const auto& operation = replay.operations[operation_index];
+            if (!operation.realized ||
+                operation.kind != prosper::gpu::SubmitOperationKind::Draw) continue;
+            const auto item = draw_item_by_index.find(operation.source_index);
+            if (item == draw_item_by_index.end()) continue;
+            const auto& draw = replay.items[item->second];
             if (draw.color0_base && draw.color0_width && draw.color0_height)
                 prior_targets.push_back({draw.color0_base,
                     static_cast<uint64_t>(draw.color0_width) * draw.color0_height * 4,
                     capture.metadata.submit_index});
-        std::fprintf(stderr, "[gpureplay] bundle-submit=%llu operations=%zu output_bytes=%zu hash=%016llx\n",
+        }
+        std::fprintf(stderr, "[gpureplay] bundle-submit=%llu operations=%zu/%zu output_bytes=%zu hash=%016llx\n",
                      static_cast<unsigned long long>(capture.metadata.submit_index),
-                     replay.operations.size(), final_pixels.size(),
+                     operation_limit, replay.operations.size(), final_pixels.size(),
                      static_cast<unsigned long long>(prosper::gpu::gpu_capture_hash(final_pixels)));
     }
     std::fprintf(stderr, "[gpureplay] closure temporal-resolved=%llu seeded=%llu bounded=%llu "
@@ -489,9 +660,15 @@ int main(int argc, char** argv) {
     bool inspect = false, inspect_only = false, validate_only = false, allow_mismatch = false;
     bool graph_only = false, bundle_zero_boundary = false;
     size_t bundle_tail = 0;
+    uint32_t bundle_intermediate_target_width = 0, bundle_intermediate_target_height = 0;
     int draw_first = -1, draw_last = -1;
+    int through_operation = -1;
     std::string dump_spec, dump_path, shader_spec, shader_path, graph_json_path, prepend_path;
     std::string bundle_path, bundle_compact_path;
+    std::string bundle_final_capsule_path;
+    std::string bundle_extract_submit_path;
+    uint64_t bundle_extract_submit_no = 0;
+    uint64_t bundle_find_ds_addr = 0;
     std::vector<const char*> positional;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--inspect") inspect = true;
@@ -512,11 +689,37 @@ int main(int argc, char** argv) {
             if (!end || *end || !value || value > SIZE_MAX) { usage(argv[0]); return 2; }
             bundle_tail = static_cast<size_t>(value);
         }
+        else if (std::string(argv[i]) == "--bundle-intermediate-through-target" && i + 1 < argc) {
+            unsigned width = 0, height = 0; char tail = 0;
+            if (std::sscanf(argv[++i], "%ux%u%c", &width, &height, &tail) != 2 ||
+                !width || !height) { usage(argv[0]); return 2; }
+            bundle_intermediate_target_width = width;
+            bundle_intermediate_target_height = height;
+        }
+        else if (std::string(argv[i]) == "--bundle-final-capsule" && i + 1 < argc)
+            bundle_final_capsule_path = argv[++i];
+        else if (std::string(argv[i]) == "--bundle-extract-submit" && i + 2 < argc) {
+            char* end = nullptr;
+            bundle_extract_submit_no = std::strtoull(argv[++i], &end, 0);
+            if (!end || *end || !bundle_extract_submit_no) { usage(argv[0]); return 2; }
+            bundle_extract_submit_path = argv[++i];
+        }
+        else if (std::string(argv[i]) == "--bundle-find-ds" && i + 1 < argc) {
+            char* end = nullptr;
+            bundle_find_ds_addr = std::strtoull(argv[++i], &end, 0);
+            if (!end || *end || !bundle_find_ds_addr) { usage(argv[0]); return 2; }
+        }
         else if (std::string(argv[i]) == "--prepend" && i + 1 < argc) prepend_path = argv[++i];
         else if (std::string(argv[i]) == "--draw" && i + 1 < argc) {
             std::string range = argv[++i]; size_t colon = range.find(':');
             draw_first = std::atoi(range.c_str());
             draw_last = colon == std::string::npos ? draw_first : std::atoi(range.c_str() + colon + 1);
+        }
+        else if (std::string(argv[i]) == "--through-operation" && i + 1 < argc) {
+            char* end = nullptr;
+            const long value = std::strtol(argv[++i], &end, 0);
+            if (!end || *end || value < 0 || value > INT_MAX) { usage(argv[0]); return 2; }
+            through_operation = static_cast<int>(value);
         }
         else if (std::string(argv[i]) == "--dump-resource" && i + 2 < argc) {
             dump_spec = argv[++i]; dump_path = argv[++i];
@@ -528,16 +731,26 @@ int main(int argc, char** argv) {
     }
     if (!bundle_path.empty()) {
         if (positional.size() > 1 || inspect || inspect_only || validate_only || graph_only ||
-            draw_first >= 0 || !dump_spec.empty() || !shader_spec.empty() || !prepend_path.empty()) {
+            draw_first >= 0 || through_operation >= 0 || !dump_spec.empty() ||
+            !shader_spec.empty() || !prepend_path.empty()) {
             usage(argv[0]); return 2;
         }
         return replay_bundle(bundle_path, positional.empty() ? nullptr : positional[0],
-                             bundle_zero_boundary, bundle_tail, bundle_compact_path);
+                             bundle_zero_boundary, bundle_tail, bundle_compact_path,
+                             bundle_intermediate_target_width,
+                             bundle_intermediate_target_height,
+                             bundle_final_capsule_path,
+                             bundle_extract_submit_no,
+                             bundle_extract_submit_path,
+                             bundle_find_ds_addr);
     }
-    if (bundle_zero_boundary || bundle_tail || !bundle_compact_path.empty()) {
+    if (bundle_zero_boundary || bundle_tail || !bundle_compact_path.empty() ||
+        bundle_intermediate_target_width || !bundle_final_capsule_path.empty() ||
+        !bundle_extract_submit_path.empty() || bundle_find_ds_addr) {
         usage(argv[0]); return 2;
     }
     if (positional.empty() || positional.size() > 2) { usage(argv[0]); return 2; }
+    if (draw_first >= 0 && through_operation >= 0) { usage(argv[0]); return 2; }
     prosper::gpu::GpuCaptureFile capture; std::string error;
     if (!prosper::gpu::read_gpu_capture(positional[0], capture, error)) {
         std::fprintf(stderr, "gpu_replay: %s: %s\n", positional[0], error.c_str()); return 2;
@@ -625,6 +838,14 @@ int main(int argc, char** argv) {
         replay.items = std::move(selected); allow_mismatch = true;
         std::fprintf(stderr, "[gpureplay] selected original draws %d:%d\n", draw_first, draw_last);
     }
+    if (through_operation >= 0) {
+        if (static_cast<size_t>(through_operation) >= replay.operations.size()) {
+            std::fprintf(stderr, "gpu_replay: operation %d is out of range\n", through_operation);
+            return 2;
+        }
+        allow_mismatch = true;
+        std::fprintf(stderr, "[gpureplay] executing through mixed operation %d\n", through_operation);
+    }
     const auto& m = replay.metadata;
     std::fprintf(stderr, "[gpureplay] rev=%s title=%s submit=%llu %ux%u draws=%zu computes=%zu "
                          "operations=%zu shaders=%zu blobs=%zu RTT-seeds=%zu oracle=%s\n",
@@ -660,13 +881,32 @@ int main(int argc, char** argv) {
     if (!prosper::gpu::restore_gpu_replay_rtt_seeds(consumer_seeds, error)) {
         std::fprintf(stderr, "gpu_replay: cannot restore RTT seeds: %s\n", error.c_str()); return 2;
     }
-    std::vector<uint8_t> pixels = execute_frame(replay, draw_first >= 0);
+    const size_t operation_limit = through_operation >= 0
+        ? static_cast<size_t>(through_operation) + 1 : SIZE_MAX;
+    std::vector<uint8_t> pixels = execute_frame(replay, draw_first >= 0, operation_limit);
+    uint32_t output_width = m.width, output_height = m.height;
+    if (through_operation >= 0) {
+        for (size_t operation_index = 0; operation_index < operation_limit; ++operation_index) {
+            const auto& operation = replay.operations[operation_index];
+            if (!operation.realized ||
+                operation.kind != prosper::gpu::SubmitOperationKind::Draw) continue;
+            const auto item = std::find_if(replay.items.begin(), replay.items.end(),
+                [&](const auto& draw) { return draw.draw_index == operation.source_index; });
+            if (item != replay.items.end() && item->color0_width && item->color0_height) {
+                output_width = item->color0_width;
+                output_height = item->color0_height;
+            }
+        }
+    }
     uint64_t hash = prosper::gpu::gpu_capture_hash(pixels);
-    std::fprintf(stderr, "[gpureplay] output_bytes=%zu hash=%016llx expected_bytes=%llu expected_hash=%016llx\n",
-                 pixels.size(), static_cast<unsigned long long>(hash),
+    std::fprintf(stderr, "[gpureplay] output=%ux%u bytes=%zu hash=%016llx "
+                         "expected_bytes=%llu expected_hash=%016llx\n",
+                 output_width, output_height, pixels.size(), static_cast<unsigned long long>(hash),
                  static_cast<unsigned long long>(replay.expected_output_bytes),
                  static_cast<unsigned long long>(replay.expected_output_hash));
-    if (positional.size() == 2 && !pixels.empty() && !prosper::test::dump_bmp(positional[1], pixels, m.width, m.height)) {
+    if (positional.size() == 2 && !pixels.empty() &&
+        (pixels.size() != static_cast<size_t>(output_width) * output_height * 4 ||
+         !prosper::test::dump_bmp(positional[1], pixels, output_width, output_height))) {
         std::fprintf(stderr, "gpu_replay: cannot write %s\n", positional[1]); return 2;
     }
     if (!allow_mismatch && replay.expected_output_valid &&

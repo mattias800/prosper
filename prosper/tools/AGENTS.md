@@ -94,14 +94,30 @@ Bundles use content-defined chunks so shifted capture metadata does not defeat c
 `PROSPER_GPU_TIMELINE_CAPTURE_TARGET_DIM=WxH` restricts predecessor captures to draws targeting that extent;
 it is a size diagnostic, not a dependency proof. `gpu_replay --bundle-zero-boundary` supplies transparent
 pixels to the oldest unseeded temporal leaves for an explicit A/B test and labels the synthetic seeds.
+`PROSPER_GPU_TIMELINE_CAPTURE_START_TARGET_DIM=WxH` delays bundle capture until the first matching target
+writer while timeline/lifetime recording continues, avoiding progression distortion from irrelevant submits.
 `gpu_replay --bundle-tail N` skips older manifests without changing dictionary content; use it only when
 lifetime evidence proves the suffix contains the target's beginning, then inspect its lower-bound frontier.
+`gpu_replay --bundle-intermediate-through-target WxH` omits later passes from non-final submits only when
+dependency evidence proves that the named target family is the sole temporal image frontier.
+`gpu_replay --bundle-final-capsule PATH` exports the complete live color RTT cache; verify its standalone output
+hash against the bundle before using it for rapid final-submit isolation. Persistent Vulkan depth/stencil images
+are not serialized yet (#569/#611), so complete color seeds do not guarantee equality.
+`gpu_replay --bundle-extract-submit N PATH` materializes one exact manifest for normal inspect/graph/validate
+work without replaying the bundle.
+`gpu_replay --bundle-find-ds ADDR` scans compact manifests for guest depth/stencil use, writes, clears, compare
+ops, and target extents without reconstructing resource payloads or invoking Vulkan.
+`gpu_replay --through-operation N` preserves the inclusive mixed graphics/compute prefix and is the preferred
+final-composition bisect after a seeded capsule has matched the full bundle hash.
 `gpu_replay --bundle-compact PATH` removes dictionary resources/chunks unreachable from retained rolling
 manifests and exits without Vulkan when no image output path is supplied.
 Set `PROSPER_GPU_TIMELINE_EXIT_AFTER_CAPTURE=1` for long unattended runs; it exits only after the selected
 capsule and requested bundle are installed, never on capture failure or budget exhaustion.
 For timing-sensitive routes, `PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM=WxH` selects the first matching
-submit at or after `CAPTURE_SUBMIT`; `PROSPER_GPU_TIMELINE_CAPTURE_MIN_DRAWS=N` can reject loading passes.
+submit at or after `CAPTURE_SUBMIT`; `PROSPER_GPU_TIMELINE_CAPTURE_MIN_DRAWS=N` and
+`PROSPER_GPU_TIMELINE_CAPTURE_MAX_DRAWS=N` bound semantic complexity to reject loading or cinematic passes.
+`PROSPER_GPU_TIMELINE_CAPTURE_TARGET_DRAW_INDEX=MIN:MAX` narrows where the selected target may occur in the
+raw semantic draw sequence; derive it from repeated positives and nearby negative samples.
 When the endpoint moves, predecessor manifests roll forward so the final bundle retains the latest requested
 depth; dictionary bytes observed by evicted manifests still count against the unique-byte budget.
 Per-target RTT is the normal renderer path. `PROSPER_RTT_SINGLE_TARGET=1` restores the obsolete flattened
@@ -122,6 +138,9 @@ The draw header also reports raster state as `raster=cull/front-face/polygon-mod
 values. `PROSPER_NO_CULL=1` disables culling; `PROSPER_FLIP_FRONT_FACE=1` preserves the cull mode and
 toggles only the resolved winding convention. The latter is useful for isolating `PA_SU_SC_MODE_CNTL`
 translation without the overdraw introduced by disabling culling entirely.
+`PROSPER_EXECLOG=1` includes command order, target extent, depth/stencil identity, compare/write state, and clear
+intent on recompile failures. `PROSPER_DS_CLEARLOG=1` logs only nonzero fold-time `DB_RENDER_CONTROL` clear-enable
+writes, which is suitable for detecting transient clear pulses without `PROSPER_GFXLOG` packet volume.
 Use `gpu_replay --validate` to reflect every draw's statically used VS/PS descriptor interface and validate it
 against the captured runtime resource tables without initializing Vulkan. It exits nonzero for malformed SPIR-V,
 stage/set mismatches, missing or duplicate bindings, wrong descriptor classes, or statically provable undersized

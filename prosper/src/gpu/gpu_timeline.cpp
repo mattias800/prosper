@@ -217,14 +217,20 @@ struct RuntimeDetailRequest {
     uint64_t bundle_max_unique_bytes = 1ull << 30;
     uint32_t bundle_target_width = 0;
     uint32_t bundle_target_height = 0;
+    uint32_t bundle_start_target_width = 0;
+    uint32_t bundle_start_target_height = 0;
     uint32_t select_target_width = 0;
     uint32_t select_target_height = 0;
+    uint32_t select_target_min_index = 0;
+    uint32_t select_target_max_index = UINT32_MAX;
     uint32_t select_min_draws = 0;
+    uint32_t select_max_draws = UINT32_MAX;
     bool exit_after_capture = false;
     uint64_t submit_no = 0;
     bool valid = false;
     std::atomic<bool> claimed{false};
     std::atomic<bool> predecessor_claimed{false};
+    bool bundle_start_reached = false;
 
     RuntimeDetailRequest() {
         const char* path_env = std::getenv("PROSPER_GPU_TIMELINE_CAPTURE");
@@ -278,6 +284,18 @@ struct RuntimeDetailRequest {
                     bundle_target_width = width; bundle_target_height = height;
                 }
             }
+            if (const char* dimensions = std::getenv(
+                    "PROSPER_GPU_TIMELINE_CAPTURE_START_TARGET_DIM")) {
+                unsigned width = 0, height = 0; char tail = 0;
+                if (std::sscanf(dimensions, "%ux%u%c", &width, &height, &tail) != 2 ||
+                    !width || !height) {
+                    std::fprintf(stderr, "[timeline] capture start target dimension must be WxH\n");
+                    bundle_path.clear(); bundle_depth = 0;
+                } else {
+                    bundle_start_target_width = width;
+                    bundle_start_target_height = height;
+                }
+            }
         }
         if (const char* dimensions = std::getenv("PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM")) {
             unsigned width = 0, height = 0; char tail = 0;
@@ -289,6 +307,16 @@ struct RuntimeDetailRequest {
             select_target_width = width;
             select_target_height = height;
         }
+        if (const char* range = std::getenv(
+                "PROSPER_GPU_TIMELINE_CAPTURE_TARGET_DRAW_INDEX")) {
+            unsigned first = 0, last = 0; char tail = 0;
+            if (std::sscanf(range, "%u:%u%c", &first, &last, &tail) != 2 || first > last) {
+                std::fprintf(stderr, "[timeline] target draw index must be MIN:MAX\n");
+                return;
+            }
+            select_target_min_index = first;
+            select_target_max_index = last;
+        }
         if (const char* min_draws = std::getenv("PROSPER_GPU_TIMELINE_CAPTURE_MIN_DRAWS")) {
             char* min_end = nullptr;
             const uint64_t value = std::strtoull(min_draws, &min_end, 0);
@@ -298,15 +326,29 @@ struct RuntimeDetailRequest {
             }
             select_min_draws = static_cast<uint32_t>(value);
         }
+        if (const char* max_draws = std::getenv("PROSPER_GPU_TIMELINE_CAPTURE_MAX_DRAWS")) {
+            char* max_end = nullptr;
+            const uint64_t value = std::strtoull(max_draws, &max_end, 0);
+            if (!max_end || *max_end || value > UINT32_MAX) {
+                std::fprintf(stderr, "[timeline] capture maximum draws must be 0..4294967295\n");
+                return;
+            }
+            select_max_draws = static_cast<uint32_t>(value);
+        }
+        if (select_min_draws > select_max_draws) {
+            std::fprintf(stderr, "[timeline] capture minimum draws exceeds maximum draws\n");
+            return;
+        }
         if (const char* value = std::getenv("PROSPER_GPU_TIMELINE_EXIT_AFTER_CAPTURE"))
             exit_after_capture = *value && std::strcmp(value, "0") && std::strcmp(value, "off");
         submit_no = parsed;
         valid = true;
         if (select_target_width)
             std::fprintf(stderr, "[timeline] semantic capture endpoint submit>=%llu "
-                                 "target=%ux%u min-draws=%u\n",
+                                 "target=%ux%u target-index=%u..%u draws=%u..%u\n",
                          static_cast<unsigned long long>(submit_no), select_target_width,
-                         select_target_height, select_min_draws);
+                         select_target_height, select_target_min_index,
+                         select_target_max_index, select_min_draws, select_max_draws);
     }
 };
 
@@ -479,12 +521,27 @@ bool runtime_capture_endpoint_matches(const RuntimeDetailRequest& request,
     if (submit_no < request.submit_no) return false;
     if (!request.select_target_width)
         return submit_no == request.submit_no;
-    if (state.draws.size() < request.select_min_draws) return false;
-    for (size_t i = 0; i < state.draws.size(); ++i) {
+    if (state.draws.size() < request.select_min_draws ||
+        state.draws.size() > request.select_max_draws) return false;
+    for (size_t i = request.select_target_min_index;
+         i < state.draws.size() && i <= request.select_target_max_index; ++i) {
         const RenderState rs = extract_render_state(state.state_at_draw(i));
         if (rs.color0_width == request.select_target_width &&
-            rs.color0_height == request.select_target_height)
+            rs.color0_height == request.select_target_height) {
+            std::fprintf(stderr,
+                         "[timeline] semantic capture endpoint matched submit=%llu target-draw=%zu\n",
+                         static_cast<unsigned long long>(submit_no), i);
             return true;
+        }
+    }
+    return false;
+}
+
+bool runtime_submit_has_target(const GpuState& state, uint32_t width, uint32_t height) {
+    if (!width || !height) return false;
+    for (size_t i = 0; i < state.draws.size(); ++i) {
+        const RenderState rs = extract_render_state(state.state_at_draw(i));
+        if (rs.color0_width == width && rs.color0_height == height) return true;
     }
     return false;
 }
@@ -971,6 +1028,14 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
 
     RuntimeDetailRequest& request = runtime_detail_request();
     RuntimeProducerHistory& history = runtime_producer_history();
+    if (request.valid && request.bundle_start_target_width && !request.bundle_start_reached &&
+        runtime_submit_has_target(state, request.bundle_start_target_width,
+                                  request.bundle_start_target_height)) {
+        request.bundle_start_reached = true;
+        std::fprintf(stderr, "[timeline] capture bundle start reached submit=%llu target=%ux%u\n",
+                     static_cast<unsigned long long>(submit_no),
+                     request.bundle_start_target_width, request.bundle_start_target_height);
+    }
     const bool capture_endpoint = request.valid &&
         runtime_capture_endpoint_matches(request, state, submit_no);
     const uint64_t bundle_first = request.bundle_depth > request.submit_no
@@ -978,6 +1043,7 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
     if (request.valid && !request.bundle_path.empty() &&
         !runtime_capture_bundle().budget_exhausted && !runtime_capture_bundle().failed &&
         submit_no >= bundle_first &&
+        (!request.bundle_start_target_width || request.bundle_start_reached) &&
         !capture_endpoint) {
         begin_runtime_capture_bundle();
         GpuCaptureFile predecessor;

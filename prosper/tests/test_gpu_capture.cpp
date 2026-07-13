@@ -169,6 +169,37 @@ int main() {
           error == "capture blob content hash mismatch",
           "writer rejects a resource version whose content identity is stale");
 
+    set_gpu_capture_rtt_seed_reader([](uint64_t addr, GpuCaptureRttSeed& seed) {
+        if (addr != 0x9000) return false;
+        seed.guest_addr = addr; seed.width = 2; seed.height = 2;
+        seed.rgba.assign(16, 0x5a);
+        return true;
+    });
+    GpuCaptureRttSeed exported_seed;
+    CHECK(read_gpu_capture_rtt_seed(0x9000, exported_seed, error) &&
+          exported_seed.guest_addr == 0x9000 && exported_seed.rgba.size() == 16 &&
+          exported_seed.rgba[0] == 0x5a,
+          "registered RTT reader exports a validated temporal seed");
+    set_gpu_capture_rtt_seed_snapshot_reader([](std::vector<GpuCaptureRttSeed>& seeds, std::string&) {
+        GpuCaptureRttSeed high, low;
+        high.guest_addr = 0xa000; high.width = 1; high.height = 1; high.rgba.assign(4, 0xa0);
+        low.guest_addr = 0x8000; low.width = 1; low.height = 1; low.rgba.assign(4, 0x80);
+        seeds.push_back(std::move(high)); seeds.push_back(std::move(low));
+        return true;
+    });
+    std::vector<GpuCaptureRttSeed> exported_seeds;
+    CHECK(read_all_gpu_capture_rtt_seeds(exported_seeds, error) && exported_seeds.size() == 2 &&
+          exported_seeds[0].guest_addr == 0x8000 && exported_seeds[1].guest_addr == 0xa000,
+          "registered RTT snapshot reader exports and sorts the complete live cache");
+    set_gpu_capture_rtt_seed_snapshot_reader({});
+    CHECK(!read_all_gpu_capture_rtt_seeds(exported_seeds, error) &&
+          error == "live renderer has no RTT seed snapshot reader",
+          "RTT snapshot export fails explicitly without a registered renderer reader");
+    set_gpu_capture_rtt_seed_reader({});
+    CHECK(!read_gpu_capture_rtt_seed(0x9000, exported_seed, error) &&
+          error == "live renderer has no RTT seed reader",
+          "RTT export fails explicitly without a registered renderer reader");
+
     auto truncated = path; truncated += ".truncated";
     std::filesystem::copy_file(path, truncated, std::filesystem::copy_options::overwrite_existing);
     std::filesystem::resize_file(truncated, std::filesystem::file_size(truncated) - 5);

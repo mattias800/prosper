@@ -46,6 +46,7 @@ constexpr uint32_t kMaxStringBytes = 1u << 20;
 constexpr uint64_t kMaxTotalRttSeedBytes = 1ull << 30;
 
 CaptureRttSeedReader g_rtt_seed_reader;
+CaptureRttSeedSnapshotReader g_rtt_seed_snapshot_reader;
 ReplayRttSeedWriter g_rtt_seed_writer;
 
 size_t read_capture_guest_memory(uint64_t addr, uint8_t* dst, size_t bytes) {
@@ -772,6 +773,39 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
 }
 
 void set_gpu_capture_rtt_seed_reader(CaptureRttSeedReader reader) { g_rtt_seed_reader = std::move(reader); }
+bool read_gpu_capture_rtt_seed(uint64_t guest_addr, GpuCaptureRttSeed& seed, std::string& error) {
+    error.clear();
+    if (!g_rtt_seed_reader) { error = "live renderer has no RTT seed reader"; return false; }
+    if (!g_rtt_seed_reader(guest_addr, seed)) { error = "render target is absent from live cache"; return false; }
+    return validate_rtt_seed(seed, error);
+}
+void set_gpu_capture_rtt_seed_snapshot_reader(CaptureRttSeedSnapshotReader reader) {
+    g_rtt_seed_snapshot_reader = std::move(reader);
+}
+bool read_all_gpu_capture_rtt_seeds(std::vector<GpuCaptureRttSeed>& seeds, std::string& error) {
+    error.clear(); seeds.clear();
+    if (!g_rtt_seed_snapshot_reader) {
+        error = "live renderer has no RTT seed snapshot reader"; return false;
+    }
+    if (!g_rtt_seed_snapshot_reader(seeds, error)) return false;
+    if (seeds.size() > kMaxResources) { error = "invalid RTT seed count"; return false; }
+    uint64_t total = 0;
+    std::unordered_set<uint64_t> addresses;
+    for (const auto& seed : seeds) {
+        if (!validate_rtt_seed(seed, error)) return false;
+        if (!addresses.insert(seed.guest_addr).second) {
+            error = "duplicate RTT seed address"; return false;
+        }
+        if (seed.rgba.size() > kMaxTotalRttSeedBytes - total) {
+            error = "RTT seed bytes exceed limit"; return false;
+        }
+        total += seed.rgba.size();
+    }
+    std::sort(seeds.begin(), seeds.end(), [](const auto& a, const auto& b) {
+        return a.guest_addr < b.guest_addr;
+    });
+    return true;
+}
 void set_gpu_replay_rtt_seed_writer(ReplayRttSeedWriter writer) { g_rtt_seed_writer = std::move(writer); }
 
 bool restore_gpu_replay_rtt_seeds(const std::vector<GpuCaptureRttSeed>& seeds, std::string& error) {
