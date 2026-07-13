@@ -233,11 +233,30 @@ namespace {
 
     __attribute__((noinline)) void veh_recover() { __builtin_longjmp(t_jb, 1); }   // runs on the faulting thread
 
+    // Tracked-mapping state probe for the lazy-commit fault path (defined in hle_kernel_mem.cpp):
+    // 0 = untracked/gap, 1 = reserved-but-uncommitted, 2 = committed.
+    extern "C" int prosper_reserved_range_state(uint64_t addr);
+
     LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
         CONTEXT* c = ep->ContextRecord;
         DWORD code = ep->ExceptionRecord->ExceptionCode;
         if (code == EXCEPTION_ILLEGAL_INSTRUCTION && try_emulate_sse4a(c))
             return EXCEPTION_CONTINUE_EXECUTION;
+        // Lazy-commit inside a guest-RESERVED range — parity with the Linux SIGSEGV handler. The guest
+        // reserves a virtual range then touches pages it believes committed (its binned allocator relies
+        // on a commit protocol real HW satisfies but our HLE doesn't fully replicate). If the faulting
+        // read/write address is one the memory HLE tracks as reserved-but-uncommitted, commit the 64 KiB
+        // page and retry. Gated to tracked-reserved addresses (state 1) and non-execute accesses
+        // (ExceptionInformation[0]!=8) so a genuine wild access / bad instruction fetch still faults.
+        if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2 &&
+            ep->ExceptionRecord->ExceptionInformation[0] != 8) {
+            uint64_t a = (uint64_t)ep->ExceptionRecord->ExceptionInformation[1];
+            if (a >= 0x1000000000ull && prosper_reserved_range_state(a) == 1) {
+                void* page = (void*)(uintptr_t)(a & ~(uint64_t)0xffff);
+                if (VirtualAlloc(page, 0x10000, MEM_COMMIT, PAGE_READWRITE))
+                    return EXCEPTION_CONTINUE_EXECUTION;   // re-execute against the now-committed page
+            }
+        }
         // Guest %fs base drift: Windows zeroes the user FS base on every kernel transition, so a
         // guest fs-relative TLS access can fault at a low linear address after a context switch /
         // syscall even though the guest TCB is fine. If the faulting instruction is fs-relative and
@@ -250,6 +269,15 @@ namespace {
             code != EXCEPTION_IN_PAGE_ERROR && code != EXCEPTION_PRIV_INSTRUCTION &&
             code != EXCEPTION_DATATYPE_MISALIGNMENT)
             return EXCEPTION_CONTINUE_SEARCH;   // not a guest fault we own
+        // PROSPER_VEHLOG: surface a fault we're about to decline (unarmed thread → the process will die
+        // without a RUN ENDED report). This is the only visibility into a guest worker-thread crash.
+        if (getenv("PROSPER_VEHLOG")) {
+            uint64_t fa = (ep->ExceptionRecord->NumberParameters >= 2)
+                        ? (uint64_t)ep->ExceptionRecord->ExceptionInformation[1] : 0;
+            fprintf(stderr, "[veh] tid=%lu code=0x%lx rip=0x%llx addr=0x%llx armed=%d rstate=%d\n",
+                    (unsigned long)cur_tid(), (unsigned long)code, (unsigned long long)c->Rip,
+                    (unsigned long long)fa, (int)t_armed, prosper_reserved_range_state(fa));
+        }
         if (!t_armed) return EXCEPTION_CONTINUE_SEARCH;   // worker thread with no recovery point
 
         g_trap_kind = (code == EXCEPTION_ILLEGAL_INSTRUCTION) ? 3 : 2;

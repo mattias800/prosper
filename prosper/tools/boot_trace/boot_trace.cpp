@@ -8,6 +8,8 @@
 #include "hle/dispatch.hpp"
 #include <cstdio>
 #include <string>
+#include <cstdint>
+extern "C" int prosper_reserved_range_state(uint64_t);   // memory-HLE mapping classifier (diagnostic)
 #ifdef PROSPER_AUDIO_SDL3
 #include "audio_sdl3.hpp"                 // optional SDL3 audio frontend (-DPROSPER_AUDIO_SDL3=ON)
 #endif
@@ -208,6 +210,16 @@ int main(int argc, char** argv) {
            (unsigned long long)r.rdx, (unsigned long long)r.rbp, (unsigned long long)r.rsp);
     printf("  backtrace (%zu frames):\n", r.backtrace.size());
     for (uint64_t a : r.backtrace) printf("    %-12s +0x%llx\n", cls(a), (unsigned long long)bof(a));
+    // Classify the fault address vs our tracked guest mappings (0=untracked/gap, 1=reserved-uncommitted,
+    // 2=committed). A write at a page boundary whose predecessor byte is committed but which is itself
+    // reserved/untracked pinpoints a guest run-off-the-end-of-a-region (Windows memory-model diagnosis).
+    if (r.kind == 2 && r.fault_addr) {
+        auto st = [](int s){ return s==2?"committed":s==1?"reserved":"untracked/gap"; };
+        printf("  [memclass] fault_addr=%s  fault_addr-8=%s  fault_addr-0x1000=%s\n",
+               st(prosper_reserved_range_state(r.fault_addr)),
+               st(prosper_reserved_range_state(r.fault_addr - 8)),
+               st(prosper_reserved_range_state(r.fault_addr - 0x1000)));
+    }
     // PROSPER_CRASHPEEK: after a recovered main-thread fault, dump guest memory at the fault registers
     // (still 1:1-mapped) so a null-source deref (e.g. an IL2CPP memcpy from a null field) can be traced
     // to the object + field that is null. Reads are bounded by guest_readable (never re-faults).
