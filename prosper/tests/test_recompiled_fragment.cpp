@@ -216,6 +216,34 @@ int main() {
         }
     }
 
+    // MULTI-RENDER-TARGET selection (#566 — Dead Cells world/G-buffer shaders). A 4-MRT shader emits its
+    // color exports in DESCENDING target order (MRT3..MRT0). Vulkan color attachment 0 must receive MRT0's
+    // data; the old "first EXP with target<=7 wins" wrote MRT3 (a non-albedo G-buffer plane) into color0,
+    // so the world rendered as that grayscale channel instead of the colored albedo. Here MRT3 exports RED
+    // and MRT0 exports BLUE (emitted MRT3-first); the triangle must be BLUE (MRT0 chosen), not RED (MRT3).
+    {
+        const uint32_t ps[] = {
+            0x7E0002F2u, 0x7E020280u, 0x7E040280u, 0x7E0602F2u,   // v0=1.0,v1=0,v2=0,v3=1.0  -> RED
+            0xF800183Fu, 0x03020100u,                             // exp mrt3 v0,v1,v2,v3
+            0x7E080280u, 0x7E0A0280u, 0x7E0C02F2u, 0x7E0E02F2u,   // v4=0,v5=0,v6=1.0,v7=1.0  -> BLUE
+            0xF800180Fu, 0x07060504u,                             // exp mrt0 v4,v5,v6,v7
+            0xBF810000u,                                          // s_endpgm
+        };
+        std::vector<uint32_t> frg = recompile_fragment(ps, sizeof(ps)/sizeof(ps[0]));
+        CHECK(!frg.empty(), "#566: recompiled descending-order 4-MRT (MRT3 then MRT0) PS -> SPIR-V");
+        if (!frg.empty()) {
+            std::vector<uint8_t> px2 = prosper::test::render_triangle_rgba(vert, frg, W, H);
+            CHECK(px2.size() == (size_t)W*H*4, "rendered the MRT-order PS");
+            if (px2.size() == (size_t)W*H*4) {
+                const uint8_t* cc = &px2[((size_t)(H/2) * W + W/2) * 4];
+                printf("  mrt-order center=(%u,%u,%u,%u) expect BLUE (MRT0), not RED (MRT3)\n",
+                       cc[0],cc[1],cc[2],cc[3]);
+                CHECK(cc[2] > 0x80 && cc[0] < 0x40,
+                      "#566: color0 receives MRT0 (BLUE), not the first-emitted MRT3 (RED)");
+            }
+        }
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
