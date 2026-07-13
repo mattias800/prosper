@@ -37,7 +37,7 @@ namespace prosper::gpu {
 namespace {
 
 constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
-constexpr uint32_t kVersion = 7;
+constexpr uint32_t kVersion = 8;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -51,10 +51,13 @@ constexpr uint32_t kMaxRawShaderWords = 0x4000; // 64 KiB per failed stage
 constexpr uint32_t kMaxFailureStages = 3;
 constexpr uint32_t kMaxStringBytes = 1u << 20;
 constexpr uint64_t kMaxTotalRttSeedBytes = 1ull << 30;
+constexpr uint64_t kMaxTotalDsSeedBytes = 1ull << 30;
 
 CaptureRttSeedReader g_rtt_seed_reader;
 CaptureRttSeedSnapshotReader g_rtt_seed_snapshot_reader;
 ReplayRttSeedWriter g_rtt_seed_writer;
+CaptureDsSeedSnapshotReader g_ds_seed_snapshot_reader;
+ReplayDsSeedWriter g_ds_seed_writer;
 
 size_t read_capture_guest_memory(uint64_t addr, uint8_t* dst, size_t bytes) {
 #if defined(__linux__) || defined(__APPLE__)
@@ -346,6 +349,41 @@ bool validate_rtt_seed(const GpuCaptureRttSeed& seed, std::string& error) {
     const uint64_t bytes = checked_mul(pixels, 4);
     if (bytes > kMaxBlobBytes || bytes != seed.rgba.size()) {
         error = "RTT seed byte count does not match its RGBA extent"; return false;
+    }
+    return true;
+}
+
+auto ds_seed_key(const GpuCaptureDsSeed& seed) {
+    return std::tuple(seed.depth_read_base, seed.depth_write_base,
+                      seed.stencil_read_base, seed.stencil_write_base,
+                      seed.htile_data_base, seed.width, seed.height,
+                      static_cast<uint32_t>(seed.format));
+}
+
+bool validate_ds_seed(const GpuCaptureDsSeed& seed, std::string& error) {
+    if ((!seed.depth_read_base && !seed.depth_write_base && !seed.stencil_read_base &&
+         !seed.stencil_write_base && !seed.htile_data_base) || !seed.width || !seed.height) {
+        error = "DS seed has an invalid identity or extent"; return false;
+    }
+    if (seed.format != GpuCaptureDsFormat::D32Float &&
+        seed.format != GpuCaptureDsFormat::D32FloatS8) {
+        error = "DS seed has an unsupported format"; return false;
+    }
+    if (!seed.depth_valid && !seed.stencil_valid) {
+        error = "DS seed has no valid plane"; return false;
+    }
+    const uint64_t pixels = checked_mul(seed.width, seed.height);
+    const uint64_t depth_bytes = checked_mul(pixels, 4);
+    if ((seed.depth_valid && (depth_bytes > kMaxBlobBytes || depth_bytes != seed.depth.size())) ||
+        (!seed.depth_valid && !seed.depth.empty())) {
+        error = "DS seed depth byte count does not match its extent and validity"; return false;
+    }
+    if ((seed.stencil_valid &&
+         (seed.format != GpuCaptureDsFormat::D32FloatS8 || pixels > kMaxBlobBytes ||
+          pixels != seed.stencil.size())) ||
+        (!seed.stencil_valid && !seed.stencil.empty())) {
+        error = "DS seed stencil byte count does not match its extent, format, and validity";
+        return false;
     }
     return true;
 }
@@ -844,6 +882,28 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
             w.u32(stage.descriptor_issue_count); w.u32(stage.first_descriptor_issue);
         }
     }
+    if (c.ds_seeds.size() > kMaxResources) { error = "invalid DS seed count"; return false; }
+    uint64_t ds_seed_total = 0;
+    std::set<decltype(ds_seed_key(GpuCaptureDsSeed{}))> ds_seed_keys;
+    w.u32(static_cast<uint32_t>(c.ds_seeds.size()));
+    for (const auto& seed : c.ds_seeds) {
+        if (!validate_ds_seed(seed, error)) return false;
+        if (!ds_seed_keys.insert(ds_seed_key(seed)).second) {
+            error = "duplicate DS seed identity"; return false;
+        }
+        const uint64_t plane_bytes = seed.depth.size() + seed.stencil.size();
+        if (plane_bytes > kMaxTotalDsSeedBytes ||
+            ds_seed_total > kMaxTotalDsSeedBytes - plane_bytes) {
+            error = "capture DS seed data exceeds 1 GiB"; return false;
+        }
+        ds_seed_total += plane_bytes;
+        w.u64(seed.depth_read_base); w.u64(seed.depth_write_base);
+        w.u64(seed.stencil_read_base); w.u64(seed.stencil_write_base);
+        w.u64(seed.htile_data_base); w.u32(seed.width); w.u32(seed.height);
+        w.u32(static_cast<uint32_t>(seed.format));
+        w.u8(seed.depth_valid); w.u8(seed.stencil_valid);
+        w.bytes(seed.depth); w.bytes(seed.stencil);
+    }
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -1057,12 +1117,47 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
         }
         if (!validate_failure_diagnostics(c, error)) return false;
     }
+    if (version >= 8) {
+        uint32_t seed_count = 0;
+        if (!r.u32(seed_count) || seed_count > kMaxResources) {
+            error = "invalid DS seed count"; return false;
+        }
+        c.ds_seeds.resize(seed_count);
+        uint64_t seed_total = 0;
+        std::set<decltype(ds_seed_key(GpuCaptureDsSeed{}))> keys;
+        for (auto& seed : c.ds_seeds) {
+            uint32_t format = 0;
+            uint8_t depth_valid = 0, stencil_valid = 0;
+            if (!r.u64(seed.depth_read_base) || !r.u64(seed.depth_write_base) ||
+                !r.u64(seed.stencil_read_base) || !r.u64(seed.stencil_write_base) ||
+                !r.u64(seed.htile_data_base) || !r.u32(seed.width) || !r.u32(seed.height) ||
+                !r.u32(format) || !r.u8(depth_valid) || !r.u8(stencil_valid) ||
+                !r.bytes(seed.depth) || !r.bytes(seed.stencil)) return false;
+            if (depth_valid > 1 || stencil_valid > 1) {
+                error = "invalid DS seed plane validity"; return false;
+            }
+            seed.format = static_cast<GpuCaptureDsFormat>(format);
+            seed.depth_valid = depth_valid != 0;
+            seed.stencil_valid = stencil_valid != 0;
+            if (!validate_ds_seed(seed, error)) return false;
+            if (!keys.insert(ds_seed_key(seed)).second) {
+                error = "duplicate DS seed identity"; return false;
+            }
+            const uint64_t plane_bytes = seed.depth.size() + seed.stencil.size();
+            if (plane_bytes > kMaxTotalDsSeedBytes ||
+                seed_total > kMaxTotalDsSeedBytes - plane_bytes) {
+                error = "capture DS seed data exceeds 1 GiB"; return false;
+            }
+            seed_total += plane_bytes;
+        }
+    }
     if (r.left) { error = "capture has trailing data"; return false; }
     return true;
 }
 
 bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::string& error) {
-    error.clear(); out = {}; out.metadata = c.metadata; out.blobs = c.blobs; out.rtt_seeds = c.rtt_seeds;
+    error.clear(); out = {}; out.metadata = c.metadata; out.blobs = c.blobs;
+    out.rtt_seeds = c.rtt_seeds; out.ds_seeds = c.ds_seeds;
     out.raw_shader_versions = c.raw_shader_versions;
     out.failure_diagnostics = c.failure_diagnostics;
     out.failure_diagnostics_available = c.failure_diagnostics_available;
@@ -1166,6 +1261,56 @@ bool restore_gpu_replay_rtt_seeds(const std::vector<GpuCaptureRttSeed>& seeds, s
     if (!seeds.empty() && !g_rtt_seed_writer) { error = "live renderer has no RTT seed writer"; return false; }
     for (const auto& seed : seeds) {
         if (!validate_rtt_seed(seed, error) || !g_rtt_seed_writer(seed, error)) return false;
+    }
+    return true;
+}
+
+void set_gpu_capture_ds_seed_snapshot_reader(CaptureDsSeedSnapshotReader reader) {
+    g_ds_seed_snapshot_reader = std::move(reader);
+}
+
+bool read_all_gpu_capture_ds_seeds(std::vector<GpuCaptureDsSeed>& seeds, std::string& error) {
+    error.clear(); seeds.clear();
+    if (!g_ds_seed_snapshot_reader) {
+        error = "live renderer has no DS seed snapshot reader"; return false;
+    }
+    if (!g_ds_seed_snapshot_reader(seeds, error)) return false;
+    if (seeds.size() > kMaxResources) { error = "invalid DS seed count"; return false; }
+    uint64_t total = 0;
+    std::set<decltype(ds_seed_key(GpuCaptureDsSeed{}))> keys;
+    for (const auto& seed : seeds) {
+        if (!validate_ds_seed(seed, error)) return false;
+        if (!keys.insert(ds_seed_key(seed)).second) {
+            error = "duplicate DS seed identity"; return false;
+        }
+        const uint64_t plane_bytes = seed.depth.size() + seed.stencil.size();
+        if (plane_bytes > kMaxTotalDsSeedBytes || total > kMaxTotalDsSeedBytes - plane_bytes) {
+            error = "DS seed bytes exceed limit"; return false;
+        }
+        total += plane_bytes;
+    }
+    std::sort(seeds.begin(), seeds.end(), [](const auto& a, const auto& b) {
+        return ds_seed_key(a) < ds_seed_key(b);
+    });
+    return true;
+}
+
+void set_gpu_replay_ds_seed_writer(ReplayDsSeedWriter writer) {
+    g_ds_seed_writer = std::move(writer);
+}
+
+bool restore_gpu_replay_ds_seeds(const std::vector<GpuCaptureDsSeed>& seeds, std::string& error) {
+    error.clear();
+    if (!seeds.empty() && !g_ds_seed_writer) {
+        error = "live renderer has no DS seed writer"; return false;
+    }
+    std::set<decltype(ds_seed_key(GpuCaptureDsSeed{}))> keys;
+    for (const auto& seed : seeds) {
+        if (!validate_ds_seed(seed, error)) return false;
+        if (!keys.insert(ds_seed_key(seed)).second) {
+            error = "duplicate DS seed identity"; return false;
+        }
+        if (!g_ds_seed_writer(seed, error)) return false;
     }
     return true;
 }

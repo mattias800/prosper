@@ -4,11 +4,13 @@
 // including test links Vulkan::Vulkan.
 #pragma once
 #include <vulkan/vulkan.h>
+#include "../src/gpu/gpu_capture.hpp"
 #include "../src/gpu/render_state.hpp"
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -181,6 +183,16 @@ inline const RenderVkCtx& render_vk_ctx() {
     return c;
 }
 
+inline uint32_t render_memory_type(VkPhysicalDevice phys, uint32_t bits,
+                                   VkMemoryPropertyFlags wanted) {
+    VkPhysicalDeviceMemoryProperties properties{};
+    vkGetPhysicalDeviceMemoryProperties(phys, &properties);
+    for (uint32_t i = 0; i < properties.memoryTypeCount; ++i)
+        if ((bits & (1u << i)) &&
+            (properties.memoryTypes[i].propertyFlags & wanted) == wanted) return i;
+    return UINT32_MAX;
+}
+
 struct PersistentDsKey {
     uint64_t dr = 0, dw = 0, sr = 0, sw = 0, htile = 0;
     uint32_t w = 0, h = 0, fmt = 0;
@@ -246,6 +258,238 @@ inline size_t invalidate_persistent_ds_guest_write(uint64_t addr, uint64_t size)
         fprintf(stderr, "[ds] guest-write addr=%llx size=%llu invalidated=%zu\n",
                 (unsigned long long)addr, (unsigned long long)size, invalidated);
     return invalidated;
+}
+
+inline bool persistent_ds_transfer_buffer(const RenderVkCtx& ctx, VkDeviceSize bytes,
+                                          VkBufferUsageFlags usage, VkBuffer& buffer,
+                                          VkDeviceMemory& memory, std::string& error) {
+    VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    info.size = bytes; info.usage = usage;
+    if (vkCreateBuffer(ctx.dev, &info, nullptr, &buffer) != VK_SUCCESS) {
+        error = "cannot create persistent DS transfer buffer"; return false;
+    }
+    VkMemoryRequirements requirements{};
+    vkGetBufferMemoryRequirements(ctx.dev, buffer, &requirements);
+    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocation.allocationSize = requirements.size;
+    allocation.memoryTypeIndex = render_memory_type(
+        ctx.phys, requirements.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (allocation.memoryTypeIndex == UINT32_MAX ||
+        vkAllocateMemory(ctx.dev, &allocation, nullptr, &memory) != VK_SUCCESS ||
+        vkBindBufferMemory(ctx.dev, buffer, memory, 0) != VK_SUCCESS) {
+        if (memory) vkFreeMemory(ctx.dev, memory, nullptr);
+        vkDestroyBuffer(ctx.dev, buffer, nullptr); buffer = VK_NULL_HANDLE; memory = VK_NULL_HANDLE;
+        error = "cannot allocate persistent DS transfer buffer"; return false;
+    }
+    return true;
+}
+
+inline bool submit_persistent_ds_transfer(const RenderVkCtx& ctx, VkImage image,
+                                          VkImageAspectFlags aspects, VkImageLayout old_layout,
+                                          VkImageLayout transfer_layout, VkBuffer buffer,
+                                          uint32_t width, uint32_t height,
+                                          bool copy_depth, bool copy_stencil,
+                                          bool upload, std::string& error) {
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer command = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pool_info.queueFamilyIndex = ctx.qfi;
+    if (vkCreateCommandPool(ctx.dev, &pool_info, nullptr, &pool) != VK_SUCCESS) {
+        error = "cannot create persistent DS transfer command pool"; return false;
+    }
+    VkCommandBufferAllocateInfo command_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    command_info.commandPool = pool; command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    command_info.commandBufferCount = 1;
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkAllocateCommandBuffers(ctx.dev, &command_info, &command) != VK_SUCCESS ||
+        vkBeginCommandBuffer(command, &begin) != VK_SUCCESS) {
+        vkDestroyCommandPool(ctx.dev, pool, nullptr);
+        error = "cannot begin persistent DS transfer command"; return false;
+    }
+    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    barrier.oldLayout = old_layout; barrier.newLayout = transfer_layout;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = image;
+    barrier.subresourceRange = {aspects, 0, 1, 0, 1};
+    barrier.srcAccessMask = old_layout == VK_IMAGE_LAYOUT_UNDEFINED ? 0 :
+        (VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+         VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+    barrier.dstAccessMask = upload ? VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_TRANSFER_READ_BIT;
+    const VkPipelineStageFlags source_stage = old_layout == VK_IMAGE_LAYOUT_UNDEFINED
+        ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+        : VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    vkCmdPipelineBarrier(command, source_stage, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                         0, nullptr, 0, nullptr, 1, &barrier);
+
+    VkDeviceSize offset = 0;
+    auto copy_plane = [&](VkImageAspectFlagBits aspect, VkDeviceSize bytes) {
+        VkBufferImageCopy copy{};
+        copy.bufferOffset = offset;
+        copy.imageSubresource = {static_cast<VkImageAspectFlags>(aspect), 0, 0, 1};
+        copy.imageExtent = {width, height, 1};
+        if (upload)
+            vkCmdCopyBufferToImage(command, buffer, image, transfer_layout, 1, &copy);
+        else
+            vkCmdCopyImageToBuffer(command, image, transfer_layout, buffer, 1, &copy);
+        offset += bytes;
+    };
+    if (copy_depth) copy_plane(VK_IMAGE_ASPECT_DEPTH_BIT,
+                               static_cast<VkDeviceSize>(width) * height * 4);
+    if (copy_stencil) copy_plane(VK_IMAGE_ASPECT_STENCIL_BIT,
+                                 static_cast<VkDeviceSize>(width) * height);
+
+    barrier.oldLayout = transfer_layout;
+    barrier.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    barrier.srcAccessMask = upload ? VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_TRANSFER_READ_BIT;
+    barrier.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                         VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &barrier);
+    VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    const bool recorded = vkEndCommandBuffer(command) == VK_SUCCESS;
+    const bool fenced = recorded &&
+        vkCreateFence(ctx.dev, &fence_info, nullptr, &fence) == VK_SUCCESS;
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1; submit.pCommandBuffers = &command;
+    const bool submitted = fenced && vkQueueSubmit(ctx.queue, 1, &submit, fence) == VK_SUCCESS;
+    bool finished = submitted &&
+        vkWaitForFences(ctx.dev, 1, &fence, VK_TRUE, 5ull * 1000 * 1000 * 1000) == VK_SUCCESS;
+    if (submitted && !finished) finished = vkQueueWaitIdle(ctx.queue) == VK_SUCCESS;
+    if (fence) vkDestroyFence(ctx.dev, fence, nullptr);
+    vkDestroyCommandPool(ctx.dev, pool, nullptr);
+    if (!finished) { error = "persistent DS transfer did not complete"; return false; }
+    return true;
+}
+
+inline bool snapshot_persistent_ds_images(std::vector<prosper::gpu::GpuCaptureDsSeed>& seeds,
+                                          std::string& error) {
+    error.clear(); seeds.clear();
+    const RenderVkCtx& ctx = render_vk_ctx();
+    if (!ctx.ok) { error = "Vulkan renderer is unavailable"; return false; }
+    for (const auto& [key, image] : persistent_ds_cache()) {
+        if (!image.depth_valid && !image.stencil_valid) continue;
+        if (!image.image || !image.layout_initialized) {
+            error = "valid persistent DS cache entry has no initialized image"; return false;
+        }
+        prosper::gpu::GpuCaptureDsSeed seed;
+        seed.depth_read_base = key.dr; seed.depth_write_base = key.dw;
+        seed.stencil_read_base = key.sr; seed.stencil_write_base = key.sw;
+        seed.htile_data_base = key.htile; seed.width = key.w; seed.height = key.h;
+        if (key.fmt == static_cast<uint32_t>(VK_FORMAT_D32_SFLOAT))
+            seed.format = prosper::gpu::GpuCaptureDsFormat::D32Float;
+        else if (key.fmt == static_cast<uint32_t>(VK_FORMAT_D32_SFLOAT_S8_UINT))
+            seed.format = prosper::gpu::GpuCaptureDsFormat::D32FloatS8;
+        else {
+            error = "persistent DS cache uses an unsupported capture format"; return false;
+        }
+        seed.depth_valid = image.depth_valid;
+        seed.stencil_valid = image.stencil_valid;
+        const size_t depth_bytes = seed.depth_valid ? static_cast<size_t>(key.w) * key.h * 4 : 0;
+        const size_t stencil_bytes = seed.stencil_valid ? static_cast<size_t>(key.w) * key.h : 0;
+        VkBuffer buffer = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE;
+        if (!persistent_ds_transfer_buffer(ctx, depth_bytes + stencil_bytes,
+                                           VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                           buffer, memory, error)) return false;
+        const VkImageAspectFlags aspects = VK_IMAGE_ASPECT_DEPTH_BIT |
+            (key.fmt == static_cast<uint32_t>(VK_FORMAT_D32_SFLOAT_S8_UINT)
+                 ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
+        const bool copied = submit_persistent_ds_transfer(
+            ctx, image.image, aspects, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, key.w, key.h,
+            seed.depth_valid, seed.stencil_valid, false, error);
+        void* mapped = nullptr;
+        const bool mapped_ok = copied &&
+            vkMapMemory(ctx.dev, memory, 0, depth_bytes + stencil_bytes, 0, &mapped) == VK_SUCCESS;
+        if (mapped_ok) {
+            const auto* bytes = static_cast<const uint8_t*>(mapped);
+            seed.depth.assign(bytes, bytes + depth_bytes);
+            seed.stencil.assign(bytes + depth_bytes, bytes + depth_bytes + stencil_bytes);
+            vkUnmapMemory(ctx.dev, memory);
+        }
+        vkDestroyBuffer(ctx.dev, buffer, nullptr); vkFreeMemory(ctx.dev, memory, nullptr);
+        if (!mapped_ok) {
+            if (error.empty()) error = "cannot map persistent DS readback";
+            return false;
+        }
+        seeds.push_back(std::move(seed));
+    }
+    return true;
+}
+
+inline bool restore_persistent_ds_image(const prosper::gpu::GpuCaptureDsSeed& seed,
+                                        std::string& error) {
+    error.clear();
+    const RenderVkCtx& ctx = render_vk_ctx();
+    if (!ctx.ok) { error = "Vulkan renderer is unavailable"; return false; }
+    const VkFormat format = seed.format == prosper::gpu::GpuCaptureDsFormat::D32Float
+        ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_D32_SFLOAT_S8_UINT;
+    const VkImageAspectFlags aspects = VK_IMAGE_ASPECT_DEPTH_BIT |
+        (format == VK_FORMAT_D32_SFLOAT_S8_UINT ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
+    PersistentDsKey key{seed.depth_read_base, seed.depth_write_base,
+                        seed.stencil_read_base, seed.stencil_write_base,
+                        seed.htile_data_base, seed.width, seed.height,
+                        static_cast<uint32_t>(format)};
+    PersistentDsImage& image = persistent_ds_cache()[key];
+    if (!image.image) {
+        VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        info.imageType = VK_IMAGE_TYPE_2D; info.format = format;
+        info.extent = {seed.width, seed.height, 1};
+        info.mipLevels = 1; info.arrayLayers = 1; info.samples = VK_SAMPLE_COUNT_1_BIT;
+        info.tiling = VK_IMAGE_TILING_OPTIMAL;
+        info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if (vkCreateImage(ctx.dev, &info, nullptr, &image.image) != VK_SUCCESS) {
+            error = "cannot create restored persistent DS image"; return false;
+        }
+        VkMemoryRequirements requirements{};
+        vkGetImageMemoryRequirements(ctx.dev, image.image, &requirements);
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocation.allocationSize = requirements.size;
+        allocation.memoryTypeIndex = render_memory_type(ctx.phys, requirements.memoryTypeBits, 0);
+        VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        view_info.image = image.image; view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        view_info.format = format; view_info.subresourceRange = {aspects, 0, 1, 0, 1};
+        if (allocation.memoryTypeIndex == UINT32_MAX ||
+            vkAllocateMemory(ctx.dev, &allocation, nullptr, &image.memory) != VK_SUCCESS ||
+            vkBindImageMemory(ctx.dev, image.image, image.memory, 0) != VK_SUCCESS ||
+            vkCreateImageView(ctx.dev, &view_info, nullptr, &image.view) != VK_SUCCESS) {
+            if (image.view) vkDestroyImageView(ctx.dev, image.view, nullptr);
+            vkDestroyImage(ctx.dev, image.image, nullptr);
+            if (image.memory) vkFreeMemory(ctx.dev, image.memory, nullptr);
+            image = {};
+            error = "cannot allocate restored persistent DS image"; return false;
+        }
+    }
+    const size_t transfer_bytes = seed.depth.size() + seed.stencil.size();
+    VkBuffer buffer = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE;
+    if (!persistent_ds_transfer_buffer(ctx, transfer_bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                       buffer, memory, error)) return false;
+    void* mapped = nullptr;
+    if (vkMapMemory(ctx.dev, memory, 0, transfer_bytes, 0, &mapped) != VK_SUCCESS) {
+        vkDestroyBuffer(ctx.dev, buffer, nullptr); vkFreeMemory(ctx.dev, memory, nullptr);
+        error = "cannot map persistent DS upload"; return false;
+    }
+    if (!seed.depth.empty()) std::memcpy(mapped, seed.depth.data(), seed.depth.size());
+    if (!seed.stencil.empty())
+        std::memcpy(static_cast<uint8_t*>(mapped) + seed.depth.size(),
+                    seed.stencil.data(), seed.stencil.size());
+    vkUnmapMemory(ctx.dev, memory);
+    const VkImageLayout old_layout = image.layout_initialized
+        ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
+    const bool copied = submit_persistent_ds_transfer(
+        ctx, image.image, aspects, old_layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        buffer, seed.width, seed.height, seed.depth_valid, seed.stencil_valid, true, error);
+    vkDestroyBuffer(ctx.dev, buffer, nullptr); vkFreeMemory(ctx.dev, memory, nullptr);
+    if (!copied) return false;
+    image.layout_initialized = true;
+    image.depth_valid = seed.depth_valid; image.stencil_valid = seed.stencil_valid;
+    return true;
 }
 
 inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& draws, uint32_t W, uint32_t H,
@@ -402,7 +646,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         VkImageCreateInfo dci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         dci.imageType = VK_IMAGE_TYPE_2D; dci.format = DFMT; dci.extent = {W, H, 1};
         dci.mipLevels = 1; dci.arrayLayers = 1; dci.samples = VK_SAMPLE_COUNT_1_BIT;
-        dci.tiling = VK_IMAGE_TILING_OPTIMAL; dci.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        dci.tiling = VK_IMAGE_TILING_OPTIMAL;
+        dci.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         vkCreateImage(dev, &dci, nullptr, &dimg);
         VkMemoryRequirements dr; vkGetImageMemoryRequirements(dev, dimg, &dr);
         VkMemoryAllocateInfo dai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};

@@ -2,6 +2,7 @@
 #include "../src/gpu/rdna2_to_spirv.hpp"
 #include "../frontends/shared/live_renderer.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -61,8 +62,12 @@ int main() {
 
 #ifdef _WIN32
     _putenv_s("PROSPER_GPU_REPLAY_RTT_SEEDS", "1");
+    _putenv_s("PROSPER_GPU_REPLAY_DS_SEEDS", "1");
+    _putenv_s("PROSPER_GPU_REPLAY_EXPORT_DS", "1");
 #else
     setenv("PROSPER_GPU_REPLAY_RTT_SEEDS", "1", 1);
+    setenv("PROSPER_GPU_REPLAY_DS_SEEDS", "1", 1);
+    setenv("PROSPER_GPU_REPLAY_EXPORT_DS", "1", 1);
 #endif
     prosper::frontend::register_live_renderer(".", false);
     std::vector<uint8_t> pixels = render_submit_items(replay.items, W, H);
@@ -138,6 +143,31 @@ int main() {
         CHECK(center[0] > 0xC0 && center[1] < 0x40 && center[2] < 0x40,
               "temporal consumer samples restored host RTT pixels, not guest-memory fallback");
     }
+
+    GpuCaptureDsSeed ds_seed;
+    ds_seed.depth_read_base = ds_seed.depth_write_base = 0x810000;
+    ds_seed.stencil_read_base = ds_seed.stencil_write_base = 0x820000;
+    ds_seed.htile_data_base = 0x800000;
+    ds_seed.width = 4; ds_seed.height = 3;
+    ds_seed.format = GpuCaptureDsFormat::D32FloatS8;
+    ds_seed.depth_valid = true; ds_seed.stencil_valid = true;
+    ds_seed.depth.resize(4u * 3u * 4u);
+    ds_seed.stencil.resize(4u * 3u);
+    for (size_t i = 0; i < ds_seed.depth.size(); ++i)
+        ds_seed.depth[i] = static_cast<uint8_t>(i * 17u + 3u);
+    for (size_t i = 0; i < ds_seed.stencil.size(); ++i)
+        ds_seed.stencil[i] = static_cast<uint8_t>(i * 11u + 1u);
+    CHECK(restore_gpu_replay_ds_seeds({ds_seed}, error),
+          "replay uploads exact persistent Vulkan depth and stencil planes");
+    std::vector<GpuCaptureDsSeed> ds_snapshot;
+    const bool ds_read = read_all_gpu_capture_ds_seeds(ds_snapshot, error);
+    const auto restored = std::find_if(ds_snapshot.begin(), ds_snapshot.end(), [&](const auto& seed) {
+        return seed.depth_read_base == ds_seed.depth_read_base &&
+               seed.stencil_read_base == ds_seed.stencil_read_base;
+    });
+    CHECK(ds_read && restored != ds_snapshot.end() && restored->depth == ds_seed.depth &&
+          restored->stencil == ds_seed.stencil && restored->depth_valid && restored->stencil_valid,
+          "persistent Vulkan DS snapshot reads back byte-exact checkpoint contents");
 
     DrawItem missing_texture = replay.items[0];
     missing_texture.prt = std::make_shared<ShaderResourceTable>();

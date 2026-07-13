@@ -56,6 +56,12 @@ int main() {
     failed_operation.stages.push_back(failed_stage);
     first.failure_diagnostics.push_back(failed_operation);
     first.failure_diagnostics_available = true;
+    GpuCaptureDsSeed ds_seed;
+    ds_seed.depth_read_base = ds_seed.depth_write_base = 0x310000;
+    ds_seed.htile_data_base = 0x300000; ds_seed.width = 2; ds_seed.height = 2;
+    ds_seed.format = GpuCaptureDsFormat::D32Float;
+    ds_seed.depth_valid = true; ds_seed.depth.assign(16, 0x5a);
+    first.ds_seeds.push_back(ds_seed);
     GpuCaptureFile second = first;
     second.metadata.submit_index = 42;
     second.metadata.input_route = "shift-the-serialized-blob-boundary";
@@ -108,11 +114,13 @@ int main() {
           restored_second.metadata.submit_index == 42 && restored_second.blobs.size() == 1 &&
           restored_second.blobs[0].guest_addr == 0x200000 && restored_second.blobs[0].bytes == blob.bytes &&
           restored_second.failure_diagnostics_available && restored_second.failure_diagnostics.size() == 1 &&
-          restored_second.raw_shader_versions[0].words == failed_shader.words,
+          restored_second.raw_shader_versions[0].words == failed_shader.words &&
+          restored_second.ds_seeds.size() == 1 && restored_second.ds_seeds[0].depth == ds_seed.depth,
           "bundle reconstructs an exact validated capture");
     CHECK(materialize_gpu_capture_bundle_manifest(loaded, 1, second_manifest, error) &&
           second_manifest.metadata.submit_index == 42 && second_manifest.blobs.size() == 1 &&
-          second_manifest.blobs[0].bytes.empty() && second_manifest.draws.size() == restored_second.draws.size(),
+          second_manifest.blobs[0].bytes.empty() && second_manifest.draws.size() == restored_second.draws.size() &&
+          second_manifest.ds_seeds.size() == 1 && second_manifest.ds_seeds[0].depth == ds_seed.depth,
           "manifest-only materialization exposes submit state without resource payload reconstruction");
     restored_first.blobs[0].bytes[0] ^= 0xff;
     CHECK(restored_second.blobs[0].bytes == blob.bytes,

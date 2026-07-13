@@ -82,6 +82,8 @@ accepts scripted gamepad input, and renders the first level.
   cached Vulkan depth images, restoring the rejected gameplay layers in a routed live A/B (#611). The four
   remaining scene draws used uniform VCCZ-exit light loops; the fragment/vertex recompiler now proves that
   narrow wave-uniform shape, emits structured loops, and realizes every sampled gameplay draw (#615).
+  Capture v8 snapshots exact persistent Vulkan depth/stencil planes alongside temporal color targets, turning
+  the final composition into a standalone, hash-checked replay checkpoint (#569).
 
 **Frontend:** `prosper-app` is a windowed player (SDL3 window + Vulkan present + audio sink +
 evdev/SDL3 controllers + real message/error/IME dialogs), sharing the same boot + render core as the

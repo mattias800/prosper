@@ -119,7 +119,7 @@ latest same-run writer identity for every temporal image leaf in the selected ca
 the consumer submit/operation/range, the in-submit future writer, and either the matched prior graphics
 submit/draw/PM4 order/target extent or an explicit unresolved result.
 
-Version 2 added exactly one bounded detailed submit per run. The linked version-7 `.prgcap` contains
+Version 2 added exactly one bounded detailed submit per run. The linked version-8 `.prgcap` contains
 content-hashed/deduplicated shaders and resource
 bytes, graphics and compute items, complete raw depth-surface programming, and the original mixed PM4 operation
 order. An operation whose shader

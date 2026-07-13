@@ -49,10 +49,9 @@ possible without console keys. Dumps are user-supplied and gitignored.
   structurizer now accepts that shape only when each compare operand has a proved wave-uniform reaching
   definition; varying bounds and the compute wave-mask form still reject. Current routed gameplay submits
   realize every semantic draw (#615).
-  Version-7 GPU captures seed temporal render targets, retain complete depth-surface programming, and keep
-  content-addressed resource versions for
-  faithful offline isolation (#568/#594); one residual
-  live/replay hash mismatch remains (#569). Dispatch thread counts and derived workgroup dimensions,
+  Version-8 GPU captures seed temporal render targets, retain complete depth-surface programming, preserve
+  exact persistent Vulkan depth/stencil checkpoint planes, and keep content-addressed resource versions for
+  faithful offline isolation (#568/#594/#569). Dispatch thread counts and derived workgroup dimensions,
   compute program binding, direct type-1 buffers, and mixed graphics/compute PM4 order now execute correctly
   (#580/#576/#584).
 - 🚧 **Active frontiers:** bundle v2 makes long Dead Cells history practical with exact shared-resource
@@ -65,8 +64,10 @@ possible without console keys. Dumps are user-supplied and gitignored.
   predicate can be discovered and validated offline before an expensive detailed capture (#594).
   The faithful 883-submit closure resolves 1,764 temporal image dependencies and established the stale-depth
   failure. The draw stream has no `DB_RENDER_CONTROL` clear because hardware observes the compute-written
-  HTILE metadata instead; #611 implements that missing cache boundary. #569 still tracks exact depth/stencil
-  checkpoint serialization. The Dead Cells splash guard now checks the richest frame in its startup window against
+  HTILE metadata instead; #611 implements that missing cache boundary. Capture v8 now snapshots exact valid
+  depth/stencil planes with their complete cache identity and embeds the source bundle output oracle. Both the
+  normal production path and an invalidation-disabled stale-depth A/B replay byte-identically from one final
+  capsule in about 3.3 seconds (#569). The Dead Cells splash guard checks the richest frame in its startup window against
   a measured content threshold, avoiding its nondeterministic animation frame. UE4's measured GPU boundary remains
   under its area issues.
 

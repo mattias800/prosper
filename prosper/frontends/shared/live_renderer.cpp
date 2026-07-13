@@ -81,6 +81,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 return true;
             });
     }
+    if (getenv("PROSPER_GPU_CAPTURE") || getenv("PROSPER_GPU_TIMELINE_CAPTURE") ||
+        getenv("PROSPER_GPU_REPLAY_EXPORT_DS"))
+        prosper::gpu::set_gpu_capture_ds_seed_snapshot_reader(
+            [](std::vector<prosper::gpu::GpuCaptureDsSeed>& seeds, std::string& error) {
+                return prosper::test::snapshot_persistent_ds_images(seeds, error);
+            });
     if (getenv("PROSPER_GPU_REPLAY_RTT_SEEDS"))
         prosper::gpu::set_gpu_replay_rtt_seed_writer([](const prosper::gpu::GpuCaptureRttSeed& seed, std::string& error) {
             const uint64_t expected = static_cast<uint64_t>(seed.width) * seed.height * 4;
@@ -91,6 +97,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             surface.w = seed.width; surface.h = seed.height; surface.rgba = seed.rgba;
             return true;
         });
+    if (getenv("PROSPER_GPU_REPLAY_DS_SEEDS"))
+        prosper::gpu::set_gpu_replay_ds_seed_writer(
+            [](const prosper::gpu::GpuCaptureDsSeed& seed, std::string& error) {
+                return prosper::test::restore_persistent_ds_image(seed, error);
+            });
     // A real command stream renders each CB_COLOR0_BASE into its own surface. Keep the old flattened
     // compositor only as a diagnostic fallback; it cannot preserve post chains or target extents.
     static const bool pertarget = getenv("PROSPER_RTT_PERTARGET") != nullptr ||

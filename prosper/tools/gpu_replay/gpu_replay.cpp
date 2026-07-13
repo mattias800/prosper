@@ -194,6 +194,21 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
                     static_cast<unsigned long long>(seed.guest_addr), seed.width, seed.height,
                     seed.rgba.size(), static_cast<unsigned long long>(hash));
     }
+    for (const auto& seed : replay.ds_seeds) {
+        const uint64_t depth_hash = prosper::gpu::gpu_capture_hash(seed.depth);
+        const uint64_t stencil_hash = prosper::gpu::gpu_capture_hash(seed.stencil);
+        std::printf("ds-seed base-z=%016llx/%016llx base-s=%016llx/%016llx htile=%016llx "
+                    "extent=%ux%u format=%s valid=%d/%d depth=%zu/%016llx stencil=%zu/%016llx\n",
+                    static_cast<unsigned long long>(seed.depth_read_base),
+                    static_cast<unsigned long long>(seed.depth_write_base),
+                    static_cast<unsigned long long>(seed.stencil_read_base),
+                    static_cast<unsigned long long>(seed.stencil_write_base),
+                    static_cast<unsigned long long>(seed.htile_data_base), seed.width, seed.height,
+                    seed.format == prosper::gpu::GpuCaptureDsFormat::D32FloatS8 ? "D32S8" : "D32",
+                    seed.depth_valid, seed.stencil_valid, seed.depth.size(),
+                    static_cast<unsigned long long>(depth_hash), seed.stencil.size(),
+                    static_cast<unsigned long long>(stencil_hash));
+    }
     for (size_t i = 0; i < replay.items.size(); ++i) {
         const auto& d = replay.items[i];
         std::printf("draw[%zu] target=%016llx extent=%ux%u vcount=%u indices=%zu topo=%u fmt=%u cwm=%x "
@@ -693,7 +708,11 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
     set_environment("PROSPER_RENDER_FIRST", "0");
     set_environment("PROSPER_RENDER_LAST", "2147483647");
     set_environment("PROSPER_GPU_REPLAY_RTT_SEEDS", "1");
-    if (!final_capsule_path.empty()) set_environment("PROSPER_GPU_REPLAY_EXPORT_RTT", "1");
+    set_environment("PROSPER_GPU_REPLAY_DS_SEEDS", "1");
+    if (!final_capsule_path.empty()) {
+        set_environment("PROSPER_GPU_REPLAY_EXPORT_RTT", "1");
+        set_environment("PROSPER_GPU_REPLAY_EXPORT_DS", "1");
+    }
     prosper::frontend::register_live_renderer(".", false);
     final_capture = {};
 
@@ -826,6 +845,14 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
             if (std::none_of(prior_targets.begin(), prior_targets.end(), [&](const auto& target) {
                     return target.addr == seed.guest_addr;
                 })) seeds.push_back(seed);
+        if (!prosper::gpu::restore_gpu_replay_ds_seeds(replay.ds_seeds, error)) {
+            std::fprintf(stderr, "gpu_replay: cannot restore bundle DS seeds: %s\n", error.c_str());
+            return 2;
+        }
+        bool final_capsule_prepared = false;
+        size_t final_cache_surfaces = 0, final_required = 0;
+        size_t final_exported = 0, final_refreshed = 0, final_migrated_failures = 0;
+        uint64_t final_ds_snapshot_bytes = 0;
         if (i + 1 == bundle.submits.size() && !final_capsule_path.empty()) {
             std::unordered_set<uint64_t> required;
             for (const auto& leaf : graph.external_leaves) {
@@ -840,17 +867,16 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
                              error.c_str());
                 return 2;
             }
-            size_t exported = 0, refreshed = 0;
             for (auto& seed : snapshot) {
                 const uint64_t addr = seed.guest_addr;
                 auto existing = std::find_if(capture.rtt_seeds.begin(), capture.rtt_seeds.end(),
                     [&](const auto& candidate) { return candidate.guest_addr == addr; });
                 if (existing == capture.rtt_seeds.end()) {
                     capture.rtt_seeds.push_back(std::move(seed));
-                    ++exported;
+                    ++final_exported;
                 } else {
                     *existing = std::move(seed);
-                    ++refreshed;
+                    ++final_refreshed;
                 }
             }
             for (uint64_t addr : required)
@@ -861,6 +887,56 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
                                  static_cast<unsigned long long>(addr));
                     return 2;
                 }
+            std::vector<prosper::gpu::GpuCaptureDsSeed> ds_snapshot;
+            if (!prosper::gpu::read_all_gpu_capture_ds_seeds(ds_snapshot, error)) {
+                std::fprintf(stderr, "gpu_replay: cannot snapshot final DS cache: %s\n",
+                             error.c_str());
+                return 2;
+            }
+            for (const auto& seed : ds_snapshot)
+                final_ds_snapshot_bytes += seed.depth.size() + seed.stencil.size();
+            capture.ds_seeds = std::move(ds_snapshot);
+            if (!capture.failure_diagnostics_available) {
+                for (const auto& operation : capture.operations) {
+                    if (operation.realized) continue;
+                    prosper::gpu::GpuCapturedOperationFailure failure;
+                    failure.kind = operation.kind;
+                    failure.source_index = operation.source_index;
+                    failure.command_order = operation.command_order;
+                    failure.reason = prosper::gpu::RealizationFailureReason::Unknown;
+                    capture.failure_diagnostics.push_back(std::move(failure));
+                    ++final_migrated_failures;
+                }
+                capture.failure_diagnostics_available = true;
+            }
+            for (const char* name : {"PROSPER_DS_GUEST_WRITE_INVALIDATE",
+                                     "PROSPER_GPU_REPLAY_LEGACY_HTILE_BEFORE_STENCIL"}) {
+                const char* value = std::getenv(name);
+                if (!value) continue;
+                auto existing = std::find_if(capture.metadata.renderer_env.begin(),
+                                             capture.metadata.renderer_env.end(),
+                    [&](const auto& entry) { return entry.first == name; });
+                if (existing == capture.metadata.renderer_env.end())
+                    capture.metadata.renderer_env.emplace_back(name, value);
+                else
+                    existing->second = value;
+            }
+            final_cache_surfaces = snapshot.size(); final_required = required.size();
+            final_capsule_prepared = true;
+        }
+        if (!prosper::gpu::restore_gpu_replay_rtt_seeds(seeds, error)) {
+            std::fprintf(stderr, "gpu_replay: cannot restore bundle RTT seeds: %s\n", error.c_str());
+            return 2;
+        }
+        final_pixels = execute_frame(replay, false, operation_limit);
+        if (final_capsule_prepared) {
+            if (final_pixels.empty()) {
+                std::fprintf(stderr, "gpu_replay: final submit produced no checkpoint oracle\n");
+                return 2;
+            }
+            capture.expected_output_valid = true;
+            capture.expected_output_bytes = final_pixels.size();
+            capture.expected_output_hash = prosper::gpu::gpu_capture_hash(final_pixels);
             if (!prosper::gpu::write_gpu_capture(final_capsule_path, capture, error)) {
                 std::fprintf(stderr, "gpu_replay: cannot write final seeded capsule: %s\n",
                              error.c_str());
@@ -868,15 +944,16 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
             }
             std::fprintf(stderr,
                          "[gpureplay] exported final seeded capsule cache-surfaces=%zu required=%zu "
-                         "new-seeds=%zu refreshed=%zu total-seeds=%zu -> %s\n",
-                         snapshot.size(), required.size(), exported, refreshed, capture.rtt_seeds.size(),
+                         "new-seeds=%zu refreshed=%zu total-seeds=%zu DS-seeds=%zu DS-bytes=%llu "
+                         "migrated-failures=%zu oracle=%016llx/%llu -> %s\n",
+                         final_cache_surfaces, final_required, final_exported, final_refreshed,
+                         capture.rtt_seeds.size(), capture.ds_seeds.size(),
+                         static_cast<unsigned long long>(final_ds_snapshot_bytes),
+                         final_migrated_failures,
+                         static_cast<unsigned long long>(capture.expected_output_hash),
+                         static_cast<unsigned long long>(capture.expected_output_bytes),
                          final_capsule_path.c_str());
         }
-        if (!prosper::gpu::restore_gpu_replay_rtt_seeds(seeds, error)) {
-            std::fprintf(stderr, "gpu_replay: cannot restore bundle RTT seeds: %s\n", error.c_str());
-            return 2;
-        }
-        final_pixels = execute_frame(replay, false, operation_limit);
         for (size_t operation_index = 0; operation_index < operation_limit; ++operation_index) {
             const auto& operation = replay.operations[operation_index];
             if (!operation.realized ||
@@ -1226,22 +1303,30 @@ int main(int argc, char** argv) {
     const auto& m = replay.metadata;
     std::fprintf(stderr, "[gpureplay] rev=%s title=%s submit=%llu %ux%u draws=%zu computes=%zu "
                          "operations=%zu shaders=%zu failed=%zu raw-failed-shaders=%zu blobs=%zu "
-                         "RTT-seeds=%zu oracle=%s\n",
+                         "RTT-seeds=%zu DS-seeds=%zu oracle=%s\n",
                  m.revision.c_str(), m.title_id.c_str(), static_cast<unsigned long long>(m.submit_index),
                  m.width, m.height, replay.items.size(), replay.computes.size(), replay.operations.size(),
                  capture.shader_versions.size(), replay.failure_diagnostics.size(),
                  replay.raw_shader_versions.size(), replay.blobs.size(), replay.rtt_seeds.size(),
+                 replay.ds_seeds.size(),
                  replay.expected_output_valid ? "yes" : "no");
     if (inspect) inspect_frame(replay);
     if (validate_only) return validate_frame(replay) ? 0 : 1;
     if (inspect_only) return 0;
     if (!replay.rtt_seeds.empty() || !prepend.rtt_seeds.empty())
         set_environment("PROSPER_GPU_REPLAY_RTT_SEEDS", "1");
+    if (!replay.ds_seeds.empty() || !prepend.ds_seeds.empty())
+        set_environment("PROSPER_GPU_REPLAY_DS_SEEDS", "1");
     prosper::frontend::register_live_renderer(".", false);
     std::unordered_set<uint64_t> predecessor_targets;
     if (!prepend_path.empty()) {
         if (!prosper::gpu::restore_gpu_replay_rtt_seeds(prepend.rtt_seeds, error)) {
             std::fprintf(stderr, "gpu_replay: cannot restore predecessor RTT seeds: %s\n",
+                         error.c_str());
+            return 2;
+        }
+        if (!prosper::gpu::restore_gpu_replay_ds_seeds(prepend.ds_seeds, error)) {
+            std::fprintf(stderr, "gpu_replay: cannot restore predecessor DS seeds: %s\n",
                          error.c_str());
             return 2;
         }
@@ -1259,6 +1344,9 @@ int main(int argc, char** argv) {
         if (!predecessor_targets.count(seed.guest_addr)) consumer_seeds.push_back(seed);
     if (!prosper::gpu::restore_gpu_replay_rtt_seeds(consumer_seeds, error)) {
         std::fprintf(stderr, "gpu_replay: cannot restore RTT seeds: %s\n", error.c_str()); return 2;
+    }
+    if (!prosper::gpu::restore_gpu_replay_ds_seeds(replay.ds_seeds, error)) {
+        std::fprintf(stderr, "gpu_replay: cannot restore DS seeds: %s\n", error.c_str()); return 2;
     }
     const size_t operation_limit = through_operation >= 0
         ? static_cast<size_t>(through_operation) + 1 : SIZE_MAX;

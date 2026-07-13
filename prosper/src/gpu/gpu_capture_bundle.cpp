@@ -163,6 +163,7 @@ GpuCaptureFile make_capture_manifest(const GpuCaptureFile& capture) {
     manifest.expected_output_bytes = capture.expected_output_bytes;
     manifest.expected_output_valid = capture.expected_output_valid;
     manifest.rtt_seeds = capture.rtt_seeds;
+    manifest.ds_seeds = capture.ds_seeds;
     manifest.shader_versions = capture.shader_versions;
     manifest.raw_shader_versions = capture.raw_shader_versions;
     manifest.draws = capture.draws;

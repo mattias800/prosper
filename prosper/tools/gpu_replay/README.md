@@ -1,7 +1,8 @@
 # GPU replay
 
 `gpu_replay` inspects, validates, graphs, and renders a local `.prgcap` without booting the guest.
-Capsules contain title-derived shaders, resource bytes, addresses, and optional rendered RTT pixels.
+Capsules contain title-derived shaders, resource bytes, addresses, optional rendered RTT pixels, and optional
+exact persistent Vulkan depth/stencil checkpoint planes.
 They are gitignored local artifacts and must never be committed or shared as project fixtures.
 
 Build from `prosper/`, using the worktree-local Linux build:
@@ -67,7 +68,7 @@ expected hash. `--allow-mismatch` is for an intentional differential such as `--
 
 ### Failed operations
 
-Capture v7 retains bounded diagnostics for draws and dispatches that semantic PM4 ordering contains but the
+Capture v7 and later retain bounded diagnostics for draws and dispatches that semantic PM4 ordering contains but the
 executor cannot realize. `--inspect-only` prints the failure reason, decoded target/pipeline or compute-launch
 state, every referenced stage address, resource-table presence/count, descriptor issues, recompile coverage,
 and the first rejected opcode/format at its exact dword PC. It also prints the raw RDNA2 content hash, byte
@@ -79,6 +80,12 @@ stage is fault-safely read once, content-deduplicated, capped at 64 KiB, and sto
 `s_endpgm`/unknown instruction or the cap. Total failed-stage data is capped at 64 MiB, diagnostics cannot
 outnumber semantic operations, and every reference/hash is validated while reading. Captures v1-v6 remain
 readable and print `failure-diagnostics: unavailable (capture predates v7)` rather than inventing evidence.
+
+Capture v8 adds persistent depth/stencil checkpoints. Each seed stores the renderer's complete guest cache
+identity (depth/stencil read/write bases, HTILE base, extent, and D32/D32S8 format), independent depth/stencil
+validity, and raw valid-plane bytes. Counts, extents, formats, duplicate identities, per-plane lengths, and a
+1 GiB total are validated before allocation or Vulkan upload. Captures v1-v7 remain readable with zero DS
+seeds. `--inspect-only` prints every seed's identity, validity, byte counts, and content hashes.
 
 Compute selectors use the realized compute index printed by `--inspect-only`. The resource selector is
 `COMPUTE:BINDING`; it writes the captured pre-dispatch storage-buffer bytes, while `--dump-compute` writes
@@ -103,7 +110,7 @@ restored. The tool rejects a predecessor whose submit number is not earlier. A c
 consumer sampled the retained producer output, but it does not prove faithful closure: graph the predecessor
 and continue if it also has temporal leaves.
 
-`--bundle` reconstructs each captured submit through the normal version-7 validator, executes them in
+`--bundle` reconstructs each captured submit through the normal versioned validator, executes them in
 ascending order through one renderer instance, and releases each materialized submit before the next.
 The summary reports logical versus unique bytes, per-submit output hashes, and every temporal image leaf:
 
@@ -126,11 +133,15 @@ that only the named target family crosses submit boundaries. The final submit re
 if an included temporal image leaf has another extent or an intermediate submit has no matching draw. This is
 an evidence-gated optimization, not automatic dependency closure.
 
-`--bundle-final-capsule PATH` snapshots the complete live color RTT cache before executing the final submit
-and writes it as seeds in a standalone capsule. Its standalone output must match the bundle's final hash before
-using it for fast `--draw`, resource, or shader experiments. Export validates every surface and fails when a
-required temporal surface is absent; it never substitutes zero pixels. The capsule does not yet serialize live
-Vulkan depth/stencil images (#569/#611), so a hash mismatch can remain even when every color seed is exact.
+`--bundle-final-capsule PATH` snapshots the complete live color RTT and persistent Vulkan depth/stencil caches
+before executing the final submit and writes them as seeds in a standalone capture-v8 capsule. Its standalone
+output must match the bundle's final hash before using it for fast `--draw`, operation-prefix, resource, or
+shader experiments. Export validates every surface and fails when a required temporal color surface is absent;
+it never substitutes zero pixels. The file is installed only after the source final submit renders, and embeds
+that output byte count/hash as its replay oracle. A legacy pre-v7 manifest with unrealized operations is migrated explicitly to
+`Unknown` failure diagnostics with the original operation kind/source/order, so the v8 writer remains strict.
+The DS snapshot uses transfer barriers to return every image to depth/stencil-attachment layout before the final
+bundle submit executes; equality therefore also checks that readback did not perturb the source run.
 
 `--bundle-extract-submit N PATH` materializes one run-local submit manifest as a normal capsule and exits
 without Vulkan when no image output is requested. Use it to inspect, graph, or validate the exact predecessor
@@ -165,16 +176,25 @@ faithful replacement for the missing producer history.
 
 ## Current Dead Cells reference
 
-The preserved #608 playable closure selects exactly 90 semantic draws with the 738x420 pass at draw 79..81. Its retained
-submits 18,165..19,047 represent 158.94 GiB logically and 739 MiB uniquely. Replay resolves 1,764 temporal image
-dependencies with zero bounded/unresolved leaves and renders hash `5759c125812154dc`. A complete-color-cache
-final capsule renders `71b84bdfae53933c` because it begins with fresh depth. Manifest scanning shows the same
-642x362 depth address in all 883 submits, always with LESS_OR_EQUAL tests/writes and never a draw/register
-clear. Timeline-v5 backing hashes and writer provenance resolve the missing boundary: supported compute program
-`0x401aec200` fills the exact 32 KiB HTILE allocation with `0xfffffff0` before the scene draw span. The live
-backend now invalidates overlapping persistent DS entries on guest GPU writeback (#611); a routed A/B restores
-the layers that stayed black with invalidation disabled. #569 remains the exact DS checkpoint gap, not another
-color RTT producer.
+The preserved #608 playable closure selects exactly 90 semantic draws with the 738x420 pass at draw 79..81. Its
+retained submits 18,165..19,047 represent 158.94 GiB logically and 739 MiB uniquely, resolving all 1,764 temporal
+image dependencies. Its original pre-#611/#615 replay hash was `5759c125812154dc`; absolute hashes from that old
+renderer revision are historical, while source/capsule equality remains the checkpoint invariant.
+
+On current code, normal #611 invalidation produces `fac9ca4cbbba8196` from both the full bundle and standalone
+v8 capsule. With `PROSPER_DS_GUEST_WRITE_INVALIDATE=0`, the exact stale-depth A/B produces
+`535256588b67a536` from both paths and byte-identical BMPs. The self-contained capsule holds 12 RTT surfaces,
+one valid 642x362 D32S8 depth plane (929,616 bytes), the effective invalidation/legacy-HTILE settings, and its
+33,177,600-byte output oracle; standalone replay takes about 3.3 seconds instead of roughly 24 minutes. A
+tail-two negative control remains `71b84bdfae53933c` in both bundle and capsule because its two color frontiers
+are explicitly bounded. This closes #569 without hiding an incomplete history boundary.
+
+Manifest scanning shows the same 642x362 depth address in all 883 submits, always with LESS_OR_EQUAL
+tests/writes and never a draw/register clear. Timeline-v5 backing hashes and writer provenance resolved the
+hardware boundary: supported compute program `0x401aec200` fills the exact 32 KiB HTILE allocation with
+`0xfffffff0` before the scene draw span. The live backend invalidates overlapping persistent DS entries on guest
+GPU writeback (#611); capture v8 preserves the state exactly when an investigation deliberately disables that
+invalidation.
 
 For new routed captures, timeline v6 replaces that historical endpoint with 91..93 semantic draws, exactly
 8 dispatches, and the 738x420 pass at draw 80..82. `gpu_timeline --signatures` derived the conjunction from two
