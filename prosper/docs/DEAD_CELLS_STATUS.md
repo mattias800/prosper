@@ -1,17 +1,20 @@
-# Dead Cells graphics status
+# Dead Cells graphics status and regression workflow
 
 Last updated: 2026-07-13
 
-This is the handoff for the remaining *Dead Cells* gameplay-composition work. The operational route and
-selector reference is [`../scripts/dead-cells/README.md`](../scripts/dead-cells/README.md). The active bug is
-[#566](https://github.com/mattias800/ps5ys/issues/566).
+The operational route and selector reference is
+[`../scripts/dead-cells/README.md`](../scripts/dead-cells/README.md). The gameplay-composition bug
+[#566](https://github.com/mattias800/ps5ys/issues/566) was fixed by #626; this document retains the exact
+checkpoint recipe as a regression and future-investigation workflow.
 
 ## Current state
 
 *Dead Cells* boots, passes the splash and menus, loads `PrisonStart`, and reaches the controllable Jump tutorial.
-Scene geometry, smoke, silhouettes, the player, the tutorial prompt, and the HUD render. The remaining output is
-visibly wrong compared with the game: the world composition is largely grayscale and overexposed instead of the
-colored, lit scene.
+The scene renders in full color, including geometry, lighting, smoke, silhouettes, the player, terrain, effects,
+the tutorial prompt, and the HUD. The final grayscale-world root cause was the fragment recompiler selecting the
+first color export from shaders that emit MRT3..MRT0; MRT0 now feeds the backend's single color attachment (#626).
+The same change set recovers a separately dropped format-copy dispatch by resolving its directly placed
+destination buffer descriptor at s4.
 
 The original mostly-white repeated-block image is not the current bug. It was caused by beginning diagnostic
 rendering after a required 642x362 temporal render-target producer had already run (#586). Do not use a
@@ -24,10 +27,12 @@ The important fixes already on `master` are:
 - four uniform VCCZ-exit fragment-lighting loops recompile through a narrowly proved structured form (#615);
 - failed operations retain bounded raw shaders and exact rejection diagnostics in capture v7 (#618);
 - capture v8 checkpoints complete color RTT state and persistent depth/stencil planes, including a source-output
-  hash oracle (#569).
+  hash oracle (#569);
+- directly placed compute buffer destinations resolve, so the current scene realizes all eight dispatches (#626);
+- MRT0, rather than the first-emitted non-color G-buffer plane, supplies the visible fragment output (#626).
 
-Current live gameplay submits after #615 realize all semantic draws. Descriptor validation has not identified a
-missing or undersized binding in the exercised frame.
+The producer-complete post-#626 checkpoint realizes every semantic draw and all eight dispatches. Descriptor
+validation has not identified a missing or undersized binding in the exercised frame.
 
 ## Evidence boundary
 
@@ -41,10 +46,11 @@ invalidation deliberately disabled, both produce `535256588b67a536`. This exact 
 the checkpoint implementation, but the image still reflects the old capture's missing operations. Do not use it
 to conclude which pass is wrong in a post-#615 live submit.
 
-A fresh producer-complete current bundle is therefore the required starting point. Title-derived `.prgtl`,
+A fresh producer-complete current bundle is the required starting point for any new regression or deeper-scene
+investigation. Title-derived `.prgtl`,
 `.prgcap`, `.prgbundle`, shader, and image artifacts are local and gitignored; none belong in a commit.
 
-## Recreate the current checkpoint
+## Recreate the regression checkpoint
 
 Build in WSL from the repository root. Adjust the dump path if needed:
 
@@ -107,27 +113,21 @@ cmp /tmp/dead-cells-current-source.bmp \
     /tmp/dead-cells-current-standalone.bmp
 ```
 
-Do not begin isolation until `cmp` succeeds and standalone replay reports that its embedded oracle passed. Also
-require `gpu_replay --inspect-only` to report zero failed operations for the current endpoint.
+Do not use a checkpoint as an oracle until `cmp` succeeds and standalone replay reports that its embedded oracle
+passed. Also require `gpu_replay --inspect-only` to report zero failed operations for the current endpoint.
 
 ## What remains
 
-1. Produce the fresh current bundle and hash-checked v8 capsule above. This removes the five legacy operation
-   holes from the debugging baseline.
-2. Obtain a hardware/reference capture of the same controllable frame and route state. The image currently
-   attached to #566 is from the preceding opening vignette, so it is a qualitative color reference rather than
-   a pixel-aligned oracle.
-3. Use `gpu_replay --through-operation N --allow-mismatch` to locate the operation where the 642x362 scene first
-   loses the expected material/color information. Preserve mixed graphics/compute order; `--draw` is not a
-   substitute for a semantic prefix.
-4. For the first suspect operation, record its draw/dispatch source, PM4 order, target, shader hashes, resource
-   hashes, blend/depth state, and before/after output. Dump only the relevant shader/resource inputs.
-5. Implement the missing generic GPU contract, add a synthetic regression, run all CTests and both Messenger and
-   Dead Cells snapshot guards, then repeat the source/capsule equality check.
+1. Keep the deterministic gameplay route and source/capsule equality check green as shared GPU work lands.
+2. Extend routed playability and checkpoint coverage beyond the first tutorial scene and into later rooms.
+3. Obtain a pixel-aligned hardware capture when exact visual comparison is needed; the #566 reference is from the
+   preceding opening vignette and remains a qualitative rather than pixel-exact oracle.
+4. For any new visual regression, use semantic operation prefixes to name the first divergent pass before changing
+   the renderer. Record its draw/dispatch source, PM4 order, target, shader and resource hashes, and fixed-function
+   state, then add a synthetic contract test for the generic fix.
 
-The likely fault domain is now a scene color/light composition contract, but shader execution, resource decode,
-format conversion, and blending remain hypotheses until the current producer-complete prefix identifies the
-first bad pass.
+There is no known remaining #566 composition defect in the exercised checkpoint. Generic GPU limitations and
+tooling follow-ups should be tracked as separate issues rather than reopening the completed grayscale investigation.
 
 ## Tooling note
 

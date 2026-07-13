@@ -24,7 +24,7 @@ presented, framebuffer CRC == golden" is. Each change adds the check that proves
 
 ---
 
-## Current status (2026-07-12) - at a glance
+## Current status (2026-07-13) - at a glance
 
 - **Messenger reaches and renders the first level:** intro, title, menus, save list, dialogue, player,
   background, foreground tree/terrain, water, and structures render at native 1920×1080. The causal fixes
@@ -35,31 +35,16 @@ presented, framebuffer CRC == golden" is. Each change adds the check that proves
   live/replay hashes and per-draw/resource isolation; #515 provides reflected SPIR-V/runtime descriptor
   validation in live and offline replay paths. Producer provenance, normal screenshot capture, and the local
   content-metric snapshot guard complete the current first-bad-contract workflow.
-- **Dead Cells cross-title milestone:** deterministic routing now reaches gameplay. The initial mostly-white world
-  in #566 was a diagnostic warmup artifact, not the current renderer output. Version-4 captures seeded temporal
-  render targets (#568) and originally isolated that artifact at draw 18, where a 642x362 input lacked its prior
-  renderer-owned color-target version. The corrected
-  dispatch thread/local/group contract (#580), `sceAgcCbSetShRegistersDirect`, and compute direct type-1 V#
-  decoding (#574) now execute a valid registered fill program against real guest buffers before submit completion
-  (#576). Range provenance proved one submit orders a 642x362 consumer, dispatch 5's fill, then another consumer.
-  Graphics spans and compute now execute by that retained PM4 order (#584). Per-consumer hashes and target-prefix
-  metrics proved the later overbright screenshot was a warmup artifact: a skipped temporal RTT fell back to an
-  all-`0xFF` compute backing, then the bad copy persisted. Preserving the 642x362 producers renders real geometry.
-  The faithful playable closure subsequently isolated a second lifetime bug: one detached Vulkan depth image
-  accumulated across 883 submits even though a supported compute kernel filled its 32 KiB HTILE allocation
-  with `0xfffffff0` before every scene pass. Timeline-v5 depth backing hashes/writer provenance found the exact
-  writer, and guest GPU writes now invalidate overlapping persistent DS cache entries (#611). A routed live A/B
-  restores the layers rejected without that boundary.
-  The four remaining fragment failures were uniform VCCZ-exit light loops; narrowly proved vertex/fragment
-  structurization now restores them while varying and compute-wave forms still reject (#615). Capture v7 now
-  records bounded raw stages, exact rejection opcode/PC, decoded state, and resource/descriptor summaries for
-  every observed realization failure, so the next unsupported shader can be reduced offline (#618).
-- **Immediate milestone:** use the exact capture-v8 final checkpoint to bisect remaining Dead Cells composition
-  contracts without replaying 883 submits. #569 now preserves complete persistent DS identity, independent valid
-  planes, effective lifetime settings, and the source output oracle; source and standalone BMPs are byte-identical.
-  Keep extending this workflow across Unity and Unreal targets rather than returning to long unstructured live
-  traces. Timeline v6 supplies offline target-span discovery and a two-route semantic selector (#594), and the
-  splash guard uses a measured run-level content threshold (#596/#573).
+- **Dead Cells cross-title milestone:** deterministic routing now reaches the controllable Prisoners' Quarters
+  scene with full-color geometry, lighting, player, effects, and HUD. Retained PM4 graphics/compute order (#584),
+  guest-write depth-cache invalidation (#611), and narrowly proved uniform VCCZ lighting loops (#615) restore the
+  producer and depth layers. #626 fixes the last grayscale composition error: multi-target world shaders export
+  MRT3..MRT0, so the single-attachment recompiler must select MRT0 rather than the first emitted G-buffer plane.
+  It also realizes the eighth scene dispatch by resolving its directly placed destination V#. #566 is closed.
+- **Immediate milestone:** extend the capture-first workflow to later Dead Cells rooms and additional 3D titles.
+  Capture v8 preserves complete persistent color/depth state and embeds a source-output oracle (#569), while
+  Timeline v6 supplies offline target-span discovery and a semantic scene selector (#594). Keep reducing new
+  failures through standalone checkpoints and synthetic contracts rather than long unstructured live traces.
 
 ## Historical status (2026-07-05) - retained for the milestone log
 
