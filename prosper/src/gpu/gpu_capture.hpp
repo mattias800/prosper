@@ -35,6 +35,14 @@ struct GpuCaptureShaderVersion {
     std::vector<uint32_t> words;
 };
 
+// Raw RDNA2 retained only for failed operations. Each version is capped at 64 KiB and ends at the
+// first decoded s_endpgm/unknown instruction or that cap. Equal byte streams share one version.
+struct GpuCaptureRawShaderVersion {
+    uint64_t content_hash = 0;
+    bool has_endpgm = false;
+    std::vector<uint32_t> words;
+};
+
 struct GpuCapturedResource {
     ShaderResource resource;
     uint32_t blob_index = 0xFFFFFFFFu;
@@ -77,6 +85,33 @@ struct GpuCapturedOperation {
     bool realized = false;
 };
 
+struct GpuCapturedStageDiagnostic {
+    ShaderProgramStage stage = ShaderProgramStage::Vertex;
+    uint64_t program_addr = 0;
+    uint32_t raw_shader_index = 0xFFFFFFFFu;
+    bool recompiled = false;
+    bool resource_table_present = false;
+    uint32_t resource_count = 0;
+    RecompileCoverage coverage;
+    uint32_t descriptor_issue_count = 0;
+    uint32_t first_descriptor_issue = 0xFFFFFFFFu;
+};
+
+struct GpuCapturedOperationFailure {
+    SubmitOperationKind kind = SubmitOperationKind::Draw;
+    uint64_t source_index = 0;
+    uint64_t command_order = 0;
+    RealizationFailureReason reason = RealizationFailureReason::None;
+    bool pipeline_present = false;
+    ResolvedPipelineState pipeline;
+    uint64_t color0_base = 0;
+    uint32_t color0_width = 0;
+    uint32_t color0_height = 0;
+    uint32_t vertex_count = 0;
+    ComputeLaunchDimensions compute_launch;
+    std::vector<GpuCapturedStageDiagnostic> stages;
+};
+
 // Host-rendered pixels retained across submits. The HLE renderer does not write these pixels back to
 // guest memory, so a standalone replay must seed its RTT cache explicitly to reproduce consumers whose
 // producer was in an earlier submit.
@@ -91,10 +126,13 @@ struct GpuCaptureFile {
     GpuCaptureMetadata metadata;
     std::vector<GpuCaptureBlob> blobs;
     std::vector<GpuCaptureShaderVersion> shader_versions;
+    std::vector<GpuCaptureRawShaderVersion> raw_shader_versions;
     std::vector<GpuCaptureRttSeed> rtt_seeds;
     std::vector<GpuCapturedDraw> draws;
     std::vector<GpuCapturedCompute> computes;
     std::vector<GpuCapturedOperation> operations;
+    std::vector<GpuCapturedOperationFailure> failure_diagnostics;
+    bool failure_diagnostics_available = false;
     bool expected_output_valid = false;
     uint64_t expected_output_hash = 0;
     uint64_t expected_output_bytes = 0;
@@ -115,7 +153,8 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
                           const std::vector<SubmitOperation>& operations,
                           const GpuCaptureMetadata& metadata,
                           const CaptureMemoryReader& reader, GpuCaptureFile& out,
-                          std::string& error, const CaptureRttSeedReader& rtt_reader = {});
+                          std::string& error, const CaptureRttSeedReader& rtt_reader = {},
+                          const std::vector<OperationRealizationFailure>& failures = {});
 bool capture_gpustate_submit(const GpuState& state, uint64_t submit_no,
                              uint32_t width, uint32_t height,
                              const GpuCaptureMetadata& metadata,
@@ -145,6 +184,9 @@ struct GpuReplayFrame {
     std::vector<DrawItem> items;
     std::vector<ComputeItem> computes;
     std::vector<GpuCapturedOperation> operations;
+    std::vector<GpuCaptureRawShaderVersion> raw_shader_versions;
+    std::vector<GpuCapturedOperationFailure> failure_diagnostics;
+    bool failure_diagnostics_available = false;
     bool expected_output_valid = false;
     uint64_t expected_output_hash = 0;
     uint64_t expected_output_bytes = 0;
@@ -166,6 +208,8 @@ uint64_t gpu_capture_hash(const uint8_t* data, size_t size);
 inline uint64_t gpu_capture_hash(const std::vector<uint8_t>& data) {
     return gpu_capture_hash(data.data(), data.size());
 }
+const char* shader_program_stage_name(ShaderProgramStage stage);
+const char* realization_failure_reason_name(RealizationFailureReason reason);
 
 // Runtime hook used by execute_and_present. PROSPER_GPU_CAPTURE=<path> captures exactly one realized
 // submit. MIN_DRAWS/MAX_DRAWS select a semantic candidate class; PROSPER_GPU_CAPTURE_AT=N then selects

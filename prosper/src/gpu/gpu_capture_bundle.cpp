@@ -164,9 +164,11 @@ GpuCaptureFile make_capture_manifest(const GpuCaptureFile& capture) {
     manifest.expected_output_valid = capture.expected_output_valid;
     manifest.rtt_seeds = capture.rtt_seeds;
     manifest.shader_versions = capture.shader_versions;
+    manifest.raw_shader_versions = capture.raw_shader_versions;
     manifest.draws = capture.draws;
     manifest.computes = capture.computes;
     manifest.operations = capture.operations;
+    manifest.failure_diagnostics = capture.failure_diagnostics;
     manifest.blobs.resize(capture.blobs.size());
     const uint64_t empty_hash = gpu_capture_hash(nullptr, 0);
     for (size_t i = 0; i < capture.blobs.size(); ++i) {

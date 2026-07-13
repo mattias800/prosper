@@ -4075,7 +4075,11 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
         else if (table_dependent(in)) { cov.table_dependent++; }
         else {
             cov.unsupported++;
-            if (cov.first_bad_fmt < 0) { cov.first_bad_fmt = (int)in.fmt; cov.first_bad_op = in.opcode; }
+            if (cov.first_bad_fmt < 0) {
+                cov.first_bad_fmt = (int)in.fmt;
+                cov.first_bad_op = in.opcode;
+                cov.first_bad_pc = in.pc;
+            }
         }
     }
     return cov;

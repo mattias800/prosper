@@ -1,4 +1,5 @@
 #include "../src/gpu/gpu_capture.hpp"
+#include "../src/gpu/pm4_registers.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -6,6 +7,24 @@
 #include <fstream>
 
 using namespace prosper::gpu;
+namespace P = prosper::agc::Pm4;
+
+alignas(256) static const uint32_t kDiagnosticVs[] = {
+    0x36020081u, 0x2C040081u, 0x7E020D01u, 0x7E040D02u, 0x7E0A02F6u, 0x7E0C02F2u,
+    0x10020B01u, 0x08020D01u, 0x10040B02u, 0x08040D02u, 0x7E060280u, 0x7E0802F2u,
+    0xF80008CFu, 0x04030201u, 0xBF810000u,
+};
+// Forward VCCZ branch is deliberately not invocation-safe and must remain fail-visible.
+alignas(256) static const uint32_t kDiagnosticBadPs[] = {
+    0x7da80300u, 0xbf860001u, 0x4a060300u, 0xBF810000u,
+};
+
+static void set_pgm(GpuState& state, uint32_t lo_register, uint32_t hi_register,
+                    const void* program) {
+    const uint64_t addr = reinterpret_cast<uint64_t>(program);
+    state.sh[lo_register] = static_cast<uint32_t>(addr >> 8);
+    state.sh[hi_register] = static_cast<uint32_t>((addr >> 40) & 0xffu);
+}
 
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); ++fails; } \
@@ -152,6 +171,9 @@ int main() {
     CHECK(mixed.operations.size() == 3 && mixed.operations[0].realized &&
           mixed.operations[1].realized && !mixed.operations[2].realized,
           "mixed operation plan explicitly retains unrealized work");
+    CHECK(mixed.failure_diagnostics_available && mixed.failure_diagnostics.size() == 1 &&
+          mixed.failure_diagnostics[0].reason == RealizationFailureReason::Unknown,
+          "pre-realized capture inputs label an unexplained omission explicitly");
     const auto mixed_path = std::filesystem::temp_directory_path() / "prosper_gpu_capture_mixed_test.prgcap";
     CHECK(write_gpu_capture(mixed_path.string(), mixed, error), "mixed versioned capture writes");
     GpuCaptureFile mixed_loaded;
@@ -172,6 +194,90 @@ int main() {
     mixed_compute_bytes[0] ^= 0xff;
     CHECK(mixed_draw_bytes[0] == repeated[0],
           "compute copy-on-write cannot create a false alias between equal resource versions");
+
+    GpuState failed_state;
+    set_pgm(failed_state, P::SPI_SHADER_PGM_LO_ES, P::SPI_SHADER_PGM_HI_ES, kDiagnosticVs);
+    set_pgm(failed_state, P::SPI_SHADER_PGM_LO_PS, P::SPI_SHADER_PGM_HI_PS, kDiagnosticBadPs);
+    failed_state.uc[P::VGT_PRIMITIVE_TYPE] = 4;
+    failed_state.cx[P::CB_TARGET_MASK] = 0xf;
+    failed_state.cx[P::CB_COLOR0_BASE] = 0x1234;
+    failed_state.draws.push_back({3});
+    failed_state.draws.back().command_order = 777;
+    GpuCaptureFile failed_capture;
+    CHECK(capture_gpustate_submit(failed_state, 99, 640, 360, meta, failed_capture, error),
+          "actual realization path captures a deliberately failed synthetic draw");
+    CHECK(failed_capture.draws.empty() && failed_capture.operations.size() == 1 &&
+          !failed_capture.operations[0].realized && failed_capture.failure_diagnostics_available &&
+          failed_capture.failure_diagnostics.size() == 1,
+          "unrealized operation retains one explicit v7 failure diagnostic");
+    const auto& failed = failed_capture.failure_diagnostics[0];
+    const auto failed_stage = std::find_if(failed.stages.begin(), failed.stages.end(), [](const auto& stage) {
+        return stage.stage == ShaderProgramStage::Fragment;
+    });
+    CHECK(failed.reason == RealizationFailureReason::ShaderRecompile && failed.pipeline_present &&
+          failed.pipeline.color_write_mask == 0xf && failed.vertex_count == 3 &&
+          failed_stage != failed.stages.end(),
+          "diagnostic distinguishes shader rejection and retains decoded draw state");
+    CHECK(failed_stage != failed.stages.end() && !failed_stage->recompiled &&
+          failed_stage->coverage.unsupported == 1 && failed_stage->coverage.first_bad_pc == 1 &&
+          failed_stage->coverage.first_bad_op == 0x06,
+          "failed fragment stage retains the exact rejection opcode and dword PC");
+    const GpuCaptureRawShaderVersion* failed_raw =
+        failed_stage != failed.stages.end() &&
+        failed_stage->raw_shader_index < failed_capture.raw_shader_versions.size()
+            ? &failed_capture.raw_shader_versions[failed_stage->raw_shader_index] : nullptr;
+    CHECK(failed_raw && failed_raw->has_endpgm &&
+          failed_raw->words == std::vector<uint32_t>(std::begin(kDiagnosticBadPs), std::end(kDiagnosticBadPs)) &&
+          failed_raw->content_hash == gpu_capture_hash(
+              reinterpret_cast<const uint8_t*>(kDiagnosticBadPs), sizeof(kDiagnosticBadPs)),
+          "failed stage retains the exact content-addressed raw stream through s_endpgm");
+
+    const auto failed_path = std::filesystem::temp_directory_path() /
+        "prosper_gpu_capture_failed_diagnostic_test.prgcap";
+    CHECK(write_gpu_capture(failed_path.string(), failed_capture, error),
+          "failed-operation diagnostic capture writes");
+    GpuCaptureFile failed_loaded;
+    CHECK(read_gpu_capture(failed_path.string(), failed_loaded, error) &&
+          failed_loaded.failure_diagnostics_available && failed_loaded.failure_diagnostics.size() == 1 &&
+          failed_loaded.raw_shader_versions.size() == failed_capture.raw_shader_versions.size() &&
+          failed_loaded.failure_diagnostics[0].stages[1].coverage.first_bad_pc == 1,
+          "failed stage state, coverage, and raw shader versions round-trip offline");
+
+    GpuCaptureFile stale_raw = failed_capture;
+    stale_raw.raw_shader_versions[0].content_hash ^= 1;
+    CHECK(!serialize_gpu_capture(stale_raw, repeated, error) &&
+          error == "failed-operation raw shader content hash mismatch",
+          "writer rejects stale failed-shader content identity");
+    GpuCaptureFile bad_raw_index = failed_capture;
+    bad_raw_index.failure_diagnostics[0].stages[0].raw_shader_index = 0xfffffffeu;
+    CHECK(!serialize_gpu_capture(bad_raw_index, repeated, error) &&
+          error == "invalid failed-stage diagnostic metadata",
+          "writer rejects an out-of-range failed-shader reference");
+    GpuCaptureFile oversized_raw = failed_capture;
+    oversized_raw.raw_shader_versions[0].words.resize(0x4001, 0xbf810000u);
+    oversized_raw.raw_shader_versions[0].content_hash = gpu_capture_hash(
+        reinterpret_cast<const uint8_t*>(oversized_raw.raw_shader_versions[0].words.data()),
+        oversized_raw.raw_shader_versions[0].words.size() * sizeof(uint32_t));
+    CHECK(!serialize_gpu_capture(oversized_raw, repeated, error) &&
+          error == "failed-operation raw shader data exceeds its bounded limit",
+          "writer enforces the documented 64 KiB per-stage raw bound");
+
+    std::vector<uint8_t> legacy_bytes;
+    CHECK(serialize_gpu_capture(captured, legacy_bytes, error) && legacy_bytes.size() >= 20,
+          "created a diagnostic-free v7 payload for the legacy-reader fixture");
+    if (legacy_bytes.size() >= 20) {
+        legacy_bytes[8] = 6; legacy_bytes[9] = legacy_bytes[10] = legacy_bytes[11] = 0;
+        legacy_bytes.resize(legacy_bytes.size() - 8); // remove v7 raw-shader/diagnostic zero counts
+    }
+    GpuCaptureFile legacy_loaded;
+    CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
+          !legacy_loaded.failure_diagnostics_available && legacy_loaded.failure_diagnostics.empty(),
+          "v6 capture reopens with failed-operation diagnostics reported unavailable");
+    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 8;
+    CHECK(!deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
+          error == "unsupported capture version 8",
+          "future capture versions fail with a concrete version error");
+
     GpuCaptureFile bad_hash = mixed;
     bad_hash.blobs[0].content_hash ^= 1;
     CHECK(!write_gpu_capture(mixed_path.string(), bad_hash, error) &&
@@ -215,6 +321,7 @@ int main() {
     GpuCaptureFile bad;
     CHECK(!read_gpu_capture(truncated.string(), bad, error) && !error.empty(), "truncated capture fails loudly");
     std::filesystem::remove(path); std::filesystem::remove(truncated); std::filesystem::remove(mixed_path);
+    std::filesystem::remove(failed_path);
 
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
     std::printf("== PASS ==\n"); return 0;
