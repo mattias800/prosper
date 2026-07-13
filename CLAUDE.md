@@ -118,8 +118,9 @@ The current tooling frontier is deterministic offline capture rather than longer
 Native-speed `.prgtl` indexes retain every submit/present boundary, and an exact-submit selector can materialize
 immutable, content-deduplicated graphics/compute state plus mixed PM4 order into a version-7 `.prgcap` (#594).
 `gpu_replay --graph` / `--graph-json` now resolve in-submit versions and temporal read-before-write leaves (#600;
-full workflow: `prosper/tools/gpu_replay/README.md`). Timeline version 5 resolves those leaves against bounded
-same-run target history. Ordered `.prgbundle` windows now capture producer-time submits with content-defined
+full workflow: `prosper/tools/gpu_replay/README.md`). Timeline version 6 retains the version-5 bounded same-run
+target/depth history and adds compact per-draw target spans for offline scene selection. Ordered `.prgbundle`
+windows now capture producer-time submits with content-defined
 cross-submit deduplication and replay them through one persistent renderer (#603). Dead Cells depth 16 resolves
 all 30 internal temporal edges in submits 18735..18750 while storing 2.883 GiB logical data in 166.3 MiB, but
 the earliest submit still has two unseeded 642x362 leaves. Full-run aggregation places their first observed
@@ -129,10 +130,11 @@ Bundle v2 (#606) now uses fault-safe bulk guest reads plus an exact shared-resou
 1,200-submit full-state run folded 122.97 GiB into 301.1 MiB in 169.4 seconds. Semantic endpoints, rolling
 windows, successful-only exit, final compaction, and `gpu_replay --bundle-tail` prevent timing drift and replay
 holes. A compact two-submit closure resolves both 642x362 edges with no bounded leaves, but its 80-draw endpoint
-is the opening vignette rather than gameplay. #608 now identifies the controllable Jump tutorial without a
-submit ordinal: require exactly 90 semantic draws and the 738x420 target at semantic draw index 79..81. Target
-extent or total draw count alone also selects cinematic/transition frames and must not be used as the oracle.
-Use this checkpoint to isolate the first bad composition.
+is the opening vignette rather than gameplay. The preserved #608 playable bundle used exactly 90 semantic draws
+and the 738x420 target at draw 79..81. Current routes use 91..93 draws, exactly 8 dispatches, and the 738x420
+target at draw 80..82; two independent timelines selected only sustained gameplay from about 29.5 seconds onward.
+Target extent or total draw count alone also selects cinematic/transition frames and must not be used as the
+oracle. Use this checkpoint to isolate the first bad composition.
 The faithful playable bundle spans submits 18,165..19,047, stores 158.94 GiB logical state in 739 MiB, resolves
 all 1,764 temporal image dependencies, and renders hash `5759c125812154dc`. A fresh-depth final replay instead
 renders `71b84bdfae53933c`; `gpu_replay --bundle-find-ds ADDR` scans manifest-only DS use in seconds and proves
@@ -154,10 +156,9 @@ resource/descriptor summaries. Start with `gpu_replay --inspect-only`; extract a
 `--dump-failed-shader FAILURE:STAGE PATH` instead of rerunning the title.
 Do not treat `--bundle-final-capsule` as an exact DS checkpoint: it snapshots color RTT state, not live Vulkan
 depth/stencil images (#569). Capture v7 reads v1-v6 artifacts (failed-operation diagnostics report unavailable);
-timeline v5 remains backward-compatible with old local artifacts.
-Addresses and operation ordinals are run-local. The #608 `90 draws + 738x420 at draw 79..81` conjunction is
-also historical: a fresh 2026-07-13 route reached sustained 90-91-draw gameplay submits but did not match it.
-Recalibrate the semantic selector under #594 before a new exact capture. The Dead Cells splash guard deliberately
+timeline v6 reads timeline v1-v5 artifacts. Addresses and operation ordinals are run-local. Use
+`gpu_timeline FILE --signatures DRAWS DISPATCHES` to discover target spans and `--select` to validate the exact
+live-capture predicate before recording another detailed bundle. The Dead Cells splash guard deliberately
 uses `min_colors=1500` rather than an exact hash: unchanged builds select multiple valid animation states with
 1,650-1,698 distinct colors, while observed partial transitions contain only about 325-339.
 `PROSPER_PROVENANCE_DIM=WxH` reports overlapping color, compute, DMA_DATA, and WRITE_DATA writers with

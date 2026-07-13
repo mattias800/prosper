@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <map>
 #include <set>
+#include <sstream>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -149,9 +150,60 @@ int print_depth_summary(const GpuTimelineFile& timeline, uint32_t filter_width,
     return totals.empty() ? 1 : 0;
 }
 
+bool parse_u32_range(const char* text, uint32_t& first, uint32_t& last) {
+    const std::string value(text ? text : "");
+    const size_t colon = value.find(':');
+    auto parse_one = [](const std::string& part, uint32_t& out) {
+        if (part.empty()) return false;
+        char* end = nullptr;
+        const unsigned long long parsed = std::strtoull(part.c_str(), &end, 0);
+        if (!end || *end || parsed > UINT32_MAX) return false;
+        out = static_cast<uint32_t>(parsed);
+        return true;
+    };
+    if (colon == std::string::npos) {
+        if (!parse_one(value, first)) return false;
+        last = first;
+        return true;
+    }
+    if (value.find(':', colon + 1) != std::string::npos ||
+        !parse_one(value.substr(0, colon), first) ||
+        !parse_one(value.substr(colon + 1), last))
+        return false;
+    return first <= last;
+}
+
+bool parse_dimensions(const char* text, uint32_t& width, uint32_t& height) {
+    unsigned parsed_width = 0, parsed_height = 0;
+    char tail = 0;
+    if (!text || std::sscanf(text, "%ux%u%c", &parsed_width, &parsed_height, &tail) != 2 ||
+        !parsed_width || !parsed_height)
+        return false;
+    width = parsed_width;
+    height = parsed_height;
+    return true;
+}
+
+std::string target_signature(const GpuTimelineSubmit& submit) {
+    std::ostringstream out;
+    if (submit.target_spans.empty()) out << "unavailable";
+    for (size_t i = 0; i < submit.target_spans.size(); ++i) {
+        const auto& span = submit.target_spans[i];
+        if (i) out << ',';
+        out << span.first_draw;
+        if (span.draw_count > 1) out << '-' << (uint64_t{span.first_draw} + span.draw_count - 1);
+        out << ':' << span.width << 'x' << span.height;
+    }
+    if (submit.target_spans_truncated) out << ",truncated";
+    return out.str();
+}
+
 int main(int argc, char** argv) {
     const bool records = argc == 3 && std::string(argv[2]) == "--records";
-    const bool depth_summary = argc >= 3 && std::string(argv[2]) == "--depth-summary";
+    const bool depth_summary = (argc == 3 || argc == 4) &&
+                               std::string(argv[2]) == "--depth-summary";
+    const bool signatures = argc == 5 && std::string(argv[2]) == "--signatures";
+    const bool select = argc == 7 && std::string(argv[2]) == "--select";
     uint32_t depth_width = 0, depth_height = 0;
     if (depth_summary && argc == 4) {
         unsigned width = 0, height = 0; char tail = 0;
@@ -159,9 +211,26 @@ int main(int argc, char** argv) {
             depth_width = width; depth_height = height;
         }
     }
-    if (argc < 2 || argc > 4 || (argc == 3 && !records && !depth_summary) ||
-        (argc == 4 && (!depth_summary || !depth_width))) {
-        std::fprintf(stderr, "usage: gpu_timeline <capture.prgtl> [--records|--depth-summary [WxH]]\n");
+    uint32_t filter_min_draws = 0, filter_max_draws = 0;
+    uint32_t filter_min_dispatches = 0, filter_max_dispatches = 0;
+    uint32_t select_width = 0, select_height = 0;
+    uint32_t select_min_draw = 0, select_max_draw = 0;
+    const bool filter_ok = !signatures ||
+        (parse_u32_range(argv[3], filter_min_draws, filter_max_draws) &&
+         parse_u32_range(argv[4], filter_min_dispatches, filter_max_dispatches));
+    const bool select_ok = !select ||
+        (parse_dimensions(argv[3], select_width, select_height) &&
+         parse_u32_range(argv[4], select_min_draw, select_max_draw) &&
+         parse_u32_range(argv[5], filter_min_draws, filter_max_draws) &&
+         parse_u32_range(argv[6], filter_min_dispatches, filter_max_dispatches));
+    const bool basic = argc == 2;
+    if (argc < 2 || (!basic && !records && !depth_summary && !signatures && !select) ||
+        (depth_summary && argc == 4 && !depth_width) || !filter_ok || !select_ok) {
+        std::fprintf(stderr,
+            "usage: gpu_timeline <capture.prgtl> [--records|--depth-summary [WxH]]\n"
+            "       gpu_timeline <capture.prgtl> --signatures DRAWS DISPATCHES\n"
+            "       gpu_timeline <capture.prgtl> --select WxH DRAW_INDEX DRAWS DISPATCHES\n"
+            "ranges accept N or MIN:MAX\n");
         return 2;
     }
     GpuTimelineFile timeline;
@@ -171,6 +240,82 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (depth_summary) return print_depth_summary(timeline, depth_width, depth_height);
+    if (signatures || select) {
+        if (timeline.version < 6) {
+            std::fprintf(stderr,
+                         "gpu_timeline: target signatures require timeline version 6 (file is v%u)\n",
+                         timeline.version);
+            return 1;
+        }
+        if (signatures) {
+            struct Stats { uint64_t count = 0, first = UINT64_MAX, last = 0; };
+            std::map<std::string, Stats> grouped;
+            for (const auto& submit : timeline.submits) {
+                if (submit.draw_count < filter_min_draws || submit.draw_count > filter_max_draws ||
+                    submit.dispatch_count < filter_min_dispatches ||
+                    submit.dispatch_count > filter_max_dispatches)
+                    continue;
+                const std::string signature = "draws=" + std::to_string(submit.draw_count) +
+                    " dispatches=" + std::to_string(submit.dispatch_count) +
+                    " targets=" + target_signature(submit);
+                Stats& stats = grouped[signature];
+                ++stats.count;
+                stats.first = std::min(stats.first, submit.submit_no);
+                stats.last = std::max(stats.last, submit.submit_no);
+            }
+            for (const auto& [signature, stats] : grouped)
+                std::printf("signature submits=%llu first=%llu last=%llu %s\n",
+                            static_cast<unsigned long long>(stats.count),
+                            static_cast<unsigned long long>(stats.first),
+                            static_cast<unsigned long long>(stats.last), signature.c_str());
+            std::fprintf(stderr, "gpu_timeline: signatures=%zu\n", grouped.size());
+            return grouped.empty() ? 1 : 0;
+        }
+        GpuTimelineSelector selector;
+        selector.target_width = select_width;
+        selector.target_height = select_height;
+        selector.target_min_draw = select_min_draw;
+        selector.target_max_draw = select_max_draw;
+        selector.min_draws = filter_min_draws;
+        selector.max_draws = filter_max_draws;
+        selector.min_dispatches = filter_min_dispatches;
+        selector.max_dispatches = filter_max_dispatches;
+        uint64_t matches = 0;
+        uint64_t incomplete_candidates = 0;
+        const GpuTimelineSubmit* first_match = nullptr;
+        const GpuTimelineSubmit* last_match = nullptr;
+        for (const auto& submit : timeline.submits) {
+            if (submit.target_spans_truncated &&
+                submit.draw_count >= selector.min_draws && submit.draw_count <= selector.max_draws &&
+                submit.dispatch_count >= selector.min_dispatches &&
+                submit.dispatch_count <= selector.max_dispatches)
+                ++incomplete_candidates;
+            if (!gpu_timeline_submit_matches(submit, selector)) continue;
+            if (!first_match) first_match = &submit;
+            last_match = &submit;
+            ++matches;
+        }
+        auto print_match = [](const char* label, const GpuTimelineSubmit& submit) {
+            std::printf("%s submit=%llu t=%.6f draws=%u dispatches=%u targets=%s\n", label,
+                        static_cast<unsigned long long>(submit.submit_no), submit.elapsed_ns / 1e9,
+                        submit.draw_count, submit.dispatch_count, target_signature(submit).c_str());
+        };
+        if (first_match) {
+            print_match("first-match", *first_match);
+            if (last_match != first_match) print_match("last-match", *last_match);
+        }
+        std::fprintf(stderr, "gpu_timeline: matches=%llu%s\n",
+                     static_cast<unsigned long long>(matches),
+                     matches ? " (capture selects first match)" : "");
+        if (incomplete_candidates) {
+            std::fprintf(stderr,
+                         "gpu_timeline: selector is inconclusive: %llu count-matching submits have "
+                         "truncated target spans\n",
+                         static_cast<unsigned long long>(incomplete_candidates));
+            return 2;
+        }
+        return matches ? 0 : 1;
+    }
 
     uint64_t last_ns = 0, draws = 0, dispatches = 0;
     std::map<std::pair<uint32_t, uint32_t>, uint64_t> target_extents;
@@ -285,6 +430,14 @@ int main(int argc, char** argv) {
                                     static_cast<unsigned long long>(depth.backing_writer_size),
                                     static_cast<unsigned long long>(depth.backing_writer_order),
                                     static_cast<unsigned long long>(depth.backing_writer_identity));
+                for (const auto& span : s.target_spans)
+                    std::printf("  target-span draws=%u..%llu target=%ux%u\n",
+                                span.first_draw,
+                                static_cast<unsigned long long>(
+                                    uint64_t{span.first_draw} + span.draw_count - 1),
+                                span.width, span.height);
+                if (s.target_spans_truncated)
+                    std::printf("  target-spans truncated=yes\n");
             } else if (ps <= ds && ps <= xs) {
                 const auto& p = timeline.presents[pi++];
                 std::printf("%llu %.6f present=%llu latest-submit=%llu buffer=%d flip-arg=%lld extent=%ux%u\n",

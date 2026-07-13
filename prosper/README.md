@@ -33,8 +33,9 @@ possible without console keys. Dumps are user-supplied and gitignored.
 - ✅ **Graphics investigation tooling:** versioned live GPU capture/replay (`.prgcap`), per-draw/resource
   inspection and isolation, strict reflected SPIR-V/runtime descriptor validation, render-target producer
   provenance, normal screenshot capture, and a local content-metric snapshot guard. Native-speed `.prgtl`
-  submit/present indexes can select one exact submit before renderer sampling and materialize immutable,
-  content-deduplicated graphics/compute state plus mixed operation order for offline replay (#594).
+  submit/present indexes can select an exact submit or semantic route checkpoint before renderer sampling and
+  materialize immutable, content-deduplicated graphics/compute state plus mixed operation order for offline
+  replay (#594).
   Offline dependency graphs resolve in-submit resource versions and identify deduplicated prior-submit
   leaves, including temporal read-before-write surfaces, without invoking Vulkan (#595). Capture v7 retains
   bounded, content-addressed raw RDNA2 and exact opcode/PC/state diagnostics for unrealized draws/dispatches;
@@ -58,10 +59,10 @@ possible without console keys. Dumps are user-supplied and gitignored.
   chunks, rolling semantic endpoints, final compaction, and suffix replay (#606). A fixed 1,200-submit full-state
   run reduced 122.97 GiB logical data to 301.1 MiB. A compact exact two-submit closure resolves both temporal
   642×362 edges without bounded leaves, but the first 80-draw semantic endpoint is the opening vignette rather
-  than playable gameplay. #608 selected the controllable Jump tutorial by combining an exact 90-draw submit
-  with the 738x420 pass at semantic draw 79..81, and tracked its exact history and first bad composition. That
-  exact conjunction is now a preserved-capture recipe: current fresh routes reach sustained gameplay but no
-  longer match it, so selector recalibration remains under #594.
+  than playable gameplay. The preserved #608 bundle selected the Jump tutorial with exactly 90 draws and the
+  738x420 pass at draw 79..81. Current routes are selected without submit ordinals by combining 91..93 semantic
+  draws, exactly 8 dispatches, and that pass at draw 80..82. Timeline v6 records compact target spans so the
+  predicate can be discovered and validated offline before an expensive detailed capture (#594).
   The faithful 883-submit closure resolves 1,764 temporal image dependencies and established the stale-depth
   failure. The draw stream has no `DB_RENDER_CONTROL` clear because hardware observes the compute-written
   HTILE metadata instead; #611 implements that missing cache boundary. #569 still tracks exact depth/stencil
