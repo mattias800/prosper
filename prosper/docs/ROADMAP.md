@@ -44,10 +44,15 @@ presented, framebuffer CRC == golden" is. Each change adds the check that proves
   Graphics spans and compute now execute by that retained PM4 order (#584). Per-consumer hashes and target-prefix
   metrics proved the later overbright screenshot was a warmup artifact: a skipped temporal RTT fell back to an
   all-`0xFF` compute backing, then the bad copy persisted. Preserving the 642x362 producers renders real geometry.
-- **Immediate milestone:** build a practical late Dead Cells checkpoint with required RTT history intact (#586).
-  Separately, resolve the seeded replay hash
-  mismatch (#569) and animation-sensitive splash
-  snapshot (#573), while continuing the same capture/replay workflow across Unity and Unreal targets.
+  The faithful playable closure subsequently isolated a second lifetime bug: one detached Vulkan depth image
+  accumulated across 883 submits even though a supported compute kernel filled its 32 KiB HTILE allocation
+  with `0xfffffff0` before every scene pass. Timeline-v5 depth backing hashes/writer provenance found the exact
+  writer, and guest GPU writes now invalidate overlapping persistent DS cache entries (#611). A routed live A/B
+  restores the layers rejected without that boundary.
+- **Immediate milestone:** finish the remaining Dead Cells composition gaps using the same semantic checkpoint.
+  Implement the four repeated fragment control-flow failures (#615), resolve exact depth/stencil checkpointing (#569),
+  and refresh the stale animation-sensitive snapshot (#596/#573). Keep extending the workflow across Unity and
+  Unreal targets rather than returning to long unstructured live traces.
 
 ## Historical status (2026-07-05) - retained for the milestone log
 

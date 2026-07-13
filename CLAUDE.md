@@ -106,17 +106,17 @@ draw 19 consumes one backing, dispatch 5 fills it, then draw 31 consumes it agai
 compute now execute by retained PM4 order (#584), fixing that future-read. The later overbright screenshot was a
 warmup artifact: the 35-second render delay skipped a 642x362 RTT producer, then a replace-copy sampled dispatch
 4's raw all-`0xFF` backing and cached it indefinitely. `PROSPER_RENDER_TARGET_DIM=642x362` preserves the real
-opening vignette/level geometry; #586 now tracks a practical late checkpoint with that history intact. The
-residual seeded replay mismatch (#569) is persistent depth/stencil state outside color RTT seeds: the faithful
-playable closure reuses one 642x362 depth surface across all 883 submits with LESS_OR_EQUAL writes/tests and no
-captured clears, so stale depth rejects most world geometry (#611). The animation-sensitive exact splash guard
-(#573) remains separate.
+opening vignette/level geometry; #586 established a practical late checkpoint with that history intact. The
+residual seeded replay mismatch (#569) exposed persistent depth/stencil state outside color RTT seeds. The
+faithful closure reuses one 642x362 depth identity, but timeline-v5 backing provenance proves compute fills its
+HTILE allocation before drawing; #611 now invalidates the detached Vulkan DS cache on that guest GPU write.
+The animation-sensitive exact splash guard (#573) remains separate.
 
 The current tooling frontier is deterministic offline capture rather than longer live-render windows.
 Native-speed `.prgtl` indexes retain every submit/present boundary, and an exact-submit selector can materialize
-immutable, content-deduplicated graphics/compute state plus mixed PM4 order into a version-5 `.prgcap` (#594).
+immutable, content-deduplicated graphics/compute state plus mixed PM4 order into a version-6 `.prgcap` (#594).
 `gpu_replay --graph` / `--graph-json` now resolve in-submit versions and temporal read-before-write leaves (#600;
-full workflow: `prosper/tools/gpu_replay/README.md`). Timeline version 4 resolves those leaves against bounded
+full workflow: `prosper/tools/gpu_replay/README.md`). Timeline version 5 resolves those leaves against bounded
 same-run target history. Ordered `.prgbundle` windows now capture producer-time submits with content-defined
 cross-submit deduplication and replay them through one persistent renderer (#603). Dead Cells depth 16 resolves
 all 30 internal temporal edges in submits 18735..18750 while storing 2.883 GiB logical data in 166.3 MiB, but
@@ -134,8 +134,15 @@ Use this checkpoint to isolate the first bad composition.
 The faithful playable bundle spans submits 18,165..19,047, stores 158.94 GiB logical state in 739 MiB, resolves
 all 1,764 temporal image dependencies, and renders hash `5759c125812154dc`. A fresh-depth final replay instead
 renders `71b84bdfae53933c`; `gpu_replay --bundle-find-ds ADDR` scans manifest-only DS use in seconds and proves
-the shared surface has no clear intent. Do not treat `--bundle-final-capsule` as exact until its standalone hash
-matches: it snapshots color RTT state, not live Vulkan depth/stencil images.
+the shared surface has no draw/register clear intent. The missing hardware boundary is now identified and
+implemented (#611): timeline-v5 retains complete raw DS programming plus optional guest backing hashes/writer
+provenance, which found compute program `0x401aec200` filling the exact 32 KiB HTILE allocation with
+`0xfffffff0` before scene drawing. Guest GPU writes notify the live backend, and overlapping persistent Vulkan
+DS entries become invalid so the next use follows the existing compare-derived clear path. A routed live A/B
+restores the foreground/platform/HUD layers that remain black with invalidation disabled. The explicit
+`--legacy-htile-before-stencil` switch supplies the omitted HTILE identity only for the preserved pre-v6 bundle.
+Do not treat `--bundle-final-capsule` as an exact DS checkpoint: it snapshots color RTT state, not live Vulkan
+depth/stencil images (#569). Capture v6 and timeline v5 remain backward-compatible with old local artifacts.
 Addresses and operation ordinals are run-local. The stale exact Dead Cells snapshot baseline is
 tracked separately in #596 and must not be silently updated.
 `PROSPER_PROVENANCE_DIM=WxH` reports overlapping color, compute, DMA_DATA, and WRITE_DATA writers with

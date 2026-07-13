@@ -74,8 +74,10 @@ accepts scripted gamepad input, and renders the first level.
   producers. Versioned offline bundles now retain long, exact cross-submit resource history and replay a
   minimized closure. #608 now defines a run-local semantic checkpoint for the controllable Jump tutorial:
   exactly 90 semantic draws with the 738x420 pass at draw index 79..81. Its faithful 883-submit replay
-  isolates the remaining missing-world symptom to a persistent 642x362 depth surface that is never cleared
-  in the captured draw/register stream (#611), rather than another missing color RTT.
+  isolated the missing-world symptom to a persistent 642x362 depth surface. Timeline-v5 backing hashes and
+  writer provenance then found the real clear boundary: a supported compute kernel fills the surface's
+  32 KiB HTILE allocation with `0xfffffff0` before drawing. Guest GPU writes now invalidate overlapping
+  cached Vulkan depth images, restoring the rejected gameplay layers in a routed live A/B (#611).
 
 **Frontend:** `prosper-app` is a windowed player (SDL3 window + Vulkan present + audio sink +
 evdev/SDL3 controllers + real message/error/IME dialogs), sharing the same boot + render core as the

@@ -32,6 +32,7 @@ namespace prosper::gpu {
 namespace {
 LiveRenderFn g_live;   // empty until the runtime/test registers a device-backed renderer
 LiveComputeFn g_compute;   // synchronous compute backend, registered with the live Vulkan frontend
+GuestGpuWriteObserver g_guest_gpu_write_observer;
 thread_local LiveRenderPhase g_live_phase;
 
 // Read a 32-dword user-data SGPR block from a stage's register file. `base` = the stage's
@@ -1326,6 +1327,12 @@ void set_submit_renderer(LiveRenderFn fn) { g_live = std::move(fn); }
 bool have_submit_renderer()               { return static_cast<bool>(g_live); }
 void set_submit_compute(LiveComputeFn fn) { g_compute = std::move(fn); }
 bool have_submit_compute()                { return static_cast<bool>(g_compute); }
+void set_guest_gpu_write_observer(GuestGpuWriteObserver observer) {
+    g_guest_gpu_write_observer = std::move(observer);
+}
+void notify_guest_gpu_write(uint64_t addr, uint64_t size) {
+    if (addr && size && g_guest_gpu_write_observer) g_guest_gpu_write_observer(addr, size);
+}
 LiveRenderPhase live_render_phase()       { return g_live_phase; }
 std::vector<uint8_t> render_submit_items(const std::vector<DrawItem>& items,
                                          uint32_t width, uint32_t height) {

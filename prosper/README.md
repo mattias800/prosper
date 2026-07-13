@@ -38,9 +38,12 @@ possible without console keys. Dumps are user-supplied and gitignored.
   Offline dependency graphs resolve in-submit resource versions and identify deduplicated prior-submit
   leaves, including temporal read-before-write surfaces, without invoking Vulkan (#595).
 - ✅ **Dead Cells reaches gameplay reproducibly:** a deterministic input route passes the splash and menus
-  into the first playable scene. HUD and some composition render, but most world geometry is rejected after
-  a long history (#611).
-  Version-5 GPU captures seed temporal render targets and retain content-addressed resource versions for
+  into the first playable scene. The persistent-depth rejection is fixed: timeline-v5 backing hashes and
+  compute writer provenance identify Unity's 32 KiB HTILE fill as the per-frame fast clear, and overlapping
+  guest GPU writes now invalidate the detached Vulkan depth cache (#611). A routed live A/B restores the
+  foreground/platform/HUD layers that remained black without invalidation.
+  Version-6 GPU captures seed temporal render targets, retain complete depth-surface programming, and keep
+  content-addressed resource versions for
   faithful offline isolation (#568/#594); one residual
   live/replay hash mismatch remains (#569). Dispatch thread counts and derived workgroup dimensions,
   compute program binding, direct type-1 buffers, and mixed graphics/compute PM4 order now execute correctly
@@ -51,9 +54,10 @@ possible without console keys. Dumps are user-supplied and gitignored.
   642×362 edges without bounded leaves, but the first 80-draw semantic endpoint is the opening vignette rather
   than playable gameplay. #608 now selects the controllable Jump tutorial by combining an exact 90-draw submit
   with the 738x420 pass at semantic draw 79..81, and tracks its exact history and first bad composition.
-  The faithful 883-submit closure resolves 1,764 temporal image dependencies but reuses one 642x362 depth
-  surface with LESS_OR_EQUAL writes and zero clears across every retained submit; #611 tracks the missing
-  clear/lifetime boundary and #569 tracks depth/stencil checkpoint serialization.
+  The faithful 883-submit closure resolves 1,764 temporal image dependencies and established the stale-depth
+  failure. The draw stream has no `DB_RENDER_CONTROL` clear because hardware observes the compute-written
+  HTILE metadata instead; #611 implements that missing cache boundary. #569 still tracks exact depth/stencil
+  checkpoint serialization, and #615 tracks four fragment control-flow failures at the playable endpoint.
   The stale exact Dead Cells
   snapshot baseline is tracked separately in #596. UE4's measured GPU boundary remains under its area issues.
 

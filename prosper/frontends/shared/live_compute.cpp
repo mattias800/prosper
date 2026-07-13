@@ -105,9 +105,31 @@ uint64_t fnv1a(const void* data, size_t size) {
     return hash;
 }
 
+bool trace_compute_item(const prosper::gpu::ComputeItem& item) {
+    if (std::getenv("PROSPER_COMPUTELOG")) return true;
+    const char* code_env = std::getenv("PROSPER_COMPUTELOG_CODE");
+    const char* size_env = std::getenv("PROSPER_COMPUTELOG_SIZE");
+    if ((!code_env || !*code_env) && (!size_env || !*size_env)) return false;
+    if (code_env && *code_env) {
+        char* end = nullptr;
+        const uint64_t wanted = std::strtoull(code_env, &end, 0);
+        if (!end || *end || item.code_addr != wanted) return false;
+    }
+    if (size_env && *size_env) {
+        char* end = nullptr;
+        const unsigned long wanted = std::strtoul(size_env, &end, 0);
+        if (!end || *end || !item.resources) return false;
+        const auto found = std::find_if(item.resources->resources.begin(),
+                                       item.resources->resources.end(),
+            [&](const auto& resource) { return resource.size == wanted; });
+        if (found == item.resources->resources.end()) return false;
+    }
+    return true;
+}
+
 bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& item) {
     using namespace prosper::gpu;
-    const bool trace = std::getenv("PROSPER_COMPUTELOG") != nullptr;
+    const bool trace = trace_compute_item(item);
     auto report = validate_spirv_descriptor_interface(
         item.spirv, item.resources.get(), 0, SpirvShaderStage::Compute, false);
     if (!report.ok()) return false;
@@ -281,6 +303,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
             std::memcpy(destination, result, buffer.resource->size);
             vkUnmapMemory(ctx.device, buffer.memory);
+            notify_guest_gpu_write(buffer.resource->gpu_addr, buffer.resource->size);
             if (!buffer.resource->host_data && writer_provenance_enabled())
                 record_guest_write(GuestWriterKind::ComputeBuffer,
                                    buffer.resource->gpu_addr, buffer.resource->size,

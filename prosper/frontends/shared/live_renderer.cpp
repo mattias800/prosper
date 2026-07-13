@@ -43,6 +43,14 @@ namespace { struct RttSurf { std::vector<uint8_t> rgba; uint32_t w = 0, h = 0; }
 
 void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
     register_live_compute();
+    const char* ds_invalidate = getenv("PROSPER_DS_GUEST_WRITE_INVALIDATE");
+    if (!ds_invalidate || strcmp(ds_invalidate, "0"))
+        prosper::gpu::set_guest_gpu_write_observer(
+            [](uint64_t addr, uint64_t size) {
+                prosper::test::invalidate_persistent_ds_guest_write(addr, size);
+            });
+    else
+        prosper::gpu::set_guest_gpu_write_observer({});
     // Resource tables are built before the submit reaches this callback. Publish the renderer's
     // default mode now so unmapped render-target descriptors remain available for RTT injection.
     // Outside a registered renderer, resource decoding retains its strict unknown-format policy.

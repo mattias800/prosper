@@ -122,6 +122,36 @@ int main() {
               "ordered executor brackets one submit across two graphics spans");
     }
 
+    // #611: a compute fast-clear writes HTILE guest memory between graphics spans. The detached
+    // Vulkan depth image must be invalidated through the core's backend-agnostic write observer.
+    {
+        auto& cache = prosper::test::persistent_ds_cache();
+        cache.clear();
+        prosper::test::PersistentDsKey scene;
+        scene.dr = 0x100000; scene.dw = 0x100000;
+        scene.sr = 0x200000; scene.sw = 0x200000;
+        scene.htile = 0x300000; scene.w = 642; scene.h = 362; scene.fmt = 1;
+        auto& image = cache[scene];
+        image.depth_valid = true;
+        image.stencil_valid = true;
+        set_guest_gpu_write_observer([](uint64_t addr, uint64_t size) {
+            prosper::test::invalidate_persistent_ds_guest_write(addr, size);
+        });
+        notify_guest_gpu_write(0x300000, 0x8000);
+        CHECK(!image.depth_valid && !image.stencil_valid,
+              "HTILE guest write invalidates both cached Vulkan DS planes");
+        image.depth_valid = image.stencil_valid = true;
+        notify_guest_gpu_write(0x100100, 16);
+        CHECK(!image.depth_valid && !image.stencil_valid,
+              "partial write inside a depth plane invalidates the cached Vulkan DS image");
+        image.depth_valid = image.stencil_valid = true;
+        notify_guest_gpu_write(0x400000, 0x8000);
+        CHECK(image.depth_valid && image.stencil_valid,
+              "unrelated guest write preserves cached Vulkan DS planes");
+        set_guest_gpu_write_observer({});
+        cache.clear();
+    }
+
     // --- Indexed draws through the executor (issue #64) -------------------------------------------------
     // realize_draw_item fetches a REAL 16-bit guest index buffer (index_type 0, the SetIndexType reset
     // default this title relies on) and the backend renders it with vkCmdDrawIndexed — gl_VertexIndex is

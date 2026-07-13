@@ -45,6 +45,10 @@ prompt, and the full HUD. Nearby cinematic and transition captures are explicitl
 
 The faithful playable reference on #608 retained 883 submits and renders hash
 `5759c125812154dc`. A final-submit replay with fresh depth renders `71b84bdfae53933c` instead. Use
-`gpu_replay --bundle-find-ds ADDR` to scan a bundle's depth/stencil identity, tests, writes, clears, and
-target extents without reconstructing resource payloads or invoking Vulkan. #611 tracks the observed
-642x362 depth surface reused throughout the closure with no captured clear.
+`gpu_replay --bundle-ds-summary` to scan every depth/stencil identity and raw programming variant without
+reconstructing resource payloads or invoking Vulkan. Timeline-v5 `--depth-summary 642x362`, enabled during
+capture with `PROSPER_GPU_TIMELINE_DEPTH_HASH_DIM=642x362`, found that the stable surface backing changed via
+compute: program `0x401aec200` fills the 32 KiB HTILE block with `0xfffffff0` before the scene draws. #611 now
+invalidates overlapping persistent Vulkan depth/stencil images on guest GPU writes, restoring the rejected
+layers. The 35-second screenshot warmup still skips color RTT history and therefore remains an overbright
+progression diagnostic, not a color-correct gameplay oracle.
