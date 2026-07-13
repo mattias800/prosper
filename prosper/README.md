@@ -54,11 +54,14 @@ possible without console keys. Dumps are user-supplied and gitignored.
   faithful offline isolation (#568/#594/#569). Dispatch thread counts and derived workgroup dimensions,
   compute program binding, direct type-1 buffers, and mixed graphics/compute PM4 order now execute correctly
   (#580/#576/#584).
-- 🚧 **Blasphemous 2 reaches its title and EULA:** prelinking the title's optional FMOD core/studio
+- 🚧 **Blasphemous 2 passes its EULA and loads gameplay content:** prelinking the title's optional FMOD core/studio
   plugins lets IL2CPP P/Invoke complete `FMODAudioBanksManager` initialization (#638/#640). The later AGC
   fault was prosper corrupting live DCB state: `+kSrjIVxKFE` is `sceAgcDcbPushMarker`, not the context
-  constructor modeled by the old workaround (#641). The current routed boundary is the offline HTTP path
-  after accepting the EULA, where success-returning Http2 stubs leave invalid handles/outputs (#642).
+  constructor modeled by the old workaround (#641). A dedicated two-pass `sceHttpUriParse` implementation
+  replaces the success-with-stale-output stub that crashed the title's telemetry worker (#642). The routed
+  run continues through its Http2 calls and loads gameplay scenes, UI, enemies, bosses, audio banks, and
+  cutscene assets. Its current boundary is a normal-return guest pthread restoring guest `%fs` before glibc
+  performs host TLS cleanup (#644).
 - 🚧 **Active frontiers:** bundle v2 makes long Dead Cells history practical with exact shared-resource
   chunks, rolling semantic endpoints, final compaction, and suffix replay (#606). A fixed 1,200-submit full-state
   run reduced 122.97 GiB logical data to 301.1 MiB. A compact exact two-submit closure resolves both temporal

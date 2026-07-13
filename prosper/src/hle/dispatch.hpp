@@ -81,6 +81,8 @@ void savedata0_umount();
 std::vector<std::string> savedata0_list_dirs();   // existing save dirs under the host save root (#299)
 // PS5 system services (user/NP/mouse/appcontent/dialog); called by register_builtin_hle().
 void register_service_hle();
+// libSceHttp local URI helpers; called by register_builtin_hle().
+void register_http_hle();
 // libScePad game-controller input (real host controller via input/pad.cpp); called by register_builtin_hle().
 void register_pad_hle();
 // Headless graphics bring-up (libSceAgc/libSceVideoOut placeholders); see hle_graphics.cpp.

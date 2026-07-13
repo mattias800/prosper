@@ -6,9 +6,10 @@ from `prosper/` so relative script paths resolve.
 ## Current Route
 
 `reach-first-gameplay.pad` is an exploratory Cross-tap route anchored to the
-first pad poll. On #641 stacked over #640 it passes the studio logos, title, and
-EULA, then reaches the offline HTTP boundary tracked by #642. It does not yet
-reach gameplay; tighten the taps only after that service boundary is fixed.
+first pad poll. It passes the studio logos, title, and EULA. With the local URI
+parser from #642, it also passes the title's telemetry calls and loads gameplay
+scenes and assets. The current run stops at the normal-return pthread/TLS cleanup
+boundary tracked by #644, before a gameplay screenshot is confirmed.
 
 Capture one full-resolution PNG per second with:
 
@@ -22,4 +23,5 @@ PROSPER_PAD_SCRIPT=@scripts/blasphemous2/reach-first-gameplay.pad \
 
 The title's optional `libfmodstudio.prx` and `libfmod.prx` must be prelinked as
 described by #638/#640. A run that stops before the first studio logo has not
-reached the #641/#642 frontier.
+reached the #641 marker fix; a run that faults at guest `eboot+0x11f79d0` has not
+picked up the #642 URI parser.

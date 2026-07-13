@@ -93,6 +93,11 @@ Two later fixes complete the hardware-oracle composition and restore boot progre
 cannot poison the intro's reverse-Z depth plane. A clean scripted route produced 180 native 1920×1080 frames,
 and the user confirmed the first-level graphics match the hardware reference. #530 and #540 are closed.
 
+*Blasphemous 2* now passes FMOD initialization (#638/#640), renders its logos/title/EULA after the corrected
+AGC marker implementation (#641), and passes the post-EULA telemetry parser after `sceHttpUriParse` gained its
+two-pass caller-pool contract (#642). The route loads gameplay scenes and assets; the next boundary is the
+normal-return guest pthread TLS cleanup bug tracked by #644. Use `scripts/blasphemous2/README.md` for the route.
+
 Cross-title breadth has advanced: *Dead Cells* now starts reliably after the AGC resource-name fix (#544), its
 exercised NGS2 lifecycle returns initialized sizes/handles/state and silent output (#554), and a late render
 window reaches the Evil Empire splash. #545 was software-render throughput, not a guest deadlock: synchronous

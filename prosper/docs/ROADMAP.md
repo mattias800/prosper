@@ -159,6 +159,9 @@ Turn the file into a resident, relocated guest image in host memory.
       `+kSrjIVxKFE` as `sceAgcDcbPushMarker`. The temporary context-init workaround was also wrong
       and was removed by #641 after it was shown to clear live DCB state. See `docs/AGC_TRACE.md` and
       the correction in `docs/GRAPHICS.md` rather than restarting the locale/context theory.
+- [x] `sceHttpUriParse` implements its two-pass caller-pool contract and initializes the public URI
+      element layout (#642). This removes Blasphemous 2's post-EULA stale-pointer crash and advances
+      its route to the guest pthread exit boundary tracked by #644.
 - [x] Dependent-module `init_array` (C++ global ctors) now run before entry — the key
       unlock that let IL2CPP's runtime initialize.
 - [x] locale/ctype tables; `sync_on_address` futex (Linux `futex(2)`); C++ new/delete; stdio.
