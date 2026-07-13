@@ -17,6 +17,8 @@ PROSPER_PAD_SCRIPT=@scripts/dead-cells/reach-first-gameplay.pad \
 ./build-linux/gpu_timeline /tmp/dead-cells.prgtl
 ./build-linux/gpu_timeline /tmp/dead-cells.prgtl --records
 ./build-linux/gpu_timeline /tmp/dead-cells.prgtl --depth-summary 642x362
+./build-linux/gpu_timeline /tmp/dead-cells.prgtl --signatures 91:93 8
+./build-linux/gpu_timeline /tmp/dead-cells.prgtl --select 738x420 80:82 91:93 8
 ```
 
 Capture a selected submit and, optionally, its immediate predecessor from the same run:
@@ -49,9 +51,11 @@ PROSPER_GPU_TIMELINE_CAPTURE_DEPTH=1000 \
 PROSPER_GPU_TIMELINE_CAPTURE_MAX_UNIQUE_MB=1024 \
 PROSPER_GPU_TIMELINE_CAPTURE_START_TARGET_DIM=642x362 \
 PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM=738x420 \
-PROSPER_GPU_TIMELINE_CAPTURE_TARGET_DRAW_INDEX=79:81 \
-PROSPER_GPU_TIMELINE_CAPTURE_MIN_DRAWS=90 \
-PROSPER_GPU_TIMELINE_CAPTURE_MAX_DRAWS=90 \
+PROSPER_GPU_TIMELINE_CAPTURE_TARGET_DRAW_INDEX=80:82 \
+PROSPER_GPU_TIMELINE_CAPTURE_MIN_DRAWS=91 \
+PROSPER_GPU_TIMELINE_CAPTURE_MAX_DRAWS=93 \
+PROSPER_GPU_TIMELINE_CAPTURE_MIN_DISPATCHES=8 \
+PROSPER_GPU_TIMELINE_CAPTURE_MAX_DISPATCHES=8 \
 PROSPER_GPU_TIMELINE_EXIT_AFTER_CAPTURE=1 \
   ./build-linux/boot_trace /path/to/PPSA15552-app0
 
@@ -64,7 +68,11 @@ semantics, draw isolation, resource/shader extraction, and the distinction betwe
 
 The summary reports duration, submit/present/draw/dispatch counts, rates, target extents, and whether
 an incomplete final record was discarded. `--records` prints the globally ordered submit/present
-index. Version-2+ detail records link the selected submit to its `.prgcap` and report semantic versus
+index plus v6 target spans. `--signatures DRAWS DISPATCHES` groups target-span sequences for candidate
+submit-count ranges; each range accepts `N` or `MIN:MAX`. `--select WxH DRAW_INDEX DRAWS DISPATCHES` applies
+the same semantic predicate as live capture, reports its first/last match and total, and exits nonzero when no
+submit matches. It reports an inconclusive error instead of treating a truncated target signature as a negative.
+Version-2+ detail records link the selected submit to its `.prgcap` and report semantic versus
 realized draw/dispatch counts, missing operations, unique shader/resource versions, and resource bytes.
 Run metadata includes the revision, title, and input route when the corresponding capture environment
 variables are set.
@@ -82,11 +90,15 @@ variables are set.
 
 ## Current boundary
 
-Version 5 remains backward-compatible with version-1 through version-4 indexes. Every submit now retains a
-compact manifest of distinct depth/stencil surfaces without realizing shaders or copying general resources:
-plane and HTILE bases, raw view/format/size/override programming, target extent, draw/test/write/clear counts,
-and compare-op coverage. `gpu_timeline FILE --depth-summary [WxH]` groups complete lifetimes and reports raw
-programming transitions. This is the fast first check for a stale persistent DS cache identity.
+Version 6 reads version-1 through version-5 indexes. It adds run-length encoded color-target extent spans over
+the semantic draw sequence, excluding run-local addresses, so scene predicates can be discovered and tested
+offline before a detailed rerun. Span storage is bounded and an incomplete signature is marked truncated.
+
+Version 5 added a compact per-submit manifest of distinct depth/stencil surfaces without realizing shaders or
+copying general resources: plane and HTILE bases, raw view/format/size/override programming, target extent,
+draw/test/write/clear counts, and compare-op coverage. `gpu_timeline FILE --depth-summary [WxH]` groups
+complete lifetimes and reports raw programming transitions. This is the fast first check for a stale persistent
+DS cache identity.
 
 Set `PROSPER_GPU_TIMELINE_DEPTH_HASH_DIM=WxH` only for a focused native run. Matching submits hash the readable
 guest depth, stencil, and padded HTILE spans and record the latest overlapping graphics/compute/DMA/WRITE_DATA
@@ -116,8 +128,10 @@ stage coverage, first rejected opcode/PC, decoded state, and failure reason. Ins
 submit as complete. A timeline-selected capsule has no live-output hash oracle unless the renderer also
 produced one; replay reports `oracle=no` and renders without pretending an expected pixel hash exists.
 
-The capture is selected by exact submit number, not yet by route checkpoint or present. It contains the
-selected submit and temporal RTT surfaces currently resident in the renderer, but does not automatically
+Without a semantic endpoint predicate, capture uses the exact configured submit. With target/draw/dispatch
+conditions, that submit becomes a lower bound and the first matching route checkpoint is selected. Present
+selection is not implemented. A capsule contains the selected submit and temporal RTT surfaces currently
+resident in the renderer, but does not automatically
 pull earlier producer submits. Automatic present-to-producer dependency closure is tracked by #595.
 `gpu_replay --graph` resolves dependencies inside the selected submit and reports the remaining external
 versions; a `future-writer` on an external leaf is the characteristic temporal read-before-write case that
@@ -165,3 +179,5 @@ compacts unreachable dictionary entries before installing the bundle.
 `PROSPER_GPU_TIMELINE_CAPTURE_TARGET_DRAW_INDEX=MIN:MAX` restricts the matching target to a zero-based
 semantic draw-index window. Establish the range across multiple desired captures and nearby negative samples;
 realized replay indices can differ when earlier semantic draws are unrealized.
+`PROSPER_GPU_TIMELINE_CAPTURE_MIN_DISPATCHES=N` and
+`PROSPER_GPU_TIMELINE_CAPTURE_MAX_DISPATCHES=N` restrict the same checkpoint by semantic dispatch count.

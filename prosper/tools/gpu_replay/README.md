@@ -165,7 +165,7 @@ faithful replacement for the missing producer history.
 
 ## Current Dead Cells reference
 
-The #608 playable closure selects exactly 90 semantic draws with the 738x420 pass at draw 79..81. Its retained
+The preserved #608 playable closure selects exactly 90 semantic draws with the 738x420 pass at draw 79..81. Its retained
 submits 18,165..19,047 represent 158.94 GiB logically and 739 MiB uniquely. Replay resolves 1,764 temporal image
 dependencies with zero bounded/unresolved leaves and renders hash `5759c125812154dc`. A complete-color-cache
 final capsule renders `71b84bdfae53933c` because it begins with fresh depth. Manifest scanning shows the same
@@ -175,6 +175,10 @@ clear. Timeline-v5 backing hashes and writer provenance resolve the missing boun
 backend now invalidates overlapping persistent DS entries on guest GPU writeback (#611); a routed A/B restores
 the layers that stayed black with invalidation disabled. #569 remains the exact DS checkpoint gap, not another
 color RTT producer.
+
+For new routed captures, timeline v6 replaces that historical endpoint with 91..93 semantic draws, exactly
+8 dispatches, and the 738x420 pass at draw 80..82. `gpu_timeline --signatures` derived the conjunction from two
+independent routes, and `--select` proves it has no splash/menu/loading or adjacent-index matches before capture.
 
 The #594/#595 gameplay capsule at submit 18,750 has two external 642x362 temporal versions. Timeline-v4
 full-run aggregation shows that both surfaces begin around submit 17,400 in current runs and are rewritten

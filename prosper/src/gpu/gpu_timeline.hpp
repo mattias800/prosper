@@ -40,6 +40,15 @@ struct GpuTimelineDepthSurface {
     uint64_t backing_writer_order = 0, backing_writer_identity = 0;
 };
 
+// Consecutive semantic draws that use the same color-target extent. Addresses are deliberately
+// excluded: they are run-local, while the extent/order signature is useful across routed boots.
+struct GpuTimelineTargetSpan {
+    uint32_t first_draw = 0;
+    uint32_t draw_count = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+};
+
 struct GpuTimelineSubmit {
     uint64_t sequence = 0;
     uint64_t elapsed_ns = 0;
@@ -53,6 +62,22 @@ struct GpuTimelineSubmit {
     uint32_t color0_width = 0;
     uint32_t color0_height = 0;
     std::vector<GpuTimelineDepthSurface> depth_surfaces;
+    std::vector<GpuTimelineTargetSpan> target_spans;
+    bool target_spans_truncated = false;
+};
+
+// Shared by live detailed-capture selection and offline timeline inspection. A zero target extent
+// disables target matching; all numeric ranges are inclusive.
+struct GpuTimelineSelector {
+    uint64_t min_submit_no = 1;
+    uint32_t target_width = 0;
+    uint32_t target_height = 0;
+    uint32_t target_min_draw = 0;
+    uint32_t target_max_draw = UINT32_MAX;
+    uint32_t min_draws = 0;
+    uint32_t max_draws = UINT32_MAX;
+    uint32_t min_dispatches = 0;
+    uint32_t max_dispatches = UINT32_MAX;
 };
 
 struct GpuTimelinePresent {
@@ -156,6 +181,8 @@ private:
 };
 
 bool read_gpu_timeline(const std::string& path, GpuTimelineFile& timeline, std::string& error);
+bool gpu_timeline_submit_matches(const GpuTimelineSubmit& submit,
+                                 const GpuTimelineSelector& selector);
 
 // Runtime hooks. Inert unless PROSPER_GPU_TIMELINE=<path> is set. They record folded semantic state
 // before renderer sampling and never realize shaders, copy resources, or invoke Vulkan.

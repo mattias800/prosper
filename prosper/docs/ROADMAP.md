@@ -53,10 +53,10 @@ presented, framebuffer CRC == golden" is. Each change adds the check that proves
   structurization now restores them while varying and compute-wave forms still reject (#615). Capture v7 now
   records bounded raw stages, exact rejection opcode/PC, decoded state, and resource/descriptor summaries for
   every observed realization failure, so the next unsupported shader can be reduced offline (#618).
-- **Immediate milestone:** refresh the now-stale Dead Cells semantic checkpoint under #594 and resolve exact
-  depth/stencil checkpointing (#569). Keep extending the workflow across Unity and Unreal targets rather than
-  returning to long unstructured live traces. The Dead Cells splash regression guard now uses a measured run-level
-  content threshold instead of the historical animation-sensitive exact frame (#596/#573).
+- **Immediate milestone:** resolve exact depth/stencil checkpointing (#569). Keep extending the workflow across
+  Unity and Unreal targets rather than returning to long unstructured live traces. Timeline v6 closes the stale
+  Dead Cells checkpoint problem with offline target-span discovery and a two-route semantic selector (#594), and
+  the splash guard uses a measured run-level content threshold (#596/#573).
 
 ## Historical status (2026-07-05) - retained for the milestone log
 

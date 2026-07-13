@@ -40,6 +40,14 @@ int main() {
     first.submit_no = 10; first.process_command_order = 400; first.first_command_order = 390;
     first.last_command_order = 400; first.color0_base = 0x12340000; first.draw_count = 3;
     first.dispatch_count = 1; first.color0_width = 642; first.color0_height = 362;
+    first.target_spans.push_back({0, 1, 642, 362});
+    first.target_spans.push_back({1, 2, 738, 420});
+    GpuTimelineSubmit invalid_spans = first;
+    invalid_spans.target_spans[1].first_draw = 2;
+    CHECK(!writer.append_submit(invalid_spans, error) &&
+          error.find("invalid target spans") != std::string::npos,
+          "writer rejects noncontiguous target-span coverage");
+    error.clear();
     GpuTimelineDepthSurface first_depth;
     first_depth.depth_read_base = first_depth.depth_write_base = 0x700000;
     first_depth.stencil_read_base = first_depth.stencil_write_base = 0x830000;
@@ -87,6 +95,7 @@ int main() {
     CHECK(writer.append_producer(producer, error), "writer appends a prior-producer identity");
     GpuTimelineSubmit second = first;
     second.submit_no = 11; second.draw_count = 4; second.dispatch_count = 0;
+    second.target_spans[1].draw_count = 3;
     CHECK(writer.append_submit(second, error), "writer appends a second submit record");
     CHECK(writer.flush(error), "writer flushes explicitly");
     writer.close();
@@ -97,7 +106,7 @@ int main() {
           timeline.metadata.title_id == metadata.title_id &&
           timeline.metadata.input_route == metadata.input_route,
           "metadata round-trips");
-    CHECK(timeline.version == 5 && timeline.submits.size() == 2 && timeline.presents.size() == 1 &&
+    CHECK(timeline.version == 6 && timeline.submits.size() == 2 && timeline.presents.size() == 1 &&
           timeline.details.size() == 1 && timeline.producers.size() == 1,
           "version and record counts round-trip");
     CHECK(timeline.submits[0].sequence == 1 && timeline.presents[0].sequence == 2 &&
@@ -116,6 +125,31 @@ int main() {
           timeline.submits[0].depth_surfaces[0].backing_writer_sequence == 9 &&
           timeline.submits[0].depth_surfaces[0].backing_writer_identity == 0xabcdef,
           "native timeline depth identity, HTILE programming, and use counts round-trip");
+    CHECK(timeline.submits[0].target_spans.size() == 2 &&
+          timeline.submits[0].target_spans[1].first_draw == 1 &&
+          timeline.submits[0].target_spans[1].draw_count == 2 &&
+          timeline.submits[0].target_spans[1].width == 738 &&
+          !timeline.submits[0].target_spans_truncated,
+          "target-extent spans round-trip without run-local addresses");
+    GpuTimelineSelector selector;
+    selector.min_submit_no = 1; selector.target_width = 738; selector.target_height = 420;
+    selector.target_min_draw = 1; selector.target_max_draw = 2;
+    selector.min_draws = selector.max_draws = 3;
+    selector.min_dispatches = selector.max_dispatches = 1;
+    CHECK(gpu_timeline_submit_matches(timeline.submits[0], selector),
+          "shared selector matches target position plus draw/dispatch counts");
+    selector.target_min_draw = selector.target_max_draw = 0;
+    CHECK(!gpu_timeline_submit_matches(timeline.submits[0], selector),
+          "shared selector rejects a target outside the requested draw range");
+    selector.target_min_draw = 1; selector.target_max_draw = 2;
+    selector.min_dispatches = selector.max_dispatches = 2;
+    CHECK(!gpu_timeline_submit_matches(timeline.submits[0], selector),
+          "shared selector rejects an otherwise identical dispatch-count mismatch");
+    selector.min_dispatches = selector.max_dispatches = 1;
+    timeline.submits[0].target_spans_truncated = true;
+    CHECK(!gpu_timeline_submit_matches(timeline.submits[0], selector),
+          "shared selector refuses an incomplete target signature");
+    timeline.submits[0].target_spans_truncated = false;
     CHECK(timeline.presents[0].buffer_index == 2 && timeline.presents[0].flip_arg == -5,
           "signed present fields round-trip");
     CHECK(timeline.details[0].submit_no == 10 && timeline.details[0].missing_operation_count == 1 &&
@@ -207,6 +241,12 @@ int main() {
           runtime_timeline.submits[1].depth_surfaces[0].htile_data_base == 0x820000 &&
           runtime_timeline.submits[1].depth_surfaces[0].depth_test_count == 1,
           "runtime timeline extracts compact DS programming without realizing resources");
+    CHECK(runtime_timeline.submits[1].target_spans.size() == 1 &&
+          runtime_timeline.submits[1].target_spans[0].first_draw == 0 &&
+          runtime_timeline.submits[1].target_spans[0].draw_count == 1 &&
+          runtime_timeline.submits[1].target_spans[0].width == 642 &&
+          runtime_timeline.submits[1].target_spans[0].height == 362,
+          "runtime timeline records compact semantic target spans");
     CHECK(runtime_timeline.details.size() == 3 && runtime_timeline.details[0].submit_no == 41 &&
           runtime_timeline.details[0].capture_path.find(bundle_capture + "#submit=41") == 0 &&
           runtime_timeline.details[1].capture_path == predecessor_capture &&
@@ -224,7 +264,8 @@ int main() {
 
     const auto compat_v2 = base.string() + "-compat-v2.prgtl";
     GpuTimelineWriter compat_writer;
-    GpuTimelineSubmit legacy_first = first; legacy_first.depth_surfaces.clear();
+    GpuTimelineSubmit legacy_first = first;
+    legacy_first.depth_surfaces.clear(); legacy_first.target_spans.clear();
     CHECK(compat_writer.open(compat_v2, metadata, error) && compat_writer.append_submit(legacy_first, error),
           "created a detail-free compatibility timeline");
     compat_writer.close();

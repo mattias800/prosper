@@ -72,7 +72,9 @@ the guest and command decoder advance. The `screenshot` frontend exposes this as
 `--warmup-submits` for `PROSPER_RENDER_FIRST`; use wall-clock warmup for progression captures and the exact
 submit gate for repeatable renderer investigations.
 `PROSPER_GPU_TIMELINE=<path>.prgtl` records every folded submit before renderer sampling plus every
-VideoOut flip. `gpu_timeline <path> [--records]` inspects the checksummed index offline. Recording is
+VideoOut flip. `gpu_timeline <path> [--records]` inspects the checksummed index offline. Version 6 also records
+compact target-extent spans; use `--signatures DRAWS DISPATCHES` to discover scene shapes and
+`--select WxH DRAW_INDEX DRAWS DISPATCHES` to validate the live predicate. Recording is
 independent of `PROSPER_RENDER_EVERY`. To materialize one exact indexed submit without rendering the
 warmup, set `PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT=N` and
 `PROSPER_GPU_TIMELINE_CAPTURE=<path>.prgcap` on a second run. Version-2 detail records link the capsule;
@@ -83,14 +85,14 @@ and extract one with `--dump-failed-shader FAILURE:STAGE PATH`. Selection is
 intentionally bounded to the consumer and an optional
 immediate predecessor. Explicit-depth `.prgbundle` capture provides bounded recursive cross-submit closure;
 automatic present-to-producer selection remains #595.
-Timeline version 5 retains a sliding graphics-target window plus full-run aggregate lifetime metadata when a
-detailed capture is requested. `PROSPER_GPU_TIMELINE_HISTORY=N` raises the sliding window to at most 65536.
+Timeline version 6 retains the version-5 sliding graphics-target window plus full-run aggregate lifetime metadata
+when a detailed capture is requested. `PROSPER_GPU_TIMELINE_HISTORY=N` raises the window to at most 65536.
 Producer records identify the latest overlapping prior submit/draw/PM4 order, earliest observed graphics
 writer, write/submit counts, truncation, and raw first-writer clear/target state. Raw clear registers are
 provenance, not proof of an implicit hardware clear. The timeline intentionally retains no delayed pointers
 to mutable guest bytes.
-Every v5 submit also records distinct DS plane/HTILE identities, raw view/format/size programming, target
-extents, and test/write/clear counts. `gpu_timeline FILE --depth-summary [WxH]` groups their full lifetimes.
+Every current submit also records the v5 distinct DS plane/HTILE identities, raw view/format/size programming,
+target extents, and test/write/clear counts. `gpu_timeline FILE --depth-summary [WxH]` groups their full lifetimes.
 For a focused run, `PROSPER_GPU_TIMELINE_DEPTH_HASH_DIM=WxH` adds guest depth/stencil/HTILE hashes and latest
 overlapping writer provenance without realizing general resources; use it before attempting a full bundle.
 Set `PROSPER_GPU_TIMELINE_CAPTURE_PREDECESSOR=<path>.prgcap` to snapshot exact submit `N-1` at producer
@@ -130,7 +132,9 @@ For timing-sensitive routes, `PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM=WxH` 
 submit at or after `CAPTURE_SUBMIT`; `PROSPER_GPU_TIMELINE_CAPTURE_MIN_DRAWS=N` and
 `PROSPER_GPU_TIMELINE_CAPTURE_MAX_DRAWS=N` bound semantic complexity to reject loading or cinematic passes.
 `PROSPER_GPU_TIMELINE_CAPTURE_TARGET_DRAW_INDEX=MIN:MAX` narrows where the selected target may occur in the
-raw semantic draw sequence; derive it from repeated positives and nearby negative samples.
+raw semantic draw sequence. `PROSPER_GPU_TIMELINE_CAPTURE_MIN_DISPATCHES=N` and
+`PROSPER_GPU_TIMELINE_CAPTURE_MAX_DISPATCHES=N` add dispatch-count bounds. Derive the full conjunction from
+repeated positives and nearby negative samples with the offline v6 selector.
 When the endpoint moves, predecessor manifests roll forward so the final bundle retains the latest requested
 depth; dictionary bytes observed by evicted manifests still count against the unique-byte budget.
 Per-target RTT is the normal renderer path. `PROSPER_RTT_SINGLE_TARGET=1` restores the obsolete flattened
