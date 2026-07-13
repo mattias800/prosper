@@ -72,8 +72,8 @@ large capsule or bundle:
 The adjacent target indices 79 and 83, exact 90-draw count, and dispatch counts 7 and 9 all produced zero
 matches. The live selector reproduced the offline result and installed a gameplay capsule at its first match.
 
-The faithful playable reference on #608 retained 883 submits and renders hash
-`5759c125812154dc`. A final-submit replay with fresh depth renders `71b84bdfae53933c` instead. Use
+The faithful playable reference on #608 retained 883 submits; its `5759c125812154dc` hash is historical to the
+pre-#611/#615 renderer. A two-submit color-bounded replay still renders `71b84bdfae53933c`. Use
 `gpu_replay --bundle-ds-summary` to scan every depth/stencil identity and raw programming variant without
 reconstructing resource payloads or invoking Vulkan. Timeline-v5 `--depth-summary 642x362`, enabled during
 capture with `PROSPER_GPU_TIMELINE_DEPTH_HASH_DIM=642x362`, found that the stable surface backing changed via
@@ -82,6 +82,10 @@ invalidates overlapping persistent Vulkan depth/stencil images on guest GPU writ
 layers. Dead Cells' four repeated fragment failures were uniform VCCZ-exit light loops; #615 adds a narrowly
 proved fragment/vertex structurization path and current gameplay submits realize every semantic draw. Use
 `shader_inspect` for raw `PROSPER_SHADER_DUMP` binaries; capture v7 retains bounded raw stages and exact
-failure diagnostics for unrealized operations (#618). The 35-second screenshot warmup still skips color RTT
-history and therefore remains an
-overbright progression diagnostic, not a color-correct gameplay oracle.
+failure diagnostics for unrealized operations (#618). Capture v8 additionally snapshots exact persistent
+Vulkan depth/stencil planes at final-submit entry; export it with `--bundle-final-capsule`, then require its
+standalone hash to equal the source bundle before using fast operation-prefix experiments (#569). The
+current invalidation-disabled stale-depth A/B is `535256588b67a536` in both the 883-submit source and a
+self-contained v8 capsule, with byte-identical BMPs and a 3.3-second standalone replay. The
+35-second screenshot warmup still skips color RTT
+history and therefore remains an overbright progression diagnostic, not a color-correct gameplay oracle.

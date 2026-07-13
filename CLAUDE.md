@@ -116,7 +116,7 @@ animation-sensitive exact-frame contract from #573/#596.
 
 The current tooling frontier is deterministic offline capture rather than longer live-render windows.
 Native-speed `.prgtl` indexes retain every submit/present boundary, and an exact-submit selector can materialize
-immutable, content-deduplicated graphics/compute state plus mixed PM4 order into a version-7 `.prgcap` (#594).
+immutable, content-deduplicated graphics/compute state plus mixed PM4 order into a version-8 `.prgcap` (#594/#569).
 `gpu_replay --graph` / `--graph-json` now resolve in-submit versions and temporal read-before-write leaves (#600;
 full workflow: `prosper/tools/gpu_replay/README.md`). Timeline version 6 retains the version-5 bounded same-run
 target/depth history and adds compact per-draw target spans for offline scene selection. Ordered `.prgbundle`
@@ -135,9 +135,10 @@ and the 738x420 target at draw 79..81. Current routes use 91..93 draws, exactly 
 target at draw 80..82; two independent timelines selected only sustained gameplay from about 29.5 seconds onward.
 Target extent or total draw count alone also selects cinematic/transition frames and must not be used as the
 oracle. Use this checkpoint to isolate the first bad composition.
-The faithful playable bundle spans submits 18,165..19,047, stores 158.94 GiB logical state in 739 MiB, resolves
-all 1,764 temporal image dependencies, and renders hash `5759c125812154dc`. A fresh-depth final replay instead
-renders `71b84bdfae53933c`; `gpu_replay --bundle-find-ds ADDR` scans manifest-only DS use in seconds and proves
+The faithful playable bundle spans submits 18,165..19,047, stores 158.94 GiB logical state in 739 MiB, and
+resolves all 1,764 temporal image dependencies. Its pre-#611/#615 historical hash was `5759c125812154dc`; do
+not use that old absolute hash as a current renderer oracle. A two-submit color-bounded replay remains
+`71b84bdfae53933c`; `gpu_replay --bundle-find-ds ADDR` scans manifest-only DS use in seconds and proves
 the shared surface has no draw/register clear intent. The missing hardware boundary is now identified and
 implemented (#611): timeline-v5 retains complete raw DS programming plus optional guest backing hashes/writer
 provenance, which found compute program `0x401aec200` filling the exact 32 KiB HTILE allocation with
@@ -145,6 +146,11 @@ provenance, which found compute program `0x401aec200` filling the exact 32 KiB H
 DS entries become invalid so the next use follows the existing compare-derived clear path. A routed live A/B
 restores the foreground/platform/HUD layers that remain black with invalidation disabled. The explicit
 `--legacy-htile-before-stencil` switch supplies the omitted HTILE identity only for the preserved pre-v6 bundle.
+Capture v8 closes the exact offline boundary (#569). Current #611-enabled full-bundle and standalone output are
+both `fac9ca4cbbba8196`. An invalidation-disabled stale-depth A/B is `535256588b67a536` in both paths with
+byte-identical BMPs; the self-contained capsule carries 12 RTT surfaces, one 929,616-byte 642x362 D32S8 depth
+plane, effective DS lifetime/legacy settings, and the 33,177,600-byte source oracle. Standalone replay takes
+about 3.3 seconds instead of roughly 24 minutes.
 The four repeated Dead Cells fragment failures were canonical VCCZ-exit light-accumulation loops. #615 adds a
 stage-specific proof: every VOPC input must be scalar/inline/literal or have a nearest overlapping VGPR
 definition from an unmodified uniform VOP1 move/conversion. Only then can the wave-empty VCC test lower to a
@@ -154,9 +160,10 @@ semantic draws. Capture v7 (#618) retains a failed stage fault-safely through `s
 content-deduplicates it, and records exact coverage/opcode/PC, decoded pipeline/launch state, and
 resource/descriptor summaries. Start with `gpu_replay --inspect-only`; extract a raw stage with
 `--dump-failed-shader FAILURE:STAGE PATH` instead of rerunning the title.
-Do not treat `--bundle-final-capsule` as an exact DS checkpoint: it snapshots color RTT state, not live Vulkan
-depth/stencil images (#569). Capture v7 reads v1-v6 artifacts (failed-operation diagnostics report unavailable);
-timeline v6 reads timeline v1-v5 artifacts. Addresses and operation ordinals are run-local. Use
+`--bundle-final-capsule` snapshots both color RTT state and exact valid planes from persistent Vulkan
+depth/stencil images into capture v8 (#569). Capture v8 reads v1-v7 artifacts; pre-v7 failed-operation diagnostics
+report unavailable and pre-v8 captures contain no invented DS seeds. Timeline v6 reads timeline v1-v5
+artifacts. Addresses and operation ordinals are run-local. Use
 `gpu_timeline FILE --signatures DRAWS DISPATCHES` to discover target spans and `--select` to validate the exact
 live-capture predicate before recording another detailed bundle. The Dead Cells splash guard deliberately
 uses `min_colors=1500` rather than an exact hash: unchanged builds select multiple valid animation states with

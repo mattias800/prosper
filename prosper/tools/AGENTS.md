@@ -78,7 +78,7 @@ compact target-extent spans; use `--signatures DRAWS DISPATCHES` to discover sce
 independent of `PROSPER_RENDER_EVERY`. To materialize one exact indexed submit without rendering the
 warmup, set `PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT=N` and
 `PROSPER_GPU_TIMELINE_CAPTURE=<path>.prgcap` on a second run. Version-2 detail records link the capsule;
-version-7 capsules deduplicate content-addressed shader/resource versions, retain complete raw depth-surface
+version-8 capsules deduplicate content-addressed shader/resource versions, retain complete raw depth-surface
 programming, and preserve mixed draw/dispatch order plus explicit unrealized operations. Failed operations
 also retain bounded raw stages and exact rejection/state summaries; inspect them with `gpu_replay --inspect-only`
 and extract one with `--dump-failed-shader FAILURE:STAGE PATH`. Selection is
@@ -112,9 +112,11 @@ writer while timeline/lifetime recording continues, avoiding progression distort
 lifetime evidence proves the suffix contains the target's beginning, then inspect its lower-bound frontier.
 `gpu_replay --bundle-intermediate-through-target WxH` omits later passes from non-final submits only when
 dependency evidence proves that the named target family is the sole temporal image frontier.
-`gpu_replay --bundle-final-capsule PATH` exports the complete live color RTT cache; verify its standalone output
-hash against the bundle before using it for rapid final-submit isolation. Persistent Vulkan depth/stencil images
-are not serialized yet (#569/#611), so complete color seeds do not guarantee equality.
+`gpu_replay --bundle-final-capsule PATH` exports the complete live color RTT cache plus exact valid planes from
+the persistent Vulkan depth/stencil cache into a capture-v8 capsule. Verify its standalone output hash against
+the bundle before using it for rapid final-submit isolation. `--inspect-only` prints each DS seed's full cache
+identity, format, independent validity flags, byte counts, and hashes. Captures v1-v7 remain readable without
+invented DS state.
 `gpu_replay --bundle-extract-submit N PATH` materializes one exact manifest for normal inspect/graph/validate
 work without replaying the bundle.
 `gpu_replay --bundle-find-ds ADDR` scans compact manifests for guest depth/stencil use, writes, clears, compare

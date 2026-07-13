@@ -93,11 +93,36 @@ int main() {
           "capture indexes unique shaders and retains operation provenance");
     captured.expected_output_valid = true;
     captured.expected_output_hash = 0x1122334455667788ull; captured.expected_output_bytes = 480ull * 270 * 4;
+    GpuCaptureDsSeed ds_seed;
+    ds_seed.depth_read_base = 0x810000; ds_seed.depth_write_base = 0x810000;
+    ds_seed.stencil_read_base = 0x820000; ds_seed.stencil_write_base = 0x820000;
+    ds_seed.htile_data_base = 0x800000; ds_seed.width = 2; ds_seed.height = 2;
+    ds_seed.format = GpuCaptureDsFormat::D32FloatS8;
+    ds_seed.depth_valid = true; ds_seed.stencil_valid = true;
+    ds_seed.depth.assign(16, 0x31); ds_seed.stencil = {1, 2, 3, 4};
+    captured.ds_seeds.push_back(ds_seed);
 
     auto path = std::filesystem::temp_directory_path() / "prosper_gpu_capture_test.prgcap";
     GpuCaptureFile duplicate_seed = captured; duplicate_seed.rtt_seeds.push_back(captured.rtt_seeds[0]);
     CHECK(!write_gpu_capture(path.string(), duplicate_seed, error) && error == "duplicate RTT seed address",
           "writer rejects duplicate temporal RTT seed addresses");
+    GpuCaptureFile duplicate_ds = captured; duplicate_ds.ds_seeds.push_back(ds_seed);
+    CHECK(!write_gpu_capture(path.string(), duplicate_ds, error) && error == "duplicate DS seed identity",
+          "writer rejects duplicate persistent DS seed identities");
+    GpuCaptureFile stencil_only = captured;
+    stencil_only.ds_seeds[0].depth_valid = false; stencil_only.ds_seeds[0].depth.clear();
+    std::vector<uint8_t> stencil_only_bytes;
+    GpuCaptureFile stencil_only_loaded;
+    CHECK(serialize_gpu_capture(stencil_only, stencil_only_bytes, error) &&
+          deserialize_gpu_capture(stencil_only_bytes, stencil_only_loaded, error) &&
+          !stencil_only_loaded.ds_seeds[0].depth_valid &&
+          stencil_only_loaded.ds_seeds[0].stencil_valid,
+          "stencil-only validity survives capture v8 independently of depth");
+    GpuCaptureFile invalid_stencil_format = stencil_only;
+    invalid_stencil_format.ds_seeds[0].format = GpuCaptureDsFormat::D32Float;
+    CHECK(!serialize_gpu_capture(invalid_stencil_format, stencil_only_bytes, error) &&
+          error == "DS seed stencil byte count does not match its extent, format, and validity",
+          "writer rejects stencil bytes for a depth-only format");
     CHECK(write_gpu_capture(path.string(), captured, error), "versioned capture writes atomically");
     GpuCaptureFile loaded;
     CHECK(read_gpu_capture(path.string(), loaded, error), "versioned capture reads back");
@@ -113,6 +138,10 @@ int main() {
           "content versions and draw operation identity round-trip");
     CHECK(loaded.rtt_seeds.size() == 1 && loaded.rtt_seeds[0].width == 2 &&
           loaded.rtt_seeds[0].rgba == temporal_rgba, "temporal RTT seed round-trips");
+    CHECK(loaded.ds_seeds.size() == 1 && loaded.ds_seeds[0].depth == ds_seed.depth &&
+          loaded.ds_seeds[0].stencil == ds_seed.stencil && loaded.ds_seeds[0].depth_valid &&
+          loaded.ds_seeds[0].stencil_valid,
+          "persistent depth and stencil planes round-trip independently");
     CHECK(loaded.draws[0].ps.db_render_control == 2 && loaded.draws[0].ps.stencil_clear_enable &&
           loaded.draws[0].ps.has_stencil_clear && loaded.draws[0].ps.stencil_clear_value == 3 &&
           loaded.draws[0].ps.stencil_read_base == 0x12345000 &&
@@ -136,6 +165,8 @@ int main() {
           "materialized draw retains its source operation identity");
     CHECK(replay.rtt_seeds.size() == 1 && replay.rtt_seeds[0].guest_addr == draw.color0_base,
           "materialized replay owns temporal RTT seed pixels");
+    CHECK(replay.ds_seeds.size() == 1 && replay.ds_seeds[0].htile_data_base == 0x800000,
+          "materialized replay owns persistent DS checkpoint bytes");
 
     std::vector<uint8_t> repeated(48);
     for (size_t i = 0; i < 16; ++i) repeated[i] = repeated[i + 32] = static_cast<uint8_t>(i * 3 + 1);
@@ -262,20 +293,28 @@ int main() {
           error == "failed-operation raw shader data exceeds its bounded limit",
           "writer enforces the documented 64 KiB per-stage raw bound");
 
+    GpuCaptureFile legacy_source = captured; legacy_source.ds_seeds.clear();
     std::vector<uint8_t> legacy_bytes;
-    CHECK(serialize_gpu_capture(captured, legacy_bytes, error) && legacy_bytes.size() >= 20,
-          "created a diagnostic-free v7 payload for the legacy-reader fixture");
-    if (legacy_bytes.size() >= 20) {
-        legacy_bytes[8] = 6; legacy_bytes[9] = legacy_bytes[10] = legacy_bytes[11] = 0;
-        legacy_bytes.resize(legacy_bytes.size() - 8); // remove v7 raw-shader/diagnostic zero counts
+    CHECK(serialize_gpu_capture(legacy_source, legacy_bytes, error) && legacy_bytes.size() >= 24,
+          "created a diagnostic-free v8 payload for legacy-reader fixtures");
+    if (legacy_bytes.size() >= 24) {
+        legacy_bytes.resize(legacy_bytes.size() - 4); // remove v8 DS-seed zero count
+        legacy_bytes[8] = 7; legacy_bytes[9] = legacy_bytes[10] = legacy_bytes[11] = 0;
     }
     GpuCaptureFile legacy_loaded;
     CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
+          legacy_loaded.failure_diagnostics_available && legacy_loaded.ds_seeds.empty(),
+          "v7 capture reopens without persistent DS checkpoint data");
+    if (legacy_bytes.size() >= 20) {
+        legacy_bytes.resize(legacy_bytes.size() - 8); // remove v7 raw-shader/diagnostic zero counts
+        legacy_bytes[8] = 6;
+    }
+    CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
           !legacy_loaded.failure_diagnostics_available && legacy_loaded.failure_diagnostics.empty(),
           "v6 capture reopens with failed-operation diagnostics reported unavailable");
-    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 8;
+    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 9;
     CHECK(!deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
-          error == "unsupported capture version 8",
+          error == "unsupported capture version 9",
           "future capture versions fail with a concrete version error");
 
     GpuCaptureFile bad_hash = mixed;
@@ -314,6 +353,35 @@ int main() {
     CHECK(!read_gpu_capture_rtt_seed(0x9000, exported_seed, error) &&
           error == "live renderer has no RTT seed reader",
           "RTT export fails explicitly without a registered renderer reader");
+
+    set_gpu_capture_ds_seed_snapshot_reader(
+        [&](std::vector<GpuCaptureDsSeed>& seeds, std::string&) {
+            GpuCaptureDsSeed high = ds_seed, low = ds_seed;
+            high.depth_read_base = high.depth_write_base = 0xa10000;
+            low.depth_read_base = low.depth_write_base = 0x710000;
+            seeds.push_back(std::move(high)); seeds.push_back(std::move(low));
+            return true;
+        });
+    std::vector<GpuCaptureDsSeed> exported_ds;
+    CHECK(read_all_gpu_capture_ds_seeds(exported_ds, error) && exported_ds.size() == 2 &&
+          exported_ds[0].depth_read_base == 0x710000 &&
+          exported_ds[1].depth_read_base == 0xa10000,
+          "registered DS snapshot reader validates and sorts the complete live cache");
+    GpuCaptureDsSeed restored_ds;
+    set_gpu_replay_ds_seed_writer([&](const GpuCaptureDsSeed& seed, std::string&) {
+        restored_ds = seed; return true;
+    });
+    CHECK(restore_gpu_replay_ds_seeds({ds_seed}, error) && restored_ds.depth == ds_seed.depth &&
+          restored_ds.stencil == ds_seed.stencil,
+          "registered DS writer receives exact validated checkpoint planes");
+    set_gpu_capture_ds_seed_snapshot_reader({});
+    CHECK(!read_all_gpu_capture_ds_seeds(exported_ds, error) &&
+          error == "live renderer has no DS seed snapshot reader",
+          "DS snapshot export fails explicitly without a registered renderer reader");
+    set_gpu_replay_ds_seed_writer({});
+    CHECK(!restore_gpu_replay_ds_seeds({ds_seed}, error) &&
+          error == "live renderer has no DS seed writer",
+          "DS restore fails explicitly without a registered renderer writer");
 
     auto truncated = path; truncated += ".truncated";
     std::filesystem::copy_file(path, truncated, std::filesystem::copy_options::overwrite_existing);

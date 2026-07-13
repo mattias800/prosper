@@ -122,12 +122,36 @@ struct GpuCaptureRttSeed {
     std::vector<uint8_t> rgba;
 };
 
+enum class GpuCaptureDsFormat : uint32_t {
+    D32Float = 1,
+    D32FloatS8 = 2,
+};
+
+// Exact host depth/stencil attachment contents retained across submits. These planes are detached
+// from guest tiled memory, just like RTT pixels, so a final-submit capsule needs an explicit copy of
+// every valid plane selected by the persistent renderer cache.
+struct GpuCaptureDsSeed {
+    uint64_t depth_read_base = 0;
+    uint64_t depth_write_base = 0;
+    uint64_t stencil_read_base = 0;
+    uint64_t stencil_write_base = 0;
+    uint64_t htile_data_base = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    GpuCaptureDsFormat format = GpuCaptureDsFormat::D32Float;
+    bool depth_valid = false;
+    bool stencil_valid = false;
+    std::vector<uint8_t> depth;
+    std::vector<uint8_t> stencil;
+};
+
 struct GpuCaptureFile {
     GpuCaptureMetadata metadata;
     std::vector<GpuCaptureBlob> blobs;
     std::vector<GpuCaptureShaderVersion> shader_versions;
     std::vector<GpuCaptureRawShaderVersion> raw_shader_versions;
     std::vector<GpuCaptureRttSeed> rtt_seeds;
+    std::vector<GpuCaptureDsSeed> ds_seeds;
     std::vector<GpuCapturedDraw> draws;
     std::vector<GpuCapturedCompute> computes;
     std::vector<GpuCapturedOperation> operations;
@@ -144,6 +168,8 @@ using CaptureMemoryReader = std::function<size_t(uint64_t guest_addr, uint8_t* d
 using CaptureRttSeedReader = std::function<bool(uint64_t guest_addr, GpuCaptureRttSeed& seed)>;
 using CaptureRttSeedSnapshotReader =
     std::function<bool(std::vector<GpuCaptureRttSeed>& seeds, std::string& error)>;
+using CaptureDsSeedSnapshotReader =
+    std::function<bool(std::vector<GpuCaptureDsSeed>& seeds, std::string& error)>;
 
 bool capture_draw_items(const std::vector<DrawItem>& items, const GpuCaptureMetadata& metadata,
                         const CaptureMemoryReader& reader, GpuCaptureFile& out, std::string& error,
@@ -181,6 +207,7 @@ struct GpuReplayFrame {
     std::vector<GpuCaptureBlob> blobs;
     std::vector<ResourceInstance> resource_instances;
     std::vector<GpuCaptureRttSeed> rtt_seeds;
+    std::vector<GpuCaptureDsSeed> ds_seeds;
     std::vector<DrawItem> items;
     std::vector<ComputeItem> computes;
     std::vector<GpuCapturedOperation> operations;
@@ -194,16 +221,21 @@ struct GpuReplayFrame {
 
 bool materialize_gpu_replay(const GpuCaptureFile& capture, GpuReplayFrame& replay, std::string& error);
 
-// The Vulkan frontend owns the RTT cache and registers these hooks when its renderer is installed.
-// Capture queries only addresses referenced by the selected submit; replay restores the serialized
-// surfaces before draw zero.
+// The Vulkan frontend owns the RTT and persistent DS caches and registers these hooks when its renderer
+// is installed. Normal capture queries only RTT addresses referenced by the selected submit; final bundle
+// export snapshots both complete caches. Replay restores serialized surfaces before draw zero.
 using ReplayRttSeedWriter = std::function<bool(const GpuCaptureRttSeed& seed, std::string& error)>;
+using ReplayDsSeedWriter = std::function<bool(const GpuCaptureDsSeed& seed, std::string& error)>;
 void set_gpu_capture_rtt_seed_reader(CaptureRttSeedReader reader);
 bool read_gpu_capture_rtt_seed(uint64_t guest_addr, GpuCaptureRttSeed& seed, std::string& error);
 void set_gpu_capture_rtt_seed_snapshot_reader(CaptureRttSeedSnapshotReader reader);
 bool read_all_gpu_capture_rtt_seeds(std::vector<GpuCaptureRttSeed>& seeds, std::string& error);
 void set_gpu_replay_rtt_seed_writer(ReplayRttSeedWriter writer);
 bool restore_gpu_replay_rtt_seeds(const std::vector<GpuCaptureRttSeed>& seeds, std::string& error);
+void set_gpu_capture_ds_seed_snapshot_reader(CaptureDsSeedSnapshotReader reader);
+bool read_all_gpu_capture_ds_seeds(std::vector<GpuCaptureDsSeed>& seeds, std::string& error);
+void set_gpu_replay_ds_seed_writer(ReplayDsSeedWriter writer);
+bool restore_gpu_replay_ds_seeds(const std::vector<GpuCaptureDsSeed>& seeds, std::string& error);
 uint64_t gpu_capture_hash(const uint8_t* data, size_t size);
 inline uint64_t gpu_capture_hash(const std::vector<uint8_t>& data) {
     return gpu_capture_hash(data.data(), data.size());
