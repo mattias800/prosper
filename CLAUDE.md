@@ -110,7 +110,9 @@ opening vignette/level geometry; #586 established a practical late checkpoint wi
 residual seeded replay mismatch (#569) exposed persistent depth/stencil state outside color RTT seeds. The
 faithful closure reuses one 642x362 depth identity, but timeline-v5 backing provenance proves compute fills its
 HTILE allocation before drawing; #611 now invalidates the detached Vulkan DS cache on that guest GPU write.
-The animation-sensitive exact splash guard (#573) remains separate.
+The Dead Cells splash regression guard is now a run-level content check: after a three-second renderer warmup,
+the richest frame in a 20-second window must contain at least 1,500 distinct colors. This replaces the historical
+animation-sensitive exact-frame contract from #573/#596.
 
 The current tooling frontier is deterministic offline capture rather than longer live-render windows.
 Native-speed `.prgtl` indexes retain every submit/present boundary, and an exact-submit selector can materialize
@@ -155,9 +157,9 @@ depth/stencil images (#569). Capture v7 reads v1-v6 artifacts (failed-operation 
 timeline v5 remains backward-compatible with old local artifacts.
 Addresses and operation ordinals are run-local. The #608 `90 draws + 738x420 at draw 79..81` conjunction is
 also historical: a fresh 2026-07-13 route reached sustained 90-91-draw gameplay submits but did not match it.
-Recalibrate the semantic selector under #594 before a new exact capture. The Dead Cells splash guard alternates
-between hashes `8429fedd427b...` and `891a80fc9178...` on one unchanged build; replace that nondeterministic
-exact-frame contract under #596 rather than silently choosing or re-blessing either hash.
+Recalibrate the semantic selector under #594 before a new exact capture. The Dead Cells splash guard deliberately
+uses `min_colors=1500` rather than an exact hash: unchanged builds select multiple valid animation states with
+1,650-1,698 distinct colors, while observed partial transitions contain only about 325-339.
 `PROSPER_PROVENANCE_DIM=WxH` reports overlapping color, compute, DMA_DATA, and WRITE_DATA writers with
 submit/item/PM4 ordinals.
 `PROSPER_RESOURCE_HASH_DIM=WxH` correlates raw and sampled hashes with those writers at each live draw;

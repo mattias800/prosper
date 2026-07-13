@@ -22,8 +22,8 @@ On failure, `check` writes the screenshot and boot log to
 ## Guard Modes
 
 - `min_colors`: run for the configured timeout and require the richest rendered
-  frame to reach a distinct-color threshold. The current `messenger-scene`
-  guard uses this mode and tolerates frame timing variance.
+  frame to reach a distinct-color threshold. `verify <name>` repeats the full
+  capture and requires both runs to meet the threshold at the same dimensions.
 - `frame` plus `hash`: compare one targeted draw-submit frame exactly. Run
   `verify <name>` before establishing its baseline with `update <name>`.
 
@@ -31,9 +31,11 @@ On failure, `check` writes the screenshot and boot log to
 
 - `messenger-scene`: run-level content guard because the threaded boot does not
   choose a stable exact frame.
-- `dead-cells-splash`: exact first frame after a three-second renderer warmup.
-  The warmup advances the submit-heavy startup without synchronous llvmpipe
-  rendering; repeated captures are pixel-identical at 960x540.
+- `dead-cells-splash`: run-level content guard after a three-second renderer
+  warmup. The warmup advances the submit-heavy startup without synchronous
+  llvmpipe rendering; the richest startup frame must contain at least 1,500
+  colors. Exact hashes are intentionally not used because an unchanged build
+  selects multiple valid splash animation states at 960x540.
 
 ## Adding A Snapshot
 
