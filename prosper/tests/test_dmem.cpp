@@ -6,6 +6,9 @@
 // own process, so the process-global direct-memory pool starts empty here.
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
+#ifdef _WIN32
+#include "../src/host/exec_image.hpp"
+#endif
 #include <cstdio>
 #include <cstdint>
 #ifdef __linux__
@@ -25,10 +28,33 @@ static constexpr uint64_t kEnd   = kBase + kTotal;
 
 int main() {
     printf("== test_dmem ==\n");
-#ifndef __linux__
+#ifdef _WIN32
+    // Windows first-touch handling must commit one 16 KiB guest page, not a 64 KiB allocation-
+    // granularity span. The latter crosses this reservation and fails with ERROR_INVALID_ADDRESS.
+    register_builtin_hle();
+    auto reserve = Hle::lookup(nid_hash("sceKernelReserveVirtualRange"));
+    auto unmap   = Hle::lookup(nid_hash("sceKernelMunmap"));
+    CHECK(reserve && unmap, "reserve/unmap HLE functions registered");
+    if (fails) return 1;
+
+    constexpr uint64_t len = 0x4000;
+    uint64_t va = 0x30000000000ull;  // Fixed, 64 KiB-aligned, and above the VEH's heap threshold.
+    CHECK(reserve((uint64_t)(uintptr_t)&va, len, 0x10 /* MAP_FIXED */, len, 0, 0) == 0,
+          "ReserveVirtualRange creates an exact 16 KiB reservation");
+    if (fails) return 1;
+
+    install_trap_handler();
+    volatile uint32_t* cell = (volatile uint32_t*)(uintptr_t)va;
+    *cell = 0x6310CAFEu;
+    CHECK(*cell == 0x6310CAFEu, "first touch commits one guest page and preserves the write");
+    CHECK(unmap(va, len, 0, 0, 0, 0) == 0, "reserved page unmaps cleanly");
+
+    if (fails) { printf("== FAIL: %d check(s) ==\n", fails); return 1; }
+    printf("== PASS ==\n");
+    return 0;
+#elif !defined(__linux__)
     // The direct-memory HLE (hle_kernel_mem.cpp) is #ifdef __linux__ — its functions aren't
-    // registered on other platforms (e.g. the Windows/MinGW CI build), so there is nothing to
-    // exercise here. Skip cleanly rather than fail on the absent registrations.
+    // registered on this platform, so there is nothing to exercise here. Skip cleanly.
     printf("  [skip] direct-memory HLE is Linux-only on this build\n== PASS ==\n");
     return 0;
 #else

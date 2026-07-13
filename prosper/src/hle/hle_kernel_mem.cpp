@@ -1339,9 +1339,8 @@ namespace {
     }
 } // namespace
 
-// Fault-handler lazy-commit probe parity (Linux exports this for its SIGSEGV handler). We commit
-// eagerly on Win32 so the VEH handler never needs lazy commit, but expose the symbol identically
-// in case the shared fault path references it: 0 = untracked, 1 = reserved, 2 = committed.
+// Fault-handler lazy-commit probe parity (Linux exports this for its SIGSEGV handler). The Windows
+// VEH uses this to back reserved guest pages on first touch: 0 = untracked, 1 = reserved, 2 = committed.
 extern "C" int prosper_reserved_range_state(uint64_t addr) {
     std::lock_guard<std::mutex> lk(g_mx);
     const Mapping* best = nullptr;

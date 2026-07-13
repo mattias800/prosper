@@ -245,15 +245,17 @@ namespace {
         // Lazy-commit inside a guest-RESERVED range — parity with the Linux SIGSEGV handler. The guest
         // reserves a virtual range then touches pages it believes committed (its binned allocator relies
         // on a commit protocol real HW satisfies but our HLE doesn't fully replicate). If the faulting
-        // read/write address is one the memory HLE tracks as reserved-but-uncommitted, commit the 64 KiB
-        // page and retry. Gated to tracked-reserved addresses (state 1) and non-execute accesses
+        // read/write address is one the memory HLE tracks as reserved-but-uncommitted, commit the 16 KiB
+        // guest page and retry. Windows reservations can be only one guest page long; committing a
+        // 64 KiB allocation-granularity span would cross that reservation and fail with ERROR_INVALID_ADDRESS.
+        // Gated to tracked-reserved addresses (state 1) and non-execute accesses
         // (ExceptionInformation[0]!=8) so a genuine wild access / bad instruction fetch still faults.
         if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2 &&
             ep->ExceptionRecord->ExceptionInformation[0] != 8) {
             uint64_t a = (uint64_t)ep->ExceptionRecord->ExceptionInformation[1];
             if (a >= 0x1000000000ull && prosper_reserved_range_state(a) == 1) {
-                void* page = (void*)(uintptr_t)(a & ~(uint64_t)0xffff);
-                if (VirtualAlloc(page, 0x10000, MEM_COMMIT, PAGE_READWRITE))
+                void* page = (void*)(uintptr_t)(a & ~(uint64_t)0x3fff);
+                if (VirtualAlloc(page, 0x4000, MEM_COMMIT, PAGE_READWRITE))
                     return EXCEPTION_CONTINUE_EXECUTION;   // re-execute against the now-committed page
             }
         }
