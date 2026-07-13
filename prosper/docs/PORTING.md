@@ -255,6 +255,47 @@ The debugging toolbox (`tools/`, see `tools/AGENTS.md`) splits cleanly:
 - **Deliberately Linux-only:** `pad_evdev` (SDL3 pads elsewhere) and the gdb-based `tools/dbg/`
   scripts.
 
+## macOS port status (2026-07-13) — landed, in progress on branch `port/macos-core`
+
+The macOS x86_64/Rosetta path is now real, not theoretical:
+
+- **Substrate ported.** `src/host/posix_shim.hpp` supplies the Darwin equivalents of the ~15
+  Linux/glibc primitives the emulator uses (mach `process_vm_*`, `os_sync_wait_on_address` futex,
+  `shm_open` memfd, `MAP_FIXED_NOREPLACE` emulation, timed locks, real semaphore/barrier, an
+  indexable mcontext register view, Mach-O global-asm). `exec_image_linux.cpp`, `boot_program.cpp`,
+  `guest_tls.cpp`, `hle_kernel_mem.cpp`, and the thread/exception paths in `hle_kernel.cpp` compile
+  and run on Darwin.
+- **Everything green.** Full x86_64 build on an Apple M2; **67/67 ctest under Rosetta 2** (was a
+  55-test pure subset before; the substrate tests — trap/boot/setjmp/stack/AGC/videoout/prot_none —
+  now run too). The Rosetta spike confirmed MAP_FIXED at the guest bases, RWX self-modifying
+  execution, catchable SIGILL, `os_sync_wait_on_address`, and 4 KB pages. Two spike facts shaped the
+  port: **Rosetta does not implement `wrfsbase`/`rdfsbase` (SIGILL)**, and MAP_FIXED at
+  `0x100000000`/`0x1000000000` is refused (Rosetta reserves the 4 GiB and 64 GiB windows) — the
+  module bases (`0x4xx…`, `0x5xx…`, `0x6xx…`) map fine.
+- **A game boots into guest code.** `boot_trace PPSA13579-app0` (Blasphemous 2, Unity/IL2CPP) links
+  all 7 modules, resolves 3554 imports (408 cross-module), dispatches every `.init_array`, and
+  executes real guest x86-64 under Rosetta — reaching the C runtime's first constructor running libc
+  initialization.
+- One correctness fix fell out of the port (all platforms): the unannounced-32-bit index-buffer
+  fingerprint (#304) read the same bytes through `uint16_t*` and `uint32_t*` — strict-aliasing UB
+  that Apple Clang 21 compiled into `ud2`. Now `memcpy` loads.
+
+### The macOS frontier: guest `%fs` TLS
+
+Boot stalls a few frames into libc init: a guest function does `call *rax` where `rax` resolved to
+a stack address, faulting (caught cleanly now, thanks to a mandatory alt stack on Darwin). The root
+cause is the predicted one — **guest initial-exec `%fs` TLS**. The Messenger needed
+`PROSPER_GUEST_FS` on Linux for correct TLS (see `guest_tls.cpp`: without it, guest `%fs:`-relative
+reads alias the host glibc TCB and return garbage). On macOS that gate is *force-disabled* because it
+is implemented with `wrfsbase`, which Rosetta SIGILLs on — and Darwin's `%fs` base is 0 (macOS uses
+`%gs` for TLS), so the guest's TLS reads resolve to garbage/stack values immediately, deeper and
+earlier than on Linux.
+
+This is exactly the hard sub-problem flagged above for both Windows and macOS. Path forward
+(unchanged): find Rosetta's segment-base mechanism, or **patch/trap the guest `%fs`-relative
+accesses** — the fault handler already decodes instructions at fault sites (SSE4a), so
+trap-and-emulate of `%fs:` operands is in-house technology.
+
 ## Proposed sequence
 
 1. **Spikes (hours each, no commitment):**
