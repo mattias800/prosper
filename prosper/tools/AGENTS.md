@@ -76,8 +76,10 @@ VideoOut flip. `gpu_timeline <path> [--records]` inspects the checksummed index 
 independent of `PROSPER_RENDER_EVERY`. To materialize one exact indexed submit without rendering the
 warmup, set `PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT=N` and
 `PROSPER_GPU_TIMELINE_CAPTURE=<path>.prgcap` on a second run. Version-2 detail records link the capsule;
-version-6 capsules deduplicate content-addressed shader/resource versions, retain complete raw depth-surface
-programming, and preserve mixed draw/dispatch order plus explicit unrealized operations. Selection is
+version-7 capsules deduplicate content-addressed shader/resource versions, retain complete raw depth-surface
+programming, and preserve mixed draw/dispatch order plus explicit unrealized operations. Failed operations
+also retain bounded raw stages and exact rejection/state summaries; inspect them with `gpu_replay --inspect-only`
+and extract one with `--dump-failed-shader FAILURE:STAGE PATH`. Selection is
 intentionally bounded to the consumer and an optional
 immediate predecessor. Explicit-depth `.prgbundle` capture provides bounded recursive cross-submit closure;
 automatic present-to-producer selection remains #595.

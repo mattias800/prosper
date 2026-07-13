@@ -32,8 +32,9 @@ int main() {
     // the skipped block even when VCC says to branch, so the recompiler must reject it for now.
     const uint32_t vcc_branch[] = { 0x7da80300u, 0xbf860001u, 0x4a060300u, 0xBF810000u };
     RecompileCoverage c = recompile_coverage(vcc_branch, sizeof(vcc_branch)/sizeof(vcc_branch[0]));
-    CHECK(c.unsupported == 1 && c.first_bad_fmt >= 0 && c.first_bad_op == 0x06,
-          "a forward s_cbranch_vccz is rejected instead of linearized as a no-op");
+    CHECK(c.unsupported == 1 && c.first_bad_fmt >= 0 && c.first_bad_op == 0x06 &&
+          c.first_bad_pc == 1,
+          "a forward s_cbranch_vccz reports its exact rejection PC instead of becoming a no-op");
     CHECK(recompile_valu(vcc_branch, sizeof(vcc_branch)/sizeof(vcc_branch[0]), 2, 3).empty(),
           "the production recompiler rejects the unsafe forward VCC branch");
 

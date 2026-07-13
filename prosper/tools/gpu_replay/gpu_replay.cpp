@@ -41,6 +41,7 @@ void usage(const char* argv0) {
                          "[--prepend producer.prgcap] "
                          "[--dump-resource DRAW:vs|ps:BINDING PATH] [--allow-mismatch] "
                          "[--dump-shader DRAW:vs|fs PATH] [--dump-compute N PATH] "
+                         "[--dump-failed-shader FAILURE:STAGE PATH] "
                          "[--dump-compute-resource N:BINDING PATH] "
                          "[--legacy-htile-before-stencil] "
                          "<capture.prgcap> [output.bmp]\n", argv0);
@@ -259,6 +260,66 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
                     static_cast<unsigned long long>(operation.source_index),
                     static_cast<unsigned long long>(operation.command_order),
                     operation.realized ? "yes" : "no");
+    }
+    if (!replay.failure_diagnostics_available) {
+        std::printf("failure-diagnostics: unavailable (capture predates v7)\n");
+    } else if (replay.failure_diagnostics.empty()) {
+        std::printf("failure-diagnostics: none\n");
+    }
+    for (size_t i = 0; i < replay.failure_diagnostics.size(); ++i) {
+        const auto& failure = replay.failure_diagnostics[i];
+        std::printf("failure[%zu] %s source=%llu order=%llu reason=%s stages=%zu\n", i,
+                    failure.kind == prosper::gpu::SubmitOperationKind::Draw ? "draw" : "dispatch",
+                    static_cast<unsigned long long>(failure.source_index),
+                    static_cast<unsigned long long>(failure.command_order),
+                    prosper::gpu::realization_failure_reason_name(failure.reason),
+                    failure.stages.size());
+        if (failure.kind == prosper::gpu::SubmitOperationKind::Draw) {
+            std::printf("  target=%016llx extent=%ux%u vertices=%u pipeline=%s",
+                        static_cast<unsigned long long>(failure.color0_base),
+                        failure.color0_width, failure.color0_height, failure.vertex_count,
+                        failure.pipeline_present ? "yes" : "no");
+            if (failure.pipeline_present)
+                std::printf(" fmt=%u cwm=%x depth=%d/%d/%u stencil=%d blend=%d",
+                            failure.pipeline.color0_format, failure.pipeline.color_write_mask,
+                            failure.pipeline.depth_test_enable, failure.pipeline.depth_write_enable,
+                            failure.pipeline.depth_compare_op, failure.pipeline.stencil_enable,
+                            failure.pipeline.blend_enable);
+            std::printf("\n");
+        } else {
+            const auto& launch = failure.compute_launch;
+            std::printf("  threads=%ux%ux%u local=%ux%ux%u groups=%ux%ux%u\n",
+                        launch.threads_x, launch.threads_y, launch.threads_z,
+                        launch.local_x, launch.local_y, launch.local_z,
+                        launch.groups_x, launch.groups_y, launch.groups_z);
+        }
+        for (const auto& stage : failure.stages) {
+            const prosper::gpu::GpuCaptureRawShaderVersion* raw = nullptr;
+            if (stage.raw_shader_index < replay.raw_shader_versions.size())
+                raw = &replay.raw_shader_versions[stage.raw_shader_index];
+            std::printf("  %s program=%016llx raw=%s",
+                        prosper::gpu::shader_program_stage_name(stage.stage),
+                        static_cast<unsigned long long>(stage.program_addr), raw ? "yes" : "no");
+            if (raw)
+                std::printf(" words=%zu bytes=%zu hash=%016llx endpgm=%s",
+                            raw->words.size(), raw->words.size() * sizeof(uint32_t),
+                            static_cast<unsigned long long>(raw->content_hash),
+                            raw->has_endpgm ? "yes" : "no");
+            std::printf(" recompiled=%s resources=%s/%u descriptors=%u",
+                        stage.recompiled ? "yes" : "no",
+                        stage.resource_table_present ? "present" : "absent",
+                        stage.resource_count, stage.descriptor_issue_count);
+            if (stage.first_descriptor_issue != 0xFFFFFFFFu)
+                std::printf(" first-descriptor=%s", prosper::gpu::descriptor_issue_name(
+                    static_cast<prosper::gpu::DescriptorIssueCode>(stage.first_descriptor_issue)));
+            std::printf("\n    coverage total=%u alu=%u exports=%u table-dependent=%u unsupported=%u",
+                        stage.coverage.total, stage.coverage.alu, stage.coverage.exports,
+                        stage.coverage.table_dependent, stage.coverage.unsupported);
+            if (stage.coverage.first_bad_fmt >= 0)
+                std::printf(" first-reject pc=%u fmt=%d op=0x%x", stage.coverage.first_bad_pc,
+                            stage.coverage.first_bad_fmt, stage.coverage.first_bad_op);
+            std::printf("\n");
+        }
     }
 }
 
@@ -865,6 +926,7 @@ int main(int argc, char** argv) {
     std::string dump_spec, dump_path, shader_spec, shader_path;
     std::string compute_shader_spec, compute_shader_path;
     std::string compute_resource_spec, compute_resource_path;
+    std::string failed_shader_spec, failed_shader_path;
     std::string graph_json_path, prepend_path;
     std::string bundle_path, bundle_compact_path;
     std::string bundle_final_capsule_path;
@@ -938,6 +1000,9 @@ int main(int argc, char** argv) {
         else if (std::string(argv[i]) == "--dump-compute-resource" && i + 2 < argc) {
             compute_resource_spec = argv[++i]; compute_resource_path = argv[++i];
         }
+        else if (std::string(argv[i]) == "--dump-failed-shader" && i + 2 < argc) {
+            failed_shader_spec = argv[++i]; failed_shader_path = argv[++i];
+        }
         else positional.push_back(argv[i]);
     }
     if (legacy_htile_before_stencil)
@@ -947,7 +1012,7 @@ int main(int argc, char** argv) {
         if (positional.size() > 1 || inspect || inspect_only || validate_only || graph_only ||
             draw_first >= 0 || through_operation >= 0 || !dump_spec.empty() ||
             !shader_spec.empty() || !compute_shader_spec.empty() ||
-            !compute_resource_spec.empty() || !prepend_path.empty()) {
+            !compute_resource_spec.empty() || !failed_shader_spec.empty() || !prepend_path.empty()) {
             usage(argv[0]); return 2;
         }
         return replay_bundle(bundle_path, positional.empty() ? nullptr : positional[0],
@@ -1045,6 +1110,42 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[gpureplay] dumped %s (%zu bytes) to %s\n", shader_spec.c_str(), bytes,
                      shader_path.c_str());
     }
+    if (!failed_shader_spec.empty()) {
+        const size_t colon = failed_shader_spec.find(':');
+        char* failure_end = nullptr;
+        const long failure_index = std::strtol(failed_shader_spec.c_str(), &failure_end, 0);
+        char* stage_end = nullptr;
+        const long stage_index = colon == std::string::npos ? -1 :
+            std::strtol(failed_shader_spec.c_str() + colon + 1, &stage_end, 0);
+        if (colon == std::string::npos || failure_end != failed_shader_spec.c_str() + colon ||
+            !stage_end || *stage_end || failure_index < 0 || stage_index < 0 ||
+            static_cast<size_t>(failure_index) >= replay.failure_diagnostics.size() ||
+            static_cast<size_t>(stage_index) >=
+                replay.failure_diagnostics[static_cast<size_t>(failure_index)].stages.size()) {
+            std::fprintf(stderr, "gpu_replay: invalid failed-shader selector %s\n",
+                         failed_shader_spec.c_str());
+            return 2;
+        }
+        const auto& stage = replay.failure_diagnostics[static_cast<size_t>(failure_index)]
+                                .stages[static_cast<size_t>(stage_index)];
+        if (stage.raw_shader_index >= replay.raw_shader_versions.size()) {
+            std::fprintf(stderr, "gpu_replay: failed shader %s has no captured raw stream\n",
+                         failed_shader_spec.c_str());
+            return 2;
+        }
+        const auto& words = replay.raw_shader_versions[stage.raw_shader_index].words;
+        FILE* f = std::fopen(failed_shader_path.c_str(), "wb");
+        const size_t bytes = words.size() * sizeof(uint32_t);
+        if (!f || std::fwrite(words.data(), 1, bytes, f) != bytes) {
+            if (f) std::fclose(f);
+            std::fprintf(stderr, "gpu_replay: cannot write %s\n", failed_shader_path.c_str());
+            return 2;
+        }
+        std::fclose(f);
+        std::fprintf(stderr, "[gpureplay] dumped failed shader %s (%zu bytes) to %s\n",
+                     failed_shader_spec.c_str(), bytes, failed_shader_path.c_str());
+        if (positional.size() == 1 && !inspect) return 0;
+    }
     if (!compute_shader_spec.empty()) {
         char* end = nullptr;
         const long index = std::strtol(compute_shader_spec.c_str(), &end, 0);
@@ -1124,10 +1225,12 @@ int main(int argc, char** argv) {
     }
     const auto& m = replay.metadata;
     std::fprintf(stderr, "[gpureplay] rev=%s title=%s submit=%llu %ux%u draws=%zu computes=%zu "
-                         "operations=%zu shaders=%zu blobs=%zu RTT-seeds=%zu oracle=%s\n",
+                         "operations=%zu shaders=%zu failed=%zu raw-failed-shaders=%zu blobs=%zu "
+                         "RTT-seeds=%zu oracle=%s\n",
                  m.revision.c_str(), m.title_id.c_str(), static_cast<unsigned long long>(m.submit_index),
                  m.width, m.height, replay.items.size(), replay.computes.size(), replay.operations.size(),
-                 capture.shader_versions.size(), replay.blobs.size(), replay.rtt_seeds.size(),
+                 capture.shader_versions.size(), replay.failure_diagnostics.size(),
+                 replay.raw_shader_versions.size(), replay.blobs.size(), replay.rtt_seeds.size(),
                  replay.expected_output_valid ? "yes" : "no");
     if (inspect) inspect_frame(replay);
     if (validate_only) return validate_frame(replay) ? 0 : 1;

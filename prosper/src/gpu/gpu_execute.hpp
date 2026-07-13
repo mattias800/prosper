@@ -13,6 +13,7 @@
 #include "rdna2_to_spirv.hpp"      // recompile_vertex / recompile_fragment
 #include "shader_resources.hpp"    // ShaderResourceTable
 #include "agc_shader_layout.hpp"   // DecodedBufferDescriptor (DynFetch)
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -148,6 +149,52 @@ struct ComputeItem {
     uint64_t command_order = 0;
 };
 
+enum class SubmitOperationKind : uint8_t { Draw, Dispatch };
+struct SubmitOperation {
+    SubmitOperationKind kind = SubmitOperationKind::Draw;
+    size_t index = 0;
+    uint64_t command_order = 0;
+};
+
+enum class ShaderProgramStage : uint8_t { Vertex, Fragment, Compute };
+enum class RealizationFailureReason : uint8_t {
+    None,
+    Unknown,
+    MissingProgram,
+    ShaderRecompile,
+    DescriptorContract,
+    NoEffect,
+    ZeroVertices,
+    Filtered,
+};
+
+// Capture-facing facts collected at the exact point an operation is dropped. These contain no raw
+// shader bytes; gpu_capture reads those through its fault-safe, size-bounded memory reader.
+struct ShaderRealizationDiagnostic {
+    ShaderProgramStage stage = ShaderProgramStage::Vertex;
+    uint64_t program_addr = 0;
+    std::shared_ptr<ShaderResourceTable> resources;
+    RecompileCoverage coverage;
+    bool recompiled = false;
+    uint32_t descriptor_issue_count = 0;
+    uint32_t first_descriptor_issue = 0xFFFFFFFFu;
+};
+
+struct OperationRealizationFailure {
+    SubmitOperationKind kind = SubmitOperationKind::Draw;
+    size_t index = 0;
+    uint64_t command_order = 0;
+    RealizationFailureReason reason = RealizationFailureReason::None;
+    bool pipeline_present = false;
+    ResolvedPipelineState pipeline;
+    uint64_t color0_base = 0;
+    uint32_t color0_width = 0;
+    uint32_t color0_height = 0;
+    uint32_t vertex_count = 0;
+    ComputeLaunchDimensions compute_launch;
+    std::vector<ShaderRealizationDiagnostic> stages;
+};
+
 using LiveComputeFn = std::function<bool(const std::vector<ComputeItem>& items)>;
 
 // Guest GPU writes can change backing memory represented by a persistent host-side image. Backends
@@ -162,15 +209,9 @@ void notify_guest_gpu_write(uint64_t addr, uint64_t size);
 void set_submit_compute(LiveComputeFn fn);
 bool have_submit_compute();
 std::vector<ComputeItem> realize_compute_dispatches(const GpuState& st,
-                                                     uint64_t submit_no = 0);
+                                                     uint64_t submit_no = 0,
+                                                     std::vector<OperationRealizationFailure>* failures = nullptr);
 bool execute_compute_dispatches(const GpuState& st, uint64_t submit_no = 0);
-
-enum class SubmitOperationKind : uint8_t { Draw, Dispatch };
-struct SubmitOperation {
-    SubmitOperationKind kind = SubmitOperationKind::Draw;
-    size_t index = 0;
-    uint64_t command_order = 0;
-};
 std::vector<SubmitOperation> plan_submit_operations(const GpuState& st);
 
 // PROSPER_PROVENANCE_DIM=WxH: inspect sampled images of that size and report overlapping
@@ -226,9 +267,49 @@ inline bool index_buffer_is_unannounced_32bit(const uint16_t* p16, const uint32_
 // the draw is a no-op (no PGM bound, recompile failed, or no color/depth/stencil effect). Shared by the default
 // (folded-state, one item) and PROSPER_PERDRAW (per-draw) paths so their per-draw handling is identical.
 inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcount_hint,
-                              uint32_t max_shader_dwords, bool log, DrawItem& out) {
+                              uint32_t max_shader_dwords, bool log, DrawItem& out,
+                              OperationRealizationFailure* failure = nullptr) {
     RenderState rs = extract_render_state(ds);
+    if (failure) {
+        *failure = {};
+        failure->kind = SubmitOperationKind::Draw;
+        failure->pipeline_present = true;
+        failure->pipeline = resolve_pipeline_state(rs);
+        failure->color0_base = rs.color0_base;
+        failure->color0_width = rs.color0_width;
+        failure->color0_height = rs.color0_height;
+        failure->vertex_count = vcount_hint;
+    }
+    auto add_stage_diagnostic = [&](ShaderProgramStage stage, uint64_t addr,
+                                    const std::shared_ptr<ShaderResourceTable>& resources,
+                                    const std::vector<uint32_t>& spirv) {
+        if (!failure) return;
+        ShaderRealizationDiagnostic diagnostic;
+        diagnostic.stage = stage;
+        diagnostic.program_addr = addr;
+        diagnostic.resources = resources;
+        diagnostic.recompiled = !spirv.empty();
+        if (!spirv.empty()) {
+            const uint32_t expected_set = stage == ShaderProgramStage::Vertex ? 0u : 1u;
+            const SpirvShaderStage expected_stage = stage == ShaderProgramStage::Vertex
+                ? SpirvShaderStage::Vertex : SpirvShaderStage::Fragment;
+            const DescriptorValidationReport report = validate_spirv_descriptor_interface(
+                spirv, resources.get(), expected_set, expected_stage, true);
+            diagnostic.descriptor_issue_count = static_cast<uint32_t>(report.issues.size());
+            auto issue = std::find_if(report.issues.begin(), report.issues.end(),
+                                      [](const auto& candidate) { return candidate.error; });
+            if (issue == report.issues.end() && !report.issues.empty()) issue = report.issues.begin();
+            if (issue != report.issues.end())
+                diagnostic.first_descriptor_issue = static_cast<uint32_t>(issue->code);
+        }
+        failure->stages.push_back(std::move(diagnostic));
+    };
     if (!rs.es_addr || !rs.ps_addr) {
+        if (failure) {
+            failure->reason = RealizationFailureReason::MissingProgram;
+            add_stage_diagnostic(ShaderProgramStage::Vertex, rs.es_addr, {}, {});
+            add_stage_diagnostic(ShaderProgramStage::Fragment, rs.ps_addr, {}, {});
+        }
         if (log) fprintf(stderr, "[exec] skip draw: no PGM bound (es=0x%llx ps=0x%llx)\n",
                          (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr);
         return false;
@@ -251,6 +332,8 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     }
     std::vector<uint32_t> vs = recompile_vertex((const uint32_t*)(uintptr_t)rs.es_addr, max_shader_dwords, vrt.get());
     std::vector<uint32_t> fs = recompile_fragment((const uint32_t*)(uintptr_t)rs.ps_addr, max_shader_dwords, prt.get());
+    add_stage_diagnostic(ShaderProgramStage::Vertex, rs.es_addr, vrt, vs);
+    add_stage_diagnostic(ShaderProgramStage::Fragment, rs.ps_addr, prt, fs);
     if (const char* dd = getenv("PROSPER_VS_DUMP")) {   // diag: dump successful VS SPIR-V + raw RDNA2 for inspection
         static int nd = 0;
         if (nd < 3 && !vs.empty()) {
@@ -266,6 +349,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         }
     }
     if (vs.empty() || fs.empty()) {
+        if (failure) failure->reason = RealizationFailureReason::ShaderRecompile;
         // PROSPER_DYNTRACE_FAIL=1: replay the FAILED vertex stage's resource build with the
         // dynamic-fetch walk trace + user-data block dump forced on (once per distinct VS), so the
         // failing draw's exact seeding/s_load chain is captured without knowing its address up front.
@@ -323,6 +407,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     }
     if (!validate_runtime_descriptor_contract("VS", vs, vrt.get(), 0, SpirvShaderStage::Vertex) ||
         !validate_runtime_descriptor_contract("PS", fs, prt.get(), 1, SpirvShaderStage::Fragment)) {
+        if (failure) failure->reason = RealizationFailureReason::DescriptorContract;
         if (log) fprintf(stderr, "[exec] skip draw: strict descriptor contract failed "
                                 "(es=0x%llx ps=0x%llx color0=0x%llx)\n",
                          (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr,
@@ -336,6 +421,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     // be produced (#520). Skip only when the draw has no observable color OR depth/stencil effect.
     const bool ds_effect = has_depth_stencil_side_effect(ps);
     if (ps.color_write_mask == 0 && !ds_effect && !getenv("PROSPER_FORCE_COLORWRITE")) {
+        if (failure) failure->reason = RealizationFailureReason::NoEffect;
         if (log) fprintf(stderr, "[exec] skip draw: no color/depth/stencil effect cb_target_mask=0x%x cb_color_control=0x%x color0_fmt=%u\n",
                          rs.cb_target_mask, rs.cb_color_control, ps.color0_format);
         return false;
@@ -446,6 +532,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     // full-VB draw of stale geometry composited into the frame (#400). The vb_entries "truer count"
     // override exists to correct a LOW/stale count, never to synthesize one for a zero-count draw.
     if (vcount_hint == 0 && out.indices.empty()) {
+        if (failure) failure->reason = RealizationFailureReason::ZeroVertices;
         if (log) fprintf(stderr, "[exec] skip draw: zero vertex count (no-op draw)\n");
         return false;
     }
@@ -477,13 +564,19 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         bool sa = false;
         if (prt) for (const auto& r : prt->resources)
             if (r.cls == ResourceClass::Texture && r.width == 2048 && r.height == 1024) sa = true;
-        if (!sa) return false;
+        if (!sa) {
+            if (failure) failure->reason = RealizationFailureReason::Filtered;
+            return false;
+        }
         // PROSPER_ONLY_IC=<n>: further restrict to draws whose index count == n (isolate one atlas mesh,
         // e.g. the main glyph batch idx=1566 vs a fullscreen atlas draw).
         if (const char* ic_s = getenv("PROSPER_ONLY_IC")) {
             uint32_t want = (uint32_t)atoi(ic_s);
             uint32_t ic = (draw && draw->indexed) ? draw->index_count : vcount_hint;
-            if (ic != want) return false;
+            if (ic != want) {
+                if (failure) failure->reason = RealizationFailureReason::Filtered;
+                return false;
+            }
         }
     }
     if (getenv("PROSPER_CAPTION_DIAG") && prt) {
@@ -562,7 +655,9 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
 inline std::vector<DrawItem> realize_gpustate_draws(const GpuState& st,
                                                     uint32_t max_shader_dwords = 0x10000,
                                                     float vp_scale_x = 1.0f,
-                                                    float vp_scale_y = 1.0f) {
+                                                    float vp_scale_y = 1.0f,
+                                                    std::vector<OperationRealizationFailure>* failures = nullptr) {
+    if (failures) failures->clear();
     if (st.draws.empty()) return {};
     // PROSPER_EXECLOG: just the per-draw bail-point/skip logs, without PROSPER_GFXLOG's per-packet
     // firehose (which is GBs over a minutes-long run) — for "which draws skip and why" surveys (#319).
@@ -583,21 +678,47 @@ inline std::vector<DrawItem> realize_gpustate_draws(const GpuState& st,
     if (perdraw) {
         for (size_t i = 0; i < st.draws.size(); i++) {
             DrawItem it;
+            OperationRealizationFailure failure;
             if (realize_draw_item(st.state_at_draw(i), &st.draws[i], st.draws[i].index_count,
-                                  max_shader_dwords, log, it)) {
+                                  max_shader_dwords, log, it, failures ? &failure : nullptr)) {
                 it.draw_index = i;
                 it.command_order = st.draws[i].command_order;
                 items.push_back(std::move(it));
+            } else if (failures) {
+                failure.index = i;
+                failure.command_order = st.draws[i].command_order;
+                failures->push_back(std::move(failure));
             }
         }
     } else {
+        // A forced folded capture still needs an explanation for every earlier semantic draw that
+        // the execution policy omits. Diagnose those draws without adding them to the realized list.
+        if (failures && st.draws.size() > 1) {
+            for (size_t i = 0; i + 1 < st.draws.size(); ++i) {
+                DrawItem ignored;
+                OperationRealizationFailure failure;
+                const bool would_realize = realize_draw_item(
+                    st.state_at_draw(i), &st.draws[i], st.draws[i].index_count,
+                    max_shader_dwords, log, ignored, &failure);
+                if (would_realize) failure.reason = RealizationFailureReason::Filtered;
+                failure.index = i;
+                failure.command_order = st.draws[i].command_order;
+                failures->push_back(std::move(failure));
+            }
+        }
         // Default: render the submit's last draw from the folded end state as a single item.
         DrawItem it;
         const GpuState::Draw& last = st.draws.back();
-        if (realize_draw_item(st, &last, last.index_count, max_shader_dwords, log, it)) {
+        OperationRealizationFailure failure;
+        if (realize_draw_item(st, &last, last.index_count, max_shader_dwords, log, it,
+                              failures ? &failure : nullptr)) {
             it.draw_index = st.draws.size() - 1;
             it.command_order = last.command_order;
             items.push_back(std::move(it));
+        } else if (failures) {
+            failure.index = st.draws.size() - 1;
+            failure.command_order = last.command_order;
+            failures->push_back(std::move(failure));
         }
     }
     if (getenv("PROSPER_DRAWLOG")) { fprintf(stderr, "[exec] draws=%zu perdraw=%d -> %zu item(s): raw index_counts=[",

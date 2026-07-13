@@ -72,6 +72,7 @@ struct RecompileCoverage {
     uint32_t table_dependent = 0;
     int      first_bad_fmt = -1;   // Rdna2Format of the first TRULY-unsupported instruction (-1 if none)
     uint32_t first_bad_op  = 0;
+    uint32_t first_bad_pc  = 0xFFFFFFFFu; // dword offset of that instruction (-1 if none)
 };
 RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords);
 

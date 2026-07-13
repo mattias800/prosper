@@ -32,6 +32,30 @@ int main() {
     }
     blob.content_hash = gpu_capture_hash(blob.bytes);
     first.blobs.push_back(blob);
+    first.operations.push_back({SubmitOperationKind::Draw, 5, 900, false});
+    GpuCaptureRawShaderVersion failed_shader;
+    failed_shader.words = {0xbf860001u, 0xbf810000u};
+    failed_shader.has_endpgm = true;
+    failed_shader.content_hash = gpu_capture_hash(
+        reinterpret_cast<const uint8_t*>(failed_shader.words.data()), failed_shader.words.size() * 4);
+    first.raw_shader_versions.push_back(failed_shader);
+    GpuCapturedOperationFailure failed_operation;
+    failed_operation.kind = SubmitOperationKind::Draw;
+    failed_operation.source_index = 5;
+    failed_operation.command_order = 900;
+    failed_operation.reason = RealizationFailureReason::ShaderRecompile;
+    GpuCapturedStageDiagnostic failed_stage;
+    failed_stage.stage = ShaderProgramStage::Fragment;
+    failed_stage.program_addr = 0x400000;
+    failed_stage.raw_shader_index = 0;
+    failed_stage.coverage.total = 1;
+    failed_stage.coverage.unsupported = 1;
+    failed_stage.coverage.first_bad_fmt = 2;
+    failed_stage.coverage.first_bad_op = 6;
+    failed_stage.coverage.first_bad_pc = 0;
+    failed_operation.stages.push_back(failed_stage);
+    first.failure_diagnostics.push_back(failed_operation);
+    first.failure_diagnostics_available = true;
     GpuCaptureFile second = first;
     second.metadata.submit_index = 42;
     second.metadata.input_route = "shift-the-serialized-blob-boundary";
@@ -82,7 +106,9 @@ int main() {
     CHECK(materialize_gpu_capture_bundle_submit(loaded, 0, restored_first, error) &&
           materialize_gpu_capture_bundle_submit(loaded, 1, restored_second, error) &&
           restored_second.metadata.submit_index == 42 && restored_second.blobs.size() == 1 &&
-          restored_second.blobs[0].guest_addr == 0x200000 && restored_second.blobs[0].bytes == blob.bytes,
+          restored_second.blobs[0].guest_addr == 0x200000 && restored_second.blobs[0].bytes == blob.bytes &&
+          restored_second.failure_diagnostics_available && restored_second.failure_diagnostics.size() == 1 &&
+          restored_second.raw_shader_versions[0].words == failed_shader.words,
           "bundle reconstructs an exact validated capture");
     CHECK(materialize_gpu_capture_bundle_manifest(loaded, 1, second_manifest, error) &&
           second_manifest.metadata.submit_index == 42 && second_manifest.blobs.size() == 1 &&

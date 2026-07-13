@@ -873,7 +873,10 @@ ComputeLaunchDimensions resolve_compute_launch(const GpuState::Dispatch& d) {
     return out;
 }
 
-std::vector<ComputeItem> realize_compute_dispatches(const GpuState& st, uint64_t submit_no) {
+std::vector<ComputeItem> realize_compute_dispatches(
+    const GpuState& st, uint64_t submit_no,
+    std::vector<OperationRealizationFailure>* failures) {
+    if (failures) failures->clear();
     if (st.dispatches.empty()) return {};
     namespace P = prosper::agc::Pm4;
     auto rd = [](const std::unordered_map<uint32_t, uint32_t>& regs, uint32_t off) {
@@ -888,9 +891,42 @@ std::vector<ComputeItem> realize_compute_dispatches(const GpuState& st, uint64_t
         const GpuState& ds = dispatch.state ? *dispatch.state : st;
         const uint64_t code_addr = (static_cast<uint64_t>(rd(ds.sh, P::COMPUTE_PGM_LO)) << 8) |
                                    (static_cast<uint64_t>(rd(ds.sh, P::COMPUTE_PGM_HI) & 0xffu) << 40);
+        OperationRealizationFailure failure;
+        failure.kind = SubmitOperationKind::Dispatch;
+        failure.index = dispatch_index;
+        failure.command_order = dispatch.command_order;
+        failure.compute_launch = resolve_compute_launch(dispatch);
+        auto record_failure = [&](RealizationFailureReason reason,
+                                  const std::shared_ptr<ShaderResourceTable>& resources,
+                                  const std::vector<uint32_t>& spirv) {
+            if (!failures) return;
+            failure.reason = reason;
+            ShaderRealizationDiagnostic stage;
+            stage.stage = ShaderProgramStage::Compute;
+            stage.program_addr = code_addr;
+            stage.resources = resources;
+            stage.recompiled = !spirv.empty();
+            if (!spirv.empty()) {
+                const DescriptorValidationReport diagnostic_report =
+                    validate_spirv_descriptor_interface(spirv, resources.get(), 0,
+                                                        SpirvShaderStage::Compute, true);
+                stage.descriptor_issue_count =
+                    static_cast<uint32_t>(diagnostic_report.issues.size());
+                auto issue = std::find_if(diagnostic_report.issues.begin(),
+                                          diagnostic_report.issues.end(),
+                                          [](const auto& candidate) { return candidate.error; });
+                if (issue == diagnostic_report.issues.end() && !diagnostic_report.issues.empty())
+                    issue = diagnostic_report.issues.begin();
+                if (issue != diagnostic_report.issues.end())
+                    stage.first_descriptor_issue = static_cast<uint32_t>(issue->code);
+            }
+            failure.stages.push_back(std::move(stage));
+            failures->push_back(std::move(failure));
+        };
         const auto* header = static_cast<const AgcShaderHeader*>(
             prosper_agc_shader_header_for_code(code_addr));
         if (!header || !code_addr || !guest_readable(code_addr, sizeof(uint32_t))) {
+            record_failure(RealizationFailureReason::MissingProgram, {}, {});
             static std::set<uint64_t> logged;
             if (logged.insert(code_addr).second)
                 std::fprintf(stderr, "[compute] skip unregistered/unreadable program 0x%llx\n",
@@ -944,6 +980,7 @@ std::vector<ComputeItem> realize_compute_dispatches(const GpuState& st, uint64_t
         item.submit_no = submit_no;
         item.command_order = dispatch.command_order;
         if (item.spirv.empty()) {
+            record_failure(RealizationFailureReason::ShaderRecompile, item.resources, item.spirv);
             // PROSPER_DYNTRACE_FAIL=1: replay the FAILED compute program's resource build with the
             // const-fold walk trace + user-data dump forced on (once per distinct program) — the
             // compute analog of the graphics VS/PS fail-replay (gpu_execute.hpp). Compute dispatches
@@ -984,6 +1021,7 @@ std::vector<ComputeItem> realize_compute_dispatches(const GpuState& st, uint64_t
         const DescriptorValidationReport report = validate_spirv_descriptor_interface(
             item.spirv, item.resources.get(), 0, SpirvShaderStage::Compute, false);
         if (!report.ok()) {
+            record_failure(RealizationFailureReason::DescriptorContract, item.resources, item.spirv);
             static std::set<uint64_t> logged;
             if (logged.insert(code_addr).second)
                 std::fprintf(stderr, "[compute] skip invalid descriptor contract for program 0x%llx\n",

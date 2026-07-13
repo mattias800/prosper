@@ -7,6 +7,7 @@
 #include "gpu_capture.hpp"
 
 #include "bc_decode.hpp"
+#include "rdna2_decode.hpp"
 #include "tile.hpp"
 
 #include <algorithm>
@@ -18,8 +19,11 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <map>
+#include <set>
+#include <tuple>
 #include <unordered_set>
 #include <utility>
 
@@ -32,7 +36,7 @@ namespace prosper::gpu {
 namespace {
 
 constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
-constexpr uint32_t kVersion = 6;
+constexpr uint32_t kVersion = 7;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -42,6 +46,8 @@ constexpr uint32_t kMaxComputes = 65536;
 constexpr uint32_t kMaxOperations = 131072;
 constexpr uint32_t kMaxResources = 65536;
 constexpr uint32_t kMaxShaderWords = 16u << 20;
+constexpr uint32_t kMaxRawShaderWords = 0x4000; // 64 KiB per failed stage
+constexpr uint32_t kMaxFailureStages = 3;
 constexpr uint32_t kMaxStringBytes = 1u << 20;
 constexpr uint64_t kMaxTotalRttSeedBytes = 1ull << 30;
 
@@ -116,10 +122,16 @@ struct Reader {
         if (n > kMaxStringBytes || n > left) { if (error) *error = "invalid string length"; return false; }
         s.assign(reinterpret_cast<const char*>(p), n); p += n; left -= n; return true;
     }
-    bool words(std::vector<uint32_t>& v) {
+    bool words_bounded(std::vector<uint32_t>& v, uint32_t maximum, const char* length_error) {
         uint32_t n; if (!u32(n)) return false;
-        if (n > kMaxShaderWords || uint64_t(n) * 4 > left) { if (error) *error = "invalid word-vector length"; return false; }
+        if (n > maximum || uint64_t(n) * 4 > left) {
+            if (error) *error = length_error;
+            return false;
+        }
         v.resize(n); for (auto& x : v) if (!u32(x)) return false; return true;
+    }
+    bool words(std::vector<uint32_t>& v) {
+        return words_bounded(v, kMaxShaderWords, "invalid word-vector length");
     }
     bool bytes(std::vector<uint8_t>& v) {
         uint64_t n; if (!u64(n)) return false;
@@ -367,12 +379,223 @@ uint32_t shader_version_index(const std::vector<GpuCaptureShaderVersion>& versio
     return it == versions.end() ? 0xFFFFFFFFu : static_cast<uint32_t>(it - versions.begin());
 }
 
+using OperationIdentity = std::tuple<uint8_t, uint64_t, uint64_t>;
+
+OperationIdentity operation_identity(SubmitOperationKind kind, uint64_t source_index,
+                                     uint64_t command_order) {
+    return {static_cast<uint8_t>(kind), source_index, command_order};
+}
+
+bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::string& error) {
+    if (capture.raw_shader_versions.size() > kMaxResources ||
+        capture.failure_diagnostics.size() > kMaxOperations) {
+        error = "invalid failed-operation diagnostic count";
+        return false;
+    }
+    uint64_t raw_words = 0;
+    for (const auto& shader : capture.raw_shader_versions) {
+        if (shader.words.empty() || shader.words.size() > kMaxRawShaderWords ||
+            raw_words > kMaxShaderWords - shader.words.size()) {
+            error = "failed-operation raw shader data exceeds its bounded limit";
+            return false;
+        }
+        if (shader.content_hash != shader_hash(shader.words)) {
+            error = "failed-operation raw shader content hash mismatch";
+            return false;
+        }
+        raw_words += shader.words.size();
+    }
+
+    std::set<OperationIdentity> diagnosed;
+    std::vector<bool> raw_referenced(capture.raw_shader_versions.size(), false);
+    for (const auto& diagnostic : capture.failure_diagnostics) {
+        if (diagnostic.kind > SubmitOperationKind::Dispatch ||
+            diagnostic.reason <= RealizationFailureReason::None ||
+            diagnostic.reason > RealizationFailureReason::Filtered ||
+            diagnostic.stages.size() > kMaxFailureStages) {
+            error = "invalid failed-operation diagnostic metadata";
+            return false;
+        }
+        const OperationIdentity identity = operation_identity(
+            diagnostic.kind, diagnostic.source_index, diagnostic.command_order);
+        const auto operation = std::find_if(capture.operations.begin(), capture.operations.end(),
+            [&](const auto& candidate) {
+                return operation_identity(candidate.kind, candidate.source_index,
+                                          candidate.command_order) == identity;
+            });
+        if (operation == capture.operations.end() || operation->realized) {
+            error = "failed-operation diagnostic does not match an unrealized operation";
+            return false;
+        }
+        if (!diagnosed.insert(identity).second) {
+            error = "duplicate failed-operation diagnostic";
+            return false;
+        }
+        std::set<uint8_t> stage_kinds;
+        for (const auto& stage : diagnostic.stages) {
+            if (stage.stage > ShaderProgramStage::Compute ||
+                (stage.raw_shader_index != 0xFFFFFFFFu &&
+                 stage.raw_shader_index >= capture.raw_shader_versions.size()) ||
+                stage.resource_count > kMaxResources ||
+                stage.coverage.total > kMaxRawShaderWords ||
+                stage.coverage.alu > stage.coverage.total ||
+                stage.coverage.exports > stage.coverage.total ||
+                stage.coverage.table_dependent > stage.coverage.total ||
+                stage.coverage.unsupported > stage.coverage.total ||
+                (!stage.resource_table_present && stage.resource_count != 0) ||
+                (!stage.program_addr && stage.raw_shader_index != 0xFFFFFFFFu) ||
+                !stage_kinds.insert(static_cast<uint8_t>(stage.stage)).second) {
+                error = "invalid failed-stage diagnostic metadata";
+                return false;
+            }
+            if (stage.raw_shader_index != 0xFFFFFFFFu)
+                raw_referenced[stage.raw_shader_index] = true;
+            const uint32_t max_issue = static_cast<uint32_t>(DescriptorIssueCode::UnusedRuntimeBinding);
+            if ((!stage.descriptor_issue_count && stage.first_descriptor_issue != 0xFFFFFFFFu) ||
+                (stage.descriptor_issue_count && stage.first_descriptor_issue > max_issue)) {
+                error = "invalid failed-stage descriptor diagnostic";
+                return false;
+            }
+        }
+    }
+    for (const auto& operation : capture.operations) {
+        if (!operation.realized && diagnosed.count(operation_identity(
+                operation.kind, operation.source_index, operation.command_order)) == 0) {
+            error = "unrealized operation is missing its failure diagnostic";
+            return false;
+        }
+    }
+    if (std::find(raw_referenced.begin(), raw_referenced.end(), false) != raw_referenced.end()) {
+        error = "failed-operation raw shader is not referenced";
+        return false;
+    }
+    return true;
+}
+
+bool capture_failure_diagnostics(
+    const std::vector<OperationRealizationFailure>& failures,
+    const CaptureMemoryReader& reader, GpuCaptureFile& capture, std::string& error) {
+    if (failures.size() > kMaxOperations) {
+        error = "invalid failed-operation diagnostic count";
+        return false;
+    }
+    uint64_t raw_words = 0;
+    auto capture_raw_shader = [&](uint64_t addr, uint32_t& index) -> bool {
+        index = 0xFFFFFFFFu;
+        if (!addr) return true;
+        std::vector<uint32_t> words(kMaxRawShaderWords);
+        const size_t bytes_read = std::min<size_t>(
+            reader(addr, reinterpret_cast<uint8_t*>(words.data()), words.size() * sizeof(uint32_t)),
+            words.size() * sizeof(uint32_t));
+        words.resize(bytes_read / sizeof(uint32_t));
+        if (words.empty()) return true;
+        std::vector<Rdna2Inst> instructions;
+        const size_t consumed = rdna2_walk(words.data(), words.size(), instructions);
+        if (consumed && consumed < words.size()) words.resize(consumed);
+        const bool has_endpgm = !instructions.empty() && instructions.back().is_end;
+        const uint64_t hash = shader_hash(words);
+        auto existing = std::find_if(capture.raw_shader_versions.begin(),
+                                     capture.raw_shader_versions.end(), [&](const auto& candidate) {
+            return candidate.content_hash == hash && candidate.words == words;
+        });
+        if (existing != capture.raw_shader_versions.end()) {
+            index = static_cast<uint32_t>(existing - capture.raw_shader_versions.begin());
+            return true;
+        }
+        if (capture.raw_shader_versions.size() >= kMaxResources ||
+            raw_words > kMaxShaderWords - words.size()) {
+            error = "failed-operation raw shader data exceeds its bounded limit";
+            return false;
+        }
+        index = static_cast<uint32_t>(capture.raw_shader_versions.size());
+        raw_words += words.size();
+        capture.raw_shader_versions.push_back({hash, has_endpgm, std::move(words)});
+        return true;
+    };
+
+    for (const auto& failure : failures) {
+        GpuCapturedOperationFailure diagnostic;
+        diagnostic.kind = failure.kind;
+        diagnostic.source_index = failure.index;
+        diagnostic.command_order = failure.command_order;
+        diagnostic.reason = failure.reason;
+        diagnostic.pipeline_present = failure.pipeline_present;
+        diagnostic.pipeline = failure.pipeline;
+        diagnostic.color0_base = failure.color0_base;
+        diagnostic.color0_width = failure.color0_width;
+        diagnostic.color0_height = failure.color0_height;
+        diagnostic.vertex_count = failure.vertex_count;
+        diagnostic.compute_launch = failure.compute_launch;
+        for (const auto& runtime_stage : failure.stages) {
+            GpuCapturedStageDiagnostic stage;
+            stage.stage = runtime_stage.stage;
+            stage.program_addr = runtime_stage.program_addr;
+            stage.recompiled = runtime_stage.recompiled;
+            stage.resource_table_present = runtime_stage.resources != nullptr;
+            stage.resource_count = runtime_stage.resources
+                ? static_cast<uint32_t>(runtime_stage.resources->resources.size()) : 0;
+            stage.coverage = runtime_stage.coverage;
+            stage.descriptor_issue_count = runtime_stage.descriptor_issue_count;
+            stage.first_descriptor_issue = runtime_stage.first_descriptor_issue;
+            if (!capture_raw_shader(stage.program_addr, stage.raw_shader_index)) return false;
+            if (stage.raw_shader_index < capture.raw_shader_versions.size()) {
+                const auto& raw = capture.raw_shader_versions[stage.raw_shader_index].words;
+                stage.coverage = recompile_coverage(raw.data(), raw.size());
+            }
+            diagnostic.stages.push_back(std::move(stage));
+        }
+        capture.failure_diagnostics.push_back(std::move(diagnostic));
+    }
+    for (const auto& operation : capture.operations) {
+        if (operation.realized) continue;
+        const auto existing = std::find_if(capture.failure_diagnostics.begin(),
+                                           capture.failure_diagnostics.end(), [&](const auto& candidate) {
+            return operation_identity(candidate.kind, candidate.source_index,
+                                      candidate.command_order) ==
+                   operation_identity(operation.kind, operation.source_index,
+                                      operation.command_order);
+        });
+        if (existing == capture.failure_diagnostics.end()) {
+            GpuCapturedOperationFailure unknown;
+            unknown.kind = operation.kind;
+            unknown.source_index = operation.source_index;
+            unknown.command_order = operation.command_order;
+            unknown.reason = RealizationFailureReason::Unknown;
+            capture.failure_diagnostics.push_back(std::move(unknown));
+        }
+    }
+    return validate_failure_diagnostics(capture, error);
+}
+
 } // namespace
 
 uint64_t gpu_capture_hash(const uint8_t* data, size_t size) {
     uint64_t h = 1469598103934665603ull;
     for (size_t i = 0; i < size; ++i) { h ^= data[i]; h *= 1099511628211ull; }
     return h;
+}
+
+const char* shader_program_stage_name(ShaderProgramStage stage) {
+    switch (stage) {
+        case ShaderProgramStage::Vertex: return "vertex";
+        case ShaderProgramStage::Fragment: return "fragment";
+        case ShaderProgramStage::Compute: return "compute";
+    }
+    return "unknown";
+}
+
+const char* realization_failure_reason_name(RealizationFailureReason reason) {
+    switch (reason) {
+        case RealizationFailureReason::None: return "none";
+        case RealizationFailureReason::Unknown: return "unknown";
+        case RealizationFailureReason::MissingProgram: return "missing-program";
+        case RealizationFailureReason::ShaderRecompile: return "shader-recompile";
+        case RealizationFailureReason::DescriptorContract: return "descriptor-contract";
+        case RealizationFailureReason::NoEffect: return "no-effect";
+        case RealizationFailureReason::ZeroVertices: return "zero-vertices";
+        case RealizationFailureReason::Filtered: return "filtered";
+    }
+    return "unknown";
 }
 
 bool capture_draw_items(const std::vector<DrawItem>& items, const GpuCaptureMetadata& metadata,
@@ -392,8 +615,10 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
                           const std::vector<SubmitOperation>& operations,
                           const GpuCaptureMetadata& metadata,
                           const CaptureMemoryReader& reader, GpuCaptureFile& out,
-                          std::string& error, const CaptureRttSeedReader& rtt_reader) {
+                          std::string& error, const CaptureRttSeedReader& rtt_reader,
+                          const std::vector<OperationRealizationFailure>& failures) {
     error.clear(); out = {}; out.metadata = metadata;
+    out.failure_diagnostics_available = true;
     if (draws.size() > kMaxDraws || computes.size() > kMaxComputes ||
         operations.size() > kMaxOperations) {
         error = "capture item or operation count is invalid";
@@ -444,6 +669,7 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
             : realized_computes.count(operation.index) != 0;
         out.operations.push_back({operation.kind, operation.index, operation.command_order, realized});
     }
+    if (!capture_failure_diagnostics(failures, reader, out, error)) return false;
     collect_shader_versions(out);
     if (rtt_reader) {
         std::vector<uint64_t> candidates;
@@ -479,14 +705,17 @@ bool capture_gpustate_submit(const GpuState& state, uint64_t submit_no,
                              uint32_t width, uint32_t height,
                              const GpuCaptureMetadata& metadata,
                              GpuCaptureFile& out, std::string& error) {
-    std::vector<DrawItem> draws = realize_gpustate_draws(state);
-    std::vector<ComputeItem> computes = realize_compute_dispatches(state, submit_no);
+    std::vector<OperationRealizationFailure> failures, compute_failures;
+    std::vector<DrawItem> draws = realize_gpustate_draws(state, 0x10000, 1.0f, 1.0f, &failures);
+    std::vector<ComputeItem> computes = realize_compute_dispatches(state, submit_no, &compute_failures);
+    failures.insert(failures.end(), std::make_move_iterator(compute_failures.begin()),
+                    std::make_move_iterator(compute_failures.end()));
     GpuCaptureMetadata actual = metadata;
     actual.width = width;
     actual.height = height;
     actual.submit_index = submit_no;
     return capture_submit_items(draws, computes, plan_submit_operations(state), actual,
-                                read_capture_guest_memory, out, error, g_rtt_seed_reader);
+                                read_capture_guest_memory, out, error, g_rtt_seed_reader, failures);
 }
 
 bool capture_gpustate_target_submit(const GpuState& state, uint64_t submit_no,
@@ -584,6 +813,36 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         w.u8(static_cast<uint8_t>(operation.kind)); w.u64(operation.source_index);
         w.u64(operation.command_order); w.u8(operation.realized);
     }
+    if (!validate_failure_diagnostics(c, error)) return false;
+    w.u32(static_cast<uint32_t>(c.raw_shader_versions.size()));
+    for (const auto& shader : c.raw_shader_versions) {
+        w.u64(shader.content_hash); w.u8(shader.has_endpgm); w.words(shader.words);
+    }
+    w.u32(static_cast<uint32_t>(c.failure_diagnostics.size()));
+    for (const auto& diagnostic : c.failure_diagnostics) {
+        w.u8(static_cast<uint8_t>(diagnostic.kind)); w.u64(diagnostic.source_index);
+        w.u64(diagnostic.command_order); w.u8(static_cast<uint8_t>(diagnostic.reason));
+        w.u8(diagnostic.pipeline_present);
+        if (diagnostic.pipeline_present) write_pipeline(w, diagnostic.pipeline);
+        w.u64(diagnostic.color0_base); w.u32(diagnostic.color0_width);
+        w.u32(diagnostic.color0_height); w.u32(diagnostic.vertex_count);
+        const auto& launch = diagnostic.compute_launch;
+        w.u32(launch.threads_x); w.u32(launch.threads_y); w.u32(launch.threads_z);
+        w.u32(launch.local_x); w.u32(launch.local_y); w.u32(launch.local_z);
+        w.u32(launch.groups_x); w.u32(launch.groups_y); w.u32(launch.groups_z);
+        w.u32(static_cast<uint32_t>(diagnostic.stages.size()));
+        for (const auto& stage : diagnostic.stages) {
+            w.u8(static_cast<uint8_t>(stage.stage)); w.u64(stage.program_addr);
+            w.u32(stage.raw_shader_index); w.u8(stage.recompiled);
+            w.u8(stage.resource_table_present); w.u32(stage.resource_count);
+            w.u32(stage.coverage.total); w.u32(stage.coverage.alu);
+            w.u32(stage.coverage.exports); w.u32(stage.coverage.unsupported);
+            w.u32(stage.coverage.table_dependent);
+            w.u32(static_cast<uint32_t>(stage.coverage.first_bad_fmt));
+            w.u32(stage.coverage.first_bad_op); w.u32(stage.coverage.first_bad_pc);
+            w.u32(stage.descriptor_issue_count); w.u32(stage.first_descriptor_issue);
+        }
+    }
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -617,8 +876,15 @@ bool read_gpu_capture(const std::string& path, GpuCaptureFile& c, std::string& e
 bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& c, std::string& error) {
     error.clear(); c = {};
     Reader r{bytes.data(), bytes.size(), &error}; char magic[8]; uint32_t version, endian;
-    if (!r.take(magic, 8) || std::memcmp(magic, kMagic, 8) || !r.u32(version) || version < 1 || version > kVersion ||
-        !r.u32(endian) || endian != kEndian) { error = "unsupported capture header"; return false; }
+    if (!r.take(magic, 8)) { error = "truncated capture header"; return false; }
+    if (std::memcmp(magic, kMagic, 8)) { error = "invalid capture magic"; return false; }
+    if (!r.u32(version)) { error = "truncated capture version"; return false; }
+    if (version < 1 || version > kVersion) {
+        error = "unsupported capture version " + std::to_string(version);
+        return false;
+    }
+    if (!r.u32(endian)) { error = "truncated capture byte-order marker"; return false; }
+    if (endian != kEndian) { error = "unsupported capture byte order"; return false; }
     auto& m = c.metadata;
     if (!r.u32(m.width) || !r.u32(m.height) || !r.u64(m.submit_index) || !r.string(m.revision) ||
         !r.string(m.title_id) || !r.string(m.input_route) || !r.string(m.savedata_dir)) return false;
@@ -718,12 +984,87 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
             c.operations.push_back({SubmitOperationKind::Draw, i, c.draws[i].command_order, true});
         }
     }
+    if (version >= 7) {
+        c.failure_diagnostics_available = true;
+        uint32_t raw_count = 0;
+        if (!r.u32(raw_count) || raw_count > kMaxResources) {
+            error = "invalid failed-operation raw shader count";
+            return false;
+        }
+        c.raw_shader_versions.resize(raw_count);
+        uint64_t raw_words = 0;
+        for (auto& shader : c.raw_shader_versions) {
+            uint8_t has_endpgm = 0;
+            if (!r.u64(shader.content_hash) || !r.u8(has_endpgm) ||
+                !r.words_bounded(shader.words, kMaxRawShaderWords,
+                                 "invalid failed-operation raw shader length")) return false;
+            shader.has_endpgm = has_endpgm != 0;
+            if (shader.words.empty() || raw_words > kMaxShaderWords - shader.words.size()) {
+                error = "failed-operation raw shader data exceeds its bounded limit";
+                return false;
+            }
+            raw_words += shader.words.size();
+        }
+        uint32_t diagnostic_count = 0;
+        if (!r.u32(diagnostic_count) || diagnostic_count > kMaxOperations) {
+            error = "invalid failed-operation diagnostic count";
+            return false;
+        }
+        c.failure_diagnostics.resize(diagnostic_count);
+        for (auto& diagnostic : c.failure_diagnostics) {
+            uint8_t kind = 0, reason = 0, pipeline_present = 0;
+            if (!r.u8(kind) || kind > static_cast<uint8_t>(SubmitOperationKind::Dispatch) ||
+                !r.u64(diagnostic.source_index) || !r.u64(diagnostic.command_order) ||
+                !r.u8(reason) || reason <= static_cast<uint8_t>(RealizationFailureReason::None) ||
+                reason > static_cast<uint8_t>(RealizationFailureReason::Filtered) ||
+                !r.u8(pipeline_present)) {
+                error = "invalid failed-operation diagnostic metadata";
+                return false;
+            }
+            diagnostic.kind = static_cast<SubmitOperationKind>(kind);
+            diagnostic.reason = static_cast<RealizationFailureReason>(reason);
+            diagnostic.pipeline_present = pipeline_present != 0;
+            if (diagnostic.pipeline_present && !read_pipeline(r, diagnostic.pipeline, version)) return false;
+            if (!r.u64(diagnostic.color0_base) || !r.u32(diagnostic.color0_width) ||
+                !r.u32(diagnostic.color0_height) || !r.u32(diagnostic.vertex_count)) return false;
+            auto& launch = diagnostic.compute_launch;
+            if (!r.u32(launch.threads_x) || !r.u32(launch.threads_y) || !r.u32(launch.threads_z) ||
+                !r.u32(launch.local_x) || !r.u32(launch.local_y) || !r.u32(launch.local_z) ||
+                !r.u32(launch.groups_x) || !r.u32(launch.groups_y) || !r.u32(launch.groups_z)) return false;
+            uint32_t stage_count = 0;
+            if (!r.u32(stage_count) || stage_count > kMaxFailureStages) {
+                error = "invalid failed-stage diagnostic count";
+                return false;
+            }
+            diagnostic.stages.resize(stage_count);
+            for (auto& stage : diagnostic.stages) {
+                uint8_t stage_kind = 0, recompiled = 0, table_present = 0;
+                uint32_t first_bad_fmt = 0;
+                if (!r.u8(stage_kind) || stage_kind > static_cast<uint8_t>(ShaderProgramStage::Compute) ||
+                    !r.u64(stage.program_addr) || !r.u32(stage.raw_shader_index) ||
+                    !r.u8(recompiled) || !r.u8(table_present) || !r.u32(stage.resource_count) ||
+                    !r.u32(stage.coverage.total) || !r.u32(stage.coverage.alu) ||
+                    !r.u32(stage.coverage.exports) || !r.u32(stage.coverage.unsupported) ||
+                    !r.u32(stage.coverage.table_dependent) || !r.u32(first_bad_fmt) ||
+                    !r.u32(stage.coverage.first_bad_op) || !r.u32(stage.coverage.first_bad_pc) ||
+                    !r.u32(stage.descriptor_issue_count) || !r.u32(stage.first_descriptor_issue)) return false;
+                stage.stage = static_cast<ShaderProgramStage>(stage_kind);
+                stage.recompiled = recompiled != 0;
+                stage.resource_table_present = table_present != 0;
+                stage.coverage.first_bad_fmt = static_cast<int32_t>(first_bad_fmt);
+            }
+        }
+        if (!validate_failure_diagnostics(c, error)) return false;
+    }
     if (r.left) { error = "capture has trailing data"; return false; }
     return true;
 }
 
 bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::string& error) {
     error.clear(); out = {}; out.metadata = c.metadata; out.blobs = c.blobs; out.rtt_seeds = c.rtt_seeds;
+    out.raw_shader_versions = c.raw_shader_versions;
+    out.failure_diagnostics = c.failure_diagnostics;
+    out.failure_diagnostics_available = c.failure_diagnostics_available;
     out.expected_output_valid = c.expected_output_valid;
     out.expected_output_hash = c.expected_output_hash; out.expected_output_bytes = c.expected_output_bytes;
     size_t resource_reference_count = 0;

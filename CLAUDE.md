@@ -114,7 +114,7 @@ The animation-sensitive exact splash guard (#573) remains separate.
 
 The current tooling frontier is deterministic offline capture rather than longer live-render windows.
 Native-speed `.prgtl` indexes retain every submit/present boundary, and an exact-submit selector can materialize
-immutable, content-deduplicated graphics/compute state plus mixed PM4 order into a version-6 `.prgcap` (#594).
+immutable, content-deduplicated graphics/compute state plus mixed PM4 order into a version-7 `.prgcap` (#594).
 `gpu_replay --graph` / `--graph-json` now resolve in-submit versions and temporal read-before-write leaves (#600;
 full workflow: `prosper/tools/gpu_replay/README.md`). Timeline version 5 resolves those leaves against bounded
 same-run target history. Ordered `.prgbundle` windows now capture producer-time submits with content-defined
@@ -146,9 +146,13 @@ stage-specific proof: every VOPC input must be scalar/inline/literal or have a n
 definition from an unmodified uniform VOP1 move/conversion. Only then can the wave-empty VCC test lower to a
 per-invocation structured loop; varying bounds and compute remain fail-visible. `shader_inspect` decodes raw
 `PROSPER_SHADER_DUMP` files with exact dword PCs and branch targets. Current live gameplay samples realize all
-semantic draws; #618 tracks retaining the failed shader/state in future capsules.
+semantic draws. Capture v7 (#618) retains a failed stage fault-safely through `s_endpgm` or a 64 KiB cap,
+content-deduplicates it, and records exact coverage/opcode/PC, decoded pipeline/launch state, and
+resource/descriptor summaries. Start with `gpu_replay --inspect-only`; extract a raw stage with
+`--dump-failed-shader FAILURE:STAGE PATH` instead of rerunning the title.
 Do not treat `--bundle-final-capsule` as an exact DS checkpoint: it snapshots color RTT state, not live Vulkan
-depth/stencil images (#569). Capture v6 and timeline v5 remain backward-compatible with old local artifacts.
+depth/stencil images (#569). Capture v7 reads v1-v6 artifacts (failed-operation diagnostics report unavailable);
+timeline v5 remains backward-compatible with old local artifacts.
 Addresses and operation ordinals are run-local. The #608 `90 draws + 738x420 at draw 79..81` conjunction is
 also historical: a fresh 2026-07-13 route reached sustained 90-91-draw gameplay submits but did not match it.
 Recalibrate the semantic selector under #594 before a new exact capture. The Dead Cells splash guard alternates
