@@ -338,19 +338,31 @@ fault per kernel-transition boundary, not per access; a loop guard only re-appli
 actually changed). `PROSPER_NO_GUEST_FS=1` reverts to the old wall, confirming this is the enabler.
 Result: boot advances far past the wall into deep guest code.
 
-### The Windows frontier: a deep, nondeterministic guest crash
+### Guest allocator + worker threads — SOLVED (lazy-commit + worker trampoline)
 
-With `%fs` TLS in, boot reaches a much deeper guest crash — `eboot+0x17968cd`, a 9-frame guest
-backtrace, faulting on a **high mapped guest address** (not null), and it is **nondeterministic**
-(some runs `RUN ENDED` cleanly, some hard-fault / trip the Windows heap check). Prime suspects, in
-order: (1) the **deferred phys-aliasing** in the memory HLE — the guest may map one phys offset at two
-VAs expecting shared bytes, but Win32 gives it two private `VirtualAlloc` buffers, so writes through
-one VA aren't seen through the other; (2) **ASLR** — guest `VirtualAlloc` bases vary per run, so a
-guest assumption about layout would fault differently each time (a fixed-base reservation would make
-runs reproducible); (3) an HLE behavior only now reached. Next step: make the guest mapping
-deterministic (fixed base) to get a reproducible crash, then decide whether phys-aliasing must be
-implemented (the 64 KiB-granularity `CreateFileMapping`/`MapViewOfFile3` section approach) for this
-title.
+The deep crash after `%fs` TLS was two more Linux-parity gaps (fixed on `port/windows-boot-2`, PR #628):
+- **Lazy-commit.** The guest's binned allocator writes into pages inside a range it RESERVED but never
+  explicitly committed. Linux's SIGSEGV handler lazily backs these on first touch; the Windows VEH did
+  not, so allocator init faulted at a reserved page (diagnosed with a `[memclass]` fault classifier that
+  showed the fault address as reserved-but-uncommitted). The VEH now `VirtualAlloc(MEM_COMMIT)`s the
+  64 KiB page on a tracked-reserved fault and retries.
+- **Worker-thread ABI + TLS.** The Windows `pthread_create` path called the guest entry directly via
+  winpthreads: MS-x64 ABI (arg in rcx, guest reads rdi) and no `guest_tls_activate_thread()`. The first
+  worker got a garbage arg and no guest TCB and crashed on a null-derived deref (`mov 0x38(%rbx)`,
+  rbx=0) on an unrecoverable thread. A `win_thread_trampoline` now marshals the SysV entry through
+  `prosper_call_guest_sysv` and activates the worker's guest `%fs` TCB.
+
+### The Windows frontier: wire the renderer (guest reaches the frame loop and idle-waits)
+
+The Windows guest now **boots fully multi-threaded into the running frame loop and idle-waits** (0%
+CPU across 4 threads, zero unimplemented Sony calls, no crash) — the same state the Linux *headless*
+`boot_trace` reaches: alive, waiting for the GPU/present side to make progress. `boot_trace` wires no
+Vulkan on Windows, so the next step to a rendered frame is bringing up the live Vulkan renderer +
+present path on Windows (the `frontends/shared/live_renderer` used by `prosper-app`), analogous to
+`PROSPER_RENDER=1` on Linux. Deferred, lower-priority items surfaced along the way: phys-offset
+aliasing in the memory HLE (needed by UE4 MallocBinned3, not this Unity title — `CreateFileMapping`/
+`MapViewOfFile3`, 64 KiB granularity); honoring reserve alignment > 64 KiB (over-reserve + trim);
+worker-thread stack registration for GC bounds; and `PROSPER_CRASHPEEK` guards.
 
 **What is done (compiles + links, in CI):**
 - **`exec_image_win.cpp`** — the Win32 sibling of `exec_image_linux.cpp` implementing the full
@@ -373,21 +385,22 @@ title.
   `Windows MinGW` job builds the whole boot path.
 
 **What is left (runtime work, on a Windows host):**
-1. **The deep nondeterministic guest crash — the current blocker.** See "The Windows frontier" above:
-   make guest mappings deterministic (fixed base) for a reproducible crash, then likely implement
-   phys-aliasing in the memory HLE (`CreateFileMapping`/`MapViewOfFile3`, 64 KiB granularity).
-2. ~~Port the direct/flexible-memory HLE~~ — **DONE** (private-`VirtualAlloc` port; phys-aliasing
-   deferred — now a prime suspect for item 1).
-3. ~~Guest `%fs` TLS~~ — **DONE** (FSGSBASE + VEH re-apply; see above).
-4. **Validate/repair the guest→HLE ABI trampoline for XMM/float args.** Integer args are converted
+1. **Wire the Vulkan renderer on Windows — the current frontier.** The guest boots into the frame loop
+   and idle-waits for the GPU/present side (see above). Bring up `frontends/shared/live_renderer` +
+   present on Windows (the `PROSPER_RENDER=1` analogue) to drive past the wait toward a rendered frame.
+2. ~~Port the direct/flexible-memory HLE~~ — **DONE** (private-`VirtualAlloc`; phys-aliasing deferred,
+   only needed by UE4 MallocBinned3, not this Unity title).
+3. ~~Guest `%fs` TLS~~ — **DONE** (FSGSBASE + VEH re-apply).
+4. ~~Guest allocator (reserved-page lazy commit) + worker-thread ABI/%fs TLS~~ — **DONE** (PR #628).
+5. **Validate/repair the guest→HLE ABI trampoline for XMM/float args.** Integer args are converted
    and now runtime-exercised through init; **XMM/float args are still not converted** (e.g. some libc
    formatters / `printf`-family) — add float-arg conversion when a title needs it.
-5. **VEH recovery hardening for stack-overflow faults** — recovery resumes on the faulting thread's
+6. **VEH recovery hardening for stack-overflow faults** — recovery resumes on the faulting thread's
    current stack; a true stack-overflow fault still needs a guard-page/dedicated-stack story (Linux
    uses `sigaltstack`). The `__builtin_longjmp` change fixed the cross-frame-unwind crash; this is the
    separate genuine-overflow case. Also: `PROSPER_CRASHPEEK` faults on Windows (the IL2CPP klass
    walker needs the same `guest_readable` guards the Linux path has).
-6. **Audit the 103 `(HleFn)`-cast handlers** — almost all cast targets are `HLE()`-defined handlers
+7. **Audit the 103 `(HleFn)`-cast handlers** — almost all cast targets are `HLE()`-defined handlers
    and so route correctly through the trampoline, but confirm none are raw host functions relying on
    host-ABI arg passing.
 
