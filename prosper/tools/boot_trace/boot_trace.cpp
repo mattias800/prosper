@@ -140,6 +140,7 @@ int main(int argc, char** argv) {
     // this lets the REAL cutscene render past the crash while the engine-level "create the Stopwatch"
     // fix is developed. `len` = number of whole prologue bytes to relocate (>=5). Requires an executable
     // guest-adjacent cave within +/-2GB so a 5-byte jmp rel32 reaches it.
+#ifndef _WIN32   // PROSPER_NULLGUARD is a Messenger-specific mmap+patch diagnostic; not ported to Windows yet.
     if (const char* ng = getenv("PROSPER_NULLGUARD")) {
         char* e1 = nullptr; uint64_t addr = strtoull(ng, &e1, 0);
         long len = (e1 && *e1 == ',') ? strtol(e1 + 1, nullptr, 0) : 13;
@@ -184,6 +185,7 @@ int main(int argc, char** argv) {
             }
         }
     }
+#endif  // !_WIN32 (PROSPER_NULLGUARD)
 
 #ifdef PROSPER_HAVE_VULKAN
     // Compute is part of command submission even when frame rendering/dumping is disabled.

@@ -33,7 +33,7 @@
 
 namespace prosper {
 
-#define HLE(name) static uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
+#define HLE(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
                                        uint64_t a3, uint64_t a4, uint64_t a5)
 
 namespace {
@@ -1137,18 +1137,405 @@ void register_kernel_mem_hle() {
 } // namespace prosper
 
 #else
+// ============================================================================================
+// Windows backing (Win32 VirtualAlloc/VirtualProtect). Sibling of the POSIX impl above.
+//
+// PS5 memory model (identical to the Linux path): reserve a virtual range, allocate "direct"
+// (physical) memory as an opaque pool offset, then map it — or flexible memory — into VA. The
+// direct-memory POOL BOOKKEEPING (dmem_take / g_dmem) and the VA TRACKER (g_maps) are pure
+// logic COPIED VERBATIM from the Linux path so VirtualQuery/DirectMemoryQuery stay truthful and
+// the allocator's first-fit/window semantics match byte-for-byte.
+//
+// What DIFFERS: the OS primitives. Linux uses mmap over a shared memfd so a phys offset can be
+// mapped at two VAs that ALIAS the same bytes (unified-physical-memory contract, needed by UE4
+// PPSA17942 MallocBinned3). Win32 file-mapping views are hard-limited to 64 KiB granularity for
+// both base address and file offset, but the guest maps at 16 KiB — so a faithful section-based
+// alias is a larger follow-up (tracked separately, area:ue4). Here we back every mapping with
+// PRIVATE committed VirtualAlloc memory: aliasing is NOT preserved, but the Messenger (Unity/
+// IL2CPP) never re-aliases a phys offset, so this unblocks its Windows boot. VirtualAlloc
+// zero-fills committed pages, so the console's fresh-pages-read-zero contract holds for free
+// (no dmem_zero needed). CONFIDENCE: HIGH for private-memory correctness on non-aliasing guests;
+// the aliasing gap is documented and will break MallocBinned3 on Windows until the section port.
+// ============================================================================================
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #include <atomic>
 #include <chrono>
 #include <climits>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
+#include <vector>
 
 namespace prosper {
 
-#define HLE(name) static uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
+#define HLE(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
                                        uint64_t a3, uint64_t a4, uint64_t a5)
+
+namespace {
+    bool memlog() { static int v = getenv("PROSPER_MEMLOG") ? 1 : 0; return v; }
+    #define MLOG(...) do { if (memlog()) fprintf(stderr, "[memhle] " __VA_ARGS__); } while (0)
+
+    // --- VA tracker + direct-memory pool: PURE logic, copied verbatim from the Linux path -----
+    struct Mapping { uint64_t base, size; int prot; bool committed; char name[32]; };
+    std::mutex g_mx;
+    std::vector<Mapping> g_maps;
+    constexpr uint64_t kDmemBase  = 0x10000000;
+    constexpr uint64_t kDmemTotal = 8ull * 1024 * 1024 * 1024;   // 8 GiB pool
+    struct DMem { uint64_t start, end; int type; };
+    std::mutex g_dmx;
+    std::vector<DMem> g_dmem;
+
+    // First-fit claim of `sz` bytes at `align` within [lo,hi) — identical to the Linux allocator.
+    bool dmem_take(uint64_t sz, uint64_t align, int type, uint64_t& off_out,
+                   uint64_t lo = 0, uint64_t hi = ~0ull) {
+        if (!align) align = 0x4000;
+        if (lo < kDmemBase) lo = kDmemBase;
+        if (hi > kDmemBase + kDmemTotal) hi = kDmemBase + kDmemTotal;
+        if (lo >= hi) return false;
+        std::lock_guard<std::mutex> lk(g_dmx);
+        uint64_t cursor = kDmemBase;
+        size_t insert_at = 0;
+        for (size_t i = 0; i <= g_dmem.size(); i++) {
+            uint64_t gap_beg = cursor;
+            uint64_t gap_end = (i < g_dmem.size()) ? g_dmem[i].start : kDmemBase + kDmemTotal;
+            uint64_t beg = gap_beg < lo ? lo : gap_beg;
+            uint64_t end = gap_end > hi ? hi : gap_end;
+            uint64_t off = (beg + align - 1) & ~(align - 1);
+            if (off + sz <= end) { insert_at = i; off_out = off; goto found; }
+            if (i < g_dmem.size()) cursor = g_dmem[i].end;
+        }
+        return false;
+    found:
+        g_dmem.insert(g_dmem.begin() + insert_at, { off_out, off_out + sz, type });
+        return true;
+    }
+    void dmem_largest_free(uint64_t lo, uint64_t hi, uint64_t align, uint64_t& off_out, uint64_t& size_out) {
+        if (!align) align = 0x4000;
+        if (lo < kDmemBase) lo = kDmemBase;
+        if (hi > kDmemBase + kDmemTotal) hi = kDmemBase + kDmemTotal;
+        off_out = 0; size_out = 0;
+        std::lock_guard<std::mutex> lk(g_dmx);
+        uint64_t cursor = kDmemBase;
+        for (size_t i = 0; i <= g_dmem.size(); i++) {
+            uint64_t gap_beg = cursor;
+            uint64_t gap_end = (i < g_dmem.size()) ? g_dmem[i].start : kDmemBase + kDmemTotal;
+            uint64_t beg = gap_beg < lo ? lo : gap_beg;
+            uint64_t end = gap_end > hi ? hi : gap_end;
+            uint64_t aligned = (beg + align - 1) & ~(align - 1);
+            if (end > aligned && end - aligned > size_out) { off_out = aligned; size_out = end - aligned; }
+            if (i < g_dmem.size()) cursor = g_dmem[i].end;
+        }
+    }
+    void dmem_release(uint64_t start, uint64_t len) {
+        uint64_t end = start + len;
+        std::lock_guard<std::mutex> lk(g_dmx);
+        std::vector<DMem> out;
+        out.reserve(g_dmem.size());
+        for (auto& d : g_dmem) {
+            if (d.end <= start || d.start >= end) { out.push_back(d); continue; }
+            if (d.start < start) out.push_back({ d.start, start, d.type });
+            if (d.end > end)     out.push_back({ end, d.end, d.type });
+        }
+        g_dmem.swap(out);
+    }
+    void track(uint64_t base, uint64_t size, int prot, bool committed, const char* nm) {
+        std::lock_guard<std::mutex> lk(g_mx);
+        Mapping m{ base, size, prot, committed, {0} };
+        if (nm) { strncpy(m.name, nm, sizeof m.name - 1); }
+        g_maps.push_back(m);
+    }
+    void untrack(uint64_t base, uint64_t len) {
+        if (!len) return;
+        uint64_t end = base + len;
+        std::lock_guard<std::mutex> lk(g_mx);
+        std::vector<Mapping> out;
+        out.reserve(g_maps.size() + 1);
+        for (auto& m : g_maps) {
+            uint64_t me = m.base + m.size;
+            if (me <= base || m.base >= end) { out.push_back(m); continue; }
+            if (m.base < base) { Mapping lo = m; lo.size = base - m.base; out.push_back(lo); }
+            if (me > end)      { Mapping hi = m; hi.base = end; hi.size = me - end; out.push_back(hi); }
+        }
+        g_maps.swap(out);
+    }
+    void retrack_prot(uint64_t base, uint64_t len, int prot, const char* nm) {
+        if (!len) return;
+        untrack(base, len);
+        track(base, len, prot, true, nm);
+    }
+    const Mapping* find(uint64_t addr) {
+        std::lock_guard<std::mutex> lk(g_mx);
+        const Mapping* best = nullptr;
+        for (auto& m : g_maps)
+            if (addr >= m.base && addr < m.base + m.size)
+                if (!best || m.base > best->base) best = &m;
+        return best;
+    }
+    uint64_t next_base(uint64_t addr) {
+        std::lock_guard<std::mutex> lk(g_mx);
+        uint64_t n = 0;
+        for (auto& m : g_maps)
+            if (m.base > addr && (n == 0 || m.base < n)) n = m.base;
+        return n;
+    }
+    uint64_t align_up(uint64_t v, uint64_t a) { return a ? (v + a - 1) & ~(a - 1) : v; }
+
+    // Guest Orbis protection bits (READ=1, WRITE=2 [implies read], EXEC=4). WRITE implies READ,
+    // and prot 0 is a legitimate no-access guard page (matches the Linux host_prot #342 fix).
+    enum { HP_R = 1, HP_W = 2, HP_X = 4 };
+    int host_prot(uint64_t p) {
+        int hp = 0;
+        if (p & 0x1) hp |= HP_R;
+        if (p & 0x2) hp |= HP_R | HP_W;
+        if (p & 0x4) hp |= HP_X;
+        return hp;   // p == 0 -> no access
+    }
+    // --- Win32 OS primitives (the platform-specific half) -------------------------------------
+    DWORD win_page_prot(int hp) {
+        bool w = hp & HP_W, r = hp & HP_R, x = hp & HP_X;
+        if (x) return w ? PAGE_EXECUTE_READWRITE : (r ? PAGE_EXECUTE_READ : PAGE_EXECUTE);
+        if (w) return PAGE_READWRITE;
+        if (r) return PAGE_READONLY;
+        return PAGE_NOACCESS;
+    }
+    // Commit `len` at `hint` (0 = OS chooses). Handles BOTH the guest's reserve-then-commit flow
+    // (ReserveVirtualRange did MEM_RESERVE; commit within it) AND a fresh map, by trying MEM_COMMIT
+    // first (succeeds only over an existing reservation) then MEM_RESERVE|MEM_COMMIT.
+    void* win_commit(uint64_t hint, uint64_t len, int hp) {
+        DWORD pp = win_page_prot(hp);
+        if (!hint) return VirtualAlloc(nullptr, (SIZE_T)len, MEM_RESERVE | MEM_COMMIT, pp);
+        if (void* p = VirtualAlloc((void*)hint, (SIZE_T)len, MEM_COMMIT, pp)) return p;
+        return VirtualAlloc((void*)hint, (SIZE_T)len, MEM_RESERVE | MEM_COMMIT, pp);
+    }
+    // Reserve (no commit). VirtualAlloc reservations are 64 KiB-aligned, satisfying guest aligns
+    // up to 64 KiB; larger alignment is logged and left to the OS base (follow-up).
+    void* win_reserve(uint64_t hint, uint64_t len, bool fixed, uint64_t align) {
+        if (align > 0x10000)
+            MLOG("reserve align=0x%llx > 64KiB not honored on Win32 (OS 64KiB base)\n",
+                 (unsigned long long)align);
+        if (hint) {
+            if (void* p = VirtualAlloc((void*)hint, (SIZE_T)len, MEM_RESERVE, PAGE_NOACCESS)) return p;
+            if (fixed) return nullptr;   // SCE_KERNEL_MAP_FIXED: must be exactly this address
+        }
+        return VirtualAlloc(nullptr, (SIZE_T)len, MEM_RESERVE, PAGE_NOACCESS);
+    }
+    bool win_protect(uint64_t addr, uint64_t len, int hp) {
+        DWORD old = 0;
+        return VirtualProtect((void*)addr, (SIZE_T)len, win_page_prot(hp), &old) != 0;
+    }
+    // Decommit (partial-safe; keeps any surrounding reservation). A full MEM_RELEASE needs the
+    // exact allocation base with size 0, which we don't track, so decommit is the safe general op.
+    void win_unmap(uint64_t addr, uint64_t len) {
+        if (addr && len) VirtualFree((void*)addr, (SIZE_T)len, MEM_DECOMMIT);
+    }
+} // namespace
+
+// Fault-handler lazy-commit probe parity (Linux exports this for its SIGSEGV handler). We commit
+// eagerly on Win32 so the VEH handler never needs lazy commit, but expose the symbol identically
+// in case the shared fault path references it: 0 = untracked, 1 = reserved, 2 = committed.
+extern "C" int prosper_reserved_range_state(uint64_t addr) {
+    std::lock_guard<std::mutex> lk(g_mx);
+    const Mapping* best = nullptr;
+    for (auto& m : g_maps)
+        if (addr >= m.base && addr < m.base + m.size)
+            if (!best || m.base > best->base) best = &m;
+    return best ? (best->committed ? 2 : 1) : 0;
+}
+
+// --- Handlers: Win32 versions of the Linux memory HLE, same Sony contracts -------------------
+
+// sceKernelReserveVirtualRange(void** addrInOut, size_t len, int flags, size_t align)
+HLE(k_reserve_vrange) {
+    uint64_t hint = a0 ? *(uint64_t*)a0 : 0;
+    uint64_t align = a3 ? a3 : 0x4000;
+    const bool fixed = (a2 & 0x10) != 0;   // SCE_KERNEL_MAP_FIXED
+    if (!a1) return 0x80020016ull;         // EINVAL (len 0)
+    // Idempotent re-reserve of our own uncommitted range (Linux #115 parity).
+    if (hint) {
+        bool ours = false;
+        { std::lock_guard<std::mutex> lk(g_mx);
+          for (auto& m : g_maps)
+              if (!m.committed && hint >= m.base && hint < m.base + m.size) { ours = true; break; } }
+        if (ours) { if (a0) *(uint64_t*)a0 = hint;
+                    MLOG("reserve hint=0x%llx re-reserve-of-own-range -> OK\n", (unsigned long long)hint);
+                    return 0; }
+    }
+    void* p = win_reserve(hint, a1, fixed, align);
+    if (!p) { MLOG("reserve hint=0x%llx len=0x%llx FAILED\n",
+                   (unsigned long long)hint, (unsigned long long)a1); return 0x8002000cull; } // ENOMEM
+    if (a0) *(uint64_t*)a0 = (uint64_t)p;
+    track((uint64_t)p, a1, 0, false, "reserved");
+    MLOG("reserve -> 0x%llx len=0x%llx flags=0x%llx align=0x%llx\n",
+         (unsigned long long)p, (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)align);
+    return 0;
+}
+
+// sceKernelMapNamedFlexibleMemory(void** addrInOut, size_t len, int prot, int flags, const char* name)
+HLE(k_map_flexible) {
+    uint64_t hint = a0 ? *(uint64_t*)a0 : 0;
+    void* p = win_commit(hint, a1, host_prot(a2));
+    if (!p) { MLOG("mapflexible hint=0x%llx len=0x%llx FAILED\n",
+                   (unsigned long long)hint, (unsigned long long)a1); return 0x8002000cull; }
+    if (a0) *(uint64_t*)a0 = (uint64_t)p;
+    track((uint64_t)p, a1, host_prot(a2), true, a4 ? (const char*)a4 : "flexible");
+    MLOG("mapflexible -> 0x%llx len=0x%llx prot=0x%llx\n",
+         (unsigned long long)p, (unsigned long long)a1, (unsigned long long)a2);
+    return 0;
+}
+HLE(k_map_flexible_noname) { return k_map_flexible(a0, a1, a2, a3, 0, 0); }
+
+// sceKernelAvailableFlexibleMemorySize(size_t* sizeOut) — 512 MiB budget (shadPS4 parity).
+HLE(k_avail_flexible) { if (!a0) return 0x80020016ull; *(uint64_t*)(uintptr_t)a0 = 512ull * 1024 * 1024; return 0; }
+
+// sceKernelAllocateDirectMemory(start, end, len, align, memType, off_t* physOut)
+HLE(k_alloc_dmem) {
+    uint64_t align = a3 ? a3 : 0x4000;
+    uint64_t sz = align_up(a2, align);
+    uint64_t off;
+    if (!dmem_take(sz, align, (int)a4, off, a0, a1 ? a1 : ~0ull)) {
+        MLOG("alloc_dmem len=0x%llx in [0x%llx,0x%llx) -> ENOMEM\n",
+             (unsigned long long)a2, (unsigned long long)a0, (unsigned long long)a1);
+        return 0x8002000Cull;
+    }
+    if (a5 > 0xffff) *(uint64_t*)a5 = off;
+    MLOG("alloc_dmem len=0x%llx -> phys=0x%llx\n", (unsigned long long)a2, (unsigned long long)off);
+    return 0;
+}
+// sceKernelAllocateMainDirectMemory(len, align, memType, off_t* physOut) — physOut at arg3.
+HLE(k_alloc_main_dmem) {
+    uint64_t align = a1 ? a1 : 0x4000;
+    uint64_t sz = align_up(a0, align);
+    uint64_t off;
+    if (!dmem_take(sz, align, (int)a2, off)) {
+        MLOG("alloc_main_dmem len=0x%llx -> ENOMEM\n", (unsigned long long)a0);
+        return 0x8002000Cull;
+    }
+    if (a3 > 0xffff) *(uint64_t*)a3 = off;
+    MLOG("alloc_main_dmem len=0x%llx -> phys=0x%llx\n", (unsigned long long)a0, (unsigned long long)off);
+    return 0;
+}
+
+// sceKernelDirectMemoryQuery(off_t offset, int flags, info*, size_t infoSize)
+HLE(k_direct_memory_query) {
+    if (!a2) return 0x80020016ull;
+    uint8_t* info = (uint8_t*)a2;
+    uint64_t sz = a3 ? (a3 > 0x18 ? 0x18 : a3) : 0x18;
+    memset(info, 0, sz);
+    std::lock_guard<std::mutex> lk(g_dmx);
+    const DMem* hit = nullptr; const DMem* next = nullptr;
+    for (auto& d : g_dmem) {
+        if (a0 >= d.start && a0 < d.end) { if (!hit || d.start > hit->start) hit = &d; }
+        if (d.start > a0 && (!next || d.start < next->start)) next = &d;
+    }
+    const DMem* r = hit ? hit : ((a1 & 1) ? next : nullptr);
+    if (!r) return 0x8002000eull;
+    if (sz >= 0x08) *(uint64_t*)(info + 0x00) = r->start;
+    if (sz >= 0x10) *(uint64_t*)(info + 0x08) = r->end;
+    if (sz >= 0x14) *(int32_t*)(info + 0x10) = r->type;
+    return 0;
+}
+
+// sceKernelMapDirectMemory(void** addrInOut, len, prot, flags, off_t phys, size_t align)
+HLE(k_map_dmem) {
+    uint64_t hint = a0 ? *(uint64_t*)a0 : 0;
+    void* p = win_commit(hint, a1, host_prot(a2));   // private memory: phys (a4) not aliased (see banner)
+    if (!p) { MLOG("map_dmem hint=0x%llx len=0x%llx FAILED\n",
+                   (unsigned long long)hint, (unsigned long long)a1); return 0x8002000cull; }
+    if (a0) *(uint64_t*)a0 = (uint64_t)p;
+    track((uint64_t)p, a1, host_prot(a2), true, "direct");
+    MLOG("map_dmem -> 0x%llx len=0x%llx phys=0x%llx\n",
+         (unsigned long long)p, (unsigned long long)a1, (unsigned long long)a4);
+    return 0;
+}
+
+HLE(k_munmap)   { if (!a1) return 0x80020016ull;
+                  if (a0) { win_unmap(a0, a1); untrack(a0, a1); } return 0; }
+HLE(k_mprotect) { if (a0) { win_protect(a0, a1, host_prot(a2)); retrack_prot(a0, a1, host_prot(a2), "mprotect"); } return 0; }
+HLE(k_mtypeprotect) { if (a0) { win_protect(a0, a1, host_prot(a3)); retrack_prot(a0, a1, host_prot(a3), "mtypeprotect"); } return 0; }
+HLE(k_dmem_size){ return kDmemTotal; }
+// sceKernelAvailableDirectMemorySize(searchStart, searchEnd, align, off_t* physOut, size_t* sizeOut)
+HLE(k_avail_dmem) {
+    if (!a3 || !a4) return 0x80020016ull;
+    uint64_t off = 0, size = 0;
+    dmem_largest_free(a0, a1 ? a1 : (kDmemBase + kDmemTotal), a2, off, size);
+    if (!size) return 0x8002000Cull;
+    *(uint64_t*)(uintptr_t)a3 = off;
+    *(uint64_t*)(uintptr_t)a4 = size;
+    return 0;
+}
+HLE(k_release_dmem) { dmem_release(a0, a1); return 0; }
+
+// sceKernelBatchMap(entries, num, int* numOut) — entry 0x20 bytes: start@0, phys@8, len@0x10,
+// prot@0x18(char), type@0x19, op@0x1c. Ops: 0=MAP_DIRECT 1=UNMAP 2=PROTECT 3=MAP_FLEXIBLE 4=TYPE_PROTECT.
+HLE(k_batch_map) {
+    const uint8_t* e = (const uint8_t*)(uintptr_t)a0;
+    int n = (int)(int64_t)a1, done = 0;
+    if (!e || n < 0) return 0x80020016ull;
+    uint64_t ret = 0;
+    for (int i = 0; i < n; i++, e += 0x20) {
+        uint64_t start = *(const uint64_t*)(e + 0x00);
+        uint64_t len   = *(const uint64_t*)(e + 0x10);
+        uint8_t  prot  = e[0x18];
+        int32_t  op    = *(const int32_t*)(e + 0x1c);
+        bool ok = true;
+        switch (op) {
+            case 0: case 3: {                       // MAP_DIRECT / MAP_FLEXIBLE (private-backed on Win32)
+                void* p = win_commit(start, len, host_prot(prot));
+                ok = (p != nullptr);
+                if (ok) track((uint64_t)p, len, host_prot(prot), true, op == 0 ? "batch-direct" : "batch-flex");
+                break;
+            }
+            case 1: if (start) { win_unmap(start, len); untrack(start, len); } break;   // UNMAP
+            case 2: case 4:                                                              // PROTECT / TYPE_PROTECT
+                if (start) { win_protect(start, len, host_prot(prot));
+                             retrack_prot(start, len, host_prot(prot), "batch-prot"); } break;
+            default: ok = false; ret = 0x80020016ull; break;
+        }
+        if (!ok) { if (!ret) ret = 0x8002000Cull; break; }
+        done++;
+    }
+    if (a2) *(int32_t*)(uintptr_t)a2 = done;
+    MLOG("batchmap n=%d done=%d -> 0x%llx\n", n, done, (unsigned long long)ret);
+    return ret;
+}
+
+// sceKernelVirtualQuery(addr, flags, info*, infoSize): 0x00 start;0x08 end;0x18 i32 prot;0x20 u32 flags;0x24 name[32]
+HLE(k_virtual_query) {
+    if (!a2) return 0x80020016ull;
+    uint8_t* info = (uint8_t*)a2;
+    uint64_t sz = a3 ? (a3 > 0x48 ? 0x48 : a3) : 0x48;
+    memset(info, 0, sz);
+    const Mapping* m = find(a0);
+    uint64_t start, end; int prot; uint32_t flags;
+    if (m) {
+        start = m->base; end = m->base + m->size;
+        prot = m->committed ? 0x3 : 0x0; flags = m->committed ? 0x10 : 0x0;
+    } else {
+        uint64_t nb = next_base(a0);
+        if (!nb) return 0x8002000eull;
+        start = a0 & ~(uint64_t)0x3fff; end = nb; prot = 0; flags = 0;
+    }
+    if (sz >= 0x08) *(uint64_t*)(info + 0x00) = start;
+    if (sz >= 0x10) *(uint64_t*)(info + 0x08) = end;
+    if (sz >= 0x1c) *(int32_t*)(info + 0x18) = prot;
+    if (sz >= 0x24) *(uint32_t*)(info + 0x20) = flags;
+    if (sz >= 0x44 && m && m->name[0]) memcpy(info + 0x24, m->name, 32);
+    return 0;
+}
+
+// libSceAmpr / APR command-buffer trio + teardown. These commit UE4 (PPSA17942, area:ue4)
+// allocator pages; that title does not boot on Windows yet, so no-op stubs are correct here
+// (the Linux path models them). Registered by raw NID for parity.
+HLE(k_ampr_ok) { return 0; }
 
 namespace {
 std::mutex g_sync_mx;
@@ -1192,8 +1579,44 @@ HLE(k_wake_by_address) {
 }
 
 void register_kernel_mem_hle() {
+    #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
+    R("sceKernelReserveVirtualRange", k_reserve_vrange);
+    R("sceKernelMapNamedFlexibleMemory", k_map_flexible);
+    R("sceKernelMapFlexibleMemory", k_map_flexible_noname);
+    Hle::register_fn("4h6F1LLbTiw", (HleFn)k_map_flexible_noname, "sceKernelMapFlexibleMemoryInternal");
+    R("sceKernelAvailableFlexibleMemorySize", k_avail_flexible);
+    R("sceKernelAllocateDirectMemory", k_alloc_dmem);
+    R("sceKernelAllocateMainDirectMemory", k_alloc_main_dmem);
+    R("sceKernelMapDirectMemory", k_map_dmem);
+    R("sceKernelMapNamedDirectMemory", k_map_dmem);
+    R("sceKernelMunmap", k_munmap);
+    R("sceKernelReleaseFlexibleMemory", k_munmap);
+    R("sceKernelMprotect", k_mprotect);
+    R("sceKernelMtypeprotect", k_mtypeprotect);
+    R("sceKernelReleaseDirectMemory", k_release_dmem);
+    R("sceKernelCheckedReleaseDirectMemory", k_release_dmem);
+    R("sceKernelBatchMap", k_batch_map);
+    R("sceKernelBatchMap2", k_batch_map);
+    R("sceKernelVirtualQuery", k_virtual_query);
+    R("sceKernelDirectMemoryQuery", k_direct_memory_query);
+    R("sceKernelGetDirectMemorySize", k_dmem_size);
+    R("sceKernelAvailableDirectMemorySize", k_avail_dmem);
+    #undef R
     Hle::register_fn("Hc4CaR6JBL0", (HleFn)k_wait_on_address, "sceKernelWaitOnAddress?");
     Hle::register_fn("q2y-wDIVWZA", (HleFn)k_wake_by_address, "sceKernelWakeByAddress?");
+    // libSceAmpr / APR command-buffer trio + teardown — no-op stubs on Windows (area:ue4).
+    Hle::register_fn("8aI7R7WaOlc", (HleFn)k_ampr_ok, "sceAmprCommandBufferConstructor");
+    Hle::register_fn("a8uLzYY--tM", (HleFn)k_ampr_ok, "sceAmprAprCommandBufferConstructor");
+    Hle::register_fn("N-FSPA4S3nI", (HleFn)k_ampr_ok, "sceAmprCommandBufferSetBuffer");
+    Hle::register_fn("baQO9ez2gL4", (HleFn)k_ampr_ok, "sceAmprCommandBufferReset");
+    Hle::register_fn("ULvXMDz56po", (HleFn)k_ampr_ok, "sceAmprCommandBufferClearBuffer");
+    Hle::register_fn("tZDDEo2tE5k", (HleFn)k_ampr_ok, "sceAmprCommandBufferGetSize");
+    Hle::register_fn("Qs1xtplKo0U", (HleFn)k_ampr_ok, "sceAmprAprCommandBufferDestructor");
+    Hle::register_fn("GuchCTefuZw", (HleFn)k_ampr_ok, "sceAmprCommandBufferDestructor");
+    Hle::register_fn("sSAUCCU1dv4", (HleFn)k_ampr_ok, "AprSetEventQueue?");
+    Hle::register_fn("H896Pt-yB4I", (HleFn)k_ampr_ok, "AprCbSetEventQueue?");
+    Hle::register_fn("ASoW5WE-UPo", (HleFn)k_ampr_ok, "AprSubmitCommandBuffer?");
+    Hle::register_fn("GnxKOHEawhk", (HleFn)k_ampr_ok, "AmprUnknown3");
 }
 
 } // namespace prosper

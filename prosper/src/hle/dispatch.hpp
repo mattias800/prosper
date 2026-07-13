@@ -13,8 +13,23 @@
 
 namespace prosper {
 
+// Guest↔host calling-convention boundary. The guest is always System V AMD64 (PS5/FreeBSD ABI).
+// On Linux/macOS the host is *also* SysV, so an HLE handler is a plain C function the guest calls
+// directly. On Windows the host ABI is Microsoft x64, so every function the guest calls directly —
+// the HLE handlers and any host callback the guest invokes — MUST be tagged SysV, or the six
+// integer args (guest: rdi/rsi/rdx/rcx/r8/r9) are read from the wrong registers (MS: rcx/rdx/r8/r9
+// + stack). PROSPER_SYSV_ABI is that tag: `__attribute__((sysv_abi))` on Windows, empty elsewhere.
+// See docs/PORTING.md "Windows". NOTE: we do NOT tag handlers `__attribute__((sysv_abi))` on
+// Windows — that conflicts with SEH-based C++ exception unwinding in MinGW ("`.seh_handlerdata`
+// used outside of `.seh_proc` block"), and 537 STL-using handlers can't all drop exceptions.
+// Instead the guest↔host ABI conversion is done in the emitted import-stub trampoline
+// (exec_image_win.cpp emit_impl/emit_unimpl), so every handler stays a plain host function.
+// PROSPER_SYSV_ABI is therefore empty on all platforms today; it is kept as the single documented
+// marker of the boundary in case a future toolchain makes the attribute viable.
+#define PROSPER_SYSV_ABI
+
 // Generic HLE handler signature (up to 6 integer/pointer args, SysV).
-using HleFn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+using HleFn = PROSPER_SYSV_ABI uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 
 // One unresolved import across the whole linked program (deduped by NID). Its index
 // is the stub slot number; the trap logger names calls via this table.
@@ -127,6 +142,14 @@ uint64_t guest_tls_activate_thread();   // per guest thread at entry; returns gu
 void guest_fs_enter_host_for_signal();  // crash-signal-handler entry: swap guest %fs -> host %fs (no-op if not guest TCB)
 uint64_t guest_fs_to_host_scoped();     // diagnostic handler (returns to guest): swap to host %fs, return prev fs
 void guest_fs_restore_scoped(uint64_t prev_fs);  // restore the fs returned by guest_fs_to_host_scoped
+// This thread's guest TP (0 if guest-fs not active on it). On Windows the fault handler queries this
+// to detect a drifted FS base (Windows zeroes the user FS base on every kernel transition).
+uint64_t guest_fs_current_tp();
+// If guest-fs is active on this thread and the live FS base has drifted from the guest TP, re-apply
+// wrfsbase(guest TP) and return true; else false. The Windows VEH calls this to transparently retry a
+// faulting guest %fs access after the OS reset the base. Returns false when the base is already
+// correct (so a genuine fault at an fs-relative insn is NOT retried forever). No-op → false on Linux.
+bool guest_fs_reapply();
 // Diagnostic (test): the Variant II static-TLS distance below the thread pointer for module id
 // `modid`, and the total below TP — verifies the per-module PT_TLS p_align layout (#143). Linux-only.
 uint64_t guest_tls_module_below(uint32_t modid);

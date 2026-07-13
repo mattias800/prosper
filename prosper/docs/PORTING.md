@@ -296,6 +296,107 @@ This is exactly the hard sub-problem flagged above for both Windows and macOS. P
 accesses** — the fault handler already decodes instructions at fault sites (SSE4a), so
 trap-and-emulate of `%fs:` operands is in-house technology.
 
+## Windows port status (2026-07-13) — the guest now BOOTS through module init into guest code
+
+The foundation (below) was compile-verified via MinGW-w64; since then a **Windows host has
+runtime-verified the boot**. The guest now links its modules, runs its module-init functions,
+reaches the real entry point, and executes deep guest code — stopping only at the confirmed
+**guest `%fs` TLS wall** (details below). `boot_trace.exe` goes from "crash at the first init fn"
+to a full `RUN ENDED` report. Three runtime bugs were fixed to get here (commits on
+`port/windows-core`):
+
+- **Direct/flexible-memory HLE ported to Win32** (`hle_kernel_mem.cpp` `#else` block). The pool
+  bookkeeping + VA tracker are copied verbatim from POSIX; mappings are backed by private
+  `VirtualAlloc`/`VirtualProtect`/`VirtualFree`. Phys-offset aliasing is NOT preserved (Win32 view
+  granularity is 64 KiB vs the guest's 16 KiB) — fine for Unity/IL2CPP (Messenger), a follow-up for
+  UE4 MallocBinned3. The guest now allocates + maps its pools.
+- **Host→guest SysV call trampoline** (`prosper_call_guest_sysv`). `run_guest_inits` called the guest
+  init fns with a plain C call, which on Windows uses the MS x64 ABI (args in rcx/rdx) while the guest
+  reads SysV (rdi/rsi) — the `module_start` got a garbage `argp` and jumped wild. The asm shim marshals
+  argc→rdi/argp→rsi and preserves the MS callee-saved regs the SysV callee may clobber (rsi/rdi/xmm6-15).
+- **VEH recovery uses `__builtin_setjmp`/`__builtin_longjmp`, not the CRT pair.** The CRT `longjmp`
+  does a full SEH unwind (`RtlUnwindEx`) from the fault site back to `setjmp`, which cannot traverse
+  the guest frame or the hand-written trampoline (no `.pdata`/`.xdata`) → `STATUS_STACK_OVERFLOW`
+  instead of recovery. The `__builtin_*` pair restores rsp/rbp/rip with no unwind (matching Linux).
+  Also: `run_entry` now points `NT_TIB.StackBase/StackLimit` at the switched guest stack during guest
+  execution so exception dispatch on that stack doesn't spuriously report stack exhaustion.
+
+### Guest `%fs` TLS — SOLVED (FSGSBASE + VEH re-apply)
+
+Was: boot stopped at `eboot+0x808f35` (`mov %fs:0x0,%rax` faulting at `addr=0x0`, zero Sony imports
+called) — uninitialized guest initial-exec TLS, guest `%fs` base 0 on Windows. An FS-base probe
+settled the strategy: **user-mode `rdfsbase`/`wrfsbase` work** (CR4.FSGSBASE, Win10 1709+), but
+**Windows resets the user FS base to 0 on every kernel transition** (a `Sleep()` zeroed it; it
+restores the thread's kernel-saved base and `wrfsbase` doesn't update that copy), so "set once" is
+impossible. Unlike Linux, the *host* uses `%gs` and only the *guest* uses `%fs`, so no per-HLE-call
+swap is needed.
+
+Implemented: a real Windows `guest_tls.cpp` TCB (Variant-II layout, `VirtualAlloc`-backed, self-ptr +
+magic + guest canary), `wrfsbase(TP)` on each guest entry/thread start, and a VEH hook that re-applies
+`wrfsbase(TP)` and retries whenever an `fs`-prefixed instruction faults with the base drifted (one
+fault per kernel-transition boundary, not per access; a loop guard only re-applies when the base
+actually changed). `PROSPER_NO_GUEST_FS=1` reverts to the old wall, confirming this is the enabler.
+Result: boot advances far past the wall into deep guest code.
+
+### The Windows frontier: a deep, nondeterministic guest crash
+
+With `%fs` TLS in, boot reaches a much deeper guest crash — `eboot+0x17968cd`, a 9-frame guest
+backtrace, faulting on a **high mapped guest address** (not null), and it is **nondeterministic**
+(some runs `RUN ENDED` cleanly, some hard-fault / trip the Windows heap check). Prime suspects, in
+order: (1) the **deferred phys-aliasing** in the memory HLE — the guest may map one phys offset at two
+VAs expecting shared bytes, but Win32 gives it two private `VirtualAlloc` buffers, so writes through
+one VA aren't seen through the other; (2) **ASLR** — guest `VirtualAlloc` bases vary per run, so a
+guest assumption about layout would fault differently each time (a fixed-base reservation would make
+runs reproducible); (3) an HLE behavior only now reached. Next step: make the guest mapping
+deterministic (fixed base) to get a reproducible crash, then decide whether phys-aliasing must be
+implemented (the 64 KiB-granularity `CreateFileMapping`/`MapViewOfFile3` section approach) for this
+title.
+
+**What is done (compiles + links, in CI):**
+- **`exec_image_win.cpp`** — the Win32 sibling of `exec_image_linux.cpp` implementing the full
+  `exec_image.hpp` contract: fixed-address guest mapping (`VirtualAlloc` at the guest bases), import
+  stub region, a **Vectored Exception Handler** (VEH) fault handler with SSE4a `INSERTQ`/`EXTRQ`
+  emulation over `CONTEXT.Xmm*`, lazy-ish recovery via a Rip-redirect to a `longjmp` trampoline,
+  `run_entry` (SysV crt0 stack + `jmp`), `run_guest_inits`, the thread-stack registry, and
+  `VirtualQuery`-based region classification. Linux-only diagnostics (perf_event HWBP/HWWATCH, int3
+  `PROSPER_BP`, PEEK/DUMPAT) are intentionally absent.
+- **The SysV⇄MS-x64 ABI boundary** is done in the emitted stub trampoline, NOT via
+  `__attribute__((sysv_abi))` on handlers. The attribute route was tried and **abandoned**: on MinGW
+  it conflicts with SEH-based C++ exception unwinding (`.seh_handlerdata used outside of .seh_proc
+  block`) and cannot be applied to 537 STL-using handlers. Instead `emit_impl` emits a trampoline that
+  converts the guest's SysV integer args (`rdi rsi rdx rcx r8 r9`) to MS x64 (`rcx rdx r8 r9`,
+  `[rsp+0x20]`, `[rsp+0x28]`, +32B shadow, 16-aligned call) before calling the handler, which stays a
+  plain MS-x64 C++ function. Byte encoding disassembly-verified; the register-move ordering is
+  clobber-safe by construction. `PROSPER_SYSV_ABI` (dispatch.hpp) is now an empty documented marker.
+- `guest_tls.cpp` Windows path (guest `%fs` TLS now IMPLEMENTED via FSGSBASE — see above),
+  `boot_program.cpp` enabled on Windows, `boot_trace` built on Windows (no evdev/Vulkan), CI
+  `Windows MinGW` job builds the whole boot path.
+
+**What is left (runtime work, on a Windows host):**
+1. **The deep nondeterministic guest crash — the current blocker.** See "The Windows frontier" above:
+   make guest mappings deterministic (fixed base) for a reproducible crash, then likely implement
+   phys-aliasing in the memory HLE (`CreateFileMapping`/`MapViewOfFile3`, 64 KiB granularity).
+2. ~~Port the direct/flexible-memory HLE~~ — **DONE** (private-`VirtualAlloc` port; phys-aliasing
+   deferred — now a prime suspect for item 1).
+3. ~~Guest `%fs` TLS~~ — **DONE** (FSGSBASE + VEH re-apply; see above).
+4. **Validate/repair the guest→HLE ABI trampoline for XMM/float args.** Integer args are converted
+   and now runtime-exercised through init; **XMM/float args are still not converted** (e.g. some libc
+   formatters / `printf`-family) — add float-arg conversion when a title needs it.
+5. **VEH recovery hardening for stack-overflow faults** — recovery resumes on the faulting thread's
+   current stack; a true stack-overflow fault still needs a guard-page/dedicated-stack story (Linux
+   uses `sigaltstack`). The `__builtin_longjmp` change fixed the cross-frame-unwind crash; this is the
+   separate genuine-overflow case. Also: `PROSPER_CRASHPEEK` faults on Windows (the IL2CPP klass
+   walker needs the same `guest_readable` guards the Linux path has).
+6. **Audit the 103 `(HleFn)`-cast handlers** — almost all cast targets are `HLE()`-defined handlers
+   and so route correctly through the trampoline, but confirm none are raw host functions relying on
+   host-ABI arg passing.
+
+**Reproducing the local compile loop (macOS → Windows):** `brew install mingw-w64`, then
+`cmake -S prosper -B build-win -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc
+-DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ -DCMAKE_SYSTEM_NAME=Windows
+-DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE` and `cmake --build build-win`. A Windows agent builds
+natively under MSYS2/UCRT64 exactly as the CI `Windows MinGW` job does.
+
 ## Proposed sequence
 
 1. **Spikes (hours each, no commitment):**

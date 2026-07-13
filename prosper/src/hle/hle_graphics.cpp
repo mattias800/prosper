@@ -27,7 +27,7 @@
 
 namespace prosper {
 
-#define HLE(name) static uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
+#define HLE(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
                                        uint64_t a3, uint64_t a4, uint64_t a5)
 
 namespace {
@@ -567,7 +567,7 @@ uint64_t glog_impl(const char* nid, void* ra,
     return 0;
 }
 template <size_t I>
-__attribute__((noinline)) uint64_t glog_thunk(uint64_t a0, uint64_t a1, uint64_t a2,
+__attribute__((noinline)) PROSPER_SYSV_ABI uint64_t glog_thunk(uint64_t a0, uint64_t a1, uint64_t a2,
                                               uint64_t a3, uint64_t a4, uint64_t a5) {
     return glog_impl(kAgcNids[I], __builtin_return_address(0), a0, a1, a2, a3, a4, a5);
 }

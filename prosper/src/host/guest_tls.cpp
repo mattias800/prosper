@@ -146,6 +146,20 @@ uint64_t guest_fs_to_host_scoped() {
 }
 void guest_fs_restore_scoped(uint64_t prev_fs) { if (prev_fs) wr_fsbase(prev_fs); }
 
+// This thread's guest TP if it is running on our guest TCB, else 0. (Linux/macOS query the live
+// %fs; the magic marks it as ours.) Used by the Windows fault handler; harmless on Linux.
+uint64_t guest_fs_current_tp() {
+    if (!guest_tls_enabled()) return 0;
+#ifdef __APPLE__
+    return 0;   // guest-fs force-disabled; rd_fsbase SIGILLs under Rosetta
+#else
+    uint64_t fs = rd_fsbase();
+    return (fs && *(volatile uint32_t*)(fs + MAGIC_OFF) == TCB_MAGIC) ? fs : 0;
+#endif
+}
+// Linux/macOS preserve the FS base across kernel transitions, so there is never drift to correct.
+bool guest_fs_reapply() { return false; }
+
 // Diagnostic/test accessors for the Variant II static-TLS layout (#143): the distance below the
 // thread pointer at which module `modid`'s block starts (0 if out of range), and the total static
 // TLS below TP. Computed by guest_tls_set_templates regardless of the PROSPER_GUEST_FS gate, so a
@@ -153,5 +167,108 @@ void guest_fs_restore_scoped(uint64_t prev_fs) { if (prev_fs) wr_fsbase(prev_fs)
 uint64_t guest_tls_module_below(uint32_t modid) { return modid < g_below.size() ? g_below[modid] : 0; }
 uint64_t guest_tls_total_below() { return g_total_below; }
 
+} // namespace prosper
+
+#elif defined(_WIN32)
+// Windows: guest initial-exec %fs TLS, via user-mode FSGSBASE (rdfsbase/wrfsbase, enabled on
+// Win10 1709+). This differs from the Linux path in two ways that together make it SIMPLER here:
+//   (1) The HOST uses %gs (TEB) and only the GUEST uses %fs, so there is NO per-HLE-call %fs swap —
+//       host handlers and guest code never collide on %fs (the Linux stub swap dance is unneeded).
+//   (2) But Windows RESETS the user %fs base to 0 on every kernel transition (context switch /
+//       syscall) — it restores the thread's kernel-saved FS base (0), and wrfsbase updates only the
+//       live register. So "set once and leave it" is impossible. We set the base on guest entry and
+//       the VEH (exec_image_win.cpp) re-applies it and retries whenever a guest %fs access faults
+//       because the base drifted (guest_fs_reapply). One fault per kernel-transition boundary, not
+//       per access. See docs/PORTING.md "The Windows frontier: guest %fs TLS".
+// Because host-%fs aliasing (the Linux default fallback) cannot work here, guest-fs is enabled
+// whenever templates are configured (opt out with PROSPER_NO_GUEST_FS for bisection).
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include "../hle/dispatch.hpp"
+#include <windows.h>
+#include <cstdint>
+#include <cstddef>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+namespace prosper {
+namespace {
+    std::vector<TlsModuleDesc> g_mods;
+    std::vector<uint64_t> g_below;
+    uint64_t g_total_below = 0;
+    bool g_enabled = false, g_configured = false;
+    thread_local uint64_t t_guest_tp = 0;
+
+    inline uint64_t align_up(uint64_t v, uint64_t a) { return a ? (v + a - 1) & ~(a - 1) : v; }
+    inline uint64_t rd_fsbase() { uint64_t v; __asm__ volatile("rdfsbase %0" : "=r"(v)); return v; }
+    inline void     wr_fsbase(uint64_t v) { __asm__ volatile("wrfsbase %0" : : "r"(v)); }
+}
+
+static constexpr uint64_t TCB_SIZE  = 0x200;
+static constexpr uint64_t MAGIC_OFF = 0x108;
+static constexpr uint32_t TCB_MAGIC = 0x50524F53u;   // "PROS"
+
+void guest_tls_set_templates(const TlsModuleDesc* descs, size_t count) {
+    g_enabled = getenv("PROSPER_NO_GUEST_FS") == nullptr;
+    g_mods.assign(descs, descs + count);
+    // x86-64 Variant II static-TLS layout (same math as the Linux path): each module's block sits
+    // BELOW the thread pointer at a distance rounded to its PT_TLS p_align, so a symbol at byte X
+    // reads at %fs:(X - off[i]) — exactly the tpoff the guest static linker baked in.
+    g_below.assign(g_mods.size(), 0);
+    uint64_t off = 0, max_align = 16;
+    for (size_t i = 1; i < g_mods.size(); i++) {
+        uint64_t a = g_mods[i].align ? g_mods[i].align : 16;
+        if (a > max_align) max_align = a;
+        off = align_up(off + g_mods[i].memsz, a);
+        g_below[i] = off;
+    }
+    g_total_below = align_up(off, max_align < 64 ? 64 : max_align);
+    g_configured = true;
+    if (getenv("PROSPER_TLSLOG"))
+        fprintf(stderr, "[tls] guest-fs %s (win/fsgsbase); static TLS below TP = 0x%llx bytes\n",
+                g_enabled ? "ENABLED" : "disabled", (unsigned long long)g_total_below);
+}
+
+bool guest_tls_enabled() { return g_enabled && g_configured; }
+
+uint64_t guest_tls_activate_thread() {
+    if (!guest_tls_enabled()) return 0;
+    if (t_guest_tp) { wr_fsbase(t_guest_tp); return t_guest_tp; }   // idempotent: re-apply, never re-alloc
+    size_t total = (size_t)g_total_below + TCB_SIZE;
+    uint8_t* block = (uint8_t*)VirtualAlloc(nullptr, total, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!block) return 0;
+    memset(block, 0, total);
+    uint64_t tp = (uint64_t)block + g_total_below;
+    for (size_t i = 1; i < g_mods.size(); i++)
+        if (g_mods[i].filesz && g_mods[i].init_va)
+            memcpy((void*)(tp - g_below[i]), (const void*)(uintptr_t)g_mods[i].init_va, g_mods[i].filesz);
+    *(uint64_t*)(tp + 0)         = tp;            // TCB self-pointer (the `mov %fs:0x0` idiom)
+    *(uint32_t*)(tp + MAGIC_OFF) = TCB_MAGIC;     // marks OUR guest TCB
+    // Guest stack-guard canary at %fs:0x28: a fixed non-zero value (the guest checks it for
+    // self-consistency; MinGW's host protector uses a global __stack_chk_guard, not %fs, so there
+    // is no host canary to mirror here — unlike the Linux path).
+    *(uint64_t*)(tp + 0x28) = 0x00000aff0c2b1d5eull;
+    t_guest_tp = tp;
+    wr_fsbase(tp);   // MUST be last — an intervening syscall (e.g. VirtualAlloc) resets the FS base
+    return tp;
+}
+
+uint64_t guest_fs_current_tp() { return t_guest_tp; }
+bool guest_fs_reapply() {
+    if (!t_guest_tp) return false;
+    if (rd_fsbase() == t_guest_tp) return false;   // already correct -> genuine fault, don't loop
+    wr_fsbase(t_guest_tp);
+    return true;
+}
+
+// Host uses %gs on Windows, so no guest<->host %fs swap is ever needed.
+void guest_fs_enter_host_for_signal() {}
+uint64_t guest_fs_to_host_scoped() { return 0; }
+void guest_fs_restore_scoped(uint64_t) {}
+uint64_t guest_tls_module_below(uint32_t modid) { return modid < g_below.size() ? g_below[modid] : 0; }
+uint64_t guest_tls_total_below() { return g_total_below; }
 } // namespace prosper
 #endif
