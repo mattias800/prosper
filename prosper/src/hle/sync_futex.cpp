@@ -6,6 +6,14 @@
 #include <unistd.h>
 #include <sys/syscall.h>
 #include "../host/posix_shim.hpp"
+#elif defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00   // WakeByAddressAll needs >= 0x0602 (Win8)
+#endif
+#include <windows.h>   // native futex: WakeByAddressAll (pairs with WaitOnAddress in hle_kernel_mem.cpp)
 #endif
 
 namespace prosper {
@@ -18,6 +26,14 @@ void futex_wake(uint64_t addr, int n) {
 #if defined(__linux__) || defined(__APPLE__)
     if (!addr) return;
     prosper_futex_wake((uint32_t*)(uintptr_t)addr, n > 1);
+#elif defined(_WIN32)
+    // Native Win32 futex wake, pairing with sceKernelWaitOnAddress's WaitOnAddress (hle_kernel_mem.cpp).
+    // The GPU command processor calls this from RELEASE_MEM/EOP to wake a guest render/producer thread
+    // parked on the label the GPU just wrote — without it the guest's WaitOnAddress never wakes on
+    // Windows and rendering wedges after the first submit. Wake ALL (n is a hint; label waiters are few).
+    if (!addr) return;
+    (void)n;
+    WakeByAddressAll((PVOID)(uintptr_t)addr);
 #else
     (void)addr; (void)n;
 #endif
