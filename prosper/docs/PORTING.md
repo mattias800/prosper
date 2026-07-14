@@ -352,17 +352,29 @@ The deep crash after `%fs` TLS was two more Linux-parity gaps (fixed on `port/wi
   rbx=0) on an unrecoverable thread. A `win_thread_trampoline` now marshals the SysV entry through
   `prosper_call_guest_sysv` and activates the worker's guest `%fs` TCB.
 
-### The Windows frontier: wire the renderer (guest reaches the frame loop and idle-waits)
+### Renderer wired on Windows (#655); the Windows frontier: the Unity job-system pre-render stall
 
-The Windows guest now **boots fully multi-threaded into the running frame loop and idle-waits** (0%
-CPU across 4 threads, zero unimplemented Sony calls, no crash) — the same state the Linux *headless*
-`boot_trace` reaches: alive, waiting for the GPU/present side to make progress. `boot_trace` wires no
-Vulkan on Windows, so the next step to a rendered frame is bringing up the live Vulkan renderer +
-present path on Windows (the `frontends/shared/live_renderer` used by `prosper-app`), analogous to
-`PROSPER_RENDER=1` on Linux. Deferred, lower-priority items surfaced along the way: phys-offset
-aliasing in the memory HLE (needed by UE4 MallocBinned3, not this Unity title — `CreateFileMapping`/
-`MapViewOfFile3`, 64 KiB granularity); honoring reserve alignment > 64 KiB (over-reserve + trim);
-worker-thread stack registration for GC bounds; and `PROSPER_CRASHPEEK` guards.
+The live Vulkan renderer now builds + initializes on Windows (#655): the whole GPU/Vulkan translation
+layer + `prosper_live_renderer` compile under MinGW (the Vulkan SDK is found via `VULKAN_SDK`), and at
+runtime the live compute + submit renderers register cleanly. With the renderer wired and
+`PROSPER_RENDER=1`, the guest boots into Unity engine init (allocates its pools, spawns
+`AssetGarbageCollectorHelper` threads) and then **idle-waits** (0% CPU) — it does NOT yet submit draws.
+
+Diagnosis (via the new `PROSPER_SYNCLOG` WaitOnAddress logging): the guest's **Unity job-system worker
+threads park in `sceKernelWaitOnAddress`** on a contiguous array of per-worker words (observed ~44
+stuck waits, `*addr==expected==0`, no timeout), waiting for jobs the dispatcher never posts because the
+**main/dispatch thread is itself blocked** after an init burst (24 `scePthreadCondBroadcast`s). This is
+the same producer/consumer class as the Linux pre-render stall. Next step: identify what the dispatch
+thread is blocked on (likely a resource-load / async / GPU-or-VideoOut completion that must tick to
+release it), using the sync + EventFlag logs; the Linux bring-up (worker pool via PSN.prx, EOP
+completions, scene activation) is the reference. Note the coarse Windows `WaitOnAddress` uses one global
+`std::condition_variable` (any wake re-checks all waiters) — correct but worth revisiting if the wake
+path proves to be the gap.
+
+Deferred, lower-priority items (some now done): ~~honor reserve alignment > 64 KiB~~ (done, #658);
+~~worker-thread stack registration for GC bounds~~ (done, #658); phys-offset aliasing in the memory HLE
+(needed by UE4 MallocBinned3, not this Unity title — `CreateFileMapping`/`MapViewOfFile3`, 64 KiB
+granularity); and `PROSPER_CRASHPEEK` guards.
 
 **What is done (compiles + links, in CI):**
 - **`exec_image_win.cpp`** — the Win32 sibling of `exec_image_linux.cpp` implementing the full
@@ -385,22 +397,25 @@ worker-thread stack registration for GC bounds; and `PROSPER_CRASHPEEK` guards.
   `Windows MinGW` job builds the whole boot path.
 
 **What is left (runtime work, on a Windows host):**
-1. **Wire the Vulkan renderer on Windows — the current frontier.** The guest boots into the frame loop
-   and idle-waits for the GPU/present side (see above). Bring up `frontends/shared/live_renderer` +
-   present on Windows (the `PROSPER_RENDER=1` analogue) to drive past the wait toward a rendered frame.
+1. **The Unity job-system pre-render stall — the current frontier.** The renderer is wired (#655) but
+   the guest idle-waits in engine init: job workers park in `sceKernelWaitOnAddress` for jobs the
+   blocked dispatch thread never posts (see above). Find what blocks the dispatch thread (sync/EventFlag
+   logs are in place) so draws start flowing to the now-wired renderer.
 2. ~~Port the direct/flexible-memory HLE~~ — **DONE** (private-`VirtualAlloc`; phys-aliasing deferred,
    only needed by UE4 MallocBinned3, not this Unity title).
 3. ~~Guest `%fs` TLS~~ — **DONE** (FSGSBASE + VEH re-apply).
-4. ~~Guest allocator (reserved-page lazy commit) + worker-thread ABI/%fs TLS~~ — **DONE** (PR #628).
-5. **Validate/repair the guest→HLE ABI trampoline for XMM/float args.** Integer args are converted
+4. ~~Guest allocator lazy-commit + worker-thread ABI/%fs TLS~~ — **DONE** (#628).
+5. ~~Wire the Vulkan renderer on Windows~~ — **DONE** (#655: builds + initializes).
+6. ~~Reserve alignment > 64 KiB + worker-thread stack registration~~ — **DONE** (#658).
+7. **Validate/repair the guest→HLE ABI trampoline for XMM/float args.** Integer args are converted
    and now runtime-exercised through init; **XMM/float args are still not converted** (e.g. some libc
    formatters / `printf`-family) — add float-arg conversion when a title needs it.
-6. **VEH recovery hardening for stack-overflow faults** — recovery resumes on the faulting thread's
+8. **VEH recovery hardening for stack-overflow faults** — recovery resumes on the faulting thread's
    current stack; a true stack-overflow fault still needs a guard-page/dedicated-stack story (Linux
    uses `sigaltstack`). The `__builtin_longjmp` change fixed the cross-frame-unwind crash; this is the
    separate genuine-overflow case. Also: `PROSPER_CRASHPEEK` faults on Windows (the IL2CPP klass
    walker needs the same `guest_readable` guards the Linux path has).
-7. **Audit the 103 `(HleFn)`-cast handlers** — almost all cast targets are `HLE()`-defined handlers
+9. **Audit the 103 `(HleFn)`-cast handlers** — almost all cast targets are `HLE()`-defined handlers
    and so route correctly through the trampoline, but confirm none are raw host functions relying on
    host-ABI arg passing.
 

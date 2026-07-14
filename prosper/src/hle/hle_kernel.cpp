@@ -5,6 +5,13 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE   // pthread_getattr_np
 #endif
+#ifdef _WIN32
+// Must precede any header that transitively includes windows.h (e.g. winpthreads <pthread.h>) so
+// GetCurrentThreadStackLimits (needs _WIN32_WINNT >= 0x0602 / Win8) is declared.
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
+#endif
 #include "dispatch.hpp"
 #include "nid.hpp"
 #include "../host/exec_image.hpp"
@@ -22,6 +29,9 @@
 #include <thread>
 #include <atomic>
 #include <condition_variable>
+#ifdef _WIN32
+#include <windows.h>   // GetCurrentThreadStackLimits/GetCurrentThreadId for the guest-thread trampoline
+#endif
 #if defined(__linux__) || defined(__APPLE__)
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -500,9 +510,19 @@ extern "C" uint64_t prosper_call_guest_sysv(uint64_t fn, uint64_t a0, uint64_t a
 void* win_thread_trampoline(void* p) {
     auto* ts = (WinThreadStart*)p;
     uint64_t entry = ts->entry; void* arg = ts->arg; free(ts);   // host libc: run on host %fs (before activate)
+    // Register this worker's stack bounds FIRST, keyed by the Windows thread id (== exec_image_win's
+    // cur_tid) so a guest GC that queries its own stack base (GC_register_my_thread / stack scanning —
+    // e.g. Unity's AssetGarbageCollectorHelper) finds real bounds instead of wedging on "Bad stack
+    // base". Mirrors the Linux thread_trampoline's register-first ordering. GetCurrentThreadStackLimits
+    // gives the committed stack range (Win8+).
+    ULONG_PTR stk_lo = 0, stk_hi = 0;
+    GetCurrentThreadStackLimits(&stk_lo, &stk_hi);
+    if (stk_lo && stk_hi > stk_lo)
+        register_thread_stack((uint64_t)GetCurrentThreadId(), (void*)stk_lo, (uint64_t)(stk_hi - stk_lo));
     guest_tls_activate_thread();   // this worker's guest %fs TCB (FSGSBASE); no-op if the gate is off
     void* rv = entry ? (void*)(uintptr_t)prosper_call_guest_sysv(entry, (uint64_t)(uintptr_t)arg, 0) : nullptr;
     tls_dtv_purge_current_thread();
+    unregister_thread_stack((uint64_t)GetCurrentThreadId());   // ids recycle; stale bounds = wrong bounds
     return rv;
 }
 }
@@ -627,7 +647,7 @@ HLE(k_ef_delete)  {
     if (!has_waiters) ef_destroy(e);               // none parked -> free now; else the last waiter frees
     return 0;
 }
-HLE(k_ef_set)     { auto* e = (EventFlag*)(uintptr_t)a0; if (!e) return 0; pthread_mutex_lock(&e->m); e->bits |= a1; pthread_cond_broadcast(&e->c); pthread_mutex_unlock(&e->m); return 0; }
+HLE(k_ef_set)     { auto* e = (EventFlag*)(uintptr_t)a0; if (!e) return 0; if (sclog()) fprintf(stderr, "[sync2] T%ld EF.set       ef=0x%llx bits|=0x%llx\n", sctid(), (unsigned long long)a0, (unsigned long long)a1); pthread_mutex_lock(&e->m); e->bits |= a1; pthread_cond_broadcast(&e->c); pthread_mutex_unlock(&e->m); return 0; }
 HLE(k_ef_clear)   { auto* e = (EventFlag*)(uintptr_t)a0; if (!e) return 0; pthread_mutex_lock(&e->m); e->bits &= a1; pthread_mutex_unlock(&e->m); return 0; }
 // Absolute CLOCK_REALTIME deadline `usec` microseconds from now (for pthread_cond_timedwait
 // on default-attr condvars, which time against CLOCK_REALTIME).
@@ -699,6 +719,9 @@ HLE(k_ef_wait)    { // (ef, pattern, waitMode, resultPat*, SceKernelUseconds* ti
     // expiry returns KERNEL_ERROR_ETIMEDOUT (Kyty EventFlag.cpp / Errno.h 0x8002003C).
     auto* e = (EventFlag*)(uintptr_t)a0; if (!e) return 0;
     uint64_t ret = 0;
+    if (sclog()) fprintf(stderr, "[sync2] T%ld EF.wait.ent  ef=0x%llx pat=0x%llx mode=0x%llx bits=0x%llx\n",
+                         sctid(), (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
+                         (unsigned long long)e->bits);
     pthread_mutex_lock(&e->m);
     e->waiters++;
     if (a4) {
@@ -725,6 +748,8 @@ HLE(k_ef_wait)    { // (ef, pattern, waitMode, resultPat*, SceKernelUseconds* ti
     pthread_mutex_unlock(&e->m);
     if (last) ef_destroy(e);                        // safe: `res` was copied before the free
     if (a3) *(uint64_t*)(uintptr_t)a3 = res;
+    if (sclog()) fprintf(stderr, "[sync2] T%ld EF.wait.exit ef=0x%llx res=0x%llx ret=0x%llx\n",
+                         sctid(), (unsigned long long)a0, (unsigned long long)res, (unsigned long long)ret);
     return ret;
 }
 HLE(k_ef_poll)    { // (ef, pattern, waitMode, resultPat*)
