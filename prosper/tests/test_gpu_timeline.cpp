@@ -200,6 +200,7 @@ int main() {
     _putenv_s("PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE", bundle_capture.c_str());
     _putenv_s("PROSPER_GPU_TIMELINE_CAPTURE_DEPTH", "2");
     _putenv_s("PROSPER_GPU_TIMELINE_CAPTURE_START_TARGET_DIM", "642x362");
+    _putenv_s("PROSPER_GPU_TIMELINE_CAPTURE_CHECKPOINT_EVERY", "1");
 #else
     setenv("PROSPER_GPU_TIMELINE", runtime.c_str(), 1);
     setenv("PROSPER_CAPTURE_TITLE", "runtime-title", 1);
@@ -209,6 +210,7 @@ int main() {
     setenv("PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE", bundle_capture.c_str(), 1);
     setenv("PROSPER_GPU_TIMELINE_CAPTURE_DEPTH", "2", 1);
     setenv("PROSPER_GPU_TIMELINE_CAPTURE_START_TARGET_DIM", "642x362", 1);
+    setenv("PROSPER_GPU_TIMELINE_CAPTURE_CHECKPOINT_EVERY", "1", 1);
 #endif
     GpuState prestart_state;
     begin_gpu_timeline_submit(40);
@@ -225,6 +227,11 @@ int main() {
     predecessor_state.command_order = 120;
     begin_gpu_timeline_submit(41);
     record_gpu_timeline_submit(predecessor_state, 41);
+    GpuCaptureBundle checkpoint_bundle;
+    CHECK(read_gpu_capture_bundle(bundle_capture, checkpoint_bundle, error) &&
+          checkpoint_bundle.submits.size() == 1 &&
+          checkpoint_bundle.submits[0].submit_index == 41,
+          "bundle checkpoint preserves predecessor history before the endpoint exists");
     begin_gpu_timeline_submit(42);
     record_gpu_timeline_present(9, 1, 77, 1920, 1080); // a PM4 flip can precede submit completion
     GpuState runtime_state;

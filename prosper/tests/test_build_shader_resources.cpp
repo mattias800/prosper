@@ -73,6 +73,9 @@ int main() {
         CHECK(gen5_image_format(36, &fi) && fi.format == DataFormat::Float10_11_11 &&
               fi.num_components == 3 && fi.bytes_per_block == 4 && fi.block_width == 1 && !fi.srgb,
               "IMG_FMT 36 -> Float10_11_11 packed, 4 B/texel");
+        CHECK(gen5_image_format(50, &fi) && fi.format == DataFormat::Unorm2_10_10_10 &&
+              fi.num_components == 4 && fi.bytes_per_block == 4 && fi.block_width == 1 && !fi.srgb,
+              "IMG_FMT 50 -> R10G10B10A2 UNORM packed, 4 B/texel");
         CHECK(!gen5_image_format(0, &fi) && fi.format == DataFormat::Unknown, "IMG_FMT 0 (INVALID) unmapped");
         CHECK(!gen5_image_format(9, &fi), "IMG_FMT 9 (16_USCALED) unmapped -> false");
         CHECK(!gen5_image_format(44, &fi), "IMG_FMT 44 (10_10_10_2) unmapped -> false");
@@ -85,6 +88,39 @@ int main() {
               image_type_to_dim(14) == 6 && image_type_to_dim(15) == 7,
               "T# TYPE array/MSAA variants map to MIMG dims 4..7");
         CHECK(image_type_to_dim(0) == 1, "unknown T# TYPE keeps the conservative 2D fallback");
+    }
+
+    // --- AGC semantic metadata -> SPI_PS_INPUT_CNTL wiring ------------------------------------
+    // Live DOLL shape: the producer exports semantics 15..18 in PARAM0..3, while the PS consumes
+    // semantic 15 and semantic 18. Identity wiring would feed PS input 1 from PARAM1; semantic
+    // matching must instead select PARAM3. A missing producer semantic uses DEFAULT_VAL.
+    {
+        AgcShaderSemantic producer_out[] = {
+            {0x0000000fu}, {0x00000110u}, {0x00000211u}, {0x00000312u},
+        };
+        AgcShaderSemantic pixel_in[] = {{0x0000000fu}, {0x00000012u}};
+        AgcShaderHeader producer{};
+        producer.output_semantics = producer_out;
+        producer.num_output_semantics = 4;
+        AgcShaderHeader pixel{};
+        pixel.input_semantics = pixel_in;
+        pixel.num_input_semantics = 2;
+        AgcPixelInputControls mapping = derive_agc_pixel_input_controls(&producer, &pixel);
+        CHECK(mapping.valid_mask == 0x3u && mapping.controls[0] == 0u && mapping.controls[1] == 3u,
+              "DOLL semantics map PS inputs {15,18} to producer PARAM slots {0,3}");
+
+        producer.output_semantics = nullptr;
+        producer.num_output_semantics = 0;
+        mapping = derive_agc_pixel_input_controls(&producer, &pixel);
+        CHECK(mapping.valid_mask == 0x3u && mapping.controls[0] == 0x20u && mapping.controls[1] == 0x20u,
+              "procedural producer with no PARAM exports materializes PS input defaults");
+
+        AgcShaderSemantic default_flat[] = {{0x30400055u}}; // DEFAULT_VAL=3 + flat, no matching output
+        pixel.input_semantics = default_flat;
+        pixel.num_input_semantics = 1;
+        mapping = derive_agc_pixel_input_controls(&producer, &pixel);
+        CHECK(mapping.valid_mask == 1u && mapping.controls[0] == 0x720u,
+              "unmatched flat semantic preserves DEFAULT_VAL and FLAT_SHADE control bits");
     }
 
     // --- V# decode in isolation ---------------------------------------------------------------
@@ -175,8 +211,10 @@ int main() {
     // --- vertex buffers: direct resource usage type 8 (V# inline in the user-data SGPRs) ------------
     // A 16-entry direct_resource_offset table; type 8 (vertex buffer) points at a V# at SGPR dword 20.
     uint16_t dro[16]; for (auto& x : dro) x = 0xffff;
+    make_vsharp(&sgprs[16], 0xD0000000ull, 0, 0x0fe9c0c0u, /*fmt*/0); // user data: near-cap false V#
     make_vsharp(&sgprs[20], 0xC0000000ull, 12, 90, /*fmt*/74);  // 32_32_32 FLOAT, stride 12
     dro[8] = 20;                                                            // vertex buffer V# at sgpr 20
+    dro[10] = 16;                                                           // metadata can name non-V# data
     ud.direct_resource_offset = dro;
     ud.direct_resource_count  = 16;
     cbuf_sharps[1].bits = (uint16_t)(12 & 0x7fff);   // restore cbuf1 so we test cbuf + vbuf together
@@ -188,6 +226,8 @@ int main() {
     CHECK(vb && vb->format == DataFormat::Float32 && vb->num_components == 3, "vbuf format Float32 x3");
     CHECK(vb && vb->gpu_addr == 0xC0000000ull && vb->stride == 12 && vb->size == 90 * 12, "vbuf base/stride/size");
     CHECK(vb && vb->srt_offset == 0xFFFFFFFFu, "DIRECT vbuf leaves srt_offset unset");
+    CHECK(t3.by_sgpr_base(16) == nullptr,
+          "unknown-format user data just below the size cap is not guessed as a direct V#");
     CHECK(t3.by_sgpr_base(4) != nullptr, "constant buffers still present alongside vertex buffers");
     CHECK(t3.by_sgpr_base(99) == nullptr, "unknown sgpr_base -> null");
 

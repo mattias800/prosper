@@ -1,5 +1,6 @@
 // agc_shader_layout.cpp — see agc_shader_layout.hpp. V# decode + the front-half resource-table build.
 #include "agc_shader_layout.hpp"
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
@@ -8,6 +9,45 @@ namespace prosper::gpu {
 // Guest-memory readability probe (defined in gpu_executor.cpp, same lib) — used by the gated
 // PROSPER_DUMP_TILERAW diagnostic to avoid a SIGSEGV on a mis-decoded texture base.
 bool guest_readable(uint64_t addr, uint32_t bytes);
+
+AgcPixelInputControls derive_agc_pixel_input_controls(const AgcShaderHeader* producer,
+                                                      const AgcShaderHeader* pixel) {
+    AgcPixelInputControls out;
+    const uint32_t producer_count = producer && producer->output_semantics &&
+                                    producer->num_output_semantics <= 64
+        ? producer->num_output_semantics : 0u;
+
+    // The no-PS form used by sceAgcCreateInterpolantMapping maps the producer's declared outputs
+    // directly. Normal rendering always supplies a PS and takes the semantic-matching path below.
+    if (!pixel) {
+        const uint32_t n = std::min<uint32_t>(producer_count, 32u);
+        for (uint32_t i = 0; i < n; ++i) {
+            const AgcShaderSemantic& semantic = producer->output_semantics[i];
+            const uint32_t slot = semantic.hardware_mapping() < 32u
+                ? semantic.hardware_mapping() : i;
+            out.controls[i] = slot | (semantic.is_flat_shaded() ? 0x400u : 0u);
+            out.valid_mask |= 1u << i;
+        }
+        return out;
+    }
+
+    if (!pixel->input_semantics || pixel->num_input_semantics > 32u) return out;
+    for (uint32_t i = 0; i < pixel->num_input_semantics; ++i) {
+        const AgcShaderSemantic& input = pixel->input_semantics[i];
+        uint32_t control = 0x20u | (input.default_value() << 8); // constant if no output matches
+        for (uint32_t j = 0; j < producer_count; ++j) {
+            const AgcShaderSemantic& output = producer->output_semantics[j];
+            if (output.semantic() == input.semantic() && output.hardware_mapping() < 32u) {
+                control = output.hardware_mapping();
+                break;
+            }
+        }
+        if (input.is_flat_shaded()) control |= 0x400u;
+        out.controls[i] = control;
+        out.valid_mask |= 1u << i;
+    }
+    return out;
+}
 
 // RDNA2 (GFX10/PS5) V# dword3 carries a COMBINED 7-bit FORMAT at bits[18:12] — NOT the separate GCN/PS4
 // NFMT[14:12]/DFMT[18:15] split (reading that on a PS5 V# yields garbage fields, so every descriptor came
@@ -106,6 +146,12 @@ bool gen5_image_format(uint32_t fmt, Gen5ImageFormatInfo* out) {
         // format must keep falling back rather than mis-convert. CONFIDENCE: HIGH (value from
         // AMD's GFX10 register DB; live DOLL T#s confirmed fmt=36 at scene-color dimensions).
         fi.format = DataFormat::Float10_11_11; fi.num_components = 3; fi.bytes_per_block = 4;
+    } else if (fmt == 50) {
+        // GFX10_FORMAT_2_10_10_10_UNORM — Mesa maps a logical R10G10B10A2 format to this enum.
+        // DOLL's final composite PS samples a live 32x32 T# in this format; leaving it unmapped drops
+        // the binding and rejects the entire scene-color writer. It is one packed 4-byte texel and the
+        // live renderer expands it to RGBA8 before upload. CONFIDENCE: HIGH (Mesa DB + live T#).
+        fi.format = DataFormat::Unorm2_10_10_10; fi.num_components = 4; fi.bytes_per_block = 4;
     } else if (fmt >= 1 && fmt <= 77) {          // shared with the V# buffer-format numbering
         DataFormat f = DataFormat::Unknown; uint32_t n = 0;
         rdna2_buffer_format(fmt, &f, &n);
@@ -458,7 +504,13 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             // non-descriptor SGPRs -> a garbage decode (e.g. size ~1.4 GB). Skip those rather than emit
             // a bogus binding. (When the dynamic-fetch path is implemented, this direct case still holds
             // for shaders that DO place the V# inline.)
-            if (d.base == 0 || d.size_bytes == 0 || d.size_bytes > 0x10000000u) continue;
+            // The metadata slot can name ordinary user data when the real V# is bindless. A mapped
+            // buffer FORMAT is part of the direct-sharp contract and provides a stronger discriminator
+            // than the size ceiling alone: DOLL has a live false positive just below 256 MiB whose four
+            // pointer/data dwords decode with FORMAT=0. Dynamic descriptors whose format is patched by
+            // shader ALU are recovered by resolve_dynamic_fetch instead of this metadata-only path.
+            if (d.base == 0 || d.size_bytes == 0 || d.size_bytes > 0x10000000u ||
+                d.format == DataFormat::Unknown || !d.num_components) continue;
             ShaderResource r;
             r.cls            = compute_buffer ? ResourceClass::ConstantBuffer : ResourceClass::VertexBuffer;
             r.format         = d.format;
@@ -500,7 +552,8 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                 if (e.sgpr_base == sgpr) { covered = true; break; }
             if (covered) continue;
             DecodedBufferDescriptor d = decode_buffer_descriptor(&user_sgprs[reg]);
-            if (d.base <= 0x10000 || d.size_bytes == 0 || d.size_bytes > 0x10000000u) continue;
+            if (d.base <= 0x10000 || d.size_bytes == 0 || d.size_bytes > 0x10000000u ||
+                d.format == DataFormat::Unknown || !d.num_components) continue;
             ShaderResource r;
             r.cls            = ResourceClass::ConstantBuffer;   // storage buffer (readable + writable)
             r.format         = d.format;

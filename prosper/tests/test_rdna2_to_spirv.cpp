@@ -453,6 +453,34 @@ int main() {
     printf("  kernel22 mismatches=%u (out[0]=%g expect=320: cbuf0[1]=20 + cbuf1[1]=300)\n", bad22, got22.size()==N?got22[0]:-1);
     CHECK(got22.size()==N && bad22==0, "recompiled kernel 22 (provenance routes s_buffer_loads to bindings 2 & 3) correct");
 
+    // DOLL scene VS: the compiler loads several V# descriptors into separate SGPR ranges, then
+    // reuses one SRSRC range by copying a selected descriptor into it with s_mov_b32. Descriptor
+    // provenance must follow each scalar move. Keeping the destination's previous SRT tag routes
+    // every later raw MUBUF through the first constant buffer and collapses the scene triangles.
+    const uint32_t code22move[] = {
+        0xf4080200u, 0xfa000020u,                         // s_load_dwordx4 s[8:11],  s[0:1], 0x20
+        0xf4080300u, 0xfa000040u,                         // s_load_dwordx4 s[12:15], s[0:1], 0x40
+        0xbe88030cu, 0xbe89030du, 0xbe8a030eu, 0xbe8b030fu, // s_mov_b32 s[8:11], s[12:15]
+        0xe0300000u, 0x84020000u,                         // buffer_load_dword v0, off, s[8:11], 4
+        0x7e000d00u, 0xbf810000u,                         // v_cvt_f32_u32 v0,v0; s_endpgm
+    };
+    ShaderResourceTable rt22move;
+    rt22move.resources.push_back({ResourceClass::ConstantBuffer, DataFormat::Uint32, 1,
+                                  /*binding*/2, 0, 0, 0, /*srt*/0x20});
+    rt22move.resources.push_back({ResourceClass::ConstantBuffer, DataFormat::Uint32, 1,
+                                  /*binding*/3, 0, 0, 0, /*srt*/0x40});
+    std::vector<uint32_t> spv22move = recompile_valu(
+        code22move, sizeof(code22move) / sizeof(code22move[0]), 1, 0, &rt22move);
+    std::vector<uint32_t> decoy22move(4, 0u), wanted22move(4, 0u);
+    decoy22move[1] = 20u; wanted22move[1] = 300u;
+    std::vector<float> got22move = prosper::test::run_compute(
+        spv22move, in22, N, N, decoy22move, wanted22move);
+    uint32_t bad22move = 0;
+    for (uint32_t i = 0; i < N && got22move.size() == N; i++)
+        if (std::fabs(got22move[i] - 300.0f) > 1e-3f) bad22move++;
+    CHECK(!spv22move.empty() && got22move.size() == N && bad22move == 0,
+          "descriptor provenance follows s_mov_b32 when an SRSRC range is reused");
+
     // #515: a stage whose decoded resources start at 32/33 must not retain dead fallback-binding-2
     // loads for the preceding raw descriptor fetches. Those s_load_dwordx4 results are provenance;
     // the actual s_buffer_load data operations below resolve to the table's high bindings.
@@ -509,6 +537,69 @@ int main() {
     uint32_t bad23 = 0; for (uint32_t i=0;i<N&&got23.size()==N;i++) if (std::fabs(got23[i]-exp23[i])>1e-3f) bad23++;
     printf("  kernel23 mismatches=%u (out[5]=%g expect=6.5)\n", bad23, got23.size()==N?got23[5]:-1);
     CHECK(got23.size()==N && bad23==0, "recompiled kernel 23 (float32 vertex fetch via sgpr_base provenance) correct");
+
+    // A pc-keyed VertexBuffer is not necessarily the NGG v0 fetch prologue. DOLL's skinned scene
+    // shaders use a direct structured V# through computed VADDRs (v4/v5/v7/...); the old shortcut
+    // replaced all of them with gl_VertexIndex. Pin v1=1 and prove the fetch stays on record 1 for
+    // every lane even though exact per-PC provenance is present.
+    const uint32_t code23computed[] = {
+        0x7e020281u,                 // v_mov_b32 v1, 1
+        0xe0002000u, 0x80020201u,   // buffer_load_format_x v2, v1, s[8:11], 0 idxen
+        0xbf810000u,
+    };
+    ShaderResourceTable rt23computed;
+    { ShaderResource vb{}; vb.cls = ResourceClass::VertexBuffer; vb.format = DataFormat::Float32;
+      vb.num_components = 1; vb.binding = 3; vb.stride = 4; vb.sgpr_base = 8; vb.fetch_pc = 1;
+      rt23computed.resources.push_back(vb); }
+    std::vector<uint32_t> spv23computed = recompile_valu(
+        code23computed, sizeof(code23computed)/sizeof(code23computed[0]), 1, 2, &rt23computed);
+    std::vector<float> got23computed = prosper::test::run_compute(
+        spv23computed, in23, N, N, {}, vbuf23);
+    uint32_t bad23computed = 0;
+    for (uint32_t i = 0; i < N && got23computed.size() == N; ++i)
+        if (std::fabs(got23computed[i] - exp23[1]) > 1e-3f) ++bad23computed;
+    CHECK(!spv23computed.empty() && got23computed.size() == N && bad23computed == 0,
+          "pc-keyed structured vertex fetch preserves its computed non-v0 VADDR");
+
+    // Conversely, a descriptor-loaded attribute remains an NGG fetch-prologue use even when the
+    // incomplete prologue left its element index in a non-v0 register. The rewritten SRSRC is the
+    // discriminator: the vertex module must reload gl_VertexIndex for the fetch instead of reading
+    // record zero from v1. Count loads from the decorated built-in (one ABI seed + one fetch use).
+    const uint32_t code23rewritten[] = {
+        0xbe880380u,                 // s_mov_b32 s8, 0 (marks the SRSRC range rewritten)
+        0x7e020280u,                 // v_mov_b32 v1, 0
+        0xe0002000u, 0x80020201u,   // buffer_load_format_x v2, v1, s[8:11], 0 idxen
+        0x7e060280u, 0x7e0802f2u,   // v3=0, v4=1.0
+        0xf80008cfu, 0x04030201u,   // exp pos0 v[1:4]
+        0xbf810000u,
+    };
+    ShaderResourceTable rt23rewritten;
+    { ShaderResource vb{}; vb.cls = ResourceClass::VertexBuffer; vb.format = DataFormat::Float32;
+      vb.num_components = 1; vb.binding = 3; vb.stride = 4; vb.fetch_pc = 2;
+      rt23rewritten.resources.push_back(vb); }
+    std::vector<uint32_t> spv23rewritten = recompile_vertex(
+        code23rewritten, sizeof(code23rewritten)/sizeof(code23rewritten[0]), &rt23rewritten);
+    uint32_t vertex_index_id = 0, vertex_index_loads = 0;
+    for (size_t word = 5; word < spv23rewritten.size(); ) {
+        const uint32_t count = spv23rewritten[word] >> 16;
+        const uint32_t opcode = spv23rewritten[word] & 0xffffu;
+        if (!count || word + count > spv23rewritten.size()) break;
+        // OpDecorate target BuiltIn VertexIndex (71, decoration 11, built-in 42).
+        if (opcode == 71 && count >= 4 && spv23rewritten[word + 2] == 11u &&
+            spv23rewritten[word + 3] == 42u)
+            vertex_index_id = spv23rewritten[word + 1];
+        word += count;
+    }
+    for (size_t word = 5; word < spv23rewritten.size(); ) {
+        const uint32_t count = spv23rewritten[word] >> 16;
+        const uint32_t opcode = spv23rewritten[word] & 0xffffu;
+        if (!count || word + count > spv23rewritten.size()) break;
+        if (opcode == 61 && count >= 4 && spv23rewritten[word + 3] == vertex_index_id)
+            ++vertex_index_loads; // OpLoad result-type result-id pointer
+        word += count;
+    }
+    CHECK(!spv23rewritten.empty() && vertex_index_id && vertex_index_loads == 2,
+          "pc-keyed rewritten SRSRC keeps vertex-index recovery for non-v0 attributes");
 
     // Kernel 24: UNORM8x4 vertex fetch (stage 3 — packed-format conversion). buffer_load_format_xyzw
     // unpacks a dword into 4 bytes, each normalized /255 into v1..v4. out = v1 + 2*v2 + 3*v3 + 4*v4

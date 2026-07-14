@@ -39,7 +39,10 @@ enum class DataFormat : uint32_t {
     // format (#294). data_format_bytes() returns 0 (packed — per-component size is meaningless;
     // the texel is 4 bytes, carried by Gen5ImageFormatInfo::bytes_per_block).
     Float10_11_11,
-    // Other 10/11-bit packed formats are added as the target needs them.
+    // Packed 32-bit R10G10B10A2 UNORM. GFX10 names its high-to-low storage layout
+    // "2_10_10_10_UNORM" (IMG_FMT 50); logical R/G/B occupy the low/middle 10-bit fields and
+    // alpha occupies the high 2 bits. Sampled uploads unpack it to RGBA8.
+    Unorm2_10_10_10,
 };
 
 // How many bytes one component of `format` occupies (0 for Unknown and block-compressed formats).
@@ -55,6 +58,9 @@ float half_to_float(uint16_t h);
 // widening (subnormals scale identically, inf/NaN preserved). Pure + testable.
 float f11_to_float(uint16_t v);   // low 11 bits used
 float f10_to_float(uint16_t v);   // low 10 bits used
+
+// GFX10_FORMAT_2_10_10_10_UNORM packed texel -> RGBA8, with nearest UNORM scaling. Pure + testable.
+void unorm2_10_10_10_to_rgba8(uint32_t packed, uint8_t rgba[4]);
 
 enum class ResourceClass : uint32_t {
     ConstantBuffer,  // read by s_buffer_load_* (scalar, uniform across the wave)

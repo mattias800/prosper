@@ -8,6 +8,8 @@
 // Stride[16:29], NumRecords=word2, Nfmt[12:14], Dfmt[15:18]).
 #pragma once
 #include "shader_resources.hpp"
+#include <array>
+#include <cstddef>
 #include <cstdint>
 
 namespace prosper::gpu {
@@ -44,6 +46,18 @@ struct AgcShaderSpecials {
     uint16_t user_data_range_end;     // +0x16
 };
 
+// One packed shader input/output semantic (Kyty Shader.h:958). Keep the storage as a raw dword:
+// C++ bitfield allocation is implementation-defined, while these accessors describe the SDK ABI.
+struct AgcShaderSemantic {
+    uint32_t bits = 0;
+    uint32_t semantic()         const { return  bits        & 0xffu; }
+    uint32_t hardware_mapping() const { return (bits >>  8) & 0xffu; }
+    bool     is_flat_shaded()   const { return ((bits >> 22) & 1u) != 0; }
+    uint32_t default_value()    const { return (bits >> 28) & 0x3u; }
+    uint32_t default_value_hi() const { return (bits >> 30) & 0x3u; }
+};
+static_assert(sizeof(AgcShaderSemantic) == 4, "AGC semantic is one dword");
+
 // The SDK shader header (Kyty Shader.h:974) — only the fields the resource builder needs.
 struct AgcShaderHeader {
     uint32_t           file_header;   // +0x00 '1234'
@@ -53,9 +67,34 @@ struct AgcShaderHeader {
     const void*        cx_registers;  // +0x18
     const void*        sh_registers;  // +0x20
     const AgcShaderSpecials* specials;// +0x28
-    uint8_t            pad[0x5a - 0x30];
+    const AgcShaderSemantic* input_semantics;  // +0x30
+    const AgcShaderSemantic* output_semantics; // +0x38
+    uint32_t           header_size;             // +0x40
+    uint32_t           shader_size;             // +0x44
+    uint32_t           embedded_constant_buffer_size_dqw; // +0x48
+    uint32_t           target;                  // +0x4c
+    uint32_t           num_input_semantics;     // +0x50
+    uint16_t           scratch_size_dw_per_thread; // +0x54
+    uint16_t           num_output_semantics;    // +0x56
+    uint16_t           special_sizes_bytes;     // +0x58
     uint8_t            type;          // +0x5a (2=VS/ES, 1=PS, 0=CS)
+    uint8_t            num_cx_registers; // +0x5b
+    uint8_t            num_sh_registers; // +0x5c
 };
+static_assert(offsetof(AgcShaderHeader, input_semantics) == 0x30 &&
+              offsetof(AgcShaderHeader, num_input_semantics) == 0x50 &&
+              offsetof(AgcShaderHeader, type) == 0x5a,
+              "AgcShaderHeader must match the SDK blob layout");
+
+// Hardware SPI_PS_INPUT_CNTL values derived from an ES/GS producer and a PS consumer's semantic
+// metadata. Each valid control maps one logical PS input either to the matching producer PARAM slot
+// or to OFFSET=0x20 + DEFAULT_VAL when the producer does not export that semantic.
+struct AgcPixelInputControls {
+    std::array<uint32_t, 32> controls{};
+    uint32_t valid_mask = 0;
+};
+AgcPixelInputControls derive_agc_pixel_input_controls(const AgcShaderHeader* producer,
+                                                      const AgcShaderHeader* pixel);
 
 // A decoded buffer resource descriptor (V#, 4 dwords). base/stride/num_records per Kyty's getters;
 // format+num_components from the (dfmt,nfmt) split. `size_bytes` is the backing region size.

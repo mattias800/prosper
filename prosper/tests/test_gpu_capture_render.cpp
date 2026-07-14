@@ -116,6 +116,39 @@ int main() {
               "later replay submit samples the retained producer target");
     }
 
+    // UE depth prepasses can use a tiny dummy color target with writes disabled while their viewport
+    // and depth surface are full-size. The lighting pass then changes color targets but keeps the exact
+    // DS identity and performs EQUAL testing. Persistent DS must follow the viewport extent, not the
+    // dummy color extent, or the lighting pass receives a fresh clear image and rejects every pixel.
+    DrawItem depth_prepass = replay.items[0];
+    depth_prepass.color0_base = 0x910000;
+    depth_prepass.color0_width = 8; depth_prepass.color0_height = 8;
+    depth_prepass.ps.color_write_mask = 0;
+    depth_prepass.ps.depth_test_enable = true;
+    depth_prepass.ps.depth_write_enable = true;
+    depth_prepass.ps.depth_compare_op = 7; // ALWAYS: populate the persistent surface
+    depth_prepass.ps.depth_clear_value = 1.0f;
+    depth_prepass.ps.has_viewport = true;
+    depth_prepass.ps.viewport_x = 0.0f; depth_prepass.ps.viewport_y = static_cast<float>(H);
+    depth_prepass.ps.viewport_w = static_cast<float>(W); depth_prepass.ps.viewport_h = -static_cast<float>(H);
+    depth_prepass.ps.depth_read_base = depth_prepass.ps.depth_write_base = 0x920000;
+    depth_prepass.ps.htile_data_base = 0x930000;
+
+    DrawItem equal_lighting = depth_prepass;
+    equal_lighting.color0_base = 0x940000;
+    equal_lighting.color0_width = W; equal_lighting.color0_height = H;
+    equal_lighting.ps.color_write_mask = 0xF;
+    equal_lighting.ps.depth_write_enable = false;
+    equal_lighting.ps.depth_compare_op = 2; // EQUAL: same VS depth must match the prepass
+    std::vector<uint8_t> depth_reused = render_submit_items({depth_prepass, equal_lighting}, W, H);
+    CHECK(depth_reused.size() == static_cast<size_t>(W) * H * 4,
+          "full-size lighting pass follows a dummy-color depth prepass");
+    if (depth_reused.size() == static_cast<size_t>(W) * H * 4) {
+        const uint8_t* center = &depth_reused[(static_cast<size_t>(H / 2) * W + W / 2) * 4];
+        CHECK(center[0] > 0xC0 && center[1] < 0x40 && center[2] < 0x40,
+              "EQUAL lighting reuses viewport-sized depth written behind the tiny color attachment");
+    }
+
     // A captured consumer may depend on a producer from an earlier submit. Restore its serialized
     // host RTT surface before replaying draw zero; guest memory has no copy of these rendered pixels.
     GpuCaptureRttSeed temporal_seed;

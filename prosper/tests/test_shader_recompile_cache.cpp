@@ -87,6 +87,26 @@ int main() {
     CHECK(!direct_ps.empty() && cached_ps == direct_ps,
           "fragment cache output is byte-identical to the direct recompiler");
 
+    // Interpolant wiring changes vertex PARAM export locations/defaults, so it is part of the
+    // compile-time key even when the guest code and resource interface are otherwise identical.
+    stats = shader_recompile_cache_stats();
+    const uint64_t mapping_misses = stats.misses;
+    const uint64_t mapping_hits = stats.hits;
+    PixelInputMapping mapping;
+    mapping.valid_mask = 1;
+    mapping.controls[0] = 1;
+    const auto mapped_once = recompile_graphics_shader_cached(
+        ShaderProgramStage::Vertex, kVs, std::size(kVs), &table, &mapping);
+    const auto mapped_again = recompile_graphics_shader_cached(
+        ShaderProgramStage::Vertex, kVs, std::size(kVs), &table, &mapping);
+    mapping.controls[0] = 2;
+    const auto remapped = recompile_graphics_shader_cached(
+        ShaderProgramStage::Vertex, kVs, std::size(kVs), &table, &mapping);
+    stats = shader_recompile_cache_stats();
+    CHECK(!mapped_once.empty() && mapped_again == mapped_once && !remapped.empty() &&
+              stats.misses == mapping_misses + 2 && stats.hits == mapping_hits + 1,
+          "pixel-input mappings participate in the vertex shader cache key");
+
     clear_shader_recompile_cache();
     stats = shader_recompile_cache_stats();
     CHECK(stats.entries == 0 && stats.hits == 0 && stats.misses == 0 && stats.bytes == 0,

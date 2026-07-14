@@ -169,6 +169,10 @@ is reused only after byte comparison, never from guest address identity. Version
 data to 64..4096 MiB (default 1024) and aborts bundle installation if exhausted. The selected standalone
 `.prgcap` remains the graph/oracle reference and is currently required with the bundle.
 
+`PROSPER_GPU_TIMELINE_CAPTURE_CHECKPOINT_EVERY=N` atomically writes the current rolling bundle after every N
+captured predecessor submits (1..4096). Use it when the guest may crash before the semantic endpoint; the
+checkpoint remains replayable, while a later successful endpoint still compacts and replaces it normally.
+
 `PROSPER_GPU_TIMELINE_CAPTURE_TARGET_DIM=WxH` restricts predecessor bundle submits to graphics draws for
 matching target extents while leaving the selected consumer complete. This is a capture-volume diagnostic,
 not renderer substitution. It may still be expensive when relevant passes reference large shared assets;
@@ -193,6 +197,10 @@ selecting the wrong scene when it perturbs wall-clock pacing. A requested bundle
 forward so the final bundle contains exactly the latest requested depth. The dictionary may retain content
 seen by evicted manifests during capture, and the unique-byte budget remains authoritative. Finalization
 compacts unreachable dictionary entries before installing the bundle.
+
+For a standalone capsule that reads its own prior-frame targets, `gpu_replay --warmup-repeats N CAPTURE OUTPUT`
+executes N unmeasured copies into the persistent RTT/depth caches before the final replay. This is a temporal
+convergence diagnostic, not evidence that the first native frame contained those prior versions.
 
 `PROSPER_GPU_TIMELINE_CAPTURE_TARGET_DRAW_INDEX=MIN:MAX` restricts the matching target to a zero-based
 semantic draw-index window. Establish the range across multiple desired captures and nearby negative samples;

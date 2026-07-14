@@ -77,6 +77,8 @@ struct ShaderCompileKey {
     ShaderProgramStage stage = ShaderProgramStage::Vertex;
     bool has_resource_table = false;
     bool force_position_w = false;
+    bool has_pixel_inputs = false;
+    PixelInputMapping pixel_inputs{};
     std::vector<uint32_t> code;
     std::vector<ShaderResourceCompileKey> resources;
 
@@ -98,6 +100,12 @@ struct ShaderCompileKeyHash {
         hash = hash_mix(hash, static_cast<uint32_t>(key.stage));
         hash = hash_mix(hash, key.has_resource_table);
         hash = hash_mix(hash, key.force_position_w);
+        hash = hash_mix(hash, key.has_pixel_inputs);
+        if (key.has_pixel_inputs) {
+            hash = hash_mix(hash, key.pixel_inputs.valid_mask);
+            for (uint32_t control : key.pixel_inputs.controls)
+                hash = hash_mix(hash, control);
+        }
         hash = hash_mix(hash, key.code.size());
         for (uint32_t word : key.code) hash = hash_mix(hash, word);
         hash = hash_mix(hash, key.resources.size());
@@ -266,15 +274,19 @@ uint64_t shader_cache_limit_bytes() {
 uint64_t shader_cache_entry_bytes(const ShaderCompileKey& key, const std::vector<uint32_t>& spirv) {
     return static_cast<uint64_t>(key.code.size()) * sizeof(uint32_t) +
            static_cast<uint64_t>(key.resources.size()) * sizeof(ShaderResourceCompileKey) +
+           (key.has_pixel_inputs ? sizeof(PixelInputMapping) : 0u) +
            static_cast<uint64_t>(spirv.size()) * sizeof(uint32_t);
 }
 
 ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_t* code, size_t dwords,
-                                         const ShaderResourceTable* resources) {
+                                         const ShaderResourceTable* resources,
+                                         const PixelInputMapping* pixel_inputs) {
     ShaderCompileKey key;
     key.stage = stage;
     key.has_resource_table = resources != nullptr;
     key.force_position_w = getenv("PROSPER_FORCE_W") != nullptr;
+    key.has_pixel_inputs = stage == ShaderProgramStage::Vertex && pixel_inputs != nullptr;
+    if (key.has_pixel_inputs) key.pixel_inputs = *pixel_inputs;
     if (code && dwords) {
         std::vector<Rdna2Inst> instructions;
         const size_t consumed = rdna2_walk(code, dwords, instructions);
@@ -297,7 +309,8 @@ std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const Sh
                                               const ShaderResourceTable* resources) {
     const uint32_t* code = key.code.empty() ? nullptr : key.code.data();
     if (stage == ShaderProgramStage::Vertex)
-        return recompile_vertex(code, key.code.size(), resources);
+        return recompile_vertex(code, key.code.size(), resources,
+                                key.has_pixel_inputs ? &key.pixel_inputs : nullptr);
     if (stage == ShaderProgramStage::Fragment)
         return recompile_fragment(code, key.code.size(), resources);
     return {};
@@ -323,8 +336,9 @@ void clear_shader_decode_cache() {
 
 std::vector<uint32_t> recompile_graphics_shader_cached(ShaderProgramStage stage,
                                                        const uint32_t* code, size_t dwords,
-                                                       const ShaderResourceTable* resources) {
-    ShaderCompileKey key = make_shader_compile_key(stage, code, dwords, resources);
+                                                       const ShaderResourceTable* resources,
+                                                       const PixelInputMapping* pixel_inputs) {
+    ShaderCompileKey key = make_shader_compile_key(stage, code, dwords, resources, pixel_inputs);
     if (getenv("PROSPER_NO_SHADER_CACHE")) {
         auto& cache = shader_cache();
         {
@@ -593,6 +607,18 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     for (uint32_t i = 0; i < nsgpr; i++)
         set_value((int)(user_sgpr_base + i), user_sgprs[i]);
 
+    // A direct sharp lives in the initial user-data SGPR block rather than arriving through an
+    // s_load. It remains a usable load-time descriptor only while none of its SGPRs has subsequently
+    // been reloaded from memory. ALU descriptor patches deliberately retain the same pre-patch
+    // snapshot semantics as `descr`/`descr8` and the seed-V# fallback below.
+    auto untouched_seed_range = [&](int first, int count) {
+        if (!user_sgprs || first < (int)user_sgpr_base ||
+            first + count > (int)(user_sgpr_base + nsgpr)) return false;
+        for (int r = first; r < first + count; r++)
+            if (!valid_reg(r) || reloaded.test((size_t)r)) return false;
+        return true;
+    };
+
     auto known = [&](int r, uint32_t& v) {
         if (!valid_reg(r) || !val_known.test((size_t)r)) return false;
         v = val[(size_t)r];
@@ -759,7 +785,27 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 }
                 // in.literal is the SIGN-EXTENDED 21-bit immediate (#149) — add it as signed so a
                 // negative offset subtracts from the base instead of wrapping to a huge address.
-                uint64_t addr = base + (uint64_t)(int64_t)(int32_t)in.literal + soff_val;
+                const int64_t byte_off = (int64_t)(int32_t)in.literal + (int64_t)soff_val;
+                uint64_t addr = (base + (uint64_t)byte_off) & ~3ull;
+                // AGC scalar-pointer user data can carry aperture/tag bits above the title's usable
+                // GPU VA. Real GFX10 S_LOAD addresses are canonicalized by the memory system; a raw
+                // host dereference is not. Prefer the exact 64-bit address, then (only when it is
+                // unreadable) try the architectural Base48 and the PS5 process' exercised 40-bit VA
+                // aperture. Every candidate must be mapped for the complete load, so this never turns
+                // an unreadable pointer into an unchecked dereference. The 4-byte alignment matches
+                // scalar-memory dword addressing (SharpEmu's evaluator applies the same alignment).
+                if (!is_buffer && !guest_readable(addr, n * 4)) {
+                    for (uint64_t mask : {0xFFFFFFFFFFFFull, 0xFFFFFFFFFFull}) {
+                        const uint64_t candidate = (((base & mask) + (uint64_t)byte_off) & ~3ull);
+                        if (candidate != addr && guest_readable(candidate, n * 4)) {
+                            if (trc) fprintf(stderr, "[dyntrace]   canonical S_LOAD addr 0x%llx -> 0x%llx (mask=0x%llx)\n",
+                                             (unsigned long long)addr, (unsigned long long)candidate,
+                                             (unsigned long long)mask);
+                            addr = candidate;
+                            break;
+                        }
+                    }
+                }
                 if (!guest_readable(addr, n * 4)) { if (trc) fprintf(stderr, "[dyntrace]   addr 0x%llx unreadable\n", (unsigned long long)addr);
                                                     for (uint32_t k = 0; k < n; k++) forget(sdst + (int)k); break; }
                 const uint32_t* mem = (const uint32_t*)(uintptr_t)addr;
@@ -801,18 +847,43 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     const int samp_base = in.src[2].value;
                     const bool have_t8 = valid_reg(tbase) && descr8_known.test((size_t)tbase);
                     const bool have_key = valid_reg(tbase) && descr8_key_known.test((size_t)tbase);
-                    if (trc) fprintf(stderr, "[dyntrace] MIMG pc=%u srsrc=s%d ssamp=s%d have_t8=%d key=0x%x t8[0]=0x%x\n",
-                                     in.pc, tbase, samp_base, have_t8,
-                                     have_key ? descr8_key[(size_t)tbase] : 0xEEEEEEEEu,
-                                     have_t8 ? descr8[(size_t)tbase][0] : 0u);
-                    if (have_t8) {
-                        SrtUse u; u.kind = 0; u.t8 = descr8[(size_t)tbase];
-                        u.key = have_key ? descr8_key[(size_t)tbase] : 0xFFFFFFFFu;
+                    const std::array<uint32_t, 8>* t8 = have_t8
+                        ? &descr8[(size_t)tbase] : nullptr;
+                    std::array<uint32_t, 8> seed_t8{};
+                    const uint32_t tkey = have_key
+                        ? descr8_key[(size_t)tbase] : 0xFFFFFFFFu;
+                    bool from_seed = false;
+                    if (!t8 && untouched_seed_range(tbase, 8)) {
+                        for (int k = 0; k < 8; k++)
+                            seed_t8[k] = user_sgprs[tbase - (int)user_sgpr_base + k];
+                        DecodedImageDescriptor d = decode_image_descriptor(seed_t8.data());
+                        // A direct T# has no s_load provenance key, so it is resolved by this MIMG's
+                        // exact pc. Reject obviously non-image user data before creating that mapping.
+                        if (d.base > 0x10000 && d.width && d.height &&
+                            d.width <= 16384 && d.height <= 16384 &&
+                            d.type >= 8 && d.type <= 15) {
+                            t8 = &seed_t8;
+                            from_seed = true;
+                        }
+                    }
+                    if (trc) fprintf(stderr, "[dyntrace] MIMG pc=%u srsrc=s%d ssamp=s%d have_t8=%d seed_t8=%d key=0x%x t8[0]=0x%x\n",
+                                     in.pc, tbase, samp_base, have_t8, from_seed,
+                                     tkey, t8 ? (*t8)[0] : 0u);
+                    if (t8) {
+                        SrtUse u; u.kind = 0; u.t8 = *t8;
+                        u.key = tkey;
                         u.use_pc = in.pc;
                         u.is_store = in.opcode == 0x08;   // image_store: a STORAGE-image use (#590)
                         if (valid_reg(samp_base) && descr_known.test((size_t)samp_base)) {
                             u.has_samp = true;
                             u.s4 = descr[(size_t)samp_base];
+                        } else if (untouched_seed_range(samp_base, 4)) {
+                            // Direct S# paired with the direct/table T#. Samplers have no address or
+                            // extent field to validate; block membership plus reload invalidation is
+                            // the conservative provenance check.
+                            for (int k = 0; k < 4; k++)
+                                u.s4[k] = user_sgprs[samp_base - (int)user_sgpr_base + k];
+                            u.has_samp = true;
                         }
                         srt_uses->push_back(u);
                     }
@@ -837,6 +908,25 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             ? descr_key[(size_t)srsrc] : 0xFFFFFFFFu;
                         u.use_pc = in.pc;
                         srt_uses->push_back(u);
+                    } else if (in.opcode >= 0x0C && untouched_seed_range(srsrc, 4)) {
+                        // Direct RAW V#: an untyped MUBUF can consume a V# placed in the initial
+                        // user-data SGPRs without any preceding s_load. This is not a vertex-format
+                        // fetch, so the dyn_vb path below never reports it. Preserve the exact V# as
+                        // a pc-keyed buffer view; treating the same eight SGPRs as a plausible T# can
+                        // otherwise make raw MUBUF resolve to a texture (stride 0), dropping idxen.
+                        SrtUse u; u.kind = 1; u.key = 0xFFFFFFFFu; u.use_pc = in.pc;
+                        for (int k = 0; k < 4; ++k)
+                            u.v4[k] = user_sgprs[srsrc - (int)user_sgpr_base + k];
+                        DecodedBufferDescriptor d = decode_buffer_descriptor(u.v4.data());
+                        if (d.base > 0x10000 && d.size_bytes != 0 &&
+                            d.size_bytes <= 0x10000000u && d.stride != 0) {
+                            if (trc) fprintf(stderr,
+                                             "[dyntrace] raw MUBUF pc=%u direct V# s%d base=0x%llx "
+                                             "stride=%u size=%u\n",
+                                             in.pc, srsrc, (unsigned long long)d.base,
+                                             d.stride, d.size_bytes);
+                            srt_uses->push_back(u);
+                        }
                     }
                 }
                 // buffer_load_format_* (vertex fetch): opcodes 0..3. Resolve the SRSRC (src[1]) SGPR to the
@@ -1173,7 +1263,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                         bool piggybacked = false;
                         for (auto& r0 : t.resources)
                             if ((r0.cls == ResourceClass::ConstantBuffer || r0.cls == ResourceClass::VertexBuffer) &&
-                                r0.gpu_addr == d.base && r0.size == d.size_bytes) {
+                                r0.gpu_addr == d.base && r0.size == d.size_bytes && r0.stride == d.stride) {
                                 if (r0.fetch_pc == 0xFFFFFFFFu && r0.cls == ResourceClass::ConstantBuffer)
                                     r0.fetch_pc = u.use_pc;
                                 piggybacked = r0.fetch_pc == u.use_pc || r0.cls == ResourceClass::VertexBuffer;

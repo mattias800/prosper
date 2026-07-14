@@ -137,6 +137,16 @@ int main() {
     { float nan = f10_to_float(0x3E1); CHECK(nan != nan, "f10 0x3E1 = NaN"); }
     CHECK(data_format_bytes(DataFormat::Float10_11_11) == 0,
           "Float10_11_11 is packed: per-component bytes = 0 (texel size lives in bytes_per_block)");
+    CHECK(data_format_bytes(DataFormat::Unorm2_10_10_10) == 0,
+          "Unorm2_10_10_10 is packed: per-component bytes = 0");
+
+    uint8_t rgba10[4] = {};
+    unorm2_10_10_10_to_rgba8(0xFFFFFFFFu, rgba10);
+    CHECK(rgba10[0] == 255 && rgba10[1] == 255 && rgba10[2] == 255 && rgba10[3] == 255,
+          "packed R10G10B10A2 all-ones maps to opaque white");
+    unorm2_10_10_10_to_rgba8((512u << 0) | (256u << 10) | (1u << 20) | (2u << 30), rgba10);
+    CHECK(rgba10[0] == 128 && rgba10[1] == 64 && rgba10[2] == 0 && rgba10[3] == 170,
+          "packed R10G10B10A2 fields normalize and round independently");
 
     const std::vector<uint32_t> spv = descriptor_test_spirv();
     ShaderResource good{}; good.cls = ResourceClass::VertexBuffer; good.binding = 9;

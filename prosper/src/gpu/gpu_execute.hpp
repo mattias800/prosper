@@ -25,6 +25,8 @@
 #include <vector>
 #include <set>
 
+extern "C" const void* prosper_agc_shader_header_for_code(uint64_t code_addr);
+
 namespace prosper::gpu {
 
 struct ShaderResourceTable;   // fwd (shader_resources.hpp); passed to the backend so it can bind resources
@@ -195,7 +197,8 @@ struct ShaderRecompileCacheStats {
 };
 std::vector<uint32_t> recompile_graphics_shader_cached(ShaderProgramStage stage,
                                                        const uint32_t* code, size_t dwords,
-                                                       const ShaderResourceTable* resources = nullptr);
+                                                       const ShaderResourceTable* resources = nullptr,
+                                                       const PixelInputMapping* pixel_inputs = nullptr);
 ShaderRecompileCacheStats shader_recompile_cache_stats();
 void clear_shader_recompile_cache();
 
@@ -411,10 +414,39 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                 fprintf(stderr, " vtex=0x%llx(%ux%u f%u)", (unsigned long long)r.gpu_addr, r.width, r.height, (unsigned)r.format);
         fprintf(stderr, "\n");
     }
+    PixelInputMapping pixel_inputs;
+    pixel_inputs.controls = rs.ps_input_cntl;
+    pixel_inputs.valid_mask = rs.ps_input_cntl_valid_mask;
+    bool interpolants_from_metadata = false;
+    if (!pixel_inputs.valid_mask) {
+        const auto* producer = static_cast<const AgcShaderHeader*>(
+            prosper_agc_shader_header_for_code(rs.es_addr));
+        const auto* pixel = static_cast<const AgcShaderHeader*>(
+            prosper_agc_shader_header_for_code(rs.ps_addr));
+        const AgcPixelInputControls derived = derive_agc_pixel_input_controls(producer, pixel);
+        if (derived.valid_mask) {
+            pixel_inputs.controls = derived.controls;
+            pixel_inputs.valid_mask = derived.valid_mask;
+            interpolants_from_metadata = true;
+        }
+    }
+    if (getenv("PROSPER_INTERPLOG")) {
+        fprintf(stderr, "[interp] es=0x%llx ps=0x%llx source=%s valid=%08x",
+                (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr,
+                interpolants_from_metadata ? "metadata" : "registers",
+                pixel_inputs.valid_mask);
+        for (uint32_t i = 0; i < pixel_inputs.controls.size(); ++i)
+            if (pixel_inputs.valid_mask & (1u << i))
+                fprintf(stderr, " i%u=%08x", i, pixel_inputs.controls[i]);
+        fprintf(stderr, "\n");
+    }
+    const PixelInputMapping* pixel_input_ptr = pixel_inputs.valid_mask ? &pixel_inputs : nullptr;
     std::vector<uint32_t> vs = recompile_graphics_shader_cached(
-        ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)rs.es_addr, max_shader_dwords, vrt.get());
+        ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)rs.es_addr,
+        max_shader_dwords, vrt.get(), pixel_input_ptr);
     std::vector<uint32_t> fs = recompile_graphics_shader_cached(
-        ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr, max_shader_dwords, prt.get());
+        ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
+        max_shader_dwords, prt.get());
     if (phase_timing) {
         const auto shader_done = std::chrono::steady_clock::now();
         record_draw_realization_phases(

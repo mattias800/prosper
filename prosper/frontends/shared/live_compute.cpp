@@ -908,10 +908,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
 
     if (trace)
         std::fprintf(stderr, "[compute] execute submit=%llu dispatch=%llu code=0x%llx "
-                     "groups=%ux%ux%u buffers=%zu images=%zu result=%s\n",
+                     "threads=%ux%ux%u local=%ux%ux%u groups=%ux%ux%u "
+                     "buffers=%zu images=%zu result=%s\n",
                      (unsigned long long)item.submit_no, (unsigned long long)item.dispatch_index,
-                     (unsigned long long)item.code_addr, item.launch.groups_x, item.launch.groups_y,
-                     item.launch.groups_z, buffers.size(), images.size(), ok ? "ok" : "failed");
+                     (unsigned long long)item.code_addr, item.launch.threads_x,
+                     item.launch.threads_y, item.launch.threads_z, item.launch.local_x,
+                     item.launch.local_y, item.launch.local_z, item.launch.groups_x,
+                     item.launch.groups_y, item.launch.groups_z, buffers.size(), images.size(),
+                     ok ? "ok" : "failed");
     if (trace) {
         for (const auto& buffer : buffers) {
             if (!buffer.resource) continue;

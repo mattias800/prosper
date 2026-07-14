@@ -70,6 +70,13 @@ RenderState extract_render_state(const GpuState& st) {
     rs.gs_addr = addr_of(rd(st.sh, P::SPI_SHADER_PGM_LO_GS), rd(st.sh, P::SPI_SHADER_PGM_HI_GS));
     rs.es_addr = addr_of(rd(st.sh, P::SPI_SHADER_PGM_LO_ES), rd(st.sh, P::SPI_SHADER_PGM_HI_ES));
     rs.hs_addr = addr_of(rd(st.sh, P::SPI_SHADER_PGM_LO_HS), rd(st.sh, P::SPI_SHADER_PGM_HI_HS));
+    for (uint32_t i = 0; i < rs.ps_input_cntl.size(); ++i) {
+        const uint32_t reg = P::SPI_PS_INPUT_CNTL_0 + i;
+        auto it = st.cx.find(reg);
+        if (it == st.cx.end()) continue;
+        rs.ps_input_cntl[i] = it->second;
+        rs.ps_input_cntl_valid_mask |= 1u << i;
+    }
 
     // Color MRT 0 (context register file).
     rs.color0_base            = addr_of(rd(st.cx, P::CB_COLOR0_BASE), rd(st.cx, P::CB_COLOR0_BASE_EXT));

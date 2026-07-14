@@ -73,6 +73,8 @@ int main() {
         { P::CB_COLOR0_CLEAR_WORD0, 0x11223344u },
         { P::CB_COLOR0_CLEAR_WORD1, 0x00000000u },
         { P::CB_COLOR0_ATTRIB2, ((1024u - 1u) << 14) | (32u - 1u) },
+        { P::SPI_PS_INPUT_CNTL_0, 0x00000401u }, // PS input 0 <- PARAM1, flat
+        { P::SPI_PS_INPUT_CNTL_0 + 1u, 0x00000320u }, // PS input 1 <- DEFAULT_VAL 1111
     };
     // Shader-stage program addresses.
     ShaderReg sh_regs[] = {
@@ -95,6 +97,9 @@ int main() {
     CHECK(rs.ps_addr == rdna2_addr(0x00ABCDEFu, 0x12u), "PS shader addr = (LO<<8)|(HI<<40)");
     CHECK(rs.es_addr == rdna2_addr(0x00111111u, 0x34u), "ES shader addr = (LO<<8)|(HI<<40)");
     CHECK(rs.gs_addr == 0 && rs.hs_addr == 0, "unset GS/HS shader addrs are 0");
+    CHECK(rs.ps_input_cntl_valid_mask == 0x3u &&
+          rs.ps_input_cntl[0] == 0x00000401u && rs.ps_input_cntl[1] == 0x00000320u,
+          "programmed SPI_PS_INPUT_CNTL words and presence mask are retained");
 
     CHECK(rs.color0_base == rdna2_addr(0x00100000u, 0x12u), "color0_base = (BASE<<8)|(EXT<<40)");
     CHECK(rs.color0_format == 0x0Au, "color0_format = 0x0A (FORMAT field)");

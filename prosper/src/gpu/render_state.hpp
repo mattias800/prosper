@@ -9,6 +9,7 @@
 // here is fabricated.
 #pragma once
 #include "command_processor.hpp"
+#include <array>
 #include <cstdint>
 
 namespace prosper::gpu {
@@ -19,6 +20,13 @@ struct RenderState {
     uint64_t gs_addr = 0;   // geometry (…_GS)
     uint64_t es_addr = 0;   // export/vertex (…_ES)
     uint64_t hs_addr = 0;   // hull/tess (…_HS)
+
+    // Pixel-input wiring (SPI_PS_INPUT_CNTL_0..31). Each programmed word maps a PS interpolant
+    // number to an ES/VS PARAM export slot, or selects one of the hardware constant defaults when
+    // OFFSET=0x20. Vulkan has no equivalent fixed-function remap/default stage, so the vertex
+    // recompiler materializes this contract in its output interface.
+    std::array<uint32_t, 32> ps_input_cntl{};
+    uint32_t ps_input_cntl_valid_mask = 0;
 
     // Color MRT 0. format/number_type/comp_swap together select the VkFormat (see vk_translate).
     uint64_t color0_base        = 0;   // byte address (CB_COLOR0_BASE + BASE_EXT)

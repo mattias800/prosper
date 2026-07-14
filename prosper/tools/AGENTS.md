@@ -125,6 +125,8 @@ For bounded recursion, add `PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE=<path>.prgbundle
 `PROSPER_GPU_TIMELINE_CAPTURE_MAX_UNIQUE_MB=64..4096` (default 1024). `gpu_replay --bundle bundle output`
 executes the ordered window and classifies each temporal frontier as included, seeded, or depth-bounded.
 Bundles use content-defined chunks so shifted capture metadata does not defeat cross-submit deduplication.
+`PROSPER_GPU_TIMELINE_CAPTURE_CHECKPOINT_EVERY=N` atomically installs the rolling bundle every N captured
+predecessor submits, preserving the latest complete window if the guest crashes before the selected endpoint.
 `PROSPER_GPU_TIMELINE_CAPTURE_TARGET_DIM=WxH` restricts predecessor captures to draws targeting that extent;
 it is a size diagnostic, not a dependency proof. `gpu_replay --bundle-zero-boundary` supplies transparent
 pixels to the oldest unseeded temporal leaves for an explicit A/B test and labels the synthetic seeds.
@@ -141,6 +143,8 @@ identity, format, independent validity flags, byte counts, and hashes. Captures 
 invented DS state.
 `gpu_replay --bundle-extract-submit N PATH` materializes one exact manifest for normal inspect/graph/validate
 work without replaying the bundle.
+`gpu_replay --warmup-repeats N CAPTURE OUTPUT` executes the same capsule N times into the persistent RTT/DS
+caches before the measured replay, providing an explicit temporal-history convergence probe.
 `gpu_replay --bundle-find-ds ADDR` scans compact manifests for guest depth/stencil use, writes, clears, compare
 ops, and target extents without reconstructing resource payloads or invoking Vulkan.
 `gpu_replay --bundle-ds-summary` groups every DS-active draw by complete captured identity/programming and

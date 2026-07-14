@@ -2061,8 +2061,24 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
             uint32_t a = val(in.src[0]); uint32_t& d = rs.sreg[in.dst.value];
             switch (in.opcode) {
-                case 0x03: d = a; break;                    // s_mov_b32
-                case 0x07: d = b.iun(Op_Not, a); break;     // s_not_b32
+                case 0x03: {                                // s_mov_b32
+                    d = a;
+                    // Descriptor provenance is part of the scalar value. Shader compilers commonly
+                    // load several V#s into separate SGPR ranges and copy the selected four words into
+                    // one reused SRSRC range before each MUBUF. Keeping that range's OLD tag makes all
+                    // subsequent buffer loads resolve to the first descriptor (DOLL scene VS: the four
+                    // transform rows became one row, degenerating every triangle).
+                    auto tag = rs.sreg_srt.find(in.src[0].value);
+                    if ((in.src[0].kind == OperandKind::SGPR ||
+                         (in.src[0].kind == OperandKind::Special && in.src[0].value >= 106 && in.src[0].value <= 123)) &&
+                        tag != rs.sreg_srt.end())
+                        rs.sreg_srt[in.dst.value] = tag->second;
+                    else
+                        rs.sreg_srt.erase(in.dst.value);
+                    break;
+                }
+                case 0x07:                                  // s_not_b32 changes the descriptor word
+                    d = b.iun(Op_Not, a); rs.sreg_srt.erase(in.dst.value); break;
                 default: ok = false;
             }
             return true;
@@ -2200,6 +2216,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 default: ok = false;
             }
+            // Every modeled SOP2 operation changes the scalar bits (including cselect unless both
+            // inputs happen to be identical). A previous descriptor tag on the destination is stale;
+            // retaining it can bind an unrelated later SRSRC to the old buffer.
+            if (ok) {
+                rs.sreg_srt.erase(in.dst.value);
+                if (in.opcode == 0x29) rs.sreg_srt.erase(in.dst.value + 1);
+            }
             return true;
         }
         case Rdna2Format::VOP3P: {
@@ -2271,7 +2294,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // 16-bit-immediate scalar ops. s_movk_i32 (0x00): dst = sign-extend(simm16). The decoder
             // already sign-extended simm16 to 32 bits. (s_cmovk/s_cmpk/s_addk/s_mulk deferred.)
             switch (in.opcode) {
-                case 0x00: rs.sreg[in.dst.value] = b.uconst((uint32_t)in.simm16); break;   // s_movk_i32
+                case 0x00:                                  // s_movk_i32
+                    rs.sreg[in.dst.value] = b.uconst((uint32_t)in.simm16);
+                    rs.sreg_srt.erase(in.dst.value);
+                    break;
                 // s_waitcnt_vscnt/vmcnt/expcnt/lgkmcnt: wait-for-counter — benign no-ops in our
                 // synchronous model (like SOPP s_waitcnt). These are SOPK on gfx10, NOT SOPP 0x7d
                 // as previously claimed (that case was unreachable dead code, and a real
@@ -2302,7 +2328,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // THIS lane's value. SPECULATIVE(confidence: med): exact only when src0 is wave-uniform —
                 // which is the standard use (reading a uniformly-computed VGPR into an SGPR, e.g. the
                 // integer-divide reciprocal in the game's shaders). Writes an SGPR, not a VGPR.
-                rs.sreg[in.dst.value] = a; return true;
+                rs.sreg[in.dst.value] = a;
+                rs.sreg_srt.erase(in.dst.value);
+                return true;
             }
             uint32_t& d = vreg[in.dst.value];
             // WORD-select v_mov_b32_sdwa (#273): extract the selected 16-bit source half and insert it
@@ -2993,8 +3021,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // A wide scalar load is a descriptor fetch — tag its dest SGPRs with the SRT offset so a
             // later buffer/image op using them resolves to the right resource (provenance). x4 = V#/S#
             // (buffers, samplers), x8 = T# (textures, 8 dwords).
-            if (rt && (in.opcode == 0x2 || in.opcode == 0x3))
+            if (rt && (in.opcode == 0x2 || in.opcode == 0x3)) {
                 for (uint32_t k = 0; k < n; k++) rs.sreg_srt[in.dst.value + (int)k] = in.literal;
+            } else {
+                // Scalar data loads overwrite the destination; they do not carry descriptor identity.
+                for (uint32_t k = 0; k < n; k++) rs.sreg_srt.erase(in.dst.value + (int)k);
+            }
             return true;
         }
         case Rdna2Format::MUBUF: {
@@ -3074,7 +3106,19 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // CONSTANT/structured buffer (a PS's per-lane table fetch, #273) keeps the faithful
                     // VADDR*stride+offset address below.
                     res = rt->by_fetch_pc(in.pc);
-                    if (res) dyn_vfetch = (res->cls == ResourceClass::VertexBuffer);
+                    // The NGG fetch-prologue shortcut applies to the conventional v0 element index
+                    // and to attributes whose SRSRC was rewritten by an in-shader descriptor load.
+                    // In the latter case the folded V# base already includes the attribute offset,
+                    // even when the incomplete prologue left a non-v0 VADDR. A pc-keyed VertexBuffer
+                    // can also be a directly supplied structured V# whose SRSRC was never rewritten;
+                    // DOLL skinning indexes those through computed v4/v5/v7/... values. Replacing
+                    // those addresses with gl_VertexIndex reads the wrong matrix row and collapses
+                    // the whole mesh, so preserve a non-v0 VADDR for untouched direct user data.
+                    if (res) {
+                        const bool srsrc_rewritten = rs.sreg.find(in.src[1].value) != rs.sreg.end();
+                        dyn_vfetch = res->cls == ResourceClass::VertexBuffer &&
+                                     (in.src[0].value == 0 || srsrc_rewritten);
+                    }
                     if (!res) res = rt->by_sgpr_base_cls(in.src[1].value, ResourceClass::VertexBuffer);
                     if (!res) { auto it = rs.sreg_srt.find(in.src[1].value);
                         if (it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second); }
@@ -4283,7 +4327,9 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords, co
     return b.finish();
 }
 
-std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords, const ShaderResourceTable* rt) {
+std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
+                                       const ShaderResourceTable* rt,
+                                       const PixelInputMapping* pixel_inputs) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
 
@@ -4314,14 +4360,42 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords, cons
             b.export_position(operand_bits(b, rs, in, in.src[0], &eok), operand_bits(b, rs, in, in.src[1], &eok),
                               operand_bits(b, rs, in, in.src[2], &eok), operand_bits(b, rs, in, in.src[3], &eok));
             exported = true;
-        } else if (in.exp_target >= 32) {                    // PARAM0.. -> Output varying (location N)
-            b.export_param(in.exp_target - 32, operand_bits(b, rs, in, in.src[0], &eok), operand_bits(b, rs, in, in.src[1], &eok),
-                           operand_bits(b, rs, in, in.src[2], &eok), operand_bits(b, rs, in, in.src[3], &eok));
+        } else if (in.exp_target >= 32) {                    // PARAM0.. -> remapped PS input varying
+            const uint32_t source = in.exp_target - 32;
+            const uint32_t x = operand_bits(b, rs, in, in.src[0], &eok);
+            const uint32_t y = operand_bits(b, rs, in, in.src[1], &eok);
+            const uint32_t z = operand_bits(b, rs, in, in.src[2], &eok);
+            const uint32_t w = operand_bits(b, rs, in, in.src[3], &eok);
+            if (!pixel_inputs || source >= 32 || !(pixel_inputs->valid_mask & (1u << source)))
+                b.export_param(source, x, y, z, w);           // absent control retains identity wiring
+            if (pixel_inputs) {
+                for (uint32_t ps_input = 0; ps_input < pixel_inputs->controls.size(); ++ps_input) {
+                    if (!(pixel_inputs->valid_mask & (1u << ps_input))) continue;
+                    const uint32_t offset = pixel_inputs->controls[ps_input] & 0x3Fu;
+                    if (offset == source) b.export_param(ps_input, x, y, z, w);
+                }
+            }
         }
         return eok;
     };
     if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/true, /*allow_smem*/rt != nullptr, exp_fn, code, dwords)) return {};
     if (!exported) return {};
+    // OFFSET=0x20 asks the interpolator to synthesize a constant instead of consuming a PARAM
+    // export. GFX10 DEFAULT_VAL encodes 0000, 0001, 1110, and 1111. Materialize those outputs in
+    // the Vulkan vertex stage, whose fixed-function interface has no equivalent default source.
+    if (pixel_inputs) {
+        for (uint32_t ps_input = 0; ps_input < pixel_inputs->controls.size(); ++ps_input) {
+            if (!(pixel_inputs->valid_mask & (1u << ps_input))) continue;
+            const uint32_t control = pixel_inputs->controls[ps_input];
+            if ((control & 0x3Fu) != 0x20u) continue;
+            const uint32_t one = b.uconst(0x3F800000u), zero = b.uconst(0u);
+            const uint32_t default_val = (control >> 8) & 0x3u;
+            const bool xyz_one = (default_val & 0x2u) != 0;
+            const bool w_one = (default_val & 0x1u) != 0;
+            b.export_param(ps_input, xyz_one ? one : zero, xyz_one ? one : zero,
+                           xyz_one ? one : zero, w_one ? one : zero);
+        }
+    }
     return b.finish();
 }
 
