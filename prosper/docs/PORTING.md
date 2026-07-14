@@ -294,7 +294,43 @@ earlier than on Linux.
 This is exactly the hard sub-problem flagged above for both Windows and macOS. Path forward
 (unchanged): find Rosetta's segment-base mechanism, or **patch/trap the guest `%fs`-relative
 accesses** — the fault handler already decodes instructions at fault sites (SSE4a), so
-trap-and-emulate of `%fs:` operands is in-house technology.
+trap-and-emulate of `%fs:` operands is in-house technology. NOTE (2026-07-14): the Windows port
+SOLVED its equivalent `%fs` TLS wall (FSGSBASE + VEH re-apply, see the Windows section) — but that
+relies on native FSGSBASE, which Rosetta does not expose (`wrfsbase` SIGILLs), so macOS still needs
+the trap/patch route rather than a direct port of the Windows fix.
+
+### The macOS harness app (prosper-app) — WORKS (2026-07-14)
+
+The realtime window frontend (the Linux `prosper-app`: SDL3 window + Vulkan present, so you watch
+the game live instead of dumping screenshots) now **builds and runs on macOS** under Rosetta 2:
+
+- **Built x86_64** (links the guest-running core) against a **universal MoltenVK** (Homebrew's is
+  arm64-only; `scripts/fetch-macos-vulkan.sh` drops the universal Khronos release into
+  `.macos-vulkan/`). SDL3 is FetchContent-built for x86_64 (a system arm64 SDL3 is skipped on Apple);
+  SDL uses Cocoa (Wayland/X11 are Linux-only now). MoltenVK is linked **directly** (no Khronos
+  loader), so `SDL_Vulkan_LoadLibrary` points at it and the SDL-injected
+  `VK_KHR_portability_enumeration` instance extension is stripped (a loader-only extension MoltenVK
+  rejects in direct-link mode); the device enables the spec-mandated `VK_KHR_portability_subset`.
+- **Verified on an M2:** `prosper-app --test-pattern` opens a Cocoa window, creates the MoltenVK
+  swapchain, and presents animated frames (exit 0). Against the Blasphemous 2 dump the guest boots on
+  its worker thread, the window comes up and waits for guest frames, and the boot hits the **same
+  `%fs` TLS wall** as `boot_trace` — so the harness is complete and will show live gameplay the moment
+  that frontier is solved, exactly like the Linux app.
+- **MoltenVK renders correctly**, not just presents: with `PROSPER_MACOS_MOLTENVK` set, the offscreen
+  GPU tests run on macOS and **90/91 pass** (SPIR-V recompile → MoltenVK → readback → CRC). The one
+  failure, `rdna2_to_spirv_exec`, is a genuine Metal semantics gap — `v_cvt_i32_f32` NaN→0 /
+  INT_MIN/MAX saturation differs from Vulkan/RDNA2 (Metal's out-of-range float→int is undefined). All
+  compute values match (`mismatches=0`); only that saturation subcase diverges. Tracked as an issue.
+
+Build recipe (see the CMake `PROSPER_MACOS_MOLTENVK` override and `scripts/fetch-macos-vulkan.sh`):
+```bash
+bash prosper/scripts/fetch-macos-vulkan.sh
+cmake -S prosper -B prosper/build-mac-app -G Ninja -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+  -DPROSPER_APP=ON -DPROSPER_AUDIO_SDL3=ON -DPROSPER_PAD_SDL3=ON \
+  -DPROSPER_MACOS_MOLTENVK="$PWD/.macos-vulkan/lib/libMoltenVK.dylib"
+cmake --build prosper/build-mac-app --target prosper-app
+PROSPER_VULKAN_LIB="$PWD/.macos-vulkan/lib/libMoltenVK.dylib" ./prosper/build-mac-app/prosper-app --test-pattern
+```
 
 ## Windows port status (2026-07-14) — Messenger reaches the first level natively
 

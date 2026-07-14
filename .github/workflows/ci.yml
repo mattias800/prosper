@@ -117,3 +117,31 @@ jobs:
 
       - name: Test
         run: ctest --test-dir prosper/build-ci --output-on-failure
+
+  macos-app:
+    name: macOS App (SDL3 + MoltenVK)
+    runs-on: macos-latest
+
+    # Builds the realtime window frontend (prosper-app) x86_64 against a UNIVERSAL MoltenVK, so the
+    # SDL3-window/MoltenVK-present glue and the frontends stay compiling on a real macOS toolchain.
+    # Build-only: the window needs a display and headless Metal is flaky on CI runners, so it isn't
+    # run here (locally on an M2, --test-pattern presents fine and the offscreen GPU tests pass 90/91
+    # -- see docs/PORTING.md "The macOS harness app"). Mirrors the Linux App job.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          brew install ninja vulkan-headers
+          softwareupdate --install-rosetta --agree-to-license
+
+      - name: Fetch universal MoltenVK
+        # Homebrew's MoltenVK is arm64-only; the x86_64 app needs a universal driver.
+        run: bash prosper/scripts/fetch-macos-vulkan.sh
+
+      - name: Configure
+        run: cmake -S prosper -B prosper/build-app -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_OSX_ARCHITECTURES=x86_64 -DPROSPER_APP=ON -DPROSPER_AUDIO_SDL3=ON -DPROSPER_PAD_SDL3=ON -DPROSPER_MACOS_MOLTENVK=${{ github.workspace }}/.macos-vulkan/lib/libMoltenVK.dylib
+
+      - name: Build prosper-app
+        run: cmake --build prosper/build-app --target prosper-app

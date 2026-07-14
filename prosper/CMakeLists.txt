@@ -15,6 +15,34 @@ if(MINGW OR (WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU"))
   add_link_options(-static -static-libgcc -static-libstdc++)
 endif()
 
+# --- macOS Vulkan (MoltenVK) override ------------------------------------
+# prosper on macOS is built x86_64 (to run the guest under Rosetta), but Homebrew's MoltenVK/loader
+# are arm64-only, so find_package(Vulkan) would hand back an unlinkable arm64 lib. Point the build at
+# a UNIVERSAL (x86_64+arm64) MoltenVK instead — either the LunarG Vulkan SDK, or the prebuilt
+# KhronosGroup/MoltenVK release (`MoltenVK-macos.tar`, universal). Pass:
+#   -DPROSPER_MACOS_MOLTENVK=/path/to/libMoltenVK.dylib   (universal)
+#   -DPROSPER_MACOS_VULKAN_INCLUDE=/path/to/vulkan/headers (dir containing vulkan/vulkan.h)
+# When set we pre-create the Vulkan::Vulkan imported target from it, so every later
+# find_package(Vulkan) is skipped (guarded on `NOT TARGET Vulkan::Vulkan`). Headers are
+# architecture-independent, so Homebrew's vulkan-headers work for the include dir.
+if(APPLE AND PROSPER_MACOS_MOLTENVK)
+  if(NOT PROSPER_MACOS_VULKAN_INCLUDE)
+    set(PROSPER_MACOS_VULKAN_INCLUDE "/opt/homebrew/include")   # Homebrew vulkan-headers (arch-independent)
+  endif()
+  add_library(Vulkan::Vulkan UNKNOWN IMPORTED)
+  set_target_properties(Vulkan::Vulkan PROPERTIES
+    IMPORTED_LOCATION "${PROSPER_MACOS_MOLTENVK}"
+    INTERFACE_INCLUDE_DIRECTORIES "${PROSPER_MACOS_VULKAN_INCLUDE}")
+  set(Vulkan_FOUND TRUE)
+  set(Vulkan_LIBRARY "${PROSPER_MACOS_MOLTENVK}")
+  set(Vulkan_INCLUDE_DIR "${PROSPER_MACOS_VULKAN_INCLUDE}")
+  # The app dlopen's / links MoltenVK by leaf name; add its dir to the executables' rpath so
+  # SDL_Vulkan_LoadLibrary("libMoltenVK.dylib") and the direct link both resolve at runtime.
+  get_filename_component(_mvk_dir "${PROSPER_MACOS_MOLTENVK}" DIRECTORY)
+  set(CMAKE_BUILD_RPATH "${_mvk_dir}")
+  message(STATUS "macOS Vulkan: using universal MoltenVK ${PROSPER_MACOS_MOLTENVK}")
+endif()
+
 # --- tools ---------------------------------------------------------------
 # self_dump: SELF/ELF inspector and NID import extractor (M0).
 add_executable(self_dump tools/self_dump/self_dump.cpp)
@@ -464,7 +492,9 @@ if(TARGET prosper_core)
     # shared DrawItem->Vulkan compositor boot_trace uses on Linux so the guest's SubmitDcb draws
     # execute + present + dump frames. Mirrors the UNIX block below (boot_trace + prosper_live_renderer
     # only; the extra replay/screenshot tools stay Linux-first for now). See docs/PORTING.md "Windows".
-    find_package(Vulkan QUIET)
+    if(NOT TARGET Vulkan::Vulkan)
+      find_package(Vulkan QUIET)
+    endif()
     if(Vulkan_FOUND)
       target_link_libraries(boot_trace PRIVATE Vulkan::Vulkan)
       target_compile_definitions(boot_trace PRIVATE PROSPER_HAVE_VULKAN=1)
@@ -548,7 +578,9 @@ if(TARGET prosper_core)
 
     # Graphics-phase foundation + agentic-first verification harness: headless offscreen Vulkan
     # (render/clear -> readback -> pixel/CRC assert). Only built if Vulkan dev files are present.
-    find_package(Vulkan QUIET)
+    if(NOT TARGET Vulkan::Vulkan)
+      find_package(Vulkan QUIET)
+    endif()
     if(Vulkan_FOUND)
       # Live game rendering: with Vulkan available, boot_trace can register the live submit renderer
       # (PROSPER_RENDER=1) so the game's SubmitDcb draws execute + present + dump frames to disk.
@@ -722,7 +754,11 @@ option(PROSPER_AUDIO_SDL3 "Build the optional SDL3 audio frontend"   OFF)
 option(PROSPER_PAD_SDL3   "Build the optional SDL3 gamepad frontend" OFF)
 option(PROSPER_APP        "Build the prosper-app frontend (SDL3 window + Vulkan present)" OFF)
 if((PROSPER_AUDIO_SDL3 OR PROSPER_PAD_SDL3 OR PROSPER_APP) AND TARGET prosper_core AND NOT TARGET SDL3::SDL3)
-  find_package(SDL3 QUIET CONFIG)
+  # On macOS the build is x86_64 (Rosetta), but a system SDL3 (e.g. Homebrew) is arm64-only and won't
+  # link — so skip discovery there and always FetchContent+build SDL3 for the requested architecture.
+  if(NOT APPLE)
+    find_package(SDL3 QUIET CONFIG)
+  endif()
   if(NOT SDL3_FOUND)
     message(STATUS "SDL3 not found — fetching release-3.2.30 (audio=${PROSPER_AUDIO_SDL3} pad=${PROSPER_PAD_SDL3} app=${PROSPER_APP})")
     include(FetchContent)
@@ -738,8 +774,12 @@ if((PROSPER_AUDIO_SDL3 OR PROSPER_PAD_SDL3 OR PROSPER_APP) AND TARGET prosper_co
     if(PROSPER_APP)
       set(SDL_UNIX_CONSOLE_BUILD OFF CACHE BOOL "" FORCE)
       set(SDL_VIDEO   ON CACHE BOOL "" FORCE)
-      set(SDL_WAYLAND ON CACHE BOOL "" FORCE)
-      set(SDL_X11     ON CACHE BOOL "" FORCE)
+      # Wayland/X11 are the Linux window backends; on macOS SDL uses Cocoa (forcing X11/Wayland ON
+      # there makes SDL hunt for X11/Wayland dev headers that don't exist). Only request them on Linux.
+      if(NOT APPLE)
+        set(SDL_WAYLAND ON CACHE BOOL "" FORCE)
+        set(SDL_X11     ON CACHE BOOL "" FORCE)
+      endif()
     else()
       set(SDL_UNIX_CONSOLE_BUILD ON CACHE BOOL "" FORCE)
       set(SDL_VIDEO   OFF CACHE BOOL "" FORCE)
@@ -776,7 +816,9 @@ endif()
 # window. A SEPARATE Vulkan context from the core's headless render device (docs/FRONTEND_APP.md);
 # frames cross as CPU pixels. Entirely outside prosper_core. Default OFF; needs SDL3 (video) + Vulkan.
 if(PROSPER_APP AND TARGET SDL3::SDL3)
-  find_package(Vulkan QUIET)
+  if(NOT TARGET Vulkan::Vulkan)
+    find_package(Vulkan QUIET)
+  endif()
   if(Vulkan_FOUND)
     add_executable(prosper-app frontends/prosper-app/main.cpp)
     target_include_directories(prosper-app PRIVATE src)

@@ -88,6 +88,17 @@ struct VulkanComputeContext {
         dci.queueCreateInfoCount = 1;
         dci.pQueueCreateInfos = &qci;
         dci.pEnabledFeatures = &enabled;
+        std::vector<const char*> dev_exts;
+#ifdef __APPLE__
+        // Spec-mandated on MoltenVK: enable VK_KHR_portability_subset when advertised (always is).
+        { uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, nullptr);
+          std::vector<VkExtensionProperties> de(ne);
+          vkEnumerateDeviceExtensionProperties(physical, nullptr, &ne, de.data());
+          for (auto& e : de) if (!std::strcmp(e.extensionName, "VK_KHR_portability_subset")) {
+              dev_exts.push_back("VK_KHR_portability_subset"); break; } }
+        dci.enabledExtensionCount = (uint32_t)dev_exts.size();
+        dci.ppEnabledExtensionNames = dev_exts.empty() ? nullptr : dev_exts.data();
+#endif
         if (vkCreateDevice(physical, &dci, nullptr, &device) != VK_SUCCESS) return false;
         vkGetDeviceQueue(device, queue_family, 0, &queue);
         vkGetPhysicalDeviceMemoryProperties(physical, &memory);

@@ -42,6 +42,7 @@
 #include <cstdint>
 #include <vector>
 #include <string>
+#include <algorithm>
 #include <cmath>
 #include <chrono>
 #include <thread>
@@ -104,6 +105,17 @@ bool create_instance(Vk& vk, SDL_Window* win) {
     if (!sdlExts) { fprintf(stderr, "[app] SDL_Vulkan_GetInstanceExtensions: %s\n", SDL_GetError()); return false; }
     std::vector<const char*> exts(sdlExts, sdlExts + extCount);
 
+    // macOS: SDL adds VK_KHR_portability_enumeration to its required extensions because it assumes
+    // the Khronos loader. This build links MoltenVK DIRECTLY (no loader), where MoltenVK is the sole
+    // driver — no enumeration is needed and MoltenVK rejects the extension with
+    // VK_ERROR_EXTENSION_NOT_PRESENT. Strip it (and never set the enumerate flag). The device-level
+    // VK_KHR_portability_subset (below) is the piece that actually matters. If a future build routes
+    // through the loader, keep SDL's extension and add the ENUMERATE_PORTABILITY flag instead.
+#ifdef __APPLE__
+    exts.erase(std::remove_if(exts.begin(), exts.end(),
+                   [](const char* e){ return std::strcmp(e, "VK_KHR_portability_enumeration") == 0; }),
+               exts.end());
+#endif
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "prosper-app"; app.apiVersion = VK_API_VERSION_1_1;
     VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
@@ -136,10 +148,19 @@ bool pick_device(Vk& vk) {
     float pr = 1.0f;
     VkDeviceQueueCreateInfo qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qi.queueFamilyIndex = vk.qfamily; qi.queueCount = 1; qi.pQueuePriorities = &pr;
-    const char* devExts[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+    std::vector<const char*> devExts = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+#ifdef __APPLE__
+    // The Vulkan spec requires enabling VK_KHR_portability_subset on any device that advertises it
+    // (all MoltenVK devices do), or vkCreateDevice fails with VK_ERROR_EXTENSION_NOT_PRESENT.
+    { uint32_t n = 0; vkEnumerateDeviceExtensionProperties(vk.phys, nullptr, &n, nullptr);
+      std::vector<VkExtensionProperties> dp(n);
+      vkEnumerateDeviceExtensionProperties(vk.phys, nullptr, &n, dp.data());
+      for (auto& e : dp) if (!strcmp(e.extensionName, "VK_KHR_portability_subset")) {
+          devExts.push_back("VK_KHR_portability_subset"); break; } }
+#endif
     VkDeviceCreateInfo di{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     di.queueCreateInfoCount = 1; di.pQueueCreateInfos = &qi;
-    di.enabledExtensionCount = 1; di.ppEnabledExtensionNames = devExts;
+    di.enabledExtensionCount = (uint32_t)devExts.size(); di.ppEnabledExtensionNames = devExts.data();
     VKCHECK(vkCreateDevice(vk.phys, &di, nullptr, &vk.device), "vkCreateDevice");
     vkGetDeviceQueue(vk.device, vk.qfamily, 0, &vk.queue);
 
@@ -379,6 +400,16 @@ int main(int argc, char** argv) {
     }
 
     if (!SDL_Init(SDL_INIT_VIDEO)) { fprintf(stderr, "[app] SDL_Init: %s\n", SDL_GetError()); return 1; }
+#ifdef __APPLE__
+    // There is no system Vulkan loader on macOS; point SDL at MoltenVK so SDL_Vulkan_* uses the same
+    // driver this binary links. PROSPER_VULKAN_LIB overrides the path; default resolves via the
+    // executable's rpath (CMake links MoltenVK with an rpath, so the dylib sits beside/near the app).
+    if (!SDL_Vulkan_LoadLibrary(getenv("PROSPER_VULKAN_LIB") ? getenv("PROSPER_VULKAN_LIB") : "libMoltenVK.dylib")) {
+        fprintf(stderr, "[app] SDL_Vulkan_LoadLibrary(MoltenVK): %s\n", SDL_GetError());
+        fprintf(stderr, "[app] set PROSPER_VULKAN_LIB=/path/to/libMoltenVK.dylib\n");
+        return 1;
+    }
+#endif
     // Title: "prosper — <app0 basename>" for a booted game, else a plain label.
     std::string title = "prosper";
     if (!dump.empty()) { auto sl = dump.find_last_of("/\\"); title += " — " + (sl == std::string::npos ? dump : dump.substr(sl + 1)); }
