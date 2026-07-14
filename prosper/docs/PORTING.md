@@ -352,7 +352,7 @@ The deep crash after `%fs` TLS was two more Linux-parity gaps (fixed on `port/wi
   rbx=0) on an unrecoverable thread. A `win_thread_trampoline` now marshals the SysV entry through
   `prosper_call_guest_sysv` and activates the worker's guest `%fs` TCB.
 
-### Renderer wired on Windows (#655); the Windows frontier: the Unity job-system pre-render stall
+### Renderer wired on Windows (#655); the Windows frontier: the Unity GC-helper init handshake
 
 The live Vulkan renderer now builds + initializes on Windows (#655): the whole GPU/Vulkan translation
 layer + `prosper_live_renderer` compile under MinGW (the Vulkan SDK is found via `VULKAN_SDK`), and at
@@ -360,16 +360,27 @@ runtime the live compute + submit renderers register cleanly. With the renderer 
 `PROSPER_RENDER=1`, the guest boots into Unity engine init (allocates its pools, spawns
 `AssetGarbageCollectorHelper` threads) and then **idle-waits** (0% CPU) — it does NOT yet submit draws.
 
-Diagnosis (via the new `PROSPER_SYNCLOG` WaitOnAddress logging): the guest's **Unity job-system worker
-threads park in `sceKernelWaitOnAddress`** on a contiguous array of per-worker words (observed ~44
-stuck waits, `*addr==expected==0`, no timeout), waiting for jobs the dispatcher never posts because the
-**main/dispatch thread is itself blocked** after an init burst (24 `scePthreadCondBroadcast`s). This is
-the same producer/consumer class as the Linux pre-render stall. Next step: identify what the dispatch
-thread is blocked on (likely a resource-load / async / GPU-or-VideoOut completion that must tick to
-release it), using the sync + EventFlag logs; the Linux bring-up (worker pool via PSN.prx, EOP
-completions, scene activation) is the reference. Note the coarse Windows `WaitOnAddress` uses one global
-`std::condition_variable` (any wake re-checks all waiters) — correct but worth revisiting if the wake
-path proves to be the gap.
+Diagnosis (via `PROSPER_SYNCLOG` WaitOnAddress logging + `PROSPER_GUEST_ARGS=-force-gfx-direct
+PROSPER_RENDER=1` + gdb thread inventory). **A thread-inventory diff vs Linux localizes the stall
+precisely — it is NOT the later job-dispatch loop, it is the very first GC-helper init handshake:**
+
+- **Linux** (renders 330+ frames, ~37 000 WaitOnAddress wakes) spawns the whole Unity thread ecosystem:
+  13 `AssetGarbageCollectorHelper`, `Job.Worker 0..12` + `Background Job.Worker`, `Loading.PreloadManager`,
+  `Loading.AsyncRead`, `UnityEOPThread`, `GfxFlipThread`, FMOD threads, `BatchDeleteObjects`, ….
+- **Windows** creates only **2 `AssetGarbageCollectorHelper` threads and then deadlocks**: exactly 3
+  guest threads remain, ALL parked in `sceKernelWaitOnAddress` (`*addr==expected==0`, no timeout), ~13
+  total wakes then silence. None of `Job.Worker*`/`PreloadManager`/`AsyncRead`/`GfxFlipThread` is ever
+  created.
+
+So the `AssetGarbageCollectorHelper` thread (guest entry `eboot+0xbfbac0`) now RUNS on Windows (the
+worker-thread ABI + `%fs` TLS fixes stopped it crashing at `mov 0x38(%rbx)`), but it **fails to complete
+its init handshake / signal the main thread it is ready**, so the main thread never advances to spawn
+the rest of Unity's threads. Next step: trace what that helper does on Windows vs Linux — which
+`WaitOnAddress`/wake or HLE call it diverges on (its own TLS-derived state, or a wake it should send to
+main that never fires). The coarse Windows `WaitOnAddress` (one global `std::condition_variable`; any
+wake re-checks all waiters) is correct under its mutex (no lost-wakeup) but is a candidate to revisit.
+Diagnostics in place: `PROSPER_SYNCLOG` (`[sync]` WaitOnAddress + `[sync2]` cond/sema/EventFlag),
+`PROSPER_MEMLOG`, `PROSPER_VEHLOG`, boot_trace `[memclass]`.
 
 Deferred, lower-priority items (some now done): ~~honor reserve alignment > 64 KiB~~ (done, #658);
 ~~worker-thread stack registration for GC bounds~~ (done, #658); phys-offset aliasing in the memory HLE
@@ -397,10 +408,11 @@ granularity); and `PROSPER_CRASHPEEK` guards.
   `Windows MinGW` job builds the whole boot path.
 
 **What is left (runtime work, on a Windows host):**
-1. **The Unity job-system pre-render stall — the current frontier.** The renderer is wired (#655) but
-   the guest idle-waits in engine init: job workers park in `sceKernelWaitOnAddress` for jobs the
-   blocked dispatch thread never posts (see above). Find what blocks the dispatch thread (sync/EventFlag
-   logs are in place) so draws start flowing to the now-wired renderer.
+1. **The Unity GC-helper init handshake — the current frontier.** The renderer is wired (#655) but the
+   guest deadlocks EARLY: it creates only 2 `AssetGarbageCollectorHelper` threads (Linux creates 40+ incl.
+   Job.Workers/PreloadManager/GfxFlipThread and renders 330 frames), then all 3 guest threads park in
+   `sceKernelWaitOnAddress`. The helper (`eboot+0xbfbac0`) runs but never signals the main thread ready.
+   Trace the helper's Windows-vs-Linux divergence (see "the Windows frontier" above) so main advances.
 2. ~~Port the direct/flexible-memory HLE~~ — **DONE** (private-`VirtualAlloc`; phys-aliasing deferred,
    only needed by UE4 MallocBinned3, not this Unity title).
 3. ~~Guest `%fs` TLS~~ — **DONE** (FSGSBASE + VEH re-apply).
