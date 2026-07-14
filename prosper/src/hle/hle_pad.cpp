@@ -43,6 +43,7 @@ std::atomic<int> g_pad_handle{1};
 
 // PROSPER_PADLOG=1: trace pad calls (rate-limited) so a boot run shows the game polling input.
 bool padlog() { static const bool on = getenv("PROSPER_PADLOG") != nullptr; return on; }
+bool pad_script_log() { static const bool on = getenv("PROSPER_PAD_SCRIPT_LOG") != nullptr; return on; }
 void padlog_once(const char* what, const HostPadState* s) {
     if (!padlog()) return;
     static std::atomic<int> n{0};
@@ -128,7 +129,18 @@ bool apply_pad_script(HostPadState& s, int64_t frame) {
         if (g_pad_t0_us.compare_exchange_strong(expect, now)) t0 = now; else t0 = expect;
     }
     double elapsed = (now_us() - t0) / 1e6;
-    s.buttons |= pad_script_buttons_at(script, elapsed, pad_hold_secs(), frame, pad_frame_hold());
+    const uint32_t scripted =
+        pad_script_buttons_at(script, elapsed, pad_hold_secs(), frame, pad_frame_hold());
+    if (pad_script_log()) {
+        static std::atomic<uint32_t> previous{std::numeric_limits<uint32_t>::max()};
+        const uint32_t observed = previous.exchange(scripted, std::memory_order_relaxed);
+        if (observed != scripted) {
+            const std::string names = pad_button_names(scripted);
+            fprintf(stderr, "[pad-script] elapsed=%.3f frame=%lld buttons=%s\n", elapsed,
+                    (long long)frame, names.empty() ? "neutral" : names.c_str());
+        }
+    }
+    s.buttons |= scripted;
     return true;
 }
 
