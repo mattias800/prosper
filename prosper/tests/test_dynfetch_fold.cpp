@@ -156,6 +156,25 @@ int main() {
     for (const auto& u : uses_m0) if (u.kind == 0 && u.key == 0x40) have_tex_m0 = true;
     CHECK(!have_tex_m0, "#398: m0-SOFFSET s_load marks the T# UNKNOWN (no descriptor fabricated from soffset 0)");
 
+    // The instruction cache must reuse an unchanged shader but invalidate when code at the same guest
+    // address changes. The second case is important for games that recycle or patch shader allocations:
+    // stale decoded literals would resolve a confidently wrong descriptor.
+    clear_shader_decode_cache();
+    std::vector<uint32_t> mutable_code(k1, k1 + sizeof(k1) / sizeof(k1[0]));
+    auto cached_first = resolve_dynamic_fetch(mutable_code.data(), mutable_code.size(), nullptr, 0, 0);
+    auto cached_second = resolve_dynamic_fetch(mutable_code.data(), mutable_code.size(), nullptr, 0, 0);
+    ShaderDecodeCacheStats cache_stats = shader_decode_cache_stats();
+    CHECK(cache_stats.misses == 1 && cache_stats.hits == 1,
+          "unchanged shader bytes reuse the decoded-instruction cache");
+    mutable_code[1] = 0x00002000u;  // same address, change s_mov_b32 literal: V# base 0x1000 -> 0x2000
+    auto patched = resolve_dynamic_fetch(mutable_code.data(), mutable_code.size(), nullptr, 0, 0);
+    cache_stats = shader_decode_cache_stats();
+    CHECK(cache_stats.invalidations == 1 && cache_stats.misses == 2,
+          "same-address shader mutation invalidates the decoded instructions");
+    CHECK(cached_first.size() == 1 && cached_second.size() == 1 && patched.size() == 1 &&
+              cached_first[0].desc.base == 0x1000u && patched[0].desc.base == 0x2000u,
+          "cache invalidation preserves the real fold result after a shader literal changes");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

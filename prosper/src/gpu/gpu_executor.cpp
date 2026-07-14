@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <bitset>
 #include <iterator>
 #include <mutex>
 #include <set>
@@ -132,6 +133,126 @@ ShaderCache& shader_cache() {
     return cache;
 }
 
+struct DecodedShader {
+    std::vector<uint32_t> code;
+    std::vector<Rdna2Inst> instructions;
+    size_t source_dwords = 0;
+    bool terminated = false;
+    uint64_t bytes = 0;
+};
+
+struct DecodedShaderEntry {
+    std::shared_ptr<const DecodedShader> shader;
+    uint64_t last_use = 0;
+};
+
+struct ShaderDecodeCache {
+    std::mutex mutex;
+    std::unordered_map<uintptr_t, DecodedShaderEntry> entries;
+    ShaderDecodeCacheStats stats;
+    uint64_t use_counter = 0;
+};
+
+ShaderDecodeCache& shader_decode_cache() {
+    static ShaderDecodeCache cache;
+    return cache;
+}
+
+uint64_t shader_decode_cache_limit_bytes() {
+    constexpr uint64_t default_bytes = 64ull * 1024 * 1024;
+    const char* value = getenv("PROSPER_SHADER_DECODE_CACHE_MB");
+    if (!value || !*value) return default_bytes;
+    char* end = nullptr;
+    const unsigned long long mib = strtoull(value, &end, 10);
+    if (end == value || *end != '\0') return default_bytes;
+    return std::min<uint64_t>(mib, 1024ull) * 1024 * 1024;
+}
+
+std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, size_t dwords) {
+    auto decode = [&] {
+        auto result = std::make_shared<DecodedShader>();
+        result->source_dwords = dwords;
+        std::vector<Rdna2Inst> decoded;
+        const size_t consumed = rdna2_walk(code, dwords, decoded);
+        result->code.assign(code, code + consumed);
+        if (!decoded.empty()) {
+            const Rdna2Inst& last = decoded.back();
+            result->terminated = last.is_end || last.fmt == Rdna2Format::Unknown ||
+                                 last.len_dwords == 0;
+        }
+        // The fold ignores vector/control/export instructions unless the decoder reports an SGPR
+        // destination (the conservative unknown-value invalidation). Retain only instructions that can
+        // affect its state or emit a descriptor use, preserving their original order and PCs.
+        result->instructions.reserve(decoded.size());
+        for (const Rdna2Inst& instruction : decoded) {
+            if (instruction.is_end) break;
+            const bool fold_format = instruction.fmt == Rdna2Format::SOP1 ||
+                                     instruction.fmt == Rdna2Format::SOP2 ||
+                                     instruction.fmt == Rdna2Format::SOPC ||
+                                     instruction.fmt == Rdna2Format::SOPK ||
+                                     instruction.fmt == Rdna2Format::SMEM ||
+                                     instruction.fmt == Rdna2Format::MIMG ||
+                                     instruction.fmt == Rdna2Format::MUBUF;
+            if (fold_format || instruction.dst.kind == OperandKind::SGPR)
+                result->instructions.push_back(instruction);
+        }
+        result->bytes = static_cast<uint64_t>(result->code.size()) * sizeof(uint32_t) +
+                        static_cast<uint64_t>(result->instructions.size()) * sizeof(Rdna2Inst);
+        return result;
+    };
+
+    if (!code || !dwords) return decode();
+    auto& cache = shader_decode_cache();
+    if (getenv("PROSPER_NO_SHADER_DECODE_CACHE")) {
+        std::lock_guard lock(cache.mutex);
+        ++cache.stats.bypasses;
+        return decode();
+    }
+
+    const uintptr_t address = reinterpret_cast<uintptr_t>(code);
+    {
+        std::lock_guard lock(cache.mutex);
+        auto found = cache.entries.find(address);
+        if (found != cache.entries.end()) {
+            const auto& cached = found->second.shader;
+            const bool compatible_length = cached->terminated || cached->source_dwords == dwords;
+            const uint64_t code_bytes = static_cast<uint64_t>(cached->code.size()) * sizeof(uint32_t);
+            const bool readable = code_bytes == 0 ||
+                                  (code_bytes <= UINT32_MAX && guest_readable(address, (uint32_t)code_bytes));
+            if (compatible_length && cached->code.size() <= dwords && readable &&
+                (code_bytes == 0 || memcmp(code, cached->code.data(), (size_t)code_bytes) == 0)) {
+                ++cache.stats.hits;
+                found->second.last_use = ++cache.use_counter;
+                return cached;
+            }
+            cache.stats.bytes -= cached->bytes;
+            cache.entries.erase(found);
+            ++cache.stats.invalidations;
+        }
+        ++cache.stats.misses;
+    }
+
+    auto decoded = decode();
+    std::lock_guard lock(cache.mutex);
+    constexpr size_t max_entries = 4096;
+    const uint64_t limit = shader_decode_cache_limit_bytes();
+    while (!cache.entries.empty() &&
+           (cache.entries.size() >= max_entries || cache.stats.bytes + decoded->bytes > limit)) {
+        auto oldest = cache.entries.begin();
+        for (auto it = std::next(cache.entries.begin()); it != cache.entries.end(); ++it)
+            if (it->second.last_use < oldest->second.last_use) oldest = it;
+        cache.stats.bytes -= oldest->second.shader->bytes;
+        cache.entries.erase(oldest);
+        ++cache.stats.evictions;
+    }
+    if (decoded->bytes <= limit && max_entries != 0) {
+        cache.entries[address] = {decoded, ++cache.use_counter};
+        cache.stats.bytes += decoded->bytes;
+    }
+    cache.stats.entries = cache.entries.size();
+    return decoded;
+}
+
 uint64_t shader_cache_limit_bytes() {
     constexpr uint64_t default_bytes = 128ull * 1024 * 1024;
     const char* value = getenv("PROSPER_SHADER_CACHE_MB");
@@ -183,6 +304,22 @@ std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const Sh
 }
 
 } // namespace
+
+ShaderDecodeCacheStats shader_decode_cache_stats() {
+    auto& cache = shader_decode_cache();
+    std::lock_guard lock(cache.mutex);
+    ShaderDecodeCacheStats stats = cache.stats;
+    stats.entries = cache.entries.size();
+    return stats;
+}
+
+void clear_shader_decode_cache() {
+    auto& cache = shader_decode_cache();
+    std::lock_guard lock(cache.mutex);
+    cache.entries.clear();
+    cache.stats = {};
+    cache.use_counter = 0;
+}
 
 std::vector<uint32_t> recompile_graphics_shader_cached(ShaderProgramStage stage,
                                                        const uint32_t* code, size_t dwords,
@@ -264,6 +401,65 @@ DrawRealizationPhaseStats draw_realization_phase_stats() {
     return g_draw_realization_phases;
 }
 
+thread_local StageTablePhaseStats g_stage_table_phases;
+
+void record_stage_table_phases(double metadata_ms, double dynamic_fold_ms, double resources_ms) {
+    ++g_stage_table_phases.calls;
+    g_stage_table_phases.metadata_ms += metadata_ms;
+    g_stage_table_phases.dynamic_fold_ms += dynamic_fold_ms;
+    g_stage_table_phases.resources_ms += resources_ms;
+}
+
+StageTablePhaseStats stage_table_phase_stats() {
+    return g_stage_table_phases;
+}
+
+namespace {
+
+struct GuestReadableRange { uint64_t begin = 0, end = 0; };
+struct GuestReadableCacheState {
+    bool active = false;
+    std::vector<GuestReadableRange> ranges;
+    uint64_t calls = 0, hits = 0, os_probes = 0;
+};
+thread_local GuestReadableCacheState g_guest_readable_cache;
+
+bool guest_range_cache_hit(uint64_t begin, uint64_t end) {
+    if (!g_guest_readable_cache.active) return false;
+    ++g_guest_readable_cache.calls;
+    for (const auto& range : g_guest_readable_cache.ranges) {
+        if (begin >= range.begin && end <= range.end) {
+            ++g_guest_readable_cache.hits;
+            return true;
+        }
+    }
+    return false;
+}
+
+void cache_guest_readable_range(uint64_t begin, uint64_t end) {
+    if (!g_guest_readable_cache.active || begin >= end) return;
+    for (auto it = g_guest_readable_cache.ranges.begin(); it != g_guest_readable_cache.ranges.end();) {
+        if (end < it->begin || begin > it->end) { ++it; continue; }
+        begin = std::min(begin, it->begin);
+        end = std::max(end, it->end);
+        it = g_guest_readable_cache.ranges.erase(it);
+    }
+    g_guest_readable_cache.ranges.push_back({begin, end});
+}
+
+struct GuestReadableSubmitScope {
+    GuestReadableSubmitScope() {
+        g_guest_readable_cache = {};
+        g_guest_readable_cache.active = getenv("PROSPER_NO_GUEST_READ_CACHE") == nullptr;
+    }
+    ~GuestReadableSubmitScope() {
+        g_guest_readable_cache.active = false;
+        g_guest_readable_cache.ranges.clear();
+    }
+};
+
+} // namespace
+
 // Readability probe (guest memory is 1:1-mapped, but a mis-decoded address could be unmapped),
 // so guarded derefs on the render/submit thread don't risk a SIGSEGV. NOTE: /dev/null does NOT
 // work for this — the kernel's null_write returns count without ever touching the source buffer,
@@ -304,19 +500,26 @@ static bool probe_byte(uint64_t a) {
 bool guest_readable(uint64_t a, uint32_t n) {
     if (a < 0x1000 || n == 0) return false;
     if (a + n < a) return false;   // wrap
+    const uint64_t end = a + n;
+    if (guest_range_cache_hit(a, end)) return true;
     if (!probe_pipe_ok()) return false;
     uint64_t last_page = (a + n - 1) & ~0xfffull;
-    for (uint64_t p = a & ~0xfffull; p <= last_page; p += 0x1000)
+    for (uint64_t p = a & ~0xfffull; p <= last_page; p += 0x1000) {
+        if (g_guest_readable_cache.active) ++g_guest_readable_cache.os_probes;
         if (!probe_byte(p < a ? a : p)) return false;
+    }
+    cache_guest_readable_range(a & ~0xfffull, last_page + 0x1000);
     return true;
 }
 #else
 bool guest_readable(uint64_t a, uint32_t n) {
     if (a < 0x1000 || n == 0 || a + n < a) return false;
     const uint64_t end = a + n;
+    if (guest_range_cache_hit(a, end)) return true;
     uint64_t cursor = a;
     while (cursor < end) {
         MEMORY_BASIC_INFORMATION mbi{};
+        if (g_guest_readable_cache.active) ++g_guest_readable_cache.os_probes;
         if (!VirtualQuery((const void*)(uintptr_t)cursor, &mbi, sizeof(mbi))) return false;
         const DWORD blocked = PAGE_NOACCESS | PAGE_GUARD;
         if (mbi.State != MEM_COMMIT || (mbi.Protect & blocked)) return false;
@@ -325,6 +528,7 @@ bool guest_readable(uint64_t a, uint32_t n) {
         if (!(mbi.Protect & readable)) return false;
         const uint64_t region_end = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
         if (region_end <= cursor) return false;
+        cache_guest_readable_range((uint64_t)(uintptr_t)mbi.BaseAddress, region_end);
         cursor = std::min(end, region_end);
     }
     return true;
@@ -347,8 +551,8 @@ std::vector<DynFetch>
 resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_sgprs, uint32_t nsgpr,
                       uint32_t user_sgpr_base, std::vector<SrtUse>* srt_uses) {
     std::vector<DynFetch> out;
-    std::vector<Rdna2Inst> ins;
-    rdna2_walk(code, dwords, ins);
+    const auto decoded = decode_shader_cached(code, dwords);
+    const auto& ins = decoded->instructions;
 
     // PROSPER_DYNTRACE traces the whole const-fold walk; PROSPER_DYNTRACE_ADDR=<hex code addr>
     // narrows it to ONE shader (a full run otherwise traces every draw's walk — unusable volume).
@@ -358,24 +562,42 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     if (trc && !g_dyntrace_force)
         if (const char* fa = getenv("PROSPER_DYNTRACE_ADDR"))
             trc = strtoull(fa, nullptr, 16) == (uint64_t)(uintptr_t)code;
-    std::unordered_map<int, uint32_t> val;                 // known concrete SGPR values (by SHADER SGPR #)
-    std::unordered_map<int, std::array<uint32_t, 4>> descr; // SGPR -> the 4-dword V# it holds (load-time snapshot)
+    // Scalar operands encode at most 128 SGPRs. Fixed register files avoid hundreds of tiny hash/tree
+    // allocations per submit while retaining exactly the same known/unknown state model.
+    constexpr size_t kFoldSgprs = 128;
+    std::array<uint32_t, kFoldSgprs> val{};                 // concrete SGPR values
+    std::bitset<kFoldSgprs> val_known;
+    std::array<std::array<uint32_t, 4>, kFoldSgprs> descr{}; // load-time V# snapshots by base SGPR
+    std::bitset<kFoldSgprs> descr_known;
     // Descriptor-TABLE provenance (#294): for each snapshotted 4/8-dword s_load, the load's IMMEDIATE
     // byte offset — the recompiler's sreg_srt/by_srt_offset key. 0xFFFFFFFF = not provenance-usable
     // (register-SOFFSET or negative-immediate load, which emit_alu doesn't tag).
-    std::unordered_map<int, uint32_t> descr_key;
-    std::unordered_map<int, std::array<uint32_t, 8>> descr8;  // SGPR -> 8-dword T# (load-time snapshot)
-    std::unordered_map<int, uint32_t> descr8_key;
+    std::array<uint32_t, kFoldSgprs> descr_key{};
+    std::bitset<kFoldSgprs> descr_key_known;
+    std::array<std::array<uint32_t, 8>, kFoldSgprs> descr8{};  // load-time T# snapshots by base SGPR
+    std::bitset<kFoldSgprs> descr8_known;
+    std::array<uint32_t, kFoldSgprs> descr8_key{};
+    std::bitset<kFoldSgprs> descr8_key_known;
     // SGPRs overwritten by an s_load since seeding — the seed-V# MUBUF fallback below must not use a
     // stale user-data snapshot once the register was RELOADED from memory (ALU patches deliberately
     // don't count: descriptor snapshots are load-time semantics, pre-patch, like `descr`).
-    std::set<int> reloaded;
+    std::bitset<kFoldSgprs> reloaded;
     int scc = -1;   // tracked SCC (-1 unknown): set by s_cmp_*, consumed by s_cselect (the format patch's tail)
     // The SPI loads the user-data block starting at shader SGPR `user_sgpr_base` (s0..s7 are NGG system
     // SGPRs). So user-data block index k lands in shader SGPR (user_sgpr_base + k).
-    for (uint32_t i = 0; i < nsgpr; i++) val[(int)(user_sgpr_base + i)] = user_sgprs[i];
+    auto valid_reg = [](int r) { return r >= 0 && r < (int)kFoldSgprs; };
+    auto set_value = [&](int r, uint32_t v) {
+        if (valid_reg(r)) { val[(size_t)r] = v; val_known.set((size_t)r); }
+    };
+    auto forget = [&](int r) { if (valid_reg(r)) val_known.reset((size_t)r); };
+    for (uint32_t i = 0; i < nsgpr; i++)
+        set_value((int)(user_sgpr_base + i), user_sgprs[i]);
 
-    auto known = [&](int r, uint32_t& v) { auto it = val.find(r); if (it == val.end()) return false; v = it->second; return true; };
+    auto known = [&](int r, uint32_t& v) {
+        if (!valid_reg(r) || !val_known.test((size_t)r)) return false;
+        v = val[(size_t)r];
+        return true;
+    };
     // Resolve an ALU source operand to a concrete value (SGPR / inline int / literal / a vcc Special).
     // vcc_lo/hi (106/107) are written by ALU dsts as SGPR 106/107 but read back as Special operands with
     // the same field value, so map them onto the same val[] keys. Other Specials (EXEC/M0/...) stay unknown.
@@ -396,8 +618,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 if (in.opcode == 0x03) {                        // s_mov_b32
                     uint32_t v;
                     if (in.src[0].kind == OperandKind::Literal ? (v = in.literal, true) : srcval(in.src[0], v))
-                        val[in.dst.value] = v;
-                    else val.erase(in.dst.value);
+                        set_value(in.dst.value, v);
+                    else forget(in.dst.value);
                 } else if (in.dst.kind == OperandKind::SGPR) {
                     // Not the modeled s_mov_b32 -> the dest is unknown. Erase the PAIR: 64-bit SOP1 ops
                     // (s_mov_b64, s_getpc_b64, s_and/or/xor/not_b64, s_*_saveexec_b64, …) write
@@ -405,8 +627,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     // confidently-wrong 64-bit base/offset -> a wrong V#/T# read from the wrong guest
                     // address (#460). Over-erasing dst+1 for a 32-bit SOP1 only loses a fold opportunity
                     // (never fabricates a value) — matching the SOP2 s_bfe_u64 pair-erase.
-                    val.erase(in.dst.value);
-                    val.erase(in.dst.value + 1);
+                    forget(in.dst.value);
+                    forget(in.dst.value + 1);
                 }
                 // Several SOP1 ops write SCC (s_abs_i32, s_not_b32, s_and_saveexec_*, …). Only the moves
                 // (s_mov_b32 0x03 / s_mov_b64 0x04) are known not to — anything else invalidates the
@@ -461,10 +683,10 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // Every SOP2 ALU op except s_cselect writes SCC to a value we don't track here — invalidate so a
                 // later s_cselect only trusts SCC set by an immediately-preceding s_cmp.
                 if (in.opcode != 0x0A) scc = -1;
-                if (ok) { val[d] = r; if (wrote_pair) val[d + 1] = hi64; }
+                if (ok) { set_value(d, r); if (wrote_pair) set_value(d + 1, hi64); }
                 // A 64-bit-dst op (s_bfe_u64) invalidates BOTH dwords even when its sources were
                 // unknown (the opcode switch never ran, so wrote_pair may still be false).
-                else    { val.erase(d); if (wrote_pair || in.opcode == 0x29) val.erase(d + 1); }
+                else    { forget(d); if (wrote_pair || in.opcode == 0x29) forget(d + 1); }
                 break;
             }
             case Rdna2Format::SOPC: {   // scalar compare -> SCC (feeds the format patch's s_cselect)
@@ -512,13 +734,16 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // immediate (matching the recompiler's sreg_srt tag). Recorded BEFORE the dest write
                 // below (SBASE and SDST ranges may overlap).
                 if (srt_uses && is_buffer) {
-                    auto dit = descr.find(sbase); auto kit = descr_key.find(sbase);
-                    if (dit != descr.end() && kit != descr_key.end() && kit->second != 0xFFFFFFFFu) {
-                        SrtUse u; u.kind = 1; u.key = kit->second; u.v4 = dit->second;
+                    if (valid_reg(sbase) && descr_known.test((size_t)sbase) &&
+                        descr_key_known.test((size_t)sbase) &&
+                        descr_key[(size_t)sbase] != 0xFFFFFFFFu) {
+                        SrtUse u; u.kind = 1; u.key = descr_key[(size_t)sbase];
+                        u.v4 = descr[(size_t)sbase];
                         srt_uses->push_back(u);
                     }
                 }
-                for (uint32_t k = 0; k < n; k++) reloaded.insert(sdst + (int)k);   // dest now holds memory data
+                for (uint32_t k = 0; k < n; k++)
+                    if (valid_reg(sdst + (int)k)) reloaded.set((size_t)(sdst + (int)k));
                 uint64_t base = 0; bool base_ok;
                 if (is_buffer) { uint32_t b0, b1; base_ok = known(sbase, b0) && known(sbase + 1, b1);
                                  base = ((uint64_t)b0 | ((uint64_t)b1 << 32)) & 0xFFFFFFFFFFFFull; }   // V#.Base48
@@ -528,14 +753,17 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                                  "soff_field=%u soff_val=0x%x soff_ok=%d imm=0x%x n=%u\n", in.opcode,
                                  is_buffer ? "bufload" : "load", sdst, sbase, (unsigned long long)base, base_ok,
                                  soff_field, soff_val, soff_ok, in.literal, n);
-                if (n == 0 || !base_ok || !soff_ok) { for (uint32_t k = 0; k < n; k++) val.erase(sdst + (int)k); break; }
+                if (n == 0 || !base_ok || !soff_ok) {
+                    for (uint32_t k = 0; k < n; k++) forget(sdst + (int)k);
+                    break;
+                }
                 // in.literal is the SIGN-EXTENDED 21-bit immediate (#149) — add it as signed so a
                 // negative offset subtracts from the base instead of wrapping to a huge address.
                 uint64_t addr = base + (uint64_t)(int64_t)(int32_t)in.literal + soff_val;
                 if (!guest_readable(addr, n * 4)) { if (trc) fprintf(stderr, "[dyntrace]   addr 0x%llx unreadable\n", (unsigned long long)addr);
-                                                    for (uint32_t k = 0; k < n; k++) val.erase(sdst + (int)k); break; }
+                                                    for (uint32_t k = 0; k < n; k++) forget(sdst + (int)k); break; }
                 const uint32_t* mem = (const uint32_t*)(uintptr_t)addr;
-                for (uint32_t k = 0; k < n; k++) val[sdst + (int)k] = mem[k];
+                for (uint32_t k = 0; k < n; k++) set_value(sdst + (int)k, mem[k]);
                 // Provenance key: the recompiler tags an IMMEDIATE-only descriptor load's dest SGPRs
                 // with the load immediate (sreg_srt = in.literal); register-SOFFSET / negative loads
                 // are not tagged, so mark those snapshots key-less.
@@ -543,11 +771,22 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // A 4-dword load is a V# candidate — snapshot it now (before any later stride patch) so a
                 // vertex fetch using these SGPRs resolves to the descriptor as loaded. An 8-dword load is
                 // a T# candidate (image_sample SRSRC), snapshotted the same way (#294).
-                if (n == 4) { descr[sdst] = { mem[0], mem[1], mem[2], mem[3] };
+                if (n == 4 && valid_reg(sdst)) {
+                              descr[(size_t)sdst] = { mem[0], mem[1], mem[2], mem[3] };
+                              descr_known.set((size_t)sdst);
                               // only s_load (not s_buffer_load) dests get the recompiler's sreg_srt tag
-                              descr_key[sdst] = (imm_only && !is_buffer) ? in.literal : 0xFFFFFFFFu; }
-                if (n == 8) { descr8[sdst] = { mem[0], mem[1], mem[2], mem[3], mem[4], mem[5], mem[6], mem[7] };
-                              descr8_key[sdst] = (imm_only && !is_buffer) ? in.literal : 0xFFFFFFFFu; }
+                              descr_key[(size_t)sdst] = (imm_only && !is_buffer)
+                                  ? in.literal : 0xFFFFFFFFu;
+                              descr_key_known.set((size_t)sdst);
+                }
+                if (n == 8 && valid_reg(sdst)) {
+                              descr8[(size_t)sdst] = {
+                                  mem[0], mem[1], mem[2], mem[3], mem[4], mem[5], mem[6], mem[7] };
+                              descr8_known.set((size_t)sdst);
+                              descr8_key[(size_t)sdst] = (imm_only && !is_buffer)
+                                  ? in.literal : 0xFFFFFFFFu;
+                              descr8_key_known.set((size_t)sdst);
+                }
                 break;
             }
             case Rdna2Format::MIMG: {
@@ -558,18 +797,23 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // its instruction pc, which the recompiler resolves via ShaderResource::fetch_pc when
                 // the immediate-key model fails or collides.
                 if (srt_uses) {
-                    auto tit = descr8.find(in.src[1].value); auto kit = descr8_key.find(in.src[1].value);
+                    const int tbase = in.src[1].value;
+                    const int samp_base = in.src[2].value;
+                    const bool have_t8 = valid_reg(tbase) && descr8_known.test((size_t)tbase);
+                    const bool have_key = valid_reg(tbase) && descr8_key_known.test((size_t)tbase);
                     if (trc) fprintf(stderr, "[dyntrace] MIMG pc=%u srsrc=s%d ssamp=s%d have_t8=%d key=0x%x t8[0]=0x%x\n",
-                                     in.pc, in.src[1].value, in.src[2].value, tit != descr8.end(),
-                                     kit != descr8_key.end() ? kit->second : 0xEEEEEEEEu,
-                                     tit != descr8.end() ? tit->second[0] : 0u);
-                    if (tit != descr8.end()) {
-                        SrtUse u; u.kind = 0; u.t8 = tit->second;
-                        u.key = kit != descr8_key.end() ? kit->second : 0xFFFFFFFFu;
+                                     in.pc, tbase, samp_base, have_t8,
+                                     have_key ? descr8_key[(size_t)tbase] : 0xEEEEEEEEu,
+                                     have_t8 ? descr8[(size_t)tbase][0] : 0u);
+                    if (have_t8) {
+                        SrtUse u; u.kind = 0; u.t8 = descr8[(size_t)tbase];
+                        u.key = have_key ? descr8_key[(size_t)tbase] : 0xFFFFFFFFu;
                         u.use_pc = in.pc;
                         u.is_store = in.opcode == 0x08;   // image_store: a STORAGE-image use (#590)
-                        auto sit = descr.find(in.src[2].value);
-                        if (sit != descr.end()) { u.has_samp = true; u.s4 = sit->second; }
+                        if (valid_reg(samp_base) && descr_known.test((size_t)samp_base)) {
+                            u.has_samp = true;
+                            u.s4 = descr[(size_t)samp_base];
+                        }
                         srt_uses->push_back(u);
                     }
                 }
@@ -583,14 +827,14 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // use. (The VS vertex-fetch path below is unchanged: by_fetch_pc still wins there.)
                 if (srt_uses && (in.opcode <= 3 || (in.opcode >= 0x0C && in.opcode <= 0x0F))) {
                     int srsrc = in.src[1].value;
-                    auto dit = descr.find(srsrc); auto kit = descr_key.find(srsrc);
-                    if (dit != descr.end()) {
+                    if (valid_reg(srsrc) && descr_known.test((size_t)srsrc)) {
                         // Key-less snapshots (an s_buffer_load-fetched V# — a structured-buffer
                         // descriptor stored INSIDE a constant buffer, DOLL's title post PSes) carry
                         // the consuming instruction's pc instead; the recompiler resolves those via
                         // ShaderResource::fetch_pc with the faithful (non-vertex-index) address path.
-                        SrtUse u; u.kind = 1; u.v4 = dit->second;
-                        u.key = kit != descr_key.end() ? kit->second : 0xFFFFFFFFu;
+                        SrtUse u; u.kind = 1; u.v4 = descr[(size_t)srsrc];
+                        u.key = descr_key_known.test((size_t)srsrc)
+                            ? descr_key[(size_t)srsrc] : 0xFFFFFFFFu;
                         u.use_pc = in.pc;
                         srt_uses->push_back(u);
                     }
@@ -607,7 +851,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     uint32_t vv[4]; bool k0 = known(srsrc, vv[0]), k1 = known(srsrc + 1, vv[1]),
                                          k2 = known(srsrc + 2, vv[2]), k3 = known(srsrc + 3, vv[3]);
                     bool patched = k0 && k1 && k2 && k3;
-                    auto it = descr.find(srsrc);
+                    const bool have_descr = valid_reg(srsrc) && descr_known.test((size_t)srsrc);
                     // Fold the fetch's CONSTANT byte offset into the emitted V# base (#273 item 1, the
                     // "solid banner" bug): the recompiler's per-fetch (by_fetch_pc) address model is
                     // exactly gl_VertexIndex*stride from the resolved base — it assumes the attribute's
@@ -637,7 +881,8 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         return d;
                     };
                     if (trc) fprintf(stderr, "[dyntrace] MUBUF fetch pc=%u op=0x%x SRSRC=s%d patched=%d (k=%d%d%d%d v3=0x%x) have_descr=%d off=+0x%x soff_known=%d\n",
-                                     in.pc, in.opcode, srsrc, patched, k0, k1, k2, k3, k3 ? vv[3] : 0, it != descr.end(), fetch_off, (int)soff_known);
+                                     in.pc, in.opcode, srsrc, patched, k0, k1, k2, k3,
+                                     k3 ? vv[3] : 0, have_descr, fetch_off, (int)soff_known);
                     // A real (non-NULL) SOFFSET the fold cannot resolve would silently collapse fetch_off's
                     // in-record component to 0 — every attribute reads base+inst_off (the "solid banner"
                     // collapse this fold was written to fix) or a wrong descriptor address. Leave the fetch
@@ -650,11 +895,15 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     // per vertex attribute — position, uv, color…). Keyed by the fetch's pc so the recompiler
                     // resolves each buffer_load_format to the descriptor as loaded at that instruction.
                     if (patched)          out.push_back({ in.pc, srsrc, with_off(decode_buffer_descriptor(vv)), vv[3] });
-                    else if (it != descr.end())
-                        out.push_back({ in.pc, srsrc, with_off(decode_buffer_descriptor(it->second.data())), it->second[3] });
+                    else if (have_descr)
+                        out.push_back({ in.pc, srsrc,
+                                        with_off(decode_buffer_descriptor(descr[(size_t)srsrc].data())),
+                                        descr[(size_t)srsrc][3] });
                     else if (srsrc >= (int)user_sgpr_base && srsrc + 4 <= (int)(user_sgpr_base + nsgpr) &&
-                             !reloaded.count(srsrc) && !reloaded.count(srsrc + 1) &&
-                             !reloaded.count(srsrc + 2) && !reloaded.count(srsrc + 3)) {
+                             valid_reg(srsrc + 3) && !reloaded.test((size_t)srsrc) &&
+                             !reloaded.test((size_t)(srsrc + 1)) &&
+                             !reloaded.test((size_t)(srsrc + 2)) &&
+                             !reloaded.test((size_t)(srsrc + 3))) {
                         // SEED fallback (#294): the SRSRC V# was placed directly in the user-data SGPRs
                         // by the driver (never s_loaded — so no `descr` snapshot) and the shader's
                         // stride/format patch left the CURRENT dwords partially unknown (its s_cselect
@@ -683,11 +932,11 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // interpreter doesn't model SOPK, so ANY SOPK conservatively invalidates the tracked SCC —
                 // a stale SCC consumed by a later s_cselect would fabricate a confidently-wrong V# patch.
                 scc = -1;
-                if (in.dst.kind == OperandKind::SGPR) val.erase(in.dst.value);
+                if (in.dst.kind == OperandKind::SGPR) forget(in.dst.value);
                 break;
             default:
                 // Remaining formats (SOPP, VALU, memory, …) don't write SCC, so the tracked SCC survives.
-                if (in.dst.kind == OperandKind::SGPR) val.erase(in.dst.value);   // unmodeled scalar write -> unknown
+                if (in.dst.kind == OperandKind::SGPR) forget(in.dst.value);   // unmodeled scalar write -> unknown
                 break;
         }
     }
@@ -726,6 +975,9 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
     if (!code_addr) return nullptr;
     const auto* hdr = (const AgcShaderHeader*)prosper_agc_shader_header_for_code(code_addr);
     if (!hdr) return nullptr;
+    using StageClock = std::chrono::steady_clock;
+    const bool phase_timing = getenv("PROSPER_RENDER_TIMING") != nullptr;
+    const auto metadata_start = phase_timing ? StageClock::now() : StageClock::time_point{};
     namespace P = prosper::agc::Pm4;
     const bool log = getenv("PROSPER_GFXLOG") != nullptr;
 
@@ -814,6 +1066,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
     // becomes the resource's srt_offset (the recompiler's by_srt_offset provenance).
     std::vector<DynFetch> dyn_vb;
     std::vector<SrtUse> srt_uses;
+    const auto metadata_done = phase_timing ? StageClock::now() : StageClock::time_point{};
     if (is_ps) {
         uint32_t sgprs[kUserSgprs]; read_user_sgprs(st.sh, bases[0] + range_start, sgprs);
         resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, 0x4000, sgprs, kUserSgprs, 0, &srt_uses);
@@ -846,6 +1099,16 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
             }
         }
     }
+
+    const auto fold_done = phase_timing ? StageClock::now() : StageClock::time_point{};
+    auto record_phases = [&] {
+        if (!phase_timing) return;
+        const auto resources_done = StageClock::now();
+        record_stage_table_phases(
+            std::chrono::duration<double, std::milli>(metadata_done - metadata_start).count(),
+            std::chrono::duration<double, std::milli>(fold_done - metadata_done).count(),
+            std::chrono::duration<double, std::milli>(resources_done - fold_done).count());
+    };
 
     // NGG VS/GS loads user data at shader s8 (s0..s7 = system SGPRs); PS at s0. The resource sgpr_base
     // (an s_buffer_load/image_sample's SBASE/SRSRC register) is in that shader-SGPR space.
@@ -1029,10 +1292,13 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                 }
             }
         }
-        return std::make_shared<ShaderResourceTable>(std::move(t));
+        auto result = std::make_shared<ShaderResourceTable>(std::move(t));
+        record_phases();
+        return result;
     }
     if (log) fprintf(stderr, "[restab] %s code=0x%llx -> no resources in any user-data base\n",
                      is_ps ? "PS" : "VS", (unsigned long long)code_addr);
+    record_phases();
     return nullptr;
 }
 
@@ -1752,13 +2018,21 @@ bool execute_compute_items(const std::vector<ComputeItem>& items) {
 bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t height,
                                  uint64_t submit_no) {
     if ((!g_live && !g_compute) || (st.draws.empty() && st.dispatches.empty())) return false;
+    // Guest allocations referenced by a GPU submit must remain mapped until that submit completes.
+    // Reuse positive page/VirtualQuery results only inside this synchronous execution window; the
+    // scope is discarded before guest code can submit a later mapping generation.
+    GuestReadableSubmitScope guest_readable_scope;
     using TimingClock = std::chrono::steady_clock;
     const bool timing_enabled = std::getenv("PROSPER_RENDER_TIMING") != nullptr;
     const auto timing_start = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     const ShaderRecompileCacheStats shader_before = timing_enabled
         ? shader_recompile_cache_stats() : ShaderRecompileCacheStats{};
+    const ShaderDecodeCacheStats decode_before = timing_enabled
+        ? shader_decode_cache_stats() : ShaderDecodeCacheStats{};
     const DrawRealizationPhaseStats phases_before = timing_enabled
         ? draw_realization_phase_stats() : DrawRealizationPhaseStats{};
+    const StageTablePhaseStats table_phases_before = timing_enabled
+        ? stage_table_phase_stats() : StageTablePhaseStats{};
     uint32_t fw = present_width(), fh = present_height();
     float sx = fw ? (float)width / (float)fw : 1.0f;
     float sy = fh ? (float)height / (float)fh : 1.0f;
@@ -1766,8 +2040,12 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
         ? realize_gpustate_draws(st, 0x10000, sx, sy) : std::vector<DrawItem>{};
     const ShaderRecompileCacheStats shader_after = timing_enabled
         ? shader_recompile_cache_stats() : ShaderRecompileCacheStats{};
+    const ShaderDecodeCacheStats decode_after = timing_enabled
+        ? shader_decode_cache_stats() : ShaderDecodeCacheStats{};
     const DrawRealizationPhaseStats phases_after = timing_enabled
         ? draw_realization_phase_stats() : DrawRealizationPhaseStats{};
+    const StageTablePhaseStats table_phases_after = timing_enabled
+        ? stage_table_phase_stats() : StageTablePhaseStats{};
     const auto timing_draws_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     std::vector<ComputeItem> computes = g_compute
         ? realize_compute_dispatches(st, submit_no) : std::vector<ComputeItem>{};
@@ -1775,18 +2053,17 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
 
     auto operations = plan_submit_operations(st);
     const auto timing_plan_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
+    auto pending_capture = begin_requested_gpu_capture(
+        draws, computes, operations, width, height);
     OrderedSubmitResult result = execute_ordered_items(
         operations, draws, computes, g_live, g_compute, width, height);
     const auto timing_backend_done = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     std::vector<uint8_t>& px = result.pixels;
 
-    if (!draws.empty()) {
-        auto pending = begin_requested_gpu_capture(draws, width, height);
-        if (pending) {
-            std::string error;
-            if (!finish_requested_gpu_capture(std::move(pending), px, error))
-                std::fprintf(stderr, "[gpucap] write failed: %s\n", error.c_str());
-        }
+    if (pending_capture) {
+        std::string error;
+        if (!finish_requested_gpu_capture(std::move(pending_capture), px, error))
+            std::fprintf(stderr, "[gpucap] write failed: %s\n", error.c_str());
     }
     const bool presented = px.size() == static_cast<size_t>(width) * height * 4;
     if (presented) present_write_frame(px.data(), width, height);
@@ -1798,8 +2075,11 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
         struct TimingTotals {
             uint64_t submits = 0, draws = 0, dispatches = 0, render_spans = 0;
             uint64_t shader_hits = 0, shader_misses = 0, shader_bypasses = 0;
+            uint64_t decode_hits = 0, decode_misses = 0, decode_invalidations = 0;
+            uint64_t readable_calls = 0, readable_hits = 0, readable_os_probes = 0;
             double realize_draws = 0, realize_compute = 0, plan = 0, backend = 0, publish = 0;
             double table_build = 0, shader_lookup = 0, shader_compile = 0;
+            double table_metadata = 0, table_dynamic_fold = 0, table_resources = 0;
         };
         static TimingTotals totals;
         static TimingTotals window;
@@ -1811,12 +2091,22 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
             timing.shader_hits += shader_after.hits - shader_before.hits;
             timing.shader_misses += shader_after.misses - shader_before.misses;
             timing.shader_bypasses += shader_after.bypasses - shader_before.bypasses;
+            timing.decode_hits += decode_after.hits - decode_before.hits;
+            timing.decode_misses += decode_after.misses - decode_before.misses;
+            timing.decode_invalidations += decode_after.invalidations - decode_before.invalidations;
+            timing.readable_calls += g_guest_readable_cache.calls;
+            timing.readable_hits += g_guest_readable_cache.hits;
+            timing.readable_os_probes += g_guest_readable_cache.os_probes;
             timing.realize_draws += ms(timing_start, timing_draws_ready);
             timing.realize_compute += ms(timing_draws_ready, timing_compute_ready);
             timing.plan += ms(timing_compute_ready, timing_plan_ready);
             timing.backend += ms(timing_plan_ready, timing_backend_done);
             timing.publish += ms(timing_backend_done, timing_done);
             timing.table_build += phases_after.table_ms - phases_before.table_ms;
+            timing.table_metadata += table_phases_after.metadata_ms - table_phases_before.metadata_ms;
+            timing.table_dynamic_fold += table_phases_after.dynamic_fold_ms -
+                                         table_phases_before.dynamic_fold_ms;
+            timing.table_resources += table_phases_after.resources_ms - table_phases_before.resources_ms;
             timing.shader_lookup += phases_after.shader_ms - phases_before.shader_ms;
             timing.shader_compile += shader_after.compile_ms - shader_before.compile_ms;
         };
@@ -1841,15 +2131,22 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
             std::fprintf(stderr,
                          "[render-window] submits=%llu avg_items: draws=%.1f dispatches=%.1f "
                          "spans=%.1f shaders: hit=%.1f miss=%.1f bypass=%.1f "
+                         "decode: hit=%.1f miss=%.1f invalid=%.1f "
+                         "readable: hit=%.1f/%.1f os=%.1f "
                          "avg_ms: total=%.2f realize_draws=%.2f tables=%.2f shader_lookup=%.2f "
-                         "shader_compile=%.2f "
+                         "shader_compile=%.2f table_parts: metadata=%.2f fold=%.2f resources=%.2f "
                          "realize_compute=%.2f plan=%.2f backend=%.2f publish=%.2f\n",
                          (unsigned long long)window.submits, window.draws / wn,
                          window.dispatches / wn, window.render_spans / wn,
                          window.shader_hits / wn, window.shader_misses / wn,
-                         window.shader_bypasses / wn, window_total / wn,
+                         window.shader_bypasses / wn, window.decode_hits / wn,
+                         window.decode_misses / wn, window.decode_invalidations / wn,
+                         window.readable_hits / wn, window.readable_calls / wn,
+                         window.readable_os_probes / wn, window_total / wn,
                          window.realize_draws / wn, window.table_build / wn,
                          window.shader_lookup / wn, window.shader_compile / wn,
+                         window.table_metadata / wn, window.table_dynamic_fold / wn,
+                         window.table_resources / wn,
                          window.realize_compute / wn, window.plan / wn, window.backend / wn,
                          window.publish / wn);
             window = {};
@@ -1870,7 +2167,12 @@ bool execute_and_present(const GpuState& st, uint32_t width, uint32_t height) {
     float sy = fh ? (float)height / (float)fh : 1.0f;
     std::vector<uint8_t> px = execute_gpustate(st,
         [&](const std::vector<DrawItem>& items) {
-            auto pending = begin_requested_gpu_capture(items, width, height);
+            std::vector<SubmitOperation> operations;
+            operations.reserve(items.size());
+            for (const auto& item : items)
+                operations.push_back({SubmitOperationKind::Draw,
+                                      static_cast<size_t>(item.draw_index), item.command_order});
+            auto pending = begin_requested_gpu_capture(items, {}, operations, width, height);
             std::vector<uint8_t> rendered = g_live(items, width, height);
             if (pending) {
                 std::string error;

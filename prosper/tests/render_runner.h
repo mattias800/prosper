@@ -866,11 +866,21 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         uint32_t n_sets = 1, vcount = 3, icount = 0; bool use_desc = false, ok = false;
     };
     std::vector<DV> dv(draws.size());
+    double setup_shader_ms = 0.0;
+    double setup_fixed_ms = 0.0;
+    double setup_resources_ms = 0.0;
+    double setup_pipeline_ms = 0.0;
+    auto setup_elapsed_ms = [](auto begin, auto end) {
+        return std::chrono::duration<double, std::milli>(end - begin).count();
+    };
     // Pass 1: create each draw's shader modules, descriptors (with texture staging upload), and pipeline.
     for (size_t di = 0; di < draws.size(); di++) {
+        const auto setup_begin = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
         const BackendDraw& bd = draws[di];
         DV& v = dv[di];
         v.vs = mkmod(bd.vs); v.fs = mkmod(bd.fs);
+        const auto setup_shaders_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
+        if (timing_enabled) setup_shader_ms += setup_elapsed_ms(setup_begin, setup_shaders_ready);
         if (!v.vs || !v.fs) continue;   // rejected SPIR-V -> skip this draw
         const prosper::gpu::ResolvedPipelineState* ps = bd.ps;
         v.vcount = bd.vcount;
@@ -984,6 +994,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                         ps->stencil_fail_op[0], ps->stencil_pass_op[0], ps->stencil_depth_fail_op[0], dss.front.reference, (int)ps->depth_test_enable);
         }
         // Descriptor resources for this draw (two-set: VS=set0, PS=set1 — same layout as the single path).
+        const auto setup_fixed_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
+        if (timing_enabled) setup_fixed_ms += setup_elapsed_ms(setup_shaders_ready, setup_fixed_ready);
         v.R = bd.R; auto& R = v.R;
         v.use_desc = !R.empty();
         for (auto& r : R) v.n_sets = std::max(v.n_sets, r.set + 1);
@@ -1145,6 +1157,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             for (size_t i = 0; i < R.size(); i++) wr[i].dstSet = v.dsets[R[i].set];
             vkUpdateDescriptorSets(dev, (uint32_t)wr.size(), wr.data(), 0, nullptr);
         }
+        const auto setup_resources_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
+        if (timing_enabled) setup_resources_ms += setup_elapsed_ms(setup_fixed_ready, setup_resources_ready);
         VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         if (v.use_desc) { plci.setLayoutCount = v.n_sets; plci.pSetLayouts = v.dsls.data(); }
         vkCreatePipelineLayout(dev, &plci, nullptr, &v.layout);
@@ -1154,6 +1168,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         gp.pColorBlendState = &cb; gp.layout = v.layout; gp.renderPass = rp; gp.subpass = 0;
         if (ps && (ps->depth_test_enable || ps->stencil_enable)) gp.pDepthStencilState = &dss;
         if (vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gp, nullptr, &v.pipe) == VK_SUCCESS) v.ok = true;
+        const auto setup_pipeline_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
+        if (timing_enabled) setup_pipeline_ms += setup_elapsed_ms(setup_resources_ready, setup_pipeline_ready);
     }
 
     const auto timing_draws_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
@@ -1414,6 +1430,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         struct TimingTotals {
             uint64_t calls = 0, draws = 0;
             double target = 0, draw_setup = 0, record = 0, gpu_wait = 0, readback = 0, cleanup = 0;
+            double setup_shader = 0, setup_fixed = 0, setup_resources = 0, setup_pipeline = 0;
         };
         static TimingTotals totals;
         static TimingTotals window;
@@ -1426,6 +1443,10 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             timing.gpu_wait += ms(timing_recorded, timing_gpu_done);
             timing.readback += ms(timing_gpu_done, timing_readback_done);
             timing.cleanup += ms(timing_readback_done, timing_done);
+            timing.setup_shader += setup_shader_ms;
+            timing.setup_fixed += setup_fixed_ms;
+            timing.setup_resources += setup_resources_ms;
+            timing.setup_pipeline += setup_pipeline_ms;
         };
         accumulate(totals);
         accumulate(window);
@@ -1439,6 +1460,10 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     (unsigned long long)totals.calls, (unsigned long long)totals.draws, total / n,
                     totals.target / n, totals.draw_setup / n, totals.record / n,
                     totals.gpu_wait / n, totals.readback / n, totals.cleanup / n);
+            fprintf(stderr,
+                    "[render-timing] draw_setup avg_ms: shaders=%.2f fixed=%.2f resources=%.2f pipeline=%.2f\n",
+                    totals.setup_shader / n, totals.setup_fixed / n,
+                    totals.setup_resources / n, totals.setup_pipeline / n);
             const RenderMemoryPoolStats pool = render_memory_pool_stats();
             fprintf(stderr,
                     "[render-timing] memory_pool hits=%llu misses=%llu cached=%zu %.1f MiB "
@@ -1456,6 +1481,10 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     (unsigned long long)window.calls, window.draws / wn, window_total / wn,
                     window.target / wn, window.draw_setup / wn, window.record / wn,
                     window.gpu_wait / wn, window.readback / wn, window.cleanup / wn);
+            fprintf(stderr,
+                    "[render-window] draw_setup avg_ms: shaders=%.2f fixed=%.2f resources=%.2f pipeline=%.2f\n",
+                    window.setup_shader / wn, window.setup_fixed / wn,
+                    window.setup_resources / wn, window.setup_pipeline / wn);
             window = {};
         }
     }
