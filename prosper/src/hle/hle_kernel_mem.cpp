@@ -1606,6 +1606,10 @@ HLE(k_wait_on_address) {
         deadline = GetTickCount64() + ms;
     }
     volatile uint32_t* wa = (volatile uint32_t*)(uintptr_t)a0;
+    // Register as a futex waiter so the GPU command processor's RELEASE_MEM/EOP wake (wake_label_waiters,
+    // which only fires when g_waiters>0) reaches this thread. RAII so every return path unregisters.
+    futex_wait_enter();
+    struct WaiterGuard { ~WaiterGuard() { futex_wait_exit(); } } _waiter_guard;
     while (*wa == expected) {
         DWORD wait_ms = INFINITE;
         if (deadline) {
