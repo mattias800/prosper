@@ -156,7 +156,15 @@ int main() {
 
     // #312: learn a per-thread MB3 pool array from pthread TLS and detect a 0x20-byte block in both
     // of size-class idx=1's freelists. The descriptor address is dynamic; no DOLL address is baked in.
-    alignas(0x10000) static uint8_t mb3_pool[0x10000] = {};
+    // Real MB3 pool arrays are 64 KiB allocations, so mb3_note_tls_pool_candidate only accepts a
+    // 64-KiB-aligned base ((base & 0xffff) == 0). alignas(0x10000) on a STATIC can't guarantee that:
+    // linkers cap static alignment below 64 KiB (macOS reduces __bss to 4 KiB, MinGW rejects > 8 KiB),
+    // so the buffer may land off a 64-KiB boundary and the candidate is silently dropped — the four MB3
+    // membership subtests then fail on macOS/Windows while passing on Linux. Over-allocate and carve a
+    // 64-KiB-aligned 64-KiB window at runtime, which is honored everywhere. Production MB3 logic is
+    // unchanged; only the test's backing memory is.
+    static uint8_t mb3_pool_backing[0x20000] = {};
+    uint8_t* mb3_pool = (uint8_t*)(((uintptr_t)mb3_pool_backing + 0xffffull) & ~0xffffull);
     struct alignas(0x20) FreeNode { uint64_t next; uint64_t pad[3]; };
     static FreeNode free_label{}, free_tail{}, secondary_label{}, live_label{};
     uint64_t* bin = (uint64_t*)(mb3_pool + 0x20);
