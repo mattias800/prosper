@@ -1643,14 +1643,11 @@ namespace {
     // handler on the current fs — exactly the old behavior. Uses FSGSBASE. Clobbers only rax/r11 (never
     // the arg regs rdi..r9).
     //
-    // STACK-ARG FORWARDING: the guest path interposes `push r11` + `call` between the guest caller and
-    // the handler, which shifts the caller's STACK args (args 7+) by two qwords — a handler reading its
-    // 7th arg at the SysV frame slot fp[2] silently got the saved guest-fs base instead (ReleaseMem read
-    // a TCB pointer as data_sel and the guest return address as the 64-bit fence value). The stub now
-    // re-pushes the first TWO stack args before the call, so handlers see the documented SysV layout
-    // (fp[2]=arg7, fp[3]=arg8) on BOTH paths. Alignment: entry rsp≡8 (caller's call), +3 pushes ≡0,
-    // call ≡8 at handler entry — the SysV contract. Handlers needing >2 stack args would need this
-    // widened. Keep 0x108/0x100/magic in sync with guest_tls.cpp (MAGIC_OFF/HOSTFS_OFF/TCB_MAGIC).
+    // STACK-ARG FORWARDING: the guest path interposes a call between the guest caller and handler.
+    // Re-push args 9,8,7 so fixed-arity handlers receive the normal SysV layout ([rsp+8]=arg7,
+    // [rsp+16]=arg8, [rsp+24]=arg9). The saved r11 plus an 8-byte pad remain behind those arguments.
+    // Alignment: entry rsp is 8 mod 16; five qwords of storage make the call site 0 mod 16 and the
+    // handler entry 8 mod 16. Keep offsets/magic in sync with guest_tls.cpp.
     void emit_swap_stub(uint8_t* p, uint32_t idx, uint64_t fn, bool unimpl) {
         uint8_t* s = p;
         auto mid = [&](uint8_t*& q) {   // per-variant: unimpl loads its slot index into edi first
@@ -1662,16 +1659,18 @@ namespace {
         *p++=0x41; *p++=0x81; *p++=0xBB; uint32_t mo=0x108; memcpy(p,&mo,4); p+=4;
         uint32_t magic=0x50524F53u; memcpy(p,&magic,4); p+=4;
         *p++=0x75; uint8_t* jne_rel = p++;                                  // jne rel8 (patched below)
-        // .guest: push r11 ; push [rsp+0x18] (arg8) ; push [rsp+0x18] (arg7) ; mov rax,[r11+0x100] ;
-        //         wrfsbase rax ; <mid> ; call rax ; add rsp,0x10 ; pop r11 ; wrfsbase r11 ; ret
+        // .guest: push r11 ; sub rsp,8 ; push [rsp+0x28] (arg9/8/7) x3 ; mov rax,[r11+0x100] ;
+        //         wrfsbase rax ; <mid> ; call rax ; add rsp,0x20 ; pop r11 ; wrfsbase r11 ; ret
         *p++=0x41; *p++=0x53;
-        *p++=0xFF; *p++=0x74; *p++=0x24; *p++=0x18;                         // push qword [rsp+0x18] = arg8
-        *p++=0xFF; *p++=0x74; *p++=0x24; *p++=0x18;                         // push qword [rsp+0x18] = arg7
+        *p++=0x48; *p++=0x83; *p++=0xEC; *p++=0x08;                         // sub rsp,8 (alignment pad)
+        *p++=0xFF; *p++=0x74; *p++=0x24; *p++=0x28;                         // push original arg9
+        *p++=0xFF; *p++=0x74; *p++=0x24; *p++=0x28;                         // push original arg8
+        *p++=0xFF; *p++=0x74; *p++=0x24; *p++=0x28;                         // push original arg7
         *p++=0x49; *p++=0x8B; *p++=0x83; uint32_t ho=0x100; memcpy(p,&ho,4); p+=4;
         *p++=0xF3; *p++=0x48; *p++=0x0F; *p++=0xAE; *p++=0xD0;
         mid(p);
         *p++=0xFF; *p++=0xD0;                                               // call rax
-        *p++=0x48; *p++=0x83; *p++=0xC4; *p++=0x10;                         // add rsp, 0x10
+        *p++=0x48; *p++=0x83; *p++=0xC4; *p++=0x20;                         // discard arg copies + pad
         *p++=0x41; *p++=0x5B;                                               // pop r11
         *p++=0xF3; *p++=0x49; *p++=0x0F; *p++=0xAE; *p++=0xD3;              // wrfsbase r11
         *p++=0xC3;                                                          // ret

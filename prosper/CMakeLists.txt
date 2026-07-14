@@ -414,6 +414,21 @@ if(TARGET prosper_core)
   target_link_libraries(test_initfault_dump PRIVATE prosper_core)
   add_test(NAME initfault_dump_survives COMMAND test_initfault_dump)
 
+  # Generated guest->host import boundary: preserve all register args, stack args 7-9, return value,
+  # and ABI stack alignment. Windows exercises SysV->Microsoft-x64; Linux also drives the FS-swap path.
+  add_executable(test_hle_stack_args tests/test_hle_stack_args.cpp)
+  target_link_libraries(test_hle_stack_args PRIVATE prosper_core)
+  add_test(NAME hle_stack_args COMMAND test_hle_stack_args)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_test(NAME hle_stack_args_guest_fs COMMAND test_hle_stack_args --guest-fs)
+  endif()
+
+  # End-to-end AGC submit plus fixed args 7-9 in ReleaseMem/WaitRegMem. This is cross-platform so
+  # Windows validates the real fence builders behind the generated import-ABI conformance test.
+  add_executable(test_agc_submit tests/test_agc_submit.cpp)
+  target_link_libraries(test_agc_submit PRIVATE prosper_core)
+  add_test(NAME agc_submit_to_gpustate COMMAND test_agc_submit)
+
   # Windows guest-execution substrate (exec_image_win.cpp): build boot_trace so the whole boot path
   # links (proves the substrate + SysV-ABI HLE boundary resolve). No evdev/Vulkan here. The guest boot
   # itself is not yet verified on Windows — see docs/PORTING.md "Windows".
@@ -494,12 +509,6 @@ if(TARGET prosper_core)
     add_executable(test_agc_dcb tests/test_agc_dcb.cpp)
     target_link_libraries(test_agc_dcb PRIVATE prosper_core)
     add_test(NAME agc_dcb_pm4 COMMAND test_agc_dcb)
-
-    # End-to-end AGC submit: build a Dcb via the HLE fns -> sceAgcDriverSubmitDcb -> CommandProcessor
-    # folds it into a GpuState. Locks in the "first real command buffer executes" milestone.
-    add_executable(test_agc_submit tests/test_agc_submit.cpp)
-    target_link_libraries(test_agc_submit PRIVATE prosper_core)
-    add_test(NAME agc_submit_to_gpustate COMMAND test_agc_submit)
 
     # libSceVideoOut: query/config functions return real 1080p60 values + swapchain-scaffolding
     # display-buffer registry records the game's registered framebuffers.
