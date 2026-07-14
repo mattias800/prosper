@@ -37,10 +37,21 @@ int main() {
     auto setidx = Hle::lookup("GIIW2J37e70");   // GraphicsDcbSetIndexSize
     auto draw   = Hle::lookup("Yw0jKSqop+E");   // GraphicsDcbDrawIndexAuto
     auto submit = Hle::lookup("UglJIZjGssM");   // GraphicsDriverSubmitDcb
+    auto regmem = Hle::lookup("AOLcoIkQDgM");   // QueryResourceRegistrationUserMemoryRequirements
     auto maxname = Hle::lookup("uJziRsODk1c");   // sceAgcDriverGetResourceRegistrationMaxNameLength
-    CHECK(reset && setcx && setidx && draw && submit && maxname,
+    CHECK(reset && setcx && setidx && draw && submit && regmem && maxname,
           "AGC Dcb, submit, and resource-registration functions registered");
-    if (!(reset && setcx && setidx && draw && submit && maxname)) { printf("== FAIL ==\n"); return 1; }
+    if (!(reset && setcx && setidx && draw && submit && regmem && maxname)) { printf("== FAIL ==\n"); return 1; }
+
+    uint64_t registration_bytes = 0x7a2a67fe6900ull;
+    CHECK(regmem((uint64_t)(uintptr_t)&registration_bytes, 0x2000, 0x38, 0, 0, 0) == 0,
+          "resource-registration memory query returned OK");
+    CHECK(registration_bytes == 0x80800,
+          "resource-registration memory query replaced the poisoned size deterministically");
+    CHECK((registration_bytes & 0x3f) == 0 && registration_bytes < 0x100000,
+          "resource-registration memory requirement is aligned and bounded");
+    CHECK((int64_t)regmem(0, 0x2000, 0x38, 0, 0, 0) < 0,
+          "resource-registration memory query rejects a null output");
 
     uint32_t max_name_length = 0xdeadbeefu;
     CHECK(maxname((uint64_t)(uintptr_t)&max_name_length, 0, 0, 0, 0, 0) == 0,

@@ -1355,6 +1355,27 @@ HLE(agc_driver_get_resource_registration_max_name_length) {
     return 0;
 }
 
+// sceAgcDriverQueryResourceRegistrationUserMemoryRequirements. The API returns the opaque backing
+// store required by ResourceRegistration::init for the requested resource and owner capacities.
+// Prosper keeps the registry on the host and does not consume this guest block, so use a stable,
+// conservative layout estimate rather than exposing host implementation details. Most importantly,
+// always initialize the size_t output: the former success stub left Dead Cells' stack poison in it,
+// intermittently turning this allocation into a multi-gigabyte texture-pool request (#660).
+// CONFIDENCE: HIGH on ABI/output/error; MED on opaque record sizes (irrelevant until init consumes it).
+HLE(agc_driver_query_resource_registration_user_memory_requirements) {
+    if (!a0)
+        return (uint64_t)(int64_t)(int32_t)0x80D19005u;
+
+    constexpr uint64_t kHeaderBytes = 0x100;
+    constexpr uint64_t kResourceBytes = 0x40;
+    constexpr uint64_t kOwnerBytes = 0x20;
+    constexpr uint64_t kAlignment = 0x40;
+    const uint64_t required = kHeaderBytes + (uint32_t)a1 * kResourceBytes
+                            + (uint32_t)a2 * kOwnerBytes;
+    *(uint64_t*)(uintptr_t)a0 = (required + kAlignment - 1) & ~(kAlignment - 1);
+    return 0;
+}
+
 // sceAgcCbDispatch (NID k3GhuSNmBLU) — compute dispatch.
 // The authoritative PS5 3.20 export name is sceAgcCbDispatch, and its ABI is
 // (dcb, thread_count_x, thread_count_y, thread_count_z, dispatch_modifier). Dead Cells' bound
@@ -1376,6 +1397,7 @@ HLE(agc_cb_dispatch) {  // (buf, thread_count_x, thread_count_y, thread_count_z,
 void register_agc_hle() {
     #define RN(nid, fn) Hle::register_fn(nid, (HleFn)(fn), nid)
     RN("f3dg2CSgRKY", agc_create_shader);   // sceAgcCreateShader — populates the shader registry
+    RN("AOLcoIkQDgM", agc_driver_query_resource_registration_user_memory_requirements);
     RN("uJziRsODk1c", agc_driver_get_resource_registration_max_name_length);
     RN("V++UgBtQhn0", agc_get_data_packet_payload);          // data packet -> register-bank payload
     RN("n2fD4A+pb+g", agc_cb_set_sh_register_range_direct);  // SET_SH_REG range packet

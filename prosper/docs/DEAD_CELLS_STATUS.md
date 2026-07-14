@@ -1,6 +1,6 @@
 # Dead Cells graphics status and regression workflow
 
-Last updated: 2026-07-13
+Last updated: 2026-07-14
 
 The operational route and selector reference is
 [`../scripts/dead-cells/README.md`](../scripts/dead-cells/README.md). The gameplay-composition bug
@@ -16,6 +16,12 @@ first color export from shaders that emit MRT3..MRT0; MRT0 now feeds the backend
 The same change set recovers a separately dropped format-copy dispatch by resolving its directly placed
 destination buffer descriptor at s4.
 
+Startup and progression are stable after implementing both AGC resource-registration output queries. The former
+success-only `QueryResourceRegistrationUserMemoryRequirements` stub left Dead Cells' stack value untouched and
+occasionally requested a multi-gigabyte texture-pool allocation (#660). A native-speed fresh-save matrix improved
+from 7/10 gameplay matches, two texture-memory crashes, and one timeout to 20/20 gameplay matches with no crash or
+timeout. The issue's 120-second live-render screenshot route also completes without the former lavapipe fault.
+
 The original mostly-white repeated-block image is not the current bug. It was caused by beginning diagnostic
 rendering after a required 642x362 temporal render-target producer had already run (#586). Do not use a
 35-second sparse-render screenshot as a color oracle.
@@ -29,7 +35,9 @@ The important fixes already on `master` are:
 - capture v8 checkpoints complete color RTT state and persistent depth/stencil planes, including a source-output
   hash oracle (#569);
 - directly placed compute buffer destinations resolve, so the current scene realizes all eight dispatches (#626);
-- MRT0, rather than the first-emitted non-color G-buffer plane, supplies the visible fragment output (#626).
+- MRT0, rather than the first-emitted non-color G-buffer plane, supplies the visible fragment output (#626);
+- AGC resource-registration memory requirements always initialize their output instead of leaking stack data into
+  the game's texture-pool allocation size (#660).
 
 The producer-complete post-#626 checkpoint realizes every semantic draw and all eight dispatches. Descriptor
 validation has not identified a missing or undersized binding in the exercised frame.

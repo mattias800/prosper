@@ -108,7 +108,9 @@ indices 0..3 to all four clip-space corners while the guest submits count 3. #65
 Vulkan strip and invokes the fourth procedural vertex for the observed no-VB form. A 420-frame native run
 then showed full-screen moving gameplay with no accumulated tutorial glyphs.
 
-Cross-title breadth has advanced: *Dead Cells* now starts reliably after the AGC resource-name fix (#544), its
+Cross-title breadth has advanced: *Dead Cells* now starts reliably after both AGC resource-registration output
+queries were implemented (#544, #660). The old success stubs left stack data in the max-name and required-memory
+outputs, causing intermittent multi-gigabyte stack or texture-pool allocations. Its
 exercised NGS2 lifecycle returns initialized sizes/handles/state and silent output (#554), and a late render
 window reaches the Evil Empire splash. #545 was software-render throughput, not a guest deadlock: synchronous
 3840×2160 llvmpipe rendering stretches its ~13,000-submit startup into minutes.
