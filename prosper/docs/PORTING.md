@@ -352,13 +352,32 @@ The deep crash after `%fs` TLS was two more Linux-parity gaps (fixed on `port/wi
   rbx=0) on an unrecoverable thread. A `win_thread_trampoline` now marshals the SysV entry through
   `prosper_call_guest_sysv` and activates the worker's guest `%fs` TCB.
 
-### Renderer wired on Windows (#655); the Windows frontier: the Unity GC-helper init handshake
+### Renderer wired (#655); WaitOnAddress lost-wakeup FIXED; frontier: draw submission after VideoOut setup
 
-The live Vulkan renderer now builds + initializes on Windows (#655): the whole GPU/Vulkan translation
+**SOLVED — the pre-render wedge was a lost wakeup in the Windows `sceKernelWaitOnAddress`.** It had been
+backed by ONE global `std::condition_variable` shared across every waited address, so a guest
+`WakeByAddress(n=1)` → `notify_one()` could wake a waiter parked on a DIFFERENT address (it re-checked its
+own word, found it unchanged, re-slept) while the intended waiter was never woken. That randomly lost
+Unity's job/thread startup handshakes → the boot nondeterministically wedged (2 vs ~45 threads, or a
+worker fault). Re-implemented on the **native Win32 futex** (`WaitOnAddress` / `WakeByAddressSingle` /
+`WakeByAddressAll`, needs `-lsynchronization`), a true per-address wait exactly like the Linux
+`FUTEX_WAIT` path — correct `n=1` semantics, no thundering herd. The boot is now **deterministic** and
+goes far deeper: it spawns the full Unity thread ecosystem (13 `AssetGarbageCollectorHelper`,
+`Job.Worker 0-12`, `Background Job.Worker 0-15`, `Loading.AsyncRead`, `BatchDeleteObjects`) and reaches
+**VideoOut display setup** — `RegisterBuffers2`, "display surface: 1920x1080, 3 buffers registered",
+`ConfigureOutput`, `GetOutputStatus`.
+
+Current frontier: from VideoOut setup to actual draw submission + flip. Immediate next blocker seen: an
+unimplemented `libSceSystemService::mPpPxv5CZt4` (returning 0) right after `GetOutputStatus`; implement
+it (and any siblings) and re-check whether the guest starts submitting Dcbs to the now-wired renderer.
+
+(Historical, pre-fix diagnosis retained below for context.)
+
+The live Vulkan renderer builds + initializes on Windows (#655): the whole GPU/Vulkan translation
 layer + `prosper_live_renderer` compile under MinGW (the Vulkan SDK is found via `VULKAN_SDK`), and at
 runtime the live compute + submit renderers register cleanly. With the renderer wired and
 `PROSPER_RENDER=1`, the guest boots into Unity engine init (allocates its pools, spawns
-`AssetGarbageCollectorHelper` threads) and then **idle-waits** (0% CPU) — it does NOT yet submit draws.
+`AssetGarbageCollectorHelper` threads) and (before the fix above) **idle-waited** (0% CPU).
 
 Diagnosis (via `PROSPER_SYNCLOG` WaitOnAddress logging + `PROSPER_GUEST_ARGS=-force-gfx-direct
 PROSPER_RENDER=1` + gdb thread inventory). **A thread-inventory diff vs Linux localizes the stall
@@ -372,10 +391,23 @@ precisely — it is NOT the later job-dispatch loop, it is the very first GC-hel
   total wakes then silence. None of `Job.Worker*`/`PreloadManager`/`AsyncRead`/`GfxFlipThread` is ever
   created.
 
-So the `AssetGarbageCollectorHelper` thread (guest entry `eboot+0xbfbac0`) now RUNS on Windows (the
-worker-thread ABI + `%fs` TLS fixes stopped it crashing at `mov 0x38(%rbx)`), but it **fails to complete
-its init handshake / signal the main thread it is ready**, so the main thread never advances to spawn
-the rest of Unity's threads. Next step: trace what that helper does on Windows vs Linux — which
+**Update — the stall is a RACE, and it wedges on a custom semaphore.** With a validated guest-caller +
+thread-id sync log (the `[sync] T<tid> ... caller=0x...` fields), the stuck waits resolve to a
+Unity/Sony **custom counting semaphore**: `mov $-1,%eax; lock xadd %eax,0x8(%rdi); test %eax,%eax; jle
+<slow>` — decrement a job-count at `[obj+8]`, and if it went ≤0 take the `sceKernelWaitOnAddress` slow
+path (sites `eboot+0x18ab088` job-pool and `eboot+0xae1463`). So workers block acquiring jobs the
+producer never releases. Crucially the boot is **nondeterministic**: different runs reach very different
+depths — sometimes only 2 `AssetGarbageCollectorHelper` threads then wedge, sometimes ~45 guest threads
+(much of the Unity set) then wedge, and sometimes a worker hard-faults (exit 139). That variability
+means a **startup race** in the sync/thread path, not a fixed missing tick. The global-`std::condition_variable`
+`WaitOnAddress` is logically correct under its mutex (no lost wakeup even with the 45-thread thundering
+herd), so suspicion falls on thread-startup ordering / the guest's timing assumptions under our slower
+per-call sync. Linux (real per-address futex) never exhibits this and renders 330 frames.
+
+(Historical framing, still true of the early-wedge runs:) the `AssetGarbageCollectorHelper` thread
+(guest entry `eboot+0xbfbac0`) RUNS on Windows (the worker-thread ABI + `%fs` TLS fixes stopped it
+crashing at `mov 0x38(%rbx)`) but on an early-wedge run never signals main ready. Next step: trace what
+that helper does on Windows vs Linux — which
 `WaitOnAddress`/wake or HLE call it diverges on (its own TLS-derived state, or a wake it should send to
 main that never fires). The coarse Windows `WaitOnAddress` (one global `std::condition_variable`; any
 wake re-checks all waiters) is correct under its mutex (no lost-wakeup) but is a candidate to revisit.

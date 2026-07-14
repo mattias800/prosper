@@ -34,6 +34,11 @@ if(PROSPER_SRC)
   target_compile_definitions(prosper_core PRIVATE PROSPER_GIT_REVISION="${PROSPER_GIT_REVISION}")
   find_package(Threads REQUIRED)
   target_link_libraries(prosper_core PUBLIC Threads::Threads)
+  # Windows: the guest futex HLE (sceKernelWaitOnAddress/WakeByAddress) is backed by the native Win32
+  # WaitOnAddress/WakeByAddressSingle/All, which live in the Synchronization import lib (not kernel32).
+  if(WIN32)
+    target_link_libraries(prosper_core PUBLIC synchronization)
+  endif()
 endif()
 
 # --- tests (agentic-first: self-checking, exit-code = truth) -------------

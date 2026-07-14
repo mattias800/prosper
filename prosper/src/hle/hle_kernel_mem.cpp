@@ -1163,6 +1163,9 @@ void register_kernel_mem_hle() {
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00   // Win10: WaitOnAddress/WakeByAddress* need >= 0x0602 (Win8)
+#endif
 #include <windows.h>
 #include <atomic>
 #include <chrono>
@@ -1548,6 +1551,34 @@ namespace {
 std::mutex g_sync_mx;
 std::condition_variable g_sync_cv;
 bool wsynclog() { static int v = getenv("PROSPER_SYNCLOG") ? 1 : 0; return v; }
+// Best-effort guest call site of the current HLE call. The Windows import stub `call`s the handler
+// (no frame pointer), so an [rbp+8] walk misses the guest return address; instead scan our stack for
+// the first value in the guest code range (eboot..libc = [0x400000000, 0x700000000)). The guest's
+// `call <stub>` pushed its return address just below, so the first in-range hit is the caller. Coarse
+// (a stack data word could coincidentally look like a guest PC), but good enough to name a wait site.
+uint64_t sync_guest_caller() {
+    uint64_t* sp = (uint64_t*)__builtin_frame_address(0);
+    for (int i = 0; i < 160; i++) {
+        uint64_t v = sp[i];
+        if (v < 0x400000000ull || v >= 0x600000000ull) continue;   // guest MODULES only (exclude 0x6.. import stubs)
+        if ((v & 0xfff) < 8) continue;                             // keep the 6-byte look-back on v's page
+        // A stack word in the guest range may be data, not a return address, and could point at an
+        // UNMAPPED gap between modules — so confirm the page is committed+readable before dereferencing
+        // (this scan runs on every logged wait; an unguarded read faulted intermittently).
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery((LPCVOID)(uintptr_t)v, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) continue;
+        const DWORD rd = PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE
+                       | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY;
+        if (!(mbi.Protect & rd) || (mbi.Protect & PAGE_GUARD)) continue;
+        const uint8_t* p = (const uint8_t*)(uintptr_t)v;
+        // Accept only a real return address: the preceding instruction must be a CALL.
+        if (p[-5] == 0xE8) return v;                                        // call rel32
+        if (p[-2] == 0xFF && ((p[-1] >> 3) & 7) == 2) return v;             // call r/m (2-byte)
+        if (p[-3] == 0xFF && ((p[-2] >> 3) & 7) == 2) return v;             // call r/m (3-byte, modrm+sib/disp8)
+        if (p[-6] == 0xFF && ((p[-5] >> 3) & 7) == 2) return v;             // call r/m (rip-rel disp32)
+    }
+    return 0;
+}
 }
 
 HLE(k_wait_on_address) {
@@ -1555,43 +1586,60 @@ HLE(k_wait_on_address) {
     auto& raw = *(uint32_t*)(uintptr_t)a0;
     std::atomic_ref<uint32_t> addr(raw);
     uint32_t expected = (uint32_t)a1;
-    if (wsynclog()) fprintf(stderr, "[sync] WAIT.enter addr=0x%llx *addr=0x%x exp=0x%x timo_ptr=0x%llx\n",
+    if (wsynclog()) fprintf(stderr, "[sync] T%lu WAIT.enter addr=0x%llx *addr=0x%x exp=0x%x timo_ptr=0x%llx caller=0x%llx\n",
+                            (unsigned long)GetCurrentThreadId(),
                             (unsigned long long)a0, (unsigned)addr.load(std::memory_order_acquire),
-                            (unsigned)expected, (unsigned long long)a2);
-    // Honor the guest timeout by default (#142) — the same fix the Linux futex path got (#139).
-    // Previously this global-cv fallback IGNORED the timeout arg and blocked FOREVER while
-    // *addr == expected, returning 0 (=signaled), so a Windows-build timed wait could never take its
-    // timeout branch. Parse *a2 as uint32 microseconds, wait to that deadline, and return SCE
-    // ETIMEDOUT on expiry. PROSPER_NO_WAIT_TIMEOUT restores infinite waits (parity with Linux).
-    // The 32-bit compare is a shared limitation with the Linux FUTEX_WAIT path (WaitOnAddress can
-    // wait on 1/2/4/8-byte values; only 4 is modeled) — unchanged here.
+                            (unsigned)expected, (unsigned long long)a2, (unsigned long long)sync_guest_caller());
+    // Back this with the NATIVE Win32 futex (WaitOnAddress/WakeByAddress*, Win8+): a true PER-ADDRESS
+    // wait, exactly like the Linux FUTEX_WAIT path. The previous global-`condition_variable` shared one
+    // cv across every waited address, so WakeByAddress(n=1) -> notify_one() could wake a waiter parked
+    // on a DIFFERENT address (it re-checks its own word, finds it unchanged, re-sleeps) while the
+    // intended waiter was never woken — a lost wakeup that made the boot nondeterministically deadlock.
+    // Native WaitOnAddress blocks while *addr == compare and is woken only by WakeByAddress* on THIS
+    // addr, so n=1 semantics are correct and there is no thundering herd. The 32-bit compare is a
+    // shared limitation with the Linux path (WaitOnAddress supports 1/2/4/8-byte; only 4 is modeled).
     static const bool honor_timeout = getenv("PROSPER_NO_WAIT_TIMEOUT") == nullptr;
-    std::unique_lock<std::mutex> lk(g_sync_mx);
+    ULONGLONG deadline = 0;   // 0 = infinite
     if (a2 && honor_timeout) {
         uint32_t us = *(volatile uint32_t*)(uintptr_t)a2;
-        if (us == 0) us = 1;   // 0 == "poll" -> a minimal wait so we re-check
-        auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(us);
-        while (addr.load(std::memory_order_acquire) == expected)
-            if (g_sync_cv.wait_until(lk, deadline) == std::cv_status::timeout &&
-                addr.load(std::memory_order_acquire) == expected) {
+        ULONGLONG ms = us == 0 ? 1 : (ULONGLONG)((us + 999) / 1000);   // us -> ms, round up; 0 == poll
+        deadline = GetTickCount64() + ms;
+    }
+    volatile uint32_t* wa = (volatile uint32_t*)(uintptr_t)a0;
+    while (*wa == expected) {
+        DWORD wait_ms = INFINITE;
+        if (deadline) {
+            ULONGLONG now = GetTickCount64();
+            if (now >= deadline) {
                 if (wsynclog()) fprintf(stderr, "[sync] WAIT.exit  addr=0x%llx TIMEOUT\n", (unsigned long long)a0);
                 return 0x80020060ull;   // SCE_KERNEL_ERROR_ETIMEDOUT
             }
-        if (wsynclog()) fprintf(stderr, "[sync] WAIT.exit  addr=0x%llx woke\n", (unsigned long long)a0);
-        return 0;
+            wait_ms = (DWORD)(deadline - now);
+        }
+        uint32_t cmp = expected;
+        if (!WaitOnAddress(wa, &cmp, sizeof(cmp), wait_ms) && GetLastError() == ERROR_TIMEOUT) {
+            if (*wa == expected) {
+                if (wsynclog()) fprintf(stderr, "[sync] WAIT.exit  addr=0x%llx TIMEOUT\n", (unsigned long long)a0);
+                return 0x80020060ull;
+            }
+        }
+        // else: woken or spurious — loop re-checks *addr
     }
-    while (addr.load(std::memory_order_acquire) == expected) g_sync_cv.wait(lk);
-    if (wsynclog()) fprintf(stderr, "[sync] WAIT.exit  addr=0x%llx woke (untimed)\n", (unsigned long long)a0);
+    if (wsynclog()) fprintf(stderr, "[sync] WAIT.exit  addr=0x%llx woke\n", (unsigned long long)a0);
     return 0;
 }
 
 HLE(k_wake_by_address) {
-    if (wsynclog()) fprintf(stderr, "[sync] WAKE       addr=0x%llx *addr=0x%x n=%lld\n",
-                            (unsigned long long)a0, a0 ? *(uint32_t*)(uintptr_t)a0 : 0, (long long)a1);
-    std::lock_guard<std::mutex> lk(g_sync_mx);
-    int n = a1 ? (int)a1 : INT_MAX;
-    if (n == 1) g_sync_cv.notify_one();
-    else        g_sync_cv.notify_all();
+    if (wsynclog()) fprintf(stderr, "[sync] T%lu WAKE       addr=0x%llx *addr=0x%x n=%lld caller=0x%llx\n",
+                            (unsigned long)GetCurrentThreadId(),
+                            (unsigned long long)a0, a0 ? *(uint32_t*)(uintptr_t)a0 : 0, (long long)a1,
+                            (unsigned long long)sync_guest_caller());
+    if (!a0) return 0;
+    // Native per-address wake: n==1 wakes ONE waiter on THIS address (correct semaphore-release
+    // semantics), otherwise wake all. No lost wakeup and no global thundering herd (unlike the old
+    // single shared condition_variable).
+    if (a1 == 1) WakeByAddressSingle((PVOID)(uintptr_t)a0);
+    else         WakeByAddressAll((PVOID)(uintptr_t)a0);
     return 0;
 }
 
