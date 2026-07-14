@@ -1,8 +1,8 @@
-// hle_kernel_mem.cpp — HLE of libkernel virtual/direct memory (Linux backing).
+// hle_kernel_mem.cpp — HLE of libkernel virtual/direct memory.
 // PS5 memory model: reserve a virtual range, allocate "direct" (physical) memory as
 // an opaque offset, then map it (or flexible memory) into VA. We back it with host
-// mmap and TRACK every mapping so VirtualQuery is truthful and so we can log/debug the
-// guest's address-space construction. Guarded to Linux.
+// native VM primitives and TRACK every mapping so VirtualQuery is truthful and so we can
+// log/debug the guest's address-space construction.
 #include "dispatch.hpp"
 #include "nid.hpp"
 #include "sync_futex.hpp"   // shared futex wake + waiter registration (also used by the GPU's label wake)
@@ -1147,15 +1147,12 @@ void register_kernel_mem_hle() {
 // the allocator's first-fit/window semantics match byte-for-byte.
 //
 // What DIFFERS: the OS primitives. Linux uses mmap over a shared memfd so a phys offset can be
-// mapped at two VAs that ALIAS the same bytes (unified-physical-memory contract, needed by UE4
-// PPSA17942 MallocBinned3). Win32 file-mapping views are hard-limited to 64 KiB granularity for
-// both base address and file offset, but the guest maps at 16 KiB — so a faithful section-based
-// alias is a larger follow-up (tracked separately, area:ue4). Here we back every mapping with
-// PRIVATE committed VirtualAlloc memory: aliasing is NOT preserved, but the Messenger (Unity/
-// IL2CPP) never re-aliases a phys offset, so this unblocks its Windows boot. VirtualAlloc
-// zero-fills committed pages, so the console's fresh-pages-read-zero contract holds for free
-// (no dmem_zero needed). CONFIDENCE: HIGH for private-memory correctness on non-aliasing guests;
-// the aliasing gap is documented and will break MallocBinned3 on Windows until the section port.
+// mapped at two VAs that ALIAS the same bytes (unified-physical-memory contract). One sparse
+// paging-file section backs the entire pool, matching the POSIX memfd implementation. Windows
+// file views require 64 KiB-aligned offsets and bases, so an unaligned guest physical offset is
+// represented by a view of the containing 64 KiB block plus an in-view delta. Exact hinted maps
+// whose VA/physical deltas are incompatible with that host constraint retain the old private
+// fallback; ordinary zero-hint allocations and congruent fixed maps preserve aliasing.
 // ============================================================================================
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -1167,6 +1164,7 @@ void register_kernel_mem_hle() {
 #define _WIN32_WINNT 0x0A00   // Win10: WaitOnAddress/WakeByAddress* need >= 0x0602 (Win8)
 #endif
 #include <windows.h>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <climits>
@@ -1310,6 +1308,143 @@ namespace {
         if (r) return PAGE_READONLY;
         return PAGE_NOACCESS;
     }
+    constexpr uint64_t kWinAllocationGranularity = 0x10000;
+
+    // One sparse paging-file section is the Windows equivalent of the POSIX direct-memory memfd.
+    // SEC_RESERVE avoids charging 8 GiB of host commit up front; each view commits only its guest span.
+    HANDLE dmem_section() {
+        static HANDLE section = [] {
+            HANDLE h = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr,
+                                          PAGE_READWRITE | SEC_RESERVE,
+                                          (DWORD)(kDmemTotal >> 32),
+                                          (DWORD)(kDmemTotal & 0xffffffffu), nullptr);
+            if (!h) MLOG("CreateFileMapping(dmem) failed error=%lu\n", GetLastError());
+            return h;
+        }();
+        return section;
+    }
+
+    struct DmemView {
+        uint64_t guest_base;
+        uint64_t guest_size;
+        uint64_t phys;
+        void* view_base;
+        uint64_t view_size;
+    };
+    std::mutex g_dview_mx;
+    std::vector<DmemView> g_dviews;
+
+    void* map_section_view(uint64_t hint, uint64_t len, int hp, uint64_t phys, uint64_t align) {
+        HANDLE section = dmem_section();
+        if (!section || !len || phys < kDmemBase || phys - kDmemBase > kDmemTotal ||
+            len > kDmemTotal - (phys - kDmemBase)) return nullptr;
+
+        const uint64_t rel = phys - kDmemBase;
+        const uint64_t file_off = rel & ~(kWinAllocationGranularity - 1);
+        const uint64_t delta = rel - file_off;
+        const uint64_t view_size = align_up(delta + len, kWinAllocationGranularity);
+        void* requested = nullptr;
+        if (hint) {
+            if (hint < delta || ((hint - delta) & (kWinAllocationGranularity - 1)) != 0) {
+                MLOG("section map incompatible hint=0x%llx phys=0x%llx delta=0x%llx\n",
+                     (unsigned long long)hint, (unsigned long long)phys,
+                     (unsigned long long)delta);
+                return nullptr;
+            }
+            requested = (void*)(uintptr_t)(hint - delta);
+        }
+
+        void* view = MapViewOfFileEx(section, FILE_MAP_ALL_ACCESS,
+                                     (DWORD)(file_off >> 32), (DWORD)(file_off & 0xffffffffu),
+                                     (SIZE_T)view_size, requested);
+        if (!view) return nullptr;
+        uint8_t* guest = (uint8_t*)view + delta;
+
+        const uint64_t requested_align = align ? align : 0x4000;
+        if (!hint && requested_align &&
+            ((uint64_t)(uintptr_t)guest & (requested_align - 1)) != 0) {
+            UnmapViewOfFile(view);
+            return nullptr;
+        }
+        if (!VirtualAlloc(guest, (SIZE_T)len, MEM_COMMIT, PAGE_READWRITE)) {
+            MLOG("section commit va=0x%llx len=0x%llx failed error=%lu\n",
+                 (unsigned long long)(uintptr_t)guest, (unsigned long long)len, GetLastError());
+            UnmapViewOfFile(view);
+            return nullptr;
+        }
+        DWORD old = 0;
+        if (!VirtualProtect(guest, (SIZE_T)len, win_page_prot(hp), &old)) {
+            MLOG("section protect va=0x%llx len=0x%llx failed error=%lu\n",
+                 (unsigned long long)(uintptr_t)guest, (unsigned long long)len, GetLastError());
+            UnmapViewOfFile(view);
+            return nullptr;
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_dview_mx);
+            g_dviews.push_back({ (uint64_t)(uintptr_t)guest, len, phys, view, view_size });
+        }
+        return guest;
+    }
+
+    // A released physical range can be allocated again while old virtual aliases still exist.
+    // Zeroing the shared section at allocation time gives every alias the console's fresh-page view.
+    void dmem_zero(uint64_t phys, uint64_t len) {
+        HANDLE section = dmem_section();
+        if (!section || !len || phys < kDmemBase || phys - kDmemBase > kDmemTotal ||
+            len > kDmemTotal - (phys - kDmemBase)) return;
+        const uint64_t rel = phys - kDmemBase;
+        const uint64_t file_off = rel & ~(kWinAllocationGranularity - 1);
+        const uint64_t delta = rel - file_off;
+        const uint64_t view_size = align_up(delta + len, kWinAllocationGranularity);
+        void* view = MapViewOfFile(section, FILE_MAP_ALL_ACCESS,
+                                   (DWORD)(file_off >> 32), (DWORD)(file_off & 0xffffffffu),
+                                   (SIZE_T)view_size);
+        if (!view) {
+            MLOG("dmem zero map phys=0x%llx len=0x%llx failed error=%lu\n",
+                 (unsigned long long)phys, (unsigned long long)len, GetLastError());
+            return;
+        }
+        uint8_t* bytes = (uint8_t*)view + delta;
+        if (VirtualAlloc(bytes, (SIZE_T)len, MEM_COMMIT, PAGE_READWRITE)) {
+            memset(bytes, 0, (size_t)len);
+        } else {
+            MLOG("dmem zero commit phys=0x%llx len=0x%llx failed error=%lu\n",
+                 (unsigned long long)phys, (unsigned long long)len, GetLastError());
+        }
+        UnmapViewOfFile(view);
+    }
+
+    struct PhysRange { uint64_t start, end; };
+    std::mutex g_dmem_seen_mx;
+    std::vector<PhysRange> g_dmem_seen;
+
+    // Paging-file sections are zero-filled on first commit, so touching every first-time allocation
+    // would needlessly charge and write several GiB during title startup. Only ranges overlapping a
+    // previous allocation can contain stale bytes. Keep a compact union of ever-allocated ranges and
+    // zero on reuse; sequential first-time allocations normally collapse to one interval.
+    void dmem_prepare_allocation(uint64_t phys, uint64_t len) {
+        if (!len) return;
+        const uint64_t end = phys + len;
+        bool reused = false;
+        {
+            std::lock_guard<std::mutex> lk(g_dmem_seen_mx);
+            for (const auto& r : g_dmem_seen) {
+                if (r.start < end && r.end > phys) { reused = true; break; }
+            }
+            g_dmem_seen.push_back({ phys, end });
+            std::sort(g_dmem_seen.begin(), g_dmem_seen.end(),
+                      [](const PhysRange& a, const PhysRange& b) { return a.start < b.start; });
+            std::vector<PhysRange> merged;
+            merged.reserve(g_dmem_seen.size());
+            for (const auto& r : g_dmem_seen) {
+                if (merged.empty() || merged.back().end < r.start) merged.push_back(r);
+                else if (r.end > merged.back().end) merged.back().end = r.end;
+            }
+            g_dmem_seen.swap(merged);
+        }
+        if (reused) dmem_zero(phys, len);
+    }
+
     // Commit `len` at `hint` (0 = OS chooses). Handles BOTH the guest's reserve-then-commit flow
     // (ReserveVirtualRange did MEM_RESERVE; commit within it) AND a fresh map, by trying MEM_COMMIT
     // first (succeeds only over an existing reservation) then MEM_RESERVE|MEM_COMMIT.
@@ -1318,6 +1453,20 @@ namespace {
         if (!hint) return VirtualAlloc(nullptr, (SIZE_T)len, MEM_RESERVE | MEM_COMMIT, pp);
         if (void* p = VirtualAlloc((void*)hint, (SIZE_T)len, MEM_COMMIT, pp)) return p;
         return VirtualAlloc((void*)hint, (SIZE_T)len, MEM_RESERVE | MEM_COMMIT, pp);
+    }
+    void* win_map_phys(uint64_t hint, uint64_t len, int hp, uint64_t phys, uint64_t align,
+                       bool fixed) {
+        if (void* p = map_section_view(hint, len, hp, phys, align)) return p;
+        // Without SCE_KERNEL_MAP_FIXED, addrInOut is a search hint. If Windows cannot extend a
+        // run of adjacent section views at that exact VA, relocate the mapping and return the
+        // chosen address instead of silently changing it into non-aliasing private memory.
+        if (hint && !fixed) {
+            if (void* p = map_section_view(0, len, hp, phys, align)) return p;
+        }
+        MLOG("map_dmem private fallback hint=0x%llx len=0x%llx phys=0x%llx align=0x%llx error=%lu\n",
+             (unsigned long long)hint, (unsigned long long)len,
+             (unsigned long long)phys, (unsigned long long)align, GetLastError());
+        return win_commit(fixed ? hint : 0, len, hp);
     }
     // Reserve (no commit). VirtualAlloc reservations are 64 KiB-aligned, satisfying guest aligns
     // up to 64 KiB; larger alignment is logged and left to the OS base (follow-up).
@@ -1343,10 +1492,26 @@ namespace {
         DWORD old = 0;
         return VirtualProtect((void*)addr, (SIZE_T)len, win_page_prot(hp), &old) != 0;
     }
-    // Decommit (partial-safe; keeps any surrounding reservation). A full MEM_RELEASE needs the
-    // exact allocation base with size 0, which we don't track, so decommit is the safe general op.
+    // Shared section views must be released with UnmapViewOfFile. Anonymous/private mappings keep
+    // the old partial-safe decommit behavior.
     void win_unmap(uint64_t addr, uint64_t len) {
-        if (addr && len) VirtualFree((void*)addr, (SIZE_T)len, MEM_DECOMMIT);
+        if (!addr || !len) return;
+        void* section_view = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_dview_mx);
+            for (auto it = g_dviews.begin(); it != g_dviews.end(); ++it) {
+                if (it->guest_base == addr && it->guest_size == len) {
+                    section_view = it->view_base;
+                    g_dviews.erase(it);
+                    break;
+                }
+            }
+        }
+        if (section_view) {
+            UnmapViewOfFile(section_view);
+            return;
+        }
+        VirtualFree((void*)addr, (SIZE_T)len, MEM_DECOMMIT);
     }
 } // namespace
 
@@ -1416,6 +1581,7 @@ HLE(k_alloc_dmem) {
              (unsigned long long)a2, (unsigned long long)a0, (unsigned long long)a1);
         return 0x8002000Cull;
     }
+    dmem_prepare_allocation(off, sz);
     if (a5 > 0xffff) *(uint64_t*)a5 = off;
     MLOG("alloc_dmem len=0x%llx -> phys=0x%llx\n", (unsigned long long)a2, (unsigned long long)off);
     return 0;
@@ -1429,6 +1595,7 @@ HLE(k_alloc_main_dmem) {
         MLOG("alloc_main_dmem len=0x%llx -> ENOMEM\n", (unsigned long long)a0);
         return 0x8002000Cull;
     }
+    dmem_prepare_allocation(off, sz);
     if (a3 > 0xffff) *(uint64_t*)a3 = off;
     MLOG("alloc_main_dmem len=0x%llx -> phys=0x%llx\n", (unsigned long long)a0, (unsigned long long)off);
     return 0;
@@ -1457,13 +1624,15 @@ HLE(k_direct_memory_query) {
 // sceKernelMapDirectMemory(void** addrInOut, len, prot, flags, off_t phys, size_t align)
 HLE(k_map_dmem) {
     uint64_t hint = a0 ? *(uint64_t*)a0 : 0;
-    void* p = win_commit(hint, a1, host_prot(a2));   // private memory: phys (a4) not aliased (see banner)
+    const bool fixed = (a3 & 0x10) != 0;
+    void* p = win_map_phys(hint, a1, host_prot(a2), a4, a5, fixed);
     if (!p) { MLOG("map_dmem hint=0x%llx len=0x%llx FAILED\n",
                    (unsigned long long)hint, (unsigned long long)a1); return 0x8002000cull; }
     if (a0) *(uint64_t*)a0 = (uint64_t)p;
     track((uint64_t)p, a1, host_prot(a2), true, "direct");
-    MLOG("map_dmem -> 0x%llx len=0x%llx phys=0x%llx\n",
-         (unsigned long long)p, (unsigned long long)a1, (unsigned long long)a4);
+    MLOG("map_dmem -> 0x%llx len=0x%llx phys=0x%llx prot=0x%llx flags=0x%llx align=0x%llx\n",
+         (unsigned long long)p, (unsigned long long)a1, (unsigned long long)a4,
+         (unsigned long long)a2, (unsigned long long)a3, (unsigned long long)a5);
     return 0;
 }
 
@@ -1493,15 +1662,25 @@ HLE(k_batch_map) {
     uint64_t ret = 0;
     for (int i = 0; i < n; i++, e += 0x20) {
         uint64_t start = *(const uint64_t*)(e + 0x00);
+        uint64_t phys  = *(const uint64_t*)(e + 0x08);
         uint64_t len   = *(const uint64_t*)(e + 0x10);
         uint8_t  prot  = e[0x18];
         int32_t  op    = *(const int32_t*)(e + 0x1c);
+        MLOG("bm op=%d va=0x%llx phys=0x%llx len=0x%llx prot=0x%x\n",
+             op, (unsigned long long)start, (unsigned long long)phys,
+             (unsigned long long)len, prot);
         bool ok = true;
         switch (op) {
-            case 0: case 3: {                       // MAP_DIRECT / MAP_FLEXIBLE (private-backed on Win32)
+            case 0: {                               // MAP_DIRECT: shared physical backing
+                void* p = win_map_phys(start, len, host_prot(prot), phys, 0, start != 0);
+                ok = (p != nullptr);
+                if (ok) track((uint64_t)p, len, host_prot(prot), true, "batch-direct");
+                break;
+            }
+            case 3: {                               // MAP_FLEXIBLE: anonymous/private
                 void* p = win_commit(start, len, host_prot(prot));
                 ok = (p != nullptr);
-                if (ok) track((uint64_t)p, len, host_prot(prot), true, op == 0 ? "batch-direct" : "batch-flex");
+                if (ok) track((uint64_t)p, len, host_prot(prot), true, "batch-flex");
                 break;
             }
             case 1: if (start) { win_unmap(start, len); untrack(start, len); } break;   // UNMAP

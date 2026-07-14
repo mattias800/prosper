@@ -34,7 +34,10 @@ int main() {
     register_builtin_hle();
     auto reserve = Hle::lookup(nid_hash("sceKernelReserveVirtualRange"));
     auto unmap   = Hle::lookup(nid_hash("sceKernelMunmap"));
-    CHECK(reserve && unmap, "reserve/unmap HLE functions registered");
+    auto alloc   = Hle::lookup(nid_hash("sceKernelAllocateDirectMemory"));
+    auto map     = Hle::lookup(nid_hash("sceKernelMapDirectMemory"));
+    auto release = Hle::lookup(nid_hash("sceKernelReleaseDirectMemory"));
+    CHECK(reserve && unmap && alloc && map && release, "memory HLE functions registered");
     if (fails) return 1;
 
     constexpr uint64_t len = 0x4000;
@@ -48,6 +51,48 @@ int main() {
     *cell = 0x6310CAFEu;
     CHECK(*cell == 0x6310CAFEu, "first touch commits one guest page and preserves the write");
     CHECK(unmap(va, len, 0, 0, 0, 0) == 0, "reserved page unmaps cleanly");
+
+    // Direct memory is one physical pool, not private memory per virtual mapping. Dead Cells
+    // releases and reuses small physical ranges aggressively; independent Windows allocations
+    // let its allocator observe different metadata through two aliases and corrupt adjacent VA.
+    constexpr uint64_t dlen = 0x10000;
+    uint64_t phys = 0, va1 = 0, va2 = 0;
+    CHECK(alloc(0, kEnd, dlen, dlen, 0, (uint64_t)(uintptr_t)&phys) == 0 && phys == kBase,
+          "allocate one 64 KiB direct-memory page");
+    CHECK(map((uint64_t)(uintptr_t)&va1, dlen, 0x2, 0, phys, dlen) == 0 && va1,
+          "map first direct-memory view");
+    CHECK(map((uint64_t)(uintptr_t)&va2, dlen, 0x2, 0, phys, dlen) == 0 && va2 && va2 != va1,
+          "map second direct-memory view");
+    if (va1 && va2) {
+        *(volatile uint64_t*)(uintptr_t)(va1 + 0x1230) = 0x6310CAFEDEADC0DEull;
+        CHECK(*(volatile uint64_t*)(uintptr_t)(va2 + 0x1230) == 0x6310CAFEDEADC0DEull,
+              "two virtual mappings of one physical offset alias the same bytes");
+    }
+
+    uint64_t hinted = va1;
+    CHECK(map((uint64_t)(uintptr_t)&hinted, dlen, 0x2, 0, phys, dlen) == 0 &&
+              hinted && hinted != va1,
+          "non-fixed occupied hint relocates to a shared direct-memory view");
+    if (hinted) {
+        CHECK(*(volatile uint64_t*)(uintptr_t)(hinted + 0x1230) == 0x6310CAFEDEADC0DEull,
+              "relocated hinted mapping retains physical aliasing");
+    }
+
+    CHECK(release(phys, dlen, 0, 0, 0, 0) == 0, "release direct-memory page");
+    uint64_t reused_phys = 0, va3 = 0;
+    CHECK(alloc(0, kEnd, dlen, dlen, 0, (uint64_t)(uintptr_t)&reused_phys) == 0 && reused_phys == phys,
+          "released physical range is reused");
+    CHECK(map((uint64_t)(uintptr_t)&va3, dlen, 0x2, 0, reused_phys, dlen) == 0 && va3,
+          "map reused direct-memory page");
+    if (va3) {
+        CHECK(*(volatile uint64_t*)(uintptr_t)(va3 + 0x1230) == 0,
+              "fresh direct-memory allocation is zeroed after physical reuse");
+    }
+    if (va1) CHECK(unmap(va1, dlen, 0, 0, 0, 0) == 0, "unmap first direct-memory view");
+    if (va2) CHECK(unmap(va2, dlen, 0, 0, 0, 0) == 0, "unmap second direct-memory view");
+    if (va3) CHECK(unmap(va3, dlen, 0, 0, 0, 0) == 0, "unmap reused direct-memory view");
+    if (hinted) CHECK(unmap(hinted, dlen, 0, 0, 0, 0) == 0, "unmap relocated direct-memory view");
+    if (reused_phys) release(reused_phys, dlen, 0, 0, 0, 0);
 
     if (fails) { printf("== FAIL: %d check(s) ==\n", fails); return 1; }
     printf("== PASS ==\n");
