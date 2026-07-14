@@ -146,6 +146,11 @@ VkFormat vk_color_format(uint32_t format, uint32_t number_type, uint32_t comp_sw
 
 uint32_t vk_blend_factor(uint32_t f) {
     // RDNA2 blend factor -> VkBlendFactor value (Kyty GraphicsRender.cpp).
+    // CONFIDENCE: HIGH — cross-checked against SharpEmu @ 85cc2b9
+    // (src/SharpEmu.Libs/VideoOut/VulkanVideoPresenter.cs ToVkBlendFactor + AgcExports.cs
+    // CB_BLEND0_CONTROL 0x1E0 decode): same register/bit-fields (COLOR_SRCBLEND[4:0],
+    // COLOR_DESTBLEND[12:8], COLOR_COMB_FCN[7:5], ENABLE[30]) and same enum (4->SrcAlpha,
+    // 5->OneMinusSrcAlpha). The two emulators decode blend identically.
     switch (f) {
         case 0x00: return 0;   // Zero              -> ZERO
         case 0x01: return 1;   // One               -> ONE
