@@ -2,6 +2,7 @@
 #include "../src/gpu/pm4_registers.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -29,6 +30,14 @@ static void set_pgm(GpuState& state, uint32_t lo_register, uint32_t hi_register,
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { std::printf("  [FAIL] %s\n", m); ++fails; } \
                          else std::printf("  [ok]   %s\n", m); } while (0)
+
+static void set_test_env(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) setenv(name, value, 1); else unsetenv(name);
+#endif
+}
 
 int main() {
     std::printf("== test_gpu_capture ==\n");
@@ -91,6 +100,36 @@ int main() {
     CHECK(captured.shader_versions.size() == 2 && captured.operations.size() == 1 &&
           captured.operations[0].source_index == 7 && captured.operations[0].realized,
           "capture indexes unique shaders and retains operation provenance");
+
+    auto large_table = std::make_shared<ShaderResourceTable>();
+    ShaderResource large_resource = a;
+    large_resource.size = 2u << 20;
+    CHECK(gpu_capture_resource_footprint(large_resource) == (2u << 20),
+          "public capture footprint reports the planner's declared buffer range");
+    large_table->resources = {large_resource};
+    DrawItem large_draw = draw;
+    large_draw.vrt = large_table;
+    GpuCaptureFile bounded_capture;
+    set_test_env("PROSPER_GPU_CAPTURE_MAX_MB", "1");
+    CHECK(!capture_draw_items({large_draw}, meta, reader, bounded_capture, error, rtt_reader) &&
+          error.find("requires 2 MiB") != std::string::npos &&
+          error.find("PROSPER_GPU_CAPTURE_METADATA_ONLY=1") != std::string::npos,
+          "resource capture rejects an oversized plan before allocating and reports the thin fallback");
+    set_test_env("PROSPER_GPU_CAPTURE_METADATA_ONLY", "1");
+    CHECK(capture_draw_items({large_draw}, meta, reader, bounded_capture, error, rtt_reader) &&
+          bounded_capture.blobs.empty() && bounded_capture.rtt_seeds.empty() &&
+          bounded_capture.draws[0].vrt.resources[0].blob_index == 0xFFFFFFFFu &&
+          bounded_capture.metadata.renderer_env.back().first == "PROSPER_GPU_CAPTURE_METADATA_ONLY" &&
+          bounded_capture.metadata.renderer_env.back().second == "1",
+          "metadata-only capture retains resource descriptors without guest or RTT byte blobs");
+    GpuReplayFrame bounded_replay;
+    CHECK(materialize_gpu_replay(bounded_capture, bounded_replay, error) &&
+          bounded_replay.items[0].vrt->resources[0].gpu_addr == large_resource.gpu_addr &&
+          bounded_replay.items[0].vrt->resources[0].host_data == nullptr,
+          "metadata-only capture materializes inspectable descriptors with unavailable bytes explicit");
+    set_test_env("PROSPER_GPU_CAPTURE_METADATA_ONLY", nullptr);
+    set_test_env("PROSPER_GPU_CAPTURE_MAX_MB", nullptr);
+
     captured.expected_output_valid = true;
     captured.expected_output_hash = 0x1122334455667788ull; captured.expected_output_bytes = 480ull * 270 * 4;
     GpuCaptureDsSeed ds_seed;

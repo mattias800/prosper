@@ -23,8 +23,17 @@ CaptureClassification CaptureTracker::observe(const CaptureObservation& observat
         distinct_source_frames_++;
         last_advance_seconds_ = observation.elapsed_seconds;
     }
+    if (!have_previous_ || !result.pixel_identical) {
+        pixel_distinct_frames_++;
+        last_pixel_change_seconds_ = observation.elapsed_seconds;
+    } else {
+        result.pixel_stale_seconds =
+            std::max(0.0, observation.elapsed_seconds - last_pixel_change_seconds_);
+    }
     if (observation.source == CaptureSource::Rendered) rendered_samples_++;
     max_stale_seconds_ = std::max(max_stale_seconds_, result.stale_seconds);
+    max_pixel_stale_seconds_ =
+        std::max(max_pixel_stale_seconds_, result.pixel_stale_seconds);
     max_frame_seq_ = std::max(max_frame_seq_, observation.frame_seq);
     max_present_count_ = std::max(max_present_count_, observation.present_count);
     previous_ = observation;
@@ -75,11 +84,15 @@ std::string manifest_run_json(const CaptureRunConfig& c) {
          << ",\"warmup_ms\":" << c.warmup_ms
          << ",\"warmup_submits\":" << c.warmup_submits
          << ",\"render_every\":\"" << json_escape(c.render_every) << "\""
+         << ",\"render_every_for_ms\":\"" << json_escape(c.render_every_for_ms) << "\""
          << ",\"render_scale\":\"" << json_escape(c.render_scale) << "\""
          << ",\"render_target_dim\":\"" << json_escape(c.render_target_dim) << "\""
          << ",\"render_resource_dim\":\"" << json_escape(c.render_resource_dim) << "\""
          << ",\"assertions\":{\"min_distinct_frames\":" << c.min_distinct_frames
          << ",\"max_stale_seconds\":" << std::fixed << std::setprecision(6) << c.max_stale_seconds
+         << ",\"min_pixel_distinct_frames\":" << c.min_pixel_distinct_frames
+         << ",\"max_pixel_stale_seconds\":" << std::fixed << std::setprecision(6)
+         << c.max_pixel_stale_seconds
          << ",\"require_composited_frame\":" << (c.require_composited_frame ? "true" : "false")
          << ",\"min_present_count\":" << c.min_present_count
          << ",\"min_frame_seq\":" << c.min_frame_seq
@@ -112,6 +125,8 @@ std::string manifest_sample_json(int index, const std::string& png_path,
          << ",\"source_advanced\":" << (c.source_advanced ? "true" : "false")
          << ",\"pixel_identical\":" << (c.pixel_identical ? "true" : "false")
          << ",\"stale_seconds\":" << std::fixed << std::setprecision(6) << c.stale_seconds
+         << ",\"pixel_stale_seconds\":" << std::fixed << std::setprecision(6)
+         << c.pixel_stale_seconds
          << ",\"input_route\":\"" << json_escape(input_route) << "\"}";
     return line.str();
 }
@@ -123,9 +138,12 @@ std::string manifest_summary_json(int saved, int requested, bool timed_out,
          << ",\"requested\":" << requested
          << ",\"timed_out\":" << (timed_out ? "true" : "false")
          << ",\"distinct_source_frames\":" << tracker.distinct_source_frames()
+         << ",\"pixel_distinct_frames\":" << tracker.pixel_distinct_frames()
          << ",\"rendered_samples\":" << tracker.rendered_samples()
          << ",\"max_stale_seconds\":" << std::fixed << std::setprecision(6)
          << tracker.max_stale_seconds()
+         << ",\"max_pixel_stale_seconds\":" << std::fixed << std::setprecision(6)
+         << tracker.max_pixel_stale_seconds()
          << ",\"max_frame_seq\":" << tracker.max_frame_seq()
          << ",\"max_present_count\":" << tracker.max_present_count()
          << ",\"exit_code\":" << exit_code << "}";

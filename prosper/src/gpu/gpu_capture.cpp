@@ -52,6 +52,7 @@ constexpr uint32_t kMaxFailureStages = 3;
 constexpr uint32_t kMaxStringBytes = 1u << 20;
 constexpr uint64_t kMaxTotalRttSeedBytes = 1ull << 30;
 constexpr uint64_t kMaxTotalDsSeedBytes = 1ull << 30;
+constexpr uint64_t kDefaultResourceCaptureBytes = 512ull << 20;
 
 CaptureRttSeedReader g_rtt_seed_reader;
 CaptureRttSeedSnapshotReader g_rtt_seed_snapshot_reader;
@@ -290,6 +291,7 @@ struct Interval {
 
 bool collect_intervals(const std::vector<DrawItem>& draws,
                        const std::vector<ComputeItem>& computes,
+                       uint64_t resource_limit_bytes,
                        std::vector<Interval>& intervals, std::string& error) {
     uint64_t total = 0;
     auto add_table = [&](const ShaderResourceTable* t) -> bool {
@@ -312,22 +314,33 @@ bool collect_intervals(const std::vector<DrawItem>& draws,
         if (!merged.empty() && x.begin <= merged.back().end) merged.back().end = std::max(merged.back().end, x.end);
         else merged.push_back(x);
     }
+    uint64_t largest = 0;
     for (auto x : merged) {
         uint64_t n = x.end - x.begin;
         if (total > kMaxTotalBlobBytes - n) { error = "capture resource data exceeds 3 GiB"; return false; }
         total += n;
+        largest = std::max(largest, n);
+    }
+    if (total > resource_limit_bytes) {
+        error = "capture resource data requires " + std::to_string((total + (1u << 20) - 1) >> 20) +
+                " MiB across " + std::to_string(merged.size()) + " range(s), largest " +
+                std::to_string((largest + (1u << 20) - 1) >> 20) + " MiB; limit is " +
+                std::to_string(resource_limit_bytes >> 20) +
+                " MiB (raise PROSPER_GPU_CAPTURE_MAX_MB or set "
+                "PROSPER_GPU_CAPTURE_METADATA_ONLY=1)";
+        return false;
     }
     intervals = std::move(merged); return true;
 }
 
 bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& intervals,
-                   GpuCapturedTable& dst, std::string& error) {
+                   bool include_resource_data, GpuCapturedTable& dst, std::string& error) {
     dst.present = src != nullptr;
     if (!src) return true;
     for (const auto& r : src->resources) {
         GpuCapturedResource c; c.resource = r; c.resource.host_data = nullptr; c.resource.host_data_size = 0;
         uint64_t n = resource_footprint(r);
-        if (n) {
+        if (n && include_resource_data) {
             auto it = std::find_if(intervals.begin(), intervals.end(), [&](auto x) {
                 return x.begin <= r.gpu_addr && r.gpu_addr + n <= x.end;
             });
@@ -340,6 +353,25 @@ bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& 
 }
 
 const char* env_or_empty(const char* name) { const char* v = std::getenv(name); return v ? v : ""; }
+
+bool env_enabled(const char* name) {
+    const char* value = std::getenv(name);
+    return value && *value && std::strcmp(value, "0") && std::strcmp(value, "off");
+}
+
+bool capture_resource_limit(uint64_t& bytes, std::string& error) {
+    bytes = kDefaultResourceCaptureBytes;
+    const char* value = std::getenv("PROSPER_GPU_CAPTURE_MAX_MB");
+    if (!value || !*value) return true;
+    char* end = nullptr;
+    const uint64_t mib = std::strtoull(value, &end, 0);
+    if (!end || *end || mib < 1 || mib > (kMaxTotalBlobBytes >> 20)) {
+        error = "PROSPER_GPU_CAPTURE_MAX_MB must be between 1 and 3072";
+        return false;
+    }
+    bytes = mib << 20;
+    return true;
+}
 
 bool validate_rtt_seed(const GpuCaptureRttSeed& seed, std::string& error) {
     if (!seed.guest_addr || !seed.width || !seed.height) {
@@ -608,6 +640,10 @@ bool capture_failure_diagnostics(
 
 } // namespace
 
+uint64_t gpu_capture_resource_footprint(const ShaderResource& resource) {
+    return resource_footprint(resource);
+}
+
 uint64_t gpu_capture_hash(const uint8_t* data, size_t size) {
     uint64_t h = 1469598103934665603ull;
     for (size_t i = 0; i < size; ++i) { h ^= data[i]; h *= 1099511628211ull; }
@@ -664,8 +700,16 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         return false;
     }
     if (!reader) { error = "capture memory reader is missing"; return false; }
+    const bool include_resource_data = !env_enabled("PROSPER_GPU_CAPTURE_METADATA_ONLY");
+    uint64_t resource_limit_bytes = 0;
+    if (!capture_resource_limit(resource_limit_bytes, error)) return false;
+    if (!include_resource_data && std::none_of(
+            out.metadata.renderer_env.begin(), out.metadata.renderer_env.end(),
+            [](const auto& entry) { return entry.first == "PROSPER_GPU_CAPTURE_METADATA_ONLY"; }))
+        out.metadata.renderer_env.emplace_back("PROSPER_GPU_CAPTURE_METADATA_ONLY", "1");
     std::vector<Interval> intervals;
-    if (!collect_intervals(draws, computes, intervals, error)) return false;
+    if (include_resource_data &&
+        !collect_intervals(draws, computes, resource_limit_bytes, intervals, error)) return false;
     for (auto& x : intervals) {
         GpuCaptureBlob b; b.guest_addr = x.begin; b.bytes.resize(static_cast<size_t>(x.end - x.begin), 0);
         b.bytes_read = std::min<uint64_t>(reader(x.begin, b.bytes.data(), b.bytes.size()), b.bytes.size());
@@ -685,7 +729,8 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         c.indices = d.indices; c.color0_base = d.color0_base;
         c.color0_width = d.color0_width; c.color0_height = d.color0_height;
         c.draw_index = d.draw_index; c.command_order = d.command_order;
-        if (!capture_table(d.vrt.get(), intervals, c.vrt, error) || !capture_table(d.prt.get(), intervals, c.prt, error)) return false;
+        if (!capture_table(d.vrt.get(), intervals, include_resource_data, c.vrt, error) ||
+            !capture_table(d.prt.get(), intervals, include_resource_data, c.prt, error)) return false;
         out.draws.push_back(std::move(c));
     }
     for (const auto& compute : computes) {
@@ -696,7 +741,8 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         c.dispatch_index = compute.dispatch_index;
         c.submit_no = compute.submit_no;
         c.command_order = compute.command_order;
-        if (!capture_table(compute.resources.get(), intervals, c.resources, error)) return false;
+        if (!capture_table(compute.resources.get(), intervals, include_resource_data,
+                           c.resources, error)) return false;
         out.computes.push_back(std::move(c));
     }
     std::unordered_set<uint64_t> realized_draws, realized_computes;
@@ -710,7 +756,7 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
     }
     if (!capture_failure_diagnostics(failures, reader, out, error)) return false;
     collect_shader_versions(out);
-    if (rtt_reader) {
+    if (rtt_reader && include_resource_data) {
         std::vector<uint64_t> candidates;
         auto add_table = [&](const ShaderResourceTable* table) {
             if (!table) return;

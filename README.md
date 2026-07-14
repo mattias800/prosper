@@ -77,12 +77,19 @@ accepts scripted gamepad input, and renders the first level.
   preserves the complete color/depth checkpoint and source-image oracle for fast standalone regression replay
   (#569). The exact route and reproduction workflow are in
   [`prosper/docs/DEAD_CELLS_STATUS.md`](prosper/docs/DEAD_CELLS_STATUS.md).
+- ✅ **Blasphemous 2 reaches first gameplay:** the FMOD plugin path, AGC marker contract, two-pass HTTP URI
+  parser, and guest-thread return boundary are implemented. A poll-safe scripted route traverses the EULA and
+  opening cinematic into a complete native 1920x1080 first room with player, HUD, world layers, lighting, and
+  interaction UI. The last black-world defect was PS5 primitive type 7: it is a RectList used by transparent
+  fullscreen clears, while prosper treated it as three points. The observed procedural form now runs its fourth
+  corner and renders as a Vulkan triangle strip (#654). The reproducible capture recipe is in
+  [`prosper/scripts/blasphemous2/README.md`](prosper/scripts/blasphemous2/README.md).
 
 **Frontend:** `prosper-app` is a windowed player (SDL3 window + Vulkan present + audio sink +
 evdev/SDL3 controllers + real message/error/IME dialogs), sharing the same boot + render core as the
 headless `boot_trace`.
 
-Development is **agentic-first**: correctness is verified programmatically — **91 self-checking tests**
+Development is **agentic-first**: correctness is verified programmatically — **92 self-checking tests**
 under `ctest` (including a headless Vulkan/llvmpipe harness that runs recompiled shaders and asserts
 numeric/pixel results, and per-opcode round-trip disassembly checks), a **golden-image snapshot guard**
 that boots a real title and pixel/content-asserts an exact frame, cross-platform CI (Linux +
@@ -108,7 +115,7 @@ Requires a C++20 compiler, CMake, and Ninja. A Vulkan loader is needed for the g
 cd prosper
 cmake -G Ninja -B build-linux
 cmake --build build-linux
-ctest --test-dir build-linux          # 87 self-checking tests
+ctest --test-dir build-linux          # 92 self-checking tests
 ```
 
 Add `-DPROSPER_APP=ON` to also build the windowed `prosper-app` frontend (fetches SDL3). A

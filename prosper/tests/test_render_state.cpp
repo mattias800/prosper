@@ -128,6 +128,8 @@ int main() {
     CHECK(vk_topology(rs.prim_type) == VkTopology::TriangleList, "prim_type 4 -> VK TriangleList");
     CHECK(vk_topology(6) == VkTopology::TriangleStrip && vk_topology(1) == VkTopology::PointList,
           "topology map: 6 -> TriangleStrip, 1 -> PointList");
+    CHECK(vk_topology(7) == VkTopology::TriangleStrip,
+          "PS5 primitive type 7 translates RectList to a Vulkan triangle strip");
     // #384: RectList/QuadList are the screen-space primitives full-screen passes emit; they must not
     // collapse to PointList (3 stray points instead of a covered target). Kyty's strip/fan approximation.
     CHECK(vk_topology(17) == VkTopology::TriangleStrip, "prim_type 17 (RectList) -> TriangleStrip");

@@ -10,6 +10,11 @@ the shipped runtime. Build them from `build-linux/` like everything else.
 - **`boot_trace/`** — boots a SELF/ELF game image through the loader + HLE and
   runs it, with the fault handler, GPU executor, and (under `PROSPER_RENDER`) the
   live Vulkan renderer. The main harness for exercising a real title headlessly.
+- **`screenshot/`** — writes normal composited PNG sequences plus a JSONL evidence manifest. Use
+  `--seconds 1` for wall-clock sampling, warmup or `--render-every N --render-every-for-seconds S`
+  for slow software rendering,
+  and the pixel-distinct/pixel-stale assertions when visible progression matters. Source publication
+  counts alone do not prove that the image changed; see `screenshot/README.md`.
 - **`self_dump/`** — parse a SELF/ELF and print its segment/program-header map
   (find file offsets for offline disassembly).
 - **`shader_histo/`** — histogram RDNA2 opcodes across a title's shaders.
@@ -37,6 +42,8 @@ and explicit ranges such as `f300-340:cross`. See `docs/INPUT_REPLAY.md`.
 Set `PROSPER_PAD_RECORD=<path>` on any runner, or use `prosper-app --record <path>`, to capture the
 final controller stream in that format. Completed button intervals are flushed immediately.
 Set `PROSPER_PAD_SCRIPT_LOG=1` to log each scripted state transition observed at a pad poll.
+For long exploratory runs, add `PROSPER_PAD_SCRIPT_RELOAD=1` to live-reload an `@file` route while
+preserving its original time/flip origin; append only future windows and confirm the reload log.
 Wall-clock ranges can be skipped entirely when their duration is shorter than the interval between
 polls, especially under synchronous software rendering; use poll-safe holds with neutral gaps or
 flip-anchored ranges for reproducible routes.
@@ -57,6 +64,11 @@ sampling. Aim the live run near the target first; the capture itself writes once
 `PROSPER_GPU_CAPTURE_AFTER=N` ignores the first `N` renderer invocations before applying the draw-count
 filters and `AT` counter. Pair it with `PROSPER_SUBMITLOG`/`PROSPER_RENDER_FIRST` when several early
 scenes share the same draw count as a late target.
+Resource bytes are preflighted before allocation and default to a 512 MiB total limit. Raise it with
+`PROSPER_GPU_CAPTURE_MAX_MB=1..3072` only when a replayable capsule genuinely needs the data. For a
+suspect descriptor or very large submit, set `PROSPER_GPU_CAPTURE_METADATA_ONLY=1`: the thin capsule
+keeps shaders, operations, pipeline state, and resource descriptors for `--inspect-only`, `--validate`,
+and `--graph`, but deliberately cannot render.
 Set `PROSPER_CAPTURE_REVISION` explicitly in WSL worktrees: WSL Git cannot resolve their Windows-path
 gitdir links, so the build-time fallback revision is `unknown` there.
 `PROSPER_SUBMITLOG_DIM=WxH` prints the exact renderer invocation for any submit targeting that Gen5

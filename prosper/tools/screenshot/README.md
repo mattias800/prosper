@@ -25,8 +25,10 @@ cmake --build build --target screenshot
 ```
 screenshot <app0-dir> [--every N] [--count M] [--out DIR] [--timeout SECS]
            [--warmup-seconds S] [--warmup-submits N]
+           [--render-every N] [--render-every-for-seconds S]
            [--manifest PATH | --no-manifest]
            [--min-distinct-frames N] [--max-stale-seconds S]
+           [--min-pixel-distinct-frames N] [--max-pixel-stale-seconds S]
            [--require-composited-frame] [--min-present-count N]
            [--min-frame-seq N] [--require-crc32 N]
 ```
@@ -41,10 +43,14 @@ screenshot <app0-dir> [--every N] [--count M] [--out DIR] [--timeout SECS]
 | `--timeout S` | 900 | Give up after S seconds if the game isn't rendering enough (0 = no limit) |
 | `--warmup-seconds S` | 0 | Advance the guest for S seconds without synchronous Vulkan rendering |
 | `--warmup-submits N` | 0 | Advance without rendering until GPU submit N |
+| `--render-every N` | 1 | Render every Nth draw-carrying submit during the sampling phase |
+| `--render-every-for-seconds S` | unset | After S seconds, stop sampling and render every submit to rebuild temporal history |
 | `--manifest PATH` | `<out>/<run>.jsonl` | Write the machine-readable capture manifest here |
 | `--no-manifest` | off | Disable the default JSONL sidecar |
 | `--min-distinct-frames N` | 0 | Fail unless at least N distinct source publications were captured |
 | `--max-stale-seconds S` | unset | Fail if one source publication is reused longer than S seconds |
+| `--min-pixel-distinct-frames N` | 0 | Fail unless at least N samples differ from the preceding PNG |
+| `--max-pixel-stale-seconds S` | unset | Fail if identical pixels persist longer than S seconds, even across new publications |
 | `--require-composited-frame` | off | Fail if every PNG came from raw guest scanout fallback |
 | `--min-present-count N` | 0 | Fail unless a captured sample reaches guest flip N |
 | `--min-frame-seq N` | 0 | Fail unless a captured sample reaches rendered-frame N |
@@ -59,6 +65,10 @@ input route, and whether the source advanced or was stale. A final summary recor
 maximum-stale metrics plus the exit status. Manifests flush after every sample so a killed run retains
 usable evidence. `--no-manifest` preserves the old PNG-only behavior.
 
+Source progression and pixel progression are reported separately. A game can publish a new renderer
+frame every second while drawing the same image, so `source-distinct` alone is not evidence of visible
+progress. Use the pixel assertions for loading screens, frozen cinematics, and other visual checkpoints.
+
 Assertions preserve every PNG and the manifest, print the concrete failed condition, and exit nonzero.
 This lets an automated progression run distinguish "120 files written" from "120 advancing frames" or
 "the requested checkpoint was reached." A timeout or incomplete screenshot count is also a failure.
@@ -69,6 +79,11 @@ ends. During warmup, both rendered frames and the raw-scanout fallback are suppr
 diagnostic target/resource overrides can preserve producers without saving early frames (#588). The two
 warmup gates are additive when both are supplied. `--timeout` covers
 the entire run, including warmup.
+
+Renderer cadence is useful when the sequence itself must include boot, so a complete warmup is not
+appropriate. Sparse rendering can omit temporal producers and is therefore not a gameplay oracle by
+itself. Pair `--render-every N` with `--render-every-for-seconds S` to accelerate a long intro, then
+render every submit long enough to rebuild temporal render targets before the checkpoint frames.
 
 **"Frames" = rendered frames** (composited images handed to the present layer), *not* guest flips —
 the guest flips far faster than llvmpipe renders, so counting flips would bunch every shot into the

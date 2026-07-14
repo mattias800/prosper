@@ -54,15 +54,19 @@ possible without console keys. Dumps are user-supplied and gitignored.
   faithful offline isolation (#568/#594/#569). Dispatch thread counts and derived workgroup dimensions,
   compute program binding, direct type-1 buffers, and mixed graphics/compute PM4 order now execute correctly
   (#580/#576/#584).
-- 🚧 **Blasphemous 2 passes its EULA and loads gameplay content:** prelinking the title's optional FMOD core/studio
+- ✅ **Blasphemous 2 reaches first gameplay:** prelinking the title's optional FMOD core/studio
   plugins lets IL2CPP P/Invoke complete `FMODAudioBanksManager` initialization (#638/#640). The later AGC
   fault was prosper corrupting live DCB state: `+kSrjIVxKFE` is `sceAgcDcbPushMarker`, not the context
   constructor modeled by the old workaround (#641). A dedicated two-pass `sceHttpUriParse` implementation
   replaces the success-with-stale-output stub that crashed the title's telemetry worker (#642). The routed
   run continues through its Http2 calls and loads gameplay scenes, UI, enemies, bosses, audio banks, and
   cutscene assets. Normal-return guest pthreads now leave host `%fs` active before glibc performs its own
-  thread cleanup (#644), removing the next host crash. Native-resolution captures reach the opening
-  cinematic; reliable boot-to-gameplay input delivery under slow synchronous rendering is tracked by #646.
+  thread cleanup (#644), removing the next host crash. Poll-safe scripted presses and observed-state logging
+  (#646) reliably traverse the long opening. PS5 primitive type 7 is the title's procedural RectList clear;
+  mapping it to a four-corner Vulkan triangle strip clears stale UI alpha instead of rasterizing three points
+  over an otherwise valid world (#654). A 420-frame sampled-render native capture confirms the complete first
+  playable room, and screenshot manifests distinguish new publications from actual pixel progress (#648).
+  The route and capture recipe are in `scripts/blasphemous2/README.md`.
 - 🚧 **Active frontiers:** bundle v2 makes long Dead Cells history practical with exact shared-resource
   chunks, rolling semantic endpoints, final compaction, and suffix replay (#606). A fixed 1,200-submit full-state
   run reduced 122.97 GiB logical data to 301.1 MiB. A compact exact two-submit closure resolves both temporal
@@ -110,7 +114,7 @@ prosper/
 ```
 cmake -S . -B build -G Ninja
 cmake --build build
-ctest --test-dir build          # 90 self-checking tests
+ctest --test-dir build          # 92 self-checking tests
 ```
 Add `-DPROSPER_APP=ON` for the windowed `prosper-app` frontend (fetches SDL3). Or a tool directly:
 ```

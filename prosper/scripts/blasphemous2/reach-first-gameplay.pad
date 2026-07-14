@@ -1,4 +1,5 @@
 # Blasphemous 2 exploratory default-menu route.
+# Safe to extend with future windows while PROSPER_PAD_SCRIPT_RELOAD=1 is active.
 # One-second Cross holds remain observable when synchronous rendering permits only a few pad polls/s.
 1-2:cross
 4-5:cross
@@ -67,36 +68,44 @@
 193-194:cross
 196-197:cross
 199-200:cross
-202-203:cross
-205-206:cross
-208-209:cross
-211-212:cross
-214-215:cross
-217-218:cross
-220-221:cross
-223-224:cross
-226-227:cross
-229-230:cross
-232-233:cross
-235-236:cross
-238-239:cross
-241-242:cross
-244-245:cross
-247-248:cross
-250-251:cross
-253-254:cross
-256-257:cross
-259-260:cross
-262-263:cross
-265-266:cross
-268-269:cross
-271-272:cross
-274-275:cross
-277-278:cross
-280-281:cross
-283-284:cross
-286-287:cross
-289-290:cross
-292-293:cross
-295-296:cross
-298-299:cross
+# The first gameplay tutorial asks for a bile flask (Triangle), opens a help page
+# that closes with Circle, then requires Triangle once more to consume the flask.
+# Repeat short close/action taps with neutral gaps because full-resolution rendering can
+# make the overlay become ready while an earlier button is already held. The later edge
+# still closes it, while extra face-button taps are harmless after the tutorial advances.
+207-209:triangle
+220-222:circle
+225-227:triangle
+230-231:circle
+233-234:circle
+236-237:circle
+239-240:circle
+243-244:circle
+248-249:triangle
+252-253:triangle
+256-257:circle
+260-261:triangle
+
+# Leave the awakening room, then acknowledge the Down and Down+Cross movement prompts.
+265-285:right
+288-300:down
+303-315:down+cross
+
+# Continue moving and jump periodically so captures prove that gameplay advances.
+318-449:right
+321-324:cross
+329-332:cross
+337-340:cross
+345-348:cross
+353-356:cross
+361-364:cross
+369-372:cross
+377-380:cross
+385-388:cross
+393-396:cross
+401-404:cross
+409-412:cross
+417-420:cross
+425-428:cross
+433-436:cross
+441-444:cross

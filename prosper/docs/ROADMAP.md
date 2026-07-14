@@ -166,6 +166,12 @@ Turn the file into a resident, relocated guest image in host memory.
       `start_thread` cleanup (#644). The regression enables real guest FS, returns a sentinel from a
       guest worker, and joins it; restoring guest FS at that boundary previously crashed in
       `__res_thread_freeres` before the join completed.
+- [x] Blasphemous 2's poll-safe route records the scripted states actually observed at pad polls (#646),
+      traverses its opening, and reaches a complete native-resolution first gameplay frame. Screenshot
+      verification now reports pixel progress separately from renderer publication progress (#648).
+- [x] PS5 primitive type 7 is decoded as RectList, and its observed no-vertex-buffer three-vertex form
+      invokes the procedural fourth corner before Vulkan triangle-strip rasterization (#654). This clears the
+      persistent UI target's alpha and exposes the complete Blasphemous 2 world instead of a black composite.
 - [x] Dependent-module `init_array` (C++ global ctors) now run before entry — the key
       unlock that let IL2CPP's runtime initialize.
 - [x] locale/ctype tables; `sync_on_address` futex (Linux `futex(2)`); C++ new/delete; stdio.

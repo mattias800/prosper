@@ -96,9 +96,17 @@ and the user confirmed the first-level graphics match the hardware reference. #5
 *Blasphemous 2* now passes FMOD initialization (#638/#640), renders its logos/title/EULA after the corrected
 AGC marker implementation (#641), and passes the post-EULA telemetry parser after `sceHttpUriParse` gained its
 two-pass caller-pool contract (#642). Normal-return guest pthreads also leave host `%fs` active before glibc
-thread cleanup (#644), so the route loads gameplay scenes/assets without the old host crash and renders the
-opening cinematic. Poll-safe native-resolution input delivery remains tracked by #646; do not claim a verified
-gameplay screenshot until that route is stable. Use `scripts/blasphemous2/README.md` for the current recipe.
+thread cleanup (#644), so the route loads gameplay scenes/assets without the old host crash. One-second
+poll-safe presses plus observed-state logging (#646) make the long opening reproducible under slow software
+rendering, and a native 1920x1080 capture now confirms the complete first playable room: player, HUD,
+foreground/background art, lighting, and interaction prompt. Use `scripts/blasphemous2/README.md` for the
+validated sampled-render screenshot recipe. Screenshot manifests report source and pixel progression
+separately (#648), because a newly published renderer frame can still contain byte-identical pixels. The
+remaining black-world composition was stale opaque alpha: PS5 primitive type 7 is a RectList clear, but the
+standard RDNA2 table labels 7 reserved and prosper fell back to PointList. The captured vertex shader maps
+indices 0..3 to all four clip-space corners while the guest submits count 3. #654 maps the PS5 topology to a
+Vulkan strip and invokes the fourth procedural vertex for the observed no-VB form. A 420-frame native run
+then showed full-screen moving gameplay with no accumulated tutorial glyphs.
 
 Cross-title breadth has advanced: *Dead Cells* now starts reliably after the AGC resource-name fix (#544), its
 exercised NGS2 lifecycle returns initialized sizes/handles/state and silent output (#554), and a late render

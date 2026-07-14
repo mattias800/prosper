@@ -167,11 +167,15 @@ void inspect_table(const char* stage, const prosper::gpu::ShaderResourceTable* t
         const bool temporal_seed = std::any_of(seeds.begin(), seeds.end(), [&](const auto& seed) {
             return seed.guest_addr == r.gpu_addr;
         });
-        std::printf("  %s %-7s b=%u addr=%016llx bytes=%llu nz=%zu hash=%016llx first=%08x "
+        std::printf("  %s %-7s b=%u addr=%016llx declared=%u footprint=%llu captured=%llu "
+                    "nz=%zu hash=%016llx first=%08x "
                     "fmt=%u nc=%u stride=%u %ux%u tile=%u addr=%u%u%u swz=%u%u%u%u filt=%u/%u/%u "
                     "srt=%08x sgpr=%08x pc=%08x%s\n",
                     stage, class_name(r.cls), r.binding, static_cast<unsigned long long>(r.gpu_addr),
-                    static_cast<unsigned long long>(r.host_data_size), nz, static_cast<unsigned long long>(hash), first,
+                    r.size,
+                    static_cast<unsigned long long>(prosper::gpu::gpu_capture_resource_footprint(r)),
+                    static_cast<unsigned long long>(r.host_data_size), nz,
+                    static_cast<unsigned long long>(hash), first,
                     static_cast<unsigned>(r.format), r.num_components, r.stride, r.width, r.height, r.tile_mode,
                     r.addr_uvw[0], r.addr_uvw[1], r.addr_uvw[2],
                     r.swizzle[0], r.swizzle[1], r.swizzle[2], r.swizzle[3],
@@ -1301,18 +1305,29 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[gpureplay] executing through mixed operation %d\n", through_operation);
     }
     const auto& m = replay.metadata;
+    const bool metadata_only = std::any_of(
+        m.renderer_env.begin(), m.renderer_env.end(), [](const auto& entry) {
+            return entry.first == "PROSPER_GPU_CAPTURE_METADATA_ONLY" &&
+                   !entry.second.empty() && entry.second != "0" && entry.second != "off";
+        });
     std::fprintf(stderr, "[gpureplay] rev=%s title=%s submit=%llu %ux%u draws=%zu computes=%zu "
                          "operations=%zu shaders=%zu failed=%zu raw-failed-shaders=%zu blobs=%zu "
-                         "RTT-seeds=%zu DS-seeds=%zu oracle=%s\n",
+                         "RTT-seeds=%zu DS-seeds=%zu oracle=%s resource-data=%s\n",
                  m.revision.c_str(), m.title_id.c_str(), static_cast<unsigned long long>(m.submit_index),
                  m.width, m.height, replay.items.size(), replay.computes.size(), replay.operations.size(),
                  capture.shader_versions.size(), replay.failure_diagnostics.size(),
                  replay.raw_shader_versions.size(), replay.blobs.size(), replay.rtt_seeds.size(),
                  replay.ds_seeds.size(),
-                 replay.expected_output_valid ? "yes" : "no");
+                 replay.expected_output_valid ? "yes" : "no",
+                 metadata_only ? "omitted" : "present");
     if (inspect) inspect_frame(replay);
     if (validate_only) return validate_frame(replay) ? 0 : 1;
     if (inspect_only) return 0;
+    if (metadata_only) {
+        std::fprintf(stderr, "gpu_replay: metadata-only capture cannot render; use --inspect-only, "
+                             "--validate, or --graph\n");
+        return 2;
+    }
     if (!replay.rtt_seeds.empty() || !prepend.rtt_seeds.empty())
         set_environment("PROSPER_GPU_REPLAY_RTT_SEEDS", "1");
     if (!replay.ds_seeds.empty() || !prepend.ds_seeds.empty())

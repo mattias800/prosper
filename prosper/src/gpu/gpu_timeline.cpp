@@ -584,7 +584,7 @@ bool runtime_capture_endpoint_matches(const RuntimeDetailRequest& request,
     selector.min_dispatches = request.select_min_dispatches;
     selector.max_dispatches = request.select_max_dispatches;
     if (!gpu_timeline_submit_matches(submit, selector)) return false;
-    std::fprintf(stderr, "[timeline] semantic capture endpoint matched submit=%llu\n",
+    std::fprintf(stderr, "[timeline] semantic capture selector matched submit=%llu\n",
                  static_cast<unsigned long long>(submit_no));
     return true;
 }
@@ -1412,20 +1412,57 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
 
     GpuCaptureFile capture;
     if (!request.bundle_path.empty()) begin_runtime_capture_bundle();
+    const auto capture_started = std::chrono::steady_clock::now();
+    std::fprintf(stderr, "[timeline] submit %llu detailed capture starting: semantic-draws=%zu "
+                         "semantic-dispatches=%zu metadata-only=%s\n",
+                 static_cast<unsigned long long>(submit_no), state.draws.size(),
+                 state.dispatches.size(),
+                 std::getenv("PROSPER_GPU_CAPTURE_METADATA_ONLY") ? "yes" : "no");
     if (!capture_gpustate_submit(state, submit_no, metadata.width, metadata.height,
-                                 metadata, capture, error) ||
-        !write_gpu_capture(request.path, capture, error)) {
+                                 metadata, capture, error)) {
         std::fprintf(stderr, "[timeline] submit %llu detailed capture failed: %s\n",
                      static_cast<unsigned long long>(submit_no), error.c_str());
         history.remember(state, submit_no);
+        if (request.exit_after_capture) {
+            std::fprintf(stderr, "[timeline] selected capture failed; exiting nonzero as requested\n");
+            close_gpu_timeline();
+            std::fflush(nullptr);
+            std::exit(2);
+        }
         return;
     }
+    const auto capture_realized = std::chrono::steady_clock::now();
+    const uint64_t realization_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            capture_realized - capture_started).count());
+    std::fprintf(stderr, "[timeline] submit %llu detailed capture realized in %llums: "
+                         "draws=%zu dispatches=%zu operations=%zu blobs=%zu\n",
+                 static_cast<unsigned long long>(submit_no),
+                 static_cast<unsigned long long>(realization_ms), capture.draws.size(),
+                 capture.computes.size(), capture.operations.size(), capture.blobs.size());
+    if (!write_gpu_capture(request.path, capture, error)) {
+        std::fprintf(stderr, "[timeline] submit %llu detailed capture write failed: %s\n",
+                     static_cast<unsigned long long>(submit_no), error.c_str());
+        history.remember(state, submit_no);
+        if (request.exit_after_capture) {
+            std::fprintf(stderr, "[timeline] selected capture failed; exiting nonzero as requested\n");
+            close_gpu_timeline();
+            std::fflush(nullptr);
+            std::exit(2);
+        }
+        return;
+    }
+    const uint64_t total_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - capture_started).count());
+    std::fprintf(stderr, "[timeline] submit %llu detailed capture written in %llums -> %s\n",
+                 static_cast<unsigned long long>(submit_no),
+                 static_cast<unsigned long long>(total_ms), request.path.c_str());
     GpuReplayFrame replay;
     GpuDependencyGraph graph;
     if (materialize_gpu_replay(capture, replay, error) &&
         build_gpu_dependency_graph(replay, graph, error)) {
         for (const auto& leaf : graph.external_leaves) {
-            if (leaf.first_future_writer == UINT32_MAX) continue;
             if (leaf.access.resource_class != ResourceClass::Texture &&
                 leaf.access.resource_class != ResourceClass::StorageImage) continue;
             GpuTimelineProducer producer;

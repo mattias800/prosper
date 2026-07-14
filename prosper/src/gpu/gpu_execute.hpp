@@ -551,6 +551,17 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         return false;
     }
     if (out.indices.empty() && vb_entries > vertex_count) vertex_count = vb_entries;
+    // PS5 RectList (primitive 7; standard AMD RectList is 17) consumes three procedural vertices but
+    // covers the rectangle's synthesized fourth corner. Vulkan has no rectangle-list topology. The
+    // Blasphemous 2 clear shader explicitly computes all four clip-space corners from VertexIndex, has
+    // no vertex-buffer inputs, and submits count=3; invoke index 3 and render the four results as a
+    // triangle strip. Restrict the expansion to that observed no-VB form: a general VB-backed RectList
+    // needs post-VS fourth-vertex synthesis and must not speculatively fetch a fourth input record.
+    const bool rect_list = rs.prim_type == 7u || rs.prim_type == 17u;
+    if (rect_list && out.indices.empty() && vertex_count == 3u && vb_entries == 0u) {
+        vertex_count = 4u;
+        if (log) fprintf(stderr, "[exec] RectList: expanded procedural 3-vertex rectangle to 4-vertex strip\n");
+    }
     // Bindless per-glyph vertex fetch (#257): the fetch-shader patches a SMALL per-glyph V# (num_records=4
     // = one glyph's 4 corners, size=304). But the draw indexes ALL vertices (gl_VertexIndex 0..N-1) out of
     // the CONTIGUOUS vertex pool that begins at that base — so uploading only num_records*stride bytes
