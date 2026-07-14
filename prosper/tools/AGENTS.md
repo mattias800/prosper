@@ -36,6 +36,10 @@ seconds/flip syntax as inline scripts, accept one entry per line, `#` comments,
 and explicit ranges such as `f300-340:cross`. See `docs/INPUT_REPLAY.md`.
 Set `PROSPER_PAD_RECORD=<path>` on any runner, or use `prosper-app --record <path>`, to capture the
 final controller stream in that format. Completed button intervals are flushed immediately.
+Set `PROSPER_PAD_SCRIPT_LOG=1` to log each scripted state transition observed at a pad poll.
+Wall-clock ranges can be skipped entirely when their duration is shorter than the interval between
+polls, especially under synchronous software rendering; use poll-safe holds with neutral gaps or
+flip-anchored ranges for reproducible routes.
 
 Capture one draw-carrying renderer invocation with:
 

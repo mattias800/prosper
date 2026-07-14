@@ -7,6 +7,7 @@
 > between flips. Realtime/RTC clocks remain tied to host time. `PROSPER_PAD_SCRIPT=@path` loads newline-
 > separated routes with comments and explicit time/flip ranges. `PROSPER_PAD_RECORD=path` records the
 > final button stream on that same flip axis; `prosper-app --record path` exposes it interactively.
+> `PROSPER_PAD_SCRIPT_LOG=1` logs state transitions as the game observes them at pad polls.
 > The first checked-in route, `scripts/messenger/reach-intro-story.pad`, repeatedly reaches the opening
 > story but still has small narration-phase drift. Deeper routes and a precise pad-read screenshot
 > checkpoint axis remain open in #302. The original design follows.
@@ -35,6 +36,10 @@ We already have the seed: **`PROSPER_PAD_SCRIPT` (#202)** — a scripted `PadBac
 - Each entry holds its button(s) for `PROSPER_PAD_HOLD` ms (default 300) starting at `<seconds>`.
 - **Anchored to the first pad poll** (t=0 = "the game first read the controller" ≈ menu appeared) — robust to asset-load time.
 - Pad reports CONNECTED whenever a script is set. Parse + time-eval are pure and unit-tested in `pad.cpp`.
+- Explicit wall-clock ranges are sampled only when the game polls the pad. A short range can fall
+  entirely between polls under slow synchronous rendering. Use longer holds with neutral gaps,
+  prefer flip-anchored ranges when the title keeps presenting, and enable
+  `PROSPER_PAD_SCRIPT_LOG=1` to verify delivery rather than inferring it from the route text.
 
 Good bones. Two gaps for reaching deep states reliably: the clock is **wall-time**, and scripts are an env string (fine for a few presses, not for a long route).
 
