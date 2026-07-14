@@ -34,6 +34,12 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
         // in the list => its init runs first (it's PSNCore's dependency). Absent-file titles skip these.
         { d + "/Media/Plugins/PSNCore.prx", BOOT_PSNCORE },
         { d + "/Media/Plugins/PSNCommon.prx", BOOT_PSNCOMMON },
+        // FMOD's C# integration resolves these through P/Invoke only when its RuntimeManager is first
+        // constructed. Until prosper has true runtime PRX loading (#639), link the optional pair up
+        // front so LoadStartModule returns a real module handle. Studio precedes core in this list
+        // because dependent-module init functions run in reverse order (core must initialize first).
+        { d + "/Media/Plugins/libfmodstudio.prx", BOOT_FMODSTUDIO },
+        { d + "/Media/Plugins/libfmod.prx", BOOT_FMOD },
         { d + "/sce_module/libc.prx", BOOT_LIBC },
     };
     if (getenv("PROSPER_NO_PSN"))
