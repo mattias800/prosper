@@ -18,6 +18,15 @@ int main() {
         printf("  [FAIL] wild init fns were counted as succeeded (ok=%zu)\n", ok);
         return 1;
     }
+#ifdef _WIN32
+    int call_alignment = prosper::recovery_thunk_call_rsp_mod16();
+    if (call_alignment != 0) {
+        printf("  [FAIL] recovery thunk called compiled code with RSP%%16=%d (expected 0)\n",
+               call_alignment);
+        return 1;
+    }
+    printf("  [ok]   recovery thunk provided aligned MS-x64 shadow-space call frame\n");
+#endif
     printf("  [ok]   wild + null init fns tolerated; the fault report did not kill the process\n");
     printf("== PASS ==\n");
     return 0;

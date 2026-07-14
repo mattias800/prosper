@@ -408,6 +408,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_writer_provenance PRIVATE prosper_core)
   add_test(NAME writer_provenance_ranges COMMAND test_writer_provenance)
 
+  # The init-fault report must survive a wild/null faulting RIP (#128). On Windows this also drives
+  # the VEH recovery thunk and asserts its compiled-helper call obeys the Microsoft-x64 ABI (#633).
+  add_executable(test_initfault_dump tests/test_initfault_dump.cpp)
+  target_link_libraries(test_initfault_dump PRIVATE prosper_core)
+  add_test(NAME initfault_dump_survives COMMAND test_initfault_dump)
+
   # Windows guest-execution substrate (exec_image_win.cpp): build boot_trace so the whole boot path
   # links (proves the substrate + SysV-ABI HLE boundary resolve). No evdev/Vulkan here. The guest boot
   # itself is not yet verified on Windows — see docs/PORTING.md "Windows".
@@ -458,11 +464,6 @@ if(TARGET prosper_core)
       add_test(NAME trap_identifies_imports
                COMMAND test_trap_linux "${GAME_DUMP}")
     endif()
-
-    # The init-fault report must survive a wild/null faulting rip (#128). No game dump needed.
-    add_executable(test_initfault_dump tests/test_initfault_dump.cpp)
-    target_link_libraries(test_initfault_dump PRIVATE prosper_core)
-    add_test(NAME initfault_dump_survives COMMAND test_initfault_dump)
 
     add_executable(test_boot_linux tests/test_boot_linux.cpp)
     target_link_libraries(test_boot_linux PRIVATE prosper_core)
