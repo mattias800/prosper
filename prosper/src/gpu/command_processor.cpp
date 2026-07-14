@@ -1,5 +1,6 @@
 // command_processor.cpp — see command_processor.hpp.
 #include "command_processor.hpp"
+#include "mb3_freelist.hpp"
 #include "pm4_registers.hpp"
 #include "writer_provenance.hpp"
 #include "hle/sync_futex.hpp"   // wake_label_waiters (shared with sceKernelWaitOnAddress's futex)
@@ -149,7 +150,8 @@ extern "C" int prosper_fence_journal_lookup(uint64_t pkt, uint64_t* addr, uint64
 namespace {
 // Event types for the per-label ring. Build events fire in the AGC builder HLEs (guest thread);
 // exec events fire in the honor_* paths (fold thread / pend worker).
-enum : uint8_t { LE_DMA_BUILT = 1, LE_REL_BUILT, LE_WAIT_BUILT, LE_DMA_EXEC, LE_REL_EXEC, LE_DMA_SKIP };
+enum : uint8_t { LE_DMA_BUILT = 1, LE_REL_BUILT, LE_WAIT_BUILT, LE_DMA_EXEC, LE_REL_EXEC, LE_DMA_SKIP,
+                 LE_DMA_FREE, LE_REL_FREE };
 struct LabelEvent {
     uint8_t  type;
     uint32_t fold;        // g_fold_seq at event time (exec events; builds carry it too for context)
@@ -160,6 +162,7 @@ struct LabelHist {
     uint64_t addr;
     std::atomic<uint32_t> n;              // total events (ring index)
     std::atomic<uint32_t> dma_built_n, dma_exec_n, rel_built_n, rel_exec_n;   // overlap counters
+    std::atomic<uint32_t> mb3_dma_suppressed_n, mb3_rel_debt_consumed_n;
     LabelEvent ev[16];                    // last 16 events
 };
 constexpr uint32_t kLabelHistSize = 16384;            // power of two
@@ -170,6 +173,7 @@ inline LabelHist& label_hist_slot(uint64_t addr) {
     if (h.addr != addr) {                              // collision/new: reset (diagnostic-grade)
         h.addr = addr; h.n.store(0, std::memory_order_relaxed);
         h.dma_built_n = h.dma_exec_n = h.rel_built_n = h.rel_exec_n = 0;
+        h.mb3_dma_suppressed_n = h.mb3_rel_debt_consumed_n = 0;
         memset(h.ev, 0, sizeof h.ev);
     }
     return h;
@@ -212,6 +216,23 @@ void label_hist_dma_skip(uint64_t addr)               { label_hist_event(addr, L
 void label_hist_rel_exec(uint64_t addr, uint64_t pre) {
     label_hist_slot(addr).rel_exec_n.fetch_add(1, std::memory_order_relaxed);
     label_hist_event(addr, LE_REL_EXEC, pre);
+}
+void label_hist_dma_free(uint64_t addr, uint64_t pool_base) {
+    label_hist_slot(addr).mb3_dma_suppressed_n.fetch_add(1, std::memory_order_relaxed);
+    label_hist_event(addr, LE_DMA_FREE, pool_base);
+}
+bool label_hist_take_dma_free_debt(uint64_t addr) {
+    LabelHist& h = label_hist_slot(addr);
+    uint32_t used = h.mb3_rel_debt_consumed_n.load(std::memory_order_relaxed);
+    for (;;) {
+        uint32_t made = h.mb3_dma_suppressed_n.load(std::memory_order_acquire);
+        if (used >= made) return false;
+        if (h.mb3_rel_debt_consumed_n.compare_exchange_weak(
+                used, used + 1, std::memory_order_acq_rel, std::memory_order_relaxed)) return true;
+    }
+}
+void label_hist_rel_free(uint64_t addr, uint64_t pool_base) {
+    label_hist_event(addr, LE_REL_FREE, pool_base);
 }
 // #312 in-flight-overlap probe: at REL1 exec time, a SECOND init/fence pair already built for the
 // same label (built-execed >= 2 pending, counting this one) means two fence generations were in
@@ -284,7 +305,8 @@ int label_freed_marker_kind(uint64_t addr, uint64_t pre, uint64_t value) {
 }
 // Format the event ring for a suspect report, oldest first. b=built x=exec, aux in hex.
 void label_hist_report(uint64_t addr, char* out, size_t cap) {
-    static const char* nm[] = {"?", "dmaB", "relB", "waitB", "dmaX", "relX", "dmaSKIP"};
+    static const char* nm[] = {"?", "dmaB", "relB", "waitB", "dmaX", "relX", "dmaSKIP",
+                               "dmaFREE", "relFREE"};
     const LabelHist& h = label_hist_slot(addr);
     uint32_t n = h.n.load(std::memory_order_relaxed);
     uint32_t first = n > 16 ? n - 16 : 0;
@@ -292,7 +314,7 @@ void label_hist_report(uint64_t addr, char* out, size_t cap) {
     for (uint32_t i = first; i < n && off + 48 < cap; i++) {
         const LabelEvent& e = h.ev[i & 15];
         int m = snprintf(out + off, cap - off, " %s@%llu/f%u:0x%llx",
-                         e.type <= 6 ? nm[e.type] : "?", (unsigned long long)e.t_ms, e.fold,
+                         e.type <= 8 ? nm[e.type] : "?", (unsigned long long)e.t_ms, e.fold,
                          (unsigned long long)e.aux);
         if (m > 0) off += (size_t)m;
     }
@@ -424,6 +446,44 @@ static void waf_report(const char* kind, uint64_t addr, uint64_t pre, uint64_t v
                 kind, catname[cat & 3], (unsigned long long)addr, (unsigned long long)pre,
                 (unsigned long long)value, (unsigned long long)now_ms());
 }
+// #312 close: direct, non-trapping membership in the guest allocator's Malloc(0x20) freelists.
+// Unlike content/counter inference, this remains truthful before our DmaData init has overwritten a
+// freed node's NextFreeBlock with 0. Default ON; PROSPER_MB3_FREELIST_GUARD=0 is the live A/B escape.
+static bool mb3_freelist_guard() {
+    static const bool v = [] { const char* e = getenv("PROSPER_MB3_FREELIST_GUARD");
+                               return !e || strtol(e, nullptr, 0) != 0; }();
+    return v;
+}
+static void mb3_freelist_report(const char* kind, uint64_t addr, uint64_t pre,
+                                const Mb3FreelistMatch* match, bool debt) {
+    static std::atomic<uint32_t> n{0};
+    uint32_t i = n.fetch_add(1, std::memory_order_relaxed);
+    if (i < 64 || (i & 4095u) == 0)
+        fprintf(stderr, "[agc] MB3-FREE-SUPPRESS kind=%s [0x%llx] pre=0x%llx via=%s "
+                        "pool=0x%llx list=%u head=0x%llx hops=%u t=%llums\n",
+                kind, (unsigned long long)addr, (unsigned long long)pre,
+                debt ? "dma-debt" : "membership",
+                (unsigned long long)(match ? match->pool_base : 0), match ? match->list : 0,
+                (unsigned long long)(match ? match->head : 0), match ? match->hops : 0,
+                (unsigned long long)now_ms());
+}
+// If an init was suppressed while its target was free, its paired ReleaseMem must stay suppressed
+// even when the allocator pops/reuses the block between the two packets. Otherwise direct membership
+// would correctly turn false but the old generation's fence would corrupt the block's new owner.
+static bool mb3_suppress_release(uint64_t addr, uint64_t value, const char* kind) {
+    if (!mb3_freelist_guard() || value != 1 || !label_is_consumed_marker(addr)) return false;
+    uint64_t pre = peek_qword(addr);
+    if (label_hist_take_dma_free_debt(addr)) {
+        label_hist_rel_free(addr, 0);
+        mb3_freelist_report(kind, addr, pre, nullptr, true);
+        return true;
+    }
+    Mb3FreelistMatch match{};
+    if (!mb3_freelist_contains_stable(addr, &match)) return false;
+    label_hist_rel_free(addr, match.pool_base);
+    mb3_freelist_report(kind, addr, pre, &match, false);
+    return true;
+}
 // #312: report one suspicious fence write with its build-journal verdict. kindtag: "REL1" etc.
 //
 // RUN-2026-07-10 FINDING (this instrumentation's own history): the historical "~96 pointer-valued
@@ -482,6 +542,7 @@ static void honor_eop_write(const Pm4Command& c) {
         // packet's rel_value is a fabricated 0 that could move a satisfied fence label BACKWARDS
         // (re-blocking a `*label >= expected` poll).
         case 1: { if (!c.rel_value_valid) return;
+                  if (mb3_suppress_release(c.rel_addr, c.rel_value, "REL1")) return;
                   // #312 stomp-catcher: a live fence label holds small ints/timestamps; a freed
                   // MallocBinned3 FFreeBlock header holds heap POINTERS. Pointer-like pre-content
                   // means this fence write is landing in freed (or reused) memory — log it in the
@@ -562,6 +623,7 @@ static void honor_eop_write(const Pm4Command& c) {
                   poolshift_check("REL1", c.rel_addr, 4, c.rel_value, pkt_addr(c));
                   label_hist_rel_exec(c.rel_addr, pre); break; }
         case 2: { if (!c.rel_value_valid) return;
+                  if (mb3_suppress_release(c.rel_addr, c.rel_value, "REL2")) return;
                   // #312: the same freelist-stomp guard as the 32-bit path. An 8-byte value-1 fence
                   // over a live consumed-marker freelist node overwrites BOTH the next-pointer dwords
                   // (observed live: 8-byte kind=1 writes to a hot recycled label preceding a canary
@@ -654,6 +716,19 @@ static void honor_dma_data(const Pm4Command& c) {
     }
     uint32_t v32 = (uint32_t)c.dd_src;
     uint8_t* dst = (uint8_t*)(uintptr_t)c.dd_dst;
+    // The exact consumed-marker initializer is a 4-byte immediate zero. Test allocator membership
+    // BEFORE touching it: memset(0) would erase a free node's NextFreeBlock and make the later fence
+    // indistinguishable from a live initialized label (the session-11 residual).
+    if (mb3_freelist_guard() && c.dd_bytes == 4 && v32 == 0 &&
+        label_is_consumed_marker(c.dd_dst)) {
+        Mb3FreelistMatch match{};
+        if (mb3_freelist_contains_stable(c.dd_dst, &match)) {
+            uint64_t pre = peek_qword(c.dd_dst);
+            label_hist_dma_free(c.dd_dst, match.pool_base);
+            mb3_freelist_report("DMA", c.dd_dst, pre, &match, false);
+            return;
+        }
+    }
     uint64_t pre_dma = peek_qword(c.dd_dst);   // #312: pre-content for the label event ring
     forge_trip("DMA", c.dd_dst, pre_dma, v32, 4, pkt_addr(c));   // #312 session-10 tripwire (log-only)
     if (v32 == 0) {
