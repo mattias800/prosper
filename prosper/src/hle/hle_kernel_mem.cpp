@@ -1548,6 +1548,34 @@ namespace {
 std::mutex g_sync_mx;
 std::condition_variable g_sync_cv;
 bool wsynclog() { static int v = getenv("PROSPER_SYNCLOG") ? 1 : 0; return v; }
+// Best-effort guest call site of the current HLE call. The Windows import stub `call`s the handler
+// (no frame pointer), so an [rbp+8] walk misses the guest return address; instead scan our stack for
+// the first value in the guest code range (eboot..libc = [0x400000000, 0x700000000)). The guest's
+// `call <stub>` pushed its return address just below, so the first in-range hit is the caller. Coarse
+// (a stack data word could coincidentally look like a guest PC), but good enough to name a wait site.
+uint64_t sync_guest_caller() {
+    uint64_t* sp = (uint64_t*)__builtin_frame_address(0);
+    for (int i = 0; i < 160; i++) {
+        uint64_t v = sp[i];
+        if (v < 0x400000000ull || v >= 0x600000000ull) continue;   // guest MODULES only (exclude 0x6.. import stubs)
+        if ((v & 0xfff) < 8) continue;                             // keep the 6-byte look-back on v's page
+        // A stack word in the guest range may be data, not a return address, and could point at an
+        // UNMAPPED gap between modules — so confirm the page is committed+readable before dereferencing
+        // (this scan runs on every logged wait; an unguarded read faulted intermittently).
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery((LPCVOID)(uintptr_t)v, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) continue;
+        const DWORD rd = PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE
+                       | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY;
+        if (!(mbi.Protect & rd) || (mbi.Protect & PAGE_GUARD)) continue;
+        const uint8_t* p = (const uint8_t*)(uintptr_t)v;
+        // Accept only a real return address: the preceding instruction must be a CALL.
+        if (p[-5] == 0xE8) return v;                                        // call rel32
+        if (p[-2] == 0xFF && ((p[-1] >> 3) & 7) == 2) return v;             // call r/m (2-byte)
+        if (p[-3] == 0xFF && ((p[-2] >> 3) & 7) == 2) return v;             // call r/m (3-byte, modrm+sib/disp8)
+        if (p[-6] == 0xFF && ((p[-5] >> 3) & 7) == 2) return v;             // call r/m (rip-rel disp32)
+    }
+    return 0;
+}
 }
 
 HLE(k_wait_on_address) {
@@ -1555,9 +1583,10 @@ HLE(k_wait_on_address) {
     auto& raw = *(uint32_t*)(uintptr_t)a0;
     std::atomic_ref<uint32_t> addr(raw);
     uint32_t expected = (uint32_t)a1;
-    if (wsynclog()) fprintf(stderr, "[sync] WAIT.enter addr=0x%llx *addr=0x%x exp=0x%x timo_ptr=0x%llx\n",
+    if (wsynclog()) fprintf(stderr, "[sync] T%lu WAIT.enter addr=0x%llx *addr=0x%x exp=0x%x timo_ptr=0x%llx caller=0x%llx\n",
+                            (unsigned long)GetCurrentThreadId(),
                             (unsigned long long)a0, (unsigned)addr.load(std::memory_order_acquire),
-                            (unsigned)expected, (unsigned long long)a2);
+                            (unsigned)expected, (unsigned long long)a2, (unsigned long long)sync_guest_caller());
     // Honor the guest timeout by default (#142) — the same fix the Linux futex path got (#139).
     // Previously this global-cv fallback IGNORED the timeout arg and blocked FOREVER while
     // *addr == expected, returning 0 (=signaled), so a Windows-build timed wait could never take its
@@ -1586,8 +1615,10 @@ HLE(k_wait_on_address) {
 }
 
 HLE(k_wake_by_address) {
-    if (wsynclog()) fprintf(stderr, "[sync] WAKE       addr=0x%llx *addr=0x%x n=%lld\n",
-                            (unsigned long long)a0, a0 ? *(uint32_t*)(uintptr_t)a0 : 0, (long long)a1);
+    if (wsynclog()) fprintf(stderr, "[sync] T%lu WAKE       addr=0x%llx *addr=0x%x n=%lld caller=0x%llx\n",
+                            (unsigned long)GetCurrentThreadId(),
+                            (unsigned long long)a0, a0 ? *(uint32_t*)(uintptr_t)a0 : 0, (long long)a1,
+                            (unsigned long long)sync_guest_caller());
     std::lock_guard<std::mutex> lk(g_sync_mx);
     int n = a1 ? (int)a1 : INT_MAX;
     if (n == 1) g_sync_cv.notify_one();
