@@ -165,6 +165,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_service_getters PRIVATE prosper_core)
   add_test(NAME service_getters COMMAND test_service_getters)
 
+  # libSceHttp local URI parser (#642): two-pass caller pool sizing, public URI layout, and
+  # deterministic error paths. Pure and offline; it never contacts a network.
+  add_executable(test_http tests/test_http.cpp)
+  target_link_libraries(test_http PRIVATE prosper_core)
+  add_test(NAME http_hle COMMAND test_http)
+
   # PlatformUi hook (#347): the app frontend can service the guest's ImeDialog with real UI; with no
   # backend registered the headless auto-complete default is unchanged. Pure, no game dump.
   add_executable(test_platform_ui tests/test_platform_ui.cpp)

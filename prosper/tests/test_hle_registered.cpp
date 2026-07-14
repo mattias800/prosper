@@ -35,6 +35,8 @@ int main() {
         // services / dialogs
         "sceUserServiceGetInitialUser", "scePadOpen", "sceMsgDialogUpdateStatus",
         "sceSystemServiceHideSplashScreen",
+        // HTTP helpers
+        "sceHttpUriParse",
         // graphics (headless bring-up)
         "sceVideoOutOpen", "sceVideoOutSubmitFlip", "sceVideoOutGetFlipStatus",
         // audio (headless / pluggable backend)
