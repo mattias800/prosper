@@ -28,6 +28,13 @@
 #else
 #include <direct.h>
 #include <io.h>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>   // ReadFile/WriteFile + OVERLAPPED for positioned IO (pread/pwrite equivalents)
 #endif
 #include "../host/posix_shim.hpp"   // Darwin: process_vm_*, pthread_getattr_np, st_*tim, prosper_mincore
 
@@ -408,7 +415,17 @@ HLE(f_read)  { if (fdlog_on()) preadlog("read", a0, (uint64_t)::lseek((int)a0, 0
 #ifndef _WIN32
                return (uint64_t)read_full((int)a0, P(a1), (size_t)a2, false, 0);
 #else
-               return (uint64_t)(int64_t)::read((int)a0, P(a1), (size_t)a2);
+               // Full sequential read (loop) — same full-count contract as read_full: a short ::read
+               // would leave Unity's asset cache block partially filled and deserialize corrupt data.
+               { size_t done = 0, cnt = (size_t)a2; char* b = (char*)P(a1);
+                 while (done < cnt) {
+                     unsigned want = (cnt - done) > 0x40000000u ? 0x40000000u : (unsigned)(cnt - done);
+                     int r = ::read((int)a0, b + done, want);
+                     if (r < 0) return done ? (uint64_t)done : (uint64_t)-1;
+                     if (r == 0) break;   // EOF
+                     done += (size_t)r;
+                 }
+                 return (uint64_t)done; }
 #endif
              }
 HLE(f_write) {
@@ -432,12 +449,56 @@ HLE(f_writev) { return (uint64_t)(int64_t)::writev((int)a0, (const struct iovec*
 HLE(f_preadv) { return (uint64_t)(int64_t)::preadv((int)a0, (const struct iovec*)P(a1), (int)a2, (off_t)a3); }
 HLE(f_pwritev){ return (uint64_t)(int64_t)::pwritev((int)a0, (const struct iovec*)P(a1), (int)a2, (off_t)a3); }
 #else
-HLE(f_pread)  { return (uint64_t)-1; }
-HLE(f_pwrite) { return (uint64_t)-1; }
-HLE(f_readv)  { return (uint64_t)-1; }
-HLE(f_writev) { return (uint64_t)-1; }
-HLE(f_preadv) { return (uint64_t)-1; }
-HLE(f_pwritev){ return (uint64_t)-1; }
+// Windows positioned/vectored IO. MinGW has no pread/pwrite/*v, and these previously returned -1
+// (error) — which broke Unity's async asset streamer (FileCacher/CachedReader does POSITIONED reads
+// via sceKernelPread from the Loading.AsyncRead thread), so no assets loaded and the boot stalled
+// after VideoOut setup. Back them with ReadFile/WriteFile + an OVERLAPPED offset: atomic positioned
+// IO that is thread-safe even with concurrent reads on the SAME fd (it doesn't touch the shared file
+// position). Full-read/write loop to honor the PS5 regular-file full-count contract (a short read
+// leaves Unity's 64 KB cache block partially filled -> corrupt deserialization). CONFIDENCE: HIGH.
+namespace {
+int64_t win_pio(int fd, void* buf, size_t count, uint64_t off, bool write) {
+    HANDLE h = (HANDLE)(intptr_t)_get_osfhandle(fd);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    size_t done = 0;
+    while (done < count) {
+        OVERLAPPED ov; memset(&ov, 0, sizeof ov);
+        uint64_t o = off + done;
+        ov.Offset = (DWORD)(o & 0xffffffffu); ov.OffsetHigh = (DWORD)(o >> 32);
+        DWORD want = (count - done) > 0x40000000u ? 0x40000000u : (DWORD)(count - done);
+        DWORD n = 0;
+        BOOL ok = write ? WriteFile(h, (const char*)buf + done, want, &n, &ov)
+                        : ReadFile(h, (char*)buf + done, want, &n, &ov);
+        if (!ok) {
+            if (!write && GetLastError() == ERROR_HANDLE_EOF) break;   // read past EOF -> partial
+            return done ? (int64_t)done : -1;
+        }
+        if (n == 0) break;   // EOF (read) / no progress (write)
+        done += n;
+    }
+    return (int64_t)done;
+}
+// Guest OrbisKernelIovec == host layout { void* base; size_t len }.
+struct GIovec { void* base; size_t len; };
+} // namespace
+HLE(f_pread)  { return (uint64_t)win_pio((int)a0, P(a1), (size_t)a2, (uint64_t)a3, false); }
+HLE(f_pwrite) { return (uint64_t)win_pio((int)a0, P(a1), (size_t)a2, (uint64_t)a3, true); }
+HLE(f_readv)  { auto* v = (GIovec*)P(a1); int nc = (int)a2; int64_t tot = 0;
+                for (int i = 0; i < nc; i++) { int64_t r = (int64_t)(int)::read((int)a0, v[i].base, (unsigned)v[i].len);
+                    if (r < 0) return tot ? (uint64_t)tot : (uint64_t)-1; tot += r; if ((size_t)r < v[i].len) break; }
+                return (uint64_t)tot; }
+HLE(f_writev) { auto* v = (GIovec*)P(a1); int nc = (int)a2; int64_t tot = 0;
+                for (int i = 0; i < nc; i++) { int64_t w = (int64_t)(int)::write((int)a0, v[i].base, (unsigned)v[i].len);
+                    if (w < 0) return tot ? (uint64_t)tot : (uint64_t)-1; tot += w; if ((size_t)w < v[i].len) break; }
+                return (uint64_t)tot; }
+HLE(f_preadv) { auto* v = (GIovec*)P(a1); int nc = (int)a2; uint64_t off = (uint64_t)a3; int64_t tot = 0;
+                for (int i = 0; i < nc; i++) { int64_t r = win_pio((int)a0, v[i].base, v[i].len, off + (uint64_t)tot, false);
+                    if (r < 0) return tot ? (uint64_t)tot : (uint64_t)-1; tot += r; if ((size_t)r < v[i].len) break; }
+                return (uint64_t)tot; }
+HLE(f_pwritev){ auto* v = (GIovec*)P(a1); int nc = (int)a2; uint64_t off = (uint64_t)a3; int64_t tot = 0;
+                for (int i = 0; i < nc; i++) { int64_t w = win_pio((int)a0, v[i].base, v[i].len, off + (uint64_t)tot, true);
+                    if (w < 0) return tot ? (uint64_t)tot : (uint64_t)-1; tot += w; if ((size_t)w < v[i].len) break; }
+                return (uint64_t)tot; }
 #endif
 
 // sceKernelFtruncate(fd, length): resize an open file. Was MISSING -> the return-0 stub faked success
