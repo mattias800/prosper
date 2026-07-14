@@ -216,6 +216,32 @@ int main() {
         }
     }
 
+    // A compiler may recycle the spill-array VGPR for ordinary per-pixel data. The normal write
+    // ends the lane-slot lifetime: an EXP must read the new value, while a later readlane from an
+    // old slot is invalid. Blasphemous 2's missing world composite reuses v11 this way (#652).
+    {
+        const uint32_t recycled[] = {
+            0xBE8503FFu, 0x3E800000u,              // s5 = 0.25
+            0xD761000Au, 0x00010605u,              // v_writelane_b32 v10, s5, 3
+            0x7E1402F2u,                           // v_mov_b32 v10, 1.0
+            0xF800180Fu, 0x0A0A0A0Au,              // exp mrt0 v10, v10, v10, v10
+            0xBF810000u,
+        };
+        CHECK(!recompile_fragment(recycled, sizeof(recycled)/sizeof(recycled[0])).empty(),
+              "#652: ordinary VGPR write ends a scalar-spill lane-slot lifetime");
+
+        const uint32_t stale_readlane[] = {
+            0xBE8503FFu, 0x3E800000u,              // s5 = 0.25
+            0xD761000Au, 0x00010605u,              // v_writelane_b32 v10, s5, 3
+            0x7E1402F2u,                           // v_mov_b32 v10, 1.0 (kills spill slots)
+            0xD7600007u, 0x0001070Au,              // v_readlane_b32 s7, v10, 3
+            0x7E000207u, 0xF800180Fu, 0x00000000u, 0xBF810000u,
+        };
+        CHECK(recompile_fragment(stale_readlane,
+                                 sizeof(stale_readlane)/sizeof(stale_readlane[0])).empty(),
+              "#652: readlane rejects a lane slot invalidated by an ordinary VGPR write");
+    }
+
     // MULTI-RENDER-TARGET selection (#566 — Dead Cells world/G-buffer shaders). A 4-MRT shader emits its
     // color exports in DESCENDING target order (MRT3..MRT0). Vulkan color attachment 0 must receive MRT0's
     // data; the old "first EXP with target<=7 wins" wrote MRT3 (a non-albedo G-buffer plane) into color0,

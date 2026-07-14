@@ -1004,6 +1004,11 @@ struct RegState {
 // prior value. A no-op when EXEC is full (the straight-line common case), so nothing is perturbed.
 inline void predicate_write(SpirvCompute& b, RegState& rs, int idx, uint32_t old_val) {
     if (rs.exec_narrowed) rs.vreg[idx] = b.sel(rs.exec, rs.vreg[idx], old_val);
+    // A VGPR can be recycled after serving as a v_writelane scalar-spill array. Any ordinary
+    // per-lane write starts a new register lifetime, so later ALU/EXP reads must see that value
+    // rather than rejecting it as a stale cross-lane spill. Blasphemous 2 does exactly this after
+    // an image_sample overwrites the shader's early scalar-spill v11 (#652).
+    rs.vgpr_lane_slots.erase(idx);
 }
 inline uint32_t vreg_old(SpirvCompute& b, RegState& rs, int idx) {
     auto it = rs.vreg.find(idx); return it == rs.vreg.end() ? b.uconst(0) : it->second;
@@ -2604,7 +2609,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (in.src[1].kind != OperandKind::InlineInt || in.src[1].value < 0 || in.src[1].value > 63) {
                     ok = false; return true;
                 }
-                rs.vgpr_lane_slots[in.dst.value][in.src[1].value] = val(in.src[0]);
+                auto [slots, inserted] = rs.vgpr_lane_slots.try_emplace(in.dst.value);
+                if (inserted) rs.vreg.erase(in.dst.value);             // new spill-array lifetime
+                slots->second[in.src[1].value] = val(in.src[0]);
                 return true;
             }
             if (in.opcode == 0x360) {                                 // v_readlane_b32 sDST, vSRC, lane
