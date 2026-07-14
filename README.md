@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/prosper-logo.png" alt="prosper" width="720">
+  <img src="assets/prosper-logo.png" alt="prosper" width="256">
 </p>
 
 # prosper
