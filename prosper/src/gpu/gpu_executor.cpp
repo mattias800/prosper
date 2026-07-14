@@ -1027,17 +1027,23 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     if (mapped_fmt && fi.block_width > 1 && fi.snorm) continue;   // signed BCn: not wired
                     ShaderResource r;
                     r.cls = u.is_store ? ResourceClass::StorageImage : ResourceClass::Texture;
+                    // 3D / 2D_ARRAY surfaces (SQ_RSRC_IMG type 10 / 13) carry their slice count in
+                    // the T#'s WORD4 DEPTH field — the storage-image path sizes the bound image and
+                    // its guest writeback with it (#590). Plain 2D keeps depth 1.
+                    const uint32_t slices = (d.type == 10 || d.type == 13)
+                                                ? (d.depth ? d.depth : 1u) : 1u;
                     if (mapped_fmt) {
                         r.format = fi.format; r.num_components = fi.num_components;
                         const bool is_bcn = fi.block_width > 1;
                         r.size = is_bcn ? (((d.width + 3) / 4) * ((d.height + 3) / 4) * fi.bytes_per_block)
-                                        : (d.width * d.height * fi.bytes_per_block);
+                                        : (d.width * d.height * fi.bytes_per_block * slices);
                         r.srgb = fi.srgb;
                     } else {
                         r.format = DataFormat::Unorm8; r.num_components = 4;
-                        r.size = d.width * d.height * 4;
+                        r.size = d.width * d.height * 4 * slices;
                     }
                     r.gpu_addr = d.base; r.width = d.width; r.height = d.height;
+                    r.depth = slices;
                     r.tile_mode = d.tile_mode;
                     r.img_dim = d.type == 11 ? 3u : d.type == 10 ? 2u : d.type == 13 ? 5u : 1u;
                     r.swizzle[0] = d.dst_sel[0]; r.swizzle[1] = d.dst_sel[1];
@@ -1150,28 +1156,9 @@ std::vector<ComputeItem> realize_compute_dispatches(
                              (unsigned long long)code_addr);
             continue;
         }
-        // The live compute backend binds STORAGE BUFFERS only (live_compute.cpp). A program whose
-        // reflected interface needs a storage image / sampled texture now RECOMPILES (the #590 fold
-        // above resolves its descriptors), but executing it would fail at bind time — and one failing
-        // item aborts the whole batch in execute_live_compute_items, skipping dispatches that ran
-        // before this change. Gate it here, loudly and once per program, until the backend grows the
-        // STORAGE_IMAGE path; this line is the measure of exactly what that backend work unblocks.
-        {
-            bool backend_bindable = true;
-            SpirvDescriptorKind blocked = SpirvDescriptorKind::Unknown;
-            for (const auto& d : report.descriptors)
-                if (d.kind != SpirvDescriptorKind::StorageBuffer) {
-                    backend_bindable = false; blocked = d.kind; break;
-                }
-            if (!backend_bindable) {
-                static std::set<uint64_t> logged;
-                if (logged.insert(code_addr).second)
-                    std::fprintf(stderr, "[compute] program 0x%llx recompiles but needs a %s binding "
-                                         "the backend cannot execute yet (#590)\n",
-                                 (unsigned long long)code_addr, spirv_descriptor_kind_name(blocked));
-                continue;
-            }
-        }
+        // Image bindings (sampled textures + storage images) execute through the live backend's
+        // image paths (#590, live_compute.cpp); shapes it cannot bind correctly are skipped there,
+        // loudly and per-item, without aborting the rest of the batch.
         items.push_back(std::move(item));
     }
     return items;

@@ -140,6 +140,7 @@ DecodedImageDescriptor decode_image_descriptor(const uint32_t t[8]) {
     d.base      = (((uint64_t)t[0] | ((uint64_t)t[1] << 32)) & 0xFFFFFFFFFFull) << 8;             // Base40
     d.width     = (uint32_t)(((t[1] >> 30) & 0x3u) | (((t[2] >> 0) & 0xFFFu) << 2)) + 1;          // Width5
     d.height    = (uint32_t)((t[2] >> 14) & 0x3FFFu) + 1;                                          // Height5
+    d.depth     = (uint32_t)(t[4] & 0x1FFFu) + 1;                                                  // Depth (WORD4[12:0])
     d.format    = (t[1] >> 20) & 0x1FFu;                                                           // Format
     d.tile_mode = (t[3] >> 20) & 0x1Fu;                                                            // TileMode (SW_MODE)
     d.type      = (uint8_t)((t[3] >> 28) & 0xFu);                                                  // Type
