@@ -296,14 +296,14 @@ This is exactly the hard sub-problem flagged above for both Windows and macOS. P
 accesses** — the fault handler already decodes instructions at fault sites (SSE4a), so
 trap-and-emulate of `%fs:` operands is in-house technology.
 
-## Windows port status (2026-07-14) — first GPU fence fixed; IL2CPP init parity is next
+## Windows port status (2026-07-14) — IL2CPP metadata fixed; GC exception delivery is next
 
 The native MinGW build now links and initializes the live Vulkan renderer, boots The Messenger through
-Unity asset loading, emits a correct first GPU fence, and completes SubmitDcb #1. The guest `%fs`,
-threading, positioned-I/O, WaitOnAddress, VEH, and integer ABI foundations below are runtime-verified.
-The current blocker is #673: Windows `il2cpp_init("IL2CPP Root Domain")` returns false, leaving an
-Il2CppClass global null; once the corrected fence releases the render thread, generated code faults on
-that null before SubmitDcb #2. Linux initializes the same path and reaches repeated draw submissions.
+Unity asset loading, reads and initializes IL2CPP metadata, emits a correct first GPU fence, and completes
+SubmitDcb #1. The guest `%fs`, threading, positioned-I/O, WaitOnAddress, VEH, and integer ABI foundations
+below are runtime-verified. The current blocker is #678: the Windows `sceKernelRaiseException` path still
+returns success without asynchronously running the installed handler on the target thread. IL2CPP's GC
+therefore waits forever for a stop-the-world suspension acknowledgement before later graphics submissions.
 
 - **Direct/flexible-memory HLE ported to Win32** (`hle_kernel_mem.cpp` `#else` block). The pool
   bookkeeping + VA tracker are copied verbatim from POSIX; mappings are backed by private
@@ -376,7 +376,7 @@ thread-safe on a shared fd, full-read loop for the PS5 full-count contract) — 
 also loop now. (`libSceSystemService::mPpPxv5CZt4` = `sceSystemServiceGetHdrToneMapLuminance` is a benign
 HDR stub returning 0, tracked in #664 — not a blocker.)
 
-### GPU stack-argument fence fields — SOLVED (#672); current frontier: IL2CPP initialization (#673)
+### GPU stack-argument fence fields — SOLVED (#672)
 
 The EOP machinery was working; the Windows import trampoline dropped guest stack arguments 7-9. AGC's
 ReleaseMem/WaitRegMem handlers then decoded compiler shadow-space garbage as `data_sel`, `data`,
@@ -387,8 +387,24 @@ and fixed-arity AGC handlers use explicit parameters instead of `__builtin_frame
 Native validation now matches Linux exactly: `ReleaseMem data_sel=2 data=1`, followed by
 `WaitRegMem ref=1 mask=ffffffff`; the `NOT satisfied` message is gone and SubmitDcb #1 completes. Five
 Windows runs then fail consistently at `Il2cpp+0x17d64b` because `il2cpp_init` had already returned false
-and an Il2CppClass global at `Il2cpp+0x268c878` is null. That distinct initialization-parity problem is
-tracked in #673; do not mask the null or reopen the solved fence-field investigation.
+and an Il2CppClass global at `Il2cpp+0x268c878` is null. That distinct initialization-parity problem was
+tracked and solved in #673; do not reopen the solved fence-field investigation.
+
+### IL2CPP metadata read — SOLVED (#673); current frontier: GC exception delivery (#678)
+
+Windows opened and fstat'd `Media/Metadata/global-metadata.dat` correctly, but the low-level guest fd
+path omitted `O_BINARY`. The Windows CRT consequently treated the first `0x1a` byte as text EOF: a
+10,743,608-byte read returned exactly 440 bytes, the real file's first `0x1a` offset, and
+`il2cpp_init` rejected the truncated metadata. Windows `host_open_flags` now always includes `O_BINARY`;
+a cross-platform HLE regression test reads through embedded `0x1a` and CRLF bytes. `PROSPER_FILELOG=1`
+now records host open results, fd-to-path associations, fstat sizes, and read/pread return counts, which
+made this failure visible without debugger stepping.
+
+Native validation reads all 10,743,608 bytes, no longer prints `unable to initialize il2cpp`, and shows
+the formerly-null global at `Il2cpp+0x268c878` initialized. That exposes the distinct #678 stop-the-world
+blocker: `sceKernelRaiseException(target, 0x1e)` is implemented with targeted signals on Linux/macOS but
+is a success no-op on Windows, so the raiser blocks on `SuspendSemaphore` while the target never runs the
+installed handler.
 
 (Historical, pre-fix diagnosis retained below for context.)
 
@@ -459,9 +475,10 @@ granularity); and `PROSPER_CRASHPEEK` guards.
   `Windows MinGW` job builds the whole boot path.
 
 **What is left (runtime work, on a Windows host):**
-1. **Restore IL2CPP initialization parity (#673), the current frontier.** Identify the cross-module
-   `il2cpp_init` binding at eboot GOT `+0x2031d10`, compare its return path and required globals with
-   Linux, and make `Il2cpp+0x268c878` valid before use. Do not patch around the null class.
+1. **Port asynchronous GC exception delivery (#678), the current frontier.** Windows must interrupt
+   the requested `pthread_t`, synthesize the same FreeBSD mcontext used by the POSIX path, run the
+   installed guest handler on that target thread, and resume the interrupted context after the handler
+   returns. Do not fake the `SuspendSemaphore` acknowledgement.
 2. **Preserve physical-offset aliasing in the Windows memory HLE.** Private `VirtualAlloc` is sufficient
    for Unity, but UE4 MallocBinned3 needs shared backing (`CreateFileMapping`/`MapViewOfFile3`) while
    respecting Windows' 64 KiB allocation granularity.
