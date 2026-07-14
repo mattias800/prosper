@@ -1,12 +1,16 @@
+<p align="center">
+  <img src="assets/prosper-logo.png" alt="prosper" width="720">
+</p>
+
 # prosper
 
 **A user-space PlayStation 5 → PC compatibility layer.** Think *Proton/Wine, but for PS5*: prosper
 runs PS5 (Prospero) game binaries on Linux (primary) and Windows (secondary) by reimplementing the
 console's OS, ABI, and GPU stack on the host — **not** by emulating a CPU.
 
-> ⚠️ **Experimental research project.** It is not a general-purpose game runner yet. The primary
-> title now reaches a hardware-verified first level, while other retail titles expose substantial
-> compatibility gaps. See [Status](#status) for exactly how far each target gets today.
+> ⚠️ **Experimental research project.** It is not a general-purpose game runner yet. Tested retail
+> titles currently reach different milestones and still expose substantial compatibility gaps. See
+> [Game compatibility](COMPATIBILITY.md) for title-by-title results and known blockers.
 
 ## Why no CPU emulation?
 
@@ -26,10 +30,9 @@ natural primary target and the long-term dream is running on that hardware.
 
 ## Status
 
-prosper boots **multiple real retail titles** across two engine families — Unity 2022 / IL2CPP
-(*The Messenger*, `PPSA24651`, the primary target) and Unreal Engine (`PPSA17942`) — from a
-user-supplied, **unencrypted-segment** dump. For the primary title it now boots *through* the engine,
-accepts scripted gamepad input, and renders the first level.
+prosper boots **multiple real retail titles** from user-supplied, **unencrypted-segment** dumps. The
+tested set spans multiple engines and exercises the loader, host-side OS/ABI layer, services, input,
+audio, and graphics stack. See [Game compatibility](COMPATIBILITY.md) for exact per-title progress.
 
 **Boot & runtime (host-side OS / ABI / HLE):**
 - ✅ Parses `SELF`/`ELF`, builds a relocatable image, resolves Sony **NID**-hashed imports, links the
@@ -65,25 +68,6 @@ accepts scripted gamepad input, and renders the first level.
   `resolve_pipeline_state` → real `VkGraphicsPipeline`s, with topology, blend (incl. separate-alpha),
   depth, stencil, per-MRT color-write-mask, the game's real fast-clear color, and a render-to-texture
   cache for multi-pass composites — all driven from the decoded registers and pixel-verified.
-- ✅ **The Messenger reaches gameplay:** intro, title, menus, save list, dialogue, player, terrain,
-  water, structures, and foreground composition render through the first level at native 1920x1080.
-  A scripted gamepad route produced a full-resolution sequence that was confirmed against PS5 hardware.
-- ✅ **Dead Cells reaches full-color gameplay:** deterministic input routing passes the splash and menus into
-  the controllable Prisoners' Quarters scene. Graphics and compute execute in retained PM4 order (#584), guest
-  compute writes invalidate overlapping depth-cache state (#611), and the remaining lighting loops recompile
-  through a narrowly proved wave-uniform form (#615). The final grayscale-world defect was MRT selection: the
-  shaders export MRT3..MRT0, while the single-attachment backend previously used the first export. MRT0 now feeds
-  color attachment 0 (#626), restoring the colored atlas, lighting, player, terrain, effects, and HUD. Capture v8
-  preserves the complete color/depth checkpoint and source-image oracle for fast standalone regression replay
-  (#569). The exact route and reproduction workflow are in
-  [`prosper/docs/DEAD_CELLS_STATUS.md`](prosper/docs/DEAD_CELLS_STATUS.md).
-- ✅ **Blasphemous 2 reaches first gameplay:** the FMOD plugin path, AGC marker contract, two-pass HTTP URI
-  parser, and guest-thread return boundary are implemented. A poll-safe scripted route traverses the EULA and
-  opening cinematic into a complete native 1920x1080 first room with player, HUD, world layers, lighting, and
-  interaction UI. The last black-world defect was PS5 primitive type 7: it is a RectList used by transparent
-  fullscreen clears, while prosper treated it as three points. The observed procedural form now runs its fourth
-  corner and renders as a Vulkan triangle strip (#654). The reproducible capture recipe is in
-  [`prosper/scripts/blasphemous2/README.md`](prosper/scripts/blasphemous2/README.md).
 
 **Frontend:** `prosper-app` is a windowed player (SDL3 window + Vulkan present + audio sink +
 evdev/SDL3 controllers + real message/error/IME dialogs), sharing the same boot + render core as the
