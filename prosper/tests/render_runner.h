@@ -67,7 +67,8 @@ struct FrameResource {
                                     // collide binding 2/3 between stages and make the layout invalid).
     std::vector<uint32_t> dwords;   // storage-buffer contents (empty -> a 1-dword zero buffer)
     const uint8_t* tex_rgba = nullptr;   // non-null => a texture; then tw/th are its dimensions
-    uint32_t tw = 0, th = 0;
+    uint32_t tw = 0, th = 0, td = 1;
+    uint32_t img_dim = 1;             // ShaderResource/MIMG dim (1=2D, 2=3D); depth-1 3D stays 3D
     // Sampler state (Texture only). Defaults = LINEAR + clamp-to-edge — the harness's prior fixed
     // sampler — so render tests that build FrameResources directly stay byte-identical. The live path
     // fills these from the decoded S# (shader_resources.hpp). filter: 0=nearest, 1=linear; addr = Gen5
@@ -1024,7 +1025,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                         ? (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)
                         : VK_SHADER_STAGE_FRAGMENT_BIT;
                     VkImageCreateInfo tci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-                    tci.imageType = VK_IMAGE_TYPE_2D; tci.format = VK_FORMAT_R8G8B8A8_UNORM; tci.extent = {r.tw, r.th, 1};
+                    const bool texture_3d = r.img_dim == 2;
+                    tci.imageType = texture_3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
+                    tci.format = VK_FORMAT_R8G8B8A8_UNORM; tci.extent = {r.tw, r.th, r.td};
                     tci.mipLevels = 1; tci.arrayLayers = 1; tci.samples = VK_SAMPLE_COUNT_1_BIT; tci.tiling = VK_IMAGE_TILING_OPTIMAL;
                     tci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
                     vkCreateImage(dev, &tci, nullptr, &v.timg[i]);
@@ -1044,7 +1047,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     // matching encode on store -> linear values into a UNORM swapchain -> too dark. A
                     // correct sRGB fix is a coordinated linear-working-space + output-encode change (see the
                     // #263 discussion), NOT a per-view format flip. r.srgb is decoded now as groundwork.
-                    tvci.image = v.timg[i]; tvci.viewType = VK_IMAGE_VIEW_TYPE_2D; tvci.format = VK_FORMAT_R8G8B8A8_UNORM;
+                    tvci.image = v.timg[i];
+                    tvci.viewType = texture_3d ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;
+                    tvci.format = VK_FORMAT_R8G8B8A8_UNORM;
                     // T# DST_SEL channel remap (#261): map each SQ_SEL to a VkComponentSwizzle. Identity
                     // (the default, and the narrow/font path) yields IDENTITY == a no-op. PROSPER_NO_SWIZZLE
                     // forces identity for A/B testing against the pre-swizzle behavior.
@@ -1106,7 +1111,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     }
                     sci.minLod = r.min_lod; sci.maxLod = r.max_lod; sci.mipLodBias = r.lod_bias;
                     vkCreateSampler(dev, &sci, nullptr, &v.tsamp[i]);
-                    VkDeviceSize tbytes = (VkDeviceSize)r.tw * r.th * 4;
+                    VkDeviceSize tbytes = (VkDeviceSize)r.tw * r.th * r.td * 4;
                     VkBufferCreateInfo stci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; stci.size = tbytes; stci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
                     vkCreateBuffer(dev, &stci, nullptr, &v.tstage[i]);
                     VkMemoryRequirements sr; vkGetBufferMemoryRequirements(dev, v.tstage[i], &sr);
@@ -1236,7 +1241,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         b0.image = v.timg[i]; b0.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         b0.srcAccessMask = 0; b0.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b0);
-        VkBufferImageCopy tc{}; tc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; tc.imageExtent = {v.R[i].tw, v.R[i].th, 1};
+        VkBufferImageCopy tc{}; tc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        tc.imageExtent = {v.R[i].tw, v.R[i].th, v.R[i].td};
         vkCmdCopyBufferToImage(cmd, v.tstage[i], v.timg[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &tc);
         VkImageMemoryBarrier b1{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         b1.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b1.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;

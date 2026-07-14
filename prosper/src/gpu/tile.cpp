@@ -342,6 +342,73 @@ void sw64kb_copy(uint8_t* dst, const uint8_t* src, uint32_t ew, uint32_t eh, uin
 inline bool is_64kb_mode(uint32_t tile_mode) {
     return tile_mode == (uint32_t)TileMode::Sw64KbS || tile_mode == (uint32_t)TileMode::Sw64KbRX;
 }
+
+// For the PS5/default 16-pipe GFX10_SW_64K_R_X_1xaa pattern, AddrLib nibble2[74]
+// contributes z3,z2,z1,z0 to byte-offset bits 8..11 respectively. The X/Y portions are the
+// existing kSw64kRX[4] table above. Keeping this separate makes the previously 2D-only table's
+// intentional z==0 projection explicit.
+constexpr uint16_t kSw64kbRXVolumeZ[16] = {
+    0, 0, 0, 0, 0, 0, 0, 0, 0x0008, 0x0004, 0x0002, 0x0001, 0, 0, 0, 0
+};
+
+size_t sw64kb_volume_bytes(uint32_t width, uint32_t height, uint32_t depth, uint32_t bpe) {
+    const uint32_t el = sw64kb_elem_log2(bpe);
+    if (el == UINT32_MAX) return 0;
+    const size_t slice = sw64kb_tiled_bytes(width, height, 0, bpe);
+    if (!slice || depth > SIZE_MAX / slice) return 0;
+    return slice * depth;
+}
+
+template <bool ToTiled>
+bool sw64kb_volume_copy(uint8_t* dst, const uint8_t* src, size_t tiled_bytes,
+                        uint32_t width, uint32_t height, uint32_t depth, uint32_t bpe) {
+    const uint32_t el = sw64kb_elem_log2(bpe);
+    if (el == UINT32_MAX || sw64kb_rx_pipes_log2() != 4) return false;
+    uint32_t bw = 0, bh = 0;
+    sw64kb_dims(el, bw, bh);
+    const uint64_t blocks_x = (static_cast<uint64_t>(width) + bw - 1) / bw;
+    const uint64_t blocks_y = (static_cast<uint64_t>(height) + bh - 1) / bh;
+    const PatBit* pat = kSw64kRX[4][el];
+    std::vector<uint16_t> fx(width), fy(height), fz(depth);
+    for (uint32_t x = 0; x < width; x++) {
+        uint32_t v = 0;
+        for (uint32_t i = el; i < 16; i++)
+            v |= static_cast<uint32_t>(__builtin_popcount(x & pat[i].x) & 1) << i;
+        fx[x] = static_cast<uint16_t>(v);
+    }
+    for (uint32_t y = 0; y < height; y++) {
+        uint32_t v = 0;
+        for (uint32_t i = el; i < 16; i++)
+            v |= static_cast<uint32_t>(__builtin_popcount(y & pat[i].y) & 1) << i;
+        fy[y] = static_cast<uint16_t>(v);
+    }
+    for (uint32_t z = 0; z < depth; z++) {
+        uint32_t v = 0;
+        for (uint32_t i = el; i < 16; i++)
+            v |= static_cast<uint32_t>(__builtin_popcount(z & kSw64kbRXVolumeZ[i]) & 1) << i;
+        fz[z] = static_cast<uint16_t>(v);
+    }
+    for (uint32_t z = 0; z < depth; z++) {
+        const uint64_t slab = static_cast<uint64_t>(z) * blocks_y * blocks_x;
+        for (uint32_t y = 0; y < height; y++) {
+            const uint64_t row = slab + static_cast<uint64_t>(y / bh) * blocks_x;
+            for (uint32_t x = 0; x < width; x++) {
+                const uint64_t block = row + x / bw;
+                const uint64_t tiled = (block << 16) | static_cast<uint32_t>(fx[x] ^ fy[y] ^ fz[z]);
+                const size_t linear =
+                    ((static_cast<size_t>(z) * height + y) * width + x) * bpe;
+                if (ToTiled) {
+                    if (tiled + bpe <= tiled_bytes) std::memcpy(dst + tiled, src + linear, bpe);
+                } else if (tiled + bpe <= tiled_bytes) {
+                    std::memcpy(dst + linear, src + tiled, bpe);
+                } else {
+                    std::memset(dst + linear, 0, bpe);
+                }
+            }
+        }
+    }
+    return true;
+}
 } // namespace
 
 size_t tiled_surface_bytes(uint32_t width, uint32_t height, uint32_t tile_mode, uint32_t pitch,
@@ -415,6 +482,49 @@ void detile_elements(uint8_t* dst, const uint8_t* src, size_t src_bytes,
         return;
     }
     sw4kb_copy<false>(dst, src, ew, eh, /*pitch*/0, bpe, src_bytes);
+}
+
+bool tile_mode_supports_volume(uint32_t tile_mode) {
+    return tile_mode == (uint32_t)TileMode::Linear ||
+           (tile_mode == (uint32_t)TileMode::Sw64KbRX && sw64kb_rx_pipes_log2() == 4);
+}
+
+size_t tiled_volume_bytes(uint32_t width, uint32_t height, uint32_t depth,
+                          uint32_t tile_mode, uint32_t bytes_per_texel) {
+    if (!width || !height || !depth || !bytes_per_texel) return 0;
+    if (tile_mode == (uint32_t)TileMode::Linear) {
+        const uint64_t texels = static_cast<uint64_t>(width) * height * depth;
+        if (texels > SIZE_MAX / bytes_per_texel) return 0;
+        return static_cast<size_t>(texels * bytes_per_texel);
+    }
+    if (!tile_mode_supports_volume(tile_mode)) return 0;
+    return sw64kb_volume_bytes(width, height, depth, bytes_per_texel);
+}
+
+bool detile_volume(uint8_t* dst, const uint8_t* src, size_t src_bytes,
+                   uint32_t width, uint32_t height, uint32_t depth,
+                   uint32_t tile_mode, uint32_t bytes_per_texel) {
+    const size_t linear_bytes = static_cast<size_t>(width) * height * depth * bytes_per_texel;
+    if (tile_mode == (uint32_t)TileMode::Linear) {
+        if (src_bytes < linear_bytes) return false;
+        std::memcpy(dst, src, linear_bytes);
+        return true;
+    }
+    if (!tile_mode_supports_volume(tile_mode)) return false;
+    return sw64kb_volume_copy<false>(dst, src, src_bytes, width, height, depth, bytes_per_texel);
+}
+
+bool tile_volume(uint8_t* dst, size_t dst_bytes, const uint8_t* src,
+                 uint32_t width, uint32_t height, uint32_t depth,
+                 uint32_t tile_mode, uint32_t bytes_per_texel) {
+    const size_t need = tiled_volume_bytes(width, height, depth, tile_mode, bytes_per_texel);
+    if (!need || dst_bytes < need) return false;
+    if (tile_mode == (uint32_t)TileMode::Linear) {
+        std::memcpy(dst, src, need);
+        return true;
+    }
+    std::memset(dst, 0, need);
+    return sw64kb_volume_copy<true>(dst, src, need, width, height, depth, bytes_per_texel);
 }
 
 } // namespace prosper::gpu

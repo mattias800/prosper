@@ -78,6 +78,15 @@ int main() {
           "8-bit formats are 1 byte");
     CHECK(data_format_bytes(DataFormat::Unknown) == 0, "Unknown format is 0 bytes");
 
+    CHECK(float_to_half(0.0f) == 0x0000u && float_to_half(-0.0f) == 0x8000u &&
+          float_to_half(1.0f) == 0x3c00u && float_to_half(-2.0f) == 0xc000u &&
+          float_to_half(65504.0f) == 0x7bffu,
+          "float32 -> float16 conversion preserves zero/sign and exact finite values");
+    CHECK(float_to_half(half_to_float(0x0001u)) == 0x0001u &&
+          float_to_half(half_to_float(0x3555u)) == 0x3555u &&
+          float_to_half(half_to_float(0x7bffu)) == 0x7bffu,
+          "float16 -> float32 -> float16 round-trip is bit exact for finite values");
+
     // A table as the front-half would build it: a float32×4 constant buffer (descriptor at SRT 0x20)
     // and a unorm8×4 vertex buffer (descriptor at SRT 0x40).
     ShaderResourceTable t;

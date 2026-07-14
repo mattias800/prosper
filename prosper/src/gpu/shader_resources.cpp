@@ -2,6 +2,7 @@
 #include "shader_resources.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <set>
@@ -42,6 +43,38 @@ float half_to_float(uint16_t h) {
     static_assert(sizeof(f) == sizeof(bits), "float is 32-bit");
     __builtin_memcpy(&f, &bits, sizeof f);
     return f;
+}
+
+uint16_t float_to_half(float f) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &f, sizeof(bits));
+    const uint16_t sign = static_cast<uint16_t>((bits >> 16) & 0x8000u);
+    const uint32_t exponent = (bits >> 23) & 0xffu;
+    uint32_t mantissa = bits & 0x7fffffu;
+    if (exponent == 0xffu) {
+        if (!mantissa) return static_cast<uint16_t>(sign | 0x7c00u);
+        uint16_t payload = static_cast<uint16_t>(mantissa >> 13);
+        if (!payload) payload = 1;
+        return static_cast<uint16_t>(sign | 0x7c00u | payload);
+    }
+
+    const int32_t half_exponent = static_cast<int32_t>(exponent) - 127 + 15;
+    if (half_exponent >= 31) return static_cast<uint16_t>(sign | 0x7c00u);
+    if (half_exponent <= 0) {
+        if (half_exponent < -10) return sign;
+        mantissa |= 0x800000u;
+        const uint32_t shift = static_cast<uint32_t>(14 - half_exponent);
+        uint32_t rounded = mantissa >> shift;
+        const uint32_t remainder = mantissa & ((1u << shift) - 1u);
+        const uint32_t halfway = 1u << (shift - 1u);
+        if (remainder > halfway || (remainder == halfway && (rounded & 1u))) rounded++;
+        return static_cast<uint16_t>(sign | rounded);
+    }
+
+    uint32_t rounded = mantissa >> 13;
+    const uint32_t remainder = mantissa & 0x1fffu;
+    if (remainder > 0x1000u || (remainder == 0x1000u && (rounded & 1u))) rounded++;
+    return static_cast<uint16_t>(sign | (static_cast<uint32_t>(half_exponent) << 10) | rounded);
 }
 
 float f11_to_float(uint16_t v) {

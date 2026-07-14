@@ -37,7 +37,7 @@ namespace prosper::gpu {
 namespace {
 
 constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
-constexpr uint32_t kVersion = 8;
+constexpr uint32_t kVersion = 9;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -264,7 +264,7 @@ uint64_t checked_mul(uint64_t a, uint64_t b) {
 uint64_t resource_footprint(const ShaderResource& r) {
     uint64_t result = r.size;
     if (r.cls != ResourceClass::Texture && r.cls != ResourceClass::StorageImage) return result;
-    const uint64_t faces = r.img_dim == 3u ? 6u : 1u;
+    const uint64_t layers = r.img_dim == 3u ? 6u : (r.img_dim == 2u ? std::max(r.depth, 1u) : 1u);
     uint32_t w = r.width ? r.width : 4, h = r.height ? r.height : 4;
     const uint32_t bc = bc_block_bytes(r.format);
     uint64_t decoded = 0;
@@ -279,7 +279,7 @@ uint64_t resource_footprint(const ShaderResource& r) {
         decoded = tile_mode_is_tiled(r.tile_mode) ? tiled_surface_bytes(w, h, r.tile_mode, 0, bpt)
                                                   : checked_mul(checked_mul(w, h), bpt);
     }
-    decoded = checked_mul(decoded, faces);
+    decoded = checked_mul(decoded, layers);
     return std::max(result, decoded);
 }
 
@@ -956,6 +956,20 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         w.u8(seed.depth_valid); w.u8(seed.stencil_valid);
         w.bytes(seed.depth); w.bytes(seed.stencil);
     }
+    // v9 extends the resource contract with the base-level depth of 3D images. Keep the resource
+    // record itself byte-compatible with v1-v8 and append depths in deterministic table order, so old
+    // captures remain readable without duplicating every legacy table parser.
+    uint64_t resource_depth_count = 0;
+    for (const auto& draw : c.draws)
+        resource_depth_count += draw.vrt.resources.size() + draw.prt.resources.size();
+    for (const auto& compute : c.computes) resource_depth_count += compute.resources.resources.size();
+    if (resource_depth_count > UINT32_MAX) { error = "invalid resource depth count"; return false; }
+    w.u32(static_cast<uint32_t>(resource_depth_count));
+    auto write_depths = [&](const GpuCapturedTable& table) {
+        for (const auto& captured : table.resources) w.u32(captured.resource.depth);
+    };
+    for (const auto& draw : c.draws) { write_depths(draw.vrt); write_depths(draw.prt); }
+    for (const auto& compute : c.computes) write_depths(compute.resources);
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -1202,6 +1216,30 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
             }
             seed_total += plane_bytes;
         }
+    }
+    if (version >= 9) {
+        uint64_t expected_depths = 0;
+        for (const auto& draw : c.draws)
+            expected_depths += draw.vrt.resources.size() + draw.prt.resources.size();
+        for (const auto& compute : c.computes)
+            expected_depths += compute.resources.resources.size();
+        uint32_t depth_count = 0;
+        if (!r.u32(depth_count) || depth_count != expected_depths) {
+            error = "invalid resource depth count"; return false;
+        }
+        auto read_depths = [&](GpuCapturedTable& table) {
+            for (auto& captured : table.resources)
+                if (!r.u32(captured.resource.depth) || !captured.resource.depth ||
+                    captured.resource.depth > 8192u) {
+                    error = "invalid resource depth";
+                    return false;
+                }
+            return true;
+        };
+        for (auto& draw : c.draws)
+            if (!read_depths(draw.vrt) || !read_depths(draw.prt)) return false;
+        for (auto& compute : c.computes)
+            if (!read_depths(compute.resources)) return false;
     }
     if (r.left) { error = "capture has trailing data"; return false; }
     return true;

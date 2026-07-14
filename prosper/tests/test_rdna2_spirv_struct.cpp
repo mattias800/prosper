@@ -241,7 +241,8 @@ int main() {
     // the Fragment execution model — the compute and vertex shells have no derivatives, so an
     // image_sample there must lower to OpImageSampleExplicitLod (LOD 0) or spirv-val rejects the
     // module and pipeline creation fails.
-    enum : uint32_t { OpImageSampleImplicitLod = 87, OpImageSampleExplicitLod = 88 };
+    enum : uint32_t { OpImageSampleImplicitLod = 87, OpImageSampleExplicitLod = 88,
+                      OpImageQuerySizeLod = 103, OpImageQueryLevels = 106 };
     ShaderResourceTable rt_tex;
     { ShaderResource t{}; t.cls = ResourceClass::Texture; t.binding = 4; t.img_dim = 1; /*2D*/
       t.width = 2; t.height = 2; t.sgpr_base = 8; rt_tex.resources.push_back(t); }
@@ -283,6 +284,25 @@ int main() {
         return 1;
     }
     printf("  [ok]   fragment image_sample still uses OpImageSampleImplicitLod\n");
+
+    // UE4/DOLL volume initialization starts by querying a 3D T# with image_get_resinfo, then uses the
+    // xyz result for its dispatch bounds. This was the sole rejected opcode in that captured kernel.
+    ShaderResourceTable rt_3d;
+    { ShaderResource t{}; t.cls = ResourceClass::Texture; t.binding = 4; t.img_dim = 2;
+      t.width = 8; t.height = 8; t.sgpr_base = 0; rt_3d.resources.push_back(t); }
+    const uint32_t cs_resinfo[] = {
+        0x7e060280u,                         // v_mov_b32 v3, 0 (LOD)
+        0xf0380710u, 0x00000003u,           // image_get_resinfo v[0:2], v3, s[0:7] dmask:xyz dim:3D
+        0xbf810000u,
+    };
+    std::vector<uint32_t> resinfo_spv = recompile_valu(
+        cs_resinfo, sizeof(cs_resinfo)/sizeof(cs_resinfo[0]), 0, 0, &rt_3d);
+    if (resinfo_spv.empty() || !has_opcode(resinfo_spv, OpImageQuerySizeLod) ||
+        !has_opcode(resinfo_spv, OpImageQueryLevels)) {
+        printf("  [FAIL] image_get_resinfo 3D did not lower to SPIR-V image queries\n");
+        return 1;
+    }
+    printf("  [ok]   image_get_resinfo 3D lowers to size/level image queries\n");
 
     // LDS array is sized from the shader's real allocation (#130), not a hardcoded 16 KB. A compute
     // kernel that uses ds_write/ds_read declares a Workgroup array; its length must be 4096 dwords

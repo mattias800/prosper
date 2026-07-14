@@ -1,6 +1,8 @@
 // rdna2_decode.cpp — see rdna2_decode.hpp.
 #include "rdna2_decode.hpp"
 
+#include <algorithm>
+
 namespace prosper::gpu {
 
 namespace {
@@ -146,6 +148,21 @@ void decode_operands(Rdna2Inst& i) {
                 if (((sd >> 16) & 7u) == 6u && ((sd >> 24) & 7u) == 6u &&
                     !((sd >> 19) & 0x9u) && !((sd >> 27) & 0x9u))
                     i.has_modifier = false;
+                // f16 VOPC may select either 16-bit half. UE4 uses WORD_1 for packed visibility
+                // values (`v_cmpx_gt_f16_sdwa ..., v7, 0 src0_sel:WORD_1`). Preserve the selects so
+                // the recompiler can unpack the chosen half; other sub-dword compare forms reject.
+                else {
+                    const uint32_t eff = i.opcode >= 0xD9u && i.opcode <= 0xDEu
+                                           ? i.opcode - 0x10u : i.opcode;
+                    const uint32_t s0sel = (sd >> 16) & 7u, s1sel = (sd >> 24) & 7u;
+                    if (eff >= 0xC9u && eff <= 0xCEu &&
+                        s0sel >= 4u && s0sel <= 6u && s1sel >= 4u && s1sel <= 6u &&
+                        !((sd >> 19) & 0x9u) && !((sd >> 27) & 0x9u)) {
+                        i.sdwa_src0_sel = static_cast<uint8_t>(s0sel);
+                        i.sdwa_src1_sel = static_cast<uint8_t>(s1sel);
+                        i.has_modifier = false;
+                    }
+                }
             } else { i.src[0] = decode_src_field(w & 0x1FFu); i.src[1] = vgpr(w >> 9); i.n_src = 2; }
             break;
         case Rdna2Format::VOP3: {
@@ -434,6 +451,27 @@ size_t rdna2_walk(const uint32_t* code, size_t dwords, std::vector<Rdna2Inst>& o
         if (i.is_end || i.fmt == Rdna2Format::Unknown) break;
     }
     return pc;
+}
+
+uint32_t rdna2_sload_required_bytes(const uint32_t* code, size_t dwords, uint32_t sgpr_base) {
+    std::vector<Rdna2Inst> instructions;
+    rdna2_walk(code, dwords, instructions);
+    uint64_t required = 0;
+    for (const auto& in : instructions) {
+        if (in.is_end) break;
+        if (in.fmt != Rdna2Format::SMEM || in.opcode > 0x04u ||
+            in.src[0].value != static_cast<int32_t>(sgpr_base) ||
+            in.src[1].kind != OperandKind::Special || in.src[1].value != 125 ||
+            static_cast<int32_t>(in.literal) < 0)
+            continue;
+        uint32_t words = 1;
+        if (in.opcode == 0x01u) words = 2;
+        else if (in.opcode == 0x02u) words = 4;
+        else if (in.opcode == 0x03u) words = 8;
+        else if (in.opcode == 0x04u) words = 16;
+        required = std::max<uint64_t>(required, static_cast<uint64_t>(in.literal) + words * 4u);
+    }
+    return required > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(required);
 }
 
 } // namespace prosper::gpu

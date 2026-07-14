@@ -140,6 +140,7 @@ int main() {
     ds_seed.depth_valid = true; ds_seed.stencil_valid = true;
     ds_seed.depth.assign(16, 0x31); ds_seed.stencil = {1, 2, 3, 4};
     captured.ds_seeds.push_back(ds_seed);
+    captured.draws[0].vrt.resources[0].resource.depth = 7;
 
     auto path = std::filesystem::temp_directory_path() / "prosper_gpu_capture_test.prgcap";
     GpuCaptureFile duplicate_seed = captured; duplicate_seed.rtt_seeds.push_back(captured.rtt_seeds[0]);
@@ -156,7 +157,7 @@ int main() {
           deserialize_gpu_capture(stencil_only_bytes, stencil_only_loaded, error) &&
           !stencil_only_loaded.ds_seeds[0].depth_valid &&
           stencil_only_loaded.ds_seeds[0].stencil_valid,
-          "stencil-only validity survives capture v8 independently of depth");
+          "stencil-only validity survives capture v9 independently of depth");
     GpuCaptureFile invalid_stencil_format = stencil_only;
     invalid_stencil_format.ds_seeds[0].format = GpuCaptureDsFormat::D32Float;
     CHECK(!serialize_gpu_capture(invalid_stencil_format, stencil_only_bytes, error) &&
@@ -174,6 +175,8 @@ int main() {
           "per-target extent round-trips");
     CHECK(loaded.draws[0].vrt.resources[0].resource.format == DataFormat::Unorm2_10_10_10,
           "newest packed image format enum round-trips");
+    CHECK(loaded.draws[0].vrt.resources[0].resource.depth == 7,
+          "v9 resource depth round-trips");
     CHECK(loaded.shader_versions.size() == 2 && loaded.draws[0].draw_index == 7 &&
           loaded.draws[0].command_order == 123 && loaded.operations[0].source_index == 7,
           "content versions and draw operation identity round-trip");
@@ -336,10 +339,13 @@ int main() {
 
     GpuCaptureFile legacy_source = captured; legacy_source.ds_seeds.clear();
     std::vector<uint8_t> legacy_bytes;
-    CHECK(serialize_gpu_capture(legacy_source, legacy_bytes, error) && legacy_bytes.size() >= 24,
-          "created a diagnostic-free v8 payload for legacy-reader fixtures");
-    if (legacy_bytes.size() >= 24) {
-        legacy_bytes.resize(legacy_bytes.size() - 4); // remove v8 DS-seed zero count
+    CHECK(serialize_gpu_capture(legacy_source, legacy_bytes, error) && legacy_bytes.size() >= 28,
+          "created a diagnostic-free v9 payload for legacy-reader fixtures");
+    if (legacy_bytes.size() >= 28) {
+        const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
+                                             legacy_source.draws[0].prt.resources.size();
+        legacy_bytes.resize(legacy_bytes.size() - 4 - 4 - 4 * legacy_resource_count);
+        // remove v9 depth section (count + values) and the v8 DS-seed zero count
         legacy_bytes[8] = 7; legacy_bytes[9] = legacy_bytes[10] = legacy_bytes[11] = 0;
     }
     GpuCaptureFile legacy_loaded;
@@ -353,9 +359,9 @@ int main() {
     CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
           !legacy_loaded.failure_diagnostics_available && legacy_loaded.failure_diagnostics.empty(),
           "v6 capture reopens with failed-operation diagnostics reported unavailable");
-    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 9;
+    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 10;
     CHECK(!deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
-          error == "unsupported capture version 9",
+          error == "unsupported capture version 10",
           "future capture versions fail with a concrete version error");
 
     GpuCaptureFile bad_hash = mixed;

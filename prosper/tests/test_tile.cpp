@@ -454,6 +454,49 @@ int main() {
         CHECK(std::memcmp(&tiled[8704], at(16, 0), bpe) == 0, "64KB_R_X 4B golden: element (16,0) at byte 8704 (x4 -> bits 9+13)");
     }
 
+    // GFX10 thin/view-as-2D 3D SW_64KB_R_X. Each Z slice owns a padded 2D block grid, while Z
+    // participates in the pipe-XOR inside that slice; z0..z3 map to offset bits 11..8.
+    if (!getenv("PROSPER_RX_PIPES")) {
+        const uint32_t M = (uint32_t)TileMode::Sw64KbRX;
+        CHECK(tile_mode_supports_volume(M), "SW_64KB_R_X has an explicit 3D pipe-XOR pattern");
+        CHECK(tiled_volume_bytes(120, 68, 32, M, 8) == (size_t)1 * 2 * 32 * 65536,
+              "120x68x32 @ 8 B uses 1x2 padded 2D blocks per Z slice");
+        auto rt_volume = [&](uint32_t bpe) {
+            static const uint32_t dims[5][2] = {
+                {256,256}, {256,128}, {128,128}, {128,64}, {64,64}
+            };
+            uint32_t el = 0; while ((1u << el) < bpe) el++;
+            const uint32_t w = dims[el][0] + 3, h = dims[el][1] + 2, d = 5;
+            std::vector<uint8_t> ref((size_t)w * h * d * bpe);
+            for (size_t i = 0; i < ref.size(); i++) ref[i] = (uint8_t)((i * 2246822519u) >> 13);
+            const size_t bytes = tiled_volume_bytes(w, h, d, M, bpe);
+            std::vector<uint8_t> tiled(bytes, 0), back(ref.size(), 0);
+            return tile_volume(tiled.data(), tiled.size(), ref.data(), w, h, d, M, bpe) &&
+                   detile_volume(back.data(), tiled.data(), tiled.size(), w, h, d, M, bpe) &&
+                   back == ref;
+        };
+        CHECK(rt_volume(1) && rt_volume(2) && rt_volume(4) && rt_volume(8) && rt_volume(16),
+              "SW_64KB_R_X 3D round-trip is exact at every supported texel size");
+
+        const uint32_t w = 128, h = 64, d = 16, bpe = 8;
+        std::vector<uint8_t> ref((size_t)w * h * d * bpe);
+        for (size_t i = 0; i < ref.size(); i++) ref[i] = (uint8_t)((i >> 3) * 43 + i);
+        std::vector<uint8_t> tiled((size_t)d * 65536, 0);
+        CHECK(tile_volume(tiled.data(), tiled.size(), ref.data(), w, h, d, M, bpe),
+              "one 128x64 8-B block per volume slice tiles successfully");
+        auto at3 = [&](uint32_t x, uint32_t y, uint32_t z) {
+            return &ref[(((size_t)z * h + y) * w + x) * bpe];
+        };
+        CHECK(std::memcmp(&tiled[(size_t)1 * 65536 + 2048], at3(0,0,1), bpe) == 0,
+              "64KB_R_X 3D golden: z0 maps to byte-offset bit 11");
+        CHECK(std::memcmp(&tiled[(size_t)2 * 65536 + 1024], at3(0,0,2), bpe) == 0,
+              "64KB_R_X 3D golden: z1 maps to byte-offset bit 10");
+        CHECK(std::memcmp(&tiled[(size_t)4 * 65536 + 512], at3(0,0,4), bpe) == 0,
+              "64KB_R_X 3D golden: z2 maps to byte-offset bit 9");
+        CHECK(std::memcmp(&tiled[(size_t)8 * 65536 + 256], at3(0,0,8), bpe) == 0,
+              "64KB_R_X 3D golden: z3 maps to byte-offset bit 8");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

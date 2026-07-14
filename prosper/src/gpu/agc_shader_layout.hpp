@@ -115,7 +115,7 @@ DecodedBufferDescriptor decode_buffer_descriptor(const uint32_t v[4]);
 // in unified guest memory. `tile_mode` 0 = linear (no detiling needed); non-zero = GPU-tiled.
 struct DecodedImageDescriptor {
     uint64_t base = 0;
-    uint32_t width = 0, height = 0;
+    uint32_t width = 0, height = 0, depth = 1;
     uint32_t format = 0;      // Gen5 surface-format enum (fields[1] bits 20..28)
     uint32_t tile_mode = 0;   // 0 = linear
     uint8_t  type = 0;        // SQ_RSRC_IMG dim (GFX10: 8=1D, 9=2D, 10=3D, 11=CUBE, 12=1D_ARRAY, 13=2D_ARRAY).

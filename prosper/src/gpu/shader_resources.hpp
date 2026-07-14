@@ -52,6 +52,10 @@ uint32_t data_format_bytes(DataFormat f);
 // convert a sampled Float16 surface to the RGBA8 the backend uploads (#290). Pure + testable.
 float half_to_float(uint16_t h);
 
+// IEEE-754 binary32 -> binary16, round-to-nearest-even. This is the inverse conversion needed when
+// a format-free storage-image write targets an R16_FLOAT/R16G16B16A16_FLOAT guest surface.
+uint16_t float_to_half(float f);
+
 // Unsigned small-float components of a packed Float10_11_11 texel (#294). Both share binary16's
 // 5-bit exponent (bias 15) with a shortened mantissa (6 bits for the 11-bit R/G, 5 for the 10-bit B)
 // and NO sign bit — so a left-shift of the mantissa into a half's 10-bit field is an exact
@@ -106,13 +110,14 @@ struct ShaderResource {
     uint32_t      fetch_pc      = 0xFFFFFFFFu;
 
     // Texture-only (cls == Texture). img_dim mirrors the MIMG dim field (1D=0, 2D=1, 3D=2, ...).
-    // width/height are for image_load/texelFetch + unnormalized addressing (unused by normalized
-    // image_sample). sampler_sgpr_base = the paired sampler's S# base SGPR (SSAMP); with a Vulkan
+    // width/height/depth are the complete base-level extent (depth is >1 for 3D only), used by image
+    // queries, uploads, and image_load/texelFetch. sampler_sgpr_base = the paired sampler's S# base SGPR (SSAMP); with a Vulkan
     // COMBINED_IMAGE_SAMPLER the sampler is baked into the same `binding`, so this is provenance for a
     // future image/sampler split.
     uint32_t      img_dim           = 1;
     uint32_t      width             = 0;
     uint32_t      height            = 0;
+    uint32_t      depth             = 1;
     uint32_t      tile_mode         = 0;                  // T# GFX10 TileMode; drives auto-detile of a sampled surface
     bool          srgb              = false;              // T# is a gamma-encoded (sRGB) surface — sample with sRGB->linear (#263)
     uint32_t      sampler_sgpr_base = 0xFFFFFFFFu;
