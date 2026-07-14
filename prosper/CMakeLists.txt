@@ -43,6 +43,11 @@ endif()
 
 # --- tests (agentic-first: self-checking, exit-code = truth) -------------
 enable_testing()
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME re_xref_decoder
+           COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/re/test_xref.py")
+endif()
 # Path to the (gitignored) local game dump; override with -DGAME_DUMP=...
 set(GAME_DUMP "${CMAKE_SOURCE_DIR}/../PPSA24651-app0" CACHE PATH "Local PS5 game dump root")
 set(HAVE_GAME_DUMP OFF)

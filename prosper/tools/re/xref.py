@@ -3,7 +3,8 @@
 #
 # PS5 eboot/PRX code is position-independent: internal references appear as
 #   - direct calls          e8 <rel32>
-#   - rip-relative lea/mov   REX.W/REX.WR  8d|8b  modrm(rip)  <disp32>
+#   - rip-relative load/store REX.W/REX.WR 8d|8b|89 modrm(rip) <disp32>
+#   - indirect call/jump     ff /2|/4 modrm(rip) <disp32>
 #   - data pointers          absolute pointers stored in data, emitted as
 #                            R_X86_64_RELATIVE relocations (DT_RELA / DT_SCE_RELA)
 # so "grep for who references address X" is not a text search — it needs all three
@@ -69,7 +70,7 @@ class Module:
     def _build(self):
         raw = self.raw
         self.data_xref = defaultdict(list)   # target VA -> [site VAs] (relocated data pointers)
-        self.code_xref = defaultdict(list)   # target VA -> [(site VA, kind)]  kind in {call, lea, mov}
+        self.code_xref = defaultdict(list)   # target VA -> [(site VA, kind)]
         # --- relocations (standard DT_RELA + Sony DT_SCE_RELA) ---
         if self.dyn_va:
             o = self.foff(self.dyn_va)
@@ -86,7 +87,7 @@ class Module:
                         r_off, r_info, r_add = struct.unpack_from('<QQq', raw, base + i * 24)
                         if (r_info & 0xffffffff) == 8:   # R_X86_64_RELATIVE: target VA = addend
                             self.data_xref[r_add].append(r_off)
-        # --- code scan: rip-relative lea/mov (REX.W 0x48 and REX.WR 0x4c) + e8 calls ---
+        # --- code scan: direct calls, RIP-relative data accesses, and calls/jumps through slots ---
         for v, o, fs, fl in self.segs:
             if not (fl & 1):
                 continue
@@ -94,10 +95,17 @@ class Module:
             n = len(d)
             for i in range(n - 7):
                 b = d[i]
-                if b in (0x48, 0x4c) and d[i + 1] in (0x8d, 0x8b) and d[i + 2] in MODRM_RIP:
+                if b in (0x48, 0x4c) and d[i + 1] in (0x8d, 0x8b, 0x89) and d[i + 2] in MODRM_RIP:
                     disp = struct.unpack_from('<i', d, i + 3)[0]
                     site = v + i
-                    self.code_xref[site + 7 + disp].append((site, 'lea' if d[i + 1] == 0x8d else 'mov'))
+                    kind = {0x8d: 'lea', 0x8b: 'load', 0x89: 'store'}[d[i + 1]]
+                    self.code_xref[site + 7 + disp].append((site, kind))
+                elif b == 0xff and i + 5 < n and (d[i + 1] & 0xc7) == 0x05:
+                    reg = (d[i + 1] >> 3) & 7
+                    if reg in (2, 4):
+                        disp = struct.unpack_from('<i', d, i + 2)[0]
+                        site = v + i
+                        self.code_xref[site + 6 + disp].append((site, 'call*' if reg == 2 else 'jmp*'))
                 elif b == 0xe8:
                     disp = struct.unpack_from('<i', d, i + 1)[0]
                     site = v + i

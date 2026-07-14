@@ -13,7 +13,7 @@
 // module/function set defines the entire HLE surface we must implement.
 //
 // Build: g++ -O2 -std=c++20 self_dump.cpp -o self_dump
-// Usage: self_dump <file.self|eboot.bin|*.prx> [--symbols]
+// Usage: self_dump <file.self|eboot.bin|*.prx> [--symbols] [--find-symbol NID]
 
 #include <cstdio>
 #include <cstdint>
@@ -150,8 +150,22 @@ static const char* dtag_name(int64_t t) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 2) { fprintf(stderr, "usage: %s <file> [--symbols]\n", argv[0]); return 1; }
-    bool dump_syms = (argc >= 3 && strcmp(argv[2], "--symbols") == 0);
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s <file> [--symbols] [--find-symbol NID]\n", argv[0]);
+        return 1;
+    }
+    bool dump_syms = false;
+    std::string find_symbol;
+    for (int i = 2; i < argc; ++i) {
+        if (strcmp(argv[i], "--symbols") == 0) {
+            dump_syms = true;
+        } else if (strcmp(argv[i], "--find-symbol") == 0 && i + 1 < argc) {
+            find_symbol = argv[++i];
+        } else {
+            fprintf(stderr, "usage: %s <file> [--symbols] [--find-symbol NID]\n", argv[0]);
+            return 1;
+        }
+    }
     auto b = read_file(argv[1]);
 
     // -- SELF header --
@@ -321,7 +335,13 @@ int main(int argc, char** argv) {
     auto b64val = [&](const std::string& s) -> int {
         int v = 0; for (char c : s) { const char* p = strchr(B64, c); if (!p) return -1; v = v * 64 + (int)(p - B64); } return v;
     };
-    std::map<std::string, std::set<std::string>> by_lib; // libname -> set of NIDs
+    struct SymbolRec {
+        std::string nid, libname, modname;
+        uint64_t value = 0, size = 0;
+        bool is_import = false;
+    };
+    std::vector<SymbolRec> symbol_recs;
+    std::map<std::string, std::set<std::string>> by_lib; // libname -> set of import NIDs
     size_t nsym = syment ? symtabsz / syment : 0, n_import = 0, n_export = 0;
     for (size_t i = 0; i < nsym && symtab_foff >= 0; i++) {
         auto sym = rd<Elf64_Sym>(b, (size_t)symtab_foff + i * syment);
@@ -332,10 +352,20 @@ int main(int argc, char** argv) {
         auto h2 = s.find('#', h1 + 1);
         std::string nid = s.substr(0, h1);
         std::string libid = (h2 == std::string::npos) ? "" : s.substr(h1 + 1, h2 - h1 - 1);
+        std::string modid = (h2 == std::string::npos) ? "" : s.substr(h2 + 1);
         int lid = b64val(libid);
-        std::string libname = import_libs.count(lid) ? import_libs[lid].name
-                              : export_libs.count(lid) ? export_libs[lid].name : ("lib#" + libid);
         bool is_import = (sym.st_shndx == 0 && sym.st_value == 0);
+        std::string libname;
+        if (is_import && import_libs.count(lid)) libname = import_libs[lid].name;
+        else if (!is_import && export_libs.count(lid)) libname = export_libs[lid].name;
+        else if (import_libs.count(lid)) libname = import_libs[lid].name;
+        else if (export_libs.count(lid)) libname = export_libs[lid].name;
+        else libname = "lib#" + libid;
+        int mid = b64val(modid);
+        std::string modname = !is_import && export_libs.count(lid) ? export_libs[lid].name
+                              : needed_mods.count(mid) ? needed_mods[mid].name
+                              : ("mod#" + modid);
+        symbol_recs.push_back({nid, libname, modname, sym.st_value, sym.st_size, is_import});
         if (is_import) { n_import++; by_lib[libname].insert(nid); }
         else n_export++;
     }
@@ -344,6 +374,33 @@ int main(int argc, char** argv) {
     for (auto& [lib, nids] : by_lib) {
         printf("  %-32s %zu functions\n", lib.c_str(), nids.size());
         if (dump_syms) for (auto& n : nids) printf("       %s\n", n.c_str());
+    }
+
+    if (dump_syms) {
+        printf("\n[EXPORTS]\n");
+        for (const auto& sym : symbol_recs) {
+            if (sym.is_import) continue;
+            printf("  0x%09llx size=0x%-8llx %-11s  %s::%s\n",
+                   (unsigned long long)sym.value, (unsigned long long)sym.size,
+                   sym.nid.c_str(), sym.modname.c_str(), sym.libname.c_str());
+        }
+    }
+
+    if (!find_symbol.empty()) {
+        size_t found = 0;
+        printf("\n[SYMBOL QUERY] %s\n", find_symbol.c_str());
+        for (const auto& sym : symbol_recs) {
+            if (sym.nid != find_symbol) continue;
+            ++found;
+            printf("  %-6s value=0x%09llx size=0x%llx  %s::%s\n",
+                   sym.is_import ? "IMPORT" : "EXPORT",
+                   (unsigned long long)sym.value, (unsigned long long)sym.size,
+                   sym.modname.c_str(), sym.libname.c_str());
+        }
+        if (!found) {
+            printf("  not found\n");
+            return 2;
+        }
     }
     return 0;
 }
