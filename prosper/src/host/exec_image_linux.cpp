@@ -1758,7 +1758,7 @@ namespace {
     // [rsp+16]=arg8, [rsp+24]=arg9). The saved r11 plus an 8-byte pad remain behind those arguments.
     // Alignment: entry rsp is 8 mod 16; five qwords of storage make the call site 0 mod 16 and the
     // handler entry 8 mod 16. Keep offsets/magic in sync with guest_tls.cpp.
-    void emit_swap_stub(uint8_t* p, uint32_t idx, uint64_t fn, bool unimpl) {
+    size_t emit_swap_stub(uint8_t* p, uint32_t idx, uint64_t fn, bool unimpl) {
         uint8_t* s = p;
         auto mid = [&](uint8_t*& q) {   // per-variant: unimpl loads its slot index into edi first
             if (unimpl) { *q++ = 0xBF; memcpy(q, &idx, 4); q += 4; }         // mov edi, idx
@@ -1769,10 +1769,10 @@ namespace {
         *p++=0x41; *p++=0x81; *p++=0xBB; uint32_t mo=0x108; memcpy(p,&mo,4); p+=4;
         uint32_t magic=0x50524F53u; memcpy(p,&magic,4); p+=4;
         *p++=0x75; uint8_t* jne_rel = p++;                                  // jne rel8 (patched below)
-        // .guest: push r11 ; sub rsp,8 ; push [rsp+0x28] (arg9/8/7) x3 ; mov rax,[r11+0x100] ;
+        // .guest: push r11 ; push rax (alignment pad) ; push [rsp+0x28] (arg9/8/7) x3 ; mov rax,[r11+0x100] ;
         //         wrfsbase rax ; <mid> ; call rax ; add rsp,0x20 ; pop r11 ; wrfsbase r11 ; ret
         *p++=0x41; *p++=0x53;
-        *p++=0x48; *p++=0x83; *p++=0xEC; *p++=0x08;                         // sub rsp,8 (alignment pad)
+        *p++=0x50;                                                          // push rax (alignment pad)
         *p++=0xFF; *p++=0x74; *p++=0x24; *p++=0x28;                         // push original arg9
         *p++=0xFF; *p++=0x74; *p++=0x24; *p++=0x28;                         // push original arg8
         *p++=0xFF; *p++=0x74; *p++=0x24; *p++=0x28;                         // push original arg7
@@ -1788,10 +1788,10 @@ namespace {
         *jne_rel = (uint8_t)(p - (jne_rel + 1));
         mid(p);
         *p++=0xFF; *p++=0xE0;                                               // jmp rax
-        (void)s;
+        return static_cast<size_t>(p - s);
     }
-    void emit_impl_swap(uint8_t* p, uint64_t fn)              { emit_swap_stub(p, 0,   fn, false); }
-    void emit_unimpl_swap(uint8_t* p, uint32_t idx, uint64_t fn) { emit_swap_stub(p, idx, fn, true); }
+    size_t emit_impl_swap(uint8_t* p, uint64_t fn)                 { return emit_swap_stub(p, 0,   fn, false); }
+    size_t emit_unimpl_swap(uint8_t* p, uint32_t idx, uint64_t fn) { return emit_swap_stub(p, idx, fn, true); }
 }
 
 bool map_image(const LoadedImage& img, std::string* err) {
@@ -1838,9 +1838,11 @@ bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
     for (uint64_t i = 0; i < n; i++) {
         uint8_t* slot = base + i * stub_size;
         HleFn fn = Hle::lookup(slots[i].nid);
-        if (fn) { if (swap) emit_impl_swap(slot, (uint64_t)fn);       else emit_impl(slot, (uint64_t)fn); }
-        else    { if (swap) emit_unimpl_swap(slot, (uint32_t)i, (uint64_t)&prosper_on_unimpl);
+        size_t emitted = 0;
+        if (fn) { if (swap) emitted = emit_impl_swap(slot, (uint64_t)fn); else emit_impl(slot, (uint64_t)fn); }
+        else    { if (swap) emitted = emit_unimpl_swap(slot, (uint32_t)i, (uint64_t)&prosper_on_unimpl);
                   else      emit_unimpl(slot, (uint32_t)i, (uint64_t)&prosper_on_unimpl); }
+        if (emitted > stub_size) return fail("generated guest-%fs swap stub exceeds stub_size");
     }
     g_stub_base = stub_base; g_stub_size = stub_size; g_nstubs = n;
     // PROSPER_STUBDUMP: dump the stub table (index, guest offset from stub_base, lib::nid + resolved name).

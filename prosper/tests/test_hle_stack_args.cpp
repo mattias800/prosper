@@ -92,9 +92,18 @@ int main(int argc, char** argv) {
     constexpr const char* kNid = "test.hle.stack.args";
     Hle::register_fn(kNid, reinterpret_cast<HleFn>(&prosper_test_hle9_entry),
                      "prosper_test_hle9_entry");
-    const std::vector<ImportSlot> slots = {{"test", kNid}};
+    // Keep an unresolved import immediately before the implemented one. The largest Linux guest-FS
+    // variant is the unresolved stub; it must fit its fixed 96-byte slot without corrupting its
+    // neighbour.
+    const std::vector<ImportSlot> slots = {{"test", "test.hle.unimplemented"}, {"test", kNid}};
     std::string err;
-    CHECK(install_stubs(slots, 0x710000000ull, 96, &err), "generated one executable import stub");
+    CHECK(install_stubs(slots, 0x710000000ull, 96, &err), "generated adjacent unresolved and executable import stubs");
+#if defined(__linux__)
+    if (guest_fs) {
+        const auto* second = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(stub_addr(1)));
+        CHECK(second[0] == 0xF3, "unresolved guest-FS stub stayed within its 96-byte slot");
+    }
+#endif
     if (fails) {
         if (!err.empty()) std::printf("  install error: %s\n", err.c_str());
         return 1;
@@ -107,7 +116,7 @@ int main(int argc, char** argv) {
     if (guest_fs) guest_fs_active = guest_tls_activate_thread() != 0;
 #endif
 
-    auto call = reinterpret_cast<GuestHle9>(static_cast<uintptr_t>(stub_addr(0)));
+    auto call = reinterpret_cast<GuestHle9>(static_cast<uintptr_t>(stub_addr(1)));
     const uint64_t result = call(kArgs[0], kArgs[1], kArgs[2], kArgs[3], kArgs[4],
                                  kArgs[5], kArgs[6], kArgs[7], kArgs[8]);
 
