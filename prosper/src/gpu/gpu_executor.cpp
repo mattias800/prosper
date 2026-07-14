@@ -12,10 +12,13 @@
 #include "rdna2_decode.hpp"       // rdna2_walk (for the vertex-fetch const-eval)
 #include "rdna2_to_spirv.hpp"     // recompile_compute
 #include "writer_provenance.hpp"
+#include <chrono>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <iterator>
+#include <mutex>
 #include <set>
 #include <vector>
 #include <unordered_map>
@@ -53,6 +56,213 @@ void read_user_sgprs(const std::unordered_map<uint32_t, uint32_t>& sh, uint32_t 
 // envs. Set (and cleared) by realize_draw_item's failure replay — the submit path is serialized
 // by the HLE submit mutex, so a plain global is safe there.
 bool g_dyntrace_force = false;
+
+namespace {
+
+struct ShaderResourceCompileKey {
+    uint32_t cls = 0;
+    uint32_t format = 0;
+    uint32_t num_components = 0;
+    uint32_t binding = 0;
+    uint32_t stride = 0;
+    uint32_t srt_offset = 0;
+    uint32_t sgpr_base = 0;
+    uint32_t fetch_pc = 0;
+
+    bool operator==(const ShaderResourceCompileKey&) const = default;
+};
+
+struct ShaderCompileKey {
+    ShaderProgramStage stage = ShaderProgramStage::Vertex;
+    bool has_resource_table = false;
+    bool force_position_w = false;
+    std::vector<uint32_t> code;
+    std::vector<ShaderResourceCompileKey> resources;
+
+    bool operator==(const ShaderCompileKey&) const = default;
+};
+
+static uint64_t hash_mix(uint64_t hash, uint64_t value) {
+    // FNV-1a over fixed-width values. Equality still compares the full key, so collisions are benign.
+    for (unsigned i = 0; i < 8; ++i) {
+        hash ^= static_cast<uint8_t>(value >> (i * 8));
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+struct ShaderCompileKeyHash {
+    size_t operator()(const ShaderCompileKey& key) const {
+        uint64_t hash = 1469598103934665603ull;
+        hash = hash_mix(hash, static_cast<uint32_t>(key.stage));
+        hash = hash_mix(hash, key.has_resource_table);
+        hash = hash_mix(hash, key.force_position_w);
+        hash = hash_mix(hash, key.code.size());
+        for (uint32_t word : key.code) hash = hash_mix(hash, word);
+        hash = hash_mix(hash, key.resources.size());
+        for (const auto& resource : key.resources) {
+            hash = hash_mix(hash, resource.cls);
+            hash = hash_mix(hash, resource.format);
+            hash = hash_mix(hash, resource.num_components);
+            hash = hash_mix(hash, resource.binding);
+            hash = hash_mix(hash, resource.stride);
+            hash = hash_mix(hash, resource.srt_offset);
+            hash = hash_mix(hash, resource.sgpr_base);
+            hash = hash_mix(hash, resource.fetch_pc);
+        }
+        return static_cast<size_t>(hash);
+    }
+};
+
+struct CachedShader {
+    std::vector<uint32_t> spirv;
+    uint64_t last_use = 0;
+    uint64_t bytes = 0;
+};
+
+struct ShaderCache {
+    std::mutex mutex;
+    std::unordered_map<ShaderCompileKey, CachedShader, ShaderCompileKeyHash> entries;
+    ShaderRecompileCacheStats stats;
+    uint64_t use_counter = 0;
+};
+
+ShaderCache& shader_cache() {
+    static ShaderCache cache;
+    return cache;
+}
+
+uint64_t shader_cache_limit_bytes() {
+    constexpr uint64_t default_bytes = 128ull * 1024 * 1024;
+    const char* value = getenv("PROSPER_SHADER_CACHE_MB");
+    if (!value || !*value) return default_bytes;
+    char* end = nullptr;
+    const unsigned long long mib = strtoull(value, &end, 10);
+    if (end == value || *end != '\0') return default_bytes;
+    return std::min<uint64_t>(mib, 4096ull) * 1024 * 1024;
+}
+
+uint64_t shader_cache_entry_bytes(const ShaderCompileKey& key, const std::vector<uint32_t>& spirv) {
+    return static_cast<uint64_t>(key.code.size()) * sizeof(uint32_t) +
+           static_cast<uint64_t>(key.resources.size()) * sizeof(ShaderResourceCompileKey) +
+           static_cast<uint64_t>(spirv.size()) * sizeof(uint32_t);
+}
+
+ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_t* code, size_t dwords,
+                                         const ShaderResourceTable* resources) {
+    ShaderCompileKey key;
+    key.stage = stage;
+    key.has_resource_table = resources != nullptr;
+    key.force_position_w = getenv("PROSPER_FORCE_W") != nullptr;
+    if (code && dwords) {
+        std::vector<Rdna2Inst> instructions;
+        const size_t consumed = rdna2_walk(code, dwords, instructions);
+        key.code.assign(code, code + consumed);
+    }
+    if (resources) {
+        key.resources.reserve(resources->resources.size());
+        for (const auto& resource : resources->resources) {
+            key.resources.push_back({
+                static_cast<uint32_t>(resource.cls), static_cast<uint32_t>(resource.format),
+                resource.num_components, resource.binding, resource.stride,
+                resource.srt_offset, resource.sgpr_base, resource.fetch_pc,
+            });
+        }
+    }
+    return key;
+}
+
+std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const ShaderCompileKey& key,
+                                              const ShaderResourceTable* resources) {
+    const uint32_t* code = key.code.empty() ? nullptr : key.code.data();
+    if (stage == ShaderProgramStage::Vertex)
+        return recompile_vertex(code, key.code.size(), resources);
+    if (stage == ShaderProgramStage::Fragment)
+        return recompile_fragment(code, key.code.size(), resources);
+    return {};
+}
+
+} // namespace
+
+std::vector<uint32_t> recompile_graphics_shader_cached(ShaderProgramStage stage,
+                                                       const uint32_t* code, size_t dwords,
+                                                       const ShaderResourceTable* resources) {
+    ShaderCompileKey key = make_shader_compile_key(stage, code, dwords, resources);
+    if (getenv("PROSPER_NO_SHADER_CACHE")) {
+        auto& cache = shader_cache();
+        {
+            std::lock_guard lock(cache.mutex);
+            ++cache.stats.bypasses;
+        }
+        return compile_graphics_shader(stage, key, resources);
+    }
+
+    auto& cache = shader_cache();
+    std::lock_guard lock(cache.mutex);
+    auto found = cache.entries.find(key);
+    if (found != cache.entries.end()) {
+        ++cache.stats.hits;
+        found->second.last_use = ++cache.use_counter;
+        return found->second.spirv;
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    std::vector<uint32_t> spirv = compile_graphics_shader(stage, key, resources);
+    const auto end = std::chrono::steady_clock::now();
+    ++cache.stats.misses;
+    cache.stats.compile_ms += std::chrono::duration<double, std::milli>(end - start).count();
+
+    constexpr size_t max_entries = 4096;
+    const uint64_t bytes = shader_cache_entry_bytes(key, spirv);
+    const uint64_t limit = shader_cache_limit_bytes();
+    while (!cache.entries.empty() &&
+           (cache.entries.size() >= max_entries || cache.stats.bytes + bytes > limit)) {
+        auto oldest = cache.entries.begin();
+        for (auto it = std::next(cache.entries.begin()); it != cache.entries.end(); ++it)
+            if (it->second.last_use < oldest->second.last_use) oldest = it;
+        cache.stats.bytes -= oldest->second.bytes;
+        cache.entries.erase(oldest);
+        ++cache.stats.evictions;
+    }
+    if (bytes <= limit && max_entries != 0) {
+        CachedShader value;
+        value.spirv = spirv;
+        value.last_use = ++cache.use_counter;
+        value.bytes = bytes;
+        cache.stats.bytes += bytes;
+        cache.entries.emplace(std::move(key), std::move(value));
+    }
+    cache.stats.entries = cache.entries.size();
+    return spirv;
+}
+
+ShaderRecompileCacheStats shader_recompile_cache_stats() {
+    auto& cache = shader_cache();
+    std::lock_guard lock(cache.mutex);
+    ShaderRecompileCacheStats result = cache.stats;
+    result.entries = cache.entries.size();
+    return result;
+}
+
+void clear_shader_recompile_cache() {
+    auto& cache = shader_cache();
+    std::lock_guard lock(cache.mutex);
+    cache.entries.clear();
+    cache.stats = {};
+    cache.use_counter = 0;
+}
+
+thread_local DrawRealizationPhaseStats g_draw_realization_phases;
+
+void record_draw_realization_phases(double table_ms, double shader_ms) {
+    ++g_draw_realization_phases.draws;
+    g_draw_realization_phases.table_ms += table_ms;
+    g_draw_realization_phases.shader_ms += shader_ms;
+}
+
+DrawRealizationPhaseStats draw_realization_phase_stats() {
+    return g_draw_realization_phases;
+}
 
 // Readability probe (guest memory is 1:1-mapped, but a mis-decoded address could be unmapped),
 // so guarded derefs on the render/submit thread don't risk a SIGSEGV. NOTE: /dev/null does NOT
@@ -611,7 +821,8 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
         uint32_t sgprs[kUserSgprs]; read_user_sgprs(st.sh, bases[0] + range_start, sgprs);
         // NGG merged VS/GS: s0..s7 are system SGPRs, user data starts at s8 (confirmed by matching the
         // shader's s[8:11]/s[24:25] descriptor pointers to the register file at GS_0+offset).
-        dyn_vb = resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, 0x4000, sgprs, kUserSgprs, 8, &srt_uses);
+        dyn_vb = resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, 0x4000,
+                                       sgprs, kUserSgprs, 8, &srt_uses);
         if (getenv("PROSPER_GFXLOG") || getenv("PROSPER_RESDUMP")) {
             fprintf(stderr, "[dynvb] VS resolved %zu dynamic vertex-fetch descriptor(s):\n", dyn_vb.size());
             for (auto& kv : dyn_vb) {
@@ -1541,16 +1752,32 @@ bool execute_compute_items(const std::vector<ComputeItem>& items) {
 bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t height,
                                  uint64_t submit_no) {
     if ((!g_live && !g_compute) || (st.draws.empty() && st.dispatches.empty())) return false;
+    using TimingClock = std::chrono::steady_clock;
+    const bool timing_enabled = std::getenv("PROSPER_RENDER_TIMING") != nullptr;
+    const auto timing_start = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
+    const ShaderRecompileCacheStats shader_before = timing_enabled
+        ? shader_recompile_cache_stats() : ShaderRecompileCacheStats{};
+    const DrawRealizationPhaseStats phases_before = timing_enabled
+        ? draw_realization_phase_stats() : DrawRealizationPhaseStats{};
     uint32_t fw = present_width(), fh = present_height();
     float sx = fw ? (float)width / (float)fw : 1.0f;
     float sy = fh ? (float)height / (float)fh : 1.0f;
     std::vector<DrawItem> draws = g_live && width && height
         ? realize_gpustate_draws(st, 0x10000, sx, sy) : std::vector<DrawItem>{};
+    const ShaderRecompileCacheStats shader_after = timing_enabled
+        ? shader_recompile_cache_stats() : ShaderRecompileCacheStats{};
+    const DrawRealizationPhaseStats phases_after = timing_enabled
+        ? draw_realization_phase_stats() : DrawRealizationPhaseStats{};
+    const auto timing_draws_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     std::vector<ComputeItem> computes = g_compute
         ? realize_compute_dispatches(st, submit_no) : std::vector<ComputeItem>{};
+    const auto timing_compute_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
 
+    auto operations = plan_submit_operations(st);
+    const auto timing_plan_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     OrderedSubmitResult result = execute_ordered_items(
-        plan_submit_operations(st), draws, computes, g_live, g_compute, width, height);
+        operations, draws, computes, g_live, g_compute, width, height);
+    const auto timing_backend_done = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     std::vector<uint8_t>& px = result.pixels;
 
     if (!draws.empty()) {
@@ -1561,9 +1788,74 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
                 std::fprintf(stderr, "[gpucap] write failed: %s\n", error.c_str());
         }
     }
-    if (px.size() != static_cast<size_t>(width) * height * 4) return false;
-    present_write_frame(px.data(), width, height);
-    return true;
+    const bool presented = px.size() == static_cast<size_t>(width) * height * 4;
+    if (presented) present_write_frame(px.data(), width, height);
+    if (timing_enabled) {
+        const auto timing_done = TimingClock::now();
+        auto ms = [](auto begin, auto end) {
+            return std::chrono::duration<double, std::milli>(end - begin).count();
+        };
+        struct TimingTotals {
+            uint64_t submits = 0, draws = 0, dispatches = 0, render_spans = 0;
+            uint64_t shader_hits = 0, shader_misses = 0, shader_bypasses = 0;
+            double realize_draws = 0, realize_compute = 0, plan = 0, backend = 0, publish = 0;
+            double table_build = 0, shader_lookup = 0, shader_compile = 0;
+        };
+        static TimingTotals totals;
+        static TimingTotals window;
+        auto accumulate = [&](TimingTotals& timing) {
+            timing.submits++;
+            timing.draws += draws.size();
+            timing.dispatches += computes.size();
+            timing.render_spans += result.render_spans;
+            timing.shader_hits += shader_after.hits - shader_before.hits;
+            timing.shader_misses += shader_after.misses - shader_before.misses;
+            timing.shader_bypasses += shader_after.bypasses - shader_before.bypasses;
+            timing.realize_draws += ms(timing_start, timing_draws_ready);
+            timing.realize_compute += ms(timing_draws_ready, timing_compute_ready);
+            timing.plan += ms(timing_compute_ready, timing_plan_ready);
+            timing.backend += ms(timing_plan_ready, timing_backend_done);
+            timing.publish += ms(timing_backend_done, timing_done);
+            timing.table_build += phases_after.table_ms - phases_before.table_ms;
+            timing.shader_lookup += phases_after.shader_ms - phases_before.shader_ms;
+            timing.shader_compile += shader_after.compile_ms - shader_before.compile_ms;
+        };
+        accumulate(totals);
+        accumulate(window);
+        if (totals.submits % 25 == 0) {
+            const double n = static_cast<double>(totals.submits);
+            const double total = totals.realize_draws + totals.realize_compute + totals.plan +
+                                 totals.backend + totals.publish;
+            std::fprintf(stderr,
+                         "[render-timing] submits=%llu draws=%llu dispatches=%llu spans=%llu "
+                         "avg_ms: total=%.2f "
+                         "realize_draws=%.2f realize_compute=%.2f plan=%.2f backend=%.2f publish=%.2f\n",
+                         (unsigned long long)totals.submits, (unsigned long long)totals.draws,
+                         (unsigned long long)totals.dispatches,
+                         (unsigned long long)totals.render_spans, total / n,
+                         totals.realize_draws / n, totals.realize_compute / n, totals.plan / n,
+                         totals.backend / n, totals.publish / n);
+            const double wn = static_cast<double>(window.submits);
+            const double window_total = window.realize_draws + window.realize_compute + window.plan +
+                                        window.backend + window.publish;
+            std::fprintf(stderr,
+                         "[render-window] submits=%llu avg_items: draws=%.1f dispatches=%.1f "
+                         "spans=%.1f shaders: hit=%.1f miss=%.1f bypass=%.1f "
+                         "avg_ms: total=%.2f realize_draws=%.2f tables=%.2f shader_lookup=%.2f "
+                         "shader_compile=%.2f "
+                         "realize_compute=%.2f plan=%.2f backend=%.2f publish=%.2f\n",
+                         (unsigned long long)window.submits, window.draws / wn,
+                         window.dispatches / wn, window.render_spans / wn,
+                         window.shader_hits / wn, window.shader_misses / wn,
+                         window.shader_bypasses / wn, window_total / wn,
+                         window.realize_draws / wn, window.table_build / wn,
+                         window.shader_lookup / wn, window.shader_compile / wn,
+                         window.realize_compute / wn, window.plan / wn, window.backend / wn,
+                         window.publish / wn);
+            window = {};
+        }
+    }
+    return presented;
 }
 
 bool execute_and_present(const GpuState& st, uint32_t width, uint32_t height) {

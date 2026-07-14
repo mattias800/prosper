@@ -86,12 +86,39 @@ inline uint32_t sw4kb_morton(uint32_t ix, uint32_t iy, uint32_t bx, uint32_t by)
     }
     return m;
 }
-// Element (x,y) -> its linear element INDEX in the tiled surface: tiles laid out row-major over the
-// padded pitch, sw4kb_morton within a tile.
-inline uint64_t sw4kb_index(uint32_t x, uint32_t y, uint32_t tiles_per_row, uint32_t bx, uint32_t by) {
-    uint32_t tw = 1u << bx, th = 1u << by;
-    uint32_t tx = x >> bx, ty = y >> by, ix = x & (tw - 1), iy = y & (th - 1);
-    return (uint64_t)(ty * tiles_per_row + tx) * ((uint64_t)tw * th) + sw4kb_morton(ix, iy, bx, by);
+
+struct Sw4kbLookup {
+    uint32_t bx = 0, by = 0, tw = 0, th = 0;
+    std::vector<uint16_t> byte_offsets;
+};
+
+Sw4kbLookup make_sw4kb_lookup(uint32_t bpe) {
+    Sw4kbLookup lookup;
+    sw4kb_dims(bpe, lookup.bx, lookup.by);
+    lookup.tw = 1u << lookup.bx;
+    lookup.th = 1u << lookup.by;
+    lookup.byte_offsets.resize(static_cast<size_t>(lookup.tw) * lookup.th);
+    for (uint32_t y = 0; y < lookup.th; ++y)
+        for (uint32_t x = 0; x < lookup.tw; ++x)
+            lookup.byte_offsets[static_cast<size_t>(y) * lookup.tw + x] =
+                static_cast<uint16_t>(sw4kb_morton(x, y, lookup.bx, lookup.by) * bpe);
+    return lookup;
+}
+
+const Sw4kbLookup& sw4kb_lookup(uint32_t bpe) {
+    static const Sw4kbLookup b1 = make_sw4kb_lookup(1);
+    static const Sw4kbLookup b2 = make_sw4kb_lookup(2);
+    static const Sw4kbLookup b4 = make_sw4kb_lookup(4);
+    static const Sw4kbLookup b8 = make_sw4kb_lookup(8);
+    static const Sw4kbLookup b16 = make_sw4kb_lookup(16);
+    switch (bpe) {
+        case 1: return b1;
+        case 2: return b2;
+        case 4: return b4;
+        case 8: return b8;
+        case 16: return b16;
+        default: return b1;
+    }
 }
 
 // The single tiled<->linear walk every public function shares: per element, the tiled offset
@@ -101,17 +128,35 @@ inline uint64_t sw4kb_index(uint32_t x, uint32_t y, uint32_t tiles_per_row, uint
 template <bool ToTiled>
 void sw4kb_copy(uint8_t* dst, const uint8_t* src, uint32_t ew, uint32_t eh, uint32_t pitch,
                 uint32_t bpe, size_t tiled_bytes) {
-    uint32_t bx = 0, by = 0; sw4kb_dims(bpe, bx, by);
+    const Sw4kbLookup& lookup = sw4kb_lookup(bpe);
     uint32_t pw = pitch ? pitch : ew;
-    uint32_t tiles_per_row = (pw + (1u << bx) - 1) >> bx;
-    for (uint32_t y = 0; y < eh; y++)
-        for (uint32_t x = 0; x < ew; x++) {
-            uint64_t t = sw4kb_index(x, y, tiles_per_row, bx, by) * bpe;   // tiled offset
-            size_t   l = ((size_t)y * ew + x) * bpe;                       // linear offset
-            if (ToTiled) { if (t + bpe <= tiled_bytes) std::memcpy(dst + t, src + l, bpe); }
-            else         { if (t + bpe <= tiled_bytes) std::memcpy(dst + l, src + t, bpe);
-                           else                        std::memset(dst + l, 0, bpe); }
+    uint32_t tiles_per_row = (pw + lookup.tw - 1) / lookup.tw;
+    uint32_t surface_tile_rows = (eh + lookup.th - 1) / lookup.th;
+    uint32_t surface_tile_cols = (ew + lookup.tw - 1) / lookup.tw;
+    for (uint32_t ty = 0; ty < surface_tile_rows; ++ty) {
+        const uint32_t rows = std::min(lookup.th, eh - ty * lookup.th);
+        for (uint32_t tx = 0; tx < surface_tile_cols; ++tx) {
+            const uint32_t columns = std::min(lookup.tw, ew - tx * lookup.tw);
+            const size_t tile_base = static_cast<size_t>(ty * tiles_per_row + tx) * 4096;
+            for (uint32_t iy = 0; iy < rows; ++iy) {
+                const size_t linear_base =
+                    (static_cast<size_t>(ty * lookup.th + iy) * ew + tx * lookup.tw) * bpe;
+                const uint16_t* offsets =
+                    lookup.byte_offsets.data() + static_cast<size_t>(iy) * lookup.tw;
+                for (uint32_t ix = 0; ix < columns; ++ix) {
+                    const size_t tiled = tile_base + offsets[ix];
+                    const size_t linear = linear_base + static_cast<size_t>(ix) * bpe;
+                    if (ToTiled) {
+                        if (tiled + bpe <= tiled_bytes) std::memcpy(dst + tiled, src + linear, bpe);
+                    } else if (tiled + bpe <= tiled_bytes) {
+                        std::memcpy(dst + linear, src + tiled, bpe);
+                    } else {
+                        std::memset(dst + linear, 0, bpe);
+                    }
+                }
+            }
         }
+    }
 }
 
 size_t sw4kb_tiled_bytes(uint32_t ew, uint32_t eh, uint32_t pitch, uint32_t bpe) {

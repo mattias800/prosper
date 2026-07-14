@@ -95,11 +95,14 @@ The core keeps its existing headless render device. Frames cross the boundary as
   the renderer, no `#ifdef`, headless + CI identical.
 - The seam already emits CPU pixels, so the frontend is a pure consumer — the cleanest boundary, and
   the same seam becomes a shared-memory frame ring if the two are ever split into separate processes.
-- Cost = one readback + one upload per frame. The Messenger is 2D at 1080p (~8 MB/frame) — negligible.
+- Cost = one readback + one upload per frame. The Messenger is 2D at 1080p (~8 MB/frame), but native
+  Windows measurements showed that memory-type selection matters: uncached host-visible readback cost
+  roughly 570 ms per frame on an RTX 4090, versus about 1.8 ms with `HOST_CACHED` memory.
 
-**When to revisit:** only if a future 3D-heavy title makes the per-frame copy a real bottleneck. Then
-unify on a single frontend-provided device and share the render target via `VK_KHR_external_memory`
-(zero-copy) — but keep `present_readback` as the abstraction so headless still works. Not now.
+**When to revisit:** direct image presentation remains worthwhile after the renderer stops rebuilding
+pipelines and image/buffer objects per batch. At that point, unify on a single frontend-provided device
+or share the render target via `VK_KHR_external_memory` (zero-copy), while retaining `present_readback`
+for headless tests and screenshot tooling.
 
 ## Present loop (sketch)
 
@@ -154,6 +157,63 @@ For native Windows, configure MinGW with `-DPROSPER_APP=ON -DPROSPER_AUDIO_SDL3=
 ```
 
 The complete manual PowerShell recipe is in `WINDOWS_PORT_HANDOFF.md`.
+
+### Live renderer performance diagnostics
+
+Set `PROSPER_RENDER_TIMING=1` before launching to print aggregate timings every 25 operations:
+
+```powershell
+$env:PROSPER_RENDER_TIMING = '1'
+.\prosper\scripts\run-windows.ps1 .\PPSA24651-app0 -NoBuild
+```
+
+The output separates guest-state realization, ordered graphics/compute execution, CPU resource
+decode/detile, Vulkan target and pipeline setup, upload/recording, GPU fence wait, readback, cleanup,
+and frontend publication. Cumulative `[render-timing]` lines show the whole run; `[render-window]`
+lines show only the latest 25 submits/calls so a scene transition is immediately visible. The core
+window also reports graphics-shader cache hits, misses, bypasses, and actual miss compilation time.
+Use `PROSPER_RENDER_TIMING=detail` to additionally print individual texture decodes taking at least
+0.5 ms (capped at 250 lines). The instrumentation does not take clock samples when the variable is
+unset. This is the first tool to use when the window presents correctly but a title is not interactive;
+do not infer a GPU bottleneck from low FPS without the stage breakdown.
+
+Transient Vulkan memory uses a bounded, exact-requirements pool because every backend call waits for its
+fence before cleanup. Timing output includes `memory_pool` hits, misses, cached allocation count/bytes,
+and budget-driven discards. The default budget is 512 MiB; override it with
+`PROSPER_MEMORY_POOL_MB=<MiB>`, or set `PROSPER_NO_MEMORY_POOL=1` for an A/B run against direct
+`vkAllocateMemory`/`vkFreeMemory`. The pool retains only allocation objects: images, buffers, views,
+descriptors, and their layout/content rules keep their existing per-call lifetimes.
+
+The persistent compute device has the same exact-requirements allocation pool with a separate 256 MiB
+default budget (`PROSPER_COMPUTE_MEMORY_POOL_MB=<MiB>`). `PROSPER_NO_MEMORY_POOL=1` disables both
+graphics and compute pools. Decoded texture scratch vectors are also retained across callbacks; they
+are storage only, and every partial decode/read explicitly clears its unwritten tail.
+
+Within one renderer callback, repeated guest-backed texture descriptions reuse the first decoded
+pixel buffer. This is intentionally callback-local because ordered compute splits graphics into new
+callbacks where guest memory may have changed. Live render-to-texture inputs are never reused through
+this map because an earlier pass can replace their pixels. The rolling frontend timing reports both
+`textures` (texture resource uses) and `reused` (decodes avoided); performed decodes are their
+difference.
+
+Graphics RDNA2-to-SPIR-V results use a process-wide bounded cache (4096 entries and 128 MiB by
+default). Its key contains the shader bytes and only the resource-table fields consumed by compilation;
+current guest addresses and backing data remain on each draw and are never cached. Use
+`PROSPER_NO_SHADER_CACHE=1` for a direct-recompiler A/B run or
+`PROSPER_SHADER_CACHE_MB=<MiB>` to change the byte budget. `test_shader_recompile_cache` compares
+every tested miss byte-for-byte with the direct recompiler and verifies that runtime-only resource
+changes hit while descriptor-interface changes miss.
+
+Do not cache `build_stage_table` results using only shader addresses and user-SGPR values. Descriptor
+tables are reached through guest pointers, and their memory can change while every pointer/register
+value remains identical. That experiment caused Messenger to remain on its initial loading screen and
+was removed after an enabled/disabled A/B test. A future table cache needs explicit guest-memory
+versioning or equivalent invalidation; the `tables=` timing bucket measures this work without caching it.
+
+The current renderer remains a deterministic readback-based implementation. It retains CPU-visible pixels
+for screenshots and temporal RTT composition, so it is not the final zero-copy architecture. Issue #702
+tracks persistent Vulkan resource/pipeline caching and direct image presentation beyond the initial
+readback-memory, detile, compute-context, transient-memory-pool, scratch-reuse, and shader-cache fixes.
 
 WSLg remains a useful alternate path for running the Linux build:
 

@@ -374,6 +374,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_recompile_coverage PRIVATE prosper_core)
   add_test(NAME recompile_coverage COMMAND test_recompile_coverage)
 
+  # Bounded graphics-shader cache: cached modules must match the direct recompiler byte-for-byte.
+  add_executable(test_shader_recompile_cache tests/test_shader_recompile_cache.cpp)
+  target_link_libraries(test_shader_recompile_cache PRIVATE prosper_core)
+  add_test(NAME shader_recompile_cache COMMAND test_shader_recompile_cache)
+
   # RDNA2 shader instruction-stream walker (first stage of the RDNA2->SPIR-V recompiler).
   add_executable(test_rdna2_decode tests/test_rdna2_decode.cpp)
   target_link_libraries(test_rdna2_decode PRIVATE prosper_core)

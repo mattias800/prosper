@@ -180,6 +180,22 @@ PROSPER_GFXLOG=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
   PROSPER_FRAME_DIR=/some/dir ./boot_trace.exe /c/Users/matti/repos/ps5ys/PPSA24651-app0
 ```
 
+Performance diagnostics: set `PROSPER_RENDER_TIMING=1` for aggregate graphics/compute stage timings, or
+`PROSPER_RENDER_TIMING=detail` to include slow individual texture decodes. The output and bucket definitions
+are documented in `FRONTEND_APP.md`; rolling `[render-window]` lines cover the latest 25 operations rather
+than averaging away the current scene. Backend output also reports transient Vulkan memory-pool statistics;
+use `PROSPER_NO_MEMORY_POOL=1` for a direct allocate/free A/B run, or `PROSPER_MEMORY_POOL_MB=<MiB>` to
+override the default 512 MiB graphics budget. Compute allocations use a separate 256 MiB default budget,
+overridable with `PROSPER_COMPUTE_MEMORY_POOL_MB=<MiB>`. Graphics shader translation is cached by shader
+bytes plus descriptor-interface semantics; `PROSPER_NO_SHADER_CACHE=1` disables it for comparison and
+`PROSPER_SHADER_CACHE_MB=<MiB>` overrides its 128 MiB budget. Timing windows report shader hits/misses and
+miss compilation time. Run `test_shader_recompile_cache` after changing the key or recompiler contract.
+Frontend windows also report texture resource uses as `textures` and callback-local duplicate decodes
+avoided as `reused`; their difference is the number of performed decodes. Do not infer descriptor-table
+identity from shader/user-SGPR values alone:
+pointed-to guest memory is mutable, and that cache experiment stalled Messenger at its loading screen.
+See `FRONTEND_APP.md` for the invalidation requirement.
+
 Diagnostics (env, all off by default): `PROSPER_GFXLOG` (`[gfx]`/`[agc]` PM4 decode + the `NOT satisfied`
 fence log), `PROSPER_EVLOG` (`[ev]` equeue/flip/EOP), `PROSPER_SYNCLOG` (`[sync]` WaitOnAddress/Wake with
 tid + validated guest caller, `[sync2]` cond/sema/EventFlag), `PROSPER_EXCLOG` (GC exception

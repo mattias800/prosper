@@ -9,16 +9,69 @@
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <functional>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
 namespace prosper::frontend {
 namespace {
 
 constexpr VkDeviceSize kMaxComputeImageBytes = 256ull << 20;
+
+struct ComputeMemoryKey {
+    VkDeviceSize bytes = 0;
+    uint32_t memory_type = UINT32_MAX;
+    bool operator==(const ComputeMemoryKey& other) const {
+        return bytes == other.bytes && memory_type == other.memory_type;
+    }
+};
+
+struct ComputeMemoryKeyHash {
+    size_t operator()(const ComputeMemoryKey& key) const {
+        return std::hash<uint64_t>{}(static_cast<uint64_t>(key.bytes)) ^
+               (std::hash<uint32_t>{}(key.memory_type) << 1);
+    }
+};
+
+struct ComputeMemoryPool {
+    std::mutex mutex;
+    std::unordered_map<ComputeMemoryKey, std::vector<VkDeviceMemory>, ComputeMemoryKeyHash> available;
+    std::unordered_map<VkDeviceMemory, ComputeMemoryKey> active;
+    VkDeviceSize cached_bytes = 0;
+    size_t cached_allocations = 0;
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t discarded = 0;
+};
+
+struct ComputeMemoryPoolStats {
+    VkDeviceSize cached_bytes = 0;
+    size_t cached_allocations = 0;
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t discarded = 0;
+};
+
+bool compute_memory_pool_enabled() {
+    static const bool enabled = std::getenv("PROSPER_NO_MEMORY_POOL") == nullptr;
+    return enabled;
+}
+
+VkDeviceSize compute_memory_pool_limit() {
+    static const VkDeviceSize limit = []() -> VkDeviceSize {
+        const char* value = std::getenv("PROSPER_COMPUTE_MEMORY_POOL_MB");
+        const uint64_t mib = value ? std::strtoull(value, nullptr, 10) : 256ull;
+        if (mib > UINT64_MAX / (1024ull * 1024ull)) return VkDeviceSize{UINT64_MAX};
+        return static_cast<VkDeviceSize>(mib) * 1024ull * 1024ull;
+    }();
+    return limit;
+}
 
 struct VulkanComputeContext {
     VkInstance instance = VK_NULL_HANDLE;
@@ -27,6 +80,7 @@ struct VulkanComputeContext {
     VkQueue queue = VK_NULL_HANDLE;
     uint32_t queue_family = UINT32_MAX;
     VkPhysicalDeviceMemoryProperties memory{};
+    ComputeMemoryPool memory_pool;
     // Storage-image support (#590): the recompiler's storage path declares the
     // StorageImageRead/WriteWithoutFormat capabilities (raw uvec4 texel model — see
     // tests/image_compute_runner.h, the exec-diff harness for that contract). When the device lacks
@@ -34,8 +88,93 @@ struct VulkanComputeContext {
     bool image_support = false;
 
     ~VulkanComputeContext() {
+        release_cached_memory();
         if (device) vkDestroyDevice(device, nullptr);
         if (instance) vkDestroyInstance(instance, nullptr);
+    }
+
+    VkDeviceMemory allocate_memory(VkDeviceSize bytes, uint32_t memory_type) {
+        if (memory_type == UINT32_MAX) return VK_NULL_HANDLE;
+        const ComputeMemoryKey key{bytes, memory_type};
+        if (compute_memory_pool_enabled()) {
+            std::lock_guard<std::mutex> lock(memory_pool.mutex);
+            auto found = memory_pool.available.find(key);
+            if (found != memory_pool.available.end() && !found->second.empty()) {
+                const VkDeviceMemory allocation = found->second.back();
+                found->second.pop_back();
+                if (found->second.empty()) memory_pool.available.erase(found);
+                memory_pool.cached_bytes -= bytes;
+                --memory_pool.cached_allocations;
+                ++memory_pool.hits;
+                memory_pool.active.emplace(allocation, key);
+                return allocation;
+            }
+            ++memory_pool.misses;
+        }
+
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocation.allocationSize = bytes;
+        allocation.memoryTypeIndex = memory_type;
+        VkDeviceMemory result = VK_NULL_HANDLE;
+        if (vkAllocateMemory(device, &allocation, nullptr, &result) != VK_SUCCESS)
+            return VK_NULL_HANDLE;
+        if (compute_memory_pool_enabled()) {
+            std::lock_guard<std::mutex> lock(memory_pool.mutex);
+            memory_pool.active.emplace(result, key);
+        }
+        return result;
+    }
+
+    void release_memory(VkDeviceMemory allocation) {
+        if (!allocation) return;
+        if (!compute_memory_pool_enabled()) {
+            vkFreeMemory(device, allocation, nullptr);
+            return;
+        }
+        std::lock_guard<std::mutex> lock(memory_pool.mutex);
+        auto found = memory_pool.active.find(allocation);
+        if (found == memory_pool.active.end()) {
+            vkFreeMemory(device, allocation, nullptr);
+            return;
+        }
+        const ComputeMemoryKey key = found->second;
+        memory_pool.active.erase(found);
+        constexpr size_t max_cached_allocations = 2048;
+        const VkDeviceSize limit = compute_memory_pool_limit();
+        const VkDeviceSize remaining = memory_pool.cached_bytes < limit
+            ? limit - memory_pool.cached_bytes : 0;
+        if (memory_pool.cached_allocations >= max_cached_allocations || key.bytes > remaining) {
+            ++memory_pool.discarded;
+            vkFreeMemory(device, allocation, nullptr);
+            return;
+        }
+        memory_pool.available[key].push_back(allocation);
+        memory_pool.cached_bytes += key.bytes;
+        ++memory_pool.cached_allocations;
+    }
+
+    ComputeMemoryPoolStats memory_pool_stats() {
+        std::lock_guard<std::mutex> lock(memory_pool.mutex);
+        return {memory_pool.cached_bytes, memory_pool.cached_allocations, memory_pool.hits,
+                memory_pool.misses, memory_pool.discarded};
+    }
+
+    void release_cached_memory() {
+        if (!device) return;
+        std::lock_guard<std::mutex> lock(memory_pool.mutex);
+        for (const auto& [key, allocations] : memory_pool.available) {
+            (void)key;
+            for (VkDeviceMemory allocation : allocations)
+                vkFreeMemory(device, allocation, nullptr);
+        }
+        for (const auto& [allocation, key] : memory_pool.active) {
+            (void)key;
+            vkFreeMemory(device, allocation, nullptr);
+        }
+        memory_pool.available.clear();
+        memory_pool.active.clear();
+        memory_pool.cached_bytes = 0;
+        memory_pool.cached_allocations = 0;
     }
 
     bool init() {
@@ -282,15 +421,15 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         if (descriptor_layout) vkDestroyDescriptorSetLayout(ctx.device, descriptor_layout, nullptr);
         for (auto& buffer : buffers) {
             if (buffer.buffer) vkDestroyBuffer(ctx.device, buffer.buffer, nullptr);
-            if (buffer.memory) vkFreeMemory(ctx.device, buffer.memory, nullptr);
+            if (buffer.memory) ctx.release_memory(buffer.memory);
         }
         for (size_t i = 0; i < images.size(); i++) {
             if (images[i].sampler) vkDestroySampler(ctx.device, images[i].sampler, nullptr);
             if (images[i].view) vkDestroyImageView(ctx.device, images[i].view, nullptr);
             if (images[i].image) vkDestroyImage(ctx.device, images[i].image, nullptr);
-            if (images[i].memory) vkFreeMemory(ctx.device, images[i].memory, nullptr);
+            if (images[i].memory) ctx.release_memory(images[i].memory);
             if (staging[i]) vkDestroyBuffer(ctx.device, staging[i], nullptr);
-            if (staging_memory[i]) vkFreeMemory(ctx.device, staging_memory[i], nullptr);
+            if (staging_memory[i]) ctx.release_memory(staging_memory[i]);
         }
     };
     auto resource_bytes = [](const ShaderResource* resource) -> uint8_t* {
@@ -315,10 +454,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             vkGetBufferMemoryRequirements(ctx.device, buffers[i].buffer, &requirements);
             const uint32_t memory_type = ctx.host_memory_type(requirements.memoryTypeBits);
             if (memory_type == UINT32_MAX) break;
-            VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-            mai.allocationSize = requirements.size;
-            mai.memoryTypeIndex = memory_type;
-            if (vkAllocateMemory(ctx.device, &mai, nullptr, &buffers[i].memory) != VK_SUCCESS) break;
+            buffers[i].memory = ctx.allocate_memory(requirements.size, memory_type);
+            if (!buffers[i].memory) break;
             if (vkBindBufferMemory(ctx.device, buffers[i].buffer, buffers[i].memory, 0) != VK_SUCCESS) break;
             void* mapped = nullptr;
             if (vkMapMemory(ctx.device, buffers[i].memory, 0, resource->size, 0, &mapped) != VK_SUCCESS) break;
@@ -482,11 +619,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (vkCreateBuffer(ctx.device, &sci, nullptr, &staging[i]) != VK_SUCCESS) { images_ready = false; break; }
             VkMemoryRequirements sreq{};
             vkGetBufferMemoryRequirements(ctx.device, staging[i], &sreq);
-            VkMemoryAllocateInfo smai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-            smai.allocationSize = sreq.size;
-            smai.memoryTypeIndex = ctx.host_memory_type(sreq.memoryTypeBits);
-            if (smai.memoryTypeIndex == UINT32_MAX ||
-                vkAllocateMemory(ctx.device, &smai, nullptr, &staging_memory[i]) != VK_SUCCESS ||
+            const uint32_t staging_memory_type = ctx.host_memory_type(sreq.memoryTypeBits);
+            staging_memory[i] = ctx.allocate_memory(sreq.size, staging_memory_type);
+            if (!staging_memory[i] ||
                 vkBindBufferMemory(ctx.device, staging[i], staging_memory[i], 0) != VK_SUCCESS) {
                 images_ready = false; break; }
             { void* mapped = nullptr;
@@ -511,11 +646,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (vkCreateImage(ctx.device, &ici, nullptr, &bi.image) != VK_SUCCESS) { images_ready = false; break; }
             VkMemoryRequirements ireq{};
             vkGetImageMemoryRequirements(ctx.device, bi.image, &ireq);
-            VkMemoryAllocateInfo imai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-            imai.allocationSize = ireq.size;
-            imai.memoryTypeIndex = device_memory_type(ireq.memoryTypeBits);
-            if (imai.memoryTypeIndex == UINT32_MAX ||
-                vkAllocateMemory(ctx.device, &imai, nullptr, &bi.memory) != VK_SUCCESS ||
+            const uint32_t image_memory_type = device_memory_type(ireq.memoryTypeBits);
+            bi.memory = ctx.allocate_memory(ireq.size, image_memory_type);
+            if (!bi.memory ||
                 vkBindImageMemory(ctx.device, bi.image, bi.memory, 0) != VK_SUCCESS) {
                 images_ready = false; break; }
             VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -802,17 +935,59 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
 } // namespace
 
 bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& items) {
-    VulkanComputeContext context;
-    if (!context.init()) {
+    // Keep the Vulkan device alive across dispatch spans. Constructing an instance, device, and queue for
+    // every callback cost roughly 25 ms/frame on the native Windows frontend before any kernel work ran.
+    // Function-local static initialization is thread-safe; AGC submit execution serializes subsequent use.
+    static VulkanComputeContext context;
+    static const bool context_ready = context.init();
+    if (!context_ready) {
         std::fprintf(stderr, "[compute] Vulkan initialization failed\n");
         return false;
     }
+    const bool timing_enabled = std::getenv("PROSPER_RENDER_TIMING") != nullptr;
+    const auto timing_start = timing_enabled
+        ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // Dispatches are independent PM4-order operations: one item failing (e.g. an image shape the
     // backend can't bind yet, #590) must not abort the rest of the batch — that would regress
     // dispatches that executed before image bindings existed. Run all; report all-succeeded.
     bool all_ok = true;
     for (const auto& item : items)
         all_ok &= execute_item(context, item);
+    if (timing_enabled) {
+        struct TimingTotals { uint64_t calls = 0, dispatches = 0; double milliseconds = 0; };
+        static TimingTotals totals;
+        static TimingTotals window;
+        const double elapsed = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - timing_start).count();
+        auto accumulate = [&](TimingTotals& timing) {
+            timing.calls++;
+            timing.dispatches += items.size();
+            timing.milliseconds += elapsed;
+        };
+        accumulate(totals);
+        accumulate(window);
+        if (totals.calls % 25 == 0) {
+            std::fprintf(stderr,
+                         "[render-timing] compute calls=%llu dispatches=%llu avg_ms=%.2f\n",
+                         (unsigned long long)totals.calls,
+                         (unsigned long long)totals.dispatches,
+                         totals.milliseconds / static_cast<double>(totals.calls));
+            const ComputeMemoryPoolStats pool = context.memory_pool_stats();
+            std::fprintf(stderr,
+                         "[render-timing] compute_memory_pool hits=%llu misses=%llu cached=%zu "
+                         "%.1f MiB discarded=%llu\n",
+                         (unsigned long long)pool.hits, (unsigned long long)pool.misses,
+                         pool.cached_allocations,
+                         static_cast<double>(pool.cached_bytes) / (1024.0 * 1024.0),
+                         (unsigned long long)pool.discarded);
+            std::fprintf(stderr,
+                         "[render-window] compute calls=%llu dispatches=%.1f avg_ms=%.2f\n",
+                         (unsigned long long)window.calls,
+                         window.dispatches / static_cast<double>(window.calls),
+                         window.milliseconds / static_cast<double>(window.calls));
+            window = {};
+        }
+    }
     return all_ok;
 }
 

@@ -37,6 +37,63 @@ static bool roundtrip_ok(uint32_t w, uint32_t h) {
     return back == ref;
 }
 
+// Independent, deliberately slow SW_4KB_S oracle. These bit orders are the low-bit GFX10 addrlib
+// patterns documented by the hardware-derived golden tests below. This does not share production's
+// lookup table or indexing code, so it catches a fast-path error that a tile/detile round trip cannot.
+struct RefOrder {
+    const uint8_t* bits;
+    uint32_t count, tile_w, tile_h;
+};
+
+static RefOrder reference_order(uint32_t bpe) {
+    // 0..6 = x bit; 0x80..0x86 = y bit.
+    static const uint8_t b1[]  = {0,1,2,3, 0x80,0x81,0x82,0x83,0x84, 4,0x85,5};
+    static const uint8_t b2[]  = {0,1,2, 0x80,0x81,0x82, 3,0x83,4,0x84,5};
+    static const uint8_t b4[]  = {0,1, 0x80,0x81,0x82, 2,0x83,3,0x84,4};
+    static const uint8_t b8[]  = {0,0x80,0x81,1,2,0x82,3,0x83,4};
+    static const uint8_t b16[] = {0x80,0x81,0,1,0x82,2,0x83,3};
+    switch (bpe) {
+        case 1:  return {b1,  12, 64, 64};
+        case 2:  return {b2,  11, 64, 32};
+        case 4:  return {b4,  10, 32, 32};
+        case 8:  return {b8,   9, 32, 16};
+        case 16: return {b16,  8, 16, 16};
+        default: return {nullptr, 0, 0, 0};
+    }
+}
+
+static uint32_t reference_element_index(uint32_t x, uint32_t y, const RefOrder& order) {
+    uint32_t index = 0;
+    for (uint32_t out_bit = 0; out_bit < order.count; ++out_bit) {
+        const uint8_t source = order.bits[out_bit];
+        const uint32_t bit = source & 0x7fu;
+        const uint32_t value = source & 0x80u ? ((y >> bit) & 1u) : ((x >> bit) & 1u);
+        index |= value << out_bit;
+    }
+    return index;
+}
+
+template <bool ToTiled>
+static void reference_sw4kb_copy(uint8_t* dst, const uint8_t* src, uint32_t w, uint32_t h,
+                                 uint32_t pitch, uint32_t bpe, size_t tiled_bytes) {
+    const RefOrder order = reference_order(bpe);
+    const uint32_t tiles_per_row = ((pitch ? pitch : w) + order.tile_w - 1) / order.tile_w;
+    for (uint32_t y = 0; y < h; ++y) for (uint32_t x = 0; x < w; ++x) {
+        const uint32_t tx = x / order.tile_w, ty = y / order.tile_h;
+        const uint32_t ix = x % order.tile_w, iy = y % order.tile_h;
+        const size_t tiled = static_cast<size_t>(ty * tiles_per_row + tx) * 4096 +
+                             reference_element_index(ix, iy, order) * bpe;
+        const size_t linear = (static_cast<size_t>(y) * w + x) * bpe;
+        if (ToTiled) {
+            if (tiled + bpe <= tiled_bytes) std::memcpy(dst + tiled, src + linear, bpe);
+        } else if (tiled + bpe <= tiled_bytes) {
+            std::memcpy(dst + linear, src + tiled, bpe);
+        } else {
+            std::memset(dst + linear, 0, bpe);
+        }
+    }
+}
+
 int main() {
     printf("== test_tile ==\n");
 
@@ -127,6 +184,52 @@ int main() {
         CHECK(rt_bpe(96, 64, 4),   "round-trip 96x64 @ 4 B/texel (explicit-bpt path == default)");
         CHECK(rt_bpe(70, 40, 8),   "round-trip 70x40 @ 8 B/elem (32x16 tiles)");
         CHECK(rt_bpe(40, 40, 16),  "round-trip 40x40 @ 16 B/elem (16x16 tiles)");
+    }
+
+    // Compare the optimized tile-oriented implementation directly with the independent per-element
+    // oracle. Cover every element size, partial edge tiles, padded pitches, and bounded/truncated reads.
+    {
+        const uint32_t M = (uint32_t)TileMode::Sw4KbS;
+        struct Case { uint32_t w, h, pitch, bpe; };
+        const Case cases[] = {
+            {131, 70, 193, 1}, {131, 70, 191, 2}, {67, 45, 96, 4},
+            {70, 41, 97, 8}, {41, 39, 55, 16},
+        };
+        bool tile_matches = true, detile_matches = true, truncated_matches = true;
+        for (const Case& c : cases) {
+            std::vector<uint8_t> linear((size_t)c.w * c.h * c.bpe);
+            for (size_t i = 0; i < linear.size(); ++i)
+                linear[i] = (uint8_t)((i * 11400714819323198485ull) >> 37);
+            const size_t bytes = tiled_surface_bytes(c.w, c.h, M, c.pitch, c.bpe);
+            std::vector<uint8_t> expected(bytes, 0), actual(bytes, 0);
+            reference_sw4kb_copy<true>(expected.data(), linear.data(), c.w, c.h,
+                                       c.pitch, c.bpe, bytes);
+            tile_surface(actual.data(), linear.data(), c.w, c.h, M, c.pitch, c.bpe);
+            tile_matches &= actual == expected;
+
+            std::vector<uint8_t> expected_linear(linear.size(), 0), actual_linear(linear.size(), 0);
+            reference_sw4kb_copy<false>(expected_linear.data(), expected.data(), c.w, c.h,
+                                        c.pitch, c.bpe, bytes);
+            detile_surface(actual_linear.data(), expected.data(), c.w, c.h, M, c.pitch, c.bpe);
+            detile_matches &= actual_linear == expected_linear;
+
+            // detile_elements exposes an explicit source bound. Use pitch=width, as that API does.
+            const size_t unpitched_bytes = tiled_elements_bytes(c.w, c.h, c.bpe, M);
+            std::vector<uint8_t> unpitched(unpitched_bytes, 0);
+            reference_sw4kb_copy<true>(unpitched.data(), linear.data(), c.w, c.h,
+                                       0, c.bpe, unpitched_bytes);
+            const size_t available = unpitched_bytes > 123 ? unpitched_bytes - 123 : unpitched_bytes / 2;
+            std::fill(expected_linear.begin(), expected_linear.end(), 0);
+            std::fill(actual_linear.begin(), actual_linear.end(), 0);
+            reference_sw4kb_copy<false>(expected_linear.data(), unpitched.data(), c.w, c.h,
+                                        0, c.bpe, available);
+            detile_elements(actual_linear.data(), unpitched.data(), available,
+                            c.w, c.h, c.bpe, M);
+            truncated_matches &= actual_linear == expected_linear;
+        }
+        CHECK(tile_matches, "optimized SW_4KB_S tile matches independent addrlib-order oracle");
+        CHECK(detile_matches, "optimized SW_4KB_S detile matches oracle for padded pitches/edge tiles");
+        CHECK(truncated_matches, "optimized bounded detile matches oracle for truncated tiled buffers");
     }
 
     // Golden positions for the GFX10 SW_4KB_S element order (#118): the lowest four element bits are a

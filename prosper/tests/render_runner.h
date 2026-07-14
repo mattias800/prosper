@@ -6,10 +6,13 @@
 #include <vulkan/vulkan.h>
 #include "../src/gpu/gpu_capture.hpp"
 #include "../src/gpu/render_state.hpp"
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -191,6 +194,133 @@ inline const RenderVkCtx& render_vk_ctx() {
         return r;
     }();
     return c;
+}
+
+// Each call waits for its fence before cleanup, so transient allocations can be safely recycled by
+// exact Vulkan memory requirements. Keeping only the memory object avoids changing image layouts or
+// descriptor lifetimes while removing the driver's expensive allocate/free churn between batches.
+struct RenderMemoryKey {
+    VkDeviceSize bytes = 0;
+    uint32_t memory_type = UINT32_MAX;
+    bool operator==(const RenderMemoryKey& other) const {
+        return bytes == other.bytes && memory_type == other.memory_type;
+    }
+};
+
+struct RenderMemoryKeyHash {
+    size_t operator()(const RenderMemoryKey& key) const {
+        return std::hash<uint64_t>{}(static_cast<uint64_t>(key.bytes)) ^
+               (std::hash<uint32_t>{}(key.memory_type) << 1);
+    }
+};
+
+struct RenderMemoryPool {
+    std::mutex mutex;
+    std::unordered_map<RenderMemoryKey, std::vector<VkDeviceMemory>, RenderMemoryKeyHash> available;
+    std::unordered_map<VkDeviceMemory, RenderMemoryKey> active;
+    VkDeviceSize cached_bytes = 0;
+    size_t cached_allocations = 0;
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t discarded = 0;
+};
+
+struct RenderMemoryPoolStats {
+    VkDeviceSize cached_bytes = 0;
+    size_t cached_allocations = 0;
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t discarded = 0;
+};
+
+inline RenderMemoryPool& render_memory_pool() {
+    static RenderMemoryPool pool;
+    return pool;
+}
+
+inline bool render_memory_pool_enabled() {
+    static const bool enabled = getenv("PROSPER_NO_MEMORY_POOL") == nullptr;
+    return enabled;
+}
+
+inline VkDeviceSize render_memory_pool_limit() {
+    static const VkDeviceSize limit = []() -> VkDeviceSize {
+        const char* value = getenv("PROSPER_MEMORY_POOL_MB");
+        const uint64_t mib = value ? strtoull(value, nullptr, 10) : 512ull;
+        if (mib > UINT64_MAX / (1024ull * 1024ull)) return VkDeviceSize{UINT64_MAX};
+        return static_cast<VkDeviceSize>(mib) * 1024ull * 1024ull;
+    }();
+    return limit;
+}
+
+inline VkDeviceMemory allocate_transient_render_memory(VkDevice device, VkDeviceSize bytes,
+                                                       uint32_t memory_type) {
+    if (memory_type == UINT32_MAX) return VK_NULL_HANDLE;
+    RenderMemoryKey key{bytes, memory_type};
+    if (render_memory_pool_enabled()) {
+        RenderMemoryPool& pool = render_memory_pool();
+        std::lock_guard<std::mutex> lock(pool.mutex);
+        auto found = pool.available.find(key);
+        if (found != pool.available.end() && !found->second.empty()) {
+            VkDeviceMemory memory = found->second.back();
+            found->second.pop_back();
+            if (found->second.empty()) pool.available.erase(found);
+            pool.cached_bytes -= bytes;
+            --pool.cached_allocations;
+            ++pool.hits;
+            pool.active.emplace(memory, key);
+            return memory;
+        }
+        ++pool.misses;
+    }
+
+    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocation.allocationSize = bytes;
+    allocation.memoryTypeIndex = memory_type;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    if (vkAllocateMemory(device, &allocation, nullptr, &memory) != VK_SUCCESS) return VK_NULL_HANDLE;
+    if (render_memory_pool_enabled()) {
+        RenderMemoryPool& pool = render_memory_pool();
+        std::lock_guard<std::mutex> lock(pool.mutex);
+        pool.active.emplace(memory, key);
+    }
+    return memory;
+}
+
+inline void release_transient_render_memory(VkDevice device, VkDeviceMemory memory) {
+    if (!memory) return;
+    if (!render_memory_pool_enabled()) {
+        vkFreeMemory(device, memory, nullptr);
+        return;
+    }
+
+    RenderMemoryPool& pool = render_memory_pool();
+    std::lock_guard<std::mutex> lock(pool.mutex);
+    auto found = pool.active.find(memory);
+    if (found == pool.active.end()) {
+        vkFreeMemory(device, memory, nullptr);
+        return;
+    }
+    const RenderMemoryKey key = found->second;
+    pool.active.erase(found);
+    constexpr size_t max_cached_allocations = 4096;
+    const VkDeviceSize limit = render_memory_pool_limit();
+    const VkDeviceSize remaining = pool.cached_bytes < limit ? limit - pool.cached_bytes : 0;
+    if (pool.cached_allocations >= max_cached_allocations ||
+        key.bytes > remaining) {
+        ++pool.discarded;
+        vkFreeMemory(device, memory, nullptr);
+        return;
+    }
+    pool.available[key].push_back(memory);
+    pool.cached_bytes += key.bytes;
+    ++pool.cached_allocations;
+}
+
+inline RenderMemoryPoolStats render_memory_pool_stats() {
+    RenderMemoryPool& pool = render_memory_pool();
+    std::lock_guard<std::mutex> lock(pool.mutex);
+    return {pool.cached_bytes, pool.cached_allocations, pool.hits, pool.misses, pool.discarded};
 }
 
 inline uint32_t render_memory_type(VkPhysicalDevice phys, uint32_t bits,
@@ -506,6 +636,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                                               const uint8_t* seed_rgba = nullptr,
                                               const float* clear_rgba = nullptr,
                                               bool persist_depth_stencil = false) {
+    using TimingClock = std::chrono::steady_clock;
+    const bool timing_enabled = getenv("PROSPER_RENDER_TIMING") != nullptr;
+    const auto timing_start = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     std::vector<uint8_t> out;
     if (draws.empty()) return out;
     const RenderVkCtx& ctx = render_vk_ctx();
@@ -646,7 +779,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     VkMemoryRequirements ir; vkGetImageMemoryRequirements(dev, img, &ir);
     VkMemoryAllocateInfo iai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     iai.allocationSize = ir.size; iai.memoryTypeIndex = pick(ir.memoryTypeBits, 0);
-    VkDeviceMemory imem; vkAllocateMemory(dev, &iai, nullptr, &imem); vkBindImageMemory(dev, img, imem, 0);
+    VkDeviceMemory imem = allocate_transient_render_memory(dev, iai.allocationSize,
+                                                            iai.memoryTypeIndex);
+    vkBindImageMemory(dev, img, imem, 0);
     VkImageViewCreateInfo ivci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     ivci.image = img; ivci.viewType = VK_IMAGE_VIEW_TYPE_2D; ivci.format = FMT;
     ivci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -663,7 +798,10 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         VkMemoryRequirements dr; vkGetImageMemoryRequirements(dev, dimg, &dr);
         VkMemoryAllocateInfo dai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         dai.allocationSize = dr.size; dai.memoryTypeIndex = pick(dr.memoryTypeBits, 0);
-        vkAllocateMemory(dev, &dai, nullptr, &dmem); vkBindImageMemory(dev, dimg, dmem, 0);
+        if (cached_ds) vkAllocateMemory(dev, &dai, nullptr, &dmem);
+        else dmem = allocate_transient_render_memory(dev, dai.allocationSize,
+                                                      dai.memoryTypeIndex);
+        vkBindImageMemory(dev, dimg, dmem, 0);
         VkImageViewCreateInfo dvci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         dvci.image = dimg; dvci.viewType = VK_IMAGE_VIEW_TYPE_2D; dvci.format = DFMT;
         dvci.subresourceRange = {DASPECT, 0, 1, 0, 1};
@@ -715,6 +853,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         s.codeSize = c.size() * 4; s.pCode = c.data(); VkShaderModule m = VK_NULL_HANDLE;
         vkCreateShaderModule(dev, &s, nullptr, &m); return m; };
     // Per-draw Vulkan objects — kept alive until after the queue submit, freed at the end.
+    const auto timing_target_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     struct DV {
         VkShaderModule vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
         std::vector<FrameResource> R;
@@ -745,7 +884,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             VkMemoryRequirements imr; vkGetBufferMemoryRequirements(dev, v.ibuf, &imr);
             VkMemoryAllocateInfo imai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; imai.allocationSize = imr.size;
             imai.memoryTypeIndex = pick(imr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-            vkAllocateMemory(dev, &imai, nullptr, &v.ibmem); vkBindBufferMemory(dev, v.ibuf, v.ibmem, 0);
+            v.ibmem = allocate_transient_render_memory(dev, imai.allocationSize,
+                                                        imai.memoryTypeIndex);
+            vkBindBufferMemory(dev, v.ibuf, v.ibmem, 0);
             void* ip = nullptr; vkMapMemory(dev, v.ibmem, 0, isz, 0, &ip);
             std::memcpy(ip, bd.indices.data(), (size_t)isz); vkUnmapMemory(dev, v.ibmem);
             v.icount = (uint32_t)bd.indices.size();
@@ -877,7 +1018,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     vkCreateImage(dev, &tci, nullptr, &v.timg[i]);
                     VkMemoryRequirements tr; vkGetImageMemoryRequirements(dev, v.timg[i], &tr);
                     VkMemoryAllocateInfo tai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; tai.allocationSize = tr.size;
-                    tai.memoryTypeIndex = pick(tr.memoryTypeBits, 0); vkAllocateMemory(dev, &tai, nullptr, &v.tmem[i]);
+                    tai.memoryTypeIndex = pick(tr.memoryTypeBits, 0);
+                    v.tmem[i] = allocate_transient_render_memory(dev, tai.allocationSize,
+                                                                  tai.memoryTypeIndex);
                     vkBindImageMemory(dev, v.timg[i], v.tmem[i], 0);
                     VkImageViewCreateInfo tvci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
                     // NOTE(#263): r.srgb carries whether the T# is a gamma-encoded (sRGB) surface, but we
@@ -957,7 +1100,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     VkMemoryRequirements sr; vkGetBufferMemoryRequirements(dev, v.tstage[i], &sr);
                     VkMemoryAllocateInfo sai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; sai.allocationSize = sr.size;
                     sai.memoryTypeIndex = pick(sr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-                    vkAllocateMemory(dev, &sai, nullptr, &v.tstagemem[i]); vkBindBufferMemory(dev, v.tstage[i], v.tstagemem[i], 0);
+                    v.tstagemem[i] = allocate_transient_render_memory(dev, sai.allocationSize,
+                                                                      sai.memoryTypeIndex);
+                    vkBindBufferMemory(dev, v.tstage[i], v.tstagemem[i], 0);
                     void* sp = nullptr; vkMapMemory(dev, v.tstagemem[i], 0, tbytes, 0, &sp);
                     std::memcpy(sp, r.tex_rgba, (size_t)tbytes); vkUnmapMemory(dev, v.tstagemem[i]);
                     dii[i] = {v.tsamp[i], v.tview[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
@@ -972,7 +1117,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     VkMemoryRequirements mr; vkGetBufferMemoryRequirements(dev, v.sbuf[i], &mr);
                     VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; mai.allocationSize = mr.size;
                     mai.memoryTypeIndex = pick(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-                    vkAllocateMemory(dev, &mai, nullptr, &v.sbmem[i]); vkBindBufferMemory(dev, v.sbuf[i], v.sbmem[i], 0);
+                    v.sbmem[i] = allocate_transient_render_memory(dev, mai.allocationSize,
+                                                                  mai.memoryTypeIndex);
+                    vkBindBufferMemory(dev, v.sbuf[i], v.sbmem[i], 0);
                     void* p = nullptr; vkMapMemory(dev, v.sbmem[i], 0, sz, 0, &p);
                     if (r.dwords.empty()) ((uint32_t*)p)[0] = 0; else std::memcpy(p, r.dwords.data(), r.dwords.size() * 4);
                     vkUnmapMemory(dev, v.sbmem[i]);
@@ -1009,13 +1156,25 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         if (vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gp, nullptr, &v.pipe) == VK_SUCCESS) v.ok = true;
     }
 
+    const auto timing_draws_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     VkDeviceSize bytes = (VkDeviceSize)W * H * 4;
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; bci.size = bytes; bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     VkBuffer rb; vkCreateBuffer(dev, &bci, nullptr, &rb);
     VkMemoryRequirements br; vkGetBufferMemoryRequirements(dev, rb, &br);
     VkMemoryAllocateInfo bai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; bai.allocationSize = br.size;
-    bai.memoryTypeIndex = pick(br.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    VkDeviceMemory bmem; vkAllocateMemory(dev, &bai, nullptr, &bmem); vkBindBufferMemory(dev, rb, bmem, 0);
+    // Prefer cached host memory for GPU -> CPU readback. Discrete NVIDIA exposes an earlier coherent,
+    // write-combined BAR type and a later HOST_CACHED type; the generic first-match selector chose the
+    // former, making an 8 MiB 1080p read take roughly 570 ms on Windows. Upload buffers deliberately keep
+    // the write-combined type. Integrated GPUs and portability drivers may not expose HOST_CACHED, so fall
+    // back to the original required flags.
+    constexpr VkMemoryPropertyFlags host_coherent =
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    bai.memoryTypeIndex = pick(br.memoryTypeBits, host_coherent | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    if (bai.memoryTypeIndex == UINT32_MAX)
+        bai.memoryTypeIndex = pick(br.memoryTypeBits, host_coherent);
+    VkDeviceMemory bmem = allocate_transient_render_memory(dev, bai.allocationSize,
+                                                            bai.memoryTypeIndex);
+    vkBindBufferMemory(dev, rb, bmem, 0);
 
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO}; pci.queueFamilyIndex = qfi;
     VkCommandPool pool; vkCreateCommandPool(dev, &pci, nullptr, &pool);
@@ -1034,7 +1193,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         VkMemoryRequirements sr; vkGetBufferMemoryRequirements(dev, seedbuf, &sr);
         VkMemoryAllocateInfo sai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; sai.allocationSize = sr.size;
         sai.memoryTypeIndex = pick(sr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        vkAllocateMemory(dev, &sai, nullptr, &seedmem); vkBindBufferMemory(dev, seedbuf, seedmem, 0);
+        seedmem = allocate_transient_render_memory(dev, sai.allocationSize,
+                                                    sai.memoryTypeIndex);
+        vkBindBufferMemory(dev, seedbuf, seedmem, 0);
         void* sp = nullptr; vkMapMemory(dev, seedmem, 0, bytes, 0, &sp);
         memcpy(sp, seed_rgba, (size_t)bytes); vkUnmapMemory(dev, seedmem);
         VkImageMemoryBarrier s0{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -1117,19 +1278,24 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     VkBufferImageCopy cp{}; cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; cp.imageExtent = {W, H, 1};
     vkCmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb, 1, &cp);
     vkEndCommandBuffer(cmd);
+    const auto timing_recorded = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
     VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VkFence fence; vkCreateFence(dev, &fci, nullptr, &fence);
     vkQueueSubmit(queue, 1, &si, fence); vkWaitForFences(dev, 1, &fence, VK_TRUE, 5ull * 1000 * 1000 * 1000);
+    const auto timing_gpu_done = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     if (cached_ds) {
         cached_ds->layout_initialized = true;
         cached_ds->depth_valid |= use_depth && depth_used_meaningfully;
         cached_ds->stencil_valid |= use_stencil;
     }
 
-    out.resize(bytes);
     void* mp = nullptr; vkMapMemory(dev, bmem, 0, bytes, 0, &mp);
-    for (VkDeviceSize i = 0; i < bytes; i++) out[i] = ((const uint8_t*)mp)[i];
+    const auto* readback = static_cast<const uint8_t*>(mp);
+    // A range assignment constructs directly from the mapped pixels. resize()+memcpy first zeroed the
+    // entire 8.3 MiB 1080p vector even though every byte was immediately overwritten.
+    out.assign(readback, readback + static_cast<size_t>(bytes));
     vkUnmapMemory(dev, bmem);
+    const auto timing_readback_done = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
 
     // PROSPER_DRAW_ISO + PROSPER_ISO_AT="x,y": per-draw kill isolation (generalizes the #240 title harness
     // to any submit / any target pixel). On the FIRST submit whose rendered pixel at (x,y) is lit
@@ -1215,29 +1381,83 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         if (v.pipe)   vkDestroyPipeline(dev, v.pipe, nullptr);
         if (v.layout) vkDestroyPipelineLayout(dev, v.layout, nullptr);
         if (v.ibuf)   vkDestroyBuffer(dev, v.ibuf, nullptr);
-        if (v.ibmem)  vkFreeMemory(dev, v.ibmem, nullptr);
+        if (v.ibmem)  release_transient_render_memory(dev, v.ibmem);
         if (v.vs)     vkDestroyShaderModule(dev, v.vs, nullptr);
         if (v.fs)     vkDestroyShaderModule(dev, v.fs, nullptr);
         if (v.dpool)  vkDestroyDescriptorPool(dev, v.dpool, nullptr);
         for (auto d : v.dsls) if (d) vkDestroyDescriptorSetLayout(dev, d, nullptr);
         for (size_t i = 0; i < v.R.size(); i++) {
             if (v.sbuf[i])     vkDestroyBuffer(dev, v.sbuf[i], nullptr);
-            if (v.sbmem[i])    vkFreeMemory(dev, v.sbmem[i], nullptr);
+            if (v.sbmem[i])    release_transient_render_memory(dev, v.sbmem[i]);
             if (v.tsamp[i])    vkDestroySampler(dev, v.tsamp[i], nullptr);
             if (v.tview[i])    vkDestroyImageView(dev, v.tview[i], nullptr);
             if (v.timg[i])     vkDestroyImage(dev, v.timg[i], nullptr);
-            if (v.tmem[i])     vkFreeMemory(dev, v.tmem[i], nullptr);
+            if (v.tmem[i])     release_transient_render_memory(dev, v.tmem[i]);
             if (v.tstage[i])   vkDestroyBuffer(dev, v.tstage[i], nullptr);
-            if (v.tstagemem[i])vkFreeMemory(dev, v.tstagemem[i], nullptr);
+            if (v.tstagemem[i])release_transient_render_memory(dev, v.tstagemem[i]);
         }
     }
     if (seedbuf) vkDestroyBuffer(dev, seedbuf, nullptr);
-    if (seedmem) vkFreeMemory(dev, seedmem, nullptr);
-    vkDestroyBuffer(dev, rb, nullptr); vkFreeMemory(dev, bmem, nullptr);
+    if (seedmem) release_transient_render_memory(dev, seedmem);
+    vkDestroyBuffer(dev, rb, nullptr); release_transient_render_memory(dev, bmem);
     vkDestroyFramebuffer(dev, fb, nullptr); vkDestroyRenderPass(dev, rp, nullptr); vkDestroyImageView(dev, view, nullptr);
-    vkDestroyImage(dev, img, nullptr); vkFreeMemory(dev, imem, nullptr);
+    vkDestroyImage(dev, img, nullptr); release_transient_render_memory(dev, imem);
     if (use_ds && !cached_ds) {
-        vkDestroyImageView(dev, dview, nullptr); vkDestroyImage(dev, dimg, nullptr); vkFreeMemory(dev, dmem, nullptr);
+        vkDestroyImageView(dev, dview, nullptr); vkDestroyImage(dev, dimg, nullptr);
+        release_transient_render_memory(dev, dmem);
+    }
+    if (timing_enabled) {
+        const auto timing_done = TimingClock::now();
+        auto ms = [](auto begin, auto end) {
+            return std::chrono::duration<double, std::milli>(end - begin).count();
+        };
+        struct TimingTotals {
+            uint64_t calls = 0, draws = 0;
+            double target = 0, draw_setup = 0, record = 0, gpu_wait = 0, readback = 0, cleanup = 0;
+        };
+        static TimingTotals totals;
+        static TimingTotals window;
+        auto accumulate = [&](TimingTotals& timing) {
+            timing.calls++;
+            timing.draws += draws.size();
+            timing.target += ms(timing_start, timing_target_ready);
+            timing.draw_setup += ms(timing_target_ready, timing_draws_ready);
+            timing.record += ms(timing_draws_ready, timing_recorded);
+            timing.gpu_wait += ms(timing_recorded, timing_gpu_done);
+            timing.readback += ms(timing_gpu_done, timing_readback_done);
+            timing.cleanup += ms(timing_readback_done, timing_done);
+        };
+        accumulate(totals);
+        accumulate(window);
+        if (totals.calls % 25 == 0) {
+            const double n = static_cast<double>(totals.calls);
+            const double total = totals.target + totals.draw_setup + totals.record +
+                                 totals.gpu_wait + totals.readback + totals.cleanup;
+            fprintf(stderr,
+                    "[render-timing] backend calls=%llu draws=%llu avg_ms: total=%.2f target=%.2f "
+                    "draw_setup=%.2f record_upload=%.2f gpu_wait=%.2f readback=%.2f cleanup=%.2f\n",
+                    (unsigned long long)totals.calls, (unsigned long long)totals.draws, total / n,
+                    totals.target / n, totals.draw_setup / n, totals.record / n,
+                    totals.gpu_wait / n, totals.readback / n, totals.cleanup / n);
+            const RenderMemoryPoolStats pool = render_memory_pool_stats();
+            fprintf(stderr,
+                    "[render-timing] memory_pool hits=%llu misses=%llu cached=%zu %.1f MiB "
+                    "discarded=%llu\n",
+                    (unsigned long long)pool.hits, (unsigned long long)pool.misses,
+                    pool.cached_allocations,
+                    static_cast<double>(pool.cached_bytes) / (1024.0 * 1024.0),
+                    (unsigned long long)pool.discarded);
+            const double wn = static_cast<double>(window.calls);
+            const double window_total = window.target + window.draw_setup + window.record +
+                                        window.gpu_wait + window.readback + window.cleanup;
+            fprintf(stderr,
+                    "[render-window] backend calls=%llu draws=%.1f avg_ms: total=%.2f target=%.2f "
+                    "draw_setup=%.2f record_upload=%.2f gpu_wait=%.2f readback=%.2f cleanup=%.2f\n",
+                    (unsigned long long)window.calls, window.draws / wn, window_total / wn,
+                    window.target / wn, window.draw_setup / wn, window.record / wn,
+                    window.gpu_wait / wn, window.readback / wn, window.cleanup / wn);
+            window = {};
+        }
     }
     // NB: dev/instance are the persistent RenderVkCtx — do NOT destroy them here (reused across calls).
     return out;
