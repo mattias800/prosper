@@ -352,7 +352,7 @@ The deep crash after `%fs` TLS was two more Linux-parity gaps (fixed on `port/wi
   rbx=0) on an unrecoverable thread. A `win_thread_trampoline` now marshals the SysV entry through
   `prosper_call_guest_sysv` and activates the worker's guest `%fs` TCB.
 
-### Renderer wired (#655); WaitOnAddress lost-wakeup FIXED; frontier: draw submission after VideoOut setup
+### Renderer wired (#655); WaitOnAddress (#663) + positioned IO (#665) FIXED; frontier: GPU EOP completion
 
 **SOLVED — the pre-render wedge was a lost wakeup in the Windows `sceKernelWaitOnAddress`.** It had been
 backed by ONE global `std::condition_variable` shared across every waited address, so a guest
@@ -367,9 +367,28 @@ goes far deeper: it spawns the full Unity thread ecosystem (13 `AssetGarbageColl
 **VideoOut display setup** — `RegisterBuffers2`, "display surface: 1920x1080, 3 buffers registered",
 `ConfigureOutput`, `GetOutputStatus`.
 
-Current frontier: from VideoOut setup to actual draw submission + flip. Immediate next blocker seen: an
-unimplemented `libSceSystemService::mPpPxv5CZt4` (returning 0) right after `GetOutputStatus`; implement
-it (and any siblings) and re-check whether the guest starts submitting Dcbs to the now-wired renderer.
+**SOLVED #2 — asset streaming (positioned file IO).** After the WaitOnAddress fix the guest reached
+VideoOut setup then stalled again; root cause: Windows `sceKernelPread`/`Pwrite`/`readv`/`writev`/
+`preadv`/`pwritev` all returned -1 (MinGW has no POSIX `pread`, so they were stubbed). Unity's async
+asset streamer (FileCacher/CachedReader on `Loading.AsyncRead`) reads assets via **positioned reads**, so
+nothing loaded. Backed them with `ReadFile`/`WriteFile` + an `OVERLAPPED` offset (atomic positioned IO,
+thread-safe on a shared fd, full-read loop for the PS5 full-count contract) — #665. `f_read`/`f_write`
+also loop now. (`libSceSystemService::mPpPxv5CZt4` = `sceSystemServiceGetHdrToneMapLuminance` is a benign
+HDR stub returning 0, tracked in #664 — not a blocker.)
+
+### Current frontier: the GPU EOP-completion handshake (first rendered frame)
+
+With #663 + #665 the guest now **streams assets and drives the GPU command stream**: it builds AGC
+command buffers and submits, and the executor decodes real PM4 — including `WriteData`, **`ReleaseMem`
+(EOP label write)** and **`WaitRegMem` (wait-for-memory)**. It then plateaus (no `[render] frame N` yet):
+the guest submits a Dcb and waits (CPU-side `WaitOnAddress`) for that submission's **GPU end-of-pipe
+completion** before building the next frame. Getting the first frame is now a GPU-executor question:
+confirm the Windows executor folds the submitted Dcb and DELIVERS the EOP completion (the label write +
+waking the guest's waiter / the flip-completion equeue event) — the same lost-semaphore/EOP-delivery
+class Linux solved in #236 ("deliver every GPU EOP completion, coalesce=false"). The EOP + vblank pump
+threads are cross-platform `std::thread`s, so the machinery exists; verify it actually fires on Windows
+for the guest's submitted work. Diagnostics: `PROSPER_GFXLOG` (`[gfx]`/`[agc]` PM4 decode), `PROSPER_EVLOG`
+(`[ev]` equeue/flip/EOP events), `PROSPER_SYNCLOG`.
 
 (Historical, pre-fix diagnosis retained below for context.)
 
