@@ -99,6 +99,17 @@ solved fence investigation when diagnosing a later Windows failure.
 
 ## Full frontend build and validation (native Windows, MinGW)
 
+The normal interactive path is now one command from the repository root. It configures the full
+SDL3 video/audio/controller build when needed and then launches the title in the native window:
+
+```powershell
+.\prosper\scripts\run-windows.ps1 .\PPSA24651-app0
+```
+
+Use `-TestPattern -Frames 120` for a no-game swapchain smoke, or `-NoBuild` after the first build.
+The explicit commands below remain the diagnostic recipe when compiler or CMake configuration needs
+to be controlled directly.
+
 Required tools are WinLibs MinGW-w64 UCRT `gcc/g++.exe`, Ninja, CMake, and a Vulkan SDK with
 `VULKAN_SDK` set. Configure the window, SDL3 audio/controller, live renderer, and screenshot tool
 directly from PowerShell:

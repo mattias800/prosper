@@ -71,17 +71,19 @@ hands out those **CPU pixels**. The frontend polls `present_count()` for a new f
 readback into its swapchain. This is the whole video boundary — the frontend is a pure *consumer* of
 finished frames.
 
-### 4. Lifecycle — run/stop (the ONE new core hook)
-Today `boot_trace` runs the guest to a fixed frame budget. An app needs the guest loop to live with
-the window. Add a minimal, headless-agnostic control:
+### 4. Lifecycle — stop request exists; guest consumption remains
+The frontend has the minimal, headless-agnostic control:
 ```cpp
 // in the run harness / a small host lifecycle header
 void prosper_request_stop();     // idempotent; sets a flag the guest run-loop checks
 bool prosper_stop_requested();
 ```
-`boot_trace` keeps its fixed-budget behavior for CI; the frontend calls `prosper_request_stop()` on
-window close, and the run-loop (guest driver) exits, threads join, teardown runs. **This is the only
-change inside the core-adjacent code, and it touches the run harness — coordinate (see Risks).**
+`boot_trace` keeps its fixed-budget behavior for CI and the frontend calls `prosper_request_stop()`
+on window close. `run_entry` does not consume the flag yet, so the current app cannot safely join a
+booted guest. It flushes logs and calls `std::_Exit` instead; returning from `main` after detaching the
+guest caused a reproducible Windows access violation when static teardown raced live guest threads.
+The remaining lifecycle work is a guest flip-boundary check followed by a real join and normal
+teardown (#352).
 
 ## The Vulkan-context decision: two contexts, frames cross as CPU pixels
 
@@ -114,7 +116,8 @@ frame: SDL_PollEvent → on SDL_QUIT / window-close: prosper_request_stop(); bre
            upload staging → VkImage; blit/scale VkImage → acquired swapchain image; vkQueuePresentKHR;
        else: small sleep / wait on a frame condvar to avoid spinning.
 
-quit:  prosper_request_stop(); join guest thread; destroy swapchain/device/window; SDL_Quit().
+quit target: prosper_request_stop(); join guest thread; destroy swapchain/device/window; SDL_Quit().
+quit today:  prosper_request_stop(); flush logs; direct process exit while the guest is still live.
 ```
 Handle swapchain resize (`present_width/height` change or window resize → recreate). Vsync via
 `VK_PRESENT_MODE_FIFO`.
@@ -127,9 +130,9 @@ Handle swapchain resize (`present_width/height` change or window resize → recr
 - Audio/pad callbacks run on whatever thread the core calls them from; the SDL sink/backend must be
   thread-safe (the pad header already requires it).
 
-Shutdown ordering: `request_stop` → guest thread observes the flag at its loop boundary and returns →
-join → tear down GPU/window. No teardown races because the frontend owns the window/device and only
-destroys them after the guest thread has joined.
+Target shutdown ordering: `request_stop` → guest thread observes the flag at its loop boundary and
+returns → join → tear down GPU/window. Until that check exists, direct process exit deliberately
+skips frontend/HLE static teardown so it cannot race the detached guest.
 
 ## Target / build layout
 
@@ -144,7 +147,13 @@ destroys them after the guest thread has joined.
 
 For native Windows, configure MinGW with `-DPROSPER_APP=ON -DPROSPER_AUDIO_SDL3=ON
 -DPROSPER_PAD_SDL3=ON`, build `prosper-app.exe`, and verify the window/swapchain first with
-`--test-pattern --frames 120`. The complete PowerShell recipe is in `WINDOWS_PORT_HANDOFF.md`.
+`--test-pattern --frames 120`. `scripts/run-windows.ps1` performs that full configure/build/run path:
+
+```powershell
+.\prosper\scripts\run-windows.ps1 .\PPSA24651-app0
+```
+
+The complete manual PowerShell recipe is in `WINDOWS_PORT_HANDOFF.md`.
 
 WSLg remains a useful alternate path for running the Linux build:
 
@@ -195,19 +204,19 @@ duplicate. Until then the app is fully functional via `--test-pattern` (and any 
   shows the composited game (verified `--dump … --frames 3`).
 - **P1 — audio** ✅ **done**: `prosper-app` installs the SDL3 `AudioSink` (`sceAudioOut` → host).
 - **P2 — controllers** ✅ **done**: installs the SDL3 `PadBackend` (host gamepad → `libScePad`).
-- **P3 — polish** (in progress): resize/fullscreen, pause/quit UX, present-mode/latency tuning,
-  packaging (WSLg launcher). Cooperative guest-stop at a flip boundary is a follow-up (today the
+- **P3 — polish** (in progress): resize/fullscreen, pause/quit UX, and present-mode/latency tuning.
+  Native Windows build/run packaging is done via `scripts/run-windows.ps1`. Cooperative guest-stop
+  at a flip boundary is a follow-up (today the
   guest thread is detached at window-close and reclaimed by process exit).
-- **P1 — audio**: land the SDL3 `AudioSink` (from `feat/audio-sdl3`). Result: sound.
-- **P2 — controllers**: SDL3 `GameController` `PadBackend`. Result: play it.
-- **P3 — polish**: resize, fullscreen, pause/quit UX, present-mode/latency tuning, packaging.
 
 ## Risks & open questions
 
-- **Vulkan-in-WSL ICD** — the single external unknown; verify with `vulkaninfo` before P0.
+- **Vulkan availability** — native Windows needs the Vulkan SDK at build time and a working host
+  driver at runtime. WSLg additionally needs a usable WSL Vulkan ICD.
 - **The run/stop hook touches the run harness** (`boot_trace`/how the guest loop is driven), which the
   render-frontier and audio workstreams also use — coordinate; keep the fixed-budget CI path intact.
 - **`feat/audio-sdl3` overlap** — P1 must build on that branch, not fork it.
-- **Present latency/vsync** under WSLg is decent, not native — acceptable for a smoke/dev view.
+- **Present latency/vsync** is intentionally FIFO today; low-latency present-mode selection remains
+  P3 work.
 - **Later zero-copy** (`external_memory`) is deliberately deferred; the readback seam is the v1 answer.
 - **area:** shared/host infrastructure — needs an `area:` decision and coordination before build.

@@ -123,6 +123,12 @@ Windows/MinGW now boots and renders the primary title through the same live Vulk
 current build, run, screenshot, and diagnostic recipe is maintained in
 [`prosper/docs/WINDOWS_PORT_HANDOFF.md`](prosper/docs/WINDOWS_PORT_HANDOFF.md).
 
+On Windows, the full graphics + WASAPI audio + controller/keyboard frontend is one command:
+
+```powershell
+.\prosper\scripts\run-windows.ps1 .\PPSA24651-app0
+```
+
 ## Repository layout
 
 ```
