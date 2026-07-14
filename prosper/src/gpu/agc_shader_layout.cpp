@@ -160,6 +160,23 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
     ShaderResourceTable table;
     const AgcShaderUserData* ud = shdr.user_data;
     if (!ud || !user_sgprs) return table;
+    // The user_data pointer can be non-null yet point at UNMAPPED guest memory — e.g. an offline
+    // capsule capture (#713) realizing a reconstructed per-draw state whose PS user_data block the
+    // guest has since freed/reused. Dereferencing ud->... then SIGSEGVs and kills the capture of any
+    // scene that contains such a draw. Verify the struct is actually mapped before reading it; if not,
+    // skip this stage's resources (empty table) rather than fault. Live rendering (memory still mapped)
+    // is byte-identical. CONFIDENCE: HIGH (pinpointed: build_shader_resources faults on the first
+    // ud field read for PPSA02664 title draw 2's PS at capture time).
+    if (!guest_readable((uint64_t)(uintptr_t)ud, sizeof(AgcShaderUserData))) return table;
+    // The sharp/direct resource-offset arrays are further guest pointers in the same spill area and can
+    // likewise be non-null-but-unmapped for a reconstructed capture state (#713). Verify each is mapped
+    // for its declared entry count before iterating, else skip that category (don't fault).
+    auto arr_ok = [](const void* p, size_t count, size_t elem) {
+        if (!p || !count) return false;
+        const size_t bytes = count * elem;
+        if (bytes > (1u << 20)) return false;   // insane count -> treat as absent
+        return guest_readable((uint64_t)(uintptr_t)p, (uint32_t)bytes);
+    };
 
     uint32_t binding = 0;
 
@@ -173,7 +190,8 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
     // so the text colour read as (0,0,0,0) = transparent black. #257.
     uint64_t eud_base = 0;
     if (const uint16_t* dro = ud->direct_resource_offset)
-        if (ud->direct_resource_count > 5 && dro[5] != 0xffff && (uint64_t)dro[5] + 2 <= num_user_sgprs) {
+        if (arr_ok(dro, ud->direct_resource_count, sizeof(uint16_t)) &&
+            ud->direct_resource_count > 5 && dro[5] != 0xffff && (uint64_t)dro[5] + 2 <= num_user_sgprs) {
             uint64_t p = (uint64_t)user_sgprs[dro[5]] | ((uint64_t)user_sgprs[dro[5] + 1] << 32);
             if (p > 0x10000 && p < 0x0000800000000000ull) eud_base = p;   // plausible guest pointer
         }
@@ -201,7 +219,7 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
     // Constant buffers: sharp_resource_offset[3] (storage-as-constant). Each slot's offset_dw points at
     // a 4-dword V# in the user-data SGPR block OR the EUD (see above).
     const AgcShaderSharp* cbufs = ud->sharp_resource_offset[3];
-    if (cbufs) {
+    if (arr_ok(cbufs, ud->sharp_resource_count[3], sizeof(AgcShaderSharp))) {
         for (uint16_t slot = 0; slot < ud->sharp_resource_count[3]; slot++) {
             const AgcShaderSharp& s = cbufs[slot];
             if (s.empty()) continue;
@@ -236,7 +254,7 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
     // provenance: sgpr_base = offset_dw. The paired sampler (sharp[2]) is folded into the combined
     // image-sampler at the same binding by the backend, so we don't emit a separate Sampler resource.
     const AgcShaderSharp* texs = ud->sharp_resource_offset[0];
-    if (texs) {
+    if (arr_ok(texs, ud->sharp_resource_count[0], sizeof(AgcShaderSharp))) {
         for (uint16_t slot = 0; slot < ud->sharp_resource_count[0]; slot++) {
             const AgcShaderSharp& s = texs[slot];
             if (s.empty()) continue;
@@ -368,7 +386,8 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             // has XY_MAG_FILTER [21:20], XY_MIN_FILTER [23:22], MIP_FILTER [27:26] (0 = point/nearest).
             // Absent/garbage sampler -> keep the linear/clamp defaults. CONFIDENCE: HIGH (layout matches
             // GCN/RDNA2 SQ_IMG_SAMP; verified against decoded raw dwords under PROSPER_GFXLOG).
-            if (const AgcShaderSharp* samps = ud->sharp_resource_offset[2]) {
+            const AgcShaderSharp* samps = ud->sharp_resource_offset[2];
+            if (arr_ok(samps, ud->sharp_resource_count[2], sizeof(AgcShaderSharp))) {
                 if (slot < ud->sharp_resource_count[2] && !samps[slot].empty()) {
                     uint32_t soff = samps[slot].offset_dw();
                     // The paired S# may live in the user-SGPR block OR spill to the EUD alongside its T#
@@ -424,7 +443,8 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
     // ConstantBuffer-class resource: both that class and VertexBuffer lower to a Vulkan storage
     // buffer, while ConstantBuffer also lets scalar buffer loads resolve by their direct SBASE.
     // Restrict this Gen5 observation to compute shaders; other stages have no exercised contract.
-    if (const uint16_t* dro = ud->direct_resource_offset) {
+    const uint16_t* dro = ud->direct_resource_offset;
+    if (arr_ok(dro, ud->direct_resource_count, sizeof(uint16_t))) {
         for (uint16_t type = 0; type < ud->direct_resource_count; type++) {
             const bool compute_buffer = shdr.type == 0 && type == 1;
             if (!compute_buffer && type != 8 && type != 10) continue;
