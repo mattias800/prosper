@@ -1,0 +1,35 @@
+# Alex Kidd in Miracle World DX (PPSA02664): skip the intro credits, advance the title screen, and
+# start a new game. Seconds are measured from the first pad poll. One-second Cross holds are poll-safe
+# under slow software rendering (only a few pad polls/second). Cross confirms/advances menus and the
+# "press any button" title; Options (start) is a fallback for a start-button title prompt. New Game is
+# the default menu entry, so repeated Cross reaches gameplay without directional navigation.
+1-2:options
+4-5:cross
+7-8:cross
+10-11:cross
+13-14:cross
+16-17:cross
+19-20:cross
+22-23:cross
+25-26:cross
+28-29:cross
+31-32:cross
+34-35:cross
+37-38:cross
+40-41:cross
+43-44:cross
+46-47:cross
+49-50:cross
+52-53:cross
+55-56:cross
+58-59:cross
+61-62:cross
+64-65:cross
+67-68:cross
+70-71:cross
+73-74:cross
+76-77:cross
+79-80:cross
+82-83:cross
+85-86:cross
+88-89:cross
