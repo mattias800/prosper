@@ -16,6 +16,7 @@
 #include "agc_shader_layout.hpp"   // DecodedBufferDescriptor (DynFetch)
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -162,6 +163,35 @@ struct SubmitOperation {
 };
 
 enum class ShaderProgramStage : uint8_t { Vertex, Fragment, Compute };
+
+// Graphics shaders are commonly submitted dozens of times per frame with different guest backing
+// addresses but the same code and descriptor interface. Cache the deterministic RDNA2 -> SPIR-V
+// result by shader bytes plus the resource fields the recompiler actually consumes. Runtime resource
+// state (addresses, sizes, dimensions, sampler state, and host backing) deliberately stays out of the
+// key; the backend reads it from each draw's current ShaderResourceTable.
+struct ShaderRecompileCacheStats {
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t bypasses = 0;
+    uint64_t evictions = 0;
+    uint64_t entries = 0;
+    uint64_t bytes = 0;
+    double compile_ms = 0.0;
+};
+std::vector<uint32_t> recompile_graphics_shader_cached(ShaderProgramStage stage,
+                                                       const uint32_t* code, size_t dwords,
+                                                       const ShaderResourceTable* resources = nullptr);
+ShaderRecompileCacheStats shader_recompile_cache_stats();
+void clear_shader_recompile_cache();
+
+struct DrawRealizationPhaseStats {
+    uint64_t draws = 0;
+    double table_ms = 0.0;
+    double shader_ms = 0.0;
+};
+void record_draw_realization_phases(double table_ms, double shader_ms);
+DrawRealizationPhaseStats draw_realization_phase_stats();
+
 enum class RealizationFailureReason : uint8_t {
     None,
     Unknown,
@@ -336,8 +366,13 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                          (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr);
         return false;
     }
+    const bool phase_timing = getenv("PROSPER_RENDER_TIMING") != nullptr;
+    const auto table_start = phase_timing
+        ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::shared_ptr<ShaderResourceTable> vrt = build_stage_table(ds, rs.es_addr, false);
     std::shared_ptr<ShaderResourceTable> prt = build_stage_table(ds, rs.ps_addr, true);
+    const auto table_done = phase_timing
+        ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // PROSPER_RTLOG: correlate this draw's render-target address (CB_COLOR0_BASE) with the addresses of
     // the textures it SAMPLES. If a sampled texture's base equals some draw's color0_base, that surface is
     // a GPU render target (the game renders into it then samples it) -> render-to-texture (#83/#101).
@@ -352,8 +387,16 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                 fprintf(stderr, " vtex=0x%llx(%ux%u f%u)", (unsigned long long)r.gpu_addr, r.width, r.height, (unsigned)r.format);
         fprintf(stderr, "\n");
     }
-    std::vector<uint32_t> vs = recompile_vertex((const uint32_t*)(uintptr_t)rs.es_addr, max_shader_dwords, vrt.get());
-    std::vector<uint32_t> fs = recompile_fragment((const uint32_t*)(uintptr_t)rs.ps_addr, max_shader_dwords, prt.get());
+    std::vector<uint32_t> vs = recompile_graphics_shader_cached(
+        ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)rs.es_addr, max_shader_dwords, vrt.get());
+    std::vector<uint32_t> fs = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr, max_shader_dwords, prt.get());
+    if (phase_timing) {
+        const auto shader_done = std::chrono::steady_clock::now();
+        record_draw_realization_phases(
+            std::chrono::duration<double, std::milli>(table_done - table_start).count(),
+            std::chrono::duration<double, std::milli>(shader_done - table_done).count());
+    }
     add_stage_diagnostic(ShaderProgramStage::Vertex, rs.es_addr, vrt, vs);
     add_stage_diagnostic(ShaderProgramStage::Fragment, rs.ps_addr, prt, fs);
     if (const char* dd = getenv("PROSPER_VS_DUMP")) {   // diag: dump successful VS SPIR-V + raw RDNA2 for inspection
