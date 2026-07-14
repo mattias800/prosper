@@ -349,7 +349,7 @@ const char* const kAgcNids[] = {
     "IxYiarKlXxM",   // sceAgcDmaDataPatchSetDstAddressOrOffset — observe-only (packet now gets valid ptrs, #117)
     // Dead Cells resource-registration startup path (#539). These trace entries preserve the original
     // six arguments, which the generic unimplemented stub cannot do because it replaces a0 with the
-    // import index. The max-name-length query is overridden by its real handler in hle_agc.
+    // import index. The two output queries are overridden by real handlers in hle_agc.
     "AOLcoIkQDgM",   // sceAgcDriverQueryResourceRegistrationUserMemoryRequirements
     "F0Y42t-3e18",   // sceAgcDriverInitResourceRegistration
     "U9ueyEhSkF4",   // sceAgcDriverRegisterDefaultOwner (shadPS4 symbol map)
