@@ -101,7 +101,8 @@ int main() {
         CHECK(ci.stick_dead_zone_left == ci.stick_dead_zone_right, "info: symmetric dead zone");
     }
 
-    // (6) HLE registration + full-struct fill (no PROSPER_PAD -> neutral, but complete + connected=0).
+    // (6) HLE registration + full-struct fill (no PROSPER_PAD -> neutral input, but ONE controller is
+    // connected by default: the built-in NeutralPadBackend now presents a connected pad for dev/testing).
     {
         register_builtin_hle();
         HleFn read_state = Hle::lookup(nid_hash("scePadReadState"));
@@ -118,7 +119,7 @@ int main() {
             uint64_t r = read_state(1, (uint64_t)(uintptr_t)&d, 0, 0, 0, 0);
             CHECK(r == 0, "scePadReadState -> 0 (OK)");
             // The struct's TAIL (bytes the old 48-byte stub never touched) must now be written:
-            CHECK(d.connected == 0, "readstate: connected written (was uninit in old stub)");
+            CHECK(d.connected == 1, "readstate: one controller connected by default (dev/testing default)");
             CHECK(d.left_stick_x == 0x80, "readstate: sticks centered");
             CHECK(d.orientation_w == 1.0f, "readstate: identity orientation");
         }

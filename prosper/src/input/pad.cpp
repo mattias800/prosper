@@ -76,10 +76,15 @@ void pad_fill_data(ScePadData* out, const HostPadState& s, uint64_t timestamp, u
 
 // --- pluggable backend: default neutral (headless), plus the injector -----------------------------
 namespace {
-// The built-in backend: no host device. Reports a neutral, disconnected pad so the HLE contract is
-// fully defined with zero dependencies. A frontend replaces this via pad_set_backend().
+// The built-in backend: no host device, but reports ONE connected controller with neutral input.
+// A PS5 title legitimately gates progression on a pad being present (e.g. PPSA02664 loops a
+// "Please, connect a controller to continue." message dialog forever while none is connected), so the
+// headless/dev-testing default must present one — otherwise the game never reaches its title/gameplay.
+// Input stays neutral (no buttons); PROSPER_PAD_PRESS / PROSPER_PAD_SCRIPT drive actual presses on top.
+// A real frontend (SDL3 / evdev) replaces this via pad_set_backend(); the harness app will manage the
+// connected-controller count there. CONFIDENCE: HIGH (controller-presence gate is live-observed).
 struct NeutralPadBackend : PadBackend {
-    bool poll(int /*index*/, HostPadState& out) override { out = HostPadState{}; return false; }
+    bool poll(int /*index*/, HostPadState& out) override { out = HostPadState{}; out.connected = true; return true; }
 };
 NeutralPadBackend        g_neutral;
 std::atomic<PadBackend*> g_backend{&g_neutral};   // a frontend may install from another thread

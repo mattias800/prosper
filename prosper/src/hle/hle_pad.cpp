@@ -311,11 +311,11 @@ void pad_record(int64_t frame, uint32_t buttons) {
 }
 
 // Snapshot the controller for a given pad handle via the installed backend. With no host frontend
-// installed, prosper_core's default backend reports a neutral, disconnected pad (fully-formed
-// struct). PROSPER_PAD_PRESS overrides with a synthetic connected pad (CROSS held); PROSPER_PAD_SCRIPT
-// overrides with a timed button sequence — both are device-independent end-to-end test drivers.
+// installed, prosper_core's default backend reports ONE connected controller with neutral input (a PS5
+// title can gate progression on a pad being present, so dev/testing needs one). PROSPER_PAD_PRESS adds
+// a synthetic CROSS; PROSPER_PAD_SCRIPT adds a timed button sequence — device-independent test drivers.
 HostPadState snapshot(int /*handle*/, const char* what) {
-    HostPadState s;   // neutral, disconnected by default
+    HostPadState s;   // filled by the backend below (default: one connected, neutral controller)
     pad_backend()->poll(0, s);
     if (getenv("PROSPER_PAD_PRESS")) {
         s.connected = true;
