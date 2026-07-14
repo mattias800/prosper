@@ -409,6 +409,24 @@ if(TARGET prosper_core)
   if(WIN32)
     add_executable(boot_trace tools/boot_trace/boot_trace.cpp)
     target_link_libraries(boot_trace PRIVATE prosper_core)
+
+    # Live Vulkan renderer on Windows (PROSPER_RENDER=1): with the Vulkan SDK present, wire the same
+    # shared DrawItem->Vulkan compositor boot_trace uses on Linux so the guest's SubmitDcb draws
+    # execute + present + dump frames. Mirrors the UNIX block below (boot_trace + prosper_live_renderer
+    # only; the extra replay/screenshot tools stay Linux-first for now). See docs/PORTING.md "Windows".
+    find_package(Vulkan QUIET)
+    if(Vulkan_FOUND)
+      target_link_libraries(boot_trace PRIVATE Vulkan::Vulkan)
+      target_compile_definitions(boot_trace PRIVATE PROSPER_HAVE_VULKAN=1)
+      add_library(prosper_live_renderer STATIC frontends/shared/live_renderer.cpp
+                                               frontends/shared/live_compute.cpp)
+      target_include_directories(prosper_live_renderer PRIVATE src tests tools/boot_trace)
+      target_link_libraries(prosper_live_renderer PUBLIC prosper_core Vulkan::Vulkan)
+      target_include_directories(prosper_live_renderer PUBLIC frontends/shared)
+      target_link_libraries(boot_trace PRIVATE prosper_live_renderer)
+    else()
+      message(STATUS "Vulkan not found — Windows boot_trace built without the live renderer")
+    endif()
   endif()
 
   # M2+: real memory mapping, trap, boot, and the boot-trace debug tool (Linux + macOS/Rosetta).

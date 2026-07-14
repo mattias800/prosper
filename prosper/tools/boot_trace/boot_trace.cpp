@@ -34,9 +34,11 @@ extern "C" int prosper_reserved_range_state(uint64_t);   // memory-HLE mapping c
 #include <cstring>
 #include <algorithm>
 #include <vector>
+#ifndef _WIN32
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#endif
 #endif
 
 // PROSPER_CRASHPEEK (below) needs these in every config — the gpu/*.hpp includes above are gated on
