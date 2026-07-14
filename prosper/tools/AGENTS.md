@@ -63,6 +63,10 @@ PROSPER_GPU_CAPTURE=/tmp/messenger-level.prgcap PROSPER_GPU_CAPTURE_AT=0 \
 `PROSPER_GPU_CAPTURE_MIN_DRAWS`/`MAX_DRAWS` filter by realized item count; `PROSPER_GPU_CAPTURE_AT`
 counts matching invocations that reach the registered renderer, after the normal `RENDER_EVERY`
 sampling. Aim the live run near the target first; the capture itself writes once.
+The live hook snapshots realized draws, compute dispatches, and the original mixed PM4 operation order
+before executing the selected submit, then attaches the rendered pixel oracle afterward. An inspected
+mixed capsule must report the same draw/compute/operation counts as the live timing line; `computes=0`
+for a known mixed submit indicates an obsolete capture build, not proof that the barriers are unnecessary.
 `PROSPER_GPU_CAPTURE_AFTER=N` ignores the first `N` renderer invocations before applying the draw-count
 filters and `AT` counter. Pair it with `PROSPER_SUBMITLOG`/`PROSPER_RENDER_FIRST` when several early
 scenes share the same draw count as a late target.

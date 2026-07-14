@@ -254,8 +254,9 @@ struct PendingGpuCapture {
     std::string path;
     GpuCaptureFile capture;
 };
-std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(const std::vector<DrawItem>& items,
-                                                               uint32_t width, uint32_t height);
+std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
+    const std::vector<DrawItem>& draws, const std::vector<ComputeItem>& computes,
+    const std::vector<SubmitOperation>& operations, uint32_t width, uint32_t height);
 bool finish_requested_gpu_capture(std::unique_ptr<PendingGpuCapture> pending,
                                   const std::vector<uint8_t>& output, std::string& error);
 

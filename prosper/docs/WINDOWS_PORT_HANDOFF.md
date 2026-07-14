@@ -1,5 +1,8 @@
 # Windows native port — handoff (2026-07-14)
 
+For users of the prebuilt archive, start with `WINDOWS_RELEASE.md`. This document is the engineering
+build, validation, and debugging handoff.
+
 The Windows native core boots The Messenger (`PPSA24651`) through IL2CPP and repeated GC
 stop-the-world cycles, drives real GPU draws, and presents 1920x1080 frames. The fence-field,
 binary-file-read, and asynchronous-GC blockers were fixed in #672, #673, and #678 respectively.
@@ -183,7 +186,8 @@ PROSPER_GFXLOG=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
 Performance diagnostics: set `PROSPER_RENDER_TIMING=1` for aggregate graphics/compute stage timings, or
 `PROSPER_RENDER_TIMING=detail` to include slow individual texture decodes. The output and bucket definitions
 are documented in `FRONTEND_APP.md`; rolling `[render-window]` lines cover the latest 25 operations rather
-than averaging away the current scene. Backend output also reports transient Vulkan memory-pool statistics;
+than averaging away the current scene. Use `PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT=N` to defer detailed
+texture lines until the scene being profiled. Backend output also reports transient Vulkan memory-pool statistics;
 use `PROSPER_NO_MEMORY_POOL=1` for a direct allocate/free A/B run, or `PROSPER_MEMORY_POOL_MB=<MiB>` to
 override the default 512 MiB graphics budget. Compute allocations use a separate 256 MiB default budget,
 overridable with `PROSPER_COMPUTE_MEMORY_POOL_MB=<MiB>`. Graphics shader translation is cached by shader
@@ -191,7 +195,10 @@ bytes plus descriptor-interface semantics; `PROSPER_NO_SHADER_CACHE=1` disables 
 `PROSPER_SHADER_CACHE_MB=<MiB>` overrides its 128 MiB budget. Timing windows report shader hits/misses and
 miss compilation time. Run `test_shader_recompile_cache` after changing the key or recompiler contract.
 Frontend windows also report texture resource uses as `textures` and callback-local duplicate decodes
-avoided as `reused`; their difference is the number of performed decodes. Do not infer descriptor-table
+avoided as `reused`, plus exact-byte cross-submit `texture_cache` hits/misses/invalidations. The persistent
+cache is limited to guest-backed tiled `Unorm8x4` sampled textures and defaults to 256 MiB; use
+`PROSPER_NO_TEXTURE_DECODE_CACHE=1` for an A/B or `PROSPER_TEXTURE_DECODE_CACHE_MB=<MiB>` to change the
+budget. Do not infer descriptor-table
 identity from shader/user-SGPR values alone:
 pointed-to guest memory is mutable, and that cache experiment stalled Messenger at its loading screen.
 See `FRONTEND_APP.md` for the invalidation requirement.

@@ -173,9 +173,11 @@ and frontend publication. Cumulative `[render-timing]` lines show the whole run;
 lines show only the latest 25 submits/calls so a scene transition is immediately visible. The core
 window also reports graphics-shader cache hits, misses, bypasses, and actual miss compilation time.
 Use `PROSPER_RENDER_TIMING=detail` to additionally print individual texture decodes taking at least
-0.5 ms (capped at 250 lines). The instrumentation does not take clock samples when the variable is
-unset. This is the first tool to use when the window presents correctly but a title is not interactive;
-do not infer a GPU bottleneck from low FPS without the stage breakdown.
+0.5 ms (capped at 250 lines). Set `PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT=N` to begin those detail
+lines at renderer submit N, so boot textures do not consume the cap before the scene under study.
+The instrumentation does not take clock samples when the variable is unset. This is the first tool
+to use when the window presents correctly but a title is not interactive; do not infer a GPU
+bottleneck from low FPS without the stage breakdown.
 
 Transient Vulkan memory uses a bounded, exact-requirements pool because every backend call waits for its
 fence before cleanup. Timing output includes `memory_pool` hits, misses, cached allocation count/bytes,
@@ -190,11 +192,14 @@ graphics and compute pools. Decoded texture scratch vectors are also retained ac
 are storage only, and every partial decode/read explicitly clears its unwritten tail.
 
 Within one renderer callback, repeated guest-backed texture descriptions reuse the first decoded
-pixel buffer. This is intentionally callback-local because ordered compute splits graphics into new
-callbacks where guest memory may have changed. Live render-to-texture inputs are never reused through
-this map because an earlier pass can replace their pixels. The rolling frontend timing reports both
-`textures` (texture resource uses) and `reused` (decodes avoided); performed decodes are their
-difference.
+pixel buffer. A bounded process-wide cache also covers guest-backed tiled `Unorm8x4` sampled textures,
+the common sprite-atlas case. Every cross-submit lookup copies and compares the complete padded tiled
+source bytes before reusing decoded pixels; changed bytes, a changed mapping extent, or an address
+reuse invalidates the entry. Live render targets, storage images, and other formats remain excluded.
+The default budget is 256 MiB; use `PROSPER_TEXTURE_DECODE_CACHE_MB=<MiB>` to change it or
+`PROSPER_NO_TEXTURE_DECODE_CACHE=1` for an A/B run. Timing reports cross-submit `texture_cache`
+hits/misses/invalidations separately from `textures` (all texture uses) and `reused` (both local and
+persistent decodes avoided).
 
 Graphics RDNA2-to-SPIR-V results use a process-wide bounded cache (4096 entries and 128 MiB by
 default). Its key contains the shader bytes and only the resource-table fields consumed by compilation;
@@ -214,6 +219,14 @@ The current renderer remains a deterministic readback-based implementation. It r
 for screenshots and temporal RTT composition, so it is not the final zero-copy architecture. Issue #702
 tracks persistent Vulkan resource/pipeline caching and direct image presentation beyond the initial
 readback-memory, detile, compute-context, transient-memory-pool, scratch-reuse, and shader-cache fixes.
+On the native Windows Messenger first level, the exact-byte texture cache improved the same-binary
+workload from about 20 FPS to 24 FPS (resource construction 10.1-10.5 ms to about 3.9 ms). The remaining
+roughly 36-38 ms submit time is primarily ordered graphics/compute backend work: four graphics spans,
+four compute dispatches, synchronous fence waits/readbacks, and transient Vulkan pipelines/resources.
+Further work should be validated against a 3D title and converge graphics/compute resource ownership;
+title-specific 2D cache additions are not the current priority.
+The complete A/B table, heavy-frame budget, corrected capture graph, rejected experiments, and handoff
+decision are preserved in `RENDERER_PERFORMANCE_2026_07.md`.
 
 WSLg remains a useful alternate path for running the Linux build:
 

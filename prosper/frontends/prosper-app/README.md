@@ -38,6 +38,8 @@ CMake, Ninja, and MinGW-w64 UCRT are required; the launcher discovers the standa
 installation automatically.
 
 WSLg remains an alternate way to run the Linux build, but it is no longer the primary Windows path.
+Prebuilt Windows archives include `start-prosper.ps1`; see `prosper/docs/WINDOWS_RELEASE.md` for the
+no-UI launch command, save-data selection, keyboard map, and runtime requirements.
 
 ## Run
 

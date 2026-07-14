@@ -85,6 +85,13 @@ exposed a stale Windows `guest_readable` stub in dynamic-fetch folding; a `Virtu
 fixes the resulting loading-time host access violation (#688). Start Windows work from
 `docs/WINDOWS_PORT_HANDOFF.md`, not the historical pre-render fence investigation.
 
+The July native-renderer performance pass and its stop decision are documented in
+`docs/RENDERER_PERFORMANCE_2026_07.md`. Exact-byte texture decode reuse, per-submit readable-range
+reuse, output-copy removal, and corrected mixed-operation capture improve Messenger's first level
+from roughly 12 to 24 FPS. The remaining synchronous graphics/compute boundaries must be evaluated
+against a 3D workload; do not resume Messenger-specific cache work toward 60 FPS first. Windows
+release users start from `docs/WINDOWS_RELEASE.md`; build/debug work stays in the port handoff.
+
 The save-game list is visible (#299 closed), and retaining color-disabled depth/stencil passes (#520) recovers
 the first level's source scene. The black gameplay root cause was fixed on master by #528 (`e5fce22`):
 the direct 1024x32 RGBA16F grading-LUT producer was skipped because the recompiler lacked
@@ -236,7 +243,7 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   `/mnt/c/Users/matti/repos/ps5ys/PPSA24651-app0` (gitignored — **never commit it**).
   ```bash
   cd /mnt/c/Users/matti/repos/ps5ys/prosper/build-linux
-  cmake --build . -j8 && ctest        # 92/92 expected green on Linux
+  cmake --build . -j8 && ctest        # 93/93 expected green on Linux
   ```
 - **Verification is agentic-first / programmatic** (`docs/VERIFICATION.md`): ctest exit code is truth;
   shaders are `spirv-val`-gated; rendered frames are pixel/CRC-asserted or dumped to BMP. No manual

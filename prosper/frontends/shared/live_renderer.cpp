@@ -81,6 +81,17 @@ struct DecodedTexture {
     uint32_t output_height = 0;
     bool narrow = false;
 };
+
+struct PersistentDecodedTexture {
+    size_t source_size = 0;
+    std::vector<uint8_t> source_prefix;
+    std::vector<uint8_t> pixels;
+    uint32_t output_height = 0;
+    bool narrow = false;
+    uint64_t last_use = 0;
+
+    size_t bytes() const { return source_prefix.size() + pixels.size(); }
+};
 }
 
 void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
@@ -181,8 +192,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             using RenderClock = std::chrono::steady_clock;
             struct RenderTiming {
                 uint64_t callbacks = 0;
-                double total_ms = 0, build_resources_ms = 0, backend_ms = 0;
+                double total_ms = 0, build_resources_ms = 0, backend_ms = 0, output_copy_ms = 0;
                 uint64_t textures = 0, texture_reuses = 0, buffers = 0;
+                uint64_t persistent_hits = 0, persistent_misses = 0, persistent_invalidations = 0;
                 uint64_t texture_bytes = 0, buffer_bytes = 0;
                 double texture_ms = 0, buffer_ms = 0;
             };
@@ -270,6 +282,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             static std::vector<std::vector<uint8_t>> texstore;
             size_t texstore_used = 0;
             std::unordered_map<TextureDecodeKey, DecodedTexture, TextureDecodeKeyHash> decoded_textures;
+            static std::unordered_map<TextureDecodeKey, PersistentDecodedTexture, TextureDecodeKeyHash>
+                persistent_decoded_textures;
+            static size_t persistent_decoded_texture_bytes = 0;
+            static uint64_t persistent_decode_generation = 0;
+            const uint64_t decode_generation = ++persistent_decode_generation;
+            static std::vector<uint8_t> persistent_validation_scratch;
+            const size_t persistent_decode_limit = [] {
+                const char* value = getenv("PROSPER_TEXTURE_DECODE_CACHE_MB");
+                const uint64_t mib = value ? strtoull(value, nullptr, 10) : 256ull;
+                return static_cast<size_t>(std::min<uint64_t>(mib, SIZE_MAX / (1024ull * 1024ull))) *
+                       1024ull * 1024ull;
+            }();
             uint32_t resource_hash_w = 0, resource_hash_h = 0;
             if (const char* dim = getenv("PROSPER_RESOURCE_HASH_DIM"))
                 if (sscanf(dim, "%ux%u", &resource_hash_w, &resource_hash_h) != 2)
@@ -316,17 +340,55 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         auto live_rtt = rtt_on ? g_rtt.find(r.gpu_addr) : g_rtt.end();
                         const bool has_live_rtt = live_rtt != g_rtt.end() && live_rtt->second.w &&
                             live_rtt->second.h && !live_rtt->second.rgba.empty();
+                        const bool is_cube = r.img_dim == 3u;   // CUBE: six faces stacked vertically (#273)
+                        const uint32_t persistent_pitch = getenv("PROSPER_PITCH")
+                            ? static_cast<uint32_t>(atoi(getenv("PROSPER_PITCH"))) : 0;
+                        const bool persistent_cache_eligible =
+                            !getenv("PROSPER_NO_TEXTURE_DECODE_CACHE") && persistent_decode_limit &&
+                            !has_live_rtt && !is_cube && r.cls == RC::Texture &&
+                            r.format == prosper::gpu::DataFormat::Unorm8 && r.num_components == 4 &&
+                            !getenv("PROSPER_NODETILE") && prosper::gpu::tile_mode_is_tiled(r.tile_mode);
+                        const size_t persistent_source_size = persistent_cache_eligible
+                            ? prosper::gpu::tiled_surface_bytes(tw, th, r.tile_mode, persistent_pitch) : 0;
                         bool narrow_done = false;
                         auto reused = has_live_rtt ? decoded_textures.end()
                                                    : decoded_textures.find(decode_key);
-                        if (reused != decoded_textures.end()) {
-                            fr.tex_rgba = reused->second.pixels;
+                        DecodedTexture persistent_reuse;
+                        const DecodedTexture* decoded_reuse = reused != decoded_textures.end()
+                            ? &reused->second : nullptr;
+                        if (!decoded_reuse && persistent_cache_eligible) {
+                            auto cached = persistent_decoded_textures.find(decode_key);
+                            if (cached != persistent_decoded_textures.end() &&
+                                cached->second.source_size == persistent_source_size) {
+                                persistent_validation_scratch.resize(persistent_source_size);
+                                const size_t got = copy_resource(
+                                    persistent_validation_scratch.data(), r.gpu_addr,
+                                    persistent_source_size);
+                                if (got == cached->second.source_prefix.size() &&
+                                    (got == 0 || !std::memcmp(persistent_validation_scratch.data(),
+                                                              cached->second.source_prefix.data(), got))) {
+                                    cached->second.last_use = decode_generation;
+                                    persistent_reuse = {cached->second.pixels.data(),
+                                                        cached->second.output_height,
+                                                        cached->second.narrow};
+                                    decoded_reuse = &persistent_reuse;
+                                    if (timing_enabled) pending_timing.persistent_hits++;
+                                } else if (timing_enabled) {
+                                    pending_timing.persistent_invalidations++;
+                                }
+                            } else if (timing_enabled) {
+                                pending_timing.persistent_misses++;
+                            }
+                        }
+                        if (decoded_reuse) {
+                            fr.tex_rgba = decoded_reuse->pixels;
                             fr.tw = tw;
-                            fr.th = reused->second.output_height;
-                            narrow_done = reused->second.narrow;
+                            fr.th = decoded_reuse->output_height;
+                            narrow_done = decoded_reuse->narrow;
+                            decoded_textures.emplace(
+                                decode_key, DecodedTexture{fr.tex_rgba, fr.th, narrow_done});
                             if (timing_enabled) pending_timing.texture_reuses++;
                         } else {
-                        const bool is_cube = r.img_dim == 3u;   // CUBE: six faces stacked vertically (#273)
                         size_t nb = (size_t)tw * th * 4 * (is_cube ? 6u : 1u);
                         if (texstore_used == texstore.size()) texstore.emplace_back();
                         std::vector<uint8_t>& texture_pixels = texstore[texstore_used++];
@@ -709,6 +771,52 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             }
                         }
                         fr.tex_rgba = texture_pixels.data(); fr.tw = tw; fr.th = cube_done ? th * 6u : th;
+                        if (persistent_cache_eligible) {
+                            persistent_validation_scratch.resize(persistent_source_size);
+                            const size_t got = copy_resource(
+                                persistent_validation_scratch.data(), r.gpu_addr,
+                                persistent_source_size);
+                            auto old = persistent_decoded_textures.find(decode_key);
+                            const bool can_replace = old == persistent_decoded_textures.end() ||
+                                old->second.last_use != decode_generation;
+                            if (old != persistent_decoded_textures.end() && can_replace) {
+                                persistent_decoded_texture_bytes -= old->second.bytes();
+                                persistent_decoded_textures.erase(old);
+                            }
+                            const size_t required = got + texture_pixels.size();
+                            while (required <= persistent_decode_limit &&
+                                   persistent_decoded_texture_bytes > persistent_decode_limit - required) {
+                                auto victim = persistent_decoded_textures.end();
+                                for (auto it = persistent_decoded_textures.begin();
+                                     it != persistent_decoded_textures.end(); ++it) {
+                                    if (it->second.last_use == decode_generation) continue;
+                                    if (victim == persistent_decoded_textures.end() ||
+                                        it->second.last_use < victim->second.last_use) victim = it;
+                                }
+                                if (victim == persistent_decoded_textures.end()) break;
+                                persistent_decoded_texture_bytes -= victim->second.bytes();
+                                persistent_decoded_textures.erase(victim);
+                            }
+                            if (can_replace &&
+                                required <= persistent_decode_limit &&
+                                persistent_decoded_texture_bytes <= persistent_decode_limit - required) {
+                                PersistentDecodedTexture cached;
+                                cached.source_size = persistent_source_size;
+                                cached.source_prefix.assign(
+                                    persistent_validation_scratch.begin(),
+                                    persistent_validation_scratch.begin() + got);
+                                cached.pixels = texture_pixels;
+                                cached.output_height = fr.th;
+                                cached.narrow = narrow_done;
+                                cached.last_use = decode_generation;
+                                auto [inserted, ok] = persistent_decoded_textures.emplace(
+                                    decode_key, std::move(cached));
+                                if (ok) {
+                                    persistent_decoded_texture_bytes += inserted->second.bytes();
+                                    fr.tex_rgba = inserted->second.pixels.data();
+                                }
+                            }
+                        }
                         if (!resource_rtt_hit && !has_live_rtt)
                             decoded_textures.emplace(
                                 decode_key, DecodedTexture{fr.tex_rgba, fr.th, narrow_done});
@@ -765,8 +873,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             pending_timing.textures++;
                             pending_timing.texture_bytes += static_cast<uint64_t>(fr.tw) * fr.th * 4;
                             pending_timing.texture_ms += elapsed;
+                            const uint64_t detail_min_submit = getenv("PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT")
+                                ? strtoull(getenv("PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT"), nullptr, 0) : 0;
                             if (const char* mode = getenv("PROSPER_RENDER_TIMING");
-                                mode && strcmp(mode, "detail") == 0 && elapsed >= 0.5) {
+                                mode && strcmp(mode, "detail") == 0 &&
+                                static_cast<uint64_t>(g_this_submit) >= detail_min_submit && elapsed >= 0.5) {
                                 static uint64_t detail_lines = 0;
                                 if (detail_lines++ < 250) {
                                     fprintf(stderr,
@@ -921,6 +1032,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 return g.empty() ? nullptr : g.front()->ps.clear_color;
             };
             std::vector<uint8_t> px;
+            const std::vector<uint8_t>* selected_pixels = nullptr;
             if (pertarget) {
                 // PER-TARGET RTT: a real frame is a sequence of passes, each rendering into a specific
                 // color target (CB_COLOR0_BASE), and a final composite pass SAMPLES the earlier targets.
@@ -953,7 +1065,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         fprintf(stderr, " [%d]=0x%llx", i, (unsigned long long)prosper_vo_buffer_addr(i));
                     fprintf(stderr, "\n");
                 }
-                std::vector<uint8_t> px_front, px_vo;   // flip-matched / any-scanout-matched candidates
+                const std::vector<uint8_t>* px_front = nullptr;
+                const std::vector<uint8_t>* px_vo = nullptr;
+                const std::vector<uint8_t>* px_last = nullptr;
                 // Render-target persistence (default on; PROSPER_RTT_NOSEED reverts to per-pass blue
                 // clear): seed each group's framebuffer with the pixels last rendered into that SAME
                 // target VA, so a pass that draws into an already-written target (UE4's UI pass onto
@@ -1023,10 +1137,19 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         pending_timing.backend_ms +=
                             std::chrono::duration<double, std::milli>(backend_done - build_done).count();
                     }
-                    if (base && !gpx.empty()) { RttSurf& s = g_rtt[base]; s.rgba = gpx; s.w = gw; s.h = gh; }
-                    if (native_w == resource_hash_w && native_h == resource_hash_h && !gpx.empty()) {
+                    const std::vector<uint8_t>* pass_pixels = &gpx;
+                    if (base && !gpx.empty()) {
+                        RttSurf& surface = g_rtt[base];
+                        surface.rgba = std::move(gpx);
+                        surface.w = gw;
+                        surface.h = gh;
+                        pass_pixels = &surface.rgba;
+                    }
+                    const std::vector<uint8_t>& rendered_pixels = *pass_pixels;
+                    if (native_w == resource_hash_w && native_h == resource_hash_h &&
+                        !rendered_pixels.empty()) {
                         uint64_t hash = 1469598103934665603ull;
-                        for (uint8_t byte : gpx) {
+                        for (uint8_t byte : rendered_pixels) {
                             hash ^= byte;
                             hash *= 1099511628211ull;
                         }
@@ -1103,9 +1226,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     for (int i = 0; i < vo_n && !is_vo; i++) is_vo = base && base == prosper_vo_buffer_addr(i);
                     if (getenv("PROSPER_RTTLOG")) {
                         size_t nz = 0, rgb_nz = 0;
-                        for (uint8_t b : gpx) nz += (b != 0);
-                        for (size_t p = 0; p + 3 < gpx.size(); p += 4)
-                            rgb_nz += (gpx[p] != 0 || gpx[p + 1] != 0 || gpx[p + 2] != 0);
+                        for (uint8_t b : rendered_pixels) nz += (b != 0);
+                        for (size_t p = 0; p + 3 < rendered_pixels.size(); p += 4)
+                            rgb_nz += (rendered_pixels[p] != 0 || rendered_pixels[p + 1] != 0 ||
+                                       rendered_pixels[p + 2] != 0);
                         fprintf(stderr, "[rtt] pass target=0x%llx extent=%ux%u native=%ux%u (%zu draws) "
                                 "px_nonzero=%zu rgb_nonblack=%zu cache_size=%zu%s%s\n",
                                 (unsigned long long)base, gw, gh, native_w, native_h, pass.size(), nz, rgb_nz, g_rtt.size(),
@@ -1131,25 +1255,24 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     // PROSPER_DUMP_RTGROUPS=<min-nonzero-bytes>: dump each per-target group's rendered
                     // pixels (rtgrp_<base>_<frame>.bmp in PROSPER_FRAME_DIR) — to inspect an intermediate
                     // pass (e.g. the UI/banner RT) instead of only the presented composite. Diagnostic.
-                    if (const char* rg = getenv("PROSPER_DUMP_RTGROUPS"); rg && !gpx.empty()) {
-                        size_t nz = 0; for (uint8_t b : gpx) nz += (b != 0);
+                    if (const char* rg = getenv("PROSPER_DUMP_RTGROUPS"); rg && !rendered_pixels.empty()) {
+                        size_t nz = 0; for (uint8_t b : rendered_pixels) nz += (b != 0);
                         if (nz >= (size_t)atol(rg)) {
                             const char* dd = getenv("PROSPER_FRAME_DIR");
                             char fn[512]; snprintf(fn, sizeof fn, "%s/rtgrp_%llx_%04d.bmp",
                                                    dd ? dd : ".", (unsigned long long)base, frame_no.load());
-                            prosper::test::dump_bmp(fn, gpx, gw, gh);
+                            prosper::test::dump_bmp(fn, rendered_pixels, gw, gh);
                         }
                     }
-                    if (!gpx.empty()) {
-                        if (base && base == front_va) px_front = gpx;                   // the flipped buffer
-                        if (is_vo)                    px_vo    = gpx;                   // any registered scanout
-                        px = std::move(gpx);                                            // last non-empty (fallback)
+                    if (!rendered_pixels.empty()) {
+                        if (base && base == front_va) px_front = pass_pixels;  // the flipped buffer
+                        if (is_vo)                    px_vo = pass_pixels;     // any registered scanout
+                        px_last = pass_pixels;                                  // last non-empty (fallback)
                     }
                 }
                 // Present priority: the flipped front buffer > any registered scanout target > the
                 // legacy "last group" fallback (unchanged behavior when no group targets a VO buffer).
-                if (!px_front.empty())   px = std::move(px_front);
-                else if (!px_vo.empty()) px = std::move(px_vo);
+                selected_pixels = px_front ? px_front : (px_vo ? px_vo : px_last);
             } else {
                 // Single-framebuffer path: render_draws_rgba composites every draw into ONE framebuffer.
                 std::vector<const prosper::gpu::DrawItem*> all; all.reserve(items.size());
@@ -1198,7 +1321,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     for (int i = 0; i < prosper_vo_buffer_count(); ++i)
                         if ((scanout = cached_scanout(prosper_vo_buffer_addr(i)))) break;
                 }
-                if (scanout) px = scanout->rgba;
+                if (scanout) selected_pixels = &scanout->rgba;
+            }
+            if (phase.final_span && selected_pixels) {
+                const auto copy_start = timing_enabled
+                    ? RenderClock::now() : RenderClock::time_point{};
+                px.assign(selected_pixels->begin(), selected_pixels->end());
+                if (timing_enabled)
+                    pending_timing.output_copy_ms += std::chrono::duration<double, std::milli>(
+                        RenderClock::now() - copy_start).count();
             }
             if (!phase.final_span) {
                 if (timing_enabled) {
@@ -1227,8 +1358,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     RenderClock::now() - callback_timing_start).count();
                 struct TimingTotals {
                     uint64_t submits = 0, callbacks = 0;
-                    double total_ms = 0, build_resources_ms = 0, backend_ms = 0;
+                    double total_ms = 0, build_resources_ms = 0, backend_ms = 0, output_copy_ms = 0;
                     uint64_t textures = 0, texture_reuses = 0, buffers = 0;
+                    uint64_t persistent_hits = 0, persistent_misses = 0, persistent_invalidations = 0;
                     uint64_t texture_bytes = 0, buffer_bytes = 0;
                     double texture_ms = 0, buffer_ms = 0;
                 };
@@ -1240,8 +1372,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     timing.total_ms += pending_timing.total_ms;
                     timing.build_resources_ms += pending_timing.build_resources_ms;
                     timing.backend_ms += pending_timing.backend_ms;
+                    timing.output_copy_ms += pending_timing.output_copy_ms;
                     timing.textures += pending_timing.textures;
                     timing.texture_reuses += pending_timing.texture_reuses;
+                    timing.persistent_hits += pending_timing.persistent_hits;
+                    timing.persistent_misses += pending_timing.persistent_misses;
+                    timing.persistent_invalidations += pending_timing.persistent_invalidations;
                     timing.buffers += pending_timing.buffers;
                     timing.texture_bytes += pending_timing.texture_bytes;
                     timing.buffer_bytes += pending_timing.buffer_bytes;
@@ -1252,13 +1388,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 accumulate(window);
                 if (totals.submits % 25 == 0) {
                     const double nsub = static_cast<double>(totals.submits);
-                    const double other = totals.total_ms - totals.build_resources_ms - totals.backend_ms;
+                    const double other = totals.total_ms - totals.build_resources_ms - totals.backend_ms -
+                                         totals.output_copy_ms;
                     fprintf(stderr,
                             "[render-timing] frontend submits=%llu callbacks=%llu avg_ms: total=%.2f "
-                            "build_resources=%.2f backend=%.2f other=%.2f\n",
+                            "build_resources=%.2f backend=%.2f output_copy=%.2f other=%.2f\n",
                             (unsigned long long)totals.submits, (unsigned long long)totals.callbacks,
                             totals.total_ms / nsub, totals.build_resources_ms / nsub,
-                            totals.backend_ms / nsub, other / nsub);
+                            totals.backend_ms / nsub, totals.output_copy_ms / nsub, other / nsub);
                     fprintf(stderr,
                             "[render-timing] resources textures=%llu reused=%llu %.1f MiB %.2f ms/submit; "
                             "buffers=%llu %.1f MiB %.2f ms/submit\n",
@@ -1267,20 +1404,33 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             totals.texture_bytes / (1024.0 * 1024.0), totals.texture_ms / nsub,
                             (unsigned long long)totals.buffers,
                             totals.buffer_bytes / (1024.0 * 1024.0), totals.buffer_ms / nsub);
+                    fprintf(stderr,
+                            "[render-timing] texture_cache hits=%llu misses=%llu invalid=%llu entries=%zu %.1f MiB\n",
+                            (unsigned long long)totals.persistent_hits,
+                            (unsigned long long)totals.persistent_misses,
+                            (unsigned long long)totals.persistent_invalidations,
+                            persistent_decoded_textures.size(),
+                            persistent_decoded_texture_bytes / (1024.0 * 1024.0));
                     const double wn = static_cast<double>(window.submits);
                     const double window_other = window.total_ms - window.build_resources_ms -
-                                                window.backend_ms;
+                                                window.backend_ms - window.output_copy_ms;
                     fprintf(stderr,
                             "[render-window] frontend submits=%llu callbacks=%.1f avg_ms: total=%.2f "
-                            "build_resources=%.2f backend=%.2f other=%.2f; resources textures=%.1f "
+                            "build_resources=%.2f backend=%.2f output_copy=%.2f other=%.2f; "
+                            "resources textures=%.1f "
                             "reused=%.1f %.1f MiB %.2f ms buffers=%.1f %.1f MiB %.2f ms\n",
                             (unsigned long long)window.submits, window.callbacks / wn,
                             window.total_ms / wn, window.build_resources_ms / wn,
-                            window.backend_ms / wn, window_other / wn, window.textures / wn,
+                            window.backend_ms / wn, window.output_copy_ms / wn, window_other / wn,
+                            window.textures / wn,
                             window.texture_reuses / wn,
                             window.texture_bytes / (wn * 1024.0 * 1024.0), window.texture_ms / wn,
                             window.buffers / wn, window.buffer_bytes / (wn * 1024.0 * 1024.0),
                             window.buffer_ms / wn);
+                    fprintf(stderr,
+                            "[render-window] texture_cache hits=%.1f misses=%.1f invalid=%.1f\n",
+                            window.persistent_hits / wn, window.persistent_misses / wn,
+                            window.persistent_invalidations / wn);
                     window = {};
                 }
             }

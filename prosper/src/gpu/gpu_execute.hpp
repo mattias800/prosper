@@ -111,6 +111,21 @@ std::vector<DynFetch> resolve_dynamic_fetch(const uint32_t* code, size_t dwords,
                                             uint32_t user_sgpr_base,
                                             std::vector<SrtUse>* srt_uses = nullptr);
 
+// The dynamic descriptor fold and shader-cache key builder both walk immutable shader instructions
+// on every draw. Cache only the decoded instructions, validating the complete consumed byte range on
+// every hit. Concrete SGPR values and descriptor-table memory remain per-draw inputs to the fold.
+struct ShaderDecodeCacheStats {
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t bypasses = 0;
+    uint64_t invalidations = 0;
+    uint64_t evictions = 0;
+    uint64_t entries = 0;
+    uint64_t bytes = 0;
+};
+ShaderDecodeCacheStats shader_decode_cache_stats();
+void clear_shader_decode_cache();
+
 // PROSPER_DYNTRACE_FAIL support (gpu_executor.cpp): while true, resolve_dynamic_fetch traces its
 // walk and build_stage_table dumps the user-data SGPR blocks. realize_draw_item sets it around a
 // replay of a FAILED vertex-stage resource build, so the diagnostic captures exactly the failing
@@ -191,6 +206,15 @@ struct DrawRealizationPhaseStats {
 };
 void record_draw_realization_phases(double table_ms, double shader_ms);
 DrawRealizationPhaseStats draw_realization_phase_stats();
+
+struct StageTablePhaseStats {
+    uint64_t calls = 0;
+    double metadata_ms = 0.0;
+    double dynamic_fold_ms = 0.0;
+    double resources_ms = 0.0;
+};
+void record_stage_table_phases(double metadata_ms, double dynamic_fold_ms, double resources_ms);
+StageTablePhaseStats stage_table_phase_stats();
 
 enum class RealizationFailureReason : uint8_t {
     None,
