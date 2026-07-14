@@ -2950,15 +2950,19 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // user-data SGPR index (the V# was placed in SGPRs by the driver). Default binding 2.
             uint32_t binding = 2; bool cbuf_resolved = false;
             if (rt) { const ShaderResource* res = nullptr;
+                // Descriptor-table folding emits pc-only entries when a V# has no stable SRT key
+                // (or that key collides). Exact per-use provenance must win, as it does for MUBUF/MIMG.
+                res = rt->by_fetch_pc(in.pc);
+                if (res && res->cls != ResourceClass::ConstantBuffer) res = nullptr;
                 auto it = rs.sreg_srt.find(in.src[0].value);
-                if (it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second);
+                if (!res && it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second);
                 // A scalar buffer load reads a CONSTANT buffer — resolve the SBASE SGPR to a constant
                 // buffer specifically (the same SGPR may also hold a vertex-buffer V# elsewhere).
                 if (!res) res = rt->by_sgpr_base_cls(in.src[0].value, ResourceClass::ConstantBuffer);
                 if (res) { binding = res->binding; cbuf_resolved = true; } }
             if (getenv("PROSPER_CBUFLOG"))
-                fprintf(stderr, "[cbuf] s_buffer_load x%u src0=s%d off=0x%x(dw%u) dyn=%d -> binding=%u %s\n",
-                        n, in.src[0].value, in.literal, base_idx, (int)soff_dyn, binding,
+                fprintf(stderr, "[cbuf] pc=%u s_buffer_load x%u src0=s%d off=0x%x(dw%u) dyn=%d -> binding=%u %s\n",
+                        in.pc, n, in.src[0].value, in.literal, base_idx, (int)soff_dyn, binding,
                         cbuf_resolved ? "resolved" : "DEFAULT-2");
             // Immediate s_load_dwordx4/x8 is the same descriptor-table fetch as the dynamic form
             // handled above. When the front-half table already decoded that V#/T#/S#, its raw words

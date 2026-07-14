@@ -3,6 +3,7 @@
 #include "gpu_capture.hpp"
 #include "gpu_capture_bundle.hpp"
 #include "gpu_dependency_graph.hpp"
+#include "pm4_registers.hpp"
 #include "render_state.hpp"
 #include "videoout_present.hpp"
 #include "writer_provenance.hpp"
@@ -1200,6 +1201,95 @@ bool gpu_timeline_submit_matches(const GpuTimelineSubmit& submit,
     return false;
 }
 
+// PROSPER_GPU_TIMELINE_MRT_SUBMIT=N, or the MRT_{MIN,MAX}_{DRAWS,DISPATCHES} predicates: print the
+// complete raw color-target programming for every semantic draw in one selected submit. Timeline
+// target spans intentionally retain only MRT0's extent, which is enough for scene selection but
+// cannot prove whether a sampled GPU-only surface was produced through MRT1..7. This bounded
+// diagnostic reads the draw-time register snapshots and never realizes shaders, copies resources,
+// or invokes Vulkan. Semantic predicates select only their first match so a title loop stays bounded.
+bool select_timeline_mrt_submit(const GpuState& state, uint64_t submit_no) {
+    struct Config {
+        uint64_t exact = 0;
+        size_t min_draws = 0, max_draws = std::numeric_limits<size_t>::max();
+        size_t min_dispatches = 0, max_dispatches = std::numeric_limits<size_t>::max();
+        bool semantic = false;
+    };
+    static const Config config = [] {
+        Config out;
+        auto read = [&](const char* name, size_t& field) {
+            const char* value = std::getenv(name);
+            if (!value || !*value) return;
+            field = static_cast<size_t>(std::strtoull(value, nullptr, 0));
+            out.semantic = true;
+        };
+        if (const char* value = std::getenv("PROSPER_GPU_TIMELINE_MRT_SUBMIT"); value && *value)
+            out.exact = std::strtoull(value, nullptr, 0);
+        read("PROSPER_GPU_TIMELINE_MRT_MIN_DRAWS", out.min_draws);
+        read("PROSPER_GPU_TIMELINE_MRT_MAX_DRAWS", out.max_draws);
+        read("PROSPER_GPU_TIMELINE_MRT_MIN_DISPATCHES", out.min_dispatches);
+        read("PROSPER_GPU_TIMELINE_MRT_MAX_DISPATCHES", out.max_dispatches);
+        return out;
+    }();
+    if (config.exact) return submit_no == config.exact;
+    if (!config.semantic || state.draws.size() < config.min_draws ||
+        state.draws.size() > config.max_draws ||
+        state.dispatches.size() < config.min_dispatches ||
+        state.dispatches.size() > config.max_dispatches)
+        return false;
+    static std::atomic<uint64_t> selected{0};
+    uint64_t expected = 0;
+    selected.compare_exchange_strong(expected, submit_no, std::memory_order_relaxed);
+    return selected.load(std::memory_order_relaxed) == submit_no;
+}
+
+void log_timeline_mrt_draw(const GpuState& draw_state, uint64_t submit_no,
+                           size_t draw_index, uint64_t command_order, bool selected) {
+    if (!selected) return;
+    namespace P = prosper::agc::Pm4;
+    auto read = [&](uint32_t reg) {
+        const auto found = draw_state.cx.find(reg);
+        return found == draw_state.cx.end() ? 0u : found->second;
+    };
+    const bool has_target_mask = draw_state.cx.count(P::CB_TARGET_MASK) != 0;
+    const bool has_shader_mask = draw_state.cx.count(P::CB_SHADER_MASK) != 0;
+    const uint32_t target_mask = has_target_mask ? read(P::CB_TARGET_MASK) : 0xffffffffu;
+    const uint32_t shader_mask = read(P::CB_SHADER_MASK);
+
+    std::fprintf(stderr,
+                 "[timeline-mrt] submit=%llu draw=%zu order=%llu target-mask=%08x%s "
+                 "shader-mask=%08x%s",
+                 static_cast<unsigned long long>(submit_no), draw_index,
+                 static_cast<unsigned long long>(command_order), target_mask,
+                 has_target_mask ? "" : "(default)", shader_mask,
+                 has_shader_mask ? "" : "(absent)");
+    for (uint32_t slot = 0; slot < 8; ++slot) {
+        constexpr uint32_t kColorRegisterStride = 0xf;
+        const uint32_t base_reg = P::CB_COLOR0_BASE + slot * kColorRegisterStride;
+        const uint32_t info_reg = P::CB_COLOR0_INFO + slot * kColorRegisterStride;
+        const uint32_t attrib2_reg = P::CB_COLOR0_ATTRIB2 + slot;
+        const uint32_t base = read(base_reg);
+        const uint32_t base_ext = read(P::CB_COLOR0_BASE_EXT + slot);
+        const uint32_t info = read(info_reg);
+        const auto attrib2 = draw_state.cx.find(attrib2_reg);
+        const uint32_t write_mask = (target_mask >> (slot * 4)) & 0xfu;
+        const uint32_t export_mask = (shader_mask >> (slot * 4)) & 0xfu;
+        // An absent CB_TARGET_MASK defaults to all ones, but that does not bind seven zero-address
+        // targets. Report only a programmed surface or shader export, while still showing its mask.
+        if (!base && !base_ext && !info && !export_mask) continue;
+        const uint64_t address = (static_cast<uint64_t>(base) << 8) |
+                                 (static_cast<uint64_t>(base_ext & 0xffu) << 40);
+        const uint32_t format = PM4_FIELD(info, CB_COLOR0_INFO, FORMAT);
+        std::fprintf(stderr, " c%u=0x%llx/f%u/w%x/e%x", slot,
+                     static_cast<unsigned long long>(address), format, write_mask, export_mask);
+        if (attrib2 != draw_state.cx.end()) {
+            const uint32_t width = PM4_FIELD(attrib2->second, CB_COLOR0_ATTRIB2, MIP0_WIDTH) + 1u;
+            const uint32_t height = PM4_FIELD(attrib2->second, CB_COLOR0_ATTRIB2, MIP0_HEIGHT) + 1u;
+            std::fprintf(stderr, "/%ux%u", width, height);
+        }
+    }
+    std::fputc('\n', stderr);
+}
+
 void begin_gpu_timeline_submit(uint64_t submit_no) {
     static const bool requested = [] {
         const char* path = std::getenv("PROSPER_GPU_TIMELINE");
@@ -1222,11 +1312,14 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
     submit.draw_count = static_cast<uint32_t>(std::min<size_t>(state.draws.size(), UINT32_MAX));
     submit.dispatch_count = static_cast<uint32_t>(std::min<size_t>(state.dispatches.size(), UINT32_MAX));
     submit.first_command_order = std::numeric_limits<uint64_t>::max();
+    const bool log_mrt = select_timeline_mrt_submit(state, submit_no);
     for (size_t draw_index = 0; draw_index < state.draws.size(); ++draw_index) {
         const auto& draw = state.draws[draw_index];
         submit.first_command_order = std::min(submit.first_command_order, draw.command_order);
         submit.last_command_order = std::max(submit.last_command_order, draw.command_order);
-        const RenderState rs = extract_render_state(draw.state ? *draw.state : state);
+        const GpuState& draw_state = draw.state ? *draw.state : state;
+        log_timeline_mrt_draw(draw_state, submit_no, draw_index, draw.command_order, log_mrt);
+        const RenderState rs = extract_render_state(draw_state);
         if (!submit.target_spans_truncated) {
             if (draw_index > UINT32_MAX) {
                 submit.target_spans_truncated = true;

@@ -472,6 +472,26 @@ int main() {
     CHECK(!spv22hi.empty() && !has2 && has32 && has33,
           "#515: decoded descriptor fetches add no dead binding-2 contract; data loads use 32/33");
 
+    // #319: key-less/collided descriptor-table V#s carry exact consuming-PC provenance. Scalar
+    // loads must consult it; otherwise the real resource is present while generated code reads b2.
+    const uint32_t code22pc[] = {
+        0xf4200002u, 0xfa000004u, 0x7e000c00u, 0xbf810000u,
+    };
+    ShaderResourceTable rt22pc;
+    { ShaderResource cb{}; cb.cls = ResourceClass::ConstantBuffer; cb.format = DataFormat::Uint32;
+      cb.num_components = 1; cb.binding = 3; cb.fetch_pc = 0; rt22pc.resources.push_back(cb); }
+    std::vector<uint32_t> spv22pc = recompile_valu(
+        code22pc, sizeof(code22pc)/sizeof(code22pc[0]), 1, 0, &rt22pc);
+    std::vector<uint32_t> cbuf22pc0(4, 0u), cbuf22pc1(4, 0u);
+    cbuf22pc0[1] = 20u; cbuf22pc1[1] = 300u;
+    std::vector<float> got22pc = prosper::test::run_compute(
+        spv22pc, in22, N, N, cbuf22pc0, cbuf22pc1);
+    uint32_t bad22pc = 0;
+    for (uint32_t i = 0; i < N && got22pc.size() == N; i++)
+        if (std::fabs(got22pc[i] - 300.0f) > 1e-3f) bad22pc++;
+    CHECK(!spv22pc.empty() && got22pc.size() == N && bad22pc == 0,
+          "#319: pc-only cbuf provenance routes s_buffer_load off fallback binding 2");
+
     // Kernel 23: buffer_load_format_x FLOAT32 VERTEX FETCH (stage 2 — the real-VS mechanism). v0=(uint)
     // gid (element index); buffer_load_format_x v1, v0, s[8:11] idxen fetches vbuf[gid]; out=v1. The V#
     // descriptor is DIRECT (in user-data SGPR s8) -> resolved via sgpr_base -> VertexBuffer binding 3,
