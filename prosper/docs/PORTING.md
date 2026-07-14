@@ -521,9 +521,10 @@ Diagnostics in place: `PROSPER_SYNCLOG` (`[sync]` WaitOnAddress + `[sync2]` cond
 `PROSPER_MEMLOG`, `PROSPER_VEHLOG`, boot_trace `[memclass]`.
 
 Deferred, lower-priority items (some now done): ~~honor reserve alignment > 64 KiB~~ (done, #658);
-~~worker-thread stack registration for GC bounds~~ (done, #658); phys-offset aliasing in the memory HLE
-(needed by UE4 MallocBinned3, not this Unity title — `CreateFileMapping`/`MapViewOfFile3`, 64 KiB
-granularity); and `PROSPER_CRASHPEEK` guards.
+~~worker-thread stack registration for GC bounds~~ (done, #658); ~~preserve phys-offset aliasing in
+the ordinary Windows direct-memory path~~ (done, #691 with one sparse `CreateFileMapping` section and
+shared views); and `PROSPER_CRASHPEEK` guards. The remaining exact 16 KiB placement and partial-unmap
+edge cases are tracked separately in #697.
 
 **What is done (compiles + links, in CI):**
 - **`exec_image_win.cpp`** — the Win32 sibling of `exec_image_linux.cpp` implementing the full
@@ -549,9 +550,11 @@ granularity); and `PROSPER_CRASHPEEK` guards.
 1. **Extend native scripted gameplay coverage beyond The Messenger (#683/#688).** The frontend,
    controller composition, WIC screenshot path, and routed first-level acceptance now work. Add
    checkpoint automation for more titles as the Windows substrate is exercised more broadly.
-2. **Preserve physical-offset aliasing in the Windows memory HLE.** Private `VirtualAlloc` is sufficient
-   for Unity, but UE4 MallocBinned3 needs shared backing (`CreateFileMapping`/`MapViewOfFile3`) while
-   respecting Windows' 64 KiB allocation granularity.
+2. **Complete the remaining 16 KiB section-view edge cases (#697).** Direct memory now uses one sparse
+   paging-file section, so zero-hint and 64 KiB-congruent mappings alias correctly and Dead Cells no
+   longer corrupts the host heap during physical-range churn (#691). Exact fixed maps whose virtual and
+   physical 64 KiB deltas differ still use the private fallback, and partial unmap needs a section-aware
+   implementation. These likely require placeholder APIs (`VirtualAlloc2`/`MapViewOfFile3`).
 3. **Validate/repair the guest→HLE ABI trampoline for XMM/float args.** Integer args 1-9 are converted
    and now runtime-exercised through init; **XMM/float args are still not converted** (e.g. some libc
    formatters / `printf`-family) — add float-arg conversion when a title needs it.
