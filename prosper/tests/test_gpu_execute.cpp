@@ -5,6 +5,7 @@
 #include "../src/gpu/gpu_execute.hpp"
 #include "../src/gpu/videoout_present.hpp"
 #include "../src/gpu/pm4_registers.hpp"
+#include "../src/gpu/vk_translate.hpp"
 #include "render_runner.h"
 #include <cstdio>
 #include <cstdint>
@@ -203,6 +204,15 @@ int main() {
         DrawItem it3;
         bool made3 = realize_draw_item(st, nullptr, /*vcount_hint*/3u, 0x10000u, /*log*/false, it3);
         CHECK(made3 && it3.vertex_count == 3u, "non-zero vertex-count draw still realizes");
+
+        GpuState rect = st;
+        rect.uc[P::VGT_PRIMITIVE_TYPE] = 7;
+        DrawItem rect_item;
+        bool made_rect = realize_draw_item(rect, nullptr, /*vcount_hint*/3u, 0x10000u,
+                                           /*log*/false, rect_item);
+        CHECK(made_rect && rect_item.vertex_count == 4u &&
+              rect_item.ps.topology == static_cast<uint32_t>(VkTopology::TriangleStrip),
+              "PS5 procedural RectList expands three vertices to a four-corner Vulkan strip");
     }
 
     // #461: an indexed draw whose fetched index buffer contains a garbage-large value (an announced

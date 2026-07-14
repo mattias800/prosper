@@ -8,7 +8,10 @@ namespace prosper::gpu {
 
 VkTopology vk_topology(uint32_t prim_type) {
     // RDNA2 VGT_DI_PRIMITIVE_TYPE (kPrimitiveType*): 1=point, 2=line list, 3=line strip,
-    // 4=triangle list, 5=triangle fan, 6=triangle strip. RectList(17)/QuadList(19) are the
+    // 4=triangle list, 5=triangle fan, 6=triangle strip. PS5 AGC also emits 7 for RectList:
+    // Blasphemous 2 uses it for transparent fullscreen clears. The executor expands the observed
+    // three-vertex procedural form to four vertices; treating 7 as the standard AMD reserved value
+    // leaves stale opaque alpha over the scene. RectList(17)/QuadList(19) are the
     // screen-space primitives drivers emit for full-screen passes / fast clears / resolves;
     // Kyty (GraphicsRender.cpp) approximates them as TriangleStrip / TriangleFan — far closer
     // than the old PointList fallback, which rasterized a full-screen effect as 3 stray points.
@@ -19,6 +22,7 @@ VkTopology vk_topology(uint32_t prim_type) {
         case 4:  return VkTopology::TriangleList;
         case 5:  return VkTopology::TriangleFan;
         case 6:  return VkTopology::TriangleStrip;
+        case 7:  return VkTopology::TriangleStrip;  // PS5 RectList (executor supplies the fourth corner)
         case 17: return VkTopology::TriangleStrip;  // kPrimitiveTypeRectList (3-vertex screen rect ~ strip)
         case 19: return VkTopology::TriangleFan;    // kPrimitiveTypeQuadList (~ fan)
         default: break;

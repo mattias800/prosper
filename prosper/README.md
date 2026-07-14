@@ -62,8 +62,10 @@ possible without console keys. Dumps are user-supplied and gitignored.
   run continues through its Http2 calls and loads gameplay scenes, UI, enemies, bosses, audio banks, and
   cutscene assets. Normal-return guest pthreads now leave host `%fs` active before glibc performs its own
   thread cleanup (#644), removing the next host crash. Poll-safe scripted presses and observed-state logging
-  (#646) reliably traverse the long opening. A sampled-render native capture confirms the complete first
-  playable room, and screenshot manifests now distinguish new publications from actual pixel progress (#648).
+  (#646) reliably traverse the long opening. PS5 primitive type 7 is the title's procedural RectList clear;
+  mapping it to a four-corner Vulkan triangle strip clears stale UI alpha instead of rasterizing three points
+  over an otherwise valid world (#654). A 420-frame sampled-render native capture confirms the complete first
+  playable room, and screenshot manifests distinguish new publications from actual pixel progress (#648).
   The route and capture recipe are in `scripts/blasphemous2/README.md`.
 - 🚧 **Active frontiers:** bundle v2 makes long Dead Cells history practical with exact shared-resource
   chunks, rolling semantic endpoints, final compaction, and suffix replay (#606). A fixed 1,200-submit full-state

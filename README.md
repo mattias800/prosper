@@ -80,7 +80,9 @@ accepts scripted gamepad input, and renders the first level.
 - ✅ **Blasphemous 2 reaches first gameplay:** the FMOD plugin path, AGC marker contract, two-pass HTTP URI
   parser, and guest-thread return boundary are implemented. A poll-safe scripted route traverses the EULA and
   opening cinematic into a complete native 1920x1080 first room with player, HUD, world layers, lighting, and
-  interaction UI. The reproducible capture recipe is in
+  interaction UI. The last black-world defect was PS5 primitive type 7: it is a RectList used by transparent
+  fullscreen clears, while prosper treated it as three points. The observed procedural form now runs its fourth
+  corner and renders as a Vulkan triangle strip (#654). The reproducible capture recipe is in
   [`prosper/scripts/blasphemous2/README.md`](prosper/scripts/blasphemous2/README.md).
 
 **Frontend:** `prosper-app` is a windowed player (SDL3 window + Vulkan present + audio sink +

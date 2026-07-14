@@ -101,7 +101,12 @@ poll-safe presses plus observed-state logging (#646) make the long opening repro
 rendering, and a native 1920x1080 capture now confirms the complete first playable room: player, HUD,
 foreground/background art, lighting, and interaction prompt. Use `scripts/blasphemous2/README.md` for the
 validated sampled-render screenshot recipe. Screenshot manifests report source and pixel progression
-separately (#648), because a newly published renderer frame can still contain byte-identical pixels.
+separately (#648), because a newly published renderer frame can still contain byte-identical pixels. The
+remaining black-world composition was stale opaque alpha: PS5 primitive type 7 is a RectList clear, but the
+standard RDNA2 table labels 7 reserved and prosper fell back to PointList. The captured vertex shader maps
+indices 0..3 to all four clip-space corners while the guest submits count 3. #654 maps the PS5 topology to a
+Vulkan strip and invokes the fourth procedural vertex for the observed no-VB form. A 420-frame native run
+then showed full-screen moving gameplay with no accumulated tutorial glyphs.
 
 Cross-title breadth has advanced: *Dead Cells* now starts reliably after the AGC resource-name fix (#544), its
 exercised NGS2 lifecycle returns initialized sizes/handles/state and silent output (#554), and a late render
