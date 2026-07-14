@@ -51,9 +51,11 @@ namespace prosper {
 namespace {
 
 // --- PM4 encoding (Kyty Pm4.h) ---------------------------------------------------------------
-constexpr uint32_t IT_NOP = 0x10, IT_INDEX_TYPE = 0x2A, IT_EVENT_WRITE = 0x46, IT_SET_SH_REG = 0x76;
+constexpr uint32_t IT_NOP = 0x10, IT_INDEX_TYPE = 0x2A, IT_NUM_INSTANCES = 0x2F,
+                   IT_EVENT_WRITE = 0x46, IT_SET_SH_REG = 0x76;
 // Custom sub-opcodes carried inside IT_NOP:
 constexpr uint32_t R_DRAW_INDEX = 0x03, R_DRAW_INDEX_AUTO = 0x04, R_DRAW_RESET = 0x05, R_WAIT_FLIP_DONE = 0x06,
+                   R_PUSH_MARKER = 0x0b, R_POP_MARKER = 0x0c,
                    R_SH_REGS_INDIRECT = 0x11, R_CX_REGS_INDIRECT = 0x12, R_UC_REGS_INDIRECT = 0x13,
                    R_ACQUIRE_MEM = 0x14, R_WRITE_DATA = 0x15, R_WAIT_MEM_64 = 0x16, R_FLIP = 0x17,
                    R_RELEASE_MEM = 0x18, R_DMA_DATA = 0x19, R_DISPATCH_DIRECT = 0x1a,
@@ -126,6 +128,33 @@ inline bool patch_check(uint32_t* cmd, uint32_t want_r, const char* who) {
 HLE(agc_dcb_reset_queue) {  // (buf, op=0x3ff, state=0)
     uint32_t* cmd; if (!begin_packet(a0, 2, IT_NOP, R_DRAW_RESET, &cmd)) return 0;
     cmd[1] = 0; return (uint64_t)(uintptr_t)cmd;
+}
+// Debug markers are regular DCB packets. The old +kSrjIVxKFE handler mistook PushMarker for a
+// context constructor and zeroed live DCB state on every call (#641). Preserve the NUL-terminated
+// marker text in the packet, as Kyty's Gen4 implementation does; the command processor may ignore
+// the semantic marker, but the stream remains correctly framed and tools can recover its label.
+HLE(agc_dcb_push_marker) {  // (buf, const char* marker)
+    const char* marker = (const char*)(uintptr_t)a1;
+    if (!marker) return 0;
+    constexpr size_t kMaxMarkerBytes = 0x4000u * sizeof(uint32_t);
+    size_t bytes = strnlen(marker, kMaxMarkerBytes);
+    if (bytes == kMaxMarkerBytes) return 0;
+    bytes++;  // include NUL
+    uint32_t dwords = 1u + (uint32_t)((bytes + sizeof(uint32_t) - 1u) / sizeof(uint32_t));
+    uint32_t* cmd; if (!begin_packet(a0, dwords, IT_NOP, R_PUSH_MARKER, &cmd)) return 0;
+    memset(cmd + 1, 0, (dwords - 1u) * sizeof(uint32_t));
+    memcpy(cmd + 1, marker, bytes);
+    return (uint64_t)(uintptr_t)cmd;
+}
+HLE(agc_dcb_pop_marker) {  // (buf)
+    uint32_t* cmd; if (!begin_packet(a0, 2, IT_NOP, R_POP_MARKER, &cmd)) return 0;
+    cmd[1] = 0;
+    return (uint64_t)(uintptr_t)cmd;
+}
+HLE(agc_dcb_set_num_instances) {  // (buf, num_instances)
+    uint32_t* cmd; if (!begin_packet(a0, 2, IT_NUM_INSTANCES, 0, &cmd)) return 0;
+    cmd[1] = (uint32_t)a1;
+    return (uint64_t)(uintptr_t)cmd;
 }
 HLE(agc_dcb_wait_safe_for_rendering) {  // (buf, video_out_handle, display_buffer_index)
     uint32_t* cmd; if (!begin_packet(a0, 7, IT_NOP, R_WAIT_FLIP_DONE, &cmd)) return 0;
@@ -1342,6 +1371,9 @@ void register_agc_hle() {
     RN("D9sr1xGUriE", agc_create_prim_state);                // prim registers from gs specials
     RN("HV4j+E0MBHE", agc_create_interpolant_mapping);       // SPI_PS_INPUT_CNTL_* wiring
     RN("TRO721eVt4g", agc_dcb_reset_queue);
+    RN("+kSrjIVxKFE", agc_dcb_push_marker);
+    RN("H7uZqCoNuWk", agc_dcb_pop_marker);
+    RN("tSBxhAPyytQ", agc_dcb_set_num_instances);
     RN("MWiElSNE8j8", agc_dcb_wait_safe_for_rendering);
     RN("ZvwO9euwYzc", agc_dcb_set_cx_regs_indirect);
     RN("-HOOCn0JY48", agc_dcb_set_sh_regs_indirect);

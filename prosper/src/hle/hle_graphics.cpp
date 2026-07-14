@@ -54,89 +54,6 @@ extern "C" void* prosper_agc_reg_defaults_internal(unsigned int ver);  // -> g_r
 HLE(g_agc_regdefs)     { gfx_tick(); return (uint64_t)(uintptr_t)prosper_agc_reg_defaults((unsigned)a0); }
 HLE(g_agc_regdefs_int) { gfx_tick(); return (uint64_t)(uintptr_t)prosper_agc_reg_defaults_internal((unsigned)a0); }
 
-// +kSrjIVxKFE (kAgcNids[14]): the AGC register-context constructor. The game calls this on its
-// register context (embedded at device+0x48) as the first operation, expecting it to install a
-// "register classify table" at [context+0x08]. That table is consumed by the eboot-internal
-// classifier at eboot+0x3b5ea0: classify(table, sel, key) = (key < table.limit16[sel]) ?
-// table.subarray[sel][key] : 0x7fff, where limit16[] is a u16[4] at table+0x2e and subarray*[] is a
-// void*[4] at table+0x08. With no real impl the context stayed zeroed and the register-set loop
-// null-derefed the table (boot blocker, see docs/GRAPHICS.md).
-//
-// The register banks are an array of 0x70-byte sub-objects at context+0x38 (index 0..2 = the cx/sh/uc
-// register sets): the setter thunks (eboot+0x3a7aa0/0x3a7b20/0x3a7b60) do `add $0x38,%rdi` then
-// `sub = (context+0x38) + sel*0x70` before running the register-set loop. Each sub-object holds its
-// own classify table at [sub+0x08] and register banks at [sub+0x10]/[sub+0x18]. So the constructor
-// must install a table into every sub-object, not into the context base.
-//
-// STAGE 1 (this commit): install a zeroed table in each sub-object -> every per-selector limit is 0
-// -> classify (eboot+0x3b5ea0) returns 0x7fff for all keys -> the register-set loops skip every
-// register (their `cmp $0x7fff; je skip`) without ever touching the (still-null) register banks. This
-// is a structurally-valid empty init: it unblocks the boot so the NEXT blocker is observable. STAGE 2
-// will populate the tables from the real register offsets (agc_reg_defaults.cpp) and allocate the
-// register banks so registers are actually stored.
-// RE convergence (2026-07-06): the "classify table" IS an AgcShaderUserData descriptor — the u16
-// limits at +0x2e are sharp_resource_count[4], the void*[4] at +0x08 are sharp_resource_offset[4],
-// and +0x00 is direct_resource_offset: a u16 table the EUD writer (eboot+0x3af620, via the reader
-// eboot+0x3b5e90) indexes UNCONDITIONALLY by resource type before its `cmp $0xffff -> skip` guard.
-// [sub+0x08] is the sub-object's ACTIVE user-data descriptor: this ctor installs the default and
-// SetSource (eboot+0x3af400) swaps in the bound shader's ud (re-init restores the default). A bare
-// zeroed block left direct_resource_offset null -> the first real pipeline bind (post-deser-fix)
-// null-derefed at eboot+0x3b5e95 (addr=0x8). The empty descriptor must therefore carry a real
-// direct table filled with the 0xffff "no entry" sentinel; counts/limits stay 0 so the register
-// classify path (eboot+0x3b5ea0) keeps returning 0x7fff (skip) exactly as before.
-namespace {
-alignas(64) uint16_t g_agc_ud_no_entries[32] = {};  // set to all-0xffff at first ctx init
-alignas(64) uint8_t g_agc_ctx_regmap[0x40] = {0};   // the empty AgcShaderUserData descriptor
-constexpr int   kAgcCtxSubCount  = 3;               // cx / sh / uc register-set sub-objects
-constexpr size_t kAgcCtxSubBase  = 0x38;            // first sub-object offset inside the context
-constexpr size_t kAgcCtxSubStride = 0x70;           // per sub-object (matches eboot+0x3b0210: *0x70)
-}
-// RE update (2026-07-09, issue #222 — DOLL/PPSA17942 EUD-ring fault at eboot+0x59949e4): this ctor
-// is ALSO called on LIVE contexts (a per-frame/POST-BIND reset), not just at device init. The sub-
-// object contract, recovered from DOLL's statically-linked AGC context code (identical library to
-// the Messenger eboot's 0x3afxxx block, at DOLL eboot+0x599xxxx):
-//   SetSource (+0x5994620) EARLY-OUTS when [sub+0x00] already equals the shader being bound; a full
-//   bind installs [sub+0x08] = shader->user_data and derives +0x34 (eud_size_dw), +0x38/+0x3c (the
-//   ud register range), +0x40 (0x20 if ud direct table[8] valid), +0x44 (nonzero iff table[10]
-//   valid) — all from the SAME descriptor, so table[10]==0xffff with +0x44!=0 cannot happen on real
-//   hardware. The EUD writer (+0x5994940, gated on +0x44!=0) indexes table[10] with NO 0xffff guard
-//   and stores through bank A [sub+0x10] / spill [sub+0x18]-0x80.
-// Our old Stage-1 ctor overwrote ONLY [sub+0x08] with the empty all-0xffff descriptor. On a live
-// context that had a shader bound, the next SetSource of the SAME shader early-outs (its cache key
-// [sub+0x00] survived), leaving +0x44 stale-nonzero against our sentinel table: the writer computes
-// slot 0xffff -> spill base 0 + 0xffff*4 - 0x80 = the exact observed fault address 0x3ff7c
-// (gdb-captured live: [sub+0x08] == g_agc_ctx_regmap, [sub+0x00] == live shader, +0x44 == 4).
-// Fix: model the ctor as the guest's own sub-reset (DOLL eboot+0x59945e0) — zero the source key,
-// banks and every ud-derived field ([sub+0x00..0x47] and the +0x60 cached bank / +0x68 init flags),
-// PRESERVE the guest-owned allocator pointers (+0x48/+0x50) and the +0x58 mode byte, then install
-// the empty descriptor. A later SetSource can then never early-out against the sentinel — it always
-// re-installs the real shader ud together with its derived fields. First-call behaviour on a fresh
-// zeroed context (the Messenger path) is bit-identical to the old ctor. CONFIDENCE: HIGH on the
-// reset semantics (guest reset fn + SetSource disassembly + live fault capture), MED on sub COUNT
-// (DOLL stage-selects sub indices up to 7; we reset the 3 we install descriptors into — subs we
-// never touched stay guest-consistent by construction).
-HLE(g_agc_ctx_init) {   // a0 = context pointer (device+0x48)
-    gfx_tick();
-    if (getenv("PROSPER_GFXLOG"))
-        fprintf(stderr, "[gfx] libSceAgc::+kSrjIVxKFE(CtxInit) a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx\n",
-                (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
-                (unsigned long long)a3);
-    if (a0) {
-        if (g_agc_ud_no_entries[0] != 0xffffu) {    // one-time: wire the sentinel direct table
-            for (auto& e : g_agc_ud_no_entries) e = 0xffffu;
-            *(void**)(g_agc_ctx_regmap + 0x00) = g_agc_ud_no_entries;   // direct_resource_offset
-        }
-        uint8_t* ctx = (uint8_t*)(uintptr_t)a0;
-        for (int i = 0; i < kAgcCtxSubCount; i++) {
-            uint8_t* sub = ctx + kAgcCtxSubBase + i * kAgcCtxSubStride;
-            memset(sub + 0x00, 0, 0x48);            // source key, ud ptr, banks, derived fields
-            memset(sub + 0x60, 0, 0x09);            // cached bank (+0x60 qword) + init flags (+0x68)
-            *(void**)(sub + 0x08) = g_agc_ctx_regmap;
-        }
-    }
-    return 0;
-}
-
 // --- libSceVideoOut (display / frame presentation). ------------------------------------------
 // Models a single connected 1080p60 display. Query functions return real, self-consistent values
 // (not zeroed stubs) so the game's display setup — resolution query, output configuration, buffer
@@ -593,9 +510,6 @@ void register_graphics_hle() {
     if (getenv("PROSPER_AGC_REG_TRACE"))
         register_agc_tracers<kDefaultAgcNidCount>(
             std::make_index_sequence<kAgcNidCount - kDefaultAgcNidCount>{});
-    // Override the +kSrjIVxKFE tracer with the real register-context constructor (must come AFTER the
-    // tracer registration above so it wins; registry is last-write-wins per NID).
-    RN("+kSrjIVxKFE", g_agc_ctx_init);      // AGC register-context init (installs classify table)
     // Override the w2rJhmD+dsE tracer with the real sceAgcDriverAddEqEvent (registers the GPU-completion
     // event source the game's FTM/EOP queues wait on). Must come AFTER the tracer registrations.
     RN("w2rJhmD+dsE", g_agc_add_eq_event);  // sceAgcDriverAddEqEvent (GPU EOP completion, Agc driver path)

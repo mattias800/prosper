@@ -35,8 +35,13 @@ int main() {
     auto draw  = Hle::lookup("Yw0jKSqop+E");   // DrawIndexAuto
     auto drawi = Hle::lookup("q88lQ+GP5Yk");   // DrawIndex (indexed sibling)
     auto evt   = Hle::lookup("aJf+j5yntiU");   // EventWrite
-    CHECK(reset && idx && setcx && p_add && p_adr && draw && drawi && evt, "AGC Dcb builders registered");
-    if (!(reset && idx && setcx && p_add && p_adr && draw && drawi && evt)) { printf("== FAIL ==\n"); return 1; }
+    auto push  = Hle::lookup("+kSrjIVxKFE");   // PushMarker (#641)
+    auto pop   = Hle::lookup("H7uZqCoNuWk");   // PopMarker (#641)
+    CHECK(reset && idx && setcx && p_add && p_adr && draw && drawi && evt && push && pop,
+          "AGC Dcb builders registered");
+    if (!(reset && idx && setcx && p_add && p_adr && draw && drawi && evt && push && pop)) {
+        printf("== FAIL ==\n"); return 1;
+    }
 
     uint32_t buffer[256];
     memset(buffer, 0, sizeof buffer);          // zero => any tail dword is a non-type3 stream end
@@ -44,7 +49,9 @@ int main() {
     dcb.bottom = buffer; dcb.top = buffer + 256; dcb.cursor_up = buffer; dcb.cursor_down = buffer + 256;
     auto D = (uint64_t)(uintptr_t)&dcb;
 
-    // Build a representative frame: reset -> index type -> set Cx regs (patched) -> draw -> event.
+    // Build a representative frame: marker scope -> reset -> index type -> set Cx regs -> draws -> event.
+    const char marker[] = "test frame";
+    push(D, (uint64_t)(uintptr_t)marker, 0, 0, 0, 0);
     reset(D, 0x3ff, 0, 0, 0, 0);
     idx(D, /*index_size*/ 2, 0, 0, 0, 0);
     uint64_t rc = setcx(D, /*regs vaddr*/ 0x1122334455667788ull, /*num*/ 3, 0, 0, 0);
@@ -53,6 +60,7 @@ int main() {
     draw(D, /*index_count*/ 0x1234, 0, 0, 0, 0);
     drawi(D, /*index_count*/ 0x0600, /*indices*/ 0xDEAD0000BEEF0040ull, /*modifier*/ 0x40000000ull, 0, 0);
     evt(D, /*event_type*/ 0x42, /*address*/ 0x1400ABCD00ull, 0, 0, 0);
+    pop(D, 0, 0, 0, 0, 0);
 
     size_t used_dw = (size_t)(dcb.cursor_up - dcb.bottom);
     printf("  built %zu dwords\n", used_dw);
@@ -60,31 +68,35 @@ int main() {
     std::vector<Pm4Command> ops;
     size_t consumed = decode_pm4(buffer, 256, ops);   // pass full buffer; decoder stops at the zero tail
     CHECK(consumed == used_dw, "decoder consumed exactly the built dwords (stops at zero pad)");
-    CHECK(ops.size() == 6, "decoded 6 packets");
-    if (ops.size() != 6) { printf("== FAIL: got %zu packets ==\n", ops.size()); return 1; }
+    CHECK(ops.size() == 8, "decoded 8 packets");
+    if (ops.size() != 8) { printf("== FAIL: got %zu packets ==\n", ops.size()); return 1; }
 
     using K = Pm4Command::Kind;
-    CHECK(ops[0].kind == K::DrawReset, "op0 = DrawReset");
+    CHECK(ops[0].kind == K::PushMarker && ops[0].marker_label &&
+          strcmp(ops[0].marker_label, marker) == 0, "op0 = PushMarker(label)");
 
-    CHECK(ops[1].kind == K::SetIndexType && ops[1].index_size == 2, "op1 = SetIndexType(size=2)");
+    CHECK(ops[1].kind == K::DrawReset, "op1 = DrawReset");
 
-    CHECK(ops[2].kind == K::SetRegsIndirect, "op2 = SetRegsIndirect");
-    CHECK(ops[2].reg_class == RegClass::Cx, "op2 reg_class = Cx");
-    CHECK(ops[2].num_regs == 8, "op2 num_regs = 8 (3 + patched 5)");
-    CHECK(ops[2].regs_vaddr == 0xCAFEF00DDEADBEEFull, "op2 regs_vaddr = patched address");
+    CHECK(ops[2].kind == K::SetIndexType && ops[2].index_size == 2, "op2 = SetIndexType(size=2)");
 
-    CHECK(ops[3].kind == K::DrawIndexAuto && ops[3].index_count == 0x1234, "op3 = DrawIndexAuto(0x1234)");
+    CHECK(ops[3].kind == K::SetRegsIndirect, "op3 = SetRegsIndirect");
+    CHECK(ops[3].reg_class == RegClass::Cx, "op3 reg_class = Cx");
+    CHECK(ops[3].num_regs == 8, "op3 num_regs = 8 (3 + patched 5)");
+    CHECK(ops[3].regs_vaddr == 0xCAFEF00DDEADBEEFull, "op3 regs_vaddr = patched address");
+
+    CHECK(ops[4].kind == K::DrawIndexAuto && ops[4].index_count == 0x1234, "op4 = DrawIndexAuto(0x1234)");
 
     // DrawIndex round-trip (issue #63): the builder wrote [1]=count, [2..3]=index addr, [4..5]=modifier;
     // the decoder must hand every field back (indexed draws were previously dropped as unknown NOPs).
-    CHECK(ops[4].kind == K::DrawIndex && ops[4].index_count == 0x0600, "op4 = DrawIndex(count=0x600)");
-    CHECK(ops[4].di_index_addr == 0xDEAD0000BEEF0040ull, "op4 index-buffer address round-trips");
-    CHECK(ops[4].di_modifier == 0x40000000ull && ops[4].di_valid, "op4 modifier round-trips (valid)");
+    CHECK(ops[5].kind == K::DrawIndex && ops[5].index_count == 0x0600, "op5 = DrawIndex(count=0x600)");
+    CHECK(ops[5].di_index_addr == 0xDEAD0000BEEF0040ull, "op5 index-buffer address round-trips");
+    CHECK(ops[5].di_modifier == 0x40000000ull && ops[5].di_valid, "op5 modifier round-trips (valid)");
 
-    CHECK(ops[5].kind == K::EventWrite && ops[5].event_type == 0x42, "op5 = EventWrite(0x42)");
+    CHECK(ops[6].kind == K::EventWrite && ops[6].event_type == 0x42, "op6 = EventWrite(0x42)");
     // Address-carrying EVENT_WRITE (#132): the widened packet now round-trips its destination
     // address (was discarded, so an address-carrying event lost its write target).
-    CHECK(ops[5].event_addr == 0x1400ABCD00ull, "op5 EventWrite address round-trips (was dropped)");
+    CHECK(ops[6].event_addr == 0x1400ABCD00ull, "op6 EventWrite address round-trips (was dropped)");
+    CHECK(ops[7].kind == K::PopMarker, "op7 = PopMarker");
 
     // Every decoded packet's len must match its header, and the payload pointer must be in-buffer.
     bool spans_ok = true;

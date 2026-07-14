@@ -21,6 +21,7 @@ enum : uint32_t {
 };
 enum : uint32_t {
     R_DRAW_INDEX = 0x03, R_DRAW_INDEX_AUTO = 0x04, R_DRAW_RESET = 0x05, R_WAIT_FLIP_DONE = 0x06,
+    R_PUSH_MARKER = 0x0b, R_POP_MARKER = 0x0c,
     R_SH_REGS_INDIRECT = 0x11, R_CX_REGS_INDIRECT = 0x12, R_UC_REGS_INDIRECT = 0x13,
     R_ACQUIRE_MEM = 0x14, R_WRITE_DATA = 0x15, R_WAIT_MEM_64 = 0x16, R_FLIP = 0x17,
     R_RELEASE_MEM = 0x18, R_DMA_DATA = 0x19, R_DISPATCH_DIRECT = 0x1a,
@@ -46,7 +47,7 @@ enum class RegClass { Cx, Sh, Uc };
 // the header), so unknown packets are still walkable and inspectable.
 struct Pm4Command {
     enum class Kind {
-        DrawReset, WaitFlipDone, SetShRegDirect, SetRegsIndirect, SetIndexType,
+        DrawReset, WaitFlipDone, PushMarker, PopMarker, SetShRegDirect, SetRegsIndirect, SetIndexType,
         DrawIndex, DrawIndexAuto, EventWrite, AcquireMem, WriteData, WaitRegMem, Flip, ReleaseMem,
         DispatchDirect, SetIndexBase, SetIndexCount, DrawIndexOffset, Jump, SetPredication,
         DmaData, Unknown,
@@ -56,6 +57,10 @@ struct Pm4Command {
     uint32_t        header = 0;
     uint32_t        op = 0, r = 0, len = 0;   // op, sub-op, total dwords (incl. header)
     const uint32_t* payload = nullptr;        // points at header+1 (len-1 dwords)
+
+    // PushMarker label inside the packet payload. The builder always NUL-terminates it; consumers
+    // that retain commands past the source stream's lifetime must copy it.
+    const char* marker_label = nullptr;
 
     // Decoded operands (only the ones relevant to `kind` are meaningful):
     RegClass reg_class = RegClass::Cx;   // SetRegsIndirect
