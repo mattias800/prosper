@@ -180,6 +180,10 @@ PROSPER_GFXLOG=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
   PROSPER_FRAME_DIR=/some/dir ./boot_trace.exe /c/Users/matti/repos/ps5ys/PPSA24651-app0
 ```
 
+Performance diagnostics: set `PROSPER_RENDER_TIMING=1` for aggregate graphics/compute stage timings, or
+`PROSPER_RENDER_TIMING=detail` to include slow individual texture decodes. The output and bucket definitions
+are documented in `FRONTEND_APP.md`.
+
 Diagnostics (env, all off by default): `PROSPER_GFXLOG` (`[gfx]`/`[agc]` PM4 decode + the `NOT satisfied`
 fence log), `PROSPER_EVLOG` (`[ev]` equeue/flip/EOP), `PROSPER_SYNCLOG` (`[sync]` WaitOnAddress/Wake with
 tid + validated guest caller, `[sync2]` cond/sema/EventFlag), `PROSPER_EXCLOG` (GC exception

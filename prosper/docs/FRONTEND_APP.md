@@ -155,6 +155,27 @@ For native Windows, configure MinGW with `-DPROSPER_APP=ON -DPROSPER_AUDIO_SDL3=
 
 The complete manual PowerShell recipe is in `WINDOWS_PORT_HANDOFF.md`.
 
+### Live renderer performance diagnostics
+
+Set `PROSPER_RENDER_TIMING=1` before launching to print aggregate timings every 25 operations:
+
+```powershell
+$env:PROSPER_RENDER_TIMING = '1'
+.\prosper\scripts\run-windows.ps1 .\PPSA24651-app0 -NoBuild
+```
+
+The output separates guest-state realization, ordered graphics/compute execution, CPU resource
+decode/detile, Vulkan target and pipeline setup, upload/recording, GPU fence wait, readback, cleanup,
+and frontend publication. Use `PROSPER_RENDER_TIMING=detail` to additionally print individual texture
+decodes taking at least 0.5 ms (capped at 250 lines). The instrumentation does not take clock samples
+when the variable is unset. This is the first tool to use when the window presents correctly but a title
+is not interactive; do not infer a GPU bottleneck from low FPS without the stage breakdown.
+
+The current renderer remains a deterministic readback-based implementation. It retains CPU-visible pixels
+for screenshots and temporal RTT composition, so it is not the final zero-copy architecture. Issue #702
+tracks persistent Vulkan resource/pipeline caching and direct image presentation beyond the initial
+readback-memory, detile, and compute-context fixes.
+
 WSLg remains a useful alternate path for running the Linux build:
 
 1. Prereq check: `vulkaninfo` in the WSL shell confirms a usable Vulkan device (vendor WSL ICD, else

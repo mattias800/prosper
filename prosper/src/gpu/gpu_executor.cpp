@@ -12,6 +12,7 @@
 #include "rdna2_decode.hpp"       // rdna2_walk (for the vertex-fetch const-eval)
 #include "rdna2_to_spirv.hpp"     // recompile_compute
 #include "writer_provenance.hpp"
+#include <chrono>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -1541,16 +1542,24 @@ bool execute_compute_items(const std::vector<ComputeItem>& items) {
 bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t height,
                                  uint64_t submit_no) {
     if ((!g_live && !g_compute) || (st.draws.empty() && st.dispatches.empty())) return false;
+    using TimingClock = std::chrono::steady_clock;
+    const bool timing_enabled = std::getenv("PROSPER_RENDER_TIMING") != nullptr;
+    const auto timing_start = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     uint32_t fw = present_width(), fh = present_height();
     float sx = fw ? (float)width / (float)fw : 1.0f;
     float sy = fh ? (float)height / (float)fh : 1.0f;
     std::vector<DrawItem> draws = g_live && width && height
         ? realize_gpustate_draws(st, 0x10000, sx, sy) : std::vector<DrawItem>{};
+    const auto timing_draws_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     std::vector<ComputeItem> computes = g_compute
         ? realize_compute_dispatches(st, submit_no) : std::vector<ComputeItem>{};
+    const auto timing_compute_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
 
+    auto operations = plan_submit_operations(st);
+    const auto timing_plan_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     OrderedSubmitResult result = execute_ordered_items(
-        plan_submit_operations(st), draws, computes, g_live, g_compute, width, height);
+        operations, draws, computes, g_live, g_compute, width, height);
+    const auto timing_backend_done = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     std::vector<uint8_t>& px = result.pixels;
 
     if (!draws.empty()) {
@@ -1561,9 +1570,40 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
                 std::fprintf(stderr, "[gpucap] write failed: %s\n", error.c_str());
         }
     }
-    if (px.size() != static_cast<size_t>(width) * height * 4) return false;
-    present_write_frame(px.data(), width, height);
-    return true;
+    const bool presented = px.size() == static_cast<size_t>(width) * height * 4;
+    if (presented) present_write_frame(px.data(), width, height);
+    if (timing_enabled) {
+        const auto timing_done = TimingClock::now();
+        auto ms = [](auto begin, auto end) {
+            return std::chrono::duration<double, std::milli>(end - begin).count();
+        };
+        struct TimingTotals {
+            uint64_t submits = 0, draws = 0, dispatches = 0;
+            double realize_draws = 0, realize_compute = 0, plan = 0, backend = 0, publish = 0;
+        };
+        static TimingTotals totals;
+        totals.submits++;
+        totals.draws += draws.size();
+        totals.dispatches += computes.size();
+        totals.realize_draws += ms(timing_start, timing_draws_ready);
+        totals.realize_compute += ms(timing_draws_ready, timing_compute_ready);
+        totals.plan += ms(timing_compute_ready, timing_plan_ready);
+        totals.backend += ms(timing_plan_ready, timing_backend_done);
+        totals.publish += ms(timing_backend_done, timing_done);
+        if (totals.submits % 25 == 0) {
+            const double n = static_cast<double>(totals.submits);
+            const double total = totals.realize_draws + totals.realize_compute + totals.plan +
+                                 totals.backend + totals.publish;
+            std::fprintf(stderr,
+                         "[render-timing] submits=%llu draws=%llu dispatches=%llu avg_ms: total=%.2f "
+                         "realize_draws=%.2f realize_compute=%.2f plan=%.2f backend=%.2f publish=%.2f\n",
+                         (unsigned long long)totals.submits, (unsigned long long)totals.draws,
+                         (unsigned long long)totals.dispatches, total / n, totals.realize_draws / n,
+                         totals.realize_compute / n, totals.plan / n, totals.backend / n,
+                         totals.publish / n);
+        }
+    }
+    return presented;
 }
 
 bool execute_and_present(const GpuState& st, uint32_t width, uint32_t height) {

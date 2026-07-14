@@ -136,6 +136,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             static thread_local int g_this_submit = -1;
             if (phase.first_span || g_this_submit < 0) g_this_submit = g_submit_idx++;
             if (g_this_submit > g_render_last) return {};
+            using RenderClock = std::chrono::steady_clock;
+            struct RenderTiming {
+                uint64_t callbacks = 0;
+                double total_ms = 0, build_resources_ms = 0, backend_ms = 0;
+                uint64_t textures = 0, buffers = 0, texture_bytes = 0, buffer_bytes = 0;
+                double texture_ms = 0, buffer_ms = 0;
+            };
+            static thread_local RenderTiming pending_timing;
+            const bool timing_enabled = getenv("PROSPER_RENDER_TIMING") != nullptr;
+            if (timing_enabled && phase.first_span) pending_timing = {};
+            const auto callback_timing_start = timing_enabled
+                ? RenderClock::now() : RenderClock::time_point{};
             // PROSPER_SUBMITLOG: print the GPU-submit index periodically (at native speed, before the slow
             // render) so it can be correlated with guest-side log lines (e.g. a MsgDialog wait) to find the
             // exact submit at which a scene appears — for aiming PROSPER_RENDER_FIRST at it.
@@ -230,6 +242,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
               auto add = [&](const prosper::gpu::ShaderResourceTable* t, uint32_t set){
                 if (!t) return;
                 for (auto& r : t->resources) {
+                    const auto resource_timing_start = timing_enabled
+                        ? RenderClock::now() : RenderClock::time_point{};
+                    bool resource_rtt_hit = false;
                     prosper::test::FrameResource fr; fr.binding = r.binding; fr.set = set;
                     // Captured replays preserve the logical guest address for RT identity but provide
                     // owned bytes here. Production resources leave host_data null and use guest memory.
@@ -294,12 +309,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         if (rtt_on) { auto rit = g_rtt.find(r.gpu_addr);
                             if (rit != g_rtt.end() && rit->second.w && rit->second.h && !rit->second.rgba.empty()) {
                                 const RttSurf& s = rit->second;
-                                for (uint32_t y = 0; y < th; y++) for (uint32_t x = 0; x < tw; x++) {
-                                    uint32_t sx = (uint32_t)((uint64_t)x * s.w / tw), sy = (uint32_t)((uint64_t)y * s.h / th);
-                                    size_t si = ((size_t)sy * s.w + sx) * 4;
-                                    if (si + 4 <= s.rgba.size()) std::memcpy(&texstore.back()[((size_t)y * tw + x) * 4], &s.rgba[si], 4);
+                                const size_t expected = static_cast<size_t>(tw) * th * 4;
+                                if (s.w == tw && s.h == th && s.rgba.size() == expected) {
+                                    std::memcpy(texstore.back().data(), s.rgba.data(), expected);
+                                } else {
+                                    for (uint32_t y = 0; y < th; y++) for (uint32_t x = 0; x < tw; x++) {
+                                        uint32_t sx = (uint32_t)((uint64_t)x * s.w / tw), sy = (uint32_t)((uint64_t)y * s.h / th);
+                                        size_t si = ((size_t)sy * s.w + sx) * 4;
+                                        if (si + 4 <= s.rgba.size()) std::memcpy(&texstore.back()[((size_t)y * tw + x) * 4], &s.rgba[si], 4);
+                                    }
                                 }
                                 rtt_hit = true;
+                                resource_rtt_hit = true;
                             }
                             if (getenv("PROSPER_RTTLOG"))
                                 fprintf(stderr, "[rtt] sample tex addr=0x%llx %ux%u fmt=%u -> %s (cache_size=%zu)\n",
@@ -656,6 +677,31 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             }
                         }
                     }
+                    if (timing_enabled) {
+                        const double elapsed = std::chrono::duration<double, std::milli>(
+                            RenderClock::now() - resource_timing_start).count();
+                        if (fr.is_texture()) {
+                            pending_timing.textures++;
+                            pending_timing.texture_bytes += static_cast<uint64_t>(fr.tw) * fr.th * 4;
+                            pending_timing.texture_ms += elapsed;
+                            if (const char* mode = getenv("PROSPER_RENDER_TIMING");
+                                mode && strcmp(mode, "detail") == 0 && elapsed >= 0.5) {
+                                static uint64_t detail_lines = 0;
+                                if (detail_lines++ < 250) {
+                                    fprintf(stderr,
+                                            "[render-timing] texture addr=0x%llx %ux%u out=%ux%u "
+                                            "fmt=%u comps=%u tile=%u rtt=%d %.2f ms\n",
+                                            (unsigned long long)r.gpu_addr, r.width, r.height,
+                                            fr.tw, fr.th, (unsigned)r.format, r.num_components,
+                                            r.tile_mode, (int)resource_rtt_hit, elapsed);
+                                }
+                            }
+                        } else {
+                            pending_timing.buffers++;
+                            pending_timing.buffer_bytes += static_cast<uint64_t>(fr.dwords.size()) * 4;
+                            pending_timing.buffer_ms += elapsed;
+                        }
+                    }
                     R.push_back(std::move(fr));
                 }
               };
@@ -881,8 +927,21 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     if (seed_rtt && base) { auto sit = g_rtt.find(base);
                         if (sit != g_rtt.end() && sit->second.w == gw && sit->second.h == gh &&
                             sit->second.rgba.size() == (size_t)gw * gh * 4) seed = sit->second.rgba.data(); }
+                    const auto build_start = timing_enabled
+                        ? RenderClock::now() : RenderClock::time_point{};
+                    auto backend_draws = build_bds(render_pass);
+                    const auto build_done = timing_enabled
+                        ? RenderClock::now() : RenderClock::time_point{};
                     std::vector<uint8_t> gpx = prosper::test::render_draws_rgba(
-                        build_bds(render_pass), gw, gh, seed, clear_for(render_pass), true);
+                        backend_draws, gw, gh, seed, clear_for(render_pass), true);
+                    const auto backend_done = timing_enabled
+                        ? RenderClock::now() : RenderClock::time_point{};
+                    if (timing_enabled) {
+                        pending_timing.build_resources_ms +=
+                            std::chrono::duration<double, std::milli>(build_done - build_start).count();
+                        pending_timing.backend_ms +=
+                            std::chrono::duration<double, std::milli>(backend_done - build_done).count();
+                    }
                     if (base && !gpx.empty()) { RttSurf& s = g_rtt[base]; s.rgba = gpx; s.w = gw; s.h = gh; }
                     if (native_w == resource_hash_w && native_h == resource_hash_h && !gpx.empty()) {
                         uint64_t hash = 1469598103934665603ull;
@@ -1013,7 +1072,20 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 // Single-framebuffer path: render_draws_rgba composites every draw into ONE framebuffer.
                 std::vector<const prosper::gpu::DrawItem*> all; all.reserve(items.size());
                 for (const auto& it : items) all.push_back(&it);
-                px = prosper::test::render_draws_rgba(build_bds(all), w, h, nullptr, clear_for(all), true);
+                const auto build_start = timing_enabled
+                    ? RenderClock::now() : RenderClock::time_point{};
+                auto backend_draws = build_bds(all);
+                const auto build_done = timing_enabled
+                    ? RenderClock::now() : RenderClock::time_point{};
+                px = prosper::test::render_draws_rgba(backend_draws, w, h, nullptr, clear_for(all), true);
+                const auto backend_done = timing_enabled
+                    ? RenderClock::now() : RenderClock::time_point{};
+                if (timing_enabled) {
+                    pending_timing.build_resources_ms +=
+                        std::chrono::duration<double, std::milli>(build_done - build_start).count();
+                    pending_timing.backend_ms +=
+                        std::chrono::duration<double, std::milli>(backend_done - build_done).count();
+                }
                 // RTT (#167): cache these rendered pixels under this submit's render-target base, so a later
                 // composite pass that samples that address gets the scene we drew (not empty guest memory).
                 if (rtt_on && !px.empty()) {
@@ -1046,7 +1118,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 }
                 if (scanout) px = scanout->rgba;
             }
-            if (!phase.final_span) return px;
+            if (!phase.final_span) {
+                if (timing_enabled) {
+                    pending_timing.callbacks++;
+                    pending_timing.total_ms += std::chrono::duration<double, std::milli>(
+                        RenderClock::now() - callback_timing_start).count();
+                }
+                return px;
+            }
             int n = frame_no++;
             // PROSPER_DUMP_CONTENT=<min-nonzero-bytes>: dump ONLY frames whose framebuffer has at least
             // that many nonzero bytes — catches the intermittent content submits the periodic dump misses.
@@ -1059,6 +1138,46 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 char fn[512]; snprintf(fn, sizeof fn, "%s/frame_%04d.bmp", frame_dir.c_str(), n);
                 prosper::test::dump_bmp(fn, px, w, h);
                 fprintf(stderr, "[render] frame %d rendered (%ux%u) nz=%zu -> %s\n", n, w, h, px_nz, fn);
+            }
+            if (timing_enabled) {
+                pending_timing.callbacks++;
+                pending_timing.total_ms += std::chrono::duration<double, std::milli>(
+                    RenderClock::now() - callback_timing_start).count();
+                struct TimingTotals {
+                    uint64_t submits = 0, callbacks = 0;
+                    double total_ms = 0, build_resources_ms = 0, backend_ms = 0;
+                    uint64_t textures = 0, buffers = 0, texture_bytes = 0, buffer_bytes = 0;
+                    double texture_ms = 0, buffer_ms = 0;
+                };
+                static TimingTotals totals;
+                totals.submits++;
+                totals.callbacks += pending_timing.callbacks;
+                totals.total_ms += pending_timing.total_ms;
+                totals.build_resources_ms += pending_timing.build_resources_ms;
+                totals.backend_ms += pending_timing.backend_ms;
+                totals.textures += pending_timing.textures;
+                totals.buffers += pending_timing.buffers;
+                totals.texture_bytes += pending_timing.texture_bytes;
+                totals.buffer_bytes += pending_timing.buffer_bytes;
+                totals.texture_ms += pending_timing.texture_ms;
+                totals.buffer_ms += pending_timing.buffer_ms;
+                if (totals.submits % 25 == 0) {
+                    const double nsub = static_cast<double>(totals.submits);
+                    const double other = totals.total_ms - totals.build_resources_ms - totals.backend_ms;
+                    fprintf(stderr,
+                            "[render-timing] frontend submits=%llu callbacks=%llu avg_ms: total=%.2f "
+                            "build_resources=%.2f backend=%.2f other=%.2f\n",
+                            (unsigned long long)totals.submits, (unsigned long long)totals.callbacks,
+                            totals.total_ms / nsub, totals.build_resources_ms / nsub,
+                            totals.backend_ms / nsub, other / nsub);
+                    fprintf(stderr,
+                            "[render-timing] resources textures=%llu %.1f MiB %.2f ms/submit; "
+                            "buffers=%llu %.1f MiB %.2f ms/submit\n",
+                            (unsigned long long)totals.textures,
+                            totals.texture_bytes / (1024.0 * 1024.0), totals.texture_ms / nsub,
+                            (unsigned long long)totals.buffers,
+                            totals.buffer_bytes / (1024.0 * 1024.0), totals.buffer_ms / nsub);
+                }
             }
             return px;
         });

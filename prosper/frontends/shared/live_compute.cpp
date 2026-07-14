@@ -9,6 +9,7 @@
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
@@ -802,17 +803,39 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
 } // namespace
 
 bool execute_live_compute_items(const std::vector<prosper::gpu::ComputeItem>& items) {
-    VulkanComputeContext context;
-    if (!context.init()) {
+    // Keep the Vulkan device alive across dispatch spans. Constructing an instance, device, and queue for
+    // every callback cost roughly 25 ms/frame on the native Windows frontend before any kernel work ran.
+    // Function-local static initialization is thread-safe; AGC submit execution serializes subsequent use.
+    static VulkanComputeContext context;
+    static const bool context_ready = context.init();
+    if (!context_ready) {
         std::fprintf(stderr, "[compute] Vulkan initialization failed\n");
         return false;
     }
+    const bool timing_enabled = std::getenv("PROSPER_RENDER_TIMING") != nullptr;
+    const auto timing_start = timing_enabled
+        ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // Dispatches are independent PM4-order operations: one item failing (e.g. an image shape the
     // backend can't bind yet, #590) must not abort the rest of the batch — that would regress
     // dispatches that executed before image bindings existed. Run all; report all-succeeded.
     bool all_ok = true;
     for (const auto& item : items)
         all_ok &= execute_item(context, item);
+    if (timing_enabled) {
+        struct TimingTotals { uint64_t calls = 0, dispatches = 0; double milliseconds = 0; };
+        static TimingTotals totals;
+        totals.calls++;
+        totals.dispatches += items.size();
+        totals.milliseconds += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - timing_start).count();
+        if (totals.calls % 25 == 0) {
+            std::fprintf(stderr,
+                         "[render-timing] compute calls=%llu dispatches=%llu avg_ms=%.2f\n",
+                         (unsigned long long)totals.calls,
+                         (unsigned long long)totals.dispatches,
+                         totals.milliseconds / static_cast<double>(totals.calls));
+        }
+    }
     return all_ok;
 }
 

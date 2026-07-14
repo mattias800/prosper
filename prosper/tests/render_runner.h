@@ -6,6 +6,7 @@
 #include <vulkan/vulkan.h>
 #include "../src/gpu/gpu_capture.hpp"
 #include "../src/gpu/render_state.hpp"
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -506,6 +507,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                                               const uint8_t* seed_rgba = nullptr,
                                               const float* clear_rgba = nullptr,
                                               bool persist_depth_stencil = false) {
+    using TimingClock = std::chrono::steady_clock;
+    const bool timing_enabled = getenv("PROSPER_RENDER_TIMING") != nullptr;
+    const auto timing_start = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     std::vector<uint8_t> out;
     if (draws.empty()) return out;
     const RenderVkCtx& ctx = render_vk_ctx();
@@ -715,6 +719,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         s.codeSize = c.size() * 4; s.pCode = c.data(); VkShaderModule m = VK_NULL_HANDLE;
         vkCreateShaderModule(dev, &s, nullptr, &m); return m; };
     // Per-draw Vulkan objects — kept alive until after the queue submit, freed at the end.
+    const auto timing_target_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     struct DV {
         VkShaderModule vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
         std::vector<FrameResource> R;
@@ -1009,12 +1014,22 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         if (vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gp, nullptr, &v.pipe) == VK_SUCCESS) v.ok = true;
     }
 
+    const auto timing_draws_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     VkDeviceSize bytes = (VkDeviceSize)W * H * 4;
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; bci.size = bytes; bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     VkBuffer rb; vkCreateBuffer(dev, &bci, nullptr, &rb);
     VkMemoryRequirements br; vkGetBufferMemoryRequirements(dev, rb, &br);
     VkMemoryAllocateInfo bai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; bai.allocationSize = br.size;
-    bai.memoryTypeIndex = pick(br.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    // Prefer cached host memory for GPU -> CPU readback. Discrete NVIDIA exposes an earlier coherent,
+    // write-combined BAR type and a later HOST_CACHED type; the generic first-match selector chose the
+    // former, making an 8 MiB 1080p read take roughly 570 ms on Windows. Upload buffers deliberately keep
+    // the write-combined type. Integrated GPUs and portability drivers may not expose HOST_CACHED, so fall
+    // back to the original required flags.
+    constexpr VkMemoryPropertyFlags host_coherent =
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    bai.memoryTypeIndex = pick(br.memoryTypeBits, host_coherent | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    if (bai.memoryTypeIndex == UINT32_MAX)
+        bai.memoryTypeIndex = pick(br.memoryTypeBits, host_coherent);
     VkDeviceMemory bmem; vkAllocateMemory(dev, &bai, nullptr, &bmem); vkBindBufferMemory(dev, rb, bmem, 0);
 
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO}; pci.queueFamilyIndex = qfi;
@@ -1117,9 +1132,11 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     VkBufferImageCopy cp{}; cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; cp.imageExtent = {W, H, 1};
     vkCmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb, 1, &cp);
     vkEndCommandBuffer(cmd);
+    const auto timing_recorded = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
     VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VkFence fence; vkCreateFence(dev, &fci, nullptr, &fence);
     vkQueueSubmit(queue, 1, &si, fence); vkWaitForFences(dev, 1, &fence, VK_TRUE, 5ull * 1000 * 1000 * 1000);
+    const auto timing_gpu_done = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     if (cached_ds) {
         cached_ds->layout_initialized = true;
         cached_ds->depth_valid |= use_depth && depth_used_meaningfully;
@@ -1128,8 +1145,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
 
     out.resize(bytes);
     void* mp = nullptr; vkMapMemory(dev, bmem, 0, bytes, 0, &mp);
-    for (VkDeviceSize i = 0; i < bytes; i++) out[i] = ((const uint8_t*)mp)[i];
+    std::memcpy(out.data(), mp, static_cast<size_t>(bytes));
     vkUnmapMemory(dev, bmem);
+    const auto timing_readback_done = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
 
     // PROSPER_DRAW_ISO + PROSPER_ISO_AT="x,y": per-draw kill isolation (generalizes the #240 title harness
     // to any submit / any target pixel). On the FIRST submit whose rendered pixel at (x,y) is lit
@@ -1238,6 +1256,36 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     vkDestroyImage(dev, img, nullptr); vkFreeMemory(dev, imem, nullptr);
     if (use_ds && !cached_ds) {
         vkDestroyImageView(dev, dview, nullptr); vkDestroyImage(dev, dimg, nullptr); vkFreeMemory(dev, dmem, nullptr);
+    }
+    if (timing_enabled) {
+        const auto timing_done = TimingClock::now();
+        auto ms = [](auto begin, auto end) {
+            return std::chrono::duration<double, std::milli>(end - begin).count();
+        };
+        struct TimingTotals {
+            uint64_t calls = 0, draws = 0;
+            double target = 0, draw_setup = 0, record = 0, gpu_wait = 0, readback = 0, cleanup = 0;
+        };
+        static TimingTotals totals;
+        totals.calls++;
+        totals.draws += draws.size();
+        totals.target += ms(timing_start, timing_target_ready);
+        totals.draw_setup += ms(timing_target_ready, timing_draws_ready);
+        totals.record += ms(timing_draws_ready, timing_recorded);
+        totals.gpu_wait += ms(timing_recorded, timing_gpu_done);
+        totals.readback += ms(timing_gpu_done, timing_readback_done);
+        totals.cleanup += ms(timing_readback_done, timing_done);
+        if (totals.calls % 25 == 0) {
+            const double n = static_cast<double>(totals.calls);
+            const double total = totals.target + totals.draw_setup + totals.record +
+                                 totals.gpu_wait + totals.readback + totals.cleanup;
+            fprintf(stderr,
+                    "[render-timing] backend calls=%llu draws=%llu avg_ms: total=%.2f target=%.2f "
+                    "draw_setup=%.2f record_upload=%.2f gpu_wait=%.2f readback=%.2f cleanup=%.2f\n",
+                    (unsigned long long)totals.calls, (unsigned long long)totals.draws, total / n,
+                    totals.target / n, totals.draw_setup / n, totals.record / n,
+                    totals.gpu_wait / n, totals.readback / n, totals.cleanup / n);
+        }
     }
     // NB: dev/instance are the persistent RenderVkCtx — do NOT destroy them here (reused across calls).
     return out;
