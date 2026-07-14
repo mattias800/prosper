@@ -105,6 +105,71 @@ int main() {
             replay_filled &= replay_owned[record * 4 + component] == expected[component];
     CHECK(replay_filled, "compute writeback updates owned backing for a later replay operation");
 
+    // --- #590: the live backend's storage-IMAGE path. The same 1D image-copy kernel that
+    // test_storage_image_copy proves against the raw harness, executed through the PRODUCTION
+    // backend with Unorm8x4 guest-style backing — exercising the full chain: channel unpack
+    // (bytes -> float-bit uvec4 texels), the R32G32B32A32_UINT image contract, and the pack-back
+    // writeback (float bits -> clamped bytes). Unorm8 pack(unpack(b)) == b exactly, so a bit-exact
+    // dst==src is the correctness assertion.
+    static const uint32_t image_copy[] = {
+        0x7E080300u, 0xF0000F00u, 0x00000004u, 0xBF8C3F70u, 0xF0200F00u, 0x00020004u, 0xBF810000u,
+    };
+    const uint32_t W = 64;
+    std::vector<uint32_t> lane_index(W);
+    for (uint32_t i = 0; i < W; i++) lane_index[i] = i;      // shell input: v0 = input[gid] = gid
+    std::vector<uint32_t> dummy(4, 0);
+    std::vector<uint8_t> img_src(W * 4), img_dst(W * 4, 0xEE);
+    for (uint32_t i = 0; i < W * 4; i++) img_src[i] = (uint8_t)(i * 37 + 5);
+    ShaderResourceTable irt;
+    auto add_buffer = [&](uint32_t binding, void* data, uint32_t size) {
+        ShaderResource b{};
+        b.cls = ResourceClass::ConstantBuffer;
+        b.binding = binding;
+        b.gpu_addr = (uint64_t)(uintptr_t)data;
+        b.size = size;
+        irt.resources.push_back(b);
+    };
+    add_buffer(0, lane_index.data(), W * sizeof(uint32_t));
+    add_buffer(1, dummy.data(), 16);
+    add_buffer(2, dummy.data(), 16);
+    add_buffer(3, dummy.data(), 16);
+    auto add_image = [&](uint32_t binding, uint32_t sgpr, void* data, uint32_t size) {
+        ShaderResource im{};
+        im.cls = ResourceClass::StorageImage;
+        im.img_dim = 0;                     // 1D
+        im.binding = binding;
+        im.sgpr_base = sgpr;
+        im.format = DataFormat::Unorm8;
+        im.num_components = 4;
+        im.width = W; im.height = 1;
+        im.gpu_addr = (uint64_t)(uintptr_t)data;
+        im.size = size;
+        irt.resources.push_back(im);
+    };
+    add_image(4, 0, img_src.data(), W * 4);
+    add_image(5, 8, img_dst.data(), W * 4);
+    std::vector<uint32_t> image_spirv = recompile_valu(
+        image_copy, sizeof(image_copy) / sizeof(image_copy[0]), 1, 0, &irt);
+    CHECK(!image_spirv.empty(), "storage-image copy kernel recompiles against the game-style table");
+    if (!image_spirv.empty()) {
+        ComputeItem image_item;
+        image_item.spirv = image_spirv;
+        image_item.resources = std::make_shared<ShaderResourceTable>(irt);
+        image_item.launch.threads_x = W;
+        image_item.launch.local_x = 64;
+        image_item.launch.groups_x = 1;
+        image_item.launch.local_y = image_item.launch.local_z = 1;
+        image_item.launch.groups_y = image_item.launch.groups_z = 1;
+        image_item.code_addr = 0x590590;
+        CHECK(prosper::frontend::execute_live_compute_items({image_item}),
+              "live backend executes the storage-image copy dispatch (#590)");
+        uint32_t bad = 0;
+        for (uint32_t i = 0; i < W * 4; i++) bad += img_dst[i] != img_src[i];
+        if (bad) std::printf("  image copy mismatched bytes = %u/%u (b0 src=%02x dst=%02x)\n",
+                             bad, W * 4, img_src[0], img_dst[0]);
+        CHECK(bad == 0, "Unorm8 unpack -> uvec4 copy -> pack writeback is byte-exact (#590)");
+    }
+
     if (fails) {
         std::printf("== FAIL: %d ==\n", fails);
         return 1;

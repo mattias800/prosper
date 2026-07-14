@@ -78,6 +78,13 @@ int main() {
         CHECK(!gen5_image_format(44, &fi), "IMG_FMT 44 (10_10_10_2) unmapped -> false");
         CHECK(!gen5_image_format(157, &fi), "IMG_FMT 157 (FMASK) unmapped -> false");
         CHECK(!gen5_image_format(511, &fi), "IMG_FMT 511 out-of-table -> false");
+        CHECK(image_type_to_dim(8) == 0 && image_type_to_dim(9) == 1 &&
+              image_type_to_dim(10) == 2 && image_type_to_dim(11) == 3,
+              "T# TYPE 1D/2D/3D/CUBE maps to MIMG dims 0..3");
+        CHECK(image_type_to_dim(12) == 4 && image_type_to_dim(13) == 5 &&
+              image_type_to_dim(14) == 6 && image_type_to_dim(15) == 7,
+              "T# TYPE array/MSAA variants map to MIMG dims 4..7");
+        CHECK(image_type_to_dim(0) == 1, "unknown T# TYPE keeps the conservative 2D fallback");
     }
 
     // --- V# decode in isolation ---------------------------------------------------------------

@@ -3294,20 +3294,18 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             const uint32_t SQ_DIM_2D = 1u;
             auto vread = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
             // Resolve the T#/U# via SRSRC (src[1]) provenance: s_load tag (indirect) else user-data SGPR.
-            const ShaderResource* res = nullptr;
-            { auto it = rs.sreg_srt.find(in.src[1].value);
-              if (it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second);
-              if (!res) res = rt->by_sgpr_base(in.src[1].value); }
-            // PER-USE pc provenance fallback (#273 — DOLL's title-composite image_sample_b): the
-            // executor's const-fold walk snapshots the T# each image op consumes and keys it by the
-            // INSTRUCTION pc (ShaderResource::fetch_pc). Used when the key/SGPR chains found nothing,
-            // or found a NON-image resource — the load-immediate key model collides when two different
-            // tables reuse one immediate (a key-0 EUD sharp vs the key-0 table T# here).
+            const ShaderResource* res = rt->by_fetch_pc(in.pc);
             if (!res || (res->cls != ResourceClass::Texture && res->cls != ResourceClass::StorageImage)) {
-                if (const ShaderResource* pr = rt->by_fetch_pc(in.pc);
-                    pr && (pr->cls == ResourceClass::Texture || pr->cls == ResourceClass::StorageImage))
-                    res = pr;
+                res = nullptr;
+                auto it = rs.sreg_srt.find(in.src[1].value);
+                if (it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second);
+                if (!res) res = rt->by_sgpr_base(in.src[1].value);
             }
+            // Exact per-use provenance wins over table keys. A sample and store may consume the same
+            // T# through a colliding offset but require different Vulkan descriptor classes.
+            if ((in.opcode == 0x08 && res && res->cls != ResourceClass::StorageImage) ||
+                (in.opcode != 0x00 && in.opcode != 0x08 && res && res->cls != ResourceClass::Texture))
+                res = nullptr;
             if ((!res || (res->cls != ResourceClass::Texture && res->cls != ResourceClass::StorageImage))
                 && getenv("PROSPER_DBG")) {
                 // Resolution-failure diagnostic: which provenance step failed for this image op.

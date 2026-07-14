@@ -89,6 +89,10 @@ struct DecodedImageDescriptor {
 // Decode an 8-dword T# (RDNA2/Gen5 image resource). Pure; exposed for reuse + testing.
 DecodedImageDescriptor decode_image_descriptor(const uint32_t t[8]);
 
+// Convert SQ_RSRC_IMG TYPE (8..15) to the MIMG dim convention (0..7). Unknown values retain the
+// long-standing 2D fallback.
+uint32_t image_type_to_dim(uint8_t type);
+
 // A Gen5/GFX10 T# IMG_FMT (the 9-bit combined format field) decoded to sizing + conversion info.
 // bytes_per_block is the byte size of one block_width x block_height texel block — for uncompressed
 // formats block dims are 1x1 and it equals bytes-per-texel; for BCn blocks are 4x4.
