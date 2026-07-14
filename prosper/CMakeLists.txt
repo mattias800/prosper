@@ -253,6 +253,16 @@ if(TARGET prosper_core)
   target_link_libraries(test_file_binary PRIVATE prosper_core)
   add_test(NAME file_binary_roundtrip COMMAND test_file_binary)
 
+  if(WIN32)
+    add_executable(test_win_exception_delivery tests/test_win_exception_delivery.cpp)
+    target_link_libraries(test_win_exception_delivery PRIVATE prosper_core)
+    add_test(NAME win_exception_delivery COMMAND test_win_exception_delivery)
+
+    add_executable(test_win_kernel_is_stack tests/test_win_kernel_is_stack.cpp)
+    target_link_libraries(test_win_kernel_is_stack PRIVATE prosper_core)
+    add_test(NAME win_kernel_is_stack COMMAND test_win_kernel_is_stack)
+  endif()
+
   # APR container registry + size-keyed read matching (issue #62): stable ids, path dedup, and
   # the ambiguity/chunk-read refusal the read-submit path relies on. Pure, no game dump needed.
   add_executable(test_apr_registry tests/test_apr_registry.cpp)

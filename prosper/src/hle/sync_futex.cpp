@@ -14,13 +14,49 @@
 #define _WIN32_WINNT 0x0A00   // WakeByAddressAll needs >= 0x0602 (Win8)
 #endif
 #include <windows.h>   // native futex: WakeByAddressAll (pairs with WaitOnAddress in hle_kernel_mem.cpp)
+#include <pthread.h>
+#include <mutex>
+#include <unordered_map>
 #endif
 
 namespace prosper {
-namespace { std::atomic<int> g_waiters{0}; }
+namespace {
+std::atomic<int> g_waiters{0};
+#ifdef _WIN32
+std::mutex g_wait_mx;
+std::unordered_map<uint64_t, uint64_t> g_thread_waits;  // pthread_t -> guest wait address
+#endif
+}
 
-void futex_wait_enter() { g_waiters.fetch_add(1, std::memory_order_seq_cst); }
-void futex_wait_exit()  { g_waiters.fetch_sub(1, std::memory_order_seq_cst); }
+void futex_wait_enter(uint64_t addr) {
+#ifdef _WIN32
+    { std::lock_guard<std::mutex> lk(g_wait_mx); g_thread_waits[(uint64_t)pthread_self()] = addr; }
+#else
+    (void)addr;
+#endif
+    g_waiters.fetch_add(1, std::memory_order_seq_cst);
+}
+void futex_wait_exit() {
+    g_waiters.fetch_sub(1, std::memory_order_seq_cst);
+#ifdef _WIN32
+    std::lock_guard<std::mutex> lk(g_wait_mx);
+    g_thread_waits.erase((uint64_t)pthread_self());
+#endif
+}
+
+bool interrupt_futex_wait(uint64_t thread) {
+#ifdef _WIN32
+    uint64_t addr = 0;
+    { std::lock_guard<std::mutex> lk(g_wait_mx);
+      auto it = g_thread_waits.find(thread);
+      if (it != g_thread_waits.end()) addr = it->second; }
+    if (addr) WakeByAddressAll((PVOID)(uintptr_t)addr);
+    return addr != 0;
+#else
+    (void)thread;
+    return false;
+#endif
+}
 
 void futex_wake(uint64_t addr, int n) {
 #if defined(__linux__) || defined(__APPLE__)

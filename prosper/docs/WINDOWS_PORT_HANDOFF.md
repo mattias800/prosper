@@ -1,9 +1,10 @@
 # Windows native port — handoff (2026-07-14)
 
-The Windows native core boots The Messenger (`PPSA24651`) through the OS/runtime/asset/sync layer and
-drives the GPU pipeline. The GPU-fence field bug documented below was fixed in #672: native validation
-now matches Linux and SubmitDcb #1 completes. The newly exposed blocker is #673: `il2cpp_init` returns
-false on Windows, leaving a generated-code class global null before SubmitDcb #2. Companion:
+The Windows native core boots The Messenger (`PPSA24651`) through IL2CPP and repeated GC
+stop-the-world cycles, then drives real GPU draws and presents 1920x1080 frames. The fence-field,
+metadata-read, and asynchronous-GC blockers were fixed in #672, #673, and #678 respectively. A
+60-second native validation reached SubmitDcb #28 (up to 11 draws per submit) without a guest fatal;
+the next frontier is user-facing frontend/gameplay validation and the remaining portability gaps in
 `docs/PORTING.md` ("Windows").
 
 ## What works today (merged to master)
@@ -16,6 +17,8 @@ The guest, on Windows (MinGW, native), reproducibly:
   registers flip/vblank/EOP equeues, and does an initial `GpuFlip` of buffer 0.
 - Compiles 36 real shaders and submits GPU command buffers; the executor decodes real PM4
   (`WriteData`/`ReleaseMem`/`WaitRegMem`) and delivers flip/vblank/EOP events.
+- Delivers IL2CPP's exception-type `0x1e` asynchronously on the requested target thread, allowing
+  repeated GC stop-the-world suspend/resume cycles to complete.
 
 Merged PRs that got it here (all `#ifdef _WIN32` — Linux/macOS unaffected, CI green on all 4 platforms):
 - **#624** substrate: `exec_image_win.cpp` (VirtualAlloc mapping, VEH fault handler, SysV↔MS-x64 stub
@@ -88,8 +91,8 @@ generated stub with nine sentinels and checks alignment/return value; `test_agc_
 ReleaseMem/WaitRegMem packet fields.
 
 Native runtime validation: `data_sel=2 data=1`, `ref=1 mask=ffffffff`, no `NOT satisfied`, SubmitDcb #1
-completes. Five repeat runs then expose #673 at `Il2cpp+0x17d64b` before SubmitDcb #2; the next work is
-initialization parity, not further fence decoding.
+completes. The later #673 metadata and #678 GC-delivery blockers are also resolved; do not reopen the
+solved fence investigation when diagnosing a later Windows failure.
 
 ## Build + run + diagnose (native Windows, MinGW)
 
@@ -115,9 +118,9 @@ PROSPER_GFXLOG=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
 
 Diagnostics (env, all off by default): `PROSPER_GFXLOG` (`[gfx]`/`[agc]` PM4 decode + the `NOT satisfied`
 fence log), `PROSPER_EVLOG` (`[ev]` equeue/flip/EOP), `PROSPER_SYNCLOG` (`[sync]` WaitOnAddress/Wake with
-tid + validated guest caller, `[sync2]` cond/sema/EventFlag), `PROSPER_MEMLOG`, `PROSPER_VEHLOG`,
-boot_trace `[memclass]`. The Messenger renders on **Linux** (`build-linux`, `PROSPER_GUEST_FS=1 …`) —
-use it as the oracle: `SubmitDcb #2: executed 3 draws -> presented 1920x1080 frame`.
+tid + validated guest caller, `[sync2]` cond/sema/EventFlag), `PROSPER_EXCLOG` (GC exception
+raise/deliver/resume), `PROSPER_MEMLOG`, `PROSPER_VEHLOG`, boot_trace `[memclass]`. The Messenger renders
+on **Linux** (`build-linux`, `PROSPER_GUEST_FS=1 …`) — use it as the oracle.
 
 ## Gotchas learned (so the next agent doesn't relearn them)
 

@@ -296,14 +296,14 @@ This is exactly the hard sub-problem flagged above for both Windows and macOS. P
 accesses** — the fault handler already decodes instructions at fault sites (SSE4a), so
 trap-and-emulate of `%fs:` operands is in-house technology.
 
-## Windows port status (2026-07-14) — IL2CPP metadata fixed; GC exception delivery is next
+## Windows port status (2026-07-14) — Messenger presents frames after GC delivery fix
 
 The native MinGW build now links and initializes the live Vulkan renderer, boots The Messenger through
-Unity asset loading, reads and initializes IL2CPP metadata, emits a correct first GPU fence, and completes
-SubmitDcb #1. The guest `%fs`, threading, positioned-I/O, WaitOnAddress, VEH, and integer ABI foundations
-below are runtime-verified. The current blocker is #678: the Windows `sceKernelRaiseException` path still
-returns success without asynchronously running the installed handler on the target thread. IL2CPP's GC
-therefore waits forever for a stop-the-world suspension acknowledgement before later graphics submissions.
+Unity asset loading and IL2CPP initialization, completes repeated GC stop-the-world cycles, and presents
+real 1920x1080 frames. The guest `%fs`, threading, positioned-I/O, WaitOnAddress, VEH, integer ABI, and
+targeted exception-delivery foundations below are runtime-verified. A 60-second run reached SubmitDcb #28
+with up to 11 draws per submission and no guest fatal. The next work is frontend/gameplay acceptance and
+the remaining portability gaps, not another boot-time IL2CPP investigation.
 
 - **Direct/flexible-memory HLE ported to Win32** (`hle_kernel_mem.cpp` `#else` block). The pool
   bookkeeping + VA tracker are copied verbatim from POSIX; mappings are backed by private
@@ -390,7 +390,7 @@ Windows runs then fail consistently at `Il2cpp+0x17d64b` because `il2cpp_init` h
 and an Il2CppClass global at `Il2cpp+0x268c878` is null. That distinct initialization-parity problem was
 tracked and solved in #673; do not reopen the solved fence-field investigation.
 
-### IL2CPP metadata read — SOLVED (#673); current frontier: GC exception delivery (#678)
+### IL2CPP metadata read — SOLVED (#673)
 
 Windows opened and fstat'd `Media/Metadata/global-metadata.dat` correctly, but the low-level guest fd
 path omitted `O_BINARY`. The Windows CRT consequently treated the first `0x1a` byte as text EOF: a
@@ -401,10 +401,30 @@ now records host open results, fd-to-path associations, fstat sizes, and read/pr
 made this failure visible without debugger stepping.
 
 Native validation reads all 10,743,608 bytes, no longer prints `unable to initialize il2cpp`, and shows
-the formerly-null global at `Il2cpp+0x268c878` initialized. That exposes the distinct #678 stop-the-world
-blocker: `sceKernelRaiseException(target, 0x1e)` is implemented with targeted signals on Linux/macOS but
-is a success no-op on Windows, so the raiser blocks on `SuspendSemaphore` while the target never runs the
-installed handler.
+the formerly-null global at `Il2cpp+0x268c878` initialized. That exposed the distinct #678 stop-the-world
+blocker described below.
+
+### GC target-thread exception delivery — SOLVED (#678)
+
+IL2CPP installs exception type `0x1e`, then raises it on each target thread to stop the world for GC.
+Windows had returned success without delivery, leaving the raiser blocked on `SuspendSemaphore` forever.
+The native path now suspends the requested winpthreads thread, captures its Windows `CONTEXT`, redirects
+it through a small aligned thunk, synthesizes the FreeBSD mcontext layout expected by the guest handler,
+runs that handler on the requested thread, and resumes the exact interrupted context with
+`RtlRestoreContext`.
+
+A redirected context is not dispatched until a blocked `WaitOnAddress` returns. The futex layer therefore
+tracks each Windows waiter's guest address and wakes that exact address after the target's suspend count is
+dropped. The injection leaves the guest SysV red zone intact. `PROSPER_EXCLOG=1` records the target-thread
+handler enter/exit cycles without enabling the much noisier synchronization trace.
+
+The first live delivery exposed two more Windows success-no-ops: `sceKernelIsStack` always returned false,
+and `scePthreadAttrGet` never copied the registered worker-stack bounds. The latter made BDWGC abort with
+`Bad stack base in GC_register_my_thread`. Both now use the existing cross-platform stack registry.
+`win_exception_delivery` tests real delivery while the worker is blocked in the HLE WaitOnAddress path;
+`win_kernel_is_stack` covers both the direct query and IL2CPP's AttrGet/Getstackaddr/Getstacksize sequence.
+The live Messenger acceptance run completed many GC cycles and reached SubmitDcb #28 with repeated
+1920x1080 presentations.
 
 (Historical, pre-fix diagnosis retained below for context.)
 
@@ -471,14 +491,13 @@ granularity); and `PROSPER_CRASHPEEK` guards.
   plain MS-x64 C++ function. `test_hle_stack_args` executes the generated stub and verifies every arg,
   the return value, and handler-entry alignment; `test_agc_submit` pins the real first-fence fields.
 - `guest_tls.cpp` Windows path (guest `%fs` TLS now IMPLEMENTED via FSGSBASE — see above),
-  `boot_program.cpp` enabled on Windows, `boot_trace` built on Windows (no evdev/Vulkan), CI
-  `Windows MinGW` job builds the whole boot path.
+  `boot_program.cpp` enabled on Windows, and the Vulkan-backed `boot_trace` built and runtime-validated
+  on Windows. CI's `Windows MinGW` job builds the whole boot path.
 
 **What is left (runtime work, on a Windows host):**
-1. **Port asynchronous GC exception delivery (#678), the current frontier.** Windows must interrupt
-   the requested `pthread_t`, synthesize the same FreeBSD mcontext used by the POSIX path, run the
-   installed guest handler on that target thread, and resume the interrupted context after the handler
-   returns. Do not fake the `SuspendSemaphore` acknowledgement.
+1. **Validate the user-facing frontend through scripted gameplay.** The headless renderer now presents
+   real frames; run the same deterministic input/screenshot acceptance route used on Linux and repair any
+   Windows-specific SDL/present/input gaps it exposes.
 2. **Preserve physical-offset aliasing in the Windows memory HLE.** Private `VirtualAlloc` is sufficient
    for Unity, but UE4 MallocBinned3 needs shared backing (`CreateFileMapping`/`MapViewOfFile3`) while
    respecting Windows' 64 KiB allocation granularity.

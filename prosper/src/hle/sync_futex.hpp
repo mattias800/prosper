@@ -10,8 +10,13 @@ namespace prosper {
 
 // Bracket a blocking guest futex wait: enter before FUTEX_WAIT, exit after it returns. Lets
 // wake_label_waiters skip its wake syscalls entirely while no thread is blocked.
-void futex_wait_enter();
+void futex_wait_enter(uint64_t addr);
 void futex_wait_exit();
+
+// Windows applies SetThreadContext only after a blocked syscall returns. If `thread` is currently
+// inside the HLE WaitOnAddress path, wake that exact address so an asynchronous guest exception can
+// enter its redirected context. Returns true when a registered futex wait was woken.
+bool interrupt_futex_wait(uint64_t thread);
 
 // FUTEX_WAKE up to n waiters blocked on the 32-bit word at addr. No-op when addr==0 or non-Linux.
 void futex_wake(uint64_t addr, int n);
