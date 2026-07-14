@@ -238,7 +238,18 @@ struct SpirvCompute {
                        t_u64_cache = id(); put(types, Op_TypeInt, {t_u64_cache, 64, 0}); } return t_u64_cache; }
     // A 64-bit uint constant needs two value words. Shift amounts MUST be u64 here: a u32 shift operand on
     // a u64 base is mishandled by some drivers (llvmpipe), silently dropping the high half.
-    uint32_t uconst64(uint64_t v) { uint32_t c = id(); put(types, Op_Constant, {t_u64(), c, (uint32_t)v, (uint32_t)(v >> 32)}); return c; }
+    uint32_t uconst64(uint64_t v) {
+        // For values that fit in 32 bits (all current uses are shift amounts of 32), materialize the
+        // u64 by widening a 32-bit constant in the body rather than emitting a 2-word 64-bit OpConstant
+        // literal. Two reasons, both satisfied by this form: (1) MoltenVK's bundled SPIRV-Cross
+        // mis-parses 64-bit OpConstant literals (reads the high value word as a zero Id -> "Cannot
+        // resolve expression type", failing the whole shader) — a u32->u64 OpUConvert has no 2-word
+        // literal; (2) the result is still u64-typed, so llvmpipe's requirement that a u64 shift amount
+        // be u64 (a u32 shift operand drops the high half there) is preserved. Semantically identical on
+        // every driver. A genuine >32-bit constant still needs the 2-word form (not currently emitted).
+        if (v <= 0xffffffffull) { uint32_t r = id(); put(code, Op_UConvert, {t_u64(), r, uconst((uint32_t)v)}); return r; }
+        uint32_t c = id(); put(types, Op_Constant, {t_u64(), c, (uint32_t)v, (uint32_t)(v >> 32)}); return c;
+    }
     uint32_t u64_from_lohi(uint32_t lo, uint32_t hi) {   // (u64)hi<<32 | (u64)lo  — combine an SGPR pair
         uint32_t l = id(); put(code, Op_UConvert, {t_u64(), l, lo});
         uint32_t h = id(); put(code, Op_UConvert, {t_u64(), h, hi});
