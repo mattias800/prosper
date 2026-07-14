@@ -16,6 +16,11 @@ PROSPER_PAD_SCRIPT=@scripts/dead-cells/reach-first-gameplay.pad \
   roots on current master and reaches the controllable Jump tutorial. The
   route is wall-clock anchored because Dead Cells submits tens of thousands of
   loading flips before the menu.
+- `reach-first-gameplay-full-render.pad`: performs the same route with input
+  delayed until the title appears when every submit is rendered. Use this for
+  presented-image regression investigation; it does not depend on a renderer
+  warmup. WSL llvmpipe runs have not yet cleared Prisoners' Quarters loading
+  repeatably by 180 seconds, so the gameplay baseline remains pending.
 - `reach-first-gameplay-capture.pad`: uses the same menu input but holds Circle from
   28 through 300 seconds. Use it when synchronous timeline/bundle capture begins during
   level loading; the ordinary six-second hold can expire while capture stalls GPU progress.
@@ -25,7 +30,9 @@ skip temporal GPU producers. The former post-warmup fullscreen-white image was
 caused by that skip and is not normal renderer output (#586). For graphics
 investigation, add `PROSPER_RENDER_TARGET_DIM=642x362` to preserve the level's
 RTT chain; this is much slower and currently remains in the opening vignette at
-the 35-second checkpoint. Do not use the fast route as a visual golden guard.
+the 35-second checkpoint. Do not use the warmup-based fast route as a visual
+golden guard. The snapshot matrix uses the full-render route and requires
+inspected multi-frame evidence.
 
 ## Playable Semantic Checkpoints
 

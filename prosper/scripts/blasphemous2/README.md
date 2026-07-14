@@ -52,6 +52,19 @@ manifest records the renderer policy and reports source and pixel progression
 separately. The #654 validation produced all 420 requested 1920x1080 PNGs, with
 315 pixel-distinct samples and moving full-screen gameplay through the final frame.
 
+For the routine renderer regression gate, run:
+
+```bash
+python3 tools/snapshot/snapshot.py check blasphemous2-gameplay
+```
+
+That guard starts from an isolated fresh save, replays this route, and evaluates
+multiple changing frames only after the first-playable-room movement begins. It
+uses a coarse content threshold rather than exact hashes so subtle pixel changes
+do not fail the check. Any new or changed threshold must first be generated with
+`snapshot.py verify blasphemous2-gameplay` and accepted only after every retained
+image from both runs is inspected; see `tools/snapshot/README.md`.
+
 The title's optional `libfmodstudio.prx` and `libfmod.prx` must be prelinked as
 described by #638/#640. A run that stops before the first studio logo has not
 reached the #641 marker fix; a run that faults at guest `eboot+0x11f79d0` has not

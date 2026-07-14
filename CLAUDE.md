@@ -243,14 +243,17 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   `/mnt/c/Users/matti/repos/ps5ys/PPSA24651-app0` (gitignored — **never commit it**).
   ```bash
   cd /mnt/c/Users/matti/repos/ps5ys/prosper/build-linux
-  cmake --build . -j8 && ctest        # 93/93 expected green on Linux
+  cmake --build . -j8 && ctest        # 99/99 expected green on Linux
   ```
 - **Verification is agentic-first / programmatic** (`docs/VERIFICATION.md`): ctest exit code is truth;
-  shaders are `spirv-val`-gated; rendered frames are pixel/CRC-asserted or dumped to BMP. No manual
-  eyeballing is required to know a change works. **After any change that can affect rendered output**
-  (recompiler, AGC decode, render state, detile, executor/present), run the golden-image guard
-  `python3 tools/snapshot/snapshot.py check` (local-only, boots a real game and pixel-hashes an exact
-  frame vs a stored baseline — see `tools/snapshot/AGENTS.md`).
+  shaders are `spirv-val`-gated; rendered frames are asserted by pixels, hashes, or routed content
+  metrics. **After any change that can affect rendered output** (recompiler, AGC decode, render state,
+  detile, executor/present), run `python3 tools/snapshot/snapshot.py check` (local-only). Gameplay
+  guards inspect multiple frames in route-specific windows and use SSIM over compact luminance
+  signatures from several reviewed states, looking for major collapse without rejecting subtle pixel improvements.
+  Every new or materially changed baseline requires `snapshot.py verify`,
+  inspection of all retained images from both runs, and a factual `review` note. See
+  `tools/snapshot/AGENTS.md`.
 - **Build tools — don't avoid them.** This project is a long reverse-engineering effort, and getting
   progressively more complicated games running will keep demanding new instrumentation. When you hit a
   question the existing tools can't answer — "who references this address in the unsymbolicated eboot?",

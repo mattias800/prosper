@@ -64,8 +64,12 @@ Only the game is required; everything else has a sane default.
 Directory-creation and PNG write failures include the failing path and operating-system error.
 
 Every normal run writes a JSONL manifest beside its PNGs. Each sample records the atomic present-source
-identity, guest flip count, rendered-frame sequence, dimensions, CRC32, capture source, elapsed time,
-input route, and whether the source advanced or was stale. A final summary records distinct-frame and
+identity, guest flip count, rendered-frame sequence, dimensions, CRC32, distinct RGB color count,
+non-black pixel count, a 16x9 luminance signature, and standard 64-bit average/difference hashes,
+capture source, elapsed time, input route, and whether the source advanced or was stale. The color
+count and signatures are computed from the visible presented RGBA result (including alpha) and support scene-collapse,
+coverage, and SSIM likeness guards without decoding the PNG again. The hashes and CRC32 remain useful
+diagnostics, but are not sufficient likeness oracles by themselves. A final summary records distinct-frame and
 maximum-stale metrics plus the exit status. Manifests flush after every sample so a killed run retains
 usable evidence. `--no-manifest` preserves the old PNG-only behavior.
 
