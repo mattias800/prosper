@@ -476,13 +476,14 @@ void* thread_trampoline(void* p) {
     // Normal-return exit path: purge this thread's __tls_get_addr DTV entries and free the blocks
     // (#68 — glibc recycles pthread ids, so a stale entry would hand the NEXT thread on this id the
     // dead thread's dirty TLS). The guest entry can return with %fs still = the guest TP
-    // (PROSPER_GUEST_FS), and the purge is host libc (mutex/free), so run it under the host %fs
-    // (scoped swap; both calls are no-ops when the gate is off / not on a guest TCB). Threads that
-    // exit via scePthreadExit never get here — k_pthread_exit purges before host pthread_exit.
-    uint64_t sfs = guest_fs_to_host_scoped();
+    // (PROSPER_GUEST_FS), and the purge is host libc (mutex/free), so switch permanently to host
+    // %fs before cleanup. This is a terminal guest boundary: restoring guest %fs before returning
+    // makes glibc's start_thread cleanup read its TLS through the guest TCB (#644). Threads that
+    // exit via scePthreadExit never get here — its import gate already restored host %fs and
+    // k_pthread_exit purges before host pthread_exit.
+    (void)guest_fs_to_host_scoped();
     tls_dtv_purge_current_thread();
     unregister_thread_stack((uint64_t)pthread_self());   // ids recycle; stale bounds = wrong bounds (#138)
-    guest_fs_restore_scoped(sfs);
     return rv;
 }
 }
