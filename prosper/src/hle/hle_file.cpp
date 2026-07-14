@@ -48,6 +48,45 @@ namespace prosper {
 namespace {
     std::string g_app0;   // host directory backing guest "/app0"
     bool filelog() { static int v = getenv("PROSPER_FILELOG") ? 1 : 0; return v; }
+    std::mutex g_filelog_fd_mx;
+    std::map<int, std::string> g_filelog_fd_paths;
+
+    void filelog_remember_fd(int fd, const std::string& path) {
+        if (!filelog() || fd < 0) return;
+        std::lock_guard<std::mutex> lk(g_filelog_fd_mx);
+        g_filelog_fd_paths[fd] = path;
+    }
+
+    std::string filelog_fd_path(int fd) {
+        if (!filelog()) return {};
+        std::lock_guard<std::mutex> lk(g_filelog_fd_mx);
+        auto it = g_filelog_fd_paths.find(fd);
+        return it == g_filelog_fd_paths.end() ? std::string() : it->second;
+    }
+
+    void filelog_forget_fd(int fd) {
+        if (!filelog()) return;
+        std::lock_guard<std::mutex> lk(g_filelog_fd_mx);
+        g_filelog_fd_paths.erase(fd);
+    }
+
+    void filelog_fd_io(const char* op, int fd, int64_t off, uint64_t count,
+                       int64_t result, int err) {
+        if (!filelog()) return;
+        std::string path = filelog_fd_path(fd);
+        fprintf(stderr,
+                "[file] %s fd=%d path='%s' off=0x%llx count=0x%llx -> %lld error=%d\n",
+                op, fd, path.empty() ? "?" : path.c_str(),
+                (unsigned long long)off, (unsigned long long)count,
+                (long long)result, err);
+    }
+
+    void filelog_fd_stat(int fd, int result, int err, int64_t size) {
+        if (!filelog()) return;
+        std::string path = filelog_fd_path(fd);
+        fprintf(stderr, "[file] fstat fd=%d path='%s' -> %d size=%lld error=%d\n",
+                fd, path.empty() ? "?" : path.c_str(), result, (long long)size, err);
+    }
     // Host directory backing guest "/temp0" — the app temp-data area that
     // sceAppContentTemporaryDataMount2 (hle_service.cpp) reports to the game. Created on first
     // use; override with PROSPER_TEMP0. A scratch dir outside the dump keeps the game's writes
@@ -350,7 +389,12 @@ static int host_open_flags(uint64_t f) {
     if (f & 0x0200) h |= O_CREAT;
     if (f & 0x0400) h |= O_TRUNC;
     if (f & 0x0800) h |= O_EXCL;
-#ifndef _WIN32
+#ifdef _WIN32
+    // Game content is binary. Without O_BINARY, the Windows CRT treats 0x1a as EOF and
+    // translates CRLF during _read; global-metadata.dat's first 0x1a is at byte 440, so
+    // IL2CPP received 440 bytes from a valid 10.7 MiB file and rejected initialization.
+    h |= O_BINARY;
+#else
     if (f & 0x0004) h |= O_NONBLOCK;
     if (f & 0x0080) h |= O_SYNC;                // FreeBSD O_FSYNC
     if (f & 0x0100) h |= O_NOFOLLOW;
@@ -358,13 +402,23 @@ static int host_open_flags(uint64_t f) {
 #endif
     return h;
 }
-HLE(f_open)  { std::string h = translate(CS(a0)); int fd = (int)::open(h.c_str(), host_open_flags(a1), (mode_t)a2);
+HLE(f_open)  { std::string h = translate(CS(a0)); int host_flags = host_open_flags(a1);
+               int fd = (int)::open(h.c_str(), host_flags, (mode_t)a2);
 #ifndef _WIN32
                while (fd >= 0 && fd < 3) { int nfd = fcntl(fd, F_DUPFD, 3); ::close(fd); fd = nfd; }
 #endif
+               int err = fd < 0 ? errno : 0;
+               filelog_remember_fd(fd, h);
+               if (filelog()) fprintf(stderr,
+                   "[file] open-result host='%s' guest-flags=0x%llx host-flags=0x%x -> fd=%d error=%d\n",
+                   h.c_str(), (unsigned long long)a1, host_flags, fd, err);
                if (fd >= 0) preadlog("open", (uint64_t)fd, 0, 0); return (uint64_t)(int64_t)fd; }
 HLE(f_close) { if (a0 < 3) { preadlog("close-lo-ignored", a0, 0, 0); return 0; }
-               preadlog("close", a0, 0, 0); return (uint64_t)(int64_t)::close((int)a0); }
+               preadlog("close", a0, 0, 0);
+               int fd = (int)a0; int r = ::close(fd); int err = r < 0 ? errno : 0;
+               filelog_fd_io("close", fd, 0, 0, r, err);
+               if (r == 0) filelog_forget_fd(fd);
+               return (uint64_t)(int64_t)r; }
 // dup/dup2 were MISSING -> the return-0 stub handed back fd 0 (a valid-looking descriptor that is actually
 // stdin), so the guest read/closed stdin thinking it was its duplicate -> the fd-0 hazard this file guards
 // against elsewhere. Back with host dup/dup2; dup keeps the result above fd 2 (same as f_open).
@@ -411,9 +465,15 @@ static int64_t write_full(int fd, const void* buf, size_t count, bool positioned
     return (int64_t)done;
 }
 #endif
-HLE(f_read)  { if (fdlog_on()) preadlog("read", a0, (uint64_t)::lseek((int)a0, 0, SEEK_CUR), a2);
+HLE(f_read)  { int fd = (int)a0; int64_t off = -1;
+               if (filelog() || fdlog_on()) off = (int64_t)::lseek(fd, 0, SEEK_CUR);
+               if (fdlog_on()) preadlog("read", a0, (uint64_t)off, a2);
+               auto logged_return = [&](int64_t r) -> uint64_t {
+                   filelog_fd_io("read", fd, off, a2, r, r < 0 ? errno : 0);
+                   return (uint64_t)r;
+               };
 #ifndef _WIN32
-               return (uint64_t)read_full((int)a0, P(a1), (size_t)a2, false, 0);
+               return logged_return(read_full(fd, P(a1), (size_t)a2, false, 0));
 #else
                // Full sequential read (loop) — same full-count contract as read_full: a short ::read
                // would leave Unity's asset cache block partially filled and deserialize corrupt data.
@@ -421,11 +481,11 @@ HLE(f_read)  { if (fdlog_on()) preadlog("read", a0, (uint64_t)::lseek((int)a0, 0
                  while (done < cnt) {
                      unsigned want = (cnt - done) > 0x40000000u ? 0x40000000u : (unsigned)(cnt - done);
                      int r = ::read((int)a0, b + done, want);
-                     if (r < 0) return done ? (uint64_t)done : (uint64_t)-1;
+                     if (r < 0) return logged_return(done ? (int64_t)done : (int64_t)-1);
                      if (r == 0) break;   // EOF
                      done += (size_t)r;
                  }
-                 return (uint64_t)done; }
+                 return logged_return((int64_t)done); }
 #endif
              }
 HLE(f_write) {
@@ -438,7 +498,8 @@ HLE(f_write) {
 HLE(f_lseek) { if (fdlog_on() && ((int)a2 != SEEK_CUR || a1 != 0)) preadlog("lseek", a0, a1, (uint64_t)a2);
                return (uint64_t)(int64_t)::lseek((int)a0, (off_t)a1, (int)a2); }
 #ifndef _WIN32
-HLE(f_pread)  { preadlog("pread", a0, a3, a2); return (uint64_t)read_full((int)a0, P(a1), (size_t)a2, true, (off_t)a3); }
+HLE(f_pread)  { preadlog("pread", a0, a3, a2); int64_t r = read_full((int)a0, P(a1), (size_t)a2, true, (off_t)a3);
+                filelog_fd_io("pread", (int)a0, (int64_t)a3, a2, r, r < 0 ? errno : 0); return (uint64_t)r; }
 HLE(f_pwrite) { return (uint64_t)write_full((int)a0, P(a1), (size_t)a2, true, (off_t)a3); }
 // Vectored IO — OrbisKernelIovec == host iovec { void* iov_base; size_t iov_len }, and guest pointers are
 // identity-mapped, so the guest iovec array and its buffers pass straight to host (p)readv/(p)writev.
@@ -481,7 +542,9 @@ int64_t win_pio(int fd, void* buf, size_t count, uint64_t off, bool write) {
 // Guest OrbisKernelIovec == host layout { void* base; size_t len }.
 struct GIovec { void* base; size_t len; };
 } // namespace
-HLE(f_pread)  { return (uint64_t)win_pio((int)a0, P(a1), (size_t)a2, (uint64_t)a3, false); }
+HLE(f_pread)  { int64_t r = win_pio((int)a0, P(a1), (size_t)a2, (uint64_t)a3, false);
+                int err = r < 0 ? (int)GetLastError() : 0;
+                filelog_fd_io("pread", (int)a0, (int64_t)a3, a2, r, err); return (uint64_t)r; }
 HLE(f_pwrite) { return (uint64_t)win_pio((int)a0, P(a1), (size_t)a2, (uint64_t)a3, true); }
 HLE(f_readv)  { auto* v = (GIovec*)P(a1); int nc = (int)a2; int64_t tot = 0;
                 for (int i = 0; i < nc; i++) { int64_t r = (int64_t)(int)::read((int)a0, v[i].base, (unsigned)v[i].len);
@@ -600,7 +663,9 @@ HLE(k_aio_cancel) {  // (id, s32* state): nothing is in flight to cancel — rep
 
 #ifndef _WIN32
 HLE(f_stat)  { std::string h = translate(CS(a0)); struct stat st; int r = ::stat(h.c_str(), &st); if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
-HLE(f_fstat) { struct stat st; int r = ::fstat((int)a0, &st); if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
+HLE(f_fstat) { struct stat st; int r = ::fstat((int)a0, &st); int err = r < 0 ? errno : 0;
+               if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1));
+               filelog_fd_stat((int)a0, r, err, r == 0 ? (int64_t)st.st_size : -1); return (uint64_t)(int64_t)r; }
 // lstat: was MISSING -> the return-0 stub reported success while leaving the caller's stat buffer as
 // uninitialized garbage (wrong file type/size). We have no symlinks in the dump, so ::lstat == ::stat, but
 // the key fix is WRITING the buffer. fsync: was fake-success; flush for real save durability.
@@ -608,7 +673,9 @@ HLE(f_lstat) { std::string h = translate(CS(a0)); struct stat st; int r = ::lsta
 HLE(f_fsync) { return (uint64_t)(int64_t)::fsync((int)a0); }
 #else
 HLE(f_stat)  { std::string h = translate(CS(a0)); struct _stat64 st; int r = ::_stat64(h.c_str(), &st); if (r == 0 && a1) to_sce_stat64(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
-HLE(f_fstat) { struct _stat64 st; int r = ::_fstat64((int)a0, &st); if (r == 0 && a1) to_sce_stat64(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
+HLE(f_fstat) { struct _stat64 st; int r = ::_fstat64((int)a0, &st); int err = r < 0 ? errno : 0;
+               if (r == 0 && a1) to_sce_stat64(st, (uint8_t*)P(a1));
+               filelog_fd_stat((int)a0, r, err, r == 0 ? (int64_t)st.st_size : -1); return (uint64_t)(int64_t)r; }
 HLE(f_lstat) { return f_stat(a0,a1,a2,a3,a4,a5); }
 HLE(f_fsync) { return 0; }
 #endif

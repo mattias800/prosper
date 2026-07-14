@@ -249,6 +249,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_stat PRIVATE prosper_core)
   add_test(NAME sce_stat_layout COMMAND test_stat)
 
+  add_executable(test_file_binary tests/test_file_binary.cpp)
+  target_link_libraries(test_file_binary PRIVATE prosper_core)
+  add_test(NAME file_binary_roundtrip COMMAND test_file_binary)
+
   # APR container registry + size-keyed read matching (issue #62): stable ids, path dedup, and
   # the ambiguity/chunk-read refusal the read-submit path relies on. Pure, no game dump needed.
   add_executable(test_apr_registry tests/test_apr_registry.cpp)
