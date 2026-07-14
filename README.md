@@ -73,7 +73,7 @@ audio, and graphics stack. See [Game compatibility](COMPATIBILITY.md) for exact 
 evdev/SDL3 controllers + real message/error/IME dialogs), sharing the same boot + render core as the
 headless `boot_trace`.
 
-Development is **agentic-first**: correctness is verified programmatically — **92 self-checking tests**
+Development is **agentic-first**: correctness is verified programmatically — **93 self-checking tests**
 under `ctest` (including a headless Vulkan/llvmpipe harness that runs recompiled shaders and asserts
 numeric/pixel results, and per-opcode round-trip disassembly checks), a **golden-image snapshot guard**
 that boots a real title and pixel/content-asserts an exact frame, cross-platform CI (Linux +
@@ -90,7 +90,9 @@ Windows/MinGW), structured logs, and purpose-built tracing tooling — never by 
 - This is an independent interoperability / preservation research project, not affiliated with or
   endorsed by Sony Interactive Entertainment.
 
-## Building (Linux)
+## Building
+
+### Linux
 
 Requires a C++20 compiler, CMake, and Ninja. A Vulkan loader is needed for the graphics tests
 (the CI/headless path uses the `llvmpipe` software ICD).
@@ -99,19 +101,72 @@ Requires a C++20 compiler, CMake, and Ninja. A Vulkan loader is needed for the g
 cd prosper
 cmake -G Ninja -B build-linux
 cmake --build build-linux
-ctest --test-dir build-linux          # 92 self-checking tests
+ctest --test-dir build-linux          # 93 self-checking tests
 ```
 
-Add `-DPROSPER_APP=ON` to also build the windowed `prosper-app` frontend (fetches SDL3). Native
-Windows/MinGW now boots and renders the primary title through the same live Vulkan renderer; its
-current build, run, screenshot, and diagnostic recipe is maintained in
-[`prosper/docs/WINDOWS_PORT_HANDOFF.md`](prosper/docs/WINDOWS_PORT_HANDOFF.md).
+Add `-DPROSPER_APP=ON -DPROSPER_AUDIO_SDL3=ON -DPROSPER_PAD_SDL3=ON` to build the windowed frontend
+with audio and controller support. CMake fetches SDL3 when it is not installed.
 
-On Windows, the full graphics + WASAPI audio + controller/keyboard frontend is one command:
+### Windows core
+
+The supported Windows toolchain is 64-bit MinGW-w64 UCRT. In an MSYS2 UCRT64 shell:
+
+```sh
+pacman -S --needed git mingw-w64-ucrt-x86_64-gcc \
+  mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja
+cmake -S prosper -B prosper/build-windows-core -G Ninja \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE
+cmake --build prosper/build-windows-core
+ctest --test-dir prosper/build-windows-core --output-on-failure
+```
+
+This builds and tests the headless core without SDL or Vulkan. GitHub Actions runs the same UCRT64
+path on every push and pull request.
+
+### Windows app
+
+Install the Vulkan development packages in the same UCRT64 shell, then enable the app and its SDL3
+backends:
+
+```sh
+pacman -S --needed mingw-w64-ucrt-x86_64-vulkan-headers \
+  mingw-w64-ucrt-x86_64-vulkan-loader
+cmake -S prosper -B prosper/build-windows-app -G Ninja \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo -DPROSPER_APP=ON \
+  -DPROSPER_AUDIO_SDL3=ON -DPROSPER_PAD_SDL3=ON
+cmake --build prosper/build-windows-app --target prosper-app
+./prosper/build-windows-app/prosper-app.exe --test-pattern --frames 120
+```
+
+From native PowerShell, the repository launcher supports WinLibs or MSYS2 MinGW plus an installed
+Vulkan SDK and performs configure, build, and launch in one command:
 
 ```powershell
 .\prosper\scripts\run-windows.ps1 .\PPSA24651-app0
 ```
+
+The detailed native build, screenshot, and diagnostic recipe is in
+[`WINDOWS_PORT_HANDOFF.md`](prosper/docs/WINDOWS_PORT_HANDOFF.md).
+
+## Windows download and use
+
+Every CI run publishes a `prosper-windows-x64` artifact. A `v*` tag publishes the same
+`prosper-windows-x64.zip` on the repository's [GitHub Releases page](https://github.com/mattias800/ps5ys/releases).
+The archive contains
+`prosper-app.exe`, a one-command PowerShell launcher, and its usage guide; it never contains games,
+firmware, or keys.
+
+After extracting the archive, launch an unpacked `app0` directory:
+
+```powershell
+./start-prosper.ps1 'D:/PS5/PPSA24651-app0'
+```
+
+There is no game-picker or settings UI yet. The launcher supplies the required guest environment,
+creates local save data, and enables the Vulkan window, audio, physical controller, and keyboard
+overlay. Use `./start-prosper.ps1 -TestPattern -Frames 120` to test the frontend without a game.
+See [`WINDOWS_RELEASE.md`](prosper/docs/WINDOWS_RELEASE.md) for requirements, direct-executable use,
+save-data selection, the complete keyboard mapping, recordings, and troubleshooting.
 
 ## Repository layout
 
@@ -128,6 +183,10 @@ prosper/
   tests/          unit + boot + Vulkan-execution tests (run under ctest)
   docs/           ARCHITECTURE, ROADMAP, GRAPHICS, RENDER_LOOP, VERIFICATION, and per-frontier logs
 ```
+
+The July 2026 renderer profiling results, correctness constraints, rejected experiments, and next
+architecture step are recorded in
+[`RENDERER_PERFORMANCE_2026_07.md`](prosper/docs/RENDERER_PERFORMANCE_2026_07.md).
 
 ## License
 
