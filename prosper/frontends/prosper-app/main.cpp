@@ -4,8 +4,9 @@
 //
 // P0a scope (this file): the whole present half, decoupled from the guest boot. It pulls finished
 // frames from prosper_core's present layer (present_readback) and blits them to a real swapchain,
-// and closes on SDL_QUIT/Esc via the cooperative stop signal (prosper_request_stop). To verify the
-// pipeline without a game dump it can also FEED the present layer a synthetic animated pattern
+// and handles SDL_QUIT/Esc via the shared stop request. run_entry does not consume that request yet,
+// so a booted guest uses direct process exit after the present loop (issue #352). To verify the
+// pipeline without a game dump the app can FEED the present layer a synthetic animated pattern
 // (--test-pattern): frame -> present_write_frame -> present_readback -> swapchain, exactly the path
 // a real guest frame takes. P0b wires the actual guest boot in front of this (the same present
 // path, no changes here).
@@ -502,10 +503,20 @@ int main(int argc, char** argv) {
 
     prosper_request_stop();   // signal the guest run-loop to wind down at its next boundary
     fprintf(stderr, "[app] shutting down after %llu presented frame(s)\n", (unsigned long long)shown);
+    const int exitCode = (exitAfter && (int)shown < exitAfter) ? 1 : 0;
+
+    // run_entry does not yet observe the frontend stop flag, so a booted guest cannot be joined.
+    // Returning from main after detaching it is unsafe: C++ static teardown destroys HLE/renderer
+    // state while guest threads still use it (a short --frames run reliably ended in 0xC0000005 on
+    // Windows). Until the flip-boundary cooperative stop is implemented, terminate directly and
+    // let the OS reclaim process state without running destructors under the live guest.
+    if (guestThread.joinable()) {
+        guestThread.detach();
+        fflush(nullptr);
+        std::_Exit(exitCode);
+    }
+
     vkDeviceWaitIdle(vk.device);
-    // The guest runs guest code with no cooperative yield point yet (a flip-boundary stop check is a
-    // refinement), so we detach and let process exit reclaim it rather than block on a join.
-    if (guestThread.joinable()) guestThread.detach();
     SDL_DestroyWindow(win); SDL_Quit();
-    return (exitAfter && (int)shown < exitAfter) ? 1 : 0;
+    return exitCode;
 }

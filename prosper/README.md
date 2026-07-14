@@ -122,6 +122,13 @@ g++ -O2 -std=c++20 tools/self_dump/self_dump.cpp -o self_dump
 ./self_dump ../PPSA24651-app0/eboot.bin [--symbols]
 ```
 
+From the parent repository root, native Windows builds and runs the full graphics + WASAPI audio +
+controller/keyboard frontend with:
+
+```powershell
+.\prosper\scripts\run-windows.ps1 .\PPSA24651-app0
+```
+
 ## Legal / scope
 Interoperability & preservation research on legally-owned titles. `prosper` ships **no** Sony code,
 firmware, or keys — it reimplements published library interfaces clean-room style. It only operates on

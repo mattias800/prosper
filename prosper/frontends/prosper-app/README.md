@@ -4,7 +4,8 @@ The OS-integration frontend: an SDL3 window + Vulkan swapchain that runs a PS5 t
 rendering, audio out, and controller in. See `prosper/docs/FRONTEND_APP.md` for the design and issue
 #164 for the plan.
 
-**Status:** boots and displays the game, with audio and controllers. `--dump <app0>` boots a title
+**Status:** boots and displays the game natively on Linux, Windows, and macOS, with audio and
+controllers. `--dump <app0>` boots a title
 via the shared `boot_program()` path, composites its GPU submits with the shared live renderer, and
 presents them to the window; `sceAudioOut` is routed to the host and a host gamepad drives
 `libScePad`. `--test-pattern` verifies the window + swapchain without a dump.
@@ -21,9 +22,22 @@ cmake --build build-app -j8 --target prosper-app
 
 (`-DPROSPER_APP=ON` alone builds a video-only app — no audio/controllers.)
 
-On Windows this builds/runs under WSL2; the window appears on the Windows desktop via WSLg, audio via
-WSLg's PulseAudio. A real GPU needs your vendor's WSL Vulkan driver (else it falls back to the
-`llvmpipe` software rasterizer — correct but slow). Confirm your device with `vulkaninfo`.
+### Native Windows
+
+From the repository root, the launcher configures a MinGW/Ninja build with video, WASAPI audio, and
+SDL3 controller support, then starts the supplied title:
+
+```powershell
+.\prosper\scripts\run-windows.ps1 .\PPSA24651-app0
+```
+
+It reuses `prosper/build-mingw-app` on later runs. Use `-NoBuild` to skip the configure/build check,
+`-TestPattern -Frames 120` to smoke-test the real window and Vulkan swapchain without a game, and
+`-GuestArgs ''` when a title must not receive Unity's `-force-gfx-direct` argument. A Vulkan SDK,
+CMake, Ninja, and MinGW-w64 UCRT are required; the launcher discovers the standard winget WinLibs
+installation automatically.
+
+WSLg remains an alternate way to run the Linux build, but it is no longer the primary Windows path.
 
 ## Run
 
