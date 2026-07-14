@@ -55,6 +55,16 @@ float f10_to_float(uint16_t v) {
     return half_to_float((uint16_t)(((v & 0x3FFu) >> 5 << 10) | ((v & 0x1Fu) << 5)));
 }
 
+void unorm2_10_10_10_to_rgba8(uint32_t packed, uint8_t rgba[4]) {
+    // Mesa's GFX10 format table maps a logical R10G10B10A2 description to hardware IMG_FMT 50,
+    // whose name lists the packed fields high-to-low. Scale with integer rounding so both endpoints
+    // and intermediate UNORM values match a normalized hardware sample as closely as RGBA8 permits.
+    rgba[0] = (uint8_t)((((packed >>  0) & 0x3FFu) * 255u + 511u) / 1023u);
+    rgba[1] = (uint8_t)((((packed >> 10) & 0x3FFu) * 255u + 511u) / 1023u);
+    rgba[2] = (uint8_t)((((packed >> 20) & 0x3FFu) * 255u + 511u) / 1023u);
+    rgba[3] = (uint8_t)(((packed >> 30) & 0x3u) * 85u);
+}
+
 const ShaderResource* ShaderResourceTable::by_srt_offset(uint32_t srt_offset) const {
     if (srt_offset == 0xFFFFFFFFu) return nullptr;
     for (const auto& r : resources) if (r.srt_offset == srt_offset) return &r;

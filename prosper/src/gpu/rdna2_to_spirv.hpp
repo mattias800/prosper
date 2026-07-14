@@ -11,6 +11,7 @@
 // floats per invocation from storage buffer 0 into v0..v(num_inputs-1)  (v[k] = a[gid*num_inputs+k]),
 // runs the translated ALU ops, then stores v[out_vgpr] to storage buffer 1 (b[gid]).
 #pragma once
+#include <array>
 #include <cstdint>
 #include <cstddef>
 #include <vector>
@@ -18,6 +19,17 @@
 namespace prosper::gpu {
 
 struct ShaderResourceTable;   // resource-binding contract (shader_resources.hpp); optional to recompile_valu
+
+// Fixed-function PS interpolant wiring captured from SPI_PS_INPUT_CNTL_0..31. A valid entry's
+// OFFSET selects the vertex PARAM export feeding that logical PS input; OFFSET=0x20 selects the
+// four hardware default vectors encoded by DEFAULT_VAL instead. Keeping this separate from
+// RenderState makes the recompiler independently unit-testable.
+struct PixelInputMapping {
+    std::array<uint32_t, 32> controls{};
+    uint32_t valid_mask = 0;
+
+    bool operator==(const PixelInputMapping&) const = default;
+};
 
 // Translate a straight-line float-VALU RDNA2 stream to a compute-shader SPIR-V module.
 // Returns {} if the stream contains an opcode/format this stage does not yet handle. An optional
@@ -57,7 +69,8 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
 // to a POS target write vec4(src0..3) to gl_Position. Returns {} if unsupported / no position export.
 // An optional ShaderResourceTable enables vertex fetch (buffer_load_format_*) + constant loads.
 std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
-                                       const ShaderResourceTable* rt = nullptr);
+                                       const ShaderResourceTable* rt = nullptr,
+                                       const PixelInputMapping* pixel_inputs = nullptr);
 
 // How much of a shader the recompiler currently covers (per-instruction), without requiring the
 // stream to be a complete vertex/fragment. `alu` = instructions emit_alu handles (VALU/scalar/

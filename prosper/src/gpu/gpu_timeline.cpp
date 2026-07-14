@@ -240,6 +240,7 @@ struct RuntimeDetailRequest {
     uint32_t bundle_target_height = 0;
     uint32_t bundle_start_target_width = 0;
     uint32_t bundle_start_target_height = 0;
+    uint32_t bundle_checkpoint_interval = 0;
     uint32_t select_target_width = 0;
     uint32_t select_target_height = 0;
     uint32_t select_target_min_index = 0;
@@ -317,6 +318,18 @@ struct RuntimeDetailRequest {
                 } else {
                     bundle_start_target_width = width;
                     bundle_start_target_height = height;
+                }
+            }
+            if (const char* interval = std::getenv(
+                    "PROSPER_GPU_TIMELINE_CAPTURE_CHECKPOINT_EVERY")) {
+                char* interval_end = nullptr;
+                const uint64_t value = std::strtoull(interval, &interval_end, 0);
+                if (!interval_end || *interval_end || value < 1 || value > 4096) {
+                    std::fprintf(stderr,
+                                 "[timeline] capture bundle checkpoint interval must be 1..4096\n");
+                    bundle_path.clear(); bundle_depth = 0;
+                } else {
+                    bundle_checkpoint_interval = static_cast<uint32_t>(value);
                 }
             }
         }
@@ -561,6 +574,7 @@ struct RuntimeCaptureBundle {
     bool started = false;
     std::chrono::steady_clock::time_point started_at;
     uint64_t captured_resource_bytes = 0;
+    uint64_t captured_submit_count = 0;
 };
 
 RuntimeCaptureBundle& runtime_capture_bundle() {
@@ -1464,6 +1478,23 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
         } else {
             if (request.select_target_width)
                 trim_runtime_capture_bundle(request.bundle_depth - 1);
+            RuntimeCaptureBundle& bundle_state = runtime_capture_bundle();
+            ++bundle_state.captured_submit_count;
+            if (request.bundle_checkpoint_interval &&
+                !(bundle_state.captured_submit_count % request.bundle_checkpoint_interval)) {
+                if (!write_gpu_capture_bundle(request.bundle_path, bundle_state.bundle, error)) {
+                    std::fprintf(stderr,
+                                 "[timeline] capture bundle checkpoint at submit %llu failed: %s\n",
+                                 static_cast<unsigned long long>(submit_no), error.c_str());
+                    error.clear();
+                } else {
+                    std::fprintf(stderr,
+                                 "[timeline] checkpointed capture bundle submits=%zu through=%llu -> %s\n",
+                                 bundle_state.bundle.submits.size(),
+                                 static_cast<unsigned long long>(submit_no),
+                                 request.bundle_path.c_str());
+                }
+            }
             const std::string identity = request.bundle_path + "#submit=" + std::to_string(submit_no);
             const GpuTimelineDetail detail = capture_detail(submit, identity, predecessor);
             if (!writer->append_detail(detail, error)) {

@@ -51,7 +51,7 @@ int main() {
 
     auto table = std::make_shared<ShaderResourceTable>();
     ShaderResource a{}; a.cls = ResourceClass::VertexBuffer; a.binding = 9; a.gpu_addr = 0x1000;
-    a.size = 16; a.stride = 4; a.format = DataFormat::Unorm8; a.num_components = 4; a.fetch_pc = 12;
+    a.size = 16; a.stride = 4; a.format = DataFormat::Unorm2_10_10_10; a.num_components = 4; a.fetch_pc = 12;
     ShaderResource b{}; b.cls = ResourceClass::ConstantBuffer; b.binding = 2; b.gpu_addr = 0x1008;
     b.size = 16; b.format = DataFormat::Float32; b.num_components = 4; b.srt_offset = 0x20;
     table->resources = {a, b};
@@ -172,6 +172,8 @@ int main() {
           "fixed-function pipeline state round-trips explicitly");
     CHECK(loaded.draws[0].color0_width == 1024 && loaded.draws[0].color0_height == 32,
           "per-target extent round-trips");
+    CHECK(loaded.draws[0].vrt.resources[0].resource.format == DataFormat::Unorm2_10_10_10,
+          "newest packed image format enum round-trips");
     CHECK(loaded.shader_versions.size() == 2 && loaded.draws[0].draw_index == 7 &&
           loaded.draws[0].command_order == 123 && loaded.operations[0].source_index == 7,
           "content versions and draw operation identity round-trip");

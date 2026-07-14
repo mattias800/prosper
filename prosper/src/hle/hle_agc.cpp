@@ -757,7 +757,6 @@ HLE(agc_create_shader) {  // (Shader** dst, void* header, const void* code)
                         "cx=%u sh=%u pgm_patched=%d\n",
                 agc_shaders().size(), (void*)h, (void*)code, h->type, h->target, h->shader_size,
                 h->num_cx_registers, h->num_sh_registers, (int)patched);
-
     // Semantic surfacing probe (PROSPER_PIPETRACE): logs the shader's input/output vertex semantics.
     // CORRECTION (2026-07-05, fresh 3-agent RE, ground-truth via eboot x86 disasm): an earlier theory
     // blamed the eboot+0xba6e08 GfxDevice fault on "empty semantics leaving the reflection table empty
@@ -803,22 +802,6 @@ HLE(agc_create_shader) {  // (Shader** dst, void* header, const void* code)
 // ([sub+0x10]/[sub+0x18]) at the packet payload. The leaf imports it needs are these four
 // (semantics per Kyty Graphics.cpp:1606-1762, generalized — see each note).
 namespace {
-
-struct AgcShaderSemantic {           // guest-visible 32-bit bitfield (Kyty Shader.h:958)
-    uint32_t semantic         : 8;
-    uint32_t hardware_mapping : 8;
-    uint32_t size_in_elements : 4;
-    uint32_t is_f16           : 2;
-    uint32_t is_flat_shaded   : 1;
-    uint32_t is_linear        : 1;
-    uint32_t is_custom        : 1;
-    uint32_t static_vb_index  : 1;
-    uint32_t static_attribute : 1;
-    uint32_t reserved         : 1;
-    uint32_t default_value    : 2;
-    uint32_t default_value_hi : 2;
-};
-static_assert(sizeof(AgcShaderSemantic) == 4, "semantic must be one dword");
 
 struct AgcShaderSpecialRegs {        // guest-visible (Kyty Shader.h:947); pointed to by Shader+0x28
     AgcShaderRegister ge_cntl;                  // +0x00
@@ -946,8 +929,6 @@ HLE(agc_create_interpolant_mapping) {  // (ShaderRegister regs[32], const Shader
     auto* ps   = (const AgcShader*)(uintptr_t)a2;
     if (!regs || !gs) return kAgcErrInvalidArg;
     using namespace prosper::agc::Pm4;
-    const auto* gs_out = (const AgcShaderSemantic*)gs->output_semantics;
-    const auto* ps_in  = ps ? (const AgcShaderSemantic*)ps->input_semantics : nullptr;
     uint32_t n = ps ? ps->num_input_semantics : (uint32_t)gs->num_output_semantics;
     if (getenv("PROSPER_PIPETRACE"))
         fprintf(stderr, "  [interp] gs.num_out=%u ps=%p ps.num_in=%u -> mapping %u interpolants\n",
@@ -955,21 +936,12 @@ HLE(agc_create_interpolant_mapping) {  // (ShaderRegister regs[32], const Shader
                 ps ? ps->num_input_semantics : 0u, n);
     pipetrace_shader_user_data("CreateInterpolant.gs", gs);
     pipetrace_shader_user_data("CreateInterpolant.ps", ps);
+    const auto mapping = prosper::gpu::derive_agc_pixel_input_controls(
+        reinterpret_cast<const prosper::gpu::AgcShaderHeader*>(gs),
+        reinterpret_cast<const prosper::gpu::AgcShaderHeader*>(ps));
     for (uint32_t i = 0; i < 32; i++) {
         regs[i].offset = SPI_PS_INPUT_CNTL_0 + i;
-        uint32_t value = 0;
-        if (i < n) {
-            uint32_t slot = i; bool flat = false;
-            if (ps_in && gs_out) {
-                flat = ps_in[i].is_flat_shaded != 0;
-                for (uint32_t j = 0; j < gs->num_output_semantics; j++)
-                    if (gs_out[j].semantic == ps_in[i].semantic) { slot = gs_out[j].hardware_mapping; break; }
-            } else if (gs_out) {
-                slot = gs_out[i].hardware_mapping;
-            }
-            value = slot | (flat ? 0x400u : 0u);
-        }
-        regs[i].value = value;
+        regs[i].value = (mapping.valid_mask & (1u << i)) ? mapping.controls[i] : 0u;
     }
     return 0;
 }

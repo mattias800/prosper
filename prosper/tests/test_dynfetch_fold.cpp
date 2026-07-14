@@ -139,6 +139,74 @@ int main() {
     CHECK(have_cbuf, "kernel 5 s_buffer_load reports a ConstantBuffer table-use keyed by the V# load imm");
     CHECK(cbuf_ok,   "kernel 5 V# dwords match the table as loaded");
 
+    // Kernel 5d: direct T#/S# sharps already occupy the initial PS user SGPRs, so no s_load creates
+    // descr8/descr snapshots. The MIMG use must still receive a pc-keyed texture and paired sampler.
+    const uint32_t k5d[] = {
+        0xF0800F08u, 0x00400000u,   // image_sample v[0:3], v[0:1], s[0:7], s[8:11] dmask:0xf 2D
+        0xBF810000u,                // s_endpgm
+    };
+    const uint32_t seed5d[12] = {
+        0x20753500u, 0xC2400000u, 0x021BC3BFu, 0x91B003ACu, // T#: 0x2075350000, 3840x2160, 2D
+        0x00000000u, 0x00700000u, 0x006B0000u, 0x00205072u,
+        0x00000092u, 0x00FFF000u, 0x06500000u, 0x00000000u, // S#
+    };
+    std::vector<SrtUse> direct_uses;
+    resolve_dynamic_fetch(k5d, sizeof(k5d)/sizeof(k5d[0]), seed5d, 12, 0, &direct_uses);
+    CHECK(direct_uses.size() == 1 && direct_uses[0].kind == 0 &&
+          direct_uses[0].key == 0xFFFFFFFFu && direct_uses[0].use_pc == 0,
+          "direct user-SGPR T# resolves the image_sample by exact pc");
+    CHECK(direct_uses.size() == 1 && direct_uses[0].t8[0] == seed5d[0] &&
+          direct_uses[0].t8[7] == seed5d[7] && direct_uses[0].has_samp &&
+          direct_uses[0].s4[0] == seed5d[8] && direct_uses[0].s4[3] == seed5d[11],
+          "direct user-SGPR T#/S# dwords are preserved");
+
+    // DOLL scene VS: an untyped buffer_load_dwordx3 uses a V# placed directly in user-data
+    // s[8:11]. There is no preceding s_load and it is not a format/vertex fetch, so it needs its
+    // own pc-keyed buffer use. The same eight seed SGPRs may also happen to decode as a plausible
+    // T#; the consuming MUBUF instruction is definitive that these first four words are a V#.
+    const uint32_t k5v[] = {
+        0xE03C2000u, 0x80020003u,   // buffer_load_dwordx3 v[0:2], v3, s[8:11], 0 idxen
+        0xBF810000u,
+    };
+    const uint32_t seed5v[4] = {
+        0x00020000u, 0x00040000u, 1480u, 75u << 12, // base=0x20000 stride=4 size=5920
+    };
+    std::vector<SrtUse> direct_v_uses;
+    resolve_dynamic_fetch(k5v, sizeof(k5v)/sizeof(k5v[0]), seed5v, 4, 8, &direct_v_uses);
+    CHECK(direct_v_uses.size() == 1 && direct_v_uses[0].kind == 1 &&
+          direct_v_uses[0].key == 0xFFFFFFFFu && direct_v_uses[0].use_pc == 0,
+          "direct user-SGPR V# resolves raw MUBUF by exact pc");
+    CHECK(direct_v_uses.size() == 1 && direct_v_uses[0].v4[0] == seed5v[0] &&
+          direct_v_uses[0].v4[1] == seed5v[1] && direct_v_uses[0].v4[2] == seed5v[2],
+          "direct raw-MUBUF V# preserves base/stride/record dwords");
+
+    // Kernel 5dr: once any T# SGPR is reloaded, the initial sharp is stale. An unresolved reload must
+    // not silently resurrect it and fabricate a texture mapping for the later image operation.
+    const uint32_t k5dr[] = {
+        0xF4000014u, 0xFA000000u,   // s_load_dword s0, s[40:41], 0x0 (unknown base -> reloaded+unknown)
+        0xF0800F08u, 0x00400000u,   // image_sample v[0:3], v[0:1], s[0:7], s[8:11]
+        0xBF810000u,                // s_endpgm
+    };
+    std::vector<SrtUse> direct_reloaded_uses;
+    resolve_dynamic_fetch(k5dr, sizeof(k5dr)/sizeof(k5dr[0]), seed5d, 12, 0, &direct_reloaded_uses);
+    CHECK(direct_reloaded_uses.empty(),
+          "reloaded direct T# SGPR blocks the stale seed fallback");
+
+    // Kernel 5t: AGC user data may carry non-address aperture/tag bits above Base48. A scalar load
+    // must canonicalize an otherwise-unreadable tagged pair before the host memory read; the exact
+    // same descriptor table should still resolve. (The untagged address is the real in-process table,
+    // so the full-range readability check also guards the fallback.)
+    uint32_t tagged_seed5[2] = { seed5[0], seed5[1] | 0xABCD0000u };
+    std::vector<SrtUse> tagged_uses;
+    resolve_dynamic_fetch(k5, sizeof(k5)/sizeof(k5[0]), tagged_seed5, 2, 8, &tagged_uses);
+    bool tagged_tex = false, tagged_cbuf = false;
+    for (const auto& u : tagged_uses) {
+        if (u.kind == 0 && u.key == 0x40 && u.t8[0] == table[16]) tagged_tex = true;
+        if (u.kind == 1 && u.key == 0x80 && u.v4[0] == table[32]) tagged_cbuf = true;
+    }
+    CHECK(tagged_tex && tagged_cbuf,
+          "tagged scalar Base48 pointer canonicalizes to the mapped descriptor table");
+
     // Kernel 5m (#398): same as k5 but the T# s_load uses m0 as SOFFSET (field 124), a special register
     // the fold does not track. It must NOT be folded to offset 0 and snapshotted — that would decode a T#
     // from base+0x40+0 (the wrong address in general) and report it as valid. The fix marks s[12:19]

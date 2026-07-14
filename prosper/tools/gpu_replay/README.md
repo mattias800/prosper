@@ -66,7 +66,9 @@ expected hash. `--allow-mismatch` is for an intentional differential such as `--
 
 ```bash
 ./build-linux/gpu_replay --draw 12:18 /tmp/submit.prgcap /tmp/pass.bmp
+./build-linux/gpu_replay --draw 18 --draw-with-compute-prefix /tmp/submit.prgcap /tmp/draw.bmp
 ./build-linux/gpu_replay --through-operation 52 /tmp/submit.prgcap /tmp/prefix.bmp
+./build-linux/gpu_replay --warmup-repeats 2 /tmp/submit.prgcap /tmp/converged.bmp
 ./build-linux/gpu_replay --dump-resource 18:ps:34 /tmp/texture.bin /tmp/submit.prgcap
 ./build-linux/gpu_replay --dump-shader 18:fs /tmp/fragment.spv /tmp/submit.prgcap
 ./build-linux/gpu_replay --dump-compute 0 /tmp/compute.spv /tmp/submit.prgcap
@@ -106,6 +108,10 @@ interchangeable when dispatches or unrealized operations are present. Replay res
 seeds before operation zero and uses owned resource memory; it must not dereference original guest mappings.
 Bundle operation sources are semantic draw IDs and may contain holes; tooling must resolve them through each
 realized item's `draw_index`, never treat them as offsets into the compact draw vector.
+
+`--draw-with-compute-prefix` retains every compute operation before the selected draw while discarding the
+other graphics draws. This isolates geometry whose vertex/indirect buffers are produced earlier in the same
+submit without losing those producers. Plain `--draw` intentionally remains the cheaper graphics-only path.
 
 `--through-operation N` executes the inclusive mixed graphics/compute prefix `0..N`, preserving operation
 order and all earlier work. Prefix output uses the last executed draw target's native dimensions. Use it with

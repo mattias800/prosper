@@ -16,6 +16,7 @@
 #include <atomic>
 #include <chrono>
 #include <climits>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -660,6 +661,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 tp[t * 4 + 3] = 255;
                             }
                         }
+                        // Packed R10G10B10A2 UNORM (GFX10 IMG_FMT 50 / "2_10_10_10_UNORM"):
+                        // the generic 4-B read and detile above preserve packed texels; normalize each
+                        // field to the RGBA8 image format used by this renderer before sampling.
+                        if (!rtt_hit && r.format == prosper::gpu::DataFormat::Unorm2_10_10_10) {
+                            uint8_t* tp = texstore.back().data();
+                            for (size_t t = 0; t < (size_t)tw * th; t++) {
+                                uint32_t v; std::memcpy(&v, tp + t * 4, 4);
+                                prosper::gpu::unorm2_10_10_10_to_rgba8(v, tp + t * 4);
+                            }
+                        }
                         // Focused per-consumer version probe (#586). Hash both the raw guest backing
                         // and the final decoded/RTT-injected pixels so a live draw identifies whether
                         // divergence precedes format conversion or enters through renderer-owned state.
@@ -1090,6 +1101,46 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     uint32_t gw = w, gh = h;
                     const uint32_t present_w = prosper::gpu::present_width();
                     const uint32_t present_h = prosper::gpu::present_height();
+                    // A depth prepass may bind a tiny/dummy color target with CB_TARGET_MASK=0 while
+                    // rasterizing the full-size guest depth surface. Keying and allocating persistent
+                    // DS from that irrelevant color extent creates (for DOLL) a 512x256 depth image;
+                    // the following 3840x2160 EQUAL lighting pass then gets a separate blank image and
+                    // rejects every fragment. For a wholly color-disabled DS pass, recover the native
+                    // attachment extent from its viewport (undoing execute_gpustate's render scale).
+                    // Mixed/color-writing passes retain the authoritative CB_COLOR extent.
+                    const bool color_disabled = !pass.empty() && std::all_of(
+                        pass.begin(), pass.end(), [](const auto* draw) {
+                            return draw->ps.color_write_mask == 0;
+                        });
+                    const bool uses_ds = std::any_of(pass.begin(), pass.end(), [](const auto* draw) {
+                        return draw->ps.depth_test_enable || draw->ps.depth_write_enable ||
+                               draw->ps.depth_clear_enable || draw->ps.stencil_enable ||
+                               draw->ps.stencil_clear_enable;
+                    });
+                    if (color_disabled && uses_ds && w && h) {
+                        float viewport_x = 0.0f, viewport_y = 0.0f;
+                        for (const auto* draw : pass) {
+                            if (!draw->ps.has_viewport) continue;
+                            const float x1 = draw->ps.viewport_x;
+                            const float x2 = x1 + draw->ps.viewport_w;
+                            const float y1 = draw->ps.viewport_y;
+                            const float y2 = y1 + draw->ps.viewport_h;
+                            if (std::isfinite(x1) && std::isfinite(x2))
+                                viewport_x = std::max(viewport_x, std::max(std::fabs(x1), std::fabs(x2)));
+                            if (std::isfinite(y1) && std::isfinite(y2))
+                                viewport_y = std::max(viewport_y, std::max(std::fabs(y1), std::fabs(y2)));
+                        }
+                        const uint32_t scale_w = present_w ? present_w : w;
+                        const uint32_t scale_h = present_h ? present_h : h;
+                        const uint64_t viewport_native_w = static_cast<uint64_t>(
+                            std::ceil(viewport_x * static_cast<float>(scale_w) / w));
+                        const uint64_t viewport_native_h = static_cast<uint64_t>(
+                            std::ceil(viewport_y * static_cast<float>(scale_h) / h));
+                        if (viewport_native_w && viewport_native_w <= 16384)
+                            native_w = std::max(native_w, static_cast<uint32_t>(viewport_native_w));
+                        if (viewport_native_h && viewport_native_h <= 16384)
+                            native_h = std::max(native_h, static_cast<uint32_t>(viewport_native_h));
+                    }
                     if (native_w && native_h) {
                         uint64_t native_pixels = (uint64_t)native_w * native_h;
                         uint64_t global_pixels = (uint64_t)w * h;

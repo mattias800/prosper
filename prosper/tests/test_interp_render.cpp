@@ -9,6 +9,7 @@
 // and blue stay ~0, proving the output is the interpolated attribute, not garbage.
 #include "../src/gpu/rdna2_to_spirv.hpp"
 #include "render_runner.h"
+#include <algorithm>
 #include <cstdio>
 #include <cstdint>
 #include <vector>
@@ -56,6 +57,53 @@ int main() {
     printf("  red range [%u..%u]  max(green,blue)=%u\n", rmin, rmax, max_gb);
     CHECK(rmax - rmin > 40, "the interpolated attribute forms a red GRADIENT across the viewport");
     CHECK(max_gb < 0x20, "green/blue stay ~0 (output is the interpolated attribute, not garbage)");
+
+    // DOLL's live linkage shape is non-identity: PS input 1 consumes producer PARAM3. Exercise the
+    // generic form here by moving this fixture's export from PARAM0 to PARAM3, then remapping logical
+    // PS input 0 back to source slot 3. The unchanged attr0 PS must still receive the gradient.
+    std::vector<uint32_t> param3_vs(vs, vs + sizeof(vs)/sizeof(vs[0]));
+    for (uint32_t& word : param3_vs) if (word == 0xf800020fu) word = 0xf800023fu;
+    PixelInputMapping remap;
+    remap.valid_mask = 1u;
+    remap.controls[0] = 3u;
+    std::vector<uint32_t> remapped_vert = recompile_vertex(
+        param3_vs.data(), param3_vs.size(), nullptr, &remap);
+    std::vector<uint8_t> remapped_px = prosper::test::render_triangle_rgba(
+        remapped_vert, frag, W, H);
+    CHECK(remapped_px.size() == (size_t)W * H * 4,
+          "SPI_PS_INPUT_CNTL remap links source PARAM3 to logical PS input 0");
+    if (remapped_px.size() == (size_t)W * H * 4) {
+        uint8_t remapped_min = 255, remapped_max = 0;
+        for (size_t i = 0; i < remapped_px.size(); i += 4) {
+            remapped_min = std::min(remapped_min, remapped_px[i]);
+            remapped_max = std::max(remapped_max, remapped_px[i]);
+        }
+        CHECK(remapped_max - remapped_min > 40,
+              "remapped PARAM3 preserves the interpolated gradient at PS input 0");
+    }
+
+    // GFX10 fixed-function interpolation can replace a missing PARAM export with one of four
+    // DEFAULT_VAL vectors. Vulkan has no matching pipeline state, so the vertex recompiler emits
+    // the selected constant at the logical PS input location. DEFAULT_VAL=3 is (1,1,1,1): the same
+    // PS that produced a gradient above must now see attr0.x=1 at every covered pixel.
+    PixelInputMapping default_input;
+    default_input.valid_mask = 1u;
+    default_input.controls[0] = 0x00000320u; // OFFSET=0x20, DEFAULT_VAL=3 (1111)
+    std::vector<uint32_t> default_vert = recompile_vertex(
+        vs, sizeof(vs)/sizeof(vs[0]), nullptr, &default_input);
+    std::vector<uint8_t> default_px = prosper::test::render_triangle_rgba(
+        default_vert, frag, W, H);
+    CHECK(default_px.size() == (size_t)W * H * 4,
+          "SPI_PS_INPUT_CNTL default produces a linkable VS/PS interface");
+    if (default_px.size() == (size_t)W * H * 4) {
+        uint8_t default_min = 255, default_max = 0;
+        for (size_t i = 0; i < default_px.size(); i += 4) {
+            if (default_px[i] < default_min) default_min = default_px[i];
+            if (default_px[i] > default_max) default_max = default_px[i];
+        }
+        CHECK(default_min == 255 && default_max == 255,
+              "DEFAULT_VAL=3 materializes attr0=(1,1,1,1), not an unwritten zero varying");
+    }
 
     // DPP quad_perm as screen-space derivatives (#273 — DOLL's manual ddx/ddy idiom). The attribute
     // attr0.x ramps linearly across the fullscreen triangle: PARAM0.x = vid with vertices

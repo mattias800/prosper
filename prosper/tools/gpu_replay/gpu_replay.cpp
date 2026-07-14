@@ -29,8 +29,8 @@ bool set_environment(const std::string& name, const std::string& value) {
 
 void usage(const char* argv0) {
     std::fprintf(stderr, "usage: %s [--inspect|--inspect-only|--validate|--graph] "
-                         "[--graph-json PATH] [--draw N[:M]] "
-                         "[--through-operation N] "
+                         "[--graph-json PATH] [--draw N[:M]] [--draw-with-compute-prefix] "
+                         "[--through-operation N] [--warmup-repeats N] "
                          "[--bundle capture.prgbundle] [--bundle-tail N] [--bundle-compact PATH] "
                          "[--bundle-intermediate-through-target WxH] "
                          "[--bundle-final-capsule PATH] "
@@ -215,10 +215,11 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
     }
     for (size_t i = 0; i < replay.items.size(); ++i) {
         const auto& d = replay.items[i];
-        std::printf("draw[%zu] target=%016llx extent=%ux%u vcount=%u indices=%zu topo=%u fmt=%u cwm=%x "
+        std::printf("draw[%zu] source=%llu target=%016llx extent=%ux%u vcount=%u indices=%zu topo=%u fmt=%u cwm=%x "
                     "depth=%d/%d/%u stencil=%d blend=%d raster=%u/%u/%u viewport=%d %.1f,%.1f %.1fx%.1f "
                     "vs=%zu/%016llx fs=%zu/%016llx\n",
-                    i, static_cast<unsigned long long>(d.color0_base), d.color0_width, d.color0_height,
+                    i, static_cast<unsigned long long>(d.draw_index),
+                    static_cast<unsigned long long>(d.color0_base), d.color0_width, d.color0_height,
                     d.vertex_count, d.indices.size(),
                     d.ps.topology, d.ps.color0_format, d.ps.color_write_mask, d.ps.depth_test_enable,
                     d.ps.depth_write_enable, d.ps.depth_compare_op, d.ps.stencil_enable, d.ps.blend_enable,
@@ -256,6 +257,13 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
                     d.ps.db_depth_size_xy, d.ps.db_depth_size, d.ps.db_depth_slice,
                     d.ps.db_depth_info, d.ps.db_z_info, d.ps.db_stencil_info,
                     d.ps.db_dfsm_control, d.ps.db_rmi_l2_cache_control);
+        if (!d.indices.empty()) {
+            const size_t preview_count = std::min<size_t>(d.indices.size(), 16);
+            std::printf("  indices first[%zu/%zu]=", preview_count, d.indices.size());
+            for (size_t index = 0; index < preview_count; ++index)
+                std::printf("%s%u", index ? "," : "", d.indices[index]);
+            std::printf("\n");
+        }
         inspect_table("VS", d.vrt.get(), replay.rtt_seeds);
         inspect_table("PS", d.prt.get(), replay.rtt_seeds);
     }
@@ -999,11 +1007,12 @@ int replay_bundle(const std::string& path, const char* output_path, bool zero_bo
 int main(int argc, char** argv) {
     bool inspect = false, inspect_only = false, validate_only = false, allow_mismatch = false;
     bool graph_only = false, bundle_zero_boundary = false, bundle_ds_summary = false;
-    bool legacy_htile_before_stencil = false;
+    bool legacy_htile_before_stencil = false, draw_with_compute_prefix = false;
     size_t bundle_tail = 0;
     uint32_t bundle_intermediate_target_width = 0, bundle_intermediate_target_height = 0;
     int draw_first = -1, draw_last = -1;
     int through_operation = -1;
+    uint32_t warmup_repeats = 0;
     std::string dump_spec, dump_path, shader_spec, shader_path;
     std::string compute_shader_spec, compute_shader_path;
     std::string compute_resource_spec, compute_resource_path;
@@ -1063,11 +1072,19 @@ int main(int argc, char** argv) {
             draw_first = std::atoi(range.c_str());
             draw_last = colon == std::string::npos ? draw_first : std::atoi(range.c_str() + colon + 1);
         }
+        else if (std::string(argv[i]) == "--draw-with-compute-prefix")
+            draw_with_compute_prefix = true;
         else if (std::string(argv[i]) == "--through-operation" && i + 1 < argc) {
             char* end = nullptr;
             const long value = std::strtol(argv[++i], &end, 0);
             if (!end || *end || value < 0 || value > INT_MAX) { usage(argv[0]); return 2; }
             through_operation = static_cast<int>(value);
+        }
+        else if (std::string(argv[i]) == "--warmup-repeats" && i + 1 < argc) {
+            char* end = nullptr;
+            const unsigned long value = std::strtoul(argv[++i], &end, 0);
+            if (!end || *end || !value || value > 1024) { usage(argv[0]); return 2; }
+            warmup_repeats = static_cast<uint32_t>(value);
         }
         else if (std::string(argv[i]) == "--dump-resource" && i + 2 < argc) {
             dump_spec = argv[++i]; dump_path = argv[++i];
@@ -1091,9 +1108,11 @@ int main(int argc, char** argv) {
     if (!bundle_path.empty()) {
         if (bundle_ds_summary && bundle_find_ds_addr) { usage(argv[0]); return 2; }
         if (positional.size() > 1 || inspect || inspect_only || validate_only || graph_only ||
-            draw_first >= 0 || through_operation >= 0 || !dump_spec.empty() ||
+            draw_first >= 0 || draw_with_compute_prefix || through_operation >= 0 ||
+            warmup_repeats || !dump_spec.empty() ||
             !shader_spec.empty() || !compute_shader_spec.empty() ||
-            !compute_resource_spec.empty() || !failed_shader_spec.empty() || !prepend_path.empty()) {
+            !compute_resource_spec.empty() || !failed_shader_spec.empty() ||
+            !prepend_path.empty()) {
             usage(argv[0]); return 2;
         }
         return replay_bundle(bundle_path, positional.empty() ? nullptr : positional[0],
@@ -1113,6 +1132,7 @@ int main(int argc, char** argv) {
     }
     if (positional.empty() || positional.size() > 2) { usage(argv[0]); return 2; }
     if (draw_first >= 0 && through_operation >= 0) { usage(argv[0]); return 2; }
+    if (draw_with_compute_prefix && draw_first < 0) { usage(argv[0]); return 2; }
     prosper::gpu::GpuCaptureFile capture; std::string error;
     if (!prosper::gpu::read_gpu_capture(positional[0], capture, error)) {
         std::fprintf(stderr, "gpu_replay: %s: %s\n", positional[0], error.c_str()); return 2;
@@ -1287,14 +1307,33 @@ int main(int argc, char** argv) {
                      static_cast<unsigned long long>(found->host_data_size),
                      compute_resource_path.c_str());
     }
+    size_t selected_operation_limit = SIZE_MAX;
     if (draw_first >= 0) {
         if (draw_last < draw_first || static_cast<size_t>(draw_last) >= replay.items.size()) {
             std::fprintf(stderr, "gpu_replay: draw range %d:%d is out of range\n", draw_first, draw_last); return 2;
         }
         std::vector<prosper::gpu::DrawItem> selected;
-        for (int i = draw_first; i <= draw_last; ++i) selected.push_back(std::move(replay.items[i]));
+        std::unordered_set<uint64_t> selected_draw_indexes;
+        for (int i = draw_first; i <= draw_last; ++i) {
+            selected_draw_indexes.insert(replay.items[i].draw_index);
+            selected.push_back(std::move(replay.items[i]));
+        }
+        if (draw_with_compute_prefix) {
+            for (size_t operation_index = 0; operation_index < replay.operations.size();
+                 ++operation_index) {
+                const auto& operation = replay.operations[operation_index];
+                if (operation.kind == prosper::gpu::SubmitOperationKind::Draw &&
+                    selected_draw_indexes.count(operation.source_index))
+                    selected_operation_limit = operation_index + 1;
+            }
+            if (selected_operation_limit == SIZE_MAX) {
+                std::fprintf(stderr, "gpu_replay: selected draw range has no submit operation\n");
+                return 2;
+            }
+        }
         replay.items = std::move(selected); allow_mismatch = true;
-        std::fprintf(stderr, "[gpureplay] selected original draws %d:%d\n", draw_first, draw_last);
+        std::fprintf(stderr, "[gpureplay] selected original draws %d:%d%s\n", draw_first,
+                     draw_last, draw_with_compute_prefix ? " with compute prefix" : "");
     }
     if (through_operation >= 0) {
         if (static_cast<size_t>(through_operation) >= replay.operations.size()) {
@@ -1363,9 +1402,17 @@ int main(int argc, char** argv) {
     if (!prosper::gpu::restore_gpu_replay_ds_seeds(replay.ds_seeds, error)) {
         std::fprintf(stderr, "gpu_replay: cannot restore DS seeds: %s\n", error.c_str()); return 2;
     }
+    for (uint32_t repeat = 0; repeat < warmup_repeats; ++repeat) {
+        std::vector<uint8_t> warmup_pixels = execute_frame(replay);
+        std::fprintf(stderr, "[gpureplay] warmup repeat=%u/%u output_bytes=%zu hash=%016llx\n",
+                     repeat + 1, warmup_repeats, warmup_pixels.size(),
+                     static_cast<unsigned long long>(
+                         prosper::gpu::gpu_capture_hash(warmup_pixels)));
+    }
     const size_t operation_limit = through_operation >= 0
-        ? static_cast<size_t>(through_operation) + 1 : SIZE_MAX;
-    std::vector<uint8_t> pixels = execute_frame(replay, draw_first >= 0, operation_limit);
+        ? static_cast<size_t>(through_operation) + 1 : selected_operation_limit;
+    std::vector<uint8_t> pixels = execute_frame(
+        replay, draw_first >= 0 && !draw_with_compute_prefix, operation_limit);
     uint32_t output_width = m.width, output_height = m.height;
     if (through_operation >= 0) {
         for (size_t operation_index = 0; operation_index < operation_limit; ++operation_index) {

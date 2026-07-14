@@ -5,6 +5,7 @@
 // builders themselves read SysV stack args via __builtin_frame_address, only valid under the loaded
 // game) and asserts run_command_buffer writes the right bytes to the target address.
 #include "../src/gpu/command_processor.hpp"
+#include "../src/gpu/mb3_freelist.hpp"
 #include "../src/gpu/pm4_decode.hpp"
 #include <cstdio>
 #include <cstdint>
@@ -15,6 +16,7 @@ using namespace prosper::gpu;
 // The guest TSC clock the GPU EOP timestamp shares (hle_kernel_time.cpp) — same source as
 // sceKernelReadTsc, so a GPU fence timestamp and a CPU TSC read lie on one timeline (#156).
 extern "C" uint64_t prosper_guest_tsc_ns();
+extern "C" void prosper_label_hist_dma_built(uint64_t addr, uint64_t cb, uint32_t src, uint8_t builder);
 
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
@@ -151,6 +153,82 @@ int main() {
         size_t n = run_cb(buf, 4, st);    // must not fault / write anywhere
         CHECK(n == 1, "address-less EVENT_WRITE decodes and is a harmless no-op");
     }
+
+    // #312: learn a per-thread MB3 pool array from pthread TLS and detect a 0x20-byte block in both
+    // of size-class idx=1's freelists. The descriptor address is dynamic; no DOLL address is baked in.
+    // Real MB3 pool arrays are 64 KiB allocations, so mb3_note_tls_pool_candidate only accepts a
+    // 64-KiB-aligned base ((base & 0xffff) == 0). alignas(0x10000) on a STATIC can't guarantee that:
+    // linkers cap static alignment below 64 KiB (macOS reduces __bss to 4 KiB, MinGW rejects > 8 KiB),
+    // so the buffer may land off a 64-KiB boundary and the candidate is silently dropped — the four MB3
+    // membership subtests then fail on macOS/Windows while passing on Linux. Over-allocate and carve a
+    // 64-KiB-aligned 64-KiB window at runtime, which is honored everywhere. Production MB3 logic is
+    // unchanged; only the test's backing memory is.
+    static uint8_t mb3_pool_backing[0x20000] = {};
+    uint8_t* mb3_pool = (uint8_t*)(((uintptr_t)mb3_pool_backing + 0xffffull) & ~0xffffull);
+    struct alignas(0x20) FreeNode { uint64_t next; uint64_t pad[3]; };
+    static FreeNode free_label{}, free_tail{}, secondary_label{}, live_label{};
+    uint64_t* bin = (uint64_t*)(mb3_pool + 0x20);
+    mb3_reset_pool_candidates_for_test();
+    mb3_note_tls_pool_candidate((uint64_t)(uintptr_t)mb3_pool);
+    free_label.next = (uint64_t)(uintptr_t)&free_tail;
+    free_tail.next = 0;
+    bin[0] = (uint64_t)(uintptr_t)&free_label; bin[1] = 2;
+    bin[2] = (uint64_t)(uintptr_t)&secondary_label; bin[3] = 1;
+    Mb3FreelistMatch match{};
+    CHECK(mb3_freelist_contains_stable((uint64_t)(uintptr_t)&free_tail, &match) &&
+          match.list == 1 && match.hops == 1,
+          "MB3 membership walks the dynamic primary size-class freelist");
+    CHECK(mb3_freelist_contains_stable((uint64_t)(uintptr_t)&secondary_label, &match) &&
+          match.list == 2,
+          "MB3 membership checks the secondary size-class freelist");
+    CHECK(!mb3_freelist_contains_stable((uint64_t)(uintptr_t)&live_label, nullptr),
+          "an allocated block absent from both freelists is not classified free");
+
+    // The free label's DmaData(:=0) must be skipped before it erases NextFreeBlock. Then simulate an
+    // allocator pop/reuse before ReleaseMem(<-1): the one-generation debt must still suppress that
+    // old fence even though direct membership has become false.
+    {
+        uint64_t addr = (uint64_t)(uintptr_t)&free_label;
+        prosper_label_hist_dma_built(addr, 0x1000, 0, 1);
+        uint32_t dma[7] = {};
+        dma[0] = PM4(7, IT_NOP, R_DMA_DATA);
+        dma[1] = (uint32_t)addr; dma[2] = (uint32_t)(addr >> 32);
+        dma[3] = 0; dma[4] = 0; dma[5] = 4; dma[6] = 0x303;
+        uint64_t next_before = free_label.next;
+        GpuState st; run_cb(dma, 7, st);
+        CHECK(free_label.next == next_before,
+              "DmaData zero-init does not overwrite a block currently on the MB3 freelist");
+
+        bin[0] = 0; bin[1] = 0;                    // allocator popped/reused it after the skipped init
+        free_label.next = 0x1122334455667788ull;   // observable data belonging to the new owner
+        uint32_t rel[7] = {};
+        rel[0] = PM4(7, IT_NOP, R_RELEASE_MEM);
+        rel[1] = (uint32_t)addr; rel[2] = (uint32_t)(addr >> 32);
+        rel[3] = 1; rel[4] = 1; rel[5] = 0; rel[6] = 4;
+        run_cb(rel, 7, st);
+        CHECK(free_label.next == 0x1122334455667788ull,
+              "paired ReleaseMem remains suppressed after the free block is popped/reused");
+    }
+
+    // A normal consumed-marker label that is not on a freelist must retain the real protocol: init
+    // low dword to 0, then signal it to 1. This is the false-positive/liveness side of the guard.
+    {
+        bin[2] = 0; bin[3] = 0;
+        live_label.next = 0xAABBCCDDFFFFFFFFull;
+        uint64_t addr = (uint64_t)(uintptr_t)&live_label;
+        prosper_label_hist_dma_built(addr, 0x2000, 0, 1);
+        uint32_t stream[14] = {};
+        stream[0] = PM4(7, IT_NOP, R_DMA_DATA);
+        stream[1] = (uint32_t)addr; stream[2] = (uint32_t)(addr >> 32);
+        stream[3] = 0; stream[4] = 0; stream[5] = 4; stream[6] = 0x303;
+        stream[7] = PM4(7, IT_NOP, R_RELEASE_MEM);
+        stream[8] = (uint32_t)addr; stream[9] = (uint32_t)(addr >> 32);
+        stream[10] = 1; stream[11] = 1; stream[12] = 0; stream[13] = 4;
+        GpuState st; run_cb(stream, 14, st);
+        CHECK((uint32_t)live_label.next == 1,
+              "live consumed-marker labels still execute DmaData(0) then ReleaseMem(1)");
+    }
+    mb3_reset_pool_candidates_for_test();
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
