@@ -83,6 +83,16 @@ realized draw/dispatch counts, missing operations, unique shader/resource versio
 Run metadata includes the revision, title, and input route when the corresponding capture environment
 variables are set.
 
+When MRT0-only target spans are insufficient, set `PROSPER_GPU_TIMELINE_MRT_SUBMIT=N` on a second
+native-speed run. For timing-sensitive routes, use the semantic
+`PROSPER_GPU_TIMELINE_MRT_MIN_DRAWS`, `MAX_DRAWS`, `MIN_DISPATCHES`, and `MAX_DISPATCHES` predicates
+instead; only their first matching submit is logged. For every semantic draw in the selected submit,
+the recorder prints all eight raw `CB_COLOR` addresses, formats, extents, target write masks, and
+shader export masks. Use this to prove whether a GPU-only input was produced through MRT1..7 before
+proposing multi-attachment renderer work. The diagnostic does not realize shaders, copy resource
+bytes, or invoke Vulkan. Exact submit numbers are run-local, so prefer predicates derived from prior
+positive and nearby negative `.prgtl` samples when timing can move the endpoint.
+
 ## Format contract
 
 - Explicit little-endian versioned header; C++ struct layout is never serialized.
