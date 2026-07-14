@@ -23,6 +23,12 @@ PROSPER_PAD_SCRIPT=@scripts/dead-cells/reach-first-gameplay.pad \
 
 Capture a selected submit and, optionally, its immediate predecessor from the same run:
 
+For unusually large submits, add `PROSPER_GPU_CAPTURE_METADATA_ONLY=1` to retain the selected
+shader/operation/descriptor metadata without copying resource bytes. This avoids a suspicious resource
+footprint obscuring the checkpoint; use the resulting capsule for inspect, validation, or graphing,
+not pixel replay. Full captures preflight a 512 MiB resource limit, configurable with
+`PROSPER_GPU_CAPTURE_MAX_MB=1..3072`.
+
 ```bash
 PROSPER_GPU_TIMELINE=/tmp/dead-cells-detail.prgtl \
 PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT=18420 \
@@ -114,7 +120,8 @@ memory scales with distinct surfaces rather than draw count.
 
 Version 3 added bounded latest-writer history. When detailed capture is
 enabled, it retains lightweight target-writer summaries for the previous 64 submits and records the
-latest same-run writer identity for every temporal image leaf in the selected capsule. Set
+latest same-run writer identity for every external texture or storage-image leaf in the selected capsule,
+including inputs that are not overwritten later in the selected submit. Set
 `PROSPER_GPU_TIMELINE_HISTORY=N` to change that bounded window (maximum 65536). A producer record includes
 the consumer submit/operation/range, the in-submit future writer, and either the matched prior graphics
 submit/draw/PM4 order/target extent or an explicit unresolved result.
@@ -162,9 +169,10 @@ that writes a target with that extent. Use it when native-speed lifetime evidenc
 the relevant surface family; earlier submits remain in the timeline but do not perturb progression or consume
 bundle budget. The matching start submit is included.
 
-`PROSPER_GPU_TIMELINE_EXIT_AFTER_CAPTURE=1` terminates the process only after the selected standalone
+`PROSPER_GPU_TIMELINE_EXIT_AFTER_CAPTURE=1` terminates the process after the selected standalone
 capsule and any requested bundle have been installed successfully. Use it for long captures instead of a
-wall-clock timeout; capture failure or budget exhaustion leaves the process running for diagnostics.
+wall-clock timeout. A selected-capture realization or write failure exits nonzero instead of waiting for
+an outer watchdog; the runtime logs realization and total serialization time before exiting.
 
 `PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM=WxH` changes the configured submit into a lower endpoint
 bound: the first later submit with a draw targeting that extent is selected. Optionally require a semantic

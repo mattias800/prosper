@@ -58,6 +58,7 @@ int main() {
     config.seconds = 1;
     config.requested = 120;
     config.render_every = "1000";
+    config.render_every_for_ms = "120000";
     config.min_distinct_frames = 10;
     config.min_pixel_distinct_frames = 8;
     config.max_pixel_stale_seconds = 3.5;
@@ -66,7 +67,8 @@ int main() {
     config.required_crc32 = 0x1234abcd;
     const std::string run = manifest_run_json(config);
     CHECK(run.find("\"capture_mode\":\"wall_seconds\"") != std::string::npos &&
-          run.find("\"render_every\":\"1000\"") != std::string::npos,
+          run.find("\"render_every\":\"1000\"") != std::string::npos &&
+          run.find("\"render_every_for_ms\":\"120000\"") != std::string::npos,
           "run header records cadence and renderer policy");
     CHECK(run.find("\"required_crc32\":\"1234abcd\"") != std::string::npos,
           "run header records checkpoint assertions");

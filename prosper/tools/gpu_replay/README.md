@@ -5,6 +5,14 @@ Capsules contain title-derived shaders, resource bytes, addresses, optional rend
 exact persistent Vulkan depth/stencil checkpoint planes.
 They are gitignored local artifacts and must never be committed or shared as project fixtures.
 
+Normal capture preflights merged resource ranges and rejects plans above 512 MiB before allocating.
+`PROSPER_GPU_CAPTURE_MAX_MB=1..3072` overrides that bound. If descriptor metadata is the evidence you
+need, `PROSPER_GPU_CAPTURE_METADATA_ONLY=1` writes a thin capsule with shaders, operations, pipeline
+state, and resource descriptors but no guest resource or RTT bytes. Thin capsules support
+`--inspect-only`, `--validate`, and `--graph`; rendering exits with a concrete error.
+Inspection reports each descriptor's declared size, capture-planned footprint, and captured byte
+count separately, so a thin capsule can still expose a pathological range.
+
 Build from `prosper/`, using the worktree-local Linux build:
 
 ```bash

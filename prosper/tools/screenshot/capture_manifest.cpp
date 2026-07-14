@@ -84,6 +84,7 @@ std::string manifest_run_json(const CaptureRunConfig& c) {
          << ",\"warmup_ms\":" << c.warmup_ms
          << ",\"warmup_submits\":" << c.warmup_submits
          << ",\"render_every\":\"" << json_escape(c.render_every) << "\""
+         << ",\"render_every_for_ms\":\"" << json_escape(c.render_every_for_ms) << "\""
          << ",\"render_scale\":\"" << json_escape(c.render_scale) << "\""
          << ",\"render_target_dim\":\"" << json_escape(c.render_target_dim) << "\""
          << ",\"render_resource_dim\":\"" << json_escape(c.render_resource_dim) << "\""

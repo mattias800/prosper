@@ -221,6 +221,10 @@ struct GpuReplayFrame {
 
 bool materialize_gpu_replay(const GpuCaptureFile& capture, GpuReplayFrame& replay, std::string& error);
 
+// Byte range the capture planner reserves for one descriptor. This includes decoded/tiled image
+// storage when it is larger than the descriptor's declared byte count.
+uint64_t gpu_capture_resource_footprint(const ShaderResource& resource);
+
 // The Vulkan frontend owns the RTT and persistent DS caches and registers these hooks when its renderer
 // is installed. Normal capture queries only RTT addresses referenced by the selected submit; final bundle
 // export snapshots both complete caches. Replay restores serialized surfaces before draw zero.

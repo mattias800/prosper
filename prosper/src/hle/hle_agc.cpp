@@ -1079,13 +1079,25 @@ static bool execute_submit_work(gpu::GpuState& st, uint64_t submit_no, unsigned&
     // Native-speed semantic capture happens before renderer sampling. PROSPER_RENDER_EVERY and
     // warmup may skip Vulkan work, but must not erase submit/present history from the timeline.
     gpu::record_gpu_timeline_submit(st, submit_no);
+    // A bounded sparse phase accelerates long intros, then cadence=1 rebuilds any temporal render
+    // targets before a visual checkpoint. Screenshot exposes these as --render-every/--render-every-for-seconds.
     static const unsigned render_every = [] {
         const char* e = getenv("PROSPER_RENDER_EVERY");
         long v = e ? atol(e) : 1;
         return v > 0 ? (unsigned)v : 1u;
     }();
+    static const uint64_t render_every_for_ms = [] {
+        const char* e = getenv("PROSPER_RENDER_EVERY_FOR_MS");
+        long long v = e ? atoll(e) : 0;
+        return v > 0 ? (uint64_t)v : 0;
+    }();
+    static const auto render_sampling_t0 = std::chrono::steady_clock::now();
+    const uint64_t sampling_elapsed_ms = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - render_sampling_t0).count();
+    const unsigned cadence = render_every_for_ms > 0 && sampling_elapsed_ms >= render_every_for_ms
+        ? 1u : render_every;
     const bool render = gpu::have_submit_renderer() && !st.draws.empty() &&
-                        (draw_submits++ % render_every) == 0;
+                        (draw_submits++ % cadence) == 0;
     if (!render) {
         if (gpu::have_submit_compute() && !st.dispatches.empty() &&
             !gpu::execute_compute_dispatches(st, submit_no) && getenv("PROSPER_COMPUTELOG"))

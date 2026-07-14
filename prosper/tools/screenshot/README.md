@@ -25,6 +25,7 @@ cmake --build build --target screenshot
 ```
 screenshot <app0-dir> [--every N] [--count M] [--out DIR] [--timeout SECS]
            [--warmup-seconds S] [--warmup-submits N]
+           [--render-every N] [--render-every-for-seconds S]
            [--manifest PATH | --no-manifest]
            [--min-distinct-frames N] [--max-stale-seconds S]
            [--min-pixel-distinct-frames N] [--max-pixel-stale-seconds S]
@@ -42,6 +43,8 @@ screenshot <app0-dir> [--every N] [--count M] [--out DIR] [--timeout SECS]
 | `--timeout S` | 900 | Give up after S seconds if the game isn't rendering enough (0 = no limit) |
 | `--warmup-seconds S` | 0 | Advance the guest for S seconds without synchronous Vulkan rendering |
 | `--warmup-submits N` | 0 | Advance without rendering until GPU submit N |
+| `--render-every N` | 1 | Render every Nth draw-carrying submit during the sampling phase |
+| `--render-every-for-seconds S` | unset | After S seconds, stop sampling and render every submit to rebuild temporal history |
 | `--manifest PATH` | `<out>/<run>.jsonl` | Write the machine-readable capture manifest here |
 | `--no-manifest` | off | Disable the default JSONL sidecar |
 | `--min-distinct-frames N` | 0 | Fail unless at least N distinct source publications were captured |
@@ -76,6 +79,11 @@ ends. During warmup, both rendered frames and the raw-scanout fallback are suppr
 diagnostic target/resource overrides can preserve producers without saving early frames (#588). The two
 warmup gates are additive when both are supplied. `--timeout` covers
 the entire run, including warmup.
+
+Renderer cadence is useful when the sequence itself must include boot, so a complete warmup is not
+appropriate. Sparse rendering can omit temporal producers and is therefore not a gameplay oracle by
+itself. Pair `--render-every N` with `--render-every-for-seconds S` to accelerate a long intro, then
+render every submit long enough to rebuild temporal render targets before the checkpoint frames.
 
 **"Frames" = rendered frames** (composited images handed to the present layer), *not* guest flips —
 the guest flips far faster than llvmpipe renders, so counting flips would bunch every shot into the

@@ -8,6 +8,9 @@
 > separated routes with comments and explicit time/flip ranges. `PROSPER_PAD_RECORD=path` records the
 > final button stream on that same flip axis; `prosper-app --record path` exposes it interactively.
 > `PROSPER_PAD_SCRIPT_LOG=1` logs state transitions as the game observes them at pad polls.
+> `PROSPER_PAD_SCRIPT_RELOAD=1` live-reloads an `@file` route after a changed file remains
+> stable across two metadata polls. Existing time and flip anchors are preserved, so an agent can
+> append future input windows during a long exploratory run without restarting the title.
 > The first checked-in route, `scripts/messenger/reach-intro-story.pad`, repeatedly reaches the opening
 > story but still has small narration-phase drift. Deeper routes and a precise pad-read screenshot
 > checkpoint axis remain open in #302. The original design follows.
@@ -40,6 +43,9 @@ We already have the seed: **`PROSPER_PAD_SCRIPT` (#202)** — a scripted `PadBac
   entirely between polls under slow synchronous rendering. Use longer holds with neutral gaps,
   prefer flip-anchored ranges when the title keeps presenting, and enable
   `PROSPER_PAD_SCRIPT_LOG=1` to verify delivery rather than inferring it from the route text.
+- For exploratory `@file` routes, set `PROSPER_PAD_SCRIPT_RELOAD=1`. A changed route is debounced
+  for 250 ms and replaces the active route only after a complete stable read; read/stat failures
+  retain the last valid route. Reload does not reset the first-poll wall-clock or flip origin.
 
 Good bones. Two gaps for reaching deep states reliably: the clock is **wall-time**, and scripts are an env string (fine for a few presses, not for a long route).
 

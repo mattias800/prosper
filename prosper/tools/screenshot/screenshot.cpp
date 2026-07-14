@@ -145,9 +145,11 @@ int main(int argc, char** argv) {
     double warmup_seconds = -1.0;  // <0 => preserve the environment; explicit values override it
     double max_stale_seconds = -1.0;
     double max_pixel_stale_seconds = -1.0;
+    double render_every_for_seconds = -1.0;
     int warmup_submits = -1;
     int min_distinct_frames = 0;
     int min_pixel_distinct_frames = 0;
+    int render_every_arg = -1;
     uint64_t min_present_count = 0, min_frame_seq = 0, required_crc32 = 0;
     bool manifest_disabled = false, require_composited_frame = false, required_crc32_set = false;
     bool warmup_seconds_set = false, warmup_submits_set = false;
@@ -181,6 +183,19 @@ int main(int argc, char** argv) {
         else if (a == "--max-pixel-stale-seconds" && i + 1 < argc) {
             if (!parse_nonnegative_double(argv[++i], max_pixel_stale_seconds)) {
                 fprintf(stderr, "screenshot: --max-pixel-stale-seconds requires a non-negative number\n");
+                return 2;
+            }
+        }
+        else if (a == "--render-every" && i + 1 < argc) {
+            if (!parse_nonnegative_int(argv[++i], render_every_arg) || render_every_arg < 1) {
+                fprintf(stderr, "screenshot: --render-every requires a positive integer\n");
+                return 2;
+            }
+        }
+        else if (a == "--render-every-for-seconds" && i + 1 < argc) {
+            if (!parse_nonnegative_double(argv[++i], render_every_for_seconds) ||
+                render_every_for_seconds <= 0) {
+                fprintf(stderr, "screenshot: --render-every-for-seconds requires a positive number\n");
                 return 2;
             }
         }
@@ -226,6 +241,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "usage: screenshot <app0-dir> [--every N=60 | --seconds S] [--count M=30] "
                         "[--out DIR] [--manifest PATH | --no-manifest] [--timeout SECS] "
                         "[--warmup-seconds S] [--warmup-submits N] [--min-distinct-frames N] "
+                        "[--render-every N] [--render-every-for-seconds S] "
                         "[--max-stale-seconds S] [--min-pixel-distinct-frames N] "
                         "[--max-pixel-stale-seconds S] [--require-composited-frame] "
                         "[--min-present-count N] [--min-frame-seq N] [--require-crc32 N]\n");
@@ -261,6 +277,17 @@ int main(int argc, char** argv) {
         char first_submit[32];
         snprintf(first_submit, sizeof first_submit, "%d", warmup_submits);
         setenv("PROSPER_RENDER_FIRST", first_submit, 1);
+    }
+    if (render_every_arg > 0) {
+        char cadence[32];
+        snprintf(cadence, sizeof cadence, "%d", render_every_arg);
+        setenv("PROSPER_RENDER_EVERY", cadence, 1);
+    }
+    if (render_every_for_seconds > 0) {
+        char duration_ms[32];
+        snprintf(duration_ms, sizeof duration_ms, "%lld",
+                 (long long)(render_every_for_seconds * 1000.0 + 0.5));
+        setenv("PROSPER_RENDER_EVERY_FOR_MS", duration_ms, 1);
     }
 
     const int64_t render_delay_ms = getenv("PROSPER_RENDER_DELAY_MS")
@@ -308,6 +335,7 @@ int main(int argc, char** argv) {
         run_config.output_dir = out;
         run_config.input_route = input_route;
         run_config.render_every = env_string("PROSPER_RENDER_EVERY");
+        run_config.render_every_for_ms = env_string("PROSPER_RENDER_EVERY_FOR_MS");
         run_config.render_scale = env_string("PROSPER_RENDER_SCALE");
         run_config.render_target_dim = env_string("PROSPER_RENDER_TARGET_DIM");
         run_config.render_resource_dim = env_string("PROSPER_RENDER_RESOURCE_DIM");
@@ -353,6 +381,14 @@ int main(int argc, char** argv) {
     if (warming_up)
         fprintf(stderr, "[shot] warmup: %lld ms, %d submits; capture suppressed until warmup ends\n",
                 (long long)render_delay_ms, render_first);
+    if (getenv("PROSPER_RENDER_EVERY")) {
+        if (getenv("PROSPER_RENDER_EVERY_FOR_MS"))
+            fprintf(stderr, "[shot] render cadence: every %s draw submit(s) for %s ms, then every submit\n",
+                    getenv("PROSPER_RENDER_EVERY"), getenv("PROSPER_RENDER_EVERY_FOR_MS"));
+        else
+            fprintf(stderr, "[shot] render cadence: every %s draw submit(s)\n",
+                    getenv("PROSPER_RENDER_EVERY"));
+    }
     if (manifest)
         fprintf(stderr, "[shot] manifest: %s\n", manifest_path.c_str());
 

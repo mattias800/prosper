@@ -33,6 +33,7 @@ struct CaptureRunConfig {
     std::string output_dir;
     std::string input_route;
     std::string render_every;
+    std::string render_every_for_ms;
     std::string render_scale;
     std::string render_target_dim;
     std::string render_resource_dim;

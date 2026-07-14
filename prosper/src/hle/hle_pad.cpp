@@ -26,7 +26,9 @@
 #include <filesystem>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace prosper {
@@ -74,16 +76,135 @@ uint64_t now_us() {
 // reaches the interactive menu, so t=0 == "menu appeared" — robust to how long asset loading takes.
 // CONFIDENCE: HIGH (mechanism); MED (that the game's submit maps to OPTIONS="Start" / CROSS).
 // The parse + time-eval live in pad.cpp (pure, unit-tested); this file supplies getenv + the clock.
-const std::vector<PadScriptEntry>& pad_script() {
-    static const std::vector<PadScriptEntry> script = [] {
+double pad_hold_secs();
+int64_t pad_frame_hold();
+
+struct PadScriptFileStamp {
+    std::filesystem::file_time_type write_time{};
+    uintmax_t size = 0;
+
+    bool operator==(const PadScriptFileStamp& other) const {
+        return write_time == other.write_time && size == other.size;
+    }
+};
+
+std::optional<PadScriptFileStamp> pad_script_file_stamp(const std::filesystem::path& path,
+                                                        std::string& error) {
+    std::error_code ec;
+    const auto write_time = std::filesystem::last_write_time(path, ec);
+    if (ec) {
+        error = "cannot stat route file: " + path.string() + ": " + ec.message();
+        return std::nullopt;
+    }
+    const uintmax_t size = std::filesystem::file_size(path, ec);
+    if (ec) {
+        error = "cannot size route file: " + path.string() + ": " + ec.message();
+        return std::nullopt;
+    }
+    error.clear();
+    return PadScriptFileStamp{write_time, size};
+}
+
+// Long exploratory boots can discover a new prompt minutes into a route. Opt-in @file reload keeps
+// the original time/flip anchors while allowing future windows to be appended without rebooting.
+// A changed stamp must remain stable across two 250 ms polls, and a replacement is published only
+// after a complete read whose metadata is still unchanged. Pad readers serialize here, so no thread
+// can observe a vector while another replaces it.
+class PadScriptRuntime {
+public:
+    PadScriptRuntime() {
         const char* env = getenv("PROSPER_PAD_SCRIPT");
-        if (!env) return std::vector<PadScriptEntry>{};
+        if (!env || !*env) return;
+        source_ = env;
+        live_reload_ = source_[0] == '@' && getenv("PROSPER_PAD_SCRIPT_RELOAD") != nullptr;
+        if (source_[0] == '@') path_ = source_.substr(1);
+
         std::string error;
-        auto loaded = load_pad_script(env, &error);
-        if (!error.empty()) fprintf(stderr, "[pad] PROSPER_PAD_SCRIPT: %s\n", error.c_str());
-        return loaded;
-    }();
-    return script;
+        script_ = load_pad_script(source_, &error);
+        const bool initial_load_succeeded = error.empty();
+        if (!error.empty()) log_error(error);
+        if (live_reload_) {
+            const auto stamp = pad_script_file_stamp(path_, error);
+            if (initial_load_succeeded) applied_stamp_ = stamp;
+            if (!error.empty()) log_error(error);
+            fprintf(stderr, "[pad] live route reload enabled for %s\n", path_.string().c_str());
+        }
+    }
+
+    bool configured() const { return !source_.empty(); }
+
+    uint32_t buttons_at(double elapsed, int64_t frame) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        refresh_locked();
+        return pad_script_buttons_at(script_, elapsed, pad_hold_secs(), frame, pad_frame_hold());
+    }
+
+private:
+    void log_error(const std::string& error) {
+        if (error == last_error_) return;
+        last_error_ = error;
+        fprintf(stderr, "[pad] PROSPER_PAD_SCRIPT: %s\n", error.c_str());
+    }
+
+    void refresh_locked() {
+        if (!live_reload_) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (now < next_check_) return;
+        next_check_ = now + std::chrono::milliseconds(250);
+
+        std::string error;
+        const auto stamp = pad_script_file_stamp(path_, error);
+        if (!stamp) {
+            log_error(error);
+            return;
+        }
+        if (applied_stamp_ && *stamp == *applied_stamp_) {
+            pending_stamp_.reset();
+            last_error_.clear();
+            return;
+        }
+        if (!pending_stamp_ || !(*stamp == *pending_stamp_)) {
+            pending_stamp_ = stamp;
+            return;
+        }
+
+        auto replacement = load_pad_script(source_, &error);
+        if (!error.empty()) {
+            log_error(error);
+            return;
+        }
+        const auto after = pad_script_file_stamp(path_, error);
+        if (!after) {
+            log_error(error);
+            return;
+        }
+        if (!(*after == *stamp)) {
+            pending_stamp_ = after;
+            return;
+        }
+
+        script_ = std::move(replacement);
+        applied_stamp_ = after;
+        pending_stamp_.reset();
+        last_error_.clear();
+        fprintf(stderr, "[pad] reloaded route %s (%zu entries)\n",
+                path_.string().c_str(), script_.size());
+    }
+
+    std::mutex mutex_;
+    std::string source_;
+    std::filesystem::path path_;
+    std::vector<PadScriptEntry> script_;
+    bool live_reload_ = false;
+    std::optional<PadScriptFileStamp> applied_stamp_;
+    std::optional<PadScriptFileStamp> pending_stamp_;
+    std::chrono::steady_clock::time_point next_check_{};
+    std::string last_error_;
+};
+
+PadScriptRuntime& pad_script_runtime() {
+    static PadScriptRuntime runtime;
+    return runtime;
 }
 
 double pad_hold_secs() {
@@ -120,8 +241,8 @@ int64_t pad_frame_now() {
 
 // Overlay any active scripted press onto `s`. Returns true if a script is driving the pad.
 bool apply_pad_script(HostPadState& s, int64_t frame) {
-    const auto& script = pad_script();
-    if (script.empty()) return false;
+    auto& script = pad_script_runtime();
+    if (!script.configured()) return false;
     s.connected = true;                                     // a controller is present for the whole run
     uint64_t t0 = g_pad_t0_us.load(std::memory_order_relaxed);
     if (t0 == 0) {                                          // anchor to this first poll
@@ -129,8 +250,7 @@ bool apply_pad_script(HostPadState& s, int64_t frame) {
         if (g_pad_t0_us.compare_exchange_strong(expect, now)) t0 = now; else t0 = expect;
     }
     double elapsed = (now_us() - t0) / 1e6;
-    const uint32_t scripted =
-        pad_script_buttons_at(script, elapsed, pad_hold_secs(), frame, pad_frame_hold());
+    const uint32_t scripted = script.buttons_at(elapsed, frame);
     if (pad_script_log()) {
         static std::atomic<uint32_t> previous{std::numeric_limits<uint32_t>::max()};
         const uint32_t observed = previous.exchange(scripted, std::memory_order_relaxed);
