@@ -15,8 +15,10 @@ the shipped runtime. Build them from `build-linux/` like everything else.
   for slow software rendering,
   and the pixel-distinct/pixel-stale assertions when visible progression matters. Source publication
   counts alone do not prove that the image changed; see `screenshot/README.md`.
-- **`self_dump/`** — parse a SELF/ELF and print its segment/program-header map
-  (find file offsets for offline disassembly).
+- **`self_dump/`** — parse a SELF/ELF and print its segment/program-header map, import NIDs, and
+  export RVAs. Use `--find-symbol NID` for a focused import/export query.
+- **`re/xref.py`** — find relative data pointers, direct references, runtime function-table
+  writers, and indirect callers in a flattened guest module. See `re/README.md`.
 - **`shader_histo/`** — histogram RDNA2 opcodes across a title's shaders.
 - **`shader_inspect/`** — decode one raw `PROSPER_SHADER_DUMP` binary offline. It prints bounded
   instruction PCs, operands, raw words, signed branch immediates, and resolved branch targets so a
