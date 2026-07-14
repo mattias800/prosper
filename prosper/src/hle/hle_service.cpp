@@ -6,6 +6,7 @@
 #include "dispatch.hpp"
 #include "nid.hpp"
 #include "platform_ui.hpp"
+#include "video_backend.hpp"   // sceAvPlayer -> host hardware-decode backend (#705)
 #include "../host/posix_shim.hpp"   // PROSPER_ASM_TRAMPOLINE (Mach-O/ELF global-asm portability)
 #include <cstdint>
 #include <cstring>
@@ -98,31 +99,228 @@ HLE(s_user_getevent)  {
 // systemservice.cpp: NO_EVENT = 0x80A10004, PARAMETER (ev==NULL) = 0x80A10003.
 HLE(s_sysservice_receiveevent) { if (!a0) return 0x80A10003ull; return 0x80A10004ull; }
 HLE(s_ok)             { return 0; }
-// libSceAvPlayer (#324): a title can play an intro/title video via AvPlayer. We don't decode video;
-// implement just enough lifecycle that Init returns a VALID (non-NULL) handle and playback reports
-// finished immediately — so the game advances past the video into its scene instead of stalling on a
-// NULL handle from a stubbed InitEx. No decode needed to progress; the game's while(IsActive) frame
-// loop simply doesn't run (or ends at once) and it moves on.
-HLE(s_avplayer_init)     { svc_log("sceAvPlayerInit", a0,a1,a2,a3,a4,a5); return g_handle.fetch_add(1); }   // non-NULL SceAvPlayerHandle
-// sceAvPlayerInitEx(const SceAvPlayerInitDataEx* data, SceAvPlayerHandle* out) has a DIFFERENT ABI from
-// sceAvPlayerInit: it returns an int32 ERROR CODE (0 = success) and writes the handle to the *out*
-// param — it does NOT return the handle. Registering it to s_avplayer_init (return-the-handle) makes the
-// game read a non-zero handle as an error code: The Messenger-family PS5VideoPlayback wrapper logs
-// "[PS5VideoPlayback] ERROR: sceAvPlayerInitEx() failed" and aborts the intro video (live-captured;
-// PPSA02664). Return 0 and write a valid non-NULL handle to a1. CONFIDENCE: HIGH (live guest error log).
-HLE(s_avplayer_initex)   { svc_log("sceAvPlayerInitEx", a0,a1,a2,a3,a4,a5); if (a1) *(uint64_t*)PW(a1) = g_handle.fetch_add(1); return 0; }
-HLE(s_avplayer_isactive) { svc_log("sceAvPlayerIsActive", a0,a1,a2,a3,a4,a5); return 0; }   // 0 = not active. Real playback state comes from the video backend (#324).
-// Logged lifecycle stubs (PROSPER_SVCLOG) — used to establish the real AvPlayer call sequence a Unity
-// VideoPlayer title drives, ahead of the real hardware-decode backend (#324). Still no-ops for now.
-HLE(s_avp_postinit)       { svc_log("sceAvPlayerPostInit", a0,a1,a2,a3,a4,a5); return 0; }
-HLE(s_avp_setlogcb)       { svc_log("sceAvPlayerSetLogCallback", a0,a1,a2,a3,a4,a5); return 0; }
-HLE(s_avp_addsource)      { svc_log("sceAvPlayerAddSource", a0,a1,a2,a3,a4,a5); return 0; }
-HLE(s_avp_addsourceex)    { svc_log("sceAvPlayerAddSourceEx", a0,a1,a2,a3,a4,a5); return 0; }
-HLE(s_avp_getvideodata)   { svc_log("sceAvPlayerGetVideoData", a0,a1,a2,a3,a4,a5); return 0; }
-HLE(s_avp_getvideodataex) { svc_log("sceAvPlayerGetVideoDataEx", a0,a1,a2,a3,a4,a5); return 0; }
-HLE(s_avp_getaudiodata)   { svc_log("sceAvPlayerGetAudioData", a0,a1,a2,a3,a4,a5); return 0; }
-HLE(s_avp_stop)           { svc_log("sceAvPlayerStop", a0,a1,a2,a3,a4,a5); return 0; }
-HLE(s_avp_close)          { svc_log("sceAvPlayerClose", a0,a1,a2,a3,a4,a5); return 0; }
+// ===== libSceAvPlayer (#324/#705): real playback lifecycle over a host video-decode backend =====
+// The core owns the guest sceAvPlayer contract + per-player state + the guest event callback and
+// pulls decoded frames from a registered VideoBackend (app-side hardware decode). With NO backend
+// (headless/tests) it runs a synthetic black-frame lifecycle so the title's video state machine still
+// completes and the boot advances. ABI structs mirror the published sceAvPlayer layout (guest is
+// SysV LP64 == host on Linux, so guest pointers are read directly).
+namespace {
+// Guest event callback: void(void* object_ptr, uint32_t event, int32_t source_id, void* data).
+using AvpEventCb = void (PROSPER_SYSV_ABI *)(void*, uint32_t, int32_t, void*);
+enum : uint32_t { AVP_STOP = 0x01, AVP_READY = 0x02, AVP_PLAY = 0x03, AVP_PAUSE = 0x04, AVP_BUFFERING = 0x05 };
+
+struct AvpMemAllocator  { void* obj; void* allocate; void* deallocate; void* allocate_texture; void* deallocate_texture; };
+struct AvpFileReplace   { void* obj; void* open; void* close; void* read_offset; void* size; };
+struct AvpEventReplace  { void* obj; void* event_callback; };
+struct AvpInitData {                 // sceAvPlayerInit
+    AvpMemAllocator memory; AvpFileReplace file; AvpEventReplace event;
+    uint32_t debug_level; uint32_t base_priority; int32_t num_fb; uint8_t auto_start; uint8_t rsv[3]; const char* default_language;
+};
+struct AvpInitDataEx {               // sceAvPlayerInitEx (note: this_size first)
+    uint64_t this_size; AvpMemAllocator memory; AvpFileReplace file; AvpEventReplace event;
+    const char* default_language; uint32_t debug_level;
+    uint32_t a_prio,a_aff,v_prio,v_aff,d_prio,d_aff,c_prio,c_aff,h_prio,h_aff,f_prio,f_aff;
+    int32_t num_fb; uint8_t auto_start; uint8_t rsv[3];
+};
+struct AvpUri           { const char* name; uint32_t length; };
+struct AvpSourceDetails { AvpUri uri; uint8_t rsv1[64]; uint32_t source_type; uint8_t rsv2[44]; };
+struct AvpFrameInfo {                // sceAvPlayerGetVideoData / GetAudioData out-param
+    uint8_t* p_data; uint8_t reserved[4]; uint64_t timestamp;
+    uint32_t d0, d1, d2, d3;         // AvPlayerStreamDetails union (16B): video={width,height,aspect,lang}
+};
+struct AvpVideoEx {                  // AvPlayerVideoEx (in the 80B details union)
+    uint32_t width, height; float aspect; uint8_t lang[4];
+    uint32_t framerate, crop_l, crop_r, crop_t, crop_b, pitch;
+    uint8_t luma_bd, chroma_bd, full_range, rsv[37];
+};
+struct AvpFrameInfoEx {              // sceAvPlayerGetVideoDataEx out-param (larger details union)
+    void* p_data; uint8_t reserved[4]; uint64_t timestamp;
+    union { AvpVideoEx video; uint8_t raw[80]; } details;
+};
+
+struct AvpPlayer {
+    void* ev_obj = nullptr; AvpEventCb ev_cb = nullptr;
+    bool auto_start = false, have_source = false, playing = false, stop_fired = false;
+    std::string guest_path;
+    int backend_id = -1;             // >=0 when a host backend is decoding
+    uint32_t width = 1920, height = 1080;
+    uint64_t poll = 0;               // synthetic-timeline frame counter (headless, no backend)
+    std::vector<uint8_t> frame;      // synthetic black NV12 buffer (kept alive across GetVideoData)
+};
+std::mutex g_avp_mx;
+std::unordered_map<uint64_t, AvpPlayer> g_avp;
+
+uint64_t avp_synth_frames() { static uint64_t n = []{ const char* e = getenv("PROSPER_AVP_SYNTH_FRAMES"); return e ? strtoull(e, nullptr, 0) : 120ull; }(); return n; }
+
+// Fire the guest event callback. Caller MUST NOT hold g_avp_mx (the callback re-enters AvPlayer HLE).
+void avp_fire(void* obj, AvpEventCb cb, uint32_t ev) {
+    if (!cb) return;
+    if (svclog()) fprintf(stderr, "[avp] -> event 0x%02x\n", ev);
+#if defined(_WIN32)
+    // TODO(#705): Windows host ABI != guest SysV; route through a 4-arg prosper_call_guest_sysv
+    // trampoline. Milestone 1 targets Linux headless; the direct call is correct there.
+#endif
+    cb(obj, ev, 0, nullptr);
+}
+} // namespace
+
+HLE(s_avplayer_init) {   // AvPlayerHandle sceAvPlayerInit(AvPlayerInitData*)
+    svc_log("sceAvPlayerInit", a0,a1,a2,a3,a4,a5);
+    uint64_t h = g_handle.fetch_add(1);
+    AvpPlayer p;
+    if (auto* d = (const AvpInitData*)PW(a0)) { p.ev_obj = d->event.obj; p.ev_cb = (AvpEventCb)d->event.event_callback; p.auto_start = d->auto_start != 0; }
+    { std::lock_guard<std::mutex> lk(g_avp_mx); g_avp[h] = std::move(p); }
+    return h;   // non-NULL SceAvPlayerHandle
+}
+// sceAvPlayerInitEx returns an int32 error code (0 = success) and writes the handle to *out — a
+// DIFFERENT ABI from sceAvPlayerInit (which returns the handle). Returning the handle here made the
+// game read it as an error and abort the intro (live-captured, PPSA02664). CONFIDENCE: HIGH.
+HLE(s_avplayer_initex) {   // s32 sceAvPlayerInitEx(const AvPlayerInitDataEx*, AvPlayerHandle* out)
+    svc_log("sceAvPlayerInitEx", a0,a1,a2,a3,a4,a5);
+    uint64_t h = g_handle.fetch_add(1);
+    AvpPlayer p;
+    if (auto* d = (const AvpInitDataEx*)PW(a0)) { p.ev_obj = d->event.obj; p.ev_cb = (AvpEventCb)d->event.event_callback; p.auto_start = d->auto_start != 0; }
+    { std::lock_guard<std::mutex> lk(g_avp_mx); g_avp[h] = std::move(p); }
+    if (a1) *(uint64_t*)PW(a1) = h;
+    return 0;
+}
+HLE(s_avplayer_isactive) {   // bool sceAvPlayerIsActive(AvPlayerHandle)
+    svc_log("sceAvPlayerIsActive", a0,a1,a2,a3,a4,a5);
+    void* obj = nullptr; AvpEventCb cb = nullptr; bool fire_stop = false; uint64_t active = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_avp_mx);
+        auto it = g_avp.find(a0); if (it == g_avp.end()) return 0;
+        AvpPlayer& p = it->second;
+        if (p.playing) {
+            p.poll++;
+            bool still = (p.backend_id >= 0 && prosper::video::backend())
+                             ? !prosper::video::backend()->eof(p.backend_id)
+                             : (p.poll < avp_synth_frames());
+            if (still) { active = 1; }
+            else if (!p.stop_fired) { p.playing = false; p.stop_fired = true; fire_stop = true; obj = p.ev_obj; cb = p.ev_cb; }
+        }
+    }
+    if (fire_stop) avp_fire(obj, cb, AVP_STOP);   // playback complete -> game advances past the video
+    return active;
+}
+HLE(s_avp_postinit)   { svc_log("sceAvPlayerPostInit", a0,a1,a2,a3,a4,a5); return 0; }
+HLE(s_avp_setlogcb)   { svc_log("sceAvPlayerSetLogCallback", a0,a1,a2,a3,a4,a5); return 0; }
+// Begin a source: resolve/open it, fire READY, and (auto_start) begin playback with PLAY.
+static uint64_t avp_add_source(uint64_t handle, const char* guest_path) {
+    void* obj = nullptr; AvpEventCb cb = nullptr; bool ready = false, play = false;
+    {
+        std::lock_guard<std::mutex> lk(g_avp_mx);
+        auto it = g_avp.find(handle); if (it == g_avp.end()) return 0x80000000ull;
+        AvpPlayer& p = it->second;
+        if (guest_path) p.guest_path = guest_path;
+        p.have_source = true;
+        if (auto* b = prosper::video::backend()) p.backend_id = b->open(p.guest_path);  // TODO(#705): guest->host path resolve for real backend
+        obj = p.ev_obj; cb = p.ev_cb; ready = true;
+        if (p.auto_start) { p.playing = true; play = true; }
+    }
+    if (ready) avp_fire(obj, cb, AVP_READY);
+    if (play)  avp_fire(obj, cb, AVP_PLAY);
+    return 0;
+}
+HLE(s_avp_addsource)   {   // s32 sceAvPlayerAddSource(handle, const char* filename)
+    svc_log("sceAvPlayerAddSource", a0,a1,a2,a3,a4,a5);
+    return avp_add_source(a0, (const char*)PW(a1));
+}
+HLE(s_avp_addsourceex) {   // s32 sceAvPlayerAddSourceEx(handle, AvPlayerUriType, AvPlayerSourceDetails*)
+    svc_log("sceAvPlayerAddSourceEx", a0,a1,a2,a3,a4,a5);
+    const char* path = nullptr;
+    if (auto* d = (const AvpSourceDetails*)PW(a2)) path = d->uri.name;
+    return avp_add_source(a0, path);
+}
+HLE(s_avp_start) {   // s32 sceAvPlayerStart(handle) — used when auto_start is false
+    svc_log("sceAvPlayerStart", a0,a1,a2,a3,a4,a5);
+    void* obj = nullptr; AvpEventCb cb = nullptr; bool play = false;
+    {
+        std::lock_guard<std::mutex> lk(g_avp_mx);
+        auto it = g_avp.find(a0); if (it == g_avp.end()) return 0x80000000ull;
+        AvpPlayer& p = it->second;
+        if (p.have_source && !p.playing && !p.stop_fired) { p.playing = true; play = true; obj = p.ev_obj; cb = p.ev_cb; }
+    }
+    if (play) avp_fire(obj, cb, AVP_PLAY);
+    return 0;
+}
+// bool sceAvPlayerGetVideoData(handle, AvPlayerFrameInfo*) — deliver the next decoded frame (NV12).
+HLE(s_avp_getvideodata) {
+    svc_log("sceAvPlayerGetVideoData", a0,a1,a2,a3,a4,a5);
+    auto* fi = (AvpFrameInfo*)PW(a1); if (!fi) return 0;
+    std::lock_guard<std::mutex> lk(g_avp_mx);
+    auto it = g_avp.find(a0); if (it == g_avp.end() || !it->second.playing) return 0;
+    AvpPlayer& p = it->second;
+    if (auto* b = prosper::video::backend(); b && p.backend_id >= 0) {
+        prosper::video::VideoFrame vf;
+        if (!b->next_video(p.backend_id, vf)) return 0;
+        fi->p_data = const_cast<uint8_t*>(vf.y); fi->timestamp = vf.pts_us * 1000;
+        fi->d0 = vf.width; fi->d1 = vf.height; fi->d2 = 0; fi->d3 = 0;
+        return 1;
+    }
+    // Synthetic (headless): a black NV12 frame at the default dimensions.
+    size_t need = (size_t)p.width * p.height * 3 / 2;
+    if (p.frame.size() != need) p.frame.assign(need, 0);
+    fi->p_data = p.frame.data(); fi->timestamp = p.poll * 33'000'000ull;   // ~30fps pts (ns)
+    fi->d0 = p.width; fi->d1 = p.height; fi->d2 = 0; fi->d3 = 0;
+    return 1;
+}
+// bool sceAvPlayerGetVideoDataEx(handle, AvPlayerFrameInfoEx*) — the game uses this Ex variant.
+HLE(s_avp_getvideodataex) {
+    svc_log("sceAvPlayerGetVideoDataEx", a0,a1,a2,a3,a4,a5);
+    auto* fi = (AvpFrameInfoEx*)PW(a1); if (!fi) return 0;
+    std::lock_guard<std::mutex> lk(g_avp_mx);
+    auto it = g_avp.find(a0); if (it == g_avp.end() || !it->second.playing) return 0;
+    AvpPlayer& p = it->second;
+    if (auto* b = prosper::video::backend(); b && p.backend_id >= 0) {
+        prosper::video::VideoFrame vf;
+        if (!b->next_video(p.backend_id, vf)) return 0;
+        fi->p_data = const_cast<uint8_t*>(vf.y); fi->timestamp = vf.pts_us * 1000;
+        fi->details.video = {}; fi->details.video.width = vf.width; fi->details.video.height = vf.height;
+        fi->details.video.pitch = vf.y_stride ? vf.y_stride : vf.width; fi->details.video.framerate = 30;
+        return 1;
+    }
+    size_t need = (size_t)p.width * p.height * 3 / 2;        // synthetic black NV12
+    if (p.frame.size() != need) p.frame.assign(need, 0);
+    fi->p_data = p.frame.data(); fi->timestamp = p.poll * 33'000'000ull;
+    fi->details.video = {}; fi->details.video.width = p.width; fi->details.video.height = p.height;
+    fi->details.video.pitch = p.width; fi->details.video.framerate = 30;
+    return 1;
+}
+HLE(s_avp_getaudiodata)   {   // bool sceAvPlayerGetAudioData(handle, AvPlayerFrameInfo*)
+    svc_log("sceAvPlayerGetAudioData", a0,a1,a2,a3,a4,a5);
+    auto* b = prosper::video::backend();
+    if (!b) return 0;   // synthetic: no audio frames (silent intro); playback still ends via IsActive
+    std::lock_guard<std::mutex> lk(g_avp_mx);
+    auto it = g_avp.find(a0); if (it == g_avp.end() || it->second.backend_id < 0 || !it->second.playing) return 0;
+    auto* fi = (AvpFrameInfo*)PW(a1); if (!fi) return 0;
+    prosper::video::AudioFrame af;
+    if (!b->next_audio(it->second.backend_id, af)) return 0;
+    fi->p_data = (uint8_t*)const_cast<int16_t*>(af.pcm); fi->timestamp = af.pts_us * 1000; return 1;
+}
+HLE(s_avp_stop) {   // s32 sceAvPlayerStop(handle)
+    svc_log("sceAvPlayerStop", a0,a1,a2,a3,a4,a5);
+    void* obj = nullptr; AvpEventCb cb = nullptr; bool fire_stop = false;
+    {
+        std::lock_guard<std::mutex> lk(g_avp_mx);
+        auto it = g_avp.find(a0); if (it == g_avp.end()) return 0;
+        AvpPlayer& p = it->second;
+        if (p.playing && !p.stop_fired) { p.playing = false; p.stop_fired = true; fire_stop = true; obj = p.ev_obj; cb = p.ev_cb; }
+    }
+    if (fire_stop) avp_fire(obj, cb, AVP_STOP);
+    return 0;
+}
+HLE(s_avp_close) {   // s32 sceAvPlayerClose(handle)
+    svc_log("sceAvPlayerClose", a0,a1,a2,a3,a4,a5);
+    std::lock_guard<std::mutex> lk(g_avp_mx);
+    auto it = g_avp.find(a0);
+    if (it != g_avp.end()) {
+        if (auto* b = prosper::video::backend(); b && it->second.backend_id >= 0) b->close(it->second.backend_id);
+        g_avp.erase(it);
+    }
+    return 0;
+}
 // sceUserServiceGetGamePresets(userId, presets): MUST return success (0). The Unity engine's
 // per-controller connection check (eboot 0x14707e0, reached from the pad "reset" path 0x1470ca0)
 // calls this and treats ANY non-zero user-service return as "controller invalid" — it then clears the
@@ -1150,8 +1348,9 @@ void register_service_hle() {
     R("sceAvPlayerSetLogCallback", s_avp_setlogcb);
     R("sceAvPlayerAddSource",      s_avp_addsource);
     R("sceAvPlayerAddSourceEx",    s_avp_addsourceex);
+    R("sceAvPlayerStart",          s_avp_start);
     R("sceAvPlayerIsActive",       s_avplayer_isactive);
-    R("sceAvPlayerGetVideoData",   s_avp_getvideodata);     // 0 = no frame available (we don't decode) -> game skips it
+    R("sceAvPlayerGetVideoData",   s_avp_getvideodata);
     R("sceAvPlayerGetVideoDataEx", s_avp_getvideodataex);
     R("sceAvPlayerGetAudioData",   s_avp_getaudiodata);
     R("sceAvPlayerStop",           s_avp_stop);
