@@ -790,16 +790,22 @@ bool capture_gpustate_submit(const GpuState& state, uint64_t submit_no,
                              uint32_t width, uint32_t height,
                              const GpuCaptureMetadata& metadata,
                              GpuCaptureFile& out, std::string& error) {
+    const bool caplog = std::getenv("PROSPER_GPU_CAPTURE_LOG") != nullptr;
     std::vector<OperationRealizationFailure> failures, compute_failures;
+    if (caplog) std::fprintf(stderr, "[cap] realize_gpustate_draws...\n");
     std::vector<DrawItem> draws = realize_gpustate_draws(state, 0x10000, 1.0f, 1.0f, &failures);
+    if (caplog) std::fprintf(stderr, "[cap] realize draws=%zu; realize_compute_dispatches...\n", draws.size());
     std::vector<ComputeItem> computes = realize_compute_dispatches(state, submit_no, &compute_failures);
+    if (caplog) std::fprintf(stderr, "[cap] realize computes=%zu; plan_submit_operations...\n", computes.size());
     failures.insert(failures.end(), std::make_move_iterator(compute_failures.begin()),
                     std::make_move_iterator(compute_failures.end()));
     GpuCaptureMetadata actual = metadata;
     actual.width = width;
     actual.height = height;
     actual.submit_index = submit_no;
-    return capture_submit_items(draws, computes, plan_submit_operations(state), actual,
+    auto ops = plan_submit_operations(state);
+    if (caplog) std::fprintf(stderr, "[cap] ops=%zu; capture_submit_items...\n", ops.size());
+    return capture_submit_items(draws, computes, ops, actual,
                                 read_capture_guest_memory, out, error, g_rtt_seed_reader, failures);
 }
 
