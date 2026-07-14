@@ -106,6 +106,13 @@ int main() {
     large_resource.size = 2u << 20;
     CHECK(gpu_capture_resource_footprint(large_resource) == (2u << 20),
           "public capture footprint reports the planner's declared buffer range");
+    ShaderResource layered_footprint{};
+    layered_footprint.cls = ResourceClass::StorageImage;
+    layered_footprint.format = DataFormat::Unorm8; layered_footprint.num_components = 4;
+    layered_footprint.img_dim = 2; layered_footprint.width = 2; layered_footprint.height = 3;
+    layered_footprint.depth = 4;
+    CHECK(gpu_capture_resource_footprint(layered_footprint) == 2u * 3 * 4 * 4,
+          "capture footprint includes every 3D slice");
     large_table->resources = {large_resource};
     DrawItem large_draw = draw;
     large_draw.vrt = large_table;
@@ -156,7 +163,7 @@ int main() {
           deserialize_gpu_capture(stencil_only_bytes, stencil_only_loaded, error) &&
           !stencil_only_loaded.ds_seeds[0].depth_valid &&
           stencil_only_loaded.ds_seeds[0].stencil_valid,
-          "stencil-only validity survives capture v8 independently of depth");
+          "stencil-only validity survives capture v9 independently of depth");
     GpuCaptureFile invalid_stencil_format = stencil_only;
     invalid_stencil_format.ds_seeds[0].format = GpuCaptureDsFormat::D32Float;
     CHECK(!serialize_gpu_capture(invalid_stencil_format, stencil_only_bytes, error) &&
@@ -238,6 +245,23 @@ int main() {
           "mixed graphics/compute submit captures without a renderer");
     CHECK(mixed.blobs.size() == 1 && mixed.shader_versions.size() == 2,
           "identical address-distinct resources and shared shaders deduplicate by content");
+    GpuCaptureFile layered_capture = mixed;
+    GpuCapturedResource layered_ref;
+    layered_ref.resource = layered_footprint;
+    layered_ref.resource.binding = 6; layered_ref.resource.gpu_addr = 0x4000;
+    layered_ref.resource.size = 2u * 3 * 4 * 4;
+    layered_capture.computes[0].resources.resources.push_back(layered_ref);
+    std::vector<uint8_t> layered_bytes;
+    GpuCaptureFile layered_loaded;
+    CHECK(serialize_gpu_capture(layered_capture, layered_bytes, error) &&
+          deserialize_gpu_capture(layered_bytes, layered_loaded, error) &&
+          layered_loaded.computes[0].resources.resources.back().resource.depth == 4,
+          "capture v9 round-trips image depth/array-layer metadata");
+    GpuCaptureFile invalid_layered = layered_capture;
+    invalid_layered.computes[0].resources.resources.back().resource.depth = 0;
+    CHECK(!serialize_gpu_capture(invalid_layered, layered_bytes, error) &&
+          error == "resource image depth/layer count is outside the T# range",
+          "capture writer rejects an invalid zero layer count");
     CHECK(mixed.operations.size() == 3 && mixed.operations[0].realized &&
           mixed.operations[1].realized && !mixed.operations[2].realized,
           "mixed operation plan explicitly retains unrealized work");
@@ -335,12 +359,24 @@ int main() {
     GpuCaptureFile legacy_source = captured; legacy_source.ds_seeds.clear();
     std::vector<uint8_t> legacy_bytes;
     CHECK(serialize_gpu_capture(legacy_source, legacy_bytes, error) && legacy_bytes.size() >= 24,
-          "created a diagnostic-free v8 payload for legacy-reader fixtures");
+          "created a diagnostic-free v9 payload for legacy-reader fixtures");
     if (legacy_bytes.size() >= 24) {
+        size_t legacy_resource_count = 0;
+        for (const auto& draw_ref : legacy_source.draws)
+            legacy_resource_count += draw_ref.vrt.resources.size() + draw_ref.prt.resources.size();
+        for (const auto& compute_ref : legacy_source.computes)
+            legacy_resource_count += compute_ref.resources.resources.size();
+        legacy_bytes.resize(legacy_bytes.size() - 4 - legacy_resource_count * 4); // remove v9 shape sidecar
+        legacy_bytes[8] = 8; legacy_bytes[9] = legacy_bytes[10] = legacy_bytes[11] = 0;
+    }
+    GpuCaptureFile legacy_loaded;
+    CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
+          legacy_loaded.draws[0].vrt.resources[0].resource.depth == 1,
+          "v8 capture reopens with legacy image depth defaulted to one");
+    if (legacy_bytes.size() >= 16) {
         legacy_bytes.resize(legacy_bytes.size() - 4); // remove v8 DS-seed zero count
         legacy_bytes[8] = 7; legacy_bytes[9] = legacy_bytes[10] = legacy_bytes[11] = 0;
     }
-    GpuCaptureFile legacy_loaded;
     CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
           legacy_loaded.failure_diagnostics_available && legacy_loaded.ds_seeds.empty(),
           "v7 capture reopens without persistent DS checkpoint data");
@@ -351,9 +387,9 @@ int main() {
     CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
           !legacy_loaded.failure_diagnostics_available && legacy_loaded.failure_diagnostics.empty(),
           "v6 capture reopens with failed-operation diagnostics reported unavailable");
-    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 9;
+    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 10;
     CHECK(!deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
-          error == "unsupported capture version 9",
+          error == "unsupported capture version 10",
           "future capture versions fail with a concrete version error");
 
     GpuCaptureFile bad_hash = mixed;

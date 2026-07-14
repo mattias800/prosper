@@ -99,7 +99,9 @@ struct ShaderResource {
     //     vertex fetch by its instruction pc first (exact), falling back to sgpr_base. 0xFFFFFFFF = unset.
     uint32_t      fetch_pc      = 0xFFFFFFFFu;
 
-    // Texture-only (cls == Texture). img_dim mirrors the MIMG dim field (1D=0, 2D=1, 3D=2, ...).
+    // Image-only (cls == Texture or StorageImage). img_dim mirrors the MIMG dim field
+    // (1D=0, 2D=1, 3D=2, CUBE=3, 1D_ARRAY=4, 2D_ARRAY=5, ...). `depth` is the 3D depth or
+    // array-layer count decoded from SQ_IMG_RSRC_WORD4.DEPTH; it is 1 for non-layered images.
     // width/height are for image_load/texelFetch + unnormalized addressing (unused by normalized
     // image_sample). sampler_sgpr_base = the paired sampler's S# base SGPR (SSAMP); with a Vulkan
     // COMBINED_IMAGE_SAMPLER the sampler is baked into the same `binding`, so this is provenance for a
@@ -107,6 +109,7 @@ struct ShaderResource {
     uint32_t      img_dim           = 1;
     uint32_t      width             = 0;
     uint32_t      height            = 0;
+    uint32_t      depth             = 1;
     uint32_t      tile_mode         = 0;                  // T# GFX10 TileMode; drives auto-detile of a sampled surface
     bool          srgb              = false;              // T# is a gamma-encoded (sRGB) surface — sample with sRGB->linear (#263)
     uint32_t      sampler_sgpr_base = 0xFFFFFFFFu;

@@ -94,8 +94,9 @@ compact target-extent spans; use `--signatures DRAWS DISPATCHES` to discover sce
 independent of `PROSPER_RENDER_EVERY`. To materialize one exact indexed submit without rendering the
 warmup, set `PROSPER_GPU_TIMELINE_CAPTURE_SUBMIT=N` and
 `PROSPER_GPU_TIMELINE_CAPTURE=<path>.prgcap` on a second run. Version-2 detail records link the capsule;
-version-8 capsules deduplicate content-addressed shader/resource versions, retain complete raw depth-surface
-programming, and preserve mixed draw/dispatch order plus explicit unrealized operations. Failed operations
+version-9 capsules deduplicate content-addressed shader/resource versions, retain complete raw depth-surface
+programming plus layered-image depth/layer counts, and preserve mixed draw/dispatch order plus explicit
+unrealized operations. Failed operations
 also retain bounded raw stages and exact rejection/state summaries; inspect them with `gpu_replay --inspect-only`
 and extract one with `--dump-failed-shader FAILURE:STAGE PATH`. Selection is
 intentionally bounded to the consumer and an optional
@@ -129,7 +130,7 @@ lifetime evidence proves the suffix contains the target's beginning, then inspec
 `gpu_replay --bundle-intermediate-through-target WxH` omits later passes from non-final submits only when
 dependency evidence proves that the named target family is the sole temporal image frontier.
 `gpu_replay --bundle-final-capsule PATH` exports the complete live color RTT cache plus exact valid planes from
-the persistent Vulkan depth/stencil cache into a capture-v8 capsule. Verify its standalone output hash against
+the persistent Vulkan depth/stencil cache into a capture-v9 capsule. Verify its standalone output hash against
 the bundle before using it for rapid final-submit isolation. `--inspect-only` prints each DS seed's full cache
 identity, format, independent validity flags, byte counts, and hashes. Captures v1-v7 remain readable without
 invented DS state.

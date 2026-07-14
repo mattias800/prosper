@@ -140,6 +140,7 @@ DecodedImageDescriptor decode_image_descriptor(const uint32_t t[8]) {
     d.base      = (((uint64_t)t[0] | ((uint64_t)t[1] << 32)) & 0xFFFFFFFFFFull) << 8;             // Base40
     d.width     = (uint32_t)(((t[1] >> 30) & 0x3u) | (((t[2] >> 0) & 0xFFFu) << 2)) + 1;          // Width5
     d.height    = (uint32_t)((t[2] >> 14) & 0x3FFFu) + 1;                                          // Height5
+    d.depth     = (uint32_t)(t[4] & 0x1FFFu) + 1;                                                   // Depth
     d.format    = (t[1] >> 20) & 0x1FFu;                                                           // Format
     d.tile_mode = (t[3] >> 20) & 0x1Fu;                                                            // TileMode (SW_MODE)
     d.type      = (uint8_t)((t[3] >> 28) & 0xFu);                                                  // Type
@@ -152,6 +153,13 @@ DecodedImageDescriptor decode_image_descriptor(const uint32_t t[8]) {
 
 uint32_t image_type_to_dim(uint8_t type) {
     return type >= 8 && type <= 15 ? static_cast<uint32_t>(type - 8) : 1u;
+}
+
+uint32_t image_slice_count(uint32_t img_dim, uint32_t depth) {
+    if (img_dim == 3u) return 6u;
+    if (img_dim == 2u || img_dim == 4u || img_dim == 5u || img_dim == 7u)
+        return depth ? depth : 1u;
+    return 1u;
 }
 
 ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
@@ -350,13 +358,18 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             // 12=1D_ARRAY, 13=2D_ARRAY). A CUBE resource (img_dim 3) uploads as six faces stacked
             // vertically in one 2D image (#273); everything else keeps the 2D default.
             r.img_dim       = image_type_to_dim(d.type);
+            r.depth         = image_slice_count(r.img_dim, d.depth);
             r.srgb          = fi.srgb;              // gamma-encoded surface: sample with sRGB->linear (#263)
             if (fi.srgb && getenv("PROSPER_GFXLOG"))
                 fprintf(stderr, "[t#] SRGB texture fmt=%u %ux%u (binding %u)\n", d.format, d.width, d.height, r.binding);
             // Backing byte size: block-compressed surfaces store one bytes_per_block unit per 4x4 block
             // (ceil dims); uncompressed store bytes_per_block per texel (fmt=56 -> *4).
-            r.size          = is_bcn ? (((d.width + 3) / 4) * ((d.height + 3) / 4) * fi.bytes_per_block)
-                                     : (d.width * d.height * fi.bytes_per_block);
+            const uint64_t slice_bytes = is_bcn
+                ? static_cast<uint64_t>((d.width + 3) / 4) * ((d.height + 3) / 4) * fi.bytes_per_block
+                : static_cast<uint64_t>(d.width) * d.height * fi.bytes_per_block;
+            const uint64_t backing_bytes = slice_bytes * r.depth;
+            if (!backing_bytes || backing_bytes > UINT32_MAX) continue;
+            r.size          = static_cast<uint32_t>(backing_bytes);
             // SGPR-resident T#: DIRECT provenance (image_sample SRSRC SGPR). EUD-resident T#: INDIRECT
             // (the s_load immediate = tsrt), and sgpr_base must be invalid so a stray by_sgpr_base for an
             // unrelated op reading that (bogus, out-of-file) SGPR number can't spuriously match it (#382).

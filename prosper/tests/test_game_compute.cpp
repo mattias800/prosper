@@ -1,15 +1,51 @@
+#include "../src/gpu/agc_shader_layout.hpp"
 #include "../src/gpu/rdna2_to_spirv.hpp"
 #include "../src/gpu/shader_resources.hpp"
 #include "live_compute.hpp"
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 using namespace prosper::gpu;
 
 static int fails = 0;
 #define CHECK(c, msg) do { if (!(c)) { std::printf("FAIL: %s\n", msg); fails++; } } while (0)
+
+static void make_tsharp(uint32_t t[8], uint64_t base, uint32_t width, uint32_t height,
+                        uint32_t type, uint32_t depth) {
+    std::memset(t, 0, 8 * sizeof(uint32_t));
+    const uint64_t encoded_base = base >> 8;
+    t[0] = static_cast<uint32_t>(encoded_base);
+    t[1] = static_cast<uint32_t>((encoded_base >> 32) & 0xffu) |
+           (56u << 20) | (((width - 1) & 0x3u) << 30); // IMG_FMT 56 = Unorm8x4
+    t[2] = (((width - 1) >> 2) & 0xfffu) | (((height - 1) & 0x3fffu) << 14);
+    t[3] = (type & 0xfu) << 28; // linear tile mode + real SQ_RSRC_IMG TYPE
+    t[4] = (depth - 1) & 0x1fffu;
+}
+
+static bool build_storage_image_resource(ShaderResource& out, uint8_t* data,
+                                         uint32_t width, uint32_t height,
+                                         uint32_t type, uint32_t depth,
+                                         uint32_t binding, uint32_t sgpr_base) {
+    uint32_t sgprs[8];
+    make_tsharp(sgprs, reinterpret_cast<uint64_t>(data), width, height, type, depth);
+    AgcShaderSharp sharp[1]; sharp[0].bits = 0;
+    AgcShaderUserData user_data{};
+    user_data.sharp_resource_offset[0] = sharp;
+    user_data.sharp_resource_count[0] = 1;
+    AgcShaderHeader header{};
+    header.file_header = 0x34333231u; header.version = 0x18; header.type = 1;
+    header.user_data = &user_data;
+    ShaderResourceTable decoded = build_shader_resources(header, sgprs, 8);
+    if (decoded.resources.size() != 1) return false;
+    out = decoded.resources.front();
+    out.cls = ResourceClass::StorageImage; // image_store consumer selects this class in gpu_executor.
+    out.binding = binding;
+    out.sgpr_base = sgpr_base;
+    return true;
+}
 
 int main() {
     // Dead Cells' bound startup fill kernel, copied verbatim from eboot.elf at runtime address
@@ -169,6 +205,85 @@ int main() {
                              bad, W * 4, img_src[0], img_dst[0]);
         CHECK(bad == 0, "Unorm8 unpack -> uvec4 copy -> pack writeback is byte-exact (#590)");
     }
+
+    // #657: production-backend copies for every newly enabled layered shape. Unlike the old 1D
+    // fixture, image metadata here is decoded from real 8-dword T#s via build_shader_resources.
+    static const uint32_t copy_3d[] = {
+        0x361000bfu, 0x7e120280u, 0x2c140086u,
+        0xf0000f10u, 0x00000008u, 0xbf8c3f70u,
+        0xf0200f10u, 0x00020008u, 0xbf810000u,
+    };
+    static const uint32_t copy_1d_array[] = {
+        0x361000bfu, 0x2c120086u,
+        0xf0000f20u, 0x00000008u, 0xbf8c3f70u,
+        0xf0200f20u, 0x00020008u, 0xbf810000u,
+    };
+    static const uint32_t copy_2d_array[] = {
+        0x361000bfu, 0x7e120280u, 0x2c140086u,
+        0xf0000f28u, 0x00000008u, 0xbf8c3f70u,
+        0xf0200f28u, 0x00020008u, 0xbf810000u,
+    };
+    auto run_layered_copy = [&](const uint32_t* code_words, size_t word_count,
+                                uint32_t tsharp_type, uint32_t expected_dim,
+                                const char* shape_name) {
+        constexpr uint32_t width = 64, height = 1, slices = 3;
+        constexpr size_t image_bytes = static_cast<size_t>(width) * height * slices * 4;
+        std::vector<uint8_t> backing(image_bytes * 2 + 512);
+        const uintptr_t first = (reinterpret_cast<uintptr_t>(backing.data()) + 255u) & ~uintptr_t(255u);
+        uint8_t* layered_src = reinterpret_cast<uint8_t*>(first);
+        uint8_t* layered_dst = layered_src + image_bytes; // image_bytes is 256-byte aligned.
+        for (size_t i = 0; i < image_bytes; ++i) layered_src[i] = static_cast<uint8_t>(i * 29 + 11);
+        std::memset(layered_dst, 0xee, image_bytes);
+
+        const uint32_t threads = width * height * slices;
+        std::vector<uint32_t> indices(threads);
+        for (uint32_t i = 0; i < threads; ++i) indices[i] = i;
+        std::vector<uint32_t> scratch(4, 0);
+        ShaderResourceTable layered_table;
+        auto add_layered_buffer = [&](uint32_t binding, void* ptr, uint32_t bytes) {
+            ShaderResource resource{};
+            resource.cls = ResourceClass::ConstantBuffer; resource.binding = binding;
+            resource.gpu_addr = reinterpret_cast<uint64_t>(ptr); resource.size = bytes;
+            layered_table.resources.push_back(resource);
+        };
+        add_layered_buffer(0, indices.data(), threads * sizeof(uint32_t));
+        add_layered_buffer(1, scratch.data(), 16);
+        add_layered_buffer(2, scratch.data(), 16);
+        add_layered_buffer(3, scratch.data(), 16);
+        ShaderResource src_image{}, dst_image{};
+        const bool src_built = build_storage_image_resource(
+            src_image, layered_src, width, height, tsharp_type, slices, 4, 0);
+        const bool dst_built = build_storage_image_resource(
+            dst_image, layered_dst, width, height, tsharp_type, slices, 5, 8);
+        CHECK(src_built && dst_built, "layered storage images decode from real T# descriptors");
+        CHECK(src_built && src_image.img_dim == expected_dim && src_image.depth == slices &&
+              src_image.size == image_bytes,
+              "layered T# carries the expected dimension, slice count, and backing size");
+        if (!src_built || !dst_built) return;
+        layered_table.resources.push_back(src_image);
+        layered_table.resources.push_back(dst_image);
+
+        std::vector<uint32_t> layered_spirv = recompile_valu(
+            code_words, word_count, 1, 0, &layered_table);
+        CHECK(!layered_spirv.empty(), "layered storage-image copy kernel recompiles");
+        if (layered_spirv.empty()) return;
+        ComputeItem layered_item;
+        layered_item.spirv = std::move(layered_spirv);
+        layered_item.resources = std::make_shared<ShaderResourceTable>(layered_table);
+        layered_item.launch.threads_x = threads; layered_item.launch.local_x = 64;
+        layered_item.launch.groups_x = threads / 64;
+        layered_item.launch.local_y = layered_item.launch.local_z = 1;
+        layered_item.launch.groups_y = layered_item.launch.groups_z = 1;
+        layered_item.code_addr = 0x657000 + expected_dim;
+        const bool executed = prosper::frontend::execute_live_compute_items({layered_item});
+        if (!executed) std::printf("  layered backend rejected %s\n", shape_name);
+        CHECK(executed, "production backend executes layered storage-image dispatch");
+        CHECK(std::memcmp(layered_src, layered_dst, image_bytes) == 0,
+              "layered upload -> copy -> writeback is byte-exact across every slice");
+    };
+    run_layered_copy(copy_3d, sizeof(copy_3d) / sizeof(copy_3d[0]), 10, 2, "3D");
+    run_layered_copy(copy_1d_array, sizeof(copy_1d_array) / sizeof(copy_1d_array[0]), 12, 4, "1D_ARRAY");
+    run_layered_copy(copy_2d_array, sizeof(copy_2d_array) / sizeof(copy_2d_array[0]), 13, 5, "2D_ARRAY");
 
     if (fails) {
         std::printf("== FAIL: %d ==\n", fails);

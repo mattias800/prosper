@@ -28,13 +28,14 @@ static void make_vsharp(uint32_t v[4], uint64_t base, uint32_t stride, uint32_t 
 // Width5-1 split over word1[31:30] (lo) + word2[11:0] (hi), Height5-1 @word2[27:14], TileMode
 // @word3[24:20], Type @word3[31:28]. Mirrors decode_image_descriptor / Kyty's Gen5 getters.
 static void make_tsharp(uint32_t t[8], uint64_t base, uint32_t w, uint32_t h, uint32_t fmt,
-                        uint32_t tile_mode, uint32_t type) {
+                         uint32_t tile_mode, uint32_t type, uint32_t depth = 1) {
     memset(t, 0, 8 * sizeof(uint32_t));
     uint64_t b = base >> 8;                       // 256-byte-aligned base, stored >>8
     t[0] = (uint32_t)(b & 0xffffffffu);
     t[1] = (uint32_t)((b >> 32) & 0xffu) | ((fmt & 0x1ffu) << 20) | (((w - 1) & 0x3u) << 30);
     t[2] = (((w - 1) >> 2) & 0xfffu) | (((h - 1) & 0x3fffu) << 14);
     t[3] = ((tile_mode & 0x1fu) << 20) | ((type & 0xfu) << 28);
+    t[4] = ((depth ? depth : 1) - 1) & 0x1fffu;
 }
 
 int main() {
@@ -294,6 +295,41 @@ int main() {
         CHECK(t2 && t2->size == ((256u + 3) / 4) * ((256u + 3) / 4) * 8u,
               "BC1 size = ceil(w/4)*ceil(h/4)*8 (compressed block bytes, not w*h*4)");
         CHECK(tt.by_sgpr_base(24) == nullptr, "unmapped IMG_FMT T# skipped (no silent RGBA8)");
+    }
+
+    // #657: WORD4 DEPTH is persisted as 3D depth / array-layer count, and the backing size covers
+    // every slice. These resources go through the real T# front half (not hand-filled img_dim fields).
+    {
+        uint32_t layered_sgprs[32]; memset(layered_sgprs, 0, sizeof layered_sgprs);
+        make_tsharp(&layered_sgprs[0],  0xD1000000ull, 16, 4, /*fmt*/56, /*linear*/0,
+                    /*3D*/10, /*depth*/3);
+        make_tsharp(&layered_sgprs[8],  0xD2000000ull, 32, 1, /*fmt*/56, /*linear*/0,
+                    /*1D_ARRAY*/12, /*layers*/4);
+        make_tsharp(&layered_sgprs[16], 0xD3000000ull, 8, 4, /*fmt*/56, /*linear*/0,
+                    /*2D_ARRAY*/13, /*layers*/5);
+        make_tsharp(&layered_sgprs[24], 0xD4000000ull, 16384, 16384, /*RGBA16F*/71, /*linear*/0,
+                    /*3D*/10, /*depth*/8192); // valid fields, impossible uint32 backing -> rejected
+        AgcShaderSharp sharps[4];
+        for (int i = 0; i < 4; ++i) sharps[i].bits = static_cast<uint16_t>(i * 8);
+        AgcShaderUserData lud; memset(&lud, 0, sizeof lud);
+        lud.sharp_resource_offset[0] = sharps; lud.sharp_resource_count[0] = 4;
+        AgcShaderHeader lsh; memset(&lsh, 0, sizeof lsh);
+        lsh.file_header = 0x34333231u; lsh.version = 0x18; lsh.type = 1; lsh.user_data = &lud;
+
+        DecodedImageDescriptor decoded = decode_image_descriptor(&layered_sgprs[0]);
+        CHECK(decoded.depth == 3, "T# WORD4 DEPTH decodes as depth-minus-one + 1");
+        ShaderResourceTable layered = build_shader_resources(lsh, layered_sgprs, 32);
+        CHECK(layered.resources.size() == 3,
+              "3D/array T#s emit; a layered backing beyond uint32 is rejected before probing");
+        const ShaderResource* image3d = layered.by_sgpr_base(0);
+        const ShaderResource* image1da = layered.by_sgpr_base(8);
+        const ShaderResource* image2da = layered.by_sgpr_base(16);
+        CHECK(image3d && image3d->img_dim == 2 && image3d->depth == 3 && image3d->size == 16u * 4 * 3 * 4,
+              "3D descriptor carries depth and all-slice backing size");
+        CHECK(image1da && image1da->img_dim == 4 && image1da->depth == 4 && image1da->size == 32u * 4 * 4,
+              "1D-array descriptor carries layer count and all-layer backing size");
+        CHECK(image2da && image2da->img_dim == 5 && image2da->depth == 5 && image2da->size == 8u * 4 * 5 * 4,
+              "2D-array descriptor carries layer count and all-layer backing size");
     }
 
     // #382: an EUD-resident texture (T# spilled beyond the user-SGPR block) must be emitted, mirroring

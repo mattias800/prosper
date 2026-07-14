@@ -1012,8 +1012,10 @@ std::vector<ComputeItem> realize_compute_dispatches(
                         const ResourceClass wanted = u.is_store ? ResourceClass::StorageImage
                                                                : ResourceClass::Texture;
                         for (auto& r0 : table->resources)
-                            if (r0.cls == wanted &&
-                                r0.gpu_addr == d.base && r0.width == d.width && r0.height == d.height) {
+                            if (r0.cls == wanted && r0.gpu_addr == d.base &&
+                                r0.width == d.width && r0.height == d.height &&
+                                r0.img_dim == image_type_to_dim(d.type) &&
+                                r0.depth == image_slice_count(r0.img_dim, d.depth)) {
                                 if (r0.fetch_pc == 0xFFFFFFFFu) { r0.fetch_pc = u.use_pc; mapped = true; break; }
                                 if (r0.fetch_pc == u.use_pc)    { mapped = true; break; }
                             }
@@ -1028,24 +1030,26 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     if (mapped_fmt && fi.block_width > 1 && fi.snorm) continue;   // signed BCn: not wired
                     ShaderResource r;
                     r.cls = u.is_store ? ResourceClass::StorageImage : ResourceClass::Texture;
+                    r.img_dim = image_type_to_dim(d.type);
+                    r.depth = image_slice_count(r.img_dim, d.depth);
                     if (mapped_fmt) {
                         r.format = fi.format; r.num_components = fi.num_components;
                         const bool is_bcn = fi.block_width > 1;
-                        const uint64_t bytes = is_bcn
+                        const uint64_t slice_bytes = is_bcn
                             ? static_cast<uint64_t>((d.width + 3) / 4) * ((d.height + 3) / 4) * fi.bytes_per_block
                             : static_cast<uint64_t>(d.width) * d.height * fi.bytes_per_block;
+                        const uint64_t bytes = slice_bytes * r.depth;
                         if (!bytes || bytes > UINT32_MAX) continue;
                         r.size = static_cast<uint32_t>(bytes);
                         r.srgb = fi.srgb;
                     } else {
-                        const uint64_t bytes = static_cast<uint64_t>(d.width) * d.height * 4;
+                        const uint64_t bytes = static_cast<uint64_t>(d.width) * d.height * r.depth * 4;
                         if (!bytes || bytes > UINT32_MAX) continue;
                         r.format = DataFormat::Unknown; r.num_components = 4;
                         r.size = static_cast<uint32_t>(bytes);
                     }
                     r.gpu_addr = d.base; r.width = d.width; r.height = d.height;
                     r.tile_mode = d.tile_mode;
-                    r.img_dim = image_type_to_dim(d.type);
                     r.swizzle[0] = d.dst_sel[0]; r.swizzle[1] = d.dst_sel[1];
                     r.swizzle[2] = d.dst_sel[2]; r.swizzle[3] = d.dst_sel[3];
                     r.srt_offset = clash ? 0xFFFFFFFFu : u.key;

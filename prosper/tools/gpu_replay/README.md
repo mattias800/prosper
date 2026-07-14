@@ -142,7 +142,7 @@ if an included temporal image leaf has another extent or an intermediate submit 
 an evidence-gated optimization, not automatic dependency closure.
 
 `--bundle-final-capsule PATH` snapshots the complete live color RTT and persistent Vulkan depth/stencil caches
-before executing the final submit and writes them as seeds in a standalone capture-v8 capsule. Its standalone
+before executing the final submit and writes them as seeds in a standalone capture-v9 capsule. Its standalone
 output must match the bundle's final hash before using it for fast `--draw`, operation-prefix, resource, or
 shader experiments. Export validates every surface and fails when a required temporal color surface is absent;
 it never substitutes zero pixels. The file is installed only after the source final submit renders, and embeds
