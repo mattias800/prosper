@@ -43,14 +43,13 @@ static constexpr uint32_t TCB_MAGIC       = 0x50524F53u;  // "PROS" — marks OU
 void guest_tls_set_templates(const TlsModuleDesc* descs, size_t count) {
     g_enabled = getenv("PROSPER_GUEST_FS") != nullptr;
 #ifdef __APPLE__
-    // Rosetta 2 does not implement rdfsbase/wrfsbase (verified: SIGILL on an M2, macOS 26) and
-    // Darwin has no fsbase API, so guest initial-exec %fs TLS cannot be enabled on this host yet.
-    // The default (host-%fs-aliasing) boot path is unaffected. See docs/PORTING.md.
-    if (g_enabled) {
-        fprintf(stderr, "[guest-tls] PROSPER_GUEST_FS is not supported on macOS (Rosetta lacks "
-                        "wrfsbase); continuing with it DISABLED\n");
-        g_enabled = false;
-    }
+    // Rosetta 2 does not implement rdfsbase/wrfsbase (verified: SIGILL on an M2) and Darwin has no
+    // fsbase API, so we cannot give the CPU a real guest %fs base. Instead run in TRAP mode: build
+    // the guest TCB, leave the hardware fs base at Rosetta's 0, and emulate each `%fs:`-prefixed
+    // access in the SIGSEGV handler (the fault address is exactly the guest's offset, since base==0,
+    // so the real target is guest_TP + fault_addr). Enabled by the same PROSPER_GUEST_FS gate.
+    // See exec_image_linux.cpp try_emulate_fs_access and docs/PORTING.md "macOS harness app".
+    if (g_enabled) fprintf(stderr, "[guest-tls] macOS TRAP mode: %%fs accesses emulated (no wrfsbase)\n");
 #endif
     g_mods.assign(descs, descs + count);
     // x86-64 Variant II static-TLS layout (glibc _dl_determine_tlsoffset, TLS_TCB_AT_TP): each
@@ -84,6 +83,33 @@ bool guest_tls_enabled() { return g_enabled && g_configured; }
 // Allocate + initialize this thread's guest TLS block and switch %fs to the guest TP. Returns the guest
 // TP (fs base), or 0 if disabled. Idempotent-ish: always makes a fresh block (called once per guest thread
 // at its entry). The block is intentionally leaked for the thread's lifetime (freed by process exit).
+#ifdef __APPLE__
+// The current thread's guest thread-pointer (0 if this isn't a guest thread / trap mode off). Lives
+// in host TLS (%gs on Darwin — host libc's own TLS, untouched by the guest %fs emulation), so the
+// SIGSEGV handler can read it to relocate a faulting `%fs:` access to guest_TP + offset.
+static thread_local uint64_t t_guest_tp = 0;
+uint64_t guest_tls_tp() { return t_guest_tp; }
+
+uint64_t guest_tls_activate_thread() {
+    if (!guest_tls_enabled()) return 0;
+    if (t_guest_tp) return t_guest_tp;   // idempotent: one TCB per thread, shared across inits + entry
+    size_t total = (size_t)g_total_below + TCB_SIZE;
+    uint8_t* block = (uint8_t*)mmap(nullptr, total, PROT_READ | PROT_WRITE,
+                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (block == MAP_FAILED) return 0;
+    memset(block, 0, total);
+    uint64_t tp = (uint64_t)block + g_total_below;
+    for (size_t i = 1; i < g_mods.size(); i++)
+        if (g_mods[i].filesz && g_mods[i].init_va)
+            memcpy((void*)(tp - g_below[i]), (const void*)(uintptr_t)g_mods[i].init_va, g_mods[i].filesz);
+    *(uint64_t*)(tp + 0)         = tp;          // TCB self-pointer (the `mov %fs:0x0,rax` idiom)
+    *(uint32_t*)(tp + MAGIC_OFF) = TCB_MAGIC;   // marks OUR guest TCB
+    // No host-canary copy: Darwin's host canary is %gs-relative, and the guest seeds its own
+    // %fs:0x28 canary during crt init. HOSTFS_OFF is unused in trap mode (no per-call swap).
+    t_guest_tp = tp;
+    return tp;   // NB: hardware fs base stays 0; accesses are trapped+emulated (try_emulate_fs_access)
+}
+#else
 uint64_t guest_tls_activate_thread() {
     if (!guest_tls_enabled()) return 0;
     uint64_t host_fs = rd_fsbase();
@@ -113,6 +139,7 @@ uint64_t guest_tls_activate_thread() {
     wr_fsbase(tp);
     return tp;
 }
+#endif  // __APPLE__ (trap-mode activation) vs else (wrfsbase activation)
 
 // Called at the entry of the CRASH signal handler (fault_handler). If the faulting thread is running on
 // OUR guest %fs, switch to the stashed host %fs so the handler's host-libc calls (snprintf/write) and any

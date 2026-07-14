@@ -701,6 +701,109 @@ namespace {
     // source xmm (EXTRQ: rm[13:0]; INSERTQ: rm[77:64]).  len==0 means 64. CONFIDENCE: HIGH (Intel SDM).
     volatile unsigned long g_sse4a_emulated = 0;
     const bool g_sse4a_stat = getenv("PROSPER_SSE4A_STAT") != nullptr;
+#ifdef __APPLE__
+    // macOS/Rosetta guest %fs TLS emulation. Rosetta keeps the CPU fs base at 0 and rejects wrfsbase,
+    // so every guest `%fs:disp` access faults at linear address == the raw offset. With the per-thread
+    // guest TCB (guest_tls trap mode), the real target is guest_TP + fault_addr. Decode the fs-prefixed
+    // instruction, perform the access against the TCB, advance RIP, and resume. Handles the mov family
+    // (the overwhelming majority of TLS touches: self-ptr read, IE-var load/store, imm store, and
+    // movzx/movsx); logs+bails on any other form so it can be extended from real boot evidence.
+    volatile unsigned long g_fs_emulated = 0;
+    const bool g_fslog = getenv("PROSPER_FSLOG") != nullptr;
+    // x86 register number (rax=0..r15=15) -> Darwin greg view index.
+    static const int kX86ToReg[16] = { REG_RAX,REG_RCX,REG_RDX,REG_RBX,REG_RSP,REG_RBP,REG_RSI,REG_RDI,
+                                       REG_R8,REG_R9,REG_R10,REG_R11,REG_R12,REG_R13,REG_R14,REG_R15 };
+    bool try_emulate_fs_access(ucontext_t* uc, uint64_t fault_addr) {
+        uint64_t tp = guest_tls_tp();
+        if (!tp) return false;
+        auto g = PROSPER_GREGS(uc);
+        const uint8_t* p = (const uint8_t*)(uintptr_t)g[REG_RIP];
+        size_t i = 0;
+        bool fs = false, opsz16 = false;
+        for (;; i++) {              // legacy prefixes
+            uint8_t b = p[i];
+            if (b == 0x64) { fs = true; continue; }                 // %fs override — the one we want
+            if (b == 0x66) { opsz16 = true; continue; }
+            if (b==0xF2||b==0xF3||b==0x2E||b==0x36||b==0x3E||b==0x26||b==0x65||b==0x67) continue;
+            break;
+        }
+        if (!fs) return false;      // no fs prefix -> a genuine fault, not guest TLS
+        uint8_t rex = 0;
+        if ((p[i] & 0xF0) == 0x40) rex = p[i++];
+        bool w = rex & 8; bool rexR = rex & 4;
+        uint8_t op = p[i++];
+        bool two = (op == 0x0F);
+        if (two) op = p[i++];
+        uint8_t modrm = p[i++];
+        int mod = modrm >> 6;
+        int reg = ((modrm >> 3) & 7) | (rexR ? 8 : 0);
+        int rm  = modrm & 7;
+        if (mod == 3) return false;                 // register operand: not an fs memory access
+        size_t sib_off = i;
+        if (rm == 4) i++;                            // SIB byte present
+        if (mod == 0) {
+            if (rm == 5) i += 4;                     // disp32 (no base)
+            else if (rm == 4 && (p[sib_off] & 7) == 5) i += 4;
+        } else if (mod == 1) i += 1;
+        else i += 4;                                 // mod == 2
+        // Safety: only touch the guest TCB window [TP - total_below, TP + 0x200). A mis-decode with a
+        // wild offset is treated as a real fault (bail) rather than corrupting/reading random memory.
+        int64_t off = (int64_t)fault_addr;
+        if (off < -(int64_t)guest_tls_total_below() || off >= 0x200) return false;
+        volatile uint8_t* mem = (volatile uint8_t*)(uintptr_t)(tp + fault_addr);
+
+        auto wr_reg = [&](int xr, uint64_t v, int sz) {   // write a value into a reg with x86 width rules
+            uint64_t& r = g[kX86ToReg[xr]];
+            if (sz == 8)      r = v;
+            else if (sz == 4) r = (uint32_t)v;                    // 32-bit dest zero-extends to 64
+            else if (sz == 2) r = (r & ~0xffffull) | (v & 0xffff);
+            else              r = (r & ~0xffull)   | (v & 0xff);
+        };
+        auto rd_mem = [&](int sz) -> uint64_t {
+            uint64_t v = 0; for (int k = 0; k < sz; k++) v |= (uint64_t)mem[k] << (8*k); return v;
+        };
+        auto wr_mem = [&](uint64_t v, int sz) { for (int k = 0; k < sz; k++) mem[k] = (uint8_t)(v >> (8*k)); };
+
+        int sz = w ? 8 : (opsz16 ? 2 : 4);
+        bool handled = false;
+        if (!two) {
+            switch (op) {
+                case 0x8B: wr_reg(reg, rd_mem(sz), sz); handled = true; break;            // mov r, [fs:m]
+                case 0x8A: wr_reg(reg, rd_mem(1), 1);  handled = true; break;            // mov r8, [fs:m8]
+                case 0x89: wr_mem(g[kX86ToReg[reg]], sz); handled = true; break;         // mov [fs:m], r
+                case 0x88: wr_mem(g[kX86ToReg[reg]], 1);  handled = true; break;         // mov [fs:m8], r8
+                case 0xC7: { int isz = opsz16 ? 2 : 4; int32_t im = 0; memcpy(&im, p + i, isz); i += isz;
+                             wr_mem(w ? (uint64_t)(int64_t)im : (uint64_t)(uint32_t)im, sz); handled = true; break; } // mov [fs:m], imm
+                case 0xC6: { uint8_t imm = p[i++]; wr_mem(imm, 1); handled = true; break; }  // mov [fs:m8], imm8
+                default: break;
+            }
+        } else {
+            switch (op) {
+                case 0xB6: wr_reg(reg, rd_mem(1), w?8:4); handled = true; break;          // movzx r, m8
+                case 0xB7: wr_reg(reg, rd_mem(2), w?8:4); handled = true; break;          // movzx r, m16
+                case 0xBE: wr_reg(reg, (uint64_t)(int64_t)(int8_t)rd_mem(1), w?8:4);  handled = true; break;  // movsx m8
+                case 0xBF: wr_reg(reg, (uint64_t)(int64_t)(int16_t)rd_mem(2), w?8:4); handled = true; break;  // movsx m16
+                default: break;
+            }
+        }
+        if (!handled) {
+            char b[128]; int n = snprintf(b, sizeof b,
+                "[fs-emu] UNHANDLED fs insn rip=0x%llx off=%lld bytes: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                (unsigned long long)g[REG_RIP], (long long)off,
+                p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7]);
+            ssize_t wr = write(2, b, (size_t)(n>0?n:0)); (void)wr;
+            return false;   // fall through to the normal (fatal) fault path so the form is visible
+        }
+        g[REG_RIP] = (greg_t)(uintptr_t)(p + i);   // advance past the emulated instruction
+        g_fs_emulated++;
+        if (g_fslog && (g_fs_emulated & 0x3FFF) == 0) {
+            char b[64]; int n = snprintf(b, sizeof b, "[fs-emu] %lu accesses\n", g_fs_emulated);
+            ssize_t wr = write(2, b, (size_t)(n>0?n:0)); (void)wr;
+        }
+        return true;
+    }
+#endif  // __APPLE__
+
     bool try_emulate_sse4a(ucontext_t* uc) {
         auto g = PROSPER_GREGS(uc);
         uint64_t rip = (uint64_t)g[REG_RIP];
@@ -765,6 +868,13 @@ namespace {
     void fault_handler(int sig, siginfo_t* si, void* uctx) {
         // Emulate AMD-only SSE4a bitfield ops (insertq/extrq) that #UD on Intel hosts, then resume.
         if (sig == SIGILL && try_emulate_sse4a((ucontext_t*)uctx)) return;
+#ifdef __APPLE__
+        // macOS/Rosetta: a guest `%fs:`-relative TLS access faults (fs base is 0). Redirect it to the
+        // guest TCB (guest_TP + offset) and resume. Only fires when trap-mode TLS is active and the
+        // faulting instruction actually carries an fs prefix; otherwise falls through to the real path.
+        if ((sig == SIGSEGV || sig == SIGBUS) && try_emulate_fs_access((ucontext_t*)uctx, (uint64_t)si->si_addr))
+            return;
+#endif
         // A SIGILL we did NOT emulate: log the faulting instruction bytes so the offending opcode can be
         // identified (another AMD-only ISA extension, or a decode miss in try_emulate_sse4a). #163-progress.
         if (sig == SIGILL) {
@@ -1715,7 +1825,14 @@ bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
                                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (got == MAP_FAILED || got != want) return fail("mmap stub region failed");
 
+#ifdef __APPLE__
+    // macOS trap mode NEVER swaps %fs: the CPU fs base stays 0 and HLE handlers run on the host's own
+    // (%gs) TLS, so the plain tail-jump stub is correct. (The swap stub uses rdfsbase/wrfsbase, which
+    // SIGILL on Rosetta — emitting it here made every guest import call trap.)
+    bool swap = false;
+#else
     bool swap = guest_tls_enabled();   // gated: emit the %fs swap stubs so HLE handlers run on the host TCB
+#endif
     if (swap && stub_size < 96) return fail("stub_size too small for guest-%fs swap stub (need >= 96)");
     uint8_t* base = (uint8_t*)got;
     for (uint64_t i = 0; i < n; i++) {
@@ -2101,6 +2218,14 @@ static void dump_fault_bytes(uint64_t start, int n) {
 }
 
 size_t run_guest_inits(const std::vector<uint64_t>& fns) {
+#ifdef __APPLE__
+    // macOS only: the module .init_array ctors touch guest %fs TLS and run on this (main) thread BEFORE
+    // run_entry, so activate the guest TCB now to give the %fs emulator its per-thread guest_TP
+    // (idempotent — run_entry's later call reuses the same TP). On Linux the inits run under the host
+    // glibc %fs (a valid TCB) and activation stays in run_entry, so this is deliberately NOT done there
+    // to avoid perturbing the tuned Messenger/PROSPER_GUEST_FS boot ordering.
+    guest_tls_activate_thread();
+#endif
     size_t ok = 0;
     for (uint64_t f : fns) {
         g_trap_kind = 0; g_armed_tid = cur_tid();
