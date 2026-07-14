@@ -10,6 +10,10 @@ the shipped runtime. Build them from `build-linux/` like everything else.
 - **`boot_trace/`** — boots a SELF/ELF game image through the loader + HLE and
   runs it, with the fault handler, GPU executor, and (under `PROSPER_RENDER`) the
   live Vulkan renderer. The main harness for exercising a real title headlessly.
+- **`screenshot/`** — writes normal composited PNG sequences plus a JSONL evidence manifest. Use
+  `--seconds 1` for wall-clock sampling, warmup/`PROSPER_RENDER_EVERY` for slow software rendering,
+  and the pixel-distinct/pixel-stale assertions when visible progression matters. Source publication
+  counts alone do not prove that the image changed; see `screenshot/README.md`.
 - **`self_dump/`** — parse a SELF/ELF and print its segment/program-header map
   (find file offsets for offline disassembly).
 - **`shader_histo/`** — histogram RDNA2 opcodes across a title's shaders.

@@ -27,6 +27,7 @@ screenshot <app0-dir> [--every N] [--count M] [--out DIR] [--timeout SECS]
            [--warmup-seconds S] [--warmup-submits N]
            [--manifest PATH | --no-manifest]
            [--min-distinct-frames N] [--max-stale-seconds S]
+           [--min-pixel-distinct-frames N] [--max-pixel-stale-seconds S]
            [--require-composited-frame] [--min-present-count N]
            [--min-frame-seq N] [--require-crc32 N]
 ```
@@ -45,6 +46,8 @@ screenshot <app0-dir> [--every N] [--count M] [--out DIR] [--timeout SECS]
 | `--no-manifest` | off | Disable the default JSONL sidecar |
 | `--min-distinct-frames N` | 0 | Fail unless at least N distinct source publications were captured |
 | `--max-stale-seconds S` | unset | Fail if one source publication is reused longer than S seconds |
+| `--min-pixel-distinct-frames N` | 0 | Fail unless at least N samples differ from the preceding PNG |
+| `--max-pixel-stale-seconds S` | unset | Fail if identical pixels persist longer than S seconds, even across new publications |
 | `--require-composited-frame` | off | Fail if every PNG came from raw guest scanout fallback |
 | `--min-present-count N` | 0 | Fail unless a captured sample reaches guest flip N |
 | `--min-frame-seq N` | 0 | Fail unless a captured sample reaches rendered-frame N |
@@ -58,6 +61,10 @@ identity, guest flip count, rendered-frame sequence, dimensions, CRC32, capture 
 input route, and whether the source advanced or was stale. A final summary records distinct-frame and
 maximum-stale metrics plus the exit status. Manifests flush after every sample so a killed run retains
 usable evidence. `--no-manifest` preserves the old PNG-only behavior.
+
+Source progression and pixel progression are reported separately. A game can publish a new renderer
+frame every second while drawing the same image, so `source-distinct` alone is not evidence of visible
+progress. Use the pixel assertions for loading screens, frozen cinematics, and other visual checkpoints.
 
 Assertions preserve every PNG and the manifest, print the concrete failed condition, and exit nonzero.
 This lets an automated progression run distinguish "120 files written" from "120 advancing frames" or
