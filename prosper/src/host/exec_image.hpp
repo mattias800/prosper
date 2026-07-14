@@ -25,6 +25,12 @@ bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
 // Install the fault handler for genuine guest faults during a run.
 void install_trap_handler();
 
+#ifdef _WIN32
+// Test diagnostic: RSP&15 immediately before the recovery thunk calls its compiled MS-x64 helper.
+// A valid Microsoft-x64 call site is 0; -1 means the thunk has not run yet.
+int recovery_thunk_call_rsp_mod16();
+#endif
+
 // Install a per-thread alternate signal stack (so the fault handler survives a guest stack overflow).
 // The main thread gets one via install_trap_handler(); worker threads call this in their trampoline.
 void install_sigaltstack();

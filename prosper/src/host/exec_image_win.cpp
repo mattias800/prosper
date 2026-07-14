@@ -229,7 +229,32 @@ namespace {
         return true;
     }
 
-    __attribute__((noinline)) void veh_recover() { __builtin_longjmp(t_jb, 1); }   // runs on the faulting thread
+    // The VEH resumes at this assembly thunk instead of entering a compiled function directly. Its
+    // entry contract is deliberately not a normal call frame: RSP is 16-byte aligned and there is no
+    // return address. The thunk allocates the Microsoft-x64 32-byte home area, then makes a normal,
+    // aligned call into the compiled helper. __builtin_longjmp never returns across the foreign guest
+    // frames, so the missing caller frame is immaterial. The recorded alignment makes the contract
+    // regression-testable on Windows rather than relying on current compiler tolerance (#633).
+    extern "C" {
+        volatile uint64_t prosper_veh_recover_call_rsp_mod16 = ~uint64_t{0};
+        void prosper_veh_recover_thunk();
+    }
+    extern "C" __attribute__((noinline, noreturn)) void prosper_veh_recover_longjmp() {
+        __builtin_longjmp(t_jb, 1);
+        __builtin_unreachable();
+    }
+    __asm__(
+        ".text\n"
+        ".p2align 4\n"
+        ".globl prosper_veh_recover_thunk\n"
+        "prosper_veh_recover_thunk:\n"
+        "    subq $32, %rsp\n"       // MS-x64 shadow space; preserves 16-byte call-site alignment
+        "    movq %rsp, %rax\n"
+        "    andq $15, %rax\n"
+        "    movq %rax, prosper_veh_recover_call_rsp_mod16(%rip)\n"
+        "    callq prosper_veh_recover_longjmp\n"
+        "    ud2\n"
+    );
 
     // Tracked-mapping state probe for the lazy-commit fault path (defined in hle_kernel_mem.cpp):
     // 0 = untracked/gap, 1 = reserved-but-uncommitted, 2 = committed.
@@ -287,11 +312,10 @@ namespace {
         g_rax=c->Rax; g_rbx=c->Rbx; g_rcx=c->Rcx; g_rdx=c->Rdx; g_rsi=c->Rsi; g_rdi=c->Rdi;
         g_rbp=c->Rbp; g_rsp=c->Rsp; g_r8=c->R8; g_r9=c->R9; g_r10=c->R10; g_r11=c->R11;
         g_r12=c->R12; g_r13=c->R13; g_r14=c->R14; g_r15=c->R15;
-        // Redirect execution to veh_recover (which longjmps): calling longjmp directly out of a VEH
-        // is unsafe, so resume the thread at veh_recover on its current stack. 16-align the stack for
-        // the ABI. CONFIDENCE: MED — validated design, unverified at runtime on Windows.
+        // Resume at the explicit recovery thunk. Its entry contract is RSP%16==0; it creates the
+        // MS-x64 shadow space and a normal call frame before entering compiled code.
         c->Rsp &= ~(uint64_t)0xf;
-        c->Rip = (DWORD64)(uintptr_t)&veh_recover;
+        c->Rip = (DWORD64)(uintptr_t)&prosper_veh_recover_thunk;
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 } // namespace
@@ -338,6 +362,11 @@ void install_trap_handler() {
     if (installed) return;
     installed = true;
     AddVectoredExceptionHandler(1 /*first*/, veh);
+}
+
+int recovery_thunk_call_rsp_mod16() {
+    return prosper_veh_recover_call_rsp_mod16 == ~uint64_t{0}
+         ? -1 : (int)prosper_veh_recover_call_rsp_mod16;
 }
 
 // Diagnostics that need Linux perf_event / int3 patching are unavailable on Windows.
