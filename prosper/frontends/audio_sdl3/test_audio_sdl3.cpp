@@ -27,7 +27,13 @@ int main() {
     printf("== test_audio_sdl3 ==\n");
     register_builtin_hle();
     // Force the dummy driver so this runs on headless CI with no sound hardware.
-    if (!getenv("SDL_AUDIO_DRIVER")) setenv("SDL_AUDIO_DRIVER", "dummy", 1);
+    if (!getenv("SDL_AUDIO_DRIVER")) {
+#ifdef _WIN32
+        _putenv_s("SDL_AUDIO_DRIVER", "dummy");
+#else
+        setenv("SDL_AUDIO_DRIVER", "dummy", 1);
+#endif
+    }
 
     bool ok = install_sdl3_audio_sink();
     CHECK(ok);

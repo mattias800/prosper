@@ -10,8 +10,8 @@
 namespace prosper {
 
 // Initialise SDL gamepad and install the SDL3 PadBackend as the active backend. Idempotent.
-// Returns true on success; false (leaving the core's neutral default active) if SDL gamepad could
-// not be initialised. Call once at startup after register_builtin_hle().
+// Returns true on success; false (leaving the core's connected-neutral default active) if SDL
+// gamepad could not be initialised. Call once at startup after register_builtin_hle().
 bool install_sdl3_pad_backend();
 
 // Uninstall the SDL3 backend (restores the neutral default) and shut SDL gamepad down.

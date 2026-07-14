@@ -1,0 +1,40 @@
+# The Messenger (PPSA24651): fresh-save route for native Windows full rendering.
+# Explicit windows survive the roughly one-second pad poll interval. The final tail waits
+# for save-slot and name-entry transitions which complete later than in the Linux renderer.
+3-4.5:options
+7-8.5:options
+13-14.5:cross
+20-21.5:cross
+26-27.5:cross
+28-29.5:options
+33-34.5:up
+35-36.5:cross
+45-46.5:cross
+55-56.5:cross
+70-71.5:cross
+85-86.5:options
+100-101.5:up
+112-113.5:cross
+
+# Select a fresh slot and enter the name screen.
+120-121.5:up
+122-123.5:cross
+124-125.5:cross
+128-129.5:up
+130-131.5:cross
+132-133.5:cross
+136-137.5:up
+138-139.5:cross
+140-141.5:cross
+
+# Enter "AA", submit it, select Yes, and confirm.
+185-186.5:cross
+200-201.5:cross
+215-216.5:options
+230-231.5:up
+245-246.5:cross
+
+# Redundant confirmations around the long save/load boundary; presses are ignored while the game
+# suspends pad polling, but cover timing drift after confirmation without changing menu selections.
+270-271.5:cross
+285-286.5:cross

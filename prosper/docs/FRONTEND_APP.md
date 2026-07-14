@@ -13,10 +13,10 @@ desktop app: a window showing the game, audio out, controller in, and close-to-q
 we can watch prosper run on a real GPU with sound — a human-perspective smoke test — **without
 compromising the headless-first core**, which stays the source of truth for agentic/CI verification.
 
-On Windows this runs under WSL2: Windows 11's **WSLg** already provides a Wayland/X11 compositor
-+ PulseAudio + (vendor-ICD) Vulkan, so a Linux GUI app's window appears on the Windows desktop
-(taskbar + Start-menu entry), plays audio through Windows, and quits when the window closes. The
-frontend is an ordinary Linux SDL app; WSLg is the whole "Windows app" story. See *Deployment*.
+The frontend runs both as a Linux application (including through WSLg) and as a native MinGW Windows
+application. Native Windows uses SDL3's Win32/WASAPI/XInput-HIDAPI backends and a Vulkan SDK; it boots
+the same guest and renderer directly, without WSL. See `WINDOWS_PORT_HANDOFF.md` for the current build
+and routed screenshot validation commands.
 
 ## First principle: the dependency arrow points one way
 
@@ -134,13 +134,19 @@ destroys them after the guest thread has joined.
 ## Target / build layout
 
 - New dir `frontends/prosper-app/` with its own `main.cpp` + the SDL sink/backend.
-- Its own CMake target linking `prosper_core`, gated `if(BUILD_FRONTEND_APP)` (**default OFF**), and
+- Its own CMake target linking `prosper_core`, gated by `-DPROSPER_APP=ON` (**default OFF**), and
   on `find_package(SDL3)` + `find_package(Vulkan)` being present. The core and all existing tests
   build and pass with the frontend absent — never a core/CI dependency.
 - SDL3 unifies window + audio + gamepad in one dep, matching the existing SDL3 direction
   (`feat/audio-sdl3`, the gamepad frontend).
 
-## Deployment on Windows (WSLg)
+## Deployment on Windows
+
+For native Windows, configure MinGW with `-DPROSPER_APP=ON -DPROSPER_AUDIO_SDL3=ON
+-DPROSPER_PAD_SDL3=ON`, build `prosper-app.exe`, and verify the window/swapchain first with
+`--test-pattern --frames 120`. The complete PowerShell recipe is in `WINDOWS_PORT_HANDOFF.md`.
+
+WSLg remains a useful alternate path for running the Linux build:
 
 1. Prereq check: `vulkaninfo` in the WSL shell confirms a usable Vulkan device (vendor WSL ICD, else
    Mesa Dozen over D3D12). This is the one external dependency worth verifying up front.
@@ -161,7 +167,7 @@ Vulkan device + display, which CI may lack).
 The chosen path was **(b): extract a shared `boot_program()` helper** both `boot_trace` and the
 frontend call, rather than duplicate the boot glue.
 
-- `src/host/boot_program.hpp/.cpp` (in `prosper_core`, Linux-only body): links the fixed module set
+- `src/host/boot_program.hpp/.cpp` (in `prosper_core`, Linux and Windows): links the fixed module set
   (honoring `PROSPER_NO_PSN`, dropping absent modules), registers the built-in HLE, maps images, sets
   up TLS/unwind/procparam, installs the import stubs + trap handler, registers the PSN/SaveData
   module-start ranges, and runs the dependent-module init_arrays. An `after_hle_registered` hook lets

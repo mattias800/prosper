@@ -1,13 +1,14 @@
 # Windows native port — handoff (2026-07-14)
 
 The Windows native core boots The Messenger (`PPSA24651`) through IL2CPP and repeated GC
-stop-the-world cycles, then drives real GPU draws and presents 1920x1080 frames. The fence-field,
-metadata-read, and asynchronous-GC blockers were fixed in #672, #673, and #678 respectively. A
-60-second native validation reached SubmitDcb #28 (up to 11 draws per submit) without a guest fatal;
-the next frontier is user-facing frontend/gameplay validation and the remaining portability gaps in
-`docs/PORTING.md` ("Windows").
+stop-the-world cycles, drives real GPU draws, and presents 1920x1080 frames. The fence-field,
+binary-file-read, and asynchronous-GC blockers were fixed in #672, #673, and #678 respectively.
+Issue #683 adds and validates the SDL3/Vulkan window, audio and controller frontends plus the normal
+sampled screenshot tool. Its native fresh-save route now reaches a fully lit first-level frame at
+1920x1080 and exits cleanly. During that acceptance run, #688 exposed and fixed a stale Windows
+readability stub that allowed a null dynamic-fetch table to reach a host dereference.
 
-## What works today (merged to master)
+## What works today
 
 The guest, on Windows (MinGW, native), reproducibly:
 - Boots through SELF/ELF load → multi-module link → `module_start` init → guest `%fs` TLS.
@@ -19,6 +20,8 @@ The guest, on Windows (MinGW, native), reproducibly:
   (`WriteData`/`ReleaseMem`/`WaitRegMem`) and delivers flip/vblank/EOP events.
 - Delivers IL2CPP's exception-type `0x1e` asynchronously on the requested target thread, allowing
   repeated GC stop-the-world suspend/resume cycles to complete.
+- Runs the shared live Vulkan renderer and normal 1920x1080 present/readback path on an NVIDIA host.
+- Builds SDL3 with native Win32 video, WASAPI audio, XInput/HIDAPI controllers, and Vulkan support.
 
 Merged PRs that got it here (all `#ifdef _WIN32` — Linux/macOS unaffected, CI green on all 4 platforms):
 - **#624** substrate: `exec_image_win.cpp` (VirtualAlloc mapping, VEH fault handler, SysV↔MS-x64 stub
@@ -94,10 +97,60 @@ Native runtime validation: `data_sel=2 data=1`, `ref=1 mask=ffffffff`, no `NOT s
 completes. The later #673 metadata and #678 GC-delivery blockers are also resolved; do not reopen the
 solved fence investigation when diagnosing a later Windows failure.
 
-## Build + run + diagnose (native Windows, MinGW)
+## Full frontend build and validation (native Windows, MinGW)
 
-Toolchain on PATH: WinLibs MinGW-w64 UCRT `gcc/g++.exe` + Ninja; CMake; Vulkan SDK (`VULKAN_SDK` set).
-Git via PowerShell; build/run via Git Bash. Configure a Vulkan-enabled build dir once:
+Required tools are WinLibs MinGW-w64 UCRT `gcc/g++.exe`, Ninja, CMake, and a Vulkan SDK with
+`VULKAN_SDK` set. Configure the window, SDL3 audio/controller, live renderer, and screenshot tool
+directly from PowerShell:
+
+```powershell
+$wlb = "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin"
+cmake -S prosper -B prosper/build-mingw-app -G Ninja `
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo `
+  -DCMAKE_C_COMPILER="$wlb\gcc.exe" -DCMAKE_CXX_COMPILER="$wlb\g++.exe" `
+  -DPROSPER_APP=ON -DPROSPER_AUDIO_SDL3=ON -DPROSPER_PAD_SDL3=ON `
+  -DGAME_DUMP=C:/Users/matti/repos/ps5ys/PPSA24651-app0
+cmake --build prosper/build-mingw-app -j 8
+```
+
+Smoke-test the actual SDL window and Vulkan swapchain without a game, then run the game frontend:
+
+```powershell
+prosper/build-mingw-app/prosper-app.exe --test-pattern --frames 120
+$env:PROSPER_GUEST_FS = '1'
+$env:PROSPER_GUEST_ARGS = '-force-gfx-direct'
+prosper/build-mingw-app/prosper-app.exe --dump C:/Users/matti/repos/ps5ys/PPSA24651-app0
+```
+
+For unattended evidence, `screenshot.exe` uses Windows Imaging Component to write normal PNGs and
+creates missing output directories. The following is the measured fresh-save acceptance route. It
+samples every ten seconds to keep the evidence compact while retaining boot, menu, loading, fade, and
+fully lit first-level milestones:
+
+```powershell
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$env:PROSPER_PAD_SCRIPT = '@C:/Users/matti/repos/ps5ys/prosper/scripts/messenger/reach-first-level-windows.pad'
+$env:PROSPER_PAD_SCRIPT_LOG = '1'
+$env:PROSPER_SAVEDATA_DIR = "$env:TEMP/prosper-messenger-$stamp"
+prosper/build-mingw-app/screenshot.exe C:/Users/matti/repos/ps5ys/PPSA24651-app0 `
+  --seconds 10 --count 36 --out "$env:USERPROFILE/Downloads/messenger-windows-$stamp" `
+  --min-distinct-frames 25 --min-pixel-distinct-frames 10 --require-composited-frame
+```
+
+Use `--seconds 1 --count 360` when a complete one-frame-per-second sequence is more useful than a
+compact acceptance sample. The validated 2026-07-14 run completed 36/36 captures at 360.3 seconds,
+reported 36 distinct source frames and 23 distinct pixel frames, and showed the fully lit level in
+the final PNG with process exit 0.
+
+Use a new `PROSPER_SAVEDATA_DIR` for every fresh-save route validation. The manifest and PNG count
+prove capture health; inspect the final PNGs too, because delivered input does not prove that the
+intended game state was reached. Wall-time routes are renderer-speed sensitive, so use the dedicated
+Windows route for native full rendering and keep `PROSPER_PAD_SCRIPT_LOG=1` enabled.
+
+## Core diagnostics build
+
+This smaller Git Bash recipe remains useful when only `boot_trace` and verbose core diagnostics are
+needed. It shares the same compiler and Vulkan SDK prerequisites as the full build above:
 
 ```bash
 WLB="/c/Users/matti/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/bin"
@@ -108,7 +161,7 @@ cmake -S prosper -B prosper/build-mingw-vk -G Ninja -DCMAKE_BUILD_TYPE=Debug \
 cmake --build prosper/build-mingw-vk --target boot_trace -j8
 ```
 
-Run (Git Bash — PowerShell redirection writes UTF-16). Guest-fs is default-on on Windows:
+Run from Git Bash (guest-fs is default-on on Windows):
 
 ```bash
 cd prosper/build-mingw-vk
@@ -119,8 +172,8 @@ PROSPER_GFXLOG=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 \
 Diagnostics (env, all off by default): `PROSPER_GFXLOG` (`[gfx]`/`[agc]` PM4 decode + the `NOT satisfied`
 fence log), `PROSPER_EVLOG` (`[ev]` equeue/flip/EOP), `PROSPER_SYNCLOG` (`[sync]` WaitOnAddress/Wake with
 tid + validated guest caller, `[sync2]` cond/sema/EventFlag), `PROSPER_EXCLOG` (GC exception
-raise/deliver/resume), `PROSPER_MEMLOG`, `PROSPER_VEHLOG`, boot_trace `[memclass]`. The Messenger renders
-on **Linux** (`build-linux`, `PROSPER_GUEST_FS=1 …`) — use it as the oracle.
+raise/deliver/resume), `PROSPER_MEMLOG`, `PROSPER_VEHLOG`, and boot_trace `[memclass]`. Compare with a
+known-good Linux capture when separating cross-platform frontend faults from shared renderer faults.
 
 ## Gotchas learned (so the next agent doesn't relearn them)
 
@@ -130,5 +183,9 @@ on **Linux** (`build-linux`, `PROSPER_GUEST_FS=1 …`) — use it as the oracle.
 - MinGW `longjmp` does an SEH unwind that can't cross guest/asm frames → use `__builtin_setjmp/longjmp`.
 - `boot_trace` on Windows is nondeterministic-crash-prone ONLY if a diagnostic reads raw stack words —
   the sync-caller scanner is `VirtualQuery`-guarded now; keep any new stack-walk guarded.
-- The intermittent `exit 139` on some runs is a residual worker-thread edge; runs mostly reach the
-  fence stall deterministically.
+- Windows file descriptors must use binary mode for guest assets. Text-mode reads can translate
+  bytes and corrupt metadata even when the same path works on Linux (#673).
+- Asynchronous GC delivery must wake a target blocked in `WaitOnAddress`; rewriting its context alone
+  is insufficient because it may never return to guest code (#678).
+- Dynamic-fetch constant folding must reject unreadable guest ranges on every host. The native
+  renderer exercises this path; an unconditional Windows readability stub caused #688.

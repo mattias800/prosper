@@ -296,14 +296,17 @@ This is exactly the hard sub-problem flagged above for both Windows and macOS. P
 accesses** — the fault handler already decodes instructions at fault sites (SSE4a), so
 trap-and-emulate of `%fs:` operands is in-house technology.
 
-## Windows port status (2026-07-14) — Messenger presents frames after GC delivery fix
+## Windows port status (2026-07-14) — Messenger reaches the first level natively
 
-The native MinGW build now links and initializes the live Vulkan renderer, boots The Messenger through
+The native MinGW build links and initializes the live Vulkan renderer, boots The Messenger through
 Unity asset loading and IL2CPP initialization, completes repeated GC stop-the-world cycles, and presents
-real 1920x1080 frames. The guest `%fs`, threading, positioned-I/O, WaitOnAddress, VEH, integer ABI, and
-targeted exception-delivery foundations below are runtime-verified. A 60-second run reached SubmitDcb #28
-with up to 11 draws per submission and no guest fatal. The next work is frontend/gameplay acceptance and
-the remaining portability gaps, not another boot-time IL2CPP investigation.
+real 1920x1080 frames. The SDL3 window, WASAPI audio, XInput/HIDAPI pad, keyboard overlay, and normal WIC
+PNG screenshot path now build and run under #683. The guest `%fs`, threading, positioned-I/O,
+WaitOnAddress, VEH, integer ABI, and targeted exception-delivery foundations below are runtime-verified.
+Fresh-save routing now reaches a fully lit first-level frame and exits cleanly. #688 fixed the final
+Windows-only crash found by that route: an always-true `guest_readable` stub let a null dynamic-fetch
+table reach a host dereference. The 360-second acceptance produced 36/36 compact sampled captures,
+36 distinct source frames, and 23 distinct pixel frames at 1920x1080.
 
 - **Direct/flexible-memory HLE ported to Win32** (`hle_kernel_mem.cpp` `#else` block). The pool
   bookkeeping + VA tracker are copied verbatim from POSIX; mappings are backed by private
@@ -352,7 +355,7 @@ The deep crash after `%fs` TLS was two more Linux-parity gaps (fixed on `port/wi
   rbx=0) on an unrecoverable thread. A `win_thread_trampoline` now marshals the SysV entry through
   `prosper_call_guest_sysv` and activates the worker's guest `%fs` TCB.
 
-### Renderer wired (#655); WaitOnAddress (#663) + positioned IO (#665) FIXED; frontier: GPU EOP completion
+### Renderer, WaitOnAddress, positioned I/O, and GPU completion — SOLVED
 
 **SOLVED — the pre-render wedge was a lost wakeup in the Windows `sceKernelWaitOnAddress`.** It had been
 backed by ONE global `std::condition_variable` shared across every waited address, so a guest
@@ -495,9 +498,9 @@ granularity); and `PROSPER_CRASHPEEK` guards.
   on Windows. CI's `Windows MinGW` job builds the whole boot path.
 
 **What is left (runtime work, on a Windows host):**
-1. **Validate the user-facing frontend through scripted gameplay.** The headless renderer now presents
-   real frames; run the same deterministic input/screenshot acceptance route used on Linux and repair any
-   Windows-specific SDL/present/input gaps it exposes.
+1. **Extend native scripted gameplay coverage beyond The Messenger (#683/#688).** The frontend,
+   controller composition, WIC screenshot path, and routed first-level acceptance now work. Add
+   checkpoint automation for more titles as the Windows substrate is exercised more broadly.
 2. **Preserve physical-offset aliasing in the Windows memory HLE.** Private `VirtualAlloc` is sufficient
    for Unity, but UE4 MallocBinned3 needs shared backing (`CreateFileMapping`/`MapViewOfFile3`) while
    respecting Windows' 64 KiB allocation granularity.
@@ -532,8 +535,8 @@ natively under MSYS2/UCRT64 exactly as the CI `Windows MinGW` job does.
    make `hle_kernel_mem.cpp`/`hle_kernel.cpp` use the shims.
 3. **macOS port:** `exec_image_darwin.cpp`, x86_64 preset, MoltenVK + SDL3 frontend. Exit
    criterion: the pure test suite + a dump-gated boot test green under Rosetta on this laptop.
-4. **Windows native port:** `exec_image_win.cpp`, `sysv_abi` boundary, FS strategy per spike
-   result. WSL2 remains the supported Windows path meanwhile.
+4. **Windows native hardening:** keep extending gameplay coverage beyond the completed substrate,
+   then address physical-memory aliasing, XMM import arguments, and remaining VEH edge cases.
 5. **Android packaging:** Box64 + rootfs + Turnip APK, Kotlin shell. After macOS/Windows ship.
 6. **Hedge track (background):** validate the Linux-VM-on-macOS route (Rosetta-for-Linux or
    FEX/muvm + Venus) before macOS 28 removes general Rosetta.

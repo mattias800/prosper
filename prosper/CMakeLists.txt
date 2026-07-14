@@ -216,6 +216,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_pad PRIVATE prosper_core)
   add_test(NAME pad_input COMMAND test_pad)
 
+  add_executable(test_prosper_app_pad_overlay frontends/prosper-app/test_pad_overlay.cpp)
+  target_include_directories(test_prosper_app_pad_overlay PRIVATE src frontends/prosper-app)
+  target_link_libraries(test_prosper_app_pad_overlay PRIVATE prosper_core)
+  add_test(NAME prosper_app_pad_overlay COMMAND test_prosper_app_pad_overlay)
+
   add_executable(test_sync_on_address tests/test_sync_on_address.cpp)
   target_link_libraries(test_sync_on_address PRIVATE prosper_core)
   add_test(NAME sync_on_address COMMAND test_sync_on_address)
@@ -573,18 +578,6 @@ if(TARGET prosper_core)
       target_link_libraries(test_gpu_capture_render PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan)
       add_test(NAME gpu_capture_render_replay COMMAND test_gpu_capture_render)
 
-      # screenshot: run a game and capture a PNG every N frames (default 60) until M shots (default
-      # 30). Reuses boot_program + the shared live renderer; writes zlib-compressed PNGs (needs zlib).
-      find_package(ZLIB QUIET)
-      if(ZLIB_FOUND)
-        add_executable(screenshot tools/screenshot/screenshot.cpp
-                                  tools/screenshot/capture_manifest.cpp)
-        target_include_directories(screenshot PRIVATE src tools/screenshot)
-        target_link_libraries(screenshot PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan ZLIB::ZLIB)
-      else()
-        message(STATUS "zlib not found — skipping the screenshot tool")
-      endif()
-
       add_executable(test_vulkan_offscreen tests/test_vulkan_offscreen.cpp)
       target_link_libraries(test_vulkan_offscreen PRIVATE Vulkan::Vulkan)
       add_test(NAME vulkan_offscreen_clear COMMAND test_vulkan_offscreen)
@@ -692,6 +685,28 @@ if(TARGET prosper_core)
       message(STATUS "Vulkan found (${Vulkan_LIBRARY}) — offscreen graphics harness enabled")
     else()
       message(STATUS "Vulkan not found — skipping offscreen graphics harness")
+    endif()
+  endif()
+endif()
+
+# Normal sampled-render capture on every host with the live renderer. Unix writes PNG through zlib;
+# Windows uses its built-in WIC PNG encoder so the native tool needs no extra package.
+if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
+  if(WIN32)
+    add_executable(screenshot tools/screenshot/screenshot.cpp
+                              tools/screenshot/capture_manifest.cpp)
+    target_include_directories(screenshot PRIVATE src tools/screenshot)
+    target_link_libraries(screenshot PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan
+                                              windowscodecs ole32)
+  else()
+    find_package(ZLIB QUIET)
+    if(ZLIB_FOUND)
+      add_executable(screenshot tools/screenshot/screenshot.cpp
+                                tools/screenshot/capture_manifest.cpp)
+      target_include_directories(screenshot PRIVATE src tools/screenshot)
+      target_link_libraries(screenshot PRIVATE prosper_core prosper_live_renderer Vulkan::Vulkan ZLIB::ZLIB)
+    else()
+      message(STATUS "zlib not found — skipping the screenshot tool")
     endif()
   endif()
 endif()

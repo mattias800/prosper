@@ -21,7 +21,7 @@ int main() {
     if (!installed) {
         // If SDL gamepad can't init in this environment, the core default must remain active and safe.
         HostPadState s; bool present = pad_backend()->poll(0, s);
-        CHECK(!present && !s.connected, "fallback: neutral default backend still safe");
+        CHECK(present && s.connected, "fallback: connected neutral default backend restored");
         printf(fails ? "== FAIL ==\n" : "== PASS (SDL unavailable, safe fallback) ==\n");
         return fails ? 1 : 0;
     }
@@ -40,9 +40,10 @@ int main() {
     CHECK(d.connected == 0 && d.orientation_w == 1.0f, "mapping: disconnected + identity orientation");
 
     shutdown_sdl3_pad_backend();
-    // After shutdown the neutral core default is restored.
+    // After shutdown the connected-neutral core default (#680) is restored.
     HostPadState s2; bool p2 = pad_backend()->poll(0, s2);
-    CHECK(!p2 && !s2.connected, "after shutdown: neutral default restored");
+    CHECK(p2 && s2.connected && s2.buttons == 0,
+          "after shutdown: connected neutral default restored");
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");

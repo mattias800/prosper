@@ -1,0 +1,25 @@
+# The Messenger (PPSA24651): fresh-save route through menus/story into first-level dialogue.
+# Recovered from the final clean-build validation on issue #522.
+3:options
+7:options
+13:cross
+20:cross
+26:cross
+28:options
+33:up
+35:cross
+45:cross
+55:cross
+70:cross
+85:options
+100:up
+112:cross
+120:up
+122:cross
+124:cross
+128:up
+130:cross
+132:cross
+136:up
+138:cross
+140:cross

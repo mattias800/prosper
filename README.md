@@ -89,7 +89,7 @@ accepts scripted gamepad input, and renders the first level.
 evdev/SDL3 controllers + real message/error/IME dialogs), sharing the same boot + render core as the
 headless `boot_trace`.
 
-Development is **agentic-first**: correctness is verified programmatically — **96 self-checking tests**
+Development is **agentic-first**: correctness is verified programmatically — **92 self-checking tests**
 under `ctest` (including a headless Vulkan/llvmpipe harness that runs recompiled shaders and asserts
 numeric/pixel results, and per-opcode round-trip disassembly checks), a **golden-image snapshot guard**
 that boots a real title and pixel/content-asserts an exact frame, cross-platform CI (Linux +
@@ -115,11 +115,13 @@ Requires a C++20 compiler, CMake, and Ninja. A Vulkan loader is needed for the g
 cd prosper
 cmake -G Ninja -B build-linux
 cmake --build build-linux
-ctest --test-dir build-linux          # 96 self-checking tests
+ctest --test-dir build-linux          # 92 self-checking tests
 ```
 
-Add `-DPROSPER_APP=ON` to also build the windowed `prosper-app` frontend (fetches SDL3). A
-static-linked Windows (MinGW) build covers the host-agnostic parts as well.
+Add `-DPROSPER_APP=ON` to also build the windowed `prosper-app` frontend (fetches SDL3). Native
+Windows/MinGW now boots and renders the primary title through the same live Vulkan renderer; its
+current build, run, screenshot, and diagnostic recipe is maintained in
+[`prosper/docs/WINDOWS_PORT_HANDOFF.md`](prosper/docs/WINDOWS_PORT_HANDOFF.md).
 
 ## Repository layout
 
@@ -128,7 +130,7 @@ prosper/
   src/self/       SELF/ELF parsing → relocatable module image
   src/loader/     multi-module linker + global export table
   src/hle/        HLE of Sony libraries (libc, libkernel, AGC/graphics, services), NID hashing
-  src/host/       host execution: image mapping, stubs, fault handling (Linux)
+  src/host/       host execution: per-platform image mapping, ABI stubs, fault handling
   src/gpu/        AGC→Vulkan: PM4 decode, command processor, render state, vk_translate,
                   texture tiling + BC decode, and the RDNA2→SPIR-V shader recompiler
   frontends/      shared boot+render core, the windowed prosper-app, SDL3 audio/dialog, controllers
