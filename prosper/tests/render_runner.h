@@ -756,6 +756,12 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         VkPipelineVertexInputStateCreateInfo vin{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
         VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
         ia.topology = ps ? (VkPrimitiveTopology)ps->topology : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+#ifdef __APPLE__
+        // Metal always has primitive restart enabled and MoltenVK rejects primitiveRestartEnable=VK_FALSE
+        // with VK_ERROR_FEATURE_NOT_PRESENT. Force it on; harmless here because these draws don't use the
+        // strip-restart sentinel index (0xFFFF/0xFFFFFFFF), and it has no effect on list topologies.
+        ia.primitiveRestartEnable = VK_TRUE;
+#endif
         // Default: full-target viewport. When the resolved state carries the guest's PA_CL_VPORT transform,
         // honor it — a guest yscale < 0 arrives as a negative viewport_h (Vulkan core-1.1 flipped viewport),
         // reproducing the hardware's Y orientation (#38; each draw item keeps its own resolved viewport).

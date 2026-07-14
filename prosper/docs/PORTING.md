@@ -280,24 +280,36 @@ The macOS x86_64/Rosetta path is now real, not theoretical:
   fingerprint (#304) read the same bytes through `uint16_t*` and `uint32_t*` — strict-aliasing UB
   that Apple Clang 21 compiled into `ud2`. Now `memcpy` loads.
 
-### The macOS frontier: guest `%fs` TLS
+### The macOS frontier: guest `%fs` TLS — SOLVED (2026-07-14, trap-and-emulate)
 
-Boot stalls a few frames into libc init: a guest function does `call *rax` where `rax` resolved to
-a stack address, faulting (caught cleanly now, thanks to a mandatory alt stack on Darwin). The root
-cause is the predicted one — **guest initial-exec `%fs` TLS**. The Messenger needed
-`PROSPER_GUEST_FS` on Linux for correct TLS (see `guest_tls.cpp`: without it, guest `%fs:`-relative
-reads alias the host glibc TCB and return garbage). On macOS that gate is *force-disabled* because it
-is implemented with `wrfsbase`, which Rosetta SIGILLs on — and Darwin's `%fs` base is 0 (macOS uses
-`%gs` for TLS), so the guest's TLS reads resolve to garbage/stack values immediately, deeper and
-earlier than on Linux.
+Was: boot died a few frames into libc init on guest initial-exec `%fs` TLS. Rosetta rejects
+`wrfsbase`/`rdfsbase` (SIGILL) and Darwin's `%fs` base is 0 (macOS uses `%gs`), so we can't give the
+CPU a real guest fs base the way Linux (`wrfsbase`) and Windows (FSGSBASE + VEH re-apply) do.
 
-This is exactly the hard sub-problem flagged above for both Windows and macOS. Path forward
-(unchanged): find Rosetta's segment-base mechanism, or **patch/trap the guest `%fs`-relative
-accesses** — the fault handler already decodes instructions at fault sites (SSE4a), so
-trap-and-emulate of `%fs:` operands is in-house technology. NOTE (2026-07-14): the Windows port
-SOLVED its equivalent `%fs` TLS wall (FSGSBASE + VEH re-apply, see the Windows section) — but that
-relies on native FSGSBASE, which Rosetta does not expose (`wrfsbase` SIGILLs), so macOS still needs
-the trap/patch route rather than a direct port of the Windows fix.
+Solved by **trap-and-emulate**, settled by a spike: under Rosetta a guest `%fs:disp` access faults at
+linear address == the raw offset (fs base is 0), so the real target is simply `guest_TP + fault_addr`
+— no addressing-mode decode needed. Implementation:
+- `guest_tls.cpp` macOS "trap mode" (same `PROSPER_GUEST_FS` gate): build the per-thread Variant-II
+  guest TCB and store its thread pointer in host (`%gs`) TLS, but **do not** touch the CPU fs base.
+- `exec_image_linux.cpp` `try_emulate_fs_access`: in the SIGSEGV/SIGBUS handler, if the faulting
+  instruction carries an `%fs` prefix and trap-mode TLS is active, redirect the access to
+  `guest_TP + fault_addr`, emulate it (mov family — load/store all sizes, movzx/movsx, imm store),
+  advance RIP, and resume. Unknown instruction forms log and fall through (none seen so far).
+- The Linux `%fs` swap stubs are disabled on macOS (they use `wrfsbase`); handlers run on host `%gs`
+  TLS so no per-HLE-call swap is needed. TLS is activated before `.init_array` too (Apple-only).
+
+Result: Blasphemous 2 boots from the old libc-init death **all the way into Unity's PS5 GPU device
+init** (`GfxDevicePS5SharedData::CreateWorkload`), AGC command submission, and ~500 StreamingAssets
+bundles — 180k+ `%fs` accesses emulated with zero unhandled forms. The `prosper-app` window comes up
+and the live renderer begins creating real pipelines from the guest's draws.
+
+**Remaining to on-screen gameplay (follow-on frontiers, MoltenVK shader fidelity, not TLS):**
+- MoltenVK pipeline compat: `primitiveRestartEnable=VK_FALSE` is rejected by Metal — fixed (force
+  `VK_TRUE` on Apple). Next: the guest **vertex shader fails MSL compilation** in MoltenVK
+  (`Vertex shader function could not be compiled into pipeline`) — a SPIR-V→Metal translation gap to
+  isolate (same class as the `v_cvt_i32_f32` issue #686).
+- A guest **worker-thread fault** (`ret` to `0x0` at a host address) during asset load — a separate
+  HLE issue to diagnose.
 
 ### The macOS harness app (prosper-app) — WORKS (2026-07-14)
 
