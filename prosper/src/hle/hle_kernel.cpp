@@ -14,6 +14,7 @@
 #endif
 #include "dispatch.hpp"
 #include "nid.hpp"
+#include "sync_futex.hpp"
 #include "../host/exec_image.hpp"
 #include <pthread.h>
 #include <semaphore.h>   // scePthreadSem* -> host sem_t
@@ -29,6 +30,7 @@
 #include <thread>
 #include <atomic>
 #include <condition_variable>
+#include <new>
 #ifdef _WIN32
 #include <windows.h>   // GetCurrentThreadStackLimits/GetCurrentThreadId for the guest-thread trampoline
 #endif
@@ -378,7 +380,6 @@ HLE(k_attr_get) {
     // thread's attributes. a0 = thread handle (== the host pthread_t we store), a1 = attr handle.
     // (Bug fixed: the attr is arg1, not arg0 — reading arg0 left the real attr empty, so the GC's
     // GC_get_stack_base got a 0 stack base -> "Bad stack base in GC_register_my_thread".)
-#if defined(__linux__) || defined(__APPLE__)
     if (a1 && *(void**)a1) {
         auto* at = (pthread_attr_t*)*(void**)a1;
         void* base = nullptr; size_t sz = 0;
@@ -387,7 +388,6 @@ HLE(k_attr_get) {
         if (ok) pthread_attr_setstack(at, base, sz);   // real, tracked stack for that thread
         // else: leave the attr as-is (avoid the fragile pthread_getattr_np)
     }
-#endif
     return 0;
 }
 // scePthreadAttrGetstackaddr(attr, void** addr) — Sony reports the stack *base* (low addr).
@@ -888,10 +888,10 @@ void set_unwind_modules(const UnwindModuleDesc* d, size_t c) {
 // then to stop the world it calls sceKernelRaiseException(thread, 0x1e) on each thread. On
 // real hardware that asynchronously interrupts the target thread and runs its handler ON that
 // thread; the handler captures the thread's registers (for GC root scanning) and blocks until
-// resumed. We reproduce this exactly with a real-time signal: pthread_sigqueue delivers it to
-// the target thread, and our SA_SIGINFO handler synthesises a FreeBSD amd64 mcontext from the
-// interrupted ucontext (so the guest handler sees the real registers) and runs the guest
-// handler on that thread. A stubbed RaiseException left every thread un-acked -> deadlock.
+// resumed. POSIX hosts use a targeted signal. Windows suspends the target, redirects its CONTEXT
+// through a small aligned thunk, and restores the interrupted CONTEXT after the guest handler
+// returns. Both paths synthesize the same FreeBSD amd64 mcontext and run the real guest handler
+// on the target thread. A stubbed RaiseException left every thread un-acked -> deadlock.
 namespace {
 uint64_t g_exc_handlers[128] = {0};   // guest handler fn ptr, indexed by exception type
 bool g_exc_log = false;               // set once (outside signal ctx) from PROSPER_SYNCLOG
@@ -1022,6 +1022,132 @@ void ensure_exc_sig() {
     sigemptyset(&sa.sa_mask);
     sigaction(g_exc_sig, &sa, nullptr);
 }
+#elif defined(_WIN32)
+struct WinExcDelivery {
+    CONTEXT saved{};
+    uint64_t type = 0;
+    uint64_t handler = 0;
+};
+using RtlRestoreContextFn = VOID (WINAPI*)(PCONTEXT, PEXCEPTION_RECORD);
+RtlRestoreContextFn g_rtl_restore_context = nullptr;
+
+extern "C" uint64_t prosper_call_guest_sysv(uint64_t fn, uint64_t a0, uint64_t a1);
+extern "C" __attribute__((noreturn)) void prosper_win_exc_delivery(WinExcDelivery* delivery);
+extern "C" void prosper_win_exc_thunk();
+
+// SetThreadContext reliably redirects RIP/RSP, but Windows may rewrite volatile integer registers
+// while resuming a suspended syscall. Pass the delivery pointer on the target stack, not in RCX.
+// Entry RSP is 8 mod 16; pop makes it call-site aligned, and the 32-byte subtraction supplies the
+// Microsoft-x64 home area before the compiled helper call. The injected RSP is placed below the
+// guest SysV red zone so an asynchronous delivery cannot overwrite a leaf function's live locals.
+__asm__(
+    ".text\n"
+    ".p2align 4\n"
+    ".globl prosper_win_exc_thunk\n"
+    "prosper_win_exc_thunk:\n"
+    "    popq %rcx\n"
+    "    subq $32, %rsp\n"
+    "    call prosper_win_exc_delivery\n"
+    "    ud2\n"
+);
+
+void win_exc_log(const char* msg) {
+    if (!g_exc_log && !g_exc_log2) return;
+    DWORD written = 0;
+    WriteFile(GetStdHandle(STD_ERROR_HANDLE), msg, (DWORD)strlen(msg), &written, nullptr);
+}
+
+extern "C" __attribute__((noinline, noreturn))
+void prosper_win_exc_delivery(WinExcDelivery* delivery) {
+    CONTEXT saved = delivery->saved;
+    uint64_t type = delivery->type;
+    uint64_t handler = delivery->handler;
+
+    // FreeBSD amd64 mcontext layout; keep in lockstep with the POSIX signal path above.
+    alignas(16) uint8_t ctx[0x400]{};
+    auto WQ = [&](int off, uint64_t v) { *(uint64_t*)(ctx + off) = v; };
+    WQ(0x08, saved.Rdi); WQ(0x10, saved.Rsi); WQ(0x18, saved.Rdx); WQ(0x20, saved.Rcx);
+    WQ(0x28, saved.R8);  WQ(0x30, saved.R9);  WQ(0x38, saved.Rax); WQ(0x40, saved.Rbx);
+    WQ(0x48, saved.Rbp); WQ(0x50, saved.R10); WQ(0x58, saved.R11); WQ(0x60, saved.R12);
+    WQ(0x68, saved.R13); WQ(0x70, saved.R14); WQ(0x78, saved.R15);
+    WQ(0xA0, saved.Rip); WQ(0xB8, saved.Rsp); WQ(0xF8, saved.Rsp);
+
+    win_exc_log("[exc] handler ENTER on Windows target\n");
+    prosper_call_guest_sysv(handler, type, (uint64_t)(uintptr_t)ctx);
+    win_exc_log("[exc] handler EXIT on Windows target (resumed)\n");
+
+    delete delivery;
+    g_rtl_restore_context(&saved, nullptr);
+    TerminateProcess(GetCurrentProcess(), ERROR_INVALID_STATE);   // RtlRestoreContext never returns
+    __builtin_unreachable();
+}
+
+uint64_t win_raise_exception(uint64_t target, uint64_t type) {
+    if (!target || type >= 128 || !g_exc_handlers[type]) return 0;
+    if (pthread_equal((pthread_t)target, pthread_self())) return 0x80020023ull; // EDEADLK-ish
+    if (!g_rtl_restore_context) return 0x80020026ull;                         // ENOSYS-ish
+
+    HANDLE thread = (HANDLE)pthread_gethandle((pthread_t)target);
+    if (!thread || thread == INVALID_HANDLE_VALUE) return 0x80020003ull;       // ESRCH
+
+    // Allocate before suspending: the target could currently own the process heap lock.
+    auto* delivery = new (std::nothrow) WinExcDelivery;
+    if (!delivery) return 0x8002000cull;                                      // ENOMEM
+    delivery->type = type;
+    delivery->handler = g_exc_handlers[type];
+
+    DWORD previous_suspend = SuspendThread(thread);
+    if (previous_suspend == (DWORD)-1) { DWORD e = GetLastError(); delete delivery; return 0x80020000ull | (e & 0xffff); }
+    if (previous_suspend != 0) {
+        ResumeThread(thread);
+        delete delivery;
+        return 0x80020010ull;                                                 // EBUSY
+    }
+
+    delivery->saved.ContextFlags = CONTEXT_ALL;
+    if (!GetThreadContext(thread, &delivery->saved)) {
+        DWORD e = GetLastError(); ResumeThread(thread); delete delivery;
+        return 0x80020000ull | (e & 0xffff);
+    }
+
+    CONTEXT injected = delivery->saved;
+    injected.ContextFlags = CONTEXT_FULL;
+    injected.Rip = (DWORD64)(uintptr_t)&prosper_win_exc_thunk;
+    constexpr DWORD64 kGuestRedZone = 128;
+    injected.Rsp = (injected.Rsp & ~(DWORD64)0xf) - kGuestRedZone - 8;
+    DWORD64 delivery_ptr = (DWORD64)(uintptr_t)delivery;
+    SIZE_T written = 0;
+    if (!WriteProcessMemory(GetCurrentProcess(), (void*)(uintptr_t)injected.Rsp,
+                            &delivery_ptr, sizeof(delivery_ptr), &written) ||
+        written != sizeof(delivery_ptr)) {
+        DWORD e = GetLastError(); ResumeThread(thread); delete delivery;
+        return 0x80020000ull | (e & 0xffff);
+    }
+    if (!SetThreadContext(thread, &injected)) {
+        DWORD e = GetLastError(); ResumeThread(thread); delete delivery;
+        return 0x80020000ull | (e & 0xffff);
+    }
+    if (ResumeThread(thread) == (DWORD)-1) {
+        DWORD e = GetLastError();
+        bool restored = SetThreadContext(thread, &delivery->saved) != FALSE;
+        if (restored && ResumeThread(thread) != (DWORD)-1) delete delivery;
+        return 0x80020000ull | (e & 0xffff);
+    }
+    // A redirected Windows CONTEXT is not dispatched until a blocking syscall returns. Current
+    // IL2CPP targets commonly sit in our infinite WaitOnAddress HLE; wake its registered address
+    // after dropping the suspend count so the target enters prosper_win_exc_thunk immediately.
+    interrupt_futex_wait(target);
+    return 0;
+}
+
+void ensure_exc_sig() {
+    if (g_rtl_restore_context) return;
+    g_exc_log = getenv("PROSPER_SYNCLOG") != nullptr;
+    g_exc_log2 = getenv("PROSPER_EXCLOG") != nullptr;
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    g_rtl_restore_context = ntdll
+        ? (RtlRestoreContextFn)GetProcAddress(ntdll, "RtlRestoreContext") : nullptr;
+}
 #else
 void ensure_exc_sig() {}
 #endif
@@ -1058,6 +1184,8 @@ HLE(k_raise_exception) {       // (targetThread /*host pthread_t*/, exceptionTyp
         fprintf(stderr, "[exc2] RAISE-NOOP by tid=%ld target=0x%llx type=0x%llx (no handler)\n",
                 sctid(), (unsigned long long)a0, (unsigned long long)a1);
     }
+#elif defined(_WIN32)
+    return win_raise_exception(a0, a1);
 #endif
     return 0;
 }
@@ -1065,12 +1193,10 @@ HLE(k_raise_exception) {       // (targetThread /*host pthread_t*/, exceptionTyp
 void set_exc_raise_counter(volatile int* counter) { g_exc_counter = counter; }
 
 HLE(k_is_stack) {   // sceKernelIsStack(void* addr): is addr within the current thread's stack?
-#if defined(__linux__) || defined(__APPLE__)
     void* base = nullptr; size_t sz = 0;
     if (guest_stack_for_current_thread(&base, &sz) &&
         a0 >= (uint64_t)(uintptr_t)base && a0 < (uint64_t)(uintptr_t)base + sz)
         return 1;
-#endif
     return 0;
 }
 // Global export table (NID -> guest addr) registered by the loader, so dlsym can resolve

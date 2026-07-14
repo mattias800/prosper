@@ -592,7 +592,7 @@ HLE(k_wait_on_address) {
                            (long)prosper_gettid(), (unsigned long long)a0, *(uint32_t*)a0,
                            (unsigned long long)a1, pts ? (long long)(ts.tv_sec*1000000 + ts.tv_nsec/1000) : -1,
                            (unsigned long long)goff);
-    futex_wait_enter();   // registers this waiter so GPU-side label wakes know someone is blocked
+    futex_wait_enter(a0); // registers this waiter so GPU-side label wakes know someone is blocked
     long r = prosper_futex_wait((uint32_t*)a0, (uint32_t)a1, pts);
     int e = errno;
     futex_wait_exit();
@@ -1608,7 +1608,7 @@ HLE(k_wait_on_address) {
     volatile uint32_t* wa = (volatile uint32_t*)(uintptr_t)a0;
     // Register as a futex waiter so the GPU command processor's RELEASE_MEM/EOP wake (wake_label_waiters,
     // which only fires when g_waiters>0) reaches this thread. RAII so every return path unregisters.
-    futex_wait_enter();
+    futex_wait_enter(a0);
     struct WaiterGuard { ~WaiterGuard() { futex_wait_exit(); } } _waiter_guard;
     while (*wa == expected) {
         DWORD wait_ms = INFINITE;
