@@ -47,7 +47,7 @@ prosper/
   src/self/        SELF/ELF parsing -> relocatable module image
   src/loader/      multi-module linker + global NID export table
   src/hle/         reimplemented Sony libraries (libc, libkernel, AGC/graphics), NID hashing
-  src/host/        host execution: image mapping, import stubs, fault handling (Linux)
+  src/host/        host execution: per-platform image mapping, ABI stubs, fault handling
   src/gpu/         AGC->Vulkan: PM4 decode, command processor, render state, vk_translate,
                    resource layer, RDNA2->SPIR-V recompiler
   tools/           self_dump, boot_trace, shader_histo, imgdump, spv_validate,
@@ -72,12 +72,18 @@ renderer is wired in; the game's **real pixel shader recompiles to valid SPIR-V*
 **bindless-dynamic vertex-fetch resolution** for the vertex shader — fully specified in
 `prosper/docs/NEXT_STEP_VERTEX_FETCH.md`. This paragraph is historical only.
 
-## Current frontier (2026-07-13)
+## Current frontier (2026-07-14)
 
 The game now **boots through IL2CPP, renders its intro/title/menu, and reaches gameplay with real GPU
 draws.** The old bindless vertex-fetch frontier is complete: both shader stages recompile and dynamic
 V#/T#/S# resources resolve on current master. Do **not** start from `NEXT_STEP_VERTEX_FETCH.md`; it is
 retained as a historical bring-up record.
+
+The native Windows/MinGW substrate now runs the same SDL3/Vulkan frontend and normal PNG screenshot
+workflow through a routed Messenger fresh save and a fully lit first-level frame (#683). The route
+exposed a stale Windows `guest_readable` stub in dynamic-fetch folding; a `VirtualQuery` range guard
+fixes the resulting loading-time host access violation (#688). Start Windows work from
+`docs/WINDOWS_PORT_HANDOFF.md`, not the historical pre-render fence investigation.
 
 The save-game list is visible (#299 closed), and retaining color-disabled depth/stencil passes (#520) recovers
 the first level's source scene. The black gameplay root cause was fixed on master by #528 (`e5fce22`):
@@ -230,7 +236,7 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   `/mnt/c/Users/matti/repos/ps5ys/PPSA24651-app0` (gitignored — **never commit it**).
   ```bash
   cd /mnt/c/Users/matti/repos/ps5ys/prosper/build-linux
-  cmake --build . -j8 && ctest        # 91/91 expected green on Linux
+  cmake --build . -j8 && ctest        # 92/92 expected green on Linux
   ```
 - **Verification is agentic-first / programmatic** (`docs/VERIFICATION.md`): ctest exit code is truth;
   shaders are `spirv-val`-gated; rendered frames are pixel/CRC-asserted or dumped to BMP. No manual

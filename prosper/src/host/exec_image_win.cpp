@@ -6,10 +6,10 @@
 // of ucontext. The guest is System V AMD64; the host is Microsoft x64. Emitted import stubs marshal
 // guest calls into the host ABI, and prosper_call_guest_sysv marshals host calls into the guest ABI.
 //
-// STATUS (2026-07-13): runtime-verified through a multi-threaded headless frame-loop boot. Remaining
-// work is tracked in docs/PORTING.md "Windows": wire the Vulkan renderer, preserve physical-memory
-// aliasing, cover float/XMM import arguments, and harden VEH recovery. Diagnostics that depend on
-// Linux perf_event / ptrace (PROSPER_HWBP/HWWATCH/BP/PEEK/DUMPAT) are intentionally absent here.
+// STATUS (2026-07-14): runtime-verified through repeated GC cycles and the native live Vulkan
+// renderer. Remaining work is tracked in docs/PORTING.md "Windows", including physical-memory
+// alias fidelity, float/XMM import arguments, and deeper frontend/gameplay validation. Diagnostics
+// that depend on Linux perf_event / ptrace (PROSPER_HWBP/HWWATCH/BP/PEEK/DUMPAT) remain absent.
 #ifdef _WIN32
 
 #include "exec_image.hpp"

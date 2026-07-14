@@ -20,7 +20,7 @@
 // Reaching a rendering frame loop needs the guest switches the render frontier documents; this tool
 // defaults PROSPER_GUEST_FS=1 and PROSPER_GUEST_ARGS=-force-gfx-direct (Unity/Messenger recipe) if
 // they aren't already set. For other titles, set the appropriate env before running (e.g. a UE4
-// title: PROSPER_GUEST_ARGS= PROSPER_NULL_PAGE=1). Linux-only (the guest substrate is).
+// title: PROSPER_GUEST_ARGS= PROSPER_NULL_PAGE=1).
 #include "loader/linker.hpp"          // Program
 #include "host/boot_program.hpp"       // boot_program
 #include "host/exec_image.hpp"         // run_entry
@@ -29,7 +29,14 @@
 #include "live_renderer.hpp"           // register_live_renderer (frontends/shared)
 #include "capture_manifest.hpp"
 
+#ifdef _WIN32
+#include <windows.h>
+#include <wincodec.h>
+#include <objbase.h>
+#else
 #include <zlib.h>
+#include <unistd.h>
+#endif
 #include <algorithm>
 #include <climits>
 #include <cmath>
@@ -47,11 +54,30 @@
 #include <thread>
 #include <chrono>
 #include <ctime>
-#include <unistd.h>
 
 using namespace prosper;
 
 namespace {
+
+bool set_environment(const char* name, const char* value, bool overwrite) {
+    if (!overwrite && getenv(name)) return true;
+#ifdef _WIN32
+    return _putenv_s(name, value) == 0;
+#else
+    return setenv(name, value, overwrite ? 1 : 0) == 0;
+#endif
+}
+
+uint32_t crc32_bytes(const void* data, size_t len, uint32_t seed = 0) {
+    uint32_t crc = ~seed;
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < len; ++i) {
+        crc ^= bytes[i];
+        for (int bit = 0; bit < 8; ++bit)
+            crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
+    }
+    return ~crc;
+}
 
 bool parse_nonnegative_double(const char* text, double& value) {
     char* end = nullptr;
@@ -85,15 +111,92 @@ void put_chunk(FILE* f, const char* type, const uint8_t* data, size_t len) {
     fwrite(hdr, 1, 4, f);
     fwrite(type, 1, 4, f);
     if (len) fwrite(data, 1, len, f);
-    uint32_t crc = crc32(0, (const Bytef*)type, 4);
-    if (len) crc = crc32(crc, (const Bytef*)data, (uInt)len);
+    uint32_t crc = crc32_bytes(type, 4);
+    if (len) crc = crc32_bytes(data, len, crc);
     uint8_t crcb[4] = { (uint8_t)(crc >> 24), (uint8_t)(crc >> 16), (uint8_t)(crc >> 8), (uint8_t)crc };
     fwrite(crcb, 1, 4, f);
 }
 
-// Write w*h RGBA8 as an 8-bit RGBA PNG (filter None per row, zlib-compressed IDAT).
+// Write w*h RGBA8 as an 8-bit RGBA PNG.
 bool write_png(const char* path, const uint8_t* rgba, uint32_t w, uint32_t h,
                std::string& error) {
+#ifdef _WIN32
+    const HRESULT init_hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool uninitialize = SUCCEEDED(init_hr);
+    if (FAILED(init_hr) && init_hr != RPC_E_CHANGED_MODE) {
+        char detail[64];
+        snprintf(detail, sizeof detail, "COM init failed (0x%08lx)", (unsigned long)init_hr);
+        error = detail;
+        return false;
+    }
+
+    IWICImagingFactory* factory = nullptr;
+    IWICStream* stream = nullptr;
+    IWICBitmapEncoder* encoder = nullptr;
+    IWICBitmapFrameEncode* frame = nullptr;
+    IPropertyBag2* properties = nullptr;
+    HRESULT hr = S_OK;
+    bool ok = false;
+    do {
+        hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                              IID_PPV_ARGS(&factory));
+        if (FAILED(hr)) break;
+        hr = factory->CreateStream(&stream);
+        if (FAILED(hr)) break;
+        const std::wstring wide_path = std::filesystem::path(path).wstring();
+        hr = stream->InitializeFromFilename(wide_path.c_str(), GENERIC_WRITE);
+        if (FAILED(hr)) break;
+        hr = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder);
+        if (FAILED(hr)) break;
+        hr = encoder->Initialize(stream, WICBitmapEncoderNoCache);
+        if (FAILED(hr)) break;
+        hr = encoder->CreateNewFrame(&frame, &properties);
+        if (FAILED(hr)) break;
+        hr = frame->Initialize(properties);
+        if (FAILED(hr)) break;
+        hr = frame->SetSize(w, h);
+        if (FAILED(hr)) break;
+        WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
+        hr = frame->SetPixelFormat(&format);
+        if (FAILED(hr) || !IsEqualGUID(format, GUID_WICPixelFormat32bppBGRA)) {
+            if (SUCCEEDED(hr)) hr = WINCODEC_ERR_UNSUPPORTEDPIXELFORMAT;
+            break;
+        }
+        if (w == 0 || h == 0 || w > UINT32_MAX / 4) { hr = E_INVALIDARG; break; }
+        const UINT stride = w * 4;
+        if (h > UINT32_MAX / stride) { hr = E_INVALIDARG; break; }
+        const UINT byte_count = stride * h;
+        std::vector<uint8_t> bgra(byte_count);
+        for (size_t i = 0; i < byte_count; i += 4) {
+            bgra[i + 0] = rgba[i + 2];
+            bgra[i + 1] = rgba[i + 1];
+            bgra[i + 2] = rgba[i + 0];
+            bgra[i + 3] = rgba[i + 3];
+        }
+        hr = frame->WritePixels(h, stride, byte_count, bgra.data());
+        if (FAILED(hr)) break;
+        hr = frame->Commit();
+        if (FAILED(hr)) break;
+        hr = encoder->Commit();
+        if (FAILED(hr)) break;
+        ok = true;
+    } while (false);
+
+    if (properties) properties->Release();
+    if (frame) frame->Release();
+    if (encoder) encoder->Release();
+    if (stream) stream->Release();
+    if (factory) factory->Release();
+    if (uninitialize) CoUninitialize();
+    if (!ok) {
+        char detail[64];
+        snprintf(detail, sizeof detail, "WIC PNG encode failed (0x%08lx)", (unsigned long)hr);
+        error = detail;
+        std::error_code remove_error;
+        std::filesystem::remove(path, remove_error);
+    }
+    return ok;
+#else
     std::vector<uint8_t> raw;
     raw.reserve((size_t)h * (1 + (size_t)w * 4));
     for (uint32_t y = 0; y < h; y++) {
@@ -127,13 +230,18 @@ bool write_png(const char* path, const uint8_t* rgba, uint32_t w, uint32_t h,
     if (ferror(f)) {
         error = std::string("write failed: ") + strerror(errno);
         fclose(f);
+        std::error_code remove_error;
+        std::filesystem::remove(path, remove_error);
         return false;
     }
     if (fclose(f) != 0) {
         error = std::string("close failed: ") + strerror(errno);
+        std::error_code remove_error;
+        std::filesystem::remove(path, remove_error);
         return false;
     }
     return true;
+#endif
 }
 
 } // namespace
@@ -259,35 +367,41 @@ int main(int argc, char** argv) {
 
     // Run-start timestamp shared by every screenshot in this run, so a run groups when sorted.
     char ts[32];
-    { time_t t = time(nullptr); struct tm tmv; localtime_r(&t, &tmv); strftime(ts, sizeof ts, "%Y%m%d-%H%M%S", &tmv); }
+    { time_t t = time(nullptr); struct tm tmv;
+#ifdef _WIN32
+      localtime_s(&tmv, &t);
+#else
+      localtime_r(&t, &tmv);
+#endif
+      strftime(ts, sizeof ts, "%Y%m%d-%H%M%S", &tmv); }
 
     // Zero-pad the index to the width of the largest index (min 2), for correct lexical sort.
     int pad = 2; for (int m = count - 1, d = 1; ; m /= 10, d++) { if (m < 10) { if (d > pad) pad = d; break; } }
 
     // Sane render-frontier defaults (don't override if the caller set them for another title).
-    setenv("PROSPER_GUEST_FS",   "1", 0);
-    setenv("PROSPER_GUEST_ARGS", "-force-gfx-direct", 0);
+    set_environment("PROSPER_GUEST_FS",   "1", false);
+    set_environment("PROSPER_GUEST_ARGS", "-force-gfx-direct", false);
     if (warmup_seconds_set) {
         char delay_ms[32];
         snprintf(delay_ms, sizeof delay_ms, "%lld",
                  (long long)(warmup_seconds * 1000.0 + 0.5));
-        setenv("PROSPER_RENDER_DELAY_MS", delay_ms, 1);
+        set_environment("PROSPER_RENDER_DELAY_MS", delay_ms, true);
     }
     if (warmup_submits_set) {
         char first_submit[32];
         snprintf(first_submit, sizeof first_submit, "%d", warmup_submits);
-        setenv("PROSPER_RENDER_FIRST", first_submit, 1);
+        set_environment("PROSPER_RENDER_FIRST", first_submit, true);
     }
     if (render_every_arg > 0) {
         char cadence[32];
         snprintf(cadence, sizeof cadence, "%d", render_every_arg);
-        setenv("PROSPER_RENDER_EVERY", cadence, 1);
+        set_environment("PROSPER_RENDER_EVERY", cadence, true);
     }
     if (render_every_for_seconds > 0) {
         char duration_ms[32];
         snprintf(duration_ms, sizeof duration_ms, "%lld",
                  (long long)(render_every_for_seconds * 1000.0 + 0.5));
-        setenv("PROSPER_RENDER_EVERY_FOR_MS", duration_ms, 1);
+        set_environment("PROSPER_RENDER_EVERY_FOR_MS", duration_ms, true);
     }
 
     const int64_t render_delay_ms = getenv("PROSPER_RENDER_DELAY_MS")
@@ -427,9 +541,7 @@ int main(int argc, char** argv) {
                     const std::string fn = filename.str();
                     std::string png_error;
                     if (write_png(fn.c_str(), snap.rgba.data(), snap.width, snap.height, png_error)) {
-                        const uint32_t pixel_crc = static_cast<uint32_t>(crc32(
-                            0, reinterpret_cast<const Bytef*>(snap.rgba.data()),
-                            static_cast<uInt>(snap.rgba.size())));
+                        const uint32_t pixel_crc = crc32_bytes(snap.rgba.data(), snap.rgba.size());
                         screenshot::CaptureObservation observation;
                         observation.source = snap_rendered ? screenshot::CaptureSource::Rendered
                                                            : screenshot::CaptureSource::RawScanout;

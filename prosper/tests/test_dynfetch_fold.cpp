@@ -22,6 +22,11 @@ static int fails = 0;
 int main() {
     printf("== test_dynfetch_fold ==\n");
 
+    uint32_t readable_probe = 0;
+    CHECK(!guest_readable(0, sizeof(uint32_t)), "null guest address is not readable");
+    CHECK(guest_readable((uint64_t)(uintptr_t)&readable_probe, sizeof(readable_probe)),
+          "mapped host/guest address is readable");
+
     // Kernel 1: negative INLINE INT src0 sign-extends to 64 bits.
     //   s_mov_b32 s8, 0x1000 | s_mov_b32 s9, 0 | s_mov_b32 s10, 64
     //   s_bfe_u64 s[12:13], -1, 0x80028      ; bits [47:40] of 0xFFFF..FF = 0xFF (hi dword all-ones)

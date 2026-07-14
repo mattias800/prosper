@@ -13,12 +13,16 @@ partial early output instead of waiting indefinitely for a Vulkan draw.
 
 ## Build
 
-Built automatically wherever Vulkan + zlib are available (same block as `boot_trace`):
+Built automatically with the live Vulkan renderer. Unix uses zlib; native Windows uses the built-in
+Windows Imaging Component PNG encoder and needs no zlib package:
 
 ```bash
 cmake -S prosper -B build -DPROSPER_APP=ON      # or any config that finds Vulkan
 cmake --build build --target screenshot
 ```
+
+The executable is `screenshot.exe` in a native Windows build. Commands and environment variables are
+otherwise identical in PowerShell; use `$env:NAME = 'value'` to set each variable.
 
 ## Usage
 

@@ -100,7 +100,7 @@ prosper/
   src/self/        SELF/ELF parsing → relocatable module image
   src/loader/      multi-module linker + global export table
   src/hle/         HLE of Sony libraries (libc, libkernel, AGC/graphics, services), NID hashing
-  src/host/        host execution: image mapping, stubs, fault handling (Linux)
+  src/host/        host execution: per-platform image mapping, ABI stubs, fault handling
   src/gpu/         AGC→Vulkan: PM4 decode, command processor, render state, vk_translate,
                    texture tiling + BC decode, RDNA2→SPIR-V recompiler
   frontends/       shared boot+render core, windowed prosper-app, SDL3 audio/dialog, controllers

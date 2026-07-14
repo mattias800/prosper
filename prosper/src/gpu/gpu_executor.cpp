@@ -19,7 +19,9 @@
 #include <set>
 #include <vector>
 #include <unordered_map>
-#ifndef _WIN32
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <unistd.h>
 #endif
@@ -58,9 +60,10 @@ bool g_dyntrace_force = false;
 // so the old probe reported EVERY address >= 0x1000 "readable" and all guards built on it were
 // no-ops (verified empirically on this project's WSL kernel). A pipe write actually imports the
 // user pages and returns EFAULT for unmapped memory. Readability is page-granular: probe one byte
-// in each page the range touches, draining after every write so the pipe can never fill. Always-
-// true on Windows (the const-eval only runs on the live-render path, which is Linux; tests never
-// pass wild addresses).
+// in each page the range touches, draining after every write so the pipe can never fill. Windows
+// uses VirtualQuery for the same guard. Dynamic fetch resolution now runs in the native
+// live renderer too, so an always-true probe turns a guest null descriptor-table pointer into a
+// host access violation (#688).
 #ifndef _WIN32
 static int g_probe_pipe[2] = {-1, -1};
 // One-time pipe creation via a C++11 magic static (thread-safe). guest_readable is shared with
@@ -98,7 +101,24 @@ bool guest_readable(uint64_t a, uint32_t n) {
     return true;
 }
 #else
-bool guest_readable(uint64_t, uint32_t) { return true; }
+bool guest_readable(uint64_t a, uint32_t n) {
+    if (a < 0x1000 || n == 0 || a + n < a) return false;
+    const uint64_t end = a + n;
+    uint64_t cursor = a;
+    while (cursor < end) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery((const void*)(uintptr_t)cursor, &mbi, sizeof(mbi))) return false;
+        const DWORD blocked = PAGE_NOACCESS | PAGE_GUARD;
+        if (mbi.State != MEM_COMMIT || (mbi.Protect & blocked)) return false;
+        const DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                               PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        if (!(mbi.Protect & readable)) return false;
+        const uint64_t region_end = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (region_end <= cursor) return false;
+        cursor = std::min(end, region_end);
+    }
+    return true;
+}
 #endif
 
 // --- Bindless-dynamic vertex-fetch resolution (const-fold the scalar setup) ---------------------------

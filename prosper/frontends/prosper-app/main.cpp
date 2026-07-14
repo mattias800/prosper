@@ -18,6 +18,7 @@
 #include "host/exec_image.hpp"         // run_entry
 #include "loader/linker.hpp"           // Program
 #include "input/pad.hpp"               // keyboard -> libScePad (HostPadState / PadBackend)
+#include "pad_overlay.hpp"              // keyboard pad 0 composed over the physical controller backend
 #ifdef PROSPER_HAVE_LIVE_RENDERER
 #include "live_renderer.hpp"           // shared DrawItem->Vulkan compositor (register_live_renderer)
 #endif
@@ -44,11 +45,18 @@
 #include <cmath>
 #include <chrono>
 #include <thread>
-#include <mutex>
 
 using namespace prosper;
 
 namespace {
+
+bool set_environment(const char* name, const char* value) {
+#ifdef _WIN32
+    return _putenv_s(name, value) == 0;
+#else
+    return setenv(name, value, 1) == 0;
+#endif
+}
 
 // ---- tiny Vulkan error helper -----------------------------------------------------------------
 #define VKCHECK(x, msg) do { VkResult _r = (x); if (_r != VK_SUCCESS) { \
@@ -276,22 +284,11 @@ void feed_test_pattern(uint32_t w, uint32_t h, uint64_t frame) {
 
 // ---- keyboard -> virtual DualSense (pad 0) ----------------------------------------------------
 // A controller over WSL passthrough is flaky, so the app maps the keyboard onto the same
-// HostPadState the SDL gamepad backend fills. The event loop snapshots the current key state into
-// g_kb_state (main thread); the guest's scePadReadState reads it through this backend (guest thread).
-std::mutex g_kb_mx;
-prosper::input::HostPadState g_kb_state;
+// HostPadState the SDL gamepad backend fills. The event loop updates g_keyboard_pad on the main
+// thread; the guest's scePadReadState reads the composed keyboard/physical state on a guest thread.
+prosper::frontend::KeyboardPadOverlay g_keyboard_pad;
 
-struct KeyboardPad : prosper::input::PadBackend {
-    bool poll(int index, prosper::input::HostPadState& out) override {
-        if (index != 0) return false;                 // single virtual pad
-        std::lock_guard<std::mutex> lk(g_kb_mx);
-        out = g_kb_state;
-        return true;
-    }
-};
-KeyboardPad g_keyboard_pad;
-
-// Snapshot the current keyboard into g_kb_state. Call from the thread that pumps SDL events.
+// Snapshot the current keyboard into the overlay. Call from the thread that pumps SDL events.
 void poll_keyboard() {
     using namespace prosper::input;
     const bool* k = SDL_GetKeyboardState(nullptr);
@@ -321,8 +318,7 @@ void poll_keyboard() {
     st.l2 = d(SDL_SCANCODE_Y) ? 255 : 0;
     st.r2 = d(SDL_SCANCODE_H) ? 255 : 0;
     st.connected = true;
-    std::lock_guard<std::mutex> lk(g_kb_mx);
-    g_kb_state = st;
+    g_keyboard_pad.set_keyboard_state(st);
 }
 
 } // namespace
@@ -335,7 +331,12 @@ int main(int argc, char** argv) {
         if (a == "--test-pattern") testPattern = true;
         else if (a == "--frames" && i + 1 < argc) exitAfter = atoi(argv[++i]);   // present N frames then exit (CI/smoke)
         else if (a == "--dump" && i + 1 < argc) dump = argv[++i];                // boot the game at this app0 dir
-        else if (a == "--record" && i + 1 < argc) setenv("PROSPER_PAD_RECORD", argv[++i], 1);
+        else if (a == "--record" && i + 1 < argc) {
+            if (!set_environment("PROSPER_PAD_RECORD", argv[++i])) {
+                fprintf(stderr, "prosper-app: failed to set PROSPER_PAD_RECORD\n");
+                return 2;
+            }
+        }
         else if (a[0] != '-' && dump.empty()) dump = a;                          // positional dump path
     }
 
@@ -360,7 +361,10 @@ int main(int argc, char** argv) {
             prosper::install_sdl3_audio_sink();
 #endif
 #ifdef PROSPER_PAD_SDL3
-            if (prosper::install_sdl3_pad_backend()) fprintf(stderr, "[app] controller backend installed.\n");
+            if (prosper::install_sdl3_pad_backend()) {
+                g_keyboard_pad.set_fallback(prosper::input::pad_backend());
+                fprintf(stderr, "[app] controller backend installed.\n");
+            }
 #endif
 #ifdef PROSPER_HAVE_DIALOG_SDL3
             prosper::install_sdl3_platform_ui();   // real SDL message boxes for MsgDialog/ErrorDialog (#347)
@@ -403,7 +407,7 @@ int main(int argc, char** argv) {
     fprintf(stderr, "[app] window up (%s). Close the window or press Esc to quit.\n",
             testPattern ? "test-pattern" : "waiting for guest frames");
 
-    // Keyboard controls (installed last, so it's the active pad even if the SDL gamepad backend ran).
+    // Keyboard controls augment SDL pad 0; the fallback keeps physical pads and their analog state.
     prosper::input::pad_set_backend(&g_keyboard_pad);
     fprintf(stderr, "[app] keyboard: WASD/Arrows=move  J/Space=Cross(jump)  K=Square(attack)  L=Circle  "
                     "I=Triangle  U/O=L1/R1  Y/H=L2/R2  Enter=Options  Esc=quit\n");

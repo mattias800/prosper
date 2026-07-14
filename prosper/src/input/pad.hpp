@@ -178,8 +178,9 @@ uint32_t pad_script_buttons_at(const std::vector<PadScriptEntry>& script, double
 
 // ---- Pluggable host backend (mirrors AudioSink / audio_set_sink) -------------------------------
 //
-// prosper_core is HEADLESS: it ships a default backend that reports a neutral, disconnected pad, so
-// the HLE contract is fully defined with no dependencies and is unit-testable. A concrete host
+// prosper_core is HEADLESS: it ships a default backend that reports one connected neutral pad, so
+// titles with a controller-presence gate can progress and the HLE contract remains dependency-free
+// and unit-testable. A concrete host
 // backend (SDL3 gamepad, or the zero-dep Linux evdev reader) lives OUTSIDE prosper_core, under
 // frontends/, and installs itself via pad_set_backend() from the harness (boot_trace). This keeps
 // prosper_core free of any host-input / device code, and makes a future libretro core trivial — it
@@ -192,7 +193,7 @@ struct PadBackend {
     virtual bool poll(int index, HostPadState& out) = 0;
 };
 
-// Install a backend. Non-owning; pass nullptr to restore the built-in neutral/disconnected default.
+// Install a backend. Non-owning; pass nullptr to restore the built-in connected-neutral default.
 void pad_set_backend(PadBackend* backend);
 // The active backend (never null — the neutral default is returned when none is installed).
 PadBackend* pad_backend();
