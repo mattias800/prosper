@@ -453,6 +453,27 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 }
                                 rtt_hit = true;
                                 resource_rtt_hit = true;
+                                // PROSPER_DUMP_SAMPLED_RTT (#710/#320): dump the EXACT RTT-layer pixels a
+                                // draw samples, at sample time, so we can see whether an already-rendered
+                                // layer (e.g. the title's menu panel) arrives bright or dark — disambiguates
+                                // "layer rendered dark" from "composite/tint darkens a correct layer". One
+                                // BMP per (sampled addr) into PROSPER_FRAME_DIR.
+                                if (getenv("PROSPER_DUMP_SAMPLED_RTT")) {
+                                    static std::set<uint64_t> seen;
+                                    if (seen.insert(r.gpu_addr).second) {
+                                        size_t nz = 0, rgbnz = 0;
+                                        for (size_t p = 0; p + 3 < texture_pixels.size(); p += 4) {
+                                            if (texture_pixels[p] || texture_pixels[p+1] || texture_pixels[p+2]) rgbnz++;
+                                            for (int k = 0; k < 4; k++) nz += (texture_pixels[p+k] != 0);
+                                        }
+                                        const char* dd = getenv("PROSPER_FRAME_DIR");
+                                        char fn[512]; snprintf(fn, sizeof fn, "%s/sampledrtt_%llx_%ux%u.bmp",
+                                                               dd ? dd : ".", (unsigned long long)r.gpu_addr, tw, th);
+                                        prosper::test::dump_bmp(fn, texture_pixels, tw, th);
+                                        fprintf(stderr, "[sampledrtt] addr=0x%llx %ux%u rgb_nonblack=%zu/%u -> %s\n",
+                                                (unsigned long long)r.gpu_addr, tw, th, rgbnz, tw*th, fn);
+                                    }
+                                }
                             }
                             if (getenv("PROSPER_RTTLOG"))
                                 fprintf(stderr, "[rtt] sample tex addr=0x%llx %ux%u fmt=%u -> %s (cache_size=%zu)\n",
