@@ -18,7 +18,7 @@
       "min_content_match_ratio": 0.75,
       "dims": [480, 270],
       "review": "pending",
-      "_note": "Provisional presented-frame guard for The Messenger's first-level scene. Valid palette-rendered screenshots contain only 27-39 visible RGB colors, proving the previous 5000-color threshold measured the wrong source. Baseline approval is blocked because inspected runs also contain cyclic incomplete compositions tracked by #720."
+      "_note": "Provisional presented-frame guard for The Messenger's first-level scene. Valid palette-rendered screenshots contain only 27-39 visible RGB colors, proving the previous 5000-color threshold measured the wrong source. The retained dialog samples are visually complete, but the baseline remains pending until the route evidence is deliberately reviewed and approved."
     },
     {
       "name": "dead-cells-gameplay",
