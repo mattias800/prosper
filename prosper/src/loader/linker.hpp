@@ -27,7 +27,7 @@ struct Program {
     std::vector<uint64_t>                init_fns; // dependent-module init fns, in call order
     std::vector<TlsTemplate>             tls_templates; // indexed by module TLS id (0 = unused)
     uint64_t entry = 0;                            // main module entry
-    uint64_t stub_base = 0, stub_size = 96;   // 96 leaves room for the gated guest-%fs swap stub (~74 bytes)
+    uint64_t stub_base = 0, stub_size = 96;   // 96 contains the largest guest-%fs swap stub (94 bytes)
 
     // Global export table: NID -> absolute guest address (first definition wins). Retained so the
     // HLE can serve sceKernelDlsym by name (nid_hash(name)) against loaded modules — e.g. resolve

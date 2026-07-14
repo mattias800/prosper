@@ -296,14 +296,14 @@ This is exactly the hard sub-problem flagged above for both Windows and macOS. P
 accesses** — the fault handler already decodes instructions at fault sites (SSE4a), so
 trap-and-emulate of `%fs:` operands is in-house technology.
 
-## Windows port status (2026-07-13) — the guest now BOOTS through module init into guest code
+## Windows port status (2026-07-14) — first GPU fence fixed; IL2CPP init parity is next
 
-The foundation (below) was compile-verified via MinGW-w64; since then a **Windows host has
-runtime-verified the boot**. The guest now links its modules, runs its module-init functions,
-reaches the real entry point, and executes deep guest code — stopping only at the confirmed
-**guest `%fs` TLS wall** (details below). `boot_trace.exe` goes from "crash at the first init fn"
-to a full `RUN ENDED` report. Three runtime bugs were fixed to get here (commits on
-`port/windows-core`):
+The native MinGW build now links and initializes the live Vulkan renderer, boots The Messenger through
+Unity asset loading, emits a correct first GPU fence, and completes SubmitDcb #1. The guest `%fs`,
+threading, positioned-I/O, WaitOnAddress, VEH, and integer ABI foundations below are runtime-verified.
+The current blocker is #673: Windows `il2cpp_init("IL2CPP Root Domain")` returns false, leaving an
+Il2CppClass global null; once the corrected fence releases the render thread, generated code faults on
+that null before SubmitDcb #2. Linux initializes the same path and reaches repeated draw submissions.
 
 - **Direct/flexible-memory HLE ported to Win32** (`hle_kernel_mem.cpp` `#else` block). The pool
   bookkeeping + VA tracker are copied verbatim from POSIX; mappings are backed by private
@@ -376,19 +376,19 @@ thread-safe on a shared fd, full-read loop for the PS5 full-count contract) — 
 also loop now. (`libSceSystemService::mPpPxv5CZt4` = `sceSystemServiceGetHdrToneMapLuminance` is a benign
 HDR stub returning 0, tracked in #664 — not a blocker.)
 
-### Current frontier: the GPU EOP-completion handshake (first rendered frame)
+### GPU stack-argument fence fields — SOLVED (#672); current frontier: IL2CPP initialization (#673)
 
-With #663 + #665 the guest now **streams assets and drives the GPU command stream**: it builds AGC
-command buffers and submits, and the executor decodes real PM4 — including `WriteData`, **`ReleaseMem`
-(EOP label write)** and **`WaitRegMem` (wait-for-memory)**. It then plateaus (no `[render] frame N` yet):
-the guest submits a Dcb and waits (CPU-side `WaitOnAddress`) for that submission's **GPU end-of-pipe
-completion** before building the next frame. Getting the first frame is now a GPU-executor question:
-confirm the Windows executor folds the submitted Dcb and DELIVERS the EOP completion (the label write +
-waking the guest's waiter / the flip-completion equeue event) — the same lost-semaphore/EOP-delivery
-class Linux solved in #236 ("deliver every GPU EOP completion, coalesce=false"). The EOP + vblank pump
-threads are cross-platform `std::thread`s, so the machinery exists; verify it actually fires on Windows
-for the guest's submitted work. Diagnostics: `PROSPER_GFXLOG` (`[gfx]`/`[agc]` PM4 decode), `PROSPER_EVLOG`
-(`[ev]` equeue/flip/EOP events), `PROSPER_SYNCLOG`.
+The EOP machinery was working; the Windows import trampoline dropped guest stack arguments 7-9. AGC's
+ReleaseMem/WaitRegMem handlers then decoded compiler shadow-space garbage as `data_sel`, `data`,
+`reference`, and `mask`, making the first fence impossible to satisfy. The trampoline now forwards those
+arguments into the standard Microsoft-x64 call slots, Linux's guest-FS stub forwards the same three args,
+and fixed-arity AGC handlers use explicit parameters instead of `__builtin_frame_address` offsets.
+
+Native validation now matches Linux exactly: `ReleaseMem data_sel=2 data=1`, followed by
+`WaitRegMem ref=1 mask=ffffffff`; the `NOT satisfied` message is gone and SubmitDcb #1 completes. Five
+Windows runs then fail consistently at `Il2cpp+0x17d64b` because `il2cpp_init` had already returned false
+and an Il2CppClass global at `Il2cpp+0x268c878` is null. That distinct initialization-parity problem is
+tracked in #673; do not mask the null or reopen the solved fence-field investigation.
 
 (Historical, pre-fix diagnosis retained below for context.)
 
@@ -450,35 +450,28 @@ granularity); and `PROSPER_CRASHPEEK` guards.
   `__attribute__((sysv_abi))` on handlers. The attribute route was tried and **abandoned**: on MinGW
   it conflicts with SEH-based C++ exception unwinding (`.seh_handlerdata used outside of .seh_proc
   block`) and cannot be applied to 537 STL-using handlers. Instead `emit_impl` emits a trampoline that
-  converts the guest's SysV integer args (`rdi rsi rdx rcx r8 r9`) to MS x64 (`rcx rdx r8 r9`,
-  `[rsp+0x20]`, `[rsp+0x28]`, +32B shadow, 16-aligned call) before calling the handler, which stays a
-  plain MS-x64 C++ function. Byte encoding disassembly-verified; the register-move ordering is
-  clobber-safe by construction. `PROSPER_SYSV_ABI` (dispatch.hpp) is now an empty documented marker.
+  converts guest SysV args 1-9 (`rdi rsi rdx rcx r8 r9` plus three guest-stack words) to MS x64
+  (`rcx rdx r8 r9`, stack args 5-9, +32B shadow, aligned call) before calling the handler, which stays a
+  plain MS-x64 C++ function. `test_hle_stack_args` executes the generated stub and verifies every arg,
+  the return value, and handler-entry alignment; `test_agc_submit` pins the real first-fence fields.
 - `guest_tls.cpp` Windows path (guest `%fs` TLS now IMPLEMENTED via FSGSBASE — see above),
   `boot_program.cpp` enabled on Windows, `boot_trace` built on Windows (no evdev/Vulkan), CI
   `Windows MinGW` job builds the whole boot path.
 
 **What is left (runtime work, on a Windows host):**
-1. **The Unity GC-helper init handshake — the current frontier.** The renderer is wired (#655) but the
-   guest deadlocks EARLY: it creates only 2 `AssetGarbageCollectorHelper` threads (Linux creates 40+ incl.
-   Job.Workers/PreloadManager/GfxFlipThread and renders 330 frames), then all 3 guest threads park in
-   `sceKernelWaitOnAddress`. The helper (`eboot+0xbfbac0`) runs but never signals the main thread ready.
-   Trace the helper's Windows-vs-Linux divergence (see "the Windows frontier" above) so main advances.
-2. ~~Port the direct/flexible-memory HLE~~ — **DONE** (private-`VirtualAlloc`; phys-aliasing deferred,
-   only needed by UE4 MallocBinned3, not this Unity title).
-3. ~~Guest `%fs` TLS~~ — **DONE** (FSGSBASE + VEH re-apply).
-4. ~~Guest allocator lazy-commit + worker-thread ABI/%fs TLS~~ — **DONE** (#628).
-5. ~~Wire the Vulkan renderer on Windows~~ — **DONE** (#655: builds + initializes).
-6. ~~Reserve alignment > 64 KiB + worker-thread stack registration~~ — **DONE** (#658).
-7. **Validate/repair the guest→HLE ABI trampoline for XMM/float args.** Integer args are converted
+1. **Restore IL2CPP initialization parity (#673), the current frontier.** Identify the cross-module
+   `il2cpp_init` binding at eboot GOT `+0x2031d10`, compare its return path and required globals with
+   Linux, and make `Il2cpp+0x268c878` valid before use. Do not patch around the null class.
+2. **Preserve physical-offset aliasing in the Windows memory HLE.** Private `VirtualAlloc` is sufficient
+   for Unity, but UE4 MallocBinned3 needs shared backing (`CreateFileMapping`/`MapViewOfFile3`) while
+   respecting Windows' 64 KiB allocation granularity.
+3. **Validate/repair the guest→HLE ABI trampoline for XMM/float args.** Integer args 1-9 are converted
    and now runtime-exercised through init; **XMM/float args are still not converted** (e.g. some libc
    formatters / `printf`-family) — add float-arg conversion when a title needs it.
-8. **VEH recovery hardening for stack-overflow faults** — recovery resumes on the faulting thread's
-   current stack; a true stack-overflow fault still needs a guard-page/dedicated-stack story (Linux
-   uses `sigaltstack`). The `__builtin_longjmp` change fixed the cross-frame-unwind crash; this is the
-   separate genuine-overflow case. Also: `PROSPER_CRASHPEEK` faults on Windows (the IL2CPP klass
-   walker needs the same `guest_readable` guards the Linux path has).
-9. **Audit the 103 `(HleFn)`-cast handlers** — almost all cast targets are `HLE()`-defined handlers
+4. **VEH recovery hardening for genuine stack-overflow faults.** #633 added a tested assembly recovery
+   entry with valid Microsoft-x64 shadow space/alignment, but a truly exhausted guest stack still needs
+   a guard-page/dedicated-stack story (Linux uses `sigaltstack`).
+5. **Audit the `(HleFn)`-cast handlers** — almost all cast targets are `HLE()`-defined handlers
    and so route correctly through the trampoline, but confirm none are raw host functions relying on
    host-ABI arg passing.
 

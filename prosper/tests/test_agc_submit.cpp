@@ -27,6 +27,8 @@ struct Dcb {
 };
 // The AgcDriver submit descriptor (Kyty Gen5Driver::Packet).
 struct Packet { uint32_t* addr; uint32_t dw_num; uint8_t pad[4]; };
+using HostHle9 = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                              uint64_t, uint64_t, uint64_t, uint64_t);
 
 int main() {
     printf("== test_agc_submit ==\n");
@@ -39,9 +41,13 @@ int main() {
     auto submit = Hle::lookup("UglJIZjGssM");   // GraphicsDriverSubmitDcb
     auto regmem = Hle::lookup("AOLcoIkQDgM");   // QueryResourceRegistrationUserMemoryRequirements
     auto maxname = Hle::lookup("uJziRsODk1c");   // sceAgcDriverGetResourceRegistrationMaxNameLength
-    CHECK(reset && setcx && setidx && draw && submit && regmem && maxname,
+    auto release = reinterpret_cast<HostHle9>(Hle::lookup("wr23dPKyWc0")); // GraphicsCbReleaseMem
+    auto waitmem = reinterpret_cast<HostHle9>(Hle::lookup("VmW0Tdpy420")); // GraphicsDcbWaitRegMem
+    CHECK(reset && setcx && setidx && draw && submit && regmem && maxname && release && waitmem,
           "AGC Dcb, submit, and resource-registration functions registered");
-    if (!(reset && setcx && setidx && draw && submit && regmem && maxname)) { printf("== FAIL ==\n"); return 1; }
+    if (!(reset && setcx && setidx && draw && submit && regmem && maxname && release && waitmem)) {
+        printf("== FAIL ==\n"); return 1;
+    }
 
     uint64_t registration_bytes = 0x7a2a67fe6900ull;
     CHECK(regmem((uint64_t)(uintptr_t)&registration_bytes, 0x2000, 0x38, 0, 0, 0) == 0,
@@ -104,6 +110,29 @@ int main() {
         CHECK(st.index_type == 1, "folded the index type");
         CHECK(st.draws.size() == 1 && st.draws[0].index_count == 42,
               "recorded one DrawIndexAuto with index_count=42");
+    }
+
+    // Fixed args 7-9 must be real function parameters, not compiler-frame offsets. This is the exact
+    // first-fence field pattern whose missing Windows stack forwarding blocked the render thread (#672).
+    {
+        uint32_t sync_buffer[64] = {};
+        Dcb sync{};
+        sync.bottom = sync_buffer; sync.top = sync_buffer + 64;
+        sync.cursor_up = sync_buffer; sync.cursor_down = sync_buffer + 64;
+        uint64_t label = 0;
+        const uint64_t S = (uint64_t)(uintptr_t)&sync;
+        const uint64_t A = (uint64_t)(uintptr_t)&label;
+        release(S, 0x28, 0, 1, 0, A, 2, 1, 0);
+        waitmem(S, 8, 3, 0, 0, A, 1, 0xffffffffu, 0x20);
+
+        CHECK(sync.cursor_up - sync_buffer == 16, "ReleaseMem + WaitRegMem emitted 7 + 9 dwords");
+        CHECK(sync_buffer[3] == 2 && sync_buffer[4] == 1 && sync_buffer[5] == 0,
+              "ReleaseMem encoded stack args data_sel=2 and data=1");
+        const uint32_t* wait = sync_buffer + 7;
+        CHECK(wait[3] == 0xffffffffu && wait[4] == 0 && wait[5] == 1 && wait[6] == 0,
+              "WaitRegMem encoded stack args mask=0xffffffff and reference=1");
+        CHECK(wait[7] == 3 && wait[8] == 0x20,
+              "WaitRegMem encoded compare function and arg9 poll interval");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }

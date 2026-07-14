@@ -47,6 +47,9 @@ namespace prosper {
 
 #define HLE(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
                                        uint64_t a3, uint64_t a4, uint64_t a5)
+#define HLE9(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
+                                       uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, \
+                                       uint64_t a7, uint64_t a8)
 
 namespace {
 
@@ -356,21 +359,13 @@ HLE(agc_cb_nop) {  // (dcb, num_dwords, ...)
 //    this generation's fence packets are still in flight, and our (faithful) value-1 fence writes
 //    then land in freed MallocBinned3 memory — the #312 "Canary was 0x3, should be 0x1" /
 //    "free an unrecognized block 0x1000000001" / 0x20015f00 freelist-pop fatals.
-// numBytes is stack arg9 — beyond the swap stub's 2-arg re-push window, recovered from the intact
-// original guest frame exactly like agc_driver_submit_dcb_variant's arg9 (validated: the re-pushed
-// args must match the originals and the return address must be guest text; on mismatch numBytes
-// stays 0 and the CommandProcessor skips the packet with a loud log — the pre-fix behavior).
+// numBytes is stack arg9. The import ABI bridge forwards args 7-9 as normal fixed parameters on
+// Windows and on Linux's guest-FS path; no compiler-frame decoding is involved (#672).
 // Custom R_DMA_DATA payload: [1..2]=dst lo/hi, [3..4]=srcOrImm lo/hi, [5]=numBytes, [6]=sels.
 // CONFIDENCE: HIGH on a4=dst/a1=srcOrImm (malloc-destination callsite + patcher names + protocol);
 // MED on the selector args (recorded raw; the executor only honors the small-immediate form).
-HLE(agc_dcb_dma_data) {  // (dcb, srcOrImm, srcSel?, dstSel?, dst, sel/policy, ..., stack9=numBytes)
-    volatile uint64_t* fp = (uint64_t*)__builtin_frame_address(0);
-    uint64_t num_bytes = 0;
-    if (fp[6] == fp[2] && fp[7] == fp[3] &&
-        fp[5] >= 0x400000000ull && fp[5] < 0x500000000ull) {
-        uint64_t n = fp[8];                       // original stack arg9 = byte count
-        if (n && n <= 0x10000000ull) num_bytes = n;
-    }
+HLE9(agc_dcb_dma_data) {  // (dcb, srcOrImm, srcSel?, dstSel?, dst, sel/policy, ..., stack9=numBytes)
+    uint64_t num_bytes = a8 <= 0x10000000ull ? a8 : 0;
     static std::atomic<uint64_t> g_dma_n{0};
     if (getenv("PROSPER_PREDLOG") || getenv("PROSPER_GFXLOG")) {
         uint64_t k = g_dma_n.fetch_add(1);
@@ -390,11 +385,10 @@ HLE(agc_dcb_dma_data) {  // (dcb, srcOrImm, srcSel?, dstSel?, dst, sel/policy, .
 // sceAgcAcbDmaData (-RnpfpxIhec) — the async-compute-queue sibling. Same operation, shifted ABI
 // (RE'd from the Acb consumed-marker emitter at eboot+0x220d31e, which pairs it with the same
 // sceAgcCbReleaseMem(label<-1): (acb, srcSel?=3, dstSel?=3, dst=label, 2, 3, stack7=srcOrImm=0,
-// stack8=numBytes=4). srcOrImm/numBytes are stack args 7/8 = fp[2]/fp[3], INSIDE the swap stub's
-// forwarded window. CONFIDENCE: MED (single callsite; the executor gate limits the blast radius).
-HLE(agc_acb_dma_data) {  // (acb, srcSel?, dstSel?, dst, ?, ?, stack7=srcOrImm, stack8=numBytes)
-    volatile uint64_t* fp = (uint64_t*)__builtin_frame_address(0);
-    uint64_t src_imm = fp[2], num_bytes = fp[3];
+// stack8=numBytes=4). srcOrImm/numBytes are explicit stack args 7/8 after the import bridge.
+// CONFIDENCE: MED (single callsite; the executor gate limits the blast radius).
+HLE9(agc_acb_dma_data) {  // (acb, srcSel?, dstSel?, dst, ?, ?, stack7=srcOrImm, stack8=numBytes)
+    uint64_t src_imm = a6, num_bytes = a7;
     if (num_bytes > 0x10000000ull) num_bytes = 0;
     uint32_t* cmd; if (!begin_packet(a0, 7, IT_NOP, R_DMA_DATA, &cmd)) return 0;
     cmd[1] = (uint32_t)(a3 & 0xffffffffu); cmd[2] = (uint32_t)(a3 >> 32u);
@@ -435,14 +429,10 @@ HLE(agc_dcb_acquire_mem) {  // (buf, engine, cb_db_op, gcr_cntl, ...) — 8 dw
     cmd[1] = (uint32_t)a2; cmd[2] = cmd[3] = cmd[4] = cmd[5] = cmd[6] = 0; cmd[7] = (uint32_t)a3;
     return (uint64_t)(uintptr_t)cmd;
 }
-HLE(agc_cb_release_mem) {  // sceAgcCbReleaseMem(buf, action, gcr_cntl, dst, cache_policy, address, data_sel, data, …)
+HLE9(agc_cb_release_mem) {  // sceAgcCbReleaseMem(buf, action, gcr_cntl, dst, cache_policy, address, data_sel, data, …)
     // ABI pinned to Kyty GraphicsCbReleaseMem (Graphics.cpp:1763): a5=label address, then the two stack
-    // args are data_sel (7th) and the 64-bit fence value (8th). SysV: fp[1]=ret, fp[2]=data_sel, fp[3]=data.
-    // Valid under BOTH stub shapes: the guest-%fs swap stub forwards the first two stack args
-    // (exec_image_linux.cpp emit_swap_stub) — previously fp[2]/fp[3] were the saved guest-fs base and
-    // guest return address there, so every fence under PROSPER_GUEST_FS was written with garbage.
-    volatile uint64_t* fp = (uint64_t*)__builtin_frame_address(0);
-    uint64_t data_sel = fp[2], data = fp[3];
+    // args are data_sel (7th) and the 64-bit fence value (8th), forwarded as a6/a7 by the import bridge.
+    uint64_t data_sel = a6, data = a7;
     if (getenv("PROSPER_GFXLOG"))
         fprintf(stderr, "[agc] ReleaseMem action=0x%llx dst=0x%llx addr=0x%llx data_sel=0x%llx data=0x%llx\n",
             (unsigned long long)a1,(unsigned long long)a3,(unsigned long long)a5,
@@ -478,9 +468,11 @@ HLE(agc_cb_release_mem) {  // sceAgcCbReleaseMem(buf, action, gcr_cntl, dst, cac
 #endif
         static std::atomic<int> seen_n{0};
         static uint64_t seen_ra[16];
+        // Diagnostic-only stack scan for guest callsite attribution. ABI arguments never come from it.
+        volatile uint64_t* stack_scan = (uint64_t*)__builtin_frame_address(0);
         uint64_t ra = 0, ra2 = 0, ra3 = 0;
         for (int i = 1; i < 96; i++) {
-            uint64_t v = fp[i];
+            uint64_t v = stack_scan[i];
             if (v >= 0x400000000ull && v < 0x4c0000000ull) {
                 if (!ra) ra = v; else if (!ra2) ra2 = v; else { ra3 = v; break; }
             }
@@ -544,16 +536,14 @@ HLE(agc_dcb_write_data) {  // sceAgcDcbWriteData(buf, dst, cache_policy, address
     if (num <= 4) prosper_fence_journal_record((uint64_t)(uintptr_t)cmd, a3);   // #312 discriminator
     return (uint64_t)(uintptr_t)cmd;
 }
-HLE(agc_dcb_wait_reg_mem) {  // sceAgcDcbWaitRegMem(buf, size, compare_func, op, cache_policy, address, reference, mask, poll_cycles)
+HLE9(agc_dcb_wait_reg_mem) {  // sceAgcDcbWaitRegMem(buf, size, compare_func, op, cache_policy, address, reference, mask, poll_cycles)
     // ABI pinned to Kyty GraphicsDcbWaitRegMem (Graphics.cpp:2096): a5 = label address; the 7th/8th
-    // args (reference, mask) are STACK args, readable at fp[2]/fp[3] under both stub shapes (the
-    // guest-%fs swap stub forwards two stack args). poll_cycles (9th) is beyond the forwarded
-    // window and is only a poll-interval hint — encode 0. The payload previously ZEROED every
+    // stack args reference, mask, and poll_cycles are forwarded as a6/a7/a8 by the import bridge.
+    // The payload previously ZEROED every
     // wait parameter at build time (address/ref/mask/function destroyed — the wait could never be
     // honored downstream); now it mirrors Kyty's layout exactly:
     // [1..2]=addr lo/hi, [3..4]=mask lo/hi, [5..6]=reference lo/hi, [7]=compare_function, [8]=interval.
-    volatile uint64_t* fp = (uint64_t*)__builtin_frame_address(0);
-    uint64_t reference = fp[2], mask = fp[3];
+    uint64_t reference = a6, mask = a7;
     if (getenv("PROSPER_GFXLOG"))
         fprintf(stderr, "[agc] WaitRegMem size=%llu func=%llu op=%llu addr=0x%llx ref=0x%llx mask=0x%llx\n",
             (unsigned long long)a1,(unsigned long long)a2,(unsigned long long)a3,
@@ -563,7 +553,7 @@ HLE(agc_dcb_wait_reg_mem) {  // sceAgcDcbWaitRegMem(buf, size, compare_func, op,
     cmd[3] = (uint32_t)(mask & 0xffffffffu);      cmd[4] = (uint32_t)(mask >> 32u);
     cmd[5] = (uint32_t)(reference & 0xffffffffu); cmd[6] = (uint32_t)(reference >> 32u);
     cmd[7] = (uint32_t)a2;                        // compare_function
-    cmd[8] = 0;                                   // poll interval hint (arg9 not forwarded; unused by our fold)
+    cmd[8] = (uint32_t)a8;                        // poll interval hint
     prosper_fence_journal_record((uint64_t)(uintptr_t)cmd, a5);   // #312 discriminator (wait leg)
     prosper_label_hist_wait_built(a5, a0);                        // #312 protocol history
     return (uint64_t)(uintptr_t)cmd;
@@ -1181,19 +1171,9 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
 //
 // ABI (RE'd from the compiler-generated adapter thunk at eboot+0x58df3f0, which marshals DOLL's
 // internal call at eboot+0x220aace into the Sony import): the raw Dcb dword-stream address arrives as
-// stack arg8, which the guest-%fs swap stub forwards to fp[3] (the same slot ReleaseMem/WaitRegMem read
-// their 8th arg from). The dword COUNT is stack arg9: the callsite loads the buffer-array entry
+// stack arg8, forwarded as a7 by the import ABI bridge. The dword COUNT is stack arg9: the callsite loads the buffer-array entry
 // {addr @+0x00, dw_count32 @+0x10} (`mov 0x10(%rax,%r12,1),%r10d`) and the adapter pushes it as the
 // import's 9th arg (32-bit, matching Packet.dw_num on the primary UglJIZjGssM path).
-//
-// arg9 is beyond the swap stub's 2-arg re-push window, but the ORIGINAL guest stack frame is still
-// intact above the stub's pushes. Guest-path stub frame at handler entry ([rsp] up):
-//   ret-to-stub, arg7-copy, arg8-copy, saved-r11(guest fs), ret-to-guest, orig-arg7, orig-arg8, orig-arg9
-// i.e. with the handler's rbp frame: fp[2]=arg7, fp[3]=arg8, fp[4]=saved r11, fp[5]=ret-to-guest,
-// fp[6]=orig arg7, fp[7]=orig arg8, fp[8]=orig arg9. We take arg9 from fp[8] ONLY after validating the
-// frame shape (fp[7]==fp[3] — the re-pushed arg8 must equal the original — and fp[5] must return into
-// guest code): a mismatch means a different stub layout (host path / future stub change), and we fall
-// back to the self-terminating fold rather than trust a garbage count.
 //
 // WHY the exact count matters (#241 and the boot crash-zoo): the Dcb is carved from a live ring whose
 // STALE tail is still valid type-3 PM4 from previous frames. An unknown-length fold does not stop at
@@ -1202,15 +1182,14 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
 // into live allocator state (the deterministic 0x20015f00 free-list node of issue #241, the libc.prx
 // logger stack-smash) — intermittent because it depends on what got reallocated under the stale fences.
 // CONFIDENCE: HIGH on the arg9=count ABI (callsite + adapter disassembly agree, and the count matches
-// the primary path's Packet.dw_num field offset); the validated-frame walk falls back safely.
-HLE(agc_driver_submit_dcb_variant) {
+// the primary path's Packet.dw_num field offset).
+HLE9(agc_driver_submit_dcb_variant) {
     auto is_pm4 = [](uint64_t p) -> bool {
         if (p < 0x10000 || (p & 3)) return false;
         uint32_t h = *(const volatile uint32_t*)(uintptr_t)p;
         return (h & 0xC0000000u) == 0xC0000000u;
     };
-    volatile uint64_t* fp = (uint64_t*)__builtin_frame_address(0);
-    uint64_t cand = fp[3];                                  // arg8 = the Dcb stream address (adapter ABI)
+    uint64_t cand = a7;                                     // arg8 = the Dcb stream address (adapter ABI)
     if (!is_pm4(cand)) {                                    // fallback: scan the register args
         const uint64_t regs[6] = { a0, a1, a2, a3, a4, a5 };
         cand = 0;
@@ -1219,24 +1198,16 @@ HLE(agc_driver_submit_dcb_variant) {
     if (!cand) {
         static std::atomic<int> logged{0};
         if (logged.fetch_add(1) < 4)
-            fprintf(stderr, "[agc] w1KFAHVqpaU: no PM4 stream found (fp[3]=0x%llx a0=0x%llx a1=0x%llx) — submit refused\n",
-                    (unsigned long long)fp[3], (unsigned long long)a0, (unsigned long long)a1);
+            fprintf(stderr, "[agc] w1KFAHVqpaU: no PM4 stream found (arg8=0x%llx a0=0x%llx a1=0x%llx) — submit refused\n",
+                    (unsigned long long)a7, (unsigned long long)a0, (unsigned long long)a1);
         return 0;
     }
-    // Recover the true dword count (arg9) from the original guest frame, validated as described above.
-    // Guest code range for the return-address check: main image at 0x400000000 (see classify_addr).
-    uint32_t dw_num = 0;
-    if (cand == fp[3] && fp[7] == fp[3] &&
-        fp[5] >= 0x400000000ull && fp[5] < 0x500000000ull) {
-        uint64_t n = fp[8];
-        if (n && n <= 0x400000ull)                          // plausible: bounded by any real ring size
-            dw_num = (uint32_t)n;
-    }
+    uint32_t dw_num = a8 && a8 <= 0x400000ull ? (uint32_t)a8 : 0;
     if (!dw_num) {
         static std::atomic<int> logged9{0};
         if (logged9.fetch_add(1) < 4)
-            fprintf(stderr, "[agc] w1KFAHVqpaU: arg9 count unavailable (fp[5]=0x%llx fp[7]=0x%llx fp[8]=0x%llx) — self-terminating fold\n",
-                    (unsigned long long)fp[5], (unsigned long long)fp[7], (unsigned long long)fp[8]);
+            fprintf(stderr, "[agc] w1KFAHVqpaU: invalid arg9 count 0x%llx — self-terminating fold\n",
+                    (unsigned long long)a8);
     }
     return submit_dcb_stream((const uint32_t*)(uintptr_t)cand, dw_num, "SubmitDcbFinal");
 }

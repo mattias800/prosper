@@ -1,9 +1,10 @@
 # Windows native port — handoff (2026-07-14)
 
-The Windows native core boots The Messenger (`PPSA24651`) through the entire OS/runtime/asset/sync
-layer and drives the GPU pipeline; it wedges just before the **first draw command buffer** on a
-**GPU-fence field-decode bug**. This doc hands off that exact next step, with the evidence, a strong
-root-cause lead, and the full build/run/diagnose recipe. Companion: `docs/PORTING.md` ("Windows").
+The Windows native core boots The Messenger (`PPSA24651`) through the OS/runtime/asset/sync layer and
+drives the GPU pipeline. The GPU-fence field bug documented below was fixed in #672: native validation
+now matches Linux and SubmitDcb #1 completes. The newly exposed blocker is #673: `il2cpp_init` returns
+false on Windows, leaving a generated-code class global null before SubmitDcb #2. Companion:
+`docs/PORTING.md` ("Windows").
 
 ## What works today (merged to master)
 
@@ -31,7 +32,7 @@ Merged PRs that got it here (all `#ifdef _WIN32` — Linux/macOS unaffected, CI 
   (was a no-op on Windows) + native wait registers `futex_wait_enter/exit`.
 - **#664** HDR support tracking issue (benign `sceSystemServiceGetHdrToneMapLuminance` stub).
 
-## The current blocker: GPU fence fields are garbage on Windows
+## Resolved blocker (#672): GPU fence fields were garbage on Windows
 
 The guest submits SubmitDcb #1 (a **sync-only** Dcb, 0 draws) and then wedges before submitting the
 first **draw** Dcb. The executor logs:
@@ -54,7 +55,7 @@ On Linux `data_sel=0x2, data=0x1, mask=0xffffffff` (a normal "write 1, wait for 
 writes the wrong value / the wait can never be satisfied → the guest's render thread never proceeds to
 draws. **Rendering is gated entirely on decoding these fence fields correctly.**
 
-### Strong root-cause lead: stack-argument ABI in HLE handlers (args 7+)
+### Confirmed root cause: stack-argument ABI in HLE handlers (args 7+)
 
 The fence builders read their high arguments off the stack via `__builtin_frame_address(0)`:
 
@@ -78,24 +79,17 @@ entry), but for the **guest→host** direction and specifically for **stack-pass
 registers**. The 6 register args are converted correctly by the stub (that's why everything else works);
 only handlers that reach past arg 6 into the guest stack are affected.
 
-### Suggested fix directions (pick one; verify against the Linux field values above)
+### Implemented fix and validation
 
-1. **Forward the guest stack args in the stub, at a known offset.** Extend `emit_sysv_to_ms_prologue`/
-   `emit_impl` so the guest's stack args 7,8 (at the guest `[rsp+8]`,`[rsp+16]` on entry to the stub) are
-   copied to a fixed, handler-discoverable location, and give the `_WIN32` handlers a small accessor
-   (e.g. `guest_stack_arg(n)`) that reads them from there instead of `__builtin_frame_address`. Cleanest;
-   fixes all such handlers at once.
-2. **Windows-specific `fp[]` offset** in each affected handler: work out the constant delta the stub
-   frame adds (stub does `sub rsp,0x38` then `call` pushes 8 → the guest return address sits at a fixed
-   offset above the handler frame; the guest stack args are `+8`/`+16` from there). Add
-   `#ifdef _WIN32` offsets to `agc_cb_release_mem`, `agc_acb_dma_data`, and any WaitRegMem builder.
-   Quicker but per-handler and brittle.
-3. Confirm which handler builds the WaitRegMem `mask`/`func`/`ref` (grep `R_WAIT_REG_MEM` / the
-   `WaitRegMem` builder in `hle_agc.cpp`) and check whether IT also reads stack args.
+`emit_impl` now copies guest stack args 7-9 into the standard Microsoft-x64 outgoing argument slots;
+Linux's guest-FS swap stub re-pushes the same three arguments with valid SysV alignment. Fixed-arity AGC
+handlers take explicit args 7-9 instead of decoding compiler frames. `test_hle_stack_args` calls a real
+generated stub with nine sentinels and checks alignment/return value; `test_agc_submit` checks the actual
+ReleaseMem/WaitRegMem packet fields.
 
-Validation: with any fix, the Windows first fence pair must read `data_sel=0x2 data=0x1 mask=0xffffffff`
-(matching Linux), the `NOT satisfied` log must disappear, and `SubmitDcb #2: executed N draws ->
-presented 1920x1080 frame` should appear (with BMPs in `PROSPER_FRAME_DIR`).
+Native runtime validation: `data_sel=2 data=1`, `ref=1 mask=ffffffff`, no `NOT satisfied`, SubmitDcb #1
+completes. Five repeat runs then expose #673 at `Il2cpp+0x17d64b` before SubmitDcb #2; the next work is
+initialization parity, not further fence decoding.
 
 ## Build + run + diagnose (native Windows, MinGW)
 

@@ -123,16 +123,22 @@ namespace {
 
     // Import-stub machine code. Unlike Linux (where host ABI == guest SysV, so the stub is a bare
     // tail-jump with args intact), Windows handlers are Microsoft x64, so the stub is a TRAMPOLINE
-    // that converts the guest's SysV integer-arg registers to MS x64 before calling the handler:
-    //   SysV in:  rdi rsi rdx rcx r8 r9        (args a0..a5)
-    //   MS out:   rcx rdx r8  r9  [rsp+0x20] [rsp+0x28]  (+32B shadow space, 16-byte aligned call)
+    // that converts the guest's SysV integer arguments to MS x64 before calling the handler:
+    //   SysV in: rdi rsi rdx rcx r8 r9 [guest rsp+8] [guest rsp+16] [guest rsp+24] (a0..a8)
+    //   MS out:  rcx rdx r8 r9 [rsp+20]...[rsp+40] (+32B shadow, stack args a4..a8)
     // Return value is rax in both ABIs. This handles integer/pointer args (the whole HleFn surface);
     // XMM/float args (e.g. some libc formatters) are NOT converted yet — see docs/PORTING.md.
-    // The move ordering is chosen so no source register is clobbered before it is read (verified by
-    // hand). CONFIDENCE: MED (design verified on paper; not yet runtime-tested on Windows).
+    // The 0x48-byte outgoing area is 8 mod 16, so a normally-entered stub (RSP%16==8) has the required
+    // RSP%16==0 at its handler call site. The ABI conformance test verifies args 1-9 and alignment.
     size_t emit_sysv_to_ms_prologue(uint8_t* p) {
         static const uint8_t seq[] = {
-            0x48,0x83,0xEC,0x38,              // sub rsp,0x38   (0x20 shadow + a4/a5 + align: call rsp%16==0)
+            0x48,0x83,0xEC,0x48,              // sub rsp,0x48   (shadow + a4..a8; call rsp%16==0)
+            0x48,0x8B,0x44,0x24,0x50,         // mov rax,[rsp+0x50]   ; guest a6 at original rsp+8
+            0x48,0x89,0x44,0x24,0x30,         // mov [rsp+0x30],rax  ; MS 7th arg = a6
+            0x48,0x8B,0x44,0x24,0x58,         // mov rax,[rsp+0x58]   ; guest a7 at original rsp+16
+            0x48,0x89,0x44,0x24,0x38,         // mov [rsp+0x38],rax  ; MS 8th arg = a7
+            0x48,0x8B,0x44,0x24,0x60,         // mov rax,[rsp+0x60]   ; guest a8 at original rsp+24
+            0x48,0x89,0x44,0x24,0x40,         // mov [rsp+0x40],rax  ; MS 9th arg = a8
             0x4C,0x89,0x44,0x24,0x20,         // mov [rsp+0x20],r8    ; MS 5th arg = a4
             0x4C,0x89,0x4C,0x24,0x28,         // mov [rsp+0x28],r9    ; MS 6th arg = a5
             0x49,0x89,0xC9,                   // mov r9,rcx           ; MS 4th = a3  (save before rcx clobbered)
@@ -146,7 +152,7 @@ namespace {
         size_t o = emit_sysv_to_ms_prologue(p);
         p[o++] = 0x48; p[o++] = 0xB8; memcpy(p + o, &fn, 8); o += 8;   // movabs rax,fn
         p[o++] = 0xFF; p[o++] = 0xD0;                                  // call rax
-        p[o++] = 0x48; p[o++] = 0x83; p[o++] = 0xC4; p[o++] = 0x38;    // add rsp,0x38
+        p[o++] = 0x48; p[o++] = 0x83; p[o++] = 0xC4; p[o++] = 0x48;    // add rsp,0x48
         p[o++] = 0xC3;                                                 // ret
     }
     void emit_unimpl(uint8_t* p, uint32_t idx, uint64_t fn) {
@@ -334,7 +340,7 @@ bool map_image(const LoadedImage& img, std::string* err) {
 bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
                    uint64_t stub_size, std::string* err) {
     auto fail = [&](const char* s){ if (err) *err = s; return false; };
-    if (stub_size < 24) return fail("stub_size too small (need >= 24)");
+    if (stub_size < 80) return fail("stub_size too small for Windows ABI bridge (need >= 80)");
     if (!g_nid_db) g_nid_db = new NidDb();
     dispatch_init(&slots, g_nid_db);
 
