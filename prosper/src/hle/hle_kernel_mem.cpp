@@ -1163,6 +1163,9 @@ void register_kernel_mem_hle() {
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00   // Win10: WaitOnAddress/WakeByAddress* need >= 0x0602 (Win8)
+#endif
 #include <windows.h>
 #include <atomic>
 #include <chrono>
@@ -1587,30 +1590,42 @@ HLE(k_wait_on_address) {
                             (unsigned long)GetCurrentThreadId(),
                             (unsigned long long)a0, (unsigned)addr.load(std::memory_order_acquire),
                             (unsigned)expected, (unsigned long long)a2, (unsigned long long)sync_guest_caller());
-    // Honor the guest timeout by default (#142) — the same fix the Linux futex path got (#139).
-    // Previously this global-cv fallback IGNORED the timeout arg and blocked FOREVER while
-    // *addr == expected, returning 0 (=signaled), so a Windows-build timed wait could never take its
-    // timeout branch. Parse *a2 as uint32 microseconds, wait to that deadline, and return SCE
-    // ETIMEDOUT on expiry. PROSPER_NO_WAIT_TIMEOUT restores infinite waits (parity with Linux).
-    // The 32-bit compare is a shared limitation with the Linux FUTEX_WAIT path (WaitOnAddress can
-    // wait on 1/2/4/8-byte values; only 4 is modeled) — unchanged here.
+    // Back this with the NATIVE Win32 futex (WaitOnAddress/WakeByAddress*, Win8+): a true PER-ADDRESS
+    // wait, exactly like the Linux FUTEX_WAIT path. The previous global-`condition_variable` shared one
+    // cv across every waited address, so WakeByAddress(n=1) -> notify_one() could wake a waiter parked
+    // on a DIFFERENT address (it re-checks its own word, finds it unchanged, re-sleeps) while the
+    // intended waiter was never woken — a lost wakeup that made the boot nondeterministically deadlock.
+    // Native WaitOnAddress blocks while *addr == compare and is woken only by WakeByAddress* on THIS
+    // addr, so n=1 semantics are correct and there is no thundering herd. The 32-bit compare is a
+    // shared limitation with the Linux path (WaitOnAddress supports 1/2/4/8-byte; only 4 is modeled).
     static const bool honor_timeout = getenv("PROSPER_NO_WAIT_TIMEOUT") == nullptr;
-    std::unique_lock<std::mutex> lk(g_sync_mx);
+    ULONGLONG deadline = 0;   // 0 = infinite
     if (a2 && honor_timeout) {
         uint32_t us = *(volatile uint32_t*)(uintptr_t)a2;
-        if (us == 0) us = 1;   // 0 == "poll" -> a minimal wait so we re-check
-        auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(us);
-        while (addr.load(std::memory_order_acquire) == expected)
-            if (g_sync_cv.wait_until(lk, deadline) == std::cv_status::timeout &&
-                addr.load(std::memory_order_acquire) == expected) {
+        ULONGLONG ms = us == 0 ? 1 : (ULONGLONG)((us + 999) / 1000);   // us -> ms, round up; 0 == poll
+        deadline = GetTickCount64() + ms;
+    }
+    volatile uint32_t* wa = (volatile uint32_t*)(uintptr_t)a0;
+    while (*wa == expected) {
+        DWORD wait_ms = INFINITE;
+        if (deadline) {
+            ULONGLONG now = GetTickCount64();
+            if (now >= deadline) {
                 if (wsynclog()) fprintf(stderr, "[sync] WAIT.exit  addr=0x%llx TIMEOUT\n", (unsigned long long)a0);
                 return 0x80020060ull;   // SCE_KERNEL_ERROR_ETIMEDOUT
             }
-        if (wsynclog()) fprintf(stderr, "[sync] WAIT.exit  addr=0x%llx woke\n", (unsigned long long)a0);
-        return 0;
+            wait_ms = (DWORD)(deadline - now);
+        }
+        uint32_t cmp = expected;
+        if (!WaitOnAddress(wa, &cmp, sizeof(cmp), wait_ms) && GetLastError() == ERROR_TIMEOUT) {
+            if (*wa == expected) {
+                if (wsynclog()) fprintf(stderr, "[sync] WAIT.exit  addr=0x%llx TIMEOUT\n", (unsigned long long)a0);
+                return 0x80020060ull;
+            }
+        }
+        // else: woken or spurious — loop re-checks *addr
     }
-    while (addr.load(std::memory_order_acquire) == expected) g_sync_cv.wait(lk);
-    if (wsynclog()) fprintf(stderr, "[sync] WAIT.exit  addr=0x%llx woke (untimed)\n", (unsigned long long)a0);
+    if (wsynclog()) fprintf(stderr, "[sync] WAIT.exit  addr=0x%llx woke\n", (unsigned long long)a0);
     return 0;
 }
 
@@ -1619,10 +1634,12 @@ HLE(k_wake_by_address) {
                             (unsigned long)GetCurrentThreadId(),
                             (unsigned long long)a0, a0 ? *(uint32_t*)(uintptr_t)a0 : 0, (long long)a1,
                             (unsigned long long)sync_guest_caller());
-    std::lock_guard<std::mutex> lk(g_sync_mx);
-    int n = a1 ? (int)a1 : INT_MAX;
-    if (n == 1) g_sync_cv.notify_one();
-    else        g_sync_cv.notify_all();
+    if (!a0) return 0;
+    // Native per-address wake: n==1 wakes ONE waiter on THIS address (correct semaphore-release
+    // semantics), otherwise wake all. No lost wakeup and no global thundering herd (unlike the old
+    // single shared condition_variable).
+    if (a1 == 1) WakeByAddressSingle((PVOID)(uintptr_t)a0);
+    else         WakeByAddressAll((PVOID)(uintptr_t)a0);
     return 0;
 }
 
