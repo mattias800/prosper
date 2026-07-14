@@ -1547,6 +1547,7 @@ HLE(k_ampr_ok) { return 0; }
 namespace {
 std::mutex g_sync_mx;
 std::condition_variable g_sync_cv;
+bool wsynclog() { static int v = getenv("PROSPER_SYNCLOG") ? 1 : 0; return v; }
 }
 
 HLE(k_wait_on_address) {
@@ -1554,6 +1555,9 @@ HLE(k_wait_on_address) {
     auto& raw = *(uint32_t*)(uintptr_t)a0;
     std::atomic_ref<uint32_t> addr(raw);
     uint32_t expected = (uint32_t)a1;
+    if (wsynclog()) fprintf(stderr, "[sync] WAIT.enter addr=0x%llx *addr=0x%x exp=0x%x timo_ptr=0x%llx\n",
+                            (unsigned long long)a0, (unsigned)addr.load(std::memory_order_acquire),
+                            (unsigned)expected, (unsigned long long)a2);
     // Honor the guest timeout by default (#142) — the same fix the Linux futex path got (#139).
     // Previously this global-cv fallback IGNORED the timeout arg and blocked FOREVER while
     // *addr == expected, returning 0 (=signaled), so a Windows-build timed wait could never take its
@@ -1569,15 +1573,21 @@ HLE(k_wait_on_address) {
         auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(us);
         while (addr.load(std::memory_order_acquire) == expected)
             if (g_sync_cv.wait_until(lk, deadline) == std::cv_status::timeout &&
-                addr.load(std::memory_order_acquire) == expected)
+                addr.load(std::memory_order_acquire) == expected) {
+                if (wsynclog()) fprintf(stderr, "[sync] WAIT.exit  addr=0x%llx TIMEOUT\n", (unsigned long long)a0);
                 return 0x80020060ull;   // SCE_KERNEL_ERROR_ETIMEDOUT
+            }
+        if (wsynclog()) fprintf(stderr, "[sync] WAIT.exit  addr=0x%llx woke\n", (unsigned long long)a0);
         return 0;
     }
     while (addr.load(std::memory_order_acquire) == expected) g_sync_cv.wait(lk);
+    if (wsynclog()) fprintf(stderr, "[sync] WAIT.exit  addr=0x%llx woke (untimed)\n", (unsigned long long)a0);
     return 0;
 }
 
 HLE(k_wake_by_address) {
+    if (wsynclog()) fprintf(stderr, "[sync] WAKE       addr=0x%llx *addr=0x%x n=%lld\n",
+                            (unsigned long long)a0, a0 ? *(uint32_t*)(uintptr_t)a0 : 0, (long long)a1);
     std::lock_guard<std::mutex> lk(g_sync_mx);
     int n = a1 ? (int)a1 : INT_MAX;
     if (n == 1) g_sync_cv.notify_one();
