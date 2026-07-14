@@ -303,7 +303,26 @@ init** (`GfxDevicePS5SharedData::CreateWorkload`), AGC command submission, and ~
 bundles — 180k+ `%fs` accesses emulated with zero unhandled forms. The `prosper-app` window comes up
 and the live renderer begins creating real pipelines from the guest's draws.
 
-**Remaining to on-screen gameplay (follow-on frontiers, MoltenVK shader fidelity, not TLS):**
+**MoltenVK build matters (2026-07-14):** the guest's shaders exposed a SPIRV-Cross bug in the
+**x86_64 Khronos-release MoltenVK 1.4.1** (`Cannot resolve expression type`) — proven build/arch
+specific: the *arm64* MoltenVK 1.4.1 and the **LunarG Vulkan SDK's** universal MoltenVK both convert
+the identical shaders fine. So for real rendering, use a good MoltenVK:
+`scripts/fetch-macos-vulkan.sh --lunarg` (headless-installs the LunarG SDK's universal MoltenVK into
+`.macos-vulkan/`). With it, most guest shaders compile and `prosper-app` presents frames (slowly —
+first-use Metal pipeline compilation under Rosetta is ~a few fps until warm). The plain
+`fetch-macos-vulkan.sh` (Khronos release) stays the light build/CI path. #701 fixed one SPIRV-Cross
+trigger (64-bit OpConstant); `draft/recompiler-int64-lowering` removes Int64 entirely (unmerged,
+helps weak drivers).
+
+**Remaining to on-screen gameplay (follow-on frontiers, not TLS):**
+- One guest vertex shader still fails MSL conversion *at runtime* even with the good MoltenVK, though
+  the SDK's standalone converter handles the same SPIR-V — a MoltenVK pipeline-config/SPIRV-Cross
+  interaction (tracked with #693). One missing draw.
+- GPU submit-completion: with real pipelines created, the guest waits on GPU work
+  (`sce::Agc::suspendPoint` / fence) — the completion/label-writeback handshake needs verifying on
+  macOS so the frame loop advances at speed (same class as the Windows "GPU EOP completion" step).
+- On-screen content not yet visually confirmed (headless dev context); the present path is proven by
+  `--test-pattern`.
 - MoltenVK pipeline compat: `primitiveRestartEnable=VK_FALSE` is rejected by Metal — fixed (force
   `VK_TRUE` on Apple). Next: the guest **vertex shader fails MSL compilation** in MoltenVK
   (`Vertex shader function could not be compiled into pipeline`) — a SPIR-V→Metal translation gap to
