@@ -162,6 +162,10 @@ Turn the file into a resident, relocated guest image in host memory.
 - [x] `sceHttpUriParse` implements its two-pass caller-pool contract and initializes the public URI
       element layout (#642). This removes Blasphemous 2's post-EULA stale-pointer crash and advances
       its route to the guest pthread exit boundary tracked by #644.
+- [x] A normally returning guest pthread leaves host `%fs` active before returning into glibc's
+      `start_thread` cleanup (#644). The regression enables real guest FS, returns a sentinel from a
+      guest worker, and joins it; restoring guest FS at that boundary previously crashed in
+      `__res_thread_freeres` before the join completed.
 - [x] Dependent-module `init_array` (C++ global ctors) now run before entry — the key
       unlock that let IL2CPP's runtime initialize.
 - [x] locale/ctype tables; `sync_on_address` futex (Linux `futex(2)`); C++ new/delete; stdio.

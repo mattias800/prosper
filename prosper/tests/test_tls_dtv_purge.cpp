@@ -6,10 +6,12 @@
 // Covers: (1) fresh zero+tdata init of a new block, (2) purge-then-refetch returns fresh state on
 // the same thread (the recycled-id scenario, simulated deterministically), (3) the trampoline
 // normal-return exit path purges, (4) the scePthreadExit path (host pthread_exit — never returns
-// through the trampoline) purges, (5) main/host threads with no DTV entries purge as a no-op.
+// through the trampoline) purges, (5) main/host threads with no DTV entries purge as a no-op,
+// (6) a normal-return thread leaves guest %fs before returning to the host pthread runtime (#644).
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
 #include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 
@@ -52,6 +54,9 @@ static void* worker_exit(void* p) {     // exit path 2: scePthreadExit (host pth
     tls_touch_and_dirty((WorkerResult*)p);
     EXITF(0, 0, 0, 0, 0, 0);
     return (void*)0xdead;               // not reached
+}
+static void* worker_guest_fs_return(void*) {
+    return (void*)0x644;
 }
 
 int main() {
@@ -105,6 +110,28 @@ int main() {
         snprintf(msg, sizeof msg, "iter %d (%s): DTV entry purged on thread exit", i, via_exit ? "scePthreadExit" : "return");
         CHECK(tls_dtv_thread_count() == 0, msg);
     }
+
+#ifdef __linux__
+    // (6) The guest entry returns with guest %fs active. The trampoline must switch permanently
+    // back to host %fs before it returns into glibc's start_thread cleanup. Restoring guest %fs at
+    // that terminal boundary makes __res_thread_freeres read glibc TLS through the guest TCB and
+    // fault at null+0x10 (#644). Index zero is reserved; no static TLS module is needed here.
+    setenv("PROSPER_GUEST_FS", "1", 1);
+    TlsModuleDesc reserved{};
+    guest_tls_set_templates(&reserved, 1);
+    CHECK(guest_tls_enabled(), "guest FS enabled for normal-return boundary test");
+
+    uint64_t tid = 0;
+    void* result = nullptr;
+    uint64_t rc = CREATE((uint64_t)(uintptr_t)&tid, 0,
+                         (uint64_t)(uintptr_t)worker_guest_fs_return, 0, 0, 0);
+    CHECK(rc == 0, "guest-FS worker created");
+    if (rc == 0) {
+        JOIN(tid, (uint64_t)(uintptr_t)&result, 0, 0, 0, 0);
+        CHECK(result == (void*)0x644,
+              "normal-return worker reaches host pthread cleanup and preserves its result");
+    }
+#endif
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");

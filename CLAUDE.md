@@ -95,8 +95,10 @@ and the user confirmed the first-level graphics match the hardware reference. #5
 
 *Blasphemous 2* now passes FMOD initialization (#638/#640), renders its logos/title/EULA after the corrected
 AGC marker implementation (#641), and passes the post-EULA telemetry parser after `sceHttpUriParse` gained its
-two-pass caller-pool contract (#642). The route loads gameplay scenes and assets; the next boundary is the
-normal-return guest pthread TLS cleanup bug tracked by #644. Use `scripts/blasphemous2/README.md` for the route.
+two-pass caller-pool contract (#642). Normal-return guest pthreads also leave host `%fs` active before glibc
+thread cleanup (#644), so the route loads gameplay scenes/assets without the old host crash and renders the
+opening cinematic. Poll-safe native-resolution input delivery remains tracked by #646; do not claim a verified
+gameplay screenshot until that route is stable. Use `scripts/blasphemous2/README.md` for the current recipe.
 
 Cross-title breadth has advanced: *Dead Cells* now starts reliably after the AGC resource-name fix (#544), its
 exercised NGS2 lifecycle returns initialized sizes/handles/state and silent output (#554), and a late render
