@@ -1319,14 +1319,22 @@ namespace {
     // Reserve (no commit). VirtualAlloc reservations are 64 KiB-aligned, satisfying guest aligns
     // up to 64 KiB; larger alignment is logged and left to the OS base (follow-up).
     void* win_reserve(uint64_t hint, uint64_t len, bool fixed, uint64_t align) {
-        if (align > 0x10000)
-            MLOG("reserve align=0x%llx > 64KiB not honored on Win32 (OS 64KiB base)\n",
-                 (unsigned long long)align);
         if (hint) {
             if (void* p = VirtualAlloc((void*)hint, (SIZE_T)len, MEM_RESERVE, PAGE_NOACCESS)) return p;
             if (fixed) return nullptr;   // SCE_KERNEL_MAP_FIXED: must be exactly this address
         }
-        return VirtualAlloc(nullptr, (SIZE_T)len, MEM_RESERVE, PAGE_NOACCESS);
+        // VirtualAlloc only guarantees 64 KiB (allocation-granularity) base alignment. Guest allocators
+        // reserve with LARGER alignment (e.g. 0x40000 = 256 KiB) and then compute chunk/metadata offsets
+        // by rounding a pointer DOWN to that alignment — so a base that is 64 KiB- but not 256 KiB-aligned
+        // makes those computations land below the reservation and corrupt/wedge the allocator. Honor a
+        // >64 KiB request by over-reserving len+align and returning the aligned sub-base; commits within
+        // it still succeed (it is one reserved region) and the slack stays reserved (only wasted address
+        // space — trimming a reservation would race a concurrent reserve). CONFIDENCE: HIGH.
+        if (align <= 0x10000)
+            return VirtualAlloc(nullptr, (SIZE_T)len, MEM_RESERVE, PAGE_NOACCESS);
+        void* raw = VirtualAlloc(nullptr, (SIZE_T)(len + align), MEM_RESERVE, PAGE_NOACCESS);
+        if (!raw) return nullptr;
+        return (void*)(((uint64_t)raw + (align - 1)) & ~(align - 1));
     }
     bool win_protect(uint64_t addr, uint64_t len, int hp) {
         DWORD old = 0;
