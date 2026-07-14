@@ -103,15 +103,26 @@ HLE(s_ok)             { return 0; }
 // finished immediately — so the game advances past the video into its scene instead of stalling on a
 // NULL handle from a stubbed InitEx. No decode needed to progress; the game's while(IsActive) frame
 // loop simply doesn't run (or ends at once) and it moves on.
-HLE(s_avplayer_init)     { return g_handle.fetch_add(1); }   // non-NULL SceAvPlayerHandle
+HLE(s_avplayer_init)     { svc_log("sceAvPlayerInit", a0,a1,a2,a3,a4,a5); return g_handle.fetch_add(1); }   // non-NULL SceAvPlayerHandle
 // sceAvPlayerInitEx(const SceAvPlayerInitDataEx* data, SceAvPlayerHandle* out) has a DIFFERENT ABI from
 // sceAvPlayerInit: it returns an int32 ERROR CODE (0 = success) and writes the handle to the *out*
 // param — it does NOT return the handle. Registering it to s_avplayer_init (return-the-handle) makes the
 // game read a non-zero handle as an error code: The Messenger-family PS5VideoPlayback wrapper logs
 // "[PS5VideoPlayback] ERROR: sceAvPlayerInitEx() failed" and aborts the intro video (live-captured;
 // PPSA02664). Return 0 and write a valid non-NULL handle to a1. CONFIDENCE: HIGH (live guest error log).
-HLE(s_avplayer_initex)   { if (a1) *(uint64_t*)PW(a1) = g_handle.fetch_add(1); return 0; }
-HLE(s_avplayer_isactive) { return 0; }                       // 0 = not active -> stream done -> proceed
+HLE(s_avplayer_initex)   { svc_log("sceAvPlayerInitEx", a0,a1,a2,a3,a4,a5); if (a1) *(uint64_t*)PW(a1) = g_handle.fetch_add(1); return 0; }
+HLE(s_avplayer_isactive) { svc_log("sceAvPlayerIsActive", a0,a1,a2,a3,a4,a5); return 0; }   // 0 = not active. Real playback state comes from the video backend (#324).
+// Logged lifecycle stubs (PROSPER_SVCLOG) — used to establish the real AvPlayer call sequence a Unity
+// VideoPlayer title drives, ahead of the real hardware-decode backend (#324). Still no-ops for now.
+HLE(s_avp_postinit)       { svc_log("sceAvPlayerPostInit", a0,a1,a2,a3,a4,a5); return 0; }
+HLE(s_avp_setlogcb)       { svc_log("sceAvPlayerSetLogCallback", a0,a1,a2,a3,a4,a5); return 0; }
+HLE(s_avp_addsource)      { svc_log("sceAvPlayerAddSource", a0,a1,a2,a3,a4,a5); return 0; }
+HLE(s_avp_addsourceex)    { svc_log("sceAvPlayerAddSourceEx", a0,a1,a2,a3,a4,a5); return 0; }
+HLE(s_avp_getvideodata)   { svc_log("sceAvPlayerGetVideoData", a0,a1,a2,a3,a4,a5); return 0; }
+HLE(s_avp_getvideodataex) { svc_log("sceAvPlayerGetVideoDataEx", a0,a1,a2,a3,a4,a5); return 0; }
+HLE(s_avp_getaudiodata)   { svc_log("sceAvPlayerGetAudioData", a0,a1,a2,a3,a4,a5); return 0; }
+HLE(s_avp_stop)           { svc_log("sceAvPlayerStop", a0,a1,a2,a3,a4,a5); return 0; }
+HLE(s_avp_close)          { svc_log("sceAvPlayerClose", a0,a1,a2,a3,a4,a5); return 0; }
 // sceUserServiceGetGamePresets(userId, presets): MUST return success (0). The Unity engine's
 // per-controller connection check (eboot 0x14707e0, reached from the pad "reset" path 0x1470ca0)
 // calls this and treats ANY non-zero user-service return as "controller invalid" — it then clears the
@@ -1135,16 +1146,16 @@ void register_service_hle() {
     // Init/InitEx must return a non-NULL handle; IsActive must report finished; the rest succeed as no-ops.
     R("sceAvPlayerInit",           s_avplayer_init);
     R("sceAvPlayerInitEx",         s_avplayer_initex);
-    R("sceAvPlayerPostInit",       s_ok);
-    R("sceAvPlayerSetLogCallback", s_ok);
-    R("sceAvPlayerAddSource",      s_ok);
-    R("sceAvPlayerAddSourceEx",    s_ok);
+    R("sceAvPlayerPostInit",       s_avp_postinit);
+    R("sceAvPlayerSetLogCallback", s_avp_setlogcb);
+    R("sceAvPlayerAddSource",      s_avp_addsource);
+    R("sceAvPlayerAddSourceEx",    s_avp_addsourceex);
     R("sceAvPlayerIsActive",       s_avplayer_isactive);
-    R("sceAvPlayerGetVideoData",   s_ok);   // 0 = no frame available (we don't decode) -> game skips it
-    R("sceAvPlayerGetVideoDataEx", s_ok);
-    R("sceAvPlayerGetAudioData",   s_ok);
-    R("sceAvPlayerStop",           s_ok);
-    R("sceAvPlayerClose",          s_ok);
+    R("sceAvPlayerGetVideoData",   s_avp_getvideodata);     // 0 = no frame available (we don't decode) -> game skips it
+    R("sceAvPlayerGetVideoDataEx", s_avp_getvideodataex);
+    R("sceAvPlayerGetAudioData",   s_avp_getaudiodata);
+    R("sceAvPlayerStop",           s_avp_stop);
+    R("sceAvPlayerClose",          s_avp_close);
     R("sceSystemServiceGetStatus", s_syss_getstatus);
     R("sceSystemServiceReceiveEvent", s_sysservice_receiveevent);   // NO_EVENT, don't leave the struct garbage
     // sceSystemServiceGetDisplaySafeAreaInfo (1n37q1Bvc5Y) — fill ratio=1.0 (see s_syss_safearea).
