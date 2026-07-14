@@ -1,10 +1,14 @@
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
 
 namespace prosper::screenshot {
+
+constexpr size_t kPerceptualLumaCells = 16 * 9;
 
 enum class CaptureSource : uint8_t { Rendered, RawScanout };
 
@@ -18,7 +22,28 @@ struct CaptureObservation {
     uint32_t height = 0;
     uint32_t pixel_crc32 = 0;
     double elapsed_seconds = 0;
+    uint32_t distinct_rgb_colors = 0;
+    uint64_t nonblack_rgb_pixels = 0;
+    uint64_t average_hash = 0;
+    uint64_t difference_hash = 0;
+    std::array<uint8_t, kPerceptualLumaCells> luma16x9{};
 };
+
+struct PerceptualHashes {
+    uint64_t average = 0;
+    uint64_t difference = 0;
+};
+
+// Standard 8x8 average hash plus 9x8 horizontal difference hash. These intentionally discard
+// fine pixel detail so small raster changes remain close while missing layers alter the signature.
+PerceptualHashes perceptual_hashes_rgba(const std::vector<uint8_t>& pixels,
+                                        uint32_t width, uint32_t height);
+
+// A small spatial luminance signature suitable for SSIM comparisons. Unlike aHash/dHash,
+// it preserves the magnitude and location of large missing layers.
+std::array<uint8_t, kPerceptualLumaCells>
+perceptual_luma16x9_rgba(const std::vector<uint8_t>& pixels,
+                         uint32_t width, uint32_t height);
 
 struct CaptureClassification {
     bool source_advanced = true;

@@ -1,4 +1,6 @@
 failures/
+review/
 *.bmp
 *.png
 snap_*/
+__pycache__/

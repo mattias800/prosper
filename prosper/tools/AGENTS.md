@@ -3,10 +3,12 @@
 Developer/agent tooling. These are debugging and verification aids, not part of
 the shipped runtime. Build them from `build-linux/` like everything else.
 
-- **`snapshot/`** — golden-image **rendering regression guard**. Run
-  `python3 tools/snapshot/snapshot.py check` before/after any change that can
-  affect rendered output (recompiler, AGC decode, render state, detile, present).
-  See `snapshot/AGENTS.md`. **Run this after touching the render path.**
+- **`snapshot/`** - routed, multi-frame **rendering regression guard**. Run
+  `python3 tools/snapshot/snapshot.py check` after any change that can affect
+  rendered output (recompiler, AGC decode, render state, detile, present). It
+  catches major scene collapse without treating subtle pixel changes as
+  regressions. New or changed baselines require two-run image inspection; see
+  `snapshot/AGENTS.md`. **Run this after touching the render path.**
 - **`boot_trace/`** — boots a SELF/ELF game image through the loader + HLE and
   runs it, with the fault handler, GPU executor, and (under `PROSPER_RENDER`) the
   live Vulkan renderer. The main harness for exercising a real title headlessly.

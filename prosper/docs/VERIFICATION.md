@@ -1,8 +1,9 @@
-# Verification strategy (agentic-first — no manual eyeballing)
+# Verification strategy (automated gates, reviewed baselines)
 
-Every milestone is gated by a self-checking test whose **exit code is the truth**. Nobody looks at a
-window; nobody diffs an image by hand. This keeps a long project cheap to run — `ctest` is the only
-verification step. The graphics path is verified in layers, cheapest first.
+Every milestone is gated by a self-checking test whose **exit code is the truth**. Routine checks do
+not require a person to operate a game window or compare images. Baselines are different: a new or
+changed real-game baseline must be visually inspected once so an automated check cannot bless a black
+frame, logo, menu, or wrong scene. The graphics path is verified in layers, cheapest first.
 
 ## 1. Structural assertions (no GPU) — the bulk of correctness
 
@@ -60,11 +61,24 @@ coverage % + the top first-unsupported opcodes. This turns "what to build next" 
 ~67% of instructions; the dominant remaining blocker is `SMEM`), and is regression-tested pure
 (`test_recompile_coverage`).
 
-## 5. Frame-CRC golden for the real game (once it boots)
+## 5. Routed multi-frame guards for real games
 
-When the completion-event fix lets the residency pass run and real draws flow through the spine,
-capture the per-frame command-stream / framebuffer CRC once, then assert it thereafter. The game's
-early frames are deterministic, so this detects any rendering regression frame-by-frame without review.
+`tools/snapshot/snapshot.py` boots local game dumps through the normal presented-screenshot frontend,
+can replay a title-specific input route from a fresh temporary save, and evaluates several composited
+frames from a gameplay-only time window. Threaded games rarely select one deterministic frame, and subtle pixel changes may be
+valid improvements, so gameplay guards use coarse contracts: multiple frames must exceed a reviewed
+scene-richness threshold, several frames must meet an SSIM threshold against visually reviewed 16x9
+luminance reference states, non-black coverage and dimensions must remain correct, and moving routes can require visible pixel
+changes. This catches black output, missing major layers, stalled routes, and presentation collapse
+without making every pixel part of the API. Exact CRCs identify samples for debugging but do not reject
+subtle changes in timing-sensitive gameplay.
+
+Exact frame hashes remain available for checkpoints proven deterministic by two independent captures.
+For either mode, `snapshot.py verify NAME` retains images from two runs under
+`tools/snapshot/review/NAME/`. A person must inspect every retained image and confirm the intended state,
+layers, and progression before recording a new hash or threshold. Routine `snapshot.py check` runs are
+then automated. Dumps and evidence images are local and gitignored, so real-game guards do not run in CI.
+See `tools/snapshot/README.md` for the complete approval workflow.
 
 ## CI
 
@@ -76,5 +90,6 @@ game dump is absent.
 ## Rule of thumb
 
 Prefer the cheapest layer that can catch a given bug: pure structural asserts for translation logic,
-pixel/region + golden-hash for the raster path, execution-differential for shader semantics. Only the
-final integrated frame needs the GPU; everything upstream is verified on the CPU.
+pixel/region plus golden hashes for deterministic raster tests, execution-differential checks for shader
+semantics, and routed multi-frame guards for integrated games. Only the final integrated scene needs a
+game dump and the GPU; everything upstream is verified on the CPU.

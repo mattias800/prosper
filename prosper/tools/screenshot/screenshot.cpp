@@ -50,6 +50,7 @@
 #include <sstream>
 #include <string>
 #include <system_error>
+#include <unordered_set>
 #include <vector>
 #include <thread>
 #include <chrono>
@@ -58,6 +59,27 @@
 using namespace prosper;
 
 namespace {
+
+struct PixelContentMetrics {
+    uint32_t distinct_colors = 0;
+    uint64_t nonblack_pixels = 0;
+};
+
+PixelContentMetrics measure_pixel_content(const std::vector<uint8_t>& rgba) {
+    std::unordered_set<uint32_t> colors;
+    colors.reserve(std::min<size_t>(rgba.size() / 4, 65536));
+    uint64_t nonblack = 0;
+    for (size_t i = 0; i + 3 < rgba.size(); i += 4) {
+        const uint32_t alpha = rgba[i + 3];
+        const uint32_t red = (static_cast<uint32_t>(rgba[i]) * alpha + 127) / 255;
+        const uint32_t green = (static_cast<uint32_t>(rgba[i + 1]) * alpha + 127) / 255;
+        const uint32_t blue = (static_cast<uint32_t>(rgba[i + 2]) * alpha + 127) / 255;
+        const uint32_t rgb = (red << 16) | (green << 8) | blue;
+        colors.insert(rgb);
+        nonblack += rgb != 0;
+    }
+    return {static_cast<uint32_t>(colors.size()), nonblack};
+}
 
 bool set_environment(const char* name, const char* value, bool overwrite) {
     if (!overwrite && getenv(name)) return true;
@@ -553,6 +575,15 @@ int main(int argc, char** argv) {
                         observation.height = snap.height;
                         observation.pixel_crc32 = pixel_crc;
                         observation.elapsed_seconds = el;
+                        const auto content = measure_pixel_content(snap.rgba);
+                        observation.distinct_rgb_colors = content.distinct_colors;
+                        observation.nonblack_rgb_pixels = content.nonblack_pixels;
+                        const auto perceptual = screenshot::perceptual_hashes_rgba(
+                            snap.rgba, snap.width, snap.height);
+                        observation.average_hash = perceptual.average;
+                        observation.difference_hash = perceptual.difference;
+                        observation.luma16x9 = screenshot::perceptual_luma16x9_rgba(
+                            snap.rgba, snap.width, snap.height);
                         const auto classification = tracker.observe(observation, snap.rgba);
                         required_crc32_seen |= required_crc32_set && pixel_crc == required_crc32;
                         fprintf(stderr, "[shot] %d/%d  %s  (frame %llu, %.1fs%s, crc=%08x)\n",

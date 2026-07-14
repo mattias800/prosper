@@ -1,59 +1,58 @@
 # AGENTS.md - rendering snapshot tests
 
-Real-game rendering regression guard. Run this whenever a change can affect
-rendered output: RDNA2-to-SPIR-V recompilation, AGC/PM4 decoding, render state,
-texture detiling, or executor/present behavior.
-
-The Messenger and Dead Cells guards record the richest frame's distinct-color
-count across their configured windows. Both titles have threaded/timing-sensitive
-boots whose exact rendered frame is not a stable contract.
-
-## Run It
+This is the required local real-game rendering gate. Run the affected title
+guards after any change that can affect output: RDNA2-to-SPIR-V recompilation,
+AGC/PM4 decoding, render state, texture decode/detiling, executor behavior, or
+presentation.
 
 ```bash
-# From prosper/, with build-linux/boot_trace built for the change.
+# From prosper/, with build-linux/boot_trace built from the change.
 python3 tools/snapshot/snapshot.py check
 python3 tools/snapshot/snapshot.py check messenger-scene
 python3 tools/snapshot/snapshot.py check dead-cells-splash
+python3 tools/snapshot/snapshot.py check blasphemous2-gameplay
 ```
 
-On failure, the screenshot and boot log are written to
-`tools/snapshot/failures/<name>.{bmp,log}`. Convert a BMP for inspection with:
+## Contract
 
-```bash
-python3 -c 'from PIL import Image; Image.open("x.bmp").save("x.png")'
-```
+- Local only. Game dumps and captured imagery must never be committed.
+- Gameplay guards are deliberately coarse. Subtle pixel changes may be valid or
+  improvements; use tolerant average/difference hashes to detect major collapse,
+  missing layers, lost progression, and wrong dimensions without freezing every pixel.
+- A content guard examines all frames in a gameplay-only evidence window and
+  requires multiple qualifying frames. Do not treat one richest frame, a logo,
+  a menu, or a static screen as proof of gameplay.
+- `check` is fully automated. On failure, inspect the representative PNGs and
+  log under `tools/snapshot/failures/` before changing code or thresholds.
+- Do not lower a threshold merely to pass. Explain intentional contract changes
+  and repeat the baseline-review workflow below.
 
-## Non-Negotiables
+## New Or Changed Baselines
 
-- Local only, never CI. Game dumps and captured imagery must not be committed.
-- Only thresholds or pixel hashes live in `snapshots.json`.
-- Do not lower `min_colors` merely to make a failing check pass. Investigate the
-  regression, or explain an intentional baseline change in the PR.
+Baseline evidence requires visual review even though routine regression runs do
+not. This prevents checksums or thresholds from blessing black output or the
+wrong scene.
 
-## Guard Modes
+1. Set `review` to `pending` and run `snapshot.py verify NAME`.
+2. Inspect every image retained from both independent runs in
+   `tools/snapshot/review/NAME/`. Confirm the intended gameplay state, expected
+   layers, and progression across multiple timestamps.
+   Use the adjacent `runN-evidence.json` when a bad frame needs correlation
+   with its flip count, front-buffer index, or renderer publication.
+3. For content mode, choose a conservative `min_colors`, require at least two
+   qualifying frames, and add `min_pixel_changes` for moving routes.
+4. Run `snapshot.py update NAME --reviewed` only after every image is accepted.
+   Content mode records reviewed luminance references for SSIM plus a
+   conservative non-black coverage floor; exact mode records the identical
+   pixel hash. Never use exact hashes for threaded gameplay merely because one
+   run happened to be stable.
+5. Run `snapshot.py check NAME` after approval.
 
-- `min_colors`: run the full configured timeout, inspect every dumped frame,
-  and require the richest frame to meet the threshold. `messenger-scene` uses
-  this because exact frame hashes are not stable across threaded boots. The
-  Dead Cells splash uses the same mode because one unchanged build selects
-  multiple valid static/animated splash hashes after its renderer warmup. Use
-  `verify <name>` to require two full runs to meet the threshold at equal
-  dimensions.
-- `frame` plus `hash`: target one draw-submit frame. Use `verify <name>` before
-  trusting a new exact baseline, then `update <name>` after an intentional pixel
-  change.
-
-`RENDER_SCALE` shrinks the framebuffer. Keep `scale` fixed for either mode.
-
-## Adding A Snapshot
-
-Add `name`, `dump`, `scale`, `timeout`, optional `env`, and either:
-
-- a justified `min_colors` threshold for a run-level content guard; or
-- `frame` plus an exact `hash`, established with `verify` then `update`.
+See `README.md` for every manifest field and the current title matrix.
 
 ## Environment
 
 - `PROSPER_GAME_ROOT`: directory holding `*-app0` dumps; defaults to the repo.
-- `PROSPER_BOOT_TRACE`: boot_trace path; defaults to `build-linux/boot_trace`.
+- `PROSPER_BOOT_TRACE`: `boot_trace` path; defaults to `build-linux/boot_trace`.
+- `PROSPER_SCREENSHOT`: presented-capture frontend; defaults to
+  `build-linux/screenshot`.

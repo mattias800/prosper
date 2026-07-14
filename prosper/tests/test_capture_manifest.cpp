@@ -26,6 +26,11 @@ int main() {
           "same source identity is classified stale");
 
     auto c = b; c.source_seq = c.frame_seq = 11; c.pixel_crc32 = 0x87654321; c.elapsed_seconds = 4.0;
+    c.distinct_rgb_colors = 37;
+    c.nonblack_rgb_pixels = 101;
+    c.average_hash = 0x0123456789abcdef;
+    c.difference_hash = 0xfedcba9876543210;
+    c.luma16x9.fill(0x7f);
     pixels[0] = 0x22;
     auto cc = tracker.observe(c, pixels);
     CHECK(cc.source_advanced && !cc.pixel_identical && cc.stale_seconds == 0,
@@ -46,6 +51,37 @@ int main() {
     CHECK(line.find("@route\\nname") != std::string::npos, "manifest JSON escapes route text");
     CHECK(line.find("\"source\":\"composited\"") != std::string::npos,
           "manifest names the capture source");
+    CHECK(line.find("\"distinct_rgb_colors\":37") != std::string::npos,
+          "manifest records a coarse content metric for presented pixels");
+    CHECK(line.find("\"nonblack_rgb_pixels\":101") != std::string::npos,
+          "manifest records black-frame coverage");
+    CHECK(line.find("\"average_hash\":\"0123456789abcdef\"") != std::string::npos &&
+          line.find("\"difference_hash\":\"fedcba9876543210\"") != std::string::npos,
+          "manifest records tolerant perceptual fingerprints");
+    CHECK(line.find("\"luma16x9\":\"7f7f7f7f") != std::string::npos,
+          "manifest records a structural luminance signature");
+
+    std::vector<uint8_t> gradient(9 * 8 * 4, 255);
+    for (uint32_t y = 0; y < 8; ++y) for (uint32_t x = 0; x < 9; ++x) {
+        const size_t offset = (y * 9 + x) * 4;
+        gradient[offset] = gradient[offset + 1] = gradient[offset + 2] = static_cast<uint8_t>(x * 28);
+    }
+    const auto increasing = perceptual_hashes_rgba(gradient, 9, 8);
+    CHECK(increasing.difference == 0, "difference hash follows the standard left-greater-than-right rule");
+    for (uint32_t y = 0; y < 8; ++y) for (uint32_t x = 0; x < 9; ++x) {
+        const size_t offset = (y * 9 + x) * 4;
+        gradient[offset] = gradient[offset + 1] = gradient[offset + 2] = static_cast<uint8_t>((8 - x) * 28);
+    }
+    const auto decreasing = perceptual_hashes_rgba(gradient, 9, 8);
+    CHECK(decreasing.difference == UINT64_MAX,
+          "difference hash detects the opposite horizontal structure in all 64 cells");
+    const auto luma = perceptual_luma16x9_rgba(gradient, 9, 8);
+    CHECK(luma.size() == kPerceptualLumaCells && luma.front() > luma.back(),
+          "16x9 luminance signature preserves broad spatial structure");
+    for (size_t i = 3; i < gradient.size(); i += 4) gradient[i] = 0;
+    const auto transparent_luma = perceptual_luma16x9_rgba(gradient, 9, 8);
+    CHECK(transparent_luma.front() == 0 && transparent_luma.back() == 0,
+          "structural signature ignores invisible RGB beneath zero alpha");
     const std::string long_route(4096, 'x');
     const std::string long_line = manifest_sample_json(3, "long.png", c, cc, long_route);
     CHECK(long_line.size() > long_route.size() && long_line.find(long_route) != std::string::npos,

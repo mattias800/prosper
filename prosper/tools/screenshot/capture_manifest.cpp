@@ -7,6 +7,71 @@
 
 namespace prosper::screenshot {
 
+namespace {
+uint8_t cell_luma(const std::vector<uint8_t>& pixels, uint32_t width, uint32_t height,
+                  uint32_t cell_x, uint32_t cell_y, uint32_t grid_width, uint32_t grid_height) {
+    const uint32_t x0 = cell_x * width / grid_width;
+    const uint32_t x1 = std::max(x0 + 1, (cell_x + 1) * width / grid_width);
+    const uint32_t y0 = cell_y * height / grid_height;
+    const uint32_t y1 = std::max(y0 + 1, (cell_y + 1) * height / grid_height);
+    uint64_t sum = 0;
+    uint64_t count = 0;
+    for (uint32_t y = y0; y < std::min(y1, height); ++y) {
+        for (uint32_t x = x0; x < std::min(x1, width); ++x) {
+            const size_t offset = (static_cast<size_t>(y) * width + x) * 4;
+            // Integer Rec. 601 luma after compositing the presented RGBA over black. Some
+            // renderer failures preserve stale RGB under zero alpha, which is not visible output.
+            const uint32_t luma = 299u * pixels[offset] + 587u * pixels[offset + 1] +
+                                  114u * pixels[offset + 2];
+            sum += (luma * pixels[offset + 3] + 127) / 255;
+            ++count;
+        }
+    }
+    return count ? static_cast<uint8_t>((sum / count + 500) / 1000) : 0;
+}
+} // namespace
+
+PerceptualHashes perceptual_hashes_rgba(const std::vector<uint8_t>& pixels,
+                                        uint32_t width, uint32_t height) {
+    PerceptualHashes result;
+    if (!width || !height || pixels.size() < static_cast<size_t>(width) * height * 4)
+        return result;
+
+    uint8_t average_cells[64]{};
+    uint32_t sum = 0;
+    for (uint32_t y = 0; y < 8; ++y) {
+        for (uint32_t x = 0; x < 8; ++x) {
+            const uint8_t value = cell_luma(pixels, width, height, x, y, 8, 8);
+            average_cells[y * 8 + x] = value;
+            sum += value;
+        }
+    }
+    const uint32_t mean = sum / 64;
+    for (uint32_t i = 0; i < 64; ++i)
+        if (average_cells[i] > mean) result.average |= uint64_t{1} << i;
+
+    for (uint32_t y = 0; y < 8; ++y) {
+        uint8_t row[9]{};
+        for (uint32_t x = 0; x < 9; ++x)
+            row[x] = cell_luma(pixels, width, height, x, y, 9, 8);
+        for (uint32_t x = 0; x < 8; ++x)
+            if (row[x] > row[x + 1]) result.difference |= uint64_t{1} << (y * 8 + x);
+    }
+    return result;
+}
+
+std::array<uint8_t, kPerceptualLumaCells>
+perceptual_luma16x9_rgba(const std::vector<uint8_t>& pixels,
+                         uint32_t width, uint32_t height) {
+    std::array<uint8_t, kPerceptualLumaCells> result{};
+    if (!width || !height || pixels.size() < static_cast<size_t>(width) * height * 4)
+        return result;
+    for (uint32_t y = 0; y < 9; ++y)
+        for (uint32_t x = 0; x < 16; ++x)
+            result[y * 16 + x] = cell_luma(pixels, width, height, x, y, 16, 9);
+    return result;
+}
+
 CaptureClassification CaptureTracker::observe(const CaptureObservation& observation,
                                                const std::vector<uint8_t>& pixels) {
     CaptureClassification result;
@@ -122,6 +187,15 @@ std::string manifest_sample_json(int index, const std::string& png_path,
          << ",\"width\":" << o.width << ",\"height\":" << o.height
          << ",\"pixel_crc32\":\"" << std::hex << std::setw(8) << std::setfill('0')
          << o.pixel_crc32 << std::dec << "\""
+         << ",\"distinct_rgb_colors\":" << o.distinct_rgb_colors
+         << ",\"nonblack_rgb_pixels\":" << o.nonblack_rgb_pixels
+         << ",\"average_hash\":\"" << std::hex << std::setw(16) << std::setfill('0')
+         << o.average_hash << "\""
+         << ",\"difference_hash\":\"" << std::setw(16) << o.difference_hash << "\""
+         << ",\"luma16x9\":\"";
+    for (const uint8_t value : o.luma16x9)
+        line << std::setw(2) << static_cast<unsigned>(value);
+    line << std::dec << "\""
          << ",\"source_advanced\":" << (c.source_advanced ? "true" : "false")
          << ",\"pixel_identical\":" << (c.pixel_identical ? "true" : "false")
          << ",\"stale_seconds\":" << std::fixed << std::setprecision(6) << c.stale_seconds

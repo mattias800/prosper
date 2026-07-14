@@ -5,20 +5,63 @@
       "dump": "PPSA24651-app0",
       "scale": 4,
       "timeout": 200,
+      "capture_after_seconds": 150,
+      "capture_before_seconds": 199,
+      "pad_script": "scripts/messenger/reach-first-level.pad",
+      "savedata_policy": "fresh",
       "env": {},
-      "min_colors": 5000,
-      "_note": "Content-metric guard (min_colors): The Messenger's boot render isn't pixel-deterministic across runs (exact hashing AND a single settled frame both flake — the stable screen varies run-to-run). So `check` runs the whole boot and takes the RICHEST frame's distinct-color count — robust to per-frame variance, but still catches the regression that matters: a rejected/dropped shader (the #199/#201/#239 class) collapses every frame to the debug clear (~1 color), while a real render peaks in the tens of thousands (observed ~34k-137k once the scene/cutscene renders). 5000 is a wide margin below that and far above any blue-clear."
+      "min_colors": 20,
+      "min_qualifying_frames": 4,
+      "min_pixel_changes": 3,
+      "min_structural_similarity": 0.85,
+      "min_structural_matches": 4,
+      "min_content_match_ratio": 0.75,
+      "dims": [480, 270],
+      "review": "pending",
+      "_note": "Provisional presented-frame guard for The Messenger's first-level scene. Valid palette-rendered screenshots contain only 27-39 visible RGB colors, proving the previous 5000-color threshold measured the wrong source. The retained dialog samples are visually complete, but the baseline remains pending until the route evidence is deliberately reviewed and approved."
     },
     {
-      "name": "dead-cells-splash",
+      "name": "dead-cells-gameplay",
       "dump": "PPSA15552-app0",
       "scale": 4,
-      "timeout": 20,
+      "timeout": 180,
+      "capture_after_seconds": 130,
+      "capture_before_seconds": 179,
+      "pad_script": "scripts/dead-cells/reach-first-gameplay-full-render.pad",
+      "savedata_policy": "fresh",
+      "env": {},
+      "min_colors": 5000,
+      "min_qualifying_frames": 4,
+      "min_pixel_changes": 3,
+      "min_structural_similarity": 0.85,
+      "min_structural_matches": 4,
+      "min_content_match_ratio": 0.75,
+      "dims": [960, 540],
+      "review": "pending",
+      "_note": "Provisional full-render route toward the controllable Jump tutorial. Two inspected WSL runs diverged in Prisoners' Quarters loading and did not reach gameplay by 180 seconds, so this remains pending. Approve it only after both runs show the intended gameplay, full scene layers/HUD, and progression."
+    },
+    {
+      "name": "blasphemous2-gameplay",
+      "dump": "PPSA13579-app0",
+      "scale": 1,
+      "timeout": 420,
+      "capture_after_seconds": 318,
+      "capture_before_seconds": 419,
+      "pad_script": "scripts/blasphemous2/reach-first-gameplay.pad",
+      "savedata_policy": "fresh",
       "env": {
-        "PROSPER_RENDER_DELAY_MS": "3000"
+        "PROSPER_RENDER_EVERY": "30",
+        "PROSPER_RENDER_EVERY_FOR_MS": "230000"
       },
-      "min_colors": 1500,
-      "_note": "Run-level splash content guard. Frame 0 after the 3-second render delay is timing-dependent: unchanged builds select multiple valid static/animated states (including hashes 8429fedd..., 891a80fc..., and a9e41a6b...). Preserved failures and three fresh runs show valid rich states at 1650-1698 distinct colors, while later transition frames are only about 325-339. Requiring the richest startup frame to reach 1500 accepts all observed valid splash phases without blessing one animation frame, while still rejecting partial transitions and clear-only rendering."
+      "min_colors": 1000,
+      "min_qualifying_frames": 4,
+      "min_pixel_changes": 3,
+      "min_structural_similarity": 0.85,
+      "min_structural_matches": 4,
+      "min_content_match_ratio": 0.75,
+      "dims": [1920, 1080],
+      "review": "pending",
+      "_note": "Route-aware provisional guard for the first playable room. Only frames written after movement begins are evidence; multiple rich frames and pixel changes reject boot logos, static menus, and black-world output. Run verify and visually inspect its retained review images before replacing the pending review note or adjusting thresholds."
     }
   ]
 }
