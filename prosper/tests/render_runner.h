@@ -139,6 +139,8 @@ inline const RenderVkCtx& render_vk_ctx() {
         RenderVkCtx r;
         VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO}; app.apiVersion = VK_API_VERSION_1_1;
         VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; ici.pApplicationInfo = &app;
+        // macOS: MoltenVK is linked directly, so VK_KHR_portability_enumeration is neither needed nor
+        // accepted here (see prosper-app main.cpp). Only the device-level portability_subset matters.
         if (vkCreateInstance(&ici, nullptr, &r.inst) != VK_SUCCESS || !r.inst) return r;
         uint32_t nd = 0; vkEnumeratePhysicalDevices(r.inst, &nd, nullptr);
         if (!nd) return r;
@@ -163,18 +165,26 @@ inline const RenderVkCtx& render_vk_ctx() {
         r.max_aniso_limit = phys_props.limits.maxSamplerAnisotropy;
         if (r.aniso_enabled) feats.samplerAnisotropy = VK_TRUE;
         // robustImageAccess (VK_EXT_image_robustness): OpImageRead OOB must return zero (#131). Guarded.
+        // Device extensions accumulate into a vector so the (optional) image-robustness and (macOS)
+        // portability-subset extensions coexist.
+        std::vector<const char*> dev_exts;
         VkPhysicalDeviceImageRobustnessFeaturesEXT irf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES_EXT};
-        const char* img_robust_ext[] = { "VK_EXT_image_robustness" };
         { uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(r.phys, nullptr, &ne, nullptr);
           std::vector<VkExtensionProperties> de(ne);
           vkEnumerateDeviceExtensionProperties(r.phys, nullptr, &ne, de.data());
-          for (uint32_t i = 0; i < ne; i++) if (!strcmp(de[i].extensionName, "VK_EXT_image_robustness")) {
-              VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-              f2.pNext = &irf; vkGetPhysicalDeviceFeatures2(r.phys, &f2);
-              if (irf.robustImageAccess) { dci.pNext = &irf;
-                  dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = img_robust_ext; }
-              break;
+          for (uint32_t i = 0; i < ne; i++) {
+              if (!strcmp(de[i].extensionName, "VK_EXT_image_robustness")) {
+                  VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+                  f2.pNext = &irf; vkGetPhysicalDeviceFeatures2(r.phys, &f2);
+                  if (irf.robustImageAccess) { dci.pNext = &irf; dev_exts.push_back("VK_EXT_image_robustness"); }
+              }
+#ifdef __APPLE__
+              // Spec-mandated: must be enabled when advertised (MoltenVK always advertises it).
+              if (!strcmp(de[i].extensionName, "VK_KHR_portability_subset")) dev_exts.push_back("VK_KHR_portability_subset");
+#endif
           } }
+        dci.enabledExtensionCount = (uint32_t)dev_exts.size();
+        dci.ppEnabledExtensionNames = dev_exts.empty() ? nullptr : dev_exts.data();
         if (vkCreateDevice(r.phys, &dci, nullptr, &r.dev) != VK_SUCCESS || !r.dev) return r;
         vkGetDeviceQueue(r.dev, r.qfi, 0, &r.queue);
         r.ok = true;

@@ -45,3 +45,6 @@ prosper/screenshots/
 *.spv
 *.bmp
 frame_*.png
+
+# Local universal MoltenVK for the macOS (Rosetta/x86_64) app build — not committed
+/.macos-vulkan/
