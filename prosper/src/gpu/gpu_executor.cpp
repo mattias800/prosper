@@ -738,7 +738,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     r.tile_mode = d.tile_mode; r.srgb = fi.srgb;
                     // T# TYPE -> MIMG dim (GFX10: 9=2D, 10=3D, 11=CUBE, 13=2D_ARRAY); a cube
                     // uploads as six vertically-stacked faces (#273 — see agc_shader_layout).
-                    r.img_dim = d.type == 11 ? 3u : d.type == 10 ? 2u : d.type == 13 ? 5u : 1u;
+                    r.img_dim = image_type_to_dim(d.type);
                     r.swizzle[0] = d.dst_sel[0]; r.swizzle[1] = d.dst_sel[1];
                     r.swizzle[2] = d.dst_sel[2]; r.swizzle[3] = d.dst_sel[3];
                     r.size = is_bcn ? (((d.width + 3) / 4) * ((d.height + 3) / 4) * fi.bytes_per_block)
@@ -1009,8 +1009,10 @@ std::vector<ComputeItem> realize_compute_dispatches(
                         d.width > 16384 || d.height > 16384) continue;   // garbage/degenerate T#
                     {
                         bool mapped = false;
+                        const ResourceClass wanted = u.is_store ? ResourceClass::StorageImage
+                                                               : ResourceClass::Texture;
                         for (auto& r0 : table->resources)
-                            if ((r0.cls == ResourceClass::Texture || r0.cls == ResourceClass::StorageImage) &&
+                            if (r0.cls == wanted &&
                                 r0.gpu_addr == d.base && r0.width == d.width && r0.height == d.height) {
                                 if (r0.fetch_pc == 0xFFFFFFFFu) { r0.fetch_pc = u.use_pc; mapped = true; break; }
                                 if (r0.fetch_pc == u.use_pc)    { mapped = true; break; }
@@ -1019,33 +1021,31 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     }
                     Gen5ImageFormatInfo fi;
                     const bool mapped_fmt = gen5_image_format(d.format, &fi);
-                    // Storage images move texels bit-exact (uint view; format lives in the T#), so an
-                    // unmapped IMG_FMT is acceptable THERE with a 4-byte-texel assumption only when the
-                    // format is genuinely unknown; sampled textures keep the strict policy (skip when
-                    // unmapped — a wrong RGBA8 read samples garbage).
+                    // Unknown sampled formats cannot be decoded. Unknown storage formats may still
+                    // recompile (format-free SPIR-V), but remain explicitly Unknown so the live backend
+                    // rejects them instead of silently treating arbitrary bytes as RGBA8.
                     if (!mapped_fmt && !u.is_store) continue;
                     if (mapped_fmt && fi.block_width > 1 && fi.snorm) continue;   // signed BCn: not wired
                     ShaderResource r;
                     r.cls = u.is_store ? ResourceClass::StorageImage : ResourceClass::Texture;
-                    // 3D / 2D_ARRAY surfaces (SQ_RSRC_IMG type 10 / 13) carry their slice count in
-                    // the T#'s WORD4 DEPTH field — the storage-image path sizes the bound image and
-                    // its guest writeback with it (#590). Plain 2D keeps depth 1.
-                    const uint32_t slices = (d.type == 10 || d.type == 13)
-                                                ? (d.depth ? d.depth : 1u) : 1u;
                     if (mapped_fmt) {
                         r.format = fi.format; r.num_components = fi.num_components;
                         const bool is_bcn = fi.block_width > 1;
-                        r.size = is_bcn ? (((d.width + 3) / 4) * ((d.height + 3) / 4) * fi.bytes_per_block)
-                                        : (d.width * d.height * fi.bytes_per_block * slices);
+                        const uint64_t bytes = is_bcn
+                            ? static_cast<uint64_t>((d.width + 3) / 4) * ((d.height + 3) / 4) * fi.bytes_per_block
+                            : static_cast<uint64_t>(d.width) * d.height * fi.bytes_per_block;
+                        if (!bytes || bytes > UINT32_MAX) continue;
+                        r.size = static_cast<uint32_t>(bytes);
                         r.srgb = fi.srgb;
                     } else {
-                        r.format = DataFormat::Unorm8; r.num_components = 4;
-                        r.size = d.width * d.height * 4 * slices;
+                        const uint64_t bytes = static_cast<uint64_t>(d.width) * d.height * 4;
+                        if (!bytes || bytes > UINT32_MAX) continue;
+                        r.format = DataFormat::Unknown; r.num_components = 4;
+                        r.size = static_cast<uint32_t>(bytes);
                     }
                     r.gpu_addr = d.base; r.width = d.width; r.height = d.height;
-                    r.depth = slices;
                     r.tile_mode = d.tile_mode;
-                    r.img_dim = d.type == 11 ? 3u : d.type == 10 ? 2u : d.type == 13 ? 5u : 1u;
+                    r.img_dim = image_type_to_dim(d.type);
                     r.swizzle[0] = d.dst_sel[0]; r.swizzle[1] = d.dst_sel[1];
                     r.swizzle[2] = d.dst_sel[2]; r.swizzle[3] = d.dst_sel[3];
                     r.srt_offset = clash ? 0xFFFFFFFFu : u.key;

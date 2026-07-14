@@ -107,9 +107,6 @@ struct ShaderResource {
     uint32_t      img_dim           = 1;
     uint32_t      width             = 0;
     uint32_t      height            = 0;
-    // 3D depth / array-layer count from the T#'s WORD4 DEPTH field (#590); 1 for plain 2D. Used by
-    // the compute storage-image path to size 3D/2D_ARRAY images and their guest writeback.
-    uint32_t      depth             = 1;
     uint32_t      tile_mode         = 0;                  // T# GFX10 TileMode; drives auto-detile of a sampled surface
     bool          srgb              = false;              // T# is a gamma-encoded (sRGB) surface — sample with sRGB->linear (#263)
     uint32_t      sampler_sgpr_base = 0xFFFFFFFFu;

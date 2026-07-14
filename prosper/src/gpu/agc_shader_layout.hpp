@@ -77,11 +77,6 @@ DecodedBufferDescriptor decode_buffer_descriptor(const uint32_t v[4]);
 struct DecodedImageDescriptor {
     uint64_t base = 0;
     uint32_t width = 0, height = 0;
-    // DEPTH+1 (3D) / last-array-slice+1 (arrays) from WORD4 bits [12:0], per the same AMD GFX10
-    // register DB the fields above cite (SQ_IMG_RSRC_WORD4.DEPTH). 1 for plain 2D. Consumed by the
-    // compute storage-image path (#590) to size 3D/array images. CONFIDENCE: MED (DB-derived, no
-    // live cross-check yet — a wrong value mis-sizes the bound image; reads stay bounds-checked).
-    uint32_t depth = 1;
     uint32_t format = 0;      // Gen5 surface-format enum (fields[1] bits 20..28)
     uint32_t tile_mode = 0;   // 0 = linear
     uint8_t  type = 0;        // SQ_RSRC_IMG dim (GFX10: 8=1D, 9=2D, 10=3D, 11=CUBE, 12=1D_ARRAY, 13=2D_ARRAY).
@@ -93,6 +88,10 @@ struct DecodedImageDescriptor {
 };
 // Decode an 8-dword T# (RDNA2/Gen5 image resource). Pure; exposed for reuse + testing.
 DecodedImageDescriptor decode_image_descriptor(const uint32_t t[8]);
+
+// Convert SQ_RSRC_IMG TYPE (8..15) to the MIMG dim convention (0..7). Unknown values retain the
+// long-standing 2D fallback.
+uint32_t image_type_to_dim(uint8_t type);
 
 // A Gen5/GFX10 T# IMG_FMT (the 9-bit combined format field) decoded to sizing + conversion info.
 // bytes_per_block is the byte size of one block_width x block_height texel block — for uncompressed

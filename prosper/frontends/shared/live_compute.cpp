@@ -18,6 +18,8 @@
 namespace prosper::frontend {
 namespace {
 
+constexpr VkDeviceSize kMaxComputeImageBytes = 256ull << 20;
+
 struct VulkanComputeContext {
     VkInstance instance = VK_NULL_HANDLE;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
@@ -160,6 +162,7 @@ void storage_pack_texel(const uint32_t in[4], prosper::gpu::DataFormat f, uint32
     for (uint32_t c = 0; c < ncomp && c < 4; c++) {
         switch (f) {
             case DF::Unorm8: { float v; std::memcpy(&v, &in[c], 4);
+                               if (std::isnan(v)) v = 0.f;
                                v = v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
                                dst[c] = (uint8_t)std::lround(v * 255.0f); break; }
             default: std::memcpy(dst + c * 4, &in[c], 4); break;    // 32-bit raw
@@ -225,7 +228,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         }
     }
     if (descriptors.empty() && image_descriptors.empty()) return false;
-    if (!image_descriptors.empty() && !ctx.image_support) {
+    const bool has_storage_images = std::any_of(
+        image_descriptors.begin(), image_descriptors.end(), [](const auto& descriptor) {
+            return descriptor.kind == SpirvDescriptorKind::StorageImage;
+        });
+    if (has_storage_images && !ctx.image_support) {
         static bool warned = false;
         if (!warned) { warned = true;
             std::fprintf(stderr, "[compute] device lacks shaderStorageImageRead/WriteWithoutFormat; "
@@ -340,7 +347,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 std::fprintf(stderr, "[compute] program 0x%llx image 0x%llx %ux%ux%u fmt=%u: %s -> "
                                      "dispatch skipped (#590)\n",
                              (unsigned long long)item.code_addr, (unsigned long long)key,
-                             r ? r->width : 0, r ? r->height : 0, r ? r->depth : 0,
+                             r ? r->width : 0, r ? r->height : 0, 1u,
                              r ? (unsigned)r->format : 0u, why);
             }
             images_ready = false;
@@ -355,11 +362,16 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // A surface whose CURRENT pixels live in the renderer's RTT cache must not be read from
             // raw guest memory (empty/stale — the Dead Cells 642x362 lesson).
             if (is_live_render_target(r->gpu_addr)) { skip_image(r, "renderer-owned RTT surface"); break; }
-            const uint32_t slices = r->depth ? r->depth : 1;
-            const bool dim_1d = r->img_dim == 0, dim_3d = r->img_dim == 2, dim_array = r->img_dim == 5;
-            if (!dim_1d && !dim_3d && !dim_array && r->img_dim != 1) { skip_image(r, "unsupported image dim"); break; }
+            const bool dim_1d = r->img_dim == 0;
+            if (!dim_1d && r->img_dim != 1) {
+                skip_image(r, "layered/3D image deferred to #657"); break;
+            }
+            if (dim_1d && r->height != 1) { skip_image(r, "1D image has non-unit height"); break; }
             const uint32_t texel_bytes = bi.storage ? 16u : 4u;   // uvec4 raw channels / RGBA8
-            const VkDeviceSize sbytes = (VkDeviceSize)r->width * r->height * slices * texel_bytes;
+            const VkDeviceSize sbytes = static_cast<VkDeviceSize>(r->width) * r->height * texel_bytes;
+            if (!sbytes || sbytes > kMaxComputeImageBytes) {
+                skip_image(r, "expanded image exceeds the 256 MiB backend bound"); break;
+            }
             staging_bytes[i] = sbytes;
 
             // Fill the upload staging bytes.
@@ -371,30 +383,39 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const uint32_t cb = data_format_bytes(r->format);
                 const uint32_t nc = r->num_components ? r->num_components : 1;
                 const size_t guest_texel = (size_t)cb * nc;
-                const size_t texels = (size_t)r->width * r->height * slices;
+                const size_t texels = (size_t)r->width * r->height;
+                const uint64_t guest_bytes = static_cast<uint64_t>(texels) * guest_texel;
+                if (!guest_bytes || guest_bytes > UINT32_MAX || guest_bytes > r->size) {
+                    skip_image(r, "storage backing size is invalid"); break;
+                }
                 const uint8_t* src = resource_bytes(r);
-                const bool readable = (r->host_data && r->host_data_size >= texels * guest_texel) ||
-                                      guest_readable(r->gpu_addr, (uint32_t)(texels * guest_texel));
-                // Unreadable source = a fresh store-only allocation: seed zeros (the kernel writes it).
-                if (readable)
-                    for (size_t t = 0; t < texels; t++)
-                        storage_unpack_texel(src + t * guest_texel, r->format, nc,
-                                             reinterpret_cast<uint32_t*>(upload.data()) + t * 4);
+                const bool readable = (r->host_data && r->host_data_size >= guest_bytes) ||
+                                      guest_readable(r->gpu_addr, static_cast<uint32_t>(guest_bytes));
+                if (!readable) { skip_image(r, "storage backing unreadable"); break; }
+                for (size_t t = 0; t < texels; t++)
+                    storage_unpack_texel(src + t * guest_texel, r->format, nc,
+                                         reinterpret_cast<uint32_t*>(upload.data()) + t * 4);
             } else {
                 if (r->img_dim != 1) { skip_image(r, "non-2D sampled texture"); break; }
                 const uint32_t bpb = bc_block_bytes(r->format);
                 const uint32_t cb = data_format_bytes(r->format);
                 const uint32_t nc = r->num_components ? r->num_components : 1;
+                const bool rgba8 = r->format == DataFormat::Unorm8 && nc == 4;
+                const bool r8 = r->format == DataFormat::Unorm8 && nc == 1;
+                const bool f16 = r->format == DataFormat::Float16 && nc >= 1 && nc <= 4;
                 size_t need;                                       // guest bytes the decode reads
                 if (bpb) {
                     const uint32_t bw = (r->width + 3) / 4, bh = (r->height + 3) / 4;
                     need = r->tile_mode ? tiled_elements_bytes(bw, bh, bpb, r->tile_mode)
                                         : (size_t)bw * bh * bpb;
-                } else if (cb * nc == 4 || cb * nc == 1 || (r->format == DataFormat::Float16 && nc == 4)) {
+                } else if (rgba8 || r8 || f16) {
                     const uint32_t bpt = cb * nc;
                     need = r->tile_mode ? tiled_surface_bytes(r->width, r->height, r->tile_mode, 0, bpt)
                                         : (size_t)r->width * r->height * bpt;
                 } else { skip_image(r, "sampled format not decodable yet"); break; }
+                if (!need || need > kMaxComputeImageBytes || need > UINT32_MAX) {
+                    skip_image(r, "sampled backing exceeds the 256 MiB backend bound"); break;
+                }
                 const uint8_t* src = resource_bytes(r);
                 const bool readable = (r->host_data && r->host_data_size >= need) ||
                                       guest_readable(r->gpu_addr, (uint32_t)need);
@@ -417,20 +438,27 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     else
                         std::memcpy(lin.data(), src, lin.size());
                     const size_t texels = (size_t)r->width * r->height;
-                    if (bpt == 4) {                                 // RGBA8-class: direct
+                    if (rgba8) {                                    // RGBA8: direct
                         std::memcpy(upload.data(), lin.data(), lin.size());
-                    } else if (bpt == 1) {                          // R8: broadcast coverage to RGBA
+                    } else if (r8) {                                // R8: broadcast coverage to RGBA
                         for (size_t t = 0; t < texels; t++) {
                             const uint8_t v = lin[t];
                             upload[t * 4 + 0] = v; upload[t * 4 + 1] = v;
                             upload[t * 4 + 2] = v; upload[t * 4 + 3] = v;
                         }
-                    } else {                                        // Float16 x4: half -> UNORM8 clamp
+                    } else {                                        // Float16: half -> UNORM8 + default fill
                         const uint16_t* hp = reinterpret_cast<const uint16_t*>(lin.data());
-                        for (size_t t = 0; t < texels * 4; t++) {
-                            float v = half_to_float(hp[t]);
-                            v = v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
-                            upload[t] = (uint8_t)std::lround(v * 255.0f);
+                        for (size_t t = 0; t < texels; t++) {
+                            for (uint32_t c = 0; c < 4; c++) {
+                                if (c >= nc) {
+                                    upload[t * 4 + c] = c == 3 ? 255 : 0;
+                                    continue;
+                                }
+                                float v = half_to_float(hp[t * nc + c]);
+                                if (std::isnan(v)) v = 0.f;
+                                v = v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
+                                upload[t * 4 + c] = (uint8_t)std::lround(v * 255.0f);
+                            }
                         }
                     }
                 }
@@ -458,11 +486,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
 
             // Device-local image.
             VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-            ici.imageType = dim_1d ? VK_IMAGE_TYPE_1D : dim_3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
+            ici.imageType = dim_1d ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D;
             ici.format = bi.storage ? VK_FORMAT_R32G32B32A32_UINT : VK_FORMAT_R8G8B8A8_UNORM;
-            ici.extent = {r->width, r->height, dim_3d ? slices : 1u};
+            ici.extent = {r->width, r->height, 1};
             ici.mipLevels = 1;
-            ici.arrayLayers = dim_array ? slices : 1u;
+            ici.arrayLayers = 1;
             ici.samples = VK_SAMPLE_COUNT_1_BIT;
             ici.tiling = VK_IMAGE_TILING_OPTIMAL;
             ici.usage = (bi.storage ? (VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
@@ -481,8 +509,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 images_ready = false; break; }
             VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
             vci.image = bi.image;
-            vci.viewType = dim_1d ? VK_IMAGE_VIEW_TYPE_1D : dim_3d ? VK_IMAGE_VIEW_TYPE_3D
-                         : dim_array ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+            vci.viewType = dim_1d ? VK_IMAGE_VIEW_TYPE_1D : VK_IMAGE_VIEW_TYPE_2D;
             vci.format = ici.format;
             if (!bi.storage) {
                 // T# DST_SEL channel routing (SQ_SEL: 0=0, 1=1, 4=R, 5=G, 6=B, 7=A) — same mapping
@@ -620,8 +647,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         for (size_t i = 0; i < images.size(); i++) {
             const BoundImage& bi = images[i];
             const ShaderResource* r = bi.resource;
-            const uint32_t slices = r->depth ? r->depth : 1;
-            const bool dim_1d = r->img_dim == 0, dim_3d = r->img_dim == 2, dim_array = r->img_dim == 5;
             VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
             to_dst.srcAccessMask = 0;
             to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -629,13 +654,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             to_dst.srcQueueFamilyIndex = to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             to_dst.image = bi.image;
-            to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
-                                       dim_array ? slices : 1u};
+            to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
             vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                                  VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_dst);
             VkBufferImageCopy region{};
-            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, dim_array ? slices : 1u};
-            region.imageExtent = {r->width, r->height, dim_3d ? slices : 1u};
+            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            region.imageExtent = {r->width, r->height, 1};
             vkCmdCopyBufferToImage(command, staging[i], bi.image,
                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
             VkImageMemoryBarrier to_general = to_dst;
@@ -657,8 +681,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const BoundImage& bi = images[i];
             if (!bi.storage) continue;
             const ShaderResource* r = bi.resource;
-            const uint32_t slices = r->depth ? r->depth : 1;
-            const bool dim_1d = r->img_dim == 0, dim_3d = r->img_dim == 2, dim_array = r->img_dim == 5;
             VkImageMemoryBarrier to_src{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
             to_src.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
             to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -666,13 +688,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             to_src.srcQueueFamilyIndex = to_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             to_src.image = bi.image;
-            to_src.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
-                                       dim_array ? slices : 1u};
+            to_src.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
             vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                  VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_src);
             VkBufferImageCopy region{};
-            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, dim_array ? slices : 1u};
-            region.imageExtent = {r->width, r->height, dim_3d ? slices : 1u};
+            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            region.imageExtent = {r->width, r->height, 1};
             vkCmdCopyImageToBuffer(command, bi.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                    staging[i], 1, &region);
         }
@@ -724,22 +745,17 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const uint32_t cb = data_format_bytes(r->format);
             const uint32_t nc = r->num_components ? r->num_components : 1;
             const size_t guest_texel = (size_t)cb * nc;
-            const uint32_t slices = r->depth ? r->depth : 1;
-            const size_t texels = (size_t)r->width * r->height * slices;
+            const size_t texels = (size_t)r->width * r->height;
             uint8_t* destination = resource_bytes(r);
-            const bool writable = (r->host_data && r->host_data_size >= texels * guest_texel) ||
-                                  guest_readable(r->gpu_addr, (uint32_t)(texels * guest_texel));
-            if (writable) {
-                const uint32_t* channels = static_cast<const uint32_t*>(mapped);
-                for (size_t t = 0; t < texels; t++)
-                    storage_pack_texel(channels + t * 4, r->format, nc, destination + t * guest_texel);
-                notify_guest_gpu_write(r->gpu_addr, texels * guest_texel);
-                if (!r->host_data && writer_provenance_enabled())
-                    record_guest_write(GuestWriterKind::ComputeBuffer,
-                                       r->gpu_addr, texels * guest_texel,
-                                       item.submit_no, item.dispatch_index,
-                                       item.command_order, item.code_addr);
-            }
+            const uint32_t* channels = static_cast<const uint32_t*>(mapped);
+            for (size_t t = 0; t < texels; t++)
+                storage_pack_texel(channels + t * 4, r->format, nc, destination + t * guest_texel);
+            notify_guest_gpu_write(r->gpu_addr, texels * guest_texel);
+            if (!r->host_data && writer_provenance_enabled())
+                record_guest_write(GuestWriterKind::ComputeBuffer,
+                                   r->gpu_addr, texels * guest_texel,
+                                   item.submit_no, item.dispatch_index,
+                                   item.command_order, item.code_addr);
             vkUnmapMemory(ctx.device, staging_memory[i]);
         }
         if (!readback_ok) break;

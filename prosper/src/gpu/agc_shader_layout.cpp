@@ -140,7 +140,6 @@ DecodedImageDescriptor decode_image_descriptor(const uint32_t t[8]) {
     d.base      = (((uint64_t)t[0] | ((uint64_t)t[1] << 32)) & 0xFFFFFFFFFFull) << 8;             // Base40
     d.width     = (uint32_t)(((t[1] >> 30) & 0x3u) | (((t[2] >> 0) & 0xFFFu) << 2)) + 1;          // Width5
     d.height    = (uint32_t)((t[2] >> 14) & 0x3FFFu) + 1;                                          // Height5
-    d.depth     = (uint32_t)(t[4] & 0x1FFFu) + 1;                                                  // Depth (WORD4[12:0])
     d.format    = (t[1] >> 20) & 0x1FFu;                                                           // Format
     d.tile_mode = (t[3] >> 20) & 0x1Fu;                                                            // TileMode (SW_MODE)
     d.type      = (uint8_t)((t[3] >> 28) & 0xFu);                                                  // Type
@@ -149,6 +148,10 @@ DecodedImageDescriptor decode_image_descriptor(const uint32_t t[8]) {
     d.dst_sel[2] = (uint8_t)((t[3] >> 6) & 0x7u);   // DST_SEL_Z ([8:6])
     d.dst_sel[3] = (uint8_t)((t[3] >> 9) & 0x7u);   // DST_SEL_W ([11:9])
     return d;
+}
+
+uint32_t image_type_to_dim(uint8_t type) {
+    return type >= 8 && type <= 15 ? static_cast<uint32_t>(type - 8) : 1u;
 }
 
 ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
@@ -346,7 +349,7 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             // T# TYPE -> the MIMG dim convention (GFX10 SQ_RSRC_IMG: 8=1D, 9=2D, 10=3D, 11=CUBE,
             // 12=1D_ARRAY, 13=2D_ARRAY). A CUBE resource (img_dim 3) uploads as six faces stacked
             // vertically in one 2D image (#273); everything else keeps the 2D default.
-            r.img_dim       = d.type == 11 ? 3u : d.type == 10 ? 2u : d.type == 13 ? 5u : 1u;
+            r.img_dim       = image_type_to_dim(d.type);
             r.srgb          = fi.srgb;              // gamma-encoded surface: sample with sRGB->linear (#263)
             if (fi.srgb && getenv("PROSPER_GFXLOG"))
                 fprintf(stderr, "[t#] SRGB texture fmt=%u %ux%u (binding %u)\n", d.format, d.width, d.height, r.binding);

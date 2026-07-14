@@ -141,7 +141,7 @@ int main() {
         im.sgpr_base = sgpr;
         im.format = DataFormat::Unorm8;
         im.num_components = 4;
-        im.width = W; im.height = 1; im.depth = 1;
+        im.width = W; im.height = 1;
         im.gpu_addr = (uint64_t)(uintptr_t)data;
         im.size = size;
         irt.resources.push_back(im);
