@@ -2,6 +2,7 @@
 // on non-Linux so the shared (mingw) build is unaffected.
 #include "exec_image.hpp"
 #include "sse4a.hpp"
+#include "fs_emu.hpp"
 #include "../hle/nid.hpp"
 #include "../hle/dispatch.hpp"
 
@@ -718,75 +719,19 @@ namespace {
         if (!tp) return false;
         auto g = PROSPER_GREGS(uc);
         const uint8_t* p = (const uint8_t*)(uintptr_t)g[REG_RIP];
-        size_t i = 0;
-        bool fs = false, opsz16 = false;
-        for (;; i++) {              // legacy prefixes
-            uint8_t b = p[i];
-            if (b == 0x64) { fs = true; continue; }                 // %fs override — the one we want
-            if (b == 0x66) { opsz16 = true; continue; }
-            if (b==0xF2||b==0xF3||b==0x2E||b==0x36||b==0x3E||b==0x26||b==0x65||b==0x67) continue;
-            break;
-        }
-        if (!fs) return false;      // no fs prefix -> a genuine fault, not guest TLS
-        uint8_t rex = 0;
-        if ((p[i] & 0xF0) == 0x40) rex = p[i++];
-        bool w = rex & 8; bool rexR = rex & 4;
-        uint8_t op = p[i++];
-        bool two = (op == 0x0F);
-        if (two) op = p[i++];
-        uint8_t modrm = p[i++];
-        int mod = modrm >> 6;
-        int reg = ((modrm >> 3) & 7) | (rexR ? 8 : 0);
-        int rm  = modrm & 7;
-        if (mod == 3) return false;                 // register operand: not an fs memory access
-        size_t sib_off = i;
-        if (rm == 4) i++;                            // SIB byte present
-        if (mod == 0) {
-            if (rm == 5) i += 4;                     // disp32 (no base)
-            else if (rm == 4 && (p[sib_off] & 7) == 5) i += 4;
-        } else if (mod == 1) i += 1;
-        else i += 4;                                 // mod == 2
         // Safety: only touch the guest TCB window [TP - total_below, TP + 0x200). A mis-decode with a
         // wild offset is treated as a real fault (bail) rather than corrupting/reading random memory.
         int64_t off = (int64_t)fault_addr;
         if (off < -(int64_t)guest_tls_total_below() || off >= 0x200) return false;
         volatile uint8_t* mem = (volatile uint8_t*)(uintptr_t)(tp + fault_addr);
 
-        auto wr_reg = [&](int xr, uint64_t v, int sz) {   // write a value into a reg with x86 width rules
-            uint64_t& r = g[kX86ToReg[xr]];
-            if (sz == 8)      r = v;
-            else if (sz == 4) r = (uint32_t)v;                    // 32-bit dest zero-extends to 64
-            else if (sz == 2) r = (r & ~0xffffull) | (v & 0xffff);
-            else              r = (r & ~0xffull)   | (v & 0xff);
-        };
-        auto rd_mem = [&](int sz) -> uint64_t {
-            uint64_t v = 0; for (int k = 0; k < sz; k++) v |= (uint64_t)mem[k] << (8*k); return v;
-        };
-        auto wr_mem = [&](uint64_t v, int sz) { for (int k = 0; k < sz; k++) mem[k] = (uint8_t)(v >> (8*k)); };
-
-        int sz = w ? 8 : (opsz16 ? 2 : 4);
-        bool handled = false;
-        if (!two) {
-            switch (op) {
-                case 0x8B: wr_reg(reg, rd_mem(sz), sz); handled = true; break;            // mov r, [fs:m]
-                case 0x8A: wr_reg(reg, rd_mem(1), 1);  handled = true; break;            // mov r8, [fs:m8]
-                case 0x89: wr_mem(g[kX86ToReg[reg]], sz); handled = true; break;         // mov [fs:m], r
-                case 0x88: wr_mem(g[kX86ToReg[reg]], 1);  handled = true; break;         // mov [fs:m8], r8
-                case 0xC7: { int isz = opsz16 ? 2 : 4; int32_t im = 0; memcpy(&im, p + i, isz); i += isz;
-                             wr_mem(w ? (uint64_t)(int64_t)im : (uint64_t)(uint32_t)im, sz); handled = true; break; } // mov [fs:m], imm
-                case 0xC6: { uint8_t imm = p[i++]; wr_mem(imm, 1); handled = true; break; }  // mov [fs:m8], imm8
-                default: break;
-            }
-        } else {
-            switch (op) {
-                case 0xB6: wr_reg(reg, rd_mem(1), w?8:4); handled = true; break;          // movzx r, m8
-                case 0xB7: wr_reg(reg, rd_mem(2), w?8:4); handled = true; break;          // movzx r, m16
-                case 0xBE: wr_reg(reg, (uint64_t)(int64_t)(int8_t)rd_mem(1), w?8:4);  handled = true; break;  // movsx m8
-                case 0xBF: wr_reg(reg, (uint64_t)(int64_t)(int16_t)rd_mem(2), w?8:4); handled = true; break;  // movsx m16
-                default: break;
-            }
-        }
-        if (!handled) {
+        // Decode + execute via the platform-neutral core (fs_emu.hpp — unit-tested on Linux,
+        // tests/test_fs_emu.cpp, incl. the #727 AH/CH/DH/BH byte-register rules).
+        uint64_t regs[16];
+        for (int k = 0; k < 16; k++) regs[k] = (uint64_t)g[kX86ToReg[k]];
+        FsEmuResult res = fs_emulate_access(p, mem, regs);
+        if (res.status == FsEmuStatus::NotFs) return false;   // genuine fault, not guest TLS
+        if (res.status == FsEmuStatus::Unhandled) {
             char b[128]; int n = snprintf(b, sizeof b,
                 "[fs-emu] UNHANDLED fs insn rip=0x%llx off=%lld bytes: %02x %02x %02x %02x %02x %02x %02x %02x\n",
                 (unsigned long long)g[REG_RIP], (long long)off,
@@ -794,7 +739,8 @@ namespace {
             ssize_t wr = write(2, b, (size_t)(n>0?n:0)); (void)wr;
             return false;   // fall through to the normal (fatal) fault path so the form is visible
         }
-        g[REG_RIP] = (greg_t)(uintptr_t)(p + i);   // advance past the emulated instruction
+        for (int k = 0; k < 16; k++) g[kX86ToReg[k]] = (greg_t)regs[k];
+        g[REG_RIP] = (greg_t)(uintptr_t)(p + res.insn_len);   // advance past the emulated instruction
         g_fs_emulated++;
         if (g_fslog && (g_fs_emulated & 0x3FFF) == 0) {
             char b[64]; int n = snprintf(b, sizeof b, "[fs-emu] %lu accesses\n", g_fs_emulated);

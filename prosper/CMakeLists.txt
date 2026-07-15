@@ -155,6 +155,12 @@ if(TARGET prosper_core)
   add_executable(test_sse4a tests/test_sse4a.cpp)
   add_test(NAME sse4a_insertq_extrq COMMAND test_sse4a)
 
+  # macOS/Rosetta %fs trap-emulation decode core (guest-TLS access redirection). Golden
+  # instruction vectors incl. the #727 no-REX AH/CH/DH/BH byte-register rules — header-only,
+  # runs on Linux where the __APPLE__ handler itself never compiles.
+  add_executable(test_fs_emu tests/test_fs_emu.cpp)
+  add_test(NAME fs_emu_decode COMMAND test_fs_emu)
+
   # sceAudioOut HLE: format decode, port lifecycle, PCM forwarding, volume, batch, error paths
   # (via a capturing AudioSink — headless, no device).
   add_executable(test_audio tests/test_audio.cpp)
