@@ -100,10 +100,15 @@ int main(int argc, char** argv) {
                 catch (const std::exception& ex) { fprintf(stderr, "  what(): %s\n", ex.what()); }
                 catch (...) { fprintf(stderr, "  (non-std exception)\n"); }
             }
+#ifndef _WIN32
             void* frames[64];
             int n = backtrace(frames, 64);
             char** syms = backtrace_symbols(frames, n);
             for (int i = 0; i < n; ++i) fprintf(stderr, "  #%02d %s\n", i, syms ? syms[i] : "?");
+#else
+            // No execinfo on MinGW; the exception message above is still the useful part.
+            fprintf(stderr, "  (host backtrace unavailable on this platform)\n");
+#endif
             fflush(stderr);
             _Exit(42);
         });
