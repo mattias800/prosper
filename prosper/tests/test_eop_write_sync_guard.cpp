@@ -24,7 +24,12 @@ static constexpr uint64_t kUnmapped = 0x5F0000010000ull;
 
 int main() {
     // Must be set before the first honor_* call: eop_write_sync() latches on first use.
+    // (MinGW has no setenv; _putenv is the Windows equivalent.)
+#ifdef _WIN32
+    _putenv((char*)"PROSPER_EOP_WRITE_SYNC=1");
+#else
     setenv("PROSPER_EOP_WRITE_SYNC", "1", 1);
+#endif
     printf("== test_eop_write_sync_guard ==\n");
 
     // RELEASE_MEM (data_sel=1) to an unmapped label: the #312 pre-read alone used to fault.
