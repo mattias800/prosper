@@ -82,6 +82,22 @@ int main() {
                           sizeof(compute_cfg_dispatch)/sizeof(compute_cfg_dispatch[0]), 0, 0,
                           &dispatch_rt).empty(),
           "a nested varying-VCC compute CFG preserves spilled EXEC and lowers through the dispatcher");
+    // Ordinary LDS effects do not require workgroup-uniform control flow. Keep the same dispatcher
+    // shape, but make the inner SCC arm conditionally execute a ds_write_b32 before the back-edge.
+    // (A barrier remains forbidden below; only the blanket rejection of raw DS is being relaxed.)
+    const uint32_t compute_cfg_dispatch_lds[] = {
+        0xBE800380u, 0x7E000280u, 0x7E020300u,
+        0xD7610013u, 0x00014A7Eu, 0xD7610013u, 0x0001507Fu,
+        0xD760000Eu, 0x00014B13u, 0xD760000Fu, 0x00015113u, 0xBEFE040Eu,
+        0xE00C2000u, 0x80020400u, 0x7DB900F9u, 0x86050007u,
+        0x7D020200u, 0xBF860006u, 0xBF0A8204u, 0x360000FDu, 0xBF840002u,
+        0xD8340000u, 0x00000302u, 0xBF82FFF4u,
+        0xBF810000u,
+    };
+    CHECK(!recompile_valu(compute_cfg_dispatch_lds,
+                          sizeof(compute_cfg_dispatch_lds)/sizeof(compute_cfg_dispatch_lds[0]), 0, 0,
+                          &dispatch_rt).empty(),
+          "a complex compute CFG may execute ordinary LDS writes through the dispatcher");
     const uint32_t scc_data_source[] = {
         0xBF060000u, 0x360000FDu, 0xBF810000u, // s_cmp_eq_u32 s0,s0; v_and_b32 v0,scc,v0
     };
@@ -158,17 +174,16 @@ int main() {
                          sizeof(compute_vcc_if_clobber)/sizeof(compute_vcc_if_clobber[0]), 0, 0).empty(),
           "an intervening write to s106 (VCC) between compare and branch stops the proof");
 
-    // A forward s_cbranch_execz that REJOINS LIVE CODE is only safe to linearize when its skipped block
-    // is EXEC-predicated VGPR writes. Here the block is a scalar write (s_mov_b32 s0,1) and the branch
-    // target is a live use of s0 (v_mov_b32 v0,s0) — the scalar write is NOT dead, so linearizing would
-    // wrongly set s0 for lanes that should have skipped. Must reject.
+    // A forward s_cbranch_execz that REJOINS LIVE CODE cannot be linearized when its skipped block has
+    // a live scalar write. The compute structurizer now handles that case with subgroupAny(EXEC), so
+    // the whole wave either executes or skips the scalar write and its live use remains exact.
     //   v_cmpx ; s_cbranch_execz +1 ; s_mov_b32 s0,1 ; v_mov_b32 v0,s0 ; s_endpgm
     const uint32_t execz_scalar[] = { 0x7da80300u, 0xbf880001u, 0xbe800381u, 0x7e000200u, 0xBF810000u };
     RecompileCoverage d = recompile_coverage(execz_scalar, sizeof(execz_scalar)/sizeof(execz_scalar[0]));
-    CHECK(d.unsupported == 1 && d.first_bad_fmt >= 0 && d.first_bad_op == 0x08,
-          "a narrowed EXEC branch over live scalar state (rejoining live code) is rejected");
-    CHECK(recompile_valu(execz_scalar, sizeof(execz_scalar)/sizeof(execz_scalar[0]), 2, 0).empty(),
-          "the production recompiler rejects execz branches that would skip live scalar writes");
+    CHECK(d.unsupported == 0,
+          "a narrowed EXEC branch over live scalar state is reconstructed in compute coverage");
+    CHECK(!recompile_valu(execz_scalar, sizeof(execz_scalar)/sizeof(execz_scalar[0]), 2, 0).empty(),
+          "the production recompiler structures execz branches over live scalar writes");
 
     // But the SAME scalar write IS safe to linearize when the execz skips straight to s_endpgm: the
     // write is dead (nothing runs after s_endpgm) and scalar ops are wave-uniform, so running it under

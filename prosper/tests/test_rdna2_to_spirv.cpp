@@ -386,6 +386,31 @@ int main() {
     CHECK(act17b>0 && act17b<N, "kernel 17b exercises both complemented-mask outcomes");
     CHECK(got17b.size()==N && bad17b==0, "s_not_b64 complements VCC before EXEC predication");
 
+    // Kernel 17c: compute s_cbranch_execz tests whether the whole wave's EXEC mask is empty.
+    // The guarded scalar write is live after the merge, so the safe-linearization shortcut cannot
+    // consume this branch. Wave 0 has no surviving lanes and keeps s0=0; wave 1 is active and writes
+    // s0=5. The following EXEC restore lets every lane report its wave's scalar result.
+    const uint32_t code17c[] = {
+        0x7e000f00u, 0x7e020f01u, 0x7d880300u, 0xbeea086au, 0xbefe046au,
+        0xbf880001u, 0xbe800385u, 0xbefe04c1u, 0x7e040c00u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv17c = recompile_valu(
+        code17c, sizeof(code17c)/sizeof(code17c[0]), 2, /*out_vgpr*/2);
+    CHECK(!spv17c.empty(), "recompiled kernel 17c (compute wave-wide execz if) -> SPIR-V");
+    std::vector<float> in17c(N * 2), exp17c(N);
+    for (uint32_t i = 0; i < N; i++) {
+        const bool empty_after_not = i < 64;
+        in17c[i*2+0] = empty_after_not ? 2.0f : 1.0f;
+        in17c[i*2+1] = empty_after_not ? 1.0f : 2.0f;
+        exp17c[i] = empty_after_not ? 0.0f : 5.0f;
+    }
+    std::vector<float> got17c = prosper::test::run_compute(spv17c, in17c, N, N);
+    uint32_t bad17c = 0;
+    for (uint32_t i=0;i<N&&got17c.size()==N;i++)
+        if (std::fabs(got17c[i]-exp17c[i])>1e-3f) bad17c++;
+    CHECK(got17c.size()==N && bad17c==0,
+          "compute execz uses subgroupAny(EXEC): empty wave skips, active wave enters");
+
     // Kernel 18: the REAL if-then idiom with a forward branch. v3=7; vcc=(u0>u1);
     // s_and_saveexec_b64 s[0:1],vcc (save exec, exec=vcc); s_cbranch_execz skip (forward -> no-op);
     // v_add v3=u0+u1 (predicated); skip: s_mov_b64 exec,s[0:1] (restore); cvt+store. Same result as
@@ -831,6 +856,248 @@ int main() {
            bad32, got32.size()==WG?got32[0]:-1, got32.size()==WG?got32[63]:-1);
     CHECK(got32.size()==WG && bad32==0, "recompiled kernel 32 (LDS write->barrier->cross-lane read) correct");
 
+    // Kernel 32b: gfx10 wide LDS operations used by UE4's volume-lighting compute producer. write2_b64
+    // writes v[1:2] at byte 0 and v[3:4] at byte 8; write_b64 repeats the first pair. read_b64 recovers
+    // the first pair and read2_b64 recovers both; selecting the non-duplicate halves gives 1+2+3+4=10.
+    const uint32_t code32b[] = {
+        0x7e000280u, 0x7e0202f2u, 0x7e0402f4u, 0x7e0602ffu, 0x40400000u, 0x7e0802f6u,
+        0xd9380100u, 0x00030100u, 0xd9340000u, 0x00000100u, 0xbf8a0000u,
+        0xd9d80000u, 0x05000000u, 0xd9dc0100u, 0x07000000u,
+        0x060a0d05u, 0x060a1305u, 0x060a1505u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv32b = recompile_valu(code32b, sizeof(code32b)/sizeof(code32b[0]), 0, 5);
+    CHECK(!spv32b.empty(), "recompiled kernel 32b (ds_write_b64 + ds_write2_b64) -> SPIR-V");
+    std::vector<float> got32b = prosper::test::run_compute(spv32b, std::vector<float>(1), 1, 1);
+    CHECK(got32b.size()==1 && std::fabs(got32b[0]-10.0f)<1e-3f,
+          "kernel 32b wide LDS stores and loads preserve both dwords of both VGPR pairs");
+
+    // Kernel 32c: the same UE4 producer uses non-returning unsigned LDS min/max atomics. Start at
+    // 10, min with 3, then max with 7; a read and uint->float conversion must report 7.
+    const uint32_t code32c[] = {
+        0x7e000280u, 0x7e02028au, 0x7e040283u, 0x7e060287u,
+        0xd8340000u, 0x00000100u, 0xbf8a0000u,
+        0xd81c0000u, 0x00000200u, 0xd8200000u, 0x00000300u, 0xbf8a0000u,
+        0xd8d80000u, 0x04000000u, 0x7e080d04u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv32c = recompile_valu(code32c, sizeof(code32c)/sizeof(code32c[0]), 0, 4);
+    CHECK(!spv32c.empty(), "recompiled kernel 32c (ds_min_u32 + ds_max_u32) -> SPIR-V");
+    std::vector<float> got32c = prosper::test::run_compute(spv32c, std::vector<float>(1), 1, 1);
+    CHECK(got32c.size()==1 && std::fabs(got32c[0]-7.0f)<1e-3f,
+          "kernel 32c LDS min/max atomics update shared memory exactly");
+
+    // Kernel 32c2: ds_add_rtn_u32 returns the old value (10) while atomically updating LDS to 13.
+    // Convert and add both observations so the single output must be 23.
+    const uint32_t code32c2[] = {
+        0x7e02028au, 0x7e040283u,
+        0xd8340000u, 0x00000100u, 0xbf8a0000u,
+        0xd8800000u, 0x03000200u, 0xbf8a0000u,
+        0xd8d80000u, 0x04000000u, 0x7e060d03u, 0x7e080d04u,
+        0x060a0903u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv32c2 = recompile_valu(code32c2, sizeof(code32c2)/sizeof(code32c2[0]), 1, 5);
+    CHECK(!spv32c2.empty(), "recompiled kernel 32c2 (ds_add_rtn_u32) -> SPIR-V");
+    std::vector<float> in32c2(WG);
+    for (uint32_t i = 0; i < WG; ++i) { const uint32_t addr = 4u*i; std::memcpy(&in32c2[i], &addr, 4); }
+    std::vector<float> got32c2 = prosper::test::run_compute(spv32c2, in32c2, WG, WG);
+    uint32_t bad32c2 = 0;
+    for (uint32_t i = 0; i < WG && got32c2.size()==WG; ++i)
+        if (std::fabs(got32c2[i]-23.0f) >= 1e-3f) ++bad32c2;
+    printf("  kernel32c2 mismatches=%u out[0]=%g expect=23\n",
+           bad32c2, got32c2.size()==WG ? got32c2[0] : -1.0f);
+    CHECK(got32c2.size()==WG && bad32c2==0,
+          "kernel 32c2 returns old LDS and atomically stores the sum");
+
+    // Kernel 32d: SDWA f16->f32 conversion selects WORD_1 before applying source negate. The packed
+    // high half is -2, so `-WORD_1` converts to +2 (not a negation of the packed 32-bit payload).
+    const uint32_t code32d[] = {
+        0x7e0002ffu, 0xc0003c00u, 0x7e0216f9u, 0x00150600u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv32d = recompile_valu(code32d, sizeof(code32d)/sizeof(code32d[0]), 0, 1);
+    CHECK(!spv32d.empty(), "recompiled kernel 32d (v_cvt_f32_f16_sdwa WORD_1 negate) -> SPIR-V");
+    std::vector<float> got32d = prosper::test::run_compute(spv32d, std::vector<float>(1), 1, 1);
+    CHECK(got32d.size()==1 && std::fabs(got32d[0]-2.0f)<1e-3f,
+          "kernel 32d selects the high f16 half before applying float modifiers");
+
+    // Kernel 32e: packed f16 add/mul operate independently on both halves. Inputs are (1,2) and
+    // (3,4); XORing add=(4,6) with mul=(3,8) makes both packed results observable as 0x0e000600.
+    const uint32_t code32e[] = {
+        0x7e0002ffu, 0x40003c00u, 0x7e0202ffu, 0x44004200u,
+        0xcc0f4002u, 0x18020300u, 0xcc104003u, 0x18020300u,
+        0x3a080702u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv32e = recompile_valu(code32e, sizeof(code32e)/sizeof(code32e[0]), 0, 4);
+    CHECK(!spv32e.empty(), "recompiled kernel 32e (v_pk_add_f16 + v_pk_mul_f16) -> SPIR-V");
+    std::vector<float> got32e = prosper::test::run_compute(spv32e, std::vector<float>(1), 1, 1);
+    CHECK(got32e.size()==1 && bits_of(got32e[0])==0x0e000600u,
+          "kernel 32e packed f16 add/mul compute both halves exactly");
+
+    // Kernel 32f: the live UE4 modifier word selects src1's high half for both results and negates
+    // it in both low/high operations: (1* -4, 2* -4) -> packed (-4,-8).
+    const uint32_t code32f[] = {
+        0x7e0002ffu, 0x40003c00u, 0x7e0c02ffu, 0x44004200u,
+        0xcc105202u, 0x58020d00u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv32f = recompile_valu(code32f, sizeof(code32f)/sizeof(code32f[0]), 0, 2);
+    CHECK(!spv32f.empty(), "recompiled kernel 32f (live v_pk_mul_f16 modifiers) -> SPIR-V");
+    std::vector<float> got32f = prosper::test::run_compute(spv32f, std::vector<float>(1), 1, 1);
+    CHECK(got32f.size()==1 && bits_of(got32f[0])==0xc800c400u,
+          "kernel 32f honors packed low/high selects and negates");
+
+    // Kernel 32g: exact live DCC-producer SDWA forms select src1 WORD_1 while src0 uses the low
+    // half, write WORD_0, and preserve WORD_1. max((1,3)) -> (3,3), min((4,2)) -> (2,2).
+    const uint32_t code32g[] = {
+        0x7e0002ffu, 0x42003c00u, 0x7e0202ffu, 0x40004400u,
+        0x720000f9u, 0x05061400u, 0x740202f9u, 0x05061401u,
+        0x3a040300u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv32g = recompile_valu(code32g, sizeof(code32g)/sizeof(code32g[0]), 0, 2);
+    CHECK(!spv32g.empty(), "recompiled kernel 32g (live v_max/min_f16_sdwa forms) -> SPIR-V");
+    std::vector<float> got32g = prosper::test::run_compute(spv32g, std::vector<float>(1), 1, 1);
+    CHECK(got32g.size()==1 && bits_of(got32g[0])==0x02000200u,
+          "kernel 32g selects f16 halves and preserves destinations exactly");
+
+    // Kernel 32h: the live producer's paired v_add_f16_sdwa writes assemble a packed result in v7.
+    // The first writes low=(1+3)=4; the second preserves it while writing high=(2+4)=6.
+    const uint32_t code32h[] = {
+        0x7e0002ffu, 0x42003c00u, 0x7e0202ffu, 0x40004400u,
+        0x640e00f9u, 0x05061400u, 0x640e02f9u, 0x06051501u,
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv32h = recompile_valu(code32h, sizeof(code32h)/sizeof(code32h[0]), 0, 7);
+    CHECK(!spv32h.empty(), "recompiled kernel 32h (live paired v_add_f16_sdwa forms) -> SPIR-V");
+    std::vector<float> got32h = prosper::test::run_compute(spv32h, std::vector<float>(1), 1, 1);
+    CHECK(got32h.size()==1 && bits_of(got32h[0])==0x46004400u,
+          "kernel 32h writes and preserves both packed f16 destination halves");
+
+    // Kernel 32i: the live paired v_sub_f16_sdwa forms likewise assemble both halves in v0.
+    // low=(1-4)=-3 and high=(5-6)=-1, with each instruction preserving the opposite half.
+    const uint32_t code32i[] = {
+        0x7e0002ffu, 0x44004000u, 0x7e0202ffu, 0x46004200u,
+        0x7e1602ffu, 0x45003c00u, 0x660000f9u, 0x0506140bu,
+        0x660002f9u, 0x0505150bu, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv32i = recompile_valu(code32i, sizeof(code32i)/sizeof(code32i[0]), 0, 0);
+    CHECK(!spv32i.empty(), "recompiled kernel 32i (live paired v_sub_f16_sdwa forms) -> SPIR-V");
+    std::vector<float> got32i = prosper::test::run_compute(spv32i, std::vector<float>(1), 1, 1);
+    CHECK(got32i.size()==1 && bits_of(got32i[0])==0xbc00c200u,
+          "kernel 32i subtracts selected halves and preserves both destination halves");
+
+    // Kernel 32j: v_pk_fmac_f16 accumulates both half lanes independently. Starting from (5,6),
+    // (1,2)*(3,4)+(5,6) produces packed (8,14).
+    const uint32_t code32j[] = {
+        0x7e0002ffu, 0x40003c00u, 0x7e0202ffu, 0x44004200u,
+        0x7e0402ffu, 0x46004500u, 0x78040300u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv32j = recompile_valu(code32j, sizeof(code32j)/sizeof(code32j[0]), 0, 2);
+    CHECK(!spv32j.empty(), "recompiled kernel 32j (v_pk_fmac_f16) -> SPIR-V");
+    std::vector<float> got32j = prosper::test::run_compute(spv32j, std::vector<float>(1), 1, 1);
+    CHECK(got32j.size()==1 && bits_of(got32j[0])==0x4b004800u,
+          "kernel 32j accumulates both packed f16 lanes exactly");
+
+    // Kernel 32k: exact live v_sqrt_f16_sdwa pair writes sqrt(4)=2 to a high half and sqrt(9)=3
+    // to a low half, preserving the opposite destination halves in both cases.
+    const uint32_t code32k[] = {
+        0x7e1c02ffu, 0x45003c00u, 0x7e2c02ffu, 0x47004600u,
+        0x7e2a02ffu, 0x48804400u, 0x7e1caaf9u, 0x00061515u,
+        0x7e2caaf9u, 0x00051415u, 0x3a042d0eu, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv32k = recompile_valu(code32k, sizeof(code32k)/sizeof(code32k[0]), 0, 2);
+    CHECK(!spv32k.empty(), "recompiled kernel 32k (live paired v_sqrt_f16_sdwa forms) -> SPIR-V");
+    std::vector<float> got32k = prosper::test::run_compute(spv32k, std::vector<float>(1), 1, 1);
+    CHECK(got32k.size()==1 && bits_of(got32k[0])==0x07007e00u,
+          "kernel 32k selects, roots, writes, and preserves packed f16 halves");
+
+    // Kernel 32l: exact live v_cvt_f16_f32_sdwa forms write WORD_1 and preserve WORD_0. The first
+    // aliases source/destination, while the second preserves an unrelated packed low word.
+    const uint32_t code32l[] = {
+        0x7e0202ffu, 0x40800000u, 0x7e0802ffu, 0x40000000u,
+        0x7e0a02ffu, 0x12345678u, 0x7e0214f9u, 0x00061501u,
+        0x7e0a14f9u, 0x00061504u, 0x3a040b01u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv32l = recompile_valu(code32l, sizeof(code32l)/sizeof(code32l[0]), 0, 2);
+    CHECK(!spv32l.empty(), "recompiled kernel 32l (live v_cvt_f16_f32_sdwa WORD_1 forms) -> SPIR-V");
+    std::vector<float> got32l = prosper::test::run_compute(spv32l, std::vector<float>(1), 1, 1);
+    CHECK(got32l.size()==1 && bits_of(got32l[0])==0x04005678u,
+          "kernel 32l converts into high f16 halves while preserving low halves");
+
+    // Kernel 32m: exact live f16 SDWA controls apply abs after selecting src1 WORD_1, and treat an
+    // inline f32 constant as a numeric value before packing the product back into WORD_1.
+    const uint32_t code32m[] = {
+        0x7e0402ffu, 0xc4001234u, 0x7e0802ffu, 0x40005678u,
+        0x640404f9u, 0x25861480u, 0x6a0808f9u, 0x058615f8u,
+        0x3a0c0902u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv32m = recompile_valu(code32m, sizeof(code32m)/sizeof(code32m[0]), 0, 6);
+    CHECK(!spv32m.empty(), "recompiled kernel 32m (live f16 SDWA abs + inline float) -> SPIR-V");
+    std::vector<float> got32m = prosper::test::run_compute(spv32m, std::vector<float>(1), 1, 1);
+    CHECK(got32m.size()==1 && bits_of(got32m[0])==0xf1181278u,
+          "kernel 32m applies packed f16 modifiers and inline constants exactly");
+
+    // Kernel 32n: exact live cos/rcp f16 SDWA controls write WORD_1 and preserve WORD_0. cos(0
+    // revolutions)=1 and rcp(2)=0.5; XOR makes both packed results observable.
+    const uint32_t code32n[] = {
+        0x7e0802ffu, 0x00001234u, 0x7e08c2f9u, 0x00051504u,
+        0x7e0c0304u, 0x7e0802ffu, 0x40005678u, 0x7e08a8f9u,
+        0x00051504u, 0x3a040906u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv32n = recompile_valu(code32n, sizeof(code32n)/sizeof(code32n[0]), 0, 2);
+    CHECK(!spv32n.empty(), "recompiled kernel 32n (live v_cos/rcp_f16_sdwa forms) -> SPIR-V");
+    std::vector<float> got32n = prosper::test::run_compute(spv32n, std::vector<float>(1), 1, 1);
+    CHECK(got32n.size()==1 && bits_of(got32n[0])==0x0400444cu,
+          "kernel 32n evaluates packed f16 cosine/reciprocal and preserves low halves");
+
+    // Kernel 32o: exact live v_fma_f16 VOP3 forms select a source high half and independently write
+    // the low/high destination halves. Literals are f16 bit patterns; inline -2 remains numeric.
+    const uint32_t code32o[] = {
+        0x7e0602ffu, 0x12345678u, 0x7e0802ffu, 0x40005678u,
+        0xd74b1003u, 0x23fe08ffu, 0x00004648u,
+        0xd74b5004u, 0x03fe08f5u, 0x00004200u,
+        0x3a040903u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv32o = recompile_valu(code32o, sizeof(code32o)/sizeof(code32o[0]), 0, 2);
+    CHECK(!spv32o.empty(), "recompiled kernel 32o (live v_fma_f16 VOP3 forms) -> SPIR-V");
+    std::vector<float> got32o = prosper::test::run_compute(spv32o, std::vector<float>(1), 1, 1);
+    CHECK(got32o.size()==1 && bits_of(got32o[0])==0xae349030u,
+          "kernel 32o selects f16 sources and preserves the opposite destination halves");
+
+    // Kernel 32o2: the same low-half fma with OMOD x2 must scale before f16 packing. The unscaled
+    // result is -6.28125 (0xc648); x2 becomes -12.5625 (0xca48), preserving the high destination.
+    const uint32_t code32o2[] = {
+        0x7e0602ffu, 0x12345678u, 0x7e0802ffu, 0x40005678u,
+        0xd74b1003u, 0x2bfe08ffu, 0x00004648u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv32o2 = recompile_valu(code32o2, sizeof(code32o2)/sizeof(code32o2[0]), 0, 3);
+    CHECK(!spv32o2.empty(), "recompiled kernel 32o2 (v_fma_f16 OMOD) -> SPIR-V");
+    std::vector<float> got32o2 = prosper::test::run_compute(spv32o2, std::vector<float>(1), 1, 1);
+    CHECK(got32o2.size()==1 && bits_of(got32o2[0])==0x1234ca48u,
+          "kernel 32o2 applies VOP3 output scaling before f16 packing");
+
+    // Kernel 32p: exact live v_cndmask_b32_sdwa selects src1 WORD_0 through VCC, writes WORD_1,
+    // and preserves the destination's low half.
+    const uint32_t code32p[] = {
+        0x7e0002ffu, 0x3f800000u, 0x7e0202ffu, 0x3f800000u,
+        0x7e0602ffu, 0x9999abcdu, 0x7e1c02ffu, 0x12345678u,
+        0x7c040300u, 0x021c06f9u, 0x04861580u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv32p = recompile_valu(code32p, sizeof(code32p)/sizeof(code32p[0]), 0, 14);
+    CHECK(!spv32p.empty(), "recompiled kernel 32p (live v_cndmask_b32_sdwa WORD form) -> SPIR-V");
+    std::vector<float> got32p = prosper::test::run_compute(spv32p, std::vector<float>(1), 1, 1);
+    CHECK(got32p.size()==1 && bits_of(got32p[0])==0xabcd5678u,
+          "kernel 32p selects and inserts a word while preserving the opposite half");
+
+    // Kernel 32q: exact live CLAMP forms saturate before f16 packing. The first preserves WORD_0;
+    // the final form reads the tracked vcc_lo scalar scratch and writes a zero-padded DWORD.
+    const uint32_t code32q[] = {
+        0x7e0802ffu, 0x40004000u, 0x6a0808f9u, 0x06053504u,
+        0x7e0a0304u, 0xb06a385au, 0x6a0808f9u, 0x0686266au,
+        0x3a040905u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv32q = recompile_valu(code32q, sizeof(code32q)/sizeof(code32q[0]), 0, 2);
+    CHECK(!spv32q.empty(), "recompiled kernel 32q (live clamped/padded f16 SDWA forms) -> SPIR-V");
+    std::vector<float> got32q = prosper::test::run_compute(spv32q, std::vector<float>(1), 1, 1);
+    CHECK(got32q.size()==1 && bits_of(got32q[0])==0x3c007c00u,
+          "kernel 32q clamps packed f16 results and zero-pads DWORD destinations");
+
     // Kernel 33: PACKED-format store. buffer_store_format_xyzw of (0,0.25,0.5,1.0) as UNORM8x4 packs to
     // bytes (0,64,128,255) = dword 0xFF804000 (inverse of the unorm8 unpack). Verifies pack_norm + the
     // tight-component packing into one dword.
@@ -1073,17 +1340,28 @@ int main() {
     CHECK(act47>0 && msk47>0, "kernel 47 exercises both active and masked lanes");
     CHECK(got47.size()==N && bad47==0, "recompiled kernel 47 (dead scalar write in divergent block) correct");
 
-    // Kernel 47b (NEGATIVE): same shape but the block's s5 is READ after the merge without being
-    // redefined -> s5 is LIVE at the merge, so linearizing the unconditional scalar write would corrupt
-    // masked lanes. The dead-at-merge analysis must NOT prove it dead, so the execz block is not
-    // linearizable and recompilation must FAIL (return empty) rather than silently miscompile. Guards the
-    // soundness of the relaxation (it accepts only provably-dead scalar writes).
+    // Kernel 47b: same shape but the block's s5 is LIVE at the merge. The linearization shortcut must
+    // not consume it; structured compute execz instead branches on subgroupAny(EXEC), making the scalar
+    // write wave-uniform. Wave 0 enters and produces 102; wave 1 is empty and preserves s5=0 / v3=100.
     const uint32_t code47b[] = {
         0x7e0602ffu, 0x42c80000u, 0x7d880300u, 0xbe80246au, 0xbf880003u, 0xbe8503ffu, 0x42480000u,
         0x06060005u, 0xbefe0400u, 0x06060605u, 0xbf810000u,
     };
     std::vector<uint32_t> spv47b = recompile_valu(code47b, sizeof(code47b)/sizeof(code47b[0]), 2, /*out_vgpr*/3);
-    CHECK(spv47b.empty(), "kernel 47b (LIVE scalar write in divergent block) correctly REJECTED (not miscompiled)");
+    CHECK(!spv47b.empty(), "recompiled kernel 47b (live scalar write in wave-uniform execz block) -> SPIR-V");
+    std::vector<float> in47b(N * 2), exp47b(N);
+    for (uint32_t i = 0; i < N; i++) {
+        const bool active_wave = i < 64;
+        in47b[i*2+0] = active_wave ? 2.0f : 1.0f;
+        in47b[i*2+1] = active_wave ? 1.0f : 2.0f;
+        exp47b[i] = active_wave ? 102.0f : 100.0f;
+    }
+    std::vector<float> got47b = prosper::test::run_compute(spv47b, in47b, N, N);
+    uint32_t bad47b = 0;
+    for (uint32_t i=0;i<N&&got47b.size()==N;i++)
+        if (std::fabs(got47b[i]-exp47b[i])>1e-3f) bad47b++;
+    CHECK(got47b.size()==N && bad47b==0,
+          "compute execz preserves live scalar state on both wave-uniform paths");
 
     // Kernel 47c (NEGATIVE, soundness): the in-block "scalar move" targets vcc_lo (SDST code 106, which
     // decodes as SGPR-kind). A move into VCC/EXEC/M0 has wave-wide side effects read IMPLICITLY, so it can
@@ -1091,7 +1369,7 @@ int main() {
     // corruption past the merge). Must return empty.
     const uint32_t code47c[] = {
         0x7e0602ffu, 0x42c80000u, 0x7d880300u, 0xbe80246au, 0xbf880003u, 0xbeea03ffu, 0x42480000u,
-        0x06060100u, 0xbefe0400u, 0x06060703u, 0xbf810000u,
+        0x06060100u, 0xbefe0400u, 0x02060703u, 0xbf810000u,
     };
     std::vector<uint32_t> spv47c = recompile_valu(code47c, sizeof(code47c)/sizeof(code47c[0]), 2, /*out_vgpr*/3);
     CHECK(spv47c.empty(), "kernel 47c (special-reg (vcc) write in divergent block) correctly REJECTED");
