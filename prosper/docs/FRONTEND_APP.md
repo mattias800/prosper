@@ -179,6 +179,13 @@ The instrumentation does not take clock samples when the variable is unset. This
 to use when the window presents correctly but a title is not interactive; do not infer a GPU
 bottleneck from low FPS without the stage breakdown.
 
+When the `tables=` bucket is unexpectedly large, set `PROSPER_STAGE_FOLD_PROFILE=1`. It ranks the
+shader address and user-SGPR base pairs responsible for scalar table folding, including average and
+maximum time, decoded instructions, dynamic fetches, SRT uses, guest readability checks, and the
+decode/probe/interpreter split. It prints every 4096 folds by default; set
+`PROSPER_STAGE_FOLD_PROFILE_CALLS=<N>` to change that window. The profiler is intended for short
+diagnostic runs and takes no timing samples when disabled.
+
 Transient Vulkan memory uses a bounded, exact-requirements pool because every backend call waits for its
 fence before cleanup. Timing output includes `memory_pool` hits, misses, cached allocation count/bytes,
 and budget-driven discards. The default budget is 512 MiB; override it with
@@ -226,6 +233,15 @@ tables are reached through guest pointers, and their memory can change while eve
 value remains identical. That experiment caused Messenger to remain on its initial loading screen and
 was removed after an enabled/disabled A/B test. A future table cache needs explicit guest-memory
 versioning or equivalent invalidation; the `tables=` timing bucket measures this work without caching it.
+
+Windows readability checks retain positive results across synchronous submits only for explicitly
+tracked, currently readable kernel-HLE mappings. This is mapping-topology reuse, not a table or
+guest-content cache: HLE map, unmap, and protection operations advance a process generation and
+discard all retained ranges before the next submit. Host-managed guest stacks, diagnostic mappings,
+and other untracked regions are reused only within one submit. Guest bytes are still interpreted on
+every fold. Set `PROSPER_NO_GUEST_READ_CACHE=1` for the uncached A/B path. The contract assumes memory
+referenced by a synchronous GPU submit remains mapped until that submit returns, which was already
+required before the cross-submit reuse was added.
 
 The current renderer remains a deterministic readback-based implementation. It retains CPU-visible pixels
 for screenshots and temporal RTT composition, so it is not the final zero-copy architecture. Issue #702
