@@ -38,7 +38,7 @@ enum : uint32_t {
     Op_TypeImage=25, Op_TypeSampledImage=27, Op_SampledImage=86,
     Op_ImageSampleImplicitLod=87, Op_ImageSampleExplicitLod=88, Op_ImageFetch=95, Op_ImageGather=96, Op_Image=100,
     Op_ImageRead=98, Op_ImageWrite=99, Op_ImageQuerySizeLod=103, Op_ImageQueryLevels=106,
-    Op_TypeArray=28, Op_ControlBarrier=224,
+    Op_TypeArray=28, Op_ControlBarrier=224, Op_AtomicIAdd=234, Op_AtomicUMin=237, Op_AtomicUMax=239,
     Op_DPdx=207, Op_DPdy=208,   // screen-space derivatives (Fragment; plain Shader capability)
     Op_Phi=245, Op_LoopMerge=246,
     Op_SelectionMerge=247, Op_Label=248, Op_Branch=249, Op_BranchConditional=250, Op_Switch=251,
@@ -729,6 +729,46 @@ struct SpirvCompute {
         put(code, Op_Store, {p, value});
         put(code, Op_Branch, {merge});
         put(code, Op_Label, {merge}); cur_block = merge;
+    }
+    // Unsigned LDS atomic RMW. The old value is intentionally discarded; the non-returning RDNA DS
+    // form exposes only the memory effect. Workgroup scope + WorkgroupMemory AcquireRelease matches
+    // the storage class and the barrier helper used around cooperating accesses.
+    void lds_atomic(uint32_t op, uint32_t idx, uint32_t value, bool predicated, uint32_t pred) {
+        auto emit = [&]() {
+            uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_wg_u32, p, lds_var, idx});
+            uint32_t result = id();
+            put(code, op, {t_u32, result, p, uconst(Scope_Workgroup), uconst(MemSem_WGAcqRel), value});
+        };
+        if (!predicated) { emit(); return; }
+        uint32_t then = id(), merge = id();
+        put(code, Op_SelectionMerge, {merge, 0});
+        put(code, Op_BranchConditional, {pred, then, merge});
+        put(code, Op_Label, {then}); cur_block = then;
+        emit();
+        put(code, Op_Branch, {merge});
+        put(code, Op_Label, {merge}); cur_block = merge;
+    }
+    // Returning LDS atomic RMW. Inactive lanes must neither touch LDS nor observe an undefined
+    // atomic result, so the predicated form joins the old destination fallback through OpPhi.
+    uint32_t lds_atomic_rtn(uint32_t op, uint32_t idx, uint32_t value,
+                            bool predicated, uint32_t pred, uint32_t fallback) {
+        auto emit = [&]() {
+            uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_wg_u32, p, lds_var, idx});
+            uint32_t result = id();
+            put(code, op, {t_u32, result, p, uconst(Scope_Workgroup), uconst(MemSem_WGAcqRel), value});
+            return result;
+        };
+        if (!predicated) return emit();
+        const uint32_t entry = cur_block;
+        uint32_t then = id(), merge = id();
+        put(code, Op_SelectionMerge, {merge, 0});
+        put(code, Op_BranchConditional, {pred, then, merge});
+        put(code, Op_Label, {then}); cur_block = then;
+        const uint32_t result = emit();
+        const uint32_t then_end = cur_block;
+        put(code, Op_Branch, {merge});
+        put(code, Op_Label, {merge}); cur_block = merge;
+        return emit_phi_2way(t_u32, result, then_end, fallback, entry);
     }
     // s_barrier: workgroup execution + memory barrier (OpControlBarrier).
     void barrier() {
@@ -1464,7 +1504,10 @@ uint32_t vgpr_write_count(const Rdna2Inst& in) {
         case Rdna2Format::VOP2: case Rdna2Format::VOP3: case Rdna2Format::VOP3P:
             return 1;
         case Rdna2Format::DS:
-            return in.opcode == 0x36 || in.opcode == 0xb1 ? 1 : 0;
+            if (in.opcode == 0x36 || in.opcode == 0xb1) return 1;
+            if (in.opcode == 0x76) return 2;
+            if (in.opcode == 0x77) return 4;
+            return 0;
         case Rdna2Format::MUBUF:
             switch (in.opcode) {
                 case 0x1: case 0x5: case 0xD: return 2;
@@ -1783,14 +1826,14 @@ ForwardIf detect_forward_if(const std::vector<Rdna2Inst>& ins, bool allow_vcc,
 // plus a structural check: blocks must nest or be disjoint — a partial overlap (branch into the
 // middle of another block) is not an if-tree and rejects. Returns branches in pc order; empty =
 // no/unsupported control flow (the caller falls back to straight-line, which rejects loudly at the
-// branch). s_branch / execz / execnz still reject wholesale, exactly like detect_forward_if.
+// branch). Compute execz uses a subgroup vote; execnz and unclaimed s_branch still reject wholesale.
 // CONFIDENCE: HIGH on the structure (guarded by the phi machinery shared with the single-if path).
 std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, bool allow_vcc,
                                           const uint32_t* code, size_t dwords,
                                           const std::unordered_set<uint32_t>* skip = nullptr,
                                           const std::vector<DivLoop>* loops = nullptr,
                                           bool* rejected = nullptr,
-                                          bool uniform_vcc_compute = false) {
+                                          bool compute_wave_branches = false) {
     std::vector<ForwardIf> out;
     if (rejected) *rejected = false;
     auto reject = [&]() -> std::vector<ForwardIf> { if (rejected) *rejected = true; return {}; };
@@ -1820,9 +1863,9 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
             case 0x08:                                               // execz: safe-linearized predication
                 if (skip && skip->count(in.pc)) continue;            // branch -> emit_alu no-ops it; else a
                 if (loop_exit(in.pc)) continue;                      // loop exit test: the loop emitter's
-                if (!allow_vcc) return reject();                     // OpBranchConditional consumes it
-                break;                                               // DIVERGENT-REGION if (per-invocation
-                                                                     // stages only — compute has wave VCC/EXEC)
+                if (!allow_vcc && !compute_wave_branches) return reject();
+                break;                                               // compute lowers the wave-empty test with
+                                                                     // OpGroupNonUniformAny(EXEC)
             case 0x06: case 0x07:                                    // vccz / vccnz
                 if (loop_exit(in.pc)) continue;                      // canonical loop condition: loop emitter owns it
                 if (!allow_vcc) {
@@ -1832,7 +1875,7 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
                     // branch (cannot_write_vcc walk). Every lane's bool is then identical, so the
                     // wave-empty vccz test lowers to this invocation's bool. Varying compares keep
                     // rejecting loudly (per-invocation lowering of a varying wave test is wrong).
-                    if (!uniform_vcc_compute || !vcc_exit_is_wave_uniform(ins, in.pc)) return reject();
+                    if (!compute_wave_branches || !vcc_exit_is_wave_uniform(ins, in.pc)) return reject();
                     compute_uniform_vcc = true;
                 }
                 break;
@@ -1890,6 +1933,41 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
                 if (lm <= tgt || lm > end_pc) return reject();       // merge must be forward, in-stream
                 F.has_else = true; F.sb_pc = sb.pc; F.merge_pc = lm;
                 break;
+            }
+        }
+        if (!allow_vcc && compute_wave_branches && F.on_exec) {
+            // A compute execz condition is subgroup-uniform, so live scalar writes and LDS are safe
+            // inside the structured arm. A workgroup barrier is not: different waves may take
+            // different arms. Scalar writes into VCC_LO/HI also have an implicit mask-domain side
+            // effect which the scalar scratch model cannot reconstruct; accept those only when the
+            // mask is provably overwritten before any post-merge implicit read. The captured UE4
+            // kernel writes VCC_LO as an integer scratch in the arm and overwrites VCC with a VOPC at
+            // the merge, which this deliberately narrow proof accepts.
+            const uint32_t region_end = F.has_else ? F.merge_pc : F.target_pc;
+            for (const auto& r : ins) {
+                if (r.is_end || r.pc >= region_end) break;
+                if (r.pc <= in.pc) continue;
+                if (r.fmt == Rdna2Format::SOPP && r.opcode == 0x0a) return reject();
+
+                uint32_t scalar_width = 0;
+                if (r.fmt == Rdna2Format::SOP1) scalar_width = r.opcode == 0x04 ? 2u : 1u;
+                else if (r.fmt == Rdna2Format::SOP2 || r.fmt == Rdna2Format::SOPK) scalar_width = 1;
+                else if (r.fmt == Rdna2Format::SMEM) {
+                    switch (r.opcode) {
+                        case 0x0: case 0x8: scalar_width = 1; break;
+                        case 0x1: case 0x9: scalar_width = 2; break;
+                        case 0x2: case 0xA: scalar_width = 4; break;
+                        case 0x3: case 0xB: scalar_width = 8; break;
+                        case 0x4: case 0xC: scalar_width = 16; break;
+                        default: break;
+                    }
+                }
+                if (!scalar_width ||
+                    (r.dst.kind != OperandKind::SGPR && r.dst.kind != OperandKind::Special)) continue;
+                for (int vcc_half = 106; vcc_half <= 107; ++vcc_half) {
+                    if (vcc_half < r.dst.value || vcc_half >= r.dst.value + (int)scalar_width) continue;
+                    if (!sgpr_dead_at_merge(ins, region_end, vcc_half)) return reject();
+                }
             }
         }
         if (compute_uniform_vcc) {
@@ -1966,8 +2044,10 @@ void loop_written_regs(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t 
             case Rdna2Format::VOP3:
                 if (in.opcode == 0x360) sregs.insert(in.dst.value);       // v_readlane -> SGPR
                 else vregs.insert(in.dst.value); break;                   // (writelane: slots, not SSA)
-            case Rdna2Format::DS:                                          // ds_read writes one VGPR
-                if (in.opcode == 0x36 || in.opcode == 0xb1) vregs.insert(in.dst.value); break;
+            case Rdna2Format::DS:
+                for (uint32_t k = 0; k < vgpr_write_count(in); ++k)
+                    vregs.insert(in.dst.value + (int)k);
+                break;
             case Rdna2Format::MUBUF: case Rdna2Format::MIMG:
                 for (uint32_t k = 0; k < vgpr_write_count(in); ++k)
                     vregs.insert(in.dst.value + (int)k);
@@ -2347,6 +2427,39 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             return true;
         }
         case Rdna2Format::VOP3P: {
+            if (in.opcode == 0x0F || in.opcode == 0x10) {  // v_pk_add_f16 / v_pk_mul_f16
+                const uint32_t old_d = vreg_old(b, rs, in.dst.value);
+                auto half = [&](int source, bool high_result) -> uint32_t {
+                    uint32_t v = val(in.src[source]);
+                    // Inline float constants already arrive as full f32 values; register operands
+                    // contain two packed halves selected independently for each result half.
+                    if (in.src[source].kind == OperandKind::InlineInt) {
+                        v = b.uconst(fbits(static_cast<float>(in.src[source].value)));
+                    } else if (in.src[source].kind != OperandKind::InlineFloat) {
+                        const uint8_t selectors = high_result ? in.vop3p_opsel_hi : in.vop3p_opsel;
+                        v = b.unpack_half(v, (selectors >> source) & 1u);
+                    }
+                    const bool negate = high_result
+                        ? ((in.vop3p_neg_hi >> source) & 1u) != 0
+                        : in.src_neg[source];
+                    return negate ? b.fbin(Op_FSub, b.uconst(0), v) : v;
+                };
+                auto operation = [&](bool high) {
+                    uint32_t r = in.opcode == 0x0F
+                        ? b.fbin(Op_FAdd, half(0, high), half(1, high))
+                        : b.fbin(Op_FMul, half(0, high), half(1, high));
+                    if (in.clamp)
+                        r = b.fext2(Glsl_FMax,
+                                    b.fext2(Glsl_FMin, r, b.uconst(fbits(1.0f))),
+                                    b.uconst(fbits(0.0f)));
+                    return r;
+                };
+                const uint32_t lo = b.pack_half_lo(operation(false));
+                const uint32_t hi = b.ibin(Op_ShiftLeftLogical, b.pack_half_lo(operation(true)), b.uconst(16));
+                rs.vreg[in.dst.value] = b.ibin(Op_BitwiseOr, lo, hi);
+                predicate_write(b, rs, in.dst.value, old_d);
+                return true;
+            }
             // Mixed-precision FMA family, trivial form only (all sources full f32 — the decoder set
             // has_modifier for any opsel/neg/clamp bits, rejected above). v_fma_mix_f32 (0x20):
             // d = s0*s1+s2. v_fma_mixlo/hi_f16 (0x21/0x22): the f32 result converts to f16 into the
@@ -2441,9 +2554,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (!b.is_fragment || in.opcode != 0x01) { ok = false; return true; }
                 a = b.dpp_quad(a, in.dpp_ctrl);
             }
-            // SDWA float source modifiers on src0 (abs then neg) — only set on float ops by the assembler.
-            if (in.src_abs[0]) a = b.fext1(Glsl_FAbs, a);
-            if (in.src_neg[0]) a = b.fbin(Op_FSub, b.uconst(0), a);
+            // SDWA float source modifiers on src0 (abs then neg). v_cvt_f32_f16 applies them after
+            // selecting and unpacking the requested half below; applying them to the packed u32 as
+            // though it were an f32 changes both the value and the selected sign bit.
+            if (in.opcode != 0x0B) {
+                if (in.src_abs[0]) a = b.fext1(Glsl_FAbs, a);
+                if (in.src_neg[0]) a = b.fbin(Op_FSub, b.uconst(0), a);
+            }
             if (in.opcode == 0x02) {   // v_readfirstlane_b32: SGPR dst = value of the lowest active lane
                 // Cross-lane broadcast. Our per-lane scalar model has no cross-lane reduction, so we use
                 // THIS lane's value. SPECULATIVE(confidence: med): exact only when src0 is wave-uniform —
@@ -2476,6 +2593,34 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 predicate_write(b, rs, in.dst.value, old_d);
                 return true;
             }
+            // Packed unary f16 SDWA: select one source half, compute in f32, round back to f16, and
+            // insert while preserving the opposite destination half. Trig input is in revolutions.
+            if ((in.opcode == 0x54 || in.opcode == 0x55 || in.opcode == 0x61) &&
+                in.sdwa_dst_sel != 6) {
+                uint32_t x = b.unpack_half(a, in.sdwa_src0_sel == 5 ? 1 : 0);
+                uint32_t result = in.opcode == 0x54 ? b.frcp(x)
+                                : in.opcode == 0x55 ? b.fext1(Glsl_Sqrt, x)
+                                : b.fext1(Glsl_Cos,
+                                          b.fbin(Op_FMul, x, b.uconst(fbits(6.28318530717958647692f))));
+                uint32_t r16 = b.pack_half_lo(result);
+                d = in.sdwa_dst_sel == 5
+                    ? b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0x0000FFFFu)),
+                             b.ibin(Op_ShiftLeftLogical, r16, b.uconst(16)))
+                    : b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0xFFFF0000u)), r16);
+                predicate_write(b, rs, in.dst.value, old_d);
+                return true;
+            }
+            // v_cvt_f16_f32_sdwa inserts the converted half into the selected destination word and
+            // preserves the other word (unlike the plain form, whose result occupies the low half).
+            if (in.opcode == 0x0A && in.sdwa_dst_sel != 6) {
+                uint32_t r16 = b.pack_half_lo(a);
+                d = in.sdwa_dst_sel == 5
+                    ? b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0x0000FFFFu)),
+                             b.ibin(Op_ShiftLeftLogical, r16, b.uconst(16)))
+                    : b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0xFFFF0000u)), r16);
+                predicate_write(b, rs, in.dst.value, old_d);
+                return true;
+            }
             switch (in.opcode) {
                 case 0x00: return true;                              // v_nop — no-op (writes nothing; common
                                                                      // scheduling/hazard filler in real shaders)
@@ -2488,7 +2633,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // v_cvt_f16_f32 packs into the LOW half (high bits zero); v_cvt_f32_f16 unpacks the
                 // low half. VERIFIED(round-trip llvm-mc gfx1030: 0x0a/0x0b).
                 case 0x0A: d = b.pack_half_lo(a); break;              // v_cvt_f16_f32
-                case 0x0B: d = b.unpack_half(a, 0); break;            // v_cvt_f32_f16
+                case 0x0B: {                                        // v_cvt_f32_f16 (SDWA may select high half)
+                    d = b.unpack_half(a, in.sdwa_src0_sel == 5 ? 1 : 0);
+                    if (in.src_abs[0]) d = b.fext1(Glsl_FAbs, d);
+                    if (in.src_neg[0]) d = b.fbin(Op_FSub, b.uconst(0), d);
+                    break;
+                }
                 // v_cvt_off_f32_i4: sign-extend the low 4-bit integer and scale by 1/16.
                 // AMD RDNA2 ISA: "4-bit signed int to 32-bit float"; LLVM's intrinsic
                 // contract specifies result = 0.0625f * src_i4. This is the only opcode
@@ -2570,13 +2720,30 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 a = b.dpp_quad(a, in.dpp_ctrl);
             }
             // SDWA float source modifiers (only ever set on float ops by the assembler): abs then neg.
-            if (in.src_abs[0]) a = b.fext1(Glsl_FAbs, a);
-            if (in.src_neg[0]) a = b.fbin(Op_FSub, b.uconst(0), a);
-            if (in.src_abs[1]) c = b.fext1(Glsl_FAbs, c);
-            if (in.src_neg[1]) c = b.fbin(Op_FSub, b.uconst(0), c);
+            // Packed-f16 ops apply these after selecting/unpacking the half below.
+            const bool packed_f16 = in.opcode == 0x32 || in.opcode == 0x33 || in.opcode == 0x35 ||
+                                    in.opcode == 0x39 || in.opcode == 0x3A;
+            if (!packed_f16) {
+                if (in.src_abs[0]) a = b.fext1(Glsl_FAbs, a);
+                if (in.src_neg[0]) a = b.fbin(Op_FSub, b.uconst(0), a);
+                if (in.src_abs[1]) c = b.fext1(Glsl_FAbs, c);
+                if (in.src_neg[1]) c = b.fbin(Op_FSub, b.uconst(0), c);
+            }
             uint32_t& d = vreg[in.dst.value];
             switch (in.opcode) {
-                case 0x01: d = b.sel(vcc, c, a); break;               // v_cndmask_b32: dst = vcc ? src1 : src0
+                case 0x01: {                                         // v_cndmask_b32: dst = vcc ? src1 : src0
+                    if (in.sdwa_dst_sel == 6) { d = b.sel(vcc, c, a); break; }
+                    auto word = [&](uint32_t raw, uint8_t sel) {
+                        if (sel == 5) raw = b.ibin(Op_ShiftRightLogical, raw, b.uconst(16));
+                        return b.ibin(Op_BitwiseAnd, raw, b.uconst(0xFFFFu));
+                    };
+                    uint32_t selected = b.sel(vcc, word(c, in.sdwa_src1_sel), word(a, in.sdwa_src0_sel));
+                    d = in.sdwa_dst_sel == 5
+                        ? b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0x0000FFFFu)),
+                                 b.ibin(Op_ShiftLeftLogical, selected, b.uconst(16)))
+                        : b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0xFFFF0000u)), selected);
+                    break;
+                }
                 case 0x03: d = b.fbin(Op_FAdd, a, c); break;          // v_add_f32
                 case 0x04: d = b.fbin(Op_FSub, a, c); break;          // v_sub_f32
                 case 0x05: d = b.fbin(Op_FSub, c, a); break;          // v_subrev_f32 (src1 - src0; e32 form of
@@ -2629,19 +2796,48 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x20: case 0x2C: d = b.fbin(Op_FAdd, b.fbin(Op_FMul, a, b.uconst(in.literal)), c); break;  // v_madmk / v_fmamk
                 case 0x21: case 0x2D: d = b.fbin(Op_FAdd, b.fbin(Op_FMul, a, c), b.uconst(in.literal)); break;  // v_madak / v_fmaak
                 case 0x2F: d = b.pack_half2x16_rtz(a, c); break;      // v_cvt_pkrtz_f16_f32 (e32 form): RTZ clamp (#452)
-                case 0x35: {   // v_mul_f16: 16-bit float multiply. Sources read their selected halves
+                case 0x3C: {                                         // v_pk_fmac_f16: packed dst += src0*src1
+                    auto fmac_half = [&](uint32_t half) {
+                        return b.fbin(Op_FAdd,
+                                      b.fbin(Op_FMul, b.unpack_half(a, half), b.unpack_half(c, half)),
+                                      b.unpack_half(old_d, half));
+                    };
+                    uint32_t lo = b.pack_half_lo(fmac_half(0));
+                    uint32_t hi = b.ibin(Op_ShiftLeftLogical, b.pack_half_lo(fmac_half(1)), b.uconst(16));
+                    d = b.ibin(Op_BitwiseOr, lo, hi);
+                    break;
+                }
+                case 0x32: case 0x33: case 0x35: case 0x39: case 0x3A: { // v_add/sub/mul/max/min_f16
                     // (SDWA WORD_1 = high 16; DWORD/WORD_0 = low 16 — an f16 op reads bits[15:0]);
                     // f16xf16 products are exact in f32, so multiply in f32 and round once to f16.
                     // The 16-bit result inserts into the selected dest half PRESERVING the other
                     // (dst_sel WORD_1 for the SDWA pack idiom; DWORD/WORD_0 = the plain e32 form's
                     // "write [15:0], preserve [31:16]" gfx10 f16-VOP2 contract). #273 (DOLL box-blur).
-                    auto half_of = [&](uint32_t x, uint8_t s) {
-                        return s == 5 ? b.ibin(Op_ShiftRightLogical, x, b.uconst(16)) : x;
+                    auto source = [&](uint32_t raw, const Operand& operand, uint8_t sel, int k) {
+                        // Inline float constants already carry the numeric f32 value. Register/scalar
+                        // operands carry packed halves and must be selected before abs/neg.
+                        uint32_t v = operand.kind == OperandKind::InlineFloat ? raw
+                                   : operand.kind == OperandKind::InlineInt
+                                       ? b.uconst(fbits(static_cast<float>(operand.value)))
+                                       : b.unpack_half(raw, sel == 5 ? 1 : 0);
+                        if (in.src_abs[k]) v = b.fext1(Glsl_FAbs, v);
+                        if (in.src_neg[k]) v = b.fbin(Op_FSub, b.uconst(0), v);
+                        return v;
                     };
-                    uint32_t p = b.fbin(Op_FMul, b.unpack_half(half_of(a, in.sdwa_src0_sel), 0),
-                                                 b.unpack_half(half_of(c, in.sdwa_src1_sel), 0));
+                    uint32_t x = source(a, in.src[0], in.sdwa_src0_sel, 0);
+                    uint32_t y = source(c, in.src[1], in.sdwa_src1_sel, 1);
+                    uint32_t p = in.opcode == 0x32 ? b.fbin(Op_FAdd, x, y)
+                               : in.opcode == 0x33 ? b.fbin(Op_FSub, x, y)
+                               : in.opcode == 0x35 ? b.fbin(Op_FMul, x, y)
+                               : in.opcode == 0x39 ? b.fext2(Glsl_FMax, x, y)
+                                                   : b.fext2(Glsl_FMin, x, y);
+                    if (in.clamp)
+                        p = b.fext2(Glsl_FMax,
+                                    b.fext2(Glsl_FMin, p, b.uconst(fbits(1.0f))),
+                                    b.uconst(fbits(0.0f)));
                     uint32_t r16 = b.pack_half_lo(p);
-                    d = (in.sdwa_dst_sel == 5)
+                    d = in.sdwa_dst_sel == 6 ? r16
+                      : (in.sdwa_dst_sel == 5)
                         ? b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0x0000FFFFu)),
                                  b.ibin(Op_ShiftLeftLogical, r16, b.uconst(16)))
                         : b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0xFFFF0000u)), r16);
@@ -2651,7 +2847,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
             // SDWA output modifier: OMOD scale (×2/×4/×0.5) then CLAMP saturate, on FLOAT-result opcodes
             // only (int ops never carry omod). Mirrors the VOP3 fresult path; a no-op when omod/clamp unset.
-            if (ok && (in.omod || in.clamp)) switch (in.opcode) {
+            if (ok && (in.omod || in.clamp) && !packed_f16) switch (in.opcode) {
                 case 0x03: case 0x04: case 0x05: case 0x08: case 0x0F: case 0x10:
                 case 0x1F: case 0x2B: case 0x20: case 0x2C: case 0x21: case 0x2D:
                     if      (in.omod == 1) d = b.fbin(Op_FMul, d, b.uconst(fbits(2.0f)));
@@ -2844,7 +3040,26 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (in.clamp) bits = b.fext2(Glsl_FMax, b.fext2(Glsl_FMin, bits, b.uconst(fbits(1.0f))), b.uconst(fbits(0.0f)));
                 return bits;
             };
-            if (in.opcode == 0x14B || in.opcode == 0x141) {           // v_fma_f32 / v_mad_f32 = src0*src1 + src2
+            if (in.opcode == 0x34B) {                                // v_fma_f16: one selected packed half
+                auto f16src = [&](int k) {
+                    const Operand& operand = in.src[k];
+                    uint32_t raw = val(operand);
+                    uint32_t value = operand.kind == OperandKind::InlineFloat ? raw
+                                   : operand.kind == OperandKind::InlineInt
+                                       ? b.uconst(fbits(static_cast<float>(operand.value)))
+                                       : b.unpack_half(raw, (in.vop3p_opsel >> k) & 1u);
+                    if (in.src_abs[k]) value = b.fext1(Glsl_FAbs, value);
+                    if (in.src_neg[k]) value = b.fbin(Op_FSub, b.uconst(0), value);
+                    return value;
+                };
+                uint32_t result = fresult(
+                    b.fbin(Op_FAdd, b.fbin(Op_FMul, f16src(0), f16src(1)), f16src(2)));
+                uint32_t r16 = b.pack_half_lo(result);
+                vreg[in.dst.value] = (in.vop3p_opsel & 8u)
+                    ? b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0x0000FFFFu)),
+                             b.ibin(Op_ShiftLeftLogical, r16, b.uconst(16)))
+                    : b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0xFFFF0000u)), r16);
+            } else if (in.opcode == 0x14B || in.opcode == 0x141) {    // v_fma_f32 / v_mad_f32 = src0*src1 + src2
                 // v_mad_f32 (op 0x141) is a gfx10.1 (Navi) instruction REMOVED in gfx10.3, so llvm-mc
                 // -mcpu=gfx1030 rejects it as invalid — but the PS5 shader compiler targets gfx10.1 and
                 // emits it (real game shaders 5,26-29: manual attribute interpolation p0+i*p1). Its result
@@ -3771,15 +3986,68 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 predicate_write(b, rs, in.dst.value, old);
                 return true;
             }
-            // LDS (workgroup shared memory), compute-only. ds_write_b32 (0x0d) / ds_read_b32 (0x36);
-            // GDS and wider widths deferred. Byte address = ADDR VGPR + inst offset; dword index = >>2.
-            if (!b.is_compute || (in.opcode != 0x0d && in.opcode != 0x36)) { ok = false; return true; }
+            // LDS (workgroup shared memory), compute-only. Byte address = ADDR VGPR + instruction
+            // offset; the backing store is dword-indexed. gfx10 ds_write2_b64 carries two independent
+            // 8-bit offsets in units of 64-bit elements, while ds_write_b64 uses the ordinary 16-bit
+            // byte offset. GDS and the remaining widths/atomics are deferred.
+            if (!b.is_compute || (in.opcode != 0x07 && in.opcode != 0x08 && in.opcode != 0x20 &&
+                                  in.opcode != 0x0d && in.opcode != 0x36 &&
+                                  in.opcode != 0x4d && in.opcode != 0x4e &&
+                                  in.opcode != 0x76 && in.opcode != 0x77)) {
+                ok = false; return true;
+            }
             b.declare_lds();
             auto vread = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
+            if (in.opcode == 0x4e) {                    // ds_write2_b64: two VGPR pairs at offset0/offset1
+                const uint32_t base = b.ibin(Op_ShiftRightLogical, vread(in.src[0].value), b.uconst(2));
+                const uint32_t idx0 = b.ibin(Op_IAdd, base, b.uconst((in.literal & 0xFFu) * 2u));
+                const uint32_t idx1 = b.ibin(Op_IAdd, base, b.uconst(((in.literal >> 8) & 0xFFu) * 2u));
+                b.lds_store(idx0, vread(in.src[1].value), rs.exec_narrowed, rs.exec);
+                b.lds_store(b.ibin(Op_IAdd, idx0, b.uconst(1)), vread(in.src[1].value + 1),
+                            rs.exec_narrowed, rs.exec);
+                b.lds_store(idx1, vread(in.src[2].value), rs.exec_narrowed, rs.exec);
+                b.lds_store(b.ibin(Op_IAdd, idx1, b.uconst(1)), vread(in.src[2].value + 1),
+                            rs.exec_narrowed, rs.exec);
+                return true;
+            }
+            if (in.opcode == 0x77) {                    // ds_read2_b64: two pairs at scaled offsets
+                const uint32_t base = b.ibin(Op_ShiftRightLogical, vread(in.src[0].value), b.uconst(2));
+                const uint32_t idx0 = b.ibin(Op_IAdd, base, b.uconst((in.literal & 0xFFu) * 2u));
+                const uint32_t idx1 = b.ibin(Op_IAdd, base, b.uconst(((in.literal >> 8) & 0xFFu) * 2u));
+                const uint32_t indices[4] = {
+                    idx0, b.ibin(Op_IAdd, idx0, b.uconst(1)),
+                    idx1, b.ibin(Op_IAdd, idx1, b.uconst(1)),
+                };
+                for (int k = 0; k < 4; ++k) {
+                    const uint32_t old = vreg_old(b, rs, in.dst.value + k);
+                    rs.vreg[in.dst.value + k] = b.lds_load(indices[k]);
+                    predicate_write(b, rs, in.dst.value + k, old);
+                }
+                return true;
+            }
             uint32_t addr = b.ibin(Op_IAdd, vread(in.src[0].value), b.uconst(in.literal));
             uint32_t idx  = b.ibin(Op_ShiftRightLogical, addr, b.uconst(2));
-            if (in.opcode == 0x0d) {                    // ds_write_b32: LDS[idx] = DATA0
+            if (in.opcode == 0x07 || in.opcode == 0x08) { // ds_min_u32 / ds_max_u32
+                b.lds_atomic(in.opcode == 0x07 ? Op_AtomicUMin : Op_AtomicUMax,
+                             idx, vread(in.src[1].value), rs.exec_narrowed, rs.exec);
+            } else if (in.opcode == 0x20) {             // ds_add_rtn_u32: VDST = old LDS; LDS += DATA0
+                const uint32_t old = vreg_old(b, rs, in.dst.value);
+                rs.vreg[in.dst.value] = b.lds_atomic_rtn(
+                    Op_AtomicIAdd, idx, vread(in.src[1].value), rs.exec_narrowed, rs.exec, old);
+                predicate_write(b, rs, in.dst.value, old);
+            } else if (in.opcode == 0x0d) {             // ds_write_b32: LDS[idx] = DATA0
                 b.lds_store(idx, vread(in.src[1].value), rs.exec_narrowed, rs.exec);
+            } else if (in.opcode == 0x4d) {             // ds_write_b64: LDS[idx:idx+1] = DATA0 pair
+                b.lds_store(idx, vread(in.src[1].value), rs.exec_narrowed, rs.exec);
+                b.lds_store(b.ibin(Op_IAdd, idx, b.uconst(1)), vread(in.src[1].value + 1),
+                            rs.exec_narrowed, rs.exec);
+            } else if (in.opcode == 0x76) {             // ds_read_b64: VDST pair = LDS[idx:idx+1]
+                for (int k = 0; k < 2; ++k) {
+                    const uint32_t old = vreg_old(b, rs, in.dst.value + k);
+                    const uint32_t at = k ? b.ibin(Op_IAdd, idx, b.uconst(1)) : idx;
+                    rs.vreg[in.dst.value + k] = b.lds_load(at);
+                    predicate_write(b, rs, in.dst.value + k, old);
+                }
             } else {                                    // ds_read_b32: VDST = LDS[idx]
                 uint32_t old = vreg_old(b, rs, in.dst.value);
                 rs.vreg[in.dst.value] = b.lds_load(idx);
@@ -3940,8 +4208,9 @@ size_t rdna2_recompile_code_span(const uint32_t* code, size_t dwords) {
 // narrow pattern structurizer below. Lower them as a structured dispatcher loop: one switch case per
 // basic block, with the emulated register file persisted in Function variables between iterations.
 // VCCZ/EXECZ test subgroup-wide Any, matching the hardware branch's wave-mask reduction instead of
-// treating one invocation's bit as the whole mask. The fallback is gated by emit_body to complex,
-// barrier/LDS-free compute CFGs; simple or unsafe shaders retain the existing conservative path.
+// treating one invocation's bit as the whole mask. The fallback is gated by emit_body to complex
+// compute CFGs without workgroup barriers or synthesized cross-lane operations; ordinary LDS reads,
+// writes, and atomics remain valid when different waves visit them independently.
 bool emit_compute_cfg_state_machine(
     SpirvCompute& b, RegState& initial, const std::vector<Rdna2Inst>& ins,
     const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt,
@@ -4393,19 +4662,20 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         bool cf_rejected = false;
         const std::vector<ForwardIf> Fs = detect_forward_ifs(ins, /*allow_vcc*/!b.is_compute, code, dwords, &safe,
                                                              Ls.empty() ? nullptr : &Ls, &cf_rejected,
-                                                             /*uniform_vcc_compute*/b.is_compute);
+                                                             /*compute_wave_branches*/b.is_compute);
 
         // UE4's volume-lighting kernels combine nested EXEC loops with a backward VCC vote loop.
         // That shape is intentionally outside the narrow pattern structurizer above. Use the
         // dispatcher fallback only when there is unmistakably complex compute control flow and the
         // body is free of operations whose workgroup-uniform placement the dispatcher cannot prove.
+        // Raw DS operations are wave-local memory effects and are valid in a case; only barriers and
+        // cross-lane operations which synthesize barriers require workgroup-uniform placement.
         // Existing straight-line, single-if, and recognized single-loop shaders keep their old path.
         size_t cfg_branches = 0;
         bool cfg_has_backedge = false, cfg_dispatch_safe = b.is_compute;
         for (const auto& in : ins) {
             if (in.is_end) break;
-            if (in.fmt == Rdna2Format::DS ||
-                (in.fmt == Rdna2Format::SOPP && in.opcode == 0x0a) ||
+            if ((in.fmt == Rdna2Format::SOPP && in.opcode == 0x0a) ||
                 (in.fmt == Rdna2Format::VOP3 &&
                  (in.opcode == 0x365 || in.opcode == 0x366)))
                 cfg_dispatch_safe = false;
@@ -4429,6 +4699,11 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             (void)safe_branches;
             return true;
         }
+        if (b.is_compute && std::any_of(Fs.begin(), Fs.end(),
+                                        [](const ForwardIf& branch) { return branch.on_exec; })) {
+            SpirvCompute::put(b.caps, Op_Capability, {Cap_GroupNonUniform});
+            SpirvCompute::put(b.caps, Op_Capability, {Cap_GroupNonUniformVote});
+        }
         // Structured uniform IFs (forward s_cbranch_scc*/vcc*), possibly SEQUENTIAL and/or NESTED
         // (detect_forward_ifs verified the region tree). Each if emits as OpSelectionMerge +
         // OpBranchConditional on the SCC/VCC bool, with an OpPhi per register written in the
@@ -4444,8 +4719,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // `cont` = the pc control flows to after `hi` — the enclosing construct's merge chain. An
         // if/else whose merge ESCAPES the current region (the shared-outer-merge cascade) is legal
         // only when it targets exactly this continuation (no skipped instructions); anything else
-        // rejects, fail-visible. Divergent execz-ifs (#273) condition on THIS lane's EXEC bool and
-        // may enter/leave with EXEC narrowed — EXEC is phi'd across the merge like any other value.
+        // rejects, fail-visible. Fragment execz-ifs (#273) condition on THIS lane's EXEC bool;
+        // compute execz-ifs condition on subgroupAny(EXEC). Either may enter/leave with EXEC narrowed,
+        // and EXEC is phi'd across the merge like any other value.
         // CONFIDENCE: MED — per-invocation lowering of wave-level branches; spirv-val + exec-diff
         // kernels + the live-boot A/B gate it.
         std::function<bool(uint32_t, uint32_t, uint32_t)> emit_structured;
@@ -4552,8 +4828,11 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 const ForwardIf F = Fs[bi++];
                 if (idx < ins.size() && ins[idx].pc == F.branch_pc) ++idx;   // skip the branch itself
                 // scc0/vccz/execz: branch (skip block) taken when the flag==0 → the block runs when
-                // flag!=0; scc1/vccnz are the inverse. Condition = SCC/VCC/EXEC per-invocation bool.
-                uint32_t cond_reg  = F.on_exec ? rs.exec : (F.on_vcc ? rs.vcc : rs.scc);
+                // flag!=0; scc1/vccnz are the inverse. Compute execz first reduces the per-invocation
+                // EXEC bool to the architecture's wave-wide "any lane active" predicate.
+                uint32_t cond_reg = F.on_exec
+                    ? (b.is_compute ? b.subgroup_any(rs.exec) : rs.exec)
+                    : (F.on_vcc ? rs.vcc : rs.scc);
                 uint32_t exec_cond = F.on_scc0 ? cond_reg : b.bsel(cond_reg, b.bfalse(), b.btrue());
                 const uint32_t preblock = b.cur_block;      // block holding the OpBranchConditional
                 if (!F.has_else) {
@@ -4759,7 +5038,7 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
     const CountedLoop cL = detect_counted_loop(ins);
     const std::vector<ForwardIf> cFs = detect_forward_ifs(ins, /*allow_vcc*/false, code, dwords,
                                                           nullptr, nullptr, nullptr,
-                                                          /*uniform_vcc_compute*/true);   // matches the compute shell (#590)
+                                                          /*compute_wave_branches*/true);   // matches the compute shell (#590)
     auto cf_reconstructed = [&](const Rdna2Inst& i) {
         if (cL.found && (i.pc == cL.backedge_pc || i.pc == cL.exit_branch_pc)) return true;
         for (const auto& F : cFs) if (i.pc == F.branch_pc) return true;
