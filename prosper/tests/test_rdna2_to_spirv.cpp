@@ -532,6 +532,19 @@ int main() {
     CHECK(spv22unresolved.empty(),
           "unresolved scalar data load with a runtime table is REJECTED (no binding-2 fallback)");
 
+    ShaderResourceTable rt22fallback;
+    { ShaderResource cb{}; cb.cls = ResourceClass::ConstantBuffer; cb.format = DataFormat::Uint32;
+      cb.num_components = 1; cb.binding = 2; rt22fallback.resources.push_back(cb); }
+    std::vector<uint32_t> spv22fallback = recompile_valu(
+        code22pc, sizeof(code22pc)/sizeof(code22pc[0]), 1, 0, &rt22fallback);
+    std::vector<float> got22fallback = prosper::test::run_compute(
+        spv22fallback, in22, N, N, cbuf22pc1);
+    bool good22fallback = got22fallback.size() == N;
+    for (uint32_t i = 0; i < N && good22fallback; ++i)
+        good22fallback = std::fabs(got22fallback[i] - 300.0f) <= 1e-3f;
+    CHECK(!spv22fallback.empty() && good22fallback,
+          "unresolved scalar data load may use binding 2 when the runtime table binds it");
+
     // Kernel 23: buffer_load_format_x FLOAT32 VERTEX FETCH (stage 2 — the real-VS mechanism). v0=(uint)
     // gid (element index); buffer_load_format_x v1, v0, s[8:11] idxen fetches vbuf[gid]; out=v1. The V#
     // descriptor is DIRECT (in user-data SGPR s8) -> resolved via sgpr_base -> VertexBuffer binding 3,
