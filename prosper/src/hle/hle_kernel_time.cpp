@@ -391,8 +391,18 @@ namespace {
     // an all-zeros range write that a value-conditional hardware watchpoint cannot even see —
     // is the stray write. The poller detects and localizes the hit bytes at native speed; the
     // armed addresses are printed so a second run can aim exact hardware watchpoints at them.
-    // The linker decides final .bss placement — verify adjacency with `nm --numeric-sort`.
-    volatile uint8_t g_eq_canary_a[128];
+    // The linker decides final placement — verify adjacency with `nm --numeric-sort`.
+    // SEGMENT MATCH (#707, macOS): the canaries must share g_eq_mx's segment to bracket it. On glibc
+    // g_eq_mx (std::mutex) is zero-init -> .bss, so UNINITIALIZED canaries co-locate (Linux: verified).
+    // On macOS the std::mutex PTHREAD_MUTEX_INITIALIZER sig is NON-ZERO -> g_eq_mx lands in __DATA, so an
+    // uninitialized canary goes to __bss (megabytes away, useless). Initialize the canaries on macOS so
+    // they land in __DATA beside g_eq_mx. (The arm step overwrites all 128 bytes with 0xA5 regardless.)
+#ifdef __APPLE__
+#define PROSPER_EQ_CANARY_INIT = {0xA5}
+#else
+#define PROSPER_EQ_CANARY_INIT
+#endif
+    volatile uint8_t g_eq_canary_a[128] PROSPER_EQ_CANARY_INIT;
     extern volatile uint8_t g_eq_canary_d[128];   // defined beside the APR ring arrays below
     // Equeue lifetime (#67): states are SHARED-ptr owned. eq_find hands out a reference that keeps
     // the object alive across the caller's wait, so sceKernelDeleteEqueue can never destroy a mutex/
@@ -401,7 +411,7 @@ namespace {
     // object dies when the last reference drops.
     struct EqState { std::mutex m; std::condition_variable cv; std::deque<SceKEvent> ready; bool deleted = false; };
     std::mutex g_eq_mx;
-    volatile uint8_t g_eq_canary_b[128];   // #707 canary: immediately beside g_eq_mx/g_eqs in declaration order
+    volatile uint8_t g_eq_canary_b[128] PROSPER_EQ_CANARY_INIT;   // #707 canary: immediately beside g_eq_mx/g_eqs in declaration order
     std::unordered_map<uint64_t, std::shared_ptr<EqState>> g_eqs;   // guest eq handle -> state
     struct FlipReg { uint64_t eq; int64_t ident; uint64_t udata; };
     std::vector<FlipReg> g_flip_regs, g_vblank_regs;
@@ -422,7 +432,7 @@ namespace {
     struct TimerTok { std::shared_ptr<std::atomic<bool>> cancelled; };
     std::map<std::pair<uint64_t, int64_t>, TimerTok> g_timers;
     std::atomic<bool> g_pump_started{false};
-    volatile uint8_t g_eq_canary_c[128];   // #707 canary: tail side of the timer/registration block
+    volatile uint8_t g_eq_canary_c[128] PROSPER_EQ_CANARY_INIT;   // #707 canary: tail side of the timer/registration block
     std::atomic<bool> g_eq_canary_started{false};
     void eq_canary_thread() {
         volatile uint8_t* rows[4] = { g_eq_canary_a, g_eq_canary_b, g_eq_canary_c, g_eq_canary_d };
@@ -790,7 +800,7 @@ namespace {
     // Own mutex (NOT g_eq_mx): the post path calls eq_post/eq_find, which lock g_eq_mx themselves.
     std::mutex g_apr_mx;
     std::vector<AprEqReg> g_apr_eq_regs;               // guarded by g_apr_mx (registration log)
-    volatile uint8_t g_eq_canary_d[128];               // #707 canary (declared beside g_eq_mx above)
+    volatile uint8_t g_eq_canary_d[128] PROSPER_EQ_CANARY_INIT;   // #707 canary (declared beside g_eq_mx above)
     uint64_t g_apr_ring_seq[64] = {};                  // per-ring counters for prosper-issued tokens
     uint64_t g_apr_tag_hwm[64] = {};                   // per-ring highest tag counter posted (guarded)
     void apr_post(const AprEqReg& r, unsigned ring, uint64_t token) {   // no APR lock held
