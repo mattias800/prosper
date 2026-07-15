@@ -112,6 +112,8 @@ struct Pm4Command {
     uint32_t rel_data_sel = 0;           // ReleaseMem: DATA_SEL (1/2/3)
     uint64_t rel_value = 0;              // ReleaseMem: 64-bit fence value (for data_sel 1/2)
     bool rel_value_valid = false;        // ReleaseMem: packet was long enough to carry rel_value
+    uint64_t rel_build_pre = 0;          // ReleaseMem: destination qword when this packet was built
+    bool rel_build_pre_valid = false;    // ReleaseMem: extended packet carried the build snapshot
 
     // WaitRegMem — laid out by hle_agc.cpp agc_dcb_wait_reg_mem per sceAgcDcbWaitRegMem(buf, size,
     // compare_func, op, cache_policy, address, reference, mask, poll_cycles) (Kyty
@@ -156,12 +158,15 @@ struct Pm4Command {
     // stack arg9 = byte count. DOLL's RHI translate loop emits DmaData(src=0, dst=<per-chunk fence
     // label>, 4 bytes) per segment — the GPU-side label INIT (label := 0) of the consumed-marker
     // protocol whose completion leg is ReleaseMem(label <- 1). Packet payload:
-    // [0..1]=dst lo/hi, [2..3]=srcOrImm lo/hi, [4]=numBytes, [5]=sels (a2 | a3<<8).
+    // [0..1]=dst lo/hi, [2..3]=srcOrImm lo/hi, [4]=numBytes, [5]=sels (a2 | a3<<8),
+    // [6..7]=the destination qword captured at build time (stale-generation identity, #312).
     uint64_t dd_dst = 0;                 // DmaData: destination address
     uint64_t dd_src = 0;                 // DmaData: source address OR immediate value
     uint32_t dd_bytes = 0;               // DmaData: byte count (0 = unrecovered -> not executed)
     uint32_t dd_sels = 0;                // DmaData: raw selector args (a2 | a3<<8)
     bool     dd_valid = false;           // DmaData: payload carried the full operand set
+    uint64_t dd_build_pre = 0;           // DmaData: destination qword when this exact packet was built
+    bool     dd_build_pre_valid = false; // DmaData: extended packet carried the build snapshot
 
     uint32_t flip_handle = 0;            // Flip: sceVideoOut handle
     int32_t  flip_bufidx = -1;           // Flip: display buffer index (-1 = not decoded)

@@ -184,6 +184,90 @@ int main() {
     CHECK(!mb3_freelist_contains_stable((uint64_t)(uintptr_t)&live_label, nullptr),
           "an allocated block absent from both freelists is not classified free");
 
+    // Full bundles leave the per-thread secondary root and move into one of eight lock-free global
+    // recycler slots. Membership must continue to see those nodes until the slot is popped.
+    static uint64_t global_slots[8] = {};
+    static FreeNode global_label{}, global_tail{};
+    global_label.next = (uint64_t)(uintptr_t)&global_tail;
+    global_tail.next = 0;
+    global_slots[5] = (uint64_t)(uintptr_t)&global_label;
+    mb3_note_global_recycler_bin((uint64_t)(uintptr_t)global_slots);
+    CHECK(mb3_freelist_contains_stable((uint64_t)(uintptr_t)&global_tail, &match) &&
+          match.list == 8 && match.hops == 1,
+          "MB3 membership walks a bundle held in a global recycler slot");
+    global_slots[5] = 0;
+    CHECK(!mb3_freelist_contains_stable((uint64_t)(uintptr_t)&global_tail, nullptr),
+          "a bundle removed from the global recycler is no longer classified free");
+
+    // Once all eight global recycler slots are occupied, MB3 returns a bundle to the central page
+    // structure. FFreeBlock is an in-place header at the low end of its contiguous free run. Detect
+    // an interior 0x20-byte block without knowing the title-specific FPoolInfoSmall table address.
+    static uint8_t central_backing[0x20000] = {};
+    uint8_t* central_page =
+        (uint8_t*)(((uintptr_t)central_backing + 0xffffull) & ~0xffffull);
+    uint32_t* central_header = (uint32_t*)(central_page + 0x2000);
+    central_header[0] = 0xe3010002; // DOLL: BlockSizeShifted=2, PoolIndex=1, Canary=0xe3
+    central_header[1] = 4;          // four free blocks in [header, header + 4*0x20)
+    central_header[2] = ~0u;        // end of the central free-run index chain
+    uint64_t central_free = (uint64_t)(uintptr_t)(central_page + 0x2040);
+    CHECK(mb3_freelist_contains_stable(central_free, &match) &&
+          match.list == 11 && match.pool_base == (uint64_t)(uintptr_t)central_page &&
+          match.head == (uint64_t)(uintptr_t)(central_page + 0x2000) && match.hops == 2,
+          "MB3 membership detects an interior block in a central in-page free run");
+    CHECK(!mb3_freelist_contains_stable((uint64_t)(uintptr_t)(central_page + 0x2080), nullptr),
+          "a block immediately outside a central free run is not classified free");
+    central_header[0] = 0xe2010002;
+    CHECK(!mb3_freelist_contains_stable(central_free, nullptr),
+          "a central-run lookalike with the wrong MB3 canary is rejected");
+    central_header[0] = 0xe7010002;
+    CHECK(mb3_freelist_contains_stable(central_free, nullptr),
+          "MB3 membership accepts the newer UE central-run canary");
+
+    // A command packet can outlive the 0x20-byte label generation it captured. If that block was
+    // reused, executing the stale DmaData(0) would overwrite its new owner's first dword (observed
+    // live as a C++ vtable becoming 0x400000000). Key the build snapshot by the exact packet.
+    {
+        struct alignas(0x20) ReusedLabel { uint64_t value; uint64_t pad[3]; } reused{};
+        reused.value = 0x1020304050607080ull;
+        uint64_t addr = (uint64_t)(uintptr_t)&reused;
+        prosper_label_hist_dma_built(addr, 0x3000, 0, 1);
+        uint32_t dma[9] = {};
+        dma[0] = PM4(9, IT_NOP, R_DMA_DATA);
+        dma[1] = (uint32_t)addr; dma[2] = (uint32_t)(addr >> 32);
+        dma[5] = 4; dma[6] = 0x303;
+        dma[7] = (uint32_t)reused.value; dma[8] = (uint32_t)(reused.value >> 32);
+        reused.value = 0x409123458ull; // a different owner replaced the build-time label residue
+        GpuState st; run_cb(dma, 9, st);
+        CHECK(reused.value == 0x409123458ull,
+              "stale DmaData does not overwrite a label block reused after packet build");
+
+        uint32_t rel[7] = {};
+        rel[0] = PM4(7, IT_NOP, R_RELEASE_MEM);
+        rel[1] = (uint32_t)addr; rel[2] = (uint32_t)(addr >> 32);
+        rel[3] = 1; rel[4] = 1; rel[6] = 4;
+        run_cb(rel, 7, st);
+        CHECK(reused.value == 0x409123458ull,
+              "the paired stale ReleaseMem does not overwrite the reused block either");
+    }
+
+    // ReleaseMem also carries its own build snapshot. Cover that guard without a preceding
+    // suppressed DmaData (and therefore without relying on the one-generation suppression debt).
+    {
+        struct alignas(0x20) ReusedLabel { uint64_t value; uint64_t pad[3]; } reused{};
+        reused.value = 0x1020304050607080ull;
+        uint64_t addr = (uint64_t)(uintptr_t)&reused;
+        prosper_label_hist_dma_built(addr, 0x4000, 0, 1);
+        uint32_t rel[9] = {};
+        rel[0] = PM4(9, IT_NOP, R_RELEASE_MEM);
+        rel[1] = (uint32_t)addr; rel[2] = (uint32_t)(addr >> 32);
+        rel[3] = 1; rel[4] = 1; rel[6] = 4;
+        rel[7] = (uint32_t)reused.value; rel[8] = (uint32_t)(reused.value >> 32);
+        reused.value = 0x409abcdefull;
+        GpuState st; run_cb(rel, 9, st);
+        CHECK(reused.value == 0x409abcdefull,
+              "packet-local ReleaseMem identity protects a reused label without DmaData debt");
+    }
+
     // The free label's DmaData(:=0) must be skipped before it erases NextFreeBlock. Then simulate an
     // allocator pop/reuse before ReleaseMem(<-1): the one-generation debt must still suppress that
     // old fence even though direct membership has become false.

@@ -454,6 +454,41 @@ static bool mb3_freelist_guard() {
                                return !e || strtol(e, nullptr, 0) != 0; }();
     return v;
 }
+// A consumed-marker label is intentionally uninitialized when its DmaData packet is built. The
+// packet-exact snapshot distinguishes that harmless residue from a target whose 0x20-byte block was
+// freed and reused before this old packet executed. Content alone cannot do that: a reused block may
+// also begin with 0/1, while a live uninitialized label may contain an arbitrary pointer residue.
+static bool dma_build_pre_changed(const Pm4Command& c, uint64_t pre, uint64_t* build_pre) {
+    if (!c.dd_build_pre_valid || c.dd_build_pre == pre) return false;
+    if (build_pre) *build_pre = c.dd_build_pre;
+    return true;
+}
+static void stale_dma_change_report(uint64_t addr, uint64_t build_pre, uint64_t pre, uint64_t pkt) {
+    static std::atomic<uint32_t> n{0};
+    if (n.fetch_add(1, std::memory_order_relaxed) < 256)
+        fprintf(stderr, "[agc] DMA-GENERATION-CHANGED-STALE-SUPPRESS [0x%llx] build-pre=0x%llx "
+                        "exec-pre=0x%llx pkt=0x%llx t=%llums\n",
+                (unsigned long long)addr, (unsigned long long)build_pre,
+                (unsigned long long)pre, (unsigned long long)pkt,
+                (unsigned long long)now_ms());
+}
+static bool stale_release_generation(const Pm4Command& c, uint64_t pre) {
+    if (!c.rel_build_pre_valid || c.rel_data_sel != 1 || c.rel_value != 1 ||
+        !label_is_consumed_marker(c.rel_addr)) return false;
+    uint64_t initialized = c.rel_build_pre & 0xffffffff00000000ull;
+    uint64_t signaled = initialized | 1ull;
+    if (pre == initialized || pre == signaled) return false;
+    static std::atomic<uint32_t> n{0};
+    if (n.fetch_add(1, std::memory_order_relaxed) < 256)
+        fprintf(stderr, "[agc] REL-GENERATION-CHANGED-STALE-SUPPRESS [0x%llx] "
+                        "build-pre=0x%llx expected-init=0x%llx exec-pre=0x%llx "
+                        "pkt=0x%llx t=%llums\n",
+                (unsigned long long)c.rel_addr, (unsigned long long)c.rel_build_pre,
+                (unsigned long long)initialized, (unsigned long long)pre,
+                (unsigned long long)pkt_addr(c), (unsigned long long)now_ms());
+    label_hist_rel_free(c.rel_addr, 0);
+    return true;
+}
 static void mb3_freelist_report(const char* kind, uint64_t addr, uint64_t pre,
                                 const Mb3FreelistMatch* match, bool debt) {
     static std::atomic<uint32_t> n{0};
@@ -564,6 +599,7 @@ static void honor_eop_write(const Pm4Command& c) {
                   // target-region trigger caught only benign fences and burned the report cap.
                   // Trigger on pointer-like PRE-CONTENT only.)
                   uint64_t pre = 0; memcpy(&pre, dst, sizeof pre);
+                  if (stale_release_generation(c, pre)) return;
                   // #312 — label free-state write-after-free guard (default OFF; A/B instrumentation,
                   // see waf_guard). Keys on tracked lifecycle state; suppresses genuine WAFs but does
                   // NOT close the gate (the dominant residual is GPU-side-undetectable — see waf_guard).
@@ -734,20 +770,28 @@ static void honor_dma_data(const Pm4Command& c) {
     }
     uint32_t v32 = (uint32_t)c.dd_src;
     uint8_t* dst = (uint8_t*)(uintptr_t)c.dd_dst;
+    uint64_t pre_dma = peek_qword(c.dd_dst);   // #312: pre-content for generation/membership checks
     // The exact consumed-marker initializer is a 4-byte immediate zero. Test allocator membership
     // BEFORE touching it: memset(0) would erase a free node's NextFreeBlock and make the later fence
     // indistinguishable from a live initialized label (the session-11 residual).
     if (mb3_freelist_guard() && c.dd_bytes == 4 && v32 == 0 &&
         label_is_consumed_marker(c.dd_dst)) {
+        uint64_t build_pre = 0;
+        bool generation_changed = dma_build_pre_changed(c, pre_dma, &build_pre);
+        if (generation_changed) {
+            // Pair a debt with the skipped init so its following ReleaseMem cannot overwrite the
+            // new owner either. This is the allocated/reused sibling of a free-membership hit.
+            label_hist_dma_free(c.dd_dst, 0);
+            stale_dma_change_report(c.dd_dst, build_pre, pre_dma, pkt_addr(c));
+            return;
+        }
         Mb3FreelistMatch match{};
         if (mb3_freelist_contains_stable(c.dd_dst, &match)) {
-            uint64_t pre = peek_qword(c.dd_dst);
             label_hist_dma_free(c.dd_dst, match.pool_base);
-            mb3_freelist_report("DMA", c.dd_dst, pre, &match, false);
+            mb3_freelist_report("DMA", c.dd_dst, pre_dma, &match, false);
             return;
         }
     }
-    uint64_t pre_dma = peek_qword(c.dd_dst);   // #312: pre-content for the label event ring
     forge_trip("DMA", c.dd_dst, pre_dma, v32, 4, pkt_addr(c));   // #312 session-10 tripwire (log-only)
     if (v32 == 0) {
         memset(dst, 0, c.dd_bytes);

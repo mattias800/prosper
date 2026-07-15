@@ -361,9 +361,17 @@ HLE(agc_cb_nop) {  // (dcb, num_dwords, ...)
 //    "free an unrecognized block 0x1000000001" / 0x20015f00 freelist-pop fatals.
 // numBytes is stack arg9. The import ABI bridge forwards args 7-9 as normal fixed parameters on
 // Windows and on Linux's guest-FS path; no compiler-frame decoding is involved (#672).
-// Custom R_DMA_DATA payload: [1..2]=dst lo/hi, [3..4]=srcOrImm lo/hi, [5]=numBytes, [6]=sels.
+// Custom R_DMA_DATA payload: [1..2]=dst lo/hi, [3..4]=srcOrImm lo/hi, [5]=numBytes, [6]=sels,
+// [7..8]=the destination qword when this exact packet was built (#312 generation identity).
 // CONFIDENCE: HIGH on a4=dst/a1=srcOrImm (malloc-destination callsite + patcher names + protocol);
 // MED on the selector args (recorded raw; the executor only honors the small-immediate form).
+static uint64_t label_build_pre(uint64_t dst, uint64_t num_bytes) {
+    uint64_t pre = 0;
+    if (num_bytes <= 8 && dst >= 0x10000 && !(dst & 3) && gpu::guest_readable(dst, sizeof pre))
+        memcpy(&pre, (const void*)(uintptr_t)dst, sizeof pre);
+    return pre;
+}
+
 HLE9(agc_dcb_dma_data) {  // (dcb, srcOrImm, srcSel?, dstSel?, dst, sel/policy, ..., stack9=numBytes)
     uint64_t num_bytes = a8 <= 0x10000000ull ? a8 : 0;
     static std::atomic<uint64_t> g_dma_n{0};
@@ -374,12 +382,16 @@ HLE9(agc_dcb_dma_data) {  // (dcb, srcOrImm, srcSel?, dstSel?, dst, sel/policy, 
                     (unsigned long long)k, (unsigned long long)a4, (unsigned long long)a1,
                     (unsigned long long)num_bytes, (unsigned long long)a2, (unsigned long long)a3);
     }
-    uint32_t* cmd; if (!begin_packet(a0, 7, IT_NOP, R_DMA_DATA, &cmd)) return 0;
+    uint32_t* cmd; if (!begin_packet(a0, 9, IT_NOP, R_DMA_DATA, &cmd)) return 0;
     cmd[1] = (uint32_t)(a4 & 0xffffffffu); cmd[2] = (uint32_t)(a4 >> 32u);
     cmd[3] = (uint32_t)(a1 & 0xffffffffu); cmd[4] = (uint32_t)(a1 >> 32u);
     cmd[5] = (uint32_t)num_bytes;
     cmd[6] = (uint32_t)((a2 & 0xffu) | ((a3 & 0xffu) << 8));
-    if (num_bytes <= 8) prosper_label_hist_dma_built(a4, a0, (uint32_t)a1, 1);   // #312 (label-init form)
+    uint64_t build_pre = label_build_pre(a4, num_bytes);
+    cmd[7] = (uint32_t)build_pre; cmd[8] = (uint32_t)(build_pre >> 32);
+    if (num_bytes <= 8) {
+        prosper_label_hist_dma_built(a4, a0, (uint32_t)a1, 1);                  // #312 label-init form
+    }
     return (uint64_t)(uintptr_t)cmd;
 }
 // sceAgcAcbDmaData (-RnpfpxIhec) — the async-compute-queue sibling. Same operation, shifted ABI
@@ -390,12 +402,16 @@ HLE9(agc_dcb_dma_data) {  // (dcb, srcOrImm, srcSel?, dstSel?, dst, sel/policy, 
 HLE9(agc_acb_dma_data) {  // (acb, srcSel?, dstSel?, dst, ?, ?, stack7=srcOrImm, stack8=numBytes)
     uint64_t src_imm = a6, num_bytes = a7;
     if (num_bytes > 0x10000000ull) num_bytes = 0;
-    uint32_t* cmd; if (!begin_packet(a0, 7, IT_NOP, R_DMA_DATA, &cmd)) return 0;
+    uint32_t* cmd; if (!begin_packet(a0, 9, IT_NOP, R_DMA_DATA, &cmd)) return 0;
     cmd[1] = (uint32_t)(a3 & 0xffffffffu); cmd[2] = (uint32_t)(a3 >> 32u);
     cmd[3] = (uint32_t)(src_imm & 0xffffffffu); cmd[4] = (uint32_t)(src_imm >> 32u);
     cmd[5] = (uint32_t)num_bytes;
     cmd[6] = (uint32_t)((a1 & 0xffu) | ((a2 & 0xffu) << 8));
-    if (num_bytes <= 8) prosper_label_hist_dma_built(a3, a0, (uint32_t)src_imm, 2);   // #312
+    uint64_t build_pre = label_build_pre(a3, num_bytes);
+    cmd[7] = (uint32_t)build_pre; cmd[8] = (uint32_t)(build_pre >> 32);
+    if (num_bytes <= 8) {
+        prosper_label_hist_dma_built(a3, a0, (uint32_t)src_imm, 2);              // #312
+    }
     return (uint64_t)(uintptr_t)cmd;
 }
 // sceAgcDmaDataPatchSetDstAddressOrOffset (IxYiarKlXxM) / ...SetSrcAddressOrOffsetOrImmediate
@@ -405,6 +421,11 @@ HLE(agc_patch_dma_data_dst) {  // (cmd, address)
     auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
     if (!patch_check(cmd, R_DMA_DATA, "DmaDataPatchSetDst")) return 0;
     cmd[1] = (uint32_t)(a1 & 0xffffffffu); cmd[2] = (uint32_t)(a1 >> 32u);
+    uint32_t len = ((cmd[0] >> 16) & 0x3fffu) + 2;
+    if (len >= 9) {
+        uint64_t build_pre = label_build_pre(a1, cmd[5]);
+        cmd[7] = (uint32_t)build_pre; cmd[8] = (uint32_t)(build_pre >> 32);
+    }
     return 0;
 }
 HLE(agc_patch_dma_data_src) {  // (cmd, addressOrImmediate)
@@ -496,11 +517,13 @@ HLE9(agc_cb_release_mem) {  // sceAgcCbReleaseMem(buf, action, gcr_cntl, dst, ca
     // into the packet so the CommandProcessor performs the completion write at SUBMIT time (correct
     // end-of-pipe timing — our GPU folds synchronously, so submit == pipe drain). CONFIDENCE: HIGH — the
     // arg positions are fixed by the AGC ABI; a5-as-label was independently confirmed (WaitRegMem polls it).
-    uint32_t* cmd; if (!begin_packet(a0, 7, IT_NOP, R_RELEASE_MEM, &cmd)) return 0;
+    uint32_t* cmd; if (!begin_packet(a0, 9, IT_NOP, R_RELEASE_MEM, &cmd)) return 0;
     cmd[1] = (uint32_t)(a5 & 0xffffffffu); cmd[2] = (uint32_t)(a5 >> 32u);
     cmd[3] = (uint32_t)data_sel;
     cmd[4] = (uint32_t)(data & 0xffffffffu); cmd[5] = (uint32_t)(data >> 32u);
     cmd[6] = (uint32_t)a1;
+    uint64_t build_pre = label_build_pre(a5, data_sel == 1 ? 4 : 8);
+    cmd[7] = (uint32_t)build_pre; cmd[8] = (uint32_t)(build_pre >> 32);
     if (data_sel == 1) {
         prosper_fence_journal_record((uint64_t)(uintptr_t)cmd, a5);   // #312 discriminator
         prosper_label_hist_rel_built(a5, a0);                         // #312 protocol history
@@ -1281,6 +1304,11 @@ HLE(agc_patch_release_mem_addr) {  // 0fWWK5uG9rQ (cmd, address): ReleaseMem pay
     auto* cmd = (uint32_t*)(uintptr_t)a0; if (!cmd) return 0;
     if (!patch_check(cmd, R_RELEASE_MEM, "ReleaseMemPatchAddress")) return 0;
     cmd[1] = (uint32_t)(a1 & 0xffffffffu); cmd[2] = (uint32_t)(a1 >> 32u);
+    uint32_t len = ((cmd[0] >> 16) & 0x3fffu) + 2;
+    if (len >= 9) {
+        uint64_t build_pre = label_build_pre(a1, cmd[3] == 1 ? 4 : 8);
+        cmd[7] = (uint32_t)build_pre; cmd[8] = (uint32_t)(build_pre >> 32);
+    }
     prosper_fence_journal_record((uint64_t)(uintptr_t)cmd, a1);   // #312: target set post-build
     return 0;
 }
