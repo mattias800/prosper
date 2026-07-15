@@ -100,6 +100,10 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
                     if (npl >= 2) c.rel_addr = lo_hi(pl);
                     if (npl >= 3) c.rel_data_sel = pl[2];
                     if (npl >= 5) { c.rel_value = (uint64_t)pl[3] | ((uint64_t)pl[4] << 32); c.rel_value_valid = true; }
+                    if (npl >= 8) {
+                        c.rel_build_pre = lo_hi(pl + 6);
+                        c.rel_build_pre_valid = true;
+                    }
                     break;
                 case R_FLIP:
                     c.kind = K::Flip;
@@ -162,7 +166,7 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
                     break;
                 case R_DMA_DATA:
                     // sceAgcDcbDmaData / sceAgcAcbDmaData (#312): CP-DMA. payload: [0..1]=dst lo/hi,
-                    // [2..3]=srcOrImm lo/hi, [4]=numBytes, [5]=sels (see agc_dcb_dma_data).
+                    // [2..3]=srcOrImm lo/hi, [4]=numBytes, [5]=sels, [6..7]=build-time dst qword.
                     c.kind = K::DmaData;
                     if (npl >= 6) {
                         c.dd_dst   = lo_hi(pl);
@@ -170,6 +174,10 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
                         c.dd_bytes = pl[4];
                         c.dd_sels  = pl[5];
                         c.dd_valid = true;
+                    }
+                    if (npl >= 8) {
+                        c.dd_build_pre = lo_hi(pl + 6);
+                        c.dd_build_pre_valid = true;
                     }
                     break;
                 case R_SET_PRED:
