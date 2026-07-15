@@ -692,6 +692,7 @@ namespace {
     // proof but the real corruptor never touches it — retained only for the selftest).
     std::atomic<bool> g_eq_guard_det{false};
     std::atomic<bool> g_eq_guard_relift{false};
+    std::atomic<bool> g_eq_guard_step{false};   // det-step: TF single-step co-located writes (zero gap)
     uint64_t eq_guard_page() {
         if (g_eq_guard_det.load(std::memory_order_acquire))
             return (uint64_t)(uintptr_t)&g_det_clock & ~4095ull;   // g_det_clock's own page
@@ -728,11 +729,14 @@ namespace {
         static std::atomic<bool> once{false};
         if (once.exchange(true)) return;
         std::thread(eq_pageguard_reporter).detach();
-        if (strcmp(mode, "det") == 0) {
+        if (strcmp(mode, "det") == 0 || strcmp(mode, "det-step") == 0) {
             // DET mode fault-storms the render if armed continuously (every co-located per-frame write on
             // g_det_clock's page faults). The corruptor fires in a narrow flip-count window (~2400), so
             // arm ONLY inside [GUARD_AFTER, GUARD_UNTIL] flips: render runs RW/full-speed before and
             // after, and the storm is bounded to the ~40 render frames that bracket the corruption.
+            // det-step: instead of an async 10µs re-arm (which leaves an RW gap the corruptor slips
+            // through), TF-single-step each co-located write and re-arm RO immediately after — zero gap.
+            if (strcmp(mode, "det-step") == 0) g_eq_guard_step.store(true, std::memory_order_release);
             g_eq_guard_det.store(true, std::memory_order_release);   // MUST precede eq_guard_page() below
             void* pg = (void*)(uintptr_t)eq_guard_page();            // now resolves to g_det_clock's page
             uint64_t after = getenv("PROSPER_EQ_GUARD_AFTER") ? strtoull(getenv("PROSPER_EQ_GUARD_AFTER"), 0, 0) : 2000;
@@ -857,13 +861,25 @@ extern "C" int prosper_eq_pageguard_classify(uint64_t addr) {
             uint64_t b = (uint64_t)(uintptr_t)mtx; return addr >= b && addr < b + 8;
         };
         bool victim = sig_hit(&g_det_clock) || sig_hit(&g_eq_mx) || sig_hit(&g_apr_mx);
-        g_eq_guard_relift.store(true, std::memory_order_release);
-        if (!victim) return 2;                                     // legit co-located write: silent
+        if (!g_eq_guard_step.load(std::memory_order_acquire))
+            g_eq_guard_relift.store(true, std::memory_order_release);   // async-relift mode only
+        if (!victim) return 2;                                     // legit co-located write (step: TF re-arm)
         g_eq_pageguard_armed.store(false, std::memory_order_release);
         return 1;                                                  // corruptor hit a victim: report
     }
     g_eq_pageguard_armed.store(false, std::memory_order_release);   // bigdecoy mode: one-shot
     return 1;
+}
+
+// det-step support (PR #753 round 8): the fault handler TF-single-steps a co-located write and then
+// re-arms the guard page RO immediately, so the RW window is one instruction wide (no async-relift gap
+// for the corruptor to slip through). Called only from the fault handler; one syscall, async-safe.
+extern "C" int  prosper_eq_guard_step_mode() { return g_eq_guard_step.load(std::memory_order_acquire) ? 1 : 0; }
+extern "C" void prosper_eq_guard_rearm() {
+#ifndef _WIN32
+    if (g_eq_pageguard_armed.load(std::memory_order_acquire))
+        mprotect((void*)(uintptr_t)eq_guard_page(), 4096, PROT_READ);
+#endif
 }
 
 // Exposed to hle_graphics.cpp (sceVideoOut* flip/vblank event registration).

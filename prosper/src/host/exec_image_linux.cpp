@@ -55,6 +55,8 @@ struct f_owner_ex { int type; pid_t pid; };
 
 extern "C" int prosper_eq_pageguard_classify(uint64_t);  // #707 decoy-page guard (hle_kernel_time.cpp)
 extern "C" void prosper_eq_pageguard_record(uint64_t rip, const uint64_t* frames, int n);  // deferred symbolize
+extern "C" int  prosper_eq_guard_step_mode();   // #707 det-step: TF single-step co-located writes
+extern "C" void prosper_eq_guard_rearm();       // re-arm the guard page RO after a single-step
 
 namespace prosper {
 
@@ -192,6 +194,7 @@ namespace {
     int      g_hwbp_fd = -1;
     bool     g_hwbp_stepping = false;
     volatile sig_atomic_t g_hwbp_count = 0;
+    volatile sig_atomic_t g_eq_guard_stepping = 0;   // #707 det-step: mid TF single-step of a co-located write
     int      g_hwbp_max = 200;
     // PROSPER_HWBP_ALLTHREADS=1: also arm the same execute bp on every guest worker thread (each thread
     // gets its own perf fd + owns its own SIGTRAP). Lets us observe code that runs off the main thread
@@ -828,7 +831,17 @@ namespace {
         // Raw syscalls only (may run on a guest-%fs thread).
         if (sig == SIGSEGV || sig == SIGBUS) {
           int pg_verdict = prosper_eq_pageguard_classify((uint64_t)(uintptr_t)si->si_addr);
-          if (pg_verdict == 2) return;   // legit co-located write on the guarded page: lifted, resume silently
+          if (pg_verdict == 2) {
+              // Legit co-located write; the page is now RW so the store can complete. In det-step mode,
+              // set TF so exactly ONE instruction executes, then the SIGTRAP below re-arms the page RO —
+              // the RW window is a single instruction wide (no gap the corruptor can slip through).
+              if (prosper_eq_guard_step_mode()) {
+                  auto gs = PROSPER_GREGS((ucontext_t*)uctx);
+                  gs[REG_EFL] |= 0x100ll;                 // trap flag: single-step the co-located store
+                  g_eq_guard_stepping = true;
+              }
+              return;
+          }
           if (pg_verdict == 1) {
             auto gpg = PROSPER_GREGS((ucontext_t*)uctx);
             uint64_t rip = (uint64_t)gpg[REG_RIP];
@@ -919,6 +932,15 @@ namespace {
         if ((sig == SIGSEGV || sig == SIGBUS) && try_emulate_fs_access((ucontext_t*)uctx, (uint64_t)si->si_addr))
             return;
 #endif
+        // #707 det-step: the single-step trap after a co-located write on the guarded page. Re-arm the
+        // page RO immediately (RW window was one instruction) and clear TF. Checked before the other
+        // SIGTRAP consumers — it only fires when a det-step guard set g_eq_guard_stepping.
+        if (sig == SIGTRAP && g_eq_guard_stepping) {
+            g_eq_guard_stepping = 0;
+            prosper_eq_guard_rearm();
+            PROSPER_GREGS((ucontext_t*)uctx)[REG_EFL] &= ~0x100ll;   // clear trap flag
+            return;
+        }
         // A SIGILL we did NOT emulate: log the faulting instruction bytes so the offending opcode can be
         // identified (another AMD-only ISA extension, or a decode miss in try_emulate_sse4a). #163-progress.
         if (sig == SIGILL) {
@@ -2094,6 +2116,7 @@ void install_trap_handler() {
         || getenv("PROSPER_WATCH_LABEL")
         || getenv("PROSPER_WATCH_ABS")
         || getenv("PROSPER_MB3WATCH")
+        || (getenv("PROSPER_EQ_PAGEGUARD") && !strcmp(getenv("PROSPER_EQ_PAGEGUARD"), "det-step"))
         || getenv("PROSPER_WATCH_HOT")) sigaction(SIGTRAP, &sa, nullptr);   // single-step / breakpoint
 }
 
