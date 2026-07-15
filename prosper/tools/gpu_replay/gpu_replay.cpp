@@ -223,9 +223,11 @@ void inspect_table(const char* stage, const prosper::gpu::ShaderResourceTable* t
 void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
     for (const auto& seed : replay.rtt_seeds) {
         const uint64_t hash = prosper::gpu::gpu_capture_hash(seed.rgba);
-        std::printf("rtt-seed addr=%016llx extent=%ux%u bytes=%zu hash=%016llx\n",
+        const char* format = seed.format == prosper::gpu::GpuCaptureColorFormat::Rgba16Float
+            ? "rgba16f" : "rgba8";
+        std::printf("rtt-seed addr=%016llx extent=%ux%u format=%s bytes=%zu hash=%016llx\n",
                     static_cast<unsigned long long>(seed.guest_addr), seed.width, seed.height,
-                    seed.rgba.size(), static_cast<unsigned long long>(hash));
+                    format, seed.rgba.size(), static_cast<unsigned long long>(hash));
     }
     for (const auto& seed : replay.ds_seeds) {
         const uint64_t depth_hash = prosper::gpu::gpu_capture_hash(seed.depth);

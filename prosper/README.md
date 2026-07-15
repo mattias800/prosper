@@ -55,6 +55,10 @@ possible without console keys. Dumps are user-supplied and gitignored.
   faithful offline isolation (#568/#594/#569). Dispatch thread counts and derived workgroup dimensions,
   compute program binding, direct type-1 buffers, and mixed graphics/compute PM4 order now execute correctly
   (#580/#576/#584).
+  The later giant translucent Dead Cells gameplay surface was a native-format loss: a 642x362 RGBA16F lighting
+  target was rendered and sampled as RGBA8, clamping HDR values before composition. Renderer-owned targets now
+  preserve RGBA16F through render, readback, seeding, sampling, and persistent Vulkan caches. Capture v13 records
+  the RTT format and remains backward-compatible with v1..v12 artifacts (#773).
 - ✅ **Blasphemous 2 reaches first gameplay:** prelinking the title's optional FMOD core/studio
   plugins lets IL2CPP P/Invoke complete `FMODAudioBanksManager` initialization (#638/#640). The later AGC
   fault was prosper corrupting live DCB state: `+kSrjIVxKFE` is `sceAgcDcbPushMarker`, not the context
@@ -73,8 +77,8 @@ possible without console keys. Dumps are user-supplied and gitignored.
   run reduced 122.97 GiB logical data to 301.1 MiB. A compact exact two-submit closure resolves both temporal
   642×362 edges without bounded leaves, but the first 80-draw semantic endpoint is the opening vignette rather
   than playable gameplay. The preserved #608 bundle selected the Jump tutorial with exactly 90 draws and the
-  738x420 pass at draw 79..81. Current routes are selected without submit ordinals by combining 91..93 semantic
-  draws, exactly 8 dispatches, and that pass at draw 80..82. Timeline v6 records compact target spans so the
+  738x420 pass at draw 79..81. Current routes are selected without submit ordinals by combining 91..94 semantic
+  draws, exactly 8 dispatches, and the 636x420 pass at draw 77..85. Timeline v6 records compact target spans so the
   predicate can be discovered and validated offline before an expensive detailed capture (#594).
   The faithful 883-submit closure resolves 1,764 temporal image dependencies and established the stale-depth
   failure. The draw stream has no `DB_RENDER_CONTROL` clear because hardware observes the compute-written

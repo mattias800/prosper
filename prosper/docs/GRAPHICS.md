@@ -91,7 +91,9 @@ initializers to construct valid GPU objects (correctness-first — no plausible-
 - **libSceAgc** getters that return dereferenced objects → stable zeroed singletons.
 - **event queues** (`hle_kernel_time.cpp`) — valid queue objects; `WaitEqueue` yields + reports no
   events.
-- **Diagnostics** — `PROSPER_GFXLOG` logs AgcDriver call args.
+- **Diagnostics** — `PROSPER_GFXLOG` logs AgcDriver call args. Sampled-texture isolation accepts
+  `PROSPER_TESTTEX_DRAW=N`, `PROSPER_TESTTEX_BINDING=B`, and `PROSPER_TESTTEX=zero|checker`; both RGBA8 and
+  renderer-owned RGBA16F RTT inputs are replaced in their native format.
 
 ## Build environment
 

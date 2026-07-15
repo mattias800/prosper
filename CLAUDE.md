@@ -162,8 +162,8 @@ Bundle v2 (#606) now uses fault-safe bulk guest reads plus an exact shared-resou
 windows, successful-only exit, final compaction, and `gpu_replay --bundle-tail` prevent timing drift and replay
 holes. A compact two-submit closure resolves both 642x362 edges with no bounded leaves, but its 80-draw endpoint
 is the opening vignette rather than gameplay. The preserved #608 playable bundle used exactly 90 semantic draws
-and the 738x420 target at draw 79..81. Current routes use 91..93 draws, exactly 8 dispatches, and the 738x420
-target at draw 80..82; two independent timelines selected only sustained gameplay from about 29.5 seconds onward.
+and the 738x420 target at draw 79..81. Current routes use 91..94 draws, exactly 8 dispatches, and the 636x420
+target at draw 77..85; timeline selection isolates sustained gameplay without depending on run-local submits.
 Target extent or total draw count alone also selects cinematic/transition frames and must not be used as the
 oracle. This checkpoint established the stable offline baseline used to isolate the composition defects.
 The faithful playable bundle spans submits 18,165..19,047, stores 158.94 GiB logical state in 739 MiB, and
@@ -198,6 +198,13 @@ G-buffer plane as color0. Selecting MRT0 restores the full-color Prisoners' Quar
 also exposes the directly placed destination V# for a format-copy compute shader, taking the current checkpoint
 from seven to eight realized dispatches. #566 is closed. Use `prosper/docs/DEAD_CELLS_STATUS.md` for the current
 route and regression workflow rather than restarting the completed composition localization.
+
+The later giant translucent gameplay surface was native-format loss (#773). Draw 23 sampled a 642x362
+`Float16x4` lighting target that the backend had rendered and reuploaded as RGBA8, clamping its HDR data.
+Renderer-owned targets now preserve `VK_FORMAT_R16G16B16A16_SFLOAT` through attachments, readback/seed bytes,
+sampled images, and persistent target/texture/pipeline cache identities. Capture v13 tags RTT seeds as `rgba8`
+or `rgba16f` and reads v1..v12 artifacts. The current semantic selector is documented in
+`prosper/docs/DEAD_CELLS_STATUS.md`; do not reuse the historical 738x420 predicate for new captures.
 
 `--bundle-final-capsule` snapshots both color RTT state and exact valid planes from persistent Vulkan
 depth/stencil images into capture v8 (#569). Capture v8 reads v1-v7 artifacts; pre-v7 failed-operation diagnostics

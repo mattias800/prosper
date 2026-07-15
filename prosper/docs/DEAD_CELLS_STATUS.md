@@ -31,6 +31,15 @@ first color export from shaders that emit MRT3..MRT0; MRT0 now feeds the backend
 The same change set recovers a separately dropped format-copy dispatch by resolving its directly placed
 destination buffer descriptor at s4.
 
+Issue #773 exposed a later generic format gap as a giant translucent green/blue surface over gameplay. A
+deterministic operation-prefix replay localized the first bad composite to draw 23 sampling binding 36: a
+642x362 `Float16x4` lighting target produced by draws 17..22. The backend rendered and reuploaded that target as
+RGBA8, clamping HDR values before the composite. Renderer-owned RTTs now retain
+`VK_FORMAT_R16G16B16A16_SFLOAT` through attachment creation, readback/seed bytes, texture upload/views, and
+persistent target/texture/pipeline cache identities. Capture v13 records each RTT seed's native format while
+remaining able to read v1..v12 captures. The issue-773 77-submit source and its standalone v13 capsule are
+byte-identical at `9145002cabc36e97`; inspection shows one 642x362 `rgba16f` seed with 1,859,232 bytes.
+
 Startup and progression are stable after implementing both AGC resource-registration output queries. The former
 success-only `QueryResourceRegistrationUserMemoryRequirements` stub left Dead Cells' stack value untouched and
 occasionally requested a multi-gigabyte texture-pool allocation (#660). A native-speed fresh-save matrix improved
@@ -101,10 +110,10 @@ PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE=/tmp/dead-cells-current.prgbundle \
 PROSPER_GPU_TIMELINE_CAPTURE_DEPTH=1000 \
 PROSPER_GPU_TIMELINE_CAPTURE_MAX_UNIQUE_MB=1024 \
 PROSPER_GPU_TIMELINE_CAPTURE_START_TARGET_DIM=642x362 \
-PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM=738x420 \
-PROSPER_GPU_TIMELINE_CAPTURE_TARGET_DRAW_INDEX=80:82 \
+PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM=636x420 \
+PROSPER_GPU_TIMELINE_CAPTURE_TARGET_DRAW_INDEX=77:85 \
 PROSPER_GPU_TIMELINE_CAPTURE_MIN_DRAWS=91 \
-PROSPER_GPU_TIMELINE_CAPTURE_MAX_DRAWS=93 \
+PROSPER_GPU_TIMELINE_CAPTURE_MAX_DRAWS=94 \
 PROSPER_GPU_TIMELINE_CAPTURE_MIN_DISPATCHES=8 \
 PROSPER_GPU_TIMELINE_CAPTURE_MAX_DISPATCHES=8 \
 PROSPER_GPU_TIMELINE_EXIT_AFTER_CAPTURE=1 \
@@ -117,7 +126,7 @@ Confirm the timeline selected the intended scene:
 
 ```bash
 ./build-linux/gpu_timeline /tmp/dead-cells-current.prgtl \
-  --select 738x420 80:82 91:93 8
+  --select 636x420 77:85 91:94 8
 ```
 
 Replay the complete source once and export the exact final checkpoint:
@@ -125,11 +134,11 @@ Replay the complete source once and export the exact final checkpoint:
 ```bash
 ./build-linux/gpu_replay \
   --bundle /tmp/dead-cells-current.prgbundle \
-  --bundle-final-capsule /tmp/dead-cells-current-v8.prgcap \
+  --bundle-final-capsule /tmp/dead-cells-current-v13.prgcap \
   /tmp/dead-cells-current-source.bmp
 
 ./build-linux/gpu_replay \
-  /tmp/dead-cells-current-v8.prgcap \
+  /tmp/dead-cells-current-v13.prgcap \
   /tmp/dead-cells-current-standalone.bmp
 
 cmp /tmp/dead-cells-current-source.bmp \
@@ -159,3 +168,9 @@ at final-submit entry and embeds the source output oracle. A standalone capsule 
 is useful for state inspection, but it does not by itself prove complete renderer history or source-image
 equality. Prefer improving the capture/replay diagnostics when an investigation would otherwise require repeated
 full-title runs.
+
+Capture v13 stores `rgba8` or `rgba16f` with every temporal RTT seed. `gpu_replay --inspect-only` prints the
+format, extent, byte count, and hash; use those together to catch a format/size mismatch before rendering.
+For consumer localization, `PROSPER_TESTTEX_DRAW=N PROSPER_TESTTEX_BINDING=B PROSPER_TESTTEX=zero` replaces only
+one draw's selected sampled resource. A non-`zero` value writes a format-correct checker. This is an A/B probe,
+not a renderer fix or a valid output oracle.
