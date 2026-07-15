@@ -48,6 +48,9 @@ int main() {
         { P::CB_COLOR0_BASE_EXT, 0x00000012u },
         // CB_COLOR0_INFO: FORMAT=0xA (bits[6:2]) | NUMBER_TYPE=6/SRGB (bits[10:8]) | COMP_SWAP=1/BGRA (bits[12:11])
         { P::CB_COLOR0_INFO,     (0x0Au << 2) | (6u << 8) | (1u << 11) },
+        { P::CB_COLOR1_BASE,     0x00110000u },
+        { P::CB_COLOR1_BASE_EXT, 0x00000012u },
+        { P::CB_COLOR1_INFO,     (0x0Au << 2) },
         // DB_DEPTH_CONTROL: Z_ENABLE(bit1)|Z_WRITE_ENABLE(bit2)|ZFUNC=4(bits[6:4]) = 0x46
         { P::DB_DEPTH_CONTROL,   0x00000046u },
         { P::DB_RENDER_CONTROL,  0x00000002u }, // explicit stencil clear
@@ -68,11 +71,14 @@ int main() {
         { P::CB_COLOR_CONTROL,   0x00CC0010u },
         // CB_BLEND0_CONTROL: ENABLE(bit30) | SRCBLEND=4/SrcAlpha | DESTBLEND=5/OneMinusSrcAlpha | COMB_FCN=0/Add
         { P::CB_BLEND0_CONTROL,  (1u << 30) | (4u << 0) | (5u << 8) | (0u << 5) },
-        { P::CB_TARGET_MASK,     0x0000000Fu },
+        { P::CB_BLEND1_CONTROL,  (1u << 30) | (1u << 0) | (5u << 8) | (0u << 5) },
+        { P::CB_TARGET_MASK,     0x000000FFu },
         // CB fast-clear (#309): CLEAR_WORD0 holds one texel in the surface's 8_8_8_8 format.
         { P::CB_COLOR0_CLEAR_WORD0, 0x11223344u },
         { P::CB_COLOR0_CLEAR_WORD1, 0x00000000u },
         { P::CB_COLOR0_ATTRIB2, ((1024u - 1u) << 14) | (32u - 1u) },
+        { P::CB_COLOR1_CLEAR_WORD0, 0xFF0000FFu },
+        { P::CB_COLOR1_ATTRIB2, ((1024u - 1u) << 14) | (32u - 1u) },
         { P::SPI_PS_INPUT_CNTL_0, 0x00000401u }, // PS input 0 <- PARAM1, flat
         { P::SPI_PS_INPUT_CNTL_0 + 1u, 0x00000320u }, // PS input 1 <- DEFAULT_VAL 1111
         { P::SPI_PS_INPUT_ENA, 0x00000303u }, // perspective sample/center + float position X/Y
@@ -111,6 +117,11 @@ int main() {
     CHECK(rs.color0_comp_swap == 1u, "color0_comp_swap = 1 (BGRA)");
     CHECK(rs.color0_has_extent && rs.color0_width == 1024 && rs.color0_height == 32,
           "CB_COLOR0_ATTRIB2 dimension-minus-one fields decode to 1024x32");
+    CHECK(rs.color1_base == rdna2_addr(0x00110000u, 0x12u) &&
+          rs.color1_format == 0x0Au && rs.color1_number_type == 0u &&
+          rs.color1_comp_swap == 0u && rs.color1_has_extent &&
+          rs.color1_width == 1024 && rs.color1_height == 32,
+          "MRT1 base, format, and extent decode from the second color block");
     CHECK(vk_color_format(rs.color0_format, rs.color0_number_type, rs.color0_comp_swap)
               == VkFormat::B8G8R8A8_SRGB, "color format -> VK B8G8R8A8_SRGB");
     CHECK(vk_color_format(0x0Au, 0u, 0u) == VkFormat::R8G8B8A8_UNORM, "0xA/UNORM/RGBA -> R8G8B8A8_UNORM");
@@ -256,6 +267,8 @@ int main() {
     CHECK(rs.color_dst_blend == 5u && vk_blend_factor(rs.color_dst_blend) == 7u,
           "dst blend 5/OneMinusSrcAlpha -> VK ONE_MINUS_SRC_ALPHA(7)");
     CHECK(rs.color_comb_fcn == 0u && vk_blend_op(rs.color_comb_fcn) == 0u, "comb_fcn 0/Add -> VK ADD(0)");
+    CHECK(rs.blend1_enable && rs.color1_src_blend == 1u && rs.color1_dst_blend == 5u,
+          "CB_BLEND1_CONTROL decodes independently from MRT0");
     CHECK(vk_blend_factor(0x08u) == 4u, "RDNA2 DstColor(8) -> VK DST_COLOR(4) (non-identity)");
     CHECK(vk_blend_op(2u) == 3u, "RDNA2 comb Min(2) -> VK MIN(3) (non-identity)");
 
@@ -282,7 +295,7 @@ int main() {
 
     CHECK(rs.db_depth_control  == 0x00000046u, "db_depth_control raw preserved");
     CHECK(rs.cb_color_control  == 0x00CC0010u, "cb_color_control raw preserved");
-    CHECK(rs.cb_target_mask    == 0x0000000Fu, "cb_target_mask raw preserved");
+    CHECK(rs.cb_target_mask    == 0x000000FFu, "cb_target_mask raw preserved");
 
     // #309: CB fast-clear word extraction + format-aware decode in resolve_pipeline_state.
     CHECK(rs.color0_has_clear, "color0_has_clear = true (CLEAR_WORD programmed)");
@@ -295,6 +308,12 @@ int main() {
         CHECK_NEAR(ps.clear_color[1], srgb2lin(0x33 / 255.0f), "clear G = byte1, sRGB-linearized");
         CHECK_NEAR(ps.clear_color[2], srgb2lin(0x44 / 255.0f), "clear B = byte0 (ALT swap), sRGB-linearized");
         CHECK_NEAR(ps.clear_color[3], 0x11 / 255.0f,           "clear A = byte3, linear (no sRGB on alpha)");
+        CHECK(ps.has_clear_color1 && ps.color1_write_mask == 0xFu && ps.blend1_enable,
+              "MRT1 clear, write mask, and blend state resolve independently");
+        CHECK_NEAR(ps.clear_color1[0], 1.0f, "MRT1 clear R decodes from its own clear word");
+        CHECK_NEAR(ps.clear_color1[1], 0.0f, "MRT1 clear G decodes from its own clear word");
+        CHECK_NEAR(ps.clear_color1[2], 0.0f, "MRT1 clear B decodes from its own clear word");
+        CHECK_NEAR(ps.clear_color1[3], 1.0f, "MRT1 clear A decodes from its own clear word");
     }
     {
         // STD/RGBA + UNORM: byte0=R, byte1=G, byte2=B, byte3=A, no sRGB — exact byte/255.

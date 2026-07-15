@@ -59,6 +59,7 @@ int main() {
     DrawItem draw; draw.vs = {0x07230203, 1, 2}; draw.fs = {0x07230203, 3}; draw.vrt = table;
     draw.vertex_count = 6; draw.indices = {0, 1, 2, 2, 3, 0}; draw.color0_base = 0x2000;
     draw.color0_width = 1024; draw.color0_height = 32;
+    draw.color1_base = 0x3000; draw.color1_width = 1024; draw.color1_height = 32;
     draw.draw_index = 7; draw.command_order = 123;
     draw.ps.topology = 3; draw.ps.color0_format = 37; draw.ps.blend_enable = true;
     draw.ps.has_viewport = true; draw.ps.viewport_w = 1920; draw.ps.viewport_h = -1080;
@@ -71,6 +72,12 @@ int main() {
     draw.ps.db_z_info = 0x55; draw.ps.db_stencil_info = 0x66;
     draw.ps.db_depth_size = 0x77; draw.ps.db_depth_slice = 0x88;
     draw.ps.db_htile_surface = 0x99;
+    draw.ps.color1_format = 37; draw.ps.has_clear_color1 = true;
+    draw.ps.clear_color1[0] = 0.25f; draw.ps.clear_color1[3] = 1.0f;
+    draw.ps.blend1_enable = true; draw.ps.src_color_blend_factor1 = 1;
+    draw.ps.dst_color_blend_factor1 = 7; draw.ps.color_blend_op1 = 0;
+    draw.ps.src_alpha_blend_factor1 = 1; draw.ps.dst_alpha_blend_factor1 = 7;
+    draw.ps.alpha_blend_op1 = 0; draw.ps.color1_write_mask = 0xf;
 
     GpuCaptureMetadata meta; meta.width = 480; meta.height = 270; meta.submit_index = 42;
     meta.revision = "deadbeef"; meta.title_id = "PPSA24651"; meta.input_route = "@reach-level.pad";
@@ -157,7 +164,7 @@ int main() {
           deserialize_gpu_capture(stencil_only_bytes, stencil_only_loaded, error) &&
           !stencil_only_loaded.ds_seeds[0].depth_valid &&
           stencil_only_loaded.ds_seeds[0].stencil_valid,
-          "stencil-only validity survives capture v9 independently of depth");
+          "stencil-only validity survives capture v10 independently of depth");
     GpuCaptureFile invalid_stencil_format = stencil_only;
     invalid_stencil_format.ds_seeds[0].format = GpuCaptureDsFormat::D32Float;
     CHECK(!serialize_gpu_capture(invalid_stencil_format, stencil_only_bytes, error) &&
@@ -173,6 +180,11 @@ int main() {
           "fixed-function pipeline state round-trips explicitly");
     CHECK(loaded.draws[0].color0_width == 1024 && loaded.draws[0].color0_height == 32,
           "per-target extent round-trips");
+    CHECK(loaded.draws[0].color1_base == 0x3000 && loaded.draws[0].color1_width == 1024 &&
+          loaded.draws[0].color1_height == 32 && loaded.draws[0].ps.color1_format == 37 &&
+          loaded.draws[0].ps.has_clear_color1 && loaded.draws[0].ps.clear_color1[0] == 0.25f &&
+          loaded.draws[0].ps.blend1_enable && loaded.draws[0].ps.color1_write_mask == 0xf,
+          "MRT1 target and fixed-function state round-trip through the v10 extension");
     CHECK(loaded.draws[0].vrt.resources[0].resource.format == DataFormat::Unorm2_10_10_10,
           "newest packed image format enum round-trips");
     CHECK(loaded.draws[0].vrt.resources[0].resource.depth == 7,
@@ -340,8 +352,11 @@ int main() {
     GpuCaptureFile legacy_source = captured; legacy_source.ds_seeds.clear();
     std::vector<uint8_t> legacy_bytes;
     CHECK(serialize_gpu_capture(legacy_source, legacy_bytes, error) && legacy_bytes.size() >= 28,
-          "created a diagnostic-free v9 payload for legacy-reader fixtures");
+          "created a diagnostic-free v10 payload for legacy-reader fixtures");
     if (legacy_bytes.size() >= 28) {
+        // Remove the v10 MRT tail: draw count + one (target identity + 50-byte pipeline state) +
+        // zero failure count. The remaining payload is byte-exact v9.
+        legacy_bytes.resize(legacy_bytes.size() - (4 + 16 + 50 + 4));
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
         legacy_bytes.resize(legacy_bytes.size() - 4 - 4 - 4 * legacy_resource_count);
@@ -359,9 +374,9 @@ int main() {
     CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
           !legacy_loaded.failure_diagnostics_available && legacy_loaded.failure_diagnostics.empty(),
           "v6 capture reopens with failed-operation diagnostics reported unavailable");
-    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 10;
+    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 11;
     CHECK(!deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
-          error == "unsupported capture version 10",
+          error == "unsupported capture version 11",
           "future capture versions fail with a concrete version error");
 
     GpuCaptureFile bad_hash = mixed;

@@ -29,9 +29,12 @@ int main() {
     DrawItem producer;
     producer.draw_index = 0;
     producer.command_order = 10;
-    producer.color0_base = 0x2000;
+    producer.color0_base = 0x2800;
     producer.color0_width = 8;
     producer.color0_height = 8;
+    producer.color1_base = 0x2000;
+    producer.color1_width = 8;
+    producer.color1_height = 8;
     producer.prt = std::make_shared<ShaderResourceTable>();
     producer.prt->resources.push_back(resource(0x1000, 0x100, 4));
 
@@ -71,7 +74,7 @@ int main() {
     CHECK(graph.edges.size() == 2 && graph.edges[0].producer_operation == 0 &&
           graph.edges[0].consumer_operation == 2 && graph.edges[1].producer_operation == 1 &&
           graph.edges[1].consumer_operation == 2,
-          "consumer resolves latest overlapping draw and compute writers");
+          "consumer resolves latest overlapping MRT1 and compute writers");
     CHECK(graph.external_leaves.size() == 3,
           "resources with no earlier in-capsule writer remain explicit external leaves");
     CHECK(graph.external_leaves[0].access.addr == 0x1000 &&

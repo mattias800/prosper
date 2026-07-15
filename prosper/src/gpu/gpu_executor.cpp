@@ -2253,6 +2253,18 @@ void diagnose_resource_provenance(const GpuState& st, uint64_t submit_no) {
                                    rs.color0_width, rs.color0_height);
             }
         }
+        if (rs.color1_base) {
+            last_color_write[rs.color1_base] = {
+                submit_no, this_draw_submit, i, rs.es_addr, rs.ps_addr,
+                rs.color1_width, rs.color1_height, st.draws[i]
+            };
+            if (recorded_color_ranges.insert(rs.color1_base).second) {
+                const uint64_t bytes = static_cast<uint64_t>(rs.color1_width) * rs.color1_height * 4;
+                record_guest_write(GuestWriterKind::ColorTarget, rs.color1_base, bytes,
+                                   submit_no, i, st.draws[i].command_order, rs.ps_addr,
+                                   rs.color1_width, rs.color1_height);
+            }
+        }
     }
 }
 

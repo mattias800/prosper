@@ -489,37 +489,46 @@ struct RuntimeProducerHistory {
         if (!enabled) return;
         if (!first_submit_no) first_submit_no = submit_no;
         std::vector<RuntimeTargetWrite> writes;
-        writes.reserve(state.draws.size());
+        writes.reserve(state.draws.size() * 2);
         for (size_t i = 0; i < state.draws.size(); ++i) {
             const RenderState rs = extract_render_state(state.state_at_draw(i));
-            if (!rs.color0_base || !rs.color0_width || !rs.color0_height) continue;
-            writes.push_back({submit_no, i, state.draws[i].command_order, rs.color0_base,
-                              static_cast<uint64_t>(rs.color0_width) * rs.color0_height * 4,
-                              rs.color0_width, rs.color0_height, rs.color0_has_clear,
-                              rs.color0_clear_word0, rs.color0_clear_word1, rs.cb_color_control,
-                              rs.cb_target_mask, rs.color0_format});
-            const RuntimeTargetWrite& write = writes.back();
-            const RuntimeTargetKey key{write.addr, write.size};
-            auto found = lifetimes.find(key);
-            if (found == lifetimes.end()) {
-                if (lifetimes.size() >= 65536) {
-                    lifetime_truncated = true;
+            auto remember_target = [&](uint64_t base, uint32_t width, uint32_t height,
+                                       bool has_clear, uint32_t clear0, uint32_t clear1,
+                                       uint32_t format) {
+                if (!base || !width || !height) return;
+                writes.push_back({submit_no, i, state.draws[i].command_order, base,
+                                  static_cast<uint64_t>(width) * height * 4,
+                                  width, height, has_clear, clear0, clear1,
+                                  rs.cb_color_control, rs.cb_target_mask, format});
+                const RuntimeTargetWrite& write = writes.back();
+                const RuntimeTargetKey key{write.addr, write.size};
+                auto found = lifetimes.find(key);
+                if (found == lifetimes.end()) {
+                    if (lifetimes.size() >= 65536) {
+                        lifetime_truncated = true;
+                    } else {
+                        RuntimeTargetAggregate aggregate;
+                        aggregate.first = aggregate.last = write;
+                        aggregate.write_count = aggregate.submit_count = 1;
+                        aggregate.last_counted_submit = submit_no;
+                        lifetimes.emplace(key, std::move(aggregate));
+                    }
                 } else {
-                    RuntimeTargetAggregate aggregate;
-                    aggregate.first = aggregate.last = write;
-                    aggregate.write_count = aggregate.submit_count = 1;
-                    aggregate.last_counted_submit = submit_no;
-                    lifetimes.emplace(key, std::move(aggregate));
+                    RuntimeTargetAggregate& aggregate = found->second;
+                    aggregate.last = write;
+                    ++aggregate.write_count;
+                    if (aggregate.last_counted_submit != submit_no) {
+                        ++aggregate.submit_count;
+                        aggregate.last_counted_submit = submit_no;
+                    }
                 }
-            } else {
-                RuntimeTargetAggregate& aggregate = found->second;
-                aggregate.last = write;
-                ++aggregate.write_count;
-                if (aggregate.last_counted_submit != submit_no) {
-                    ++aggregate.submit_count;
-                    aggregate.last_counted_submit = submit_no;
-                }
-            }
+            };
+            remember_target(rs.color0_base, rs.color0_width, rs.color0_height,
+                            rs.color0_has_clear, rs.color0_clear_word0,
+                            rs.color0_clear_word1, rs.color0_format);
+            remember_target(rs.color1_base, rs.color1_width, rs.color1_height,
+                            rs.color1_has_clear, rs.color1_clear_word0,
+                            rs.color1_clear_word1, rs.color1_format);
         }
         submits.push_back(std::move(writes));
         while (submits.size() > capacity) { submits.pop_front(); ++dropped_submits; }

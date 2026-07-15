@@ -294,6 +294,46 @@ int main() {
         }
     }
 
+    // True MRT0+MRT1: preserve both hardware export locations and bind two simultaneous Vulkan color
+    // attachments. DOLL writes its temporal scene input this way; dropping Location 1 leaves the later
+    // scene sample black (#635/#719).
+    {
+        const uint32_t ps[] = {
+            0x7E0002F2u, 0x7E020280u, 0x7E040280u, 0x7E0602F2u,   // v0..3 = RED
+            0xF800180Fu, 0x03020100u,                             // exp mrt0
+            0x7E080280u, 0x7E0A02F2u, 0x7E0C0280u, 0x7E0E02F2u,   // v4..7 = GREEN
+            0xF800181Fu, 0x07060504u,                             // exp mrt1
+            0xBF810000u,
+        };
+        std::vector<uint32_t> frg = recompile_fragment(ps, std::size(ps));
+        CHECK(!frg.empty(), "#635: MRT0+MRT1 fragment shader recompiles with distinct outputs");
+        if (!frg.empty()) {
+            prosper::test::BackendDraw draw;
+            draw.vs = vert; draw.fs = frg;
+            std::vector<uint8_t> mrt1;
+            const float black[4] = {0, 0, 0, 1};
+            std::vector<uint8_t> mrt0 = prosper::test::render_draws_rgba(
+                {draw}, W, H, nullptr, black, false, nullptr, nullptr, black, &mrt1);
+            CHECK(mrt0.size() == (size_t)W * H * 4 && mrt1.size() == mrt0.size(),
+                  "#635: dual-attachment backend reads back both MRT surfaces");
+            if (mrt0.size() == (size_t)W * H * 4 && mrt1.size() == mrt0.size()) {
+                const uint8_t* c0 = &mrt0[((size_t)(H / 2) * W + W / 2) * 4];
+                const uint8_t* c1 = &mrt1[((size_t)(H / 2) * W + W / 2) * 4];
+                CHECK(c0[0] > 0xC0 && c0[1] < 0x40 && c0[2] < 0x40,
+                      "#635: MRT0 export reaches color attachment 0");
+                CHECK(c1[1] > 0xC0 && c1[0] < 0x40 && c1[2] < 0x40,
+                      "#635: MRT1 export reaches color attachment 1");
+            }
+        }
+
+        const uint32_t mrt3_only[] = {
+            0x7E0002F2u, 0x7E020280u, 0x7E040280u, 0x7E0602F2u,
+            0xF800183Fu, 0x03020100u, 0xBF810000u,
+        };
+        CHECK(recompile_fragment(mrt3_only, std::size(mrt3_only)).empty(),
+              "#635: unsupported MRT3-only export stays fail-visible instead of remapping to color0");
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

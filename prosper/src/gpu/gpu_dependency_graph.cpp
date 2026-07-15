@@ -74,6 +74,9 @@ bool build_gpu_dependency_graph(const GpuReplayFrame& replay,
             if (draw.color0_base && draw.color0_width && draw.color0_height)
                 writes.push_back({draw.color0_base,
                                   static_cast<uint64_t>(draw.color0_width) * draw.color0_height * 4});
+            if (draw.color1_base && draw.color1_width && draw.color1_height)
+                writes.push_back({draw.color1_base,
+                                  static_cast<uint64_t>(draw.color1_width) * draw.color1_height * 4});
         } else {
             auto it = computes.find(operation.source_index);
             if (it == computes.end()) {

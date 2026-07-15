@@ -106,6 +106,45 @@ int main() {
               "later pass samples pixels cached from the 32x2 producer target");
     }
 
+    // A simultaneous MRT producer must publish its second attachment under CB_COLOR1_BASE so a later
+    // pass can sample it in the same submit. This is DOLL's missing temporal scene dependency (#719).
+    const uint32_t dual_ps_rdna[] = {
+        0x7E0002F2u, 0x7E020280u, 0x7E040280u, 0x7E0602F2u, // RED -> MRT0
+        0xF800180Fu, 0x03020100u,
+        0x7E080280u, 0x7E0A02F2u, 0x7E0C0280u, 0x7E0E02F2u, // GREEN -> MRT1
+        0xF800181Fu, 0x07060504u, 0xBF810000u,
+    };
+    DrawItem mrt_producer = replay.items[0];
+    mrt_producer.fs = recompile_fragment(dual_ps_rdna, std::size(dual_ps_rdna));
+    mrt_producer.fs_identity = 0; mrt_producer.prt.reset();
+    mrt_producer.color0_base = 0xa00000;
+    mrt_producer.color0_width = 32; mrt_producer.color0_height = 32;
+    mrt_producer.color1_base = 0xb00000;
+    mrt_producer.color1_width = 32; mrt_producer.color1_height = 32;
+    mrt_producer.ps.color_write_mask = 0xf;
+    mrt_producer.ps.color1_write_mask = 0xf;
+
+    DrawItem mrt_consumer = replay.items[0];
+    mrt_consumer.color0_base = 0xc00000;
+    mrt_consumer.color0_width = 16; mrt_consumer.color0_height = 16;
+    mrt_consumer.color1_base = 0; mrt_consumer.color1_width = mrt_consumer.color1_height = 0;
+    mrt_consumer.ps.color1_write_mask = 0;
+    auto mrt_consumer_rt = std::make_shared<ShaderResourceTable>(*mrt_consumer.prt);
+    mrt_consumer_rt->resources[0].gpu_addr = mrt_producer.color1_base;
+    mrt_consumer_rt->resources[0].width = mrt_producer.color1_width;
+    mrt_consumer_rt->resources[0].height = mrt_producer.color1_height;
+    mrt_consumer_rt->resources[0].host_data = nullptr;
+    mrt_consumer_rt->resources[0].host_data_size = 0;
+    mrt_consumer.prt = std::move(mrt_consumer_rt);
+    std::vector<uint8_t> mrt_chain = render_submit_items({mrt_producer, mrt_consumer}, W, H);
+    CHECK(!mrt_producer.fs.empty() && mrt_chain.size() == 16u * 16u * 4u,
+          "MRT1 producer and consumer execute through the per-target live renderer");
+    if (mrt_chain.size() == 16u * 16u * 4u) {
+        const uint8_t* center = &mrt_chain[(8u * 16u + 8u) * 4];
+        CHECK(center[1] > 0xc0 && center[0] < 0x40 && center[2] < 0x40,
+              "later pass samples the GREEN pixels retained from color attachment 1");
+    }
+
     render_submit_items({producer}, W, H);
     std::vector<uint8_t> cross_submit = render_submit_items({consumer}, W, H);
     CHECK(cross_submit.size() == static_cast<size_t>(16) * 16 * 4,

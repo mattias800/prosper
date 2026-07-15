@@ -51,6 +51,17 @@ struct RenderState {
     bool     color0_has_clear   = false;
     uint32_t color0_clear_word0 = 0, color0_clear_word1 = 0;
 
+    // Color MRT 1. The first two targets are enough for UE4's DOLL scene dependency; later MRTs stay
+    // fail-visible until their attachment semantics are implemented.
+    uint64_t color1_base        = 0;
+    uint32_t color1_format      = 0;
+    uint32_t color1_number_type = 0;
+    uint32_t color1_comp_swap   = 0;
+    bool     color1_has_extent  = false;
+    uint32_t color1_width = 0, color1_height = 0;
+    bool     color1_has_clear   = false;
+    uint32_t color1_clear_word0 = 0, color1_clear_word1 = 0;
+
     // Primitive topology (VGT_PRIMITIVE_TYPE.PRIM_TYPE).
     uint32_t prim_type = 0;
 
@@ -99,6 +110,12 @@ struct RenderState {
     uint32_t alpha_src_blend  = 0;    // ALPHA_SRCBLEND  (@16)
     uint32_t alpha_dst_blend  = 0;    // ALPHA_DESTBLEND (@24)
     uint32_t alpha_comb_fcn   = 0;    // ALPHA_COMB_FCN  (@21)
+
+    // MRT1 blend state has the same register layout as CB_BLEND0_CONTROL.
+    bool     blend1_enable = false;
+    uint32_t color1_src_blend = 0, color1_dst_blend = 0, color1_comb_fcn = 0;
+    bool     separate_alpha_blend1 = false;
+    uint32_t alpha1_src_blend = 0, alpha1_dst_blend = 0, alpha1_comb_fcn = 0;
 
     // Raw state registers — remaining bit layouts decoded by the Vulkan backend later (kept faithful).
     uint32_t db_depth_control  = 0;   // DB_DEPTH_CONTROL
@@ -205,6 +222,16 @@ struct ResolvedPipelineState {
     uint32_t cull_mode    = 0;   // VK_CULL_MODE_NONE
     uint32_t front_face   = 0;   // VK_FRONT_FACE_COUNTER_CLOCKWISE / guest FACE=0
     uint32_t polygon_mode = 0;   // VK_POLYGON_MODE_FILL
+
+    // Optional second color attachment. These fields are appended so capture versions through v9
+    // retain their exact serialized prefix and materialize with MRT1 disabled.
+    uint32_t color1_format = 0;  // == VkFormat (0 = VK_FORMAT_UNDEFINED)
+    bool     has_clear_color1 = false;
+    float    clear_color1[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    bool     blend1_enable = false;
+    uint32_t src_color_blend_factor1 = 0, dst_color_blend_factor1 = 0, color_blend_op1 = 0;
+    uint32_t src_alpha_blend_factor1 = 0, dst_alpha_blend_factor1 = 0, alpha_blend_op1 = 0;
+    uint32_t color1_write_mask = 0; // MRT1 nibble of CB_TARGET_MASK
 };
 
 // A color-disabled draw must still execute when it can change the depth/stencil attachment consumed
