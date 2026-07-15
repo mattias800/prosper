@@ -609,7 +609,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // Fill the upload staging bytes.
             std::vector<uint8_t> upload((size_t)sbytes, 0);
             if (bi.storage) {
-                if (r->tile_mode && !dim_3d) {
+                if (r->tile_mode && !dim_3d &&
+                    !std::getenv("PROSPER_COMPUTE_TILED_2D_STORAGE")) {
                     skip_image(r, "tiled 1D/2D storage writeback deferred"); break;
                 }
                 if (!storage_unpack_supported(r->format) || !storage_pack_supported(r->format)) {
@@ -950,8 +951,10 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         cpci.stage.module = shader;
         cpci.stage.pName = "main";
         cpci.layout = pipeline_layout;
+        if (trace) std::fprintf(stderr, "[compute]   creating compute pipeline\n");
         if (!vk_ok(vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &cpci, nullptr, &pipeline),
                    "compute-pipeline")) break;
+        if (trace) std::fprintf(stderr, "[compute]   compute pipeline ready\n");
 
         VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         pci.queueFamilyIndex = ctx.queue_family;
@@ -1026,9 +1029,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submit.commandBufferCount = 1;
         submit.pCommandBuffers = &command;
+        if (trace) std::fprintf(stderr, "[compute]   submitting dispatch\n");
         if (!vk_ok(vkQueueSubmit(ctx.queue, 1, &submit, fence), "queue-submit")) break;
+        if (trace) std::fprintf(stderr, "[compute]   waiting for dispatch\n");
         if (!vk_ok(vkWaitForFences(ctx.device, 1, &fence, VK_TRUE,
                                    30ull * 1000 * 1000 * 1000), "queue-wait")) break;
+        if (trace) std::fprintf(stderr, "[compute]   dispatch complete\n");
 
         bool readback_ok = true;
         for (auto& buffer : buffers) {

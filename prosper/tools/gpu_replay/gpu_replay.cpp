@@ -32,7 +32,7 @@ bool set_environment(const std::string& name, const std::string& value) {
 void usage(const char* argv0) {
     std::fprintf(stderr, "usage: %s [--inspect|--inspect-only|--validate|--graph] "
                          "[--graph-json PATH] [--draw N[:M]] [--draw-with-compute-prefix] "
-                         "[--through-operation N] [--warmup-repeats N] "
+                         "[--through-operation N] [--compute-only N] [--warmup-repeats N] "
                          "[--bundle capture.prgbundle] [--bundle-tail N] [--bundle-compact PATH] "
                          "[--bundle-intermediate-through-target WxH] "
                          "[--bundle-final-capsule PATH] "
@@ -44,6 +44,7 @@ void usage(const char* argv0) {
                          "[--dump-resource DRAW:vs|ps:BINDING PATH] [--allow-mismatch] "
                          "[--dump-rtt-seed ADDR PATH] "
                          "[--dump-shader DRAW:vs|fs PATH] [--dump-compute N PATH] "
+                         "[--override-compute-spv N PATH] "
                          "[--dump-failed-shader FAILURE:STAGE PATH] "
                          "[--dump-compute-resource N:BINDING PATH] "
                          "[--legacy-htile-before-stencil] "
@@ -1071,9 +1072,11 @@ int main(int argc, char** argv) {
     uint32_t bundle_intermediate_target_width = 0, bundle_intermediate_target_height = 0;
     int draw_first = -1, draw_last = -1;
     int through_operation = -1;
+    int compute_only = -1;
     uint32_t warmup_repeats = 0;
     std::string dump_spec, dump_path, shader_spec, shader_path;
     std::string compute_shader_spec, compute_shader_path;
+    std::string compute_override_spec, compute_override_path;
     std::string compute_resource_spec, compute_resource_path;
     std::string failed_shader_spec, failed_shader_path;
     std::string rtt_seed_path;
@@ -1141,6 +1144,12 @@ int main(int argc, char** argv) {
             if (!end || *end || value < 0 || value > INT_MAX) { usage(argv[0]); return 2; }
             through_operation = static_cast<int>(value);
         }
+        else if (std::string(argv[i]) == "--compute-only" && i + 1 < argc) {
+            char* end = nullptr;
+            const long value = std::strtol(argv[++i], &end, 0);
+            if (!end || *end || value < 0 || value > INT_MAX) { usage(argv[0]); return 2; }
+            compute_only = static_cast<int>(value);
+        }
         else if (std::string(argv[i]) == "--warmup-repeats" && i + 1 < argc) {
             char* end = nullptr;
             const unsigned long value = std::strtoul(argv[++i], &end, 0);
@@ -1162,6 +1171,9 @@ int main(int argc, char** argv) {
         else if (std::string(argv[i]) == "--dump-compute" && i + 2 < argc) {
             compute_shader_spec = argv[++i]; compute_shader_path = argv[++i];
         }
+        else if (std::string(argv[i]) == "--override-compute-spv" && i + 2 < argc) {
+            compute_override_spec = argv[++i]; compute_override_path = argv[++i];
+        }
         else if (std::string(argv[i]) == "--dump-compute-resource" && i + 2 < argc) {
             compute_resource_spec = argv[++i]; compute_resource_path = argv[++i];
         }
@@ -1176,8 +1188,10 @@ int main(int argc, char** argv) {
         if (bundle_ds_summary && bundle_find_ds_addr) { usage(argv[0]); return 2; }
         if (positional.size() > 1 || inspect || inspect_only || validate_only || graph_only ||
             draw_first >= 0 || draw_with_compute_prefix || through_operation >= 0 ||
+            compute_only >= 0 ||
             warmup_repeats || !dump_spec.empty() || rtt_seed_addr ||
             !shader_spec.empty() || !compute_shader_spec.empty() ||
+            !compute_override_spec.empty() ||
             !compute_resource_spec.empty() || !failed_shader_spec.empty() ||
             !prepend_path.empty()) {
             usage(argv[0]); return 2;
@@ -1198,7 +1212,10 @@ int main(int argc, char** argv) {
         usage(argv[0]); return 2;
     }
     if (positional.empty() || positional.size() > 2) { usage(argv[0]); return 2; }
-    if (draw_first >= 0 && through_operation >= 0) { usage(argv[0]); return 2; }
+    if ((draw_first >= 0 && through_operation >= 0) ||
+        (compute_only >= 0 && (draw_first >= 0 || through_operation >= 0))) {
+        usage(argv[0]); return 2;
+    }
     if (draw_with_compute_prefix && draw_first < 0) { usage(argv[0]); return 2; }
     prosper::gpu::GpuCaptureFile capture; std::string error;
     if (!prosper::gpu::read_gpu_capture(positional[0], capture, error)) {
@@ -1226,6 +1243,57 @@ int main(int argc, char** argv) {
     if (!prepend_path.empty() && prepend.metadata.submit_index >= replay.metadata.submit_index) {
         std::fprintf(stderr, "gpu_replay: predecessor submit must be earlier than consumer submit\n");
         return 2;
+    }
+    if (!compute_override_spec.empty()) {
+        char* end = nullptr;
+        const long index = std::strtol(compute_override_spec.c_str(), &end, 0);
+        if (!end || *end || index < 0 || static_cast<size_t>(index) >= replay.computes.size()) {
+            std::fprintf(stderr, "gpu_replay: invalid compute override selector %s\n",
+                         compute_override_spec.c_str());
+            return 2;
+        }
+        FILE* file = std::fopen(compute_override_path.c_str(), "rb");
+        if (!file || std::fseek(file, 0, SEEK_END) != 0) {
+            if (file) std::fclose(file);
+            std::fprintf(stderr, "gpu_replay: cannot read compute override %s\n",
+                         compute_override_path.c_str());
+            return 2;
+        }
+        const long byte_count = std::ftell(file);
+        if (byte_count < 20 || byte_count > 16 * 1024 * 1024 || (byte_count & 3) != 0 ||
+            std::fseek(file, 0, SEEK_SET) != 0) {
+            std::fclose(file);
+            std::fprintf(stderr, "gpu_replay: invalid SPIR-V size for compute override %s\n",
+                         compute_override_path.c_str());
+            return 2;
+        }
+        std::vector<uint32_t> words(static_cast<size_t>(byte_count) / sizeof(uint32_t));
+        if (std::fread(words.data(), 1, static_cast<size_t>(byte_count), file) !=
+                static_cast<size_t>(byte_count) || words[0] != 0x07230203u) {
+            std::fclose(file);
+            std::fprintf(stderr, "gpu_replay: invalid SPIR-V compute override %s\n",
+                         compute_override_path.c_str());
+            return 2;
+        }
+        std::fclose(file);
+        replay.computes[static_cast<size_t>(index)].spirv = std::move(words);
+        allow_mismatch = true;
+        std::fprintf(stderr, "[gpureplay] override compute %ld with %ld bytes from %s\n",
+                     index, byte_count, compute_override_path.c_str());
+    }
+    if (compute_only >= 0) {
+        if (static_cast<size_t>(compute_only) >= replay.computes.size()) {
+            std::fprintf(stderr, "gpu_replay: compute index %d is out of range\n", compute_only);
+            return 2;
+        }
+        const prosper::gpu::ComputeItem& item = replay.computes[static_cast<size_t>(compute_only)];
+        replay.operations = {{prosper::gpu::SubmitOperationKind::Dispatch,
+                              item.dispatch_index, item.command_order, true}};
+        replay.items.clear();
+        allow_mismatch = true;
+        std::fprintf(stderr, "[gpureplay] selected compute %d (dispatch=%llu code=0x%llx)\n",
+                     compute_only, static_cast<unsigned long long>(item.dispatch_index),
+                     static_cast<unsigned long long>(item.code_addr));
     }
     if (rtt_seed_addr) {
         const auto seed = std::find_if(replay.rtt_seeds.begin(), replay.rtt_seeds.end(),
