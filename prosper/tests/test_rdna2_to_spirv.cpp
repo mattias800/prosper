@@ -361,6 +361,31 @@ int main() {
     CHECK(act17>0 && msk17>0, "kernel 17 exercises both active and masked lanes");
     CHECK(got17.size()==N && bad17==0, "recompiled kernel 17 (per-write predication + EXEC restore) correct");
 
+    // Kernel 17b: s_not_b64 complements a VCC lane mask before saveexec. DOLL's failed
+    // 120x68 LUT producer uses the exact gfx1030 encoding below (`s_not_b64 vcc,vcc`).
+    // v3=7; vcc=(u0>u1); vcc=!vcc; saveexec(vcc); v3=u0+u1; restore; output v3.
+    const uint32_t code17b[] = {
+        0x7e000f00u, 0x7e020f01u, 0x7e060287u, 0x7d880300u, 0xbeea086au,
+        0xbe80246au, 0xbf880001u, 0x4a060300u, 0xbefe0400u, 0x7e060d03u, 0xbf810000u,
+    };
+    std::vector<uint32_t> spv17b = recompile_valu(
+        code17b, sizeof(code17b)/sizeof(code17b[0]), 2, /*out_vgpr*/3);
+    CHECK(!spv17b.empty(), "recompiled kernel 17b (s_not_b64 VCC complement) -> SPIR-V");
+    std::vector<float> in17b(N * 2), exp17b(N);
+    for (uint32_t i = 0; i < N; i++) {
+        uint32_t u0 = i % 17, u1 = i % 13;
+        in17b[i*2+0]=(float)u0; in17b[i*2+1]=(float)u1;
+        exp17b[i] = (u0 <= u1) ? (float)(u0 + u1) : 7.0f;
+    }
+    std::vector<float> got17b = prosper::test::run_compute(spv17b, in17b, N, N);
+    uint32_t bad17b = 0, act17b = 0;
+    for (uint32_t i=0;i<N&&got17b.size()==N;i++) {
+        if (std::fabs(got17b[i]-exp17b[i])>1e-3f) bad17b++;
+        if ((i%17)<=(i%13)) act17b++;
+    }
+    CHECK(act17b>0 && act17b<N, "kernel 17b exercises both complemented-mask outcomes");
+    CHECK(got17b.size()==N && bad17b==0, "s_not_b64 complements VCC before EXEC predication");
+
     // Kernel 18: the REAL if-then idiom with a forward branch. v3=7; vcc=(u0>u1);
     // s_and_saveexec_b64 s[0:1],vcc (save exec, exec=vcc); s_cbranch_execz skip (forward -> no-op);
     // v_add v3=u0+u1 (predicated); skip: s_mov_b64 exec,s[0:1] (restore); cvt+store. Same result as
