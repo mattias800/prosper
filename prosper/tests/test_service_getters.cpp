@@ -5,6 +5,7 @@
 // NID, so this looks them up by NID and exercises the output contract.
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
+#include "../src/hle/callback_fs.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -26,6 +27,30 @@ static int32_t call_int_getter(HleFn fn, int32_t sentinel) {
 int main() {
     printf("== test_service_getters ==\n");
     register_builtin_hle();
+
+#ifndef _WIN32
+    // Guest callback shims must recover saved r11 from the import stub's real +0x28 slot. +0x18 is
+    // forwarded arg9 and can legitimately contain an eboot pointer; treating it as %fs crashes the
+    // next host-libc call on executable memory.
+    {
+        struct alignas(16) FakeTcb { uint8_t bytes[0x110]; } tcb{};
+        uint64_t tp = (uint64_t)(uintptr_t)&tcb;
+        *(uint64_t*)(tcb.bytes + 0x00) = tp;
+        *(uint32_t*)(tcb.bytes + 0x108) = 0x50524F53u;
+        uint64_t frame[7] = {};
+        frame[0] = 0x600001000ull;    // return into an import swap stub
+        frame[3] = 0x400000000ull;    // arg9 decoy: the old +0x18 bug selected this as %fs
+        frame[5] = tp;                // +0x28: saved r11 / real guest %fs
+        CHECK(callback_guest_fs_from_entry_stack((uint64_t)(uintptr_t)frame) == tp,
+              "callback shim recovers guest fs from saved-r11 +0x28, not arg9 +0x18");
+        *(uint32_t*)(tcb.bytes + 0x108) = 0;
+        CHECK(callback_guest_fs_from_entry_stack((uint64_t)(uintptr_t)frame) == 0,
+              "callback shim rejects a value without the guest-TCB magic");
+        frame[0] = 0x400001000ull;
+        CHECK(callback_guest_fs_from_entry_stack((uint64_t)(uintptr_t)frame) == 0,
+              "host-context callback entry does not invent a guest fs frame");
+    }
+#endif
 
     // UserService getters: age level -> adult (18), accessibility -> off (0). Must WRITE the output.
     struct { const char* nid; int32_t want; const char* what; } getters[] = {

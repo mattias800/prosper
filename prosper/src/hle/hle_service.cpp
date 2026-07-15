@@ -5,6 +5,7 @@
 // (Game-controller input — libScePad — moved to hle_pad.cpp with a real host backend.)
 #include "dispatch.hpp"
 #include "nid.hpp"
+#include "callback_fs.hpp"
 #include "platform_ui.hpp"
 #include "video_backend.hpp"   // sceAvPlayer -> host hardware-decode backend (#705)
 #include "../host/posix_shim.hpp"   // PROSPER_ASM_TRAMPOLINE (Mach-O/ELF global-asm portability)
@@ -1005,8 +1006,9 @@ HLE(s_npent_addcont_info) {
 // import swap-stub switched), so the guest callback must run with the GUEST %fs restored or its
 // TLS accesses (UE MallocBinned caches!) read host TLS garbage. The swap-stub saves the guest fs
 // base in its frame (push r11), so an asm entry shim (the f_apr_read_submit_entry pattern) hands
-// the handler its entry %rsp: [rsp]=ret-to-stub, [+8/+0x10]=re-pushed args7/8, [+0x18]=guest fs,
-// [+0x20]=guest RA. A [rsp] outside the stub region [0x6_0000_0000,0x7_0000_0000) means the
+// the handler its entry %rsp. The guest swap path re-pushes args7/8/9, an alignment pad, then the
+// saved r11: [rsp]=ret-to-stub, args at +8/+0x10/+0x18, pad at +0x20, guest fs at +0x28, and guest
+// RA at +0x30. A [rsp] outside the stub region [0x6_0000_0000,0x7_0000_0000) means the
 // host-context tail-jmp path (no swap happened) — call the callback on the current fs.
 // Mechanism proven live by the PROSPER_NETCTL_CB experiment (run 7/9: delivered + consumed
 // cleanly, no crash). CONFIDENCE: HIGH.
@@ -1014,13 +1016,6 @@ HLE(s_npent_addcont_info) {
 namespace {
 inline uint64_t cb_rd_fsbase() { uint64_t v; __asm__ volatile("rdfsbase %0" : "=r"(v)); return v; }
 inline void     cb_wr_fsbase(uint64_t v) { __asm__ volatile("wrfsbase %0" : : "r"(v)); }
-// The guest %fs base saved by the import swap-stub, or 0 if the call came in on a host context.
-inline uint64_t cb_guest_fs(uint64_t entry_rsp) {
-    uint64_t shim_ret = entry_rsp ? *(uint64_t*)entry_rsp : 0;
-    if (shim_ret >= 0x600000000ull && shim_ret < 0x700000000ull)
-        return *(uint64_t*)(entry_rsp + 0x18);                // the swap-stub's saved r11
-    return 0;
-}
 // RAII: run the enclosed guest callback on the guest %fs (no-op when guest_fs==0).
 struct CbGuestFsScope {
     uint64_t saved = 0, active = 0;
@@ -1072,7 +1067,7 @@ extern "C" uint64_t s_netctl_check_cb_c(uint64_t, uint64_t, uint64_t, uint64_t, 
                                         uint64_t entry_rsp) {
     uint64_t fn = g_netctl_cb_fn.load();
     if (!fn || g_netctl_cb_delivered.exchange(1)) return 0;   // deliver the initial state exactly once
-    uint64_t gfs = cb_guest_fs(entry_rsp);
+    uint64_t gfs = callback_guest_fs_from_entry_stack(entry_rsp);
     {
         CbGuestFsScope fs(gfs);
         ((void (*)(int, void*))(uintptr_t)fn)(1 /*SCE_NET_CTL_EVENT_TYPE_DISCONNECTED*/,
@@ -1127,7 +1122,7 @@ extern "C" void s_np_check_cb_entry();
 extern "C" uint64_t s_np_check_cb_c(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
                                     uint64_t entry_rsp) {
     int n = g_np_state_cb_n.load(); if (n > 4) n = 4;
-    uint64_t gfs = cb_guest_fs(entry_rsp);
+    uint64_t gfs = callback_guest_fs_from_entry_stack(entry_rsp);
     for (int i = 0; i < n; i++) {
         uint64_t fn = g_np_state_cbs[i].fn.load();
         if (!fn || g_np_state_cbs[i].delivered.exchange(1)) continue;
