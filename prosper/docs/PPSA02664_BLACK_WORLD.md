@@ -5,6 +5,15 @@ is proposed as ready; the watchpoint material is a **conditional toolbox appendi
 evidence-selected Phase 1. Revised after review by Mira Voss (2026-07-15), whose Phase-0A discipline
 falsified the original premise (below) before any tooling was built.
 
+> **Current status (2026-07-15) — this is a frozen METHOD/DIAGNOSTIC PR.** Phase −1 (target identity)
+> was subsequently completed: the actual Mt. Eternal gameplay scene is content-verified, and the world
+> IS rendered but is lost during final composition in offline replay. The **evolving diagnosis and all
+> results now live on issue #320**, not in this document (a durable doc must not become a moving
+> hypothesis log). This PR contains only two diagnostics — `PROSPER_FS_SPV_MATCH` (fail-closed
+> content-gated fragment override) and `PROSPER_DUMP_RTGROUPS_RGBA` (alpha-preserving per-target dump).
+> **Neither constitutes a gameplay root-cause claim or a fix**; the current root cause is unresolved and
+> gated on a live/replay state comparison (see #320).
+
 ## Governing invariant (adopt this first)
 
 **Scene identity must be established from rendered *semantic content* before any shader/resource
