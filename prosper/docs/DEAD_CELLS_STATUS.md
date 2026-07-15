@@ -1,15 +1,24 @@
 # Dead Cells graphics status and regression workflow
 
-Last updated: 2026-07-14
+Last updated: 2026-07-15
 
 The operational route and selector reference is
 [`../scripts/dead-cells/README.md`](../scripts/dead-cells/README.md). The gameplay-composition bug
 [#566](https://github.com/mattias800/ps5ys/issues/566) was fixed by #626; this document retains the exact
 checkpoint recipe as a regression and future-investigation workflow.
+The current full-render progression investigation and its behavior-equivalence rows are documented in
+[`DEAD_CELLS_PROGRESSION_MATRIX.md`](DEAD_CELLS_PROGRESSION_MATRIX.md) and tracked by
+[#723](https://github.com/mattias800/ps5ys/issues/723).
 
 ## Current state
 
-*Dead Cells* boots, passes the splash and menus, loads `PrisonStart`, and reaches the controllable Jump tutorial.
+*Dead Cells* boots, passes the splash and menus, and loads `PrisonStart`. Native-speed and sampled-graphics routes
+reach the controllable Jump tutorial and have supplied full-color gameplay captures. The current full synchronous
+renderer reaches `Loading level PrisonStart` and completes `PARSEALL`, but remains on the loading screen under the
+measured timeout. Therefore "reaches gameplay" currently describes the diagnostic/sampled route and the renderer's
+ability to render a selected gameplay checkpoint, not end-to-end full-render app progression. Issue #723 owns that
+remaining behavior gap.
+
 The scene renders in full color, including geometry, lighting, smoke, silhouettes, the player, terrain, effects,
 the tutorial prompt, and the HUD. The final grayscale-world root cause was the fragment recompiler selecting the
 first color export from shaders that emit MRT3..MRT0; MRT0 now feeds the backend's single color attachment (#626).

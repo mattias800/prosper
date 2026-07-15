@@ -2529,7 +2529,7 @@ bool execute_compute_items(const std::vector<ComputeItem>& items) {
 }
 
 bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t height,
-                                 uint64_t submit_no) {
+                                 uint64_t submit_no, bool publish) {
     if ((!g_live && !g_compute) || (st.draws.empty() && st.dispatches.empty())) return false;
     // Guest allocations referenced by a GPU submit must remain mapped until that submit completes.
     // Reuse positive page/VirtualQuery results only inside this synchronous execution window; the
@@ -2578,7 +2578,8 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
         if (!finish_requested_gpu_capture(std::move(pending_capture), px, error))
             std::fprintf(stderr, "[gpucap] write failed: %s\n", error.c_str());
     }
-    const bool presented = px.size() == static_cast<size_t>(width) * height * 4;
+    const bool frame_ready = px.size() == static_cast<size_t>(width) * height * 4;
+    const bool presented = frame_ready && publish;
     if (presented) present_write_frame(result.frame.storage, width, height);
     if (timing_enabled) {
         const auto timing_done = TimingClock::now();
@@ -2668,7 +2669,7 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
     return presented;
 }
 
-bool execute_and_present(const GpuState& st, uint32_t width, uint32_t height) {
+bool execute_and_present(const GpuState& st, uint32_t width, uint32_t height, bool publish) {
     if (!g_live || st.draws.empty() || !width || !height) return false;
     // Bind the target dimensions and defer to the pure core, which recompiles the shaders from their
     // SHADER_PGM addresses and resolves fixed-function state before calling back into the live renderer.
@@ -2693,6 +2694,7 @@ bool execute_and_present(const GpuState& st, uint32_t width, uint32_t height) {
             std::fprintf(stderr, "[gpucap] write failed: %s\n", error.c_str());
     }
     if (rendered.size() != static_cast<size_t>(width) * height * 4) return false;
+    if (!publish) return false;
     present_write_frame(rendered.storage, width, height);
     return true;
 }

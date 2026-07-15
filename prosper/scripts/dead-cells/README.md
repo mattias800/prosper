@@ -9,6 +9,12 @@ PROSPER_PAD_SCRIPT=@scripts/dead-cells/reach-first-gameplay.pad \
   --warmup-seconds 35 --seconds 1 --count 5 --timeout 65 --out shots
 ```
 
+For progression investigations, use
+[`progression-matrix.ps1`](progression-matrix.ps1) and read
+[`../../docs/DEAD_CELLS_PROGRESSION_MATRIX.md`](../../docs/DEAD_CELLS_PROGRESSION_MATRIX.md). It compares
+full-render headless and SDL-app runs against full-execution sparse publication, sampled graphics, and
+no-graphics diagnostics with isolated saves and the same semantic gameplay selector.
+
 ## Routes
 
 - `reach-first-gameplay.pad`: selects Play/slot 1, starts `PrisonStart`, and
@@ -22,7 +28,9 @@ PROSPER_PAD_SCRIPT=@scripts/dead-cells/reach-first-gameplay.pad \
   warmup. Circle remains held through 240 seconds because synchronous rendering
   has made `PARSEALL` take from about 60 to more than 160 seconds across measured
   builds. The route now survives that throughput variance, but the gameplay
-  snapshot baseline remains pending until its retained frames are reviewed.
+  snapshot baseline remains pending until its retained frames are reviewed. Current master reaches
+  `PrisonStart` and finishes `PARSEALL`, but the full synchronous-render route remains on the loading
+  screen under the measured timeout (#723); do not conflate it with the sampled route below.
 - `reach-first-gameplay-capture.pad`: uses the same menu input but holds Circle from
   28 through 300 seconds. Use it when synchronous timeline/bundle capture begins during
   level loading; the ordinary six-second hold can expire while capture stalls GPU progress.
