@@ -127,6 +127,7 @@ struct ShaderCompileKey {
     PixelInputMapping pixel_inputs{};
     bool has_system_inputs = false;
     PixelSystemInputMapping system_inputs{};
+    bool early_depth_stencil = false;   // #320: guest DB_SHADER_CONTROL.Z_ORDER == EARLY_Z (fragment)
     std::vector<uint32_t> code;
     std::vector<ShaderResourceCompileKey> resources;
 
@@ -159,6 +160,7 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, key.system_inputs.ena);
             hash = hash_mix(hash, key.system_inputs.addr);
         }
+        hash = hash_mix(hash, key.early_depth_stencil);
         hash = hash_mix(hash, key.code.size());
         for (uint32_t word : key.code) hash = hash_mix(hash, word);
         hash = hash_mix(hash, key.resources.size());
@@ -446,7 +448,8 @@ uint64_t shader_cache_entry_bytes(const ShaderCompileKey& key, const std::vector
 ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_t* code, size_t dwords,
                                          const ShaderResourceTable* resources,
                                          const PixelInputMapping* pixel_inputs,
-                                         const PixelSystemInputMapping* system_inputs) {
+                                         const PixelSystemInputMapping* system_inputs,
+                                         bool early_depth_stencil) {
     ShaderCompileKey key;
     key.stage = stage;
     key.has_resource_table = resources != nullptr;
@@ -455,6 +458,7 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
     if (key.has_pixel_inputs) key.pixel_inputs = *pixel_inputs;
     key.has_system_inputs = stage == ShaderProgramStage::Fragment && system_inputs != nullptr;
     if (key.has_system_inputs) key.system_inputs = *system_inputs;
+    key.early_depth_stencil = stage == ShaderProgramStage::Fragment && early_depth_stencil;
     if (code && dwords) {
         // Most shaders end at S_ENDPGM. A compiler-generated s_getpc_b64 V# may instead address an
         // embedded lookup table after ENDPGM; retain that proven tail so cached recompilation sees the
@@ -483,7 +487,8 @@ std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const Sh
                                 key.has_pixel_inputs ? &key.pixel_inputs : nullptr);
     if (stage == ShaderProgramStage::Fragment)
         return recompile_fragment(code, key.code.size(), resources,
-                                  key.has_system_inputs ? &key.system_inputs : nullptr);
+                                  key.has_system_inputs ? &key.system_inputs : nullptr,
+                                  key.early_depth_stencil);
     return {};
 }
 
@@ -553,10 +558,11 @@ std::vector<uint32_t> recompile_graphics_shader_cached(ShaderProgramStage stage,
                                                        const ShaderResourceTable* resources,
                                                        const PixelInputMapping* pixel_inputs,
                                                        const PixelSystemInputMapping* system_inputs,
-                                                       uint64_t* cache_identity) {
+                                                       uint64_t* cache_identity,
+                                                       bool early_depth_stencil) {
     if (cache_identity) *cache_identity = 0;
     ShaderCompileKey key = make_shader_compile_key(stage, code, dwords, resources, pixel_inputs,
-                                                   system_inputs);
+                                                   system_inputs, early_depth_stencil);
     if (getenv("PROSPER_NO_SHADER_CACHE")) {
         auto& cache = shader_cache();
         {

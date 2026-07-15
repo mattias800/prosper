@@ -81,7 +81,8 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
 // An optional ShaderResourceTable enables memory ops (SMEM/MUBUF) with resolved bindings.
 std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
                                          const ShaderResourceTable* rt = nullptr,
-                                         const PixelSystemInputMapping* system_inputs = nullptr);
+                                         const PixelSystemInputMapping* system_inputs = nullptr,
+                                         bool early_fragment_tests = false);
 
 // Recompile a vertex shader to a vertex SPIR-V module: v0 = gl_VertexIndex, run the VALU, and on EXP
 // to a POS target write vec4(src0..3) to gl_Position. Returns {} if unsupported / no position export.

@@ -52,7 +52,7 @@ enum : uint32_t { Glsl_FAbs=4, Glsl_RoundEven=2, Glsl_Trunc=3, Glsl_Floor=8, Gls
 enum : uint32_t {
     Cap_Shader=1, Cap_Int64=11, Cap_GroupNonUniform=61, Cap_GroupNonUniformVote=62,
     Addr_Logical=0, Mem_GLSL450=1, Exec_Vertex=0, Exec_Fragment=4, Exec_GLCompute=5,
-    EM_OriginUpperLeft=7, EM_LocalSize=17,
+    EM_EarlyFragmentTests=5, EM_OriginUpperLeft=7, EM_LocalSize=17,
     SC_Input=1, SC_UniformConstant=0, SC_Output=3, SC_Function=7, SC_StorageBuffer=12, FC_None=0,
     Dim_1D=0, Dim_2D=1, Dim_3D=2,   // SPIR-V Dim. (2D coincides with the SQ_RSRC 2D dim value, but distinct.)
     Cap_Sampled1D=43, Cap_Image1D=44,   // Dim=1D needs Sampled1D; a 1D STORAGE image (read/write) also needs Image1D
@@ -923,7 +923,8 @@ struct SpirvCompute {
     // --- Fragment-shader shell: vec4 outputs for the implemented MRT0/MRT1 exports. ---
     uint32_t t_v4f = 0;
     std::array<uint32_t, 2> v_color{};
-    void begin_fragment(const ShaderResourceTable* rt = nullptr, uint32_t color_mask = 1u) {
+    void begin_fragment(const ShaderResourceTable* rt = nullptr, uint32_t color_mask = 1u,
+                        bool early_fragment_tests = false) {
         bool with_cbufs = rt != nullptr;
         t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_i32 = id(); t_bool = id();
         t_v4f = id(); uint32_t t_ptr_out = id();
@@ -938,6 +939,16 @@ struct SpirvCompute {
         exec_model = Exec_Fragment;
         for (uint32_t output : v_color) if (output) iface.push_back(output); // EntryPoint deferred
         put(exec, Op_ExecutionMode, {f_main, EM_OriginUpperLeft});
+        // Early depth/stencil (#320): when the guest programs DB_SHADER_CONTROL.Z_ORDER = EARLY_Z, the
+        // depth/stencil test AND write happen BEFORE the pixel shader — so a shader that discards
+        // (OpKill) still writes stencil/depth for covered samples. Without EarlyFragmentTests, Vulkan
+        // runs the tests LATE and the discard suppresses the stencil write, silently dropping
+        // stencil-mask writers (PPSA02664 draws a full-screen stencil mask via a kill-shader; losing it
+        // made a later masked opaque fill cover the whole scene -> black gameplay world). Emitting this
+        // only for guest-programmed early-Z leaves LATE_Z alpha-tested geometry (foliage etc., where the
+        // kill must suppress the depth write) unchanged.
+        if (early_fragment_tests)
+            put(exec, Op_ExecutionMode, {f_main, EM_EarlyFragmentTests});
         for (uint32_t mrt = 0; mrt < v_color.size(); ++mrt)
             if (v_color[mrt]) put(deco, Op_Decorate, {v_color[mrt], Dec_Location, mrt});
         put(types, Op_TypeVoid, {t_void});
@@ -5098,7 +5109,8 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
 
 std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
                                          const ShaderResourceTable* rt,
-                                         const PixelSystemInputMapping* system_inputs) {
+                                         const PixelSystemInputMapping* system_inputs,
+                                         bool early_fragment_tests) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
 
@@ -5113,7 +5125,7 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
     if (!color_mask) return {};
 
     SpirvCompute b;
-    b.begin_fragment(rt, color_mask);
+    b.begin_fragment(rt, color_mask, early_fragment_tests);
     // Classify each interpolated attribute by HOW it's read (#152): v_interp_p2 (op 1) = smooth
     // rasterizer interpolation; v_interp_mov (op 2) = a raw per-vertex / provoking-vertex value (a
     // flat read). An attribute read only via v_interp_mov gets its Input varying decorated Flat so
