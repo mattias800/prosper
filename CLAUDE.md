@@ -206,6 +206,14 @@ sampled images, and persistent target/texture/pipeline cache identities. Capture
 or `rgba16f` and reads v1..v12 artifacts. The current semantic selector is documented in
 `prosper/docs/DEAD_CELLS_STATUS.md`; do not reuse the historical 738x420 predicate for new captures.
 
+The first FP16 live run then exposed stale temporal history (#780), not another shader defect. Compute operation
+19 resets the same lighting backing to RGBA16F `(0,0,0,1)` before draws 17..22, but guest-write notification
+invalidated only the persistent Vulkan target; the frontend immediately uploaded the previous frame's CPU RTT
+copy as a seed and brightness fed back toward white/yellow. Guest GPU writes now discard overlapping CPU RTT
+entries using their native byte width as well as invalidating GPU targets. Live user validation reports stable,
+artifact-free composition apart from separately tracked window-light banding (#781). The corrected 77-submit
+source and standalone capsule are byte-identical at `13b4ccdfa15b1f4d`.
+
 `--bundle-final-capsule` snapshots both color RTT state and exact valid planes from persistent Vulkan
 depth/stencil images into capture v8 (#569). Capture v8 reads v1-v7 artifacts; pre-v7 failed-operation diagnostics
 report unavailable and pre-v8 captures contain no invented DS seeds. Timeline v6 reads timeline v1-v5

@@ -37,8 +37,18 @@ deterministic operation-prefix replay localized the first bad composite to draw 
 RGBA8, clamping HDR values before the composite. Renderer-owned RTTs now retain
 `VK_FORMAT_R16G16B16A16_SFLOAT` through attachment creation, readback/seed bytes, texture upload/views, and
 persistent target/texture/pipeline cache identities. Capture v13 records each RTT seed's native format while
-remaining able to read v1..v12 captures. The issue-773 77-submit source and its standalone v13 capsule are
-byte-identical at `9145002cabc36e97`; inspection shows one 642x362 `rgba16f` seed with 1,859,232 bytes.
+remaining able to read v1..v12 captures. The issue-773 pre-#780 77-submit source and its standalone v13 capsule
+were byte-identical at `9145002cabc36e97`; inspection shows one 642x362 `rgba16f` seed with 1,859,232 bytes.
+
+That native-format fix exposed a second temporal defect (#780): compute operation 19 writes the FP16 backing at
+`0x...50810000` with repeating half-float `(0,0,0,1)` before draws 17..22, resetting the lighting history. Guest
+GPU write notification invalidated the persistent Vulkan color target but left the frontend's older CPU RTT copy
+alive. Pass setup then uploaded that stale copy as `seed_rgba`, defeating the reset and feeding brightness back
+until the moving background became white/yellow. Guest GPU writes now discard every overlapping CPU RTT using
+the surface's native byte width. The corrected 77-submit bundle and regenerated standalone v13 capsule are
+byte-identical at `13b4ccdfa15b1f4d` (BMP SHA-256
+`6a4e88dbc163d6075b18b768b20d91cfb6467c76e61af6798e22ec6ea3d2c53c`). Live Windows validation found no
+remaining composition artifacts; localized banding in the window light is tracked separately in #781.
 
 Startup and progression are stable after implementing both AGC resource-registration output queries. The former
 success-only `QueryResourceRegistrationUserMemoryRequirements` stub left Dead Cells' stack value untouched and
@@ -61,7 +71,9 @@ The important fixes already on `master` are:
 - directly placed compute buffer destinations resolve, so the current scene realizes all eight dispatches (#626);
 - MRT0, rather than the first-emitted non-color G-buffer plane, supplies the visible fragment output (#626);
 - AGC resource-registration memory requirements always initialize their output instead of leaking stack data into
-  the game's texture-pool allocation size (#660).
+  the game's texture-pool allocation size (#660);
+- guest compute/DMA writes invalidate overlapping native-format CPU RTT snapshots as well as persistent Vulkan
+  targets, so a reset backing cannot be overwritten by stale temporal history (#780).
 
 The producer-complete post-#626 checkpoint realizes every semantic draw and all eight dispatches. Descriptor
 validation has not identified a missing or undersized binding in the exercised frame.

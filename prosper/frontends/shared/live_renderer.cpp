@@ -54,6 +54,23 @@ struct RttSurf {
     bool gpu_valid = false;
 };
 
+using RttCache = std::unordered_map<uint64_t, RttSurf>;
+
+void invalidate_cpu_rtt_guest_write(RttCache& cache, uint64_t addr, uint64_t size) {
+    if (!addr || !size) return;
+    const uint64_t end = size > UINT64_MAX - addr ? UINT64_MAX : addr + size;
+    for (auto it = cache.begin(); it != cache.end();) {
+        const RttSurf& surface = it->second;
+        const uint64_t bpp = prosper::test::backend_color_bytes_per_pixel(surface.format);
+        const uint64_t pixels = static_cast<uint64_t>(surface.w) * surface.h;
+        const uint64_t bytes = pixels > UINT64_MAX / bpp ? UINT64_MAX : pixels * bpp;
+        const uint64_t target_end = bytes > UINT64_MAX - it->first
+            ? UINT64_MAX : it->first + bytes;
+        if (addr < target_end && it->first < end) it = cache.erase(it);
+        else ++it;
+    }
+}
+
 prosper::gpu::GpuCaptureColorFormat capture_color_format(VkFormat format) {
     return prosper::test::backend_color_format(format) == VK_FORMAT_R16G16B16A16_SFLOAT
         ? prosper::gpu::GpuCaptureColorFormat::Rgba16Float
@@ -151,6 +168,7 @@ struct PersistentDecodedTexture {
 }
 
 void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
+    static RttCache g_rtt;   // render-to-texture cache (#167)
     register_live_compute();
     const char* ds_invalidate = getenv("PROSPER_DS_GUEST_WRITE_INVALIDATE");
     const bool invalidate_ds = !ds_invalidate || strcmp(ds_invalidate, "0");
@@ -159,6 +177,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             if (invalidate_ds)
                 prosper::test::invalidate_persistent_ds_guest_write(addr, size);
             prosper::test::invalidate_persistent_color_target_guest_write(addr, size);
+            invalidate_cpu_rtt_guest_write(g_rtt, addr, size);
         });
     // Resource tables are built before the submit reaches this callback. Publish the renderer's
     // default mode now so unmapped render-target descriptors remain available for RTT injection.
@@ -171,7 +190,6 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
 #endif
     }
     static std::atomic<int> frame_no{0};
-    static std::unordered_map<uint64_t, RttSurf> g_rtt;   // render-to-texture cache (#167)
     if (getenv("PROSPER_GPU_CAPTURE") || getenv("PROSPER_GPU_TIMELINE_CAPTURE") ||
         getenv("PROSPER_GPU_REPLAY_EXPORT_RTT")) {
         prosper::gpu::set_gpu_capture_rtt_seed_reader([](uint64_t addr, prosper::gpu::GpuCaptureRttSeed& seed) {
