@@ -11,6 +11,7 @@
 #include "../src/gpu/shader_resources.hpp"
 #include "render_runner.h"
 #include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <vector>
 
@@ -76,6 +77,42 @@ int main() {
     bool ok1 = sample_center(C075, C025, rgb);
     printf("  (0.75,0.25) center=(%u,%u,%u)\n", ok1?rgb[0]:0, ok1?rgb[1]:0, ok1?rgb[2]:0);
     CHECK(ok1 && rgb[1] > 0x80 && rgb[0] < 0x40 && rgb[2] < 0x40, "sampling texel (1,0) yields GREEN (proves u routing)");
+
+    // The live renderer commonly submits hundreds of draws that reference the same few decoded
+    // textures. The backend must upload identical pixels once per call while preserving the legacy
+    // rendered bytes and separate per-descriptor views/samplers.
+    {
+        std::vector<uint32_t> ps(ps_template, ps_template + sizeof(ps_template)/sizeof(ps_template[0]));
+        ps[1] = C075; ps[3] = C025;
+        std::vector<uint32_t> frag = recompile_fragment(ps.data(), ps.size(), &rt);
+        prosper::test::FrameResource resource;
+        resource.binding = 4; resource.set = 1;
+        resource.tex_rgba = texels; resource.tw = 2; resource.th = 2;
+        prosper::test::BackendDraw draw;
+        draw.vs = vert; draw.fs = frag; draw.R = {resource}; draw.vcount = 3;
+
+        std::vector<uint8_t> shared = prosper::test::render_draws_rgba({draw, draw}, W, H);
+        const auto shared_stats = prosper::test::backend_texture_upload_stats();
+        CHECK(shared_stats.references == 2 && shared_stats.unique_uploads == 1,
+              "two draws sharing decoded pixels produce one backend texture upload");
+
+#ifdef _WIN32
+        _putenv_s("PROSPER_NO_BACKEND_TEXTURE_SHARE", "1");
+#else
+        setenv("PROSPER_NO_BACKEND_TEXTURE_SHARE", "1", 1);
+#endif
+        std::vector<uint8_t> legacy = prosper::test::render_draws_rgba({draw, draw}, W, H);
+        const auto legacy_stats = prosper::test::backend_texture_upload_stats();
+#ifdef _WIN32
+        _putenv_s("PROSPER_NO_BACKEND_TEXTURE_SHARE", "");
+#else
+        unsetenv("PROSPER_NO_BACKEND_TEXTURE_SHARE");
+#endif
+        CHECK(legacy_stats.references == 2 && legacy_stats.unique_uploads == 2,
+              "disable switch restores one backend upload per texture reference");
+        CHECK(!shared.empty() && shared == legacy,
+              "shared and legacy texture uploads render byte-identical output");
+    }
 
     bool ok2 = sample_center(C025, C075, rgb);
     printf("  (0.25,0.75) center=(%u,%u,%u)\n", ok2?rgb[0]:0, ok2?rgb[1]:0, ok2?rgb[2]:0);
