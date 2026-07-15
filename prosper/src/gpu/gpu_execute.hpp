@@ -40,6 +40,9 @@ struct ShaderResourceTable;   // fwd (shader_resources.hpp); passed to the backe
 // correctly instead of collapsing onto a single draw. The tables may be null (color-only shaders).
 struct DrawItem {
     std::vector<uint32_t> vs, fs;                     // recompiled SPIR-V
+    // Process-unique identities supplied by the exact shader-recompile cache. Zero means the
+    // shader came from an external/replay path, so persistent backend caches must compare words.
+    uint64_t vs_identity = 0, fs_identity = 0;
     ResolvedPipelineState ps;                         // THIS draw's fixed-function state
     std::shared_ptr<ShaderResourceTable> vrt, prt;    // may be null
     uint32_t vertex_count = 3;
@@ -199,7 +202,8 @@ std::vector<uint32_t> recompile_graphics_shader_cached(ShaderProgramStage stage,
                                                        const uint32_t* code, size_t dwords,
                                                        const ShaderResourceTable* resources = nullptr,
                                                        const PixelInputMapping* pixel_inputs = nullptr,
-                                                       const PixelSystemInputMapping* system_inputs = nullptr);
+                                                       const PixelSystemInputMapping* system_inputs = nullptr,
+                                                       uint64_t* cache_identity = nullptr);
 ShaderRecompileCacheStats shader_recompile_cache_stats();
 void clear_shader_recompile_cache();
 
@@ -462,12 +466,13 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     PixelSystemInputMapping system_inputs{rs.ps_input_ena, rs.ps_input_addr};
     const PixelSystemInputMapping* system_input_ptr =
         (system_inputs.ena || system_inputs.addr) ? &system_inputs : nullptr;
+    uint64_t vs_identity = 0, fs_identity = 0;
     std::vector<uint32_t> vs = recompile_graphics_shader_cached(
         ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)rs.es_addr,
-        max_shader_dwords, vrt.get(), pixel_input_ptr);
+        max_shader_dwords, vrt.get(), pixel_input_ptr, nullptr, &vs_identity);
     std::vector<uint32_t> fs = recompile_graphics_shader_cached(
         ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
-        max_shader_dwords, prt.get(), nullptr, system_input_ptr);
+        max_shader_dwords, prt.get(), nullptr, system_input_ptr, &fs_identity);
     if (phase_timing) {
         const auto shader_done = std::chrono::steady_clock::now();
         record_draw_realization_phases(
@@ -784,7 +789,8 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
             }
         }
     }
-    out.vs = std::move(vs); out.fs = std::move(fs); out.ps = ps;
+    out.vs = std::move(vs); out.fs = std::move(fs);
+    out.vs_identity = vs_identity; out.fs_identity = fs_identity; out.ps = ps;
     out.vrt = std::move(vrt); out.prt = std::move(prt); out.vertex_count = vertex_count;
     out.color0_base = rs.color0_base;   // render-to-texture: the target this draw writes into (#167)
     out.color0_width = rs.color0_width; out.color0_height = rs.color0_height; // per-target extent (#526)

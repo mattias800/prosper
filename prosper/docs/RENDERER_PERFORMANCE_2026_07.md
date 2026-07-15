@@ -382,6 +382,45 @@ the workload playable. The next investigation must identify the true dependencie
 persisting pipelines addresses about 13 ms, while removing unnecessary synchronous wait/readback boundaries
 has the larger ceiling but requires preserving graphics/compute and RTT producer-consumer order.
 
+## Persistent graphics pipelines
+
+The backend now retains Vulkan graphics pipelines across target calls with an exact, bounded key. The first
+prototype copied and hashed both complete SPIR-V modules on every draw; despite a 100% hit rate, that made a
+54-draw loading submit slower. The accepted path assigns each entry in the exact shader-recompile cache a
+process-unique identity that is never recycled, even when that cache is cleared. Live pipeline keys use those
+two identities, an inline allocation-free fixed-state key, and the descriptor contract already named by the
+shader identities. Externally constructed, captured, and replayed draws have identity zero and retain the full
+SPIR-V plus descriptor-layout fallback. Hash collisions are benign because equality compares the exact key.
+Pipeline hits also skip temporary `VkShaderModule` creation.
+
+The cache defaults to 1024 entries and evicts the least-recently-used pipeline not referenced by the current
+backend call. `PROSPER_PIPELINE_CACHE_ENTRIES` changes the bound and
+`PROSPER_NO_BACKEND_PIPELINE_CACHE=1` restores transient creation. Timing output reports references, hits,
+misses, bypasses, entries, and evictions at both backend-call and submit-aligned scopes.
+
+Native Windows / RTX 4090, fresh saves, current master including #750, extended full-render input hold, and
+the workload-filtered target profiler produced nearby animated heavy windows rather than identical draw
+counts. The state-specific setup buckets are therefore the useful comparison:
+
+| Mode | Draws | Shader modules | Pipeline work | Total draw setup | Backend wall time |
+|---|---:|---:|---:|---:|---:|
+| Cache disabled | 378 | 3.27-3.35 ms | 14.96-15.75 ms | 30.19-31.51 ms | 106.45-110.35 ms |
+| Persistent cache | 359 | 0.00 ms | 10.05-10.24 ms | 20.89-20.99 ms | 95.63-97.88 ms |
+
+After normalizing the setup buckets for the draw-count difference, retained pipelines remove about 7-8 ms
+per heavy submit. The 54-draw loading loop improves by only about 1 ms because the Windows NVIDIA driver
+already makes repeated transient creation cheap; the larger expected benefit on MoltenVK remains to be
+measured. The enabled run held 30 pipelines in the heavy scene. Its final private-memory range was
+1.77-1.80 GiB and its working-set range was 3.74-3.76 GiB, indistinguishable from the disabled control at
+1.79-1.80 GiB / 3.74 GiB. Both extended routes reached the post-parse workload. Per-target logging materially
+perturbs whole-submit time, so the reported application FPS from these diagnostic runs is not a normal-play
+benchmark.
+
+This closes the measured pipeline-creation tranche, not the renderer problem. Ten target calls still perform
+synchronous GPU waits and readbacks, and the whole ordered submit remains hundreds of milliseconds under the
+target profiler. Coordinated GPU ownership across those producer-consumer boundaries is the next architectural
+step.
+
 ## Current frame budget
 
 After shared publication, the Dead Cells post-parse loading workload is the most useful current budget:

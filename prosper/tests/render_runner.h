@@ -6,6 +6,7 @@
 #include <vulkan/vulkan.h>
 #include "../src/gpu/gpu_capture.hpp"
 #include "../src/gpu/render_state.hpp"
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -110,6 +111,7 @@ struct FrameResource {
 // correctly. render_triangle_rgba is a thin single-draw wrapper (below).
 struct BackendDraw {
     std::vector<uint32_t> vs, fs;
+    uint64_t vs_identity = 0, fs_identity = 0;
     const prosper::gpu::ResolvedPipelineState* ps = nullptr;   // null -> triangle-list, write RGBA, no depth
     std::vector<FrameResource> R;                              // set-tagged resources (empty -> no descriptors)
     uint32_t vcount = 3;
@@ -136,6 +138,74 @@ inline BackendTextureUploadStats& backend_texture_upload_stats_storage() {
 
 inline BackendTextureUploadStats backend_texture_upload_stats() {
     return backend_texture_upload_stats_storage();
+}
+
+struct BackendPipelineCacheStats {
+    uint64_t references = 0;
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t bypasses = 0;
+    uint64_t entries = 0;
+    uint64_t evictions = 0;
+};
+
+inline BackendPipelineCacheStats& backend_pipeline_cache_stats_storage() {
+    static thread_local BackendPipelineCacheStats stats;
+    return stats;
+}
+
+inline BackendPipelineCacheStats backend_pipeline_cache_stats() {
+    return backend_pipeline_cache_stats_storage();
+}
+
+struct PersistentPipelineKey {
+    static constexpr size_t kInlineWords = 64;
+    std::array<uint32_t, kInlineWords> inline_words{};
+    std::vector<uint32_t> overflow_words;
+    uint32_t word_count = 0;
+    uint64_t hash = 1469598103934665603ull;
+
+    bool operator==(const PersistentPipelineKey& other) const {
+        if (hash != other.hash || word_count != other.word_count) return false;
+        const size_t inline_count = std::min<size_t>(word_count, kInlineWords);
+        return std::equal(inline_words.begin(), inline_words.begin() + inline_count,
+                          other.inline_words.begin()) &&
+               overflow_words == other.overflow_words;
+    }
+};
+
+struct PersistentPipelineKeyHash {
+    size_t operator()(const PersistentPipelineKey& key) const {
+        return static_cast<size_t>(key.hash);
+    }
+};
+
+struct PersistentPipeline {
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    uint64_t last_use = 0;
+};
+
+inline std::unordered_map<PersistentPipelineKey, PersistentPipeline, PersistentPipelineKeyHash>&
+persistent_pipeline_cache() {
+    static std::unordered_map<PersistentPipelineKey, PersistentPipeline, PersistentPipelineKeyHash> cache;
+    return cache;
+}
+
+inline uint64_t& persistent_pipeline_generation() {
+    static uint64_t generation = 0;
+    return generation;
+}
+
+inline bool persistent_pipeline_cache_enabled() {
+    return getenv("PROSPER_NO_BACKEND_PIPELINE_CACHE") == nullptr;
+}
+
+inline size_t persistent_pipeline_cache_limit() {
+    static const size_t limit = [] {
+        const char* value = getenv("PROSPER_PIPELINE_CACHE_ENTRIES");
+        return value ? static_cast<size_t>(strtoull(value, nullptr, 10)) : size_t{1024};
+    }();
+    return limit;
 }
 
 struct BackendRenderTimingStats {
@@ -916,7 +986,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         std::vector<VkImageView> tview; std::vector<VkSampler> tsamp;
         VkPipelineLayout layout = VK_NULL_HANDLE; VkPipeline pipe = VK_NULL_HANDLE;
         VkBuffer ibuf = VK_NULL_HANDLE; VkDeviceMemory ibmem = VK_NULL_HANDLE;   // index buffer (indexed draws)
-        uint32_t n_sets = 1, vcount = 3, icount = 0; bool use_desc = false, ok = false;
+        uint32_t n_sets = 1, vcount = 3, icount = 0;
+        bool use_desc = false, ok = false, pipeline_cached = false;
     };
     struct TextureUploadKey {
         const uint8_t* pixels = nullptr;
@@ -997,15 +1068,33 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     auto setup_elapsed_ms = [](auto begin, auto end) {
         return std::chrono::duration<double, std::milli>(end - begin).count();
     };
+    BackendPipelineCacheStats& pipeline_stats = backend_pipeline_cache_stats_storage();
+    pipeline_stats = {};
+    auto& pipeline_cache = persistent_pipeline_cache();
+    const uint64_t pipeline_generation = ++persistent_pipeline_generation();
+    const bool pipeline_cache_enabled = persistent_pipeline_cache_enabled();
+    const size_t pipeline_cache_limit = persistent_pipeline_cache_limit();
+    auto evict_pipeline = [&]() {
+        auto victim = pipeline_cache.end();
+        for (auto it = pipeline_cache.begin(); it != pipeline_cache.end(); ++it) {
+            if (it->second.last_use == pipeline_generation) continue;
+            if (victim == pipeline_cache.end() ||
+                it->second.last_use < victim->second.last_use) victim = it;
+        }
+        if (victim == pipeline_cache.end()) return false;
+        vkDestroyPipeline(dev, victim->second.pipeline, nullptr);
+        pipeline_cache.erase(victim);
+        ++pipeline_stats.evictions;
+        return true;
+    };
     // Pass 1: create each draw's shader modules, descriptors (with texture staging upload), and pipeline.
     for (size_t di = 0; di < draws.size(); di++) {
         const auto setup_begin = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
         const BackendDraw& bd = draws[di];
         DV& v = dv[di];
-        v.vs = mkmod(bd.vs); v.fs = mkmod(bd.fs);
-        const auto setup_shaders_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
-        if (timing_enabled) setup_shader_ms += setup_elapsed_ms(setup_begin, setup_shaders_ready);
-        if (!v.vs || !v.fs) continue;   // rejected SPIR-V -> skip this draw
+        // Pipeline hits do not need temporary VkShaderModules. Defer module creation until after the
+        // persistent lookup; the fixed/resource setup below is also required by the hit pipeline.
+        const auto setup_shaders_ready = setup_begin;
         const prosper::gpu::ResolvedPipelineState* ps = bd.ps;
         v.vcount = bd.vcount;
         // Indexed draw: upload the 32-bit index data to a host-visible VkIndexBuffer now; the record
@@ -1351,9 +1440,136 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         gp.pViewportState = &vpst; gp.pRasterizationState = &rs; gp.pMultisampleState = &ms;
         gp.pColorBlendState = &cb; gp.layout = v.layout; gp.renderPass = rp; gp.subpass = 0;
         if (ps && (ps->depth_test_enable || ps->stencil_enable)) gp.pDepthStencilState = &dss;
-        if (vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gp, nullptr, &v.pipe) == VK_SUCCESS) v.ok = true;
+        ++pipeline_stats.references;
+        bool create_pipeline = true;
+        PersistentPipelineKey pipeline_key;
+        if (pipeline_cache_enabled && pipeline_cache_limit) {
+            auto append = [&](uint32_t word) {
+                if (pipeline_key.word_count < PersistentPipelineKey::kInlineWords)
+                    pipeline_key.inline_words[pipeline_key.word_count] = word;
+                else
+                    pipeline_key.overflow_words.push_back(word);
+                ++pipeline_key.word_count;
+                pipeline_key.hash ^= word;
+                pipeline_key.hash *= 1099511628211ull;
+            };
+            auto append_float = [&](float value) {
+                uint32_t word = 0;
+                static_assert(sizeof word == sizeof value);
+                memcpy(&word, &value, sizeof word);
+                append(word);
+            };
+            append(1); // key schema version
+            append(W); append(H); append(use_ds); append(static_cast<uint32_t>(DFMT));
+            const bool exact_shader_identities = bd.vs_identity && bd.fs_identity;
+            append(bd.vs_identity != 0);
+            if (bd.vs_identity) {
+                append(static_cast<uint32_t>(bd.vs_identity));
+                append(static_cast<uint32_t>(bd.vs_identity >> 32));
+            } else {
+                append(static_cast<uint32_t>(bd.vs.size()));
+                for (uint32_t word : bd.vs) append(word);
+            }
+            append(bd.fs_identity != 0);
+            if (bd.fs_identity) {
+                append(static_cast<uint32_t>(bd.fs_identity));
+                append(static_cast<uint32_t>(bd.fs_identity >> 32));
+            } else {
+                append(static_cast<uint32_t>(bd.fs.size()));
+                for (uint32_t word : bd.fs) append(word);
+            }
+            append(v.use_desc); append(v.n_sets);
+            // A pair of shader-cache identities names the exact compile keys, including every
+            // descriptor's class and binding. External/replay shaders have identity zero and keep
+            // the full layout contract in the fallback key.
+            append(!exact_shader_identities);
+            if (!exact_shader_identities) {
+                append(static_cast<uint32_t>(R.size()));
+                for (size_t i = 0; i < R.size(); ++i) {
+                    const bool texture = R[i].is_texture();
+                    const VkDescriptorType descriptor_type = texture
+                        ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                        : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                    const VkShaderStageFlags stage_flags = !texture || R[i].set == 0
+                        ? (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)
+                        : VK_SHADER_STAGE_FRAGMENT_BIT;
+                    append(R[i].set); append(R[i].binding); append(descriptor_type);
+                    append(1); append(stage_flags);
+                }
+            }
+            append(ia.topology); append(ia.primitiveRestartEnable);
+            append_float(vp.x); append_float(vp.y); append_float(vp.width); append_float(vp.height);
+            append_float(vp.minDepth); append_float(vp.maxDepth);
+            append(static_cast<uint32_t>(sc.offset.x)); append(static_cast<uint32_t>(sc.offset.y));
+            append(sc.extent.width); append(sc.extent.height);
+            append(rs.polygonMode); append(rs.cullMode); append(rs.frontFace); append_float(rs.lineWidth);
+            append(cba.blendEnable); append(cba.srcColorBlendFactor); append(cba.dstColorBlendFactor);
+            append(cba.colorBlendOp); append(cba.srcAlphaBlendFactor); append(cba.dstAlphaBlendFactor);
+            append(cba.alphaBlendOp); append(cba.colorWriteMask);
+            append(gp.pDepthStencilState != nullptr);
+            if (gp.pDepthStencilState) {
+                append(dss.depthTestEnable); append(dss.depthWriteEnable); append(dss.depthCompareOp);
+                append(dss.depthBoundsTestEnable); append(dss.stencilTestEnable);
+                auto append_stencil = [&](const VkStencilOpState& stencil) {
+                    append(stencil.failOp); append(stencil.passOp); append(stencil.depthFailOp);
+                    append(stencil.compareOp); append(stencil.compareMask); append(stencil.writeMask);
+                    append(stencil.reference);
+                };
+                append_stencil(dss.front); append_stencil(dss.back);
+                append_float(dss.minDepthBounds); append_float(dss.maxDepthBounds);
+            }
+            auto found = pipeline_cache.find(pipeline_key);
+            if (found != pipeline_cache.end()) {
+                found->second.last_use = pipeline_generation;
+                v.pipe = found->second.pipeline;
+                v.pipeline_cached = true;
+                v.ok = true;
+                create_pipeline = false;
+                ++pipeline_stats.hits;
+            } else {
+                ++pipeline_stats.misses;
+            }
+        } else {
+            ++pipeline_stats.bypasses;
+        }
+        const auto setup_pipeline_key_ready = timing_enabled
+            ? TimingClock::now() : TimingClock::time_point{};
+        auto setup_pipeline_create_begin = setup_pipeline_key_ready;
+        if (create_pipeline) {
+            const auto setup_shader_begin = timing_enabled
+                ? TimingClock::now() : TimingClock::time_point{};
+            v.vs = mkmod(bd.vs); v.fs = mkmod(bd.fs);
+            const auto setup_shader_ready = timing_enabled
+                ? TimingClock::now() : TimingClock::time_point{};
+            if (timing_enabled)
+                setup_shader_ms += setup_elapsed_ms(setup_shader_begin, setup_shader_ready);
+            if (!v.vs || !v.fs) {
+                if (timing_enabled)
+                    setup_pipeline_ms += setup_elapsed_ms(
+                        setup_resources_ready, setup_pipeline_key_ready);
+                continue;   // rejected SPIR-V -> skip this draw
+            }
+            st[0].module = v.vs; st[1].module = v.fs;
+            setup_pipeline_create_begin = setup_shader_ready;
+            if (vkCreateGraphicsPipelines(
+                    dev, VK_NULL_HANDLE, 1, &gp, nullptr, &v.pipe) == VK_SUCCESS) {
+                v.ok = true;
+                bool retain = pipeline_cache_enabled && pipeline_cache_limit;
+                while (retain && pipeline_cache.size() >= pipeline_cache_limit)
+                    if (!evict_pipeline()) retain = false;
+                if (retain) {
+                    pipeline_cache.emplace(std::move(pipeline_key),
+                                           PersistentPipeline{v.pipe, pipeline_generation});
+                    v.pipeline_cached = true;
+                }
+            }
+        }
+        pipeline_stats.entries = pipeline_cache.size();
         const auto setup_pipeline_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
-        if (timing_enabled) setup_pipeline_ms += setup_elapsed_ms(setup_resources_ready, setup_pipeline_ready);
+        if (timing_enabled) {
+            setup_pipeline_ms += setup_elapsed_ms(setup_resources_ready, setup_pipeline_key_ready);
+            setup_pipeline_ms += setup_elapsed_ms(setup_pipeline_create_begin, setup_pipeline_ready);
+        }
     }
 
     BackendTextureUploadStats& texture_stats = backend_texture_upload_stats_storage();
@@ -1593,7 +1809,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
 
     vkDestroyFence(dev, fence, nullptr); vkDestroyCommandPool(dev, pool, nullptr);
     for (auto& v : dv) {   // per-draw objects
-        if (v.pipe)   vkDestroyPipeline(dev, v.pipe, nullptr);
+        if (v.pipe && !v.pipeline_cached) vkDestroyPipeline(dev, v.pipe, nullptr);
         if (v.layout) vkDestroyPipelineLayout(dev, v.layout, nullptr);
         if (v.ibuf)   vkDestroyBuffer(dev, v.ibuf, nullptr);
         if (v.ibmem)  release_transient_render_memory(dev, v.ibmem);
@@ -1687,6 +1903,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             uint64_t calls = 0, draws = 0;
             uint64_t texture_references = 0, texture_uploads = 0, texture_upload_bytes = 0;
             uint64_t persistent_hits = 0, persistent_misses = 0, persistent_cached_bytes = 0;
+            uint64_t pipeline_references = 0, pipeline_hits = 0, pipeline_misses = 0;
+            uint64_t pipeline_bypasses = 0, pipeline_entries = 0, pipeline_evictions = 0;
             double target = 0, draw_setup = 0, record = 0, gpu_wait = 0, readback = 0, cleanup = 0;
             double setup_shader = 0, setup_fixed = 0, setup_resources = 0, setup_pipeline = 0;
         };
@@ -1701,6 +1919,12 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             timing.persistent_hits += texture_stats.persistent_hits;
             timing.persistent_misses += texture_stats.persistent_misses;
             timing.persistent_cached_bytes = texture_stats.persistent_cached_bytes;
+            timing.pipeline_references += pipeline_stats.references;
+            timing.pipeline_hits += pipeline_stats.hits;
+            timing.pipeline_misses += pipeline_stats.misses;
+            timing.pipeline_bypasses += pipeline_stats.bypasses;
+            timing.pipeline_entries = pipeline_stats.entries;
+            timing.pipeline_evictions += pipeline_stats.evictions;
             timing.target += call_timing.target_ms;
             timing.draw_setup += call_timing.draw_setup_ms;
             timing.record += call_timing.record_upload_ms;
@@ -1737,6 +1961,15 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     (unsigned long long)totals.persistent_hits,
                     (unsigned long long)totals.persistent_misses,
                     totals.persistent_cached_bytes / (1024.0 * 1024.0));
+            fprintf(stderr,
+                    "[render-timing] backend pipelines refs=%llu hits=%llu misses=%llu bypass=%llu "
+                    "entries=%llu evictions=%llu\n",
+                    (unsigned long long)totals.pipeline_references,
+                    (unsigned long long)totals.pipeline_hits,
+                    (unsigned long long)totals.pipeline_misses,
+                    (unsigned long long)totals.pipeline_bypasses,
+                    (unsigned long long)totals.pipeline_entries,
+                    (unsigned long long)totals.pipeline_evictions);
             const RenderMemoryPoolStats pool = render_memory_pool_stats();
             fprintf(stderr,
                     "[render-timing] memory_pool hits=%llu misses=%llu cached=%zu %.1f MiB "
@@ -1765,6 +1998,12 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     window.texture_upload_bytes / (wn * 1024.0 * 1024.0),
                     window.persistent_hits / wn, window.persistent_misses / wn,
                     window.persistent_cached_bytes / (1024.0 * 1024.0));
+            fprintf(stderr,
+                    "[render-window] backend pipelines refs=%.1f hits=%.1f misses=%.1f bypass=%.1f "
+                    "entries=%llu evictions=%.1f\n",
+                    window.pipeline_references / wn, window.pipeline_hits / wn,
+                    window.pipeline_misses / wn, window.pipeline_bypasses / wn,
+                    (unsigned long long)window.pipeline_entries, window.pipeline_evictions / wn);
             window = {};
         }
     }
