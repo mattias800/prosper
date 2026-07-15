@@ -179,6 +179,13 @@ The instrumentation does not take clock samples when the variable is unset. This
 to use when the window presents correctly but a title is not interactive; do not infer a GPU
 bottleneck from low FPS without the stage breakdown.
 
+On native Windows, large aligned direct-memory views are demand-paged. Their committed 16 KiB pages
+are retained in a mapping-generation-invalidated bitmap so repeated GPU resource reads do not repeat
+the same `VirtualQuery` calls. Set `PROSPER_NO_SPARSE_DMEM_PAGE_CACHE=1` for a control run when
+investigating this path; it is expected to be substantially slower in resource-heavy scenes. A
+thread-local positive HLE mapping lookup can be disabled separately with
+`PROSPER_NO_SPARSE_DMEM_ACCESS_CACHE=1`.
+
 When the `tables=` bucket is unexpectedly large, set `PROSPER_STAGE_FOLD_PROFILE=1`. It ranks the
 shader address and user-SGPR base pairs responsible for scalar table folding, including average and
 maximum time, decoded instructions, dynamic fetches, SRT uses, guest readability checks, and the

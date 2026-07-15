@@ -192,6 +192,53 @@ spent about 40 ms in resource construction, and presented at roughly 8-10 FPS. I
 repeated scans or materialization of untouched resource tails is follow-up renderer work, not a reason to
 restore the eager 3 GiB private allocation.
 
+## Windows sparse page-state cache (2026-07-15)
+
+Demand paging removed the 3 GiB private commit, but the renderer still called `VirtualQuery` for every
+resource reference on every submit to prove that its sparse direct-memory pages were committed. Dead
+Cells' buffers made the cost clear: a matched 170-draw scene referenced about 680 buffers containing
+only 0.4 MiB in total, yet their guards took about 40 ms per submit. The bytes and copies were not the
+bottleneck; repeated kernel page-state queries were.
+
+Each sparse Windows direct-memory view now retains a compact bitmap of host-committed 16 KiB pages.
+The existing HLE mapping generation invalidates the bitmap after any tracked map, unmap, or protection
+change. A miss still commits the exact guest pages with the current tracked protection and falls back to
+`VirtualQuery` if the commit call fails; a hit skips the OS query. The 3 GiB Dead Cells view needs only
+24 KiB for this metadata. A thread-local positive mapping lookup, guarded by the same generation,
+also avoids rescanning the HLE mapping vector for every resource. Set
+`PROSPER_NO_SPARSE_DMEM_PAGE_CACHE=1` or `PROSPER_NO_SPARSE_DMEM_ACCESS_CACHE=1` to disable the
+corresponding layer for controlled comparison.
+
+Native Windows / RTX 4090, the same RelWithDebInfo binary, fresh processes without pad input,
+115-second runs, and the last 20 matched 168-176-draw title/menu windows:
+
+| Measurement | Page cache disabled | Page cache enabled |
+|---|---:|---:|
+| Frontend callback | 91.70 ms | 46.09 ms |
+| Resource construction | 60.28 ms | 13.12 ms |
+| Texture resource time | 18.12 ms | 9.82 ms |
+| Buffer resource time | 39.53 ms | 1.04 ms |
+| Late app rate | 8.75 FPS | 14.7 FPS |
+
+The enabled run's final ten process samples averaged 1584 MiB private memory and 2034 MiB working set;
+both decreased slightly over that sample rather than growing. `dmem_available` exercises first-touch
+commit, a far untouched page, physical aliases, read-only rejection, and generation invalidation when a
+materialized page becomes writable. The full native Windows suite passed 70 of 71 tests; the remaining
+`module_loads_eboot` failure was the expected fixture mismatch because this profiling build was configured
+against Dead Cells while that test pins The Messenger's import counts.
+
+A separate 160-second presented-screenshot run used the correctly file-prefixed
+`PROSPER_PAD_SCRIPT=@.../reach-first-gameplay-full-render.pad` route. It reached
+`Loading level PrisonStart` and saved 32 normal 3840x2160 screenshots; all 32 had distinct source and
+pixel identities. Inspected samples showed the title, update/menu flow, Prisoners' Quarters loading art,
+and the later loading fade without a blank-frame collapse. In the late 54-draw scene, buffer guards took
+0.40-0.43 ms, resource construction 9.56-12.27 ms, and total submits 45.21-48.06 ms. The run remained
+in the existing level-loading state at 160 seconds, so this is routed output evidence rather than a new
+gameplay progression proof. A matching 165-second app run sustained an 18.95 FPS median over its last
+ten reports. Its last ten process samples averaged 1619 MiB private memory with a +1.1 MiB change;
+working set averaged 2733 MiB and gained 119 MiB as the repeated texture scans continued making shared
+pages resident.
+
 ## Current frame budget
 
 After the above changes, a representative renderer submit remains about 36-38 ms. Approximate costs

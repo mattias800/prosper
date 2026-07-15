@@ -576,6 +576,12 @@ edge cases are tracked separately in #697.
    `MapViewOfFile3`, and commit 16 KiB pages on first CPU/GPU access. Guest `VirtualQuery` still reports the
    direct mapping as committed; untouched host pages carry no commit charge. Dead Cells' 3 GiB, 2 MiB-
    aligned arena therefore remains physically aliased without one 3 GiB eager private allocation.
+   A per-view bitmap remembers which 16 KiB host pages have been materialized, so repeated renderer
+   reads do not issue `VirtualQuery` for every resource reference. Any tracked map, unmap, or protection
+   change invalidates the bitmap through the guest-mapping generation; set
+   `PROSPER_NO_SPARSE_DMEM_PAGE_CACHE=1` only for an A/B against the query-per-access path. The same
+   generation guards a thread-local positive HLE mapping lookup; disable it independently with
+   `PROSPER_NO_SPARSE_DMEM_ACCESS_CACHE=1`.
    Exact fixed maps whose virtual and physical 64 KiB deltas differ still use the private fallback, and
    partial unmap needs a section-aware implementation.
 3. **Validate/repair the guest→HLE ABI trampoline for XMM/float args.** Integer args 1-9 are converted

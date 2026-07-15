@@ -165,6 +165,8 @@ int main() {
               "first touch applies the tracked read-only protection");
         CHECK(protect(protected_page, 0x4000, 0x2, 0, 0, 0) == 0,
               "mprotect restores read/write on a materialized sparse page");
+        CHECK(prosper_try_commit_dmem(protected_page, 0x4000, 1),
+              "mapping-generation invalidation permits a cached sparse-page write");
         MEMORY_BASIC_INFORMATION writable_after{};
         VirtualQuery((void*)(uintptr_t)protected_page, &writable_after,
                      sizeof(writable_after));
