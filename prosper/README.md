@@ -40,8 +40,9 @@ possible without console keys. Dumps are user-supplied and gitignored.
   leaves, including temporal read-before-write surfaces, without invoking Vulkan (#595). Capture v7 retains
   bounded, content-addressed raw RDNA2 and exact opcode/PC/state diagnostics for unrealized draws/dispatches;
   `gpu_replay` can inspect and extract the failed stage without rerunning the title (#618).
-- ✅ **Dead Cells reaches gameplay reproducibly:** a deterministic input route passes the splash and menus
-  into the first playable scene. The persistent-depth rejection is fixed: timeline-v5 backing hashes and
+- ✅ **Dead Cells reaches gameplay reproducibly:** deterministic native-Windows routes pass the splash and menus
+  into the first playable scene with rendering disabled or with every retained GPU submit fully executed and
+  published (#766). The persistent-depth rejection is fixed: timeline-v5 backing hashes and
   compute writer provenance identify Unity's 32 KiB HTILE fill as the per-frame fast clear, and overlapping
   guest GPU writes now invalidate the detached Vulkan depth cache (#611). A routed live A/B restores the
   foreground/platform/HUD layers that remained black without invalidation.
