@@ -9,6 +9,10 @@
 #include <cstdio>
 #include <string>
 #include <cstdint>
+#include <exception>          // std::set_terminate / std::current_exception (PROSPER_TERM_BT)
+#ifndef _WIN32
+#include <execinfo.h>         // backtrace / backtrace_symbols (host crash backtrace)
+#endif
 extern "C" int prosper_reserved_range_state(uint64_t);   // memory-HLE mapping classifier (diagnostic)
 #ifdef PROSPER_AUDIO_SDL3
 #include "audio_sdl3.hpp"                 // optional SDL3 audio frontend (-DPROSPER_AUDIO_SDL3=ON)
@@ -84,6 +88,31 @@ static uint64_t bof(uint64_t a) {
 }
 
 int main(int argc, char** argv) {
+    // PROSPER_TERM_BT: install a std::terminate handler that dumps the HOST backtrace + exception
+    // message. Diagnostic for the macOS std::mutex EINVAL crash — the guest rbp-walker only shows
+    // guest frames, but an uncaught host C++ exception (e.g. a mutex lock throwing) terminates on
+    // the throwing thread, so backtrace() here captures the real host call chain to the bad lock.
+    if (getenv("PROSPER_TERM_BT")) {
+        std::set_terminate([]{
+            fprintf(stderr, "\n=== PROSPER_TERM_BT: std::terminate ===\n");
+            if (auto ep = std::current_exception()) {
+                try { std::rethrow_exception(ep); }
+                catch (const std::exception& ex) { fprintf(stderr, "  what(): %s\n", ex.what()); }
+                catch (...) { fprintf(stderr, "  (non-std exception)\n"); }
+            }
+#ifndef _WIN32
+            void* frames[64];
+            int n = backtrace(frames, 64);
+            char** syms = backtrace_symbols(frames, n);
+            for (int i = 0; i < n; ++i) fprintf(stderr, "  #%02d %s\n", i, syms ? syms[i] : "?");
+#else
+            // No execinfo on MinGW; the exception message above is still the useful part.
+            fprintf(stderr, "  (host backtrace unavailable on this platform)\n");
+#endif
+            fflush(stderr);
+            _Exit(42);
+        });
+    }
     std::string d = (argc >= 2) ? argv[1] : "../../PPSA24651-app0";
     Program p; std::string e;
     // Boot the title via the shared path (also used by prosper-app): link the fixed module set,

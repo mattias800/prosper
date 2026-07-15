@@ -245,9 +245,23 @@ namespace { inline uint64_t fbsd_errno(int host) {
     return (uint64_t)(unsigned)host;
 } }
 HLE(k_mutex_destroy) { if (a0 && !pt_static_sentinel(*(void**)a0)) { pthread_mutex_destroy((pthread_mutex_t*)*(void**)a0); free(*(void**)a0); } if (a0) *(void**)a0 = nullptr; return 0; }
-HLE(k_mutex_lock)    { auto* m = ensure_mutex(a0); return m ? fbsd_errno(pthread_mutex_lock(m))    : 0x16; }
-HLE(k_mutex_trylock) { auto* m = ensure_mutex(a0); return m ? fbsd_errno(pthread_mutex_trylock(m)) : 0x16; }
-HLE(k_mutex_unlock)  { auto* m = ensure_mutex(a0); return m ? fbsd_errno(pthread_mutex_unlock(m))  : 0x16; }
+// PROSPER_MUTEX_FAILLOG: report any mutex op that returns a non-zero (EINVAL/EDEADLK/...) result,
+// with the guest slot address and the host object it resolved to. Diagnostic for the macOS
+// guest-side "std::mutex lock failed: Invalid argument" terminate — a host EINVAL(22) surfaces as
+// a FreeBSD EINVAL(0x16) to the guest's libc++, which throws and terminates. This pinpoints the
+// exact slot/host-pointer producing the bad lock without needing a debugger (unusable under Rosetta).
+namespace {
+    inline uint64_t mtx_report(const char* op, uint64_t slot, pthread_mutex_t* m, int host) {
+        static const bool on = getenv("PROSPER_MUTEX_FAILLOG") != nullptr;
+        if (on && host != 0)
+            fprintf(stderr, "[mtx-fail] %s slot=0x%llx host_m=%p rc=%d(%s)\n", op,
+                    (unsigned long long)slot, (void*)m, host, strerror(host));
+        return fbsd_errno(host);
+    }
+}
+HLE(k_mutex_lock)    { auto* m = ensure_mutex(a0); return m ? mtx_report("lock",    a0, m, pthread_mutex_lock(m))    : 0x16; }
+HLE(k_mutex_trylock) { auto* m = ensure_mutex(a0); return m ? mtx_report("trylock", a0, m, pthread_mutex_trylock(m)) : 0x16; }
+HLE(k_mutex_unlock)  { auto* m = ensure_mutex(a0); return m ? mtx_report("unlock",  a0, m, pthread_mutex_unlock(m))  : 0x16; }
 
 // --- condition variables ---
 HLE(k_condattr_init)    { if (a0) { auto* c = (pthread_condattr_t*)calloc(1, sizeof(pthread_condattr_t)); pthread_condattr_init(c); *(void**)a0 = c; } return 0; }
