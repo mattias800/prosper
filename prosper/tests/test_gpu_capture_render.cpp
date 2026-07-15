@@ -78,6 +78,62 @@ int main() {
               "replay samples captured red texel from owned backing");
     }
 
+    // Texture decode scratch survives between renderer callbacks and reuses slots from the front.
+    // Grow it to two slots, then make a packed texture the sole decode in the next callback. Converting
+    // texstore.back() here used to mutate the stale second slot while uploading the first slot's raw
+    // R10G10B10A2 bytes, so a logical half-red texel arrived almost black.
+    {
+        uint8_t filler_a[16] = {
+            255, 0, 0, 255, 255, 0, 0, 255,
+            255, 0, 0, 255, 255, 0, 0, 255,
+        };
+        uint8_t filler_b[16] = {
+            0, 255, 0, 255, 0, 255, 0, 255,
+            0, 255, 0, 255, 0, 255, 0, 255,
+        };
+        auto texture_draw = [&](uint64_t texture_addr, uint64_t target_addr,
+                                uint8_t* host_data, DataFormat format) {
+            DrawItem draw = replay.items[0];
+            draw.color0_base = target_addr;
+            auto table = std::make_shared<ShaderResourceTable>(*draw.prt);
+            ShaderResource& resource = table->resources[0];
+            resource.gpu_addr = texture_addr;
+            resource.size = 16;
+            resource.width = resource.height = 2;
+            resource.depth = 1;
+            resource.tile_mode = 0;
+            resource.format = format;
+            resource.num_components = 4;
+            resource.host_data = host_data;
+            resource.host_data_size = 16;
+            draw.prt = std::move(table);
+            return draw;
+        };
+        DrawItem filler_draw_a = texture_draw(
+            0xd10000, 0xd30000, filler_a, DataFormat::Unorm8);
+        DrawItem filler_draw_b = texture_draw(
+            0xd20000, 0xd30000, filler_b, DataFormat::Unorm8);
+        std::vector<uint8_t> filler = render_submit_items(
+            {filler_draw_a, filler_draw_b}, W, H);
+        CHECK(!filler.empty(), "renderer grows reusable texture decode scratch beyond one slot");
+
+        uint32_t packed_texels[4] = {
+            0xC0000200u, 0xC0000200u, 0xC0000200u, 0xC0000200u,
+        };  // logical RGBA = (128,0,0,255); raw little-endian bytes = (0,2,0,192)
+        DrawItem packed_draw = texture_draw(
+            0xd40000, 0xd50000, reinterpret_cast<uint8_t*>(packed_texels),
+            DataFormat::Unorm2_10_10_10);
+        std::vector<uint8_t> packed = render_submit_items({packed_draw}, W, H);
+        bool packed_red = packed.size() == static_cast<size_t>(W) * H * 4;
+        if (packed_red) {
+            const uint8_t* center = &packed[(static_cast<size_t>(H / 2) * W + W / 2) * 4];
+            packed_red = center[0] >= 120 && center[0] <= 136 &&
+                         center[1] < 8 && center[2] < 8 && center[3] > 240;
+        }
+        CHECK(packed_red,
+              "reused scratch converts and uploads the current packed R10G10B10A2 texture");
+    }
+
     // A non-VideoOut producer must render at CB_COLOR0_ATTRIB2's extent, be cached under its
     // target address, and feed a later pass. Before #526 both passes used the global 64x64 extent.
     DrawItem producer = replay.items[0];
