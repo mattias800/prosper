@@ -148,13 +148,15 @@ if an included temporal image leaf has another extent or an intermediate submit 
 an evidence-gated optimization, not automatic dependency closure.
 
 `--bundle-final-capsule PATH` snapshots the complete live color RTT and persistent Vulkan depth/stencil caches
-before executing the final submit and writes them as seeds in a standalone capture-v9 capsule. Capture v9 also
-retains the base-level depth of every 3D image resource. Its standalone
+before executing the final submit and writes them as seeds in a standalone current-version capsule. Capture v9
+introduced the base-level depth of every 3D image resource; v11 also retains each image T#'s GFX10 DCC flags,
+block-size fields, and metadata address. `--inspect-only` reports compressed base allocations explicitly;
+metadata bytes and a software DCC decode are not inferred. The capsule's standalone
 output must match the bundle's final hash before using it for fast `--draw`, operation-prefix, resource, or
 shader experiments. Export validates every surface and fails when a required temporal color surface is absent;
 it never substitutes zero pixels. The file is installed only after the source final submit renders, and embeds
 that output byte count/hash as its replay oracle. A legacy pre-v7 manifest with unrealized operations is migrated explicitly to
-`Unknown` failure diagnostics with the original operation kind/source/order, so the v9 writer remains strict.
+`Unknown` failure diagnostics with the original operation kind/source/order, so the current writer remains strict.
 The DS snapshot uses transfer barriers to return every image to depth/stencil-attachment layout before the final
 bundle submit executes; equality therefore also checks that readback did not perturb the source run.
 

@@ -68,6 +68,9 @@ struct TextureDecodeKey {
     uint32_t width = 0, height = 0, depth = 1;
     uint32_t tile_mode = 0;
     uint32_t img_dim = 0;
+    uint32_t max_uncompressed_block_size = 0, max_compressed_block_size = 0;
+    uint32_t dcc_flags = 0;
+    uint64_t metadata_addr = 0;
     bool operator==(const TextureDecodeKey&) const = default;
 };
 
@@ -82,7 +85,8 @@ struct TextureDecodeKeyHash {
         };
         mix(key.gpu_addr); mix(key.host_data); mix(key.host_data_size); mix(key.size);
         mix(key.cls); mix(key.format); mix(key.num_components); mix(key.width); mix(key.height); mix(key.depth);
-        mix(key.tile_mode); mix(key.img_dim);
+        mix(key.tile_mode); mix(key.img_dim); mix(key.max_uncompressed_block_size);
+        mix(key.max_compressed_block_size); mix(key.dcc_flags); mix(key.metadata_addr);
         return hash;
     }
 };
@@ -496,6 +500,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             r.host_data_size, r.size, static_cast<uint32_t>(r.cls),
                             static_cast<uint32_t>(r.format), r.num_components, tw, th, r.depth,
                             r.tile_mode, r.img_dim,
+                            r.compression_enabled ? r.max_uncompressed_block_size : 0u,
+                            r.compression_enabled ? r.max_compressed_block_size : 0u,
+                            r.compression_enabled
+                                ? ((r.meta_pipe_aligned ? 1u : 0u) |
+                                   (r.write_compress_enabled ? 2u : 0u) | 4u |
+                                   (r.alpha_is_on_msb ? 8u : 0u) |
+                                   (r.color_transform ? 16u : 0u))
+                                : 0u,
+                            r.compression_enabled ? r.metadata_addr : 0u,
                         };
                         auto live_rtt = rtt_on ? g_rtt.find(r.gpu_addr) : g_rtt.end();
                         const bool has_cpu_live_rtt = r.img_dim == 1u && live_rtt != g_rtt.end() &&
@@ -508,6 +521,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             prosper::test::find_persistent_color_target(
                                 r.gpu_addr, tw, th, VK_FORMAT_R8G8B8A8_UNORM) != nullptr;
                         const bool has_live_rtt = has_cpu_live_rtt || has_gpu_live_rtt;
+                        if (r.compression_enabled && !has_live_rtt) {
+                            static std::set<std::pair<uint64_t, uint64_t>> warned_dcc_images;
+                            if (warned_dcc_images.emplace(r.gpu_addr, r.metadata_addr).second)
+                                fprintf(stderr,
+                                        "[render] DCC-compressed sampled image addr=0x%llx meta=0x%llx "
+                                        "%ux%ux%u fmt=%u tile=%u is unsupported; base bytes are not a valid decode\n",
+                                        (unsigned long long)r.gpu_addr,
+                                        (unsigned long long)r.metadata_addr,
+                                        tw, th, r.depth, (unsigned)r.format, r.tile_mode);
+                        }
                         const bool is_cube = r.img_dim == 3u;   // CUBE: six faces stacked vertically (#273)
                         const bool is_volume = r.img_dim == 2u;
                         const uint32_t persistent_pitch = getenv("PROSPER_PITCH")
@@ -1036,14 +1059,16 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 r.gpu_addr, raw_size);
                             fprintf(stderr,
                                     "[resource-version] render-submit=%llu draw=%llu order=%llu set=%u bind=%u "
-                                    "addr=0x%llx dims=%ux%u class=%u fmt=%u tile=%u rtt=%d "
+                                    "addr=0x%llx dims=%ux%u class=%u fmt=%u tile=%u dcc=%u meta=0x%llx rtt=%d "
                                     "raw=%zu/%zu:%016llx sample=%zu:%016llx "
                                     "writer=%s/%llu/%llu/%llu/0x%llx\n",
                                     (unsigned long long)g_this_submit,
                                     (unsigned long long)draw.draw_index,
                                     (unsigned long long)draw.command_order,
                                     set, r.binding, (unsigned long long)r.gpu_addr, tw, th,
-                                    (unsigned)r.cls, (unsigned)r.format, r.tile_mode, (int)rtt_hit,
+                                    (unsigned)r.cls, (unsigned)r.format, r.tile_mode,
+                                    r.compression_enabled, (unsigned long long)r.metadata_addr,
+                                    (int)rtt_hit,
                                     raw_got, raw_size, (unsigned long long)raw_hash,
                                     texture_pixels.size(), (unsigned long long)sample_hash,
                                     writer ? prosper::gpu::guest_writer_kind_name(writer->kind) : "none",

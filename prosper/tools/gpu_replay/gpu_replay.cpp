@@ -170,6 +170,7 @@ void inspect_table(const char* stage, const prosper::gpu::ShaderResourceTable* t
         std::printf("  %s %-7s b=%u addr=%016llx declared=%u footprint=%llu captured=%llu "
                     "nz=%zu hash=%016llx first=%08x "
                     "fmt=%u nc=%u stride=%u %ux%ux%u tile=%u addr=%u%u%u swz=%u%u%u%u filt=%u/%u/%u "
+                    "dcc=%u meta=%016llx blocks=%u/%u flags=%u%u%u%u "
                     "srt=%08x sgpr=%08x pc=%08x%s\n",
                     stage, class_name(r.cls), r.binding, static_cast<unsigned long long>(r.gpu_addr),
                     r.size,
@@ -181,6 +182,10 @@ void inspect_table(const char* stage, const prosper::gpu::ShaderResourceTable* t
                     r.addr_uvw[0], r.addr_uvw[1], r.addr_uvw[2],
                     r.swizzle[0], r.swizzle[1], r.swizzle[2], r.swizzle[3],
                     r.mag_filter, r.min_filter, r.mip_filter,
+                    r.compression_enabled, static_cast<unsigned long long>(r.metadata_addr),
+                    r.max_uncompressed_block_size, r.max_compressed_block_size,
+                    r.meta_pipe_aligned, r.write_compress_enabled,
+                    r.alpha_is_on_msb, r.color_transform,
                     r.srt_offset, r.sgpr_base, r.fetch_pc, temporal_seed ? " temporal-RTT-seed" : "");
         if (r.host_data && r.host_data_size >= 16 &&
             (r.cls == prosper::gpu::ResourceClass::ConstantBuffer ||

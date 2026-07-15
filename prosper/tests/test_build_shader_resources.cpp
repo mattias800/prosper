@@ -91,9 +91,17 @@ int main() {
         CHECK(image_type_to_dim(0) == 1, "unknown T# TYPE keeps the conservative 2D fallback");
         uint32_t t3d[8];
         make_tsharp(t3d, 0x12000000ull, 32, 16, /*fmt*/56, /*tile*/0, /*type 3D*/10, /*depth*/8);
+        t3d[6] = (2u << 15) | (1u << 17) | (1u << 19) | (1u << 20) |
+                 (1u << 21) | (1u << 22) | (1u << 23) | (0xabu << 24);
+        t3d[7] = 0x00206e33u;
         const DecodedImageDescriptor d3d = decode_image_descriptor(t3d);
         CHECK(d3d.width == 32 && d3d.height == 16 && d3d.depth == 8,
               "3D T# word4 DEPTH decodes as depth-minus-one");
+        CHECK(d3d.compression_enabled && d3d.write_compress_enabled && d3d.meta_pipe_aligned &&
+              d3d.alpha_is_on_msb && d3d.color_transform &&
+              d3d.max_uncompressed_block_size == 2 && d3d.max_compressed_block_size == 1 &&
+              d3d.metadata_addr == 0x206e33ab00ull,
+              "GFX10 T# WORD6/7 DCC flags and 40-bit metadata address decode exactly");
     }
 
     // --- AGC semantic metadata -> SPI_PS_INPUT_CNTL wiring ------------------------------------
@@ -302,6 +310,9 @@ int main() {
     {
         uint32_t tsgprs[32]; memset(tsgprs, 0, sizeof tsgprs);
         make_tsharp(&tsgprs[0],  0xD0000000ull, 1920, 1080, /*fmt*/56,  /*tile*/5, /*type 2D*/9);
+        tsgprs[6] = (2u << 15) | (1u << 17) | (1u << 19) | (1u << 21) |
+                    (1u << 22) | (0xabu << 24);
+        tsgprs[7] = 0x00206e33u;
         make_tsharp(&tsgprs[8],  0xE0000000ull, 2048, 1024, /*fmt*/1,   /*tile*/5, /*type*/9);
         make_tsharp(&tsgprs[16], 0xF0000000ull,  256,  256, /*fmt*/169, /*tile*/5, /*type*/9);  // BC1
         make_tsharp(&tsgprs[24], 0xF0010000ull,  128,  128, /*fmt*/44,  /*tile*/5, /*type*/9);  // unmapped
@@ -329,6 +340,11 @@ int main() {
         CHECK(t0 && t0->format == DataFormat::Unorm8 && t0->num_components == 4,
               "fmt=56 -> Unorm8 x4 (current behavior preserved)");
         CHECK(t0 && t0->size == 1920u * 1080u * 4u, "fmt=56 size = w*h*4 (unchanged)");
+        CHECK(t0 && t0->compression_enabled && t0->meta_pipe_aligned && t0->alpha_is_on_msb &&
+              !t0->write_compress_enabled && !t0->color_transform &&
+              t0->max_uncompressed_block_size == 2 && t0->max_compressed_block_size == 1 &&
+              t0->metadata_addr == 0x206e33ab00ull,
+              "texture resource preserves all decoded DCC state for renderer/capture consumers");
 
         const ShaderResource* t1 = tt.by_sgpr_base(8);
         CHECK(t1 && t1->format == DataFormat::Unorm8 && t1->num_components == 1,
