@@ -125,10 +125,10 @@ int main() {
         release(S, 0x28, 0, 1, 0, A, 2, 1, 0);
         waitmem(S, 8, 3, 0, 0, A, 1, 0xffffffffu, 0x20);
 
-        CHECK(sync.cursor_up - sync_buffer == 16, "ReleaseMem + WaitRegMem emitted 7 + 9 dwords");
+        CHECK(sync.cursor_up - sync_buffer == 18, "ReleaseMem + WaitRegMem emitted 9 + 9 dwords");
         CHECK(sync_buffer[3] == 2 && sync_buffer[4] == 1 && sync_buffer[5] == 0,
               "ReleaseMem encoded stack args data_sel=2 and data=1");
-        const uint32_t* wait = sync_buffer + 7;
+        const uint32_t* wait = sync_buffer + 9;
         CHECK(wait[3] == 0xffffffffu && wait[4] == 0 && wait[5] == 1 && wait[6] == 0,
               "WaitRegMem encoded stack args mask=0xffffffff and reference=1");
         CHECK(wait[7] == 3 && wait[8] == 0x20,
