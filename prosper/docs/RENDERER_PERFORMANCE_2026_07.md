@@ -136,6 +136,46 @@ with `PROSPER_BACKEND_TEXTURE_CACHE_MB`.
 `test_texture_sample_render` verifies the initial miss/upload, a cross-callback hit with zero upload,
 byte-identical forced-upload output, and a new content version that cannot reuse the prior image.
 
+## Dead Cells cross-submit mapping topology cache (2026-07-15)
+
+After persistent texture residency, Dead Cells still spent 38-44 ms per large submit in the
+`tables=` phase. `PROSPER_STAGE_FOLD_PROFILE=1` showed that the scalar interpreter body took about
+0.003 ms per call and shader decode validation about 0.002 ms. The dominant cost was the Windows
+readability guard: the same mapped descriptor regions were checked thousands of times, but the
+positive `VirtualQuery` results were discarded at the end of every synchronous submit.
+
+Positive readable ranges from explicitly tracked kernel-HLE mappings now survive across submits while
+the HLE guest-mapping generation remains unchanged. Every tracked map, unmap, or protection change
+advances that generation and clears the ranges before reuse. Host-managed guest stacks, diagnostic
+mappings, and other regions whose lifetime does not pass through the memory HLE remain submit-local.
+The cache stores only OS mapping topology; it never stores descriptor bytes, shader fold results, or
+resource tables. The existing contract that a synchronous GPU submit's guest allocations remain
+mapped until the submit returns is unchanged. Use `PROSPER_NO_GUEST_READ_CACHE=1` for a control run.
+
+Native Windows / RTX 4090, same RelWithDebInfo binary and matched 169-175-draw Dead Cells scene:
+
+| Measurement | Submit-local ranges | Generation-retained ranges |
+|---|---:|---:|
+| Actual `VirtualQuery` calls per submit | about 31 | 0-2 |
+| Table-fold phase | 38-44 ms | 2-5 ms |
+| Total submit | 99-103 ms | 63-66 ms |
+| App rate | about 9.1 FPS | 13.5-14.2 FPS |
+
+A separate 300-second run remained stable and sustained about 17-18 FPS in a later 56-draw scene.
+Its final 60 seconds averaged 4705 MiB private memory and 3681 MiB working set, with changes of about
++31 MiB and +34 MiB respectively rather than continuing multi-gigabyte growth. The fresh-save scripted
+route did not reach the PrisonStart progression marker in that run, so this is renderer and memory
+stability evidence, not a new progression proof.
+
+The large process baseline has a separate source. Dead Cells explicitly allocates and maps a
+`0xc0000000` (3 GiB) direct-memory arena at 2 MiB alignment. On Windows, the shared-section view
+currently falls back to one eagerly committed `MEM_PRIVATE` allocation. A `VirtualQueryEx` census at
+35 seconds attributed exactly 3072 MiB of roughly 4638 MiB private commit to this arena; measured
+renderer persistent images and transient pools together accounted for about 441 MiB. Placeholder,
+aligned shared-view, or sparse-realization work belongs to
+[#697](https://github.com/mattias800/ps5ys/issues/697) because it must preserve guest query semantics,
+untouched zero-page reads, aliases, and partial unmaps.
+
 ## Current frame budget
 
 After the above changes, a representative renderer submit remains about 36-38 ms. Approximate costs

@@ -6,6 +6,7 @@
 #include "dispatch.hpp"
 #include "nid.hpp"
 #include "sync_futex.hpp"   // shared futex wake + waiter registration (also used by the GPU's label wake)
+#include "../host/guest_memory_map.hpp"
 
 #if defined(__linux__) || defined(__APPLE__)
 #include "../host/posix_shim.hpp"
@@ -133,6 +134,7 @@ namespace {
         Mapping m{ base, size, prot, committed, {0} };
         if (nm) { strncpy(m.name, nm, sizeof m.name - 1); }
         g_maps.push_back(m);
+        host::notify_guest_mapping_added(base, size, committed && (prot & 0x1));
     }
     // Trim/split tracked mappings overlapping [base, base+len). munmap/BatchMap-UNMAP must remove
     // their tracking (this never happened before — g_maps only ever grew): stale "committed"
@@ -153,6 +155,7 @@ namespace {
             if (me > end)      { Mapping hi = m; hi.base = end; hi.size = me - end; out.push_back(hi); }
         }
         g_maps.swap(out);
+        host::notify_guest_mapping_removed(base, len);
     }
     // Re-tag [base, base+len) with a new protection (mprotect): replace the overlapped span so
     // VirtualQuery/the fault probe report the CURRENT prot, not the one from map time.
@@ -1253,6 +1256,7 @@ namespace {
         Mapping m{ base, size, prot, committed, {0} };
         if (nm) { strncpy(m.name, nm, sizeof m.name - 1); }
         g_maps.push_back(m);
+        host::notify_guest_mapping_added(base, size, committed && (prot & 0x1));
     }
     void untrack(uint64_t base, uint64_t len) {
         if (!len) return;
@@ -1267,6 +1271,7 @@ namespace {
             if (me > end)      { Mapping hi = m; hi.base = end; hi.size = me - end; out.push_back(hi); }
         }
         g_maps.swap(out);
+        host::notify_guest_mapping_removed(base, len);
     }
     void retrack_prot(uint64_t base, uint64_t len, int prot, const char* nm) {
         if (!len) return;

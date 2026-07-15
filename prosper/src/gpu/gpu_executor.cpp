@@ -12,6 +12,7 @@
 #include "rdna2_decode.hpp"       // rdna2_walk (for the vertex-fetch const-eval)
 #include "rdna2_to_spirv.hpp"     // recompile_compute
 #include "writer_provenance.hpp"
+#include "../host/guest_memory_map.hpp"
 #include <chrono>
 #include <cstdlib>
 #include <cstdio>
@@ -167,6 +168,100 @@ struct ShaderDecodeCache {
     ShaderDecodeCacheStats stats;
     uint64_t use_counter = 0;
 };
+
+struct StageFoldProfileEntry {
+    uint64_t code = 0;
+    uint32_t user_base = 0;
+    uint64_t calls = 0;
+    uint64_t instructions = 0;
+    uint64_t dynamic_fetches = 0;
+    uint64_t srt_uses = 0;
+    uint64_t code_dwords = 0;
+    uint64_t guest_probes = 0;
+    double total_ms = 0.0;
+    double decode_ms = 0.0;
+    double guest_probe_ms = 0.0;
+    double max_ms = 0.0;
+};
+
+struct StageFoldProfileKey {
+    uint64_t code = 0;
+    uint32_t user_base = 0;
+    bool operator==(const StageFoldProfileKey&) const = default;
+};
+
+struct StageFoldProfileKeyHash {
+    size_t operator()(const StageFoldProfileKey& key) const {
+        const uint64_t mixed = key.code ^ (static_cast<uint64_t>(key.user_base) << 48);
+        return static_cast<size_t>(mixed ^ (mixed >> 32));
+    }
+};
+
+struct StageFoldProfiler {
+    std::mutex mutex;
+    std::unordered_map<StageFoldProfileKey, StageFoldProfileEntry,
+                       StageFoldProfileKeyHash> window;
+    uint64_t calls = 0;
+};
+
+StageFoldProfiler& stage_fold_profiler() {
+    static StageFoldProfiler profiler;
+    return profiler;
+}
+
+void record_stage_fold_profile(uint64_t code, uint32_t user_base, size_t code_dwords,
+                               size_t instructions, size_t dynamic_fetches, size_t srt_uses,
+                               uint64_t guest_probes, double elapsed_ms, double decode_ms,
+                               double guest_probe_ms) {
+    static const uint64_t interval = [] {
+        const char* value = std::getenv("PROSPER_STAGE_FOLD_PROFILE_CALLS");
+        if (!value || !*value) return 4096ull;
+        char* end = nullptr;
+        const unsigned long long parsed = std::strtoull(value, &end, 10);
+        return end != value && parsed > 0 ? parsed : 4096ull;
+    }();
+    StageFoldProfiler& profiler = stage_fold_profiler();
+    std::lock_guard lock(profiler.mutex);
+    StageFoldProfileEntry& entry = profiler.window[{code, user_base}];
+    entry.code = code;
+    entry.user_base = user_base;
+    ++entry.calls;
+    entry.instructions += instructions;
+    entry.dynamic_fetches += dynamic_fetches;
+    entry.srt_uses += srt_uses;
+    entry.code_dwords += code_dwords;
+    entry.guest_probes += guest_probes;
+    entry.total_ms += elapsed_ms;
+    entry.decode_ms += decode_ms;
+    entry.guest_probe_ms += guest_probe_ms;
+    entry.max_ms = std::max(entry.max_ms, elapsed_ms);
+    if (++profiler.calls < interval) return;
+
+    std::vector<StageFoldProfileEntry> ranked;
+    ranked.reserve(profiler.window.size());
+    for (const auto& item : profiler.window) ranked.push_back(item.second);
+    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+        return a.total_ms > b.total_ms;
+    });
+    std::fprintf(stderr, "[stage-fold-profile] calls=%llu shaders=%zu top-by-total-ms:\n",
+                 (unsigned long long)profiler.calls, ranked.size());
+    for (size_t i = 0; i < std::min<size_t>(ranked.size(), 12); ++i) {
+        const StageFoldProfileEntry& item = ranked[i];
+        const double calls = static_cast<double>(item.calls);
+        std::fprintf(stderr,
+                     "[stage-fold-profile] code=0x%llx base=%u calls=%llu total=%.3f avg=%.3f "
+                     "max=%.3f decode=%.3f probe=%.3f body=%.3f dw/call=%.1f ins/call=%.1f "
+                     "probes/call=%.1f dyn/call=%.1f srt/call=%.1f\n",
+                     (unsigned long long)item.code, item.user_base,
+                     (unsigned long long)item.calls, item.total_ms, item.total_ms / calls,
+                     item.max_ms, item.decode_ms / calls, item.guest_probe_ms / calls,
+                     (item.total_ms - item.decode_ms - item.guest_probe_ms) / calls,
+                     item.code_dwords / calls, item.instructions / calls,
+                     item.guest_probes / calls, item.dynamic_fetches / calls, item.srt_uses / calls);
+    }
+    profiler.window.clear();
+    profiler.calls = 0;
+}
 
 ShaderDecodeCache& shader_decode_cache() {
     static ShaderDecodeCache cache;
@@ -444,10 +539,10 @@ StageTablePhaseStats stage_table_phase_stats() {
 
 namespace {
 
-struct GuestReadableRange { uint64_t begin = 0, end = 0; };
 struct GuestReadableCacheState {
     bool active = false;
-    std::vector<GuestReadableRange> ranges;
+    host::GuestReadableRangeCache persistent_ranges;
+    host::GuestReadableRangeCache submit_ranges;
     uint64_t calls = 0, hits = 0, os_probes = 0;
 };
 thread_local GuestReadableCacheState g_guest_readable_cache;
@@ -455,34 +550,34 @@ thread_local GuestReadableCacheState g_guest_readable_cache;
 bool guest_range_cache_hit(uint64_t begin, uint64_t end) {
     if (!g_guest_readable_cache.active) return false;
     ++g_guest_readable_cache.calls;
-    for (const auto& range : g_guest_readable_cache.ranges) {
-        if (begin >= range.begin && end <= range.end) {
-            ++g_guest_readable_cache.hits;
-            return true;
-        }
-    }
-    return false;
+    const bool hit = g_guest_readable_cache.persistent_ranges.contains(begin, end) ||
+                     g_guest_readable_cache.submit_ranges.contains(begin, end);
+    if (hit) ++g_guest_readable_cache.hits;
+    return hit;
 }
 
-void cache_guest_readable_range(uint64_t begin, uint64_t end) {
+void cache_guest_readable_range(uint64_t begin, uint64_t end,
+                                uint64_t query_begin, uint64_t query_end) {
     if (!g_guest_readable_cache.active || begin >= end) return;
-    for (auto it = g_guest_readable_cache.ranges.begin(); it != g_guest_readable_cache.ranges.end();) {
-        if (end < it->begin || begin > it->end) { ++it; continue; }
-        begin = std::min(begin, it->begin);
-        end = std::max(end, it->end);
-        it = g_guest_readable_cache.ranges.erase(it);
-    }
-    g_guest_readable_cache.ranges.push_back({begin, end});
+    g_guest_readable_cache.submit_ranges.insert(begin, end);
+    host::GuestReadableRange mapping{};
+    if (host::guest_readable_mapping_containing(query_begin, query_end, mapping))
+        g_guest_readable_cache.persistent_ranges.insert(mapping.begin, mapping.end);
 }
 
 struct GuestReadableSubmitScope {
     GuestReadableSubmitScope() {
-        g_guest_readable_cache = {};
         g_guest_readable_cache.active = getenv("PROSPER_NO_GUEST_READ_CACHE") == nullptr;
+        g_guest_readable_cache.calls = 0;
+        g_guest_readable_cache.hits = 0;
+        g_guest_readable_cache.os_probes = 0;
+        g_guest_readable_cache.submit_ranges.clear();
+        if (g_guest_readable_cache.active)
+            g_guest_readable_cache.persistent_ranges.sync_generation(
+                host::guest_mapping_generation());
     }
     ~GuestReadableSubmitScope() {
         g_guest_readable_cache.active = false;
-        g_guest_readable_cache.ranges.clear();
     }
 };
 
@@ -536,7 +631,7 @@ bool guest_readable(uint64_t a, uint32_t n) {
         if (g_guest_readable_cache.active) ++g_guest_readable_cache.os_probes;
         if (!probe_byte(p < a ? a : p)) return false;
     }
-    cache_guest_readable_range(a & ~0xfffull, last_page + 0x1000);
+    cache_guest_readable_range(a & ~0xfffull, last_page + 0x1000, a, end);
     return true;
 }
 #else
@@ -556,8 +651,10 @@ bool guest_readable(uint64_t a, uint32_t n) {
         if (!(mbi.Protect & readable)) return false;
         const uint64_t region_end = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
         if (region_end <= cursor) return false;
-        cache_guest_readable_range((uint64_t)(uintptr_t)mbi.BaseAddress, region_end);
-        cursor = std::min(end, region_end);
+        const uint64_t query_end = std::min(end, region_end);
+        cache_guest_readable_range((uint64_t)(uintptr_t)mbi.BaseAddress, region_end,
+                                   cursor, query_end);
+        cursor = query_end;
     }
     return true;
 }
@@ -578,9 +675,26 @@ bool guest_readable(uint64_t a, uint32_t n) {
 std::vector<DynFetch>
 resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_sgprs, uint32_t nsgpr,
                       uint32_t user_sgpr_base, std::vector<SrtUse>* srt_uses) {
+    using FoldClock = std::chrono::steady_clock;
+    static const bool profile_fold = std::getenv("PROSPER_STAGE_FOLD_PROFILE") != nullptr;
+    const auto fold_start = profile_fold ? FoldClock::now() : FoldClock::time_point{};
+    const size_t srt_before = srt_uses ? srt_uses->size() : 0;
+    uint64_t guest_probe_calls = 0;
+    double guest_probe_ms = 0.0;
     std::vector<DynFetch> out;
     const auto decoded = decode_shader_cached(code, dwords);
+    const auto decode_done = profile_fold ? FoldClock::now() : FoldClock::time_point{};
     const auto& ins = decoded->instructions;
+
+    auto readable = [&](uint64_t addr, uint32_t bytes) {
+        if (!profile_fold) return guest_readable(addr, bytes);
+        const auto start = FoldClock::now();
+        const bool result = guest_readable(addr, bytes);
+        guest_probe_ms += std::chrono::duration<double, std::milli>(
+            FoldClock::now() - start).count();
+        ++guest_probe_calls;
+        return result;
+    };
 
     // PROSPER_DYNTRACE traces the whole const-fold walk; PROSPER_DYNTRACE_ADDR=<hex code addr>
     // narrows it to ONE shader (a full run otherwise traces every draw's walk — unusable volume).
@@ -808,20 +922,23 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // aperture. Every candidate must be mapped for the complete load, so this never turns
                 // an unreadable pointer into an unchecked dereference. The 4-byte alignment matches
                 // scalar-memory dword addressing (SharpEmu's evaluator applies the same alignment).
-                if (!is_buffer && !guest_readable(addr, n * 4)) {
+                bool addr_readable = is_buffer ? false : readable(addr, n * 4);
+                if (!is_buffer && !addr_readable) {
                     for (uint64_t mask : {0xFFFFFFFFFFFFull, 0xFFFFFFFFFFull}) {
                         const uint64_t candidate = (((base & mask) + (uint64_t)byte_off) & ~3ull);
-                        if (candidate != addr && guest_readable(candidate, n * 4)) {
+                        if (candidate != addr && readable(candidate, n * 4)) {
                             if (trc) fprintf(stderr, "[dyntrace]   canonical S_LOAD addr 0x%llx -> 0x%llx (mask=0x%llx)\n",
                                              (unsigned long long)addr, (unsigned long long)candidate,
                                              (unsigned long long)mask);
                             addr = candidate;
+                            addr_readable = true;
                             break;
                         }
                     }
                 }
-                if (!guest_readable(addr, n * 4)) { if (trc) fprintf(stderr, "[dyntrace]   addr 0x%llx unreadable\n", (unsigned long long)addr);
-                                                    for (uint32_t k = 0; k < n; k++) forget(sdst + (int)k); break; }
+                if (is_buffer) addr_readable = readable(addr, n * 4);
+                if (!addr_readable) { if (trc) fprintf(stderr, "[dyntrace]   addr 0x%llx unreadable\n", (unsigned long long)addr);
+                                      for (uint32_t k = 0; k < n; k++) forget(sdst + (int)k); break; }
                 const uint32_t* mem = (const uint32_t*)(uintptr_t)addr;
                 for (uint32_t k = 0; k < n; k++) set_value(sdst + (int)k, mem[k]);
                 // Provenance key: the recompiler tags an IMMEDIATE-only descriptor load's dest SGPRs
@@ -1044,6 +1161,13 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 break;
         }
     }
+    if (profile_fold)
+        record_stage_fold_profile(
+            (uint64_t)(uintptr_t)code, user_sgpr_base, decoded->code.size(), ins.size(), out.size(),
+            srt_uses ? srt_uses->size() - srt_before : 0, guest_probe_calls,
+            std::chrono::duration<double, std::milli>(FoldClock::now() - fold_start).count(),
+            std::chrono::duration<double, std::milli>(decode_done - fold_start).count(),
+            guest_probe_ms);
     return out;
 }
 
