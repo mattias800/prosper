@@ -411,6 +411,40 @@ int main() {
     CHECK(got17c.size()==N && bad17c==0,
           "compute execz uses subgroupAny(EXEC): empty wave skips, active wave enters");
 
+    // Kernel 17d: force the generic CFG dispatcher (a varying VCC branch plus a VCC loop) and
+    // verify that its wave vote spans all 64 emulated RDNA2 lanes, independent of the host Vulkan
+    // subgroup width. Wave 0 has no matching lanes and skips v2=1; wave 1 has one matching lane at
+    // its end, deliberately outside llvmpipe's first 8-lane subgroup, so every lane must enter.
+    const uint32_t code17d[] = {
+        0x7e040280u,              // v_mov_b32 v2, 0
+        0x7c020300u,              // v_cmp_lt_f32 vcc, v0, v1
+        0xbf860001u,              // s_cbranch_vccz +1
+        0x7e040281u,              // v_mov_b32 v2, 1
+        0x7d840100u,              // v_cmp_eq_u32 vcc, v0, v0 (always true)
+        0xbf870001u,              // s_cbranch_vccnz +1
+        0xbf82fffdu,              // s_branch -3
+        0x7e040d02u,              // v_cvt_f32_u32 v2, v2
+        0xbf810000u,              // s_endpgm
+    };
+    std::vector<uint32_t> spv17d = recompile_valu(
+        code17d, sizeof(code17d)/sizeof(code17d[0]), 2, /*out_vgpr*/2);
+    CHECK(!spv17d.empty(), "recompiled kernel 17d (wave64 CFG dispatcher) -> SPIR-V");
+    std::vector<float> in17d(N * 2), exp17d(N);
+    for (uint32_t i = 0; i < N; i++) {
+        in17d[i*2+0] = (i == N - 1) ? 0.0f : 1.0f;
+        in17d[i*2+1] = 0.5f;
+        exp17d[i] = i < 64 ? 0.0f : 1.0f;
+    }
+    std::vector<float> got17d = prosper::test::run_compute(spv17d, in17d, N, N);
+    uint32_t bad17d = 0;
+    for (uint32_t i=0;i<N&&got17d.size()==N;i++)
+        if (std::fabs(got17d[i]-exp17d[i])>1e-3f) bad17d++;
+    printf("  kernel17d mismatches=%u (out[63]=%g out[64]=%g out[127]=%g)\n",
+           bad17d, got17d.size()==N?got17d[63]:-1, got17d.size()==N?got17d[64]:-1,
+           got17d.size()==N?got17d[127]:-1);
+    CHECK(got17d.size()==N && bad17d==0,
+          "CFG dispatcher emulates a 64-lane wave across narrower Vulkan subgroups");
+
     // Kernel 18: the REAL if-then idiom with a forward branch. v3=7; vcc=(u0>u1);
     // s_and_saveexec_b64 s[0:1],vcc (save exec, exec=vcc); s_cbranch_execz skip (forward -> no-op);
     // v_add v3=u0+u1 (predicated); skip: s_mov_b64 exec,s[0:1] (restore); cvt+store. Same result as

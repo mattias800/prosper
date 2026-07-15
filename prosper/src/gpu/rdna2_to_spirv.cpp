@@ -85,6 +85,7 @@ struct SpirvCompute {
     uint32_t t_void=0, t_fn=0, t_f32=0, t_u32=0, t_i32=0, t_v3u=0, t_bool=0, t_ptr_sb_f32=0;
     uint32_t v_gid=0, v_groupid=0, v_in=0, v_out=0, gidx=0, f_main=0, glsl=0, bconst_false=0;
     uint32_t groupid[3] = {0, 0, 0}, localid_comp[3] = {0, 0, 0};
+    uint32_t linear_localid = 0, local_count = 64, wave_size = 64;
     uint32_t v_cbuf=0, v_cbuf1=0, t_ptr_sb_u32=0;   // scalar-memory constant buffers (bindings 2 and 3)
     std::map<uint32_t, uint32_t> cbuf_var;          // binding -> storage-buffer var (N-buffer model; 2/3 map to v_cbuf/v_cbuf1)
     bool     is_fragment=0;                          // true in the fragment shell (gates VINTRP interp)
@@ -775,6 +776,25 @@ struct SpirvCompute {
         put(code, Op_ControlBarrier, {uconst(Scope_Workgroup), uconst(Scope_Workgroup), uconst(MemSem_WGAcqRel)});
     }
 
+    // Dispatcher-only scratch. Unlike guest LDS, this is private recompiler state: one flag slot per
+    // padded hardware-wave lane, one result per wave, and one whole-workgroup liveness result.
+    uint32_t cfg_scratch = 0, t_ptr_cfg_u32 = 0;
+    void declare_cfg_scratch(uint32_t dwords) {
+        if (cfg_scratch) return;
+        uint32_t t_arr = id(); put(types, Op_TypeArray, {t_arr, t_u32, uconst(dwords)});
+        uint32_t t_ptr = id(); put(types, Op_TypePointer, {t_ptr, SC_Workgroup, t_arr});
+        cfg_scratch = id(); put(types, Op_Variable, {t_ptr, cfg_scratch, SC_Workgroup});
+        t_ptr_cfg_u32 = id(); put(types, Op_TypePointer, {t_ptr_cfg_u32, SC_Workgroup, t_u32});
+    }
+    uint32_t cfg_scratch_load(uint32_t idx) {
+        uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_cfg_u32, p, cfg_scratch, idx});
+        uint32_t value = id(); put(code, Op_Load, {t_u32, value, p}); return value;
+    }
+    void cfg_scratch_store(uint32_t idx, uint32_t value) {
+        uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_cfg_u32, p, cfg_scratch, idx});
+        put(code, Op_Store, {p, value});
+    }
+
     // --- Wave model (cross-lane ops via a workgroup-as-wave + LDS). The compute shell dispatches one
     // 64-invocation workgroup per wave; gl_LocalInvocationID.x is the lane. A dedicated LDS scratch array
     // (separate from ds_read/write's lds_var) holds each lane's contribution so cross-lane reductions work.
@@ -861,8 +881,11 @@ struct SpirvCompute {
     uint32_t lor(uint32_t a, uint32_t b_)  { uint32_t r = id(); put(code, Op_LogicalOr,  {t_bool, r, a, b_}); return r; }
 
     void begin(uint32_t input_stride, const ShaderResourceTable* rt = nullptr,
-               uint32_t local_x = 64, uint32_t local_y = 1, uint32_t local_z = 1) {
+               uint32_t local_x = 64, uint32_t local_y = 1, uint32_t local_z = 1,
+               uint32_t hardware_wave_size = 64) {
         stride = input_stride;
+        local_count = local_x * local_y * local_z;
+        wave_size = hardware_wave_size;
         t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_i32 = id(); t_v3u = id(); t_bool = id();
         t_v4f = id();   // vec4<float>: needed by the sampled-texture path (image_sample) in a compute shader
         uint32_t t_ptr_in_v3u = id(); v_gid = id(); v_groupid = id(); v_localid = id();
@@ -914,6 +937,11 @@ struct SpirvCompute {
             put(code, Op_CompositeExtract, {t_u32, localid_comp[c], ldl, c});
         }
         localid = localid_comp[0];   // wave lane index
+        // Vulkan and RDNA both linearize X fastest, then Y, then Z. Keep the legacy X-only lane id
+        // for the older 64x1 wave helpers, but retain the exact linear id for 2D/3D dispatcher waves.
+        uint32_t yz = ibin(Op_IMul, localid_comp[2], uconst(local_y));
+        yz = ibin(Op_IAdd, yz, localid_comp[1]);
+        linear_localid = ibin(Op_IAdd, ibin(Op_IMul, yz, uconst(local_x)), localid_comp[0]);
         uint32_t ldg = id(); put(code, Op_Load, {t_v3u, ldg, v_groupid});
         for (uint32_t c = 0; c < 3; c++) {
             groupid[c] = id();
@@ -4207,10 +4235,12 @@ size_t rdna2_recompile_code_span(const uint32_t* code, size_t dwords) {
 // a small backward VCC vote loop. They are valid reducible machine CFGs, but deliberately exceed the
 // narrow pattern structurizer below. Lower them as a structured dispatcher loop: one switch case per
 // basic block, with the emulated register file persisted in Function variables between iterations.
-// VCCZ/EXECZ test subgroup-wide Any, matching the hardware branch's wave-mask reduction instead of
-// treating one invocation's bit as the whole mask. The fallback is gated by emit_body to complex
-// compute CFGs without workgroup barriers or synthesized cross-lane operations; ordinary LDS reads,
-// writes, and atomics remain valid when different waves visit them independently.
+// VCCZ/EXECZ reduce over the dispatch's 32/64-lane hardware wave, not the host Vulkan subgroup.
+// Native subgroup widths are implementation-defined (llvmpipe is commonly 8), so every invocation
+// remains in the dispatcher until the whole workgroup is done and exchanges its vote at the common
+// switch merge. Dedicated Workgroup scratch keeps multiple hardware waves independent. The fallback
+// is gated by emit_body to complex compute CFGs without guest barriers or synthesized cross-lane
+// operations; ordinary LDS reads, writes, and atomics remain valid while waves visit different cases.
 bool emit_compute_cfg_state_machine(
     SpirvCompute& b, RegState& initial, const std::vector<Rdna2Inst>& ins,
     const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt,
@@ -4221,6 +4251,13 @@ bool emit_compute_cfg_state_machine(
     uint32_t end_pc = UINT32_MAX;
     for (const auto& in : ins) if (in.is_end) { end_pc = in.pc; break; }
     if (end_pc == UINT32_MAX) return false;
+    if ((b.wave_size != 32 && b.wave_size != 64) || !b.local_count || b.local_count > 1024)
+        return false;
+    const uint32_t wave_count = (b.local_count + b.wave_size - 1) / b.wave_size;
+    const uint32_t padded_lanes = wave_count * b.wave_size;
+    const uint32_t wave_result_base = padded_lanes;
+    const uint32_t group_active_slot = wave_result_base + wave_count;
+    b.declare_cfg_scratch(group_active_slot + 1);
 
     // Split at every branch target and fallthrough. Case values are dense block indices, not guest PCs.
     std::set<uint32_t> start_set{ins.front().pc};
@@ -4326,6 +4363,11 @@ bool emit_compute_cfg_state_machine(
     const uint32_t exec_var = b.function_var(b.t_bool, ptr_bool);
     const uint32_t pc_var = b.function_var(b.t_u32, ptr_u32);
     const uint32_t active_var = b.function_var(b.t_bool, ptr_bool);
+    const uint32_t vote_pending_var = b.function_var(b.t_bool, ptr_bool);
+    const uint32_t vote_value_var = b.function_var(b.t_bool, ptr_bool);
+    const uint32_t vote_invert_var = b.function_var(b.t_bool, ptr_bool);
+    const uint32_t vote_taken_var = b.function_var(b.t_u32, ptr_u32);
+    const uint32_t vote_next_var = b.function_var(b.t_u32, ptr_u32);
 
     const uint32_t zero = b.uconst(0), no = b.bfalse(), yes = b.btrue();
     for (const auto& kv : vv) {
@@ -4421,11 +4463,6 @@ bool emit_compute_cfg_state_machine(
         b.store_function(exec_var, state.exec);
     };
 
-    // Subgroup votes are required only by this fallback and therefore add no capability to the
-    // normal shader path.
-    SpirvCompute::put(b.caps, Op_Capability, {Cap_GroupNonUniform});
-    SpirvCompute::put(b.caps, Op_Capability, {Cap_GroupNonUniformVote});
-
     const uint32_t loop_header = b.id(), switch_header = b.id(), switch_merge = b.id();
     const uint32_t loop_continue = b.id(), loop_merge = b.id(), fallback = b.id();
     std::vector<uint32_t> labels(starts.size());
@@ -4436,10 +4473,18 @@ bool emit_compute_cfg_state_machine(
     }
     b.emit_branch(loop_header);
     b.emit_label(loop_header);
+    // Every live hardware wave executes one guest basic block per dispatcher iteration. Inactive
+    // invocations remain in the loop as synchronization participants until all waves finish.
+    b.store_function(vote_pending_var, no);
+    b.store_function(vote_value_var, no);
+    b.store_function(vote_invert_var, no);
+    b.store_function(vote_taken_var, zero);
+    b.store_function(vote_next_var, zero);
     b.emit_loopmerge(loop_merge, loop_continue);
     b.emit_branch(switch_header);
     b.emit_label(switch_header);
-    const uint32_t selector = b.load_function(b.t_u32, pc_var);
+    const uint32_t selector = b.sel(b.load_function(b.t_bool, active_var),
+                                    b.load_function(b.t_u32, pc_var), b.uconst(UINT32_MAX));
     b.emit_selmerge(switch_merge);
     b.emit_switch(selector, fallback, switch_cases);
 
@@ -4492,18 +4537,25 @@ bool emit_compute_cfg_state_machine(
             switch (terminator->opcode) {
                 case 0x04: condition = b.logical_not(state.scc); break; // s_cbranch_scc0
                 case 0x05: condition = state.scc; break;
-                case 0x06: condition = b.logical_not(b.subgroup_any(state.vcc)); break;
-                case 0x07: condition = b.subgroup_any(state.vcc); break;
-                case 0x08: condition = b.logical_not(b.subgroup_any(state.exec)); break;
-                case 0x09: condition = b.subgroup_any(state.exec); break;
+                case 0x06: case 0x07: case 0x08: case 0x09: break;
                 default: return false;
             }
             const uint32_t target = branch_target(*terminator);
             const uint32_t fallthrough = terminator->pc + terminator->len_dwords;
             auto taken = block_for_pc.find(target), next = block_for_pc.find(fallthrough);
             if (taken == block_for_pc.end() || next == block_for_pc.end()) return false;
-            b.store_function(pc_var,
-                b.sel(condition, b.uconst(taken->second), b.uconst(next->second)));
+            if (terminator->opcode == 0x04 || terminator->opcode == 0x05) {
+                b.store_function(pc_var,
+                    b.sel(condition, b.uconst(taken->second), b.uconst(next->second)));
+            } else {
+                b.store_function(vote_pending_var, yes);
+                b.store_function(vote_value_var,
+                    terminator->opcode <= 0x07 ? state.vcc : state.exec);
+                b.store_function(vote_invert_var,
+                    terminator->opcode == 0x06 || terminator->opcode == 0x08 ? yes : no);
+                b.store_function(vote_taken_var, b.uconst(taken->second));
+                b.store_function(vote_next_var, b.uconst(next->second));
+            }
         }
         b.emit_branch(switch_merge);
     }
@@ -4513,7 +4565,74 @@ bool emit_compute_cfg_state_machine(
     b.emit_label(switch_merge);
     b.emit_branch(loop_continue);
     b.emit_label(loop_continue);
-    b.emit_condbranch(b.load_function(b.t_bool, active_var), loop_header, loop_merge);
+
+    // Publish this lane's pending vote bit and liveness. The switch merge is reached by every
+    // invocation on every iteration, including lanes whose emulated wave has already ended.
+    const uint32_t pending = b.load_function(b.t_bool, vote_pending_var);
+    const uint32_t vote_value = b.load_function(b.t_bool, vote_value_var);
+    const uint32_t vote_bit = b.sel(b.land(pending, vote_value), b.uconst(1), zero);
+    const uint32_t active_bit = b.sel(b.load_function(b.t_bool, active_var), b.uconst(2), zero);
+    b.cfg_scratch_store(b.linear_localid, b.ibin(Op_BitwiseOr, vote_bit, active_bit));
+    b.barrier();
+
+    const uint32_t wave_shift = b.wave_size == 32 ? 5u : 6u;
+    const uint32_t wave_index = b.ibin(Op_ShiftRightLogical, b.linear_localid,
+                                       b.uconst(wave_shift));
+    const uint32_t wave_base = b.ibin(Op_ShiftLeftLogical, wave_index,
+                                      b.uconst(wave_shift));
+    const uint32_t lane_in_wave = b.ibin(Op_BitwiseAnd, b.linear_localid,
+                                         b.uconst(b.wave_size - 1));
+
+    // One lane per hardware wave reduces that wave's vote. Padding keeps every dynamic access in
+    // bounds for a partial final wave; padded values are explicitly masked out.
+    uint32_t wave_leader = b.id(), wave_reduced = b.id();
+    const uint32_t is_wave_leader = b.ucmp(Op_IEqual, lane_in_wave, zero);
+    b.emit_selmerge(wave_reduced);
+    b.emit_condbranch(is_wave_leader, wave_leader, wave_reduced);
+    b.emit_label(wave_leader);
+    uint32_t wave_flags = zero;
+    for (uint32_t lane = 0; lane < b.wave_size; ++lane) {
+        const uint32_t idx = b.ibin(Op_IAdd, wave_base, b.uconst(lane));
+        uint32_t flags = b.cfg_scratch_load(idx);
+        if (padded_lanes != b.local_count)
+            flags = b.sel(b.ucmp(Op_ULessThan, idx, b.uconst(b.local_count)), flags, zero);
+        wave_flags = b.ibin(Op_BitwiseOr, wave_flags,
+                            b.ibin(Op_BitwiseAnd, flags, b.uconst(1)));
+    }
+    b.cfg_scratch_store(b.ibin(Op_IAdd, b.uconst(wave_result_base), wave_index), wave_flags);
+    b.emit_branch(wave_reduced);
+    b.emit_label(wave_reduced);
+
+    // Lane zero also reduces workgroup liveness. This uniform dispatcher loop is what makes the
+    // internal barriers legal even after one hardware wave reaches S_ENDPGM before another.
+    uint32_t group_leader = b.id(), group_reduced = b.id();
+    const uint32_t is_group_leader = b.ucmp(Op_IEqual, b.linear_localid, zero);
+    b.emit_selmerge(group_reduced);
+    b.emit_condbranch(is_group_leader, group_leader, group_reduced);
+    b.emit_label(group_leader);
+    uint32_t group_flags = zero;
+    for (uint32_t lane = 0; lane < b.local_count; ++lane) {
+        const uint32_t flags = b.cfg_scratch_load(b.uconst(lane));
+        group_flags = b.ibin(Op_BitwiseOr, group_flags,
+                             b.ibin(Op_BitwiseAnd, flags, b.uconst(2)));
+    }
+    b.cfg_scratch_store(b.uconst(group_active_slot), group_flags);
+    b.emit_branch(group_reduced);
+    b.emit_label(group_reduced);
+    b.barrier();
+
+    const uint32_t wave_flags_result = b.cfg_scratch_load(
+        b.ibin(Op_IAdd, b.uconst(wave_result_base), wave_index));
+    const uint32_t wave_any = b.ucmp(
+        Op_INotEqual, b.ibin(Op_BitwiseAnd, wave_flags_result, b.uconst(1)), zero);
+    const uint32_t vote_condition = b.bsel(
+        b.load_function(b.t_bool, vote_invert_var), b.logical_not(wave_any), wave_any);
+    const uint32_t selected_pc = b.sel(vote_condition,
+        b.load_function(b.t_u32, vote_taken_var), b.load_function(b.t_u32, vote_next_var));
+    b.store_function(pc_var, b.sel(pending, selected_pc, b.load_function(b.t_u32, pc_var)));
+    const uint32_t group_active = b.ucmp(
+        Op_INotEqual, b.cfg_scratch_load(b.uconst(group_active_slot)), zero);
+    b.emit_condbranch(group_active, loop_header, loop_merge);
     b.emit_label(loop_merge);
 
     // Expose the final emulated state to the caller (compute currently consumes no register output,
@@ -4980,7 +5099,8 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     const uint32_t local_x = std::max(1u, config.local_x);
     const uint32_t local_y = std::max(1u, config.local_y);
     const uint32_t local_z = std::max(1u, config.local_z);
-    b.begin(1, rt, local_x, local_y, local_z);
+    const uint32_t wave_size = config.wave_size == 32 ? 32u : 64u;
+    b.begin(1, rt, local_x, local_y, local_z, wave_size);
 
     RegState rs;
     rs.vcc = b.bfalse();

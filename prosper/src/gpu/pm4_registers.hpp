@@ -843,6 +843,10 @@ constexpr uint32_t COMPUTE_SHADER_CHKSUM      = 0x22A;
 constexpr uint32_t COMPUTE_USER_DATA_0        = 0x240;
 constexpr uint32_t COMPUTE_USER_DATA_15       = 0x24F;
 constexpr uint32_t COMPUTE_DISPATCH_TUNNEL    = 0x27D;
+// GFX10 DISPATCH_DIRECT initiator bit retained by sceAgcCbDispatch's ShaderDispatchModifier.
+// Clear selects wave64; set selects wave32.
+constexpr uint32_t COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT = 15;
+constexpr uint32_t COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_MASK  = 0x1;
 constexpr uint32_t SH_NOP = 0x800002FF;
 constexpr uint32_t SH_NUM = 0x2FF + 1;
 constexpr uint32_t VGT_PRIMITIVE_TYPE                 = 0x242;
