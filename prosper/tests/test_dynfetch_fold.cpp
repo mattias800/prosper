@@ -139,6 +139,84 @@ int main() {
     CHECK(have_cbuf, "kernel 5 s_buffer_load reports a ConstantBuffer table-use keyed by the V# load imm");
     CHECK(cbuf_ok,   "kernel 5 V# dwords match the table as loaded");
 
+    // Kernel 5n: an s_buffer_load_dwordx8 result is typeless SGPR data. A later scalar buffer load
+    // may consume its first four words as a nested V#, as DOLL's post-process shader does. Since the
+    // V# came through another buffer descriptor it has no immediate key; preserve it by consumer pc.
+    static uint32_t nested_payload[16];
+    static uint32_t nested_descriptors[8];
+    uint64_t nested_payload_base = (uint64_t)(uintptr_t)nested_payload;
+    nested_descriptors[0] = (uint32_t)nested_payload_base;
+    nested_descriptors[1] = (uint32_t)(nested_payload_base >> 32) & 0xFFFFu;
+    nested_descriptors[2] = sizeof(nested_payload);
+    nested_descriptors[3] = 0u;
+    uint64_t nested_table_base = (uint64_t)(uintptr_t)nested_descriptors;
+    const uint32_t k5n[] = {
+        0xF42C0404u, 0xFA000000u,   // s_buffer_load_dwordx8 s[16:23], s[8:11], 0
+        0xF4280608u, 0xFA000000u,   // s_buffer_load_dwordx4 s[24:27], s[16:19], 0
+        0xBF810000u,
+    };
+    const uint32_t seed5n[4] = {
+        (uint32_t)nested_table_base, (uint32_t)(nested_table_base >> 32) & 0xFFFFu,
+        sizeof(nested_descriptors), 0u,
+    };
+    std::vector<SrtUse> nested_uses;
+    resolve_dynamic_fetch(k5n, sizeof(k5n)/sizeof(k5n[0]), seed5n, 4, 8, &nested_uses);
+    bool nested_ok = false;
+    for (const auto& u : nested_uses) {
+        if (u.kind == 1 && u.key == 0xFFFFFFFFu && u.use_pc == 2 && u.required_size == 16 &&
+            u.v4[0] == nested_descriptors[0] && u.v4[1] == nested_descriptors[1] &&
+            u.v4[2] == nested_descriptors[2] && u.v4[3] == nested_descriptors[3])
+            nested_ok = true;
+    }
+    CHECK(nested_ok, "kernel 5n nested s_buffer V# resolves by the consuming instruction pc");
+
+    // Kernel 5s: UE's large post shaders spill descriptor words into fixed lanes of one VGPR and
+    // later restore them with v_readlane before a scalar buffer load. The restored V# has no static
+    // SRT tag in the recompiler, so the fold must preserve its words and key it by the consumer pc.
+    const uint32_t k5s[] = {
+        0xD7610024u, 0x00010848u,   // v_writelane_b32 v36, s72, 4
+        0xD7610024u, 0x00010A49u,   // v_writelane_b32 v36, s73, 5
+        0xD7610024u, 0x00010C4Au,   // v_writelane_b32 v36, s74, 6
+        0xD7610024u, 0x00010E4Bu,   // v_writelane_b32 v36, s75, 7
+        0xD7600028u, 0x00010924u,   // v_readlane_b32 s40, v36, 4
+        0xD7600029u, 0x00010B24u,   // v_readlane_b32 s41, v36, 5
+        0xD760002Au, 0x00010D24u,   // v_readlane_b32 s42, v36, 6
+        0xD760002Bu, 0x00010F24u,   // v_readlane_b32 s43, v36, 7
+        0xF4281014u, 0xFA000000u,   // s_buffer_load_dwordx4 s[64:67], s[40:43], 0
+        0xBF810000u,
+    };
+    std::vector<SrtUse> spill_uses;
+    resolve_dynamic_fetch(k5s, sizeof(k5s)/sizeof(k5s[0]), seed5n, 4, 72, &spill_uses);
+    bool spill_ok = false;
+    for (const auto& u : spill_uses) {
+        if (u.kind == 1 && u.key == 0xFFFFFFFFu && u.use_pc == 16 && u.required_size == 16 &&
+            u.v4[0] == seed5n[0] && u.v4[1] == seed5n[1] &&
+            u.v4[2] == seed5n[2] && u.v4[3] == seed5n[3])
+            spill_ok = true;
+    }
+    CHECK(spill_ok, "kernel 5s scalar-spilled V# resolves by the consuming instruction pc");
+
+    // Kernel 5sr: an ordinary write to the spill VGPR replaces every lane. Restoring after that
+    // write must not resurrect descriptor words saved by earlier v_writelane instructions.
+    const uint32_t k5sr[] = {
+        0xD7610024u, 0x00010848u,   // v_writelane_b32 v36, s72, 4
+        0xD7610024u, 0x00010A49u,   // v_writelane_b32 v36, s73, 5
+        0xD7610024u, 0x00010C4Au,   // v_writelane_b32 v36, s74, 6
+        0xD7610024u, 0x00010E4Bu,   // v_writelane_b32 v36, s75, 7
+        0x7E4802F2u,                // v_mov_b32 v36, 1.0
+        0xD7600028u, 0x00010924u,   // v_readlane_b32 s40, v36, 4
+        0xD7600029u, 0x00010B24u,   // v_readlane_b32 s41, v36, 5
+        0xD760002Au, 0x00010D24u,   // v_readlane_b32 s42, v36, 6
+        0xD760002Bu, 0x00010F24u,   // v_readlane_b32 s43, v36, 7
+        0xF4281014u, 0xFA000000u,   // s_buffer_load_dwordx4 s[64:67], s[40:43], 0
+        0xBF810000u,
+    };
+    std::vector<SrtUse> recycled_spill_uses;
+    resolve_dynamic_fetch(k5sr, sizeof(k5sr)/sizeof(k5sr[0]), seed5n, 4, 72,
+                          &recycled_spill_uses);
+    CHECK(recycled_spill_uses.empty(),
+          "kernel 5sr ordinary VGPR write invalidates scalar spill lanes");
+
     // Kernel 5d: direct T#/S# sharps already occupy the initial PS user SGPRs, so no s_load creates
     // descr8/descr snapshots. The MIMG use must still receive a pc-keyed texture and paired sampler.
     const uint32_t k5d[] = {
