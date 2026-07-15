@@ -23,6 +23,7 @@
 #include <cstring>
 #include <algorithm>
 #include <memory>
+#include <string>
 #include <vector>
 #include <set>
 #include <unordered_map>
@@ -244,6 +245,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 uint64_t target = 0;
                 uint32_t width = 0, height = 0;
                 size_t draws = 0;
+                double measured_ms = 0;
                 prosper::test::BackendRenderTimingStats timing;
             };
             static thread_local RenderTiming pending_timing;
@@ -280,16 +282,28 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 pending_timing.backend_pipeline_entries = pipelines.entries;
                 pending_timing.backend_pipeline_evictions += pipelines.evictions;
             };
-            auto print_rtt_timing = [](const RttTimingRecord& record) {
+            auto append_rtt_timing = [](std::string& output, const RttTimingRecord& record) {
                 const prosper::test::BackendRenderTimingStats& timing = record.timing;
-                fprintf(stderr,
-                        "[rtt-timing] submit=%d target=0x%llx extent=%ux%u draws=%zu "
-                        "total=%.2f target_setup=%.2f draw_setup=%.2f record_upload=%.2f "
-                        "gpu_wait=%.2f readback=%.2f cleanup=%.2f\n",
-                        record.submit, (unsigned long long)record.target,
-                        record.width, record.height, record.draws, timing.total_ms(),
-                        timing.target_ms, timing.draw_setup_ms, timing.record_upload_ms,
-                        timing.gpu_wait_ms, timing.readback_ms, timing.cleanup_ms);
+                const double detail_ms = timing.total_ms();
+                char line[512];
+                const int length = snprintf(
+                    line, sizeof(line),
+                    "[rtt-timing] submit=%d target=0x%llx extent=%ux%u draws=%zu "
+                    "measured=%.2f detail=%.2f other=%.2f target_setup=%.2f "
+                    "draw_setup=%.2f record_upload=%.2f gpu_wait=%.2f "
+                    "readback=%.2f cleanup=%.2f\n",
+                    record.submit, (unsigned long long)record.target,
+                    record.width, record.height, record.draws, record.measured_ms, detail_ms,
+                    record.measured_ms - detail_ms,
+                    timing.target_ms, timing.draw_setup_ms, timing.record_upload_ms,
+                    timing.gpu_wait_ms, timing.readback_ms, timing.cleanup_ms);
+                if (length > 0)
+                    output.append(line, std::min<size_t>(length, sizeof(line) - 1));
+            };
+            auto print_rtt_timing = [&](const RttTimingRecord& record) {
+                std::string output;
+                append_rtt_timing(output, record);
+                if (!output.empty()) fwrite(output.data(), 1, output.size(), stderr);
             };
             // PROSPER_SUBMITLOG: print the GPU-submit index periodically (at native speed, before the slow
             // render) so it can be correlated with guest-side log lines (e.g. a MsgDialog wait) to find the
@@ -1645,7 +1659,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     bool is_vo = false;
                     for (int i = 0; i < vo_n && !is_vo; i++) is_vo = base && base == prosper_vo_buffer_addr(i);
                     const RttTimingRecord rtt_timing_record{
-                        g_this_submit, base, gw, gh, pass.size(), backend_call_timing};
+                        g_this_submit, base, gw, gh, pass.size(),
+                        std::chrono::duration<double, std::milli>(
+                            backend_done - build_done).count(),
+                        backend_call_timing};
                     if (lightweight_rtt_timing) pending_rtt_timing.push_back(rtt_timing_record);
                     else if (timing_enabled && rtt_log) print_rtt_timing(rtt_timing_record);
                     if (rtt_log) {
@@ -1760,8 +1777,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 if (scanout) selected_pixels = scanout->rgba;
             }
             if (phase.final_span && lightweight_rtt_timing && rtt_log_in_range &&
-                pending_timing.backend_draws >= rtt_timing_min_draws)
-                for (const RttTimingRecord& record : pending_rtt_timing) print_rtt_timing(record);
+                pending_timing.backend_draws >= rtt_timing_min_draws) {
+                std::string output;
+                output.reserve(pending_rtt_timing.size() * 320);
+                for (const RttTimingRecord& record : pending_rtt_timing)
+                    append_rtt_timing(output, record);
+                if (!output.empty()) fwrite(output.data(), 1, output.size(), stderr);
+            }
             if (!phase.final_span) {
                 if (timing_enabled) {
                     pending_timing.callbacks++;

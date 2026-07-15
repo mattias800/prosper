@@ -1938,7 +1938,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         };
         accumulate(totals);
         accumulate(window);
-        if (totals.calls % 25 == 0) {
+        static const bool print_backend_timing_windows =
+            getenv("PROSPER_BACKEND_TIMING_WINDOWS") != nullptr;
+        if (print_backend_timing_windows && totals.calls % 25 == 0) {
             const double n = static_cast<double>(totals.calls);
             const double total = totals.target + totals.draw_setup + totals.record +
                                  totals.gpu_wait + totals.readback + totals.cleanup;

@@ -182,6 +182,9 @@ lines show only the latest 25 submits/calls so a scene transition is immediately
 an independent 25-call backend window across submit boundaries. Compare `measured` with `detail` and
 its `other` remainder to verify that the subphase attribution covers the frontend's backend wall time.
 The core window also reports graphics-shader cache hits, misses, bypasses, and actual miss compilation time.
+The older independent 25-backend-call timing windows are disabled by default because their multi-line logging
+can materially perturb the target call charged for printing them on Windows. Set
+`PROSPER_BACKEND_TIMING_WINDOWS=1` only when that cross-submit legacy view or its memory-pool line is needed.
 Use `PROSPER_RENDER_TIMING=detail` to additionally print individual texture decodes taking at least
 0.5 ms (capped at 250 lines). Set `PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT=N` to begin those detail
 lines at renderer submit N, so boot textures do not consume the cap before the scene under study. Each
@@ -190,13 +193,17 @@ aggregate output also reports retained RTT bytes, decode-scratch capacity, and v
 use those figures before treating a process-memory increase as an unbounded cache.
 Set `PROSPER_RTT_TIMING=1` with timing enabled to print one lightweight `[rtt-timing]` line per rendered target
 group. It includes the submit number, target address, dimensions, draw count, and that target's exact Vulkan
-phase breakdown without scanning pixels or printing every draw. `PROSPER_RTTLOG=1` includes the same line plus
+phase breakdown without scanning pixels or printing every draw. `measured`, `detail`, and `other` show the
+frontend-observed call duration, attributed backend phase sum, and remaining wrapper/logging cost for that
+specific target. `PROSPER_RTTLOG=1` includes the same line plus
 the more expensive visual RTT diagnostics. Use `PROSPER_RTTLOG_MIN_SUBMIT=N` and
 `PROSPER_RTTLOG_MAX_SUBMIT=N` to bound either mode; unrestricted output can still perturb wall-clock routes.
 For scene selection that is stable across runs, set `PROSPER_RTT_TIMING_MIN_DRAWS=N`. Lightweight records are
 buffered for one ordered submit and emitted together only when its total backend draw count reaches N, so all
 target calls are retained without logging the boot/menu workloads. For example, 300 selects the current
 Dead Cells post-parse workload while excluding its 54-56-draw loading loop.
+Selected lightweight records are formatted together and written to stderr in one batch at submit completion;
+this preserves one parseable line per target without paying a Windows console write for every target.
 
 Ordered graphics/compute submits retain a bounded journal of exact guest-memory ranges written by the
 compute backend. A persistent texture validated in an earlier graphics span can therefore skip its repeated
@@ -232,7 +239,7 @@ decode/probe/interpreter split. It prints every 4096 folds by default; set
 diagnostic runs and takes no timing samples when disabled.
 
 Transient Vulkan memory uses a bounded, exact-requirements pool because every backend call waits for its
-fence before cleanup. Timing output includes `memory_pool` hits, misses, cached allocation count/bytes,
+fence before cleanup. The optional backend timing windows include `memory_pool` hits, misses, cached allocation count/bytes,
 and budget-driven discards. The default budget is 512 MiB; override it with
 `PROSPER_MEMORY_POOL_MB=<MiB>`, or set `PROSPER_NO_MEMORY_POOL=1` for an A/B run against direct
 `vkAllocateMemory`/`vkFreeMemory`. The pool retains only allocation objects: images, buffers, views,

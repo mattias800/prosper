@@ -347,10 +347,21 @@ They also print the frontend-measured backend duration, the detailed phase sum, 
 This is the authoritative view for choosing the next backend optimization; the legacy per-call lines remain
 useful for spotting an individually slow render target. `PROSPER_RTT_TIMING=1` adds a lightweight
 `[rtt-timing]` record for each target group with its submit, address, dimensions, draw count, and exact phase
-costs. `PROSPER_RTTLOG=1` retains its visual pixel/draw diagnostics and also emits the timing record. Bound both
+costs. Each record also reports its frontend-measured duration and the remainder outside those phases, so an
+unattributed submit-level cost can be assigned to a concrete target call. `PROSPER_RTTLOG=1` retains its visual
+pixel/draw diagnostics and also emits the timing record. Bound both
 modes with `PROSPER_RTTLOG_MIN_SUBMIT` and `PROSPER_RTTLOG_MAX_SUBMIT`. The full visual mode scans rendered
 pixels and dropped one Dead Cells title loop from about 20 FPS to 13-14 FPS, causing its wall-clock input route
 to miss the menu; use the lightweight mode for performance attribution.
+Lightweight records selected for one submit are emitted with a single stderr write while preserving their
+line-oriented format, avoiding one slow Windows console operation per target.
+
+The legacy 25-backend-call window is now separately enabled with `PROSPER_BACKEND_TIMING_WINDOWS=1`.
+Printing its multiple aggregate lines from inside `render_draws_rgba` was charged to whichever target crossed
+the 25-call boundary. One Dead Cells 636x420 five-draw target measured 103.15 ms outside but only 2.55 ms across
+all backend phases; 100.60 ms was diagnostic output. This explained almost exactly the submit-aligned 39 ms
+unattributed remainder. Submit-aligned and lightweight target timing remain enabled by
+`PROSPER_RENDER_TIMING` without that legacy output.
 
 Submit ordinals also varied enough across fresh runs that preselected ranges repeatedly missed the transition.
 `PROSPER_RTT_TIMING_MIN_DRAWS=N` therefore buffers lightweight target records until the final graphics span and
