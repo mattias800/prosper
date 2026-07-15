@@ -410,7 +410,16 @@ namespace {
     // the state while k_eq_wait sat in cv.wait on it). Delete marks `deleted` and wakes waiters; the
     // object dies when the last reference drops.
     struct EqState { std::mutex m; std::condition_variable cv; std::deque<SceKEvent> ready; bool deleted = false; };
+    // #707 addressing-mode discriminator (PR #753): a mutex-sized DECOY declared immediately before
+    // g_eq_mx. On macOS both are initialized-sig mutexes sharing __DATA and the linker keeps the
+    // mutex cluster in declaration order, so the decoy takes g_eq_mx's former fixed offset and
+    // g_eq_mx shifts +64. If the corruptor targets the SLOT (binary_base + const, or one-past-
+    // g_det_clock), it now hits the decoy: the crash vanishes and the decoy's sig carries the
+    // payload (reported by the sig-watcher below). If it follows g_eq_mx by symbol, the crash
+    // persists at the new offset. Never locked — diagnostic layout ballast only.
+    std::mutex g_eq_decoy;
     std::mutex g_eq_mx;
+    extern std::mutex g_apr_mx;   // defined in the APR block below; sig-watched alongside g_eq_mx
     volatile uint8_t g_eq_canary_b[128] PROSPER_EQ_CANARY_INIT;   // #707 canary: immediately beside g_eq_mx/g_eqs in declaration order
     std::unordered_map<uint64_t, std::shared_ptr<EqState>> g_eqs;   // guest eq handle -> state
     struct FlipReg { uint64_t eq; int64_t ident; uint64_t udata; };
@@ -459,6 +468,59 @@ namespace {
         static const bool on = getenv("PROSPER_EQ_CANARY") != nullptr;
         if (!on || g_eq_canary_started.exchange(true)) return;
         std::thread(eq_canary_thread).detach();
+    }
+
+    // --- #707 sig-watcher (PROSPER_EQ_SIGWATCH=1 or =repair; default off — see PR #753). A
+    // read-only poller over the stable head bytes of the cluster's mutexes. On macOS these are the
+    // pthread sig words: written once at image load, never by lock/unlock (legit locks touch
+    // offsets 24/32 only, verified on the issue), so ANY deviation from the armed baseline is the
+    // corruptor — reported as exact byte, old->new value, and time: the payload fingerprint the
+    // canaries cannot capture for a short targeted write. "repair" also restores the baseline
+    // byte, which on macOS suppresses the EINVAL crash so the run stays alive and every
+    // subsequent hit is captured too. On glibc the lock word [0,16) mutates legitimately, so the
+    // Linux build watches the stable __kind window instead — the diagnostic compiles and runs
+    // everywhere, but its target platform is macOS.
+    std::atomic<bool> g_eq_sigwatch_started{false};
+    void eq_sigwatch_thread(bool repair) {
+#ifdef __APPLE__
+        constexpr int kOff = 0, kLen = 16;    // pthread_mutex __sig + head: init-only on Darwin
+#else
+        constexpr int kOff = 16, kLen = 8;    // glibc __kind/__spins: never written for a plain mutex
+#endif
+        struct Target { const char* name; volatile uint8_t* p; uint8_t base[16]; };
+        static Target t[4] = {
+            { "g_eq_decoy",        (volatile uint8_t*)&g_eq_decoy,  {} },
+            { "g_eq_mx",           (volatile uint8_t*)&g_eq_mx,     {} },
+            { "g_det_clock.mutex", (volatile uint8_t*)&g_det_clock, {} },
+            { "g_apr_mx",          (volatile uint8_t*)&g_apr_mx,    {} },
+        };
+        for (auto& x : t) for (int i = 0; i < kLen; i++) x.base[i] = x.p[kOff + i];
+        fprintf(stderr, "[eq-sigwatch] armed repair=%d window=[%d,%d): decoy=%p eq_mx=%p det=%p apr=%p\n",
+                repair ? 1 : 0, kOff, kOff + kLen,
+                (void*)t[0].p, (void*)t[1].p, (void*)t[2].p, (void*)t[3].p);
+        auto ms = [] { struct timespec ts{}; clock_gettime(CLOCK_MONOTONIC, &ts);
+                       return (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)ts.tv_nsec / 1000000ull; };
+        uint64_t hits = 0;
+        for (;;) {
+            struct timespec ts{ 0, 200000 }; nanosleep(&ts, nullptr);   // 200 µs poll
+            for (auto& x : t)
+                for (int i = 0; i < kLen; i++) {
+                    uint8_t v = x.p[kOff + i];
+                    if (v == x.base[i]) continue;
+                    fprintf(stderr, "[eq-sigwatch] HIT %s off=%d 0x%02x->0x%02x addr=%p t=%llums%s\n",
+                            x.name, kOff + i, x.base[i], v, (void*)&x.p[kOff + i], ms(),
+                            repair ? " (repaired)" : "");
+                    if (repair) x.p[kOff + i] = x.base[i];
+                    else        x.base[i] = v;   // track the new state so further deltas keep reporting
+                    if (++hits >= 512) { fprintf(stderr, "[eq-sigwatch] report cap reached\n"); return; }
+                }
+        }
+    }
+    void eq_sigwatch_maybe_start() {
+        static const char* mode = getenv("PROSPER_EQ_SIGWATCH");
+        if (!mode || g_eq_sigwatch_started.exchange(true)) return;
+        bool repair = strcmp(mode, "repair") == 0;
+        std::thread(eq_sigwatch_thread, repair).detach();
     }
 
     std::shared_ptr<EqState> eq_find(uint64_t eq) {
@@ -518,7 +580,8 @@ namespace {
         }
     }
     void ensure_pump() {
-        eq_canary_maybe_start();   // #707 diagnostic; no-op unless PROSPER_EQ_CANARY is set
+        eq_canary_maybe_start();     // #707 diagnostics; no-ops unless their env vars are set
+        eq_sigwatch_maybe_start();
         if (!g_pump_started.exchange(true)) std::thread(vblank_pump).detach();
     }
 }
