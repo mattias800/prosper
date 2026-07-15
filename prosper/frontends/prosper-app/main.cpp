@@ -1,19 +1,19 @@
 // prosper-app (P0a) — the OS-integration frontend: an SDL3 window + Vulkan swapchain that presents
-// the frame prosper's renderer hands to the present layer (present_readback). See
+// the frame prosper's renderer hands to the present layer. See
 // docs/FRONTEND_APP.md and issue #164.
 //
 // P0a scope (this file): the whole present half, decoupled from the guest boot. It pulls finished
-// frames from prosper_core's present layer (present_readback) and blits them to a real swapchain,
+// frames from prosper_core's present layer and blits them to a real swapchain,
 // and handles SDL_QUIT/Esc via the shared stop request. run_entry does not consume that request yet,
 // so a booted guest uses direct process exit after the present loop (issue #352). To verify the
 // pipeline without a game dump the app can FEED the present layer a synthetic animated pattern
-// (--test-pattern): frame -> present_write_frame -> present_readback -> swapchain, exactly the path
+// (--test-pattern): frame -> present_write_frame -> shared frame lease -> swapchain, exactly the path
 // a real guest frame takes. P0b wires the actual guest boot in front of this (the same present
 // path, no changes here).
 //
 // Two Vulkan contexts by design (docs/FRONTEND_APP.md): the core keeps its headless render device;
-// THIS is a separate presentation device, and frames cross as CPU pixels via present_readback.
-#include "gpu/videoout_present.hpp"   // present_readback / present_write_frame / present_width/height/count
+// THIS is a separate presentation device, and frames cross as shared immutable CPU pixels.
+#include "gpu/videoout_present.hpp"   // present_acquire_rendered_frame / present_write_frame
 #include "host/lifecycle.hpp"          // prosper_request_stop / prosper_stop_requested
 #include "host/boot_program.hpp"       // boot_program (shared guest-boot path, also used by boot_trace)
 #include "host/exec_image.hpp"         // run_entry
@@ -469,15 +469,13 @@ int main(int argc, char** argv) {
         // In normal use a frame is "new" when the guest flips (present_count advances); test-pattern
         // has no flips, so treat every iteration as new.
         bool newFrame = testPattern || (gpu::present_count() != lastCount);
-        if (gpu::present_has_frame() && newFrame) {
-            uint32_t w = testPattern ? kPatW : gpu::present_width();
-            uint32_t h = testPattern ? kPatH : gpu::present_height();
+        gpu::PresentFrameLease frame;
+        if (newFrame && gpu::present_acquire_rendered_frame(frame)) {
+            uint32_t w = frame.width;
+            uint32_t h = frame.height;
             if (w == 0 || h == 0) { std::this_thread::sleep_for(std::chrono::milliseconds(2)); continue; }
-            static std::vector<uint8_t> buf;
-            buf.resize((size_t)w * h * 4);
-            size_t n = gpu::present_readback(buf.data(), buf.size());
-            if (n == buf.size()) {
-                if (!present_frame(vk, buf.data(), w, h)) {
+            if (frame.rgba && frame.rgba->size() == (size_t)w * h * 4) {
+                if (!present_frame(vk, frame.rgba->data(), w, h)) {
                     // out-of-date / resize: recreate the swapchain and retry next iteration.
                     vkDeviceWaitIdle(vk.device);
                     vkDestroySwapchainKHR(vk.device, vk.swapchain, nullptr); vk.swapchain = VK_NULL_HANDLE;

@@ -23,7 +23,7 @@ and routed screenshot validation commands.
 ```
 prosper_core   (static lib — ZERO windowing/surface/OS-device deps; headless; CI-tested)
      ▲ links
-     │      audio_set_sink() · pad_set_backend() · present_* readback · run/request_stop()
+     │      audio_set_sink() · pad_set_backend() · present frame lease · run/request_stop()
 frontends/prosper-app   (new binary — owns ALL OS integration, via SDL3)
 ```
 
@@ -59,17 +59,21 @@ void pad_set_backend(PadBackend*);   // nullptr restores the neutral (no-device)
 Frontend supplies an **SDL3 `GameController` backend**, mapping SDL buttons/axes → `HostPadState`.
 The pad header already documents frontends installing this from the harness.
 
-### 3. Video — the present readback (exists, `src/gpu/videoout_present.hpp`)
+### 3. Video — rendered-frame ownership (exists, `src/gpu/videoout_present.hpp`)
 ```cpp
-bool     present_has_frame();
-uint32_t present_width();  uint32_t present_height();
-uint64_t present_count();                 // total flips presented (advances on guest flip)
-size_t   present_readback(void* dst, size_t dst_cap);   // copy the presented frame's pixels (w*h*4)
+struct PresentFrameLease {
+    uint64_t frame_seq;
+    uint32_t width, height;
+    std::shared_ptr<const std::vector<uint8_t>> rgba;
+};
+bool present_acquire_rendered_frame(PresentFrameLease& out);
+size_t present_readback(void* dst, size_t dst_cap); // compatibility/capture copy
 ```
-On each guest flip the renderer writes the finished frame into the scanout buffer; `present_readback`
-hands out those **CPU pixels**. The frontend polls `present_count()` for a new frame and blits the
-readback into its swapchain. This is the whole video boundary — the frontend is a pure *consumer* of
-finished frames.
+The renderer's selected scanout, the present layer, and `prosper-app` share one immutable CPU-pixel
+allocation. Acquiring a lease does not copy the image, and its storage stays valid if the renderer
+publishes a newer frame while the app uploads the old one. Screenshot, capture, replay, and legacy
+readback APIs deliberately retain copying semantics. The frontend remains a pure *consumer* of finished
+frames and polls `present_count()` for guest flip pacing.
 
 ### 4. Lifecycle — stop request exists; guest consumption remains
 The frontend has the minimal, headless-agnostic control:
@@ -85,17 +89,19 @@ guest caused a reproducible Windows access violation when static teardown raced 
 The remaining lifecycle work is a guest flip-boundary check followed by a real join and normal
 teardown (#352).
 
-## The Vulkan-context decision: two contexts, frames cross as CPU pixels
+## The Vulkan-context decision: two contexts, one shared CPU frame
 
 **The frontend owns its own Vulkan context (instance + device + swapchain on the window surface).
-The core keeps its existing headless render device. Frames cross the boundary as CPU pixels via
-`present_readback`.** Rationale:
+The core keeps its existing headless render device. Frames cross the boundary through immutable shared
+CPU storage acquired with `present_acquire_rendered_frame`.** Rationale:
 
 - The core's render device stays **surface-free and unchanged** — no swapchain dependency leaks into
   the renderer, no `#ifdef`, headless + CI identical.
 - The seam already emits CPU pixels, so the frontend is a pure consumer — the cleanest boundary, and
   the same seam becomes a shared-memory frame ring if the two are ever split into separate processes.
-- Cost = one readback + one upload per frame. The Messenger is 2D at 1080p (~8 MB/frame), but native
+- Cost = the renderer's required GPU readback plus one frontend upload per frame. There are no
+  renderer-cache-to-return, return-to-present, or present-to-app copies. The Messenger is 2D at 1080p
+  (~8 MB/frame), but native
   Windows measurements showed that memory-type selection matters: uncached host-visible readback cost
   roughly 570 ms per frame on an RTX 4090, versus about 1.8 ms with `HOST_CACHED` memory.
 
@@ -115,8 +121,8 @@ init:  SDL_Init(VIDEO|AUDIO|GAMECONTROLLER); create window;
 
 frame: SDL_PollEvent → on SDL_QUIT / window-close: prosper_request_stop(); break;
        if present_count() advanced since last shown:
-           n = present_readback(staging_mapped, cap);
-           upload staging → VkImage; blit/scale VkImage → acquired swapchain image; vkQueuePresentKHR;
+           lease = present_acquire_rendered_frame();
+           upload lease.rgba → VkImage; blit/scale VkImage → acquired swapchain image; vkQueuePresentKHR;
        else: small sleep / wait on a frame condvar to avoid spinning.
 
 quit target: prosper_request_stop(); join guest thread; destroy swapchain/device/window; SDL_Quit().
@@ -128,8 +134,9 @@ Handle swapchain resize (`present_width/height` change or window resize → recr
 ## Threading
 
 - **Guest run-loop thread**: drives the guest (as `boot_trace` does), renders into scanout on flip.
-- **Main/UI thread**: SDL event pump + swapchain present. It only *reads* via `present_readback`
-  (already mutex-guarded: renderer writes, present reads) — no new shared state.
+- **Main/UI thread**: SDL event pump + swapchain present. It holds an immutable shared frame lease
+  while copying to its Vulkan staging allocation; publication only swaps shared ownership under the
+  present mutex.
 - Audio/pad callbacks run on whatever thread the core calls them from; the SDL sink/backend must be
   thread-safe (the pad header already requires it).
 

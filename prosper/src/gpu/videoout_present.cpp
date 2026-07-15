@@ -25,7 +25,7 @@ std::atomic<uint64_t> g_frame_seq{0};   // # of rendered frames handed in via pr
 // The rendered frame the back-half hands us (the "scanout" image). Guarded by a mutex because the
 // renderer thread writes it while guest threads / tests read it via present_readback.
 std::mutex           g_frame_mx;
-std::vector<uint8_t> g_frame;      // w*h*4 bytes when a frame is present
+std::shared_ptr<const std::vector<uint8_t>> g_frame; // w*h*4 bytes when a frame is present
 uint32_t             g_frame_w = 0, g_frame_h = 0;
 std::atomic<bool>    g_have_frame{false};
 }
@@ -33,9 +33,16 @@ std::atomic<bool>    g_have_frame{false};
 void present_write_frame(const void* pixels, uint32_t w, uint32_t h) {
     if (!pixels || !w || !h) return;
     size_t bytes = (size_t)w * h * 4;
+    auto owned = std::make_shared<std::vector<uint8_t>>(bytes);
+    std::memcpy(owned->data(), pixels, bytes);
+    present_write_frame(std::move(owned), w, h);
+}
+
+void present_write_frame(std::shared_ptr<const std::vector<uint8_t>> pixels,
+                         uint32_t w, uint32_t h) {
+    if (!pixels || !w || !h || pixels->size() != (size_t)w * h * 4) return;
     std::lock_guard<std::mutex> lk(g_frame_mx);
-    g_frame.resize(bytes);
-    std::memcpy(g_frame.data(), pixels, bytes);
+    g_frame = std::move(pixels);
     g_frame_w = w; g_frame_h = h;
     g_have_frame.store(true, std::memory_order_release);
     g_frame_seq.fetch_add(1, std::memory_order_relaxed);
@@ -85,9 +92,9 @@ size_t present_readback(void* dst, size_t dst_cap) {
     // Prefer the real rendered frame from the back-half, if one has been handed in.
     if (g_have_frame.load(std::memory_order_acquire)) {
         std::lock_guard<std::mutex> lk(g_frame_mx);
-        if (!g_frame.empty() && dst_cap >= g_frame.size()) {
-            std::memcpy(dst, g_frame.data(), g_frame.size());
-            return g_frame.size();
+        if (g_frame && !g_frame->empty() && dst_cap >= g_frame->size()) {
+            std::memcpy(dst, g_frame->data(), g_frame->size());
+            return g_frame->size();
         }
         return 0;
     }
@@ -103,13 +110,25 @@ size_t present_readback(void* dst, size_t dst_cap) {
     return bytes;
 }
 
+bool present_acquire_rendered_frame(PresentFrameLease& out) {
+    out = {};
+    if (!g_have_frame.load(std::memory_order_acquire)) return false;
+    std::lock_guard<std::mutex> lk(g_frame_mx);
+    if (!g_frame || g_frame->empty() || !g_frame_w || !g_frame_h) return false;
+    out.frame_seq = g_frame_seq.load(std::memory_order_relaxed);
+    out.width = g_frame_w;
+    out.height = g_frame_h;
+    out.rgba = g_frame;
+    return true;
+}
+
 bool present_snapshot(PresentSnapshot& out) {
     out = {};
     // frame_seq is incremented while holding this mutex, after the pixels and dimensions are
     // installed, so the copied bytes and identity describe the same renderer publication.
     if (g_have_frame.load(std::memory_order_acquire)) {
         std::lock_guard<std::mutex> lk(g_frame_mx);
-        if (g_frame.empty() || !g_frame_w || !g_frame_h) return false;
+        if (!g_frame || g_frame->empty() || !g_frame_w || !g_frame_h) return false;
         out.source = PresentSource::Rendered;
         out.frame_seq = g_frame_seq.load(std::memory_order_relaxed);
         out.source_seq = out.frame_seq;
@@ -117,7 +136,7 @@ bool present_snapshot(PresentSnapshot& out) {
         out.front_index = g_front.load(std::memory_order_relaxed);
         out.width = g_frame_w;
         out.height = g_frame_h;
-        out.rgba = g_frame;
+        out.rgba = *g_frame;
         return true;
     }
 
@@ -143,7 +162,7 @@ void present_reset() {
     g_front.store(-1, std::memory_order_relaxed);
     g_present_count.store(0, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lk(g_frame_mx);
-    g_frame.clear(); g_frame_w = g_frame_h = 0;
+    g_frame.reset(); g_frame_w = g_frame_h = 0;
     g_frame_seq.store(0, std::memory_order_relaxed);   // #399: reset the rendered-frame counter too
     g_have_frame.store(false, std::memory_order_release);
 }

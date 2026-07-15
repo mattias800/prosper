@@ -2252,9 +2252,9 @@ OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& op
         if (span.empty() || !render) return;
         LiveRenderPhase saved = g_live_phase;
         g_live_phase = {result.render_spans == 0, result.render_spans + 1 == total_spans};
-        std::vector<uint8_t> rendered = render(span, width, height);
+        RenderedFrame rendered = render(span, width, height);
         g_live_phase = saved;
-        if (!rendered.empty()) result.pixels = std::move(rendered);
+        if (!rendered.empty()) result.frame = std::move(rendered);
         span.clear();
         ++result.render_spans;
     };
@@ -2290,7 +2290,9 @@ void notify_guest_gpu_write(uint64_t addr, uint64_t size) {
 LiveRenderPhase live_render_phase()       { return g_live_phase; }
 std::vector<uint8_t> render_submit_items(const std::vector<DrawItem>& items,
                                          uint32_t width, uint32_t height) {
-    return g_live ? g_live(items, width, height) : std::vector<uint8_t>{};
+    if (!g_live) return {};
+    RenderedFrame frame = g_live(items, width, height);
+    return frame.storage ? *frame.storage : std::vector<uint8_t>{};
 }
 bool execute_compute_items(const std::vector<ComputeItem>& items) {
     return g_compute && !items.empty() && g_compute(items);
@@ -2339,7 +2341,7 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
     OrderedSubmitResult result = execute_ordered_items(
         operations, draws, computes, g_live, g_compute, width, height);
     const auto timing_backend_done = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
-    std::vector<uint8_t>& px = result.pixels;
+    const std::vector<uint8_t>& px = result.frame.bytes();
 
     if (pending_capture) {
         std::string error;
@@ -2347,7 +2349,7 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
             std::fprintf(stderr, "[gpucap] write failed: %s\n", error.c_str());
     }
     const bool presented = px.size() == static_cast<size_t>(width) * height * 4;
-    if (presented) present_write_frame(px.data(), width, height);
+    if (presented) present_write_frame(result.frame.storage, width, height);
     if (timing_enabled) {
         const auto timing_done = TimingClock::now();
         auto ms = [](auto begin, auto end) {
@@ -2446,25 +2448,22 @@ bool execute_and_present(const GpuState& st, uint32_t width, uint32_t height) {
     uint32_t fw = present_width(), fh = present_height();
     float sx = fw ? (float)width  / (float)fw : 1.0f;
     float sy = fh ? (float)height / (float)fh : 1.0f;
-    std::vector<uint8_t> px = execute_gpustate(st,
-        [&](const std::vector<DrawItem>& items) {
-            std::vector<SubmitOperation> operations;
-            operations.reserve(items.size());
-            for (const auto& item : items)
-                operations.push_back({SubmitOperationKind::Draw,
-                                      static_cast<size_t>(item.draw_index), item.command_order});
-            auto pending = begin_requested_gpu_capture(items, {}, operations, width, height);
-            std::vector<uint8_t> rendered = g_live(items, width, height);
-            if (pending) {
-                std::string error;
-                if (!finish_requested_gpu_capture(std::move(pending), rendered, error))
-                    std::fprintf(stderr, "[gpucap] write failed: %s\n", error.c_str());
-            }
-            return rendered;
-        },
-        0x10000, sx, sy);
-    if (px.size() != static_cast<size_t>(width) * height * 4) return false;   // recompile/render failed
-    present_write_frame(px.data(), width, height);
+    std::vector<DrawItem> items = realize_gpustate_draws(st, 0x10000, sx, sy);
+    if (items.empty()) return false;
+    std::vector<SubmitOperation> operations;
+    operations.reserve(items.size());
+    for (const auto& item : items)
+        operations.push_back({SubmitOperationKind::Draw,
+                              static_cast<size_t>(item.draw_index), item.command_order});
+    auto pending = begin_requested_gpu_capture(items, {}, operations, width, height);
+    RenderedFrame rendered = g_live(items, width, height);
+    if (pending) {
+        std::string error;
+        if (!finish_requested_gpu_capture(std::move(pending), rendered.bytes(), error))
+            std::fprintf(stderr, "[gpucap] write failed: %s\n", error.c_str());
+    }
+    if (rendered.size() != static_cast<size_t>(width) * height * 4) return false;
+    present_write_frame(rendered.storage, width, height);
     return true;
 }
 

@@ -13,6 +13,7 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
+#include <memory>
 #include <vector>
 
 namespace prosper::gpu {
@@ -33,6 +34,15 @@ struct PresentSnapshot {
     std::vector<uint8_t> rgba;
 };
 
+// Lifetime-safe access to the current rendered frame without copying its pixels. The immutable
+// storage remains valid after a newer frame is published or present_reset() is called.
+struct PresentFrameLease {
+    uint64_t frame_seq = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::shared_ptr<const std::vector<uint8_t>> rgba;
+};
+
 // Present the display buffer `buffer_index` (from sceVideoOutSubmitFlip). Records it as the front
 // buffer and bumps the present counter. `flip_arg` is the guest's flip label (echoed in flip status).
 void present_flip(int buffer_index, int64_t flip_arg);
@@ -42,6 +52,8 @@ void present_flip(int buffer_index, int64_t flip_arg);
 // pixels — instead of the raw guest display buffer, closing the loop shader → render →
 // present_write_frame → present_readback. Thread-safe (renderer writes, present reads).
 void present_write_frame(const void* pixels, uint32_t w, uint32_t h);
+void present_write_frame(std::shared_ptr<const std::vector<uint8_t>> pixels,
+                         uint32_t w, uint32_t h);
 
 // True once a rendered frame has been handed in (readback returns rendered pixels, not the guest buffer).
 bool present_has_frame();
@@ -60,6 +72,10 @@ uint32_t present_frame_height();
 // Copy the presented frame's pixels (width*height, 4 bytes/pixel) from the front buffer's guest
 // memory into `dst`. Returns bytes written, or 0 if there is no surface / no flip yet / dst too small.
 size_t present_readback(void* dst, size_t dst_cap);
+
+// Acquire immutable shared ownership of the latest rendered frame. Unlike present_readback(), this
+// does not copy pixels and never falls back to raw guest scanout.
+bool present_acquire_rendered_frame(PresentFrameLease& out);
 
 // Copy the best available frame and its identity as one observation. Prefers a rendered frame and
 // falls back to the raw guest scanout. Returns false before either source is available.
