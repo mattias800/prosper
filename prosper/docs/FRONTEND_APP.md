@@ -185,6 +185,15 @@ lines at renderer submit N, so boot textures do not consume the cap before the s
 line identifies local reuse, persistent hit/miss/invalidation, RTT sourcing, or an uncached decode. The
 aggregate output also reports retained RTT bytes, decode-scratch capacity, and validation-scratch capacity;
 use those figures before treating a process-memory increase as an unbounded cache.
+
+Ordered graphics/compute submits retain a bounded journal of exact guest-memory ranges written by the
+compute backend. A persistent texture validated in an earlier graphics span can therefore skip its repeated
+full-byte scan when no later write overlaps it. Timing output reports these as `persistent-submit` details and
+`submit_reuse` aggregates, alongside the remaining exact validation count and bytes. Cross-submit reuse still
+uses exact comparison because guest CPU writes are not yet tracked. Set
+`PROSPER_NO_SUBMIT_TEXTURE_VALIDATION_REUSE=1` for the exact-validation A/B control. Set
+`PROSPER_AUDIT_SUBMIT_TEXTURE_VALIDATION_REUSE=1` to keep every comparison while checking and logging any
+disagreement with the journal's unchanged decision; use that audit before extending writer coverage.
 The instrumentation does not take clock samples when the variable is unset. This is the first tool
 to use when the window presents correctly but a title is not interactive; do not infer a GPU
 bottleneck from low FPS without the stage breakdown.

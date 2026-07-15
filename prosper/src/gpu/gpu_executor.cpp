@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <atomic>
 #include <bitset>
 #include <iterator>
 #include <mutex>
@@ -41,6 +42,48 @@ LiveRenderFn g_live;   // empty until the runtime/test registers a device-backed
 LiveComputeFn g_compute;   // synchronous compute backend, registered with the live Vulkan frontend
 GuestGpuWriteObserver g_guest_gpu_write_observer;
 thread_local LiveRenderPhase g_live_phase;
+
+struct GuestGpuWriteRange {
+    uint64_t addr = 0;
+    uint64_t size = 0;
+};
+struct GuestGpuWriteJournal {
+    bool active = false;
+    bool overflowed = false;
+    uint64_t submit_serial = 0;
+    std::vector<GuestGpuWriteRange> writes;
+};
+thread_local GuestGpuWriteJournal g_guest_gpu_writes;
+std::atomic<uint64_t> g_next_guest_gpu_submit_serial{0};
+
+bool ranges_overlap(uint64_t a, uint64_t a_size, uint64_t b, uint64_t b_size) {
+    if (!a_size || !b_size) return false;
+    return a <= b ? b - a < a_size : a - b < b_size;
+}
+
+class GuestGpuWriteSubmitScope {
+public:
+    GuestGpuWriteSubmitScope() {
+        // Ordered execution is synchronous and non-recursive. If that contract is ever broken,
+        // force conservative validation rather than silently losing the outer write history.
+        if (g_guest_gpu_writes.active) {
+            nested_ = true;
+            g_guest_gpu_writes.overflowed = true;
+            return;
+        }
+        g_guest_gpu_writes.active = true;
+        g_guest_gpu_writes.overflowed = false;
+        g_guest_gpu_writes.submit_serial =
+            g_next_guest_gpu_submit_serial.fetch_add(1, std::memory_order_relaxed) + 1;
+        g_guest_gpu_writes.writes.clear();
+    }
+    ~GuestGpuWriteSubmitScope() {
+        if (!nested_) g_guest_gpu_writes.active = false;
+    }
+
+private:
+    bool nested_ = false;
+};
 
 // Read a 32-dword user-data SGPR block from a stage's register file. `base` = the stage's
 // SPI_SHADER_USER_DATA_*_0 register offset; absent registers read as 0. 32 (not 16) because NGG merged
@@ -2218,6 +2261,7 @@ OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& op
                                           const LiveRenderFn& render,
                                           const LiveComputeFn& compute,
                                           uint32_t width, uint32_t height) {
+    GuestGpuWriteSubmitScope guest_gpu_write_scope;
     std::unordered_map<size_t, size_t> draw_by_index, compute_by_index;
     for (size_t i = 0; i < draws.size(); ++i) draw_by_index[draws[i].draw_index] = i;
     for (size_t i = 0; i < computes.size(); ++i)
@@ -2285,7 +2329,32 @@ void set_guest_gpu_write_observer(GuestGpuWriteObserver observer) {
     g_guest_gpu_write_observer = std::move(observer);
 }
 void notify_guest_gpu_write(uint64_t addr, uint64_t size) {
-    if (addr && size && g_guest_gpu_write_observer) g_guest_gpu_write_observer(addr, size);
+    if (!addr || !size) return;
+    if (g_guest_gpu_writes.active) {
+        if (g_guest_gpu_writes.writes.size() < kGuestGpuWriteJournalCapacity)
+            g_guest_gpu_writes.writes.push_back({addr, size});
+        else
+            g_guest_gpu_writes.overflowed = true;
+    }
+    if (g_guest_gpu_write_observer) g_guest_gpu_write_observer(addr, size);
+}
+GuestGpuWriteSnapshot guest_gpu_write_snapshot() {
+    if (!g_guest_gpu_writes.active || g_guest_gpu_writes.overflowed) return {};
+    return {g_guest_gpu_writes.submit_serial, g_guest_gpu_writes.writes.size()};
+}
+GuestGpuWriteQuery guest_gpu_writes_since(const GuestGpuWriteSnapshot& snapshot,
+                                           uint64_t addr, uint64_t size) {
+    if (!snapshot.submit_serial || !g_guest_gpu_writes.active ||
+        snapshot.submit_serial != g_guest_gpu_writes.submit_serial ||
+        g_guest_gpu_writes.overflowed ||
+        snapshot.write_count > g_guest_gpu_writes.writes.size())
+        return GuestGpuWriteQuery::Unknown;
+    for (size_t i = snapshot.write_count; i < g_guest_gpu_writes.writes.size(); ++i) {
+        const auto& write = g_guest_gpu_writes.writes[i];
+        if (ranges_overlap(addr, size, write.addr, write.size))
+            return GuestGpuWriteQuery::Overlap;
+    }
+    return GuestGpuWriteQuery::Unchanged;
 }
 LiveRenderPhase live_render_phase()       { return g_live_phase; }
 std::vector<uint8_t> render_submit_items(const std::vector<DrawItem>& items,

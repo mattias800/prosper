@@ -100,6 +100,9 @@ int main() {
         uint32_t aliased_value = 7;
         std::vector<uint32_t> observed;
         std::vector<LiveRenderPhase> phases;
+        GuestGpuWriteSnapshot validation;
+        GuestGpuWriteQuery overlapping = GuestGpuWriteQuery::Unknown;
+        GuestGpuWriteQuery unrelated = GuestGpuWriteQuery::Unknown;
         DrawItem first, second;
         first.draw_index = 0;
         second.draw_index = 1;
@@ -108,10 +111,17 @@ int main() {
         LiveRenderFn observe = [&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
             for (size_t i = 0; i < items.size(); ++i) observed.push_back(aliased_value);
             phases.push_back(live_render_phase());
+            if (phases.size() == 1) {
+                validation = guest_gpu_write_snapshot();
+            } else {
+                overlapping = guest_gpu_writes_since(validation, 0x2080, 16);
+                unrelated = guest_gpu_writes_since(validation, 0x4000, 16);
+            }
             return std::vector<uint8_t>(4, static_cast<uint8_t>(aliased_value));
         };
         LiveComputeFn mutate = [&](const std::vector<ComputeItem>&) {
             aliased_value = 9;
+            notify_guest_gpu_write(0x2000, 0x100);
             return true;
         };
         OrderedSubmitResult ordered = execute_ordered_items(
@@ -122,6 +132,41 @@ int main() {
               phases[0].first_span && !phases[0].final_span &&
               !phases[1].first_span && phases[1].final_span,
               "ordered executor brackets one submit across two graphics spans");
+        CHECK(overlapping == GuestGpuWriteQuery::Overlap &&
+              unrelated == GuestGpuWriteQuery::Unchanged,
+              "write journal distinguishes overlapping and unrelated in-submit GPU writes");
+        CHECK(guest_gpu_writes_since(validation, 0x4000, 16) == GuestGpuWriteQuery::Unknown,
+              "write journal snapshots cannot suppress validation after submit completion");
+    }
+
+    // Overflow or otherwise incomplete write history must fall back to exact validation.
+    {
+        DrawItem first, second;
+        first.draw_index = 0;
+        second.draw_index = 1;
+        ComputeItem fill;
+        fill.dispatch_index = 0;
+        const std::vector<SubmitOperation> operations = {
+            {SubmitOperationKind::Draw, 0, 100},
+            {SubmitOperationKind::Dispatch, 0, 200},
+            {SubmitOperationKind::Draw, 1, 300},
+        };
+        GuestGpuWriteSnapshot validation;
+        GuestGpuWriteQuery after_overflow = GuestGpuWriteQuery::Unchanged;
+        size_t renders = 0;
+        LiveRenderFn observe = [&](const std::vector<DrawItem>&, uint32_t, uint32_t) {
+            if (renders++ == 0) validation = guest_gpu_write_snapshot();
+            else after_overflow = guest_gpu_writes_since(validation, 0x8000, 16);
+            return std::vector<uint8_t>(4, 0);
+        };
+        LiveComputeFn overflow = [&](const std::vector<ComputeItem>&) {
+            for (size_t i = 0; i <= kGuestGpuWriteJournalCapacity; ++i)
+                notify_guest_gpu_write(0x100000 + i * 0x10, 1);
+            return true;
+        };
+        execute_ordered_items(operations, {first, second}, {fill}, observe, overflow, 1, 1);
+        CHECK(after_overflow == GuestGpuWriteQuery::Unknown,
+              "write journal overflow forces conservative validation");
     }
 
     // #611: a compute fast-clear writes HTILE guest memory between graphics spans. The detached

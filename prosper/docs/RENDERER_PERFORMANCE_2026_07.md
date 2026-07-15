@@ -304,6 +304,37 @@ for one 1024x2048 image on every graphics span. `PROSPER_RENDER_TIMING=detail` l
 local reuse, persistent hit/miss/invalidation, RTT source, or uncached decode. Replacing exact validation
 requires write-aware invalidation; probabilistic sampling is not an acceptable correctness shortcut.
 
+## Same-submit write-aware validation (2026-07-15)
+
+Ordered execution now opens a backend-neutral, bounded journal for each synchronous submit. Compute buffer
+and storage-image writeback already reports exact guest ranges through `notify_guest_gpu_write`; later
+graphics spans query only events after the cache entry's last successful validation. An unrelated write proves
+the source unchanged, an overlap forces an exact comparison, and a different submit, inactive scope, nested
+execution, or 4,096-event overflow also falls back to exact comparison. DMA_DATA and WRITE_DATA currently
+execute during command-buffer folding before ordered backend execution, so the first graphics span's exact
+comparison observes them; they are not silently treated as between-span events.
+
+Cross-submit validation is intentionally unchanged. Guest CPU writes need authoritative dirty-page tracking
+before the exact comparison can be removed there. `PROSPER_NO_SUBMIT_TEXTURE_VALIDATION_REUSE=1` disables the
+same-submit shortcut. `PROSPER_AUDIT_SUBMIT_TEXTURE_VALIDATION_REUSE=1` exercises every proposed shortcut but
+still performs the old exact comparison. A 180-second native Windows Dead Cells audit reached `PrisonStart`,
+completed `PARSEALL`, exercised 1,196 cumulative shortcuts, and reported zero disagreements.
+
+The fully rendered route is animated and the compared four-span windows contained different draw counts, so
+whole-submit figures are directional rather than a strict benchmark. The resource-specific reduction is
+directly counted:
+
+| Four-span window | Exact validations/submit | Validated bytes/submit | Texture resource time | Resource build |
+|---|---:|---:|---:|---:|
+| Audit, exact comparisons retained | 28 | 275.8 MiB | 40.2-40.4 ms | 49.9-50.3 ms |
+| Write-aware shortcut enabled | 22 | 145.1 MiB | 30.5-30.7 ms | 40.8-41.2 ms |
+
+The audit window's whole submit was about 202 ms with 348 draws; the optimized window was 196-199 ms with
+386 draws. Reported app rate remained about 4.3 FPS, confirming this is a bounded frontend improvement rather
+than the dominant remaining renderer cost. The optimized run ended stable near 1.81 GiB private and 3.79 GiB
+working set. The next large performance work remains persistent Vulkan object reuse and fewer synchronous
+graphics/compute/readback boundaries.
+
 ## Current frame budget
 
 After shared publication, the Dead Cells post-parse loading workload is the most useful current budget:
