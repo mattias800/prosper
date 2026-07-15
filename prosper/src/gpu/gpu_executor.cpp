@@ -335,12 +335,26 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
             result->terminated = last.is_end || last.fmt == Rdna2Format::Unknown ||
                                  last.len_dwords == 0;
         }
-        // The fold ignores vector/control/export instructions unless the decoder reports an SGPR
-        // destination (the conservative unknown-value invalidation). Retain only instructions that can
-        // affect its state or emit a descriptor use, preserving their original order and PCs.
+        // The fold ignores most vector/control/export instructions unless the decoder reports an SGPR
+        // destination (the conservative unknown-value invalidation). Scalar lane spills are the exception:
+        // retain their spill VGPR writes too, so an ordinary VGPR write invalidates any saved lane values.
+        std::set<int> scalar_spill_vgprs;
+        for (const Rdna2Inst& instruction : decoded) {
+            if (instruction.fmt != Rdna2Format::VOP3) continue;
+            if (instruction.opcode == 0x361 && instruction.dst.kind == OperandKind::VGPR)
+                scalar_spill_vgprs.insert(instruction.dst.value);       // v_writelane_b32
+            else if (instruction.opcode == 0x360 && instruction.src[0].kind == OperandKind::VGPR)
+                scalar_spill_vgprs.insert(instruction.src[0].value);    // v_readlane_b32
+        }
+        // Retain only instructions that can affect fold state or emit a descriptor use, preserving
+        // their original order and PCs.
         result->instructions.reserve(decoded.size());
         for (const Rdna2Inst& instruction : decoded) {
             if (instruction.is_end) break;
+            const bool scalar_spill = instruction.fmt == Rdna2Format::VOP3 &&
+                                      (instruction.opcode == 0x360 || instruction.opcode == 0x361);
+            const bool scalar_spill_invalidation = instruction.dst.kind == OperandKind::VGPR &&
+                                                   scalar_spill_vgprs.contains(instruction.dst.value);
             const bool fold_format = instruction.fmt == Rdna2Format::SOP1 ||
                                      instruction.fmt == Rdna2Format::SOP2 ||
                                      instruction.fmt == Rdna2Format::SOPC ||
@@ -348,7 +362,8 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
                                      instruction.fmt == Rdna2Format::SMEM ||
                                      instruction.fmt == Rdna2Format::MIMG ||
                                      instruction.fmt == Rdna2Format::MUBUF;
-            if (fold_format || instruction.dst.kind == OperandKind::SGPR)
+            if (fold_format || scalar_spill || scalar_spill_invalidation ||
+                instruction.dst.kind == OperandKind::SGPR)
                 result->instructions.push_back(instruction);
         }
         result->bytes = static_cast<uint64_t>(result->code.size()) * sizeof(uint32_t) +
@@ -768,6 +783,12 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     constexpr size_t kFoldSgprs = 128;
     std::array<uint32_t, kFoldSgprs> val{};                 // concrete SGPR values
     std::bitset<kFoldSgprs> val_known;
+    // Descriptor provenance attached to the CURRENT scalar value. Unlike the load-time snapshots
+    // below, this follows s_mov shuffles and is cleared by arithmetic/data writes. A key-less value
+    // uses exact consuming-pc provenance, matching the recompiler after scalar spills.
+    std::array<uint32_t, kFoldSgprs> val_srt_key{};
+    std::bitset<kFoldSgprs> val_srt_key_known;
+    std::unordered_map<uint32_t, uint32_t> scalar_spill_slots; // (VGPR << 6) | lane -> scalar value
     std::array<std::array<uint32_t, 4>, kFoldSgprs> descr{}; // load-time V# snapshots by base SGPR
     std::bitset<kFoldSgprs> descr_known;
     // Descriptor-TABLE provenance (#294): for each snapshotted 4/8-dword s_load, the load's IMMEDIATE
@@ -788,9 +809,18 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
     // SGPRs). So user-data block index k lands in shader SGPR (user_sgpr_base + k).
     auto valid_reg = [](int r) { return r >= 0 && r < (int)kFoldSgprs; };
     auto set_value = [&](int r, uint32_t v) {
-        if (valid_reg(r)) { val[(size_t)r] = v; val_known.set((size_t)r); }
+        if (valid_reg(r)) {
+            val[(size_t)r] = v;
+            val_known.set((size_t)r);
+            val_srt_key_known.reset((size_t)r);
+        }
     };
-    auto forget = [&](int r) { if (valid_reg(r)) val_known.reset((size_t)r); };
+    auto forget = [&](int r) {
+        if (valid_reg(r)) {
+            val_known.reset((size_t)r);
+            val_srt_key_known.reset((size_t)r);
+        }
+    };
     for (uint32_t i = 0; i < nsgpr; i++)
         set_value((int)(user_sgpr_base + i), user_sgprs[i]);
 
@@ -826,13 +856,29 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
 
     for (const auto& in : ins) {
         if (in.is_end) break;
+        const bool scalar_spill = in.fmt == Rdna2Format::VOP3 &&
+                                  (in.opcode == 0x360 || in.opcode == 0x361);
+        if (!scalar_spill && in.dst.kind == OperandKind::VGPR) {
+            // Any ordinary write replaces the whole vector result. Drop scalar values previously
+            // packed into that VGPR's lanes rather than restoring stale descriptor words later.
+            for (uint32_t lane = 0; lane < 64; ++lane)
+                scalar_spill_slots.erase(((uint32_t)in.dst.value << 6) | lane);
+        }
         switch (in.fmt) {
             case Rdna2Format::SOP1:
                 if (in.opcode == 0x03) {                        // s_mov_b32
-                    uint32_t v;
-                    if (in.src[0].kind == OperandKind::Literal ? (v = in.literal, true) : srcval(in.src[0], v))
+                    uint32_t v, source_key = 0;
+                    const bool source_key_known =
+                        in.src[0].kind == OperandKind::SGPR && valid_reg(in.src[0].value) &&
+                        val_srt_key_known.test((size_t)in.src[0].value) &&
+                        (source_key = val_srt_key[(size_t)in.src[0].value], true);
+                    if (in.src[0].kind == OperandKind::Literal ? (v = in.literal, true) : srcval(in.src[0], v)) {
                         set_value(in.dst.value, v);
-                    else forget(in.dst.value);
+                        if (source_key_known && valid_reg(in.dst.value)) {
+                            val_srt_key[(size_t)in.dst.value] = source_key;
+                            val_srt_key_known.set((size_t)in.dst.value);
+                        }
+                    } else forget(in.dst.value);
                 } else if (in.dst.kind == OperandKind::SGPR) {
                     // Not the modeled s_mov_b32 -> the dest is unknown. Erase the PAIR: 64-bit SOP1 ops
                     // (s_mov_b64, s_getpc_b64, s_and/or/xor/not_b64, s_*_saveexec_b64, …) write
@@ -946,13 +992,36 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // snapshotted from a table load, report it as a ConstantBuffer use keyed by its load
                 // immediate (matching the recompiler's sreg_srt tag). Recorded BEFORE the dest write
                 // below (SBASE and SDST ranges may overlap).
+                SrtUse pending_srt_use;
+                bool have_pending_srt_use = false;
                 if (srt_uses && is_buffer) {
-                    if (valid_reg(sbase) && descr_known.test((size_t)sbase) &&
-                        descr_key_known.test((size_t)sbase) &&
-                        descr_key[(size_t)sbase] != 0xFFFFFFFFu) {
-                        SrtUse u; u.kind = 1; u.key = descr_key[(size_t)sbase];
-                        u.v4 = descr[(size_t)sbase];
-                        srt_uses->push_back(u);
+                    bool current_known = true, current_key_known = true;
+                    uint32_t current_key = 0;
+                    for (int k = 0; k < 4; ++k) {
+                        if (!valid_reg(sbase + k) || !val_known.test((size_t)(sbase + k)))
+                            current_known = false;
+                        if (!valid_reg(sbase + k) || !val_srt_key_known.test((size_t)(sbase + k))) {
+                            current_key_known = false;
+                        } else if (k == 0) {
+                            current_key = val_srt_key[(size_t)sbase];
+                        } else if (val_srt_key[(size_t)(sbase + k)] != current_key) {
+                            current_key_known = false;
+                        }
+                    }
+                    if (current_known && current_key_known) {
+                        pending_srt_use.kind = 1;
+                        pending_srt_use.key = current_key;
+                        for (int k = 0; k < 4; ++k)
+                            pending_srt_use.v4[(size_t)k] = val[(size_t)(sbase + k)];
+                        pending_srt_use.use_pc = in.pc;
+                        have_pending_srt_use = true;
+                    } else if (valid_reg(sbase) && descr_known.test((size_t)sbase) &&
+                               descr_key_known.test((size_t)sbase)) {
+                        pending_srt_use.kind = 1;
+                        pending_srt_use.key = descr_key[(size_t)sbase];
+                        pending_srt_use.v4 = descr[(size_t)sbase];
+                        pending_srt_use.use_pc = in.pc;
+                        have_pending_srt_use = true;
                     }
                 }
                 for (uint32_t k = 0; k < n; k++)
@@ -974,6 +1043,13 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // negative offset subtracts from the base instead of wrapping to a huge address.
                 const int64_t byte_off = (int64_t)(int32_t)in.literal + (int64_t)soff_val;
                 uint64_t addr = (base + (uint64_t)byte_off) & ~3ull;
+                if (have_pending_srt_use) {
+                    const int64_t required = byte_off + (int64_t)n * 4;
+                    if (required > 0 && required <= (int64_t)UINT32_MAX) {
+                        pending_srt_use.required_size = (uint32_t)required;
+                        srt_uses->push_back(pending_srt_use);
+                    }
+                }
                 // AGC scalar-pointer user data can carry aperture/tag bits above the title's usable
                 // GPU VA. Real GFX10 S_LOAD addresses are canonicalized by the memory system; a raw
                 // host dereference is not. Prefer the exact 64-bit address, then (only when it is
@@ -999,11 +1075,18 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 if (!addr_readable) { if (trc) fprintf(stderr, "[dyntrace]   addr 0x%llx unreadable\n", (unsigned long long)addr);
                                       for (uint32_t k = 0; k < n; k++) forget(sdst + (int)k); break; }
                 const uint32_t* mem = (const uint32_t*)(uintptr_t)addr;
+                const bool imm_only = (soff_field == 125) && (int32_t)in.literal >= 0;   // SGPR_NULL soffset
                 for (uint32_t k = 0; k < n; k++) set_value(sdst + (int)k, mem[k]);
+                if ((n == 4 || n == 8) && valid_reg(sdst) && valid_reg(sdst + (int)n - 1)) {
+                    const uint32_t key = (imm_only && !is_buffer) ? in.literal : 0xFFFFFFFFu;
+                    for (uint32_t k = 0; k < n; ++k) {
+                        val_srt_key[(size_t)(sdst + (int)k)] = key;
+                        val_srt_key_known.set((size_t)(sdst + (int)k));
+                    }
+                }
                 // Provenance key: the recompiler tags an IMMEDIATE-only descriptor load's dest SGPRs
                 // with the load immediate (sreg_srt = in.literal); register-SOFFSET / negative loads
                 // are not tagged, so mark those snapshots key-less.
-                const bool imm_only = (soff_field == 125) && (int32_t)in.literal >= 0;   // SGPR_NULL soffset
                 // A 4-dword load is a V# candidate — snapshot it now (before any later stride patch) so a
                 // vertex fetch using these SGPRs resolves to the descriptor as loaded. An 8-dword load is
                 // a T# candidate (image_sample SRSRC), snapshotted the same way (#294).
@@ -1022,6 +1105,13 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                               descr8_key[(size_t)sdst] = (imm_only && !is_buffer)
                                   ? in.literal : 0xFFFFFFFFu;
                               descr8_key_known.set((size_t)sdst);
+                              // SGPR loads are typeless: a later scalar buffer load may consume the
+                              // first four words of this eight-dword result as a V#. Keep both views;
+                              // only an actual buffer consumer reports the V# candidate.
+                              descr[(size_t)sdst] = { mem[0], mem[1], mem[2], mem[3] };
+                              descr_known.set((size_t)sdst);
+                              descr_key[(size_t)sdst] = descr8_key[(size_t)sdst];
+                              descr_key_known.set((size_t)sdst);
                 }
                 break;
             }
@@ -1207,6 +1297,35 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 }
                 break;
             }
+            case Rdna2Format::VOP3:
+                // Scalar spill slots used by large UE shaders: v_writelane_b32 packs wave-uniform
+                // SGPR values into fixed VGPR lanes, then v_readlane_b32 restores them later. The
+                // recompiler deliberately drops SRT tags on restore, so recovered descriptors use
+                // key-less, exact-pc provenance.
+                if ((in.opcode == 0x361 || in.opcode == 0x360) &&
+                    in.src[1].kind == OperandKind::InlineInt &&
+                    in.src[1].value >= 0 && in.src[1].value < 64) {
+                    const uint32_t slot =
+                        ((uint32_t)(in.opcode == 0x361 ? in.dst.value : in.src[0].value) << 6) |
+                        (uint32_t)in.src[1].value;
+                    if (in.opcode == 0x361) {                         // v_writelane_b32 vDST, sSRC, lane
+                        uint32_t v;
+                        if (srcval(in.src[0], v)) scalar_spill_slots[slot] = v;
+                        else scalar_spill_slots.erase(slot);
+                    } else {                                          // v_readlane_b32 sDST, vSRC, lane
+                        auto it = scalar_spill_slots.find(slot);
+                        if (it == scalar_spill_slots.end()) {
+                            forget(in.dst.value);
+                        } else {
+                            set_value(in.dst.value, it->second);
+                            if (valid_reg(in.dst.value)) {
+                                val_srt_key[(size_t)in.dst.value] = 0xFFFFFFFFu;
+                                val_srt_key_known.set((size_t)in.dst.value);
+                            }
+                        }
+                    }
+                }
+                break;
             case Rdna2Format::SOPK:
                 // s_cmpk_* / s_addk_i32 write SCC (only s_movk/s_version/s_cmovk/s_mulk don't); this
                 // interpreter doesn't model SOPK, so ANY SOPK conservatively invalidates the tracked SCC —
@@ -1459,7 +1578,21 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     for (const auto& r0 : t.resources) if (r0.srt_offset == u.key) { clash = true; break; }
                 if (u.kind == 1) {                       // constant buffer / structured-buffer V#
                     DecodedBufferDescriptor d = decode_buffer_descriptor(u.v4.data());
-                    if (d.base <= 0x10000 || d.size_bytes == 0 || d.size_bytes > 0x10000000u) continue;
+                    if (d.base <= 0x10000) continue;
+                    uint32_t resource_size = d.size_bytes;
+                    uint32_t resource_stride = d.stride;
+                    if (resource_size == 0 || resource_size > 0x10000000u) {
+                        // Scalar SMEM only needs V#.Base plus the consuming load's exact byte span.
+                        // DOLL uses base-valid sharps whose other words do not describe a conventional
+                        // bounded buffer. Cap the pc-keyed upload to the observed access; the renderer's
+                        // safe copy preserves its usual zero-fill behavior for an unavailable guest page.
+                        if (u.key != 0xFFFFFFFFu || u.required_size == 0 ||
+                            u.required_size > (1u << 20)) continue;
+                        resource_size = u.required_size;
+                        resource_stride = 0;
+                    } else if (resource_size < u.required_size) {
+                        resource_size = u.required_size;
+                    }
                     // A keyed use whose key already resolves keeps the existing resource; a key-less
                     // (or key-clashed) use still needs a pc-provenance entry — piggyback the pc onto
                     // an existing resource describing the SAME buffer, else create one (#273).
@@ -1467,7 +1600,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                         bool piggybacked = false;
                         for (auto& r0 : t.resources)
                             if ((r0.cls == ResourceClass::ConstantBuffer || r0.cls == ResourceClass::VertexBuffer) &&
-                                r0.gpu_addr == d.base && r0.size == d.size_bytes && r0.stride == d.stride) {
+                                r0.gpu_addr == d.base && r0.size == resource_size && r0.stride == resource_stride) {
                                 if (r0.fetch_pc == 0xFFFFFFFFu && r0.cls == ResourceClass::ConstantBuffer)
                                     r0.fetch_pc = u.use_pc;
                                 piggybacked = r0.fetch_pc == u.use_pc || r0.cls == ResourceClass::VertexBuffer;
@@ -1478,11 +1611,11 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     ShaderResource r;
                     r.cls = ResourceClass::ConstantBuffer;
                     r.format = d.format; r.num_components = d.num_components ? d.num_components : 1;
-                    r.gpu_addr = d.base; r.size = d.size_bytes; r.stride = d.stride;
+                    r.gpu_addr = d.base; r.size = resource_size; r.stride = resource_stride;
                     r.srt_offset = clash ? 0xFFFFFFFFu : u.key;
                     if (clash) r.fetch_pc = u.use_pc;    // pc-only provenance (key-less/collided V#)
                     if (log) fprintf(stderr, "[srt] %s cbuf key=0x%x pc=%u base=0x%llx size=%u\n", is_ps ? "PS" : "VS",
-                                     u.key, u.use_pc, (unsigned long long)d.base, d.size_bytes);
+                                     u.key, u.use_pc, (unsigned long long)d.base, resource_size);
                     t.resources.push_back(r);
                 } else {                                  // texture (T# [+ paired S#])
                     DecodedImageDescriptor d = decode_image_descriptor(u.t8.data());

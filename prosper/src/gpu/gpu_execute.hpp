@@ -102,12 +102,16 @@ struct SrtUse {
     std::array<uint32_t, 4> v4{};    // V# dwords as loaded (kind 1)
     bool has_samp = false;
     std::array<uint32_t, 4> s4{};    // paired S# dwords (kind 0, when the SSAMP load also resolved)
+    // Minimum byte span needed by this scalar-buffer consumer, measured from V#.Base. Some PS5
+    // scalar descriptors carry usable base bits but do not expose a conventional bounded V# size;
+    // the exact observed access span is sufficient for their pc-keyed upload.
+    uint32_t required_size = 0;      // kind 1 only
     // PER-USE pc provenance (#273 — DOLL's title-composite image_sample_b): the pc of the consuming
     // image op. The load-immediate key model breaks when the same immediate appears against two
     // different table pointers (a key-0 EUD sharp colliding with a key-0 table T#) or when the load
     // has no usable key; keying the TEXTURE use by its exact instruction (ShaderResource::fetch_pc,
     // the same per-instruction provenance the vertex fetches use) is unambiguous.
-    uint32_t use_pc = 0xFFFFFFFFu;   // kind 0 only (cbufs keep the key model)
+    uint32_t use_pc = 0xFFFFFFFFu;   // exact consuming pc for key-less texture/buffer uses
     // The consuming image op WRITES the image (image_store — MIMG op 0x8): the resource must be a
     // STORAGE image, not a sampled texture (#590 — the recompiler's storage path requires
     // ResourceClass::StorageImage). Only meaningful for kind 0.
