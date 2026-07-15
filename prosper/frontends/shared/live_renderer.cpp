@@ -1158,12 +1158,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     const uint32_t present_w = prosper::gpu::present_width();
                     const uint32_t present_h = prosper::gpu::present_height();
                     // A depth prepass may bind a tiny/dummy color target with CB_TARGET_MASK=0 while
-                    // rasterizing the full-size guest depth surface. Keying and allocating persistent
-                    // DS from that irrelevant color extent creates (for DOLL) a 512x256 depth image;
-                    // the following 3840x2160 EQUAL lighting pass then gets a separate blank image and
-                    // rejects every fragment. For a wholly color-disabled DS pass, recover the native
-                    // attachment extent from its viewport (undoing execute_gpustate's render scale).
-                    // Mixed/color-writing passes retain the authoritative CB_COLOR extent.
+                    // rasterizing the full-size guest depth surface. Keying persistent DS from that
+                    // irrelevant color extent creates a small depth image that the later lighting pass
+                    // cannot reuse. Recover the attachment extent from the viewport, but only when the
+                    // complete inferred extent fits the known presentation surface. Viewport coordinates
+                    // position rasterization and are not allocation metadata; accepting translated or
+                    // otherwise oversized coordinates here previously created persistent images as large
+                    // as 16384x16384 and exhausted the host while Dead Cells loaded its first level.
                     const bool color_disabled = !pass.empty() && std::all_of(
                         pass.begin(), pass.end(), [](const auto* draw) {
                             return draw->ps.color_write_mask == 0;
@@ -1186,16 +1187,26 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             if (std::isfinite(y1) && std::isfinite(y2))
                                 viewport_y = std::max(viewport_y, std::max(std::fabs(y1), std::fabs(y2)));
                         }
-                        const uint32_t scale_w = present_w ? present_w : w;
-                        const uint32_t scale_h = present_h ? present_h : h;
+                        const uint32_t max_native_w = present_w ? present_w : w;
+                        const uint32_t max_native_h = present_h ? present_h : h;
                         const uint64_t viewport_native_w = static_cast<uint64_t>(
-                            std::ceil(viewport_x * static_cast<float>(scale_w) / w));
+                            std::ceil(viewport_x * static_cast<float>(max_native_w) / w));
                         const uint64_t viewport_native_h = static_cast<uint64_t>(
-                            std::ceil(viewport_y * static_cast<float>(scale_h) / h));
-                        if (viewport_native_w && viewport_native_w <= 16384)
+                            std::ceil(viewport_y * static_cast<float>(max_native_h) / h));
+                        const bool viewport_extent_valid = viewport_native_w && viewport_native_h &&
+                            viewport_native_w <= max_native_w && viewport_native_h <= max_native_h;
+                        if (getenv("PROSPER_DSLOG") && (viewport_native_w || viewport_native_h)) {
+                            fprintf(stderr,
+                                    "[ds] viewport-derived extent %llux%llu (presentation %ux%u) -> %s\n",
+                                    (unsigned long long)viewport_native_w,
+                                    (unsigned long long)viewport_native_h,
+                                    max_native_w, max_native_h,
+                                    viewport_extent_valid ? "accept" : "reject");
+                        }
+                        if (viewport_extent_valid) {
                             native_w = std::max(native_w, static_cast<uint32_t>(viewport_native_w));
-                        if (viewport_native_h && viewport_native_h <= 16384)
                             native_h = std::max(native_h, static_cast<uint32_t>(viewport_native_h));
+                        }
                     }
                     if (native_w && native_h) {
                         uint64_t native_pixels = (uint64_t)native_w * native_h;

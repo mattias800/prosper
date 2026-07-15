@@ -149,6 +149,29 @@ int main() {
               "EQUAL lighting reuses viewport-sized depth written behind the tiny color attachment");
     }
 
+    // A translated viewport is raster state, not proof that the attachment itself is larger than the
+    // presentation surface. Promoting its far edge used to allocate and retain enormous depth images
+    // (up to 16384x16384) during Dead Cells level loading. Keep this deliberately out-of-bounds
+    // prepass on its declared dummy extent; the full-size EQUAL pass must not find invented depth.
+    DrawItem translated_prepass = depth_prepass;
+    translated_prepass.color0_base = 0x950000;
+    translated_prepass.ps.viewport_x = static_cast<float>(W * 2);
+    translated_prepass.ps.depth_read_base = translated_prepass.ps.depth_write_base = 0x960000;
+    translated_prepass.ps.htile_data_base = 0x970000;
+    DrawItem translated_lighting = equal_lighting;
+    translated_lighting.color0_base = 0x980000;
+    translated_lighting.ps.depth_read_base = translated_lighting.ps.depth_write_base = 0x960000;
+    translated_lighting.ps.htile_data_base = 0x970000;
+    std::vector<uint8_t> translated = render_submit_items(
+        {translated_prepass, translated_lighting}, W, H);
+    CHECK(translated.size() == static_cast<size_t>(W) * H * 4,
+          "oversized viewport does not inflate the persistent depth attachment");
+    if (translated.size() == static_cast<size_t>(W) * H * 4) {
+        const uint8_t* center = &translated[(static_cast<size_t>(H / 2) * W + W / 2) * 4];
+        CHECK(center[0] < 0x40,
+              "lighting does not reuse depth invented from a translated viewport far edge");
+    }
+
     // A captured consumer may depend on a producer from an earlier submit. Restore its serialized
     // host RTT surface before replaying draw zero; guest memory has no copy of these rendered pixels.
     GpuCaptureRttSeed temporal_seed;
