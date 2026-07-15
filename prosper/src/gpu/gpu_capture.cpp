@@ -37,7 +37,7 @@ namespace prosper::gpu {
 namespace {
 
 constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
-constexpr uint32_t kVersion = 10;
+constexpr uint32_t kVersion = 11;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -1009,6 +1009,33 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         w.u32(diagnostic.color1_height);
         if (diagnostic.pipeline_present) write_mrt1_pipeline(w, diagnostic.pipeline);
     }
+    // v11 preserves GFX10 DCC descriptor state in deterministic resource-table order. Like the v9
+    // depth tail, this leaves the v1-v10 resource record byte-compatible while making compressed
+    // base allocations explicit to offline inspection. Metadata bytes are not inferred or invented.
+    w.u32(static_cast<uint32_t>(resource_depth_count));
+    auto write_dcc_state = [&](const GpuCapturedTable& table) {
+        for (const auto& captured : table.resources) {
+            const auto& resource = captured.resource;
+            if (resource.max_uncompressed_block_size > 3u ||
+                resource.max_compressed_block_size > 3u) {
+                error = "invalid resource DCC state"; return false;
+            }
+            const uint8_t flags = (resource.meta_pipe_aligned ? 1u : 0u) |
+                                  (resource.write_compress_enabled ? 2u : 0u) |
+                                  (resource.compression_enabled ? 4u : 0u) |
+                                  (resource.alpha_is_on_msb ? 8u : 0u) |
+                                  (resource.color_transform ? 16u : 0u);
+            w.u8(flags);
+            w.u32(resource.max_uncompressed_block_size);
+            w.u32(resource.max_compressed_block_size);
+            w.u64(resource.metadata_addr);
+        }
+        return true;
+    };
+    for (const auto& draw : c.draws)
+        if (!write_dcc_state(draw.vrt) || !write_dcc_state(draw.prt)) return false;
+    for (const auto& compute : c.computes)
+        if (!write_dcc_state(compute.resources)) return false;
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -1297,6 +1324,41 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                 !r.u32(diagnostic.color1_height)) return false;
             if (diagnostic.pipeline_present && !read_mrt1_pipeline(r, diagnostic.pipeline)) return false;
         }
+    }
+    if (version >= 11) {
+        uint64_t expected_states = 0;
+        for (const auto& draw : c.draws)
+            expected_states += draw.vrt.resources.size() + draw.prt.resources.size();
+        for (const auto& compute : c.computes)
+            expected_states += compute.resources.resources.size();
+        uint32_t state_count = 0;
+        if (!r.u32(state_count) || state_count != expected_states) {
+            error = "invalid resource DCC-state count"; return false;
+        }
+        auto read_dcc_state = [&](GpuCapturedTable& table) {
+            for (auto& captured : table.resources) {
+                auto& resource = captured.resource;
+                uint8_t flags = 0;
+                if (!r.u8(flags) || (flags & ~0x1fu) ||
+                    !r.u32(resource.max_uncompressed_block_size) ||
+                    !r.u32(resource.max_compressed_block_size) ||
+                    !r.u64(resource.metadata_addr) ||
+                    resource.max_uncompressed_block_size > 3u ||
+                    resource.max_compressed_block_size > 3u) {
+                    error = "invalid resource DCC state"; return false;
+                }
+                resource.meta_pipe_aligned = (flags & 1u) != 0;
+                resource.write_compress_enabled = (flags & 2u) != 0;
+                resource.compression_enabled = (flags & 4u) != 0;
+                resource.alpha_is_on_msb = (flags & 8u) != 0;
+                resource.color_transform = (flags & 16u) != 0;
+            }
+            return true;
+        };
+        for (auto& draw : c.draws)
+            if (!read_dcc_state(draw.vrt) || !read_dcc_state(draw.prt)) return false;
+        for (auto& compute : c.computes)
+            if (!read_dcc_state(compute.resources)) return false;
     }
     if (r.left) { error = "capture has trailing data"; return false; }
     return true;

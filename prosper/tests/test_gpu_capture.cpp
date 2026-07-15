@@ -54,7 +54,13 @@ int main() {
     a.size = 16; a.stride = 4; a.format = DataFormat::Unorm2_10_10_10; a.num_components = 4; a.fetch_pc = 12;
     ShaderResource b{}; b.cls = ResourceClass::ConstantBuffer; b.binding = 2; b.gpu_addr = 0x1008;
     b.size = 16; b.format = DataFormat::Float32; b.num_components = 4; b.srt_offset = 0x20;
-    table->resources = {a, b};
+    ShaderResource dcc{}; dcc.cls = ResourceClass::Texture; dcc.binding = 4; dcc.gpu_addr = 0x1000;
+    dcc.size = 16; dcc.format = DataFormat::Unorm8; dcc.num_components = 4;
+    dcc.width = dcc.height = 2; dcc.max_uncompressed_block_size = 2;
+    dcc.max_compressed_block_size = 1; dcc.meta_pipe_aligned = true;
+    dcc.compression_enabled = true; dcc.alpha_is_on_msb = true;
+    dcc.metadata_addr = 0x206e33ab00ull;
+    table->resources = {a, b, dcc};
 
     DrawItem draw; draw.vs = {0x07230203, 1, 2}; draw.fs = {0x07230203, 3}; draw.vrt = table;
     draw.vertex_count = 6; draw.indices = {0, 1, 2, 2, 3, 0}; draw.color0_base = 0x2000;
@@ -164,12 +170,17 @@ int main() {
           deserialize_gpu_capture(stencil_only_bytes, stencil_only_loaded, error) &&
           !stencil_only_loaded.ds_seeds[0].depth_valid &&
           stencil_only_loaded.ds_seeds[0].stencil_valid,
-          "stencil-only validity survives capture v10 independently of depth");
+          "stencil-only validity survives capture v11 independently of depth");
     GpuCaptureFile invalid_stencil_format = stencil_only;
     invalid_stencil_format.ds_seeds[0].format = GpuCaptureDsFormat::D32Float;
     CHECK(!serialize_gpu_capture(invalid_stencil_format, stencil_only_bytes, error) &&
           error == "DS seed stencil byte count does not match its extent, format, and validity",
           "writer rejects stencil bytes for a depth-only format");
+    GpuCaptureFile invalid_dcc = captured;
+    invalid_dcc.draws[0].vrt.resources[2].resource.max_compressed_block_size = 4;
+    CHECK(!serialize_gpu_capture(invalid_dcc, stencil_only_bytes, error) &&
+          error == "invalid resource DCC state",
+          "writer rejects DCC block-size values wider than their two-bit descriptor fields");
     CHECK(write_gpu_capture(path.string(), captured, error), "versioned capture writes atomically");
     GpuCaptureFile loaded;
     CHECK(read_gpu_capture(path.string(), loaded, error), "versioned capture reads back");
@@ -189,6 +200,13 @@ int main() {
           "newest packed image format enum round-trips");
     CHECK(loaded.draws[0].vrt.resources[0].resource.depth == 7,
           "v9 resource depth round-trips");
+    const auto& loaded_dcc = loaded.draws[0].vrt.resources[2].resource;
+    CHECK(loaded_dcc.compression_enabled && loaded_dcc.meta_pipe_aligned &&
+          loaded_dcc.alpha_is_on_msb && !loaded_dcc.write_compress_enabled &&
+          !loaded_dcc.color_transform && loaded_dcc.max_uncompressed_block_size == 2 &&
+          loaded_dcc.max_compressed_block_size == 1 &&
+          loaded_dcc.metadata_addr == 0x206e33ab00ull,
+          "v11 resource DCC descriptor state round-trips without inventing metadata bytes");
     CHECK(loaded.shader_versions.size() == 2 && loaded.draws[0].draw_index == 7 &&
           loaded.draws[0].command_order == 123 && loaded.operations[0].source_index == 7,
           "content versions and draw operation identity round-trip");
@@ -352,13 +370,15 @@ int main() {
     GpuCaptureFile legacy_source = captured; legacy_source.ds_seeds.clear();
     std::vector<uint8_t> legacy_bytes;
     CHECK(serialize_gpu_capture(legacy_source, legacy_bytes, error) && legacy_bytes.size() >= 28,
-          "created a diagnostic-free v10 payload for legacy-reader fixtures");
+          "created a diagnostic-free v11 payload for legacy-reader fixtures");
     if (legacy_bytes.size() >= 28) {
+        const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
+                                             legacy_source.draws[0].prt.resources.size();
+        // Remove the v11 DCC tail: count + 17-byte state record per resource.
+        legacy_bytes.resize(legacy_bytes.size() - (4 + 17 * legacy_resource_count));
         // Remove the v10 MRT tail: draw count + one (target identity + 50-byte pipeline state) +
         // zero failure count. The remaining payload is byte-exact v9.
         legacy_bytes.resize(legacy_bytes.size() - (4 + 16 + 50 + 4));
-        const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
-                                             legacy_source.draws[0].prt.resources.size();
         legacy_bytes.resize(legacy_bytes.size() - 4 - 4 - 4 * legacy_resource_count);
         // remove v9 depth section (count + values) and the v8 DS-seed zero count
         legacy_bytes[8] = 7; legacy_bytes[9] = legacy_bytes[10] = legacy_bytes[11] = 0;
@@ -374,9 +394,9 @@ int main() {
     CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
           !legacy_loaded.failure_diagnostics_available && legacy_loaded.failure_diagnostics.empty(),
           "v6 capture reopens with failed-operation diagnostics reported unavailable");
-    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 11;
+    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 12;
     CHECK(!deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
-          error == "unsupported capture version 11",
+          error == "unsupported capture version 12",
           "future capture versions fail with a concrete version error");
 
     GpuCaptureFile bad_hash = mixed;

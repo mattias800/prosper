@@ -1657,6 +1657,14 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     r.format = fi.format; r.num_components = fi.num_components;
                     r.gpu_addr = d.base; r.width = d.width; r.height = d.height; r.depth = d.depth;
                     r.tile_mode = d.tile_mode; r.srgb = fi.srgb;
+                    r.max_uncompressed_block_size = d.max_uncompressed_block_size;
+                    r.max_compressed_block_size = d.max_compressed_block_size;
+                    r.meta_pipe_aligned = d.meta_pipe_aligned;
+                    r.write_compress_enabled = d.write_compress_enabled;
+                    r.compression_enabled = d.compression_enabled;
+                    r.alpha_is_on_msb = d.alpha_is_on_msb;
+                    r.color_transform = d.color_transform;
+                    r.metadata_addr = d.metadata_addr;
                     // T# TYPE -> MIMG dim (GFX10: 9=2D, 10=3D, 11=CUBE, 13=2D_ARRAY); a cube
                     // uploads as six vertically-stacked faces (#273 — see agc_shader_layout).
                     r.img_dim = image_type_to_dim(d.type);
@@ -1973,6 +1981,14 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     }
                     r.gpu_addr = d.base; r.width = d.width; r.height = d.height; r.depth = d.depth;
                     r.tile_mode = d.tile_mode;
+                    r.max_uncompressed_block_size = d.max_uncompressed_block_size;
+                    r.max_compressed_block_size = d.max_compressed_block_size;
+                    r.meta_pipe_aligned = d.meta_pipe_aligned;
+                    r.write_compress_enabled = d.write_compress_enabled;
+                    r.compression_enabled = d.compression_enabled;
+                    r.alpha_is_on_msb = d.alpha_is_on_msb;
+                    r.color_transform = d.color_transform;
+                    r.metadata_addr = d.metadata_addr;
                     r.img_dim = image_type_to_dim(d.type);
                     r.swizzle[0] = d.dst_sel[0]; r.swizzle[1] = d.dst_sel[1];
                     r.swizzle[2] = d.dst_sel[2]; r.swizzle[3] = d.dst_sel[3];

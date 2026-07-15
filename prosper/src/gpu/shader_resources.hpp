@@ -163,6 +163,19 @@ struct ShaderResource {
     // path (that already broadcasts coverage to every channel).
     uint32_t      swizzle[4]        = {4, 5, 6, 7};
 
+    // GFX10 image-compression state decoded from T# WORD6/7. A DCC-compressed base allocation cannot
+    // be interpreted as ordinary tiled texels: metadata_addr names the separate compression-control
+    // surface. These fields are preserved through captures even though software DCC decode is not yet
+    // implemented, so live/replay diagnostics remain truthful instead of hiding corrupt source bytes.
+    uint32_t      max_uncompressed_block_size = 0;
+    uint32_t      max_compressed_block_size   = 0;
+    bool          meta_pipe_aligned           = false;
+    bool          write_compress_enabled      = false;
+    bool          compression_enabled         = false;
+    bool          alpha_is_on_msb             = false;
+    bool          color_transform             = false;
+    uint64_t      metadata_addr               = 0;
+
     // Replay-only owned backing. `gpu_addr` remains the captured logical guest address so render-target
     // identity/alias checks stay faithful. Graphics reads from host_data; compute may update it before a
     // later operation consumes the same version. Production tables leave both fields zero and use guest memory.

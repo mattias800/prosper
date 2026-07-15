@@ -112,7 +112,9 @@ DecodedBufferDescriptor decode_buffer_descriptor(const uint32_t v[4]);
 
 // A decoded image resource descriptor (T#, 8 dwords / 256-bit). Layout = Kyty ShaderTextureResource
 // Gen5 getters (Base40/Width5/Height5/Format/TileMode). `base` is the byte address of the texel data
-// in unified guest memory. `tile_mode` 0 = linear (no detiling needed); non-zero = GPU-tiled.
+// in unified guest memory. `tile_mode` 0 = linear (no detiling needed); non-zero = GPU-tiled. GFX10
+// DCC state lives in WORD6/7 and is kept separately from the base allocation: compressed texels are
+// not meaningful without the metadata surface.
 struct DecodedImageDescriptor {
     uint64_t base = 0;
     uint32_t width = 0, height = 0, depth = 1;
@@ -124,6 +126,14 @@ struct DecodedImageDescriptor {
     // DST_SEL_X/Y/Z/W channel swizzle (WORD3 [2:0]/[5:3]/[8:6]/[11:9]); SQ_SEL enum:
     // 0=0, 1=1, 4=X(R), 5=Y(G), 6=Z(B), 7=W(A). Default = identity (R,G,B,A).
     uint8_t  dst_sel[4] = {4, 5, 6, 7};
+    uint32_t max_uncompressed_block_size = 0; // WORD6[16:15]
+    uint32_t max_compressed_block_size = 0;   // WORD6[18:17]
+    bool     meta_pipe_aligned = false;       // WORD6[19]
+    bool     write_compress_enabled = false;  // WORD6[20]
+    bool     compression_enabled = false;     // WORD6[21]
+    bool     alpha_is_on_msb = false;          // WORD6[22]
+    bool     color_transform = false;          // WORD6[23]
+    uint64_t metadata_addr = 0;                // 40-bit META_DATA_ADDRESS, in 256-byte units
 };
 // Decode an 8-dword T# (RDNA2/Gen5 image resource). Pure; exposed for reuse + testing.
 DecodedImageDescriptor decode_image_descriptor(const uint32_t t[8]);

@@ -195,6 +195,15 @@ DecodedImageDescriptor decode_image_descriptor(const uint32_t t[8]) {
     d.dst_sel[1] = (uint8_t)((t[3] >> 3) & 0x7u);   // DST_SEL_Y ([5:3])
     d.dst_sel[2] = (uint8_t)((t[3] >> 6) & 0x7u);   // DST_SEL_Z ([8:6])
     d.dst_sel[3] = (uint8_t)((t[3] >> 9) & 0x7u);   // DST_SEL_W ([11:9])
+    d.max_uncompressed_block_size = (t[6] >> 15) & 0x3u;
+    d.max_compressed_block_size   = (t[6] >> 17) & 0x3u;
+    d.meta_pipe_aligned           = ((t[6] >> 19) & 0x1u) != 0;
+    d.write_compress_enabled      = ((t[6] >> 20) & 0x1u) != 0;
+    d.compression_enabled         = ((t[6] >> 21) & 0x1u) != 0;
+    d.alpha_is_on_msb             = ((t[6] >> 22) & 0x1u) != 0;
+    d.color_transform             = ((t[6] >> 23) & 0x1u) != 0;
+    const uint64_t metadata_field = (static_cast<uint64_t>(t[7]) << 8) | (t[6] >> 24);
+    d.metadata_addr               = metadata_field << 8;
     return d;
 }
 
@@ -358,9 +367,14 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             }
             if (getenv("PROSPER_GFXLOG")) {
                 const uint32_t* t = tv;   // the fetched T# (SGPR block or EUD spill)
-                fprintf(stderr, "[t#] %ux%u base=0x%llx tile_mode=%u type=%u fmt=%u swz=%u,%u,%u,%u | raw: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                fprintf(stderr, "[t#] %ux%u base=0x%llx tile_mode=%u type=%u fmt=%u swz=%u,%u,%u,%u "
+                                "dcc=%u meta=0x%llx blocks=%u/%u flags=%u%u%u%u | raw: %08x %08x %08x %08x %08x %08x %08x %08x\n",
                         d.width, d.height, (unsigned long long)d.base, d.tile_mode, d.type, d.format,
                         d.dst_sel[0], d.dst_sel[1], d.dst_sel[2], d.dst_sel[3],
+                        d.compression_enabled, (unsigned long long)d.metadata_addr,
+                        d.max_uncompressed_block_size, d.max_compressed_block_size,
+                        d.meta_pipe_aligned, d.write_compress_enabled,
+                        d.alpha_is_on_msb, d.color_transform,
                         t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7]);
             }
             // Decode the T#'s real Gen5 IMG_FMT (#65 — was hardcoded Unorm8 x4 / size w*h*4, which
@@ -411,6 +425,14 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             r.height        = d.height;
             r.depth         = d.depth;
             r.tile_mode     = d.tile_mode;          // so the renderer can auto-detile a GPU-tiled surface
+            r.max_uncompressed_block_size = d.max_uncompressed_block_size;
+            r.max_compressed_block_size = d.max_compressed_block_size;
+            r.meta_pipe_aligned = d.meta_pipe_aligned;
+            r.write_compress_enabled = d.write_compress_enabled;
+            r.compression_enabled = d.compression_enabled;
+            r.alpha_is_on_msb = d.alpha_is_on_msb;
+            r.color_transform = d.color_transform;
+            r.metadata_addr = d.metadata_addr;
             r.swizzle[0] = d.dst_sel[0]; r.swizzle[1] = d.dst_sel[1];
             r.swizzle[2] = d.dst_sel[2]; r.swizzle[3] = d.dst_sel[3];   // T# DST_SEL channel remap (#261)
             // T# TYPE -> the MIMG dim convention (GFX10 SQ_RSRC_IMG: 8=1D, 9=2D, 10=3D, 11=CUBE,
