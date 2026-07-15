@@ -2044,22 +2044,52 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             prosper::test::dump_bmp(fn, spx, gw, gh);
                         }
                     }
-                    // PROSPER_DUMP_RTGROUPS=<min-nonzero-bytes>: dump each per-target group's rendered
-                    // pixels (rtgrp_<base>_<frame>.bmp in PROSPER_FRAME_DIR) — to inspect an intermediate
-                    // pass (e.g. the UI/banner RT) instead of only the presented composite. Diagnostic.
-                    // PROSPER_DUMP_RTGROUPS_ADDR optionally limits a long replay to one target.
-                    if (const char* rg = getenv("PROSPER_DUMP_RTGROUPS"); rg && !rendered_pixels.empty()) {
+                    // Per-target group dumps into PROSPER_FRAME_DIR. Two INDEPENDENT opt-ins (either may
+                    // be set alone); PROSPER_DUMP_RTGROUPS_ADDR optionally limits a long replay to one
+                    // target VA. Diagnostic; no default behavior change.
+                    //  - PROSPER_DUMP_RTGROUPS=<min-nonzero-bytes>: a 24-bit BMP (alpha dropped) of the
+                    //    format-inspected pixels — to eyeball an intermediate pass (e.g. a UI/banner RT).
+                    //  - PROSPER_DUMP_RTGROUPS_RGBA: the RAW RGBA8 backend bytes (alpha PRESERVED, no
+                    //    format inspection) — needed to reason about premultiplied-alpha UI compositing
+                    //    that samples an RT's alpha as a blend factor. dump_bmp cannot show this.
+                    if ((getenv("PROSPER_DUMP_RTGROUPS") || getenv("PROSPER_DUMP_RTGROUPS_RGBA")) &&
+                        !rendered_pixels.empty()) {
                         size_t nz = 0; for (uint8_t b : rendered_pixels) nz += (b != 0);
                         const char* address_filter = getenv("PROSPER_DUMP_RTGROUPS_ADDR");
                         const uint64_t wanted_base = address_filter && *address_filter
                             ? strtoull(address_filter, nullptr, 0) : 0;
-                        if (nz >= (size_t)atol(rg) && (!wanted_base || base == wanted_base)) {
-                            const std::vector<uint8_t> inspected = inspection_rgba8(
-                                rendered_pixels, gw, gh, pass_format);
-                            const char* dd = getenv("PROSPER_FRAME_DIR");
-                            char fn[512]; snprintf(fn, sizeof fn, "%s/rtgrp_%llx_%04d.bmp",
-                                                   dd ? dd : ".", (unsigned long long)base, frame_no.load());
-                            prosper::test::dump_bmp(fn, inspected, gw, gh);
+                        const char* dd = getenv("PROSPER_FRAME_DIR");
+                        // Identify the pass by its first..last draw index so multiple passes to the same
+                        // target VA in one frame do not silently overwrite each other.
+                        const unsigned pass_d0 = render_pass.empty() ? 0u : (unsigned)render_pass.front()->draw_index;
+                        const unsigned pass_d1 = render_pass.empty() ? 0u : (unsigned)render_pass.back()->draw_index;
+                        if (!wanted_base || base == wanted_base) {
+                            if (const char* rg = getenv("PROSPER_DUMP_RTGROUPS"); rg && nz >= (size_t)atol(rg)) {
+                                const std::vector<uint8_t> inspected = inspection_rgba8(
+                                    rendered_pixels, gw, gh, pass_format);
+                                char fn[512]; snprintf(fn, sizeof fn, "%s/rtgrp_%llx_%04d.bmp",
+                                                       dd ? dd : ".", (unsigned long long)base, frame_no.load());
+                                prosper::test::dump_bmp(fn, inspected, gw, gh);
+                            }
+                            // Independent of the BMP variable AND its nonzero threshold, so a fully
+                            // transparent (all-zero) group is captured too. Self-describing filename
+                            // (extent + draw range) and failure-visible: a missing file must not be
+                            // mistaken for a transparent/empty result.
+                            if (getenv("PROSPER_DUMP_RTGROUPS_RGBA")) {
+                                char rn[600]; snprintf(rn, sizeof rn, "%s/rtgrp_%llx_%ux%u_f%04d_d%04u-%04u.rgba",
+                                                       dd ? dd : ".", (unsigned long long)base, gw, gh,
+                                                       frame_no.load(), pass_d0, pass_d1);
+                                FILE* rf = fopen(rn, "wb");
+                                bool ok = rf != nullptr; size_t wrote = 0;
+                                if (rf) {
+                                    wrote = fwrite(rendered_pixels.data(), 1, rendered_pixels.size(), rf);
+                                    ok = (wrote == rendered_pixels.size());
+                                    if (fclose(rf) != 0) ok = false;
+                                }
+                                fprintf(stderr, "[rtt] rgba-dump %s target=0x%llx %ux%u draws=%u..%u "
+                                        "bytes=%zu path=%s\n", ok ? "ok" : "FAILED",
+                                        (unsigned long long)base, gw, gh, pass_d0, pass_d1, wrote, rn);
+                            }
                         }
                     }
                     if (!rendered_pixels.empty() && pass_format == VK_FORMAT_R8G8B8A8_UNORM) {
