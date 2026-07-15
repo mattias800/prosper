@@ -61,6 +61,43 @@ texture uses, retained 101 entries / about 75 MiB, and observed no invalidation.
 `PROSPER_NO_TEXTURE_DECODE_CACHE=1`; its default 256 MiB budget is controlled by
 `PROSPER_TEXTURE_DECODE_CACHE_MB`.
 
+## Dead Cells backend upload duplication (2026-07-15)
+
+Dead Cells exposed a second duplication layer after the frontend decode caches. The frontend correctly
+reused one decoded pixel allocation for repeated texture references in a graphics span, but the Vulkan
+backend created a separate image, device-memory allocation, staging buffer, staging allocation, and full
+upload for every draw reference. One slow control window averaged 188.8 texture references and 5.07 GiB
+of uploads per backend call even though 181.3 references reused pixels the frontend had already built.
+
+The backend now uploads each distinct `(decoded pixel pointer, width, height, depth, image dimension)`
+once per synchronous backend call. Draw bindings still get separate image views and samplers, preserving
+component swizzles and sampler state. The scope is deliberately one call: no guest-memory freshness or
+cross-frame lifetime assumption is introduced. Set `PROSPER_NO_BACKEND_TEXTURE_SHARE=1` for the legacy
+one-upload-per-reference A/B.
+
+Native Windows / RTX 4090, same RelWithDebInfo binary, fresh saves, documented Dead Cells full-render
+route, and 110-second wall-clock samples:
+
+| Measurement | Sharing disabled | Sharing enabled |
+|---|---:|---:|
+| App rate in the slow section | 0.6 FPS | 7-11 FPS |
+| Peak process working set | 6.80 GiB | 2.08 GiB |
+| Peak process private memory | 14.28 GiB | 4.40 GiB |
+| Peak dedicated GPU commit | 5.15 GiB | 0.28 GiB |
+| Peak shared GPU commit | 5.18 GiB | 0.36 GiB |
+| Transient pool discards | 15,615 and rising | 0 |
+
+The enabled run advanced farther in the same wall-clock period, so the end-to-end peaks are intentionally
+reported as outcomes rather than a matched-scene microbenchmark. The renderer counters establish the
+mechanism directly: a representative enabled 54-reference span produced 11 uploads / 96.3 MiB instead
+of 54 uploads / 460.3 MiB. Its pool stabilized at 1,865 allocations / 374.7 MiB with no discards. Process
+private memory averaged 4.34 GiB at 60-90 seconds and 4.37 GiB at 90-110 seconds, never exceeding
+4.40 GiB after 60 seconds.
+
+The Vulkan regression test compares sharing on/off byte-for-byte while using separate swizzled image
+views. It also renders a two-slice 3D texture twice, verifies the selected depth slice, and requires one
+depth-accounted upload. This protects the general 2D and 3D paths rather than only the Dead Cells shape.
+
 ## Current frame budget
 
 After the above changes, a representative renderer submit remains about 36-38 ms. Approximate costs
