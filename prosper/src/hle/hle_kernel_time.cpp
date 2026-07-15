@@ -722,6 +722,20 @@ namespace {
         uint64_t end = (uint64_t)(uintptr_t)&g_eq_bigdecoy[384];   // one-past-end of the 24 KiB array
         return (end & ~4095ull) - 4096;                            // last page fully inside the array
     }
+    // Exit-time false-positive suppressor (round 10): at process exit the guarded arrays' OWN static
+    // destructors (~mutex on each element -> pthread_mutex_destroy) fault the still-armed RO page and
+    // masquerade as the corruptor. This object is declared AFTER g_eq_bigdecoy/g_eq_ballast_hi, so its
+    // destructor runs BEFORE theirs (reverse construction order): it disarms the guard and lifts the
+    // page to RW, so the array dtors run harmlessly and only a RUNTIME fault can report.
+    struct EqGuardDisarmer {
+        ~EqGuardDisarmer() {
+#ifndef _WIN32
+            if (g_eq_pageguard_armed.exchange(false))
+                mprotect((void*)(uintptr_t)eq_guard_page(), 4096, PROT_READ | PROT_WRITE);
+#endif
+        }
+    };
+    EqGuardDisarmer g_eq_guard_disarmer;   // dtor runs before the ballast/bigdecoy array dtors
     // Continuous re-arm: keep g_det_clock's page RO except for the brief windows the handler lifts it
     // for a legitimate co-located write. Idempotent mprotect every ~25 µs, so the corruptor's store
     // (which lands on a victim offset) almost always hits an RO page and faults -> caught.
