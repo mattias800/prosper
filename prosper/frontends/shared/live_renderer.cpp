@@ -81,15 +81,19 @@ struct DecodedTexture {
     const uint8_t* pixels = nullptr;
     uint32_t output_height = 0;
     bool narrow = false;
+    uint64_t persistent_id = 0;
 };
 
 struct PersistentDecodedTexture {
     size_t source_size = 0;
+    size_t source_prefix_size = 0;
+    bool source_matches_pixels = false;
     std::vector<uint8_t> source_prefix;
     std::vector<uint8_t> pixels;
     uint32_t output_height = 0;
     bool narrow = false;
     uint64_t last_use = 0;
+    uint64_t persistent_id = 0;
 
     size_t bytes() const { return source_prefix.size() + pixels.size(); }
 };
@@ -276,6 +280,22 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 }
                 return done;
             };
+            auto safe_equal = [](const uint8_t* expected, uint64_t a, size_t n,
+                                 size_t& compared) -> bool {
+                const size_t PG = 0x10000;
+                compared = 0;
+                while (compared < n) {
+                    const uint64_t cur = a + compared;
+                    if (cur < 0x1000 || prosper_reserved_range_state(cur) == 0) return true;
+                    const size_t chunk = std::min(
+                        n - compared, PG - static_cast<size_t>(cur & (PG - 1)));
+                    if (std::memcmp(expected + compared,
+                                    reinterpret_cast<const void*>(static_cast<uintptr_t>(cur)),
+                                    chunk)) return false;
+                    compared += chunk;
+                }
+                return true;
+            };
             // Keep decoded texture storage alive across callbacks. The old clear()+emplace(size, 0)
             // released and zero-filled tens of MiB every submit even though the decode paths overwrite
             // all pixels. Reusing same-sized slots avoids both costs; short guest reads explicitly clear
@@ -288,6 +308,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             static size_t persistent_decoded_texture_bytes = 0;
             static uint64_t persistent_decode_generation = 0;
             const uint64_t decode_generation = ++persistent_decode_generation;
+            static uint64_t persistent_texture_id = 0;
             static std::vector<uint8_t> persistent_validation_scratch;
             const size_t persistent_decode_limit = [] {
                 const char* value = getenv("PROSPER_TEXTURE_DECODE_CACHE_MB");
@@ -345,13 +366,28 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         const bool is_volume = r.img_dim == 2u;
                         const uint32_t persistent_pitch = getenv("PROSPER_PITCH")
                             ? static_cast<uint32_t>(atoi(getenv("PROSPER_PITCH"))) : 0;
+                        const bool persistent_rgba_texture =
+                            !has_live_rtt && !r.host_data && r.img_dim == 1u &&
+                            r.cls == RC::Texture &&
+                            r.format == prosper::gpu::DataFormat::Unorm8 &&
+                            r.num_components == 4;
+                        const bool persistent_source_is_tiled =
+                            persistent_rgba_texture && !getenv("PROSPER_NODETILE") &&
+                            prosper::gpu::tile_mode_is_tiled(r.tile_mode);
+                        const bool persistent_source_matches_pixels =
+                            persistent_rgba_texture &&
+                            !prosper::gpu::tile_mode_is_tiled(r.tile_mode) &&
+                            (!getenv("PROSPER_DETILE") || atoi(getenv("PROSPER_DETILE")) == 0);
                         const bool persistent_cache_eligible =
-                            !getenv("PROSPER_NO_TEXTURE_DECODE_CACHE") && persistent_decode_limit &&
-                            !has_live_rtt && r.img_dim == 1u && r.cls == RC::Texture &&
-                            r.format == prosper::gpu::DataFormat::Unorm8 && r.num_components == 4 &&
-                            !getenv("PROSPER_NODETILE") && prosper::gpu::tile_mode_is_tiled(r.tile_mode);
-                        const size_t persistent_source_size = persistent_cache_eligible
-                            ? prosper::gpu::tiled_surface_bytes(tw, th, r.tile_mode, persistent_pitch) : 0;
+                            !getenv("PROSPER_NO_TEXTURE_DECODE_CACHE") &&
+                            persistent_decode_limit &&
+                            (persistent_source_is_tiled || persistent_source_matches_pixels);
+                        const size_t persistent_source_size = persistent_source_matches_pixels
+                            ? static_cast<size_t>(tw) * th * 4
+                            : (persistent_source_is_tiled
+                                ? prosper::gpu::tiled_surface_bytes(
+                                      tw, th, r.tile_mode, persistent_pitch)
+                                : 0);
                         bool narrow_done = false;
                         auto reused = has_live_rtt ? decoded_textures.end()
                                                    : decoded_textures.find(decode_key);
@@ -362,17 +398,31 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             auto cached = persistent_decoded_textures.find(decode_key);
                             if (cached != persistent_decoded_textures.end() &&
                                 cached->second.source_size == persistent_source_size) {
-                                persistent_validation_scratch.resize(persistent_source_size);
-                                const size_t got = copy_resource(
-                                    persistent_validation_scratch.data(), r.gpu_addr,
-                                    persistent_source_size);
-                                if (got == cached->second.source_prefix.size() &&
-                                    (got == 0 || !std::memcmp(persistent_validation_scratch.data(),
-                                                              cached->second.source_prefix.data(), got))) {
+                                bool content_matches = false;
+                                if (cached->second.source_matches_pixels) {
+                                    size_t compared = 0;
+                                    content_matches = safe_equal(
+                                        cached->second.pixels.data(), r.gpu_addr,
+                                        persistent_source_size, compared) &&
+                                        compared == cached->second.source_prefix_size;
+                                } else {
+                                    persistent_validation_scratch.resize(persistent_source_size);
+                                    const size_t got = copy_resource(
+                                        persistent_validation_scratch.data(), r.gpu_addr,
+                                        persistent_source_size);
+                                    content_matches =
+                                        got == cached->second.source_prefix_size &&
+                                        got == cached->second.source_prefix.size() &&
+                                        (got == 0 || !std::memcmp(
+                                            persistent_validation_scratch.data(),
+                                            cached->second.source_prefix.data(), got));
+                                }
+                                if (content_matches) {
                                     cached->second.last_use = decode_generation;
                                     persistent_reuse = {cached->second.pixels.data(),
                                                         cached->second.output_height,
-                                                        cached->second.narrow};
+                                                        cached->second.narrow,
+                                                        cached->second.persistent_id};
                                     decoded_reuse = &persistent_reuse;
                                     if (timing_enabled) pending_timing.persistent_hits++;
                                 } else if (timing_enabled) {
@@ -389,12 +439,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             fr.td = is_volume ? r.depth : 1u;
                             fr.img_dim = r.img_dim;
                             narrow_done = decoded_reuse->narrow;
+                            fr.persistent_texture_id = decoded_reuse->persistent_id;
                             decoded_textures.emplace(
-                                decode_key, DecodedTexture{fr.tex_rgba, fr.th, narrow_done});
+                                decode_key, DecodedTexture{fr.tex_rgba, fr.th, narrow_done,
+                                                          fr.persistent_texture_id});
                             if (timing_enabled) pending_timing.texture_reuses++;
                         } else {
                         const size_t volume_texels = (size_t)tw * th * (is_volume ? r.depth : 1u);
                         size_t nb = volume_texels * 4 * (is_cube ? 6u : 1u);
+                        size_t linear_source_prefix_size = 0;
                         if (texstore_used == texstore.size()) texstore.emplace_back();
                         std::vector<uint8_t>& texture_pixels = texstore[texstore_used++];
                         texture_pixels.resize(nb);
@@ -632,6 +685,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             narrow_done = true;   // already detiled+expanded; skip the 32-bpp auto-detile below
                         } else {
                             const size_t got = copy_resource(texture_pixels.data(), r.gpu_addr, nb);
+                            linear_source_prefix_size = got;
                             if (got < nb)
                                 std::fill(texture_pixels.begin() + got, texture_pixels.end(), 0);
                         }
@@ -838,10 +892,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         fr.td = is_volume ? r.depth : 1u;
                         fr.img_dim = r.img_dim;
                         if (persistent_cache_eligible) {
-                            persistent_validation_scratch.resize(persistent_source_size);
-                            const size_t got = copy_resource(
-                                persistent_validation_scratch.data(), r.gpu_addr,
-                                persistent_source_size);
+                            size_t source_prefix_size = linear_source_prefix_size;
+                            if (!persistent_source_matches_pixels) {
+                                persistent_validation_scratch.resize(persistent_source_size);
+                                source_prefix_size = copy_resource(
+                                    persistent_validation_scratch.data(), r.gpu_addr,
+                                    persistent_source_size);
+                            }
                             auto old = persistent_decoded_textures.find(decode_key);
                             const bool can_replace = old == persistent_decoded_textures.end() ||
                                 old->second.last_use != decode_generation;
@@ -849,7 +906,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 persistent_decoded_texture_bytes -= old->second.bytes();
                                 persistent_decoded_textures.erase(old);
                             }
-                            const size_t required = got + texture_pixels.size();
+                            const size_t required =
+                                (persistent_source_matches_pixels ? 0 : source_prefix_size) +
+                                texture_pixels.size();
                             while (required <= persistent_decode_limit &&
                                    persistent_decoded_texture_bytes > persistent_decode_limit - required) {
                                 auto victim = persistent_decoded_textures.end();
@@ -868,24 +927,32 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 persistent_decoded_texture_bytes <= persistent_decode_limit - required) {
                                 PersistentDecodedTexture cached;
                                 cached.source_size = persistent_source_size;
-                                cached.source_prefix.assign(
-                                    persistent_validation_scratch.begin(),
-                                    persistent_validation_scratch.begin() + got);
+                                cached.source_prefix_size = source_prefix_size;
+                                cached.source_matches_pixels = persistent_source_matches_pixels;
+                                if (!persistent_source_matches_pixels)
+                                    cached.source_prefix.assign(
+                                        persistent_validation_scratch.begin(),
+                                        persistent_validation_scratch.begin() + source_prefix_size);
                                 cached.pixels = texture_pixels;
                                 cached.output_height = fr.th;
                                 cached.narrow = narrow_done;
                                 cached.last_use = decode_generation;
+                                cached.persistent_id = ++persistent_texture_id;
+                                if (!cached.persistent_id)
+                                    cached.persistent_id = ++persistent_texture_id;
                                 auto [inserted, ok] = persistent_decoded_textures.emplace(
                                     decode_key, std::move(cached));
                                 if (ok) {
                                     persistent_decoded_texture_bytes += inserted->second.bytes();
                                     fr.tex_rgba = inserted->second.pixels.data();
+                                    fr.persistent_texture_id = inserted->second.persistent_id;
                                 }
                             }
                         }
                         if (!resource_rtt_hit && !has_live_rtt)
                             decoded_textures.emplace(
-                                decode_key, DecodedTexture{fr.tex_rgba, fr.th, narrow_done});
+                                decode_key, DecodedTexture{fr.tex_rgba, fr.th, narrow_done,
+                                                          fr.persistent_texture_id});
                         }
                         // Carry the decoded S# sampler state (filter/wrap/mip) so the pipeline samples the
                         // way the game asked instead of a fixed LINEAR/clamp sampler (#<sampler-fix>).

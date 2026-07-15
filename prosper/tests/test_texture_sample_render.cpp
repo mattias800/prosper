@@ -121,6 +121,63 @@ int main() {
               "shared and legacy uploads with distinct view swizzles render byte-identically");
     }
 
+    // A non-zero content ID is an exact-validation proof supplied by the frontend. The backend may
+    // retain that uploaded image across render callbacks, but the diagnostic switch must preserve
+    // rendered output while forcing the old upload path for controlled A/B runs.
+    {
+        std::vector<uint32_t> ps(ps_template, ps_template + sizeof(ps_template)/sizeof(ps_template[0]));
+        ps[1] = C075; ps[3] = C025;
+        std::vector<uint32_t> frag = recompile_fragment(ps.data(), ps.size(), &rt);
+        prosper::test::FrameResource resource;
+        resource.binding = 4; resource.set = 1;
+        resource.tex_rgba = texels; resource.tw = 2; resource.th = 2;
+        resource.persistent_texture_id = 0x7020000000000001ull;
+        prosper::test::BackendDraw draw;
+        draw.vs = vert; draw.fs = frag; draw.R = {resource}; draw.vcount = 3;
+
+        std::vector<uint8_t> first = prosper::test::render_draws_rgba({draw}, W, H);
+        const auto first_stats = prosper::test::backend_texture_upload_stats();
+        std::vector<uint8_t> reused = prosper::test::render_draws_rgba({draw}, W, H);
+        const auto reused_stats = prosper::test::backend_texture_upload_stats();
+        CHECK(first_stats.persistent_misses == 1 && first_stats.unique_uploads == 1,
+              "first exact-validated texture version is uploaded into the persistent cache");
+        CHECK(reused_stats.persistent_hits == 1 && reused_stats.unique_uploads == 0 &&
+                  reused_stats.upload_bytes == 0,
+              "same exact-validated texture version skips its next callback upload");
+        CHECK(!first.empty() && first == reused,
+              "persistent texture reuse renders byte-identically to its initial upload");
+
+#ifdef _WIN32
+        _putenv_s("PROSPER_NO_BACKEND_PERSISTENT_TEXTURES", "1");
+#else
+        setenv("PROSPER_NO_BACKEND_PERSISTENT_TEXTURES", "1", 1);
+#endif
+        std::vector<uint8_t> bypassed = prosper::test::render_draws_rgba({draw}, W, H);
+        const auto bypassed_stats = prosper::test::backend_texture_upload_stats();
+#ifdef _WIN32
+        _putenv_s("PROSPER_NO_BACKEND_PERSISTENT_TEXTURES", "");
+#else
+        unsetenv("PROSPER_NO_BACKEND_PERSISTENT_TEXTURES");
+#endif
+        CHECK(bypassed_stats.persistent_hits == 0 && bypassed_stats.unique_uploads == 1,
+              "persistent texture disable switch restores an upload on every callback");
+        CHECK(reused == bypassed,
+              "persistent cache and forced-upload paths render byte-identically");
+
+        uint8_t changed_texels[sizeof(texels)];
+        std::memcpy(changed_texels, texels, sizeof(texels));
+        changed_texels[4] = 255;  // sampled top-right texel: green -> yellow
+        resource.tex_rgba = changed_texels;
+        resource.persistent_texture_id = 0x7020000000000002ull;
+        draw.R = {resource};
+        std::vector<uint8_t> changed = prosper::test::render_draws_rgba({draw}, W, H);
+        const auto changed_stats = prosper::test::backend_texture_upload_stats();
+        CHECK(changed_stats.persistent_misses == 1 && changed_stats.unique_uploads == 1,
+              "a new exact-validated content version cannot hit the prior image");
+        CHECK(!changed.empty() && changed != reused,
+              "a new content version uploads and renders its changed pixels");
+    }
+
     // The backend upload key includes depth and image dimensionality. Exercise a real 3D image here
     // so depth-1 3D resources cannot accidentally regress to a 2D Vulkan image/view during sharing.
     {

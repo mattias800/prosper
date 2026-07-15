@@ -98,6 +98,44 @@ The Vulkan regression test compares sharing on/off byte-for-byte while using sep
 views. It also renders a two-slice 3D texture twice, verifies the selected depth slice, and requires one
 depth-accounted upload. This protects the general 2D and 3D paths rather than only the Dead Cells shape.
 
+## Dead Cells cross-callback texture residency (2026-07-15)
+
+Per-call sharing removed duplicate uploads within one graphics span, but the same large immutable
+linear atlases were still copied from guest memory and uploaded again on every callback. The steady
+Dead Cells loading submit referenced 54 textures. Eleven distinct uploads remained and transferred
+96.3 MiB per callback, including unchanged 64 MiB, 32 MiB, and 8 MiB linear RGBA atlases.
+
+The frontend cache now exact-validates linear `Unorm8x4` sources as well as tiled sources. A validated
+content version receives a monotonic ID; any source-byte or readable-prefix change creates a new ID.
+The Vulkan backend retains only images with such an ID, under a 256 MiB / 1024-entry default bound.
+Render targets, storage images, captured host backing, and unvalidated formats never receive an ID.
+Per-call views and samplers remain independent, so descriptor swizzles and filtering are unchanged.
+
+Native Windows / RTX 4090, same RelWithDebInfo binary, fresh saves, documented full-render route, and
+matched 110-second samples:
+
+| Measurement | Forced upload | Persistent images |
+|---|---:|---:|
+| Late app rate | about 10.9 FPS | 13.7-14.4 FPS |
+| Late backend call | 36.8-37.9 ms | 17.7-19.0 ms |
+| Backend resource setup | 5.8-6.1 ms | 0.42-0.44 ms |
+| GPU fence wait | 21.8-22.6 ms | 8.1-9.5 ms |
+| Steady texture upload | 96.3 MiB/call | 0 |
+| Transient allocation pool | 375.3 MiB | 232.0 MiB |
+| Peak process working set | 2.20 GiB | 2.29 GiB |
+| Peak process private memory | 4.54 GiB | 4.60 GiB |
+
+Both runs reached `Loading level PrisonStart`; neither cleared the separately tracked loading
+starvation within the sample. The enabled run retained 15 frontend versions / 192.9 MiB and the same
+192.9 MiB of backend images, with zero invalidations and zero transient-pool discards. Private memory
+plateaued rather than growing without bound. The small residency increase is therefore the explicit
+cache tradeoff, not a return of the earlier multi-gigabyte per-draw allocation growth. Disable the
+backend half with `PROSPER_NO_BACKEND_PERSISTENT_TEXTURES=1`, or change its independent byte budget
+with `PROSPER_BACKEND_TEXTURE_CACHE_MB`.
+
+`test_texture_sample_render` verifies the initial miss/upload, a cross-callback hit with zero upload,
+byte-identical forced-upload output, and a new content version that cannot reuse the prior image.
+
 ## Current frame budget
 
 After the above changes, a representative renderer submit remains about 36-38 ms. Approximate costs
