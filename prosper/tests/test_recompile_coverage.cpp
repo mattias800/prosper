@@ -61,7 +61,7 @@ int main() {
     CHECK(recompile_valu(compute_vcc_loop_varying,
                          sizeof(compute_vcc_loop_varying)/sizeof(compute_vcc_loop_varying[0]), 0, 0).empty(),
           "a VCCZ-exit loop whose compare reads a varying VGPR still rejects in the compute shell");
-    // A genuinely nested/multi-branch compute CFG uses the subgroup-vote dispatcher fallback. This
+    // A genuinely nested/multi-branch compute CFG uses the hardware-wave-vote dispatcher fallback. This
     // is the reduced shape of UE4's volume-lighting kernel: varying VCC exit, an inner scalar branch,
     // and a backward loop edge. The simpler two-branch loop above deliberately remains rejected.
     const uint32_t compute_cfg_dispatch[] = {

@@ -2080,6 +2080,9 @@ std::vector<ComputeItem> realize_compute_dispatches(
         config.local_x = launch.local_x;
         config.local_y = launch.local_y;
         config.local_z = launch.local_z;
+        config.wave_size = ((dispatch.modifier >>
+            P::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT) &
+            P::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_MASK) ? 32u : 64u;
         config.tgid_x_en = field(P::COMPUTE_PGM_RSRC2_TGID_X_EN_SHIFT,
                                  P::COMPUTE_PGM_RSRC2_TGID_X_EN_MASK) != 0;
         config.tgid_y_en = field(P::COMPUTE_PGM_RSRC2_TGID_Y_EN_SHIFT,

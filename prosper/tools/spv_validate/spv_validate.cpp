@@ -137,7 +137,7 @@ int main(int argc, char** argv) {
     { const uint32_t c[] = {0x7C040CF9u,0x06869880u,0x8DEA6A18u,0xBF810000u};
       dump(dir, "compute_mask_nor", recompile_valu(c, sizeof(c)/4, 0, 0)); }
     // Compute: nested/multi-branch CFG dispatcher (varying VCC exit + inner SCC branch + back-edge).
-    // Locks both structured switch-loop formation and the subgroup Any vote used for wave branches.
+    // Locks both structured switch-loop formation and the workgroup-scratch hardware-wave vote.
     { const uint32_t c[] = {0xBE800380u,0x7E000280u,0x7E020300u,
                             0xD7610013u,0x00014A7Eu,0xD7610013u,0x0001507Fu,
                             0xD760000Eu,0x00014B13u,0xD760000Fu,0x00015113u,0xBEFE040Eu,
