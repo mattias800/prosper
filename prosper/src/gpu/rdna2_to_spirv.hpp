@@ -31,6 +31,18 @@ struct PixelInputMapping {
     bool operator==(const PixelInputMapping&) const = default;
 };
 
+// Fixed-function per-pixel VGPR loads selected by SPI_PS_INPUT_ENA / SPI_PS_INPUT_ADDR. ENA says
+// which values hardware computes and loads; ADDR also reserves VGPR slots for disabled values, so it
+// participates in the destination-register mapping. The fragment shell currently materializes the
+// four floating-point position terms through SPIR-V FragCoord; the remaining enabled terms still
+// reserve their documented slots for faithful position placement.
+struct PixelSystemInputMapping {
+    uint32_t ena = 0;
+    uint32_t addr = 0;
+
+    bool operator==(const PixelSystemInputMapping&) const = default;
+};
+
 // Translate a straight-line float-VALU RDNA2 stream to a compute-shader SPIR-V module.
 // Returns {} if the stream contains an opcode/format this stage does not yet handle. An optional
 // ShaderResourceTable routes SMEM constant-buffer loads to distinct bindings via descriptor provenance.
@@ -63,7 +75,8 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
 // target write vec4(src0..3) to the location-0 color output. Returns {} if unsupported / no export.
 // An optional ShaderResourceTable enables memory ops (SMEM/MUBUF) with resolved bindings.
 std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
-                                         const ShaderResourceTable* rt = nullptr);
+                                         const ShaderResourceTable* rt = nullptr,
+                                         const PixelSystemInputMapping* system_inputs = nullptr);
 
 // Recompile a vertex shader to a vertex SPIR-V module: v0 = gl_VertexIndex, run the VALU, and on EXP
 // to a POS target write vec4(src0..3) to gl_Position. Returns {} if unsupported / no position export.

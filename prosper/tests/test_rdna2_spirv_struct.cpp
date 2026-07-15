@@ -97,6 +97,20 @@ bool has_decoration(const std::vector<uint32_t>& spv, uint32_t decoration) {
     return false;
 }
 
+bool has_builtin(const std::vector<uint32_t>& spv, uint32_t builtin) {
+    enum : uint32_t { OpDecorateL = 71, DecBuiltIn = 11 };
+    if (spv.size() < 5) return false;
+    for (size_t i = 5; i < spv.size();) {
+        uint32_t word = spv[i];
+        uint32_t op = word & 0xffffu, wc = word >> 16u;
+        if (wc == 0 || i + wc > spv.size()) return false;
+        if (op == OpDecorateL && wc >= 4 && spv[i + 2] == DecBuiltIn && spv[i + 3] == builtin)
+            return true;
+        i += wc;
+    }
+    return false;
+}
+
 // The largest OpTypeArray length (resolved through its OpConstant) in the module — for LDS sizing
 // (#130), the Workgroup LDS array is the biggest array the compute shell declares.
 uint32_t max_array_length(const std::vector<uint32_t>& spv) {
@@ -366,6 +380,25 @@ int main() {
         return 1;
     }
     printf("  [ok]   mixed flat+smooth read of one attribute is rejected\n");
+
+    // Pixel-system VGPR initialization: with perspective sample/center enabled, disabled
+    // centroid/pull-model slots reserved by ADDR, and position X/Y enabled, the packed destinations
+    // are v12/v13. The fragment shell must source those values from gl_FragCoord rather than the
+    // old undefined-register zero. Encodings: exp mrt0 v12,v13,0,1; s_endpgm. BuiltIn FragCoord=15.
+    const uint32_t ps_position[] = {
+        0x7e1c0280u, 0x7e1e02f2u, // v_mov v14,0; v_mov v15,1
+        0xf800000fu, 0x0f0e0d0cu, 0xbf810000u,
+    };
+    PixelSystemInputMapping sys{};
+    sys.ena = (1u << 0) | (1u << 1) | (1u << 8) | (1u << 9);
+    sys.addr = sys.ena | (1u << 2) | (1u << 3) | (1u << 6) | (1u << 7);
+    std::vector<uint32_t> position_spv = recompile_fragment(
+        ps_position, sizeof(ps_position)/sizeof(ps_position[0]), nullptr, &sys);
+    if (position_spv.empty() || !has_builtin(position_spv, 15)) {
+        printf("  [FAIL] enabled POS_X/Y_FLOAT system VGPRs do not materialize gl_FragCoord\n");
+        return 1;
+    }
+    printf("  [ok]   packed POS_X/Y_FLOAT system VGPRs source gl_FragCoord\n");
 
     printf("== PASS ==\n");
     return 0;

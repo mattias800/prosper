@@ -77,6 +77,8 @@ RenderState extract_render_state(const GpuState& st) {
         rs.ps_input_cntl[i] = it->second;
         rs.ps_input_cntl_valid_mask |= 1u << i;
     }
+    rs.ps_input_ena = rd(st.cx, P::SPI_PS_INPUT_ENA);
+    rs.ps_input_addr = rd(st.cx, P::SPI_PS_INPUT_ADDR);
 
     // Color MRT 0 (context register file).
     rs.color0_base            = addr_of(rd(st.cx, P::CB_COLOR0_BASE), rd(st.cx, P::CB_COLOR0_BASE_EXT));

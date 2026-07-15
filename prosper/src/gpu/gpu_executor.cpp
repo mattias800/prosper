@@ -79,6 +79,8 @@ struct ShaderCompileKey {
     bool force_position_w = false;
     bool has_pixel_inputs = false;
     PixelInputMapping pixel_inputs{};
+    bool has_system_inputs = false;
+    PixelSystemInputMapping system_inputs{};
     std::vector<uint32_t> code;
     std::vector<ShaderResourceCompileKey> resources;
 
@@ -105,6 +107,11 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, key.pixel_inputs.valid_mask);
             for (uint32_t control : key.pixel_inputs.controls)
                 hash = hash_mix(hash, control);
+        }
+        hash = hash_mix(hash, key.has_system_inputs);
+        if (key.has_system_inputs) {
+            hash = hash_mix(hash, key.system_inputs.ena);
+            hash = hash_mix(hash, key.system_inputs.addr);
         }
         hash = hash_mix(hash, key.code.size());
         for (uint32_t word : key.code) hash = hash_mix(hash, word);
@@ -275,18 +282,22 @@ uint64_t shader_cache_entry_bytes(const ShaderCompileKey& key, const std::vector
     return static_cast<uint64_t>(key.code.size()) * sizeof(uint32_t) +
            static_cast<uint64_t>(key.resources.size()) * sizeof(ShaderResourceCompileKey) +
            (key.has_pixel_inputs ? sizeof(PixelInputMapping) : 0u) +
+           (key.has_system_inputs ? sizeof(PixelSystemInputMapping) : 0u) +
            static_cast<uint64_t>(spirv.size()) * sizeof(uint32_t);
 }
 
 ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_t* code, size_t dwords,
                                          const ShaderResourceTable* resources,
-                                         const PixelInputMapping* pixel_inputs) {
+                                         const PixelInputMapping* pixel_inputs,
+                                         const PixelSystemInputMapping* system_inputs) {
     ShaderCompileKey key;
     key.stage = stage;
     key.has_resource_table = resources != nullptr;
     key.force_position_w = getenv("PROSPER_FORCE_W") != nullptr;
     key.has_pixel_inputs = stage == ShaderProgramStage::Vertex && pixel_inputs != nullptr;
     if (key.has_pixel_inputs) key.pixel_inputs = *pixel_inputs;
+    key.has_system_inputs = stage == ShaderProgramStage::Fragment && system_inputs != nullptr;
+    if (key.has_system_inputs) key.system_inputs = *system_inputs;
     if (code && dwords) {
         std::vector<Rdna2Inst> instructions;
         const size_t consumed = rdna2_walk(code, dwords, instructions);
@@ -312,7 +323,8 @@ std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const Sh
         return recompile_vertex(code, key.code.size(), resources,
                                 key.has_pixel_inputs ? &key.pixel_inputs : nullptr);
     if (stage == ShaderProgramStage::Fragment)
-        return recompile_fragment(code, key.code.size(), resources);
+        return recompile_fragment(code, key.code.size(), resources,
+                                  key.has_system_inputs ? &key.system_inputs : nullptr);
     return {};
 }
 
@@ -337,8 +349,10 @@ void clear_shader_decode_cache() {
 std::vector<uint32_t> recompile_graphics_shader_cached(ShaderProgramStage stage,
                                                        const uint32_t* code, size_t dwords,
                                                        const ShaderResourceTable* resources,
-                                                       const PixelInputMapping* pixel_inputs) {
-    ShaderCompileKey key = make_shader_compile_key(stage, code, dwords, resources, pixel_inputs);
+                                                       const PixelInputMapping* pixel_inputs,
+                                                       const PixelSystemInputMapping* system_inputs) {
+    ShaderCompileKey key = make_shader_compile_key(stage, code, dwords, resources, pixel_inputs,
+                                                   system_inputs);
     if (getenv("PROSPER_NO_SHADER_CACHE")) {
         auto& cache = shader_cache();
         {

@@ -28,6 +28,12 @@ struct RenderState {
     std::array<uint32_t, 32> ps_input_cntl{};
     uint32_t ps_input_cntl_valid_mask = 0;
 
+    // Hardware-provided PS VGPR inputs (barycentrics, floating-point position, face/sample data).
+    // INPUT_ADDR controls slot reservation even for terms disabled in INPUT_ENA, so both raw words
+    // are retained for the fragment recompiler.
+    uint32_t ps_input_ena = 0;
+    uint32_t ps_input_addr = 0;
+
     // Color MRT 0. format/number_type/comp_swap together select the VkFormat (see vk_translate).
     uint64_t color0_base        = 0;   // byte address (CB_COLOR0_BASE + BASE_EXT)
     uint32_t color0_format      = 0;   // CB_COLOR0_INFO.FORMAT       (surface format)

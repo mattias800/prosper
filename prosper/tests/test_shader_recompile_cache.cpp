@@ -107,6 +107,22 @@ int main() {
               stats.misses == mapping_misses + 2 && stats.hits == mapping_hits + 1,
           "pixel-input mappings participate in the vertex shader cache key");
 
+    // Fragment system-input placement changes SPIR-V declarations and the initial VGPR values.
+    // Both ENA and ADDR therefore belong to the cache key.
+    const uint64_t system_misses = stats.misses;
+    PixelSystemInputMapping system_inputs{0x00000303u, 0x00000303u};
+    const auto system_once = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, kPs, std::size(kPs), nullptr, nullptr, &system_inputs);
+    const auto system_again = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, kPs, std::size(kPs), nullptr, nullptr, &system_inputs);
+    system_inputs.addr |= 1u << 2;
+    const auto system_remapped = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, kPs, std::size(kPs), nullptr, nullptr, &system_inputs);
+    stats = shader_recompile_cache_stats();
+    CHECK(!system_once.empty() && system_again == system_once && !system_remapped.empty() &&
+              stats.misses == system_misses + 2,
+          "pixel-system ENA/ADDR mappings participate in the fragment shader cache key");
+
     clear_shader_recompile_cache();
     stats = shader_recompile_cache_stats();
     CHECK(stats.entries == 0 && stats.hits == 0 && stats.misses == 0 && stats.bytes == 0,
