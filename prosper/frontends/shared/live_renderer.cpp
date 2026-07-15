@@ -223,6 +223,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 double backend_readback_ms = 0, backend_cleanup_ms = 0;
                 double backend_setup_shader_ms = 0, backend_setup_fixed_ms = 0;
                 double backend_setup_resources_ms = 0, backend_setup_pipeline_ms = 0;
+                uint64_t backend_pipeline_refs = 0, backend_pipeline_hits = 0;
+                uint64_t backend_pipeline_misses = 0, backend_pipeline_bypasses = 0;
+                uint64_t backend_pipeline_entries = 0, backend_pipeline_evictions = 0;
                 uint64_t textures = 0, texture_reuses = 0, buffers = 0;
                 uint64_t persistent_hits = 0, persistent_misses = 0, persistent_invalidations = 0;
                 uint64_t persistent_submit_reuses = 0, persistent_validations = 0;
@@ -249,7 +252,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             }
             const auto callback_timing_start = timing_enabled
                 ? RenderClock::now() : RenderClock::time_point{};
-            auto record_backend_timing = [&](const prosper::test::BackendRenderTimingStats& backend) {
+            auto record_backend_timing = [&]
+                (const prosper::test::BackendRenderTimingStats& backend,
+                 const prosper::test::BackendPipelineCacheStats& pipelines) {
                 pending_timing.backend_calls += backend.calls;
                 pending_timing.backend_draws += backend.draws;
                 pending_timing.backend_target_ms += backend.target_ms;
@@ -262,6 +267,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 pending_timing.backend_setup_fixed_ms += backend.setup_fixed_ms;
                 pending_timing.backend_setup_resources_ms += backend.setup_resources_ms;
                 pending_timing.backend_setup_pipeline_ms += backend.setup_pipeline_ms;
+                pending_timing.backend_pipeline_refs += pipelines.references;
+                pending_timing.backend_pipeline_hits += pipelines.hits;
+                pending_timing.backend_pipeline_misses += pipelines.misses;
+                pending_timing.backend_pipeline_bypasses += pipelines.bypasses;
+                pending_timing.backend_pipeline_entries = pipelines.entries;
+                pending_timing.backend_pipeline_evictions += pipelines.evictions;
             };
             auto print_rtt_timing = [](const RttTimingRecord& record) {
                 const prosper::test::BackendRenderTimingStats& timing = record.timing;
@@ -1260,6 +1271,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     prosper::test::BackendDraw bd;
                     bd.vs     = refvs ? refvs_spv : it.vs;
                     bd.fs     = ps_override.empty() ? it.fs : ps_override;
+                    bd.vs_identity = refvs ? 0 : it.vs_identity;
+                    bd.fs_identity = ps_override.empty() ? it.fs_identity : 0;
                     bd.vcount = refvs ? 3u : it.vertex_count;
                     bd.ps     = nops ? nullptr : &it.ps;
                     bd.R      = build_R(it, it.vrt.get(), it.prt.get());
@@ -1460,12 +1473,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     const prosper::test::BackendRenderTimingStats backend_call_timing = timing_enabled
                         ? prosper::test::backend_render_timing_stats()
                         : prosper::test::BackendRenderTimingStats{};
+                    const prosper::test::BackendPipelineCacheStats backend_pipeline_stats = timing_enabled
+                        ? prosper::test::backend_pipeline_cache_stats()
+                        : prosper::test::BackendPipelineCacheStats{};
                     if (timing_enabled) {
                         pending_timing.build_resources_ms +=
                             std::chrono::duration<double, std::milli>(build_done - build_start).count();
                         pending_timing.backend_ms +=
                             std::chrono::duration<double, std::milli>(backend_done - build_done).count();
-                        record_backend_timing(backend_call_timing);
+                        record_backend_timing(backend_call_timing, backend_pipeline_stats);
                     }
                     auto pass_pixels = std::make_shared<const std::vector<uint8_t>>(std::move(gpx));
                     if (base && !pass_pixels->empty()) {
@@ -1623,12 +1639,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 const prosper::test::BackendRenderTimingStats backend_call_timing = timing_enabled
                     ? prosper::test::backend_render_timing_stats()
                     : prosper::test::BackendRenderTimingStats{};
+                const prosper::test::BackendPipelineCacheStats backend_pipeline_stats = timing_enabled
+                    ? prosper::test::backend_pipeline_cache_stats()
+                    : prosper::test::BackendPipelineCacheStats{};
                 if (timing_enabled) {
                     pending_timing.build_resources_ms +=
                         std::chrono::duration<double, std::milli>(build_done - build_start).count();
                     pending_timing.backend_ms +=
                         std::chrono::duration<double, std::milli>(backend_done - build_done).count();
-                    record_backend_timing(backend_call_timing);
+                    record_backend_timing(backend_call_timing, backend_pipeline_stats);
                 }
                 // RTT (#167): cache these rendered pixels under this submit's render-target base, so a later
                 // composite pass that samples that address gets the scene we drew (not empty guest memory).
@@ -1704,6 +1723,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     double backend_readback_ms = 0, backend_cleanup_ms = 0;
                     double backend_setup_shader_ms = 0, backend_setup_fixed_ms = 0;
                     double backend_setup_resources_ms = 0, backend_setup_pipeline_ms = 0;
+                    uint64_t backend_pipeline_refs = 0, backend_pipeline_hits = 0;
+                    uint64_t backend_pipeline_misses = 0, backend_pipeline_bypasses = 0;
+                    uint64_t backend_pipeline_entries = 0, backend_pipeline_evictions = 0;
                     uint64_t textures = 0, texture_reuses = 0, buffers = 0;
                     uint64_t persistent_hits = 0, persistent_misses = 0, persistent_invalidations = 0;
                     uint64_t persistent_submit_reuses = 0, persistent_validations = 0;
@@ -1732,6 +1754,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     timing.backend_setup_fixed_ms += pending_timing.backend_setup_fixed_ms;
                     timing.backend_setup_resources_ms += pending_timing.backend_setup_resources_ms;
                     timing.backend_setup_pipeline_ms += pending_timing.backend_setup_pipeline_ms;
+                    timing.backend_pipeline_refs += pending_timing.backend_pipeline_refs;
+                    timing.backend_pipeline_hits += pending_timing.backend_pipeline_hits;
+                    timing.backend_pipeline_misses += pending_timing.backend_pipeline_misses;
+                    timing.backend_pipeline_bypasses += pending_timing.backend_pipeline_bypasses;
+                    timing.backend_pipeline_entries = pending_timing.backend_pipeline_entries;
+                    timing.backend_pipeline_evictions += pending_timing.backend_pipeline_evictions;
                     timing.textures += pending_timing.textures;
                     timing.texture_reuses += pending_timing.texture_reuses;
                     timing.persistent_hits += pending_timing.persistent_hits;
@@ -1779,6 +1807,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             totals.backend_setup_fixed_ms / nsub,
                             totals.backend_setup_resources_ms / nsub,
                             totals.backend_setup_pipeline_ms / nsub);
+                    fprintf(stderr,
+                            "[render-timing] backend-submit pipelines refs=%.1f hits=%.1f misses=%.1f "
+                            "bypass=%.1f entries=%llu evictions=%.1f\n",
+                            totals.backend_pipeline_refs / nsub,
+                            totals.backend_pipeline_hits / nsub,
+                            totals.backend_pipeline_misses / nsub,
+                            totals.backend_pipeline_bypasses / nsub,
+                            (unsigned long long)totals.backend_pipeline_entries,
+                            totals.backend_pipeline_evictions / nsub);
                     fprintf(stderr,
                             "[render-timing] resources textures=%llu reused=%llu %.1f MiB %.2f ms/submit; "
                             "buffers=%llu %.1f MiB %.2f ms/submit\n",
@@ -1849,6 +1886,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             window.backend_setup_fixed_ms / wn,
                             window.backend_setup_resources_ms / wn,
                             window.backend_setup_pipeline_ms / wn);
+                    fprintf(stderr,
+                            "[render-window] backend-submit pipelines refs=%.1f hits=%.1f misses=%.1f "
+                            "bypass=%.1f entries=%llu evictions=%.1f\n",
+                            window.backend_pipeline_refs / wn,
+                            window.backend_pipeline_hits / wn,
+                            window.backend_pipeline_misses / wn,
+                            window.backend_pipeline_bypasses / wn,
+                            (unsigned long long)window.backend_pipeline_entries,
+                            window.backend_pipeline_evictions / wn);
                     fprintf(stderr,
                             "[render-window] texture_cache hits=%.1f submit_reuse=%.1f misses=%.1f "
                             "invalid=%.1f validations=%.1f %.1f MiB\n",

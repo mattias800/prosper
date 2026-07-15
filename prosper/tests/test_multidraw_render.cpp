@@ -18,13 +18,17 @@ static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
                          else       { printf("  [ok]   %s\n", m); } } while (0)
 
+static void set_env(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) setenv(name, value, 1); else unsetenv(name);
+#endif
+}
+
 int main() {
     printf("== test_multidraw_render ==\n");
-#ifdef _WIN32
-    _putenv_s("PROSPER_RENDER_TIMING", "1");
-#else
-    setenv("PROSPER_RENDER_TIMING", "1", 1);
-#endif
+    set_env("PROSPER_RENDER_TIMING", "1");
     const uint32_t W = 64, H = 64;
 
     // Known-good fullscreen-triangle vertex shader (SPIR-V), shared by both draws.
@@ -80,6 +84,27 @@ int main() {
         CHECK(timing.draw_setup_ms + 0.001 >= timing.setup_shader_ms + timing.setup_fixed_ms +
                   timing.setup_resources_ms + timing.setup_pipeline_ms,
               "draw-setup subphases fit inside the backend draw-setup phase");
+        const prosper::test::BackendPipelineCacheStats first_cache =
+            prosper::test::backend_pipeline_cache_stats();
+        CHECK(first_cache.references == 2 && first_cache.hits == 1 && first_cache.misses == 1,
+              "pipeline cache reuses the prior opaque pipeline but separates blend state");
+
+        std::vector<uint8_t> cached = prosper::test::render_draws_rgba({d0, d1}, W, H);
+        const prosper::test::BackendPipelineCacheStats cached_stats =
+            prosper::test::backend_pipeline_cache_stats();
+        CHECK(cached == px, "persistent pipeline hits preserve multi-draw pixels byte-for-byte");
+        CHECK(cached_stats.references == 2 && cached_stats.hits == 2 && cached_stats.misses == 0,
+              "repeated draw contracts hit the persistent pipeline cache");
+
+        set_env("PROSPER_NO_BACKEND_PIPELINE_CACHE", "1");
+        std::vector<uint8_t> bypassed = prosper::test::render_draws_rgba({d0, d1}, W, H);
+        const prosper::test::BackendPipelineCacheStats bypassed_stats =
+            prosper::test::backend_pipeline_cache_stats();
+        set_env("PROSPER_NO_BACKEND_PIPELINE_CACHE", nullptr);
+        CHECK(bypassed == px, "pipeline-cache disable A/B preserves output byte-for-byte");
+        CHECK(bypassed_stats.references == 2 && bypassed_stats.bypasses == 2 &&
+                  bypassed_stats.hits == 0,
+              "pipeline-cache disable A/B bypasses every lookup");
     }
 
     // A guest depth/stencil surface survives renderer calls. The first call writes stencil=2 with no

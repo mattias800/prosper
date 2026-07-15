@@ -43,19 +43,25 @@ int main() {
     table.resources.push_back(resource);
 
     const auto direct_vs = recompile_vertex(kVs, std::size(kVs), &table);
+    uint64_t first_identity = 0;
     const auto cached_vs = recompile_graphics_shader_cached(
-        ShaderProgramStage::Vertex, kVs, std::size(kVs), &table);
+        ShaderProgramStage::Vertex, kVs, std::size(kVs), &table, nullptr, nullptr,
+        &first_identity);
     CHECK(!direct_vs.empty() && cached_vs == direct_vs,
           "cache miss is byte-identical to the direct vertex recompiler");
     auto stats = shader_recompile_cache_stats();
     CHECK(stats.misses == 1 && stats.hits == 0 && stats.entries == 1,
           "first shader realization records one cache miss");
 
+    uint64_t repeated_identity = 0;
     const auto repeated_vs = recompile_graphics_shader_cached(
-        ShaderProgramStage::Vertex, kVs, std::size(kVs), &table);
+        ShaderProgramStage::Vertex, kVs, std::size(kVs), &table, nullptr, nullptr,
+        &repeated_identity);
     stats = shader_recompile_cache_stats();
     CHECK(repeated_vs == direct_vs && stats.hits == 1 && stats.misses == 1,
           "identical code and descriptor semantics hit the cache");
+    CHECK(first_identity != 0 && repeated_identity == first_identity,
+          "shader cache hits preserve a non-zero compiled-shader identity");
 
     // These fields are consumed by the runtime backend, not by the recompiler. Changing them must
     // reuse SPIR-V while each DrawItem continues to carry the new table to descriptor upload.
@@ -123,10 +129,17 @@ int main() {
               stats.misses == system_misses + 2,
           "pixel-system ENA/ADDR mappings participate in the fragment shader cache key");
 
+    const uint64_t identity_before_clear = first_identity;
     clear_shader_recompile_cache();
     stats = shader_recompile_cache_stats();
     CHECK(stats.entries == 0 && stats.hits == 0 && stats.misses == 0 && stats.bytes == 0,
           "cache reset clears entries and instrumentation");
+    uint64_t identity_after_clear = 0;
+    (void)recompile_graphics_shader_cached(
+        ShaderProgramStage::Vertex, kVs, std::size(kVs), &table, nullptr, nullptr,
+        &identity_after_clear);
+    CHECK(identity_after_clear > identity_before_clear,
+          "cache reset never recycles compiled-shader identities");
 
     if (failures) {
         std::printf("== FAIL: %d ==\n", failures);

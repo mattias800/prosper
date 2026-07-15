@@ -176,6 +176,7 @@ struct ShaderCompileKeyHash {
 
 struct CachedShader {
     std::vector<uint32_t> spirv;
+    uint64_t identity = 0;
     uint64_t last_use = 0;
     uint64_t bytes = 0;
 };
@@ -185,6 +186,7 @@ struct ShaderCache {
     std::unordered_map<ShaderCompileKey, CachedShader, ShaderCompileKeyHash> entries;
     ShaderRecompileCacheStats stats;
     uint64_t use_counter = 0;
+    uint64_t next_identity = 1;
 };
 
 ShaderCache& shader_cache() {
@@ -488,7 +490,9 @@ std::vector<uint32_t> recompile_graphics_shader_cached(ShaderProgramStage stage,
                                                        const uint32_t* code, size_t dwords,
                                                        const ShaderResourceTable* resources,
                                                        const PixelInputMapping* pixel_inputs,
-                                                       const PixelSystemInputMapping* system_inputs) {
+                                                       const PixelSystemInputMapping* system_inputs,
+                                                       uint64_t* cache_identity) {
+    if (cache_identity) *cache_identity = 0;
     ShaderCompileKey key = make_shader_compile_key(stage, code, dwords, resources, pixel_inputs,
                                                    system_inputs);
     if (getenv("PROSPER_NO_SHADER_CACHE")) {
@@ -506,6 +510,7 @@ std::vector<uint32_t> recompile_graphics_shader_cached(ShaderProgramStage stage,
     if (found != cache.entries.end()) {
         ++cache.stats.hits;
         found->second.last_use = ++cache.use_counter;
+        if (cache_identity) *cache_identity = found->second.identity;
         return found->second.spirv;
     }
 
@@ -530,8 +535,10 @@ std::vector<uint32_t> recompile_graphics_shader_cached(ShaderProgramStage stage,
     if (bytes <= limit && max_entries != 0) {
         CachedShader value;
         value.spirv = spirv;
+        value.identity = cache.next_identity++;
         value.last_use = ++cache.use_counter;
         value.bytes = bytes;
+        if (cache_identity) *cache_identity = value.identity;
         cache.stats.bytes += bytes;
         cache.entries.emplace(std::move(key), std::move(value));
     }
