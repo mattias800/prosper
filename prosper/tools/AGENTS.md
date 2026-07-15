@@ -139,9 +139,10 @@ lifetime evidence proves the suffix contains the target's beginning, then inspec
 `gpu_replay --bundle-intermediate-through-target WxH` omits later passes from non-final submits only when
 dependency evidence proves that the named target family is the sole temporal image frontier.
 `gpu_replay --bundle-final-capsule PATH` exports the complete live color RTT cache plus exact valid planes from
-the persistent Vulkan depth/stencil cache into a capture-v8 capsule. Verify its standalone output hash against
+the persistent Vulkan depth/stencil cache into a capture-v9 capsule, including base-level depth for 3D image
+resources. Verify its standalone output hash against
 the bundle before using it for rapid final-submit isolation. `--inspect-only` prints each DS seed's full cache
-identity, format, independent validity flags, byte counts, and hashes. Captures v1-v7 remain readable without
+identity, format, independent validity flags, byte counts, and hashes. Captures v1-v8 remain readable without
 invented DS state.
 `gpu_replay --bundle-extract-submit N PATH` materializes one exact manifest for normal inspect/graph/validate
 work without replaying the bundle.

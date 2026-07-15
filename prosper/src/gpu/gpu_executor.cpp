@@ -1297,7 +1297,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                         bool mapped = false;
                         for (auto& r0 : t.resources)
                             if (r0.cls == ResourceClass::Texture && r0.gpu_addr == d.base &&
-                                r0.width == d.width && r0.height == d.height) {
+                                r0.width == d.width && r0.height == d.height && r0.depth == d.depth) {
                                 if (r0.fetch_pc == 0xFFFFFFFFu) { r0.fetch_pc = u.use_pc; mapped = true; break; }
                                 if (r0.fetch_pc == u.use_pc)    { mapped = true; break; }
                             }
@@ -1318,15 +1318,18 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     ShaderResource r;
                     r.cls = ResourceClass::Texture;
                     r.format = fi.format; r.num_components = fi.num_components;
-                    r.gpu_addr = d.base; r.width = d.width; r.height = d.height;
+                    r.gpu_addr = d.base; r.width = d.width; r.height = d.height; r.depth = d.depth;
                     r.tile_mode = d.tile_mode; r.srgb = fi.srgb;
                     // T# TYPE -> MIMG dim (GFX10: 9=2D, 10=3D, 11=CUBE, 13=2D_ARRAY); a cube
                     // uploads as six vertically-stacked faces (#273 — see agc_shader_layout).
                     r.img_dim = image_type_to_dim(d.type);
                     r.swizzle[0] = d.dst_sel[0]; r.swizzle[1] = d.dst_sel[1];
                     r.swizzle[2] = d.dst_sel[2]; r.swizzle[3] = d.dst_sel[3];
-                    r.size = is_bcn ? (((d.width + 3) / 4) * ((d.height + 3) / 4) * fi.bytes_per_block)
-                                    : (d.width * d.height * fi.bytes_per_block);
+                    const uint64_t backing_bytes = is_bcn
+                        ? static_cast<uint64_t>((d.width + 3) / 4) * ((d.height + 3) / 4) * d.depth * fi.bytes_per_block
+                        : static_cast<uint64_t>(d.width) * d.height * d.depth * fi.bytes_per_block;
+                    if (!backing_bytes || backing_bytes > UINT32_MAX) continue;
+                    r.size = static_cast<uint32_t>(backing_bytes);
                     r.srt_offset = clash ? 0xFFFFFFFFu : u.key;   // ambiguous/absent key: pc-only provenance
                     r.fetch_pc   = u.use_pc;                       // per-instruction provenance (#273)
                     if (u.has_samp) {                     // paired S# (same SQ_IMG_SAMP decode as the sharp path)
@@ -1600,7 +1603,8 @@ std::vector<ComputeItem> realize_compute_dispatches(
                                                                : ResourceClass::Texture;
                         for (auto& r0 : table->resources)
                             if (r0.cls == wanted &&
-                                r0.gpu_addr == d.base && r0.width == d.width && r0.height == d.height) {
+                                r0.gpu_addr == d.base && r0.width == d.width && r0.height == d.height &&
+                                r0.depth == d.depth) {
                                 if (r0.fetch_pc == 0xFFFFFFFFu) { r0.fetch_pc = u.use_pc; mapped = true; break; }
                                 if (r0.fetch_pc == u.use_pc)    { mapped = true; break; }
                             }
@@ -1619,18 +1623,18 @@ std::vector<ComputeItem> realize_compute_dispatches(
                         r.format = fi.format; r.num_components = fi.num_components;
                         const bool is_bcn = fi.block_width > 1;
                         const uint64_t bytes = is_bcn
-                            ? static_cast<uint64_t>((d.width + 3) / 4) * ((d.height + 3) / 4) * fi.bytes_per_block
-                            : static_cast<uint64_t>(d.width) * d.height * fi.bytes_per_block;
+                            ? static_cast<uint64_t>((d.width + 3) / 4) * ((d.height + 3) / 4) * d.depth * fi.bytes_per_block
+                            : static_cast<uint64_t>(d.width) * d.height * d.depth * fi.bytes_per_block;
                         if (!bytes || bytes > UINT32_MAX) continue;
                         r.size = static_cast<uint32_t>(bytes);
                         r.srgb = fi.srgb;
                     } else {
-                        const uint64_t bytes = static_cast<uint64_t>(d.width) * d.height * 4;
+                        const uint64_t bytes = static_cast<uint64_t>(d.width) * d.height * d.depth * 4;
                         if (!bytes || bytes > UINT32_MAX) continue;
                         r.format = DataFormat::Unknown; r.num_components = 4;
                         r.size = static_cast<uint32_t>(bytes);
                     }
-                    r.gpu_addr = d.base; r.width = d.width; r.height = d.height;
+                    r.gpu_addr = d.base; r.width = d.width; r.height = d.height; r.depth = d.depth;
                     r.tile_mode = d.tile_mode;
                     r.img_dim = image_type_to_dim(d.type);
                     r.swizzle[0] = d.dst_sel[0]; r.swizzle[1] = d.dst_sel[1];
@@ -1639,6 +1643,27 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     r.fetch_pc = u.use_pc;               // per-use pc provenance (the image op)
                     table->resources.push_back(r);
                 }
+            }
+        }
+        // A direct compute "constant buffer" can actually be an SRT address pair consumed by
+        // s_load_dword[xN]. Its adjacent SGPRs are not V# NUM_RECORDS/format words, so decoding them
+        // as a four-dword V# can produce a nonsense one-byte bound. Size these pointer-backed tables
+        // from the shader's immediate s_load accesses, but only when that exact guest range is mapped.
+        for (auto& resource : table->resources) {
+            if (resource.cls != ResourceClass::ConstantBuffer ||
+                resource.sgpr_base == 0xFFFFFFFFu || !resource.gpu_addr)
+                continue;
+            const uint32_t required = rdna2_sload_required_bytes(
+                reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
+                0x4000, resource.sgpr_base);
+            if (required > resource.size && required <= 0x10000000u &&
+                guest_readable(resource.gpu_addr, required)) {
+                if (std::getenv("PROSPER_DBG"))
+                    std::fprintf(stderr,
+                                 "[compute-sload-range] s%u addr=0x%llx decoded=%u inferred=%u\n",
+                                 resource.sgpr_base, (unsigned long long)resource.gpu_addr,
+                                 resource.size, required);
+                resource.size = required;
             }
         }
         assign_convention_bindings(*table, 2);
@@ -1738,9 +1763,30 @@ std::vector<ComputeItem> realize_compute_dispatches(
         if (!report.ok()) {
             record_failure(RealizationFailureReason::DescriptorContract, item.resources, item.spirv);
             static std::set<uint64_t> logged;
-            if (logged.insert(code_addr).second)
+            if (logged.insert(code_addr).second) {
                 std::fprintf(stderr, "[compute] skip invalid descriptor contract for program 0x%llx\n",
                              (unsigned long long)code_addr);
+                if (std::getenv("PROSPER_DBG")) for (const auto& issue : report.issues) {
+                    std::fprintf(stderr,
+                                 "[compute-descriptor] %s binding=%u expected=%s actual=%s required=%llu available=%llu error=%d\n",
+                                 descriptor_issue_name(issue.code), issue.binding,
+                                 spirv_descriptor_kind_name(issue.expected),
+                                 spirv_descriptor_kind_name(issue.actual),
+                                 (unsigned long long)issue.required_bytes,
+                                 (unsigned long long)issue.available_bytes, issue.error ? 1 : 0);
+                    if (item.resources) for (const auto& resource : item.resources->resources)
+                        if (resource.binding == issue.binding)
+                            std::fprintf(stderr,
+                                         "[compute-resource] binding=%u class=%u addr=0x%llx size=%llu host=%zu stride=%u fmt=%u comps=%u dims=%ux%ux%u srt=0x%x sgpr=%u pc=%u\n",
+                                         resource.binding, static_cast<unsigned>(resource.cls),
+                                         (unsigned long long)resource.gpu_addr,
+                                         (unsigned long long)resource.size, resource.host_data_size,
+                                         resource.stride, static_cast<unsigned>(resource.format),
+                                         resource.num_components, resource.width, resource.height,
+                                         resource.depth, resource.srt_offset, resource.sgpr_base,
+                                         resource.fetch_pc);
+                }
+            }
             continue;
         }
         // Image bindings (sampled textures + storage images) execute through the live backend's

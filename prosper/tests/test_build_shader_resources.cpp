@@ -28,13 +28,14 @@ static void make_vsharp(uint32_t v[4], uint64_t base, uint32_t stride, uint32_t 
 // Width5-1 split over word1[31:30] (lo) + word2[11:0] (hi), Height5-1 @word2[27:14], TileMode
 // @word3[24:20], Type @word3[31:28]. Mirrors decode_image_descriptor / Kyty's Gen5 getters.
 static void make_tsharp(uint32_t t[8], uint64_t base, uint32_t w, uint32_t h, uint32_t fmt,
-                        uint32_t tile_mode, uint32_t type) {
+                        uint32_t tile_mode, uint32_t type, uint32_t depth = 1) {
     memset(t, 0, 8 * sizeof(uint32_t));
     uint64_t b = base >> 8;                       // 256-byte-aligned base, stored >>8
     t[0] = (uint32_t)(b & 0xffffffffu);
     t[1] = (uint32_t)((b >> 32) & 0xffu) | ((fmt & 0x1ffu) << 20) | (((w - 1) & 0x3u) << 30);
     t[2] = (((w - 1) >> 2) & 0xfffu) | (((h - 1) & 0x3fffu) << 14);
     t[3] = ((tile_mode & 0x1fu) << 20) | ((type & 0xfu) << 28);
+    if (type == 10) t[4] = (depth - 1) & 0x1fffu;
 }
 
 int main() {
@@ -88,6 +89,11 @@ int main() {
               image_type_to_dim(14) == 6 && image_type_to_dim(15) == 7,
               "T# TYPE array/MSAA variants map to MIMG dims 4..7");
         CHECK(image_type_to_dim(0) == 1, "unknown T# TYPE keeps the conservative 2D fallback");
+        uint32_t t3d[8];
+        make_tsharp(t3d, 0x12000000ull, 32, 16, /*fmt*/56, /*tile*/0, /*type 3D*/10, /*depth*/8);
+        const DecodedImageDescriptor d3d = decode_image_descriptor(t3d);
+        CHECK(d3d.width == 32 && d3d.height == 16 && d3d.depth == 8,
+              "3D T# word4 DEPTH decodes as depth-minus-one");
     }
 
     // --- AGC semantic metadata -> SPI_PS_INPUT_CNTL wiring ------------------------------------

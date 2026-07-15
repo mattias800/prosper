@@ -2,6 +2,7 @@
 // requiring a complete vertex/fragment. Pure (no Vulkan), so it runs in CI. It also drives the
 // data-driven coverage report over the real game shaders (shader_histo).
 #include "../src/gpu/rdna2_to_spirv.hpp"
+#include "../src/gpu/shader_resources.hpp"
 #include <cstdio>
 #include <vector>
 
@@ -60,6 +61,37 @@ int main() {
     CHECK(recompile_valu(compute_vcc_loop_varying,
                          sizeof(compute_vcc_loop_varying)/sizeof(compute_vcc_loop_varying[0]), 0, 0).empty(),
           "a VCCZ-exit loop whose compare reads a varying VGPR still rejects in the compute shell");
+    // A genuinely nested/multi-branch compute CFG uses the subgroup-vote dispatcher fallback. This
+    // is the reduced shape of UE4's volume-lighting kernel: varying VCC exit, an inner scalar branch,
+    // and a backward loop edge. The simpler two-branch loop above deliberately remains rejected.
+    const uint32_t compute_cfg_dispatch[] = {
+        0xBE800380u, 0x7E000280u, 0x7E020300u,
+        0xD7610013u, 0x00014A7Eu, 0xD7610013u, 0x0001507Fu,
+        0xD760000Eu, 0x00014B13u, 0xD760000Fu, 0x00015113u, 0xBEFE040Eu,
+        0xE00C2000u, 0x80020400u, 0x7DB900F9u, 0x86050007u,
+        0x7D020200u, 0xBF860006u, 0xBF0A8204u, 0x360000FDu, 0xBF840001u,
+        0x81008100u, 0x81008100u, 0xBF82FFF4u,
+        0xBF810000u,
+    };
+    ShaderResourceTable dispatch_rt;
+    ShaderResource dispatch_vb{}; dispatch_vb.cls = ResourceClass::VertexBuffer;
+    dispatch_vb.binding = 3; dispatch_vb.sgpr_base = 8; dispatch_vb.stride = 16;
+    dispatch_vb.format = DataFormat::Float32; dispatch_vb.num_components = 4;
+    dispatch_rt.resources.push_back(dispatch_vb);
+    CHECK(!recompile_valu(compute_cfg_dispatch,
+                          sizeof(compute_cfg_dispatch)/sizeof(compute_cfg_dispatch[0]), 0, 0,
+                          &dispatch_rt).empty(),
+          "a nested varying-VCC compute CFG preserves spilled EXEC and lowers through the dispatcher");
+    const uint32_t scc_data_source[] = {
+        0xBF060000u, 0x360000FDu, 0xBF810000u, // s_cmp_eq_u32 s0,s0; v_and_b32 v0,scc,v0
+    };
+    CHECK(!recompile_valu(scc_data_source, sizeof(scc_data_source)/sizeof(scc_data_source[0]), 0, 0).empty(),
+          "SCC is accepted as its architectural scalar 0/1 ALU source");
+    const uint32_t mask_nor[] = {
+        0x7C040CF9u, 0x06869880u, 0x8DEA6A18u, 0xBF810000u,
+    };
+    CHECK(!recompile_valu(mask_nor, sizeof(mask_nor)/sizeof(mask_nor[0]), 0, 0).empty(),
+          "s_nor_b64 combines a saved comparison mask with VCC in the bool domain");
     // An s_barrier INSIDE the loop body also rejects: the uniformity proof is per-WAVE, and a
     // barrier inside a loop whose trip count could differ across the workgroup's waves would be
     // workgroup-divergent control flow (UB).
@@ -106,6 +138,17 @@ int main() {
     CHECK(!recompile_valu(compute_vcc_if_hoisted,
                           sizeof(compute_vcc_if_hoisted)/sizeof(compute_vcc_if_hoisted[0]), 0, 0).empty(),
           "the uniformity proof looks past VCC-preserving instructions between compare and branch");
+    // UE4's scalar-spill lowering also schedules v_writelane_b32 between the uniform compare and
+    // its VCCZ branch. The op updates one lane of a VGPR and cannot clobber VCC, so it must not stop
+    // the same local proof. (Raw pair assembled and round-tripped with llvm-mc gfx1010.)
+    const uint32_t compute_vcc_if_writelane[] = {
+        0xBE800380u, 0x7E000280u, 0x7E020284u, 0x7D020200u,
+        0xD7610013u, 0x00012A1Bu, // v_writelane_b32 v19, s27, 21
+        0xBF860002u, 0x060000FFu, 0x3E800000u, 0xBF810000u,
+    };
+    CHECK(!recompile_valu(compute_vcc_if_writelane,
+                          sizeof(compute_vcc_if_writelane)/sizeof(compute_vcc_if_writelane[0]), 0, 0).empty(),
+          "the uniformity proof looks past VCC-preserving v_writelane scalar spills");
     // But an intervening write that COULD hit VCC (s_mov_b32 s106, 0) stops the walk: reject.
     const uint32_t compute_vcc_if_clobber[] = {
         0xBE800380u, 0x7E000280u, 0x7E020284u, 0x7D020200u, 0xBEEA0380u,

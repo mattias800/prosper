@@ -122,4 +122,9 @@ Rdna2Inst rdna2_decode_one(const uint32_t* code, size_t max_dwords);
 // encoding, or the end of the buffer. Returns the number of dwords consumed.
 size_t rdna2_walk(const uint32_t* code, size_t dwords, std::vector<Rdna2Inst>& out);
 
+// Minimum byte range touched by immediate s_load_dword[xN] operations whose 64-bit SBASE begins at
+// `sgpr_base`. Unlike s_buffer_load, s_load consumes an address pair rather than a bounded V#; callers
+// use this to size pointer-backed user-data tables from the shader's actual accesses.
+uint32_t rdna2_sload_required_bytes(const uint32_t* code, size_t dwords, uint32_t sgpr_base);
+
 } // namespace prosper::gpu

@@ -110,6 +110,11 @@ int main() {
     Rdna2Inst sd = rdna2_decode_one(sdwa, 2);
     CHECK(sd.fmt == Rdna2Format::VOP2 && sd.len_dwords == 2 && sd.has_modifier,
           "VOP2 SDWA form is 2 dwords and flagged has_modifier");
+    const uint32_t f16cmp[] = { 0x7db900f9u, 0x86050007u };
+    Rdna2Inst fc = rdna2_decode_one(f16cmp, 2);
+    CHECK(fc.fmt == Rdna2Format::VOPC && fc.opcode == 0xDCu && !fc.has_modifier &&
+          fc.sdwa_src0_sel == 5u && fc.sdwa_src1_sel == 6u,
+          "VOPC f16 SDWA WORD_1 source select is decoded for recompilation");
     const uint32_t dpp16[] = { 0x4a0e0cfau, 0xff011106u };   // v_add_nc_u32_dpp v7, v6, v6 row_shr:1
     Rdna2Inst dp = rdna2_decode_one(dpp16, 2);
     CHECK(dp.fmt == Rdna2Format::VOP2 && dp.len_dwords == 2 && dp.has_modifier,
@@ -174,6 +179,14 @@ int main() {
     const uint32_t smem_neg[] = { 0xf4000002u, 0xfa1ffff8u };
     Rdna2Inst sn = rdna2_decode_one(smem_neg, 2);
     CHECK((int32_t)sn.literal == -8, "SMEM 21-bit immediate is sign-extended (0x1ffff8 -> -8)");
+
+    // s_load uses a 64-bit address pair, not V# bounds. UE4's root SRT at s[12:13] loads x4 at
+    // byte offset 0x250, requiring a 0x260-byte mapped range even when s14 happens to contain 1.
+    const uint32_t sload_range[] = { 0xf4080706u, 0xfa000250u, 0xbf810000u };
+    CHECK(rdna2_sload_required_bytes(sload_range, 3, 12) == 0x260u,
+          "immediate s_load range inference includes offset plus x4 width");
+    CHECK(rdna2_sload_required_bytes(sload_range, 3, 8) == 0u,
+          "s_load range inference ignores a different SBASE pair");
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");

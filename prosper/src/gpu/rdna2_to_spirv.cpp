@@ -21,7 +21,7 @@ enum : uint32_t {
     Op_Capability=17, Op_TypeVoid=19, Op_TypeBool=20, Op_TypeInt=21, Op_TypeFloat=22, Op_TypeVector=23,
     Op_TypeRuntimeArray=29, Op_TypeStruct=30, Op_TypePointer=32, Op_TypeFunction=33,
     Op_ConstantTrue=41, Op_ConstantFalse=42, Op_Constant=43, Op_Function=54, Op_FunctionEnd=56, Op_Variable=59,
-    Op_LogicalOr=166, Op_LogicalAnd=167, Op_Select=169, Op_FOrdEqual=180, Op_FOrdNotEqual=182, Op_FOrdLessThan=184, Op_FOrdGreaterThan=186,
+    Op_LogicalOr=166, Op_LogicalAnd=167, Op_LogicalNot=168, Op_Select=169, Op_FOrdEqual=180, Op_FOrdNotEqual=182, Op_FOrdLessThan=184, Op_FOrdGreaterThan=186,
     Op_FOrdLessThanEqual=188, Op_FOrdGreaterThanEqual=190,
     Op_FUnordEqual=181, Op_FUnordNotEqual=183, Op_FUnordLessThan=185, Op_FUnordGreaterThan=187,   // NaN-inclusive ("n"-prefix) compares
     Op_FUnordLessThanEqual=189, Op_FUnordGreaterThanEqual=191,
@@ -37,11 +37,12 @@ enum : uint32_t {
     Op_BitReverse=204, Op_UConvert=113,
     Op_TypeImage=25, Op_TypeSampledImage=27, Op_SampledImage=86,
     Op_ImageSampleImplicitLod=87, Op_ImageSampleExplicitLod=88, Op_ImageFetch=95, Op_ImageGather=96, Op_Image=100,
-    Op_ImageRead=98, Op_ImageWrite=99, Op_ImageQuerySizeLod=103,
+    Op_ImageRead=98, Op_ImageWrite=99, Op_ImageQuerySizeLod=103, Op_ImageQueryLevels=106,
     Op_TypeArray=28, Op_ControlBarrier=224,
     Op_DPdx=207, Op_DPdy=208,   // screen-space derivatives (Fragment; plain Shader capability)
     Op_Phi=245, Op_LoopMerge=246,
-    Op_SelectionMerge=247, Op_Label=248, Op_Branch=249, Op_BranchConditional=250, Op_Kill=252, Op_Return=253,
+    Op_SelectionMerge=247, Op_Label=248, Op_Branch=249, Op_BranchConditional=250, Op_Switch=251,
+    Op_Kill=252, Op_Return=253, Op_GroupNonUniformAny=335,
 };
 // GLSL.std.450 extended-instruction numbers.
 enum : uint32_t { Glsl_FAbs=4, Glsl_RoundEven=2, Glsl_Trunc=3, Glsl_Floor=8, Glsl_Ceil=9, Glsl_Fract=10, Glsl_Sin=13, Glsl_Cos=14,
@@ -49,9 +50,10 @@ enum : uint32_t { Glsl_FAbs=4, Glsl_RoundEven=2, Glsl_Trunc=3, Glsl_Floor=8, Gls
                   Glsl_Sqrt=31, Glsl_InverseSqrt=32, Glsl_FMin=37, Glsl_UMin=38, Glsl_SMin=39, Glsl_FMax=40,
                   Glsl_UMax=41, Glsl_SMax=42, Glsl_PackHalf2x16=58, Glsl_UnpackHalf2x16=62 };
 enum : uint32_t {
-    Cap_Shader=1, Cap_Int64=11, Addr_Logical=0, Mem_GLSL450=1, Exec_Vertex=0, Exec_Fragment=4, Exec_GLCompute=5,
+    Cap_Shader=1, Cap_Int64=11, Cap_GroupNonUniform=61, Cap_GroupNonUniformVote=62,
+    Addr_Logical=0, Mem_GLSL450=1, Exec_Vertex=0, Exec_Fragment=4, Exec_GLCompute=5,
     EM_OriginUpperLeft=7, EM_LocalSize=17,
-    SC_Input=1, SC_UniformConstant=0, SC_Output=3, SC_StorageBuffer=12, FC_None=0,
+    SC_Input=1, SC_UniformConstant=0, SC_Output=3, SC_Function=7, SC_StorageBuffer=12, FC_None=0,
     Dim_1D=0, Dim_2D=1, Dim_3D=2,   // SPIR-V Dim. (2D coincides with the SQ_RSRC 2D dim value, but distinct.)
     Cap_Sampled1D=43, Cap_Image1D=44,   // Dim=1D needs Sampled1D; a 1D STORAGE image (read/write) also needs Image1D
     Cap_StorageImageMultisample=27,      // MS=1 storage image (read/write a multisampled image)
@@ -63,7 +65,7 @@ enum : uint32_t {
     Img_Sampled_Storage=2,   // OpTypeImage "Sampled" operand: 2 = used WITHOUT a sampler (read/write storage image)
     ImgFmt_Unknown=0,        // OpTypeImage "Image Format": Unknown (runtime view format; needs the caps above)
     ImgOp_Bias=1, ImgOp_Lod=2, ImgOp_Sample=0x40,   // ImageOperands bits: LOD bias / explicit LOD / MSAA Sample index.
-    SC_Workgroup=4, Scope_Workgroup=2, MemSem_WGAcqRel=0x108,   // LDS: Workgroup storage + barrier scope/semantics
+    SC_Workgroup=4, Scope_Workgroup=2, Scope_Subgroup=3, MemSem_WGAcqRel=0x108,   // LDS: Workgroup storage + barrier scope/semantics
     Dec_Block=2, Dec_ArrayStride=6, Dec_BuiltIn=11, Dec_Flat=14, Dec_Location=30, Dec_Binding=33,
     Dec_DescriptorSet=34, Dec_Offset=35,
     BI_Position=0, BI_FragCoord=15, BI_WorkgroupId=26, BI_LocalInvocationId=27,
@@ -93,6 +95,7 @@ struct SpirvCompute {
     // geometry). Each stage owns its own set: VS=set 0, PS=set 1 (mirrors the PS5's per-stage resource
     // tables). Set in begin_fragment(); the host binds one descriptor set per stage.
     uint32_t desc_set=0;
+    size_t function_var_insert = 0;                   // first-function-block OpVariable insertion point
     uint32_t exec_model=0;                           // deferred EntryPoint (emitted in finish() so lazily-
     std::vector<uint32_t> iface;                     // declared I/O varyings can join the interface list)
 
@@ -174,6 +177,34 @@ struct SpirvCompute {
     }
     void patch_phi(size_t patch_off, uint32_t v1, uint32_t l1) { code[patch_off] = v1; code[patch_off + 1] = l1; }
     void emit_selmerge(uint32_t m) { put(code, Op_SelectionMerge, {m, 0}); }   // structured if (before condbranch)
+    void emit_switch(uint32_t selector, uint32_t fallback,
+                     const std::vector<std::pair<uint32_t, uint32_t>>& cases) {
+        std::vector<uint32_t> operands{selector, fallback};
+        for (const auto& c : cases) { operands.push_back(c.first); operands.push_back(c.second); }
+        putv(code, Op_Switch, operands);
+    }
+    uint32_t function_var(uint32_t type, uint32_t& ptr_type) {
+        if (!ptr_type) { ptr_type = id(); put(types, Op_TypePointer, {ptr_type, SC_Function, type}); }
+        uint32_t var = id();
+        std::vector<uint32_t> decl;
+        put(decl, Op_Variable, {ptr_type, var, SC_Function});
+        code.insert(code.begin() + static_cast<std::ptrdiff_t>(function_var_insert),
+                    decl.begin(), decl.end());
+        function_var_insert += decl.size();
+        return var;
+    }
+    uint32_t load_function(uint32_t type, uint32_t var) {
+        uint32_t value = id(); put(code, Op_Load, {type, value, var}); return value;
+    }
+    void store_function(uint32_t var, uint32_t value) { put(code, Op_Store, {var, value}); }
+    uint32_t logical_not(uint32_t value) {
+        uint32_t result = id(); put(code, Op_LogicalNot, {t_bool, result, value}); return result;
+    }
+    uint32_t subgroup_any(uint32_t value) {
+        uint32_t result = id();
+        put(code, Op_GroupNonUniformAny, {t_bool, result, uconst(Scope_Subgroup), value});
+        return result;
+    }
     // Fragment discard: OpKill any lane where `alive` is false, survivors fall through to `mergeL`. Used to
     // lower an EXP done under a narrowed EXEC (an alpha-test / WQM discard — the surviving lanes are the
     // ones that pass the kill test) to a real per-invocation discard. OpKill is a block terminator, so the
@@ -321,102 +352,115 @@ struct SpirvCompute {
         return ibin(Op_BitwiseAnd, pack_half2x16(fbits, bcu(fconstf(0.0f))), uconst(0xFFFFu));
     }
 
-    // Combined image+sampler support (MIMG image_sample). One float OpTypeImage/OpTypeSampledImage PER DIM
-    // (2D/3D) is shared; each texture is a COMBINED_IMAGE_SAMPLER UniformConstant at its binding.
-    uint32_t t_image = 0, t_sampled_image = 0;            // 2D (the common case; kept for existing callers)
+    // Combined image+sampler support (MIMG image_sample/image_load). Float and unsigned-integer
+    // textures need distinct SPIR-V image types even at the same dimension: normalized/float T#s
+    // return float bits, while UINT T#s return raw integer channel values. Each texture is still a
+    // COMBINED_IMAGE_SAMPLER UniformConstant at its binding.
     std::unordered_map<uint32_t, uint32_t> tex_var;       // binding -> combined-sampler OpVariable id
-    std::unordered_map<uint32_t, uint32_t> tex_simg_dim;  // SPIR-V Dim -> OpTypeSampledImage id
-    std::unordered_map<uint32_t, uint32_t> tex_img_dim;   // SPIR-V Dim -> its OpTypeImage id (OpImage results)
+    std::unordered_map<uint32_t, uint32_t> tex_simg_type; // (Dim | UINT flag) -> OpTypeSampledImage id
+    std::unordered_map<uint32_t, uint32_t> tex_img_type;  // same key -> its OpTypeImage id
+    std::unordered_map<uint32_t, uint32_t> tex_binding_simg;
+    std::unordered_map<uint32_t, uint32_t> tex_binding_img;
+    std::unordered_map<uint32_t, bool> tex_binding_uint;
     uint32_t t_v3f_cache = 0;
     uint32_t t_v3f() { if (!t_v3f_cache) { t_v3f_cache = id(); put(types, Op_TypeVector, {t_v3f_cache, t_f32, 3}); } return t_v3f_cache; }
-    uint32_t sampled_image_type(uint32_t dim) {
-        auto it = tex_simg_dim.find(dim); if (it != tex_simg_dim.end()) return it->second;
-        uint32_t ti = id(); put(types, Op_TypeImage, {ti, t_f32, dim, 0, 0, 0, 1, 0});  // sampled f32, Sampled=1
+    uint32_t t_v3i_cache = 0;
+    uint32_t t_v3i() { if (!t_v3i_cache) { t_v3i_cache = id(); put(types, Op_TypeVector, {t_v3i_cache, t_i32, 3}); } return t_v3i_cache; }
+    static uint32_t sampled_image_key(uint32_t dim, bool is_uint) {
+        return dim | (is_uint ? 0x100u : 0u);
+    }
+    uint32_t sampled_image_type(uint32_t dim, bool is_uint = false) {
+        const uint32_t key = sampled_image_key(dim, is_uint);
+        auto it = tex_simg_type.find(key); if (it != tex_simg_type.end()) return it->second;
+        uint32_t ti = id(); put(types, Op_TypeImage, {ti, is_uint ? t_u32 : t_f32,
+                                                      dim, 0, 0, 0, 1, 0});  // sampled, Sampled=1
         uint32_t si = id(); put(types, Op_TypeSampledImage, {si, ti});
-        if (dim == Dim_2D) { t_image = ti; t_sampled_image = si; }
-        tex_simg_dim[dim] = si; tex_img_dim[dim] = ti; return si;
+        tex_simg_type[key] = si; tex_img_type[key] = ti; return si;
     }
     // Declare (idempotently) a combined image+sampler of SPIR-V `dim` at descriptor-set 0, `binding`.
-    void declare_texture(uint32_t binding, uint32_t dim = Dim_2D) {
-        uint32_t simg = sampled_image_type(dim);
+    void declare_texture(uint32_t binding, uint32_t dim = Dim_2D, bool is_uint = false) {
+        const uint32_t key = sampled_image_key(dim, is_uint);
+        uint32_t simg = sampled_image_type(dim, is_uint);
         if (tex_var.count(binding)) return;
         uint32_t t_ptr = id(); put(types, Op_TypePointer, {t_ptr, SC_UniformConstant, simg});
         uint32_t v = id();     put(types, Op_Variable,    {t_ptr, v, SC_UniformConstant});
         put(deco, Op_Decorate, {v, Dec_DescriptorSet, desc_set});
         put(deco, Op_Decorate, {v, Dec_Binding, binding});
         tex_var[binding] = v;
+        tex_binding_simg[binding] = simg;
+        tex_binding_img[binding] = tex_img_type[key];
+        tex_binding_uint[binding] = is_uint;
+    }
+    uint32_t texture_vec4(uint32_t binding) {
+        return tex_binding_uint[binding] ? t_v4u() : t_v4f;
+    }
+    void unpack_texture_result(uint32_t binding, uint32_t result, uint32_t out[4]) {
+        const bool is_uint = tex_binding_uint[binding];
+        const uint32_t scalar_type = is_uint ? t_u32 : t_f32;
+        for (uint32_t c = 0; c < 4; c++) {
+            uint32_t e = id(); put(code, Op_CompositeExtract, {scalar_type, e, result, c});
+            out[c] = is_uint ? e : bcu(e);
+        }
     }
     // image_sample 2D: sample the combined sampler at `binding` with (u,v) float-BITS coords; fills
     // out[0..3] with the RGBA result components as raw VGPR bits. Implicit LOD is only legal in the
     // Fragment execution model (#151) — the compute/vertex shells have no derivatives, so there we
     // sample at explicit LOD 0 (what a non-pixel-shader image_sample resolves to without gradients).
     void image_sample_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t out[4]) {
-        uint32_t si    = id(); put(code, Op_Load, {t_sampled_image, si, tex_var[binding]});
+        uint32_t si    = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
         uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
         uint32_t res   = id();
-        if (is_fragment) put(code, Op_ImageSampleImplicitLod, {t_v4f, res, si, coord});
-        else             put(code, Op_ImageSampleExplicitLod, {t_v4f, res, si, coord, ImgOp_Lod, fconstf(0.0f)});
-        for (uint32_t c = 0; c < 4; c++) {
-            uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, res, c}); out[c] = bcu(e);
-        }
+        if (is_fragment) put(code, Op_ImageSampleImplicitLod, {texture_vec4(binding), res, si, coord});
+        else             put(code, Op_ImageSampleExplicitLod, {texture_vec4(binding), res, si, coord, ImgOp_Lod, fconstf(0.0f)});
+        unpack_texture_result(binding, res, out);
     }
     // image_sample 3D: (u,v,w) float-BITS coords -> RGBA. Uses the Dim_3D sampled image; same
     // implicit-LOD-only-in-Fragment rule as image_sample_2d.
     void image_sample_3d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t w_bits, uint32_t out[4]) {
-        uint32_t simg  = sampled_image_type(Dim_3D);
+        uint32_t simg  = tex_binding_simg[binding];
         uint32_t si    = id(); put(code, Op_Load, {simg, si, tex_var[binding]});
         uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v3f(), coord, bcf(u_bits), bcf(v_bits), bcf(w_bits)});
         uint32_t res   = id();
-        if (is_fragment) put(code, Op_ImageSampleImplicitLod, {t_v4f, res, si, coord});
-        else             put(code, Op_ImageSampleExplicitLod, {t_v4f, res, si, coord, ImgOp_Lod, fconstf(0.0f)});
-        for (uint32_t c = 0; c < 4; c++) {
-            uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, res, c}); out[c] = bcu(e);
-        }
+        if (is_fragment) put(code, Op_ImageSampleImplicitLod, {texture_vec4(binding), res, si, coord});
+        else             put(code, Op_ImageSampleExplicitLod, {texture_vec4(binding), res, si, coord, ImgOp_Lod, fconstf(0.0f)});
+        unpack_texture_result(binding, res, out);
     }
     // image_sample_l / _lz: sample with an EXPLICIT LOD (lod_bits float). Stage-agnostic (no derivatives).
     void image_sample_lod_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t lod_bits, uint32_t out[4]) {
-        uint32_t si    = id(); put(code, Op_Load, {t_sampled_image, si, tex_var[binding]});
+        uint32_t si    = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
         uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
-        uint32_t res   = id(); put(code, Op_ImageSampleExplicitLod, {t_v4f, res, si, coord, ImgOp_Lod, bcf(lod_bits)});
-        for (uint32_t c = 0; c < 4; c++) {
-            uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, res, c}); out[c] = bcu(e);
-        }
+        uint32_t res   = id(); put(code, Op_ImageSampleExplicitLod, {texture_vec4(binding), res, si, coord, ImgOp_Lod, bcf(lod_bits)});
+        unpack_texture_result(binding, res, out);
     }
     // image_sample_lz from a 3D texture: explicit LOD (usually 0) on a (u,v,w) coord. Stage-agnostic.
     void image_sample_lod_3d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t w_bits,
                              uint32_t lod_bits, uint32_t out[4]) {
-        uint32_t simg  = sampled_image_type(Dim_3D);
+        uint32_t simg  = tex_binding_simg[binding];
         uint32_t si    = id(); put(code, Op_Load, {simg, si, tex_var[binding]});
         uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v3f(), coord, bcf(u_bits), bcf(v_bits), bcf(w_bits)});
-        uint32_t res   = id(); put(code, Op_ImageSampleExplicitLod, {t_v4f, res, si, coord, ImgOp_Lod, bcf(lod_bits)});
-        for (uint32_t c = 0; c < 4; c++) {
-            uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, res, c}); out[c] = bcu(e);
-        }
+        uint32_t res   = id(); put(code, Op_ImageSampleExplicitLod, {texture_vec4(binding), res, si, coord, ImgOp_Lod, bcf(lod_bits)});
+        unpack_texture_result(binding, res, out);
     }
     // image_sample_b 2D: implicit-LOD sample with an LOD BIAS (bias_bits float). Bias only means
     // anything with implicit LOD (fragment derivatives); outside the fragment stage the op resolves
     // like the other samples there — explicit LOD 0 (bias dropped, matching image_sample_2d's rule).
     void image_sample_bias_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t bias_bits, uint32_t out[4]) {
-        uint32_t si    = id(); put(code, Op_Load, {t_sampled_image, si, tex_var[binding]});
+        uint32_t si    = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
         uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
         uint32_t res   = id();
-        if (is_fragment) put(code, Op_ImageSampleImplicitLod, {t_v4f, res, si, coord, ImgOp_Bias, bcf(bias_bits)});
-        else             put(code, Op_ImageSampleExplicitLod, {t_v4f, res, si, coord, ImgOp_Lod, fconstf(0.0f)});
-        for (uint32_t c = 0; c < 4; c++) {
-            uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, res, c}); out[c] = bcu(e);
-        }
+        if (is_fragment) put(code, Op_ImageSampleImplicitLod, {texture_vec4(binding), res, si, coord, ImgOp_Bias, bcf(bias_bits)});
+        else             put(code, Op_ImageSampleExplicitLod, {texture_vec4(binding), res, si, coord, ImgOp_Lod, fconstf(0.0f)});
+        unpack_texture_result(binding, res, out);
     }
     // image_gather4_lz 2D: OpImageGather of component `comp` (0..3) — the 2x2 footprint's four texels
     // of one channel, in the DX/GL gather order ((0,1),(1,1),(1,0),(0,0)), which the AMD gather4
     // result order matches. Gather always samples the base level (== the _lz behavior). out[0..3] =
     // the four gathered values as raw bits.
     void image_gather_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t comp, uint32_t out[4]) {
-        uint32_t si    = id(); put(code, Op_Load, {t_sampled_image, si, tex_var[binding]});
+        uint32_t si    = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
         uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
-        uint32_t res   = id(); put(code, Op_ImageGather, {t_v4f, res, si, coord, uconst(comp)});
-        for (uint32_t c = 0; c < 4; c++) {
-            uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, res, c}); out[c] = bcu(e);
-        }
+        uint32_t res   = id(); put(code, Op_ImageGather, {texture_vec4(binding), res, si, coord, uconst(comp)});
+        unpack_texture_result(binding, res, out);
     }
     // image_gather4_lz_o 2D: gather with the MIMG _o per-pixel OFFSET operand. The offset VGPR packs
     // signed 6-bit TEXEL offsets (x = bits[5:0], y = bits[13:8] — AMD RDNA2 ISA "offset" packing, the
@@ -429,17 +473,15 @@ struct SpirvCompute {
     void image_gather_offset_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits, uint32_t comp,
                                 uint32_t off_bits, uint32_t out[4]) {
         if (!declared_gather_ext) { put(caps, Op_Capability, {Cap_ImageGatherExtended}); declared_gather_ext = true; }
-        uint32_t si    = id(); put(code, Op_Load, {t_sampled_image, si, tex_var[binding]});
+        uint32_t si    = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
         uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v2f(), coord, bcf(u_bits), bcf(v_bits)});
         // signed 6-bit texel offsets. NOTE: bfe_s takes SPIR-V IDs — raw integers here (the #296
         // original) emitted OpBitFieldSExtract with invalid operand IDs; never caught live because
         // the only gather4_lz_o user (DOLL's FXAA PS) still rejected upstream on its execz region.
         uint32_t ox    = bfe_s(off_bits, uconst(0), uconst(6)), oy = bfe_s(off_bits, uconst(8), uconst(6));
         uint32_t offv  = id(); put(code, Op_CompositeConstruct, {t_v2i(), offv, bcs(ox), bcs(oy)});
-        uint32_t res   = id(); put(code, Op_ImageGather, {t_v4f, res, si, coord, uconst(comp), ImgOp_Offset, offv});
-        for (uint32_t c = 0; c < 4; c++) {
-            uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, res, c}); out[c] = bcu(e);
-        }
+        uint32_t res   = id(); put(code, Op_ImageGather, {texture_vec4(binding), res, si, coord, uconst(comp), ImgOp_Offset, offv});
+        unpack_texture_result(binding, res, out);
     }
     // image_sample_lz_o 2D: explicit-LOD-0 sample with the MIMG _o packed texel offset (x = bits[5:0],
     // y = bits[13:8], signed 6-bit — same packing as gather4_lz_o). Vulkan forbids the dynamic Offset
@@ -451,8 +493,8 @@ struct SpirvCompute {
     void image_sample_lz_offset_2d(uint32_t binding, uint32_t u_bits, uint32_t v_bits,
                                    uint32_t off_bits, uint32_t out[4]) {
         if (!declared_image_query) { put(caps, Op_Capability, {Cap_ImageQuery}); declared_image_query = true; }
-        uint32_t si   = id(); put(code, Op_Load,  {t_sampled_image, si, tex_var[binding]});
-        uint32_t img  = id(); put(code, Op_Image, {t_image, img, si});
+        uint32_t si   = id(); put(code, Op_Load,  {tex_binding_simg[binding], si, tex_var[binding]});
+        uint32_t img  = id(); put(code, Op_Image, {tex_binding_img[binding], img, si});
         uint32_t size = id(); put(code, Op_ImageQuerySizeLod, {t_v2i(), size, img, uconst(0)});
         uint32_t w_i  = id(); put(code, Op_CompositeExtract, {t_i32, w_i, size, 0});
         uint32_t h_i  = id(); put(code, Op_CompositeExtract, {t_i32, h_i, size, 1});
@@ -461,35 +503,60 @@ struct SpirvCompute {
         uint32_t dv = fbin(Op_FDiv, cvt_i2f(oy), cvt_i2f(i2u(h_i)));
         image_sample_lod_2d(binding, fbin(Op_FAdd, u_bits, du), fbin(Op_FAdd, v_bits, dv), uconst(0), out);
     }
+    // image_get_resinfo: query a sampled image's dimensions at the integer LOD carried in VADDR.
+    // RDNA returns {width,height,depth-or-layers,mip-levels}; absent spatial axes are 1. The result is
+    // integer data in ordinary VGPRs, so the signed SPIR-V query result is bitcast back to raw u32.
+    void image_get_resinfo(uint32_t binding, uint32_t dim, uint32_t lod_bits, uint32_t out[4]) {
+        if (!declared_image_query) { put(caps, Op_Capability, {Cap_ImageQuery}); declared_image_query = true; }
+        const uint32_t simg = tex_binding_simg[binding];
+        const uint32_t image_type = tex_binding_img[binding];
+        uint32_t si = id();  put(code, Op_Load,  {simg, si, tex_var[binding]});
+        uint32_t img = id(); put(code, Op_Image, {image_type, img, si});
+        out[0] = out[1] = out[2] = uconst(1);
+        if (dim == Dim_1D) {
+            uint32_t size = id(); put(code, Op_ImageQuerySizeLod, {t_i32, size, img, bcs(lod_bits)});
+            out[0] = i2u(size);
+        } else {
+            const uint32_t size_type = dim == Dim_2D ? t_v2i() : t_v3i();
+            uint32_t size = id(); put(code, Op_ImageQuerySizeLod, {size_type, size, img, bcs(lod_bits)});
+            const uint32_t components = dim == Dim_2D ? 2u : 3u;
+            for (uint32_t c = 0; c < components; c++) {
+                uint32_t value = id(); put(code, Op_CompositeExtract, {t_i32, value, size, c});
+                out[c] = i2u(value);
+            }
+        }
+        uint32_t levels = id(); put(code, Op_ImageQueryLevels, {t_i32, levels, img});
+        out[3] = i2u(levels);
+    }
     // 2-component uint vector (integer texel coordinates for OpImageFetch).
     uint32_t t_v2u_cache = 0;
     uint32_t t_v2u() { if (!t_v2u_cache) { t_v2u_cache = id(); put(types, Op_TypeVector, {t_v2u_cache, t_u32, 2}); } return t_v2u_cache; }
     // image_load 2D (image_load): texelFetch the image at the combined sampler's `binding` with INTEGER
     // (x,y) coords (raw VGPR bits). OpImage strips the sampler; OpImageFetch at explicit LOD 0.
     void image_fetch_2d(uint32_t binding, uint32_t x_bits, uint32_t y_bits, uint32_t out[4]) {
-        uint32_t si    = id(); put(code, Op_Load,  {t_sampled_image, si, tex_var[binding]});
-        uint32_t img   = id(); put(code, Op_Image, {t_image, img, si});
+        uint32_t si    = id(); put(code, Op_Load,  {tex_binding_simg[binding], si, tex_var[binding]});
+        uint32_t img   = id(); put(code, Op_Image, {tex_binding_img[binding], img, si});
         uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v2u(), coord, x_bits, y_bits});
-        uint32_t res   = id(); put(code, Op_ImageFetch, {t_v4f, res, img, coord, ImgOp_Lod, uconst(0)});
-        for (uint32_t c = 0; c < 4; c++) {
-            uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, res, c}); out[c] = bcu(e);
-        }
+        uint32_t res   = id(); put(code, Op_ImageFetch, {texture_vec4(binding), res, img, coord, ImgOp_Lod, uconst(0)});
+        unpack_texture_result(binding, res, out);
     }
 
     // image_load from a 3D texture (integer texel fetch through the combined sampler — DOLL's
     // color-grade LUT, #273): OpImage strips the sampler; OpImageFetch with (x,y,z) integer coords.
     uint32_t t_v3u_cache2 = 0;
-    uint32_t t_v3u_fetch() { if (!t_v3u_cache2) { t_v3u_cache2 = id(); put(types, Op_TypeVector, {t_v3u_cache2, t_u32, 3}); } return t_v3u_cache2; }
+    uint32_t t_v3u_fetch() {
+        if (t_v3u) return t_v3u;   // compute/vertex shells already declare a uvec3 for built-ins
+        if (!t_v3u_cache2) { t_v3u_cache2 = id(); put(types, Op_TypeVector, {t_v3u_cache2, t_u32, 3}); }
+        return t_v3u_cache2;
+    }
     void image_fetch_3d(uint32_t binding, uint32_t x_bits, uint32_t y_bits, uint32_t z_bits, uint32_t out[4]) {
-        uint32_t simg  = sampled_image_type(Dim_3D);
-        uint32_t t_img3 = tex_img_dim[Dim_3D];   // OpImage's result type must be the pair's Image type
+        uint32_t simg  = tex_binding_simg[binding];
+        uint32_t t_img3 = tex_binding_img[binding];   // OpImage's result type must be the pair's Image type
         uint32_t si    = id(); put(code, Op_Load,  {simg, si, tex_var[binding]});
         uint32_t img   = id(); put(code, Op_Image, {t_img3, img, si});
         uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v3u_fetch(), coord, x_bits, y_bits, z_bits});
-        uint32_t res   = id(); put(code, Op_ImageFetch, {t_v4f, res, img, coord, ImgOp_Lod, uconst(0)});
-        for (uint32_t c = 0; c < 4; c++) {
-            uint32_t e = id(); put(code, Op_CompositeExtract, {t_f32, e, res, c}); out[c] = bcu(e);
-        }
+        uint32_t res   = id(); put(code, Op_ImageFetch, {texture_vec4(binding), res, img, coord, ImgOp_Lod, uconst(0)});
+        unpack_texture_result(binding, res, out);
     }
 
     // --- STORAGE images (MIMG image_load / image_store WITHOUT a sampler; compute copy/blit) ---
@@ -798,6 +865,7 @@ struct SpirvCompute {
         declare_cbufs(rt); // scalar-memory buffers, including table-assigned bindings beyond 2/3
         put(code, Op_Function, {t_void, f_main, FC_None, t_fn});
         put(code, Op_Label, {lbl}); cur_block = lbl;
+        function_var_insert = code.size();
         uint32_t ld = id(); put(code, Op_Load, {t_v3u, ld, v_gid});
         gidx = id(); put(code, Op_CompositeExtract, {t_u32, gidx, ld, 0});
         uint32_t ldl = id(); put(code, Op_Load, {t_v3u, ldl, v_localid});
@@ -1003,6 +1071,8 @@ struct RegState {
     // scalar: vgpr -> lane -> SSA id. A vgpr used as a spill array must never be read as ordinary
     // per-lane data — operand_bits rejects that (fail-visible), keeping the model honest.
     std::unordered_map<int, std::unordered_map<int, uint32_t>> vgpr_lane_slots;
+    // EXEC/VCC/saved-mask spills use the same fixed lanes but remain bool-domain values.
+    std::unordered_map<int, std::unordered_map<int, uint32_t>> vgpr_lane_mask_slots;
     // LDS ADDTID per-lane spill slots (#273 — DOLL's title post PSes): `s_movk m0, K;
     // ds_write_addtid_b32 vN` spills THIS lane's vN to LDS[M0 + offset + tid*4], and the matching
     // `ds_read_addtid_b32` reloads it. Per-invocation the slot is one value, keyed by the M0 SSA id
@@ -1020,6 +1090,7 @@ inline void predicate_write(SpirvCompute& b, RegState& rs, int idx, uint32_t old
     // rather than rejecting it as a stale cross-lane spill. Blasphemous 2 does exactly this after
     // an image_sample overwrites the shader's early scalar-spill v11 (#652).
     rs.vgpr_lane_slots.erase(idx);
+    rs.vgpr_lane_mask_slots.erase(idx);
 }
 inline uint32_t vreg_old(SpirvCompute& b, RegState& rs, int idx) {
     auto it = rs.vreg.find(idx); return it == rs.vreg.end() ? b.uconst(0) : it->second;
@@ -1442,8 +1513,15 @@ static bool cannot_write_vcc(const Rdna2Inst& in) {
         case Rdna2Format::SOPC:  return true;                      // writes SCC only
         case Rdna2Format::VOP2:  return in.opcode < 0x28 || in.opcode > 0x2a;
         case Rdna2Format::VOP3P: return true;                      // packed VALU: VGPR dst, no carry
-        case Rdna2Format::VOP3:  return in.opcode >= 0x140 && in.opcode < 0x300 &&
-                                        sgpr_dst_misses_vcc(1);    // plain-VALU window only
+        case Rdna2Format::VOP3:
+            // gfx10 v_writelane_b32 writes only its VGPR lane slot. v_readlane_b32 writes the
+            // scalar destination encoded in the decoder's dst field, so it is VCC-preserving as
+            // long as that destination does not overlap s106:s107. UE4 schedules long scalar-spill
+            // sequences of these two ops between a uniform VOPC and its s_cbranch_vccz.
+            if (in.opcode == 0x361) return true;
+            if (in.opcode == 0x360) return sgpr_dst_misses_vcc(1);
+            return in.opcode >= 0x140 && in.opcode < 0x300 &&
+                   sgpr_dst_misses_vcc(1);                         // plain-VALU window only
         case Rdna2Format::SOP1: case Rdna2Format::SOP2: case Rdna2Format::SOPK:
             return sgpr_dst_misses_vcc(2);                         // conservative 64-bit pair
         case Rdna2Format::SMEM: {
@@ -1895,14 +1973,17 @@ void loop_written_regs(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t 
 // Resolve an operand to its raw 32-bit value (bits). Float ops bitcast these to float.
 // `ok`: cleared when the operand's VALUE is not representable — a Special operand read as ALU DATA
 // (VCC/EXEC live as per-lane bools in rs.vcc/rs.exec; their 32-bit wave-mask value does not exist
-// in the per-invocation model, and M0/SCC/ttmp aren't modeled at all). Only SGPR_NULL (field 125)
-// has a defined value, 0. Previously every Special silently read as 0 and the shader computed
+// in the per-invocation model, and untracked M0/ttmp aren't modeled). SGPR_NULL (field 125) is 0;
+// SCC (field 253) is a scalar 0/1 and therefore is representable exactly. Previously other
+// untracked Specials silently read as 0 and the shader computed
 // garbage (#134); now it rejects, matching the SDWA/DPP reject-rather-than-miscompute discipline.
 uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, const Operand& o, bool* ok = nullptr) {
     switch (o.kind) {
         case OperandKind::VGPR: {
             // A scalar-spill vgpr (v_writelane slots) has no per-lane data value — reject, don't read 0.
-            if (rs.vgpr_lane_slots.count(o.value)) { if (ok) *ok = false; return b.uconst(0); }
+            if (rs.vgpr_lane_slots.count(o.value) || rs.vgpr_lane_mask_slots.count(o.value)) {
+                if (ok) *ok = false; return b.uconst(0);
+            }
             auto it = rs.vreg.find(o.value); return it == rs.vreg.end() ? b.uconst(0) : it->second; }
         case OperandKind::SGPR: { auto it = rs.sreg.find(o.value); return it == rs.sreg.end() ? b.uconst(0) : it->second; }
         case OperandKind::InlineInt:   return b.uconst((uint32_t)o.value);
@@ -1910,6 +1991,7 @@ uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, const 
         case OperandKind::Literal:     return b.uconst(in.literal);
         case OperandKind::Special:
             if (o.value == 125) return b.uconst(0);   // SGPR_NULL: the one Special whose data value IS 0
+            if (o.value == 253) return b.sel(rs.scc, b.uconst(1), b.uconst(0)); // SCC scalar source
             // VCC_LO/HI (106/107), ttmp0..15 (108..123) and M0 (124) double as plain scalar SCRATCH
             // in compiled code — the NGG preamble does `s_bfe_u32 vcc_lo, s3, ...` then reads vcc
             // back as data, and DOLL's skinned VS round-trips M0 (`s_mov m0, s4 … s_mov s36, m0`,
@@ -2105,9 +2187,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 else { rs.sreg_bool[in.dst.value] = r; rs.sreg_bool_narrowed[in.dst.value] = true; }  // conservative flag
                 return true;
             }
-            if (in.opcode == 0x0f || in.opcode == 0x11 || in.opcode == 0x13 || in.opcode == 0x15) {
-                // 64-bit wave-mask LOGICAL ops on per-lane bools: s_and_b64(0x0f)/s_or_b64(0x11)/
-                // s_xor_b64(0x13)/s_andn2_b64(0x15, = m0 AND NOT m1). Used for lane-mask arithmetic around
+            if (in.opcode == 0x0f || in.opcode == 0x11 || in.opcode == 0x13 || in.opcode == 0x15 ||
+                in.opcode == 0x17 || in.opcode == 0x19 || in.opcode == 0x1b || in.opcode == 0x1d) {
+                // 64-bit wave-mask LOGICAL ops on per-lane bools: AND/OR/XOR/ANDN2 plus the
+                // complementary ORN2/NAND/NOR/XNOR family. Used for lane-mask arithmetic around
                 // divergent control flow / ballot. SCC=(result!=0) is a cross-lane reduction we can't form
                 // per-lane, so (like every mask op) we don't write SCC. Same mask-resolution as s_cselect_b64.
                 auto is_exec = [](const Operand& o){ return o.value == 126 || o.value == 127; };
@@ -2122,10 +2205,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 };
                 uint32_t m0 = mask(in.src[0]), m1 = mask(in.src[1]);
                 if (!m0 || !m1) { ok = false; return true; }
-                uint32_t r = in.opcode == 0x0f ? b.land(m0, m1)
-                           : in.opcode == 0x11 ? b.lor(m0, m1)
-                           : in.opcode == 0x13 ? b.bsel(m0, b.bsel(m1, b.bfalse(), b.btrue()), m1)   // xor = m0?!m1:m1
-                           : b.land(m0, b.bsel(m1, b.bfalse(), b.btrue()));                            // andn2 = m0 & !m1
+                const uint32_t n0 = b.logical_not(m0), n1 = b.logical_not(m1);
+                const uint32_t x = b.bsel(m0, n1, m1);               // xor = m0 ? !m1 : m1
+                uint32_t r = in.opcode == 0x0f ? b.land(m0, m1)      // and
+                           : in.opcode == 0x11 ? b.lor(m0, m1)       // or
+                           : in.opcode == 0x13 ? x                    // xor
+                           : in.opcode == 0x15 ? b.land(m0, n1)      // andn2
+                           : in.opcode == 0x17 ? b.lor(m0, n1)       // orn2
+                           : in.opcode == 0x19 ? b.lor(n0, n1)       // nand
+                           : in.opcode == 0x1b ? b.land(n0, n1)      // nor
+                           : b.logical_not(x);                        // xnor
                 if (is_exec(in.dst)) { rs.exec = r; rs.exec_narrowed = true; }
                 else if (in.dst.value == 106 || in.dst.value == 107) { rs.vcc = r; rs.sreg_bool_narrowed[in.dst.value] = true; }
                 else { rs.sreg_bool[in.dst.value] = r; rs.sreg_bool_narrowed[in.dst.value] = true; }
@@ -2601,7 +2690,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         uint32_t v = (in.src[k].kind == OperandKind::InlineFloat ||
                                       in.src[k].kind == OperandKind::InlineInt)
                                          ? raw                       // inline: already a full-width value
-                                         : b.unpack_half(raw, 0);    // register/literal: f16 in the low half
+                                         : b.unpack_half(raw, in.sdwa_src0_sel == 5u && k == 0 ? 1u :
+                                                              in.sdwa_src1_sel == 5u && k == 1 ? 1u : 0u);
                         if (in.src_abs[k]) v = b.fext1(Glsl_FAbs, v);
                         if (in.src_neg[k]) v = b.fbin(Op_FSub, b.uconst(0), v);
                         return v;
@@ -2648,20 +2738,58 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (in.src[1].kind != OperandKind::InlineInt || in.src[1].value < 0 || in.src[1].value > 63) {
                     ok = false; return true;
                 }
-                auto [slots, inserted] = rs.vgpr_lane_slots.try_emplace(in.dst.value);
-                if (inserted) rs.vreg.erase(in.dst.value);             // new spill-array lifetime
-                slots->second[in.src[1].value] = val(in.src[0]);
+                const int lane = in.src[1].value;
+                uint32_t mask_value = 0;
+                bool mask_source = false;
+                if (in.src[0].value == 126 || in.src[0].value == 127) {
+                    mask_value = rs.exec; mask_source = true;
+                } else if ((in.src[0].value == 106 || in.src[0].value == 107) &&
+                           !rs.sreg.count(in.src[0].value)) {
+                    mask_value = rs.vcc; mask_source = true;
+                } else if (in.src[0].kind == OperandKind::SGPR) {
+                    auto saved = rs.sreg_bool.find(in.src[0].value);
+                    if (saved != rs.sreg_bool.end()) { mask_value = saved->second; mask_source = true; }
+                }
+                rs.vreg.erase(in.dst.value);                            // spill-array lifetime
+                if (mask_source) {
+                    rs.vgpr_lane_mask_slots[in.dst.value][lane] = mask_value;
+                    auto data = rs.vgpr_lane_slots.find(in.dst.value);
+                    if (data != rs.vgpr_lane_slots.end()) {
+                        data->second.erase(lane);
+                        if (data->second.empty()) rs.vgpr_lane_slots.erase(data);
+                    }
+                } else {
+                    rs.vgpr_lane_slots[in.dst.value][lane] = val(in.src[0]);
+                    auto masks = rs.vgpr_lane_mask_slots.find(in.dst.value);
+                    if (masks != rs.vgpr_lane_mask_slots.end()) {
+                        masks->second.erase(lane);
+                        if (masks->second.empty()) rs.vgpr_lane_mask_slots.erase(masks);
+                    }
+                }
                 return true;
             }
             if (in.opcode == 0x360) {                                 // v_readlane_b32 sDST, vSRC, lane
                 if (in.src[1].kind != OperandKind::InlineInt || in.src[1].value < 0 || in.src[1].value > 63) {
                     ok = false; return true;
                 }
+                auto mit = rs.vgpr_lane_mask_slots.find(in.src[0].value);
+                if (mit != rs.vgpr_lane_mask_slots.end()) {
+                    auto sit = mit->second.find(in.src[1].value);
+                    if (sit != mit->second.end()) {
+                        rs.sreg_bool[in.dst.value] = sit->second;
+                        rs.sreg_bool_narrowed[in.dst.value] = true;
+                        rs.sreg.erase(in.dst.value);
+                        rs.sreg_srt.erase(in.dst.value);
+                        return true;
+                    }
+                }
                 auto vit = rs.vgpr_lane_slots.find(in.src[0].value);
                 if (vit == rs.vgpr_lane_slots.end()) { ok = false; return true; }   // not a spill array
                 auto sit = vit->second.find(in.src[1].value);
                 if (sit == vit->second.end()) { ok = false; return true; }          // slot never written
                 rs.sreg[in.dst.value] = sit->second;   // dst field is the SGPR number (like readfirstlane)
+                rs.sreg_bool.erase(in.dst.value);
+                rs.sreg_bool_narrowed.erase(in.dst.value);
                 rs.sreg_srt.erase(in.dst.value);
                 return true;
             }
@@ -3363,7 +3491,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // Exact per-use provenance wins over table keys. A sample and store may consume the same
             // T# through a colliding offset but require different Vulkan descriptor classes.
             if ((in.opcode == 0x08 && res && res->cls != ResourceClass::StorageImage) ||
-                (in.opcode != 0x00 && in.opcode != 0x08 && res && res->cls != ResourceClass::Texture))
+                (in.opcode != 0x00 && in.opcode != 0x08 && in.opcode != 0x0e &&
+                 res && res->cls != ResourceClass::Texture))
                 res = nullptr;
             if ((!res || (res->cls != ResourceClass::Texture && res->cls != ResourceClass::StorageImage))
                 && getenv("PROSPER_DBG")) {
@@ -3379,6 +3508,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         rt->resources.size());
             }
             if (!res) { ok = false; return true; }
+            const bool uint_texture = res->format == DataFormat::Uint8 ||
+                                      res->format == DataFormat::Uint16 ||
+                                      res->format == DataFormat::Uint32;
 
             // --- Storage-image path: image_load (0x00) / image_store (0x08), no sampler, any dim ---
             if (res->cls == ResourceClass::StorageImage) {
@@ -3425,6 +3557,27 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     int vd = in.dst.value, w = 0;
                     for (uint32_t c = 0; c < 4; c++) if (in.mimg_dmask & (1u << c)) { vals[c] = vread(vd + w); w++; }
                     b.image_write(res->binding, dim, arrayed, ncoord, coords, vals, rs.exec_narrowed, rs.exec);
+                }
+                return true;
+            }
+
+            // image_get_resinfo (0x0e): sampled-image dimensions at the integer LOD in VADDR. The
+            // DOLL UE4 volume initializer uses dim:3D, dmask:xyz to bounds-check its 8x8x8 dispatch
+            // before loading and writing the volume. Array/cube queries remain deferred with their
+            // corresponding sampled-image representations.
+            if (in.opcode == 0x0e) {
+                uint32_t dim;
+                if (in.mimg_dim == 0u) dim = Dim_1D;
+                else if (in.mimg_dim == 1u) dim = Dim_2D;
+                else if (in.mimg_dim == 2u) dim = Dim_3D;
+                else { ok = false; return true; }
+                if (res->cls != ResourceClass::Texture) { ok = false; return true; }
+                b.declare_texture(res->binding, dim, uint_texture);
+                uint32_t out[4]; b.image_get_resinfo(res->binding, dim, vread(in.src[0].value), out);
+                int vd = in.dst.value, w = 0;
+                for (uint32_t c = 0; c < 4; c++) if (in.mimg_dmask & (1u << c)) {
+                    uint32_t old = vreg_old(b, rs, vd + w); rs.vreg[vd + w] = out[c];
+                    predicate_write(b, rs, vd + w, old); w++;
                 }
                 return true;
             }
@@ -3487,13 +3640,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 uint32_t layer = b.fext1(Glsl_RoundEven,
                                      b.fext2(Glsl_FMax, b.fext2(Glsl_FMin, fid, b.uconst(fbits(5.0f))), zero));
                 uint32_t v6 = b.fbin(Op_FMul, b.fbin(Op_FAdd, layer, vf), b.uconst(fbits(1.0f / 6.0f)));
-                b.declare_texture(res->binding, Dim_2D);
+                b.declare_texture(res->binding, Dim_2D, uint_texture);
                 b.image_sample_lod_2d(res->binding, uf, v6, b.uconst(0), out);
             } else if (dim3d) {
                 // 3D: implicit-LOD / LOD-0 sample, or an integer texel FETCH (image_load — DOLL's
                 // color-grade 3D LUT, #273).
                 if (!is_sample && !is_sample_lz && !is_load) { ok = false; return true; }
-                b.declare_texture(res->binding, Dim_3D);
+                b.declare_texture(res->binding, Dim_3D, uint_texture);
                 if (is_sample)      b.image_sample_3d(res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)), out);
                 else if (is_load)   b.image_fetch_3d(res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)), out);
                 else                b.image_sample_lod_3d(res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)),
@@ -3504,7 +3657,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 uint32_t dm = in.mimg_dmask;
                 if (dm != 1u && dm != 2u && dm != 4u && dm != 8u) { ok = false; return true; }
                 uint32_t comp = dm == 1u ? 0u : dm == 2u ? 1u : dm == 4u ? 2u : 3u;
-                b.declare_texture(res->binding, Dim_2D);
+                b.declare_texture(res->binding, Dim_2D, uint_texture);
                 if (is_gather_lz_o)   // vaddr order for _o: [packed offset, u, v]
                     b.image_gather_offset_2d(res->binding, vread(cvg(1)), vread(cvg(2)), comp, vread(cvg(0)), out);
                 else
@@ -3517,7 +3670,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 return true;
             } else {
-                b.declare_texture(res->binding, Dim_2D);
+                b.declare_texture(res->binding, Dim_2D, uint_texture);
                 if (is_sample_b) {      // vaddr order for _b: [bias, u, v]
                     b.image_sample_bias_2d(res->binding, vread(cvg(1)), vread(cvg(2)), vread(cvg(0)), out);
                 } else if (is_sample_lz_o) {   // vaddr order for _o: [packed offset, u, v]
@@ -3723,6 +3876,324 @@ std::unordered_map<uint32_t, std::vector<uint32_t>> detect_pcrel_tables(
     return out;
 }
 
+// Arbitrary compute CFG fallback. Some UE4 volume-lighting kernels contain nested EXEC loops plus
+// a small backward VCC vote loop. They are valid reducible machine CFGs, but deliberately exceed the
+// narrow pattern structurizer below. Lower them as a structured dispatcher loop: one switch case per
+// basic block, with the emulated register file persisted in Function variables between iterations.
+// VCCZ/EXECZ test subgroup-wide Any, matching the hardware branch's wave-mask reduction instead of
+// treating one invocation's bit as the whole mask. The fallback is gated by emit_body to complex,
+// barrier/LDS-free compute CFGs; simple or unsafe shaders retain the existing conservative path.
+bool emit_compute_cfg_state_machine(
+    SpirvCompute& b, RegState& initial, const std::vector<Rdna2Inst>& ins,
+    const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt,
+    bool allow_exec_update, bool allow_smem,
+    const std::function<bool(const Rdna2Inst&)>& exp_fn) {
+    if (!b.is_compute || ins.empty()) return false;
+
+    uint32_t end_pc = UINT32_MAX;
+    for (const auto& in : ins) if (in.is_end) { end_pc = in.pc; break; }
+    if (end_pc == UINT32_MAX) return false;
+
+    // Split at every branch target and fallthrough. Case values are dense block indices, not guest PCs.
+    std::set<uint32_t> start_set{ins.front().pc};
+    for (size_t i = 0; i < ins.size(); ++i) {
+        const auto& in = ins[i];
+        if (in.is_end) break;
+        if (in.fmt != Rdna2Format::SOPP || in.opcode < 0x02 || in.opcode > 0x09 ||
+            in.opcode == 0x03) continue;
+        const uint32_t target = branch_target(in);
+        if (target <= end_pc) start_set.insert(target);
+        if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc) start_set.insert(ins[i + 1].pc);
+    }
+    start_set.insert(end_pc);
+    std::vector<uint32_t> starts(start_set.begin(), start_set.end());
+    if (starts.empty() || starts.front() != ins.front().pc) return false;
+    std::unordered_map<uint32_t, uint32_t> block_for_pc;
+    for (uint32_t i = 0; i < starts.size(); ++i) block_for_pc[starts[i]] = i;
+
+    // Persist only registers that the stream reads or writes, plus the caller's initialized inputs.
+    std::set<int> vregs, sregs;
+    loop_written_regs(ins, 0, end_pc, vregs, sregs);
+    for (const auto& in : ins) {
+        if (in.is_end) break;
+        for (uint32_t k = 0; k < in.n_src; ++k) {
+            const Operand& src = in.src[k];
+            if (src.kind == OperandKind::VGPR) vregs.insert(src.value);
+            else if (src.kind == OperandKind::SGPR ||
+                     (src.kind == OperandKind::Special && src.value >= 106 && src.value <= 124))
+                sregs.insert(src.value);
+        }
+    }
+    for (const auto& kv : initial.vreg) vregs.insert(kv.first);
+    for (const auto& kv : initial.sreg) sregs.insert(kv.first);
+
+    // Direct user-data descriptors are deliberately absent from the initial scalar SSA map: their
+    // identity lives in the resource table, and presence in sreg means shader code overwrote them.
+    // The dispatcher persists every referenced SGPR in a Function variable, so recover that
+    // distinction per block until the first static write; otherwise a direct V# such as UE4's s[8:11]
+    // looks rewritten merely because the dispatcher loaded its zero-initialized backing variable.
+    std::set<int> direct_descriptor_sregs;
+    if (rt) {
+        for (const auto& resource : rt->resources) {
+            if (resource.srt_offset != 0xFFFFFFFFu || resource.sgpr_base == 0xFFFFFFFFu) continue;
+            const uint32_t words = (resource.cls == ResourceClass::Texture ||
+                                    resource.cls == ResourceClass::StorageImage) ? 8u : 4u;
+            for (uint32_t word = 0; word < words; ++word)
+                direct_descriptor_sregs.insert(static_cast<int>(resource.sgpr_base + word));
+        }
+    }
+
+    // Saved mask pairs and scalar-spill lane slots have their own value domains.
+    std::set<int> mask_keys;
+    for (const auto& kv : initial.sreg_bool) mask_keys.insert(kv.first);
+    std::set<std::pair<int, int>> lane_slots, mask_lane_slots;
+    // Discover every mask-valued SGPR first. A lane spill can precede another static definition of
+    // that mask in a back-edge block, so classifying spills in the same pass would be order-dependent.
+    for (const auto& in : ins) {
+        if (in.is_end) break;
+        if (in.fmt == Rdna2Format::SOP1 &&
+            (in.opcode == 0x04 || in.opcode == 0x0a || in.opcode == 0x24 || in.opcode == 0x25) &&
+            in.dst.value != 126 && in.dst.value != 127)
+            mask_keys.insert(in.dst.value);
+        if (in.fmt == Rdna2Format::SOP2 &&
+            (in.opcode == 0x0b || in.opcode == 0x0f || in.opcode == 0x11 ||
+             in.opcode == 0x13 || in.opcode == 0x15 || in.opcode == 0x17 ||
+             in.opcode == 0x19 || in.opcode == 0x1b || in.opcode == 0x1d) &&
+            in.dst.value != 106 && in.dst.value != 107 && in.dst.value != 126 && in.dst.value != 127)
+            mask_keys.insert(in.dst.value);
+        if (in.fmt == Rdna2Format::VOPC && in.dst.kind == OperandKind::SGPR && in.dst.value <= 105)
+            mask_keys.insert(in.dst.value);
+    }
+    for (const auto& in : ins) {
+        if (in.is_end) break;
+        if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x361 &&
+            in.src[1].kind == OperandKind::InlineInt && in.src[1].value >= 0 && in.src[1].value <= 63) {
+            const std::pair<int, int> slot{in.dst.value, in.src[1].value};
+            const bool is_mask = in.src[0].value == 106 || in.src[0].value == 107 ||
+                                 in.src[0].value == 126 || in.src[0].value == 127 ||
+                                 (in.src[0].kind == OperandKind::SGPR && mask_keys.count(in.src[0].value));
+            (is_mask ? mask_lane_slots : lane_slots).insert(slot);
+        }
+    }
+    for (const auto& vg : initial.vgpr_lane_slots)
+        for (const auto& slot : vg.second) lane_slots.emplace(vg.first, slot.first);
+    for (const auto& vg : initial.vgpr_lane_mask_slots)
+        for (const auto& slot : vg.second) mask_lane_slots.emplace(vg.first, slot.first);
+    // The dispatcher has separate persisted value domains for scalar data and lane masks. If one
+    // physical spill slot changes domain across paths, rejecting is safer than reloading both and
+    // letting v_readlane choose an arbitrary representation.
+    for (const auto& slot : lane_slots)
+        if (mask_lane_slots.count(slot)) return false;
+
+    uint32_t ptr_u32 = 0, ptr_bool = 0;
+    std::map<int, uint32_t> vv, sv, mv;
+    std::map<std::pair<int, int>, uint32_t> lv, lmv;
+    for (int r : vregs) vv[r] = b.function_var(b.t_u32, ptr_u32);
+    for (int r : sregs) sv[r] = b.function_var(b.t_u32, ptr_u32);
+    for (int r : mask_keys) mv[r] = b.function_var(b.t_bool, ptr_bool);
+    for (const auto& slot : lane_slots) lv[slot] = b.function_var(b.t_u32, ptr_u32);
+    for (const auto& slot : mask_lane_slots) lmv[slot] = b.function_var(b.t_bool, ptr_bool);
+    const uint32_t scc_var = b.function_var(b.t_bool, ptr_bool);
+    const uint32_t vcc_var = b.function_var(b.t_bool, ptr_bool);
+    const uint32_t exec_var = b.function_var(b.t_bool, ptr_bool);
+    const uint32_t pc_var = b.function_var(b.t_u32, ptr_u32);
+    const uint32_t active_var = b.function_var(b.t_bool, ptr_bool);
+
+    const uint32_t zero = b.uconst(0), no = b.bfalse(), yes = b.btrue();
+    for (const auto& kv : vv) {
+        auto it = initial.vreg.find(kv.first);
+        b.store_function(kv.second, it == initial.vreg.end() ? zero : it->second);
+    }
+    for (const auto& kv : sv) {
+        auto it = initial.sreg.find(kv.first);
+        b.store_function(kv.second, it == initial.sreg.end() ? zero : it->second);
+    }
+    for (const auto& kv : mv) {
+        auto it = initial.sreg_bool.find(kv.first);
+        b.store_function(kv.second, it == initial.sreg_bool.end() ? no : it->second);
+    }
+    for (const auto& kv : lv) {
+        uint32_t value = zero;
+        auto vg = initial.vgpr_lane_slots.find(kv.first.first);
+        if (vg != initial.vgpr_lane_slots.end()) {
+            auto slot = vg->second.find(kv.first.second);
+            if (slot != vg->second.end()) value = slot->second;
+        }
+        b.store_function(kv.second, value);
+    }
+    for (const auto& kv : lmv) {
+        uint32_t value = no;
+        auto vg = initial.vgpr_lane_mask_slots.find(kv.first.first);
+        if (vg != initial.vgpr_lane_mask_slots.end()) {
+            auto slot = vg->second.find(kv.first.second);
+            if (slot != vg->second.end()) value = slot->second;
+        }
+        b.store_function(kv.second, value);
+    }
+    b.store_function(scc_var, initial.scc);
+    b.store_function(vcc_var, initial.vcc);
+    b.store_function(exec_var, initial.exec);
+    b.store_function(pc_var, b.uconst(0));
+    b.store_function(active_var, yes);
+
+    auto load_state = [&]() {
+        RegState state;
+        for (const auto& kv : vv) state.vreg[kv.first] = b.load_function(b.t_u32, kv.second);
+        for (const auto& kv : sv) state.sreg[kv.first] = b.load_function(b.t_u32, kv.second);
+        for (const auto& kv : mv) {
+            state.sreg_bool[kv.first] = b.load_function(b.t_bool, kv.second);
+            state.sreg_bool_narrowed[kv.first] = true;
+        }
+        for (const auto& kv : lv)
+            state.vgpr_lane_slots[kv.first.first][kv.first.second] =
+                b.load_function(b.t_u32, kv.second);
+        for (const auto& kv : lmv)
+            state.vgpr_lane_mask_slots[kv.first.first][kv.first.second] =
+                b.load_function(b.t_bool, kv.second);
+        state.scc = b.load_function(b.t_bool, scc_var);
+        state.vcc = b.load_function(b.t_bool, vcc_var);
+        state.exec = b.load_function(b.t_bool, exec_var);
+        state.exec_narrowed = true; // state-machine joins may carry a narrowed EXEC edge
+        state.mubuf_pcrel_tables = initial.mubuf_pcrel_tables;
+        return state;
+    };
+    auto save_state = [&](const RegState& state) {
+        for (const auto& kv : vv) {
+            auto it = state.vreg.find(kv.first);
+            b.store_function(kv.second, it == state.vreg.end() ? zero : it->second);
+        }
+        for (const auto& kv : sv) {
+            auto it = state.sreg.find(kv.first);
+            b.store_function(kv.second, it == state.sreg.end() ? zero : it->second);
+        }
+        for (const auto& kv : mv) {
+            auto it = state.sreg_bool.find(kv.first);
+            b.store_function(kv.second, it == state.sreg_bool.end() ? no : it->second);
+        }
+        for (const auto& kv : lv) {
+            uint32_t value = zero;
+            auto vg = state.vgpr_lane_slots.find(kv.first.first);
+            if (vg != state.vgpr_lane_slots.end()) {
+                auto slot = vg->second.find(kv.first.second);
+                if (slot != vg->second.end()) value = slot->second;
+            }
+            b.store_function(kv.second, value);
+        }
+        for (const auto& kv : lmv) {
+            uint32_t value = no;
+            auto vg = state.vgpr_lane_mask_slots.find(kv.first.first);
+            if (vg != state.vgpr_lane_mask_slots.end()) {
+                auto slot = vg->second.find(kv.first.second);
+                if (slot != vg->second.end()) value = slot->second;
+            }
+            b.store_function(kv.second, value);
+        }
+        b.store_function(scc_var, state.scc);
+        b.store_function(vcc_var, state.vcc);
+        b.store_function(exec_var, state.exec);
+    };
+
+    // Subgroup votes are required only by this fallback and therefore add no capability to the
+    // normal shader path.
+    SpirvCompute::put(b.caps, Op_Capability, {Cap_GroupNonUniform});
+    SpirvCompute::put(b.caps, Op_Capability, {Cap_GroupNonUniformVote});
+
+    const uint32_t loop_header = b.id(), switch_header = b.id(), switch_merge = b.id();
+    const uint32_t loop_continue = b.id(), loop_merge = b.id(), fallback = b.id();
+    std::vector<uint32_t> labels(starts.size());
+    std::vector<std::pair<uint32_t, uint32_t>> switch_cases;
+    for (uint32_t i = 0; i < starts.size(); ++i) {
+        labels[i] = b.id();
+        switch_cases.emplace_back(i, labels[i]);
+    }
+    b.emit_branch(loop_header);
+    b.emit_label(loop_header);
+    b.emit_loopmerge(loop_merge, loop_continue);
+    b.emit_branch(switch_header);
+    b.emit_label(switch_header);
+    const uint32_t selector = b.load_function(b.t_u32, pc_var);
+    b.emit_selmerge(switch_merge);
+    b.emit_switch(selector, fallback, switch_cases);
+
+    auto set_next = [&](uint32_t pc) {
+        auto found = block_for_pc.find(pc);
+        if (pc > end_pc || found == block_for_pc.end()) b.store_function(active_var, no);
+        else b.store_function(pc_var, b.uconst(found->second));
+    };
+    for (uint32_t block = 0; block < starts.size(); ++block) {
+        const uint32_t lo = starts[block];
+        const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
+        b.emit_label(labels[block]);
+        RegState state = load_state();
+        if (!direct_descriptor_sregs.empty()) {
+            std::set<int> written_vregs, written_sregs;
+            loop_written_regs(ins, 0, lo, written_vregs, written_sregs);
+            for (int reg : direct_descriptor_sregs)
+                if (!written_sregs.count(reg)) state.sreg.erase(reg);
+        }
+        const Rdna2Inst* terminator = nullptr;
+        for (const auto& in : ins) {
+            if (in.pc < lo || in.pc >= hi) continue;
+            if (in.is_end || (in.fmt == Rdna2Format::SOPP && in.opcode >= 0x02 &&
+                              in.opcode <= 0x09 && in.opcode != 0x03)) {
+                terminator = &in;
+                break;
+            }
+            if (in.fmt == Rdna2Format::EXP) {
+                if (!exp_fn(in)) return false;
+                continue;
+            }
+            bool ok = true;
+            if (!emit_alu(b, state, in, ok, allow_exec_update, &safe, allow_smem, rt,
+                          /*allow_wave*/false) || !ok) {
+                if (getenv("PROSPER_DBG"))
+                    std::fprintf(stderr, "[cfg-recompile-reject] pc=%u fmt=%d op=0x%x\n",
+                                 in.pc, static_cast<int>(in.fmt), in.opcode);
+                return false;
+            }
+        }
+        save_state(state);
+        if (!terminator) {
+            set_next(hi);
+        } else if (terminator->is_end) {
+            b.store_function(active_var, no);
+        } else if (terminator->opcode == 0x02) {
+            set_next(branch_target(*terminator));
+        } else {
+            uint32_t condition = 0;
+            switch (terminator->opcode) {
+                case 0x04: condition = b.logical_not(state.scc); break; // s_cbranch_scc0
+                case 0x05: condition = state.scc; break;
+                case 0x06: condition = b.logical_not(b.subgroup_any(state.vcc)); break;
+                case 0x07: condition = b.subgroup_any(state.vcc); break;
+                case 0x08: condition = b.logical_not(b.subgroup_any(state.exec)); break;
+                case 0x09: condition = b.subgroup_any(state.exec); break;
+                default: return false;
+            }
+            const uint32_t target = branch_target(*terminator);
+            const uint32_t fallthrough = terminator->pc + terminator->len_dwords;
+            auto taken = block_for_pc.find(target), next = block_for_pc.find(fallthrough);
+            if (taken == block_for_pc.end() || next == block_for_pc.end()) return false;
+            b.store_function(pc_var,
+                b.sel(condition, b.uconst(taken->second), b.uconst(next->second)));
+        }
+        b.emit_branch(switch_merge);
+    }
+    b.emit_label(fallback);
+    b.store_function(active_var, no);
+    b.emit_branch(switch_merge);
+    b.emit_label(switch_merge);
+    b.emit_branch(loop_continue);
+    b.emit_label(loop_continue);
+    b.emit_condbranch(b.load_function(b.t_bool, active_var), loop_header, loop_merge);
+    b.emit_label(loop_merge);
+
+    // Expose the final emulated state to the caller (compute currently consumes no register output,
+    // but keeping it coherent makes the helper reusable and avoids surprising post-body state).
+    initial = load_state();
+    return true;
+}
+
 // Emit the instruction body (shared by every stage). Handles a single recognized COUNTED loop as a real
 // structured SPIR-V loop (OpLoopMerge + OpPhi for loop-carried registers); loop-FREE streams walk straight
 // through, byte-identical to the pre-loop-feature behavior. `exp_fn` handles an EXP instruction per stage
@@ -3864,6 +4335,34 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         const std::vector<ForwardIf> Fs = detect_forward_ifs(ins, /*allow_vcc*/!b.is_compute, code, dwords, &safe,
                                                              Ls.empty() ? nullptr : &Ls, &cf_rejected,
                                                              /*uniform_vcc_compute*/b.is_compute);
+
+        // UE4's volume-lighting kernels combine nested EXEC loops with a backward VCC vote loop.
+        // That shape is intentionally outside the narrow pattern structurizer above. Use the
+        // dispatcher fallback only when there is unmistakably complex compute control flow and the
+        // body is free of operations whose workgroup-uniform placement the dispatcher cannot prove.
+        // Existing straight-line, single-if, and recognized single-loop shaders keep their old path.
+        size_t cfg_branches = 0;
+        bool cfg_has_backedge = false, cfg_dispatch_safe = b.is_compute;
+        for (const auto& in : ins) {
+            if (in.is_end) break;
+            if (in.fmt == Rdna2Format::DS ||
+                (in.fmt == Rdna2Format::SOPP && in.opcode == 0x0a) ||
+                (in.fmt == Rdna2Format::VOP3 &&
+                 (in.opcode == 0x365 || in.opcode == 0x366)))
+                cfg_dispatch_safe = false;
+            if (in.fmt == Rdna2Format::SOPP && in.opcode >= 0x02 && in.opcode <= 0x09 &&
+                in.opcode != 0x03) {
+                ++cfg_branches;
+                if (branch_target(in) <= in.pc) cfg_has_backedge = true;
+            }
+        }
+        // A lone exit + back-edge is the ordinary single-loop shape. Keep rejecting it when its
+        // wave-uniformity proof fails; the dispatcher is reserved for genuinely nested/multi-branch CFGs.
+        const bool complex_compute_cfg = cfg_dispatch_safe && cfg_branches > 2 && cfg_has_backedge;
+        if (complex_compute_cfg && (cf_rejected || Ls.empty()) &&
+            emit_compute_cfg_state_machine(b, rs, ins, safe, rt,
+                                           allow_exec_update, allow_smem, exp_fn))
+            return true;
         if (cf_rejected) Ls.clear();   // unmodeled CF somewhere: fall through to straight-line (loud reject)
         if (Fs.empty() && Ls.empty()) {
             wave_ok = true;   // straight-line: barriers are wave-uniform, so cross-lane mbcnt is safe here
@@ -4026,14 +4525,13 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     // Narrowed-ness is sticky (either edge narrowed → post-merge writes stay predicated).
                     if (then_exec != pre_exec) rs.exec = b.emit_phi_2way(b.t_bool, pre_exec, preblock, then_exec, thenEnd);
                     rs.exec_narrowed = pre_narrowed || then_narrowed;
-                    // A saved MASK (sreg_bool) whose value CHANGED inside the block would not dominate the
-                    // merge — phi it like SCC/VCC (a mask newly CREATED inside the block is left as-is,
-                    // matching the previous single-if behavior; its post-merge use, if any, was already
-                    // undominated before this path existed).
+                    // A saved MASK (sreg_bool) created or changed inside the block must dominate both
+                    // merge predecessors. A newly-created per-lane mask is false on the skipped edge.
                     for (auto& kv : rs.sreg_bool) {
                         auto p = pre_bool.find(kv.first);
-                        if (p != pre_bool.end() && p->second != kv.second) {
-                            kv.second = b.emit_phi_2way(b.t_bool, p->second, preblock, kv.second, thenEnd);
+                        const uint32_t before = p != pre_bool.end() ? p->second : b.bfalse();
+                        if (before != kv.second) {
+                            kv.second = b.emit_phi_2way(b.t_bool, before, preblock, kv.second, thenEnd);
                             rs.sreg_bool_narrowed[kv.first] = true;   // conservative: provenance now mixed
                         }
                     }
@@ -4078,12 +4576,19 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     if (then_vcc != rs.vcc) rs.vcc = b.emit_phi_2way(b.t_bool, then_vcc, thenEnd, rs.vcc, elseEnd);
                     if (then_exec != rs.exec) rs.exec = b.emit_phi_2way(b.t_bool, then_exec, thenEnd, rs.exec, elseEnd);
                     rs.exec_narrowed = then_narrowed || rs.exec_narrowed;
-                    for (auto& kv : rs.sreg_bool) {         // masks changed differently per arm -> phi
-                        auto t = then_bool.find(kv.first);
-                        if (t != then_bool.end() && t->second != kv.second) {
-                            kv.second = b.emit_phi_2way(b.t_bool, t->second, thenEnd, kv.second, elseEnd);
-                            rs.sreg_bool_narrowed[kv.first] = true;
-                        }
+                    // Merge the UNION of mask keys. A mask created in only one arm is false in the
+                    // other arm; leaving that arm-local SSA id live after the merge is invalid SPIR-V.
+                    std::set<int> bool_keys;
+                    for (const auto& kv : then_bool) bool_keys.insert(kv.first);
+                    for (const auto& kv : rs.sreg_bool) bool_keys.insert(kv.first);
+                    for (int key : bool_keys) {
+                        auto t = then_bool.find(key);
+                        auto e = rs.sreg_bool.find(key);
+                        const uint32_t tv = t != then_bool.end() ? t->second : b.bfalse();
+                        const uint32_t ev = e != rs.sreg_bool.end() ? e->second : b.bfalse();
+                        rs.sreg_bool[key] = tv == ev ? tv
+                            : b.emit_phi_2way(b.t_bool, tv, thenEnd, ev, elseEnd);
+                        if (tv != ev) rs.sreg_bool_narrowed[key] = true;
                     }
                     lo = else_hi;   // continue after the merge (== hi for the escaping-cascade shape)
                 }
@@ -4224,6 +4729,7 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
                     const bool st_dim = i.mimg_dim <= 2u || i.mimg_dim == 4u || i.mimg_dim == 5u;
                     if (i.opcode == 0x00u) return st_dim || i.mimg_dim == 6u || i.mimg_dim == 7u;   // image_load (+ 2D_MSAA[_ARRAY])
                     if (i.opcode == 0x08u) return st_dim;                       // image_store (no per-sample MSAA store)
+                    if (i.opcode == 0x0eu) return i.mimg_dim <= 2u;             // image_get_resinfo 1D/2D/3D
                     // sample*: 2D (NSA ok); plus implicit-LOD image_sample (0x20) / LOD-0 image_sample_lz
                     // (0x27) from a 3D texture; sample_b (0x25) and gather4_lz (0x47) are 2D. 2D_ARRAY (dim 5)
                     // is accepted for all sample paths and handled as its base 2D slice (array index dropped,

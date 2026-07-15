@@ -55,7 +55,7 @@ struct TextureDecodeKey {
     uint32_t cls = 0;
     uint32_t format = 0;
     uint32_t num_components = 0;
-    uint32_t width = 0, height = 0;
+    uint32_t width = 0, height = 0, depth = 1;
     uint32_t tile_mode = 0;
     uint32_t img_dim = 0;
     bool operator==(const TextureDecodeKey&) const = default;
@@ -71,7 +71,7 @@ struct TextureDecodeKeyHash {
             hash *= 1099511628211ull;
         };
         mix(key.gpu_addr); mix(key.host_data); mix(key.host_data_size); mix(key.size);
-        mix(key.cls); mix(key.format); mix(key.num_components); mix(key.width); mix(key.height);
+        mix(key.cls); mix(key.format); mix(key.num_components); mix(key.width); mix(key.height); mix(key.depth);
         mix(key.tile_mode); mix(key.img_dim);
         return hash;
     }
@@ -335,18 +335,19 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         const TextureDecodeKey decode_key{
                             r.gpu_addr, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(r.host_data)),
                             r.host_data_size, r.size, static_cast<uint32_t>(r.cls),
-                            static_cast<uint32_t>(r.format), r.num_components, tw, th,
+                            static_cast<uint32_t>(r.format), r.num_components, tw, th, r.depth,
                             r.tile_mode, r.img_dim,
                         };
                         auto live_rtt = rtt_on ? g_rtt.find(r.gpu_addr) : g_rtt.end();
-                        const bool has_live_rtt = live_rtt != g_rtt.end() && live_rtt->second.w &&
+                        const bool has_live_rtt = r.img_dim == 1u && live_rtt != g_rtt.end() && live_rtt->second.w &&
                             live_rtt->second.h && !live_rtt->second.rgba.empty();
                         const bool is_cube = r.img_dim == 3u;   // CUBE: six faces stacked vertically (#273)
+                        const bool is_volume = r.img_dim == 2u;
                         const uint32_t persistent_pitch = getenv("PROSPER_PITCH")
                             ? static_cast<uint32_t>(atoi(getenv("PROSPER_PITCH"))) : 0;
                         const bool persistent_cache_eligible =
                             !getenv("PROSPER_NO_TEXTURE_DECODE_CACHE") && persistent_decode_limit &&
-                            !has_live_rtt && !is_cube && r.cls == RC::Texture &&
+                            !has_live_rtt && r.img_dim == 1u && r.cls == RC::Texture &&
                             r.format == prosper::gpu::DataFormat::Unorm8 && r.num_components == 4 &&
                             !getenv("PROSPER_NODETILE") && prosper::gpu::tile_mode_is_tiled(r.tile_mode);
                         const size_t persistent_source_size = persistent_cache_eligible
@@ -385,12 +386,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             fr.tex_rgba = decoded_reuse->pixels;
                             fr.tw = tw;
                             fr.th = decoded_reuse->output_height;
+                            fr.td = is_volume ? r.depth : 1u;
+                            fr.img_dim = r.img_dim;
                             narrow_done = decoded_reuse->narrow;
                             decoded_textures.emplace(
                                 decode_key, DecodedTexture{fr.tex_rgba, fr.th, narrow_done});
                             if (timing_enabled) pending_timing.texture_reuses++;
                         } else {
-                        size_t nb = (size_t)tw * th * 4 * (is_cube ? 6u : 1u);
+                        const size_t volume_texels = (size_t)tw * th * (is_volume ? r.depth : 1u);
+                        size_t nb = volume_texels * 4 * (is_cube ? 6u : 1u);
                         if (texstore_used == texstore.size()) texstore.emplace_back();
                         std::vector<uint8_t>& texture_pixels = texstore[texstore_used++];
                         texture_pixels.resize(nb);
@@ -437,7 +441,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // RTT (#167): if this texture's base is a color target we rendered into, inject those
                         // pixels (nearest-scaled to tw x th) instead of reading empty guest memory.
                         bool rtt_hit = false;
-                        if (rtt_on) { auto rit = g_rtt.find(r.gpu_addr);
+                        if (rtt_on && !is_volume) { auto rit = g_rtt.find(r.gpu_addr);
                             if (rit != g_rtt.end() && rit->second.w && rit->second.h && !rit->second.rgba.empty()) {
                                 const RttSurf& s = rit->second;
                                 const size_t expected = static_cast<size_t>(tw) * th * 4;
@@ -559,18 +563,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             // unit-tested, but the [0,1] clamp loses >1.0 bloom energy (native
                             // VK_FORMAT_R16G16B16A16_SFLOAT upload is the documented follow-up).
                             const uint32_t nc = bpt / 2;                    // fp16 components per texel
-                            std::vector<uint8_t> hlin((size_t)tw * th * bpt, 0);
+                            std::vector<uint8_t> hlin(volume_texels * bpt, 0);
                             bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) && !getenv("PROSPER_NODETILE");
                             if (tiled) {
-                                size_t tbytes = prosper::gpu::tiled_surface_bytes(tw, th, r.tile_mode, 0, bpt);
+                                size_t tbytes = is_volume
+                                    ? prosper::gpu::tiled_volume_bytes(tw, th, r.depth, r.tile_mode, bpt)
+                                    : prosper::gpu::tiled_surface_bytes(tw, th, r.tile_mode, 0, bpt);
                                 std::vector<uint8_t> traw(tbytes, 0);
                                 size_t got = copy_resource(traw.data(), r.gpu_addr, tbytes);
                                 if (got < hlin.size()) copy_resource(hlin.data(), r.gpu_addr, hlin.size());  // short backing -> linear fallback
-                                else prosper::gpu::detile_surface(hlin.data(), traw.data(), tw, th, r.tile_mode, 0, bpt);
+                                else if (is_volume) prosper::gpu::detile_volume(
+                                    hlin.data(), traw.data(), got, tw, th, r.depth, r.tile_mode, bpt);
+                                else prosper::gpu::detile_surface(
+                                    hlin.data(), traw.data(), tw, th, r.tile_mode, 0, bpt);
                             } else {
                                 copy_resource(hlin.data(), r.gpu_addr, hlin.size());
                             }
-                            for (size_t t = 0; t < (size_t)tw * th; t++) {
+                            for (size_t t = 0; t < volume_texels; t++) {
                                 uint8_t* p = &texture_pixels[t * 4];
                                 for (uint32_t c = 0; c < 4; c++) {
                                     if (c < nc) {
@@ -587,10 +596,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             // with the matching bpe geometry (1 B -> 64x64 micro-tiles, #119), then expand
                             // each texel to grayscale RGBA8 (replicate to R,G,B,A) so the sampling shader
                             // reads the coverage in ANY channel it uses (.r for a font atlas, .a for a mask).
-                            std::vector<uint8_t> nlin((size_t)tw * th * bpt, 0);
+                            std::vector<uint8_t> nlin(volume_texels * bpt, 0);
                             bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) && !getenv("PROSPER_NODETILE");
                             if (tiled) {
-                                size_t tbytes = prosper::gpu::tiled_surface_bytes(tw, th, r.tile_mode, 0, bpt);
+                                size_t tbytes = is_volume
+                                    ? prosper::gpu::tiled_volume_bytes(tw, th, r.depth, r.tile_mode, bpt)
+                                    : prosper::gpu::tiled_surface_bytes(tw, th, r.tile_mode, 0, bpt);
                                 std::vector<uint8_t> traw(tbytes, 0);
                                 size_t got = copy_resource(traw.data(), r.gpu_addr, tbytes);
                                 // PROSPER_DUMP_RAWTILE (narrow path): the single/dual-channel RAW TILED bytes,
@@ -606,11 +617,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                     }
                                 }
                                 if (got < nlin.size()) copy_resource(nlin.data(), r.gpu_addr, nlin.size());  // short backing -> linear fallback
-                                else prosper::gpu::detile_surface(nlin.data(), traw.data(), tw, th, r.tile_mode, 0, bpt);
+                                else if (is_volume) prosper::gpu::detile_volume(
+                                    nlin.data(), traw.data(), got, tw, th, r.depth, r.tile_mode, bpt);
+                                else prosper::gpu::detile_surface(
+                                    nlin.data(), traw.data(), tw, th, r.tile_mode, 0, bpt);
                             } else {
                                 copy_resource(nlin.data(), r.gpu_addr, nlin.size());
                             }
-                            for (size_t t = 0; t < (size_t)tw * th; t++) {
+                            for (size_t t = 0; t < volume_texels; t++) {
                                 uint8_t v = nlin[t * bpt];   // first (coverage) channel
                                 uint8_t* p = &texture_pixels[t * 4];
                                 p[0] = p[1] = p[2] = p[3] = v;
@@ -637,10 +651,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         bool auto_tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode);
                         const char* dt = getenv("PROSPER_DETILE");
                         // BC textures already block-detiled + decoded above; the 32-bpp detiler must not touch them.
-                        if (!rtt_hit && !cube_done && !bcb && !narrow_done && !f16_done && !getenv("PROSPER_NODETILE") && (auto_tiled || (dt && atoi(dt) != 0))) {
+                        if (!rtt_hit && !cube_done && !bcb && !narrow_done && !f16_done &&
+                            !getenv("PROSPER_NODETILE") &&
+                            (auto_tiled || (!is_volume && dt && atoi(dt) != 0))) {
                             const uint32_t tmode = auto_tiled ? r.tile_mode : (uint32_t)prosper::gpu::TileMode::Sw4KbS;
                             const uint32_t pitch = getenv("PROSPER_PITCH") ? (uint32_t)atoi(getenv("PROSPER_PITCH")) : 0;
-                            size_t tiled_bytes = prosper::gpu::tiled_surface_bytes(tw, th, tmode, pitch);
+                            size_t tiled_bytes = is_volume
+                                ? prosper::gpu::tiled_volume_bytes(tw, th, r.depth, tmode, 4)
+                                : prosper::gpu::tiled_surface_bytes(tw, th, tmode, pitch);
                             std::vector<uint8_t> tiled(tiled_bytes, 0);
                             size_t got = copy_resource(tiled.data(), r.gpu_addr, tiled_bytes);
                             if (got < nb)
@@ -663,7 +681,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                     if (FILE* bf = fopen(bn, "wb")) { fwrite(tiled.data(), 1, tiled.size(), bf); fclose(bf); }
                                 }
                             }
-                            prosper::gpu::detile_surface(texture_pixels.data(), tiled.data(), tw, th, tmode, pitch);
+                            if (is_volume) prosper::gpu::detile_volume(
+                                texture_pixels.data(), tiled.data(), got, tw, th, r.depth, tmode, 4);
+                            else prosper::gpu::detile_surface(
+                                texture_pixels.data(), tiled.data(), tw, th, tmode, pitch);
                         }
                         // Packed R11G11B10F (Gen5 IMG_FMT 36 -> DataFormat::Float10_11_11, #294): UE4's
                         // scene-color RT format. The texel IS 4 bytes, so the generic read + auto-detile
@@ -671,7 +692,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // the same semantics as the fp16 path (NaN/neg -> 0, clamp [0,1], no alpha -> 255).
                         if (!rtt_hit && r.format == prosper::gpu::DataFormat::Float10_11_11) {
                             uint8_t* tp = texture_pixels.data();
-                            for (size_t t = 0; t < (size_t)tw * th; t++) {
+                            for (size_t t = 0; t < volume_texels; t++) {
                                 uint32_t v; std::memcpy(&v, tp + t * 4, 4);
                                 const float fc[3] = { prosper::gpu::f11_to_float((uint16_t)(v & 0x7FFu)),
                                                       prosper::gpu::f11_to_float((uint16_t)((v >> 11) & 0x7FFu)),
@@ -687,7 +708,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // field to the RGBA8 image format used by this renderer before sampling.
                         if (!rtt_hit && r.format == prosper::gpu::DataFormat::Unorm2_10_10_10) {
                             uint8_t* tp = texstore.back().data();
-                            for (size_t t = 0; t < (size_t)tw * th; t++) {
+                            for (size_t t = 0; t < volume_texels; t++) {
                                 uint32_t v; std::memcpy(&v, tp + t * 4, 4);
                                 prosper::gpu::unorm2_10_10_10_to_rgba8(v, tp + t * 4);
                             }
@@ -697,7 +718,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // divergence precedes format conversion or enters through renderer-owned state.
                         if (resource_hash_w == tw && resource_hash_h == th) {
                             const size_t raw_size = std::min<size_t>(
-                                r.size ? r.size : (size_t)tw * th * 4, 64u << 20);
+                                r.size ? r.size : volume_texels * 4, 64u << 20);
                             std::vector<uint8_t> raw(raw_size, 0);
                             const size_t raw_got = copy_resource(raw.data(), r.gpu_addr, raw.size());
                             auto fnv = [](const uint8_t* data, size_t size) {
@@ -750,13 +771,24 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // Apply the synthetic texture after every decode/conversion step. Applying it before
                         // auto-detile let the real tiled bytes overwrite the checker, producing a false-negative
                         // sampling diagnosis (#522).
-                        if (getenv("PROSPER_TESTTEX")) {
-                            for (uint32_t y = 0; y < th; y++) for (uint32_t x = 0; x < tw; x++) {
-                                uint8_t* p = &texture_pixels[((size_t)y * tw + x) * 4];
-                                bool ck = ((x / 64) ^ (y / 64)) & 1;
-                                p[0] = (uint8_t)(255 * x / tw); p[1] = (uint8_t)(255 * y / th);
-                                p[2] = ck ? 200 : 40; p[3] = 255;
-                            }
+                        const char* test_texture = getenv("PROSPER_TESTTEX");
+                        const char* test_texture_binding = getenv("PROSPER_TESTTEX_BINDING");
+                        const bool test_this_texture = test_texture &&
+                            (!test_texture_binding ||
+                             strtoul(test_texture_binding, nullptr, 0) == r.binding);
+                        if (test_this_texture) {
+                            const uint32_t slices = is_volume ? std::max(r.depth, 1u) : 1u;
+                            for (uint32_t z = 0; z < slices; ++z)
+                                for (uint32_t y = 0; y < th; ++y)
+                                    for (uint32_t x = 0; x < tw; ++x) {
+                                        uint8_t* p = &texture_pixels[
+                                            (((size_t)z * th + y) * tw + x) * 4];
+                                        bool ck = ((x / 64) ^ (y / 64) ^ z) & 1;
+                                        p[0] = (uint8_t)(255 * x / tw);
+                                        p[1] = (uint8_t)(255 * y / th);
+                                        p[2] = ck ? 200 : 40;
+                                        p[3] = 255;
+                                    }
                         }
                         // This 256x16 sparse palette is addressed like 16 blue slices, each 16 texels wide.
                         // The identity probe preserves source color through shaders using
@@ -803,6 +835,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             }
                         }
                         fr.tex_rgba = texture_pixels.data(); fr.tw = tw; fr.th = cube_done ? th * 6u : th;
+                        fr.td = is_volume ? r.depth : 1u;
+                        fr.img_dim = r.img_dim;
                         if (persistent_cache_eligible) {
                             persistent_validation_scratch.resize(persistent_source_size);
                             const size_t got = copy_resource(
@@ -903,7 +937,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             RenderClock::now() - resource_timing_start).count();
                         if (fr.is_texture()) {
                             pending_timing.textures++;
-                            pending_timing.texture_bytes += static_cast<uint64_t>(fr.tw) * fr.th * 4;
+                            pending_timing.texture_bytes += static_cast<uint64_t>(fr.tw) * fr.th * fr.td * 4;
                             pending_timing.texture_ms += elapsed;
                             const uint64_t detail_min_submit = getenv("PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT")
                                 ? strtoull(getenv("PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT"), nullptr, 0) : 0;
@@ -958,7 +992,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     for (const auto& r : resources) if (r.set == set && r.binding == d.binding) ++count;
                     const bool wants_buffer = d.kind == prosper::gpu::SpirvDescriptorKind::StorageBuffer;
                     const uint64_t available = first == resources.end() ? 0 :
-                        (first->is_texture() ? (uint64_t)first->tw * first->th * 4 : first->dwords.size() * 4);
+                        (first->is_texture() ? (uint64_t)first->tw * first->th * first->td * 4
+                                             : first->dwords.size() * 4);
                     const bool wrong_type = first != resources.end() && (first->is_texture() == wants_buffer);
                     const bool undersized = wants_buffer && available < std::max<uint64_t>(d.required_bytes, 4);
                     resources.erase(std::remove_if(resources.begin(), resources.end(), [&](const auto& r) {

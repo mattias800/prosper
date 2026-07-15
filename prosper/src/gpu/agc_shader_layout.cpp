@@ -1,6 +1,7 @@
 // agc_shader_layout.cpp — see agc_shader_layout.hpp. V# decode + the front-half resource-table build.
 #include "agc_shader_layout.hpp"
 #include <algorithm>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 
@@ -189,6 +190,7 @@ DecodedImageDescriptor decode_image_descriptor(const uint32_t t[8]) {
     d.format    = (t[1] >> 20) & 0x1FFu;                                                           // Format
     d.tile_mode = (t[3] >> 20) & 0x1Fu;                                                            // TileMode (SW_MODE)
     d.type      = (uint8_t)((t[3] >> 28) & 0xFu);                                                  // Type
+    d.depth     = d.type == 10 ? ((t[4] & 0x1FFFu) + 1u) : 1u;                                     // DEPTH (3D)
     d.dst_sel[0] = (uint8_t)((t[3] >> 0) & 0x7u);   // DST_SEL_X (WORD3 [2:0])
     d.dst_sel[1] = (uint8_t)((t[3] >> 3) & 0x7u);   // DST_SEL_Y ([5:3])
     d.dst_sel[2] = (uint8_t)((t[3] >> 6) & 0x7u);   // DST_SEL_Z ([8:6])
@@ -407,6 +409,7 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             r.gpu_addr      = d.base;
             r.width         = d.width;
             r.height        = d.height;
+            r.depth         = d.depth;
             r.tile_mode     = d.tile_mode;          // so the renderer can auto-detile a GPU-tiled surface
             r.swizzle[0] = d.dst_sel[0]; r.swizzle[1] = d.dst_sel[1];
             r.swizzle[2] = d.dst_sel[2]; r.swizzle[3] = d.dst_sel[3];   // T# DST_SEL channel remap (#261)
@@ -419,8 +422,11 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                 fprintf(stderr, "[t#] SRGB texture fmt=%u %ux%u (binding %u)\n", d.format, d.width, d.height, r.binding);
             // Backing byte size: block-compressed surfaces store one bytes_per_block unit per 4x4 block
             // (ceil dims); uncompressed store bytes_per_block per texel (fmt=56 -> *4).
-            r.size          = is_bcn ? (((d.width + 3) / 4) * ((d.height + 3) / 4) * fi.bytes_per_block)
-                                     : (d.width * d.height * fi.bytes_per_block);
+            const uint64_t backing_bytes = is_bcn
+                ? static_cast<uint64_t>((d.width + 3) / 4) * ((d.height + 3) / 4) * d.depth * fi.bytes_per_block
+                : static_cast<uint64_t>(d.width) * d.height * d.depth * fi.bytes_per_block;
+            if (!backing_bytes || backing_bytes > UINT32_MAX) continue;
+            r.size = static_cast<uint32_t>(backing_bytes);
             // SGPR-resident T#: DIRECT provenance (image_sample SRSRC SGPR). EUD-resident T#: INDIRECT
             // (the s_load immediate = tsrt), and sgpr_base must be invalid so a stray by_sgpr_base for an
             // unrelated op reading that (bogus, out-of-file) SGPR number can't spuriously match it (#382).

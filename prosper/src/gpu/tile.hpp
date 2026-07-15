@@ -57,4 +57,18 @@ void detile_elements(uint8_t* dst, const uint8_t* src, size_t src_bytes,
 // must read at least this many bytes of tiled source before detiling.
 size_t tiled_elements_bytes(uint32_t ew, uint32_t eh, uint32_t bpe, uint32_t tile_mode);
 
+// GFX10 volume layout. PS5's observed 3D surfaces use SW_64KB_R_X (mode 27), which AddrLib defines
+// as a thin/view-as-2D volume: each Z slice owns a padded grid of 2D 64KB blocks, but Z still
+// participates in the pipe-XOR bits inside every block. These helpers return false/zero for tiled
+// modes whose 3D pattern is not implemented. `src_bytes` bounds detile reads.
+bool tile_mode_supports_volume(uint32_t tile_mode);
+size_t tiled_volume_bytes(uint32_t width, uint32_t height, uint32_t depth,
+                          uint32_t tile_mode, uint32_t bytes_per_texel);
+bool detile_volume(uint8_t* dst, const uint8_t* src, size_t src_bytes,
+                   uint32_t width, uint32_t height, uint32_t depth,
+                   uint32_t tile_mode, uint32_t bytes_per_texel);
+bool tile_volume(uint8_t* dst, size_t dst_bytes, const uint8_t* src,
+                 uint32_t width, uint32_t height, uint32_t depth,
+                 uint32_t tile_mode, uint32_t bytes_per_texel);
+
 } // namespace prosper::gpu

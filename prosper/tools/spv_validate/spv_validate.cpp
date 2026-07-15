@@ -113,9 +113,42 @@ int main(int argc, char** argv) {
       ShaderResource s{};  s.cls=ResourceClass::StorageImage; s.binding=1; s.sgpr_base=16; rt.resources.push_back(s);
       const uint32_t c[] = {0x7E0002F0u,0x7E0202F0u,0xF09C0F08u,0x00400400u,0xBF8C3F70u,0xF0200108u,0x00040402u,0xBF810000u};
       dump(dir, "compute_sample_store", recompile_valu(c, sizeof(c)/4, 0, 0, &rt)); }
+    // Compute image_get_resinfo on a sampled 3D image (DOLL's volume-initializer bounds query).
+    { ShaderResourceTable rt;
+      ShaderResource t{}; t.cls=ResourceClass::Texture; t.binding=4; t.sgpr_base=0; t.img_dim=2; rt.resources.push_back(t);
+      const uint32_t c[] = {0x7E060280u,0xF0380710u,0x00000003u,0xBF810000u};
+      dump(dir, "compute_resinfo_3d", recompile_valu(c, sizeof(c)/4, 0, 0, &rt)); }
+    // Compute integer image_load from a UINT8x4 3D texture. The sampled image's scalar type and
+    // OpImageFetch result must be uint, matching the explicit v_cvt_f32_ubyte* sequence used by
+    // UE4's volumetric-lightmap indirection volume (DOLL producer pc 816).
+    { ShaderResourceTable rt;
+      ShaderResource t{}; t.cls=ResourceClass::Texture; t.format=DataFormat::Uint8;
+      t.num_components=4; t.binding=4; t.sgpr_base=0; t.img_dim=2;
+      t.width=32; t.height=32; t.depth=32; rt.resources.push_back(t);
+      const uint32_t c[] = {0x7E1E0280u,0x7E200280u,0x7E220280u,
+                            0xF0000F10u,0x0000000Fu,0xBF8C3F70u,
+                            0x7E000D00u,0x7E020D01u,0x7E040D02u,0x7E060D03u,
+                            0xBF810000u};
+      dump(dir, "compute_uint_load_3d", recompile_valu(c, sizeof(c)/4, 0, 0, &rt)); }
     // Compute mul_hi (high 32 bits via OpUMulExtended -> {lo,hi} struct extract).
     { const uint32_t c[] = {0x7E0202FFu,0x80000000u,0xD56A0002u,0x00020301u,0x7E000D02u,0xBF810000u};
       dump(dir, "compute_mul_hi", recompile_valu(c, sizeof(c)/4, 1, 0)); }
+    // Compute: saved VOPC mask combined with VCC by s_nor_b64 (UE4 visibility-mask shape).
+    { const uint32_t c[] = {0x7C040CF9u,0x06869880u,0x8DEA6A18u,0xBF810000u};
+      dump(dir, "compute_mask_nor", recompile_valu(c, sizeof(c)/4, 0, 0)); }
+    // Compute: nested/multi-branch CFG dispatcher (varying VCC exit + inner SCC branch + back-edge).
+    // Locks both structured switch-loop formation and the subgroup Any vote used for wave branches.
+    { const uint32_t c[] = {0xBE800380u,0x7E000280u,0x7E020300u,
+                            0xD7610013u,0x00014A7Eu,0xD7610013u,0x0001507Fu,
+                            0xD760000Eu,0x00014B13u,0xD760000Fu,0x00015113u,0xBEFE040Eu,
+                            0xE00C2000u,0x80020400u,0x7DB900F9u,0x86050007u,
+                            0x7D020200u,0xBF860006u,0xBF0A8204u,0x360000FDu,0xBF840001u,
+                            0x81008100u,0x81008100u,0xBF82FFF4u,
+                            0xBF810000u};
+      ShaderResourceTable rt; ShaderResource vb{}; vb.cls=ResourceClass::VertexBuffer;
+      vb.binding=3; vb.sgpr_base=8; vb.stride=16; vb.format=DataFormat::Float32;
+      vb.num_components=4; rt.resources.push_back(vb);
+      dump(dir, "compute_cfg_dispatch", recompile_valu(c, sizeof(c)/4, 0, 0, &rt)); }
 
     // --- #273 additions (DOLL recompiler frontier) ---
     // Fragment: 3D image_load (integer LUT fetch through the combined sampler; OpImage+OpImageFetch).
@@ -149,6 +182,11 @@ int main(int argc, char** argv) {
     { const uint32_t c[] = {0x7e020280u,0x7e0002f2u,0x7c2200f0u,0xbf880002u,0xbe8503f2u,0x7e020205u,
                             0x7e040205u,0xf800180fu,0x01010101u,0xbf810000u};
       dump(dir, "fragment_execz_if", recompile_fragment(c, sizeof(c)/4, nullptr)); }
+    // A saved lane mask first defined inside a forward if and consumed after its merge. The skipped
+    // edge contributes false; without that phi the arm-local definition does not dominate its use.
+    { const uint32_t c[] = {0x7E020280u,0x7E0002F2u,0x7C2200F0u,0xBF880001u,0xBE82047Eu,
+                            0xBEFE0402u,0x7E0202F2u,0xF800180Fu,0x01010101u,0xBF810000u};
+      dump(dir, "fragment_if_new_mask", recompile_fragment(c, sizeof(c)/4, nullptr)); }
     // Fragment: DIVERGENT execz-exit loop with a nested execz if in the body (#273 — the DOLL
     // title post-process accumulation shape; test_recompiled_fragment executes it).
     { const uint32_t c[] = {0x7E020284u,0xBE800380u,0x7E040280u,0x7E060280u,0x7E080282u,0x7E0A02F2u,

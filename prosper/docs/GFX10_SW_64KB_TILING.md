@@ -74,6 +74,24 @@ Default: **16 pipes** — PS5's Oberon is Navi10-class (36-40 CU, 256-bit GDDR6,
 and Navi10's `GB_ADDR_CONFIG` is 16 pipes. Override with `PROSPER_RX_PIPES=<1|2|4|8|16|32|64>`
 for live A/B. `pipeBankXor` is assumed 0. CONFIDENCE: MED.
 
+### SW_64KB_R_X 3D volumes
+
+DOLL's UE4 lighting pipeline also uses mode-27 thin 3D images (not array textures), including
+`120x68x32` Float16 volumes. Mesa AddrLib's 16-pipe 3D pattern adds `z3,z2,z1,z0` to byte-offset
+bits 8..11 respectively. Each Z slice owns its own padded grid of 64KB 2D blocks, while those Z
+bits still participate in the XOR inside the slice:
+
+```
+addr(x, y, z) = z * blocksPerSlice * 65536
+              + block2D(x, y) * 65536
+              + patternOffset(x, y, z)
+```
+
+`tiled_volume_bytes`, `detile_volume`, and `tile_volume` implement this layout for mode 27 at
+1/2/4/8/16 bytes per texel. Unit tests cover exact round-trips at every size plus golden Z-bit
+positions derived from AddrLib. Capture v9 retains each resource's base-level depth so standalone
+replay uses the same volume footprint. CONFIDENCE: HIGH for the observed 16-pipe PS5 layout.
+
 ## Validation (agentic, offline)
 
 1. `PROSPER_DUMP_TILERAW=1 PROSPER_FRAME_DIR=<dir>` dumps every sampled tiled texture's raw guest
