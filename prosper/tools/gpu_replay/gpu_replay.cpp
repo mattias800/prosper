@@ -69,7 +69,7 @@ std::vector<uint8_t> execute_frame(const prosper::gpu::GpuReplayFrame& replay,
         },
         [](const auto& items) { return prosper::gpu::execute_compute_items(items); },
         replay.metadata.width, replay.metadata.height);
-    return std::move(result.pixels);
+    return result.frame.bytes();
 }
 
 const char* class_name(prosper::gpu::ResourceClass c);
