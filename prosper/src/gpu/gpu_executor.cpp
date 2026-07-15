@@ -439,9 +439,11 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
     key.has_system_inputs = stage == ShaderProgramStage::Fragment && system_inputs != nullptr;
     if (key.has_system_inputs) key.system_inputs = *system_inputs;
     if (code && dwords) {
-        std::vector<Rdna2Inst> instructions;
-        const size_t consumed = rdna2_walk(code, dwords, instructions);
-        key.code.assign(code, code + consumed);
+        // Most shaders end at S_ENDPGM. A compiler-generated s_getpc_b64 V# may instead address an
+        // embedded lookup table after ENDPGM; retain that proven tail so cached recompilation sees the
+        // same blob as the direct path and table contents participate in the cache identity.
+        const size_t span = rdna2_recompile_code_span(code, dwords);
+        key.code.assign(code, code + span);
     }
     if (resources) {
         key.resources.reserve(resources->resources.size());

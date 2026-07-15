@@ -93,6 +93,41 @@ int main() {
     CHECK(!direct_ps.empty() && cached_ps == direct_ps,
           "fragment cache output is byte-identical to the direct recompiler");
 
+    // Unreal fragment shaders place small constant tables after S_ENDPGM and address them through an
+    // s_getpc_b64-built V#. The owning cache copy must include that proven tail; copying only the walked
+    // instruction span makes the cached recompiler reject s_getpc_b64 even though the direct path works.
+    std::vector<uint32_t> pcrel_ps = {
+        0xbe841f00u,               // s_getpc_b64 s[4:5]
+        0x800404b0u,               // s_add_u32 s4, 48, s4 (table begins at byte 52)
+        0x82050580u,               // s_addc_u32 s5, 0, s5
+        0xbe860390u,               // s_mov_b32 s6, 16 bytes
+        0xbe8703ffu, 0x10005004u,  // s_mov_b32 s7, V# format/stride
+        0x7e020280u,               // v_mov_b32 v1, 0 (table byte offset)
+        0xe0301000u, 0x80010101u,  // buffer_load_dword v1, v1, s[4:7], 0 offen
+        0xbf8c3f70u,               // s_waitcnt vmcnt(0)
+        0xf800180fu, 0x01010101u,  // exp mrt0 v1,v1,v1,v1
+        0xbf810000u,               // s_endpgm
+        7u, 11u, 13u, 17u,        // embedded table
+    };
+    CHECK(rdna2_recompile_code_span(pcrel_ps.data(), pcrel_ps.size()) == pcrel_ps.size(),
+          "PC-relative cache span includes the embedded table tail");
+    ShaderResourceTable pcrel_table;
+    const auto direct_pcrel_ps = recompile_fragment(
+        pcrel_ps.data(), pcrel_ps.size(), &pcrel_table);
+    const auto cached_pcrel_ps = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, pcrel_ps.data(), pcrel_ps.size(), &pcrel_table);
+    CHECK(!direct_pcrel_ps.empty() && cached_pcrel_ps == direct_pcrel_ps,
+          "fragment cache retains a proven post-ENDPGM PC-relative table");
+
+    const auto pcrel_stats = shader_recompile_cache_stats();
+    pcrel_ps.back() = 19u;
+    const auto changed_pcrel_ps = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, pcrel_ps.data(), pcrel_ps.size(), &pcrel_table);
+    stats = shader_recompile_cache_stats();
+    CHECK(!changed_pcrel_ps.empty() && changed_pcrel_ps != cached_pcrel_ps &&
+              stats.misses == pcrel_stats.misses + 1,
+          "embedded table contents participate in the shader cache key");
+
     // Interpolant wiring changes vertex PARAM export locations/defaults, so it is part of the
     // compile-time key even when the guest code and resource interface are otherwise identical.
     stats = shader_recompile_cache_stats();

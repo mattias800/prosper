@@ -20,6 +20,11 @@ namespace prosper::gpu {
 
 struct ShaderResourceTable;   // resource-binding contract (shader_resources.hpp); optional to recompile_valu
 
+// Return the portion of a raw shader blob that participates in recompilation. This normally ends at
+// S_ENDPGM, but compiler-generated PC-relative lookup tables may live immediately after the program and
+// must remain part of an owning/cache copy. The result never exceeds `dwords`.
+size_t rdna2_recompile_code_span(const uint32_t* code, size_t dwords);
+
 // Fixed-function PS interpolant wiring captured from SPI_PS_INPUT_CNTL_0..31. A valid entry's
 // OFFSET selects the vertex PARAM export feeding that logical PS input; OFFSET=0x20 selects the
 // four hardware default vectors encoded by DEFAULT_VAL instead. Keeping this separate from

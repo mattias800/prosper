@@ -3795,7 +3795,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
 // CONFIDENCE: MED-HIGH — exact for the compiler idiom (verified against DOLL's dither PS); every
 // guard failure falls back to the old reject.
 std::unordered_map<uint32_t, std::vector<uint32_t>> detect_pcrel_tables(
-        const std::vector<Rdna2Inst>& ins, const uint32_t* code, size_t dwords) {
+        const std::vector<Rdna2Inst>& ins, const uint32_t* code, size_t dwords,
+        size_t* required_dwords = nullptr) {
     std::unordered_map<uint32_t, std::vector<uint32_t>> out;
     std::unordered_map<int, uint64_t> pcoff;   // reg -> byte offset into the code blob (pair LO half)
     std::unordered_set<int> pchi;              // regs holding the matching HI half
@@ -3893,6 +3894,9 @@ std::unordered_map<uint32_t, std::vector<uint32_t>> detect_pcrel_tables(
                 if (entered) break;
                 if (idxen || !soff0 || (off & 3u) || (nrec & 3u) || nrec == 0 || nrec > 1024 ||
                     off / 4 + nrec / 4 > dwords) break;            // unprovable / out of window -> reject
+                if (required_dwords)
+                    *required_dwords = std::max(*required_dwords,
+                                                static_cast<size_t>(off / 4 + nrec / 4));
                 out[in.pc] = std::vector<uint32_t>(code + off / 4, code + off / 4 + nrec / 4);
                 (void)offen;                                       // offen just adds the runtime index
                 break;
@@ -3901,6 +3905,16 @@ std::unordered_map<uint32_t, std::vector<uint32_t>> detect_pcrel_tables(
         }
     }
     return out;
+}
+
+size_t rdna2_recompile_code_span(const uint32_t* code, size_t dwords) {
+    if (!code || !dwords) return 0;
+    std::vector<Rdna2Inst> ins;
+    size_t required = rdna2_walk(code, dwords, ins);
+    // Detection both proves the compiler idiom and bounds every referenced table. Do not retain an
+    // arbitrary post-ENDPGM trailer: only bytes that can affect the generated SPIR-V belong in the key.
+    (void)detect_pcrel_tables(ins, code, dwords, &required);
+    return std::min(required, dwords);
 }
 
 // Arbitrary compute CFG fallback. Some UE4 volume-lighting kernels contain nested EXEC loops plus
