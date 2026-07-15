@@ -459,6 +459,13 @@ int main() {
     if (!getenv("PROSPER_RX_PIPES")) {
         const uint32_t M = (uint32_t)TileMode::Sw64KbRX;
         CHECK(tile_mode_supports_volume(M), "SW_64KB_R_X has an explicit 3D pipe-XOR pattern");
+        CHECK(gfx10_dcc_metadata_bytes(32, 32, 32, M, 4, true) == 128 * 1024,
+              "32x32x32 RGBA8 R_X DCC occupies one 4 KiB metadata block per slice");
+        CHECK(gfx10_dcc_metadata_bytes(513, 512, 1, M, 4, true) == 8 * 1024,
+              "R_X DCC sizing rounds a 4-B image to 512x512 metadata-block coverage");
+        CHECK(gfx10_dcc_metadata_bytes(32, 32, 32, (uint32_t)TileMode::Sw64KbS,
+                                       4, true) == 0,
+              "DCC sizing rejects a swizzle outside the supported R_X contract");
         CHECK(tiled_volume_bytes(120, 68, 32, M, 8) == (size_t)1 * 2 * 32 * 65536,
               "120x68x32 @ 8 B uses 1x2 padded 2D blocks per Z slice");
         auto rt_volume = [&](uint32_t bpe) {

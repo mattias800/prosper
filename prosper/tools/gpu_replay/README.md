@@ -150,8 +150,10 @@ an evidence-gated optimization, not automatic dependency closure.
 `--bundle-final-capsule PATH` snapshots the complete live color RTT and persistent Vulkan depth/stencil caches
 before executing the final submit and writes them as seeds in a standalone current-version capsule. Capture v9
 introduced the base-level depth of every 3D image resource; v11 also retains each image T#'s GFX10 DCC flags,
-block-size fields, and metadata address. `--inspect-only` reports compressed base allocations explicitly;
-metadata bytes and a software DCC decode are not inferred. The capsule's standalone
+block-size fields, and metadata address. Version 12 captures the exact DCC control-surface bytes for the
+validated single-sample/base-level SW_64KB_R_X layout; metadata-only and older capsules keep their absence
+explicit. `--inspect-only` reports the planned/captured byte counts, non-zero and unique-byte counts,
+first control word, and content hash. A software DCC decode is still not inferred. The capsule's standalone
 output must match the bundle's final hash before using it for fast `--draw`, operation-prefix, resource, or
 shader experiments. Export validates every surface and fails when a required temporal color surface is absent;
 it never substitutes zero pixels. The file is installed only after the source final submit renders, and embeds

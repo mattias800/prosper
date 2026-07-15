@@ -37,7 +37,7 @@ namespace prosper::gpu {
 namespace {
 
 constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
-constexpr uint32_t kVersion = 11;
+constexpr uint32_t kVersion = 12;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -303,6 +303,19 @@ uint64_t resource_footprint(const ShaderResource& r) {
     return std::max(result, decoded);
 }
 
+uint64_t dcc_metadata_footprint(const ShaderResource& r) {
+    if (!r.compression_enabled || !r.metadata_addr ||
+        (r.cls != ResourceClass::Texture && r.cls != ResourceClass::StorageImage) ||
+        bc_block_bytes(r.format))
+        return 0;
+    uint32_t bytes_per_texel = data_format_bytes(r.format) * (r.num_components ? r.num_components : 1u);
+    if (!bytes_per_texel && r.format == DataFormat::Unorm2_10_10_10)
+        bytes_per_texel = 4;
+    const uint32_t layers = r.img_dim == 3u ? 6u : (r.img_dim == 2u ? std::max(r.depth, 1u) : 1u);
+    return gfx10_dcc_metadata_bytes(r.width, r.height, layers, r.tile_mode,
+                                    bytes_per_texel, r.meta_pipe_aligned);
+}
+
 struct Interval {
     uint64_t begin = 0;
     uint64_t end = 0;
@@ -318,11 +331,19 @@ bool collect_intervals(const std::vector<DrawItem>& draws,
         if (!t) return true;
         for (const auto& r : t->resources) {
             uint64_t n = resource_footprint(r);
-            if (!n) continue;
-            if (n > kMaxBlobBytes || r.gpu_addr > std::numeric_limits<uint64_t>::max() - n) {
-                error = "resource capture range is invalid or exceeds 1 GiB"; return false;
+            if (n) {
+                if (n > kMaxBlobBytes || r.gpu_addr > std::numeric_limits<uint64_t>::max() - n) {
+                    error = "resource capture range is invalid or exceeds 1 GiB"; return false;
+                }
+                intervals.push_back({r.gpu_addr, r.gpu_addr + n});
             }
-            intervals.push_back({r.gpu_addr, r.gpu_addr + n});
+            n = dcc_metadata_footprint(r);
+            if (n) {
+                if (n > kMaxBlobBytes || r.metadata_addr > std::numeric_limits<uint64_t>::max() - n) {
+                    error = "DCC metadata capture range is invalid or exceeds 1 GiB"; return false;
+                }
+                intervals.push_back({r.metadata_addr, r.metadata_addr + n});
+            }
         }
         return true;
     };
@@ -359,14 +380,27 @@ bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& 
     if (!src) return true;
     for (const auto& r : src->resources) {
         GpuCapturedResource c; c.resource = r; c.resource.host_data = nullptr; c.resource.host_data_size = 0;
-        uint64_t n = resource_footprint(r);
-        if (n && include_resource_data) {
+        c.resource.dcc_metadata_host_data = nullptr;
+        c.resource.dcc_metadata_host_data_size = 0;
+        c.metadata_size = dcc_metadata_footprint(r);
+        c.resource.dcc_metadata_size = c.metadata_size;
+        auto assign_blob = [&](uint64_t addr, uint64_t bytes, uint32_t& index,
+                               uint64_t& offset, const char* missing) {
             auto it = std::find_if(intervals.begin(), intervals.end(), [&](auto x) {
-                return x.begin <= r.gpu_addr && r.gpu_addr + n <= x.end;
+                return x.begin <= addr && addr + bytes <= x.end;
             });
-            if (it == intervals.end()) { error = "resource was not assigned to a capture blob"; return false; }
-            c.blob_index = it->blob_index; c.blob_offset = r.gpu_addr - it->begin;
-        }
+            if (it == intervals.end()) { error = missing; return false; }
+            index = it->blob_index; offset = addr - it->begin;
+            return true;
+        };
+        uint64_t n = resource_footprint(r);
+        if (n && include_resource_data &&
+            !assign_blob(r.gpu_addr, n, c.blob_index, c.blob_offset,
+                         "resource was not assigned to a capture blob")) return false;
+        if (c.metadata_size && include_resource_data &&
+            !assign_blob(r.metadata_addr, c.metadata_size, c.metadata_blob_index,
+                         c.metadata_blob_offset,
+                         "DCC metadata was not assigned to a capture blob")) return false;
         dst.resources.push_back(std::move(c));
     }
     return true;
@@ -665,6 +699,10 @@ bool capture_failure_diagnostics(
 
 uint64_t gpu_capture_resource_footprint(const ShaderResource& resource) {
     return resource_footprint(resource);
+}
+
+uint64_t gpu_capture_dcc_metadata_footprint(const ShaderResource& resource) {
+    return dcc_metadata_footprint(resource);
 }
 
 uint64_t gpu_capture_hash(const uint8_t* data, size_t size) {
@@ -1036,6 +1074,40 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         if (!write_dcc_state(draw.vrt) || !write_dcc_state(draw.prt)) return false;
     for (const auto& compute : c.computes)
         if (!write_dcc_state(compute.resources)) return false;
+    // v12 captures the exact DCC control surface as a normal content-addressed blob range. Keep the
+    // references in a tail so v1-v11 resource records remain byte-compatible. An invalid blob index
+    // with a non-zero size is intentional for metadata-only and legacy-upgraded captures.
+    w.u32(static_cast<uint32_t>(resource_depth_count));
+    auto write_dcc_metadata = [&](const GpuCapturedTable& table) {
+        for (const auto& captured : table.resources) {
+            const uint64_t expected = dcc_metadata_footprint(captured.resource);
+            if (captured.metadata_size != expected ||
+                (!expected && (captured.metadata_blob_index != 0xFFFFFFFFu ||
+                               captured.metadata_blob_offset != 0)) ||
+                (captured.metadata_blob_index == 0xFFFFFFFFu &&
+                 captured.metadata_blob_offset != 0)) {
+                error = "invalid resource DCC metadata reference"; return false;
+            }
+            if (captured.metadata_blob_index != 0xFFFFFFFFu) {
+                if (captured.metadata_blob_index >= c.blobs.size()) {
+                    error = "resource DCC metadata references an invalid capture blob"; return false;
+                }
+                const auto& blob = c.blobs[captured.metadata_blob_index].bytes;
+                if (captured.metadata_blob_offset > blob.size() ||
+                    expected > blob.size() - captured.metadata_blob_offset) {
+                    error = "resource DCC metadata exceeds its capture blob"; return false;
+                }
+            }
+            w.u64(captured.metadata_size);
+            w.u32(captured.metadata_blob_index);
+            w.u64(captured.metadata_blob_offset);
+        }
+        return true;
+    };
+    for (const auto& draw : c.draws)
+        if (!write_dcc_metadata(draw.vrt) || !write_dcc_metadata(draw.prt)) return false;
+    for (const auto& compute : c.computes)
+        if (!write_dcc_metadata(compute.resources)) return false;
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -1352,6 +1424,8 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                 resource.compression_enabled = (flags & 4u) != 0;
                 resource.alpha_is_on_msb = (flags & 8u) != 0;
                 resource.color_transform = (flags & 16u) != 0;
+                captured.metadata_size = dcc_metadata_footprint(resource);
+                resource.dcc_metadata_size = captured.metadata_size;
             }
             return true;
         };
@@ -1359,6 +1433,48 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
             if (!read_dcc_state(draw.vrt) || !read_dcc_state(draw.prt)) return false;
         for (auto& compute : c.computes)
             if (!read_dcc_state(compute.resources)) return false;
+    }
+    if (version >= 12) {
+        uint64_t expected_refs = 0;
+        for (const auto& draw : c.draws)
+            expected_refs += draw.vrt.resources.size() + draw.prt.resources.size();
+        for (const auto& compute : c.computes)
+            expected_refs += compute.resources.resources.size();
+        uint32_t ref_count = 0;
+        if (!r.u32(ref_count) || ref_count != expected_refs) {
+            error = "invalid resource DCC-metadata reference count"; return false;
+        }
+        auto read_dcc_metadata = [&](GpuCapturedTable& table) {
+            for (auto& captured : table.resources) {
+                if (!r.u64(captured.metadata_size) ||
+                    !r.u32(captured.metadata_blob_index) ||
+                    !r.u64(captured.metadata_blob_offset) ||
+                    captured.metadata_size != dcc_metadata_footprint(captured.resource) ||
+                    (!captured.metadata_size &&
+                     (captured.metadata_blob_index != 0xFFFFFFFFu ||
+                      captured.metadata_blob_offset != 0)) ||
+                    (captured.metadata_blob_index == 0xFFFFFFFFu &&
+                     captured.metadata_blob_offset != 0)) {
+                    error = "invalid resource DCC metadata reference"; return false;
+                }
+                if (captured.metadata_blob_index != 0xFFFFFFFFu) {
+                    if (captured.metadata_blob_index >= c.blobs.size()) {
+                        error = "resource DCC metadata references an invalid capture blob"; return false;
+                    }
+                    const auto& blob = c.blobs[captured.metadata_blob_index].bytes;
+                    if (captured.metadata_blob_offset > blob.size() ||
+                        captured.metadata_size > blob.size() - captured.metadata_blob_offset) {
+                        error = "resource DCC metadata exceeds its capture blob"; return false;
+                    }
+                }
+                captured.resource.dcc_metadata_size = captured.metadata_size;
+            }
+            return true;
+        };
+        for (auto& draw : c.draws)
+            if (!read_dcc_metadata(draw.vrt) || !read_dcc_metadata(draw.prt)) return false;
+        for (auto& compute : c.computes)
+            if (!read_dcc_metadata(compute.resources)) return false;
     }
     if (r.left) { error = "capture has trailing data"; return false; }
     return true;
@@ -1377,29 +1493,49 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         resource_reference_count += draw.vrt.resources.size() + draw.prt.resources.size();
     for (const auto& compute : c.computes)
         resource_reference_count += compute.resources.resources.size();
-    out.resource_instances.reserve(resource_reference_count);
+    out.resource_instances.reserve(resource_reference_count * 2);
     std::map<std::pair<uint32_t, uint64_t>, size_t> instance_by_version_and_base;
+    auto bind_range = [&](uint32_t blob_index, uint64_t blob_offset, uint64_t guest_addr,
+                          uint64_t need, uint8_t*& host_data, uint64_t& host_data_size,
+                          const char* invalid_error, const char* exceeds_error,
+                          const char* offset_error) {
+        if (blob_index == 0xFFFFFFFFu) return true;
+        if (blob_index >= out.blobs.size() || blob_offset > out.blobs[blob_index].bytes.size()) {
+            error = invalid_error; return false;
+        }
+        const auto& blob = out.blobs[blob_index].bytes;
+        if (need > blob.size() - blob_offset) { error = exceeds_error; return false; }
+        if (blob_offset > guest_addr) { error = offset_error; return false; }
+        const uint64_t logical_base = guest_addr - blob_offset;
+        const auto key = std::make_pair(blob_index, logical_base);
+        auto [it, inserted] = instance_by_version_and_base.emplace(key, out.resource_instances.size());
+        if (inserted)
+            out.resource_instances.push_back({logical_base, blob_index, blob});
+        auto& instance = out.resource_instances[it->second].bytes;
+        host_data = instance.data() + blob_offset;
+        host_data_size = need;
+        return true;
+    };
     auto table = [&](const GpuCapturedTable& src, std::shared_ptr<ShaderResourceTable>& dst) -> bool {
         if (!src.present) { dst.reset(); return src.resources.empty(); }
         dst = std::make_shared<ShaderResourceTable>();
         for (const auto& x : src.resources) {
             ShaderResource r = x.resource; r.host_data = nullptr; r.host_data_size = 0;
-            if (x.blob_index != 0xFFFFFFFFu) {
-                if (x.blob_index >= out.blobs.size() || x.blob_offset > out.blobs[x.blob_index].bytes.size()) {
-                    error = "resource references an invalid capture blob"; return false;
-                }
-                const auto& b = out.blobs[x.blob_index].bytes;
-                uint64_t need = resource_footprint(r);
-                if (need > b.size() - x.blob_offset) { error = "resource footprint exceeds capture blob"; return false; }
-                if (x.blob_offset > r.gpu_addr) { error = "resource blob offset exceeds its logical address"; return false; }
-                const uint64_t logical_base = r.gpu_addr - x.blob_offset;
-                const auto key = std::make_pair(x.blob_index, logical_base);
-                auto [it, inserted] = instance_by_version_and_base.emplace(key, out.resource_instances.size());
-                if (inserted)
-                    out.resource_instances.push_back({logical_base, x.blob_index, b});
-                auto& instance = out.resource_instances[it->second].bytes;
-                r.host_data = instance.data() + x.blob_offset; r.host_data_size = need;
-            }
+            r.dcc_metadata_size = x.metadata_size;
+            r.dcc_metadata_host_data = nullptr;
+            r.dcc_metadata_host_data_size = 0;
+            if (!bind_range(x.blob_index, x.blob_offset, r.gpu_addr, resource_footprint(r),
+                            r.host_data, r.host_data_size,
+                            "resource references an invalid capture blob",
+                            "resource footprint exceeds capture blob",
+                            "resource blob offset exceeds its logical address") ||
+                !bind_range(x.metadata_blob_index, x.metadata_blob_offset, r.metadata_addr,
+                            x.metadata_size, r.dcc_metadata_host_data,
+                            r.dcc_metadata_host_data_size,
+                            "resource DCC metadata references an invalid capture blob",
+                            "resource DCC metadata exceeds capture blob",
+                            "resource DCC metadata blob offset exceeds its logical address"))
+                return false;
             dst->resources.push_back(r);
         }
         return true;
