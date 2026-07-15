@@ -2,6 +2,7 @@
 #include "../src/gpu/pm4_registers.hpp"
 #include "../src/gpu/tile.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -275,7 +276,19 @@ int main() {
           loaded.draws[0].command_order == 123 && loaded.operations[0].source_index == 7,
           "content versions and draw operation identity round-trip");
     CHECK(loaded.rtt_seeds.size() == 1 && loaded.rtt_seeds[0].width == 2 &&
+          loaded.rtt_seeds[0].format == GpuCaptureColorFormat::Rgba8Unorm &&
           loaded.rtt_seeds[0].rgba == temporal_rgba, "temporal RTT seed round-trips");
+    GpuCaptureFile fp16_capture = captured;
+    fp16_capture.rtt_seeds[0].format = GpuCaptureColorFormat::Rgba16Float;
+    fp16_capture.rtt_seeds[0].rgba.assign(2 * 2 * 8, 0x5a);
+    std::vector<uint8_t> fp16_bytes;
+    GpuCaptureFile fp16_loaded;
+    CHECK(serialize_gpu_capture(fp16_capture, fp16_bytes, error) &&
+          deserialize_gpu_capture(fp16_bytes, fp16_loaded, error) &&
+          fp16_loaded.rtt_seeds.size() == 1 &&
+          fp16_loaded.rtt_seeds[0].format == GpuCaptureColorFormat::Rgba16Float &&
+          fp16_loaded.rtt_seeds[0].rgba == fp16_capture.rtt_seeds[0].rgba,
+          "native FP16 RTT seed format and bytes round-trip");
     CHECK(loaded.ds_seeds.size() == 1 && loaded.ds_seeds[0].depth == ds_seed.depth &&
           loaded.ds_seeds[0].stencil == ds_seed.stencil && loaded.ds_seeds[0].depth_valid &&
           loaded.ds_seeds[0].stencil_valid,
@@ -434,7 +447,7 @@ int main() {
     GpuCaptureFile legacy_source = captured; legacy_source.ds_seeds.clear();
     std::vector<uint8_t> legacy_bytes;
     CHECK(serialize_gpu_capture(legacy_source, legacy_bytes, error) && legacy_bytes.size() >= 28,
-          "created a diagnostic-free v12 payload for legacy-reader fixtures");
+          "created a diagnostic-free v13 payload for legacy-reader fixtures");
     if (legacy_bytes.size() >= 28) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
@@ -442,6 +455,23 @@ int main() {
         legacy_bytes.resize(legacy_bytes.size() - (4 + 20 * legacy_resource_count));
         // Remove the v11 DCC tail: count + 17-byte state record per resource.
         legacy_bytes.resize(legacy_bytes.size() - (4 + 17 * legacy_resource_count));
+        // v13 inserted one format dword between every RTT seed extent and byte vector. Remove the
+        // fixture's only format word to recover a byte-exact v10 prefix before trimming older tails.
+        const auto& seed = legacy_source.rtt_seeds[0];
+        std::vector<uint8_t> marker;
+        auto append_u32 = [&](uint32_t value) {
+            for (unsigned i = 0; i < 4; ++i) marker.push_back(uint8_t(value >> (8 * i)));
+        };
+        auto append_u64 = [&](uint64_t value) {
+            for (unsigned i = 0; i < 8; ++i) marker.push_back(uint8_t(value >> (8 * i)));
+        };
+        append_u64(seed.guest_addr); append_u32(seed.width); append_u32(seed.height);
+        append_u32(static_cast<uint32_t>(seed.format)); append_u64(seed.rgba.size());
+        auto seed_header = std::search(legacy_bytes.begin(), legacy_bytes.end(),
+                                       marker.begin(), marker.end());
+        if (seed_header != legacy_bytes.end())
+            legacy_bytes.erase(seed_header + 16, seed_header + 20);
+        legacy_bytes[8] = 10;
         // Remove the v10 MRT tail: draw count + one (target identity + 50-byte pipeline state) +
         // zero failure count. The remaining payload is byte-exact v9.
         legacy_bytes.resize(legacy_bytes.size() - (4 + 16 + 50 + 4));
@@ -460,9 +490,9 @@ int main() {
     CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
           !legacy_loaded.failure_diagnostics_available && legacy_loaded.failure_diagnostics.empty(),
           "v6 capture reopens with failed-operation diagnostics reported unavailable");
-    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 13;
+    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 14;
     CHECK(!deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
-          error == "unsupported capture version 13",
+          error == "unsupported capture version 14",
           "future capture versions fail with a concrete version error");
 
     GpuCaptureFile bad_hash = mixed;

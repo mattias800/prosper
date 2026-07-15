@@ -50,8 +50,41 @@ namespace {
 struct RttSurf {
     std::shared_ptr<const std::vector<uint8_t>> rgba;
     uint32_t w = 0, h = 0;
+    VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
     bool gpu_valid = false;
 };
+
+prosper::gpu::GpuCaptureColorFormat capture_color_format(VkFormat format) {
+    return prosper::test::backend_color_format(format) == VK_FORMAT_R16G16B16A16_SFLOAT
+        ? prosper::gpu::GpuCaptureColorFormat::Rgba16Float
+        : prosper::gpu::GpuCaptureColorFormat::Rgba8Unorm;
+}
+
+VkFormat replay_color_format(prosper::gpu::GpuCaptureColorFormat format) {
+    return format == prosper::gpu::GpuCaptureColorFormat::Rgba16Float
+        ? VK_FORMAT_R16G16B16A16_SFLOAT
+        : VK_FORMAT_R8G8B8A8_UNORM;
+}
+
+std::vector<uint8_t> inspection_rgba8(const std::vector<uint8_t>& pixels,
+                                      uint32_t width, uint32_t height, VkFormat format) {
+    const size_t texels = static_cast<size_t>(width) * height;
+    if (format == VK_FORMAT_R8G8B8A8_UNORM && pixels.size() == texels * 4)
+        return pixels;
+    if (format != VK_FORMAT_R16G16B16A16_SFLOAT || pixels.size() != texels * 8)
+        return {};
+    std::vector<uint8_t> rgba(texels * 4);
+    for (size_t texel = 0; texel < texels; ++texel) {
+        for (uint32_t channel = 0; channel < 4; ++channel) {
+            uint16_t half = 0;
+            std::memcpy(&half, pixels.data() + texel * 8 + channel * 2, sizeof(half));
+            const float value = prosper::gpu::half_to_float(half);
+            rgba[texel * 4 + channel] = !std::isfinite(value) || value <= 0.0f ? 0
+                : value >= 1.0f ? 255 : static_cast<uint8_t>(value * 255.0f + 0.5f);
+        }
+    }
+    return rgba;
+}
 
 // Pixel decoding is a pure function of these fields for guest-backed textures. Keep this cache local
 // to one renderer callback: graphics spans are split at compute operations, so guest texture bytes
@@ -145,6 +178,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             auto it = g_rtt.find(addr); if (it == g_rtt.end()) return false;
             if (!it->second.rgba) return false;
             seed.guest_addr = addr; seed.width = it->second.w; seed.height = it->second.h;
+            seed.format = capture_color_format(it->second.format);
             seed.rgba = *it->second.rgba; return true;
         });
         prosper::gpu::set_gpu_capture_rtt_seed_snapshot_reader(
@@ -154,6 +188,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     if (!surface.rgba) continue;
                     prosper::gpu::GpuCaptureRttSeed seed;
                     seed.guest_addr = addr; seed.width = surface.w; seed.height = surface.h;
+                    seed.format = capture_color_format(surface.format);
                     seed.rgba = *surface.rgba; seeds.push_back(std::move(seed));
                 }
                 return true;
@@ -171,12 +206,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             });
     if (getenv("PROSPER_GPU_REPLAY_RTT_SEEDS"))
         prosper::gpu::set_gpu_replay_rtt_seed_writer([](const prosper::gpu::GpuCaptureRttSeed& seed, std::string& error) {
-            const uint64_t expected = static_cast<uint64_t>(seed.width) * seed.height * 4;
+            const VkFormat format = replay_color_format(seed.format);
+            const uint64_t expected = static_cast<uint64_t>(seed.width) * seed.height *
+                                      prosper::test::backend_color_bytes_per_pixel(format);
             if (!seed.guest_addr || !seed.width || !seed.height || expected != seed.rgba.size()) {
                 error = "invalid temporal RTT seed"; return false;
             }
             RttSurf& surface = g_rtt[seed.guest_addr];
             surface.w = seed.width; surface.h = seed.height;
+            surface.format = format;
             surface.rgba = std::make_shared<const std::vector<uint8_t>>(seed.rgba);
             surface.gpu_valid = false;
             prosper::test::invalidate_persistent_color_target(seed.guest_addr);
@@ -519,7 +557,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             live_rtt->second.w == tw && live_rtt->second.h == th &&
                             r.gpu_addr != draw.color0_base &&
                             prosper::test::find_persistent_color_target(
-                                r.gpu_addr, tw, th, VK_FORMAT_R8G8B8A8_UNORM) != nullptr;
+                                r.gpu_addr, tw, th, live_rtt->second.format) != nullptr;
                         const bool has_live_rtt = has_cpu_live_rtt || has_gpu_live_rtt;
                         if (r.compression_enabled && !has_live_rtt) {
                             static std::set<std::pair<uint64_t, uint64_t>> warned_dcc_images;
@@ -698,6 +736,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         if (has_gpu_live_rtt) {
                             fr.persistent_render_target_id = r.gpu_addr;
                             fr.tw = tw; fr.th = th; fr.td = 1; fr.img_dim = r.img_dim;
+                            fr.texture_format = live_rtt->second.format;
                             resource_rtt_hit = true;
                         } else if (decoded_reuse) {
                             fr.tex_rgba = decoded_reuse->pixels;
@@ -713,7 +752,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             if (timing_enabled) pending_timing.texture_reuses++;
                         } else {
                         const size_t volume_texels = (size_t)tw * th * (is_volume ? r.depth : 1u);
-                        size_t nb = volume_texels * 4 * (is_cube ? 6u : 1u);
+                        const VkFormat live_rtt_format = has_cpu_live_rtt
+                            ? live_rtt->second.format : VK_FORMAT_R8G8B8A8_UNORM;
+                        const uint32_t output_bpp = has_cpu_live_rtt
+                            ? prosper::test::backend_color_bytes_per_pixel(live_rtt_format) : 4u;
+                        size_t nb = volume_texels * output_bpp * (is_cube ? 6u : 1u);
                         size_t linear_source_prefix_size = 0;
                         if (texstore_used == texstore.size()) texstore.emplace_back();
                         std::vector<uint8_t>& texture_pixels = texstore[texstore_used++];
@@ -752,8 +795,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // narrow read+expand path below. StorageImage / unknown formats keep 4 B (bpt=0->4).
                         uint32_t bpt = prosper::gpu::data_format_bytes(r.format) * (r.num_components ? r.num_components : 1);
                         // fp16 surfaces (fmt 71 Float16x4 = 8 B/texel, 29 = 4 B, 13 = 2 B) get a real
-                        // half->UNORM8 conversion path below; everything else unknown/oversized keeps
-                        // the legacy RGBA8 read (bpt=4).
+                        // half->UNORM8 conversion path below for guest-backed textures. Renderer-owned
+                        // Float16x4 RTTs bypass it and retain native bytes. Other unknown formats keep RGBA8.
                         const bool f16 = r.format == prosper::gpu::DataFormat::Float16 &&
                                          (bpt == 2 || bpt == 4 || bpt == 8);
                         if (bpt == 0 || (bpt > 4 && !f16)) bpt = 4;
@@ -765,19 +808,21 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             if (rit != g_rtt.end() && rit->second.w && rit->second.h && rit->second.rgba &&
                                 !rit->second.rgba->empty()) {
                                 const RttSurf& s = rit->second;
-                                const size_t expected = static_cast<size_t>(tw) * th * 4;
+                                const uint32_t rtt_bpp = prosper::test::backend_color_bytes_per_pixel(s.format);
+                                const size_t expected = static_cast<size_t>(tw) * th * rtt_bpp;
                                 if (s.w == tw && s.h == th && s.rgba->size() == expected) {
                                     std::memcpy(texture_pixels.data(), s.rgba->data(), expected);
                                 } else {
                                     std::fill(texture_pixels.begin(), texture_pixels.end(), 0);
                                     for (uint32_t y = 0; y < th; y++) for (uint32_t x = 0; x < tw; x++) {
                                         uint32_t sx = (uint32_t)((uint64_t)x * s.w / tw), sy = (uint32_t)((uint64_t)y * s.h / th);
-                                        size_t si = ((size_t)sy * s.w + sx) * 4;
-                                        if (si + 4 <= s.rgba->size())
-                                            std::memcpy(&texture_pixels[((size_t)y * tw + x) * 4],
-                                                        &(*s.rgba)[si], 4);
+                                        size_t si = ((size_t)sy * s.w + sx) * rtt_bpp;
+                                        if (si + rtt_bpp <= s.rgba->size())
+                                            std::memcpy(&texture_pixels[((size_t)y * tw + x) * rtt_bpp],
+                                                        &(*s.rgba)[si], rtt_bpp);
                                     }
                                 }
+                                fr.texture_format = s.format;
                                 rtt_hit = true;
                                 resource_rtt_hit = true;
                                 // PROSPER_DUMP_SAMPLED_RTT (#710/#320): dump the EXACT RTT-layer pixels a
@@ -788,15 +833,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 if (getenv("PROSPER_DUMP_SAMPLED_RTT")) {
                                     static std::set<uint64_t> seen;
                                     if (seen.insert(r.gpu_addr).second) {
+                                        const std::vector<uint8_t> inspected = inspection_rgba8(
+                                            texture_pixels, tw, th, s.format);
                                         size_t nz = 0, rgbnz = 0;
-                                        for (size_t p = 0; p + 3 < texture_pixels.size(); p += 4) {
-                                            if (texture_pixels[p] || texture_pixels[p+1] || texture_pixels[p+2]) rgbnz++;
-                                            for (int k = 0; k < 4; k++) nz += (texture_pixels[p+k] != 0);
+                                        for (size_t p = 0; p + 3 < inspected.size(); p += 4) {
+                                            if (inspected[p] || inspected[p+1] || inspected[p+2]) rgbnz++;
+                                            for (int k = 0; k < 4; k++) nz += (inspected[p+k] != 0);
                                         }
                                         const char* dd = getenv("PROSPER_FRAME_DIR");
                                         char fn[512]; snprintf(fn, sizeof fn, "%s/sampledrtt_%llx_%ux%u.bmp",
                                                                dd ? dd : ".", (unsigned long long)r.gpu_addr, tw, th);
-                                        prosper::test::dump_bmp(fn, texture_pixels, tw, th);
+                                        prosper::test::dump_bmp(fn, inspected, tw, th);
                                         fprintf(stderr, "[sampledrtt] addr=0x%llx %ux%u rgb_nonblack=%zu/%u -> %s\n",
                                                 (unsigned long long)r.gpu_addr, tw, th, rgbnz, tw*th, fn);
                                     }
@@ -878,13 +925,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             // with the REAL element size — the old clamp read an 8-B/texel Float16x4
                             // surface at 4 B AND detiled it with bpe=4 against 8-B tiled elements, so
                             // the result was doubly wrong ("confetti" regions, e.g. DOLL's 960x540 /
-                            // 480x270 bloom-chain buffers). Convert half->UNORM8 on upload: the backend
-                            // uploads RGBA8 only (the whole render path is 8-bit gamma space — see the
-                            // #263 note in render_runner), so HDR values above 1.0 clamp to 255.
+                            // 480x270 bloom-chain buffers). Guest memory still converts half->UNORM8 on
+                            // upload. That path clamps values above 1.0 and remains separate from native
+                            // tiled guest-texture upload and the renderer-owned RTT fix in #773.
                             // Missing components read (0,0,0,1) per the hardware rule; the T# DST_SEL
                             // swizzle still applies. CONFIDENCE: MED — the half decode is exact and
-                            // unit-tested, but the [0,1] clamp loses >1.0 bloom energy (native
-                            // VK_FORMAT_R16G16B16A16_SFLOAT upload is the documented follow-up).
+                            // unit-tested, but the [0,1] clamp loses >1.0 bloom energy for guest-backed
+                            // textures; renderer-owned RTTs retain RGBA16F through the #773 path.
                             const uint32_t nc = bpt / 2;                    // fp16 components per texel
                             std::vector<uint8_t> hlin(volume_texels * bpt, 0);
                             bool tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) && !getenv("PROSPER_NODETILE");
@@ -1099,22 +1146,42 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // sampling diagnosis (#522).
                         const char* test_texture = getenv("PROSPER_TESTTEX");
                         const char* test_texture_binding = getenv("PROSPER_TESTTEX_BINDING");
+                        const char* test_texture_draw = getenv("PROSPER_TESTTEX_DRAW");
                         const bool test_this_texture = test_texture &&
                             (!test_texture_binding ||
-                             strtoul(test_texture_binding, nullptr, 0) == r.binding);
+                             strtoul(test_texture_binding, nullptr, 0) == r.binding) &&
+                            (!test_texture_draw ||
+                             strtoull(test_texture_draw, nullptr, 0) == draw.draw_index);
                         if (test_this_texture) {
                             const uint32_t slices = is_volume ? std::max(r.depth, 1u) : 1u;
-                            for (uint32_t z = 0; z < slices; ++z)
-                                for (uint32_t y = 0; y < th; ++y)
-                                    for (uint32_t x = 0; x < tw; ++x) {
-                                        uint8_t* p = &texture_pixels[
-                                            (((size_t)z * th + y) * tw + x) * 4];
-                                        bool ck = ((x / 64) ^ (y / 64) ^ z) & 1;
-                                        p[0] = (uint8_t)(255 * x / tw);
-                                        p[1] = (uint8_t)(255 * y / th);
-                                        p[2] = ck ? 200 : 40;
-                                        p[3] = 255;
-                                    }
+                            if (!strcmp(test_texture, "zero")) {
+                                std::fill(texture_pixels.begin(), texture_pixels.end(), 0);
+                            } else if (fr.texture_format == VK_FORMAT_R16G16B16A16_SFLOAT) {
+                                for (uint32_t z = 0; z < slices; ++z)
+                                    for (uint32_t y = 0; y < th; ++y)
+                                        for (uint32_t x = 0; x < tw; ++x) {
+                                            uint16_t* p = reinterpret_cast<uint16_t*>(
+                                                texture_pixels.data() +
+                                                (((size_t)z * th + y) * tw + x) * 8);
+                                            const bool ck = ((x / 64) ^ (y / 64) ^ z) & 1;
+                                            p[0] = prosper::gpu::float_to_half((float)x / tw);
+                                            p[1] = prosper::gpu::float_to_half((float)y / th);
+                                            p[2] = prosper::gpu::float_to_half(ck ? 0.8f : 0.16f);
+                                            p[3] = prosper::gpu::float_to_half(1.0f);
+                                        }
+                            } else {
+                                for (uint32_t z = 0; z < slices; ++z)
+                                    for (uint32_t y = 0; y < th; ++y)
+                                        for (uint32_t x = 0; x < tw; ++x) {
+                                            uint8_t* p = &texture_pixels[
+                                                (((size_t)z * th + y) * tw + x) * 4];
+                                            bool ck = ((x / 64) ^ (y / 64) ^ z) & 1;
+                                            p[0] = (uint8_t)(255 * x / tw);
+                                            p[1] = (uint8_t)(255 * y / th);
+                                            p[2] = ck ? 200 : 40;
+                                            p[3] = 255;
+                                        }
+                            }
                         }
                         // This 256x16 sparse palette is addressed like 16 blue slices, each 16 texels wide.
                         // The identity probe preserves source color through shaders using
@@ -1143,7 +1210,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         }
                         // PROSPER_DUMP_TEX: write the RAW texture memory (interpreted linearly) to a BMP,
                         // bypassing the shader — reveals whether the render target is tiled or linear.
-                        if (getenv("PROSPER_DUMP_TEX") && !texture_pixels.empty() && frame_no < 200) {
+                        if (getenv("PROSPER_DUMP_TEX") && !texture_pixels.empty() && frame_no < 200 &&
+                            fr.texture_format == VK_FORMAT_R8G8B8A8_UNORM) {
                             std::string d = getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".";
                             char fn[512]; snprintf(fn, sizeof fn, "%s/rawtex_f%04d_b%u.bmp", d.c_str(), (int)frame_no, r.binding);
                             prosper::test::dump_bmp(fn, texture_pixels, tw, th);
@@ -1151,7 +1219,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         }
                         // PROSPER_DUMP_ATLAS: dump each SMALL sampled texture once per ADDRESS (find the caption
                         // font among same-size UI textures). Capped.
-                        if (getenv("PROSPER_DUMP_ATLAS") && !texture_pixels.empty() && tw <= 2048 && th <= 1024) {
+                        if (getenv("PROSPER_DUMP_ATLAS") && !texture_pixels.empty() && tw <= 2048 && th <= 1024 &&
+                            fr.texture_format == VK_FORMAT_R8G8B8A8_UNORM) {
                             static std::unordered_map<uint64_t,int> seen; static int ndumped = 0;
                             if (seen[r.gpu_addr]++ == 0 && ndumped++ < 60) {
                                 std::string d = getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".";
@@ -1295,7 +1364,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             RenderClock::now() - resource_timing_start).count();
                         if (fr.is_texture()) {
                             pending_timing.textures++;
-                            pending_timing.texture_bytes += static_cast<uint64_t>(fr.tw) * fr.th * fr.td * 4;
+                            pending_timing.texture_bytes += static_cast<uint64_t>(fr.tw) * fr.th * fr.td *
+                                prosper::test::backend_color_bytes_per_pixel(fr.texture_format);
                             pending_timing.texture_ms += elapsed;
                             const uint64_t detail_min_submit = getenv("PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT")
                                 ? strtoull(getenv("PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT"), nullptr, 0) : 0;
@@ -1512,13 +1582,22 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     return draw.ps.color1_write_mask && draw.color1_base
                         ? draw.color1_base : uint64_t{0};
                 };
+                auto active_format = [](const prosper::gpu::DrawItem& draw, bool color1) {
+                    return prosper::test::backend_color_format(static_cast<VkFormat>(
+                        color1 ? draw.ps.color1_format : draw.ps.color0_format));
+                };
                 size_t pass_i = 0;
                 while (pass_i < items.size()) {
                     const uint64_t base = items[pass_i].color0_base;
                     const uint64_t base1 = active_color1(items[pass_i]);
+                    const VkFormat format0 = active_format(items[pass_i], false);
+                    const VkFormat format1 = base1
+                        ? active_format(items[pass_i], true) : VK_FORMAT_UNDEFINED;
                     std::vector<const prosper::gpu::DrawItem*> pass;
                     while (pass_i < items.size() && items[pass_i].color0_base == base &&
-                           active_color1(items[pass_i]) == base1) {
+                           active_color1(items[pass_i]) == base1 &&
+                           active_format(items[pass_i], false) == format0 &&
+                           (!base1 || active_format(items[pass_i], true) == format1)) {
                         pass.push_back(&items[pass_i]); ++pass_i;
                     }
 
@@ -1613,14 +1692,19 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     }
                     const uint8_t* seed = nullptr;
                     bool gpu_seed_available = false;
+                    const VkFormat pass_format = format0;
+                    const size_t pass_bytes = static_cast<size_t>(gw) * gh *
+                        prosper::test::backend_color_bytes_per_pixel(pass_format);
                     if (seed_rtt && base) { auto sit = g_rtt.find(base);
                         gpu_seed_available = live_gpu_targets && sit != g_rtt.end() &&
                             sit->second.gpu_valid && sit->second.w == gw && sit->second.h == gh &&
+                            sit->second.format == pass_format &&
                             prosper::test::find_persistent_color_target(
-                                base, gw, gh, VK_FORMAT_R8G8B8A8_UNORM) != nullptr;
+                                base, gw, gh, pass_format) != nullptr;
                         if (!gpu_seed_available && sit != g_rtt.end() &&
                             sit->second.w == gw && sit->second.h == gh &&
-                            sit->second.rgba && sit->second.rgba->size() == (size_t)gw * gh * 4)
+                            sit->second.format == pass_format && sit->second.rgba &&
+                            sit->second.rgba->size() == pass_bytes)
                             seed = sit->second.rgba->data(); }
                     bool is_vo = false;
                     for (int i = 0; i < vo_n && !is_vo; i++)
@@ -1653,7 +1737,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     const bool defer_readback = live_gpu_targets && vo_n > 0 && base && !is_vo &&
                         base != front_va && sampled_exact_later && !feedback_later;
                     prosper::test::BackendColorTarget backend_target{
-                        base, seed_rtt, !defer_readback};
+                        base, seed_rtt, !defer_readback, pass_format};
                     const bool color1_extent_matches = base1 && !render_pass.empty() &&
                         render_pass.front()->color1_width == native_w &&
                         render_pass.front()->color1_height == native_h;
@@ -1661,10 +1745,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     // against the previous single-target behavior without recapturing.
                     const bool use_color1 = base1 && color1_extent_matches &&
                                             getenv("PROSPER_NO_MRT1") == nullptr;
+                    const VkFormat pass_format1 = use_color1 ? format1 : VK_FORMAT_UNDEFINED;
                     const uint8_t* seed1 = nullptr;
                     if (seed_rtt && use_color1) { auto sit = g_rtt.find(base1);
                         if (sit != g_rtt.end() && sit->second.w == gw && sit->second.h == gh &&
-                            sit->second.rgba && sit->second.rgba->size() == (size_t)gw * gh * 4)
+                            sit->second.format == pass_format1 && sit->second.rgba &&
+                            sit->second.rgba->size() == static_cast<size_t>(gw) * gh *
+                                prosper::test::backend_color_bytes_per_pixel(pass_format1))
                             seed1 = sit->second.rgba->data(); }
                     if (base1 && !use_color1 && rtt_log) {
                         const auto* first = render_pass.empty() ? nullptr : render_pass.front();
@@ -1713,8 +1800,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         RttSurf& surface = g_rtt[base];
                         surface.w = gw;
                         surface.h = gh;
+                        surface.format = pass_format;
                         surface.gpu_valid = prosper::test::find_persistent_color_target(
-                            base, gw, gh, VK_FORMAT_R8G8B8A8_UNORM) != nullptr;
+                            base, gw, gh, pass_format) != nullptr;
                         if (!pass_pixels->empty()) surface.rgba = pass_pixels;
                         else if (surface.gpu_valid) surface.rgba.reset();
                     } else if (base && !pass_pixels->empty()) {
@@ -1722,15 +1810,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         surface.rgba = pass_pixels;
                         surface.w = gw;
                         surface.h = gh;
+                        surface.format = pass_format;
                         surface.gpu_valid = false;
                     }
                     if (use_color1 && !gpx1.empty()) {
                         if (rtt_log) {
                             size_t nz = 0, rgb_nz = 0;
                             for (uint8_t byte : gpx1) nz += byte != 0;
-                            for (size_t p = 0; p + 3 < gpx1.size(); p += 4)
-                                rgb_nz += gpx1[p] != 0 || gpx1[p + 1] != 0 ||
-                                          gpx1[p + 2] != 0;
+                            if (pass_format1 == VK_FORMAT_R8G8B8A8_UNORM)
+                                for (size_t p = 0; p + 3 < gpx1.size(); p += 4)
+                                    rgb_nz += gpx1[p] != 0 || gpx1[p + 1] != 0 ||
+                                              gpx1[p + 2] != 0;
                             fprintf(stderr,
                                     "[rtt] pass target1=0x%llx extent=%ux%u (%zu draws) "
                                     "px_nonzero=%zu rgb_nonblack=%zu\n",
@@ -1738,7 +1828,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         }
                         RttSurf& surface = g_rtt[base1];
                         surface.rgba = std::make_shared<const std::vector<uint8_t>>(std::move(gpx1));
-                        surface.w = gw; surface.h = gh; surface.gpu_valid = false;
+                        surface.w = gw; surface.h = gh; surface.format = pass_format1;
+                        surface.gpu_valid = false;
                     }
                     const std::vector<uint8_t>& rendered_pixels = *pass_pixels;
                     if (native_w == resource_hash_w && native_h == resource_hash_h &&
@@ -1783,14 +1874,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             }
                             size_t dark = 0, near_white = 0;
                             uint64_t rgb_sum = 0;
-                            for (size_t p = 0; p + 3 < step.size(); p += 4) {
-                                const uint8_t r = step[p], g = step[p + 1], b = step[p + 2];
+                            const VkFormat step_format = prosper::test::backend_color_format(
+                                static_cast<VkFormat>(prefix.front()->ps.color0_format));
+                            const std::vector<uint8_t> step_rgba = inspection_rgba8(
+                                step, gw, gh, step_format);
+                            for (size_t p = 0; p + 3 < step_rgba.size(); p += 4) {
+                                const uint8_t r = step_rgba[p], g = step_rgba[p + 1], b = step_rgba[p + 2];
                                 dark += std::max({r, g, b}) < 64;
                                 near_white += std::min({r, g, b}) > 240;
                                 rgb_sum += r + g + b;
                             }
-                            const double mean_rgb = step.empty() ? 0.0 :
-                                (double)rgb_sum / ((step.size() / 4) * 3);
+                            const double mean_rgb = step_rgba.empty() ? 0.0 :
+                                (double)rgb_sum / ((step_rgba.size() / 4) * 3);
                             const auto* draw = prefix.back();
                             auto spirv_hash = [](const std::vector<uint32_t>& words) {
                                 uint64_t hash = 1469598103934665603ull;
@@ -1825,11 +1920,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     if (lightweight_rtt_timing) pending_rtt_timing.push_back(rtt_timing_record);
                     else if (timing_enabled && rtt_log) print_rtt_timing(rtt_timing_record);
                     if (rtt_log) {
+                        const std::vector<uint8_t> inspected = inspection_rgba8(
+                            rendered_pixels, gw, gh, pass_format);
                         size_t nz = 0, rgb_nz = 0;
                         for (uint8_t b : rendered_pixels) nz += (b != 0);
-                        for (size_t p = 0; p + 3 < rendered_pixels.size(); p += 4)
-                            rgb_nz += (rendered_pixels[p] != 0 || rendered_pixels[p + 1] != 0 ||
-                                       rendered_pixels[p + 2] != 0);
+                        for (size_t p = 0; p + 3 < inspected.size(); p += 4)
+                            rgb_nz += (inspected[p] != 0 || inspected[p + 1] != 0 ||
+                                       inspected[p + 2] != 0);
                         fprintf(stderr, "[rtt] pass target=0x%llx extent=%ux%u native=%ux%u (%zu draws) "
                                 "px_nonzero=%zu rgb_nonblack=%zu cache_size=%zu%s%s\n",
                                 (unsigned long long)base, gw, gh, native_w, native_h, pass.size(), nz, rgb_nz, g_rtt.size(),
@@ -1859,13 +1956,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     if (const char* rg = getenv("PROSPER_DUMP_RTGROUPS"); rg && !rendered_pixels.empty()) {
                         size_t nz = 0; for (uint8_t b : rendered_pixels) nz += (b != 0);
                         if (nz >= (size_t)atol(rg)) {
+                            const std::vector<uint8_t> inspected = inspection_rgba8(
+                                rendered_pixels, gw, gh, pass_format);
                             const char* dd = getenv("PROSPER_FRAME_DIR");
                             char fn[512]; snprintf(fn, sizeof fn, "%s/rtgrp_%llx_%04d.bmp",
                                                    dd ? dd : ".", (unsigned long long)base, frame_no.load());
-                            prosper::test::dump_bmp(fn, rendered_pixels, gw, gh);
+                            prosper::test::dump_bmp(fn, inspected, gw, gh);
                         }
                     }
-                    if (!rendered_pixels.empty()) {
+                    if (!rendered_pixels.empty() && pass_format == VK_FORMAT_R8G8B8A8_UNORM) {
                         if (base && base == front_va) px_front = pass_pixels;  // the flipped buffer
                         if (is_vo)                    px_vo = pass_pixels;     // any registered scanout
                         px_last = pass_pixels;                                  // last non-empty (fallback)
@@ -1908,7 +2007,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     for (const auto& it : items) if (it.color0_base) { tgt = it.color0_base; break; }
                     if (tgt) {
                         RttSurf& s = g_rtt[tgt];
-                        s.rgba = selected_pixels; s.w = w; s.h = h; s.gpu_valid = false;
+                        s.rgba = selected_pixels; s.w = w; s.h = h;
+                        s.format = VK_FORMAT_R8G8B8A8_UNORM; s.gpu_valid = false;
                         prosper::test::invalidate_persistent_color_target(tgt);
                     }
                     if (rtt_log) { size_t nz=0;
@@ -1926,6 +2026,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 auto cached_scanout = [&](uint64_t addr) -> const RttSurf* {
                     auto it = g_rtt.find(addr);
                     if (it == g_rtt.end() || it->second.w != w || it->second.h != h ||
+                        it->second.format != VK_FORMAT_R8G8B8A8_UNORM ||
                         !it->second.rgba || it->second.rgba->size() != (size_t)w * h * 4)
                         return nullptr;
                     return &it->second;

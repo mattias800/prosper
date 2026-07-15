@@ -17,8 +17,8 @@ PROSPER_PAD_SCRIPT=@scripts/dead-cells/reach-first-gameplay.pad \
 ./build-linux/gpu_timeline /tmp/dead-cells.prgtl
 ./build-linux/gpu_timeline /tmp/dead-cells.prgtl --records
 ./build-linux/gpu_timeline /tmp/dead-cells.prgtl --depth-summary 642x362
-./build-linux/gpu_timeline /tmp/dead-cells.prgtl --signatures 91:93 8
-./build-linux/gpu_timeline /tmp/dead-cells.prgtl --select 738x420 80:82 91:93 8
+./build-linux/gpu_timeline /tmp/dead-cells.prgtl --signatures 91:94 8
+./build-linux/gpu_timeline /tmp/dead-cells.prgtl --select 636x420 77:85 91:94 8
 ```
 
 Capture a selected submit and, optionally, its immediate predecessor from the same run:
@@ -56,10 +56,10 @@ PROSPER_GPU_TIMELINE_CAPTURE_BUNDLE=/tmp/dead-cells-gameplay.prgbundle \
 PROSPER_GPU_TIMELINE_CAPTURE_DEPTH=1000 \
 PROSPER_GPU_TIMELINE_CAPTURE_MAX_UNIQUE_MB=1024 \
 PROSPER_GPU_TIMELINE_CAPTURE_START_TARGET_DIM=642x362 \
-PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM=738x420 \
-PROSPER_GPU_TIMELINE_CAPTURE_TARGET_DRAW_INDEX=80:82 \
+PROSPER_GPU_TIMELINE_CAPTURE_WHEN_TARGET_DIM=636x420 \
+PROSPER_GPU_TIMELINE_CAPTURE_TARGET_DRAW_INDEX=77:85 \
 PROSPER_GPU_TIMELINE_CAPTURE_MIN_DRAWS=91 \
-PROSPER_GPU_TIMELINE_CAPTURE_MAX_DRAWS=93 \
+PROSPER_GPU_TIMELINE_CAPTURE_MAX_DRAWS=94 \
 PROSPER_GPU_TIMELINE_CAPTURE_MIN_DISPATCHES=8 \
 PROSPER_GPU_TIMELINE_CAPTURE_MAX_DISPATCHES=8 \
 PROSPER_GPU_TIMELINE_EXIT_AFTER_CAPTURE=1 \

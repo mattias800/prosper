@@ -70,6 +70,9 @@ struct FrameResource {
     const uint8_t* tex_rgba = nullptr;   // non-null => a texture; then tw/th are its dimensions
     uint32_t tw = 0, th = 0, td = 1;
     uint32_t img_dim = 1;             // ShaderResource/MIMG dim (1=2D, 2=3D); depth-1 3D stays 3D
+    // Renderer-owned RTTs keep their native format between producer and consumer. Guest-backed
+    // textures still arrive through the existing RGBA8 decoder unless explicitly tagged otherwise.
+    VkFormat texture_format = VK_FORMAT_R8G8B8A8_UNORM;
     // Sampler state (Texture only). Defaults = LINEAR + clamp-to-edge — the harness's prior fixed
     // sampler — so render tests that build FrameResources directly stay byte-identical. The live path
     // fills these from the decoded S# (shader_resources.hpp). filter: 0=nearest, 1=linear; addr = Gen5
@@ -105,7 +108,18 @@ struct BackendColorTarget {
     uint64_t persistent_id = 0;
     bool load_existing = true;
     bool readback = true;
+    VkFormat format = VK_FORMAT_UNDEFINED;
 };
+
+inline VkFormat backend_color_format(VkFormat format) {
+    return format == VK_FORMAT_R16G16B16A16_SFLOAT
+        ? VK_FORMAT_R16G16B16A16_SFLOAT
+        : VK_FORMAT_R8G8B8A8_UNORM;
+}
+
+inline uint32_t backend_color_bytes_per_pixel(VkFormat format) {
+    return backend_color_format(format) == VK_FORMAT_R16G16B16A16_SFLOAT ? 8u : 4u;
+}
 
 struct BackendColorTargetStats {
     uint64_t writes = 0;
@@ -125,7 +139,7 @@ inline BackendColorTargetStats backend_color_target_stats() {
     return backend_color_target_stats_storage();
 }
 
-// Returns W*H*4 RGBA bytes, or {} on any Vulkan failure (incl. a rejected SPIR-V module). When `ps`
+// Returns native target bytes (RGBA8 by default, RGBA16F when requested), or {} on failure. When `ps`
 // is non-null, the pipeline's fixed-function state (topology, blend, color write mask) is taken from
 // the resolved RDNA2 render-state — this is how the back-half realizes a GpuState as a real VkPipeline.
 //
@@ -268,7 +282,7 @@ inline BackendRenderTimingStats backend_render_timing_stats() {
     return backend_render_timing_stats_storage();
 }
 
-// `seed_rgba` (optional): W*H*4 RGBA8 pixels to PRELOAD the color attachment with before the draws
+// `seed_rgba` (optional): native-format pixels to PRELOAD the color attachment with before the draws
 // run (loadOp LOAD instead of the blue clear). This is real render-target memory semantics: a game
 // pass that draws into a target it (or an earlier submit) already rendered composites OVER that
 // content — without it every pass starts from the diagnostic blue clear, so cross-submit
@@ -425,7 +439,8 @@ inline void invalidate_persistent_color_target_guest_write(uint64_t addr, uint64
     if (!addr || !size) return;
     const uint64_t end = size > UINT64_MAX - addr ? UINT64_MAX : addr + size;
     for (auto& [key, target] : persistent_color_target_cache()) {
-        const uint64_t bytes = static_cast<uint64_t>(key.width) * key.height * 4;
+        const uint64_t bytes = static_cast<uint64_t>(key.width) * key.height *
+                               backend_color_bytes_per_pixel(key.format);
         const uint64_t target_end = bytes > UINT64_MAX - key.id ? UINT64_MAX : key.id + bytes;
         if (addr < target_end && key.id < end) target.valid = false;
     }
@@ -922,8 +937,25 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         for (uint32_t i = 0; i < memp.memoryTypeCount; i++)
             if ((bits & (1u << i)) && (memp.memoryTypes[i].propertyFlags & want) == want) return i;
         return UINT32_MAX; };
-    const VkFormat FMT = VK_FORMAT_R8G8B8A8_UNORM;
     const bool use_color1 = out_rgba1 != nullptr;
+    const auto first_pipeline_format = [&](bool color1) {
+        for (const auto& draw : draws) {
+            if (!draw.ps) continue;
+            const VkFormat format = static_cast<VkFormat>(
+                color1 ? draw.ps->color1_format : draw.ps->color0_format);
+            if (format != VK_FORMAT_UNDEFINED) return backend_color_format(format);
+        }
+        return VK_FORMAT_R8G8B8A8_UNORM;
+    };
+    const VkFormat FMT = color_target && color_target->format != VK_FORMAT_UNDEFINED
+        ? backend_color_format(color_target->format)
+        : first_pipeline_format(false);
+    const VkFormat FMT1 = use_color1 ? first_pipeline_format(true) : VK_FORMAT_UNDEFINED;
+    const VkDeviceSize bytes = static_cast<VkDeviceSize>(W) * H *
+                               backend_color_bytes_per_pixel(FMT);
+    const VkDeviceSize bytes1 = use_color1
+        ? static_cast<VkDeviceSize>(W) * H * backend_color_bytes_per_pixel(FMT1)
+        : 0;
     const uint32_t color_count = use_color1 ? 2u : 1u;
     const uint32_t ds_attachment = color_count;
     // Depth attachment is created if ANY draw enables the depth test (the shared render pass has one
@@ -1048,7 +1080,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         for (const auto& resource : draw.R)
             if (persistent_color_targets_enabled && resource.persistent_render_target_id)
                 if (auto* sampled = find_persistent_color_target(
-                        resource.persistent_render_target_id, resource.tw, resource.th, FMT))
+                        resource.persistent_render_target_id, resource.tw, resource.th,
+                        backend_color_format(resource.texture_format)))
                     sampled->last_use = color_target_generation;
 
     bool persistent_color = persistent_color_enabled;
@@ -1123,7 +1156,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     VkImageView view1 = VK_NULL_HANDLE;
     if (use_color1) {
         VkImageCreateInfo color1_ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        color1_ci.imageType = VK_IMAGE_TYPE_2D; color1_ci.format = FMT;
+        color1_ci.imageType = VK_IMAGE_TYPE_2D; color1_ci.format = FMT1;
         color1_ci.extent = {W, H, 1}; color1_ci.mipLevels = 1; color1_ci.arrayLayers = 1;
         color1_ci.samples = VK_SAMPLE_COUNT_1_BIT; color1_ci.tiling = VK_IMAGE_TILING_OPTIMAL;
         color1_ci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
@@ -1139,7 +1172,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         vkBindImageMemory(dev, img1, imem1, 0);
         VkImageViewCreateInfo color1_view_ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         color1_view_ci.image = img1; color1_view_ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        color1_view_ci.format = FMT;
+        color1_view_ci.format = FMT1;
         color1_view_ci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         vkCreateImageView(dev, &color1_view_ci, nullptr, &view1);
     }
@@ -1178,7 +1211,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     att[0].finalLayout = persistent_color ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
                                           : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     if (use_color1) {
-        att[1].format = FMT; att[1].samples = VK_SAMPLE_COUNT_1_BIT;
+        att[1].format = FMT1; att[1].samples = VK_SAMPLE_COUNT_1_BIT;
         att[1].loadOp = seed_rgba1 ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
         att[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         att[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
@@ -1248,10 +1281,11 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         uint64_t render_target_id = 0;
         uint32_t width = 0, height = 0, depth = 1;
         uint32_t img_dim = 1;
+        VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
         bool operator==(const TextureUploadKey& other) const {
             return pixels == other.pixels && render_target_id == other.render_target_id &&
                    width == other.width && height == other.height && depth == other.depth &&
-                   img_dim == other.img_dim;
+                   img_dim == other.img_dim && format == other.format;
         }
     };
     struct TextureUploadKeyHash {
@@ -1262,6 +1296,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             h ^= static_cast<size_t>(key.height) + 0x9e3779b9u + (h << 6) + (h >> 2);
             h ^= static_cast<size_t>(key.depth) + 0x9e3779b9u + (h << 6) + (h >> 2);
             h ^= static_cast<size_t>(key.img_dim) + 0x9e3779b9u + (h << 6) + (h >> 2);
+            h ^= static_cast<size_t>(key.format) + 0x9e3779b9u + (h << 6) + (h >> 2);
             return h;
         }
     };
@@ -1280,6 +1315,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     struct PersistentTextureKey {
         uint64_t id = 0;
         uint32_t width = 0, height = 0, depth = 1, img_dim = 1;
+        VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
         bool operator==(const PersistentTextureKey&) const = default;
     };
     struct PersistentTextureKeyHash {
@@ -1289,6 +1325,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 h ^= static_cast<size_t>(value) + 0x9e3779b9u + (h << 6) + (h >> 2);
             };
             mix(key.width); mix(key.height); mix(key.depth); mix(key.img_dim);
+            mix(static_cast<uint32_t>(key.format));
             return h;
         }
     };
@@ -1506,7 +1543,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                         : VK_SHADER_STAGE_FRAGMENT_BIT;
                     texture_references++;
                     const TextureUploadKey texture_key{
-                        r.tex_rgba, r.persistent_render_target_id, r.tw, r.th, r.td, r.img_dim};
+                        r.tex_rgba, r.persistent_render_target_id, r.tw, r.th, r.td, r.img_dim,
+                        backend_color_format(r.texture_format)};
                     size_t upload_index = SIZE_MAX;
                     if (share_texture_uploads) {
                         auto found = texture_upload_indices.find(texture_key);
@@ -1524,7 +1562,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                         if (persistent_color_targets_enabled && !target_feedback &&
                             r.persistent_render_target_id && r.img_dim == 1) {
                             if (auto* target = find_persistent_color_target(
-                                    r.persistent_render_target_id, r.tw, r.th, FMT)) {
+                                    r.persistent_render_target_id, r.tw, r.th,
+                                    backend_color_format(r.texture_format))) {
                                 target->last_use = color_target_generation;
                                 upload.image = target->image;
                                 upload.image_bytes = target->bytes;
@@ -1534,7 +1573,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                         }
                         upload.persistent_id = r.persistent_texture_id;
                         const PersistentTextureKey persistent_key{
-                            r.persistent_texture_id, r.tw, r.th, r.td, r.img_dim};
+                            r.persistent_texture_id, r.tw, r.th, r.td, r.img_dim,
+                            backend_color_format(r.texture_format)};
                         if (!upload.borrowed_target && persistent_textures_enabled &&
                             r.persistent_texture_id) {
                             auto cached = persistent_texture_images.find(persistent_key);
@@ -1553,7 +1593,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                             VkImageCreateInfo tci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
                             const bool texture_3d = r.img_dim == 2;
                             tci.imageType = texture_3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
-                            tci.format = VK_FORMAT_R8G8B8A8_UNORM;
+                            tci.format = backend_color_format(r.texture_format);
                             tci.extent = {r.tw, r.th, r.td};
                             tci.mipLevels = 1; tci.arrayLayers = 1;
                             tci.samples = VK_SAMPLE_COUNT_1_BIT; tci.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -1577,7 +1617,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                             vkBindImageMemory(dev, upload.image, upload.memory, 0);
 
                             const VkDeviceSize tbytes =
-                                static_cast<VkDeviceSize>(r.tw) * r.th * r.td * 4;
+                                static_cast<VkDeviceSize>(r.tw) * r.th * r.td *
+                                backend_color_bytes_per_pixel(r.texture_format);
                             VkBufferCreateInfo stci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
                             stci.size = tbytes; stci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
                             vkCreateBuffer(dev, &stci, nullptr, &upload.staging);
@@ -1611,7 +1652,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     // #263 discussion), NOT a per-view format flip. r.srgb is decoded now as groundwork.
                     tvci.image = upload.image;
                     tvci.viewType = r.img_dim == 2 ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;
-                    tvci.format = VK_FORMAT_R8G8B8A8_UNORM;
+                    tvci.format = backend_color_format(r.texture_format);
                     // T# DST_SEL channel remap (#261): map each SQ_SEL to a VkComponentSwizzle. Identity
                     // (the default, and the narrow/font path) yields IDENTITY == a no-op. PROSPER_NO_SWIZZLE
                     // forces identity for A/B testing against the pre-swizzle behavior.
@@ -1742,8 +1783,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 memcpy(&word, &value, sizeof word);
                 append(word);
             };
-            append(2); // key schema version
-            append(W); append(H); append(color_count); append(use_ds); append(static_cast<uint32_t>(DFMT));
+            append(3); // key schema version
+            append(W); append(H); append(color_count); append(static_cast<uint32_t>(FMT));
+            append(static_cast<uint32_t>(FMT1)); append(use_ds); append(static_cast<uint32_t>(DFMT));
             const bool exact_shader_identities = bd.vs_identity && bd.fs_identity;
             append(bd.vs_identity != 0);
             if (bd.vs_identity) {
@@ -1867,12 +1909,11 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         if (!upload.staging) continue;
         ++texture_stats.unique_uploads;
         texture_stats.upload_bytes += static_cast<uint64_t>(upload.key.width) * upload.key.height *
-                                      upload.key.depth * 4;
+                                      upload.key.depth * backend_color_bytes_per_pixel(upload.key.format);
     }
 
     const auto timing_draws_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
-    VkDeviceSize bytes = (VkDeviceSize)W * H * 4;
-    const VkDeviceSize readback_bytes = bytes * color_count;
+    const VkDeviceSize readback_bytes = bytes + bytes1;
     // MRT1 is currently retained in the live renderer's CPU RTT cache, so a paired pass always
     // reads both attachments back. Single-target passes keep the persistent no-readback fast path.
     const bool readback_requested = use_color1 || !persistent_color || color_target->readback;
@@ -1953,7 +1994,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     VkBuffer seedbuf1 = VK_NULL_HANDLE; VkDeviceMemory seedmem1 = VK_NULL_HANDLE;
     if (use_color1 && seed_rgba1) {
         VkBufferCreateInfo sci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        sci.size = bytes; sci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        sci.size = bytes1; sci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
         vkCreateBuffer(dev, &sci, nullptr, &seedbuf1);
         VkMemoryRequirements sr; vkGetBufferMemoryRequirements(dev, seedbuf1, &sr);
         VkMemoryAllocateInfo sai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; sai.allocationSize = sr.size;
@@ -1961,8 +2002,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
         seedmem1 = allocate_transient_render_memory(dev, sai.allocationSize, sai.memoryTypeIndex);
         vkBindBufferMemory(dev, seedbuf1, seedmem1, 0);
-        void* sp = nullptr; vkMapMemory(dev, seedmem1, 0, bytes, 0, &sp);
-        memcpy(sp, seed_rgba1, static_cast<size_t>(bytes)); vkUnmapMemory(dev, seedmem1);
+        void* sp = nullptr; vkMapMemory(dev, seedmem1, 0, bytes1, 0, &sp);
+        memcpy(sp, seed_rgba1, static_cast<size_t>(bytes1)); vkUnmapMemory(dev, seedmem1);
         VkImageMemoryBarrier s0{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         s0.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; s0.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         s0.image = img1; s0.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -2125,7 +2166,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     // that pixel — the kill index that turns (x,y) dark is the culprit. Reuses the built pipelines/
     // descriptors; a fresh clear each pass. Env-gated, no default behavior. Used to locate a stray primitive
     // such as the #298 menu focus-ring sliver. Dumps iso_kill_<k>.bmp to PROSPER_FRAME_DIR.
-    if (getenv("PROSPER_DRAW_ISO") && getenv("PROSPER_ISO_AT")) {
+    if (FMT == VK_FORMAT_R8G8B8A8_UNORM &&
+        getenv("PROSPER_DRAW_ISO") && getenv("PROSPER_ISO_AT")) {
         static bool iso_done = false;
         int tx = -1, ty = -1; sscanf(getenv("PROSPER_ISO_AT"), "%d,%d", &tx, &ty);
         // Optional PROSPER_ISO_RGB="r,g,b" (+ PROSPER_ISO_TOL, default 45): the target submit is the first
@@ -2233,7 +2275,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     for (auto& upload : texture_uploads) {
         if (!upload.direct_memory || !upload.persistent_id || upload.persistent_hit) continue;
         const PersistentTextureKey key{upload.persistent_id, upload.key.width, upload.key.height,
-                                       upload.key.depth, upload.key.img_dim};
+                                       upload.key.depth, upload.key.img_dim, upload.key.format};
         while ((persistent_texture_images.size() >= persistent_texture_max_entries ||
                 (upload.image_bytes <= persistent_texture_limit &&
                  persistent_texture_bytes > persistent_texture_limit - upload.image_bytes)) &&
