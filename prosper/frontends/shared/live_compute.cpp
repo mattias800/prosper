@@ -535,7 +535,6 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             bi.storage = image_descriptors[i].kind == SpirvDescriptorKind::StorageImage;
             // A surface whose CURRENT pixels live in the renderer's RTT cache must not be read from
             // raw guest memory (empty/stale — the Dead Cells 642x362 lesson).
-            if (is_live_render_target(r->gpu_addr)) { skip_image(r, "renderer-owned RTT surface"); break; }
             const bool dim_1d = r->img_dim == 0;
             const bool dim_3d = r->img_dim == 2;
             if (!dim_1d && r->img_dim != 1 && !dim_3d) {
@@ -548,6 +547,32 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             if (dim_3d && r->depth > 1 && r->tile_mode &&
                 !tile_mode_supports_volume(r->tile_mode)) {
                 skip_image(r, "3D tile mode has no volume address pattern"); break;
+            }
+            // A renderer-owned target's current pixels are not in raw guest memory. Import its
+            // immutable CPU snapshot for sampled bindings; storage bindings and GPU-only targets
+            // stay unsupported rather than silently reading or overwriting stale guest bytes.
+            LiveTargetSnapshot live_target;
+            const bool renderer_owned = is_live_render_target(r->gpu_addr);
+            if (renderer_owned) {
+                if (bi.storage) {
+                    skip_image(r, "renderer-owned RTT bound as storage image"); break;
+                }
+                if (dim_3d || r->depth != 1 ||
+                    !read_live_render_target(r->gpu_addr, live_target) || !live_target.pixels) {
+                    skip_image(r, "renderer-owned RTT has no readable snapshot"); break;
+                }
+                if (live_target.width != r->width || live_target.height != r->height) {
+                    skip_image(r, "renderer-owned RTT snapshot extent mismatch"); break;
+                }
+                const uint64_t bpp = live_target.format == LiveTargetPixelFormat::Rgba16Float ? 8u : 4u;
+                const uint64_t texels = static_cast<uint64_t>(r->width) * r->height;
+                if (texels > UINT64_MAX / bpp) {
+                    skip_image(r, "renderer-owned RTT snapshot size overflow"); break;
+                }
+                const uint64_t expected = texels * bpp;
+                if (expected != live_target.pixels->size()) {
+                    skip_image(r, "renderer-owned RTT snapshot byte count mismatch"); break;
+                }
             }
             // Multiple U# bindings may intentionally name the same guest surface (read/modify/write
             // views of one UE4 volume). They must see one Vulkan image and produce one guest
@@ -635,74 +660,106 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const bool r8 = r->format == DataFormat::Unorm8 && nc == 1;
                 const bool f16 = r->format == DataFormat::Float16 && nc >= 1 && nc <= 4;
                 const bool r11g11b10 = r->format == DataFormat::Float10_11_11 && nc == 3;
-                size_t need;                                       // guest bytes the decode reads
-                if (bpb && dim_3d) {
-                    skip_image(r, "block-compressed 3D texture deferred"); break;
-                } else if (bpb) {
-                    const uint32_t bw = (r->width + 3) / 4, bh = (r->height + 3) / 4;
-                    need = r->tile_mode ? tiled_elements_bytes(bw, bh, bpb, r->tile_mode)
-                                        : (size_t)bw * bh * bpb;
-                } else if (rgba8 || uint8 || r8 || f16 || r11g11b10) {
-                    const uint32_t bpt = r11g11b10 ? 4u : cb * nc;
-                    need = r->tile_mode
-                        ? (dim_3d && r->depth > 1
-                               ? tiled_volume_bytes(r->width, r->height, r->depth,
-                                                    r->tile_mode, bpt)
-                                  : tiled_surface_bytes(r->width, r->height, r->tile_mode, 0, bpt))
-                        : (size_t)volume_texels * bpt;
-                } else { skip_image(r, "sampled format not decodable yet"); break; }
-                if (!need || need > kMaxComputeImageBytes || need > UINT32_MAX) {
-                    skip_image(r, "sampled backing exceeds the 256 MiB backend bound"); break;
-                }
-                bi.guest_bytes = need;
-                const uint8_t* src = resource_bytes_for(r, need);
-                const bool readable = (r->host_data && r->host_data_size >= need) ||
-                                      guest_readable(r->gpu_addr, (uint32_t)need);
-                if (!readable) { skip_image(r, "sampled surface unreadable"); break; }
-                if (bpb) {                                          // BCn: (block-detile ->) decode
-                    const uint32_t bw = (r->width + 3) / 4, bh = (r->height + 3) / 4;
-                    std::vector<uint8_t> lin((size_t)bw * bh * bpb, 0);
-                    if (r->tile_mode)
-                        detile_elements(lin.data(), src, need, bw, bh, bpb, r->tile_mode);
-                    else
-                        std::memcpy(lin.data(), src, lin.size());
-                    if (!bc_decode_surface(upload.data(), lin.data(), lin.size(),
-                                           r->width, r->height, r->format)) {
-                        skip_image(r, "BC decode unsupported"); break; }
-                } else {
-                    const uint32_t bpt = r11g11b10 ? 4u : cb * nc;
-                    std::vector<uint8_t> lin((size_t)volume_texels * bpt, 0);
-                    if (r->tile_mode && dim_3d && r->depth > 1) {
-                        if (!detile_volume(lin.data(), src, need, r->width, r->height, r->depth,
-                                           r->tile_mode, bpt)) {
-                            skip_image(r, "sampled volume detile failed"); break;
-                        }
-                    } else if (r->tile_mode) {
-                        detile_surface(lin.data(), src, r->width, r->height, r->tile_mode, 0, bpt);
-                    } else {
-                        std::memcpy(lin.data(), src, lin.size());
+                if (renderer_owned) {
+                    if (r11g11b10) {
+                        skip_image(r, "renderer RTT cannot be reconstructed as packed R11G11B10");
+                        break;
                     }
-                    const size_t texels = (size_t)volume_texels;
-                    if (rgba8 || uint8 || r11g11b10) {              // Native 4-byte sampled texels
-                        std::memcpy(upload.data(), lin.data(), lin.size());
-                    } else if (r8) {                                // R8: broadcast coverage to RGBA
-                        for (size_t t = 0; t < texels; t++) {
-                            const uint8_t v = lin[t];
-                            upload[t * 4 + 0] = v; upload[t * 4 + 1] = v;
-                            upload[t * 4 + 2] = v; upload[t * 4 + 3] = v;
+                    const std::vector<uint8_t>& pixels = *live_target.pixels;
+                    if (live_target.format == LiveTargetPixelFormat::Rgba8Unorm) {
+                        std::memcpy(upload.data(), pixels.data(), upload.size());
+                    } else {
+                        const size_t texels = static_cast<size_t>(volume_texels);
+                        for (size_t t = 0; t < texels; ++t) {
+                            for (uint32_t c = 0; c < 4; ++c) {
+                                uint16_t half = 0;
+                                std::memcpy(&half, pixels.data() + t * 8 + c * 2, sizeof(half));
+                                float value = half_to_float(half);
+                                if (!std::isfinite(value) || value <= 0.0f) value = 0.0f;
+                                else if (value >= 1.0f) value = 1.0f;
+                                upload[t * 4 + c] = static_cast<uint8_t>(
+                                    std::lround(value * 255.0f));
+                            }
                         }
-                    } else {                                        // Float16: half -> UNORM8 + default fill
-                        const uint16_t* hp = reinterpret_cast<const uint16_t*>(lin.data());
-                        for (size_t t = 0; t < texels; t++) {
-                            for (uint32_t c = 0; c < 4; c++) {
-                                if (c >= nc) {
-                                    upload[t * 4 + c] = c == 3 ? 255 : 0;
-                                    continue;
+                    }
+                    if (trace)
+                        std::fprintf(stderr,
+                                     "[compute]   imported renderer RTT binding=%u addr=0x%llx "
+                                     "extent=%ux%u format=%s\n",
+                                     bi.binding, (unsigned long long)r->gpu_addr, r->width, r->height,
+                                     live_target.format == LiveTargetPixelFormat::Rgba16Float
+                                         ? "rgba16f" : "rgba8");
+                    bi.guest_bytes = 0;
+                } else {
+                    size_t need;                                   // guest bytes the decode reads
+                    if (bpb && dim_3d) {
+                        skip_image(r, "block-compressed 3D texture deferred"); break;
+                    } else if (bpb) {
+                        const uint32_t bw = (r->width + 3) / 4, bh = (r->height + 3) / 4;
+                        need = r->tile_mode ? tiled_elements_bytes(bw, bh, bpb, r->tile_mode)
+                                            : (size_t)bw * bh * bpb;
+                    } else if (rgba8 || uint8 || r8 || f16 || r11g11b10) {
+                        const uint32_t bpt = r11g11b10 ? 4u : cb * nc;
+                        need = r->tile_mode
+                            ? (dim_3d && r->depth > 1
+                                   ? tiled_volume_bytes(r->width, r->height, r->depth,
+                                                        r->tile_mode, bpt)
+                                   : tiled_surface_bytes(r->width, r->height, r->tile_mode, 0, bpt))
+                            : (size_t)volume_texels * bpt;
+                    } else { skip_image(r, "sampled format not decodable yet"); break; }
+                    if (!need || need > kMaxComputeImageBytes || need > UINT32_MAX) {
+                        skip_image(r, "sampled backing exceeds the 256 MiB backend bound"); break;
+                    }
+                    bi.guest_bytes = need;
+                    const uint8_t* src = resource_bytes_for(r, need);
+                    const bool readable = (r->host_data && r->host_data_size >= need) ||
+                                          guest_readable(r->gpu_addr, (uint32_t)need);
+                    if (!readable) { skip_image(r, "sampled surface unreadable"); break; }
+                    if (bpb) {                                      // BCn: (block-detile ->) decode
+                        const uint32_t bw = (r->width + 3) / 4, bh = (r->height + 3) / 4;
+                        std::vector<uint8_t> lin((size_t)bw * bh * bpb, 0);
+                        if (r->tile_mode)
+                            detile_elements(lin.data(), src, need, bw, bh, bpb, r->tile_mode);
+                        else
+                            std::memcpy(lin.data(), src, lin.size());
+                        if (!bc_decode_surface(upload.data(), lin.data(), lin.size(),
+                                               r->width, r->height, r->format)) {
+                            skip_image(r, "BC decode unsupported"); break; }
+                    } else {
+                        const uint32_t bpt = r11g11b10 ? 4u : cb * nc;
+                        std::vector<uint8_t> lin((size_t)volume_texels * bpt, 0);
+                        if (r->tile_mode && dim_3d && r->depth > 1) {
+                            if (!detile_volume(lin.data(), src, need, r->width, r->height, r->depth,
+                                               r->tile_mode, bpt)) {
+                                skip_image(r, "sampled volume detile failed"); break;
+                            }
+                        } else if (r->tile_mode) {
+                            detile_surface(lin.data(), src, r->width, r->height, r->tile_mode, 0, bpt);
+                        } else {
+                            std::memcpy(lin.data(), src, lin.size());
+                        }
+                        const size_t texels = (size_t)volume_texels;
+                        if (rgba8 || uint8 || r11g11b10) {          // Native 4-byte sampled texels
+                            std::memcpy(upload.data(), lin.data(), lin.size());
+                        } else if (r8) {                            // R8: broadcast coverage to RGBA
+                            for (size_t t = 0; t < texels; t++) {
+                                const uint8_t v = lin[t];
+                                upload[t * 4 + 0] = v; upload[t * 4 + 1] = v;
+                                upload[t * 4 + 2] = v; upload[t * 4 + 3] = v;
+                            }
+                        } else {                                    // Float16: half -> UNORM8 + default fill
+                            const uint16_t* hp = reinterpret_cast<const uint16_t*>(lin.data());
+                            for (size_t t = 0; t < texels; t++) {
+                                for (uint32_t c = 0; c < 4; c++) {
+                                    if (c >= nc) {
+                                        upload[t * 4 + c] = c == 3 ? 255 : 0;
+                                        continue;
+                                    }
+                                    float v = half_to_float(hp[t * nc + c]);
+                                    if (std::isnan(v)) v = 0.f;
+                                    v = v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
+                                    upload[t * 4 + c] = (uint8_t)std::lround(v * 255.0f);
                                 }
-                                float v = half_to_float(hp[t * nc + c]);
-                                if (std::isnan(v)) v = 0.f;
-                                v = v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
-                                upload[t * 4 + c] = (uint8_t)std::lround(v * 255.0f);
                             }
                         }
                     }

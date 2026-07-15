@@ -114,6 +114,12 @@ int main() {
     static const uint32_t image_copy[] = {
         0x7E080300u, 0xF0000F00u, 0x00000004u, 0xBF8C3F70u, 0xF0200F00u, 0x00020004u, 0xBF810000u,
     };
+    static const uint32_t image_copy_2d[] = {
+        0x7E080300u,             // v4 = x from the shell input
+        0x7E0A0280u,             // v5 = y = 0
+        0xF0000F08u, 0x00000004u, 0xBF8C3F70u,
+        0xF0200F08u, 0x00020004u, 0xBF810000u,
+    };
     const uint32_t W = 64;
     std::vector<uint32_t> lane_index(W);
     for (uint32_t i = 0; i < W; i++) lane_index[i] = i;      // shell input: v0 = input[gid] = gid
@@ -169,6 +175,66 @@ int main() {
                              bad, W * 4, img_src[0], img_dst[0]);
         CHECK(bad == 0, "Unorm8 unpack -> uvec4 copy -> pack writeback is byte-exact (#590)");
     }
+
+    // A renderer-owned color target is newer than its guest backing. Recompile the same copy kernel
+    // with a sampled source, publish deliberately different live pixels, and prove the production
+    // backend imports the immutable renderer snapshot instead of either skipping or reading stale RAM.
+    std::vector<uint8_t> stale_rtt(W * 4, 0);
+    auto live_rtt = std::make_shared<std::vector<uint8_t>>(W * 4);
+    std::vector<uint8_t> live_dst(W * 4, 0xEE);
+    for (uint32_t i = 0; i < W * 4; ++i) (*live_rtt)[i] = static_cast<uint8_t>(i * 29 + 11);
+    ShaderResourceTable live_rt = irt;
+    for (ShaderResource& resource : live_rt.resources) {
+        if (resource.binding == 4) {
+            resource.cls = ResourceClass::Texture;
+            resource.img_dim = 1;
+            resource.gpu_addr = reinterpret_cast<uint64_t>(stale_rtt.data());
+            resource.host_data = nullptr;
+            resource.host_data_size = 0;
+            resource.swizzle[0] = 4;
+            resource.swizzle[1] = 5;
+            resource.swizzle[2] = 6;
+            resource.swizzle[3] = 7;
+        } else if (resource.binding == 5) {
+            resource.img_dim = 1;
+            resource.gpu_addr = reinterpret_cast<uint64_t>(live_dst.data());
+            resource.host_data = nullptr;
+            resource.host_data_size = 0;
+        }
+    }
+    const uint64_t live_addr = reinterpret_cast<uint64_t>(stale_rtt.data());
+    set_live_target_query([live_addr](uint64_t addr) { return addr == live_addr; });
+    set_live_target_reader(
+        [live_addr, live_rtt](uint64_t addr, LiveTargetSnapshot& snapshot) {
+            if (addr != live_addr) return false;
+            snapshot.width = W;
+            snapshot.height = 1;
+            snapshot.format = LiveTargetPixelFormat::Rgba8Unorm;
+            snapshot.pixels = live_rtt;
+            return true;
+        });
+    std::vector<uint32_t> live_spirv = recompile_valu(
+        image_copy_2d, sizeof(image_copy_2d) / sizeof(image_copy_2d[0]), 1, 0,
+        &live_rt);
+    CHECK(!live_spirv.empty(), "sampled-image copy kernel recompiles for renderer RTT import");
+    if (!live_spirv.empty()) {
+        ComputeItem live_item;
+        live_item.spirv = live_spirv;
+        live_item.resources = std::make_shared<ShaderResourceTable>(live_rt);
+        live_item.launch.threads_x = W;
+        live_item.launch.local_x = 64;
+        live_item.launch.groups_x = 1;
+        live_item.launch.local_y = live_item.launch.local_z = 1;
+        live_item.launch.groups_y = live_item.launch.groups_z = 1;
+        live_item.code_addr = 0x590591;
+        CHECK(prosper::frontend::execute_live_compute_items({live_item}),
+              "live backend executes a dispatch sampling a renderer-owned RTT");
+        CHECK(live_dst == *live_rtt,
+              "sampled renderer RTT pixels reach storage-image writeback byte-exactly");
+        CHECK(live_dst != stale_rtt, "renderer RTT import does not use stale guest backing");
+    }
+    set_live_target_reader({});
+    set_live_target_query({});
 
     if (fails) {
         std::printf("== FAIL: %d ==\n", fails);

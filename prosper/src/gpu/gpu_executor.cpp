@@ -2501,6 +2501,12 @@ void set_live_target_query(LiveTargetQueryFn fn) { g_live_target_query = std::mo
 bool is_live_render_target(uint64_t gpu_addr) {
     return g_live_target_query && g_live_target_query(gpu_addr);
 }
+static LiveTargetReaderFn g_live_target_reader;
+void set_live_target_reader(LiveTargetReaderFn fn) { g_live_target_reader = std::move(fn); }
+bool read_live_render_target(uint64_t gpu_addr, LiveTargetSnapshot& snapshot) {
+    snapshot = {};
+    return g_live_target_reader && g_live_target_reader(gpu_addr, snapshot);
+}
 
 void set_guest_gpu_write_observer(GuestGpuWriteObserver observer) {
     g_guest_gpu_write_observer = std::move(observer);

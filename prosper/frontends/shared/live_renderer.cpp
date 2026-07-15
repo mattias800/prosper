@@ -214,8 +214,27 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
     }
     // The compute backend must not sample a surface whose CURRENT pixels live in this renderer's
     // RTT cache (raw guest memory is then empty/stale — the Dead Cells 642x362 lesson): publish the
-    // exact-match target query it skips on (#590). Same keying as the RTT injection below.
+    // exact-match identity and immutable CPU snapshot used by live compute (#590).
     prosper::gpu::set_live_target_query([](uint64_t addr) { return g_rtt.count(addr) != 0; });
+    prosper::gpu::set_live_target_reader(
+        [](uint64_t addr, prosper::gpu::LiveTargetSnapshot& snapshot) {
+            const auto it = g_rtt.find(addr);
+            if (it == g_rtt.end() || !it->second.rgba || !it->second.w || !it->second.h)
+                return false;
+            const VkFormat format = prosper::test::backend_color_format(it->second.format);
+            const uint32_t bytes_per_pixel = prosper::test::backend_color_bytes_per_pixel(format);
+            const uint64_t texels = static_cast<uint64_t>(it->second.w) * it->second.h;
+            if (texels > UINT64_MAX / bytes_per_pixel) return false;
+            const uint64_t expected = texels * bytes_per_pixel;
+            if (expected != it->second.rgba->size()) return false;
+            snapshot.width = it->second.w;
+            snapshot.height = it->second.h;
+            snapshot.format = format == VK_FORMAT_R16G16B16A16_SFLOAT
+                ? prosper::gpu::LiveTargetPixelFormat::Rgba16Float
+                : prosper::gpu::LiveTargetPixelFormat::Rgba8Unorm;
+            snapshot.pixels = it->second.rgba;
+            return true;
+        });
     if (getenv("PROSPER_GPU_CAPTURE") || getenv("PROSPER_GPU_TIMELINE_CAPTURE") ||
         getenv("PROSPER_GPU_REPLAY_EXPORT_DS"))
         prosper::gpu::set_gpu_capture_ds_seed_snapshot_reader(
