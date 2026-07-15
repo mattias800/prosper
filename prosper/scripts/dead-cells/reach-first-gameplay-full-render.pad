@@ -2,9 +2,10 @@
 # Unlike reach-first-gameplay.pad, this does not depend on a renderer warmup making
 # guest startup run ahead. Full rendering can reduce pad polls below 1 Hz, so
 # every menu action is held across several polls with a release gap between it
-# and the next action. Circle remains held through the skippable opening.
+# and the next action. Circle remains held through the slow full-render parse and skippable opening;
+# it deliberately outlives the current snapshot timeout so host throughput cannot expire the skip.
 40-48:cross
 52-60:cross
 64-72:cross
 76-84:cross
-88-115:circle
+88-240:circle

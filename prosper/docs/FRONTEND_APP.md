@@ -266,6 +266,16 @@ current guest addresses and backing data remain on each draw and are never cache
 every tested miss byte-for-byte with the direct recompiler and verifies that runtime-only resource
 changes hit while descriptor-interface changes miss.
 
+The Vulkan backend retains graphics pipelines across render-target calls. Live draws carry a
+process-unique, never-recycled identity from the exact shader cache, so a hot lookup does not copy or
+hash complete SPIR-V modules. Capture, replay, and test draws without those identities fall back to an
+exact full-module key. The rest of the key contains the descriptor-layout contract and every baked
+fixed-function value; equality still compares the complete key after hashing. The cache is bounded to
+1024 entries by default. Set `PROSPER_PIPELINE_CACHE_ENTRIES=<N>` to change the entry limit or
+`PROSPER_NO_BACKEND_PIPELINE_CACHE=1` for a transient-pipeline A/B. With `PROSPER_RENDER_TIMING=1`,
+the backend and submit-aligned windows report references, hits, misses, bypasses, current entries, and
+evictions. A pipeline hit also skips temporary Vulkan shader-module creation.
+
 Do not cache `build_stage_table` results using only shader addresses and user-SGPR values. Descriptor
 tables are reached through guest pointers, and their memory can change while every pointer/register
 value remains identical. That experiment caused Messenger to remain on its initial loading screen and
