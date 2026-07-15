@@ -1515,18 +1515,50 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             const bool refvs = getenv("PROSPER_RENDER_REFVS");
             std::vector<uint32_t> refvs_spv(kRefVs, kRefVs + sizeof(kRefVs) / 4);
             std::vector<uint32_t> ps_override;
+            bool ps_override_is_file = false;   // true only for a valid PROSPER_FS_SPV *file* override
             if (getenv("PROSPER_RENDER_TESTPS")) {
                 static const uint32_t kMagentaPs[] = {   // v0=1.0(R) v1=0.0(G) v2=1.0(B) v3=1.0(A); exp mrt0; endpgm
                     0x7E0002F2u, 0x7E020280u, 0x7E0402F2u, 0x7E0602F2u, 0xF800180Fu, 0x03020100u, 0xBF810000u };
                 ps_override = prosper::gpu::recompile_fragment(kMagentaPs, sizeof(kMagentaPs) / 4, nullptr);
             }
-            if (const char* fsp = getenv("PROSPER_FS_SPV")) {
-                if (FILE* f = fopen(fsp, "rb")) {
-                    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
-                    std::vector<uint32_t> m((size_t)sz / 4);
-                    if (sz >= 20 && fread(m.data(), 4, m.size(), f) == m.size()) ps_override = std::move(m);
-                    fclose(f);
+            // Validated SPIR-V file load: require a complete read of a word-aligned file >= 20 bytes
+            // (5 words: the minimum SPIR-V header). Validate size BEFORE allocating so a failed ftell
+            // (-1 -> huge size_t) cannot trigger a wild allocation, and reject non-word-aligned files
+            // rather than silently dropping trailing bytes. Returns false (out untouched) on any failure.
+            auto load_spv_file = [](const char* path, std::vector<uint32_t>& out) -> bool {
+                FILE* f = fopen(path, "rb");
+                if (!f) return false;
+                bool ok = false;
+                if (fseek(f, 0, SEEK_END) == 0) {
+                    long sz = ftell(f);
+                    if (sz >= 20 && (sz % 4) == 0 && fseek(f, 0, SEEK_SET) == 0) {
+                        std::vector<uint32_t> m(static_cast<size_t>(sz) / 4);
+                        if (fread(m.data(), 4, m.size(), f) == m.size()) { out = std::move(m); ok = true; }
+                    }
                 }
+                fclose(f);
+                return ok;
+            };
+            if (const char* fsp = getenv("PROSPER_FS_SPV")) {
+                std::vector<uint32_t> m;
+                if (load_spv_file(fsp, m)) { ps_override = std::move(m); ps_override_is_file = true; }
+                else fprintf(stderr, "[fs-spv] PROSPER_FS_SPV='%s' invalid/unreadable -> no file override\n", fsp);
+            }
+            // PROSPER_FS_SPV_MATCH=<file>: restrict the PROSPER_FS_SPV *file* override to draws whose
+            // recompiled fragment SPIR-V EXACTLY equals this file (a per-draw A/B substitution that does
+            // not touch draws with a different descriptor contract). FAILS CLOSED: if requested but the
+            // file is missing/short/unaligned/unreadable, NO file override is applied — never a silent
+            // global fallback (that would recreate the exact hazard this gate exists to prevent). Does
+            // NOT gate PROSPER_RENDER_TESTPS, which stays global by design.
+            // mode: 0 = not requested (legacy global file override), 1 = loaded+valid (exact match only),
+            //       2 = requested but invalid (file override disabled).
+            int fs_match_mode = 0;
+            std::vector<uint32_t> fs_match;
+            if (const char* mp = getenv("PROSPER_FS_SPV_MATCH")) {
+                fs_match_mode = load_spv_file(mp, fs_match) ? 1 : 2;
+                if (fs_match_mode == 2)
+                    fprintf(stderr, "[fs-match] PROSPER_FS_SPV_MATCH='%s' invalid/unreadable -> applying NO "
+                            "fragment file override (fail closed)\n", mp);
             }
             const bool nops = getenv("PROSPER_RENDER_NOPS");
             // Assemble backend draws for a subset of the submit's items — one BackendDraw per realized
@@ -1539,9 +1571,19 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     const auto& it = *itp;
                     prosper::test::BackendDraw bd;
                     bd.vs     = refvs ? refvs_spv : it.vs;
-                    bd.fs     = ps_override.empty() ? it.fs : ps_override;
+                    // The PROSPER_FS_SPV *file* override is match-gated; a TESTPS override is not.
+                    bool fs_ov = !ps_override.empty();
+                    if (fs_ov && ps_override_is_file) {
+                        if (fs_match_mode == 1)      fs_ov = (it.fs == fs_match);   // valid match -> exact only
+                        else if (fs_match_mode == 2) fs_ov = false;                // requested-but-invalid -> off
+                        // mode 0 -> legacy global file override (unchanged)
+                    }
+                    if (fs_ov && ps_override_is_file && fs_match_mode == 1)
+                        fprintf(stderr, "[fs-match] file override applied to draw#%llu\n",
+                                (unsigned long long)it.draw_index);
+                    bd.fs     = fs_ov ? ps_override : it.fs;
                     bd.vs_identity = refvs ? 0 : it.vs_identity;
-                    bd.fs_identity = ps_override.empty() ? it.fs_identity : 0;
+                    bd.fs_identity = fs_ov ? 0 : it.fs_identity;
                     bd.vcount = refvs ? 3u : it.vertex_count;
                     bd.ps     = nops ? nullptr : &it.ps;
                     bd.R      = build_R(it, it.vrt.get(), it.prt.get());
