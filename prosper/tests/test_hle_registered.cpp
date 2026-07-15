@@ -4,7 +4,9 @@
 // a representative set across every HLE module (libc, math, file, kernel, time, service, graphics).
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
+#include <atomic>
 #include <cstdio>
+#include <thread>
 
 using namespace prosper;
 
@@ -58,6 +60,28 @@ int main() {
         uint64_t v = fn(0, 0, 0, 0, 0, 0);
         if (v == 0) { printf("  [FAIL] getpid returned kernel-special pid 0\n"); fails++; }
     } else { printf("  [FAIL] not registered: getpid\n"); fails++; }
+
+    if (HleFn fn = Hle::lookup(nid_hash("scePthreadGetthreadid"))) {
+        const uint64_t main_id = fn(0, 0, 0, 0, 0, 0);
+        const uint64_t main_id_again = fn(0, 0, 0, 0, 0, 0);
+        std::atomic<uint64_t> worker_id{0};
+        std::atomic<uint64_t> worker_id_again{0};
+        std::thread worker([&] {
+            worker_id.store(fn(0, 0, 0, 0, 0, 0), std::memory_order_relaxed);
+            worker_id_again.store(fn(0, 0, 0, 0, 0, 0), std::memory_order_relaxed);
+        });
+        worker.join();
+        if (main_id == 0 || main_id != main_id_again) {
+            printf("  [FAIL] scePthreadGetthreadid is zero or unstable on the main thread\n");
+            fails++;
+        }
+        if (worker_id.load(std::memory_order_relaxed) == 0 ||
+            worker_id.load(std::memory_order_relaxed) != worker_id_again.load(std::memory_order_relaxed) ||
+            worker_id.load(std::memory_order_relaxed) == main_id) {
+            printf("  [FAIL] scePthreadGetthreadid does not distinguish concurrent threads\n");
+            fails++;
+        }
+    } else { printf("  [FAIL] not registered: scePthreadGetthreadid\n"); fails++; }
 
     if (fails) { printf("== FAIL: %d function(s) not registered ==\n", fails); return 1; }
     printf("== PASS: all %zu checked HLE functions registered ==\n", sizeof(names)/sizeof(names[0]) + 1);

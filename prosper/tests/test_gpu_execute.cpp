@@ -281,15 +281,28 @@ int main() {
     CHECK(!have_submit_renderer(), "no live renderer registered by default (game path stays inert)");
     CHECK(!execute_and_present(st, W, H), "execute_and_present is a no-op with no renderer registered");
     std::shared_ptr<const std::vector<uint8_t>> live_storage;
+    unsigned live_calls = 0;
     set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t w, uint32_t h) -> RenderedFrame {
         if (items.empty()) return {};
+        live_calls++;
         live_storage = std::make_shared<const std::vector<uint8_t>>(
             prosper::test::render_triangle_rgba(items[0].vs, items[0].fs, w, h, &items[0].ps));
         return RenderedFrame(live_storage);
     });
     CHECK(have_submit_renderer(), "live renderer registered");
     prosper::gpu::present_reset();
+    CHECK(!execute_ordered_and_present(st, W, H, 1, /*publish=*/false),
+          "ordered publication suppression reports no presented frame");
+    CHECK(live_calls == 1, "ordered publication suppression still executes the live renderer");
+    CHECK(!prosper::gpu::present_has_frame(),
+          "ordered publication suppression leaves the scanout path unchanged");
+    CHECK(!execute_and_present(st, W, H, /*publish=*/false),
+          "publication suppression reports no presented frame");
+    CHECK(live_calls == 2, "publication suppression still executes the live renderer");
+    CHECK(!prosper::gpu::present_has_frame(),
+          "publication suppression leaves the scanout path unchanged");
     CHECK(execute_and_present(st, W, H), "execute_and_present rendered + presented the submit");
+    CHECK(live_calls == 3, "normal publication executes the live renderer again");
     CHECK(prosper::gpu::present_has_frame(), "the presented submit frame reached the scanout path");
     std::vector<uint8_t> submit_scan((size_t)W * H * 4, 0);
     prosper::gpu::present_readback(submit_scan.data(), submit_scan.size());

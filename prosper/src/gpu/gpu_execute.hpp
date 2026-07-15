@@ -981,14 +981,17 @@ std::vector<uint8_t> render_submit_items(const std::vector<DrawItem>& items,
 bool execute_compute_items(const std::vector<ComputeItem>& items);
 
 // Render a folded GpuState at (width,height) via the registered live renderer and hand the frame to the
-// present path (present_write_frame). Returns true iff a frame was produced and presented. A no-op
+// present path (present_write_frame) when publish is true. Returns true iff a frame was produced and
+// published. With publish=false the renderer still executes all GPU work, but scanout remains unchanged.
+// A no-op
 // returning false when there is no renderer registered or the state has no draws — so it is inert on the
 // game path until the runtime wires a device, yet fully exercised by tests. Stage A of GPU_EXECUTOR_DESIGN.
-bool execute_and_present(const GpuState& st, uint32_t width, uint32_t height);
+bool execute_and_present(const GpuState& st, uint32_t width, uint32_t height,
+                         bool publish = true);
 
 // Execute retained graphics and compute work in PM4 order. Graphics spans share the frontend's
 // persistent render-target cache, and only the final span is handed to the present path.
 bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t height,
-                                 uint64_t submit_no = 0);
+                                 uint64_t submit_no = 0, bool publish = true);
 
 } // namespace prosper::gpu

@@ -1107,7 +1107,17 @@ static bool execute_submit_work(gpu::GpuState& st, uint64_t submit_no, unsigned&
     // resources, then retire completion only after the ordered mixed timeline has finished.
     gpu::flush_deferred_streams();
     prosper_gpu_drain_completion_writes();
-    const bool presented = gpu::execute_ordered_and_present(st, w, h, submit_no);
+    // PROSPER_PRESENT_EVERY=N suppresses publication only. Unlike PROSPER_RENDER_EVERY, every
+    // graphics/compute operation still executes and persistent targets advance on every submit.
+    // Publish the first eligible frame, then one in every N so a consumer gets an image promptly.
+    static const unsigned present_every = [] {
+        const char* e = getenv("PROSPER_PRESENT_EVERY");
+        long v = e ? atol(e) : 1;
+        return v > 0 ? (unsigned)v : 1u;
+    }();
+    static uint64_t publication_candidates = 0;
+    const bool publish = (publication_candidates++ % present_every) == 0;
+    const bool presented = gpu::execute_ordered_and_present(st, w, h, submit_no, publish);
     if (presented) g_presents_cum++;
     if (presented && getenv("PROSPER_GFXLOG"))
         fprintf(stderr, "[agc] SubmitDcb #%llu: executed %zu draws -> presented %ux%u frame\n",

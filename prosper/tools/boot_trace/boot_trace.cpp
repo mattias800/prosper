@@ -222,14 +222,19 @@ int main(int argc, char** argv) {
 
 #ifdef PROSPER_HAVE_VULKAN
     // Compute is part of command submission even when frame rendering/dumping is disabled.
-    prosper::frontend::register_live_compute();
+    // PROSPER_NO_COMPUTE=1 is a progression diagnostic only: semantic timelines still retain the
+    // dispatches, but neither graphics nor compute mutates guest GPU resources. This distinguishes
+    // host compute throughput from guest/HLE progression; it is never a correctness mode.
+    if (!getenv("PROSPER_NO_COMPUTE")) prosper::frontend::register_live_compute();
     // PROSPER_RENDER=1: register the live Vulkan renderer (shared with prosper-app via
     // frontends/shared/live_renderer) so execute_and_present composites every submitted Dcb with
     // draws and hands the frame to the present path; periodic BMP screenshots go to PROSPER_FRAME_DIR
-    // (default cwd). llvmpipe renders headless in WSL.
+    // (default cwd). Set PROSPER_NO_FRAME_DUMPS=1 for renderer-equivalence diagnostics without that
+    // boot_trace-only disk I/O. llvmpipe renders headless in WSL.
     if (getenv("PROSPER_RENDER")) {
         std::string fdir = getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".";
-        prosper::frontend::register_live_renderer(fdir, /*dump_bmps=*/true);
+        const bool dump_bmps = getenv("PROSPER_NO_FRAME_DUMPS") == nullptr;
+        prosper::frontend::register_live_renderer(fdir, dump_bmps);
     }
 #endif
 

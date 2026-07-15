@@ -4,10 +4,12 @@
 #include "nid.hpp"
 #include <pthread.h>
 #include <chrono>
-#ifndef _WIN32
+#if defined(__linux__)
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>   // process_vm_readv (slot-echo scan, issue #180)
+#elif defined(_WIN32)
+#include <windows.h>
 #endif
 #include <cstdint>
 #include <cstdlib>
@@ -335,10 +337,18 @@ HLE(k_debug_raise_release) {
     fflush(nullptr);
     _Exit(0x66);
 }
-#ifndef _WIN32
+#if defined(__APPLE__)
+HLE(k_getthreadid) {
+    uint64_t tid = 0;
+    return pthread_threadid_np(nullptr, &tid) == 0 ? tid : 0;
+} // scePthreadGetthreadid
+#elif defined(__linux__)
 HLE(k_getthreadid) { return (uint64_t)syscall(SYS_gettid); }   // scePthreadGetthreadid
 #else
-HLE(k_getthreadid) { return 1; }
+// The guest uses this as an ownership/current-thread identity, so a process-wide constant makes every
+// guest pthread appear to be the same thread. Windows thread IDs are stable for a live thread and unique
+// among concurrently running threads, matching the observable contract of Linux gettid here.
+HLE(k_getthreadid) { return (uint64_t)GetCurrentThreadId(); }
 #endif
 // sceKernelAprResolveFilepathsToIdsAndFileSizes — PS5 APR (async page read) IO path. Signature
 // unconfirmed; a garbage-out "success" poisons the engine's file table, so fail cleanly and let

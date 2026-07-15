@@ -1,15 +1,27 @@
 # Dead Cells graphics status and regression workflow
 
-Last updated: 2026-07-14
+Last updated: 2026-07-15
 
 The operational route and selector reference is
 [`../scripts/dead-cells/README.md`](../scripts/dead-cells/README.md). The gameplay-composition bug
 [#566](https://github.com/mattias800/ps5ys/issues/566) was fixed by #626; this document retains the exact
 checkpoint recipe as a regression and future-investigation workflow.
+The current full-render progression investigation and its behavior-equivalence rows are documented in
+[`DEAD_CELLS_PROGRESSION_MATRIX.md`](DEAD_CELLS_PROGRESSION_MATRIX.md) and tracked by
+[#723](https://github.com/mattias800/ps5ys/issues/723). The former native-Windows render-disabled divergence is
+tracked by [#768](https://github.com/mattias800/ps5ys/issues/768).
 
 ## Current state
 
-*Dead Cells* boots, passes the splash and menus, loads `PrisonStart`, and reaches the controllable Jump tutorial.
+*Dead Cells* boots, passes the splash and menus, and loads `PrisonStart`. WSL/Linux native-speed and sampled-graphics
+routes reach the controllable Jump tutorial and have supplied full-color gameplay captures. Native Windows now also
+reaches the sustained 92-94 draw / 8-dispatch gameplay state in the no-GPU-work progression control. #768's former
+356-390-draw loop was not a renderer stall: `sceSaveDataDialogUpdateStatus` was unimplemented and returned `NONE`
+more than a thousand times while the game waited for `FINISHED`. The separate full synchronous-render throughput
+and progression gap remains #723. After renderer PRs #767 and #769, the native-Windows compute-enabled,
+render-disabled control also reaches the sustained gameplay signature; its earlier first-dispatch process exit is
+not reproducible on current `master`.
+
 The scene renders in full color, including geometry, lighting, smoke, silhouettes, the player, terrain, effects,
 the tutorial prompt, and the HUD. The final grayscale-world root cause was the fragment recompiler selecting the
 first color export from shaders that emit MRT3..MRT0; MRT0 now feeds the backend's single color attachment (#626).

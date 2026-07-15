@@ -9,11 +9,18 @@ PROSPER_PAD_SCRIPT=@scripts/dead-cells/reach-first-gameplay.pad \
   --warmup-seconds 35 --seconds 1 --count 5 --timeout 65 --out shots
 ```
 
+For progression investigations, use
+[`progression-matrix.ps1`](progression-matrix.ps1) and read
+[`../../docs/DEAD_CELLS_PROGRESSION_MATRIX.md`](../../docs/DEAD_CELLS_PROGRESSION_MATRIX.md). It compares
+full-render headless and SDL-app runs against full-execution sparse publication, sampled graphics, and
+no-graphics diagnostics with isolated saves and the same semantic gameplay selector.
+
 ## Routes
 
 - `reach-first-gameplay.pad`: selects Play/slot 1, starts `PrisonStart`, and
   holds Circle through the skippable opening. It was verified from fresh save
-  roots on current master and reaches the controllable Jump tutorial. The
+  roots under WSL/Linux and native Windows and reaches the controllable Jump tutorial. The former Windows-only
+  post-`PARSEALL` wait was the SaveDataDialog lifecycle bug tracked in #768. The
   route is wall-clock anchored because Dead Cells submits tens of thousands of
   loading flips before the menu.
 - `reach-first-gameplay-full-render.pad`: performs the same route with input
@@ -22,7 +29,9 @@ PROSPER_PAD_SCRIPT=@scripts/dead-cells/reach-first-gameplay.pad \
   warmup. Circle remains held through 240 seconds because synchronous rendering
   has made `PARSEALL` take from about 60 to more than 160 seconds across measured
   builds. The route now survives that throughput variance, but the gameplay
-  snapshot baseline remains pending until its retained frames are reviewed.
+  snapshot baseline remains pending until its retained frames are reviewed. Current master reaches
+  `PrisonStart` and finishes `PARSEALL`, but the full synchronous-render route remains on the loading
+  screen under the measured timeout (#723); do not conflate it with the sampled route below.
 - `reach-first-gameplay-capture.pad`: uses the same menu input but holds Circle from
   28 through 300 seconds. Use it when synchronous timeline/bundle capture begins during
   level loading; the ordinary six-second hold can expire while capture stalls GPU progress.
@@ -56,7 +65,7 @@ and the full HUD. Nearby cinematic and transition captures were outside this con
 
 Treat that conjunction as a preserved-capture recipe only.
 
-### Current timeline-v6 checkpoint (#594)
+### Historical WSL timeline-v6 checkpoint (#594)
 
 Two independent 90-second native-speed routes selected sustained gameplay from about 29.5 seconds onward with
 this conjunction, despite different submit ordinals:
@@ -80,6 +89,18 @@ large capsule or bundle:
 
 The adjacent target indices 79 and 83, exact 90-draw count, and dispatch counts 7 and 9 all produced zero
 matches. The live selector reproduced the offline result and installed a gameplay capsule at its first match.
+
+### Current native-Windows progression checkpoint (#768)
+
+Current native-Windows timelines use a different target layout from the historical WSL capture. The progression
+matrix selects the sustained gameplay workload with:
+
+```text
+target 636x420, target draw index 77:85, total draws 91:94, dispatches 8
+```
+
+On current `master` this selector matches with live compute enabled and disabled. It is a semantic progression
+check only, not a pixel oracle; use the inspected full-render snapshot workflow for visual regression decisions.
 
 The faithful playable reference on #608 retained 883 submits; its `5759c125812154dc` hash is historical to the
 pre-#611/#615 renderer. A two-submit color-bounded replay still renders `71b84bdfae53933c`. Use
