@@ -8,11 +8,13 @@
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>   // process_vm_readv (slot-echo scan, issue #180)
+#include <sys/mman.h>  // mprotect (the #707 decoy page guard, PR #753)
 #endif
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <cerrno>
 #include <atomic>
 #include <ctime>
 #include <deque>
@@ -60,6 +62,18 @@ namespace {
     // these six extend the sig-watched window 384 bytes downward. Never locked; layout ballast.
     std::mutex g_eq_decoy_lo0, g_eq_decoy_lo1, g_eq_decoy_lo2,
                g_eq_decoy_lo3, g_eq_decoy_lo4, g_eq_decoy_lo5;
+    // --- #707 sacrificial decoy PAGE (PROSPER_EQ_PAGEGUARD=1; PR #753 round 5). Round 4 proved
+    // the corruptor zeroes the whole __DATA mutex-cluster REGION, engulfing any object added to
+    // it — so give it a page-aligned, page-sized, never-locked sacrifice inside the region and
+    // mprotect it PROT_READ. Nothing legitimate ever touches these bytes, so the FIRST zeroing
+    // store faults with a clean writer RIP and none of the deadlock risk that killed guarding the
+    // live shared page (hot mutexes + condvar). The fault handler (exec_image fault_handler)
+    // reports rip + guest return addresses, lifts the protection, and resumes: the decoys are
+    // sacrificial and the run continues. alignas(4096) + sizeof >= 4096 means the first page
+    // belongs entirely to this object.
+    struct alignas(4096) EqDecoyPage { std::mutex m[128]; };   // >= 4 KiB on both glibc and Darwin
+    EqDecoyPage g_eq_decoy_page;
+    std::atomic<bool> g_eq_pageguard_armed{false};
     DetClockState g_det_clock;
 
     uint64_t det_clock_fps() {
@@ -536,6 +550,36 @@ namespace {
         std::thread(eq_sigwatch_thread, repair).detach();
     }
 
+    // #707 decoy-page guard arming (PR #753 round 5; no-op unless PROSPER_EQ_PAGEGUARD is set and
+    // never on Windows). PROT_READ the sacrificial page so the region-zeroing corruptor's first
+    // store into it faults with a clean RIP; the fault handler reports, lifts the protection, and
+    // resumes (see prosper_eq_decoy_page_range below and exec_image's fault_handler).
+    void eq_pageguard_maybe_arm() {
+#ifndef _WIN32
+        static const char* mode = getenv("PROSPER_EQ_PAGEGUARD");
+        if (!mode) return;
+        static std::atomic<bool> once{false};
+        if (once.exchange(true)) return;
+        void* pg = (void*)&g_eq_decoy_page;
+        if (mprotect(pg, 4096, PROT_READ) == 0) {
+            g_eq_pageguard_armed.store(true, std::memory_order_release);
+            fprintf(stderr, "[eq-pageguard] armed: decoy page %p PROT_READ (4096 bytes)\n", pg);
+        } else {
+            fprintf(stderr, "[eq-pageguard] mprotect(%p) FAILED errno=%d — guard inactive\n", pg, errno);
+            return;
+        }
+        // Known-answer validation (=selftest): simulate the corruptor with a delayed in-process
+        // zeroing of the guarded page. Expect one [eq-pageguard] CORRUPTOR report (host rip) from
+        // the fault handler, then the survival line — proving trap, report, lift, and resume all
+        // work before trusting a silent real run.
+        if (strcmp(mode, "selftest") == 0) std::thread([] {
+            struct timespec ts{ 2, 0 }; nanosleep(&ts, nullptr);
+            memset((void*)&g_eq_decoy_page, 0, 256);
+            fprintf(stderr, "[eq-pageguard] selftest write survived (report should precede this)\n");
+        }).detach();
+#endif
+    }
+
     std::shared_ptr<EqState> eq_find(uint64_t eq) {
         std::lock_guard<std::mutex> lk(g_eq_mx);
         auto it = g_eqs.find(eq);
@@ -595,8 +639,25 @@ namespace {
     void ensure_pump() {
         eq_canary_maybe_start();     // #707 diagnostics; no-ops unless their env vars are set
         eq_sigwatch_maybe_start();
+        eq_pageguard_maybe_arm();
         if (!g_pump_started.exchange(true)) std::thread(vblank_pump).detach();
     }
+}
+
+// #707 decoy-page guard classifier (PR #753 round 5) — called from exec_image's fault_handler on
+// SIGSEGV/SIGBUS, BEFORE any other fault interpretation. Async-signal-safe: atomics + one syscall.
+// A write fault inside the sacrificial RO decoy page IS the region-zeroing corruptor: lift the
+// protection (the decoys are sacrificial; the zeroing then completes harmlessly and the run
+// continues) and return 1 so the caller reports the faulting RIP + guest stack and resumes.
+extern "C" int prosper_eq_pageguard_classify(uint64_t addr) {
+    if (!g_eq_pageguard_armed.load(std::memory_order_acquire)) return 0;
+    uint64_t lo = (uint64_t)(uintptr_t)&g_eq_decoy_page;
+    if (addr < lo || addr >= lo + 4096) return 0;
+#ifndef _WIN32
+    mprotect((void*)(uintptr_t)lo, 4096, PROT_READ | PROT_WRITE);
+#endif
+    g_eq_pageguard_armed.store(false, std::memory_order_release);   // one-shot
+    return 1;
 }
 
 // Exposed to hle_graphics.cpp (sceVideoOut* flip/vblank event registration).

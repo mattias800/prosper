@@ -50,6 +50,8 @@ struct f_owner_ex { int type; pid_t pid; };
 #endif
 #endif
 
+extern "C" int prosper_eq_pageguard_classify(uint64_t);  // #707 decoy-page guard (hle_kernel_time.cpp)
+
 namespace prosper {
 
 namespace {
@@ -814,6 +816,43 @@ namespace {
     void fault_handler(int sig, siginfo_t* si, void* uctx) {
         // Emulate AMD-only SSE4a bitfield ops (insertq/extrq) that #UD on Intel hosts, then resume.
         if (sig == SIGILL && try_emulate_sse4a((ucontext_t*)uctx)) return;
+        // #707 decoy-page guard (PR #753 round 5): a write fault inside the sacrificial RO decoy
+        // page IS the region-zeroing corruptor. Checked FIRST — nothing legitimate touches that
+        // page, and on macOS the %fs emulation below must not swallow the fault. The classifier
+        // lifts the protection (sacrificial page; the run continues) and we report the writer:
+        // RIP, guest/host classification, and guest return addresses from the faulting stack.
+        // Raw syscalls only (may run on a guest-%fs thread).
+        if ((sig == SIGSEGV || sig == SIGBUS) &&
+            prosper_eq_pageguard_classify((uint64_t)(uintptr_t)si->si_addr)) {
+            auto gpg = PROSPER_GREGS((ucontext_t*)uctx);
+            uint64_t rip = (uint64_t)gpg[REG_RIP];
+            bool guest_rip = rip >= 0x400000000ull && rip < 0x620000000ull;
+            char b[192]; int n = snprintf(b, sizeof b,
+                "[eq-pageguard] CORRUPTOR rip=%s0x%llx writes 0x%llx tid=%ld — protection lifted, resuming\n",
+                guest_rip ? "guest:" : "host:", (unsigned long long)rip,
+                (unsigned long long)(uintptr_t)si->si_addr, (long)cur_tid());
+            syscall(SYS_write, 2, b, (size_t)n);
+            char ib[128]; int in_n = snprintf(ib, sizeof ib, "[eq-pageguard]   insn bytes:");
+            const uint8_t* ip = (const uint8_t*)(uintptr_t)rip;
+            for (int k = 0; k < 16 && probe_readable(rip + (uint64_t)k); k++)
+                in_n += snprintf(ib + in_n, sizeof ib - in_n, " %02x", ip[k]);
+            in_n += snprintf(ib + in_n, sizeof ib - in_n, "\n");
+            syscall(SYS_write, 2, ib, (size_t)in_n);
+            uint64_t rsp = (uint64_t)gpg[REG_RSP];
+            char sb[320]; int sn = snprintf(sb, sizeof sb, "[eq-pageguard]   guest-stack:");
+            int found = 0;
+            for (uint64_t p = rsp; p < rsp + 0x400 && found < 10; p += 8) {
+                if (!probe_readable(p)) break;
+                uint64_t ra = *(const uint64_t*)p;
+                if (ra >= 0x400000000ull && ra < 0x620000000ull) {
+                    sn += snprintf(sb + sn, sizeof sb - sn, " 0x%llx", (unsigned long long)ra);
+                    found++;
+                }
+            }
+            sn += snprintf(sb + sn, sizeof sb - sn, "\n");
+            syscall(SYS_write, 2, sb, (size_t)sn);
+            return;
+        }
 #ifdef __APPLE__
         // macOS/Rosetta: a guest `%fs:`-relative TLS access faults (fs base is 0). Redirect it to the
         // guest TCB (guest_TP + offset) and resume. Only fires when trap-mode TLS is active and the
