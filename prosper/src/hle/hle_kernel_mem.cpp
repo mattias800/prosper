@@ -7,6 +7,7 @@
 #include "nid.hpp"
 #include "sync_futex.hpp"   // shared futex wake + waiter registration (also used by the GPU's label wake)
 #include "../host/guest_memory_map.hpp"
+#include "../host/guest_write_watch.hpp"
 
 #if defined(__linux__) || defined(__APPLE__)
 #include "../host/posix_shim.hpp"
@@ -1472,6 +1473,8 @@ namespace {
             }
             g_dviews.push_back(std::move(tracked));
         }
+        host::guest_write_watch_notify_direct_mapping_added(
+            (uint64_t)(uintptr_t)guest, len, phys, win_page_prot(hp));
         if (sparse)
             MLOG("map_dmem sparse aligned view va=0x%llx len=0x%llx phys=0x%llx align=0x%llx\n",
                  (unsigned long long)(uintptr_t)guest, (unsigned long long)len,
@@ -1629,6 +1632,10 @@ namespace {
     // A released physical range can be allocated again while old virtual aliases still exist.
     // Zeroing the shared section at allocation time gives every alias the console's fresh-page view.
     void dmem_zero(uint64_t phys, uint64_t len) {
+        // A temporary physical-section alias bypasses protections installed on persistent guest
+        // aliases. Invalidate first so a recycled direct-memory allocation cannot retain a clean
+        // texture watch for bytes this zeroing operation is about to replace.
+        host::guest_write_watch_notify_physical_write(phys, len);
         HANDLE section = dmem_section();
         if (!section || !len || phys < kDmemBase || phys - kDmemBase > kDmemTotal ||
             len > kDmemTotal - (phys - kDmemBase)) return;
@@ -1690,9 +1697,18 @@ namespace {
     // first (succeeds only over an existing reservation) then MEM_RESERVE|MEM_COMMIT.
     void* win_commit(uint64_t hint, uint64_t len, int hp) {
         DWORD pp = win_page_prot(hp);
-        if (!hint) return VirtualAlloc(nullptr, (SIZE_T)len, MEM_RESERVE | MEM_COMMIT, pp);
-        if (void* p = VirtualAlloc((void*)hint, (SIZE_T)len, MEM_COMMIT, pp)) return p;
-        return VirtualAlloc((void*)hint, (SIZE_T)len, MEM_RESERVE | MEM_COMMIT, pp);
+        void* result = nullptr;
+        if (!hint) {
+            result = VirtualAlloc(nullptr, (SIZE_T)len, MEM_RESERVE | MEM_COMMIT, pp);
+        } else {
+            result = VirtualAlloc((void*)hint, (SIZE_T)len, MEM_COMMIT, pp);
+            if (!result)
+                result = VirtualAlloc((void*)hint, (SIZE_T)len, MEM_RESERVE | MEM_COMMIT, pp);
+        }
+        if (result)
+            host::guest_write_watch_notify_direct_mapping_added(
+                (uint64_t)(uintptr_t)result, len, (uint64_t)(uintptr_t)result, pp);
+        return result;
     }
     void* win_map_phys(uint64_t hint, uint64_t len, int hp, uint64_t phys, uint64_t align,
                        bool fixed) {
@@ -1729,27 +1745,42 @@ namespace {
         return (void*)(((uint64_t)raw + (align - 1)) & ~(align - 1));
     }
     bool win_protect(uint64_t addr, uint64_t len, int hp) {
+        // Update the alias registry before changing the OS protection so an overlapping watch first
+        // restores its old writable pages. Unrelated mappings leave existing watches armed.
+        host::guest_write_watch_notify_direct_mapping_protection(
+            addr, len, win_page_prot(hp));
         if (len && addr <= UINT64_MAX - len && sparse_dmem_view_overlaps(addr, addr + len)) {
             const uint64_t end = addr + len;
             uint64_t cursor = addr;
             while (cursor < end) {
                 MEMORY_BASIC_INFORMATION mbi{};
-                if (!VirtualQuery((const void*)(uintptr_t)cursor, &mbi, sizeof(mbi))) return false;
+                if (!VirtualQuery((const void*)(uintptr_t)cursor, &mbi, sizeof(mbi))) {
+                    host::guest_write_watch_notify_direct_mapping_removed(addr, len);
+                    return false;
+                }
                 const uint64_t region_end = std::min<uint64_t>(
                     end, (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize);
-                if (region_end <= cursor || mbi.State == MEM_FREE) return false;
+                if (region_end <= cursor || mbi.State == MEM_FREE) {
+                    host::guest_write_watch_notify_direct_mapping_removed(addr, len);
+                    return false;
+                }
                 if (mbi.State == MEM_COMMIT) {
                     DWORD old = 0;
                     if (!VirtualProtect((void*)(uintptr_t)cursor,
                                         (SIZE_T)(region_end - cursor),
-                                        win_page_prot(hp), &old)) return false;
+                                        win_page_prot(hp), &old)) {
+                        host::guest_write_watch_notify_direct_mapping_removed(addr, len);
+                        return false;
+                    }
                 }
                 cursor = region_end;
             }
             return true;
         }
         DWORD old = 0;
-        return VirtualProtect((void*)addr, (SIZE_T)len, win_page_prot(hp), &old) != 0;
+        const bool ok = VirtualProtect((void*)addr, (SIZE_T)len, win_page_prot(hp), &old) != 0;
+        if (!ok) host::guest_write_watch_notify_direct_mapping_removed(addr, len);
+        return ok;
     }
     // Shared section views must be released with UnmapViewOfFile. Anonymous/private mappings keep
     // the old partial-safe decommit behavior.
@@ -1767,9 +1798,11 @@ namespace {
             }
         }
         if (section_view) {
+            host::guest_write_watch_notify_direct_mapping_removed(addr, len);
             UnmapViewOfFile(section_view);
             return;
         }
+        host::guest_write_watch_notify_direct_mapping_removed(addr, len);
         VirtualFree((void*)addr, (SIZE_T)len, MEM_DECOMMIT);
     }
 } // namespace
