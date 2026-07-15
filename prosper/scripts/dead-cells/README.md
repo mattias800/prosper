@@ -29,9 +29,10 @@ no-graphics diagnostics with isolated saves and the same semantic gameplay selec
   warmup. Circle remains held through 240 seconds because synchronous rendering
   has made `PARSEALL` take from about 60 to more than 160 seconds across measured
   builds. The route now survives that throughput variance, but the gameplay
-  snapshot baseline remains pending until its retained frames are reviewed. Current master reaches
-  `PrisonStart` and finishes `PARSEALL`, but the full synchronous-render route remains on the loading
-  screen under the measured timeout (#723); do not conflate it with the sampled route below.
+  snapshot baseline remains pending until its retained frames are reviewed. Post-#766 native-Windows
+  validation executes and publishes every retained submit, completes `PARSEALL`, and first matches the
+  sustained gameplay semantic selector at 104.81 seconds. #723 is closed; the route remains much slower
+  than the render-disabled control, and the selector does not replace visual inspection.
 - `reach-first-gameplay-capture.pad`: uses the same menu input but holds Circle from
   28 through 300 seconds. Use it when synchronous timeline/bundle capture begins during
   level loading; the ordinary six-second hold can expire while capture stalls GPU progress.

@@ -4,9 +4,10 @@ Last updated: 2026-07-15
 
 This matrix separates guest progression from renderer output and frontend behavior. It exists because a
 native-speed or sampled-render run reaching `PrisonStart` does not prove that the full synchronous renderer
-reaches the same state. Track the current full-render stall in
+reaches the same state. The matrix localized and verified the fixes for the full-render stall in
 [#723](https://github.com/mattias800/ps5ys/issues/723) and the native-Windows render-disabled divergence in
-[#768](https://github.com/mattias800/ps5ys/issues/768).
+[#768](https://github.com/mattias800/ps5ys/issues/768); both issues are closed by the #766 lifecycle fix and its
+post-merge validation.
 
 ## Run It
 
@@ -41,7 +42,12 @@ Post-#767/#769 validation on 2026-07-15 reached the selector in both native-Wind
 disabled, the first match was at 28.35 seconds and the 38-second run contained 1,104 matches. With live compute
 enabled, the first match was at 30.67 seconds and the run remained alive through the same timeout. This establishes
 that SaveDataDialog progression is independent of rendering, while current compute execution no longer exits at
-its first live dispatch. It does not resolve the full synchronous-render throughput problem tracked by #723.
+its first live dispatch.
+
+The post-merge full-render row also reaches the same semantic gameplay state. In a 240-second run it completed
+`PARSEALL` in 22.94 seconds, first matched at 104.81 seconds, and produced 697 matches while executing and publishing
+every retained submit. This closes the progression question from #723. The much longer wall-clock route remains a
+renderer-throughput concern, and a semantic match still does not replace inspected pixel evidence.
 
 ## Rows And Semantics
 

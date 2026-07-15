@@ -6,21 +6,24 @@ The operational route and selector reference is
 [`../scripts/dead-cells/README.md`](../scripts/dead-cells/README.md). The gameplay-composition bug
 [#566](https://github.com/mattias800/ps5ys/issues/566) was fixed by #626; this document retains the exact
 checkpoint recipe as a regression and future-investigation workflow.
-The current full-render progression investigation and its behavior-equivalence rows are documented in
+The full-render progression investigation and its behavior-equivalence rows are documented in
 [`DEAD_CELLS_PROGRESSION_MATRIX.md`](DEAD_CELLS_PROGRESSION_MATRIX.md) and tracked by
-[#723](https://github.com/mattias800/ps5ys/issues/723). The former native-Windows render-disabled divergence is
-tracked by [#768](https://github.com/mattias800/ps5ys/issues/768).
+the now-closed [#723](https://github.com/mattias800/ps5ys/issues/723). The former native-Windows
+render-disabled divergence was tracked by the now-closed
+[#768](https://github.com/mattias800/ps5ys/issues/768).
 
 ## Current state
 
 *Dead Cells* boots, passes the splash and menus, and loads `PrisonStart`. WSL/Linux native-speed and sampled-graphics
-routes reach the controllable Jump tutorial and have supplied full-color gameplay captures. Native Windows now also
-reaches the sustained 92-94 draw / 8-dispatch gameplay state in the no-GPU-work progression control. #768's former
+routes reach the controllable Jump tutorial and have supplied full-color gameplay captures. Native Windows reaches
+the sustained 91-94 draw / 8-dispatch gameplay state both with rendering disabled and with every retained GPU submit
+fully executed and published. #768's former
 356-390-draw loop was not a renderer stall: `sceSaveDataDialogUpdateStatus` was unimplemented and returned `NONE`
-more than a thousand times while the game waited for `FINISHED`. The separate full synchronous-render throughput
-and progression gap remains #723. After renderer PRs #767 and #769, the native-Windows compute-enabled,
-render-disabled control also reaches the sustained gameplay signature; its earlier first-dispatch process exit is
-not reproducible on current `master`.
+more than a thousand times while the game waited for `FINISHED`. After #766, a 240-second native-Windows full-render
+control completed `PARSEALL` in 22.94 seconds, first matched gameplay at 104.81 seconds, and accumulated 697 matches.
+This closes #723's progression bug; synchronous renderer throughput remains performance work. After renderer PRs
+#767 and #769, the native-Windows compute-enabled, render-disabled control also reaches the sustained gameplay
+signature; its earlier first-dispatch process exit is not reproducible on current `master`.
 
 The scene renders in full color, including geometry, lighting, smoke, silhouettes, the player, terrain, effects,
 the tutorial prompt, and the HUD. The final grayscale-world root cause was the fragment recompiler selecting the
