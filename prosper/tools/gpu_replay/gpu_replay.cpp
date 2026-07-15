@@ -2,10 +2,12 @@
 #include "gpu/gpu_capture_bundle.hpp"
 #include "gpu/gpu_dependency_graph.hpp"
 #include "gpu/gpu_execute.hpp"
+#include "gpu/shader_resources.hpp"
 #include "live_renderer.hpp"
 #include "render_runner.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -40,11 +42,34 @@ void usage(const char* argv0) {
                          "[--bundle-zero-boundary] "
                          "[--prepend producer.prgcap] "
                          "[--dump-resource DRAW:vs|ps:BINDING PATH] [--allow-mismatch] "
+                         "[--dump-rtt-seed ADDR PATH] "
                          "[--dump-shader DRAW:vs|fs PATH] [--dump-compute N PATH] "
                          "[--dump-failed-shader FAILURE:STAGE PATH] "
                          "[--dump-compute-resource N:BINDING PATH] "
                          "[--legacy-htile-before-stencil] "
                          "<capture.prgcap> [output.bmp]\n", argv0);
+}
+
+std::vector<uint8_t> inspect_rtt_seed(const prosper::gpu::GpuCaptureRttSeed& seed) {
+    const size_t texels = static_cast<size_t>(seed.width) * seed.height;
+    if (seed.format == prosper::gpu::GpuCaptureColorFormat::Rgba8Unorm &&
+        seed.rgba.size() == texels * 4)
+        return seed.rgba;
+    if (seed.format != prosper::gpu::GpuCaptureColorFormat::Rgba16Float ||
+        seed.rgba.size() != texels * 8)
+        return {};
+
+    std::vector<uint8_t> rgba(texels * 4);
+    for (size_t texel = 0; texel < texels; ++texel) {
+        for (uint32_t channel = 0; channel < 4; ++channel) {
+            uint16_t half = 0;
+            std::memcpy(&half, seed.rgba.data() + texel * 8 + channel * 2, sizeof(half));
+            const float value = prosper::gpu::half_to_float(half);
+            rgba[texel * 4 + channel] = !std::isfinite(value) || value <= 0.0f ? 0
+                : value >= 1.0f ? 255 : static_cast<uint8_t>(value * 255.0f + 0.5f);
+        }
+    }
+    return rgba;
 }
 
 std::vector<uint8_t> execute_frame(const prosper::gpu::GpuReplayFrame& replay,
@@ -1051,12 +1076,14 @@ int main(int argc, char** argv) {
     std::string compute_shader_spec, compute_shader_path;
     std::string compute_resource_spec, compute_resource_path;
     std::string failed_shader_spec, failed_shader_path;
+    std::string rtt_seed_path;
     std::string graph_json_path, prepend_path;
     std::string bundle_path, bundle_compact_path;
     std::string bundle_final_capsule_path;
     std::string bundle_extract_submit_path;
     uint64_t bundle_extract_submit_no = 0;
     uint64_t bundle_find_ds_addr = 0;
+    uint64_t rtt_seed_addr = 0;
     std::vector<const char*> positional;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--inspect") inspect = true;
@@ -1123,6 +1150,12 @@ int main(int argc, char** argv) {
         else if (std::string(argv[i]) == "--dump-resource" && i + 2 < argc) {
             dump_spec = argv[++i]; dump_path = argv[++i];
         }
+        else if (std::string(argv[i]) == "--dump-rtt-seed" && i + 2 < argc) {
+            char* end = nullptr;
+            rtt_seed_addr = std::strtoull(argv[++i], &end, 0);
+            if (!end || *end || !rtt_seed_addr) { usage(argv[0]); return 2; }
+            rtt_seed_path = argv[++i];
+        }
         else if (std::string(argv[i]) == "--dump-shader" && i + 2 < argc) {
             shader_spec = argv[++i]; shader_path = argv[++i];
         }
@@ -1143,7 +1176,7 @@ int main(int argc, char** argv) {
         if (bundle_ds_summary && bundle_find_ds_addr) { usage(argv[0]); return 2; }
         if (positional.size() > 1 || inspect || inspect_only || validate_only || graph_only ||
             draw_first >= 0 || draw_with_compute_prefix || through_operation >= 0 ||
-            warmup_repeats || !dump_spec.empty() ||
+            warmup_repeats || !dump_spec.empty() || rtt_seed_addr ||
             !shader_spec.empty() || !compute_shader_spec.empty() ||
             !compute_resource_spec.empty() || !failed_shader_spec.empty() ||
             !prepend_path.empty()) {
@@ -1193,6 +1226,28 @@ int main(int argc, char** argv) {
     if (!prepend_path.empty() && prepend.metadata.submit_index >= replay.metadata.submit_index) {
         std::fprintf(stderr, "gpu_replay: predecessor submit must be earlier than consumer submit\n");
         return 2;
+    }
+    if (rtt_seed_addr) {
+        const auto seed = std::find_if(replay.rtt_seeds.begin(), replay.rtt_seeds.end(),
+            [&](const auto& candidate) { return candidate.guest_addr == rtt_seed_addr; });
+        if (seed == replay.rtt_seeds.end()) {
+            std::fprintf(stderr, "gpu_replay: RTT seed %016llx not found\n",
+                         static_cast<unsigned long long>(rtt_seed_addr));
+            return 2;
+        }
+        const std::vector<uint8_t> rgba = inspect_rtt_seed(*seed);
+        if (rgba.empty() || !prosper::test::dump_bmp(
+                rtt_seed_path.c_str(), rgba, seed->width, seed->height)) {
+            std::fprintf(stderr, "gpu_replay: cannot write RTT seed %s\n",
+                         rtt_seed_path.c_str());
+            return 2;
+        }
+        std::fprintf(stderr,
+                     "[gpureplay] dumped RTT seed %016llx %ux%u format=%s -> %s\n",
+                     static_cast<unsigned long long>(seed->guest_addr), seed->width, seed->height,
+                     seed->format == prosper::gpu::GpuCaptureColorFormat::Rgba16Float
+                         ? "rgba16f" : "rgba8",
+                     rtt_seed_path.c_str());
     }
     if (graph_only) {
         prosper::gpu::GpuDependencyGraph graph;

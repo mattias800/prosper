@@ -20,9 +20,11 @@
 #include <algorithm>
 #include <atomic>
 #include <bitset>
+#include <filesystem>
 #include <iterator>
 #include <mutex>
 #include <set>
+#include <tuple>
 #include <vector>
 #include <unordered_map>
 #ifdef _WIN32
@@ -485,6 +487,49 @@ std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const Sh
     return {};
 }
 
+void maybe_dump_successful_shader(ShaderProgramStage stage, const ShaderCompileKey& key,
+                                  const std::vector<uint32_t>& spirv) {
+    const char* directory = getenv("PROSPER_SHADER_DUMP_SUCCESS");
+    if (!directory || !*directory || key.code.empty() || spirv.empty()) return;
+
+    const uint64_t spirv_hash = gpu_capture_hash(
+        reinterpret_cast<const uint8_t*>(spirv.data()), spirv.size() * sizeof(uint32_t));
+    const uint64_t raw_hash = gpu_capture_hash(
+        reinterpret_cast<const uint8_t*>(key.code.data()), key.code.size() * sizeof(uint32_t));
+    static std::mutex dump_mutex;
+    static std::set<std::tuple<uint32_t, uint64_t, uint64_t>> dumped;
+    std::lock_guard lock(dump_mutex);
+    if (!dumped.emplace(static_cast<uint32_t>(stage), spirv_hash, raw_hash).second) return;
+
+    std::error_code ec;
+    std::filesystem::create_directories(directory, ec);
+    if (ec) {
+        fprintf(stderr, "[shader-dump] cannot create %s: %s\n", directory, ec.message().c_str());
+        return;
+    }
+    const char* tag = stage == ShaderProgramStage::Vertex ? "vs" : "ps";
+    char raw_path[1024], spirv_path[1024];
+    snprintf(raw_path, sizeof(raw_path), "%s/success_%s_%016llx_%016llx.bin", directory, tag,
+             static_cast<unsigned long long>(spirv_hash),
+             static_cast<unsigned long long>(raw_hash));
+    snprintf(spirv_path, sizeof(spirv_path), "%s/success_%s_%016llx_%016llx.spv", directory, tag,
+             static_cast<unsigned long long>(spirv_hash),
+             static_cast<unsigned long long>(raw_hash));
+    FILE* raw = fopen(raw_path, "wb");
+    FILE* translated = fopen(spirv_path, "wb");
+    const size_t raw_bytes = key.code.size() * sizeof(uint32_t);
+    const size_t spirv_bytes = spirv.size() * sizeof(uint32_t);
+    const bool ok = raw && translated &&
+        fwrite(key.code.data(), 1, raw_bytes, raw) == raw_bytes &&
+        fwrite(spirv.data(), 1, spirv_bytes, translated) == spirv_bytes;
+    if (raw) fclose(raw);
+    if (translated) fclose(translated);
+    fprintf(stderr, "[shader-dump] %s spv=%016llx raw=%016llx words=%zu/%zu result=%s\n", tag,
+            static_cast<unsigned long long>(spirv_hash),
+            static_cast<unsigned long long>(raw_hash), key.code.size(), spirv.size(),
+            ok ? "written" : "failed");
+}
+
 } // namespace
 
 ShaderDecodeCacheStats shader_decode_cache_stats() {
@@ -518,7 +563,9 @@ std::vector<uint32_t> recompile_graphics_shader_cached(ShaderProgramStage stage,
             std::lock_guard lock(cache.mutex);
             ++cache.stats.bypasses;
         }
-        return compile_graphics_shader(stage, key, resources);
+        std::vector<uint32_t> spirv = compile_graphics_shader(stage, key, resources);
+        maybe_dump_successful_shader(stage, key, spirv);
+        return spirv;
     }
 
     auto& cache = shader_cache();
@@ -528,11 +575,13 @@ std::vector<uint32_t> recompile_graphics_shader_cached(ShaderProgramStage stage,
         ++cache.stats.hits;
         found->second.last_use = ++cache.use_counter;
         if (cache_identity) *cache_identity = found->second.identity;
+        maybe_dump_successful_shader(stage, key, found->second.spirv);
         return found->second.spirv;
     }
 
     const auto start = std::chrono::steady_clock::now();
     std::vector<uint32_t> spirv = compile_graphics_shader(stage, key, resources);
+    maybe_dump_successful_shader(stage, key, spirv);
     const auto end = std::chrono::steady_clock::now();
     ++cache.stats.misses;
     cache.stats.compile_ms += std::chrono::duration<double, std::milli>(end - start).count();

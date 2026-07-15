@@ -50,6 +50,19 @@ byte-identical at `13b4ccdfa15b1f4d` (BMP SHA-256
 `6a4e88dbc163d6075b18b768b20d91cfb6467c76e61af6798e22ec6ea3d2c53c`). Live Windows validation found no
 remaining composition artifacts; localized banding in the window light is tracked separately in #781.
 
+The #781 investigation localized that remaining window-light pattern without finding a justified renderer
+change. In the deterministic `13b4ccdfa15b1f4d` capsule, compute operation 19 resets the FP16 lighting target,
+draws 17..22 build it, and draw 23 composites it with the base/history inputs. Draw 19 is the window light
+(pixel shader `35956264829da0c6`): a 69-vertex CPU-generated visibility polygon with additive blending. Its
+history input already contains the evolving rays, has uniform alpha, and builds progressively across
+producer-complete submit history. Disabling depth, forcing linear filtering on its history input, and changing
+its relevant varying to non-perspective interpolation did not change the output. Forcing linear filtering on
+draw 23's FP16 light input changed and softened the standalone image, but a matching live run retained the
+visible radial bands, so that override is not a fix. The successfully recompiled raw shader decodes to coherent
+radial-distance, visibility, and attenuation math, and its translated SPIR-V preserves that structure. Keep
+[#781](https://github.com/mattias800/ps5ys/issues/781) open, but do not spend more live-run time on it without a
+pixel-aligned hardware oracle or evidence of a generic error. The user judged the residual artifact low priority.
+
 Startup and progression are stable after implementing both AGC resource-registration output queries. The former
 success-only `QueryResourceRegistrationUserMemoryRequirements` stub left Dead Cells' stack value untouched and
 occasionally requested a multi-gigabyte texture-pool allocation (#660). A native-speed fresh-save matrix improved
