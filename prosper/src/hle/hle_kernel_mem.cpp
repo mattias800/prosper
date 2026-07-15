@@ -1192,6 +1192,7 @@ namespace {
     struct Mapping { uint64_t base, size; int prot; bool committed; char name[32]; };
     std::mutex g_mx;
     std::vector<Mapping> g_maps;
+    bool sparse_dmem_view_overlaps(uint64_t begin, uint64_t end);
     constexpr uint64_t kDmemBase  = 0x10000000;
     constexpr uint64_t kDmemTotal = 8ull * 1024 * 1024 * 1024;   // 8 GiB pool
     struct DMem { uint64_t start, end; int type; };
@@ -1251,12 +1252,14 @@ namespace {
         }
         g_dmem.swap(out);
     }
-    void track(uint64_t base, uint64_t size, int prot, bool committed, const char* nm) {
+    void track(uint64_t base, uint64_t size, int prot, bool committed, const char* nm,
+               bool host_readable = true) {
         std::lock_guard<std::mutex> lk(g_mx);
         Mapping m{ base, size, prot, committed, {0} };
         if (nm) { strncpy(m.name, nm, sizeof m.name - 1); }
         g_maps.push_back(m);
-        host::notify_guest_mapping_added(base, size, committed && (prot & 0x1));
+        host::notify_guest_mapping_added(base, size,
+                                         committed && host_readable && (prot & 0x1));
     }
     void untrack(uint64_t base, uint64_t len) {
         if (!len) return;
@@ -1276,7 +1279,10 @@ namespace {
     void retrack_prot(uint64_t base, uint64_t len, int prot, const char* nm) {
         if (!len) return;
         untrack(base, len);
-        track(base, len, prot, true, nm);
+        // Sparse protection overlays remain submit-local; fully committed mappings retain the
+        // generation-guarded cross-submit readability optimization from #737.
+        track(base, len, prot, true, nm,
+              base <= UINT64_MAX - len && !sparse_dmem_view_overlaps(base, base + len));
     }
     const Mapping* find(uint64_t addr) {
         std::lock_guard<std::mutex> lk(g_mx);
@@ -1335,9 +1341,65 @@ namespace {
         uint64_t phys;
         void* view_base;
         uint64_t view_size;
+        bool sparse;
     };
     std::mutex g_dview_mx;
     std::vector<DmemView> g_dviews;
+
+    using VirtualAlloc2Fn = PVOID (WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG,
+                                            MEM_EXTENDED_PARAMETER*, ULONG);
+    using MapViewOfFile3Fn = PVOID (WINAPI*)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T,
+                                             ULONG, ULONG, MEM_EXTENDED_PARAMETER*, ULONG);
+
+    struct PlaceholderApis {
+        VirtualAlloc2Fn virtual_alloc2 = nullptr;
+        MapViewOfFile3Fn map_view_of_file3 = nullptr;
+    };
+
+    const PlaceholderApis& placeholder_apis() {
+        static const PlaceholderApis apis = [] {
+            HMODULE module = GetModuleHandleW(L"kernelbase.dll");
+            if (!module) module = GetModuleHandleW(L"kernel32.dll");
+            PlaceholderApis out;
+            if (module) {
+                out.virtual_alloc2 = reinterpret_cast<VirtualAlloc2Fn>(
+                    GetProcAddress(module, "VirtualAlloc2"));
+                out.map_view_of_file3 = reinterpret_cast<MapViewOfFile3Fn>(
+                    GetProcAddress(module, "MapViewOfFile3"));
+            }
+            return out;
+        }();
+        return apis;
+    }
+
+    void* map_sparse_aligned_section_view(HANDLE section, uint64_t file_off,
+                                          uint64_t view_size, uint64_t align) {
+        const PlaceholderApis& apis = placeholder_apis();
+        if (!apis.virtual_alloc2 || !apis.map_view_of_file3 ||
+            align < kWinAllocationGranularity || (align & (align - 1))) return nullptr;
+
+        MEM_ADDRESS_REQUIREMENTS requirements{};
+        requirements.Alignment = static_cast<SIZE_T>(align);
+        MEM_EXTENDED_PARAMETER parameter{};
+        parameter.Type = MemExtendedParameterAddressRequirements;
+        parameter.Pointer = &requirements;
+        void* placeholder = apis.virtual_alloc2(
+            GetCurrentProcess(), nullptr, static_cast<SIZE_T>(view_size),
+            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, &parameter, 1);
+        if (!placeholder) return nullptr;
+
+        void* view = apis.map_view_of_file3(
+            section, GetCurrentProcess(), placeholder, file_off,
+            static_cast<SIZE_T>(view_size), MEM_REPLACE_PLACEHOLDER,
+            PAGE_READWRITE, nullptr, 0);
+        if (!view) {
+            const DWORD error = GetLastError();
+            VirtualFree(placeholder, 0, MEM_RELEASE);
+            SetLastError(error);
+            return nullptr;
+        }
+        return view;
+    }
 
     void* map_section_view(uint64_t hint, uint64_t len, int hp, uint64_t phys, uint64_t align) {
         HANDLE section = dmem_section();
@@ -1359,26 +1421,38 @@ namespace {
             requested = (void*)(uintptr_t)(hint - delta);
         }
 
-        void* view = MapViewOfFileEx(section, FILE_MAP_ALL_ACCESS,
-                                     (DWORD)(file_off >> 32), (DWORD)(file_off & 0xffffffffu),
-                                     (SIZE_T)view_size, requested);
+        const uint64_t requested_align = align ? align : 0x4000;
+        bool sparse = false;
+        void* view = nullptr;
+        // MapViewOfFileEx only chooses a 64 KiB-aligned base. A zero-hint title requesting a
+        // larger alignment needs a placeholder reservation with explicit address requirements.
+        // Keep the SEC_RESERVE pages uncommitted here; first CPU/GPU access materializes 16 KiB.
+        if (!hint && requested_align > kWinAllocationGranularity &&
+            (delta & (requested_align - 1)) == 0) {
+            view = map_sparse_aligned_section_view(section, file_off, view_size, requested_align);
+            sparse = view != nullptr;
+        }
+        if (!view) {
+            view = MapViewOfFileEx(section, FILE_MAP_ALL_ACCESS,
+                                   (DWORD)(file_off >> 32), (DWORD)(file_off & 0xffffffffu),
+                                   (SIZE_T)view_size, requested);
+        }
         if (!view) return nullptr;
         uint8_t* guest = (uint8_t*)view + delta;
 
-        const uint64_t requested_align = align ? align : 0x4000;
         if (!hint && requested_align &&
             ((uint64_t)(uintptr_t)guest & (requested_align - 1)) != 0) {
             UnmapViewOfFile(view);
             return nullptr;
         }
-        if (!VirtualAlloc(guest, (SIZE_T)len, MEM_COMMIT, PAGE_READWRITE)) {
+        if (!sparse && !VirtualAlloc(guest, (SIZE_T)len, MEM_COMMIT, PAGE_READWRITE)) {
             MLOG("section commit va=0x%llx len=0x%llx failed error=%lu\n",
                  (unsigned long long)(uintptr_t)guest, (unsigned long long)len, GetLastError());
             UnmapViewOfFile(view);
             return nullptr;
         }
         DWORD old = 0;
-        if (!VirtualProtect(guest, (SIZE_T)len, win_page_prot(hp), &old)) {
+        if (!sparse && !VirtualProtect(guest, (SIZE_T)len, win_page_prot(hp), &old)) {
             MLOG("section protect va=0x%llx len=0x%llx failed error=%lu\n",
                  (unsigned long long)(uintptr_t)guest, (unsigned long long)len, GetLastError());
             UnmapViewOfFile(view);
@@ -1386,9 +1460,95 @@ namespace {
         }
         {
             std::lock_guard<std::mutex> lk(g_dview_mx);
-            g_dviews.push_back({ (uint64_t)(uintptr_t)guest, len, phys, view, view_size });
+            g_dviews.push_back({ (uint64_t)(uintptr_t)guest, len, phys, view, view_size, sparse });
         }
+        if (sparse)
+            MLOG("map_dmem sparse aligned view va=0x%llx len=0x%llx phys=0x%llx align=0x%llx\n",
+                 (unsigned long long)(uintptr_t)guest, (unsigned long long)len,
+                 (unsigned long long)phys, (unsigned long long)requested_align);
         return guest;
+    }
+
+    bool sparse_dmem_view_contains(uint64_t begin, uint64_t end, DmemView* out = nullptr) {
+        if (begin >= end) return false;
+        std::lock_guard<std::mutex> lk(g_dview_mx);
+        for (const DmemView& view : g_dviews) {
+            if (!view.sparse || begin < view.guest_base ||
+                end > view.guest_base + view.guest_size) continue;
+            if (out) *out = view;
+            return true;
+        }
+        return false;
+    }
+
+    bool sparse_dmem_view_overlaps(uint64_t begin, uint64_t end) {
+        if (begin >= end) return false;
+        std::lock_guard<std::mutex> lk(g_dview_mx);
+        for (const DmemView& view : g_dviews)
+            if (view.sparse && begin < view.guest_base + view.guest_size &&
+                end > view.guest_base) return true;
+        return false;
+    }
+
+    bool tracked_mapping_access(uint64_t begin, uint64_t end, bool write, int& hp) {
+        if (begin >= end) return false;
+        std::lock_guard<std::mutex> lk(g_mx);
+        const Mapping* best = nullptr;
+        for (const Mapping& mapping : g_maps) {
+            if (!mapping.committed || begin < mapping.base ||
+                begin >= mapping.base + mapping.size) continue;
+            if (!best || mapping.base > best->base) best = &mapping;
+        }
+        if (!best || end > best->base + best->size || !(best->prot & HP_R) ||
+            (write && !(best->prot & HP_W))) return false;
+        hp = best->prot;
+        return true;
+    }
+
+    int commit_sparse_dmem(uint64_t addr, uint64_t len, bool write) {
+        if (!len || addr > UINT64_MAX - len ||
+            !sparse_dmem_view_contains(addr, addr + len)) return 0;
+        int hp = 0;
+        if (!tracked_mapping_access(addr, addr + len, write, hp)) return 0;
+        const uint64_t first = addr & ~0x3fffull;
+        const uint64_t last = (addr + len - 1) & ~0x3fffull;
+        uint64_t page = first;
+        for (;;) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (!VirtualQuery((const void*)(uintptr_t)page, &mbi, sizeof(mbi))) return 0;
+            if (mbi.State != MEM_COMMIT) {
+                if (!VirtualAlloc((void*)(uintptr_t)page, 0x4000, MEM_COMMIT,
+                                  win_page_prot(hp))) {
+                    MLOG("sparse dmem commit va=0x%llx failed error=%lu\n",
+                         (unsigned long long)page, GetLastError());
+                    return 0;
+                }
+            } else {
+                const DWORD blocked = PAGE_NOACCESS | PAGE_GUARD;
+                const DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                                       PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                                       PAGE_EXECUTE_WRITECOPY;
+                const DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY |
+                                       PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+                if ((mbi.Protect & blocked) || !(mbi.Protect & readable) ||
+                    (write && !(mbi.Protect & writable))) return 0;
+                const uint64_t region_end = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+                if (region_end > last) break;
+                if (region_end <= page) return 0;
+                page = (region_end + 0x3fff) & ~0x3fffull;
+                continue;
+            }
+            if (page == last) break;
+            page += 0x4000;
+        }
+        return 1;
+    }
+
+    bool sparse_dmem_page_uncommitted(uint64_t addr) {
+        if (!sparse_dmem_view_contains(addr, addr + 1)) return false;
+        MEMORY_BASIC_INFORMATION mbi{};
+        return VirtualQuery((const void*)(uintptr_t)addr, &mbi, sizeof(mbi)) &&
+               mbi.State != MEM_COMMIT;
     }
 
     // A released physical range can be allocated again while old virtual aliases still exist.
@@ -1494,6 +1654,25 @@ namespace {
         return (void*)(((uint64_t)raw + (align - 1)) & ~(align - 1));
     }
     bool win_protect(uint64_t addr, uint64_t len, int hp) {
+        if (len && addr <= UINT64_MAX - len && sparse_dmem_view_overlaps(addr, addr + len)) {
+            const uint64_t end = addr + len;
+            uint64_t cursor = addr;
+            while (cursor < end) {
+                MEMORY_BASIC_INFORMATION mbi{};
+                if (!VirtualQuery((const void*)(uintptr_t)cursor, &mbi, sizeof(mbi))) return false;
+                const uint64_t region_end = std::min<uint64_t>(
+                    end, (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize);
+                if (region_end <= cursor || mbi.State == MEM_FREE) return false;
+                if (mbi.State == MEM_COMMIT) {
+                    DWORD old = 0;
+                    if (!VirtualProtect((void*)(uintptr_t)cursor,
+                                        (SIZE_T)(region_end - cursor),
+                                        win_page_prot(hp), &old)) return false;
+                }
+                cursor = region_end;
+            }
+            return true;
+        }
         DWORD old = 0;
         return VirtualProtect((void*)addr, (SIZE_T)len, win_page_prot(hp), &old) != 0;
     }
@@ -1520,15 +1699,30 @@ namespace {
     }
 } // namespace
 
+// Materialize untouched zero pages in a sparse direct-memory view before a host-side read/write.
+// Returns 0 for an unrelated, inaccessible, or invalid range so callers retain their normal guard.
+extern "C" int prosper_try_commit_dmem(uint64_t addr, uint64_t len, int write) {
+    return commit_sparse_dmem(addr, len, write != 0);
+}
+
 // Fault-handler lazy-commit probe parity (Linux exports this for its SIGSEGV handler). The Windows
-// VEH uses this to back reserved guest pages on first touch: 0 = untracked, 1 = reserved, 2 = committed.
+// VEH uses this to back reserved guest pages on first touch: 0 = untracked, 1 = reserved,
+// 2 = committed, 3 = guest-committed sparse direct page awaiting host commitment.
 extern "C" int prosper_reserved_range_state(uint64_t addr) {
-    std::lock_guard<std::mutex> lk(g_mx);
-    const Mapping* best = nullptr;
-    for (auto& m : g_maps)
-        if (addr >= m.base && addr < m.base + m.size)
-            if (!best || m.base > best->base) best = &m;
-    return best ? (best->committed ? 2 : 1) : 0;
+    bool tracked = false;
+    bool committed = false;
+    {
+        std::lock_guard<std::mutex> lk(g_mx);
+        const Mapping* best = nullptr;
+        for (auto& m : g_maps)
+            if (addr >= m.base && addr < m.base + m.size)
+                if (!best || m.base > best->base) best = &m;
+        tracked = best != nullptr;
+        committed = best && best->committed;
+    }
+    if (!tracked) return 0;
+    if (!committed) return 1;
+    return addr != UINT64_MAX && sparse_dmem_page_uncommitted(addr) ? 3 : 2;
 }
 
 // --- Handlers: Win32 versions of the Linux memory HLE, same Sony contracts -------------------
@@ -1634,7 +1828,8 @@ HLE(k_map_dmem) {
     if (!p) { MLOG("map_dmem hint=0x%llx len=0x%llx FAILED\n",
                    (unsigned long long)hint, (unsigned long long)a1); return 0x8002000cull; }
     if (a0) *(uint64_t*)a0 = (uint64_t)p;
-    track((uint64_t)p, a1, host_prot(a2), true, "direct");
+    const bool sparse = sparse_dmem_view_contains((uint64_t)p, (uint64_t)p + a1);
+    track((uint64_t)p, a1, host_prot(a2), true, "direct", !sparse);
     MLOG("map_dmem -> 0x%llx len=0x%llx phys=0x%llx prot=0x%llx flags=0x%llx align=0x%llx\n",
          (unsigned long long)p, (unsigned long long)a1, (unsigned long long)a4,
          (unsigned long long)a2, (unsigned long long)a3, (unsigned long long)a5);
@@ -1679,7 +1874,12 @@ HLE(k_batch_map) {
             case 0: {                               // MAP_DIRECT: shared physical backing
                 void* p = win_map_phys(start, len, host_prot(prot), phys, 0, start != 0);
                 ok = (p != nullptr);
-                if (ok) track((uint64_t)p, len, host_prot(prot), true, "batch-direct");
+                if (ok) {
+                    const bool sparse = sparse_dmem_view_contains(
+                        (uint64_t)p, (uint64_t)p + len);
+                    track((uint64_t)p, len, host_prot(prot), true,
+                          "batch-direct", !sparse);
+                }
                 break;
             }
             case 3: {                               // MAP_FLEXIBLE: anonymous/private

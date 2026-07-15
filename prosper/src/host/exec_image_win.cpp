@@ -263,8 +263,9 @@ namespace {
     );
 
     // Tracked-mapping state probe for the lazy-commit fault path (defined in hle_kernel_mem.cpp):
-    // 0 = untracked/gap, 1 = reserved-but-uncommitted, 2 = committed.
+    // 0 = untracked/gap, 1 = reserved, 2 = committed, 3 = sparse direct-memory page.
     extern "C" int prosper_reserved_range_state(uint64_t addr);
+    extern "C" int prosper_try_commit_dmem(uint64_t addr, uint64_t len, int write);
 
     LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
         CONTEXT* c = ep->ContextRecord;
@@ -282,6 +283,10 @@ namespace {
         if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2 &&
             ep->ExceptionRecord->ExceptionInformation[0] != 8) {
             uint64_t a = (uint64_t)ep->ExceptionRecord->ExceptionInformation[1];
+            if (a >= 0x1000000000ull &&
+                prosper_try_commit_dmem(
+                    a, 1, ep->ExceptionRecord->ExceptionInformation[0] == 1))
+                return EXCEPTION_CONTINUE_EXECUTION;
             if (a >= 0x1000000000ull && prosper_reserved_range_state(a) == 1) {
                 void* page = (void*)(uintptr_t)(a & ~(uint64_t)0x3fff);
                 if (VirtualAlloc(page, 0x4000, MEM_COMMIT, PAGE_READWRITE))
