@@ -421,6 +421,16 @@ inline void invalidate_persistent_color_target(uint64_t id) {
         if (key.id == id) target.valid = false;
 }
 
+inline void invalidate_persistent_color_target_guest_write(uint64_t addr, uint64_t size) {
+    if (!addr || !size) return;
+    const uint64_t end = size > UINT64_MAX - addr ? UINT64_MAX : addr + size;
+    for (auto& [key, target] : persistent_color_target_cache()) {
+        const uint64_t bytes = static_cast<uint64_t>(key.width) * key.height * 4;
+        const uint64_t target_end = bytes > UINT64_MAX - key.id ? UINT64_MAX : key.id + bytes;
+        if (addr < target_end && key.id < end) target.valid = false;
+    }
+}
+
 inline void destroy_persistent_color_target(const RenderVkCtx& ctx,
                                             PersistentColorTargetImage& target) {
     if (target.view) vkDestroyImageView(ctx.dev, target.view, nullptr);
