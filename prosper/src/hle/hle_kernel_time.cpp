@@ -86,6 +86,15 @@ namespace {
     std::mutex g_eq_bigdecoy[384];   // 384 * 64B = 24 KiB = 6 pages; never locked; layout ballast+guard
     std::atomic<bool> g_eq_pageguard_armed{false};
     DetClockState g_det_clock;
+    // #707 round 8 (PR #753): quiet ballast ABOVE det. The async det-page guard loses its re-arm
+    // race, and det-step clashes with the macOS %fs emulation, ONLY because hot writers (g_eq_mx /
+    // g_apr_mx / vblank locks, pad recorder) share g_det_clock's page. With a page-plus of
+    // never-locked mutexes on EACH side (g_eq_bigdecoy below, this array above), det's page holds
+    // nothing legitimately written — so the guard can arm once at boot, PROT_READ, and STAY armed:
+    // no fault storm, no re-arm gap to race, and the FIRST fault on the page is the corruptor with
+    // a clean rbp-chain. 72 mutexes = 4.5 KiB on Darwin; declaration order keeps it between det
+    // and the hot cluster on macOS (verify with nm as usual).
+    std::mutex g_eq_ballast_hi[72];
 
     uint64_t det_clock_fps() {
         static const uint64_t fps = [] {
