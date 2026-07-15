@@ -58,6 +58,8 @@ struct DrawItem {
     // memory — the scene RT is never populated on the CPU side — and the frame is a black composite).
     uint64_t color0_base = 0;
     uint32_t color0_width = 0, color0_height = 0;
+    uint64_t color1_base = 0;
+    uint32_t color1_width = 0, color1_height = 0;
     uint64_t draw_index = 0;
     uint64_t command_order = 0;
 };
@@ -257,6 +259,9 @@ struct OperationRealizationFailure {
     uint64_t color0_base = 0;
     uint32_t color0_width = 0;
     uint32_t color0_height = 0;
+    uint64_t color1_base = 0;
+    uint32_t color1_width = 0;
+    uint32_t color1_height = 0;
     uint32_t vertex_count = 0;
     ComputeLaunchDimensions compute_launch;
     std::vector<ShaderRealizationDiagnostic> stages;
@@ -379,6 +384,9 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         failure->color0_base = rs.color0_base;
         failure->color0_width = rs.color0_width;
         failure->color0_height = rs.color0_height;
+        failure->color1_base = rs.color1_base;
+        failure->color1_width = rs.color1_width;
+        failure->color1_height = rs.color1_height;
         failure->vertex_count = vcount_hint;
     }
     auto add_stage_diagnostic = [&](ShaderProgramStage stage, uint64_t addr,
@@ -567,7 +575,8 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     // those writers made The Messenger clear stencil to 0 and then test for bits 1/2 that could never
     // be produced (#520). Skip only when the draw has no observable color OR depth/stencil effect.
     const bool ds_effect = has_depth_stencil_side_effect(ps);
-    if (ps.color_write_mask == 0 && !ds_effect && !getenv("PROSPER_FORCE_COLORWRITE")) {
+    if (ps.color_write_mask == 0 && ps.color1_write_mask == 0 &&
+        !ds_effect && !getenv("PROSPER_FORCE_COLORWRITE")) {
         if (failure) failure->reason = RealizationFailureReason::NoEffect;
         if (log) fprintf(stderr, "[exec] skip draw: no color/depth/stencil effect cb_target_mask=0x%x cb_color_control=0x%x color0_fmt=%u\n",
                          rs.cb_target_mask, rs.cb_color_control, ps.color0_format);
@@ -794,6 +803,8 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     out.vrt = std::move(vrt); out.prt = std::move(prt); out.vertex_count = vertex_count;
     out.color0_base = rs.color0_base;   // render-to-texture: the target this draw writes into (#167)
     out.color0_width = rs.color0_width; out.color0_height = rs.color0_height; // per-target extent (#526)
+    out.color1_base = rs.color1_base;
+    out.color1_width = rs.color1_width; out.color1_height = rs.color1_height;
     return true;
 }
 

@@ -216,13 +216,16 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
     }
     for (size_t i = 0; i < replay.items.size(); ++i) {
         const auto& d = replay.items[i];
-        std::printf("draw[%zu] source=%llu target=%016llx extent=%ux%u vcount=%u indices=%zu topo=%u fmt=%u cwm=%x "
+        std::printf("draw[%zu] source=%llu target=%016llx extent=%ux%u fmt=%u cwm=%x "
+                    "target1=%016llx extent1=%ux%u fmt1=%u cwm1=%x vcount=%u indices=%zu topo=%u "
                     "depth=%d/%d/%u stencil=%d blend=%d raster=%u/%u/%u viewport=%d %.1f,%.1f %.1fx%.1f "
                     "vs=%zu/%016llx fs=%zu/%016llx\n",
                     i, static_cast<unsigned long long>(d.draw_index),
                     static_cast<unsigned long long>(d.color0_base), d.color0_width, d.color0_height,
-                    d.vertex_count, d.indices.size(),
-                    d.ps.topology, d.ps.color0_format, d.ps.color_write_mask, d.ps.depth_test_enable,
+                    d.ps.color0_format, d.ps.color_write_mask,
+                    static_cast<unsigned long long>(d.color1_base), d.color1_width, d.color1_height,
+                    d.ps.color1_format, d.ps.color1_write_mask, d.vertex_count, d.indices.size(),
+                    d.ps.topology, d.ps.depth_test_enable,
                     d.ps.depth_write_enable, d.ps.depth_compare_op, d.ps.stencil_enable, d.ps.blend_enable,
                     d.ps.cull_mode, d.ps.front_face, d.ps.polygon_mode,
                     d.ps.has_viewport, d.ps.viewport_x, d.ps.viewport_y, d.ps.viewport_w, d.ps.viewport_h,

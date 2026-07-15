@@ -42,16 +42,16 @@ float srgb_to_linear(float c) {
 // default and never worse than the old debug blue. CONFIDENCE: HIGH for 8_8_8_8 (the live-verified
 // Messenger / PPSA02664 target); the byte order matches vk_color_format's 0xA row (STD->R8G8B8A8,
 // ALT->B8G8R8A8) and the sRGB rows are linearized. Other formats: MED -> left to the black fallback.
-bool decode_clear_color(const RenderState& rs, float out[4]) {
-    if (!rs.color0_has_clear) return false;
-    const uint32_t w0 = rs.color0_clear_word0;
-    if (rs.color0_format == 0xAu) {  // COLOR_8_8_8_8
+bool decode_clear_color(uint32_t format, uint32_t number_type, uint32_t comp_swap,
+                        bool has_clear, uint32_t w0, float out[4]) {
+    if (!has_clear) return false;
+    if (format == 0xAu) {  // COLOR_8_8_8_8
         const float b0 = (w0 & 0xFFu) / 255.0f, b1 = ((w0 >> 8) & 0xFFu) / 255.0f,
                     b2 = ((w0 >> 16) & 0xFFu) / 255.0f, b3 = ((w0 >> 24) & 0xFFu) / 255.0f;
         float r, g, b, a = b3;                     // alpha is byte 3 for both swaps
-        if (rs.color0_comp_swap == 1u) { r = b2; g = b1; b = b0; }   // ALT: B8G8R8A8 (byte0=B)
+        if (comp_swap == 1u) { r = b2; g = b1; b = b0; }   // ALT: B8G8R8A8 (byte0=B)
         else                            { r = b0; g = b1; b = b2; }  // STD: R8G8B8A8 (byte0=R)
-        const bool is_srgb = (rs.color0_number_type == 6u);
+        const bool is_srgb = (number_type == 6u);
         out[0] = is_srgb ? srgb_to_linear(r) : r;
         out[1] = is_srgb ? srgb_to_linear(g) : g;
         out[2] = is_srgb ? srgb_to_linear(b) : b;
@@ -99,6 +99,26 @@ RenderState extract_render_state(const GpuState& st) {
     rs.color0_has_clear   = st.cx.count(P::CB_COLOR0_CLEAR_WORD0) || st.cx.count(P::CB_COLOR0_CLEAR_WORD1);
     rs.color0_clear_word0 = st.cx.count(P::CB_COLOR0_CLEAR_WORD0) ? rd(st.cx, P::CB_COLOR0_CLEAR_WORD0) : 0u;
     rs.color0_clear_word1 = st.cx.count(P::CB_COLOR0_CLEAR_WORD1) ? rd(st.cx, P::CB_COLOR0_CLEAR_WORD1) : 0u;
+
+    // Color MRT 1 uses the same field layouts as MRT0, with the RDNA2 target-block stride encoded by
+    // the named register constants in pm4_registers.hpp.
+    rs.color1_base = addr_of(rd(st.cx, P::CB_COLOR1_BASE), rd(st.cx, P::CB_COLOR1_BASE_EXT));
+    const uint32_t cinfo1 = rd(st.cx, P::CB_COLOR1_INFO);
+    rs.color1_format = PM4_FIELD(cinfo1, CB_COLOR0_INFO, FORMAT);
+    rs.color1_number_type = PM4_FIELD(cinfo1, CB_COLOR0_INFO, NUMBER_TYPE);
+    rs.color1_comp_swap = PM4_FIELD(cinfo1, CB_COLOR0_INFO, COMP_SWAP);
+    auto color1_attrib2 = st.cx.find(P::CB_COLOR1_ATTRIB2);
+    if (color1_attrib2 != st.cx.end()) {
+        rs.color1_has_extent = true;
+        rs.color1_width = PM4_FIELD(color1_attrib2->second, CB_COLOR0_ATTRIB2, MIP0_WIDTH) + 1u;
+        rs.color1_height = PM4_FIELD(color1_attrib2->second, CB_COLOR0_ATTRIB2, MIP0_HEIGHT) + 1u;
+    }
+    rs.color1_has_clear = st.cx.count(P::CB_COLOR1_CLEAR_WORD0) ||
+                          st.cx.count(P::CB_COLOR1_CLEAR_WORD1);
+    rs.color1_clear_word0 = st.cx.count(P::CB_COLOR1_CLEAR_WORD0)
+        ? rd(st.cx, P::CB_COLOR1_CLEAR_WORD0) : 0u;
+    rs.color1_clear_word1 = st.cx.count(P::CB_COLOR1_CLEAR_WORD1)
+        ? rd(st.cx, P::CB_COLOR1_CLEAR_WORD1) : 0u;
 
     // Primitive topology. VGT_PRIMITIVE_TYPE (0x242) is a UCONFIG register in RDNA2 (the game sets it via
     // a Uc-class SetRegsIndirect / CreatePrimState's uc[2]), NOT a context register — read it from st.uc.
@@ -158,6 +178,16 @@ RenderState extract_render_state(const GpuState& st) {
     rs.alpha_dst_blend = PM4_FIELD(bc, CB_BLEND0_CONTROL, ALPHA_DESTBLEND);
     rs.alpha_comb_fcn  = PM4_FIELD(bc, CB_BLEND0_CONTROL, ALPHA_COMB_FCN);
 
+    const uint32_t bc1 = rd(st.cx, P::CB_BLEND1_CONTROL);
+    rs.blend1_enable = PM4_FIELD(bc1, CB_BLEND0_CONTROL, ENABLE) != 0;
+    rs.color1_src_blend = PM4_FIELD(bc1, CB_BLEND0_CONTROL, COLOR_SRCBLEND);
+    rs.color1_dst_blend = PM4_FIELD(bc1, CB_BLEND0_CONTROL, COLOR_DESTBLEND);
+    rs.color1_comb_fcn = PM4_FIELD(bc1, CB_BLEND0_CONTROL, COLOR_COMB_FCN);
+    rs.separate_alpha_blend1 = PM4_FIELD(bc1, CB_BLEND0_CONTROL, SEPARATE_ALPHA_BLEND) != 0;
+    rs.alpha1_src_blend = PM4_FIELD(bc1, CB_BLEND0_CONTROL, ALPHA_SRCBLEND);
+    rs.alpha1_dst_blend = PM4_FIELD(bc1, CB_BLEND0_CONTROL, ALPHA_DESTBLEND);
+    rs.alpha1_comb_fcn = PM4_FIELD(bc1, CB_BLEND0_CONTROL, ALPHA_COMB_FCN);
+
     // Faithful raw state registers.
     rs.db_depth_control  = dc;
     // Rasterizer cull/front-face/polygon mode (#456). Absent -> 0 -> CULL_NONE/CCW/FILL (prior default).
@@ -193,11 +223,18 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
     ps.topology      = static_cast<uint32_t>(vk_topology(rs.prim_type));
     ps.color0_format = static_cast<uint32_t>(
         vk_color_format(rs.color0_format, rs.color0_number_type, rs.color0_comp_swap));
+    ps.color1_format = rs.color1_format ? static_cast<uint32_t>(
+        vk_color_format(rs.color1_format, rs.color1_number_type, rs.color1_comp_swap)) : 0u;
 
     // Fast-clear color: decode the CB_COLOR0_CLEAR_WORD when the game programmed one (#309). A
     // decode miss (no fast-clear, or an unmapped format) leaves has_clear_color false and the
     // default opaque-black clear_color, which the backend uses instead of the old debug blue.
-    ps.has_clear_color = decode_clear_color(rs, ps.clear_color);
+    ps.has_clear_color = decode_clear_color(
+        rs.color0_format, rs.color0_number_type, rs.color0_comp_swap,
+        rs.color0_has_clear, rs.color0_clear_word0, ps.clear_color);
+    ps.has_clear_color1 = decode_clear_color(
+        rs.color1_format, rs.color1_number_type, rs.color1_comp_swap,
+        rs.color1_has_clear, rs.color1_clear_word0, ps.clear_color1);
 
     ps.depth_test_enable  = rs.z_enable;
     ps.depth_write_enable = rs.z_write_enable;
@@ -315,9 +352,24 @@ ResolvedPipelineState resolve_pipeline_state(const RenderState& rs) {
         ps.alpha_blend_op         = ps.color_blend_op;
     }
 
+    ps.blend1_enable = rs.blend1_enable;
+    ps.src_color_blend_factor1 = vk_blend_factor(rs.color1_src_blend);
+    ps.dst_color_blend_factor1 = vk_blend_factor(rs.color1_dst_blend);
+    ps.color_blend_op1 = vk_blend_op(rs.color1_comb_fcn);
+    if (rs.separate_alpha_blend1) {
+        ps.src_alpha_blend_factor1 = vk_blend_factor(rs.alpha1_src_blend);
+        ps.dst_alpha_blend_factor1 = vk_blend_factor(rs.alpha1_dst_blend);
+        ps.alpha_blend_op1 = vk_blend_op(rs.alpha1_comb_fcn);
+    } else {
+        ps.src_alpha_blend_factor1 = ps.src_color_blend_factor1;
+        ps.dst_alpha_blend_factor1 = ps.dst_color_blend_factor1;
+        ps.alpha_blend_op1 = ps.color_blend_op1;
+    }
+
     // CB_TARGET_MASK holds a 4-bit write mask per MRT; MRT0 is bits [3:0]. RDNA2's R/G/B/A bit order
     // matches VkColorComponentFlags (R=1,G=2,B=4,A=8), so the nibble maps 1:1.
     ps.color_write_mask = rs.cb_target_mask & 0xFu;
+    ps.color1_write_mask = (rs.cb_target_mask >> 4) & 0xFu;
 
     // Viewport: hardware maps screen = offset + scale * ndc; Vulkan maps px = (x + w/2) + ndc * (w/2).
     // Equating the two: x = xoffset - xscale, w = 2*xscale (same for y). A guest with GNM's +Y-up NDC

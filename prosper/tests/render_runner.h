@@ -894,7 +894,10 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                                               const uint8_t* seed_rgba = nullptr,
                                               const float* clear_rgba = nullptr,
                                               bool persist_depth_stencil = false,
-                                              const BackendColorTarget* color_target = nullptr) {
+                                              const BackendColorTarget* color_target = nullptr,
+                                              const uint8_t* seed_rgba1 = nullptr,
+                                              const float* clear_rgba1 = nullptr,
+                                              std::vector<uint8_t>* out_rgba1 = nullptr) {
     using TimingClock = std::chrono::steady_clock;
     const bool timing_enabled = getenv("PROSPER_RENDER_TIMING") != nullptr;
     const auto timing_start = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
@@ -902,6 +905,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     BackendColorTargetStats& color_target_stats = backend_color_target_stats_storage();
     color_target_stats = {};
     std::vector<uint8_t> out;
+    if (out_rgba1) out_rgba1->clear();
     if (draws.empty()) return out;
     const RenderVkCtx& ctx = render_vk_ctx();
     if (!ctx.ok) return out;
@@ -919,6 +923,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             if ((bits & (1u << i)) && (memp.memoryTypes[i].propertyFlags & want) == want) return i;
         return UINT32_MAX; };
     const VkFormat FMT = VK_FORMAT_R8G8B8A8_UNORM;
+    const bool use_color1 = out_rgba1 != nullptr;
+    const uint32_t color_count = use_color1 ? 2u : 1u;
+    const uint32_t ds_attachment = color_count;
     // Depth attachment is created if ANY draw enables the depth test (the shared render pass has one
     // fixed attachment set); each draw's pipeline sets its own depthTest/Write/CompareOp. A frame with
     // no depth-using draw takes the color-only path unchanged.
@@ -1112,6 +1119,31 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         color_target_stats.write_hits = load_cached_color ? 1 : 0;
     }
 
+    VkImage img1 = VK_NULL_HANDLE; VkDeviceMemory imem1 = VK_NULL_HANDLE;
+    VkImageView view1 = VK_NULL_HANDLE;
+    if (use_color1) {
+        VkImageCreateInfo color1_ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        color1_ci.imageType = VK_IMAGE_TYPE_2D; color1_ci.format = FMT;
+        color1_ci.extent = {W, H, 1}; color1_ci.mipLevels = 1; color1_ci.arrayLayers = 1;
+        color1_ci.samples = VK_SAMPLE_COUNT_1_BIT; color1_ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+        color1_ci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                          (seed_rgba1 ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0u);
+        vkCreateImage(dev, &color1_ci, nullptr, &img1);
+        VkMemoryRequirements color1_requirements{};
+        vkGetImageMemoryRequirements(dev, img1, &color1_requirements);
+        VkMemoryAllocateInfo color1_allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        color1_allocation.allocationSize = color1_requirements.size;
+        color1_allocation.memoryTypeIndex = pick(color1_requirements.memoryTypeBits, 0);
+        imem1 = allocate_transient_render_memory(
+            dev, color1_allocation.allocationSize, color1_allocation.memoryTypeIndex);
+        vkBindImageMemory(dev, img1, imem1, 0);
+        VkImageViewCreateInfo color1_view_ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        color1_view_ci.image = img1; color1_view_ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        color1_view_ci.format = FMT;
+        color1_view_ci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCreateImageView(dev, &color1_view_ci, nullptr, &view1);
+    }
+
     if (use_ds && !dimg) {
         VkImageCreateInfo dci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         dci.imageType = VK_IMAGE_TYPE_2D; dci.format = DFMT; dci.extent = {W, H, 1};
@@ -1134,7 +1166,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         if (cached_ds) { cached_ds->image = dimg; cached_ds->memory = dmem; cached_ds->view = dview; }
     }
 
-    VkAttachmentDescription att[2]{};
+    VkAttachmentDescription att[3]{};
     att[0].format = FMT; att[0].samples = VK_SAMPLE_COUNT_1_BIT;
     // Seeded or persistent: the attachment already holds valid pixels before this pass, so LOAD them.
     att[0].loadOp = (seed_rgba || load_cached_color) ? VK_ATTACHMENT_LOAD_OP_LOAD
@@ -1145,34 +1177,51 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
     att[0].finalLayout = persistent_color ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
                                           : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    att[1].format = DFMT; att[1].samples = VK_SAMPLE_COUNT_1_BIT;
+    if (use_color1) {
+        att[1].format = FMT; att[1].samples = VK_SAMPLE_COUNT_1_BIT;
+        att[1].loadOp = seed_rgba1 ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
+        att[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        att[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        att[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        att[1].initialLayout = seed_rgba1 ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+                                          : VK_IMAGE_LAYOUT_UNDEFINED;
+        att[1].finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    }
+    att[ds_attachment].format = DFMT; att[ds_attachment].samples = VK_SAMPLE_COUNT_1_BIT;
     // A guest-identified DS surface survives calls. New attachments get a defined initial value;
     // existing ones LOAD. Explicit DB_RENDER_CONTROL clears execute at their draw below, preserving
     // command order instead of being promoted to an unconditional pass-start clear (#518).
     // Depth and stencil have independent guest lifetimes even when Vulkan stores them in one D32S8
     // image. Using stencil must not make an untouched depth plane valid: Unity can stencil-prime a
     // surface under an ALWAYS, read-only depth test and only later use reverse-Z depth (#540).
-    att[1].loadOp = depth_was_valid ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
-    att[1].storeOp = persistent_ds ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    att[1].stencilLoadOp = format_has_stencil
+    att[ds_attachment].loadOp = depth_was_valid ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
+    att[ds_attachment].storeOp = persistent_ds ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att[ds_attachment].stencilLoadOp = format_has_stencil
         ? (stencil_was_valid ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR)
         : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    att[1].stencilStoreOp = (persistent_ds && format_has_stencil)
+    att[ds_attachment].stencilStoreOp = (persistent_ds && format_has_stencil)
         ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    att[1].initialLayout = ds_layout_initialized ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
-                                                  : VK_IMAGE_LAYOUT_UNDEFINED;
-    att[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-    VkAttachmentReference ar{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
-    VkAttachmentReference dar{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+    att[ds_attachment].initialLayout = ds_layout_initialized
+        ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
+    att[ds_attachment].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    VkAttachmentReference ar[2] = {
+        {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
+        {1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
+    };
+    VkAttachmentReference dar{ds_attachment, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
     VkSubpassDescription sub{}; sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    sub.colorAttachmentCount = 1; sub.pColorAttachments = &ar;
+    sub.colorAttachmentCount = color_count; sub.pColorAttachments = ar;
     if (use_ds) sub.pDepthStencilAttachment = &dar;
     VkRenderPassCreateInfo rpci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
-    rpci.attachmentCount = use_ds ? 2 : 1; rpci.pAttachments = att; rpci.subpassCount = 1; rpci.pSubpasses = &sub;
+    rpci.attachmentCount = color_count + (use_ds ? 1u : 0u); rpci.pAttachments = att;
+    rpci.subpassCount = 1; rpci.pSubpasses = &sub;
     VkRenderPass rp; vkCreateRenderPass(dev, &rpci, nullptr, &rp);
-    VkImageView fbviews[2] = {view, dview};
+    VkImageView fbviews[3] = {view, VK_NULL_HANDLE, VK_NULL_HANDLE};
+    if (use_color1) fbviews[1] = view1;
+    if (use_ds) fbviews[ds_attachment] = dview;
     VkFramebufferCreateInfo fbci{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
-    fbci.renderPass = rp; fbci.attachmentCount = use_ds ? 2 : 1; fbci.pAttachments = fbviews; fbci.width = W; fbci.height = H; fbci.layers = 1;
+    fbci.renderPass = rp; fbci.attachmentCount = color_count + (use_ds ? 1u : 0u);
+    fbci.pAttachments = fbviews; fbci.width = W; fbci.height = H; fbci.layers = 1;
     VkFramebuffer fb; vkCreateFramebuffer(dev, &fbci, nullptr, &fb);
 
     auto mkmod = [&](const std::vector<uint32_t>& c) -> VkShaderModule {
@@ -1358,23 +1407,33 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                   rs.polygonMode = (VkPolygonMode)ps->polygon_mode; }
         VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
         ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-        VkPipelineColorBlendAttachmentState cba{}; cba.colorWriteMask = 0xF;
+        VkPipelineColorBlendAttachmentState cba[2]{};
+        cba[0].colorWriteMask = 0xF; cba[1].colorWriteMask = 0xF;
         if (ps) {
-            cba.colorWriteMask = ps->color_write_mask;
-            cba.blendEnable    = ps->blend_enable ? VK_TRUE : VK_FALSE;
-            if (getenv("PROSPER_NO_BLEND")) cba.blendEnable = VK_FALSE;   // diag: isolate blend compositing
-            cba.srcColorBlendFactor = (VkBlendFactor)ps->src_color_blend_factor;
-            cba.dstColorBlendFactor = (VkBlendFactor)ps->dst_color_blend_factor;
-            cba.colorBlendOp        = (VkBlendOp)ps->color_blend_op;
+            cba[0].colorWriteMask = ps->color_write_mask;
+            cba[0].blendEnable    = ps->blend_enable ? VK_TRUE : VK_FALSE;
+            if (getenv("PROSPER_NO_BLEND")) cba[0].blendEnable = VK_FALSE;   // diag: isolate blend compositing
+            cba[0].srcColorBlendFactor = (VkBlendFactor)ps->src_color_blend_factor;
+            cba[0].dstColorBlendFactor = (VkBlendFactor)ps->dst_color_blend_factor;
+            cba[0].colorBlendOp        = (VkBlendOp)ps->color_blend_op;
             // Alpha channel uses its OWN resolved factors (#381): resolve set these from the separate
             // ALPHA_* blend fields when SEPARATE_ALPHA_BLEND was programmed, else it already mirrored the
             // color factors — so this is correct in both cases without guessing here.
-            cba.srcAlphaBlendFactor = (VkBlendFactor)ps->src_alpha_blend_factor;
-            cba.dstAlphaBlendFactor = (VkBlendFactor)ps->dst_alpha_blend_factor;
-            cba.alphaBlendOp        = (VkBlendOp)ps->alpha_blend_op;
+            cba[0].srcAlphaBlendFactor = (VkBlendFactor)ps->src_alpha_blend_factor;
+            cba[0].dstAlphaBlendFactor = (VkBlendFactor)ps->dst_alpha_blend_factor;
+            cba[0].alphaBlendOp        = (VkBlendOp)ps->alpha_blend_op;
+            cba[1].colorWriteMask = ps->color1_write_mask;
+            cba[1].blendEnable = ps->blend1_enable ? VK_TRUE : VK_FALSE;
+            if (getenv("PROSPER_NO_BLEND")) cba[1].blendEnable = VK_FALSE;
+            cba[1].srcColorBlendFactor = (VkBlendFactor)ps->src_color_blend_factor1;
+            cba[1].dstColorBlendFactor = (VkBlendFactor)ps->dst_color_blend_factor1;
+            cba[1].colorBlendOp = (VkBlendOp)ps->color_blend_op1;
+            cba[1].srcAlphaBlendFactor = (VkBlendFactor)ps->src_alpha_blend_factor1;
+            cba[1].dstAlphaBlendFactor = (VkBlendFactor)ps->dst_alpha_blend_factor1;
+            cba[1].alphaBlendOp = (VkBlendOp)ps->alpha_blend_op1;
         }
         VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-        cb.attachmentCount = 1; cb.pAttachments = &cba;
+        cb.attachmentCount = color_count; cb.pAttachments = cba;
         VkPipelineDepthStencilStateCreateInfo dss{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
         if (ps && ps->depth_test_enable) {
             dss.depthTestEnable  = VK_TRUE;
@@ -1683,8 +1742,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                 memcpy(&word, &value, sizeof word);
                 append(word);
             };
-            append(1); // key schema version
-            append(W); append(H); append(use_ds); append(static_cast<uint32_t>(DFMT));
+            append(2); // key schema version
+            append(W); append(H); append(color_count); append(use_ds); append(static_cast<uint32_t>(DFMT));
             const bool exact_shader_identities = bd.vs_identity && bd.fs_identity;
             append(bd.vs_identity != 0);
             if (bd.vs_identity) {
@@ -1727,9 +1786,12 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             append(static_cast<uint32_t>(sc.offset.x)); append(static_cast<uint32_t>(sc.offset.y));
             append(sc.extent.width); append(sc.extent.height);
             append(rs.polygonMode); append(rs.cullMode); append(rs.frontFace); append_float(rs.lineWidth);
-            append(cba.blendEnable); append(cba.srcColorBlendFactor); append(cba.dstColorBlendFactor);
-            append(cba.colorBlendOp); append(cba.srcAlphaBlendFactor); append(cba.dstAlphaBlendFactor);
-            append(cba.alphaBlendOp); append(cba.colorWriteMask);
+            for (uint32_t attachment = 0; attachment < color_count; ++attachment) {
+                append(cba[attachment].blendEnable); append(cba[attachment].srcColorBlendFactor);
+                append(cba[attachment].dstColorBlendFactor); append(cba[attachment].colorBlendOp);
+                append(cba[attachment].srcAlphaBlendFactor); append(cba[attachment].dstAlphaBlendFactor);
+                append(cba[attachment].alphaBlendOp); append(cba[attachment].colorWriteMask);
+            }
             append(gp.pDepthStencilState != nullptr);
             if (gp.pDepthStencilState) {
                 append(dss.depthTestEnable); append(dss.depthWriteEnable); append(dss.depthCompareOp);
@@ -1810,12 +1872,15 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
 
     const auto timing_draws_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     VkDeviceSize bytes = (VkDeviceSize)W * H * 4;
-    const bool readback_requested = !persistent_color || color_target->readback;
+    const VkDeviceSize readback_bytes = bytes * color_count;
+    // MRT1 is currently retained in the live renderer's CPU RTT cache, so a paired pass always
+    // reads both attachments back. Single-target passes keep the persistent no-readback fast path.
+    const bool readback_requested = use_color1 || !persistent_color || color_target->readback;
     VkBuffer rb = VK_NULL_HANDLE;
     VkDeviceMemory bmem = VK_NULL_HANDLE;
     if (readback_requested) {
         VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        bci.size = bytes; bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bci.size = readback_bytes; bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         vkCreateBuffer(dev, &bci, nullptr, &rb);
         VkMemoryRequirements br; vkGetBufferMemoryRequirements(dev, rb, &br);
         VkMemoryAllocateInfo bai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; bai.allocationSize = br.size;
@@ -1885,6 +1950,38 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         s1.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &s1);
     }
+    VkBuffer seedbuf1 = VK_NULL_HANDLE; VkDeviceMemory seedmem1 = VK_NULL_HANDLE;
+    if (use_color1 && seed_rgba1) {
+        VkBufferCreateInfo sci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        sci.size = bytes; sci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        vkCreateBuffer(dev, &sci, nullptr, &seedbuf1);
+        VkMemoryRequirements sr; vkGetBufferMemoryRequirements(dev, seedbuf1, &sr);
+        VkMemoryAllocateInfo sai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; sai.allocationSize = sr.size;
+        sai.memoryTypeIndex = pick(sr.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        seedmem1 = allocate_transient_render_memory(dev, sai.allocationSize, sai.memoryTypeIndex);
+        vkBindBufferMemory(dev, seedbuf1, seedmem1, 0);
+        void* sp = nullptr; vkMapMemory(dev, seedmem1, 0, bytes, 0, &sp);
+        memcpy(sp, seed_rgba1, static_cast<size_t>(bytes)); vkUnmapMemory(dev, seedmem1);
+        VkImageMemoryBarrier s0{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        s0.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; s0.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        s0.image = img1; s0.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        s0.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &s0);
+        VkBufferImageCopy sc{}; sc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        sc.imageExtent = {W, H, 1};
+        vkCmdCopyBufferToImage(cmd, seedbuf1, img1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &sc);
+        VkImageMemoryBarrier s1{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        s1.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        s1.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        s1.image = img1; s1.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        s1.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        s1.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &s1);
+    }
     // Upload each distinct texture once. Draw descriptors may use separate views/samplers over the
     // same image, preserving per-binding swizzle and sampler state without duplicating pixel storage.
     for (const auto& upload : texture_uploads) {
@@ -1916,10 +2013,15 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     float cc[4] = {0.0f, 0.0f, 1.0f, 1.0f};   // diagnostic blue
     if (clear_rgba && getenv("PROSPER_CLEAR_DEBUG") == nullptr)
         for (int i = 0; i < 4; i++) cc[i] = clear_rgba[i];
-    VkClearValue clear[2]{}; clear[0].color = {{cc[0], cc[1], cc[2], cc[3]}};
-    clear[1].depthStencil = {depth_clear, stencil_clear};   // guest DB_DEPTH_CLEAR / compare-op default (#371)
+    float cc1[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+    if (clear_rgba1 && getenv("PROSPER_CLEAR_DEBUG") == nullptr)
+        for (int i = 0; i < 4; ++i) cc1[i] = clear_rgba1[i];
+    VkClearValue clear[3]{}; clear[0].color = {{cc[0], cc[1], cc[2], cc[3]}};
+    if (use_color1) clear[1].color = {{cc1[0], cc1[1], cc1[2], cc1[3]}};
+    clear[ds_attachment].depthStencil = {depth_clear, stencil_clear}; // guest DB clear/default
     VkRenderPassBeginInfo rpbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-    rpbi.renderPass = rp; rpbi.framebuffer = fb; rpbi.renderArea = {{0, 0}, {W, H}}; rpbi.clearValueCount = use_ds ? 2 : 1; rpbi.pClearValues = clear;
+    rpbi.renderPass = rp; rpbi.framebuffer = fb; rpbi.renderArea = {{0, 0}, {W, H}};
+    rpbi.clearValueCount = color_count + (use_ds ? 1u : 0u); rpbi.pClearValues = clear;
     if (getenv("PROSPER_PIPELOG")) {   // diag: how many draws' pipelines built + will be recorded
         int nok = 0; for (auto& v : dv) if (v.ok) nok++;
         fprintf(stderr, "[pipe] %zu draws, %d pipelines OK, use_depth=%d use_stencil=%d; counts:", dv.size(), nok, (int)use_depth, (int)use_stencil);
@@ -1968,6 +2070,11 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         cp.imageExtent = {W, H, 1};
         vkCmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb, 1, &cp);
+        if (use_color1) {
+            VkBufferImageCopy cp1 = cp; cp1.bufferOffset = bytes;
+            vkCmdCopyImageToBuffer(
+                cmd, img1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb, 1, &cp1);
+        }
         if (persistent_color) {
             VkImageMemoryBarrier to_sample{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
             to_sample.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
@@ -1999,11 +2106,14 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     }
 
     if (readback_requested) {
-        void* mp = nullptr; vkMapMemory(dev, bmem, 0, bytes, 0, &mp);
+        void* mp = nullptr; vkMapMemory(dev, bmem, 0, readback_bytes, 0, &mp);
         const auto* readback = static_cast<const uint8_t*>(mp);
         // A range assignment constructs directly from the mapped pixels. resize()+memcpy first zeroed the
         // entire 8.3 MiB 1080p vector even though every byte was immediately overwritten.
         out.assign(readback, readback + static_cast<size_t>(bytes));
+        if (use_color1)
+            out_rgba1->assign(readback + static_cast<size_t>(bytes),
+                              readback + static_cast<size_t>(readback_bytes));
         vkUnmapMemory(dev, bmem);
         color_target_stats.readbacks = persistent_color ? 1 : 0;
     }
@@ -2156,6 +2266,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     }
     if (seedbuf) vkDestroyBuffer(dev, seedbuf, nullptr);
     if (seedmem) release_transient_render_memory(dev, seedmem);
+    if (seedbuf1) vkDestroyBuffer(dev, seedbuf1, nullptr);
+    if (seedmem1) release_transient_render_memory(dev, seedmem1);
     if (rb) vkDestroyBuffer(dev, rb, nullptr);
     if (bmem) release_transient_render_memory(dev, bmem);
     vkDestroyFramebuffer(dev, fb, nullptr); vkDestroyRenderPass(dev, rp, nullptr);
@@ -2163,6 +2275,10 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         vkDestroyImageView(dev, view, nullptr);
         vkDestroyImage(dev, img, nullptr);
         release_transient_render_memory(dev, imem);
+    }
+    if (use_color1) {
+        vkDestroyImageView(dev, view1, nullptr); vkDestroyImage(dev, img1, nullptr);
+        release_transient_render_memory(dev, imem1);
     }
     if (use_ds && !cached_ds) {
         vkDestroyImageView(dev, dview, nullptr); vkDestroyImage(dev, dimg, nullptr);

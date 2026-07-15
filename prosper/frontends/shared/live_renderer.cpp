@@ -1483,11 +1483,19 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 // the backbuffer, incremental HUD updates) composites OVER the earlier content instead
                 // of starting from the diagnostic clear. Real RT memory persists exactly this way.
                 static const bool seed_rtt = getenv("PROSPER_RTT_NOSEED") == nullptr;
+                auto active_color1 = [](const prosper::gpu::DrawItem& draw) {
+                    return draw.ps.color1_write_mask && draw.color1_base
+                        ? draw.color1_base : uint64_t{0};
+                };
                 size_t pass_i = 0;
                 while (pass_i < items.size()) {
                     const uint64_t base = items[pass_i].color0_base;
+                    const uint64_t base1 = active_color1(items[pass_i]);
                     std::vector<const prosper::gpu::DrawItem*> pass;
-                    while (pass_i < items.size() && items[pass_i].color0_base == base) { pass.push_back(&items[pass_i]); ++pass_i; }
+                    while (pass_i < items.size() && items[pass_i].color0_base == base &&
+                           active_color1(items[pass_i]) == base1) {
+                        pass.push_back(&items[pass_i]); ++pass_i;
+                    }
 
                     // Gen5 render-target extent (#526). Large scene/scanout surfaces retain the
                     // configured VideoOut render scale; small offscreen targets render at native
@@ -1621,14 +1629,37 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         base != front_va && sampled_exact_later && !feedback_later;
                     prosper::test::BackendColorTarget backend_target{
                         base, seed_rtt, !defer_readback};
+                    const bool color1_extent_matches = base1 && !render_pass.empty() &&
+                        render_pass.front()->color1_width == native_w &&
+                        render_pass.front()->color1_height == native_h;
+                    // Keep an exact-capture diagnostic switch so MRT1 can be compared
+                    // against the previous single-target behavior without recapturing.
+                    const bool use_color1 = base1 && color1_extent_matches &&
+                                            getenv("PROSPER_NO_MRT1") == nullptr;
+                    const uint8_t* seed1 = nullptr;
+                    if (seed_rtt && use_color1) { auto sit = g_rtt.find(base1);
+                        if (sit != g_rtt.end() && sit->second.w == gw && sit->second.h == gh &&
+                            sit->second.rgba && sit->second.rgba->size() == (size_t)gw * gh * 4)
+                            seed1 = sit->second.rgba->data(); }
+                    if (base1 && !use_color1 && rtt_log) {
+                        const auto* first = render_pass.empty() ? nullptr : render_pass.front();
+                        fprintf(stderr,
+                                "[rtt] skip MRT1 target=0x%llx extent=%ux%u; MRT0 is %ux%u\n",
+                                (unsigned long long)base1,
+                                first ? first->color1_width : 0u,
+                                first ? first->color1_height : 0u, native_w, native_h);
+                    }
                     const auto build_start = timing_enabled
                         ? RenderClock::now() : RenderClock::time_point{};
                     auto backend_draws = build_bds(render_pass);
                     const auto build_done = timing_enabled
                         ? RenderClock::now() : RenderClock::time_point{};
+                    std::vector<uint8_t> gpx1;
                     std::vector<uint8_t> gpx = prosper::test::render_draws_rgba(
                         backend_draws, gw, gh, seed, clear_for(render_pass), true,
-                        live_gpu_targets && base ? &backend_target : nullptr);
+                        live_gpu_targets && base ? &backend_target : nullptr,
+                        seed1, use_color1 ? render_pass.front()->ps.clear_color1 : nullptr,
+                        use_color1 ? &gpx1 : nullptr);
                     const auto backend_done = timing_enabled
                         ? RenderClock::now() : RenderClock::time_point{};
                     const prosper::test::BackendColorTargetStats color_target_call =
@@ -1667,6 +1698,22 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         surface.w = gw;
                         surface.h = gh;
                         surface.gpu_valid = false;
+                    }
+                    if (use_color1 && !gpx1.empty()) {
+                        if (rtt_log) {
+                            size_t nz = 0, rgb_nz = 0;
+                            for (uint8_t byte : gpx1) nz += byte != 0;
+                            for (size_t p = 0; p + 3 < gpx1.size(); p += 4)
+                                rgb_nz += gpx1[p] != 0 || gpx1[p + 1] != 0 ||
+                                          gpx1[p + 2] != 0;
+                            fprintf(stderr,
+                                    "[rtt] pass target1=0x%llx extent=%ux%u (%zu draws) "
+                                    "px_nonzero=%zu rgb_nonblack=%zu\n",
+                                    (unsigned long long)base1, gw, gh, pass.size(), nz, rgb_nz);
+                        }
+                        RttSurf& surface = g_rtt[base1];
+                        surface.rgba = std::make_shared<const std::vector<uint8_t>>(std::move(gpx1));
+                        surface.w = gw; surface.h = gh; surface.gpu_valid = false;
                     }
                     const std::vector<uint8_t>& rendered_pixels = *pass_pixels;
                     if (native_w == resource_hash_w && native_h == resource_hash_h &&

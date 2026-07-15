@@ -64,6 +64,8 @@ struct GpuCapturedDraw {
     std::vector<uint32_t> indices;
     uint64_t color0_base = 0;
     uint32_t color0_width = 0, color0_height = 0;
+    uint64_t color1_base = 0;
+    uint32_t color1_width = 0, color1_height = 0;
     uint64_t draw_index = 0;
     uint64_t command_order = 0;
 };
@@ -107,6 +109,9 @@ struct GpuCapturedOperationFailure {
     uint64_t color0_base = 0;
     uint32_t color0_width = 0;
     uint32_t color0_height = 0;
+    uint64_t color1_base = 0;
+    uint32_t color1_width = 0;
+    uint32_t color1_height = 0;
     uint32_t vertex_count = 0;
     ComputeLaunchDimensions compute_launch;
     std::vector<GpuCapturedStageDiagnostic> stages;

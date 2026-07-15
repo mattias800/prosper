@@ -880,19 +880,26 @@ struct SpirvCompute {
             put(code, Op_CompositeExtract, {t_u32, groupid[c], ldg, c});
         }
     }
-    // --- Fragment-shader shell: a location-0 vec4 color output; EXP MRT0 stores to it. ---
-    uint32_t t_v4f = 0, v_color = 0;
-    void begin_fragment(const ShaderResourceTable* rt = nullptr) { bool with_cbufs = rt != nullptr;
+    // --- Fragment-shader shell: vec4 outputs for the implemented MRT0/MRT1 exports. ---
+    uint32_t t_v4f = 0;
+    std::array<uint32_t, 2> v_color{};
+    void begin_fragment(const ShaderResourceTable* rt = nullptr, uint32_t color_mask = 1u) {
+        bool with_cbufs = rt != nullptr;
         t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_i32 = id(); t_bool = id();
-        t_v4f = id(); uint32_t t_ptr_out = id(); v_color = id(); f_main = id(); uint32_t lbl = id(); glsl = id();
+        t_v4f = id(); uint32_t t_ptr_out = id();
+        for (uint32_t mrt = 0; mrt < v_color.size(); ++mrt)
+            if (color_mask & (1u << mrt)) v_color[mrt] = id();
+        f_main = id(); uint32_t lbl = id(); glsl = id();
         put(caps, Op_Capability, {Cap_Shader});
         { std::vector<uint32_t> o{glsl}; pstr(o, "GLSL.std.450"); putv(extimp, Op_ExtInstImport, o); }
         put(mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
         is_fragment = true;
         desc_set = 1;   // PS resources live in descriptor set 1 (VS owns set 0) — no cross-stage binding collision
-        exec_model = Exec_Fragment; iface = {v_color};   // EntryPoint deferred to finish()
+        exec_model = Exec_Fragment;
+        for (uint32_t output : v_color) if (output) iface.push_back(output); // EntryPoint deferred
         put(exec, Op_ExecutionMode, {f_main, EM_OriginUpperLeft});
-        put(deco, Op_Decorate, {v_color, Dec_Location, 0});
+        for (uint32_t mrt = 0; mrt < v_color.size(); ++mrt)
+            if (v_color[mrt]) put(deco, Op_Decorate, {v_color[mrt], Dec_Location, mrt});
         put(types, Op_TypeVoid, {t_void});
         put(types, Op_TypeFunction, {t_fn, t_void});
         put(types, Op_TypeFloat, {t_f32, 32});
@@ -901,15 +908,17 @@ struct SpirvCompute {
         put(types, Op_TypeBool, {t_bool});
         put(types, Op_TypeVector, {t_v4f, t_f32, 4});
         put(types, Op_TypePointer, {t_ptr_out, SC_Output, t_v4f});
-        put(types, Op_Variable, {t_ptr_out, v_color, SC_Output});
+        for (uint32_t output : v_color)
+            if (output) put(types, Op_Variable, {t_ptr_out, output, SC_Output});
         if (with_cbufs) declare_cbufs(rt);   // only when the shader has memory ops (keeps no-op renders binding-free)
         put(code, Op_Function, {t_void, f_main, FC_None, t_fn});
         put(code, Op_Label, {lbl}); cur_block = lbl;
     }
-    // Write a vec4(r,g,b,a) (bit-operands) to the fragment color output (EXP MRT0).
-    void export_color(uint32_t r, uint32_t g, uint32_t bl, uint32_t a) {
+    // Write a vec4(r,g,b,a) (bit-operands) to the matching fragment color output.
+    void export_color(uint32_t mrt, uint32_t r, uint32_t g, uint32_t bl, uint32_t a) {
+        if (mrt >= v_color.size() || !v_color[mrt]) return;
         uint32_t v = id(); putv(code, Op_CompositeConstruct, {t_v4f, v, bcf(r), bcf(g), bcf(bl), bcf(a)});
-        put(code, Op_Store, {v_color, v});
+        put(code, Op_Store, {v_color[mrt], v});
     }
 
     // --- Vertex-shader shell: gl_VertexIndex input + gl_Position (member 0 of a gl_PerVertex Block). ---
@@ -4782,8 +4791,18 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
 
+    // Preserve hardware target locations. MRT0 and MRT1 are backed by real Vulkan attachments; later
+    // targets remain unsupported and must never be silently remapped to location 0 (#635).
+    uint32_t color_mask = 0;
+    for (const auto& in : ins) {
+        if (in.is_end) break;
+        if (in.fmt == Rdna2Format::EXP && in.exp_target < 2)
+            color_mask |= 1u << in.exp_target;
+    }
+    if (!color_mask) return {};
+
     SpirvCompute b;
-    b.begin_fragment(rt);
+    b.begin_fragment(rt, color_mask);
     // Classify each interpolated attribute by HOW it's read (#152): v_interp_p2 (op 1) = smooth
     // rasterizer interpolation; v_interp_mov (op 2) = a raw per-vertex / provoking-vertex value (a
     // flat read). An attribute read only via v_interp_mov gets its Input varying decorated Flat so
@@ -4820,21 +4839,8 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
     // skips it; the block's EXEC narrow + the export's OpKill do the per-invocation discard (#102). This is
     // NOT added for the vertex/compute shells (their scc branches are real uniform-ifs / NGG culling).
     for (uint32_t pc : mask_test_branches(ins)) safe_branches.insert(pc);
-    // Which color MRT feeds Vulkan color attachment 0? By the hardware convention MRT0 -> color0, and
-    // prosper binds a single color attachment (color0), so the fragment's one Location-0 output must carry
-    // MRT0's export. Multi-render-target shaders (Dead Cells' world/G-buffer passes) emit their exports in
-    // DESCENDING target order (MRT3, MRT2, MRT1, MRT0), so the old "first EXP with target<=7 wins" wrote a
-    // non-color plane (MRT3) into color0 — the world rendered as that grayscale G-buffer channel instead of
-    // the colored albedo (#566, exact R=G=B / chroma 0). Select the LOWEST-numbered color MRT (MRT0 when
-    // present); single-MRT shaders (target 0 only) are unchanged.
-    uint32_t color_mrt = 0xFFFFFFFFu;
-    for (const auto& in : ins) {
-        if (in.is_end) break;
-        if (in.fmt == Rdna2Format::EXP && in.exp_target <= 7 && in.exp_target < color_mrt)
-            color_mrt = in.exp_target;
-    }
-    bool exported = false;
-    auto exp_fn = [&](const Rdna2Inst& in) -> bool {         // EXP MRTn -> the color0 output
+    std::array<bool, 2> exported{};
+    auto exp_fn = [&](const Rdna2Inst& in) -> bool {         // EXP MRT0/MRT1 -> matching output
         // An export while EXEC is narrowed (lanes killed by an alpha test / v_cmpx and not restored to
         // all-on) must not write the inactive lanes. Lower it to a real fragment discard: OpKill the lanes
         // whose EXEC bit is false, then export from the survivors under full EXEC. This is exactly the
@@ -4842,20 +4848,21 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
         // exec,saved -> shade -> export): the surviving lanes are the ones that passed the test. (When EXEC
         // was never narrowed this is a no-op — the common sRGB/tonemap restore-then-export path.)
         if (rs.exec_narrowed) { b.discard_unless(rs.exec); rs.exec = b.btrue(); rs.exec_narrowed = false; }
-        if (in.exp_target == color_mrt && !exported) {
+        if (in.exp_target < exported.size() && !exported[in.exp_target]) {
             bool eok = true;   // a Special (wave-mask) source has no data value — reject, don't export 0 (#134)
             if (in.exp_compr) {
                 // COMPR: the 4 channels are two f16x2 pairs — src[0] holds (r,g), src[1] holds (b,a).
                 // Unpack each half to a float and reassemble the vec4 (the pkrtz'd tonemap/sRGB output).
                 uint32_t p0 = operand_bits(b, rs, in, in.src[0], &eok), p1 = operand_bits(b, rs, in, in.src[1], &eok);
-                b.export_color(b.unpack_half(p0, 0), b.unpack_half(p0, 1),
+                b.export_color(in.exp_target, b.unpack_half(p0, 0), b.unpack_half(p0, 1),
                                b.unpack_half(p1, 0), b.unpack_half(p1, 1));
             } else {
-                b.export_color(operand_bits(b, rs, in, in.src[0], &eok), operand_bits(b, rs, in, in.src[1], &eok),
+                b.export_color(in.exp_target,
+                               operand_bits(b, rs, in, in.src[0], &eok), operand_bits(b, rs, in, in.src[1], &eok),
                                operand_bits(b, rs, in, in.src[2], &eok), operand_bits(b, rs, in, in.src[3], &eok));
             }
             if (!eok) return false;
-            exported = true;
+            exported[in.exp_target] = true;
         }
         return true;   // ignore NULL / additional exports for now
     };
@@ -4863,7 +4870,7 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
     // is handled by EXEC predication like compute, and the export is guarded above. Memory ops need a
     // resource table. Loops (if any) are reconstructed by emit_body.
     if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/true, /*allow_smem*/rt != nullptr, exp_fn, code, dwords)) return {};
-    if (!exported) return {};
+    if (!exported[0] && !exported[1]) return {};
     return b.finish();
 }
 

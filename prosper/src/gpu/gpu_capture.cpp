@@ -37,7 +37,7 @@ namespace prosper::gpu {
 namespace {
 
 constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
-constexpr uint32_t kVersion = 9;
+constexpr uint32_t kVersion = 10;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -213,6 +213,26 @@ bool read_pipeline(Reader& r, ResolvedPipelineState& p, uint32_t version) {
         !r.u32(p.db_depth_size) || !r.u32(p.db_depth_slice) || !r.u32(p.db_htile_surface) ||
         !r.u32(p.db_rmi_l2_cache_control)) return false;
     return true;
+}
+
+void write_mrt1_pipeline(Writer& w, const ResolvedPipelineState& p) {
+    w.u32(p.color1_format); w.u8(p.has_clear_color1); for (float v : p.clear_color1) w.f32(v);
+    w.u8(p.blend1_enable); w.u32(p.src_color_blend_factor1); w.u32(p.dst_color_blend_factor1);
+    w.u32(p.color_blend_op1); w.u32(p.src_alpha_blend_factor1); w.u32(p.dst_alpha_blend_factor1);
+    w.u32(p.alpha_blend_op1); w.u32(p.color1_write_mask);
+}
+
+bool read_mrt1_pipeline(Reader& r, ResolvedPipelineState& p) {
+    uint8_t b = 0;
+    if (!r.u32(p.color1_format) || !r.u8(b)) return false;
+    p.has_clear_color1 = b != 0;
+    for (float& v : p.clear_color1) if (!r.f32(v)) return false;
+    if (!r.u8(b)) return false;
+    p.blend1_enable = b != 0;
+    return r.u32(p.src_color_blend_factor1) && r.u32(p.dst_color_blend_factor1) &&
+           r.u32(p.color_blend_op1) && r.u32(p.src_alpha_blend_factor1) &&
+           r.u32(p.dst_alpha_blend_factor1) && r.u32(p.alpha_blend_op1) &&
+           r.u32(p.color1_write_mask);
 }
 
 void write_resource(Writer& w, const GpuCapturedResource& c) {
@@ -595,6 +615,9 @@ bool capture_failure_diagnostics(
         diagnostic.color0_base = failure.color0_base;
         diagnostic.color0_width = failure.color0_width;
         diagnostic.color0_height = failure.color0_height;
+        diagnostic.color1_base = failure.color1_base;
+        diagnostic.color1_width = failure.color1_width;
+        diagnostic.color1_height = failure.color1_height;
         diagnostic.vertex_count = failure.vertex_count;
         diagnostic.compute_launch = failure.compute_launch;
         for (const auto& runtime_stage : failure.stages) {
@@ -728,6 +751,8 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         GpuCapturedDraw c; c.vs = d.vs; c.fs = d.fs; c.ps = d.ps; c.vertex_count = d.vertex_count;
         c.indices = d.indices; c.color0_base = d.color0_base;
         c.color0_width = d.color0_width; c.color0_height = d.color0_height;
+        c.color1_base = d.color1_base;
+        c.color1_width = d.color1_width; c.color1_height = d.color1_height;
         c.draw_index = d.draw_index; c.command_order = d.command_order;
         if (!capture_table(d.vrt.get(), intervals, include_resource_data, c.vrt, error) ||
             !capture_table(d.prt.get(), intervals, include_resource_data, c.prt, error)) return false;
@@ -767,6 +792,7 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         for (const auto& item : draws) {
             add_table(item.vrt.get()); add_table(item.prt.get());
             if (item.color0_base) candidates.push_back(item.color0_base);
+            if (item.color1_base) candidates.push_back(item.color1_base);
         }
         for (const auto& item : computes) add_table(item.resources.get());
         std::sort(candidates.begin(), candidates.end());
@@ -970,6 +996,19 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
     };
     for (const auto& draw : c.draws) { write_depths(draw.vrt); write_depths(draw.prt); }
     for (const auto& compute : c.computes) write_depths(compute.resources);
+    // v10 appends MRT1 state in one deterministic extension, leaving every v1-v9 record prefix byte-
+    // compatible. This also keeps old fixture construction simple: remove this tail and lower version.
+    w.u32(static_cast<uint32_t>(c.draws.size()));
+    for (const auto& draw : c.draws) {
+        w.u64(draw.color1_base); w.u32(draw.color1_width); w.u32(draw.color1_height);
+        write_mrt1_pipeline(w, draw.ps);
+    }
+    w.u32(static_cast<uint32_t>(c.failure_diagnostics.size()));
+    for (const auto& diagnostic : c.failure_diagnostics) {
+        w.u64(diagnostic.color1_base); w.u32(diagnostic.color1_width);
+        w.u32(diagnostic.color1_height);
+        if (diagnostic.pipeline_present) write_mrt1_pipeline(w, diagnostic.pipeline);
+    }
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -1241,6 +1280,24 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
         for (auto& compute : c.computes)
             if (!read_depths(compute.resources)) return false;
     }
+    if (version >= 10) {
+        uint32_t draw_count = 0;
+        if (!r.u32(draw_count) || draw_count != c.draws.size()) {
+            error = "invalid MRT1 draw-state count"; return false;
+        }
+        for (auto& draw : c.draws)
+            if (!r.u64(draw.color1_base) || !r.u32(draw.color1_width) ||
+                !r.u32(draw.color1_height) || !read_mrt1_pipeline(r, draw.ps)) return false;
+        uint32_t failure_count = 0;
+        if (!r.u32(failure_count) || failure_count != c.failure_diagnostics.size()) {
+            error = "invalid MRT1 failure-state count"; return false;
+        }
+        for (auto& diagnostic : c.failure_diagnostics) {
+            if (!r.u64(diagnostic.color1_base) || !r.u32(diagnostic.color1_width) ||
+                !r.u32(diagnostic.color1_height)) return false;
+            if (diagnostic.pipeline_present && !read_mrt1_pipeline(r, diagnostic.pipeline)) return false;
+        }
+    }
     if (r.left) { error = "capture has trailing data"; return false; }
     return true;
 }
@@ -1290,6 +1347,8 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         DrawItem d; d.vs = x.vs; d.fs = x.fs; d.ps = x.ps; d.vertex_count = x.vertex_count;
         d.indices = x.indices; d.color0_base = x.color0_base;
         d.color0_width = x.color0_width; d.color0_height = x.color0_height;
+        d.color1_base = x.color1_base;
+        d.color1_width = x.color1_width; d.color1_height = x.color1_height;
         d.draw_index = x.draw_index; d.command_order = x.command_order;
         if (!table(x.vrt, d.vrt) || !table(x.prt, d.prt)) return false;
         out.items.push_back(std::move(d));
