@@ -1342,6 +1342,8 @@ namespace {
         void* view_base;
         uint64_t view_size;
         bool sparse;
+        uint64_t page_cache_generation = 0;
+        std::vector<uint64_t> committed_pages;
     };
     std::mutex g_dview_mx;
     std::vector<DmemView> g_dviews;
@@ -1460,7 +1462,15 @@ namespace {
         }
         {
             std::lock_guard<std::mutex> lk(g_dview_mx);
-            g_dviews.push_back({ (uint64_t)(uintptr_t)guest, len, phys, view, view_size, sparse });
+            DmemView tracked{
+                (uint64_t)(uintptr_t)guest, len, phys, view, view_size, sparse
+            };
+            if (sparse) {
+                const uint64_t pages = (len + 0x3fff) / 0x4000;
+                tracked.committed_pages.resize((pages + 63) / 64);
+                tracked.page_cache_generation = host::guest_mapping_generation();
+            }
+            g_dviews.push_back(std::move(tracked));
         }
         if (sparse)
             MLOG("map_dmem sparse aligned view va=0x%llx len=0x%llx phys=0x%llx align=0x%llx\n",
@@ -1492,6 +1502,21 @@ namespace {
 
     bool tracked_mapping_access(uint64_t begin, uint64_t end, bool write, int& hp) {
         if (begin >= end) return false;
+        struct AccessCache {
+            uint64_t generation = 0;
+            uint64_t begin = 0;
+            uint64_t end = 0;
+            int prot = 0;
+        };
+        static thread_local AccessCache cache;
+        static const bool cache_disabled = getenv("PROSPER_NO_SPARSE_DMEM_ACCESS_CACHE") != nullptr;
+        const uint64_t generation = host::guest_mapping_generation();
+        if (!cache_disabled && cache.generation == generation &&
+            begin >= cache.begin && end <= cache.end) {
+            if (!(cache.prot & HP_R) || (write && !(cache.prot & HP_W))) return false;
+            hp = cache.prot;
+            return true;
+        }
         std::lock_guard<std::mutex> lk(g_mx);
         const Mapping* best = nullptr;
         for (const Mapping& mapping : g_maps) {
@@ -1502,6 +1527,12 @@ namespace {
         if (!best || end > best->base + best->size || !(best->prot & HP_R) ||
             (write && !(best->prot & HP_W))) return false;
         hp = best->prot;
+        if (!cache_disabled) {
+            cache.generation = host::guest_mapping_generation();
+            cache.begin = best->base;
+            cache.end = best->base + best->size;
+            cache.prot = best->prot;
+        }
         return true;
     }
 
@@ -1512,6 +1543,50 @@ namespace {
         if (!tracked_mapping_access(addr, addr + len, write, hp)) return 0;
         const uint64_t first = addr & ~0x3fffull;
         const uint64_t last = (addr + len - 1) & ~0x3fffull;
+        static const bool page_cache_disabled =
+            getenv("PROSPER_NO_SPARSE_DMEM_PAGE_CACHE") != nullptr;
+        if (!page_cache_disabled) {
+            std::lock_guard<std::mutex> lk(g_dview_mx);
+            DmemView* selected = nullptr;
+            for (DmemView& view : g_dviews) {
+                if (!view.sparse || addr < view.guest_base ||
+                    addr + len > view.guest_base + view.guest_size) continue;
+                selected = &view;
+                break;
+            }
+            if (!selected) return 0;
+            const uint64_t generation = host::guest_mapping_generation();
+            if (selected->page_cache_generation != generation) {
+                std::fill(selected->committed_pages.begin(),
+                          selected->committed_pages.end(), 0);
+                selected->page_cache_generation = generation;
+            }
+            const uint64_t view_first = selected->guest_base & ~0x3fffull;
+            for (uint64_t page = first;; page += 0x4000) {
+                const uint64_t index = (page - view_first) / 0x4000;
+                if (index / 64 >= selected->committed_pages.size()) return 0;
+                const uint64_t mask = 1ull << (index & 63);
+                if (!(selected->committed_pages[index / 64] & mask)) {
+                    if (!VirtualAlloc((void*)(uintptr_t)page, 0x4000, MEM_COMMIT,
+                                      win_page_prot(hp))) {
+                        MEMORY_BASIC_INFORMATION mbi{};
+                        if (!VirtualQuery((const void*)(uintptr_t)page, &mbi, sizeof(mbi)) ||
+                            mbi.State != MEM_COMMIT) return 0;
+                        const DWORD blocked = PAGE_NOACCESS | PAGE_GUARD;
+                        const DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                                               PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                                               PAGE_EXECUTE_WRITECOPY;
+                        const DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY |
+                                               PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+                        if ((mbi.Protect & blocked) || !(mbi.Protect & readable) ||
+                            (write && !(mbi.Protect & writable))) return 0;
+                    }
+                    selected->committed_pages[index / 64] |= mask;
+                }
+                if (page == last) break;
+            }
+            return 1;
+        }
         uint64_t page = first;
         for (;;) {
             MEMORY_BASIC_INFORMATION mbi{};
