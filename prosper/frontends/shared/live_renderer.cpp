@@ -273,7 +273,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
         pertarget && !getenv("PROSPER_GPU_CAPTURE") &&
         !getenv("PROSPER_GPU_TIMELINE_CAPTURE") && !getenv("PROSPER_GPU_REPLAY_EXPORT_RTT") &&
         !getenv("PROSPER_GPU_REPLAY_RTT_SEEDS") && !getenv("PROSPER_DUMP_SAMPLED_RTT") &&
-        !getenv("PROSPER_DUMP_RTGROUPS") && !getenv("PROSPER_DUMP_DRAWSTEPS") &&
+        !getenv("PROSPER_DUMP_RTGROUPS") && !getenv("PROSPER_DUMP_RTGROUPS_RGBA") &&
+        !getenv("PROSPER_DUMP_DRAWSTEPS") &&
         !getenv("PROSPER_RESOURCE_HASH_DIM") && !getenv("PROSPER_TARGET_STEP_HASH_DIM") &&
         !getenv("PROSPER_RTTLOG");
     if (live_gpu_targets)
@@ -1515,18 +1516,50 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             const bool refvs = getenv("PROSPER_RENDER_REFVS");
             std::vector<uint32_t> refvs_spv(kRefVs, kRefVs + sizeof(kRefVs) / 4);
             std::vector<uint32_t> ps_override;
+            bool ps_override_is_file = false;   // true only for a valid PROSPER_FS_SPV *file* override
             if (getenv("PROSPER_RENDER_TESTPS")) {
                 static const uint32_t kMagentaPs[] = {   // v0=1.0(R) v1=0.0(G) v2=1.0(B) v3=1.0(A); exp mrt0; endpgm
                     0x7E0002F2u, 0x7E020280u, 0x7E0402F2u, 0x7E0602F2u, 0xF800180Fu, 0x03020100u, 0xBF810000u };
                 ps_override = prosper::gpu::recompile_fragment(kMagentaPs, sizeof(kMagentaPs) / 4, nullptr);
             }
-            if (const char* fsp = getenv("PROSPER_FS_SPV")) {
-                if (FILE* f = fopen(fsp, "rb")) {
-                    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
-                    std::vector<uint32_t> m((size_t)sz / 4);
-                    if (sz >= 20 && fread(m.data(), 4, m.size(), f) == m.size()) ps_override = std::move(m);
-                    fclose(f);
+            // Validated SPIR-V file load: require a complete read of a word-aligned file >= 20 bytes
+            // (5 words: the minimum SPIR-V header). Validate size BEFORE allocating so a failed ftell
+            // (-1 -> huge size_t) cannot trigger a wild allocation, and reject non-word-aligned files
+            // rather than silently dropping trailing bytes. Returns false (out untouched) on any failure.
+            auto load_spv_file = [](const char* path, std::vector<uint32_t>& out) -> bool {
+                FILE* f = fopen(path, "rb");
+                if (!f) return false;
+                bool ok = false;
+                if (fseek(f, 0, SEEK_END) == 0) {
+                    long sz = ftell(f);
+                    if (sz >= 20 && (sz % 4) == 0 && fseek(f, 0, SEEK_SET) == 0) {
+                        std::vector<uint32_t> m(static_cast<size_t>(sz) / 4);
+                        if (fread(m.data(), 4, m.size(), f) == m.size()) { out = std::move(m); ok = true; }
+                    }
                 }
+                fclose(f);
+                return ok;
+            };
+            if (const char* fsp = getenv("PROSPER_FS_SPV")) {
+                std::vector<uint32_t> m;
+                if (load_spv_file(fsp, m)) { ps_override = std::move(m); ps_override_is_file = true; }
+                else fprintf(stderr, "[fs-spv] PROSPER_FS_SPV='%s' invalid/unreadable -> no file override\n", fsp);
+            }
+            // PROSPER_FS_SPV_MATCH=<file>: restrict the PROSPER_FS_SPV *file* override to draws whose
+            // recompiled fragment SPIR-V EXACTLY equals this file (a per-draw A/B substitution that does
+            // not touch draws with a different descriptor contract). FAILS CLOSED: if requested but the
+            // file is missing/short/unaligned/unreadable, NO file override is applied — never a silent
+            // global fallback (that would recreate the exact hazard this gate exists to prevent). Does
+            // NOT gate PROSPER_RENDER_TESTPS, which stays global by design.
+            // mode: 0 = not requested (legacy global file override), 1 = loaded+valid (exact match only),
+            //       2 = requested but invalid (file override disabled).
+            int fs_match_mode = 0;
+            std::vector<uint32_t> fs_match;
+            if (const char* mp = getenv("PROSPER_FS_SPV_MATCH")) {
+                fs_match_mode = load_spv_file(mp, fs_match) ? 1 : 2;
+                if (fs_match_mode == 2)
+                    fprintf(stderr, "[fs-match] PROSPER_FS_SPV_MATCH='%s' invalid/unreadable -> applying NO "
+                            "fragment file override (fail closed)\n", mp);
             }
             const bool nops = getenv("PROSPER_RENDER_NOPS");
             // Assemble backend draws for a subset of the submit's items — one BackendDraw per realized
@@ -1539,9 +1572,19 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     const auto& it = *itp;
                     prosper::test::BackendDraw bd;
                     bd.vs     = refvs ? refvs_spv : it.vs;
-                    bd.fs     = ps_override.empty() ? it.fs : ps_override;
+                    // The PROSPER_FS_SPV *file* override is match-gated; a TESTPS override is not.
+                    bool fs_ov = !ps_override.empty();
+                    if (fs_ov && ps_override_is_file) {
+                        if (fs_match_mode == 1)      fs_ov = (it.fs == fs_match);   // valid match -> exact only
+                        else if (fs_match_mode == 2) fs_ov = false;                // requested-but-invalid -> off
+                        // mode 0 -> legacy global file override (unchanged)
+                    }
+                    if (fs_ov && ps_override_is_file && fs_match_mode == 1)
+                        fprintf(stderr, "[fs-match] file override applied to draw#%llu\n",
+                                (unsigned long long)it.draw_index);
+                    bd.fs     = fs_ov ? ps_override : it.fs;
                     bd.vs_identity = refvs ? 0 : it.vs_identity;
-                    bd.fs_identity = ps_override.empty() ? it.fs_identity : 0;
+                    bd.fs_identity = fs_ov ? 0 : it.fs_identity;
                     bd.vcount = refvs ? 3u : it.vertex_count;
                     bd.ps     = nops ? nullptr : &it.ps;
                     bd.R      = build_R(it, it.vrt.get(), it.prt.get());
@@ -2002,22 +2045,72 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             prosper::test::dump_bmp(fn, spx, gw, gh);
                         }
                     }
-                    // PROSPER_DUMP_RTGROUPS=<min-nonzero-bytes>: dump each per-target group's rendered
-                    // pixels (rtgrp_<base>_<frame>.bmp in PROSPER_FRAME_DIR) — to inspect an intermediate
-                    // pass (e.g. the UI/banner RT) instead of only the presented composite. Diagnostic.
-                    // PROSPER_DUMP_RTGROUPS_ADDR optionally limits a long replay to one target.
-                    if (const char* rg = getenv("PROSPER_DUMP_RTGROUPS"); rg && !rendered_pixels.empty()) {
+                    // Per-target group dumps into PROSPER_FRAME_DIR. Two INDEPENDENT opt-ins (either may
+                    // be set alone); PROSPER_DUMP_RTGROUPS_ADDR optionally limits a long replay to one
+                    // target VA. Diagnostic; no default behavior change.
+                    //  - PROSPER_DUMP_RTGROUPS=<min-nonzero-bytes>: a 24-bit BMP (alpha dropped) of the
+                    //    format-inspected pixels — to eyeball an intermediate pass (e.g. a UI/banner RT).
+                    //  - PROSPER_DUMP_RTGROUPS_RGBA: the RAW RGBA8 backend bytes (alpha PRESERVED, no
+                    //    format inspection) — needed to reason about premultiplied-alpha UI compositing
+                    //    that samples an RT's alpha as a blend factor. Non-RGBA8 targets are skipped
+                    //    visibly rather than writing native bytes under a misleading .rgba contract.
+                    if ((getenv("PROSPER_DUMP_RTGROUPS") || getenv("PROSPER_DUMP_RTGROUPS_RGBA")) &&
+                        !rendered_pixels.empty()) {
                         size_t nz = 0; for (uint8_t b : rendered_pixels) nz += (b != 0);
                         const char* address_filter = getenv("PROSPER_DUMP_RTGROUPS_ADDR");
                         const uint64_t wanted_base = address_filter && *address_filter
                             ? strtoull(address_filter, nullptr, 0) : 0;
-                        if (nz >= (size_t)atol(rg) && (!wanted_base || base == wanted_base)) {
-                            const std::vector<uint8_t> inspected = inspection_rgba8(
-                                rendered_pixels, gw, gh, pass_format);
-                            const char* dd = getenv("PROSPER_FRAME_DIR");
-                            char fn[512]; snprintf(fn, sizeof fn, "%s/rtgrp_%llx_%04d.bmp",
-                                                   dd ? dd : ".", (unsigned long long)base, frame_no.load());
-                            prosper::test::dump_bmp(fn, inspected, gw, gh);
+                        const char* dd = getenv("PROSPER_FRAME_DIR");
+                        // Identify the pass by its first..last draw index so multiple passes to the same
+                        // target VA in one frame do not silently overwrite each other.
+                        const uint64_t pass_d0 = render_pass.empty() ? 0u : render_pass.front()->draw_index;
+                        const uint64_t pass_d1 = render_pass.empty() ? 0u : render_pass.back()->draw_index;
+                        if (!wanted_base || base == wanted_base) {
+                            if (const char* rg = getenv("PROSPER_DUMP_RTGROUPS"); rg && nz >= (size_t)atol(rg)) {
+                                const std::vector<uint8_t> inspected = inspection_rgba8(
+                                    rendered_pixels, gw, gh, pass_format);
+                                char fn[512]; snprintf(fn, sizeof fn, "%s/rtgrp_%llx_%04d.bmp",
+                                                       dd ? dd : ".", (unsigned long long)base, frame_no.load());
+                                prosper::test::dump_bmp(fn, inspected, gw, gh);
+                            }
+                            // Independent of the BMP variable AND its nonzero threshold, so a fully
+                            // transparent (all-zero) group is captured too. Self-describing filename
+                            // (extent + draw range) and failure-visible: a missing file must not be
+                            // mistaken for a transparent/empty result.
+                            if (getenv("PROSPER_DUMP_RTGROUPS_RGBA")) {
+                                const uint64_t expected_bytes_u64 = static_cast<uint64_t>(gw) * gh * 4u;
+                                const bool rgba8_format = pass_format == VK_FORMAT_R8G8B8A8_UNORM;
+                                const bool size_valid = expected_bytes_u64 <= SIZE_MAX &&
+                                    rendered_pixels.size() == static_cast<size_t>(expected_bytes_u64);
+                                if (!rgba8_format || !size_valid) {
+                                    fprintf(stderr,
+                                            "[rtt] rgba-dump skipped target=0x%llx %ux%u draws=%llu..%llu "
+                                            "reason=%s format=%d expected=%llu actual=%zu\n",
+                                            (unsigned long long)base, gw, gh,
+                                            (unsigned long long)pass_d0, (unsigned long long)pass_d1,
+                                            rgba8_format ? "size-mismatch" : "unsupported-format",
+                                            static_cast<int>(pass_format),
+                                            (unsigned long long)expected_bytes_u64,
+                                            rendered_pixels.size());
+                                } else {
+                                    char rn[600]; snprintf(rn, sizeof rn, "%s/rtgrp_%llx_%ux%u_f%04d_d%04llu-%04llu.rgba",
+                                                           dd ? dd : ".", (unsigned long long)base, gw, gh,
+                                                           frame_no.load(), (unsigned long long)pass_d0,
+                                                           (unsigned long long)pass_d1);
+                                    FILE* rf = fopen(rn, "wb");
+                                    bool ok = rf != nullptr; size_t wrote = 0;
+                                    if (rf) {
+                                        wrote = fwrite(rendered_pixels.data(), 1, rendered_pixels.size(), rf);
+                                        ok = (wrote == rendered_pixels.size());
+                                        if (fclose(rf) != 0) ok = false;
+                                    }
+                                    fprintf(stderr, "[rtt] rgba-dump %s target=0x%llx %ux%u draws=%llu..%llu "
+                                            "bytes=%zu path=%s\n", ok ? "ok" : "FAILED",
+                                            (unsigned long long)base, gw, gh,
+                                            (unsigned long long)pass_d0, (unsigned long long)pass_d1,
+                                            wrote, rn);
+                                }
+                            }
                         }
                     }
                     if (!rendered_pixels.empty() && pass_format == VK_FORMAT_R8G8B8A8_UNORM) {

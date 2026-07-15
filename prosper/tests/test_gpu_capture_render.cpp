@@ -4,10 +4,14 @@
 #include "../frontends/shared/live_renderer.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <string>
 #include <vector>
+#include <vulkan/vulkan.h>
 
 using namespace prosper::gpu;
 
@@ -20,6 +24,22 @@ static void set_descriptor_mode(const char* value) {
     _putenv_s("PROSPER_DESCRIPTOR_VALIDATE", value);
 #else
     setenv("PROSPER_DESCRIPTOR_VALIDATE", value, 1);
+#endif
+}
+
+static void set_env(const char* name, const std::string& value) {
+#ifdef _WIN32
+    _putenv_s(name, value.c_str());
+#else
+    setenv(name, value.c_str(), 1);
+#endif
+}
+
+static void unset_env(const char* name) {
+#ifdef _WIN32
+    _putenv_s(name, "");
+#else
+    unsetenv(name);
 #endif
 }
 
@@ -79,6 +99,48 @@ int main() {
         const uint8_t* center = &pixels[(static_cast<size_t>(H / 2) * W + W / 2) * 4];
         CHECK(center[0] > 0xC0 && center[1] < 0x40 && center[2] < 0x40,
               "replay samples captured red texel from owned backing");
+    }
+
+    {
+        const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+        const std::filesystem::path dump_dir = std::filesystem::temp_directory_path() /
+            ("prosper-rtgroup-rgba8-" + std::to_string(nonce));
+        std::filesystem::create_directories(dump_dir);
+        set_env("PROSPER_FRAME_DIR", dump_dir.string());
+        set_env("PROSPER_DUMP_RTGROUPS_RGBA", "1");
+
+        DrawItem rgba8_dump = replay.items[0];
+        rgba8_dump.color0_base = 0xda700000;
+        rgba8_dump.color0_width = 8;
+        rgba8_dump.color0_height = 8;
+        rgba8_dump.draw_index = (uint64_t{1} << 32) + 7;
+        rgba8_dump.ps.color0_format = VK_FORMAT_R8G8B8A8_UNORM;
+        render_submit_items({rgba8_dump}, 8, 8);
+
+        const std::string rgba8_prefix = "rtgrp_da700000_8x8_";
+        const std::string draw_suffix = "_d4294967303-4294967303.rgba";
+        bool found_rgba8 = false;
+        for (const auto& entry : std::filesystem::directory_iterator(dump_dir)) {
+            const std::string name = entry.path().filename().string();
+            if (name.starts_with(rgba8_prefix) && name.ends_with(draw_suffix)) {
+                found_rgba8 = std::filesystem::file_size(entry.path()) == 8u * 8u * 4u;
+            }
+        }
+        CHECK(found_rgba8, "RT-group RGBA8 dump preserves alpha bytes and 64-bit draw indices");
+
+        DrawItem fp16_dump = rgba8_dump;
+        fp16_dump.color0_base = 0xdb700000;
+        fp16_dump.ps.color0_format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        render_submit_items({fp16_dump}, 8, 8);
+        bool found_fp16 = false;
+        for (const auto& entry : std::filesystem::directory_iterator(dump_dir)) {
+            found_fp16 |= entry.path().filename().string().starts_with("rtgrp_db700000_8x8_");
+        }
+        CHECK(!found_fp16, "RT-group RGBA8 dump skips native FP16 targets");
+
+        unset_env("PROSPER_DUMP_RTGROUPS_RGBA");
+        unset_env("PROSPER_FRAME_DIR");
+        std::filesystem::remove_all(dump_dir);
     }
 
     // Texture decode scratch survives between renderer callbacks and reuses slots from the front.
