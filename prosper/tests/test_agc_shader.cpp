@@ -125,9 +125,9 @@ int main() {
         empty_state, reinterpret_cast<uint64_t>(pixel_buffer_fetch), true);
     const prosper::gpu::ShaderResource* pixel_buffer = pixel_table
         ? pixel_table->by_fetch_pc(6) : nullptr;
-    CHECK(pixel_buffer && pixel_buffer->cls == prosper::gpu::ResourceClass::VertexBuffer &&
+    CHECK(pixel_buffer && pixel_buffer->cls == prosper::gpu::ResourceClass::ConstantBuffer &&
           pixel_buffer->gpu_addr == 0x20000u && pixel_buffer->stride == 16u,
-          "pixel-stage buffer_load_format keeps its exact dynamic V# resource");
+          "pixel-stage buffer_load_format keeps its exact structured-buffer V# resource");
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");

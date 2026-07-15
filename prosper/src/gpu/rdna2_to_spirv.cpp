@@ -3138,6 +3138,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 return true;
             }
+            // A data load with a runtime table must resolve to one of that table's buffers. The
+            // table-less compute harness still owns the legacy binding-2 convention, but silently
+            // retaining it here produces SPIR-V whose descriptor interface the live renderer cannot
+            // satisfy (and, worse, could read the wrong buffer if binding 2 happened to exist).
+            if (rt && !cbuf_resolved) { ok = false; return true; }
             if (soff_dyn) {
                 // Dynamic dword index: (soffset + signed imm) >> 2 (uint add == two's-complement add).
                 uint32_t idx0 = b.ibin(Op_ShiftRightLogical,
