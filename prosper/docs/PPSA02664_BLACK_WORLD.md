@@ -10,7 +10,8 @@ falsified the original premise (below) before any tooling was built.
 > IS rendered but is lost during final composition in offline replay. The **evolving diagnosis and all
 > results now live on issue #320**, not in this document (a durable doc must not become a moving
 > hypothesis log). This PR contains only two diagnostics — `PROSPER_FS_SPV_MATCH` (fail-closed
-> content-gated fragment override) and `PROSPER_DUMP_RTGROUPS_RGBA` (alpha-preserving per-target dump).
+> content-gated fragment override) and `PROSPER_DUMP_RTGROUPS_RGBA` (alpha-preserving raw-RGBA8
+> per-target dump; non-RGBA8 targets are skipped with an explicit format/size diagnostic).
 > **Neither constitutes a gameplay root-cause claim or a fix**; the current root cause is unresolved and
 > gated on a live/replay state comparison (see #320).
 

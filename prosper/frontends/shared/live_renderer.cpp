@@ -273,7 +273,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
         pertarget && !getenv("PROSPER_GPU_CAPTURE") &&
         !getenv("PROSPER_GPU_TIMELINE_CAPTURE") && !getenv("PROSPER_GPU_REPLAY_EXPORT_RTT") &&
         !getenv("PROSPER_GPU_REPLAY_RTT_SEEDS") && !getenv("PROSPER_DUMP_SAMPLED_RTT") &&
-        !getenv("PROSPER_DUMP_RTGROUPS") && !getenv("PROSPER_DUMP_DRAWSTEPS") &&
+        !getenv("PROSPER_DUMP_RTGROUPS") && !getenv("PROSPER_DUMP_RTGROUPS_RGBA") &&
+        !getenv("PROSPER_DUMP_DRAWSTEPS") &&
         !getenv("PROSPER_RESOURCE_HASH_DIM") && !getenv("PROSPER_TARGET_STEP_HASH_DIM") &&
         !getenv("PROSPER_RTTLOG");
     if (live_gpu_targets)
@@ -2051,7 +2052,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     //    format-inspected pixels — to eyeball an intermediate pass (e.g. a UI/banner RT).
                     //  - PROSPER_DUMP_RTGROUPS_RGBA: the RAW RGBA8 backend bytes (alpha PRESERVED, no
                     //    format inspection) — needed to reason about premultiplied-alpha UI compositing
-                    //    that samples an RT's alpha as a blend factor. dump_bmp cannot show this.
+                    //    that samples an RT's alpha as a blend factor. Non-RGBA8 targets are skipped
+                    //    visibly rather than writing native bytes under a misleading .rgba contract.
                     if ((getenv("PROSPER_DUMP_RTGROUPS") || getenv("PROSPER_DUMP_RTGROUPS_RGBA")) &&
                         !rendered_pixels.empty()) {
                         size_t nz = 0; for (uint8_t b : rendered_pixels) nz += (b != 0);
@@ -2061,8 +2063,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         const char* dd = getenv("PROSPER_FRAME_DIR");
                         // Identify the pass by its first..last draw index so multiple passes to the same
                         // target VA in one frame do not silently overwrite each other.
-                        const unsigned pass_d0 = render_pass.empty() ? 0u : (unsigned)render_pass.front()->draw_index;
-                        const unsigned pass_d1 = render_pass.empty() ? 0u : (unsigned)render_pass.back()->draw_index;
+                        const uint64_t pass_d0 = render_pass.empty() ? 0u : render_pass.front()->draw_index;
+                        const uint64_t pass_d1 = render_pass.empty() ? 0u : render_pass.back()->draw_index;
                         if (!wanted_base || base == wanted_base) {
                             if (const char* rg = getenv("PROSPER_DUMP_RTGROUPS"); rg && nz >= (size_t)atol(rg)) {
                                 const std::vector<uint8_t> inspected = inspection_rgba8(
@@ -2076,19 +2078,38 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             // (extent + draw range) and failure-visible: a missing file must not be
                             // mistaken for a transparent/empty result.
                             if (getenv("PROSPER_DUMP_RTGROUPS_RGBA")) {
-                                char rn[600]; snprintf(rn, sizeof rn, "%s/rtgrp_%llx_%ux%u_f%04d_d%04u-%04u.rgba",
-                                                       dd ? dd : ".", (unsigned long long)base, gw, gh,
-                                                       frame_no.load(), pass_d0, pass_d1);
-                                FILE* rf = fopen(rn, "wb");
-                                bool ok = rf != nullptr; size_t wrote = 0;
-                                if (rf) {
-                                    wrote = fwrite(rendered_pixels.data(), 1, rendered_pixels.size(), rf);
-                                    ok = (wrote == rendered_pixels.size());
-                                    if (fclose(rf) != 0) ok = false;
+                                const uint64_t expected_bytes_u64 = static_cast<uint64_t>(gw) * gh * 4u;
+                                const bool rgba8_format = pass_format == VK_FORMAT_R8G8B8A8_UNORM;
+                                const bool size_valid = expected_bytes_u64 <= SIZE_MAX &&
+                                    rendered_pixels.size() == static_cast<size_t>(expected_bytes_u64);
+                                if (!rgba8_format || !size_valid) {
+                                    fprintf(stderr,
+                                            "[rtt] rgba-dump skipped target=0x%llx %ux%u draws=%llu..%llu "
+                                            "reason=%s format=%d expected=%llu actual=%zu\n",
+                                            (unsigned long long)base, gw, gh,
+                                            (unsigned long long)pass_d0, (unsigned long long)pass_d1,
+                                            rgba8_format ? "size-mismatch" : "unsupported-format",
+                                            static_cast<int>(pass_format),
+                                            (unsigned long long)expected_bytes_u64,
+                                            rendered_pixels.size());
+                                } else {
+                                    char rn[600]; snprintf(rn, sizeof rn, "%s/rtgrp_%llx_%ux%u_f%04d_d%04llu-%04llu.rgba",
+                                                           dd ? dd : ".", (unsigned long long)base, gw, gh,
+                                                           frame_no.load(), (unsigned long long)pass_d0,
+                                                           (unsigned long long)pass_d1);
+                                    FILE* rf = fopen(rn, "wb");
+                                    bool ok = rf != nullptr; size_t wrote = 0;
+                                    if (rf) {
+                                        wrote = fwrite(rendered_pixels.data(), 1, rendered_pixels.size(), rf);
+                                        ok = (wrote == rendered_pixels.size());
+                                        if (fclose(rf) != 0) ok = false;
+                                    }
+                                    fprintf(stderr, "[rtt] rgba-dump %s target=0x%llx %ux%u draws=%llu..%llu "
+                                            "bytes=%zu path=%s\n", ok ? "ok" : "FAILED",
+                                            (unsigned long long)base, gw, gh,
+                                            (unsigned long long)pass_d0, (unsigned long long)pass_d1,
+                                            wrote, rn);
                                 }
-                                fprintf(stderr, "[rtt] rgba-dump %s target=0x%llx %ux%u draws=%u..%u "
-                                        "bytes=%zu path=%s\n", ok ? "ok" : "FAILED",
-                                        (unsigned long long)base, gw, gh, pass_d0, pass_d1, wrote, rn);
                             }
                         }
                     }
