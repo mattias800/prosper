@@ -164,13 +164,32 @@ void inspect_table(const char* stage, const prosper::gpu::ShaderResourceTable* t
             if (r.host_data_size >= 4) std::memcpy(&first, r.host_data, 4);
         }
         uint64_t hash = r.host_data ? prosper::gpu::gpu_capture_hash(r.host_data, static_cast<size_t>(r.host_data_size)) : 0;
+        size_t metadata_nz = 0, metadata_unique = 0;
+        size_t metadata_histogram[256] = {};
+        uint32_t metadata_first = 0;
+        if (r.dcc_metadata_host_data) {
+            for (uint64_t i = 0; i < r.dcc_metadata_host_data_size; ++i) {
+                const uint8_t value = r.dcc_metadata_host_data[i];
+                metadata_nz += value != 0;
+                metadata_histogram[value]++;
+            }
+            for (size_t count : metadata_histogram) metadata_unique += count != 0;
+            if (r.dcc_metadata_host_data_size >= 4)
+                std::memcpy(&metadata_first, r.dcc_metadata_host_data, 4);
+        }
+        const uint64_t metadata_hash = r.dcc_metadata_host_data
+            ? prosper::gpu::gpu_capture_hash(r.dcc_metadata_host_data,
+                                             static_cast<size_t>(r.dcc_metadata_host_data_size))
+            : 0;
         const bool temporal_seed = std::any_of(seeds.begin(), seeds.end(), [&](const auto& seed) {
             return seed.guest_addr == r.gpu_addr;
         });
         std::printf("  %s %-7s b=%u addr=%016llx declared=%u footprint=%llu captured=%llu "
                     "nz=%zu hash=%016llx first=%08x "
                     "fmt=%u nc=%u stride=%u %ux%ux%u tile=%u addr=%u%u%u swz=%u%u%u%u filt=%u/%u/%u "
-                    "dcc=%u meta=%016llx blocks=%u/%u flags=%u%u%u%u "
+                    "dcc=%u meta=%016llx meta-bytes=%llu/%llu meta-nz=%zu meta-unique=%zu "
+                    "meta-first=%08x meta-hash=%016llx "
+                    "blocks=%u/%u flags=%u%u%u%u "
                     "srt=%08x sgpr=%08x pc=%08x%s\n",
                     stage, class_name(r.cls), r.binding, static_cast<unsigned long long>(r.gpu_addr),
                     r.size,
@@ -183,6 +202,10 @@ void inspect_table(const char* stage, const prosper::gpu::ShaderResourceTable* t
                     r.swizzle[0], r.swizzle[1], r.swizzle[2], r.swizzle[3],
                     r.mag_filter, r.min_filter, r.mip_filter,
                     r.compression_enabled, static_cast<unsigned long long>(r.metadata_addr),
+                    static_cast<unsigned long long>(r.dcc_metadata_host_data_size),
+                    static_cast<unsigned long long>(r.dcc_metadata_size), metadata_nz,
+                    metadata_unique, metadata_first,
+                    static_cast<unsigned long long>(metadata_hash),
                     r.max_uncompressed_block_size, r.max_compressed_block_size,
                     r.meta_pipe_aligned, r.write_compress_enabled,
                     r.alpha_is_on_msb, r.color_transform,

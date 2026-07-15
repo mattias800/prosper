@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <algorithm>
+#include <limits>
 #include <mutex>
 #include <set>
 #include <vector>
@@ -15,6 +16,43 @@ bool tile_mode_is_tiled(uint32_t tile_mode) {
     return tile_mode == (uint32_t)TileMode::Sw4KbS ||
            tile_mode == (uint32_t)TileMode::Sw64KbS ||
            tile_mode == (uint32_t)TileMode::Sw64KbRX;
+}
+
+size_t gfx10_dcc_metadata_bytes(uint32_t width, uint32_t height, uint32_t depth,
+                                uint32_t tile_mode, uint32_t bytes_per_texel,
+                                bool pipe_aligned) {
+    if (tile_mode != (uint32_t)TileMode::Sw64KbRX || !width || !height || !depth)
+        return 0;
+    uint32_t elem_log2 = 0;
+    switch (bytes_per_texel) {
+        case 1: elem_log2 = 0; break;
+        case 2: elem_log2 = 1; break;
+        case 4: elem_log2 = 2; break;
+        case 8: elem_log2 = 3; break;
+        case 16: elem_log2 = 4; break;
+        default: return 0;
+    }
+
+    // AddrLib GetMetaBlkSize(Gfx10DataColor): PS5's 16-pipe R_X configuration resolves to a
+    // 2^12-byte metadata block for both pipe-aligned and unaligned single-sample surfaces. A color
+    // compression block is 2^8 bytes and one DCC metadata element is one byte.
+    (void)pipe_aligned;
+    constexpr uint64_t meta_block_bytes = 1u << 12;
+    const uint32_t meta_bits_log2 = 12u + 8u - elem_log2;
+    const uint64_t meta_width = 1ull << ((meta_bits_log2 + 1u) / 2u);
+    const uint64_t meta_height = 1ull << (meta_bits_log2 / 2u);
+    const uint64_t blocks_w = (static_cast<uint64_t>(width) + meta_width - 1u) / meta_width;
+    const uint64_t blocks_h = (static_cast<uint64_t>(height) + meta_height - 1u) / meta_height;
+    if (blocks_w > std::numeric_limits<uint64_t>::max() / blocks_h)
+        return 0;
+    const uint64_t blocks_per_slice = blocks_w * blocks_h;
+    if (blocks_per_slice > std::numeric_limits<uint64_t>::max() / depth)
+        return 0;
+    const uint64_t blocks = blocks_per_slice * depth;
+    if (blocks > std::numeric_limits<uint64_t>::max() / meta_block_bytes)
+        return 0;
+    const uint64_t bytes = blocks * meta_block_bytes;
+    return bytes <= std::numeric_limits<size_t>::max() ? static_cast<size_t>(bytes) : 0;
 }
 
 // One-time diagnostic when a NON-ZERO (tiled) tile_mode is not one of the swizzles we de-swizzle

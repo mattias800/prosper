@@ -1,5 +1,6 @@
 #include "../src/gpu/gpu_capture.hpp"
 #include "../src/gpu/pm4_registers.hpp"
+#include "../src/gpu/tile.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -143,6 +144,69 @@ int main() {
     set_test_env("PROSPER_GPU_CAPTURE_METADATA_ONLY", nullptr);
     set_test_env("PROSPER_GPU_CAPTURE_MAX_MB", nullptr);
 
+    // --- v12: capture the separate GFX10 DCC control surface for Unreal's R_X volume LUTs. ---
+    ShaderResource volume_dcc{};
+    volume_dcc.cls = ResourceClass::Texture; volume_dcc.binding = 7;
+    volume_dcc.gpu_addr = 0x100000; volume_dcc.size = 32 * 32 * 32 * 4;
+    volume_dcc.format = DataFormat::Sint32; volume_dcc.num_components = 1;
+    volume_dcc.img_dim = 2; volume_dcc.width = 32; volume_dcc.height = 32;
+    volume_dcc.depth = 32; volume_dcc.tile_mode = (uint32_t)TileMode::Sw64KbRX;
+    volume_dcc.compression_enabled = true; volume_dcc.meta_pipe_aligned = true;
+    volume_dcc.metadata_addr = 0x400000;
+    CHECK(gpu_capture_dcc_metadata_footprint(volume_dcc) == 128 * 1024,
+          "32x32x32 R_X volume descriptor plans the validated 128 KiB DCC span");
+    auto volume_table = std::make_shared<ShaderResourceTable>();
+    volume_table->resources = {volume_dcc};
+    DrawItem volume_draw; volume_draw.vs = {0x07230203, 31};
+    volume_draw.fs = {0x07230203, 32}; volume_draw.vrt = volume_table;
+    auto volume_reader = [](uint64_t addr, uint8_t* dst, size_t n) -> size_t {
+        for (size_t i = 0; i < n; ++i) {
+            const uint64_t at = addr + i;
+            dst[i] = static_cast<uint8_t>(at ^ (at >> 11) ^ (at >> 23));
+        }
+        return n;
+    };
+    GpuCaptureFile volume_capture;
+    CHECK(capture_draw_items({volume_draw}, meta, volume_reader, volume_capture, error),
+          "capture reads a compressed base allocation and its separate DCC control surface");
+    const auto& captured_volume = volume_capture.draws[0].vrt.resources[0];
+    CHECK(volume_capture.blobs.size() == 2 && captured_volume.metadata_size == 128 * 1024 &&
+          captured_volume.metadata_blob_index != 0xFFFFFFFFu &&
+          volume_capture.blobs[captured_volume.metadata_blob_index].guest_addr == 0x400000 &&
+          volume_capture.blobs[captured_volume.metadata_blob_index].bytes.size() == 128 * 1024,
+          "DCC metadata receives an exact independently-addressed content blob");
+    std::vector<uint8_t> volume_bytes;
+    CHECK(serialize_gpu_capture(volume_capture, volume_bytes, error),
+          "v12 DCC metadata capture serializes");
+    GpuCaptureFile volume_loaded;
+    GpuReplayFrame volume_replay;
+    CHECK(deserialize_gpu_capture(volume_bytes, volume_loaded, error) &&
+          materialize_gpu_replay(volume_loaded, volume_replay, error) &&
+          volume_replay.items[0].vrt->resources[0].dcc_metadata_host_data &&
+          volume_replay.items[0].vrt->resources[0].dcc_metadata_host_data_size == 128 * 1024 &&
+          volume_replay.resource_instances.size() == 2,
+          "v12 replay owns base and DCC bytes as distinct mutable address instances");
+    GpuCaptureFile bad_metadata_ref = volume_capture;
+    bad_metadata_ref.draws[0].vrt.resources[0].metadata_blob_offset = 128 * 1024;
+    CHECK(!serialize_gpu_capture(bad_metadata_ref, volume_bytes, error) &&
+          error == "resource DCC metadata exceeds its capture blob",
+          "writer rejects an out-of-bounds DCC metadata reference");
+    CHECK(serialize_gpu_capture(volume_capture, volume_bytes, error),
+          "recreated valid v12 DCC bytes after malformed-reference check");
+    volume_bytes.resize(volume_bytes.size() - 24); // v12 count plus one 20-byte reference
+    volume_bytes[8] = 11; volume_bytes[9] = volume_bytes[10] = volume_bytes[11] = 0;
+    CHECK(deserialize_gpu_capture(volume_bytes, volume_loaded, error) &&
+          volume_loaded.draws[0].vrt.resources[0].metadata_size == 128 * 1024 &&
+          volume_loaded.draws[0].vrt.resources[0].metadata_blob_index == 0xFFFFFFFFu,
+          "v11 capsule reopens with the DCC span derivable but metadata bytes explicitly unavailable");
+    set_test_env("PROSPER_GPU_CAPTURE_METADATA_ONLY", "1");
+    CHECK(capture_draw_items({volume_draw}, meta, volume_reader, volume_capture, error) &&
+          volume_capture.blobs.empty() &&
+          volume_capture.draws[0].vrt.resources[0].metadata_size == 128 * 1024 &&
+          volume_capture.draws[0].vrt.resources[0].metadata_blob_index == 0xFFFFFFFFu,
+          "metadata-only capture retains the planned DCC span without pretending bytes exist");
+    set_test_env("PROSPER_GPU_CAPTURE_METADATA_ONLY", nullptr);
+
     captured.expected_output_valid = true;
     captured.expected_output_hash = 0x1122334455667788ull; captured.expected_output_bytes = 480ull * 270 * 4;
     GpuCaptureDsSeed ds_seed;
@@ -170,7 +234,7 @@ int main() {
           deserialize_gpu_capture(stencil_only_bytes, stencil_only_loaded, error) &&
           !stencil_only_loaded.ds_seeds[0].depth_valid &&
           stencil_only_loaded.ds_seeds[0].stencil_valid,
-          "stencil-only validity survives capture v11 independently of depth");
+          "stencil-only validity survives capture v12 independently of depth");
     GpuCaptureFile invalid_stencil_format = stencil_only;
     invalid_stencil_format.ds_seeds[0].format = GpuCaptureDsFormat::D32Float;
     CHECK(!serialize_gpu_capture(invalid_stencil_format, stencil_only_bytes, error) &&
@@ -206,7 +270,7 @@ int main() {
           !loaded_dcc.color_transform && loaded_dcc.max_uncompressed_block_size == 2 &&
           loaded_dcc.max_compressed_block_size == 1 &&
           loaded_dcc.metadata_addr == 0x206e33ab00ull,
-          "v11 resource DCC descriptor state round-trips without inventing metadata bytes");
+          "v11 resource DCC descriptor state remains intact in the v12 capsule");
     CHECK(loaded.shader_versions.size() == 2 && loaded.draws[0].draw_index == 7 &&
           loaded.draws[0].command_order == 123 && loaded.operations[0].source_index == 7,
           "content versions and draw operation identity round-trip");
@@ -370,10 +434,12 @@ int main() {
     GpuCaptureFile legacy_source = captured; legacy_source.ds_seeds.clear();
     std::vector<uint8_t> legacy_bytes;
     CHECK(serialize_gpu_capture(legacy_source, legacy_bytes, error) && legacy_bytes.size() >= 28,
-          "created a diagnostic-free v11 payload for legacy-reader fixtures");
+          "created a diagnostic-free v12 payload for legacy-reader fixtures");
     if (legacy_bytes.size() >= 28) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
+        // Remove the v12 DCC metadata-reference tail: count + 20-byte reference per resource.
+        legacy_bytes.resize(legacy_bytes.size() - (4 + 20 * legacy_resource_count));
         // Remove the v11 DCC tail: count + 17-byte state record per resource.
         legacy_bytes.resize(legacy_bytes.size() - (4 + 17 * legacy_resource_count));
         // Remove the v10 MRT tail: draw count + one (target identity + 50-byte pipeline state) +
@@ -394,9 +460,9 @@ int main() {
     CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
           !legacy_loaded.failure_diagnostics_available && legacy_loaded.failure_diagnostics.empty(),
           "v6 capture reopens with failed-operation diagnostics reported unavailable");
-    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 12;
+    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 13;
     CHECK(!deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
-          error == "unsupported capture version 12",
+          error == "unsupported capture version 13",
           "future capture versions fail with a concrete version error");
 
     GpuCaptureFile bad_hash = mixed;

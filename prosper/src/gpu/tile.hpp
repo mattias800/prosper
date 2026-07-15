@@ -71,4 +71,12 @@ bool tile_volume(uint8_t* dst, size_t dst_bytes, const uint8_t* src,
                  uint32_t width, uint32_t height, uint32_t depth,
                  uint32_t tile_mode, uint32_t bytes_per_texel);
 
+// GFX10 DCC control-surface size for the single-sample, base-level SW_64KB_R_X images currently
+// emitted by PS5 Unreal. The PS5/default 16-pipe layout uses a 4 KiB metadata block. Each byte in
+// that block describes one 256-byte compressed block, so the covered texel extent follows AddrLib's
+// thin-resource equation. Returns zero for unsupported swizzles/element sizes or overflow.
+size_t gfx10_dcc_metadata_bytes(uint32_t width, uint32_t height, uint32_t depth,
+                                uint32_t tile_mode, uint32_t bytes_per_texel,
+                                bool pipe_aligned);
+
 } // namespace prosper::gpu

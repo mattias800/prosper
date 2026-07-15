@@ -176,6 +176,13 @@ struct ShaderResource {
     bool          color_transform             = false;
     uint64_t      metadata_addr               = 0;
 
+    // Replay-only DCC backing. Captures retain the exact control-surface span separately from the
+    // compressed base allocation. Production tables leave these zero/null and read guest memory by
+    // metadata_addr; a future software decoder can consume either source without changing identity.
+    uint64_t      dcc_metadata_size           = 0;
+    uint8_t*      dcc_metadata_host_data      = nullptr;
+    uint64_t      dcc_metadata_host_data_size = 0;
+
     // Replay-only owned backing. `gpu_addr` remains the captured logical guest address so render-target
     // identity/alias checks stay faithful. Graphics reads from host_data; compute may update it before a
     // later operation consumes the same version. Production tables leave both fields zero and use guest memory.

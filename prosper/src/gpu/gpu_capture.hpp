@@ -47,6 +47,9 @@ struct GpuCapturedResource {
     ShaderResource resource;
     uint32_t blob_index = 0xFFFFFFFFu;
     uint64_t blob_offset = 0;
+    uint64_t metadata_size = 0;
+    uint32_t metadata_blob_index = 0xFFFFFFFFu;
+    uint64_t metadata_blob_offset = 0;
 };
 
 struct GpuCapturedTable {
@@ -229,6 +232,10 @@ bool materialize_gpu_replay(const GpuCaptureFile& capture, GpuReplayFrame& repla
 // Byte range the capture planner reserves for one descriptor. This includes decoded/tiled image
 // storage when it is larger than the descriptor's declared byte count.
 uint64_t gpu_capture_resource_footprint(const ShaderResource& resource);
+
+// Exact supported GFX10 DCC control-surface span for one descriptor, or zero when the descriptor is
+// uncompressed or outside the currently validated SW_64KB_R_X single-sample/base-level contract.
+uint64_t gpu_capture_dcc_metadata_footprint(const ShaderResource& resource);
 
 // The Vulkan frontend owns the RTT and persistent DS caches and registers these hooks when its renderer
 // is installed. Normal capture queries only RTT addresses referenced by the selected submit; final bundle
