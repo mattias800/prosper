@@ -239,25 +239,62 @@ ten reports. Its last ten process samples averaged 1619 MiB private memory with 
 working set averaged 2733 MiB and gained 119 MiB as the repeated texture scans continued making shared
 pages resident.
 
+## Shared rendered-frame publication (2026-07-15)
+
+The selected render target previously crossed three additional full-frame CPU copies after Vulkan
+readback: persistent RTT storage to the live-renderer return vector, that vector to the present layer,
+and `present_readback` to the app's scratch vector. At 3840x2160 RGBA8 each copy moved about 31.6 MiB.
+
+`RenderedFrame` now carries immutable shared ownership from the live renderer through the executor and
+present layer. `prosper-app` acquires a lifetime-safe `PresentFrameLease` and uploads directly from that
+storage. Compatibility readback, screenshots, captures, and replay still copy by design. Unit coverage
+asserts pointer identity across renderer-to-present publication and proves a lease survives replacement
+and `present_reset()`.
+
+On native Windows / RTX 4090, the fresh-save full-render Dead Cells route improved the matched 54-draw
+loading scene as follows:
+
+| Measurement | Before | Shared publication |
+|---|---:|---:|
+| Frontend callback | 36-38 ms | 31-34 ms |
+| Frontend output copy | 4.3-4.4 ms | 0.0 ms |
+| Core submit | 46-49 ms | 40-42 ms |
+| Core publication | 1.7 ms | 0.0 ms |
+| App present rate | about 19 FPS | about 21-22 FPS |
+
+The speedup was sufficient for the same 165-second route to finish Dead Cells' 71.6-second
+`PrisonStart` parse and enter the next loading workload instead of remaining in the 54-draw loop. That
+post-parse workload uses about 344 draws, eight dispatches, and four graphics spans per submit. It runs at about
+4.3 FPS, with about 202 ms core submit time: 32 ms realization, 20 ms table work, and 170 ms ordered
+backend execution. The frontend portion spends about 51 ms building resources and 89 ms in its Vulkan
+backend. Full-resolution screenshots at 150 seconds still show the Prisoners' Quarters loading art, so
+this is a later loading phase rather than confirmed gameplay. It is now the representative optimization target.
+
+Private memory rose once from about 1.59 GiB to about 1.90 GiB when that workload arrived, then fluctuated
+in a narrow band during the final 20 seconds. Working set settled around 3.82 GiB. Vulkan graphics and
+compute pools remained bounded at 355 MiB and 47 MiB. The workload nevertheless invalidates about two
+persistent textures per submit window and performs repeated uploads, so resource versioning and residency
+are the next memory/performance investigation rather than further publication lookup tuning.
+
 ## Current frame budget
 
-After the above changes, a representative renderer submit remains about 36-38 ms. Approximate costs
-per frame are:
+After shared publication, the Dead Cells post-parse loading workload is the most useful current budget:
 
 | Area | Approximate cost |
 |---|---:|
-| Four graphics GPU waits | 10-11 ms |
-| Four graphics readbacks | 4-5 ms |
-| Graphics pipeline creation/setup | about 3 ms |
-| Backend resource/descriptor setup | about 2 ms |
-| Graphics record/upload | about 2 ms |
-| Four compute dispatches | about 3 ms |
-| Remaining realization, publication, and overhead | remainder |
+| Draw realization | 32 ms |
+| Scalar table work (included above) | 20 ms |
+| Frontend resource construction | 51 ms |
+| Frontend Vulkan work | 89 ms |
+| Ordered backend total (graphics + compute) | 170 ms |
+| Frame publication | approximately 0 ms |
+| Whole submit | 201-203 ms |
 
 These numbers explain why another small CPU lookup cache is not a credible path to 60 FPS. The
 renderer currently creates transient Vulkan objects, waits, and reads back at each ordered backend
-boundary. A durable improvement needs persistent resources and coordinated graphics/compute
-ownership, then direct presentation where screenshots/captures do not require CPU pixels.
+boundary. A durable improvement needs persistent resources and coordinated graphics/compute ownership.
+Shared CPU publication is complete; direct GPU-image presentation remains a later step because the app
+and headless renderer still own separate Vulkan devices.
 
 ## Capture correction and dependency evidence
 

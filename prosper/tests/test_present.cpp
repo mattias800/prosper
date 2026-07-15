@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <vector>
 
 using namespace prosper;
@@ -94,14 +95,33 @@ int main() {
           "snapshot identifies the rendered publication");
     CHECK(snap.width == W && snap.height == H && snap.rgba == rendered,
           "snapshot metadata and pixels describe the same frame");
+
+    // The shared publication path must retain the renderer's exact immutable allocation. A lease
+    // keeps the old frame alive even after a newer frame replaces it or the present state resets.
+    auto shared_pixels = std::make_shared<const std::vector<uint8_t>>(rendered);
+    const uint8_t* shared_data = shared_pixels->data();
+    gpu::present_write_frame(shared_pixels, W, H);
+    gpu::PresentFrameLease lease;
+    CHECK(gpu::present_acquire_rendered_frame(lease) && lease.rgba &&
+          lease.rgba->data() == shared_data,
+          "shared rendered publication preserves allocation identity without copying");
+    const uint64_t leased_seq = lease.frame_seq;
+    std::vector<uint8_t> replacement(FB_BYTES, 0x5A);
+    gpu::present_write_frame(replacement.data(), W, H);
+    CHECK(lease.frame_seq == leased_seq && lease.rgba->data() == shared_data &&
+          *lease.rgba == rendered,
+          "rendered-frame lease remains valid after a newer publication");
     // The rendered frame wins over the raw guest buffer even across flips.
     flip(0x1001, 0, 0, 0, 0, 0);
     gpu::present_readback(out.data(), out.size());
-    CHECK(memcmp(out.data(), rendered.data(), FB_BYTES) == 0, "rendered frame takes precedence over the flipped guest buffer");
+    CHECK(memcmp(out.data(), replacement.data(), FB_BYTES) == 0,
+          "latest rendered frame takes precedence over the flipped guest buffer");
 
     // After reset, readback falls back to the guest buffer again.
     gpu::present_reset();
     CHECK(!gpu::present_has_frame(), "reset clears the rendered frame");
+    CHECK(lease.rgba->data() == shared_data && *lease.rgba == rendered,
+          "rendered-frame lease remains valid after present reset");
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");

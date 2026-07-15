@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <memory>
 #include <vector>
 #include <set>
 #include <unordered_map>
@@ -44,7 +45,10 @@ namespace prosper::frontend {
 // this the composite samples zeros and the frame is black. We cache each submit's rendered pixels under
 // its render-target base and inject them when a subsequent draw samples a texture at a matching base.
 namespace {
-struct RttSurf { std::vector<uint8_t> rgba; uint32_t w = 0, h = 0; };
+struct RttSurf {
+    std::shared_ptr<const std::vector<uint8_t>> rgba;
+    uint32_t w = 0, h = 0;
+};
 
 // Pixel decoding is a pure function of these fields for guest-backed textures. Keep this cache local
 // to one renderer callback: graphics spans are split at compute operations, so guest texture bytes
@@ -128,16 +132,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
         getenv("PROSPER_GPU_REPLAY_EXPORT_RTT")) {
         prosper::gpu::set_gpu_capture_rtt_seed_reader([](uint64_t addr, prosper::gpu::GpuCaptureRttSeed& seed) {
             auto it = g_rtt.find(addr); if (it == g_rtt.end()) return false;
+            if (!it->second.rgba) return false;
             seed.guest_addr = addr; seed.width = it->second.w; seed.height = it->second.h;
-            seed.rgba = it->second.rgba; return true;
+            seed.rgba = *it->second.rgba; return true;
         });
         prosper::gpu::set_gpu_capture_rtt_seed_snapshot_reader(
             [](std::vector<prosper::gpu::GpuCaptureRttSeed>& seeds, std::string&) {
                 seeds.reserve(g_rtt.size());
                 for (const auto& [addr, surface] : g_rtt) {
+                    if (!surface.rgba) continue;
                     prosper::gpu::GpuCaptureRttSeed seed;
                     seed.guest_addr = addr; seed.width = surface.w; seed.height = surface.h;
-                    seed.rgba = surface.rgba; seeds.push_back(std::move(seed));
+                    seed.rgba = *surface.rgba; seeds.push_back(std::move(seed));
                 }
                 return true;
             });
@@ -159,7 +165,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 error = "invalid temporal RTT seed"; return false;
             }
             RttSurf& surface = g_rtt[seed.guest_addr];
-            surface.w = seed.width; surface.h = seed.height; surface.rgba = seed.rgba;
+            surface.w = seed.width; surface.h = seed.height;
+            surface.rgba = std::make_shared<const std::vector<uint8_t>>(seed.rgba);
             return true;
         });
     if (getenv("PROSPER_GPU_REPLAY_DS_SEEDS"))
@@ -173,7 +180,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                   getenv("PROSPER_RTT_SINGLE_TARGET") == nullptr;
     static const bool rtt_on = getenv("PROSPER_RTT") != nullptr || pertarget;
     prosper::gpu::set_submit_renderer(
-        [frame_dir, dump_bmps](const std::vector<prosper::gpu::DrawItem>& items, uint32_t w, uint32_t h) -> std::vector<uint8_t> {
+        [frame_dir, dump_bmps](const std::vector<prosper::gpu::DrawItem>& items,
+                               uint32_t w, uint32_t h) -> prosper::gpu::RenderedFrame {
             using RC = prosper::gpu::ResourceClass;
             const prosper::gpu::LiveRenderPhase phase = prosper::gpu::live_render_phase();
             // PROSPER_RENDER_FIRST=<N>: skip the slow (~400x) Vulkan render for the first N GPU submits, so
@@ -378,7 +386,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         };
                         auto live_rtt = rtt_on ? g_rtt.find(r.gpu_addr) : g_rtt.end();
                         const bool has_live_rtt = r.img_dim == 1u && live_rtt != g_rtt.end() && live_rtt->second.w &&
-                            live_rtt->second.h && !live_rtt->second.rgba.empty();
+                            live_rtt->second.h && live_rtt->second.rgba &&
+                            !live_rtt->second.rgba->empty();
                         const bool is_cube = r.img_dim == 3u;   // CUBE: six faces stacked vertically (#273)
                         const bool is_volume = r.img_dim == 2u;
                         const uint32_t persistent_pitch = getenv("PROSPER_PITCH")
@@ -512,17 +521,20 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // pixels (nearest-scaled to tw x th) instead of reading empty guest memory.
                         bool rtt_hit = false;
                         if (rtt_on && !is_volume) { auto rit = g_rtt.find(r.gpu_addr);
-                            if (rit != g_rtt.end() && rit->second.w && rit->second.h && !rit->second.rgba.empty()) {
+                            if (rit != g_rtt.end() && rit->second.w && rit->second.h && rit->second.rgba &&
+                                !rit->second.rgba->empty()) {
                                 const RttSurf& s = rit->second;
                                 const size_t expected = static_cast<size_t>(tw) * th * 4;
-                                if (s.w == tw && s.h == th && s.rgba.size() == expected) {
-                                    std::memcpy(texture_pixels.data(), s.rgba.data(), expected);
+                                if (s.w == tw && s.h == th && s.rgba->size() == expected) {
+                                    std::memcpy(texture_pixels.data(), s.rgba->data(), expected);
                                 } else {
                                     std::fill(texture_pixels.begin(), texture_pixels.end(), 0);
                                     for (uint32_t y = 0; y < th; y++) for (uint32_t x = 0; x < tw; x++) {
                                         uint32_t sx = (uint32_t)((uint64_t)x * s.w / tw), sy = (uint32_t)((uint64_t)y * s.h / th);
                                         size_t si = ((size_t)sy * s.w + sx) * 4;
-                                        if (si + 4 <= s.rgba.size()) std::memcpy(&texture_pixels[((size_t)y * tw + x) * 4], &s.rgba[si], 4);
+                                        if (si + 4 <= s.rgba->size())
+                                            std::memcpy(&texture_pixels[((size_t)y * tw + x) * 4],
+                                                        &(*s.rgba)[si], 4);
                                     }
                                 }
                                 rtt_hit = true;
@@ -1182,8 +1194,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             auto clear_for = [](const std::vector<const prosper::gpu::DrawItem*>& g) -> const float* {
                 return g.empty() ? nullptr : g.front()->ps.clear_color;
             };
-            std::vector<uint8_t> px;
-            const std::vector<uint8_t>* selected_pixels = nullptr;
+            std::shared_ptr<const std::vector<uint8_t>> selected_pixels;
             if (pertarget) {
                 // PER-TARGET RTT: a real frame is a sequence of passes, each rendering into a specific
                 // color target (CB_COLOR0_BASE), and a final composite pass SAMPLES the earlier targets.
@@ -1216,9 +1227,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         fprintf(stderr, " [%d]=0x%llx", i, (unsigned long long)prosper_vo_buffer_addr(i));
                     fprintf(stderr, "\n");
                 }
-                const std::vector<uint8_t>* px_front = nullptr;
-                const std::vector<uint8_t>* px_vo = nullptr;
-                const std::vector<uint8_t>* px_last = nullptr;
+                std::shared_ptr<const std::vector<uint8_t>> px_front;
+                std::shared_ptr<const std::vector<uint8_t>> px_vo;
+                std::shared_ptr<const std::vector<uint8_t>> px_last;
                 // Render-target persistence (default on; PROSPER_RTT_NOSEED reverts to per-pass blue
                 // clear): seed each group's framebuffer with the pixels last rendered into that SAME
                 // target VA, so a pass that draws into an already-written target (UE4's UI pass onto
@@ -1323,7 +1334,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     const uint8_t* seed = nullptr;
                     if (seed_rtt && base) { auto sit = g_rtt.find(base);
                         if (sit != g_rtt.end() && sit->second.w == gw && sit->second.h == gh &&
-                            sit->second.rgba.size() == (size_t)gw * gh * 4) seed = sit->second.rgba.data(); }
+                            sit->second.rgba && sit->second.rgba->size() == (size_t)gw * gh * 4)
+                            seed = sit->second.rgba->data(); }
                     const auto build_start = timing_enabled
                         ? RenderClock::now() : RenderClock::time_point{};
                     auto backend_draws = build_bds(render_pass);
@@ -1339,13 +1351,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         pending_timing.backend_ms +=
                             std::chrono::duration<double, std::milli>(backend_done - build_done).count();
                     }
-                    const std::vector<uint8_t>* pass_pixels = &gpx;
-                    if (base && !gpx.empty()) {
+                    auto pass_pixels = std::make_shared<const std::vector<uint8_t>>(std::move(gpx));
+                    if (base && !pass_pixels->empty()) {
                         RttSurf& surface = g_rtt[base];
-                        surface.rgba = std::move(gpx);
+                        surface.rgba = pass_pixels;
                         surface.w = gw;
                         surface.h = gh;
-                        pass_pixels = &surface.rgba;
                     }
                     const std::vector<uint8_t>& rendered_pixels = *pass_pixels;
                     if (native_w == resource_hash_w && native_h == resource_hash_h &&
@@ -1484,7 +1495,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 auto backend_draws = build_bds(all);
                 const auto build_done = timing_enabled
                     ? RenderClock::now() : RenderClock::time_point{};
-                px = prosper::test::render_draws_rgba(backend_draws, w, h, nullptr, clear_for(all), true);
+                auto rendered = prosper::test::render_draws_rgba(
+                    backend_draws, w, h, nullptr, clear_for(all), true);
                 const auto backend_done = timing_enabled
                     ? RenderClock::now() : RenderClock::time_point{};
                 if (timing_enabled) {
@@ -1495,11 +1507,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 }
                 // RTT (#167): cache these rendered pixels under this submit's render-target base, so a later
                 // composite pass that samples that address gets the scene we drew (not empty guest memory).
-                if (rtt_on && !px.empty()) {
+                selected_pixels = std::make_shared<const std::vector<uint8_t>>(std::move(rendered));
+                if (rtt_on && !selected_pixels->empty()) {
                     uint64_t tgt = 0;
                     for (const auto& it : items) if (it.color0_base) { tgt = it.color0_base; break; }
-                    if (tgt) { RttSurf& s = g_rtt[tgt]; s.rgba = px; s.w = w; s.h = h; }
-                    if (getenv("PROSPER_RTTLOG")) { size_t nz=0; for(size_t i=0;i<px.size();i++) nz+=(px[i]!=0);
+                    if (tgt) { RttSurf& s = g_rtt[tgt]; s.rgba = selected_pixels; s.w = w; s.h = h; }
+                    if (getenv("PROSPER_RTTLOG")) { size_t nz=0;
+                        for (uint8_t byte : *selected_pixels) nz += byte != 0;
                         fprintf(stderr, "[rtt] store target=0x%llx (%zu items, color0s:", (unsigned long long)tgt, items.size());
                         for (const auto& it : items) fprintf(stderr, " 0x%llx", (unsigned long long)it.color0_base);
                         fprintf(stderr, ") px_nonzero=%zu cache_size=%zu\n", nz, g_rtt.size()); }
@@ -1513,7 +1527,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 auto cached_scanout = [&](uint64_t addr) -> const RttSurf* {
                     auto it = g_rtt.find(addr);
                     if (it == g_rtt.end() || it->second.w != w || it->second.h != h ||
-                        it->second.rgba.size() != (size_t)w * h * 4) return nullptr;
+                        !it->second.rgba || it->second.rgba->size() != (size_t)w * h * 4)
+                        return nullptr;
                     return &it->second;
                 };
                 const int front = prosper::gpu::present_front_index();
@@ -1523,15 +1538,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     for (int i = 0; i < prosper_vo_buffer_count(); ++i)
                         if ((scanout = cached_scanout(prosper_vo_buffer_addr(i)))) break;
                 }
-                if (scanout) selected_pixels = &scanout->rgba;
-            }
-            if (phase.final_span && selected_pixels) {
-                const auto copy_start = timing_enabled
-                    ? RenderClock::now() : RenderClock::time_point{};
-                px.assign(selected_pixels->begin(), selected_pixels->end());
-                if (timing_enabled)
-                    pending_timing.output_copy_ms += std::chrono::duration<double, std::milli>(
-                        RenderClock::now() - copy_start).count();
+                if (scanout) selected_pixels = scanout->rgba;
             }
             if (!phase.final_span) {
                 if (timing_enabled) {
@@ -1539,8 +1546,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     pending_timing.total_ms += std::chrono::duration<double, std::milli>(
                         RenderClock::now() - callback_timing_start).count();
                 }
-                return px;
+                return {};
             }
+            static const std::vector<uint8_t> empty_pixels;
+            const std::vector<uint8_t>& px = selected_pixels ? *selected_pixels : empty_pixels;
             int n = frame_no++;
             // PROSPER_DUMP_CONTENT=<min-nonzero-bytes>: dump ONLY frames whose framebuffer has at least
             // that many nonzero bytes — catches the intermittent content submits the periodic dump misses.
@@ -1636,7 +1645,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     window = {};
                 }
             }
-            return px;
+            return prosper::gpu::RenderedFrame(std::move(selected_pixels));
         });
     fprintf(stderr, "[render] live Vulkan submit renderer registered (dump=%d, frames -> %s)\n",
             (int)dump_bmps, frame_dir.c_str());

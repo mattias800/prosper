@@ -9,6 +9,7 @@
 #include "render_runner.h"
 #include <cstdio>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -234,9 +235,12 @@ int main() {
     // The live-submit registry path — exactly what agc_driver_submit_dcb drives once a device is wired.
     CHECK(!have_submit_renderer(), "no live renderer registered by default (game path stays inert)");
     CHECK(!execute_and_present(st, W, H), "execute_and_present is a no-op with no renderer registered");
-    set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t w, uint32_t h) -> std::vector<uint8_t> {
+    std::shared_ptr<const std::vector<uint8_t>> live_storage;
+    set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t w, uint32_t h) -> RenderedFrame {
         if (items.empty()) return {};
-        return prosper::test::render_triangle_rgba(items[0].vs, items[0].fs, w, h, &items[0].ps);
+        live_storage = std::make_shared<const std::vector<uint8_t>>(
+            prosper::test::render_triangle_rgba(items[0].vs, items[0].fs, w, h, &items[0].ps));
+        return RenderedFrame(live_storage);
     });
     CHECK(have_submit_renderer(), "live renderer registered");
     prosper::gpu::present_reset();
@@ -245,6 +249,10 @@ int main() {
     std::vector<uint8_t> submit_scan((size_t)W * H * 4, 0);
     prosper::gpu::present_readback(submit_scan.data(), submit_scan.size());
     CHECK(submit_scan == px, "live-submit path presents the same GREEN frame as the direct executor");
+    prosper::gpu::PresentFrameLease submit_lease;
+    CHECK(prosper::gpu::present_acquire_rendered_frame(submit_lease) && submit_lease.rgba &&
+          submit_lease.rgba->data() == live_storage->data(),
+          "live-submit path publishes the renderer allocation without copying");
     CHECK(!execute_and_present(empty, W, H), "execute_and_present skips a draw-less submit even with a renderer");
     set_submit_renderer({});  // restore inert default
 

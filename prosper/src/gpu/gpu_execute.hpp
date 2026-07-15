@@ -893,11 +893,29 @@ inline std::vector<uint8_t> execute_gpustate(const GpuState& st, const RenderFn&
 // attachments. Registered by whoever owns a persistent Vulkan device — the runtime binary at startup, or a
 // test — so prosper_core itself stays Vulkan-free (this just stores a std::function). Same DrawItem-list
 // shape as RenderFn, plus (w,h).
-using LiveRenderFn = std::function<std::vector<uint8_t>(const std::vector<DrawItem>& items,
-                                                        uint32_t width, uint32_t height)>;
+struct RenderedFrame {
+    std::shared_ptr<const std::vector<uint8_t>> storage;
+
+    RenderedFrame() = default;
+    RenderedFrame(std::vector<uint8_t> pixels)
+        : storage(std::make_shared<const std::vector<uint8_t>>(std::move(pixels))) {}
+    explicit RenderedFrame(std::shared_ptr<const std::vector<uint8_t>> pixels)
+        : storage(std::move(pixels)) {}
+
+    bool empty() const { return !storage || storage->empty(); }
+    size_t size() const { return storage ? storage->size() : 0; }
+    const uint8_t* data() const { return storage ? storage->data() : nullptr; }
+    const std::vector<uint8_t>& bytes() const {
+        static const std::vector<uint8_t> empty;
+        return storage ? *storage : empty;
+    }
+};
+
+using LiveRenderFn = std::function<RenderedFrame(const std::vector<DrawItem>& items,
+                                                  uint32_t width, uint32_t height)>;
 
 struct OrderedSubmitResult {
-    std::vector<uint8_t> pixels;
+    RenderedFrame frame;
     size_t render_spans = 0;
     bool compute_executed = false;
 };
