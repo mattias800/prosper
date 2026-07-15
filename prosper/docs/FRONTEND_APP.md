@@ -243,6 +243,13 @@ every fold. Set `PROSPER_NO_GUEST_READ_CACHE=1` for the uncached A/B path. The c
 referenced by a synchronous GPU submit remains mapped until that submit returns, which was already
 required before the cross-submit reuse was added.
 
+Large-alignment Windows direct-memory views can be sparse section mappings. They are deliberately
+excluded from cross-submit readability reuse because guest-visible committed pages may still be host-
+reserved until first access. CPU faults, GPU readability guards, and the live renderer materialize the
+required 16 KiB pages through the memory HLE, which validates the complete guest mapping and its current
+protection first. This preserves untouched-zero and alias behavior without eagerly committing a title's
+entire arena. `PROSPER_MEMLOG=1` reports `map_dmem sparse aligned view` when this path is active.
+
 The current renderer remains a deterministic readback-based implementation. It retains CPU-visible pixels
 for screenshots and temporal RTT composition, so it is not the final zero-copy architecture. Issue #702
 tracks persistent Vulkan resource/pipeline caching and direct image presentation beyond the initial

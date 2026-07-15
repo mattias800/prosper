@@ -8,6 +8,10 @@
 #include "../src/hle/nid.hpp"
 #ifdef _WIN32
 #include "../src/host/exec_image.hpp"
+#include "../src/host/guest_memory_map.hpp"
+#include "../src/gpu/gpu_execute.hpp"
+#include <windows.h>
+extern "C" int prosper_try_commit_dmem(uint64_t addr, uint64_t len, int write);
 #endif
 #include <cstdio>
 #include <cstdint>
@@ -36,8 +40,11 @@ int main() {
     auto unmap   = Hle::lookup(nid_hash("sceKernelMunmap"));
     auto alloc   = Hle::lookup(nid_hash("sceKernelAllocateDirectMemory"));
     auto map     = Hle::lookup(nid_hash("sceKernelMapDirectMemory"));
+    auto protect = Hle::lookup(nid_hash("sceKernelMprotect"));
     auto release = Hle::lookup(nid_hash("sceKernelReleaseDirectMemory"));
-    CHECK(reserve && unmap && alloc && map && release, "memory HLE functions registered");
+    auto query   = Hle::lookup(nid_hash("sceKernelVirtualQuery"));
+    CHECK(reserve && unmap && alloc && map && protect && release && query,
+          "memory HLE functions registered");
     if (fails) return 1;
 
     constexpr uint64_t len = 0x4000;
@@ -93,6 +100,92 @@ int main() {
     if (va3) CHECK(unmap(va3, dlen, 0, 0, 0, 0) == 0, "unmap reused direct-memory view");
     if (hinted) CHECK(unmap(hinted, dlen, 0, 0, 0, 0) == 0, "unmap relocated direct-memory view");
     if (reused_phys) release(reused_phys, dlen, 0, 0, 0, 0);
+
+    // Large zero-hint alignments use a placeholder-backed SEC_RESERVE view. Dead Cells requests
+    // one 3 GiB mapping at 2 MiB alignment; committing that whole range made private memory exceed
+    // 4.5 GiB. Prove that placement is aligned, untouched pages remain sparse, host GPU reads
+    // materialize exactly their range, and a second VA still aliases the same physical bytes.
+    constexpr uint64_t sparse_len = 0x02000000;
+    constexpr uint64_t sparse_align = 0x00200000;
+    constexpr uint64_t sparse_window = kBase + 0x10000000;
+    uint64_t sparse_phys = 0, sparse_va1 = 0, sparse_va2 = 0;
+    CHECK(alloc(sparse_window, sparse_window + sparse_len, sparse_len, sparse_align, 0,
+                (uint64_t)(uintptr_t)&sparse_phys) == 0 && sparse_phys == sparse_window,
+          "allocate a virgin 32 MiB sparse direct-memory range");
+    CHECK(map((uint64_t)(uintptr_t)&sparse_va1, sparse_len, 0x2, 0,
+              sparse_phys, sparse_align) == 0 && sparse_va1 &&
+              (sparse_va1 & (sparse_align - 1)) == 0,
+          "large-alignment direct view uses a 2 MiB-aligned address");
+    MEMORY_BASIC_INFORMATION near_before{}, far_before{};
+    if (sparse_va1) {
+        uint8_t guest_query[0x48]{};
+        CHECK(query(sparse_va1 + 0x01000000, 0,
+                    (uint64_t)(uintptr_t)guest_query, sizeof(guest_query), 0, 0) == 0 &&
+                  *(uint32_t*)(guest_query + 0x20) == 0x10,
+              "guest VirtualQuery reports the sparse direct view as committed");
+        host::GuestReadableRange persistent_range{};
+        CHECK(!host::guest_readable_mapping_containing(
+                  sparse_va1 + 0x4000, sparse_va1 + 0x8000, persistent_range),
+              "sparse view is excluded from cross-submit host-readability reuse");
+        VirtualQuery((void*)(uintptr_t)(sparse_va1 + 0x4000), &near_before,
+                     sizeof(near_before));
+        VirtualQuery((void*)(uintptr_t)(sparse_va1 + 0x01000000), &far_before,
+                     sizeof(far_before));
+        CHECK(near_before.State == MEM_RESERVE && far_before.State == MEM_RESERVE,
+              "untouched sparse direct pages carry no host commit");
+        CHECK(gpu::guest_readable(sparse_va1 + 0x4000, 0x4000),
+              "GPU guest-read guard materializes an untouched zero page");
+        MEMORY_BASIC_INFORMATION near_after{}, far_after{};
+        VirtualQuery((void*)(uintptr_t)(sparse_va1 + 0x4000), &near_after,
+                     sizeof(near_after));
+        VirtualQuery((void*)(uintptr_t)(sparse_va1 + 0x01000000), &far_after,
+                     sizeof(far_after));
+        CHECK(near_after.State == MEM_COMMIT && far_after.State == MEM_RESERVE,
+              "host read commits only the requested 16 KiB guest page");
+        CHECK(*(volatile uint32_t*)(uintptr_t)(sparse_va1 + 0x4120) == 0,
+              "virgin sparse direct-memory page reads as zero");
+
+        const uint64_t protected_page = sparse_va1 + 0x01000000;
+        CHECK(protect(protected_page, 0x4000, 0x1, 0, 0, 0) == 0,
+              "mprotect accepts an untouched sparse page");
+        MEMORY_BASIC_INFORMATION protected_before{};
+        VirtualQuery((void*)(uintptr_t)protected_page, &protected_before,
+                     sizeof(protected_before));
+        CHECK(protected_before.State == MEM_RESERVE,
+              "mprotect does not materialize an untouched sparse page");
+        CHECK(!prosper_try_commit_dmem(protected_page, 0x4000, 1),
+              "read-only sparse mapping rejects host write materialization");
+        CHECK(prosper_try_commit_dmem(protected_page, 0x4000, 0),
+              "read-only sparse mapping permits host read materialization");
+        MEMORY_BASIC_INFORMATION protected_after{};
+        VirtualQuery((void*)(uintptr_t)protected_page, &protected_after,
+                     sizeof(protected_after));
+        CHECK(protected_after.State == MEM_COMMIT &&
+                  (protected_after.Protect & 0xff) == PAGE_READONLY,
+              "first touch applies the tracked read-only protection");
+        CHECK(protect(protected_page, 0x4000, 0x2, 0, 0, 0) == 0,
+              "mprotect restores read/write on a materialized sparse page");
+        MEMORY_BASIC_INFORMATION writable_after{};
+        VirtualQuery((void*)(uintptr_t)protected_page, &writable_after,
+                     sizeof(writable_after));
+        CHECK(writable_after.State == MEM_COMMIT &&
+                  (writable_after.Protect & 0xff) == PAGE_READWRITE,
+              "mprotect updates an existing sparse host page");
+    }
+    CHECK(map((uint64_t)(uintptr_t)&sparse_va2, sparse_len, 0x2, 0,
+              sparse_phys, sparse_align) == 0 && sparse_va2 && sparse_va2 != sparse_va1,
+          "map a second sparse view of the same physical range");
+    if (sparse_va1 && sparse_va2) {
+        *(volatile uint64_t*)(uintptr_t)(sparse_va1 + 0x5120) = 0x5A17C0DE6310CAFEull;
+        CHECK(*(volatile uint64_t*)(uintptr_t)(sparse_va2 + 0x5120) ==
+                  0x5A17C0DE6310CAFEull,
+              "sparse views retain physical alias coherence");
+    }
+    if (sparse_va1) CHECK(unmap(sparse_va1, sparse_len, 0, 0, 0, 0) == 0,
+                          "unmap first sparse direct-memory view");
+    if (sparse_va2) CHECK(unmap(sparse_va2, sparse_len, 0, 0, 0, 0) == 0,
+                          "unmap second sparse direct-memory view");
+    if (sparse_phys) release(sparse_phys, sparse_len, 0, 0, 0, 0);
 
     if (fails) { printf("== FAIL: %d check(s) ==\n", fails); return 1; }
     printf("== PASS ==\n");

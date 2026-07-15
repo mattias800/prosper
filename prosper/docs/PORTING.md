@@ -569,11 +569,15 @@ edge cases are tracked separately in #697.
 1. **Extend native scripted gameplay coverage beyond The Messenger (#683/#688).** The frontend,
    controller composition, WIC screenshot path, and routed first-level acceptance now work. Add
    checkpoint automation for more titles as the Windows substrate is exercised more broadly.
-2. **Complete the remaining 16 KiB section-view edge cases (#697).** Direct memory now uses one sparse
+2. **Complete the remaining 16 KiB section-view edge cases (#697).** Direct memory uses one sparse
    paging-file section, so zero-hint and 64 KiB-congruent mappings alias correctly and Dead Cells no
-   longer corrupts the host heap during physical-range churn (#691). Exact fixed maps whose virtual and
-   physical 64 KiB deltas differ still use the private fallback, and partial unmap needs a section-aware
-   implementation. These likely require placeholder APIs (`VirtualAlloc2`/`MapViewOfFile3`).
+   longer corrupts the host heap during physical-range churn (#691). Large-alignment zero-hint maps now
+   reserve an explicitly aligned placeholder with `VirtualAlloc2`, replace it with the shared section via
+   `MapViewOfFile3`, and commit 16 KiB pages on first CPU/GPU access. Guest `VirtualQuery` still reports the
+   direct mapping as committed; untouched host pages carry no commit charge. Dead Cells' 3 GiB, 2 MiB-
+   aligned arena therefore remains physically aliased without one 3 GiB eager private allocation.
+   Exact fixed maps whose virtual and physical 64 KiB deltas differ still use the private fallback, and
+   partial unmap needs a section-aware implementation.
 3. **Validate/repair the guest→HLE ABI trampoline for XMM/float args.** Integer args 1-9 are converted
    and now runtime-exercised through init; **XMM/float args are still not converted** (e.g. some libc
    formatters / `printf`-family) — add float-arg conversion when a title needs it.

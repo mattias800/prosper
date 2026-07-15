@@ -169,12 +169,28 @@ stability evidence, not a new progression proof.
 
 The large process baseline has a separate source. Dead Cells explicitly allocates and maps a
 `0xc0000000` (3 GiB) direct-memory arena at 2 MiB alignment. On Windows, the shared-section view
-currently falls back to one eagerly committed `MEM_PRIVATE` allocation. A `VirtualQueryEx` census at
+previously fell back to one eagerly committed `MEM_PRIVATE` allocation. A `VirtualQueryEx` census at
 35 seconds attributed exactly 3072 MiB of roughly 4638 MiB private commit to this arena; measured
 renderer persistent images and transient pools together accounted for about 441 MiB. Placeholder,
 aligned shared-view, or sparse-realization work belongs to
 [#697](https://github.com/mattias800/ps5ys/issues/697) because it must preserve guest query semantics,
 untouched zero-page reads, aliases, and partial unmaps.
+
+The Windows sparse large-alignment path now uses `VirtualAlloc2` address requirements plus
+`MapViewOfFile3(MEM_REPLACE_PLACEHOLDER)` and commits shared 16 KiB pages on demand. The focused test
+checks 2 MiB placement, guest query state, an untouched far page, GPU-read materialization, alias
+coherence, protection changes before and after first touch, and exact whole-view unmap. The modern APIs
+are resolved dynamically; systems without them retain the old mapping path.
+
+A five-minute fresh-save Dead Cells run removed the 3072 MiB private fallback and had no sparse commit
+failure. In the late 54-draw loading scene, private commit averaged 1604 MiB over the final minute and
+changed by about +1 MiB. Working set was 2815 MiB at exit and still gaining about 190 MiB over that
+minute: repeated renderer reads were making the shared section resident even though they no longer
+charged private commit. That run repeatedly scanned about 460 MiB of declared texture ranges per submit,
+spent about 40 ms in resource construction, and presented at roughly 8-10 FPS. It did not reach the
+`PrisonStart` marker, so it is memory/fault stability evidence rather than a progression proof. Avoiding
+repeated scans or materialization of untouched resource tails is follow-up renderer work, not a reason to
+restore the eager 3 GiB private allocation.
 
 ## Current frame budget
 

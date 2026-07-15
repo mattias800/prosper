@@ -27,6 +27,9 @@
 
 // Classify a guest address: 0 => not within a reserved/committed guest mapping (see hle_kernel_mem).
 extern "C" int prosper_reserved_range_state(uint64_t addr);
+#ifdef _WIN32
+extern "C" int prosper_try_commit_dmem(uint64_t addr, uint64_t len, int write);
+#endif
 // VideoOut scanout registry (hle_graphics.cpp) — which guest buffer the game most recently FLIPPED
 // to screen. The flip fires during the Dcb fold (agc_dcb_set_flip -> prosper_vo_flip_from_gpu),
 // BEFORE the submit's execute_and_present, so at render time these identify this frame's scanout VA.
@@ -270,6 +273,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             // short copy just leaves a transparent/black tail (only the missing region degrades).
             auto safe_copy = [](uint8_t* dst, uint64_t a, size_t n) -> size_t {
                 const size_t PG = 0x10000;   // lazy-commit granularity (64 KB)
+#ifdef _WIN32
+                // Prepare a complete sparse direct-memory resource once. The per-chunk mapping
+                // checks below still stop an over-declared resource at its real guest boundary.
+                if (prosper_try_commit_dmem(a, n, 0)) {
+                    std::memcpy(dst, (const void*)(uintptr_t)a, n);
+                    return n;
+                }
+#endif
                 size_t done = 0;
                 while (done < n) {
                     uint64_t cur = a + done;
@@ -283,6 +294,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             auto safe_equal = [](const uint8_t* expected, uint64_t a, size_t n,
                                  size_t& compared) -> bool {
                 const size_t PG = 0x10000;
+#ifdef _WIN32
+                if (prosper_try_commit_dmem(a, n, 0)) {
+                    compared = n;
+                    return std::memcmp(expected, (const void*)(uintptr_t)a, n) == 0;
+                }
+#endif
                 compared = 0;
                 while (compared < n) {
                     const uint64_t cur = a + compared;

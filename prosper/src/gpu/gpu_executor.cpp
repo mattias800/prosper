@@ -635,6 +635,8 @@ bool guest_readable(uint64_t a, uint32_t n) {
     return true;
 }
 #else
+extern "C" int prosper_try_commit_dmem(uint64_t addr, uint64_t len, int write);
+
 bool guest_readable(uint64_t a, uint32_t n) {
     if (a < 0x1000 || n == 0 || a + n < a) return false;
     const uint64_t end = a + n;
@@ -645,6 +647,11 @@ bool guest_readable(uint64_t a, uint32_t n) {
         if (g_guest_readable_cache.active) ++g_guest_readable_cache.os_probes;
         if (!VirtualQuery((const void*)(uintptr_t)cursor, &mbi, sizeof(mbi))) return false;
         const DWORD blocked = PAGE_NOACCESS | PAGE_GUARD;
+        if (mbi.State != MEM_COMMIT) {
+            if (!prosper_try_commit_dmem(cursor, end - cursor, 0)) return false;
+            if (g_guest_readable_cache.active) ++g_guest_readable_cache.os_probes;
+            if (!VirtualQuery((const void*)(uintptr_t)cursor, &mbi, sizeof(mbi))) return false;
+        }
         if (mbi.State != MEM_COMMIT || (mbi.Protect & blocked)) return false;
         const DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
                                PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
