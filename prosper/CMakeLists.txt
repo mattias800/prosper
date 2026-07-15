@@ -346,6 +346,13 @@ if(TARGET prosper_core)
   target_link_libraries(test_eop_write PRIVATE prosper_core)
   add_test(NAME eop_write COMMAND test_eop_write)
 
+  # #729: the synchronous (PROSPER_EOP_WRITE_SYNC=1) honor_* label writes must probe
+  # guest_readable before dereferencing a guest-PM4-supplied address (own executable: the
+  # env var latches process-wide on first use).
+  add_executable(test_eop_write_sync_guard tests/test_eop_write_sync_guard.cpp)
+  target_link_libraries(test_eop_write_sync_guard PRIVATE prosper_core)
+  add_test(NAME eop_write_sync_guard COMMAND test_eop_write_sync_guard)
+
   # #312 per-queue WAIT_REG_MEM barrier model: unsatisfied waits gate downstream memory effects,
   # streams release independently, jumps don't un-gate, timeout backstop preserves liveness.
   add_executable(test_wait_barrier tests/test_wait_barrier.cpp)

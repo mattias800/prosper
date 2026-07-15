@@ -532,6 +532,17 @@ static bool rel1_stomp_guard() {
 // data_sel and value are decoded directly from the packet the game's ReleaseMem call built.
 static void honor_eop_write(const Pm4Command& c) {
     if (eop_writes_disabled() || !c.rel_addr || (c.rel_addr & 3)) return;
+    // #729: the synchronous path (PROSPER_EOP_WRITE_SYNC=1) reaches here without
+    // apply_deferred_effect's #449 guard, and the #312 pre-reads below read 8 bytes regardless of
+    // the write size — probe mappedness before any dereference of the guest-PM4-supplied address.
+    // Skipping matches what the deferred path does for an unmapped label.
+    if (!guest_readable(c.rel_addr, 8)) {
+        static std::atomic<int> n{0};
+        if (n.fetch_add(1) < 24)
+            fprintf(stderr, "[agc] RELEASE_MEM label unmapped — write SKIPPED: addr=0x%llx\n",
+                    (unsigned long long)c.rel_addr);
+        return;
+    }
     void* dst = (void*)(uintptr_t)c.rel_addr;
     switch (c.rel_data_sel) {
         // data_sel==0 is "interrupt only, NO data write" (PM4 spec) — writing anyway clobbers 8 bytes
@@ -675,6 +686,13 @@ static void honor_eop_write(const Pm4Command& c) {
 // currently exercises this (the Messenger fences via ReleaseMem/WriteData), so it's latent.
 static void honor_event_write(const Pm4Command& c) {
     if (eop_writes_disabled() || !c.event_addr || (c.event_addr & 3)) return;
+    if (!guest_readable(c.event_addr, 8)) {   // #729: sync path lacks the #449 deferred guard
+        static std::atomic<int> n{0};
+        if (n.fetch_add(1) < 24)
+            fprintf(stderr, "[agc] EVENT_WRITE label unmapped — write SKIPPED: addr=0x%llx\n",
+                    (unsigned long long)c.event_addr);
+        return;
+    }
     uint64_t v = gpu_clock64();
     memcpy((void*)(uintptr_t)c.event_addr, &v, sizeof v);
     ring_record(c.event_addr, v, 8, 2, pkt_addr(c));
@@ -753,6 +771,16 @@ static void honor_dma_data(const Pm4Command& c) {
 // Honor a WRITE_DATA packet: copy the inline dwords to the destination address (same synchronous timing).
 static void honor_write_data(const Pm4Command& c) {
     if (eop_writes_disabled() || !c.wd_addr || (c.wd_addr & 3) || !c.wd_data || !c.wd_num) return;
+    // #729: guard both the payload span and the 8-byte #312 pre-read below (a 4-byte label write
+    // still pre-reads one qword). The deferred path's #449 guard only covers the payload size.
+    uint32_t wbytes = c.wd_num * 4;
+    if (!guest_readable(c.wd_addr, wbytes > 8 ? wbytes : 8)) {
+        static std::atomic<int> n{0};
+        if (n.fetch_add(1) < 24)
+            fprintf(stderr, "[agc] WRITE_DATA target unmapped — write SKIPPED: addr=0x%llx dwords=%u\n",
+                    (unsigned long long)c.wd_addr, c.wd_num);
+        return;
+    }
     // #312 stomp-catcher (same as the ReleaseMem one): a small label-init WriteData landing over
     // pointer-like memory, or targeting the allocator-metadata region, is a suspect stomp.
     if (c.wd_num <= 4) {
