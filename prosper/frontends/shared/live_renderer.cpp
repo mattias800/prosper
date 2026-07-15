@@ -1607,10 +1607,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     // blend factors, write mask, viewport, and each PS-sampled texture address (#319).
                     if (rtt_log) {
                         fprintf(stderr, "[rtt]   draw tgt=0x%llx vcount=%u nidx=%zu topo=%u mask=0x%x "
-                                "blend=%d(src=%u dst=%u) vp=%d(%.2f,%.2f %.2fx%.2f) z=%d zw=%d ps=",
+                                "blend=%d(csrc=%u cdst=%u cop=%u asrc=%u adst=%u aop=%u) vp=%d(%.2f,%.2f %.2fx%.2f) z=%d zw=%d ps=",
                                 (unsigned long long)it.color0_base, bd.vcount, bd.indices.size(),
                                 it.ps.topology, it.ps.color_write_mask, (int)it.ps.blend_enable,
-                                it.ps.src_color_blend_factor, it.ps.dst_color_blend_factor,
+                                it.ps.src_color_blend_factor, it.ps.dst_color_blend_factor, it.ps.color_blend_op,
+                                it.ps.src_alpha_blend_factor,
+                                it.ps.dst_alpha_blend_factor, it.ps.alpha_blend_op,
                                 (int)it.ps.has_viewport,
                                 it.ps.viewport_x, it.ps.viewport_y, it.ps.viewport_w, it.ps.viewport_h,
                                 (int)it.ps.depth_test_enable, (int)it.ps.depth_write_enable);
