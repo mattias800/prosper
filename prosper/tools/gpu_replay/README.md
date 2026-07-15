@@ -152,7 +152,9 @@ before executing the final submit and writes them as seeds in a standalone curre
 introduced the base-level depth of every 3D image resource; v11 also retains each image T#'s GFX10 DCC flags,
 block-size fields, and metadata address. Version 12 captures the exact DCC control-surface bytes for the
 validated single-sample/base-level SW_64KB_R_X layout; metadata-only and older capsules keep their absence
-explicit. `--inspect-only` reports the planned/captured byte counts, non-zero and unique-byte counts,
+explicit. Version 13 tags every temporal color RTT seed as `rgba8` or `rgba16f`, preserving its native byte
+width through standalone replay while reading v1..v12 seeds as the historical RGBA8 default.
+`--inspect-only` reports the RTT format and the planned/captured byte counts, non-zero and unique-byte counts,
 first control word, and content hash. A software DCC decode is still not inferred. The capsule's standalone
 output must match the bundle's final hash before using it for fast `--draw`, operation-prefix, resource, or
 shader experiments. Export validates every surface and fails when a required temporal color surface is absent;
@@ -215,9 +217,9 @@ hardware boundary: supported compute program `0x401aec200` fills the exact 32 Ki
 GPU writeback (#611); capture v8 preserves the state exactly when an investigation deliberately disables that
 invalidation.
 
-For new routed captures, timeline v6 replaces that historical endpoint with 91..93 semantic draws, exactly
-8 dispatches, and the 738x420 pass at draw 80..82. `gpu_timeline --signatures` derived the conjunction from two
-independent routes, and `--select` proves it has no splash/menu/loading or adjacent-index matches before capture.
+For new routed captures, timeline v6 replaces that historical endpoint with 91..94 semantic draws, exactly
+8 dispatches, and the 636x420 pass at draw 77..85. `gpu_timeline --signatures` derives the conjunction, and
+`--select` proves it has no splash/menu/loading or adjacent-index matches before capture.
 
 The #594/#595 gameplay capsule at submit 18,750 has two external 642x362 temporal versions. Timeline-v4
 full-run aggregation shows that both surfaces begin around submit 17,400 in current runs and are rewritten

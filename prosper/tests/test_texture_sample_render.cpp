@@ -271,6 +271,84 @@ int main() {
               "invalidated GPU target uses the supplied CPU fallback instead of stale pixels");
     }
 
+    // Renderer-owned FP16 targets must retain HDR values through both CPU RTT readback/upload and
+    // direct GPU-resident sampling. A producer value of 2.0 multiplied by 0.25 in the consumer is
+    // 0.5; the historical RGBA8 conversion clamped it to 1.0 first and therefore produced 0.25.
+    {
+        static const uint32_t kHdrPs[] = {
+            0x7E0002FFu, 0x40000000u,  // v0 = 2.0
+            0x7E0202FFu, 0x3E800000u,  // v1 = 0.25
+            0x7E040280u,               // v2 = 0.0
+            0x7E0602F2u,               // v3 = 1.0
+            0xF800180Fu, 0x03020100u, 0xBF810000u,
+        };
+        const uint32_t kHdrSamplePs[] = {
+            0x7E0002FFu, C025, 0x7E0202FFu, C025,
+            0xF0800F08u, 0x00820000u,  // image_sample v[0:3]
+            0x100000FFu, 0x3E800000u,  // v0 *= 0.25
+            0xF800000Fu, 0x03020100u, 0xBF810000u,
+        };
+        std::vector<uint32_t> hdr = recompile_fragment(
+            kHdrPs, sizeof(kHdrPs) / sizeof(kHdrPs[0]), nullptr);
+        std::vector<uint32_t> hdr_sample = recompile_fragment(
+            kHdrSamplePs, sizeof(kHdrSamplePs) / sizeof(kHdrSamplePs[0]), &rt);
+        CHECK(!hdr.empty() && !hdr_sample.empty(),
+              "recompiled native FP16 producer and sampled consumer shaders");
+        if (!hdr.empty() && !hdr_sample.empty()) {
+            ResolvedPipelineState fp16_state{};
+            fp16_state.topology = 3;
+            fp16_state.color_write_mask = 0xF;
+            fp16_state.color0_format = VK_FORMAT_R16G16B16A16_SFLOAT;
+            prosper::test::BackendDraw producer;
+            producer.vs = vert; producer.fs = hdr; producer.ps = &fp16_state;
+            producer.vcount = 3;
+
+            constexpr uint64_t fp16_target_id = 0x7590000000000016ull;
+            prosper::test::BackendColorTarget fp16_target{
+                fp16_target_id, false, true, VK_FORMAT_R16G16B16A16_SFLOAT};
+            std::vector<uint8_t> native = prosper::test::render_draws_rgba(
+                {producer}, W, H, nullptr, nullptr, false, &fp16_target);
+            bool native_ok = native.size() == static_cast<size_t>(W) * H * 8;
+            float native_red = 0.0f;
+            if (native_ok) {
+                uint16_t half = 0;
+                std::memcpy(&half, native.data() +
+                    ((static_cast<size_t>(H / 2) * W + W / 2) * 8), sizeof(half));
+                native_red = half_to_float(half);
+                native_ok = native_red > 1.99f && native_red < 2.01f;
+            }
+            CHECK(native_ok, "native FP16 target readback preserves HDR value 2.0");
+
+            prosper::test::FrameResource fp16_resource;
+            fp16_resource.binding = 4; fp16_resource.set = 1;
+            fp16_resource.tex_rgba = native.data(); fp16_resource.tw = W; fp16_resource.th = H;
+            fp16_resource.texture_format = VK_FORMAT_R16G16B16A16_SFLOAT;
+            prosper::test::BackendDraw consumer;
+            consumer.vs = vert; consumer.fs = hdr_sample; consumer.R = {fp16_resource};
+            consumer.vcount = 3;
+            std::vector<uint8_t> cpu_sampled = prosper::test::render_draws_rgba(
+                {consumer}, W, H);
+            auto center_red = [&](const std::vector<uint8_t>& pixels) -> uint8_t {
+                return pixels.size() == static_cast<size_t>(W) * H * 4
+                    ? pixels[(static_cast<size_t>(H / 2) * W + W / 2) * 4] : 0;
+            };
+            const uint8_t cpu_red = center_red(cpu_sampled);
+            CHECK(cpu_red >= 126 && cpu_red <= 129,
+                  "FP16 readback/upload consumer observes 2.0 before scaling to 0.5");
+
+            prosper::test::FrameResource gpu_fp16_resource = fp16_resource;
+            gpu_fp16_resource.tex_rgba = nullptr;
+            gpu_fp16_resource.persistent_render_target_id = fp16_target_id;
+            consumer.R = {gpu_fp16_resource};
+            std::vector<uint8_t> gpu_sampled = prosper::test::render_draws_rgba(
+                {consumer}, W, H);
+            const auto gpu_sample_stats = prosper::test::backend_color_target_stats();
+            CHECK(gpu_sample_stats.sampled_hits == 1 && gpu_sampled == cpu_sampled,
+                  "GPU-resident FP16 target sampling matches native CPU RTT round-trip");
+            prosper::test::invalidate_persistent_color_target(fp16_target_id);
+        }
+    }
+
     // The backend upload key includes depth and image dimensionality. Exercise a real 3D image here
     // so depth-1 3D resources cannot accidentally regress to a 2D Vulkan image/view during sharing.
     {

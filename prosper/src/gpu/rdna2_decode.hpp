@@ -107,11 +107,12 @@ struct Rdna2Inst {
     uint32_t vintrp_attr = 0;
     uint32_t vintrp_chan = 0;
 
-    // VOP3P v_fma_mix* only (#273): per-source half-select bitmasks. Bit k of vop3p_opsel_hi set =
-    // source k reads as an f16 HALF (which half chosen by bit k of vop3p_opsel: 0 = low, 1 = high)
-    // converted to f32; clear = full f32. NEG lands in src_neg[], NEG_HI (abs for the mix ops) in
-    // src_abs[], CLAMP in clamp.
+    // Packed/mixed f16 selector bitmasks. For VOP3P mix ops, bit k of vop3p_opsel_hi means source k
+    // reads as an f16 half selected by vop3p_opsel[k]; packed add/mul use the two masks for the low
+    // and high results. VOP3 v_fma_f16 reuses vop3p_opsel[2:0] for its sources and bit 3 for dst.
+    // NEG lands in src_neg[], NEG_HI (abs for mix ops) in src_abs[], and CLAMP in clamp.
     uint8_t vop3p_opsel = 0, vop3p_opsel_hi = 0;
+    uint8_t vop3p_neg_hi = 0;   // packed add/mul: per-source negate for the HIGH f16 result
 };
 
 // Decode the single instruction at code[0..]; `max_dwords` bounds the read. On a truncated/unknown

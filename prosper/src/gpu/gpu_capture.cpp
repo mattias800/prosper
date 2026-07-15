@@ -37,7 +37,7 @@ namespace prosper::gpu {
 namespace {
 
 constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
-constexpr uint32_t kVersion = 12;
+constexpr uint32_t kVersion = 13;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -431,10 +431,16 @@ bool validate_rtt_seed(const GpuCaptureRttSeed& seed, std::string& error) {
     if (!seed.guest_addr || !seed.width || !seed.height) {
         error = "RTT seed has an invalid address or extent"; return false;
     }
+    uint32_t bytes_per_pixel = 0;
+    switch (seed.format) {
+        case GpuCaptureColorFormat::Rgba8Unorm: bytes_per_pixel = 4; break;
+        case GpuCaptureColorFormat::Rgba16Float: bytes_per_pixel = 8; break;
+        default: error = "RTT seed has an unsupported color format"; return false;
+    }
     const uint64_t pixels = checked_mul(seed.width, seed.height);
-    const uint64_t bytes = checked_mul(pixels, 4);
+    const uint64_t bytes = checked_mul(pixels, bytes_per_pixel);
     if (bytes > kMaxBlobBytes || bytes != seed.rgba.size()) {
-        error = "RTT seed byte count does not match its RGBA extent"; return false;
+        error = "RTT seed byte count does not match its color format and extent"; return false;
     }
     return true;
 }
@@ -916,7 +922,8 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
             error = "capture RTT seed data exceeds 1 GiB"; return false;
         }
         seed_total += seed.rgba.size();
-        w.u64(seed.guest_addr); w.u32(seed.width); w.u32(seed.height); w.bytes(seed.rgba);
+        w.u64(seed.guest_addr); w.u32(seed.width); w.u32(seed.height);
+        w.u32(static_cast<uint32_t>(seed.format)); w.bytes(seed.rgba);
     }
     std::vector<GpuCaptureShaderVersion> versions = c.shader_versions;
     auto add_shader = [&](const std::vector<uint32_t>& words) {
@@ -1180,7 +1187,10 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
         uint64_t seed_total = 0; c.rtt_seeds.resize(ns);
         std::unordered_set<uint64_t> addresses;
         for (auto& seed : c.rtt_seeds) {
-            if (!r.u64(seed.guest_addr) || !r.u32(seed.width) || !r.u32(seed.height) || !r.bytes(seed.rgba)) return false;
+            uint32_t format = static_cast<uint32_t>(GpuCaptureColorFormat::Rgba8Unorm);
+            if (!r.u64(seed.guest_addr) || !r.u32(seed.width) || !r.u32(seed.height) ||
+                (version >= 13 && !r.u32(format)) || !r.bytes(seed.rgba)) return false;
+            seed.format = static_cast<GpuCaptureColorFormat>(format);
             if (!validate_rtt_seed(seed, error)) return false;
             if (!addresses.insert(seed.guest_addr).second) { error = "duplicate RTT seed address"; return false; }
             if (seed_total > kMaxTotalRttSeedBytes - seed.rgba.size()) {

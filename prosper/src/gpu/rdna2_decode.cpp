@@ -87,6 +87,48 @@ void decode_operands(Rdna2Inst& i) {
                         i.has_modifier = false;
                     }
                 }
+                // v_cvt_f32_f16_sdwa may select either packed half before conversion. The source
+                // abs/neg modifiers apply to that f16 value (the recompiler applies them after
+                // unpacking); destination remains a full f32 dword. UE4's volume-lighting kernel
+                // uses WORD_1 heavily for packed half intermediates.
+                else if (((w >> 9) & 0xFFu) == 0x0Bu) {
+                    const uint32_t dsel = (sd >> 8) & 7u, dun = (sd >> 11) & 3u;
+                    const uint32_t s0sel = (sd >> 16) & 7u;
+                    if (dsel == 6u && dun == 0u && s0sel >= 4u && s0sel <= 6u &&
+                        !((sd >> 19) & 0x9u) && !i.clamp && !i.omod) {
+                        i.sdwa_src0_sel = static_cast<uint8_t>(s0sel);
+                        i.has_modifier = false;
+                    }
+                }
+                // v_cvt_f16_f32_sdwa packs a full f32 source into the selected destination half.
+                // The live producer writes WORD_1 with UNUSED_PRESERVE to assemble packed values.
+                else if (((w >> 9) & 0xFFu) == 0x0Au) {
+                    const uint32_t dsel = (sd >> 8) & 7u, dun = (sd >> 11) & 3u;
+                    const uint32_t s0sel = (sd >> 16) & 7u;
+                    if ((dsel == 4u || dsel == 5u) && dun == 2u && s0sel == 6u &&
+                        !((sd >> 19) & 0x9u) && !i.clamp && !i.omod &&
+                        !i.src_neg[0] && !i.src_abs[0]) {
+                        i.sdwa_dst_sel = static_cast<uint8_t>(dsel);
+                        i.sdwa_dst_unused = static_cast<uint8_t>(dun);
+                        i.has_modifier = false;
+                    }
+                }
+                // Packed unary f16 SDWA selects one source half, writes one destination half, and
+                // preserves the other. The producer uses rcp/sqrt/cos (0x54/0x55/0x61).
+                else if (((w >> 9) & 0xFFu) == 0x54u ||
+                         ((w >> 9) & 0xFFu) == 0x55u ||
+                         ((w >> 9) & 0xFFu) == 0x61u) {
+                    const uint32_t dsel = (sd >> 8) & 7u, dun = (sd >> 11) & 3u;
+                    const uint32_t s0sel = (sd >> 16) & 7u;
+                    if ((dsel == 4u || dsel == 5u) && dun == 2u &&
+                        (s0sel >= 4u && s0sel <= 6u) && !((sd >> 19) & 0x9u) &&
+                        !i.clamp && !i.omod && !i.src_neg[0] && !i.src_abs[0]) {
+                        i.sdwa_dst_sel = static_cast<uint8_t>(dsel);
+                        i.sdwa_dst_unused = static_cast<uint8_t>(dun);
+                        i.sdwa_src0_sel = static_cast<uint8_t>(s0sel);
+                        i.has_modifier = false;
+                    }
+                }
             } else if (i.has_dpp) { i.src[0] = vgpr(i.words[1]); i.n_src = 1; }   // DPP16: real SRC0 in dw1[7:0]
             else { i.src[0] = decode_src_field(w & 0x1FFu); i.n_src = 1; }
             break;
@@ -114,15 +156,36 @@ void decode_operands(Rdna2Inst& i) {
                 // UNUSED_PRESERVE, src sels WORD/DWORD, no sext/neg/abs/clamp/omod. (llvm-mc gfx1010:
                 // 0x6a0000f9 0x0686156a -> v_mul_f16_sdwa v0, vcc_lo, v0 dst_sel:WORD_1
                 // dst_unused:UNUSED_PRESERVE — DOLL's box-blur tail.)
-                else if (((w >> 25) & 0x3Fu) == 0x35u) {
+                else if (((w >> 25) & 0x3Fu) == 0x32u ||
+                         ((w >> 25) & 0x3Fu) == 0x33u ||
+                         ((w >> 25) & 0x3Fu) == 0x35u ||
+                         ((w >> 25) & 0x3Fu) == 0x39u ||
+                         ((w >> 25) & 0x3Fu) == 0x3Au) {
+                    uint32_t dsel = (sd >> 8) & 7u, dun = (sd >> 11) & 3u;
+                    uint32_t s0sel = (sd >> 16) & 7u, s1sel = (sd >> 24) & 7u;
+                    const bool preserve_word = (dsel == 4u || dsel == 5u) && dun == 2u;
+                    const bool padded_dword = dsel == 6u && dun == 0u;
+                    if ((preserve_word || padded_dword) &&
+                        (s0sel >= 4u && s0sel <= 6u) && (s1sel >= 4u && s1sel <= 6u) &&
+                        !((sd >> 19) & 0x9u) && !((sd >> 27) & 0x9u) && !i.omod) {
+                        i.sdwa_dst_sel = (uint8_t)dsel; i.sdwa_dst_unused = (uint8_t)dun;
+                        i.sdwa_src0_sel = (uint8_t)s0sel; i.sdwa_src1_sel = (uint8_t)s1sel;
+                        i.has_modifier = false;
+                    }
+                }
+                // WORD-destination v_cndmask_b32_sdwa selects one 16-bit source through VCC and
+                // preserves the opposite destination half (the producer's packed conditional).
+                else if (((w >> 25) & 0x3Fu) == 0x01u) {
                     uint32_t dsel = (sd >> 8) & 7u, dun = (sd >> 11) & 3u;
                     uint32_t s0sel = (sd >> 16) & 7u, s1sel = (sd >> 24) & 7u;
                     if ((dsel == 4u || dsel == 5u) && dun == 2u &&
-                        (s0sel >= 4u && s0sel <= 6u) && (s1sel >= 4u && s1sel <= 6u) &&
+                        s0sel >= 4u && s0sel <= 6u && s1sel >= 4u && s1sel <= 6u &&
                         !((sd >> 19) & 0x9u) && !((sd >> 27) & 0x9u) && !i.clamp && !i.omod &&
                         !i.src_neg[0] && !i.src_abs[0] && !i.src_neg[1] && !i.src_abs[1]) {
-                        i.sdwa_dst_sel = (uint8_t)dsel; i.sdwa_dst_unused = (uint8_t)dun;
-                        i.sdwa_src0_sel = (uint8_t)s0sel; i.sdwa_src1_sel = (uint8_t)s1sel;
+                        i.sdwa_dst_sel = static_cast<uint8_t>(dsel);
+                        i.sdwa_dst_unused = static_cast<uint8_t>(dun);
+                        i.sdwa_src0_sel = static_cast<uint8_t>(s0sel);
+                        i.sdwa_src1_sel = static_cast<uint8_t>(s1sel);
                         i.has_modifier = false;
                     }
                 }
@@ -185,6 +248,10 @@ void decode_operands(Rdna2Inst& i) {
                 i.src_abs[0] = i.src_abs[1] = i.src_abs[2] = false;
                 i.clamp = false;
             }
+            // v_fma_f16 VOP3: OPSEL[2:0] selects each packed source half and OPSEL[3]
+            // selects the destination half. Reuse the packed-op selector field for this family.
+            if (i.opcode == 0x34Bu)
+                i.vop3p_opsel = static_cast<uint8_t>((w >> 11) & 0xFu);
             break;
         }
         case Rdna2Format::VOP3P: {
@@ -197,13 +264,23 @@ void decode_operands(Rdna2Inst& i) {
             i.src[0] = decode_src_field(d1 & 0x1FFu);
             i.src[1] = decode_src_field((d1 >> 9) & 0x1FFu);
             i.src[2] = decode_src_field((d1 >> 18) & 0x1FFu); i.n_src = 3;
-            // v_fma_mix_f32/mixlo/mixhi (0x20-0x22): every modifier bit is MODELED (#273) —
+            // Packed f16 add/mul (0x0f/0x10) and v_fma_mix_f32/mixlo/mixhi (0x20-0x22): every
+            // modifier bit is MODELED (#273). For packed ops OPSEL/NEG select and negate each source
+            // independently for the low result; OPSEL_HI/NEG_HI do the same for the high result.
+            // For the mix family:
             // OPSEL_HI[k] selects an f16-half read (which half via OPSEL[k]), NEG negates, NEG_HI
             // is ABS for the mix family, CLAMP saturates. (llvm-mc gfx1030 round-trip on the live
             // DOLL bytes: 0xcc200044 0x9a02170b = v_fma_mix_f32 v68, v11, v11, neg(0)
             // op_sel_hi:[1,1,0].) Other VOP3P ops (v_pk_*, per-half packed semantics) still reject
             // on any modifier bit.
-            if (i.opcode >= 0x20 && i.opcode <= 0x22) {
+            if (i.opcode == 0x0F || i.opcode == 0x10) {
+                const uint32_t neg = (d1 >> 29) & 7u;
+                for (int k = 0; k < 3; ++k) i.src_neg[k] = ((neg >> k) & 1u) != 0;
+                i.vop3p_neg_hi  = static_cast<uint8_t>((w >> 8) & 7u);
+                i.vop3p_opsel   = static_cast<uint8_t>((w >> 11) & 7u);
+                i.vop3p_opsel_hi = static_cast<uint8_t>(((d1 >> 27) & 3u) | (((w >> 14) & 1u) << 2));
+                i.clamp = ((w >> 15) & 1u) != 0;
+            } else if (i.opcode >= 0x20 && i.opcode <= 0x22) {
                 const uint32_t neg = (d1 >> 29) & 7u, neg_hi = (w >> 8) & 7u;
                 for (int k = 0; k < 3; k++) {
                     i.src_neg[k] = ((neg >> k) & 1u) != 0;
@@ -285,14 +362,16 @@ void decode_operands(Rdna2Inst& i) {
         }
         case Rdna2Format::DS: {
             // LDS/GDS op. opcode[25:18]; 16-bit byte offset[15:0]; dword1: ADDR[7:0], DATA0[15:8],
-            // DATA1[23:16], VDST[31:24]. (Verified via llvm-mc gfx1030: ds_write_b32=0x0d, ds_read_b32=0x36.)
+            // DATA1[23:16], VDST[31:24]. (Verified via llvm-mc gfx1030: ds_write_b32=0x0d,
+            // ds_read_b32=0x36, ds_write_b64=0x4d, ds_write2_b64=0x4e.)
             const uint32_t d1 = i.words[1];
             i.opcode  = (w >> 18) & 0xFFu;
             i.literal = w & 0xFFFFu;                 // byte offset (offset0:offset1)
             i.src[0]  = vgpr(d1 & 0xFFu);            // ADDR (byte offset into LDS)
             i.src[1]  = vgpr((d1 >> 8) & 0xFFu);     // DATA0 (store source)
+            i.src[2]  = vgpr((d1 >> 16) & 0xFFu);    // DATA1 (write2 store source)
             i.dst     = vgpr((d1 >> 24) & 0xFFu);    // VDST (load dest)
-            i.n_src = 2; break;
+            i.n_src = 3; break;
         }
         case Rdna2Format::VINTRP: {
             // Pixel-shader interpolation. opcode[17:16] (p1=0,p2=1,mov=2); vdst[25:18]; attr[15:10];

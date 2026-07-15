@@ -123,10 +123,16 @@ struct GpuCapturedOperationFailure {
 // Host-rendered pixels retained across submits. The HLE renderer does not write these pixels back to
 // guest memory, so a standalone replay must seed its RTT cache explicitly to reproduce consumers whose
 // producer was in an earlier submit.
+enum class GpuCaptureColorFormat : uint32_t {
+    Rgba8Unorm = 1,
+    Rgba16Float = 2,
+};
+
 struct GpuCaptureRttSeed {
     uint64_t guest_addr = 0;
     uint32_t width = 0;
     uint32_t height = 0;
+    GpuCaptureColorFormat format = GpuCaptureColorFormat::Rgba8Unorm;
     std::vector<uint8_t> rgba;
 };
 
