@@ -491,6 +491,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 ? prosper::gpu::tiled_surface_bytes(
                                       tw, th, r.tile_mode, persistent_pitch)
                                 : 0);
+                        static const bool cross_submit_watch_enabled =
+                            !getenv("PROSPER_NO_CROSS_SUBMIT_TEXTURE_WRITE_WATCH");
+                        static const bool audit_cross_submit_watch =
+                            getenv("PROSPER_AUDIT_CROSS_SUBMIT_TEXTURE_WRITE_WATCH") != nullptr;
+                        prosper::host::GuestWriteWatch pending_source_watch;
                         bool narrow_done = false;
                         auto reused = has_live_rtt ? decoded_textures.end()
                                                    : decoded_textures.find(decode_key);
@@ -537,10 +542,6 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                         cached->second.validation_snapshot, r.gpu_addr,
                                         persistent_source_size) ==
                                         prosper::gpu::GuestGpuWriteQuery::Unchanged;
-                                static const bool cross_submit_watch_enabled =
-                                    !getenv("PROSPER_NO_CROSS_SUBMIT_TEXTURE_WRITE_WATCH");
-                                static const bool audit_cross_submit_watch =
-                                    getenv("PROSPER_AUDIT_CROSS_SUBMIT_TEXTURE_WRITE_WATCH") != nullptr;
                                 prosper::host::GuestWriteWatchQuery watch_query =
                                     prosper::host::GuestWriteWatchQuery::Unknown;
                                 if (!submit_unchanged && cross_submit_watch_enabled &&
@@ -565,6 +566,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 }
                                 const bool watch_unchanged = !submit_unchanged &&
                                     watch_query == prosper::host::GuestWriteWatchQuery::Unchanged;
+                                if (!submit_unchanged && !watch_unchanged &&
+                                    cross_submit_watch_enabled &&
+                                    !cached->second.source_watch_disabled) {
+                                    // Arm before reading. A concurrent CPU write during or after the
+                                    // authoritative comparison then dirties this registration instead of
+                                    // landing in an unprotected compare-to-rearm window.
+                                    if (!cached->second.source_watch.rearm())
+                                        cached->second.source_watch =
+                                            prosper::host::GuestWriteWatch::create(
+                                                r.gpu_addr, persistent_source_size);
+                                }
                                 bool content_matches = false;
                                 if (submit_unchanged || watch_unchanged) {
                                     const bool audit = submit_unchanged
@@ -590,14 +602,6 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                     content_matches = validate_exact();
                                 }
                                 if (content_matches) {
-                                    if (!submit_unchanged && cross_submit_watch_enabled &&
-                                        !cached->second.source_watch_disabled &&
-                                        watch_query != prosper::host::GuestWriteWatchQuery::Unchanged) {
-                                        if (!cached->second.source_watch.rearm())
-                                            cached->second.source_watch =
-                                                prosper::host::GuestWriteWatch::create(
-                                                    r.gpu_addr, persistent_source_size);
-                                    }
                                     cached->second.last_use = decode_generation;
                                     cached->second.validation_snapshot =
                                         prosper::gpu::guest_gpu_write_snapshot();
@@ -612,9 +616,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                     resource_persistent_invalidation = true;
                                     pending_timing.persistent_invalidations++;
                                 }
-                            } else if (timing_enabled) {
-                                resource_persistent_miss = true;
-                                pending_timing.persistent_misses++;
+                            } else {
+                                // Establish the mutation boundary before the initial source read/decode.
+                                // If registration is unsupported, the empty watch keeps all later reuse on
+                                // the exact fallback.
+                                if (cross_submit_watch_enabled)
+                                    pending_source_watch = prosper::host::GuestWriteWatch::create(
+                                        r.gpu_addr, persistent_source_size);
+                                if (timing_enabled) {
+                                    resource_persistent_miss = true;
+                                    pending_timing.persistent_misses++;
+                                }
                             }
                         }
                         if (decoded_reuse) {
@@ -1090,9 +1102,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             auto old = persistent_decoded_textures.find(decode_key);
                             uint32_t inherited_watch_dirty_count = 0;
                             bool inherited_watch_disabled = false;
-                            if (old != persistent_decoded_textures.end()) {
+                            prosper::host::GuestWriteWatch inherited_source_watch =
+                                std::move(pending_source_watch);
+                            if (old != persistent_decoded_textures.end() &&
+                                old->second.source_size == persistent_source_size) {
                                 inherited_watch_dirty_count = old->second.source_watch_dirty_count;
                                 inherited_watch_disabled = old->second.source_watch_disabled;
+                                if (!inherited_watch_disabled)
+                                    inherited_source_watch = std::move(old->second.source_watch);
                             }
                             const bool can_replace = old == persistent_decoded_textures.end() ||
                                 old->second.last_use != decode_generation;
@@ -1141,10 +1158,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                     prosper::gpu::guest_gpu_write_snapshot();
                                 cached.source_watch_dirty_count = inherited_watch_dirty_count;
                                 cached.source_watch_disabled = inherited_watch_disabled;
-                                if (!cached.source_watch_disabled &&
-                                    !getenv("PROSPER_NO_CROSS_SUBMIT_TEXTURE_WRITE_WATCH"))
-                                    cached.source_watch = prosper::host::GuestWriteWatch::create(
-                                        r.gpu_addr, persistent_source_size);
+                                cached.source_watch = std::move(inherited_source_watch);
                                 auto [inserted, ok] = persistent_decoded_textures.emplace(
                                     decode_key, std::move(cached));
                                 if (ok) {
