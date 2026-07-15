@@ -1008,7 +1008,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // the generic 4-B read and detile above preserve packed texels; normalize each
                         // field to the RGBA8 image format used by this renderer before sampling.
                         if (!rtt_hit && r.format == prosper::gpu::DataFormat::Unorm2_10_10_10) {
-                            uint8_t* tp = texstore.back().data();
+                            uint8_t* tp = texture_pixels.data();
                             for (size_t t = 0; t < volume_texels; t++) {
                                 uint32_t v; std::memcpy(&v, tp + t * 4, 4);
                                 prosper::gpu::unorm2_10_10_10_to_rgba8(v, tp + t * 4);
