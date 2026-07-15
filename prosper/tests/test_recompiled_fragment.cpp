@@ -41,6 +41,30 @@ int main() {
     CHECK(c[1] > 0x80 && c[0] < 0x40 && c[2] < 0x40, "center pixel is GREEN (from the recompiled shader)");
     CHECK(k[2] > 0x80 && k[0] < 0x40 && k[1] < 0x40, "corner pixel is the BLUE clear");
 
+    // DOLL's volume-sampling PS uses ENA=ADDR=0x702: perspective-center occupies v0:v1 and
+    // POS_X/Y/Z_FLOAT occupy v2:v4. Export v2 as red; a real FragCoord.x saturates the UNORM target
+    // while the old undefined-register fallback exported zero and left the triangle black.
+    const uint32_t position_ps[] = {
+        0x7E060280u, 0x7E080280u, 0x7E0A02F2u, // v3=0, v4=0, v5=1
+        0xF800180Fu, 0x05040302u, 0xBF810000u, // exp mrt0 v2,v3,v4,v5; s_endpgm
+    };
+    PixelSystemInputMapping doll_inputs{0x00000702u, 0x00000702u};
+    std::vector<uint32_t> position_frag = recompile_fragment(
+        position_ps, std::size(position_ps), nullptr, &doll_inputs);
+    CHECK(!position_frag.empty(), "recompiled DOLL's packed perspective-center + position inputs");
+    if (!position_frag.empty()) {
+        std::vector<uint8_t> position_px = prosper::test::render_triangle_rgba(
+            vert, position_frag, W, H);
+        CHECK(position_px.size() == (size_t)W * H * 4,
+              "rendered a fragment shader consuming the hardware position VGPR");
+        if (position_px.size() == (size_t)W * H * 4) {
+            const uint8_t* pc = &position_px[((size_t)(H/2) * W + W/2) * 4];
+            printf("  system-position center=(%u,%u,%u,%u)\n", pc[0],pc[1],pc[2],pc[3]);
+            CHECK(pc[0] > 0x80 && pc[1] < 0x40 && pc[2] < 0x40,
+                  "DOLL layout: v2 receives FragCoord.x and renders RED");
+        }
+    }
+
     // VCC kill-mask early-out (#273 — DOLL's alpha-cull PS): `v_cmp; s_andn2_b64 vcc, exec, vcc;
     // s_cbranch_scc0 <null-export>; s_mov_b64 exec, vcc; export`. The kill mask lives in VCC itself
     // (not a saved SGPR pair); mask_test_branches must recognize it so the branch linearizes and the

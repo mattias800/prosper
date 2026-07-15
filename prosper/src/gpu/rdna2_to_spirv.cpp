@@ -990,6 +990,11 @@ struct SpirvCompute {
         put(deco, Op_Decorate, {v_fragcoord, Dec_BuiltIn, BI_FragCoord});
         iface.push_back(v_fragcoord); return v_fragcoord;
     }
+    uint32_t fragcoord_component(uint32_t component) {
+        uint32_t value = id(); put(code, Op_Load, {t_v4f, value, fragcoord_var()});
+        uint32_t scalar = id(); put(code, Op_CompositeExtract, {t_f32, scalar, value, component});
+        return bcu(scalar);
+    }
     // DPP16 quad_perm (#273 — DOLL's manual ddx/ddy in its sharpen/AA PSs): the value of `x` at quad
     // lane t = QP[my_lane] is reconstructed as x + (tx-px)·dPdx(x) + (ty-py)·dPdy(x), where (px,py) =
     // (int(gl_FragCoord.xy) & 1) is this invocation's quad position and (tx,ty) = (t&1, t>>1). Exact
@@ -4758,7 +4763,9 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
     return cov;
 }
 
-std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords, const ShaderResourceTable* rt) {
+std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
+                                         const ShaderResourceTable* rt,
+                                         const PixelSystemInputMapping* system_inputs) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
 
@@ -4779,6 +4786,20 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords, co
       for (uint32_t a : b.flat_attrs) if (smooth_attr.count(a)) return {};   // mixed smooth+flat: reject
     }
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
+    if (system_inputs) {
+        // RDNA2 PS system values are packed in field order. ADDR reserves each field's documented
+        // width even when ENA is clear, allowing a driver to keep later VGPR numbers stable. Vulkan
+        // exposes the four floating-point position terms directly as FragCoord.xyzw.
+        static constexpr uint8_t widths[16] = {2, 2, 2, 3, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+        uint32_t vgpr = 0;
+        for (uint32_t field = 0; field < 16; ++field) {
+            const uint32_t bit = 1u << field;
+            if (!(system_inputs->addr & bit)) continue;
+            if ((system_inputs->ena & bit) && field >= 8 && field <= 11)
+                rs.vreg[(int)vgpr] = b.fragcoord_component(field - 8);
+            vgpr += widths[field];
+        }
+    }
     auto safe_branches = safe_execz_branches(ins);
     for (uint32_t wpc : waterfall_branches(ins)) safe_branches.insert(wpc);   // readfirstlane waterfalls (#273)
     // FRAGMENT-only: also linearize alpha-test / clip() kill-mask s_cbranch_scc0/scc1 early-outs (Unity

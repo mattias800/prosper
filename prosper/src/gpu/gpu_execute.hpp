@@ -198,7 +198,8 @@ struct ShaderRecompileCacheStats {
 std::vector<uint32_t> recompile_graphics_shader_cached(ShaderProgramStage stage,
                                                        const uint32_t* code, size_t dwords,
                                                        const ShaderResourceTable* resources = nullptr,
-                                                       const PixelInputMapping* pixel_inputs = nullptr);
+                                                       const PixelInputMapping* pixel_inputs = nullptr,
+                                                       const PixelSystemInputMapping* system_inputs = nullptr);
 ShaderRecompileCacheStats shader_recompile_cache_stats();
 void clear_shader_recompile_cache();
 
@@ -431,22 +432,25 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         }
     }
     if (getenv("PROSPER_INTERPLOG")) {
-        fprintf(stderr, "[interp] es=0x%llx ps=0x%llx source=%s valid=%08x",
+        fprintf(stderr, "[interp] es=0x%llx ps=0x%llx source=%s valid=%08x ena=%08x addr=%08x",
                 (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr,
                 interpolants_from_metadata ? "metadata" : "registers",
-                pixel_inputs.valid_mask);
+                pixel_inputs.valid_mask, rs.ps_input_ena, rs.ps_input_addr);
         for (uint32_t i = 0; i < pixel_inputs.controls.size(); ++i)
             if (pixel_inputs.valid_mask & (1u << i))
                 fprintf(stderr, " i%u=%08x", i, pixel_inputs.controls[i]);
         fprintf(stderr, "\n");
     }
     const PixelInputMapping* pixel_input_ptr = pixel_inputs.valid_mask ? &pixel_inputs : nullptr;
+    PixelSystemInputMapping system_inputs{rs.ps_input_ena, rs.ps_input_addr};
+    const PixelSystemInputMapping* system_input_ptr =
+        (system_inputs.ena || system_inputs.addr) ? &system_inputs : nullptr;
     std::vector<uint32_t> vs = recompile_graphics_shader_cached(
         ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)rs.es_addr,
         max_shader_dwords, vrt.get(), pixel_input_ptr);
     std::vector<uint32_t> fs = recompile_graphics_shader_cached(
         ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
-        max_shader_dwords, prt.get());
+        max_shader_dwords, prt.get(), nullptr, system_input_ptr);
     if (phase_timing) {
         const auto shader_done = std::chrono::steady_clock::now();
         record_draw_realization_phases(
