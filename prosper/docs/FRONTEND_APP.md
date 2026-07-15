@@ -177,14 +177,21 @@ $env:PROSPER_RENDER_TIMING = '1'
 The output separates guest-state realization, ordered graphics/compute execution, CPU resource
 decode/detile, Vulkan target and pipeline setup, upload/recording, GPU fence wait, readback, cleanup,
 and frontend publication. Cumulative `[render-timing]` lines show the whole run; `[render-window]`
-lines show only the latest 25 submits/calls so a scene transition is immediately visible. The core
-window also reports graphics-shader cache hits, misses, bypasses, and actual miss compilation time.
+lines show only the latest 25 submits/calls so a scene transition is immediately visible. The
+`backend-submit` lines sum every Vulkan call made by those exact ordered submits, rather than mixing
+an independent 25-call backend window across submit boundaries. Compare `measured` with `detail` and
+its `other` remainder to verify that the subphase attribution covers the frontend's backend wall time.
+The core window also reports graphics-shader cache hits, misses, bypasses, and actual miss compilation time.
 Use `PROSPER_RENDER_TIMING=detail` to additionally print individual texture decodes taking at least
 0.5 ms (capped at 250 lines). Set `PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT=N` to begin those detail
 lines at renderer submit N, so boot textures do not consume the cap before the scene under study. Each
 line identifies local reuse, persistent hit/miss/invalidation, RTT sourcing, or an uncached decode. The
 aggregate output also reports retained RTT bytes, decode-scratch capacity, and validation-scratch capacity;
 use those figures before treating a process-memory increase as an unbounded cache.
+Combine timing with `PROSPER_RTTLOG=1` to print one `[rtt-timing]` line per rendered target group. It includes
+the submit number, target address, dimensions, draw count, and that target's exact Vulkan phase breakdown.
+Use `PROSPER_RTTLOG_MIN_SUBMIT=N` and `PROSPER_RTTLOG_MAX_SUBMIT=N` to bound the diagnostic window; unrestricted
+logging can materially slow a title and perturb wall-clock input routes.
 
 Ordered graphics/compute submits retain a bounded journal of exact guest-memory ranges written by the
 compute backend. A persistent texture validated in an earlier graphics span can therefore skip its repeated

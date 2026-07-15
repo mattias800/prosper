@@ -8,6 +8,7 @@
 #include "../src/gpu/render_state.hpp"
 #include "render_runner.h"
 #include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <vector>
 
@@ -19,6 +20,11 @@ static int fails = 0;
 
 int main() {
     printf("== test_multidraw_render ==\n");
+#ifdef _WIN32
+    _putenv_s("PROSPER_RENDER_TIMING", "1");
+#else
+    setenv("PROSPER_RENDER_TIMING", "1", 1);
+#endif
     const uint32_t W = 64, H = 64;
 
     // Known-good fullscreen-triangle vertex shader (SPIR-V), shared by both draws.
@@ -65,6 +71,15 @@ int main() {
             CHECK(c[0] > 0xC0 && c[1] > 0xC0 && c[2] < 0x40,
                   "two draws composite into ONE cleared-once framebuffer -> YELLOW center (red+green)");
         }
+        const prosper::test::BackendRenderTimingStats timing =
+            prosper::test::backend_render_timing_stats();
+        CHECK(timing.calls == 1 && timing.draws == 2,
+              "backend timing publishes the completed call and draw count");
+        CHECK(timing.total_ms() > 0 && timing.draw_setup_ms > 0,
+              "backend timing publishes a non-empty phase breakdown");
+        CHECK(timing.draw_setup_ms + 0.001 >= timing.setup_shader_ms + timing.setup_fixed_ms +
+                  timing.setup_resources_ms + timing.setup_pipeline_ms,
+              "draw-setup subphases fit inside the backend draw-setup phase");
     }
 
     // A guest depth/stencil surface survives renderer calls. The first call writes stencil=2 with no

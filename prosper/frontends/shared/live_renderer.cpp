@@ -206,10 +206,22 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             static thread_local int g_this_submit = -1;
             if (phase.first_span || g_this_submit < 0) g_this_submit = g_submit_idx++;
             if (g_this_submit > g_render_last) return {};
+            static const int g_rttlog_min_submit = getenv("PROSPER_RTTLOG_MIN_SUBMIT")
+                ? std::max(0, atoi(getenv("PROSPER_RTTLOG_MIN_SUBMIT"))) : 0;
+            static const int g_rttlog_max_submit = getenv("PROSPER_RTTLOG_MAX_SUBMIT")
+                ? std::max(0, atoi(getenv("PROSPER_RTTLOG_MAX_SUBMIT"))) : INT_MAX;
+            const bool rtt_log = getenv("PROSPER_RTTLOG") &&
+                g_this_submit >= g_rttlog_min_submit && g_this_submit <= g_rttlog_max_submit;
             using RenderClock = std::chrono::steady_clock;
             struct RenderTiming {
                 uint64_t callbacks = 0;
                 double total_ms = 0, build_resources_ms = 0, backend_ms = 0, output_copy_ms = 0;
+                uint64_t backend_calls = 0, backend_draws = 0;
+                double backend_target_ms = 0, backend_draw_setup_ms = 0;
+                double backend_record_upload_ms = 0, backend_gpu_wait_ms = 0;
+                double backend_readback_ms = 0, backend_cleanup_ms = 0;
+                double backend_setup_shader_ms = 0, backend_setup_fixed_ms = 0;
+                double backend_setup_resources_ms = 0, backend_setup_pipeline_ms = 0;
                 uint64_t textures = 0, texture_reuses = 0, buffers = 0;
                 uint64_t persistent_hits = 0, persistent_misses = 0, persistent_invalidations = 0;
                 uint64_t persistent_submit_reuses = 0, persistent_validations = 0;
@@ -222,6 +234,20 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             if (timing_enabled && phase.first_span) pending_timing = {};
             const auto callback_timing_start = timing_enabled
                 ? RenderClock::now() : RenderClock::time_point{};
+            auto record_backend_timing = [&](const prosper::test::BackendRenderTimingStats& backend) {
+                pending_timing.backend_calls += backend.calls;
+                pending_timing.backend_draws += backend.draws;
+                pending_timing.backend_target_ms += backend.target_ms;
+                pending_timing.backend_draw_setup_ms += backend.draw_setup_ms;
+                pending_timing.backend_record_upload_ms += backend.record_upload_ms;
+                pending_timing.backend_gpu_wait_ms += backend.gpu_wait_ms;
+                pending_timing.backend_readback_ms += backend.readback_ms;
+                pending_timing.backend_cleanup_ms += backend.cleanup_ms;
+                pending_timing.backend_setup_shader_ms += backend.setup_shader_ms;
+                pending_timing.backend_setup_fixed_ms += backend.setup_fixed_ms;
+                pending_timing.backend_setup_resources_ms += backend.setup_resources_ms;
+                pending_timing.backend_setup_pipeline_ms += backend.setup_pipeline_ms;
+            };
             // PROSPER_SUBMITLOG: print the GPU-submit index periodically (at native speed, before the slow
             // render) so it can be correlated with guest-side log lines (e.g. a MsgDialog wait) to find the
             // exact submit at which a scene appears — for aiming PROSPER_RENDER_FIRST at it.
@@ -608,7 +634,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                     }
                                 }
                             }
-                            if (getenv("PROSPER_RTTLOG"))
+                            if (rtt_log)
                                 fprintf(stderr, "[rtt] sample tex addr=0x%llx %ux%u fmt=%u -> %s (cache_size=%zu)\n",
                                         (unsigned long long)r.gpu_addr, tw, th, (unsigned)r.format,
                                         rtt_hit ? "HIT" : "miss", g_rtt.size());
@@ -1228,7 +1254,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     // RTTLOG per-draw detail (render-window-only, unlike the GFXLOG firehose): enough
                     // state to diagnose a pass whose inputs HIT the RTT cache yet outputs nothing —
                     // blend factors, write mask, viewport, and each PS-sampled texture address (#319).
-                    if (getenv("PROSPER_RTTLOG")) {
+                    if (rtt_log) {
                         fprintf(stderr, "[rtt]   draw tgt=0x%llx vcount=%u nidx=%zu topo=%u mask=0x%x "
                                 "blend=%d(src=%u dst=%u) vp=%d(%.2f,%.2f %.2fx%.2f) z=%d zw=%d ps=",
                                 (unsigned long long)it.color0_base, bd.vcount, bd.indices.size(),
@@ -1280,7 +1306,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 const int      vo_n     = prosper_vo_buffer_count();
                 const int      vo_front = prosper::gpu::present_front_index();
                 const uint64_t front_va = vo_front >= 0 ? prosper_vo_buffer_addr(vo_front) : 0;
-                if (getenv("PROSPER_RTTLOG")) {
+                if (rtt_log) {
                     fprintf(stderr, "[rtt] flip state: front=%d va=0x%llx of %d registered:",
                             vo_front, (unsigned long long)front_va, vo_n);
                     for (int i = 0; i < vo_n && i < 8; i++)
@@ -1405,11 +1431,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         backend_draws, gw, gh, seed, clear_for(render_pass), true);
                     const auto backend_done = timing_enabled
                         ? RenderClock::now() : RenderClock::time_point{};
+                    const prosper::test::BackendRenderTimingStats backend_call_timing = timing_enabled
+                        ? prosper::test::backend_render_timing_stats()
+                        : prosper::test::BackendRenderTimingStats{};
                     if (timing_enabled) {
                         pending_timing.build_resources_ms +=
                             std::chrono::duration<double, std::milli>(build_done - build_start).count();
                         pending_timing.backend_ms +=
                             std::chrono::duration<double, std::milli>(backend_done - build_done).count();
+                        record_backend_timing(backend_call_timing);
                     }
                     auto pass_pixels = std::make_shared<const std::vector<uint8_t>>(std::move(gpx));
                     if (base && !pass_pixels->empty()) {
@@ -1497,7 +1527,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     }
                     bool is_vo = false;
                     for (int i = 0; i < vo_n && !is_vo; i++) is_vo = base && base == prosper_vo_buffer_addr(i);
-                    if (getenv("PROSPER_RTTLOG")) {
+                    if (rtt_log) {
                         size_t nz = 0, rgb_nz = 0;
                         for (uint8_t b : rendered_pixels) nz += (b != 0);
                         for (size_t p = 0; p + 3 < rendered_pixels.size(); p += 4)
@@ -1506,7 +1536,19 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         fprintf(stderr, "[rtt] pass target=0x%llx extent=%ux%u native=%ux%u (%zu draws) "
                                 "px_nonzero=%zu rgb_nonblack=%zu cache_size=%zu%s%s\n",
                                 (unsigned long long)base, gw, gh, native_w, native_h, pass.size(), nz, rgb_nz, g_rtt.size(),
-                                is_vo ? " SCANOUT" : "", base && base == front_va ? " FRONT" : ""); }
+                                is_vo ? " SCANOUT" : "", base && base == front_va ? " FRONT" : "");
+                        if (timing_enabled)
+                            fprintf(stderr,
+                                    "[rtt-timing] submit=%d target=0x%llx extent=%ux%u draws=%zu "
+                                    "total=%.2f target_setup=%.2f draw_setup=%.2f record_upload=%.2f "
+                                    "gpu_wait=%.2f readback=%.2f cleanup=%.2f\n",
+                                    g_this_submit, (unsigned long long)base, gw, gh, pass.size(),
+                                    backend_call_timing.total_ms(), backend_call_timing.target_ms,
+                                    backend_call_timing.draw_setup_ms,
+                                    backend_call_timing.record_upload_ms,
+                                    backend_call_timing.gpu_wait_ms, backend_call_timing.readback_ms,
+                                    backend_call_timing.cleanup_ms);
+                    }
                     // PROSPER_DUMP_DRAWSTEPS: for a pass targeting a SCANOUT buffer, re-render the pass
                     // draw-by-draw (prefix 1, prefix 2, ...) and dump each cumulative result — a one-boot
                     // bisect for "which draw of the final composite blacks the screen" (#319). Diagnostic.
@@ -1559,11 +1601,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     backend_draws, w, h, nullptr, clear_for(all), true);
                 const auto backend_done = timing_enabled
                     ? RenderClock::now() : RenderClock::time_point{};
+                const prosper::test::BackendRenderTimingStats backend_call_timing = timing_enabled
+                    ? prosper::test::backend_render_timing_stats()
+                    : prosper::test::BackendRenderTimingStats{};
                 if (timing_enabled) {
                     pending_timing.build_resources_ms +=
                         std::chrono::duration<double, std::milli>(build_done - build_start).count();
                     pending_timing.backend_ms +=
                         std::chrono::duration<double, std::milli>(backend_done - build_done).count();
+                    record_backend_timing(backend_call_timing);
                 }
                 // RTT (#167): cache these rendered pixels under this submit's render-target base, so a later
                 // composite pass that samples that address gets the scene we drew (not empty guest memory).
@@ -1572,7 +1618,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     uint64_t tgt = 0;
                     for (const auto& it : items) if (it.color0_base) { tgt = it.color0_base; break; }
                     if (tgt) { RttSurf& s = g_rtt[tgt]; s.rgba = selected_pixels; s.w = w; s.h = h; }
-                    if (getenv("PROSPER_RTTLOG")) { size_t nz=0;
+                    if (rtt_log) { size_t nz=0;
                         for (uint8_t byte : *selected_pixels) nz += byte != 0;
                         fprintf(stderr, "[rtt] store target=0x%llx (%zu items, color0s:", (unsigned long long)tgt, items.size());
                         for (const auto& it : items) fprintf(stderr, " 0x%llx", (unsigned long long)it.color0_base);
@@ -1630,6 +1676,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 struct TimingTotals {
                     uint64_t submits = 0, callbacks = 0;
                     double total_ms = 0, build_resources_ms = 0, backend_ms = 0, output_copy_ms = 0;
+                    uint64_t backend_calls = 0, backend_draws = 0;
+                    double backend_target_ms = 0, backend_draw_setup_ms = 0;
+                    double backend_record_upload_ms = 0, backend_gpu_wait_ms = 0;
+                    double backend_readback_ms = 0, backend_cleanup_ms = 0;
+                    double backend_setup_shader_ms = 0, backend_setup_fixed_ms = 0;
+                    double backend_setup_resources_ms = 0, backend_setup_pipeline_ms = 0;
                     uint64_t textures = 0, texture_reuses = 0, buffers = 0;
                     uint64_t persistent_hits = 0, persistent_misses = 0, persistent_invalidations = 0;
                     uint64_t persistent_submit_reuses = 0, persistent_validations = 0;
@@ -1646,6 +1698,18 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     timing.build_resources_ms += pending_timing.build_resources_ms;
                     timing.backend_ms += pending_timing.backend_ms;
                     timing.output_copy_ms += pending_timing.output_copy_ms;
+                    timing.backend_calls += pending_timing.backend_calls;
+                    timing.backend_draws += pending_timing.backend_draws;
+                    timing.backend_target_ms += pending_timing.backend_target_ms;
+                    timing.backend_draw_setup_ms += pending_timing.backend_draw_setup_ms;
+                    timing.backend_record_upload_ms += pending_timing.backend_record_upload_ms;
+                    timing.backend_gpu_wait_ms += pending_timing.backend_gpu_wait_ms;
+                    timing.backend_readback_ms += pending_timing.backend_readback_ms;
+                    timing.backend_cleanup_ms += pending_timing.backend_cleanup_ms;
+                    timing.backend_setup_shader_ms += pending_timing.backend_setup_shader_ms;
+                    timing.backend_setup_fixed_ms += pending_timing.backend_setup_fixed_ms;
+                    timing.backend_setup_resources_ms += pending_timing.backend_setup_resources_ms;
+                    timing.backend_setup_pipeline_ms += pending_timing.backend_setup_pipeline_ms;
                     timing.textures += pending_timing.textures;
                     timing.texture_reuses += pending_timing.texture_reuses;
                     timing.persistent_hits += pending_timing.persistent_hits;
@@ -1672,6 +1736,27 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             (unsigned long long)totals.submits, (unsigned long long)totals.callbacks,
                             totals.total_ms / nsub, totals.build_resources_ms / nsub,
                             totals.backend_ms / nsub, totals.output_copy_ms / nsub, other / nsub);
+                    const double backend_detail_ms = totals.backend_target_ms +
+                        totals.backend_draw_setup_ms + totals.backend_record_upload_ms +
+                        totals.backend_gpu_wait_ms + totals.backend_readback_ms +
+                        totals.backend_cleanup_ms;
+                    fprintf(stderr,
+                            "[render-timing] backend-submit calls=%.2f draws=%.1f avg_ms: measured=%.2f "
+                            "detail=%.2f target=%.2f draw_setup=%.2f record_upload=%.2f "
+                            "gpu_wait=%.2f readback=%.2f cleanup=%.2f other=%.2f\n",
+                            totals.backend_calls / nsub, totals.backend_draws / nsub,
+                            totals.backend_ms / nsub, backend_detail_ms / nsub,
+                            totals.backend_target_ms / nsub, totals.backend_draw_setup_ms / nsub,
+                            totals.backend_record_upload_ms / nsub, totals.backend_gpu_wait_ms / nsub,
+                            totals.backend_readback_ms / nsub, totals.backend_cleanup_ms / nsub,
+                            (totals.backend_ms - backend_detail_ms) / nsub);
+                    fprintf(stderr,
+                            "[render-timing] backend-submit draw_setup avg_ms: shaders=%.2f fixed=%.2f "
+                            "resources=%.2f pipeline=%.2f\n",
+                            totals.backend_setup_shader_ms / nsub,
+                            totals.backend_setup_fixed_ms / nsub,
+                            totals.backend_setup_resources_ms / nsub,
+                            totals.backend_setup_pipeline_ms / nsub);
                     fprintf(stderr,
                             "[render-timing] resources textures=%llu reused=%llu %.1f MiB %.2f ms/submit; "
                             "buffers=%llu %.1f MiB %.2f ms/submit\n",
@@ -1721,6 +1806,27 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             window.texture_bytes / (wn * 1024.0 * 1024.0), window.texture_ms / wn,
                             window.buffers / wn, window.buffer_bytes / (wn * 1024.0 * 1024.0),
                             window.buffer_ms / wn);
+                    const double window_backend_detail_ms = window.backend_target_ms +
+                        window.backend_draw_setup_ms + window.backend_record_upload_ms +
+                        window.backend_gpu_wait_ms + window.backend_readback_ms +
+                        window.backend_cleanup_ms;
+                    fprintf(stderr,
+                            "[render-window] backend-submit calls=%.2f draws=%.1f avg_ms: measured=%.2f "
+                            "detail=%.2f target=%.2f draw_setup=%.2f record_upload=%.2f "
+                            "gpu_wait=%.2f readback=%.2f cleanup=%.2f other=%.2f\n",
+                            window.backend_calls / wn, window.backend_draws / wn,
+                            window.backend_ms / wn, window_backend_detail_ms / wn,
+                            window.backend_target_ms / wn, window.backend_draw_setup_ms / wn,
+                            window.backend_record_upload_ms / wn, window.backend_gpu_wait_ms / wn,
+                            window.backend_readback_ms / wn, window.backend_cleanup_ms / wn,
+                            (window.backend_ms - window_backend_detail_ms) / wn);
+                    fprintf(stderr,
+                            "[render-window] backend-submit draw_setup avg_ms: shaders=%.2f fixed=%.2f "
+                            "resources=%.2f pipeline=%.2f\n",
+                            window.backend_setup_shader_ms / wn,
+                            window.backend_setup_fixed_ms / wn,
+                            window.backend_setup_resources_ms / wn,
+                            window.backend_setup_pipeline_ms / wn);
                     fprintf(stderr,
                             "[render-window] texture_cache hits=%.1f submit_reuse=%.1f misses=%.1f "
                             "invalid=%.1f validations=%.1f %.1f MiB\n",

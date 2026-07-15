@@ -138,6 +138,34 @@ inline BackendTextureUploadStats backend_texture_upload_stats() {
     return backend_texture_upload_stats_storage();
 }
 
+struct BackendRenderTimingStats {
+    uint64_t calls = 0;
+    uint64_t draws = 0;
+    double target_ms = 0;
+    double draw_setup_ms = 0;
+    double record_upload_ms = 0;
+    double gpu_wait_ms = 0;
+    double readback_ms = 0;
+    double cleanup_ms = 0;
+    double setup_shader_ms = 0;
+    double setup_fixed_ms = 0;
+    double setup_resources_ms = 0;
+    double setup_pipeline_ms = 0;
+
+    double total_ms() const {
+        return target_ms + draw_setup_ms + record_upload_ms + gpu_wait_ms + readback_ms + cleanup_ms;
+    }
+};
+
+inline BackendRenderTimingStats& backend_render_timing_stats_storage() {
+    static thread_local BackendRenderTimingStats stats;
+    return stats;
+}
+
+inline BackendRenderTimingStats backend_render_timing_stats() {
+    return backend_render_timing_stats_storage();
+}
+
 // `seed_rgba` (optional): W*H*4 RGBA8 pixels to PRELOAD the color attachment with before the draws
 // run (loadOp LOAD instead of the blue clear). This is real render-target memory semantics: a game
 // pass that draws into a target it (or an earlier submit) already rendered composites OVER that
@@ -662,6 +690,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     using TimingClock = std::chrono::steady_clock;
     const bool timing_enabled = getenv("PROSPER_RENDER_TIMING") != nullptr;
     const auto timing_start = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
+    if (timing_enabled) backend_render_timing_stats_storage() = {};
     std::vector<uint8_t> out;
     if (draws.empty()) return out;
     const RenderVkCtx& ctx = render_vk_ctx();
@@ -1641,6 +1670,19 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         auto ms = [](auto begin, auto end) {
             return std::chrono::duration<double, std::milli>(end - begin).count();
         };
+        BackendRenderTimingStats& call_timing = backend_render_timing_stats_storage();
+        call_timing.calls = 1;
+        call_timing.draws = draws.size();
+        call_timing.target_ms = ms(timing_start, timing_target_ready);
+        call_timing.draw_setup_ms = ms(timing_target_ready, timing_draws_ready);
+        call_timing.record_upload_ms = ms(timing_draws_ready, timing_recorded);
+        call_timing.gpu_wait_ms = ms(timing_recorded, timing_gpu_done);
+        call_timing.readback_ms = ms(timing_gpu_done, timing_readback_done);
+        call_timing.cleanup_ms = ms(timing_readback_done, timing_done);
+        call_timing.setup_shader_ms = setup_shader_ms;
+        call_timing.setup_fixed_ms = setup_fixed_ms;
+        call_timing.setup_resources_ms = setup_resources_ms;
+        call_timing.setup_pipeline_ms = setup_pipeline_ms;
         struct TimingTotals {
             uint64_t calls = 0, draws = 0;
             uint64_t texture_references = 0, texture_uploads = 0, texture_upload_bytes = 0;
@@ -1659,16 +1701,16 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             timing.persistent_hits += texture_stats.persistent_hits;
             timing.persistent_misses += texture_stats.persistent_misses;
             timing.persistent_cached_bytes = texture_stats.persistent_cached_bytes;
-            timing.target += ms(timing_start, timing_target_ready);
-            timing.draw_setup += ms(timing_target_ready, timing_draws_ready);
-            timing.record += ms(timing_draws_ready, timing_recorded);
-            timing.gpu_wait += ms(timing_recorded, timing_gpu_done);
-            timing.readback += ms(timing_gpu_done, timing_readback_done);
-            timing.cleanup += ms(timing_readback_done, timing_done);
-            timing.setup_shader += setup_shader_ms;
-            timing.setup_fixed += setup_fixed_ms;
-            timing.setup_resources += setup_resources_ms;
-            timing.setup_pipeline += setup_pipeline_ms;
+            timing.target += call_timing.target_ms;
+            timing.draw_setup += call_timing.draw_setup_ms;
+            timing.record += call_timing.record_upload_ms;
+            timing.gpu_wait += call_timing.gpu_wait_ms;
+            timing.readback += call_timing.readback_ms;
+            timing.cleanup += call_timing.cleanup_ms;
+            timing.setup_shader += call_timing.setup_shader_ms;
+            timing.setup_fixed += call_timing.setup_fixed_ms;
+            timing.setup_resources += call_timing.setup_resources_ms;
+            timing.setup_pipeline += call_timing.setup_pipeline_ms;
         };
         accumulate(totals);
         accumulate(window);

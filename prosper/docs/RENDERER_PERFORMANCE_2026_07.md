@@ -335,6 +335,46 @@ than the dominant remaining renderer cost. The optimized run ended stable near 1
 working set. The next large performance work remains persistent Vulkan object reuse and fewer synchronous
 graphics/compute/readback boundaries.
 
+## Submit-aligned Vulkan timing
+
+The original backend timing window averaged every 25 calls independently. Dead Cells currently makes four
+graphics callbacks in an ordered submit, and each callback can render multiple targets, so those backend
+windows could straddle scene and submit boundaries. The frontend now records the structured timing result of
+every completed `render_draws_rgba` call and sums it into the same 25-submit window used by its resource and
+wall-time counters. The new `backend-submit` lines report calls and draws per submit plus target setup, draw
+setup, record/upload, fence wait, readback, cleanup, and the shader/fixed/resource/pipeline draw-setup split.
+They also print the frontend-measured backend duration, the detailed phase sum, and the unattributed remainder.
+This is the authoritative view for choosing the next backend optimization; the legacy per-call lines remain
+useful for spotting an individually slow render target. Combining `PROSPER_RENDER_TIMING=1` with
+`PROSPER_RTTLOG=1` adds a `[rtt-timing]` record for each target group with its submit, address, dimensions,
+draw count, and exact phase costs, allowing dependency logs and backend costs to be correlated directly. Bound
+verbose output with `PROSPER_RTTLOG_MIN_SUBMIT` and `PROSPER_RTTLOG_MAX_SUBMIT`; an unrestricted Dead Cells run
+dropped the title loop from about 20 FPS to 13-14 FPS and caused its wall-clock input route to miss the menu.
+
+A 180-second native Windows fresh-save Dead Cells run reached the post-parse workload with 373 draws, eight
+dispatches, and four graphics spans. Those spans rendered ten target groups per submit. The aligned backend
+window was:
+
+| Vulkan work per submit | Time |
+|---|---:|
+| Frontend-measured backend wall time | 90.09 ms |
+| Detailed phase sum | 75.28 ms |
+| Fence waits | 33.12 ms |
+| Draw setup | 26.54 ms |
+| Pipeline creation (inside draw setup) | 12.89 ms |
+| Descriptor/resources (inside draw setup) | 8.46 ms |
+| Readback | 9.43 ms |
+| Record/upload | 4.59 ms |
+| Target setup + cleanup | 1.59 ms |
+| Unattributed backend wrapper time | 14.81 ms |
+
+The whole ordered submit remained about 201 ms: 36 ms draw realization and 165 ms backend execution. Private
+memory stepped up with the workload, then stayed near 1.81 GiB through the end; working set stayed near
+3.78 GiB. This rules out unbounded growth in that window and shows that no single small setup cache can make
+the workload playable. The next investigation must identify the true dependencies among the ten target calls;
+persisting pipelines addresses about 13 ms, while removing unnecessary synchronous wait/readback boundaries
+has the larger ceiling but requires preserving graphics/compute and RTT producer-consumer order.
+
 ## Current frame budget
 
 After shared publication, the Dead Cells post-parse loading workload is the most useful current budget:
