@@ -471,6 +471,38 @@ resource-ownership scheduling rather than reordering by operation type.
 - Reordering compute and graphics by type is not valid. The corrected capture graph proves real
   producer/consumer edges in the representative frame.
 
+## Windows cross-submit texture write watch
+
+Windows direct memory is backed by shared sections, so `MEM_WRITE_WATCH` cannot observe writes through its
+aliases. The renderer now registers the physical 4 KiB pages behind an eligible cached texture, finds every
+writable virtual alias known to the HLE memory layer, and temporarily makes those aliases read-only. The
+existing vectored exception handler consumes the first write fault, marks the physical page generation dirty,
+and restores the original protection on every alias. Temporary host aliases used to zero recycled direct
+memory report their physical write explicitly. Mapping and protection changes invalidate affected watches.
+
+The shortcut is deliberately proof-based. A complete armed registration may return unchanged; a fault,
+incomplete mapping, protection failure, topology change, unsupported platform, or host notification falls back
+to the exact comparison. `PROSPER_AUDIT_CROSS_SUBMIT_TEXTURE_WRITE_WATCH=1` retains that comparison behind
+unchanged decisions. More than 10,000 audited decisions in the Dead Cells full-render loading route produced
+zero disagreements. A focused Windows test maps one section through two aliases and proves that writes through
+either alias, a host physical write, and an alias removal are all observed. Non-Windows builds use the exact
+path unchanged.
+
+The first live implementation exposed a separate performance trap: two textures are rewritten through nearly
+every watched page on every post-parse submit, even when some writes reproduce identical bytes. Re-arming them
+generated about 490,000 handled faults in 180 seconds. The final policy disables page protection after two
+consecutive dirty observations and preserves that decision when changed content replaces the cache entry;
+exact comparison remains authoritative for those dynamic resources. In the final 144-second run, registrations
+stopped at 26 and faults plateaued at 17,821 after the workload transition instead of growing every submit.
+
+The stable four-span window reduced exact validation from roughly 145 MiB per submit after the same-submit
+journal to 3.3 MiB per submit. Post-transition process memory remained bounded at 1.60-1.68 GiB private and
+3.62-3.68 GiB working set. The run still remained on the Prisoners' Quarters loading screen, so this result is
+a renderer performance/correctness improvement, not evidence that the separate progression stall is fixed.
+With persistent pipelines and write-aware validation in place, the measured heavy path is now dominated by
+resource construction plus roughly ten synchronous Vulkan target calls, fence waits, and readbacks per guest
+submit. That boundary/lifetime architecture is the next performance target.
+
 ## Separate unresolved risk
 
 Native Windows boot can still intermittently stop after exactly 75 submits while asset loading and

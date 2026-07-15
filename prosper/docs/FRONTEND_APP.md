@@ -200,10 +200,17 @@ Dead Cells post-parse workload while excluding its 54-56-draw loading loop.
 
 Ordered graphics/compute submits retain a bounded journal of exact guest-memory ranges written by the
 compute backend. A persistent texture validated in an earlier graphics span can therefore skip its repeated
-full-byte scan when no later write overlaps it. Timing output reports these as `persistent-submit` details and
-`submit_reuse` aggregates, alongside the remaining exact validation count and bytes. Cross-submit reuse still
-uses exact comparison because guest CPU writes are not yet tracked. Set
-`PROSPER_NO_SUBMIT_TEXTURE_VALIDATION_REUSE=1` for the exact-validation A/B control. Set
+full-byte scan when no later write overlaps it. On Windows, cross-submit reuse also protects every writable
+virtual alias of the texture's physical guest pages and handles the first CPU write through the process VEH.
+An unchanged registration proves that the bytes were not written; a fault, host physical write, mapping
+change, incomplete alias set, or unsupported platform uses the exact byte-comparison fallback. Resources
+written on consecutive uses automatically stop using page faults and retain exact validation. Timing output
+reports `watch_reuse`, `watch_dirty`, `watch_unknown`, `watch_disabled`, registration/fault counts, and the
+remaining exact validation bytes. Set `PROSPER_NO_CROSS_SUBMIT_TEXTURE_WRITE_WATCH=1` for an exact-only A/B,
+or `PROSPER_AUDIT_CROSS_SUBMIT_TEXTURE_WRITE_WATCH=1` to perform the exact comparison behind every proposed
+cross-submit shortcut and log any disagreement. `PROSPER_WRITE_WATCH_LOG=1` prints capped registration failure
+details. Non-Windows builds keep exact cross-submit validation. For the same-submit A/B control, set
+`PROSPER_NO_SUBMIT_TEXTURE_VALIDATION_REUSE=1`. Set
 `PROSPER_AUDIT_SUBMIT_TEXTURE_VALIDATION_REUSE=1` to keep every comparison while checking and logging any
 disagreement with the journal's unchanged decision; use that audit before extending writer coverage.
 The instrumentation does not take clock samples when the variable is unset. This is the first tool
