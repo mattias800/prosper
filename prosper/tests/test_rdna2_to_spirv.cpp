@@ -520,6 +520,18 @@ int main() {
     CHECK(!spv22pc.empty() && got22pc.size() == N && bad22pc == 0,
           "#319: pc-only cbuf provenance routes s_buffer_load off fallback binding 2");
 
+    // A runtime resource table makes the legacy binding-2 fallback invalid. If a scalar data load
+    // has no pc, SRT, or direct-SGPR provenance, reject the shader instead of emitting an interface
+    // that the live renderer cannot bind.
+    ShaderResourceTable rt22unresolved;
+    { ShaderResource cb{}; cb.cls = ResourceClass::ConstantBuffer; cb.format = DataFormat::Uint32;
+      cb.num_components = 1; cb.binding = 32; cb.srt_offset = 0x20;
+      rt22unresolved.resources.push_back(cb); }
+    std::vector<uint32_t> spv22unresolved = recompile_valu(
+        code22pc, sizeof(code22pc)/sizeof(code22pc[0]), 1, 0, &rt22unresolved);
+    CHECK(spv22unresolved.empty(),
+          "unresolved scalar data load with a runtime table is REJECTED (no binding-2 fallback)");
+
     // Kernel 23: buffer_load_format_x FLOAT32 VERTEX FETCH (stage 2 — the real-VS mechanism). v0=(uint)
     // gid (element index); buffer_load_format_x v1, v0, s[8:11] idxen fetches vbuf[gid]; out=v1. The V#
     // descriptor is DIRECT (in user-data SGPR s8) -> resolved via sgpr_base -> VertexBuffer binding 3,
@@ -1828,6 +1840,30 @@ int main() {
     uint32_t badT13 = 0; for (uint32_t i=0;i<N&&gotT13.size()==N;i++) if (gotT13[i]!=expT13[i]) badT13++;
     printf("  T13(uint8 fetch) mismatches=%u (out[5]=%g expect=%g)\n", badT13, gotT13.size()==N?gotT13[5]:-1, expT13[5]);
     CHECK(gotT13.size()==N && badT13==0, "T13: Uint8 attribute delivers the raw zero-extended integer");
+
+    // Pixel-stage dynamic V#s use the same format-load instruction for structured/material buffers.
+    // A stride-2 Uint16 table must retain its computed VADDR and select the runtime dword half; treating
+    // this pc-keyed resource as a VertexBuffer would substitute gl_VertexIndex and reject the load.
+    ShaderResourceTable rtT13structured;
+    { ShaderResource cb{}; cb.cls = ResourceClass::ConstantBuffer; cb.format = DataFormat::Uint16;
+      cb.num_components = 1; cb.binding = 3; cb.stride = 2; cb.sgpr_base = 8; cb.fetch_pc = 1;
+      rtT13structured.resources.push_back(cb); }
+    std::vector<uint32_t> spvT13structured = recompile_valu(
+        codeT13, sizeof(codeT13)/4, 1, 0, &rtT13structured);
+    std::vector<uint32_t> tableT13structured((N + 1) / 2, 0u);
+    std::vector<float> expT13structured(N);
+    for (uint32_t i = 0; i < N; ++i) {
+        const uint32_t value = 1000u + i;
+        tableT13structured[i / 2] |= value << ((i & 1u) * 16u);
+        expT13structured[i] = static_cast<float>(value);
+    }
+    std::vector<float> gotT13structured = prosper::test::run_compute(
+        spvT13structured, inT13, N, N, {}, tableT13structured);
+    uint32_t badT13structured = 0;
+    for (uint32_t i = 0; i < N && gotT13structured.size() == N; ++i)
+        if (gotT13structured[i] != expT13structured[i]) ++badT13structured;
+    CHECK(!spvT13structured.empty() && gotT13structured.size() == N && badT13structured == 0,
+          "T13 structured: stride-2 Uint16 format load uses computed VADDR and runtime half");
 
     // Kernel T14: SINT8x1 vertex fetch — sign-extended integer. Same code; V# format Sint8; the
     // final convert is v_cvt_f32_i32 so -1 (0xFF) comes back as -1.0.

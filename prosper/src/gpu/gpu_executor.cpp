@@ -1421,7 +1421,11 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                 if (direct_exists) continue;
             }
             ShaderResource r;
-            r.cls           = ResourceClass::VertexBuffer;
+            // A pixel-stage buffer_load_format_* is a structured/material-buffer read, not a
+            // vertex attribute fetch. Keeping it as ConstantBuffer preserves the instruction's
+            // computed VADDR/stride address; labeling it VertexBuffer makes the recompiler take
+            // the gl_VertexIndex shortcut and rejects valid stride-2 uint16 tables (#719).
+            r.cls           = is_ps ? ResourceClass::ConstantBuffer : ResourceClass::VertexBuffer;
             r.format        = (d.format == DataFormat::Unknown) ? DataFormat::Float32 : d.format;
             r.num_components = d.num_components ? d.num_components : 4;
             r.gpu_addr      = d.base;
