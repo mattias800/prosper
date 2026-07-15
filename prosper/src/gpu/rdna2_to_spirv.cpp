@@ -2040,7 +2040,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // 64-bit per-lane MASK ops (EXEC / VCC / saved masks). In our per-invocation model a wave
             // mask is a single bool for this lane. EXEC=SGPR 126/127, VCC=106/107; a saved mask lives
             // in sreg_bool. These implement divergent control flow (if/endif via saveexec + restore).
-            if (in.opcode == 0x04 || in.opcode == 0x0a || in.opcode == 0x24 || in.opcode == 0x25) {
+            if (in.opcode == 0x04 || in.opcode == 0x08 || in.opcode == 0x0a ||
+                in.opcode == 0x24 || in.opcode == 0x25) {
                 auto is_exec = [](const Operand& o){ return o.value == 126 || o.value == 127; };
                 auto src_mask = [&](const Operand& o) -> uint32_t {
                     if (o.value == 106 || o.value == 107) return rs.vcc;    // VCC
@@ -2084,6 +2085,23 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     auto it = rs.sreg_bool_narrowed.find(o.value);
                     return it != rs.sreg_bool_narrowed.end() ? it->second : true;
                 };
+                if (in.opcode == 0x08) {                    // s_not_b64
+                    const uint32_t m = src_mask(in.src[0]);
+                    if (!m) { ok = false; return true; }
+                    const uint32_t inverted = b.logical_not(m);
+                    if (is_exec(in.dst)) {
+                        rs.exec = inverted;
+                        rs.exec_narrowed = true;
+                    } else if (in.dst.value == 106 || in.dst.value == 107) {
+                        rs.vcc = inverted;
+                        rs.sreg_bool[in.dst.value] = inverted;
+                        rs.sreg_bool_narrowed[in.dst.value] = true;
+                    } else {
+                        rs.sreg_bool[in.dst.value] = inverted;
+                        rs.sreg_bool_narrowed[in.dst.value] = true;
+                    }
+                    return true;
+                }
                 if (in.opcode == 0x04) {                    // s_mov_b64
                     if (is_exec(in.dst)) {                  // set/restore EXEC
                         if (in.src[0].kind == OperandKind::InlineInt && in.src[0].value == -1) {
