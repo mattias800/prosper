@@ -1342,9 +1342,11 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
         fprintf(stderr, "\n");
     }
 
-    // Bindless-dynamic vertex fetch (VS): const-fold the scalar setup to resolve each buffer_load_format's
+    // Bindless-dynamic buffer fetch: const-fold the scalar setup to resolve each buffer_load_format's
     // V#, then emit it as a VertexBuffer keyed by its SRSRC SGPR so the recompiler's by_sgpr_base resolves
-    // it. Only meaningful for the vertex stage (the PS has no vertex fetch).
+    // it. Despite the historical vertex-fetch name, pixel shaders use the same instructions for UE4
+    // structured/material buffers. Dropping the PS results leaves those loads with no storage-buffer
+    // binding, so the recompiler falls back to its legacy binding 2 and reads zeros (#719).
     // The SAME const-fold also recovers descriptor-TABLE uses for BOTH stages (#294): UE4 shaders
     // s_load their T#/S#/V# descriptors from a table pointer in the user-data SGPRs and consume them
     // via image_sample / s_buffer_load — srt_uses reports each with its load-immediate key, which
@@ -1354,7 +1356,8 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
     const auto metadata_done = phase_timing ? StageClock::now() : StageClock::time_point{};
     if (is_ps) {
         uint32_t sgprs[kUserSgprs]; read_user_sgprs(st.sh, bases[0] + range_start, sgprs);
-        resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, 0x4000, sgprs, kUserSgprs, 0, &srt_uses);
+        dyn_vb = resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, 0x4000,
+                                       sgprs, kUserSgprs, 0, &srt_uses);
     } else {
         uint32_t sgprs[kUserSgprs]; read_user_sgprs(st.sh, bases[0] + range_start, sgprs);
         // NGG merged VS/GS: s0..s7 are system SGPRs, user data starts at s8 (confirmed by matching the
@@ -1401,7 +1404,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
     for (uint32_t base : bases) {
         uint32_t sgprs[kUserSgprs]; read_user_sgprs(st.sh, base + range_start, sgprs);
         ShaderResourceTable t = build_shader_resources(*hdr, sgprs, kUserSgprs, user_sgpr_base);
-        // Add the const-fold-resolved dynamic vertex buffers, keyed by their SRSRC SGPR so the
+        // Add the const-fold-resolved dynamic buffers, keyed by their SRSRC SGPR so the
         // recompiler's by_sgpr_base() resolves each buffer_load_format. The V#'s data format is patched
         // at runtime by the fetch shader (so the load-time snapshot reads Unknown) — default to Float32
         // (a raw 32-bit-per-component fetch, correct for float attributes like positions).
