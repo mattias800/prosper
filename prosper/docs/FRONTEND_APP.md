@@ -193,6 +193,10 @@ group. It includes the submit number, target address, dimensions, draw count, an
 phase breakdown without scanning pixels or printing every draw. `PROSPER_RTTLOG=1` includes the same line plus
 the more expensive visual RTT diagnostics. Use `PROSPER_RTTLOG_MIN_SUBMIT=N` and
 `PROSPER_RTTLOG_MAX_SUBMIT=N` to bound either mode; unrestricted output can still perturb wall-clock routes.
+For scene selection that is stable across runs, set `PROSPER_RTT_TIMING_MIN_DRAWS=N`. Lightweight records are
+buffered for one ordered submit and emitted together only when its total backend draw count reaches N, so all
+target calls are retained without logging the boot/menu workloads. For example, 300 selects the current
+Dead Cells post-parse workload while excluding its 54-56-draw loading loop.
 
 Ordered graphics/compute submits retain a bounded journal of exact guest-memory ranges written by the
 compute backend. A persistent texture validated in an earlier graphics span can therefore skip its repeated
