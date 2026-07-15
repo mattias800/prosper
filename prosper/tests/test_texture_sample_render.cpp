@@ -178,6 +178,99 @@ int main() {
               "a new content version uploads and renders its changed pixels");
     }
 
+    // A guest color target can remain on the backend GPU between render calls and be sampled by
+    // exact identity. Compare that path with the established CPU readback+upload route, then prove
+    // a LOADing second pass can skip readback without changing the eventual sampled pixels.
+    {
+        static const uint32_t kRedPs[] = {
+            0x7E0002F2u, 0x7E020280u, 0x7E040280u, 0x7E0602F2u,
+            0xF800180Fu, 0x03020100u, 0xBF810000u};
+        static const uint32_t kGreenPs[] = {
+            0x7E000280u, 0x7E0202F2u, 0x7E040280u, 0x7E0602F2u,
+            0xF800180Fu, 0x03020100u, 0xBF810000u};
+        std::vector<uint32_t> red = recompile_fragment(
+            kRedPs, sizeof(kRedPs) / sizeof(kRedPs[0]), nullptr);
+        std::vector<uint32_t> green = recompile_fragment(
+            kGreenPs, sizeof(kGreenPs) / sizeof(kGreenPs[0]), nullptr);
+        std::vector<uint32_t> sample_ps(
+            ps_template, ps_template + sizeof(ps_template) / sizeof(ps_template[0]));
+        sample_ps[1] = C025; sample_ps[3] = C025;
+        std::vector<uint32_t> sample = recompile_fragment(
+            sample_ps.data(), sample_ps.size(), &rt);
+
+        ResolvedPipelineState opaque{};
+        opaque.topology = 3; opaque.color_write_mask = 0xF;
+        ResolvedPipelineState additive = opaque;
+        additive.blend_enable = true;
+        additive.src_color_blend_factor = 1; // ONE
+        additive.dst_color_blend_factor = 1; // ONE
+        additive.color_blend_op = 0;         // ADD
+
+        prosper::test::BackendDraw producer;
+        producer.vs = vert; producer.fs = red; producer.ps = &opaque; producer.vcount = 3;
+        constexpr uint64_t target_id = 0x7590000000000001ull;
+        prosper::test::BackendColorTarget first_target{target_id, false, true};
+        std::vector<uint8_t> first = prosper::test::render_draws_rgba(
+            {producer}, W, H, nullptr, nullptr, false, &first_target);
+        const auto first_target_stats = prosper::test::backend_color_target_stats();
+        CHECK(first.size() == (size_t)W * H * 4 && first_target_stats.writes == 1 &&
+                  first_target_stats.write_hits == 0 && first_target_stats.readbacks == 1,
+              "first persistent color-target write materializes its requested CPU result");
+
+        prosper::test::FrameResource cpu_resource;
+        cpu_resource.binding = 4; cpu_resource.set = 1;
+        cpu_resource.tex_rgba = first.data(); cpu_resource.tw = W; cpu_resource.th = H;
+        prosper::test::BackendDraw cpu_sample;
+        cpu_sample.vs = vert; cpu_sample.fs = sample; cpu_sample.R = {cpu_resource};
+        cpu_sample.vcount = 3;
+        std::vector<uint8_t> cpu_roundtrip = prosper::test::render_draws_rgba(
+            {cpu_sample}, W, H);
+
+        prosper::test::FrameResource gpu_resource = cpu_resource;
+        gpu_resource.tex_rgba = nullptr;
+        gpu_resource.persistent_render_target_id = target_id;
+        prosper::test::BackendDraw gpu_sample = cpu_sample;
+        gpu_sample.R = {gpu_resource};
+        std::vector<uint8_t> gpu_resident = prosper::test::render_draws_rgba(
+            {gpu_sample}, W, H);
+        const auto sampled_stats = prosper::test::backend_color_target_stats();
+        CHECK(!gpu_resident.empty() && gpu_resident == cpu_roundtrip &&
+                  sampled_stats.sampled_hits == 1,
+              "GPU-resident target sampling matches CPU readback+upload byte-for-byte");
+
+        prosper::test::BackendDraw add_green;
+        add_green.vs = vert; add_green.fs = green; add_green.ps = &additive;
+        add_green.vcount = 3;
+        std::vector<uint8_t> cpu_accumulated = prosper::test::render_draws_rgba(
+            {add_green}, W, H, first.data());
+        cpu_resource.tex_rgba = cpu_accumulated.data();
+        cpu_sample.R = {cpu_resource};
+        std::vector<uint8_t> cpu_accumulated_sample = prosper::test::render_draws_rgba(
+            {cpu_sample}, W, H);
+
+        prosper::test::BackendColorTarget deferred_target{target_id, true, false};
+        std::vector<uint8_t> deferred = prosper::test::render_draws_rgba(
+            {add_green}, W, H, nullptr, nullptr, false, &deferred_target);
+        const auto deferred_stats = prosper::test::backend_color_target_stats();
+        std::vector<uint8_t> deferred_sample = prosper::test::render_draws_rgba(
+            {gpu_sample}, W, H);
+        CHECK(deferred.empty() && deferred_stats.write_hits == 1 &&
+                  deferred_stats.readbacks == 0,
+              "persistent LOAD pass can complete without allocating a CPU readback");
+        CHECK(!deferred_sample.empty() && deferred_sample == cpu_accumulated_sample,
+              "deferred-readback accumulation matches the CPU reference after sampling");
+
+        prosper::test::invalidate_persistent_color_target(target_id);
+        gpu_resource.tex_rgba = cpu_accumulated.data();
+        gpu_sample.R = {gpu_resource};
+        std::vector<uint8_t> invalidated_fallback = prosper::test::render_draws_rgba(
+            {gpu_sample}, W, H);
+        const auto fallback_stats = prosper::test::backend_color_target_stats();
+        CHECK(fallback_stats.sampled_hits == 0 &&
+                  invalidated_fallback == cpu_accumulated_sample,
+              "invalidated GPU target uses the supplied CPU fallback instead of stale pixels");
+    }
+
     // The backend upload key includes depth and image dimensionality. Exercise a real 3D image here
     // so depth-1 3D resources cannot accidentally regress to a 2D Vulkan image/view during sharing.
     {

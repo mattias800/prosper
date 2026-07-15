@@ -90,8 +90,40 @@ struct FrameResource {
     // prove these decoded pixels are the same content version as a prior callback. The Vulkan
     // backend may retain an uploaded image under this ID; zero remains callback-local/transient.
     uint64_t persistent_texture_id = 0;
-    bool is_texture() const { return tex_rgba != nullptr; }
+    // Non-zero identifies a color target retained by an earlier backend call. When that exact
+    // target is available, bind its GPU image directly instead of uploading `tex_rgba` again.
+    // `tex_rgba` remains an optional conservative fallback for an invalidated/missing target.
+    uint64_t persistent_render_target_id = 0;
+    bool is_texture() const { return tex_rgba != nullptr || persistent_render_target_id != 0; }
 };
+
+// Optional color-target contract for the live backend. A non-zero ID gives the target a stable
+// guest identity across calls. Existing contents are loaded only when both `load_existing` and a
+// valid matching image are present. `readback=false` leaves the completed result GPU-resident and
+// deliberately returns an empty CPU vector.
+struct BackendColorTarget {
+    uint64_t persistent_id = 0;
+    bool load_existing = true;
+    bool readback = true;
+};
+
+struct BackendColorTargetStats {
+    uint64_t writes = 0;
+    uint64_t write_hits = 0;
+    uint64_t sampled_hits = 0;
+    uint64_t readbacks = 0;
+    uint64_t cached_bytes = 0;
+    uint64_t cached_entries = 0;
+};
+
+inline BackendColorTargetStats& backend_color_target_stats_storage() {
+    static thread_local BackendColorTargetStats stats;
+    return stats;
+}
+
+inline BackendColorTargetStats backend_color_target_stats() {
+    return backend_color_target_stats_storage();
+}
 
 // Returns W*H*4 RGBA bytes, or {} on any Vulkan failure (incl. a rejected SPIR-V module). When `ps`
 // is non-null, the pipeline's fixed-function state (topology, blend, color write mask) is taken from
@@ -315,6 +347,111 @@ inline const RenderVkCtx& render_vk_ctx() {
         return r;
     }();
     return c;
+}
+
+struct PersistentColorTargetKey {
+    uint64_t id = 0;
+    uint32_t width = 0, height = 0;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    bool operator==(const PersistentColorTargetKey&) const = default;
+};
+
+struct PersistentColorTargetKeyHash {
+    size_t operator()(const PersistentColorTargetKey& key) const {
+        size_t h = std::hash<uint64_t>{}(key.id);
+        auto mix = [&](uint32_t value) {
+            h ^= static_cast<size_t>(value) + 0x9e3779b9u + (h << 6) + (h >> 2);
+        };
+        mix(key.width); mix(key.height); mix(static_cast<uint32_t>(key.format));
+        return h;
+    }
+};
+
+struct PersistentColorTargetImage {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    VkDeviceSize bytes = 0;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    uint64_t last_use = 0;
+    bool valid = false;
+};
+
+inline std::unordered_map<PersistentColorTargetKey, PersistentColorTargetImage,
+                          PersistentColorTargetKeyHash>& persistent_color_target_cache() {
+    static std::unordered_map<PersistentColorTargetKey, PersistentColorTargetImage,
+                              PersistentColorTargetKeyHash> cache;
+    return cache;
+}
+
+inline VkDeviceSize& persistent_color_target_bytes() {
+    static VkDeviceSize bytes = 0;
+    return bytes;
+}
+
+inline uint64_t& persistent_color_target_generation() {
+    static uint64_t generation = 0;
+    return generation;
+}
+
+inline VkDeviceSize persistent_color_target_limit() {
+    static const VkDeviceSize limit = []() -> VkDeviceSize {
+        const char* value = getenv("PROSPER_BACKEND_TARGET_CACHE_MB");
+        const uint64_t mib = value ? strtoull(value, nullptr, 10) : 256ull;
+        if (mib > UINT64_MAX / (1024ull * 1024ull)) return VkDeviceSize{UINT64_MAX};
+        return static_cast<VkDeviceSize>(mib) * 1024ull * 1024ull;
+    }();
+    return limit;
+}
+
+inline PersistentColorTargetImage* find_persistent_color_target(
+    uint64_t id, uint32_t width, uint32_t height, VkFormat format, bool require_valid = true) {
+    if (!id) return nullptr;
+    auto& cache = persistent_color_target_cache();
+    auto found = cache.find({id, width, height, format});
+    if (found == cache.end() || (require_valid && !found->second.valid)) return nullptr;
+    return &found->second;
+}
+
+// Guest/compute writes invalidate the GPU-produced version without immediately freeing the image.
+// The next render may reuse the allocation, but it cannot LOAD or sample stale pixels.
+inline void invalidate_persistent_color_target(uint64_t id) {
+    if (!id) return;
+    for (auto& [key, target] : persistent_color_target_cache())
+        if (key.id == id) target.valid = false;
+}
+
+inline void invalidate_persistent_color_target_guest_write(uint64_t addr, uint64_t size) {
+    if (!addr || !size) return;
+    const uint64_t end = size > UINT64_MAX - addr ? UINT64_MAX : addr + size;
+    for (auto& [key, target] : persistent_color_target_cache()) {
+        const uint64_t bytes = static_cast<uint64_t>(key.width) * key.height * 4;
+        const uint64_t target_end = bytes > UINT64_MAX - key.id ? UINT64_MAX : key.id + bytes;
+        if (addr < target_end && key.id < end) target.valid = false;
+    }
+}
+
+inline void destroy_persistent_color_target(const RenderVkCtx& ctx,
+                                            PersistentColorTargetImage& target) {
+    if (target.view) vkDestroyImageView(ctx.dev, target.view, nullptr);
+    if (target.image) vkDestroyImage(ctx.dev, target.image, nullptr);
+    if (target.memory) vkFreeMemory(ctx.dev, target.memory, nullptr);
+    target = {};
+}
+
+inline bool evict_persistent_color_target(const RenderVkCtx& ctx, uint64_t current_generation) {
+    auto& cache = persistent_color_target_cache();
+    auto victim = cache.end();
+    for (auto it = cache.begin(); it != cache.end(); ++it) {
+        if (it->second.last_use == current_generation) continue;
+        if (victim == cache.end() || it->second.last_use < victim->second.last_use)
+            victim = it;
+    }
+    if (victim == cache.end()) return false;
+    persistent_color_target_bytes() -= victim->second.bytes;
+    destroy_persistent_color_target(ctx, victim->second);
+    cache.erase(victim);
+    return true;
 }
 
 // Each call waits for its fence before cleanup, so transient allocations can be safely recycled by
@@ -756,15 +893,23 @@ inline bool restore_persistent_ds_image(const prosper::gpu::GpuCaptureDsSeed& se
 inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& draws, uint32_t W, uint32_t H,
                                               const uint8_t* seed_rgba = nullptr,
                                               const float* clear_rgba = nullptr,
-                                              bool persist_depth_stencil = false) {
+                                              bool persist_depth_stencil = false,
+                                              const BackendColorTarget* color_target = nullptr) {
     using TimingClock = std::chrono::steady_clock;
     const bool timing_enabled = getenv("PROSPER_RENDER_TIMING") != nullptr;
     const auto timing_start = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     if (timing_enabled) backend_render_timing_stats_storage() = {};
+    BackendColorTargetStats& color_target_stats = backend_color_target_stats_storage();
+    color_target_stats = {};
     std::vector<uint8_t> out;
     if (draws.empty()) return out;
     const RenderVkCtx& ctx = render_vk_ctx();
     if (!ctx.ok) return out;
+    const bool persistent_color_targets_enabled =
+        getenv("PROSPER_NO_BACKEND_PERSISTENT_COLOR_TARGETS") == nullptr;
+    const bool persistent_color_enabled = persistent_color_targets_enabled && color_target &&
+                                          color_target->persistent_id;
+    const uint64_t color_target_generation = ++persistent_color_target_generation();
     VkInstance inst = ctx.inst; (void)inst; VkPhysicalDevice phys = ctx.phys;
     VkDevice dev = ctx.dev; VkQueue queue = ctx.queue; uint32_t qfi = ctx.qfi;
     const bool aniso_enabled = ctx.aniso_enabled; const float max_aniso_limit = ctx.max_aniso_limit;
@@ -891,23 +1036,81 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         }
     }
 
-    VkImageCreateInfo imgci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    imgci.imageType = VK_IMAGE_TYPE_2D; imgci.format = FMT; imgci.extent = {W, H, 1};
-    imgci.mipLevels = 1; imgci.arrayLayers = 1; imgci.samples = VK_SAMPLE_COUNT_1_BIT;
-    imgci.tiling = VK_IMAGE_TILING_OPTIMAL;
-    imgci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                  (seed_rgba ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0u);
-    VkImage img; vkCreateImage(dev, &imgci, nullptr, &img);
-    VkMemoryRequirements ir; vkGetImageMemoryRequirements(dev, img, &ir);
-    VkMemoryAllocateInfo iai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    iai.allocationSize = ir.size; iai.memoryTypeIndex = pick(ir.memoryTypeBits, 0);
-    VkDeviceMemory imem = allocate_transient_render_memory(dev, iai.allocationSize,
-                                                            iai.memoryTypeIndex);
-    vkBindImageMemory(dev, img, imem, 0);
-    VkImageViewCreateInfo ivci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    ivci.image = img; ivci.viewType = VK_IMAGE_VIEW_TYPE_2D; ivci.format = FMT;
-    ivci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    VkImageView view; vkCreateImageView(dev, &ivci, nullptr, &view);
+    // Protect every GPU target sampled by this call from LRU eviction while its descriptors are built.
+    for (const auto& draw : draws)
+        for (const auto& resource : draw.R)
+            if (persistent_color_targets_enabled && resource.persistent_render_target_id)
+                if (auto* sampled = find_persistent_color_target(
+                        resource.persistent_render_target_id, resource.tw, resource.th, FMT))
+                    sampled->last_use = color_target_generation;
+
+    bool persistent_color = persistent_color_enabled;
+    PersistentColorTargetKey color_key{};
+    PersistentColorTargetImage* cached_color = nullptr;
+    if (persistent_color) {
+        color_key = {color_target->persistent_id, W, H, FMT};
+        auto [found, inserted] = persistent_color_target_cache().try_emplace(color_key);
+        cached_color = &found->second;
+        cached_color->last_use = color_target_generation;
+    }
+
+    VkImage img = cached_color ? cached_color->image : VK_NULL_HANDLE;
+    VkDeviceMemory imem = cached_color ? cached_color->memory : VK_NULL_HANDLE;
+    VkImageView view = cached_color ? cached_color->view : VK_NULL_HANDLE;
+    if (!img) {
+        VkImageCreateInfo imgci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        imgci.imageType = VK_IMAGE_TYPE_2D; imgci.format = FMT; imgci.extent = {W, H, 1};
+        imgci.mipLevels = 1; imgci.arrayLayers = 1; imgci.samples = VK_SAMPLE_COUNT_1_BIT;
+        imgci.tiling = VK_IMAGE_TILING_OPTIMAL;
+        imgci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                      (persistent_color ? VK_IMAGE_USAGE_SAMPLED_BIT : 0u) |
+                      ((seed_rgba || persistent_color) ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0u);
+        vkCreateImage(dev, &imgci, nullptr, &img);
+        VkMemoryRequirements ir{}; vkGetImageMemoryRequirements(dev, img, &ir);
+        VkMemoryAllocateInfo iai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        iai.allocationSize = ir.size; iai.memoryTypeIndex = pick(ir.memoryTypeBits, 0);
+        if (persistent_color) {
+            const VkDeviceSize limit = persistent_color_target_limit();
+            while ((persistent_color_target_cache().size() > 64 || ir.size > limit ||
+                    persistent_color_target_bytes() > limit - ir.size) &&
+                   evict_persistent_color_target(ctx, color_target_generation)) {}
+            if (ir.size <= limit && persistent_color_target_cache().size() <= 64 &&
+                persistent_color_target_bytes() <= limit - ir.size &&
+                vkAllocateMemory(dev, &iai, nullptr, &imem) == VK_SUCCESS) {
+                cached_color->bytes = ir.size;
+                persistent_color_target_bytes() += ir.size;
+            } else {
+                vkDestroyImage(dev, img, nullptr);
+                img = VK_NULL_HANDLE;
+                persistent_color_target_cache().erase(color_key);
+                cached_color = nullptr;
+                persistent_color = false;
+                imgci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                              (seed_rgba ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0u);
+                vkCreateImage(dev, &imgci, nullptr, &img);
+                vkGetImageMemoryRequirements(dev, img, &ir);
+                iai.allocationSize = ir.size; iai.memoryTypeIndex = pick(ir.memoryTypeBits, 0);
+            }
+        }
+        if (!imem)
+            imem = allocate_transient_render_memory(dev, iai.allocationSize, iai.memoryTypeIndex);
+        vkBindImageMemory(dev, img, imem, 0);
+        VkImageViewCreateInfo ivci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        ivci.image = img; ivci.viewType = VK_IMAGE_VIEW_TYPE_2D; ivci.format = FMT;
+        ivci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCreateImageView(dev, &ivci, nullptr, &view);
+        if (cached_color) {
+            cached_color->image = img;
+            cached_color->memory = imem;
+            cached_color->view = view;
+        }
+    }
+    const bool load_cached_color = cached_color && cached_color->valid &&
+                                   color_target->load_existing && !seed_rgba;
+    if (cached_color) {
+        ++color_target_stats.writes;
+        color_target_stats.write_hits = load_cached_color ? 1 : 0;
+    }
 
     if (use_ds && !dimg) {
         VkImageCreateInfo dci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -933,13 +1136,15 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
 
     VkAttachmentDescription att[2]{};
     att[0].format = FMT; att[0].samples = VK_SAMPLE_COUNT_1_BIT;
-    // Seeded: the attachment already holds the preloaded pixels (uploaded before the pass below), so
-    // LOAD them instead of clearing, and declare the matching initial layout.
-    att[0].loadOp = seed_rgba ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
+    // Seeded or persistent: the attachment already holds valid pixels before this pass, so LOAD them.
+    att[0].loadOp = (seed_rgba || load_cached_color) ? VK_ATTACHMENT_LOAD_OP_LOAD
+                                                     : VK_ATTACHMENT_LOAD_OP_CLEAR;
     att[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     att[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; att[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    att[0].initialLayout = seed_rgba ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
-    att[0].finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    att[0].initialLayout = (seed_rgba || load_cached_color)
+        ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
+    att[0].finalLayout = persistent_color ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                          : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     att[1].format = DFMT; att[1].samples = VK_SAMPLE_COUNT_1_BIT;
     // A guest-identified DS surface survives calls. New attachments get a defined initial value;
     // existing ones LOAD. Explicit DB_RENDER_CONTROL clears execute at their draw below, preserving
@@ -991,16 +1196,19 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     };
     struct TextureUploadKey {
         const uint8_t* pixels = nullptr;
+        uint64_t render_target_id = 0;
         uint32_t width = 0, height = 0, depth = 1;
         uint32_t img_dim = 1;
         bool operator==(const TextureUploadKey& other) const {
-            return pixels == other.pixels && width == other.width && height == other.height &&
-                   depth == other.depth && img_dim == other.img_dim;
+            return pixels == other.pixels && render_target_id == other.render_target_id &&
+                   width == other.width && height == other.height && depth == other.depth &&
+                   img_dim == other.img_dim;
         }
     };
     struct TextureUploadKeyHash {
         size_t operator()(const TextureUploadKey& key) const {
             size_t h = std::hash<const uint8_t*>{}(key.pixels);
+            h ^= std::hash<uint64_t>{}(key.render_target_id) + 0x9e3779b9u + (h << 6) + (h >> 2);
             h ^= static_cast<size_t>(key.width) + 0x9e3779b9u + (h << 6) + (h >> 2);
             h ^= static_cast<size_t>(key.height) + 0x9e3779b9u + (h << 6) + (h >> 2);
             h ^= static_cast<size_t>(key.depth) + 0x9e3779b9u + (h << 6) + (h >> 2);
@@ -1017,6 +1225,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         uint64_t persistent_id = 0;
         VkDeviceSize image_bytes = 0;
         bool persistent_hit = false;
+        bool borrowed_target = false;
         bool direct_memory = false;
     };
     struct PersistentTextureKey {
@@ -1237,7 +1446,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                         ? (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)
                         : VK_SHADER_STAGE_FRAGMENT_BIT;
                     texture_references++;
-                    const TextureUploadKey texture_key{r.tex_rgba, r.tw, r.th, r.td, r.img_dim};
+                    const TextureUploadKey texture_key{
+                        r.tex_rgba, r.persistent_render_target_id, r.tw, r.th, r.td, r.img_dim};
                     size_t upload_index = SIZE_MAX;
                     if (share_texture_uploads) {
                         auto found = texture_upload_indices.find(texture_key);
@@ -1250,10 +1460,24 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                         upload.key = texture_key;
                         if (share_texture_uploads) texture_upload_indices.emplace(texture_key, upload_index);
 
+                        const bool target_feedback = persistent_color &&
+                            r.persistent_render_target_id == color_target->persistent_id;
+                        if (persistent_color_targets_enabled && !target_feedback &&
+                            r.persistent_render_target_id && r.img_dim == 1) {
+                            if (auto* target = find_persistent_color_target(
+                                    r.persistent_render_target_id, r.tw, r.th, FMT)) {
+                                target->last_use = color_target_generation;
+                                upload.image = target->image;
+                                upload.image_bytes = target->bytes;
+                                upload.borrowed_target = true;
+                                ++color_target_stats.sampled_hits;
+                            }
+                        }
                         upload.persistent_id = r.persistent_texture_id;
                         const PersistentTextureKey persistent_key{
                             r.persistent_texture_id, r.tw, r.th, r.td, r.img_dim};
-                        if (persistent_textures_enabled && r.persistent_texture_id) {
+                        if (!upload.borrowed_target && persistent_textures_enabled &&
+                            r.persistent_texture_id) {
                             auto cached = persistent_texture_images.find(persistent_key);
                             if (cached != persistent_texture_images.end()) {
                                 cached->second.last_use = texture_generation;
@@ -1266,7 +1490,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                             }
                         }
 
-                        if (!upload.persistent_hit) {
+                        if (!upload.persistent_hit && !upload.borrowed_target) {
                             VkImageCreateInfo tci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
                             const bool texture_3d = r.img_dim == 2;
                             tci.imageType = texture_3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
@@ -1586,10 +1810,15 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
 
     const auto timing_draws_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     VkDeviceSize bytes = (VkDeviceSize)W * H * 4;
-    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; bci.size = bytes; bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    VkBuffer rb; vkCreateBuffer(dev, &bci, nullptr, &rb);
-    VkMemoryRequirements br; vkGetBufferMemoryRequirements(dev, rb, &br);
-    VkMemoryAllocateInfo bai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; bai.allocationSize = br.size;
+    const bool readback_requested = !persistent_color || color_target->readback;
+    VkBuffer rb = VK_NULL_HANDLE;
+    VkDeviceMemory bmem = VK_NULL_HANDLE;
+    if (readback_requested) {
+        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.size = bytes; bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        vkCreateBuffer(dev, &bci, nullptr, &rb);
+        VkMemoryRequirements br; vkGetBufferMemoryRequirements(dev, rb, &br);
+        VkMemoryAllocateInfo bai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; bai.allocationSize = br.size;
     // Prefer cached host memory for GPU -> CPU readback. Discrete NVIDIA exposes an earlier coherent,
     // write-combined BAR type and a later HOST_CACHED type; the generic first-match selector chose the
     // former, making an 8 MiB 1080p read take roughly 570 ms on Windows. Upload buffers deliberately keep
@@ -1597,12 +1826,12 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     // back to the original required flags.
     constexpr VkMemoryPropertyFlags host_coherent =
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    bai.memoryTypeIndex = pick(br.memoryTypeBits, host_coherent | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
-    if (bai.memoryTypeIndex == UINT32_MAX)
-        bai.memoryTypeIndex = pick(br.memoryTypeBits, host_coherent);
-    VkDeviceMemory bmem = allocate_transient_render_memory(dev, bai.allocationSize,
-                                                            bai.memoryTypeIndex);
-    vkBindBufferMemory(dev, rb, bmem, 0);
+        bai.memoryTypeIndex = pick(br.memoryTypeBits, host_coherent | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+        if (bai.memoryTypeIndex == UINT32_MAX)
+            bai.memoryTypeIndex = pick(br.memoryTypeBits, host_coherent);
+        bmem = allocate_transient_render_memory(dev, bai.allocationSize, bai.memoryTypeIndex);
+        vkBindBufferMemory(dev, rb, bmem, 0);
+    }
 
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO}; pci.queueFamilyIndex = qfi;
     VkCommandPool pool; vkCreateCommandPool(dev, &pci, nullptr, &pool);
@@ -1611,6 +1840,22 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     VkCommandBuffer cmd; vkAllocateCommandBuffers(dev, &cbai, &cmd);
     VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &cbbi);
+    if (load_cached_color) {
+        VkImageMemoryBarrier load{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        load.oldLayout = cached_color->layout;
+        load.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        load.image = img;
+        load.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        load.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+        load.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                             VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd,
+                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &load);
+    }
     // Preload the color attachment with the seed pixels (render-target persistence): staging upload +
     // transition to COLOR_ATTACHMENT_OPTIMAL, matching att[0]'s LOAD/initialLayout above.
     VkBuffer seedbuf = VK_NULL_HANDLE; VkDeviceMemory seedmem = VK_NULL_HANDLE;
@@ -1706,8 +1951,37 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         }
     }
     vkCmdEndRenderPass(cmd);
-    VkBufferImageCopy cp{}; cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; cp.imageExtent = {W, H, 1};
-    vkCmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb, 1, &cp);
+    if (readback_requested) {
+        if (persistent_color) {
+            VkImageMemoryBarrier to_readback{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            to_readback.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            to_readback.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            to_readback.image = img;
+            to_readback.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            to_readback.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            to_readback.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 0, 0, nullptr, 0, nullptr, 1, &to_readback);
+        }
+        VkBufferImageCopy cp{};
+        cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        cp.imageExtent = {W, H, 1};
+        vkCmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb, 1, &cp);
+        if (persistent_color) {
+            VkImageMemoryBarrier to_sample{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            to_sample.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            to_sample.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            to_sample.image = img;
+            to_sample.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            to_sample.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            to_sample.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                 0, 0, nullptr, 0, nullptr, 1, &to_sample);
+        }
+    }
     vkEndCommandBuffer(cmd);
     const auto timing_recorded = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
@@ -1719,13 +1993,20 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         cached_ds->depth_valid |= use_depth && depth_used_meaningfully;
         cached_ds->stencil_valid |= use_stencil;
     }
+    if (cached_color) {
+        cached_color->valid = true;
+        cached_color->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
 
-    void* mp = nullptr; vkMapMemory(dev, bmem, 0, bytes, 0, &mp);
-    const auto* readback = static_cast<const uint8_t*>(mp);
-    // A range assignment constructs directly from the mapped pixels. resize()+memcpy first zeroed the
-    // entire 8.3 MiB 1080p vector even though every byte was immediately overwritten.
-    out.assign(readback, readback + static_cast<size_t>(bytes));
-    vkUnmapMemory(dev, bmem);
+    if (readback_requested) {
+        void* mp = nullptr; vkMapMemory(dev, bmem, 0, bytes, 0, &mp);
+        const auto* readback = static_cast<const uint8_t*>(mp);
+        // A range assignment constructs directly from the mapped pixels. resize()+memcpy first zeroed the
+        // entire 8.3 MiB 1080p vector even though every byte was immediately overwritten.
+        out.assign(readback, readback + static_cast<size_t>(bytes));
+        vkUnmapMemory(dev, bmem);
+        color_target_stats.readbacks = persistent_color ? 1 : 0;
+    }
     const auto timing_readback_done = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
 
     // PROSPER_DRAW_ISO + PROSPER_ISO_AT="x,y": per-draw kill isolation (generalizes the #240 title harness
@@ -1863,7 +2144,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     while (persistent_texture_bytes > persistent_texture_limit && evict_persistent_texture()) {}
     texture_stats.persistent_cached_bytes = persistent_texture_bytes;
     for (auto& upload : texture_uploads) {
-        if (upload.image && !upload.persistent_hit) vkDestroyImage(dev, upload.image, nullptr);
+        if (upload.image && !upload.persistent_hit && !upload.borrowed_target)
+            vkDestroyImage(dev, upload.image, nullptr);
         if (upload.memory) {
             if (upload.direct_memory) vkFreeMemory(dev, upload.memory, nullptr);
             else release_transient_render_memory(dev, upload.memory);
@@ -1874,13 +2156,23 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     }
     if (seedbuf) vkDestroyBuffer(dev, seedbuf, nullptr);
     if (seedmem) release_transient_render_memory(dev, seedmem);
-    vkDestroyBuffer(dev, rb, nullptr); release_transient_render_memory(dev, bmem);
-    vkDestroyFramebuffer(dev, fb, nullptr); vkDestroyRenderPass(dev, rp, nullptr); vkDestroyImageView(dev, view, nullptr);
-    vkDestroyImage(dev, img, nullptr); release_transient_render_memory(dev, imem);
+    if (rb) vkDestroyBuffer(dev, rb, nullptr);
+    if (bmem) release_transient_render_memory(dev, bmem);
+    vkDestroyFramebuffer(dev, fb, nullptr); vkDestroyRenderPass(dev, rp, nullptr);
+    if (!cached_color) {
+        vkDestroyImageView(dev, view, nullptr);
+        vkDestroyImage(dev, img, nullptr);
+        release_transient_render_memory(dev, imem);
+    }
     if (use_ds && !cached_ds) {
         vkDestroyImageView(dev, dview, nullptr); vkDestroyImage(dev, dimg, nullptr);
         release_transient_render_memory(dev, dmem);
     }
+    while ((persistent_color_target_cache().size() > 64 ||
+            persistent_color_target_bytes() > persistent_color_target_limit()) &&
+           evict_persistent_color_target(ctx, color_target_generation)) {}
+    color_target_stats.cached_bytes = persistent_color_target_bytes();
+    color_target_stats.cached_entries = persistent_color_target_cache().size();
     if (timing_enabled) {
         const auto timing_done = TimingClock::now();
         auto ms = [](auto begin, auto end) {

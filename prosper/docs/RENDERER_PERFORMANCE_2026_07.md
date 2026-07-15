@@ -432,6 +432,41 @@ synchronous GPU waits and readbacks, and the whole ordered submit remains hundre
 target profiler. Coordinated GPU ownership across those producer-consumer boundaries is the next architectural
 step.
 
+## Persistent GPU color targets (2026-07-15)
+
+The first coordinated-ownership tranche retains exact RGBA8 color targets by guest identity, extent, and
+format in a bounded Vulkan cache. A later graphics pass that samples the same target can bind that image
+directly instead of reading it to CPU RGBA and uploading it again. Guest GPU writes invalidate overlapping
+entries through the same ordered write observer used by persistent depth/stencil state. Same-target feedback,
+scanout, presentation fallback, captures, replay seeds, and pixel diagnostics keep the established CPU path.
+
+The live path is initially opt-in with `PROSPER_LIVE_PERSISTENT_COLOR_TARGETS=1`. Set
+`PROSPER_NO_BACKEND_PERSISTENT_COLOR_TARGETS=1` to disable backend retention independently, or change its
+256 MiB budget with `PROSPER_BACKEND_TARGET_CACHE_MB`. The backend unit contract compares direct GPU
+producer-to-sampler output byte-for-byte with CPU readback/upload, verifies a deferred-readback LOAD pass,
+and proves that invalidation uses supplied CPU pixels rather than stale GPU contents.
+
+Native Windows Dead Cells post-`PARSEALL` evidence used one current-master binary with submit-aligned timing.
+The animated runs did not carry identical draw counts, so the phase counters establish the mechanism more
+reliably than the app overlay:
+
+| Measurement | CPU target path | Persistent GPU targets |
+|---|---:|---:|
+| Realized draws | 361 | 405 |
+| Target writes / readbacks | 10 / 10 | 10 / 4 |
+| Direct target samples | 0 | 8 |
+| Record/upload | 4.5 ms | 0.5 ms |
+| GPU fence waits | 26.7 ms | 16.8 ms |
+| Frontend Vulkan wall time | 60.8 ms | 48.9 ms |
+| Ordered backend total | 118.6 ms | 110.7 ms |
+| Whole submit | 154.2 ms | 151.1 ms |
+
+The enabled run retained 13 targets / 103.5 MiB and remained near 1.81 GiB private memory. It did more draw
+work while completing slightly faster, but this is not yet a playable frame budget. Four large CPU readbacks
+still cost about 9 ms, 405-draw realization costs about 40 ms, and the ordered path still executes ten target
+calls plus eight compute calls. The next architectural gain requires fewer synchronous submissions/fences or
+safe reuse of per-draw resource work; neither may weaken the captured graphics/compute dependency order.
+
 ## Current frame budget
 
 After shared publication, the Dead Cells post-parse loading workload is the most useful current budget:
