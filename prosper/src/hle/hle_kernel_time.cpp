@@ -513,42 +513,58 @@ namespace {
     // Linux build watches the stable __kind window instead — the diagnostic compiles and runs
     // everywhere, but its target platform is macOS.
     std::atomic<bool> g_eq_sigwatch_started{false};
-    void eq_sigwatch_thread(bool repair) {
+    void eq_sigwatch_thread(bool repair, bool taint) {
 #ifdef __APPLE__
         constexpr int kOff = 0, kLen = 16;    // pthread_mutex __sig + head: init-only on Darwin
 #else
         constexpr int kOff = 16, kLen = 8;    // glibc __kind/__spins: never written for a plain mutex
 #endif
-        struct Target { const char* name; volatile uint8_t* p; uint8_t base[16]; };
+        struct Target { const char* name; volatile uint8_t* p; bool taintable; int off, len; uint8_t base[16]; };
+        // taintable = the mutex is NEVER locked in this configuration, so its head bytes are dead
+        // storage we may pre-fill. g_det_clock.mutex is only locked under PROSPER_DET_CLOCK (checked
+        // below); the decoys are never locked by construction. g_eq_mx/g_apr_mx are hot — never taint.
         static Target t[10] = {
-            { "g_eq_decoy_lo0",    (volatile uint8_t*)&g_eq_decoy_lo0, {} },
-            { "g_eq_decoy_lo1",    (volatile uint8_t*)&g_eq_decoy_lo1, {} },
-            { "g_eq_decoy_lo2",    (volatile uint8_t*)&g_eq_decoy_lo2, {} },
-            { "g_eq_decoy_lo3",    (volatile uint8_t*)&g_eq_decoy_lo3, {} },
-            { "g_eq_decoy_lo4",    (volatile uint8_t*)&g_eq_decoy_lo4, {} },
-            { "g_eq_decoy_lo5",    (volatile uint8_t*)&g_eq_decoy_lo5, {} },
-            { "g_eq_decoy",        (volatile uint8_t*)&g_eq_decoy,  {} },
-            { "g_eq_mx",           (volatile uint8_t*)&g_eq_mx,     {} },
-            { "g_det_clock.mutex", (volatile uint8_t*)&g_det_clock, {} },
-            { "g_apr_mx",          (volatile uint8_t*)&g_apr_mx,    {} },
+            { "g_eq_decoy_lo0",    (volatile uint8_t*)&g_eq_decoy_lo0, true,  0, 0, {} },
+            { "g_eq_decoy_lo1",    (volatile uint8_t*)&g_eq_decoy_lo1, true,  0, 0, {} },
+            { "g_eq_decoy_lo2",    (volatile uint8_t*)&g_eq_decoy_lo2, true,  0, 0, {} },
+            { "g_eq_decoy_lo3",    (volatile uint8_t*)&g_eq_decoy_lo3, true,  0, 0, {} },
+            { "g_eq_decoy_lo4",    (volatile uint8_t*)&g_eq_decoy_lo4, true,  0, 0, {} },
+            { "g_eq_decoy_lo5",    (volatile uint8_t*)&g_eq_decoy_lo5, true,  0, 0, {} },
+            { "g_eq_decoy",        (volatile uint8_t*)&g_eq_decoy,     true,  0, 0, {} },
+            { "g_eq_mx",           (volatile uint8_t*)&g_eq_mx,        false, 0, 0, {} },
+            { "g_det_clock.mutex", (volatile uint8_t*)&g_det_clock,    true,  0, 0, {} },
+            { "g_apr_mx",          (volatile uint8_t*)&g_apr_mx,       false, 0, 0, {} },
         };
-        for (auto& x : t) for (int i = 0; i < kLen; i++) x.base[i] = x.p[kOff + i];
-        fprintf(stderr, "[eq-sigwatch] armed repair=%d window=[%d,%d): decoy=%p eq_mx=%p det=%p apr=%p\n",
-                repair ? 1 : 0, kOff, kOff + kLen,
-                (void*)t[0].p, (void*)t[1].p, (void*)t[2].p, (void*)t[3].p);
+        // #707 round 7: an all-zeros store over all-zeros bytes is invisible to a baseline diff AND
+        // to hardware watchpoints (no value change). glibc mutexes are all-zero at rest, so on Linux
+        // a det-anchored zeroing (the round-6 macOS finding) slips through the default [16,24) kind
+        // window untainted. taint mode pre-fills the never-locked targets' head bytes with 0xA5 so
+        // the zeroing becomes a visible transition — for this poller and for a follow-up gdb
+        // hardware watchpoint on the same bytes. det is only tainted while PROSPER_DET_CLOCK is off.
+        const bool det_in_use = getenv("PROSPER_DET_CLOCK") != nullptr;
+        for (auto& x : t) {
+            bool tainted = taint && x.taintable && !(x.p == (volatile uint8_t*)&g_det_clock && det_in_use);
+            x.off = tainted ? 0 : kOff;
+            x.len = tainted ? 16 : kLen;
+            if (tainted) for (int i = 0; i < x.len; i++) x.p[x.off + i] = 0xA5;
+            for (int i = 0; i < x.len; i++) x.base[i] = x.p[x.off + i];
+        }
+        fprintf(stderr, "[eq-sigwatch] armed repair=%d taint=%d: decoy=%p eq_mx=%p det=%p apr=%p\n",
+                repair ? 1 : 0, taint ? 1 : 0,
+                (void*)t[6].p, (void*)t[7].p, (void*)t[8].p, (void*)t[9].p);
         auto ms = [] { struct timespec ts{}; clock_gettime(CLOCK_MONOTONIC, &ts);
                        return (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)ts.tv_nsec / 1000000ull; };
         uint64_t hits = 0;
         for (;;) {
             struct timespec ts{ 0, 200000 }; nanosleep(&ts, nullptr);   // 200 µs poll
             for (auto& x : t)
-                for (int i = 0; i < kLen; i++) {
-                    uint8_t v = x.p[kOff + i];
+                for (int i = 0; i < x.len; i++) {
+                    uint8_t v = x.p[x.off + i];
                     if (v == x.base[i]) continue;
                     fprintf(stderr, "[eq-sigwatch] HIT %s off=%d 0x%02x->0x%02x addr=%p t=%llums%s\n",
-                            x.name, kOff + i, x.base[i], v, (void*)&x.p[kOff + i], ms(),
+                            x.name, x.off + i, x.base[i], v, (void*)&x.p[x.off + i], ms(),
                             repair ? " (repaired)" : "");
-                    if (repair) x.p[kOff + i] = x.base[i];
+                    if (repair) x.p[x.off + i] = x.base[i];
                     else        x.base[i] = v;   // track the new state so further deltas keep reporting
                     if (++hits >= 512) { fprintf(stderr, "[eq-sigwatch] report cap reached\n"); return; }
                 }
@@ -558,7 +574,9 @@ namespace {
         static const char* mode = getenv("PROSPER_EQ_SIGWATCH");
         if (!mode || g_eq_sigwatch_started.exchange(true)) return;
         bool repair = strcmp(mode, "repair") == 0;
-        std::thread(eq_sigwatch_thread, repair).detach();
+        bool taint  = strcmp(mode, "taint") == 0 || strcmp(mode, "taint-repair") == 0;
+        if (strcmp(mode, "taint-repair") == 0) repair = true;
+        std::thread(eq_sigwatch_thread, repair, taint).detach();
     }
 
 #ifdef __APPLE__
