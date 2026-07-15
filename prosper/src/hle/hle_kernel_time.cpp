@@ -94,7 +94,14 @@ namespace {
     // no fault storm, no re-arm gap to race, and the FIRST fault on the page is the corruptor with
     // a clean rbp-chain. 72 mutexes = 4.5 KiB on Darwin; declaration order keeps it between det
     // and the hot cluster on macOS (verify with nm as usual).
-    std::mutex g_eq_ballast_hi[72];
+    // Enlarged to 176 (11 KiB) so it spans a FULL page-aligned page that is entirely ballast (round 9):
+    // the corruptor's region-zero was observed to engulf this array (both g_det_clock AND g_eq_mx —
+    // 0x12a0 apart across it — got zeroed), yet these mutexes are NEVER locked. So a page in the middle
+    // of the array is in the zeroed region AND has zero legit writers → guard it continuously from boot
+    // (PROSPER_EQ_PAGEGUARD=ballast): no det_clock-lock storm (unlike det's own page), no race, and the
+    // FIRST fault on it is the corruptor with a clean rbp-chain. det's page can't be used continuously
+    // because g_det_clock.mutex is locked by det_clock_now (the guest clock) — that IS a hot writer.
+    std::mutex g_eq_ballast_hi[176];
 
     uint64_t det_clock_fps() {
         static const uint64_t fps = [] {
@@ -702,7 +709,14 @@ namespace {
     std::atomic<bool> g_eq_guard_det{false};
     std::atomic<bool> g_eq_guard_relift{false};
     std::atomic<bool> g_eq_guard_step{false};   // det-step: TF single-step co-located writes (zero gap)
+    std::atomic<bool> g_eq_guard_ballast{false}; // ballast: guard a pure never-locked page in g_eq_ballast_hi
     uint64_t eq_guard_page() {
+        if (g_eq_guard_ballast.load(std::memory_order_acquire)) {
+            // First full page-aligned page at/above &g_eq_ballast_hi[0] (fully inside the 11 KiB array,
+            // never locked, in the corruptor's zeroed region). Closest full ballast page above det.
+            uint64_t base = (uint64_t)(uintptr_t)&g_eq_ballast_hi[0];
+            return (base + 4095) & ~4095ull;
+        }
         if (g_eq_guard_det.load(std::memory_order_acquire))
             return (uint64_t)(uintptr_t)&g_det_clock & ~4095ull;   // g_det_clock's own page
         uint64_t end = (uint64_t)(uintptr_t)&g_eq_bigdecoy[384];   // one-past-end of the 24 KiB array
@@ -738,6 +752,20 @@ namespace {
         static std::atomic<bool> once{false};
         if (once.exchange(true)) return;
         std::thread(eq_pageguard_reporter).detach();
+        if (strcmp(mode, "ballast") == 0) {
+            // BALLAST mode (round 9): guard a full page INSIDE g_eq_ballast_hi — never-locked mutexes in
+            // the corruptor's zeroed region. No legit writer touches it, so arm once from boot and stay
+            // armed; the FIRST fault is the corruptor. One-shot report path (like bigdecoy) but this page
+            // is actually in the zeroed run, so it triggers at runtime, not just teardown.
+            g_eq_guard_ballast.store(true, std::memory_order_release);   // before eq_guard_page()
+            void* pg = (void*)(uintptr_t)eq_guard_page();
+            if (mprotect(pg, 4096, PROT_READ) == 0) {
+                g_eq_pageguard_armed.store(true, std::memory_order_release);
+                fprintf(stderr, "[eq-pageguard] armed BALLAST: page %p PROT_READ (ballast_hi=%p..%p, det=%p)\n",
+                        pg, (void*)&g_eq_ballast_hi[0], (void*)&g_eq_ballast_hi[176], (void*)&g_det_clock);
+            } else fprintf(stderr, "[eq-pageguard] mprotect(%p) FAILED errno=%d\n", pg, errno);
+            return;
+        }
         if (strcmp(mode, "det") == 0 || strcmp(mode, "det-step") == 0) {
             // DET mode fault-storms the render if armed continuously (every co-located per-frame write on
             // g_det_clock's page faults). The corruptor fires in a narrow flip-count window (~2400), so
