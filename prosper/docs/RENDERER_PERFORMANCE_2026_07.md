@@ -345,11 +345,12 @@ wall-time counters. The new `backend-submit` lines report calls and draws per su
 setup, record/upload, fence wait, readback, cleanup, and the shader/fixed/resource/pipeline draw-setup split.
 They also print the frontend-measured backend duration, the detailed phase sum, and the unattributed remainder.
 This is the authoritative view for choosing the next backend optimization; the legacy per-call lines remain
-useful for spotting an individually slow render target. Combining `PROSPER_RENDER_TIMING=1` with
-`PROSPER_RTTLOG=1` adds a `[rtt-timing]` record for each target group with its submit, address, dimensions,
-draw count, and exact phase costs, allowing dependency logs and backend costs to be correlated directly. Bound
-verbose output with `PROSPER_RTTLOG_MIN_SUBMIT` and `PROSPER_RTTLOG_MAX_SUBMIT`; an unrestricted Dead Cells run
-dropped the title loop from about 20 FPS to 13-14 FPS and caused its wall-clock input route to miss the menu.
+useful for spotting an individually slow render target. `PROSPER_RTT_TIMING=1` adds a lightweight
+`[rtt-timing]` record for each target group with its submit, address, dimensions, draw count, and exact phase
+costs. `PROSPER_RTTLOG=1` retains its visual pixel/draw diagnostics and also emits the timing record. Bound both
+modes with `PROSPER_RTTLOG_MIN_SUBMIT` and `PROSPER_RTTLOG_MAX_SUBMIT`. The full visual mode scans rendered
+pixels and dropped one Dead Cells title loop from about 20 FPS to 13-14 FPS, causing its wall-clock input route
+to miss the menu; use the lightweight mode for performance attribution.
 
 A 180-second native Windows fresh-save Dead Cells run reached the post-parse workload with 373 draws, eight
 dispatches, and four graphics spans. Those spans rendered ten target groups per submit. The aligned backend

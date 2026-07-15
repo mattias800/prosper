@@ -188,10 +188,11 @@ lines at renderer submit N, so boot textures do not consume the cap before the s
 line identifies local reuse, persistent hit/miss/invalidation, RTT sourcing, or an uncached decode. The
 aggregate output also reports retained RTT bytes, decode-scratch capacity, and validation-scratch capacity;
 use those figures before treating a process-memory increase as an unbounded cache.
-Combine timing with `PROSPER_RTTLOG=1` to print one `[rtt-timing]` line per rendered target group. It includes
-the submit number, target address, dimensions, draw count, and that target's exact Vulkan phase breakdown.
-Use `PROSPER_RTTLOG_MIN_SUBMIT=N` and `PROSPER_RTTLOG_MAX_SUBMIT=N` to bound the diagnostic window; unrestricted
-logging can materially slow a title and perturb wall-clock input routes.
+Set `PROSPER_RTT_TIMING=1` with timing enabled to print one lightweight `[rtt-timing]` line per rendered target
+group. It includes the submit number, target address, dimensions, draw count, and that target's exact Vulkan
+phase breakdown without scanning pixels or printing every draw. `PROSPER_RTTLOG=1` includes the same line plus
+the more expensive visual RTT diagnostics. Use `PROSPER_RTTLOG_MIN_SUBMIT=N` and
+`PROSPER_RTTLOG_MAX_SUBMIT=N` to bound either mode; unrestricted output can still perturb wall-clock routes.
 
 Ordered graphics/compute submits retain a bounded journal of exact guest-memory ranges written by the
 compute backend. A persistent texture validated in an earlier graphics span can therefore skip its repeated

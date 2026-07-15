@@ -210,8 +210,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 ? std::max(0, atoi(getenv("PROSPER_RTTLOG_MIN_SUBMIT"))) : 0;
             static const int g_rttlog_max_submit = getenv("PROSPER_RTTLOG_MAX_SUBMIT")
                 ? std::max(0, atoi(getenv("PROSPER_RTTLOG_MAX_SUBMIT"))) : INT_MAX;
-            const bool rtt_log = getenv("PROSPER_RTTLOG") &&
+            const bool rtt_log_in_range =
                 g_this_submit >= g_rttlog_min_submit && g_this_submit <= g_rttlog_max_submit;
+            const bool rtt_log = getenv("PROSPER_RTTLOG") && rtt_log_in_range;
             using RenderClock = std::chrono::steady_clock;
             struct RenderTiming {
                 uint64_t callbacks = 0;
@@ -231,6 +232,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             };
             static thread_local RenderTiming pending_timing;
             const bool timing_enabled = getenv("PROSPER_RENDER_TIMING") != nullptr;
+            const bool rtt_timing_log = timing_enabled && rtt_log_in_range &&
+                (rtt_log || getenv("PROSPER_RTT_TIMING"));
             if (timing_enabled && phase.first_span) pending_timing = {};
             const auto callback_timing_start = timing_enabled
                 ? RenderClock::now() : RenderClock::time_point{};
@@ -1527,6 +1530,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     }
                     bool is_vo = false;
                     for (int i = 0; i < vo_n && !is_vo; i++) is_vo = base && base == prosper_vo_buffer_addr(i);
+                    if (rtt_timing_log)
+                        fprintf(stderr,
+                                "[rtt-timing] submit=%d target=0x%llx extent=%ux%u draws=%zu "
+                                "total=%.2f target_setup=%.2f draw_setup=%.2f record_upload=%.2f "
+                                "gpu_wait=%.2f readback=%.2f cleanup=%.2f\n",
+                                g_this_submit, (unsigned long long)base, gw, gh, pass.size(),
+                                backend_call_timing.total_ms(), backend_call_timing.target_ms,
+                                backend_call_timing.draw_setup_ms,
+                                backend_call_timing.record_upload_ms,
+                                backend_call_timing.gpu_wait_ms, backend_call_timing.readback_ms,
+                                backend_call_timing.cleanup_ms);
                     if (rtt_log) {
                         size_t nz = 0, rgb_nz = 0;
                         for (uint8_t b : rendered_pixels) nz += (b != 0);
@@ -1537,17 +1551,6 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 "px_nonzero=%zu rgb_nonblack=%zu cache_size=%zu%s%s\n",
                                 (unsigned long long)base, gw, gh, native_w, native_h, pass.size(), nz, rgb_nz, g_rtt.size(),
                                 is_vo ? " SCANOUT" : "", base && base == front_va ? " FRONT" : "");
-                        if (timing_enabled)
-                            fprintf(stderr,
-                                    "[rtt-timing] submit=%d target=0x%llx extent=%ux%u draws=%zu "
-                                    "total=%.2f target_setup=%.2f draw_setup=%.2f record_upload=%.2f "
-                                    "gpu_wait=%.2f readback=%.2f cleanup=%.2f\n",
-                                    g_this_submit, (unsigned long long)base, gw, gh, pass.size(),
-                                    backend_call_timing.total_ms(), backend_call_timing.target_ms,
-                                    backend_call_timing.draw_setup_ms,
-                                    backend_call_timing.record_upload_ms,
-                                    backend_call_timing.gpu_wait_ms, backend_call_timing.readback_ms,
-                                    backend_call_timing.cleanup_ms);
                     }
                     // PROSPER_DUMP_DRAWSTEPS: for a pass targeting a SCANOUT buffer, re-render the pass
                     // draw-by-draw (prefix 1, prefix 2, ...) and dump each cumulative result — a one-boot
