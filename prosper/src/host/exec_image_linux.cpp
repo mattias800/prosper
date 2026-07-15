@@ -9,6 +9,9 @@
 #if defined(__linux__) || defined(__APPLE__)
 #include "posix_shim.hpp"
 #include <sys/mman.h>
+#ifdef __APPLE__
+#include <dlfcn.h>
+#endif
 #include <signal.h>
 #include <setjmp.h>
 #include <pthread.h>
@@ -51,6 +54,7 @@ struct f_owner_ex { int type; pid_t pid; };
 #endif
 
 extern "C" int prosper_eq_pageguard_classify(uint64_t);  // #707 decoy-page guard (hle_kernel_time.cpp)
+extern "C" void prosper_eq_pageguard_record(uint64_t rip, const uint64_t* frames, int n);  // deferred symbolize
 
 namespace prosper {
 
@@ -822,8 +826,10 @@ namespace {
         // lifts the protection (sacrificial page; the run continues) and we report the writer:
         // RIP, guest/host classification, and guest return addresses from the faulting stack.
         // Raw syscalls only (may run on a guest-%fs thread).
-        if ((sig == SIGSEGV || sig == SIGBUS) &&
-            prosper_eq_pageguard_classify((uint64_t)(uintptr_t)si->si_addr)) {
+        if (sig == SIGSEGV || sig == SIGBUS) {
+          int pg_verdict = prosper_eq_pageguard_classify((uint64_t)(uintptr_t)si->si_addr);
+          if (pg_verdict == 2) return;   // legit co-located write on the guarded page: lifted, resume silently
+          if (pg_verdict == 1) {
             auto gpg = PROSPER_GREGS((ucontext_t*)uctx);
             uint64_t rip = (uint64_t)gpg[REG_RIP];
             bool guest_rip = rip >= 0x400000000ull && rip < 0x620000000ull;
@@ -851,7 +857,60 @@ namespace {
             }
             sn += snprintf(sb + sn, sizeof sb - sn, "\n");
             syscall(SYS_write, 2, sb, (size_t)sn);
+            // The writer is often HOST code (a libsystem memset variant called by our render path), so the
+            // guest-stack scan above finds nothing. Also scan for HOST return addresses (our binary + loaded
+            // dylibs, below the dyld shared cache at 0x7ff8..) and print the image base for `atos`.
+            // Wide stack scan: print EVERY code-pointer-looking return address (image AND shared-cache,
+            // tagged) up the stack so the chain from the libsystem memset back to OUR call site is visible.
+            // The writer is on a HOST thread, so probe_readable() (guest-oriented) rejects its stack.
+            // The current stack is valid — read it directly. Scan rsp upward for code-pointer RAs, tagged
+            // c=shared-cache (libsystem/libc++) vs H=host image/dylib (our code / MoltenVK = the call site).
+            char hb[900]; int hn = snprintf(hb, sizeof hb, "[eq-pageguard]   stack-scan:");
+            int hfound = 0;
+            uint64_t hostras[24]; int nhost = 0;   // collect HOST-image RAs for deferred symbolization
+            if (rsp > 0x10000ull) for (uint64_t p = rsp; p < rsp + 0x1000 && hfound < 40; p += 8) {
+                uint64_t ra = *(const uint64_t*)(uintptr_t)p;
+                if (ra < 0x100000000ull) continue;
+                bool cache = ra >= 0x7f0000000000ull;
+                hn += snprintf(hb + hn, sizeof hb - hn, " %s%llx", cache ? "c" : "H", (unsigned long long)ra);
+                if (!cache && nhost < 24) hostras[nhost++] = ra;   // host image/dylib RA (our code / MoltenVK)
+                hfound++;
+                if (hn > (int)sizeof hb - 24) break;
+            }
+            hn += snprintf(hb + hn, sizeof hb - hn, "\n");
+            syscall(SYS_write, 2, hb, (size_t)hn);
+            // The stack-SCAN above is noisy (it matches stale code-pointer-shaped stack garbage, e.g.
+            // atexit's stored &EqDecoyPage::~EqDecoyPage). Walk the REAL frame-pointer chain for the
+            // true caller of the faulting store: at pthread_mutex_destroy+0x1b the prologue has run,
+            // so rbp is the callee frame and [rbp+8] is its return address = OUR call site. These are
+            // the RAs that matter; hand THESE to the deferred symbolizer (dladdr), not the scan.
+            uint64_t rbp = (uint64_t)gpg[REG_RBP];
+            char cb[512]; int cn = snprintf(cb, sizeof cb, "[eq-pageguard]   rbp-chain:");
+            uint64_t chainras[24]; int nchain = 0;
+            for (int f = 0; f < 16 && rbp > 0x10000ull && rbp < 0x800000000000ull; f++) {
+                uint64_t ra   = *(const uint64_t*)(uintptr_t)(rbp + 8);
+                uint64_t next = *(const uint64_t*)(uintptr_t)rbp;
+                bool cache = ra >= 0x7f0000000000ull;
+                cn += snprintf(cb + cn, sizeof cb - cn, " %s%llx", cache ? "c" : "H", (unsigned long long)ra);
+                if (nchain < 24) chainras[nchain++] = ra;
+                if (next <= rbp) break;          // saved rbp must move up-stack (grows down)
+                rbp = next;
+                if (cn > (int)sizeof cb - 24) break;
+            }
+            cn += snprintf(cb + cn, sizeof cb - cn, "\n");
+            syscall(SYS_write, 2, cb, (size_t)cn);
+            // Hand the writer rip + REAL rbp-chain RAs to a safe reporter thread for dladdr symbolization
+            // (dladdr takes the dyld lock -> cannot run in this signal handler). Fall back to the scan
+            // RAs only if the chain walk produced nothing.
+            prosper_eq_pageguard_record(rip, nchain ? chainras : hostras, nchain ? nchain : nhost);
+#ifdef __APPLE__
+            Dl_info hdi{}; if (dladdr((void*)&fault_handler, &hdi)) {
+                char eb[96]; int en = snprintf(eb, sizeof eb, "[eq-pageguard]   boot_trace base=%p (atos -o boot_trace -l <base>)\n", hdi.dli_fbase);
+                syscall(SYS_write, 2, eb, (size_t)en);
+            }
+#endif
             return;
+          }
         }
 #ifdef __APPLE__
         // macOS/Rosetta: a guest `%fs:`-relative TLS access faults (fs base is 0). Redirect it to the

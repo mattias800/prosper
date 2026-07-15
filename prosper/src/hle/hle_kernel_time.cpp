@@ -14,6 +14,8 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <dlfcn.h>
+#include <execinfo.h>
 #include <cerrno>
 #include <atomic>
 #include <ctime>
@@ -73,6 +75,15 @@ namespace {
     // belongs entirely to this object.
     struct alignas(4096) EqDecoyPage { std::mutex m[128]; };   // >= 4 KiB on both glibc and Darwin
     EqDecoyPage g_eq_decoy_page;
+    // #707 round 6: the alignas(4096) page above proved a DEAD END — the linker files aligned data in
+    // a separate __DATA sub-region, so the corruptor's contiguous cluster-zero never reaches it; the
+    // pageguard only ever caught the EXIT-path ~EqDecoyPage destructor (reliable rbp-chain:
+    // exit -> __cxa_finalize_ranges -> ~EqDecoyPage -> ~mutex -> pthread_mutex_destroy). So instead use
+    // a LARGE NON-ALIGNED mutex array declared right in the cluster: round 4 proved the zeroing engulfs
+    // any object added to the cluster, and a page in the MIDDLE of a 24 KiB array is owned entirely by
+    // the array (no other symbol, no hot writer) yet stays inside the contiguous zeroed run. Guard that
+    // middle page -> the region-zero's store into it faults with the REAL writer rip + rbp-chain caller.
+    std::mutex g_eq_bigdecoy[384];   // 384 * 64B = 24 KiB = 6 pages; never locked; layout ballast+guard
     std::atomic<bool> g_eq_pageguard_armed{false};
     DetClockState g_det_clock;
 
@@ -550,20 +561,182 @@ namespace {
         std::thread(eq_sigwatch_thread, repair).detach();
     }
 
+#ifdef __APPLE__
+    // #707 interpose probe (PROSPER_EQ_INTERPOSE=1): the decoy-page guard only ever caught its own
+    // exit-time destructor (pthread_mutex_destroy from EqDecoyPage::~EqDecoyPage during terminate
+    // unwinding), which told us the corruption MECHANISM may be pthread_mutex_destroy/init rather
+    // than a raw memset. Earlier interpose work covered memset/bzero/memcpy/memmove but NOT the
+    // pthread_* sig writers. Interpose them all, range-filtered to the equeue cluster, and stamp a
+    // monotonic ms + backtrace. A hit BEFORE the crash/terminate is the corruptor; a hit after is
+    // just teardown. Runs in normal (non-signal) context, so backtrace()/dladdr are safe here.
+    void eq_cluster_bounds(uintptr_t& lo, uintptr_t& hi) {
+        uintptr_t a[] = { (uintptr_t)&g_eq_mx, (uintptr_t)&g_det_clock, (uintptr_t)&g_apr_mx };
+        lo = a[0]; hi = a[0];
+        for (auto x : a) { if (x < lo) lo = x; if (x > hi) hi = x; }
+        lo -= 512; hi += 512;
+    }
+    bool eq_in_cluster(const void* p, size_t n) {
+        static const bool on = getenv("PROSPER_EQ_INTERPOSE") != nullptr;
+        if (!on || !p) return false;
+        uintptr_t lo, hi; eq_cluster_bounds(lo, hi);
+        uintptr_t s = (uintptr_t)p, e = s + (n ? n : 1);
+        return e > lo && s < hi;   // any overlap with the cluster window
+    }
+    void eq_report_cluster(const char* fn, const void* target, size_t n) {
+        static std::atomic<int> seen{0};
+        int idx = seen.fetch_add(1);
+        if (idx > 24) return;
+        struct timespec ts{}; clock_gettime(CLOCK_MONOTONIC, &ts);
+        unsigned long long ms = (unsigned long long)ts.tv_sec * 1000ull + ts.tv_nsec / 1000000ull;
+        void* bt[40]; int nb = backtrace(bt, 40);
+        fprintf(stderr, "[eq-interpose] #%d %s(%p,len=%zu) IN CLUSTER t=%llums:\n", idx, fn, target, n, ms);
+        char** syms = backtrace_symbols(bt, nb);
+        for (int i = 0; i < nb; i++) fprintf(stderr, "[eq-interpose]   %s\n", syms ? syms[i] : "?");
+        free(syms); fflush(stderr);
+    }
+    extern "C" int prosper_int_mtx_destroy(pthread_mutex_t* m) {
+        if (eq_in_cluster(m, sizeof(pthread_mutex_t))) eq_report_cluster("pthread_mutex_destroy", m, sizeof(pthread_mutex_t));
+        return pthread_mutex_destroy(m);
+    }
+    extern "C" int prosper_int_mtx_init(pthread_mutex_t* m, const pthread_mutexattr_t* a) {
+        if (eq_in_cluster(m, sizeof(pthread_mutex_t))) eq_report_cluster("pthread_mutex_init", m, sizeof(pthread_mutex_t));
+        return pthread_mutex_init(m, a);
+    }
+    extern "C" void* prosper_int_memset(void* d, int c, size_t n) {
+        if (eq_in_cluster(d, n)) eq_report_cluster("memset", d, n);
+        return memset(d, c, n);
+    }
+    extern "C" void prosper_int_bzero(void* d, size_t n) {
+        if (eq_in_cluster(d, n)) eq_report_cluster("bzero", d, n);
+        bzero(d, n);
+    }
+    extern "C" void* prosper_int_memmove(void* d, const void* s, size_t n) {
+        if (eq_in_cluster(d, n)) eq_report_cluster("memmove", d, n);
+        return memmove(d, s, n);
+    }
+    #define PROSPER_DYLD_INTERPOSE(_repl,_orig) \
+        __attribute__((used)) static struct { const void* r; const void* o; } \
+        _interpose_##_orig __attribute__((section("__DATA,__interpose"))) = \
+        { (const void*)&_repl, (const void*)&_orig };
+    PROSPER_DYLD_INTERPOSE(prosper_int_mtx_destroy, pthread_mutex_destroy)
+    PROSPER_DYLD_INTERPOSE(prosper_int_mtx_init, pthread_mutex_init)
+    PROSPER_DYLD_INTERPOSE(prosper_int_memset, memset)
+    PROSPER_DYLD_INTERPOSE(prosper_int_bzero, bzero)
+    PROSPER_DYLD_INTERPOSE(prosper_int_memmove, memmove)
+#endif
+
     // #707 decoy-page guard arming (PR #753 round 5; no-op unless PROSPER_EQ_PAGEGUARD is set and
     // never on Windows). PROT_READ the sacrificial page so the region-zeroing corruptor's first
     // store into it faults with a clean RIP; the fault handler reports, lifts the protection, and
     // resumes (see prosper_eq_decoy_page_range below and exec_image's fault_handler).
+    // Deferred symbolization: the fault handler cannot call dladdr (dyld lock). It records the writer rip
+    // + host-image return addresses here; this reporter thread dladdr-symbolizes them (module+offset+sym)
+    // in a safe context. Name the memset variant (rip) and the OUR-code/MoltenVK call site (frames).
+    volatile uint64_t g_eqpg_rip = 0, g_eqpg_frames[24] = {}; volatile int g_eqpg_n = 0;
+    std::atomic<bool> g_eqpg_pending{false};
+    extern "C" void prosper_eq_pageguard_record(uint64_t rip, const uint64_t* frames, int n) {
+        if (g_eqpg_pending.load()) return;
+        g_eqpg_rip = rip; int m = n > 24 ? 24 : n;
+        for (int i = 0; i < m; i++) g_eqpg_frames[i] = frames[i];
+        g_eqpg_n = m; g_eqpg_pending.store(true);
+    }
+    void eq_pageguard_reporter() {
+        for (;;) {
+            if (g_eqpg_pending.load()) {
+                auto sym = [](const char* what, uint64_t a) {
+                    Dl_info di{};
+                    if (dladdr((void*)(uintptr_t)a, &di) && di.dli_fname) {
+                        const char* slash = strrchr(di.dli_fname, '/');
+                        unsigned long soff = di.dli_saddr ? (unsigned long)(a - (uint64_t)(uintptr_t)di.dli_saddr) : 0;
+                        unsigned long ioff = (unsigned long)(a - (uint64_t)(uintptr_t)di.dli_fbase);   // atos -o <img> -l <fbase>
+                        fprintf(stderr, "[eq-pg-sym] %s 0x%llx  %s+0x%lx  (%s @%p +0x%lx)\n", what,
+                                (unsigned long long)a, di.dli_sname ? di.dli_sname : "?", soff,
+                                slash ? slash + 1 : di.dli_fname, di.dli_fbase, ioff);
+                    } else fprintf(stderr, "[eq-pg-sym] %s 0x%llx  (no module)\n", what, (unsigned long long)a);
+                };
+                sym("WRITER-RIP", g_eqpg_rip);
+                for (int i = 0; i < g_eqpg_n; i++) sym("frame", g_eqpg_frames[i]);
+                fflush(stderr);
+                g_eqpg_pending.store(false);
+            }
+            struct timespec ts{ 0, 2000000 }; nanosleep(&ts, nullptr);
+        }
+    }
+    // #707 round 6: the guarded page is a page fully INSIDE g_eq_bigdecoy (not the dead aligned page).
+    // Use the 2nd 4 KiB boundary within the 24 KiB array so the whole page belongs to the array.
+    // #707 round 7: the corruptor zeroes the det/eq_mx/apr region and extends UPWARD from g_det_clock;
+    // it never spills into the page below det, and relocating the victims dodges it (positional by
+    // __DATA offset). So the guard must sit on g_det_clock's OWN page — which also holds a co-located
+    // hot writer (test::persistent_ds_cache). `PROSPER_EQ_PAGEGUARD=det` guards that page and the
+    // classifier DISCRIMINATES by faulting address: a write to the mutex victims (g_det_clock..g_apr_mx)
+    // is the corruptor (report); any other write on the page (persistent_ds_cache etc.) is legit — lift
+    // briefly and let a re-arm thread re-apply RO. Default mode keeps the bigdecoy mid-page (teardown-
+    // proof but the real corruptor never touches it — retained only for the selftest).
+    std::atomic<bool> g_eq_guard_det{false};
+    std::atomic<bool> g_eq_guard_relift{false};
+    uint64_t eq_guard_page() {
+        if (g_eq_guard_det.load(std::memory_order_acquire))
+            return (uint64_t)(uintptr_t)&g_det_clock & ~4095ull;   // g_det_clock's own page
+        uint64_t end = (uint64_t)(uintptr_t)&g_eq_bigdecoy[384];   // one-past-end of the 24 KiB array
+        return (end & ~4095ull) - 4096;                            // last page fully inside the array
+    }
+    // Continuous re-arm: keep g_det_clock's page RO except for the brief windows the handler lifts it
+    // for a legitimate co-located write. Idempotent mprotect every ~25 µs, so the corruptor's store
+    // (which lands on a victim offset) almost always hits an RO page and faults -> caught.
+    void eq_guard_relift_thread(uint64_t until_flip) {
+        for (;;) {
+            if (!g_eq_pageguard_armed.load(std::memory_order_acquire)) return;   // corruptor caught -> stop
+            if (prosper_vo_flip_count() >= until_flip) {
+#ifndef _WIN32
+                mprotect((void*)(uintptr_t)eq_guard_page(), 4096, PROT_READ | PROT_WRITE);   // window closed
+#endif
+                g_eq_pageguard_armed.store(false, std::memory_order_release);
+                fprintf(stderr, "[eq-pageguard] window closed @flip=%llu — disarmed (no corruptor caught)\n",
+                        (unsigned long long)prosper_vo_flip_count());
+                return;
+            }
+            if (g_eq_guard_relift.exchange(false)) {
+#ifndef _WIN32
+                mprotect((void*)(uintptr_t)eq_guard_page(), 4096, PROT_READ);
+#endif
+            }
+            struct timespec ts{ 0, 10000 }; nanosleep(&ts, nullptr);   // 10 µs: tight RW gap, no livelock
+        }
+    }
     void eq_pageguard_maybe_arm() {
 #ifndef _WIN32
         static const char* mode = getenv("PROSPER_EQ_PAGEGUARD");
         if (!mode) return;
         static std::atomic<bool> once{false};
         if (once.exchange(true)) return;
-        void* pg = (void*)&g_eq_decoy_page;
+        std::thread(eq_pageguard_reporter).detach();
+        if (strcmp(mode, "det") == 0) {
+            // DET mode fault-storms the render if armed continuously (every co-located per-frame write on
+            // g_det_clock's page faults). The corruptor fires in a narrow flip-count window (~2400), so
+            // arm ONLY inside [GUARD_AFTER, GUARD_UNTIL] flips: render runs RW/full-speed before and
+            // after, and the storm is bounded to the ~40 render frames that bracket the corruption.
+            g_eq_guard_det.store(true, std::memory_order_release);   // MUST precede eq_guard_page() below
+            void* pg = (void*)(uintptr_t)eq_guard_page();            // now resolves to g_det_clock's page
+            uint64_t after = getenv("PROSPER_EQ_GUARD_AFTER") ? strtoull(getenv("PROSPER_EQ_GUARD_AFTER"), 0, 0) : 2000;
+            uint64_t until = getenv("PROSPER_EQ_GUARD_UNTIL") ? strtoull(getenv("PROSPER_EQ_GUARD_UNTIL"), 0, 0) : 3400;
+            std::thread([pg, after, until] {
+                while (prosper_vo_flip_count() < after) { struct timespec ts{ 0, 5000000 }; nanosleep(&ts, nullptr); }
+                if (mprotect(pg, 4096, PROT_READ) != 0) {
+                    fprintf(stderr, "[eq-pageguard] mprotect FAILED errno=%d\n", errno); return;
+                }
+                g_eq_pageguard_armed.store(true, std::memory_order_release);
+                fprintf(stderr, "[eq-pageguard] armed DET-DISCRIMINATE @flip=%llu page=%p (det=%p eq_mx=%p apr=%p) window[..%llu]\n",
+                        (unsigned long long)prosper_vo_flip_count(), pg, (void*)&g_det_clock,
+                        (void*)&g_eq_mx, (void*)&g_apr_mx, (unsigned long long)until);
+                eq_guard_relift_thread(until);   // relift until the window closes, then disarm
+            }).detach();
+            return;
+        }
+        void* pg = (void*)(uintptr_t)eq_guard_page();   // bigdecoy-mid page (selftest / non-det)
         if (mprotect(pg, 4096, PROT_READ) == 0) {
             g_eq_pageguard_armed.store(true, std::memory_order_release);
-            fprintf(stderr, "[eq-pageguard] armed: decoy page %p PROT_READ (4096 bytes)\n", pg);
+            fprintf(stderr, "[eq-pageguard] armed bigdecoy-mid: page %p PROT_READ (det=%p eq_mx=%p apr=%p)\n",
+                    pg, (void*)&g_det_clock, (void*)&g_eq_mx, (void*)&g_apr_mx);
         } else {
             fprintf(stderr, "[eq-pageguard] mprotect(%p) FAILED errno=%d — guard inactive\n", pg, errno);
             return;
@@ -574,7 +747,7 @@ namespace {
         // work before trusting a silent real run.
         if (strcmp(mode, "selftest") == 0) std::thread([] {
             struct timespec ts{ 2, 0 }; nanosleep(&ts, nullptr);
-            memset((void*)&g_eq_decoy_page, 0, 256);
+            memset((void*)(uintptr_t)eq_guard_page(), 0, 256);
             fprintf(stderr, "[eq-pageguard] selftest write survived (report should precede this)\n");
         }).detach();
 #endif
@@ -651,12 +824,27 @@ namespace {
 // continues) and return 1 so the caller reports the faulting RIP + guest stack and resumes.
 extern "C" int prosper_eq_pageguard_classify(uint64_t addr) {
     if (!g_eq_pageguard_armed.load(std::memory_order_acquire)) return 0;
-    uint64_t lo = (uint64_t)(uintptr_t)&g_eq_decoy_page;
+    uint64_t lo = eq_guard_page();
     if (addr < lo || addr >= lo + 4096) return 0;
 #ifndef _WIN32
-    mprotect((void*)(uintptr_t)lo, 4096, PROT_READ | PROT_WRITE);
+    mprotect((void*)(uintptr_t)lo, 4096, PROT_READ | PROT_WRITE);   // let the faulting store complete
 #endif
-    g_eq_pageguard_armed.store(false, std::memory_order_release);   // one-shot
+    if (g_eq_guard_det.load(std::memory_order_acquire)) {
+        // DET-DISCRIMINATE: the corruptor zeroes the mutex SIG words (offset 0 of each pthread_mutex_t).
+        // A legitimate pthread_mutex_lock/unlock writes only the lock/owner fields (offset ~0x20+) and
+        // NEVER the sig, and init runs once before arming — so a fault landing on a sig word (first 8
+        // bytes of g_det_clock.mutex / g_eq_mx / g_apr_mx) is the corruptor. Any other write on the page
+        // (persistent_ds_cache, a real lock word) is legit: flag the re-arm thread and resume silently.
+        auto sig_hit = [addr](const void* mtx) {
+            uint64_t b = (uint64_t)(uintptr_t)mtx; return addr >= b && addr < b + 8;
+        };
+        bool victim = sig_hit(&g_det_clock) || sig_hit(&g_eq_mx) || sig_hit(&g_apr_mx);
+        g_eq_guard_relift.store(true, std::memory_order_release);
+        if (!victim) return 2;                                     // legit co-located write: silent
+        g_eq_pageguard_armed.store(false, std::memory_order_release);
+        return 1;                                                  // corruptor hit a victim: report
+    }
+    g_eq_pageguard_armed.store(false, std::memory_order_release);   // bigdecoy mode: one-shot
     return 1;
 }
 
