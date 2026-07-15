@@ -116,6 +116,21 @@ struct BackendDraw {
     std::vector<uint32_t> indices;
 };
 
+struct BackendTextureUploadStats {
+    size_t references = 0;
+    size_t unique_uploads = 0;
+    uint64_t upload_bytes = 0;
+};
+
+inline BackendTextureUploadStats& backend_texture_upload_stats_storage() {
+    static BackendTextureUploadStats stats;
+    return stats;
+}
+
+inline BackendTextureUploadStats backend_texture_upload_stats() {
+    return backend_texture_upload_stats_storage();
+}
+
 // `seed_rgba` (optional): W*H*4 RGBA8 pixels to PRELOAD the color attachment with before the draws
 // run (loadOp LOAD instead of the blue clear). This is real render-target memory semantics: a game
 // pass that draws into a target it (or an earlier submit) already rendered composites OVER that
@@ -860,13 +875,44 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         std::vector<FrameResource> R;
         std::vector<VkDescriptorSetLayout> dsls; std::vector<VkDescriptorSet> dsets;
         VkDescriptorPool dpool = VK_NULL_HANDLE;
-        std::vector<VkBuffer> sbuf, tstage; std::vector<VkDeviceMemory> sbmem, tmem, tstagemem;
-        std::vector<VkImage> timg; std::vector<VkImageView> tview; std::vector<VkSampler> tsamp;
+        std::vector<VkBuffer> sbuf; std::vector<VkDeviceMemory> sbmem;
+        std::vector<size_t> texture_upload;
+        std::vector<VkImageView> tview; std::vector<VkSampler> tsamp;
         VkPipelineLayout layout = VK_NULL_HANDLE; VkPipeline pipe = VK_NULL_HANDLE;
         VkBuffer ibuf = VK_NULL_HANDLE; VkDeviceMemory ibmem = VK_NULL_HANDLE;   // index buffer (indexed draws)
         uint32_t n_sets = 1, vcount = 3, icount = 0; bool use_desc = false, ok = false;
     };
+    struct TextureUploadKey {
+        const uint8_t* pixels = nullptr;
+        uint32_t width = 0, height = 0, depth = 1;
+        uint32_t img_dim = 1;
+        bool operator==(const TextureUploadKey& other) const {
+            return pixels == other.pixels && width == other.width && height == other.height &&
+                   depth == other.depth && img_dim == other.img_dim;
+        }
+    };
+    struct TextureUploadKeyHash {
+        size_t operator()(const TextureUploadKey& key) const {
+            size_t h = std::hash<const uint8_t*>{}(key.pixels);
+            h ^= static_cast<size_t>(key.width) + 0x9e3779b9u + (h << 6) + (h >> 2);
+            h ^= static_cast<size_t>(key.height) + 0x9e3779b9u + (h << 6) + (h >> 2);
+            h ^= static_cast<size_t>(key.depth) + 0x9e3779b9u + (h << 6) + (h >> 2);
+            h ^= static_cast<size_t>(key.img_dim) + 0x9e3779b9u + (h << 6) + (h >> 2);
+            return h;
+        }
+    };
+    struct SharedTextureUpload {
+        TextureUploadKey key;
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkBuffer staging = VK_NULL_HANDLE;
+        VkDeviceMemory staging_memory = VK_NULL_HANDLE;
+    };
     std::vector<DV> dv(draws.size());
+    std::vector<SharedTextureUpload> texture_uploads;
+    std::unordered_map<TextureUploadKey, size_t, TextureUploadKeyHash> texture_upload_indices;
+    const bool share_texture_uploads = getenv("PROSPER_NO_BACKEND_TEXTURE_SHARE") == nullptr;
+    size_t texture_references = 0;
     double setup_shader_ms = 0.0;
     double setup_fixed_ms = 0.0;
     double setup_resources_ms = 0.0;
@@ -1001,9 +1047,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         v.use_desc = !R.empty();
         for (auto& r : R) v.n_sets = std::max(v.n_sets, r.set + 1);
         v.dsls.assign(v.n_sets, VK_NULL_HANDLE); v.dsets.assign(v.n_sets, VK_NULL_HANDLE);
-        v.sbuf.assign(R.size(), VK_NULL_HANDLE); v.tstage.assign(R.size(), VK_NULL_HANDLE);
-        v.sbmem.assign(R.size(), VK_NULL_HANDLE); v.tmem.assign(R.size(), VK_NULL_HANDLE); v.tstagemem.assign(R.size(), VK_NULL_HANDLE);
-        v.timg.assign(R.size(), VK_NULL_HANDLE); v.tview.assign(R.size(), VK_NULL_HANDLE); v.tsamp.assign(R.size(), VK_NULL_HANDLE);
+        v.sbuf.assign(R.size(), VK_NULL_HANDLE); v.sbmem.assign(R.size(), VK_NULL_HANDLE);
+        v.texture_upload.assign(R.size(), SIZE_MAX);
+        v.tview.assign(R.size(), VK_NULL_HANDLE); v.tsamp.assign(R.size(), VK_NULL_HANDLE);
         if (v.use_desc) {
             std::vector<VkDescriptorSetLayoutBinding> lb(R.size());
             std::vector<VkDescriptorBufferInfo> dbi(R.size());
@@ -1024,19 +1070,56 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     lb[i].stageFlags = (r.set == 0)
                         ? (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)
                         : VK_SHADER_STAGE_FRAGMENT_BIT;
-                    VkImageCreateInfo tci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-                    const bool texture_3d = r.img_dim == 2;
-                    tci.imageType = texture_3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
-                    tci.format = VK_FORMAT_R8G8B8A8_UNORM; tci.extent = {r.tw, r.th, r.td};
-                    tci.mipLevels = 1; tci.arrayLayers = 1; tci.samples = VK_SAMPLE_COUNT_1_BIT; tci.tiling = VK_IMAGE_TILING_OPTIMAL;
-                    tci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-                    vkCreateImage(dev, &tci, nullptr, &v.timg[i]);
-                    VkMemoryRequirements tr; vkGetImageMemoryRequirements(dev, v.timg[i], &tr);
-                    VkMemoryAllocateInfo tai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; tai.allocationSize = tr.size;
-                    tai.memoryTypeIndex = pick(tr.memoryTypeBits, 0);
-                    v.tmem[i] = allocate_transient_render_memory(dev, tai.allocationSize,
-                                                                  tai.memoryTypeIndex);
-                    vkBindImageMemory(dev, v.timg[i], v.tmem[i], 0);
+                    texture_references++;
+                    const TextureUploadKey texture_key{r.tex_rgba, r.tw, r.th, r.td, r.img_dim};
+                    size_t upload_index = SIZE_MAX;
+                    if (share_texture_uploads) {
+                        auto found = texture_upload_indices.find(texture_key);
+                        if (found != texture_upload_indices.end()) upload_index = found->second;
+                    }
+                    if (upload_index == SIZE_MAX) {
+                        upload_index = texture_uploads.size();
+                        texture_uploads.push_back({});
+                        SharedTextureUpload& upload = texture_uploads.back();
+                        upload.key = texture_key;
+                        if (share_texture_uploads) texture_upload_indices.emplace(texture_key, upload_index);
+
+                        VkImageCreateInfo tci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+                        const bool texture_3d = r.img_dim == 2;
+                        tci.imageType = texture_3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
+                        tci.format = VK_FORMAT_R8G8B8A8_UNORM;
+                        tci.extent = {r.tw, r.th, r.td};
+                        tci.mipLevels = 1; tci.arrayLayers = 1; tci.samples = VK_SAMPLE_COUNT_1_BIT;
+                        tci.tiling = VK_IMAGE_TILING_OPTIMAL;
+                        tci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+                        vkCreateImage(dev, &tci, nullptr, &upload.image);
+                        VkMemoryRequirements tr; vkGetImageMemoryRequirements(dev, upload.image, &tr);
+                        VkMemoryAllocateInfo tai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                        tai.allocationSize = tr.size; tai.memoryTypeIndex = pick(tr.memoryTypeBits, 0);
+                        upload.memory = allocate_transient_render_memory(dev, tai.allocationSize,
+                                                                         tai.memoryTypeIndex);
+                        vkBindImageMemory(dev, upload.image, upload.memory, 0);
+
+                        const VkDeviceSize tbytes =
+                            static_cast<VkDeviceSize>(r.tw) * r.th * r.td * 4;
+                        VkBufferCreateInfo stci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+                        stci.size = tbytes; stci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+                        vkCreateBuffer(dev, &stci, nullptr, &upload.staging);
+                        VkMemoryRequirements sr; vkGetBufferMemoryRequirements(dev, upload.staging, &sr);
+                        VkMemoryAllocateInfo sai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                        sai.allocationSize = sr.size;
+                        sai.memoryTypeIndex = pick(sr.memoryTypeBits,
+                                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                        upload.staging_memory = allocate_transient_render_memory(
+                            dev, sai.allocationSize, sai.memoryTypeIndex);
+                        vkBindBufferMemory(dev, upload.staging, upload.staging_memory, 0);
+                        void* sp = nullptr; vkMapMemory(dev, upload.staging_memory, 0, tbytes, 0, &sp);
+                        std::memcpy(sp, r.tex_rgba, static_cast<size_t>(tbytes));
+                        vkUnmapMemory(dev, upload.staging_memory);
+                    }
+                    v.texture_upload[i] = upload_index;
+                    const SharedTextureUpload& upload = texture_uploads[upload_index];
                     VkImageViewCreateInfo tvci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
                     // NOTE(#263): r.srgb carries whether the T# is a gamma-encoded (sRGB) surface, but we
                     // deliberately keep the view UNORM. This whole renderer works in gamma/sRGB space
@@ -1047,8 +1130,8 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     // matching encode on store -> linear values into a UNORM swapchain -> too dark. A
                     // correct sRGB fix is a coordinated linear-working-space + output-encode change (see the
                     // #263 discussion), NOT a per-view format flip. r.srgb is decoded now as groundwork.
-                    tvci.image = v.timg[i];
-                    tvci.viewType = texture_3d ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;
+                    tvci.image = upload.image;
+                    tvci.viewType = r.img_dim == 2 ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;
                     tvci.format = VK_FORMAT_R8G8B8A8_UNORM;
                     // T# DST_SEL channel remap (#261): map each SQ_SEL to a VkComponentSwizzle. Identity
                     // (the default, and the narrow/font path) yields IDENTITY == a no-op. PROSPER_NO_SWIZZLE
@@ -1111,17 +1194,6 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     }
                     sci.minLod = r.min_lod; sci.maxLod = r.max_lod; sci.mipLodBias = r.lod_bias;
                     vkCreateSampler(dev, &sci, nullptr, &v.tsamp[i]);
-                    VkDeviceSize tbytes = (VkDeviceSize)r.tw * r.th * r.td * 4;
-                    VkBufferCreateInfo stci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; stci.size = tbytes; stci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-                    vkCreateBuffer(dev, &stci, nullptr, &v.tstage[i]);
-                    VkMemoryRequirements sr; vkGetBufferMemoryRequirements(dev, v.tstage[i], &sr);
-                    VkMemoryAllocateInfo sai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; sai.allocationSize = sr.size;
-                    sai.memoryTypeIndex = pick(sr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-                    v.tstagemem[i] = allocate_transient_render_memory(dev, sai.allocationSize,
-                                                                      sai.memoryTypeIndex);
-                    vkBindBufferMemory(dev, v.tstage[i], v.tstagemem[i], 0);
-                    void* sp = nullptr; vkMapMemory(dev, v.tstagemem[i], 0, tbytes, 0, &sp);
-                    std::memcpy(sp, r.tex_rgba, (size_t)tbytes); vkUnmapMemory(dev, v.tstagemem[i]);
                     dii[i] = {v.tsamp[i], v.tview[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
                     wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; wr[i].dstBinding = r.binding; wr[i].descriptorCount = 1;
                     wr[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wr[i].pImageInfo = &dii[i];
@@ -1176,6 +1248,14 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         const auto setup_pipeline_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
         if (timing_enabled) setup_pipeline_ms += setup_elapsed_ms(setup_resources_ready, setup_pipeline_ready);
     }
+
+    BackendTextureUploadStats& texture_stats = backend_texture_upload_stats_storage();
+    texture_stats = {};
+    texture_stats.references = texture_references;
+    texture_stats.unique_uploads = texture_uploads.size();
+    for (const auto& upload : texture_uploads)
+        texture_stats.upload_bytes += static_cast<uint64_t>(upload.key.width) * upload.key.height *
+                                      upload.key.depth * 4;
 
     const auto timing_draws_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     VkDeviceSize bytes = (VkDeviceSize)W * H * 4;
@@ -1233,20 +1313,21 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         s1.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &s1);
     }
-    // Upload each draw's textures: UNDEFINED -> TRANSFER_DST, copy staging buffer, TRANSFER_DST -> SHADER_READ.
-    for (auto& v : dv) for (size_t i = 0; i < v.R.size(); i++) {
-        if (!v.R[i].is_texture()) continue;
+    // Upload each distinct texture once. Draw descriptors may use separate views/samplers over the
+    // same image, preserving per-binding swizzle and sampler state without duplicating pixel storage.
+    for (const auto& upload : texture_uploads) {
         VkImageMemoryBarrier b0{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         b0.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; b0.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        b0.image = v.timg[i]; b0.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        b0.image = upload.image; b0.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         b0.srcAccessMask = 0; b0.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b0);
         VkBufferImageCopy tc{}; tc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        tc.imageExtent = {v.R[i].tw, v.R[i].th, v.R[i].td};
-        vkCmdCopyBufferToImage(cmd, v.tstage[i], v.timg[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &tc);
+        tc.imageExtent = {upload.key.width, upload.key.height, upload.key.depth};
+        vkCmdCopyBufferToImage(cmd, upload.staging, upload.image,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &tc);
         VkImageMemoryBarrier b1{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         b1.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b1.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        b1.image = v.timg[i]; b1.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        b1.image = upload.image; b1.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         b1.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b1.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         // The dst stage must cover EVERY stage that samples this image. #376 made set-0 textures
         // VS-visible (stageFlags VERTEX|FRAGMENT), so a vertex texture fetch reads it in the VERTEX
@@ -1413,11 +1494,14 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             if (v.sbmem[i])    release_transient_render_memory(dev, v.sbmem[i]);
             if (v.tsamp[i])    vkDestroySampler(dev, v.tsamp[i], nullptr);
             if (v.tview[i])    vkDestroyImageView(dev, v.tview[i], nullptr);
-            if (v.timg[i])     vkDestroyImage(dev, v.timg[i], nullptr);
-            if (v.tmem[i])     release_transient_render_memory(dev, v.tmem[i]);
-            if (v.tstage[i])   vkDestroyBuffer(dev, v.tstage[i], nullptr);
-            if (v.tstagemem[i])release_transient_render_memory(dev, v.tstagemem[i]);
         }
+    }
+    for (auto& upload : texture_uploads) {
+        if (upload.image) vkDestroyImage(dev, upload.image, nullptr);
+        if (upload.memory) release_transient_render_memory(dev, upload.memory);
+        if (upload.staging) vkDestroyBuffer(dev, upload.staging, nullptr);
+        if (upload.staging_memory)
+            release_transient_render_memory(dev, upload.staging_memory);
     }
     if (seedbuf) vkDestroyBuffer(dev, seedbuf, nullptr);
     if (seedmem) release_transient_render_memory(dev, seedmem);
@@ -1435,6 +1519,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         };
         struct TimingTotals {
             uint64_t calls = 0, draws = 0;
+            uint64_t texture_references = 0, texture_uploads = 0, texture_upload_bytes = 0;
             double target = 0, draw_setup = 0, record = 0, gpu_wait = 0, readback = 0, cleanup = 0;
             double setup_shader = 0, setup_fixed = 0, setup_resources = 0, setup_pipeline = 0;
         };
@@ -1443,6 +1528,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         auto accumulate = [&](TimingTotals& timing) {
             timing.calls++;
             timing.draws += draws.size();
+            timing.texture_references += texture_stats.references;
+            timing.texture_uploads += texture_stats.unique_uploads;
+            timing.texture_upload_bytes += texture_stats.upload_bytes;
             timing.target += ms(timing_start, timing_target_ready);
             timing.draw_setup += ms(timing_target_ready, timing_draws_ready);
             timing.record += ms(timing_draws_ready, timing_recorded);
@@ -1470,6 +1558,11 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     "[render-timing] draw_setup avg_ms: shaders=%.2f fixed=%.2f resources=%.2f pipeline=%.2f\n",
                     totals.setup_shader / n, totals.setup_fixed / n,
                     totals.setup_resources / n, totals.setup_pipeline / n);
+            fprintf(stderr,
+                    "[render-timing] backend textures refs=%llu uploads=%llu %.1f MiB\n",
+                    (unsigned long long)totals.texture_references,
+                    (unsigned long long)totals.texture_uploads,
+                    totals.texture_upload_bytes / (1024.0 * 1024.0));
             const RenderMemoryPoolStats pool = render_memory_pool_stats();
             fprintf(stderr,
                     "[render-timing] memory_pool hits=%llu misses=%llu cached=%zu %.1f MiB "
@@ -1491,6 +1584,10 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     "[render-window] draw_setup avg_ms: shaders=%.2f fixed=%.2f resources=%.2f pipeline=%.2f\n",
                     window.setup_shader / wn, window.setup_fixed / wn,
                     window.setup_resources / wn, window.setup_pipeline / wn);
+            fprintf(stderr,
+                    "[render-window] backend textures refs=%.1f uploads=%.1f %.1f MiB\n",
+                    window.texture_references / wn, window.texture_uploads / wn,
+                    window.texture_upload_bytes / (wn * 1024.0 * 1024.0));
             window = {};
         }
     }

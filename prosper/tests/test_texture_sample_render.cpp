@@ -11,6 +11,7 @@
 #include "../src/gpu/shader_resources.hpp"
 #include "render_runner.h"
 #include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <vector>
 
@@ -76,6 +77,91 @@ int main() {
     bool ok1 = sample_center(C075, C025, rgb);
     printf("  (0.75,0.25) center=(%u,%u,%u)\n", ok1?rgb[0]:0, ok1?rgb[1]:0, ok1?rgb[2]:0);
     CHECK(ok1 && rgb[1] > 0x80 && rgb[0] < 0x40 && rgb[2] < 0x40, "sampling texel (1,0) yields GREEN (proves u routing)");
+
+    // The live renderer commonly submits hundreds of draws that reference the same few decoded
+    // textures. The backend must upload identical pixels once per call while preserving the legacy
+    // rendered bytes and separate per-descriptor views/samplers.
+    {
+        std::vector<uint32_t> ps(ps_template, ps_template + sizeof(ps_template)/sizeof(ps_template[0]));
+        ps[1] = C075; ps[3] = C025;
+        std::vector<uint32_t> frag = recompile_fragment(ps.data(), ps.size(), &rt);
+        prosper::test::FrameResource resource;
+        resource.binding = 4; resource.set = 1;
+        resource.tex_rgba = texels; resource.tw = 2; resource.th = 2;
+        prosper::test::BackendDraw draw;
+        draw.vs = vert; draw.fs = frag; draw.R = {resource}; draw.vcount = 3;
+        prosper::test::FrameResource swizzled_resource = resource;
+        swizzled_resource.swizzle[0] = 5;
+        swizzled_resource.swizzle[1] = 4;
+        prosper::test::BackendDraw swizzled_draw = draw;
+        swizzled_draw.R = {swizzled_resource};
+
+        std::vector<uint8_t> shared =
+            prosper::test::render_draws_rgba({draw, swizzled_draw}, W, H);
+        const auto shared_stats = prosper::test::backend_texture_upload_stats();
+        CHECK(shared_stats.references == 2 && shared_stats.unique_uploads == 1,
+              "draws with separate views over shared pixels produce one backend texture upload");
+
+#ifdef _WIN32
+        _putenv_s("PROSPER_NO_BACKEND_TEXTURE_SHARE", "1");
+#else
+        setenv("PROSPER_NO_BACKEND_TEXTURE_SHARE", "1", 1);
+#endif
+        std::vector<uint8_t> legacy =
+            prosper::test::render_draws_rgba({draw, swizzled_draw}, W, H);
+        const auto legacy_stats = prosper::test::backend_texture_upload_stats();
+#ifdef _WIN32
+        _putenv_s("PROSPER_NO_BACKEND_TEXTURE_SHARE", "");
+#else
+        unsetenv("PROSPER_NO_BACKEND_TEXTURE_SHARE");
+#endif
+        CHECK(legacy_stats.references == 2 && legacy_stats.unique_uploads == 2,
+              "disable switch restores one backend upload per texture reference");
+        CHECK(!shared.empty() && shared == legacy,
+              "shared and legacy uploads with distinct view swizzles render byte-identically");
+    }
+
+    // The backend upload key includes depth and image dimensionality. Exercise a real 3D image here
+    // so depth-1 3D resources cannot accidentally regress to a 2D Vulkan image/view during sharing.
+    {
+        const uint32_t ps_3d[] = {
+            0x7e0002ffu, C025, 0x7e0202ffu, C025, 0x7e0402ffu, C075,
+            0xf0800f10u, 0x00820000u, 0xf800000fu, 0x03020100u, 0xbf810000u,
+        };
+        ShaderResourceTable rt_3d;
+        { ShaderResource t{}; t.cls = ResourceClass::Texture; t.binding = 4; t.img_dim = 2;
+          t.width = 2; t.height = 2; t.depth = 2; t.sgpr_base = 8;
+          rt_3d.resources.push_back(t); }
+        std::vector<uint32_t> frag_3d =
+            recompile_fragment(ps_3d, sizeof(ps_3d) / sizeof(ps_3d[0]), &rt_3d);
+        CHECK(!frag_3d.empty(), "recompiled a 3D image_sample fragment shader");
+        if (!frag_3d.empty()) {
+            const uint8_t volume[2*2*2*4] = {
+                255,0,0,255, 255,0,0,255, 255,0,0,255, 255,0,0,255,
+                0,255,0,255, 0,255,0,255, 0,255,0,255, 0,255,0,255,
+            };
+            prosper::test::FrameResource resource_3d;
+            resource_3d.binding = 4; resource_3d.set = 1;
+            resource_3d.tex_rgba = volume;
+            resource_3d.tw = 2; resource_3d.th = 2; resource_3d.td = 2;
+            resource_3d.img_dim = 2;
+            prosper::test::BackendDraw draw_3d;
+            draw_3d.vs = vert; draw_3d.fs = frag_3d; draw_3d.R = {resource_3d};
+            draw_3d.vcount = 3;
+            std::vector<uint8_t> volume_px =
+                prosper::test::render_draws_rgba({draw_3d, draw_3d}, W, H);
+            const auto volume_stats = prosper::test::backend_texture_upload_stats();
+            bool volume_ok = volume_px.size() == static_cast<size_t>(W) * H * 4;
+            if (volume_ok) {
+                const uint8_t* c = &volume_px[((size_t)(H/2) * W + W/2) * 4];
+                volume_ok = c[1] > 0x80 && c[0] < 0x40 && c[2] < 0x40;
+            }
+            CHECK(volume_ok, "shared 3D upload samples the selected depth slice");
+            CHECK(volume_stats.references == 2 && volume_stats.unique_uploads == 1 &&
+                      volume_stats.upload_bytes == sizeof(volume),
+                  "3D texture sharing accounts for depth and uploads the volume once");
+        }
+    }
 
     bool ok2 = sample_center(C025, C075, rgb);
     printf("  (0.25,0.75) center=(%u,%u,%u)\n", ok2?rgb[0]:0, ok2?rgb[1]:0, ok2?rgb[2]:0);
