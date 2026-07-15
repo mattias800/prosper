@@ -116,6 +116,43 @@ int main() {
         }
     }
 
+    // SaveDataDialog lifecycle (#768): returning generic success (0 == NONE) from UpdateStatus makes
+    // a title poll forever. Headless Open auto-dismisses to FINISHED and preserves the proven result
+    // prefix without touching the reserved tail.
+    {
+        auto init   = Hle::lookup("s9e3+YpRnzw");
+        auto open   = Hle::lookup("4tPhsP6FpDI");
+        auto close  = Hle::lookup("fH46Lag88XY");
+        auto status = Hle::lookup("ERKzksauAJA");
+        auto update = Hle::lookup("KK3Bdg1RWK0");
+        auto result = Hle::lookup("yEiJ-qqr6Cg");
+        auto term   = Hle::lookup("YuH2FA7azqQ");
+        CHECK(init && open && close && status && update && result && term,
+              "SaveDataDialog lifecycle functions registered");
+        if (init && open && close && status && update && result && term) {
+            term(0,0,0,0,0,0);
+            CHECK(status(0,0,0,0,0,0) == 0, "SaveDataDialog before Initialize -> NONE(0)");
+            init(0,0,0,0,0,0);
+            CHECK(update(0,0,0,0,0,0) == 1, "SaveDataDialog Initialize -> INITIALIZED(1)");
+            uint8_t param[0x98]{};
+            *(uint32_t*)(param + 0x34) = 3;
+            *(uint64_t*)(param + 0x70) = 0x123456789abcdef0ull;
+            open((uint64_t)(uintptr_t)param,0,0,0,0,0);
+            CHECK(update(0,0,0,0,0,0) == 3, "SaveDataDialog Open auto-dismisses -> FINISHED(3)");
+            uint8_t out[0x50]; memset(out, 0xAB, sizeof out);
+            result((uint64_t)(uintptr_t)out,0,0,0,0,0);
+            CHECK(*(uint32_t*)(out + 0x00) == 3 && *(uint32_t*)(out + 0x04) == 0 &&
+                  *(uint32_t*)(out + 0x08) == 0,
+                  "SaveDataDialog result reports mode and neutral OK/INVALID outcome");
+            CHECK(*(uint64_t*)(out + 0x20) == 0x123456789abcdef0ull,
+                  "SaveDataDialog result preserves caller userData");
+            CHECK(out[0x28] == 0xAB && out[0x4f] == 0xAB,
+                  "SaveDataDialog result does not overwrite its reserved tail");
+            close(0,0,0,0,0,0);
+            CHECK(status(0,0,0,0,0,0) == 0, "SaveDataDialog Close -> NONE(0)");
+        }
+    }
+
     // SystemService / AppContent / NP getters: each must WRITE its out-param with the CORRECT value —
     // returning success with an unfilled (or wrong-valued) out is the harmful-stub class whose downstream
     // effects are hard to trace (a 0.0 safe-area ratio collapses the viewport; lang 0 localizes to

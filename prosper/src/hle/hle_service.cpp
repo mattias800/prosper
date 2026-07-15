@@ -560,6 +560,62 @@ HLE(s_dialog_result) {
     return 0;
 }
 
+// --- libSceSaveDataDialog ---------------------------------------------------------------
+// Uses the common-dialog status enum: NONE=0, INITIALIZED=1, RUNNING=2, FINISHED=3. A generic
+// success stub is not safe for UpdateStatus: Dead Cells polled it 1,135 times in 16 seconds because
+// zero means NONE, leaving its level transition in a permanent wait (#768). The headless policy
+// matches MsgDialog above: Open auto-dismisses to FINISHED so the guest can consume a neutral result.
+//
+// PS4/PS5 SDK layout used below (also used by shadPS4): param.mode is u32 at +0x34 and param.userData
+// is a pointer at +0x70. Result begins with mode/result/buttonId/pad followed by three pointers. Write
+// only that proven 0x28-byte prefix; the remaining 32 reserved bytes belong to the caller.
+namespace {
+    std::atomic<int> g_savedatadialog_status{0 /*NONE*/};
+    std::atomic<uint32_t> g_savedatadialog_mode{0 /*INVALID*/};
+    std::atomic<uint64_t> g_savedatadialog_user_data{0};
+}
+HLE(s_savedlg_initialize) {
+    g_savedatadialog_mode.store(0);
+    g_savedatadialog_user_data.store(0);
+    g_savedatadialog_status.store(1 /*INITIALIZED*/);
+    return 0;
+}
+HLE(s_savedlg_open) {
+    if (a0) {
+        const uint8_t* param = (const uint8_t*)PW(a0);
+        g_savedatadialog_mode.store(*(const uint32_t*)(param + 0x34));
+        g_savedatadialog_user_data.store(*(const uint64_t*)(param + 0x70));
+    } else {
+        g_savedatadialog_mode.store(0);
+        g_savedatadialog_user_data.store(0);
+    }
+    g_savedatadialog_status.store(3 /*FINISHED (auto-dismiss)*/);
+    return 0;
+}
+HLE(s_savedlg_status) { return (uint64_t)(unsigned)g_savedatadialog_status.load(); }
+HLE(s_savedlg_result) {
+    if (a0) {
+        uint8_t* result = (uint8_t*)PW(a0);
+        *(uint32_t*)(result + 0x00) = g_savedatadialog_mode.load();
+        *(uint32_t*)(result + 0x04) = 0 /*CommonDialogResult::OK*/;
+        *(uint32_t*)(result + 0x08) = 0 /*ButtonId::INVALID*/;
+        *(uint32_t*)(result + 0x0c) = 0;
+        *(uint64_t*)(result + 0x10) = 0 /*dirName*/;
+        *(uint64_t*)(result + 0x18) = 0 /*save param*/;
+        *(uint64_t*)(result + 0x20) = g_savedatadialog_user_data.load();
+    }
+    return 0;
+}
+HLE(s_savedlg_close) { g_savedatadialog_status.store(0 /*NONE*/); return 0; }
+HLE(s_savedlg_terminate) {
+    g_savedatadialog_status.store(0 /*NONE*/);
+    g_savedatadialog_mode.store(0);
+    g_savedatadialog_user_data.store(0);
+    return 0;
+}
+HLE(s_savedlg_ready) { return 1; }
+HLE(s_savedlg_progress) { return 0; }
+
 // --- libSceImeDialog (on-screen text-entry dialog) (#191). We have no keyboard UI, so the dialog
 // auto-completes: Init -> FINISHED immediately, so the game's "poll GetStatus until Finished" loop
 // exits at once instead of hanging on a dialog that never appears; GetResult reports endStatus =
@@ -1323,6 +1379,19 @@ void register_service_hle() {
     R("sceMsgDialogUpdateStatus", s_dialog_status);
     R("sceMsgDialogGetStatus", s_dialog_status);
     R("sceMsgDialogGetResult", s_dialog_result);
+    // libSceSaveDataDialog[.native] uses raw NIDs in current dumps. Register the complete lifecycle
+    // so future modes do not fall back to success-without-state even though Dead Cells currently uses
+    // only Initialize/Open/UpdateStatus (#768).
+    Hle::register_fn("fH46Lag88XY", (HleFn)s_savedlg_close,      "sceSaveDataDialogClose");
+    Hle::register_fn("yEiJ-qqr6Cg", (HleFn)s_savedlg_result,     "sceSaveDataDialogGetResult");
+    Hle::register_fn("ERKzksauAJA", (HleFn)s_savedlg_status,     "sceSaveDataDialogGetStatus");
+    Hle::register_fn("s9e3+YpRnzw", (HleFn)s_savedlg_initialize, "sceSaveDataDialogInitialize");
+    Hle::register_fn("en7gNVnh878", (HleFn)s_savedlg_ready,      "sceSaveDataDialogIsReadyToDisplay");
+    Hle::register_fn("4tPhsP6FpDI", (HleFn)s_savedlg_open,       "sceSaveDataDialogOpen");
+    Hle::register_fn("V-uEeFKARJU", (HleFn)s_savedlg_progress,   "sceSaveDataDialogProgressBarInc");
+    Hle::register_fn("hay1CfTmLyA", (HleFn)s_savedlg_progress,   "sceSaveDataDialogProgressBarSetValue");
+    Hle::register_fn("YuH2FA7azqQ", (HleFn)s_savedlg_terminate,  "sceSaveDataDialogTerminate");
+    Hle::register_fn("KK3Bdg1RWK0", (HleFn)s_savedlg_status,     "sceSaveDataDialogUpdateStatus");
     // libSceImeDialog (#191): auto-completing text-entry dialog (no keyboard UI). Raw NIDs.
     Hle::register_fn("NUeBrN7hzf0", (HleFn)s_imedlg_init,   "sceImeDialogInit");
     Hle::register_fn("IADmD4tScBY", (HleFn)s_imedlg_status, "sceImeDialogGetStatus");

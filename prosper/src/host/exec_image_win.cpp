@@ -367,6 +367,16 @@ bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
         else    emit_unimpl(slot, (uint32_t)i, (uint64_t)&prosper_on_unimpl);
     }
     g_stub_base = stub_base; g_stub_size = stub_size; g_nstubs = n;
+    // Keep the stack-address-to-import diagnostic available on every execution host. The fingerprint
+    // tool reports return addresses inside this table; index/off/name output makes those frames useful
+    // without relying on a Linux-only boot.
+    if (getenv("PROSPER_STUBDUMP")) {
+        for (uint64_t i = 0; i < n; i++) {
+            const std::string& nm = g_nid_db ? g_nid_db->resolve(slots[i].nid) : std::string();
+            fprintf(stderr, "[stub] #%llu off=0x%llx %s::%s %s\n", (unsigned long long)i,
+                    (unsigned long long)(i * stub_size), slots[i].lib.c_str(), slots[i].nid.c_str(), nm.c_str());
+        }
+    }
     return true;
 }
 

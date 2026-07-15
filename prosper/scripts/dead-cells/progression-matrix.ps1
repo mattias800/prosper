@@ -4,7 +4,7 @@ param(
     [string]$BuildDir,
     [string]$OutputDir,
     [ValidateSet('all', 'headless-full', 'app-full', 'headless-publish-10',
-                 'headless-render-every-10', 'headless-no-graphics')]
+                 'headless-render-every-10', 'headless-no-graphics', 'headless-no-gpu-work')]
     [string]$Mode = 'all',
     [int]$FullTimeoutSeconds = 240,
     [int]$FastTimeoutSeconds = 90
@@ -48,6 +48,7 @@ $controlledEnvironment = @(
     'PROSPER_PAD_SCRIPT', 'PROSPER_PAD_SCRIPT_LOG', 'PROSPER_SAVEDATA_DIR',
     'PROSPER_PROGRESS', 'PROSPER_GPU_TIMELINE', 'PROSPER_RENDER',
     'PROSPER_NO_FRAME_DUMPS', 'PROSPER_PRESENT_EVERY', 'PROSPER_RENDER_EVERY',
+    'PROSPER_NO_COMPUTE',
     'PROSPER_RENDER_EVERY_FOR_MS', 'PROSPER_RENDER_DELAY_MS', 'PROSPER_RENDER_FIRST',
     'PROSPER_RENDER_TIMING', 'PROSPER_FRAME_DIR'
 )
@@ -126,6 +127,12 @@ $specs = @(
         Timeout = $FastTimeoutSeconds
         Environment = @{}
         Meaning = 'Diagnostic: no graphics backend; retained compute still executes.'
+    },
+    [pscustomobject]@{
+        Name = 'headless-no-gpu-work'; Program = $bootTrace; Route = $captureRoute
+        Timeout = $FastTimeoutSeconds
+        Environment = @{ PROSPER_NO_COMPUTE = '1' }
+        Meaning = 'Diagnostic: no graphics or compute execution; semantic dispatches remain indexed.'
     }
 )
 if ($Mode -ne 'all') { $specs = @($specs | Where-Object Name -eq $Mode) }
@@ -149,7 +156,12 @@ try {
         if (-not $completed) {
             Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
             $process.WaitForExit()
+        } else {
+            # Drain redirected output and populate ExitCode on all supported PowerShell runtimes.
+            $process.WaitForExit()
         }
+        $process.Refresh()
+        $exitCode = $process.ExitCode
         $elapsed = [Math]::Round(((Get-Date) - $started).TotalSeconds, 1)
         $paths = @($stdout, $stderr)
 
@@ -160,7 +172,7 @@ try {
             $selectorStdout = Join-Path $runDir 'selector.stdout.log'
             $selectorStderr = Join-Path $runDir 'selector.stderr.log'
             $selectorProcess = Start-Process -FilePath $timelineTool -ArgumentList @(
-                $timeline, '--select', '738x420', '80:82', '91:93', '8'
+                $timeline, '--select', '636x420', '77:85', '91:94', '8'
             ) -Wait -PassThru -WindowStyle Hidden -RedirectStandardOutput $selectorStdout `
                 -RedirectStandardError $selectorStderr
             $selectorExit = $selectorProcess.ExitCode
@@ -179,7 +191,8 @@ try {
             mode = $spec.Name
             meaning = $spec.Meaning
             timed_out = -not $completed
-            exit_code = if ($completed) { $process.ExitCode } else { $null }
+            termination = if ($completed) { 'process_exit' } else { 'timeout_killed' }
+            exit_code = $exitCode
             elapsed_seconds = $elapsed
             loading_level = Get-LastMatch $paths 'Loading level PrisonStart'
             parseall = Get-LastMatch $paths 'PARSEALL TOOK'
@@ -189,7 +202,7 @@ try {
             run_dir = $runDir
         }
         $results += $result
-        Write-Host "[$($spec.Name)] timeout=$($result.timed_out) elapsed=${elapsed}s"
+        Write-Host "[$($spec.Name)] termination=$($result.termination) exit=$($result.exit_code) elapsed=${elapsed}s"
         if ($result.loading_level) { Write-Host "  $($result.loading_level)" }
         if ($result.parseall) { Write-Host "  $($result.parseall)" }
         if ($result.last_progress) { Write-Host "  $($result.last_progress)" }
