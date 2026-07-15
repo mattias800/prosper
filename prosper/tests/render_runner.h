@@ -85,6 +85,10 @@ struct FrameResource {
     // T# DST_SEL channel swizzle (SQ_SEL per channel: 0=0,1=1,4=R,5=G,6=B,7=A). Default = identity
     // (R,G,B,A) == a no-op VkComponentMapping, so tests that build FrameResources directly are unchanged.
     uint32_t swizzle[4] = {4, 5, 6, 7};
+    // Non-zero only when the frontend has revalidated the complete guest source backing and can
+    // prove these decoded pixels are the same content version as a prior callback. The Vulkan
+    // backend may retain an uploaded image under this ID; zero remains callback-local/transient.
+    uint64_t persistent_texture_id = 0;
     bool is_texture() const { return tex_rgba != nullptr; }
 };
 
@@ -120,6 +124,9 @@ struct BackendTextureUploadStats {
     size_t references = 0;
     size_t unique_uploads = 0;
     uint64_t upload_bytes = 0;
+    size_t persistent_hits = 0;
+    size_t persistent_misses = 0;
+    uint64_t persistent_cached_bytes = 0;
 };
 
 inline BackendTextureUploadStats& backend_texture_upload_stats_storage() {
@@ -907,12 +914,53 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         VkDeviceMemory memory = VK_NULL_HANDLE;
         VkBuffer staging = VK_NULL_HANDLE;
         VkDeviceMemory staging_memory = VK_NULL_HANDLE;
+        uint64_t persistent_id = 0;
+        VkDeviceSize image_bytes = 0;
+        bool persistent_hit = false;
+        bool direct_memory = false;
     };
+    struct PersistentTextureKey {
+        uint64_t id = 0;
+        uint32_t width = 0, height = 0, depth = 1, img_dim = 1;
+        bool operator==(const PersistentTextureKey&) const = default;
+    };
+    struct PersistentTextureKeyHash {
+        size_t operator()(const PersistentTextureKey& key) const {
+            size_t h = std::hash<uint64_t>{}(key.id);
+            auto mix = [&](uint32_t value) {
+                h ^= static_cast<size_t>(value) + 0x9e3779b9u + (h << 6) + (h >> 2);
+            };
+            mix(key.width); mix(key.height); mix(key.depth); mix(key.img_dim);
+            return h;
+        }
+    };
+    struct PersistentTextureImage {
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkDeviceSize bytes = 0;
+        uint64_t last_use = 0;
+    };
+    static std::unordered_map<PersistentTextureKey, PersistentTextureImage,
+                              PersistentTextureKeyHash> persistent_texture_images;
+    static VkDeviceSize persistent_texture_bytes = 0;
+    static uint64_t persistent_texture_generation = 0;
+    constexpr size_t persistent_texture_max_entries = 1024;
+    const uint64_t texture_generation = ++persistent_texture_generation;
+    const bool persistent_textures_enabled =
+        getenv("PROSPER_NO_BACKEND_PERSISTENT_TEXTURES") == nullptr;
+    const VkDeviceSize persistent_texture_limit = []() -> VkDeviceSize {
+        const char* value = getenv("PROSPER_BACKEND_TEXTURE_CACHE_MB");
+        const uint64_t mib = value ? strtoull(value, nullptr, 10) : 256ull;
+        if (mib > UINT64_MAX / (1024ull * 1024ull)) return VkDeviceSize{UINT64_MAX};
+        return static_cast<VkDeviceSize>(mib) * 1024ull * 1024ull;
+    }();
     std::vector<DV> dv(draws.size());
     std::vector<SharedTextureUpload> texture_uploads;
     std::unordered_map<TextureUploadKey, size_t, TextureUploadKeyHash> texture_upload_indices;
     const bool share_texture_uploads = getenv("PROSPER_NO_BACKEND_TEXTURE_SHARE") == nullptr;
     size_t texture_references = 0;
+    size_t persistent_texture_hits = 0;
+    size_t persistent_texture_misses = 0;
     double setup_shader_ms = 0.0;
     double setup_fixed_ms = 0.0;
     double setup_resources_ms = 0.0;
@@ -1084,39 +1132,69 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                         upload.key = texture_key;
                         if (share_texture_uploads) texture_upload_indices.emplace(texture_key, upload_index);
 
-                        VkImageCreateInfo tci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-                        const bool texture_3d = r.img_dim == 2;
-                        tci.imageType = texture_3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
-                        tci.format = VK_FORMAT_R8G8B8A8_UNORM;
-                        tci.extent = {r.tw, r.th, r.td};
-                        tci.mipLevels = 1; tci.arrayLayers = 1; tci.samples = VK_SAMPLE_COUNT_1_BIT;
-                        tci.tiling = VK_IMAGE_TILING_OPTIMAL;
-                        tci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-                        vkCreateImage(dev, &tci, nullptr, &upload.image);
-                        VkMemoryRequirements tr; vkGetImageMemoryRequirements(dev, upload.image, &tr);
-                        VkMemoryAllocateInfo tai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-                        tai.allocationSize = tr.size; tai.memoryTypeIndex = pick(tr.memoryTypeBits, 0);
-                        upload.memory = allocate_transient_render_memory(dev, tai.allocationSize,
-                                                                         tai.memoryTypeIndex);
-                        vkBindImageMemory(dev, upload.image, upload.memory, 0);
+                        upload.persistent_id = r.persistent_texture_id;
+                        const PersistentTextureKey persistent_key{
+                            r.persistent_texture_id, r.tw, r.th, r.td, r.img_dim};
+                        if (persistent_textures_enabled && r.persistent_texture_id) {
+                            auto cached = persistent_texture_images.find(persistent_key);
+                            if (cached != persistent_texture_images.end()) {
+                                cached->second.last_use = texture_generation;
+                                upload.image = cached->second.image;
+                                upload.image_bytes = cached->second.bytes;
+                                upload.persistent_hit = true;
+                                ++persistent_texture_hits;
+                            } else {
+                                ++persistent_texture_misses;
+                            }
+                        }
 
-                        const VkDeviceSize tbytes =
-                            static_cast<VkDeviceSize>(r.tw) * r.th * r.td * 4;
-                        VkBufferCreateInfo stci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-                        stci.size = tbytes; stci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-                        vkCreateBuffer(dev, &stci, nullptr, &upload.staging);
-                        VkMemoryRequirements sr; vkGetBufferMemoryRequirements(dev, upload.staging, &sr);
-                        VkMemoryAllocateInfo sai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-                        sai.allocationSize = sr.size;
-                        sai.memoryTypeIndex = pick(sr.memoryTypeBits,
-                                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-                        upload.staging_memory = allocate_transient_render_memory(
-                            dev, sai.allocationSize, sai.memoryTypeIndex);
-                        vkBindBufferMemory(dev, upload.staging, upload.staging_memory, 0);
-                        void* sp = nullptr; vkMapMemory(dev, upload.staging_memory, 0, tbytes, 0, &sp);
-                        std::memcpy(sp, r.tex_rgba, static_cast<size_t>(tbytes));
-                        vkUnmapMemory(dev, upload.staging_memory);
+                        if (!upload.persistent_hit) {
+                            VkImageCreateInfo tci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+                            const bool texture_3d = r.img_dim == 2;
+                            tci.imageType = texture_3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
+                            tci.format = VK_FORMAT_R8G8B8A8_UNORM;
+                            tci.extent = {r.tw, r.th, r.td};
+                            tci.mipLevels = 1; tci.arrayLayers = 1;
+                            tci.samples = VK_SAMPLE_COUNT_1_BIT; tci.tiling = VK_IMAGE_TILING_OPTIMAL;
+                            tci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+                            vkCreateImage(dev, &tci, nullptr, &upload.image);
+                            VkMemoryRequirements tr;
+                            vkGetImageMemoryRequirements(dev, upload.image, &tr);
+                            upload.image_bytes = tr.size;
+                            VkMemoryAllocateInfo tai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                            tai.allocationSize = tr.size;
+                            tai.memoryTypeIndex = pick(tr.memoryTypeBits, 0);
+                            const bool retain = persistent_textures_enabled && upload.persistent_id &&
+                                                tr.size <= persistent_texture_limit;
+                            if (retain && vkAllocateMemory(dev, &tai, nullptr, &upload.memory) == VK_SUCCESS)
+                                upload.direct_memory = true;
+                            if (!upload.memory) {
+                                upload.persistent_id = 0;
+                                upload.memory = allocate_transient_render_memory(
+                                    dev, tai.allocationSize, tai.memoryTypeIndex);
+                            }
+                            vkBindImageMemory(dev, upload.image, upload.memory, 0);
+
+                            const VkDeviceSize tbytes =
+                                static_cast<VkDeviceSize>(r.tw) * r.th * r.td * 4;
+                            VkBufferCreateInfo stci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+                            stci.size = tbytes; stci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+                            vkCreateBuffer(dev, &stci, nullptr, &upload.staging);
+                            VkMemoryRequirements sr;
+                            vkGetBufferMemoryRequirements(dev, upload.staging, &sr);
+                            VkMemoryAllocateInfo sai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                            sai.allocationSize = sr.size;
+                            sai.memoryTypeIndex = pick(sr.memoryTypeBits,
+                                                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                            upload.staging_memory = allocate_transient_render_memory(
+                                dev, sai.allocationSize, sai.memoryTypeIndex);
+                            vkBindBufferMemory(dev, upload.staging, upload.staging_memory, 0);
+                            void* sp = nullptr;
+                            vkMapMemory(dev, upload.staging_memory, 0, tbytes, 0, &sp);
+                            std::memcpy(sp, r.tex_rgba, static_cast<size_t>(tbytes));
+                            vkUnmapMemory(dev, upload.staging_memory);
+                        }
                     }
                     v.texture_upload[i] = upload_index;
                     const SharedTextureUpload& upload = texture_uploads[upload_index];
@@ -1252,10 +1330,14 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     BackendTextureUploadStats& texture_stats = backend_texture_upload_stats_storage();
     texture_stats = {};
     texture_stats.references = texture_references;
-    texture_stats.unique_uploads = texture_uploads.size();
-    for (const auto& upload : texture_uploads)
+    texture_stats.persistent_hits = persistent_texture_hits;
+    texture_stats.persistent_misses = persistent_texture_misses;
+    for (const auto& upload : texture_uploads) {
+        if (!upload.staging) continue;
+        ++texture_stats.unique_uploads;
         texture_stats.upload_bytes += static_cast<uint64_t>(upload.key.width) * upload.key.height *
                                       upload.key.depth * 4;
+    }
 
     const auto timing_draws_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     VkDeviceSize bytes = (VkDeviceSize)W * H * 4;
@@ -1316,6 +1398,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     // Upload each distinct texture once. Draw descriptors may use separate views/samplers over the
     // same image, preserving per-binding swizzle and sampler state without duplicating pixel storage.
     for (const auto& upload : texture_uploads) {
+        if (!upload.staging) continue;  // exact-validated persistent image already has shader-read layout
         VkImageMemoryBarrier b0{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         b0.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; b0.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         b0.image = upload.image; b0.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -1496,9 +1579,50 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             if (v.tview[i])    vkDestroyImageView(dev, v.tview[i], nullptr);
         }
     }
+    auto evict_persistent_texture = [&]() {
+        auto victim = persistent_texture_images.end();
+        for (auto it = persistent_texture_images.begin();
+             it != persistent_texture_images.end(); ++it) {
+            if (it->second.last_use == texture_generation) continue;
+            if (victim == persistent_texture_images.end() ||
+                it->second.last_use < victim->second.last_use) victim = it;
+        }
+        if (victim == persistent_texture_images.end()) return false;
+        vkDestroyImage(dev, victim->second.image, nullptr);
+        vkFreeMemory(dev, victim->second.memory, nullptr);
+        persistent_texture_bytes -= victim->second.bytes;
+        persistent_texture_images.erase(victim);
+        return true;
+    };
     for (auto& upload : texture_uploads) {
-        if (upload.image) vkDestroyImage(dev, upload.image, nullptr);
-        if (upload.memory) release_transient_render_memory(dev, upload.memory);
+        if (!upload.direct_memory || !upload.persistent_id || upload.persistent_hit) continue;
+        const PersistentTextureKey key{upload.persistent_id, upload.key.width, upload.key.height,
+                                       upload.key.depth, upload.key.img_dim};
+        while ((persistent_texture_images.size() >= persistent_texture_max_entries ||
+                (upload.image_bytes <= persistent_texture_limit &&
+                 persistent_texture_bytes > persistent_texture_limit - upload.image_bytes)) &&
+               evict_persistent_texture()) {}
+        if (upload.image_bytes <= persistent_texture_limit &&
+            persistent_texture_images.size() < persistent_texture_max_entries &&
+            persistent_texture_bytes <= persistent_texture_limit - upload.image_bytes) {
+            auto [cached, inserted] = persistent_texture_images.emplace(
+                key, PersistentTextureImage{upload.image, upload.memory, upload.image_bytes,
+                                            texture_generation});
+            if (inserted) {
+                persistent_texture_bytes += upload.image_bytes;
+                upload.image = VK_NULL_HANDLE;
+                upload.memory = VK_NULL_HANDLE;
+            }
+        }
+    }
+    while (persistent_texture_bytes > persistent_texture_limit && evict_persistent_texture()) {}
+    texture_stats.persistent_cached_bytes = persistent_texture_bytes;
+    for (auto& upload : texture_uploads) {
+        if (upload.image && !upload.persistent_hit) vkDestroyImage(dev, upload.image, nullptr);
+        if (upload.memory) {
+            if (upload.direct_memory) vkFreeMemory(dev, upload.memory, nullptr);
+            else release_transient_render_memory(dev, upload.memory);
+        }
         if (upload.staging) vkDestroyBuffer(dev, upload.staging, nullptr);
         if (upload.staging_memory)
             release_transient_render_memory(dev, upload.staging_memory);
@@ -1520,6 +1644,7 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         struct TimingTotals {
             uint64_t calls = 0, draws = 0;
             uint64_t texture_references = 0, texture_uploads = 0, texture_upload_bytes = 0;
+            uint64_t persistent_hits = 0, persistent_misses = 0, persistent_cached_bytes = 0;
             double target = 0, draw_setup = 0, record = 0, gpu_wait = 0, readback = 0, cleanup = 0;
             double setup_shader = 0, setup_fixed = 0, setup_resources = 0, setup_pipeline = 0;
         };
@@ -1531,6 +1656,9 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             timing.texture_references += texture_stats.references;
             timing.texture_uploads += texture_stats.unique_uploads;
             timing.texture_upload_bytes += texture_stats.upload_bytes;
+            timing.persistent_hits += texture_stats.persistent_hits;
+            timing.persistent_misses += texture_stats.persistent_misses;
+            timing.persistent_cached_bytes = texture_stats.persistent_cached_bytes;
             timing.target += ms(timing_start, timing_target_ready);
             timing.draw_setup += ms(timing_target_ready, timing_draws_ready);
             timing.record += ms(timing_draws_ready, timing_recorded);
@@ -1559,10 +1687,14 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     totals.setup_shader / n, totals.setup_fixed / n,
                     totals.setup_resources / n, totals.setup_pipeline / n);
             fprintf(stderr,
-                    "[render-timing] backend textures refs=%llu uploads=%llu %.1f MiB\n",
+                    "[render-timing] backend textures refs=%llu uploads=%llu %.1f MiB "
+                    "persistent=%llu/%llu cache=%.1f MiB\n",
                     (unsigned long long)totals.texture_references,
                     (unsigned long long)totals.texture_uploads,
-                    totals.texture_upload_bytes / (1024.0 * 1024.0));
+                    totals.texture_upload_bytes / (1024.0 * 1024.0),
+                    (unsigned long long)totals.persistent_hits,
+                    (unsigned long long)totals.persistent_misses,
+                    totals.persistent_cached_bytes / (1024.0 * 1024.0));
             const RenderMemoryPoolStats pool = render_memory_pool_stats();
             fprintf(stderr,
                     "[render-timing] memory_pool hits=%llu misses=%llu cached=%zu %.1f MiB "
@@ -1585,9 +1717,12 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
                     window.setup_shader / wn, window.setup_fixed / wn,
                     window.setup_resources / wn, window.setup_pipeline / wn);
             fprintf(stderr,
-                    "[render-window] backend textures refs=%.1f uploads=%.1f %.1f MiB\n",
+                    "[render-window] backend textures refs=%.1f uploads=%.1f %.1f MiB "
+                    "persistent=%.1f/%.1f cache=%.1f MiB\n",
                     window.texture_references / wn, window.texture_uploads / wn,
-                    window.texture_upload_bytes / (wn * 1024.0 * 1024.0));
+                    window.texture_upload_bytes / (wn * 1024.0 * 1024.0),
+                    window.persistent_hits / wn, window.persistent_misses / wn,
+                    window.persistent_cached_bytes / (1024.0 * 1024.0));
             window = {};
         }
     }

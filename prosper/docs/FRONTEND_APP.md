@@ -192,14 +192,26 @@ graphics and compute pools. Decoded texture scratch vectors are also retained ac
 are storage only, and every partial decode/read explicitly clears its unwritten tail.
 
 Within one renderer callback, repeated guest-backed texture descriptions reuse the first decoded
-pixel buffer. A bounded process-wide cache also covers guest-backed tiled `Unorm8x4` sampled textures,
-the common sprite-atlas case. Every cross-submit lookup copies and compares the complete padded tiled
-source bytes before reusing decoded pixels; changed bytes, a changed mapping extent, or an address
-reuse invalidates the entry. Live render targets, storage images, and other formats remain excluded.
-The default budget is 256 MiB; use `PROSPER_TEXTURE_DECODE_CACHE_MB=<MiB>` to change it or
+pixel buffer. A bounded process-wide cache also covers guest-backed linear and tiled `Unorm8x4`
+sampled textures, the common sprite-atlas cases. Every cross-submit lookup compares the complete guest
+source before reusing decoded pixels; the linear path compares directly against its decoded copy while
+the tiled path retains and compares the padded tiled source. Changed bytes, a changed mapping extent,
+or address reuse invalidates the entry and creates a new content-version ID. Live render targets,
+storage images, captured host backing, and other formats remain excluded. The default budget is
+256 MiB; use `PROSPER_TEXTURE_DECODE_CACHE_MB=<MiB>` to change it or
 `PROSPER_NO_TEXTURE_DECODE_CACHE=1` for an A/B run. Timing reports cross-submit `texture_cache`
 hits/misses/invalidations separately from `textures` (all texture uses) and `reused` (both local and
 persistent decodes avoided).
+
+The Vulkan backend may retain an optimal sampled image only when that exact frontend validation
+supplies a nonzero content-version ID. Cache hits skip image allocation, staging allocation, pixel
+copy, transfer commands, and upload barriers; per-draw views, swizzles, and samplers remain callback
+local. The cache is bounded to 256 MiB and 1024 allocations by default. Set
+`PROSPER_BACKEND_TEXTURE_CACHE_MB=<MiB>` to change the byte budget or
+`PROSPER_NO_BACKEND_PERSISTENT_TEXTURES=1` for a forced-upload A/B. Backend timing reports
+`persistent=hits/misses` and the current cache bytes. The frontend decoded-pixel budget and backend
+device-image budget are separate: a hot immutable atlas can occupy space in both, trading bounded
+residency for lower frame time.
 
 Graphics RDNA2-to-SPIR-V results use a process-wide bounded cache (4096 entries and 128 MiB by
 default). Its key contains the shader bytes and only the resource-table fields consumed by compilation;
