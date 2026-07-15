@@ -1,4 +1,5 @@
 #include "../src/gpu/gpu_capture.hpp"
+#include "../src/gpu/gpu_execute.hpp"
 #include "../src/gpu/rdna2_to_spirv.hpp"
 #include "../frontends/shared/live_renderer.hpp"
 
@@ -61,10 +62,12 @@ int main() {
           "replay keeps logical VA and exposes exact host backing size");
 
 #ifdef _WIN32
+    _putenv_s("PROSPER_GPU_CAPTURE", "1");
     _putenv_s("PROSPER_GPU_REPLAY_RTT_SEEDS", "1");
     _putenv_s("PROSPER_GPU_REPLAY_DS_SEEDS", "1");
     _putenv_s("PROSPER_GPU_REPLAY_EXPORT_DS", "1");
 #else
+    setenv("PROSPER_GPU_CAPTURE", "1", 1);
     setenv("PROSPER_GPU_REPLAY_RTT_SEEDS", "1", 1);
     setenv("PROSPER_GPU_REPLAY_DS_SEEDS", "1", 1);
     setenv("PROSPER_GPU_REPLAY_EXPORT_DS", "1", 1);
@@ -294,6 +297,28 @@ int main() {
         CHECK(center[0] > 0xC0 && center[1] < 0x40 && center[2] < 0x40,
               "temporal consumer samples restored host RTT pixels, not guest-memory fallback");
     }
+
+    // A retained CPU RTT is only authoritative until compute/DMA writes its guest backing. Dead
+    // Cells clears this FP16 lighting history with compute before drawing the next frame; keeping the
+    // older CPU seed defeated that clear and fed brightness back until the scene became white/yellow.
+    GpuCaptureRttSeed fp16_history;
+    fp16_history.guest_addr = 0x610000;
+    fp16_history.width = fp16_history.height = 2;
+    fp16_history.format = GpuCaptureColorFormat::Rgba16Float;
+    fp16_history.rgba.assign(2u * 2u * 8u, 0x5a);
+    CHECK(restore_gpu_replay_rtt_seeds({fp16_history}, error),
+          "replay restores a native FP16 temporal history surface");
+    GpuCaptureRttSeed retained_history;
+    CHECK(read_gpu_capture_rtt_seed(fp16_history.guest_addr, retained_history, error) &&
+          retained_history.format == GpuCaptureColorFormat::Rgba16Float,
+          "restored FP16 history is visible to the capture reader");
+    notify_guest_gpu_write(fp16_history.guest_addr + fp16_history.rgba.size(), 1);
+    CHECK(read_gpu_capture_rtt_seed(fp16_history.guest_addr, retained_history, error),
+          "guest write at the native FP16 range end does not invalidate history");
+    notify_guest_gpu_write(fp16_history.guest_addr + fp16_history.rgba.size() - 1, 1);
+    CHECK(!read_gpu_capture_rtt_seed(fp16_history.guest_addr, retained_history, error) &&
+          error == "render target is absent from live cache",
+          "overlapping guest GPU write invalidates stale CPU FP16 history");
 
     GpuCaptureDsSeed ds_seed;
     ds_seed.depth_read_base = ds_seed.depth_write_base = 0x810000;

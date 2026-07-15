@@ -58,7 +58,9 @@ possible without console keys. Dumps are user-supplied and gitignored.
   The later giant translucent Dead Cells gameplay surface was a native-format loss: a 642x362 RGBA16F lighting
   target was rendered and sampled as RGBA8, clamping HDR values before composition. Renderer-owned targets now
   preserve RGBA16F through render, readback, seeding, sampling, and persistent Vulkan caches. Capture v13 records
-  the RTT format and remains backward-compatible with v1..v12 artifacts (#773).
+  the RTT format and remains backward-compatible with v1..v12 artifacts (#773). A compute reset of that lighting
+  backing also invalidates the overlapping CPU RTT copy; retaining it had re-seeded the previous frame and driven
+  the temporal effect toward white/yellow (#780). Residual window-light banding is tracked separately in #781.
 - ✅ **Blasphemous 2 reaches first gameplay:** prelinking the title's optional FMOD core/studio
   plugins lets IL2CPP P/Invoke complete `FMODAudioBanksManager` initialization (#638/#640). The later AGC
   fault was prosper corrupting live DCB state: `+kSrjIVxKFE` is `sceAgcDcbPushMarker`, not the context
