@@ -1,5 +1,6 @@
 // test_agc_shader -- focused guards for sceAgcCreateShader's guest-visible side effects.
 #include "../src/hle/dispatch.hpp"
+#include "../src/gpu/gpu_execute.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -97,6 +98,36 @@ int main() {
     CHECK(dst == &good, "valid shader writes *dst");
     CHECK(good.code == reinterpret_cast<const void*>(0x2000ull), "valid shader stores code pointer");
     CHECK(prosper_agc_shader_count() == count0 + 1, "valid shader enters registry");
+
+    // #719: UE4 pixel shaders use buffer_load_format_* for structured/material data too. The
+    // dynamic V# fold is stage-agnostic; build_stage_table must retain its result for PS instead of
+    // discarding it under the old "PS has no vertex fetch" assumption. Otherwise the recompiler
+    // silently accesses its legacy binding 2, which the PS table does not provide.
+    const uint32_t pixel_buffer_fetch[] = {
+        0xBE8803FFu, 0x00020000u,   // s_mov_b32 s8, 0x20000 (V# base low)
+        0xBE8903FFu, 0x00100000u,   // s_mov_b32 s9, 0x00100000 (stride 16)
+        0xBE8A03C0u,                // s_mov_b32 s10, 64 records
+        0xBE8B0380u,                // s_mov_b32 s11, 0 (format defaults conservatively)
+        0xE0002000u, 0x80020100u,   // pc=6: buffer_load_format_x v1, v0, s[8:11], 0 idxen
+        0xBF810000u,                // s_endpgm
+    };
+    Shader pixel{};
+    pixel.file_header = 0x34333231u;
+    pixel.version = 0x18u;
+    pixel.shader_size = sizeof(pixel_buffer_fetch);
+    pixel.type = 1;
+    dst = nullptr;
+    rc = create_shader(reinterpret_cast<uint64_t>(&dst), reinterpret_cast<uint64_t>(&pixel),
+                       reinterpret_cast<uint64_t>(pixel_buffer_fetch), 0, 0, 0);
+    CHECK(rc == 0 && dst == &pixel, "pixel buffer-fetch shader enters the AGC registry");
+    prosper::gpu::GpuState empty_state;
+    auto pixel_table = prosper::gpu::build_stage_table(
+        empty_state, reinterpret_cast<uint64_t>(pixel_buffer_fetch), true);
+    const prosper::gpu::ShaderResource* pixel_buffer = pixel_table
+        ? pixel_table->by_fetch_pc(6) : nullptr;
+    CHECK(pixel_buffer && pixel_buffer->cls == prosper::gpu::ResourceClass::VertexBuffer &&
+          pixel_buffer->gpu_addr == 0x20000u && pixel_buffer->stride == 16u,
+          "pixel-stage buffer_load_format keeps its exact dynamic V# resource");
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
