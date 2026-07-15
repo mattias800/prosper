@@ -352,6 +352,12 @@ modes with `PROSPER_RTTLOG_MIN_SUBMIT` and `PROSPER_RTTLOG_MAX_SUBMIT`. The full
 pixels and dropped one Dead Cells title loop from about 20 FPS to 13-14 FPS, causing its wall-clock input route
 to miss the menu; use the lightweight mode for performance attribution.
 
+Submit ordinals also varied enough across fresh runs that preselected ranges repeatedly missed the transition.
+`PROSPER_RTT_TIMING_MIN_DRAWS=N` therefore buffers lightweight target records until the final graphics span and
+emits the complete submit only when its total backend draw count reaches N. A value of 300 selects the current
+357-373-draw Dead Cells workload while producing no output for the earlier 54-56-draw loop. The buffer contains
+only target metadata and timing scalars; rendered pixels and backend execution are unchanged.
+
 A 180-second native Windows fresh-save Dead Cells run reached the post-parse workload with 373 draws, eight
 dispatches, and four graphics spans. Those spans rendered ten target groups per submit. The aligned backend
 window was:
