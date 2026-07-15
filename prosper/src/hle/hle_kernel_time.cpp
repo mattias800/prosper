@@ -53,6 +53,13 @@ namespace {
         uint64_t anchor_flip = 0;
         uint64_t last_ns = 0;
     };
+    // #707/PR #753 round 3: the corruptor is a one-shot ~288-byte ZEROING whose observed span is
+    // [g_det_clock .. g_apr_mx+64) on macOS — but nothing below g_det_clock was watched, so the
+    // true START is unknown. Mutex-typed decoys are the only objects the macOS linker will place
+    // below g_det_clock inside the __DATA mutex cluster (byte arrays get grouped after it), so
+    // these six extend the sig-watched window 384 bytes downward. Never locked; layout ballast.
+    std::mutex g_eq_decoy_lo0, g_eq_decoy_lo1, g_eq_decoy_lo2,
+               g_eq_decoy_lo3, g_eq_decoy_lo4, g_eq_decoy_lo5;
     DetClockState g_det_clock;
 
     uint64_t det_clock_fps() {
@@ -488,7 +495,13 @@ namespace {
         constexpr int kOff = 16, kLen = 8;    // glibc __kind/__spins: never written for a plain mutex
 #endif
         struct Target { const char* name; volatile uint8_t* p; uint8_t base[16]; };
-        static Target t[4] = {
+        static Target t[10] = {
+            { "g_eq_decoy_lo0",    (volatile uint8_t*)&g_eq_decoy_lo0, {} },
+            { "g_eq_decoy_lo1",    (volatile uint8_t*)&g_eq_decoy_lo1, {} },
+            { "g_eq_decoy_lo2",    (volatile uint8_t*)&g_eq_decoy_lo2, {} },
+            { "g_eq_decoy_lo3",    (volatile uint8_t*)&g_eq_decoy_lo3, {} },
+            { "g_eq_decoy_lo4",    (volatile uint8_t*)&g_eq_decoy_lo4, {} },
+            { "g_eq_decoy_lo5",    (volatile uint8_t*)&g_eq_decoy_lo5, {} },
             { "g_eq_decoy",        (volatile uint8_t*)&g_eq_decoy,  {} },
             { "g_eq_mx",           (volatile uint8_t*)&g_eq_mx,     {} },
             { "g_det_clock.mutex", (volatile uint8_t*)&g_det_clock, {} },
