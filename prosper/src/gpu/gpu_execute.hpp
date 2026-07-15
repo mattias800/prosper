@@ -267,6 +267,23 @@ using GuestGpuWriteObserver = std::function<void(uint64_t addr, uint64_t size)>;
 void set_guest_gpu_write_observer(GuestGpuWriteObserver observer);
 void notify_guest_gpu_write(uint64_t addr, uint64_t size);
 
+// A validation snapshot is meaningful only inside one synchronous execute_ordered_items call.
+// It lets a backend prove that no retained GPU operation wrote a resource between graphics spans;
+// CPU writes and later submits deliberately remain outside this proof and must use exact validation.
+constexpr size_t kGuestGpuWriteJournalCapacity = 4096;
+struct GuestGpuWriteSnapshot {
+    uint64_t submit_serial = 0;
+    size_t write_count = 0;
+};
+enum class GuestGpuWriteQuery {
+    Unchanged,
+    Overlap,
+    Unknown,
+};
+GuestGpuWriteSnapshot guest_gpu_write_snapshot();
+GuestGpuWriteQuery guest_gpu_writes_since(const GuestGpuWriteSnapshot& snapshot,
+                                           uint64_t addr, uint64_t size);
+
 // Register the synchronous live compute backend. execute_compute_dispatches realizes every retained
 // dispatch from its state snapshot and invokes the backend in stream order.
 void set_submit_compute(LiveComputeFn fn);

@@ -101,6 +101,7 @@ struct PersistentDecodedTexture {
     bool narrow = false;
     uint64_t last_use = 0;
     uint64_t persistent_id = 0;
+    prosper::gpu::GuestGpuWriteSnapshot validation_snapshot;
 
     size_t bytes() const { return source_prefix.size() + pixels.size(); }
 };
@@ -211,6 +212,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 double total_ms = 0, build_resources_ms = 0, backend_ms = 0, output_copy_ms = 0;
                 uint64_t textures = 0, texture_reuses = 0, buffers = 0;
                 uint64_t persistent_hits = 0, persistent_misses = 0, persistent_invalidations = 0;
+                uint64_t persistent_submit_reuses = 0, persistent_validations = 0;
+                uint64_t persistent_validation_bytes = 0;
                 uint64_t texture_bytes = 0, buffer_bytes = 0;
                 double texture_ms = 0, buffer_ms = 0;
             };
@@ -366,6 +369,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     bool resource_rtt_hit = false;
                     bool resource_local_reuse = false;
                     bool resource_persistent_hit = false;
+                    bool resource_persistent_submit_reuse = false;
                     bool resource_persistent_miss = false;
                     bool resource_persistent_invalidation = false;
                     prosper::test::FrameResource fr; fr.binding = r.binding; fr.set = set;
@@ -429,27 +433,62 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             auto cached = persistent_decoded_textures.find(decode_key);
                             if (cached != persistent_decoded_textures.end() &&
                                 cached->second.source_size == persistent_source_size) {
+                                auto validate_exact = [&] {
+                                    bool matches = false;
+                                    size_t validated_bytes = 0;
+                                    if (cached->second.source_matches_pixels) {
+                                        matches = safe_equal(
+                                            cached->second.pixels.data(), r.gpu_addr,
+                                            persistent_source_size, validated_bytes) &&
+                                            validated_bytes == cached->second.source_prefix_size;
+                                    } else {
+                                        persistent_validation_scratch.resize(persistent_source_size);
+                                        validated_bytes = copy_resource(
+                                            persistent_validation_scratch.data(), r.gpu_addr,
+                                            persistent_source_size);
+                                        matches =
+                                            validated_bytes == cached->second.source_prefix_size &&
+                                            validated_bytes == cached->second.source_prefix.size() &&
+                                            (validated_bytes == 0 || !std::memcmp(
+                                                persistent_validation_scratch.data(),
+                                                cached->second.source_prefix.data(), validated_bytes));
+                                    }
+                                    if (timing_enabled) {
+                                        pending_timing.persistent_validations++;
+                                        pending_timing.persistent_validation_bytes += validated_bytes;
+                                    }
+                                    return matches;
+                                };
+                                static const bool submit_reuse_enabled =
+                                    !getenv("PROSPER_NO_SUBMIT_TEXTURE_VALIDATION_REUSE");
+                                static const bool audit_submit_reuse =
+                                    getenv("PROSPER_AUDIT_SUBMIT_TEXTURE_VALIDATION_REUSE") != nullptr;
+                                const bool submit_unchanged = submit_reuse_enabled &&
+                                    prosper::gpu::guest_gpu_writes_since(
+                                        cached->second.validation_snapshot, r.gpu_addr,
+                                        persistent_source_size) ==
+                                        prosper::gpu::GuestGpuWriteQuery::Unchanged;
                                 bool content_matches = false;
-                                if (cached->second.source_matches_pixels) {
-                                    size_t compared = 0;
-                                    content_matches = safe_equal(
-                                        cached->second.pixels.data(), r.gpu_addr,
-                                        persistent_source_size, compared) &&
-                                        compared == cached->second.source_prefix_size;
+                                if (submit_unchanged) {
+                                    content_matches = audit_submit_reuse ? validate_exact() : true;
+                                    if (!content_matches) {
+                                        fprintf(stderr,
+                                                "[render] in-submit texture validation audit failed "
+                                                "addr=0x%llx bytes=%zu\n",
+                                                (unsigned long long)r.gpu_addr,
+                                                persistent_source_size);
+                                    } else {
+                                        resource_persistent_submit_reuse = true;
+                                        if (timing_enabled)
+                                            pending_timing.persistent_submit_reuses++;
+                                    }
                                 } else {
-                                    persistent_validation_scratch.resize(persistent_source_size);
-                                    const size_t got = copy_resource(
-                                        persistent_validation_scratch.data(), r.gpu_addr,
-                                        persistent_source_size);
-                                    content_matches =
-                                        got == cached->second.source_prefix_size &&
-                                        got == cached->second.source_prefix.size() &&
-                                        (got == 0 || !std::memcmp(
-                                            persistent_validation_scratch.data(),
-                                            cached->second.source_prefix.data(), got));
+                                    content_matches = validate_exact();
                                 }
                                 if (content_matches) {
                                     cached->second.last_use = decode_generation;
+                                    cached->second.validation_snapshot =
+                                        prosper::gpu::guest_gpu_write_snapshot();
                                     persistent_reuse = {cached->second.pixels.data(),
                                                         cached->second.output_height,
                                                         cached->second.narrow,
@@ -980,6 +1019,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 cached.persistent_id = ++persistent_texture_id;
                                 if (!cached.persistent_id)
                                     cached.persistent_id = ++persistent_texture_id;
+                                cached.validation_snapshot =
+                                    prosper::gpu::guest_gpu_write_snapshot();
                                 auto [inserted, ok] = persistent_decoded_textures.emplace(
                                     decode_key, std::move(cached));
                                 if (ok) {
@@ -1056,9 +1097,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                     detail_lines++ < 250) {
                                     const char* cache_state = resource_rtt_hit ? "rtt" :
                                         (resource_local_reuse ? "local" :
+                                        (resource_persistent_submit_reuse ? "persistent-submit" :
                                         (resource_persistent_hit ? "persistent-hit" :
                                         (resource_persistent_invalidation ? "persistent-invalid" :
-                                        (resource_persistent_miss ? "persistent-miss" : "uncached"))));
+                                        (resource_persistent_miss ? "persistent-miss" : "uncached")))));
                                     fprintf(stderr,
                                             "[render-timing] texture addr=0x%llx %ux%u out=%ux%u "
                                             "fmt=%u comps=%u tile=%u cache=%s id=%llu %.2f ms\n",
@@ -1590,6 +1632,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     double total_ms = 0, build_resources_ms = 0, backend_ms = 0, output_copy_ms = 0;
                     uint64_t textures = 0, texture_reuses = 0, buffers = 0;
                     uint64_t persistent_hits = 0, persistent_misses = 0, persistent_invalidations = 0;
+                    uint64_t persistent_submit_reuses = 0, persistent_validations = 0;
+                    uint64_t persistent_validation_bytes = 0;
                     uint64_t texture_bytes = 0, buffer_bytes = 0;
                     double texture_ms = 0, buffer_ms = 0;
                 };
@@ -1607,6 +1651,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     timing.persistent_hits += pending_timing.persistent_hits;
                     timing.persistent_misses += pending_timing.persistent_misses;
                     timing.persistent_invalidations += pending_timing.persistent_invalidations;
+                    timing.persistent_submit_reuses += pending_timing.persistent_submit_reuses;
+                    timing.persistent_validations += pending_timing.persistent_validations;
+                    timing.persistent_validation_bytes += pending_timing.persistent_validation_bytes;
                     timing.buffers += pending_timing.buffers;
                     timing.texture_bytes += pending_timing.texture_bytes;
                     timing.buffer_bytes += pending_timing.buffer_bytes;
@@ -1634,10 +1681,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             (unsigned long long)totals.buffers,
                             totals.buffer_bytes / (1024.0 * 1024.0), totals.buffer_ms / nsub);
                     fprintf(stderr,
-                            "[render-timing] texture_cache hits=%llu misses=%llu invalid=%llu entries=%zu %.1f MiB\n",
+                            "[render-timing] texture_cache hits=%llu submit_reuse=%llu misses=%llu "
+                            "invalid=%llu validations=%llu %.1f GiB entries=%zu %.1f MiB\n",
                             (unsigned long long)totals.persistent_hits,
+                            (unsigned long long)totals.persistent_submit_reuses,
                             (unsigned long long)totals.persistent_misses,
                             (unsigned long long)totals.persistent_invalidations,
+                            (unsigned long long)totals.persistent_validations,
+                            totals.persistent_validation_bytes / (1024.0 * 1024.0 * 1024.0),
                             persistent_decoded_textures.size(),
                             persistent_decoded_texture_bytes / (1024.0 * 1024.0));
                     size_t rtt_bytes = 0;
@@ -1671,9 +1722,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             window.buffers / wn, window.buffer_bytes / (wn * 1024.0 * 1024.0),
                             window.buffer_ms / wn);
                     fprintf(stderr,
-                            "[render-window] texture_cache hits=%.1f misses=%.1f invalid=%.1f\n",
-                            window.persistent_hits / wn, window.persistent_misses / wn,
-                            window.persistent_invalidations / wn);
+                            "[render-window] texture_cache hits=%.1f submit_reuse=%.1f misses=%.1f "
+                            "invalid=%.1f validations=%.1f %.1f MiB\n",
+                            window.persistent_hits / wn, window.persistent_submit_reuses / wn,
+                            window.persistent_misses / wn, window.persistent_invalidations / wn,
+                            window.persistent_validations / wn,
+                            window.persistent_validation_bytes / (wn * 1024.0 * 1024.0));
                     window = {};
                 }
             }
