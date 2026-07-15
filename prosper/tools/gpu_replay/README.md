@@ -70,6 +70,8 @@ expected hash. `--allow-mismatch` is for an intentional differential such as `--
 ./build-linux/gpu_replay --through-operation 52 /tmp/submit.prgcap /tmp/prefix.bmp
 ./build-linux/gpu_replay --warmup-repeats 2 /tmp/submit.prgcap /tmp/converged.bmp
 ./build-linux/gpu_replay --dump-resource 18:ps:34 /tmp/texture.bin /tmp/submit.prgcap
+./build-linux/gpu_replay --dump-rtt-seed 0x7f9f504b0000 /tmp/history.bmp \
+  --inspect-only /tmp/submit.prgcap
 ./build-linux/gpu_replay --dump-shader 18:fs /tmp/fragment.spv /tmp/submit.prgcap
 ./build-linux/gpu_replay --dump-compute 0 /tmp/compute.spv /tmp/submit.prgcap
 ./build-linux/gpu_replay --dump-compute-resource 0:2 /tmp/storage.bin /tmp/submit.prgcap
@@ -102,6 +104,19 @@ Compute selectors use the realized compute index printed by `--inspect-only`. Th
 the exact specialized SPIR-V executed by replay. For a long live run, `PROSPER_COMPUTELOG_CODE=0x...` and
 `PROSPER_COMPUTELOG_SIZE=N` restrict before/after hash diagnostics to dispatches matching the configured
 program address and storage-buffer byte size. Either filter may be used alone.
+
+`--dump-rtt-seed ADDR PATH` writes one serialized temporal color surface as an inspection BMP. RGBA8
+seeds retain their bytes; RGBA16F seeds are clamped to 0..1 and converted to RGBA8 for viewing. The address
+is the `guest_addr` printed by `--inspect-only`. This exposes the input to operation zero, not the surface after
+the selected submit executes, and the inspection conversion is not a pixel oracle for HDR values.
+
+Live runs can narrow intermediate-target dumps with
+`PROSPER_DUMP_RTGROUPS=<min-nonzero-bytes> PROSPER_DUMP_RTGROUPS_ADDR=0x...`; only a target whose guest base
+matches the optional address filter is written. A sampled-texture filter A/B uses
+`PROSPER_TESTTEX_FILTER=linear|point` together with `PROSPER_TESTTEX_DRAW=N` and/or
+`PROSPER_TESTTEX_BINDING=B`. It changes only the matching descriptor's minification and magnification filters.
+These environment variables are localization probes, not fixes, and their output must not replace an unmodified
+regression oracle.
 
 `--draw` uses realized draw indices, while graphs use mixed semantic operation indices. They are not
 interchangeable when dispatches or unrealized operations are present. Replay restores serialized render-target

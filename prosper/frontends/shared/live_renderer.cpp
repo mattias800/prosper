@@ -1335,6 +1335,21 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // Carry the decoded S# sampler state (filter/wrap/mip) so the pipeline samples the
                         // way the game asked instead of a fixed LINEAR/clamp sampler (#<sampler-fix>).
                         fr.mag_filter = r.mag_filter; fr.min_filter = r.min_filter; fr.mip_filter = r.mip_filter;
+                        // Draw/binding-scoped sampler A/B. This shares TESTTEX's selectors but leaves
+                        // the sampled pixels intact, isolating descriptor filtering from texture content.
+                        const char* test_filter = getenv("PROSPER_TESTTEX_FILTER");
+                        const char* test_filter_binding = getenv("PROSPER_TESTTEX_BINDING");
+                        const char* test_filter_draw = getenv("PROSPER_TESTTEX_DRAW");
+                        const bool filter_valid = test_filter &&
+                            (!strcmp(test_filter, "linear") || !strcmp(test_filter, "point"));
+                        if (filter_valid &&
+                            (!test_filter_binding ||
+                             strtoul(test_filter_binding, nullptr, 0) == r.binding) &&
+                            (!test_filter_draw ||
+                             strtoull(test_filter_draw, nullptr, 0) == draw.draw_index)) {
+                            const uint32_t filter = !strcmp(test_filter, "linear") ? 1u : 0u;
+                            fr.mag_filter = fr.min_filter = filter;
+                        }
                         fr.addr_uvw[0] = r.addr_uvw[0]; fr.addr_uvw[1] = r.addr_uvw[1]; fr.addr_uvw[2] = r.addr_uvw[2];
                         // Remaining S# sampler fields (#262): border color + LOD clamp/bias (applied where
                         // valid; the decode-only compare/unnorm stay on ShaderResource).
@@ -1971,9 +1986,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     // PROSPER_DUMP_RTGROUPS=<min-nonzero-bytes>: dump each per-target group's rendered
                     // pixels (rtgrp_<base>_<frame>.bmp in PROSPER_FRAME_DIR) — to inspect an intermediate
                     // pass (e.g. the UI/banner RT) instead of only the presented composite. Diagnostic.
+                    // PROSPER_DUMP_RTGROUPS_ADDR optionally limits a long replay to one target.
                     if (const char* rg = getenv("PROSPER_DUMP_RTGROUPS"); rg && !rendered_pixels.empty()) {
                         size_t nz = 0; for (uint8_t b : rendered_pixels) nz += (b != 0);
-                        if (nz >= (size_t)atol(rg)) {
+                        const char* address_filter = getenv("PROSPER_DUMP_RTGROUPS_ADDR");
+                        const uint64_t wanted_base = address_filter && *address_filter
+                            ? strtoull(address_filter, nullptr, 0) : 0;
+                        if (nz >= (size_t)atol(rg) && (!wanted_base || base == wanted_base)) {
                             const std::vector<uint8_t> inspected = inspection_rgba8(
                                 rendered_pixels, gw, gh, pass_format);
                             const char* dd = getenv("PROSPER_FRAME_DIR");

@@ -213,6 +213,10 @@ copy as a seed and brightness fed back toward white/yellow. Guest GPU writes now
 entries using their native byte width as well as invalidating GPU targets. Live user validation reports stable,
 artifact-free composition apart from separately tracked window-light banding (#781). The corrected 77-submit
 source and standalone capsule are byte-identical at `13b4ccdfa15b1f4d`.
+The #781 investigation localizes that residual pattern to the additive window-light visibility pass and rejects
+depth, history-alpha, simple sampler-filter, and perspective-interpolation explanations. It remains open and
+deprioritized; see `docs/DEAD_CELLS_STATUS.md` before repeating live experiments. Successful raw RDNA2/SPIR-V
+pairs can now be captured with `PROSPER_SHADER_DUMP_SUCCESS=DIR` for offline inspection.
 
 `--bundle-final-capsule` snapshots both color RTT state and exact valid planes from persistent Vulkan
 depth/stencil images into capture v8 (#569). Capture v8 reads v1-v7 artifacts; pre-v7 failed-operation diagnostics

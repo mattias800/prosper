@@ -1,6 +1,8 @@
 #include "../src/gpu/gpu_execute.hpp"
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
+#include <filesystem>
 #include <iterator>
 #include <vector>
 
@@ -11,6 +13,24 @@ static int failures = 0;
     if (condition) std::printf("  [ok]   %s\n", message); \
     else { std::printf("  [FAIL] %s\n", message); ++failures; } \
 } while (0)
+
+static void set_test_env(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) setenv(name, value, 1); else unsetenv(name);
+#endif
+}
+
+static size_t count_extension(const std::filesystem::path& directory, const char* extension) {
+    std::error_code ec;
+    size_t count = 0;
+    for (std::filesystem::directory_iterator it(directory, ec), end; !ec && it != end;
+         it.increment(ec)) {
+        if (it->is_regular_file(ec) && it->path().extension() == extension) ++count;
+    }
+    return ec ? 0 : count;
+}
 
 // Fullscreen triangle and solid green shaders assembled for gfx1030. These are also used by the
 // end-to-end GPU executor tests, but this test needs no Vulkan device.
@@ -43,6 +63,11 @@ int main() {
     table.resources.push_back(resource);
 
     const auto direct_vs = recompile_vertex(kVs, std::size(kVs), &table);
+    const std::filesystem::path dump_directory =
+        std::filesystem::temp_directory_path() / "prosper-shader-dump-test";
+    std::error_code dump_ec;
+    std::filesystem::remove_all(dump_directory, dump_ec);
+    set_test_env("PROSPER_SHADER_DUMP_SUCCESS", dump_directory.string().c_str());
     uint64_t first_identity = 0;
     const auto cached_vs = recompile_graphics_shader_cached(
         ShaderProgramStage::Vertex, kVs, std::size(kVs), &table, nullptr, nullptr,
@@ -52,6 +77,9 @@ int main() {
     auto stats = shader_recompile_cache_stats();
     CHECK(stats.misses == 1 && stats.hits == 0 && stats.entries == 1,
           "first shader realization records one cache miss");
+    CHECK(count_extension(dump_directory, ".bin") == 1 &&
+              count_extension(dump_directory, ".spv") == 1,
+          "successful shader diagnostics create one raw/SPIR-V pair");
 
     uint64_t repeated_identity = 0;
     const auto repeated_vs = recompile_graphics_shader_cached(
@@ -62,6 +90,11 @@ int main() {
           "identical code and descriptor semantics hit the cache");
     CHECK(first_identity != 0 && repeated_identity == first_identity,
           "shader cache hits preserve a non-zero compiled-shader identity");
+    CHECK(count_extension(dump_directory, ".bin") == 1 &&
+              count_extension(dump_directory, ".spv") == 1,
+          "successful shader diagnostics deduplicate cache hits");
+    set_test_env("PROSPER_SHADER_DUMP_SUCCESS", nullptr);
+    std::filesystem::remove_all(dump_directory, dump_ec);
 
     // These fields are consumed by the runtime backend, not by the recompiler. Changing them must
     // reuse SPIR-V while each DrawItem continues to carry the new table to descriptor upload.
