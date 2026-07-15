@@ -364,6 +364,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     const auto resource_timing_start = timing_enabled
                         ? RenderClock::now() : RenderClock::time_point{};
                     bool resource_rtt_hit = false;
+                    bool resource_local_reuse = false;
+                    bool resource_persistent_hit = false;
+                    bool resource_persistent_miss = false;
+                    bool resource_persistent_invalidation = false;
                     prosper::test::FrameResource fr; fr.binding = r.binding; fr.set = set;
                     // Captured replays preserve the logical guest address for RT identity but provide
                     // owned bytes here. Production resources leave host_data null and use guest memory.
@@ -420,6 +424,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         DecodedTexture persistent_reuse;
                         const DecodedTexture* decoded_reuse = reused != decoded_textures.end()
                             ? &reused->second : nullptr;
+                        resource_local_reuse = decoded_reuse != nullptr;
                         if (!decoded_reuse && persistent_cache_eligible) {
                             auto cached = persistent_decoded_textures.find(decode_key);
                             if (cached != persistent_decoded_textures.end() &&
@@ -450,11 +455,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                                         cached->second.narrow,
                                                         cached->second.persistent_id};
                                     decoded_reuse = &persistent_reuse;
+                                    resource_persistent_hit = true;
                                     if (timing_enabled) pending_timing.persistent_hits++;
                                 } else if (timing_enabled) {
+                                    resource_persistent_invalidation = true;
                                     pending_timing.persistent_invalidations++;
                                 }
                             } else if (timing_enabled) {
+                                resource_persistent_miss = true;
                                 pending_timing.persistent_misses++;
                             }
                         }
@@ -962,7 +970,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                     cached.source_prefix.assign(
                                         persistent_validation_scratch.begin(),
                                         persistent_validation_scratch.begin() + source_prefix_size);
-                                cached.pixels = texture_pixels;
+                                // A successful persistent insertion owns the decoded allocation from
+                                // now on. Moving it avoids retaining the same large atlas in both the
+                                // process-wide cache and a reusable scratch slot.
+                                cached.pixels = std::move(texture_pixels);
                                 cached.output_height = fr.th;
                                 cached.narrow = narrow_done;
                                 cached.last_use = decode_generation;
@@ -1039,15 +1050,22 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 ? strtoull(getenv("PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT"), nullptr, 0) : 0;
                             if (const char* mode = getenv("PROSPER_RENDER_TIMING");
                                 mode && strcmp(mode, "detail") == 0 &&
-                                static_cast<uint64_t>(g_this_submit) >= detail_min_submit && elapsed >= 0.5) {
+                                static_cast<uint64_t>(g_this_submit) >= detail_min_submit) {
                                 static uint64_t detail_lines = 0;
-                                if (detail_lines++ < 250) {
+                                if ((elapsed >= 0.5 || resource_persistent_invalidation) &&
+                                    detail_lines++ < 250) {
+                                    const char* cache_state = resource_rtt_hit ? "rtt" :
+                                        (resource_local_reuse ? "local" :
+                                        (resource_persistent_hit ? "persistent-hit" :
+                                        (resource_persistent_invalidation ? "persistent-invalid" :
+                                        (resource_persistent_miss ? "persistent-miss" : "uncached"))));
                                     fprintf(stderr,
                                             "[render-timing] texture addr=0x%llx %ux%u out=%ux%u "
-                                            "fmt=%u comps=%u tile=%u rtt=%d %.2f ms\n",
+                                            "fmt=%u comps=%u tile=%u cache=%s id=%llu %.2f ms\n",
                                             (unsigned long long)r.gpu_addr, r.width, r.height,
                                             fr.tw, fr.th, (unsigned)r.format, r.num_components,
-                                            r.tile_mode, (int)resource_rtt_hit, elapsed);
+                                            r.tile_mode, cache_state,
+                                            (unsigned long long)fr.persistent_texture_id, elapsed);
                                 }
                             }
                         } else {
@@ -1622,6 +1640,20 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             (unsigned long long)totals.persistent_invalidations,
                             persistent_decoded_textures.size(),
                             persistent_decoded_texture_bytes / (1024.0 * 1024.0));
+                    size_t rtt_bytes = 0;
+                    for (const auto& [addr, surface] : g_rtt) {
+                        (void)addr;
+                        if (surface.rgba) rtt_bytes += surface.rgba->size();
+                    }
+                    size_t scratch_bytes = 0;
+                    for (const auto& scratch : texstore)
+                        scratch_bytes += scratch.capacity();
+                    fprintf(stderr,
+                            "[render-timing] host_cache rtt=%zu %.1f MiB decode_scratch=%zu %.1f MiB "
+                            "validation=%.1f MiB\n",
+                            g_rtt.size(), rtt_bytes / (1024.0 * 1024.0),
+                            texstore.size(), scratch_bytes / (1024.0 * 1024.0),
+                            persistent_validation_scratch.capacity() / (1024.0 * 1024.0));
                     const double wn = static_cast<double>(window.submits);
                     const double window_other = window.total_ms - window.build_resources_ms -
                                                 window.backend_ms - window.output_copy_ms;

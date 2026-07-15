@@ -181,7 +181,10 @@ lines show only the latest 25 submits/calls so a scene transition is immediately
 window also reports graphics-shader cache hits, misses, bypasses, and actual miss compilation time.
 Use `PROSPER_RENDER_TIMING=detail` to additionally print individual texture decodes taking at least
 0.5 ms (capped at 250 lines). Set `PROSPER_RENDER_TIMING_DETAIL_MIN_SUBMIT=N` to begin those detail
-lines at renderer submit N, so boot textures do not consume the cap before the scene under study.
+lines at renderer submit N, so boot textures do not consume the cap before the scene under study. Each
+line identifies local reuse, persistent hit/miss/invalidation, RTT sourcing, or an uncached decode. The
+aggregate output also reports retained RTT bytes, decode-scratch capacity, and validation-scratch capacity;
+use those figures before treating a process-memory increase as an unbounded cache.
 The instrumentation does not take clock samples when the variable is unset. This is the first tool
 to use when the window presents correctly but a title is not interactive; do not infer a GPU
 bottleneck from low FPS without the stage breakdown.

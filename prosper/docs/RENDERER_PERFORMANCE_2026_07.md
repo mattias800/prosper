@@ -276,6 +276,34 @@ compute pools remained bounded at 355 MiB and 47 MiB. The workload nevertheless 
 persistent textures per submit window and performs repeated uploads, so resource versioning and residency
 are the next memory/performance investigation rather than further publication lookup tuning.
 
+## Persistent decode ownership and cache accounting (2026-07-15)
+
+The persistent decoded-texture cache previously copied each newly decoded image out of a reusable scratch
+vector. The scratch vector retained its allocation even though all future uses referenced the persistent
+copy. Successful cache insertion now moves that allocation into the cache. Uncached and mutable resources
+still retain reusable scratch storage so steady rendering does not allocate every frame.
+
+Native Windows cache accounting shows the result:
+
+| Measurement | Copy insertion | Ownership transfer |
+|---|---:|---:|
+| Loading-loop decode scratch | 141-160 MiB | 0 MiB |
+| Post-parse decode scratch | 160 MiB | 49.8 MiB |
+| Loading-loop private memory | about 1.58 GiB | about 1.42 GiB |
+| Post-parse private memory | about 1.89 GiB | about 1.84 GiB |
+
+The smaller post-parse process delta includes variation in the workload's other bounded caches: the later
+run held 27 decoded textures, 15 RTT surfaces, a 359 MiB graphics pool, and a 49 MiB compute pool. Its final
+45 seconds stayed near 1.84 GiB private and 3.82 GiB working set. RTT retention is not the leak hypothesis:
+it stabilized at 101.8 MiB. `PROSPER_RENDER_TIMING=1` now reports RTT, decode-scratch, and validation-scratch
+storage so later titles can distinguish cache growth from an unbounded process.
+
+Detailed timing also identifies why resource construction remains expensive. Exact validation of unchanged
+linear atlases costs about 7.3 ms for one 4096x4096 image, 1.8-2.1 ms for one 2048x2048 image, and about 1 ms
+for one 1024x2048 image on every graphics span. `PROSPER_RENDER_TIMING=detail` labels each slow texture as a
+local reuse, persistent hit/miss/invalidation, RTT source, or uncached decode. Replacing exact validation
+requires write-aware invalidation; probabilistic sampling is not an acceptable correctness shortcut.
+
 ## Current frame budget
 
 After shared publication, the Dead Cells post-parse loading workload is the most useful current budget:
