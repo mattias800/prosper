@@ -74,6 +74,9 @@ expected hash. `--allow-mismatch` is for an intentional differential such as `--
   --inspect-only /tmp/submit.prgcap
 ./build-linux/gpu_replay --dump-shader 18:fs /tmp/fragment.spv /tmp/submit.prgcap
 ./build-linux/gpu_replay --dump-compute 0 /tmp/compute.spv /tmp/submit.prgcap
+./build-linux/gpu_replay --compute-only 0 /tmp/submit.prgcap
+./build-linux/gpu_replay --compute-only 0 --override-compute-spv 0 /tmp/reduced.spv \
+  /tmp/submit.prgcap
 ./build-linux/gpu_replay --dump-compute-resource 0:2 /tmp/storage.bin /tmp/submit.prgcap
 ./build-linux/gpu_replay --dump-failed-shader 0:1 /tmp/failed-fragment.bin /tmp/submit.prgcap
 ```
@@ -101,7 +104,19 @@ seeds. `--inspect-only` prints every seed's identity, validity, byte counts, and
 
 Compute selectors use the realized compute index printed by `--inspect-only`. The resource selector is
 `COMPUTE:BINDING`; it writes the captured pre-dispatch storage-buffer bytes, while `--dump-compute` writes
-the exact specialized SPIR-V executed by replay. For a long live run, `PROSPER_COMPUTELOG_CODE=0x...` and
+the exact specialized SPIR-V executed by replay. `--compute-only N` retains just that realized dispatch and
+its captured resources, making a driver or recompiler failure deterministic without running unrelated draws
+or dispatches. `--override-compute-spv N PATH` replaces that dispatch's module after capture materialization;
+the input must be a 20-byte-to-16-MiB SPIR-V binary with the standard magic word. Overrides intentionally
+disable the capture pixel oracle and are for differential diagnosis, not correctness evidence.
+
+Tiled 1D/2D storage writeback remains disabled by default. Setting
+`PROSPER_COMPUTE_TILED_2D_STORAGE=1` enables the existing tiled upload/writeback path for an explicit replay
+A/B. This can expose host Vulkan compiler or execution failures, so use it only with a bounded capsule and
+the compute-only selector. With `PROSPER_COMPUTELOG=1`, replay identifies whether failure occurred while
+creating the pipeline, submitting it, or waiting for the dispatch.
+
+For a long live run, `PROSPER_COMPUTELOG_CODE=0x...` and
 `PROSPER_COMPUTELOG_SIZE=N` restrict before/after hash diagnostics to dispatches matching the configured
 program address and storage-buffer byte size. Either filter may be used alone.
 

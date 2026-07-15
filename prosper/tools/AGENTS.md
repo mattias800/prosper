@@ -202,6 +202,11 @@ external numeric/image inspection without dereferencing the original guest addre
 `--dump-shader DRAW:vs|fs PATH` writes the captured SPIR-V module for validation/disassembly.
 `--dump-compute N PATH` writes one realized compute SPIR-V module, and
 `--dump-compute-resource N:BINDING PATH` writes its exact pre-dispatch storage-buffer bytes.
+`--compute-only N` executes one realized dispatch in isolation; combine it with
+`--override-compute-spv N PATH` to minimize or hardware-A/B a captured shader without changing its exact
+resource descriptors. The override disables the pixel oracle. Tiled 1D/2D compute storage stays skipped
+unless `PROSPER_COMPUTE_TILED_2D_STORAGE=1` is explicitly set for a bounded diagnostic replay;
+`PROSPER_COMPUTELOG=1` then separates pipeline creation, submission, and dispatch-wait failures.
 
 For compute producer provenance, `PROSPER_COMPUTELOG=1` records each `DispatchDirect` packet's
 threadgroup counts, compute-program address/hash, and AGC-resolved resources from the register state at
