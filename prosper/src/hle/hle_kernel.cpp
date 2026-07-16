@@ -49,7 +49,14 @@
 
 namespace prosper {
 namespace {
-    bool sclog() {
+    uint64_t sclog_pthread_filter() {
+        static const uint64_t filter = [] {
+            const char* value = getenv("PROSPER_SYNCLOG_PTHREAD");
+            return value ? strtoull(value, nullptr, 0) : 0ull;
+        }();
+        return filter;
+    }
+    bool sclog_time_enabled() {
         static const bool enabled = getenv("PROSPER_SYNCLOG") != nullptr;
         if (!enabled) return false;
         static const uint64_t delay_ms = [] {
@@ -59,6 +66,28 @@ namespace {
         if (!delay_ms) return true;
         static const auto start = std::chrono::steady_clock::now();
         return std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(delay_ms);
+    }
+    bool sclog_thread_enabled() {
+        const uint64_t filter = sclog_pthread_filter();
+        return sclog_time_enabled() && (!filter || (uint64_t)pthread_self() == filter);
+    }
+    bool sclog_condition() {
+        static const bool semaphore_only = getenv("PROSPER_SYNCLOG_SEMA_ONLY") != nullptr;
+        return !semaphore_only && sclog_thread_enabled();
+    }
+    bool sclog_semaphore() {
+        static const bool condition_only = getenv("PROSPER_SYNCLOG_COND_ONLY") != nullptr;
+        return !condition_only && sclog_thread_enabled();
+    }
+    bool sclog() {
+        static const bool condition_only = getenv("PROSPER_SYNCLOG_COND_ONLY") != nullptr;
+        static const bool semaphore_only = getenv("PROSPER_SYNCLOG_SEMA_ONLY") != nullptr;
+        return !condition_only && !semaphore_only && sclog_thread_enabled();
+    }
+    std::atomic<uint64_t> g_sclog_focus_sema{0};
+    bool sclog_focused_semaphore(uint64_t sema) {
+        return sclog_time_enabled() && sema &&
+               g_sclog_focus_sema.load(std::memory_order_acquire) == sema;
     }
     long sctid() {
 #if defined(__linux__) || defined(__APPLE__)
@@ -367,16 +396,16 @@ HLE(k_condattr_init)    { if (a0) { auto* c = (pthread_condattr_t*)calloc(1, siz
 HLE(k_condattr_destroy) { if (a0 && *(void**)a0) { free(*(void**)a0); *(void**)a0 = nullptr; } return 0; }
 HLE(k_cond_init)      { if (!a0) return 0x16; auto* c = (pthread_cond_t*)calloc(1, sizeof(pthread_cond_t)); pthread_cond_init(c, nullptr); *(void**)a0 = c; return 0; }
 HLE(k_cond_destroy)   { if (a0 && !pt_static_sentinel(*(void**)a0)) { pthread_cond_destroy((pthread_cond_t*)*(void**)a0); free(*(void**)a0); } if (a0) *(void**)a0 = nullptr; return 0; }
-HLE(k_cond_signal)    { if (sclog()) fprintf(stderr, "[sync2] T%ld COND.signal    cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); if (auto* c = ensure_cond(a0)) interruptible_cond_signal(c); return 0; }
-HLE(k_cond_broadcast) { if (sclog()) fprintf(stderr, "[sync2] T%ld COND.broadcast cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); if (auto* c = ensure_cond(a0)) interruptible_cond_broadcast(c); return 0; }
-HLE(k_cond_wait)      { if (sclog()) fprintf(stderr, "[sync2] T%ld COND.wait.ent  cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0);
+HLE(k_cond_signal)    { if (sclog_condition()) fprintf(stderr, "[sync2] T%ld COND.signal    cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); if (auto* c = ensure_cond(a0)) interruptible_cond_signal(c); return 0; }
+HLE(k_cond_broadcast) { if (sclog_condition()) fprintf(stderr, "[sync2] T%ld COND.broadcast cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); if (auto* c = ensure_cond(a0)) interruptible_cond_broadcast(c); return 0; }
+HLE(k_cond_wait)      { if (sclog_condition()) fprintf(stderr, "[sync2] T%ld COND.wait.ent  cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0);
     { auto* c = ensure_cond(a0); auto* m = ensure_mutex(a1);
       if (c && m) {
           guest_mutex_released(m);
           const int result = interruptible_cond_wait(c, m);
           if (result == 0) guest_mutex_acquired(m);
       } }
-    if (sclog()) fprintf(stderr, "[sync2] T%ld COND.wait.exit cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); return 0; }
+    if (sclog_condition()) fprintf(stderr, "[sync2] T%ld COND.wait.exit cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); return 0; }
 // POSIX pthread_cond_timedwait(cond_slot, mutex_slot, const timespec* abstime) — abstime is an
 // ABSOLUTE CLOCK_REALTIME deadline ({i64 sec, i64 nsec}, FreeBSD == Linux x86-64 layout), and the
 // POSIX shim returns the errno VALUE directly (FreeBSD ETIMEDOUT = 60). This was an unimplemented
@@ -1035,7 +1064,7 @@ HLE(k_sema_create) { // (sema*, name, attr, initCount, maxCount, opt)
     auto* s = (Sema*)calloc(1, sizeof(Sema));
     pthread_mutex_init(&s->m, nullptr); pthread_cond_init(&s->c, nullptr); s->count = (int64_t)(int32_t)a3;
     if (a0) *(void**)(uintptr_t)a0 = s;
-    if (sclog()) fprintf(stderr, "[sync2] T%ld SEMA.create  sema=0x%llx name='%s' init=%lld max=%lld\n",
+    if (sclog_semaphore()) fprintf(stderr, "[sync2] T%ld SEMA.create  sema=0x%llx name='%s' init=%lld max=%lld\n",
                          sctid(), (unsigned long long)(uintptr_t)s, a1 ? (const char*)(uintptr_t)a1 : "",
                          (long long)(int32_t)a3, (long long)(int32_t)a4);
     return 0;
@@ -1052,7 +1081,10 @@ HLE(k_sema_delete) {
 }
 HLE(k_sema_wait)   { // (sema, need, SceKernelUseconds* timeout) — timeout honored like k_ef_wait
     auto* s = (Sema*)(uintptr_t)a0; if (!s) return 0; int64_t need = a1 ? (int64_t)a1 : 1;
-    if (sclog()) fprintf(stderr, "[sync2] T%ld SEMA.wait     sema=0x%llx need=%lld\n", sctid(), (unsigned long long)a0, (long long)need);
+    const bool log_wait = sclog_semaphore();
+    if (log_wait && sclog_pthread_filter())
+        g_sclog_focus_sema.store(a0, std::memory_order_release);
+    if (log_wait) fprintf(stderr, "[sync2] T%ld SEMA.wait     sema=0x%llx need=%lld\n", sctid(), (unsigned long long)a0, (long long)need);
     uint64_t ret = 0;
     interruptible_mutex_lock(&s->m);
     s->waiters++;
@@ -1080,7 +1112,8 @@ HLE(k_sema_wait)   { // (sema, need, SceKernelUseconds* timeout) — timeout hon
     if (last) sema_destroy(s);
     return ret; }
 HLE(k_sema_signal) { auto* s = (Sema*)(uintptr_t)a0; if (!s) return 0; int64_t n = a1 ? (int64_t)a1 : 1;
-    if (sclog()) fprintf(stderr, "[sync2] T%ld SEMA.signal   sema=0x%llx n=%lld\n", sctid(), (unsigned long long)a0, (long long)n);
+    if (sclog_semaphore() || sclog_focused_semaphore(a0))
+        fprintf(stderr, "[sync2] T%ld SEMA.signal   sema=0x%llx n=%lld\n", sctid(), (unsigned long long)a0, (long long)n);
     interruptible_mutex_lock(&s->m); s->count += n; interruptible_cond_broadcast(&s->c); pthread_mutex_unlock(&s->m); return 0; }
 HLE(k_sema_poll)   { auto* s = (Sema*)(uintptr_t)a0; if (!s) return 0; int64_t need = a1 ? (int64_t)a1 : 1;
     interruptible_mutex_lock(&s->m); bool ok = s->count >= need; if (ok) s->count -= need; pthread_mutex_unlock(&s->m); return ok ? 0 : 0x80020023; }

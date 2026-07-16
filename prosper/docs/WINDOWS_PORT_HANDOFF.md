@@ -229,6 +229,12 @@ raise/deliver/resume), `PROSPER_MEMLOG`, `PROSPER_VEHLOG`, and boot_trace `[memc
 known-good Linux capture when separating cross-platform frontend faults from shared renderer faults. For a
 long boot, `PROSPER_SYNCLOG_DELAY_MS=N` suppresses the high-volume `[sync2]` stream until N milliseconds
 after the first synchronization call, retaining normal progression before the suspected boundary.
+`PROSPER_SYNCLOG_PTHREAD=0xN` restricts `[sync2]` records to one guest pthread when a full trace perturbs
+the title; pair it with the app's guest-thread checkpoint to obtain the pthread id.
+`PROSPER_SYNCLOG_COND_ONLY=1` further suppresses semaphore and event-flag records while retaining raw
+condition waits/signals/broadcasts.
+`PROSPER_SYNCLOG_SEMA_ONLY=1` instead keeps semaphore records. With a pthread filter, the last semaphore
+that thread waits on becomes the focus, so matching signals from other threads are retained automatically.
 
 ## Gotchas learned (so the next agent doesn't relearn them)
 
