@@ -1429,6 +1429,45 @@ struct WinCoopSlot {
 std::array<WinCoopSlot, 1024> g_win_coop_slots;
 std::atomic<uint32_t> g_win_coop_queued{0};
 
+struct WinGuestThreadSlot {
+    std::atomic<uint32_t> native_id{0};
+    std::atomic<uint64_t> pthread_id{0};
+    std::atomic<uintptr_t> stack_base{0};
+    std::atomic<size_t> stack_size{0};
+};
+std::array<WinGuestThreadSlot, 1024> g_win_guest_threads;
+
+void win_guest_thread_register(uint64_t pthread_id, uint32_t native_id,
+                               void* stack_base, size_t stack_size) {
+    for (WinGuestThreadSlot& slot : g_win_guest_threads) {
+        uint32_t current = slot.native_id.load(std::memory_order_acquire);
+        if (current == native_id) {
+            slot.pthread_id.store(pthread_id, std::memory_order_release);
+            slot.stack_base.store((uintptr_t)stack_base, std::memory_order_release);
+            slot.stack_size.store(stack_size, std::memory_order_release);
+            return;
+        }
+        if (current != 0 || !slot.native_id.compare_exchange_strong(
+                                current, native_id, std::memory_order_acq_rel))
+            continue;
+        slot.pthread_id.store(pthread_id, std::memory_order_release);
+        slot.stack_base.store((uintptr_t)stack_base, std::memory_order_release);
+        slot.stack_size.store(stack_size, std::memory_order_release);
+        return;
+    }
+}
+
+void win_guest_thread_unregister(uint32_t native_id) {
+    for (WinGuestThreadSlot& slot : g_win_guest_threads) {
+        if (slot.native_id.load(std::memory_order_acquire) != native_id) continue;
+        slot.pthread_id.store(0, std::memory_order_release);
+        slot.stack_base.store(0, std::memory_order_release);
+        slot.stack_size.store(0, std::memory_order_release);
+        slot.native_id.store(0, std::memory_order_release);
+        return;
+    }
+}
+
 void win_exc_trace(WinExcTraceKind kind, uint64_t target, uint32_t windows_tid,
                    uint64_t rip, uint64_t rsp, uint64_t extra = 0);
 
@@ -1858,6 +1897,108 @@ void dump_guest_exception_trace() {
 #endif
 }
 
+void dump_guest_thread_trace() {
+#ifdef _WIN32
+    auto trace = []<typename... Args>(const char* format, Args... args) {
+        char message[512];
+        const int length = std::snprintf(message, sizeof(message), format, args...);
+        if (length <= 0) return;
+        DWORD written = 0;
+        const DWORD bytes = static_cast<DWORD>(
+            length < (int)sizeof(message) ? length : (int)sizeof(message) - 1);
+        WriteFile(GetStdHandle(STD_ERROR_HANDLE), message, bytes, &written, nullptr);
+    };
+    std::vector<UnwindModuleDesc> modules;
+    {
+        std::lock_guard<std::mutex> lock(g_unwind_mx);
+        modules = g_unwind_mods;
+    }
+    unsigned live = 0;
+    for (const WinGuestThreadSlot& slot : g_win_guest_threads)
+        live += slot.native_id.load(std::memory_order_acquire) != 0;
+    trace("[thread-trace] live guest threads=%u\n", live);
+    for (const WinGuestThreadSlot& slot : g_win_guest_threads) {
+        const uint32_t native_id = slot.native_id.load(std::memory_order_acquire);
+        if (!native_id) continue;
+        const uint64_t pthread_id = slot.pthread_id.load(std::memory_order_acquire);
+        const uintptr_t stack_base = slot.stack_base.load(std::memory_order_acquire);
+        const size_t stack_size = slot.stack_size.load(std::memory_order_acquire);
+        HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                                       THREAD_QUERY_INFORMATION,
+                                   FALSE, native_id);
+        if (!thread) {
+            trace("[thread-trace] tid=%lu pthread=0x%llx unavailable error=%lu\n",
+                  (unsigned long)native_id, (unsigned long long)pthread_id,
+                  (unsigned long)GetLastError());
+            continue;
+        }
+        const DWORD prior_suspend = SuspendThread(thread);
+        CONTEXT context{};
+        context.ContextFlags = CONTEXT_CONTROL;
+        const bool captured = prior_suspend != (DWORD)-1 && GetThreadContext(thread, &context);
+        const DWORD capture_error = captured ? ERROR_SUCCESS : GetLastError();
+        std::array<uint64_t, 2048> stack_words{};
+        SIZE_T stack_bytes = 0;
+        if (captured && context.Rsp >= stack_base &&
+            context.Rsp < stack_base + stack_size) {
+            const size_t available = stack_base + stack_size - (uintptr_t)context.Rsp;
+            const size_t wanted = std::min(available, sizeof(stack_words));
+            ReadProcessMemory(GetCurrentProcess(), (void*)(uintptr_t)context.Rsp,
+                              stack_words.data(), wanted, &stack_bytes);
+        }
+        if (prior_suspend != (DWORD)-1) ResumeThread(thread);
+        CloseHandle(thread);
+        if (!captured) {
+            trace("[thread-trace] tid=%lu pthread=0x%llx capture-failed error=%lu\n",
+                  (unsigned long)native_id, (unsigned long long)pthread_id,
+                  (unsigned long)capture_error);
+            continue;
+        }
+        const uint64_t rip = context.Rip;
+        const char* module = "host";
+        uint64_t offset = rip;
+        if (rip >= 0x400000000ull && rip < 0x420000000ull) {
+            module = "eboot"; offset -= 0x400000000ull;
+        } else if (rip >= 0x440000000ull && rip < 0x443000000ull) {
+            module = "il2cpp"; offset -= 0x440000000ull;
+        } else if (rip >= 0x400000000ull && rip < 0x600000000ull) {
+            module = "guest-prx"; offset -= 0x400000000ull;
+        }
+        char guest_returns[224] = "-";
+        size_t guest_returns_used = 0;
+        unsigned guest_return_count = 0;
+        for (size_t i = 0; i < stack_bytes / sizeof(uint64_t) && guest_return_count < 8; ++i) {
+            const uint64_t candidate = stack_words[i];
+            if (candidate < 0x400000000ull || candidate >= 0x600000000ull) continue;
+            bool executable = false;
+            for (const UnwindModuleDesc& module : modules)
+                executable |= candidate >= module.seg0 &&
+                              candidate < module.seg0 + module.seg0_sz;
+            if (!executable) continue;
+            bool duplicate = false;
+            for (size_t j = 0; j < i; ++j)
+                duplicate |= stack_words[j] == candidate;
+            if (duplicate) continue;
+            const int appended = std::snprintf(
+                guest_returns + guest_returns_used,
+                sizeof(guest_returns) - guest_returns_used,
+                guest_return_count ? ",0x%llx" : "0x%llx",
+                (unsigned long long)candidate);
+            if (appended <= 0 || (size_t)appended >= sizeof(guest_returns) - guest_returns_used)
+                break;
+            guest_returns_used += (size_t)appended;
+            ++guest_return_count;
+        }
+        trace("[thread-trace] tid=%lu pthread=0x%llx rip=%s+0x%llx "
+              "raw=0x%llx rsp=0x%llx suspend=%lu guest-stack=%s\n",
+              (unsigned long)native_id, (unsigned long long)pthread_id, module,
+              (unsigned long long)offset, (unsigned long long)rip,
+              (unsigned long long)context.Rsp, (unsigned long)prior_suspend,
+              guest_returns);
+    }
+#endif
+}
+
 void dispatch_pending_guest_exception() {
 #ifdef _WIN32
     if (g_win_coop_queued.load(std::memory_order_acquire) == 0) return;
@@ -1921,6 +2062,10 @@ void trace_guest_stack_query(uint64_t target, bool found, void* base, size_t siz
 void trace_guest_thread_lifecycle(bool starting, uint64_t pthread_id, uint64_t native_id,
                                   void* stack_base, size_t stack_size) {
 #ifdef _WIN32
+    if (starting)
+        win_guest_thread_register(pthread_id, (uint32_t)native_id, stack_base, stack_size);
+    else
+        win_guest_thread_unregister((uint32_t)native_id);
     win_exc_trace(starting ? WinExcTraceKind::ThreadStart : WinExcTraceKind::ThreadExit,
                   pthread_id, (uint32_t)native_id, (uint64_t)(uintptr_t)stack_base,
                   (uint64_t)stack_size);

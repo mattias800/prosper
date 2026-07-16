@@ -482,7 +482,7 @@ int main(int argc, char** argv) {
     const bool frameTrace = getenv("PROSPER_APP_FRAME_TRACE") != nullptr;
     const char* stallDumpEnv = getenv("PROSPER_APP_STALL_DUMP_MS");
     const int stallDumpMs = stallDumpEnv ? std::max(0, atoi(stallDumpEnv)) : 0;
-    const char* timedDumpEnv = getenv("PROSPER_APP_EXC_DUMP_MS");
+    const char* timedDumpEnv = getenv("PROSPER_APP_GUEST_DUMP_MS");
     const int timedDumpMs = timedDumpEnv ? std::max(0, atoi(timedDumpEnv)) : 0;
     const auto loopStarted = std::chrono::steady_clock::now();
     auto lastFrameProgress = loopStarted;
@@ -503,9 +503,10 @@ int main(int argc, char** argv) {
         if (!timedDumpDone && timedDumpMs > 0 &&
             std::chrono::steady_clock::now() - loopStarted >=
                 std::chrono::milliseconds(timedDumpMs)) {
-            fprintf(stderr, "[app] timed guest-exception dump after %d ms at frame %llu\n",
+            fprintf(stderr, "[app] timed guest-state dump after %d ms at frame %llu\n",
                     timedDumpMs, (unsigned long long)shown);
             dump_guest_exception_trace();
+            dump_guest_thread_trace();
             timedDumpDone = true;
         }
 
