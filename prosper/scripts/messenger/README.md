@@ -17,9 +17,11 @@ PROSPER_PAD_SCRIPT=@scripts/messenger/reach-intro-story.pad \
   so this is a coarse state route, not an exact visual checkpoint.
 - `reach-first-level.pad`: the wall-time route used for the final fresh-save
   validation on issue #522. It crosses the title, story choices, and dialogue
-  into the first playable level. The route is intentionally time-anchored to
-  preserve the hardware-oracle validation sequence; use one-second screenshot
-  sampling and allow at least 180 seconds.
+  into the first playable level. A late Up/Cross-only recovery sequence lets a
+  cold full-render process complete name/menu prompts even when a long renderer
+  stall skips the early input windows; those inputs are harmless once gameplay
+  has begun. Use one-second screenshot sampling and allow at least 320 seconds
+  for the reviewed gameplay evidence window.
 - `reach-first-level-windows.pad`: native Windows full-render variant. Explicit
   1.5-second input windows survive sparse pad polling and its delayed tail waits
   for save-slot and name-entry transitions. The validated native run reached a
