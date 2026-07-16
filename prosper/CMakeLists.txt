@@ -294,14 +294,18 @@ if(TARGET prosper_core)
   target_link_libraries(test_file_binary PRIVATE prosper_core)
   add_test(NAME file_binary_roundtrip COMMAND test_file_binary)
 
-  if(WIN32)
-    add_executable(test_service_logging tests/test_service_logging.cpp)
-    target_link_libraries(test_service_logging PRIVATE prosper_core)
-    add_test(NAME service_logging_unmapped_args COMMAND test_service_logging)
+  add_executable(test_service_logging tests/test_service_logging.cpp)
+  target_link_libraries(test_service_logging PRIVATE prosper_core)
+  add_test(NAME service_logging_unmapped_args COMMAND test_service_logging)
 
+  if(WIN32)
     add_executable(test_win_exception_delivery tests/test_win_exception_delivery.cpp)
     target_link_libraries(test_win_exception_delivery PRIVATE prosper_core)
     add_test(NAME win_exception_delivery COMMAND test_win_exception_delivery)
+
+    add_executable(test_win_pthread_key_destructor tests/test_win_pthread_key_destructor.cpp)
+    target_link_libraries(test_win_pthread_key_destructor PRIVATE prosper_core)
+    add_test(NAME win_pthread_key_destructor COMMAND test_win_pthread_key_destructor)
 
     add_executable(test_win_kernel_is_stack tests/test_win_kernel_is_stack.cpp)
     target_link_libraries(test_win_kernel_is_stack PRIVATE prosper_core)

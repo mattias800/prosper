@@ -97,9 +97,21 @@ void register_kernel_mem_hle();
 // libkernel time/clock + C11 threads + assorted stubs; called by register_kernel_hle().
 void register_kernel_time_hle();
 
+#ifdef _WIN32
+// Windows pthread-key lifecycle probes used by the focused concurrency regression.
+void win_set_key_delete_after_host_hook_for_test(void (*hook)(uint64_t));
+size_t win_key_destructor_thunk_count_for_test();
+#endif
+
+// Preserve the unsigned native-thread identifier used by sync/exception diagnostics. Exposed so
+// the high-bit formatting contract can be covered without relying on the OS to allocate such a TID.
+uint64_t sync_trace_tid_value(uint64_t native_tid);
+
 // The default target for unimplemented imports: logs (first-seen) and returns 0.
-// Called by generated stubs with the import index in the first arg.
-extern "C" uint64_t prosper_on_unimpl(uint64_t import_index);
+// Called by generated stubs with the import index in the first arg. Windows stubs also preserve the
+// guest return address and pre-call stack pointer for low-volume caller attribution.
+extern "C" uint64_t prosper_on_unimpl(uint64_t import_index, uint64_t guest_return = 0,
+                                       uint64_t guest_rsp = 0);
 
 // First-seen order of unimplemented import indices called by the guest.
 const std::vector<uint32_t>& call_order();
@@ -179,6 +191,9 @@ void trace_guest_thread_lifecycle(bool starting, uint64_t pthread_id, uint64_t n
 // Windows cooperative exception checkpoint used when a target was woken from a registered HLE wait.
 // Other hosts provide an empty implementation.
 void dispatch_pending_guest_exception();
+// Number of cooperatively queued Windows exceptions awaiting a target checkpoint (zero elsewhere).
+// Exposed for diagnostics and lifetime/withdrawal regression tests.
+uint32_t pending_guest_exception_count();
 void dump_guest_exception_trace();
 
 // Register the linked program's global export table (NID -> absolute guest address) so

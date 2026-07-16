@@ -1,9 +1,12 @@
 // agc_shader_layout.cpp — see agc_shader_layout.hpp. V# decode + the front-half resource-table build.
 #include "agc_shader_layout.hpp"
+#include "tile.hpp"
 #include <algorithm>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <set>
 
 namespace prosper::gpu {
 
@@ -189,6 +192,9 @@ DecodedImageDescriptor decode_image_descriptor(const uint32_t t[8]) {
     d.height    = (uint32_t)((t[2] >> 14) & 0x3FFFu) + 1;                                          // Height5
     d.format    = (t[1] >> 20) & 0x1FFu;                                                           // Format
     d.tile_mode = (t[3] >> 20) & 0x1Fu;                                                            // TileMode (SW_MODE)
+    d.base_level = (t[3] >> 12) & 0xFu;
+    d.last_level = (t[3] >> 16) & 0xFu;
+    d.max_mip    = (t[5] >> 4) & 0xFu;
     d.type      = (uint8_t)((t[3] >> 28) & 0xFu);                                                  // Type
     d.depth     = d.type == 10 ? ((t[4] & 0x1FFFu) + 1u) : 1u;                                     // DEPTH (3D)
     d.dst_sel[0] = (uint8_t)((t[3] >> 0) & 0x7u);   // DST_SEL_X (WORD3 [2:0])
@@ -205,6 +211,64 @@ DecodedImageDescriptor decode_image_descriptor(const uint32_t t[8]) {
     const uint64_t metadata_field = (static_cast<uint64_t>(t[7]) << 8) | (t[6] >> 24);
     d.metadata_addr               = metadata_field << 8;
     return d;
+}
+
+DecodedImageView image_base_level_view(const DecodedImageDescriptor& d,
+                                       const Gen5ImageFormatInfo& fi) {
+    DecodedImageView view;
+    view.base = d.base;
+    view.width = d.width;
+    view.height = d.height;
+    // The offset helper models only thin 2D allocations. Cube, 3D, array, and MSAA resources have
+    // additional slice/tail rules. Level zero still names their allocation base, but a non-zero view
+    // must be rejected until those rules are modeled; returning the base would sample the wrong mip.
+    if (d.type != 9) {
+        view.supported = d.base_level == 0;
+        return view;
+    }
+    if (!fi.bytes_per_block || !fi.block_width || !fi.block_height) {
+        view.supported = d.base_level == 0;
+        return view;
+    }
+    const uint32_t element_width = (d.width + fi.block_width - 1) / fi.block_width;
+    const uint32_t element_height = (d.height + fi.block_height - 1) / fi.block_height;
+    view.mip_offset = tiled_mip_level_offset(element_width, element_height, fi.bytes_per_block,
+                                              d.tile_mode, d.max_mip, d.base_level);
+    // A zero offset is conclusive for level zero, but ambiguous for a non-zero level: linear chains
+    // and levels packed inside the shared mip tail need layout-specific coordinates that this thin-2D
+    // helper intentionally does not guess. Reject those views rather than binding a different mip.
+    if (d.base_level && !view.mip_offset) {
+        view.supported = false;
+        return view;
+    }
+    view.width = std::max(d.width >> d.base_level, 1u);
+    view.height = std::max(d.height >> d.base_level, 1u);
+    view.base += view.mip_offset;
+    return view;
+}
+
+void warn_unsupported_image_view(const DecodedImageDescriptor& d) {
+    const uint32_t signature = static_cast<uint32_t>(d.type) |
+                               (d.tile_mode << 8) |
+                               (static_cast<uint32_t>(d.base_level) << 16);
+    static std::mutex warning_mutex;
+    static std::set<uint32_t> warned;
+    static bool suppression_reported = false;
+    std::lock_guard lock(warning_mutex);
+    if (warned.find(signature) != warned.end()) return;
+    constexpr size_t kMaxUnsupportedViewWarnings = 16;
+    if (warned.size() >= kMaxUnsupportedViewWarnings) {
+        if (!suppression_reported) {
+            suppression_reported = true;
+            fprintf(stderr, "[t#] additional unsupported image-view layouts suppressed\n");
+        }
+        return;
+    }
+    warned.insert(signature);
+    fprintf(stderr,
+            "[t#] unsupported BASE_LEVEL %u for type=%u tile_mode=%u (%ux%u T#); "
+            "skipping image binding\n",
+            d.base_level, d.type, d.tile_mode, d.width, d.height);
 }
 
 uint32_t image_type_to_dim(uint8_t type) {
@@ -443,11 +507,12 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                     tseen[key] = done;
                 }
             }
-            if (getenv("PROSPER_GFXLOG")) {
+            if (getenv("PROSPER_GFXLOG") || getenv("PROSPER_TEXLOG")) {
                 const uint32_t* t = tv;   // the fetched T# (SGPR block or EUD spill)
-                fprintf(stderr, "[t#] %ux%u base=0x%llx tile_mode=%u type=%u fmt=%u swz=%u,%u,%u,%u "
+                fprintf(stderr, "[t#] %ux%u base=0x%llx tile_mode=%u type=%u fmt=%u mips=%u:%u/%u swz=%u,%u,%u,%u "
                                 "dcc=%u meta=0x%llx blocks=%u/%u flags=%u%u%u%u | raw: %08x %08x %08x %08x %08x %08x %08x %08x\n",
                         d.width, d.height, (unsigned long long)d.base, d.tile_mode, d.type, d.format,
+                        d.base_level, d.last_level, d.max_mip,
                         d.dst_sel[0], d.dst_sel[1], d.dst_sel[2], d.dst_sel[3],
                         d.compression_enabled, (unsigned long long)d.metadata_addr,
                         d.max_uncompressed_block_size, d.max_compressed_block_size,
@@ -494,23 +559,31 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                 continue;
             }
             ShaderResource r;
+            const DecodedImageView view = image_base_level_view(d, fi);
+            if (!view.supported) {
+                warn_unsupported_image_view(d);
+                continue;
+            }
             r.cls           = ResourceClass::Texture;
             r.format        = fi.format;
             r.num_components = fi.num_components;
             r.binding       = binding++;
-            r.gpu_addr      = d.base;
-            r.width         = d.width;
-            r.height        = d.height;
+            r.gpu_addr      = view.base;
+            r.width         = view.width;
+            r.height        = view.height;
             r.depth         = d.depth;
             r.tile_mode     = d.tile_mode;          // so the renderer can auto-detile a GPU-tiled surface
             r.max_uncompressed_block_size = d.max_uncompressed_block_size;
             r.max_compressed_block_size = d.max_compressed_block_size;
-            r.meta_pipe_aligned = d.meta_pipe_aligned;
-            r.write_compress_enabled = d.write_compress_enabled;
-            r.compression_enabled = d.compression_enabled;
+            // DCC metadata has its own per-mip layout. Until that offset is proven, a shifted texel
+            // view must not be paired with the allocation-level metadata base for another mip.
+            const bool shifted_view = view.mip_offset != 0;
+            r.meta_pipe_aligned = shifted_view ? false : d.meta_pipe_aligned;
+            r.write_compress_enabled = shifted_view ? false : d.write_compress_enabled;
+            r.compression_enabled = shifted_view ? false : d.compression_enabled;
             r.alpha_is_on_msb = d.alpha_is_on_msb;
             r.color_transform = d.color_transform;
-            r.metadata_addr = d.metadata_addr;
+            r.metadata_addr = shifted_view ? 0 : d.metadata_addr;
             r.swizzle[0] = d.dst_sel[0]; r.swizzle[1] = d.dst_sel[1];
             r.swizzle[2] = d.dst_sel[2]; r.swizzle[3] = d.dst_sel[3];   // T# DST_SEL channel remap (#261)
             // T# TYPE -> the MIMG dim convention (GFX10 SQ_RSRC_IMG: 8=1D, 9=2D, 10=3D, 11=CUBE,
@@ -523,8 +596,8 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             // Backing byte size: block-compressed surfaces store one bytes_per_block unit per 4x4 block
             // (ceil dims); uncompressed store bytes_per_block per texel (fmt=56 -> *4).
             const uint64_t backing_bytes = is_bcn
-                ? static_cast<uint64_t>((d.width + 3) / 4) * ((d.height + 3) / 4) * d.depth * fi.bytes_per_block
-                : static_cast<uint64_t>(d.width) * d.height * d.depth * fi.bytes_per_block;
+                ? static_cast<uint64_t>((view.width + 3) / 4) * ((view.height + 3) / 4) * d.depth * fi.bytes_per_block
+                : static_cast<uint64_t>(view.width) * view.height * d.depth * fi.bytes_per_block;
             if (!backing_bytes || backing_bytes > UINT32_MAX) continue;
             r.size = static_cast<uint32_t>(backing_bytes);
             // SGPR-resident T#: DIRECT provenance (image_sample SRSRC SGPR). EUD-resident T#: INDIRECT

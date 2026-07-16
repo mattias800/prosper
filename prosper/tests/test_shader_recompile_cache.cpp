@@ -161,6 +161,82 @@ int main() {
               stats.misses == pcrel_stats.misses + 1,
           "embedded table contents participate in the shader cache key");
 
+    // Unity emits a bounded uniform jump table for uber-shader variants. The selector is loaded from
+    // a direct constant buffer, adjusted by -1, clamped, scaled by eight, then used by s_setpc_b64.
+    // This compact synthetic stream has two paths which set v0 differently before a common export.
+    std::vector<uint32_t> dispatch_ps = {
+        0xf4201a8cu, 0xfa000010u, // pc0: s_buffer_load_dword s106, s[24:27], 0x10
+        0x816ac16au,              // pc2: s_add_i32 s106, s106, -1
+        0x83ea826au,              // pc3: s_min_u32 s106, s106, 2
+        0x8f6a836au,              // pc4: s_lshl_b32 s106, s106, 3
+        0xbea01f00u,              // pc5: s_getpc_b64 s[32:33]
+        0x802020ffu, 64u,         // pc6: add table byte delta (table starts at aligned pc22)
+        0x82212180u,              // pc8: s_addc_u32 s33, 0, s33
+        0xf4040890u, 0xd4000000u, // pc9: s_load_dwordx2 s[34:35], s[32:33], s106
+        0xbea81f00u,              // pc11: s_getpc_b64 s[40:41]
+        0x80282228u,              // pc12: s_add_u32 s40, s40, s34
+        0x82292329u,              // pc13: s_addc_u32 s41, s41, s35
+        0xbe802028u,              // pc14: s_setpc_b64 s[40:41]
+        0x7e000280u,              // pc15 target A: v_mov_b32 v0, 0
+        0xbf820001u,              // pc16: s_branch common export at pc18
+        0x7e0002f2u,              // pc17 target B: v_mov_b32 v0, 1.0
+        0xf800180fu, 0x00000000u, // pc18: exp mrt0 v0,v0,v0,v0
+        0xbf810000u,              // pc20: s_endpgm
+        0u,                       // pc21: alignment padding before the qword table
+    };
+    // Entries are signed byte offsets relative to the instruction after the second s_getpc (pc12).
+    for (uint32_t index = 0; index < 3; ++index) {
+        dispatch_ps.push_back(index == 0 ? 12u : index == 1 ? 20u : 24u); // pc15 / pc17 / merge pc18
+        dispatch_ps.push_back(0u);
+    }
+    const PcrelDispatchInfo dispatch = rdna2_pcrel_dispatch_info(
+        dispatch_ps.data(), dispatch_ps.size());
+    CHECK(dispatch.valid && dispatch.selector_sgpr_base == 24 &&
+              dispatch.selector_byte_offset == 0x10 && dispatch.selector_addend == -1 &&
+              dispatch.selector_max == 2 && dispatch.target_pcs.size() == 3 &&
+              dispatch.target_pcs[0] == 15 && dispatch.target_pcs[1] == 17 &&
+              dispatch.target_pcs[2] == 18,
+          "bounded PC-relative scalar dispatch is recognized and every target is proven");
+    CHECK(rdna2_recompile_code_span(dispatch_ps.data(), dispatch_ps.size()) == dispatch_ps.size(),
+          "scalar-dispatch table tail participates in the owning shader span");
+
+    std::vector<uint32_t> reversed_shift_dispatch = dispatch_ps;
+    reversed_shift_dispatch[4] = 0x8f6a6a83u; // s_lshl_b32 s106, 3, s106
+    CHECK(!rdna2_pcrel_dispatch_info(reversed_shift_dispatch.data(),
+                                     reversed_shift_dispatch.size()).valid,
+          "reversed non-commutative dispatch shift is rejected");
+
+    std::array<uint32_t, 5> selector_words{};
+    ShaderResourceTable dispatch_table;
+    ShaderResource selector_resource;
+    selector_resource.cls = ResourceClass::ConstantBuffer;
+    selector_resource.binding = 0;
+    selector_resource.sgpr_base = 24;
+    selector_resource.size = sizeof(selector_words);
+    selector_resource.host_data = reinterpret_cast<uint8_t*>(selector_words.data());
+    selector_resource.host_data_size = sizeof(selector_words);
+    dispatch_table.resources.push_back(selector_resource);
+    const auto direct_dispatch_a = recompile_fragment(
+        dispatch_ps.data(), dispatch_ps.size(), &dispatch_table, nullptr, 15);
+    const auto direct_dispatch_b = recompile_fragment(
+        dispatch_ps.data(), dispatch_ps.size(), &dispatch_table, nullptr, 17);
+    CHECK(!direct_dispatch_a.empty() && !direct_dispatch_b.empty(),
+          "direct fragment specialization accepts both proven dispatch paths");
+    selector_words[4] = 1; // adjusted selector 0 -> target A
+    const auto dispatch_a = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, dispatch_ps.data(), dispatch_ps.size(), &dispatch_table);
+    const auto dispatch_stats = shader_recompile_cache_stats();
+    selector_words[4] = 2; // adjusted selector 1 -> target B
+    const auto dispatch_b = recompile_graphics_shader_cached(
+        ShaderProgramStage::Fragment, dispatch_ps.data(), dispatch_ps.size(), &dispatch_table);
+    stats = shader_recompile_cache_stats();
+    CHECK(!dispatch_a.empty() && !dispatch_b.empty(),
+          "both proven uniform-dispatch targets recompile");
+    CHECK(dispatch_a != dispatch_b,
+          "uniform dispatch target specializes the emitted fragment code");
+    CHECK(stats.misses == dispatch_stats.misses + 1,
+          "uniform dispatch target participates in the cache key");
+
     // Interpolant wiring changes vertex PARAM export locations/defaults, so it is part of the
     // compile-time key even when the guest code and resource interface are otherwise identical.
     stats = shader_recompile_cache_stats();

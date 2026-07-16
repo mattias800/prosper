@@ -26,10 +26,12 @@ no-graphics diagnostics with isolated saves and the same semantic gameplay selec
 - `reach-first-gameplay-full-render.pad`: performs the same route with input
   delayed until the title appears when every submit is rendered. Use this for
   presented-image regression investigation; it does not depend on a renderer
-  warmup. Circle remains held through 240 seconds because synchronous rendering
+  warmup. Repeated Cross windows survive multi-second gaps between pad polls,
+  then Circle remains held through 300 seconds because synchronous rendering
   has made `PARSEALL` take from about 60 to more than 160 seconds across measured
-  builds. The route now survives that throughput variance, but the gameplay
-  snapshot baseline remains pending until its retained frames are reviewed. Post-#766 native-Windows
+  builds. The reviewed snapshot guard uses the 190-239 second window; repeated
+  verification reaches the controllable Primary weapon tutorial with complete
+  world and HUD layers. Post-#766 native-Windows
   validation executes and publishes every retained submit, completes `PARSEALL`, and first matches the
   sustained gameplay semantic selector at 104.81 seconds. #723 is closed; the route remains much slower
   than the render-disabled control, and the selector does not replace visual inspection.

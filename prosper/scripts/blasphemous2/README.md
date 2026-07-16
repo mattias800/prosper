@@ -17,11 +17,12 @@ states that were actually observed by the game.
 After 200 seconds the route switches from menu Cross presses to the mandatory
 bile-flask tutorial's Triangle/Circle exchange. It repeats the close/action pair
 because the help page becomes ready at different wall times under sparse versus
-full-resolution rendering. The route then holds Right and
-acknowledges the movement tutorial with long Down and Down+Cross windows before
-continuing right with periodic jumps. The awakening glyph is the PlayStation
-Triangle symbol; Cross alone only jumps, while omitting Circle leaves the title
-parked on the help page.
+full-resolution rendering, including a late fallback through 302 seconds. The
+route then holds Right and acknowledges the movement tutorial with long Down and
+Down+Cross windows before continuing right with periodic jumps. The reviewed
+evidence window is 380-479 seconds, after those recovery and movement inputs.
+The awakening glyph is the PlayStation Triangle symbol; Cross alone only jumps,
+while omitting Circle leaves the title parked on the help page.
 
 The first-room world used to remain black behind valid HUD pixels because the
 transparent UI-target clear uses PS5 primitive type 7. It is a RectList: the guest
@@ -40,7 +41,7 @@ PROSPER_GUEST_ARGS=-force-gfx-direct \
 PROSPER_PAD_SCRIPT=@scripts/blasphemous2/reach-first-gameplay.pad \
 ./build-linux/screenshot /path/PPSA13579-app0 \
   --render-every 30 --render-every-for-seconds 230 \
-  --seconds 1 --count 420 --timeout 510 --out shots
+  --seconds 1 --count 480 --timeout 570 --out shots
 ```
 
 At full resolution, rendering every draw-carrying submit reduces this route to
@@ -49,8 +50,9 @@ samples every 30th complete submit during the long opening while still writing o
 normal 1920x1080 PNG per second. After 230 seconds it renders every submit so
 temporal world layers are rebuilt before the first playable room. The
 manifest records the renderer policy and reports source and pixel progression
-separately. The #654 validation produced all 420 requested 1920x1080 PNGs, with
-315 pixel-distinct samples and moving full-screen gameplay through the final frame.
+separately. The route-aware guard retains moving 1920x1080 first-area gameplay
+after the late tutorial fallback; the historical #654 validation produced 420
+requested PNGs with 315 pixel-distinct samples.
 
 For the routine renderer regression gate, run:
 

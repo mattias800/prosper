@@ -127,6 +127,8 @@ struct ShaderCompileKey {
     PixelInputMapping pixel_inputs{};
     bool has_system_inputs = false;
     PixelSystemInputMapping system_inputs{};
+    bool has_pcrel_dispatch = false;
+    uint32_t pcrel_dispatch_target = UINT32_MAX;
     std::vector<uint32_t> code;
     std::vector<ShaderResourceCompileKey> resources;
 
@@ -159,6 +161,8 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, key.system_inputs.ena);
             hash = hash_mix(hash, key.system_inputs.addr);
         }
+        hash = hash_mix(hash, key.has_pcrel_dispatch);
+        if (key.has_pcrel_dispatch) hash = hash_mix(hash, key.pcrel_dispatch_target);
         hash = hash_mix(hash, key.code.size());
         for (uint32_t word : key.code) hash = hash_mix(hash, word);
         hash = hash_mix(hash, key.resources.size());
@@ -455,6 +459,60 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
     if (key.has_pixel_inputs) key.pixel_inputs = *pixel_inputs;
     key.has_system_inputs = stage == ShaderProgramStage::Fragment && system_inputs != nullptr;
     if (key.has_system_inputs) key.system_inputs = *system_inputs;
+    if (stage == ShaderProgramStage::Fragment && code && dwords && resources) {
+        const PcrelDispatchInfo dispatch = rdna2_pcrel_dispatch_info(code, dwords);
+        if (dispatch.valid) {
+            const ShaderResource* resource = resources->by_sgpr_base_cls(
+                dispatch.selector_sgpr_base, ResourceClass::ConstantBuffer);
+            uint32_t raw_selector = 0;
+            bool readable = false;
+            if (resource && dispatch.selector_byte_offset <= resource->size &&
+                resource->size - dispatch.selector_byte_offset >= sizeof(raw_selector)) {
+                if (resource->host_data && dispatch.selector_byte_offset <= resource->host_data_size &&
+                    resource->host_data_size - dispatch.selector_byte_offset >= sizeof(raw_selector)) {
+                    memcpy(&raw_selector, resource->host_data + dispatch.selector_byte_offset,
+                           sizeof(raw_selector));
+                    readable = true;
+                } else if (resource->gpu_addr <= UINT64_MAX - dispatch.selector_byte_offset) {
+                    const uint64_t address = resource->gpu_addr + dispatch.selector_byte_offset;
+                    if (guest_readable(address, sizeof(raw_selector))) {
+                        memcpy(&raw_selector, reinterpret_cast<const void*>(static_cast<uintptr_t>(address)),
+                               sizeof(raw_selector));
+                        readable = true;
+                    }
+                }
+            }
+            if (readable) {
+                const uint32_t adjusted = raw_selector + static_cast<uint32_t>(dispatch.selector_addend);
+                const uint32_t index = std::min(adjusted, dispatch.selector_max);
+                if (index < dispatch.target_pcs.size()) {
+                    key.has_pcrel_dispatch = true;
+                    key.pcrel_dispatch_target = dispatch.target_pcs[index];
+                }
+            }
+            if (getenv("PROSPER_DBG")) {
+                static std::mutex dispatch_log_mutex;
+                static std::set<uintptr_t> dispatch_logged;
+                std::lock_guard lock(dispatch_log_mutex);
+                if (dispatch_logged.insert(reinterpret_cast<uintptr_t>(code)).second) {
+                    fprintf(stderr,
+                            "[pcrel-dispatch] code=%p selector=s%u+0x%x resource=%s readable=%u "
+                            "raw=%u target=%u resources=%zu\n",
+                            static_cast<const void*>(code), dispatch.selector_sgpr_base,
+                            dispatch.selector_byte_offset, resource ? "found" : "missing", readable,
+                            raw_selector, key.pcrel_dispatch_target, resources->resources.size());
+                    for (const auto& candidate : resources->resources)
+                        fprintf(stderr,
+                                "[pcrel-dispatch]   cls=%u binding=%u sgpr=%u srt=%u addr=%llx "
+                                "size=%u host=%llu\n",
+                                static_cast<unsigned>(candidate.cls), candidate.binding,
+                                candidate.sgpr_base, candidate.srt_offset,
+                                static_cast<unsigned long long>(candidate.gpu_addr), candidate.size,
+                                static_cast<unsigned long long>(candidate.host_data_size));
+                }
+            }
+        }
+    }
     if (code && dwords) {
         // Most shaders end at S_ENDPGM. A compiler-generated s_getpc_b64 V# may instead address an
         // embedded lookup table after ENDPGM; retain that proven tail so cached recompilation sees the
@@ -483,7 +541,8 @@ std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const Sh
                                 key.has_pixel_inputs ? &key.pixel_inputs : nullptr);
     if (stage == ShaderProgramStage::Fragment)
         return recompile_fragment(code, key.code.size(), resources,
-                                  key.has_system_inputs ? &key.system_inputs : nullptr);
+                                  key.has_system_inputs ? &key.system_inputs : nullptr,
+                                  key.has_pcrel_dispatch ? key.pcrel_dispatch_target : UINT32_MAX);
     return {};
 }
 
@@ -1675,21 +1734,11 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                                 d.format, d.tile_mode);
                     if (d.base == 0 || d.width == 0 || d.height == 0 ||
                         d.width > 16384 || d.height > 16384) continue;       // garbage/degenerate T#
-                    // A previous use already produced a resource for this SAME surface (same T# base +
+                    // A previous use already produced a resource for this SAME selected view (address +
                     // extent): don't duplicate the binding/upload — give it this use's pc provenance
                     // if it has none yet (#273). If it already carries a DIFFERENT use's pc, fall
                     // through and create a second resource for this pc (fetch_pc holds one pc; a
                     // sample whose pc has no mapping would stay unresolved).
-                    {
-                        bool mapped = false;
-                        for (auto& r0 : t.resources)
-                            if (r0.cls == ResourceClass::Texture && r0.gpu_addr == d.base &&
-                                r0.width == d.width && r0.height == d.height && r0.depth == d.depth) {
-                                if (r0.fetch_pc == 0xFFFFFFFFu) { r0.fetch_pc = u.use_pc; mapped = true; break; }
-                                if (r0.fetch_pc == u.use_pc)    { mapped = true; break; }
-                            }
-                        if (mapped) continue;
-                    }
                     Gen5ImageFormatInfo fi;
                     if (!gen5_image_format(d.format, &fi)) {
                         // Same policy as build_shader_resources: the normal per-target renderer can
@@ -1702,27 +1751,45 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     }
                     const bool is_bcn = fi.block_width > 1;
                     if (is_bcn && fi.snorm) continue;   // signed BCn (SNORM / BC6H SF16): decode not wired
+                    const DecodedImageView view = image_base_level_view(d, fi);
+                    if (!view.supported) {
+                        warn_unsupported_image_view(d);
+                        continue;
+                    }
+                    const uint32_t img_dim = image_type_to_dim(d.type);
+                    {
+                        bool mapped = false;
+                        for (auto& r0 : t.resources)
+                            if (r0.cls == ResourceClass::Texture && r0.gpu_addr == view.base &&
+                                r0.width == view.width && r0.height == view.height &&
+                                r0.depth == d.depth && r0.format == fi.format && r0.img_dim == img_dim) {
+                                if (r0.fetch_pc == 0xFFFFFFFFu) { r0.fetch_pc = u.use_pc; mapped = true; break; }
+                                if (r0.fetch_pc == u.use_pc)    { mapped = true; break; }
+                            }
+                        if (mapped) continue;
+                    }
                     ShaderResource r;
                     r.cls = ResourceClass::Texture;
                     r.format = fi.format; r.num_components = fi.num_components;
-                    r.gpu_addr = d.base; r.width = d.width; r.height = d.height; r.depth = d.depth;
+                    r.gpu_addr = view.base; r.width = view.width; r.height = view.height; r.depth = d.depth;
                     r.tile_mode = d.tile_mode; r.srgb = fi.srgb;
                     r.max_uncompressed_block_size = d.max_uncompressed_block_size;
                     r.max_compressed_block_size = d.max_compressed_block_size;
-                    r.meta_pipe_aligned = d.meta_pipe_aligned;
-                    r.write_compress_enabled = d.write_compress_enabled;
-                    r.compression_enabled = d.compression_enabled;
+                    const bool shifted_view = view.mip_offset != 0;
+                    r.meta_pipe_aligned = shifted_view ? false : d.meta_pipe_aligned;
+                    r.write_compress_enabled = shifted_view ? false : d.write_compress_enabled;
+                    r.compression_enabled = shifted_view ? false : d.compression_enabled;
                     r.alpha_is_on_msb = d.alpha_is_on_msb;
                     r.color_transform = d.color_transform;
-                    r.metadata_addr = d.metadata_addr;
+                    r.metadata_addr = shifted_view ? 0 : d.metadata_addr;
                     // T# TYPE -> MIMG dim (GFX10: 9=2D, 10=3D, 11=CUBE, 13=2D_ARRAY); a cube
                     // uploads as six vertically-stacked faces (#273 — see agc_shader_layout).
-                    r.img_dim = image_type_to_dim(d.type);
+                    r.img_dim = img_dim;
                     r.swizzle[0] = d.dst_sel[0]; r.swizzle[1] = d.dst_sel[1];
                     r.swizzle[2] = d.dst_sel[2]; r.swizzle[3] = d.dst_sel[3];
                     const uint64_t backing_bytes = is_bcn
-                        ? static_cast<uint64_t>((d.width + 3) / 4) * ((d.height + 3) / 4) * d.depth * fi.bytes_per_block
-                        : static_cast<uint64_t>(d.width) * d.height * d.depth * fi.bytes_per_block;
+                        ? static_cast<uint64_t>((view.width + 3) / 4) * ((view.height + 3) / 4) * d.depth * fi.bytes_per_block
+                        : static_cast<uint64_t>(view.width) * view.height * d.depth * fi.bytes_per_block;
                     if (!backing_bytes || backing_bytes > UINT32_MAX) continue;
                     r.size = static_cast<uint32_t>(backing_bytes);
                     r.srt_offset = clash ? 0xFFFFFFFFu : u.key;   // ambiguous/absent key: pc-only provenance
@@ -2008,19 +2075,6 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     DecodedImageDescriptor d = decode_image_descriptor(u.t8.data());
                     if (d.base == 0 || d.width == 0 || d.height == 0 ||
                         d.width > 16384 || d.height > 16384) continue;   // garbage/degenerate T#
-                    {
-                        bool mapped = false;
-                        const ResourceClass wanted = u.is_store ? ResourceClass::StorageImage
-                                                               : ResourceClass::Texture;
-                        for (auto& r0 : table->resources)
-                            if (r0.cls == wanted &&
-                                r0.gpu_addr == d.base && r0.width == d.width && r0.height == d.height &&
-                                r0.depth == d.depth) {
-                                if (r0.fetch_pc == 0xFFFFFFFFu) { r0.fetch_pc = u.use_pc; mapped = true; break; }
-                                if (r0.fetch_pc == u.use_pc)    { mapped = true; break; }
-                            }
-                        if (mapped) continue;
-                    }
                     Gen5ImageFormatInfo fi;
                     const bool mapped_fmt = gen5_image_format(d.format, &fi);
                     // Unknown sampled formats cannot be decoded. Unknown storage formats may still
@@ -2028,14 +2082,37 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     // rejects them instead of silently treating arbitrary bytes as RGBA8.
                     if (!mapped_fmt && !u.is_store) continue;
                     if (mapped_fmt && fi.block_width > 1 && fi.snorm) continue;   // signed BCn: not wired
+                    const DecodedImageView view = mapped_fmt
+                        ? image_base_level_view(d, fi)
+                        : DecodedImageView{d.base, d.width, d.height, 0, d.base_level == 0};
+                    if (!view.supported) {
+                        warn_unsupported_image_view(d);
+                        continue;
+                    }
+                    const ResourceClass wanted = u.is_store ? ResourceClass::StorageImage
+                                                           : ResourceClass::Texture;
+                    const DataFormat view_format = mapped_fmt ? fi.format : DataFormat::Unknown;
+                    const uint32_t img_dim = image_type_to_dim(d.type);
+                    {
+                        bool mapped = false;
+                        for (auto& r0 : table->resources)
+                            if (r0.cls == wanted && r0.gpu_addr == view.base &&
+                                r0.width == view.width && r0.height == view.height &&
+                                r0.depth == d.depth && r0.format == view_format &&
+                                r0.img_dim == img_dim) {
+                                if (r0.fetch_pc == 0xFFFFFFFFu) { r0.fetch_pc = u.use_pc; mapped = true; break; }
+                                if (r0.fetch_pc == u.use_pc)    { mapped = true; break; }
+                            }
+                        if (mapped) continue;
+                    }
                     ShaderResource r;
-                    r.cls = u.is_store ? ResourceClass::StorageImage : ResourceClass::Texture;
+                    r.cls = wanted;
                     if (mapped_fmt) {
                         r.format = fi.format; r.num_components = fi.num_components;
                         const bool is_bcn = fi.block_width > 1;
                         const uint64_t bytes = is_bcn
-                            ? static_cast<uint64_t>((d.width + 3) / 4) * ((d.height + 3) / 4) * d.depth * fi.bytes_per_block
-                            : static_cast<uint64_t>(d.width) * d.height * d.depth * fi.bytes_per_block;
+                            ? static_cast<uint64_t>((view.width + 3) / 4) * ((view.height + 3) / 4) * d.depth * fi.bytes_per_block
+                            : static_cast<uint64_t>(view.width) * view.height * d.depth * fi.bytes_per_block;
                         if (!bytes || bytes > UINT32_MAX) continue;
                         r.size = static_cast<uint32_t>(bytes);
                         r.srgb = fi.srgb;
@@ -2045,17 +2122,18 @@ std::vector<ComputeItem> realize_compute_dispatches(
                         r.format = DataFormat::Unknown; r.num_components = 4;
                         r.size = static_cast<uint32_t>(bytes);
                     }
-                    r.gpu_addr = d.base; r.width = d.width; r.height = d.height; r.depth = d.depth;
+                    r.gpu_addr = view.base; r.width = view.width; r.height = view.height; r.depth = d.depth;
                     r.tile_mode = d.tile_mode;
                     r.max_uncompressed_block_size = d.max_uncompressed_block_size;
                     r.max_compressed_block_size = d.max_compressed_block_size;
-                    r.meta_pipe_aligned = d.meta_pipe_aligned;
-                    r.write_compress_enabled = d.write_compress_enabled;
-                    r.compression_enabled = d.compression_enabled;
+                    const bool shifted_view = view.mip_offset != 0;
+                    r.meta_pipe_aligned = shifted_view ? false : d.meta_pipe_aligned;
+                    r.write_compress_enabled = shifted_view ? false : d.write_compress_enabled;
+                    r.compression_enabled = shifted_view ? false : d.compression_enabled;
                     r.alpha_is_on_msb = d.alpha_is_on_msb;
                     r.color_transform = d.color_transform;
-                    r.metadata_addr = d.metadata_addr;
-                    r.img_dim = image_type_to_dim(d.type);
+                    r.metadata_addr = shifted_view ? 0 : d.metadata_addr;
+                    r.img_dim = img_dim;
                     r.swizzle[0] = d.dst_sel[0]; r.swizzle[1] = d.dst_sel[1];
                     r.swizzle[2] = d.dst_sel[2]; r.swizzle[3] = d.dst_sel[3];
                     r.srt_offset = clash ? 0xFFFFFFFFu : u.key;

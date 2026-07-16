@@ -325,6 +325,21 @@ int main() {
     CHECK(tile_mode_is_tiled((uint32_t)TileMode::Sw64KbS),  "tile_mode 9 (SW_64KB_S) is tiled");
     CHECK(tile_mode_is_tiled((uint32_t)TileMode::Sw64KbRX), "tile_mode 27 (SW_64KB_R_X) is tiled");
 
+    // GFX10 thin 2D mip chains are tail-first, then smallest-to-largest outside the tail. Evergate's
+    // 2048x1152 RGBA8, 12-level SW_4KB_S background therefore starts mip 0 after a 4KB tail and
+    // padded mips 6..1, not at the descriptor base. These offsets are direct AddrLib arithmetic.
+    {
+        const uint32_t M = (uint32_t)TileMode::Sw4KbS;
+        CHECK(tiled_mip_level_offset(2048, 1152, 4, M, 11, 0) == 3186688,
+              "SW_4KB_S mip0 follows the tail and reversed smaller levels");
+        CHECK(tiled_mip_level_offset(2048, 1152, 4, M, 11, 1) == 827392,
+              "SW_4KB_S mip1 offset uses the same tail-first chain");
+        CHECK(tiled_mip_level_offset(2048, 1152, 4, M, 11, 6) == 4096,
+              "last non-tail mip immediately follows the shared 4KB tail");
+        CHECK(tiled_mip_level_offset(2048, 1152, 4, M, 0, 0) == 0,
+              "single-level surfaces remain based at byte zero");
+    }
+
     // Tiled footprint: a 64KB block holds 65536 bytes; its element dims depend on bpe
     // (1 B -> 256x256, 2 B -> 256x128, 4 B -> 128x128, 8 B -> 128x64, 16 B -> 64x64).
     {

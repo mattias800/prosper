@@ -1,6 +1,10 @@
 #include "dispatch.hpp"
+#include <cstdlib>
 #include <unordered_map>
 #include <mutex>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace prosper {
 
@@ -27,6 +31,53 @@ namespace {
     // Guards g_order/g_count/g_progress against concurrent worker-thread unimpl calls (many under
     // -force-gfx-direct/guest-fs). The lock is cheap; the state changes are tiny.
     std::mutex                       g_unimpl_mx;
+
+#ifdef _WIN32
+    bool executable_guest_address(uint64_t address) {
+        if (address < 0x400000000ull || address >= 0x600000000ull) return false;
+        MEMORY_BASIC_INFORMATION memory{};
+        if (!VirtualQuery((const void*)(uintptr_t)address, &memory, sizeof(memory)) ||
+            memory.State != MEM_COMMIT || (memory.Protect & PAGE_GUARD)) return false;
+        const DWORD protection = memory.Protect & 0xff;
+        return protection == PAGE_EXECUTE || protection == PAGE_EXECUTE_READ ||
+               protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
+    }
+
+    void format_unimplemented_guest_stack(uint64_t guest_rsp, char* output, size_t capacity) {
+        if (!capacity) return;
+        output[0] = '-';
+        if (capacity > 1) output[1] = '\0';
+        else output[0] = '\0';
+        if (!guest_rsp || (guest_rsp & 7)) return;
+        MEMORY_BASIC_INFORMATION memory{};
+        if (!VirtualQuery((const void*)(uintptr_t)guest_rsp, &memory, sizeof(memory)) ||
+            memory.State != MEM_COMMIT || (memory.Protect & PAGE_GUARD) ||
+            memory.Protect == PAGE_NOACCESS) return;
+        const uint64_t region_end = (uint64_t)(uintptr_t)memory.BaseAddress + memory.RegionSize;
+        size_t words = (size_t)((region_end - guest_rsp) / sizeof(uint64_t));
+        if (words > 256) words = 256;
+        const auto* stack = (const uint64_t*)(uintptr_t)guest_rsp;
+        size_t used = 0;
+        unsigned count = 0;
+        for (size_t i = 0; i < words && count < 8; ++i) {
+            const uint64_t candidate = stack[i];
+            if (!executable_guest_address(candidate)) continue;
+            bool duplicate = false;
+            for (size_t j = 0; j < i; ++j) duplicate |= stack[j] == candidate;
+            if (duplicate) continue;
+            const int appended = std::snprintf(output + used, capacity - used,
+                                               count ? ",0x%llx" : "0x%llx",
+                                               (unsigned long long)candidate);
+            if (appended <= 0 || (size_t)appended >= capacity - used) break;
+            used += (size_t)appended;
+            ++count;
+        }
+        if (!count) {
+            output[0] = '-';
+            if (capacity > 1) output[1] = '\0';
+        }
+    }
+#endif
 }
 
 void dispatch_set_progress(volatile int* counter) { g_progress = counter; }
@@ -76,7 +127,8 @@ void reset_call_log() { std::lock_guard<std::mutex> lk(g_unimpl_mx); g_order.cle
                         for (auto& c : g_count) c = 0; }
 const std::vector<uint32_t>& call_order() { return g_order; }
 
-extern "C" uint64_t prosper_on_unimpl(uint64_t import_index) {
+extern "C" uint64_t prosper_on_unimpl(uint64_t import_index, uint64_t guest_return,
+                                        uint64_t guest_rsp) {
     uint32_t idx = (uint32_t)import_index;
     std::lock_guard<std::mutex> lk(g_unimpl_mx);   // serialize concurrent worker-thread unimpl calls
     if (idx >= g_count.size()) return 0;           // out-of-range import index: ignore (no alloc, no fault)
@@ -87,9 +139,21 @@ extern "C" uint64_t prosper_on_unimpl(uint64_t import_index) {
         if (g_slots && idx < g_slots->size()) {
             const auto& im = (*g_slots)[idx];
             std::string nm = g_db ? g_db->resolve(im.nid) : std::string();
+#ifdef _WIN32
+            static const bool trace_stack = getenv("PROSPER_UNIMPL_STACK") != nullptr;
+            char guest_stack[224] = "-";
+            if (trace_stack)
+                format_unimplemented_guest_stack(guest_rsp, guest_stack, sizeof(guest_stack));
+            fprintf(stderr, "[prosper] unimplemented: %s::%s%s%s%s tid=%lu caller=0x%llx%s%s  -> returning 0\n",
+                    im.lib.c_str(), im.nid.c_str(),
+                    nm.empty() ? "" : " [", nm.c_str(), nm.empty() ? "" : "]",
+                    (unsigned long)GetCurrentThreadId(), (unsigned long long)guest_return,
+                    trace_stack ? " guest-stack=" : "", trace_stack ? guest_stack : "");
+#else
             fprintf(stderr, "[prosper] unimplemented: %s::%s%s%s%s  -> returning 0\n",
                     im.lib.c_str(), im.nid.c_str(),
                     nm.empty() ? "" : " [", nm.c_str(), nm.empty() ? "" : "]");
+#endif
         }
     }
     return 0; // let the guest proceed so we can discover the next call

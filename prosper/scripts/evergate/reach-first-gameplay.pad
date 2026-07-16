@@ -1,0 +1,15 @@
+# Evergate (PPSA01885): fresh-save route through the title menu and first save slot.
+# Timing starts at the game's first pad poll. Give native Windows initialization ten seconds, then
+# pulse Cross often enough to cover the opening ident, title prompt, and initial menu transitions.
+10-12:cross
+15-17:cross
+20-22:cross
+25-27:cross
+30-32:cross
+35-37:cross
+40-42:cross
+45-47:cross
+50-52:cross
+55-57:cross
+60-62:cross
+65-67:cross

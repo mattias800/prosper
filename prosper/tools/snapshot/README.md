@@ -111,11 +111,12 @@ inspection unless they fail.
 
 ## Current Matrix
 
-- `messenger-scene`: broad content guard for a timing-sensitive rendered scene.
-- `dead-cells-gameplay`: provisional full-render route toward the controllable
-  Jump tutorial. Baseline approval is blocked on repeatably clearing level loading.
-- `blasphemous2-gameplay`: native-resolution fresh-save routed guard for
-  multiple moving frames in the first playable room.
+- `messenger-scene`: reviewed first-level gameplay guard with a late recovery
+  sequence for cold full-render processes that miss early menu pad polls.
+- `dead-cells-gameplay`: reviewed full-render guard for the controllable
+  Prisoners' Quarters Primary weapon tutorial.
+- `blasphemous2-gameplay`: reviewed native-resolution fresh-save guard for
+  multiple moving frames in the first playable area.
 
 ## Environment
 

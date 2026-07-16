@@ -31,7 +31,9 @@
 #include <thread>
 #include <atomic>
 #include <array>
+#include <cinttypes>
 #include <condition_variable>
+#include <chrono>
 #include <new>
 #ifdef _WIN32
 #include <windows.h>   // GetCurrentThreadStackLimits/GetCurrentThreadId for the guest-thread trampoline
@@ -47,14 +49,94 @@
 #endif
 
 namespace prosper {
-namespace { bool sclog() { static int v = getenv("PROSPER_SYNCLOG") ? 1 : 0; return v; }
-    long sctid() {
+uint64_t sync_trace_tid_value(uint64_t native_tid) {
+    return native_tid;
+}
+
+namespace {
+    uint64_t sclog_pthread_filter() {
+        static const uint64_t filter = [] {
+            const char* value = getenv("PROSPER_SYNCLOG_PTHREAD");
+            return value ? strtoull(value, nullptr, 0) : 0ull;
+        }();
+        return filter;
+    }
+    bool sclog_time_enabled() {
+        static const bool enabled = getenv("PROSPER_SYNCLOG") != nullptr;
+        if (!enabled) return false;
+        static const uint64_t delay_ms = [] {
+            const char* value = getenv("PROSPER_SYNCLOG_DELAY_MS");
+            return value ? strtoull(value, nullptr, 10) : 0ull;
+        }();
+        if (!delay_ms) return true;
+        static const auto start = std::chrono::steady_clock::now();
+        return std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(delay_ms);
+    }
+    bool sclog_thread_enabled() {
+        const uint64_t filter = sclog_pthread_filter();
+        return sclog_time_enabled() && (!filter || (uint64_t)pthread_self() == filter);
+    }
+    bool sclog_condition() {
+        static const bool semaphore_only = getenv("PROSPER_SYNCLOG_SEMA_ONLY") != nullptr;
+        const bool thread_enabled = sclog_thread_enabled();
+        return thread_enabled && !semaphore_only;
+    }
+    bool sclog_semaphore() {
+        static const bool condition_only = getenv("PROSPER_SYNCLOG_COND_ONLY") != nullptr;
+        const bool thread_enabled = sclog_thread_enabled();
+        return thread_enabled && !condition_only;
+    }
+    bool sclog() {
+        static const bool condition_only = getenv("PROSPER_SYNCLOG_COND_ONLY") != nullptr;
+        static const bool semaphore_only = getenv("PROSPER_SYNCLOG_SEMA_ONLY") != nullptr;
+        const bool thread_enabled = sclog_thread_enabled();
+        return thread_enabled && !condition_only && !semaphore_only;
+    }
+    std::atomic<uint64_t> g_sclog_focus_sema{0};
+    bool sclog_focused_semaphore(uint64_t sema) {
+        return sclog_time_enabled() && sema &&
+               g_sclog_focus_sema.load(std::memory_order_acquire) == sema;
+    }
+    uint64_t sctid() {
 #if defined(__linux__) || defined(__APPLE__)
-        return (long)prosper_gettid();
+        return sync_trace_tid_value(static_cast<uint64_t>(prosper_gettid()));
+#elif defined(_WIN32)
+        return sync_trace_tid_value(static_cast<uint32_t>(GetCurrentThreadId()));
 #else
         return 0;
 #endif
     }
+#ifdef _WIN32
+    std::mutex g_thread_handle_mx;
+    std::unordered_map<uint64_t, HANDLE> g_thread_handles;
+    void register_current_thread_handle(uint64_t guest_thread) {
+        HANDLE duplicate = nullptr;
+        if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &duplicate,
+                             0, FALSE, DUPLICATE_SAME_ACCESS))
+            return;
+        std::lock_guard<std::mutex> lk(g_thread_handle_mx);
+        auto [it, inserted] = g_thread_handles.emplace(guest_thread, duplicate);
+        if (!inserted) { CloseHandle(it->second); it->second = duplicate; }
+    }
+    void unregister_current_thread_handle(uint64_t guest_thread) {
+        HANDLE handle = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_thread_handle_mx);
+            auto it = g_thread_handles.find(guest_thread);
+            if (it != g_thread_handles.end()) { handle = it->second; g_thread_handles.erase(it); }
+        }
+        if (handle) CloseHandle(handle);
+    }
+    HANDLE duplicate_registered_thread_handle(uint64_t guest_thread) {
+        HANDLE duplicate = nullptr;
+        std::lock_guard<std::mutex> lk(g_thread_handle_mx);
+        auto it = g_thread_handles.find(guest_thread);
+        if (it != g_thread_handles.end())
+            DuplicateHandle(GetCurrentProcess(), it->second, GetCurrentProcess(), &duplicate,
+                            0, FALSE, DUPLICATE_SAME_ACCESS);
+        return duplicate;
+    }
+#endif
 }
 }
 #include <cstdlib>
@@ -353,16 +435,16 @@ HLE(k_condattr_init)    { if (a0) { auto* c = (pthread_condattr_t*)calloc(1, siz
 HLE(k_condattr_destroy) { if (a0 && *(void**)a0) { free(*(void**)a0); *(void**)a0 = nullptr; } return 0; }
 HLE(k_cond_init)      { if (!a0) return 0x16; auto* c = (pthread_cond_t*)calloc(1, sizeof(pthread_cond_t)); pthread_cond_init(c, nullptr); *(void**)a0 = c; return 0; }
 HLE(k_cond_destroy)   { if (a0 && !pt_static_sentinel(*(void**)a0)) { pthread_cond_destroy((pthread_cond_t*)*(void**)a0); free(*(void**)a0); } if (a0) *(void**)a0 = nullptr; return 0; }
-HLE(k_cond_signal)    { if (sclog()) fprintf(stderr, "[sync2] T%ld COND.signal    cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); if (auto* c = ensure_cond(a0)) interruptible_cond_signal(c); return 0; }
-HLE(k_cond_broadcast) { if (sclog()) fprintf(stderr, "[sync2] T%ld COND.broadcast cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); if (auto* c = ensure_cond(a0)) interruptible_cond_broadcast(c); return 0; }
-HLE(k_cond_wait)      { if (sclog()) fprintf(stderr, "[sync2] T%ld COND.wait.ent  cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0);
+HLE(k_cond_signal)    { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.signal    cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); if (auto* c = ensure_cond(a0)) interruptible_cond_signal(c); return 0; }
+HLE(k_cond_broadcast) { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.broadcast cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); if (auto* c = ensure_cond(a0)) interruptible_cond_broadcast(c); return 0; }
+HLE(k_cond_wait)      { if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.wait.ent  cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0);
     { auto* c = ensure_cond(a0); auto* m = ensure_mutex(a1);
       if (c && m) {
           guest_mutex_released(m);
           const int result = interruptible_cond_wait(c, m);
           if (result == 0) guest_mutex_acquired(m);
       } }
-    if (sclog()) fprintf(stderr, "[sync2] T%ld COND.wait.exit cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); return 0; }
+    if (sclog_condition()) fprintf(stderr, "[sync2] T%" PRIu64 " COND.wait.exit cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); return 0; }
 // POSIX pthread_cond_timedwait(cond_slot, mutex_slot, const timespec* abstime) — abstime is an
 // ABSOLUTE CLOCK_REALTIME deadline ({i64 sec, i64 nsec}, FreeBSD == Linux x86-64 layout), and the
 // POSIX shim returns the errno VALUE directly (FreeBSD ETIMEDOUT = 60). This was an unimplemented
@@ -623,11 +705,20 @@ namespace {
 // null-derived pointer; (2) it never ran guest_tls_activate_thread(), so the worker had no guest
 // %fs TCB and its initial-exec TLS was wrong. This trampoline fixes both: activate the guest %fs
 // TCB, then call the guest entry through the SysV marshalling shim, and purge DTV on exit.
-struct WinThreadStart { uint64_t entry; void* arg; };
+struct WinThreadStart { uint64_t entry; void* arg; char name[64]; };
 extern "C" uint64_t prosper_call_guest_sysv(uint64_t fn, uint64_t a0, uint64_t a1);
 void* win_thread_trampoline(void* p) {
     auto* ts = (WinThreadStart*)p;
-    uint64_t entry = ts->entry; void* arg = ts->arg; free(ts);   // host libc: run on host %fs (before activate)
+    uint64_t entry = ts->entry; void* arg = ts->arg;
+    char name[sizeof(ts->name)]; memcpy(name, ts->name, sizeof(name));
+    free(ts);   // host libc: run on host %fs (before activate)
+    if (name[0]) {
+        wchar_t wname[sizeof(name)]{};
+        MultiByteToWideChar(CP_UTF8, 0, name, -1, wname, (int)(sizeof(wname) / sizeof(wname[0])));
+        SetThreadDescription(GetCurrentThread(), wname);
+    }
+    uint64_t guest_thread = (uint64_t)pthread_self();
+    register_current_thread_handle(guest_thread);
     // Register this worker's stack bounds FIRST, keyed by the Windows thread id (== exec_image_win's
     // cur_tid) so a guest GC that queries its own stack base (GC_register_my_thread / stack scanning —
     // e.g. Unity's AssetGarbageCollectorHelper) finds real bounds instead of wedging on "Bad stack
@@ -635,8 +726,10 @@ void* win_thread_trampoline(void* p) {
     // gives the committed stack range (Win8+).
     ULONG_PTR stk_lo = 0, stk_hi = 0;
     GetCurrentThreadStackLimits(&stk_lo, &stk_hi);
-    if (stk_lo && stk_hi > stk_lo)
+    if (stk_lo && stk_hi > stk_lo) {
         register_thread_stack((uint64_t)GetCurrentThreadId(), (void*)stk_lo, (uint64_t)(stk_hi - stk_lo));
+        register_thread_stack(guest_thread, (void*)stk_lo, (uint64_t)(stk_hi - stk_lo));
+    }
     trace_guest_thread_lifecycle(true, (uint64_t)pthread_self(),
                                  (uint64_t)GetCurrentThreadId(), (void*)stk_lo,
                                  (size_t)(stk_hi - stk_lo));
@@ -647,6 +740,8 @@ void* win_thread_trampoline(void* p) {
                                  (uint64_t)GetCurrentThreadId(), (void*)stk_lo,
                                  (size_t)(stk_hi - stk_lo));
     unregister_thread_stack((uint64_t)GetCurrentThreadId());   // ids recycle; stale bounds = wrong bounds
+    unregister_thread_stack(guest_thread);
+    unregister_current_thread_handle(guest_thread);
     return rv;
 }
 }
@@ -680,6 +775,7 @@ HLE(k_pthread_create) {
     pthread_attr_setstacksize(&la, ssz);
     pthread_attr_setdetachstate(&la, detach);
     auto* ts = (ThreadStart*)malloc(sizeof(ThreadStart));
+    if (!ts) { pthread_attr_destroy(&la); return 12; }         // ENOMEM (FreeBSD and host agree)
     ts->entry = entry; ts->arg = arg; ts->name[0] = 0;
     if (a4) { strncpy(ts->name, (const char*)(uintptr_t)a4, sizeof(ts->name) - 1); ts->name[sizeof(ts->name) - 1] = 0; }
     int r = pthread_create(&tid, &la, thread_trampoline, ts);   // trampoline registers the stack first
@@ -691,7 +787,10 @@ HLE(k_pthread_create) {
     // skips TLS activation, crashing the worker on a null-derived pointer.
     pthread_attr_t* at = (a1 && *(void**)a1) ? (pthread_attr_t*)*(void**)a1 : nullptr;
     auto* ts = (WinThreadStart*)malloc(sizeof(WinThreadStart));
+    if (!ts) return 12;                                        // ENOMEM (FreeBSD and host agree)
     ts->entry = (uint64_t)(uintptr_t)entry; ts->arg = arg;
+    ts->name[0] = 0;
+    if (a4) { strncpy(ts->name, (const char*)(uintptr_t)a4, sizeof(ts->name) - 1); ts->name[sizeof(ts->name) - 1] = 0; }
     int r = pthread_create(&tid, at, win_thread_trampoline, ts);
     if (r) { free(ts); return (uint64_t)r; }
 #endif
@@ -720,21 +819,133 @@ HLE(k_pthread_exit)   {
     trace_guest_thread_lifecycle(false, (uint64_t)pthread_self(),
                                  (uint64_t)GetCurrentThreadId(), stack_base, stack_size);
     unregister_thread_stack((uint64_t)GetCurrentThreadId());
+    unregister_thread_stack((uint64_t)pthread_self());
+    unregister_current_thread_handle((uint64_t)pthread_self());
 #endif
     pthread_exit((void*)(uintptr_t)a0);
     return 0;
 }
 
 // --- thread-local storage keys (IL2CPP uses these heavily) -> host pthread keys ---
+#ifdef _WIN32
+namespace {
+std::mutex g_win_key_thunks_mutex;
+std::unordered_map<uint64_t, void*> g_win_key_thunks;
+std::atomic<void (*)(uint64_t)> g_win_key_delete_after_host_hook{nullptr};
+
+// winpthreads invokes key destructors with the Microsoft x64 ABI, but every guest callback uses
+// the PS5/FreeBSD SysV ABI. Emit one tiny Microsoft-ABI thunk per live key so winpthreads can retain
+// its normal destructor iteration semantics while the callback value is delivered in guest RDI.
+void* win_make_key_destructor_thunk(uint64_t guest_destructor) {
+    auto* code = static_cast<uint8_t*>(VirtualAlloc(
+        nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!code) return nullptr;
+
+    size_t offset = 0;
+    auto byte = [&](uint8_t value) { code[offset++] = value; };
+    auto qword = [&](uint64_t value) {
+        std::memcpy(code + offset, &value, sizeof value);
+        offset += sizeof value;
+    };
+
+    // winpthreads leaves its per-key "used" flag set after pthread_setspecific(key, nullptr),
+    // then invokes the destructor with a null value at thread exit. POSIX requires callbacks only
+    // for non-null values, so discard that spurious invocation before crossing into guest code.
+    byte(0x48); byte(0x85); byte(0xc9);                 // test rcx, rcx
+    byte(0x74); byte(0x24);                             // je final ret
+
+    // rcx=value -> prosper_call_guest_sysv(guest_destructor, value, 0).
+    byte(0x48); byte(0x89); byte(0xca);                 // mov rdx, rcx
+    byte(0x48); byte(0xb9); qword(guest_destructor);    // mov rcx, guest_destructor
+    byte(0x45); byte(0x31); byte(0xc0);                 // xor r8d, r8d
+    byte(0x48); byte(0xb8);
+    qword((uint64_t)(uintptr_t)&prosper_call_guest_sysv); // mov rax, ABI bridge
+    byte(0x48); byte(0x83); byte(0xec); byte(0x28);     // shadow space + call alignment
+    byte(0xff); byte(0xd0);                             // call rax
+    byte(0x48); byte(0x83); byte(0xc4); byte(0x28);
+    byte(0xc3);                                         // ret
+
+    DWORD old_protect = 0;
+    if (!VirtualProtect(code, 0x1000, PAGE_EXECUTE_READ, &old_protect)) {
+        VirtualFree(code, 0, MEM_RELEASE);
+        return nullptr;
+    }
+    FlushInstructionCache(GetCurrentProcess(), code, offset);
+    return code;
+}
+
+}
+
+void win_set_key_delete_after_host_hook_for_test(void (*hook)(uint64_t)) {
+    g_win_key_delete_after_host_hook.store(hook, std::memory_order_release);
+}
+
+size_t win_key_destructor_thunk_count_for_test() {
+    std::lock_guard<std::mutex> lock(g_win_key_thunks_mutex);
+    return g_win_key_thunks.size();
+}
+#endif
+
 HLE(k_key_create) {
     if (!a0) return 0x16;
     pthread_key_t k;
+#ifdef _WIN32
+    void* thunk = nullptr;
+    int r = 0;
+    {
+        // Keep host key allocation and registry publication atomic with deletion. winpthreads can
+        // immediately reuse a deleted numeric key, so exposing it before the old map entry is gone
+        // can make the new emplace lose and leave its RX thunk permanently untracked.
+        std::lock_guard<std::mutex> lock(g_win_key_thunks_mutex);
+        thunk = a1 ? win_make_key_destructor_thunk(a1) : nullptr;
+        if (a1 && !thunk) return ENOMEM;
+        r = pthread_key_create(&k, (void (*)(void*))thunk);
+        if (!r && thunk) {
+            try {
+                if (!g_win_key_thunks.emplace((uint64_t)k, thunk).second) r = EAGAIN;
+            } catch (const std::bad_alloc&) {
+                r = ENOMEM;
+            }
+            if (r) pthread_key_delete(k);
+        }
+    }
+    if (r) {
+        if (thunk) VirtualFree(thunk, 0, MEM_RELEASE);
+        return (uint64_t)r;
+    }
+#else
     int r = pthread_key_create(&k, (void (*)(void*))(uintptr_t)a1);
     if (r) return (uint64_t)r;
+#endif
     *(uint32_t*)(uintptr_t)a0 = (uint32_t)k;   // hand the guest our host key
     return 0;
 }
-HLE(k_key_delete)    { pthread_key_delete((pthread_key_t)a0); return 0; }
+HLE(k_key_delete)    {
+    const pthread_key_t key = (pthread_key_t)a0;
+#ifdef _WIN32
+    void* thunk = nullptr;
+    int result = 0;
+    {
+        // Do not release the host key until creation is excluded: winpthreads may recycle its
+        // numeric value before the corresponding thunk entry has otherwise been erased.
+        std::lock_guard<std::mutex> lock(g_win_key_thunks_mutex);
+        result = pthread_key_delete(key);
+        if (!result) {
+            if (auto hook = g_win_key_delete_after_host_hook.load(std::memory_order_acquire))
+                hook((uint64_t)key);
+            auto it = g_win_key_thunks.find((uint64_t)key);
+            if (it != g_win_key_thunks.end()) {
+                thunk = it->second;
+                g_win_key_thunks.erase(it);
+            }
+        }
+    }
+    if (thunk) VirtualFree(thunk, 0, MEM_RELEASE);
+#else
+    const int result = pthread_key_delete(key);
+#endif
+    return (uint64_t)(int64_t)result;
+}
 HLE(k_getspecific)   {
     uint64_t rv = (uint64_t)(uintptr_t)pthread_getspecific((pthread_key_t)a0);
     // #312: learn the non-trapping MB3 pool-array address even when the hardware-watch diagnostic
@@ -783,7 +994,7 @@ HLE(k_ef_delete)  {
     if (!has_waiters) ef_destroy(e);               // none parked -> free now; else the last waiter frees
     return 0;
 }
-HLE(k_ef_set)     { auto* e = (EventFlag*)(uintptr_t)a0; if (!e) return 0; if (sclog()) fprintf(stderr, "[sync2] T%ld EF.set       ef=0x%llx bits|=0x%llx\n", sctid(), (unsigned long long)a0, (unsigned long long)a1); interruptible_mutex_lock(&e->m); e->bits |= a1; interruptible_cond_broadcast(&e->c); pthread_mutex_unlock(&e->m); return 0; }
+HLE(k_ef_set)     { auto* e = (EventFlag*)(uintptr_t)a0; if (!e) return 0; if (sclog()) fprintf(stderr, "[sync2] T%" PRIu64 " EF.set       ef=0x%llx bits|=0x%llx\n", sctid(), (unsigned long long)a0, (unsigned long long)a1); interruptible_mutex_lock(&e->m); e->bits |= a1; interruptible_cond_broadcast(&e->c); pthread_mutex_unlock(&e->m); return 0; }
 HLE(k_ef_clear)   { auto* e = (EventFlag*)(uintptr_t)a0; if (!e) return 0; interruptible_mutex_lock(&e->m); e->bits &= a1; pthread_mutex_unlock(&e->m); return 0; }
 // Absolute CLOCK_REALTIME deadline `usec` microseconds from now (for pthread_cond_timedwait
 // on default-attr condvars, which time against CLOCK_REALTIME).
@@ -857,7 +1068,7 @@ HLE(k_ef_wait)    { // (ef, pattern, waitMode, resultPat*, SceKernelUseconds* ti
     // expiry returns KERNEL_ERROR_ETIMEDOUT (Kyty EventFlag.cpp / Errno.h 0x8002003C).
     auto* e = (EventFlag*)(uintptr_t)a0; if (!e) return 0;
     uint64_t ret = 0;
-    if (sclog()) fprintf(stderr, "[sync2] T%ld EF.wait.ent  ef=0x%llx pat=0x%llx mode=0x%llx bits=0x%llx\n",
+    if (sclog()) fprintf(stderr, "[sync2] T%" PRIu64 " EF.wait.ent  ef=0x%llx pat=0x%llx mode=0x%llx bits=0x%llx\n",
                          sctid(), (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
                          (unsigned long long)e->bits);
     interruptible_mutex_lock(&e->m);
@@ -886,7 +1097,7 @@ HLE(k_ef_wait)    { // (ef, pattern, waitMode, resultPat*, SceKernelUseconds* ti
     pthread_mutex_unlock(&e->m);
     if (last) ef_destroy(e);                        // safe: `res` was copied before the free
     if (a3) *(uint64_t*)(uintptr_t)a3 = res;
-    if (sclog()) fprintf(stderr, "[sync2] T%ld EF.wait.exit ef=0x%llx res=0x%llx ret=0x%llx\n",
+    if (sclog()) fprintf(stderr, "[sync2] T%" PRIu64 " EF.wait.exit ef=0x%llx res=0x%llx ret=0x%llx\n",
                          sctid(), (unsigned long long)a0, (unsigned long long)res, (unsigned long long)ret);
     return ret;
 }
@@ -911,13 +1122,16 @@ HLE(k_sema_create) { // (sema*, name, attr, initCount, maxCount, opt)
     auto* s = (Sema*)calloc(1, sizeof(Sema));
     pthread_mutex_init(&s->m, nullptr); pthread_cond_init(&s->c, nullptr); s->count = (int64_t)(int32_t)a3;
     if (a0) *(void**)(uintptr_t)a0 = s;
-    if (sclog()) fprintf(stderr, "[sync2] T%ld SEMA.create  sema=0x%llx name='%s' init=%lld max=%lld\n",
+    if (sclog_semaphore()) fprintf(stderr, "[sync2] T%" PRIu64 " SEMA.create  sema=0x%llx name='%s' init=%lld max=%lld\n",
                          sctid(), (unsigned long long)(uintptr_t)s, a1 ? (const char*)(uintptr_t)a1 : "",
                          (long long)(int32_t)a3, (long long)(int32_t)a4);
     return 0;
 }
 HLE(k_sema_delete) {
     auto* s = (Sema*)(uintptr_t)a0; if (!s) return 0;
+    uint64_t focused = a0;
+    g_sclog_focus_sema.compare_exchange_strong(focused, 0, std::memory_order_acq_rel,
+                                                std::memory_order_acquire);
     interruptible_mutex_lock(&s->m);
     s->deleted = true;
     interruptible_cond_broadcast(&s->c);
@@ -928,7 +1142,10 @@ HLE(k_sema_delete) {
 }
 HLE(k_sema_wait)   { // (sema, need, SceKernelUseconds* timeout) — timeout honored like k_ef_wait
     auto* s = (Sema*)(uintptr_t)a0; if (!s) return 0; int64_t need = a1 ? (int64_t)a1 : 1;
-    if (sclog()) fprintf(stderr, "[sync2] T%ld SEMA.wait     sema=0x%llx need=%lld\n", sctid(), (unsigned long long)a0, (long long)need);
+    const bool log_wait = sclog_semaphore();
+    if (log_wait && sclog_pthread_filter())
+        g_sclog_focus_sema.store(a0, std::memory_order_release);
+    if (log_wait) fprintf(stderr, "[sync2] T%" PRIu64 " SEMA.wait     sema=0x%llx need=%lld\n", sctid(), (unsigned long long)a0, (long long)need);
     uint64_t ret = 0;
     interruptible_mutex_lock(&s->m);
     s->waiters++;
@@ -956,7 +1173,8 @@ HLE(k_sema_wait)   { // (sema, need, SceKernelUseconds* timeout) — timeout hon
     if (last) sema_destroy(s);
     return ret; }
 HLE(k_sema_signal) { auto* s = (Sema*)(uintptr_t)a0; if (!s) return 0; int64_t n = a1 ? (int64_t)a1 : 1;
-    if (sclog()) fprintf(stderr, "[sync2] T%ld SEMA.signal   sema=0x%llx n=%lld\n", sctid(), (unsigned long long)a0, (long long)n);
+    if (sclog_semaphore() || sclog_focused_semaphore(a0))
+        fprintf(stderr, "[sync2] T%" PRIu64 " SEMA.signal   sema=0x%llx n=%lld\n", sctid(), (unsigned long long)a0, (long long)n);
     interruptible_mutex_lock(&s->m); s->count += n; interruptible_cond_broadcast(&s->c); pthread_mutex_unlock(&s->m); return 0; }
 HLE(k_sema_poll)   { auto* s = (Sema*)(uintptr_t)a0; if (!s) return 0; int64_t need = a1 ? (int64_t)a1 : 1;
     interruptible_mutex_lock(&s->m); bool ok = s->count >= need; if (ok) s->count -= need; pthread_mutex_unlock(&s->m); return ok ? 0 : 0x80020023; }
@@ -1246,7 +1464,8 @@ WinCoopSlot* win_coop_slot_for(uint64_t thread, bool create) {
 }
 
 enum class WinCoopQueueResult { Fallback, Queued, Busy };
-WinCoopQueueResult try_queue_wait_exception(uint64_t target, uint64_t type) {
+WinCoopQueueResult try_queue_wait_exception(uint64_t target, uint64_t type,
+                                            HANDLE target_handle) {
     if (getenv("PROSPER_WIN_LEGACY_EXC")) return WinCoopQueueResult::Fallback;
     WinCoopSlot* slot = win_coop_slot_for(target, true);
     if (!slot) return WinCoopQueueResult::Fallback;
@@ -1258,20 +1477,25 @@ WinCoopQueueResult try_queue_wait_exception(uint64_t target, uint64_t type) {
     slot->state.store(WinCoopState::Queued, std::memory_order_release);
     g_win_coop_queued.fetch_add(1, std::memory_order_release);
     const bool interrupted = interrupt_guest_wait(target);
-    HANDLE target_handle = (HANDLE)pthread_gethandle((pthread_t)target);
     win_exc_trace(WinExcTraceKind::CoopQueue, target,
-                  target_handle && target_handle != INVALID_HANDLE_VALUE
-                      ? GetThreadId(target_handle) : 0,
+                  GetThreadId(target_handle),
                   type, 0, interrupted ? 1 : 0);
 
     // The target claims Queued at the wrapper checkpoint before executing the handler. A bounded
-    // handoff closes the race where it left the wait just before our wake. If it does not accept
-    // immediately, leave the request queued: every Windows HLE return is also a safe point, so the
-    // target will acknowledge at its next guest/host boundary without restoring stale native state.
+    // handoff closes the race where it left the wait just before our wake. A request that remains
+    // unclaimed cannot be reported as delivered: withdraw it atomically so the caller can use forced
+    // CONTEXT delivery. The target's Queued->Running claim races this Queued->Idle withdrawal; exactly
+    // one side wins and therefore exactly one side decrements the global queued count.
     for (unsigned spin = 0; spin < 20; ++spin) {
         if (slot->state.load(std::memory_order_acquire) != WinCoopState::Queued)
             return WinCoopQueueResult::Queued;
         Sleep(1);
+    }
+    expected = WinCoopState::Queued;
+    if (slot->state.compare_exchange_strong(expected, WinCoopState::Idle,
+                                            std::memory_order_acq_rel)) {
+        g_win_coop_queued.fetch_sub(1, std::memory_order_acq_rel);
+        return WinCoopQueueResult::Fallback;
     }
     return WinCoopQueueResult::Queued;
 }
@@ -1414,7 +1638,6 @@ void prosper_win_exc_delivery(WinExcDelivery* delivery) {
         !CopyContext(saved, kWinExcContextFlags, captured)) {
         TerminateProcess(GetCurrentProcess(), ERROR_INVALID_STATE);
     }
-
     // FreeBSD amd64 mcontext layout; keep in lockstep with the POSIX signal path above.
     alignas(16) uint8_t ctx[0x400]{};
     auto WQ = [&](int off, uint64_t v) { *(uint64_t*)(ctx + off) = v; };
@@ -1444,12 +1667,31 @@ uint64_t win_raise_exception(uint64_t target, uint64_t type) {
     if (pthread_equal((pthread_t)target, pthread_self())) return 0x80020023ull; // EDEADLK-ish
     if (!g_rtl_restore_context) return 0x80020026ull;                         // ENOSYS-ish
 
-    HANDLE thread = (HANDLE)pthread_gethandle((pthread_t)target);
-    if (!thread || thread == INVALID_HANDLE_VALUE) return 0x80020003ull;       // ESRCH
+    // Hold a real duplicate for the complete queue/fallback transaction. This both validates the
+    // pthread before publishing cooperative state and keeps a detached target's kernel object alive
+    // while delivery is in flight.
+    HANDLE thread = duplicate_registered_thread_handle(target);
+    if (!thread) {
+        HANDLE borrowed = (HANDLE)pthread_gethandle((pthread_t)target);
+        if (borrowed && borrowed != INVALID_HANDLE_VALUE)
+            DuplicateHandle(GetCurrentProcess(), borrowed, GetCurrentProcess(), &thread,
+                            0, FALSE, DUPLICATE_SAME_ACCESS);
+    }
+    struct OwnedHandle { HANDLE value; ~OwnedHandle() { if (value) CloseHandle(value); } }
+        owned{thread};
+    if (!thread || thread == INVALID_HANDLE_VALUE) return 0x80020003ull;          // ESRCH
+    DWORD exit_code = 0;
+    if (!GetExitCodeThread(thread, &exit_code) || exit_code != STILL_ACTIVE)
+        return 0x80020003ull;                                                     // ESRCH
 
-    const WinCoopQueueResult cooperative = try_queue_wait_exception(target, type);
+    const WinCoopQueueResult cooperative = try_queue_wait_exception(target, type, thread);
     if (cooperative == WinCoopQueueResult::Queued) return 0;
     if (cooperative == WinCoopQueueResult::Busy) return 0x80020010ull;
+
+    // The target may have exited during the bounded cooperative handoff. Do not allocate a delivery
+    // record or turn a failed SuspendThread into an opaque Win32 error for a dead pthread.
+    if (!GetExitCodeThread(thread, &exit_code) || exit_code != STILL_ACTIVE)
+        return 0x80020003ull;                                                     // ESRCH
 
     // Do not use the process heap for delivery records. The target can be interrupted while it owns
     // that heap's lock, and freeing a record from its injected handler would then deadlock before the
@@ -1659,6 +1901,14 @@ void dispatch_pending_guest_exception() {
 #endif
 }
 
+uint32_t pending_guest_exception_count() {
+#ifdef _WIN32
+    return g_win_coop_queued.load(std::memory_order_acquire);
+#else
+    return 0;
+#endif
+}
+
 void trace_guest_stack_query(uint64_t target, bool found, void* base, size_t size) {
 #ifdef _WIN32
     win_exc_trace(WinExcTraceKind::StackQuery, target, GetCurrentThreadId(),
@@ -1691,7 +1941,7 @@ HLE(k_raise_exception) {       // (targetThread /*host pthread_t*/, exceptionTyp
     ensure_exc_sig();
     if (g_exc_counter) (*g_exc_counter)++;
     if (g_exc_log)
-        fprintf(stderr, "[exc] T%ld raise target=0x%llx type=0x%llx\n",
+        fprintf(stderr, "[exc] T%" PRIu64 " raise target=0x%llx type=0x%llx\n",
                 sctid(), (unsigned long long)a0, (unsigned long long)a1);
 #if defined(__linux__) || defined(__APPLE__)
     if (a0 && a1 < 128 && g_exc_handlers[a1]) {
@@ -1711,7 +1961,18 @@ HLE(k_raise_exception) {       // (targetThread /*host pthread_t*/, exceptionTyp
                 sctid(), (unsigned long long)a0, (unsigned long long)a1);
     }
 #elif defined(_WIN32)
-    return win_raise_exception(a0, a1);
+    {
+        uint64_t ret = win_raise_exception(a0, a1);
+        if (g_exc_log2) {
+            char msg[192];
+            snprintf(msg, sizeof msg,
+                     "[exc2] RAISE by tid=%ld self=0x%llx target=0x%llx type=0x%llx ret=0x%llx\n",
+                     sctid(), (unsigned long long)(uint64_t)pthread_self(),
+                     (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)ret);
+            win_exc_log(msg); // raw Win32 stderr write: target may be suspended while owning FILE's lock
+        }
+        return ret;
+    }
 #endif
     return 0;
 }

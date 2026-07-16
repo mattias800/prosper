@@ -25,6 +25,7 @@ std::atomic<int> g_waiters{0};
 #ifdef _WIN32
 enum class WaitKind : uint32_t { None, Address, Sequence };
 struct WaitSlot {
+    std::atomic<uint64_t> pthread_id{0};
     std::atomic<uint64_t> windows_tid{0};
     std::atomic<uintptr_t> object{0};
     std::atomic<WaitKind> kind{WaitKind::None};
@@ -60,11 +61,13 @@ WaitSlot* register_wait(WaitKind kind, uintptr_t object) {
                 owner, kWaitSlotPublishing, std::memory_order_acq_rel))
             continue;
 
-        // Publish the owner last. Each nested wait owns a distinct slot: the GC callback itself
-        // waits on semaphores and must not erase the interrupted outer wait when it returns.
+        // Each nested wait owns a distinct slot: the GC callback itself waits on semaphores and must
+        // not erase the interrupted outer wait when it returns. pthread_id is the publication field;
+        // readers that acquire it see the complete kind/object pair for this ownership generation.
         slot.object.store(object, std::memory_order_relaxed);
         slot.kind.store(kind, std::memory_order_relaxed);
-        slot.windows_tid.store(windows_tid, std::memory_order_release);
+        slot.windows_tid.store(windows_tid, std::memory_order_relaxed);
+        slot.pthread_id.store((uint64_t)pthread_self(), std::memory_order_release);
         return &slot;
     }
     return nullptr;
@@ -72,6 +75,10 @@ WaitSlot* register_wait(WaitKind kind, uintptr_t object) {
 
 void unregister_wait(WaitSlot* slot) {
     if (!slot) return;
+    // Withdraw publication before clearing the payload or releasing the claim for reuse.
+    slot->pthread_id.store(0, std::memory_order_release);
+    slot->object.store(0, std::memory_order_relaxed);
+    slot->kind.store(WaitKind::None, std::memory_order_relaxed);
     slot->windows_tid.store(0, std::memory_order_release);
 }
 #endif
@@ -204,15 +211,14 @@ int interruptible_mutex_lock(pthread_mutex_t* mutex) {
 
 bool interrupt_guest_wait(uint64_t thread) {
 #ifdef _WIN32
-    HANDLE handle = (HANDLE)pthread_gethandle((pthread_t)thread);
-    if (!handle || handle == INVALID_HANDLE_VALUE) return false;
-    const uint64_t windows_tid = GetThreadId(handle);
-    if (!windows_tid) return false;
     bool interrupted = false;
     for (WaitSlot& slot : g_wait_slots) {
-        if (slot.windows_tid.load(std::memory_order_acquire) != windows_tid) continue;
-        const WaitKind kind = slot.kind.load(std::memory_order_acquire);
+        if (slot.pthread_id.load(std::memory_order_acquire) != thread) continue;
+        const WaitKind kind = slot.kind.load(std::memory_order_relaxed);
         const uintptr_t object = slot.object.load(std::memory_order_relaxed);
+        // The waiter may have unregistered while the payload was being read. Never act on fields
+        // unless the same target still publishes this slot after those reads.
+        if (slot.pthread_id.load(std::memory_order_acquire) != thread) continue;
         if (kind == WaitKind::Address && object) {
             WakeByAddressAll((PVOID)object);
             interrupted = true;

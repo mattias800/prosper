@@ -47,6 +47,13 @@ static pthread_mutex_t nested_wait_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t nested_wait_cond = PTHREAD_COND_INITIALIZER;
 static int fails;
 
+struct CondDestroyRace {
+    pthread_mutex_t mutex{};
+    pthread_cond_t cond{};
+    volatile LONG ready = 0;
+    volatile LONG returned = 0;
+};
+
 #define CHECK(cond, msg) do { if (!(cond)) { std::printf("  [FAIL] %s\n", msg); fails++; } \
                               else        { std::printf("  [ok]   %s\n", msg); } } while (0)
 
@@ -123,6 +130,23 @@ static void* repeat_worker(void*) {
     return nullptr;
 }
 
+static void* cond_destroy_race_worker(void* raw) {
+    auto* race = static_cast<CondDestroyRace*>(raw);
+    pthread_mutex_lock(&race->mutex);
+    InterlockedExchange(&race->ready, 1);
+    interruptible_cond_wait(&race->cond, &race->mutex);
+    pthread_mutex_unlock(&race->mutex);
+    InterlockedExchange(&race->returned, 1);
+    return nullptr;
+}
+
+extern "C" __attribute__((sysv_abi)) void* detached_guest_worker(void*) {
+    worker_tid = GetCurrentThreadId();
+    wait_on_address((uint64_t)(uintptr_t)&wait_word, 0, 0, 0, 0, 0);
+    InterlockedExchange(&resumed, 1);
+    return nullptr;
+}
+
 static void* avx_worker(void*) {
     worker_tid = GetCurrentThreadId();
     __asm__ volatile(
@@ -153,6 +177,10 @@ static void* gpr_worker(void*) {
           [stop] "r"(&gpr_stop), [observed] "r"(&gpr_observed)
         : "r12", "memory", "cc");
     InterlockedExchange(&resumed, 1);
+    return nullptr;
+}
+
+static void* exited_worker(void*) {
     return nullptr;
 }
 
@@ -344,6 +372,36 @@ int main() {
     reset_delivery_state();
     _putenv_s("PROSPER_WIN_LEGACY_EXC", "");
     _putenv_s("PROSPER_WIN_COOPERATIVE_EXC", "1");
+
+    // Default delivery first offers a cooperative checkpoint, but a target running guest CPU code
+    // may not reach one. The bounded queue must be withdrawn and forced-CONTEXT delivery must run the
+    // handler before success is returned. Repeating on one target also proves its slot was returned to
+    // Idle and the global queued counter did not leak.
+    CHECK(pthread_create(&thread, nullptr, gpr_worker, nullptr) == 0,
+          "create CPU-bound default-delivery target thread");
+    for (int i = 0; i < 1000 && !gpr_ready; ++i) Sleep(1);
+    bool cpu_fallback_ok = worker_tid != 0 && gpr_ready != 0;
+    for (LONG expected_deliveries = 1; expected_deliveries <= 2 && cpu_fallback_ok;
+         ++expected_deliveries) {
+        result = raise((uint64_t)thread, 0x1e, 0, 0, 0, 0);
+        for (int spin = 0; spin < 2000 && delivered < expected_deliveries; ++spin) Sleep(1);
+        cpu_fallback_ok = result == 0 && delivered == expected_deliveries &&
+                          pending_guest_exception_count() == 0;
+    }
+    InterlockedExchange(&gpr_stop, 1);
+    pthread_join(thread, nullptr);
+    CHECK(cpu_fallback_ok,
+          "CPU-bound target receives two fallback deliveries with no queued state leak");
+
+    pthread_t exited_thread{};
+    CHECK(pthread_create(&exited_thread, nullptr, exited_worker, nullptr) == 0,
+          "create target that exits before exception delivery");
+    pthread_join(exited_thread, nullptr);
+    result = raise((uint64_t)exited_thread, 0x1e, 0, 0, 0, 0);
+    CHECK(result == 0x80020003ull && pending_guest_exception_count() == 0,
+          "exited target returns ESRCH without publishing queued state");
+
+    reset_delivery_state();
     pthread_mutex_lock(&wait_mutex);
     CHECK(pthread_create(&thread, nullptr, cond_worker, nullptr) == 0,
           "create cooperative-delivery target thread");
@@ -420,7 +478,78 @@ int main() {
     CHECK(delivered == 1, "pre-sleep checkpoint accepted the queued delivery once");
     CHECK(handler_tid == worker_tid, "pre-sleep handler ran on requested target");
     CHECK(resumed != 0, "target continued through its wait after pre-sleep delivery");
+
+    // A natural condition signal can let the target return and destroy its guest synchronization
+    // objects immediately after the GC wake is queued. Repeating the same stack addresses stresses
+    // both delayed wake work and address reuse: exception delivery must touch only the lifetime-stable
+    // sequence slot, never a detached helper's raw pthread_cond_t/pthread_mutex_t pointers.
+    bool cond_destroy_race_ok = true;
+    for (int iteration = 0; iteration < 32 && cond_destroy_race_ok; ++iteration) {
+        reset_delivery_state();
+        CondDestroyRace race{};
+        const int mutex_init = pthread_mutex_init(&race.mutex, nullptr);
+        const int cond_init = mutex_init == 0 ? pthread_cond_init(&race.cond, nullptr) : -1;
+        if (mutex_init != 0 || cond_init != 0) {
+            if (cond_init == 0) pthread_cond_destroy(&race.cond);
+            if (mutex_init == 0) pthread_mutex_destroy(&race.mutex);
+            cond_destroy_race_ok = false;
+            break;
+        }
+        pthread_t race_thread{};
+        if (pthread_create(&race_thread, nullptr, cond_destroy_race_worker, &race) != 0) {
+            pthread_cond_destroy(&race.cond);
+            pthread_mutex_destroy(&race.mutex);
+            cond_destroy_race_ok = false;
+            break;
+        }
+        for (int spin = 0; spin < 1000 && !race.ready; ++spin) Sleep(1);
+        // The worker registers its wait before unlocking this mutex. Acquiring it proves publication
+        // completed before the exception and natural signal are raced.
+        pthread_mutex_lock(&race.mutex);
+        pthread_mutex_unlock(&race.mutex);
+        const uint64_t race_result = raise((uint64_t)race_thread, 0x1e, 0, 0, 0, 0);
+        interruptible_cond_signal(&race.cond);
+        pthread_join(race_thread, nullptr);
+        const int cond_destroyed = pthread_cond_destroy(&race.cond);
+        const int mutex_destroyed = pthread_mutex_destroy(&race.mutex);
+        cond_destroy_race_ok = race_result == 0 && delivered == 1 && race.returned != 0 &&
+                               cond_destroyed == 0 && mutex_destroyed == 0;
+        SwitchToThread();
+    }
+    CHECK(cond_destroy_race_ok,
+          "natural condition wake plus immediate destroy is safe across 32 queued GC races");
     _putenv_s("PROSPER_WIN_COOPERATIVE_EXC", "");
+
+    // Winpthreads may discard its pthread_t lookup for a detached worker before that worker exits.
+    // Guest runtimes retain the opaque id and may still stop the worker for GC, so both cooperative
+    // wait lookup and the legacy/fallback HANDLE path must follow the worker's actual lifetime.
+    reset_delivery_state();
+    HleFn attr_init = Hle::lookup(nid_hash("scePthreadAttrInit"));
+    HleFn attr_setdetach = Hle::lookup(nid_hash("scePthreadAttrSetdetachstate"));
+    HleFn attr_destroy = Hle::lookup(nid_hash("scePthreadAttrDestroy"));
+    HleFn guest_create = Hle::lookup(nid_hash("scePthreadCreate"));
+    CHECK(attr_init && attr_setdetach && attr_destroy && guest_create,
+          "guest detached-thread HLE functions registered");
+    void* detached_attr = nullptr;
+    uint64_t detached_thread = 0;
+    if (attr_init && attr_setdetach && attr_destroy && guest_create) {
+        attr_init((uint64_t)(uintptr_t)&detached_attr, 0, 0, 0, 0, 0);
+        attr_setdetach((uint64_t)(uintptr_t)&detached_attr, 1, 0, 0, 0, 0);
+        CHECK(guest_create((uint64_t)(uintptr_t)&detached_thread,
+                           (uint64_t)(uintptr_t)&detached_attr,
+                           (uint64_t)(uintptr_t)&detached_guest_worker, 0, 0, 0) == 0,
+              "create detached guest worker through HLE trampoline");
+        attr_destroy((uint64_t)(uintptr_t)&detached_attr, 0, 0, 0, 0, 0);
+        for (int i = 0; i < 1000 && !worker_tid; ++i) Sleep(1);
+        CHECK(worker_tid != 0, "detached guest worker entered blocking HLE futex");
+        result = raise(detached_thread, 0x1e, 0, 0, 0, 0);
+        CHECK(result == 0, "raise exception to live detached guest worker");
+        for (int i = 0; i < 2000 && !resumed; ++i) Sleep(1);
+        CHECK(delivered == 1 && handler_tid == worker_tid,
+              "detached worker received one exception on its native target thread");
+        CHECK(resumed != 0, "detached worker resumed and exited normally");
+        Sleep(20); // allow the detached trampoline to finish its lifetime-bound cleanup
+    }
 
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
     std::printf("== PASS ==\n");
