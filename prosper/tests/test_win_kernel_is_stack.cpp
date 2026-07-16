@@ -89,8 +89,10 @@ int main() {
     // through our pthread HLE. winpthreads cannot always translate that implicit handle with
     // pthread_gethandle(), so a self-query must fall back to the current native thread id.
     bool std_thread_self_resolved = false;
+    uint64_t std_thread_native_id = 0;
     std::thread frontend_guest([&] {
         uint8_t stack_byte = 0;
+        std_thread_native_id = (uint64_t)GetCurrentThreadId();
         run_guest_inits({});
         void* self_base = nullptr;
         size_t self_size = 0;
@@ -98,9 +100,12 @@ int main() {
             guest_stack_for_thread((uint64_t)pthread_self(), &self_base, &self_size) &&
             (uintptr_t)&stack_byte >= (uintptr_t)self_base &&
             (uintptr_t)&stack_byte < (uintptr_t)self_base + self_size;
-        unregister_thread_stack((uint64_t)GetCurrentThreadId());
     });
     frontend_guest.join();
+    void* exited_base = nullptr;
+    size_t exited_size = 0;
+    bool std_thread_registration_cleaned = !guest_stack_for_thread(
+        std_thread_native_id, &exited_base, &exited_size);
 
     // A stale/unknown target must leave the caller-provided attr unchanged. Falling back to the
     // querying thread here is the exact wrong-stack substitution that can corrupt a GC scan.
@@ -122,14 +127,16 @@ int main() {
     bool unregistered = is_stack(addr, 0, 0, 0, 0, 0) == 0;
 
     if (!inside || !below || !at_end || !attr_bounds || !worker_created || !resolved_worker ||
-        !target_attr_bounds || !std_thread_self_resolved || !missing_target_unchanged ||
-        !unregistered) {
+        !target_attr_bounds || !std_thread_self_resolved || !std_thread_registration_cleaned ||
+        !missing_target_unchanged || !unregistered) {
         std::fprintf(stderr,
                      "stack HLE mismatch: inside=%d below=%d at_end=%d attr_bounds=%d "
                      "worker_created=%d resolved_worker=%d target_attr_bounds=%d std_self=%d "
+                     "std_cleaned=%d "
                      "missing_unchanged=%d reported=%p/%zu expected=%p/%zu unregistered=%d\n",
                      inside, below, at_end, attr_bounds, worker_created, resolved_worker,
-                     target_attr_bounds, std_thread_self_resolved, missing_target_unchanged,
+                     target_attr_bounds, std_thread_self_resolved,
+                     std_thread_registration_cleaned, missing_target_unchanged,
                      reported_base, reported_size,
                      probe.base, probe.size, unregistered);
         return 1;

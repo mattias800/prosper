@@ -13,6 +13,10 @@
 // one-shot int3 logger (`PROSPER_WIN_BP=off[,off...]`) is available for native branch-order probes.
 #ifdef _WIN32
 
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00   // GetCurrentThreadStackLimits (Windows 8+)
+#endif
+
 #include "exec_image.hpp"
 #include "guest_write_watch.hpp"
 #include "sse4a.hpp"
@@ -127,6 +131,21 @@ namespace {
     // Thread-stack registry (portable; mirrors the Linux one) so GC/thread code gets real bounds.
     std::map<uint64_t, std::pair<uint64_t, uint64_t>> g_stacks;
     std::mutex g_smx;
+
+    // run_guest_inits may attach a host/frontend thread to IL2CPP before run_entry moves guest
+    // execution elsewhere. Keep those bounds available while that thread lives (the collector can
+    // query it later), but remove the native-id entry when a temporary boot thread exits so Windows
+    // TID reuse cannot inherit stale stack bounds. Thread-local destruction happens while this
+    // registry is still alive.
+    struct InitThreadStackRegistration {
+        uint64_t native_tid = 0;
+        ~InitThreadStackRegistration() {
+            if (!native_tid) return;
+            std::lock_guard<std::mutex> lk(g_smx);
+            g_stacks.erase(native_tid);
+        }
+    };
+    thread_local InitThreadStackRegistration t_init_stack_registration;
 
     std::vector<std::pair<uint64_t, uint64_t>> g_modstart_param_ranges;
     struct ModStartDesc { uint64_t a, b, c; } g_modstart_desc = { 0x10, 0x200, 0 };
@@ -605,8 +624,10 @@ size_t run_guest_inits(const std::vector<uint64_t>& fns) {
     // produce a half-constructed Il2CppThread whose thread-static table is null.
     ULONG_PTR stack_lo = 0, stack_hi = 0;
     GetCurrentThreadStackLimits(&stack_lo, &stack_hi);
-    if (stack_lo && stack_hi > stack_lo)
+    if (stack_lo && stack_hi > stack_lo) {
         register_thread_stack(cur_tid(), (void*)stack_lo, (uint64_t)(stack_hi - stack_lo));
+        t_init_stack_registration.native_tid = cur_tid();
+    }
     guest_tls_activate_thread();   // give this (main) thread its guest %fs TCB before running guest code
     size_t ok = 0;
     for (uint64_t f : fns) {
