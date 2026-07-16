@@ -97,6 +97,7 @@ int main(int argc, char** argv) {
     // neighbour.
     const std::vector<ImportSlot> slots = {{"test", "test.hle.unimplemented"}, {"test", kNid}};
     std::string err;
+    dispatch_init(&slots, nullptr);
     CHECK(install_stubs(slots, 0x710000000ull, 96, &err), "generated adjacent unresolved and executable import stubs");
 #if defined(__linux__)
     if (guest_fs) {
@@ -108,6 +109,16 @@ int main(int argc, char** argv) {
         if (!err.empty()) std::printf("  install error: %s\n", err.c_str());
         return 1;
     }
+
+#ifdef _WIN32
+    _putenv_s("PROSPER_UNIMPL_STACK", "1");
+#endif
+    auto unresolved = reinterpret_cast<GuestHle9>(static_cast<uintptr_t>(stub_addr(0)));
+    CHECK(unresolved(kArgs[0], kArgs[1], kArgs[2], kArgs[3], kArgs[4],
+                     kArgs[5], kArgs[6], kArgs[7], kArgs[8]) == 0,
+          "unresolved import stub returned the generic result");
+    CHECK(call_order().size() == 1 && call_order()[0] == 0,
+          "unresolved import stub preserved its dispatch index");
 
     bool guest_fs_active = false;
 #if defined(__linux__)

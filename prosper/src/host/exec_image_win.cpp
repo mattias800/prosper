@@ -190,6 +190,10 @@ namespace {
     void emit_unimpl(uint8_t* p, uint32_t idx, uint64_t fn) {
         size_t o = 0;
         p[o++] = 0x48; p[o++] = 0x83; p[o++] = 0xEC; p[o++] = 0x28;    // sub rsp,0x28 (shadow + align)
+        p[o++] = 0x48; p[o++] = 0x8B; p[o++] = 0x54; p[o++] = 0x24; p[o++] = 0x28;
+                                                                        // mov rdx,[rsp+0x28] (guest return)
+        p[o++] = 0x4C; p[o++] = 0x8D; p[o++] = 0x44; p[o++] = 0x24; p[o++] = 0x28;
+                                                                        // lea r8,[rsp+0x28] (guest rsp)
         p[o++] = 0xB9; memcpy(p + o, &idx, 4); o += 4;                 // mov ecx,idx  (MS 1st arg)
         p[o++] = 0x48; p[o++] = 0xB8; memcpy(p + o, &fn, 8); o += 8;   // movabs rax,fn
         p[o++] = 0xFF; p[o++] = 0xD0;                                  // call rax  (prosper_on_unimpl)
