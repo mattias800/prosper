@@ -1989,12 +1989,21 @@ void dump_guest_thread_trace() {
             guest_returns_used += (size_t)appended;
             ++guest_return_count;
         }
+        char wait_description[64] = "-";
+        GuestWaitSnapshot wait{};
+        if (snapshot_guest_wait(native_id, wait)) {
+            const char* kind = wait.kind == GuestWaitKind::Address ? "address" :
+                               wait.kind == GuestWaitKind::ConditionSequence ? "condition" :
+                               "unknown";
+            std::snprintf(wait_description, sizeof(wait_description), "%s@0x%llx", kind,
+                          (unsigned long long)wait.object);
+        }
         trace("[thread-trace] tid=%lu pthread=0x%llx rip=%s+0x%llx "
-              "raw=0x%llx rsp=0x%llx suspend=%lu guest-stack=%s\n",
+              "raw=0x%llx rsp=0x%llx suspend=%lu wait=%s guest-stack=%s\n",
               (unsigned long)native_id, (unsigned long long)pthread_id, module,
               (unsigned long long)offset, (unsigned long long)rip,
               (unsigned long long)context.Rsp, (unsigned long)prior_suspend,
-              guest_returns);
+              wait_description, guest_returns);
     }
 #endif
 }

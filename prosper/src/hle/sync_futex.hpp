@@ -9,6 +9,12 @@
 
 namespace prosper {
 
+enum class GuestWaitKind : uint32_t { None, Address, ConditionSequence };
+struct GuestWaitSnapshot {
+    GuestWaitKind kind = GuestWaitKind::None;
+    uintptr_t object = 0;
+};
+
 // Bracket a blocking guest futex wait: enter before FUTEX_WAIT, exit after it returns. Lets
 // wake_label_waiters skip its wake syscalls entirely while no thread is blocked.
 using WaitRegistration = void*;
@@ -28,6 +34,10 @@ int interruptible_mutex_lock(pthread_mutex_t* mutex);
 // registered WaitOnAddress or pthread-condition wait so it can enter its redirected context.
 // Returns true when a registered wait was found and woken.
 bool interrupt_guest_wait(uint64_t thread);
+
+// Read a Windows guest thread's currently registered interruptible wait. Used by the
+// app checkpoint to distinguish futex/label waits from pthread condition waits.
+bool snapshot_guest_wait(uint64_t windows_tid, GuestWaitSnapshot& snapshot);
 
 // FUTEX_WAKE up to n waiters blocked on the 32-bit word at addr. No-op when addr==0 or non-Linux.
 void futex_wake(uint64_t addr, int n);
