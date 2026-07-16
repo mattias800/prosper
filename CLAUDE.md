@@ -289,6 +289,53 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   live renderer, `PROSPER_GFXLOG=1` for graphics diagnostics.
 - **Correctness-first:** implement real behavior (cross-checked against the Kyty PS5-emulator reference in
   `../Kyty`), not shims that fake output. Mark genuinely-uncertain code with `CONFIDENCE: HIGH/MED/LOW`.
+- **Independent review is a mandatory merge gate for every agent-authored PR.** The implementing agent must
+  never merge its own work immediately after coding, even when its tests pass. Once the implementation and
+  author-side verification are ready, push the branch, open or update the PR, and spawn a fresh code-review
+  sub-agent that did not write the change. The reviewer works from its own worktree at the exact PR head and
+  treats correctness as priority 1; style and convenience never outweigh behavioral correctness.
+  - Before requesting review, make the PR description self-contained: link the issue/goal; explain the failure
+    scenario and violated contract; describe the approach and important invariants; identify affected and
+    deliberately unaffected behavior; list risks, uncertainty, and compatibility concerns; and give exact
+    author-side build/test/snapshot commands and results. A reviewer should not need private chat context.
+  - Give the reviewer the PR number and ask it to review. Direct author/reviewer communication should otherwise
+    be limited to coordination such as `review requested` and `review posted`; put all substantive context,
+    questions, findings, replies, verification evidence, and approval on the PR as comments so the complete
+    decision trail is durable and traceable. Sign reviewer comments with one stable reviewer name.
+  - The reviewer must read this file, every applicable `AGENTS.md`, the PR description and linked issue, the
+    relevant architecture/status docs, the full base-to-head diff, all PR discussion, and the affected callers
+    and data paths rather than reviewing changed lines in isolation. The author may identify known risks and
+    required checks in the PR, but must not prime the reviewer with an expected conclusion.
+  - The review must be adversarial and evidence-based. Check assumptions, invariants, ABI/API contracts,
+    ownership and lifetimes, concurrency and ordering, bounds/overflow, error and cleanup paths, malformed
+    inputs, platform differences, compatibility with old captures/state, and whether diagnostics themselves
+    are race-safe and truthful. Inspect tests for meaningful failure coverage; passing tests are evidence, not
+    proof. For renderer/recompiler/detile/present changes, the mandatory snapshot gate remains part of review.
+  - The reviewer runs the strongest relevant focused builds/tests and required integration or snapshot checks.
+    If a required check cannot run, it posts the exact blocker and does not approve. It posts every finding on
+    the PR with severity, exact location, a concrete failing scenario, the violated contract, and the expected
+    fix or regression test. New regressions in the PR are blockers; genuinely pre-existing or out-of-scope bugs
+    follow the issue-tracking rules below.
+  - The author replies to every finding on the PR and pushes fixes. The same reviewer should re-read the complete
+    updated diff and re-run affected verification; if unavailable, a replacement reviewer must read the whole
+    review thread and perform the same full review. Continue until the reviewer explicitly posts either
+    `APPROVED FOR MERGE at <full-head-SHA>` or `NOT APPROVED`, with remaining concerns. Approval is valid only
+    for that exact head: any subsequent code change requires re-review and a new approval.
+  - Never merge with unresolved correctness findings, failing required checks, a waived mandatory verification
+    step, or approval for an older head. Reviewer approval satisfies the quality gate but is not permission to
+    merge: the agent may merge only when the user/task separately authorizes it.
+
+  Use this minimum review brief when spawning the sub-agent:
+  ```text
+  Review PR #<N> as an independent, correctness-first reviewer. Use the PR description and comments as the
+  complete coordination record. Read CLAUDE.md, applicable AGENTS.md files, the linked issue, relevant docs,
+  full base...head diff, and all PR discussion. Inspect affected callers and invariants, not just changed lines.
+  Run the strongest relevant verification, including mandatory snapshot checks. Post every finding, question,
+  test result, and final verdict on the PR, signed with a stable reviewer name; include severity, exact location,
+  concrete failure scenario, required fix, and evidence. Do not approve while any correctness concern or
+  required check remains. After fixes, review the complete new head and post either APPROVED FOR MERGE at the
+  full head SHA or NOT APPROVED. Directly message the author only to say that the posted review is complete.
+  ```
 - **Kyty is a reference, NOT an oracle — and its reliability is split by platform generation.**
   Kyty CAN run PS4 games, so the PS4-inherited surface (libkernel, pthreads, equeue, VideoOut,
   filesystem, GNM-era graphics concepts) is exercised by real titles and is solid evidence — PS5
