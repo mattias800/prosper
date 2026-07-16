@@ -222,6 +222,69 @@ int main() {
         CHECK(re && re->gpu_addr == 0xD0000000ull, "#375: in-bounds EUD cbuf decoded from the spill buffer");
     }
 
+    // --- #719: UE4 mixed sharp[0] buffers + sharp[1] writable buffer. -------------------------------
+    // Live source 258 declares sharp_counts={8,1,1,2}. sharp[0] contains both size=0 T#s and size=1
+    // V#s: a direct read-only V# at offset 8 and an EUD V# at offset 0x48. sharp[1] has the writable
+    // V# at offset 0x4c. With 32 user SGPRs, those EUD entries have provenance keys 0xa0 and 0xb0.
+    {
+        uint32_t sg[32]; memset(sg, 0, sizeof sg);
+        uint32_t eud[60]; memset(eud, 0, sizeof eud);
+        make_vsharp(&sg[8], 0x10C109AC60ull, 16, 7, 5);       // live-shaped raw V#, unknown format
+        make_vsharp(&eud[40], 0x207D300000ull, 16, 18, 77);   // sharp[0] EUD read-only V#
+        make_vsharp(&eud[44], 0x207D400000ull, 16, 64, 77);
+        const uint64_t eud_ptr = (uint64_t)(uintptr_t)eud;
+        uint16_t dro5[11]; for (auto& x : dro5) x = 0xffff;
+        dro5[5] = 12;
+        sg[12] = (uint32_t)eud_ptr; sg[13] = (uint32_t)(eud_ptr >> 32);
+        AgcShaderSharp readonly_buffers[2];
+        readonly_buffers[0].bits = (uint16_t)(0x8000u | 0x08u);
+        readonly_buffers[1].bits = (uint16_t)(0x8000u | 0x48u);
+        AgcShaderSharp writable;
+        writable.bits = (uint16_t)(0x8000u | 0x4cu);
+        AgcShaderUserData wud; memset(&wud, 0, sizeof wud);
+        wud.direct_resource_offset = dro5; wud.direct_resource_count = 11;
+        wud.eud_size_dw = 60;
+        wud.sharp_resource_offset[0] = readonly_buffers; wud.sharp_resource_count[0] = 2;
+        wud.sharp_resource_offset[1] = &writable; wud.sharp_resource_count[1] = 1;
+        AgcShaderHeader wsh; memset(&wsh, 0, sizeof wsh);
+        wsh.file_header = 0x34333231u; wsh.version = 0x18; wsh.type = 0; wsh.user_data = &wud;
+
+        ShaderResourceTable wt = build_shader_resources(wsh, sg, 32);
+        const ShaderResource* direct = wt.by_sgpr_base(8);
+        CHECK(direct && direct->cls == ResourceClass::ConstantBuffer &&
+              direct->gpu_addr == 0x10C109AC60ull && direct->size == 112 && direct->stride == 16,
+              "#719: sharp[0] size=1 direct entry decodes as a read-only V#, not a texture");
+        const ShaderResource* indirect = wt.by_srt_offset(0xa0);
+        CHECK(indirect && indirect->gpu_addr == 0x207D300000ull && indirect->size == 288,
+              "#719: sharp[0] size=1 EUD entry resolves by its 0xa0 s_load provenance key");
+        const ShaderResource* wr = wt.by_srt_offset(0xb0);
+        CHECK(wr && wr->cls == ResourceClass::ConstantBuffer,
+              "#719: sharp[1] writable V# becomes a storage-buffer-backed resource");
+        CHECK(wr && wr->gpu_addr == 0x207D400000ull && wr->size == 1024 && wr->stride == 16,
+              "#719: sharp[1] writable buffer descriptor decodes base/size/stride");
+        CHECK(wr && wr->sgpr_base == 0xFFFFFFFFu,
+              "#719: EUD-resident sharp[1] resolves only by its 0xb0 s_load provenance key");
+    }
+
+    // sharp[1] also contains writable images. Live volume kernels use size=0 8-dword T#/U# entries;
+    // decoding their first four dwords as a V# loses the image descriptor's <<8 address scale and can
+    // fabricate a >1 GiB storage-buffer range, which makes full capture fail preflight. Leave these for
+    // the compute backend's dynamic storage-image fold instead of emitting a false buffer resource.
+    {
+        uint32_t sg[32]; memset(sg, 0, sizeof sg);
+        make_tsharp(&sg[0], 0x207C670000ull, 120, 68, /*fmt*/56, /*tile*/27, /*type 2D*/9);
+        AgcShaderSharp writable_image;
+        writable_image.bits = 0;   // sharp[1] offset_dw=0, size=0: live writable image shape
+        AgcShaderUserData iud; memset(&iud, 0, sizeof iud);
+        iud.sharp_resource_offset[1] = &writable_image; iud.sharp_resource_count[1] = 1;
+        AgcShaderHeader ish; memset(&ish, 0, sizeof ish);
+        ish.file_header = 0x34333231u; ish.version = 0x18; ish.type = 0; ish.user_data = &iud;
+
+        ShaderResourceTable it = build_shader_resources(ish, sg, 32);
+        CHECK(it.resources.empty(),
+              "#719: sharp[1] size=0 writable image is not misclassified as a giant buffer");
+    }
+
     // --- vertex buffers: direct resource usage type 8 (V# inline in the user-data SGPRs) ------------
     // A 16-entry direct_resource_offset table; type 8 (vertex buffer) points at a V# at SGPR dword 20.
     uint16_t dro[16]; for (auto& x : dro) x = 0xffff;
@@ -314,7 +377,7 @@ int main() {
                     (1u << 22) | (0xabu << 24);
         tsgprs[7] = 0x00206e33u;
         make_tsharp(&tsgprs[8],  0xE0000000ull, 2048, 1024, /*fmt*/1,   /*tile*/5, /*type*/9);
-        make_tsharp(&tsgprs[16], 0xF0000000ull,  256,  256, /*fmt*/169, /*tile*/5, /*type*/9);  // BC1
+        make_tsharp(&tsgprs[16], 0x207E870000ull, 256, 256, /*fmt*/169, /*tile*/5, /*type*/9);  // BC1
         make_tsharp(&tsgprs[24], 0xF0010000ull,  128,  128, /*fmt*/44,  /*tile*/5, /*type*/9);  // unmapped
 
         {   // T# decode round-trip of the first descriptor
@@ -325,6 +388,7 @@ int main() {
 
         AgcShaderSharp tex_sharps[4];
         for (int i = 0; i < 4; i++) tex_sharps[i].bits = (uint16_t)(i * 8);
+        tex_sharps[2].bits |= 0x8000u;  // live UE4 T#s may carry size=1: must remain textures, not fake V#s
         AgcShaderUserData tud; memset(&tud, 0, sizeof tud);
         tud.sharp_resource_offset[0] = tex_sharps;
         tud.sharp_resource_count[0]  = 4;
@@ -353,6 +417,8 @@ int main() {
 
         const ShaderResource* t2 = tt.by_sgpr_base(16);
         CHECK(t2 && t2->format == DataFormat::Bc1, "BC1 T# now bound (decoded to RGBA8 on upload)");
+        CHECK(t2 && t2->gpu_addr == 0x207E870000ull,
+              "#719: size=1 T# that fails V# shape checks remains a texture");
         CHECK(t2 && t2->size == ((256u + 3) / 4) * ((256u + 3) / 4) * 8u,
               "BC1 size = ceil(w/4)*ceil(h/4)*8 (compressed block bytes, not w*h*4)");
         CHECK(tt.by_sgpr_base(24) == nullptr, "unmapped IMG_FMT T# skipped (no silent RGBA8)");

@@ -306,15 +306,93 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
         }
     }
 
-    // Textures: sharp_resource_offset[0] (textures2D). Each slot's offset_dw points at an 8-dword T#
-    // in the user-data SGPR block. The PS reads it directly in SGPRs (image_sample SRSRC), so DIRECT
+    // Writable resources: sharp_resource_offset[1] is mixed, like sharp[0]. DOLL's source-258 UE4
+    // volume-lighting dispatch declares a size=1 EUD-resident 4-dword V# here (offset_dw=0x4c with 32
+    // user SGPRs), then loads it with `s_load_dwordx4 ..., 0xb0` and consumes it in
+    // buffer_store_format_xyzw. Other live kernels put size=0 8-dword image descriptors in the same
+    // category; interpreting their first four dwords as V#s fabricated gigabyte-class capture ranges.
+    // Emit only size-flagged, buffer-shaped entries here. Writable images remain handled by the dynamic
+    // descriptor fold. ConstantBuffer is the existing read/write Vulkan storage-buffer class (the live
+    // compute backend copies every reflected storage buffer back to guest memory). Keep sharp[3] first so
+    // shaders using the two conventional cbuf bindings retain their ordering.
+    const AgcShaderSharp* writable_buffers = ud->sharp_resource_offset[1];
+    if (arr_ok(writable_buffers, ud->sharp_resource_count[1], sizeof(AgcShaderSharp))) {
+        for (uint16_t slot = 0; slot < ud->sharp_resource_count[1]; slot++) {
+            const AgcShaderSharp& s = writable_buffers[slot];
+            if (s.empty() || !s.size()) continue;
+            const uint32_t off = s.offset_dw();
+            uint32_t vv[4];
+            const uint32_t srt = load_sharp(off, 4, vv);
+            if (srt == 0xFFFFFFFFu) continue;
+            const DecodedBufferDescriptor d = decode_buffer_descriptor(vv);
+            if (d.base < 0x1000000000ull || !d.stride || !d.size_bytes ||
+                d.size_bytes > 0x10000000u)
+                continue;
+            ShaderResource r;
+            r.cls            = ResourceClass::ConstantBuffer;
+            r.format         = d.format;
+            r.num_components = d.num_components;
+            r.binding        = binding++;
+            r.gpu_addr       = d.base;
+            r.size           = d.size_bytes;
+            r.stride         = d.stride;
+            const bool in_eud = (uint64_t)off + 4 > num_user_sgprs;
+            r.srt_offset = in_eud ? srt : 0xFFFFFFFFu;
+            r.sgpr_base  = in_eud ? 0xFFFFFFFFu : (user_sgpr_base + off);
+            table.resources.push_back(r);
+        }
+    }
+
+    // Read-only buffer entries share sharp[0] with textures. A 4-dword V# carries the sharp size bit,
+    // but that bit is only a hint: live UE4 T# entries can carry it too. Source 258's size=1 direct
+    // entry at offset_dw=8 decodes as base=0x10c109ac60, stride=16, records=7 (112 bytes) and is
+    // consumed by s_buffer_load_dwordx8/x4. Treating every sharp[0] entry as a T# fabricated a tiny
+    // texture and left those scalar loads on the unrelated binding-2 fallback, which then failed the
+    // descriptor contract (required 48, available 32). EUD-resident size=1 entries use the same SRT
+    // provenance as the writable/category-1 and constant/category-3 buffers.
+    const AgcShaderSharp* readonly_resources = ud->sharp_resource_offset[0];
+    std::vector<bool> readonly_buffer_slots(ud->sharp_resource_count[0], false);
+    if (arr_ok(readonly_resources, ud->sharp_resource_count[0], sizeof(AgcShaderSharp))) {
+        for (uint16_t slot = 0; slot < ud->sharp_resource_count[0]; slot++) {
+            const AgcShaderSharp& s = readonly_resources[slot];
+            if (s.empty() || !s.size()) continue;
+            const uint32_t off = s.offset_dw();
+            uint32_t vv[4];
+            const uint32_t srt = load_sharp(off, 4, vv);
+            if (srt == 0xFFFFFFFFu) continue;
+            const DecodedBufferDescriptor d = decode_buffer_descriptor(vv);
+            // A size-flagged T# reinterpreted as V# loses the descriptor's <<8 address scale and often
+            // produces a gigabyte-class `records*stride` extent (observed: 1,247,051,952 bytes). Use the
+            // same 256 MiB sanity ceiling as direct compute V# discovery, and require the PS5 guest-VA
+            // floor plus a real stride. If this shape check fails, leave the slot for the T# path below.
+            if (d.base < 0x1000000000ull || !d.stride || !d.size_bytes ||
+                d.size_bytes > 0x10000000u)
+                continue;
+            ShaderResource r;
+            r.cls            = ResourceClass::ConstantBuffer;
+            r.format         = d.format;
+            r.num_components = d.num_components;
+            r.binding        = binding++;
+            r.gpu_addr       = d.base;
+            r.size           = d.size_bytes;
+            r.stride         = d.stride;
+            const bool in_eud = (uint64_t)off + 4 > num_user_sgprs;
+            r.srt_offset = in_eud ? srt : 0xFFFFFFFFu;
+            r.sgpr_base  = in_eud ? 0xFFFFFFFFu : (user_sgpr_base + off);
+            table.resources.push_back(r);
+            readonly_buffer_slots[slot] = true;
+        }
+    }
+
+    // Textures: sharp[0] entries that did not decode as plausible V#s above. Each slot's offset_dw points
+    // at an 8-dword T# in the user-data SGPR block. The PS reads it directly in SGPRs, so DIRECT
     // provenance: sgpr_base = offset_dw. The paired sampler (sharp[2]) is folded into the combined
     // image-sampler at the same binding by the backend, so we don't emit a separate Sampler resource.
     const AgcShaderSharp* texs = ud->sharp_resource_offset[0];
     if (arr_ok(texs, ud->sharp_resource_count[0], sizeof(AgcShaderSharp))) {
         for (uint16_t slot = 0; slot < ud->sharp_resource_count[0]; slot++) {
             const AgcShaderSharp& s = texs[slot];
-            if (s.empty()) continue;
+            if (s.empty() || readonly_buffer_slots[slot]) continue;
             uint32_t off = s.offset_dw();
             // A T# may live in the user-SGPR block OR spill into the EUD, exactly like the cbuf path
             // (#257/#382) — the old hard `continue` for off+8 > num_user_sgprs silently DROPPED any

@@ -25,7 +25,9 @@ struct AgcShaderSharp {
 
 // Shader resource-usage table (Kyty ShaderUserData, Shader.h:911). Categories (from ShaderParseUsage2):
 //   direct_resource_offset[type]: type 8 = vertex buffer, type 10 = vertex attrib (value = SGPR index)
-//   sharp_resource_offset[0]: textures2D   [2]: samplers   [3]: constant/storage buffers   [1]: unused
+//   sharp_resource_offset[0]: read-only T#/V# resources (4-dword V# entries use size=1; some T#s do too)
+//                         [1]: writable T#/V# resources (4-dword V# entries use size=1)
+//                         [2]: samplers   [3]: constant/storage buffers
 struct AgcShaderUserData {
     uint16_t*       direct_resource_offset;      // +0x00
     AgcShaderSharp* sharp_resource_offset[4];    // +0x08
