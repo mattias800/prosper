@@ -726,15 +726,125 @@ HLE(k_pthread_exit)   {
 }
 
 // --- thread-local storage keys (IL2CPP uses these heavily) -> host pthread keys ---
+#ifdef _WIN32
+namespace {
+std::mutex g_win_key_thunks_mutex;
+std::unordered_map<uint64_t, void*> g_win_key_thunks;
+std::atomic<void (*)(uint64_t)> g_win_key_delete_after_host_hook{nullptr};
+
+// winpthreads invokes key destructors with the Microsoft x64 ABI, but every guest callback uses
+// the PS5/FreeBSD SysV ABI. Emit one tiny Microsoft-ABI thunk per live key so winpthreads can retain
+// its normal destructor iteration semantics while the callback value is delivered in guest RDI.
+void* win_make_key_destructor_thunk(uint64_t guest_destructor) {
+    auto* code = static_cast<uint8_t*>(VirtualAlloc(
+        nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!code) return nullptr;
+
+    size_t offset = 0;
+    auto byte = [&](uint8_t value) { code[offset++] = value; };
+    auto qword = [&](uint64_t value) {
+        std::memcpy(code + offset, &value, sizeof value);
+        offset += sizeof value;
+    };
+
+    // winpthreads leaves its per-key "used" flag set after pthread_setspecific(key, nullptr),
+    // then invokes the destructor with a null value at thread exit. POSIX requires callbacks only
+    // for non-null values, so discard that spurious invocation before crossing into guest code.
+    byte(0x48); byte(0x85); byte(0xc9);                 // test rcx, rcx
+    byte(0x74); byte(0x24);                             // je final ret
+
+    // rcx=value -> prosper_call_guest_sysv(guest_destructor, value, 0).
+    byte(0x48); byte(0x89); byte(0xca);                 // mov rdx, rcx
+    byte(0x48); byte(0xb9); qword(guest_destructor);    // mov rcx, guest_destructor
+    byte(0x45); byte(0x31); byte(0xc0);                 // xor r8d, r8d
+    byte(0x48); byte(0xb8);
+    qword((uint64_t)(uintptr_t)&prosper_call_guest_sysv); // mov rax, ABI bridge
+    byte(0x48); byte(0x83); byte(0xec); byte(0x28);     // shadow space + call alignment
+    byte(0xff); byte(0xd0);                             // call rax
+    byte(0x48); byte(0x83); byte(0xc4); byte(0x28);
+    byte(0xc3);                                         // ret
+
+    DWORD old_protect = 0;
+    if (!VirtualProtect(code, 0x1000, PAGE_EXECUTE_READ, &old_protect)) {
+        VirtualFree(code, 0, MEM_RELEASE);
+        return nullptr;
+    }
+    FlushInstructionCache(GetCurrentProcess(), code, offset);
+    return code;
+}
+
+}
+
+void win_set_key_delete_after_host_hook_for_test(void (*hook)(uint64_t)) {
+    g_win_key_delete_after_host_hook.store(hook, std::memory_order_release);
+}
+
+size_t win_key_destructor_thunk_count_for_test() {
+    std::lock_guard<std::mutex> lock(g_win_key_thunks_mutex);
+    return g_win_key_thunks.size();
+}
+#endif
+
 HLE(k_key_create) {
     if (!a0) return 0x16;
     pthread_key_t k;
+#ifdef _WIN32
+    void* thunk = nullptr;
+    int r = 0;
+    {
+        // Keep host key allocation and registry publication atomic with deletion. winpthreads can
+        // immediately reuse a deleted numeric key, so exposing it before the old map entry is gone
+        // can make the new emplace lose and leave its RX thunk permanently untracked.
+        std::lock_guard<std::mutex> lock(g_win_key_thunks_mutex);
+        thunk = a1 ? win_make_key_destructor_thunk(a1) : nullptr;
+        if (a1 && !thunk) return ENOMEM;
+        r = pthread_key_create(&k, (void (*)(void*))thunk);
+        if (!r && thunk) {
+            try {
+                if (!g_win_key_thunks.emplace((uint64_t)k, thunk).second) r = EAGAIN;
+            } catch (const std::bad_alloc&) {
+                r = ENOMEM;
+            }
+            if (r) pthread_key_delete(k);
+        }
+    }
+    if (r) {
+        if (thunk) VirtualFree(thunk, 0, MEM_RELEASE);
+        return (uint64_t)r;
+    }
+#else
     int r = pthread_key_create(&k, (void (*)(void*))(uintptr_t)a1);
     if (r) return (uint64_t)r;
+#endif
     *(uint32_t*)(uintptr_t)a0 = (uint32_t)k;   // hand the guest our host key
     return 0;
 }
-HLE(k_key_delete)    { pthread_key_delete((pthread_key_t)a0); return 0; }
+HLE(k_key_delete)    {
+    const pthread_key_t key = (pthread_key_t)a0;
+#ifdef _WIN32
+    void* thunk = nullptr;
+    int result = 0;
+    {
+        // Do not release the host key until creation is excluded: winpthreads may recycle its
+        // numeric value before the corresponding thunk entry has otherwise been erased.
+        std::lock_guard<std::mutex> lock(g_win_key_thunks_mutex);
+        result = pthread_key_delete(key);
+        if (!result) {
+            if (auto hook = g_win_key_delete_after_host_hook.load(std::memory_order_acquire))
+                hook((uint64_t)key);
+            auto it = g_win_key_thunks.find((uint64_t)key);
+            if (it != g_win_key_thunks.end()) {
+                thunk = it->second;
+                g_win_key_thunks.erase(it);
+            }
+        }
+    }
+    if (thunk) VirtualFree(thunk, 0, MEM_RELEASE);
+#else
+    const int result = pthread_key_delete(key);
+#endif
+    return (uint64_t)(int64_t)result;
+}
 HLE(k_getspecific)   {
     uint64_t rv = (uint64_t)(uintptr_t)pthread_getspecific((pthread_key_t)a0);
     // #312: learn the non-trapping MB3 pool-array address even when the hardware-watch diagnostic

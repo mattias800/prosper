@@ -97,6 +97,12 @@ void register_kernel_mem_hle();
 // libkernel time/clock + C11 threads + assorted stubs; called by register_kernel_hle().
 void register_kernel_time_hle();
 
+#ifdef _WIN32
+// Windows pthread-key lifecycle probes used by the focused concurrency regression.
+void win_set_key_delete_after_host_hook_for_test(void (*hook)(uint64_t));
+size_t win_key_destructor_thunk_count_for_test();
+#endif
+
 // The default target for unimplemented imports: logs (first-seen) and returns 0.
 // Called by generated stubs with the import index in the first arg.
 extern "C" uint64_t prosper_on_unimpl(uint64_t import_index);
