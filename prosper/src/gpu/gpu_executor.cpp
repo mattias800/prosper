@@ -507,7 +507,8 @@ void maybe_dump_successful_shader(ShaderProgramStage stage, const ShaderCompileK
         fprintf(stderr, "[shader-dump] cannot create %s: %s\n", directory, ec.message().c_str());
         return;
     }
-    const char* tag = stage == ShaderProgramStage::Vertex ? "vs" : "ps";
+    const char* tag = stage == ShaderProgramStage::Vertex ? "vs" :
+                      stage == ShaderProgramStage::Fragment ? "ps" : "cs";
     char raw_path[1024], spirv_path[1024];
     snprintf(raw_path, sizeof(raw_path), "%s/success_%s_%016llx_%016llx.bin", directory, tag,
              static_cast<unsigned long long>(spirv_hash),
@@ -2099,6 +2100,13 @@ std::vector<ComputeItem> realize_compute_dispatches(
         ComputeItem item;
         item.spirv = recompile_compute((const uint32_t*)(uintptr_t)code_addr, 0x10000,
                                        table.get(), config);
+        if (!item.spirv.empty() && getenv("PROSPER_SHADER_DUMP_SUCCESS")) {
+            const ShaderCompileKey dump_key = make_shader_compile_key(
+                ShaderProgramStage::Compute,
+                reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
+                0x10000, table.get(), nullptr, nullptr);
+            maybe_dump_successful_shader(ShaderProgramStage::Compute, dump_key, item.spirv);
+        }
         item.resources = std::move(table);
         item.launch = launch;
         item.code_addr = code_addr;

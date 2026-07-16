@@ -110,10 +110,10 @@ or dispatches. `--override-compute-spv N PATH` replaces that dispatch's module a
 the input must be a 20-byte-to-16-MiB SPIR-V binary with the standard magic word. Overrides intentionally
 disable the capture pixel oracle and are for differential diagnosis, not correctness evidence.
 
-Tiled 1D/2D storage writeback remains disabled by default. Setting
-`PROSPER_COMPUTE_TILED_2D_STORAGE=1` enables the existing tiled upload/writeback path for an explicit replay
-A/B. This can expose host Vulkan compiler or execution failures, so use it only with a bounded capsule and
-the compute-only selector. With `PROSPER_COMPUTELOG=1`, replay identifies whether failure occurred while
+Validated tiled 1D/2D storage upload/writeback runs by default. Setting
+`PROSPER_DISABLE_COMPUTE_TILED_2D_STORAGE=1` restores the old skip for an explicit replay A/B. Use a bounded
+capsule and the compute-only selector when localizing a host Vulkan compiler or execution failure. With
+`PROSPER_COMPUTELOG=1`, replay identifies whether failure occurred while
 creating the pipeline, submitting it, or waiting for the dispatch.
 
 For a long live run, `PROSPER_COMPUTELOG_CODE=0x...` and

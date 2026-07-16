@@ -539,6 +539,12 @@ if(TARGET prosper_core)
       target_link_libraries(prosper_live_renderer PUBLIC prosper_core Vulkan::Vulkan)
       target_include_directories(prosper_live_renderer PUBLIC frontends/shared)
       target_link_libraries(boot_trace PRIVATE prosper_live_renderer)
+
+      # Keep the production compute backend covered on native Windows too. This catches host- and
+      # driver-specific image upload/writeback failures in the same backend prosper-app uses.
+      add_executable(test_game_compute tests/test_game_compute.cpp)
+      target_link_libraries(test_game_compute PRIVATE prosper_live_renderer)
+      add_test(NAME game_compute_exec COMMAND test_game_compute)
     else()
       message(STATUS "Vulkan not found — Windows boot_trace built without the live renderer")
     endif()

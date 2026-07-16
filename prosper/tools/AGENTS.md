@@ -88,7 +88,9 @@ late consumer.
 `PROSPER_RENDER_RESOURCE_DIM=WxH` likewise executes submits that sample a matching image, allowing a
 producer/consumer A/B without rendering every unrelated submit between them.
 `PROSPER_RESOURCE_HASH_DIM=WxH` logs each matching sampled resource's raw guest hash, decoded/sample
-hash, RTT-hit state, last compute/DMA writer, draw index, and PM4 order. `PROSPER_TARGET_STEP_HASH_DIM`
+hash, nonblack RGB/alpha occupancy, RTT-hit state, last compute/DMA writer, draw index, and PM4 order.
+Add `PROSPER_DUMP_RESOURCE_VERSION=1` to write each distinct decoded version as a BMP under
+`PROSPER_FRAME_DIR`; this is an inspection artifact, not a pixel oracle. `PROSPER_TARGET_STEP_HASH_DIM`
 rerenders matching target passes by prefix and logs per-draw hashes plus dark/white/mean metrics;
 `PROSPER_TARGET_STEP_HASH_MIN_DRAWS=N` bounds that intentionally expensive bisect.
 `PROSPER_RENDER_DELAY_MS=N` skips synchronous Vulkan work for N milliseconds from the first submit while
@@ -204,9 +206,11 @@ external numeric/image inspection without dereferencing the original guest addre
 `--dump-compute-resource N:BINDING PATH` writes its exact pre-dispatch storage-buffer bytes.
 `--compute-only N` executes one realized dispatch in isolation; combine it with
 `--override-compute-spv N PATH` to minimize or hardware-A/B a captured shader without changing its exact
-resource descriptors. The override disables the pixel oracle. Tiled 1D/2D compute storage stays skipped
-unless `PROSPER_COMPUTE_TILED_2D_STORAGE=1` is explicitly set for a bounded diagnostic replay;
-`PROSPER_COMPUTELOG=1` then separates pipeline creation, submission, and dispatch-wait failures.
+resource descriptors. The override disables the pixel oracle. Validated tiled 1D/2D compute storage executes
+by default; `PROSPER_DISABLE_COMPUTE_TILED_2D_STORAGE=1` restores the old skip for a diagnostic A/B.
+`PROSPER_COMPUTELOG=1` separates pipeline creation, submission, dispatch-wait, import, and writeback failures.
+Renderer-owned RTT imports include their hash and nonzero-byte count, and buffer writeback logs include the
+first eight dwords so bounds/offset constant buffers can be identified without another code change.
 
 For compute producer provenance, `PROSPER_COMPUTELOG=1` records each `DispatchDirect` packet's
 threadgroup counts, compute-program address/hash, and AGC-resolved resources from the register state at
