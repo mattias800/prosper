@@ -51,6 +51,8 @@ namespace { bool sclog() { static int v = getenv("PROSPER_SYNCLOG") ? 1 : 0; ret
     long sctid() {
 #if defined(__linux__) || defined(__APPLE__)
         return (long)prosper_gettid();
+#elif defined(_WIN32)
+        return (long)GetCurrentThreadId();
 #else
         return 0;
 #endif
