@@ -24,8 +24,8 @@ search scored a truncated single-dump wrongly... the addrlib pattern decides it 
 
 Reference: Mesa `src/amd/addrlib/src/gfx10/gfx10SwizzlePattern.h` (tables) +
 `src/core/addrlib.cpp:ComputeOffsetFromSwizzlePattern` (evaluation) +
-`gfx10addrlib.cpp:ComputeSurfaceAddrFromCoordMacroTiled` (block layout). Kyty was deliberately NOT
-used (GCN/PS4 tiling — wrong generation, per CLAUDE.md).
+`gfx10addrlib.cpp:ComputeSurfaceAddrFromCoordMacroTiled` (block layout). Older GCN/PS4 tiling models were
+deliberately not used because they target the wrong hardware generation.
 
 For a 2D single-sample surface:
 

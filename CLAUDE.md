@@ -287,8 +287,9 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
 - **Reaching the running frame loop** needs two gated switches (off by default, so the default boot stays
   stable): `PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct`. Add `PROSPER_RENDER=1` to run the
   live renderer, `PROSPER_GFXLOG=1` for graphics diagnostics.
-- **Correctness-first:** implement real behavior (cross-checked against the Kyty PS5-emulator reference in
-  `../Kyty`), not shims that fake output. Mark genuinely-uncertain code with `CONFIDENCE: HIGH/MED/LOW`.
+- **Correctness-first:** implement real behavior from primary evidence: live captures/traces, guest
+  disassembly, published platform contracts, firmware symbol data, and focused tests. Do not ship shims
+  that fake output. Mark genuinely uncertain code with `CONFIDENCE: HIGH/MED/LOW`.
 - **Independent review is a mandatory merge gate for every PR containing agent work.** This applies whenever
   the current PR head contains changes designed, debugged, authored, co-authored, implemented, or materially
   modified by an agent, regardless of who opened the branch or PR. An agent taking over an existing PR must
@@ -387,29 +388,28 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   <base-repo>:<base-ref>@<base-SHA> with tree <tree-SHA> or NOT APPROVED. Directly message the author only to say
   that the posted review is complete.
   ```
-- **Kyty is a reference, NOT an oracle — and its reliability is split by platform generation.**
-  Kyty CAN run PS4 games, so the PS4-inherited surface (libkernel, pthreads, equeue, VideoOut,
-  filesystem, GNM-era graphics concepts) is exercised by real titles and is solid evidence — PS5
-  evolved from PS4, so those behaviors usually carry over. But Kyty's PS5-SPECIFIC surface is
-  early transcription work it never runs: **AGC (the PS5's replacement for GNM) especially** —
-  Gen5 Dcb builders, T#/V# Gen5 descriptor formats, PS5-only kernel calls (APR/Ampr/BatchMap).
-  There, prosper's own live captures are the only exercised evidence (we boot the PS5 titles;
-  Kyty does not). Trust order when sources disagree: (1) prosper's live captures/traces of the
-  real guest, (2) Kyty+shadPS4 agreeing (strongest for PS4-inherited surfaces), (3) either alone
-  — cite which and mark CONFIDENCE accordingly, and weight Kyty DOWN for anything Gen5/AGC.
-  Never weaken a behavior that a live boot demonstrates just to match a reference.
+- **Evidence hierarchy and independent implementation.** Trust sources in this order: (1) prosper's
+  live captures/traces of the real guest, (2) published platform contracts, firmware symbol data, and
+  the guest's own disassembly, (3) agreement among independently written secondary implementations,
+  then (4) a single secondary implementation as a hypothesis only. PS5-specific AGC, Gen5 descriptors,
+  and PS5-only kernel calls require direct title evidence; inherited PS4 behavior still must be checked
+  against the exercised guest path. External implementations are verification-only: do not copy or port
+  their code, types, comments, prose, or tests. Re-derive behavior in prosper's own architecture and add
+  project-owned evidence/tests. Never weaken behavior demonstrated by a live boot to match a secondary
+  reference, and mark unresolved evidence with `CONFIDENCE: HIGH/MED/LOW`.
 - **PS5 3.20 firmware library reference — the definitive NID↔name database (`../PS5-3.20_Libs/`).**
   A `genstub.py`-generated dump of **all 275 PS5 3.20 system libraries**, one `libSceXxx.c` per library.
   Each file lists **every exported function AND its exact NID**: the loader lines read
   `sprx_dlsym(__handle, "<NID>", &__ptr_<funcName>)`, so each is a `<NID> ↔ <funcName>` pair. This is
-  the **authoritative PS5-specific symbol map** — trust it OVER the PS4-era shadPS4 aerolib / Kyty for
+  the **authoritative PS5-specific symbol map** — trust it over PS4-era symbol lists and secondary tables for
   any Gen5/PS5-only surface (AGC, Ampr, Pad/UserService Gen5, etc.), and use it to see a library's
   *complete* real API surface (e.g. what functions exist that a title might call). Recipes:
   - Resolve an unknown NID → name: `grep -rn '<NID>' ../PS5-3.20_Libs/` (the matching `__ptr_<name>` names it).
   - A library's full export list: `grep -oE '\.global sce[A-Za-z0-9]+' ../PS5-3.20_Libs/libSceXxx.c | sort -u`.
   - Which library exports a symbol: `grep -rl '<funcName>' ../PS5-3.20_Libs/`.
   Caveat: it gives **names + NIDs only, no bodies** — argument layouts and behavior still come from
-  prosper's live captures + Kyty/shadPS4. Gitignored sibling of the repo; never commit its contents.
+  prosper's live captures, published contracts, and guest disassembly. Gitignored sibling of the repo;
+  never commit its contents.
 - **Commit style:** small, verified commits; push to `origin` promptly. Co-author trailer as configured.
   **Do NOT add "Generated with Claude Code" attribution lines** (the 🤖 badge, "Generated with
   [Claude Code](...)" footers, session links) to PR bodies, commit messages, issue text, or

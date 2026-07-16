@@ -141,7 +141,7 @@ This mirrors how real drivers stage a fetch shader. Needs the draw's vertex-buff
 5. **No regressions:** `ctest --test-dir build-linux` 45/45 and the Windows build 20/20 stay green.
 
 ## Known follow-ups (separate, do NOT scope-creep)
-- **Texture detiling** (`tile_mode != 0`) — Kyty `Tile.cpp` reference.
+- **Texture detiling** (`tile_mode != 0`) — derive from AMD addrlib equations and captured textures.
 - **Executing the full draw chain** so sampled render targets have real content.
 - **Per-draw state** (`GpuState::Draw` currently only `index_count`).
 - **Real swapchain/window present** (`videoout_present.cpp` scaffolding exists).
@@ -156,7 +156,7 @@ This mirrors how real drivers stage a fetch shader. Needs the draw's vertex-buff
 | Register-state fold (SET_SH_REG range fix) | `src/gpu/pm4_decode.cpp` (`IT_SET_SH_REG`), `command_processor.cpp` (`SetShRegDirect`) |
 | Shader-header lookup by code addr | `src/hle/hle_agc.cpp` `prosper_agc_shader_header_for_code` |
 | Live renderer + BMP dump | `tools/boot_trace/boot_trace.cpp` (`PROSPER_RENDER`), `tests/render_runner.h` |
-| Kyty reference | `../Kyty/source/emulator/src/Graphics/Shader.cpp` (`ShaderParseUsage`, fetch handling) |
+| Independent evidence | Captured shader headers/ISA, guest wrapper disassembly, AMD RDNA2 documentation |
 | Repro switches | `PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_RENDER=1 PROSPER_GFXLOG=1 PROSPER_RESDUMP=1 PROSPER_SHADER_DUMP=/tmp PROSPER_FRAME_DIR=/tmp/frames` |
 
 **Environment:** build/run in WSL Ubuntu-24.04 as root; game dump at

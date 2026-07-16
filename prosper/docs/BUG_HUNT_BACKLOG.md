@@ -20,12 +20,12 @@ Tags: [defect] wrong behavior · [hack] shortcut standing in for real behavior �
 - FreeBSD→Linux open(2) flag words passed raw (O_CREAT became O_TRUNC).
 - sceKernelWaitEventFlag / WaitSema ignored their timeout (silent forever-block).
 - scePthread(Attr)Getschedparam/Getprio returned success with unwritten out-params.
-- EVFILT_VIDEO_OUT was -10 (FreeBSD EVFILT_LIO); Kyty + shadPS4 agree on -13.
+- EVFILT_VIDEO_OUT was -10 (FreeBSD EVFILT_LIO); FreeBSD-derived constants and independent implementations agree on -13.
 - guest_readable/probe_readable probed via /dev/null, which never faults → all guards
   were no-ops (now a drained O_NONBLOCK pipe; raw syscalls in the fault handler).
 - Lazy GPU-VA backing ignored si_code (clobbered live RO mappings; infinite fault loop
   on in-window instruction fetches). Now SEGV_MAPERR-only and addr != RIP.
-- SceAudioOutPortState layout diverged from Kyty (volume written into flag); audio
+- SceAudioOutPortState wrote volume into the flag field instead of the ABI's volume field; audio
   errors were generic -1 instead of 0x80260003/0x80260005.
 - Guest-%fs swap stubs shifted stack args by 2 qwords — ReleaseMem's (data_sel, fence
   value) read a TCB pointer + return address under PROSPER_GUEST_FS. Stub now forwards
@@ -54,7 +54,7 @@ Tags: [defect] wrong behavior · [hack] shortcut standing in for real behavior �
    (introduced 41b01f3)
 2. **[simplification] Indexed draws silently dropped** — hle_agc.cpp emits R_DRAW_INDEX
    (0x03) but pm4_decode never decodes it: every sceAgcDcbDrawIndex vanishes downstream
-   while the guest sees success. Decode it (verify a2/a3 roles vs Kyty), push a Draw
+   while the guest sees success. Decode it (verify a2/a3 roles from wrapper disassembly and live calls), push a Draw
    with index data, round-trip test. Directly relevant to scene-content rendering.
    (8d26489)
 3. **[hack] Quad-fan topology heuristic** — gpu_execute.hpp:107-112 rewrites any draw
@@ -64,7 +64,7 @@ Tags: [defect] wrong behavior · [hack] shortcut standing in for real behavior �
 4. **[hardcoded] Sampled textures assumed RGBA8** — agc_shader_layout.cpp:144,151: the
    decoded 9-bit T# format is thrown away; everything uploads as Unorm8 ×4 with
    size = w*h*4 (over-reads BCn allocations up to 8×). Add a Gen5 IMG_FMT→DataFormat
-   mapper (Kyty tables), size from block size, loud skip on unmapped. (13d70f7)
+   mapper from public format definitions and captures, size from block size, loud skip on unmapped. (13d70f7)
 5. **[defect] release-mem data_sel default write** — command_processor.cpp:58-67 writes
    8 bytes for ANY unrecognized data_sel and cases 1/2 lack the rel_value_valid guard.
    With the stub-frame fix in, data_sel now decodes correctly — make the default
@@ -72,7 +72,7 @@ Tags: [defect] wrong behavior · [hack] shortcut standing in for real behavior �
 6. **[defect] Equeue lifetime + semantics cluster** — hle_kernel_time.cpp:
    (a) k_eq_delete deletes EqState while waiters may sit in wait (UAF; registrations in
    g_*_regs never purged — address reuse resurrects them); (b) WaitEqueue returns
-   SUCCESS with *out=0 on timeout/unknown queue (Kyty/shadPS4 return ETIMEDOUT) and
+   SUCCESS with *out=0 on timeout/unknown queue (the platform-compatible result is ETIMEDOUT) and
    caps NULL timeout at 100 ms returning success; (c) eq_post drops the NEWEST event
    when 4 queued (a flip event can be the one dropped — coalesce by ident/filter
    instead); (d) detached HR-timer threads post to possibly-deleted queues and
@@ -87,7 +87,7 @@ Tags: [defect] wrong behavior · [hack] shortcut standing in for real behavior �
    cross-thread-dependent inits deadlock. Per-control state (3-state word + condvar),
    callback outside the lock (h_execute_once now shows the shape). (5fae501)
 9. **[defect] WaitRegMem args destroyed at build time** — hle_agc.cpp zeroes the whole
-   9-dword payload; the wait can never be honored downstream. Encode Kyty's layout;
+   9-dword payload; the wait can never be honored downstream. Encode the captured wrapper/packet layout;
    CP should at least assert the condition already holds at fold time. (2e4b9de)
 10. **[hardcoded] Ampr mirror view at fixed −0x540000000** — hle_kernel_mem.cpp:431:
     one-title constant, MAP_FIXED over whatever lives there. Track the guest's real
@@ -113,7 +113,7 @@ Tags: [defect] wrong behavior · [hack] shortcut standing in for real behavior �
 - [simplification] EventWrite drops its address arg (label-carrying events can never
   write) — hle_agc.cpp:136. (2e4b9de)
 - [hardcoded] vk_color_format maps ONLY 8_8_8_8 (else silently Undefined) —
-  vk_translate.cpp:20. Port Kyty rows; log unmapped. (822cd24)
+  vk_translate.cpp:20. Fill rows from public format definitions and validated captures; log unmapped. (822cd24)
 - [simplification] Special-operand ALU sources (VCC/EXEC/M0 as data) silently read 0 —
   rdna2_to_spirv.cpp operand_bits default. Route to tracked bools or reject. (e13f469)
 - [defect] v_cvt_u32_f32/i32_f32 emit bare OpConvertFToU/S (UB out-of-range; hardware

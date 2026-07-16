@@ -79,53 +79,43 @@ Two ways to get them, fastest first:
 5. **Present.** `sceVideoOut` swapchain (already stubbed) → present the rendered target; framebuffer
    CRC golden checks (agentic-first).
 
-## ⭐ Kyty is a portable reference implementation (../Kyty, MIT) — this changes the plan to PORT-and-adapt
+## Independently derived AGC model
 
-Kyty (a primitive PS5 emulator) HLE-implements the **exact** libSceAgc "Gen5" driver our game uses (same
-NIDs). MIT-licensed → directly portable with attribution. Full survey map (file:line in
-`repos/Kyty/source/emulator/`):
+The implementation must be derived from the title's live calls, its statically linked wrappers, captured
+command buffers, firmware NID/name data, AMD's public ISA/register material, and project-owned tests. Public
+implementations may be used only to challenge a conclusion after it has been derived; no source, types,
+comments, prose, or tests are copied into prosper.
 
-**Dcb `CommandBuffer` = the game's own struct** (cast from the guest pointer; Kyty never allocates it),
-`Graphics.cpp:777-831`:
-`+0x00 uint32_t* bottom` (base), `+0x08 top` (end), `+0x10 cursor_up` (write ptr), `+0x18 cursor_down`
-(reserve limit), `+0x20 callback` (`bool(*)(CommandBuffer*, uint32_t needed_dw, void*)` buffer-full),
-`+0x28 user_data`, `+0x30 reserved_dw` (~0x34 total). `AllocateDW(n)` (`:821`) reserves n dwords via the
-callback when short, returns `cursor_up`, bumps it. `ResetQueue(buf, 0x3ff, 0)` (`:1806`) only appends a
-2-dw `R_DRAW_RESET` NOP — the game sets up the pointer fields itself before the first append.
-**Our `[obj+0x40]` fault is beyond Kyty's 0x34-byte layout** — The Messenger uses a fuller Dcb; that one
-field still needs reversing (or the real AGC SDK header), but everything else transfers.
+**Dcb `CommandBuffer` model.** Live setup and cursor traces establish guest-owned base/end/write/reserve
+pointers plus a refill callback and caller data. The Messenger accesses additional fields, including the
+observed `[obj+0x40]`, so the exact layout remains title/version-specific until each offset is pinned by the
+guest wrapper or a published SDK header. `ResetQueue` and allocation behavior must be verified from cursor
+deltas and emitted packets rather than assumed from a foreign object layout.
 
-**AGC HLE model:** each `GraphicsDcb*` fn appends a custom PM4 packet `KYTY_PM4(len, IT_NOP, R_*)`
-(`Pm4.h:16`; `R_*` sub-opcodes carried in IT_NOP, `Pm4.h:75-101`). `SubmitDcb` (`Graphics.cpp:2175`) →
-`GraphicsRunSubmit` → async `GraphicsRing` worker → `CommandProcessor::Run` (`GraphicsRun.cpp:989`)
-decodes PM4 via dispatch tables (`:4215-4260`) into `HW::Context/UserConfig/Shader`
-(`HardwareContext.h:635/855/880`) → on draw, `GraphicsRenderDrawIndexAuto` recompiles shaders, builds a
-Vulkan pipeline, binds V#/T#/S# descriptors, `vkCmdDraw`. Present: `R_FLIP`/`VideoOutSubmitFlip` →
-`FlipQueue` → `WindowDrawBuffer` (SDL2 swapchain — stub headless).
+**AGC HLE model.** Each `GraphicsDcb*` entry appends a framed PM4/NOP-carried operation to guest memory.
+`SubmitDcb` hands that stream to prosper's command processor, which folds register and resource state, runs
+the project-owned RDNA2 decoder/recompiler, binds V#/T#/S# descriptors, executes Vulkan work, and presents
+through the headless/live frontend. Packet framing and sub-opcodes are accepted only after capture/disassembly
+and a round-trip test agree.
 
-**Function inventory** (NID → Kyty impl, all `Graphics.cpp`): TRO721eVt4g ResetQueue :1806; ZvwO9euwYzc
-SetCxRegistersIndirect :1874; -HOOCn0JY48 SetShRegistersIndirect :1899; hvUfkUIQcOE SetUcRegistersIndirect
-:1924; pFLArOT53+w SetShRegisterDirect :1855; GIIW2J37e70 SetIndexSize :1949; Yw0jKSqop+E DrawIndexAuto
-:1971; aJf+j5yntiU EventWrite :1996; wr23dPKyWc0 CbReleaseMem :1763; 57labkp+rSQ AcquireMem :2021;
-i1jyy49AjXU WriteData :2061; VmW0Tdpy420 WaitRegMem :2096; YUeqkyT7mEQ SetFlip :2134; MWiElSNE8j8
-WaitUntilSafeForRendering :1829; f3dg2CSgRKY CreateShader :1432 (magic 0x34333231 "1234", ver 0x18,
-relocates header + patches SPI_SHADER_PGM_LO/HI); 2JtWUUiYBXs/wRbq6ZjNop4 GetRegisterDefaults :1307/1317;
-23LRUSvYu1M Init :1294. Indirect-patch helpers (vcmNN.../d-6uF9...) patch dwords of a prior packet.
+**Function inventory** from the firmware export map and observed wrappers: `TRO721eVt4g` ResetQueue;
+`ZvwO9euwYzc` SetCxRegistersIndirect; `-HOOCn0JY48` SetShRegistersIndirect; `hvUfkUIQcOE`
+SetUcRegistersIndirect; `pFLArOT53+w` SetShRegisterDirect; `GIIW2J37e70` SetIndexSize;
+`Yw0jKSqop+E` DrawIndexAuto; `aJf+j5yntiU` EventWrite; `wr23dPKyWc0` CbReleaseMem;
+`57labkp+rSQ` AcquireMem; `i1jyy49AjXU` WriteData; `VmW0Tdpy420` WaitRegMem;
+`YUeqkyT7mEQ` SetFlip; `MWiElSNE8j8` WaitUntilSafeForRendering; `f3dg2CSgRKY` CreateShader;
+`2JtWUUiYBXs`/`wRbq6ZjNop4` GetRegisterDefaults; and `23LRUSvYu1M` Init. The shader magic,
+header relocation, program-register patching, and indirect packet patch helpers are verified separately
+against captured bytes and guest disassembly.
 
-**Shader recompiler:** `ShaderParse.cpp` (GCN/RDNA2 decode → ShaderCode IR, "NextGen"=RDNA2 path) +
-`ShaderSpirv.cpp` (~8K lines, IR → SPIR-V asm text via per-instr templates) + `Shader.cpp` (SpirvRun uses
-SPIRV-Tools assemble+optimize). Portable (needs Kyty core types + SPIRV-Tools).
+**Shader strategy.** Use `llvm-mc -mcpu=gfx1030` as an independent encoding/decoding oracle, prosper's own
+RDNA2 decoder and IR, SPIR-V validation, and offscreen Vulkan assertions. Keep packet decode, hardware state,
+shader translation, resource binding, and presentation as separately testable project-owned layers.
 
-**Coupling to abstract when porting:** portable = the AGC HLE (Graphics.cpp Gen5), PM4 defs (Pm4.h), CP
-decode (GraphicsRun.cpp), recompiler (ShaderParse/ShaderSpirv/Shader.cpp), HW regs (HardwareContext.h) —
-depend mainly on Kyty core (`String8`/`Vector`/`Hashmap`) + SPIRV-Tools. Rewrite for prosper's backend =
-`GraphicsRender.cpp` (Kyty Vulkan wrappers + GpuMemory tracking) and `Window.cpp` (SDL2 swapchain →
-headless offscreen for us).
-
-**Port order:** (1) guest Dcb struct (Kyty layout + reverse our `+0x40`) + the `GraphicsDcb*` HLE fns; (2)
-Pm4.h + CommandProcessor decode → HW state (no Vulkan yet — verify by dumping decoded state); (3) shader
-recompiler (RDNA2 path; start with embedded/trivial shaders); (4) prosper Vulkan backend from HW state
-(reuse our offscreen harness); (5) headless present (offscreen image + CRC golden — our test harness).
+**Implementation order:** (1) derive the guest Dcb fields and HLE entry contracts; (2) decode captured PM4
+into hardware state and assert exact folds without Vulkan; (3) extend the RDNA2 recompiler from embedded and
+minimal captured shaders; (4) execute that state through prosper's Vulkan backend; (5) present headlessly and
+gate each stage with decoded-state, SPIR-V, and framebuffer assertions.
 
 ## Honest scope
 

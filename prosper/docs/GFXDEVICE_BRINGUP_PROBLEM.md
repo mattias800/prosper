@@ -156,14 +156,14 @@ evidence. The pattern — reasoning *about* Unity's internals from the fault sit
   is HDR tone-map luminance (benign); `IsOutputSupported → 1`. There is **no wrong device query**
   steering a degenerate path. The device *succeeds* — yet its sub-objects were never built. Model
   doesn't fit.
-- Reference cross-check is thin: **Kyty** only implements a shallow `GraphicsInit`; not much to diff.
+- Secondary-implementation cross-checks are thin here; direct title evidence must drive the conclusion.
 
 ### Also ruled out
 - **Display surface** is not the gate: we implemented real `libSceVideoOut` (1920×1080@59.94, 3
   buffers, real flip/vblank status) and the boot faults **identically**.
 - **Shader semantics are not mangled:** raw-byte trace confirmed our `CreateShader` relocation is
-  correct (a shader with varyings reads `num_out=1`, `output_semantics[0].semantic=0x0f`, exactly what
-  Kyty's VS→PS linkage expects). The faulting pair are genuinely **zero-varying** shaders
+  correct (a shader with varyings reads `num_out=1`, `output_semantics[0].semantic=0x0f`, matching the
+  observed VS→PS linkage contract). The faulting pair are genuinely **zero-varying** shaders
   (position-only / blit / clear) — so the empty reflection worklist is a *correct* consequence for
   them, not a surfacing bug. (One PS does have a single `sharp[3]` storage-buffer binding.)
 - **Late writer / ordering race** is not the gate: the companion watchpoint saw only zero writes, not

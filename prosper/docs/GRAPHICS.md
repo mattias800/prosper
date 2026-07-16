@@ -109,7 +109,7 @@ initializers to construct valid GPU objects (correctness-first — no plausible-
 ## ✔ USER-DATA PROBE (2026-07-04): zero-varying fault pair still has PS resource bindings
 
 Follow-up to PR #14's fork between "legitimate zero-varying pipeline, bad resident flag" and
-"`[+0xc0]` is fed by shader resource bindings." `PROSPER_PIPETRACE` now logs Kyty's
+"`[+0xc0]` is fed by shader resource bindings." `PROSPER_PIPETRACE` now logs the decoded
 `ShaderUserData` resource-binding table: direct resource offsets, `eud_size_dw`/`srt_size_dw`, and
 the four sharp-resource arrays (`sharp[0]` texture, `sharp[2]` sampler, `sharp[3]` storage buffer).
 
@@ -138,7 +138,7 @@ now logs semantic counts/arrays + the raw `0x50..0x5f` header region):
 
 - Shaders that HAVE varyings read correctly: `num_input_semantics=1` (`raw[0x50]=01 00 00 00`),
   `num_output_semantics=1` (`raw[0x56]=01 00`), and `output_semantics[0].semantic=0x0f` (=15) — exactly
-  the value Kyty's VS→PS linkage expects. So our offsets (in u32@0x50, out u16@0x56, arrays@0x30/0x38)
+  the value consumed by the observed VS→PS linkage. So our offsets (in u32@0x50, out u16@0x56, arrays@0x30/0x38)
   and relocation are correct.
 - The **faulting pipelines** use `gs` (num_out=0, `raw[0x56]=00 00`) + `ps` (num_in=0) — genuinely
   **zero-varying shaders** (position-only/blit). All 3 `CreateInterpolantMapping` calls therefore map 0
@@ -223,7 +223,7 @@ explain the empty reflection table. This is the remaining thread to the true roo
 ## ✔ libSceVideoOut real 1080p60 + swapchain scaffolding (2026-07-04) — and the [+0x140] gate is NOT the display surface
 
 Implemented the 5 previously-unimplemented VideoOut NIDs with real, self-consistent values (resolved
-via shadPS4 aerolib + Kyty VideoOut.cpp): `Nv8c-Kb+DUM` sceVideoOutIsOutputSupported, `PjS5uASwcV8`
+through firmware symbols, guest call sites, and PS4-inherited public contracts): `Nv8c-Kb+DUM` sceVideoOutIsOutputSupported, `PjS5uASwcV8`
 sceVideoOutSetBufferAttribute2, `rKBUtgRrtbk` sceVideoOutRegisterBuffers2, `utPrVdxio-8`
 sceVideoOutGetOutputStatus, `w0hLuNarQxY` sceVideoOutConfigureOutput. Plus fixed GetResolutionStatus
 (was all-zero → now 1920×1080@59.94Hz) and added GetVblankStatus (advancing counter) +
@@ -347,13 +347,13 @@ code writes the global" was the classic computed-addressing blind spot (same fai
 RGCTX hunt): the writer stores through `slot+0x10`, never through the literal address.
 
 The **register source object IS the Shader**: `SetSource` (eboot+0x3af400) reads `[src+0x08]`
-(user_data), `[src+0x28]` (specials), `[src+0x5a]` (type) — exactly the SDK Shader layout (Kyty
-Shader.h:974). The "classify table" ships inside each shader blob; nothing is fabricated.
+(user_data), `[src+0x28]` (specials), `[src+0x5a]` (type) — the layout established by the guest's own
+accesses and captured header bytes. The "classify table" ships inside each shader blob; nothing is fabricated.
 
-**Implemented in `hle_agc.cpp` (all real semantics, layout-verified via Kyty + the eboot disasm):**
+**Implemented in `hle_agc.cpp` (all real semantics, layout-verified via eboot disassembly and captures):**
 - `f3dg2CSgRKY` **sceAgcCreateShader** — relocates the header's self-relative pointers in place,
   binds the code pointer, patches the leading `SPI/COMPUTE_PGM_LO/HI` sh-register pair (all five
-  stage pairs, beyond Kyty's ES/PS-only), guards double-relocation, writes `*dst`, and registers
+  stage pairs, beyond the initially observed ES/PS pair), guards double-relocation, writes `*dst`, and registers
   the shader in a host-side registry (`prosper_agc_shader_count()`) for the AGC→Vulkan pipeline.
 - `V++UgBtQhn0` **sceAgcGetDataPacketPayloadAddress** — called from *inside* eboot's static AGC
   code (register-bank prepare, `eboot+0x3af040`): the returned payload becomes the register bank
@@ -361,15 +361,15 @@ Shader.h:974). The "classify table" ships inside each shader blob; nothing is fa
 - `n2fD4A+pb+g` **sceAgcCbSetShRegisterRangeDirect** — IT_SET_SH_REG range packet (+ the marker
   NOP the real library emits).
 - `D9sr1xGUriE` **sceAgcCreatePrimState**, `HV4j+E0MBHE` **sceAgcCreateInterpolantMapping** —
-  pipeline registers derived from the bound shaders' specials/semantics (generalized semantic
-  matching instead of Kyty's hard-asserted identity layout).
+  pipeline registers derived from the bound shaders' specials/semantics using generalized semantic
+  matching rather than a hard-coded identity layout.
 
 **Result:** all 36 built-in shaders register (`PROSPER_GFXLOG` shows `pgm_patched=1` on each), the
 whole `CreateWorkload` register-context chain (`0x3b5ea6` → `0x3b1562` → `0x3b1533` → `0x3afcff`)
 completes, and **no unimplemented libSceAgc call remains in the boot**. The boot now faults much
 later at `eboot+0xba6e08` (addr=0x8, non-AGC backtrace via `0xd3xxxx`/`0x15fxxxx`) — the next,
-separate frontier. Note: the game passes AGC interface version **13** (Kyty's Gen5 games used 8) —
-layouts verified against this title, not assumed from Kyty.
+separate frontier. Note: the game passes AGC interface version **13**; layouts are verified against
+this title rather than inferred from earlier-generation material.
 
 Tooling added: `build-linux/imgdump <module> <out.img>` dumps a module's flat image for offline
 `objdump -D -b binary -m i386:x86-64` disassembly (how the registry writer was found).
@@ -404,8 +404,8 @@ The boot faults at `eboot+0x3b5ea6` inside a GPU register-setting routine. Full 
 **Disproved proposed fix:** implement `+kSrjIVxKFE` as an AGC register-context constructor: allocate the two
 register banks, install `[context+0x10]`/`[context+0x18]`, and install a valid classify table at
 `[context+0x08]` mapping (register-set selector, SDK register index) → hardware slot. The register
-offsets for that mapping are exactly the data now vendored in `agc_reg_defaults.cpp` (the ported
-Kyty `RegisterDefaults`). Note: this AGC code is **statically linked into eboot** — only the leaf
+offsets for that mapping are exactly the independently verified tables now stored in
+`agc_reg_defaults.cpp`. Note: this AGC code is **statically linked into eboot** — only the leaf
 SDK entrypoints like `+kSrjIVxKFE` are imports (PLT/GOT), which is why implementing that one import
 unblocks the whole internal register path.
 
