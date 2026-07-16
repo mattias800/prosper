@@ -730,6 +730,7 @@ HLE(k_pthread_exit)   {
 namespace {
 std::mutex g_win_key_thunks_mutex;
 std::unordered_map<uint64_t, void*> g_win_key_thunks;
+std::atomic<void (*)(uint64_t)> g_win_key_delete_after_host_hook{nullptr};
 
 // winpthreads invokes key destructors with the Microsoft x64 ABI, but every guest callback uses
 // the PS5/FreeBSD SysV ABI. Emit one tiny Microsoft-ABI thunk per live key so winpthreads can retain
@@ -772,17 +773,15 @@ void* win_make_key_destructor_thunk(uint64_t guest_destructor) {
     return code;
 }
 
-void win_release_key_destructor_thunk(pthread_key_t key) {
-    void* thunk = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(g_win_key_thunks_mutex);
-        auto it = g_win_key_thunks.find((uint64_t)key);
-        if (it == g_win_key_thunks.end()) return;
-        thunk = it->second;
-        g_win_key_thunks.erase(it);
-    }
-    VirtualFree(thunk, 0, MEM_RELEASE);
 }
+
+void win_set_key_delete_after_host_hook_for_test(void (*hook)(uint64_t)) {
+    g_win_key_delete_after_host_hook.store(hook, std::memory_order_release);
+}
+
+size_t win_key_destructor_thunk_count_for_test() {
+    std::lock_guard<std::mutex> lock(g_win_key_thunks_mutex);
+    return g_win_key_thunks.size();
 }
 #endif
 
@@ -790,16 +789,28 @@ HLE(k_key_create) {
     if (!a0) return 0x16;
     pthread_key_t k;
 #ifdef _WIN32
-    void* thunk = a1 ? win_make_key_destructor_thunk(a1) : nullptr;
-    if (a1 && !thunk) return ENOMEM;
-    int r = pthread_key_create(&k, (void (*)(void*))thunk);
+    void* thunk = nullptr;
+    int r = 0;
+    {
+        // Keep host key allocation and registry publication atomic with deletion. winpthreads can
+        // immediately reuse a deleted numeric key, so exposing it before the old map entry is gone
+        // can make the new emplace lose and leave its RX thunk permanently untracked.
+        std::lock_guard<std::mutex> lock(g_win_key_thunks_mutex);
+        thunk = a1 ? win_make_key_destructor_thunk(a1) : nullptr;
+        if (a1 && !thunk) return ENOMEM;
+        r = pthread_key_create(&k, (void (*)(void*))thunk);
+        if (!r && thunk) {
+            try {
+                if (!g_win_key_thunks.emplace((uint64_t)k, thunk).second) r = EAGAIN;
+            } catch (const std::bad_alloc&) {
+                r = ENOMEM;
+            }
+            if (r) pthread_key_delete(k);
+        }
+    }
     if (r) {
         if (thunk) VirtualFree(thunk, 0, MEM_RELEASE);
         return (uint64_t)r;
-    }
-    if (thunk) {
-        std::lock_guard<std::mutex> lock(g_win_key_thunks_mutex);
-        g_win_key_thunks.emplace((uint64_t)k, thunk);
     }
 #else
     int r = pthread_key_create(&k, (void (*)(void*))(uintptr_t)a1);
@@ -810,9 +821,27 @@ HLE(k_key_create) {
 }
 HLE(k_key_delete)    {
     const pthread_key_t key = (pthread_key_t)a0;
-    const int result = pthread_key_delete(key);
 #ifdef _WIN32
-    if (!result) win_release_key_destructor_thunk(key);
+    void* thunk = nullptr;
+    int result = 0;
+    {
+        // Do not release the host key until creation is excluded: winpthreads may recycle its
+        // numeric value before the corresponding thunk entry has otherwise been erased.
+        std::lock_guard<std::mutex> lock(g_win_key_thunks_mutex);
+        result = pthread_key_delete(key);
+        if (!result) {
+            if (auto hook = g_win_key_delete_after_host_hook.load(std::memory_order_acquire))
+                hook((uint64_t)key);
+            auto it = g_win_key_thunks.find((uint64_t)key);
+            if (it != g_win_key_thunks.end()) {
+                thunk = it->second;
+                g_win_key_thunks.erase(it);
+            }
+        }
+    }
+    if (thunk) VirtualFree(thunk, 0, MEM_RELEASE);
+#else
+    const int result = pthread_key_delete(key);
 #endif
     return (uint64_t)(int64_t)result;
 }
