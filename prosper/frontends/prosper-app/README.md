@@ -84,3 +84,6 @@ These switches isolate frontend-specific behavior without requiring a separate b
 - `PROSPER_APP_GUEST_DUMP_MS=<milliseconds>` prints that ring plus the live Windows guest-thread
   instruction/stack pointers once after the app loop has run for the requested time, even while frames
   continue. Use it for guest progression stalls that are not render stalls; it is disabled by default.
+  `PROSPER_APP_GUEST_DUMP_INTERVAL_MS` repeats the sample at that interval, and
+  `PROSPER_APP_GUEST_DUMP_PATH` writes thread samples to a dedicated append-only file so other trace
+  streams cannot interleave with them.

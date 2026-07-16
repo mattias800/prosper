@@ -1897,16 +1897,27 @@ void dump_guest_exception_trace() {
 #endif
 }
 
-void dump_guest_thread_trace() {
+void dump_guest_thread_trace(const char* path) {
 #ifdef _WIN32
-    auto trace = []<typename... Args>(const char* format, Args... args) {
+    HANDLE output = GetStdHandle(STD_ERROR_HANDLE);
+    bool close_output = false;
+    if (path && *path) {
+        HANDLE file = CreateFileA(path, FILE_APPEND_DATA,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                  nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file != INVALID_HANDLE_VALUE) {
+            output = file;
+            close_output = true;
+        }
+    }
+    auto trace = [output]<typename... Args>(const char* format, Args... args) {
         char message[512];
         const int length = std::snprintf(message, sizeof(message), format, args...);
         if (length <= 0) return;
         DWORD written = 0;
         const DWORD bytes = static_cast<DWORD>(
             length < (int)sizeof(message) ? length : (int)sizeof(message) - 1);
-        WriteFile(GetStdHandle(STD_ERROR_HANDLE), message, bytes, &written, nullptr);
+        WriteFile(output, message, bytes, &written, nullptr);
     };
     std::vector<UnwindModuleDesc> modules;
     {
@@ -2015,6 +2026,9 @@ void dump_guest_thread_trace() {
               (unsigned long long)context.Rsp, (unsigned long)prior_suspend,
               wait_description, guest_returns);
     }
+    if (close_output) CloseHandle(output);
+#else
+    (void)path;
 #endif
 }
 

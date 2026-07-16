@@ -196,7 +196,7 @@ void dispatch_pending_guest_exception();
 uint32_t pending_guest_exception_count();
 void dump_guest_exception_trace();
 // Windows-only snapshot of live guest-thread instruction/stack pointers. Other hosts are a no-op.
-void dump_guest_thread_trace();
+void dump_guest_thread_trace(const char* path = nullptr);
 
 // Register the linked program's global export table (NID -> absolute guest address) so
 // sceKernelDlsym can resolve exported symbols by name. Unity's native-plugin loader dlsym's

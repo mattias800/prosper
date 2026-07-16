@@ -484,10 +484,16 @@ int main(int argc, char** argv) {
     const int stallDumpMs = stallDumpEnv ? std::max(0, atoi(stallDumpEnv)) : 0;
     const char* timedDumpEnv = getenv("PROSPER_APP_GUEST_DUMP_MS");
     const int timedDumpMs = timedDumpEnv ? std::max(0, atoi(timedDumpEnv)) : 0;
+    const char* timedDumpIntervalEnv = getenv("PROSPER_APP_GUEST_DUMP_INTERVAL_MS");
+    const int timedDumpIntervalMs = timedDumpIntervalEnv ?
+        std::max(0, atoi(timedDumpIntervalEnv)) : 0;
+    const char* timedDumpPath = getenv("PROSPER_APP_GUEST_DUMP_PATH");
     const auto loopStarted = std::chrono::steady_clock::now();
     auto lastFrameProgress = loopStarted;
+    auto nextTimedDump = loopStarted + std::chrono::milliseconds(timedDumpMs);
     uint64_t shown = 0, lastFrameSeq = ~0ull, patFrame = 0;
-    bool timedDumpDone = false;
+    unsigned timedDumpCount = 0;
+    bool timedDumpPending = timedDumpMs > 0;
     bool running = true;
     while (running && !prosper_stop_requested()) {
         SDL_Event ev;
@@ -500,14 +506,19 @@ int main(int argc, char** argv) {
 #ifdef PROSPER_HAVE_DIALOG_SDL3
         prosper::sdl_platform_ui_pump();   // run a pending ImeDialog text-entry modal on this (main) thread
 #endif
-        if (!timedDumpDone && timedDumpMs > 0 &&
-            std::chrono::steady_clock::now() - loopStarted >=
-                std::chrono::milliseconds(timedDumpMs)) {
-            fprintf(stderr, "[app] timed guest-state dump after %d ms at frame %llu\n",
-                    timedDumpMs, (unsigned long long)shown);
+        const auto loopNow = std::chrono::steady_clock::now();
+        if (timedDumpPending && loopNow >= nextTimedDump) {
+            ++timedDumpCount;
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                loopNow - loopStarted).count();
+            fprintf(stderr, "[app] timed guest-state dump #%u after %lld ms at frame %llu\n",
+                    timedDumpCount, (long long)elapsed, (unsigned long long)shown);
             dump_guest_exception_trace();
-            dump_guest_thread_trace();
-            timedDumpDone = true;
+            dump_guest_thread_trace(timedDumpPath);
+            if (timedDumpIntervalMs > 0)
+                nextTimedDump = loopNow + std::chrono::milliseconds(timedDumpIntervalMs);
+            else
+                timedDumpPending = false;
         }
 
         static const uint32_t kPatW = 1920, kPatH = 1080;
