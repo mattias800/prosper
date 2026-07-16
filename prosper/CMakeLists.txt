@@ -267,8 +267,8 @@ if(TARGET prosper_core)
   target_link_libraries(test_dlsym_handle PRIVATE prosper_core)
   add_test(NAME dlsym_handle COMMAND test_dlsym_handle)
 
-  # Guest mutex TYPE semantics (#145): settype honored, Sony/FreeBSD ERRORCHECK default (incl.
-  # static-sentinel self-init), FreeBSD errno values (EDEADLK=11). Pure, no game dump needed.
+  # Guest mutex TYPE semantics (#145): settype honored, explicit Sony/FreeBSD ERRORCHECK default,
+  # non-recursive static-sentinel self-init, FreeBSD errno values (EDEADLK=11). Pure, no game dump.
   add_executable(test_mutex_types tests/test_mutex_types.cpp)
   target_link_libraries(test_mutex_types PRIVATE prosper_core)
   add_test(NAME mutex_types COMMAND test_mutex_types)
