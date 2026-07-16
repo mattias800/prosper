@@ -80,10 +80,11 @@ size_t gfx10_dcc_metadata_bytes(uint32_t width, uint32_t height, uint32_t depth,
                                 bool pipe_aligned);
 
 // Materialize a uniform, self-contained GFX8-GFX10 DCC fast-clear code into the renderer's RGBA8
-// upload format. The validated path is deliberately limited to four-component surfaces and the
-// embedded 0000/0001/1110/1111 codes; register clears, single-color codes, uncompressed (0xff), and
-// actual compressed blocks return false. `alpha_is_on_msb` selects the raw component that receives
-// the clear alpha before the T# destination swizzle is applied.
+// upload format. The validated path is deliberately limited to three-component color surfaces,
+// four-component color/alpha surfaces, and the embedded 0000/0001/1110/1111 codes; register clears,
+// single-color codes, uncompressed (0xff), and actual compressed blocks return false. Three-component
+// formats receive the sampled-format default alpha of one. `alpha_is_on_msb` selects the raw component
+// that receives the clear alpha on four-component formats before the T# destination swizzle is applied.
 bool gfx10_dcc_fast_clear_rgba8(uint8_t* dst, size_t texel_count,
                                 const uint8_t* metadata, size_t metadata_bytes,
                                 uint32_t num_components, bool alpha_is_on_msb,

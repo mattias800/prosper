@@ -59,7 +59,8 @@ bool gfx10_dcc_fast_clear_rgba8(uint8_t* dst, size_t texel_count,
                                 const uint8_t* metadata, size_t metadata_bytes,
                                 uint32_t num_components, bool alpha_is_on_msb,
                                 uint8_t* clear_code) {
-    if (!metadata || !metadata_bytes || num_components != 4 || (!dst && texel_count))
+    if (!metadata || !metadata_bytes ||
+        (num_components != 3 && num_components != 4) || (!dst && texel_count))
         return false;
     const uint8_t code = metadata[0];
     if (code != 0x00 && code != 0x40 && code != 0x80 && code != 0xc0)
@@ -69,10 +70,13 @@ bool gfx10_dcc_fast_clear_rgba8(uint8_t* dst, size_t texel_count,
         return false;
 
     const uint8_t color = (code == 0x80 || code == 0xc0) ? 255 : 0;
-    const uint8_t alpha = (code == 0x40 || code == 0xc0) ? 255 : 0;
-    const uint32_t alpha_component = alpha_is_on_msb ? 3u : 0u;
-    uint8_t pixel[4] = {color, color, color, color};
-    pixel[alpha_component] = alpha;
+    uint8_t pixel[4] = {color, color, color, 255};
+    if (num_components == 4) {
+        const uint8_t alpha = (code == 0x40 || code == 0xc0) ? 255 : 0;
+        const uint32_t alpha_component = alpha_is_on_msb ? 3u : 0u;
+        std::fill(pixel, pixel + 4, color);
+        pixel[alpha_component] = alpha;
+    }
     for (size_t i = 0; i < texel_count; ++i)
         std::memcpy(dst + i * 4, pixel, sizeof(pixel));
     if (clear_code) *clear_code = code;
