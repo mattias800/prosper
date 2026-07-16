@@ -306,7 +306,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             // unbounded RTT/GPU resources across tens of thousands of submits (which OOM-kills the process).
             static int g_render_last = getenv("PROSPER_RENDER_LAST") ? atoi(getenv("PROSPER_RENDER_LAST")) : INT_MAX;
             static thread_local int g_this_submit = -1;
-            if (phase.first_span || g_this_submit < 0) g_this_submit = g_submit_idx++;
+            static thread_local bool g_force_this_submit = false;
+            if (phase.first_span || g_this_submit < 0) {
+                g_this_submit = g_submit_idx++;
+                g_force_this_submit = false;
+            }
             if (g_this_submit > g_render_last) return {};
             static const int g_rttlog_min_submit = getenv("PROSPER_RTTLOG_MIN_SUBMIT")
                 ? std::max(0, atoi(getenv("PROSPER_RTTLOG_MIN_SUBMIT"))) : 0;
@@ -445,6 +449,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         if (has_dim(it.vrt.get()) || has_dim(it.prt.get())) { force_target = true; break; }
                     }
             }
+            // Ordered submits can contain several graphics spans separated by compute work. Once a
+            // diagnostic target selects one span, keep rendering the rest of that transaction so the
+            // final span can recover and return the scanout assembled in the persistent RTT cache.
+            g_force_this_submit |= force_target;
             // A one-time offscreen producer may occur before a much later consumer render window.
             // Render that target even before the warmup ends so its RTT cache entry survives skipped
             // intermediate submits (#526). Submit-count and wall-clock gates are additive.
@@ -456,7 +464,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 fprintf(stderr, "[render] wall-clock warmup complete after %lld ms at submit %d\n",
                         (long long)elapsed_ms, g_this_submit);
             }
-            if ((g_this_submit < g_render_first || before_delay) && !force_target) return {};
+            if ((g_this_submit < g_render_first || before_delay) && !g_force_this_submit) return {};
             // Dump the FIRST item's recompiled SPIR-V (diagnostic; survives a mid-render crash).
             if (getenv("PROSPER_SHADER_DUMP") && !items.empty()) {
                 std::string d = getenv("PROSPER_SHADER_DUMP");
