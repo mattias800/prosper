@@ -91,6 +91,7 @@ struct SpirvCompute {
     std::map<uint32_t, uint32_t> cbuf_var;          // binding -> storage-buffer var (N-buffer model; 2/3 map to v_cbuf/v_cbuf1)
     bool     is_fragment=0;                          // true in the fragment shell (gates VINTRP interp)
     bool     is_compute=0;                            // true in the compute shell (gates LDS / s_barrier)
+    bool     uses_barrier=0;                          // guest or synthesized workgroup barrier emitted
     // Descriptor set for this stage's resources. VS and PS share ONE Vulkan pipeline, so they must NOT
     // reuse binding numbers within one set (both stages number their cbuf/texture from binding 2 -> a
     // set-0 collision made the descriptor layout invalid, corrupting the VS's reads -> degenerate
@@ -774,6 +775,7 @@ struct SpirvCompute {
     }
     // s_barrier: workgroup execution + memory barrier (OpControlBarrier).
     void barrier() {
+        uses_barrier = true;
         put(code, Op_ControlBarrier, {uconst(Scope_Workgroup), uconst(Scope_Workgroup), uconst(MemSem_WGAcqRel)});
     }
 
@@ -5183,6 +5185,11 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/true,
                    /*allow_smem*/true, [](const Rdna2Inst&) { return false; }, code, dwords))
         return {};
+    // The entry guard is intentionally divergent only in the final partial workgroup. Vulkan requires
+    // every workgroup invocation to participate uniformly in OpControlBarrier, including barriers the
+    // recompiler synthesizes for wave operations. Reject this uncommon combination instead of emitting
+    // a module that could deadlock or observe undefined workgroup-memory behavior.
+    if (has_partial_workgroup && b.uses_barrier) return {};
     return b.finish();
 }
 
