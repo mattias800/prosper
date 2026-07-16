@@ -12,6 +12,10 @@
 // that depend on Linux perf_event / ptrace (PROSPER_HWBP/HWWATCH/BP/PEEK/DUMPAT) remain absent.
 #ifdef _WIN32
 
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00   // GetCurrentThreadStackLimits (Windows 8+)
+#endif
+
 #include "exec_image.hpp"
 #include "guest_write_watch.hpp"
 #include "sse4a.hpp"
@@ -116,6 +120,19 @@ namespace {
     // Thread-stack registry (portable; mirrors the Linux one) so GC/thread code gets real bounds.
     std::map<uint64_t, std::pair<uint64_t, uint64_t>> g_stacks;
     std::mutex g_smx;
+
+    // Module initialization may attach a frontend-owned thread to IL2CPP before run_entry switches
+    // to its dedicated guest stack. Keep the init thread's native stack registered for that
+    // thread's lifetime, then remove it before Windows can recycle the native TID.
+    struct InitThreadStackRegistration {
+        uint64_t native_tid = 0;
+        ~InitThreadStackRegistration() {
+            if (!native_tid) return;
+            std::lock_guard<std::mutex> lk(g_smx);
+            g_stacks.erase(native_tid);
+        }
+    };
+    thread_local InitThreadStackRegistration t_init_stack_registration;
 
     std::vector<std::pair<uint64_t, uint64_t>> g_modstart_param_ranges;
     struct ModStartDesc { uint64_t a, b, c; } g_modstart_desc = { 0x10, 0x200, 0 };
@@ -475,6 +492,10 @@ bool guest_stack_for_thread(uint64_t tid, void** base, size_t* size) {
     };
     if (lookup(tid)) return true;
 
+    // Frontends enter the guest from std::thread. winpthreads cannot always translate that
+    // implicit handle with pthread_gethandle(), but a self-query has an unambiguous native ID.
+    if (tid == (uint64_t)pthread_self() && lookup(cur_tid())) return true;
+
     // Windows workers are registered by native thread id because exception delivery and stack
     // limits use Win32 APIs, while the guest sees winpthreads' small pthread_t handle. Translate
     // that handle before looking up another thread's stack. Without this, scePthreadAttrGet(target)
@@ -493,6 +514,13 @@ void set_module_start_param_ranges(const std::vector<std::pair<uint64_t, uint64_
 }
 
 size_t run_guest_inits(const std::vector<uint64_t>& fns) {
+    ULONG_PTR stack_lo = 0, stack_hi = 0;
+    GetCurrentThreadStackLimits(&stack_lo, &stack_hi);
+    if (stack_lo && stack_hi > stack_lo) {
+        const uint64_t native_tid = cur_tid();
+        register_thread_stack(native_tid, (void*)stack_lo, (uint64_t)(stack_hi - stack_lo));
+        t_init_stack_registration.native_tid = native_tid;
+    }
     guest_tls_activate_thread();   // give this (main) thread its guest %fs TCB before running guest code
     size_t ok = 0;
     for (uint64_t f : fns) {
