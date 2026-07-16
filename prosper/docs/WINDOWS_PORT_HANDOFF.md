@@ -1,4 +1,4 @@
-# Windows native port — handoff (2026-07-14)
+# Windows native port — handoff (2026-07-16)
 
 For users of the prebuilt archive, start with `WINDOWS_RELEASE.md`. This document is the engineering
 build, validation, and debugging handoff.
@@ -25,6 +25,25 @@ The guest, on Windows (MinGW, native), reproducibly:
   repeated GC stop-the-world suspend/resume cycles to complete.
 - Runs the shared live Vulkan renderer and normal 1920x1080 present/readback path on an NVIDIA host.
 - Builds SDL3 with native Win32 video, WASAPI audio, XInput/HIDAPI controllers, and Vulkan support.
+
+### Current GC delivery model (#690)
+
+Do not reintroduce `SuspendThread`/`SetThreadContext` as the normal exception path. Restoring a context
+captured inside a native wait after waking it resumes stale `ntdll` state. Windows now queues the stop,
+wakes the target's registered wait, and runs the guest handler cooperatively at an HLE boundary on a
+dedicated alternate stack. `PROSPER_WIN_LEGACY_EXC=1` is the diagnostic opt-out.
+
+Wait registrations are per nesting level, not merely per thread. The GC callback performs its own
+semaphore waits, so a single thread-local registration lets the inner wait erase the still-live outer
+wait. Condition interruption also increments its sequence before waking, which closes the wake-before-
+`WaitOnAddress` race. Run `test_win_exception_delivery.exe` after touching any of these paths; its
+nested-wait case deliberately holds the handler after the inner wait returns and proves the outer wait
+is still discoverable. `PROSPER_APP_STALL_DUMP_MS=<milliseconds>` makes `prosper-app` dump the bounded
+exception ring when presented-frame progress stops, and `PROSPER_VEHLOG=1` adds fatal worker context.
+
+Validation on 2026-07-16: 30 consecutive exception-suite passes and 12/12 fresh-save Blasphemous 2
+Windows boots reached 360 presented frames with no stall or early exit. This validates boot/GC stability,
+not the title-to-menu graphics transition; tiled 2D compute storage writeback remains tracked in #787.
 
 Merged PRs that got it here (all `#ifdef _WIN32` — Linux/macOS unaffected, CI green on all 4 platforms):
 - **#624** substrate: `exec_image_win.cpp` (VirtualAlloc mapping, VEH fault handler, SysV↔MS-x64 stub

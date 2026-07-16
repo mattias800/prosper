@@ -172,6 +172,15 @@ struct UnwindModuleDesc {
 // Install module unwind descriptors (call after images are mapped). Enables sceKernelGetModuleInfoForUnwind.
 void set_unwind_modules(const UnwindModuleDesc* descs, size_t count);
 
+// Windows-only fatal-fault diagnostics. Other hosts provide empty implementations.
+void trace_guest_stack_query(uint64_t target, bool found, void* base, size_t size);
+void trace_guest_thread_lifecycle(bool starting, uint64_t pthread_id, uint64_t native_id,
+                                  void* stack_base, size_t stack_size);
+// Windows cooperative exception checkpoint used when a target was woken from a registered HLE wait.
+// Other hosts provide an empty implementation.
+void dispatch_pending_guest_exception();
+void dump_guest_exception_trace();
+
 // Register the linked program's global export table (NID -> absolute guest address) so
 // sceKernelDlsym can resolve exported symbols by name. Unity's native-plugin loader dlsym's
 // UnityPluginLoad / PSN_PrxInitialize / etc. by name; k_dlsym hashes the name (nid_hash) and

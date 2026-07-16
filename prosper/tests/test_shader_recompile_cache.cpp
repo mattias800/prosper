@@ -200,6 +200,12 @@ int main() {
     CHECK(rdna2_recompile_code_span(dispatch_ps.data(), dispatch_ps.size()) == dispatch_ps.size(),
           "scalar-dispatch table tail participates in the owning shader span");
 
+    std::vector<uint32_t> reversed_shift_dispatch = dispatch_ps;
+    reversed_shift_dispatch[4] = 0x8f6a6a83u; // s_lshl_b32 s106, 3, s106
+    CHECK(!rdna2_pcrel_dispatch_info(reversed_shift_dispatch.data(),
+                                     reversed_shift_dispatch.size()).valid,
+          "reversed non-commutative dispatch shift is rejected");
+
     std::array<uint32_t, 5> selector_words{};
     ShaderResourceTable dispatch_table;
     ShaderResource selector_resource;

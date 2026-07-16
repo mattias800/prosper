@@ -82,6 +82,26 @@ int main() {
                           sizeof(compute_cfg_dispatch)/sizeof(compute_cfg_dispatch[0]), 0, 0,
                           &dispatch_rt).empty(),
           "a nested varying-VCC compute CFG preserves spilled EXEC and lowers through the dispatcher");
+    // UE4 also recycles a physical v_writelane slot: first as ordinary scalar data, then as an
+    // EXEC-mask spill. Force a dispatcher block boundary after each lifetime so both typed views
+    // must survive the Function-variable state round trip. Consumers remain statically typed.
+    const uint32_t compute_cfg_dispatch_recycled_lane[] = {
+        0xBE800381u, 0x7E000280u, 0x7E020300u,
+        0xD7610013u, 0x00014A00u, 0xBF820000u,       // v19[37] = s0; next block
+        0xD7600002u, 0x00014B13u,                   // s2 = v19[37] (data view)
+        0xD7610013u, 0x00014A7Eu, 0xD7610013u, 0x0001507Fu,
+        0xBF820000u,                                // v19[37:40] = EXEC; next block
+        0xD760000Eu, 0x00014B13u, 0xD760000Fu, 0x00015113u, 0xBEFE040Eu,
+        0xE00C2000u, 0x80020400u, 0x7DB900F9u, 0x86050007u,
+        0x7D020200u, 0xBF860006u, 0xBF0A8204u, 0x360000FDu, 0xBF840001u,
+        0x81008100u, 0x81008100u, 0xBF82FFF4u,
+        0xBF810000u,
+    };
+    CHECK(!recompile_valu(compute_cfg_dispatch_recycled_lane,
+                          sizeof(compute_cfg_dispatch_recycled_lane) /
+                              sizeof(compute_cfg_dispatch_recycled_lane[0]),
+                          0, 0, &dispatch_rt).empty(),
+          "the compute CFG dispatcher preserves a recycled scalar/mask spill lane");
     // Ordinary LDS effects do not require workgroup-uniform control flow. Keep the same dispatcher
     // shape, but make the inner SCC arm conditionally execute a ds_write_b32 before the back-edge.
     // (A barrier remains forbidden below; only the blanket rejection of raw DS is being relaxed.)
@@ -210,6 +230,30 @@ int main() {
     RecompileCoverage g = recompile_coverage(cvt_i4, sizeof(cvt_i4)/sizeof(cvt_i4[0]));
     CHECK(g.total == 1 && g.alu == 1 && g.unsupported == 0,
           "#527: v_cvt_off_f32_i4 is covered by the VOP1 recompiler");
+
+    // A wave-empty saveexec/execz guard may surround a scalar counted loop when the body preserves
+    // both EXEC and the guard's saved mask. This is the Evergate color-conversion shape.
+    const uint32_t guarded_counted_loop[] = {
+        0xBE84247Eu, 0xBF880009u,                         // save EXEC in s[4:5]; skip to restore if empty
+        0xB0020005u, 0xBE800380u, 0x7E020280u,           // limit=5, i=0, sum=0
+        0xBF0A0200u, 0xBF840003u, 0x4A020200u,           // loop compare/exit; sum += i
+        0x81008100u, 0xBF82FFFBu,                        // i++; backedge
+        0x7E000D01u, 0xBEFE0404u, 0xBF810000u,           // convert sum; restore EXEC; end
+    };
+    CHECK(!recompile_valu(guarded_counted_loop, std::size(guarded_counted_loop), 0, 0).empty(),
+          "guarded counted loop is accepted when EXEC and the saved guard mask are preserved");
+
+    const uint32_t guarded_counted_loop_inner_save[] = {
+        0xBE84247Eu, 0xBF88000Au,
+        0xB0020005u, 0xBE800380u, 0x7E020280u,
+        0xBF0A0200u, 0xBF840004u,
+        0xBE86247Eu,                                     // inner saveexec mutates EXEC every iteration
+        0x4A020200u, 0x81008100u, 0xBF82FFFAu,
+        0x7E000D01u, 0xBEFE0404u, 0xBF810000u,
+    };
+    CHECK(recompile_valu(guarded_counted_loop_inner_save,
+                         std::size(guarded_counted_loop_inner_save), 0, 0).empty(),
+          "guarded counted loop rejects an uncarried inner EXEC mutation");
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");

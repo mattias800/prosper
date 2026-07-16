@@ -481,6 +481,41 @@ int main() {
         CHECK(gfx10_dcc_metadata_bytes(32, 32, 32, (uint32_t)TileMode::Sw64KbS,
                                        4, true) == 0,
               "DCC sizing rejects a swizzle outside the supported R_X contract");
+        std::vector<uint8_t> clear_pixels(8, 0xaa);
+        const std::vector<uint8_t> clear_0001(4096, 0x40);
+        uint8_t clear_code = 0xff;
+        CHECK(gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 2,
+                                         clear_0001.data(), clear_0001.size(),
+                                         4, true, &clear_code) && clear_code == 0x40 &&
+              clear_pixels == std::vector<uint8_t>({0, 0, 0, 255, 0, 0, 0, 255}),
+              "uniform DCC_CLEAR_0001 materializes color zero and MSB alpha one");
+        const std::vector<uint8_t> clear_0000(16, 0x00);
+        const std::vector<uint8_t> clear_1111(16, 0xc0);
+        CHECK(gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1,
+                                         clear_0000.data(), clear_0000.size(), 4, true) &&
+              clear_pixels[0] == 0 && clear_pixels[1] == 0 &&
+              clear_pixels[2] == 0 && clear_pixels[3] == 0 &&
+              gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1,
+                                         clear_1111.data(), clear_1111.size(), 4, true) &&
+              clear_pixels[0] == 255 && clear_pixels[1] == 255 &&
+              clear_pixels[2] == 255 && clear_pixels[3] == 255,
+              "uniform DCC_CLEAR_0000 and DCC_CLEAR_1111 materialize all-zero/all-one");
+        const std::vector<uint8_t> clear_1110(16, 0x80);
+        CHECK(gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1,
+                                         clear_1110.data(), clear_1110.size(),
+                                         4, false) &&
+              clear_pixels[0] == 0 && clear_pixels[1] == 255 &&
+              clear_pixels[2] == 255 && clear_pixels[3] == 255,
+              "uniform DCC_CLEAR_1110 places alpha zero in the LSB component");
+        std::vector<uint8_t> mixed_clear(16, 0); mixed_clear.back() = 0x40;
+        const std::vector<uint8_t> uncompressed(16, 0xff);
+        CHECK(!gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1,
+                                          mixed_clear.data(), mixed_clear.size(), 4, true) &&
+              !gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1,
+                                          uncompressed.data(), uncompressed.size(), 4, true) &&
+              !gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1,
+                                          clear_0001.data(), clear_0001.size(), 2, true),
+              "mixed, uncompressed, and unvalidated component layouts remain unsupported");
         CHECK(tiled_volume_bytes(120, 68, 32, M, 8) == (size_t)1 * 2 * 32 * 65536,
               "120x68x32 @ 8 B uses 1x2 padded 2D blocks per Z slice");
         auto rt_volume = [&](uint32_t bpe) {

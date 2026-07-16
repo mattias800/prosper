@@ -1383,10 +1383,20 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         return true;
     };
     // Pass 1: create each draw's shader modules, descriptors (with texture staging upload), and pipeline.
+    const bool backend_trace = getenv("PROSPER_BACKEND_TRACE") != nullptr;
     for (size_t di = 0; di < draws.size(); di++) {
         const auto setup_begin = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
         const BackendDraw& bd = draws[di];
         DV& v = dv[di];
+        if (backend_trace) {
+            fprintf(stderr,
+                    "[backend-trace] draw=%zu/%zu begin extent=%ux%u vs=%zu fs=%zu "
+                    "vs_id=%016llx fs_id=%016llx resources=%zu\n",
+                    di, draws.size(), W, H, bd.vs.size(), bd.fs.size(),
+                    (unsigned long long)bd.vs_identity,
+                    (unsigned long long)bd.fs_identity, bd.R.size());
+            fflush(stderr);
+        }
         // Pipeline hits do not need temporary VkShaderModules. Defer module creation until after the
         // persistent lookup; the fixed/resource setup below is also required by the hit pipeline.
         const auto setup_shaders_ready = setup_begin;
@@ -1476,7 +1486,19 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             dss.depthTestEnable  = VK_TRUE;
             dss.depthWriteEnable = ps->depth_write_enable ? VK_TRUE : VK_FALSE;
             dss.depthCompareOp   = (VkCompareOp)ps->depth_compare_op;
-            if (getenv("PROSPER_DEPTH_ALWAYS")) dss.depthCompareOp = VK_COMPARE_OP_ALWAYS;   // diag
+            // UE4 repeats its reverse-Z depth prepass in a separately translated base-pass shader.
+            // A one-ULP position difference between those shaders makes exact EQUAL reject the whole
+            // base pass, although the guest hardware accepts the pair. Preserve occlusion by relaxing
+            // only a read-only EQUAL against an already-populated, explicitly reverse-Z surface:
+            // GEQUAL still rejects geometry behind the prepass instead of disabling depth outright.
+            const bool reverse_z_equal_compat = persistent_ds && depth_was_valid &&
+                !ps->depth_write_enable && ps->depth_compare_op == VK_COMPARE_OP_EQUAL &&
+                ps->has_depth_clear && ps->depth_clear_value <= 0.5f;
+            if (reverse_z_equal_compat) {
+                dss.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;
+                if (getenv("PROSPER_DSLOG"))
+                    fprintf(stderr, "[ds] reverse-Z read-only EQUAL -> GEQUAL compatibility\n");
+            }
         }
         if (ps && ps->stencil_enable) {
             // Wire the front/back stencil op-state so masks clip (e.g. the title shimmer tests the
@@ -1866,7 +1888,17 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
         if (create_pipeline) {
             const auto setup_shader_begin = timing_enabled
                 ? TimingClock::now() : TimingClock::time_point{};
+            if (backend_trace) {
+                fprintf(stderr, "[backend-trace] draw=%zu create-shaders begin\n", di);
+                fflush(stderr);
+            }
             v.vs = mkmod(bd.vs); v.fs = mkmod(bd.fs);
+            if (backend_trace) {
+                fprintf(stderr,
+                        "[backend-trace] draw=%zu create-shaders end vs=%p fs=%p\n",
+                        di, (void*)v.vs, (void*)v.fs);
+                fflush(stderr);
+            }
             const auto setup_shader_ready = timing_enabled
                 ? TimingClock::now() : TimingClock::time_point{};
             if (timing_enabled)
@@ -1879,8 +1911,19 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             }
             st[0].module = v.vs; st[1].module = v.fs;
             setup_pipeline_create_begin = setup_shader_ready;
-            if (vkCreateGraphicsPipelines(
-                    dev, VK_NULL_HANDLE, 1, &gp, nullptr, &v.pipe) == VK_SUCCESS) {
+            if (backend_trace) {
+                fprintf(stderr, "[backend-trace] draw=%zu create-pipeline begin\n", di);
+                fflush(stderr);
+            }
+            const VkResult pipeline_result = vkCreateGraphicsPipelines(
+                    dev, VK_NULL_HANDLE, 1, &gp, nullptr, &v.pipe);
+            if (backend_trace) {
+                fprintf(stderr,
+                        "[backend-trace] draw=%zu create-pipeline end result=%d pipeline=%p\n",
+                        di, (int)pipeline_result, (void*)v.pipe);
+                fflush(stderr);
+            }
+            if (pipeline_result == VK_SUCCESS) {
                 v.ok = true;
                 bool retain = pipeline_cache_enabled && pipeline_cache_limit;
                 while (retain && pipeline_cache.size() >= pipeline_cache_limit)
@@ -2134,7 +2177,22 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
     const auto timing_recorded = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
     VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VkFence fence; vkCreateFence(dev, &fci, nullptr, &fence);
-    vkQueueSubmit(queue, 1, &si, fence); vkWaitForFences(dev, 1, &fence, VK_TRUE, 5ull * 1000 * 1000 * 1000);
+    if (backend_trace) {
+        fprintf(stderr, "[backend-trace] queue-submit begin draws=%zu\n", draws.size());
+        fflush(stderr);
+    }
+    const VkResult submit_result = vkQueueSubmit(queue, 1, &si, fence);
+    if (backend_trace) {
+        fprintf(stderr, "[backend-trace] queue-submit end result=%d; fence-wait begin\n",
+                (int)submit_result);
+        fflush(stderr);
+    }
+    const VkResult wait_result = vkWaitForFences(
+        dev, 1, &fence, VK_TRUE, 5ull * 1000 * 1000 * 1000);
+    if (backend_trace) {
+        fprintf(stderr, "[backend-trace] fence-wait end result=%d\n", (int)wait_result);
+        fflush(stderr);
+    }
     const auto timing_gpu_done = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     if (cached_ds) {
         cached_ds->layout_initialized = true;

@@ -1562,6 +1562,8 @@ bool vopc_is_cmpx(uint32_t opcode) {
 
 bool instruction_may_change_exec(const Rdna2Inst& in) {
     if (in.fmt == Rdna2Format::VOPC && vopc_is_cmpx(in.opcode)) return true;
+    // saveexec writes EXEC implicitly while its explicit destination receives the previous mask.
+    if (in.fmt == Rdna2Format::SOP1 && (in.opcode == 0x24 || in.opcode == 0x25)) return true;
     auto is_exec = [](const Operand& operand) {
         return (operand.kind == OperandKind::SGPR || operand.kind == OperandKind::Special) &&
                (operand.value == 126 || operand.value == 127);
@@ -2080,8 +2082,15 @@ void loop_written_regs(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t 
                 for (uint32_t k = 0; k < vgpr_write_count(in); ++k)
                     vregs.insert(in.dst.value + (int)k);
                 break;
-            case Rdna2Format::SOP1: case Rdna2Format::SOP2: case Rdna2Format::SOPK:
+            case Rdna2Format::SOP1: case Rdna2Format::SOPK:
                 sregs.insert(in.dst.value); break;
+            case Rdna2Format::SOP2:
+                // s_lshr_b64 -> EXEC is modeled only in the per-lane mask domain. It does not
+                // produce scalar SGPR data, so carrying a scalar value through a loop/if merge is
+                // both unnecessary and semantically wrong.
+                if (in.opcode != 0x21 || (in.dst.value != 126 && in.dst.value != 127))
+                    sregs.insert(in.dst.value);
+                break;
             case Rdna2Format::SMEM: {                                      // s_load/s_buffer_load: N consecutive SGPRs
                 uint32_t n = 1; switch (in.opcode) { case 0x1: case 0x9: n=2; break; case 0x2: case 0xA: n=4; break;
                     case 0x3: case 0xB: n=8; break; case 0x4: case 0xC: n=16; break; }
@@ -2360,6 +2369,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 else { rs.sreg_bool[in.dst.value] = r; rs.sreg_bool_narrowed[in.dst.value] = true; }
                 return true;
             }
+            // s_lshr_b64 — only the NGG wave-packing form (dst = EXEC) is modeled: it sets EXEC to
+            // the count of active vertices/primitives in the wave. A per-invocation SPIR-V shader has
+            // no wave to pack, so leave EXEC full. Handle this before taking an operator[] reference
+            // to rs.sreg[dst]: inserting a default SSA id 0 leaked into a later OpPhi and produced
+            // invalid SPIR-V (and an NVIDIA Windows driver crash during pipeline creation).
+            if (in.opcode == 0x21) {
+                if (in.dst.value != 126 && in.dst.value != 127) ok = false;
+                return true;
+            }
             uint32_t a = val(in.src[0]), c = val(in.src[1]); uint32_t& d = rs.sreg[in.dst.value];
             auto scc_nz = [&](uint32_t v){ rs.scc = b.ucmp(Op_INotEqual, v, b.uconst(0)); };  // SCC = (result != 0)
             switch (in.opcode) {
@@ -2412,13 +2430,6 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                              d = b.ibin(Op_ShiftRightLogical, a, sh); scc_nz(d); break; }  // dst = src0 >> (src1 & 31)
                 case 0x22: { uint32_t sh = b.ibin(Op_BitwiseAnd, c, b.uconst(31));   // s_ashr_i32
                              d = b.sbin(Op_ShiftRightArithmetic, a, sh); scc_nz(d); break; }  // dst = src0 >>a (src1 & 31)
-                case 0x21:   // s_lshr_b64 — only the NGG wave-packing form (dst = EXEC) is modeled: it sets
-                             // EXEC to the count of active vertices/primitives in the wave. A per-invocation
-                             // SPIR-V shader has no wave to pack (each invocation is one vertex), so leave
-                             // EXEC full — no narrowing. Non-EXEC 64-bit shifts stay unsupported.
-                             // (RE-TAG: NGG exec packing.)
-                    if (in.dst.value != 126 && in.dst.value != 127) ok = false;
-                    break;
                 case 0x26: d = b.ibin(Op_IMul, a, c); break;         // s_mul_i32 (low 32 bits; no SCC)
                 case 0x31: d = b.ibin(Op_IAdd, b.ibin(Op_ShiftLeftLogical, a, b.uconst(4)), c); break;  // s_lshl4_add_u32 = (src0<<4)+src1
                 case 0x35: d = b.umul_hi(a, c); break;               // s_mul_hi_u32 (high 32 bits; no SCC)
@@ -3028,18 +3039,28 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (in.src[1].kind != OperandKind::InlineInt || in.src[1].value < 0 || in.src[1].value > 63) {
                     ok = false; return true;
                 }
+                auto vit = rs.vgpr_lane_slots.find(in.src[0].value);
                 auto mit = rs.vgpr_lane_mask_slots.find(in.src[0].value);
                 if (mit != rs.vgpr_lane_mask_slots.end()) {
                     auto sit = mit->second.find(in.src[1].value);
                     if (sit != mit->second.end()) {
                         rs.sreg_bool[in.dst.value] = sit->second;
                         rs.sreg_bool_narrowed[in.dst.value] = true;
-                        rs.sreg.erase(in.dst.value);
+                        // The compute CFG dispatcher can persist a physical spill lane that is
+                        // recycled between scalar-data and wave-mask lifetimes. It exposes both
+                        // views after a block join; keep both destination domains when present so
+                        // the statically typed consumer selects the representation it needs.
+                        if (vit != rs.vgpr_lane_slots.end()) {
+                            auto data = vit->second.find(in.src[1].value);
+                            if (data != vit->second.end()) rs.sreg[in.dst.value] = data->second;
+                            else rs.sreg.erase(in.dst.value);
+                        } else {
+                            rs.sreg.erase(in.dst.value);
+                        }
                         rs.sreg_srt.erase(in.dst.value);
                         return true;
                     }
                 }
-                auto vit = rs.vgpr_lane_slots.find(in.src[0].value);
                 if (vit == rs.vgpr_lane_slots.end()) { ok = false; return true; }   // not a spill array
                 auto sit = vit->second.find(in.src[1].value);
                 if (sit == vit->second.end()) { ok = false; return true; }          // slot never written
@@ -4274,6 +4295,10 @@ bool binary_reg_immediate(const Rdna2Inst& in, int reg, uint32_t& immediate) {
            (reg_operand(in.src[1], reg) && immediate_operand(in.src[0], in, immediate));
 }
 
+bool ordered_reg_immediate(const Rdna2Inst& in, int reg, uint32_t& immediate) {
+    return reg_operand(in.src[0], reg) && immediate_operand(in.src[1], in, immediate);
+}
+
 bool binary_regs(const Rdna2Inst& in, int a, int b) {
     return (reg_operand(in.src[0], a) && reg_operand(in.src[1], b)) ||
            (reg_operand(in.src[0], b) && reg_operand(in.src[1], a));
@@ -4342,7 +4367,9 @@ PcrelDispatchInfo detect_pcrel_dispatch(const std::vector<Rdna2Inst>& ins,
         const Rdna2Inst* shift = last_scalar_writer(ins, table_load->pc, selector);
         if (!shift || shift->fmt != Rdna2Format::SOP2 || shift->opcode != 0x1e) continue;
         uint32_t shift_amount = 0;
-        if (!binary_reg_immediate(*shift, selector, shift_amount) || shift_amount != 3) continue;
+        // s_lshl_b32 is ordered: selector << 3 scales the qword index, while 3 << selector
+        // is a different program and must not be admitted by the commutative matcher.
+        if (!ordered_reg_immediate(*shift, selector, shift_amount) || shift_amount != 3) continue;
         const Rdna2Inst* clamp = last_scalar_writer(ins, shift->pc, selector);
         if (!clamp || clamp->fmt != Rdna2Format::SOP2 || clamp->opcode != 0x07) continue;
         uint32_t selector_max = 0;
@@ -4627,11 +4654,9 @@ bool emit_compute_cfg_state_machine(
         for (const auto& slot : vg.second) lane_slots.emplace(vg.first, slot.first);
     for (const auto& vg : initial.vgpr_lane_mask_slots)
         for (const auto& slot : vg.second) mask_lane_slots.emplace(vg.first, slot.first);
-    // The dispatcher has separate persisted value domains for scalar data and lane masks. If one
-    // physical spill slot changes domain across paths, rejecting is safer than reloading both and
-    // letting v_readlane choose an arbitrary representation.
-    for (const auto& slot : lane_slots)
-        if (mask_lane_slots.count(slot)) return false;
+    // A physical spill lane may be recycled between scalar-data and wave-mask lifetimes. Persist
+    // both domains across dispatcher blocks; v_readlane retains both destination views when both
+    // are present, and the statically typed consumer selects the representation it needs.
 
     uint32_t ptr_u32 = 0, ptr_bool = 0;
     std::map<int, uint32_t> vv, sv, mv;
@@ -4994,9 +5019,14 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             bool side_effect_free = true;
             for (const auto& candidate : ins) {
                 if (candidate.pc <= branch.pc || candidate.pc >= target) continue;
+                const uint32_t scalar_width = scalar_write_width(candidate);
+                const bool clobbers_guard_mask = scalar_width &&
+                    candidate.dst.value < saveexec.dst.value + 2 &&
+                    saveexec.dst.value < candidate.dst.value + static_cast<int>(scalar_width);
                 if (candidate.fmt == Rdna2Format::EXP || candidate.fmt == Rdna2Format::DS ||
                     candidate.fmt == Rdna2Format::MUBUF || candidate.fmt == Rdna2Format::MTBUF ||
                     candidate.fmt == Rdna2Format::MIMG || candidate.fmt == Rdna2Format::FLAT ||
+                    instruction_may_change_exec(candidate) || clobbers_guard_mask ||
                     (candidate.fmt == Rdna2Format::SOPP && candidate.opcode == 0x0a)) {
                     side_effect_free = false;
                     break;

@@ -474,27 +474,36 @@ Native validation reads all 10,743,608 bytes, no longer prints `unable to initia
 the formerly-null global at `Il2cpp+0x268c878` initialized. That exposed the distinct #678 stop-the-world
 blocker described below.
 
-### GC target-thread exception delivery — SOLVED (#678)
+### GC target-thread exception delivery — SOLVED, cooperative on Windows (#678, #690)
 
 IL2CPP installs exception type `0x1e`, then raises it on each target thread to stop the world for GC.
-Windows had returned success without delivery, leaving the raiser blocked on `SuspendSemaphore` forever.
-The native path now suspends the requested winpthreads thread, captures its Windows `CONTEXT`, redirects
-it through a small aligned thunk, synthesizes the FreeBSD mcontext layout expected by the guest handler,
-runs that handler on the requested thread, and resumes the exact interrupted context with
-`RtlRestoreContext`.
+The first Windows implementation returned success without delivery. The next implementation used
+`SuspendThread`/`SetThreadContext`, but a target commonly stopped inside a native wait. Restoring the
+pre-wake Windows `CONTEXT` after the guest handler then resumed stale `ntdll` state, causing unrelated
+worker crashes and intermittent Blasphemous 2 stalls.
 
-A redirected context is not dispatched until a blocked `WaitOnAddress` returns. The futex layer therefore
-tracks each Windows waiter's guest address and wakes that exact address after the target's suspend count is
-dropped. The injection leaves the guest SysV red zone intact. `PROSPER_EXCLOG=1` records the target-thread
-handler enter/exit cycles without enabling the much noisier synchronization trace.
+Production Windows delivery is now cooperative. A raise publishes one pending stop for the requested
+winpthreads target and wakes its registered wait. The target accepts the stop at an HLE/wait safe point,
+captures a fresh context there, and calls the guest handler on a dedicated 256 KiB alternate stack. The
+handler returns normally to the wrapper, so no stale native syscall context is restored. Generated import
+stubs also check after every HLE return. `PROSPER_WIN_LEGACY_EXC=1` retains forced context injection only
+for compatibility testing.
+
+The Windows wait registry is nesting-safe. This is required because the guest GC handler itself waits on
+semaphores: its inner wait must not overwrite and unregister the interrupted outer wait. Each nesting level
+owns a separately published slot keyed by native Windows thread id, and condition interruption advances a
+sequence word before `WakeByAddressAll`, making the wake persistent if it lands immediately before
+`WaitOnAddress`. Mutex contention uses a try-lock/checkpoint loop because winpthreads timed locks were
+observed remaining in `WaitForSingleObject` after their deadline.
 
 The first live delivery exposed two more Windows success-no-ops: `sceKernelIsStack` always returned false,
 and `scePthreadAttrGet` never copied the registered worker-stack bounds. The latter made BDWGC abort with
 `Bad stack base in GC_register_my_thread`. Both now use the existing cross-platform stack registry.
-`win_exception_delivery` tests real delivery while the worker is blocked in the HLE WaitOnAddress path;
-`win_kernel_is_stack` covers both the direct query and IL2CPP's AttrGet/Getstackaddr/Getstacksize sequence.
-The live Messenger acceptance run completed many GC cycles and reached SubmitDcb #28 with repeated
-1920x1080 presentations.
+`win_exception_delivery` covers the legacy path, cooperative condition/mutex delivery, queue-before-wait,
+alternate-stack use, AVX/nonvolatile-register preservation, and the nested-wait registration regression.
+`win_kernel_is_stack` covers both direct and winpthreads-handle stack queries. On 2026-07-16 the focused
+suite passed 30 consecutive runs and Blasphemous 2 completed 12/12 ordinary 360-presented-frame Windows
+boots with no stalls or early exits (the separate tiled-compute limitation still blocks its main menu).
 
 (Historical, pre-fix diagnosis retained below for context.)
 

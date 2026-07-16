@@ -54,40 +54,31 @@ int main() {
     if (fd >= 0 && close_fn) close_fn((uint64_t)fd, 0, 0, 0, 0, 0);
 
 #ifdef _WIN32
-    // Windows validates the entire destination range passed to ReadFile before it discovers EOF.
-    // Guest libc legitimately asks _read for a large stdio refill even when only a short file remains;
-    // if that oversized range crosses the guest allocation's guard page, raw _read fails with EINVAL
-    // instead of returning the bytes before EOF. Evergate's 371-byte boot.config exercises this path.
-    SYSTEM_INFO si{};
-    GetSystemInfo(&si);
-    const size_t page = si.dwPageSize;
-    auto* guarded = static_cast<uint8_t*>(VirtualAlloc(
-        nullptr, page * 2, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-    CHECK(guarded != nullptr, "allocate guarded short-read destination");
-    if (guarded) {
-        DWORD old_protect = 0;
-        CHECK(VirtualProtect(guarded + page, page, PAGE_NOACCESS, &old_protect) != 0,
-              "protect page immediately after short-read destination");
-        uint8_t* tail = guarded + page - expected.size();
-        std::memset(tail, 0, expected.size());
-        fd = open_fn ? (int64_t)open_fn((uint64_t)(uintptr_t)path, 0, 0, 0, 0, 0) : -1;
-        CHECK(fd >= 0, "reopen short fixture through guest fd HLE");
-        n = fd >= 0 && read_fn
-            ? (int64_t)read_fn((uint64_t)fd, (uint64_t)(uintptr_t)tail, page, 0, 0, 0)
-            : -1;
-        CHECK(n == (int64_t)expected.size(),
-              "oversized read returns short file before guarded page");
-        CHECK(n == (int64_t)expected.size() &&
-                  std::memcmp(tail, expected.data(), expected.size()) == 0,
-              "guarded short read preserves every available byte");
-        if (fd >= 0 && close_fn) close_fn((uint64_t)fd, 0, 0, 0, 0, 0);
-        VirtualFree(guarded, 0, MEM_RELEASE);
-    }
+    // Unity asks for a whole 64 KiB cache block even when boot.config is only a few hundred bytes.
+    // Guest allocators may leave later pages reserved until first touch. Windows _read validates the
+    // entire requested destination range before discovering EOF, so a direct host read fails EINVAL;
+    // PS5/Linux instead copy the available prefix and return its short byte count.
+    void* sparse = VirtualAlloc(nullptr, 0x10000, MEM_RESERVE, PAGE_NOACCESS);
+    CHECK(sparse != nullptr, "reserve sparse guest-style read buffer");
+    void* committed = sparse ? VirtualAlloc(sparse, 0x4000, MEM_COMMIT, PAGE_READWRITE) : nullptr;
+    CHECK(committed == sparse, "commit only the first guest page");
+    int64_t sparse_fd = open_fn
+        ? (int64_t)open_fn((uint64_t)(uintptr_t)path, 0, 0, 0, 0, 0)
+        : -1;
+    CHECK(sparse_fd >= 0, "reopen fixture for sparse-buffer short read");
+    int64_t sparse_n = sparse_fd >= 0 && read_fn && sparse
+        ? (int64_t)read_fn((uint64_t)sparse_fd, (uint64_t)(uintptr_t)sparse, 0x10000, 0, 0, 0)
+        : -1;
+    CHECK(sparse_n == (int64_t)expected.size(),
+          "short read does not probe reserved destination pages past EOF");
+    CHECK(sparse_n == (int64_t)expected.size() &&
+              std::memcmp(sparse, expected.data(), expected.size()) == 0,
+          "short read preserves the available file prefix");
+    if (sparse_fd >= 0 && close_fn) close_fn((uint64_t)sparse_fd, 0, 0, 0, 0, 0);
+    if (sparse) VirtualFree(sparse, 0, MEM_RELEASE);
 
-    // Guest virtual/direct memory is frequently reserved and committed on first touch. A host CRT
-    // _read writes from kernel context and cannot take prosper's VEH lazy-commit fault, so the file
-    // HLE must materialize tracked pages first. Evergate's 2.3 MiB Master.bank read spans many such
-    // untouched pages and otherwise fails with EINVAL/EFAULT at 12% loading.
+    // Tracked guest virtual/direct memory is also committed on first touch. The bounce-buffer copy
+    // must take the emulator's lazy-commit path before publishing data into such a destination.
     register_kernel_mem_hle();
     HleFn reserve_fn = Hle::lookup(nid_hash("sceKernelReserveVirtualRange"));
     HleFn unmap_fn = Hle::lookup(nid_hash("sceKernelMunmap"));

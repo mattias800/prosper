@@ -1,6 +1,7 @@
 #include "live_compute.hpp"
 
 #include "gpu/bc_decode.hpp"
+#include "gpu/gpu_capture.hpp"
 #include "gpu/gpu_execute.hpp"
 #include "gpu/shader_resources.hpp"
 #include "gpu/tile.hpp"
@@ -276,6 +277,8 @@ struct BoundImage {
     VkDeviceSize row_pitch = 0;         // LINEAR-tiling row pitch (bytes), from vkGetImageSubresourceLayout
     size_t guest_bytes = 0;             // real linear/tiled guest backing footprint
     size_t alias_of = SIZE_MAX;         // identical storage binding sharing an earlier image/view
+    uint8_t* dcc_metadata = nullptr;    // DCC control bytes to mark uncompressed after writeback
+    size_t dcc_metadata_bytes = 0;
     uint64_t before_hash = 0, after_hash = 0; // trace-only storage-image writeback evidence
     uint64_t nonzero_channels = 0;
 };
@@ -548,6 +551,28 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 !tile_mode_supports_volume(r->tile_mode)) {
                 skip_image(r, "3D tile mode has no volume address pattern"); break;
             }
+            // The backend writes an ordinary tiled base allocation, not hardware-compressed blocks.
+            // A compressed U# therefore also needs writable DCC metadata so successful writeback can
+            // publish the hardware's 0xff (uncompressed) state before a later sampled descriptor sees it.
+            if (bi.storage && r->compression_enabled) {
+                const uint64_t metadata_bytes = gpu_capture_dcc_metadata_footprint(*r);
+                if (!r->metadata_addr || !metadata_bytes || metadata_bytes > SIZE_MAX ||
+                    metadata_bytes > UINT32_MAX) {
+                    skip_image(r, "DCC metadata extent is unsupported"); break;
+                }
+                bi.dcc_metadata_bytes = static_cast<size_t>(metadata_bytes);
+                if (r->dcc_metadata_host_data) {
+                    if (r->dcc_metadata_host_data_size < metadata_bytes) {
+                        skip_image(r, "replay DCC metadata backing is truncated"); break;
+                    }
+                    bi.dcc_metadata = r->dcc_metadata_host_data;
+                } else {
+                    if (!guest_readable(r->metadata_addr, static_cast<uint32_t>(metadata_bytes))) {
+                        skip_image(r, "live DCC metadata backing is unreadable"); break;
+                    }
+                    bi.dcc_metadata = reinterpret_cast<uint8_t*>(uintptr_t(r->metadata_addr));
+                }
+            }
             // A renderer-owned target's current pixels are not in raw guest memory. Import its
             // immutable CPU snapshot for sampled bindings; storage bindings and GPU-only targets
             // stay unsupported rather than silently reading or overwriting stale guest bytes.
@@ -590,6 +615,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     const BoundImage& owner = images[bi.alias_of];
                     bi.image = owner.image; bi.memory = owner.memory; bi.view = owner.view;
                     bi.guest_bytes = owner.guest_bytes;
+                    bi.dcc_metadata = owner.dcc_metadata;
+                    bi.dcc_metadata_bytes = owner.dcc_metadata_bytes;
                     staging_bytes[i] = staging_bytes[bi.alias_of];
                     if (trace)
                         std::fprintf(stderr, "[compute]   image-alias binding=%u -> binding=%u addr=0x%llx\n",
@@ -1107,6 +1134,20 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                                    r->gpu_addr, bi.guest_bytes,
                                    item.submit_no, item.dispatch_index,
                                    item.command_order, item.code_addr);
+            if (bi.dcc_metadata && bi.dcc_metadata_bytes) {
+                std::memset(bi.dcc_metadata, 0xff, bi.dcc_metadata_bytes);
+                notify_guest_gpu_write(r->metadata_addr, bi.dcc_metadata_bytes);
+                if (!r->dcc_metadata_host_data && writer_provenance_enabled())
+                    record_guest_write(GuestWriterKind::ComputeBuffer,
+                                       r->metadata_addr, bi.dcc_metadata_bytes,
+                                       item.submit_no, item.dispatch_index,
+                                       item.command_order, item.code_addr);
+                if (trace)
+                    std::fprintf(stderr,
+                                 "[compute]   DCC uncompressed binding=%u meta=0x%llx bytes=%zu code=0xff\n",
+                                 bi.binding, (unsigned long long)r->metadata_addr,
+                                 bi.dcc_metadata_bytes);
+            }
             vkUnmapMemory(ctx.device, staging_memory[i]);
         }
         if (!readback_ok) break;

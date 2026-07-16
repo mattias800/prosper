@@ -316,6 +316,14 @@ uint64_t dcc_metadata_footprint(const ShaderResource& r) {
                                     bytes_per_texel, r.meta_pipe_aligned);
 }
 
+// Bundle manifests retain blob indices and offsets while their content lives in the bundle's
+// deduplicated resource dictionary. make_capture_manifest marks those deliberately empty entries
+// with the canonical empty-content hash; ordinary empty/default blobs do not bypass bounds checks.
+bool capture_blob_payload_omitted(const GpuCaptureBlob& blob) {
+    return blob.bytes.empty() && !blob.bytes_read &&
+           blob.content_hash == gpu_capture_hash(nullptr, 0);
+}
+
 struct Interval {
     uint64_t begin = 0;
     uint64_t end = 0;
@@ -1099,9 +1107,11 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
                 if (captured.metadata_blob_index >= c.blobs.size()) {
                     error = "resource DCC metadata references an invalid capture blob"; return false;
                 }
-                const auto& blob = c.blobs[captured.metadata_blob_index].bytes;
-                if (captured.metadata_blob_offset > blob.size() ||
-                    expected > blob.size() - captured.metadata_blob_offset) {
+                const auto& capture_blob = c.blobs[captured.metadata_blob_index];
+                const auto& blob = capture_blob.bytes;
+                if (!capture_blob_payload_omitted(capture_blob) &&
+                    (captured.metadata_blob_offset > blob.size() ||
+                     expected > blob.size() - captured.metadata_blob_offset)) {
                     error = "resource DCC metadata exceeds its capture blob"; return false;
                 }
             }
@@ -1471,9 +1481,11 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                     if (captured.metadata_blob_index >= c.blobs.size()) {
                         error = "resource DCC metadata references an invalid capture blob"; return false;
                     }
-                    const auto& blob = c.blobs[captured.metadata_blob_index].bytes;
-                    if (captured.metadata_blob_offset > blob.size() ||
-                        captured.metadata_size > blob.size() - captured.metadata_blob_offset) {
+                    const auto& capture_blob = c.blobs[captured.metadata_blob_index];
+                    const auto& blob = capture_blob.bytes;
+                    if (!capture_blob_payload_omitted(capture_blob) &&
+                        (captured.metadata_blob_offset > blob.size() ||
+                         captured.metadata_size > blob.size() - captured.metadata_blob_offset)) {
                         error = "resource DCC metadata exceeds its capture blob"; return false;
                     }
                 }

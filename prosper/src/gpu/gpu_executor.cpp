@@ -1733,21 +1733,11 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                                 d.format, d.tile_mode);
                     if (d.base == 0 || d.width == 0 || d.height == 0 ||
                         d.width > 16384 || d.height > 16384) continue;       // garbage/degenerate T#
-                    // A previous use already produced a resource for this SAME surface (same T# base +
+                    // A previous use already produced a resource for this SAME selected view (address +
                     // extent): don't duplicate the binding/upload — give it this use's pc provenance
                     // if it has none yet (#273). If it already carries a DIFFERENT use's pc, fall
                     // through and create a second resource for this pc (fetch_pc holds one pc; a
                     // sample whose pc has no mapping would stay unresolved).
-                    {
-                        bool mapped = false;
-                        for (auto& r0 : t.resources)
-                            if (r0.cls == ResourceClass::Texture && r0.gpu_addr == d.base &&
-                                r0.width == d.width && r0.height == d.height && r0.depth == d.depth) {
-                                if (r0.fetch_pc == 0xFFFFFFFFu) { r0.fetch_pc = u.use_pc; mapped = true; break; }
-                                if (r0.fetch_pc == u.use_pc)    { mapped = true; break; }
-                            }
-                        if (mapped) continue;
-                    }
                     Gen5ImageFormatInfo fi;
                     if (!gen5_image_format(d.format, &fi)) {
                         // Same policy as build_shader_resources: the normal per-target renderer can
@@ -1761,6 +1751,18 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     const bool is_bcn = fi.block_width > 1;
                     if (is_bcn && fi.snorm) continue;   // signed BCn (SNORM / BC6H SF16): decode not wired
                     const DecodedImageView view = image_base_level_view(d, fi);
+                    const uint32_t img_dim = image_type_to_dim(d.type);
+                    {
+                        bool mapped = false;
+                        for (auto& r0 : t.resources)
+                            if (r0.cls == ResourceClass::Texture && r0.gpu_addr == view.base &&
+                                r0.width == view.width && r0.height == view.height &&
+                                r0.depth == d.depth && r0.format == fi.format && r0.img_dim == img_dim) {
+                                if (r0.fetch_pc == 0xFFFFFFFFu) { r0.fetch_pc = u.use_pc; mapped = true; break; }
+                                if (r0.fetch_pc == u.use_pc)    { mapped = true; break; }
+                            }
+                        if (mapped) continue;
+                    }
                     ShaderResource r;
                     r.cls = ResourceClass::Texture;
                     r.format = fi.format; r.num_components = fi.num_components;
@@ -1768,20 +1770,21 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     r.tile_mode = d.tile_mode; r.srgb = fi.srgb;
                     r.max_uncompressed_block_size = d.max_uncompressed_block_size;
                     r.max_compressed_block_size = d.max_compressed_block_size;
-                    r.meta_pipe_aligned = d.meta_pipe_aligned;
-                    r.write_compress_enabled = d.write_compress_enabled;
-                    r.compression_enabled = d.compression_enabled;
+                    const bool shifted_view = view.mip_offset != 0;
+                    r.meta_pipe_aligned = shifted_view ? false : d.meta_pipe_aligned;
+                    r.write_compress_enabled = shifted_view ? false : d.write_compress_enabled;
+                    r.compression_enabled = shifted_view ? false : d.compression_enabled;
                     r.alpha_is_on_msb = d.alpha_is_on_msb;
                     r.color_transform = d.color_transform;
-                    r.metadata_addr = d.metadata_addr;
+                    r.metadata_addr = shifted_view ? 0 : d.metadata_addr;
                     // T# TYPE -> MIMG dim (GFX10: 9=2D, 10=3D, 11=CUBE, 13=2D_ARRAY); a cube
                     // uploads as six vertically-stacked faces (#273 — see agc_shader_layout).
-                    r.img_dim = image_type_to_dim(d.type);
+                    r.img_dim = img_dim;
                     r.swizzle[0] = d.dst_sel[0]; r.swizzle[1] = d.dst_sel[1];
                     r.swizzle[2] = d.dst_sel[2]; r.swizzle[3] = d.dst_sel[3];
                     const uint64_t backing_bytes = is_bcn
-                        ? static_cast<uint64_t>((d.width + 3) / 4) * ((d.height + 3) / 4) * d.depth * fi.bytes_per_block
-                        : static_cast<uint64_t>(d.width) * d.height * d.depth * fi.bytes_per_block;
+                        ? static_cast<uint64_t>((view.width + 3) / 4) * ((view.height + 3) / 4) * d.depth * fi.bytes_per_block
+                        : static_cast<uint64_t>(view.width) * view.height * d.depth * fi.bytes_per_block;
                     if (!backing_bytes || backing_bytes > UINT32_MAX) continue;
                     r.size = static_cast<uint32_t>(backing_bytes);
                     r.srt_offset = clash ? 0xFFFFFFFFu : u.key;   // ambiguous/absent key: pc-only provenance
@@ -2051,19 +2054,6 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     DecodedImageDescriptor d = decode_image_descriptor(u.t8.data());
                     if (d.base == 0 || d.width == 0 || d.height == 0 ||
                         d.width > 16384 || d.height > 16384) continue;   // garbage/degenerate T#
-                    {
-                        bool mapped = false;
-                        const ResourceClass wanted = u.is_store ? ResourceClass::StorageImage
-                                                               : ResourceClass::Texture;
-                        for (auto& r0 : table->resources)
-                            if (r0.cls == wanted &&
-                                r0.gpu_addr == d.base && r0.width == d.width && r0.height == d.height &&
-                                r0.depth == d.depth) {
-                                if (r0.fetch_pc == 0xFFFFFFFFu) { r0.fetch_pc = u.use_pc; mapped = true; break; }
-                                if (r0.fetch_pc == u.use_pc)    { mapped = true; break; }
-                            }
-                        if (mapped) continue;
-                    }
                     Gen5ImageFormatInfo fi;
                     const bool mapped_fmt = gen5_image_format(d.format, &fi);
                     // Unknown sampled formats cannot be decoded. Unknown storage formats may still
@@ -2074,14 +2064,30 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     const DecodedImageView view = mapped_fmt
                         ? image_base_level_view(d, fi)
                         : DecodedImageView{d.base, d.width, d.height, 0};
+                    const ResourceClass wanted = u.is_store ? ResourceClass::StorageImage
+                                                           : ResourceClass::Texture;
+                    const DataFormat view_format = mapped_fmt ? fi.format : DataFormat::Unknown;
+                    const uint32_t img_dim = image_type_to_dim(d.type);
+                    {
+                        bool mapped = false;
+                        for (auto& r0 : table->resources)
+                            if (r0.cls == wanted && r0.gpu_addr == view.base &&
+                                r0.width == view.width && r0.height == view.height &&
+                                r0.depth == d.depth && r0.format == view_format &&
+                                r0.img_dim == img_dim) {
+                                if (r0.fetch_pc == 0xFFFFFFFFu) { r0.fetch_pc = u.use_pc; mapped = true; break; }
+                                if (r0.fetch_pc == u.use_pc)    { mapped = true; break; }
+                            }
+                        if (mapped) continue;
+                    }
                     ShaderResource r;
-                    r.cls = u.is_store ? ResourceClass::StorageImage : ResourceClass::Texture;
+                    r.cls = wanted;
                     if (mapped_fmt) {
                         r.format = fi.format; r.num_components = fi.num_components;
                         const bool is_bcn = fi.block_width > 1;
                         const uint64_t bytes = is_bcn
-                            ? static_cast<uint64_t>((d.width + 3) / 4) * ((d.height + 3) / 4) * d.depth * fi.bytes_per_block
-                            : static_cast<uint64_t>(d.width) * d.height * d.depth * fi.bytes_per_block;
+                            ? static_cast<uint64_t>((view.width + 3) / 4) * ((view.height + 3) / 4) * d.depth * fi.bytes_per_block
+                            : static_cast<uint64_t>(view.width) * view.height * d.depth * fi.bytes_per_block;
                         if (!bytes || bytes > UINT32_MAX) continue;
                         r.size = static_cast<uint32_t>(bytes);
                         r.srgb = fi.srgb;
@@ -2095,13 +2101,14 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     r.tile_mode = d.tile_mode;
                     r.max_uncompressed_block_size = d.max_uncompressed_block_size;
                     r.max_compressed_block_size = d.max_compressed_block_size;
-                    r.meta_pipe_aligned = d.meta_pipe_aligned;
-                    r.write_compress_enabled = d.write_compress_enabled;
-                    r.compression_enabled = d.compression_enabled;
+                    const bool shifted_view = view.mip_offset != 0;
+                    r.meta_pipe_aligned = shifted_view ? false : d.meta_pipe_aligned;
+                    r.write_compress_enabled = shifted_view ? false : d.write_compress_enabled;
+                    r.compression_enabled = shifted_view ? false : d.compression_enabled;
                     r.alpha_is_on_msb = d.alpha_is_on_msb;
                     r.color_transform = d.color_transform;
-                    r.metadata_addr = d.metadata_addr;
-                    r.img_dim = image_type_to_dim(d.type);
+                    r.metadata_addr = shifted_view ? 0 : d.metadata_addr;
+                    r.img_dim = img_dim;
                     r.swizzle[0] = d.dst_sel[0]; r.swizzle[1] = d.dst_sel[1];
                     r.swizzle[2] = d.dst_sel[2]; r.swizzle[3] = d.dst_sel[3];
                     r.srt_offset = clash ? 0xFFFFFFFFu : u.key;

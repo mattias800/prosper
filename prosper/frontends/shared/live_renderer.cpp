@@ -121,6 +121,8 @@ struct TextureDecodeKey {
     uint32_t max_uncompressed_block_size = 0, max_compressed_block_size = 0;
     uint32_t dcc_flags = 0;
     uint64_t metadata_addr = 0;
+    uint64_t metadata_host_data = 0;
+    uint64_t metadata_host_data_size = 0;
     bool operator==(const TextureDecodeKey&) const = default;
 };
 
@@ -137,6 +139,7 @@ struct TextureDecodeKeyHash {
         mix(key.cls); mix(key.format); mix(key.num_components); mix(key.width); mix(key.height); mix(key.depth);
         mix(key.tile_mode); mix(key.img_dim); mix(key.max_uncompressed_block_size);
         mix(key.max_compressed_block_size); mix(key.dcc_flags); mix(key.metadata_addr);
+        mix(key.metadata_host_data); mix(key.metadata_host_data_size);
         return hash;
     }
 };
@@ -569,6 +572,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         std::memcpy(dst, r.host_data + off, take);
                         return take;
                     };
+                    auto copy_dcc_metadata = [&](uint8_t* dst, size_t n) -> size_t {
+                        if (!r.dcc_metadata_host_data)
+                            return safe_copy(dst, r.metadata_addr, n);
+                        const size_t take = static_cast<size_t>(std::min<uint64_t>(
+                            n, r.dcc_metadata_host_data_size));
+                        std::memcpy(dst, r.dcc_metadata_host_data, take);
+                        return take;
+                    };
                     if (r.cls == RC::Texture || r.cls == RC::StorageImage) {
                         uint32_t tw = r.width ? r.width : 4, th = r.height ? r.height : 4;
                         const TextureDecodeKey decode_key{
@@ -585,6 +596,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                    (r.color_transform ? 16u : 0u))
                                 : 0u,
                             r.compression_enabled ? r.metadata_addr : 0u,
+                            r.compression_enabled
+                                ? static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+                                      r.dcc_metadata_host_data))
+                                : 0u,
+                            r.compression_enabled ? r.dcc_metadata_host_data_size : 0u,
                         };
                         auto live_rtt = rtt_on ? g_rtt.find(r.gpu_addr) : g_rtt.end();
                         const bool has_cpu_live_rtt = r.img_dim == 1u && live_rtt != g_rtt.end() &&
@@ -597,16 +613,6 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             prosper::test::find_persistent_color_target(
                                 r.gpu_addr, tw, th, live_rtt->second.format) != nullptr;
                         const bool has_live_rtt = has_cpu_live_rtt || has_gpu_live_rtt;
-                        if (r.compression_enabled && !has_live_rtt) {
-                            static std::set<std::pair<uint64_t, uint64_t>> warned_dcc_images;
-                            if (warned_dcc_images.emplace(r.gpu_addr, r.metadata_addr).second)
-                                fprintf(stderr,
-                                        "[render] DCC-compressed sampled image addr=0x%llx meta=0x%llx "
-                                        "%ux%ux%u fmt=%u tile=%u is unsupported; base bytes are not a valid decode\n",
-                                        (unsigned long long)r.gpu_addr,
-                                        (unsigned long long)r.metadata_addr,
-                                        tw, th, r.depth, (unsigned)r.format, r.tile_mode);
-                        }
                         const bool is_cube = r.img_dim == 3u;   // CUBE: six faces stacked vertically (#273)
                         const bool is_volume = r.img_dim == 2u;
                         const uint32_t persistent_pitch = getenv("PROSPER_PITCH")
@@ -625,6 +631,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             (!getenv("PROSPER_DETILE") || atoi(getenv("PROSPER_DETILE")) == 0);
                         const bool persistent_cache_eligible =
                             !getenv("PROSPER_NO_TEXTURE_DECODE_CACHE") &&
+                            !r.compression_enabled &&
                             persistent_decode_limit &&
                             (persistent_source_is_tiled || persistent_source_matches_pixels);
                         const size_t persistent_source_size = persistent_source_matches_pixels
@@ -899,8 +906,56 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // detile + decode; anything else reads 4 B/texel with the surface detiler.
                         // CONFIDENCE: MED on the face stride (padded tiled footprint) — visually
                         // validated; a wrong stride garbles faces 1..5, it cannot crash (safe_copy).
-                        bool cube_done = false;
-                        if (is_cube && !rtt_hit) {
+                        // GFX8-GFX10 embeds four self-contained 0/1 fast clears in DCC metadata. A
+                        // uniform metadata surface means every compression block has that value, so it
+                        // can be materialized without interpreting compressed base bytes. Uniform 0xff
+                        // means an emulated writer published ordinary uncompressed base texels and the
+                        // normal format/detile path below is authoritative.
+                        bool dcc_fast_clear_done = false;
+                        bool dcc_uncompressed = false;
+                        if (r.compression_enabled && !rtt_hit) {
+                            const uint64_t metadata_bytes =
+                                prosper::gpu::gpu_capture_dcc_metadata_footprint(r);
+                            std::vector<uint8_t> metadata(static_cast<size_t>(metadata_bytes), 0);
+                            const size_t metadata_got = metadata_bytes
+                                ? copy_dcc_metadata(metadata.data(), metadata.size()) : 0;
+                            uint8_t clear_code = 0;
+                            dcc_uncompressed = metadata_got == metadata.size() &&
+                                !metadata.empty() &&
+                                std::all_of(metadata.begin(), metadata.end(),
+                                            [](uint8_t code) { return code == 0xff; });
+                            if (!dcc_uncompressed && metadata_got == metadata.size() &&
+                                prosper::gpu::gfx10_dcc_fast_clear_rgba8(
+                                    texture_pixels.data(), texture_pixels.size() / 4,
+                                    metadata.data(), metadata.size(), r.num_components,
+                                    r.alpha_is_on_msb, &clear_code)) {
+                                dcc_fast_clear_done = true;
+                                static std::set<std::pair<uint64_t, uint64_t>> decoded_dcc_images;
+                                if (decoded_dcc_images.emplace(r.gpu_addr, r.metadata_addr).second)
+                                    fprintf(stderr,
+                                            "[render] DCC fast-clear addr=0x%llx meta=0x%llx "
+                                            "%ux%ux%u fmt=%u code=0x%02x bytes=%zu\n",
+                                            (unsigned long long)r.gpu_addr,
+                                            (unsigned long long)r.metadata_addr,
+                                            tw, th, r.depth, (unsigned)r.format, clear_code,
+                                            metadata.size());
+                            } else if (!dcc_uncompressed) {
+                                static std::set<std::pair<uint64_t, uint64_t>> warned_dcc_images;
+                                if (warned_dcc_images.emplace(r.gpu_addr, r.metadata_addr).second)
+                                    fprintf(stderr,
+                                            "[render] DCC-compressed sampled image addr=0x%llx "
+                                            "meta=0x%llx %ux%ux%u fmt=%u tile=%u is unsupported; "
+                                            "metadata=%zu/%llu first=0x%02x\n",
+                                            (unsigned long long)r.gpu_addr,
+                                            (unsigned long long)r.metadata_addr,
+                                            tw, th, r.depth, (unsigned)r.format, r.tile_mode,
+                                            metadata_got,
+                                            (unsigned long long)metadata_bytes,
+                                            metadata_got ? metadata[0] : 0u);
+                            }
+                        }
+                        bool cube_done = dcc_fast_clear_done && is_cube;
+                        if (is_cube && !rtt_hit && !dcc_fast_clear_done) {
                             const uint32_t cb = prosper::gpu::bc_block_bytes(r.format);
                             const bool ctiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode) && !getenv("PROSPER_NODETILE");
                             for (uint32_t fface = 0; fface < 6; fface++) {
@@ -937,8 +992,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // Block-compressed (BC1/2/3): read the (possibly tiled) compressed blocks, block-
                         // detile, and decode to RGBA8 in-place. The blocks are the tiled element (BC3 =
                         // 16 bytes -> SW_4KB_S 16x16-block micro-tiles). #121.
-                        const uint32_t bcb = (rtt_hit || cube_done) ? 0u : prosper::gpu::bc_block_bytes(r.format);
-                        if (rtt_hit || cube_done) { /* pixels already injected/stacked above */ }
+                        const uint32_t bcb = (rtt_hit || cube_done || dcc_fast_clear_done)
+                            ? 0u : prosper::gpu::bc_block_bytes(r.format);
+                        if (rtt_hit || cube_done || dcc_fast_clear_done) { /* pixels already materialized */ }
                         else if (bcb) {
                             uint32_t bw = (tw + 3) / 4, bh = (th + 3) / 4;
                             // Block-detile: tiled_elements_bytes/detile_elements now derive the 4KB
@@ -1060,7 +1116,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         bool auto_tiled = prosper::gpu::tile_mode_is_tiled(r.tile_mode);
                         const char* dt = getenv("PROSPER_DETILE");
                         // BC textures already block-detiled + decoded above; the 32-bpp detiler must not touch them.
-                        if (!rtt_hit && !cube_done && !bcb && !narrow_done && !f16_done &&
+                        if (!rtt_hit && !cube_done && !dcc_fast_clear_done && !bcb && !narrow_done && !f16_done &&
                             !getenv("PROSPER_NODETILE") &&
                             (auto_tiled || (!is_volume && dt && atoi(dt) != 0))) {
                             const uint32_t tmode = auto_tiled ? r.tile_mode : (uint32_t)prosper::gpu::TileMode::Sw4KbS;
@@ -1099,7 +1155,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // scene-color RT format. The texel IS 4 bytes, so the generic read + auto-detile
                         // above already produced linear packed words; unpack each to RGBA8 in place with
                         // the same semantics as the fp16 path (NaN/neg -> 0, clamp [0,1], no alpha -> 255).
-                        if (!rtt_hit && r.format == prosper::gpu::DataFormat::Float10_11_11) {
+                        if (!rtt_hit && !dcc_fast_clear_done &&
+                            r.format == prosper::gpu::DataFormat::Float10_11_11) {
                             uint8_t* tp = texture_pixels.data();
                             for (size_t t = 0; t < volume_texels; t++) {
                                 uint32_t v; std::memcpy(&v, tp + t * 4, 4);
@@ -1115,7 +1172,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // Packed R10G10B10A2 UNORM (GFX10 IMG_FMT 50 / "2_10_10_10_UNORM"):
                         // the generic 4-B read and detile above preserve packed texels; normalize each
                         // field to the RGBA8 image format used by this renderer before sampling.
-                        if (!rtt_hit && r.format == prosper::gpu::DataFormat::Unorm2_10_10_10) {
+                        if (!rtt_hit && !dcc_fast_clear_done &&
+                            r.format == prosper::gpu::DataFormat::Unorm2_10_10_10) {
                             uint8_t* tp = texture_pixels.data();
                             for (size_t t = 0; t < volume_texels; t++) {
                                 uint32_t v; std::memcpy(&v, tp + t * 4, 4);

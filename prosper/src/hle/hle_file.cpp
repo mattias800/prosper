@@ -57,9 +57,9 @@ namespace {
     std::map<int, std::string> g_filelog_fd_paths;
 
 #ifdef _WIN32
-    // Host kernel/CRT reads write into guest memory without passing through the process VEH, so a
-    // sparse direct-memory page or tracked reserved page must be materialized before _read copies
-    // into it. Guest stores normally fault these pages in lazily; kernel copyout does not.
+    // Host I/O stages through committed memory so it can discover the real short-read byte count.
+    // Its subsequent host memcpy still bypasses the guest VEH, so materialize sparse direct-memory
+    // or tracked reserved pages before publishing those bytes into the guest destination.
     bool windows_prepare_guest_write(uint64_t dst, uint64_t bytes) {
         if (!bytes) return true;
         if (!dst || dst + bytes < dst) return false;
@@ -522,27 +522,25 @@ HLE(f_read)  { int fd = (int)a0; int64_t off = -1;
 #else
                // Full sequential read (loop) — same full-count contract as read_full: a short ::read
                // would leave Unity's asset cache block partially filled and deserialize corrupt data.
+               // Windows validates the entire destination range before _read discovers a short EOF.
+               // Guest allocators can leave later pages reserved for lazy commit, so Unity's normal
+               // 64 KiB read from a small boot.config otherwise fails with EINVAL. Stage through
+               // committed host memory and copy only the bytes the file actually supplied.
                { size_t done = 0, cnt = (size_t)a2; char* b = (char*)P(a1);
-                 // Windows validates the entire destination range before it discovers EOF. Guest
-                 // stdio may request a large refill into a buffer whose accessible extent only
-                 // covers the short file remainder; raw _read then reports EINVAL instead of the
-                 // POSIX short read the guest expects. Cap regular files to the remaining bytes.
-                 // Pipes/devices make _filelengthi64 fail and retain the original request.
-                 const int64_t pos = ::_telli64(fd);
-                 const int64_t len = ::_filelengthi64(fd);
-                 if (pos >= 0 && len >= 0 && pos <= len) {
-                     const uint64_t remaining = (uint64_t)(len - pos);
-                     if (remaining < cnt) cnt = (size_t)remaining;
-                 }
-                 if (cnt && !windows_prepare_guest_write(a1, cnt)) {
-                     errno = EFAULT;
-                     return logged_return((int64_t)-1);
-                 }
+                 constexpr size_t kBounceSize = 0x10000;
+                 std::vector<char> bounce(cnt < kBounceSize ? cnt : kBounceSize);
                  while (done < cnt) {
-                     unsigned want = (cnt - done) > 0x40000000u ? 0x40000000u : (unsigned)(cnt - done);
-                     int r = ::read(fd, b + done, want);
+                     size_t left = cnt - done;
+                     unsigned want = (unsigned)(left < bounce.size() ? left : bounce.size());
+                     int r = ::read((int)a0, bounce.data(), want);
                      if (r < 0) return logged_return(done ? (int64_t)done : (int64_t)-1);
                      if (r == 0) break;   // EOF
+                     if (!windows_prepare_guest_write(
+                             (uint64_t)(uintptr_t)(b + done), (uint64_t)r)) {
+                         errno = EFAULT;
+                         return logged_return(done ? (int64_t)done : (int64_t)-1);
+                     }
+                     memcpy(b + done, bounce.data(), (size_t)r);
                      done += (size_t)r;
                  }
                  return logged_return((int64_t)done); }

@@ -596,10 +596,10 @@ HLE(k_wait_on_address) {
                            (long)prosper_gettid(), (unsigned long long)a0, *(uint32_t*)a0,
                            (unsigned long long)a1, pts ? (long long)(ts.tv_sec*1000000 + ts.tv_nsec/1000) : -1,
                            (unsigned long long)goff);
-    futex_wait_enter(a0); // registers this waiter so GPU-side label wakes know someone is blocked
+    WaitRegistration registration = futex_wait_enter(a0); // lets labels and GC wake this waiter
     long r = prosper_futex_wait((uint32_t*)a0, (uint32_t)a1, pts);
     int e = errno;
-    futex_wait_exit();
+    futex_wait_exit(registration);
     if (synclog()) fprintf(stderr, "[sync] T%ld WAIT.exit   addr=0x%llx r=%ld errno=%d\n",
                            (long)prosper_gettid(), (unsigned long long)a0, r, r < 0 ? e : 0);
     // Return the RIGHT status to the guest. Previously we always returned 0 (=woken/success), so on a
@@ -2100,8 +2100,11 @@ HLE(k_wait_on_address) {
     volatile uint32_t* wa = (volatile uint32_t*)(uintptr_t)a0;
     // Register as a futex waiter so the GPU command processor's RELEASE_MEM/EOP wake (wake_label_waiters,
     // which only fires when g_waiters>0) reaches this thread. RAII so every return path unregisters.
-    futex_wait_enter(a0);
-    struct WaiterGuard { ~WaiterGuard() { futex_wait_exit(); } } _waiter_guard;
+    WaitRegistration registration = futex_wait_enter(a0);
+    struct WaiterGuard {
+        WaitRegistration registration;
+        ~WaiterGuard() { futex_wait_exit(registration); }
+    } _waiter_guard{registration};
     while (*wa == expected) {
         DWORD wait_ms = INFINITE;
         if (deadline) {
@@ -2113,7 +2116,13 @@ HLE(k_wait_on_address) {
             wait_ms = (DWORD)(deadline - now);
         }
         uint32_t cmp = expected;
-        if (!WaitOnAddress(wa, &cmp, sizeof(cmp), wait_ms) && GetLastError() == ERROR_TIMEOUT) {
+        const bool woke = WaitOnAddress(wa, &cmp, sizeof(cmp), wait_ms) != FALSE;
+        const DWORD wait_error = woke ? ERROR_SUCCESS : GetLastError();
+        // A cooperative guest exception wakes this address without first changing the futex word.
+        // Accept the queued handler at the native-wait boundary before re-checking the predicate;
+        // otherwise the thread immediately parks again and can never run the handler that releases it.
+        dispatch_pending_guest_exception();
+        if (!woke && wait_error == ERROR_TIMEOUT) {
             if (*wa == expected) {
                 if (wsynclog()) fprintf(stderr, "[sync] WAIT.exit  addr=0x%llx TIMEOUT\n", (unsigned long long)a0);
                 return 0x80020060ull;
