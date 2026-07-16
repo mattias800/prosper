@@ -89,7 +89,8 @@ These switches isolate frontend-specific behavior without requiring a separate b
   streams cannot interleave with them. `PROSPER_APP_GUEST_DUMP_PTHREAD=<id>` limits each sample to
   one guest pthread (for example `0x2` for a title's main thread) to reduce observer overhead.
   On Windows, each enabled sample briefly uses `SuspendThread`/`GetThreadContext`/`ResumeThread` for
-  every selected live guest thread, captures its registered wait in the same suspension window, and
+  every selected live guest thread, captures all of its active registered waits in the same suspension
+  window (nested waits are listed rather than reduced to an arbitrary slot), and
   reads at most 16 KiB of its registered stack. This perturbs scheduling and is a diagnostic checkpoint,
   not a profiler. The registry supports 1,024 live guest
   threads and uses unique generation-token publication, so a sampler never consumes a partially published

@@ -1444,6 +1444,8 @@ struct WinGuestThreadSlot {
 };
 std::array<WinGuestThreadSlot, 1024> g_win_guest_threads;
 constexpr uint64_t kWinGuestThreadSlotPublishing = UINT64_MAX;
+std::atomic<GuestThreadTraceTestHook> g_guest_thread_trace_test_hook{nullptr};
+std::atomic<void*> g_guest_thread_trace_test_opaque{nullptr};
 
 bool win_guest_thread_snapshot(const WinGuestThreadSlot& slot, GuestThreadSnapshot& snapshot,
                                uint64_t* generation = nullptr,
@@ -2005,6 +2007,12 @@ void dump_guest_thread_trace(const char* path, uint64_t pthread_filter) {
             pin_error = GetLastError();
         if (thread && GetThreadId(thread) != native_id)
             pin_error = ERROR_INVALID_THREAD_ID;
+        if (pin_error == ERROR_SUCCESS && thread) {
+            GuestThreadTraceTestHook hook =
+                g_guest_thread_trace_test_hook.load(std::memory_order_acquire);
+            if (hook)
+                hook(native_id, g_guest_thread_trace_test_opaque.load(std::memory_order_acquire));
+        }
         if (thread &&
             slot.publication.load(std::memory_order_acquire) != registration_generation)
             pin_error = ERROR_RETRY;
@@ -2037,9 +2045,10 @@ void dump_guest_thread_trace(const char* path, uint64_t pthread_filter) {
             ReadProcessMemory(GetCurrentProcess(), (void*)(uintptr_t)context.Rsp,
                               stack_words.data(), wanted, &stack_bytes);
         }
-        GuestWaitSnapshot captured_wait{};
-        const bool captured_wait_valid =
-            captured && snapshot_guest_wait(native_id, captured_wait);
+        std::array<GuestWaitSnapshot, 16> captured_waits{};
+        const size_t captured_wait_count = captured
+            ? snapshot_guest_waits(native_id, captured_waits.data(), captured_waits.size())
+            : 0;
         if (prior_suspend != (DWORD)-1) ResumeThread(thread);
         CloseHandle(thread);
         if (!captured) {
@@ -2084,25 +2093,36 @@ void dump_guest_thread_trace(const char* path, uint64_t pthread_filter) {
             guest_returns_used += (size_t)appended;
             ++guest_return_count;
         }
-        char wait_description[64] = "-";
-        if (captured_wait_valid) {
-            const GuestWaitSnapshot& wait = captured_wait;
-            const char* kind = wait.kind == GuestWaitKind::Address ? "address" :
-                               wait.kind == GuestWaitKind::ConditionSequence ? "condition" :
-                               wait.kind == GuestWaitKind::EventFlag ? "event-flag" :
-                               wait.kind == GuestWaitKind::Semaphore ? "semaphore" :
-                               "unknown";
-            if (wait.source)
-                std::snprintf(wait_description, sizeof(wait_description),
-                              "%s@0x%llx(source=0x%llx)", kind,
-                              (unsigned long long)wait.object,
-                              (unsigned long long)wait.source);
-            else
-                std::snprintf(wait_description, sizeof(wait_description), "%s@0x%llx", kind,
-                              (unsigned long long)wait.object);
+        char wait_description[256] = "-";
+        if (captured_wait_count) {
+            wait_description[0] = 0;
+            size_t used = 0;
+            const size_t stored_wait_count = std::min(captured_wait_count, captured_waits.size());
+            for (size_t wait_index = 0; wait_index < stored_wait_count; ++wait_index) {
+                const GuestWaitSnapshot& wait = captured_waits[wait_index];
+                const char* kind = wait.kind == GuestWaitKind::Address ? "address" :
+                                   wait.kind == GuestWaitKind::ConditionSequence ? "condition" :
+                                   wait.kind == GuestWaitKind::EventFlag ? "event-flag" :
+                                   wait.kind == GuestWaitKind::Semaphore ? "semaphore" :
+                                   "unknown";
+                const int appended = wait.source
+                    ? std::snprintf(wait_description + used, sizeof(wait_description) - used,
+                                    wait_index ? ";%s@0x%llx(source=0x%llx)" :
+                                                 "%s@0x%llx(source=0x%llx)",
+                                    kind, (unsigned long long)wait.object,
+                                    (unsigned long long)wait.source)
+                    : std::snprintf(wait_description + used, sizeof(wait_description) - used,
+                                    wait_index ? ";%s@0x%llx" : "%s@0x%llx", kind,
+                                    (unsigned long long)wait.object);
+                if (appended <= 0 || (size_t)appended >= sizeof(wait_description) - used) break;
+                used += (size_t)appended;
+            }
+            if (captured_wait_count > captured_waits.size() && used < sizeof(wait_description))
+                std::snprintf(wait_description + used, sizeof(wait_description) - used,
+                              ";+%zu-more", captured_wait_count - captured_waits.size());
         }
         trace("[thread-trace] tid=%lu pthread=0x%llx rip=%s+0x%llx "
-              "raw=0x%llx rsp=0x%llx suspend=%lu wait=%s guest-stack=%s\n",
+              "raw=0x%llx rsp=0x%llx suspend=%lu waits=%s guest-stack=%s\n",
               (unsigned long)native_id, (unsigned long long)pthread_id, module_name,
               (unsigned long long)offset, (unsigned long long)rip,
               (unsigned long long)context.Rsp, (unsigned long)prior_suspend,
@@ -2149,6 +2169,16 @@ bool guest_trace_page_executable(uintptr_t address) {
 #else
     (void)address;
     return false;
+#endif
+}
+
+void set_guest_thread_trace_test_hook(GuestThreadTraceTestHook hook, void* opaque) {
+#ifdef _WIN32
+    g_guest_thread_trace_test_opaque.store(opaque, std::memory_order_release);
+    g_guest_thread_trace_test_hook.store(hook, std::memory_order_release);
+#else
+    (void)hook;
+    (void)opaque;
 #endif
 }
 

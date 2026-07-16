@@ -278,20 +278,30 @@ bool interrupt_guest_wait(uint64_t thread) {
     return false;
 }
 
-bool snapshot_guest_wait(uint64_t windows_tid, GuestWaitSnapshot& snapshot) {
-    snapshot = {};
+size_t snapshot_guest_waits(uint64_t windows_tid, GuestWaitSnapshot* snapshots, size_t capacity) {
+    size_t count = 0;
 #ifdef _WIN32
     for (const WaitSlot& slot : g_wait_slots) {
         WaitSlotSnapshot slot_snapshot{};
         if (!snapshot_wait_slot(slot, slot_snapshot) || slot_snapshot.windows_tid != windows_tid)
             continue;
-        snapshot = slot_snapshot.wait;
-        return true;
+        if (count < capacity && snapshots) snapshots[count] = slot_snapshot.wait;
+        ++count;
     }
 #else
     (void)windows_tid;
+    (void)snapshots;
+    (void)capacity;
 #endif
-    return false;
+    return count;
+}
+
+bool snapshot_guest_wait(uint64_t windows_tid, GuestWaitSnapshot& snapshot) {
+    snapshot = {};
+    GuestWaitSnapshot only{};
+    if (snapshot_guest_waits(windows_tid, &only, 1) != 1) return false;
+    snapshot = only;
+    return true;
 }
 
 void snapshot_guest_wait_registry(size_t& condition_slots_used,

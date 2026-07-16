@@ -41,8 +41,11 @@ int interruptible_mutex_lock(pthread_mutex_t* mutex);
 // Returns true when a registered wait was found and woken.
 bool interrupt_guest_wait(uint64_t thread);
 
-// Read a Windows guest thread's currently registered interruptible wait. Used by the
-// app checkpoint to distinguish futex/label waits from pthread condition waits.
+// Read every Windows interruptible wait currently registered by a guest thread. Nested exception
+// delivery can retain more than one; callers must not claim an arbitrary slot is the current wait.
+// Returns the total validated count and stores up to capacity entries. Other hosts return zero.
+size_t snapshot_guest_waits(uint64_t windows_tid, GuestWaitSnapshot* snapshots, size_t capacity);
+// Convenience for callers that require exactly one active wait. Returns false for zero or nested waits.
 bool snapshot_guest_wait(uint64_t windows_tid, GuestWaitSnapshot& snapshot);
 void snapshot_guest_wait_registry(size_t& condition_slots_used,
                                   size_t& condition_slots_capacity);

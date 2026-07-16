@@ -199,6 +199,9 @@ struct GuestThreadSnapshot {
 bool snapshot_guest_thread_registration(uint32_t native_id, GuestThreadSnapshot& snapshot);
 // True only for a committed executable Windows page. Other hosts return false.
 bool guest_trace_page_executable(uintptr_t address);
+// Deterministic test seam at the sampler's handle-pinned, pre-suspend boundary. Production leaves it null.
+using GuestThreadTraceTestHook = void (*)(uint32_t native_id, void* opaque);
+void set_guest_thread_trace_test_hook(GuestThreadTraceTestHook hook, void* opaque = nullptr);
 // Windows cooperative exception checkpoint used when a target was woken from a registered HLE wait.
 // Other hosts provide an empty implementation.
 void dispatch_pending_guest_exception();
