@@ -1,4 +1,5 @@
 #include "../src/gpu/gpu_capture_bundle.hpp"
+#include "../src/gpu/tile.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -125,6 +126,48 @@ int main() {
     restored_first.blobs[0].bytes[0] ^= 0xff;
     CHECK(restored_second.blobs[0].bytes == blob.bytes,
           "materialized submits own independent mutable resource bytes");
+
+    GpuCaptureFile dcc_capture;
+    dcc_capture.metadata.submit_index = 51;
+    dcc_capture.metadata.revision = "bundle-dcc-test";
+    ShaderResource dcc_resource{};
+    dcc_resource.cls = ResourceClass::Texture; dcc_resource.binding = 7;
+    dcc_resource.gpu_addr = 0x500000; dcc_resource.size = 32 * 32 * 32 * 4;
+    dcc_resource.format = DataFormat::Sint32; dcc_resource.num_components = 1;
+    dcc_resource.img_dim = 2; dcc_resource.width = 32; dcc_resource.height = 32;
+    dcc_resource.depth = 32; dcc_resource.tile_mode = static_cast<uint32_t>(TileMode::Sw64KbRX);
+    dcc_resource.compression_enabled = true; dcc_resource.meta_pipe_aligned = true;
+    dcc_resource.metadata_addr = 0x900000;
+    GpuCaptureBlob dcc_base;
+    dcc_base.guest_addr = dcc_resource.gpu_addr;
+    dcc_base.bytes.resize(static_cast<size_t>(gpu_capture_resource_footprint(dcc_resource)), 0x41);
+    dcc_base.bytes_read = dcc_base.bytes.size();
+    dcc_base.content_hash = gpu_capture_hash(dcc_base.bytes);
+    GpuCaptureBlob dcc_metadata;
+    dcc_metadata.guest_addr = dcc_resource.metadata_addr;
+    dcc_metadata.bytes.resize(static_cast<size_t>(gpu_capture_dcc_metadata_footprint(dcc_resource)), 0x82);
+    dcc_metadata.bytes_read = dcc_metadata.bytes.size();
+    dcc_metadata.content_hash = gpu_capture_hash(dcc_metadata.bytes);
+    dcc_capture.blobs = {dcc_base, dcc_metadata};
+    GpuCapturedDraw dcc_draw;
+    dcc_draw.vs = {0x07230203, 51}; dcc_draw.fs = {0x07230203, 52};
+    dcc_draw.vrt.present = true;
+    GpuCapturedResource captured_dcc;
+    captured_dcc.resource = dcc_resource; captured_dcc.blob_index = 0;
+    captured_dcc.metadata_size = dcc_metadata.bytes.size(); captured_dcc.metadata_blob_index = 1;
+    dcc_draw.vrt.resources.push_back(captured_dcc);
+    dcc_capture.draws.push_back(dcc_draw);
+    GpuCaptureBundle dcc_bundle;
+    GpuCaptureFile dcc_manifest, dcc_restored;
+    GpuReplayFrame dcc_replay;
+    CHECK(append_gpu_capture_bundle(dcc_bundle, dcc_capture, error) &&
+          materialize_gpu_capture_bundle_manifest(dcc_bundle, 0, dcc_manifest, error) &&
+          dcc_manifest.blobs.size() == 2 && dcc_manifest.blobs[1].bytes.empty() &&
+          dcc_manifest.draws[0].vrt.resources[0].metadata_blob_index == 1 &&
+          materialize_gpu_capture_bundle_submit(dcc_bundle, 0, dcc_restored, error) &&
+          materialize_gpu_replay(dcc_restored, dcc_replay, error) &&
+          dcc_replay.items[0].vrt->resources[0].dcc_metadata_host_data_size == dcc_metadata.bytes.size(),
+          "bundle manifest preserves separate DCC references while payloads stay deduplicated");
 
     GpuCaptureBundle malformed = loaded;
     malformed.submits[0].blob_resource_indices[0] =
