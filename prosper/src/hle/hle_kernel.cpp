@@ -1436,6 +1436,7 @@ std::atomic<uint32_t> g_win_coop_queued{0};
 struct WinGuestThreadSlot {
     std::atomic<uint64_t> publication{0};
     uint64_t next_publication = 0; // written only while publication holds the exclusive sentinel
+    std::atomic<uintptr_t> thread_handle{0};
     std::atomic<uint32_t> native_id{0};
     std::atomic<uint64_t> pthread_id{0};
     std::atomic<uintptr_t> stack_base{0};
@@ -1444,31 +1445,46 @@ struct WinGuestThreadSlot {
 std::array<WinGuestThreadSlot, 1024> g_win_guest_threads;
 constexpr uint64_t kWinGuestThreadSlotPublishing = UINT64_MAX;
 
-bool win_guest_thread_snapshot(const WinGuestThreadSlot& slot, GuestThreadSnapshot& snapshot) {
+bool win_guest_thread_snapshot(const WinGuestThreadSlot& slot, GuestThreadSnapshot& snapshot,
+                               uint64_t* generation = nullptr,
+                               HANDLE* registered_handle = nullptr) {
+    if (generation) *generation = 0;
+    if (registered_handle) *registered_handle = nullptr;
     const uint64_t publication = slot.publication.load(std::memory_order_acquire);
     if (publication == 0 || publication == kWinGuestThreadSlotPublishing) return false;
+    const HANDLE handle = (HANDLE)slot.thread_handle.load(std::memory_order_relaxed);
     const uint32_t native_id = slot.native_id.load(std::memory_order_relaxed);
     const uint64_t pthread_id = slot.pthread_id.load(std::memory_order_relaxed);
     const uintptr_t stack_base = slot.stack_base.load(std::memory_order_relaxed);
     const size_t stack_size = slot.stack_size.load(std::memory_order_relaxed);
     if (slot.publication.load(std::memory_order_acquire) != publication) return false;
     snapshot = {native_id, pthread_id, stack_base, stack_size};
+    if (generation) *generation = publication;
+    if (registered_handle) *registered_handle = handle;
     return true;
 }
 
 void win_guest_thread_register(uint64_t pthread_id, uint32_t native_id,
                                void* stack_base, size_t stack_size) {
     if (native_id == 0) return;
+    HANDLE thread_handle = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
+                         &thread_handle, 0, FALSE, DUPLICATE_SAME_ACCESS))
+        return;
     for (WinGuestThreadSlot& slot : g_win_guest_threads) {
         GuestThreadSnapshot current{};
-        if (win_guest_thread_snapshot(slot, current) && current.native_id == native_id)
+        if (win_guest_thread_snapshot(slot, current) && current.native_id == native_id &&
+            current.pthread_id == pthread_id) {
+            CloseHandle(thread_handle);
             return; // idempotent lifecycle notification
+        }
         uint64_t publication = 0;
         if (!slot.publication.compare_exchange_strong(
                 publication, kWinGuestThreadSlotPublishing, std::memory_order_acq_rel))
             continue;
         // A unique publication token validates the complete payload and detects unregister/re-register
         // ABA even when Windows promptly reuses the same native thread id.
+        slot.thread_handle.store((uintptr_t)thread_handle, std::memory_order_relaxed);
         slot.native_id.store(native_id, std::memory_order_relaxed);
         slot.pthread_id.store(pthread_id, std::memory_order_relaxed);
         slot.stack_base.store((uintptr_t)stack_base, std::memory_order_relaxed);
@@ -1480,6 +1496,7 @@ void win_guest_thread_register(uint64_t pthread_id, uint32_t native_id,
         slot.publication.store(token, std::memory_order_release);
         return;
     }
+    CloseHandle(thread_handle);
 }
 
 void win_guest_thread_unregister(uint32_t native_id) {
@@ -1491,11 +1508,13 @@ void win_guest_thread_unregister(uint32_t native_id) {
             !slot.publication.compare_exchange_strong(
                 publication, kWinGuestThreadSlotPublishing, std::memory_order_acq_rel))
             continue;
+        HANDLE thread_handle = (HANDLE)slot.thread_handle.exchange(0, std::memory_order_relaxed);
         slot.native_id.store(0, std::memory_order_relaxed);
         slot.pthread_id.store(0, std::memory_order_relaxed);
         slot.stack_base.store(0, std::memory_order_relaxed);
         slot.stack_size.store(0, std::memory_order_relaxed);
         slot.publication.store(0, std::memory_order_release);
+        if (thread_handle) CloseHandle(thread_handle);
         return;
     }
 }
@@ -1968,22 +1987,43 @@ void dump_guest_thread_trace(const char* path, uint64_t pthread_filter) {
           condition_slots_used, condition_slots_capacity);
     for (const WinGuestThreadSlot& slot : g_win_guest_threads) {
         GuestThreadSnapshot registered{};
-        if (!win_guest_thread_snapshot(slot, registered)) continue;
+        uint64_t registration_generation = 0;
+        HANDLE registered_handle = nullptr;
+        if (!win_guest_thread_snapshot(
+                slot, registered, &registration_generation, &registered_handle))
+            continue;
         const uint32_t native_id = registered.native_id;
         const uint64_t pthread_id = registered.pthread_id;
         if (pthread_filter && pthread_id != pthread_filter) continue;
         const uintptr_t stack_base = registered.stack_base;
         const size_t stack_size = registered.stack_size;
-        HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
-                                       THREAD_QUERY_INFORMATION,
-                                   FALSE, native_id);
-        if (!thread) {
+        HANDLE thread = nullptr;
+        DWORD pin_error = registered_handle ? ERROR_SUCCESS : ERROR_INVALID_HANDLE;
+        if (registered_handle &&
+            !DuplicateHandle(GetCurrentProcess(), registered_handle, GetCurrentProcess(),
+                             &thread, 0, FALSE, DUPLICATE_SAME_ACCESS))
+            pin_error = GetLastError();
+        if (thread && GetThreadId(thread) != native_id)
+            pin_error = ERROR_INVALID_THREAD_ID;
+        if (thread &&
+            slot.publication.load(std::memory_order_acquire) != registration_generation)
+            pin_error = ERROR_RETRY;
+        if (pin_error != ERROR_SUCCESS || !thread) {
+            if (thread) CloseHandle(thread);
             trace("[thread-trace] tid=%lu pthread=0x%llx unavailable error=%lu\n",
                   (unsigned long)native_id, (unsigned long long)pthread_id,
-                  (unsigned long)GetLastError());
+                  (unsigned long)pin_error);
             continue;
         }
         const DWORD prior_suspend = SuspendThread(thread);
+        if (prior_suspend != (DWORD)-1 &&
+            slot.publication.load(std::memory_order_acquire) != registration_generation) {
+            ResumeThread(thread);
+            CloseHandle(thread);
+            trace("[thread-trace] tid=%lu pthread=0x%llx registration-retired\n",
+                  (unsigned long)native_id, (unsigned long long)pthread_id);
+            continue;
+        }
         CONTEXT context{};
         context.ContextFlags = CONTEXT_CONTROL;
         const bool captured = prior_suspend != (DWORD)-1 && GetThreadContext(thread, &context);

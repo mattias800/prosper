@@ -127,7 +127,7 @@ static void* registry_worker(void*) {
     constexpr size_t size_b = 0x2222u;
     for (unsigned i = 0; i < 50000; ++i) {
         trace_guest_thread_lifecycle(true, pthread_a, native_id, (void*)stack_a, size_a);
-        if (i == 0) Sleep(10); // guarantee the observer sees at least one valid published interval
+        if (i == 0) Sleep(100); // leave time for repeated handle-pinning samples of one live generation
         if ((i & 31u) == 0) SwitchToThread();
         trace_guest_thread_lifecycle(false, pthread_a, native_id, (void*)stack_a, size_a);
         trace_guest_thread_lifecycle(true, pthread_b, native_id, (void*)stack_b, size_b);
@@ -272,6 +272,9 @@ int main() {
     registry_done = 0;
     registry_torn = 0;
     registry_observations = 0;
+    const char* registry_trace_path = "test_win_exception_delivery_thread_trace.tmp";
+    DeleteFileA(registry_trace_path);
+    unsigned registry_dumps = 0;
     CHECK(pthread_create(&thread, nullptr, registry_worker, nullptr) == 0,
           "create lifecycle-registry publication stress thread");
     for (int i = 0; i < 1000 && !registry_tid; ++i) Sleep(1);
@@ -286,13 +289,20 @@ int main() {
                                   snapshot.stack_base == 0x22220000u &&
                                   snapshot.stack_size == 0x2222u;
         if (!generation_a && !generation_b) InterlockedExchange(&registry_torn, 1);
+        if (registry_dumps < 16) {
+            dump_guest_thread_trace(registry_trace_path);
+            ++registry_dumps;
+        }
     }
     pthread_join(thread, nullptr);
     GuestThreadSnapshot retired_snapshot{};
     CHECK(registry_observations != 0, "lifecycle-registry stress observed published slots");
     CHECK(registry_torn == 0, "lifecycle-registry snapshots never mix slot generations");
+    CHECK(registry_dumps == 16,
+          "timed sampler pins and releases live thread handles during lifecycle churn");
     CHECK(!snapshot_guest_thread_registration(registry_tid, retired_snapshot),
           "retired lifecycle slot is no longer visible");
+    DeleteFileA(registry_trace_path);
 
     void* readwrite_page = VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     void* executable_page = VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READ);
