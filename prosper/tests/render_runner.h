@@ -1476,7 +1476,19 @@ inline std::vector<uint8_t> render_draws_rgba(const std::vector<BackendDraw>& dr
             dss.depthTestEnable  = VK_TRUE;
             dss.depthWriteEnable = ps->depth_write_enable ? VK_TRUE : VK_FALSE;
             dss.depthCompareOp   = (VkCompareOp)ps->depth_compare_op;
-            if (getenv("PROSPER_DEPTH_ALWAYS")) dss.depthCompareOp = VK_COMPARE_OP_ALWAYS;   // diag
+            // UE4 repeats its reverse-Z depth prepass in a separately translated base-pass shader.
+            // A one-ULP position difference between those shaders makes exact EQUAL reject the whole
+            // base pass, although the guest hardware accepts the pair. Preserve occlusion by relaxing
+            // only a read-only EQUAL against an already-populated, explicitly reverse-Z surface:
+            // GEQUAL still rejects geometry behind the prepass instead of disabling depth outright.
+            const bool reverse_z_equal_compat = persistent_ds && depth_was_valid &&
+                !ps->depth_write_enable && ps->depth_compare_op == VK_COMPARE_OP_EQUAL &&
+                ps->has_depth_clear && ps->depth_clear_value <= 0.5f;
+            if (reverse_z_equal_compat) {
+                dss.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;
+                if (getenv("PROSPER_DSLOG"))
+                    fprintf(stderr, "[ds] reverse-Z read-only EQUAL -> GEQUAL compatibility\n");
+            }
         }
         if (ps && ps->stencil_enable) {
             // Wire the front/back stencil op-state so masks clip (e.g. the title shimmer tests the
