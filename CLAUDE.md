@@ -300,20 +300,28 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
     scenario and violated contract; describe the approach and important invariants; identify affected and
     deliberately unaffected behavior; list risks, uncertainty, and compatibility concerns; and give exact
     author-side build/test/snapshot commands and results. A reviewer should not need private chat context.
-  - Reviewer independence covers the entire head under review: the reviewer must not have designed, debugged,
-    authored, edited, or committed any part of it. Spawn it with fresh context, without the author's private
-    implementation/debugging transcript; give it only the PR number and the neutral brief below. The reviewer
-    uses its own worktree and must not modify the PR branch or implement fixes. If it contributes any change,
-    it is disqualified from approving that head and a different independent reviewer must perform the complete
-    review. The author may identify known risks and required checks on the PR, but not an expected conclusion.
+  - Reviewer independence covers participation in producing the entire implementation under review: the
+    reviewer must not have privately designed/debugged the solution with the author, authored or edited the
+    patch, committed any part of it, or otherwise materially co-produced it. Spawn it with fresh context,
+    without the author's private implementation/debugging transcript; give it only the PR number and the neutral
+    brief below. The reviewer uses its own worktree and must not modify the PR branch or implement fixes. Normal
+    review work—identifying a failure, stating the required behavioral contract, suggesting possible remediation,
+    requesting regression coverage, and evaluating the author's fix or rebuttal—does not itself make the
+    reviewer a contributor. The author remains responsible for designing and implementing the patch. If the
+    reviewer supplies or edits the implementation or materially co-designs the final patch, it is disqualified
+    from approving that head and a different independent reviewer must perform the complete review. The author
+    may identify known risks and required checks on the PR, but not an expected conclusion.
   - Direct author/reviewer communication is limited to coordination such as `review requested` and
     `review posted`. Put all substantive context, questions, findings, replies, verification evidence, finding
     dispositions, and verdicts on the PR as comments so the complete decision trail is durable and traceable.
     Sign reviewer comments with one stable reviewer name.
-  - The reviewer fetches and records the live full base and head SHAs, then reads this file, every applicable
-    `AGENTS.md`, the PR description and linked issue, the relevant architecture/status docs, the complete
-    base-to-head diff, all PR discussion, and the affected callers and data paths. It must also inspect the
-    prospective integration with that base rather than reviewing changed lines in isolation.
+  - The reviewer resolves the live base repository and full target ref from the PR, fetches that target ref
+    directly, and records its identity and full SHA. Do not trust cached PR `base.sha`/`baseRefOid` metadata or a
+    synthetic PR merge ref as the authoritative target tip. Resolve and fetch the head repository/ref directly
+    too. Then read this file, every applicable `AGENTS.md`, the PR description and linked issue, the relevant
+    architecture/status docs, the complete base-to-head diff, all PR discussion, and the affected callers and
+    data paths. Inspect the prospective integration with that exact base and record its resulting tree SHA rather
+    than reviewing changed lines in isolation.
   - The review must be adversarial and evidence-based. Check assumptions, invariants, ABI/API contracts,
     ownership and lifetimes, concurrency and ordering, bounds/overflow, error and cleanup paths, malformed
     inputs, platform differences, compatibility with old captures/state, and whether diagnostics themselves
@@ -334,14 +342,24 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
     the complete updated diff and re-runs affected verification. If unavailable, a replacement independent
     reviewer must read the whole review record and perform the same full review.
   - Continue until the reviewer explicitly posts either
-    `APPROVED FOR MERGE at <full-head-SHA> against <full-base-SHA>` or `NOT APPROVED`, with remaining concerns.
-    Immediately before merging, re-fetch and compare both live PR SHAs to the approved pair. Any commit or
-    force-push that changes the head—including docs, tests, workflows, fixtures, assets, generated files, or
-    configuration—invalidates approval and requires a complete current-head verdict. If the base moves, the
-    reviewer must inspect the new base delta and prospective integration, re-run affected checks, and approve
-    the new head/base pair.
+    `APPROVED FOR MERGE <head-repo>:<head-ref>@<head-SHA> into <base-repo>:<base-ref>@<base-SHA> with tree <tree-SHA>`
+    or `NOT APPROVED`, with remaining concerns. Any commit or force-push that changes the head—including docs,
+    tests, workflows, fixtures, assets, generated files, or configuration—invalidates approval and requires a
+    complete current-head verdict. A changed head/base repository or ref also invalidates approval. If the base
+    tip moves, the reviewer must inspect the new base delta and prospective integration, re-run affected checks,
+    and approve the new identities, SHAs, and integration tree.
+  - The final merge must atomically preserve the reviewed integration. Prefer a repository merge queue/ruleset
+    that verifies the exact approved inputs and integration. Without one, create a merge commit whose first
+    parent is the approved base SHA, second parent is the approved head SHA, and tree is the approved integration
+    tree; verify all three locally. Update the exact target ref with an explicit expected-old-OID lease/CAS on the
+    approved base SHA (for example,
+    `git push --force-with-lease=<base-ref>:<base-SHA> origin <merge-commit>:<base-ref>`). The merge object fixes
+    the reviewed head immutably, while the lease makes the base update atomic. If the target ref moved, the push
+    must fail: never override/retry the lease or fall back to a plain merge. Fetch the new base and obtain a new
+    integration review. A normal `gh pr merge` head-only guard is not sufficient for this multi-agent repository.
   - Never merge with an unresolved correctness finding; an applicable required check that is absent, pending,
-    or unsuccessful; an unrecorded/overbroad verification exception; or approval for a different head/base pair.
+    or unsuccessful; an unrecorded/overbroad verification exception; approval for different repository/ref/SHA
+    identities or integration tree; or a merge mechanism that cannot atomically preserve the approved base.
     Reviewer approval satisfies the quality gate but is not permission to merge: the agent may merge only when
     the user/task separately authorizes it.
 
@@ -349,13 +367,15 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   ```text
   Independently review PR #<N> under the mandatory review policy in CLAUDE.md. Begin with fresh context; do not
   modify the PR branch or implement fixes. Treat the PR description and comments as the complete coordination
-  record. Fetch and record the full live base and head SHAs; inspect the full diff, prospective integration,
-  affected callers, and invariants. Run the strongest applicable verification, including mandatory snapshot
-  checks. Post every finding, question, test result, disposition, and final verdict on the PR, signed with a
-  stable reviewer name; include severity, exact location, concrete failure scenario, required fix, and evidence.
-  Do not approve while any correctness concern or required check remains. After any update, review the complete
-  new head. Post either APPROVED FOR MERGE at <full-head-SHA> against <full-base-SHA> or NOT APPROVED. Directly
-  message the author only to say that the posted review is complete.
+  record. Resolve the live head and base repository/refs, fetch both directly, and record their full SHAs; do not
+  rely on cached PR base metadata or a synthetic merge ref. Inspect the full diff, affected callers, invariants,
+  and prospective integration, and record its tree SHA. Run the strongest applicable verification, including
+  mandatory snapshot checks. Post every finding, question, test result, disposition, and final verdict on the
+  PR, signed with a stable reviewer name; include severity, exact location, concrete failure scenario, required
+  fix, and evidence. Do not approve while any correctness concern or required check remains. After any update,
+  review the complete new head. Post either APPROVED FOR MERGE <head-repo>:<head-ref>@<head-SHA> into
+  <base-repo>:<base-ref>@<base-SHA> with tree <tree-SHA> or NOT APPROVED. Directly message the author only to say
+  that the posted review is complete.
   ```
 - **Kyty is a reference, NOT an oracle — and its reliability is split by platform generation.**
   Kyty CAN run PS4 games, so the PS4-inherited surface (libkernel, pthreads, equeue, VideoOut,
