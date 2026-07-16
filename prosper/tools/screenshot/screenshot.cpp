@@ -504,7 +504,20 @@ int main(int argc, char** argv) {
     prosper::frontend::register_live_renderer(".", /*dump_bmps=*/false);
     Program prog; std::string err;
     if (!boot_program(dump, prog, &err)) { fprintf(stderr, "screenshot: boot failed: %s\n", err.c_str()); return 1; }
-    std::thread guest([&prog] { run_entry(prog.imgs[0]); });
+    std::thread guest([&prog] {
+        const BootResult result = run_entry(prog.imgs[0]);
+        fprintf(stderr,
+                "[shot] guest thread ended: kind=%d detail=%s rip=0x%llx addr=0x%llx "
+                "rbp=0x%llx rsp=0x%llx\n",
+                result.kind, result.detail.c_str(),
+                static_cast<unsigned long long>(result.fault_rip),
+                static_cast<unsigned long long>(result.fault_addr),
+                static_cast<unsigned long long>(result.rbp),
+                static_cast<unsigned long long>(result.rsp));
+        for (uint64_t address : result.backtrace)
+            fprintf(stderr, "[shot] guest backtrace: 0x%llx\n",
+                    static_cast<unsigned long long>(address));
+    });
     guest.detach();
 
     const bool time_mode = seconds > 0;   // capture on wall-clock interval vs. every N rendered frames

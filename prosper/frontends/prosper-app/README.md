@@ -69,3 +69,5 @@ Esc or closing the window quits.
   separate presentation device; frames cross as CPU pixels via `present_readback`.
 - On window-close the guest thread is detached and reclaimed by process exit (a cooperative
   flip-boundary stop is a documented follow-up).
+- `PROSPER_APP_STALL_DUMP_MS=<milliseconds>` prints the recent Windows guest-exception ring when no new
+  presented frame arrives within that interval. It is an unattended-run diagnostic, disabled by default.

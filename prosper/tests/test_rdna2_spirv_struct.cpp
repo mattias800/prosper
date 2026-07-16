@@ -83,6 +83,23 @@ bool has_opcode(const std::vector<uint32_t>& spv, uint32_t opcode) {
     return false;
 }
 
+bool phi_ids_are_nonzero(const std::vector<uint32_t>& spv) {
+    constexpr uint32_t OpPhi = 245;
+    if (spv.size() < 5) return false;
+    for (size_t i = 5; i < spv.size();) {
+        const uint32_t word = spv[i];
+        const uint32_t op = word & 0xffffu, wc = word >> 16u;
+        if (wc == 0 || i + wc > spv.size()) return false;
+        if (op == OpPhi) {
+            if (wc < 5 || ((wc - 3) & 1u) != 0) return false;
+            for (uint32_t operand = 1; operand < wc; ++operand)
+                if (spv[i + operand] == 0) return false;
+        }
+        i += wc;
+    }
+    return true;
+}
+
 // Whether the module contains OpDecorate (71) with the given decoration (word[i+2]).
 bool has_decoration(const std::vector<uint32_t>& spv, uint32_t decoration) {
     enum : uint32_t { OpDecorateL = 71 };
@@ -160,6 +177,30 @@ int main() {
         return 1;
     }
     printf("  [ok]   signed kernel SPIR-V declares signed i32 with a nonzero id\n");
+
+    // NGG wave packing writes EXEC through s_lshr_b64 before later structured control flow. The
+    // instruction is mask-domain only; inserting rs.sreg[EXEC] left an SSA id 0 that a later merge
+    // emitted as an OpPhi input. NVIDIA's Windows driver faults in vkCreateGraphicsPipelines on that
+    // invalid module, so guard the exact wave-pack -> forward-if shape independently of a Vulkan driver.
+    const uint32_t ngg_exec_if[] = {
+        0x93EAFF03u, 0x00080008u, 0x876BFF03u, 0x000000FFu, 0x8F6A8C6Au,
+        0x887C6A6Bu, 0xBF900009u, 0x906A8803u, 0x81EA6A80u, 0x90FE6AC1u,
+        0xF8000941u, 0x00000000u, 0x81EA0380u, 0x90FE6AC1u,
+        0xBE80246Au,                         // s_and_saveexec_b64 s[0:1], vcc
+        0xBF880001u,                         // s_cbranch_execz +1
+        0x8AFE7E00u,                         // s_andn2_b64 exec, s[0:1], exec
+        0xBEFE0400u,                         // s_mov_b64 exec, s[0:1]
+        0x34040A81u, 0x36060AC2u, 0x7E000280u, 0x7E0202F2u, 0x36040482u,
+        0x4A0606C1u, 0x4A0404C1u, 0x7E060B03u, 0x7E040B02u,
+        0xF80008CFu, 0x01000302u, 0xBF810000u,
+    };
+    const auto ngg_exec_if_spv = recompile_vertex(
+        ngg_exec_if, sizeof(ngg_exec_if) / sizeof(ngg_exec_if[0]));
+    if (ngg_exec_if_spv.empty() || !phi_ids_are_nonzero(ngg_exec_if_spv)) {
+        printf("  [FAIL] NGG EXEC wave-pack control flow emitted a zero-id OpPhi\n");
+        return 1;
+    }
+    printf("  [ok]   NGG EXEC wave-pack control flow emits only valid nonzero OpPhi ids\n");
 
     // v_cmpx_* narrows EXEC. A FRAGMENT export under a narrowed EXEC is a discard (alpha test / kill): it
     // now lowers to a per-invocation OpKill of the inactive lanes followed by an export from the survivors,

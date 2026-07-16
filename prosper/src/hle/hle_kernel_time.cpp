@@ -2,6 +2,7 @@
 // libkernel stubs the engine needs during init. Cross-platform (chrono + pthread).
 #include "dispatch.hpp"
 #include "nid.hpp"
+#include "sync_futex.hpp"
 #include <pthread.h>
 #include <chrono>
 #if defined(__linux__)
@@ -361,13 +362,13 @@ HLE(k_uuid_create) {                                       // fill 16 non-zero b
 
 // --- C11 threads (used by MSVC STL std::mutex/std::condition_variable) ---
 HLE(m_mtx_init)   { if (a0) { auto* m = (pthread_mutex_t*)calloc(1, sizeof(pthread_mutex_t)); pthread_mutexattr_t at; pthread_mutexattr_init(&at); pthread_mutexattr_settype(&at, PTHREAD_MUTEX_RECURSIVE); pthread_mutex_init(m, &at); pthread_mutexattr_destroy(&at); *(void**)P(a0) = m; } return 0; }
-HLE(m_mtx_lock)   { if (a0 && *(void**)P(a0)) pthread_mutex_lock((pthread_mutex_t*)*(void**)P(a0)); return 0; }
+HLE(m_mtx_lock)   { if (a0 && *(void**)P(a0)) interruptible_mutex_lock((pthread_mutex_t*)*(void**)P(a0)); return 0; }
 HLE(m_mtx_unlock) { if (a0 && *(void**)P(a0)) pthread_mutex_unlock((pthread_mutex_t*)*(void**)P(a0)); return 0; }
 HLE(m_mtx_destroy){ if (a0 && *(void**)P(a0)) { pthread_mutex_destroy((pthread_mutex_t*)*(void**)P(a0)); free(*(void**)P(a0)); } return 0; }
 HLE(m_cnd_init)   { if (a0) { auto* c = (pthread_cond_t*)calloc(1, sizeof(pthread_cond_t)); pthread_cond_init(c, nullptr); *(void**)P(a0) = c; } return 0; }
-HLE(m_cnd_signal) { if (a0 && *(void**)P(a0)) pthread_cond_signal((pthread_cond_t*)*(void**)P(a0)); return 0; }
-HLE(m_cnd_broadcast){ if (a0 && *(void**)P(a0)) pthread_cond_broadcast((pthread_cond_t*)*(void**)P(a0)); return 0; }
-HLE(m_cnd_wait)   { if (a0 && *(void**)P(a0) && a1 && *(void**)P(a1)) pthread_cond_wait((pthread_cond_t*)*(void**)P(a0), (pthread_mutex_t*)*(void**)P(a1)); return 0; }
+HLE(m_cnd_signal) { if (a0 && *(void**)P(a0)) interruptible_cond_signal((pthread_cond_t*)*(void**)P(a0)); return 0; }
+HLE(m_cnd_broadcast){ if (a0 && *(void**)P(a0)) interruptible_cond_broadcast((pthread_cond_t*)*(void**)P(a0)); return 0; }
+HLE(m_cnd_wait)   { if (a0 && *(void**)P(a0) && a1 && *(void**)P(a1)) interruptible_cond_wait((pthread_cond_t*)*(void**)P(a0), (pthread_mutex_t*)*(void**)P(a1)); return 0; }
 HLE(m_cnd_destroy){ if (a0 && *(void**)P(a0)) { pthread_cond_destroy((pthread_cond_t*)*(void**)P(a0)); free(*(void**)P(a0)); } return 0; }
 
 // --- event queue (sceKernelEqueue): kqueue-like event mechanism the engine uses for vsync/flip
