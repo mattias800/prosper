@@ -34,6 +34,22 @@ int main() {
     // Known-good fullscreen-triangle vertex shader (SPIR-V), shared by both draws.
     #include "../tools/boot_trace/refvs.inc"
     std::vector<uint32_t> vs(kRefVs, kRefVs + sizeof(kRefVs) / 4);
+    auto ref_vs_with_depth = [](std::vector<uint32_t> words, uint32_t depth_bits) {
+        // kRefVs builds gl_Position.z from float OpConstant %37. Patch only that literal so tests can
+        // model the tiny cross-shader position drift seen between UE4's depth and base passes.
+        for (size_t i = 5; i < words.size();) {
+            const uint32_t word_count = words[i] >> 16;
+            const uint32_t opcode = words[i] & 0xffffu;
+            if (word_count == 4 && opcode == 43 /* OpConstant */ &&
+                words[i + 1] == 6 /* float type */ && words[i + 2] == 0x25) {
+                words[i + 3] = depth_bits;
+                return words;
+            }
+            if (!word_count || i + word_count > words.size()) break;
+            i += word_count;
+        }
+        return std::vector<uint32_t>{};
+    };
 
     // Two solid-color pixel shaders, recompiled from tiny RDNA2 EXP blobs (v_mov the 4 color VGPRs, then
     // EXP mrt0). Inline consts: 0xF2 = 1.0f, 0x80 = 0.0f.  RED = (1,0,0,1)  GREEN = (0,1,0,1).
@@ -184,6 +200,58 @@ int main() {
         const uint8_t* c = center(initialized);
         CHECK(c && c[1] > 0xC0 && c[0] < 0x40,
               "stencil-only initialization does not poison a later reverse-Z depth plane");
+    }
+
+    // UE4 can emit its reverse-Z depth prepass and EQUAL base pass from different shaders. Their
+    // translated clip-space positions may differ by one float ULP. On the guest this pair shades;
+    // strict Vulkan EQUAL rejects it. Relax only a read-only EQUAL on an already-valid, explicitly
+    // reverse-Z guest surface to GEQUAL, which continues rejecting fragments behind the prepass.
+    {
+        std::vector<uint32_t> depth_vs = ref_vs_with_depth(vs, 0x3f000000u); // 0.5f
+        std::vector<uint32_t> drift_vs = ref_vs_with_depth(vs, 0x3f000001u); // next float above 0.5f
+        CHECK(!depth_vs.empty() && !drift_vs.empty(), "fullscreen VS depth literal is patchable");
+
+        ResolvedPipelineState writer = opaque;
+        writer.color_write_mask = 0;
+        writer.depth_test_enable = true;
+        writer.depth_write_enable = true;
+        writer.depth_compare_op = 7; // ALWAYS
+        writer.has_depth_clear = true;
+        writer.depth_clear_value = 0.0f;
+        writer.depth_read_base = writer.depth_write_base = 0x55550000;
+
+        ResolvedPipelineState reader = opaque;
+        reader.depth_test_enable = true;
+        reader.depth_compare_op = 2; // EQUAL
+        reader.has_depth_clear = true;
+        reader.depth_clear_value = 0.0f;
+        reader.depth_read_base = reader.depth_write_base = 0x55550000;
+
+        prosper::test::BackendDraw w; w.vs = depth_vs; w.fs = red; w.ps = &writer; w.vcount = 3;
+        prosper::test::BackendDraw r; r.vs = drift_vs; r.fs = green; r.ps = &reader; r.vcount = 3;
+        (void)prosper::test::render_draws_rgba({w}, W, H, nullptr, nullptr, true);
+        std::vector<uint8_t> compatible =
+            prosper::test::render_draws_rgba({r}, W, H, nullptr, nullptr, true);
+        const uint8_t* rc = center(compatible);
+        CHECK(rc && rc[1] > 0xC0 && rc[0] < 0x40,
+              "persistent reverse-Z EQUAL tolerates one-ULP translated shader drift");
+
+        ResolvedPipelineState fresh = reader;
+        fresh.depth_read_base = fresh.depth_write_base = 0x66660000;
+        prosper::test::BackendDraw f = r; f.ps = &fresh;
+        std::vector<uint8_t> uninitialized =
+            prosper::test::render_draws_rgba({f}, W, H, nullptr, nullptr, true);
+        const uint8_t* fc = center(uninitialized);
+        CHECK(fc && fc[1] < 0x80,
+              "reverse-Z EQUAL stays strict before the guest depth surface is populated");
+
+        ResolvedPipelineState standard_z = reader;
+        standard_z.depth_clear_value = 1.0f;
+        prosper::test::BackendDraw s = r; s.ps = &standard_z;
+        std::vector<uint8_t> strict =
+            prosper::test::render_draws_rgba({s}, W, H, nullptr, nullptr, true);
+        const uint8_t* sc = center(strict);
+        CHECK(sc && sc[1] < 0x80, "standard-Z EQUAL remains exact");
     }
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
