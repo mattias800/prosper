@@ -309,7 +309,8 @@ uint64_t dcc_metadata_footprint(const ShaderResource& r) {
         bc_block_bytes(r.format))
         return 0;
     uint32_t bytes_per_texel = data_format_bytes(r.format) * (r.num_components ? r.num_components : 1u);
-    if (!bytes_per_texel && r.format == DataFormat::Unorm2_10_10_10)
+    if (!bytes_per_texel &&
+        (r.format == DataFormat::Float10_11_11 || r.format == DataFormat::Unorm2_10_10_10))
         bytes_per_texel = 4;
     const uint32_t layers = r.img_dim == 3u ? 6u : (r.img_dim == 2u ? std::max(r.depth, 1u) : 1u);
     return gfx10_dcc_metadata_bytes(r.width, r.height, layers, r.tile_mode,
