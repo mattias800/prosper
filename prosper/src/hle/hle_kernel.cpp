@@ -1079,7 +1079,8 @@ HLE(k_ef_wait)    { // (ef, pattern, waitMode, resultPat*, SceKernelUseconds* ti
         timespec dl = abs_deadline_us(usec);
         int rc = 0;
         while (!evf_match(e->bits, a1, (uint32_t)a2) && rc != ETIMEDOUT && !e->deleted)
-            rc = interruptible_cond_timedwait(&e->c, &e->m, &dl);
+            rc = interruptible_cond_timedwait(&e->c, &e->m, &dl,
+                                              GuestWaitKind::EventFlag, (uintptr_t)e);
         timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
         int64_t spent_i = (int64_t)(t1.tv_sec - t0.tv_sec) * 1000000
                         + ((int64_t)t1.tv_nsec - (int64_t)t0.tv_nsec) / 1000;
@@ -1087,7 +1088,8 @@ HLE(k_ef_wait)    { // (ef, pattern, waitMode, resultPat*, SceKernelUseconds* ti
         *(uint32_t*)(uintptr_t)a4 = spent >= usec ? 0u : (uint32_t)(usec - spent);
         if (!e->deleted && !evf_match(e->bits, a1, (uint32_t)a2)) ret = 0x8002003Cull;  // ETIMEDOUT
     } else {
-        while (!evf_match(e->bits, a1, (uint32_t)a2) && !e->deleted) interruptible_cond_wait(&e->c, &e->m);
+        while (!evf_match(e->bits, a1, (uint32_t)a2) && !e->deleted)
+            interruptible_cond_wait(&e->c, &e->m, GuestWaitKind::EventFlag, (uintptr_t)e);
     }
     bool deleted = e->deleted;                     // deleted under us -> EACCES (Kyty EventFlag.cpp)
     if (deleted) ret = 0x8002000Dull;
@@ -1155,7 +1157,8 @@ HLE(k_sema_wait)   { // (sema, need, SceKernelUseconds* timeout) — timeout hon
         timespec dl = abs_deadline_us(usec);
         int rc = 0;
         while (s->count < need && rc != ETIMEDOUT && !s->deleted)
-            rc = interruptible_cond_timedwait(&s->c, &s->m, &dl);
+            rc = interruptible_cond_timedwait(&s->c, &s->m, &dl,
+                                              GuestWaitKind::Semaphore, (uintptr_t)s);
         timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
         int64_t spent_i = (int64_t)(t1.tv_sec - t0.tv_sec) * 1000000
                         + ((int64_t)t1.tv_nsec - (int64_t)t0.tv_nsec) / 1000;
@@ -1163,7 +1166,8 @@ HLE(k_sema_wait)   { // (sema, need, SceKernelUseconds* timeout) — timeout hon
         *(uint32_t*)(uintptr_t)a2 = spent >= usec ? 0u : (uint32_t)(usec - spent);
         if (!s->deleted && s->count < need) ret = 0x8002003Cull;    // KERNEL_ERROR_ETIMEDOUT
     } else {
-        while (s->count < need && !s->deleted) interruptible_cond_wait(&s->c, &s->m);
+        while (s->count < need && !s->deleted)
+            interruptible_cond_wait(&s->c, &s->m, GuestWaitKind::Semaphore, (uintptr_t)s);
     }
     bool deleted = s->deleted;                       // deleted under us -> EACCES
     if (deleted) ret = 0x8002000Dull;
@@ -2010,6 +2014,8 @@ void dump_guest_thread_trace(const char* path, uint64_t pthread_filter) {
         if (snapshot_guest_wait(native_id, wait)) {
             const char* kind = wait.kind == GuestWaitKind::Address ? "address" :
                                wait.kind == GuestWaitKind::ConditionSequence ? "condition" :
+                               wait.kind == GuestWaitKind::EventFlag ? "event-flag" :
+                               wait.kind == GuestWaitKind::Semaphore ? "semaphore" :
                                "unknown";
             if (wait.source)
                 std::snprintf(wait_description, sizeof(wait_description),

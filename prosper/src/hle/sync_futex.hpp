@@ -10,7 +10,7 @@
 
 namespace prosper {
 
-enum class GuestWaitKind : uint32_t { None, Address, ConditionSequence };
+enum class GuestWaitKind : uint32_t { None, Address, ConditionSequence, EventFlag, Semaphore };
 struct GuestWaitSnapshot {
     GuestWaitKind kind = GuestWaitKind::None;
     uintptr_t object = 0;
@@ -25,9 +25,13 @@ void futex_wait_exit(WaitRegistration registration);
 
 // Register pthread condition waits that may need interruption for asynchronous guest exception
 // delivery on Windows. Other hosts call pthread directly through these wrappers.
-int interruptible_cond_wait(pthread_cond_t* cond, pthread_mutex_t* mutex);
+int interruptible_cond_wait(pthread_cond_t* cond, pthread_mutex_t* mutex,
+                            GuestWaitKind kind = GuestWaitKind::ConditionSequence,
+                            uintptr_t source = 0);
 int interruptible_cond_timedwait(pthread_cond_t* cond, pthread_mutex_t* mutex,
-                                 const timespec* deadline);
+                                 const timespec* deadline,
+                                 GuestWaitKind kind = GuestWaitKind::ConditionSequence,
+                                 uintptr_t source = 0);
 int interruptible_cond_signal(pthread_cond_t* cond);
 int interruptible_cond_broadcast(pthread_cond_t* cond);
 int interruptible_mutex_lock(pthread_mutex_t* mutex);

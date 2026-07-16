@@ -27,6 +27,7 @@ struct WaitSlot {
     std::atomic<uint64_t> pthread_id{0};
     std::atomic<uint64_t> windows_tid{0};
     std::atomic<uintptr_t> object{0};
+    std::atomic<uintptr_t> source{0};
     std::atomic<GuestWaitKind> kind{GuestWaitKind::None};
 };
 // SuspendThread can stop a target at any instruction. A mutex-protected registry can therefore
@@ -52,7 +53,7 @@ CondSlot* cond_slot_for(pthread_cond_t* cond) {
     return nullptr;
 }
 
-WaitSlot* register_wait(GuestWaitKind kind, uintptr_t object) {
+WaitSlot* register_wait(GuestWaitKind kind, uintptr_t object, uintptr_t source = 0) {
     const uint64_t windows_tid = GetCurrentThreadId();
     for (WaitSlot& slot : g_wait_slots) {
         uint64_t owner = 0;
@@ -64,6 +65,7 @@ WaitSlot* register_wait(GuestWaitKind kind, uintptr_t object) {
         // not erase the interrupted outer wait when it returns. pthread_id is the publication field;
         // readers that acquire it see the complete kind/object pair for this ownership generation.
         slot.object.store(object, std::memory_order_relaxed);
+        slot.source.store(source, std::memory_order_relaxed);
         slot.kind.store(kind, std::memory_order_relaxed);
         slot.windows_tid.store(windows_tid, std::memory_order_relaxed);
         slot.pthread_id.store((uint64_t)pthread_self(), std::memory_order_release);
@@ -85,7 +87,8 @@ void unregister_wait(WaitSlot* slot) {
 
 WaitRegistration futex_wait_enter(uint64_t addr) {
 #ifdef _WIN32
-    WaitSlot* registration = register_wait(GuestWaitKind::Address, (uintptr_t)addr);
+    WaitSlot* registration = register_wait(GuestWaitKind::Address, (uintptr_t)addr,
+                                           (uintptr_t)addr);
     // Close queue-before-sleep: a GC stop can be published just before this wait is registered.
     // Accept it now rather than blocking forever after the raiser's wake lookup already missed us.
     dispatch_pending_guest_exception();
@@ -111,13 +114,14 @@ void futex_wait_exit(WaitRegistration registration) {
 #endif
 }
 
-int interruptible_cond_wait(pthread_cond_t* cond, pthread_mutex_t* mutex) {
+int interruptible_cond_wait(pthread_cond_t* cond, pthread_mutex_t* mutex,
+                            GuestWaitKind kind, uintptr_t source) {
 #ifdef _WIN32
     CondSlot* slot = cond_slot_for(cond);
     if (!slot) return ENOMEM;
     uint32_t expected = slot->sequence.load(std::memory_order_acquire);
-    WaitSlot* registration = register_wait(GuestWaitKind::ConditionSequence,
-                                           (uintptr_t)&slot->sequence);
+    WaitSlot* registration = register_wait(kind, (uintptr_t)&slot->sequence,
+                                           source ? source : (uintptr_t)cond);
     const int unlock_result = pthread_mutex_unlock(mutex);
     if (unlock_result != 0) {
         unregister_wait(registration);
@@ -129,18 +133,21 @@ int interruptible_cond_wait(pthread_cond_t* cond, pthread_mutex_t* mutex) {
     unregister_wait(registration);
     return interruptible_mutex_lock(mutex);
 #else
+    (void)kind;
+    (void)source;
     return pthread_cond_wait(cond, mutex);
 #endif
 }
 
 int interruptible_cond_timedwait(pthread_cond_t* cond, pthread_mutex_t* mutex,
-                                 const timespec* deadline) {
+                                 const timespec* deadline, GuestWaitKind kind,
+                                 uintptr_t source) {
 #ifdef _WIN32
     CondSlot* slot = cond_slot_for(cond);
     if (!slot) return ENOMEM;
     uint32_t expected = slot->sequence.load(std::memory_order_acquire);
-    WaitSlot* registration = register_wait(GuestWaitKind::ConditionSequence,
-                                           (uintptr_t)&slot->sequence);
+    WaitSlot* registration = register_wait(kind, (uintptr_t)&slot->sequence,
+                                           source ? source : (uintptr_t)cond);
     const int unlock_result = pthread_mutex_unlock(mutex);
     if (unlock_result != 0) {
         unregister_wait(registration);
@@ -166,6 +173,8 @@ int interruptible_cond_timedwait(pthread_cond_t* cond, pthread_mutex_t* mutex,
     if (lock_result != 0) return lock_result;
     return signaled ? 0 : ETIMEDOUT;
 #else
+    (void)kind;
+    (void)source;
     return pthread_cond_timedwait(cond, mutex, deadline);
 #endif
 }
@@ -224,7 +233,8 @@ bool interrupt_guest_wait(uint64_t thread) {
             WakeByAddressAll((PVOID)object);
             interrupted = true;
         }
-        if (kind == GuestWaitKind::ConditionSequence && object) {
+        if ((kind == GuestWaitKind::ConditionSequence || kind == GuestWaitKind::EventFlag ||
+             kind == GuestWaitKind::Semaphore) && object) {
             auto* sequence = reinterpret_cast<std::atomic<uint32_t>*>(object);
             sequence->fetch_add(1, std::memory_order_release);
             WakeByAddressAll((PVOID)object);
@@ -248,13 +258,7 @@ bool snapshot_guest_wait(uint64_t windows_tid, GuestWaitSnapshot& snapshot) {
         if (slot.windows_tid.load(std::memory_order_acquire) != windows_tid) continue;
         snapshot.kind = kind;
         snapshot.object = object;
-        if (kind == GuestWaitKind::ConditionSequence) {
-            for (const CondSlot& cond : g_cond_slots) {
-                if ((uintptr_t)&cond.sequence != object) continue;
-                snapshot.source = cond.cond.load(std::memory_order_acquire);
-                break;
-            }
-        }
+        snapshot.source = slot.source.load(std::memory_order_relaxed);
         return true;
     }
 #else
