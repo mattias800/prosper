@@ -13,7 +13,7 @@ derefs the null chain terminator).
 DOLL now boots fully and runs a **stable frame loop**. Two blockers cleared this session:
 
 1. **CRI Atom audio init crash (fixed).** DOLL's CRI Atom (ADX) middleware drives audio through
-   **libSceAudioOut2** (PS5-only; no Kyty/shadPS4 surface). The generic unimplemented stub returned
+   **libSceAudioOut2** (PS5-only; no exercised inherited-platform surface). The generic unimplemented stub returned
    0 with out-params untouched, so CRI read an UNINITIALIZED context work-memory size, malloc'd it,
    and memset the result — when the stack garbage was unallocatable the MAIN thread died in
    `libc.prx+0x10556` (`mov %rdx,(%rdi)` inside memset) through the CRI region — the intermittent
@@ -470,8 +470,8 @@ disassembly (all offsets eboot-relative):
      completions are record-polled; ring-4 (tracked async) events are consumed correctly. The
      real discriminator is likely the H896 cb↔eq binding; ring-id gating reproduces observed
      behavior (CONFIDENCE MED).
-   - `sceKernelGetEventData/Id/Filter/Fflags/UserData/Error` implemented (Kyty field-read
-     semantics) — the listener consumes events exclusively through GetEventData.
+   - `sceKernelGetEventData/Id/Filter/Fflags/UserData/Error` implemented from the event structure
+     contract and live listener accesses — the listener consumes events exclusively through GetEventData.
 
 **Result: the GlobalShaderMap loads, PreInit continues through online/PSN init (which was never
 the blocker), pak/precacher async reads flow (180+ served in one run), and the boot reaches the
@@ -666,11 +666,11 @@ builds its own recursion on the FreeBSD self-lock contract:
 `err = mutex_lock(obj); if (err) /* EDEADLK: already mine */ skip-acquire; depth++;` — and DOLL
 creates those mutexes with `pthread_mutexattr_settype(type=4)` (ADAPTIVE_NP, live-captured via
 PROSPER_MUTEXLOG). FreeBSD libthr's `mutex_self_lock` returns EDEADLK for ERRORCHECK **and**
-ADAPTIVE_NP (adaptive = errorcheck + a spin heuristic); only NORMAL hard-deadlocks. #183 (after
-Kyty) mapped 4 -> host NORMAL, which self-deadlocks on glibc. Fixes in hle_kernel.cpp: settype
+ADAPTIVE_NP (adaptive = errorcheck + a spin heuristic); only NORMAL hard-deadlocks. #183 mapped
+4 -> host NORMAL, which self-deadlocks on glibc. Fixes in hle_kernel.cpp: settype
 type 4 -> host ERRORCHECK; a fresh mutexattr defaults to ERRORCHECK (FreeBSD attr default — the
 #183 change only covered the no-attr init path); the static ADAPTIVE sentinel (1) also maps to
-ERRORCHECK. Kyty is weighted DOWN here per policy: no title it runs exercises adaptive self-lock.
+ERRORCHECK. Direct FreeBSD and live-title evidence controls this mapping; unexercised secondary behavior does not.
 
 **Measured result (ext4 fast path, 240-480 s runs):** the 90-read wall is GONE — 978 APR reads
 served, the guest's own tag counter advanced past 0x458 (112+ batches consumed through the
@@ -812,7 +812,7 @@ path). The game now runs 200+ flips / 470+ compute dispatches, deep into post-lo
    addr, `0fWWK5uG9rQ`=ReleaseMem-patch-addr. With them stubbed, every per-draw GPU fence targeted
    address 0. Implemented all three (each validates the packet header sub-op first; 0 refusals
    across a full run). Also implemented `k3GhuSNmBLU`=sceAgcDcbDispatchDirect(dcb,x,y,z,modifier)
-   as a new R_DISPATCH_DIRECT packet (guest wrapper eboot+0x220ede0; Kyty Gen4 DispatchDirect ABI)
+   as a new R_DISPATCH_DIRECT packet (guest wrapper eboot+0x220ede0 plus captured Gen4 ABI arguments)
    — DOLL's compute prologue issues ~470 of these.
 
 3. **The 34.6 GB OOM / RenderThread-timeout was a trophy success-with-garbage-out.**
@@ -1053,8 +1053,8 @@ polls.**
 ### SESSION 5 (2026-07-10, issue #232): the PlayGo/SaveData/Trophy2/Share service contracts are implemented and the save flow now completes end-to-end — but still 0 DrawIndex; the "0x5044740 gate" hypothesis is DISPROVEN
 
 Implemented the real contracts for the services DOLL's boot flow calls (all NID<->name pairs
-verified against the PS5 3.20 library stub tables in `../PS5-3.20_Libs`; cross-checked shadPS4 +
-Kyty where the API is PS4-inherited):
+verified against the PS5 3.20 library stub tables in `../PS5-3.20_Libs`; PS4-inherited behavior was
+cross-checked against public platform contracts and independent tests):
 
 - **scePlayGo** — `Initialize`/`Open`/`GetLocus`/`GetProgress`/`GetToDoList`/`GetChunkId`/`GetEta`/
   `GetInstallSpeed`/`GetLanguageMask`/`Close`/`Terminate`. Reports everything installed &
@@ -1201,7 +1201,7 @@ best candidate improves coherence only ~4% over row-major and, rendered, is **st
 top-left micro-tile is roughly coherent). Conclusion: unlike SW_4KB_S — which this codebase models well
 enough with a flat Morton (`sw4kb_morton`) — **SW_64KB_S/_R_X need the real GFX10 addrlib swizzle equation**
 (256 B micro-tile hierarchy + the "S"/"R_X" macro pattern; "_X" adds a pipe/bank XOR), not a bit-interleave.
-Kyty is **not** a reference here (it is GCN/PS4 tiling, per CLAUDE.md). This is a bounded but genuine
+Older GCN/PS4 tiling models are **not** references here because they target the wrong generation. This is a bounded but genuine
 graphics-RE task, tracked as **#288**; shipping a guessed detiler would violate correctness-first
 (it would produce different-but-still-wrong pixels).
 

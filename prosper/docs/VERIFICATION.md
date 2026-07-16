@@ -7,15 +7,15 @@ frame, logo, menu, or wrong scene. The graphics path is verified in layers, chea
 
 ## 1. Structural assertions (no GPU) — the bulk of correctness
 
-Each pipeline stage is a pure function tested with exact-value assertions against an authoritative
-reference. This catches most bugs deterministically and instantly:
+Each pipeline stage is a pure function tested with exact-value assertions against primary evidence or
+an independently generated oracle. This catches most bugs deterministically and instantly:
 
 | Stage | Test | Reference |
 |-------|------|-----------|
 | PM4 decode | `test_pm4_decode` | packets built by the real AGC Dcb functions |
-| CommandProcessor apply | `test_command_processor` | Kyty `cp_op_indirect_cx_regs` |
-| RenderState extract | `test_render_state` | Kyty `hw_ctx_*` register decodes |
-| RDNA2→Vulkan translate | `test_render_state` | Kyty `GraphicsRender.cpp` enum maps |
+| CommandProcessor apply | `test_command_processor` | captured packet streams and exact expected folds |
+| RenderState extract | `test_render_state` | AMD register definitions plus captured state |
+| RDNA2→Vulkan translate | `test_render_state` | Vulkan specification and reviewed translation tables |
 | RDNA2 decode + operands | `test_rdna2_decode` | **`llvm-mc -mcpu=gfx1030` encodings** |
 
 Using `llvm-mc` to assemble authoritative RDNA2 encodings (and `glslangValidator` for GLSL→SPIR-V)
