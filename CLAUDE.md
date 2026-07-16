@@ -348,18 +348,28 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
     complete current-head verdict. A changed head/base repository or ref also invalidates approval. If the base
     tip moves, the reviewer must inspect the new base delta and prospective integration, re-run affected checks,
     and approve the new identities, SHAs, and integration tree.
-  - The final merge must atomically preserve the reviewed integration. Prefer a repository merge queue/ruleset
-    that verifies the exact approved inputs and integration. Without one, create a merge commit whose first
-    parent is the approved base SHA, second parent is the approved head SHA, and tree is the approved integration
-    tree; verify all three locally. Update the exact target ref with an explicit expected-old-OID lease/CAS on the
-    approved base SHA (for example,
-    `git push --force-with-lease=<base-ref>:<base-SHA> origin <merge-commit>:<base-ref>`). The merge object fixes
-    the reviewed head immutably, while the lease makes the base update atomic. If the target ref moved, the push
-    must fail: never override/retry the lease or fall back to a plain merge. Fetch the new base and obtain a new
-    integration review. A normal `gh pr merge` head-only guard is not sufficient for this multi-agent repository.
+  - The final merge must atomically preserve every reviewed input. Prefer a repository merge queue/ruleset that
+    verifies the exact approved head, target, base, and integration. Otherwise, only a same-repository PR may use
+    the direct-push fallback below; cross-repository PRs stop for a capable server-side mechanism or maintainer
+    direction. Once exact approval and separate merge authorization both exist, post the complete approved tuple
+    as a `MERGE TRANSACTION` PR comment. That freezes the approved target for this transaction: agents must not
+    push/retarget it, a later PR UI retarget cannot redirect the hard-coded destination, and only an explicit
+    maintainer cancellation revokes the authorized transaction. Abort if a head/target change is observed before
+    the push; any new proposal needs its own review.
+  - For the same-repository fallback, create a merge commit whose first parent is the approved base SHA, second
+    parent is the approved head SHA, and tree is the approved integration tree; verify all three locally. In one
+    server-side atomic push, advance both the exact target ref and exact PR head ref to that merge commit with
+    explicit expected-old-OID leases for the approved base and head, for example:
+    `git push --atomic --force-with-lease=<base-ref>:<base-SHA> --force-with-lease=<head-ref>:<head-SHA> origin`
+    `<merge-commit>:<base-ref> <merge-commit>:<head-ref>`. The merge object fixes the reviewed content and target;
+    the two leases make concurrent base or head movement reject the entire transaction. The head's atomic advance
+    to the approved merge commit is part of the merge and does not invalidate approval. If either lease fails or
+    the server cannot perform the atomic push, never override/retry it or fall back to a plain merge: fetch the
+    live state and obtain a new review or maintainer direction. A normal `gh pr merge` head-only guard is not
+    sufficient for this multi-agent repository.
   - Never merge with an unresolved correctness finding; an applicable required check that is absent, pending,
     or unsuccessful; an unrecorded/overbroad verification exception; approval for different repository/ref/SHA
-    identities or integration tree; or a merge mechanism that cannot atomically preserve the approved base.
+    identities or integration tree; or a merge mechanism that cannot atomically preserve all approved inputs.
     Reviewer approval satisfies the quality gate but is not permission to merge: the agent may merge only when
     the user/task separately authorizes it.
 
