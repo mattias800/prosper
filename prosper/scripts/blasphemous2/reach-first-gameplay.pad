@@ -86,26 +86,45 @@
 256-257:circle
 260-261:triangle
 
-# Leave the awakening room, then acknowledge the Down and Down+Cross movement prompts.
-265-285:right
-288-300:down
-303-315:down+cross
+# Full-render startup speed varies enough that the flask/help prompts can become
+# ready after the earlier acknowledgements. Keep alternating close/action holds
+# until 302 seconds; extra Circle/Triangle presses are harmless once gameplay is
+# active, while a late edge prevents the route from remaining at the coffin.
+265-267:circle
+270-272:triangle
+275-277:circle
+280-282:triangle
+285-287:circle
+290-292:triangle
+295-297:circle
+300-302:triangle
 
-# Continue moving and jump periodically so captures prove that gameplay advances.
-318-449:right
-321-324:cross
-329-332:cross
-337-340:cross
-345-348:cross
-353-356:cross
-361-364:cross
-369-372:cross
-377-380:cross
-385-388:cross
-393-396:cross
-401-404:cross
-409-412:cross
-417-420:cross
-425-428:cross
-433-436:cross
-441-444:cross
+# Leave the awakening room, then acknowledge the Down and Down+Cross movement
+# prompts after the late tutorial fallback has completed.
+305-335:right
+338-350:down
+353-365:down+cross
+
+# Continue moving and jump periodically so the later evidence window proves
+# that gameplay advances rather than preserving a rich static room.
+368-529:right
+371-374:cross
+379-382:cross
+387-390:cross
+395-398:cross
+403-406:cross
+411-414:cross
+419-422:cross
+427-430:cross
+435-438:cross
+443-446:cross
+451-454:cross
+459-462:cross
+467-470:cross
+475-478:cross
+483-486:cross
+491-494:cross
+499-502:cross
+507-510:cross
+515-518:cross
+523-526:cross

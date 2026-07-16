@@ -23,3 +23,20 @@
 136:up
 138:cross
 140:cross
+
+# A cold full-render process can spend more than 50 seconds without polling the
+# pad and miss most of the early name-entry sequence. Repeat only Up and Cross
+# late: they complete any remaining name/menu prompts, advance level dialogue,
+# and are harmless navigation/jump inputs after gameplay has already begun.
+200-202:up
+204-206:cross
+208-210:cross
+214-216:up
+218-220:cross
+222-224:cross
+228-230:up
+232-234:cross
+236-238:cross
+242-244:up
+246-248:cross
+250-252:cross
