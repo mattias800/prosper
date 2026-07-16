@@ -9,6 +9,7 @@
 #include "platform_ui.hpp"
 #include "video_backend.hpp"   // sceAvPlayer -> host hardware-decode backend (#705)
 #include "../host/posix_shim.hpp"   // Darwin process_vm_readv shim + asm portability
+#include <cinttypes>
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
@@ -80,7 +81,7 @@ void svc_log(const char* fn, uint64_t a0, uint64_t a1, uint64_t a2,
         words = (int)svc_copy_words(args[i], q, (size_t)words);
         if (!words) continue;
         fprintf(stderr, "[svc]   a%d ->", i);
-        for (int w = 0; w < words; w++) fprintf(stderr, " %016lx", (unsigned long)q[w]);
+        for (int w = 0; w < words; w++) fprintf(stderr, " %016" PRIx64, q[w]);
         fprintf(stderr, "\n");
     }
 }
