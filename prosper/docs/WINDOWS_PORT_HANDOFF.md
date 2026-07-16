@@ -224,9 +224,11 @@ See `FRONTEND_APP.md` for the invalidation requirement.
 
 Diagnostics (env, all off by default): `PROSPER_GFXLOG` (`[gfx]`/`[agc]` PM4 decode + the `NOT satisfied`
 fence log), `PROSPER_EVLOG` (`[ev]` equeue/flip/EOP), `PROSPER_SYNCLOG` (`[sync]` WaitOnAddress/Wake with
-tid + validated guest caller, `[sync2]` cond/sema/EventFlag), `PROSPER_EXCLOG` (GC exception
+native thread id + validated guest caller, `[sync2]` cond/sema/EventFlag), `PROSPER_EXCLOG` (GC exception
 raise/deliver/resume), `PROSPER_MEMLOG`, `PROSPER_VEHLOG`, and boot_trace `[memclass]`. Compare with a
-known-good Linux capture when separating cross-platform frontend faults from shared renderer faults.
+known-good Linux capture when separating cross-platform frontend faults from shared renderer faults. For a
+long boot, `PROSPER_SYNCLOG_DELAY_MS=N` suppresses the high-volume `[sync2]` stream until N milliseconds
+after the first synchronization call, retaining normal progression before the suspected boundary.
 
 ## Gotchas learned (so the next agent doesn't relearn them)
 

@@ -32,6 +32,7 @@
 #include <atomic>
 #include <array>
 #include <condition_variable>
+#include <chrono>
 #include <new>
 #ifdef _WIN32
 #include <windows.h>   // GetCurrentThreadStackLimits/GetCurrentThreadId for the guest-thread trampoline
@@ -47,7 +48,18 @@
 #endif
 
 namespace prosper {
-namespace { bool sclog() { static int v = getenv("PROSPER_SYNCLOG") ? 1 : 0; return v; }
+namespace {
+    bool sclog() {
+        static const bool enabled = getenv("PROSPER_SYNCLOG") != nullptr;
+        if (!enabled) return false;
+        static const uint64_t delay_ms = [] {
+            const char* value = getenv("PROSPER_SYNCLOG_DELAY_MS");
+            return value ? strtoull(value, nullptr, 10) : 0ull;
+        }();
+        if (!delay_ms) return true;
+        static const auto start = std::chrono::steady_clock::now();
+        return std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(delay_ms);
+    }
     long sctid() {
 #if defined(__linux__) || defined(__APPLE__)
         return (long)prosper_gettid();
