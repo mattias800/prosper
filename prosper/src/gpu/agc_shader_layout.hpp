@@ -122,6 +122,9 @@ struct DecodedImageDescriptor {
     uint32_t width = 0, height = 0, depth = 1;
     uint32_t format = 0;      // Gen5 surface-format enum (fields[1] bits 20..28)
     uint32_t tile_mode = 0;   // 0 = linear
+    uint8_t  base_level = 0;  // WORD3[15:12]
+    uint8_t  last_level = 0;  // WORD3[19:16]
+    uint8_t  max_mip = 0;     // WORD5[7:4], total allocation's final mip level
     uint8_t  type = 0;        // SQ_RSRC_IMG dim (GFX10: 8=1D, 9=2D, 10=3D, 11=CUBE, 12=1D_ARRAY, 13=2D_ARRAY).
                               // NB: 9 = plain 2D (already handled); 2D_ARRAY is 13 — the decode code in
                               // agc_shader_layout.cpp / gpu_executor.cpp uses these correct values (#378).
@@ -158,6 +161,22 @@ struct Gen5ImageFormatInfo {
                                // UNORM8 upload path can't carry signed samples, so callers keep
                                // skipping these (the UNORM decode would be numerically wrong).
 };
+
+// The single mip level Prosper uploads for a T# view. GFX10 descriptor BASE_ADDRESS names the
+// entire allocation, whose mip-tail-first layout can put BASE_LEVEL at a non-zero byte offset.
+struct DecodedImageView {
+    uint64_t base = 0;
+    uint32_t width = 0, height = 0;
+    size_t mip_offset = 0;
+    // False when BASE_LEVEL selects a mip whose layout this helper cannot prove. Callers must reject
+    // the binding instead of silently sampling the allocation's base level with the wrong dimensions.
+    bool supported = true;
+};
+DecodedImageView image_base_level_view(const DecodedImageDescriptor& descriptor,
+                                       const Gen5ImageFormatInfo& format);
+// Emit one diagnostic per unsupported layout signature. Callers use this immediately before
+// rejecting the binding; deduplication keeps per-draw resource rebuilds from flooding stderr.
+void warn_unsupported_image_view(const DecodedImageDescriptor& descriptor);
 // Map a T#'s 9-bit Gen5 IMG_FMT value to format info. Returns false (out left Unknown/zero) for
 // values not in the table — callers must not assume RGBA8 for those (#65). Pure; exposed for testing.
 bool gen5_image_format(uint32_t fmt, Gen5ImageFormatInfo* out);

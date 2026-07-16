@@ -27,6 +27,8 @@ Each instruction row includes its dword PC, encoded length, format/opcode, exact
 operands, and, for SOPP branches, the signed immediate and resolved target PC. The header also prints
 the stage-agnostic `recompile_coverage` result. That coverage is intentionally compute-safe; a VCC
 control-flow shape may remain listed there even when the vertex/fragment structurizer accepts it.
+When a shader contains the fully proven bounded scalar `s_setpc_b64` jump-table idiom, the header also
+prints its constant-buffer selector, adjustment/clamp, complete target list, merge PC, and owning span.
 
 The input is bounded to 16 MiB and decoding stops at the first `s_endpgm` or unknown instruction.
 Raw and SPIR-V dumps contain title-derived code, are local-only, and must not be committed.

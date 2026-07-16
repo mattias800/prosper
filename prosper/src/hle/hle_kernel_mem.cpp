@@ -2116,7 +2116,13 @@ HLE(k_wait_on_address) {
             wait_ms = (DWORD)(deadline - now);
         }
         uint32_t cmp = expected;
-        if (!WaitOnAddress(wa, &cmp, sizeof(cmp), wait_ms) && GetLastError() == ERROR_TIMEOUT) {
+        const bool woke = WaitOnAddress(wa, &cmp, sizeof(cmp), wait_ms) != FALSE;
+        const DWORD wait_error = woke ? ERROR_SUCCESS : GetLastError();
+        // A cooperative guest exception wakes this address without first changing the futex word.
+        // Accept the queued handler at the native-wait boundary before re-checking the predicate;
+        // otherwise the thread immediately parks again and can never run the handler that releases it.
+        dispatch_pending_guest_exception();
+        if (!woke && wait_error == ERROR_TIMEOUT) {
             if (*wa == expected) {
                 if (wsynclog()) fprintf(stderr, "[sync] WAIT.exit  addr=0x%llx TIMEOUT\n", (unsigned long long)a0);
                 return 0x80020060ull;

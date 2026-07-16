@@ -231,6 +231,30 @@ int main() {
     CHECK(g.total == 1 && g.alu == 1 && g.unsupported == 0,
           "#527: v_cvt_off_f32_i4 is covered by the VOP1 recompiler");
 
+    // A wave-empty saveexec/execz guard may surround a scalar counted loop when the body preserves
+    // both EXEC and the guard's saved mask. This is the Evergate color-conversion shape.
+    const uint32_t guarded_counted_loop[] = {
+        0xBE84247Eu, 0xBF880009u,                         // save EXEC in s[4:5]; skip to restore if empty
+        0xB0020005u, 0xBE800380u, 0x7E020280u,           // limit=5, i=0, sum=0
+        0xBF0A0200u, 0xBF840003u, 0x4A020200u,           // loop compare/exit; sum += i
+        0x81008100u, 0xBF82FFFBu,                        // i++; backedge
+        0x7E000D01u, 0xBEFE0404u, 0xBF810000u,           // convert sum; restore EXEC; end
+    };
+    CHECK(!recompile_valu(guarded_counted_loop, std::size(guarded_counted_loop), 0, 0).empty(),
+          "guarded counted loop is accepted when EXEC and the saved guard mask are preserved");
+
+    const uint32_t guarded_counted_loop_inner_save[] = {
+        0xBE84247Eu, 0xBF88000Au,
+        0xB0020005u, 0xBE800380u, 0x7E020280u,
+        0xBF0A0200u, 0xBF840004u,
+        0xBE86247Eu,                                     // inner saveexec mutates EXEC every iteration
+        0x4A020200u, 0x81008100u, 0xBF82FFFAu,
+        0x7E000D01u, 0xBEFE0404u, 0xBF810000u,
+    };
+    CHECK(recompile_valu(guarded_counted_loop_inner_save,
+                         std::size(guarded_counted_loop_inner_save), 0, 0).empty(),
+          "guarded counted loop rejects an uncarried inner EXEC mutation");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

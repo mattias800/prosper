@@ -57,6 +57,14 @@ void detile_elements(uint8_t* dst, const uint8_t* src, size_t src_bytes,
 // must read at least this many bytes of tiled source before detiling.
 size_t tiled_elements_bytes(uint32_t ew, uint32_t eh, uint32_t bpe, uint32_t tile_mode);
 
+// Byte offset of a non-tail mip level inside a GFX10 thin-2D tiled mip chain. GFX10 places the
+// shared mip-tail block first, then lays the remaining levels out from smallest to largest; mip 0
+// is therefore NOT at descriptor BASE_ADDRESS when MAX_MIP is non-zero. `ew`/`eh` are element-grid
+// dimensions (texels for plain formats, compressed blocks for BCn). Returns zero for linear,
+// single-level, invalid, or mip-tail levels (tail extraction needs an in-block coordinate).
+size_t tiled_mip_level_offset(uint32_t ew, uint32_t eh, uint32_t bpe, uint32_t tile_mode,
+                              uint32_t max_mip, uint32_t mip_level);
+
 // GFX10 volume layout. PS5's observed 3D surfaces use SW_64KB_R_X (mode 27), which AddrLib defines
 // as a thin/view-as-2D volume: each Z slice owns a padded grid of 2D 64KB blocks, but Z still
 // participates in the pipe-XOR bits inside every block. These helpers return false/zero for tiled

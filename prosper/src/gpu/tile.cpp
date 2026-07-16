@@ -534,6 +534,59 @@ size_t tiled_elements_bytes(uint32_t ew, uint32_t eh, uint32_t bpe, uint32_t til
     return sw4kb_tiled_bytes(ew, eh, /*pitch*/0, bpe);
 }
 
+size_t tiled_mip_level_offset(uint32_t ew, uint32_t eh, uint32_t bpe, uint32_t tile_mode,
+                              uint32_t max_mip, uint32_t mip_level) {
+    if (!tile_mode_is_tiled(tile_mode) || !ew || !eh || !bpe || !max_mip ||
+        mip_level > max_mip || max_mip >= 16)
+        return 0;
+
+    uint32_t block_width = 0, block_height = 0, block_log2 = 0;
+    if (is_64kb_mode(tile_mode)) {
+        const uint32_t elem_log2 = sw64kb_elem_log2(bpe);
+        if (elem_log2 == UINT32_MAX) return 0;
+        sw64kb_dims(elem_log2, block_width, block_height);
+        block_log2 = 16;
+    } else {
+        uint32_t bx = 0, by = 0;
+        sw4kb_dims(bpe, bx, by);
+        block_width = 1u << bx;
+        block_height = 1u << by;
+        block_log2 = 12;
+    }
+
+    const uint32_t num_levels = max_mip + 1;
+    const uint32_t tail_width = block_width >> 1;   // AddrLib GetMipTailDim, thin GFX10 resource
+    const uint32_t tail_height = block_height;
+    const uint32_t max_tail_levels = block_log2 <= 11
+        ? 1u + (1u << (block_log2 - 9u)) : block_log2 - 4u;
+    uint32_t first_tail = num_levels;
+    for (uint32_t level = 0; level < num_levels; ++level) {
+        const uint32_t width = std::max(ew >> level, 1u);
+        const uint32_t height = std::max(eh >> level, 1u);
+        if (width <= tail_width && height <= tail_height &&
+            num_levels - level <= max_tail_levels) {
+            first_tail = level;
+            break;
+        }
+    }
+    if (mip_level >= first_tail) return 0;          // packed inside the shared tail block
+
+    const size_t block_bytes = size_t{1} << block_log2;
+    size_t offset = first_tail == num_levels ? 0 : block_bytes;
+    for (int level = static_cast<int>(first_tail) - 1; level >= 0; --level) {
+        if (static_cast<uint32_t>(level) == mip_level) return offset;
+        const uint32_t width = std::max(ew >> level, 1u);
+        const uint32_t height = std::max(eh >> level, 1u);
+        const uint32_t pitch = (width + block_width - 1) / block_width * block_width;
+        const uint32_t padded_height =
+            (height + block_height - 1) / block_height * block_height;
+        const size_t level_bytes = static_cast<size_t>(pitch) * padded_height * bpe;
+        if (offset > SIZE_MAX - level_bytes) return 0;
+        offset += level_bytes;
+    }
+    return 0;
+}
+
 void detile_elements(uint8_t* dst, const uint8_t* src, size_t src_bytes,
                      uint32_t ew, uint32_t eh, uint32_t bpe, uint32_t tile_mode) {
     if (!tile_mode_is_tiled(tile_mode) || bpe == 0) {

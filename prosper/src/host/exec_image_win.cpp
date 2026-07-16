@@ -9,7 +9,8 @@
 // STATUS (2026-07-14): runtime-verified through repeated GC cycles and the native live Vulkan
 // renderer. Remaining work is tracked in docs/PORTING.md "Windows", including physical-memory
 // alias fidelity, float/XMM import arguments, and deeper frontend/gameplay validation. Diagnostics
-// that depend on Linux perf_event / ptrace (PROSPER_HWBP/HWWATCH/BP/PEEK/DUMPAT) remain absent.
+// that depend on Linux perf_event / ptrace (PROSPER_HWBP/HWWATCH/PEEK/DUMPAT) remain absent. A small
+// one-shot int3 logger (`PROSPER_WIN_BP=off[,off...]`) is available for native branch-order probes.
 #ifdef _WIN32
 
 #ifndef _WIN32_WINNT
@@ -117,6 +118,16 @@ namespace {
     uint64_t g_rax=0,g_rbx=0,g_rcx=0,g_rdx=0,g_rsi=0,g_rdi=0,g_rbp=0,g_rsp=0;
     uint64_t g_r8=0,g_r9=0,g_r10=0,g_r11=0,g_r12=0,g_r13=0,g_r14=0,g_r15=0;
 
+    struct WinDiagBreakpoint {
+        uint64_t addr = 0;
+        uint8_t original = 0;
+        volatile LONG armed = 0;
+    };
+    WinDiagBreakpoint g_diag_bps[16];
+    size_t g_diag_bp_count = 0;
+    bool g_diag_bp_repeat = false;
+    thread_local WinDiagBreakpoint* t_diag_bp_rearm = nullptr;
+
     // Thread-stack registry (portable; mirrors the Linux one) so GC/thread code gets real bounds.
     std::map<uint64_t, std::pair<uint64_t, uint64_t>> g_stacks;
     std::mutex g_smx;
@@ -210,6 +221,33 @@ namespace {
         DWORD ok = PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE
                  | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY;
         return (mbi.Protect & ok) != 0 && !(mbi.Protect & PAGE_GUARD);
+    }
+    void arm_diag_breakpoints() {
+        static bool initialized = false;
+        if (initialized) return;
+        initialized = true;
+        const char* spec = getenv("PROSPER_WIN_BP");
+        if (!spec || !*spec) return;
+        g_diag_bp_repeat = getenv("PROSPER_WIN_BP_REPEAT") != nullptr;
+        const char* p = spec;
+        while (*p && g_diag_bp_count < sizeof(g_diag_bps) / sizeof(g_diag_bps[0])) {
+            char* end = nullptr;
+            uint64_t addr = strtoull(p, &end, 0);
+            if (end == p) break;
+            if (addr < g_base) addr += g_base;  // match Linux PROSPER_BP's eboot-offset convention
+            if (addr_readable(addr)) {
+                WinDiagBreakpoint& bp = g_diag_bps[g_diag_bp_count++];
+                bp.addr = addr;
+                bp.original = *(uint8_t*)(uintptr_t)addr;
+                *(uint8_t*)(uintptr_t)addr = 0xcc;
+                FlushInstructionCache(GetCurrentProcess(), (const void*)(uintptr_t)addr, 1);
+                InterlockedExchange(&bp.armed, 1);
+                fprintf(stderr, "[winbp] armed at eboot+0x%llx\n",
+                        (unsigned long long)(addr - g_base));
+            }
+            p = end;
+            while (*p == ',' || *p == ';' || *p == ' ') ++p;
+        }
     }
     bool addr_executable(uint64_t addr) {
         MEMORY_BASIC_INFORMATION mbi;
@@ -315,6 +353,67 @@ namespace {
     LONG CALLBACK veh(EXCEPTION_POINTERS* ep) {
         CONTEXT* c = ep->ContextRecord;
         DWORD code = ep->ExceptionRecord->ExceptionCode;
+        if (code == EXCEPTION_SINGLE_STEP && t_diag_bp_rearm) {
+            WinDiagBreakpoint* bp = t_diag_bp_rearm;
+            *(uint8_t*)(uintptr_t)bp->addr = 0xcc;
+            FlushInstructionCache(GetCurrentProcess(), (const void*)(uintptr_t)bp->addr, 1);
+            InterlockedExchange(&bp->armed, 1);
+            t_diag_bp_rearm = nullptr;
+            c->EFlags &= ~0x100ull;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        if (code == EXCEPTION_BREAKPOINT) {
+            for (size_t i = 0; i < g_diag_bp_count; ++i) {
+                WinDiagBreakpoint& bp = g_diag_bps[i];
+                if ((c->Rip != bp.addr && c->Rip != bp.addr + 1) ||
+                    InterlockedExchange(&bp.armed, 0) != 1) continue;
+                const uint64_t addr = bp.addr;
+                *(uint8_t*)(uintptr_t)addr = bp.original;
+                FlushInstructionCache(GetCurrentProcess(), (const void*)(uintptr_t)addr, 1);
+                fprintf(stderr, "[winbp] hit eboot+0x%llx tid=%lu rax=%llx rbx=%llx rcx=%llx "
+                                "rdx=%llx rsi=%llx rdi=%llx r8=%llx r9=%llx r12=%llx r13=%llx "
+                                "r14=%llx r15=%llx rbp=%llx rsp=%llx\n",
+                        (unsigned long long)(addr - g_base), (unsigned long)cur_tid(),
+                        (unsigned long long)c->Rax, (unsigned long long)c->Rbx,
+                        (unsigned long long)c->Rcx, (unsigned long long)c->Rdx,
+                        (unsigned long long)c->Rsi, (unsigned long long)c->Rdi,
+                        (unsigned long long)c->R8, (unsigned long long)c->R9,
+                        (unsigned long long)c->R12, (unsigned long long)c->R13,
+                        (unsigned long long)c->R14, (unsigned long long)c->R15,
+                        (unsigned long long)c->Rbp, (unsigned long long)c->Rsp);
+                auto qword = [&](uint64_t p) -> uint64_t {
+                    return p && addr_readable(p) && addr_readable(p + 7)
+                        ? *(const uint64_t*)(uintptr_t)p : 0;
+                };
+                fprintf(stderr, "[winbp] mem [rdx]=%llx [rdx+10]=%llx [r8]=%llx [r9]=%llx "
+                                "[r12]=%llx [r13]=%llx\n",
+                        (unsigned long long)qword(c->Rdx), (unsigned long long)qword(c->Rdx + 0x10),
+                        (unsigned long long)qword(c->R8), (unsigned long long)qword(c->R9),
+                        (unsigned long long)qword(c->R12), (unsigned long long)qword(c->R13));
+                auto ascii = [&](uint64_t p, char out[33]) {
+                    size_t n = 0;
+                    while (n < 32 && addr_readable(p + n)) {
+                        unsigned char ch = *(const unsigned char*)(uintptr_t)(p + n);
+                        if (!ch) break;
+                        if (ch < 0x20 || ch > 0x7e) { n = 0; break; }
+                        out[n++] = (char)ch;
+                    }
+                    out[n] = 0;
+                };
+                char s12[33], s15[33], s9[33], s_node[33];
+                ascii(c->R12, s12); ascii(c->R15, s15); ascii(c->R9, s9);
+                ascii(qword(c->Rdx + 0x10), s_node);
+                fprintf(stderr,
+                        "[winbp] str r12=\"%s\" r15=\"%s\" r9=\"%s\" [rdx+10]=\"%s\"\n",
+                        s12, s15, s9, s_node);
+                if (g_diag_bp_repeat) {
+                    t_diag_bp_rearm = &bp;
+                    c->EFlags |= 0x100ull;
+                }
+                c->Rip = addr;  // replay the restored instruction
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
         if (code == EXCEPTION_ILLEGAL_INSTRUCTION && try_emulate_sse4a(c))
             return EXCEPTION_CONTINUE_EXECUTION;
         // Lazy-commit inside a guest-RESERVED range — parity with the Linux SIGSEGV handler. The guest
@@ -562,6 +661,7 @@ BootResult run_entry(const LoadedImage& img) {
     BootResult r;
     if (!stk) { r.kind = 2; r.detail = "guest stack VirtualAlloc failed"; return r; }
     register_thread_stack(cur_tid(), stk, STK);
+    arm_diag_breakpoints();
     trace_guest_thread_lifecycle(true, (uint64_t)pthread_self(), cur_tid(), stk, STK);
 
     uint64_t top = ((uint64_t)(uintptr_t)stk + STK) & ~(uint64_t)0xf;

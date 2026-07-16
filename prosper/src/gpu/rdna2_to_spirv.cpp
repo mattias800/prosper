@@ -1562,6 +1562,8 @@ bool vopc_is_cmpx(uint32_t opcode) {
 
 bool instruction_may_change_exec(const Rdna2Inst& in) {
     if (in.fmt == Rdna2Format::VOPC && vopc_is_cmpx(in.opcode)) return true;
+    // saveexec writes EXEC implicitly while its explicit destination receives the previous mask.
+    if (in.fmt == Rdna2Format::SOP1 && (in.opcode == 0x24 || in.opcode == 0x25)) return true;
     auto is_exec = [](const Operand& operand) {
         return (operand.kind == OperandKind::SGPR || operand.kind == OperandKind::Special) &&
                (operand.value == 126 || operand.value == 127);
@@ -4240,13 +4242,302 @@ std::unordered_map<uint32_t, std::vector<uint32_t>> detect_pcrel_tables(
     return out;
 }
 
+namespace {
+
+uint32_t scalar_write_width(const Rdna2Inst& in) {
+    switch (in.fmt) {
+        case Rdna2Format::SOP1:
+            if (in.opcode == 0x20) return 0; // s_setpc_b64 reads its decoded "dst" field.
+            return (in.opcode == 0x04 || in.opcode == 0x1f) ? 2u : 1u;
+        case Rdna2Format::SOP2: return in.opcode == 0x29 ? 2u : 1u;
+        case Rdna2Format::SOPK: return 1;
+        case Rdna2Format::SMEM:
+            switch (in.opcode) {
+                case 0x0: case 0x8: return 1;
+                case 0x1: case 0x9: return 2;
+                case 0x2: case 0xa: return 4;
+                case 0x3: case 0xb: return 8;
+                case 0x4: case 0xc: return 16;
+                default: return 0;
+            }
+        case Rdna2Format::VOP1: return in.opcode == 0x02 ? 1u : 0u; // v_readfirstlane
+        default: return 0;
+    }
+}
+
+const Rdna2Inst* last_scalar_writer(const std::vector<Rdna2Inst>& ins, uint32_t before_pc,
+                                    int reg) {
+    const Rdna2Inst* result = nullptr;
+    for (const auto& in : ins) {
+        if (in.is_end || in.pc >= before_pc) break;
+        const uint32_t width = scalar_write_width(in);
+        if (width && reg >= in.dst.value && reg < in.dst.value + static_cast<int>(width)) result = &in;
+    }
+    return result;
+}
+
+bool reg_operand(const Operand& operand, int reg) {
+    return (operand.kind == OperandKind::SGPR || operand.kind == OperandKind::Special) &&
+           operand.value == reg;
+}
+
+bool immediate_operand(const Operand& operand, const Rdna2Inst& in, uint32_t& value) {
+    if (operand.kind == OperandKind::Literal) { value = in.literal; return true; }
+    if (operand.kind == OperandKind::InlineInt) {
+        value = static_cast<uint32_t>(operand.value);
+        return true;
+    }
+    return false;
+}
+
+bool binary_reg_immediate(const Rdna2Inst& in, int reg, uint32_t& immediate) {
+    return (reg_operand(in.src[0], reg) && immediate_operand(in.src[1], in, immediate)) ||
+           (reg_operand(in.src[1], reg) && immediate_operand(in.src[0], in, immediate));
+}
+
+bool ordered_reg_immediate(const Rdna2Inst& in, int reg, uint32_t& immediate) {
+    return reg_operand(in.src[0], reg) && immediate_operand(in.src[1], in, immediate);
+}
+
+bool binary_regs(const Rdna2Inst& in, int a, int b) {
+    return (reg_operand(in.src[0], a) && reg_operand(in.src[1], b)) ||
+           (reg_operand(in.src[0], b) && reg_operand(in.src[1], a));
+}
+
+uint32_t scalar_branch_target(const Rdna2Inst& in) {
+    return in.pc + in.len_dwords + static_cast<uint32_t>(in.simm16);
+}
+
+PcrelDispatchInfo detect_pcrel_dispatch(const std::vector<Rdna2Inst>& ins,
+                                        const uint32_t* code, size_t dwords,
+                                        size_t program_dwords) {
+    PcrelDispatchInfo out;
+    if (!code || ins.empty()) return out;
+
+    std::unordered_set<uint32_t> instruction_pcs;
+    std::vector<uint32_t> branch_targets;
+    for (const auto& in : ins) {
+        instruction_pcs.insert(in.pc);
+        if (in.is_end) continue;
+        if (in.fmt == Rdna2Format::SOPP && in.opcode >= 0x02 && in.opcode <= 0x09 &&
+            in.opcode != 0x03)
+            branch_targets.push_back(scalar_branch_target(in));
+    }
+
+    for (const auto& setpc : ins) {
+        if (setpc.is_end || setpc.fmt != Rdna2Format::SOP1 || setpc.opcode != 0x20) continue;
+        const int jump_lo = setpc.src[0].value;
+        const Rdna2Inst* jump_add = last_scalar_writer(ins, setpc.pc, jump_lo);
+        const Rdna2Inst* jump_addc = last_scalar_writer(ins, setpc.pc, jump_lo + 1);
+        if (!jump_add || !jump_addc || jump_add->fmt != Rdna2Format::SOP2 ||
+            jump_add->opcode != 0x00 || jump_addc->fmt != Rdna2Format::SOP2 ||
+            jump_addc->opcode != 0x04 || jump_add->pc >= jump_addc->pc) continue;
+
+        int table_lo = -1;
+        for (const Operand& source : jump_add->src) {
+            if ((source.kind == OperandKind::SGPR || source.kind == OperandKind::Special) &&
+                source.value != jump_lo) table_lo = source.value;
+        }
+        if (table_lo < 0 || !binary_regs(*jump_add, jump_lo, table_lo) ||
+            !binary_regs(*jump_addc, jump_lo + 1, table_lo + 1)) continue;
+        const Rdna2Inst* target_getpc = last_scalar_writer(ins, jump_add->pc, jump_lo);
+        if (!target_getpc || target_getpc->fmt != Rdna2Format::SOP1 ||
+            target_getpc->opcode != 0x1f) continue;
+
+        const Rdna2Inst* table_load = last_scalar_writer(ins, jump_add->pc, table_lo);
+        if (!table_load || table_load != last_scalar_writer(ins, jump_add->pc, table_lo + 1) ||
+            table_load->fmt != Rdna2Format::SMEM || table_load->opcode != 0x01 ||
+            table_load->literal != 0 || table_load->src[0].kind != OperandKind::SGPR) continue;
+        const int table_base_lo = table_load->src[0].value;
+        const int selector = table_load->src[1].value;
+
+        const Rdna2Inst* table_add = last_scalar_writer(ins, table_load->pc, table_base_lo);
+        const Rdna2Inst* table_addc = last_scalar_writer(ins, table_load->pc, table_base_lo + 1);
+        if (!table_add || !table_addc || table_add->fmt != Rdna2Format::SOP2 ||
+            table_add->opcode != 0x00 || table_addc->fmt != Rdna2Format::SOP2 ||
+            table_addc->opcode != 0x04 || table_add->pc >= table_addc->pc) continue;
+        uint32_t table_delta = 0, high_zero = 1;
+        if (!binary_reg_immediate(*table_add, table_base_lo, table_delta) ||
+            !binary_reg_immediate(*table_addc, table_base_lo + 1, high_zero) || high_zero != 0)
+            continue;
+        const Rdna2Inst* table_getpc = last_scalar_writer(ins, table_add->pc, table_base_lo);
+        if (!table_getpc || table_getpc->fmt != Rdna2Format::SOP1 ||
+            table_getpc->opcode != 0x1f) continue;
+
+        const Rdna2Inst* shift = last_scalar_writer(ins, table_load->pc, selector);
+        if (!shift || shift->fmt != Rdna2Format::SOP2 || shift->opcode != 0x1e) continue;
+        uint32_t shift_amount = 0;
+        // s_lshl_b32 is ordered: selector << 3 scales the qword index, while 3 << selector
+        // is a different program and must not be admitted by the commutative matcher.
+        if (!ordered_reg_immediate(*shift, selector, shift_amount) || shift_amount != 3) continue;
+        const Rdna2Inst* clamp = last_scalar_writer(ins, shift->pc, selector);
+        if (!clamp || clamp->fmt != Rdna2Format::SOP2 || clamp->opcode != 0x07) continue;
+        uint32_t selector_max = 0;
+        if (!binary_reg_immediate(*clamp, selector, selector_max) || selector_max > 63) continue;
+
+        const Rdna2Inst* adjust = last_scalar_writer(ins, clamp->pc, selector);
+        int32_t selector_addend = 0;
+        if (adjust && adjust->fmt == Rdna2Format::SOP2 &&
+            (adjust->opcode == 0x00 || adjust->opcode == 0x02)) {
+            uint32_t addend = 0;
+            if (!binary_reg_immediate(*adjust, selector, addend)) continue;
+            selector_addend = static_cast<int32_t>(addend);
+        } else {
+            adjust = nullptr;
+        }
+        const Rdna2Inst* selector_load = last_scalar_writer(
+            ins, adjust ? adjust->pc : clamp->pc, selector);
+        if (!selector_load || selector_load->fmt != Rdna2Format::SMEM ||
+            selector_load->opcode != 0x08 || selector_load->src[0].kind != OperandKind::SGPR ||
+            selector_load->src[1].kind != OperandKind::Special ||
+            selector_load->src[1].value != 125) continue;
+
+        const uint64_t table_byte =
+            static_cast<uint64_t>(table_getpc->pc + table_getpc->len_dwords) * 4u + table_delta;
+        const size_t entry_count = static_cast<size_t>(selector_max) + 1;
+        if ((table_byte & 7u) || table_byte / 4 < program_dwords ||
+            table_byte / 4 + entry_count * 2 > dwords) continue;
+
+        std::vector<uint32_t> targets;
+        targets.reserve(entry_count);
+        const int64_t target_pc_byte =
+            static_cast<int64_t>(target_getpc->pc + target_getpc->len_dwords) * 4;
+        bool table_ok = true;
+        for (size_t index = 0; index < entry_count; ++index) {
+            const size_t word = static_cast<size_t>(table_byte / 4) + index * 2;
+            const int64_t relative = static_cast<int64_t>(
+                (static_cast<uint64_t>(code[word + 1]) << 32) | code[word]);
+            const int64_t target_byte = target_pc_byte + relative;
+            if (target_byte < 0 || (target_byte & 3) ||
+                target_byte / 4 > static_cast<int64_t>(UINT32_MAX) ||
+                !instruction_pcs.contains(static_cast<uint32_t>(target_byte / 4))) {
+                table_ok = false;
+                break;
+            }
+            targets.push_back(static_cast<uint32_t>(target_byte / 4));
+        }
+        if (!table_ok || targets.empty()) continue;
+        const uint32_t merge_pc = *std::max_element(targets.begin(), targets.end());
+        if (merge_pc <= setpc.pc) continue;
+        for (uint32_t target : targets) if (target < setpc.pc + setpc.len_dwords || target > merge_pc)
+            table_ok = false;
+        if (!table_ok) continue;
+
+        const std::vector<uint32_t> setup = {
+            selector_load->pc,
+            adjust ? adjust->pc : UINT32_MAX,
+            clamp->pc, shift->pc, table_getpc->pc, table_add->pc, table_addc->pc,
+            table_load->pc, target_getpc->pc, jump_add->pc, jump_addc->pc, setpc.pc,
+        };
+        const uint32_t setup_first = selector_load->pc;
+        for (uint32_t target : branch_targets) {
+            if (target > setup_first && target <= setpc.pc) { table_ok = false; break; }
+        }
+        if (!table_ok) continue;
+
+        out.valid = true;
+        out.selector_sgpr_base = static_cast<uint32_t>(selector_load->src[0].value);
+        out.selector_byte_offset = selector_load->literal;
+        out.selector_addend = selector_addend;
+        out.selector_max = selector_max;
+        out.setpc_pc = setpc.pc;
+        out.merge_pc = merge_pc;
+        out.required_dwords = static_cast<size_t>(table_byte / 4) + entry_count * 2;
+        out.target_pcs = std::move(targets);
+        for (uint32_t pc : setup) if (pc != UINT32_MAX) out.setup_pcs.push_back(pc);
+        return out;
+    }
+    return out;
+}
+
+bool specialize_pcrel_dispatch(std::vector<Rdna2Inst>& ins, const PcrelDispatchInfo& info,
+                               uint32_t selected_target) {
+    if (!info.valid || std::find(info.target_pcs.begin(), info.target_pcs.end(), selected_target) ==
+                           info.target_pcs.end()) return false;
+    std::unordered_set<uint32_t> remove(info.setup_pcs.begin(), info.setup_pcs.end());
+
+    // A compiler may jump over an alternate entry prologue before it starts the dispatch setup. Fold
+    // only forward unconditional branches wholly contained in that prelude; any external entry into a
+    // skipped range makes the specialization unprovable.
+    for (const auto& branch : ins) {
+        if (branch.pc >= info.setpc_pc || branch.fmt != Rdna2Format::SOPP || branch.opcode != 0x02)
+            continue;
+        const uint32_t target = scalar_branch_target(branch);
+        if (target <= branch.pc || target > info.setpc_pc) return false;
+        for (const auto& other : ins) {
+            if (other.fmt != Rdna2Format::SOPP || other.pc == branch.pc || other.opcode < 0x02 ||
+                other.opcode > 0x09 || other.opcode == 0x03) continue;
+            const uint32_t entered = scalar_branch_target(other);
+            if (entered > branch.pc + branch.len_dwords && entered < target) return false;
+        }
+        remove.insert(branch.pc);
+        for (const auto& skipped : ins)
+            if (skipped.pc >= branch.pc + branch.len_dwords && skipped.pc < target)
+                remove.insert(skipped.pc);
+    }
+
+    uint32_t selected_end = info.merge_pc;
+    for (const auto& in : ins) {
+        if (in.pc < selected_target || in.pc >= info.merge_pc) continue;
+        if (in.fmt != Rdna2Format::SOPP || in.opcode != 0x02) continue;
+        // Internal forward branches and loop back-edges remain in the selected routine and are
+        // validated/structured by emit_body. Only the compiler's route terminator jumps to the
+        // common merge and can be removed as a now-redundant branch.
+        if (scalar_branch_target(in) != info.merge_pc) continue;
+        selected_end = in.pc;
+        remove.insert(in.pc);
+        break;
+    }
+
+    std::vector<Rdna2Inst> specialized;
+    specialized.reserve(ins.size());
+    for (const auto& in : ins) {
+        const bool prelude = in.pc < info.setpc_pc;
+        const bool selected = in.pc >= selected_target && in.pc < selected_end;
+        const bool merge = in.pc >= info.merge_pc;
+        if ((prelude || selected || merge) && !remove.contains(in.pc)) specialized.push_back(in);
+    }
+    if (specialized.empty()) return false;
+
+    // No surviving branch may enter an omitted alternative. The ordinary structurizer performs the
+    // remaining detailed CFG checks after this coarse specialization boundary check.
+    std::unordered_set<uint32_t> retained;
+    uint32_t end_pc = 0;
+    for (const auto& in : specialized) retained.insert(in.pc);
+    for (const auto& in : specialized) if (in.is_end) { end_pc = in.pc; break; }
+    for (const auto& in : specialized) {
+        if (in.fmt != Rdna2Format::SOPP || in.opcode < 0x02 || in.opcode > 0x09 ||
+            in.opcode == 0x03 || in.simm16 < 0) continue;
+        const uint32_t target = scalar_branch_target(in);
+        // Existing forward-if validation accepts a compiler early-out just beyond the primary
+        // S_ENDPGM only after proving that raw target terminates immediately. Preserve that case for
+        // the detailed validator; targets into an omitted alternative still fail here.
+        if (!retained.contains(target) && target <= end_pc) return false;
+    }
+    ins = std::move(specialized);
+    return true;
+}
+
+} // namespace
+
+PcrelDispatchInfo rdna2_pcrel_dispatch_info(const uint32_t* code, size_t dwords) {
+    PcrelDispatchInfo out;
+    if (!code || !dwords) return out;
+    std::vector<Rdna2Inst> ins;
+    const size_t program_dwords = rdna2_walk(code, dwords, ins);
+    return detect_pcrel_dispatch(ins, code, dwords, program_dwords);
+}
+
 size_t rdna2_recompile_code_span(const uint32_t* code, size_t dwords) {
     if (!code || !dwords) return 0;
     std::vector<Rdna2Inst> ins;
-    size_t required = rdna2_walk(code, dwords, ins);
+    const size_t program_dwords = rdna2_walk(code, dwords, ins);
+    size_t required = program_dwords;
     // Detection both proves the compiler idiom and bounds every referenced table. Do not retain an
     // arbitrary post-ENDPGM trailer: only bytes that can affect the generated SPIR-V belong in the key.
     (void)detect_pcrel_tables(ins, code, dwords, &required);
+    const PcrelDispatchInfo dispatch = detect_pcrel_dispatch(ins, code, dwords, program_dwords);
+    if (dispatch.valid) required = std::max(required, dispatch.required_dwords);
     return std::min(required, dwords);
 }
 
@@ -4671,6 +4962,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
     // Fold PC-relative embedded-table loads (s_getpc_b64-built V#s) before the walk — emit_alu's
     // MUBUF/SOP1 handlers consult rs.mubuf_pcrel_tables (#273).
     if (code) rs.mubuf_pcrel_tables = detect_pcrel_tables(ins, code, dwords);
+    std::unordered_set<uint32_t> effective_safe = safe;
     const CountedLoop L = detect_counted_loop(ins);
     size_t idx = 0;
     // Cross-lane wave ops (mbcnt) emit LDS + barriers, which are only valid at wave-uniform points — so
@@ -4683,7 +4975,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             if (in.pc < pc_lo) continue;
             if (in.fmt == Rdna2Format::EXP) { if (!exp_fn(in)) return false; continue; }
             bool ok = true;
-            if (!emit_alu(b, rs, in, ok, allow_exec_update, &safe, allow_smem, rt, wave_ok) || !ok) {
+            if (!emit_alu(b, rs, in, ok, allow_exec_update, &effective_safe, allow_smem, rt, wave_ok) || !ok) {
                 // PROSPER_DBG (gated, off by default): report the instruction that fails recompilation —
                 // the first unsupported op / unresolved resource that makes a shader return empty.
                 if (getenv("PROSPER_DBG"))
@@ -4695,13 +4987,155 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         }
         return true;
     };
-    auto& safe_branches = safe;
+    auto& safe_branches = effective_safe;
     if (L.found) {
         auto vget = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
         auto sget = [&](int r){ auto it = rs.sreg.find(r); return it == rs.sreg.end() ? b.uconst(0) : it->second; };
-        // 1. Pre-loop body. Loops require full EXEC at entry (per-lane loop semantics); bail if narrowed.
-        if (!emit_range(0, L.header_pc)) return false;
-        if (rs.exec_narrowed) return false;
+        bool guarded_narrow_entry = false;
+        // saveexec -> execz -> matching EXEC restore around a side-effect-free counted region is a
+        // whole-wave empty-work optimization. In the per-invocation shell we may run the uniform
+        // scalar loop for every invocation while narrowed EXEC predicates vector writes; inactive
+        // lanes retain their old VGPRs until the exact restore. Reject stores/exports/barriers and
+        // unclassified memory so this never becomes a general branch-linearization escape hatch.
+        for (size_t branch_index = 0; branch_index < ins.size(); ++branch_index) {
+            const Rdna2Inst& branch = ins[branch_index];
+            if (branch.fmt != Rdna2Format::SOPP || branch.opcode != 0x08 || branch.simm16 <= 0)
+                continue;
+            size_t previous = branch_index;
+            while (previous > 0) {
+                --previous;
+                if (!sopp_is_noop(ins[previous])) break;
+            }
+            if (previous >= branch_index) continue;
+            const Rdna2Inst& saveexec = ins[previous];
+            if (saveexec.fmt != Rdna2Format::SOP1 ||
+                (saveexec.opcode != 0x24 && saveexec.opcode != 0x25) ||
+                saveexec.dst.kind != OperandKind::SGPR || saveexec.dst.value > 104) continue;
+            const uint32_t target = branch_target(branch);
+            const Rdna2Inst* restore = nullptr;
+            for (const auto& candidate : ins) if (candidate.pc == target) { restore = &candidate; break; }
+            if (!restore || restore->fmt != Rdna2Format::SOP1 || restore->opcode != 0x04 ||
+                restore->dst.value < 126 || !reg_operand(restore->src[0], saveexec.dst.value)) continue;
+            bool side_effect_free = true;
+            for (const auto& candidate : ins) {
+                if (candidate.pc <= branch.pc || candidate.pc >= target) continue;
+                const uint32_t scalar_width = scalar_write_width(candidate);
+                const bool clobbers_guard_mask = scalar_width &&
+                    candidate.dst.value < saveexec.dst.value + 2 &&
+                    saveexec.dst.value < candidate.dst.value + static_cast<int>(scalar_width);
+                if (candidate.fmt == Rdna2Format::EXP || candidate.fmt == Rdna2Format::DS ||
+                    candidate.fmt == Rdna2Format::MUBUF || candidate.fmt == Rdna2Format::MTBUF ||
+                    candidate.fmt == Rdna2Format::MIMG || candidate.fmt == Rdna2Format::FLAT ||
+                    instruction_may_change_exec(candidate) || clobbers_guard_mask ||
+                    (candidate.fmt == Rdna2Format::SOPP && candidate.opcode == 0x0a)) {
+                    side_effect_free = false;
+                    break;
+                }
+            }
+            if (!side_effect_free) continue;
+            effective_safe.insert(branch.pc);
+            if (branch.pc < L.header_pc && target >= L.exit_pc) guarded_narrow_entry = true;
+        }
+        // 1. Pre-loop body. A compiler may place one ordinary uniform if/else before the canonical
+        // counted loop (Evergate selects one of two constant blocks this way). Structure that choice
+        // with the same two-arm PHIs as the general forward-if path, then enter the existing counted
+        // loop lowering. Anything nested/more complex stays unsupported and rejects visibly.
+        std::vector<Rdna2Inst> preloop;
+        for (const auto& in : ins) {
+            if (in.pc >= L.header_pc) break;
+            // A forward execz spanning the counted loop is a redundant wave-empty guard when the
+            // prelude reaches it with full EXEC. Leave it in the emitted stream (emit_alu proves
+            // full EXEC and otherwise rejects), but do not ask the pre-loop uniform-if detector to
+            // model a region whose body deliberately extends beyond its artificial end marker.
+            if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x08 &&
+                branch_target(in) >= L.header_pc) continue;
+            preloop.push_back(in);
+        }
+        Rdna2Inst preloop_end;
+        preloop_end.pc = L.header_pc;
+        preloop_end.is_end = true;
+        preloop.push_back(preloop_end);
+        bool preloop_rejected = false;
+        const std::vector<ForwardIf> preloop_ifs = detect_forward_ifs(
+            preloop, /*allow_vcc*/!b.is_compute, code, dwords, &effective_safe, nullptr,
+            &preloop_rejected, /*compute_wave_branches*/b.is_compute);
+        if (preloop_rejected || preloop_ifs.size() > 1 ||
+            (!preloop_ifs.empty() && (!preloop_ifs[0].has_else ||
+                                      preloop_ifs[0].merge_pc > L.header_pc))) {
+            if (getenv("PROSPER_DBG"))
+                fprintf(stderr,
+                        "[recompile-reject] counted-loop prelude cfg rejected=%u ifs=%zu header=%u\n",
+                        preloop_rejected, preloop_ifs.size(), L.header_pc);
+            return false;
+        }
+        if (preloop_ifs.empty()) {
+            if (!emit_range(0, L.header_pc)) return false;
+        } else {
+            const ForwardIf F = preloop_ifs[0];
+            if (!emit_range(0, F.branch_pc)) return false;
+            if (idx >= ins.size() || ins[idx].pc != F.branch_pc) return false;
+            ++idx; // consume the conditional branch
+            uint32_t condition = F.on_exec ? rs.exec : (F.on_vcc ? rs.vcc : rs.scc);
+            condition = F.on_scc0 ? condition : b.logical_not(condition);
+            const RegState before = rs;
+            std::set<int> written_v, written_s;
+            loop_written_regs(ins, F.branch_pc + 1, F.sb_pc, written_v, written_s);
+            loop_written_regs(ins, F.target_pc, F.merge_pc, written_v, written_s);
+            const uint32_t then_label = b.id(), else_label = b.id(), merge_label = b.id();
+            b.emit_selmerge(merge_label);
+            b.emit_condbranch(condition, then_label, else_label);
+
+            b.emit_label(then_label);
+            if (!emit_range(F.branch_pc + 1, F.sb_pc)) return false;
+            if (idx >= ins.size() || ins[idx].pc != F.sb_pc) return false;
+            ++idx; // consume the then arm's jump to the merge
+            const uint32_t then_block = b.cur_block;
+            std::unordered_map<int, uint32_t> then_v, then_s;
+            for (int reg : written_v) then_v[reg] = vget(reg);
+            for (int reg : written_s) then_s[reg] = sget(reg);
+            const uint32_t then_scc = rs.scc, then_vcc = rs.vcc, then_exec = rs.exec;
+            const bool then_narrowed = rs.exec_narrowed;
+            const auto then_bool = rs.sreg_bool;
+            b.emit_branch(merge_label);
+
+            rs = before;
+            b.emit_label(else_label);
+            if (!emit_range(F.target_pc, F.merge_pc)) return false;
+            const uint32_t else_block = b.cur_block;
+            b.emit_branch(merge_label);
+            b.emit_label(merge_label);
+            for (int reg : written_v) {
+                const uint32_t else_value = vget(reg);
+                if (then_v[reg] != else_value)
+                    rs.vreg[reg] = b.emit_phi_2way(
+                        b.t_u32, then_v[reg], then_block, else_value, else_block);
+            }
+            for (int reg : written_s) {
+                const uint32_t else_value = sget(reg);
+                if (then_s[reg] != else_value)
+                    rs.sreg[reg] = b.emit_phi_2way(
+                        b.t_u32, then_s[reg], then_block, else_value, else_block);
+            }
+            if (then_scc != rs.scc)
+                rs.scc = b.emit_phi_2way(b.t_bool, then_scc, then_block, rs.scc, else_block);
+            if (then_vcc != rs.vcc)
+                rs.vcc = b.emit_phi_2way(b.t_bool, then_vcc, then_block, rs.vcc, else_block);
+            if (then_exec != rs.exec)
+                rs.exec = b.emit_phi_2way(b.t_bool, then_exec, then_block, rs.exec, else_block);
+            rs.exec_narrowed = then_narrowed || rs.exec_narrowed;
+            if (then_bool != rs.sreg_bool) {
+                if (getenv("PROSPER_DBG"))
+                    fprintf(stderr, "[recompile-reject] counted-loop prelude changes mask domain\n");
+                return false; // no mask-domain PHIs in this narrow composition
+            }
+            if (!emit_range(F.merge_pc, L.header_pc)) return false;
+        }
+        // Loops require full EXEC at entry (per-lane loop semantics); bail if narrowed.
+        if (rs.exec_narrowed && !guarded_narrow_entry) {
+            if (getenv("PROSPER_DBG"))
+                fprintf(stderr, "[recompile-reject] counted-loop enters with narrowed EXEC\n");
+            return false;
+        }
         // 2. Loop-carried registers -> a header OpPhi each. `cond_written` = regs written in the CONDITION
         // region [header, exit_branch): those execute on the exiting iteration too, so their post-loop
         // value is the condition-block value (which dominates the merge), NOT the phi (defect A). SCC/VCC
@@ -4734,7 +5168,11 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         b.emit_label(body);
         // 4. Body [after exit_branch, back-edge). Must restore EXEC before looping (bail if left narrowed).
         if (!emit_range(L.exit_branch_pc + 1, L.backedge_pc)) return false;
-        if (rs.exec_narrowed) return false;
+        if (rs.exec_narrowed && !guarded_narrow_entry) {
+            if (getenv("PROSPER_DBG"))
+                fprintf(stderr, "[recompile-reject] counted-loop body leaves EXEC narrowed\n");
+            return false;
+        }
         if (idx < ins.size() && ins[idx].pc == L.backedge_pc) ++idx;        // skip the back-edge branch
         // 5. Continue block branches back to the header; patch each phi's back-edge (value = current, cont).
         b.emit_branch(cont); b.emit_label(cont);
@@ -4755,8 +5193,15 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             else if (pr.dom == 2) rs.scc = pr.phi;
             else                  rs.vcc = pr.phi;
         }
-        // 7. Post-loop body.
-        if (!emit_range(L.exit_pc, UINT32_MAX)) return false;
+        // 7. Post-loop body. Feed the suffix back through the ordinary body selector: with this
+        // counted back-edge removed it can use the established nested forward-if/divergent-loop
+        // structurizer. This composes a counted loop with a non-trivial shared postlude without
+        // duplicating that CFG machinery or admitting arbitrary branches inside the counted loop.
+        std::vector<Rdna2Inst> postloop;
+        for (const auto& in : ins) if (in.pc >= L.exit_pc) postloop.push_back(in);
+        if (!postloop.empty() &&
+            !emit_body(b, rs, postloop, effective_safe, rt, allow_exec_update, allow_smem,
+                       exp_fn, code, dwords)) return false;
     } else if (std::vector<DivLoop> Ls; true) {
         // Per-invocation EXEC/VCC-exit loops (#273/#615) + structured uniform/divergent IFs. Loops are detected
         // for the per-invocation stages only (fragment/vertex — the compute shell keeps its
@@ -5235,9 +5680,19 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
 
 std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
                                          const ShaderResourceTable* rt,
-                                         const PixelSystemInputMapping* system_inputs) {
+                                         const PixelSystemInputMapping* system_inputs,
+                                         uint32_t pcrel_dispatch_target) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
+    if (pcrel_dispatch_target != UINT32_MAX) {
+        const PcrelDispatchInfo dispatch = rdna2_pcrel_dispatch_info(code, dwords);
+        if (!specialize_pcrel_dispatch(ins, dispatch, pcrel_dispatch_target)) {
+            if (getenv("PROSPER_DBG"))
+                fprintf(stderr, "[recompile-reject] pcrel dispatch specialization target=%u\n",
+                        pcrel_dispatch_target);
+            return {};
+        }
+    }
 
     // Preserve hardware target locations. MRT0 and MRT1 are backed by real Vulkan attachments; later
     // targets remain unsupported and must never be silently remapped to location 0 (#635).
@@ -5247,7 +5702,12 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
         if (in.fmt == Rdna2Format::EXP && in.exp_target < 2)
             color_mask |= 1u << in.exp_target;
     }
-    if (!color_mask) return {};
+    if (!color_mask) {
+        if (getenv("PROSPER_DBG") && pcrel_dispatch_target != UINT32_MAX)
+            fprintf(stderr, "[recompile-reject] pcrel target=%u has no color export\n",
+                    pcrel_dispatch_target);
+        return {};
+    }
 
     SpirvCompute b;
     b.begin_fragment(rt, color_mask);
@@ -5317,8 +5777,17 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
     // cmpx is now ALLOWED (allow_exec_update=true): a fragment divergent-if (v_cmpx ... s_mov exec,saved)
     // is handled by EXEC predication like compute, and the export is guarded above. Memory ops need a
     // resource table. Loops (if any) are reconstructed by emit_body.
-    if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/true, /*allow_smem*/rt != nullptr, exp_fn, code, dwords)) return {};
-    if (!exported[0] && !exported[1]) return {};
+    if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/true, /*allow_smem*/rt != nullptr, exp_fn, code, dwords)) {
+        if (getenv("PROSPER_DBG") && pcrel_dispatch_target != UINT32_MAX)
+            fprintf(stderr, "[recompile-reject] pcrel target=%u body failed\n", pcrel_dispatch_target);
+        return {};
+    }
+    if (!exported[0] && !exported[1]) {
+        if (getenv("PROSPER_DBG") && pcrel_dispatch_target != UINT32_MAX)
+            fprintf(stderr, "[recompile-reject] pcrel target=%u emitted no color\n",
+                    pcrel_dispatch_target);
+        return {};
+    }
     return b.finish();
 }
 
