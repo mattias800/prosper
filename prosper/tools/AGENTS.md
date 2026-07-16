@@ -206,8 +206,8 @@ external numeric/image inspection without dereferencing the original guest addre
 `--dump-compute-resource N:BINDING PATH` writes its exact pre-dispatch storage-buffer bytes.
 `--compute-only N` executes one realized dispatch in isolation; combine it with
 `--override-compute-spv N PATH` to minimize or hardware-A/B a captured shader without changing its exact
-resource descriptors. The override disables the pixel oracle. Tiled 1D/2D compute storage stays skipped
-unless `PROSPER_COMPUTE_TILED_2D_STORAGE=1` is explicitly set for a bounded diagnostic replay.
+resource descriptors. The override disables the pixel oracle. Validated tiled 1D/2D compute storage executes
+by default; `PROSPER_DISABLE_COMPUTE_TILED_2D_STORAGE=1` restores the old skip for a diagnostic A/B.
 `PROSPER_COMPUTELOG=1` separates pipeline creation, submission, dispatch-wait, import, and writeback failures.
 Renderer-owned RTT imports include their hash and nonzero-byte count, and buffer writeback logs include the
 first eight dwords so bounds/offset constant buffers can be identified without another code change.
