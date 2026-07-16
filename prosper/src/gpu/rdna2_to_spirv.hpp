@@ -64,6 +64,11 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
 struct ComputeShaderConfig {
     std::vector<uint32_t> user_sgprs;
     uint32_t local_x = 64, local_y = 1, local_z = 1;
+    // Vulkan can only launch complete workgroups, while AGC thread-dimension dispatches may end in a
+    // partial workgroup. When enabled, the generated entry point suppresses invocations outside this
+    // exact global extent before they can execute guest shader instructions.
+    bool exact_thread_extent = false;
+    uint32_t threads_x = 0, threads_y = 0, threads_z = 0;
     uint32_t wave_size = 64; // COMPUTE_DISPATCH_INITIATOR.CS_W32_EN selects 32; otherwise 64.
     uint32_t tidig_comp_cnt = 0;
     bool tgid_x_en = false, tgid_y_en = false, tgid_z_en = false;

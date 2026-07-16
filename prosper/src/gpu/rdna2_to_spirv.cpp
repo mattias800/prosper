@@ -84,7 +84,8 @@ struct SpirvCompute {
     // fixed ids (set in begin()):
     uint32_t t_void=0, t_fn=0, t_f32=0, t_u32=0, t_i32=0, t_v3u=0, t_bool=0, t_ptr_sb_f32=0;
     uint32_t v_gid=0, v_groupid=0, v_in=0, v_out=0, gidx=0, f_main=0, glsl=0, bconst_false=0;
-    uint32_t groupid[3] = {0, 0, 0}, localid_comp[3] = {0, 0, 0};
+    uint32_t globalid_comp[3] = {0, 0, 0}, groupid[3] = {0, 0, 0}, localid_comp[3] = {0, 0, 0};
+    uint32_t invocation_guard_merge = 0;
     uint32_t linear_localid = 0, local_count = 64, wave_size = 64;
     uint32_t v_cbuf=0, v_cbuf1=0, t_ptr_sb_u32=0;   // scalar-memory constant buffers (bindings 2 and 3)
     std::map<uint32_t, uint32_t> cbuf_var;          // binding -> storage-buffer var (N-buffer model; 2/3 map to v_cbuf/v_cbuf1)
@@ -930,7 +931,11 @@ struct SpirvCompute {
         put(code, Op_Label, {lbl}); cur_block = lbl;
         function_var_insert = code.size();
         uint32_t ld = id(); put(code, Op_Load, {t_v3u, ld, v_gid});
-        gidx = id(); put(code, Op_CompositeExtract, {t_u32, gidx, ld, 0});
+        for (uint32_t c = 0; c < 3; c++) {
+            globalid_comp[c] = id();
+            put(code, Op_CompositeExtract, {t_u32, globalid_comp[c], ld, c});
+        }
+        gidx = globalid_comp[0];
         uint32_t ldl = id(); put(code, Op_Load, {t_v3u, ldl, v_localid});
         for (uint32_t c = 0; c < 3; c++) {
             localid_comp[c] = id();
@@ -947,6 +952,19 @@ struct SpirvCompute {
             groupid[c] = id();
             put(code, Op_CompositeExtract, {t_u32, groupid[c], ldg, c});
         }
+    }
+    // AGC thread-dimension mode can request a non-multiple of the shader's local size. Vulkan still
+    // launches the final complete workgroup, so make its excess invocations branch directly to the
+    // function merge instead of executing guest instructions (and, in particular, memory stores).
+    void guard_invocation_extent(uint32_t threads_x, uint32_t threads_y, uint32_t threads_z) {
+        uint32_t within = ucmp(Op_ULessThan, globalid_comp[0], uconst(threads_x));
+        within = land(within, ucmp(Op_ULessThan, globalid_comp[1], uconst(threads_y)));
+        within = land(within, ucmp(Op_ULessThan, globalid_comp[2], uconst(threads_z)));
+        const uint32_t active = id();
+        invocation_guard_merge = id();
+        emit_selmerge(invocation_guard_merge);
+        emit_condbranch(within, active, invocation_guard_merge);
+        emit_label(active);
     }
     // --- Fragment-shader shell: vec4 outputs for the implemented MRT0/MRT1 exports. ---
     uint32_t t_v4f = 0;
@@ -1117,6 +1135,10 @@ struct SpirvCompute {
     }
 
     std::vector<uint32_t> finish() {
+        if (invocation_guard_merge) {
+            emit_branch(invocation_guard_merge);
+            emit_label(invocation_guard_merge);
+        }
         put(code, Op_Return, {}); put(code, Op_FunctionEnd, {});
         // EntryPoint is emitted here (not in begin_*) so lazily-declared Input/Output varyings — added
         // to `iface` as v_interp / EXP PARAM are encountered — appear in the interface list (SPIR-V 1.3).
@@ -5118,6 +5140,11 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     const uint32_t local_z = std::max(1u, config.local_z);
     const uint32_t wave_size = config.wave_size == 32 ? 32u : 64u;
     b.begin(1, rt, local_x, local_y, local_z, wave_size);
+    const bool has_partial_workgroup = config.threads_x % local_x != 0 ||
+                                       config.threads_y % local_y != 0 ||
+                                       config.threads_z % local_z != 0;
+    if (config.exact_thread_extent && has_partial_workgroup)
+        b.guard_invocation_extent(config.threads_x, config.threads_y, config.threads_z);
 
     RegState rs;
     rs.vcc = b.bfalse();

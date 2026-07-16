@@ -239,6 +239,25 @@ int main() {
         }
     }
 
+    // The decoder also accepts the older three-dimension custom packet used by focused tools. With
+    // no trailing modifier it must deterministically use modifier=0 (workgroup dimensions), rather
+    // than accidentally treating its dimensions as total threads.
+    {
+        constexpr uint32_t short_dispatch[] = {
+            0xC0000000u | (2u << 16) | (0x10u << 8) | (0x1au << 2),
+            11, 7, 3,
+        };
+        GpuState short_state;
+        run_cb(short_dispatch, 4, short_state);
+        CHECK(short_state.dispatches.size() == 1 && short_state.dispatches[0].modifier == 0,
+              "short dispatch packet defaults its missing modifier to workgroup mode");
+        if (short_state.dispatches.size() == 1) {
+            const auto launch = resolve_compute_launch(short_state.dispatches[0]);
+            CHECK(launch.groups_x == 11 && launch.groups_y == 7 && launch.groups_z == 3,
+                  "short dispatch dimensions remain workgroup counts");
+        }
+    }
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

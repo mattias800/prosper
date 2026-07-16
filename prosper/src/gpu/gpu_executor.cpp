@@ -2097,6 +2097,12 @@ std::vector<ComputeItem> realize_compute_dispatches(
         config.local_x = launch.local_x;
         config.local_y = launch.local_y;
         config.local_z = launch.local_z;
+        config.exact_thread_extent = ((dispatch.modifier >>
+            P::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS_SHIFT) &
+            P::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS_MASK) != 0;
+        config.threads_x = launch.threads_x;
+        config.threads_y = launch.threads_y;
+        config.threads_z = launch.threads_z;
         config.wave_size = ((dispatch.modifier >>
             P::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT) &
             P::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_MASK) ? 32u : 64u;
