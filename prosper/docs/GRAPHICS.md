@@ -96,7 +96,7 @@ initializers to construct valid GPU objects (correctness-first — no plausible-
   renderer-owned RGBA16F RTT inputs are replaced in their native format. `PROSPER_TESTTEX_FILTER=linear|point`
   uses the same draw/binding selectors for sampler-only A/B tests. `PROSPER_DUMP_RTGROUPS_ADDR=0x...` scopes
   `PROSPER_DUMP_RTGROUPS` to one target during a long run. `PROSPER_SHADER_DUMP_SUCCESS=DIR` captures both the
-  exact raw RDNA2 bytes and translated SPIR-V for successfully recompiled graphics shaders. These are
+  exact raw RDNA2 bytes and translated SPIR-V for successfully recompiled graphics and compute shaders. These are
   diagnostics, not renderer policy; record an unmodified output before interpreting an override.
 
 ## Build environment

@@ -779,13 +779,20 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             }
                         }
                     }
-                    if (trace)
+                    if (trace) {
+                        const uint64_t snapshot_hash = fnv1a(live_target.pixels->data(),
+                                                             live_target.pixels->size());
+                        const size_t nonzero_bytes = static_cast<size_t>(std::count_if(
+                            live_target.pixels->begin(), live_target.pixels->end(),
+                            [](uint8_t value) { return value != 0; }));
                         std::fprintf(stderr,
                                      "[compute]   imported renderer RTT binding=%u addr=0x%llx "
-                                     "extent=%ux%u format=%s\n",
+                                     "extent=%ux%u format=%s hash=%016llx nonzero-bytes=%zu\n",
                                      bi.binding, (unsigned long long)r->gpu_addr, r->width, r->height,
                                      live_target.format == LiveTargetPixelFormat::Rgba16Float
-                                         ? "rgba16f" : "rgba8");
+                                         ? "rgba16f" : "rgba8",
+                                     (unsigned long long)snapshot_hash, nonzero_bytes);
+                    }
                     bi.guest_bytes = 0;
                 } else {
                     size_t need;                                   // guest bytes the decode reads
@@ -1260,14 +1267,18 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const uint8_t* bytes = resource_bytes(buffer.resource);
             std::fprintf(stderr,
                          "[compute]   writeback binding=%u addr=0x%llx size=%u changed=%llu "
-                         "hash=%016llx->%016llx first=%08x,%08x,%08x,%08x\n",
+                         "hash=%016llx->%016llx first=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
                          buffer.resource->binding, (unsigned long long)buffer.resource->gpu_addr,
                          buffer.resource->size, (unsigned long long)buffer.changed_bytes,
                          (unsigned long long)buffer.before_hash, (unsigned long long)buffer.after_hash,
                          buffer.resource->size >= 4 ? reinterpret_cast<const uint32_t*>(bytes)[0] : 0,
                          buffer.resource->size >= 8 ? reinterpret_cast<const uint32_t*>(bytes)[1] : 0,
                          buffer.resource->size >= 12 ? reinterpret_cast<const uint32_t*>(bytes)[2] : 0,
-                         buffer.resource->size >= 16 ? reinterpret_cast<const uint32_t*>(bytes)[3] : 0);
+                         buffer.resource->size >= 16 ? reinterpret_cast<const uint32_t*>(bytes)[3] : 0,
+                         buffer.resource->size >= 20 ? reinterpret_cast<const uint32_t*>(bytes)[4] : 0,
+                         buffer.resource->size >= 24 ? reinterpret_cast<const uint32_t*>(bytes)[5] : 0,
+                         buffer.resource->size >= 28 ? reinterpret_cast<const uint32_t*>(bytes)[6] : 0,
+                         buffer.resource->size >= 32 ? reinterpret_cast<const uint32_t*>(bytes)[7] : 0);
         }
         for (const auto& image : images) {
             if (!image.storage || !image.resource || image.alias_of != SIZE_MAX) continue;
