@@ -156,10 +156,15 @@ HLE(k_mutexattr_destroy)     { if (a0 && *(void**)a0) { free(*(void**)a0); *(voi
 // CONFIDENCE: HIGH (semantics cross-checked against FreeBSD libthr + the Kyty reference).
 namespace {
     inline bool pt_static_sentinel(void* v) { return (uintptr_t)v < 0x1000; }  // NULL/1/2/3... = static initializer
+#ifdef _WIN32
+    // winpthreads' cooperative try-lock loop cannot rely on pthread_mutex_lock to report a
+    // same-thread ERRORCHECK relock before it starts polling. Track ownership explicitly on Windows
+    // for that path. Native POSIX hosts already implement the ERRORCHECK contract in pthreads; putting
+    // their every guest lock/unlock through this one process-global map mutex serializes unrelated UE4
+    // locks and severely throttles synchronization-heavy titles (#719/#793 regression).
     struct GuestMutexState { int type = PTHREAD_MUTEX_NORMAL; uint64_t owner = 0; uint32_t depth = 0; };
     std::mutex g_guest_mutex_state_mutex;
     std::unordered_map<pthread_mutex_t*, GuestMutexState> g_guest_mutex_states;
-
     void guest_mutex_register(pthread_mutex_t* mutex, int type) {
         std::lock_guard<std::mutex> lock(g_guest_mutex_state_mutex);
         g_guest_mutex_states[mutex] = {type, 0, 0};
@@ -199,6 +204,13 @@ namespace {
             found->second.depth = 0;
         }
     }
+#else
+    inline void guest_mutex_register(pthread_mutex_t*, int) {}
+    inline void guest_mutex_unregister(pthread_mutex_t*) {}
+    inline bool guest_mutex_self_deadlock(pthread_mutex_t*) { return false; }
+    inline void guest_mutex_acquired(pthread_mutex_t*) {}
+    inline void guest_mutex_released(pthread_mutex_t*) {}
+#endif
 
     pthread_mutex_t* ensure_mutex(uint64_t slot_addr) {
         if (!slot_addr) return nullptr;
@@ -207,12 +219,18 @@ namespace {
         if (!pt_static_sentinel(cur)) return (pthread_mutex_t*)cur;
         auto* m = (pthread_mutex_t*)calloc(1, sizeof(pthread_mutex_t));
         pthread_mutexattr_t at; pthread_mutexattr_init(&at);
+#ifdef _WIN32
+        // winpthreads needs the explicit type so cooperative polling can reproduce FreeBSD's
+        // same-thread EDEADLK result. Preserve the native-POSIX initializer used before #793 on
+        // Linux/macOS; changing every UE4 static lock there was outside the Windows fix's scope and
+        // materially changes title progression.
         pthread_mutexattr_settype(&at, PTHREAD_MUTEX_ERRORCHECK);
-        // The FreeBSD static sentinel ENCODES the type: NULL = PTHREAD_MUTEX_INITIALIZER (the
-        // DEFAULT type, which is ERRORCHECK on FreeBSD), 1 = PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP.
-        // BOTH map to host ERRORCHECK: FreeBSD's self-lock contract returns EDEADLK for the
-        // default AND adaptive types (libthr mutex_self_lock; adaptive's spin is pure
-        // performance). Previously every sentinel self-init forced RECURSIVE (#145).
+#endif
+        // The FreeBSD static sentinel ENCODES the type: NULL = PTHREAD_MUTEX_INITIALIZER and
+        // 1 = PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP. Windows maps both to ERRORCHECK above because
+        // its cooperative poller needs an explicit same-owner result. Native POSIX retains the
+        // host-default self-init behavior used before #793; forcing every static UE4 mutex to
+        // ERRORCHECK there changed both scheduling and title progression.
         pthread_mutex_init(m, &at);
         pthread_mutexattr_destroy(&at);
         if (__atomic_compare_exchange_n(slot, &cur, (void*)m, false,

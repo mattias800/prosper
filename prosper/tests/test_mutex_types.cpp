@@ -74,13 +74,13 @@ int main() {
     CHECK(attr_settype(U(&battr), 99, 0, 0, 0, 0) == 0x16, "settype(99) rejected EINVAL(22)");
     attr_destroy(U(&battr), 0, 0, 0, 0, 0);
 
-    // 5. STATIC SENTINEL self-init (PTHREAD_MUTEX_INITIALIZER == NULL) = DEFAULT = ERRORCHECK:
+    // 5. STATIC SENTINEL self-init remains non-recursive (native POSIX default; Windows ERRORCHECK):
     //    this is the bdwgc GC_allocate_ml shape — trylock on an owned static lock MUST fail
     //    (before this fix the self-init forced RECURSIVE and trylock succeeded on the owner).
     void* smtx = nullptr;   // NULL sentinel; first use self-initializes
     CHECK(m_lock(U(&smtx), 0, 0, 0, 0, 0) == 0 && smtx, "static sentinel self-initializes on lock");
-    CHECK(m_trylock(U(&smtx), 0, 0, 0, 0, 0) == 16, "static default: trylock on owned fails EBUSY(16)");
-    CHECK(m_unlock(U(&smtx), 0, 0, 0, 0, 0) == 0, "static default: unlock");
+    CHECK(m_trylock(U(&smtx), 0, 0, 0, 0, 0) == 16, "static non-recursive: trylock on owned fails EBUSY(16)");
+    CHECK(m_unlock(U(&smtx), 0, 0, 0, 0, 0) == 0, "static non-recursive: unlock");
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
