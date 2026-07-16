@@ -300,6 +300,59 @@ int main() {
     set_live_target_reader({});
     set_live_target_query({});
 
+    // UE4's exposure chain samples tiny tiled Float32 surfaces. Preserve those values natively:
+    // normalizing through RGBA8 would clamp negative and HDR channels before the compute shader sees
+    // them. Copy a tiled Float32x4 source through the production sampled-image path into the existing
+    // raw-channel Float32 storage path and require exact bits at the guest destination.
+    std::vector<float> float_src(W * 4), float_dst(W * 4, 0.0f);
+    for (uint32_t i = 0; i < W * 4; ++i)
+        float_src[i] = (static_cast<int32_t>(i % 17) - 8) * 0.375f;
+    const size_t float_tiled_bytes = tiled_surface_bytes(W, 1, dcc_tile, 0, 16);
+    std::vector<uint8_t> float_tiled(float_tiled_bytes, 0);
+    tile_surface(float_tiled.data(), reinterpret_cast<const uint8_t*>(float_src.data()),
+                 W, 1, dcc_tile, 0, 16);
+    ShaderResourceTable float_rt = irt;
+    for (ShaderResource& resource : float_rt.resources) {
+        if (resource.binding != 4 && resource.binding != 5) continue;
+        resource.img_dim = 1;
+        resource.format = DataFormat::Float32;
+        resource.num_components = 4;
+        resource.width = W;
+        resource.height = resource.depth = 1;
+        if (resource.binding == 4) {
+            resource.cls = ResourceClass::Texture;
+            resource.tile_mode = dcc_tile;
+            resource.gpu_addr = reinterpret_cast<uint64_t>(float_tiled.data());
+            resource.size = static_cast<uint32_t>(float_tiled.size());
+            resource.swizzle[0] = 4;
+            resource.swizzle[1] = 5;
+            resource.swizzle[2] = 6;
+            resource.swizzle[3] = 7;
+        } else {
+            resource.tile_mode = 0;
+            resource.gpu_addr = reinterpret_cast<uint64_t>(float_dst.data());
+            resource.size = static_cast<uint32_t>(float_dst.size() * sizeof(float));
+        }
+    }
+    std::vector<uint32_t> float_spirv = recompile_valu(
+        image_copy_2d, sizeof(image_copy_2d) / sizeof(image_copy_2d[0]), 1, 0, &float_rt);
+    CHECK(!float_spirv.empty(), "sampled-image copy kernel recompiles for tiled Float32 input");
+    if (!float_spirv.empty()) {
+        ComputeItem float_item;
+        float_item.spirv = float_spirv;
+        float_item.resources = std::make_shared<ShaderResourceTable>(float_rt);
+        float_item.launch.threads_x = W;
+        float_item.launch.local_x = 64;
+        float_item.launch.groups_x = 1;
+        float_item.launch.local_y = float_item.launch.local_z = 1;
+        float_item.launch.groups_y = float_item.launch.groups_z = 1;
+        float_item.code_addr = 0x590f32;
+        CHECK(prosper::frontend::execute_live_compute_items({float_item}),
+              "live backend executes a dispatch sampling a tiled Float32 image");
+        CHECK(float_dst == float_src,
+              "tiled Float32 sampled values preserve negative and HDR channels byte-exactly");
+    }
+
     if (fails) {
         std::printf("== FAIL: %d ==\n", fails);
         return 1;

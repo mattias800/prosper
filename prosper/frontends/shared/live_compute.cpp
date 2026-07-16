@@ -626,7 +626,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 if (bi.alias_of != SIZE_MAX) continue;
             }
             const VkDeviceSize volume_texels = static_cast<VkDeviceSize>(r->width) * r->height * r->depth;
-            const uint32_t texel_bytes = bi.storage ? 16u : 4u;   // uvec4 raw channels / RGBA8
+            const uint32_t sampled_components = r->num_components ? r->num_components : 1;
+            const bool sampled_float32 = !bi.storage && r->format == DataFormat::Float32 &&
+                                         sampled_components >= 1 && sampled_components <= 4;
+            const uint32_t texel_bytes = bi.storage || sampled_float32 ? 16u : 4u;
+            // Storage images use raw uvec4 channels. Most sampled formats are normalized to RGBA8,
+            // but Float32 stays native so exposure/HDR kernels do not lose sign or dynamic range.
             const VkDeviceSize sbytes = volume_texels * texel_bytes;
             if (!sbytes || sbytes > kMaxComputeImageBytes) {
                 skip_image(r, "expanded image exceeds the 256 MiB backend bound"); break;
@@ -687,6 +692,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const bool uint8 = r->format == DataFormat::Uint8 && nc == 4;
                 const bool r8 = r->format == DataFormat::Unorm8 && nc == 1;
                 const bool f16 = r->format == DataFormat::Float16 && nc >= 1 && nc <= 4;
+                const bool f32 = sampled_float32;
                 const bool r11g11b10 = r->format == DataFormat::Float10_11_11 && nc == 3;
                 if (renderer_owned) {
                     if (r11g11b10) {
@@ -694,7 +700,24 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         break;
                     }
                     const std::vector<uint8_t>& pixels = *live_target.pixels;
-                    if (live_target.format == LiveTargetPixelFormat::Rgba8Unorm) {
+                    if (f32) {
+                        const size_t texels = static_cast<size_t>(volume_texels);
+                        for (size_t t = 0; t < texels; ++t) {
+                            for (uint32_t c = 0; c < 4; ++c) {
+                                float value = 0.0f;
+                                if (live_target.format == LiveTargetPixelFormat::Rgba8Unorm) {
+                                    value = pixels[t * 4 + c] / 255.0f;
+                                } else {
+                                    uint16_t half = 0;
+                                    std::memcpy(&half, pixels.data() + t * 8 + c * 2, sizeof(half));
+                                    value = half_to_float(half);
+                                    if (std::isnan(value)) value = 0.0f;
+                                }
+                                std::memcpy(upload.data() + (t * 4 + c) * sizeof(float),
+                                            &value, sizeof(value));
+                            }
+                        }
+                    } else if (live_target.format == LiveTargetPixelFormat::Rgba8Unorm) {
                         std::memcpy(upload.data(), pixels.data(), upload.size());
                     } else {
                         const size_t texels = static_cast<size_t>(volume_texels);
@@ -726,7 +749,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         const uint32_t bw = (r->width + 3) / 4, bh = (r->height + 3) / 4;
                         need = r->tile_mode ? tiled_elements_bytes(bw, bh, bpb, r->tile_mode)
                                             : (size_t)bw * bh * bpb;
-                    } else if (rgba8 || uint8 || r8 || f16 || r11g11b10) {
+                    } else if (rgba8 || uint8 || r8 || f16 || f32 || r11g11b10) {
                         const uint32_t bpt = r11g11b10 ? 4u : cb * nc;
                         need = r->tile_mode
                             ? (dim_3d && r->depth > 1
@@ -769,6 +792,17 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         const size_t texels = (size_t)volume_texels;
                         if (rgba8 || uint8 || r11g11b10) {          // Native 4-byte sampled texels
                             std::memcpy(upload.data(), lin.data(), lin.size());
+                        } else if (f32) {                           // Native float channels + default fill
+                            for (size_t t = 0; t < texels; ++t) {
+                                for (uint32_t c = 0; c < 4; ++c) {
+                                    float value = c == 3 ? 1.0f : 0.0f;
+                                    if (c < nc)
+                                        std::memcpy(&value, lin.data() + (t * nc + c) * sizeof(float),
+                                                    sizeof(value));
+                                    std::memcpy(upload.data() + (t * 4 + c) * sizeof(float),
+                                                &value, sizeof(value));
+                                }
+                            }
                         } else if (r8) {                            // R8: broadcast coverage to RGBA
                             for (size_t t = 0; t < texels; t++) {
                                 const uint8_t v = lin[t];
@@ -826,6 +860,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             ici.format = bi.storage ? VK_FORMAT_R32G32B32A32_UINT
                                     : (sampled_uint8 ? VK_FORMAT_R8G8B8A8_UINT
                                        : sampled_r11g11b10 ? VK_FORMAT_B10G11R11_UFLOAT_PACK32
+                                         : sampled_float32 ? VK_FORMAT_R32G32B32A32_SFLOAT
                                                            : VK_FORMAT_R8G8B8A8_UNORM);
             ici.extent = {r->width, r->height, r->depth};
             ici.mipLevels = 1;
