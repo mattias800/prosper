@@ -248,6 +248,13 @@ bool snapshot_guest_wait(uint64_t windows_tid, GuestWaitSnapshot& snapshot) {
         if (slot.windows_tid.load(std::memory_order_acquire) != windows_tid) continue;
         snapshot.kind = kind;
         snapshot.object = object;
+        if (kind == GuestWaitKind::ConditionSequence) {
+            for (const CondSlot& cond : g_cond_slots) {
+                if ((uintptr_t)&cond.sequence != object) continue;
+                snapshot.source = cond.cond.load(std::memory_order_acquire);
+                break;
+            }
+        }
         return true;
     }
 #else

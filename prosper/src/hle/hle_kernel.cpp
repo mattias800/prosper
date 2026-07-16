@@ -1995,8 +1995,14 @@ void dump_guest_thread_trace() {
             const char* kind = wait.kind == GuestWaitKind::Address ? "address" :
                                wait.kind == GuestWaitKind::ConditionSequence ? "condition" :
                                "unknown";
-            std::snprintf(wait_description, sizeof(wait_description), "%s@0x%llx", kind,
-                          (unsigned long long)wait.object);
+            if (wait.source)
+                std::snprintf(wait_description, sizeof(wait_description),
+                              "%s@0x%llx(source=0x%llx)", kind,
+                              (unsigned long long)wait.object,
+                              (unsigned long long)wait.source);
+            else
+                std::snprintf(wait_description, sizeof(wait_description), "%s@0x%llx", kind,
+                              (unsigned long long)wait.object);
         }
         trace("[thread-trace] tid=%lu pthread=0x%llx rip=%s+0x%llx "
               "raw=0x%llx rsp=0x%llx suspend=%lu wait=%s guest-stack=%s\n",

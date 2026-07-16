@@ -13,6 +13,7 @@ enum class GuestWaitKind : uint32_t { None, Address, ConditionSequence };
 struct GuestWaitSnapshot {
     GuestWaitKind kind = GuestWaitKind::None;
     uintptr_t object = 0;
+    uintptr_t source = 0;
 };
 
 // Bracket a blocking guest futex wait: enter before FUTEX_WAIT, exit after it returns. Lets
