@@ -263,6 +263,17 @@ bool snapshot_guest_wait(uint64_t windows_tid, GuestWaitSnapshot& snapshot) {
     return false;
 }
 
+void snapshot_guest_wait_registry(size_t& condition_slots_used,
+                                  size_t& condition_slots_capacity) {
+    condition_slots_used = 0;
+    condition_slots_capacity = 0;
+#ifdef _WIN32
+    condition_slots_capacity = g_cond_slots.size();
+    for (const CondSlot& slot : g_cond_slots)
+        condition_slots_used += slot.cond.load(std::memory_order_acquire) != 0;
+#endif
+}
+
 void futex_wake(uint64_t addr, int n) {
 #if defined(__linux__) || defined(__APPLE__)
     if (!addr) return;

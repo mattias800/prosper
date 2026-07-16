@@ -4,6 +4,7 @@
 // never silently diverge from the blocking primitive it must pair with (a future non-futex port —
 // e.g. Windows WaitOnAddress — changes both sides together).
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include <pthread.h>
 
@@ -39,6 +40,8 @@ bool interrupt_guest_wait(uint64_t thread);
 // Read a Windows guest thread's currently registered interruptible wait. Used by the
 // app checkpoint to distinguish futex/label waits from pthread condition waits.
 bool snapshot_guest_wait(uint64_t windows_tid, GuestWaitSnapshot& snapshot);
+void snapshot_guest_wait_registry(size_t& condition_slots_used,
+                                  size_t& condition_slots_capacity);
 
 // FUTEX_WAKE up to n waiters blocked on the 32-bit word at addr. No-op when addr==0 or non-Linux.
 void futex_wake(uint64_t addr, int n);

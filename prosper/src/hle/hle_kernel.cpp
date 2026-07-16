@@ -1916,7 +1916,11 @@ void dump_guest_thread_trace() {
     unsigned live = 0;
     for (const WinGuestThreadSlot& slot : g_win_guest_threads)
         live += slot.native_id.load(std::memory_order_acquire) != 0;
-    trace("[thread-trace] live guest threads=%u\n", live);
+    size_t condition_slots_used = 0;
+    size_t condition_slots_capacity = 0;
+    snapshot_guest_wait_registry(condition_slots_used, condition_slots_capacity);
+    trace("[thread-trace] live guest threads=%u condition-slots=%zu/%zu\n", live,
+          condition_slots_used, condition_slots_capacity);
     for (const WinGuestThreadSlot& slot : g_win_guest_threads) {
         const uint32_t native_id = slot.native_id.load(std::memory_order_acquire);
         if (!native_id) continue;
