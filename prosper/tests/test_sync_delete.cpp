@@ -8,9 +8,20 @@
 #include "../src/hle/nid.hpp"
 #include <cstdio>
 #include <cstdint>
+#include <cinttypes>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <string>
 #include <thread>
+#include <vector>
+#include <pthread.h>
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 using namespace prosper;
 
@@ -19,9 +30,75 @@ static int fails = 0;
                          else       { printf("  [ok]   %s\n", m); } } while (0)
 
 static constexpr uint32_t kEACCES = 0x8002000Du;
+static constexpr uint32_t kETIMEDOUT = 0x8002003Cu;
+
+static bool set_test_env(const char* name, const char* value) {
+#ifdef _WIN32
+    return _putenv_s(name, value) == 0;
+#else
+    return setenv(name, value, 1) == 0;
+#endif
+}
+
+static int file_descriptor(FILE* file) {
+#ifdef _WIN32
+    return _fileno(file);
+#else
+    return fileno(file);
+#endif
+}
+
+static int duplicate_descriptor(int fd) {
+#ifdef _WIN32
+    return _dup(fd);
+#else
+    return dup(fd);
+#endif
+}
+
+static int replace_descriptor(int from, int to) {
+#ifdef _WIN32
+    return _dup2(from, to);
+#else
+    return dup2(from, to);
+#endif
+}
+
+static void close_descriptor(int fd) {
+#ifdef _WIN32
+    _close(fd);
+#else
+    close(fd);
+#endif
+}
 
 int main() {
     printf("== test_sync_delete ==\n");
+    char formatted_tid[32]{};
+    snprintf(formatted_tid, sizeof(formatted_tid), "%" PRIu64,
+             sync_trace_tid_value(0x80000000u));
+    CHECK(strcmp(formatted_tid, "2147483648") == 0,
+          "sync trace formats an unsigned high-bit native TID");
+
+    char pthread_filter[32]{};
+    snprintf(pthread_filter, sizeof(pthread_filter), "%llu",
+             (unsigned long long)(uintptr_t)pthread_self());
+    CHECK(set_test_env("PROSPER_SYNCLOG", "1"), "sync trace enabled for regression");
+    CHECK(set_test_env("PROSPER_SYNCLOG_SEMA_ONLY", "1"), "semaphore-only trace enabled");
+    CHECK(set_test_env("PROSPER_SYNCLOG_DELAY_MS", "20"), "sync trace delay configured");
+    CHECK(set_test_env("PROSPER_SYNCLOG_PTHREAD", pthread_filter), "sync trace pthread filter configured");
+
+    FILE* trace_file = tmpfile();
+    int saved_stderr = -1;
+    bool capturing = false;
+    if (trace_file) {
+        fflush(stderr);
+        saved_stderr = duplicate_descriptor(file_descriptor(stderr));
+        capturing = saved_stderr >= 0 &&
+                    replace_descriptor(file_descriptor(trace_file), file_descriptor(stderr)) >= 0;
+    }
+    CHECK(capturing, "stderr trace capture initialized");
+
     register_builtin_hle();
 
     auto ef_create = Hle::lookup(nid_hash("sceKernelCreateEventFlag"));
@@ -30,8 +107,12 @@ int main() {
     auto se_create = Hle::lookup(nid_hash("sceKernelCreateSema"));
     auto se_wait   = Hle::lookup(nid_hash("sceKernelWaitSema"));
     auto se_delete = Hle::lookup(nid_hash("sceKernelDeleteSema"));
-    CHECK(ef_create && ef_wait && ef_delete && se_create && se_wait && se_delete, "ef/sema fns registered");
-    if (!(ef_create && ef_wait && ef_delete && se_create && se_wait && se_delete)) { printf("== FAIL ==\n"); return 1; }
+    auto se_signal = Hle::lookup(nid_hash("sceKernelSignalSema"));
+    CHECK(ef_create && ef_wait && ef_delete && se_create && se_wait && se_delete && se_signal,
+          "ef/sema fns registered");
+    if (!(ef_create && ef_wait && ef_delete && se_create && se_wait && se_delete && se_signal)) {
+        printf("== FAIL ==\n"); return 1;
+    }
 
     // --- EventFlag: park a thread on an infinite wait for a bit-pattern that never gets set, then
     //     delete the flag. The waiter must wake with EACCES (not hang, not crash on freed memory). ---
@@ -56,7 +137,9 @@ int main() {
     // --- Semaphore: same shape — park on a count that never arrives, delete, expect EACCES wake. ---
     {
         void* se = nullptr;
-        se_create((uint64_t)(uintptr_t)&se, 0, 0, 0 /*initCount*/, 8 /*maxCount*/, 0);
+        static const char delay_origin_name[] = "delay-origin";
+        se_create((uint64_t)(uintptr_t)&se, (uint64_t)(uintptr_t)delay_origin_name, 0,
+                  0 /*initCount*/, 8 /*maxCount*/, 0);
         CHECK(se != nullptr, "semaphore created");
         std::atomic<uint64_t> wret{~0ull}; std::atomic<bool> done{false};
         std::thread t([&]{
@@ -72,6 +155,42 @@ int main() {
         CHECK((uint32_t)wret.load() == kEACCES, "woken semaphore waiter returned EACCES");
     }
 
+    // Focus is an object-lifetime identity, not just an address. Focus A from the filtered thread,
+    // delete it, require allocator reuse for B, then signal B from an excluded thread. A stale
+    // pointer-only focus would incorrectly retain that signal as causal traffic for A.
+    {
+        void* focused = nullptr;
+        se_create((uint64_t)(uintptr_t)&focused, (uint64_t)(uintptr_t)"focus-a", 0, 0, 8, 0);
+        CHECK(focused != nullptr, "focused semaphore created");
+        const uintptr_t focused_address = (uintptr_t)focused;
+        uint32_t timeout = 1;
+        const uint64_t wait_result = se_wait((uint64_t)focused_address, 1,
+                                             (uint64_t)(uintptr_t)&timeout, 0, 0, 0);
+        CHECK((uint32_t)wait_result == kETIMEDOUT, "focused semaphore wait timed out");
+        se_delete((uint64_t)focused_address, 0, 0, 0, 0, 0);
+
+#ifdef _WIN32
+        void* reused = nullptr;
+        std::vector<void*> held;
+        for (int i = 0; i < 256 && !reused; ++i) {
+            void* candidate = nullptr;
+            se_create((uint64_t)(uintptr_t)&candidate, (uint64_t)(uintptr_t)"focus-b", 0, 0, 8, 0);
+            if ((uintptr_t)candidate == focused_address) reused = candidate;
+            else held.push_back(candidate);
+        }
+        CHECK(reused != nullptr, "allocator reused the deleted focused semaphore address");
+        if (reused) {
+            std::thread signaler([&] { se_signal((uint64_t)(uintptr_t)reused, 1, 0, 0, 0, 0); });
+            signaler.join();
+            se_delete((uint64_t)(uintptr_t)reused, 0, 0, 0, 0, 0);
+        }
+        for (void* candidate : held)
+            se_delete((uint64_t)(uintptr_t)candidate, 0, 0, 0, 0, 0);
+#else
+        CHECK(true, "deleted-focus address-reuse regression is Windows-specific");
+#endif
+    }
+
     // --- Delete with NO waiters must also be safe (frees immediately, no crash on a later create). ---
     {
         void* ef = nullptr; ef_create((uint64_t)(uintptr_t)&ef, 0, 0, 0, 0, 0);
@@ -80,6 +199,23 @@ int main() {
         se_delete((uint64_t)(uintptr_t)se, 0, 0, 0, 0, 0);
         CHECK(true, "delete with no waiters frees cleanly");
     }
+
+    std::string trace;
+    if (capturing) {
+        fflush(stderr);
+        replace_descriptor(saved_stderr, file_descriptor(stderr));
+        close_descriptor(saved_stderr);
+        saved_stderr = -1;
+        rewind(trace_file);
+        char buffer[4096];
+        while (size_t count = fread(buffer, 1, sizeof(buffer), trace_file))
+            trace.append(buffer, count);
+    }
+    if (trace_file) fclose(trace_file);
+    CHECK(trace.find("name='delay-origin'") != std::string::npos,
+          "excluded event-flag traffic anchors the common trace delay");
+    CHECK(trace.find("SEMA.signal") == std::string::npos,
+          "deleted semaphore focus does not retain a reused object's signal");
 
     if (fails) { printf("== FAIL: %d check(s) ==\n", fails); return 1; }
     printf("== PASS ==\n");
