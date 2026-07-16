@@ -492,6 +492,17 @@ int main() {
               clear_pixels[0] == 0 && clear_pixels[1] == 255 &&
               clear_pixels[2] == 255 && clear_pixels[3] == 255,
               "uniform DCC_CLEAR_1110 places alpha zero in the LSB component");
+        CHECK(gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1,
+                                         clear_0000.data(), clear_0000.size(),
+                                         3, true) &&
+              clear_pixels[0] == 0 && clear_pixels[1] == 0 &&
+              clear_pixels[2] == 0 && clear_pixels[3] == 255 &&
+              gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1,
+                                         clear_1110.data(), clear_1110.size(),
+                                         3, false) &&
+              clear_pixels[0] == 255 && clear_pixels[1] == 255 &&
+              clear_pixels[2] == 255 && clear_pixels[3] == 255,
+              "three-component DCC clears materialize RGB with sampled alpha one");
         std::vector<uint8_t> mixed_clear(16, 0); mixed_clear.back() = 0x40;
         const std::vector<uint8_t> uncompressed(16, 0xff);
         CHECK(!gfx10_dcc_fast_clear_rgba8(clear_pixels.data(), 1,
