@@ -21,6 +21,17 @@
 #include <vector>
 
 namespace prosper::frontend {
+
+uint8_t storage_pack_unorm8(uint32_t float_bits) {
+    float value;
+    std::memcpy(&value, &float_bits, sizeof(value));
+    if (!(value > 0.0f)) return 0; // Includes negative values and NaN.
+    if (value >= 1.0f) return 255;
+    const float scaled = value * 255.0f;
+    const uint32_t whole = static_cast<uint32_t>(scaled);
+    return static_cast<uint8_t>(whole + (scaled - static_cast<float>(whole) >= 0.5f));
+}
+
 namespace {
 
 constexpr VkDeviceSize kMaxComputeImageBytes = 256ull << 20;
@@ -248,6 +259,10 @@ struct VulkanComputeContext {
     uint32_t host_memory_type(uint32_t bits) const {
         const VkMemoryPropertyFlags wanted = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        const VkMemoryPropertyFlags cached = wanted | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+        for (uint32_t i = 0; i < memory.memoryTypeCount; i++)
+            if ((bits & (1u << i)) && (memory.memoryTypes[i].propertyFlags & cached) == cached)
+                return i;
         for (uint32_t i = 0; i < memory.memoryTypeCount; i++)
             if ((bits & (1u << i)) && (memory.memoryTypes[i].propertyFlags & wanted) == wanted)
                 return i;
@@ -319,10 +334,7 @@ void storage_pack_texel(const uint32_t in[4], prosper::gpu::DataFormat f, uint32
     using DF = prosper::gpu::DataFormat;
     for (uint32_t c = 0; c < ncomp && c < 4; c++) {
         switch (f) {
-            case DF::Unorm8: { float v; std::memcpy(&v, &in[c], 4);
-                               if (std::isnan(v)) v = 0.f;
-                               v = v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
-                               dst[c] = (uint8_t)std::lround(v * 255.0f); break; }
+            case DF::Unorm8: dst[c] = storage_pack_unorm8(in[c]); break;
             case DF::Float16: { float v; std::memcpy(&v, &in[c], 4);
                                 const uint16_t h = prosper::gpu::float_to_half(v);
                                 dst[c * 2] = static_cast<uint8_t>(h);
@@ -372,6 +384,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
     auto phase_pipeline = phase_start;
     auto phase_dispatch = phase_start;
     auto phase_writeback = phase_start;
+    double pack_ms = 0.0;
+    double layout_ms = 0.0;
     const bool trace = trace_compute_item(item);
     auto report = validate_spirv_descriptor_interface(
         item.spirv, item.resources.get(), 0, SpirvShaderStage::Compute, false);
@@ -584,14 +598,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 }
             }
             // A renderer-owned target's current pixels are not in raw guest memory. Import its
-            // immutable CPU snapshot for sampled bindings; storage bindings and GPU-only targets
-            // stay unsupported rather than silently reading or overwriting stale guest bytes.
+            // immutable CPU snapshot for sampled and storage bindings; a successful storage
+            // writeback publishes ordinary guest bytes and invalidates the renderer-owned copy.
             LiveTargetSnapshot live_target;
             const bool renderer_owned = is_live_render_target(r->gpu_addr);
             if (renderer_owned) {
-                if (bi.storage) {
-                    skip_image(r, "renderer-owned RTT bound as storage image"); break;
-                }
                 if (dim_3d || r->depth != 1 ||
                     !read_live_render_target(r->gpu_addr, live_target) || !live_target.pixels) {
                     skip_image(r, "renderer-owned RTT has no readable snapshot"); break;
@@ -607,6 +618,17 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const uint64_t expected = texels * bpp;
                 if (expected != live_target.pixels->size()) {
                     skip_image(r, "renderer-owned RTT snapshot byte count mismatch"); break;
+                }
+                if (bi.storage) {
+                    const uint32_t nc = r->num_components ? r->num_components : 1;
+                    const bool compatible =
+                        (live_target.format == LiveTargetPixelFormat::Rgba8Unorm &&
+                         r->format == DataFormat::Unorm8 && nc == 4) ||
+                        (live_target.format == LiveTargetPixelFormat::Rgba16Float &&
+                         r->format == DataFormat::Float16 && nc == 4);
+                    if (!compatible) {
+                        skip_image(r, "renderer RTT storage format mismatch"); break;
+                    }
                 }
             }
             // Multiple U# bindings may intentionally name the same guest surface (read/modify/write
@@ -651,12 +673,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // Fill the upload staging bytes.
             std::vector<uint8_t> upload((size_t)sbytes, 0);
             if (bi.storage) {
-                // The pure tile mapping and a production-backend fixture pass, but arbitrary live
-                // 1D/2D storage descriptors still need title validation before becoming the default.
-                // Keep the prior fail-visible behavior while allowing a bounded game A/B.
                 if (r->tile_mode && !dim_3d &&
-                    !std::getenv("PROSPER_COMPUTE_TILED_2D_STORAGE")) {
-                    skip_image(r, "tiled 1D/2D storage writeback deferred"); break;
+                    std::getenv("PROSPER_DISABLE_COMPUTE_TILED_2D_STORAGE")) {
+                    skip_image(r, "tiled 1D/2D storage writeback disabled"); break;
                 }
                 if (!storage_unpack_supported(r->format) || !storage_pack_supported(r->format)) {
                     skip_image(r, "storage format has no channel pack/unpack yet"); break; }
@@ -681,17 +700,31 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const bool readable = (r->host_data && r->host_data_size >= guest_bytes) ||
                                       guest_readable(r->gpu_addr, static_cast<uint32_t>(guest_bytes));
                 if (!readable) { skip_image(r, "storage backing unreadable"); break; }
-                if (trace) bi.before_hash = fnv1a(src, guest_bytes);
                 std::vector<uint8_t> linear((size_t)linear_guest_bytes, 0);
-                if (r->tile_mode && r->depth > 1) {
+                if (renderer_owned) {
+                    std::memcpy(linear.data(), live_target.pixels->data(), linear.size());
+                    if (trace) {
+                        bi.before_hash = fnv1a(linear.data(), linear.size());
+                        std::fprintf(stderr,
+                                     "[compute]   imported writable renderer RTT binding=%u "
+                                     "addr=0x%llx extent=%ux%u format=%s\n",
+                                     bi.binding, (unsigned long long)r->gpu_addr,
+                                     r->width, r->height,
+                                     live_target.format == LiveTargetPixelFormat::Rgba16Float
+                                         ? "rgba16f" : "rgba8");
+                    }
+                } else if (r->tile_mode && r->depth > 1) {
+                    if (trace) bi.before_hash = fnv1a(src, guest_bytes);
                     if (!detile_volume(linear.data(), src, guest_bytes, r->width, r->height,
                                        r->depth, r->tile_mode, static_cast<uint32_t>(guest_texel))) {
                         skip_image(r, "storage volume detile failed"); break;
                     }
                 } else if (r->tile_mode) {
+                    if (trace) bi.before_hash = fnv1a(src, guest_bytes);
                     detile_surface(linear.data(), src, r->width, r->height, r->tile_mode, 0,
                                    static_cast<uint32_t>(guest_texel));
                 } else {
+                    if (trace) bi.before_hash = fnv1a(src, guest_bytes);
                     std::memcpy(linear.data(), src, linear.size());
                 }
                 for (size_t t = 0; t < texels; t++)
@@ -1161,9 +1194,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     for (uint32_t c = 0; c < 4; c++)
                         bi.nonzero_channels += channels[t * 4 + c] != 0;
             }
+            const auto pack_start = ComputeClock::now();
             for (size_t t = 0; t < texels; t++)
                 storage_pack_texel(channels + t * 4, r->format, nc,
                                    linear.data() + t * guest_texel);
+            const auto pack_done = ComputeClock::now();
             uint8_t* destination = resource_bytes_for(r, bi.guest_bytes);
             if (r->tile_mode && r->depth > 1) {
                 if (!tile_volume(destination, bi.guest_bytes, linear.data(), r->width, r->height,
@@ -1178,6 +1213,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             } else {
                 std::memcpy(destination, linear.data(), linear.size());
             }
+            const auto layout_done = ComputeClock::now();
+            pack_ms += std::chrono::duration<double, std::milli>(pack_done - pack_start).count();
+            layout_ms += std::chrono::duration<double, std::milli>(layout_done - pack_done).count();
             if (trace) bi.after_hash = fnv1a(destination, bi.guest_bytes);
             notify_guest_gpu_write(r->gpu_addr, bi.guest_bytes);
             if (!r->host_data && writer_provenance_enabled())
@@ -1257,12 +1295,14 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         std::fprintf(stderr,
                      "[compute-phase] submit=%llu code=0x%llx ok=%u "
                      "setup_ms=%.2f pipeline_ms=%.2f dispatch_ms=%.2f "
-                     "writeback_ms=%.2f cleanup_ms=%.2f total_ms=%.2f\n",
+                     "writeback_ms=%.2f pack_ms=%.2f layout_ms=%.2f "
+                     "cleanup_ms=%.2f total_ms=%.2f\n",
                      (unsigned long long)item.submit_no, (unsigned long long)item.code_addr,
                      ok ? 1u : 0u, milliseconds(phase_start, phase_setup),
                      milliseconds(phase_setup, phase_pipeline),
                      milliseconds(phase_pipeline, phase_dispatch),
                      milliseconds(phase_dispatch, phase_writeback),
+                     pack_ms, layout_ms,
                      milliseconds(phase_writeback, phase_cleanup),
                      milliseconds(phase_start, phase_cleanup));
     }

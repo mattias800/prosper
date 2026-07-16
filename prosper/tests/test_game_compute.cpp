@@ -4,9 +4,12 @@
 #include "live_compute.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
+#include <limits>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -14,15 +17,52 @@ using namespace prosper::gpu;
 static int fails = 0;
 #define CHECK(c, msg) do { if (!(c)) { std::printf("FAIL: %s\n", msg); fails++; } } while (0)
 
-static void set_test_env(const char* name, const char* value) {
-#ifdef _WIN32
-    _putenv_s(name, value ? value : "");
-#else
-    if (value) setenv(name, value, 1); else unsetenv(name);
-#endif
-}
-
 int main() {
+    // MinGW's lround dominates full-HD storage-image writeback. Prove the bounded integer path is
+    // identical to the previous conversion across all half-float values, every UNORM threshold and
+    // adjacent float, plus a deterministic million-value float32 sample.
+    auto reference_unorm8 = [](uint32_t bits) {
+        float value;
+        std::memcpy(&value, &bits, sizeof(value));
+        if (std::isnan(value)) value = 0.0f;
+        value = value < 0.0f ? 0.0f : (value > 1.0f ? 1.0f : value);
+        return static_cast<uint8_t>(std::lround(value * 255.0f));
+    };
+    auto check_unorm8 = [&](float value) {
+        uint32_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        return prosper::frontend::storage_pack_unorm8(bits) == reference_unorm8(bits);
+    };
+    bool unorm8_matches = true;
+    const float edge_values[] = {
+        -std::numeric_limits<float>::infinity(), -1.0f, -0.0f, 0.0f,
+        std::numeric_limits<float>::denorm_min(), 1.0f,
+        std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN(),
+    };
+    for (float value : edge_values) unorm8_matches &= check_unorm8(value);
+    for (uint32_t i = 0; i < 255; ++i) {
+        const float threshold = (static_cast<float>(i) + 0.5f) / 255.0f;
+        unorm8_matches &= check_unorm8(std::nextafter(threshold, 0.0f));
+        unorm8_matches &= check_unorm8(threshold);
+        unorm8_matches &= check_unorm8(std::nextafter(threshold, 1.0f));
+    }
+    for (uint32_t bits = 0; bits <= 0xffff; ++bits) {
+        const float value = prosper::gpu::half_to_float(static_cast<uint16_t>(bits));
+        unorm8_matches &= check_unorm8(value);
+    }
+    uint32_t random_bits = 0x6d2b79f5u;
+    for (uint32_t i = 0; i < 1000000; ++i) {
+        random_bits ^= random_bits << 13;
+        random_bits ^= random_bits >> 17;
+        random_bits ^= random_bits << 5;
+        if (prosper::frontend::storage_pack_unorm8(random_bits) !=
+            reference_unorm8(random_bits)) {
+            unorm8_matches = false;
+            break;
+        }
+    }
+    CHECK(unorm8_matches, "fast UNORM8 pack is equivalent to the lround reference");
+
     // Dead Cells' bound startup fill kernel, copied verbatim from eboot.elf at runtime address
     // 0x401aec200. It stores s4-s7 to record `(TGID_X << 6) + local_id_x` through the V# in s0-s3.
     static const uint32_t code[] = {
@@ -227,10 +267,8 @@ int main() {
         dcc_item.launch.local_y = dcc_item.launch.local_z = 1;
         dcc_item.launch.groups_y = dcc_item.launch.groups_z = 1;
         dcc_item.code_addr = 0x719dcc;
-        set_test_env("PROSPER_COMPUTE_TILED_2D_STORAGE", "1");
         CHECK(prosper::frontend::execute_live_compute_items({dcc_item}),
               "live backend writes the tiled DCC storage image");
-        set_test_env("PROSPER_COMPUTE_TILED_2D_STORAGE", nullptr);
         std::vector<uint8_t> dcc_linear(W * 4, 0);
         detile_surface(dcc_linear.data(), tiled_dst.data(), W, 1, dcc_tile, 0, 4);
         CHECK(dcc_linear == img_src,
@@ -273,7 +311,6 @@ int main() {
         &tiled2d_rt);
     CHECK(!tiled2d_spirv.empty(), "tiled 2D storage-image copy kernel recompiles");
     if (!tiled2d_spirv.empty()) {
-        set_test_env("PROSPER_COMPUTE_TILED_2D_STORAGE", "1");
         ComputeItem tiled2d_item;
         tiled2d_item.spirv = tiled2d_spirv;
         tiled2d_item.resources = std::make_shared<ShaderResourceTable>(tiled2d_rt);
@@ -293,7 +330,6 @@ int main() {
         std::copy_n(tiled2d_src_linear.begin(), W * 4, tiled2d_expected.begin());
         CHECK(tiled2d_result == tiled2d_expected,
               "tiled 2D storage-image writeback matches the linear reference byte-exactly");
-        set_test_env("PROSPER_COMPUTE_TILED_2D_STORAGE", nullptr);
     }
 
     // A renderer-owned color target is newer than its guest backing. Recompile the same copy kernel
@@ -353,6 +389,63 @@ int main() {
               "sampled renderer RTT pixels reach storage-image writeback byte-exactly");
         CHECK(live_dst != stale_rtt, "renderer RTT import does not use stale guest backing");
     }
+
+    // A renderer target can become a writable storage image before its pixels have been materialized
+    // in guest RAM. Seed the dispatch from the immutable renderer snapshot, modify row zero, and
+    // prove writeback preserves every untouched row while publishing a cache-invalidation write.
+    std::vector<uint8_t> writable_rtt_guest(tiled2d_bytes, 0);
+    auto writable_rtt = std::make_shared<std::vector<uint8_t>>(W * TILED_H * 4);
+    for (size_t i = 0; i < writable_rtt->size(); ++i)
+        (*writable_rtt)[i] = static_cast<uint8_t>(i * 17 + 3);
+    ShaderResourceTable writable_rt = tiled2d_rt;
+    for (ShaderResource& resource : writable_rt.resources) {
+        if (resource.binding == 5) {
+            resource.gpu_addr = reinterpret_cast<uint64_t>(writable_rtt_guest.data());
+            resource.size = static_cast<uint32_t>(writable_rtt_guest.size());
+        }
+    }
+    const uint64_t writable_addr = reinterpret_cast<uint64_t>(writable_rtt_guest.data());
+    set_live_target_query([writable_addr](uint64_t addr) { return addr == writable_addr; });
+    set_live_target_reader(
+        [writable_addr, writable_rtt](uint64_t addr, LiveTargetSnapshot& snapshot) {
+            if (addr != writable_addr) return false;
+            snapshot.width = W;
+            snapshot.height = TILED_H;
+            snapshot.format = LiveTargetPixelFormat::Rgba8Unorm;
+            snapshot.pixels = writable_rtt;
+            return true;
+        });
+    bool writable_rtt_published = false;
+    set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+        writable_rtt_published |= addr == writable_addr && size == writable_rtt_guest.size();
+    });
+    const std::vector<uint32_t> writable_spirv = recompile_valu(
+        image_copy_2d, sizeof(image_copy_2d) / sizeof(image_copy_2d[0]), 1, 0,
+        &writable_rt);
+    CHECK(!writable_spirv.empty(), "writable renderer RTT copy kernel recompiles");
+    if (!writable_spirv.empty()) {
+        ComputeItem writable_item;
+        writable_item.spirv = writable_spirv;
+        writable_item.resources = std::make_shared<ShaderResourceTable>(writable_rt);
+        writable_item.launch.threads_x = W;
+        writable_item.launch.local_x = 64;
+        writable_item.launch.groups_x = 1;
+        writable_item.launch.local_y = writable_item.launch.local_z = 1;
+        writable_item.launch.groups_y = writable_item.launch.groups_z = 1;
+        writable_item.code_addr = 0x590593;
+        CHECK(prosper::frontend::execute_live_compute_items({writable_item}),
+              "live backend executes a dispatch writing a renderer-owned RTT");
+        std::vector<uint8_t> writable_result(W * TILED_H * 4, 0);
+        detile_surface(writable_result.data(), writable_rtt_guest.data(), W, TILED_H,
+                       tiled2d_mode, 0, 4);
+        std::vector<uint8_t> writable_expected = *writable_rtt;
+        std::copy_n(tiled2d_src_linear.begin(), W * 4, writable_expected.begin());
+        CHECK(writable_result == writable_expected,
+              "writable renderer RTT seeds from live pixels and preserves untouched rows");
+        CHECK(writable_rtt_published,
+              "writable renderer RTT publishes guest writeback for cache invalidation");
+    }
+    set_guest_gpu_write_observer({});
     set_live_target_reader({});
     set_live_target_query({});
 
