@@ -1897,7 +1897,7 @@ void dump_guest_exception_trace() {
 #endif
 }
 
-void dump_guest_thread_trace(const char* path) {
+void dump_guest_thread_trace(const char* path, uint64_t pthread_filter) {
 #ifdef _WIN32
     HANDLE output = GetStdHandle(STD_ERROR_HANDLE);
     bool close_output = false;
@@ -1936,6 +1936,7 @@ void dump_guest_thread_trace(const char* path) {
         const uint32_t native_id = slot.native_id.load(std::memory_order_acquire);
         if (!native_id) continue;
         const uint64_t pthread_id = slot.pthread_id.load(std::memory_order_acquire);
+        if (pthread_filter && pthread_id != pthread_filter) continue;
         const uintptr_t stack_base = slot.stack_base.load(std::memory_order_acquire);
         const size_t stack_size = slot.stack_size.load(std::memory_order_acquire);
         HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
@@ -2029,6 +2030,7 @@ void dump_guest_thread_trace(const char* path) {
     if (close_output) CloseHandle(output);
 #else
     (void)path;
+    (void)pthread_filter;
 #endif
 }
 

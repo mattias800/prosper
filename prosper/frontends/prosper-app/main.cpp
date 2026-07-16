@@ -488,6 +488,9 @@ int main(int argc, char** argv) {
     const int timedDumpIntervalMs = timedDumpIntervalEnv ?
         std::max(0, atoi(timedDumpIntervalEnv)) : 0;
     const char* timedDumpPath = getenv("PROSPER_APP_GUEST_DUMP_PATH");
+    const char* timedDumpPthreadEnv = getenv("PROSPER_APP_GUEST_DUMP_PTHREAD");
+    const uint64_t timedDumpPthread = timedDumpPthreadEnv ?
+        strtoull(timedDumpPthreadEnv, nullptr, 0) : 0;
     const auto loopStarted = std::chrono::steady_clock::now();
     auto lastFrameProgress = loopStarted;
     auto nextTimedDump = loopStarted + std::chrono::milliseconds(timedDumpMs);
@@ -513,8 +516,8 @@ int main(int argc, char** argv) {
                 loopNow - loopStarted).count();
             fprintf(stderr, "[app] timed guest-state dump #%u after %lld ms at frame %llu\n",
                     timedDumpCount, (long long)elapsed, (unsigned long long)shown);
-            dump_guest_exception_trace();
-            dump_guest_thread_trace(timedDumpPath);
+            if (timedDumpCount == 1) dump_guest_exception_trace();
+            dump_guest_thread_trace(timedDumpPath, timedDumpPthread);
             if (timedDumpIntervalMs > 0)
                 nextTimedDump = loopNow + std::chrono::milliseconds(timedDumpIntervalMs);
             else

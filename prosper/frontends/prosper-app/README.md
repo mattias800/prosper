@@ -86,4 +86,5 @@ These switches isolate frontend-specific behavior without requiring a separate b
   continue. Use it for guest progression stalls that are not render stalls; it is disabled by default.
   `PROSPER_APP_GUEST_DUMP_INTERVAL_MS` repeats the sample at that interval, and
   `PROSPER_APP_GUEST_DUMP_PATH` writes thread samples to a dedicated append-only file so other trace
-  streams cannot interleave with them.
+  streams cannot interleave with them. `PROSPER_APP_GUEST_DUMP_PTHREAD=<id>` limits each sample to
+  one guest pthread (for example `0x2` for a title's main thread) to reduce observer overhead.
