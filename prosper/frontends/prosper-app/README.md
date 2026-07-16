@@ -81,3 +81,6 @@ These switches isolate frontend-specific behavior without requiring a separate b
   flip-boundary stop is a documented follow-up).
 - `PROSPER_APP_STALL_DUMP_MS=<milliseconds>` prints the recent Windows guest-exception ring when no new
   presented frame arrives within that interval. It is an unattended-run diagnostic, disabled by default.
+- `PROSPER_APP_EXC_DUMP_MS=<milliseconds>` prints that ring once after the app loop has run for the
+  requested time, even while frames continue. Use it for guest progression stalls that are not render
+  stalls; it is disabled by default.

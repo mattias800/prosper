@@ -482,8 +482,12 @@ int main(int argc, char** argv) {
     const bool frameTrace = getenv("PROSPER_APP_FRAME_TRACE") != nullptr;
     const char* stallDumpEnv = getenv("PROSPER_APP_STALL_DUMP_MS");
     const int stallDumpMs = stallDumpEnv ? std::max(0, atoi(stallDumpEnv)) : 0;
-    auto lastFrameProgress = std::chrono::steady_clock::now();
+    const char* timedDumpEnv = getenv("PROSPER_APP_EXC_DUMP_MS");
+    const int timedDumpMs = timedDumpEnv ? std::max(0, atoi(timedDumpEnv)) : 0;
+    const auto loopStarted = std::chrono::steady_clock::now();
+    auto lastFrameProgress = loopStarted;
     uint64_t shown = 0, lastFrameSeq = ~0ull, patFrame = 0;
+    bool timedDumpDone = false;
     bool running = true;
     while (running && !prosper_stop_requested()) {
         SDL_Event ev;
@@ -496,6 +500,14 @@ int main(int argc, char** argv) {
 #ifdef PROSPER_HAVE_DIALOG_SDL3
         prosper::sdl_platform_ui_pump();   // run a pending ImeDialog text-entry modal on this (main) thread
 #endif
+        if (!timedDumpDone && timedDumpMs > 0 &&
+            std::chrono::steady_clock::now() - loopStarted >=
+                std::chrono::milliseconds(timedDumpMs)) {
+            fprintf(stderr, "[app] timed guest-exception dump after %d ms at frame %llu\n",
+                    timedDumpMs, (unsigned long long)shown);
+            dump_guest_exception_trace();
+            timedDumpDone = true;
+        }
 
         static const uint32_t kPatW = 1920, kPatH = 1080;
         if (testPattern) feed_test_pattern(kPatW, kPatH, patFrame++);
