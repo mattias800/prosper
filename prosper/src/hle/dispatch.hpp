@@ -98,8 +98,10 @@ void register_kernel_mem_hle();
 void register_kernel_time_hle();
 
 // The default target for unimplemented imports: logs (first-seen) and returns 0.
-// Called by generated stubs with the import index in the first arg.
-extern "C" uint64_t prosper_on_unimpl(uint64_t import_index);
+// Called by generated stubs with the import index in the first arg. Windows stubs also preserve the
+// guest return address and pre-call stack pointer for low-volume caller attribution.
+extern "C" uint64_t prosper_on_unimpl(uint64_t import_index, uint64_t guest_return = 0,
+                                       uint64_t guest_rsp = 0);
 
 // First-seen order of unimplemented import indices called by the guest.
 const std::vector<uint32_t>& call_order();
