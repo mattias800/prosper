@@ -454,7 +454,8 @@ Built the GPU executor per `docs/GPU_EXECUTOR_DESIGN.md` (all committed, Linux 4
   `set_submit_renderer`/`execute_and_present` (`gpu_executor.cpp`); `agc_driver_submit_dcb` calls it after
   folding, gated on `have_submit_renderer() && draws>0`. Inert until a device is registered. `test_gpu_execute`.
 - **Stage B** — RESOLVES the "blocker for doing it correctly" below (capturing the fence value beyond a0–a5).
-  Pinned the AGC ABI to Kyty `GraphicsCbReleaseMem(buf, action, gcr_cntl, dst, cache_policy, address,
+  Pinned the AGC ABI from guest wrapper disassembly and live stack-argument capture:
+  `GraphicsCbReleaseMem(buf, action, gcr_cntl, dst, cache_policy, address,
   data_sel, data, …)`: a5=label address, stack arg 7=`data_sel`, stack arg 8=the **full 64-bit value**.
   `honor_eop_write` now writes the correct value honoring `data_sel` (1=32b, 2=64b, 3=GPU clock), on by
   default (`PROSPER_NO_EOP_WRITE=1` disables). `honor_write_data` copies WRITE_DATA's real dwords. `test_eop_write`.
@@ -488,7 +489,7 @@ semantics, not a hack. **Blocker for doing it correctly:** the fence *value* REL
 argument passed on the guest stack (beyond a0–a5), which the current HLE ABI shim doesn't capture, and the
 `cmpFunc`/`ref` encoding of WAIT_REG_MEM must be honored exactly (writing a guessed value would be a fake —
 correctness-first). Doing this right needs either (a) capturing the stack args in the HLE trampoline, or
-(b) the Kyty Gen5 RELEASE_MEM/WAIT_REG_MEM field reference. This is the precise, bounded task that should
+(b) direct disassembly/capture of the Gen5 RELEASE_MEM/WAIT_REG_MEM fields. This is the precise, bounded task that should
 crack the render loop — best done with the user/reference in the loop (boot-wall-caliber), but it is now a
 *specific* mechanism, not a vague "GPU-execution build."
 
@@ -664,9 +665,9 @@ trailing `SInt8 m_Type`/`m_RowCount` + align. `unity_builtin_extra` has NO embed
 descriptor** built WITHOUT referencing the type by name (a static init table), not from the per-type Transfer
 functions. **This is the fixable root class: a static-initializer / RTTI-field-registration built the
 MatrixParameter (and VectorParameter) descriptor with only 3 fields (byteSize 12) in our env** — matching
-Kyty's init-ordering divergence note and Fable's "corrupted RTTI/static-init generation" mechanism #2.
+Fable's "corrupted RTTI/static-init generation" mechanism #2.
 **NEXT:** (a) find the static init that registers MatrixParameter's fields and why our env leaves it with 3
-fields / byteSize 12 (init-array ordering: we run PRX init reverse vs Kyty forward; confirm we don't
+fields / byteSize 12 (init-array ordering: we run PRX init in reverse; confirm we do not
 double-run or skip `_init`); or (b) gated capture of `0xd4ce00`'s `*0x38` elemSize for the m_MatrixParams read
 (arm after the 5th driver hit to avoid init perturbation) to nail the 12.
 
@@ -736,8 +737,8 @@ null alloc → crash.
 
 ### Fixable root class
 A runtime reflection/registration produces `MatrixParameter`/`VectorParameter` with only 3 fields (byteSize
-12) instead of 5 (16) in our env — matching Fable's "corrupted RTTI/static-init generation" mechanism and
-Kyty's init-ordering divergence note. On real PS5 the same build reads 16 (game ships), so our env induces
+12) instead of 5 (16) in our env — matching Fable's "corrupted RTTI/static-init generation" mechanism.
+On real PS5 the same build reads 16 (game ships), so our env induces
 the 12.
 
 ### Reusable tooling added (all in `exec_image_linux.cpp`, gated, non-destructive)
@@ -910,7 +911,7 @@ first-frame draw (SubmitDcb #2, the Unity textured-UI pair):
   the registered `AgcShader` header by its bound code address (`prosper_agc_shader_header_for_code`),
   reads the user-data SGPR block from the folded `sh` register file, decodes V#/T#/S# descriptors, and
   assigns bindings to the recompiler convention (cbuf→2, vertex buffer→3, textures→4+). Added
-  `decode_image_descriptor` (T#, Kyty Gen5 layout) + texture emission in `build_shader_resources`.
+  `decode_image_descriptor` (T#, captured Gen5 layout) + texture emission in `build_shader_resources`.
 - **Result: the PIXEL shader RECOMPILES to 737 dwords of valid SPIR-V** — `image_sample` and
   `s_buffer_load` resolve against the table.
 
@@ -932,11 +933,11 @@ offset, and (for the recompiler's `sreg_srt` provenance already present) emit re
 detiling (`tile_mode`≠0) is the following step. Everything up to here is committed + green (Linux 45/45,
 Windows 20/20); the live renderer fires the moment both stages recompile.
 
-### The EUD (Extended User Data) mechanism — the exact recipe for the VS unblock (RE'd via Kyty)
+### The EUD (Extended User Data) mechanism — the exact recipe for the VS unblock
 
-Kyty `Shader.cpp` `ShaderParseUsage` shows how descriptors resolve when they don't fit in the 16-dword
-user-SGPR block:
-- A descriptor sharp's `offset_dw` (Kyty `start_register`) selects where its V#/T# bytes live:
+Captured shader metadata, ISA, and the guest's own table accesses establish how descriptors resolve when
+they do not fit in the 16-dword user-SGPR block:
+- A descriptor sharp's `offset_dw` selects where its V#/T# bytes live:
   - `offset_dw < 16`  → **inline**: read from `user_sgpr[offset_dw + j]` (what we do today).
   - `offset_dw >= 16` → **extended**: read from `extended_buffer[offset_dw - 16 + j]`, where
     `extended_buffer` is a pointer into guest memory (the EUD).

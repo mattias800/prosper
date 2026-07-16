@@ -2,9 +2,9 @@
 
 **Date:** 2026-07-06. **Goal:** execute the game's submitted AGC command buffers on a real Vulkan device
 and signal GPU completion so the Unity render loop advances past its current stall to actual frames.
-Grounded in two references in the parent folder: **shadPS4** (`src/video_core/amdgpu/liverpool.cpp`,
-`src/core/libraries/gnmdriver/gnmdriver.cpp` — mature, PS4/Gnm) and **Kyty** (`source/emulator/src/Graphics/*`
-— early, PS5/AGC-native; treat as a hint, cross-check against shadPS4).
+Grounded in live Dcb captures, guest wrapper disassembly, AMD PM4 documentation, FreeBSD event semantics,
+and the mature PS4/Gnm behavior documented by **shadPS4**. Secondary implementations are consistency
+checks only; prosper's behavior is derived and tested independently.
 
 ## The completion mechanism (cross-validated by BOTH references)
 A submit finishes and the CPU learns about it through **end-of-pipe (EOP) events**:
@@ -12,16 +12,17 @@ A submit finishes and the CPU learns about it through **end-of-pipe (EOP) events
    to a memory label** and optionally **raises a GPU interrupt**.
    - shadPS4 `liverpool.cpp`: `EventWriteEop` → `event_eop->SignalFence(...)` (the label write) + a lambda
      `IrqC::Signal(InterruptId::GfxEop)`; `ReleaseMem` → `SignalFence` + `IrqC::Signal(pipe_id)`.
-   - Kyty `GraphicsRun`: the ReleaseMem packet dispatches to `GraphicsRenderWriteAtEndOfPipeWithInterrupt*`
-     (label write) which, when a submit's work drains, calls `RenderContext::TriggerEopEvent()`.
+   - Independent implementations use the same two-step model: defer the label write until submitted
+     work drains, then route an EOP notification.
 2. The interrupt is routed to a **kevent** the app registered: `eq->TriggerEvent(ident=GfxEop=0x40,
-   filter=EVFILT_GRAPHICS, udata)`. (shadPS4 `equeue.cpp::TriggerEvent`; Kyty `KernelTriggerEvent`.)
+   filter=EVFILT_GRAPHICS, udata)`. (See shadPS4 `equeue.cpp::TriggerEvent` and FreeBSD kqueue semantics.)
 3. The app registered that source with **`sceGnmAddEqEvent`/`GraphicsAddEqEvent` (NID `b0xyllnVY-I`,
    id=`0x40`)** and a thread does `sceKernelWaitEqueue` on that queue; the trigger wakes it.
 4. Flips are the same shape: a flip `RELEASE_MEM` variant / `SubmitFlip` presents the buffer and posts a
    **flip** kevent (shadPS4 `videoout/driver.cpp` `equeue->TriggerEvent(...)` on `GfxFlip`).
 
-So completion = **{write the fence label} + {trigger the registered EOP/flip kevent}**. Both refs agree.
+So completion = **{write the fence label} + {trigger the registered EOP/flip kevent}**. The live packet
+stream and independent platform evidence agree.
 
 ## Where prosper already is (the halves that exist)
 - **Front half (done):** `agc_driver_submit_dcb` (NID `UglJIZjGssM`) replays the Dcb via
@@ -31,7 +32,7 @@ So completion = **{write the fence label} + {trigger the registered EOP/flip kev
   state; the recompiler turns the real shaders → SPIR-V (38/41, ~95%); `tests/render_runner.h` renders a
   `GpuState` to pixels on llvmpipe. `videoout_present.cpp` has `present_write_frame`/`present_readback`.
 - **Missing:** a *live, persistent* device that executes the accumulated draws at submit time and presents,
-  plus the **completion signaling** that both refs describe.
+  plus the **completion signaling** required by that model.
 
 ## The prosper-specific twist (must drive the design)
 Our target (The Messenger) does **NOT** follow the textbook EOP-equeue path:
@@ -64,12 +65,14 @@ directly (currently the backend renders to its own attachment at videoout resolu
 `GpuState::apply` performs the writes the Dcb requests, since our CommandProcessor folds a submit
 synchronously (GPU "done" the instant SubmitDcb returns → this IS the end-of-pipe moment):
 - `RELEASE_MEM`/`EVENT_WRITE_EOP` (`honor_eop_write`): write the fence value to the label address, honoring
-  `data_sel` (1=32-bit value, 2=64-bit value, 3=64-bit monotonic GPU clock). The AGC ABI is pinned to Kyty
-  `GraphicsCbReleaseMem` (`buf, action, gcr_cntl, dst, cache_policy, address, data_sel, data, …`) — this
+  `data_sel` (1=32-bit value, 2=64-bit value, 3=64-bit monotonic GPU clock). Guest wrapper disassembly and
+  live stack-argument capture pin the ABI as
+  `GraphicsCbReleaseMem(buf, action, gcr_cntl, dst, cache_policy, address, data_sel, data, …)` — this
   resolved the earlier LOW-confidence "which arg is the value" (a5=address, stack arg 7=data_sel, stack arg
   8=the 64-bit value). `agc_cb_release_mem` now lays out `[0..1]=addr [2]=data_sel [3..4]=value [5]=action`.
 - `WRITE_DATA` (`honor_write_data`): copy the inline dwords to the destination; `agc_dcb_write_data` now
-  copies the real `data*`/`num_dwords` (Kyty `GraphicsDcbWriteData`) into the packet. `WAIT_REG_MEM`: no-op
+  copies the real `data*`/`num_dwords` observed at `GraphicsDcbWriteData` call sites into the packet.
+  `WAIT_REG_MEM`: no-op
   (the label is already written → condition satisfied).
 Correct end-of-pipe semantics, on by default; `PROSPER_NO_EOP_WRITE=1` disables for bisection. Verified by
 `test_eop_write` (data_sel 1/2/3 + WRITE_DATA + overflow-clamp). Replaces the old `PROSPER_AGC_FENCE` scaffold.

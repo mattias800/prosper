@@ -87,7 +87,8 @@ PROSPER_GUEST_ARGS=-force-gfx-direct PROSPER_FILELOG=1 PROSPER_PREADLOG=1 gdb ./
 2. **Determinism**: the llvmpipe render is ~400× slower than the native loop, so a "good" frame (texture
    loaded + fade complete) is timing-dependent. Consider an on-demand capture at a chosen frame.
 3. **Loader SIGSEGV** (for the real title/gameplay scene): watchpoint the slot that receives the `"Rewired_"`
-   bytes where a pointer belongs; implement the suspect libSceAgc/libSceAmpr NIDs for real (Kyty cross-check).
+   bytes where a pointer belongs; implement the suspect libSceAgc/libSceAmpr NIDs from live capture,
+   guest disassembly, and the firmware symbol map.
 
 ## Test recipes (worktree `ps5ys-frames`, build-linux)
 
