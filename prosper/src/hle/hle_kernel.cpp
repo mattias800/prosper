@@ -746,6 +746,12 @@ void* win_make_key_destructor_thunk(uint64_t guest_destructor) {
         offset += sizeof value;
     };
 
+    // winpthreads leaves its per-key "used" flag set after pthread_setspecific(key, nullptr),
+    // then invokes the destructor with a null value at thread exit. POSIX requires callbacks only
+    // for non-null values, so discard that spurious invocation before crossing into guest code.
+    byte(0x48); byte(0x85); byte(0xc9);                 // test rcx, rcx
+    byte(0x74); byte(0x24);                             // je final ret
+
     // rcx=value -> prosper_call_guest_sysv(guest_destructor, value, 0).
     byte(0x48); byte(0x89); byte(0xca);                 // mov rdx, rcx
     byte(0x48); byte(0xb9); qword(guest_destructor);    // mov rcx, guest_destructor
