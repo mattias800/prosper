@@ -1,8 +1,11 @@
 #include "../src/gpu/rdna2_to_spirv.hpp"
 #include "../src/gpu/shader_resources.hpp"
+#include "../src/gpu/tile.hpp"
 #include "live_compute.hpp"
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <vector>
 
@@ -10,6 +13,14 @@ using namespace prosper::gpu;
 
 static int fails = 0;
 #define CHECK(c, msg) do { if (!(c)) { std::printf("FAIL: %s\n", msg); fails++; } } while (0)
+
+static void set_test_env(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) setenv(name, value, 1); else unsetenv(name);
+#endif
+}
 
 int main() {
     // Dead Cells' bound startup fill kernel, copied verbatim from eboot.elf at runtime address
@@ -174,6 +185,59 @@ int main() {
         if (bad) std::printf("  image copy mismatched bytes = %u/%u (b0 src=%02x dst=%02x)\n",
                              bad, W * 4, img_src[0], img_dst[0]);
         CHECK(bad == 0, "Unorm8 unpack -> uvec4 copy -> pack writeback is byte-exact (#590)");
+    }
+
+    // The backend publishes ordinary tiled texels, not hardware-compressed blocks. Prove that a
+    // DCC-enabled storage destination atomically becomes the uncompressed (0xff) metadata state,
+    // including replay-owned metadata that a later sampled descriptor shares by logical address.
+    const uint32_t dcc_tile = static_cast<uint32_t>(TileMode::Sw64KbRX);
+    const size_t tiled_bytes = tiled_surface_bytes(W, 1, dcc_tile, 0, 4);
+    const size_t metadata_bytes = gfx10_dcc_metadata_bytes(W, 1, 1, dcc_tile, 4, true);
+    std::vector<uint8_t> tiled_src(tiled_bytes, 0), tiled_dst(tiled_bytes, 0);
+    std::vector<uint8_t> dcc_metadata(metadata_bytes, 0x40);
+    tile_surface(tiled_src.data(), img_src.data(), W, 1, dcc_tile, 0, 4);
+    ShaderResourceTable dcc_rt = irt;
+    for (ShaderResource& resource : dcc_rt.resources) {
+        if (resource.binding != 4 && resource.binding != 5) continue;
+        resource.img_dim = 1;
+        resource.tile_mode = dcc_tile;
+        resource.size = static_cast<uint32_t>(tiled_bytes);
+        resource.gpu_addr = reinterpret_cast<uint64_t>(
+            resource.binding == 4 ? tiled_src.data() : tiled_dst.data());
+        if (resource.binding == 5) {
+            resource.compression_enabled = true;
+            resource.write_compress_enabled = true;
+            resource.meta_pipe_aligned = true;
+            resource.metadata_addr = 0x207cef0000ull;
+            resource.dcc_metadata_size = metadata_bytes;
+            resource.dcc_metadata_host_data = dcc_metadata.data();
+            resource.dcc_metadata_host_data_size = dcc_metadata.size();
+        }
+    }
+    std::vector<uint32_t> dcc_spirv = recompile_valu(
+        image_copy_2d, sizeof(image_copy_2d) / sizeof(image_copy_2d[0]), 1, 0, &dcc_rt);
+    CHECK(!dcc_spirv.empty(), "2D storage copy recompiles for a DCC-enabled tiled destination");
+    if (!dcc_spirv.empty()) {
+        ComputeItem dcc_item;
+        dcc_item.spirv = dcc_spirv;
+        dcc_item.resources = std::make_shared<ShaderResourceTable>(dcc_rt);
+        dcc_item.launch.threads_x = W;
+        dcc_item.launch.local_x = 64;
+        dcc_item.launch.groups_x = 1;
+        dcc_item.launch.local_y = dcc_item.launch.local_z = 1;
+        dcc_item.launch.groups_y = dcc_item.launch.groups_z = 1;
+        dcc_item.code_addr = 0x719dcc;
+        set_test_env("PROSPER_COMPUTE_TILED_2D_STORAGE", "1");
+        CHECK(prosper::frontend::execute_live_compute_items({dcc_item}),
+              "live backend writes the tiled DCC storage image");
+        set_test_env("PROSPER_COMPUTE_TILED_2D_STORAGE", nullptr);
+        std::vector<uint8_t> dcc_linear(W * 4, 0);
+        detile_surface(dcc_linear.data(), tiled_dst.data(), W, 1, dcc_tile, 0, 4);
+        CHECK(dcc_linear == img_src,
+              "DCC storage writeback preserves the producer's tiled base texels");
+        CHECK(std::all_of(dcc_metadata.begin(), dcc_metadata.end(),
+                          [](uint8_t code) { return code == 0xff; }),
+              "DCC storage writeback publishes uniform uncompressed metadata");
     }
 
     // A renderer-owned color target is newer than its guest backing. Recompile the same copy kernel

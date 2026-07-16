@@ -55,6 +55,30 @@ size_t gfx10_dcc_metadata_bytes(uint32_t width, uint32_t height, uint32_t depth,
     return bytes <= std::numeric_limits<size_t>::max() ? static_cast<size_t>(bytes) : 0;
 }
 
+bool gfx10_dcc_fast_clear_rgba8(uint8_t* dst, size_t texel_count,
+                                const uint8_t* metadata, size_t metadata_bytes,
+                                uint32_t num_components, bool alpha_is_on_msb,
+                                uint8_t* clear_code) {
+    if (!metadata || !metadata_bytes || num_components != 4 || (!dst && texel_count))
+        return false;
+    const uint8_t code = metadata[0];
+    if (code != 0x00 && code != 0x40 && code != 0x80 && code != 0xc0)
+        return false;
+    if (!std::all_of(metadata + 1, metadata + metadata_bytes,
+                     [=](uint8_t value) { return value == code; }))
+        return false;
+
+    const uint8_t color = (code == 0x80 || code == 0xc0) ? 255 : 0;
+    const uint8_t alpha = (code == 0x40 || code == 0xc0) ? 255 : 0;
+    const uint32_t alpha_component = alpha_is_on_msb ? 3u : 0u;
+    uint8_t pixel[4] = {color, color, color, color};
+    pixel[alpha_component] = alpha;
+    for (size_t i = 0; i < texel_count; ++i)
+        std::memcpy(dst + i * 4, pixel, sizeof(pixel));
+    if (clear_code) *clear_code = code;
+    return true;
+}
+
 // One-time diagnostic when a NON-ZERO (tiled) tile_mode is not one of the swizzles we de-swizzle
 // (Sw4KbS=5 / Sw64KbS=9 / Sw64KbRX=27): the caller then copies the surface VERBATIM as if linear, so
 // it samples as a scrambled swizzle-weave. Other GFX10 modes a PS5 T# can legally carry — SW_256B_*,
