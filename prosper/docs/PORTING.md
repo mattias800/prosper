@@ -548,6 +548,12 @@ wake re-checks all waiters) is correct under its mutex (no lost-wakeup) but is a
 Diagnostics in place: `PROSPER_SYNCLOG` (`[sync]` WaitOnAddress + `[sync2]` cond/sema/EventFlag),
 `PROSPER_MEMLOG`, `PROSPER_VEHLOG`, boot_trace `[memclass]`.
 
+Windows first-seen unresolved-import messages also include the native thread id and the exact guest
+return address. Set `PROSPER_UNIMPL_STACK=1` to append up to eight executable guest return candidates
+from the call-time stack. This is a low-volume way to identify the managed or engine operation that
+reached a missing Sony API; unlike a later thread snapshot, it records the chain before a worker
+returns to its idle wait loop.
+
 Deferred, lower-priority items (some now done): ~~honor reserve alignment > 64 KiB~~ (done, #658);
 ~~worker-thread stack registration for GC bounds~~ (done, #658); ~~preserve phys-offset aliasing in
 the ordinary Windows direct-memory path~~ (done, #691 with one sparse `CreateFileMapping` section and

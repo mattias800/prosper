@@ -8,7 +8,7 @@
 #include "callback_fs.hpp"
 #include "platform_ui.hpp"
 #include "video_backend.hpp"   // sceAvPlayer -> host hardware-decode backend (#705)
-#include "../host/posix_shim.hpp"   // PROSPER_ASM_TRAMPOLINE (Mach-O/ELF global-asm portability)
+#include "../host/posix_shim.hpp"   // Darwin process_vm_readv shim + asm portability
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
@@ -30,9 +30,8 @@
 #include <windows.h>
 #else
 #include <sys/stat.h>   // mkdir
-#endif
-#ifdef __linux__
-#include <sys/mman.h>   // msync page-mapped probe in svc_log (diagnostic-only)
+#include <sys/uio.h>    // process_vm_readv: fault-contained diagnostic snapshots
+#include <unistd.h>
 #endif
 
 namespace prosper {
@@ -50,6 +49,19 @@ namespace { std::atomic<uint64_t> g_handle{1}; }
 namespace {
 bool svclog() { static int v = getenv("PROSPER_SVCLOG") ? 1 : 0; return v; }
 bool svc_ptrish(uint64_t v) { return v >= 0x10000 && v < 0x7fffffffffffull; }
+size_t svc_copy_words(uint64_t src, uint64_t* dst, size_t words) {
+    const size_t bytes = words * sizeof(uint64_t);
+#ifdef _WIN32
+    SIZE_T copied = 0;
+    ReadProcessMemory(GetCurrentProcess(), (const void*)(uintptr_t)src, dst, bytes, &copied);
+    return (size_t)copied / sizeof(uint64_t);
+#else
+    iovec local{dst, bytes};
+    iovec remote{(void*)(uintptr_t)src, bytes};
+    const ssize_t copied = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+    return copied > 0 ? (size_t)copied / sizeof(uint64_t) : 0;
+#endif
+}
 void svc_log(const char* fn, uint64_t a0, uint64_t a1, uint64_t a2,
              uint64_t a3, uint64_t a4, uint64_t a5, int dump_words = 8) {
     if (!svclog()) return;
@@ -63,25 +75,11 @@ void svc_log(const char* fn, uint64_t a0, uint64_t a1, uint64_t a2,
         // page neighbor is unmapped, and a diagnostic must not be able to fault the boot.
         uint64_t page_left = 0x1000 - (args[i] & 0xfff);
         int words = (int)(page_left / 8); if (words > dump_words) words = dump_words;
-#ifdef _WIN32
-        MEMORY_BASIC_INFORMATION region{};
-        if (!VirtualQuery((const void*)(uintptr_t)args[i], &region, sizeof region)) continue;
-        DWORD access = region.Protect & 0xff;
-        bool readable = access == PAGE_READONLY || access == PAGE_READWRITE ||
-                        access == PAGE_WRITECOPY || access == PAGE_EXECUTE_READ ||
-                        access == PAGE_EXECUTE_READWRITE || access == PAGE_EXECUTE_WRITECOPY;
-        uintptr_t region_end = (uintptr_t)region.BaseAddress + region.RegionSize;
-        if (region.State != MEM_COMMIT || !readable || (region.Protect & PAGE_GUARD) ||
-            args[i] + (uint64_t)words * 8 > region_end)
-            continue;
-#elif defined(__linux__)
-        // Integer-valued args can masquerade as pointers; probe the page is actually mapped
-        // (msync on an unmapped range fails ENOMEM) before dereferencing — a diagnostic must
-        // never be able to fault the boot.
-        if (msync((void*)(uintptr_t)(args[i] & ~0xfffull), 1, MS_ASYNC) != 0) continue;
-#endif
+        if (words > 8) words = 8;
+        uint64_t q[8]{};
+        words = (int)svc_copy_words(args[i], q, (size_t)words);
+        if (!words) continue;
         fprintf(stderr, "[svc]   a%d ->", i);
-        const uint64_t* q = (const uint64_t*)PW(args[i]);
         for (int w = 0; w < words; w++) fprintf(stderr, " %016lx", (unsigned long)q[w]);
         fprintf(stderr, "\n");
     }

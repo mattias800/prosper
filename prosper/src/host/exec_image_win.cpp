@@ -132,11 +132,9 @@ namespace {
     std::map<uint64_t, std::pair<uint64_t, uint64_t>> g_stacks;
     std::mutex g_smx;
 
-    // run_guest_inits may attach a host/frontend thread to IL2CPP before run_entry moves guest
-    // execution elsewhere. Keep those bounds available while that thread lives (the collector can
-    // query it later), but remove the native-id entry when a temporary boot thread exits so Windows
-    // TID reuse cannot inherit stale stack bounds. Thread-local destruction happens while this
-    // registry is still alive.
+    // Module initialization may attach a frontend-owned thread to IL2CPP before run_entry switches
+    // to its dedicated guest stack. Keep the init thread's native stack registered for that
+    // thread's lifetime, then remove it before Windows can recycle the native TID.
     struct InitThreadStackRegistration {
         uint64_t native_tid = 0;
         ~InitThreadStackRegistration() {
@@ -203,6 +201,10 @@ namespace {
     void emit_unimpl(uint8_t* p, uint32_t idx, uint64_t fn) {
         size_t o = 0;
         p[o++] = 0x48; p[o++] = 0x83; p[o++] = 0xEC; p[o++] = 0x28;    // sub rsp,0x28 (shadow + align)
+        p[o++] = 0x48; p[o++] = 0x8B; p[o++] = 0x54; p[o++] = 0x24; p[o++] = 0x28;
+                                                                        // mov rdx,[rsp+0x28] (guest return)
+        p[o++] = 0x4C; p[o++] = 0x8D; p[o++] = 0x44; p[o++] = 0x24; p[o++] = 0x28;
+                                                                        // lea r8,[rsp+0x28] (guest rsp)
         p[o++] = 0xB9; memcpy(p + o, &idx, 4); o += 4;                 // mov ecx,idx  (MS 1st arg)
         p[o++] = 0x48; p[o++] = 0xB8; memcpy(p + o, &fn, 8); o += 8;   // movabs rax,fn
         p[o++] = 0xFF; p[o++] = 0xD0;                                  // call rax  (prosper_on_unimpl)
@@ -593,10 +595,8 @@ bool guest_stack_for_thread(uint64_t tid, void** base, size_t* size) {
     };
     if (lookup(tid)) return true;
 
-    // Frontends enter the guest from a std::thread. Its guest-visible winpthreads handle is not
-    // always accepted by pthread_gethandle(), but a self-query has an unambiguous native identity.
-    // run_entry registers the manually switched stack under that native id, so resolve the current
-    // thread directly before attempting the cross-thread handle translation below.
+    // Frontends enter the guest from std::thread. winpthreads cannot always translate that
+    // implicit handle with pthread_gethandle(), but a self-query has an unambiguous native ID.
     if (tid == (uint64_t)pthread_self() && lookup(cur_tid())) return true;
 
     // Windows workers are registered by native thread id because exception delivery and stack
@@ -617,16 +617,12 @@ void set_module_start_param_ranges(const std::vector<std::pair<uint64_t, uint64_
 }
 
 size_t run_guest_inits(const std::vector<uint64_t>& fns) {
-    // Guest module initialization can attach the calling thread to IL2CPP/BDWGC before run_entry
-    // switches to and registers its dedicated guest stack. Make the thread's current host stack
-    // discoverable first so scePthreadAttrGet supplies real bounds during that early attachment.
-    // A boot caller may itself be a std::thread; leaving its attr at the winpthreads defaults can
-    // produce a half-constructed Il2CppThread whose thread-static table is null.
     ULONG_PTR stack_lo = 0, stack_hi = 0;
     GetCurrentThreadStackLimits(&stack_lo, &stack_hi);
     if (stack_lo && stack_hi > stack_lo) {
-        register_thread_stack(cur_tid(), (void*)stack_lo, (uint64_t)(stack_hi - stack_lo));
-        t_init_stack_registration.native_tid = cur_tid();
+        const uint64_t native_tid = cur_tid();
+        register_thread_stack(native_tid, (void*)stack_lo, (uint64_t)(stack_hi - stack_lo));
+        t_init_stack_registration.native_tid = native_tid;
     }
     guest_tls_activate_thread();   // give this (main) thread its guest %fs TCB before running guest code
     size_t ok = 0;

@@ -85,9 +85,9 @@ int main() {
     InterlockedExchange(&probe.release, 1);
     if (worker_created) pthread_join(worker, nullptr);
 
-    // prosper-app and screenshot enter the guest from std::thread rather than a thread created
-    // through our pthread HLE. winpthreads cannot always translate that implicit handle with
-    // pthread_gethandle(), so a self-query must fall back to the current native thread id.
+    // screenshot and prosper-app initialize guest modules from a frontend-owned std::thread.
+    // Verify its implicit pthread handle resolves through the native-ID registration and that the
+    // thread-local owner removes the record when the frontend thread exits.
     bool std_thread_self_resolved = false;
     uint64_t std_thread_native_id = 0;
     std::thread frontend_guest([&] {
