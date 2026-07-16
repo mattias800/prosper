@@ -21,6 +21,13 @@
 #include <string>
 #ifdef _WIN32
 #include <direct.h>     // _mkdir (SaveDataMemory persistence dir)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #else
 #include <sys/stat.h>   // mkdir
 #endif
@@ -56,7 +63,18 @@ void svc_log(const char* fn, uint64_t a0, uint64_t a1, uint64_t a2,
         // page neighbor is unmapped, and a diagnostic must not be able to fault the boot.
         uint64_t page_left = 0x1000 - (args[i] & 0xfff);
         int words = (int)(page_left / 8); if (words > dump_words) words = dump_words;
-#ifdef __linux__
+#ifdef _WIN32
+        MEMORY_BASIC_INFORMATION region{};
+        if (!VirtualQuery((const void*)(uintptr_t)args[i], &region, sizeof region)) continue;
+        DWORD access = region.Protect & 0xff;
+        bool readable = access == PAGE_READONLY || access == PAGE_READWRITE ||
+                        access == PAGE_WRITECOPY || access == PAGE_EXECUTE_READ ||
+                        access == PAGE_EXECUTE_READWRITE || access == PAGE_EXECUTE_WRITECOPY;
+        uintptr_t region_end = (uintptr_t)region.BaseAddress + region.RegionSize;
+        if (region.State != MEM_COMMIT || !readable || (region.Protect & PAGE_GUARD) ||
+            args[i] + (uint64_t)words * 8 > region_end)
+            continue;
+#elif defined(__linux__)
         // Integer-valued args can masquerade as pointers; probe the page is actually mapped
         // (msync on an unmapped range fails ENOMEM) before dereferencing — a diagnostic must
         // never be able to fault the boot.

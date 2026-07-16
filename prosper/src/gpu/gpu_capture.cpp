@@ -309,7 +309,8 @@ uint64_t dcc_metadata_footprint(const ShaderResource& r) {
         bc_block_bytes(r.format))
         return 0;
     uint32_t bytes_per_texel = data_format_bytes(r.format) * (r.num_components ? r.num_components : 1u);
-    if (!bytes_per_texel && r.format == DataFormat::Unorm2_10_10_10)
+    if (!bytes_per_texel &&
+        (r.format == DataFormat::Float10_11_11 || r.format == DataFormat::Unorm2_10_10_10))
         bytes_per_texel = 4;
     const uint32_t layers = r.img_dim == 3u ? 6u : (r.img_dim == 2u ? std::max(r.depth, 1u) : 1u);
     return gfx10_dcc_metadata_bytes(r.width, r.height, layers, r.tile_mode,
@@ -1743,11 +1744,17 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
 bool finish_requested_gpu_capture(std::unique_ptr<PendingGpuCapture> pending,
                                   const std::vector<uint8_t>& output, std::string& error) {
     if (!pending) return true;
-    pending->capture.expected_output_valid = true;
-    pending->capture.expected_output_bytes = output.size(); pending->capture.expected_output_hash = gpu_capture_hash(output);
+    pending->capture.expected_output_valid = !output.empty();
+    pending->capture.expected_output_bytes = output.size();
+    pending->capture.expected_output_hash = output.empty() ? 0 : gpu_capture_hash(output);
     if (!write_gpu_capture(pending->path, pending->capture, error)) return false;
-    std::fprintf(stderr, "[gpucap] wrote %s output_bytes=%zu hash=%016llx\n", pending->path.c_str(), output.size(),
-                 static_cast<unsigned long long>(pending->capture.expected_output_hash));
+    if (output.empty()) {
+        std::fprintf(stderr, "[gpucap] wrote %s without output oracle\n", pending->path.c_str());
+    } else {
+        std::fprintf(stderr, "[gpucap] wrote %s output_bytes=%zu hash=%016llx\n",
+                     pending->path.c_str(), output.size(),
+                     static_cast<unsigned long long>(pending->capture.expected_output_hash));
+    }
     return true;
 }
 

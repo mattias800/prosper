@@ -156,6 +156,13 @@ int main() {
     volume_dcc.metadata_addr = 0x400000;
     CHECK(gpu_capture_dcc_metadata_footprint(volume_dcc) == 128 * 1024,
           "32x32x32 R_X volume descriptor plans the validated 128 KiB DCC span");
+    ShaderResource packed_volume_dcc = volume_dcc;
+    packed_volume_dcc.gpu_addr = 0x500000; packed_volume_dcc.size = 40 * 5 * 5 * 4;
+    packed_volume_dcc.format = DataFormat::Float10_11_11; packed_volume_dcc.num_components = 3;
+    packed_volume_dcc.width = 40; packed_volume_dcc.height = 5; packed_volume_dcc.depth = 5;
+    packed_volume_dcc.metadata_addr = 0x600000;
+    CHECK(gpu_capture_dcc_metadata_footprint(packed_volume_dcc) == 20 * 1024,
+          "40x5x5 packed R11G11B10 volume descriptor plans its 20 KiB DCC span");
     auto volume_table = std::make_shared<ShaderResourceTable>();
     volume_table->resources = {volume_dcc};
     DrawItem volume_draw; volume_draw.vs = {0x07230203, 31};
@@ -187,6 +194,18 @@ int main() {
           volume_replay.items[0].vrt->resources[0].dcc_metadata_host_data_size == 128 * 1024 &&
           volume_replay.resource_instances.size() == 2,
           "v12 replay owns base and DCC bytes as distinct mutable address instances");
+    auto packed_volume_table = std::make_shared<ShaderResourceTable>();
+    packed_volume_table->resources = {packed_volume_dcc};
+    DrawItem packed_volume_draw = volume_draw; packed_volume_draw.vrt = packed_volume_table;
+    GpuCaptureFile packed_volume_capture;
+    CHECK(capture_draw_items({packed_volume_draw}, meta, volume_reader,
+                             packed_volume_capture, error) &&
+          packed_volume_capture.blobs.size() == 2 &&
+          packed_volume_capture.draws[0].vrt.resources[0].metadata_size == 20 * 1024 &&
+          packed_volume_capture.blobs[
+              packed_volume_capture.draws[0].vrt.resources[0].metadata_blob_index].bytes.size() ==
+              20 * 1024,
+          "capture retains packed R11G11B10 volume DCC bytes as a separate content blob");
     GpuCaptureFile bad_metadata_ref = volume_capture;
     bad_metadata_ref.draws[0].vrt.resources[0].metadata_blob_offset = 128 * 1024;
     CHECK(!serialize_gpu_capture(bad_metadata_ref, volume_bytes, error) &&
@@ -312,6 +331,17 @@ int main() {
           "replay resources point into shared owned backing at captured offsets");
     CHECK(replay.expected_output_valid && replay.expected_output_hash == captured.expected_output_hash,
           "expected render oracle round-trips");
+    const auto no_oracle_path = std::filesystem::temp_directory_path() /
+        "prosper_gpu_capture_no_oracle_test.prgcap";
+    auto no_oracle_pending = std::make_unique<PendingGpuCapture>();
+    no_oracle_pending->path = no_oracle_path.string();
+    no_oracle_pending->capture = captured;
+    GpuCaptureFile no_oracle_loaded;
+    CHECK(finish_requested_gpu_capture(std::move(no_oracle_pending), {}, error) &&
+          read_gpu_capture(no_oracle_path.string(), no_oracle_loaded, error) &&
+          !no_oracle_loaded.expected_output_valid && no_oracle_loaded.expected_output_bytes == 0 &&
+          no_oracle_loaded.expected_output_hash == 0,
+          "an empty renderer result does not become a valid replay oracle");
     CHECK(replay.items[0].draw_index == 7 && replay.items[0].command_order == 123,
           "materialized draw retains its source operation identity");
     CHECK(replay.rtt_seeds.size() == 1 && replay.rtt_seeds[0].guest_addr == draw.color0_base,
@@ -567,7 +597,7 @@ int main() {
     GpuCaptureFile bad;
     CHECK(!read_gpu_capture(truncated.string(), bad, error) && !error.empty(), "truncated capture fails loudly");
     std::filesystem::remove(path); std::filesystem::remove(truncated); std::filesystem::remove(mixed_path);
-    std::filesystem::remove(failed_path);
+    std::filesystem::remove(failed_path); std::filesystem::remove(no_oracle_path);
 
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
     std::printf("== PASS ==\n"); return 0;

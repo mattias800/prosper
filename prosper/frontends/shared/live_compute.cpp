@@ -21,6 +21,17 @@
 #include <vector>
 
 namespace prosper::frontend {
+
+uint8_t storage_pack_unorm8(uint32_t float_bits) {
+    float value;
+    std::memcpy(&value, &float_bits, sizeof(value));
+    if (!(value > 0.0f)) return 0; // Includes negative values and NaN.
+    if (value >= 1.0f) return 255;
+    const float scaled = value * 255.0f;
+    const uint32_t whole = static_cast<uint32_t>(scaled);
+    return static_cast<uint8_t>(whole + (scaled - static_cast<float>(whole) >= 0.5f));
+}
+
 namespace {
 
 constexpr VkDeviceSize kMaxComputeImageBytes = 256ull << 20;
@@ -248,6 +259,10 @@ struct VulkanComputeContext {
     uint32_t host_memory_type(uint32_t bits) const {
         const VkMemoryPropertyFlags wanted = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        const VkMemoryPropertyFlags cached = wanted | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+        for (uint32_t i = 0; i < memory.memoryTypeCount; i++)
+            if ((bits & (1u << i)) && (memory.memoryTypes[i].propertyFlags & cached) == cached)
+                return i;
         for (uint32_t i = 0; i < memory.memoryTypeCount; i++)
             if ((bits & (1u << i)) && (memory.memoryTypes[i].propertyFlags & wanted) == wanted)
                 return i;
@@ -319,10 +334,7 @@ void storage_pack_texel(const uint32_t in[4], prosper::gpu::DataFormat f, uint32
     using DF = prosper::gpu::DataFormat;
     for (uint32_t c = 0; c < ncomp && c < 4; c++) {
         switch (f) {
-            case DF::Unorm8: { float v; std::memcpy(&v, &in[c], 4);
-                               if (std::isnan(v)) v = 0.f;
-                               v = v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
-                               dst[c] = (uint8_t)std::lround(v * 255.0f); break; }
+            case DF::Unorm8: dst[c] = storage_pack_unorm8(in[c]); break;
             case DF::Float16: { float v; std::memcpy(&v, &in[c], 4);
                                 const uint16_t h = prosper::gpu::float_to_half(v);
                                 dst[c * 2] = static_cast<uint8_t>(h);
@@ -366,6 +378,14 @@ bool trace_compute_item(const prosper::gpu::ComputeItem& item) {
 
 bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& item) {
     using namespace prosper::gpu;
+    using ComputeClock = std::chrono::steady_clock;
+    const auto phase_start = ComputeClock::now();
+    auto phase_setup = phase_start;
+    auto phase_pipeline = phase_start;
+    auto phase_dispatch = phase_start;
+    auto phase_writeback = phase_start;
+    double pack_ms = 0.0;
+    double layout_ms = 0.0;
     const bool trace = trace_compute_item(item);
     auto report = validate_spirv_descriptor_interface(
         item.spirv, item.resources.get(), 0, SpirvShaderStage::Compute, false);
@@ -394,6 +414,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         image_descriptors.begin(), image_descriptors.end(), [](const auto& descriptor) {
             return descriptor.kind == SpirvDescriptorKind::StorageImage;
         });
+    const bool phase_timing = has_storage_images &&
+                              std::getenv("PROSPER_COMPUTE_PHASE_TIMING") != nullptr;
     if (has_storage_images && !ctx.image_support) {
         static bool warned = false;
         if (!warned) { warned = true;
@@ -521,11 +543,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const uint64_t key = r ? r->gpu_addr : 0;
             if (std::find(warned.begin(), warned.end(), key) == warned.end()) {
                 warned.push_back(key);
-                std::fprintf(stderr, "[compute] program 0x%llx image 0x%llx %ux%ux%u fmt=%u: %s -> "
+                std::fprintf(stderr, "[compute] program 0x%llx image 0x%llx %ux%ux%u fmt=%u comps=%u "
+                                     "tile=%u size=%u: %s -> "
                                      "dispatch skipped (#590)\n",
                              (unsigned long long)item.code_addr, (unsigned long long)key,
                              r ? r->width : 0, r ? r->height : 0, r ? r->depth : 0,
-                             r ? (unsigned)r->format : 0u, why);
+                             r ? (unsigned)r->format : 0u, r ? r->num_components : 0u,
+                             r ? r->tile_mode : 0u, r ? r->size : 0u, why);
             }
             images_ready = false;
         };
@@ -574,14 +598,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 }
             }
             // A renderer-owned target's current pixels are not in raw guest memory. Import its
-            // immutable CPU snapshot for sampled bindings; storage bindings and GPU-only targets
-            // stay unsupported rather than silently reading or overwriting stale guest bytes.
+            // immutable CPU snapshot for sampled and storage bindings; a successful storage
+            // writeback publishes ordinary guest bytes and invalidates the renderer-owned copy.
             LiveTargetSnapshot live_target;
             const bool renderer_owned = is_live_render_target(r->gpu_addr);
             if (renderer_owned) {
-                if (bi.storage) {
-                    skip_image(r, "renderer-owned RTT bound as storage image"); break;
-                }
                 if (dim_3d || r->depth != 1 ||
                     !read_live_render_target(r->gpu_addr, live_target) || !live_target.pixels) {
                     skip_image(r, "renderer-owned RTT has no readable snapshot"); break;
@@ -598,6 +619,17 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 if (expected != live_target.pixels->size()) {
                     skip_image(r, "renderer-owned RTT snapshot byte count mismatch"); break;
                 }
+                if (bi.storage) {
+                    const uint32_t nc = r->num_components ? r->num_components : 1;
+                    const bool compatible =
+                        (live_target.format == LiveTargetPixelFormat::Rgba8Unorm &&
+                         r->format == DataFormat::Unorm8 && nc == 4) ||
+                        (live_target.format == LiveTargetPixelFormat::Rgba16Float &&
+                         r->format == DataFormat::Float16 && nc == 4);
+                    if (!compatible) {
+                        skip_image(r, "renderer RTT storage format mismatch"); break;
+                    }
+                }
             }
             // Multiple U# bindings may intentionally name the same guest surface (read/modify/write
             // views of one UE4 volume). They must see one Vulkan image and produce one guest
@@ -606,10 +638,23 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 for (size_t j = 0; j < i; j++) {
                     const BoundImage& prior = images[j];
                     const ShaderResource* p = prior.resource;
+                    const bool same_dcc_identity = p &&
+                        p->max_uncompressed_block_size == r->max_uncompressed_block_size &&
+                        p->max_compressed_block_size == r->max_compressed_block_size &&
+                        p->meta_pipe_aligned == r->meta_pipe_aligned &&
+                        p->write_compress_enabled == r->write_compress_enabled &&
+                        p->compression_enabled == r->compression_enabled &&
+                        p->alpha_is_on_msb == r->alpha_is_on_msb &&
+                        p->color_transform == r->color_transform &&
+                        p->metadata_addr == r->metadata_addr &&
+                        p->dcc_metadata_size == r->dcc_metadata_size &&
+                        p->dcc_metadata_host_data == r->dcc_metadata_host_data &&
+                        p->dcc_metadata_host_data_size == r->dcc_metadata_host_data_size;
                     if (!prior.storage || !p || p->gpu_addr != r->gpu_addr ||
                         p->width != r->width || p->height != r->height || p->depth != r->depth ||
                         p->format != r->format || p->num_components != r->num_components ||
-                        p->tile_mode != r->tile_mode || p->img_dim != r->img_dim)
+                        p->tile_mode != r->tile_mode || p->img_dim != r->img_dim ||
+                        !same_dcc_identity)
                         continue;
                     bi.alias_of = prior.alias_of == SIZE_MAX ? j : prior.alias_of;
                     const BoundImage& owner = images[bi.alias_of];
@@ -626,7 +671,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 if (bi.alias_of != SIZE_MAX) continue;
             }
             const VkDeviceSize volume_texels = static_cast<VkDeviceSize>(r->width) * r->height * r->depth;
-            const uint32_t texel_bytes = bi.storage ? 16u : 4u;   // uvec4 raw channels / RGBA8
+            const uint32_t sampled_components = r->num_components ? r->num_components : 1;
+            const bool sampled_float32 = !bi.storage && r->format == DataFormat::Float32 &&
+                                         sampled_components >= 1 && sampled_components <= 4;
+            const uint32_t texel_bytes = bi.storage || sampled_float32 ? 16u : 4u;
+            // Storage images use raw uvec4 channels. Most sampled formats are normalized to RGBA8,
+            // but Float32 stays native so exposure/HDR kernels do not lose sign or dynamic range.
             const VkDeviceSize sbytes = volume_texels * texel_bytes;
             if (!sbytes || sbytes > kMaxComputeImageBytes) {
                 skip_image(r, "expanded image exceeds the 256 MiB backend bound"); break;
@@ -636,9 +686,12 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // Fill the upload staging bytes.
             std::vector<uint8_t> upload((size_t)sbytes, 0);
             if (bi.storage) {
+                if (r->tile_mode && !tile_mode_is_tiled(r->tile_mode)) {
+                    skip_image(r, "storage tile mode has no supported address pattern"); break;
+                }
                 if (r->tile_mode && !dim_3d &&
-                    !std::getenv("PROSPER_COMPUTE_TILED_2D_STORAGE")) {
-                    skip_image(r, "tiled 1D/2D storage writeback deferred"); break;
+                    std::getenv("PROSPER_DISABLE_COMPUTE_TILED_2D_STORAGE")) {
+                    skip_image(r, "tiled 1D/2D storage writeback disabled"); break;
                 }
                 if (!storage_unpack_supported(r->format) || !storage_pack_supported(r->format)) {
                     skip_image(r, "storage format has no channel pack/unpack yet"); break; }
@@ -659,21 +712,36 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     skip_image(r, "storage backing size is invalid"); break;
                 }
                 bi.guest_bytes = guest_bytes;
-                const uint8_t* src = resource_bytes_for(r, guest_bytes);
-                const bool readable = (r->host_data && r->host_data_size >= guest_bytes) ||
+                const uint8_t* src = renderer_owned ? nullptr : resource_bytes_for(r, guest_bytes);
+                const bool readable = renderer_owned ||
+                                      (r->host_data && r->host_data_size >= guest_bytes) ||
                                       guest_readable(r->gpu_addr, static_cast<uint32_t>(guest_bytes));
                 if (!readable) { skip_image(r, "storage backing unreadable"); break; }
-                if (trace) bi.before_hash = fnv1a(src, guest_bytes);
                 std::vector<uint8_t> linear((size_t)linear_guest_bytes, 0);
-                if (r->tile_mode && r->depth > 1) {
+                if (renderer_owned) {
+                    std::memcpy(linear.data(), live_target.pixels->data(), linear.size());
+                    if (trace) {
+                        bi.before_hash = fnv1a(linear.data(), linear.size());
+                        std::fprintf(stderr,
+                                     "[compute]   imported writable renderer RTT binding=%u "
+                                     "addr=0x%llx extent=%ux%u format=%s\n",
+                                     bi.binding, (unsigned long long)r->gpu_addr,
+                                     r->width, r->height,
+                                     live_target.format == LiveTargetPixelFormat::Rgba16Float
+                                         ? "rgba16f" : "rgba8");
+                    }
+                } else if (r->tile_mode && r->depth > 1) {
+                    if (trace) bi.before_hash = fnv1a(src, guest_bytes);
                     if (!detile_volume(linear.data(), src, guest_bytes, r->width, r->height,
                                        r->depth, r->tile_mode, static_cast<uint32_t>(guest_texel))) {
                         skip_image(r, "storage volume detile failed"); break;
                     }
                 } else if (r->tile_mode) {
+                    if (trace) bi.before_hash = fnv1a(src, guest_bytes);
                     detile_surface(linear.data(), src, r->width, r->height, r->tile_mode, 0,
                                    static_cast<uint32_t>(guest_texel));
                 } else {
+                    if (trace) bi.before_hash = fnv1a(src, guest_bytes);
                     std::memcpy(linear.data(), src, linear.size());
                 }
                 for (size_t t = 0; t < texels; t++)
@@ -687,6 +755,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 const bool uint8 = r->format == DataFormat::Uint8 && nc == 4;
                 const bool r8 = r->format == DataFormat::Unorm8 && nc == 1;
                 const bool f16 = r->format == DataFormat::Float16 && nc >= 1 && nc <= 4;
+                const bool f32 = sampled_float32;
                 const bool r11g11b10 = r->format == DataFormat::Float10_11_11 && nc == 3;
                 if (renderer_owned) {
                     if (r11g11b10) {
@@ -694,7 +763,24 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         break;
                     }
                     const std::vector<uint8_t>& pixels = *live_target.pixels;
-                    if (live_target.format == LiveTargetPixelFormat::Rgba8Unorm) {
+                    if (f32) {
+                        const size_t texels = static_cast<size_t>(volume_texels);
+                        for (size_t t = 0; t < texels; ++t) {
+                            for (uint32_t c = 0; c < 4; ++c) {
+                                float value = 0.0f;
+                                if (live_target.format == LiveTargetPixelFormat::Rgba8Unorm) {
+                                    value = pixels[t * 4 + c] / 255.0f;
+                                } else {
+                                    uint16_t half = 0;
+                                    std::memcpy(&half, pixels.data() + t * 8 + c * 2, sizeof(half));
+                                    value = half_to_float(half);
+                                    if (std::isnan(value)) value = 0.0f;
+                                }
+                                std::memcpy(upload.data() + (t * 4 + c) * sizeof(float),
+                                            &value, sizeof(value));
+                            }
+                        }
+                    } else if (live_target.format == LiveTargetPixelFormat::Rgba8Unorm) {
                         std::memcpy(upload.data(), pixels.data(), upload.size());
                     } else {
                         const size_t texels = static_cast<size_t>(volume_texels);
@@ -710,13 +796,20 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                             }
                         }
                     }
-                    if (trace)
+                    if (trace) {
+                        const uint64_t snapshot_hash = fnv1a(live_target.pixels->data(),
+                                                             live_target.pixels->size());
+                        const size_t nonzero_bytes = static_cast<size_t>(std::count_if(
+                            live_target.pixels->begin(), live_target.pixels->end(),
+                            [](uint8_t value) { return value != 0; }));
                         std::fprintf(stderr,
                                      "[compute]   imported renderer RTT binding=%u addr=0x%llx "
-                                     "extent=%ux%u format=%s\n",
+                                     "extent=%ux%u format=%s hash=%016llx nonzero-bytes=%zu\n",
                                      bi.binding, (unsigned long long)r->gpu_addr, r->width, r->height,
                                      live_target.format == LiveTargetPixelFormat::Rgba16Float
-                                         ? "rgba16f" : "rgba8");
+                                         ? "rgba16f" : "rgba8",
+                                     (unsigned long long)snapshot_hash, nonzero_bytes);
+                    }
                     bi.guest_bytes = 0;
                 } else {
                     size_t need;                                   // guest bytes the decode reads
@@ -726,7 +819,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         const uint32_t bw = (r->width + 3) / 4, bh = (r->height + 3) / 4;
                         need = r->tile_mode ? tiled_elements_bytes(bw, bh, bpb, r->tile_mode)
                                             : (size_t)bw * bh * bpb;
-                    } else if (rgba8 || uint8 || r8 || f16 || r11g11b10) {
+                    } else if (rgba8 || uint8 || r8 || f16 || f32 || r11g11b10) {
                         const uint32_t bpt = r11g11b10 ? 4u : cb * nc;
                         need = r->tile_mode
                             ? (dim_3d && r->depth > 1
@@ -769,6 +862,17 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                         const size_t texels = (size_t)volume_texels;
                         if (rgba8 || uint8 || r11g11b10) {          // Native 4-byte sampled texels
                             std::memcpy(upload.data(), lin.data(), lin.size());
+                        } else if (f32) {                           // Native float channels + default fill
+                            for (size_t t = 0; t < texels; ++t) {
+                                for (uint32_t c = 0; c < 4; ++c) {
+                                    float value = c == 3 ? 1.0f : 0.0f;
+                                    if (c < nc)
+                                        std::memcpy(&value, lin.data() + (t * nc + c) * sizeof(float),
+                                                    sizeof(value));
+                                    std::memcpy(upload.data() + (t * 4 + c) * sizeof(float),
+                                                &value, sizeof(value));
+                                }
+                            }
                         } else if (r8) {                            // R8: broadcast coverage to RGBA
                             for (size_t t = 0; t < texels; t++) {
                                 const uint8_t v = lin[t];
@@ -826,6 +930,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             ici.format = bi.storage ? VK_FORMAT_R32G32B32A32_UINT
                                     : (sampled_uint8 ? VK_FORMAT_R8G8B8A8_UINT
                                        : sampled_r11g11b10 ? VK_FORMAT_B10G11R11_UFLOAT_PACK32
+                                         : sampled_float32 ? VK_FORMAT_R32G32B32A32_SFLOAT
                                                            : VK_FORMAT_R8G8B8A8_UNORM);
             ici.extent = {r->width, r->height, r->depth};
             ici.mipLevels = 1;
@@ -899,6 +1004,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
         }
         if (!images_ready) break;
+        phase_setup = ComputeClock::now();
 
         // Layout: the buffer bindings (filled above) + one entry per image binding (#590).
         for (size_t i = 0; i < images.size(); i++) {
@@ -982,6 +1088,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         if (!vk_ok(vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &cpci, nullptr, &pipeline),
                    "compute-pipeline")) break;
         if (trace) std::fprintf(stderr, "[compute]   compute pipeline ready\n");
+        phase_pipeline = ComputeClock::now();
 
         VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         pci.queueFamilyIndex = ctx.queue_family;
@@ -1062,6 +1169,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         if (!vk_ok(vkWaitForFences(ctx.device, 1, &fence, VK_TRUE,
                                    30ull * 1000 * 1000 * 1000), "queue-wait")) break;
         if (trace) std::fprintf(stderr, "[compute]   dispatch complete\n");
+        phase_dispatch = ComputeClock::now();
 
         bool readback_ok = true;
         for (auto& buffer : buffers) {
@@ -1110,9 +1218,11 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     for (uint32_t c = 0; c < 4; c++)
                         bi.nonzero_channels += channels[t * 4 + c] != 0;
             }
+            const auto pack_start = ComputeClock::now();
             for (size_t t = 0; t < texels; t++)
                 storage_pack_texel(channels + t * 4, r->format, nc,
                                    linear.data() + t * guest_texel);
+            const auto pack_done = ComputeClock::now();
             uint8_t* destination = resource_bytes_for(r, bi.guest_bytes);
             if (r->tile_mode && r->depth > 1) {
                 if (!tile_volume(destination, bi.guest_bytes, linear.data(), r->width, r->height,
@@ -1127,6 +1237,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             } else {
                 std::memcpy(destination, linear.data(), linear.size());
             }
+            const auto layout_done = ComputeClock::now();
+            pack_ms += std::chrono::duration<double, std::milli>(pack_done - pack_start).count();
+            layout_ms += std::chrono::duration<double, std::milli>(layout_done - pack_done).count();
             if (trace) bi.after_hash = fnv1a(destination, bi.guest_bytes);
             notify_guest_gpu_write(r->gpu_addr, bi.guest_bytes);
             if (!r->host_data && writer_provenance_enabled())
@@ -1152,6 +1265,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         }
         if (!readback_ok) break;
         ok = true;
+        phase_writeback = ComputeClock::now();
     } while (false);
 
     if (trace)
@@ -1170,14 +1284,18 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const uint8_t* bytes = resource_bytes(buffer.resource);
             std::fprintf(stderr,
                          "[compute]   writeback binding=%u addr=0x%llx size=%u changed=%llu "
-                         "hash=%016llx->%016llx first=%08x,%08x,%08x,%08x\n",
+                         "hash=%016llx->%016llx first=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
                          buffer.resource->binding, (unsigned long long)buffer.resource->gpu_addr,
                          buffer.resource->size, (unsigned long long)buffer.changed_bytes,
                          (unsigned long long)buffer.before_hash, (unsigned long long)buffer.after_hash,
                          buffer.resource->size >= 4 ? reinterpret_cast<const uint32_t*>(bytes)[0] : 0,
                          buffer.resource->size >= 8 ? reinterpret_cast<const uint32_t*>(bytes)[1] : 0,
                          buffer.resource->size >= 12 ? reinterpret_cast<const uint32_t*>(bytes)[2] : 0,
-                         buffer.resource->size >= 16 ? reinterpret_cast<const uint32_t*>(bytes)[3] : 0);
+                         buffer.resource->size >= 16 ? reinterpret_cast<const uint32_t*>(bytes)[3] : 0,
+                         buffer.resource->size >= 20 ? reinterpret_cast<const uint32_t*>(bytes)[4] : 0,
+                         buffer.resource->size >= 24 ? reinterpret_cast<const uint32_t*>(bytes)[5] : 0,
+                         buffer.resource->size >= 28 ? reinterpret_cast<const uint32_t*>(bytes)[6] : 0,
+                         buffer.resource->size >= 32 ? reinterpret_cast<const uint32_t*>(bytes)[7] : 0);
         }
         for (const auto& image : images) {
             if (!image.storage || !image.resource || image.alias_of != SIZE_MAX) continue;
@@ -1197,6 +1315,25 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         }
     }
     cleanup();
+    if (phase_timing) {
+        const auto phase_cleanup = ComputeClock::now();
+        auto milliseconds = [](auto begin, auto end) {
+            return std::chrono::duration<double, std::milli>(end - begin).count();
+        };
+        std::fprintf(stderr,
+                     "[compute-phase] submit=%llu code=0x%llx ok=%u "
+                     "setup_ms=%.2f pipeline_ms=%.2f dispatch_ms=%.2f "
+                     "writeback_ms=%.2f pack_ms=%.2f layout_ms=%.2f "
+                     "cleanup_ms=%.2f total_ms=%.2f\n",
+                     (unsigned long long)item.submit_no, (unsigned long long)item.code_addr,
+                     ok ? 1u : 0u, milliseconds(phase_start, phase_setup),
+                     milliseconds(phase_setup, phase_pipeline),
+                     milliseconds(phase_pipeline, phase_dispatch),
+                     milliseconds(phase_dispatch, phase_writeback),
+                     pack_ms, layout_ms,
+                     milliseconds(phase_writeback, phase_cleanup),
+                     milliseconds(phase_start, phase_cleanup));
+    }
     return ok;
 }
 

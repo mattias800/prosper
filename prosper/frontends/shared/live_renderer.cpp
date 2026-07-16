@@ -306,7 +306,11 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             // unbounded RTT/GPU resources across tens of thousands of submits (which OOM-kills the process).
             static int g_render_last = getenv("PROSPER_RENDER_LAST") ? atoi(getenv("PROSPER_RENDER_LAST")) : INT_MAX;
             static thread_local int g_this_submit = -1;
-            if (phase.first_span || g_this_submit < 0) g_this_submit = g_submit_idx++;
+            static thread_local bool g_force_this_submit = false;
+            if (phase.first_span || g_this_submit < 0) {
+                g_this_submit = g_submit_idx++;
+                g_force_this_submit = false;
+            }
             if (g_this_submit > g_render_last) return {};
             static const int g_rttlog_min_submit = getenv("PROSPER_RTTLOG_MIN_SUBMIT")
                 ? std::max(0, atoi(getenv("PROSPER_RTTLOG_MIN_SUBMIT"))) : 0;
@@ -445,6 +449,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         if (has_dim(it.vrt.get()) || has_dim(it.prt.get())) { force_target = true; break; }
                     }
             }
+            // Ordered submits can contain several graphics spans separated by compute work. Once a
+            // diagnostic target selects one span, keep rendering the rest of that transaction so the
+            // final span can recover and return the scanout assembled in the persistent RTT cache.
+            g_force_this_submit |= force_target;
             // A one-time offscreen producer may occur before a much later consumer render window.
             // Render that target even before the warmup ends so its RTT cache entry survives skipped
             // intermediate submits (#526). Submit-count and wall-clock gates are additive.
@@ -456,7 +464,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 fprintf(stderr, "[render] wall-clock warmup complete after %lld ms at submit %d\n",
                         (long long)elapsed_ms, g_this_submit);
             }
-            if ((g_this_submit < g_render_first || before_delay) && !force_target) return {};
+            if ((g_this_submit < g_render_first || before_delay) && !g_force_this_submit) return {};
             // Dump the FIRST item's recompiled SPIR-V (diagnostic; survives a mid-render crash).
             if (getenv("PROSPER_SHADER_DUMP") && !items.empty()) {
                 std::string d = getenv("PROSPER_SHADER_DUMP");
@@ -1198,12 +1206,20 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             };
                             const uint64_t raw_hash = fnv(raw.data(), raw_got);
                             const uint64_t sample_hash = fnv(texture_pixels.data(), texture_pixels.size());
+                            const std::vector<uint8_t> inspected = inspection_rgba8(
+                                texture_pixels, tw, th, fr.texture_format);
+                            size_t rgb_nonblack = 0, alpha_nonzero = 0;
+                            for (size_t p = 0; p + 3 < inspected.size(); p += 4) {
+                                rgb_nonblack += inspected[p] != 0 || inspected[p + 1] != 0 ||
+                                                inspected[p + 2] != 0;
+                                alpha_nonzero += inspected[p + 3] != 0;
+                            }
                             const auto writer = prosper::gpu::last_guest_write_overlap(
                                 r.gpu_addr, raw_size);
                             fprintf(stderr,
                                     "[resource-version] render-submit=%llu draw=%llu order=%llu set=%u bind=%u "
                                     "addr=0x%llx dims=%ux%u class=%u fmt=%u tile=%u dcc=%u meta=0x%llx rtt=%d "
-                                    "raw=%zu/%zu:%016llx sample=%zu:%016llx "
+                                    "raw=%zu/%zu:%016llx sample=%zu:%016llx rgb_nonblack=%zu alpha_nonzero=%zu "
                                     "writer=%s/%llu/%llu/%llu/0x%llx\n",
                                     (unsigned long long)g_this_submit,
                                     (unsigned long long)draw.draw_index,
@@ -1214,11 +1230,24 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                     (int)rtt_hit,
                                     raw_got, raw_size, (unsigned long long)raw_hash,
                                     texture_pixels.size(), (unsigned long long)sample_hash,
+                                    rgb_nonblack, alpha_nonzero,
                                     writer ? prosper::gpu::guest_writer_kind_name(writer->kind) : "none",
                                     (unsigned long long)(writer ? writer->submit : 0),
                                     (unsigned long long)(writer ? writer->item : 0),
                                     (unsigned long long)(writer ? writer->order : 0),
                                     (unsigned long long)(writer ? writer->identity : 0));
+                            if (getenv("PROSPER_DUMP_RESOURCE_VERSION")) {
+                                static std::set<std::pair<uint64_t, uint64_t>> dumped_versions;
+                                if (dumped_versions.emplace(r.gpu_addr, sample_hash).second) {
+                                    const char* dd = getenv("PROSPER_FRAME_DIR");
+                                    char fn[512];
+                                    snprintf(fn, sizeof fn, "%s/resource_%llx_%ux%u_%016llx.bmp",
+                                             dd && *dd ? dd : ".", (unsigned long long)r.gpu_addr, tw, th,
+                                             (unsigned long long)sample_hash);
+                                    prosper::test::dump_bmp(fn, inspected, tw, th);
+                                    fprintf(stderr, "[resource-version] dumped decoded sample -> %s\n", fn);
+                                }
+                            }
                         }
                         // PROSPER_PALETTELOG: compact identity/provenance trace for Unity's 256x16
                         // palette textures. Unlike GFXLOG this is cheap enough for a focused render

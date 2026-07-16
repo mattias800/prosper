@@ -305,7 +305,8 @@ bool have_submit_compute();
 // Live render-target query (#590): the compute backend must not read a sampled input from raw guest
 // memory when the LIVE RENDERER owns that surface's current pixels (an RTT color target — raw memory
 // is then empty/stale, the Dead Cells 642x362 lesson). The live renderer registers this; the compute
-// backend imports an immutable CPU snapshot when one exists and otherwise skips loudly.
+// backend imports an immutable CPU snapshot for sampled bindings. Writable bindings seed from the
+// snapshot, publish their result to guest backing, and notify the renderer to invalidate its copy.
 using LiveTargetQueryFn = std::function<bool(uint64_t gpu_addr)>;
 void set_live_target_query(LiveTargetQueryFn fn);
 bool is_live_render_target(uint64_t gpu_addr);
