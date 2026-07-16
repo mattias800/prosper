@@ -240,6 +240,62 @@ int main() {
               "DCC storage writeback publishes uniform uncompressed metadata");
     }
 
+    // Exercise the same production path with a tiled 2D guest surface. The kernel copies row zero;
+    // every untouched row must survive upload/readback/retiling exactly. This guards the inverse
+    // address mapping used by live tiled StorageImage dispatches, not only the pure tile helper.
+    constexpr uint32_t TILED_H = 19;
+    constexpr uint32_t tiled2d_mode = static_cast<uint32_t>(TileMode::Sw4KbS);
+    std::vector<uint8_t> tiled2d_src_linear(W * TILED_H * 4);
+    std::vector<uint8_t> tiled2d_dst_initial(W * TILED_H * 4, 0x5a);
+    for (size_t i = 0; i < tiled2d_src_linear.size(); ++i)
+        tiled2d_src_linear[i] = static_cast<uint8_t>(i * 41 + 7);
+    const size_t tiled2d_bytes = tiled_surface_bytes(W, TILED_H, tiled2d_mode, 0, 4);
+    std::vector<uint8_t> tiled2d_src(tiled2d_bytes, 0), tiled2d_dst(tiled2d_bytes, 0);
+    tile_surface(tiled2d_src.data(), tiled2d_src_linear.data(), W, TILED_H,
+                 tiled2d_mode, 0, 4);
+    tile_surface(tiled2d_dst.data(), tiled2d_dst_initial.data(), W, TILED_H,
+                 tiled2d_mode, 0, 4);
+
+    ShaderResourceTable tiled2d_rt = irt;
+    for (ShaderResource& resource : tiled2d_rt.resources) {
+        if (resource.binding != 4 && resource.binding != 5) continue;
+        resource.img_dim = 1;
+        resource.width = W;
+        resource.height = TILED_H;
+        resource.depth = 1;
+        resource.tile_mode = tiled2d_mode;
+        resource.size = static_cast<uint32_t>(tiled2d_bytes);
+        resource.gpu_addr = reinterpret_cast<uint64_t>(
+            resource.binding == 4 ? tiled2d_src.data() : tiled2d_dst.data());
+    }
+    const std::vector<uint32_t> tiled2d_spirv = recompile_valu(
+        image_copy_2d, sizeof(image_copy_2d) / sizeof(image_copy_2d[0]), 1, 0,
+        &tiled2d_rt);
+    CHECK(!tiled2d_spirv.empty(), "tiled 2D storage-image copy kernel recompiles");
+    if (!tiled2d_spirv.empty()) {
+        set_test_env("PROSPER_COMPUTE_TILED_2D_STORAGE", "1");
+        ComputeItem tiled2d_item;
+        tiled2d_item.spirv = tiled2d_spirv;
+        tiled2d_item.resources = std::make_shared<ShaderResourceTable>(tiled2d_rt);
+        tiled2d_item.launch.threads_x = W;
+        tiled2d_item.launch.local_x = 64;
+        tiled2d_item.launch.groups_x = 1;
+        tiled2d_item.launch.local_y = tiled2d_item.launch.local_z = 1;
+        tiled2d_item.launch.groups_y = tiled2d_item.launch.groups_z = 1;
+        tiled2d_item.code_addr = 0x590592;
+        CHECK(prosper::frontend::execute_live_compute_items({tiled2d_item}),
+              "production backend executes a tiled 2D storage-image dispatch");
+
+        std::vector<uint8_t> tiled2d_result(W * TILED_H * 4, 0);
+        detile_surface(tiled2d_result.data(), tiled2d_dst.data(), W, TILED_H,
+                       tiled2d_mode, 0, 4);
+        std::vector<uint8_t> tiled2d_expected = tiled2d_dst_initial;
+        std::copy_n(tiled2d_src_linear.begin(), W * 4, tiled2d_expected.begin());
+        CHECK(tiled2d_result == tiled2d_expected,
+              "tiled 2D storage-image writeback matches the linear reference byte-exactly");
+        set_test_env("PROSPER_COMPUTE_TILED_2D_STORAGE", nullptr);
+    }
+
     // A renderer-owned color target is newer than its guest backing. Recompile the same copy kernel
     // with a sampled source, publish deliberately different live pixels, and prove the production
     // backend imports the immutable renderer snapshot instead of either skipping or reading stale RAM.

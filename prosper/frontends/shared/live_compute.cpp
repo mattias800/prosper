@@ -366,6 +366,12 @@ bool trace_compute_item(const prosper::gpu::ComputeItem& item) {
 
 bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& item) {
     using namespace prosper::gpu;
+    using ComputeClock = std::chrono::steady_clock;
+    const auto phase_start = ComputeClock::now();
+    auto phase_setup = phase_start;
+    auto phase_pipeline = phase_start;
+    auto phase_dispatch = phase_start;
+    auto phase_writeback = phase_start;
     const bool trace = trace_compute_item(item);
     auto report = validate_spirv_descriptor_interface(
         item.spirv, item.resources.get(), 0, SpirvShaderStage::Compute, false);
@@ -394,6 +400,8 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         image_descriptors.begin(), image_descriptors.end(), [](const auto& descriptor) {
             return descriptor.kind == SpirvDescriptorKind::StorageImage;
         });
+    const bool phase_timing = has_storage_images &&
+                              std::getenv("PROSPER_COMPUTE_PHASE_TIMING") != nullptr;
     if (has_storage_images && !ctx.image_support) {
         static bool warned = false;
         if (!warned) { warned = true;
@@ -521,11 +529,13 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             const uint64_t key = r ? r->gpu_addr : 0;
             if (std::find(warned.begin(), warned.end(), key) == warned.end()) {
                 warned.push_back(key);
-                std::fprintf(stderr, "[compute] program 0x%llx image 0x%llx %ux%ux%u fmt=%u: %s -> "
+                std::fprintf(stderr, "[compute] program 0x%llx image 0x%llx %ux%ux%u fmt=%u comps=%u "
+                                     "tile=%u size=%u: %s -> "
                                      "dispatch skipped (#590)\n",
                              (unsigned long long)item.code_addr, (unsigned long long)key,
                              r ? r->width : 0, r ? r->height : 0, r ? r->depth : 0,
-                             r ? (unsigned)r->format : 0u, why);
+                             r ? (unsigned)r->format : 0u, r ? r->num_components : 0u,
+                             r ? r->tile_mode : 0u, r ? r->size : 0u, why);
             }
             images_ready = false;
         };
@@ -641,6 +651,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // Fill the upload staging bytes.
             std::vector<uint8_t> upload((size_t)sbytes, 0);
             if (bi.storage) {
+                // The pure tile mapping and a production-backend fixture pass, but arbitrary live
+                // 1D/2D storage descriptors still need title validation before becoming the default.
+                // Keep the prior fail-visible behavior while allowing a bounded game A/B.
                 if (r->tile_mode && !dim_3d &&
                     !std::getenv("PROSPER_COMPUTE_TILED_2D_STORAGE")) {
                     skip_image(r, "tiled 1D/2D storage writeback deferred"); break;
@@ -934,6 +947,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             }
         }
         if (!images_ready) break;
+        phase_setup = ComputeClock::now();
 
         // Layout: the buffer bindings (filled above) + one entry per image binding (#590).
         for (size_t i = 0; i < images.size(); i++) {
@@ -1017,6 +1031,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         if (!vk_ok(vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &cpci, nullptr, &pipeline),
                    "compute-pipeline")) break;
         if (trace) std::fprintf(stderr, "[compute]   compute pipeline ready\n");
+        phase_pipeline = ComputeClock::now();
 
         VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         pci.queueFamilyIndex = ctx.queue_family;
@@ -1097,6 +1112,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         if (!vk_ok(vkWaitForFences(ctx.device, 1, &fence, VK_TRUE,
                                    30ull * 1000 * 1000 * 1000), "queue-wait")) break;
         if (trace) std::fprintf(stderr, "[compute]   dispatch complete\n");
+        phase_dispatch = ComputeClock::now();
 
         bool readback_ok = true;
         for (auto& buffer : buffers) {
@@ -1187,6 +1203,7 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         }
         if (!readback_ok) break;
         ok = true;
+        phase_writeback = ComputeClock::now();
     } while (false);
 
     if (trace)
@@ -1232,6 +1249,23 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
         }
     }
     cleanup();
+    if (phase_timing) {
+        const auto phase_cleanup = ComputeClock::now();
+        auto milliseconds = [](auto begin, auto end) {
+            return std::chrono::duration<double, std::milli>(end - begin).count();
+        };
+        std::fprintf(stderr,
+                     "[compute-phase] submit=%llu code=0x%llx ok=%u "
+                     "setup_ms=%.2f pipeline_ms=%.2f dispatch_ms=%.2f "
+                     "writeback_ms=%.2f cleanup_ms=%.2f total_ms=%.2f\n",
+                     (unsigned long long)item.submit_no, (unsigned long long)item.code_addr,
+                     ok ? 1u : 0u, milliseconds(phase_start, phase_setup),
+                     milliseconds(phase_setup, phase_pipeline),
+                     milliseconds(phase_pipeline, phase_dispatch),
+                     milliseconds(phase_dispatch, phase_writeback),
+                     milliseconds(phase_writeback, phase_cleanup),
+                     milliseconds(phase_start, phase_cleanup));
+    }
     return ok;
 }
 
