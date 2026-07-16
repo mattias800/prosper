@@ -394,7 +394,28 @@ int main(int argc, char** argv) {
 #endif
         };
         if (!boot_program(dump, prog, &err, install_backends)) { fprintf(stderr, "[app] boot failed: %s\n", err.c_str()); return 1; }
-        guestThread = std::thread([]{ run_entry(prog.imgs[0]); });   // runs the guest frame loop
+        guestThread = std::thread([]{
+            const BootResult result = run_entry(prog.imgs[0]);
+            fprintf(stderr,
+                    "[app] guest thread ended: kind=%d detail=%s rip=0x%llx addr=0x%llx "
+                    "rax=0x%llx rbx=0x%llx rdi=0x%llx rsi=0x%llx rdx=0x%llx "
+                    "rbp=0x%llx rsp=0x%llx\n",
+                    result.kind, result.detail.c_str(),
+                    static_cast<unsigned long long>(result.fault_rip),
+                    static_cast<unsigned long long>(result.fault_addr),
+                    static_cast<unsigned long long>(result.rax),
+                    static_cast<unsigned long long>(result.rbx),
+                    static_cast<unsigned long long>(result.rdi),
+                    static_cast<unsigned long long>(result.rsi),
+                    static_cast<unsigned long long>(result.rdx),
+                    static_cast<unsigned long long>(result.rbp),
+                    static_cast<unsigned long long>(result.rsp));
+            if (result.kind != 0)
+                dump_guest_exception_trace();
+            for (uint64_t address : result.backtrace)
+                fprintf(stderr, "[app] guest backtrace: 0x%llx\n",
+                        static_cast<unsigned long long>(address));
+        });   // runs the guest frame loop
         fprintf(stderr, "[app] guest booted; presenting its frames.\n");
     } else if (!testPattern) {
         fprintf(stderr, "[app] no dump given and not --test-pattern; waiting for external present frames.\n");
@@ -444,7 +465,11 @@ int main(int argc, char** argv) {
     fprintf(stderr, "[app] keyboard: WASD/Arrows=move  J/Space=Cross(jump)  K=Square(attack)  L=Circle  "
                     "I=Triangle  U/O=L1/R1  Y/H=L2/R2  Enter=Options  Esc=quit\n");
 
-    uint64_t shown = 0, lastCount = ~0ull, patFrame = 0;
+    const bool frameTrace = getenv("PROSPER_APP_FRAME_TRACE") != nullptr;
+    const char* stallDumpEnv = getenv("PROSPER_APP_STALL_DUMP_MS");
+    const int stallDumpMs = stallDumpEnv ? std::max(0, atoi(stallDumpEnv)) : 0;
+    auto lastFrameProgress = std::chrono::steady_clock::now();
+    uint64_t shown = 0, lastFrameSeq = ~0ull, patFrame = 0;
     bool running = true;
     while (running && !prosper_stop_requested()) {
         SDL_Event ev;
@@ -466,9 +491,10 @@ int main(int argc, char** argv) {
         // test-pattern mode there is no guest, so use the dims we feed (present_width/height report
         // the VideoOut registry, which is empty without a guest). Either way, readback needs a
         // buffer sized to the frame it holds — guard zero dims so we never present a 0-extent image.
-        // In normal use a frame is "new" when the guest flips (present_count advances); test-pattern
-        // has no flips, so treat every iteration as new.
-        bool newFrame = testPattern || (gpu::present_count() != lastCount);
+        // Render completion and guest flips are separate clocks: the command stream can flip before
+        // the renderer publishes its CPU frame. Key this loop to the completed-frame sequence so a
+        // late renderer publication is not missed or marked handled while only the previous frame exists.
+        bool newFrame = testPattern || (gpu::present_frame_seq() != lastFrameSeq);
         gpu::PresentFrameLease frame;
         if (newFrame && gpu::present_acquire_rendered_frame(frame)) {
             uint32_t w = frame.width;
@@ -482,13 +508,33 @@ int main(int argc, char** argv) {
                     int dw = 0, dh = 0; SDL_GetWindowSizeInPixels(win, &dw, &dh);
                     create_swapchain(vk, (uint32_t)dw, (uint32_t)dh);
                 } else {
-                    lastCount = gpu::present_count(); shown++;
+                    lastFrameSeq = frame.frame_seq; shown++;
+                    lastFrameProgress = std::chrono::steady_clock::now();
                     // Periodic present-rate log (every 60 presented frames).
                     static auto t0 = std::chrono::steady_clock::now(); static uint64_t mark = 0;
                     if (shown - mark >= 60) {
                         auto now = std::chrono::steady_clock::now();
                         double s = std::chrono::duration<double>(now - t0).count();
-                        fprintf(stderr, "[app] %.1f fps (%llu frames)\n", (shown - mark) / (s > 0 ? s : 1), (unsigned long long)shown);
+                        if (frameTrace) {
+                            size_t nonzeroRgbBytes = 0;
+                            for (size_t i = 0; i + 3 < frame.rgba->size(); i += 4) {
+                                nonzeroRgbBytes += (*frame.rgba)[i] != 0;
+                                nonzeroRgbBytes += (*frame.rgba)[i + 1] != 0;
+                                nonzeroRgbBytes += (*frame.rgba)[i + 2] != 0;
+                            }
+                            fprintf(stderr,
+                                    "[app] %.1f fps (%llu frames) render_seq=%llu flips=%llu "
+                                    "nonzero_rgb_bytes=%zu/%zu\n",
+                                    (shown - mark) / (s > 0 ? s : 1),
+                                    (unsigned long long)shown,
+                                    (unsigned long long)frame.frame_seq,
+                                    (unsigned long long)gpu::present_count(), nonzeroRgbBytes,
+                                    (size_t)w * h * 3);
+                        } else {
+                            fprintf(stderr, "[app] %.1f fps (%llu frames)\n",
+                                    (shown - mark) / (s > 0 ? s : 1),
+                                    (unsigned long long)shown);
+                        }
                         t0 = now; mark = shown;
                     }
                     if (exitAfter && (int)shown >= exitAfter) running = false;
@@ -496,6 +542,14 @@ int main(int argc, char** argv) {
             }
         } else {
             std::this_thread::sleep_for(std::chrono::milliseconds(2));   // no new frame — don't spin
+        }
+        if (stallDumpMs > 0 &&
+            std::chrono::steady_clock::now() - lastFrameProgress >=
+                std::chrono::milliseconds(stallDumpMs)) {
+            fprintf(stderr, "[app] no presented-frame progress for %d ms at frame %llu\n",
+                    stallDumpMs, (unsigned long long)shown);
+            dump_guest_exception_trace();
+            lastFrameProgress = std::chrono::steady_clock::now();
         }
     }
 

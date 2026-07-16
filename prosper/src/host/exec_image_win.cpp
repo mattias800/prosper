@@ -19,6 +19,7 @@
 #include "../hle/dispatch.hpp"
 
 #include <windows.h>
+#include <pthread.h>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -149,10 +150,23 @@ namespace {
         };
         memcpy(p, seq, sizeof seq); return sizeof seq;
     }
+    size_t emit_hle_return_checkpoint(uint8_t* p) {
+        size_t o = 0;
+        p[o++] = 0x48; p[o++] = 0x89; p[o++] = 0x44; p[o++] = 0x24; p[o++] = 0x20;
+                                                                        // mov [rsp+0x20],rax
+        const uint64_t checkpoint = (uint64_t)(uintptr_t)&dispatch_pending_guest_exception;
+        p[o++] = 0x49; p[o++] = 0xBB; memcpy(p + o, &checkpoint, 8); o += 8;
+                                                                        // movabs r11,checkpoint
+        p[o++] = 0x41; p[o++] = 0xFF; p[o++] = 0xD3;                    // call r11
+        p[o++] = 0x48; p[o++] = 0x8B; p[o++] = 0x44; p[o++] = 0x24; p[o++] = 0x20;
+                                                                        // mov rax,[rsp+0x20]
+        return o;
+    }
     void emit_impl(uint8_t* p, uint64_t fn) {
         size_t o = emit_sysv_to_ms_prologue(p);
         p[o++] = 0x48; p[o++] = 0xB8; memcpy(p + o, &fn, 8); o += 8;   // movabs rax,fn
         p[o++] = 0xFF; p[o++] = 0xD0;                                  // call rax
+        o += emit_hle_return_checkpoint(p + o);
         p[o++] = 0x48; p[o++] = 0x83; p[o++] = 0xC4; p[o++] = 0x48;    // add rsp,0x48
         p[o++] = 0xC3;                                                 // ret
     }
@@ -162,6 +176,7 @@ namespace {
         p[o++] = 0xB9; memcpy(p + o, &idx, 4); o += 4;                 // mov ecx,idx  (MS 1st arg)
         p[o++] = 0x48; p[o++] = 0xB8; memcpy(p + o, &fn, 8); o += 8;   // movabs rax,fn
         p[o++] = 0xFF; p[o++] = 0xD0;                                  // call rax  (prosper_on_unimpl)
+        o += emit_hle_return_checkpoint(p + o);
         p[o++] = 0x48; p[o++] = 0x83; p[o++] = 0xC4; p[o++] = 0x28;    // add rsp,0x28
         p[o++] = 0xC3;                                                 // ret
     }
@@ -174,6 +189,14 @@ namespace {
         DWORD ok = PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE
                  | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY;
         return (mbi.Protect & ok) != 0 && !(mbi.Protect & PAGE_GUARD);
+    }
+    bool addr_executable(uint64_t addr) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery((LPCVOID)(uintptr_t)addr, &mbi, sizeof mbi)) return false;
+        if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD)) return false;
+        const DWORD protection = mbi.Protect & 0xff;
+        return protection == PAGE_EXECUTE || protection == PAGE_EXECUTE_READ ||
+               protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
     }
     // Does the instruction at p carry an %fs segment-override prefix (0x64)? Scans the legacy
     // prefixes and REX; stops at the opcode. Used to tell a drifted-guest-%fs fault (Windows zeroed
@@ -317,6 +340,38 @@ namespace {
             fprintf(stderr, "[veh] tid=%lu code=0x%lx rip=0x%llx addr=0x%llx armed=%d rstate=%d\n",
                     (unsigned long)cur_tid(), (unsigned long)code, (unsigned long long)c->Rip,
                     (unsigned long long)fa, (int)t_armed, prosper_reserved_range_state(fa));
+            if (!t_armed) {
+                fprintf(stderr,
+                        "[veh] regs rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx "
+                        "rsi=%016llx rdi=%016llx\n",
+                        (unsigned long long)c->Rax, (unsigned long long)c->Rbx,
+                        (unsigned long long)c->Rcx, (unsigned long long)c->Rdx,
+                        (unsigned long long)c->Rsi, (unsigned long long)c->Rdi);
+                fprintf(stderr,
+                        "[veh] regs rbp=%016llx rsp=%016llx r8=%016llx r9=%016llx "
+                        "r10=%016llx r11=%016llx r12=%016llx r13=%016llx "
+                        "r14=%016llx r15=%016llx\n",
+                        (unsigned long long)c->Rbp, (unsigned long long)c->Rsp,
+                        (unsigned long long)c->R8, (unsigned long long)c->R9,
+                        (unsigned long long)c->R10, (unsigned long long)c->R11,
+                        (unsigned long long)c->R12, (unsigned long long)c->R13,
+                        (unsigned long long)c->R14, (unsigned long long)c->R15);
+                fprintf(stderr, "[veh] bytes@rip:");
+                dump_fault_bytes(c->Rip, 24);
+                fprintf(stderr, "\n[veh] executable stack candidates:");
+                unsigned candidates = 0;
+                for (uint64_t offset = 0; offset < 0x400; offset += sizeof(uint64_t)) {
+                    const uint64_t slot = c->Rsp + offset;
+                    if (!addr_readable(slot)) break;
+                    const uint64_t value = *(const uint64_t*)(uintptr_t)slot;
+                    if (!addr_executable(value)) continue;
+                    fprintf(stderr, " +0x%llx=0x%llx", (unsigned long long)offset,
+                            (unsigned long long)value);
+                    if (++candidates == 24) break;
+                }
+                fprintf(stderr, "\n");
+                dump_guest_exception_trace();
+            }
         }
         if (!t_armed) return EXCEPTION_CONTINUE_SEARCH;   // worker thread with no recovery point
 
@@ -349,7 +404,7 @@ bool map_image(const LoadedImage& img, std::string* err) {
 bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
                    uint64_t stub_size, std::string* err) {
     auto fail = [&](const char* s){ if (err) *err = s; return false; };
-    if (stub_size < 80) return fail("stub_size too small for Windows ABI bridge (need >= 80)");
+    if (stub_size < 96) return fail("stub_size too small for Windows ABI bridge (need >= 96)");
     if (!g_nid_db) g_nid_db = new NidDb();
     dispatch_init(&slots, g_nid_db);
 
@@ -410,12 +465,24 @@ void unregister_thread_stack(uint64_t tid) {
     std::lock_guard<std::mutex> lk(g_smx); g_stacks.erase(tid);
 }
 bool guest_stack_for_thread(uint64_t tid, void** base, size_t* size) {
-    std::lock_guard<std::mutex> lk(g_smx);
-    auto it = g_stacks.find(tid);
-    if (it == g_stacks.end()) return false;
-    if (base) *base = (void*)(uintptr_t)it->second.first;
-    if (size) *size = (size_t)it->second.second;
-    return true;
+    auto lookup = [&](uint64_t key) {
+        std::lock_guard<std::mutex> lk(g_smx);
+        auto it = g_stacks.find(key);
+        if (it == g_stacks.end()) return false;
+        if (base) *base = (void*)(uintptr_t)it->second.first;
+        if (size) *size = (size_t)it->second.second;
+        return true;
+    };
+    if (lookup(tid)) return true;
+
+    // Windows workers are registered by native thread id because exception delivery and stack
+    // limits use Win32 APIs, while the guest sees winpthreads' small pthread_t handle. Translate
+    // that handle before looking up another thread's stack. Without this, scePthreadAttrGet(target)
+    // missed every worker and IL2CPP's collector scanned the caller's stack instead.
+    HANDLE thread = (HANDLE)pthread_gethandle((pthread_t)tid);
+    if (!thread || thread == INVALID_HANDLE_VALUE) return false;
+    const DWORD native_tid = GetThreadId(thread);
+    return native_tid != 0 && native_tid != tid && lookup(native_tid);
 }
 bool guest_stack_for_current_thread(void** base, size_t* size) {
     return guest_stack_for_thread(cur_tid(), base, size);
@@ -463,6 +530,7 @@ BootResult run_entry(const LoadedImage& img) {
     BootResult r;
     if (!stk) { r.kind = 2; r.detail = "guest stack VirtualAlloc failed"; return r; }
     register_thread_stack(cur_tid(), stk, STK);
+    trace_guest_thread_lifecycle(true, (uint64_t)pthread_self(), cur_tid(), stk, STK);
 
     uint64_t top = ((uint64_t)(uintptr_t)stk + STK) & ~(uint64_t)0xf;
     std::vector<std::string> args = { "/app0/eboot.bin" };
@@ -546,6 +614,8 @@ BootResult run_entry(const LoadedImage& img) {
         }
         t_armed = 0;
     }
+    trace_guest_thread_lifecycle(false, (uint64_t)pthread_self(), cur_tid(), stk, STK);
+    unregister_thread_stack(cur_tid());
     return r;
 }
 

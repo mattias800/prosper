@@ -5,18 +5,29 @@
 // e.g. Windows WaitOnAddress — changes both sides together).
 #pragma once
 #include <cstdint>
+#include <pthread.h>
 
 namespace prosper {
 
 // Bracket a blocking guest futex wait: enter before FUTEX_WAIT, exit after it returns. Lets
 // wake_label_waiters skip its wake syscalls entirely while no thread is blocked.
-void futex_wait_enter(uint64_t addr);
-void futex_wait_exit();
+using WaitRegistration = void*;
+WaitRegistration futex_wait_enter(uint64_t addr);
+void futex_wait_exit(WaitRegistration registration);
 
-// Windows applies SetThreadContext only after a blocked syscall returns. If `thread` is currently
-// inside the HLE WaitOnAddress path, wake that exact address so an asynchronous guest exception can
-// enter its redirected context. Returns true when a registered futex wait was woken.
-bool interrupt_futex_wait(uint64_t thread);
+// Register pthread condition waits that may need interruption for asynchronous guest exception
+// delivery on Windows. Other hosts call pthread directly through these wrappers.
+int interruptible_cond_wait(pthread_cond_t* cond, pthread_mutex_t* mutex);
+int interruptible_cond_timedwait(pthread_cond_t* cond, pthread_mutex_t* mutex,
+                                 const timespec* deadline);
+int interruptible_cond_signal(pthread_cond_t* cond);
+int interruptible_cond_broadcast(pthread_cond_t* cond);
+int interruptible_mutex_lock(pthread_mutex_t* mutex);
+
+// Windows applies SetThreadContext only after a blocked syscall returns. Wake the target's exact
+// registered WaitOnAddress or pthread-condition wait so it can enter its redirected context.
+// Returns true when a registered wait was found and woken.
+bool interrupt_guest_wait(uint64_t thread);
 
 // FUTEX_WAKE up to n waiters blocked on the 32-bit word at addr. No-op when addr==0 or non-Linux.
 void futex_wake(uint64_t addr, int n);

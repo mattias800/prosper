@@ -2080,8 +2080,15 @@ void loop_written_regs(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t 
                 for (uint32_t k = 0; k < vgpr_write_count(in); ++k)
                     vregs.insert(in.dst.value + (int)k);
                 break;
-            case Rdna2Format::SOP1: case Rdna2Format::SOP2: case Rdna2Format::SOPK:
+            case Rdna2Format::SOP1: case Rdna2Format::SOPK:
                 sregs.insert(in.dst.value); break;
+            case Rdna2Format::SOP2:
+                // s_lshr_b64 -> EXEC is modeled only in the per-lane mask domain. It does not
+                // produce scalar SGPR data, so carrying a scalar value through a loop/if merge is
+                // both unnecessary and semantically wrong.
+                if (in.opcode != 0x21 || (in.dst.value != 126 && in.dst.value != 127))
+                    sregs.insert(in.dst.value);
+                break;
             case Rdna2Format::SMEM: {                                      // s_load/s_buffer_load: N consecutive SGPRs
                 uint32_t n = 1; switch (in.opcode) { case 0x1: case 0x9: n=2; break; case 0x2: case 0xA: n=4; break;
                     case 0x3: case 0xB: n=8; break; case 0x4: case 0xC: n=16; break; }
@@ -2360,6 +2367,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 else { rs.sreg_bool[in.dst.value] = r; rs.sreg_bool_narrowed[in.dst.value] = true; }
                 return true;
             }
+            // s_lshr_b64 — only the NGG wave-packing form (dst = EXEC) is modeled: it sets EXEC to
+            // the count of active vertices/primitives in the wave. A per-invocation SPIR-V shader has
+            // no wave to pack, so leave EXEC full. Handle this before taking an operator[] reference
+            // to rs.sreg[dst]: inserting a default SSA id 0 leaked into a later OpPhi and produced
+            // invalid SPIR-V (and an NVIDIA Windows driver crash during pipeline creation).
+            if (in.opcode == 0x21) {
+                if (in.dst.value != 126 && in.dst.value != 127) ok = false;
+                return true;
+            }
             uint32_t a = val(in.src[0]), c = val(in.src[1]); uint32_t& d = rs.sreg[in.dst.value];
             auto scc_nz = [&](uint32_t v){ rs.scc = b.ucmp(Op_INotEqual, v, b.uconst(0)); };  // SCC = (result != 0)
             switch (in.opcode) {
@@ -2412,13 +2428,6 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                              d = b.ibin(Op_ShiftRightLogical, a, sh); scc_nz(d); break; }  // dst = src0 >> (src1 & 31)
                 case 0x22: { uint32_t sh = b.ibin(Op_BitwiseAnd, c, b.uconst(31));   // s_ashr_i32
                              d = b.sbin(Op_ShiftRightArithmetic, a, sh); scc_nz(d); break; }  // dst = src0 >>a (src1 & 31)
-                case 0x21:   // s_lshr_b64 — only the NGG wave-packing form (dst = EXEC) is modeled: it sets
-                             // EXEC to the count of active vertices/primitives in the wave. A per-invocation
-                             // SPIR-V shader has no wave to pack (each invocation is one vertex), so leave
-                             // EXEC full — no narrowing. Non-EXEC 64-bit shifts stay unsupported.
-                             // (RE-TAG: NGG exec packing.)
-                    if (in.dst.value != 126 && in.dst.value != 127) ok = false;
-                    break;
                 case 0x26: d = b.ibin(Op_IMul, a, c); break;         // s_mul_i32 (low 32 bits; no SCC)
                 case 0x31: d = b.ibin(Op_IAdd, b.ibin(Op_ShiftLeftLogical, a, b.uconst(4)), c); break;  // s_lshl4_add_u32 = (src0<<4)+src1
                 case 0x35: d = b.umul_hi(a, c); break;               // s_mul_hi_u32 (high 32 bits; no SCC)
