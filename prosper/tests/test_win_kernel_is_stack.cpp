@@ -8,6 +8,7 @@
 #include <pthread.h>
 #include <cstdint>
 #include <cstdio>
+#include <thread>
 
 using namespace prosper;
 
@@ -84,6 +85,23 @@ int main() {
     InterlockedExchange(&probe.release, 1);
     if (worker_created) pthread_join(worker, nullptr);
 
+    // prosper-app and screenshot enter the guest from std::thread rather than a thread created
+    // through our pthread HLE. winpthreads cannot always translate that implicit handle with
+    // pthread_gethandle(), so a self-query must fall back to the current native thread id.
+    bool std_thread_self_resolved = false;
+    std::thread frontend_guest([&] {
+        uint8_t stack_byte = 0;
+        run_guest_inits({});
+        void* self_base = nullptr;
+        size_t self_size = 0;
+        std_thread_self_resolved =
+            guest_stack_for_thread((uint64_t)pthread_self(), &self_base, &self_size) &&
+            (uintptr_t)&stack_byte >= (uintptr_t)self_base &&
+            (uintptr_t)&stack_byte < (uintptr_t)self_base + self_size;
+        unregister_thread_stack((uint64_t)GetCurrentThreadId());
+    });
+    frontend_guest.join();
+
     // A stale/unknown target must leave the caller-provided attr unchanged. Falling back to the
     // querying thread here is the exact wrong-stack substitution that can corrupt a GC scan.
     void* sentinel_stack = VirtualAlloc(nullptr, 1024 * 1024,
@@ -104,13 +122,15 @@ int main() {
     bool unregistered = is_stack(addr, 0, 0, 0, 0, 0) == 0;
 
     if (!inside || !below || !at_end || !attr_bounds || !worker_created || !resolved_worker ||
-        !target_attr_bounds || !missing_target_unchanged || !unregistered) {
+        !target_attr_bounds || !std_thread_self_resolved || !missing_target_unchanged ||
+        !unregistered) {
         std::fprintf(stderr,
                      "stack HLE mismatch: inside=%d below=%d at_end=%d attr_bounds=%d "
-                     "worker_created=%d resolved_worker=%d target_attr_bounds=%d "
+                     "worker_created=%d resolved_worker=%d target_attr_bounds=%d std_self=%d "
                      "missing_unchanged=%d reported=%p/%zu expected=%p/%zu unregistered=%d\n",
                      inside, below, at_end, attr_bounds, worker_created, resolved_worker,
-                     target_attr_bounds, missing_target_unchanged, reported_base, reported_size,
+                     target_attr_bounds, std_thread_self_resolved, missing_target_unchanged,
+                     reported_base, reported_size,
                      probe.base, probe.size, unregistered);
         return 1;
     }
