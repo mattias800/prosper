@@ -88,3 +88,10 @@ These switches isolate frontend-specific behavior without requiring a separate b
   `PROSPER_APP_GUEST_DUMP_PATH` writes thread samples to a dedicated append-only file so other trace
   streams cannot interleave with them. `PROSPER_APP_GUEST_DUMP_PTHREAD=<id>` limits each sample to
   one guest pthread (for example `0x2` for a title's main thread) to reduce observer overhead.
+  On Windows, each enabled sample briefly uses `SuspendThread`/`GetThreadContext`/`ResumeThread` for
+  every selected live guest thread and reads at most 16 KiB of its registered stack. This perturbs
+  scheduling and is a diagnostic checkpoint, not a profiler. The registry supports 1,024 live guest
+  threads and uses unique generation-token publication, so a sampler never consumes a partially published
+  or reused slot. Lifecycle registration adds only lock-free atomic stores at thread start/exit.
+  Wait kind/source metadata is published on the existing Windows interruptible-wait path even when
+  timed sampling is disabled; the sampler only reads it when one of these checkpoints is requested.

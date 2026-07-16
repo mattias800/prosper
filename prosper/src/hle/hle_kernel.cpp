@@ -1434,40 +1434,68 @@ std::array<WinCoopSlot, 1024> g_win_coop_slots;
 std::atomic<uint32_t> g_win_coop_queued{0};
 
 struct WinGuestThreadSlot {
+    std::atomic<uint64_t> publication{0};
+    uint64_t next_publication = 0; // written only while publication holds the exclusive sentinel
     std::atomic<uint32_t> native_id{0};
     std::atomic<uint64_t> pthread_id{0};
     std::atomic<uintptr_t> stack_base{0};
     std::atomic<size_t> stack_size{0};
 };
 std::array<WinGuestThreadSlot, 1024> g_win_guest_threads;
+constexpr uint64_t kWinGuestThreadSlotPublishing = UINT64_MAX;
+
+bool win_guest_thread_snapshot(const WinGuestThreadSlot& slot, GuestThreadSnapshot& snapshot) {
+    const uint64_t publication = slot.publication.load(std::memory_order_acquire);
+    if (publication == 0 || publication == kWinGuestThreadSlotPublishing) return false;
+    const uint32_t native_id = slot.native_id.load(std::memory_order_relaxed);
+    const uint64_t pthread_id = slot.pthread_id.load(std::memory_order_relaxed);
+    const uintptr_t stack_base = slot.stack_base.load(std::memory_order_relaxed);
+    const size_t stack_size = slot.stack_size.load(std::memory_order_relaxed);
+    if (slot.publication.load(std::memory_order_acquire) != publication) return false;
+    snapshot = {native_id, pthread_id, stack_base, stack_size};
+    return true;
+}
 
 void win_guest_thread_register(uint64_t pthread_id, uint32_t native_id,
                                void* stack_base, size_t stack_size) {
+    if (native_id == 0) return;
     for (WinGuestThreadSlot& slot : g_win_guest_threads) {
-        uint32_t current = slot.native_id.load(std::memory_order_acquire);
-        if (current == native_id) {
-            slot.pthread_id.store(pthread_id, std::memory_order_release);
-            slot.stack_base.store((uintptr_t)stack_base, std::memory_order_release);
-            slot.stack_size.store(stack_size, std::memory_order_release);
-            return;
-        }
-        if (current != 0 || !slot.native_id.compare_exchange_strong(
-                                current, native_id, std::memory_order_acq_rel))
+        GuestThreadSnapshot current{};
+        if (win_guest_thread_snapshot(slot, current) && current.native_id == native_id)
+            return; // idempotent lifecycle notification
+        uint64_t publication = 0;
+        if (!slot.publication.compare_exchange_strong(
+                publication, kWinGuestThreadSlotPublishing, std::memory_order_acq_rel))
             continue;
-        slot.pthread_id.store(pthread_id, std::memory_order_release);
-        slot.stack_base.store((uintptr_t)stack_base, std::memory_order_release);
-        slot.stack_size.store(stack_size, std::memory_order_release);
+        // A unique publication token validates the complete payload and detects unregister/re-register
+        // ABA even when Windows promptly reuses the same native thread id.
+        slot.native_id.store(native_id, std::memory_order_relaxed);
+        slot.pthread_id.store(pthread_id, std::memory_order_relaxed);
+        slot.stack_base.store((uintptr_t)stack_base, std::memory_order_relaxed);
+        slot.stack_size.store(stack_size, std::memory_order_relaxed);
+        uint64_t token;
+        do {
+            token = ++slot.next_publication;
+        } while (token == 0 || token == kWinGuestThreadSlotPublishing);
+        slot.publication.store(token, std::memory_order_release);
         return;
     }
 }
 
 void win_guest_thread_unregister(uint32_t native_id) {
     for (WinGuestThreadSlot& slot : g_win_guest_threads) {
-        if (slot.native_id.load(std::memory_order_acquire) != native_id) continue;
-        slot.pthread_id.store(0, std::memory_order_release);
-        slot.stack_base.store(0, std::memory_order_release);
-        slot.stack_size.store(0, std::memory_order_release);
-        slot.native_id.store(0, std::memory_order_release);
+        uint64_t publication = slot.publication.load(std::memory_order_acquire);
+        if (publication == 0 || publication == kWinGuestThreadSlotPublishing ||
+            slot.native_id.load(std::memory_order_relaxed) != native_id ||
+            slot.publication.load(std::memory_order_acquire) != publication ||
+            !slot.publication.compare_exchange_strong(
+                publication, kWinGuestThreadSlotPublishing, std::memory_order_acq_rel))
+            continue;
+        slot.native_id.store(0, std::memory_order_relaxed);
+        slot.pthread_id.store(0, std::memory_order_relaxed);
+        slot.stack_base.store(0, std::memory_order_relaxed);
+        slot.stack_size.store(0, std::memory_order_relaxed);
+        slot.publication.store(0, std::memory_order_release);
         return;
     }
 }
@@ -1929,20 +1957,23 @@ void dump_guest_thread_trace(const char* path, uint64_t pthread_filter) {
         modules = g_unwind_mods;
     }
     unsigned live = 0;
-    for (const WinGuestThreadSlot& slot : g_win_guest_threads)
-        live += slot.native_id.load(std::memory_order_acquire) != 0;
+    for (const WinGuestThreadSlot& slot : g_win_guest_threads) {
+        GuestThreadSnapshot registered{};
+        live += win_guest_thread_snapshot(slot, registered);
+    }
     size_t condition_slots_used = 0;
     size_t condition_slots_capacity = 0;
     snapshot_guest_wait_registry(condition_slots_used, condition_slots_capacity);
     trace("[thread-trace] live guest threads=%u condition-slots=%zu/%zu\n", live,
           condition_slots_used, condition_slots_capacity);
     for (const WinGuestThreadSlot& slot : g_win_guest_threads) {
-        const uint32_t native_id = slot.native_id.load(std::memory_order_acquire);
-        if (!native_id) continue;
-        const uint64_t pthread_id = slot.pthread_id.load(std::memory_order_acquire);
+        GuestThreadSnapshot registered{};
+        if (!win_guest_thread_snapshot(slot, registered)) continue;
+        const uint32_t native_id = registered.native_id;
+        const uint64_t pthread_id = registered.pthread_id;
         if (pthread_filter && pthread_id != pthread_filter) continue;
-        const uintptr_t stack_base = slot.stack_base.load(std::memory_order_acquire);
-        const size_t stack_size = slot.stack_size.load(std::memory_order_acquire);
+        const uintptr_t stack_base = registered.stack_base;
+        const size_t stack_size = registered.stack_size;
         HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
                                        THREAD_QUERY_INFORMATION,
                                    FALSE, native_id);
@@ -1960,8 +1991,8 @@ void dump_guest_thread_trace(const char* path, uint64_t pthread_filter) {
         std::array<uint64_t, 2048> stack_words{};
         SIZE_T stack_bytes = 0;
         if (captured && context.Rsp >= stack_base &&
-            context.Rsp < stack_base + stack_size) {
-            const size_t available = stack_base + stack_size - (uintptr_t)context.Rsp;
+            context.Rsp - stack_base < stack_size) {
+            const size_t available = stack_size - ((uintptr_t)context.Rsp - stack_base);
             const size_t wanted = std::min(available, sizeof(stack_words));
             ReadProcessMemory(GetCurrentProcess(), (void*)(uintptr_t)context.Rsp,
                               stack_words.data(), wanted, &stack_bytes);
@@ -1975,14 +2006,16 @@ void dump_guest_thread_trace(const char* path, uint64_t pthread_filter) {
             continue;
         }
         const uint64_t rip = context.Rip;
-        const char* module = "host";
+        const char* module_name = "host";
+        char guest_module_name[32]{};
         uint64_t offset = rip;
-        if (rip >= 0x400000000ull && rip < 0x420000000ull) {
-            module = "eboot"; offset -= 0x400000000ull;
-        } else if (rip >= 0x440000000ull && rip < 0x443000000ull) {
-            module = "il2cpp"; offset -= 0x440000000ull;
-        } else if (rip >= 0x400000000ull && rip < 0x600000000ull) {
-            module = "guest-prx"; offset -= 0x400000000ull;
+        for (size_t module_index = 0; module_index < modules.size(); ++module_index) {
+            const UnwindModuleDesc& guest_module = modules[module_index];
+            if (rip < guest_module.lo || rip >= guest_module.hi) continue;
+            std::snprintf(guest_module_name, sizeof(guest_module_name), "guest[%zu]", module_index);
+            module_name = guest_module_name;
+            offset = rip - guest_module.lo;
+            break;
         }
         char guest_returns[224] = "-";
         size_t guest_returns_used = 0;
@@ -1990,11 +2023,10 @@ void dump_guest_thread_trace(const char* path, uint64_t pthread_filter) {
         for (size_t i = 0; i < stack_bytes / sizeof(uint64_t) && guest_return_count < 8; ++i) {
             const uint64_t candidate = stack_words[i];
             if (candidate < 0x400000000ull || candidate >= 0x600000000ull) continue;
-            bool executable = false;
-            for (const UnwindModuleDesc& module : modules)
-                executable |= candidate >= module.seg0 &&
-                              candidate < module.seg0 + module.seg0_sz;
-            if (!executable) continue;
+            bool in_guest_module = false;
+            for (const UnwindModuleDesc& guest_module : modules)
+                in_guest_module |= candidate >= guest_module.lo && candidate < guest_module.hi;
+            if (!in_guest_module || !guest_trace_page_executable((uintptr_t)candidate)) continue;
             bool duplicate = false;
             for (size_t j = 0; j < i; ++j)
                 duplicate |= stack_words[j] == candidate;
@@ -2028,7 +2060,7 @@ void dump_guest_thread_trace(const char* path, uint64_t pthread_filter) {
         }
         trace("[thread-trace] tid=%lu pthread=0x%llx rip=%s+0x%llx "
               "raw=0x%llx rsp=0x%llx suspend=%lu wait=%s guest-stack=%s\n",
-              (unsigned long)native_id, (unsigned long long)pthread_id, module,
+              (unsigned long)native_id, (unsigned long long)pthread_id, module_name,
               (unsigned long long)offset, (unsigned long long)rip,
               (unsigned long long)context.Rsp, (unsigned long)prior_suspend,
               wait_description, guest_returns);
@@ -2037,6 +2069,43 @@ void dump_guest_thread_trace(const char* path, uint64_t pthread_filter) {
 #else
     (void)path;
     (void)pthread_filter;
+#endif
+}
+
+bool snapshot_guest_thread_registration(uint32_t native_id, GuestThreadSnapshot& snapshot) {
+    snapshot = {};
+#ifdef _WIN32
+    for (const WinGuestThreadSlot& slot : g_win_guest_threads) {
+        GuestThreadSnapshot candidate{};
+        if (win_guest_thread_snapshot(slot, candidate) && candidate.native_id == native_id) {
+            snapshot = candidate;
+            return true;
+        }
+    }
+#else
+    (void)native_id;
+#endif
+    return false;
+}
+
+bool guest_trace_page_executable(uintptr_t address) {
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION memory{};
+    if (!address || VirtualQuery((const void*)address, &memory, sizeof(memory)) != sizeof(memory) ||
+        memory.State != MEM_COMMIT || (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
+        return false;
+    switch (memory.Protect & 0xffu) {
+        case PAGE_EXECUTE:
+        case PAGE_EXECUTE_READ:
+        case PAGE_EXECUTE_READWRITE:
+        case PAGE_EXECUTE_WRITECOPY:
+            return true;
+        default:
+            return false;
+    }
+#else
+    (void)address;
+    return false;
 #endif
 }
 
