@@ -278,6 +278,42 @@ int main() {
               "DCC storage writeback publishes uniform uncompressed metadata");
     }
 
+    // Two storage views may share base texels while only one carries DCC state. They are not safe
+    // Vulkan-image aliases: collapsing the compressed view onto an uncompressed owner drops its
+    // separate metadata writeback obligation and leaves later sampled users reading stale DCC.
+    std::vector<uint8_t> mixed_alias_base = tiled_src;
+    std::vector<uint8_t> mixed_alias_metadata(metadata_bytes, 0x40);
+    ShaderResourceTable mixed_alias_rt = dcc_rt;
+    for (ShaderResource& resource : mixed_alias_rt.resources) {
+        if (resource.binding != 4 && resource.binding != 5) continue;
+        resource.gpu_addr = reinterpret_cast<uint64_t>(mixed_alias_base.data());
+        if (resource.binding == 5) {
+            resource.metadata_addr = 0x207cf00000ull;
+            resource.dcc_metadata_host_data = mixed_alias_metadata.data();
+            resource.dcc_metadata_host_data_size = mixed_alias_metadata.size();
+        }
+    }
+    const std::vector<uint32_t> mixed_alias_spirv = recompile_valu(
+        image_copy_2d, sizeof(image_copy_2d) / sizeof(image_copy_2d[0]), 1, 0,
+        &mixed_alias_rt);
+    CHECK(!mixed_alias_spirv.empty(), "mixed DCC storage-alias kernel recompiles");
+    if (!mixed_alias_spirv.empty()) {
+        ComputeItem mixed_alias_item;
+        mixed_alias_item.spirv = mixed_alias_spirv;
+        mixed_alias_item.resources = std::make_shared<ShaderResourceTable>(mixed_alias_rt);
+        mixed_alias_item.launch.threads_x = W;
+        mixed_alias_item.launch.local_x = 64;
+        mixed_alias_item.launch.groups_x = 1;
+        mixed_alias_item.launch.local_y = mixed_alias_item.launch.local_z = 1;
+        mixed_alias_item.launch.groups_y = mixed_alias_item.launch.groups_z = 1;
+        mixed_alias_item.code_addr = 0x719dcd;
+        CHECK(prosper::frontend::execute_live_compute_items({mixed_alias_item}),
+              "mixed compressed/uncompressed storage views execute independently");
+        CHECK(std::all_of(mixed_alias_metadata.begin(), mixed_alias_metadata.end(),
+                          [](uint8_t code) { return code == 0xff; }),
+              "compressed storage alias retains its DCC writeback obligation");
+    }
+
     // Exercise the same production path with a tiled 2D guest surface. The kernel copies row zero;
     // every untouched row must survive upload/readback/retiling exactly. This guards the inverse
     // address mapping used by live tiled StorageImage dispatches, not only the pure tile helper.
@@ -330,6 +366,96 @@ int main() {
         std::copy_n(tiled2d_src_linear.begin(), W * 4, tiled2d_expected.begin());
         CHECK(tiled2d_result == tiled2d_expected,
               "tiled 2D storage-image writeback matches the linear reference byte-exactly");
+    }
+
+    // Exercise the wider element mappings that become default-on with tiled storage. Float16 uses
+    // finite values so half->float->half is exact; Float32 follows the backend's raw channel contract.
+    auto wide_tiled_roundtrip = [&](DataFormat format, uint32_t bytes_per_texel,
+                                    uint64_t code_addr) {
+        const size_t linear_bytes = static_cast<size_t>(W) * TILED_H * bytes_per_texel;
+        std::vector<uint8_t> src_linear(linear_bytes, 0);
+        std::vector<uint8_t> dst_initial(linear_bytes, 0);
+        if (format == DataFormat::Float16) {
+            for (size_t i = 0; i < linear_bytes / 2; ++i) {
+                const uint16_t src_half = float_to_half(
+                    static_cast<float>(static_cast<int>(i % 31) - 15) / 16.0f);
+                const uint16_t dst_half = float_to_half(
+                    static_cast<float>(static_cast<int>(i % 17) - 8) / 8.0f);
+                std::memcpy(src_linear.data() + i * 2, &src_half, sizeof(src_half));
+                std::memcpy(dst_initial.data() + i * 2, &dst_half, sizeof(dst_half));
+            }
+        } else {
+            for (size_t i = 0; i < linear_bytes / 4; ++i) {
+                const uint32_t src_word = static_cast<uint32_t>(i * 2654435761u + 0x1020304u);
+                const uint32_t dst_word = static_cast<uint32_t>(i * 2246822519u + 0x5060708u);
+                std::memcpy(src_linear.data() + i * 4, &src_word, sizeof(src_word));
+                std::memcpy(dst_initial.data() + i * 4, &dst_word, sizeof(dst_word));
+            }
+        }
+        const size_t tiled_bytes_wide = tiled_surface_bytes(
+            W, TILED_H, tiled2d_mode, 0, bytes_per_texel);
+        std::vector<uint8_t> src_tiled(tiled_bytes_wide, 0);
+        std::vector<uint8_t> dst_tiled(tiled_bytes_wide, 0);
+        tile_surface(src_tiled.data(), src_linear.data(), W, TILED_H,
+                     tiled2d_mode, 0, bytes_per_texel);
+        tile_surface(dst_tiled.data(), dst_initial.data(), W, TILED_H,
+                     tiled2d_mode, 0, bytes_per_texel);
+        ShaderResourceTable wide_rt = tiled2d_rt;
+        for (ShaderResource& resource : wide_rt.resources) {
+            if (resource.binding != 4 && resource.binding != 5) continue;
+            resource.format = format;
+            resource.num_components = 4;
+            resource.size = static_cast<uint32_t>(tiled_bytes_wide);
+            resource.gpu_addr = reinterpret_cast<uint64_t>(
+                resource.binding == 4 ? src_tiled.data() : dst_tiled.data());
+        }
+        const std::vector<uint32_t> wide_spirv = recompile_valu(
+            image_copy_2d, sizeof(image_copy_2d) / sizeof(image_copy_2d[0]), 1, 0,
+            &wide_rt);
+        if (wide_spirv.empty()) return false;
+        ComputeItem wide_item;
+        wide_item.spirv = wide_spirv;
+        wide_item.resources = std::make_shared<ShaderResourceTable>(wide_rt);
+        wide_item.launch.threads_x = W;
+        wide_item.launch.local_x = 64;
+        wide_item.launch.groups_x = 1;
+        wide_item.launch.local_y = wide_item.launch.local_z = 1;
+        wide_item.launch.groups_y = wide_item.launch.groups_z = 1;
+        wide_item.code_addr = code_addr;
+        if (!prosper::frontend::execute_live_compute_items({wide_item})) return false;
+        std::vector<uint8_t> result(linear_bytes, 0);
+        detile_surface(result.data(), dst_tiled.data(), W, TILED_H,
+                       tiled2d_mode, 0, bytes_per_texel);
+        std::vector<uint8_t> expected = dst_initial;
+        std::copy_n(src_linear.begin(), static_cast<size_t>(W) * bytes_per_texel,
+                    expected.begin());
+        return result == expected;
+    };
+    CHECK(wide_tiled_roundtrip(DataFormat::Float16, 8, 0x590595),
+          "tiled Float16x4 storage writeback is byte-exact");
+    CHECK(wide_tiled_roundtrip(DataFormat::Float32, 16, 0x590596),
+          "tiled Float32x4 storage writeback is byte-exact");
+
+    ShaderResourceTable unsupported_tiled_rt = tiled2d_rt;
+    for (ShaderResource& resource : unsupported_tiled_rt.resources)
+        if (resource.binding == 4 || resource.binding == 5) resource.tile_mode = 6;
+    const std::vector<uint32_t> unsupported_tiled_spirv = recompile_valu(
+        image_copy_2d, sizeof(image_copy_2d) / sizeof(image_copy_2d[0]), 1, 0,
+        &unsupported_tiled_rt);
+    CHECK(!unsupported_tiled_spirv.empty(), "unsupported tiled storage kernel still recompiles");
+    if (!unsupported_tiled_spirv.empty()) {
+        ComputeItem unsupported_tiled_item;
+        unsupported_tiled_item.spirv = unsupported_tiled_spirv;
+        unsupported_tiled_item.resources =
+            std::make_shared<ShaderResourceTable>(unsupported_tiled_rt);
+        unsupported_tiled_item.launch.threads_x = W;
+        unsupported_tiled_item.launch.local_x = 64;
+        unsupported_tiled_item.launch.groups_x = 1;
+        unsupported_tiled_item.launch.local_y = unsupported_tiled_item.launch.local_z = 1;
+        unsupported_tiled_item.launch.groups_y = unsupported_tiled_item.launch.groups_z = 1;
+        unsupported_tiled_item.code_addr = 0x590594;
+        CHECK(!prosper::frontend::execute_live_compute_items({unsupported_tiled_item}),
+              "unknown nonzero tile mode is rejected before storage writeback");
     }
 
     // A renderer-owned color target is newer than its guest backing. Recompile the same copy kernel

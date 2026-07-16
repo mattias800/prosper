@@ -638,10 +638,23 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                 for (size_t j = 0; j < i; j++) {
                     const BoundImage& prior = images[j];
                     const ShaderResource* p = prior.resource;
+                    const bool same_dcc_identity = p &&
+                        p->max_uncompressed_block_size == r->max_uncompressed_block_size &&
+                        p->max_compressed_block_size == r->max_compressed_block_size &&
+                        p->meta_pipe_aligned == r->meta_pipe_aligned &&
+                        p->write_compress_enabled == r->write_compress_enabled &&
+                        p->compression_enabled == r->compression_enabled &&
+                        p->alpha_is_on_msb == r->alpha_is_on_msb &&
+                        p->color_transform == r->color_transform &&
+                        p->metadata_addr == r->metadata_addr &&
+                        p->dcc_metadata_size == r->dcc_metadata_size &&
+                        p->dcc_metadata_host_data == r->dcc_metadata_host_data &&
+                        p->dcc_metadata_host_data_size == r->dcc_metadata_host_data_size;
                     if (!prior.storage || !p || p->gpu_addr != r->gpu_addr ||
                         p->width != r->width || p->height != r->height || p->depth != r->depth ||
                         p->format != r->format || p->num_components != r->num_components ||
-                        p->tile_mode != r->tile_mode || p->img_dim != r->img_dim)
+                        p->tile_mode != r->tile_mode || p->img_dim != r->img_dim ||
+                        !same_dcc_identity)
                         continue;
                     bi.alias_of = prior.alias_of == SIZE_MAX ? j : prior.alias_of;
                     const BoundImage& owner = images[bi.alias_of];
@@ -673,6 +686,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
             // Fill the upload staging bytes.
             std::vector<uint8_t> upload((size_t)sbytes, 0);
             if (bi.storage) {
+                if (r->tile_mode && !tile_mode_is_tiled(r->tile_mode)) {
+                    skip_image(r, "storage tile mode has no supported address pattern"); break;
+                }
                 if (r->tile_mode && !dim_3d &&
                     std::getenv("PROSPER_DISABLE_COMPUTE_TILED_2D_STORAGE")) {
                     skip_image(r, "tiled 1D/2D storage writeback disabled"); break;
@@ -696,8 +712,9 @@ bool execute_item(VulkanComputeContext& ctx, const prosper::gpu::ComputeItem& it
                     skip_image(r, "storage backing size is invalid"); break;
                 }
                 bi.guest_bytes = guest_bytes;
-                const uint8_t* src = resource_bytes_for(r, guest_bytes);
-                const bool readable = (r->host_data && r->host_data_size >= guest_bytes) ||
+                const uint8_t* src = renderer_owned ? nullptr : resource_bytes_for(r, guest_bytes);
+                const bool readable = renderer_owned ||
+                                      (r->host_data && r->host_data_size >= guest_bytes) ||
                                       guest_readable(r->gpu_addr, static_cast<uint32_t>(guest_bytes));
                 if (!readable) { skip_image(r, "storage backing unreadable"); break; }
                 std::vector<uint8_t> linear((size_t)linear_guest_bytes, 0);
