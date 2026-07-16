@@ -127,6 +127,8 @@ struct ShaderCompileKey {
     PixelInputMapping pixel_inputs{};
     bool has_system_inputs = false;
     PixelSystemInputMapping system_inputs{};
+    bool has_pcrel_dispatch = false;
+    uint32_t pcrel_dispatch_target = UINT32_MAX;
     std::vector<uint32_t> code;
     std::vector<ShaderResourceCompileKey> resources;
 
@@ -159,6 +161,8 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, key.system_inputs.ena);
             hash = hash_mix(hash, key.system_inputs.addr);
         }
+        hash = hash_mix(hash, key.has_pcrel_dispatch);
+        if (key.has_pcrel_dispatch) hash = hash_mix(hash, key.pcrel_dispatch_target);
         hash = hash_mix(hash, key.code.size());
         for (uint32_t word : key.code) hash = hash_mix(hash, word);
         hash = hash_mix(hash, key.resources.size());
@@ -455,6 +459,60 @@ ShaderCompileKey make_shader_compile_key(ShaderProgramStage stage, const uint32_
     if (key.has_pixel_inputs) key.pixel_inputs = *pixel_inputs;
     key.has_system_inputs = stage == ShaderProgramStage::Fragment && system_inputs != nullptr;
     if (key.has_system_inputs) key.system_inputs = *system_inputs;
+    if (stage == ShaderProgramStage::Fragment && code && dwords && resources) {
+        const PcrelDispatchInfo dispatch = rdna2_pcrel_dispatch_info(code, dwords);
+        if (dispatch.valid) {
+            const ShaderResource* resource = resources->by_sgpr_base_cls(
+                dispatch.selector_sgpr_base, ResourceClass::ConstantBuffer);
+            uint32_t raw_selector = 0;
+            bool readable = false;
+            if (resource && dispatch.selector_byte_offset <= resource->size &&
+                resource->size - dispatch.selector_byte_offset >= sizeof(raw_selector)) {
+                if (resource->host_data && dispatch.selector_byte_offset <= resource->host_data_size &&
+                    resource->host_data_size - dispatch.selector_byte_offset >= sizeof(raw_selector)) {
+                    memcpy(&raw_selector, resource->host_data + dispatch.selector_byte_offset,
+                           sizeof(raw_selector));
+                    readable = true;
+                } else if (resource->gpu_addr <= UINT64_MAX - dispatch.selector_byte_offset) {
+                    const uint64_t address = resource->gpu_addr + dispatch.selector_byte_offset;
+                    if (guest_readable(address, sizeof(raw_selector))) {
+                        memcpy(&raw_selector, reinterpret_cast<const void*>(static_cast<uintptr_t>(address)),
+                               sizeof(raw_selector));
+                        readable = true;
+                    }
+                }
+            }
+            if (readable) {
+                const uint32_t adjusted = raw_selector + static_cast<uint32_t>(dispatch.selector_addend);
+                const uint32_t index = std::min(adjusted, dispatch.selector_max);
+                if (index < dispatch.target_pcs.size()) {
+                    key.has_pcrel_dispatch = true;
+                    key.pcrel_dispatch_target = dispatch.target_pcs[index];
+                }
+            }
+            if (getenv("PROSPER_DBG")) {
+                static std::mutex dispatch_log_mutex;
+                static std::set<uintptr_t> dispatch_logged;
+                std::lock_guard lock(dispatch_log_mutex);
+                if (dispatch_logged.insert(reinterpret_cast<uintptr_t>(code)).second) {
+                    fprintf(stderr,
+                            "[pcrel-dispatch] code=%p selector=s%u+0x%x resource=%s readable=%u "
+                            "raw=%u target=%u resources=%zu\n",
+                            static_cast<const void*>(code), dispatch.selector_sgpr_base,
+                            dispatch.selector_byte_offset, resource ? "found" : "missing", readable,
+                            raw_selector, key.pcrel_dispatch_target, resources->resources.size());
+                    for (const auto& candidate : resources->resources)
+                        fprintf(stderr,
+                                "[pcrel-dispatch]   cls=%u binding=%u sgpr=%u srt=%u addr=%llx "
+                                "size=%u host=%llu\n",
+                                static_cast<unsigned>(candidate.cls), candidate.binding,
+                                candidate.sgpr_base, candidate.srt_offset,
+                                static_cast<unsigned long long>(candidate.gpu_addr), candidate.size,
+                                static_cast<unsigned long long>(candidate.host_data_size));
+                }
+            }
+        }
+    }
     if (code && dwords) {
         // Most shaders end at S_ENDPGM. A compiler-generated s_getpc_b64 V# may instead address an
         // embedded lookup table after ENDPGM; retain that proven tail so cached recompilation sees the
@@ -483,7 +541,8 @@ std::vector<uint32_t> compile_graphics_shader(ShaderProgramStage stage, const Sh
                                 key.has_pixel_inputs ? &key.pixel_inputs : nullptr);
     if (stage == ShaderProgramStage::Fragment)
         return recompile_fragment(code, key.code.size(), resources,
-                                  key.has_system_inputs ? &key.system_inputs : nullptr);
+                                  key.has_system_inputs ? &key.system_inputs : nullptr,
+                                  key.has_pcrel_dispatch ? key.pcrel_dispatch_target : UINT32_MAX);
     return {};
 }
 
@@ -1701,10 +1760,11 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     }
                     const bool is_bcn = fi.block_width > 1;
                     if (is_bcn && fi.snorm) continue;   // signed BCn (SNORM / BC6H SF16): decode not wired
+                    const DecodedImageView view = image_base_level_view(d, fi);
                     ShaderResource r;
                     r.cls = ResourceClass::Texture;
                     r.format = fi.format; r.num_components = fi.num_components;
-                    r.gpu_addr = d.base; r.width = d.width; r.height = d.height; r.depth = d.depth;
+                    r.gpu_addr = view.base; r.width = view.width; r.height = view.height; r.depth = d.depth;
                     r.tile_mode = d.tile_mode; r.srgb = fi.srgb;
                     r.max_uncompressed_block_size = d.max_uncompressed_block_size;
                     r.max_compressed_block_size = d.max_compressed_block_size;
@@ -2011,6 +2071,9 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     // rejects them instead of silently treating arbitrary bytes as RGBA8.
                     if (!mapped_fmt && !u.is_store) continue;
                     if (mapped_fmt && fi.block_width > 1 && fi.snorm) continue;   // signed BCn: not wired
+                    const DecodedImageView view = mapped_fmt
+                        ? image_base_level_view(d, fi)
+                        : DecodedImageView{d.base, d.width, d.height, 0};
                     ShaderResource r;
                     r.cls = u.is_store ? ResourceClass::StorageImage : ResourceClass::Texture;
                     if (mapped_fmt) {
@@ -2028,7 +2091,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
                         r.format = DataFormat::Unknown; r.num_components = 4;
                         r.size = static_cast<uint32_t>(bytes);
                     }
-                    r.gpu_addr = d.base; r.width = d.width; r.height = d.height; r.depth = d.depth;
+                    r.gpu_addr = view.base; r.width = view.width; r.height = view.height; r.depth = d.depth;
                     r.tile_mode = d.tile_mode;
                     r.max_uncompressed_block_size = d.max_uncompressed_block_size;
                     r.max_compressed_block_size = d.max_compressed_block_size;

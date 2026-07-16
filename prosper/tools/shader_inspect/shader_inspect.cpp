@@ -87,6 +87,17 @@ int main(int argc, char** argv) {
                 coverage.unsupported,
                 coverage.first_bad_fmt < 0 ? "none" : format_name(static_cast<Rdna2Format>(coverage.first_bad_fmt)),
                 coverage.first_bad_op);
+    const PcrelDispatchInfo dispatch = rdna2_pcrel_dispatch_info(words.data(), words.size());
+    if (dispatch.valid) {
+        std::printf("pcrel-dispatch selector=s%u+0x%x add=%d max=%u setpc=%u merge=%u "
+                    "targets=",
+                    dispatch.selector_sgpr_base, dispatch.selector_byte_offset,
+                    dispatch.selector_addend, dispatch.selector_max, dispatch.setpc_pc,
+                    dispatch.merge_pc);
+        for (size_t i = 0; i < dispatch.target_pcs.size(); ++i)
+            std::printf("%s%u", i ? "," : "", dispatch.target_pcs[i]);
+        std::printf(" span=%zu\n", dispatch.required_dwords);
+    }
 
     for (const auto& in : instructions) {
         std::printf("pc=%04u len=%u fmt=%-7s op=0x%03x words=", in.pc, in.len_dwords,

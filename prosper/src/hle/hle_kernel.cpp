@@ -50,10 +50,201 @@ namespace { bool sclog() { static int v = getenv("PROSPER_SYNCLOG") ? 1 : 0; ret
     long sctid() {
 #if defined(__linux__) || defined(__APPLE__)
         return (long)prosper_gettid();
+#elif defined(_WIN32)
+        return (long)GetCurrentThreadId();
 #else
         return 0;
 #endif
     }
+#ifdef _WIN32
+    // Redirecting a Windows CONTEXT while winpthreads is reacquiring the predicate mutex leaves the
+    // target stranded in pthread_cond_wait's cleanup path. Track condition-backed kernel waits so a
+    // GC exception can instead be delivered cooperatively by the target after a normal wake.
+    struct CondWaitRegistration { pthread_cond_t* cond; pthread_mutex_t* mutex; bool exception_wake; };
+    struct CondWaitException { uint64_t type; uint64_t handler; };
+    std::mutex g_cond_wait_mx;
+    std::unordered_map<uint64_t, CondWaitRegistration> g_cond_waits;
+    std::unordered_map<uint64_t, CondWaitException> g_cond_wait_exceptions;
+    void win_deliver_cooperative_exception(uint64_t type, uint64_t handler);
+    std::mutex g_thread_handle_mx;
+    std::unordered_map<uint64_t, HANDLE> g_thread_handles;
+    void register_current_thread_handle(uint64_t guest_thread) {
+        HANDLE duplicate = nullptr;
+        if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &duplicate,
+                             0, FALSE, DUPLICATE_SAME_ACCESS))
+            return;
+        std::lock_guard<std::mutex> lk(g_thread_handle_mx);
+        auto [it, inserted] = g_thread_handles.emplace(guest_thread, duplicate);
+        if (!inserted) { CloseHandle(it->second); it->second = duplicate; }
+    }
+    void unregister_current_thread_handle(uint64_t guest_thread) {
+        HANDLE handle = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_thread_handle_mx);
+            auto it = g_thread_handles.find(guest_thread);
+            if (it != g_thread_handles.end()) { handle = it->second; g_thread_handles.erase(it); }
+        }
+        if (handle) CloseHandle(handle);
+    }
+    HANDLE duplicate_registered_thread_handle(uint64_t guest_thread) {
+        HANDLE duplicate = nullptr;
+        std::lock_guard<std::mutex> lk(g_thread_handle_mx);
+        auto it = g_thread_handles.find(guest_thread);
+        if (it != g_thread_handles.end())
+            DuplicateHandle(GetCurrentProcess(), it->second, GetCurrentProcess(), &duplicate,
+                            0, FALSE, DUPLICATE_SAME_ACCESS);
+        return duplicate;
+    }
+    bool semalog() { static bool enabled = getenv("PROSPER_SEMALOG") != nullptr; return enabled; }
+    uint64_t kernel_guest_caller() {
+        uint64_t* sp = (uint64_t*)__builtin_frame_address(0);
+        for (int i = 0; i < 160; ++i) {
+            uint64_t v = sp[i];
+            if (v < 0x400000000ull || v >= 0x600000000ull || (v & 0xfff) < 8) continue;
+            MEMORY_BASIC_INFORMATION mbi;
+            if (!VirtualQuery((LPCVOID)(uintptr_t)v, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT ||
+                (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) continue;
+            const uint8_t* p = (const uint8_t*)(uintptr_t)v;
+            if (p[-5] == 0xe8 ||
+                (p[-2] == 0xff && ((p[-1] >> 3) & 7) == 2) ||
+                (p[-3] == 0xff && ((p[-2] >> 3) & 7) == 2) ||
+                (p[-6] == 0xff && ((p[-5] >> 3) & 7) == 2)) return v;
+        }
+        return 0;
+    }
+    void kernel_guest_call_chain(char* out, size_t cap) {
+        if (!cap) return;
+        out[0] = 0;
+        uint64_t* sp = (uint64_t*)__builtin_frame_address(0);
+        ULONG_PTR low = 0, high = 0;
+        GetCurrentThreadStackLimits(&low, &high);
+        size_t words = high > (ULONG_PTR)sp ? (size_t)((high - (ULONG_PTR)sp) / sizeof(uint64_t)) : 0;
+        if (words > 1024) words = 1024;
+        uint64_t previous = 0;
+        size_t used = 0;
+        int found = 0;
+        for (size_t i = 0; i < words && found < 8; ++i) {
+            uint64_t v = sp[i];
+            if (v == previous || v < 0x400000000ull || v >= 0x600000000ull || (v & 0xfff) < 8) continue;
+            MEMORY_BASIC_INFORMATION mbi;
+            if (!VirtualQuery((LPCVOID)(uintptr_t)v, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT ||
+                (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) continue;
+            const uint8_t* p = (const uint8_t*)(uintptr_t)v;
+            if (!(p[-5] == 0xe8 ||
+                  (p[-2] == 0xff && ((p[-1] >> 3) & 7) == 2) ||
+                  (p[-3] == 0xff && ((p[-2] >> 3) & 7) == 2) ||
+                  (p[-6] == 0xff && ((p[-5] >> 3) & 7) == 2))) continue;
+            int n = snprintf(out + used, cap - used, "%s0x%llx", found ? "," : "",
+                             (unsigned long long)v);
+            if (n <= 0 || (size_t)n >= cap - used) break;
+            used += (size_t)n; previous = v; ++found;
+        }
+    }
+    void sema_log_raw(const char* action, uint64_t sema, const char* name,
+                      int64_t count, int64_t amount) {
+        if (!semalog()) return;
+        char chain[192]; kernel_guest_call_chain(chain, sizeof chain);
+        char msg[448];
+        int n = snprintf(msg, sizeof msg,
+                         "[sema] T%ld %s sema=0x%llx name='%s' count=%lld amount=%lld caller=0x%llx chain=%s\n",
+                         sctid(), action, (unsigned long long)sema, name ? name : "",
+                         (long long)count, (long long)amount,
+                         (unsigned long long)kernel_guest_caller(), chain);
+        DWORD written = 0;
+        WriteFile(GetStdHandle(STD_ERROR_HANDLE), msg, (DWORD)n, &written, nullptr);
+    }
+    void thread_log_raw(const char* action, uint64_t entry, const char* name, size_t stack_size,
+                        int detach, int result, uint64_t thread) {
+        static bool enabled = getenv("PROSPER_THREADLOG") != nullptr;
+        if (!enabled) return;
+        char msg[320];
+        int n = snprintf(msg, sizeof msg,
+                         "[thread2] T%ld %s entry=0x%llx name='%s' stack=%llu detach=%d result=%d thread=0x%llx\n",
+                         sctid(), action, (unsigned long long)entry, name ? name : "",
+                         (unsigned long long)stack_size, detach, result, (unsigned long long)thread);
+        DWORD written = 0;
+        WriteFile(GetStdHandle(STD_ERROR_HANDLE), msg, (DWORD)n, &written, nullptr);
+    }
+    void ef_log_raw(const char* action, uint64_t ef, const char* name, uint64_t bits,
+                    uint64_t pattern, uint64_t mode) {
+        static bool enabled = getenv("PROSPER_EFLOG") != nullptr;
+        if (!enabled) return;
+        char chain[192]; kernel_guest_call_chain(chain, sizeof chain);
+        char msg[448];
+        int n = snprintf(msg, sizeof msg,
+                         "[ef2] T%ld %s ef=0x%llx name='%s' bits=0x%llx pattern=0x%llx mode=0x%llx chain=%s\n",
+                         sctid(), action, (unsigned long long)ef, name ? name : "",
+                         (unsigned long long)bits, (unsigned long long)pattern,
+                         (unsigned long long)mode, chain);
+        DWORD written = 0;
+        WriteFile(GetStdHandle(STD_ERROR_HANDLE), msg, (DWORD)n, &written, nullptr);
+    }
+    void cond_wait_enter(pthread_cond_t* cond, pthread_mutex_t* mutex) {
+        std::lock_guard<std::mutex> lk(g_cond_wait_mx);
+        g_cond_waits[(uint64_t)pthread_self()] = { cond, mutex, false };
+    }
+    bool cond_wait_exit(pthread_mutex_t* mutex, bool preserve_raw_signal) {
+        CondWaitException pending{};
+        bool exception_wake = false;
+        {
+            std::lock_guard<std::mutex> lk(g_cond_wait_mx);
+            uint64_t self = (uint64_t)pthread_self();
+            auto wait = g_cond_waits.find(self);
+            exception_wake = wait != g_cond_waits.end() && wait->second.exception_wake;
+            if (wait != g_cond_waits.end()) g_cond_waits.erase(wait);
+            auto exception = g_cond_wait_exceptions.find(self);
+            if (exception != g_cond_wait_exceptions.end()) {
+                pending = exception->second;
+                g_cond_wait_exceptions.erase(exception);
+                exception_wake = true;
+            }
+        }
+        if (pending.handler) {
+            // A raw condition wait has no predicate, so keep its mutex held while the handler is
+            // parked: otherwise its eventual signal can slip past before the target re-waits. Event
+            // flags and semaphores do have persistent predicates and often share one mutex across
+            // dozens of workers; release those so every GC target can enter its handler concurrently.
+            if (!preserve_raw_signal) pthread_mutex_unlock(mutex);
+            win_deliver_cooperative_exception(pending.type, pending.handler);
+            if (!preserve_raw_signal) pthread_mutex_lock(mutex);
+        }
+        return exception_wake;
+    }
+    bool queue_cond_wait_exception(uint64_t thread, uint64_t type, uint64_t handler,
+                                   pthread_cond_t** cond, pthread_mutex_t** mutex,
+                                   bool try_registry, bool* registry_busy) {
+        std::unique_lock<std::mutex> lk(g_cond_wait_mx, std::defer_lock);
+        if (try_registry) {
+            if (!lk.try_lock()) { *registry_busy = true; return false; }
+        } else {
+            lk.lock();
+        }
+        *registry_busy = false;
+        auto wait = g_cond_waits.find(thread);
+        if (wait == g_cond_waits.end() || g_cond_wait_exceptions.count(thread)) return false;
+        wait->second.exception_wake = true;
+        g_cond_wait_exceptions.emplace(thread, CondWaitException{type, handler});
+        *cond = wait->second.cond;
+        *mutex = wait->second.mutex;
+        return true;
+    }
+    bool cancel_cond_wait_exception(uint64_t thread, uint64_t type, uint64_t handler) {
+        std::lock_guard<std::mutex> lk(g_cond_wait_mx);
+        auto exception = g_cond_wait_exceptions.find(thread);
+        if (exception == g_cond_wait_exceptions.end() || exception->second.type != type ||
+            exception->second.handler != handler) return false;
+        g_cond_wait_exceptions.erase(exception);
+        auto wait = g_cond_waits.find(thread);
+        if (wait != g_cond_waits.end()) wait->second.exception_wake = false;
+        return true;
+    }
+#else
+    void cond_wait_enter(pthread_cond_t*, pthread_mutex_t*) {}
+    bool cond_wait_exit(pthread_mutex_t*, bool) { return false; }
+    void sema_log_raw(const char*, uint64_t, const char*, int64_t, int64_t) {}
+    void thread_log_raw(const char*, uint64_t, const char*, size_t, int, int, uint64_t) {}
+    void ef_log_raw(const char*, uint64_t, const char*, uint64_t, uint64_t, uint64_t) {}
+#endif
 }
 }
 #include <cstdlib>
@@ -259,7 +450,32 @@ namespace {
         return fbsd_errno(host);
     }
 }
-HLE(k_mutex_lock)    { auto* m = ensure_mutex(a0); return m ? mtx_report("lock",    a0, m, pthread_mutex_lock(m))    : 0x16; }
+HLE(k_mutex_lock) {
+    auto* m = ensure_mutex(a0);
+    if (!m) return 0x16;
+#if defined(_WIN32)
+    // A Windows GC exception cannot safely redirect an arbitrary suspended host CONTEXT: the
+    // target may own the process heap or a CRT lock. Make a guest mutex acquisition a cooperative
+    // exception point instead. The short timed wait preserves ERRORCHECK/EDEADLK behaviour while
+    // allowing win_raise_exception to queue a target-thread callback between attempts. If the lock
+    // was acquired at the same instant as the exception, cond_wait_exit temporarily releases it
+    // while the handler is parked, then reacquires it before returning success to the guest.
+    for (;;) {
+        timespec dl{};
+        clock_gettime(CLOCK_REALTIME, &dl);
+        dl.tv_nsec += 1000000L;
+        if (dl.tv_nsec >= 1000000000L) { ++dl.tv_sec; dl.tv_nsec -= 1000000000L; }
+        cond_wait_enter(nullptr, m);
+        int rc = pthread_mutex_timedlock(m, &dl);
+        bool exception_wake = cond_wait_exit(rc == 0 ? m : nullptr, rc != 0);
+        if (rc == 0) return mtx_report("lock", a0, m, rc);
+        if (rc != ETIMEDOUT) return mtx_report("lock", a0, m, rc);
+        (void)exception_wake;
+    }
+#else
+    return mtx_report("lock", a0, m, pthread_mutex_lock(m));
+#endif
+}
 HLE(k_mutex_trylock) { auto* m = ensure_mutex(a0); return m ? mtx_report("trylock", a0, m, pthread_mutex_trylock(m)) : 0x16; }
 HLE(k_mutex_unlock)  { auto* m = ensure_mutex(a0); return m ? mtx_report("unlock",  a0, m, pthread_mutex_unlock(m))  : 0x16; }
 
@@ -272,7 +488,11 @@ HLE(k_cond_signal)    { if (sclog()) fprintf(stderr, "[sync2] T%ld COND.signal  
 HLE(k_cond_broadcast) { if (sclog()) fprintf(stderr, "[sync2] T%ld COND.broadcast cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); if (auto* c = ensure_cond(a0)) pthread_cond_broadcast(c); return 0; }
 HLE(k_cond_wait)      { if (sclog()) fprintf(stderr, "[sync2] T%ld COND.wait.ent  cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0);
     { auto* c = ensure_cond(a0); auto* m = ensure_mutex(a1);
-      if (c && m) pthread_cond_wait(c, m); }
+      if (c && m) {
+          bool exception_wake;
+          do { cond_wait_enter(c, m); pthread_cond_wait(c, m); exception_wake = cond_wait_exit(m, true); }
+          while (exception_wake);
+      } }
     if (sclog()) fprintf(stderr, "[sync2] T%ld COND.wait.exit cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); return 0; }
 // POSIX pthread_cond_timedwait(cond_slot, mutex_slot, const timespec* abstime) — abstime is an
 // ABSOLUTE CLOCK_REALTIME deadline ({i64 sec, i64 nsec}, FreeBSD == Linux x86-64 layout), and the
@@ -286,10 +506,21 @@ HLE(k_cond_wait)      { if (sclog()) fprintf(stderr, "[sync2] T%ld COND.wait.ent
 HLE(k_cond_timedwait) {
     auto* c = ensure_cond(a0); auto* m = ensure_mutex(a1);
     if (!c || !m) return 22;                                   // EINVAL
-    if (!a2) { pthread_cond_wait(c, m); return 0; }
+    if (!a2) {
+        bool exception_wake;
+        do { cond_wait_enter(c, m); pthread_cond_wait(c, m); exception_wake = cond_wait_exit(m, true); }
+        while (exception_wake);
+        return 0;
+    }
     const int64_t* gts = (const int64_t*)(uintptr_t)a2;
     struct timespec dl { (time_t)gts[0], (long)gts[1] };
-    int rc = pthread_cond_timedwait(c, m, &dl);
+    int rc;
+    bool exception_wake;
+    do {
+        cond_wait_enter(c, m);
+        rc = pthread_cond_timedwait(c, m, &dl);
+        exception_wake = cond_wait_exit(m, true);
+    } while (exception_wake && rc != ETIMEDOUT);
     if (rc == ETIMEDOUT) return 60;                            // FreeBSD ETIMEDOUT
     return (uint64_t)rc;
 }
@@ -520,11 +751,20 @@ namespace {
 // null-derived pointer; (2) it never ran guest_tls_activate_thread(), so the worker had no guest
 // %fs TCB and its initial-exec TLS was wrong. This trampoline fixes both: activate the guest %fs
 // TCB, then call the guest entry through the SysV marshalling shim, and purge DTV on exit.
-struct WinThreadStart { uint64_t entry; void* arg; };
+struct WinThreadStart { uint64_t entry; void* arg; char name[64]; };
 extern "C" uint64_t prosper_call_guest_sysv(uint64_t fn, uint64_t a0, uint64_t a1);
 void* win_thread_trampoline(void* p) {
     auto* ts = (WinThreadStart*)p;
-    uint64_t entry = ts->entry; void* arg = ts->arg; free(ts);   // host libc: run on host %fs (before activate)
+    uint64_t entry = ts->entry; void* arg = ts->arg;
+    char name[sizeof(ts->name)]; memcpy(name, ts->name, sizeof(name));
+    free(ts);   // host libc: run on host %fs (before activate)
+    if (name[0]) {
+        wchar_t wname[sizeof(name)]{};
+        MultiByteToWideChar(CP_UTF8, 0, name, -1, wname, (int)(sizeof(wname) / sizeof(wname[0])));
+        SetThreadDescription(GetCurrentThread(), wname);
+    }
+    uint64_t guest_thread = (uint64_t)pthread_self();
+    register_current_thread_handle(guest_thread);
     // Register this worker's stack bounds FIRST, keyed by the Windows thread id (== exec_image_win's
     // cur_tid) so a guest GC that queries its own stack base (GC_register_my_thread / stack scanning —
     // e.g. Unity's AssetGarbageCollectorHelper) finds real bounds instead of wedging on "Bad stack
@@ -532,12 +772,16 @@ void* win_thread_trampoline(void* p) {
     // gives the committed stack range (Win8+).
     ULONG_PTR stk_lo = 0, stk_hi = 0;
     GetCurrentThreadStackLimits(&stk_lo, &stk_hi);
-    if (stk_lo && stk_hi > stk_lo)
+    if (stk_lo && stk_hi > stk_lo) {
         register_thread_stack((uint64_t)GetCurrentThreadId(), (void*)stk_lo, (uint64_t)(stk_hi - stk_lo));
+        register_thread_stack(guest_thread, (void*)stk_lo, (uint64_t)(stk_hi - stk_lo));
+    }
     guest_tls_activate_thread();   // this worker's guest %fs TCB (FSGSBASE); no-op if the gate is off
     void* rv = entry ? (void*)(uintptr_t)prosper_call_guest_sysv(entry, (uint64_t)(uintptr_t)arg, 0) : nullptr;
     tls_dtv_purge_current_thread();
     unregister_thread_stack((uint64_t)GetCurrentThreadId());   // ids recycle; stale bounds = wrong bounds
+    unregister_thread_stack(guest_thread);
+    unregister_current_thread_handle(guest_thread);
     return rv;
 }
 }
@@ -571,6 +815,7 @@ HLE(k_pthread_create) {
     pthread_attr_setstacksize(&la, ssz);
     pthread_attr_setdetachstate(&la, detach);
     auto* ts = (ThreadStart*)malloc(sizeof(ThreadStart));
+    if (!ts) { pthread_attr_destroy(&la); return 12; }         // ENOMEM (FreeBSD and host agree)
     ts->entry = entry; ts->arg = arg; ts->name[0] = 0;
     if (a4) { strncpy(ts->name, (const char*)(uintptr_t)a4, sizeof(ts->name) - 1); ts->name[sizeof(ts->name) - 1] = 0; }
     int r = pthread_create(&tid, &la, thread_trampoline, ts);   // trampoline registers the stack first
@@ -581,9 +826,22 @@ HLE(k_pthread_create) {
     // gets its guest %fs TCB — a bare pthread_create(entry, arg) mis-passes the arg (MS x64 vs SysV) and
     // skips TLS activation, crashing the worker on a null-derived pointer.
     pthread_attr_t* at = (a1 && *(void**)a1) ? (pthread_attr_t*)*(void**)a1 : nullptr;
+    size_t requested_stack = 0;
+    int requested_detach = PTHREAD_CREATE_JOINABLE;
+    if (at) {
+        pthread_attr_getstacksize(at, &requested_stack);
+        pthread_attr_getdetachstate(at, &requested_detach);
+    }
+    thread_log_raw("CREATE", a2, a4 ? (const char*)(uintptr_t)a4 : "",
+                   requested_stack, requested_detach, 0, 0);
     auto* ts = (WinThreadStart*)malloc(sizeof(WinThreadStart));
+    if (!ts) return 12;                                        // ENOMEM (FreeBSD and host agree)
     ts->entry = (uint64_t)(uintptr_t)entry; ts->arg = arg;
+    ts->name[0] = 0;
+    if (a4) { strncpy(ts->name, (const char*)(uintptr_t)a4, sizeof(ts->name) - 1); ts->name[sizeof(ts->name) - 1] = 0; }
     int r = pthread_create(&tid, at, win_thread_trampoline, ts);
+    thread_log_raw("RESULT", a2, a4 ? (const char*)(uintptr_t)a4 : "",
+                   requested_stack, requested_detach, r, r ? 0 : (uint64_t)tid);
     if (r) { free(ts); return (uint64_t)r; }
 #endif
     if (a0) *(uint64_t*)a0 = (uint64_t)tid;
@@ -605,6 +863,10 @@ HLE(k_pthread_exit)   {
     tls_dtv_purge_current_thread();
 #if defined(__linux__) || defined(__APPLE__)
     unregister_thread_stack((uint64_t)pthread_self());
+#elif defined(_WIN32)
+    unregister_thread_stack((uint64_t)GetCurrentThreadId());
+    unregister_thread_stack((uint64_t)pthread_self());
+    unregister_current_thread_handle((uint64_t)pthread_self());
 #endif
     pthread_exit((void*)(uintptr_t)a0);
     return 0;
@@ -646,7 +908,7 @@ namespace {
     // the flag, wakes everyone, and defers destroy+free to the last waiter leaving (or frees now if
     // none are parked). Freeing under a live pthread_cond_wait is a UAF — destroying a condvar with
     // waiters is explicitly UB.
-    struct EventFlag { pthread_mutex_t m; pthread_cond_t c; uint64_t bits; bool deleted; int waiters; };
+    struct EventFlag { pthread_mutex_t m; pthread_cond_t c; uint64_t bits; bool deleted; int waiters; char name[48]; };
     bool evf_match(uint64_t bits, uint64_t pat, uint32_t mode) {
         return (mode & 0x1) ? ((bits & pat) == pat) : ((bits & pat) != 0);  // AND vs OR
     }
@@ -655,7 +917,9 @@ namespace {
 HLE(k_ef_create) {   // (ef*, name, attr, initPattern, opt)
     auto* e = (EventFlag*)calloc(1, sizeof(EventFlag));
     pthread_mutex_init(&e->m, nullptr); pthread_cond_init(&e->c, nullptr); e->bits = a3;
+    if (a1) { strncpy(e->name, (const char*)(uintptr_t)a1, sizeof(e->name) - 1); e->name[sizeof(e->name) - 1] = 0; }
     if (a0) *(void**)(uintptr_t)a0 = e;
+    ef_log_raw("CREATE", (uint64_t)(uintptr_t)e, e->name, e->bits, 0, 0);
     return 0;
 }
 HLE(k_ef_delete)  {
@@ -668,8 +932,8 @@ HLE(k_ef_delete)  {
     if (!has_waiters) ef_destroy(e);               // none parked -> free now; else the last waiter frees
     return 0;
 }
-HLE(k_ef_set)     { auto* e = (EventFlag*)(uintptr_t)a0; if (!e) return 0; if (sclog()) fprintf(stderr, "[sync2] T%ld EF.set       ef=0x%llx bits|=0x%llx\n", sctid(), (unsigned long long)a0, (unsigned long long)a1); pthread_mutex_lock(&e->m); e->bits |= a1; pthread_cond_broadcast(&e->c); pthread_mutex_unlock(&e->m); return 0; }
-HLE(k_ef_clear)   { auto* e = (EventFlag*)(uintptr_t)a0; if (!e) return 0; pthread_mutex_lock(&e->m); e->bits &= a1; pthread_mutex_unlock(&e->m); return 0; }
+HLE(k_ef_set)     { auto* e = (EventFlag*)(uintptr_t)a0; if (!e) return 0; if (sclog()) fprintf(stderr, "[sync2] T%ld EF.set       ef=0x%llx bits|=0x%llx\n", sctid(), (unsigned long long)a0, (unsigned long long)a1); ef_log_raw("SET", a0, e->name, e->bits, a1, 0); pthread_mutex_lock(&e->m); e->bits |= a1; pthread_cond_broadcast(&e->c); pthread_mutex_unlock(&e->m); return 0; }
+HLE(k_ef_clear)   { auto* e = (EventFlag*)(uintptr_t)a0; if (!e) return 0; ef_log_raw("CLEAR", a0, e->name, e->bits, a1, 0); pthread_mutex_lock(&e->m); e->bits &= a1; pthread_mutex_unlock(&e->m); return 0; }
 // Absolute CLOCK_REALTIME deadline `usec` microseconds from now (for pthread_cond_timedwait
 // on default-attr condvars, which time against CLOCK_REALTIME).
 static timespec abs_deadline_us(uint64_t usec) {
@@ -697,7 +961,13 @@ HLE(k_cond_timedwait_sce) {
     auto* c = ensure_cond(a0); auto* m = ensure_mutex(a1);
     if (!c || !m) return 0x16;                          // EINVAL
     timespec dl = abs_deadline_us(a2);
-    int rc = pthread_cond_timedwait(c, m, &dl);
+    int rc;
+    bool exception_wake;
+    do {
+        cond_wait_enter(c, m);
+        rc = pthread_cond_timedwait(c, m, &dl);
+        exception_wake = cond_wait_exit(m, true);
+    } while (exception_wake && rc != ETIMEDOUT);
     return rc == ETIMEDOUT ? 60u : (uint64_t)rc;        // FreeBSD ETIMEDOUT
 }
 // scePthreadRwlockTimedrd/wrlock(rwlock, SceKernelUseconds usec): acquire with a RELATIVE µs timeout.
@@ -743,6 +1013,7 @@ HLE(k_ef_wait)    { // (ef, pattern, waitMode, resultPat*, SceKernelUseconds* ti
     if (sclog()) fprintf(stderr, "[sync2] T%ld EF.wait.ent  ef=0x%llx pat=0x%llx mode=0x%llx bits=0x%llx\n",
                          sctid(), (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
                          (unsigned long long)e->bits);
+    ef_log_raw("WAIT", a0, e->name, e->bits, a1, a2);
     pthread_mutex_lock(&e->m);
     e->waiters++;
     if (a4) {
@@ -750,8 +1021,11 @@ HLE(k_ef_wait)    { // (ef, pattern, waitMode, resultPat*, SceKernelUseconds* ti
         timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
         timespec dl = abs_deadline_us(usec);
         int rc = 0;
-        while (!evf_match(e->bits, a1, (uint32_t)a2) && rc != ETIMEDOUT && !e->deleted)
+        while (!evf_match(e->bits, a1, (uint32_t)a2) && rc != ETIMEDOUT && !e->deleted) {
+            cond_wait_enter(&e->c, &e->m);
             rc = pthread_cond_timedwait(&e->c, &e->m, &dl);
+            cond_wait_exit(&e->m, false);
+        }
         timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
         int64_t spent_i = (int64_t)(t1.tv_sec - t0.tv_sec) * 1000000
                         + ((int64_t)t1.tv_nsec - (int64_t)t0.tv_nsec) / 1000;
@@ -759,7 +1033,11 @@ HLE(k_ef_wait)    { // (ef, pattern, waitMode, resultPat*, SceKernelUseconds* ti
         *(uint32_t*)(uintptr_t)a4 = spent >= usec ? 0u : (uint32_t)(usec - spent);
         if (!e->deleted && !evf_match(e->bits, a1, (uint32_t)a2)) ret = 0x8002003Cull;  // ETIMEDOUT
     } else {
-        while (!evf_match(e->bits, a1, (uint32_t)a2) && !e->deleted) pthread_cond_wait(&e->c, &e->m);
+        while (!evf_match(e->bits, a1, (uint32_t)a2) && !e->deleted) {
+            cond_wait_enter(&e->c, &e->m);
+            pthread_cond_wait(&e->c, &e->m);
+            cond_wait_exit(&e->m, false);
+        }
     }
     bool deleted = e->deleted;                     // deleted under us -> EACCES (Kyty EventFlag.cpp)
     if (deleted) ret = 0x8002000Dull;
@@ -787,13 +1065,15 @@ HLE(k_ef_poll)    { // (ef, pattern, waitMode, resultPat*)
 // deleted/waiters: same defer-free-to-last-waiter scheme as EventFlag above (delete under a blocked
 // waiter would otherwise free the mutex/condvar out from under it — UAF).
 namespace {
-    struct Sema { pthread_mutex_t m; pthread_cond_t c; int64_t count; bool deleted; int waiters; };
+    struct Sema { pthread_mutex_t m; pthread_cond_t c; int64_t count; bool deleted; int waiters; char name[48]; };
     void sema_destroy(Sema* s) { pthread_mutex_destroy(&s->m); pthread_cond_destroy(&s->c); free(s); }
 }
 HLE(k_sema_create) { // (sema*, name, attr, initCount, maxCount, opt)
     auto* s = (Sema*)calloc(1, sizeof(Sema));
     pthread_mutex_init(&s->m, nullptr); pthread_cond_init(&s->c, nullptr); s->count = (int64_t)(int32_t)a3;
+    if (a1) { strncpy(s->name, (const char*)(uintptr_t)a1, sizeof(s->name) - 1); s->name[sizeof(s->name) - 1] = 0; }
     if (a0) *(void**)(uintptr_t)a0 = s;
+    sema_log_raw("CREATE", (uint64_t)(uintptr_t)s, s->name, s->count, (int64_t)(int32_t)a4);
     if (sclog()) fprintf(stderr, "[sync2] T%ld SEMA.create  sema=0x%llx name='%s' init=%lld max=%lld\n",
                          sctid(), (unsigned long long)(uintptr_t)s, a1 ? (const char*)(uintptr_t)a1 : "",
                          (long long)(int32_t)a3, (long long)(int32_t)a4);
@@ -812,6 +1092,7 @@ HLE(k_sema_delete) {
 HLE(k_sema_wait)   { // (sema, need, SceKernelUseconds* timeout) — timeout honored like k_ef_wait
     auto* s = (Sema*)(uintptr_t)a0; if (!s) return 0; int64_t need = a1 ? (int64_t)a1 : 1;
     if (sclog()) fprintf(stderr, "[sync2] T%ld SEMA.wait     sema=0x%llx need=%lld\n", sctid(), (unsigned long long)a0, (long long)need);
+    sema_log_raw("WAIT", a0, s->name, s->count, need);
     uint64_t ret = 0;
     pthread_mutex_lock(&s->m);
     s->waiters++;
@@ -820,7 +1101,11 @@ HLE(k_sema_wait)   { // (sema, need, SceKernelUseconds* timeout) — timeout hon
         timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
         timespec dl = abs_deadline_us(usec);
         int rc = 0;
-        while (s->count < need && rc != ETIMEDOUT && !s->deleted) rc = pthread_cond_timedwait(&s->c, &s->m, &dl);
+        while (s->count < need && rc != ETIMEDOUT && !s->deleted) {
+            cond_wait_enter(&s->c, &s->m);
+            rc = pthread_cond_timedwait(&s->c, &s->m, &dl);
+            cond_wait_exit(&s->m, false);
+        }
         timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
         int64_t spent_i = (int64_t)(t1.tv_sec - t0.tv_sec) * 1000000
                         + ((int64_t)t1.tv_nsec - (int64_t)t0.tv_nsec) / 1000;
@@ -828,7 +1113,11 @@ HLE(k_sema_wait)   { // (sema, need, SceKernelUseconds* timeout) — timeout hon
         *(uint32_t*)(uintptr_t)a2 = spent >= usec ? 0u : (uint32_t)(usec - spent);
         if (!s->deleted && s->count < need) ret = 0x8002003Cull;    // KERNEL_ERROR_ETIMEDOUT
     } else {
-        while (s->count < need && !s->deleted) pthread_cond_wait(&s->c, &s->m);
+        while (s->count < need && !s->deleted) {
+            cond_wait_enter(&s->c, &s->m);
+            pthread_cond_wait(&s->c, &s->m);
+            cond_wait_exit(&s->m, false);
+        }
     }
     bool deleted = s->deleted;                       // deleted under us -> EACCES
     if (deleted) ret = 0x8002000Dull;
@@ -839,6 +1128,7 @@ HLE(k_sema_wait)   { // (sema, need, SceKernelUseconds* timeout) — timeout hon
     return ret; }
 HLE(k_sema_signal) { auto* s = (Sema*)(uintptr_t)a0; if (!s) return 0; int64_t n = a1 ? (int64_t)a1 : 1;
     if (sclog()) fprintf(stderr, "[sync2] T%ld SEMA.signal   sema=0x%llx n=%lld\n", sctid(), (unsigned long long)a0, (long long)n);
+    sema_log_raw("SIGNAL", a0, s->name, s->count, n);
     pthread_mutex_lock(&s->m); s->count += n; pthread_cond_broadcast(&s->c); pthread_mutex_unlock(&s->m); return 0; }
 HLE(k_sema_poll)   { auto* s = (Sema*)(uintptr_t)a0; if (!s) return 0; int64_t need = a1 ? (int64_t)a1 : 1;
     pthread_mutex_lock(&s->m); bool ok = s->count >= need; if (ok) s->count -= need; pthread_mutex_unlock(&s->m); return ok ? 0 : 0x80020023; }
@@ -1078,12 +1368,7 @@ void win_exc_log(const char* msg) {
     WriteFile(GetStdHandle(STD_ERROR_HANDLE), msg, (DWORD)strlen(msg), &written, nullptr);
 }
 
-extern "C" __attribute__((noinline, noreturn))
-void prosper_win_exc_delivery(WinExcDelivery* delivery) {
-    CONTEXT saved = delivery->saved;
-    uint64_t type = delivery->type;
-    uint64_t handler = delivery->handler;
-
+void win_run_exception_handler(const CONTEXT& saved, uint64_t type, uint64_t handler) {
     // FreeBSD amd64 mcontext layout; keep in lockstep with the POSIX signal path above.
     alignas(16) uint8_t ctx[0x400]{};
     auto WQ = [&](int off, uint64_t v) { *(uint64_t*)(ctx + off) = v; };
@@ -1093,9 +1378,39 @@ void prosper_win_exc_delivery(WinExcDelivery* delivery) {
     WQ(0x68, saved.R13); WQ(0x70, saved.R14); WQ(0x78, saved.R15);
     WQ(0xA0, saved.Rip); WQ(0xB8, saved.Rsp); WQ(0xF8, saved.Rsp);
 
-    win_exc_log("[exc] handler ENTER on Windows target\n");
+    if (g_exc_log || g_exc_log2) {
+        char msg[256];
+        snprintf(msg, sizeof msg,
+                 "[exc] handler ENTER target=0x%llx tid=%lu type=0x%llx saved_rip=0x%llx\n",
+                 (unsigned long long)(uint64_t)pthread_self(),
+                 (unsigned long)GetCurrentThreadId(),
+                 (unsigned long long)type,
+                 (unsigned long long)saved.Rip);
+        win_exc_log(msg);
+    }
     prosper_call_guest_sysv(handler, type, (uint64_t)(uintptr_t)ctx);
-    win_exc_log("[exc] handler EXIT on Windows target (resumed)\n");
+    if (g_exc_log || g_exc_log2) {
+        char msg[160];
+        snprintf(msg, sizeof msg, "[exc] handler EXIT target=0x%llx tid=%lu (resumed)\n",
+                 (unsigned long long)(uint64_t)pthread_self(),
+                 (unsigned long)GetCurrentThreadId());
+        win_exc_log(msg);
+    }
+}
+
+void win_deliver_cooperative_exception(uint64_t type, uint64_t handler) {
+    CONTEXT saved{};
+    RtlCaptureContext(&saved);
+    win_run_exception_handler(saved, type, handler);
+}
+
+extern "C" __attribute__((noinline, noreturn))
+void prosper_win_exc_delivery(WinExcDelivery* delivery) {
+    CONTEXT saved = delivery->saved;
+    uint64_t type = delivery->type;
+    uint64_t handler = delivery->handler;
+
+    win_run_exception_handler(saved, type, handler);
 
     delete delivery;
     g_rtl_restore_context(&saved, nullptr);
@@ -1103,62 +1418,178 @@ void prosper_win_exc_delivery(WinExcDelivery* delivery) {
     __builtin_unreachable();
 }
 
+DWORD WINAPI win_interrupt_wait_thread(void* opaque_target) {
+    uint64_t target = (uint64_t)(uintptr_t)opaque_target;
+    interrupt_futex_wait(target);
+    return 0;
+}
+
+struct CondWakeRequest { pthread_cond_t* cond; pthread_mutex_t* mutex; };
+DWORD WINAPI win_wake_cond_thread(void* opaque) {
+    auto* request = (CondWakeRequest*)opaque;
+    pthread_mutex_lock(request->mutex);
+    pthread_cond_broadcast(request->cond);
+    pthread_mutex_unlock(request->mutex);
+    delete request;
+    return 0;
+}
+
+// 0: target is not in a condition wait; 1: queued; -1: allocation failure; 2: a suspended
+// target may own the registry lock, so it must be resumed before the lookup is retried.
+int win_queue_cond_exception(uint64_t target, uint64_t type, uint64_t handler,
+                             bool try_registry = false) {
+    pthread_cond_t* cond = nullptr;
+    pthread_mutex_t* mutex = nullptr;
+    bool registry_busy = false;
+    if (!queue_cond_wait_exception(target, type, handler, &cond, &mutex,
+                                   try_registry, &registry_busy))
+        return registry_busy ? 2 : 0;
+    // Null cond identifies a short polling wait (currently guest mutex acquisition). The target
+    // will consume the queued callback when its timed host wait returns; no helper wake is needed.
+    if (!cond) {
+        win_exc_log("[exc2] cooperative polling-wait delivery queued\n");
+        return 1;
+    }
+    auto* request = new (std::nothrow) CondWakeRequest{cond, mutex};
+    if (!request) {
+        cancel_cond_wait_exception(target, type, handler);
+        return -1;
+    }
+    HANDLE wake_thread = CreateThread(nullptr, 0, win_wake_cond_thread, request, 0, nullptr);
+    if (!wake_thread) {
+        delete request;
+        // If the target already consumed the request, delivery is under way and must be reported
+        // as success. Otherwise remove the undeliverable request and let the caller report ENOMEM.
+        return cancel_cond_wait_exception(target, type, handler) ? -1 : 1;
+    }
+    CloseHandle(wake_thread);
+    win_exc_log("[exc2] cooperative condition-wait delivery queued\n");
+    return 1;
+}
+
+bool win_guest_execution_rip(uint64_t rip) {
+    // All fixed executable guest modules and import stubs live in this window (boot_program.hpp).
+    // Never park an injected GC handler over arbitrary host code: it may own the CRT/process heap,
+    // a loader lock, or a frontend mutex that the GC coordinator itself needs for the next target.
+    return rip >= 0x400000000ull && rip < 0x700000000ull;
+}
+
 uint64_t win_raise_exception(uint64_t target, uint64_t type) {
     if (!target || type >= 128 || !g_exc_handlers[type]) return 0;
     if (pthread_equal((pthread_t)target, pthread_self())) return 0x80020023ull; // EDEADLK-ish
     if (!g_rtl_restore_context) return 0x80020026ull;                         // ENOSYS-ish
 
-    HANDLE thread = (HANDLE)pthread_gethandle((pthread_t)target);
-    if (!thread || thread == INVALID_HANDLE_VALUE) return 0x80020003ull;       // ESRCH
+    for (int attempt = 0; attempt < 4096; ++attempt) {
+        int queued = win_queue_cond_exception(target, type, g_exc_handlers[type]);
+        if (queued == 1) return 0;
+        if (queued < 0) return 0x8002000cull;                                  // ENOMEM
 
-    // Allocate before suspending: the target could currently own the process heap lock.
-    auto* delivery = new (std::nothrow) WinExcDelivery;
-    if (!delivery) return 0x8002000cull;                                      // ENOMEM
-    delivery->type = type;
-    delivery->handler = g_exc_handlers[type];
+        HANDLE owned_thread = duplicate_registered_thread_handle(target);
+        struct OwnedHandle { HANDLE value; ~OwnedHandle() { if (value) CloseHandle(value); } }
+            owned{owned_thread};
+        HANDLE thread = owned_thread ? owned_thread : (HANDLE)pthread_gethandle((pthread_t)target);
+        if (!thread || thread == INVALID_HANDLE_VALUE) return 0x80020003ull;    // ESRCH
 
-    DWORD previous_suspend = SuspendThread(thread);
-    if (previous_suspend == (DWORD)-1) { DWORD e = GetLastError(); delete delivery; return 0x80020000ull | (e & 0xffff); }
-    if (previous_suspend != 0) {
-        ResumeThread(thread);
-        delete delivery;
-        return 0x80020010ull;                                                 // EBUSY
-    }
+        // Allocate before suspending: the target could currently own the process heap lock.
+        auto* delivery = new (std::nothrow) WinExcDelivery;
+        if (!delivery) return 0x8002000cull;                                   // ENOMEM
+        delivery->type = type;
+        delivery->handler = g_exc_handlers[type];
 
-    delivery->saved.ContextFlags = CONTEXT_ALL;
-    if (!GetThreadContext(thread, &delivery->saved)) {
-        DWORD e = GetLastError(); ResumeThread(thread); delete delivery;
-        return 0x80020000ull | (e & 0xffff);
-    }
+        DWORD previous_suspend = SuspendThread(thread);
+        if (previous_suspend == (DWORD)-1) {
+            DWORD e = GetLastError(); delete delivery; return 0x80020000ull | (e & 0xffff);
+        }
+        if (previous_suspend != 0) {
+            ResumeThread(thread);
+            delete delivery;
+            return 0x80020010ull;                                              // EBUSY
+        }
 
-    CONTEXT injected = delivery->saved;
-    injected.ContextFlags = CONTEXT_FULL;
-    injected.Rip = (DWORD64)(uintptr_t)&prosper_win_exc_thunk;
-    constexpr DWORD64 kGuestRedZone = 128;
-    injected.Rsp = (injected.Rsp & ~(DWORD64)0xf) - kGuestRedZone - 8;
-    DWORD64 delivery_ptr = (DWORD64)(uintptr_t)delivery;
-    SIZE_T written = 0;
-    if (!WriteProcessMemory(GetCurrentProcess(), (void*)(uintptr_t)injected.Rsp,
-                            &delivery_ptr, sizeof(delivery_ptr), &written) ||
-        written != sizeof(delivery_ptr)) {
-        DWORD e = GetLastError(); ResumeThread(thread); delete delivery;
-        return 0x80020000ull | (e & 0xffff);
+        // Close the race between the first lookup and SuspendThread before changing CONTEXT. Never
+        // block on this mutex while the target is suspended: it may be inside cond_wait_enter/exit
+        // and therefore own the registry lock. Resume it and retry after that tiny transition.
+        queued = win_queue_cond_exception(target, type, g_exc_handlers[type], true);
+        if (queued == 2) {
+            ResumeThread(thread);
+            delete delivery;
+            SwitchToThread();
+            continue;
+        }
+        if (queued != 0) {
+            ResumeThread(thread);
+            delete delivery;
+            return queued > 0 ? 0 : 0x8002000cull;
+        }
+
+        delivery->saved.ContextFlags = CONTEXT_ALL;
+        if (!GetThreadContext(thread, &delivery->saved)) {
+            DWORD e = GetLastError(); ResumeThread(thread); delete delivery;
+            return 0x80020000ull | (e & 0xffff);
+        }
+        // Direct HLE unit tests install a native test callback; retain the native-context path for
+        // those callbacks. A real title's installed handler is itself in the guest executable map.
+        if (win_guest_execution_rip(delivery->handler) &&
+            !win_guest_execution_rip(delivery->saved.Rip)) {
+            if (g_exc_log2 && (attempt == 0 || attempt == 64 || attempt == 4095)) {
+                char msg[192];
+                snprintf(msg, sizeof msg,
+                         "[exc2] host-rip retry target=0x%llx rip=0x%llx attempt=%d\n",
+                         (unsigned long long)target,
+                         (unsigned long long)delivery->saved.Rip, attempt);
+                win_exc_log(msg);
+            }
+            ResumeThread(thread);
+            delete delivery;
+            // A target in sceKernelWaitOnAddress can be moved back to its guest call site without
+            // redirecting CONTEXT. Other transient HLE/CRT work is simply allowed to finish.
+            interrupt_futex_wait(target);
+            if (attempt < 64) SwitchToThread(); else Sleep(1);
+            continue;
+        }
+
+        CONTEXT injected = delivery->saved;
+        injected.ContextFlags = CONTEXT_FULL;
+        injected.Rip = (DWORD64)(uintptr_t)&prosper_win_exc_thunk;
+        constexpr DWORD64 kGuestRedZone = 128;
+        injected.Rsp = (injected.Rsp & ~(DWORD64)0xf) - kGuestRedZone - 8;
+        DWORD64 delivery_ptr = (DWORD64)(uintptr_t)delivery;
+        SIZE_T written = 0;
+        if (!WriteProcessMemory(GetCurrentProcess(), (void*)(uintptr_t)injected.Rsp,
+                                &delivery_ptr, sizeof(delivery_ptr), &written) ||
+            written != sizeof(delivery_ptr)) {
+            DWORD e = GetLastError(); ResumeThread(thread); delete delivery;
+            return 0x80020000ull | (e & 0xffff);
+        }
+        if (!SetThreadContext(thread, &injected)) {
+            DWORD e = GetLastError(); ResumeThread(thread); delete delivery;
+            return 0x80020000ull | (e & 0xffff);
+        }
+
+        // A redirected Windows CONTEXT is not dispatched until a blocking syscall returns. Wake the
+        // futex path from a helper so the raiser remains free to finish the GC handshake.
+        HANDLE wake_thread = CreateThread(nullptr, 0, win_interrupt_wait_thread,
+                                          (void*)(uintptr_t)target, 0, nullptr);
+        if (!wake_thread) {
+            DWORD e = GetLastError();
+            SetThreadContext(thread, &delivery->saved);
+            ResumeThread(thread);
+            delete delivery;
+            return 0x80020000ull | (e & 0xffff);
+        }
+        win_exc_log("[exc2] wait interrupter created\n");
+        if (ResumeThread(thread) == (DWORD)-1) {
+            DWORD e = GetLastError();
+            bool restored = SetThreadContext(thread, &delivery->saved) != FALSE;
+            if (restored && ResumeThread(thread) != (DWORD)-1) delete delivery;
+            CloseHandle(wake_thread);
+            return 0x80020000ull | (e & 0xffff);
+        }
+        CloseHandle(wake_thread);
+        win_exc_log("[exc2] target resumed; raise returning\n");
+        return 0;
     }
-    if (!SetThreadContext(thread, &injected)) {
-        DWORD e = GetLastError(); ResumeThread(thread); delete delivery;
-        return 0x80020000ull | (e & 0xffff);
-    }
-    if (ResumeThread(thread) == (DWORD)-1) {
-        DWORD e = GetLastError();
-        bool restored = SetThreadContext(thread, &delivery->saved) != FALSE;
-        if (restored && ResumeThread(thread) != (DWORD)-1) delete delivery;
-        return 0x80020000ull | (e & 0xffff);
-    }
-    // A redirected Windows CONTEXT is not dispatched until a blocking syscall returns. Current
-    // IL2CPP targets commonly sit in our infinite WaitOnAddress HLE; wake its registered address
-    // after dropping the suspend count so the target enters prosper_win_exc_thunk immediately.
-    interrupt_futex_wait(target);
-    return 0;
+    return 0x80020010ull;                                                       // EBUSY
 }
 
 void ensure_exc_sig() {
@@ -1206,7 +1637,18 @@ HLE(k_raise_exception) {       // (targetThread /*host pthread_t*/, exceptionTyp
                 sctid(), (unsigned long long)a0, (unsigned long long)a1);
     }
 #elif defined(_WIN32)
-    return win_raise_exception(a0, a1);
+    {
+        uint64_t ret = win_raise_exception(a0, a1);
+        if (g_exc_log2) {
+            char msg[192];
+            snprintf(msg, sizeof msg,
+                     "[exc2] RAISE by tid=%ld self=0x%llx target=0x%llx type=0x%llx ret=0x%llx\n",
+                     sctid(), (unsigned long long)(uint64_t)pthread_self(),
+                     (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)ret);
+            win_exc_log(msg); // raw Win32 stderr write: target may be suspended while owning FILE's lock
+        }
+        return ret;
+    }
 #endif
     return 0;
 }

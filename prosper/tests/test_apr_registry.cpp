@@ -6,7 +6,14 @@
 // the read path uses to refuse ambiguous / unplaceable (chunk) reads instead of guessing.
 #include <cstdio>
 #include <cstdint>
+#include <array>
+#include <cstring>
 #include <string>
+#ifdef _WIN32
+#include "../src/host/exec_image.hpp"
+#include "../src/hle/dispatch.hpp"
+#include <vector>
+#endif
 
 namespace prosper {
     uint32_t    prosper_apr_register(const std::string& path, uint64_t size);
@@ -61,6 +68,53 @@ int main() {
     prosper_apr_reset_for_test();
     CHECK(prosper_apr_match_by_size(645, nullptr) == 0 && prosper_apr_path_for_id(1).empty(),
           "reset clears the registry");
+
+#ifdef _WIN32
+    // The AMPR builder is a DMA-style read: callers may consume their destination buffer directly,
+    // not only the completion record's data pointer. Evergate loads globalgamemanagers this way.
+    const char* fixture_path = "prosper-test-apr-read.tmp";
+    std::array<uint8_t, 257> expected{};
+    for (size_t i = 0; i < expected.size(); ++i) expected[i] = (uint8_t)(i * 29u + 7u);
+    FILE* fixture = std::fopen(fixture_path, "wb");
+    CHECK(fixture != nullptr, "create APR read fixture");
+    if (fixture) {
+        CHECK(std::fwrite(expected.data(), 1, expected.size(), fixture) == expected.size(),
+              "write APR read fixture");
+        std::fclose(fixture);
+    }
+    register_file_hle();
+    HleFn read_file = Hle::lookup("mQ16-QdKv7k");
+    CHECK(read_file != nullptr, "AMPR read-file HLE registered");
+    std::string stub_error;
+    const std::vector<ImportSlot> slots = {{"libSceAmpr", "mQ16-QdKv7k"}};
+    CHECK(install_stubs(slots, 0x720000000ull, 96, &stub_error),
+          "generated executable AMPR import stub");
+    using GuestReadFile = uint64_t (__attribute__((sysv_abi)) *)(
+        uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+        uint64_t, uint64_t, uint64_t, uint64_t);
+    auto read_file_guest = reinterpret_cast<GuestReadFile>(
+        static_cast<uintptr_t>(stub_addr(0)));
+    uint32_t fixture_id = prosper_apr_register(fixture_path, expected.size());
+    std::array<uint8_t, 0x48> request{};
+    std::array<uint64_t, 3> completion{};
+    constexpr size_t read_offset = 41;
+    constexpr size_t read_size = 73;
+    std::array<uint8_t, read_size> destination{};
+    uint64_t result = read_file && stub_error.empty()
+        ? read_file_guest((uint64_t)(uintptr_t)request.data(), 0,
+                          (uint64_t)(uintptr_t)completion.data(), fixture_id,
+                          (uint64_t)(uintptr_t)destination.data(), destination.size(),
+                          read_offset, 0, 0)
+        : ~uint64_t{0};
+    CHECK(result == 0, "AMPR read-file completes successfully");
+    CHECK(std::memcmp(destination.data(), expected.data() + read_offset, read_size) == 0,
+          "AMPR read-file honors its stack-passed offset and fills the DMA destination");
+    CHECK(completion[0] == (uint64_t)(uintptr_t)destination.data() &&
+              completion[1] == 0 && completion[2] == read_size,
+          "AMPR completion publishes destination, success, and byte count");
+    std::remove(fixture_path);
+    prosper_apr_reset_for_test();
+#endif
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");

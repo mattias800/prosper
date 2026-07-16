@@ -65,6 +65,16 @@ Esc or closing the window quits.
 
 ## Notes
 
+Set `PROSPER_APP_DUMP_FRAMES=1` to retain the renderer's normal composited BMP checkpoints while the
+interactive harness runs. `PROSPER_FRAME_DIR` selects their directory (the current directory by default).
+This is useful when a title only reproduces in the realtime app; use the screenshot frontend for routed
+PNG sequences and manifests when both frontends reproduce the same behavior.
+
+For frontend A/B diagnostics, `PROSPER_APP_DISABLE_AUDIO=1`, `PROSPER_APP_DISABLE_PAD=1`, and
+`PROSPER_APP_DISABLE_DIALOG=1` individually disable the corresponding SDL backend. The app then uses
+the core's realtime silent audio sink, keyboard/scripted pad input, or headless dialog auto-dismiss.
+These switches isolate frontend-specific behavior without requiring a separate build.
+
 - Two Vulkan contexts by design (`docs/FRONTEND_APP.md`): the core renders headless; the app owns a
   separate presentation device; frames cross as CPU pixels via `present_readback`.
 - On window-close the guest thread is detached and reclaimed by process exit (a cooperative

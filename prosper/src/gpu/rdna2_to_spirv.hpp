@@ -20,6 +20,25 @@ namespace prosper::gpu {
 
 struct ShaderResourceTable;   // resource-binding contract (shader_resources.hpp); optional to recompile_valu
 
+// A narrowly-proven compiler-generated scalar jump table. The shader loads a uniform selector from a
+// direct constant buffer, bounds it, scales it by the 64-bit table-entry size, loads a PC-relative
+// target, and reaches it with s_setpc_b64. Arbitrary indirect control flow remains unsupported: this
+// metadata is returned only when the complete bounded idiom and every table target can be proven.
+struct PcrelDispatchInfo {
+    bool valid = false;
+    uint32_t selector_sgpr_base = 0;
+    uint32_t selector_byte_offset = 0;
+    int32_t selector_addend = 0;
+    uint32_t selector_max = 0;
+    uint32_t setpc_pc = 0;
+    uint32_t merge_pc = 0;
+    size_t required_dwords = 0;
+    std::vector<uint32_t> target_pcs;
+    std::vector<uint32_t> setup_pcs;
+};
+
+PcrelDispatchInfo rdna2_pcrel_dispatch_info(const uint32_t* code, size_t dwords);
+
 // Return the portion of a raw shader blob that participates in recompilation. This normally ends at
 // S_ENDPGM, but compiler-generated PC-relative lookup tables may live immediately after the program and
 // must remain part of an owning/cache copy. The result never exceeds `dwords`.
@@ -82,7 +101,8 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
 // An optional ShaderResourceTable enables memory ops (SMEM/MUBUF) with resolved bindings.
 std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
                                          const ShaderResourceTable* rt = nullptr,
-                                         const PixelSystemInputMapping* system_inputs = nullptr);
+                                         const PixelSystemInputMapping* system_inputs = nullptr,
+                                         uint32_t pcrel_dispatch_target = UINT32_MAX);
 
 // Recompile a vertex shader to a vertex SPIR-V module: v0 = gl_VertexIndex, run the VALU, and on EXP
 // to a POS target write vec4(src0..3) to gl_Position. Returns {} if unsupported / no position export.

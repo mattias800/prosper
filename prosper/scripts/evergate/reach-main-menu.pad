@@ -1,0 +1,3 @@
+# Keep a controller connected without pressing through the title screen.
+# Sparse-render boot runs used for menu capture do not approach this flip.
+f999999-1000011:cross

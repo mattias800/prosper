@@ -370,7 +370,9 @@ int main(int argc, char** argv) {
     std::thread guestThread;
     if (!testPattern && !dump.empty()) {
 #ifdef PROSPER_HAVE_LIVE_RENDERER
-        prosper::frontend::register_live_renderer(".", /*dump_bmps=*/false);   // composite to the present layer, no disk spam
+        prosper::frontend::register_live_renderer(
+            getenv("PROSPER_FRAME_DIR") ? getenv("PROSPER_FRAME_DIR") : ".",
+            getenv("PROSPER_APP_DUMP_FRAMES") != nullptr);
 #else
         fprintf(stderr, "[app] built without the live renderer; the window will stay blank.\n");
 #endif
@@ -380,17 +382,29 @@ int main(int argc, char** argv) {
         // corresponding SDL3 frontend is enabled; a window app wants both on by default.
         auto install_backends = []{
 #ifdef PROSPER_AUDIO_SDL3
-            prosper::install_sdl3_audio_sink();
+            if (!getenv("PROSPER_APP_DISABLE_AUDIO")) {
+                prosper::install_sdl3_audio_sink();
+            } else {
+                fprintf(stderr, "[app] SDL audio backend disabled; using the realtime silent sink.\n");
+            }
 #endif
 #ifdef PROSPER_PAD_SDL3
-            if (prosper::install_sdl3_pad_backend()) {
-                g_keyboard_pad.set_fallback(prosper::input::pad_backend());
-                fprintf(stderr, "[app] controller backend installed.\n");
+            if (!getenv("PROSPER_APP_DISABLE_PAD")) {
+                if (prosper::install_sdl3_pad_backend()) {
+                    g_keyboard_pad.set_fallback(prosper::input::pad_backend());
+                    fprintf(stderr, "[app] controller backend installed.\n");
+                }
+            } else {
+                fprintf(stderr, "[app] SDL controller backend disabled; keyboard and scripted input remain available.\n");
             }
 #endif
 #ifdef PROSPER_HAVE_DIALOG_SDL3
-            prosper::install_sdl3_platform_ui();   // real SDL message boxes for MsgDialog/ErrorDialog (#347)
-            fprintf(stderr, "[app] dialog backend installed.\n");
+            if (!getenv("PROSPER_APP_DISABLE_DIALOG")) {
+                prosper::install_sdl3_platform_ui();   // real SDL message boxes for MsgDialog/ErrorDialog (#347)
+                fprintf(stderr, "[app] dialog backend installed.\n");
+            } else {
+                fprintf(stderr, "[app] SDL dialog backend disabled; using headless auto-dismiss.\n");
+            }
 #endif
         };
         if (!boot_program(dump, prog, &err, install_backends)) { fprintf(stderr, "[app] boot failed: %s\n", err.c_str()); return 1; }

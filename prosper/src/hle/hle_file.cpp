@@ -40,6 +40,11 @@
 
 namespace prosper {
 
+#ifdef _WIN32
+extern "C" int prosper_reserved_range_state(uint64_t addr);
+extern "C" int prosper_try_commit_dmem(uint64_t addr, uint64_t len, int write);
+#endif
+
 #define HLE(name) static PROSPER_SYSV_ABI uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
                                        uint64_t a3, uint64_t a4, uint64_t a5)
 #define P(x) ((void*)(uintptr_t)(x))
@@ -50,6 +55,36 @@ namespace {
     bool filelog() { static int v = getenv("PROSPER_FILELOG") ? 1 : 0; return v; }
     std::mutex g_filelog_fd_mx;
     std::map<int, std::string> g_filelog_fd_paths;
+
+#ifdef _WIN32
+    // Host kernel/CRT reads write into guest memory without passing through the process VEH, so a
+    // sparse direct-memory page or tracked reserved page must be materialized before _read copies
+    // into it. Guest stores normally fault these pages in lazily; kernel copyout does not.
+    bool windows_prepare_guest_write(uint64_t dst, uint64_t bytes) {
+        if (!bytes) return true;
+        if (!dst || dst + bytes < dst) return false;
+        prosper_try_commit_dmem(dst, bytes, 1);
+        const uint64_t end = dst + bytes;
+        for (uint64_t p = dst; p < end;) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (!VirtualQuery((const void*)(uintptr_t)p, &mbi, sizeof mbi)) return false;
+            if (mbi.State == MEM_RESERVE && prosper_reserved_range_state(p) == 1) {
+                const uint64_t page = p & ~uint64_t{0x3fff};
+                if (!VirtualAlloc((void*)(uintptr_t)page, 0x4000, MEM_COMMIT, PAGE_READWRITE))
+                    return false;
+                continue;
+            }
+            const DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY |
+                                   PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+            if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD) ||
+                !(mbi.Protect & writable)) return false;
+            const uint64_t region_end = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+            if (region_end <= p) return false;
+            p = region_end < end ? region_end : end;
+        }
+        return true;
+    }
+#endif
 
     void filelog_remember_fd(int fd, const std::string& path) {
         if (!filelog() || fd < 0) return;
@@ -299,9 +334,19 @@ void to_sce_stat64(const struct _stat64& s, uint8_t* out) {
 #endif
 
 // --- stdio FILE* ---
-HLE(f_fopen)   { std::string h = translate(CS(a0)); return (uint64_t)(uintptr_t)fopen(h.c_str(), CS(a1)); }
+HLE(f_fopen)   { std::string h = translate(CS(a0)); const char* mode = CS(a1);
+                  FILE* f = fopen(h.c_str(), mode);
+                  if (filelog()) fprintf(stderr, "[file] fopen host='%s' mode='%s' -> %p error=%d\n",
+                                         h.c_str(), mode ? mode : "(null)", (void*)f, f ? 0 : errno);
+                  return (uint64_t)(uintptr_t)f; }
 HLE(f_fclose)  { return a0 ? (uint64_t)(int64_t)fclose((FILE*)P(a0)) : 0; }
-HLE(f_fread)   { return a3 ? (uint64_t)fread(P(a0), a1, a2, (FILE*)P(a3)) : 0; }
+HLE(f_fread)   { if (!a3) return 0;
+                  FILE* f = (FILE*)P(a3); size_t n = fread(P(a0), a1, a2, f);
+                  if (filelog()) fprintf(stderr,
+                      "[file] fread dst=%p size=%llu count=%llu stream=%p -> %llu eof=%d error=%d errno=%d\n",
+                      P(a0), (unsigned long long)a1, (unsigned long long)a2, (void*)f,
+                      (unsigned long long)n, feof(f), ferror(f), errno);
+                  return (uint64_t)n; }
 HLE(f_fwrite)  { return a3 ? (uint64_t)fwrite(P(a0), a1, a2, (FILE*)P(a3)) : 0; }
 HLE(f_fseek)   { return a0 ? (uint64_t)(int64_t)fseek((FILE*)P(a0), (long)a1, (int)a2) : -1; }
 HLE(f_ftell)   { return a0 ? (uint64_t)(int64_t)ftell((FILE*)P(a0)) : -1; }
@@ -478,9 +523,24 @@ HLE(f_read)  { int fd = (int)a0; int64_t off = -1;
                // Full sequential read (loop) — same full-count contract as read_full: a short ::read
                // would leave Unity's asset cache block partially filled and deserialize corrupt data.
                { size_t done = 0, cnt = (size_t)a2; char* b = (char*)P(a1);
+                 // Windows validates the entire destination range before it discovers EOF. Guest
+                 // stdio may request a large refill into a buffer whose accessible extent only
+                 // covers the short file remainder; raw _read then reports EINVAL instead of the
+                 // POSIX short read the guest expects. Cap regular files to the remaining bytes.
+                 // Pipes/devices make _filelengthi64 fail and retain the original request.
+                 const int64_t pos = ::_telli64(fd);
+                 const int64_t len = ::_filelengthi64(fd);
+                 if (pos >= 0 && len >= 0 && pos <= len) {
+                     const uint64_t remaining = (uint64_t)(len - pos);
+                     if (remaining < cnt) cnt = (size_t)remaining;
+                 }
+                 if (cnt && !windows_prepare_guest_write(a1, cnt)) {
+                     errno = EFAULT;
+                     return logged_return((int64_t)-1);
+                 }
                  while (done < cnt) {
                      unsigned want = (cnt - done) > 0x40000000u ? 0x40000000u : (unsigned)(cnt - done);
-                     int r = ::read((int)a0, b + done, want);
+                     int r = ::read(fd, b + done, want);
                      if (r < 0) return logged_return(done ? (int64_t)done : (int64_t)-1);
                      if (r == 0) break;   // EOF
                      done += (size_t)r;
@@ -1005,7 +1065,14 @@ extern "C" uint64_t f_apr_read_submit_c(uint64_t a0, uint64_t a1, uint64_t a2,
                                         uint64_t a3, uint64_t a4, uint64_t a5,
                                         uint64_t entry_rsp) {
 #else
-HLE(f_apr_read_submit) {
+// The generated Windows import bridge converts the guest SysV call to Microsoft x64 and forwards
+// arguments 7-9 in the host stack slots. Keep the real fixed-arity prototype here: using HleFn's
+// six-argument declaration discarded the file offset (arg7), so every Windows APR request read
+// from byte zero even when the engine asked for a pak footer or asset range.
+extern "C" uint64_t f_apr_read_submit(uint64_t a0, uint64_t a1, uint64_t a2,
+                                      uint64_t a3, uint64_t a4, uint64_t a5,
+                                      uint64_t a6, uint64_t a7, uint64_t a8) {
+    (void)a8;
 #endif
     uint8_t* req = (uint8_t*)P(a0);
     if (!req) return 0x80020016ull;
@@ -1094,6 +1161,7 @@ HLE(f_apr_read_submit) {
     uint64_t offset = 0;
 #ifndef _WIN32
     offset = apr_stack_arg(entry_rsp, 0);
+    uint64_t arg8 = apr_stack_arg(entry_rsp, 1);
     // arg8 discriminates the engine's ASYNC streaming reads from its sync (record-polled) reads —
     // the ONLY ReadFile-level difference found across 90-read boots (identical guest-RA chains):
     // the async wrapper passes a live pointer into its own frame just above the request object
@@ -1106,7 +1174,6 @@ HLE(f_apr_read_submit) {
     // addresses, unrelated heap/stack pointers) can't satisfy it. CONFIDENCE: MED (see the
     // g_apr_eventful comment for the full evidence trail; issue #180).
     {
-        uint64_t arg8 = apr_stack_arg(entry_rsp, 1);
         bool async_notify = arg8 > a0 && arg8 - a0 < 0x1000 &&
                             (arg8 >> 16) == (a0 >> 16);
         prosper_apr_mark_eventful(a0, async_notify);
@@ -1119,6 +1186,9 @@ HLE(f_apr_read_submit) {
                             (unsigned long long)*(uint64_t*)(uintptr_t)(arg8 + o));
         }
     }
+#else
+    offset = a6;
+    (void)a7;
 #endif
     uint64_t size = a5;
     if (offset > fsize) {
@@ -1231,21 +1301,36 @@ HLE(f_apr_read_submit) {
     return ok ? 0 : 0x80020016ull;
 #else
     (void)dest;
-    // Windows host: same record-completion model over stdio, buffer from the host heap (in-process,
-    // guest-readable).
+    // Windows host: same record-completion + DMA-destination model over stdio. Read through a host
+    // staging buffer so an invalid guest range cannot make the CRT abort the whole read before EOF.
     void* slot = ::malloc(size ? (size_t)size : 16);
     if (!slot) return 0x80020016ull;
     size_t got = 0;
     if (size) {
         FILE* f = ::fopen(host.c_str(), "rb"); if (!f) { ::free(slot); return 0x80020016ull; }
-        got = ::fread(slot, 1, (size_t)size, f); ::fclose(f);
+        if (_fseeki64(f, (__int64)offset, SEEK_SET) == 0)
+            got = ::fread(slot, 1, (size_t)size, f);
+        ::fclose(f);
     }
     if ((uint64_t)got != size) { ::free(slot); return 0x80020016ull; }
+    auto write_guest_dst = [](uint64_t dst, const void* src, uint64_t bytes) -> bool {
+        if (!windows_prepare_guest_write(dst, bytes)) return false;
+        memcpy((void*)(uintptr_t)dst, src, (size_t)bytes);
+        return true;
+    };
+    const bool in_dst = a4 > 0xffff && write_guest_dst(a4, slot, size);
     if (a2) {
-        *(uint64_t*)(uintptr_t)(a2 + 0x00) = (uint64_t)(uintptr_t)slot;
+        *(uint64_t*)(uintptr_t)(a2 + 0x00) = in_dst ? a4 : (uint64_t)(uintptr_t)slot;
         *(uint64_t*)(uintptr_t)(a2 + 0x08) = 0;
         *(uint64_t*)(uintptr_t)(a2 + 0x10) = size;
     }
+    if (in_dst) ::free(slot);
+    if (filelog()) fprintf(stderr,
+        "[apr] read-submit id=%llu %s -> dst=0x%llx(%s) off=0x%llx size=%llu got=%llu OK\n",
+        (unsigned long long)id, host.c_str(),
+        in_dst ? (unsigned long long)a4 : (unsigned long long)(uintptr_t)slot,
+        in_dst ? "guest" : "staging", (unsigned long long)offset,
+        (unsigned long long)size, (unsigned long long)got);
     return 0;
 #endif
 }

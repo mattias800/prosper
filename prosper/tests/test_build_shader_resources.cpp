@@ -102,6 +102,32 @@ int main() {
               d3d.max_uncompressed_block_size == 2 && d3d.max_compressed_block_size == 1 &&
               d3d.metadata_addr == 0x206e33ab00ull,
               "GFX10 T# WORD6/7 DCC flags and 40-bit metadata address decode exactly");
+
+        uint32_t tmip[8];
+        make_tsharp(tmip, 0x18000000ull, 2048, 1152, /*fmt*/56, /*SW_4KB_S*/5, /*2D*/9);
+        tmip[3] |= 1u << 16;       // LAST_LEVEL
+        tmip[5] |= 11u << 4;       // MAX_MIP: twelve levels in the allocation
+        const DecodedImageDescriptor dmip0 = decode_image_descriptor(tmip);
+        Gen5ImageFormatInfo mip_format;
+        CHECK(gen5_image_format(56, &mip_format), "mip-view fixture format is mapped");
+        const DecodedImageView vmip0 = image_base_level_view(dmip0, mip_format);
+        CHECK(dmip0.base_level == 0 && dmip0.last_level == 1 && dmip0.max_mip == 11,
+              "GFX10 T# base/last/MAX_MIP fields decode exactly");
+        CHECK(vmip0.base == 0x18000000ull + 3186688 && vmip0.width == 2048 &&
+                  vmip0.height == 1152 && vmip0.mip_offset == 3186688,
+              "tiled level-zero view advances past the tail-first mip chain");
+        tmip[3] |= 1u << 12;       // BASE_LEVEL 1, still outside the packed tail
+        const DecodedImageDescriptor dmip1 = decode_image_descriptor(tmip);
+        const DecodedImageView vmip1 = image_base_level_view(dmip1, mip_format);
+        CHECK(vmip1.base == 0x18000000ull + 827392 && vmip1.width == 1024 &&
+                  vmip1.height == 576 && vmip1.mip_offset == 827392,
+              "non-tail base-level view applies its proven offset and dimensions");
+        tmip[3] &= ~(0x1fu << 20); // linear layout: offset is not modeled by the tiled helper
+        const DecodedImageDescriptor dlinear = decode_image_descriptor(tmip);
+        const DecodedImageView vlinear = image_base_level_view(dlinear, mip_format);
+        CHECK(vlinear.base == dlinear.base && vlinear.width == dlinear.width &&
+                  vlinear.height == dlinear.height && vlinear.mip_offset == 0,
+              "unmodeled linear base-level layout preserves the conservative whole-resource view");
     }
 
     // --- AGC semantic metadata -> SPI_PS_INPUT_CNTL wiring ------------------------------------

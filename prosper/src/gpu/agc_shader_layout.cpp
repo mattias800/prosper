@@ -1,5 +1,6 @@
 // agc_shader_layout.cpp — see agc_shader_layout.hpp. V# decode + the front-half resource-table build.
 #include "agc_shader_layout.hpp"
+#include "tile.hpp"
 #include <algorithm>
 #include <climits>
 #include <cstdio>
@@ -189,6 +190,9 @@ DecodedImageDescriptor decode_image_descriptor(const uint32_t t[8]) {
     d.height    = (uint32_t)((t[2] >> 14) & 0x3FFFu) + 1;                                          // Height5
     d.format    = (t[1] >> 20) & 0x1FFu;                                                           // Format
     d.tile_mode = (t[3] >> 20) & 0x1Fu;                                                            // TileMode (SW_MODE)
+    d.base_level = (t[3] >> 12) & 0xFu;
+    d.last_level = (t[3] >> 16) & 0xFu;
+    d.max_mip    = (t[5] >> 4) & 0xFu;
     d.type      = (uint8_t)((t[3] >> 28) & 0xFu);                                                  // Type
     d.depth     = d.type == 10 ? ((t[4] & 0x1FFFu) + 1u) : 1u;                                     // DEPTH (3D)
     d.dst_sel[0] = (uint8_t)((t[3] >> 0) & 0x7u);   // DST_SEL_X (WORD3 [2:0])
@@ -205,6 +209,27 @@ DecodedImageDescriptor decode_image_descriptor(const uint32_t t[8]) {
     const uint64_t metadata_field = (static_cast<uint64_t>(t[7]) << 8) | (t[6] >> 24);
     d.metadata_addr               = metadata_field << 8;
     return d;
+}
+
+DecodedImageView image_base_level_view(const DecodedImageDescriptor& d,
+                                       const Gen5ImageFormatInfo& fi) {
+    DecodedImageView view;
+    view.base = d.base;
+    view.width = d.width;
+    view.height = d.height;
+    if (!fi.bytes_per_block || !fi.block_width || !fi.block_height) return view;
+    const uint32_t element_width = (d.width + fi.block_width - 1) / fi.block_width;
+    const uint32_t element_height = (d.height + fi.block_height - 1) / fi.block_height;
+    view.mip_offset = tiled_mip_level_offset(element_width, element_height, fi.bytes_per_block,
+                                              d.tile_mode, d.max_mip, d.base_level);
+    // A zero offset is conclusive for level zero, but ambiguous for a non-zero level: linear chains
+    // and levels packed inside the shared mip tail need layout-specific coordinates that this thin-2D
+    // helper intentionally does not guess. Preserve the old whole-resource view in those cases.
+    if (d.base_level && !view.mip_offset) return view;
+    view.width = std::max(d.width >> d.base_level, 1u);
+    view.height = std::max(d.height >> d.base_level, 1u);
+    view.base += view.mip_offset;
+    return view;
 }
 
 uint32_t image_type_to_dim(uint8_t type) {
@@ -365,11 +390,12 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                     tseen[key] = done;
                 }
             }
-            if (getenv("PROSPER_GFXLOG")) {
+            if (getenv("PROSPER_GFXLOG") || getenv("PROSPER_TEXLOG")) {
                 const uint32_t* t = tv;   // the fetched T# (SGPR block or EUD spill)
-                fprintf(stderr, "[t#] %ux%u base=0x%llx tile_mode=%u type=%u fmt=%u swz=%u,%u,%u,%u "
+                fprintf(stderr, "[t#] %ux%u base=0x%llx tile_mode=%u type=%u fmt=%u mips=%u:%u/%u swz=%u,%u,%u,%u "
                                 "dcc=%u meta=0x%llx blocks=%u/%u flags=%u%u%u%u | raw: %08x %08x %08x %08x %08x %08x %08x %08x\n",
                         d.width, d.height, (unsigned long long)d.base, d.tile_mode, d.type, d.format,
+                        d.base_level, d.last_level, d.max_mip,
                         d.dst_sel[0], d.dst_sel[1], d.dst_sel[2], d.dst_sel[3],
                         d.compression_enabled, (unsigned long long)d.metadata_addr,
                         d.max_uncompressed_block_size, d.max_compressed_block_size,
@@ -416,13 +442,14 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
                 continue;
             }
             ShaderResource r;
+            const DecodedImageView view = image_base_level_view(d, fi);
             r.cls           = ResourceClass::Texture;
             r.format        = fi.format;
             r.num_components = fi.num_components;
             r.binding       = binding++;
-            r.gpu_addr      = d.base;
-            r.width         = d.width;
-            r.height        = d.height;
+            r.gpu_addr      = view.base;
+            r.width         = view.width;
+            r.height        = view.height;
             r.depth         = d.depth;
             r.tile_mode     = d.tile_mode;          // so the renderer can auto-detile a GPU-tiled surface
             r.max_uncompressed_block_size = d.max_uncompressed_block_size;
