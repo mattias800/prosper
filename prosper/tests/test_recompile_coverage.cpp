@@ -231,6 +231,22 @@ int main() {
     CHECK(g.total == 1 && g.alu == 1 && g.unsupported == 0,
           "#527: v_cvt_off_f32_i4 is covered by the VOP1 recompiler");
 
+    // A partial AGC thread-dimension workgroup needs a divergent entry guard to mask Vulkan's padded
+    // invocations. That is safe for ordinary kernels, but not when the module contains a workgroup
+    // barrier: every Vulkan invocation must reach OpControlBarrier uniformly. Keep exact workgroups
+    // supported and reject the partial+barrier combination rather than risking a hang or undefined LDS.
+    const uint32_t barrier_only[] = { 0xBF8A0000u, 0xBF810000u };
+    ComputeShaderConfig exact_barrier;
+    exact_barrier.local_x = 64;
+    exact_barrier.exact_thread_extent = true;
+    exact_barrier.threads_x = 64;
+    exact_barrier.threads_y = exact_barrier.threads_z = 1;
+    CHECK(!recompile_compute(barrier_only, 2, nullptr, exact_barrier).empty(),
+          "an exact thread-dimension workgroup may retain a uniform barrier");
+    exact_barrier.threads_x = 63;
+    CHECK(recompile_compute(barrier_only, 2, nullptr, exact_barrier).empty(),
+          "a partial thread-dimension workgroup with a barrier rejects fail-visibly");
+
     // A wave-empty saveexec/execz guard may surround a scalar counted loop when the body preserves
     // both EXEC and the guard's saved mask. This is the Evergate color-conversion shape.
     const uint32_t guarded_counted_loop[] = {

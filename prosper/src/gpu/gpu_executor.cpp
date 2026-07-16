@@ -1912,9 +1912,6 @@ bool validate_runtime_descriptor_contract(const char* stage_name,
 ComputeLaunchDimensions resolve_compute_launch(const GpuState::Dispatch& d) {
     namespace P = prosper::agc::Pm4;
     ComputeLaunchDimensions out;
-    out.threads_x = d.threads_x;
-    out.threads_y = d.threads_y;
-    out.threads_z = d.threads_z;
     const GpuState* ds = d.state.get();
     auto reg = [&](uint32_t off) {
         if (!ds) {
@@ -1932,9 +1929,28 @@ ComputeLaunchDimensions resolve_compute_launch(const GpuState::Dispatch& d) {
     auto groups = [](uint32_t threads, uint32_t local) {
         return threads ? 1u + (threads - 1u) / local : 0u;
     };
-    out.groups_x = groups(out.threads_x, out.local_x);
-    out.groups_y = groups(out.threads_y, out.local_y);
-    out.groups_z = groups(out.threads_z, out.local_z);
+    const bool use_thread_dimensions = ((d.modifier >>
+        P::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS_SHIFT) &
+        P::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS_MASK) != 0;
+    if (use_thread_dimensions) {
+        out.threads_x = d.threads_x;
+        out.threads_y = d.threads_y;
+        out.threads_z = d.threads_z;
+        out.groups_x = groups(out.threads_x, out.local_x);
+        out.groups_y = groups(out.threads_y, out.local_y);
+        out.groups_z = groups(out.threads_z, out.local_z);
+    } else {
+        out.groups_x = d.threads_x;
+        out.groups_y = d.threads_y;
+        out.groups_z = d.threads_z;
+        auto total_threads = [](uint32_t group_count, uint32_t local) {
+            return static_cast<uint32_t>(std::min<uint64_t>(
+                static_cast<uint64_t>(group_count) * local, UINT32_MAX));
+        };
+        out.threads_x = total_threads(out.groups_x, out.local_x);
+        out.threads_y = total_threads(out.groups_y, out.local_y);
+        out.threads_z = total_threads(out.groups_z, out.local_z);
+    }
     return out;
 }
 
@@ -2159,6 +2175,12 @@ std::vector<ComputeItem> realize_compute_dispatches(
         config.local_x = launch.local_x;
         config.local_y = launch.local_y;
         config.local_z = launch.local_z;
+        config.exact_thread_extent = ((dispatch.modifier >>
+            P::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS_SHIFT) &
+            P::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS_MASK) != 0;
+        config.threads_x = launch.threads_x;
+        config.threads_y = launch.threads_y;
+        config.threads_z = launch.threads_z;
         config.wave_size = ((dispatch.modifier >>
             P::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT) &
             P::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_MASK) ? 32u : 64u;

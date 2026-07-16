@@ -70,9 +70,9 @@ struct Pm4Command {
     uint32_t index_size = 0;             // SetIndexType
 
     // CbDispatch (sceAgcCbDispatch -> R_DISPATCH_DIRECT, hle_agc.cpp). This is a prosper custom
-    // packet, not raw hardware DISPATCH_DIRECT: payload [0..2] retains API thread counts x/y/z;
-    // the executor divides by COMPUTE_NUM_THREAD_* to obtain Vulkan workgroup counts. [3..4] is
-    // the 64-bit dispatch modifier from the CS shader's specials block.
+    // packet, not raw hardware DISPATCH_DIRECT: payload [0..2] retains raw API dimensions x/y/z.
+    // Dispatch modifier bit 5 selects total-thread dimensions; when clear, they are already
+    // workgroup counts. [3..4] is the 64-bit dispatch modifier from the CS shader's specials block.
     uint32_t threads_x = 0, threads_y = 0, threads_z = 0;
     uint64_t dispatch_modifier = 0;          // DispatchDirect modifier bits
 

@@ -71,7 +71,8 @@ int main() {
     };
 
     constexpr uint32_t records = 130;
-    std::vector<uint32_t> result(records * 4, 0xcccccccc);
+    constexpr uint32_t launched_records = 3 * 64;
+    std::vector<uint32_t> result(launched_records * 4, 0xcccccccc);
     ShaderResourceTable rt;
     ShaderResource buffer;
     // Runtime metadata classifies compute direct type-1 V#s as ConstantBuffer even though MUBUF
@@ -81,7 +82,9 @@ int main() {
     buffer.num_components = 4;
     buffer.binding = 2;
     buffer.gpu_addr = (uint64_t)(uintptr_t)result.data();
-    buffer.size = records * 4 * sizeof(uint32_t);
+    // Deliberately expose the padded Vulkan lanes as valid writable storage. Only the generated
+    // exact-thread guard can keep records 130..191 unchanged; robust buffer access cannot hide a bug.
+    buffer.size = launched_records * 4 * sizeof(uint32_t);
     buffer.stride = 4 * sizeof(uint32_t);
     buffer.sgpr_base = 0;
     rt.resources.push_back(buffer);
@@ -92,6 +95,9 @@ int main() {
         0x11223344, 0x55667788, 0x99aabbcc, 0xddeeff00,
     };
     config.local_x = 64;
+    config.exact_thread_extent = true;
+    config.threads_x = records;
+    config.threads_y = config.threads_z = 1;
     config.tidig_comp_cnt = 0;
     config.tgid_x_en = true;
 
@@ -125,9 +131,9 @@ int main() {
     item.command_order = 70;
     CHECK(prosper::frontend::execute_live_compute_items({item}),
           "production live backend executes the game kernel");
-    CHECK(result.size() == records * 4, "compute resource retains its declared size");
+    CHECK(result.size() == launched_records * 4, "compute resource retains its padded declared size");
     const uint32_t expected[4] = {0x11223344, 0x55667788, 0x99aabbcc, 0xddeeff00};
-    bool all_filled = result.size() == records * 4;
+    bool all_filled = result.size() == launched_records * 4;
     for (uint32_t record = 0; record < records; record++) {
         for (uint32_t component = 0; component < 4; component++) {
             if (result[record * 4 + component] != expected[component]) {
@@ -140,8 +146,14 @@ int main() {
         if (!all_filled) break;
     }
     CHECK(all_filled, "all 130 records are filled across three workgroups");
+    bool padded_lanes_untouched = true;
+    for (uint32_t record = records; record < launched_records; ++record)
+        for (uint32_t component = 0; component < 4; ++component)
+            padded_lanes_untouched &= result[record * 4 + component] == 0xcccccccc;
+    CHECK(padded_lanes_untouched,
+          "partial workgroup suppresses all 62 padded invocations without a guest bounds check");
 
-    std::vector<uint32_t> replay_owned(records * 4, 0xdddddddd);
+    std::vector<uint32_t> replay_owned(launched_records * 4, 0xdddddddd);
     ShaderResource replay_buffer = buffer;
     replay_buffer.gpu_addr = 1; // Deliberately unreadable: replay must never dereference this identity.
     replay_buffer.host_data = reinterpret_cast<uint8_t*>(replay_owned.data());
@@ -155,6 +167,11 @@ int main() {
         for (uint32_t component = 0; component < 4; ++component)
             replay_filled &= replay_owned[record * 4 + component] == expected[component];
     CHECK(replay_filled, "compute writeback updates owned backing for a later replay operation");
+    bool replay_padding_untouched = true;
+    for (uint32_t record = records; record < launched_records; ++record)
+        for (uint32_t component = 0; component < 4; ++component)
+            replay_padding_untouched &= replay_owned[record * 4 + component] == 0xdddddddd;
+    CHECK(replay_padding_untouched, "captured/replay-owned backing preserves padded invocations");
 
     // --- #590: the live backend's storage-IMAGE path. The same 1D image-copy kernel that
     // test_storage_image_copy proves against the raw harness, executed through the PRODUCTION

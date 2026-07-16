@@ -201,23 +201,25 @@ int main() {
             {P::COMPUTE_NUM_THREAD_X, 64}, {P::COMPUTE_NUM_THREAD_Y, 2}, {P::COMPUTE_NUM_THREAD_Z, 1},
         };
         setsh(CD, (uint64_t)(uintptr_t)thread_regs, 3, 0, 0, 0);
-        dispatch(CD, 130, 5, 3, 0x1122334455667788ull, 0);
+        dispatch(CD, 130, 5, 3, 0x21, 0); // USE_THREAD_DIMENSIONS
         setsh(CD, (uint64_t)(uintptr_t)cregs1, 1, 0, 0, 0);
-        dispatch(CD, 8, 2, 3, 0x8877665544332211ull, 0);
+        dispatch(CD, 8, 2, 3, 0x1, 0); // native workgroup dimensions
         GpuState cs;
         run_cb(cbuf, 128, cs);
         CHECK(cs.dispatch_count == 2 && cs.dispatches.size() == 2,
               "2 compute dispatches counted and retained");
         if (cs.dispatches.size() == 2) {
             CHECK(cs.dispatches[0].threads_x == 130 && cs.dispatches[0].threads_y == 5 &&
-                  cs.dispatches[0].threads_z == 3, "dispatch 0 retains API thread counts");
-            CHECK(cs.dispatches[0].modifier == 0x1122334455667788ull,
+                  cs.dispatches[0].threads_z == 3, "dispatch 0 retains raw API dimensions");
+            CHECK(cs.dispatches[0].modifier == 0x21,
                   "dispatch 0 modifier retained");
             auto launch = resolve_compute_launch(cs.dispatches[0]);
             CHECK(launch.local_x == 64 && launch.local_y == 2 && launch.local_z == 1,
                   "dispatch launch resolves local size from retained registers");
             CHECK(launch.groups_x == 3 && launch.groups_y == 3 && launch.groups_z == 3,
                   "dispatch launch ceil-divides non-divisible thread counts");
+            CHECK(launch.threads_x == 130 && launch.threads_y == 5 && launch.threads_z == 3,
+                  "thread-dimension dispatch retains its requested invocation extent");
             CHECK(cs.dispatches[0].state &&
                   cs.dispatches[0].state->sh.at(P::COMPUTE_USER_DATA_0 + 3) == 0xAAAA1111u,
                   "dispatch 0 snapshot retains pre-update compute user data");
@@ -225,10 +227,34 @@ int main() {
                   cs.dispatches[1].state->sh.at(P::COMPUTE_USER_DATA_0 + 3) == 0xBBBB2222u,
                   "dispatch 1 snapshot retains updated compute user data");
             CHECK(cs.dispatches[1].threads_x == 8 && cs.dispatches[1].threads_y == 2 &&
-                  cs.dispatches[1].threads_z == 3, "dispatch 1 asymmetric thread counts retained");
+                  cs.dispatches[1].threads_z == 3, "dispatch 1 asymmetric raw dimensions retained");
+            launch = resolve_compute_launch(cs.dispatches[1]);
+            CHECK(launch.groups_x == 8 && launch.groups_y == 2 && launch.groups_z == 3,
+                  "group-dimension dispatch does not divide its dimensions a second time");
+            CHECK(launch.threads_x == 512 && launch.threads_y == 4 && launch.threads_z == 3,
+                  "group-dimension dispatch reports the full local-size-expanded thread extent");
             CHECK(cs.dispatches[0].command_order > 0 &&
                   cs.dispatches[0].command_order < cs.dispatches[1].command_order,
                   "dispatches retain monotonic PM4 stream order");
+        }
+    }
+
+    // The decoder also accepts the older three-dimension custom packet used by focused tools. With
+    // no trailing modifier it must deterministically use modifier=0 (workgroup dimensions), rather
+    // than accidentally treating its dimensions as total threads.
+    {
+        constexpr uint32_t short_dispatch[] = {
+            0xC0000000u | (2u << 16) | (0x10u << 8) | (0x1au << 2),
+            11, 7, 3,
+        };
+        GpuState short_state;
+        run_cb(short_dispatch, 4, short_state);
+        CHECK(short_state.dispatches.size() == 1 && short_state.dispatches[0].modifier == 0,
+              "short dispatch packet defaults its missing modifier to workgroup mode");
+        if (short_state.dispatches.size() == 1) {
+            const auto launch = resolve_compute_launch(short_state.dispatches[0]);
+            CHECK(launch.groups_x == 11 && launch.groups_y == 7 && launch.groups_z == 3,
+                  "short dispatch dimensions remain workgroup counts");
         }
     }
 

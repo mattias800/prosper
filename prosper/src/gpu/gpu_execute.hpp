@@ -166,9 +166,9 @@ struct ComputeLaunchDimensions {
     uint32_t groups_x = 0, groups_y = 0, groups_z = 0;
 };
 
-// Convert sceAgcCbDispatch's API thread counts into hardware/Vulkan workgroup counts using the
-// dispatch's retained COMPUTE_NUM_THREAD_* register snapshot. Zero local-size registers fall back
-// to one so malformed/incomplete state never divides by zero.
+// Resolve sceAgcCbDispatch dimensions using the dispatch modifier. USE_THREAD_DIMENSIONS=1 means
+// the API values are total threads and must be ceil-divided by COMPUTE_NUM_THREAD_*; when clear,
+// they are already hardware/Vulkan workgroup counts. Zero local-size registers fall back to one.
 ComputeLaunchDimensions resolve_compute_launch(const GpuState::Dispatch& dispatch);
 
 struct ComputeItem {

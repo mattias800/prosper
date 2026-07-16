@@ -63,6 +63,7 @@ struct GpuState {
     // the state makes skipped-producer provenance inspectable instead of reducing every dispatch
     // to one process-lifetime counter (#524).
     struct Dispatch {
+        // Raw API dimensions. Modifier.USE_THREAD_DIMENSIONS selects threads (set) or groups (clear).
         uint32_t threads_x = 0, threads_y = 0, threads_z = 0;
         uint64_t modifier = 0;
         std::shared_ptr<const GpuState> state;

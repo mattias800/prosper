@@ -131,8 +131,10 @@ size_t decode_pm4(const uint32_t* buf, size_t dwords, std::vector<Pm4Command>& o
                     break;
                 case R_DISPATCH_DIRECT:
                     c.kind = K::DispatchDirect;
-                    // Custom HLE payload: [0..2]=thread counts x/y/z, [3..4]=64-bit modifier.
+                    // Custom HLE payload: [0..2]=raw dimensions x/y/z, [3..4]=64-bit modifier.
                     if (npl >= 3) { c.threads_x = pl[0]; c.threads_y = pl[1]; c.threads_z = pl[2]; }
+                    // A short legacy/test packet has no modifier and deliberately retains the
+                    // zero-initialized value, whose documented interpretation is workgroup mode.
                     if (npl >= 5) c.dispatch_modifier = (uint64_t)pl[3] | ((uint64_t)pl[4] << 32);
                     break;
                 case R_INDEX_BASE:
