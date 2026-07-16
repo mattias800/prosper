@@ -2037,6 +2037,9 @@ void dump_guest_thread_trace(const char* path, uint64_t pthread_filter) {
             ReadProcessMemory(GetCurrentProcess(), (void*)(uintptr_t)context.Rsp,
                               stack_words.data(), wanted, &stack_bytes);
         }
+        GuestWaitSnapshot captured_wait{};
+        const bool captured_wait_valid =
+            captured && snapshot_guest_wait(native_id, captured_wait);
         if (prior_suspend != (DWORD)-1) ResumeThread(thread);
         CloseHandle(thread);
         if (!captured) {
@@ -2082,8 +2085,8 @@ void dump_guest_thread_trace(const char* path, uint64_t pthread_filter) {
             ++guest_return_count;
         }
         char wait_description[64] = "-";
-        GuestWaitSnapshot wait{};
-        if (snapshot_guest_wait(native_id, wait)) {
+        if (captured_wait_valid) {
+            const GuestWaitSnapshot& wait = captured_wait;
             const char* kind = wait.kind == GuestWaitKind::Address ? "address" :
                                wait.kind == GuestWaitKind::ConditionSequence ? "condition" :
                                wait.kind == GuestWaitKind::EventFlag ? "event-flag" :
