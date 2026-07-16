@@ -1298,7 +1298,8 @@ WinCoopSlot* win_coop_slot_for(uint64_t thread, bool create) {
 }
 
 enum class WinCoopQueueResult { Fallback, Queued, Busy };
-WinCoopQueueResult try_queue_wait_exception(uint64_t target, uint64_t type) {
+WinCoopQueueResult try_queue_wait_exception(uint64_t target, uint64_t type,
+                                            HANDLE target_handle) {
     if (getenv("PROSPER_WIN_LEGACY_EXC")) return WinCoopQueueResult::Fallback;
     WinCoopSlot* slot = win_coop_slot_for(target, true);
     if (!slot) return WinCoopQueueResult::Fallback;
@@ -1310,20 +1311,25 @@ WinCoopQueueResult try_queue_wait_exception(uint64_t target, uint64_t type) {
     slot->state.store(WinCoopState::Queued, std::memory_order_release);
     g_win_coop_queued.fetch_add(1, std::memory_order_release);
     const bool interrupted = interrupt_guest_wait(target);
-    HANDLE target_handle = (HANDLE)pthread_gethandle((pthread_t)target);
     win_exc_trace(WinExcTraceKind::CoopQueue, target,
-                  target_handle && target_handle != INVALID_HANDLE_VALUE
-                      ? GetThreadId(target_handle) : 0,
+                  GetThreadId(target_handle),
                   type, 0, interrupted ? 1 : 0);
 
     // The target claims Queued at the wrapper checkpoint before executing the handler. A bounded
-    // handoff closes the race where it left the wait just before our wake. If it does not accept
-    // immediately, leave the request queued: every Windows HLE return is also a safe point, so the
-    // target will acknowledge at its next guest/host boundary without restoring stale native state.
+    // handoff closes the race where it left the wait just before our wake. A request that remains
+    // unclaimed cannot be reported as delivered: withdraw it atomically so the caller can use forced
+    // CONTEXT delivery. The target's Queued->Running claim races this Queued->Idle withdrawal; exactly
+    // one side wins and therefore exactly one side decrements the global queued count.
     for (unsigned spin = 0; spin < 20; ++spin) {
         if (slot->state.load(std::memory_order_acquire) != WinCoopState::Queued)
             return WinCoopQueueResult::Queued;
         Sleep(1);
+    }
+    expected = WinCoopState::Queued;
+    if (slot->state.compare_exchange_strong(expected, WinCoopState::Idle,
+                                            std::memory_order_acq_rel)) {
+        g_win_coop_queued.fetch_sub(1, std::memory_order_acq_rel);
+        return WinCoopQueueResult::Fallback;
     }
     return WinCoopQueueResult::Queued;
 }
@@ -1495,18 +1501,31 @@ uint64_t win_raise_exception(uint64_t target, uint64_t type) {
     if (pthread_equal((pthread_t)target, pthread_self())) return 0x80020023ull; // EDEADLK-ish
     if (!g_rtl_restore_context) return 0x80020026ull;                         // ENOSYS-ish
 
-    const WinCoopQueueResult cooperative = try_queue_wait_exception(target, type);
+    // Hold a real duplicate for the complete queue/fallback transaction. This both validates the
+    // pthread before publishing cooperative state and keeps a detached target's kernel object alive
+    // while delivery is in flight.
+    HANDLE thread = duplicate_registered_thread_handle(target);
+    if (!thread) {
+        HANDLE borrowed = (HANDLE)pthread_gethandle((pthread_t)target);
+        if (borrowed && borrowed != INVALID_HANDLE_VALUE)
+            DuplicateHandle(GetCurrentProcess(), borrowed, GetCurrentProcess(), &thread,
+                            0, FALSE, DUPLICATE_SAME_ACCESS);
+    }
+    struct OwnedHandle { HANDLE value; ~OwnedHandle() { if (value) CloseHandle(value); } }
+        owned{thread};
+    if (!thread || thread == INVALID_HANDLE_VALUE) return 0x80020003ull;          // ESRCH
+    DWORD exit_code = 0;
+    if (!GetExitCodeThread(thread, &exit_code) || exit_code != STILL_ACTIVE)
+        return 0x80020003ull;                                                     // ESRCH
+
+    const WinCoopQueueResult cooperative = try_queue_wait_exception(target, type, thread);
     if (cooperative == WinCoopQueueResult::Queued) return 0;
     if (cooperative == WinCoopQueueResult::Busy) return 0x80020010ull;
 
-    // Winpthreads can discard its pthread_t -> HANDLE lookup for a detached worker before that
-    // worker exits. The guest still owns the pthread_t and may request a legacy/fallback GC stop,
-    // so prefer the trampoline's lifetime-bound duplicate when one is available.
-    HANDLE owned_thread = duplicate_registered_thread_handle(target);
-    struct OwnedHandle { HANDLE value; ~OwnedHandle() { if (value) CloseHandle(value); } }
-        owned{owned_thread};
-    HANDLE thread = owned_thread ? owned_thread : (HANDLE)pthread_gethandle((pthread_t)target);
-    if (!thread || thread == INVALID_HANDLE_VALUE) return 0x80020003ull;       // ESRCH
+    // The target may have exited during the bounded cooperative handoff. Do not allocate a delivery
+    // record or turn a failed SuspendThread into an opaque Win32 error for a dead pthread.
+    if (!GetExitCodeThread(thread, &exit_code) || exit_code != STILL_ACTIVE)
+        return 0x80020003ull;                                                     // ESRCH
 
     // Do not use the process heap for delivery records. The target can be interrupted while it owns
     // that heap's lock, and freeing a record from its injected handler would then deadlock before the
@@ -1713,6 +1732,14 @@ void dispatch_pending_guest_exception() {
     win_exc_trace(WinExcTraceKind::CoopExit, self, GetCurrentThreadId(),
                   captured.Rip, captured.Rsp);
     slot->state.store(WinCoopState::Idle, std::memory_order_release);
+#endif
+}
+
+uint32_t pending_guest_exception_count() {
+#ifdef _WIN32
+    return g_win_coop_queued.load(std::memory_order_acquire);
+#else
+    return 0;
 #endif
 }
 

@@ -1752,6 +1752,10 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     const bool is_bcn = fi.block_width > 1;
                     if (is_bcn && fi.snorm) continue;   // signed BCn (SNORM / BC6H SF16): decode not wired
                     const DecodedImageView view = image_base_level_view(d, fi);
+                    if (!view.supported) {
+                        warn_unsupported_image_view(d);
+                        continue;
+                    }
                     const uint32_t img_dim = image_type_to_dim(d.type);
                     {
                         bool mapped = false;
@@ -2064,7 +2068,11 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     if (mapped_fmt && fi.block_width > 1 && fi.snorm) continue;   // signed BCn: not wired
                     const DecodedImageView view = mapped_fmt
                         ? image_base_level_view(d, fi)
-                        : DecodedImageView{d.base, d.width, d.height, 0};
+                        : DecodedImageView{d.base, d.width, d.height, 0, d.base_level == 0};
+                    if (!view.supported) {
+                        warn_unsupported_image_view(d);
+                        continue;
+                    }
                     const ResourceClass wanted = u.is_store ? ResourceClass::StorageImage
                                                            : ResourceClass::Texture;
                     const DataFormat view_format = mapped_fmt ? fi.format : DataFormat::Unknown;

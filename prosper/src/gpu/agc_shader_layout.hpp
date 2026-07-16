@@ -168,9 +168,15 @@ struct DecodedImageView {
     uint64_t base = 0;
     uint32_t width = 0, height = 0;
     size_t mip_offset = 0;
+    // False when BASE_LEVEL selects a mip whose layout this helper cannot prove. Callers must reject
+    // the binding instead of silently sampling the allocation's base level with the wrong dimensions.
+    bool supported = true;
 };
 DecodedImageView image_base_level_view(const DecodedImageDescriptor& descriptor,
                                        const Gen5ImageFormatInfo& format);
+// Emit one diagnostic per unsupported layout signature. Callers use this immediately before
+// rejecting the binding; deduplication keeps per-draw resource rebuilds from flooding stderr.
+void warn_unsupported_image_view(const DecodedImageDescriptor& descriptor);
 // Map a T#'s 9-bit Gen5 IMG_FMT value to format info. Returns false (out left Unknown/zero) for
 // values not in the table — callers must not assume RGBA8 for those (#65). Pure; exposed for testing.
 bool gen5_image_format(uint32_t fmt, Gen5ImageFormatInfo* out);

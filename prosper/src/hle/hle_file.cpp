@@ -525,21 +525,34 @@ HLE(f_read)  { int fd = (int)a0; int64_t off = -1;
                // Windows validates the entire destination range before _read discovers a short EOF.
                // Guest allocators can leave later pages reserved for lazy commit, so Unity's normal
                // 64 KiB read from a small boot.config otherwise fails with EINVAL. Stage through
-               // committed host memory and copy only the bytes the file actually supplied.
+               // committed host memory and copy only the bytes the file actually supplied. For a
+               // seekable regular file, cap each chunk to the exact remaining bytes before validating
+               // the destination. For a non-seekable descriptor, validate the whole requested chunk
+               // first: no path may consume bytes that were not delivered to the guest.
                { size_t done = 0, cnt = (size_t)a2; char* b = (char*)P(a1);
                  constexpr size_t kBounceSize = 0x10000;
                  std::vector<char> bounce(cnt < kBounceSize ? cnt : kBounceSize);
                  while (done < cnt) {
                      size_t left = cnt - done;
                      unsigned want = (unsigned)(left < bounce.size() ? left : bounce.size());
-                     int r = ::read((int)a0, bounce.data(), want);
-                     if (r < 0) return logged_return(done ? (int64_t)done : (int64_t)-1);
-                     if (r == 0) break;   // EOF
+                     const __int64 pos = ::_lseeki64((int)a0, 0, SEEK_CUR);
+                     struct _stat64 st{};
+                     if (pos >= 0 && ::_fstat64((int)a0, &st) == 0 &&
+                         (st.st_mode & _S_IFMT) == _S_IFREG) {
+                         const uint64_t len = st.st_size > 0 ? (uint64_t)st.st_size : 0;
+                         const uint64_t remaining = (uint64_t)pos < len
+                             ? len - (uint64_t)pos : 0;
+                         if (!remaining) break;
+                         if (remaining < want) want = (unsigned)remaining;
+                     }
                      if (!windows_prepare_guest_write(
-                             (uint64_t)(uintptr_t)(b + done), (uint64_t)r)) {
+                             (uint64_t)(uintptr_t)(b + done), want)) {
                          errno = EFAULT;
                          return logged_return(done ? (int64_t)done : (int64_t)-1);
                      }
+                     int r = ::read((int)a0, bounce.data(), want);
+                     if (r < 0) return logged_return(done ? (int64_t)done : (int64_t)-1);
+                     if (r == 0) break;   // EOF
                      memcpy(b + done, bounce.data(), (size_t)r);
                      done += (size_t)r;
                  }

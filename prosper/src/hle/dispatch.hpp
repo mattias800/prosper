@@ -179,6 +179,9 @@ void trace_guest_thread_lifecycle(bool starting, uint64_t pthread_id, uint64_t n
 // Windows cooperative exception checkpoint used when a target was woken from a registered HLE wait.
 // Other hosts provide an empty implementation.
 void dispatch_pending_guest_exception();
+// Number of cooperatively queued Windows exceptions awaiting a target checkpoint (zero elsewhere).
+// Exposed for diagnostics and lifetime/withdrawal regression tests.
+uint32_t pending_guest_exception_count();
 void dump_guest_exception_trace();
 
 // Register the linked program's global export table (NID -> absolute guest address) so

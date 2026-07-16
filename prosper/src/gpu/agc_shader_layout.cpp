@@ -5,6 +5,8 @@
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <set>
 
 namespace prosper::gpu {
 
@@ -218,21 +220,55 @@ DecodedImageView image_base_level_view(const DecodedImageDescriptor& d,
     view.width = d.width;
     view.height = d.height;
     // The offset helper models only thin 2D allocations. Cube, 3D, array, and MSAA resources have
-    // additional slice/tail rules; preserve their conservative whole-allocation view.
-    if (d.type != 9) return view;
-    if (!fi.bytes_per_block || !fi.block_width || !fi.block_height) return view;
+    // additional slice/tail rules. Level zero still names their allocation base, but a non-zero view
+    // must be rejected until those rules are modeled; returning the base would sample the wrong mip.
+    if (d.type != 9) {
+        view.supported = d.base_level == 0;
+        return view;
+    }
+    if (!fi.bytes_per_block || !fi.block_width || !fi.block_height) {
+        view.supported = d.base_level == 0;
+        return view;
+    }
     const uint32_t element_width = (d.width + fi.block_width - 1) / fi.block_width;
     const uint32_t element_height = (d.height + fi.block_height - 1) / fi.block_height;
     view.mip_offset = tiled_mip_level_offset(element_width, element_height, fi.bytes_per_block,
                                               d.tile_mode, d.max_mip, d.base_level);
     // A zero offset is conclusive for level zero, but ambiguous for a non-zero level: linear chains
     // and levels packed inside the shared mip tail need layout-specific coordinates that this thin-2D
-    // helper intentionally does not guess. Preserve the old whole-resource view in those cases.
-    if (d.base_level && !view.mip_offset) return view;
+    // helper intentionally does not guess. Reject those views rather than binding a different mip.
+    if (d.base_level && !view.mip_offset) {
+        view.supported = false;
+        return view;
+    }
     view.width = std::max(d.width >> d.base_level, 1u);
     view.height = std::max(d.height >> d.base_level, 1u);
     view.base += view.mip_offset;
     return view;
+}
+
+void warn_unsupported_image_view(const DecodedImageDescriptor& d) {
+    const uint32_t signature = static_cast<uint32_t>(d.type) |
+                               (d.tile_mode << 8) |
+                               (static_cast<uint32_t>(d.base_level) << 16);
+    static std::mutex warning_mutex;
+    static std::set<uint32_t> warned;
+    static bool suppression_reported = false;
+    std::lock_guard lock(warning_mutex);
+    if (warned.find(signature) != warned.end()) return;
+    constexpr size_t kMaxUnsupportedViewWarnings = 16;
+    if (warned.size() >= kMaxUnsupportedViewWarnings) {
+        if (!suppression_reported) {
+            suppression_reported = true;
+            fprintf(stderr, "[t#] additional unsupported image-view layouts suppressed\n");
+        }
+        return;
+    }
+    warned.insert(signature);
+    fprintf(stderr,
+            "[t#] unsupported BASE_LEVEL %u for type=%u tile_mode=%u (%ux%u T#); "
+            "skipping image binding\n",
+            d.base_level, d.type, d.tile_mode, d.width, d.height);
 }
 
 uint32_t image_type_to_dim(uint8_t type) {
@@ -524,6 +560,10 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             }
             ShaderResource r;
             const DecodedImageView view = image_base_level_view(d, fi);
+            if (!view.supported) {
+                warn_unsupported_image_view(d);
+                continue;
+            }
             r.cls           = ResourceClass::Texture;
             r.format        = fi.format;
             r.num_components = fi.num_components;

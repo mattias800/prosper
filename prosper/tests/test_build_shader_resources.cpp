@@ -126,15 +126,14 @@ int main() {
         tmip_cube[3] = (tmip_cube[3] & ~(0xfu << 28)) | (11u << 28); // CUBE
         const DecodedImageDescriptor dmip_cube = decode_image_descriptor(tmip_cube);
         const DecodedImageView vmip_cube = image_base_level_view(dmip_cube, mip_format);
-        CHECK(vmip_cube.base == dmip_cube.base && vmip_cube.width == dmip_cube.width &&
-                  vmip_cube.height == dmip_cube.height && vmip_cube.mip_offset == 0,
-              "cube mip descriptor preserves the conservative whole-resource view");
+        CHECK(!vmip_cube.supported && vmip_cube.base == dmip_cube.base &&
+                  vmip_cube.mip_offset == 0,
+              "nonzero cube mip view is rejected until its slice/tail layout is modeled");
         tmip[3] &= ~(0x1fu << 20); // linear layout: offset is not modeled by the tiled helper
         const DecodedImageDescriptor dlinear = decode_image_descriptor(tmip);
         const DecodedImageView vlinear = image_base_level_view(dlinear, mip_format);
-        CHECK(vlinear.base == dlinear.base && vlinear.width == dlinear.width &&
-                  vlinear.height == dlinear.height && vlinear.mip_offset == 0,
-              "unmodeled linear base-level layout preserves the conservative whole-resource view");
+        CHECK(!vlinear.supported && vlinear.base == dlinear.base && vlinear.mip_offset == 0,
+              "unmodeled nonzero linear mip view is rejected instead of sampling level zero");
     }
 
     // A shifted thin-2D mip emits the selected extent and a matching backing span. Allocation-level
@@ -160,6 +159,11 @@ int main() {
         CHECK(mip && !mip->compression_enabled && !mip->write_compress_enabled &&
                   !mip->meta_pipe_aligned && mip->metadata_addr == 0,
               "shifted mip resource does not pair texels with unshifted DCC metadata");
+
+        sg[3] &= ~(0x1fu << 20); // same nonzero BASE_LEVEL, now an unsupported linear chain
+        const ShaderResourceTable unsupported = build_shader_resources(sh, sg, 8);
+        CHECK(!unsupported.by_sgpr_base(0),
+              "resource builder rejects an unmodeled nonzero mip view instead of binding level zero");
     }
 
     // --- AGC semantic metadata -> SPI_PS_INPUT_CNTL wiring ------------------------------------
