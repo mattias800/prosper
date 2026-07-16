@@ -477,12 +477,20 @@ HLE(f_read)  { int fd = (int)a0; int64_t off = -1;
 #else
                // Full sequential read (loop) — same full-count contract as read_full: a short ::read
                // would leave Unity's asset cache block partially filled and deserialize corrupt data.
+               // Windows validates the entire destination range before _read discovers a short EOF.
+               // Guest allocators can leave later pages reserved for lazy commit, so Unity's normal
+               // 64 KiB read from a small boot.config otherwise fails with EINVAL. Stage through
+               // committed host memory and copy only the bytes the file actually supplied.
                { size_t done = 0, cnt = (size_t)a2; char* b = (char*)P(a1);
+                 constexpr size_t kBounceSize = 0x10000;
+                 std::vector<char> bounce(cnt < kBounceSize ? cnt : kBounceSize);
                  while (done < cnt) {
-                     unsigned want = (cnt - done) > 0x40000000u ? 0x40000000u : (unsigned)(cnt - done);
-                     int r = ::read((int)a0, b + done, want);
+                     size_t left = cnt - done;
+                     unsigned want = (unsigned)(left < bounce.size() ? left : bounce.size());
+                     int r = ::read((int)a0, bounce.data(), want);
                      if (r < 0) return logged_return(done ? (int64_t)done : (int64_t)-1);
                      if (r == 0) break;   // EOF
+                     memcpy(b + done, bounce.data(), (size_t)r);
                      done += (size_t)r;
                  }
                  return logged_return((int64_t)done); }
