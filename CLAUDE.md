@@ -289,6 +289,104 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   live renderer, `PROSPER_GFXLOG=1` for graphics diagnostics.
 - **Correctness-first:** implement real behavior (cross-checked against the Kyty PS5-emulator reference in
   `../Kyty`), not shims that fake output. Mark genuinely-uncertain code with `CONFIDENCE: HIGH/MED/LOW`.
+- **Independent review is a mandatory merge gate for every PR containing agent work.** This applies whenever
+  the current PR head contains changes designed, debugged, authored, co-authored, implemented, or materially
+  modified by an agent, regardless of who opened the branch or PR. An agent taking over an existing PR must
+  arrange the same review before merging. The implementing agent must never merge immediately after coding,
+  even when its tests pass. Once the implementation and author-side verification are ready, push the branch,
+  open or update the PR, and spawn a fresh, independent code-review sub-agent. Correctness is priority 1;
+  style and convenience never outweigh behavioral correctness.
+  - Before requesting review, make the PR description self-contained: link the issue/goal; explain the failure
+    scenario and violated contract; describe the approach and important invariants; identify affected and
+    deliberately unaffected behavior; list risks, uncertainty, and compatibility concerns; and give exact
+    author-side build/test/snapshot commands and results. A reviewer should not need private chat context.
+  - Reviewer independence covers participation in producing the entire implementation under review: the
+    reviewer must not have privately designed/debugged the solution with the author, authored or edited the
+    patch, committed any part of it, or otherwise materially co-produced it. Spawn it with fresh context,
+    without the author's private implementation/debugging transcript; give it only the PR number and the neutral
+    brief below. The reviewer uses its own worktree and must not modify the PR branch or implement fixes. Normal
+    review work—identifying a failure, stating the required behavioral contract, suggesting possible remediation,
+    requesting regression coverage, and evaluating the author's fix or rebuttal—does not itself make the
+    reviewer a contributor. The author remains responsible for designing and implementing the patch. If the
+    reviewer supplies or edits the implementation or materially co-designs the final patch, it is disqualified
+    from approving that head and a different independent reviewer must perform the complete review. The author
+    may identify known risks and required checks on the PR, but not an expected conclusion.
+  - Direct author/reviewer communication is limited to coordination such as `review requested` and
+    `review posted`. Put all substantive context, questions, findings, replies, verification evidence, finding
+    dispositions, and verdicts on the PR as comments so the complete decision trail is durable and traceable.
+    Sign reviewer comments with one stable reviewer name.
+  - The reviewer resolves the live base repository and full target ref from the PR, fetches that target ref
+    directly, and records its identity and full SHA. Do not trust cached PR `base.sha`/`baseRefOid` metadata or a
+    synthetic PR merge ref as the authoritative target tip. Resolve and fetch the head repository/ref directly
+    too. Then read this file, every applicable `AGENTS.md`, the PR description and linked issue, the relevant
+    architecture/status docs, the complete base-to-head diff, all PR discussion, and the affected callers and
+    data paths. Inspect the prospective integration with that exact base and record its resulting tree SHA rather
+    than reviewing changed lines in isolation.
+  - The review must be adversarial and evidence-based. Check assumptions, invariants, ABI/API contracts,
+    ownership and lifetimes, concurrency and ordering, bounds/overflow, error and cleanup paths, malformed
+    inputs, platform differences, compatibility with old captures/state, and whether diagnostics themselves
+    are race-safe and truthful. Inspect tests for meaningful failure coverage; passing tests are evidence, not
+    proof. For renderer/recompiler/detile/present changes, the mandatory snapshot gate remains part of review.
+  - The reviewer runs the strongest relevant focused builds/tests and required integration or snapshot checks.
+    Every applicable required check must be present, completed, and successful before merge. Only an explicit,
+    task-specific maintainer instruction may waive waiting for named CI checks (for example, on a docs-only
+    change), and the authorization and exact skipped checks must be recorded on the PR. Such an exception never
+    waives mandatory local, integration, or snapshot verification. If any other required check cannot run, the
+    reviewer posts the exact blocker and does not approve. It posts every finding on the PR with severity, exact
+    location, a concrete failing scenario, the violated contract, and the expected fix or regression test. New
+    regressions in the PR are blockers; pre-existing or out-of-scope bugs follow the issue-tracking rules below.
+  - The author addresses every finding on the PR by either pushing a fix with appropriate regression coverage
+    or posting a concrete, evidence-based rebuttal. Correctness outranks reviewer authority: never implement a
+    harmful request merely to obtain approval. The reviewer must explicitly accept the fix or withdraw/accept
+    the rebuttal; otherwise the finding remains open and approval is withheld. The same reviewer then re-reads
+    the complete updated diff and re-runs affected verification. If unavailable, a replacement independent
+    reviewer must read the whole review record and perform the same full review.
+  - Continue until the reviewer explicitly posts either
+    `APPROVED FOR MERGE <head-repo>:<head-ref>@<head-SHA> into <base-repo>:<base-ref>@<base-SHA> with tree <tree-SHA>`
+    or `NOT APPROVED`, with remaining concerns. Any commit or force-push that changes the head—including docs,
+    tests, workflows, fixtures, assets, generated files, or configuration—invalidates approval and requires a
+    complete current-head verdict. A changed head/base repository or ref also invalidates approval. If the base
+    tip moves, the reviewer must inspect the new base delta and prospective integration, re-run affected checks,
+    and approve the new identities, SHAs, and integration tree.
+  - The final merge must atomically preserve every reviewed input. Prefer a repository merge queue/ruleset that
+    verifies the exact approved head, target, base, and integration. Otherwise, only a same-repository PR may use
+    the direct-push fallback below; cross-repository PRs stop for a capable server-side mechanism or maintainer
+    direction. Once exact approval and separate merge authorization both exist, post the complete approved tuple
+    as a `MERGE TRANSACTION` PR comment. That freezes the approved target for this transaction: agents must not
+    push/retarget it, a later PR UI retarget cannot redirect the hard-coded destination, and only an explicit
+    maintainer cancellation revokes the authorized transaction. Abort if a head/target change is observed before
+    the push; any new proposal needs its own review.
+  - For the same-repository fallback, create a merge commit whose first parent is the approved base SHA, second
+    parent is the approved head SHA, and tree is the approved integration tree; verify all three locally. In one
+    server-side atomic push, advance both the exact target ref and exact PR head ref to that merge commit with
+    explicit expected-old-OID leases for the approved base and head, for example:
+    `git push --atomic --force-with-lease=<base-ref>:<base-SHA> --force-with-lease=<head-ref>:<head-SHA> origin`
+    `<merge-commit>:<base-ref> <merge-commit>:<head-ref>`. The merge object fixes the reviewed content and target;
+    the two leases make concurrent base or head movement reject the entire transaction. The head's atomic advance
+    to the approved merge commit is part of the merge and does not invalidate approval. If either lease fails or
+    the server cannot perform the atomic push, never override/retry it or fall back to a plain merge: fetch the
+    live state and obtain a new review or maintainer direction. A normal `gh pr merge` head-only guard is not
+    sufficient for this multi-agent repository.
+  - Never merge with an unresolved correctness finding; an applicable required check that is absent, pending,
+    or unsuccessful; an unrecorded/overbroad verification exception; approval for different repository/ref/SHA
+    identities or integration tree; or a merge mechanism that cannot atomically preserve all approved inputs.
+    Reviewer approval satisfies the quality gate but is not permission to merge: the agent may merge only when
+    the user/task separately authorizes it.
+
+  Use this minimum review brief when spawning the sub-agent:
+  ```text
+  Independently review PR #<N> under the mandatory review policy in CLAUDE.md. Begin with fresh context; do not
+  modify the PR branch or implement fixes. Treat the PR description and comments as the complete coordination
+  record. Resolve the live head and base repository/refs, fetch both directly, and record their full SHAs; do not
+  rely on cached PR base metadata or a synthetic merge ref. Inspect the full diff, affected callers, invariants,
+  and prospective integration, and record its tree SHA. Run the strongest applicable verification, including
+  mandatory snapshot checks. Post every finding, question, test result, disposition, and final verdict on the
+  PR, signed with a stable reviewer name; include severity, exact location, concrete failure scenario, required
+  fix, and evidence. Do not approve while any correctness concern or required check remains. After any update,
+  review the complete new head. Post either APPROVED FOR MERGE <head-repo>:<head-ref>@<head-SHA> into
+  <base-repo>:<base-ref>@<base-SHA> with tree <tree-SHA> or NOT APPROVED. Directly message the author only to say
+  that the posted review is complete.
+  ```
 - **Kyty is a reference, NOT an oracle — and its reliability is split by platform generation.**
   Kyty CAN run PS4 games, so the PS4-inherited surface (libkernel, pthreads, equeue, VideoOut,
   filesystem, GNM-era graphics concepts) is exercised by real titles and is solid evidence — PS5
