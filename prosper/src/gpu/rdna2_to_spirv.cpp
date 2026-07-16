@@ -3037,18 +3037,28 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (in.src[1].kind != OperandKind::InlineInt || in.src[1].value < 0 || in.src[1].value > 63) {
                     ok = false; return true;
                 }
+                auto vit = rs.vgpr_lane_slots.find(in.src[0].value);
                 auto mit = rs.vgpr_lane_mask_slots.find(in.src[0].value);
                 if (mit != rs.vgpr_lane_mask_slots.end()) {
                     auto sit = mit->second.find(in.src[1].value);
                     if (sit != mit->second.end()) {
                         rs.sreg_bool[in.dst.value] = sit->second;
                         rs.sreg_bool_narrowed[in.dst.value] = true;
-                        rs.sreg.erase(in.dst.value);
+                        // The compute CFG dispatcher can persist a physical spill lane that is
+                        // recycled between scalar-data and wave-mask lifetimes. It exposes both
+                        // views after a block join; keep both destination domains when present so
+                        // the statically typed consumer selects the representation it needs.
+                        if (vit != rs.vgpr_lane_slots.end()) {
+                            auto data = vit->second.find(in.src[1].value);
+                            if (data != vit->second.end()) rs.sreg[in.dst.value] = data->second;
+                            else rs.sreg.erase(in.dst.value);
+                        } else {
+                            rs.sreg.erase(in.dst.value);
+                        }
                         rs.sreg_srt.erase(in.dst.value);
                         return true;
                     }
                 }
-                auto vit = rs.vgpr_lane_slots.find(in.src[0].value);
                 if (vit == rs.vgpr_lane_slots.end()) { ok = false; return true; }   // not a spill array
                 auto sit = vit->second.find(in.src[1].value);
                 if (sit == vit->second.end()) { ok = false; return true; }          // slot never written
@@ -4353,11 +4363,9 @@ bool emit_compute_cfg_state_machine(
         for (const auto& slot : vg.second) lane_slots.emplace(vg.first, slot.first);
     for (const auto& vg : initial.vgpr_lane_mask_slots)
         for (const auto& slot : vg.second) mask_lane_slots.emplace(vg.first, slot.first);
-    // The dispatcher has separate persisted value domains for scalar data and lane masks. If one
-    // physical spill slot changes domain across paths, rejecting is safer than reloading both and
-    // letting v_readlane choose an arbitrary representation.
-    for (const auto& slot : lane_slots)
-        if (mask_lane_slots.count(slot)) return false;
+    // A physical spill lane may be recycled between scalar-data and wave-mask lifetimes. Persist
+    // both domains across dispatcher blocks; v_readlane retains both destination views when both
+    // are present, and the statically typed consumer selects the representation it needs.
 
     uint32_t ptr_u32 = 0, ptr_bool = 0;
     std::map<int, uint32_t> vv, sv, mv;

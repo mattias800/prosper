@@ -82,6 +82,26 @@ int main() {
                           sizeof(compute_cfg_dispatch)/sizeof(compute_cfg_dispatch[0]), 0, 0,
                           &dispatch_rt).empty(),
           "a nested varying-VCC compute CFG preserves spilled EXEC and lowers through the dispatcher");
+    // UE4 also recycles a physical v_writelane slot: first as ordinary scalar data, then as an
+    // EXEC-mask spill. Force a dispatcher block boundary after each lifetime so both typed views
+    // must survive the Function-variable state round trip. Consumers remain statically typed.
+    const uint32_t compute_cfg_dispatch_recycled_lane[] = {
+        0xBE800381u, 0x7E000280u, 0x7E020300u,
+        0xD7610013u, 0x00014A00u, 0xBF820000u,       // v19[37] = s0; next block
+        0xD7600002u, 0x00014B13u,                   // s2 = v19[37] (data view)
+        0xD7610013u, 0x00014A7Eu, 0xD7610013u, 0x0001507Fu,
+        0xBF820000u,                                // v19[37:40] = EXEC; next block
+        0xD760000Eu, 0x00014B13u, 0xD760000Fu, 0x00015113u, 0xBEFE040Eu,
+        0xE00C2000u, 0x80020400u, 0x7DB900F9u, 0x86050007u,
+        0x7D020200u, 0xBF860006u, 0xBF0A8204u, 0x360000FDu, 0xBF840001u,
+        0x81008100u, 0x81008100u, 0xBF82FFF4u,
+        0xBF810000u,
+    };
+    CHECK(!recompile_valu(compute_cfg_dispatch_recycled_lane,
+                          sizeof(compute_cfg_dispatch_recycled_lane) /
+                              sizeof(compute_cfg_dispatch_recycled_lane[0]),
+                          0, 0, &dispatch_rt).empty(),
+          "the compute CFG dispatcher preserves a recycled scalar/mask spill lane");
     // Ordinary LDS effects do not require workgroup-uniform control flow. Keep the same dispatcher
     // shape, but make the inner SCC arm conditionally execute a ds_write_b32 before the back-edge.
     // (A barrier remains forbidden below; only the blanket rejection of raw DS is being relaxed.)
