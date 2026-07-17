@@ -2288,7 +2288,7 @@ BootResult run_entry(const LoadedImage& img) {
     arm_bp();     // write the PROSPER_BP int3 now that the guest image is fully mapped
     arm_hwbp();   // open the PROSPER_HWBP hardware breakpoint on this (guest main) thread
     if (sigsetjmp(g_jb, 1) == 0) {
-        // gated (PROSPER_GUEST_FS): switch %fs to a guest TCB as the LAST host action before entering the
+        // Switch %fs to a guest TCB as the LAST host action before entering the
         // guest — any host C++ after this point would run on the guest TCB. Import stubs swap back per-call.
         guest_tls_activate_thread();
         register uint64_t e  asm("rax") = img.entry;

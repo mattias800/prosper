@@ -196,7 +196,12 @@ DecodedImageDescriptor decode_image_descriptor(const uint32_t t[8]) {
     d.last_level = (t[3] >> 16) & 0xFu;
     d.max_mip    = (t[5] >> 4) & 0xFu;
     d.type      = (uint8_t)((t[3] >> 28) & 0xFu);                                                  // Type
-    d.depth     = d.type == 10 ? ((t[4] & 0x1FFFu) + 1u) : 1u;                                     // DEPTH (3D)
+    // WORD4.DEPTH is depth-1 for 3D and layer-count-1 for array resources. On
+    // ordinary 1D/2D descriptors the same bits may carry pitch state, so do not
+    // interpret them as a layer count there.
+    const bool depth_or_array = d.type == 10 || d.type == 12 || d.type == 13 || d.type == 15;
+    d.depth      = depth_or_array ? ((t[4] & 0x1FFFu) + 1u) : 1u;
+    d.base_array = (t[4] >> 16) & 0x1FFFu;
     d.dst_sel[0] = (uint8_t)((t[3] >> 0) & 0x7u);   // DST_SEL_X (WORD3 [2:0])
     d.dst_sel[1] = (uint8_t)((t[3] >> 3) & 0x7u);   // DST_SEL_Y ([5:3])
     d.dst_sel[2] = (uint8_t)((t[3] >> 6) & 0x7u);   // DST_SEL_Z ([8:6])
@@ -232,25 +237,46 @@ DecodedImageView image_base_level_view(const DecodedImageDescriptor& d,
     }
     const uint32_t element_width = (d.width + fi.block_width - 1) / fi.block_width;
     const uint32_t element_height = (d.height + fi.block_height - 1) / fi.block_height;
-    view.mip_offset = tiled_mip_level_offset(element_width, element_height, fi.bytes_per_block,
-                                              d.tile_mode, d.max_mip, d.base_level);
-    // A zero offset is conclusive for level zero, but ambiguous for a non-zero level: linear chains
-    // and levels packed inside the shared mip tail need layout-specific coordinates that this thin-2D
-    // helper intentionally does not guess. Reject those views rather than binding a different mip.
-    if (d.base_level && !view.mip_offset) {
+    // The public RDNA2 definition says MAX_MIP is the allocation's final mip, but live PS5 AGC
+    // emits a narrowly different storage-view encoding for the final pyramid level: BASE=LAST and
+    // MAX_MIP=BASE-1 (Astro: 1920x1080, BASE/LAST=6, MAX_MIP=5). Hardware accepts that descriptor.
+    // Extend only this exact one-level PS5 form; broader contradictory ranges remain rejected.
+    uint32_t effective_max_mip = d.max_mip;
+    if (d.max_mip != 0 && d.base_level == d.last_level &&
+        d.base_level == static_cast<uint32_t>(d.max_mip) + 1u)
+        effective_max_mip = d.base_level;
+    const TiledMipLevelLayout layout = tiled_mip_level_layout(
+        element_width, element_height, fi.bytes_per_block, d.tile_mode,
+        effective_max_mip, d.base_level);
+    // Linear mip chains and invalid tiled descriptors have no proven placement. A tiled level whose
+    // byte origin is zero can still be valid (the final packed-tail mip), hence the explicit status.
+    if (!layout.supported) {
+        view.supported = d.base_level == 0;
+        return view;
+    }
+    view.mip_offset = layout.byte_offset;
+    view.in_mip_tail = layout.in_tail;
+    view.mip_tail_bytes = layout.tail_block_bytes;
+    view.mip_tail_x = layout.tail_x;
+    view.mip_tail_y = layout.tail_y;
+    if (d.base_level && !effective_max_mip) {
         view.supported = false;
         return view;
     }
     view.width = std::max(d.width >> d.base_level, 1u);
     view.height = std::max(d.height >> d.base_level, 1u);
-    view.base += view.mip_offset;
+    // Non-tail mips own a disjoint byte range. Tail levels share the allocation's first block, so
+    // shifting the guest pointer would lose sibling-preserving writeback and overstate readability.
+    if (!view.in_mip_tail) view.base += view.mip_offset;
     return view;
 }
 
 void warn_unsupported_image_view(const DecodedImageDescriptor& d) {
     const uint32_t signature = static_cast<uint32_t>(d.type) |
                                (d.tile_mode << 8) |
-                               (static_cast<uint32_t>(d.base_level) << 16);
+                               (static_cast<uint32_t>(d.base_level) << 16) |
+                               (static_cast<uint32_t>(d.last_level) << 20) |
+                               (static_cast<uint32_t>(d.max_mip) << 24);
     static std::mutex warning_mutex;
     static std::set<uint32_t> warned;
     static bool suppression_reported = false;
@@ -266,9 +292,11 @@ void warn_unsupported_image_view(const DecodedImageDescriptor& d) {
     }
     warned.insert(signature);
     fprintf(stderr,
-            "[t#] unsupported BASE_LEVEL %u for type=%u tile_mode=%u (%ux%u T#); "
+            "[t#] unsupported BASE_LEVEL %u (last=%u max_mip=%u) for type=%u tile_mode=%u "
+            "fmt=%u (%ux%u T#); "
             "skipping image binding\n",
-            d.base_level, d.type, d.tile_mode, d.width, d.height);
+            d.base_level, d.last_level, d.max_mip, d.type, d.tile_mode, d.format,
+            d.width, d.height);
 }
 
 uint32_t image_type_to_dim(uint8_t type) {
@@ -573,11 +601,17 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             r.height        = view.height;
             r.depth         = d.depth;
             r.tile_mode     = d.tile_mode;          // so the renderer can auto-detile a GPU-tiled surface
+            r.in_mip_tail   = view.in_mip_tail;
+            r.mip_tail_offset = view.in_mip_tail
+                ? static_cast<uint32_t>(view.mip_offset) : 0;
+            r.mip_tail_bytes = view.mip_tail_bytes;
+            r.mip_tail_x = view.mip_tail_x;
+            r.mip_tail_y = view.mip_tail_y;
             r.max_uncompressed_block_size = d.max_uncompressed_block_size;
             r.max_compressed_block_size = d.max_compressed_block_size;
             // DCC metadata has its own per-mip layout. Until that offset is proven, a shifted texel
             // view must not be paired with the allocation-level metadata base for another mip.
-            const bool shifted_view = view.mip_offset != 0;
+            const bool shifted_view = view.mip_offset != 0 || view.in_mip_tail;
             r.meta_pipe_aligned = shifted_view ? false : d.meta_pipe_aligned;
             r.write_compress_enabled = shifted_view ? false : d.write_compress_enabled;
             r.compression_enabled = shifted_view ? false : d.compression_enabled;

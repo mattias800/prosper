@@ -116,6 +116,42 @@ int main() {
           captured.operations[0].source_index == 7 && captured.operations[0].realized,
           "capture indexes unique shaders and retains operation provenance");
 
+    // v15: a packed mip-tail view captures the shared macroblock and retains both AddrLib origins.
+    std::vector<uint8_t> tail_memory(65536, 0x6d);
+    auto tail_reader = [&](uint64_t addr, uint8_t* dst, size_t n) -> size_t {
+        if (addr < 0x900000 || addr >= 0x900000 + tail_memory.size()) return 0;
+        const size_t offset = static_cast<size_t>(addr - 0x900000);
+        const size_t take = std::min(n, tail_memory.size() - offset);
+        std::memcpy(dst, tail_memory.data() + offset, take);
+        return take;
+    };
+    ShaderResource tail_resource{};
+    tail_resource.cls = ResourceClass::Texture; tail_resource.binding = 3;
+    tail_resource.gpu_addr = 0x900000; tail_resource.size = 60 * 33 * 4;
+    tail_resource.format = DataFormat::Uint32; tail_resource.num_components = 1;
+    tail_resource.width = 60; tail_resource.height = 33;
+    tail_resource.tile_mode = static_cast<uint32_t>(TileMode::Sw64KbRX);
+    tail_resource.in_mip_tail = true; tail_resource.mip_tail_offset = 32768;
+    tail_resource.mip_tail_bytes = 65536; tail_resource.mip_tail_x = 64;
+    tail_resource.mip_tail_y = 0;
+    auto tail_table = std::make_shared<ShaderResourceTable>();
+    tail_table->resources = {tail_resource};
+    DrawItem tail_draw = draw; tail_draw.vrt = tail_table;
+    GpuCaptureFile tail_capture;
+    CHECK(capture_draw_items({tail_draw}, meta, tail_reader, tail_capture, error) &&
+              tail_capture.blobs.size() == 1 && tail_capture.blobs[0].bytes.size() == 65536,
+          "packed mip-tail capture owns the complete shared 64 KiB macroblock");
+    std::vector<uint8_t> tail_bytes;
+    GpuCaptureFile tail_loaded;
+    CHECK(serialize_gpu_capture(tail_capture, tail_bytes, error) &&
+              deserialize_gpu_capture(tail_bytes, tail_loaded, error) &&
+              tail_loaded.draws[0].vrt.resources[0].resource.in_mip_tail &&
+              tail_loaded.draws[0].vrt.resources[0].resource.mip_tail_offset == 32768 &&
+              tail_loaded.draws[0].vrt.resources[0].resource.mip_tail_bytes == 65536 &&
+              tail_loaded.draws[0].vrt.resources[0].resource.mip_tail_x == 64 &&
+              tail_loaded.draws[0].vrt.resources[0].resource.mip_tail_y == 0,
+          "v15 capture round-trips packed-tail byte and coordinate placement exactly");
+
     auto large_table = std::make_shared<ShaderResourceTable>();
     ShaderResource large_resource = a;
     large_resource.size = 2u << 20;
@@ -213,6 +249,8 @@ int main() {
           "writer rejects an out-of-bounds DCC metadata reference");
     CHECK(serialize_gpu_capture(volume_capture, volume_bytes, error),
           "recreated valid v12 DCC bytes after malformed-reference check");
+    volume_bytes.resize(volume_bytes.size() - 21); // v15 count plus one 17-byte mip-tail state
+    volume_bytes.resize(volume_bytes.size() - 5); // v14 count plus one depth-compare flag
     volume_bytes.resize(volume_bytes.size() - 24); // v12 count plus one 20-byte reference
     volume_bytes[8] = 11; volume_bytes[9] = volume_bytes[10] = volume_bytes[11] = 0;
     CHECK(deserialize_gpu_capture(volume_bytes, volume_loaded, error) &&
@@ -477,10 +515,14 @@ int main() {
     GpuCaptureFile legacy_source = captured; legacy_source.ds_seeds.clear();
     std::vector<uint8_t> legacy_bytes;
     CHECK(serialize_gpu_capture(legacy_source, legacy_bytes, error) && legacy_bytes.size() >= 28,
-          "created a diagnostic-free v13 payload for legacy-reader fixtures");
+          "created a diagnostic-free v15 payload for legacy-reader fixtures");
     if (legacy_bytes.size() >= 28) {
         const size_t legacy_resource_count = legacy_source.draws[0].vrt.resources.size() +
                                              legacy_source.draws[0].prt.resources.size();
+        // Remove the v15 mip-tail tail: count + one 17-byte state per resource.
+        legacy_bytes.resize(legacy_bytes.size() - (4 + 17 * legacy_resource_count));
+        // Remove the v14 depth-compare tail: count + one flag per resource.
+        legacy_bytes.resize(legacy_bytes.size() - (4 + legacy_resource_count));
         // Remove the v12 DCC metadata-reference tail: count + 20-byte reference per resource.
         legacy_bytes.resize(legacy_bytes.size() - (4 + 20 * legacy_resource_count));
         // Remove the v11 DCC tail: count + 17-byte state record per resource.
@@ -520,9 +562,9 @@ int main() {
     CHECK(deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
           !legacy_loaded.failure_diagnostics_available && legacy_loaded.failure_diagnostics.empty(),
           "v6 capture reopens with failed-operation diagnostics reported unavailable");
-    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 14;
+    if (legacy_bytes.size() >= 12) legacy_bytes[8] = 16;
     CHECK(!deserialize_gpu_capture(legacy_bytes, legacy_loaded, error) &&
-          error == "unsupported capture version 14",
+          error == "unsupported capture version 16",
           "future capture versions fail with a concrete version error");
 
     GpuCaptureFile bad_hash = mixed;
@@ -575,6 +617,21 @@ int main() {
           exported_ds[0].depth_read_base == 0x710000 &&
           exported_ds[1].depth_read_base == 0xa10000,
           "registered DS snapshot reader validates and sorts the complete live cache");
+    GpuCaptureFile referenced_ds_capture;
+    referenced_ds_capture.draws.resize(1);
+    referenced_ds_capture.draws[0].color0_width = 2;
+    referenced_ds_capture.draws[0].color0_height = 2;
+    referenced_ds_capture.draws[0].ps.depth_test_enable = true;
+    referenced_ds_capture.draws[0].ps.depth_read_base = 0xa10000;
+    referenced_ds_capture.draws[0].ps.depth_write_base = 0xa10000;
+    referenced_ds_capture.draws[0].ps.stencil_read_base = ds_seed.stencil_read_base;
+    referenced_ds_capture.draws[0].ps.stencil_write_base = ds_seed.stencil_write_base;
+    referenced_ds_capture.draws[0].ps.htile_data_base = ds_seed.htile_data_base;
+    CHECK(gpu_capture_ds_seed_snapshot_available() &&
+          capture_referenced_gpu_ds_seeds(referenced_ds_capture, error) &&
+          referenced_ds_capture.ds_seeds.size() == 1 &&
+          referenced_ds_capture.ds_seeds[0].depth_read_base == 0xa10000,
+          "standalone capture retains only the exact referenced live DS checkpoint");
     GpuCaptureDsSeed restored_ds;
     set_gpu_replay_ds_seed_writer([&](const GpuCaptureDsSeed& seed, std::string&) {
         restored_ds = seed; return true;

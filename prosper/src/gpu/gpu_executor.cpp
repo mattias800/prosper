@@ -1255,14 +1255,30 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             from_seed = true;
                         }
                     }
-                    if (trc) fprintf(stderr, "[dyntrace] MIMG pc=%u srsrc=s%d ssamp=s%d have_t8=%d seed_t8=%d key=0x%x t8[0]=0x%x\n",
-                                     in.pc, tbase, samp_base, have_t8, from_seed,
-                                     tkey, t8 ? (*t8)[0] : 0u);
+                    if (trc) {
+                        fprintf(stderr, "[dyntrace] MIMG pc=%u op=0x%x srsrc=s%d ssamp=s%d "
+                                        "have_t8=%d seed_t8=%d key=0x%x t8=",
+                                in.pc, in.opcode, tbase, samp_base, have_t8, from_seed, tkey);
+                        if (t8) {
+                            for (uint32_t word : *t8) fprintf(stderr, "%08x ", word);
+                            const DecodedImageDescriptor td = decode_image_descriptor(t8->data());
+                            fprintf(stderr,
+                                    "-> base=0x%llx %ux%ux%u type=%u fmt=%u tile=%u mip=%u:%u",
+                                    (unsigned long long)td.base, td.width, td.height, td.depth,
+                                    td.type, td.format, td.tile_mode, td.base_level, td.max_mip);
+                        } else {
+                            fprintf(stderr, "<unknown>");
+                        }
+                        fputc('\n', stderr);
+                    }
                     if (t8) {
                         SrtUse u; u.kind = 0; u.t8 = *t8;
                         u.key = tkey;
                         u.use_pc = in.pc;
                         u.is_store = in.opcode == 0x08;   // image_store: a STORAGE-image use (#590)
+                        u.is_depth_compare = (in.opcode >= 0x28 && in.opcode <= 0x2f) ||
+                                             (in.opcode >= 0x38 && in.opcode <= 0x3f) ||
+                                             (in.opcode >= 0x58 && in.opcode <= 0x5f);
                         if (valid_reg(samp_base) && descr_known.test((size_t)samp_base)) {
                             u.has_samp = true;
                             u.s4 = descr[(size_t)samp_base];
@@ -1285,7 +1301,10 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                 // a keyed table slot. Report it as a kind-1 (buffer) use so the consuming instruction
                 // resolves via its sreg_srt tag -> by_srt_offset — the same key model the s_buffer_loads
                 // use. (The VS vertex-fetch path below is unchanged: by_fetch_pc still wins there.)
-                if (srt_uses && (in.opcode <= 3 || (in.opcode >= 0x0C && in.opcode <= 0x0F))) {
+                const bool raw_buffer_use =
+                    (in.opcode >= 0x08 && in.opcode <= 0x0F) ||
+                    (in.opcode >= 0x1C && in.opcode <= 0x1E);
+                if (srt_uses && (in.opcode <= 3 || raw_buffer_use)) {
                     int srsrc = in.src[1].value;
                     if (valid_reg(srsrc) && descr_known.test((size_t)srsrc)) {
                         // Key-less snapshots (an s_buffer_load-fetched V# — a structured-buffer
@@ -1297,7 +1316,7 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                             ? descr_key[(size_t)srsrc] : 0xFFFFFFFFu;
                         u.use_pc = in.pc;
                         srt_uses->push_back(u);
-                    } else if (in.opcode >= 0x0C && untouched_seed_range(srsrc, 4)) {
+                    } else if (raw_buffer_use && untouched_seed_range(srsrc, 4)) {
                         // Direct RAW V#: an untyped MUBUF can consume a V# placed in the initial
                         // user-data SGPRs without any preceding s_load. This is not a vertex-format
                         // fetch, so the dyn_vb path below never reports it. Preserve the exact V# as
@@ -1559,7 +1578,8 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
         }
         for (uint32_t base : bases) {
             uint32_t sgprs[kUserSgprs]; read_user_sgprs(st.sh, base, sgprs);
-            fprintf(stderr, "[resdump]   sgprs@0x%x:", base);
+            fprintf(stderr, "[resdump] %s code=0x%llx sgprs@0x%x:",
+                    is_ps ? "PS" : "VS", (unsigned long long)code_addr, base);
             for (uint32_t i = 0; i < kUserSgprs; i++) fprintf(stderr, " %08x", sgprs[i]);
             fprintf(stderr, "\n");
         }
@@ -1762,7 +1782,12 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                         for (auto& r0 : t.resources)
                             if (r0.cls == ResourceClass::Texture && r0.gpu_addr == view.base &&
                                 r0.width == view.width && r0.height == view.height &&
-                                r0.depth == d.depth && r0.format == fi.format && r0.img_dim == img_dim) {
+                                r0.depth == d.depth && r0.format == fi.format && r0.img_dim == img_dim &&
+                                r0.depth_compare == u.is_depth_compare &&
+                                r0.in_mip_tail == view.in_mip_tail &&
+                                r0.mip_tail_offset == (view.in_mip_tail ? view.mip_offset : 0) &&
+                                r0.mip_tail_x == view.mip_tail_x &&
+                                r0.mip_tail_y == view.mip_tail_y) {
                                 if (r0.fetch_pc == 0xFFFFFFFFu) { r0.fetch_pc = u.use_pc; mapped = true; break; }
                                 if (r0.fetch_pc == u.use_pc)    { mapped = true; break; }
                             }
@@ -1773,9 +1798,15 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     r.format = fi.format; r.num_components = fi.num_components;
                     r.gpu_addr = view.base; r.width = view.width; r.height = view.height; r.depth = d.depth;
                     r.tile_mode = d.tile_mode; r.srgb = fi.srgb;
+                    r.in_mip_tail = view.in_mip_tail;
+                    r.mip_tail_offset = view.in_mip_tail
+                        ? static_cast<uint32_t>(view.mip_offset) : 0;
+                    r.mip_tail_bytes = view.mip_tail_bytes;
+                    r.mip_tail_x = view.mip_tail_x;
+                    r.mip_tail_y = view.mip_tail_y;
                     r.max_uncompressed_block_size = d.max_uncompressed_block_size;
                     r.max_compressed_block_size = d.max_compressed_block_size;
-                    const bool shifted_view = view.mip_offset != 0;
+                    const bool shifted_view = view.mip_offset != 0 || view.in_mip_tail;
                     r.meta_pipe_aligned = shifted_view ? false : d.meta_pipe_aligned;
                     r.write_compress_enabled = shifted_view ? false : d.write_compress_enabled;
                     r.compression_enabled = shifted_view ? false : d.compression_enabled;
@@ -1785,6 +1816,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                     // T# TYPE -> MIMG dim (GFX10: 9=2D, 10=3D, 11=CUBE, 13=2D_ARRAY); a cube
                     // uploads as six vertically-stacked faces (#273 — see agc_shader_layout).
                     r.img_dim = img_dim;
+                    r.depth_compare = u.is_depth_compare;
                     r.swizzle[0] = d.dst_sel[0]; r.swizzle[1] = d.dst_sel[1];
                     r.swizzle[2] = d.dst_sel[2]; r.swizzle[3] = d.dst_sel[3];
                     const uint64_t backing_bytes = is_bcn
@@ -2084,7 +2116,8 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     if (mapped_fmt && fi.block_width > 1 && fi.snorm) continue;   // signed BCn: not wired
                     const DecodedImageView view = mapped_fmt
                         ? image_base_level_view(d, fi)
-                        : DecodedImageView{d.base, d.width, d.height, 0, d.base_level == 0};
+                        : DecodedImageView{d.base, d.width, d.height, 0, false, 0, 0, 0,
+                                           d.base_level == 0};
                     if (!view.supported) {
                         warn_unsupported_image_view(d);
                         continue;
@@ -2099,7 +2132,11 @@ std::vector<ComputeItem> realize_compute_dispatches(
                             if (r0.cls == wanted && r0.gpu_addr == view.base &&
                                 r0.width == view.width && r0.height == view.height &&
                                 r0.depth == d.depth && r0.format == view_format &&
-                                r0.img_dim == img_dim) {
+                                r0.img_dim == img_dim && r0.depth_compare == u.is_depth_compare &&
+                                r0.in_mip_tail == view.in_mip_tail &&
+                                r0.mip_tail_offset == (view.in_mip_tail ? view.mip_offset : 0) &&
+                                r0.mip_tail_x == view.mip_tail_x &&
+                                r0.mip_tail_y == view.mip_tail_y) {
                                 if (r0.fetch_pc == 0xFFFFFFFFu) { r0.fetch_pc = u.use_pc; mapped = true; break; }
                                 if (r0.fetch_pc == u.use_pc)    { mapped = true; break; }
                             }
@@ -2124,9 +2161,15 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     }
                     r.gpu_addr = view.base; r.width = view.width; r.height = view.height; r.depth = d.depth;
                     r.tile_mode = d.tile_mode;
+                    r.in_mip_tail = view.in_mip_tail;
+                    r.mip_tail_offset = view.in_mip_tail
+                        ? static_cast<uint32_t>(view.mip_offset) : 0;
+                    r.mip_tail_bytes = view.mip_tail_bytes;
+                    r.mip_tail_x = view.mip_tail_x;
+                    r.mip_tail_y = view.mip_tail_y;
                     r.max_uncompressed_block_size = d.max_uncompressed_block_size;
                     r.max_compressed_block_size = d.max_compressed_block_size;
-                    const bool shifted_view = view.mip_offset != 0;
+                    const bool shifted_view = view.mip_offset != 0 || view.in_mip_tail;
                     r.meta_pipe_aligned = shifted_view ? false : d.meta_pipe_aligned;
                     r.write_compress_enabled = shifted_view ? false : d.write_compress_enabled;
                     r.compression_enabled = shifted_view ? false : d.compression_enabled;
@@ -2134,10 +2177,29 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     r.color_transform = d.color_transform;
                     r.metadata_addr = shifted_view ? 0 : d.metadata_addr;
                     r.img_dim = img_dim;
+                    r.depth_compare = u.is_depth_compare;
                     r.swizzle[0] = d.dst_sel[0]; r.swizzle[1] = d.dst_sel[1];
                     r.swizzle[2] = d.dst_sel[2]; r.swizzle[3] = d.dst_sel[3];
                     r.srt_offset = clash ? 0xFFFFFFFFu : u.key;
                     r.fetch_pc = u.use_pc;               // per-use pc provenance (the image op)
+                    if (u.has_samp) {
+                        const uint32_t* sm = u.s4.data();
+                        r.mag_filter  = ((sm[2] >> 20) & 0x3u) ? 1u : 0u;
+                        r.min_filter  = ((sm[2] >> 22) & 0x3u) ? 1u : 0u;
+                        r.mip_filter  = ((sm[2] >> 26) & 0x3u) ? 1u : 0u;
+                        r.addr_uvw[0] = (sm[0] >> 0) & 0x7u;
+                        r.addr_uvw[1] = (sm[0] >> 3) & 0x7u;
+                        r.addr_uvw[2] = (sm[0] >> 6) & 0x7u;
+                        r.max_aniso_ratio    = (sm[0] >> 9) & 0x7u;
+                        r.depth_compare_func = (sm[0] >> 12) & 0x7u;
+                        r.unnormalized       = (sm[0] >> 15) & 0x1u;
+                        r.min_lod            = static_cast<float>(sm[1] & 0xFFFu) / 256.0f;
+                        r.max_lod            = static_cast<float>((sm[1] >> 12) & 0xFFFu) / 256.0f;
+                        int32_t bias14        = static_cast<int32_t>(sm[2] & 0x3FFFu);
+                        if (bias14 & 0x2000) bias14 -= 0x4000;
+                        r.lod_bias           = static_cast<float>(bias14) / 256.0f;
+                        r.border_color_type  = (sm[3] >> 30) & 0x3u;
+                    }
                     table->resources.push_back(r);
                 }
             }
@@ -2253,19 +2315,21 @@ std::vector<ComputeItem> realize_compute_dispatches(
                 // PROSPER_SHADER_DUMP=<dir>: write the failed COMPUTE program's raw bytes for offline
                 // shader_inspect, mirroring the graphics VS/PS dump (gpu_execute.hpp). The graphics
                 // path was the only dumper, so a failing dispatch's CFG could not be mapped offline.
-                // Bounded like the graphics dump (64 KB covers the largest observed shaders); shrink
-                // to the readable prefix instead of faulting on a short final mapping.
+                // Keep the established 64 KiB diagnostic window: some compiler-generated branches
+                // jump thousands of dwords forward even when the first rejection is near the entry.
+                // The registered shader mapping is already proven readable by the decoder.
                 if (const char* dd = getenv("PROSPER_SHADER_DUMP")) {
-                    size_t n = 0x10000;
-                    while (n >= 0x1000 && !guest_readable(code_addr, (uint32_t)n)) n >>= 1;
-                    if (n >= 0x1000) {
-                        char fn[512];
-                        snprintf(fn, sizeof fn, "%s/exec_cs_%llx.bin", dd,
-                                 (unsigned long long)code_addr);
-                        if (FILE* f = fopen(fn, "wb")) {
-                            fwrite((const void*)(uintptr_t)code_addr, 1, n, f);
-                            fclose(f);
-                        }
+                    constexpr size_t dump_bytes = 0x10000;
+                    char fn[512];
+                    snprintf(fn, sizeof fn, "%s/exec_cs_%llx.bin", dd,
+                             (unsigned long long)code_addr);
+                    if (FILE* f = fopen(fn, "wb")) {
+                        fwrite(reinterpret_cast<const void*>(static_cast<uintptr_t>(code_addr)),
+                               1, dump_bytes, f);
+                        fclose(f);
+                    } else if (getenv("PROSPER_DBG")) {
+                        std::fprintf(stderr, "[shader-dump] cannot open %s: %s\n",
+                                     fn, std::strerror(errno));
                     }
                 }
             }

@@ -1573,6 +1573,22 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
                  static_cast<unsigned long long>(submit_no),
                  static_cast<unsigned long long>(realization_ms), capture.draws.size(),
                  capture.computes.size(), capture.operations.size(), capture.blobs.size());
+    if (gpu_capture_ds_seed_snapshot_available() &&
+        !capture_referenced_gpu_ds_seeds(capture, error)) {
+        std::fprintf(stderr, "[timeline] submit %llu DS checkpoint capture failed: %s\n",
+                     static_cast<unsigned long long>(submit_no), error.c_str());
+        history.remember(state, submit_no);
+        if (request.exit_after_capture) {
+            std::fprintf(stderr, "[timeline] selected capture failed; exiting nonzero as requested\n");
+            close_gpu_timeline();
+            std::fflush(nullptr);
+            std::exit(2);
+        }
+        return;
+    }
+    if (!capture.ds_seeds.empty())
+        std::fprintf(stderr, "[timeline] submit %llu retained %zu referenced DS checkpoint(s)\n",
+                     static_cast<unsigned long long>(submit_no), capture.ds_seeds.size());
     if (!write_gpu_capture(request.path, capture, error)) {
         std::fprintf(stderr, "[timeline] submit %llu detailed capture write failed: %s\n",
                      static_cast<unsigned long long>(submit_no), error.c_str());

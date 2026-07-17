@@ -220,7 +220,11 @@ HLE(g_vo_vblankstatus) {
                                 std::chrono::steady_clock::now().time_since_epoch()).count();
               static const uint64_t t0 = ns;                       // process-relative, first-call anchored
               constexpr uint64_t kVblankNs = 16683350;             // 59.94 Hz period
-              *(uint64_t*)(s + 0x00) = (ns - t0) / kVblankNs;      // count: one tick per vblank period
+              // A live VideoOut handle has already observed at least one vblank. Returning zero on
+              // the first query made Astro Bot compute a frame-rate sample as
+              // `(frames * refresh) / (count - previous_count)` with both counts zero and trap on
+              // IDIV. Keep the time-based behavior, but number the first process-relative vblank 1.
+              *(uint64_t*)(s + 0x00) = 1 + (ns - t0) / kVblankNs;  // count: one tick per vblank period
               *(uint64_t*)(s + 0x08) = (ns - t0) / 1000;           // processTime (µs)
               *(uint64_t*)(s + 0x10) = ns; }                       // tsc (monotonic ns; matches ReadTsc's unit)
     return 0;

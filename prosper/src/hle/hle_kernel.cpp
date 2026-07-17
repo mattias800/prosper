@@ -488,6 +488,22 @@ HLE(k_rwlock_wrlock)  { if (auto* rw = ensure_rwlock(a0)) pthread_rwlock_wrlock(
 HLE(k_rwlock_unlock)  { if (auto* rw = ensure_rwlock(a0)) pthread_rwlock_unlock(rw); return 0; }
 HLE(k_rwlock_tryrdlock){ auto* rw = ensure_rwlock(a0); return rw ? (uint64_t)pthread_rwlock_tryrdlock(rw) : 0x16; }
 HLE(k_rwlock_trywrlock){ auto* rw = ensure_rwlock(a0); return rw ? (uint64_t)pthread_rwlock_trywrlock(rw) : 0x16; }
+HLE(k_rwlockattr_init) {
+    if (!a0) return 0x16;
+    auto* attr = (pthread_rwlockattr_t*)calloc(1, sizeof(pthread_rwlockattr_t));
+    if (!attr) return 12;
+    const int rc = pthread_rwlockattr_init(attr);
+    if (rc) { free(attr); return (uint64_t)(unsigned)rc; }
+    *(void**)(uintptr_t)a0 = attr;
+    return 0;
+}
+HLE(k_rwlockattr_destroy) {
+    if (!a0) return 0x16;
+    void** slot = (void**)(uintptr_t)a0;
+    if (*slot) { pthread_rwlockattr_destroy((pthread_rwlockattr_t*)*slot); free(*slot); }
+    *slot = nullptr;
+    return 0;
+}
 
 // scePthreadOnce(once_control*, init_routine): run init exactly once, PER CONTROL. The old
 // implementation held ONE process-global recursive mutex across the guest init routine — if init
@@ -533,6 +549,14 @@ HLE(k_pthread_yield){ sched_yield(); return 0; }
 HLE(k_attr_init)        { if (a0) { auto* at = (pthread_attr_t*)calloc(1, sizeof(pthread_attr_t)); pthread_attr_init(at); *(void**)a0 = at; } return 0; }
 HLE(k_attr_destroy)     { if (a0 && *(void**)a0) { pthread_attr_destroy((pthread_attr_t*)*(void**)a0); free(*(void**)a0); *(void**)a0 = nullptr; } return 0; }
 HLE(k_attr_setstacksize){ if (a0 && *(void**)a0 && a1 >= 16384) pthread_attr_setstacksize((pthread_attr_t*)*(void**)a0, a1); return 0; }
+HLE(k_attr_setstack) {
+    // Sony and every host backend we support require at least 16 KiB here.  MinGW's winpthreads
+    // headers do not consistently expose PTHREAD_STACK_MIN, so keep this check aligned with the
+    // setstacksize path above instead of depending on that optional libc macro.
+    if (!a0 || !*(void**)(uintptr_t)a0 || !a1 || a2 < 16384) return 0x16;
+    return (uint64_t)(unsigned)pthread_attr_setstack(
+        (pthread_attr_t*)*(void**)(uintptr_t)a0, (void*)(uintptr_t)a1, (size_t)a2);
+}
 HLE(k_attr_noop)        { return 0; }
 
 // sceKernelGetSanitizerMallocReplaceExternal returns the process replacement table, even when no
@@ -707,6 +731,46 @@ namespace {
 // TCB, then call the guest entry through the SysV marshalling shim, and purge DTV on exit.
 struct WinThreadStart { uint64_t entry; void* arg; char name[64]; };
 extern "C" uint64_t prosper_call_guest_sysv(uint64_t fn, uint64_t a0, uint64_t a1);
+
+// PS5 code is compiled for a stack whose entire usable range is writable.  Windows instead
+// initially commits only the top of a reserved thread stack and relies on a moving guard page;
+// native Windows compilers probe each intervening page before a large stack allocation.  Guest
+// code has no reason to emit those Windows probes, so an otherwise-valid `sub rsp, large_size`
+// followed by a call can jump past the guard and fault in still-reserved memory.  Commit the
+// guest worker's usable reservation before entering it, retaining one guard page above the
+// permanently inaccessible bottom page so a real stack overflow is still caught.
+bool prepare_guest_windows_stack(ULONG_PTR* out_low, ULONG_PTR* out_high) {
+    ULONG_PTR api_low = 0, high = 0;
+    GetCurrentThreadStackLimits(&api_low, &high);
+    if (!high) return false;
+
+    MEMORY_BASIC_INFORMATION top{};
+    if (!VirtualQuery((void*)(high - 1), &top, sizeof(top)) || !top.AllocationBase)
+        return false;
+
+    const ULONG_PTR reserve_low = (ULONG_PTR)top.AllocationBase;
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    const SIZE_T page = si.dwPageSize ? si.dwPageSize : 0x1000;
+    if (high <= reserve_low + 2 * page) return false;
+
+    // VirtualAlloc also succeeds for pages that are already committed.  Supplying the entire
+    // usable interval therefore both fills the reserved gap and leaves the existing top frames
+    // intact.  PAGE_GUARD on an already-committed page is cleared explicitly below.
+    void* usable = (void*)(reserve_low + page);
+    const SIZE_T usable_size = (SIZE_T)(high - (reserve_low + page));
+    if (!VirtualAlloc(usable, usable_size, MEM_COMMIT, PAGE_READWRITE)) return false;
+
+    DWORD old_protect = 0;
+    if (!VirtualProtect((void*)(reserve_low + page), page,
+                        PAGE_READWRITE | PAGE_GUARD, &old_protect))
+        return false;
+
+    if (out_low) *out_low = reserve_low + page;
+    if (out_high) *out_high = high;
+    return true;
+}
+
 void* win_thread_trampoline(void* p) {
     auto* ts = (WinThreadStart*)p;
     uint64_t entry = ts->entry; void* arg = ts->arg;
@@ -725,7 +789,8 @@ void* win_thread_trampoline(void* p) {
     // base". Mirrors the Linux thread_trampoline's register-first ordering. GetCurrentThreadStackLimits
     // gives the committed stack range (Win8+).
     ULONG_PTR stk_lo = 0, stk_hi = 0;
-    GetCurrentThreadStackLimits(&stk_lo, &stk_hi);
+    if (!prepare_guest_windows_stack(&stk_lo, &stk_hi))
+        GetCurrentThreadStackLimits(&stk_lo, &stk_hi);
     if (stk_lo && stk_hi > stk_lo) {
         register_thread_stack((uint64_t)GetCurrentThreadId(), (void*)stk_lo, (uint64_t)(stk_hi - stk_lo));
         register_thread_stack(guest_thread, (void*)stk_lo, (uint64_t)(stk_hi - stk_lo));
@@ -785,13 +850,29 @@ HLE(k_pthread_create) {
     // Windows: route through win_thread_trampoline so the guest entry is called with the SysV ABI and
     // gets its guest %fs TCB — a bare pthread_create(entry, arg) mis-passes the arg (MS x64 vs SysV) and
     // skips TLS activation, crashing the worker on a null-derived pointer.
-    pthread_attr_t* at = (a1 && *(void**)a1) ? (pthread_attr_t*)*(void**)a1 : nullptr;
+    constexpr size_t kStackFloor = 1 * 1024 * 1024, kStackDefault = 8 * 1024 * 1024;
+    size_t ssz = kStackDefault;
+    int detach = PTHREAD_CREATE_JOINABLE;
+    if (a1 && *(void**)a1) {
+        auto* gat = (pthread_attr_t*)*(void**)a1;
+        size_t req = 0;
+        if (pthread_attr_getstacksize(gat, &req) == 0 && req)
+            ssz = req < kStackFloor ? kStackFloor : req;
+        pthread_attr_getdetachstate(gat, &detach);
+    }
+    // Use a host-owned attr just like Linux: preserve the Sony-requested size/detach state, but
+    // do not pass through a guest-owned stack address to winpthreads.  The trampoline commits
+    // this reservation before guest entry because PS5 code does not contain Windows probes.
+    pthread_attr_t la; pthread_attr_init(&la);
+    pthread_attr_setstacksize(&la, ssz);
+    pthread_attr_setdetachstate(&la, detach);
     auto* ts = (WinThreadStart*)malloc(sizeof(WinThreadStart));
-    if (!ts) return 12;                                        // ENOMEM (FreeBSD and host agree)
+    if (!ts) { pthread_attr_destroy(&la); return 12; }          // ENOMEM (FreeBSD and host agree)
     ts->entry = (uint64_t)(uintptr_t)entry; ts->arg = arg;
     ts->name[0] = 0;
     if (a4) { strncpy(ts->name, (const char*)(uintptr_t)a4, sizeof(ts->name) - 1); ts->name[sizeof(ts->name) - 1] = 0; }
-    int r = pthread_create(&tid, at, win_thread_trampoline, ts);
+    int r = pthread_create(&tid, &la, win_thread_trampoline, ts);
+    pthread_attr_destroy(&la);
     if (r) { free(ts); return (uint64_t)r; }
 #endif
     if (a0) *(uint64_t*)a0 = (uint64_t)tid;
@@ -1047,11 +1128,12 @@ HLE(k_rwlock_timedwrlock) {
 // the generic stub returned 0: SemInit created nothing, SemWait returned immediately (never blocked),
 // SemGetvalue left *value uninitialized -> a producer/consumer or gate built on these got NO
 // synchronization (the silent-unsync / UAF class). Back them with host sem_t.
-HLE(k_sem_init)      { if (!a0) return 0x16; auto* s = (sem_t*)calloc(1, sizeof(sem_t)); sem_init(s, 0, (unsigned)a2); *(void**)(uintptr_t)a0 = s; return 0; }
-HLE(k_sem_wait)      { auto* s = ensure_sem(a0); if (!s) return 0x16; return sem_wait(s) == 0 ? 0 : (uint64_t)(unsigned)errno; }
+namespace { bool semlog() { static const bool on = getenv("PROSPER_SEMLOG") != nullptr; return on; } }
+HLE(k_sem_init)      { if (!a0) return 0x16; auto* s = (sem_t*)calloc(1, sizeof(sem_t)); sem_init(s, 0, (unsigned)a2); *(void**)(uintptr_t)a0 = s; if (semlog()) fprintf(stderr, "[sem] init slot=%p value=%u\n", (void*)(uintptr_t)a0, (unsigned)a2); return 0; }
+HLE(k_sem_wait)      { auto* s = ensure_sem(a0); if (!s) return 0x16; if (semlog()) fprintf(stderr, "[sem] wait slot=%p enter\n", (void*)(uintptr_t)a0); int rc = sem_wait(s); if (semlog()) fprintf(stderr, "[sem] wait slot=%p exit rc=%d\n", (void*)(uintptr_t)a0, rc); return rc == 0 ? 0 : (uint64_t)(unsigned)errno; }
 HLE(k_sem_trywait)   { auto* s = ensure_sem(a0); if (!s) return 0x16; return sem_trywait(s) == 0 ? 0 : (uint64_t)(unsigned)errno; }
 HLE(k_sem_timedwait) { auto* s = ensure_sem(a0); if (!s) return 0x16; timespec dl = abs_deadline_us(a1); int rc = sem_timedwait(s, &dl); return rc == 0 ? 0 : (errno == ETIMEDOUT ? 60u : (uint64_t)(unsigned)errno); }
-HLE(k_sem_post)      { auto* s = ensure_sem(a0); if (!s) return 0x16; sem_post(s); return 0; }
+HLE(k_sem_post)      { auto* s = ensure_sem(a0); if (!s) return 0x16; int rc = sem_post(s); if (semlog()) fprintf(stderr, "[sem] post slot=%p rc=%d\n", (void*)(uintptr_t)a0, rc); return rc == 0 ? 0 : (uint64_t)(unsigned)errno; }
 HLE(k_sem_getvalue)  { auto* s = ensure_sem(a0); if (!s) return 0x16; int v = 0; sem_getvalue(s, &v); if (a1) *(int*)(uintptr_t)a1 = v; return 0; }
 HLE(k_sem_destroy)   { if (a0) { void** slot = (void**)(uintptr_t)a0; if (!pt_static_sentinel(*slot)) { sem_destroy((sem_t*)*slot); free(*slot); *slot = nullptr; } } return 0; }
 // scePthreadBarrier* -- were MISSING -> the generic stub returned 0, so BarrierWait let every thread sail
@@ -2172,6 +2254,10 @@ void register_kernel_hle() {
     R("scePthreadRwlockTrywrlock", k_rwlock_trywrlock);
     R("scePthreadRwlockTimedrdlock", k_rwlock_timedrdlock);   // were MISSING -> faked "locked" without locking
     R("scePthreadRwlockTimedwrlock", k_rwlock_timedwrlock);
+    R("scePthreadRwlockattrInit", k_rwlockattr_init);
+    R("scePthreadRwlockattrDestroy", k_rwlockattr_destroy);
+    R("pthread_rwlockattr_init", k_rwlockattr_init);
+    R("pthread_rwlockattr_destroy", k_rwlockattr_destroy);
     // scePthreadSem* counting semaphores (were MISSING -> SemWait never blocked)
     R("scePthreadSemInit", k_sem_init);         R("scePthreadSemDestroy", k_sem_destroy);
     R("scePthreadSemWait", k_sem_wait);         R("scePthreadSemTrywait", k_sem_trywait);
@@ -2193,6 +2279,7 @@ void register_kernel_hle() {
     R("scePthreadExit", k_pthread_exit);
     R("scePthreadAttrInit", k_attr_init);
     R("scePthreadAttrDestroy", k_attr_destroy);
+    R("scePthreadAttrSetstack", k_attr_setstack);
     R("scePthreadAttrSetstacksize", k_attr_setstacksize);
     R("scePthreadAttrSetinheritsched", k_attr_noop);
     R("scePthreadAttrSetschedpolicy", k_attr_noop);
@@ -2238,12 +2325,18 @@ void register_kernel_hle() {
     R("pthread_cond_timedwait", k_cond_timedwait);   // issue #115: unimpl-0 spun WaitCompletion loops
     R("pthread_condattr_init", k_condattr_init); R("pthread_condattr_destroy", k_condattr_destroy);
     R("pthread_attr_init", k_attr_init);      R("pthread_attr_destroy", k_attr_destroy);
+    R("pthread_attr_setstack", k_attr_setstack);
     R("pthread_attr_setstacksize", k_attr_setstacksize);
     R("pthread_attr_setdetachstate", k_attr_setdetachstate); R("pthread_attr_getdetachstate", k_attr_getdetachstate);
     R("pthread_attr_setinheritsched", k_attr_noop);
     R("pthread_attr_setschedpolicy", k_attr_noop);  R("pthread_attr_setschedparam", k_attr_noop);
     R("pthread_attr_getstacksize", k_attr_getstacksize);
     R("scePthreadAttrSetaffinity", k_attr_noop); R("pthread_setname_np", k_attr_noop);
+    // Plain libScePosix sem_* imports use the same guest object representation as scePthreadSem*.
+    // Registering only the Sony-prefixed spellings left successful no-op imports in native engines.
+    R("sem_init", k_sem_init);       R("sem_destroy", k_sem_destroy);
+    R("sem_wait", k_sem_wait);       R("sem_trywait", k_sem_trywait);
+    R("sem_post", k_sem_post);       R("sem_getvalue", k_sem_getvalue);
     // event flags + semaphores (engine thread synchronization)
     R("sceKernelCreateEventFlag", k_ef_create); R("sceKernelDeleteEventFlag", k_ef_delete);
     R("sceKernelSetEventFlag", k_ef_set);       R("sceKernelClearEventFlag", k_ef_clear);

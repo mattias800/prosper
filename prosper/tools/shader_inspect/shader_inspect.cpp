@@ -46,8 +46,11 @@ void print_operand(const char* label, const Operand& operand) {
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 2) {
-        std::fprintf(stderr, "usage: %s <raw-rdna2.bin>\n", argv[0]);
+    std::string stage;
+    if (argc == 4 && std::strcmp(argv[2], "--stage") == 0) stage = argv[3];
+    if ((argc != 2 && argc != 4) ||
+        (!stage.empty() && stage != "vertex" && stage != "fragment")) {
+        std::fprintf(stderr, "usage: %s <raw-rdna2.bin> [--stage vertex|fragment]\n", argv[0]);
         return 2;
     }
 
@@ -87,6 +90,15 @@ int main(int argc, char** argv) {
                 coverage.unsupported,
                 coverage.first_bad_fmt < 0 ? "none" : format_name(static_cast<Rdna2Format>(coverage.first_bad_fmt)),
                 coverage.first_bad_op);
+    bool stage_ok = true;
+    if (!stage.empty()) {
+        std::vector<uint32_t> spirv = stage == "vertex"
+            ? recompile_vertex(words.data(), words.size())
+            : recompile_fragment(words.data(), words.size());
+        stage_ok = !spirv.empty();
+        std::printf("stage-recompile stage=%s status=%s spirv_dwords=%zu\n",
+                    stage.c_str(), stage_ok ? "ok" : "rejected", spirv.size());
+    }
     const PcrelDispatchInfo dispatch = rdna2_pcrel_dispatch_info(words.data(), words.size());
     if (dispatch.valid) {
         std::printf("pcrel-dispatch selector=s%u+0x%x add=%d max=%u setpc=%u merge=%u "
@@ -123,5 +135,5 @@ int main(int argc, char** argv) {
         std::printf("\n");
     }
 
-    return ended ? 0 : 1;
+    return ended && stage_ok ? 0 : 1;
 }

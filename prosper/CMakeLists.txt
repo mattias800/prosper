@@ -217,6 +217,18 @@ if(TARGET prosper_core)
   target_link_libraries(test_http PRIVATE prosper_core)
   add_test(NAME http_hle COMMAND test_http)
 
+  add_executable(test_font tests/test_font.cpp)
+  target_link_libraries(test_font PRIVATE prosper_core)
+  add_test(NAME font_hle COMMAND test_font)
+
+  add_executable(test_fiber tests/test_fiber.cpp)
+  target_link_libraries(test_fiber PRIVATE prosper_core)
+  add_test(NAME fiber_hle COMMAND test_fiber)
+
+  add_executable(test_posix_sem tests/test_posix_sem.cpp)
+  target_link_libraries(test_posix_sem PRIVATE prosper_core)
+  add_test(NAME posix_sem_hle COMMAND test_posix_sem)
+
   # PlatformUi hook (#347): the app frontend can service the guest's ImeDialog with real UI; with no
   # backend registered the headless auto-complete default is unchanged. Pure, no game dump.
   add_executable(test_platform_ui tests/test_platform_ui.cpp)

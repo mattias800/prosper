@@ -1268,6 +1268,44 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     return 0;
 }
 
+// Async-compute submissions use the same AgcDriver::Packet layout as DCB submissions. The command
+// processor already retains dispatches and orders their ReleaseMem/WaitRegMem side effects, so fold
+// ACB streams through the same serialized queue model. Keeping a named wrapper makes the queue type
+// visible in diagnostics and leaves room for independent hardware queue state later.
+HLE(agc_driver_submit_acb) {  // sceAgcDriverSubmitAcb(queue, const AcbPacket*, ...)
+    if (getenv("PROSPER_GFXLOG")) {
+        static std::atomic<unsigned> logged{0};
+        if (logged.fetch_add(1) < 16) {
+            uint64_t words[8]{};
+            bool readable = a1 >= 0x10000 && gpu::guest_readable(a1, sizeof words);
+            if (readable) memcpy(words, (const void*)(uintptr_t)a1, sizeof words);
+            fprintf(stderr, "[agc] SubmitAcb args=[0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx] a1mem=%s "
+                    "[%llx %llx %llx %llx %llx %llx %llx %llx]\n",
+                    (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
+                    (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)a5,
+                    readable ? "yes" : "no", (unsigned long long)words[0],
+                    (unsigned long long)words[1], (unsigned long long)words[2],
+                    (unsigned long long)words[3], (unsigned long long)words[4],
+                    (unsigned long long)words[5], (unsigned long long)words[6],
+                    (unsigned long long)words[7]);
+        }
+    }
+    // Live Astro Bot ABI: a0 is the hardware async-queue id (0x40/0x48); a1 points to a larger
+    // submission record whose first two qwords are {stream address, dword count}. a3 repeats the
+    // count. Validate both copies and the PM4 header before allowing the fold.
+    if (!a1 || !gpu::guest_readable(a1, 16)) return kAgcErrInvalidArg;
+    uint64_t stream = 0, count64 = 0;
+    memcpy(&stream, (const void*)(uintptr_t)a1, 8);
+    memcpy(&count64, (const void*)(uintptr_t)(a1 + 8), 8);
+    if (!stream || count64 == 0 || count64 > 0x400000ull || (a3 && a3 != count64) ||
+        !gpu::guest_readable(stream, sizeof(uint32_t)))
+        return kAgcErrInvalidArg;
+    uint32_t header = 0; memcpy(&header, (const void*)(uintptr_t)stream, sizeof header);
+    if ((header & 0xc0000000u) != 0xc0000000u && header != 0x80000000u)
+        return kAgcErrInvalidArg;
+    return submit_dcb_stream((const uint32_t*)(uintptr_t)stream, (uint32_t)count64, "SubmitAcb");
+}
+
 // --- Indirect-register patch helpers: modify a packet returned by a Set*RegsIndirect call.
 // cmd = a0 (that returned pointer). Old stub returned 0 for Set*RegsIndirect -> these wrote to null. -
 HLE(agc_patch_set_address) {  // (cmd, regs): cmd[2..3] = regs vaddr
@@ -1410,6 +1448,15 @@ void register_agc_hle() {
     RN("wr23dPKyWc0", agc_cb_release_mem);
     RN("i1jyy49AjXU", agc_dcb_write_data);
     RN("VmW0Tdpy420", agc_dcb_wait_reg_mem);
+    // Async-compute command-buffer builders share the packet encodings with their DCB siblings.
+    // Astro Bot builds producer fences on ACBs and waits for them from its graphics DCB; dropping
+    // these calls leaves the consumer queue permanently parked on labels that can never be written.
+    RN("JrtiDtKeS38", agc_dcb_reset_queue);       // sceAgcAcbResetQueue
+    RN("cpCILPya5Zk", agc_dcb_push_marker);       // sceAgcAcbPushMarker
+    RN("6mFxkVqdmbQ", agc_dcb_pop_marker);        // sceAgcAcbPopMarker
+    RN("KT-hTp-Ch14", agc_dcb_acquire_mem);       // sceAgcAcbAcquireMem
+    RN("cFazmnXpJOE", agc_dcb_event_write);       // sceAgcAcbEventWrite
+    RN("htn36gPnBk4", agc_dcb_wait_reg_mem);      // sceAgcAcbWaitRegMem
     // Indirect-register patch helpers (SetAddress patches cmd[2..3]; AddRegisters patches cmd[1]).
     RN("vcmNN+AAXnY", agc_patch_set_address);   RN("d-6uF9sZDIU", agc_patch_add_registers);   // Cx
     RN("Qrj4c+61z4A", agc_patch_set_address);   RN("z2duB-hHQSM", agc_patch_add_registers);   // Sh
@@ -1428,6 +1475,7 @@ void register_agc_hle() {
     RN("cdDRpqcFGbU", agc_patch_dma_data_src);  // sceAgcDmaDataPatchSetSrcAddressOrOffsetOrImmediate
     RN("YUeqkyT7mEQ", agc_dcb_set_flip);        // sceAgcDcbSetFlip (Kyty LibGraphicsDriver.cpp:98)
     RN("UglJIZjGssM", agc_driver_submit_dcb);   // sceAgcDriverSubmitDcb -> CommandProcessor replay
+    RN("gSRnr79F8tQ", agc_driver_submit_acb);   // sceAgcDriverSubmitAcb -> ordered compute replay
     RN("w1KFAHVqpaU", agc_driver_submit_dcb_variant);  // final-buffer submit variant (#232, DOLL RHI batch)
     #undef RN
 }

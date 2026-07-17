@@ -27,7 +27,7 @@ static int fails = 0;
 
 // Pool bounds mirror hle_kernel_mem.cpp (kDmemBase / kDmemTotal).
 static constexpr uint64_t kBase  = 0x10000000ull;
-static constexpr uint64_t kTotal = 8ull * 1024 * 1024 * 1024;
+static constexpr uint64_t kTotal = 16ull * 1024 * 1024 * 1024;
 static constexpr uint64_t kEnd   = kBase + kTotal;
 
 int main() {
@@ -281,6 +281,44 @@ int main() {
               "map direct memory honors requested 64KiB VA alignment");
         if (va) munmap((void*)(uintptr_t)va, 0x10000);
         if (p) release(p, 0x10000, 0, 0, 0, 0);
+    }
+
+    // A non-fixed direct-memory address is a search hint. Astro Bot supplies the eboot base as
+    // its preferred address; treating every non-zero input as fixed returned ENOMEM instead of
+    // relocating the mapping. A genuinely fixed collision must still fail without clobbering it.
+    {
+        constexpr uint64_t len = 0x10000;
+        uint64_t p = 0;
+        void* live = mmap(nullptr, len, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        CHECK(live != MAP_FAILED, "create a live mapping for direct-memory hint collision");
+        if (live != MAP_FAILED) {
+            *(volatile uint32_t*)live = 0xA57B0782u;
+            uint64_t hinted = (uint64_t)(uintptr_t)live;
+            uint64_t rr = alloc(0, kEnd, len, len, 0, (uint64_t)(uintptr_t)&p);
+            CHECK(rr == 0 && p, "allocate direct memory for occupied-hint test");
+            if (rr == 0 && p) {
+                rr = map((uint64_t)(uintptr_t)&hinted, len, 0x2 /*RW*/, 0,
+                         p, len);
+                CHECK(rr == 0 && hinted && hinted != (uint64_t)(uintptr_t)live,
+                      "non-fixed occupied direct-memory hint relocates");
+                CHECK(hinted >= 0x2000000000ull && hinted < 0x40000000000ull,
+                      "relocated direct mapping stays in the guest user-VA range");
+                CHECK(*(volatile uint32_t*)live == 0xA57B0782u,
+                      "relocated direct mapping does not clobber the live hint");
+                if (hinted && hinted != (uint64_t)(uintptr_t)live)
+                    munmap((void*)(uintptr_t)hinted, len);
+
+                uint64_t fixed_hint = (uint64_t)(uintptr_t)live;
+                rr = map((uint64_t)(uintptr_t)&fixed_hint, len, 0x2 /*RW*/,
+                         0x10 /*SCE_KERNEL_MAP_FIXED*/, p, len);
+                CHECK(rr != 0, "fixed occupied direct-memory hint fails");
+                CHECK(*(volatile uint32_t*)live == 0xA57B0782u,
+                      "failed fixed direct mapping preserves the live range");
+                release(p, len, 0, 0, 0, 0);
+            }
+            munmap(live, len);
+        }
     }
 
     if (fails) { printf("== FAIL: %d check(s) ==\n", fails); return 1; }

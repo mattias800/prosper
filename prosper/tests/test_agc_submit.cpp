@@ -39,13 +39,14 @@ int main() {
     auto setidx = Hle::lookup("GIIW2J37e70");   // GraphicsDcbSetIndexSize
     auto draw   = Hle::lookup("Yw0jKSqop+E");   // GraphicsDcbDrawIndexAuto
     auto submit = Hle::lookup("UglJIZjGssM");   // GraphicsDriverSubmitDcb
+    auto submit_acb = Hle::lookup("gSRnr79F8tQ"); // GraphicsDriverSubmitAcb
     auto regmem = Hle::lookup("AOLcoIkQDgM");   // QueryResourceRegistrationUserMemoryRequirements
     auto maxname = Hle::lookup("uJziRsODk1c");   // sceAgcDriverGetResourceRegistrationMaxNameLength
     auto release = reinterpret_cast<HostHle9>(Hle::lookup("wr23dPKyWc0")); // GraphicsCbReleaseMem
     auto waitmem = reinterpret_cast<HostHle9>(Hle::lookup("VmW0Tdpy420")); // GraphicsDcbWaitRegMem
-    CHECK(reset && setcx && setidx && draw && submit && regmem && maxname && release && waitmem,
-          "AGC Dcb, submit, and resource-registration functions registered");
-    if (!(reset && setcx && setidx && draw && submit && regmem && maxname && release && waitmem)) {
+    CHECK(reset && setcx && setidx && draw && submit && submit_acb && regmem && maxname && release && waitmem,
+          "AGC Dcb/Acb submit and resource-registration functions registered");
+    if (!(reset && setcx && setidx && draw && submit && submit_acb && regmem && maxname && release && waitmem)) {
         printf("== FAIL ==\n"); return 1;
     }
 
@@ -110,6 +111,25 @@ int main() {
         CHECK(st.index_type == 1, "folded the index type");
         CHECK(st.draws.size() == 1 && st.draws[0].index_count == 42,
               "recorded one DrawIndexAuto with index_count=42");
+    }
+
+
+    // ACB uses the same packet descriptor and must enter the command processor instead of silently
+    // disappearing. An empty reset packet is sufficient to prove that the async submit is folded.
+    {
+        static uint32_t acb_buffer[16]{};
+        Dcb acb{};
+        acb.bottom = acb_buffer; acb.top = acb_buffer + 16;
+        acb.cursor_up = acb_buffer; acb.cursor_down = acb_buffer + 16;
+        auto acb_reset = Hle::lookup("JrtiDtKeS38");
+        CHECK(acb_reset && acb_reset((uint64_t)(uintptr_t)&acb, 0x3ff, 0, 0, 0, 0) != 0,
+              "async-compute queue builder appends a packet");
+        Packet packet{acb_buffer, (uint32_t)(acb.cursor_up - acb_buffer), {0,0,0,0}};
+        uint64_t before = 0, ignored = 0; prosper_agc_submit_stats(&before, &ignored);
+        CHECK(submit_acb(0x40, (uint64_t)(uintptr_t)&packet, 4, packet.dw_num, 0, 0) == 0,
+              "SubmitAcb returns OK");
+        uint64_t after = 0; prosper_agc_submit_stats(&after, &ignored);
+        CHECK(after == before + 1, "SubmitAcb folds one async command stream");
     }
 
     // Fixed args 7-9 must be real function parameters, not compiler-frame offsets. This is the exact

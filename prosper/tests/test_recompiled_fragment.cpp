@@ -95,6 +95,28 @@ int main() {
         }
     }
 
+    // Astro Bot's depth/stencil prepass PS exports only NULL. The VCC mask becomes EXEC immediately
+    // before that export, so inactive fragments must still lower to OpKill even though there is no MRT
+    // output. These are its exact gfx1030 control-flow/export tail (PPSA21564, 0x500540000); the
+    // preceding resource sample is covered separately by the texture execution tests.
+    const uint32_t null_only_ps[] = {
+        0x7d840080u, 0x8aea6a7eu, 0xbf840004u, 0xbefe046au,
+        0xf8001890u, 0x00000000u, 0xbf810000u,
+    };
+    std::vector<uint32_t> null_frag = recompile_fragment(null_only_ps, std::size(null_only_ps));
+    CHECK(!null_frag.empty() && null_frag[0] == 0x07230203u,
+          "#825: recompiled Astro Bot's NULL-export depth/stencil fragment shader");
+    if (!null_frag.empty()) {
+        std::vector<uint8_t> null_px = prosper::test::render_triangle_rgba(vert, null_frag, W, H);
+        CHECK(null_px.size() == (size_t)W * H * 4,
+              "#825: Vulkan accepts a fragment module with no color outputs");
+        if (null_px.size() == (size_t)W * H * 4) {
+            const uint8_t* nc = &null_px[((size_t)(H/2) * W + W/2) * 4];
+            CHECK(nc[2] > 0x80 && nc[0] < 0x40 && nc[1] < 0x40,
+                  "#825: NULL export leaves the BLUE color attachment unchanged");
+        }
+    }
+
     // DIVERGENT execz region (#273 — DOLL's FXAA PS shape): v_cmpx narrows EXEC, s_cbranch_execz
     // skips a block containing a SCALAR write read after the merge (so it is NOT safe-linearizable
     // and must go through the structured exec-if). Then-arm sets v1 = s5 = 1.0; the export runs

@@ -857,7 +857,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                         // RTT (#167): if this texture's base is a color target we rendered into, inject those
                         // pixels (nearest-scaled to tw x th) instead of reading empty guest memory.
                         bool rtt_hit = false;
-                        if (rtt_on && !is_volume) { auto rit = g_rtt.find(r.gpu_addr);
+                        if (rtt_on && !is_volume && !r.in_mip_tail) { auto rit = g_rtt.find(r.gpu_addr);
                             if (rit != g_rtt.end() && rit->second.w && rit->second.h && rit->second.rgba &&
                                 !rit->second.rgba->empty()) {
                                 const RttSurf& s = rit->second;
@@ -1015,7 +1015,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 size_t tbytes = prosper::gpu::tiled_elements_bytes(bw, bh, bcb, r.tile_mode);
                                 std::vector<uint8_t> traw(tbytes, 0);
                                 copy_resource(traw.data(), r.gpu_addr, tbytes);
-                                prosper::gpu::detile_elements(lin.data(), traw.data(), tbytes, bw, bh, bcb, r.tile_mode);
+                                if (r.in_mip_tail)
+                                    prosper::gpu::detile_elements_level(
+                                        lin.data(), traw.data(), tbytes, bw, bh, bcb,
+                                        r.tile_mode, r.mip_tail_x, r.mip_tail_y);
+                                else
+                                    prosper::gpu::detile_elements(
+                                        lin.data(), traw.data(), tbytes, bw, bh, bcb, r.tile_mode);
                             } else {
                                 copy_resource(lin.data(), r.gpu_addr, comp_bytes);
                             }
@@ -1046,6 +1052,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 if (got < hlin.size()) copy_resource(hlin.data(), r.gpu_addr, hlin.size());  // short backing -> linear fallback
                                 else if (is_volume) prosper::gpu::detile_volume(
                                     hlin.data(), traw.data(), got, tw, th, r.depth, r.tile_mode, bpt);
+                                else if (r.in_mip_tail) prosper::gpu::detile_surface_level(
+                                    hlin.data(), traw.data(), got, tw, th, r.tile_mode, bpt,
+                                    r.mip_tail_x, r.mip_tail_y);
                                 else prosper::gpu::detile_surface(
                                     hlin.data(), traw.data(), tw, th, r.tile_mode, 0, bpt);
                             } else {
@@ -1091,6 +1100,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                                 if (got < nlin.size()) copy_resource(nlin.data(), r.gpu_addr, nlin.size());  // short backing -> linear fallback
                                 else if (is_volume) prosper::gpu::detile_volume(
                                     nlin.data(), traw.data(), got, tw, th, r.depth, r.tile_mode, bpt);
+                                else if (r.in_mip_tail) prosper::gpu::detile_surface_level(
+                                    nlin.data(), traw.data(), got, tw, th, r.tile_mode, bpt,
+                                    r.mip_tail_x, r.mip_tail_y);
                                 else prosper::gpu::detile_surface(
                                     nlin.data(), traw.data(), tw, th, r.tile_mode, 0, bpt);
                             } else {
@@ -1156,6 +1168,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             }
                             if (is_volume) prosper::gpu::detile_volume(
                                 texture_pixels.data(), tiled.data(), got, tw, th, r.depth, tmode, 4);
+                            else if (r.in_mip_tail) prosper::gpu::detile_surface_level(
+                                texture_pixels.data(), tiled.data(), got, tw, th, tmode, 4,
+                                r.mip_tail_x, r.mip_tail_y);
                             else prosper::gpu::detile_surface(
                                 texture_pixels.data(), tiled.data(), tw, th, tmode, pitch);
                         }
@@ -1596,7 +1611,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             };
             // Diagnostic shader/state overrides (computed once, applied to EVERY draw item):
             //   REFVS  -> a known-good fullscreen-triangle VS (isolates the game's real VS).
-            //   TESTPS -> a solid-magenta PS (isolates VS geometry from PS shading).
+            //   TESTPS -> a solid-magenta PS (isolates VS geometry from PS shading). The optional
+            //             TESTPS_MATCH file restricts it to one exact recompiled guest PS.
             //   FS_SPV -> a caller-supplied PS SPIR-V (e.g. a UV visualizer).
             //   NOPS   -> bypass the resolved pipeline state (default state).
             #include "refvs.inc"
@@ -1604,10 +1620,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             std::vector<uint32_t> refvs_spv(kRefVs, kRefVs + sizeof(kRefVs) / 4);
             std::vector<uint32_t> ps_override;
             bool ps_override_is_file = false;   // true only for a valid PROSPER_FS_SPV *file* override
+            bool ps_override_is_test = false;
             if (getenv("PROSPER_RENDER_TESTPS")) {
                 static const uint32_t kMagentaPs[] = {   // v0=1.0(R) v1=0.0(G) v2=1.0(B) v3=1.0(A); exp mrt0; endpgm
                     0x7E0002F2u, 0x7E020280u, 0x7E0402F2u, 0x7E0602F2u, 0xF800180Fu, 0x03020100u, 0xBF810000u };
                 ps_override = prosper::gpu::recompile_fragment(kMagentaPs, sizeof(kMagentaPs) / 4, nullptr);
+                ps_override_is_test = true;
             }
             // Validated SPIR-V file load: require a complete read of a word-aligned file >= 20 bytes
             // (5 words: the minimum SPIR-V header). Validate size BEFORE allocating so a failed ftell
@@ -1648,6 +1666,17 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     fprintf(stderr, "[fs-match] PROSPER_FS_SPV_MATCH='%s' invalid/unreadable -> applying NO "
                             "fragment file override (fail closed)\n", mp);
             }
+            // PROSPER_RENDER_TESTPS_MATCH=<file> is the geometry half of a per-shader A/B test: replace
+            // only that exact guest PS with the known solid output while retaining its real VS, indices,
+            // viewport, depth and raster state. As with FS_SPV_MATCH, a bad path fails closed.
+            int testps_match_mode = 0;
+            std::vector<uint32_t> testps_match;
+            if (const char* mp = getenv("PROSPER_RENDER_TESTPS_MATCH")) {
+                testps_match_mode = load_spv_file(mp, testps_match) ? 1 : 2;
+                if (testps_match_mode == 2)
+                    fprintf(stderr, "[testps-match] PROSPER_RENDER_TESTPS_MATCH='%s' invalid/unreadable -> "
+                            "applying NO test fragment override (fail closed)\n", mp);
+            }
             const bool nops = getenv("PROSPER_RENDER_NOPS");
             // Assemble backend draws for a subset of the submit's items — one BackendDraw per realized
             // DrawItem with its own resources + fixed-function state (or the diagnostic overrides above).
@@ -1659,15 +1688,23 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     const auto& it = *itp;
                     prosper::test::BackendDraw bd;
                     bd.vs     = refvs ? refvs_spv : it.vs;
-                    // The PROSPER_FS_SPV *file* override is match-gated; a TESTPS override is not.
+                    // File and synthetic overrides have independent exact-match gates.
                     bool fs_ov = !ps_override.empty();
                     if (fs_ov && ps_override_is_file) {
                         if (fs_match_mode == 1)      fs_ov = (it.fs == fs_match);   // valid match -> exact only
                         else if (fs_match_mode == 2) fs_ov = false;                // requested-but-invalid -> off
                         // mode 0 -> legacy global file override (unchanged)
                     }
+                    if (fs_ov && ps_override_is_test) {
+                        if (testps_match_mode == 1)      fs_ov = (it.fs == testps_match);
+                        else if (testps_match_mode == 2) fs_ov = false;
+                        // mode 0 -> legacy global TESTPS override (unchanged)
+                    }
                     if (fs_ov && ps_override_is_file && fs_match_mode == 1)
                         fprintf(stderr, "[fs-match] file override applied to draw#%llu\n",
+                                (unsigned long long)it.draw_index);
+                    if (fs_ov && ps_override_is_test && testps_match_mode == 1)
+                        fprintf(stderr, "[testps-match] synthetic override applied to draw#%llu\n",
                                 (unsigned long long)it.draw_index);
                     bd.fs     = fs_ov ? ps_override : it.fs;
                     bd.vs_identity = refvs ? 0 : it.vs_identity;
@@ -1693,8 +1730,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                     // state to diagnose a pass whose inputs HIT the RTT cache yet outputs nothing —
                     // blend factors, write mask, viewport, and each PS-sampled texture address (#319).
                     if (rtt_log) {
-                        fprintf(stderr, "[rtt]   draw tgt=0x%llx vcount=%u nidx=%zu topo=%u mask=0x%x "
+                        fprintf(stderr, "[rtt]   draw#%llu vs=0x%llx fs=0x%llx tgt=0x%llx "
+                                "vcount=%u nidx=%zu topo=%u mask=0x%x "
                                 "blend=%d(src=%u dst=%u) vp=%d(%.2f,%.2f %.2fx%.2f) z=%d zw=%d ps=",
+                                (unsigned long long)it.draw_index,
+                                (unsigned long long)it.vs_guest_addr,
+                                (unsigned long long)it.fs_guest_addr,
                                 (unsigned long long)it.color0_base, bd.vcount, bd.indices.size(),
                                 it.ps.topology, it.ps.color_write_mask, (int)it.ps.blend_enable,
                                 it.ps.src_color_blend_factor, it.ps.dst_color_blend_factor,
