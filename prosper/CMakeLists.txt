@@ -438,6 +438,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_guest_memory_map PRIVATE prosper_core)
   add_test(NAME guest_memory_map COMMAND test_guest_memory_map)
 
+  add_executable(test_guest_read_cache_disabled tests/test_guest_read_cache_disabled.cpp)
+  target_link_libraries(test_guest_read_cache_disabled PRIVATE prosper_core)
+  add_test(NAME guest_read_cache_disabled COMMAND test_guest_read_cache_disabled)
+
   if(WIN32)
     add_executable(test_guest_write_watch tests/test_guest_write_watch.cpp)
     target_link_libraries(test_guest_write_watch PRIVATE prosper_core)
