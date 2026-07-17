@@ -464,9 +464,16 @@ HLE(f_open)  { std::string h = translate(CS(a0)); int host_flags = host_open_fla
                    "[file] open-result host='%s' guest-flags=0x%llx host-flags=0x%x -> fd=%d error=%d\n",
                    h.c_str(), (unsigned long long)a1, host_flags, fd, err);
                if (fd >= 0) preadlog("open", (uint64_t)fd, 0, 0); return (uint64_t)(int64_t)fd; }
+#ifdef __APPLE__
+void getdents_forget_fd(int fd);   // #843: cache invalidator, defined with f_getdents below
+#endif
 HLE(f_close) { if (a0 < 3) { preadlog("close-lo-ignored", a0, 0, 0); return 0; }
                preadlog("close", a0, 0, 0);
-               int fd = (int)a0; int r = ::close(fd); int err = r < 0 ? errno : 0;
+               int fd = (int)a0;
+#ifdef __APPLE__
+               getdents_forget_fd(fd);   // #843: drop any cached DIR* before this fd is closed/reused
+#endif
+               int r = ::close(fd); int err = r < 0 ? errno : 0;
                filelog_fd_io("close", fd, 0, 0, r, err);
                if (r == 0) filelog_forget_fd(fd);
                return (uint64_t)(int64_t)r; }
@@ -772,6 +779,21 @@ HLE(f_rmdir) { std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::rm
 // getdents64 on the SAME fd so the kernel keeps the directory cursor; Linux and BSD DT_* type
 // values match. Returns bytes written (0 = end of directory), or an SCE error. UE4 (PPSA17942)
 // enumerates its pak directory with this during IO-stack init.
+#ifdef __APPLE__
+// #843: sceKernelGetdents caches one DIR* per directory fd (Darwin has no getdents-on-fd). The cache
+// MUST be dropped when the guest closes that fd — otherwise a reused fd number hands back a STALE DIR*
+// for a previously-enumerated directory. .NET's Interop.Sys.EnumerateFilesRecursively (OpenDir ->
+// ReadDirR -> GetDirectoryEntryFullPath) opens+closes many directories, reusing fd numbers, so a stale
+// DIR* returns a consumed/closed directory -> a garbage DirectoryEntry -> strcmp on a bad name pointer,
+// crashing scene load (the macOS Blasphemous 2 first-level wall). File-scope so f_close can invalidate.
+static std::mutex g_getdents_mx;
+static std::map<int, DIR*> g_getdents_dirs;
+void getdents_forget_fd(int fd) {
+    std::lock_guard<std::mutex> lk(g_getdents_mx);
+    auto it = g_getdents_dirs.find(fd);
+    if (it != g_getdents_dirs.end()) { if (it->second) closedir(it->second); g_getdents_dirs.erase(it); }
+}
+#endif
 HLE(f_getdents) {
     if (!a1 || a2 < 32) return 0x80020016ull;   // EINVAL
 #ifdef __APPLE__
@@ -780,16 +802,15 @@ HLE(f_getdents) {
     // guest's fd number stays valid); seekdir puts back the first entry that doesn't fit.
     // CONFIDENCE: MED — a guest that closes the fd and gets the number reused for a different
     // directory would see a stale cursor; not exercised by current titles.
-    static std::mutex dirmx; static std::map<int, DIR*> dirs;
     DIR* dp = nullptr;
-    { std::lock_guard<std::mutex> lk(dirmx);
-      auto it = dirs.find((int)a0);
-      if (it != dirs.end()) dp = it->second;
+    { std::lock_guard<std::mutex> lk(g_getdents_mx);
+      auto it = g_getdents_dirs.find((int)a0);
+      if (it != g_getdents_dirs.end()) dp = it->second;
       else {
           int d2 = dup((int)a0);
           dp = d2 >= 0 ? fdopendir(d2) : nullptr;
           if (!dp) { if (d2 >= 0) ::close(d2); return 0x80020000ull | (uint64_t)(errno & 0xff); }
-          dirs[(int)a0] = dp;
+          g_getdents_dirs[(int)a0] = dp;
       } }
     uint8_t* out = (uint8_t*)P(a1);
     size_t w = 0;
