@@ -10,6 +10,7 @@
 //   s_endpgm
 // => out = ((a0+a1)*a2)*a3 + a1
 #include "../src/gpu/rdna2_to_spirv.hpp"
+#include "../src/gpu/agc_shader_layout.hpp"
 #include "../src/gpu/shader_resources.hpp"
 #include "compute_runner.h"
 #include <cstdio>
@@ -879,6 +880,31 @@ int main() {
     check_packed_fetch(code25packed_float, sizeof(code25packed_float) / 4,
                        DataFormat::Float10_11_11, packed_words, packed_expected,
                        "packed 10_11_11 FLOAT fetch widens mini-floats and default-fills W");
+
+    // #370 review: exercise the canonical descriptor contract, not just an injected DataFormat.
+    // R11G11B10_FLOAT uses DST_SEL(X,Y,Z,1) = 0x3AC; the resulting W must be exactly 1.0.
+    const uint32_t packed_float_vsharp[4] = {
+        0x00020000u, 4u << 16, N, (36u << 12) | 0x3ACu,
+    };
+    const DecodedBufferDescriptor packed_float_desc = decode_buffer_descriptor(packed_float_vsharp);
+    ShaderResourceTable packed_float_table;
+    { ShaderResource vb{}; vb.cls = ResourceClass::VertexBuffer;
+      vb.format = packed_float_desc.format; vb.num_components = packed_float_desc.num_components;
+      vb.binding = 3; vb.stride = packed_float_desc.stride; vb.sgpr_base = 8;
+      packed_float_table.resources.push_back(vb); }
+    std::vector<uint32_t> packed_float_spv = recompile_valu(
+        code25packed_float, sizeof(code25packed_float) / 4, 1, 1, &packed_float_table);
+    std::vector<float> packed_float_input(N);
+    for (uint32_t i = 0; i < N; ++i) packed_float_input[i] = (float)i;
+    std::vector<float> packed_float_got = prosper::test::run_compute(
+        packed_float_spv, packed_float_input, N, N, {}, packed_words);
+    uint32_t packed_float_bad = 0;
+    for (uint32_t i = 0; i < N && packed_float_got.size() == N; ++i)
+        if (std::fabs(packed_float_got[i] - packed_expected[i]) > 3e-3f) ++packed_float_bad;
+    CHECK(packed_float_desc.format == DataFormat::Float10_11_11 &&
+          packed_float_desc.num_components == 3 && !packed_float_desc.forbid_unknown_fallback &&
+          !packed_float_spv.empty() && packed_float_got.size() == N && packed_float_bad == 0,
+          "canonical format-36 X/Y/Z/1 descriptor executes R/G/B widening with W=1");
 
     // Kernel 26: s_buffer_load_dwordx8 (wide scalar load). s[0:7] = cbuf[4..11] (offset 0x10>>2=4);
     // out = (float)s7 = cbuf[11]. Real shaders load whole constant blocks in one x8/x16 op; this proves

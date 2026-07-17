@@ -217,6 +217,15 @@ int main() {
         d = decode_buffer_descriptor(v);
         CHECK(d.format == DataFormat::Unorm2_10_10_10 && d.num_components == 4,
               "packed V# with identity DST_SEL decodes normally");
+        v[3] = (36u << 12) | 0x3ACu; // R11G11B10_FLOAT canonical SQ_SEL_X/Y/Z/1
+        d = decode_buffer_descriptor(v);
+        CHECK(d.format == DataFormat::Float10_11_11 && d.num_components == 3 &&
+              !d.forbid_unknown_fallback,
+              "packed float V# with canonical X/Y/Z/1 selector decodes normally");
+        v[3] = (36u << 12) | 0x977u;
+        d = decode_buffer_descriptor(v);
+        CHECK(d.format == DataFormat::Unknown && d.num_components == 0 && d.forbid_unknown_fallback,
+              "packed float V# with a component permutation stays fail-closed");
         v[3] = (50u << 12) | 0x977u; // A/B/G/R permutation: SQ_SEL_W/Z/Y/X
         d = decode_buffer_descriptor(v);
         CHECK(d.format == DataFormat::Unknown && d.num_components == 0 && d.forbid_unknown_fallback,

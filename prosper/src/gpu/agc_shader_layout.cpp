@@ -124,13 +124,17 @@ DecodedBufferDescriptor decode_buffer_descriptor(const uint32_t v[4]) {
         d.format == DataFormat::Float10_11_11 || d.format == DataFormat::Unorm2_10_10_10 ||
         d.format == DataFormat::Snorm2_10_10_10 || d.format == DataFormat::Uint2_10_10_10 ||
         d.format == DataFormat::Sint2_10_10_10;
-    // BUFFER_LOAD_FORMAT applies the V#'s DST_SEL_X/Y/Z/W after format conversion. The recompiler's
-    // packed-word path currently returns physical R/G/B/A fields, so only accept the proven identity
-    // selector (SQ_SEL_X/Y/Z/W = 4/5/6/7 -> low 12 bits 0xFAC). Permutations and constant selectors
-    // must remain fail-closed until ShaderResource carries them through to SPIR-V; accepting them here
-    // would turn the old rejected draw into a silently wrong vector (#370 review).
+    // Packed loads currently lower physical fields directly, so accept only the exact selector shape
+    // represented by the recompiler: 2_10_10_10 uses X/Y/Z/W (0xFAC), while three-component
+    // 10_11_11_FLOAT uses X/Y/Z/1 (0x3AC), matching its W=1 default. Other permutations/constants
+    // remain fail-closed until ShaderResource carries arbitrary DST_SEL through to SPIR-V; accepting
+    // them here would turn the old rejected draw into a silently wrong vector (#370 review).
+    const uint32_t packed_selector = v[3] & 0xFFFu;
+    const bool supported_packed_selector =
+        d.format == DataFormat::Float10_11_11 ? packed_selector == 0x3ACu
+                                               : packed_selector == 0xFACu;
     const bool unsupported_scaled_2_10_10_10 = raw_format == 52u || raw_format == 53u;
-    if ((packed_word && (v[3] & 0xFFFu) != 0xFACu) || unsupported_scaled_2_10_10_10) {
+    if ((packed_word && !supported_packed_selector) || unsupported_scaled_2_10_10_10) {
         d.format = DataFormat::Unknown;
         d.num_components = 0;
         d.forbid_unknown_fallback = true;
