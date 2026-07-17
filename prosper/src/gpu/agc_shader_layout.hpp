@@ -107,6 +107,10 @@ struct DecodedBufferDescriptor {
     uint32_t   size_bytes = 0;
     DataFormat format = DataFormat::Float32;
     uint32_t   num_components = 1;
+    // True when the descriptor names a packed format whose exact semantics are known to be
+    // unsupported (currently non-identity DST_SEL or scaled 2_10_10_10). Dynamic fetch recovery
+    // must not reinterpret this deliberate rejection as the legacy unresolved-format Float32 fallback.
+    bool       forbid_unknown_fallback = false;
 };
 
 // Decode a 4-dword V# (RDNA2/Gen5 buffer resource). Pure; exposed for reuse + testing.

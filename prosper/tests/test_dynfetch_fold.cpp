@@ -105,6 +105,38 @@ int main() {
     std::vector<DynFetch> f4b = resolve_dynamic_fetch(k4b, sizeof(k4b)/sizeof(k4b[0]), seed4, 4, 8);
     CHECK(f4b.empty(), "kernel 4b reloaded SGPR blocks the seed fallback (no fabricated V#)");
 
+    // #370 review: a fully-known dynamic packed V# used to decode its unsupported DST_SEL as Unknown,
+    // then build_stage_table's legacy Unknown->Float32 fallback resurrected it as four raw dwords.
+    // resolve_dynamic_fetch must omit deliberate packed rejections while retaining identity descriptors.
+    const uint32_t k4packed[] = {
+        0xE00C2000u, 0x80020100u,   // buffer_load_format_xyzw v[1:4], v0, s[8:11], 0 idxen
+        0xBF810000u,
+    };
+    const uint32_t packed_permuted[4] = {
+        0x00020000u, 0x00040000u, 64u, (50u << 12) | 0x977u, // A/B/G/R
+    };
+    const uint32_t packed_constant[4] = {
+        0x00020000u, 0x00040000u, 64u, 50u << 12,           // constant-zero selectors
+    };
+    const uint32_t packed_scaled[4] = {
+        0x00020000u, 0x00040000u, 64u, (52u << 12) | 0xFACu, // unsupported USCALED
+    };
+    CHECK(resolve_dynamic_fetch(k4packed, sizeof(k4packed)/sizeof(k4packed[0]),
+                                packed_permuted, 4, 8).empty() &&
+          resolve_dynamic_fetch(k4packed, sizeof(k4packed)/sizeof(k4packed[0]),
+                                packed_constant, 4, 8).empty() &&
+          resolve_dynamic_fetch(k4packed, sizeof(k4packed)/sizeof(k4packed[0]),
+                                packed_scaled, 4, 8).empty(),
+          "dynamic packed permutations/constants/scaled formats cannot reach the Float32 fallback");
+    const uint32_t packed_identity[4] = {
+        0x00020000u, 0x00040000u, 64u, (50u << 12) | 0xFACu,
+    };
+    std::vector<DynFetch> f4packed = resolve_dynamic_fetch(
+        k4packed, sizeof(k4packed)/sizeof(k4packed[0]), packed_identity, 4, 8);
+    CHECK(f4packed.size() == 1 && f4packed[0].desc.format == DataFormat::Unorm2_10_10_10 &&
+          !f4packed[0].desc.forbid_unknown_fallback,
+          "dynamic identity packed V# reaches the real unpack format instead of Float32");
+
     // Kernel 5: descriptor-TABLE uses (#294). s[8:9] = a pointer to a host-memory table; the shader
     // s_loads an 8-dword T# (imm 0x40) + a 4-dword S#/V# (imm 0x80), consumes them via image_sample
     // (SRSRC/SSAMP) and s_buffer_load (SBASE). Each use must be reported with the load immediate as

@@ -118,7 +118,8 @@ DecodedBufferDescriptor decode_buffer_descriptor(const uint32_t v[4]) {
     d.base        = ((uint64_t)v[0] | ((uint64_t)v[1] << 32)) & 0xFFFFFFFFFFFFull;  // Base48
     d.stride      = (v[1] >> 16) & 0x3FFFu;                                          // 14-bit stride
     d.num_records = v[2];
-    rdna2_buffer_format((v[3] >> 12) & 0x7Fu, &d.format, &d.num_components);
+    const uint32_t raw_format = (v[3] >> 12) & 0x7Fu;
+    rdna2_buffer_format(raw_format, &d.format, &d.num_components);
     const bool packed_word =
         d.format == DataFormat::Float10_11_11 || d.format == DataFormat::Unorm2_10_10_10 ||
         d.format == DataFormat::Snorm2_10_10_10 || d.format == DataFormat::Uint2_10_10_10 ||
@@ -128,9 +129,11 @@ DecodedBufferDescriptor decode_buffer_descriptor(const uint32_t v[4]) {
     // selector (SQ_SEL_X/Y/Z/W = 4/5/6/7 -> low 12 bits 0xFAC). Permutations and constant selectors
     // must remain fail-closed until ShaderResource carries them through to SPIR-V; accepting them here
     // would turn the old rejected draw into a silently wrong vector (#370 review).
-    if (packed_word && (v[3] & 0xFFFu) != 0xFACu) {
+    const bool unsupported_scaled_2_10_10_10 = raw_format == 52u || raw_format == 53u;
+    if ((packed_word && (v[3] & 0xFFFu) != 0xFACu) || unsupported_scaled_2_10_10_10) {
         d.format = DataFormat::Unknown;
         d.num_components = 0;
+        d.forbid_unknown_fallback = true;
     }
     // num_records is in units of `stride` when strided, else raw bytes. Compute in 64-bit and clamp so a
     // 32-bit wrap (num_records is a full 32-bit field) can't produce a small value that slips a bogus

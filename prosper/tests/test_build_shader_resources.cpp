@@ -219,15 +219,19 @@ int main() {
               "packed V# with identity DST_SEL decodes normally");
         v[3] = (50u << 12) | 0x977u; // A/B/G/R permutation: SQ_SEL_W/Z/Y/X
         d = decode_buffer_descriptor(v);
-        CHECK(d.format == DataFormat::Unknown && d.num_components == 0,
+        CHECK(d.format == DataFormat::Unknown && d.num_components == 0 && d.forbid_unknown_fallback,
               "packed V# with a component permutation stays fail-closed");
         v[3] = (36u << 12);          // all four selectors synthesize constant zero
         d = decode_buffer_descriptor(v);
-        CHECK(d.format == DataFormat::Unknown && d.num_components == 0,
+        CHECK(d.format == DataFormat::Unknown && d.num_components == 0 && d.forbid_unknown_fallback,
               "packed V# with constant selectors stays fail-closed");
+        v[3] = (52u << 12) | 0xFACu;
+        d = decode_buffer_descriptor(v);
+        CHECK(d.format == DataFormat::Unknown && d.num_components == 0 && d.forbid_unknown_fallback,
+              "packed 2_10_10_10 USCALED forbids the dynamic Float32 fallback");
         v[3] = (77u << 12) | 0x977u;
         d = decode_buffer_descriptor(v);
-        CHECK(d.format == DataFormat::Float32 && d.num_components == 4,
+        CHECK(d.format == DataFormat::Float32 && d.num_components == 4 && !d.forbid_unknown_fallback,
               "non-packed V# selector behavior is unchanged");
     }
     {   // RDNA2 combined-format decode coverage (the four game-observed anchors + a real V# regression).
