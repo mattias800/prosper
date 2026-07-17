@@ -66,9 +66,9 @@ size_t svc_copy_words(uint64_t src, uint64_t* dst, size_t words) {
 void svc_log(const char* fn, uint64_t a0, uint64_t a1, uint64_t a2,
              uint64_t a3, uint64_t a4, uint64_t a5, int dump_words = 8) {
     if (!svclog()) return;
-    fprintf(stderr, "[svc] %s(%#lx, %#lx, %#lx, %#lx, %#lx, %#lx)\n",
-            fn, (unsigned long)a0, (unsigned long)a1, (unsigned long)a2,
-            (unsigned long)a3, (unsigned long)a4, (unsigned long)a5);
+    fprintf(stderr, "[svc] %s(%#" PRIx64 ", %#" PRIx64 ", %#" PRIx64
+                    ", %#" PRIx64 ", %#" PRIx64 ", %#" PRIx64 ")\n",
+            fn, a0, a1, a2, a3, a4, a5);
     const uint64_t args[6] = { a0, a1, a2, a3, a4, a5 };
     for (int i = 0; i < 6; i++) {
         if (!svc_ptrish(args[i])) continue;

@@ -22,7 +22,7 @@ bool call_open(prosper::HleFn open, void* pointer) {
     return open(1, 0xdcdfb7a0, reinterpret_cast<uintptr_t>(pointer), 1, 0x83, 0) == 0;
 }
 
-bool logs_full_word(prosper::HleFn open, void* pointer) {
+bool logs_full_values(prosper::HleFn open, void* pointer) {
     FILE* capture = std::tmpfile();
     if (!capture) return false;
     if (std::fflush(stderr) != 0) {
@@ -51,7 +51,9 @@ bool logs_full_word(prosper::HleFn open, void* pointer) {
         return false;
     }
 
-    const bool called = call_open(open, pointer);
+    const bool called =
+        open(1, 0xdcdfb7a0, reinterpret_cast<uintptr_t>(pointer), 1, 0x83,
+             0x1122334455667788ull) == 0;
     const bool flushed = std::fflush(stderr) == 0;
 #ifdef _WIN32
     const bool restored = _dup2(saved_stderr, stderr_fd) == 0;
@@ -66,8 +68,13 @@ bool logs_full_word(prosper::HleFn open, void* pointer) {
     const size_t bytes = std::fread(output, 1, sizeof(output) - 1, capture);
     std::fclose(capture);
     output[bytes] = '\0';
-    return called && flushed && restored &&
-           std::strstr(output, "[svc]   a2 -> 1122334455667788") != nullptr;
+    const bool full_argument =
+        std::strstr(output, ", 0x1122334455667788)") != nullptr;
+    const bool full_word =
+        std::strstr(output, "[svc]   a2 -> 1122334455667788") != nullptr;
+    if (!full_argument || !full_word)
+        std::fprintf(stderr, "captured service log:\n%s", output);
+    return called && flushed && restored && full_argument && full_word;
 }
 }
 
@@ -115,7 +122,7 @@ int main() {
     // The remaining literals came from a Blasphemous 2 call. Each address is pointer-shaped but
     // cannot safely be dereferenced for every requested word.
     bool ok = call_open(open, reserved) && call_open(open, protected_page) &&
-              call_open(open, guard_page) && logs_full_word(open, boundary + page_size - 8);
+              call_open(open, guard_page) && logs_full_values(open, boundary + page_size - 8);
 
     // Exercise the review finding: the mapping can disappear concurrently with the snapshot.
     std::atomic<bool> run{true};
