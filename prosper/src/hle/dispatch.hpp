@@ -74,6 +74,9 @@ void register_kernel_hle();
 void register_file_hle();
 // Set the host directory backing the guest's "/app0" (the game data root).
 void set_app0_root(const std::string& root);
+// Resolve a guest filesystem path through the same mount table used by libkernel file I/O.
+// Host frontends such as native media decoders must never receive raw /app0 paths.
+std::string resolve_guest_path(const char* guest_path);
 // Mount/unmount the guest "/savedata0" area onto a host dir named by the save's dirName
 // (sceSaveDataMount3 HLE). create=true makes the dir; create=false fails if it doesn't exist.
 bool savedata0_mount(const char* dirname, bool create);

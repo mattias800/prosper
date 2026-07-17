@@ -1,4 +1,4 @@
-// test_avplayer (#324) — libSceAvPlayer lifecycle. prosper doesn't decode video, but the two init
+// test_avplayer (#324/#841) — libSceAvPlayer lifecycle and native-backend handoff. The two init
 // entry points have DIFFERENT ABIs and must be distinguished, or the guest's video wrapper misreads the
 // result. sceAvPlayerInit RETURNS the handle; sceAvPlayerInitEx returns an int32 error code (0 = success)
 // and WRITES the handle to its out-param. Registering InitEx to the return-the-handle handler made
@@ -8,10 +8,13 @@
 // player mutex. This locks both contracts.
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
+#include "../src/hle/video_backend.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <vector>
 
 using namespace prosper;
 
@@ -29,7 +32,59 @@ struct AvpInitData {
 struct AvpFrameInfoEx {
     void* data = nullptr; uint8_t reserved[4]{}; uint64_t timestamp = 0; uint8_t details[80]{};
 };
+struct AvpStreamInfoEx {
+    uint64_t size = 0; uint32_t type = 0; uint8_t reserved[4]{};
+    uint8_t details[80]{}; uint64_t duration = 0;
+};
 static_assert(offsetof(AvpFrameInfoEx, details) == 24, "AvPlayerFrameInfoEx ABI");
+
+class FakeVideoBackend final : public video::VideoBackend {
+public:
+    bool fail_open = false;
+    bool delivered = false;
+    bool audio_delivered = false;
+    int close_count = 0;
+    std::string opened_path;
+    std::vector<uint8_t> nv12 = std::vector<uint8_t>(640 * 360 * 3 / 2, 0x40);
+    std::vector<int16_t> pcm = std::vector<int16_t>(2 * 128, 0x20);
+
+    int open(const std::string& host_path) override {
+        opened_path = host_path; delivered = false; audio_delivered = false;
+        return fail_open ? -1 : 17;
+    }
+    bool info(int id, video::StreamInfo& out) override {
+        if (id != 17) return false;
+        out.width = 640; out.height = 360; out.fps = 60.0f;
+        out.has_audio = true; out.audio_channels = 2; out.audio_rate = 48'000;
+        out.duration_us = 2'000'000;
+        return true;
+    }
+    bool next_video(int id, video::VideoFrame& out) override {
+        if (id != 17 || delivered) return false;
+        out.y = nv12.data(); out.uv = nv12.data() + 640 * 360;
+        out.width = 640; out.height = 360; out.y_stride = 640; out.uv_stride = 640;
+        out.pts_us = 16'667; delivered = true;
+        return true;
+    }
+    bool next_audio(int id, video::AudioFrame& out) override {
+        if (id != 17 || audio_delivered) return false;
+        out.pcm = pcm.data(); out.channels = 2; out.samples = 128; out.sample_rate = 48'000;
+        out.pts_us = 0; audio_delivered = true;
+        return true;
+    }
+    // Video completion must not wait for an audio packet that the guest never requests.
+    bool eof(int id) override { return id != 17 || delivered; }
+    void close(int id) override { if (id == 17) ++close_count; }
+};
+
+static void set_synthetic_frames(const char* value) {
+#ifdef _WIN32
+    _putenv_s("PROSPER_AVP_SYNTH_FRAMES", value ? value : "");
+#else
+    if (value) setenv("PROSPER_AVP_SYNTH_FRAMES", value, 1);
+    else unsetenv("PROSPER_AVP_SYNTH_FRAMES");
+#endif
+}
 
 static uint32_t events[8]{};
 static int event_count = 0;
@@ -70,9 +125,10 @@ int main() {
     HleFn infoex  = Hle::lookup("ctTAcF5DiKQ");
     HleFn pause   = Hle::lookup("9y5v+fGN4Wk");
     HleFn resume  = Hle::lookup("w5moABNwnRY");
-    CHECK(init && initex && active && add && start && video && audio && streams && infoex && pause && resume,
+    HleFn close   = Hle::lookup(nid_hash("sceAvPlayerClose"));
+    CHECK(init && initex && active && add && start && video && audio && streams && infoex && pause && resume && close,
           "AvPlayer lifecycle and stream functions registered");
-    if (!(init && initex && active && add && start && video && audio && streams && infoex && pause && resume)) {
+    if (!(init && initex && active && add && start && video && audio && streams && infoex && pause && resume && close)) {
         printf("== FAIL ==\n"); return 1;
     }
 
@@ -90,21 +146,76 @@ int main() {
     // IsActive must report "not active" so the game's while(IsActive) playback loop ends and it advances.
     CHECK(active(out, 0, 0, 0, 0, 0) == 0, "sceAvPlayerIsActive -> 0 (finished, proceed)");
 
+    // A missing native source must stay failed: no READY callback, no streams, and no implicit black
+    // frames. The same backend then proves /app0 translation and real stream metadata/frame handoff.
+    set_synthetic_frames(nullptr);
+    set_app0_root("C:/prosper-test-app0");
+    FakeVideoBackend fake;
+    prosper::video::set_backend(&fake);
+    AvpInitData data{};
+    data.event.event_callback = (void*)&on_avplayer_event;
+    event_count = 0;
+    fake.fail_open = true;
+    uint64_t failed_handle = init((uint64_t)(uintptr_t)&data, 0, 0, 0, 0, 0);
+    const char missing_source[] = "/app0/missing.mp4";
+    CHECK(add(failed_handle, (uint64_t)(uintptr_t)missing_source, 0, 0, 0, 0) != 0,
+          "native source-open failure is returned instead of selecting synthetic playback");
+    CHECK(streams(failed_handle, 0, 0, 0, 0, 0) == 0 && event_count == 0,
+          "failed source has no streams and fires no READY callback");
+    close(failed_handle, 0, 0, 0, 0, 0);
+
+    fake.fail_open = false;
+    event_count = 0;
+    uint64_t native_handle = init((uint64_t)(uintptr_t)&data, 0, 0, 0, 0, 0);
+    const char native_source[] = "/app0/movie.mp4";
+    CHECK(add(native_handle, (uint64_t)(uintptr_t)native_source, 0, 0, 0, 0) == 0,
+          "native source opens through the registered backend");
+    CHECK(fake.opened_path == "C:/prosper-test-app0/movie.mp4",
+          "native backend receives the resolved host path, not raw /app0");
+    CHECK(streams(native_handle, 0, 0, 0, 0, 0) == 2,
+          "native audio-bearing source enumerates video and audio streams");
+    AvpStreamInfoEx native_info{}; native_info.size = sizeof(native_info);
+    CHECK(infoex(native_handle, 0, (uint64_t)(uintptr_t)&native_info, 0, 0, 0) == 0 &&
+              native_info.type == 1 && native_info.duration == 2000,
+          "native stream metadata and duration come from the backend");
+    native_info = {}; native_info.size = sizeof(native_info);
+    CHECK(infoex(native_handle, 1, (uint64_t)(uintptr_t)&native_info, 0, 0, 0) == 0 &&
+              native_info.type == 2,
+          "native audio stream metadata comes from the backend");
+    CHECK(start(native_handle, 0, 0, 0, 0, 0) == 0 && event_count == 2 &&
+              events[0] == 2 && events[1] == 3,
+          "native playback fires READY then PLAY");
+    AvpFrameInfoEx native_frame{};
+    CHECK(video(native_handle, (uint64_t)(uintptr_t)&native_frame, 0, 0, 0, 0) == 1 &&
+              native_frame.data == fake.nv12.data() && native_frame.timestamp == 16,
+          "native decoded NV12 frame and timestamp reach the guest");
+    uint32_t native_width = 0, native_height = 0; double native_fps = 0.0;
+    memcpy(&native_width, native_frame.details + 0, sizeof(native_width));
+    memcpy(&native_height, native_frame.details + 4, sizeof(native_height));
+    memcpy(&native_fps, native_frame.details + 48, sizeof(native_fps));
+    CHECK(native_width == 640 && native_height == 360 && native_fps == 60.0,
+          "native frame details preserve backend dimensions and frame rate");
+    CHECK(video(native_handle, (uint64_t)(uintptr_t)&native_frame, 0, 0, 0, 0) == 0 &&
+              event_count == 3 && events[2] == 1 && !fake.audio_delivered,
+          "video-only consumption of an audio-bearing source reaches EOF and fires one STOP");
+    CHECK(active(native_handle, 0, 0, 0, 0, 0) == 0 &&
+              video(native_handle, (uint64_t)(uintptr_t)&native_frame, 0, 0, 0, 0) == 0 &&
+              event_count == 3,
+          "completed audio-bearing playback stays inactive without repeating STOP");
+    close(native_handle, 0, 0, 0, 0, 0);
+    CHECK(fake.close_count == 1, "Close releases the native decode session");
+    prosper::video::set_backend(nullptr);
+
     // One delivered synthetic frame, then EOF on the next pull. Astro Bot follows this path and does
     // not call IsActive. The STOP callback re-enters no HLE here, but the production callback may do
     // so, therefore GetVideoDataEx must release the player mutex before firing it.
-#ifdef _WIN32
-    _putenv_s("PROSPER_AVP_SYNTH_FRAMES", "1");
-#else
-    setenv("PROSPER_AVP_SYNTH_FRAMES", "1", 1);
-#endif
-    AvpInitData data{};
-    data.event.event_callback = (void*)&on_avplayer_event;
+    set_synthetic_frames("1");
+    event_count = 0;
     uint64_t h2 = init((uint64_t)(uintptr_t)&data, 0, 0, 0, 0, 0);
     const char source[] = "/app0/test.mp4";
     CHECK(add(h2, (uint64_t)(uintptr_t)source, 0, 0, 0, 0) == 0, "sceAvPlayerAddSource succeeds");
     CHECK(streams(h2, 0, 0, 0, 0, 0) == 2, "synthetic MP4 source enumerates video and audio streams");
-    struct StreamInfoEx { uint64_t size; uint32_t type; uint8_t reserved[4]; uint8_t details[80]; uint64_t duration; } info{};
+    AvpStreamInfoEx info{};
     info.size = sizeof(info);
     CHECK(infoex(h2, 0, (uint64_t)(uintptr_t)&info, 0, 0, 0) == 0 && info.size == sizeof(info) &&
           info.type == 1 && info.duration == 33, "synthetic stream metadata is valid and size-preserving");

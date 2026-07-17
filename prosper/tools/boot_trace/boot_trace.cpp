@@ -24,6 +24,9 @@ extern "C" int prosper_reserved_range_state(uint64_t);   // memory-HLE mapping c
 #ifdef PROSPER_PAD_EVDEV
 #include "pad_evdev.hpp"                  // zero-dep Linux evdev gamepad frontend
 #endif
+#ifdef PROSPER_VIDEO_MF
+#include "media_foundation_backend.hpp"   // native Windows AvPlayer demux + hardware decode
+#endif
 #ifdef PROSPER_HAVE_VULKAN
 #include "gpu/gpu_execute.hpp"
 #include "gpu/tile.hpp"                   // render-target de-swizzle (detile_surface, tiled_surface_bytes)
@@ -121,6 +124,10 @@ int main(int argc, char** argv) {
     // — right after the built-in HLE is registered, before the images are mapped: sceAudioOut
     // output to the host, and (gated by PROSPER_PAD) a controller backend (SDL3, else evdev).
     if (!boot_program(d, p, &e, [&]{
+#ifdef PROSPER_VIDEO_MF
+        if (!prosper::video::install_media_foundation_backend())
+            fprintf(stderr, "[avp] Media Foundation backend unavailable\n");
+#endif
 #ifdef PROSPER_AUDIO_SDL3
         prosper::install_sdl3_audio_sink();
 #endif
