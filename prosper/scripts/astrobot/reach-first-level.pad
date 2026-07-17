@@ -1,0 +1,22 @@
+# Astro Bot (PPSA21564): fresh-save route through the title and world map into intro_next.
+# Keep both flip-anchored and wall-time recovery pulses: video decoding and resource loading advance
+# at different rates across headless/app and Linux/Windows frontends.
+f3800-3860:cross
+f4000-4060:cross
+f4200-4260:options
+f4400-4460:cross
+f4600-4660:cross
+f4800-4860:options
+f5000-5060:cross
+f5260-5330:cross
+f5600-5660:options
+f5940-6010:cross
+60-61:cross
+64-65:options
+68-69:cross
+72-73:cross
+76-77:options
+80-81:cross
+85-86:cross
+90-91:options
+95-96:cross
