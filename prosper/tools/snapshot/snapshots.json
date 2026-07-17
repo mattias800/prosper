@@ -20,7 +20,7 @@
         480,
         270
       ],
-      "review": "pending",
+      "review": "Approved 16 composited images from two independent runs on 2026-07-16; intended scene, layers, and progression visually confirmed.",
       "_note": "Reviewed presented-frame guard for The Messenger's first level. A late idempotent Up/Cross recovery sequence tolerates cold full-render stalls that can skip early menu polls. Both independent runs show the player, terrain/structures, sky, water, HUD, and animation progression in every retained frame.",
       "structural_references": [
         {

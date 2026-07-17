@@ -32,17 +32,24 @@ function Invoke-Capture {
         [Parameter(Mandatory = $true)] [string] $WorkingDirectory
     )
 
+    $PreviousErrorActionPreference = $ErrorActionPreference
     Push-Location $WorkingDirectory
     try {
+        # Native stderr is ordinary captured output (for example compiler warnings). Decide native
+        # command success from LASTEXITCODE instead of promoting any stderr line to a terminating
+        # PowerShell error under the script-wide ErrorActionPreference='Stop'.
+        $ErrorActionPreference = 'Continue'
         $Output = & $Executable @Arguments 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            throw "$Executable failed with exit code $LASTEXITCODE`: $($Output -join [Environment]::NewLine)"
-        }
-        return ($Output -join [Environment]::NewLine).Trim()
+        $ExitCode = $LASTEXITCODE
     }
     finally {
+        $ErrorActionPreference = $PreviousErrorActionPreference
         Pop-Location
     }
+    if ($ExitCode -ne 0) {
+        throw "$Executable failed with exit code $ExitCode`: $($Output -join [Environment]::NewLine)"
+    }
+    return ($Output -join [Environment]::NewLine).Trim()
 }
 
 function Format-Command {
@@ -85,8 +92,11 @@ function Invoke-AuthorCheck {
     }
 
     $Watch = [Diagnostics.Stopwatch]::StartNew()
+    $PreviousErrorActionPreference = $ErrorActionPreference
     Push-Location $WorkingDirectory
     try {
+        # Preserve and display native stderr, but let the process exit code determine PASS/FAIL.
+        $ErrorActionPreference = 'Continue'
         $Lines = @(& $Executable @Arguments 2>&1 | ForEach-Object {
             Write-Host $_
             $_.ToString()
@@ -94,6 +104,7 @@ function Invoke-AuthorCheck {
         $ExitCode = $LASTEXITCODE
     }
     finally {
+        $ErrorActionPreference = $PreviousErrorActionPreference
         Pop-Location
         $Watch.Stop()
     }
