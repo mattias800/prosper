@@ -925,6 +925,17 @@ bool guest_writable(uint64_t a, uint32_t n) {
 #endif
 }
 
+// Registered AGC headers publish the shader blob size in bytes. Dynamic descriptor folding used to
+// ignore it and hand the decoder a fixed 0x4000-dword window, allowing the walk to read up to 64 KiB
+// past a short shader. Truncate a non-dword-aligned tail rather than reading one byte beyond the blob,
+// and refuse a declared span that is not wholly readable. A zero result safely disables only the
+// optional fold; metadata-described resources remain available to build_stage_table.
+size_t registered_shader_dwords(const AgcShaderHeader& header, uint64_t code_addr) {
+    const uint32_t shader_bytes = header.shader_size & ~uint32_t{3};
+    if (!shader_bytes || !guest_readable(code_addr, shader_bytes)) return 0;
+    return shader_bytes / sizeof(uint32_t);
+}
+
 // --- Bindless-dynamic vertex-fetch resolution (const-fold the scalar setup) ---------------------------
 // This game's NGG vertex shader loads its vertex-buffer V# from a descriptor table at a RUNTIME-computed
 // offset (e.g. `s_load_dwordx4 s[8:11], s[24:25], vcc_hi` where `vcc_hi = (s64<<4)&0x1f0` and
@@ -1602,7 +1613,8 @@ void assign_convention_bindings(ShaderResourceTable& t, uint32_t first) {
             r.binding = tex_next++;
 }
 
-std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps) {
+std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint64_t code_addr,
+                                                       bool is_ps, uint32_t draw_vertex_count) {
     if (!code_addr) return nullptr;
     const auto* hdr = (const AgcShaderHeader*)prosper_agc_shader_header_for_code(code_addr);
     if (!hdr) return nullptr;
@@ -1611,6 +1623,7 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
     const auto metadata_start = phase_timing ? StageClock::now() : StageClock::time_point{};
     namespace P = prosper::agc::Pm4;
     const bool log = getenv("PROSPER_GFXLOG") != nullptr;
+    const size_t shader_dwords = registered_shader_dwords(*hdr, code_addr);
 
     // The V#/T# descriptors live in the stage's user-data SGPR block. The pixel stage uses PS user
     // data; the vertex/geometry stage under NGG merges the ES program's descriptors into GS user data.
@@ -1703,13 +1716,13 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
     const auto metadata_done = phase_timing ? StageClock::now() : StageClock::time_point{};
     if (is_ps) {
         uint32_t sgprs[kUserSgprs]; read_user_sgprs(st.sh, bases[0] + range_start, sgprs);
-        dyn_vb = resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, 0x4000,
+        dyn_vb = resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, shader_dwords,
                                        sgprs, kUserSgprs, 0, &srt_uses);
     } else {
         uint32_t sgprs[kUserSgprs]; read_user_sgprs(st.sh, bases[0] + range_start, sgprs);
         // NGG merged VS/GS: s0..s7 are system SGPRs, user data starts at s8 (confirmed by matching the
         // shader's s[8:11]/s[24:25] descriptor pointers to the register file at GS_0+offset).
-        dyn_vb = resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, 0x4000,
+        dyn_vb = resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, shader_dwords,
                                        sgprs, kUserSgprs, 8, &srt_uses);
         if (getenv("PROSPER_GFXLOG") || getenv("PROSPER_RESDUMP")) {
             fprintf(stderr, "[dynvb] VS resolved %zu dynamic vertex-fetch descriptor(s):\n", dyn_vb.size());
@@ -1780,11 +1793,37 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
             r.format        = (d.format == DataFormat::Unknown) ? DataFormat::Float32 : d.format;
             r.num_components = d.num_components ? d.num_components : 4;
             r.gpu_addr      = d.base;
-            r.size          = d.size_bytes ? d.size_bytes : (d.stride ? d.stride * 4 : 128);
+            if (d.size_bytes) {
+                r.size = d.size_bytes;
+            } else {
+                const bool packed_word =
+                    r.format == DataFormat::Float10_11_11 ||
+                    r.format == DataFormat::Unorm2_10_10_10 ||
+                    r.format == DataFormat::Snorm2_10_10_10 ||
+                    r.format == DataFormat::Uint2_10_10_10 ||
+                    r.format == DataFormat::Sint2_10_10_10;
+                const uint64_t element_bytes = packed_word ? 4u :
+                    static_cast<uint64_t>(data_format_bytes(r.format)) * r.num_components;
+                const uint64_t record_bytes = d.stride ? d.stride : element_bytes;
+                const uint64_t draw_bytes = record_bytes * draw_vertex_count;
+                r.size = static_cast<uint32_t>(std::min<uint64_t>(draw_bytes, 0x10000000ull));
+            }
             r.stride        = d.stride;
             r.sgpr_base     = kv.srsrc;           // DIRECT provenance = the fetch's SRSRC SGPR (fallback)
             r.fetch_pc      = kv.fetch_pc;        // PER-FETCH provenance = the exact fetch instruction
             r.srt_offset    = 0xFFFFFFFFu;
+            if (d.format == DataFormat::Unknown) {
+                static std::mutex unknown_mx;
+                static std::set<std::tuple<uint64_t, bool, uint32_t, uint32_t>> unknown_seen;
+                std::lock_guard<std::mutex> lk(unknown_mx);
+                if (unknown_seen.emplace(code_addr, is_ps, kv.fetch_pc, kv.desc_v3).second)
+                    std::fprintf(stderr,
+                                 "[dynvb] %s code=0x%llx fetch pc=%u has unknown V# format 0x%x; "
+                                 "using Float32x4 (draw_vertices=%u size=%u)\n",
+                                 is_ps ? "PS" : "VS", (unsigned long long)code_addr,
+                                 kv.fetch_pc, (kv.desc_v3 >> 12) & 0x7fu,
+                                 draw_vertex_count, r.size);
+            }
             t.resources.push_back(r);
         }
         // Descriptor-TABLE resources (#294): one ShaderResource per distinct table use, keyed by the
@@ -2148,6 +2187,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
                              (unsigned long long)code_addr);
             continue;
         }
+        const size_t shader_dwords = registered_shader_dwords(*header, code_addr);
 
         uint32_t range_start = 0;
         if (header->specials && guest_readable((uint64_t)(uintptr_t)header->specials,
@@ -2170,7 +2210,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
         // Texture. Never shadow an existing resource at the same srt_offset (first-match-wins).
         {
             std::vector<SrtUse> srt_uses;
-            resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, 0x4000,
+            resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, shader_dwords,
                                   sgprs, kUserSgprs, /*user_sgpr_base*/0, &srt_uses);
             std::set<uint64_t> srt_seen;
             for (const auto& u : srt_uses) {
@@ -2317,7 +2357,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
                 continue;
             const uint32_t required = rdna2_sload_required_bytes(
                 reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(code_addr)),
-                0x4000, resource.sgpr_base);
+                shader_dwords, resource.sgpr_base);
             if (required > resource.size && required <= 0x10000000u &&
                 guest_readable(resource.gpu_addr, required)) {
                 if (std::getenv("PROSPER_DBG"))
@@ -2400,7 +2440,7 @@ std::vector<ComputeItem> realize_compute_dispatches(
                                      sgprs[i], sgprs[i + 1], sgprs[i + 2], sgprs[i + 3]);
                     std::vector<SrtUse> cs_uses;
                     g_dyntrace_force = true;
-                    resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, 0x4000,
+                    resolve_dynamic_fetch((const uint32_t*)(uintptr_t)code_addr, shader_dwords,
                                           sgprs, kUserSgprs, 0, &cs_uses);
                     g_dyntrace_force = false;
                     std::fprintf(stderr, "[dynfail]   const-fold recovered %zu descriptor use(s):\n",
@@ -2663,7 +2703,7 @@ void diagnose_resource_provenance(const GpuState& st, uint64_t submit_no) {
         // Query before recording this draw's target: a feedback draw should resolve to the preceding
         // writer, not identify itself as its own producer.
         if (inspect_consumers && rs.ps_addr) {
-            auto prt = build_stage_table(ds, rs.ps_addr, true);
+            auto prt = build_stage_table(ds, rs.ps_addr, true, st.draws[i].index_count);
             if (prt) for (const auto& r : prt->resources) {
                 if (r.width != want_w || r.height != want_h) continue;
                 const uint64_t resource_size = r.size ? r.size :

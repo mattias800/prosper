@@ -122,12 +122,118 @@ int main() {
     CHECK(rc == 0 && dst == &pixel, "pixel buffer-fetch shader enters the AGC registry");
     prosper::gpu::GpuState empty_state;
     auto pixel_table = prosper::gpu::build_stage_table(
-        empty_state, reinterpret_cast<uint64_t>(pixel_buffer_fetch), true);
+        empty_state, reinterpret_cast<uint64_t>(pixel_buffer_fetch), true, 4);
     const prosper::gpu::ShaderResource* pixel_buffer = pixel_table
         ? pixel_table->by_fetch_pc(6) : nullptr;
     CHECK(pixel_buffer && pixel_buffer->cls == prosper::gpu::ResourceClass::ConstantBuffer &&
           pixel_buffer->gpu_addr == 0x20000u && pixel_buffer->stride == 16u,
           "pixel-stage buffer_load_format keeps its exact structured-buffer V# resource");
+
+    // #158: the dynamic fold must use the registered header's byte size, not a fixed 64 KiB walk.
+    // The valid-looking descriptor setup and fetch deliberately sit beyond the declared one-dword
+    // shader. The old 0x4000-dword call found them; the bounded walk must not inspect them.
+    const uint32_t trailing_fetch[] = {
+        0xBF800000u,                // declared shader: s_nop 0
+        0xBE8803FFu, 0x00020000u,   // outside blob: s_mov_b32 s8, V# base low
+        0xBE8903FFu, 0x00100000u,   // s_mov_b32 s9, stride 16
+        0xBE8A0380u,                // s_mov_b32 s10, 0 records
+        0xBE8B0380u,                // s_mov_b32 s11, unknown format
+        0xE0002000u, 0x80020100u,   // pc=7: buffer_load_format_x v1, v0, s[8:11], 0 idxen
+        0xBF810000u,
+    };
+    Shader bounded{};
+    bounded.file_header = 0x34333231u;
+    bounded.version = 0x18u;
+    bounded.shader_size = sizeof(uint32_t);
+    bounded.type = 2;
+    dst = nullptr;
+    rc = create_shader(reinterpret_cast<uint64_t>(&dst), reinterpret_cast<uint64_t>(&bounded),
+                       reinterpret_cast<uint64_t>(trailing_fetch), 0, 0, 0);
+    CHECK(rc == 0 && dst == &bounded, "short shader enters the AGC registry");
+    auto bounded_table = prosper::gpu::build_stage_table(
+        empty_state, reinterpret_cast<uint64_t>(trailing_fetch), false, 7);
+    CHECK(!bounded_table || !bounded_table->by_fetch_pc(7),
+          "dynamic fetch walk cannot discover instructions beyond header.shader_size");
+
+    // A zero-record V# has no descriptor-provided byte bound. Size it from this draw instead of the
+    // title-screen-specific stride*4 fallback. Unknown format remains a compatibility fallback, but
+    // is surfaced and its unstrided record width is derived from the effective Float32x4 shape.
+    const uint32_t zero_record_strided[] = {
+        0xBE8803FFu, 0x00020000u,   // s_mov_b32 s8, V# base low
+        0xBE8903FFu, 0x00140000u,   // s_mov_b32 s9, stride 20
+        0xBE8A0380u,                // s_mov_b32 s10, 0 records
+        0xBE8B0380u,                // s_mov_b32 s11, unknown format
+        0xE0002000u, 0x80020100u,   // pc=6: buffer_load_format_x v1, v0, s[8:11], 0 idxen
+        0xBF810000u,
+    };
+    Shader strided{};
+    strided.file_header = 0x34333231u;
+    strided.version = 0x18u;
+    strided.shader_size = sizeof(zero_record_strided);
+    strided.type = 2;
+    dst = nullptr;
+    rc = create_shader(reinterpret_cast<uint64_t>(&dst), reinterpret_cast<uint64_t>(&strided),
+                       reinterpret_cast<uint64_t>(zero_record_strided), 0, 0, 0);
+    CHECK(rc == 0 && dst == &strided, "zero-record strided shader enters the AGC registry");
+    auto strided_table = prosper::gpu::build_stage_table(
+        empty_state, reinterpret_cast<uint64_t>(zero_record_strided), false, 7);
+    const prosper::gpu::ShaderResource* strided_buffer = strided_table
+        ? strided_table->by_fetch_pc(6) : nullptr;
+    CHECK(strided_buffer && strided_buffer->format == prosper::gpu::DataFormat::Float32 &&
+          strided_buffer->num_components == 4 && strided_buffer->size == 7u * 20u,
+          "zero-record strided V# size follows draw vertex count, not four vertices");
+
+    const uint32_t zero_record_unstrided[] = {
+        0xBE8803FFu, 0x00030000u,   // s_mov_b32 s8, V# base low
+        0xBE890380u,                // s_mov_b32 s9, stride 0
+        0xBE8A0380u,                // s_mov_b32 s10, 0 records
+        0xBE8B0380u,                // s_mov_b32 s11, unknown format
+        0xE0002000u, 0x80020100u,   // pc=5: buffer_load_format_x v1, v0, s[8:11], 0 idxen
+        0xBF810000u,
+    };
+    Shader unstrided{};
+    unstrided.file_header = 0x34333231u;
+    unstrided.version = 0x18u;
+    unstrided.shader_size = sizeof(zero_record_unstrided);
+    unstrided.type = 2;
+    dst = nullptr;
+    rc = create_shader(reinterpret_cast<uint64_t>(&dst), reinterpret_cast<uint64_t>(&unstrided),
+                       reinterpret_cast<uint64_t>(zero_record_unstrided), 0, 0, 0);
+    CHECK(rc == 0 && dst == &unstrided, "zero-record unstrided shader enters the AGC registry");
+    auto unstrided_table = prosper::gpu::build_stage_table(
+        empty_state, reinterpret_cast<uint64_t>(zero_record_unstrided), false, 7);
+    const prosper::gpu::ShaderResource* unstrided_buffer = unstrided_table
+        ? unstrided_table->by_fetch_pc(5) : nullptr;
+    CHECK(unstrided_buffer && unstrided_buffer->size == 7u * 4u * sizeof(float),
+          "zero-record unstrided V# size uses draw count and effective format, not magic 128");
+
+    // Packed V# formats report no per-component byte size because their fields share one dword.
+    // The draw-derived fallback must retain that physical four-byte record instead of collapsing
+    // the resource to zero bytes when both NUM_RECORDS and STRIDE are zero.
+    const uint32_t zero_record_packed[] = {
+        0xBE8803FFu, 0x00040000u,   // s_mov_b32 s8, V# base low
+        0xBE890380u,                // s_mov_b32 s9, stride 0
+        0xBE8A0380u,                // s_mov_b32 s10, 0 records
+        0xBE8B03FFu, (50u << 12) | 0xFACu, // identity 2_10_10_10_UNORM
+        0xE00C2000u, 0x80020100u,   // pc=6: buffer_load_format_xyzw v[1:4], v0, s[8:11]
+        0xBF810000u,
+    };
+    Shader packed{};
+    packed.file_header = 0x34333231u;
+    packed.version = 0x18u;
+    packed.shader_size = sizeof(zero_record_packed);
+    packed.type = 2;
+    dst = nullptr;
+    rc = create_shader(reinterpret_cast<uint64_t>(&dst), reinterpret_cast<uint64_t>(&packed),
+                       reinterpret_cast<uint64_t>(zero_record_packed), 0, 0, 0);
+    CHECK(rc == 0 && dst == &packed, "zero-record packed shader enters the AGC registry");
+    auto packed_table = prosper::gpu::build_stage_table(
+        empty_state, reinterpret_cast<uint64_t>(zero_record_packed), false, 7);
+    const prosper::gpu::ShaderResource* packed_buffer = packed_table
+        ? packed_table->by_fetch_pc(6) : nullptr;
+    CHECK(packed_buffer && packed_buffer->format == prosper::gpu::DataFormat::Unorm2_10_10_10 &&
+          packed_buffer->size == 7u * sizeof(uint32_t),
+          "zero-record packed V# size uses one physical dword per drawn record");
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");

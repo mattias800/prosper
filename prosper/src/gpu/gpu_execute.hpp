@@ -160,8 +160,11 @@ void assign_convention_bindings(ShaderResourceTable& t, uint32_t first);
 // by its bound code address, read its user-data SGPR block from the sh register file, decode the V#/T#/S#
 // descriptors, and assign bindings matching the recompiler+backend convention (constant buffer -> binding
 // 2, vertex buffer -> binding 3, textures -> binding 4+). Returns null if the stage has no shader header
-// or no resources. Implemented in gpu_executor.cpp (needs the AGC registry + descriptor decode).
-std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint64_t code_addr, bool is_ps);
+// or no resources. `draw_vertex_count` bounds dynamic descriptors whose V# publishes zero records;
+// indexed draws are grown to their decoded max-index range later in realize_draw_item. Implemented in
+// gpu_executor.cpp (needs the AGC registry + descriptor decode).
+std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint64_t code_addr,
+                                                       bool is_ps, uint32_t draw_vertex_count = 0);
 
 // PROSPER_COMPUTELOG diagnostic: resolve every skipped DispatchDirect packet's compute shader and
 // AGC resource table from its retained register snapshot. PROSPER_COMPUTELOG_DIM=WxH restricts output
@@ -474,8 +477,8 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     const bool phase_timing = getenv("PROSPER_RENDER_TIMING") != nullptr;
     const auto table_start = phase_timing
         ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    std::shared_ptr<ShaderResourceTable> vrt = build_stage_table(ds, rs.es_addr, false);
-    std::shared_ptr<ShaderResourceTable> prt = build_stage_table(ds, rs.ps_addr, true);
+    std::shared_ptr<ShaderResourceTable> vrt = build_stage_table(ds, rs.es_addr, false, vcount_hint);
+    std::shared_ptr<ShaderResourceTable> prt = build_stage_table(ds, rs.ps_addr, true, vcount_hint);
     const auto table_done = phase_timing
         ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // PROSPER_RTLOG: correlate this draw's render-target address (CB_COLOR0_BASE) with the addresses of
@@ -564,7 +567,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                 fprintf(stderr, "[dynfail] replaying VS 0x%llx resource build with trace:\n",
                         (unsigned long long)rs.es_addr);
                 g_dyntrace_force = true;
-                (void)build_stage_table(ds, rs.es_addr, false);
+                (void)build_stage_table(ds, rs.es_addr, false, vcount_hint);
                 g_dyntrace_force = false;
             }
         }
@@ -575,7 +578,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                 fprintf(stderr, "[dynfail] replaying PS 0x%llx resource build with trace:\n",
                         (unsigned long long)rs.ps_addr);
                 g_dyntrace_force = true;
-                (void)build_stage_table(ds, rs.ps_addr, true);
+                (void)build_stage_table(ds, rs.ps_addr, true, vcount_hint);
                 g_dyntrace_force = false;
             }
         }
