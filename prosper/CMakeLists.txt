@@ -814,6 +814,26 @@ if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
   endif()
 endif()
 
+# Windows native AvPlayer backend (#841): Media Foundation performs MP4 demux and video/audio
+# decode on a worker thread. Keep it outside prosper_core so core-only/headless builds retain no OS
+# media dependency and so software fallback can never be selected merely because no frontend exists.
+if(WIN32 AND TARGET prosper_core)
+  add_library(prosper_video_mf STATIC
+              frontends/video_mf/media_foundation_backend.cpp)
+  target_include_directories(prosper_video_mf PUBLIC frontends/video_mf PRIVATE src)
+  target_link_libraries(prosper_video_mf PUBLIC prosper_core
+                         mfplat mfreadwrite mfuuid ole32 propsys d3d11 dxgi strmiids)
+
+  add_executable(test_video_mf frontends/video_mf/test_video_mf.cpp)
+  target_link_libraries(test_video_mf PRIVATE prosper_video_mf)
+  add_test(NAME video_media_foundation COMMAND test_video_mf)
+
+  if(TARGET boot_trace)
+    target_link_libraries(boot_trace PRIVATE prosper_video_mf)
+    target_compile_definitions(boot_trace PRIVATE PROSPER_VIDEO_MF=1)
+  endif()
+endif()
+
 # --- SDL3 frontends (optional; headless core stays dependency-free) --------------------------
 # The sceAudioOut sink (frontends/audio_sdl3) and the libScePad gamepad backend (frontends/pad_sdl3)
 # can both use SDL3. They must share ONE SDL3 build: if each fetched independently, the first fetch's
@@ -981,4 +1001,10 @@ if(TARGET prosper-app)
     target_compile_definitions(prosper-app PRIVATE PROSPER_PAD_SDL3=1)
     message(STATUS "prosper-app: controller input enabled")
   endif()
+endif()
+
+if(TARGET prosper-app AND TARGET prosper_video_mf)
+  target_link_libraries(prosper-app PRIVATE prosper_video_mf)
+  target_compile_definitions(prosper-app PRIVATE PROSPER_VIDEO_MF=1)
+  message(STATUS "prosper-app: Media Foundation video enabled")
 endif()
