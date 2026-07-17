@@ -37,7 +37,7 @@ namespace prosper::gpu {
 namespace {
 
 constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
-constexpr uint32_t kVersion = 15;
+constexpr uint32_t kVersion = 16;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -338,6 +338,7 @@ struct Interval {
 
 bool collect_intervals(const std::vector<DrawItem>& draws,
                        const std::vector<ComputeItem>& computes,
+                       const std::vector<GpuState::DmaCopy>& dma_copies,
                        uint64_t resource_limit_bytes,
                        std::vector<Interval>& intervals, std::string& error) {
     uint64_t total = 0;
@@ -363,6 +364,16 @@ bool collect_intervals(const std::vector<DrawItem>& draws,
     };
     for (const auto& d : draws) if (!add_table(d.vrt.get()) || !add_table(d.prt.get())) return false;
     for (const auto& c : computes) if (!add_table(c.resources.get())) return false;
+    for (const auto& copy : dma_copies) {
+        if (!copy.dst || !copy.src || !copy.bytes ||
+            copy.dst > std::numeric_limits<uint64_t>::max() - copy.bytes ||
+            copy.src > std::numeric_limits<uint64_t>::max() - copy.bytes) {
+            error = "ordered DMA capture range is invalid";
+            return false;
+        }
+        intervals.push_back({copy.dst, copy.dst + copy.bytes});
+        intervals.push_back({copy.src, copy.src + copy.bytes});
+    }
     std::sort(intervals.begin(), intervals.end(), [](auto a, auto b) { return a.begin < b.begin; });
     std::vector<Interval> merged;
     for (auto x : intervals) {
@@ -388,6 +399,18 @@ bool collect_intervals(const std::vector<DrawItem>& draws,
     intervals = std::move(merged); return true;
 }
 
+bool assign_blob_range(const std::vector<Interval>& intervals, uint64_t addr, uint64_t bytes,
+                       uint32_t& index, uint64_t& offset, const char* missing,
+                       std::string& error) {
+    auto it = std::find_if(intervals.begin(), intervals.end(), [&](auto x) {
+        return x.begin <= addr && addr <= x.end && bytes <= x.end - addr;
+    });
+    if (it == intervals.end()) { error = missing; return false; }
+    index = it->blob_index;
+    offset = addr - it->begin;
+    return true;
+}
+
 bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& intervals,
                    bool include_resource_data, GpuCapturedTable& dst, std::string& error) {
     dst.present = src != nullptr;
@@ -398,23 +421,14 @@ bool capture_table(const ShaderResourceTable* src, const std::vector<Interval>& 
         c.resource.dcc_metadata_host_data_size = 0;
         c.metadata_size = dcc_metadata_footprint(r);
         c.resource.dcc_metadata_size = c.metadata_size;
-        auto assign_blob = [&](uint64_t addr, uint64_t bytes, uint32_t& index,
-                               uint64_t& offset, const char* missing) {
-            auto it = std::find_if(intervals.begin(), intervals.end(), [&](auto x) {
-                return x.begin <= addr && addr + bytes <= x.end;
-            });
-            if (it == intervals.end()) { error = missing; return false; }
-            index = it->blob_index; offset = addr - it->begin;
-            return true;
-        };
         uint64_t n = resource_footprint(r);
         if (n && include_resource_data &&
-            !assign_blob(r.gpu_addr, n, c.blob_index, c.blob_offset,
-                         "resource was not assigned to a capture blob")) return false;
+            !assign_blob_range(intervals, r.gpu_addr, n, c.blob_index, c.blob_offset,
+                               "resource was not assigned to a capture blob", error)) return false;
         if (c.metadata_size && include_resource_data &&
-            !assign_blob(r.metadata_addr, c.metadata_size, c.metadata_blob_index,
-                         c.metadata_blob_offset,
-                         "DCC metadata was not assigned to a capture blob")) return false;
+            !assign_blob_range(intervals, r.metadata_addr, c.metadata_size,
+                               c.metadata_blob_index, c.metadata_blob_offset,
+                               "DCC metadata was not assigned to a capture blob", error)) return false;
         dst.resources.push_back(std::move(c));
     }
     return true;
@@ -529,6 +543,67 @@ using OperationIdentity = std::tuple<uint8_t, uint64_t, uint64_t>;
 OperationIdentity operation_identity(SubmitOperationKind kind, uint64_t source_index,
                                      uint64_t command_order) {
     return {static_cast<uint8_t>(kind), source_index, command_order};
+}
+
+bool validate_dma_copies(const GpuCaptureFile& capture, std::string& error) {
+    if (capture.dma_copies.size() > kMaxOperations) {
+        error = "invalid ordered DMA count";
+        return false;
+    }
+    std::vector<uint8_t> referenced(capture.dma_copies.size(), 0);
+    auto validate_blob = [&](uint32_t index, uint64_t offset, uint32_t bytes,
+                             const char* invalid, const char* exceeds) {
+        if (index == 0xFFFFFFFFu) {
+            if (!offset) return true;
+            error = invalid;
+            return false;
+        }
+        if (index >= capture.blobs.size()) {
+            error = invalid;
+            return false;
+        }
+        const auto& blob = capture.blobs[index];
+        if (!capture_blob_payload_omitted(blob) &&
+            (offset > blob.bytes.size() || bytes > blob.bytes.size() - offset)) {
+            error = exceeds;
+            return false;
+        }
+        return true;
+    };
+    for (const auto& copy : capture.dma_copies) {
+        if (!copy.dst || !copy.src || !copy.bytes || copy.bytes > kMaxBlobBytes ||
+            copy.dst > std::numeric_limits<uint64_t>::max() - copy.bytes ||
+            copy.src > std::numeric_limits<uint64_t>::max() - copy.bytes ||
+            !validate_blob(copy.destination_blob_index, copy.destination_blob_offset, copy.bytes,
+                           "ordered DMA destination references an invalid capture blob",
+                           "ordered DMA destination exceeds its capture blob") ||
+            !validate_blob(copy.source_blob_index, copy.source_blob_offset, copy.bytes,
+                           "ordered DMA source references an invalid capture blob",
+                           "ordered DMA source exceeds its capture blob")) {
+            if (error.empty()) error = "invalid ordered DMA record";
+            return false;
+        }
+    }
+    for (const auto& operation : capture.operations) {
+        if (operation.kind > SubmitOperationKind::DmaCopy) {
+            error = "invalid operation kind";
+            return false;
+        }
+        if (operation.kind != SubmitOperationKind::DmaCopy) continue;
+        if (!operation.realized || operation.source_index >= capture.dma_copies.size() ||
+            capture.dma_copies[operation.source_index].command_order != operation.command_order ||
+            referenced[operation.source_index] == UINT8_MAX) {
+            error = "ordered DMA operation does not match its record";
+            return false;
+        }
+        ++referenced[operation.source_index];
+    }
+    if (std::find_if(referenced.begin(), referenced.end(), [](uint8_t count) { return count != 1; }) !=
+        referenced.end()) {
+        error = "ordered DMA record must have exactly one operation";
+        return false;
+    }
+    return true;
 }
 
 bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::string& error) {
@@ -772,7 +847,8 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
                           const GpuCaptureMetadata& metadata,
                           const CaptureMemoryReader& reader, GpuCaptureFile& out,
                           std::string& error, const CaptureRttSeedReader& rtt_reader,
-                          const std::vector<OperationRealizationFailure>& failures) {
+                          const std::vector<OperationRealizationFailure>& failures,
+                          const std::vector<GpuState::DmaCopy>& dma_copies) {
     error.clear(); out = {}; out.metadata = metadata;
     out.failure_diagnostics_available = true;
     if (draws.size() > kMaxDraws || computes.size() > kMaxComputes ||
@@ -790,7 +866,7 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         out.metadata.renderer_env.emplace_back("PROSPER_GPU_CAPTURE_METADATA_ONLY", "1");
     std::vector<Interval> intervals;
     if (include_resource_data &&
-        !collect_intervals(draws, computes, resource_limit_bytes, intervals, error)) return false;
+        !collect_intervals(draws, computes, dma_copies, resource_limit_bytes, intervals, error)) return false;
     for (auto& x : intervals) {
         GpuCaptureBlob b; b.guest_addr = x.begin; b.bytes.resize(static_cast<size_t>(x.end - x.begin), 0);
         b.bytes_read = std::min<uint64_t>(reader(x.begin, b.bytes.data(), b.bytes.size()), b.bytes.size());
@@ -828,15 +904,47 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
                            c.resources, error)) return false;
         out.computes.push_back(std::move(c));
     }
+    out.dma_copies.reserve(dma_copies.size());
+    for (const auto& copy : dma_copies) {
+        GpuCapturedDmaCopy captured;
+        captured.dst = copy.dst; captured.src = copy.src; captured.bytes = copy.bytes;
+        captured.sels = copy.sels; captured.command_order = copy.command_order;
+        captured.packet_addr = copy.packet_addr;
+        if (include_resource_data &&
+            (!assign_blob_range(intervals, copy.dst, copy.bytes,
+                                captured.destination_blob_index,
+                                captured.destination_blob_offset,
+                                "ordered DMA destination was not assigned to a capture blob", error) ||
+             !assign_blob_range(intervals, copy.src, copy.bytes,
+                                captured.source_blob_index, captured.source_blob_offset,
+                                "ordered DMA source was not assigned to a capture blob", error)))
+            return false;
+        out.dma_copies.push_back(captured);
+    }
     std::unordered_set<uint64_t> realized_draws, realized_computes;
     for (const auto& draw : out.draws) realized_draws.insert(draw.draw_index);
     for (const auto& compute : out.computes) realized_computes.insert(compute.dispatch_index);
     for (const auto& operation : operations) {
-        const bool realized = operation.kind == SubmitOperationKind::Draw
-            ? realized_draws.count(operation.index) != 0
-            : realized_computes.count(operation.index) != 0;
+        bool realized = false;
+        switch (operation.kind) {
+            case SubmitOperationKind::Draw:
+                realized = realized_draws.count(operation.index) != 0;
+                break;
+            case SubmitOperationKind::Dispatch:
+                realized = realized_computes.count(operation.index) != 0;
+                break;
+            case SubmitOperationKind::DmaCopy:
+                if (operation.index >= out.dma_copies.size() ||
+                    out.dma_copies[operation.index].command_order != operation.command_order) {
+                    error = "ordered DMA operation references an invalid record";
+                    return false;
+                }
+                realized = true;
+                break;
+        }
         out.operations.push_back({operation.kind, operation.index, operation.command_order, realized});
     }
+    if (!validate_dma_copies(out, error)) return false;
     if (!capture_failure_diagnostics(failures, reader, out, error)) return false;
     collect_shader_versions(out);
     if (rtt_reader && include_resource_data) {
@@ -867,21 +975,38 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
             total += seed.rgba.size(); out.rtt_seeds.push_back(std::move(seed));
         }
     }
-    return true;
+    return validate_dma_copies(out, error);
 }
 
-static bool reject_unsupported_gpustate_capture(const GpuState& state, std::string& error) {
-    if (state.dma_copies.empty()) return false;
-    error = "GPU capture v13 cannot represent " + std::to_string(state.dma_copies.size()) +
-            " ordered DMA_DATA operation(s); capture would be incomplete (see #833)";
-    return true;
+static CaptureMemoryReader ordered_gpustate_capture_reader(const GpuState& state) {
+    return [&state](uint64_t addr, uint8_t* destination, size_t bytes) -> size_t {
+        size_t copied = read_capture_guest_memory(addr, destination, bytes);
+        if (!bytes || addr > std::numeric_limits<uint64_t>::max() - bytes) return copied;
+        const uint64_t end = addr + bytes;
+        for (const auto& copy : state.dma_copies) {
+            std::vector<uint8_t> source;
+            if (read_live_render_target_bytes(copy.src, copy.bytes, source) !=
+                    LiveTargetByteReadResult::Success || source.size() != copy.bytes)
+                continue;
+            const uint64_t copy_end = copy.src + copy.bytes;
+            const uint64_t overlap_begin = std::max(addr, copy.src);
+            const uint64_t overlap_end = std::min(end, copy_end);
+            if (overlap_begin >= overlap_end) continue;
+            const size_t destination_offset = static_cast<size_t>(overlap_begin - addr);
+            const size_t source_offset = static_cast<size_t>(overlap_begin - copy.src);
+            const size_t overlap_bytes = static_cast<size_t>(overlap_end - overlap_begin);
+            std::memcpy(destination + destination_offset, source.data() + source_offset,
+                        overlap_bytes);
+            copied = std::max(copied, destination_offset + overlap_bytes);
+        }
+        return copied;
+    };
 }
 
 bool capture_gpustate_submit(const GpuState& state, uint64_t submit_no,
                              uint32_t width, uint32_t height,
                              const GpuCaptureMetadata& metadata,
                              GpuCaptureFile& out, std::string& error) {
-    if (reject_unsupported_gpustate_capture(state, error)) return false;
     const bool caplog = std::getenv("PROSPER_GPU_CAPTURE_LOG") != nullptr;
     std::vector<OperationRealizationFailure> failures, compute_failures;
     if (caplog) std::fprintf(stderr, "[cap] realize_gpustate_draws...\n");
@@ -897,8 +1022,11 @@ bool capture_gpustate_submit(const GpuState& state, uint64_t submit_no,
     actual.submit_index = submit_no;
     auto ops = plan_submit_operations(state);
     if (caplog) std::fprintf(stderr, "[cap] ops=%zu; capture_submit_items...\n", ops.size());
-    return capture_submit_items(draws, computes, ops, actual,
-                                read_capture_guest_memory, out, error, g_rtt_seed_reader, failures);
+    // Raw guest memory is normally authoritative. A live renderer-owned target is the exception:
+    // ordered DMA reads its host pixels, so overlay those exact bytes into the pre-submit closure.
+    CaptureMemoryReader ordered_reader = ordered_gpustate_capture_reader(state);
+    return capture_submit_items(draws, computes, ops, actual, ordered_reader, out, error,
+                                g_rtt_seed_reader, failures, state.dma_copies);
 }
 
 bool capture_gpustate_target_submit(const GpuState& state, uint64_t submit_no,
@@ -906,7 +1034,6 @@ bool capture_gpustate_target_submit(const GpuState& state, uint64_t submit_no,
                                     uint32_t target_width, uint32_t target_height,
                                     const GpuCaptureMetadata& metadata,
                                     GpuCaptureFile& out, std::string& error) {
-    if (reject_unsupported_gpustate_capture(state, error)) return false;
     std::vector<DrawItem> draws = realize_gpustate_draws(state);
     draws.erase(std::remove_if(draws.begin(), draws.end(), [&](const DrawItem& draw) {
         return draw.color0_width != target_width || draw.color0_height != target_height;
@@ -916,10 +1043,17 @@ bool capture_gpustate_target_submit(const GpuState& state, uint64_t submit_no,
     for (const auto& draw : draws)
         operations.push_back({SubmitOperationKind::Draw, static_cast<size_t>(draw.draw_index),
                               draw.command_order});
+    for (size_t i = 0; i < state.dma_copies.size(); ++i)
+        operations.push_back({SubmitOperationKind::DmaCopy, i,
+                              state.dma_copies[i].command_order});
+    std::stable_sort(operations.begin(), operations.end(), [](const auto& a, const auto& b) {
+        return a.command_order < b.command_order;
+    });
     GpuCaptureMetadata actual = metadata;
     actual.width = width; actual.height = height; actual.submit_index = submit_no;
-    return capture_submit_items(draws, {}, operations, actual, read_capture_guest_memory,
-                                out, error, g_rtt_seed_reader);
+    return capture_submit_items(draws, {}, operations, actual,
+                                ordered_gpustate_capture_reader(state),
+                                out, error, g_rtt_seed_reader, {}, state.dma_copies);
 }
 
 bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes, std::string& error) {
@@ -992,7 +1126,10 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         w.u64(compute.code_addr); w.u64(compute.dispatch_index); w.u64(compute.submit_no);
         w.u64(compute.command_order);
     }
-    if (c.operations.size() > kMaxOperations) { error = "invalid operation count"; return false; }
+    if (c.operations.size() > kMaxOperations || !validate_dma_copies(c, error)) {
+        if (error.empty()) error = "invalid operation count";
+        return false;
+    }
     w.u32(static_cast<uint32_t>(c.operations.size()));
     for (const auto& operation : c.operations) {
         w.u8(static_cast<uint8_t>(operation.kind)); w.u64(operation.source_index);
@@ -1140,7 +1277,17 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         if (!write_dcc_metadata(draw.vrt) || !write_dcc_metadata(draw.prt)) return false;
     for (const auto& compute : c.computes)
         if (!write_dcc_metadata(compute.resources)) return false;
-    // v14 records whether an image is declared for depth comparison. Keep this in a deterministic
+    // v14 appends ordered address-backed DMA_DATA records. Both endpoints reference the same
+    // content-addressed pre-submit blobs used by draw/compute resources, so replay mutations are
+    // visible to later consumers without changing any v1-v13 prefix.
+    w.u32(static_cast<uint32_t>(c.dma_copies.size()));
+    for (const auto& copy : c.dma_copies) {
+        w.u64(copy.dst); w.u64(copy.src); w.u32(copy.bytes); w.u32(copy.sels);
+        w.u64(copy.command_order); w.u64(copy.packet_addr);
+        w.u32(copy.destination_blob_index); w.u64(copy.destination_blob_offset);
+        w.u32(copy.source_blob_index); w.u64(copy.source_blob_offset);
+    }
+    // v15 records whether an image is declared for depth comparison. Keep this in a deterministic
     // extension tail, just like the v9 depth and v11/v12 DCC additions, so every older resource
     // record remains byte-compatible.
     w.u32(static_cast<uint32_t>(resource_depth_count));
@@ -1153,7 +1300,7 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         write_depth_compare(draw.prt);
     }
     for (const auto& compute : c.computes) write_depth_compare(compute.resources);
-    // v15 records packed GFX10 mip-tail placement. Tail siblings share one captured allocation block,
+    // v16 records packed GFX10 mip-tail placement. Tail siblings share one captured allocation block,
     // so replay must retain both the common base and the selected in-block byte origin.
     w.u32(static_cast<uint32_t>(resource_depth_count));
     auto write_mip_tail = [&](const GpuCapturedTable& table, const char* owner,
@@ -1331,7 +1478,9 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
         c.operations.resize(no);
         for (auto& operation : c.operations) {
             uint8_t kind = 0, realized = 0;
-            if (!r.u8(kind) || kind > static_cast<uint8_t>(SubmitOperationKind::Dispatch) ||
+            const uint8_t max_kind = static_cast<uint8_t>(version >= 14
+                ? SubmitOperationKind::DmaCopy : SubmitOperationKind::Dispatch);
+            if (!r.u8(kind) || kind > max_kind ||
                 !r.u64(operation.source_index) || !r.u64(operation.command_order) || !r.u8(realized)) return false;
             operation.kind = static_cast<SubmitOperationKind>(kind);
             operation.realized = realized != 0;
@@ -1573,6 +1722,23 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
             if (!read_dcc_metadata(compute.resources)) return false;
     }
     if (version >= 14) {
+        uint32_t dma_count = 0;
+        if (!r.u32(dma_count) || dma_count > kMaxOperations) {
+            error = "invalid ordered DMA count";
+            return false;
+        }
+        c.dma_copies.resize(dma_count);
+        for (auto& copy : c.dma_copies) {
+            if (!r.u64(copy.dst) || !r.u64(copy.src) || !r.u32(copy.bytes) ||
+                !r.u32(copy.sels) || !r.u64(copy.command_order) ||
+                !r.u64(copy.packet_addr) || !r.u32(copy.destination_blob_index) ||
+                !r.u64(copy.destination_blob_offset) || !r.u32(copy.source_blob_index) ||
+                !r.u64(copy.source_blob_offset))
+                return false;
+        }
+        if (!validate_dma_copies(c, error)) return false;
+    }
+    if (version >= 15) {
         uint64_t expected_states = 0;
         for (const auto& draw : c.draws)
             expected_states += draw.vrt.resources.size() + draw.prt.resources.size();
@@ -1597,7 +1763,7 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
         for (auto& compute : c.computes)
             if (!read_depth_compare(compute.resources)) return false;
     }
-    if (version >= 15) {
+    if (version >= 16) {
         uint64_t expected_states = 0;
         for (const auto& draw : c.draws)
             expected_states += draw.vrt.resources.size() + draw.prt.resources.size();
@@ -1639,7 +1805,9 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
 }
 
 bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::string& error) {
-    error.clear(); out = {}; out.metadata = c.metadata; out.blobs = c.blobs;
+    error.clear();
+    if (!validate_dma_copies(c, error)) return false;
+    out = {}; out.metadata = c.metadata; out.blobs = c.blobs;
     out.rtt_seeds = c.rtt_seeds; out.ds_seeds = c.ds_seeds;
     out.raw_shader_versions = c.raw_shader_versions;
     out.failure_diagnostics = c.failure_diagnostics;
@@ -1651,6 +1819,7 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         resource_reference_count += draw.vrt.resources.size() + draw.prt.resources.size();
     for (const auto& compute : c.computes)
         resource_reference_count += compute.resources.resources.size();
+    resource_reference_count += c.dma_copies.size() * 2;
     out.resource_instances.reserve(resource_reference_count * 2);
     std::map<std::pair<uint32_t, uint64_t>, size_t> instance_by_version_and_base;
     auto bind_range = [&](uint32_t blob_index, uint64_t blob_offset, uint64_t guest_addr,
@@ -1720,6 +1889,28 @@ bool materialize_gpu_replay(const GpuCaptureFile& c, GpuReplayFrame& out, std::s
         compute.command_order = x.command_order;
         if (!table(x.resources, compute.resources)) return false;
         out.computes.push_back(std::move(compute));
+    }
+    out.dma_copies.reserve(c.dma_copies.size());
+    for (const auto& captured : c.dma_copies) {
+        ReplayDmaCopy copy;
+        copy.dst = captured.dst; copy.src = captured.src; copy.bytes = captured.bytes;
+        copy.sels = captured.sels; copy.command_order = captured.command_order;
+        copy.packet_addr = captured.packet_addr;
+        uint8_t* source = nullptr;
+        if (!bind_range(captured.destination_blob_index, captured.destination_blob_offset,
+                        captured.dst, captured.bytes, copy.destination_data,
+                        copy.destination_size,
+                        "ordered DMA destination references an invalid capture blob",
+                        "ordered DMA destination exceeds capture blob",
+                        "ordered DMA destination blob offset exceeds its logical address") ||
+            !bind_range(captured.source_blob_index, captured.source_blob_offset,
+                        captured.src, captured.bytes, source, copy.source_size,
+                        "ordered DMA source references an invalid capture blob",
+                        "ordered DMA source exceeds capture blob",
+                        "ordered DMA source blob offset exceeds its logical address"))
+            return false;
+        copy.source_data = source;
+        out.dma_copies.push_back(copy);
     }
     out.operations = c.operations;
     return true;
@@ -1863,8 +2054,9 @@ bool restore_gpu_replay_ds_seeds(const std::vector<GpuCaptureDsSeed>& seeds, std
 std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
     const std::vector<DrawItem>& draws, const std::vector<ComputeItem>& computes,
     const std::vector<SubmitOperation>& operations, uint32_t width, uint32_t height,
-    bool has_ordered_dma, uint64_t unsupported_draw_count) {
+    const GpuState* semantic_state, uint64_t submit_no, uint64_t semantic_draw_count) {
     const char* path = std::getenv("PROSPER_GPU_CAPTURE"); if (!path || !*path) return {};
+    const bool has_ordered_dma = semantic_state && !semantic_state->dma_copies.empty();
     static std::atomic<uint64_t> invocation_sequence{0};
     const uint64_t invocation = invocation_sequence.fetch_add(1);
     uint64_t after = 0;
@@ -1873,23 +2065,16 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
     uint64_t min_draws = 0, max_draws = std::numeric_limits<uint64_t>::max();
     if (const char* v = std::getenv("PROSPER_GPU_CAPTURE_MIN_DRAWS")) min_draws = std::strtoull(v, nullptr, 0);
     if (const char* v = std::getenv("PROSPER_GPU_CAPTURE_MAX_DRAWS")) max_draws = std::strtoull(v, nullptr, 0);
-    const uint64_t candidate_draw_count = has_ordered_dma && unsupported_draw_count != UINT64_MAX
-        ? unsupported_draw_count : static_cast<uint64_t>(draws.size());
+    const uint64_t candidate_draw_count = has_ordered_dma && semantic_draw_count != UINT64_MAX
+        ? semantic_draw_count : static_cast<uint64_t>(draws.size());
     if (candidate_draw_count < min_draws || candidate_draw_count > max_draws) return {};
     static std::atomic<uint64_t> sequence{0}; static std::atomic<bool> claimed{false};
     uint64_t current = sequence.fetch_add(1), wanted = 0;
     if (const char* at = std::getenv("PROSPER_GPU_CAPTURE_AT")) wanted = std::strtoull(at, nullptr, 0);
     if (current != wanted || claimed.exchange(true)) return {};
-    if (has_ordered_dma) {
-        std::fprintf(stderr,
-                     "[gpucap] selected match %llu at invocation %llu failed: capture v13 cannot "
-                     "represent ordered DMA_DATA (see #833)\n",
-                     static_cast<unsigned long long>(current),
-                     static_cast<unsigned long long>(invocation));
-        return {};
-    }
     auto pending = std::make_unique<PendingGpuCapture>(); pending->path = path;
-    GpuCaptureMetadata m; m.width = width; m.height = height; m.submit_index = current;
+    GpuCaptureMetadata m; m.width = width; m.height = height;
+    m.submit_index = submit_no ? submit_no : current;
 #ifdef PROSPER_GIT_REVISION
     m.revision = PROSPER_GIT_REVISION;
 #else
@@ -1916,14 +2101,20 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
     };
     for (const char* name : render_env) if (const char* value = std::getenv(name)) m.renderer_env.emplace_back(name, value);
     std::string error;
-    if (!capture_submit_items(draws, computes, operations, m, read_capture_guest_memory,
-                              pending->capture, error, g_rtt_seed_reader)) {
+    const bool captured = has_ordered_dma
+        ? capture_gpustate_submit(*semantic_state, m.submit_index, width, height, m,
+                                  pending->capture, error)
+        : capture_submit_items(draws, computes, operations, m, read_capture_guest_memory,
+                               pending->capture, error, g_rtt_seed_reader);
+    if (!captured) {
         std::fprintf(stderr, "[gpucap] capture failed: %s\n", error.c_str()); return {};
     }
     std::fprintf(stderr, "[gpucap] captured match %llu at invocation %llu: %zu draws, %zu computes, "
-                         "%zu operations, %zu blobs, %zu RTT seeds -> %s\n",
+                         "%zu DMA copies, %zu operations, %zu blobs, %zu RTT seeds -> %s\n",
                  static_cast<unsigned long long>(current), static_cast<unsigned long long>(invocation),
-                 draws.size(), computes.size(), operations.size(), pending->capture.blobs.size(),
+                 pending->capture.draws.size(), pending->capture.computes.size(),
+                 pending->capture.dma_copies.size(), pending->capture.operations.size(),
+                 pending->capture.blobs.size(),
                  pending->capture.rtt_seeds.size(), path);
     return pending;
 }

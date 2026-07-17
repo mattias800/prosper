@@ -33,6 +33,13 @@ int main() {
     }
     blob.content_hash = gpu_capture_hash(blob.bytes);
     first.blobs.push_back(blob);
+    GpuCapturedDmaCopy bundle_dma;
+    bundle_dma.dst = 0x100000; bundle_dma.src = 0x100010; bundle_dma.bytes = 4;
+    bundle_dma.command_order = 850; bundle_dma.packet_addr = 0x123400;
+    bundle_dma.destination_blob_index = 0; bundle_dma.source_blob_index = 0;
+    bundle_dma.source_blob_offset = 16;
+    first.dma_copies.push_back(bundle_dma);
+    first.operations.push_back({SubmitOperationKind::DmaCopy, 0, 850, true});
     first.operations.push_back({SubmitOperationKind::Draw, 5, 900, false});
     GpuCaptureRawShaderVersion failed_shader;
     failed_shader.words = {0xbf860001u, 0xbf810000u};
@@ -116,13 +123,16 @@ int main() {
           restored_second.blobs[0].guest_addr == 0x200000 && restored_second.blobs[0].bytes == blob.bytes &&
           restored_second.failure_diagnostics_available && restored_second.failure_diagnostics.size() == 1 &&
           restored_second.raw_shader_versions[0].words == failed_shader.words &&
+          restored_second.dma_copies.size() == 1 &&
+          restored_second.dma_copies[0].source_blob_offset == 16 &&
           restored_second.ds_seeds.size() == 1 && restored_second.ds_seeds[0].depth == ds_seed.depth,
-          "bundle reconstructs an exact validated capture");
+          "bundle reconstructs exact validated capture and ordered DMA records");
     CHECK(materialize_gpu_capture_bundle_manifest(loaded, 1, second_manifest, error) &&
           second_manifest.metadata.submit_index == 42 && second_manifest.blobs.size() == 1 &&
           second_manifest.blobs[0].bytes.empty() && second_manifest.draws.size() == restored_second.draws.size() &&
+          second_manifest.dma_copies.size() == 1 &&
           second_manifest.ds_seeds.size() == 1 && second_manifest.ds_seeds[0].depth == ds_seed.depth,
-          "manifest-only materialization exposes submit state without resource payload reconstruction");
+          "manifest-only materialization exposes DMA state without resource payload reconstruction");
     restored_first.blobs[0].bytes[0] ^= 0xff;
     CHECK(restored_second.blobs[0].bytes == blob.bytes,
           "materialized submits own independent mutable resource bytes");

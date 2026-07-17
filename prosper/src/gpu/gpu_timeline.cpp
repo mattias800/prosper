@@ -36,11 +36,12 @@ namespace {
 
 constexpr uint8_t kFileMagic[8] = {'P', 'R', 'G', 'T', 'L', 'N', '\0', '\0'};
 constexpr uint8_t kRecordMagic[4] = {'T', 'L', 'R', 'C'};
-constexpr uint32_t kVersion = 7;
+constexpr uint32_t kVersion = 8;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint32_t kMaxPayloadBytes = 1u << 20;
 constexpr uint32_t kFlushInterval = 256;
 constexpr uint32_t kMaxTargetSpans = 16384;
+constexpr uint32_t kMaxDmaCopies = 16384;
 
 enum class RecordType : uint32_t { Metadata = 1, Submit = 2, Present = 3, Detail = 4, Producer = 5 };
 
@@ -834,6 +835,11 @@ bool GpuTimelineWriter::append_submit(const GpuTimelineSubmit& submit, std::stri
         error = "timeline submit has invalid target spans";
         return false;
     }
+    if (submit.dma_copies.size() > kMaxDmaCopies ||
+        submit.dma_copy_count != submit.dma_copies.size()) {
+        error = "timeline submit has invalid ordered DMA records";
+        return false;
+    }
     Bytes payload;
     payload.u64(submit.submit_no);
     payload.u64(submit.process_command_order);
@@ -844,10 +850,11 @@ bool GpuTimelineWriter::append_submit(const GpuTimelineSubmit& submit, std::stri
     payload.u32(submit.dispatch_count);
     payload.u32(submit.color0_width);
     payload.u32(submit.color0_height);
-    // v7 prefixes its optional tail with unsupported-operation metadata. Older versions retain
-    // their historical tail layout in the reader below.
+    // v7 prefixes its optional tail with operation support metadata. v8 appends exact DMA records
+    // after the v6 target-span suffix, leaving the complete v1-v7 prefix byte-compatible.
     if (!submit.depth_surfaces.empty() || !submit.target_spans.empty() ||
-        submit.target_spans_truncated || submit.dma_copy_count || submit.capture_incomplete) {
+        submit.target_spans_truncated || submit.dma_copy_count || submit.capture_incomplete ||
+        !submit.dma_copies.empty()) {
         payload.u32(submit.dma_copy_count);
         payload.u32(submit.capture_incomplete ? 1u : 0u);
         payload.u32(static_cast<uint32_t>(submit.depth_surfaces.size()));
@@ -877,6 +884,12 @@ bool GpuTimelineWriter::append_submit(const GpuTimelineSubmit& submit, std::stri
             payload.u32(span.width); payload.u32(span.height);
         }
         payload.u32(submit.target_spans_truncated ? 1u : 0u);
+        payload.u32(static_cast<uint32_t>(submit.dma_copies.size()));
+        for (const auto& copy : submit.dma_copies) {
+            payload.u64(copy.dst); payload.u64(copy.src); payload.u32(copy.bytes);
+            payload.u32(copy.sels); payload.u64(copy.command_order);
+            payload.u64(copy.packet_addr);
+        }
     }
     return impl_->append(RecordType::Submit, payload, error);
 }
@@ -1127,6 +1140,25 @@ bool read_gpu_timeline(const std::string& path, GpuTimelineFile& timeline, std::
                     return false;
                 }
             }
+            if (version >= 8 && have_submit_tail) {
+                uint32_t dma_count = 0;
+                if (!p.u32(dma_count) || dma_count > kMaxDmaCopies ||
+                    dma_count != submit.dma_copy_count) {
+                    error = "invalid timeline ordered DMA count";
+                    return false;
+                }
+                submit.dma_copies.resize(dma_count);
+                for (auto& copy : submit.dma_copies) {
+                    if (!p.u64(copy.dst) || !p.u64(copy.src) || !p.u32(copy.bytes) ||
+                        !p.u32(copy.sels) || !p.u64(copy.command_order) ||
+                        !p.u64(copy.packet_addr) || !copy.dst || !copy.src || !copy.bytes ||
+                        copy.dst > std::numeric_limits<uint64_t>::max() - copy.bytes ||
+                        copy.src > std::numeric_limits<uint64_t>::max() - copy.bytes) {
+                        error = "invalid timeline ordered DMA record";
+                        return false;
+                    }
+                }
+            }
             if (p.left) {
                 error = "invalid timeline submit record size";
                 return false;
@@ -1347,7 +1379,11 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
     submit.dispatch_count = static_cast<uint32_t>(std::min<size_t>(state.dispatches.size(), UINT32_MAX));
     submit.dma_copy_count = static_cast<uint32_t>(
         std::min<size_t>(state.dma_copies.size(), UINT32_MAX));
-    submit.capture_incomplete = !state.dma_copies.empty();
+    submit.dma_copies.reserve(state.dma_copies.size());
+    for (const auto& copy : state.dma_copies)
+        submit.dma_copies.push_back({copy.dst, copy.src, copy.bytes, copy.sels,
+                                     copy.command_order, copy.packet_addr});
+    submit.capture_incomplete = false;
     submit.first_command_order = std::numeric_limits<uint64_t>::max();
     const bool log_mrt = select_timeline_mrt_submit(state, submit_no);
     for (size_t draw_index = 0; draw_index < state.draws.size(); ++draw_index) {

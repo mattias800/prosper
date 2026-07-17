@@ -22,6 +22,15 @@
 
 namespace {
 
+const char* operation_kind_name(prosper::gpu::SubmitOperationKind kind) {
+    switch (kind) {
+        case prosper::gpu::SubmitOperationKind::Draw: return "draw";
+        case prosper::gpu::SubmitOperationKind::Dispatch: return "dispatch";
+        case prosper::gpu::SubmitOperationKind::DmaCopy: return "dma";
+    }
+    return "unknown";
+}
+
 bool set_environment(const std::string& name, const std::string& value) {
 #ifdef _WIN32
     return _putenv_s(name.c_str(), value.c_str()) == 0;
@@ -78,19 +87,25 @@ std::vector<uint8_t> execute_frame(const prosper::gpu::GpuReplayFrame& replay,
                                    bool draws_only = false,
                                    size_t operation_limit = SIZE_MAX) {
     std::vector<prosper::gpu::SubmitOperation> operations;
+    std::vector<prosper::gpu::ReplayDmaCopy> dma_copies;
     const size_t count = std::min(operation_limit, replay.operations.size());
     for (size_t i = 0; i < count; ++i) {
         const auto& operation = replay.operations[i];
-        if (operation.realized)
-            operations.push_back({operation.kind, static_cast<size_t>(operation.source_index),
-                                  operation.command_order});
+        if (!operation.realized) continue;
+        size_t source_index = static_cast<size_t>(operation.source_index);
+        if (operation.kind == prosper::gpu::SubmitOperationKind::DmaCopy) {
+            if (source_index >= replay.dma_copies.size()) continue;
+            source_index = dma_copies.size();
+            dma_copies.push_back(replay.dma_copies[operation.source_index]);
+        }
+        operations.push_back({operation.kind, source_index, operation.command_order});
     }
     if (draws_only || replay.operations.empty())
         return prosper::gpu::render_submit_items(
             replay.items, replay.metadata.width, replay.metadata.height);
     if (operations.empty()) return {};
     auto result = prosper::gpu::execute_ordered_items(
-        operations, replay.items, replay.computes,
+        operations, replay.items, replay.computes, dma_copies,
         [](const auto& items, uint32_t width, uint32_t height) {
             return prosper::gpu::render_submit_items(items, width, height);
         },
@@ -108,7 +123,7 @@ void print_graph(const prosper::gpu::GpuDependencyGraph& graph) {
         if (!node.realized)
             std::printf("missing operation=%u kind=%s source=%llu order=%llu\n",
                         node.operation_index,
-                        node.kind == prosper::gpu::SubmitOperationKind::Draw ? "draw" : "dispatch",
+                        operation_kind_name(node.kind),
                         static_cast<unsigned long long>(node.source_index),
                         static_cast<unsigned long long>(node.command_order));
     for (const auto& edge : graph.edges)
@@ -136,7 +151,7 @@ bool write_graph_json(const std::string& path, const prosper::gpu::GpuDependency
         std::fprintf(file, "    {\"operation\":%u,\"kind\":\"%s\",\"source\":%llu,"
                            "\"order\":%llu,\"realized\":%s}%s\n",
                      node.operation_index,
-                     node.kind == prosper::gpu::SubmitOperationKind::Draw ? "draw" : "dispatch",
+                     operation_kind_name(node.kind),
                      static_cast<unsigned long long>(node.source_index),
                      static_cast<unsigned long long>(node.command_order),
                      node.realized ? "true" : "false", i + 1 == graph.nodes.size() ? "" : ",");
@@ -365,10 +380,20 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
                         reinterpret_cast<const uint8_t*>(c.spirv.data()), c.spirv.size() * 4)));
         inspect_table("CS", c.resources.get(), replay.rtt_seeds);
     }
+    for (size_t i = 0; i < replay.dma_copies.size(); ++i) {
+        const auto& copy = replay.dma_copies[i];
+        std::printf("dma[%zu] order=%llu src=%016llx dst=%016llx bytes=%u sels=%08x packet=%016llx backing=%s/%s\n",
+                    i, static_cast<unsigned long long>(copy.command_order),
+                    static_cast<unsigned long long>(copy.src),
+                    static_cast<unsigned long long>(copy.dst), copy.bytes, copy.sels,
+                    static_cast<unsigned long long>(copy.packet_addr),
+                    copy.source_data ? "yes" : "no",
+                    copy.destination_data ? "yes" : "no");
+    }
     for (size_t i = 0; i < replay.operations.size(); ++i) {
         const auto& operation = replay.operations[i];
         std::printf("operation[%zu] %s source=%llu order=%llu realized=%s\n", i,
-                    operation.kind == prosper::gpu::SubmitOperationKind::Draw ? "draw" : "dispatch",
+                    operation_kind_name(operation.kind),
                     static_cast<unsigned long long>(operation.source_index),
                     static_cast<unsigned long long>(operation.command_order),
                     operation.realized ? "yes" : "no");
@@ -381,7 +406,7 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
     for (size_t i = 0; i < replay.failure_diagnostics.size(); ++i) {
         const auto& failure = replay.failure_diagnostics[i];
         std::printf("failure[%zu] %s source=%llu order=%llu reason=%s stages=%zu\n", i,
-                    failure.kind == prosper::gpu::SubmitOperationKind::Draw ? "draw" : "dispatch",
+                    operation_kind_name(failure.kind),
                     static_cast<unsigned long long>(failure.source_index),
                     static_cast<unsigned long long>(failure.command_order),
                     prosper::gpu::realization_failure_reason_name(failure.reason),

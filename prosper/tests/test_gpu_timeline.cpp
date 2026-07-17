@@ -40,7 +40,10 @@ int main() {
     first.submit_no = 10; first.process_command_order = 400; first.first_command_order = 390;
     first.last_command_order = 400; first.color0_base = 0x12340000; first.draw_count = 3;
     first.dispatch_count = 1; first.color0_width = 642; first.color0_height = 362;
-    first.dma_copy_count = 2; first.capture_incomplete = true;
+    first.dma_copy_count = 2;
+    first.dma_copies.push_back({0x500000, 0x600000, 64, 0, 395, 0x1000});
+    first.dma_copies.push_back({0x500040, 0x600040, 32, 3, 398, 0x1100});
+    first.capture_incomplete = false;
     first.target_spans.push_back({0, 1, 642, 362});
     first.target_spans.push_back({1, 2, 738, 420});
     GpuTimelineSubmit invalid_spans = first;
@@ -107,7 +110,7 @@ int main() {
           timeline.metadata.title_id == metadata.title_id &&
           timeline.metadata.input_route == metadata.input_route,
           "metadata round-trips");
-    CHECK(timeline.version == 7 && timeline.submits.size() == 2 && timeline.presents.size() == 1 &&
+    CHECK(timeline.version == 8 && timeline.submits.size() == 2 && timeline.presents.size() == 1 &&
           timeline.details.size() == 1 && timeline.producers.size() == 1,
           "version and record counts round-trip");
     CHECK(timeline.submits[0].sequence == 1 && timeline.presents[0].sequence == 2 &&
@@ -118,8 +121,12 @@ int main() {
           timeline.submits[0].color0_width == 642 && timeline.submits[0].color0_height == 362,
           "target identity and extent round-trip");
     CHECK(timeline.submits[0].dma_copy_count == 2 &&
-          timeline.submits[0].capture_incomplete,
-          "ordered-DMA count and incomplete-capture marker round-trip");
+          !timeline.submits[0].capture_incomplete &&
+          timeline.submits[0].dma_copies.size() == 2 &&
+          timeline.submits[0].dma_copies[0].src == 0x600000 &&
+          timeline.submits[0].dma_copies[1].dst == 0x500040 &&
+          timeline.submits[0].dma_copies[1].command_order == 398,
+          "ordered-DMA identities and exact command order round-trip");
     CHECK(timeline.submits[0].depth_surfaces.size() == 1 &&
           timeline.submits[0].depth_surfaces[0].htile_data_base == 0x820000 &&
           timeline.submits[0].depth_surfaces[0].db_depth_size_xy == 0x01690281 &&
@@ -250,10 +257,13 @@ int main() {
           runtime_timeline.presents[0].latest_submit_no == 42,
           "a flip during folding is associated with its active submit");
     CHECK(runtime_timeline.submits[0].dma_copy_count == 1 &&
-          runtime_timeline.submits[0].capture_incomplete &&
+          !runtime_timeline.submits[0].capture_incomplete &&
+          runtime_timeline.submits[0].dma_copies.size() == 1 &&
+          runtime_timeline.submits[0].dma_copies[0].src == 0x100000000ull &&
+          runtime_timeline.submits[0].dma_copies[0].dst == 0x200000 &&
           runtime_timeline.submits[0].first_command_order == 104 &&
           runtime_timeline.submits[0].last_command_order == 104,
-          "runtime compact timeline exposes ordered DMA and marks v13 capture incomplete");
+          "runtime compact timeline exposes replayable ordered DMA identities");
     CHECK(runtime_timeline.submits[1].depth_surfaces.size() == 1 &&
           runtime_timeline.submits[1].depth_surfaces[0].depth_read_base == 0x700000 &&
           runtime_timeline.submits[1].depth_surfaces[0].htile_data_base == 0x820000 &&
@@ -284,6 +294,7 @@ int main() {
     GpuTimelineWriter compat_writer;
     GpuTimelineSubmit legacy_first = first;
     legacy_first.depth_surfaces.clear(); legacy_first.target_spans.clear();
+    legacy_first.dma_copies.clear();
     legacy_first.dma_copy_count = 0; legacy_first.capture_incomplete = false;
     CHECK(compat_writer.open(compat_v2, metadata, error) && compat_writer.append_submit(legacy_first, error),
           "created a detail-free compatibility timeline");

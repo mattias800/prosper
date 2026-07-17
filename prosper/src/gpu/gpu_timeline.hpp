@@ -49,6 +49,13 @@ struct GpuTimelineTargetSpan {
     uint32_t height = 0;
 };
 
+struct GpuTimelineDmaCopy {
+    uint64_t dst = 0, src = 0;
+    uint32_t bytes = 0, sels = 0;
+    uint64_t command_order = 0;
+    uint64_t packet_addr = 0;
+};
+
 struct GpuTimelineSubmit {
     uint64_t sequence = 0;
     uint64_t elapsed_ns = 0;
@@ -64,9 +71,10 @@ struct GpuTimelineSubmit {
     uint32_t color0_height = 0;
     std::vector<GpuTimelineDepthSurface> depth_surfaces;
     std::vector<GpuTimelineTargetSpan> target_spans;
+    std::vector<GpuTimelineDmaCopy> dma_copies;
     bool target_spans_truncated = false;
-    // Capture v13 has no ordered DMA record. The compact timeline remains truthful and selectable,
-    // but detailed capture of this submit must fail closed until #833 extends the format.
+    // Older timeline versions can report an operation count without the exact records required for
+    // replay. New v8 writers retain this flag only when some other capture limitation is discovered.
     bool capture_incomplete = false;
 };
 
