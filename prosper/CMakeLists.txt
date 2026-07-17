@@ -177,6 +177,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_avplayer PRIVATE prosper_core)
   add_test(NAME avplayer_hle COMMAND test_avplayer)
 
+  add_executable(test_json2 tests/test_json2.cpp)
+  target_link_libraries(test_json2 PRIVATE prosper_core)
+  add_test(NAME json2_hle COMMAND test_json2)
+
   add_executable(test_equeue_events tests/test_equeue_events.cpp)
   target_link_libraries(test_equeue_events PRIVATE prosper_core)
   add_test(NAME equeue_events COMMAND test_equeue_events)

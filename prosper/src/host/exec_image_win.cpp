@@ -46,6 +46,8 @@
 // guest's rax. run_entry does the equivalent inline (it jmp's and never returns); this is the
 // call-and-return path used for the init/module_start functions.
 extern "C" uint64_t prosper_call_guest_sysv(uint64_t fn, uint64_t argc, uint64_t argp);
+extern "C" uint64_t prosper_call_guest_sysv4(uint64_t fn, uint64_t a0, uint64_t a1,
+                                               uint64_t a2, uint64_t a3);
 __asm__(
     ".text\n"
     ".p2align 4\n"
@@ -69,6 +71,54 @@ __asm__(
     "    movq  %rcx, %rax\n"           // MS x64: rcx=fn, rdx=argc, r8=argp
     "    movq  %rdx, %rdi\n"           // argc -> SysV arg0
     "    movq  %r8,  %rsi\n"           // argp -> SysV arg1
+    "    callq *%rax\n"
+    "    movaps    0(%rsp), %xmm6\n"
+    "    movaps   16(%rsp), %xmm7\n"
+    "    movaps   32(%rsp), %xmm8\n"
+    "    movaps   48(%rsp), %xmm9\n"
+    "    movaps   64(%rsp), %xmm10\n"
+    "    movaps   80(%rsp), %xmm11\n"
+    "    movaps   96(%rsp), %xmm12\n"
+    "    movaps  112(%rsp), %xmm13\n"
+    "    movaps  128(%rsp), %xmm14\n"
+    "    movaps  144(%rsp), %xmm15\n"
+    "    addq  $176, %rsp\n"
+    "    popq  %rdi\n"
+    "    popq  %rsi\n"
+    "    popq  %rbp\n"
+    "    retq\n"
+);
+
+// Four-argument host->guest bridge used by registered Sony callbacks.  Microsoft x64 passes
+// fn/a0/a1/a2 in rcx/rdx/r8/r9 and a3 at [entry-rsp+0x28]; the PS5 callback reads the four payload
+// arguments from rdi/rsi/rdx/rcx.  Preserve every register that is nonvolatile to the Windows caller
+// but volatile to a SysV callee, exactly as the two-argument module-init bridge above does.
+__asm__(
+    ".text\n"
+    ".p2align 4\n"
+    ".globl prosper_call_guest_sysv4\n"
+    "prosper_call_guest_sysv4:\n"
+    "    pushq %rbp\n"
+    "    movq  %rsp, %rbp\n"
+    "    pushq %rsi\n"
+    "    pushq %rdi\n"
+    "    subq  $176, %rsp\n"
+    "    movaps %xmm6,    0(%rsp)\n"
+    "    movaps %xmm7,   16(%rsp)\n"
+    "    movaps %xmm8,   32(%rsp)\n"
+    "    movaps %xmm9,   48(%rsp)\n"
+    "    movaps %xmm10,  64(%rsp)\n"
+    "    movaps %xmm11,  80(%rsp)\n"
+    "    movaps %xmm12,  96(%rsp)\n"
+    "    movaps %xmm13, 112(%rsp)\n"
+    "    movaps %xmm14, 128(%rsp)\n"
+    "    movaps %xmm15, 144(%rsp)\n"
+    "    movq  %rcx, %rax\n"           // callback address
+    "    movq  %r9,  %r10\n"           // save a2 before r9 is reused
+    "    movq  %rdx, %rdi\n"           // a0 -> SysV rdi
+    "    movq  %r8,  %rsi\n"           // a1 -> SysV rsi
+    "    movq  %r10, %rdx\n"           // a2 -> SysV rdx
+    "    movq  48(%rbp), %rcx\n"       // a3 -> SysV rcx (5th MS argument)
     "    callq *%rax\n"
     "    movaps    0(%rsp), %xmm6\n"
     "    movaps   16(%rsp), %xmm7\n"
