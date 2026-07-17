@@ -45,7 +45,26 @@ Assert-True ($Errors.Count -eq 0) 'verifier parses without PowerShell syntax err
 
 $HeadSha = (& git -C $Repo rev-parse HEAD).Trim()
 $BaseSha = (& git -C $Repo rev-parse origin/master).Trim()
-$DryRun = Invoke-Verifier @('renderer', '-Snapshot', 'messenger-scene', '-DryRun')
+$ProvenanceBuildRelative = 'prosper/build-linux/verify-pr-provenance'
+$ProvenanceBuild = Join-Path $Repo 'prosper\build-linux\verify-pr-provenance'
+$PreviousBootTrace = $env:PROSPER_BOOT_TRACE
+$PreviousScreenshot = $env:PROSPER_SCREENSHOT
+try {
+    New-Item -ItemType Directory -Path $ProvenanceBuild -Force | Out-Null
+    $env:PROSPER_BOOT_TRACE = '/tmp/hostile-boot-trace'
+    $env:PROSPER_SCREENSHOT = '/tmp/hostile-screenshot'
+    $DryRun = Invoke-Verifier @(
+        'renderer', '-Snapshot', 'messenger-scene',
+        '-LinuxBuild', $ProvenanceBuildRelative, '-DryRun'
+    )
+}
+finally {
+    if ($null -eq $PreviousBootTrace) { Remove-Item Env:PROSPER_BOOT_TRACE -ErrorAction SilentlyContinue }
+    else { $env:PROSPER_BOOT_TRACE = $PreviousBootTrace }
+    if ($null -eq $PreviousScreenshot) { Remove-Item Env:PROSPER_SCREENSHOT -ErrorAction SilentlyContinue }
+    else { $env:PROSPER_SCREENSHOT = $PreviousScreenshot }
+    Remove-Item -LiteralPath $ProvenanceBuild -Recurse -Force -ErrorAction SilentlyContinue
+}
 Assert-True ($DryRun.ExitCode -eq 0) 'renderer dry run succeeds on a clean pushed head'
 Assert-True ($DryRun.Output.Contains("git diff --check $BaseSha...$HeadSha")) `
     'diff check uses captured immutable base and head objects'
@@ -55,6 +74,11 @@ Assert-True ($DryRun.Output.Contains('Windows build') -and
     $DryRun.Output.Contains('Windows ctest') -and
     $DryRun.Output.Contains('snapshot guard: messenger-scene')) `
     'renderer profile includes both platform checks and the selected snapshot'
+Assert-True ($DryRun.Output.Contains('/prosper/build-linux/verify-pr-provenance/boot_trace') -and
+    $DryRun.Output.Contains('/prosper/build-linux/verify-pr-provenance/screenshot') -and
+    -not $DryRun.Output.Contains('/tmp/hostile-boot-trace') -and
+    -not $DryRun.Output.Contains('/tmp/hostile-screenshot')) `
+    'snapshot executables are pinned to the selected Linux build instead of inherited overrides'
 
 $SkipAttempt = Invoke-Verifier @('core', '-SkipLinux', '-SkipWindows', '-DryRun')
 Assert-True ($SkipAttempt.ExitCode -ne 0 -and

@@ -202,7 +202,12 @@ try {
         ) $Repo
         $SnapshotNames = if ($Snapshot.Count -eq 1 -and $Snapshot[0] -eq 'all') { @() } else { $Snapshot }
         $SnapshotArguments = @('python3', 'tools/snapshot/snapshot.py', 'check') + $SnapshotNames
-        $SnapshotShell = ($SnapshotArguments | ForEach-Object { ConvertTo-BashLiteral $_ }) -join ' '
+        $SnapshotEnvironment = @(
+            'PROSPER_BOOT_TRACE=' + (ConvertTo-BashLiteral "$LinuxBuildWsl/boot_trace")
+            'PROSPER_SCREENSHOT=' + (ConvertTo-BashLiteral "$LinuxBuildWsl/screenshot")
+        ) -join ' '
+        $SnapshotShell = $SnapshotEnvironment + ' ' +
+            (($SnapshotArguments | ForEach-Object { ConvertTo-BashLiteral $_ }) -join ' ')
         $SnapshotLabel = if ($SnapshotNames.Count -eq 0) {
             'snapshot guard: all'
         }

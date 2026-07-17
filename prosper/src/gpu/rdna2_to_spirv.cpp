@@ -1299,6 +1299,10 @@ struct RegState {
     // descriptor provenance can still distinguish driver input from a shader overwrite, while
     // scalar ALU may read their real bits (Astro copies V#.word2 into M0 as an LDS base).
     std::unordered_map<int, uint32_t> sreg_input;
+    // SGPRs definitely written by shader instructions along at least one path to this point. This
+    // provenance is independent of `sreg`: an unrepresentable write deliberately erases its SSA
+    // value, but must still invalidate an entry-time direct descriptor stored in that register.
+    std::unordered_set<int> sreg_written;
     std::unordered_map<int, uint32_t> sreg_bool;   // SGPR (pairs) holding a saved per-lane mask (bool id)
     std::unordered_map<int, bool> sreg_bool_narrowed;  // was EXEC narrowed when this mask was saved? (restores it)
     std::unordered_map<int, uint32_t> sreg_srt;    // SGPR holding a descriptor -> its user_data/SRT byte offset
@@ -1340,6 +1344,12 @@ inline void predicate_write(SpirvCompute& b, RegState& rs, int idx, uint32_t old
 }
 inline uint32_t vreg_old(SpirvCompute& b, RegState& rs, int idx) {
     auto it = rs.vreg.find(idx); return it == rs.vreg.end() ? b.uconst(0) : it->second;
+}
+
+inline bool sreg_range_written(const RegState& rs, int base, uint32_t words) {
+    for (uint32_t word = 0; word < words; ++word)
+        if (rs.sreg_written.count(base + static_cast<int>(word))) return true;
+    return false;
 }
 
 // A scalar inline integer used by a B64 mask operation is sign-extended to 64 bits.  Return the bit
@@ -2377,6 +2387,52 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
     return out;
 }
 
+namespace {
+
+uint32_t scalar_write_width(const Rdna2Inst& in) {
+    switch (in.fmt) {
+        case Rdna2Format::SOP1:
+            if (in.opcode == 0x20) return 0; // s_setpc_b64 reads its decoded "dst" field.
+            switch (in.opcode) {
+                case 0x04: case 0x08: case 0x0a: case 0x1f:
+                case 0x24: case 0x25: case 0x37:
+                    return 2; // B64 data/mask writes
+                default: return 1;
+            }
+        case Rdna2Format::SOP2:
+            switch (in.opcode) {
+                case 0x0b: case 0x0f: case 0x11: case 0x13: case 0x15:
+                case 0x17: case 0x19: case 0x1b: case 0x1d: case 0x25: case 0x29:
+                    return 2; // B64 data/mask writes
+                default: return 1;
+            }
+        case Rdna2Format::SOPK: return 1;
+        case Rdna2Format::SMEM:
+            switch (in.opcode) {
+                case 0x0: case 0x8: return 1;
+                case 0x1: case 0x9: return 2;
+                case 0x2: case 0xa: return 4;
+                case 0x3: case 0xb: return 8;
+                case 0x4: case 0xc: return 16;
+                default: return 0;
+            }
+        case Rdna2Format::VOP1: return in.opcode == 0x02 ? 1u : 0u; // v_readfirstlane
+        case Rdna2Format::VOP3: return in.opcode == 0x360 ? 1u : 0u; // v_readlane
+        default: return 0;
+    }
+}
+
+void record_scalar_write(RegState& rs, const Rdna2Inst& in) {
+    const uint32_t width = scalar_write_width(in);
+    for (uint32_t word = 0; word < width; ++word) {
+        const int reg = in.dst.value + static_cast<int>(word);
+        rs.sreg_written.insert(reg);
+        rs.sreg_input.erase(reg);
+    }
+}
+
+} // namespace
+
 // Registers WRITTEN in the pc range [lo, hi): candidates for an OpPhi at the loop header. Over-
 // approximation is safe (an extra phi for a non-carried value merges equal values). Mirrors emit_alu's
 // write targets, INCLUDING multi-register writes (MIMG dmask -> N consecutive VGPRs, SMEM -> N SGPRs) so
@@ -2443,6 +2499,10 @@ uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, const 
         case OperandKind::SGPR: {
             auto it = rs.sreg.find(o.value);
             if (it != rs.sreg.end()) return it->second;
+            if (rs.sreg_written.count(o.value)) {
+                if (ok) *ok = false;
+                return b.uconst(0);
+            }
             auto input = rs.sreg_input.find(o.value);
             return input == rs.sreg_input.end() ? b.uconst(0) : input->second;
         }
@@ -3912,7 +3972,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (!res && it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second);
                 // A scalar buffer load reads a CONSTANT buffer — resolve the SBASE SGPR to a constant
                 // buffer specifically (the same SGPR may also hold a vertex-buffer V# elsewhere).
-                if (!res) res = rt->by_sgpr_base_cls(in.src[0].value, ResourceClass::ConstantBuffer);
+                if (!res && !sreg_range_written(rs, in.src[0].value, 4))
+                    res = rt->by_sgpr_base_cls(in.src[0].value, ResourceClass::ConstantBuffer);
                 if (res) { binding = res->binding; cbuf_resolved = true; } }
             if (getenv("PROSPER_CBUFLOG"))
                 fprintf(stderr, "[cbuf] pc=%u s_buffer_load x%u src0=s%d off=0x%x(dw%u) dyn=%d -> binding=%u %s\n",
@@ -4053,13 +4114,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // Any write to the four-dword SRSRC range invalidates its entry-time direct V#.
                     // Exact per-fetch and s_load provenance below may still identify the live descriptor,
                     // but a missing/rejected dynamic result must never fall back to stale user data.
-                    bool srsrc_rewritten = false;
-                    for (int component = 0; component < 4; ++component) {
-                        if (rs.sreg.find(in.src[1].value + component) != rs.sreg.end()) {
-                            srsrc_rewritten = true;
-                            break;
-                        }
-                    }
+                    const bool srsrc_rewritten = sreg_range_written(rs, in.src[1].value, 4);
                     // PER-FETCH first: a reloaded SRSRC holds a different V# per attribute, so match this
                     // exact fetch instruction's pc; fall back to untouched SGPR user data or an s_load
                     // SRT tag. A rewritten direct descriptor without either provenance stays unresolved.
@@ -4118,7 +4173,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const ShaderResource* res = rt->by_fetch_pc(in.pc);
                 if (!res) { auto it = rs.sreg_srt.find(in.src[1].value);
                     if (it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second); }
-                if (!res) res = rt->by_sgpr_base(in.src[1].value);
+                if (!res && !sreg_range_written(rs, in.src[1].value, 4))
+                    res = rt->by_sgpr_base(in.src[1].value);
                 if (!res) { ok = false; return true; }   // unresolvable V# -> reject; NEVER default to binding 2
                 binding = res->binding;
                 stride  = res->stride;
@@ -4382,7 +4438,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 res = nullptr;
                 auto it = rs.sreg_srt.find(in.src[1].value);
                 if (it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second);
-                if (!res) res = rt->by_sgpr_base(in.src[1].value);
+                if (!res && !sreg_range_written(rs, in.src[1].value, 8))
+                    res = rt->by_sgpr_base(in.src[1].value);
             }
             // Exact per-use provenance wins over table keys. A sample and store may consume the same
             // T# through a colliding offset but require different Vulkan descriptor classes.
@@ -4906,27 +4963,6 @@ std::unordered_map<uint32_t, std::vector<uint32_t>> detect_pcrel_tables(
 
 namespace {
 
-uint32_t scalar_write_width(const Rdna2Inst& in) {
-    switch (in.fmt) {
-        case Rdna2Format::SOP1:
-            if (in.opcode == 0x20) return 0; // s_setpc_b64 reads its decoded "dst" field.
-            return (in.opcode == 0x04 || in.opcode == 0x1f) ? 2u : 1u;
-        case Rdna2Format::SOP2: return in.opcode == 0x29 ? 2u : 1u;
-        case Rdna2Format::SOPK: return 1;
-        case Rdna2Format::SMEM:
-            switch (in.opcode) {
-                case 0x0: case 0x8: return 1;
-                case 0x1: case 0x9: return 2;
-                case 0x2: case 0xa: return 4;
-                case 0x3: case 0xb: return 8;
-                case 0x4: case 0xc: return 16;
-                default: return 0;
-            }
-        case Rdna2Format::VOP1: return in.opcode == 0x02 ? 1u : 0u; // v_readfirstlane
-        default: return 0;
-    }
-}
-
 const Rdna2Inst* last_scalar_writer(const std::vector<Rdna2Inst>& ins, uint32_t before_pc,
                                     int reg) {
     const Rdna2Inst* result = nullptr;
@@ -5348,6 +5384,61 @@ bool emit_compute_cfg_state_machine(
         }
     }
 
+    // The dispatcher reloads scalar values from Function variables, so map membership cannot say
+    // whether shader code has overwritten an entry-time descriptor. Compute a forward MAY-write set
+    // for every basic-block entry instead. MAY is intentional: if one predecessor overwrote the
+    // descriptor, falling back to entry metadata after the join would be wrong on that path. Backedges
+    // participate in the fixed point, preventing a stale fallback on later loop iterations.
+    std::vector<std::unordered_set<int>> scalar_writes(starts.size());
+    std::vector<std::vector<uint32_t>> successors(starts.size());
+    for (uint32_t block = 0; block < starts.size(); ++block) {
+        const uint32_t lo = starts[block];
+        const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
+        for (const auto& in : ins) {
+            if (in.pc < lo || in.pc >= hi) continue;
+            const uint32_t width = scalar_write_width(in);
+            for (uint32_t word = 0; word < width; ++word)
+                scalar_writes[block].insert(in.dst.value + static_cast<int>(word));
+        }
+
+        const Rdna2Inst* terminator = nullptr;
+        for (const auto& in : ins) {
+            if (in.pc < lo || in.pc >= hi) continue;
+            if (in.is_end || (in.fmt == Rdna2Format::SOPP && in.opcode >= 0x02 &&
+                              in.opcode <= 0x09 && in.opcode != 0x03)) {
+                terminator = &in;
+                break;
+            }
+        }
+        auto add_successor = [&](uint32_t pc) {
+            auto next = block_for_pc.find(pc);
+            if (pc <= end_pc && next != block_for_pc.end())
+                successors[block].push_back(next->second);
+        };
+        if (!terminator) {
+            add_successor(hi);
+        } else if (!terminator->is_end) {
+            add_successor(branch_target(*terminator));
+            if (terminator->opcode != 0x02)
+                add_successor(terminator->pc + terminator->len_dwords);
+        }
+    }
+    std::vector<std::unordered_set<int>> scalar_may_write_in(starts.size());
+    if (!scalar_may_write_in.empty()) scalar_may_write_in.front() = initial.sreg_written;
+    bool provenance_changed = true;
+    while (provenance_changed) {
+        provenance_changed = false;
+        for (uint32_t block = 0; block < starts.size(); ++block) {
+            std::unordered_set<int> out = scalar_may_write_in[block];
+            out.insert(scalar_writes[block].begin(), scalar_writes[block].end());
+            for (uint32_t successor : successors[block]) {
+                const size_t before = scalar_may_write_in[successor].size();
+                scalar_may_write_in[successor].insert(out.begin(), out.end());
+                provenance_changed |= scalar_may_write_in[successor].size() != before;
+            }
+        }
+    }
+
     // Saved mask pairs and scalar-spill lane slots have their own value domains.
     std::set<int> mask_keys = static_mask_keys;
     std::set<std::pair<int, int>> lane_slots, mask_lane_slots;
@@ -5551,11 +5642,10 @@ bool emit_compute_cfg_state_machine(
         const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
         b.emit_label(labels[block]);
         RegState state = load_state();
+        state.sreg_written = scalar_may_write_in[block];
         if (!direct_descriptor_sregs.empty()) {
-            std::set<int> written_vregs, written_sregs;
-            loop_written_regs(ins, 0, lo, written_vregs, written_sregs);
             for (int reg : direct_descriptor_sregs)
-                if (!written_sregs.count(reg)) state.sreg.erase(reg);
+                if (!state.sreg_written.count(reg)) state.sreg.erase(reg);
         }
         const Rdna2Inst* terminator = nullptr;
         const Rdna2Inst* mbcnt = nullptr;
@@ -5586,8 +5676,10 @@ bool emit_compute_cfg_state_machine(
                 continue;
             }
             bool ok = true;
-            if (!emit_alu(b, state, in, ok, allow_exec_update, &safe, allow_smem, rt,
-                          /*allow_wave*/false) || !ok) {
+            const bool handled = emit_alu(b, state, in, ok, allow_exec_update, &safe,
+                                          allow_smem, rt, /*allow_wave*/false);
+            if (handled && ok) record_scalar_write(state, in);
+            if (!handled || !ok) {
                 if (getenv("PROSPER_DBG"))
                     std::fprintf(stderr, "[cfg-recompile-reject] pc=%u fmt=%d op=0x%x\n",
                                  in.pc, static_cast<int>(in.fmt), in.opcode);
@@ -5966,7 +6058,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             if (dead_masks.count(in.pc)) continue;
             if (in.fmt == Rdna2Format::EXP) { if (!exp_fn(in)) return false; continue; }
             bool ok = true;
-            if (!emit_alu(b, rs, in, ok, allow_exec_update, &effective_safe, allow_smem, rt, wave_ok) || !ok) {
+            const bool handled = emit_alu(
+                b, rs, in, ok, allow_exec_update, &effective_safe, allow_smem, rt, wave_ok);
+            if (handled && ok) record_scalar_write(rs, in);
+            if (!handled || !ok) {
                 // PROSPER_DBG (gated, off by default): report the instruction that fails recompilation —
                 // the first unsupported op / unresolved resource that makes a shader return empty.
                 if (getenv("PROSPER_DBG"))
@@ -6095,6 +6190,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             const uint32_t then_scc = rs.scc, then_vcc = rs.vcc, then_exec = rs.exec;
             const bool then_narrowed = rs.exec_narrowed;
             const auto then_bool = rs.sreg_bool;
+            const auto then_written = rs.sreg_written;
             b.emit_branch(merge_label);
 
             rs = before;
@@ -6122,6 +6218,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             if (then_exec != rs.exec)
                 rs.exec = b.emit_phi_2way(b.t_bool, then_exec, then_block, rs.exec, else_block);
             rs.exec_narrowed = then_narrowed || rs.exec_narrowed;
+            rs.sreg_written.insert(then_written.begin(), then_written.end());
             if (then_bool != rs.sreg_bool) {
                 if (getenv("PROSPER_DBG"))
                     fprintf(stderr, "[recompile-reject] counted-loop prelude changes mask domain\n");
@@ -6487,6 +6584,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     uint32_t then_scc = rs.scc, then_vcc = rs.vcc, then_exec = rs.exec;
                     const bool then_narrowed = rs.exec_narrowed;
                     const std::unordered_map<int,uint32_t> then_bool = rs.sreg_bool;
+                    const auto then_written = rs.sreg_written;
                     b.emit_branch(mergeL);
                     rs = pre;                               // else-arm starts from the pre-branch state
                     b.emit_label(elseL);
@@ -6501,6 +6599,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     if (then_vcc != rs.vcc) rs.vcc = b.emit_phi_2way(b.t_bool, then_vcc, thenEnd, rs.vcc, elseEnd);
                     if (then_exec != rs.exec) rs.exec = b.emit_phi_2way(b.t_bool, then_exec, thenEnd, rs.exec, elseEnd);
                     rs.exec_narrowed = then_narrowed || rs.exec_narrowed;
+                    rs.sreg_written.insert(then_written.begin(), then_written.end());
                     // Merge the UNION of mask keys. A mask created in only one arm is false in the
                     // other arm; leaving that arm-local SSA id live after the merge is invalid SPIR-V.
                     std::set<int> bool_keys;
@@ -6653,9 +6752,11 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
         cov.total++;
         if (in.fmt == Rdna2Format::EXP) { cov.exports++; continue; }   // handled by the stage recompilers
         bool ok = true;
-        bool handled = cf_reconstructed(in)
-                     || (emit_alu(b, rs, in, ok, /*allow_exec_update*/true, &safe_branches, /*allow_smem*/true,
-                                  /*rt*/nullptr, /*allow_wave*/true) && ok);
+        const bool emitted = emit_alu(
+            b, rs, in, ok, /*allow_exec_update*/true, &safe_branches,
+            /*allow_smem*/true, /*rt*/nullptr, /*allow_wave*/true);
+        if (emitted && ok) record_scalar_write(rs, in);
+        bool handled = cf_reconstructed(in) || (emitted && ok);
         // Shapes the recompiler handles only in context (a resource table for MIMG sample/load/LOD/store
         // and buffer_load/store_format; a fragment stage for VINTRP). This table-less compute-shell pass
         // rejects them, so count them apart from truly-unsupported (cross-lane, etc.). Instruction-aware

@@ -5,7 +5,8 @@ the shipped runtime. Build them from `build-linux/` like everything else.
 
 - **`verify-pr.ps1`** - author-owned PR verification orchestrator for the Windows+WSL development
   environment. Run it only from a clean, pushed PR head: `docs` records the diff check, `core` adds
-  Linux and Windows build+ctest, and `renderer -Snapshot NAME` also runs the selected real-game guard.
+  Linux and Windows build+ctest, and `renderer -Snapshot NAME` also runs the selected real-game guard
+  with `boot_trace` and `screenshot` pinned to that run's selected Linux build directory.
   `-Pr N` posts the generated SHA-bound `AUTHOR VERIFICATION` record. Reviewers inspect its coverage
   but do not rerun it; see the mandatory merge policy in the root `CLAUDE.md`. Run
   `powershell -File tools/test-verify-pr.ps1` after changing the orchestrator; it probes exact-base

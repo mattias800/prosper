@@ -166,6 +166,36 @@ int main() {
     CHECK(rejected_rewrites_stay_closed,
           "rejected packed SRSRC rewrites cannot compile through the stale direct identity V#");
 
+    // A shader write remains provenance even when its value cannot be represented. This B64 move
+    // reads an untracked pair, so the scalar SSA entries for s[20:21] are erased. The later fetch must
+    // still reject instead of resurrecting the entry-time direct V# merely because the map is empty.
+    // Encoding round-tripped with llvm-mc gfx1030: s_mov_b64 s[20:21], s[50:51].
+    const uint32_t erased_srsrc[] = {
+        0xBE940432u,
+        0xE00C2000u, 0x80050100u, // buffer_load_format_xyzw v[1:4], v0, s[20:23], 0 idxen
+        0xBF810000u,
+    };
+    CHECK(recompile_valu(erased_srsrc, sizeof(erased_srsrc)/sizeof(erased_srsrc[0]),
+                         1, 1, &packed_entry_table).empty(),
+          "unrepresentable SRSRC writes cannot resurrect an entry-time direct V#");
+
+    // The same invalidation is a MAY-write property at structured joins: the untouched else edge
+    // cannot make entry metadata safe on the then edge that erased s[20:21]. Branch offsets and all
+    // instruction encodings were round-tripped with llvm-mc gfx1030.
+    const uint32_t branch_erased_srsrc[] = {
+        0xBF060000u,             // s_cmp_eq_u32 s0, s0
+        0xBF840002u,             // s_cbranch_scc0 else
+        0xBE940432u,             // then: s_mov_b64 s[20:21], s[50:51]
+        0xBF820001u,             // s_branch merge
+        0xBE840380u,             // else: s_mov_b32 s4, 0
+        0xE00C2000u, 0x80050100u,
+        0xBF810000u,
+    };
+    CHECK(recompile_valu(branch_erased_srsrc,
+                         sizeof(branch_erased_srsrc)/sizeof(branch_erased_srsrc[0]),
+                         1, 1, &packed_entry_table).empty(),
+          "structured joins preserve erased SRSRC write provenance from either arm");
+
     // Kernel 5: descriptor-TABLE uses (#294). s[8:9] = a pointer to a host-memory table; the shader
     // s_loads an 8-dword T# (imm 0x40) + a 4-dword S#/V# (imm 0x80), consumes them via image_sample
     // (SRSRC/SSAMP) and s_buffer_load (SBASE). Each use must be reported with the load immediate as
