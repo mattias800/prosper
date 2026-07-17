@@ -301,14 +301,17 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   authorizes it. The PR author owns verification; prefer `powershell -File prosper/tools/verify-pr.ps1 core` or,
   for renderer changes, `powershell -File prosper/tools/verify-pr.ps1 renderer -Snapshot <name>`, and post the
   exact-head results.
-- **Use independent review where risk justifies it.** Complex or high-risk changes—such as shader recompilers and
-  control flow, memory safety, synchronization, ABI-sensitive interfaces, persistent data, or changes whose
-  failure can silently corrupt results—require an independent code review before merge. Routine, well-bounded,
-  low-risk changes do not. The reviewer inspects the code, tests, risks, and author evidence, but does not
-  duplicate the author's builds, tests, snapshots, or CI jobs. Once the author is satisfied and the PR is
-  published, run author verification and any required review; the author posts exact-head evidence and the
-  reviewer posts approval on the corrected head. Address every blocking finding, then merge only after the merge
-  agent separately confirms author verification, reviewer approval where required, and green required CI.
+- **Use independent review where risk justifies it.** Complex or high-risk changes—such as shader/recompiler
+  control flow, memory safety or untrusted bounds, synchronization, ABI-sensitive interfaces, persistent data,
+  shared renderer/executor format, size, or indexing semantics, or changes whose failure can silently corrupt
+  results—require an independent code review before merge. Judge the failure modes, not merely the diff size.
+  Routine, well-bounded, low-risk changes do not require an independent reviewer. The reviewer inspects the
+  assumptions, code, risks, and tests, including whether each regression test would fail without the fix, but
+  does not duplicate the author's builds, tests, snapshots, or CI jobs. Once the author is satisfied and the PR
+  is published, run author verification and any required review; the author posts exact-head evidence and the
+  reviewer posts approval on the corrected exact head. Address every blocking finding and re-review authored
+  corrections, then merge only after the merge agent separately confirms author verification, reviewer approval
+  where required, and green required CI.
 - **Unpublished desktop-app parity is not a merge requirement.** A Linux-, Windows-, or macOS-specific app
   improvement may merge without matching work in every other frontend unless the issue explicitly promises
   parity or a shared public contract requires it. Unaffected platforms must still retain existing behavior and
