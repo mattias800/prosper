@@ -85,6 +85,37 @@ int main() {
         CHECK(gev.udata == kEopUdata, "EOP event echoed the registered udata");
     }
 
+    // --- Invalid WaitEqueue arguments (#388): num < 1 is EINVAL and a null event array is EFAULT.
+    //     Neither failure may consume a ready event; the next valid wait must still receive it.
+    {
+        trigger(eq, (uint64_t)kId, 0x3333, 0, 0, 0);
+        KEvent iev{}; int32_t iout = -1; uint32_t icap = 2000;
+        uint64_t ri = wait(eq, (uint64_t)(uintptr_t)&iev, 0,
+                           (uint64_t)(uintptr_t)&iout, (uint64_t)(uintptr_t)&icap, 0);
+        CHECK((uint32_t)ri == 0x80020016u && iout == 0,
+              "WaitEqueue num<1 returns EINVAL with 0 events");
+        iout = -1;
+        ri = wait(eq, (uint64_t)(uintptr_t)&iev, static_cast<uint64_t>(-1ll),
+                  (uint64_t)(uintptr_t)&iout, (uint64_t)(uintptr_t)&icap, 0);
+        CHECK((uint32_t)ri == 0x80020016u && iout == 0,
+              "WaitEqueue negative count returns EINVAL with 0 events");
+        uint64_t rv = wait(eq, (uint64_t)(uintptr_t)&iev, 1,
+                           (uint64_t)(uintptr_t)&iout, (uint64_t)(uintptr_t)&icap, 0);
+        CHECK(rv == 0 && iout == 1 && iev.udata == 0x3333,
+              "invalid-count wait leaves its ready event queued");
+
+        trigger(eq, (uint64_t)kId, 0x4444, 0, 0, 0);
+        iout = -1;
+        uint64_t rf = wait(eq, 0, 1, (uint64_t)(uintptr_t)&iout,
+                           (uint64_t)(uintptr_t)&icap, 0);
+        CHECK((uint32_t)rf == 0x8002000eu && iout == 0,
+              "WaitEqueue null event array returns EFAULT with 0 events");
+        rv = wait(eq, (uint64_t)(uintptr_t)&iev, 1,
+                  (uint64_t)(uintptr_t)&iout, (uint64_t)(uintptr_t)&icap, 0);
+        CHECK(rv == 0 && iout == 1 && iev.udata == 0x4444,
+              "null-array wait leaves its ready event queued");
+    }
+
     // --- Real wait semantics (#67): a timed wait that expires with nothing returns ETIMEDOUT
     //     (0x8002003C, Kyty EventQueue.cpp:310), NOT success-with-0-events; an unknown queue
     //     handle returns EBADF (0x80020009), not success. ---

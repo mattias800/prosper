@@ -629,6 +629,15 @@ HLE(k_eq_wait)   {   // (eq, SceKernelEvent* ev, int num, int* out, SceKernelUse
     if (evlog()) fprintf(stderr, "[ev] WaitEqueue eq=0x%llx num=%llu timeout=%s ra=eboot+0x%llx\n",
         (unsigned long long)a0, (unsigned long long)a2, a4 ? "yes" : "inf",
         (unsigned long long)((uint64_t)__builtin_return_address(0) - 0x400000000ull));
+    const int num = static_cast<int32_t>(a2);
+    if (num < 1) {
+        if (a3) *(int32_t*)P(a3) = 0;
+        return 0x80020016ull;   // SCE_KERNEL_ERROR_EINVAL
+    }
+    if (!a1) {
+        if (a3) *(int32_t*)P(a3) = 0;
+        return 0x8002000eull;   // SCE_KERNEL_ERROR_EFAULT; do not dequeue an event without a buffer
+    }
     // PROSPER_WAITCALLER: scan the stack for the GAME's wait-loop return address (eboot code range,
     // NOT the stub region at 0x6..) so we can disassemble the loop's exit condition. Log once per eq.
     // PROSPER_DUMPCODE=<hex eboot offset>[,<off2>...]: dump 224 code bytes at each (guest memory is mapped),
@@ -676,7 +685,6 @@ HLE(k_eq_wait)   {   // (eq, SceKernelEvent* ev, int num, int* out, SceKernelUse
         }
     }
     auto s = eq_find(a0);
-    int num = (int)a2; if (num < 1) num = 1;
     // Unknown/deleted queue: the real API errors (Kyty EventQueue.cpp returns KERNEL_ERROR_EBADF);
     // the old success-with-0-events reply made the caller consume a never-written event struct.
     if (!s) { if (a3) *(int32_t*)P(a3) = 0; return 0x80020009ull; }   // KERNEL_ERROR_EBADF
