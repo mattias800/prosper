@@ -444,6 +444,50 @@ int main() {
     printf("  image_load(1,1) center=(%u,%u,%u)\n", okL1?rgb[0]:0, okL1?rgb[1]:0, okL1?rgb[2]:0);
     CHECK(okL1 && rgb[0] > 0x80 && rgb[1] > 0x80 && rgb[2] > 0x80, "image_load texel (1,1) yields WHITE (proves integer coords)");
 
+    // The same image_load instruction becomes OpImageRead when its resource class is StorageImage.
+    // That SPIR-V interface must be backed by a STORAGE_IMAGE descriptor over an image with STORAGE
+    // usage in GENERAL layout, not the sampled texture's combined-image-sampler contract (#374).
+    {
+        ShaderResourceTable storage_rt;
+        { ShaderResource image{}; image.cls = ResourceClass::StorageImage;
+          image.binding = 4; image.img_dim = 1; image.width = 2; image.height = 2;
+          image.sgpr_base = 8; storage_rt.resources.push_back(image); }
+        std::vector<uint32_t> storage_frag = recompile_fragment(
+            il_template, sizeof(il_template) / sizeof(il_template[0]), &storage_rt);
+        CHECK(!storage_frag.empty() && storage_frag[0] == 0x07230203u,
+              "recompiled graphics image_load as a storage-image OpImageRead");
+        if (!storage_frag.empty()) {
+            prosper::test::FrameResource storage_resource;
+            storage_resource.binding = 4; storage_resource.set = 1;
+            storage_resource.tex_rgba = texels; storage_resource.tw = 2; storage_resource.th = 2;
+            storage_resource.is_storage_image = true;
+            prosper::test::BackendDraw storage_draw;
+            storage_draw.vs = vert; storage_draw.fs = storage_frag;
+            storage_draw.R = {storage_resource}; storage_draw.vcount = 3;
+            prosper::test::FrameResource sampled_resource = storage_resource;
+            sampled_resource.is_storage_image = false;
+            prosper::test::BackendDraw sampled_draw = storage_draw;
+            sampled_draw.fs = recompile_fragment(
+                il_template, sizeof(il_template) / sizeof(il_template[0]), &rt);
+            sampled_draw.R = {sampled_resource};
+            std::vector<uint8_t> storage_px = prosper::test::render_draws_rgba(
+                {storage_draw}, W, H);
+            bool storage_ok = storage_px.size() == static_cast<size_t>(W) * H * 4;
+            if (storage_ok) {
+                const uint8_t* c = &storage_px[((size_t)(H / 2) * W + W / 2) * 4];
+                storage_ok = c[0] > 0x80 && c[1] < 0x40 && c[2] < 0x40;
+            }
+            CHECK(storage_ok,
+                  "graphics storage-image descriptor reads texel (0,0) into the framebuffer");
+            // Separately exercise the alias case. Both descriptors reference the same decoded bytes
+            // in one backend call but need distinct VkImages because their usage and layouts differ.
+            prosper::test::render_draws_rgba({sampled_draw, storage_draw}, W, H);
+            const auto storage_stats = prosper::test::backend_texture_upload_stats();
+            CHECK(storage_stats.references == 2 && storage_stats.unique_uploads == 2,
+                  "sampled and storage descriptors never share an incompatible image upload");
+        }
+    }
+
     // image_sample_lz (explicit LOD 0): coords (0.75,0.25) -> texel (1,0) = green, same as image_sample.
     const uint32_t lz[] = {
         0x7e0002ffu, 0x3f400000u, 0x7e0202ffu, 0x3e800000u, 0xf09c0f08u, 0x00820000u,
