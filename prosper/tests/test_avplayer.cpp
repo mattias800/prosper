@@ -191,8 +191,13 @@ int main() {
           "native playback fires READY then PLAY");
     AvpFrameInfoEx native_frame{};
     CHECK(video(native_handle, (uint64_t)(uintptr_t)&native_frame, 0, 0, 0, 0) == 1 &&
-              native_frame.data == fake.nv12.data() && native_frame.timestamp == 16,
-          "native decoded NV12 frame and timestamp reach the guest");
+              native_frame.data && native_frame.data != fake.nv12.data() &&
+              native_frame.timestamp == 16 &&
+              memcmp(native_frame.data, fake.nv12.data(), fake.nv12.size()) == 0,
+          "native decoded NV12 frame is copied into player-owned guest staging");
+    fake.nv12[0] = 0x7f;
+    CHECK(static_cast<const uint8_t*>(native_frame.data)[0] == 0x40,
+          "guest frame storage remains independent when the backend recycles its packet");
     uint32_t native_width = 0, native_height = 0; double native_fps = 0.0;
     memcpy(&native_width, native_frame.details + 0, sizeof(native_width));
     memcpy(&native_height, native_frame.details + 4, sizeof(native_height));
