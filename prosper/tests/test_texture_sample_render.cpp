@@ -470,11 +470,8 @@ int main() {
             sampled_draw.fs = recompile_fragment(
                 il_template, sizeof(il_template) / sizeof(il_template[0]), &rt);
             sampled_draw.R = {sampled_resource};
-            // Both descriptors reference the same decoded bytes in one backend call. They must still
-            // get distinct VkImages because their usage flags and final layouts are incompatible.
             std::vector<uint8_t> storage_px = prosper::test::render_draws_rgba(
-                {sampled_draw, storage_draw}, W, H);
-            const auto storage_stats = prosper::test::backend_texture_upload_stats();
+                {storage_draw}, W, H);
             bool storage_ok = storage_px.size() == static_cast<size_t>(W) * H * 4;
             if (storage_ok) {
                 const uint8_t* c = &storage_px[((size_t)(H / 2) * W + W / 2) * 4];
@@ -482,6 +479,10 @@ int main() {
             }
             CHECK(storage_ok,
                   "graphics storage-image descriptor reads texel (0,0) into the framebuffer");
+            // Separately exercise the alias case. Both descriptors reference the same decoded bytes
+            // in one backend call but need distinct VkImages because their usage and layouts differ.
+            prosper::test::render_draws_rgba({sampled_draw, storage_draw}, W, H);
+            const auto storage_stats = prosper::test::backend_texture_upload_stats();
             CHECK(storage_stats.references == 2 && storage_stats.unique_uploads == 2,
                   "sampled and storage descriptors never share an incompatible image upload");
         }
