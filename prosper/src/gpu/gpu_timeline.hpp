@@ -59,11 +59,15 @@ struct GpuTimelineSubmit {
     uint64_t color0_base = 0;
     uint32_t draw_count = 0;
     uint32_t dispatch_count = 0;
+    uint32_t dma_copy_count = 0;
     uint32_t color0_width = 0;
     uint32_t color0_height = 0;
     std::vector<GpuTimelineDepthSurface> depth_surfaces;
     std::vector<GpuTimelineTargetSpan> target_spans;
     bool target_spans_truncated = false;
+    // Capture v13 has no ordered DMA record. The compact timeline remains truthful and selectable,
+    // but detailed capture of this submit must fail closed until #833 extends the format.
+    bool capture_incomplete = false;
 };
 
 // Shared by live detailed-capture selection and offline timeline inspection. A zero target extent

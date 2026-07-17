@@ -23,6 +23,7 @@
 #include <cstring>
 #include <algorithm>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <set>
@@ -56,6 +57,27 @@ struct RttSurf {
 
 using RttCache = std::unordered_map<uint64_t, RttSurf>;
 
+struct PendingGuestGpuWrites {
+    std::mutex mutex;
+    std::vector<std::pair<uint64_t, uint64_t>> ranges;
+    bool overflowed = false;
+};
+
+PendingGuestGpuWrites& pending_guest_gpu_writes() {
+    static PendingGuestGpuWrites pending;
+    return pending;
+}
+
+void queue_guest_gpu_write(uint64_t addr, uint64_t size) {
+    auto& pending = pending_guest_gpu_writes();
+    std::lock_guard<std::mutex> lock(pending.mutex);
+    constexpr size_t kMaxPendingRanges = 65536;
+    if (pending.ranges.size() < kMaxPendingRanges)
+        pending.ranges.emplace_back(addr, size);
+    else
+        pending.overflowed = true;
+}
+
 void invalidate_cpu_rtt_guest_write(RttCache& cache, uint64_t addr, uint64_t size) {
     if (!addr || !size) return;
     const uint64_t end = size > UINT64_MAX - addr ? UINT64_MAX : addr + size;
@@ -68,6 +90,38 @@ void invalidate_cpu_rtt_guest_write(RttCache& cache, uint64_t addr, uint64_t siz
             ? UINT64_MAX : it->first + bytes;
         if (addr < target_end && it->first < end) it = cache.erase(it);
         else ++it;
+    }
+}
+
+void drain_guest_gpu_writes(RttCache& cache, bool invalidate_ds) {
+    auto& pending = pending_guest_gpu_writes();
+    std::vector<std::pair<uint64_t, uint64_t>> ranges;
+    bool overflowed = false;
+    {
+        std::lock_guard<std::mutex> lock(pending.mutex);
+        ranges.swap(pending.ranges);
+        overflowed = pending.overflowed;
+        pending.overflowed = false;
+    }
+    if (overflowed) {
+        for (auto& [key, target] : prosper::test::persistent_color_target_cache()) {
+            (void)key;
+            target.valid = false;
+        }
+        if (invalidate_ds)
+            for (auto& [key, image] : prosper::test::persistent_ds_cache()) {
+                (void)key;
+                image.depth_valid = false;
+                image.stencil_valid = false;
+            }
+        cache.clear();
+        return;
+    }
+    for (const auto& [addr, size] : ranges) {
+        if (invalidate_ds)
+            prosper::test::invalidate_persistent_ds_guest_write(addr, size);
+        prosper::test::invalidate_persistent_color_target_guest_write(addr, size);
+        invalidate_cpu_rtt_guest_write(cache, addr, size);
     }
 }
 
@@ -176,12 +230,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
     const char* ds_invalidate = getenv("PROSPER_DS_GUEST_WRITE_INVALIDATE");
     const bool invalidate_ds = !ds_invalidate || strcmp(ds_invalidate, "0");
     prosper::gpu::set_guest_gpu_write_observer(
-        [invalidate_ds](uint64_t addr, uint64_t size) {
-            if (invalidate_ds)
-                prosper::test::invalidate_persistent_ds_guest_write(addr, size);
-            prosper::test::invalidate_persistent_color_target_guest_write(addr, size);
-            invalidate_cpu_rtt_guest_write(g_rtt, addr, size);
-        });
+        [](uint64_t addr, uint64_t size) { queue_guest_gpu_write(addr, size); });
     // Resource tables are built before the submit reaches this callback. Publish the renderer's
     // default mode now so unmapped render-target descriptors remain available for RTT injection.
     // Outside a registered renderer, resource decoding retains its strict unknown-format policy.
@@ -195,7 +244,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
     static std::atomic<int> frame_no{0};
     if (getenv("PROSPER_GPU_CAPTURE") || getenv("PROSPER_GPU_TIMELINE_CAPTURE") ||
         getenv("PROSPER_GPU_REPLAY_EXPORT_RTT")) {
-        prosper::gpu::set_gpu_capture_rtt_seed_reader([](uint64_t addr, prosper::gpu::GpuCaptureRttSeed& seed) {
+        prosper::gpu::set_gpu_capture_rtt_seed_reader([invalidate_ds](uint64_t addr, prosper::gpu::GpuCaptureRttSeed& seed) {
+            drain_guest_gpu_writes(g_rtt, invalidate_ds);
             auto it = g_rtt.find(addr); if (it == g_rtt.end()) return false;
             if (!it->second.rgba) return false;
             seed.guest_addr = addr; seed.width = it->second.w; seed.height = it->second.h;
@@ -203,7 +253,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             seed.rgba = *it->second.rgba; return true;
         });
         prosper::gpu::set_gpu_capture_rtt_seed_snapshot_reader(
-            [](std::vector<prosper::gpu::GpuCaptureRttSeed>& seeds, std::string&) {
+            [invalidate_ds](std::vector<prosper::gpu::GpuCaptureRttSeed>& seeds, std::string&) {
+                drain_guest_gpu_writes(g_rtt, invalidate_ds);
                 seeds.reserve(g_rtt.size());
                 for (const auto& [addr, surface] : g_rtt) {
                     if (!surface.rgba) continue;
@@ -218,9 +269,13 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
     // The compute backend must not sample a surface whose CURRENT pixels live in this renderer's
     // RTT cache (raw guest memory is then empty/stale — the Dead Cells 642x362 lesson): publish the
     // exact-match identity and immutable CPU snapshot used by live compute (#590).
-    prosper::gpu::set_live_target_query([](uint64_t addr) { return g_rtt.count(addr) != 0; });
+    prosper::gpu::set_live_target_query([invalidate_ds](uint64_t addr) {
+        drain_guest_gpu_writes(g_rtt, invalidate_ds);
+        return g_rtt.count(addr) != 0;
+    });
     prosper::gpu::set_live_target_reader(
-        [](uint64_t addr, prosper::gpu::LiveTargetSnapshot& snapshot) {
+        [invalidate_ds](uint64_t addr, prosper::gpu::LiveTargetSnapshot& snapshot) {
+            drain_guest_gpu_writes(g_rtt, invalidate_ds);
             const auto it = g_rtt.find(addr);
             if (it == g_rtt.end() || !it->second.rgba || !it->second.w || !it->second.h)
                 return false;
@@ -237,6 +292,52 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                 : prosper::gpu::LiveTargetPixelFormat::Rgba8Unorm;
             snapshot.pixels = it->second.rgba;
             return true;
+        });
+    prosper::gpu::set_live_target_byte_range_reader(
+        [invalidate_ds](uint64_t addr, uint32_t bytes, std::vector<uint8_t>& output) {
+            drain_guest_gpu_writes(g_rtt, invalidate_ds);
+            if (!addr || !bytes) return prosper::gpu::LiveTargetByteReadResult::InvalidRange;
+            for (auto& [base, surface] : g_rtt) {
+                if (addr < base) continue;
+                if (!surface.w || !surface.h) {
+                    if (addr == base) return prosper::gpu::LiveTargetByteReadResult::InvalidRange;
+                    continue;
+                }
+                const VkFormat format = prosper::test::backend_color_format(surface.format);
+                const uint64_t bpp = prosper::test::backend_color_bytes_per_pixel(format);
+                const uint64_t pixels = static_cast<uint64_t>(surface.w) * surface.h;
+                if (!bpp || pixels > UINT64_MAX / bpp) continue;
+                const uint64_t target_bytes = pixels * bpp;
+                const uint64_t offset = addr - base;
+                if (offset >= target_bytes) continue;
+                if ((!surface.rgba || surface.rgba->size() != target_bytes) &&
+                    surface.gpu_valid) {
+                    std::vector<uint8_t> materialized;
+                    std::string error;
+                    if (prosper::test::readback_persistent_color_target(
+                            base, surface.w, surface.h, format, materialized, error) &&
+                        materialized.size() == target_bytes) {
+                        surface.rgba = std::make_shared<const std::vector<uint8_t>>(
+                            std::move(materialized));
+                    } else {
+                        static std::atomic<int> warned{0};
+                        if (warned.fetch_add(1) < 24)
+                            std::fprintf(stderr,
+                                         "[rtt] ordered DMA target readback failed: base=0x%llx "
+                                         "extent=%ux%u error=%s\n",
+                                         static_cast<unsigned long long>(base), surface.w, surface.h,
+                                         error.c_str());
+                        return prosper::gpu::LiveTargetByteReadResult::InvalidRange;
+                    }
+                }
+                if (!surface.rgba || surface.rgba->size() != target_bytes ||
+                    bytes > target_bytes - offset)
+                    return prosper::gpu::LiveTargetByteReadResult::InvalidRange;
+                output.assign(surface.rgba->begin() + static_cast<size_t>(offset),
+                              surface.rgba->begin() + static_cast<size_t>(offset + bytes));
+                return prosper::gpu::LiveTargetByteReadResult::Success;
+            }
+            return prosper::gpu::LiveTargetByteReadResult::NotFound;
         });
     if (getenv("PROSPER_GPU_CAPTURE") || getenv("PROSPER_GPU_TIMELINE_CAPTURE") ||
         getenv("PROSPER_GPU_REPLAY_EXPORT_DS"))
@@ -283,9 +384,10 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
     if (live_gpu_targets)
         fprintf(stderr, "[render] persistent GPU color targets enabled (experimental)\n");
     prosper::gpu::set_submit_renderer(
-        [frame_dir, dump_bmps](const std::vector<prosper::gpu::DrawItem>& items,
+        [frame_dir, dump_bmps, invalidate_ds](const std::vector<prosper::gpu::DrawItem>& items,
                                uint32_t w, uint32_t h) -> prosper::gpu::RenderedFrame {
             using RC = prosper::gpu::ResourceClass;
+            drain_guest_gpu_writes(g_rtt, invalidate_ds);
             const prosper::gpu::LiveRenderPhase phase = prosper::gpu::live_render_phase();
             // PROSPER_RENDER_FIRST=<N>: skip the slow (~400x) Vulkan render for the first N GPU submits, so
             // the game reaches a LATE scene (e.g. the level1 cutscene, which only starts submitting after
@@ -1914,10 +2016,12 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             inspect(items[later].prt.get());
                         }
                     }
-                    // Defer only a proven graphics-to-graphics intermediate. Scanout, fallback-present,
-                    // size conversion, and same-image feedback retain authoritative CPU pixels.
+                    // Defer only a proven graphics-to-graphics intermediate. A same-submit DMA asks
+                    // its producer span for readback; a later-submit DMA materializes the persistent
+                    // image synchronously through the byte-range reader above.
                     const bool defer_readback = live_gpu_targets && vo_n > 0 && base && !is_vo &&
-                        base != front_va && sampled_exact_later && !feedback_later;
+                        base != front_va && sampled_exact_later && !feedback_later &&
+                        !phase.authoritative_readback;
                     prosper::test::BackendColorTarget backend_target{
                         base, seed_rtt, !defer_readback, pass_format};
                     const bool color1_extent_matches = base1 && !render_pass.empty() &&

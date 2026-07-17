@@ -267,6 +267,46 @@ int main() {
     }
 
     render_submit_items({producer}, W, H);
+    const uint64_t producer_center = producer.color0_base +
+        (static_cast<uint64_t>(producer.color0_width) + producer.color0_width / 2u) * 4u;
+    std::vector<uint8_t> producer_range;
+    CHECK(read_live_render_target_bytes(producer_center, 4, producer_range) ==
+              LiveTargetByteReadResult::Success && producer_range.size() == 4,
+          "live renderer exposes a bounded interior byte range from its authoritative target");
+    std::vector<uint8_t> invalid_range;
+    CHECK(read_live_render_target_bytes(
+              producer.color0_base + producer.color0_width * producer.color0_height * 4u - 2u,
+              4, invalid_range) == LiveTargetByteReadResult::InvalidRange,
+          "live renderer rejects a source range that crosses the native target boundary");
+
+    uint8_t copied_target[4] = {};
+    GpuState ordered_state;
+    GpuState::Draw semantic_producer;
+    semantic_producer.command_order = 100;
+    ordered_state.draws.push_back(semantic_producer);
+    DrawItem ordered_producer = producer;
+    ordered_producer.color0_base = 0x100300000ull;
+    ordered_producer.draw_index = 0;
+    ordered_producer.command_order = 100;
+    const uint64_t ordered_center = ordered_producer.color0_base +
+        (static_cast<uint64_t>(ordered_producer.color0_width) +
+         ordered_producer.color0_width / 2u) * 4u;
+    ordered_state.dma_copies.push_back({
+        reinterpret_cast<uint64_t>(copied_target), ordered_center, sizeof copied_target,
+        0, 200, 0});
+    LiveRenderFn ordered_render = [](const std::vector<DrawItem>& items, uint32_t width,
+                                     uint32_t height) {
+        return render_submit_items(items, width, height);
+    };
+    execute_ordered_items(plan_submit_operations(ordered_state), {ordered_producer}, {},
+                          ordered_state.dma_copies, ordered_render, {}, W, H);
+    std::vector<uint8_t> ordered_range;
+    const bool ordered_source_read = read_live_render_target_bytes(
+        ordered_center, sizeof copied_target, ordered_range) == LiveTargetByteReadResult::Success;
+    CHECK(ordered_source_read && ordered_range.size() == sizeof copied_target &&
+          std::memcmp(copied_target, ordered_range.data(), sizeof copied_target) == 0,
+          "ordered DMA copies current bytes produced by the preceding live-render span");
+
     std::vector<uint8_t> cross_submit = render_submit_items({consumer}, W, H);
     CHECK(cross_submit.size() == static_cast<size_t>(16) * 16 * 4,
           "renderer retains a producer target across separate replay submits");

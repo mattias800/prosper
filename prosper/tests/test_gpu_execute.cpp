@@ -139,6 +139,108 @@ int main() {
               "write journal snapshots cannot suppress validation after submit completion");
     }
 
+    // #189: address-backed DMA is an in-stream producer, not a completion write. It must split a
+    // graphics span so an earlier consumer sees old bytes and a later consumer sees copied bytes.
+    {
+        uint8_t source = 0x39;
+        uint8_t target = 0x17;
+        GpuState mixed;
+        GpuState::Draw before, after;
+        before.command_order = 100;
+        after.command_order = 300;
+        mixed.draws = {before, after};
+        mixed.dma_copies.push_back({
+            (uint64_t)(uintptr_t)&target, (uint64_t)(uintptr_t)&source,
+            1, 0, 200, 0});
+        const auto operations = plan_submit_operations(mixed);
+
+        DrawItem first, second;
+        first.draw_index = 0;
+        second.draw_index = 1;
+        std::vector<uint8_t> observed;
+        std::vector<LiveRenderPhase> dma_phases;
+        LiveRenderFn consume = [&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
+            for (size_t i = 0; i < items.size(); ++i) observed.push_back(target);
+            dma_phases.push_back(live_render_phase());
+            return std::vector<uint8_t>(4, target);
+        };
+        const OrderedSubmitResult result = execute_ordered_items(
+            operations, {first, second}, {}, mixed.dma_copies, consume, {}, 1, 1);
+        CHECK(observed == std::vector<uint8_t>({0x17, 0x39}) && target == source,
+              "ordered DMA exposes old bytes before the copy and new bytes afterward");
+        CHECK(result.render_spans == 2,
+              "an ordered DMA copy splits graphics consumers into two render spans");
+        CHECK(dma_phases.size() == 2 && dma_phases[0].authoritative_readback &&
+              !dma_phases[1].authoritative_readback,
+              "the graphics span immediately before DMA requests authoritative target readback");
+    }
+
+    // A rendered target's authoritative bytes can live only in the backend cache. Resolve the
+    // requested interior range after the preceding graphics span rather than reading stale/unmapped
+    // guest backing at the target address.
+    {
+        constexpr uint64_t live_base = 0x100000000ull;
+        const std::vector<uint8_t> live_pixels = {0x10, 0x21, 0x32, 0x43, 0x54, 0x65};
+        uint8_t target[3] = {0, 0, 0};
+        bool producer_rendered = false;
+        set_live_target_byte_range_reader(
+            [&](uint64_t addr, uint32_t bytes, std::vector<uint8_t>& output) {
+                if (addr < live_base || addr >= live_base + live_pixels.size())
+                    return LiveTargetByteReadResult::NotFound;
+                const uint64_t offset = addr - live_base;
+                if (!producer_rendered || bytes > live_pixels.size() - offset)
+                    return LiveTargetByteReadResult::InvalidRange;
+                output.assign(live_pixels.begin() + static_cast<size_t>(offset),
+                              live_pixels.begin() + static_cast<size_t>(offset + bytes));
+                return LiveTargetByteReadResult::Success;
+            });
+        GpuState state;
+        GpuState::Draw producer;
+        producer.command_order = 100;
+        state.draws.push_back(producer);
+        state.dma_copies.push_back({
+            (uint64_t)(uintptr_t)target, live_base + 2, sizeof target, 0, 200, 0});
+        DrawItem draw;
+        draw.draw_index = 0;
+        LiveRenderFn render = [&](const std::vector<DrawItem>&, uint32_t, uint32_t) {
+            producer_rendered = true;
+            return std::vector<uint8_t>(4, 0xff);
+        };
+        execute_ordered_items(plan_submit_operations(state), {draw}, {}, state.dma_copies,
+                              render, {}, 1, 1);
+        CHECK(producer_rendered &&
+              std::vector<uint8_t>(target, target + sizeof target) ==
+                  std::vector<uint8_t>({0x32, 0x43, 0x54}),
+              "ordered DMA reads an interior range from the preceding live render target");
+        set_live_target_byte_range_reader({});
+    }
+
+    // A no-draw submit still executes DMA before a later compute consumer. The old completion-FIFO
+    // path left this copy pending because execute_submit_work's compute-only branch never drained it.
+    {
+        uint8_t source = 0xA5;
+        uint8_t target = 0x4C;
+        GpuState compute_only;
+        compute_only.dma_copies.push_back({
+            (uint64_t)(uintptr_t)&target, (uint64_t)(uintptr_t)&source,
+            1, 0, 100, 0});
+        GpuState::Dispatch dispatch;
+        dispatch.command_order = 200;
+        compute_only.dispatches.push_back(dispatch);
+        const auto operations = plan_submit_operations(compute_only);
+        ComputeItem consume;
+        consume.dispatch_index = 0;
+        uint8_t observed = 0;
+        LiveComputeFn compute = [&](const std::vector<ComputeItem>&) {
+            observed = target;
+            return true;
+        };
+        const OrderedSubmitResult result = execute_ordered_items(
+            operations, {}, {consume}, compute_only.dma_copies, {}, compute, 0, 0);
+        CHECK(result.compute_executed && observed == source && target == source,
+              "compute-only timeline executes a preceding DMA copy before its consumer");
+    }
+
     // Overflow or otherwise incomplete write history must fall back to exact validation.
     {
         DrawItem first, second;
@@ -278,6 +380,82 @@ int main() {
     }
 
     // The live-submit registry path — exactly what agc_driver_submit_dcb drives once a device is wired.
+    // #189: production submit execution must realize an indexed draw only after a preceding DMA
+    // supplies its index buffer. Callback ordering alone is insufficient because realization owns
+    // a copied index vector; the old eager path permanently captured {0,0,0} before DMA ran.
+    {
+        uint16_t copied_indices[3] = {0, 0, 0};
+        uint16_t source_indices[3] = {0, 1, 2};
+        GpuState ordered = st;
+        ordered.index_type = 0;
+        ordered.draws.clear();
+        ordered.dispatches.clear();
+        ordered.dma_copies.clear();
+        ordered.ordered_memory_effects.clear();
+        GpuState::Draw draw;
+        draw.index_count = 3;
+        draw.indexed = true;
+        draw.index_addr = (uint64_t)(uintptr_t)copied_indices;
+        draw.command_order = 200;
+        ordered.draws.push_back(draw);
+        ordered.dma_copies.push_back({
+            (uint64_t)(uintptr_t)copied_indices, (uint64_t)(uintptr_t)source_indices,
+            sizeof(copied_indices), 0, 100, 0});
+        std::vector<uint32_t> submitted_indices;
+        set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
+            if (!items.empty()) submitted_indices = items.front().indices;
+            return RenderedFrame{};
+        });
+        execute_ordered_and_present(ordered, W, H, 77, /*publish=*/false);
+        set_submit_renderer({});
+        CHECK(submitted_indices == std::vector<uint32_t>({0, 1, 2}),
+              "DMA-backed index buffer is realized after the ordered copy in the production path");
+    }
+
+    // Lazy realization can drop a semantic draw only after earlier spans have already executed.
+    // If the dropped record was counted as the final span, send an empty terminal callback so the
+    // renderer finalizes cached scanout rather than losing the successful work or hanging timing.
+    for (bool failed_first : {false, true}) {
+        uint8_t source = 0x7A, target = 0;
+        GpuState ordered = st;
+        ordered.draws.clear();
+        ordered.dma_copies.clear();
+        GpuState::Draw good{3};
+        GpuState::Draw bad{0};
+        if (failed_first) {
+            bad.command_order = 100;
+            good.command_order = 300;
+            ordered.draws = {bad, good};
+        } else {
+            good.command_order = 100;
+            bad.command_order = 300;
+            ordered.draws = {good, bad};
+        }
+        ordered.dma_copies.push_back({
+            (uint64_t)(uintptr_t)&target, (uint64_t)(uintptr_t)&source,
+            sizeof(target), 0, 200, 0});
+        std::vector<LiveRenderPhase> phases;
+        size_t realized_callbacks = 0, terminal_callbacks = 0;
+        set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
+            phases.push_back(live_render_phase());
+            if (items.empty()) {
+                terminal_callbacks++;
+                return RenderedFrame(std::vector<uint8_t>(4, 0x5A));
+            }
+            realized_callbacks++;
+            return RenderedFrame{};
+        });
+        execute_ordered_and_present(ordered, 1, 1, 78 + failed_first, /*publish=*/false);
+        set_submit_renderer({});
+        CHECK(realized_callbacks == 1 && terminal_callbacks == 1 && phases.size() == 2,
+              failed_first
+                  ? "failed leading span still finalizes the later successful span"
+                  : "failed trailing span still finalizes the earlier successful span");
+        CHECK(phases[0].first_span && !phases[0].final_span &&
+              !phases[1].first_span && phases[1].final_span,
+              "lazy-span terminal callback closes the submit exactly once");
+    }
+
     CHECK(!have_submit_renderer(), "no live renderer registered by default (game path stays inert)");
     CHECK(!execute_and_present(st, W, H), "execute_and_present is a no-op with no renderer registered");
     std::shared_ptr<const std::vector<uint8_t>> live_storage;

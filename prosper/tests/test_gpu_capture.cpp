@@ -444,6 +444,31 @@ int main() {
               reinterpret_cast<const uint8_t*>(kDiagnosticBadPs), sizeof(kDiagnosticBadPs)),
           "failed stage retains the exact content-addressed raw stream through s_endpgm");
 
+    GpuState dma_state;
+    dma_state.dma_copies.push_back({0x200000, 0x100000000ull, 16, 0, 55, 0});
+    GpuCaptureFile unsupported_capture;
+    error.clear();
+    CHECK(!capture_gpustate_submit(
+              dma_state, 100, 640, 360, meta, unsupported_capture, error) &&
+          error.find("cannot represent 1 ordered DMA_DATA") != std::string::npos,
+          "central GpuState capture rejects an incomplete ordered-DMA artifact");
+    error.clear();
+    CHECK(!capture_gpustate_target_submit(
+              dma_state, 100, 640, 360, 640, 360, meta, unsupported_capture, error) &&
+          error.find("capture would be incomplete") != std::string::npos,
+          "target-selected capture cannot bypass ordered-DMA rejection");
+
+    // A selected unsupported live capture must consume the selector match. Otherwise AT=0 silently
+    // shifts to the next ordinary submit and writes an artifact for the wrong requested operation.
+    set_test_env("PROSPER_GPU_CAPTURE", "unsupported-dma-selector.prgcap");
+    set_test_env("PROSPER_GPU_CAPTURE_AT", "0");
+    const auto unsupported_pending = begin_requested_gpu_capture({}, {}, {}, 1, 1, true);
+    const auto retargeted_pending = begin_requested_gpu_capture({}, {}, {}, 1, 1, false);
+    CHECK(!unsupported_pending && !retargeted_pending,
+          "unsupported selected DMA capture fails once and cannot retarget a later submit");
+    set_test_env("PROSPER_GPU_CAPTURE_AT", nullptr);
+    set_test_env("PROSPER_GPU_CAPTURE", nullptr);
+
     const auto failed_path = std::filesystem::temp_directory_path() /
         "prosper_gpu_capture_failed_diagnostic_test.prgcap";
     CHECK(write_gpu_capture(failed_path.string(), failed_capture, error),
