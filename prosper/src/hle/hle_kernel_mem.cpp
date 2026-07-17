@@ -130,11 +130,30 @@ namespace {
         g_dmem.swap(out);
     }
 
+    // A successful host map replaces any reservation record under it. Keeping both as overlays
+    // lets the older uncommitted record win same-base queries after the real commit.
     void track(uint64_t base, uint64_t size, int prot, bool committed, const char* nm) {
-        std::lock_guard<std::mutex> lk(g_mx);
-        Mapping m{ base, size, prot, committed, {0} };
-        if (nm) { strncpy(m.name, nm, sizeof m.name - 1); }
-        g_maps.push_back(m);
+        if (!size || base > UINT64_MAX - size) return;
+        const uint64_t end = base + size;
+        {
+            std::lock_guard<std::mutex> lk(g_mx);
+            std::vector<Mapping> out;
+            out.reserve(g_maps.size() + 2);
+            for (const auto& old : g_maps) {
+                const uint64_t old_end = old.base + old.size;
+                if (old_end <= base || old.base >= end) { out.push_back(old); continue; }
+                if (old.base < base) {
+                    Mapping lo = old; lo.size = base - old.base; out.push_back(lo);
+                }
+                if (old_end > end) {
+                    Mapping hi = old; hi.base = end; hi.size = old_end - end; out.push_back(hi);
+                }
+            }
+            Mapping m{ base, size, prot, committed, {0} };
+            if (nm) { strncpy(m.name, nm, sizeof m.name - 1); }
+            out.push_back(m);
+            g_maps.swap(out);
+        }
         host::notify_guest_mapping_added(base, size, committed && (prot & 0x1));
     }
     // Trim/split tracked mappings overlapping [base, base+len). munmap/BatchMap-UNMAP must remove
@@ -158,12 +177,49 @@ namespace {
         g_maps.swap(out);
         host::notify_guest_mapping_removed(base, len);
     }
-    // Re-tag [base, base+len) with a new protection (mprotect): replace the overlapped span so
-    // VirtualQuery/the fault probe report the CURRENT prot, not the one from map time.
+    // Re-tag [base, base+len) with a new protection (mprotect) without changing whether each
+    // covered span is guest-committed. A reservation remains a reservation until a MAP operation
+    // commits it; VirtualQuery and the lazy-commit probe rely on that distinction (#343).
     void retrack_prot(uint64_t base, uint64_t len, int prot, const char* nm) {
-        if (!len) return;
-        untrack(base, len);
-        track(base, len, prot, true, nm);
+        if (!len || base > UINT64_MAX - len) return;
+        const uint64_t end = base + len;
+        std::vector<Mapping> retagged;
+        {
+            std::lock_guard<std::mutex> lk(g_mx);
+            std::vector<Mapping> out;
+            out.reserve(g_maps.size() + 2);
+            for (const auto& m : g_maps) {
+                const uint64_t me = m.base + m.size;
+                if (me <= base || m.base >= end) { out.push_back(m); continue; }
+                if (m.base < base) {
+                    Mapping lo = m; lo.size = base - m.base; out.push_back(lo);
+                }
+                Mapping changed = m;
+                changed.base = m.base < base ? base : m.base;
+                const uint64_t changed_end = me > end ? end : me;
+                changed.size = changed_end - changed.base;
+                changed.prot = prot;
+                memset(changed.name, 0, sizeof changed.name);
+                if (nm) strncpy(changed.name, nm, sizeof changed.name - 1);
+                out.push_back(changed);
+                retagged.push_back(changed);
+                if (me > end) {
+                    Mapping hi = m; hi.base = end; hi.size = me - end; out.push_back(hi);
+                }
+            }
+            // Preserve the prior treatment of a successful protection change over an otherwise
+            // untracked host mapping: begin tracking it as committed.
+            if (retagged.empty()) {
+                Mapping changed{base, len, prot, true, {0}};
+                if (nm) strncpy(changed.name, nm, sizeof changed.name - 1);
+                out.push_back(changed);
+                retagged.push_back(changed);
+            }
+            g_maps.swap(out);
+        }
+        host::notify_guest_mapping_removed(base, len);
+        for (const auto& m : retagged)
+            host::notify_guest_mapping_added(m.base, m.size, m.committed && (prot & 0x1));
     }
     const Mapping* find(uint64_t addr) {
         std::lock_guard<std::mutex> lk(g_mx);
@@ -1299,12 +1355,30 @@ namespace {
         }
         g_dmem.swap(out);
     }
+    // Keep tracking non-overlapping when a commit replaces part of an existing reservation.
     void track(uint64_t base, uint64_t size, int prot, bool committed, const char* nm,
                bool host_readable = true) {
-        std::lock_guard<std::mutex> lk(g_mx);
-        Mapping m{ base, size, prot, committed, {0} };
-        if (nm) { strncpy(m.name, nm, sizeof m.name - 1); }
-        g_maps.push_back(m);
+        if (!size || base > UINT64_MAX - size) return;
+        const uint64_t end = base + size;
+        {
+            std::lock_guard<std::mutex> lk(g_mx);
+            std::vector<Mapping> out;
+            out.reserve(g_maps.size() + 2);
+            for (const auto& old : g_maps) {
+                const uint64_t old_end = old.base + old.size;
+                if (old_end <= base || old.base >= end) { out.push_back(old); continue; }
+                if (old.base < base) {
+                    Mapping lo = old; lo.size = base - old.base; out.push_back(lo);
+                }
+                if (old_end > end) {
+                    Mapping hi = old; hi.base = end; hi.size = old_end - end; out.push_back(hi);
+                }
+            }
+            Mapping m{ base, size, prot, committed, {0} };
+            if (nm) { strncpy(m.name, nm, sizeof m.name - 1); }
+            out.push_back(m);
+            g_maps.swap(out);
+        }
         host::notify_guest_mapping_added(base, size,
                                          committed && host_readable && (prot & 0x1));
     }
@@ -1324,12 +1398,48 @@ namespace {
         host::notify_guest_mapping_removed(base, len);
     }
     void retrack_prot(uint64_t base, uint64_t len, int prot, const char* nm) {
-        if (!len) return;
-        untrack(base, len);
-        // Sparse protection overlays remain submit-local; fully committed mappings retain the
-        // generation-guarded cross-submit readability optimization from #737.
-        track(base, len, prot, true, nm,
-              base <= UINT64_MAX - len && !sparse_dmem_view_overlaps(base, base + len));
+        if (!len || base > UINT64_MAX - len) return;
+        const uint64_t end = base + len;
+        std::vector<Mapping> retagged;
+        {
+            std::lock_guard<std::mutex> lk(g_mx);
+            std::vector<Mapping> out;
+            out.reserve(g_maps.size() + 2);
+            for (const auto& m : g_maps) {
+                const uint64_t me = m.base + m.size;
+                if (me <= base || m.base >= end) { out.push_back(m); continue; }
+                if (m.base < base) {
+                    Mapping lo = m; lo.size = base - m.base; out.push_back(lo);
+                }
+                Mapping changed = m;
+                changed.base = m.base < base ? base : m.base;
+                const uint64_t changed_end = me > end ? end : me;
+                changed.size = changed_end - changed.base;
+                changed.prot = prot;
+                memset(changed.name, 0, sizeof changed.name);
+                if (nm) strncpy(changed.name, nm, sizeof changed.name - 1);
+                out.push_back(changed);
+                retagged.push_back(changed);
+                if (me > end) {
+                    Mapping hi = m; hi.base = end; hi.size = me - end; out.push_back(hi);
+                }
+            }
+            if (retagged.empty()) {
+                Mapping changed{base, len, prot, true, {0}};
+                if (nm) strncpy(changed.name, nm, sizeof changed.name - 1);
+                out.push_back(changed);
+                retagged.push_back(changed);
+            }
+            g_maps.swap(out);
+        }
+        host::notify_guest_mapping_removed(base, len);
+        for (const auto& m : retagged) {
+            // Sparse protection overlays remain submit-local; fully committed mappings retain the
+            // generation-guarded cross-submit readability optimization from #737.
+            const bool host_readable = !sparse_dmem_view_overlaps(m.base, m.base + m.size);
+            host::notify_guest_mapping_added(
+                m.base, m.size, m.committed && host_readable && (prot & 0x1));
+        }
     }
     const Mapping* find(uint64_t addr) {
         std::lock_guard<std::mutex> lk(g_mx);
