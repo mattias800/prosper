@@ -340,6 +340,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_dmem PRIVATE prosper_core)
   add_test(NAME dmem_available COMMAND test_dmem)
 
+  # A protection-only change must retain an uncommitted reservation's state (#343), or guest
+  # VirtualQuery skips the later commit and the first access faults. Cross-platform HLE contract.
+  add_executable(test_retrack_reservation tests/test_retrack_reservation.cpp)
+  target_link_libraries(test_retrack_reservation PRIVATE prosper_core)
+  add_test(NAME retrack_reservation COMMAND test_retrack_reservation)
+
   # Hinted map must not clobber a live mapping (#137): MAP_FIXED_NOREPLACE unless the hint is our
   # own uncommitted reservation. Drives the real map HLE handlers. Linux-only (mmap semantics).
   if(UNIX)
