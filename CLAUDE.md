@@ -412,7 +412,7 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   project-owned evidence/tests. Never weaken behavior demonstrated by a live boot to match a secondary
   reference, and mark unresolved evidence with `CONFIDENCE: HIGH/MED/LOW`.
 - **AMD RDNA 2 shader ISA reference:** ["RDNA 2" Instruction Set Architecture: Reference Guide
-  (document 70648)](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture). Consult it
+  (document 70648)](https://docs.amd.com/api/khub/documents/Et~wpu9g~Ffl7d9q0QZ~Og/content). Consult it
   for instruction encodings, operand and condition-code semantics, wave behavior, and memory-instruction
   details when working on the shader recompiler or GPU diagnostics. Treat it as the primary published RDNA 2
   architecture reference; PS5-specific extensions, encodings, and AGC behavior still require prosper's live
