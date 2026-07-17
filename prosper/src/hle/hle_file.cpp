@@ -281,7 +281,17 @@ namespace {
 }
 
 void set_app0_root(const std::string& root) { g_app0 = root; }
-std::string resolve_guest_path(const char* guest_path) { return translate(guest_path); }
+std::string resolve_guest_path(const char* guest_path) {
+    if (!guest_path || !*guest_path) return {};
+    // Sony media APIs accept content paths relative to the title's application root. Unlike the
+    // guest libc, a native host backend has no guest current-working-directory state, so root the
+    // relative spelling explicitly before applying the shared mount translation.
+    if (guest_path[0] != '/') {
+        const std::string app_path = std::string("/app0/") + guest_path;
+        return translate(app_path.c_str());
+    }
+    return translate(guest_path);
+}
 
 // Mount / unmount the guest "/savedata0" area onto a host dir named by the save's dirName
 // (sceSaveDataMount3 HLE, hle_service.cpp). create=true makes the host dir (CREATE-mode mount);

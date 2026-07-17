@@ -150,6 +150,10 @@ int main() {
     // frames. The same backend then proves /app0 translation and real stream metadata/frame handoff.
     set_synthetic_frames(nullptr);
     set_app0_root("C:/prosper-test-app0");
+    CHECK(resolve_guest_path("movie.mp4") == "C:/prosper-test-app0/movie.mp4",
+          "relative media paths resolve beneath the app0 host root");
+    CHECK(resolve_guest_path("/app0/movie.mp4") == "C:/prosper-test-app0/movie.mp4",
+          "absolute /app0 media paths retain the shared mount translation");
     FakeVideoBackend fake;
     prosper::video::set_backend(&fake);
     AvpInitData data{};
@@ -167,11 +171,11 @@ int main() {
     fake.fail_open = false;
     event_count = 0;
     uint64_t native_handle = init((uint64_t)(uintptr_t)&data, 0, 0, 0, 0, 0);
-    const char native_source[] = "/app0/movie.mp4";
+    const char native_source[] = "movie.mp4";
     CHECK(add(native_handle, (uint64_t)(uintptr_t)native_source, 0, 0, 0, 0) == 0,
           "native source opens through the registered backend");
     CHECK(fake.opened_path == "C:/prosper-test-app0/movie.mp4",
-          "native backend receives the resolved host path, not raw /app0");
+          "native backend receives the resolved host path, not the raw relative guest path");
     CHECK(streams(native_handle, 0, 0, 0, 0, 0) == 2,
           "native audio-bearing source enumerates video and audio streams");
     AvpStreamInfoEx native_info{}; native_info.size = sizeof(native_info);
