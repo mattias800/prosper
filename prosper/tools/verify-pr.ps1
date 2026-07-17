@@ -9,11 +9,10 @@ param(
     [string] $WindowsBuild = 'prosper/build-windows',
     [string[]] $Snapshot = @(),
     [int] $Jobs = 8,
-    [switch] $SkipLinux,
-    [switch] $SkipWindows,
     [switch] $DryRun,
     [string] $EvidenceFile,
-    [int] $Pr = 0
+    [int] $Pr = 0,
+    [int] $TestPauseAfterCaptureSeconds = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -134,14 +133,17 @@ if ($Pr -ne 0 -and $DryRun) {
 if ($Jobs -lt 1) {
     throw '-Jobs must be positive'
 }
+if ($TestPauseAfterCaptureSeconds -lt 0) {
+    throw '-TestPauseAfterCaptureSeconds cannot be negative'
+}
 
 try {
     $HeadSha = Invoke-Capture git @('rev-parse', 'HEAD') $Repo
     $TreeSha = Invoke-Capture git @('rev-parse', 'HEAD^{tree}') $Repo
     $BaseSha = Invoke-Capture git @('rev-parse', $Base) $Repo
-    $Status = Invoke-Capture git @('status', '--porcelain', '--untracked-files=no') $Repo
+    $Status = Invoke-Capture git @('status', '--porcelain') $Repo
     if ($Status) {
-        throw 'commit tracked changes before author verification'
+        throw 'commit or remove all nonignored changes before author verification'
     }
 
     try {
@@ -155,43 +157,49 @@ try {
         throw "pushed upstream $Upstream is $UpstreamSha, not local HEAD $HeadSha"
     }
 
-    Invoke-AuthorCheck 'base-to-head whitespace check' git @('diff', '--check', "$Base...HEAD") $Repo
+    if ($TestPauseAfterCaptureSeconds) {
+        Start-Sleep -Seconds $TestPauseAfterCaptureSeconds
+    }
+
+    Invoke-AuthorCheck 'base-to-head whitespace check' git @(
+        'diff', '--check', "$BaseSha...$HeadSha"
+    ) $Repo
 
     if ($Profile -in @('core', 'renderer')) {
-        if ($SkipLinux) {
-            $Notes += 'Local Linux build and tests explicitly skipped; applicable CI remains required.'
+        if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
+            throw 'wsl.exe is required for the Linux verification on this Windows host'
         }
-        else {
-            if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
-                throw 'wsl.exe is required for the Linux verification on this Windows host'
-            }
-            $LinuxBuildPath = (Resolve-Path (Join-Path $Repo $LinuxBuild)).Path
-            $LinuxBuildWsl = Invoke-Capture wsl.exe @('-e', 'wslpath', '-a', $LinuxBuildPath) $Repo
-            $QuotedLinuxBuild = ConvertTo-BashLiteral $LinuxBuildWsl
-            Invoke-AuthorCheck 'Linux build' wsl.exe @(
-                '-e', 'bash', '-lc', "cmake --build $QuotedLinuxBuild -j$Jobs"
-            ) $Repo
-            Invoke-AuthorCheck 'Linux ctest' wsl.exe @(
-                '-e', 'bash', '-lc', "ctest --test-dir $QuotedLinuxBuild --output-on-failure"
-            ) $Repo
-        }
+        $LinuxBuildPath = (Resolve-Path (Join-Path $Repo $LinuxBuild)).Path
+        $QuotedWindowsLinuxBuild = ConvertTo-BashLiteral $LinuxBuildPath
+        $LinuxBuildWsl = Invoke-Capture wsl.exe @(
+            '-d', 'Ubuntu-24.04', '-u', 'root', '--',
+            'bash', '-lc', "wslpath -a $QuotedWindowsLinuxBuild"
+        ) $Repo
+        $QuotedLinuxBuild = ConvertTo-BashLiteral $LinuxBuildWsl
+        Invoke-AuthorCheck 'Linux build' wsl.exe @(
+            '-d', 'Ubuntu-24.04', '-u', 'root', '--',
+            'bash', '-lc', "cmake --build $QuotedLinuxBuild -j$Jobs"
+        ) $Repo
+        Invoke-AuthorCheck 'Linux ctest' wsl.exe @(
+            '-d', 'Ubuntu-24.04', '-u', 'root', '--',
+            'bash', '-lc', "ctest --test-dir $QuotedLinuxBuild --output-on-failure"
+        ) $Repo
 
-        if ($SkipWindows) {
-            $Notes += 'Local Windows build and tests explicitly skipped; applicable CI remains required.'
-        }
-        else {
-            $WindowsBuildPath = (Resolve-Path (Join-Path $Repo $WindowsBuild)).Path
-            Invoke-AuthorCheck 'Windows build' cmake @(
-                '--build', $WindowsBuildPath, '--parallel', $Jobs.ToString()
-            ) $Repo
-            Invoke-AuthorCheck 'Windows ctest' ctest @(
-                '--test-dir', $WindowsBuildPath, '--output-on-failure'
-            ) $Repo
-        }
+        $WindowsBuildPath = (Resolve-Path (Join-Path $Repo $WindowsBuild)).Path
+        Invoke-AuthorCheck 'Windows build' cmake @(
+            '--build', $WindowsBuildPath, '--parallel', $Jobs.ToString()
+        ) $Repo
+        Invoke-AuthorCheck 'Windows ctest' ctest @(
+            '--test-dir', $WindowsBuildPath, '--output-on-failure'
+        ) $Repo
     }
 
     if ($Profile -eq 'renderer') {
-        $ProsperWsl = Invoke-Capture wsl.exe @('-e', 'wslpath', '-a', $Prosper) $Repo
+        $QuotedWindowsProsper = ConvertTo-BashLiteral $Prosper
+        $ProsperWsl = Invoke-Capture wsl.exe @(
+            '-d', 'Ubuntu-24.04', '-u', 'root', '--',
+            'bash', '-lc', "wslpath -a $QuotedWindowsProsper"
+        ) $Repo
         $SnapshotNames = if ($Snapshot.Count -eq 1 -and $Snapshot[0] -eq 'all') { @() } else { $Snapshot }
         $SnapshotArguments = @('python3', 'tools/snapshot/snapshot.py', 'check') + $SnapshotNames
         $SnapshotShell = ($SnapshotArguments | ForEach-Object { ConvertTo-BashLiteral $_ }) -join ' '
@@ -202,15 +210,18 @@ try {
             'snapshot guard: ' + ($SnapshotNames -join ', ')
         }
         Invoke-AuthorCheck $SnapshotLabel wsl.exe @(
-            '-e', 'bash', '-lc', "cd $(ConvertTo-BashLiteral $ProsperWsl) && $SnapshotShell"
+            '-d', 'Ubuntu-24.04', '-u', 'root', '--',
+            'bash', '-lc', "cd $(ConvertTo-BashLiteral $ProsperWsl) && $SnapshotShell"
         ) $Prosper
     }
 
     $FinalHead = Invoke-Capture git @('rev-parse', 'HEAD') $Repo
     $FinalUpstream = Invoke-Capture git @('rev-parse', '@{upstream}') $Repo
-    $FinalStatus = Invoke-Capture git @('status', '--porcelain', '--untracked-files=no') $Repo
-    if ($FinalHead -ne $HeadSha -or $FinalUpstream -ne $HeadSha -or $FinalStatus) {
-        throw 'HEAD, pushed upstream, or tracked worktree state changed during verification'
+    $FinalBase = Invoke-Capture git @('rev-parse', $Base) $Repo
+    $FinalStatus = Invoke-Capture git @('status', '--porcelain') $Repo
+    if ($FinalHead -ne $HeadSha -or $FinalUpstream -ne $HeadSha -or
+        $FinalBase -ne $BaseSha -or $FinalStatus) {
+        throw 'HEAD, pushed upstream, base ref, or nonignored worktree state changed during verification'
     }
     $Succeeded = $true
 }
