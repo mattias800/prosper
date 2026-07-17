@@ -728,11 +728,26 @@ struct GuestReadableCacheState {
 thread_local GuestReadableCacheState g_guest_readable_cache;
 
 bool guest_range_cache_hit(uint64_t begin, uint64_t end) {
-    if (!g_guest_readable_cache.active) return false;
-    ++g_guest_readable_cache.calls;
-    const bool hit = g_guest_readable_cache.persistent_ranges.contains(begin, end) ||
-                     g_guest_readable_cache.submit_ranges.contains(begin, end);
-    if (hit) ++g_guest_readable_cache.hits;
+    if (g_guest_readable_cache.active) ++g_guest_readable_cache.calls;
+
+    // Completion-label writes are folded on the guest draw thread before/after a renderer submit
+    // scope. On Windows, falling through to VirtualQuery for every 8-byte label read made Astro's
+    // otherwise headless frame loop take ~16 seconds per flip. The kernel-memory HLE already owns a
+    // generation-guarded registry of fully committed readable guest mappings; reuse it here on every
+    // call, not only while a renderer scope happens to be active. Sparse/lazy mappings are deliberately
+    // absent from that registry and retain the OS probe/commit path below.
+    g_guest_readable_cache.persistent_ranges.sync_generation(host::guest_mapping_generation());
+    bool hit = g_guest_readable_cache.persistent_ranges.contains(begin, end) ||
+               (g_guest_readable_cache.active &&
+                g_guest_readable_cache.submit_ranges.contains(begin, end));
+    if (!hit) {
+        host::GuestReadableRange mapping{};
+        if (host::guest_readable_mapping_containing(begin, end, mapping)) {
+            g_guest_readable_cache.persistent_ranges.insert(mapping.begin, mapping.end);
+            hit = true;
+        }
+    }
+    if (hit && g_guest_readable_cache.active) ++g_guest_readable_cache.hits;
     return hit;
 }
 
