@@ -90,6 +90,19 @@ struct GpuCapturedOperation {
     bool realized = false;
 };
 
+// Ordered address-backed DMA_DATA. Guest addresses preserve the semantic identity; blob references
+// bind the source and destination to their exact pre-submit backing versions for standalone replay.
+struct GpuCapturedDmaCopy {
+    uint64_t dst = 0, src = 0;
+    uint32_t bytes = 0, sels = 0;
+    uint64_t command_order = 0;
+    uint64_t packet_addr = 0;
+    uint32_t destination_blob_index = 0xFFFFFFFFu;
+    uint64_t destination_blob_offset = 0;
+    uint32_t source_blob_index = 0xFFFFFFFFu;
+    uint64_t source_blob_offset = 0;
+};
+
 struct GpuCapturedStageDiagnostic {
     ShaderProgramStage stage = ShaderProgramStage::Vertex;
     uint64_t program_addr = 0;
@@ -168,6 +181,7 @@ struct GpuCaptureFile {
     std::vector<GpuCaptureDsSeed> ds_seeds;
     std::vector<GpuCapturedDraw> draws;
     std::vector<GpuCapturedCompute> computes;
+    std::vector<GpuCapturedDmaCopy> dma_copies;
     std::vector<GpuCapturedOperation> operations;
     std::vector<GpuCapturedOperationFailure> failure_diagnostics;
     bool failure_diagnostics_available = false;
@@ -194,7 +208,8 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
                           const GpuCaptureMetadata& metadata,
                           const CaptureMemoryReader& reader, GpuCaptureFile& out,
                           std::string& error, const CaptureRttSeedReader& rtt_reader = {},
-                          const std::vector<OperationRealizationFailure>& failures = {});
+                          const std::vector<OperationRealizationFailure>& failures = {},
+                          const std::vector<GpuState::DmaCopy>& dma_copies = {});
 bool capture_gpustate_submit(const GpuState& state, uint64_t submit_no,
                              uint32_t width, uint32_t height,
                              const GpuCaptureMetadata& metadata,
@@ -224,6 +239,7 @@ struct GpuReplayFrame {
     std::vector<GpuCaptureDsSeed> ds_seeds;
     std::vector<DrawItem> items;
     std::vector<ComputeItem> computes;
+    std::vector<ReplayDmaCopy> dma_copies;
     std::vector<GpuCapturedOperation> operations;
     std::vector<GpuCaptureRawShaderVersion> raw_shader_versions;
     std::vector<GpuCapturedOperationFailure> failure_diagnostics;
@@ -275,7 +291,8 @@ struct PendingGpuCapture {
 std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
     const std::vector<DrawItem>& draws, const std::vector<ComputeItem>& computes,
     const std::vector<SubmitOperation>& operations, uint32_t width, uint32_t height,
-    bool has_ordered_dma = false, uint64_t unsupported_draw_count = UINT64_MAX);
+    const GpuState* semantic_state = nullptr, uint64_t submit_no = 0,
+    uint64_t semantic_draw_count = UINT64_MAX);
 bool finish_requested_gpu_capture(std::unique_ptr<PendingGpuCapture> pending,
                                   const std::vector<uint8_t>& output, std::string& error);
 
