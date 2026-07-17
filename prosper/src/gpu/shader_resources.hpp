@@ -43,6 +43,13 @@ enum class DataFormat : uint32_t {
     // "2_10_10_10_UNORM" (IMG_FMT 50); logical R/G/B occupy the low/middle 10-bit fields and
     // alpha occupies the high 2 bits. Sampled uploads unpack it to RGBA8.
     Unorm2_10_10_10,
+    // Vertex-fetch variants of the same packed 32-bit R10G10B10A2 layout. These stay distinct so
+    // buffer_load_format_* can apply the descriptor's signed/normalized conversion contract while
+    // texture uploads keep their existing Unorm2_10_10_10 path. Per-component byte size is 0 for
+    // every packed-word format; the fetch recompiler handles their bit fields explicitly.
+    Snorm2_10_10_10,
+    Uint2_10_10_10,
+    Sint2_10_10_10,
 };
 
 // How many bytes one component of `format` occupies (0 for Unknown and block-compressed formats).

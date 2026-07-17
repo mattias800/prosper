@@ -80,6 +80,8 @@ int main() {
         CHECK(!gen5_image_format(0, &fi) && fi.format == DataFormat::Unknown, "IMG_FMT 0 (INVALID) unmapped");
         CHECK(!gen5_image_format(9, &fi), "IMG_FMT 9 (16_USCALED) unmapped -> false");
         CHECK(!gen5_image_format(44, &fi), "IMG_FMT 44 (10_10_10_2) unmapped -> false");
+        CHECK(!gen5_image_format(51, &fi) && !gen5_image_format(54, &fi) && !gen5_image_format(55, &fi),
+              "packed SNORM/UINT/SINT buffer formats remain fail-closed for image upload");
         CHECK(!gen5_image_format(157, &fi), "IMG_FMT 157 (FMASK) unmapped -> false");
         CHECK(!gen5_image_format(511, &fi), "IMG_FMT 511 out-of-table -> false");
         CHECK(image_type_to_dim(8) == 0 && image_type_to_dim(9) == 1 &&
@@ -216,6 +218,20 @@ int main() {
         rdna2_buffer_format(64, &f, &n); CHECK(f == DataFormat::Float32 && n == 2, "fmt64 -> Float32 x2 (uvs)");
         rdna2_buffer_format(56, &f, &n); CHECK(f == DataFormat::Unorm8 && n == 4, "fmt56 -> Unorm8 x4 (colors)");
         rdna2_buffer_format(22, &f, &n); CHECK(f == DataFormat::Float32 && n == 1, "fmt22 -> Float32 x1");
+        rdna2_buffer_format(36, &f, &n); CHECK(f == DataFormat::Float10_11_11 && n == 3,
+                                               "fmt36 -> packed Float10_11_11 x3");
+        rdna2_buffer_format(50, &f, &n); CHECK(f == DataFormat::Unorm2_10_10_10 && n == 4,
+                                               "fmt50 -> packed Unorm2_10_10_10 x4");
+        rdna2_buffer_format(51, &f, &n); CHECK(f == DataFormat::Snorm2_10_10_10 && n == 4,
+                                               "fmt51 -> packed Snorm2_10_10_10 x4");
+        rdna2_buffer_format(54, &f, &n); CHECK(f == DataFormat::Uint2_10_10_10 && n == 4,
+                                               "fmt54 -> packed Uint2_10_10_10 x4");
+        rdna2_buffer_format(55, &f, &n); CHECK(f == DataFormat::Sint2_10_10_10 && n == 4,
+                                               "fmt55 -> packed Sint2_10_10_10 x4");
+        rdna2_buffer_format(52, &f, &n); CHECK(f == DataFormat::Unknown && n == 0,
+                                               "fmt52 2_10_10_10_USCALED stays fail-closed");
+        rdna2_buffer_format(53, &f, &n); CHECK(f == DataFormat::Unknown && n == 0,
+                                               "fmt53 2_10_10_10_SSCALED stays fail-closed");
         // The game's real color V# dword3 == 0x38fac: FORMAT field [18:12] == 56 (dst_sel [11:0] ignored).
         uint32_t real_v3 = 0x38facu;
         rdna2_buffer_format((real_v3 >> 12) & 0x7Fu, &f, &n);

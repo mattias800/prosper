@@ -349,6 +349,14 @@ struct SpirvCompute {
         uint32_t vec = id(); putv(code, Op_ExtInst, {t_v2f(), vec, glsl, Glsl_UnpackHalf2x16, dword});
         uint32_t f = id(); put(code, Op_CompositeExtract, {t_f32, f, vec, which}); return bcu(f);
     }
+    // GFX10's packed 10/11-bit vertex-float fields use binary16's five-bit exponent and a shortened
+    // mantissa, without a sign bit. Widening the complete field left by 4 (11-bit) or 5 (10-bit)
+    // produces the exact low-half binary16 encoding, including subnormals, infinity, and NaN.
+    uint32_t unpack_ufloat(uint32_t dword, uint32_t bit_off, uint32_t bits) {
+        uint32_t raw = bfe_u(dword, uconst(bit_off), uconst(bits));
+        uint32_t half = ibin(Op_ShiftLeftLogical, raw, uconst(bits == 11 ? 4u : 5u));
+        return unpack_half(half, 0);
+    }
     // Inverse of unpack_norm: pack a float VGPR (bits) into a `bits`-wide UNORM/SNORM integer field:
     // clamp to [0,1] (unsigned) or [-1,1] (signed), scale by `norm`, round-to-nearest-even, mask to width.
     uint32_t pack_norm(uint32_t fbits, uint32_t bits, bool is_signed, float norm) {
@@ -3637,20 +3645,28 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // table — the unit-test harness). Keep the legacy single-cbuf convention: binding 2, stride 0.
             // The live graphics path can never reach here table-less: recompile_vertex/recompile_fragment
             // set allow_smem = (rt != nullptr), so MUBUF already rejected above when rt is null there.
+            const bool packed_10_11_11 = fmt == DataFormat::Float10_11_11;
+            const bool packed_2_10_10_10 =
+                fmt == DataFormat::Unorm2_10_10_10 || fmt == DataFormat::Snorm2_10_10_10 ||
+                fmt == DataFormat::Uint2_10_10_10  || fmt == DataFormat::Sint2_10_10_10;
+            const bool packed_word = packed_10_11_11 || packed_2_10_10_10;
             const uint32_t comp_bytes = data_format_bytes(fmt);
-            if (comp_bytes == 0) { ok = false; return true; }   // unknown / unsupported format
+            if (!packed_word && comp_bytes == 0) { ok = false; return true; } // unknown / unsupported
             // Per-component decode. 4-byte formats (Float32/Uint32/Sint32) are a raw dword load — no
             // conversion in our bit model. Sub-dword formats are unpacked: UNORM/SNORM normalize an
             // integer field, Float16 unpacks a packed half. num_components components pack tightly.
-            const bool packed = comp_bytes < 4;
-            bool is_snorm = (fmt == DataFormat::Snorm8 || fmt == DataFormat::Snorm16);
+            const bool packed = packed_word || comp_bytes < 4;
+            bool is_snorm = (fmt == DataFormat::Snorm8 || fmt == DataFormat::Snorm16 ||
+                             fmt == DataFormat::Snorm2_10_10_10);
             bool is_half  = (fmt == DataFormat::Float16);
             // Integer sub-dword formats deliver the raw (un-normalized) INTEGER in the VGPR — the
             // hardware's UINT/SINT format-load contract. DOLL's skinned scene VS fetches its bone
             // indices as Uint8 x4 (stride 8, paired with Unorm8 weights); rejecting them dropped
             // every scene-geometry draw (#273). Zero-/sign-extend the field; no normalization.
-            bool is_uint = (fmt == DataFormat::Uint8 || fmt == DataFormat::Uint16);
-            bool is_sint = (fmt == DataFormat::Sint8 || fmt == DataFormat::Sint16);
+            bool is_uint = (fmt == DataFormat::Uint8 || fmt == DataFormat::Uint16 ||
+                            fmt == DataFormat::Uint2_10_10_10);
+            bool is_sint = (fmt == DataFormat::Sint8 || fmt == DataFormat::Sint16 ||
+                            fmt == DataFormat::Sint2_10_10_10);
             float norm = 0.0f;
             switch (fmt) {
                 case DataFormat::Unorm8:  norm = 255.0f;   break;
@@ -3659,7 +3675,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case DataFormat::Snorm16: norm = 32767.0f; break;
                 default: break;
             }
-            if (packed && !is_half && !is_uint && !is_sint && norm == 0.0f) {
+            if (packed && !packed_word && !is_half && !is_uint && !is_sint && norm == 0.0f) {
                 if (getenv("PROSPER_DBG"))
                     fprintf(stderr, "[mubuf-badfmt] pc=%u fmt=%u comp_bytes=%u stride=%u n=%u\n",
                             in.pc, (unsigned)fmt, comp_bytes, stride, n);
@@ -3701,7 +3717,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // offset (offen). Loads only (the packed store path still rejects sub-dword ints).
                     bool soff_zero = (in.src[2].kind == OperandKind::Special && in.src[2].value == 125) ||
                                      (in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0);
-                    dyn_half = !is_store && n == 1 && comp_bytes == 2 && !offen && !dyn_vfetch &&
+                    dyn_half = !packed_word && !is_store && n == 1 && comp_bytes == 2 && !offen && !dyn_vfetch &&
                                (offset & 1u) == 0 && (!idxen || (stride & 1u) == 0) && soff_zero;
                     if (!dyn_half) {
                         if (getenv("PROSPER_DBG"))
@@ -3740,7 +3756,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             if (is_store) {
                 // Store the VDATA VGPRs (in.dst..+n-1). Integer sub-dword formats (Uint8/Sint8/...) have
                 // no packing path here -> reject rather than mis-store (loads extend them; stores don't pack).
-                if (packed && (is_uint || is_sint)) { ok = false; return true; }
+                if (packed_word || (packed && (is_uint || is_sint))) { ok = false; return true; }
                 auto vread = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
                 if (!packed) {
                     // Raw/Float32/Uint32: one dword per component.
@@ -3771,7 +3787,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
             // Integer-typed format? Its absent-component default for W/A is integer 1, not float 1.0.
             const bool fmt_is_int = (fmt == DataFormat::Uint8  || fmt == DataFormat::Uint16 || fmt == DataFormat::Uint32 ||
-                                     fmt == DataFormat::Sint8  || fmt == DataFormat::Sint16 || fmt == DataFormat::Sint32);
+                                     fmt == DataFormat::Sint8  || fmt == DataFormat::Sint16 || fmt == DataFormat::Sint32 ||
+                                     fmt == DataFormat::Uint2_10_10_10 || fmt == DataFormat::Sint2_10_10_10);
             for (uint32_t k = 0; k < n; k++) {
                 int d = in.dst.value + (int)k;
                 uint32_t old = vreg_old(b, rs, d);
@@ -3789,6 +3806,25 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 } else if (!packed) {
                     uint32_t kidx = k ? b.ibin(Op_IAdd, idx, b.uconst(k)) : idx;
                     value = b.cbuf_load(kidx, binding);                  // raw 32-bit component
+                } else if (packed_word) {
+                    // All requested components share one packed dword. GFX10 names layouts from high
+                    // field to low field, so 2_10_10_10 is logical R/G/B in bits 0/10/20 and A in 30;
+                    // 10_11_11 is R/G/B in bits 0/11/22 with widths 11/11/10.
+                    uint32_t dw = b.cbuf_load(idx, binding);
+                    uint32_t boff = packed_10_11_11 ? (k == 0 ? 0u : k == 1 ? 11u : 22u)
+                                                    : (k == 0 ? 0u : k == 1 ? 10u : k == 2 ? 20u : 30u);
+                    uint32_t bits = packed_10_11_11 ? (k < 2 ? 11u : 10u) : (k < 3 ? 10u : 2u);
+                    if (packed_10_11_11) {
+                        value = b.unpack_ufloat(dw, boff, bits);
+                    } else if (is_uint) {
+                        value = b.bfe_u(dw, b.uconst(boff), b.uconst(bits));
+                    } else if (is_sint) {
+                        value = b.bfe_s(dw, b.uconst(boff), b.uconst(bits));
+                    } else {
+                        float field_norm = is_snorm ? (bits == 2 ? 1.0f : 511.0f)
+                                                    : (bits == 2 ? 3.0f : 1023.0f);
+                        value = b.unpack_norm(dw, boff, bits, is_snorm, field_norm);
+                    }
                 } else if (dyn_half) {
                     // Runtime dword half (n==1, 16-bit element, 2-aligned address): shift the loaded
                     // dword right by (addr&2)*8 and decode the 16-bit field at bit 0.

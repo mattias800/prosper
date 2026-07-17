@@ -148,6 +148,10 @@ int main() {
           "Float10_11_11 is packed: per-component bytes = 0 (texel size lives in bytes_per_block)");
     CHECK(data_format_bytes(DataFormat::Unorm2_10_10_10) == 0,
           "Unorm2_10_10_10 is packed: per-component bytes = 0");
+    CHECK(data_format_bytes(DataFormat::Snorm2_10_10_10) == 0 &&
+          data_format_bytes(DataFormat::Uint2_10_10_10) == 0 &&
+          data_format_bytes(DataFormat::Sint2_10_10_10) == 0,
+          "packed 2_10_10_10 vertex variants have no uniform per-component byte size");
 
     uint8_t rgba10[4] = {};
     unorm2_10_10_10_to_rgba8(0xFFFFFFFFu, rgba10);

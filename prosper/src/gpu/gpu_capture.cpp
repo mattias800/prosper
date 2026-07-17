@@ -251,7 +251,7 @@ void write_resource(Writer& w, const GpuCapturedResource& c) {
 bool read_resource(Reader& rd, GpuCapturedResource& c) {
     auto& r = c.resource; uint32_t cls, fmt; uint8_t b;
     if (!rd.u32(cls) || cls > static_cast<uint32_t>(ResourceClass::StorageImage) ||
-        !rd.u32(fmt) || fmt > static_cast<uint32_t>(DataFormat::Unorm2_10_10_10)) return false;
+        !rd.u32(fmt) || fmt > static_cast<uint32_t>(DataFormat::Sint2_10_10_10)) return false;
     r.cls = static_cast<ResourceClass>(cls); r.format = static_cast<DataFormat>(fmt);
     if (!rd.u32(r.num_components) || !rd.u32(r.binding) || !rd.u64(r.gpu_addr) || !rd.u32(r.size) ||
         !rd.u32(r.stride) || !rd.u32(r.srt_offset) || !rd.u32(r.sgpr_base) || !rd.u32(r.fetch_pc) ||

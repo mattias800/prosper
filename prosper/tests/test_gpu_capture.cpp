@@ -54,7 +54,7 @@ int main() {
 
     auto table = std::make_shared<ShaderResourceTable>();
     ShaderResource a{}; a.cls = ResourceClass::VertexBuffer; a.binding = 9; a.gpu_addr = 0x1000;
-    a.size = 16; a.stride = 4; a.format = DataFormat::Unorm2_10_10_10; a.num_components = 4; a.fetch_pc = 12;
+    a.size = 16; a.stride = 4; a.format = DataFormat::Sint2_10_10_10; a.num_components = 4; a.fetch_pc = 12;
     ShaderResource b{}; b.cls = ResourceClass::ConstantBuffer; b.binding = 2; b.gpu_addr = 0x1008;
     b.size = 16; b.format = DataFormat::Float32; b.num_components = 4; b.srt_offset = 0x20;
     ShaderResource dcc{}; dcc.cls = ResourceClass::Texture; dcc.binding = 4; dcc.gpu_addr = 0x1000;
@@ -281,8 +281,8 @@ int main() {
           loaded.draws[0].ps.has_clear_color1 && loaded.draws[0].ps.clear_color1[0] == 0.25f &&
           loaded.draws[0].ps.blend1_enable && loaded.draws[0].ps.color1_write_mask == 0xf,
           "MRT1 target and fixed-function state round-trip through the v10 extension");
-    CHECK(loaded.draws[0].vrt.resources[0].resource.format == DataFormat::Unorm2_10_10_10,
-          "newest packed image format enum round-trips");
+    CHECK(loaded.draws[0].vrt.resources[0].resource.format == DataFormat::Sint2_10_10_10,
+          "newest packed vertex format enum round-trips");
     CHECK(loaded.draws[0].vrt.resources[0].resource.depth == 7,
           "v9 resource depth round-trips");
     const auto& loaded_dcc = loaded.draws[0].vrt.resources[2].resource;

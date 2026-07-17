@@ -84,6 +84,11 @@ void rdna2_buffer_format(uint32_t fmt, DataFormat* out_fmt, uint32_t* out_compon
         case 27: f = DataFormat::Uint16;  n = 2; break;
         case 28: f = DataFormat::Sint16;  n = 2; break;
         case 29: f = DataFormat::Float16; n = 2; break;
+        case 36: f = DataFormat::Float10_11_11;       n = 3; break;
+        case 50: f = DataFormat::Unorm2_10_10_10;     n = 4; break;
+        case 51: f = DataFormat::Snorm2_10_10_10;     n = 4; break;
+        case 54: f = DataFormat::Uint2_10_10_10;      n = 4; break;
+        case 55: f = DataFormat::Sint2_10_10_10;      n = 4; break;
         case 56: f = DataFormat::Unorm8;  n = 4; break;   // 8_8_8_8_UNORM (vertex colors) — Kyty-confirmed
         case 57: f = DataFormat::Snorm8;  n = 4; break;
         case 60: f = DataFormat::Uint8;   n = 4; break;
@@ -144,11 +149,11 @@ bool gen5_image_format(uint32_t fmt, Gen5ImageFormatInfo* out) {
     if (fmt == 36) {
         // GFX10_FORMAT_10_11_11_FLOAT — packed 32-bit R11G11B10F (R=bits[10:0], G=[21:11],
         // B=[31:22], unsigned small floats, no alpha). UE4's scene-color render-target format;
-        // DOLL's final composite samples it at 3840x2160/1920x1080 (#294). Mapped HERE (not in
-        // rdna2_buffer_format) on purpose: as a texture the upload path unpacks it to RGBA8, but
-        // the vertex-fetch recompiler has no packed-component conversion, so a V# with this
-        // format must keep falling back rather than mis-convert. CONFIDENCE: HIGH (value from
-        // AMD's GFX10 register DB; live DOLL T#s confirmed fmt=36 at scene-color dimensions).
+        // DOLL's final composite samples it at 3840x2160/1920x1080 (#294). The explicit image case
+        // supplies its packed-texel byte size; rdna2_buffer_format also exposes the same value to the
+        // vertex-fetch recompiler, which widens the packed unsigned mini-floats exactly (#370).
+        // CONFIDENCE: HIGH (value from AMD's GFX10 register DB; live DOLL T#s confirmed fmt=36 at
+        // scene-color dimensions).
         fi.format = DataFormat::Float10_11_11; fi.num_components = 3; fi.bytes_per_block = 4;
     } else if (fmt == 50) {
         // GFX10_FORMAT_2_10_10_10_UNORM — Mesa maps a logical R10G10B10A2 format to this enum.
@@ -159,7 +164,10 @@ bool gen5_image_format(uint32_t fmt, Gen5ImageFormatInfo* out) {
     } else if (fmt >= 1 && fmt <= 77) {          // shared with the V# buffer-format numbering
         DataFormat f = DataFormat::Unknown; uint32_t n = 0;
         rdna2_buffer_format(fmt, &f, &n);
-        if (f != DataFormat::Unknown) plain(f, n);
+        // Packed-word formats need an explicit image upload conversion and byte size. Float10_11_11
+        // and Unorm2_10_10_10 have those dedicated cases above; the newly supported V#-only signed
+        // and integer variants must remain fail-closed here instead of returning a zero-byte image.
+        if (f != DataFormat::Unknown && data_format_bytes(f) != 0) plain(f, n);
     } else switch (fmt) {
         case 128: plain(DataFormat::Unorm8, 1, true); break;   // 8_SRGB
         case 129: plain(DataFormat::Unorm8, 2, true); break;   // 8_8_SRGB

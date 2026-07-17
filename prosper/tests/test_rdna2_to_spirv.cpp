@@ -776,6 +776,110 @@ int main() {
     printf("  kernel25 mismatches=%u (out[40]=%g expect=%g)\n", bad25, got25.size()==N?got25[40]:-1, got25.size()==N?exp25[40]:-1);
     CHECK(got25.size()==N && bad25==0, "recompiled kernel 25 (snorm16x2 -> normalized + clamped floats) correct");
 
+    // #370: packed-word vertex formats. All four logical components occupy one dword, so the ordinary
+    // uniform-byte-component path cannot represent them. Exercise the actual translated SPIR-V on Vulkan
+    // with distinct weighted components: this catches field order/width, sign extension, normalization,
+    // the two-bit alpha rule, and the R11G11B10 unsigned-small-float widening.
+    const uint32_t code25packed_float[] = {
+        0x7e000f00u, 0xe00c2000u, 0x80020100u, // index + buffer_load_format_xyzw v[1:4]
+        0x7e0a02f4u, 0x100c0505u, 0x06020d01u,
+        0x7e0a02f6u, 0x100c0905u, 0x06020d01u,
+        0x7e0a02ffu, 0x40400000u, 0x100c0705u, 0x06020d01u, 0xbf810000u,
+    };
+    const uint32_t code25packed_uint[] = {
+        0x7e000f00u, 0xe00c2000u, 0x80020100u,
+        0x7e020d01u, 0x7e040d02u, 0x7e060d03u, 0x7e080d04u, // uint fields -> float
+        0x7e0a02f4u, 0x100c0505u, 0x06020d01u,
+        0x7e0a02f6u, 0x100c0905u, 0x06020d01u,
+        0x7e0a02ffu, 0x40400000u, 0x100c0705u, 0x06020d01u, 0xbf810000u,
+    };
+    const uint32_t code25packed_sint[] = {
+        0x7e000f00u, 0xe00c2000u, 0x80020100u,
+        0x7e020b01u, 0x7e040b02u, 0x7e060b03u, 0x7e080b04u, // signed fields -> float
+        0x7e0a02f4u, 0x100c0505u, 0x06020d01u,
+        0x7e0a02f6u, 0x100c0905u, 0x06020d01u,
+        0x7e0a02ffu, 0x40400000u, 0x100c0705u, 0x06020d01u, 0xbf810000u,
+    };
+    auto check_packed_fetch = [&](const uint32_t* code, size_t code_dwords, DataFormat format,
+                                  const std::vector<uint32_t>& words,
+                                  const std::vector<float>& expected, const char* message) {
+        ShaderResourceTable table;
+        ShaderResource vb{}; vb.cls = ResourceClass::VertexBuffer; vb.format = format;
+        vb.num_components = format == DataFormat::Float10_11_11 ? 3 : 4;
+        vb.binding = 3; vb.stride = 4; vb.sgpr_base = 8; table.resources.push_back(vb);
+        std::vector<uint32_t> spv = recompile_valu(code, code_dwords, 1, 1, &table);
+        std::vector<float> input(N); for (uint32_t i = 0; i < N; ++i) input[i] = (float)i;
+        std::vector<float> got = prosper::test::run_compute(spv, input, N, N, {}, words);
+        uint32_t bad = 0;
+        for (uint32_t i = 0; i < N && got.size() == N; ++i)
+            if (std::fabs(got[i] - expected[i]) > 3e-3f) ++bad;
+        CHECK(!spv.empty() && got.size() == N && bad == 0, message);
+    };
+    auto pack_2_10_10_10 = [](int32_t r, int32_t g, int32_t b, int32_t a) {
+        return ((uint32_t)r & 0x3ffu) | (((uint32_t)g & 0x3ffu) << 10) |
+               (((uint32_t)b & 0x3ffu) << 20) | (((uint32_t)a & 0x3u) << 30);
+    };
+    std::vector<uint32_t> packed_words(N);
+    std::vector<float> packed_expected(N);
+    for (uint32_t i = 0; i < N; ++i) {
+        uint32_t r = i * 17u & 1023u, g = i * 29u + 3u & 1023u;
+        uint32_t b = i * 43u + 7u & 1023u, a = i & 3u;
+        packed_words[i] = pack_2_10_10_10(r, g, b, a);
+        packed_expected[i] = r / 1023.0f + 2.0f * g / 1023.0f +
+                             3.0f * b / 1023.0f + 4.0f * a / 3.0f;
+    }
+    check_packed_fetch(code25packed_float, sizeof(code25packed_float) / 4,
+                       DataFormat::Unorm2_10_10_10, packed_words, packed_expected,
+                       "packed 2_10_10_10 UNORM fetch decodes four normalized fields");
+
+    auto snorm = [](int32_t v, float scale) { return std::fmax((float)v / scale, -1.0f); };
+    for (uint32_t i = 0; i < N; ++i) {
+        int32_t r = (int32_t)(i * 17u & 1023u) - 512;
+        int32_t g = (int32_t)(i * 29u + 3u & 1023u) - 512;
+        int32_t b = (int32_t)(i * 43u + 7u & 1023u) - 512;
+        int32_t a = (int32_t)(i & 3u) - 2;
+        packed_words[i] = pack_2_10_10_10(r, g, b, a);
+        packed_expected[i] = snorm(r, 511.0f) + 2.0f * snorm(g, 511.0f) +
+                             3.0f * snorm(b, 511.0f) + 4.0f * snorm(a, 1.0f);
+    }
+    check_packed_fetch(code25packed_float, sizeof(code25packed_float) / 4,
+                       DataFormat::Snorm2_10_10_10, packed_words, packed_expected,
+                       "packed 2_10_10_10 SNORM fetch sign-extends and clamps every field");
+
+    for (uint32_t i = 0; i < N; ++i) {
+        uint32_t r = i * 17u & 1023u, g = i * 29u + 3u & 1023u;
+        uint32_t b = i * 43u + 7u & 1023u, a = i & 3u;
+        packed_words[i] = pack_2_10_10_10(r, g, b, a);
+        packed_expected[i] = (float)r + 2.0f * (float)g + 3.0f * (float)b + 4.0f * (float)a;
+    }
+    check_packed_fetch(code25packed_uint, sizeof(code25packed_uint) / 4,
+                       DataFormat::Uint2_10_10_10, packed_words, packed_expected,
+                       "packed 2_10_10_10 UINT fetch zero-extends four integer fields");
+
+    for (uint32_t i = 0; i < N; ++i) {
+        int32_t r = (int32_t)(i * 17u & 1023u) - 512;
+        int32_t g = (int32_t)(i * 29u + 3u & 1023u) - 512;
+        int32_t b = (int32_t)(i * 43u + 7u & 1023u) - 512;
+        int32_t a = (int32_t)(i & 3u) - 2;
+        packed_words[i] = pack_2_10_10_10(r, g, b, a);
+        packed_expected[i] = (float)r + 2.0f * (float)g + 3.0f * (float)b + 4.0f * (float)a;
+    }
+    check_packed_fetch(code25packed_sint, sizeof(code25packed_sint) / 4,
+                       DataFormat::Sint2_10_10_10, packed_words, packed_expected,
+                       "packed 2_10_10_10 SINT fetch sign-extends four integer fields");
+
+    for (uint32_t i = 0; i < N; ++i) {
+        uint32_t r = (15u << 6) | (i & 63u);       // 11-bit unsigned float, [1,2)
+        uint32_t g = (14u << 6) | (i * 3u & 63u);  // 11-bit unsigned float, [0.5,1)
+        uint32_t b = (16u << 5) | (i * 5u & 31u);  // 10-bit unsigned float, [2,4)
+        packed_words[i] = r | (g << 11) | (b << 22);
+        packed_expected[i] = f11_to_float((uint16_t)r) + 2.0f * f11_to_float((uint16_t)g) +
+                             3.0f * f10_to_float((uint16_t)b) + 4.0f; // absent W defaults to 1.0
+    }
+    check_packed_fetch(code25packed_float, sizeof(code25packed_float) / 4,
+                       DataFormat::Float10_11_11, packed_words, packed_expected,
+                       "packed 10_11_11 FLOAT fetch widens mini-floats and default-fills W");
+
     // Kernel 26: s_buffer_load_dwordx8 (wide scalar load). s[0:7] = cbuf[4..11] (offset 0x10>>2=4);
     // out = (float)s7 = cbuf[11]. Real shaders load whole constant blocks in one x8/x16 op; this proves
     // the wide loads emit all N dwords, not just x1/x2/x4.
