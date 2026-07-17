@@ -113,6 +113,28 @@ void decode_operands(Rdna2Inst& i) {
                         i.has_modifier = false;
                     }
                 }
+                // Integer-to-f32 conversion may select a byte/word before conversion. Unsigned
+                // conversion zero-extends it; signed conversion honors SDWA SEXT (bit 19). Astro's
+                // title post PS uses WORD_1+SEXT for v_cvt_f32_i32.
+                // Astro title-ship PS uses the exact packet 7e0a0cf9 0000160b:
+                // v_cvt_f32_u32_sdwa v5, v11 src0_sel:BYTE_0. Destination is a full dword; the
+                // canonical UNUSED_PRESERVE value is immaterial because all 32 bits are written.
+                else if (((w >> 9) & 0xFFu) == 0x05u ||
+                         ((w >> 9) & 0xFFu) == 0x06u) {
+                    const uint32_t dsel = (sd >> 8) & 7u, dun = (sd >> 11) & 3u;
+                    const uint32_t s0sel = (sd >> 16) & 7u;
+                    const bool signed_cvt = ((w >> 9) & 0xFFu) == 0x05u;
+                    const bool sext = ((sd >> 19) & 1u) != 0;
+                    if (dsel == 6u && (dun == 0u || dun == 2u) && s0sel <= 5u &&
+                        !((sd >> 20) & 0x7u) && (signed_cvt || !sext) &&
+                        !i.clamp && !i.omod &&
+                        !i.src_neg[0] && !i.src_abs[0]) {
+                        i.sdwa_dst_sel = static_cast<uint8_t>(dsel);
+                        i.sdwa_dst_unused = static_cast<uint8_t>(dun);
+                        i.sdwa_src0_sel = static_cast<uint8_t>(s0sel);
+                        i.has_modifier = false;
+                    }
+                }
                 // Packed unary f16 SDWA selects one source half, writes one destination half, and
                 // preserves the other. The producer uses rcp/sqrt/cos (0x54/0x55/0x61).
                 else if (((w >> 9) & 0xFFu) == 0x54u ||
@@ -215,12 +237,27 @@ void decode_operands(Rdna2Inst& i) {
                 // values (`v_cmpx_gt_f16_sdwa ..., v7, 0 src0_sel:WORD_1`). Preserve the selects so
                 // the recompiler can unpack the chosen half; other sub-dword compare forms reject.
                 else {
-                    const uint32_t eff = i.opcode >= 0xD9u && i.opcode <= 0xDEu
-                                           ? i.opcode - 0x10u : i.opcode;
+                    const bool cmpx = (i.opcode >= 0x10u && i.opcode <= 0x1Fu) ||
+                                      (i.opcode >= 0x90u && i.opcode <= 0x9Fu) ||
+                                      (i.opcode >= 0xD0u && i.opcode <= 0xDFu);
+                    const uint32_t eff = cmpx ? i.opcode - 0x10u : i.opcode;
                     const uint32_t s0sel = (sd >> 16) & 7u, s1sel = (sd >> 24) & 7u;
                     if (eff >= 0xC9u && eff <= 0xCEu &&
                         s0sel >= 4u && s0sel <= 6u && s1sel >= 4u && s1sel <= 6u &&
                         !((sd >> 19) & 0x9u) && !((sd >> 27) & 0x9u)) {
+                        i.sdwa_src0_sel = static_cast<uint8_t>(s0sel);
+                        i.sdwa_src1_sel = static_cast<uint8_t>(s1sel);
+                        i.has_modifier = false;
+                    }
+                    // Integer VOPC SDWA may compare a selected byte/word after zero extension.
+                    // Astro Bot uses `v_cmp_ne_u32 1, v63 src1_sel:BYTE_0` in its visibility
+                    // kernel. Admit the exact no-SEXT/no-neg/abs subset; signed extension and
+                    // integer source modifiers remain fail-visible until modeled.
+                    const bool integer_compare =
+                        (eff >= 0x81u && eff <= 0x86u) ||
+                        (eff >= 0xC1u && eff <= 0xC6u);
+                    if (integer_compare && s0sel <= 6u && s1sel <= 6u &&
+                        !((sd >> 19) & 0xFu) && !((sd >> 27) & 0xFu)) {
                         i.sdwa_src0_sel = static_cast<uint8_t>(s0sel);
                         i.sdwa_src1_sel = static_cast<uint8_t>(s1sel);
                         i.has_modifier = false;
@@ -243,7 +280,8 @@ void decode_operands(Rdna2Inst& i) {
             i.omod  = (uint8_t)((d1 >> 27) & 3u);
             // VOP3B carry ops (v_add/sub/subrev_co_ci_u32 = 0x128/0x129/0x12A): dword0[14:8] is a scalar
             // carry-OUT dst, not abs modifiers — decode it and clear the mis-read abs/clamp bits.
-            if (i.opcode == 0x128u || i.opcode == 0x129u || i.opcode == 0x12Au) {
+            if (i.opcode == 0x128u || i.opcode == 0x129u || i.opcode == 0x12Au ||
+                i.opcode == 0x176u) {
                 i.sdst = sgpr((w >> 8) & 0x7Fu);
                 i.src_abs[0] = i.src_abs[1] = i.src_abs[2] = false;
                 i.clamp = false;

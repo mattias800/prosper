@@ -103,6 +103,18 @@ int main() {
           isS(mb.src[1], 8) && ((mb.literal >> 12) & 1u), "buffer_load_dwordx4 MUBUF op/VDATA/VADDR/SRSRC/offen");
     CHECK(mb.src[2].kind == OperandKind::InlineInt && mb.src[2].value == 0,
           "MUBUF SOFFSET 0x80 decodes as inline 0, not SGPR s0");
+    // Exact DS_READ2_B32 words from Astro Bot's loading-surface compute producer. The packed
+    // offset bytes are dword indices (offset0 in the low byte, offset1 in the high byte).
+    const uint32_t ds_read2_adjacent[] = { 0xd8dc0100u, 0x04000002u };
+    Rdna2Inst dr2a = rdna2_decode_one(ds_read2_adjacent, 2);
+    CHECK(dr2a.fmt == Rdna2Format::DS && dr2a.opcode == 0x37u && dr2a.literal == 0x0100u &&
+          isV(dr2a.src[0], 2) && isV(dr2a.dst, 4),
+          "Astro DS_READ2_B32 decodes adjacent offsets, ADDR v2, and VDST v4");
+    const uint32_t ds_read2_16_17[] = { 0xd8dc1110u, 0x02000002u };
+    Rdna2Inst dr2b = rdna2_decode_one(ds_read2_16_17, 2);
+    CHECK(dr2b.fmt == Rdna2Format::DS && dr2b.opcode == 0x37u && dr2b.literal == 0x1110u &&
+          isV(dr2b.src[0], 2) && isV(dr2b.dst, 2),
+          "Astro DS_READ2_B32 decodes non-zero offsets 16/17");
     // VOP SDWA/DPP forms carry a mandatory 2nd (control) dword — the decoder must count it (miss it and
     // the whole downstream stream mis-aligns) and flag has_modifier so the recompiler rejects it.
     // Encodings from llvm-mc gfx1030: SDWA src0=0xf9, DPP16 src0=0xfa, DPP8 src0=0xe9.
@@ -115,6 +127,16 @@ int main() {
     CHECK(fc.fmt == Rdna2Format::VOPC && fc.opcode == 0xDCu && !fc.has_modifier &&
           fc.sdwa_src0_sel == 5u && fc.sdwa_src1_sel == 6u,
           "VOPC f16 SDWA WORD_1 source select is decoded for recompilation");
+    const uint32_t cvt_byte[] = { 0x7e0a0cf9u, 0x0000160bu };
+    Rdna2Inst cb = rdna2_decode_one(cvt_byte, 2);
+    CHECK(cb.fmt == Rdna2Format::VOP1 && cb.opcode == 0x06u && !cb.has_modifier &&
+          isV(cb.dst, 5) && isV(cb.src[0], 11) && cb.sdwa_src0_sel == 0u,
+          "Astro v_cvt_f32_u32 SDWA BYTE_0 packet is admitted with exact sub-dword select");
+    const uint32_t cvt_signed_word[] = { 0x7e240af9u, 0x000d0610u };
+    Rdna2Inst csw = rdna2_decode_one(cvt_signed_word, 2);
+    CHECK(csw.fmt == Rdna2Format::VOP1 && csw.opcode == 0x05u && !csw.has_modifier &&
+          isV(csw.dst, 18) && isV(csw.src[0], 16) && csw.sdwa_src0_sel == 5u,
+          "Astro v_cvt_f32_i32 SDWA WORD_1+SEXT packet is admitted");
     const uint32_t dpp16[] = { 0x4a0e0cfau, 0xff011106u };   // v_add_nc_u32_dpp v7, v6, v6 row_shr:1
     Rdna2Inst dp = rdna2_decode_one(dpp16, 2);
     CHECK(dp.fmt == Rdna2Format::VOP2 && dp.len_dwords == 2 && dp.has_modifier,

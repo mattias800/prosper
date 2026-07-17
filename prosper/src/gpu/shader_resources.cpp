@@ -88,6 +88,68 @@ float f10_to_float(uint16_t v) {
     return half_to_float((uint16_t)(((v & 0x3FFu) >> 5 << 10) | ((v & 0x1Fu) << 5)));
 }
 
+namespace {
+
+uint32_t round_shift_even(uint32_t value, uint32_t shift) {
+    if (!shift) return value;
+    // value is at most 24 bits here. For shifts above that it is strictly below halfway.
+    if (shift >= 32) return 0;
+    uint32_t rounded = value >> shift;
+    const uint32_t remainder = value & ((1u << shift) - 1u);
+    const uint32_t halfway = 1u << (shift - 1u);
+    if (remainder > halfway || (remainder == halfway && (rounded & 1u))) ++rounded;
+    return rounded;
+}
+
+uint16_t float_to_unsigned_small(float f, uint32_t mantissa_bits) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &f, sizeof(bits));
+    const uint32_t sign = bits >> 31;
+    const uint32_t exponent = (bits >> 23) & 0xffu;
+    const uint32_t mantissa = bits & 0x7fffffu;
+    const uint32_t mantissa_mask = (1u << mantissa_bits) - 1u;
+
+    // Both formats use the binary16 exponent (5 bits, bias 15), but have no sign bit.
+    if (exponent == 0xffu) {
+        if (!mantissa) return static_cast<uint16_t>(0x1fu << mantissa_bits); // +inf
+        uint32_t payload = mantissa >> (23u - mantissa_bits);
+        if (!payload) payload = 1;
+        return static_cast<uint16_t>((0x1fu << mantissa_bits) | payload);    // NaN
+    }
+    if (sign || exponent == 0) return 0; // negative values clamp to +0; f32 subnormals underflow
+
+    int32_t target_exponent = static_cast<int32_t>(exponent) - 127 + 15;
+    if (target_exponent >= 31)
+        return static_cast<uint16_t>(0x1fu << mantissa_bits);                // overflow -> +inf
+
+    const uint32_t significand = 0x800000u | mantissa;
+    if (target_exponent <= 0) {
+        // Target subnormal unit is 2^(-14-mantissa_bits). Express the exact f32 significand in
+        // those units, then perform one round-to-nearest-even step (no double rounding via f16).
+        const int32_t unbiased = static_cast<int32_t>(exponent) - 127;
+        const uint32_t shift = static_cast<uint32_t>(9 - static_cast<int32_t>(mantissa_bits) - unbiased);
+        const uint32_t rounded = round_shift_even(significand, shift);
+        // Rounding the largest subnormal upward produces the smallest normal (exp=1, mantissa=0).
+        if (rounded >= (1u << mantissa_bits))
+            return static_cast<uint16_t>(1u << mantissa_bits);
+        return static_cast<uint16_t>(rounded);
+    }
+
+    uint32_t rounded = round_shift_even(significand, 23u - mantissa_bits);
+    if (rounded == (1u << (mantissa_bits + 1u))) {
+        rounded >>= 1;
+        if (++target_exponent >= 31)
+            return static_cast<uint16_t>(0x1fu << mantissa_bits);
+    }
+    return static_cast<uint16_t>((static_cast<uint32_t>(target_exponent) << mantissa_bits) |
+                                 (rounded & mantissa_mask));
+}
+
+} // namespace
+
+uint16_t float_to_f11(float f) { return float_to_unsigned_small(f, 6); }
+uint16_t float_to_f10(float f) { return float_to_unsigned_small(f, 5); }
+
 void unorm2_10_10_10_to_rgba8(uint32_t packed, uint8_t rgba[4]) {
     // Mesa's GFX10 format table maps a logical R10G10B10A2 description to hardware IMG_FMT 50,
     // whose name lists the packed fields high-to-low. Scale with integer rounding so both endpoints

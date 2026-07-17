@@ -274,8 +274,30 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
     for (const auto& seed : replay.ds_seeds) {
         const uint64_t depth_hash = prosper::gpu::gpu_capture_hash(seed.depth);
         const uint64_t stencil_hash = prosper::gpu::gpu_capture_hash(seed.stencil);
+        float depth_min = INFINITY, depth_max = -INFINITY, depth_first = 0.0f;
+        size_t depth_finite = 0, depth_nonfinite = 0, depth_first_count = 0;
+        uint32_t depth_first_bits = 0;
+        if (seed.depth.size() >= sizeof(float))
+            std::memcpy(&depth_first_bits, seed.depth.data(), sizeof(depth_first_bits));
+        std::memcpy(&depth_first, &depth_first_bits, sizeof(depth_first));
+        for (size_t offset = 0; offset + sizeof(float) <= seed.depth.size();
+             offset += sizeof(float)) {
+            uint32_t bits = 0;
+            float value = 0.0f;
+            std::memcpy(&bits, seed.depth.data() + offset, sizeof(bits));
+            std::memcpy(&value, &bits, sizeof(value));
+            depth_first_count += bits == depth_first_bits;
+            if (std::isfinite(value)) {
+                depth_min = std::min(depth_min, value);
+                depth_max = std::max(depth_max, value);
+                ++depth_finite;
+            } else {
+                ++depth_nonfinite;
+            }
+        }
         std::printf("ds-seed base-z=%016llx/%016llx base-s=%016llx/%016llx htile=%016llx "
-                    "extent=%ux%u format=%s valid=%d/%d depth=%zu/%016llx stencil=%zu/%016llx\n",
+                    "extent=%ux%u format=%s valid=%d/%d depth=%zu/%016llx stencil=%zu/%016llx "
+                    "depth-stats first=%g/0x%08x same=%zu finite=%zu nonfinite=%zu range=[%g,%g]\n",
                     static_cast<unsigned long long>(seed.depth_read_base),
                     static_cast<unsigned long long>(seed.depth_write_base),
                     static_cast<unsigned long long>(seed.stencil_read_base),
@@ -284,7 +306,9 @@ void inspect_frame(const prosper::gpu::GpuReplayFrame& replay) {
                     seed.format == prosper::gpu::GpuCaptureDsFormat::D32FloatS8 ? "D32S8" : "D32",
                     seed.depth_valid, seed.stencil_valid, seed.depth.size(),
                     static_cast<unsigned long long>(depth_hash), seed.stencil.size(),
-                    static_cast<unsigned long long>(stencil_hash));
+                    static_cast<unsigned long long>(stencil_hash), depth_first, depth_first_bits,
+                    depth_first_count, depth_finite, depth_nonfinite,
+                    depth_finite ? depth_min : 0.0f, depth_finite ? depth_max : 0.0f);
     }
     for (size_t i = 0; i < replay.items.size(); ++i) {
         const auto& d = replay.items[i];

@@ -5,7 +5,9 @@
 #include "../src/hle/dispatch.hpp"
 #include "../src/hle/nid.hpp"
 #include <atomic>
+#include <array>
 #include <cstdio>
+#include <limits>
 #include <thread>
 
 using namespace prosper;
@@ -64,21 +66,30 @@ int main() {
     if (HleFn fn = Hle::lookup(nid_hash("scePthreadGetthreadid"))) {
         const uint64_t main_id = fn(0, 0, 0, 0, 0, 0);
         const uint64_t main_id_again = fn(0, 0, 0, 0, 0, 0);
-        std::atomic<uint64_t> worker_id{0};
-        std::atomic<uint64_t> worker_id_again{0};
-        std::thread worker([&] {
-            worker_id.store(fn(0, 0, 0, 0, 0, 0), std::memory_order_relaxed);
-            worker_id_again.store(fn(0, 0, 0, 0, 0, 0), std::memory_order_relaxed);
-        });
-        worker.join();
-        if (main_id == 0 || main_id != main_id_again) {
-            printf("  [FAIL] scePthreadGetthreadid is zero or unstable on the main thread\n");
+        std::array<std::atomic<uint64_t>, 2> worker_id{};
+        std::array<std::atomic<uint64_t>, 2> worker_id_again{};
+        std::array<std::thread, 2> workers;
+        for (size_t i = 0; i < workers.size(); ++i) {
+            workers[i] = std::thread([&, i] {
+                worker_id[i].store(fn(0, 0, 0, 0, 0, 0), std::memory_order_relaxed);
+                worker_id_again[i].store(fn(0, 0, 0, 0, 0, 0), std::memory_order_relaxed);
+            });
+        }
+        for (auto& worker : workers) worker.join();
+        if (main_id == 0 || main_id > std::numeric_limits<int32_t>::max() ||
+            main_id != main_id_again) {
+            printf("  [FAIL] scePthreadGetthreadid is not a stable positive guest ID on the main thread\n");
             fails++;
         }
-        if (worker_id.load(std::memory_order_relaxed) == 0 ||
-            worker_id.load(std::memory_order_relaxed) != worker_id_again.load(std::memory_order_relaxed) ||
-            worker_id.load(std::memory_order_relaxed) == main_id) {
-            printf("  [FAIL] scePthreadGetthreadid does not distinguish concurrent threads\n");
+        const uint64_t worker0 = worker_id[0].load(std::memory_order_relaxed);
+        const uint64_t worker1 = worker_id[1].load(std::memory_order_relaxed);
+        if (worker0 == 0 || worker1 == 0 ||
+            worker0 > std::numeric_limits<int32_t>::max() ||
+            worker1 > std::numeric_limits<int32_t>::max() ||
+            worker0 != worker_id_again[0].load(std::memory_order_relaxed) ||
+            worker1 != worker_id_again[1].load(std::memory_order_relaxed) ||
+            worker0 == main_id || worker1 == main_id || worker0 == worker1) {
+            printf("  [FAIL] scePthreadGetthreadid does not assign stable, distinct guest IDs\n");
             fails++;
         }
     } else { printf("  [FAIL] not registered: scePthreadGetthreadid\n"); fails++; }

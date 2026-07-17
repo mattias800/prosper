@@ -321,8 +321,9 @@ int main() {
         #undef GOLD
     }
 
-    // --- GFX10 64KB modes (#288): SW_64KB_S (tile_mode 9) and SW_64KB_R_X (tile_mode 27). ---
+    // --- GFX10 64KB modes (#288/#825): S (9), Z_X (24), and R_X (27). ---
     CHECK(tile_mode_is_tiled((uint32_t)TileMode::Sw64KbS),  "tile_mode 9 (SW_64KB_S) is tiled");
+    CHECK(tile_mode_is_tiled((uint32_t)TileMode::Sw64KbZX), "tile_mode 24 (SW_64KB_Z_X) is tiled");
     CHECK(tile_mode_is_tiled((uint32_t)TileMode::Sw64KbRX), "tile_mode 27 (SW_64KB_R_X) is tiled");
 
     // GFX10 thin 2D mip chains are tail-first, then smallest-to-largest outside the tail. Evergate's
@@ -338,6 +339,50 @@ int main() {
               "last non-tail mip immediately follows the shared 4KB tail");
         CHECK(tiled_mip_level_offset(2048, 1152, 4, M, 0, 0) == 0,
               "single-level surfaces remain based at byte zero");
+
+        const TiledMipLevelLayout tail7 =
+            tiled_mip_level_layout(2048, 1152, 4, M, 11, 7);
+        CHECK(tail7.supported && tail7.in_tail && tail7.byte_offset == 2048 &&
+                  tail7.tail_x == 4 && tail7.tail_y == 0 && tail7.tail_block_bytes == 4096,
+              "first SW_4KB_S tail level exposes AddrLib byte and element origins");
+        const TiledMipLevelLayout tail11 =
+            tiled_mip_level_layout(2048, 1152, 4, M, 11, 11);
+        CHECK(tail11.supported && tail11.in_tail && tail11.byte_offset == 768 &&
+                  tail11.tail_x == 2 && tail11.tail_y == 2,
+              "last allocated tail level retains its sparse max-tail slot");
+
+        // Pack level 7 into its shared block using the equivalent global tail coordinate, then read
+        // it through the byte-origin API. A write must alter only that level and preserve every
+        // sentinel byte belonging to its siblings.
+        std::vector<uint8_t> full_linear((size_t)32 * 32 * 4, 0);
+        std::vector<uint8_t> level_linear((size_t)16 * 9 * 4, 0);
+        for (uint32_t y = 0; y < 9; ++y) for (uint32_t x = 0; x < 16; ++x) {
+            const uint32_t value = 0x81000000u | (y << 8) | x;
+            std::memcpy(level_linear.data() + ((size_t)y * 16 + x) * 4, &value, 4);
+            std::memcpy(full_linear.data() +
+                            ((size_t)(tail7.tail_y + y) * 32 + tail7.tail_x + x) * 4,
+                        &value, 4);
+        }
+        std::vector<uint8_t> shared_tail(4096, 0);
+        tile_surface(shared_tail.data(), full_linear.data(), 32, 32, M, 0, 4);
+        std::vector<uint8_t> extracted(level_linear.size(), 0);
+        detile_surface_level(extracted.data(), shared_tail.data(), shared_tail.size(),
+                             16, 9, M, 4, tail7.tail_x, tail7.tail_y);
+        CHECK(extracted == level_linear,
+              "tail byte origin detiles the same texels as the documented global coordinate");
+        std::vector<uint8_t> rewritten = shared_tail;
+        std::vector<uint8_t> replacement(level_linear.size(), 0x5a);
+        tile_surface_level(rewritten.data(), rewritten.size(), replacement.data(),
+                           16, 9, M, 4, tail7.tail_x, tail7.tail_y);
+        std::vector<uint8_t> roundtrip(replacement.size(), 0);
+        detile_surface_level(roundtrip.data(), rewritten.data(), rewritten.size(),
+                             16, 9, M, 4, tail7.tail_x, tail7.tail_y);
+        CHECK(roundtrip == replacement,
+              "tail level write/read round-trip preserves the selected mip");
+        size_t changed = 0;
+        for (size_t i = 0; i < rewritten.size(); ++i) changed += rewritten[i] != shared_tail[i];
+        CHECK(changed <= replacement.size(),
+              "tail writeback does not clear or overwrite sibling padding bytes");
     }
 
     // Tiled footprint: a 64KB block holds 65536 bytes; its element dims depend on bpe
@@ -352,7 +397,51 @@ int main() {
               "16-byte elements (BC7 blocks): 256x128 -> 4x2 blocks of 64x64");
     }
 
-    // Round-trip identity for both 64KB modes at every element size (incl. block-unaligned dims).
+    // Official GFX10 AddrLib linear mip chains are also smallest-first. Astro's 480x270 RGBA32F
+    // post resource has eight levels: each pitch is 256-byte aligned (64 four-byte elements).
+    {
+        const TiledMipLevelLayout linear3 = tiled_mip_level_layout(480, 270, 4, 0, 7, 3);
+        const TiledMipLevelLayout linear5 = tiled_mip_level_layout(480, 270, 4, 0, 7, 5);
+        CHECK(linear3.supported && !linear3.in_tail && linear3.byte_offset == 7680,
+              "Astro linear mip3 follows smaller aligned levels exactly");
+        CHECK(linear5.supported && !linear5.in_tail && linear5.byte_offset == 1536,
+              "Astro linear mip5 follows levels 7 and 6 exactly");
+    }
+
+    // Astro Bot's 1920x1080 post chain selects levels 5/6 of an eight-level 64KB_R_X allocation.
+    // Both are packed into the first 64 KiB macroblock, at the exact coordinates below.
+    {
+        const uint32_t M = (uint32_t)TileMode::Sw64KbRX;
+        const TiledMipLevelLayout tail5 =
+            tiled_mip_level_layout(1920, 1080, 4, M, 7, 5);
+        const TiledMipLevelLayout tail6 =
+            tiled_mip_level_layout(1920, 1080, 4, M, 7, 6);
+        CHECK(tail5.supported && tail5.in_tail && tail5.byte_offset == 32768 &&
+                  tail5.tail_x == 64 && tail5.tail_y == 0 &&
+                  tail5.tail_block_bytes == 65536,
+              "Astro 60x33 level-5 R_X tail coordinate is exact");
+        CHECK(tail6.supported && tail6.in_tail && tail6.byte_offset == 16384 &&
+                  tail6.tail_x == 0 && tail6.tail_y == 64,
+              "Astro 30x16 level-6 R_X tail coordinate is exact");
+
+        std::vector<uint8_t> block_linear((size_t)128 * 128 * 4, 0);
+        std::vector<uint8_t> mip_linear((size_t)60 * 33 * 4, 0);
+        for (uint32_t y = 0; y < 33; ++y) for (uint32_t x = 0; x < 60; ++x) {
+            const uint32_t value = 0xa5000000u | (y << 10) | x;
+            std::memcpy(mip_linear.data() + ((size_t)y * 60 + x) * 4, &value, 4);
+            std::memcpy(block_linear.data() +
+                            ((size_t)(tail5.tail_y + y) * 128 + tail5.tail_x + x) * 4,
+                        &value, 4);
+        }
+        std::vector<uint8_t> tiled(65536, 0), extracted(mip_linear.size(), 0);
+        tile_surface(tiled.data(), block_linear.data(), 128, 128, M, 0, 4);
+        detile_surface_level(extracted.data(), tiled.data(), tiled.size(), 60, 33, M, 4,
+                             tail5.tail_x, tail5.tail_y);
+        CHECK(extracted == mip_linear,
+              "Astro R_X tail extraction matches the full-block swizzle exactly");
+    }
+
+    // Round-trip identity for all three 64KB modes at every element size (incl. block-unaligned dims).
     {
         auto rt64 = [&](uint32_t M, uint32_t w, uint32_t h, uint32_t bpe) -> bool {
             std::vector<uint8_t> ref((size_t)w * h * bpe);
@@ -363,17 +452,48 @@ int main() {
             detile_surface(back.data(), tiled.data(), w, h, M, 0, bpe);
             return back == ref;
         };
-        const uint32_t S = (uint32_t)TileMode::Sw64KbS, R = (uint32_t)TileMode::Sw64KbRX;
+        const uint32_t S = (uint32_t)TileMode::Sw64KbS;
+        const uint32_t Z = (uint32_t)TileMode::Sw64KbZX;
+        const uint32_t R = (uint32_t)TileMode::Sw64KbRX;
         CHECK(rt64(S, 256, 256, 1),  "SW_64KB_S round-trip 256x256 @ 1 B (one block)");
         CHECK(rt64(S, 300, 140, 2),  "SW_64KB_S round-trip 300x140 @ 2 B (unaligned)");
         CHECK(rt64(S, 500, 300, 4),  "SW_64KB_S round-trip 500x300 @ 4 B (unaligned)");
         CHECK(rt64(S, 128, 64, 8),   "SW_64KB_S round-trip 128x64 @ 8 B (one block, BC1 grid)");
         CHECK(rt64(S, 130, 70, 16),  "SW_64KB_S round-trip 130x70 @ 16 B (unaligned BC7 grid)");
+        CHECK(rt64(Z, 260, 260, 1),  "SW_64KB_Z_X round-trip 260x260 @ 1 B");
+        CHECK(rt64(Z, 300, 140, 2),  "SW_64KB_Z_X round-trip 300x140 @ 2 B");
+        CHECK(rt64(Z, 500, 300, 4),  "SW_64KB_Z_X round-trip 500x300 @ 4 B");
+        CHECK(rt64(Z, 130, 70, 8),   "SW_64KB_Z_X round-trip 130x70 @ 8 B");
+        CHECK(rt64(Z, 70, 70, 16),   "SW_64KB_Z_X round-trip 70x70 @ 16 B");
         CHECK(rt64(R, 260, 130, 1),  "SW_64KB_R_X round-trip 260x130 @ 1 B");
         CHECK(rt64(R, 300, 140, 2),  "SW_64KB_R_X round-trip 300x140 @ 2 B");
         CHECK(rt64(R, 500, 300, 4),  "SW_64KB_R_X round-trip 500x300 @ 4 B");
         CHECK(rt64(R, 130, 70, 8),   "SW_64KB_R_X round-trip 130x70 @ 8 B");
         CHECK(rt64(R, 70, 70, 16),   "SW_64KB_R_X round-trip 70x70 @ 16 B");
+    }
+
+    // AMD AddrLib GFX10_SW_64K_Z_X_1xaa golden, 16 pipes, 4 bpe. The selected pattern is
+    // nibble01[10] + nibble2[74] + nibble3[31]: low Morton pairs, four pipe-XOR bits, then
+    // y3/x4/y6/x6. These independent positions pin both the Z order and the pipe rotation used
+    // by Astro Bot's live mode-24 compute surfaces; a tile/detile round-trip alone cannot do that.
+    {
+        const uint32_t M = (uint32_t)TileMode::Sw64KbZX;
+        const uint32_t ew = 128, eh = 128, bpe = 4;
+        std::vector<uint8_t> ref((size_t)ew * eh * bpe);
+        for (size_t i = 0; i < ref.size(); i++) ref[i] = (uint8_t)((i >> 2) * 181 + i);
+        std::vector<uint8_t> tiled(65536, 0);
+        tile_surface(tiled.data(), ref.data(), ew, eh, M, 0, bpe);
+        auto at = [&](uint32_t x, uint32_t y) { return &ref[((size_t)y * ew + x) * bpe]; };
+        CHECK(std::memcmp(&tiled[4],      at(1, 0),  bpe) == 0, "64KB_Z_X 4B golden: element (1,0) at byte 4");
+        CHECK(std::memcmp(&tiled[8],      at(0, 1),  bpe) == 0, "64KB_Z_X 4B golden: element (0,1) at byte 8");
+        CHECK(std::memcmp(&tiled[256],    at(8, 0),  bpe) == 0, "64KB_Z_X 4B golden: element (8,0) at byte 256");
+        CHECK(std::memcmp(&tiled[4352],   at(0, 8),  bpe) == 0, "64KB_Z_X 4B golden: element (0,8) at byte 4352");
+        CHECK(std::memcmp(&tiled[8704],   at(16, 0), bpe) == 0, "64KB_Z_X 4B golden: element (16,0) at byte 8704");
+        CHECK(std::memcmp(&tiled[512],    at(0, 16), bpe) == 0, "64KB_Z_X 4B golden: element (0,16) at byte 512");
+        CHECK(std::memcmp(&tiled[2048],   at(32, 0), bpe) == 0, "64KB_Z_X 4B golden: element (32,0) at byte 2048");
+        CHECK(std::memcmp(&tiled[1024],   at(0, 32), bpe) == 0, "64KB_Z_X 4B golden: element (0,32) at byte 1024");
+        CHECK(std::memcmp(&tiled[33792],  at(64, 0), bpe) == 0, "64KB_Z_X 4B golden: element (64,0) at byte 33792");
+        CHECK(std::memcmp(&tiled[18432],  at(0, 64), bpe) == 0, "64KB_Z_X 4B golden: element (0,64) at byte 18432");
     }
 
     // Golden positions from the addrlib GFX10_SW_64K_S pattern (gfx10SwizzlePattern.h). At 8 bpe the

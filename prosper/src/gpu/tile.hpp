@@ -14,9 +14,17 @@
 namespace prosper::gpu {
 
 // AGC/GFX10 T# tile_mode values we recognize. 0 = linear (no swizzle). 5 = SW_4KB_S (the RGBA render
-// target). 9 = SW_64KB_S (standard 64KB, DOLL's material textures) and 27 = SW_64KB_R_X (render-target
-// 64KB with pipe XOR, DOLL's RT/post composites) — #288. Others fall through to a linear copy for now.
-enum class TileMode : uint32_t { Linear = 0, Sw4KbS = 5, Sw64KbS = 9, Sw64KbRX = 27 };
+// target). 9 = SW_64KB_S (standard 64KB, DOLL's material textures), 24 = SW_64KB_Z_X
+// (depth/texture 64KB with pipe XOR, Astro Bot compute surfaces), and 27 = SW_64KB_R_X
+// (render-target 64KB with pipe XOR, DOLL's RT/post composites) — #288/#825.
+// Others fall through to a linear copy for now.
+enum class TileMode : uint32_t {
+    Linear = 0,
+    Sw4KbS = 5,
+    Sw64KbS = 9,
+    Sw64KbZX = 24,
+    Sw64KbRX = 27,
+};
 
 // True if `tile_mode` denotes a swizzled layout that detile_surface will de-swizzle.
 bool tile_mode_is_tiled(uint32_t tile_mode);
@@ -57,13 +65,40 @@ void detile_elements(uint8_t* dst, const uint8_t* src, size_t src_bytes,
 // must read at least this many bytes of tiled source before detiling.
 size_t tiled_elements_bytes(uint32_t ew, uint32_t eh, uint32_t bpe, uint32_t tile_mode);
 
-// Byte offset of a non-tail mip level inside a GFX10 thin-2D tiled mip chain. GFX10 places the
-// shared mip-tail block first, then lays the remaining levels out from smallest to largest; mip 0
-// is therefore NOT at descriptor BASE_ADDRESS when MAX_MIP is non-zero. `ew`/`eh` are element-grid
-// dimensions (texels for plain formats, compressed blocks for BCn). Returns zero for linear,
-// single-level, invalid, or mip-tail levels (tail extraction needs an in-block coordinate).
+// One thin-2D mip's location in a GFX10 allocation. SW_MODE 0 follows AddrLib's reverse,
+// 256-byte-pitch-aligned linear chain. Tiled layouts place the shared mip-tail block first, then the
+// remaining levels from smallest to largest. Tail levels share the first 4/64 KiB block;
+// byte_offset is their independently addressable in-block origin, and tail_x/y are the equivalent
+// element coordinates from AddrLib. `ew`/`eh` are the allocation's level-zero element dimensions
+// (texels for plain formats, compressed blocks for BCn).
+struct TiledMipLevelLayout {
+    size_t byte_offset = 0;
+    uint32_t tail_x = 0, tail_y = 0;
+    uint32_t tail_block_bytes = 0;
+    bool in_tail = false;
+    bool supported = false;
+};
+TiledMipLevelLayout tiled_mip_level_layout(uint32_t ew, uint32_t eh, uint32_t bpe,
+                                           uint32_t tile_mode, uint32_t max_mip,
+                                           uint32_t mip_level);
+
+// Compatibility helper for callers interested only in non-tail placement. Tail levels intentionally
+// retain the historical zero result; use tiled_mip_level_layout when a packed-tail view is required.
 size_t tiled_mip_level_offset(uint32_t ew, uint32_t eh, uint32_t bpe, uint32_t tile_mode,
                               uint32_t max_mip, uint32_t mip_level);
+
+// Access one level packed inside a shared mip-tail block. `src`/`dst` name the allocation base and
+// `tail_x/y` are TiledMipLevelLayout's element coordinates. Unlike tile_surface, the write helper
+// preserves every byte outside this level so sibling mips in the same block are not destroyed.
+void detile_surface_level(uint8_t* dst, const uint8_t* src, size_t src_bytes,
+                          uint32_t width, uint32_t height, uint32_t tile_mode,
+                          uint32_t bytes_per_texel, uint32_t tail_x, uint32_t tail_y);
+void tile_surface_level(uint8_t* dst, size_t dst_bytes, const uint8_t* src,
+                        uint32_t width, uint32_t height, uint32_t tile_mode,
+                        uint32_t bytes_per_texel, uint32_t tail_x, uint32_t tail_y);
+void detile_elements_level(uint8_t* dst, const uint8_t* src, size_t src_bytes,
+                           uint32_t ew, uint32_t eh, uint32_t bpe, uint32_t tile_mode,
+                           uint32_t tail_x, uint32_t tail_y);
 
 // GFX10 volume layout. PS5's observed 3D surfaces use SW_64KB_R_X (mode 27), which AddrLib defines
 // as a thin/view-as-2D volume: each Z slice owns a padded grid of 2D 64KB blocks, but Z still

@@ -258,6 +258,35 @@ int main() {
           direct_v_uses[0].v4[1] == seed5v[1] && direct_v_uses[0].v4[2] == seed5v[2],
           "direct raw-MUBUF V# preserves base/stride/record dwords");
 
+    // Astro Bot's compact compute dispatcher s_loads output V#s from a table, then consumes them
+    // with buffer_store_dword/dwordx2/dwordx3. Stores need the same descriptor provenance as raw
+    // loads or the compute resource front-half never creates their writable storage-buffer binding.
+    static uint32_t store_output[16];
+    static uint32_t store_table[8];
+    const uint64_t store_output_base = (uint64_t)(uintptr_t)store_output;
+    store_table[4] = (uint32_t)store_output_base;
+    store_table[5] = (uint32_t)(store_output_base >> 32) & 0xFFFFu;
+    store_table[6] = 16u;
+    store_table[7] = 4u << 12;
+    const uint64_t store_table_base = (uint64_t)(uintptr_t)store_table;
+    const uint32_t k5vs[] = {
+        0xF4080504u, 0xFA000010u,   // s_load_dwordx4 s[20:23], s[8:9], 0x10
+        0xE0702000u, 0x80051100u,   // buffer_store_dword v17, v0, s[20:23], 0 idxen
+        0xBF810000u,
+    };
+    const uint32_t seed5vs[2] = {
+        (uint32_t)store_table_base, (uint32_t)(store_table_base >> 32),
+    };
+    std::vector<SrtUse> store_uses;
+    resolve_dynamic_fetch(k5vs, sizeof(k5vs) / sizeof(k5vs[0]), seed5vs, 2, 8,
+                          &store_uses);
+    CHECK(store_uses.size() == 1 && store_uses[0].kind == 1 &&
+          store_uses[0].key == 0x10 && store_uses[0].use_pc == 2,
+          "table-loaded V# resolves raw buffer_store_dword by SRT key");
+    CHECK(store_uses.size() == 1 && store_uses[0].v4[0] == store_table[4] &&
+          store_uses[0].v4[1] == store_table[5] && store_uses[0].v4[2] == 16u,
+          "raw buffer-store V# preserves the table-loaded descriptor dwords");
+
     // Kernel 5dr: once any T# SGPR is reloaded, the initial sharp is stale. An unresolved reload must
     // not silently resurrect it and fabricate a texture mapping for the later image operation.
     const uint32_t k5dr[] = {

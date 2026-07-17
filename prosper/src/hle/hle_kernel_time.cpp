@@ -338,19 +338,23 @@ HLE(k_debug_raise_release) {
     fflush(nullptr);
     _Exit(0x66);
 }
-#if defined(__APPLE__)
-HLE(k_getthreadid) {
-    uint64_t tid = 0;
-    return pthread_threadid_np(nullptr, &tid) == 0 ? tid : 0;
-} // scePthreadGetthreadid
-#elif defined(__linux__)
-HLE(k_getthreadid) { return (uint64_t)syscall(SYS_gettid); }   // scePthreadGetthreadid
-#else
-// The guest uses this as an ownership/current-thread identity, so a process-wide constant makes every
-// guest pthread appear to be the same thread. Windows thread IDs are stable for a live thread and unique
-// among concurrently running threads, matching the observable contract of Linux gettid here.
-HLE(k_getthreadid) { return (uint64_t)GetCurrentThreadId(); }
-#endif
+// Console pthread IDs are small, process-local identities, not native kernel TIDs.  Exposing Linux
+// gettid/GetCurrentThreadId happened to satisfy mutex ownership checks, but it also leaked a different
+// identity domain into guest code which stores the value in its TCB and uses it as a Havok context-map
+// key.  Allocate a monotonically increasing guest ID lazily on the host thread's first guest call.  HLE
+// handlers run with the host TLS base restored, so host thread_local storage is safe even while the
+// surrounding program uses a guest FS base.  IDs are deliberately never recycled during the process.
+namespace {
+std::atomic<uint32_t> g_next_guest_thread_id{1};
+
+uint32_t current_guest_thread_id() {
+    static thread_local const uint32_t id =
+        g_next_guest_thread_id.fetch_add(1, std::memory_order_relaxed);
+    return id;
+}
+} // namespace
+
+HLE(k_getthreadid) { return current_guest_thread_id(); } // scePthreadGetthreadid
 // sceKernelAprResolveFilepathsToIdsAndFileSizes — PS5 APR (async page read) IO path. Signature
 // unconfirmed; a garbage-out "success" poisons the engine's file table, so fail cleanly and let
 // the engine take its non-APR file path. CONFIDENCE: LOW on ABI, MED that failing is safer.

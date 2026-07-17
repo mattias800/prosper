@@ -52,7 +52,7 @@ namespace {
     // allocator handed out offsets past the pool, the guest's 512GB-arena block bitmap indexed
     // out of range, and user_malloc_init crashed on the bitmap read.
     constexpr uint64_t kDmemBase  = 0x10000000;
-    constexpr uint64_t kDmemTotal = 8ull * 1024 * 1024 * 1024;   // 8 GiB pool
+    constexpr uint64_t kDmemTotal = 16ull * 1024 * 1024 * 1024;  // PS5 unified-memory aperture
     // Direct ("physical") memory allocations, kept SORTED by start (first-fit allocation walks the
     // gaps). Also serves sceKernelDirectMemoryQuery.
     struct DMem { uint64_t start, end; int type; };
@@ -220,10 +220,47 @@ namespace {
         return hp;   // p == 0 -> PROT_NONE (no access), NOT read-write
     }
     uint64_t align_up(uint64_t v, uint64_t a) { return a ? (v + a - 1) & ~(a - 1) : v; }
+
+    // The console chooses automatic mappings from its guest user-VA space.  Letting mmap(nullptr)
+    // choose instead leaks a host VA (commonly 0x7f...) to the guest.  Besides being outside the PS5
+    // address model, Sony libc explicitly rejects such an address as mspace backing.  Search a quiet
+    // guest range atomically with MAP_FIXED_NOREPLACE; all HLE-created occupants are tracked, so a
+    // collision can skip directly past them instead of probing every 64 KiB page.
+    constexpr uint64_t kGuestAutoMapBase  = 0x2000000000ull;
+    constexpr uint64_t kGuestAutoMapLimit = 0x40000000000ull;
+    void* map_guest_auto(uint64_t len, int prot, uint64_t align) {
+        const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+        if (align < page) align = page;
+        if (!len || (align & (align - 1)) != 0 || len > kGuestAutoMapLimit - kGuestAutoMapBase)
+            return nullptr;
+        const uint64_t step = align > 0x10000 ? align : 0x10000;
+        uint64_t cand = align_up(kGuestAutoMapBase, align);
+        while (cand <= kGuestAutoMapLimit - len) {
+            void* p = prosper_mmap_noreplace((void*)cand, len, prot,
+                                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (p != MAP_FAILED) return p;
+
+            uint64_t next = cand + step;
+            {
+                std::lock_guard<std::mutex> lk(g_mx);
+                const uint64_t end = cand + len;
+                for (const auto& m : g_maps) {
+                    const uint64_t me = m.base + m.size;
+                    if (m.base < end && me > cand) {
+                        const uint64_t past = align_up(me, align);
+                        if (past > next) next = past;
+                    }
+                }
+            }
+            if (next <= cand) return nullptr;
+            cand = next;
+        }
+        return nullptr;
+    }
+
     void* map_at(uint64_t hint, uint64_t len, int prot) {
         if (!hint) {
-            void* p = mmap(nullptr, len, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            return p == MAP_FAILED ? nullptr : p;
+            return map_guest_auto(len, prot, 0x4000);
         }
         // Non-zero hint: claim it WITHOUT clobbering (#137). MAP_FIXED_NOREPLACE fails if anything
         // is already there; only if the occupant is entirely our own uncommitted reservation do we
@@ -273,23 +310,14 @@ namespace {
     // Reserve an anonymous span whose returned base satisfies `align`. Linux mmap only promises
     // host-page alignment, while Orbis direct-memory callers can require larger alignment.
     void* reserve_aligned(uint64_t len, uint64_t align) {
-        const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
-        if (align < page) align = page;
-        if ((align & (align - 1)) != 0 || len > UINT64_MAX - align) return nullptr;
-        void* raw = mmap(nullptr, len + align, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (raw == MAP_FAILED) return nullptr;
-        uint64_t raw_base = (uint64_t)raw;
-        uint64_t base = align_up(raw_base, align);
-        if (base > raw_base) munmap(raw, base - raw_base);
-        uint64_t used_end = base + len, raw_end = raw_base + len + align;
-        if (raw_end > used_end) munmap((void*)used_end, raw_end - used_end);
-        return (void*)base;
+        return map_guest_auto(len, PROT_NONE, align);
     }
 
     // Map `len` bytes of the phys pool at `hint` (0 = anywhere). Falls back to anonymous memory
     // if the memfd is unavailable (still boots; loses aliasing). A zero-hint mapping honors the
     // caller's requested VA alignment; the old host-page-aligned mmap violated that ABI contract.
-    void* map_phys_at(uint64_t hint, uint64_t len, int prot, uint64_t phys, uint64_t align = 0) {
+    void* map_phys_at(uint64_t hint, uint64_t len, int prot, uint64_t phys, uint64_t align = 0,
+                      bool fixed = true) {
         int fd = dmem_fd();
         if (fd >= 0 && phys < kDmemBase + kDmemTotal) {
             if (!hint) {
@@ -299,21 +327,37 @@ namespace {
                     if (p != MAP_FAILED) return p;
                     munmap(reserved, len);
                 }
-            } else {
+            } else if (range_is_free_reservation(hint, len)) {
+                // A prior sceKernelReserveVirtualRange owns this exact span. Replacing that
+                // PROT_NONE placeholder is safe even when MAP_FIXED was not requested.
+                void* p = mmap((void*)hint, len, prot, MAP_SHARED | MAP_FIXED, fd, (off_t)phys);
+                if (p != MAP_FAILED) return p;
+            } else if (fixed) {
                 // Same no-clobber discipline as map_at (#137): NOREPLACE first, MAP_FIXED replace
                 // only over our own uncommitted reservation, else refuse rather than destroy a live
                 // (committed / untracked) mapping — the exact clobber class of issues #88 / #107.
                 void* p = prosper_mmap_noreplace((void*)hint, len, prot, MAP_SHARED, fd, (off_t)phys);
                 if (p != MAP_FAILED) return p;
-                if (range_is_free_reservation(hint, len)) {
-                    p = mmap((void*)hint, len, prot, MAP_SHARED | MAP_FIXED, fd, (off_t)phys);
+                return nullptr;
+            } else {
+                // Without SCE_KERNEL_MAP_FIXED the input address is a search hint, not a demand
+                // to replace that VA. Try the hint atomically, then relocate within the *guest* VA
+                // range. Plain mmap(hint) may silently return a 0x7f... host address when the hint is
+                // occupied; Sony libc rejects such a pointer as mspace backing.
+                void* p = prosper_mmap_noreplace((void*)hint, len, prot, MAP_SHARED, fd,
+                                                  (off_t)phys);
+                if (p != MAP_FAILED &&
+                    (!align || (((uint64_t)p & (align - 1)) == 0))) return p;
+                if (p != MAP_FAILED) munmap(p, len);
+                void* reserved = reserve_aligned(len, align ? align : 0x4000);
+                if (reserved) {
+                    p = mmap(reserved, len, prot, MAP_SHARED | MAP_FIXED, fd, (off_t)phys);
                     if (p != MAP_FAILED) return p;
-                } else {
-                    return nullptr;
+                    munmap(reserved, len);
                 }
             }
         }
-        if (hint) return map_at(hint, len, prot);
+        if (hint && fixed) return map_at(hint, len, prot);
         void* reserved = reserve_aligned(len, align ? align : 0x4000);
         if (!reserved) return nullptr;
         void* p = mmap(reserved, len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
@@ -401,14 +445,9 @@ HLE(k_reserve_vrange) {
         MLOG("reserve search from 0x%llx FAILED (no free range)\n", (unsigned long long)hint);
         return 0x8002000cull;   // SCE_KERNEL_ERROR_ENOMEM
     }
-    // Over-map by `align`, then trim the head/tail slack to yield an aligned span.
-    uint64_t total = a1 + align;
-    void* raw = mmap(nullptr, total, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (raw == MAP_FAILED) { MLOG("reserve len=0x%llx FAILED\n", (unsigned long long)a1); return 0x8002000cull; } // ENOMEM
-    uint64_t base = align_up((uint64_t)raw, align);
-    if (base > (uint64_t)raw) munmap(raw, base - (uint64_t)raw);
-    uint64_t used_end = base + a1, raw_end = (uint64_t)raw + total;
-    if (raw_end > used_end) munmap((void*)used_end, raw_end - used_end);
+    void* raw = map_guest_auto(a1, PROT_NONE, align);
+    if (!raw) { MLOG("reserve len=0x%llx FAILED\n", (unsigned long long)a1); return 0x8002000cull; } // ENOMEM
+    uint64_t base = (uint64_t)raw;
     if (a0) *(uint64_t*)a0 = base;
     track(base, a1, 0, false, "reserved");
     MLOG("reserve -> 0x%llx len=0x%llx align=0x%llx (raw 0x%llx)\n",
@@ -448,13 +487,16 @@ HLE(k_alloc_dmem) {   // (searchStart, searchEnd, len, alignment, memoryType, ph
     // Honor the [searchStart, searchEnd) window (a0/a1) — dropping it handed the guest an offset
     // outside the window it asked for.
     if (!dmem_take(sz, align, (int)a4, off, a0, a1 ? a1 : ~0ull)) {
-        MLOG("alloc_dmem len=0x%llx in [0x%llx,0x%llx) -> ENOMEM\n",
-             (unsigned long long)a2, (unsigned long long)a0, (unsigned long long)a1);
+        MLOG("alloc_dmem len=0x%llx align=0x%llx type=0x%llx in [0x%llx,0x%llx) -> ENOMEM\n",
+             (unsigned long long)a2, (unsigned long long)a3, (unsigned long long)a4,
+             (unsigned long long)a0, (unsigned long long)a1);
         return 0x8002000Cull;   // SCE_KERNEL_ERROR_ENOMEM
     }
     dmem_zero(off, sz);                       // fresh allocation -> zeroed pages (console semantics)
     if (a5 > 0xffff) *(uint64_t*)a5 = off;   // only write through a plausible out-pointer
-    MLOG("alloc_dmem len=0x%llx -> phys=0x%llx\n", (unsigned long long)a2, (unsigned long long)off);
+    MLOG("alloc_dmem range=[0x%llx,0x%llx) len=0x%llx align=0x%llx type=0x%llx -> phys=0x%llx\n",
+         (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
+         (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)off);
     return 0;
 }
 
@@ -501,13 +543,17 @@ HLE(k_direct_memory_query) {
 // sceKernelMapDirectMemory(void** addrInOut, size_t len, int prot, int flags, off_t phys, size_t align)
 HLE(k_map_dmem) {
     uint64_t hint = a0 ? *(uint64_t*)a0 : 0;
-    void* p = map_phys_at(hint, a1, host_prot(a2), a4, a5);
-    if (!p) { MLOG("map_dmem hint=0x%llx len=0x%llx FAILED\n", (unsigned long long)hint, (unsigned long long)a1); return 0x8002000cull; } // ENOMEM
+    const bool fixed = (a3 & 0x10) != 0;
+    void* p = map_phys_at(hint, a1, host_prot(a2), a4, a5, fixed);
+    if (!p) { MLOG("map_dmem hint=0x%llx len=0x%llx flags=0x%llx phys=0x%llx align=0x%llx FAILED\n",
+                   (unsigned long long)hint, (unsigned long long)a1,
+                   (unsigned long long)a3, (unsigned long long)a4,
+                   (unsigned long long)a5); return 0x8002000cull; } // ENOMEM
     if (a0) *(uint64_t*)a0 = (uint64_t)p;
     track((uint64_t)p, a1, host_prot(a2), true, "direct");
-    MLOG("map_dmem -> 0x%llx len=0x%llx phys=0x%llx prot=0x%llx align=0x%llx\n",
+    MLOG("map_dmem -> 0x%llx len=0x%llx phys=0x%llx prot=0x%llx flags=0x%llx align=0x%llx\n",
          (unsigned long long)p, (unsigned long long)a1, (unsigned long long)a4,
-         (unsigned long long)a2, (unsigned long long)a5);
+         (unsigned long long)a2, (unsigned long long)a3, (unsigned long long)a5);
     return 0;
 }
 
@@ -644,7 +690,7 @@ HLE(k_mprotect) { if (a0) { mprotect((void*)a0, a1, host_prot(a2)); retrack_prot
 // as the batch-map TYPE_PROTECT op. We don't track memoryType yet, so apply the protection (the load-
 // bearing half). NOTE prot is arg a3 here, not a2.
 HLE(k_mtypeprotect) { if (a0) { mprotect((void*)a0, a1, host_prot(a3)); retrack_prot(a0, a1, host_prot(a3), "mtypeprotect"); } return 0; }
-HLE(k_dmem_size){ return kDmemTotal; }   // 8 GiB pool (allocation failures enforce this bound)
+HLE(k_dmem_size){ return kDmemTotal; }   // sparse-backed; allocation failures enforce this bound
 // sceKernelAvailableDirectMemorySize(searchStart, searchEnd, alignment, off_t* physAddrOut,
 // size_t* sizeOut) — report the LARGEST free aligned direct-memory block in [searchStart, searchEnd).
 // Signature per shadPS4 memory.cpp:120 (NID C0f7TJcbfac, PS4-inherited). Was aliased to
@@ -1195,7 +1241,7 @@ namespace {
     std::vector<Mapping> g_maps;
     bool sparse_dmem_view_overlaps(uint64_t begin, uint64_t end);
     constexpr uint64_t kDmemBase  = 0x10000000;
-    constexpr uint64_t kDmemTotal = 8ull * 1024 * 1024 * 1024;   // 8 GiB pool
+    constexpr uint64_t kDmemTotal = 16ull * 1024 * 1024 * 1024;  // PS5 unified-memory aperture
     struct DMem { uint64_t start, end; int type; };
     std::mutex g_dmx;
     std::vector<DMem> g_dmem;
@@ -1323,7 +1369,7 @@ namespace {
     constexpr uint64_t kWinAllocationGranularity = 0x10000;
 
     // One sparse paging-file section is the Windows equivalent of the POSIX direct-memory memfd.
-    // SEC_RESERVE avoids charging 8 GiB of host commit up front; each view commits only its guest span.
+    // SEC_RESERVE avoids charging 16 GiB of host commit up front; each view commits only its guest span.
     HANDLE dmem_section() {
         static HANDLE section = [] {
             HANDLE h = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr,
@@ -1959,7 +2005,12 @@ HLE(k_avail_dmem) {
     *(uint64_t*)(uintptr_t)a4 = size;
     return 0;
 }
-HLE(k_release_dmem) { dmem_release(a0, a1); return 0; }
+HLE(k_release_dmem) {
+    MLOG("release_dmem phys=0x%llx len=0x%llx\n",
+         (unsigned long long)a0, (unsigned long long)a1);
+    dmem_release(a0, a1);
+    return 0;
+}
 
 // sceKernelBatchMap(entries, num, int* numOut) — entry 0x20 bytes: start@0, phys@8, len@0x10,
 // prot@0x18(char), type@0x19, op@0x1c. Ops: 0=MAP_DIRECT 1=UNMAP 2=PROTECT 3=MAP_FLEXIBLE 4=TYPE_PROTECT.

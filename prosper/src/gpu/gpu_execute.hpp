@@ -40,6 +40,7 @@ struct ShaderResourceTable;   // fwd (shader_resources.hpp); passed to the backe
 // correctly instead of collapsing onto a single draw. The tables may be null (color-only shaders).
 struct DrawItem {
     std::vector<uint32_t> vs, fs;                     // recompiled SPIR-V
+    uint64_t vs_guest_addr = 0, fs_guest_addr = 0;    // diagnostic/source identity in guest VA space
     // Process-unique identities supplied by the exact shader-recompile cache. Zero means the
     // shader came from an external/replay path, so persistent backend caches must compare words.
     uint64_t vs_identity = 0, fs_identity = 0;
@@ -120,6 +121,9 @@ struct SrtUse {
     // STORAGE image, not a sampled texture (#590 — the recompiler's storage path requires
     // ResourceClass::StorageImage). Only meaningful for kind 0.
     bool is_store = false;
+    // The consuming MIMG opcode is a comparison/depth sample (IMAGE_SAMPLE_C*). This is a
+    // property of the use, not merely the S# compare function: NEVER is a valid compare op.
+    bool is_depth_compare = false;
 };
 std::vector<DynFetch> resolve_dynamic_fetch(const uint32_t* code, size_t dwords,
                                             const uint32_t* user_sgprs, uint32_t nsgpr,
@@ -478,7 +482,9 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
     // the textures it SAMPLES. If a sampled texture's base equals some draw's color0_base, that surface is
     // a GPU render target (the game renders into it then samples it) -> render-to-texture (#83/#101).
     if (getenv("PROSPER_RTLOG")) {
-        fprintf(stderr, "[rt] color0=0x%llx", (unsigned long long)rs.color0_base);
+        fprintf(stderr, "[rt] color0=0x%llx %ux%u cf=0x%x nt=%u cs=%u",
+                (unsigned long long)rs.color0_base, rs.color0_width, rs.color0_height,
+                rs.color0_format, rs.color0_number_type, rs.color0_comp_swap);
         if (prt) for (const auto& r : prt->resources)
             if (r.cls == ResourceClass::Texture)
                 fprintf(stderr, " tex=0x%llx(%ux%u f%u c%u)", (unsigned long long)r.gpu_addr, r.width, r.height,
@@ -573,6 +579,28 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                 g_dyntrace_force = false;
             }
         }
+        if (getenv("PROSPER_DBG"))
+            fprintf(stderr, "[exec-recompile-reject] es=0x%llx ps=0x%llx vs=%zu fs=%zu order=%llu\n",
+                    (unsigned long long)rs.es_addr, (unsigned long long)rs.ps_addr,
+                    vs.size(), fs.size(),
+                    (unsigned long long)(draw ? draw->command_order : 0));
+        if (const char* dd = getenv("PROSPER_SHADER_DUMP")) {
+            for (auto [tag, addr] : {std::pair{"vs", rs.es_addr}, std::pair{"ps", rs.ps_addr}}) {
+                if (!addr || !guest_readable(addr, sizeof(uint32_t))) continue;
+                const size_t dump_dwords = rdna2_recompile_code_span(
+                    reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(addr)),
+                    max_shader_dwords);
+                const size_t dump_bytes = dump_dwords * sizeof(uint32_t);
+                if (!dump_bytes || !guest_readable(addr, static_cast<uint32_t>(dump_bytes))) continue;
+                char fn[512];
+                snprintf(fn, sizeof fn, "%s/exec_%s_%llx.bin", dd, tag,
+                         (unsigned long long)addr);
+                if (FILE* f = fopen(fn, "wb")) {
+                    fwrite((const void*)(uintptr_t)addr, 1, dump_bytes, f);
+                    fclose(f);
+                }
+            }
+        }
         if (log) {
             fprintf(stderr, "[exec] skip draw: recompile failed (vs=%zu fs=%zu; order=%llu "
                             "es=0x%llx ps=0x%llx color0=0x%llx/%ux%u "
@@ -594,12 +622,6 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
                 fprintf(stderr, "[exec]   %s coverage: total=%u alu=%u exp=%u tabledep=%u unsupported=%u "
                                 "first_bad fmt=%d op=0x%x\n", tag, c.total, c.alu, c.exports,
                         c.table_dependent, c.unsupported, c.first_bad_fmt, c.first_bad_op);
-                if (const char* dd = getenv("PROSPER_SHADER_DUMP")) {
-                    // 64 KB: a large UE4 post-process PS (~1500 instrs) far exceeds the old 4 KB
-                    // window, which truncated the very control-flow tail the reject is about (#319).
-                    char fn[512]; snprintf(fn, sizeof fn, "%s/exec_%s_%llx.bin", dd, tag, (unsigned long long)addr);
-                    if (FILE* f = fopen(fn, "wb")) { fwrite((const void*)(uintptr_t)addr, 1, 0x10000, f); fclose(f); }
-                }
             }
         }
         return false;
@@ -843,6 +865,7 @@ inline bool realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, ui
         }
     }
     out.vs = std::move(vs); out.fs = std::move(fs);
+    out.vs_guest_addr = rs.es_addr; out.fs_guest_addr = rs.ps_addr;
     out.vs_identity = vs_identity; out.fs_identity = fs_identity; out.ps = ps;
     out.vrt = std::move(vrt); out.prt = std::move(prt); out.vertex_count = vertex_count;
     out.color0_base = rs.color0_base;   // render-to-texture: the target this draw writes into (#167)

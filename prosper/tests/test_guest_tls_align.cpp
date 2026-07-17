@@ -1,11 +1,11 @@
 // test_guest_tls_align — the x86-64 Variant II static-TLS layout must round each module's offset to
 // its REAL PT_TLS p_align (#143), not a hardcoded 16. Otherwise a module with p_align > 16 gets its
 // block at the wrong distance below the thread pointer and every initial-exec %fs:-N access resolves
-// off. Drives guest_tls_set_templates (which computes the layout regardless of the PROSPER_GUEST_FS
-// gate) and reads back the per-module offsets. Linux-only (the layout code is __linux__).
+// off. Drives guest_tls_set_templates and reads back the per-module offsets. Linux-only.
 #include "../src/hle/dispatch.hpp"
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 using namespace prosper;
@@ -18,6 +18,9 @@ static uint64_t align_up(uint64_t v, uint64_t a) { return (v + a - 1) & ~(a - 1)
 
 int main() {
     printf("== test_guest_tls_align ==\n");
+#if defined(__linux__)
+    unsetenv("PROSPER_NO_GUEST_FS");
+#endif
 
     // descs[0] is the reserved slot (module id 0 = "no TLS"); real modules start at index 1.
     // Module 1: memsz 0x30, p_align 64 (aligned TLS vars — the case the old 16-hardcode broke).
@@ -28,6 +31,9 @@ int main() {
         { 0, 0, /*memsz*/0x10, /*align*/16 },
     };
     guest_tls_set_templates(descs.data(), descs.size());
+#if defined(__linux__)
+    CHECK(guest_tls_enabled(), "guest initial-exec TLS is enabled by default on Linux");
+#endif
 
     // Variant II: off[i] = round_up(off[i-1] + memsz[i], align[i]); block start = TP - off[i].
     uint64_t exp1 = align_up(0 + 0x30, 64);          // = 0x40 (rounded to 64, NOT 0x30)

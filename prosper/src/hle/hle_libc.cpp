@@ -506,6 +506,8 @@ void register_builtin_hle() {
     register_file_hle();     // file I/O (stdio + POSIX, /app0 translation)
     register_service_hle();  // PS5 system services (user/NP/mouse/appcontent/dialog)
     register_http_hle();     // libSceHttp local URI parsing
+    register_font_hle();     // libSceFont opaque handles + deterministic text/metric fallback
+    register_fiber_hle();    // libSceFiber cooperative guest-stack execution
     register_pad_hle();      // libScePad: real game-controller input (input/pad.cpp)
     register_audio_hle();    // libSceAudioOut backed by a headless/pluggable AudioSink
     register_graphics_hle(); // headless libSceAgc/libSceVideoOut placeholders (bring-up)

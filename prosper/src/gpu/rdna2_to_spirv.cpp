@@ -34,15 +34,20 @@ enum : uint32_t {
     Op_ULessThanEqual=178, Op_SLessThanEqual=179,
     Op_ShiftRightLogical=194, Op_ShiftRightArithmetic=195, Op_ShiftLeftLogical=196, Op_BitwiseOr=197,
     Op_BitwiseXor=198, Op_BitwiseAnd=199, Op_Not=200, Op_BitFieldSExtract=202, Op_BitFieldUExtract=203,
-    Op_BitReverse=204, Op_UConvert=113,
+    Op_BitReverse=204, Op_BitCount=205, Op_UConvert=113,
     Op_TypeImage=25, Op_TypeSampledImage=27, Op_SampledImage=86,
-    Op_ImageSampleImplicitLod=87, Op_ImageSampleExplicitLod=88, Op_ImageFetch=95, Op_ImageGather=96, Op_Image=100,
+    Op_ImageSampleImplicitLod=87, Op_ImageSampleExplicitLod=88,
+    Op_ImageSampleDrefImplicitLod=89, Op_ImageSampleDrefExplicitLod=90,
+    Op_ImageFetch=95, Op_ImageGather=96, Op_Image=100,
     Op_ImageRead=98, Op_ImageWrite=99, Op_ImageQuerySizeLod=103, Op_ImageQueryLevels=106,
-    Op_TypeArray=28, Op_ControlBarrier=224, Op_AtomicIAdd=234, Op_AtomicUMin=237, Op_AtomicUMax=239,
+    Op_TypeArray=28, Op_ControlBarrier=224, Op_AtomicExchange=229, Op_AtomicIAdd=234,
+    Op_AtomicISub=235,
+    Op_AtomicUMin=237, Op_AtomicUMax=239,
     Op_DPdx=207, Op_DPdy=208,   // screen-space derivatives (Fragment; plain Shader capability)
     Op_Phi=245, Op_LoopMerge=246,
     Op_SelectionMerge=247, Op_Label=248, Op_Branch=249, Op_BranchConditional=250, Op_Switch=251,
     Op_Kill=252, Op_Return=253, Op_GroupNonUniformAny=335,
+    Op_GroupNonUniformQuadSwap=366,
 };
 // GLSL.std.450 extended-instruction numbers.
 enum : uint32_t { Glsl_FAbs=4, Glsl_RoundEven=2, Glsl_Trunc=3, Glsl_Floor=8, Glsl_Ceil=9, Glsl_Fract=10, Glsl_Sin=13, Glsl_Cos=14,
@@ -51,6 +56,7 @@ enum : uint32_t { Glsl_FAbs=4, Glsl_RoundEven=2, Glsl_Trunc=3, Glsl_Floor=8, Gls
                   Glsl_UMax=41, Glsl_SMax=42, Glsl_PackHalf2x16=58, Glsl_UnpackHalf2x16=62 };
 enum : uint32_t {
     Cap_Shader=1, Cap_Int64=11, Cap_GroupNonUniform=61, Cap_GroupNonUniformVote=62,
+    Cap_GroupNonUniformQuad=68,
     Addr_Logical=0, Mem_GLSL450=1, Exec_Vertex=0, Exec_Fragment=4, Exec_GLCompute=5,
     EM_OriginUpperLeft=7, EM_LocalSize=17,
     SC_Input=1, SC_UniformConstant=0, SC_Output=3, SC_Function=7, SC_StorageBuffer=12, FC_None=0,
@@ -65,11 +71,12 @@ enum : uint32_t {
     Img_Sampled_Storage=2,   // OpTypeImage "Sampled" operand: 2 = used WITHOUT a sampler (read/write storage image)
     ImgFmt_Unknown=0,        // OpTypeImage "Image Format": Unknown (runtime view format; needs the caps above)
     ImgOp_Bias=1, ImgOp_Lod=2, ImgOp_Sample=0x40,   // ImageOperands bits: LOD bias / explicit LOD / MSAA Sample index.
-    SC_Workgroup=4, Scope_Workgroup=2, Scope_Subgroup=3, MemSem_WGAcqRel=0x108,   // LDS: Workgroup storage + barrier scope/semantics
+    SC_Workgroup=4, Scope_Device=1, Scope_Workgroup=2, Scope_Subgroup=3,
+    MemSem_UniformAcqRel=0x48, MemSem_WGAcqRel=0x108,   // storage/LDS AcquireRelease memory semantics
     Dec_Block=2, Dec_ArrayStride=6, Dec_BuiltIn=11, Dec_Flat=14, Dec_Location=30, Dec_Binding=33,
     Dec_DescriptorSet=34, Dec_Offset=35,
     BI_Position=0, BI_FragCoord=15, BI_WorkgroupId=26, BI_LocalInvocationId=27,
-    BI_GlobalInvocationId=28, BI_VertexIndex=42,
+    BI_GlobalInvocationId=28, BI_VertexIndex=42, BI_InstanceIndex=43,
 };
 
 uint32_t fbits(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
@@ -206,6 +213,18 @@ struct SpirvCompute {
     uint32_t subgroup_any(uint32_t value) {
         uint32_t result = id();
         put(code, Op_GroupNonUniformAny, {t_bool, result, uconst(Scope_Subgroup), value});
+        return result;
+    }
+    bool declared_subgroup_quad = false;
+    uint32_t subgroup_quad_swap(uint32_t value, uint32_t direction) {
+        if (!declared_subgroup_quad) {
+            put(caps, Op_Capability, {Cap_GroupNonUniform});
+            put(caps, Op_Capability, {Cap_GroupNonUniformQuad});
+            declared_subgroup_quad = true;
+        }
+        uint32_t result = id();
+        put(code, Op_GroupNonUniformQuadSwap,
+            {t_u32, result, uconst(Scope_Subgroup), value, uconst(direction)});
         return result;
     }
     // Fragment discard: OpKill any lane where `alive` is false, survivors fall through to `mergeL`. Used to
@@ -379,21 +398,25 @@ struct SpirvCompute {
     uint32_t t_v3f() { if (!t_v3f_cache) { t_v3f_cache = id(); put(types, Op_TypeVector, {t_v3f_cache, t_f32, 3}); } return t_v3f_cache; }
     uint32_t t_v3i_cache = 0;
     uint32_t t_v3i() { if (!t_v3i_cache) { t_v3i_cache = id(); put(types, Op_TypeVector, {t_v3i_cache, t_i32, 3}); } return t_v3i_cache; }
-    static uint32_t sampled_image_key(uint32_t dim, bool is_uint) {
-        return dim | (is_uint ? 0x100u : 0u);
+    static uint32_t sampled_image_key(uint32_t dim, bool is_uint, bool arrayed, bool depth) {
+        return dim | (is_uint ? 0x100u : 0u) | (arrayed ? 0x200u : 0u) |
+               (depth ? 0x400u : 0u);
     }
-    uint32_t sampled_image_type(uint32_t dim, bool is_uint = false) {
-        const uint32_t key = sampled_image_key(dim, is_uint);
+    uint32_t sampled_image_type(uint32_t dim, bool is_uint = false,
+                                bool arrayed = false, bool depth = false) {
+        const uint32_t key = sampled_image_key(dim, is_uint, arrayed, depth);
         auto it = tex_simg_type.find(key); if (it != tex_simg_type.end()) return it->second;
         uint32_t ti = id(); put(types, Op_TypeImage, {ti, is_uint ? t_u32 : t_f32,
-                                                      dim, 0, 0, 0, 1, 0});  // sampled, Sampled=1
+                                                      dim, depth ? 1u : 0u, arrayed ? 1u : 0u,
+                                                      0, 1, 0});  // sampled, Sampled=1
         uint32_t si = id(); put(types, Op_TypeSampledImage, {si, ti});
         tex_simg_type[key] = si; tex_img_type[key] = ti; return si;
     }
     // Declare (idempotently) a combined image+sampler of SPIR-V `dim` at descriptor-set 0, `binding`.
-    void declare_texture(uint32_t binding, uint32_t dim = Dim_2D, bool is_uint = false) {
-        const uint32_t key = sampled_image_key(dim, is_uint);
-        uint32_t simg = sampled_image_type(dim, is_uint);
+    void declare_texture(uint32_t binding, uint32_t dim = Dim_2D, bool is_uint = false,
+                         bool arrayed = false, bool depth = false) {
+        const uint32_t key = sampled_image_key(dim, is_uint, arrayed, depth);
+        uint32_t simg = sampled_image_type(dim, is_uint, arrayed, depth);
         if (tex_var.count(binding)) return;
         uint32_t t_ptr = id(); put(types, Op_TypePointer, {t_ptr, SC_UniformConstant, simg});
         uint32_t v = id();     put(types, Op_Variable,    {t_ptr, v, SC_UniformConstant});
@@ -453,6 +476,21 @@ struct SpirvCompute {
         uint32_t coord = id(); put(code, Op_CompositeConstruct, {t_v3f(), coord, bcf(u_bits), bcf(v_bits), bcf(w_bits)});
         uint32_t res   = id(); put(code, Op_ImageSampleExplicitLod, {texture_vec4(binding), res, si, coord, ImgOp_Lod, bcf(lod_bits)});
         unpack_texture_result(binding, res, out);
+    }
+    // IMAGE_SAMPLE_C_LZ on a 2D array: compare the sampled depth against DREF at
+    // explicit LOD zero. Array coordinates are (u,v,layer); the comparison result is
+    // scalar and RDNA writes that value for the requested dmask component.
+    void image_sample_dref_lz_2d_array(uint32_t binding, uint32_t u_bits, uint32_t v_bits,
+                                       uint32_t layer_bits, uint32_t dref_bits, uint32_t out[4]) {
+        uint32_t si = id(); put(code, Op_Load, {tex_binding_simg[binding], si, tex_var[binding]});
+        uint32_t coord = id();
+        put(code, Op_CompositeConstruct,
+            {t_v3f(), coord, bcf(u_bits), bcf(v_bits), bcf(layer_bits)});
+        uint32_t result = id();
+        put(code, Op_ImageSampleDrefExplicitLod,
+            {t_f32, result, si, coord, bcf(dref_bits), ImgOp_Lod, fconstf(0.0f)});
+        const uint32_t bits = bcu(result);
+        out[0] = out[1] = out[2] = out[3] = bits;
     }
     // image_sample_b 2D: implicit-LOD sample with an LOD BIAS (bias_bits float). Bias only means
     // anything with implicit LOD (fragment derivatives); outside the fragment stage the op resolves
@@ -706,6 +744,31 @@ struct SpirvCompute {
         put(code, Op_Branch, {merge});
         put(code, Op_Label, {merge}); cur_block = merge;
     }
+    // Returning atomic RMW on a descriptor-backed storage buffer. BUFFER_ATOMIC_* writes memory and
+    // returns the pre-operation value in VDATA. Inactive EXEC lanes neither access the buffer nor
+    // clobber VDATA, hence the predicated path joins the old destination through OpPhi.
+    uint32_t cbuf_atomic_rtn(uint32_t op, uint32_t idx, uint32_t value, uint32_t binding,
+                             bool predicated, uint32_t pred, uint32_t fallback) {
+        const uint32_t buf = buf_for_binding(binding);
+        auto emit = [&]() {
+            uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_sb_u32, p, buf, uconst(0), idx});
+            uint32_t result = id();
+            put(code, op, {t_u32, result, p, uconst(Scope_Device),
+                           uconst(MemSem_UniformAcqRel), value});
+            return result;
+        };
+        if (!predicated) return emit();
+        const uint32_t entry = cur_block;
+        uint32_t then = id(), merge = id();
+        put(code, Op_SelectionMerge, {merge, 0});
+        put(code, Op_BranchConditional, {pred, then, merge});
+        put(code, Op_Label, {then}); cur_block = then;
+        const uint32_t result = emit();
+        const uint32_t then_end = cur_block;
+        put(code, Op_Branch, {merge});
+        put(code, Op_Label, {merge}); cur_block = merge;
+        return emit_phi_2way(t_u32, result, then_end, fallback, entry);
+    }
     // LDS (Local Data Share) — a workgroup-shared u32 array for compute ds_read/ds_write. Declared on
     // first use, sized to `lds_dwords`. RDNA2's per-workgroup LDS MAX is 64 KB (16384 dwords); the real
     // per-shader allocation is COMPUTE_PGM_RSRC2.LDS_SIZE. `lds_dwords` defaults to 4096 (16 KB) — a
@@ -808,15 +871,14 @@ struct SpirvCompute {
         put(code, Op_Store, {p, value});
     }
 
-    // --- Wave model (cross-lane ops via a workgroup-as-wave + LDS). The compute shell dispatches one
-    // 64-invocation workgroup per wave; gl_LocalInvocationID.x is the lane. A dedicated LDS scratch array
-    // (separate from ds_read/write's lds_var) holds each lane's contribution so cross-lane reductions work.
+    // --- Wave model (cross-lane ops via workgroup scratch). A dedicated LDS scratch array (separate
+    // from ds_read/write's lds_var) holds each lane's contribution so cross-lane reductions work.
     // Inactive lanes still EXECUTE (exec is a per-lane predication bool), so all 64 reach the barriers —
     // valid only at wave-uniform points (the caller must not emit these inside divergent control flow). ---
     uint32_t v_localid = 0, localid = 0, lds_wave = 0, t_ptr_wg_u32b = 0;
     void declare_wave_lds() {
         if (lds_wave) return;
-        uint32_t t_arr = id();  put(types, Op_TypeArray, {t_arr, t_u32, uconst(64)});
+        uint32_t t_arr = id();  put(types, Op_TypeArray, {t_arr, t_u32, uconst(std::max(1u, local_count))});
         uint32_t t_ptr = id();  put(types, Op_TypePointer, {t_ptr, SC_Workgroup, t_arr});
         lds_wave = id();        put(types, Op_Variable, {t_ptr, lds_wave, SC_Workgroup});
         t_ptr_wg_u32b = id();   put(types, Op_TypePointer, {t_ptr_wg_u32b, SC_Workgroup, t_u32});
@@ -828,17 +890,70 @@ struct SpirvCompute {
     uint32_t mbcnt(uint32_t active_bool, uint32_t acc_bits, bool lo) {
         declare_wave_lds();
         uint32_t bit = sel(active_bool, uconst(1), uconst(0));
-        { uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_wg_u32b, p, lds_wave, localid}); put(code, Op_Store, {p, bit}); }
+        { uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_wg_u32b, p, lds_wave, linear_localid}); put(code, Op_Store, {p, bit}); }
         barrier();
+        const uint32_t lane = ibin(Op_BitwiseAnd, linear_localid, uconst(wave_size - 1));
+        const uint32_t wave_index = ibin(Op_ShiftRightLogical, linear_localid,
+                                          uconst(wave_size == 32 ? 5u : 6u));
         uint32_t sum = uconst(0);
-        for (uint32_t i = (lo ? 0u : 32u); i < (lo ? 32u : 64u); i++) {
-            uint32_t cond = ucmp(Op_ULessThan, uconst(i), localid);        // i < lane
+        const uint32_t first = lo ? 0u : 32u;
+        const uint32_t last = std::min(wave_size, lo ? 32u : 64u);
+        for (uint32_t i = 0; i < local_count; i++) {
+            const uint32_t candidate_lane = i % wave_size;
+            if (candidate_lane < first || candidate_lane >= last) continue;
+            uint32_t cond = land(ucmp(Op_IEqual, wave_index, uconst(i / wave_size)),
+                                 ucmp(Op_ULessThan, uconst(candidate_lane), lane));
             uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_wg_u32b, p, lds_wave, uconst(i)});
             uint32_t v = id(); put(code, Op_Load, {t_u32, v, p});
             sum = b_iadd(sum, sel(cond, v, uconst(0)));
         }
         barrier();
         return b_iadd(acc_bits, sum);
+    }
+    // DS_APPEND/DS_CONSUME: one atomic add/subtract per emulated hardware wave, changing the counter
+    // by popcount(EXEC), with the old value broadcast to every lane. Every Vulkan invocation participates in the barriers;
+    // the per-lane EXEC bool only contributes 0/1 to the reduction. A partial final hardware wave
+    // (including a one-thread workgroup) contains only the launched lanes; every scratch read remains
+    // statically in-bounds and absent hardware lanes contribute zero.
+    uint32_t wave_append(uint32_t lds_idx, uint32_t active_bool, bool consume = false) {
+        declare_wave_lds();
+        const uint32_t active = sel(active_bool, uconst(1), uconst(0));
+        uint32_t p = id(); putv(code, Op_AccessChain,
+            {t_ptr_wg_u32b, p, lds_wave, linear_localid});
+        put(code, Op_Store, {p, active});
+        barrier();
+
+        const uint32_t wave_shift = wave_size == 32 ? 5u : 6u;
+        const uint32_t lane = ibin(Op_BitwiseAnd, linear_localid, uconst(wave_size - 1));
+        const uint32_t wave_base = ibin(Op_ShiftLeftLogical,
+            ibin(Op_ShiftRightLogical, linear_localid, uconst(wave_shift)), uconst(wave_shift));
+        const uint32_t wave_index = ibin(Op_ShiftRightLogical, linear_localid, uconst(wave_shift));
+        uint32_t count = uconst(0);
+        for (uint32_t i = 0; i < local_count; ++i) {
+            uint32_t q = id(); putv(code, Op_AccessChain, {t_ptr_wg_u32b, q, lds_wave, uconst(i)});
+            uint32_t v = id(); put(code, Op_Load, {t_u32, v, q});
+            const uint32_t same_wave = ucmp(Op_IEqual, wave_index, uconst(i / wave_size));
+            count = b_iadd(count, sel(same_wave, v, uconst(0)));
+        }
+
+        const uint32_t is_leader = ucmp(Op_IEqual, lane, uconst(0));
+        const uint32_t leader = id(), reduced = id();
+        emit_selmerge(reduced);
+        emit_condbranch(is_leader, leader, reduced);
+        emit_label(leader);
+        const uint32_t old = lds_atomic_rtn(consume ? Op_AtomicISub : Op_AtomicIAdd, lds_idx, count,
+                                             false, btrue(), uconst(0));
+        uint32_t result_slot = id(); putv(code, Op_AccessChain,
+            {t_ptr_wg_u32b, result_slot, lds_wave, wave_base});
+        put(code, Op_Store, {result_slot, old});
+        emit_branch(reduced);
+        emit_label(reduced);
+        barrier();
+        uint32_t result_ptr = id(); putv(code, Op_AccessChain,
+            {t_ptr_wg_u32b, result_ptr, lds_wave, wave_base});
+        uint32_t result = id(); put(code, Op_Load, {t_u32, result, result_ptr});
+        barrier();
+        return result;
     }
     uint32_t b_iadd(uint32_t a, uint32_t b_) { uint32_t r = id(); put(code, Op_IAdd, {t_u32, r, a, b_}); return r; }
     // Declare the two scalar-memory constant/vertex buffers (bindings 2 & 3) that SMEM / buffer_load_
@@ -1019,19 +1134,20 @@ struct SpirvCompute {
         put(code, Op_Store, {v_color[mrt], v});
     }
 
-    // --- Vertex-shader shell: gl_VertexIndex input + gl_Position (member 0 of a gl_PerVertex Block). ---
-    uint32_t v_vid = 0, v_pos = 0, t_ptr_out_v4f = 0;
+    // --- Vertex-shader shell: draw inputs + gl_Position (member 0 of a gl_PerVertex Block). ---
+    uint32_t v_vid = 0, v_iid = 0, v_pos = 0, t_ptr_out_v4f = 0;
     void begin_vertex(const ShaderResourceTable* rt = nullptr) { bool with_cbufs = rt != nullptr;
         t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_i32 = id(); t_bool = id();
         t_v4f = id();
-        uint32_t t_ptr_in_i32 = id(); v_vid = id();
+        uint32_t t_ptr_in_i32 = id(); v_vid = id(); v_iid = id();
         uint32_t t_pv = id(), t_ptr_out_pv = id(); v_pos = id(); t_ptr_out_v4f = id();
         f_main = id(); uint32_t lbl = id(); glsl = id();
         put(caps, Op_Capability, {Cap_Shader});
         { std::vector<uint32_t> o{glsl}; pstr(o, "GLSL.std.450"); putv(extimp, Op_ExtInstImport, o); }
         put(mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
-        exec_model = Exec_Vertex; iface = {v_vid, v_pos};   // EntryPoint deferred to finish()
+        exec_model = Exec_Vertex; iface = {v_vid, v_iid, v_pos};   // EntryPoint deferred to finish()
         put(deco, Op_Decorate, {v_vid, Dec_BuiltIn, BI_VertexIndex});
+        put(deco, Op_Decorate, {v_iid, Dec_BuiltIn, BI_InstanceIndex});
         put(deco, Op_MemberDecorate, {t_pv, 0, Dec_BuiltIn, BI_Position});   // gl_PerVertex.gl_Position
         put(deco, Op_Decorate, {t_pv, Dec_Block});
         put(types, Op_TypeVoid, {t_void});
@@ -1043,6 +1159,7 @@ struct SpirvCompute {
         put(types, Op_TypeVector, {t_v4f, t_f32, 4});
         put(types, Op_TypePointer, {t_ptr_in_i32, SC_Input, t_i32});
         put(types, Op_Variable, {t_ptr_in_i32, v_vid, SC_Input});
+        put(types, Op_Variable, {t_ptr_in_i32, v_iid, SC_Input});
         put(types, Op_TypeStruct, {t_pv, t_v4f});
         put(types, Op_TypePointer, {t_ptr_out_pv, SC_Output, t_pv});
         put(types, Op_Variable, {t_ptr_out_pv, v_pos, SC_Output});
@@ -1053,6 +1170,7 @@ struct SpirvCompute {
     }
     // Load gl_VertexIndex as raw bits (VGPR v0 for a vertex shader).
     uint32_t load_vertex_index() { uint32_t r = id(); put(code, Op_Load, {t_i32, r, v_vid}); return i2u(r); }
+    uint32_t load_instance_index() { uint32_t r = id(); put(code, Op_Load, {t_i32, r, v_iid}); return i2u(r); }
     // Write vec4(x,y,z,w) (bit-operands) to gl_Position (EXP POS0).
     void export_position(uint32_t x, uint32_t y, uint32_t z, uint32_t w) {
         // PROSPER_FORCE_W: diagnostic — force the clip-space w to 1.0. Some shaders' factored MVP
@@ -1169,6 +1287,10 @@ struct SpirvCompute {
 // operands may reference either (SGPR is a valid ALU operand), so both are resolved by operand_bits.
 struct RegState {
     std::unordered_map<int, uint32_t> vreg, sreg;
+    // Immutable raw user-data words for DIRECT descriptors. They stay absent from `sreg` so
+    // descriptor provenance can still distinguish driver input from a shader overwrite, while
+    // scalar ALU may read their real bits (Astro copies V#.word2 into M0 as an LDS base).
+    std::unordered_map<int, uint32_t> sreg_input;
     std::unordered_map<int, uint32_t> sreg_bool;   // SGPR (pairs) holding a saved per-lane mask (bool id)
     std::unordered_map<int, bool> sreg_bool_narrowed;  // was EXEC narrowed when this mask was saved? (restores it)
     std::unordered_map<int, uint32_t> sreg_srt;    // SGPR holding a descriptor -> its user_data/SRT byte offset
@@ -1210,6 +1332,43 @@ inline void predicate_write(SpirvCompute& b, RegState& rs, int idx, uint32_t old
 }
 inline uint32_t vreg_old(SpirvCompute& b, RegState& rs, int idx) {
     auto it = rs.vreg.find(idx); return it == rs.vreg.end() ? b.uconst(0) : it->second;
+}
+
+// A scalar inline integer used by a B64 mask operation is sign-extended to 64 bits.  Return the bit
+// belonging to this emulated hardware lane without ever issuing an undefined >=32 SPIR-V shift.
+// Astro's reduction tails use 15, 3, and 1 for the final 4/2/1 active lanes.
+uint32_t inline_int_mask_bit(SpirvCompute& b, int value) {
+    if (value == -1) return b.btrue();
+    if (value == 0) return b.bfalse();
+    const uint32_t lane = b.ibin(Op_BitwiseAnd, b.linear_localid,
+                                  b.uconst(b.wave_size - 1));
+    const uint32_t bit = b.ibin(Op_BitwiseAnd, lane, b.uconst(31));
+    const uint32_t high = b.ucmp(Op_UGreaterThanEqual, lane, b.uconst(32));
+    const uint32_t word = b.sel(high, b.uconst(value < 0 ? UINT32_MAX : 0u),
+                                b.uconst(static_cast<uint32_t>(value)));
+    return b.ucmp(Op_INotEqual,
+        b.ibin(Op_BitwiseAnd, b.ibin(Op_ShiftRightLogical, word, bit), b.uconst(1)),
+        b.uconst(0));
+}
+
+// Per-invocation bit of a 64-bit mask consumed by V_MBCNT. The HI instruction names the odd SGPR
+// of an aligned scalar pair (for example s7 for s[6:7]), while our bool-domain mask is keyed by the
+// pair's low register. Accept the exact key first for unusual compiler allocations, then the aligned
+// low half. VCC/EXEC are represented directly rather than through the scalar-data register file.
+uint32_t mbcnt_source_bit(SpirvCompute& b, const RegState& rs, const Operand& source,
+                          bool high_half) {
+    if (source.value == 126 || source.value == 127) return rs.exec;
+    if (source.value == 106 || source.value == 107) return rs.vcc;
+    if (source.kind == OperandKind::InlineInt)
+        return inline_int_mask_bit(b, source.value);
+    if (source.kind != OperandKind::SGPR) return 0;
+    auto found = rs.sreg_bool.find(source.value);
+    if (found != rs.sreg_bool.end()) return found->second;
+    if (high_half && source.value > 0) {
+        found = rs.sreg_bool.find(source.value - 1);
+        if (found != rs.sreg_bool.end()) return found->second;
+    }
+    return 0;
 }
 
 bool sopp_is_noop(const Rdna2Inst& in) {
@@ -1421,7 +1580,9 @@ std::unordered_set<uint32_t> mask_test_branches(const std::vector<Rdna2Inst>& in
             if (prev) {
                 bool mask_sop2 = prev->fmt == Rdna2Format::SOP2 &&
                     (prev->opcode == 0x0f || prev->opcode == 0x11 || prev->opcode == 0x13 || prev->opcode == 0x15);
-                bool mask_saveexec = prev->fmt == Rdna2Format::SOP1 && (prev->opcode == 0x24 || prev->opcode == 0x25);
+                bool mask_saveexec = prev->fmt == Rdna2Format::SOP1 &&
+                                     (prev->opcode == 0x24 || prev->opcode == 0x25 ||
+                                      prev->opcode == 0x37);
                 // The kill mask may live in a plain SGPR pair (s0..s105) OR in VCC itself — DOLL's
                 // alpha-cull PS does `s_andn2_b64 vcc, exec, vcc; s_cbranch_scc0 <null-export>` then
                 // `s_mov_b64 exec, vcc; export`. The SOP2 dst field decodes VCC_LO as SGPR 106, and
@@ -1434,6 +1595,118 @@ std::unordered_set<uint32_t> mask_test_branches(const std::vector<Rdna2Inst>& in
         prev = &in;
     }
     return out;
+}
+
+// Some GFX10 pixel shaders leave scheduled 64-bit mask operations whose VCC/SCC results feed only
+// other dead mask operations and are overwritten before an observable read. Astro Bot's SSAO shader does this with
+// `s_and_b64 vcc, s[0:1], vcc`, where s[0:1] is also a live T# descriptor; attempting to reinterpret
+// the descriptor bits as a per-lane mask is both impossible in descriptor-backed SPIR-V and pointless.
+// Elide only the mechanically proven dead form: the shader has no SCC consumer anywhere, and CFG
+// liveness proves the VCC pair cannot reach a non-mask read before redefinition. This deliberately
+// does not become a general scalar-pair-to-wave-mask fallback.
+std::unordered_set<uint32_t> dead_wave_mask_writes(const std::vector<Rdna2Inst>& ins) {
+    for (const auto& in : ins) {
+        const bool reads_scc =
+            (in.fmt == Rdna2Format::SOPP && (in.opcode == 0x04 || in.opcode == 0x05)) ||
+            (in.fmt == Rdna2Format::SOP2 &&
+             (in.opcode == 0x04 || in.opcode == 0x05 ||
+              in.opcode == 0x0a || in.opcode == 0x0b)) ||
+            (in.fmt == Rdna2Format::SOP1 && (in.opcode == 0x05 || in.opcode == 0x06)) ||
+            (in.fmt == Rdna2Format::SOPK && in.opcode == 0x02);
+        if (reads_scc) return {};
+    }
+    auto is_mask = [](const Rdna2Inst& in) {
+        return in.fmt == Rdna2Format::SOP2 &&
+            (in.opcode == 0x0f || in.opcode == 0x11 || in.opcode == 0x13 ||
+             in.opcode == 0x15 || in.opcode == 0x17 || in.opcode == 0x19 ||
+             in.opcode == 0x1b || in.opcode == 0x1d) &&
+            (in.dst.value == 106 || in.dst.value == 107);
+    };
+    const auto is_cmpx = [](uint32_t op) {
+        return (op >= 0x10 && op <= 0x1f) || (op >= 0x90 && op <= 0x9f) ||
+               (op >= 0xd0 && op <= 0xdf);
+    };
+    std::unordered_map<uint32_t, size_t> by_pc;
+    for (size_t i = 0; i < ins.size(); ++i) by_pc[ins[i].pc] = i;
+    std::vector<std::vector<size_t>> succ(ins.size());
+    for (size_t i = 0; i < ins.size(); ++i) {
+        const auto& in = ins[i];
+        if (in.is_end) continue;
+        const bool branch = in.fmt == Rdna2Format::SOPP &&
+                            in.opcode >= 0x02 && in.opcode <= 0x09 && in.opcode != 0x03;
+        if (!branch || in.opcode != 0x02) {
+            if (i + 1 < ins.size()) succ[i].push_back(i + 1);
+        }
+        if (branch) {
+            const uint32_t target = in.pc + in.len_dwords +
+                                    static_cast<uint32_t>(static_cast<int32_t>(in.simm16));
+            auto it = by_pc.find(target);
+            if (it == by_pc.end()) return {}; // malformed/unbounded CFG: make no dead-write claim
+            succ[i].push_back(it->second);
+        }
+    }
+    auto uses = [&](const Rdna2Inst& in) -> uint8_t {
+        uint8_t bits = 0;
+        for (uint8_t k = 0; k < in.n_src; ++k) {
+            if (in.src[k].kind != OperandKind::SGPR &&
+                in.src[k].kind != OperandKind::Special) continue;
+            if (in.src[k].value == 106) bits |= 1;
+            if (in.src[k].value == 107) bits |= 2;
+        }
+        if (is_mask(in) && bits) bits = 3; // every modeled mask logical reads a full B64 pair
+        if (in.fmt == Rdna2Format::VOP2 &&
+            (in.opcode == 0x01 || (in.opcode >= 0x28 && in.opcode <= 0x2a))) bits |= 3;
+        if (in.fmt == Rdna2Format::SOPP && (in.opcode == 0x06 || in.opcode == 0x07)) bits |= 3;
+        return bits;
+    };
+    auto defs = [&](const Rdna2Inst& in) -> uint8_t {
+        if (is_mask(in)) return 3;
+        if (in.fmt == Rdna2Format::VOPC && !is_cmpx(in.opcode) &&
+            (in.dst.value == 106 || in.dst.value == 107)) return 3;
+        if (in.fmt == Rdna2Format::VOP2 && in.opcode >= 0x28 && in.opcode <= 0x2a)
+            return 3;
+        if (in.fmt == Rdna2Format::VOP3 &&
+            (in.sdst.value == 106 || in.sdst.value == 107)) return 3;
+        if (in.fmt == Rdna2Format::SOP1) {
+            if (in.dst.value == 106) return in.opcode == 0x04 ? 3 : 1;
+            if (in.dst.value == 107) return 2;
+        }
+        if (in.fmt == Rdna2Format::SMEM) {
+            uint32_t n = 0;
+            switch (in.opcode) {
+                case 0x0: case 0x8: n=1; break; case 0x1: case 0x9: n=2; break;
+                case 0x2: case 0xa: n=4; break; case 0x3: case 0xb: n=8; break;
+                case 0x4: case 0xc: n=16; break; default: break;
+            }
+            uint8_t bits = 0;
+            if (n && in.dst.value <= 106 && 106 < in.dst.value + static_cast<int>(n)) bits |= 1;
+            if (n && in.dst.value <= 107 && 107 < in.dst.value + static_cast<int>(n)) bits |= 2;
+            return bits;
+        }
+        return 0;
+    };
+    // Least-fixed-point dataflow rooted only in observable (non-candidate) VCC reads. A mask
+    // candidate propagates liveness to its B64 input only when its output is itself live; this also
+    // removes dead self-dependent mask chains inside loops without mistaking the cycle for a use.
+    std::vector<uint8_t> live_in(ins.size(), 0), live_out(ins.size(), 0);
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (size_t ri = ins.size(); ri-- > 0;) {
+            uint8_t out = 0;
+            for (size_t s : succ[ri]) out |= live_in[s];
+            const uint8_t def = defs(ins[ri]), use = uses(ins[ri]);
+            const uint8_t propagated_use = is_mask(ins[ri]) && !(out & def) ? 0 : use;
+            const uint8_t in = propagated_use | (out & static_cast<uint8_t>(~def));
+            if (out != live_out[ri] || in != live_in[ri]) {
+                live_out[ri] = out; live_in[ri] = in; changed = true;
+            }
+        }
+    }
+    std::unordered_set<uint32_t> dead;
+    for (size_t i = 0; i < ins.size(); ++i)
+        if (is_mask(ins[i]) && !(live_out[i] & 3)) dead.insert(ins[i].pc);
+    return dead;
 }
 
 // WATERFALL loops (#273 — DOLL's skinned scene VS): the readfirstlane-uniformize idiom
@@ -1563,11 +1836,13 @@ uint32_t vgpr_write_count(const Rdna2Inst& in) {
     switch (in.fmt) {
         case Rdna2Format::VOP1:
             return in.opcode == 0x02 ? 0 : 1;                   // v_readfirstlane writes an SGPR
-        case Rdna2Format::VOP2: case Rdna2Format::VOP3: case Rdna2Format::VOP3P:
+        case Rdna2Format::VOP2: case Rdna2Format::VOP3P:
             return 1;
+        case Rdna2Format::VOP3:
+            return in.opcode == 0x176 ? 2 : 1;                 // v_mad_u64_u32 writes a VGPR pair
         case Rdna2Format::DS:
-            if (in.opcode == 0x36 || in.opcode == 0xb1) return 1;
-            if (in.opcode == 0x76) return 2;
+            if (in.opcode == 0x36 || in.opcode == 0x3d || in.opcode == 0x3e || in.opcode == 0xb1) return 1;
+            if (in.opcode == 0x37 || in.opcode == 0x76) return 2;
             if (in.opcode == 0x77) return 4;
             return 0;
         case Rdna2Format::MUBUF:
@@ -1597,7 +1872,8 @@ bool vopc_is_cmpx(uint32_t opcode) {
 bool instruction_may_change_exec(const Rdna2Inst& in) {
     if (in.fmt == Rdna2Format::VOPC && vopc_is_cmpx(in.opcode)) return true;
     // saveexec writes EXEC implicitly while its explicit destination receives the previous mask.
-    if (in.fmt == Rdna2Format::SOP1 && (in.opcode == 0x24 || in.opcode == 0x25)) return true;
+    if (in.fmt == Rdna2Format::SOP1 &&
+        (in.opcode == 0x24 || in.opcode == 0x25 || in.opcode == 0x37)) return true;
     auto is_exec = [](const Operand& operand) {
         return (operand.kind == OperandKind::SGPR || operand.kind == OperandKind::Special) &&
                (operand.value == 126 || operand.value == 127);
@@ -1641,6 +1917,8 @@ static bool cannot_write_vcc(const Rdna2Inst& in) {
             // sequences of these two ops between a uniform VOPC and its s_cbranch_vccz.
             if (in.opcode == 0x361) return true;
             if (in.opcode == 0x360) return sgpr_dst_misses_vcc(1);
+            if (in.opcode == 0x176)
+                return in.sdst.value != 106 && in.sdst.value != 107; // v_mad_u64_u32 carry-out
             return in.opcode >= 0x140 && in.opcode < 0x300 &&
                    sgpr_dst_misses_vcc(1);                         // plain-VALU window only
         case Rdna2Format::SOP1: case Rdna2Format::SOP2: case Rdna2Format::SOPK:
@@ -2107,7 +2385,11 @@ void loop_written_regs(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t 
                 vregs.insert(in.dst.value); break;
             case Rdna2Format::VOP3:
                 if (in.opcode == 0x360) sregs.insert(in.dst.value);       // v_readlane -> SGPR
-                else vregs.insert(in.dst.value); break;                   // (writelane: slots, not SSA)
+                else {
+                    for (uint32_t k = 0; k < vgpr_write_count(in); ++k)
+                        vregs.insert(in.dst.value + (int)k);
+                }
+                break;                                                    // (writelane: slots, not SSA)
             case Rdna2Format::DS:
                 for (uint32_t k = 0; k < vgpr_write_count(in); ++k)
                     vregs.insert(in.dst.value + (int)k);
@@ -2150,7 +2432,12 @@ uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, const 
                 if (ok) *ok = false; return b.uconst(0);
             }
             auto it = rs.vreg.find(o.value); return it == rs.vreg.end() ? b.uconst(0) : it->second; }
-        case OperandKind::SGPR: { auto it = rs.sreg.find(o.value); return it == rs.sreg.end() ? b.uconst(0) : it->second; }
+        case OperandKind::SGPR: {
+            auto it = rs.sreg.find(o.value);
+            if (it != rs.sreg.end()) return it->second;
+            auto input = rs.sreg_input.find(o.value);
+            return input == rs.sreg_input.end() ? b.uconst(0) : input->second;
+        }
         case OperandKind::InlineInt:   return b.uconst((uint32_t)o.value);
         case OperandKind::InlineFloat: return b.uconst(fbits(inline_float_value((uint32_t)o.value)));
         case OperandKind::Literal:     return b.uconst(in.literal);
@@ -2192,15 +2479,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // mask is a single bool for this lane. EXEC=SGPR 126/127, VCC=106/107; a saved mask lives
             // in sreg_bool. These implement divergent control flow (if/endif via saveexec + restore).
             if (in.opcode == 0x04 || in.opcode == 0x08 || in.opcode == 0x0a ||
-                in.opcode == 0x24 || in.opcode == 0x25) {
+                in.opcode == 0x24 || in.opcode == 0x25 || in.opcode == 0x37) {
                 auto is_exec = [](const Operand& o){ return o.value == 126 || o.value == 127; };
                 auto src_mask = [&](const Operand& o) -> uint32_t {
                     if (o.value == 106 || o.value == 107) return rs.vcc;    // VCC
                     if (o.value == 126 || o.value == 127) return rs.exec;   // EXEC
                     if (o.kind == OperandKind::SGPR) { auto it = rs.sreg_bool.find(o.value);
                         if (it != rs.sreg_bool.end()) return it->second; }
-                    if (o.kind == OperandKind::InlineInt) { if (o.value == -1) return b.btrue();
-                        if (o.value == 0) return b.bfalse(); }
+                    if (o.kind == OperandKind::InlineInt)
+                        return inline_int_mask_bit(b, o.value);
                     return 0;   // not a recognizable mask
                 };
                 if (in.opcode == 0x0a) {                    // s_wqm_b64: whole-quad-mode mask widen
@@ -2304,12 +2591,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         }
                         if (!m && !data_copied) ok = false;
                     }
-                } else {                                    // s_and/or_saveexec_b64 sDST, src
+                } else {                                    // s_and/or/andn1_saveexec_b64 sDST, src
                     rs.sreg_bool[in.dst.value] = rs.exec;   // save current EXEC to the dest SGPR pair
                     rs.sreg_bool_narrowed[in.dst.value] = rs.exec_narrowed;   // ...and its narrowed-state
                     uint32_t m = src_mask(in.src[0]);
                     if (!m) ok = false;
-                    else { rs.exec = (in.opcode == 0x24) ? b.land(rs.exec, m) : b.lor(rs.exec, m);
+                    else { rs.exec = in.opcode == 0x24 ? b.land(rs.exec, m)
+                                     : in.opcode == 0x25 ? b.lor(rs.exec, m)
+                                                        : b.land(rs.exec, b.logical_not(m));
                            rs.exec_narrowed = true; }
                 }
                 return true;
@@ -2344,11 +2633,38 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 case 0x07:                                  // s_not_b32 changes the descriptor word
                     d = b.iun(Op_Not, a); rs.sreg_srt.erase(in.dst.value); break;
+                case 0x0b:                                  // s_brev_b32
+                    d = b.iun(Op_BitReverse, a); rs.sreg_srt.erase(in.dst.value); break;
                 default: ok = false;
             }
             return true;
         }
         case Rdna2Format::SOP2: {
+            if (in.opcode == 0x25) {   // s_bfm_b64: D=((1ULL<<(S0&63))-1)<<(S1&63)
+                // Wave masks are represented as one bool per SPIR-V invocation.  Constructing the
+                // architectural 64-bit integer and then splitting it would lose that domain, so test
+                // the current lane directly: bits [offset, offset+width) are set, truncated at bit 63.
+                // This is also exact for width==0 (the ISA expression produces an empty mask).
+                const uint32_t width = b.ibin(Op_BitwiseAnd, val(in.src[0]), b.uconst(63));
+                const uint32_t offset = b.ibin(Op_BitwiseAnd, val(in.src[1]), b.uconst(63));
+                const uint32_t lane = b.ibin(Op_BitwiseAnd, b.linear_localid,
+                                              b.uconst(b.wave_size - 1));
+                const uint32_t at_or_after = b.ucmp(Op_UGreaterThanEqual, lane, offset);
+                const uint32_t within_width = b.ucmp(
+                    Op_ULessThan, b.ibin(Op_ISub, lane, offset), width);
+                const uint32_t r = b.land(at_or_after, within_width);
+                if (in.dst.value == 126 || in.dst.value == 127) {
+                    rs.exec = r;
+                    rs.exec_narrowed = true;
+                } else if (in.dst.value == 106 || in.dst.value == 107) {
+                    rs.vcc = r;
+                    rs.sreg_bool_narrowed[in.dst.value] = true;
+                } else {
+                    rs.sreg_bool[in.dst.value] = r;
+                    rs.sreg_bool_narrowed[in.dst.value] = true;
+                }
+                return true;
+            }
             if (in.opcode == 0x0b) {   // s_cselect_b64: 64-bit MASK dst = SCC ? src0 : src1 (mask domain)
                 // Operands/dest are wave masks (EXEC/VCC/saved/inline), NOT uint bits — resolve like the
                 // SOP1 mask ops and select in the bool domain. (s_cselect_b32 0x0a stays in the uint path.)
@@ -2358,8 +2674,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (o.value == 126 || o.value == 127) return rs.exec;
                     if (o.kind == OperandKind::SGPR) { auto it = rs.sreg_bool.find(o.value);
                         if (it != rs.sreg_bool.end()) return it->second; }
-                    if (o.kind == OperandKind::InlineInt) { if (o.value == -1) return b.btrue();
-                        if (o.value == 0) return b.bfalse(); }
+                    if (o.kind == OperandKind::InlineInt)
+                        return inline_int_mask_bit(b, o.value);
                     return 0;   // not a recognizable mask
                 };
                 uint32_t m0 = mask(in.src[0]), m1 = mask(in.src[1]);
@@ -2382,8 +2698,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (o.value == 126 || o.value == 127) return rs.exec;
                     if (o.kind == OperandKind::SGPR) { auto it = rs.sreg_bool.find(o.value);
                         if (it != rs.sreg_bool.end()) return it->second; }
-                    if (o.kind == OperandKind::InlineInt) { if (o.value == -1) return b.btrue();
-                        if (o.value == 0) return b.bfalse(); }
+                    if (o.kind == OperandKind::InlineInt)
+                        return inline_int_mask_bit(b, o.value);
                     return 0;
                 };
                 uint32_t m0 = mask(in.src[0]), m1 = mask(in.src[1]);
@@ -2593,6 +2909,32 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x09: rs.scc = b.ucmp(Op_UGreaterThanEqual, a, c); break;        // s_cmp_ge_u32
                 case 0x0A: rs.scc = b.ucmp(Op_ULessThan, a, c); break;                // s_cmp_lt_u32
                 case 0x0B: rs.scc = b.ucmp(Op_ULessThanEqual, a, c); break;           // s_cmp_le_u32
+                case 0x12: case 0x13: {                                                // s_cmp_eq/lg_u64
+                    // AMD RDNA2 ISA 12.4: each encoded source names the low half of an SGPR pair.
+                    // Inline integer/literal sources are extended to 64 bits; Astro compares
+                    // s[2:3] against inline zero while rebuilding a wave mask.
+                    auto high = [&](const Operand& o) -> uint32_t {
+                        if (o.kind == OperandKind::SGPR ||
+                            (o.kind == OperandKind::Special && o.value >= 106 && o.value < 124)) {
+                            auto it = rs.sreg.find(o.value + 1);
+                            if (it != rs.sreg.end()) return it->second;
+                            ok = false;
+                            return b.uconst(0);
+                        }
+                        if (o.kind == OperandKind::InlineInt)
+                            return b.uconst(o.value < 0 ? UINT32_MAX : 0);
+                        if (o.kind == OperandKind::Literal || o.kind == OperandKind::InlineFloat ||
+                            (o.kind == OperandKind::Special && o.value == 125))
+                            return b.uconst(0);
+                        ok = false;
+                        return b.uconst(0);
+                    };
+                    const uint32_t equal = b.land(
+                        b.ucmp(Op_IEqual, a, c),
+                        b.ucmp(Op_IEqual, high(in.src[0]), high(in.src[1])));
+                    rs.scc = in.opcode == 0x12 ? equal : b.logical_not(equal);
+                    break;
+                }
                 default: ok = false;
             }
             return true;
@@ -2619,13 +2961,24 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
         }
         case Rdna2Format::VOP1: {
             uint32_t a = val(in.src[0]); uint32_t old_d = vreg_old(b, rs, in.dst.value);
-            // DPP16 quad_perm on src0 (#273): reconstruct the selected quad lane's value from
-            // screen-space derivatives (fragment-only; v_mov is the observed carrier — the manual
-            // ddx/ddy idiom). Other VOP1 ops with DPP stay rejected (derivatives of non-float moves
-            // have no meaning in this lowering).
+            // DPP16 quad_perm on src0 (#273): fragment shaders reconstruct the selected quad lane
+            // from derivatives. Compute shaders use the exact subgroup quad-swap operation for the
+            // three XOR permutations emitted by Astro Bot's blur kernels: horizontal (0xb1), vertical
+            // (0x4e), and diagonal (0x1b). Quad boundaries are architectural and remain exact even
+            // when the host subgroup width differs from the guest wave width.
             if (in.has_dpp) {
-                if (!b.is_fragment || in.opcode != 0x01) { ok = false; return true; }
-                a = b.dpp_quad(a, in.dpp_ctrl);
+                if (in.opcode != 0x01) { ok = false; return true; }
+                if (b.is_fragment) {
+                    a = b.dpp_quad(a, in.dpp_ctrl);
+                } else if (b.is_compute) {
+                    uint32_t direction = in.dpp_ctrl == 0xb1 ? 0u
+                                       : in.dpp_ctrl == 0x4e ? 1u
+                                       : in.dpp_ctrl == 0x1b ? 2u : UINT32_MAX;
+                    if (direction == UINT32_MAX) { ok = false; return true; }
+                    a = b.subgroup_quad_swap(a, direction);
+                } else {
+                    ok = false; return true;
+                }
             }
             // SDWA float source modifiers on src0 (abs then neg). v_cvt_f32_f16 applies them after
             // selecting and unpacking the requested half below; applying them to the packed u32 as
@@ -2633,6 +2986,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             if (in.opcode != 0x0B) {
                 if (in.src_abs[0]) a = b.fext1(Glsl_FAbs, a);
                 if (in.src_neg[0]) a = b.fbin(Op_FSub, b.uconst(0), a);
+            }
+            if ((in.opcode == 0x05 || in.opcode == 0x06) && in.sdwa_src0_sel <= 5) {
+                const uint32_t bits = in.sdwa_src0_sel <= 3 ? 8u : 16u;
+                const uint32_t offset = in.sdwa_src0_sel <= 3
+                    ? 8u * in.sdwa_src0_sel : 16u * (in.sdwa_src0_sel - 4u);
+                a = ((in.words[1] >> 19) & 1u)
+                    ? b.bfe_s(a, b.uconst(offset), b.uconst(bits))
+                    : b.bfe_u(a, b.uconst(offset), b.uconst(bits));
             }
             if (in.opcode == 0x02) {   // v_readfirstlane_b32: SGPR dst = value of the lowest active lane
                 // Cross-lane broadcast. Our per-lane scalar model has no cross-lane reduction, so we use
@@ -2712,6 +3073,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (in.src_neg[0]) d = b.fbin(Op_FSub, b.uconst(0), d);
                     break;
                 }
+                case 0x0D:                                          // v_cvt_flr_i32_f32
+                    // AMD RDNA2 ISA: floor the f32 value before converting to signed i32. This is
+                    // observably different from v_cvt_i32_f32's truncation for negative fractions.
+                    d = b.cvt_f2i(b.fext1(Glsl_Floor, a));
+                    break;
                 // v_cvt_off_f32_i4: sign-extend the low 4-bit integer and scale by 1/16.
                 // AMD RDNA2 ISA: "4-bit signed int to 32-bit float"; LLVM's intrinsic
                 // contract specifies result = 0.0625f * src_i4. This is the only opcode
@@ -2789,8 +3155,20 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const bool fop = in.opcode == 0x03 || in.opcode == 0x04 || in.opcode == 0x05 ||
                                  in.opcode == 0x08 || in.opcode == 0x0F || in.opcode == 0x10 ||
                                  in.opcode == 0x1F || in.opcode == 0x2B;
-                if (!b.is_fragment || !fop) { ok = false; return true; }
-                a = b.dpp_quad(a, in.dpp_ctrl);
+                if (!fop) { ok = false; return true; }
+                if (b.is_fragment) {
+                    a = b.dpp_quad(a, in.dpp_ctrl);
+                } else if (b.is_compute) {
+                    // Astro's title blur/reduction kernels use the same three XOR quad permutations
+                    // as their v_mov DPP forms. DPP transforms src0 only; src1 remains in this lane.
+                    const uint32_t direction = in.dpp_ctrl == 0xb1 ? 0u
+                                             : in.dpp_ctrl == 0x4e ? 1u
+                                             : in.dpp_ctrl == 0x1b ? 2u : UINT32_MAX;
+                    if (direction == UINT32_MAX) { ok = false; return true; }
+                    a = b.subgroup_quad_swap(a, direction);
+                } else {
+                    ok = false; return true;
+                }
             }
             // SDWA float source modifiers (only ever set on float ops by the assembler): abs then neg.
             // Packed-f16 ops apply these after selecting/unpacking the half below.
@@ -2822,6 +3200,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x05: d = b.fbin(Op_FSub, c, a); break;          // v_subrev_f32 (src1 - src0; e32 form of
                                                                       // VOP3 0x105 — round-trip llvm-mc gfx1010 0x0a020702)
                 case 0x08: d = b.fbin(Op_FMul, a, c); break;          // v_mul_f32
+                case 0x0B: {                                        // v_mul_u32_u24
+                    // Only the low 24 bits of each source participate; the result is the low
+                    // 32 bits of the unsigned product (AMD RDNA2 ISA 11.6).
+                    const uint32_t mask = b.uconst(0x00FFFFFFu);
+                    d = b.ibin(Op_IMul, b.ibin(Op_BitwiseAnd, a, mask),
+                                          b.ibin(Op_BitwiseAnd, c, mask));
+                    break;
+                }
                 case 0x0F: d = b.fext2(Glsl_FMin, a, c); break;       // v_min_f32
                 case 0x10: d = b.fext2(Glsl_FMax, a, c); break;       // v_max_f32
                 case 0x11: d = b.sext2(Glsl_SMin, a, c); break;       // v_min_i32
@@ -2837,6 +3223,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x1B: d = b.ibin(Op_BitwiseAnd, a, c); break;    // v_and_b32
                 case 0x1C: d = b.ibin(Op_BitwiseOr,  a, c); break;    // v_or_b32
                 case 0x1D: d = b.ibin(Op_BitwiseXor, a, c); break;    // v_xor_b32
+                case 0x1E: d = b.iun(Op_Not, b.ibin(Op_BitwiseXor, a, c)); break; // v_xnor_b32
                 case 0x25: d = b.ibin(Op_IAdd, a, c); break;          // v_add_nc_u32
                 case 0x26: d = b.ibin(Op_ISub, a, c); break;          // v_sub_nc_u32
                 case 0x27: d = b.ibin(Op_ISub, c, a); break;          // v_subrev_nc_u32 (reverse: src1 - src0)
@@ -2953,6 +3340,18 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             bool is_cmpx = vopc_is_cmpx(op);
             if (is_cmpx && !allow_exec_update) { ok = false; return true; }
             uint32_t eff = is_cmpx ? op - 0x10 : op;
+            const bool integer_compare =
+                (eff >= 0x81u && eff <= 0x86u) ||
+                (eff >= 0xC1u && eff <= 0xC6u);
+            if (integer_compare) {
+                auto sdwa_integer = [&](uint32_t raw, uint8_t sel) {
+                    if (sel <= 3u) return b.bfe_u(raw, b.uconst(8u * sel), b.uconst(8));
+                    if (sel <= 5u) return b.bfe_u(raw, b.uconst(16u * (sel - 4u)), b.uconst(16));
+                    return raw;
+                };
+                a = sdwa_integer(ra, in.sdwa_src0_sel);
+                c = sdwa_integer(rc, in.sdwa_src1_sel);
+            }
             uint32_t cmp = 0;
             switch (eff) {
                 case 0x01: cmp = b.fcmp(Op_FOrdLessThan, a, c); break;         // v_cmp_lt_f32
@@ -3150,6 +3549,55 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // immaterial here. VERIFIED(round-trip llvm-mc gfx1010, both directions): VOP3 op 0x141.
                 uint32_t m = b.fbin(Op_FMul, fv(0), fv(1));
                 vreg[in.dst.value] = fresult(b.fbin(Op_FAdd, m, fv(2)));
+            } else if (in.opcode == 0x176) {                          // v_mad_u64_u32
+                // AMD RDNA2: {carry,D.u64} = S0.u32*S1.u32 + S2.u64. A literal
+                // or positive inline constant used as the 64-bit addend is zero-extended;
+                // a negative integer inline constant is sign-extended. Register addends
+                // consume the consecutive high register.
+                if (in.dst.value >= 255) { ok = false; }
+                else {
+                    auto high_half = [&](const Operand& operand) -> uint32_t {
+                        if (operand.kind == OperandKind::InlineInt)
+                            return b.uconst(operand.value < 0 ? 0xFFFFFFFFu : 0u);
+                        if (operand.kind == OperandKind::Literal ||
+                            operand.kind == OperandKind::InlineFloat)
+                            return b.uconst(0);
+                        if (operand.kind == OperandKind::Special && operand.value == 125)
+                            return b.uconst(0);                       // null pair
+                        if (operand.kind == OperandKind::VGPR ||
+                            operand.kind == OperandKind::SGPR ||
+                            (operand.kind == OperandKind::Special &&
+                             operand.value >= 106 && operand.value < 124)) {
+                            Operand next = operand;
+                            ++next.value;
+                            return val(next);
+                        }
+                        ok = false;
+                        return b.uconst(0);
+                    };
+
+                    const uint32_t a = val(in.src[0]), c = val(in.src[1]);
+                    const uint32_t add_lo = val(in.src[2]), add_hi = high_half(in.src[2]);
+                    const uint32_t mul_lo = b.ibin(Op_IMul, a, c);
+                    const uint32_t mul_hi = b.umul_hi(a, c);
+                    const uint32_t result_lo = b.ibin(Op_IAdd, mul_lo, add_lo);
+                    const uint32_t carry_lo = b.ucmp(Op_ULessThan, result_lo, mul_lo);
+                    const uint32_t high_sum = b.ibin(Op_IAdd, mul_hi, add_hi);
+                    const uint32_t carry_hi0 = b.ucmp(Op_ULessThan, high_sum, mul_hi);
+                    const uint32_t carry_word = b.sel(carry_lo, b.uconst(1), b.uconst(0));
+                    const uint32_t result_hi = b.ibin(Op_IAdd, high_sum, carry_word);
+                    const uint32_t carry_hi1 = b.ucmp(Op_ULessThan, result_hi, high_sum);
+                    const uint32_t carry_out = b.lor(carry_hi0, carry_hi1);
+
+                    const int hi_dst = in.dst.value + 1;
+                    const uint32_t old_hi = vreg_old(b, rs, hi_dst);
+                    vreg[in.dst.value] = result_lo;
+                    vreg[hi_dst] = result_hi;
+                    predicate_write(b, rs, hi_dst, old_hi);
+                    if (in.sdst.value == 106 || in.sdst.value == 107) rs.vcc = carry_out;
+                    else if (in.sdst.kind == OperandKind::SGPR) rs.sreg_bool[in.sdst.value] = carry_out;
+                    else ok = false;
+                }
             } else if (in.opcode == 0x169) {                          // v_mul_lo_u32
                 vreg[in.dst.value] = b.ibin(Op_IMul, val(in.src[0]), val(in.src[1]));
             } else if (in.opcode == 0x16a) {                          // v_mul_hi_u32 (high 32 bits)
@@ -3165,6 +3613,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // VOP3 0x151 = v_min3_f32, 0x154 = v_max3_f32 — 0xd551…/0xd554…). CONFIDENCE: HIGH.
                 uint32_t op = in.opcode == 0x151 ? (uint32_t)Glsl_FMin : (uint32_t)Glsl_FMax;
                 vreg[in.dst.value] = fresult(b.fext2(op, b.fext2(op, fv(0), fv(1)), fv(2)));
+            } else if (in.opcode == 0x368 || in.opcode == 0x369) {    // v_cvt_pknorm_{i16,u16}_f32
+                // Clamp and normalize two f32 values, then pack src0 in bits[15:0] and src1 in
+                // bits[31:16]. Astro's title ship VS uses the unsigned form (exact first word
+                // d7690002). AMD specifies round-to-nearest-even for the normalized conversion.
+                const bool is_signed = in.opcode == 0x368;
+                const float scale = is_signed ? 32767.0f : 65535.0f;
+                const uint32_t lo = b.pack_norm(fv(0), 16, is_signed, scale);
+                const uint32_t hi = b.pack_norm(fv(1), 16, is_signed, scale);
+                vreg[in.dst.value] = b.ibin(
+                    Op_BitwiseOr, lo, b.ibin(Op_ShiftLeftLogical, hi, b.uconst(16)));
             } else if (in.opcode == 0x36A) {                          // v_cvt_pk_u16_u32
                 // Pack two u32 into u16 halves with UNSIGNED SATURATION: lo = min(s0,0xFFFF),
                 // hi = min(s1,0xFFFF); dst = lo | hi<<16. VERIFIED(round-trip llvm-mc gfx1010:
@@ -3229,6 +3687,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 uint32_t t1 = b.ibin(Op_BitwiseAnd, s0, val(in.src[1]));
                 uint32_t t2 = b.ibin(Op_BitwiseAnd, b.iun(Op_Not, s0), val(in.src[2]));
                 vreg[in.dst.value] = b.ibin(Op_BitwiseOr, t1, t2);
+            } else if (in.opcode == 0x364) {                          // v_bcnt_u32_b32
+                // AMD RDNA2: D = popcount(S0) + S1. The third VOP3 source field is unused.
+                vreg[in.dst.value] = b.ibin(Op_IAdd,
+                                             b.iun(Op_BitCount, val(in.src[0])),
+                                             val(in.src[1]));
             } else if (in.opcode == 0x36D) {                          // v_add3_u32 = s0+s1+s2
                 vreg[in.dst.value] = b.ibin(Op_IAdd, b.ibin(Op_IAdd, val(in.src[0]), val(in.src[1])), val(in.src[2]));
             } else if (in.opcode == 0x346) {                          // v_lshl_add_u32 = (s0<<(s1&31))+s2
@@ -3293,11 +3756,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // index, the common "get my lane id" idiom, e.g. shader 037); inline 0 -> never; an SGPR
                 // pair -> that saved mask's bool. A general computed 32-bit mask VALUE isn't representable
                 // per-lane, so reject that. LDS+barriers (allow_wave => straight-line, barrier-uniform).
-                const Operand& s0 = in.src[0]; uint32_t active = 0;
-                if (s0.value == 126 || s0.value == 127) active = rs.exec;
-                else if (s0.kind == OperandKind::InlineInt && s0.value == -1) active = b.btrue();
-                else if (s0.kind == OperandKind::InlineInt && s0.value == 0)  active = b.bfalse();
-                else if (s0.kind == OperandKind::SGPR) { auto it = rs.sreg_bool.find(s0.value); if (it != rs.sreg_bool.end()) active = it->second; }
+                const uint32_t active = mbcnt_source_bit(
+                    b, rs, in.src[0], in.opcode == 0x366);
                 if (active) vreg[in.dst.value] = b.mbcnt(active, val(in.src[1]), in.opcode == 0x365);
                 else ok = false;
             } else if (in.opcode == 0x12F) {                          // v_cvt_pkrtz_f16_f32 = pack(s0->lo, s1->hi)
@@ -3505,9 +3965,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // per-lane load from the bound constant buffer: byte addr = (offen ? VADDR : 0) + SOFFSET
             // + inst-offset; index = addr>>2; N dwords -> VDATA..+N-1. Descriptor (SRSRC), idxen*stride,
             // and the format-converting buffer_load_format_* variants are deferred. Compute-only (cbuf).
-            if (!allow_smem) { ok = false; return true; }
-            uint32_t n = 0; bool is_format = false, is_store = false;
+            uint32_t n = 0; bool is_format = false, is_store = false, is_atomic = false;
+            bool raw_subword = false, raw_signed = false;
+            uint32_t raw_bits = 32;
             switch (in.opcode) {
+                case 0x8: n = 1; raw_subword = true; raw_bits = 8; break;   // buffer_load_ubyte
+                case 0x9: n = 1; raw_subword = true; raw_signed = true; raw_bits = 8; break; // sbyte
+                case 0xA: n = 1; raw_subword = true; raw_bits = 16; break;  // buffer_load_ushort
+                case 0xB: n = 1; raw_subword = true; raw_signed = true; raw_bits = 16; break; // sshort
                 case 0xC: n = 1; break;                     // buffer_load_dword
                 case 0xD: n = 2; break;                     // buffer_load_dwordx2
                 case 0xE: n = 4; break;                     // buffer_load_dwordx4
@@ -3524,7 +3989,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x5: n = 2; is_format = true; is_store = true; break;   // buffer_store_format_xy
                 case 0x6: n = 3; is_format = true; is_store = true; break;   // buffer_store_format_xyz
                 case 0x7: n = 4; is_format = true; is_store = true; break;   // buffer_store_format_xyzw
-                default: ok = false; return true;           // typed / atomics not yet
+                case 0x38: n = 1; is_atomic = true; break; // buffer_atomic_umax: mem=max_u32(mem,VDATA), VDATA=old
+                default: ok = false; return true;           // remaining typed/atomic opcodes deferred
             }
             uint32_t offset = in.literal & 0xFFFu;
             bool offen = (in.literal >> 12) & 1u, idxen = (in.literal >> 13) & 1u;
@@ -3532,7 +3998,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // table bytes live inside the shader blob — detect_pcrel_tables already copied them out.
             // Fold to a compile-time constant lookup: dword index = (inst offset + offen VADDR) >> 2;
             // out-of-range indexes read 0 (the hardware's OOB contract for a bounded V#).
-            if (!is_format && !is_store) {
+            if (!is_format && !is_store && !is_atomic && !raw_subword) {
                 auto pt = rs.mubuf_pcrel_tables.find(in.pc);
                 if (pt != rs.mubuf_pcrel_tables.end()) {
                     const std::vector<uint32_t>& tab = pt->second;
@@ -3553,6 +4019,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     return true;
                 }
             }
+            // A proven PC-relative table is self-contained shader data and needs no runtime resource
+            // bindings. Only external buffer accesses require the stage's SMEM/MUBUF resource gate.
+            // Keep this check after the fold so resource-free graphics shaders (Astro Bot's loading VS)
+            // can consume their embedded lookup table without making unresolved V# accesses permissive.
+            if (!allow_smem) { ok = false; return true; }
             uint32_t binding = 2, stride = 0;   // overwritten by SRSRC resolution below whenever a resource
                                                 // table is present (format AND raw ops); the binding-2 default
                                                 // survives only on the table-less offline path (see below)
@@ -3633,6 +4104,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 stride  = res->stride;
                 // fmt stays raw Uint32: untyped ops move raw dwords regardless of the V#'s declared format.
             }
+            if (raw_subword) {
+                if (raw_bits == 8) fmt = raw_signed ? DataFormat::Sint8 : DataFormat::Uint8;
+                else               fmt = raw_signed ? DataFormat::Sint16 : DataFormat::Uint16;
+            }
             // else (rt == nullptr): table-less offline compute shell (recompile_valu without a resource
             // table — the unit-test harness). Keep the legacy single-cbuf convention: binding 2, stride 0.
             // The live graphics path can never reach here table-less: recompile_vertex/recompile_fragment
@@ -3675,7 +4150,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // the gap) rather than silently mis-decode. Aligned iff: inst offset %4==0; stride %4==0
             // when idxen; no offen (a runtime per-lane byte offset is unprovable); SOFFSET is NULL/0.
             bool dyn_half = false;   // 16-bit element at a runtime dword half (stride-2 buffers, #273)
-            if (packed) {
+            if (packed && !raw_subword) {
                 bool base_aligned;
                 if (dyn_vfetch) {
                     // The dyn_vfetch address path (below) is exactly gl_VertexIndex*stride and DROPS the
@@ -3737,6 +4212,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 addr = b.ibin(Op_IAdd, addr, val(in.src[2]));          // SOFFSET
             }
             uint32_t idx = b.ibin(Op_ShiftRightLogical, addr, b.uconst(2));
+            if (is_atomic) {
+                const int d = in.dst.value;
+                const uint32_t old = vreg_old(b, rs, d);
+                const auto it = rs.vreg.find(d);
+                const uint32_t value = it == rs.vreg.end() ? b.uconst(0) : it->second;
+                rs.vreg[d] = b.cbuf_atomic_rtn(Op_AtomicUMax, idx, value, binding,
+                                               rs.exec_narrowed, rs.exec, old);
+                return true;
+            }
             if (is_store) {
                 // Store the VDATA VGPRs (in.dst..+n-1). Integer sub-dword formats (Uint8/Sint8/...) have
                 // no packing path here -> reject rather than mis-store (loads extend them; stores don't pack).
@@ -3786,6 +4270,27 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (is_format && fmt_ncomp && k >= fmt_ncomp) {
                     uint32_t one = fmt_is_int ? 1u : 0x3f800000u;   // integer 1 vs float 1.0 (raw bits)
                     value = b.uconst(k == 3 ? one : 0u);            // W/A -> 1, G/B/Z -> 0
+                } else if (raw_subword) {
+                    // Raw byte/short loads use their full byte address, unlike typed packed-format
+                    // loads whose component packing is descriptor-defined. A 16-bit access may begin
+                    // at byte 3 and straddle two dwords, so join the adjacent words before extracting.
+                    const uint32_t dw0 = b.cbuf_load(idx, binding);
+                    const uint32_t byte_in_dw = b.ibin(Op_BitwiseAnd, addr, b.uconst(3));
+                    const uint32_t shift = b.ibin(Op_ShiftLeftLogical, byte_in_dw, b.uconst(3));
+                    uint32_t joined = b.ibin(Op_ShiftRightLogical, dw0, shift);
+                    if (raw_bits == 16) {
+                        const uint32_t dw1 = b.cbuf_load(b.ibin(Op_IAdd, idx, b.uconst(1)), binding);
+                        const uint32_t inv_shift = b.ibin(
+                            Op_BitwiseAnd,
+                            b.ibin(Op_ISub, b.uconst(32), shift), b.uconst(31));
+                        const uint32_t upper = b.ibin(Op_ShiftLeftLogical, dw1, inv_shift);
+                        joined = b.ibin(Op_BitwiseOr, joined,
+                                        b.sel(b.ucmp(Op_IEqual, shift, b.uconst(0)),
+                                              b.uconst(0), upper));
+                    }
+                    value = raw_signed
+                        ? b.bfe_s(joined, b.uconst(0), b.uconst(raw_bits))
+                        : b.bfe_u(joined, b.uconst(0), b.uconst(raw_bits));
                 } else if (!packed) {
                     uint32_t kidx = k ? b.ibin(Op_IAdd, idx, b.uconst(k)) : idx;
                     value = b.cbuf_load(kidx, binding);                  // raw 32-bit component
@@ -3935,6 +4440,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             const bool is_sample = (in.opcode == 0x20), is_load = (in.opcode == 0x00);
             const bool is_sample_l = (in.opcode == 0x24), is_sample_lz = (in.opcode == 0x27);
             const bool is_sample_b = (in.opcode == 0x25), is_gather_lz = (in.opcode == 0x47);
+            const bool is_sample_c_lz = (in.opcode == 0x2f);
             // image_gather4_lz_o = 0x57 (gather at base level with the _o packed-offset operand in the
             // FIRST vaddr — llvm-mc gfx1030 round-trip on live DOLL bytes: 0xf15c0808 "image_gather4_lz_o
             // v[4:7], [v0, v18, v19], ..." — coords follow the offset, matching image_sample_b's
@@ -3953,7 +4459,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             const bool dimcube = (in.mimg_dim == 3u);   // CUBE: stacked-face 2D lowering (#273, below)
             if (in.mimg_dim == 5u && getenv("PROSPER_GFXLOG"))
                 fprintf(stderr, "[recompile] 2D_ARRAY image_sample -> sampled as base slice 0 (array index dropped; #325)\n");
-            if ((!is_sample && !is_load && !is_sample_l && !is_sample_lz && !is_sample_b && !is_gather_lz &&
+            if ((!is_sample && !is_load && !is_sample_l && !is_sample_lz && !is_sample_b &&
+                 !is_sample_c_lz && !is_gather_lz &&
                  !is_gather_lz_o && !is_sample_lz_o) || (!dim2d && !dim3d && !dimcube)) { ok = false; return true; }
             if (res->cls != ResourceClass::Texture) { ok = false; return true; }
             // coords (normalized float for sample, integer texel for load). Non-NSA: consecutive from VADDR.
@@ -3994,6 +4501,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 else if (is_load)   b.image_fetch_3d(res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)), out);
                 else                b.image_sample_lod_3d(res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)),
                                                           b.uconst(0), out);   // _lz: base level
+            } else if (is_sample_c_lz) {
+                // Astro Bot shadow/visibility packet (exact live opcode 0x2f, dim 2D_ARRAY,
+                // NSA vaddr=[u,v,layer,dref]). Integer views and non-array dimensions are not
+                // legal for this lowering; reject rather than silently turning a comparison
+                // sample into an ordinary color read.
+                if (in.mimg_dim != 5u || uint_texture || !res->depth_compare) {
+                    ok = false; return true;
+                }
+                b.declare_texture(res->binding, Dim_2D, false, true, true);
+                b.image_sample_dref_lz_2d_array(
+                    res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)), vread(cvg(3)), out);
             } else if (is_gather_lz || is_gather_lz_o) {
                 // gather4 dmask selects ONE channel (must be a single bit); the result is always the
                 // four texels of that channel -> 4 consecutive VDATA VGPRs, gather order preserved.
@@ -4073,14 +4591,34 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // offset; the backing store is dword-indexed. gfx10 ds_write2_b64 carries two independent
             // 8-bit offsets in units of 64-bit elements, while ds_write_b64 uses the ordinary 16-bit
             // byte offset. GDS and the remaining widths/atomics are deferred.
-            if (!b.is_compute || (in.opcode != 0x07 && in.opcode != 0x08 && in.opcode != 0x20 &&
-                                  in.opcode != 0x0d && in.opcode != 0x36 &&
-                                  in.opcode != 0x4d && in.opcode != 0x4e &&
-                                  in.opcode != 0x76 && in.opcode != 0x77)) {
+            if (!b.is_compute || (in.opcode != 0x00 && in.opcode != 0x07 &&
+                                  in.opcode != 0x08 && in.opcode != 0x20 &&
+                                  in.opcode != 0x2d &&
+                                  in.opcode != 0x0d && in.opcode != 0x36 && in.opcode != 0x37 &&
+                                  in.opcode != 0x3d && in.opcode != 0x3e && in.opcode != 0x4d && in.opcode != 0x4e &&
+                                  in.opcode != 0x76 && in.opcode != 0x77 &&
+                                  in.opcode != 0xde && in.opcode != 0xdf &&
+                                  in.opcode != 0xfe && in.opcode != 0xff)) {
                 ok = false; return true;
             }
             b.declare_lds();
             auto vread = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
+            if (in.opcode == 0x3d || in.opcode == 0x3e) { // ds_consume/append: wave-wide LDS counter allocation
+                // AMD RDNA2 ISA 12.13: address = M0[15:0] + byte offset; atomically subtract/add
+                // popcount(EXEC) once for the wave and broadcast the pre-op value to valid lanes.
+                auto m0 = rs.sreg.find(124);
+                if (!allow_wave || m0 == rs.sreg.end() ||
+                    (b.wave_size != 32 && b.wave_size != 64)) {
+                    ok = false; return true;
+                }
+                const uint32_t base = b.ibin(Op_BitwiseAnd, m0->second, b.uconst(0xFFFFu));
+                const uint32_t byte_addr = b.ibin(Op_IAdd, base, b.uconst(in.literal));
+                const uint32_t idx = b.ibin(Op_ShiftRightLogical, byte_addr, b.uconst(2));
+                const uint32_t old = vreg_old(b, rs, in.dst.value);
+                rs.vreg[in.dst.value] = b.wave_append(idx, rs.exec, in.opcode == 0x3d);
+                predicate_write(b, rs, in.dst.value, old);
+                return true;
+            }
             if (in.opcode == 0x4e) {                    // ds_write2_b64: two VGPR pairs at offset0/offset1
                 const uint32_t base = b.ibin(Op_ShiftRightLogical, vread(in.src[0].value), b.uconst(2));
                 const uint32_t idx0 = b.ibin(Op_IAdd, base, b.uconst((in.literal & 0xFFu) * 2u));
@@ -4108,9 +4646,28 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 return true;
             }
+            if (in.opcode == 0x37) {                    // ds_read2_b32: two dwords at offset0/offset1
+                // AMD RDNA2 ISA 12.13: RETURN_DATA[0/1] = MEM[ADDR + OFFSET0/1 * 4].
+                // The two 8-bit offsets share the instruction's 16-bit offset field. Astro's
+                // loading compositor uses both adjacent (0,1) and non-zero (16,17) pairs.
+                const uint32_t base = b.ibin(Op_ShiftRightLogical, vread(in.src[0].value), b.uconst(2));
+                const uint32_t indices[2] = {
+                    b.ibin(Op_IAdd, base, b.uconst(in.literal & 0xFFu)),
+                    b.ibin(Op_IAdd, base, b.uconst((in.literal >> 8) & 0xFFu)),
+                };
+                for (int k = 0; k < 2; ++k) {
+                    const uint32_t old = vreg_old(b, rs, in.dst.value + k);
+                    rs.vreg[in.dst.value + k] = b.lds_load(indices[k]);
+                    predicate_write(b, rs, in.dst.value + k, old);
+                }
+                return true;
+            }
             uint32_t addr = b.ibin(Op_IAdd, vread(in.src[0].value), b.uconst(in.literal));
             uint32_t idx  = b.ibin(Op_ShiftRightLogical, addr, b.uconst(2));
-            if (in.opcode == 0x07 || in.opcode == 0x08) { // ds_min_u32 / ds_max_u32
+            if (in.opcode == 0x00) {                     // ds_add_u32: LDS += DATA0, no VGPR return
+                b.lds_atomic(Op_AtomicIAdd, idx, vread(in.src[1].value),
+                             rs.exec_narrowed, rs.exec);
+            } else if (in.opcode == 0x07 || in.opcode == 0x08) { // ds_min_u32 / ds_max_u32
                 b.lds_atomic(in.opcode == 0x07 ? Op_AtomicUMin : Op_AtomicUMax,
                              idx, vread(in.src[1].value), rs.exec_narrowed, rs.exec);
             } else if (in.opcode == 0x20) {             // ds_add_rtn_u32: VDST = old LDS; LDS += DATA0
@@ -4118,16 +4675,29 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rs.vreg[in.dst.value] = b.lds_atomic_rtn(
                     Op_AtomicIAdd, idx, vread(in.src[1].value), rs.exec_narrowed, rs.exec, old);
                 predicate_write(b, rs, in.dst.value, old);
+            } else if (in.opcode == 0x2d) {             // ds_wrxchg_rtn_b32: swap DATA0, return old LDS
+                const uint32_t old = vreg_old(b, rs, in.dst.value);
+                rs.vreg[in.dst.value] = b.lds_atomic_rtn(
+                    Op_AtomicExchange, idx, vread(in.src[1].value),
+                    rs.exec_narrowed, rs.exec, old);
+                predicate_write(b, rs, in.dst.value, old);
             } else if (in.opcode == 0x0d) {             // ds_write_b32: LDS[idx] = DATA0
                 b.lds_store(idx, vread(in.src[1].value), rs.exec_narrowed, rs.exec);
-            } else if (in.opcode == 0x4d) {             // ds_write_b64: LDS[idx:idx+1] = DATA0 pair
-                b.lds_store(idx, vread(in.src[1].value), rs.exec_narrowed, rs.exec);
-                b.lds_store(b.ibin(Op_IAdd, idx, b.uconst(1)), vread(in.src[1].value + 1),
-                            rs.exec_narrowed, rs.exec);
-            } else if (in.opcode == 0x76) {             // ds_read_b64: VDST pair = LDS[idx:idx+1]
-                for (int k = 0; k < 2; ++k) {
+            } else if (in.opcode == 0x4d || in.opcode == 0xde || in.opcode == 0xdf) {
+                // ds_write_b64 / ds_write_b96 / ds_write_b128. The wide forms consume consecutive
+                // DATA0 VGPRs and write consecutive LDS dwords from the ordinary byte address.
+                const int dwords = in.opcode == 0x4d ? 2 : in.opcode == 0xde ? 3 : 4;
+                for (int k = 0; k < dwords; ++k) {
+                    const uint32_t at = k ? b.ibin(Op_IAdd, idx, b.uconst((uint32_t)k)) : idx;
+                    b.lds_store(at, vread(in.src[1].value + k), rs.exec_narrowed, rs.exec);
+                }
+            } else if (in.opcode == 0x76 || in.opcode == 0xfe || in.opcode == 0xff) {
+                // ds_read_b64 / ds_read_b96 / ds_read_b128. RDNA2 ISA 12.13 opcodes 118/254/255;
+                // all return consecutive dwords beginning at the ordinary LDS byte address.
+                const int dwords = in.opcode == 0x76 ? 2 : in.opcode == 0xfe ? 3 : 4;
+                for (int k = 0; k < dwords; ++k) {
                     const uint32_t old = vreg_old(b, rs, in.dst.value + k);
-                    const uint32_t at = k ? b.ibin(Op_IAdd, idx, b.uconst(1)) : idx;
+                    const uint32_t at = k ? b.ibin(Op_IAdd, idx, b.uconst((uint32_t)k)) : idx;
                     rs.vreg[in.dst.value + k] = b.lds_load(at);
                     predicate_write(b, rs, in.dst.value + k, old);
                 }
@@ -4228,7 +4798,17 @@ std::unordered_map<uint32_t, std::vector<uint32_t>> detect_pcrel_tables(
                 }
                 break;
             }
-            case Rdna2Format::SOPK: kill(in.dst.value); break;
+            case Rdna2Format::SOPK:
+                // s_movk_i32 is also a common way to fill V# word2 (num_records). Astro Bot's
+                // fullscreen-table VS uses it immediately before s_getpc_b64; treating every SOPK
+                // as an unknown write prevented the otherwise-proven embedded table from folding.
+                // The immediate is sign-extended by the ISA, matching the scalar register value.
+                kill(in.dst.value);
+                if (in.opcode == 0x00) {
+                    kconst[in.dst.value] = static_cast<uint32_t>(static_cast<int32_t>(in.simm16));
+                    fact_pc[in.dst.value] = in.pc;
+                }
+                break;
             case Rdna2Format::SMEM: {
                 uint32_t n = 1;
                 switch (in.opcode) { case 0x1: case 0x9: n=2; break; case 0x2: case 0xA: n=4; break;
@@ -4583,8 +5163,9 @@ size_t rdna2_recompile_code_span(const uint32_t* code, size_t dwords) {
 // Native subgroup widths are implementation-defined (llvmpipe is commonly 8), so every invocation
 // remains in the dispatcher until the whole workgroup is done and exchanges its vote at the common
 // switch merge. Dedicated Workgroup scratch keeps multiple hardware waves independent. The fallback
-// is gated by emit_body to complex compute CFGs without guest barriers or synthesized cross-lane
-// operations; ordinary LDS reads, writes, and atomics remain valid while waves visit different cases.
+// is gated by emit_body to complex compute CFGs without guest barriers. Ordinary LDS reads, writes,
+// and atomics remain valid while waves visit different cases. V_MBCNT is split into a dedicated
+// common phase so every workgroup invocation reaches its synthesized barriers in uniform control flow.
 bool emit_compute_cfg_state_machine(
     SpirvCompute& b, RegState& initial, const std::vector<Rdna2Inst>& ins,
     const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt,
@@ -4603,11 +5184,74 @@ bool emit_compute_cfg_state_machine(
     const uint32_t group_active_slot = wave_result_base + wave_count;
     b.declare_cfg_scratch(group_active_slot + 1);
 
-    // Split at every branch target and fallthrough. Case values are dense block indices, not guest PCs.
+    // Discover every scalar pair that lives in the per-lane mask domain.  Besides defining the
+    // dispatcher variables below, this identifies s_cmp_{eq,lg}_u64 mask,0: its SCC result is a
+    // whole-wave reduction and therefore must be lowered in the common synchronized phase.
+    std::set<int> static_mask_keys;
+    for (const auto& kv : initial.sreg_bool) static_mask_keys.insert(kv.first);
+    for (const auto& in : ins) {
+        if (in.is_end) break;
+        if (in.fmt == Rdna2Format::SOP1 &&
+            (in.opcode == 0x04 || in.opcode == 0x08 || in.opcode == 0x0a ||
+             in.opcode == 0x24 || in.opcode == 0x25 || in.opcode == 0x37) &&
+            in.dst.value != 126 && in.dst.value != 127)
+            static_mask_keys.insert(in.dst.value);
+        if (in.fmt == Rdna2Format::SOP2 &&
+            (in.opcode == 0x0b || in.opcode == 0x0f || in.opcode == 0x11 ||
+             in.opcode == 0x13 || in.opcode == 0x15 || in.opcode == 0x17 ||
+             in.opcode == 0x19 || in.opcode == 0x1b || in.opcode == 0x1d ||
+             in.opcode == 0x25) &&
+            in.dst.value != 106 && in.dst.value != 107 &&
+            in.dst.value != 126 && in.dst.value != 127)
+            static_mask_keys.insert(in.dst.value);
+        if (in.fmt == Rdna2Format::VOPC && in.dst.kind == OperandKind::SGPR &&
+            in.dst.value <= 105)
+            static_mask_keys.insert(in.dst.value);
+    }
+    auto mask_zero_compare_source = [&](const Rdna2Inst& in) -> int {
+        if (in.fmt != Rdna2Format::SOPC || (in.opcode != 0x12 && in.opcode != 0x13))
+            return -1;
+        auto zero = [](const Operand& o) {
+            return o.kind == OperandKind::InlineInt && o.value == 0;
+        };
+        if (in.src[0].kind == OperandKind::SGPR && static_mask_keys.count(in.src[0].value) &&
+            zero(in.src[1]))
+            return in.src[0].value;
+        if (in.src[1].kind == OperandKind::SGPR && static_mask_keys.count(in.src[1].value) &&
+            zero(in.src[0]))
+            return in.src[1].value;
+        return -1;
+    };
+
+    // Split at every branch target/fallthrough and around every cross-lane operation. Case values are
+    // dense block indices, not guest PCs. A cross-lane op must end its block so the common synchronized
+    // phase can publish its result before any invocation advances to the following guest instruction.
     std::set<uint32_t> start_set{ins.front().pc};
+    std::unordered_map<uint32_t, uint32_t> mbcnt_event_for_pc;
+    std::unordered_map<uint32_t, uint32_t> append_event_for_pc;
     for (size_t i = 0; i < ins.size(); ++i) {
         const auto& in = ins[i];
         if (in.is_end) break;
+        if (in.fmt == Rdna2Format::VOP3 &&
+            (in.opcode == 0x365 || in.opcode == 0x366)) {
+            mbcnt_event_for_pc.emplace(in.pc,
+                static_cast<uint32_t>(mbcnt_event_for_pc.size()));
+            start_set.insert(in.pc);
+            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
+                start_set.insert(ins[i + 1].pc);
+        }
+        if (in.fmt == Rdna2Format::DS && (in.opcode == 0x3d || in.opcode == 0x3e)) {
+            append_event_for_pc.emplace(in.pc,
+                static_cast<uint32_t>(append_event_for_pc.size()));
+            start_set.insert(in.pc);
+            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
+                start_set.insert(ins[i + 1].pc);
+        }
+        if (mask_zero_compare_source(in) >= 0) {
+            start_set.insert(in.pc);
+            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
+                start_set.insert(ins[i + 1].pc);
+        }
         if (in.fmt != Rdna2Format::SOPP || in.opcode < 0x02 || in.opcode > 0x09 ||
             in.opcode == 0x03) continue;
         const uint32_t target = branch_target(in);
@@ -4632,6 +5276,10 @@ bool emit_compute_cfg_state_machine(
                      (src.kind == OperandKind::Special && src.value >= 106 && src.value <= 124))
                 sregs.insert(src.value);
         }
+        // 64-bit scalar compares encode only the low SGPR of each pair in their two source fields.
+        if (in.fmt == Rdna2Format::SOPC && (in.opcode == 0x12 || in.opcode == 0x13))
+            for (uint32_t k = 0; k < 2; ++k)
+                if (in.src[k].kind == OperandKind::SGPR) sregs.insert(in.src[k].value + 1);
     }
     for (const auto& kv : initial.vreg) vregs.insert(kv.first);
     for (const auto& kv : initial.sreg) sregs.insert(kv.first);
@@ -4653,26 +5301,10 @@ bool emit_compute_cfg_state_machine(
     }
 
     // Saved mask pairs and scalar-spill lane slots have their own value domains.
-    std::set<int> mask_keys;
-    for (const auto& kv : initial.sreg_bool) mask_keys.insert(kv.first);
+    std::set<int> mask_keys = static_mask_keys;
     std::set<std::pair<int, int>> lane_slots, mask_lane_slots;
-    // Discover every mask-valued SGPR first. A lane spill can precede another static definition of
-    // that mask in a back-edge block, so classifying spills in the same pass would be order-dependent.
-    for (const auto& in : ins) {
-        if (in.is_end) break;
-        if (in.fmt == Rdna2Format::SOP1 &&
-            (in.opcode == 0x04 || in.opcode == 0x0a || in.opcode == 0x24 || in.opcode == 0x25) &&
-            in.dst.value != 126 && in.dst.value != 127)
-            mask_keys.insert(in.dst.value);
-        if (in.fmt == Rdna2Format::SOP2 &&
-            (in.opcode == 0x0b || in.opcode == 0x0f || in.opcode == 0x11 ||
-             in.opcode == 0x13 || in.opcode == 0x15 || in.opcode == 0x17 ||
-             in.opcode == 0x19 || in.opcode == 0x1b || in.opcode == 0x1d) &&
-            in.dst.value != 106 && in.dst.value != 107 && in.dst.value != 126 && in.dst.value != 127)
-            mask_keys.insert(in.dst.value);
-        if (in.fmt == Rdna2Format::VOPC && in.dst.kind == OperandKind::SGPR && in.dst.value <= 105)
-            mask_keys.insert(in.dst.value);
-    }
+    // A lane spill can precede another static definition of its mask in a back-edge block, hence the
+    // complete discovery pass above occurs before classifying any spill slots here.
     for (const auto& in : ins) {
         if (in.is_end) break;
         if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x361 &&
@@ -4708,8 +5340,24 @@ bool emit_compute_cfg_state_machine(
     const uint32_t vote_pending_var = b.function_var(b.t_bool, ptr_bool);
     const uint32_t vote_value_var = b.function_var(b.t_bool, ptr_bool);
     const uint32_t vote_invert_var = b.function_var(b.t_bool, ptr_bool);
+    const uint32_t vote_to_scc_var = b.function_var(b.t_bool, ptr_bool);
     const uint32_t vote_taken_var = b.function_var(b.t_u32, ptr_u32);
     const uint32_t vote_next_var = b.function_var(b.t_u32, ptr_u32);
+    const uint32_t mbcnt_pending_var = b.function_var(b.t_bool, ptr_bool);
+    const uint32_t mbcnt_mask_var = b.function_var(b.t_bool, ptr_bool);
+    const uint32_t mbcnt_low_var = b.function_var(b.t_bool, ptr_bool);
+    const uint32_t mbcnt_write_var = b.function_var(b.t_bool, ptr_bool);
+    const uint32_t mbcnt_event_var = b.function_var(b.t_u32, ptr_u32);
+    const uint32_t mbcnt_acc_var = b.function_var(b.t_u32, ptr_u32);
+    const uint32_t mbcnt_dst_var = b.function_var(b.t_u32, ptr_u32);
+    const uint32_t mbcnt_sum_var = b.function_var(b.t_u32, ptr_u32);
+    const uint32_t append_pending_var = b.function_var(b.t_bool, ptr_bool);
+    const uint32_t append_active_var = b.function_var(b.t_bool, ptr_bool);
+    const uint32_t append_event_var = b.function_var(b.t_u32, ptr_u32);
+    const uint32_t append_consume_var = b.function_var(b.t_bool, ptr_bool);
+    const uint32_t append_idx_var = b.function_var(b.t_u32, ptr_u32);
+    const uint32_t append_dst_var = b.function_var(b.t_u32, ptr_u32);
+    const uint32_t append_count_var = b.function_var(b.t_u32, ptr_u32);
 
     const uint32_t zero = b.uconst(0), no = b.bfalse(), yes = b.btrue();
     for (const auto& kv : vv) {
@@ -4750,6 +5398,7 @@ bool emit_compute_cfg_state_machine(
 
     auto load_state = [&]() {
         RegState state;
+        state.sreg_input = initial.sreg_input;
         for (const auto& kv : vv) state.vreg[kv.first] = b.load_function(b.t_u32, kv.second);
         for (const auto& kv : sv) state.sreg[kv.first] = b.load_function(b.t_u32, kv.second);
         for (const auto& kv : mv) {
@@ -4820,8 +5469,22 @@ bool emit_compute_cfg_state_machine(
     b.store_function(vote_pending_var, no);
     b.store_function(vote_value_var, no);
     b.store_function(vote_invert_var, no);
+    b.store_function(vote_to_scc_var, no);
     b.store_function(vote_taken_var, zero);
     b.store_function(vote_next_var, zero);
+    b.store_function(mbcnt_pending_var, no);
+    b.store_function(mbcnt_mask_var, no);
+    b.store_function(mbcnt_low_var, no);
+    b.store_function(mbcnt_write_var, no);
+    b.store_function(mbcnt_event_var, zero);
+    b.store_function(mbcnt_acc_var, zero);
+    b.store_function(mbcnt_dst_var, zero);
+    b.store_function(append_pending_var, no);
+    b.store_function(append_active_var, no);
+    b.store_function(append_event_var, zero);
+    b.store_function(append_consume_var, no);
+    b.store_function(append_idx_var, zero);
+    b.store_function(append_dst_var, zero);
     b.emit_loopmerge(loop_merge, loop_continue);
     b.emit_branch(switch_header);
     b.emit_label(switch_header);
@@ -4847,11 +5510,27 @@ bool emit_compute_cfg_state_machine(
                 if (!written_sregs.count(reg)) state.sreg.erase(reg);
         }
         const Rdna2Inst* terminator = nullptr;
+        const Rdna2Inst* mbcnt = nullptr;
+        const Rdna2Inst* append = nullptr;
+        const Rdna2Inst* mask_compare = nullptr;
         for (const auto& in : ins) {
             if (in.pc < lo || in.pc >= hi) continue;
             if (in.is_end || (in.fmt == Rdna2Format::SOPP && in.opcode >= 0x02 &&
                               in.opcode <= 0x09 && in.opcode != 0x03)) {
                 terminator = &in;
+                break;
+            }
+            if (in.fmt == Rdna2Format::VOP3 &&
+                (in.opcode == 0x365 || in.opcode == 0x366)) {
+                mbcnt = &in;
+                break;
+            }
+            if (in.fmt == Rdna2Format::DS && (in.opcode == 0x3d || in.opcode == 0x3e)) {
+                append = &in;
+                break;
+            }
+            if (mask_zero_compare_source(in) >= 0) {
+                mask_compare = &in;
                 break;
             }
             if (in.fmt == Rdna2Format::EXP) {
@@ -4867,8 +5546,58 @@ bool emit_compute_cfg_state_machine(
                 return false;
             }
         }
+        if (mbcnt) {
+            bool operand_ok = true;
+            const uint32_t mask = mbcnt_source_bit(
+                b, state, mbcnt->src[0], mbcnt->opcode == 0x366);
+            const uint32_t acc = operand_bits(b, state, *mbcnt, mbcnt->src[1], &operand_ok);
+            const auto event = mbcnt_event_for_pc.find(mbcnt->pc);
+            if (!mask || !operand_ok || event == mbcnt_event_for_pc.end()) return false;
+            b.store_function(mbcnt_pending_var, yes);
+            b.store_function(mbcnt_mask_var, mask);
+            b.store_function(mbcnt_low_var, mbcnt->opcode == 0x365 ? yes : no);
+            // load_state conservatively marks EXEC narrowed. Writing under the current per-lane EXEC
+            // is equivalent for a known-full mask and preserves inactive VGPR lanes for divergent code.
+            b.store_function(mbcnt_write_var, state.exec);
+            b.store_function(mbcnt_event_var, b.uconst(event->second));
+            b.store_function(mbcnt_acc_var, acc);
+            b.store_function(mbcnt_dst_var, b.uconst(static_cast<uint32_t>(mbcnt->dst.value)));
+        }
+        if (append) {
+            const auto m0 = state.sreg.find(124);
+            const auto event = append_event_for_pc.find(append->pc);
+            if (m0 == state.sreg.end() || event == append_event_for_pc.end()) return false;
+            b.declare_lds();
+            const uint32_t base = b.ibin(Op_BitwiseAnd, m0->second, b.uconst(0xffffu));
+            const uint32_t byte_addr = b.ibin(Op_IAdd, base, b.uconst(append->literal));
+            b.store_function(append_pending_var, yes);
+            b.store_function(append_active_var, state.exec);
+            b.store_function(append_event_var, b.uconst(event->second));
+            b.store_function(append_consume_var, append->opcode == 0x3d ? yes : no);
+            b.store_function(append_idx_var,
+                b.ibin(Op_ShiftRightLogical, byte_addr, b.uconst(2)));
+            b.store_function(append_dst_var,
+                b.uconst(static_cast<uint32_t>(append->dst.value)));
+        }
+        if (mask_compare) {
+            const int source = mask_zero_compare_source(*mask_compare);
+            const auto value = state.sreg_bool.find(source);
+            if (value == state.sreg_bool.end()) return false;
+            b.store_function(vote_pending_var, yes);
+            b.store_function(vote_value_var, value->second);
+            // EQ mask,0 means !any(mask); LG mask,0 means any(mask).
+            b.store_function(vote_invert_var,
+                mask_compare->opcode == 0x12 ? yes : no);
+            b.store_function(vote_to_scc_var, yes);
+        }
         save_state(state);
-        if (!terminator) {
+        if (mbcnt) {
+            set_next(mbcnt->pc + mbcnt->len_dwords);
+        } else if (append) {
+            set_next(append->pc + append->len_dwords);
+        } else if (mask_compare) {
+            set_next(mask_compare->pc + mask_compare->len_dwords);
+        } else if (!terminator) {
             set_next(hi);
         } else if (terminator->is_end) {
             b.store_function(active_var, no);
@@ -4907,6 +5636,179 @@ bool emit_compute_cfg_state_machine(
     b.emit_label(switch_merge);
     b.emit_branch(loop_continue);
     b.emit_label(loop_continue);
+
+    // MBCNT common phase. Cases publish an event-tagged mask bit and accumulator, but never emit a
+    // barrier themselves. Every invocation—including ended waves and lanes currently at a different
+    // guest block—therefore executes these two barriers in identical structured control flow. Event
+    // tags keep contributions from different static MBCNT sites isolated if malformed/nonuniform
+    // scalar state ever lets waves reach different sites during the same dispatcher iteration.
+    const uint32_t mbcnt_wave_index = b.ibin(
+        Op_ShiftRightLogical, b.linear_localid,
+        b.uconst(b.wave_size == 32 ? 5u : 6u));
+    const uint32_t mbcnt_lane = b.ibin(
+        Op_BitwiseAnd, b.linear_localid, b.uconst(b.wave_size - 1));
+
+    if (!mbcnt_event_for_pc.empty()) {
+    const uint32_t mbcnt_pending = b.load_function(b.t_bool, mbcnt_pending_var);
+    const uint32_t mbcnt_mask = b.load_function(b.t_bool, mbcnt_mask_var);
+    const uint32_t mbcnt_tag = b.ibin(
+        Op_IAdd, b.load_function(b.t_u32, mbcnt_event_var), b.uconst(1));
+    const uint32_t mbcnt_encoded = b.sel(
+        mbcnt_pending,
+        b.ibin(Op_BitwiseOr,
+               b.ibin(Op_ShiftLeftLogical, mbcnt_tag, b.uconst(1)),
+               b.sel(mbcnt_mask, b.uconst(1), zero)),
+        zero);
+    b.cfg_scratch_store(b.linear_localid, mbcnt_encoded);
+    b.barrier();
+
+    const uint32_t mbcnt_low = b.load_function(b.t_bool, mbcnt_low_var);
+    b.store_function(mbcnt_sum_var, zero);
+    const uint32_t mbcnt_scan = b.id(), mbcnt_scanned = b.id();
+    b.emit_selmerge(mbcnt_scanned);
+    b.emit_condbranch(mbcnt_pending, mbcnt_scan, mbcnt_scanned);
+    b.emit_label(mbcnt_scan);
+    uint32_t mbcnt_sum = zero;
+    const uint32_t mbcnt_wave_base = b.ibin(
+        Op_ShiftLeftLogical, mbcnt_wave_index,
+        b.uconst(b.wave_size == 32 ? 5u : 6u));
+    const uint32_t half_size = std::min(32u, b.wave_size);
+    for (uint32_t i = 0; i < half_size; ++i) {
+        const uint32_t candidate_lane = b.sel(
+            mbcnt_low, b.uconst(i), b.uconst(i + (b.wave_size == 64 ? 32u : 0u)));
+        const uint32_t candidate = b.cfg_scratch_load(
+            b.ibin(Op_IAdd, mbcnt_wave_base, candidate_lane));
+        const uint32_t candidate_tag = b.ibin(
+            Op_ShiftRightLogical, candidate, b.uconst(1));
+        const uint32_t candidate_bit = b.ibin(Op_BitwiseAnd, candidate, b.uconst(1));
+        const uint32_t below = b.ucmp(
+            Op_ULessThan, candidate_lane, mbcnt_lane);
+        uint32_t include = below;
+        if (b.wave_size == 32) include = b.land(include, mbcnt_low);
+        include = b.land(include, b.ucmp(Op_IEqual, candidate_tag, mbcnt_tag));
+        mbcnt_sum = b.b_iadd(mbcnt_sum, b.sel(include, candidate_bit, zero));
+    }
+    b.store_function(mbcnt_sum_var, mbcnt_sum);
+    b.emit_branch(mbcnt_scanned);
+    b.emit_label(mbcnt_scanned);
+    const uint32_t mbcnt_result = b.b_iadd(
+        b.load_function(b.t_u32, mbcnt_acc_var),
+        b.load_function(b.t_u32, mbcnt_sum_var));
+    const uint32_t mbcnt_dst = b.load_function(b.t_u32, mbcnt_dst_var);
+    const uint32_t mbcnt_write = b.land(
+        mbcnt_pending, b.load_function(b.t_bool, mbcnt_write_var));
+    for (const auto& kv : vv) {
+        const uint32_t selected = b.land(
+            mbcnt_write, b.ucmp(Op_IEqual, mbcnt_dst, b.uconst(static_cast<uint32_t>(kv.first))));
+        const uint32_t old = b.load_function(b.t_u32, kv.second);
+        b.store_function(kv.second, b.sel(selected, mbcnt_result, old));
+    }
+    // An ordinary VGPR write ends any scalar-spill lifetime even for lanes masked off by EXEC.
+    for (const auto& kv : lv) {
+        const uint32_t selected = b.land(
+            mbcnt_pending,
+            b.ucmp(Op_IEqual, mbcnt_dst, b.uconst(static_cast<uint32_t>(kv.first.first))));
+        const uint32_t old = b.load_function(b.t_u32, kv.second);
+        b.store_function(kv.second, b.sel(selected, zero, old));
+    }
+    for (const auto& kv : lmv) {
+        const uint32_t selected = b.land(
+            mbcnt_pending,
+            b.ucmp(Op_IEqual, mbcnt_dst, b.uconst(static_cast<uint32_t>(kv.first.first))));
+        const uint32_t old = b.load_function(b.t_bool, kv.second);
+        b.store_function(kv.second, b.bsel(selected, no, old));
+    }
+    b.barrier();
+    }
+
+    if (!append_event_for_pc.empty()) {
+    // DS_APPEND/DS_CONSUME common phase. Each wave reduces popcount(EXEC), its lane zero performs
+    // exactly one LDS atomic add/subtract, and the pre-op value is broadcast through the result slot.
+    // The event tag prevents a wave at one static append from counting another event's lanes.
+    const uint32_t append_pending = b.load_function(b.t_bool, append_pending_var);
+    const uint32_t append_active = b.load_function(b.t_bool, append_active_var);
+    const uint32_t append_tag = b.ibin(
+        Op_IAdd, b.load_function(b.t_u32, append_event_var), b.uconst(1));
+    const uint32_t append_encoded = b.sel(
+        append_pending,
+        b.ibin(Op_BitwiseOr,
+               b.ibin(Op_ShiftLeftLogical, append_tag, b.uconst(1)),
+               b.sel(append_active, b.uconst(1), zero)),
+        zero);
+    b.cfg_scratch_store(b.linear_localid, append_encoded);
+    b.barrier();
+
+    b.store_function(append_count_var, zero);
+    const uint32_t append_scan = b.id(), append_scanned = b.id();
+    b.emit_selmerge(append_scanned);
+    b.emit_condbranch(append_pending, append_scan, append_scanned);
+    b.emit_label(append_scan);
+    uint32_t append_count = zero;
+    const uint32_t append_wave_base = b.ibin(
+        Op_ShiftLeftLogical, mbcnt_wave_index,
+        b.uconst(b.wave_size == 32 ? 5u : 6u));
+    for (uint32_t i = 0; i < b.wave_size; ++i) {
+        const uint32_t candidate_index = b.ibin(
+            Op_IAdd, append_wave_base, b.uconst(i));
+        const uint32_t candidate = b.cfg_scratch_load(candidate_index);
+        const uint32_t candidate_tag = b.ibin(
+            Op_ShiftRightLogical, candidate, b.uconst(1));
+        uint32_t include = b.ucmp(
+            Op_ULessThan, candidate_index, b.uconst(b.local_count));
+        include = b.land(include, b.ucmp(Op_IEqual, candidate_tag, append_tag));
+        append_count = b.b_iadd(
+            append_count,
+            b.sel(include, b.ibin(Op_BitwiseAnd, candidate, b.uconst(1)), zero));
+    }
+    b.store_function(append_count_var, append_count);
+    b.emit_branch(append_scanned);
+    b.emit_label(append_scanned);
+    const uint32_t append_is_leader = b.land(
+        append_pending, b.ucmp(Op_IEqual, mbcnt_lane, zero));
+    const uint32_t append_leader = b.id(), append_reduced = b.id();
+    b.emit_selmerge(append_reduced);
+    b.emit_condbranch(append_is_leader, append_leader, append_reduced);
+    b.emit_label(append_leader);
+    const uint32_t append_count_value = b.load_function(b.t_u32, append_count_var);
+    const uint32_t append_delta = b.sel(
+        b.load_function(b.t_bool, append_consume_var),
+        b.ibin(Op_ISub, zero, append_count_value), append_count_value);
+    const uint32_t append_old = b.lds_atomic_rtn(
+        Op_AtomicIAdd, b.load_function(b.t_u32, append_idx_var),
+        append_delta, false, yes, zero);
+    b.cfg_scratch_store(
+        b.ibin(Op_IAdd, b.uconst(wave_result_base), mbcnt_wave_index), append_old);
+    b.emit_branch(append_reduced);
+    b.emit_label(append_reduced);
+    b.barrier();
+
+    const uint32_t append_result = b.cfg_scratch_load(
+        b.ibin(Op_IAdd, b.uconst(wave_result_base), mbcnt_wave_index));
+    const uint32_t append_dst = b.load_function(b.t_u32, append_dst_var);
+    const uint32_t append_write = b.land(append_pending, append_active);
+    for (const auto& kv : vv) {
+        const uint32_t selected = b.land(
+            append_write,
+            b.ucmp(Op_IEqual, append_dst, b.uconst(static_cast<uint32_t>(kv.first))));
+        const uint32_t old = b.load_function(b.t_u32, kv.second);
+        b.store_function(kv.second, b.sel(selected, append_result, old));
+    }
+    for (const auto& kv : lv) {
+        const uint32_t selected = b.land(
+            append_pending,
+            b.ucmp(Op_IEqual, append_dst, b.uconst(static_cast<uint32_t>(kv.first.first))));
+        const uint32_t old = b.load_function(b.t_u32, kv.second);
+        b.store_function(kv.second, b.sel(selected, zero, old));
+    }
+    for (const auto& kv : lmv) {
+        const uint32_t selected = b.land(
+            append_pending,
+            b.ucmp(Op_IEqual, append_dst, b.uconst(static_cast<uint32_t>(kv.first.first))));
+        const uint32_t old = b.load_function(b.t_bool, kv.second);
+        b.store_function(kv.second, b.bsel(selected, no, old));
+    }
+    b.barrier();
+    }
 
     // Publish this lane's pending vote bit and liveness. The switch merge is reached by every
     // invocation on every iteration, including lanes whose emulated wave has already ended.
@@ -4971,7 +5873,12 @@ bool emit_compute_cfg_state_machine(
         b.load_function(b.t_bool, vote_invert_var), b.logical_not(wave_any), wave_any);
     const uint32_t selected_pc = b.sel(vote_condition,
         b.load_function(b.t_u32, vote_taken_var), b.load_function(b.t_u32, vote_next_var));
-    b.store_function(pc_var, b.sel(pending, selected_pc, b.load_function(b.t_u32, pc_var)));
+    const uint32_t vote_to_scc = b.load_function(b.t_bool, vote_to_scc_var);
+    const uint32_t write_scc = b.land(pending, vote_to_scc);
+    b.store_function(scc_var,
+        b.bsel(write_scc, vote_condition, b.load_function(b.t_bool, scc_var)));
+    const uint32_t write_pc = b.land(pending, b.logical_not(vote_to_scc));
+    b.store_function(pc_var, b.sel(write_pc, selected_pc, b.load_function(b.t_u32, pc_var)));
     const uint32_t group_active = b.ucmp(
         Op_INotEqual, b.cfg_scratch_load(b.uconst(group_active_slot)), zero);
     b.emit_condbranch(group_active, loop_header, loop_merge);
@@ -4997,6 +5904,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
     // MUBUF/SOP1 handlers consult rs.mubuf_pcrel_tables (#273).
     if (code) rs.mubuf_pcrel_tables = detect_pcrel_tables(ins, code, dwords);
     std::unordered_set<uint32_t> effective_safe = safe;
+    const std::unordered_set<uint32_t> dead_masks = dead_wave_mask_writes(ins);
     const CountedLoop L = detect_counted_loop(ins);
     size_t idx = 0;
     // Cross-lane wave ops (mbcnt) emit LDS + barriers, which are only valid at wave-uniform points — so
@@ -5007,15 +5915,24 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             const Rdna2Inst& in = ins[idx];
             if (in.is_end || in.pc >= pc_hi) break;
             if (in.pc < pc_lo) continue;
+            if (dead_masks.count(in.pc)) continue;
             if (in.fmt == Rdna2Format::EXP) { if (!exp_fn(in)) return false; continue; }
             bool ok = true;
             if (!emit_alu(b, rs, in, ok, allow_exec_update, &effective_safe, allow_smem, rt, wave_ok) || !ok) {
                 // PROSPER_DBG (gated, off by default): report the instruction that fails recompilation —
                 // the first unsupported op / unresolved resource that makes a shader return empty.
                 if (getenv("PROSPER_DBG"))
-                    fprintf(stderr, "[recompile-reject] pc=%u fmt=%d op=0x%x dst=%d(kind%d) dmask=0x%x dim=%u len=%u\n",
-                        in.pc, (int)in.fmt, in.opcode, in.dst.value, (int)in.dst.kind,
-                        in.mimg_dmask, in.mimg_dim, in.len_dwords);
+                    fprintf(stderr, "[recompile-reject] pc=%u words=%08x,%08x fmt=%d op=0x%x "
+                                    "dst=%d(kind%d) src=%d(k%d),%d(k%d),%d(k%d) dmask=0x%x "
+                                    "dim=%u len=%u modifier=%d dpp=%d sdwa=%u/%u/%u/%u\n",
+                        in.pc, in.words[0], in.words[1], (int)in.fmt, in.opcode,
+                        in.dst.value, (int)in.dst.kind,
+                        in.src[0].value, (int)in.src[0].kind,
+                        in.src[1].value, (int)in.src[1].kind,
+                        in.src[2].value, (int)in.src[2].kind,
+                        in.mimg_dmask, in.mimg_dim, in.len_dwords, (int)in.has_modifier,
+                        (int)in.has_dpp, in.sdwa_dst_sel, in.sdwa_dst_unused,
+                        in.sdwa_src0_sel, in.sdwa_src1_sel);
                 return false;
             }
         }
@@ -5283,16 +6200,14 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // That shape is intentionally outside the narrow pattern structurizer above. Use the
         // dispatcher fallback only when there is unmistakably complex compute control flow and the
         // body is free of operations whose workgroup-uniform placement the dispatcher cannot prove.
-        // Raw DS operations are wave-local memory effects and are valid in a case; only barriers and
-        // cross-lane operations which synthesize barriers require workgroup-uniform placement.
+        // Raw DS operations are wave-local memory effects and are valid in a case. Guest barriers
+        // remain unsupported; MBCNT is hoisted into the dispatcher's uniform synchronized phase.
         // Existing straight-line, single-if, and recognized single-loop shaders keep their old path.
         size_t cfg_branches = 0;
         bool cfg_has_backedge = false, cfg_dispatch_safe = b.is_compute;
         for (const auto& in : ins) {
             if (in.is_end) break;
-            if ((in.fmt == Rdna2Format::SOPP && in.opcode == 0x0a) ||
-                (in.fmt == Rdna2Format::VOP3 &&
-                 (in.opcode == 0x365 || in.opcode == 0x366)))
+            if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x0a)
                 cfg_dispatch_safe = false;
             if (in.fmt == Rdna2Format::SOPP && in.opcode >= 0x02 && in.opcode <= 0x09 &&
                 in.opcode != 0x03) {
@@ -5302,7 +6217,16 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         }
         // A lone exit + back-edge is the ordinary single-loop shape. Keep rejecting it when its
         // wave-uniformity proof fails; the dispatcher is reserved for genuinely nested/multi-branch CFGs.
-        const bool complex_compute_cfg = cfg_dispatch_safe && cfg_branches > 2 && cfg_has_backedge;
+        // The fallback is equally valid for an acyclic branch tree: Astro Bot's screen-space kernels
+        // contain several nested forward EXEC/SCC early-outs but no back-edge. Requiring a back-edge
+        // left those valid CFGs in the straight-line path, where their first branch rejected.
+        const bool complex_compute_cfg = cfg_dispatch_safe && cfg_branches > 2;
+        if (b.is_compute && cfg_branches && getenv("PROSPER_DBG"))
+            std::fprintf(stderr,
+                         "[compute-cfg] branches=%zu backedge=%d dispatch_safe=%d complex=%d "
+                         "structured_ifs=%zu loops=%zu cf_rejected=%d local=%u wave=%u\n",
+                         cfg_branches, cfg_has_backedge, cfg_dispatch_safe, complex_compute_cfg,
+                         Fs.size(), Ls.size(), cf_rejected, b.local_count, b.wave_size);
         if (complex_compute_cfg && (cf_rejected || Ls.empty()) &&
             emit_compute_cfg_state_machine(b, rs, ins, safe, rt,
                                            allow_exec_update, allow_smem, exp_fn))
@@ -5620,9 +6544,13 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                 descriptor_sgprs.insert(resource.sgpr_base + word);
         }
     }
-    for (size_t i = 0; i < config.user_sgprs.size(); i++)
-        if (!descriptor_sgprs.count(static_cast<uint32_t>(i)))
-            rs.sreg[static_cast<int>(i)] = b.uconst(config.user_sgprs[i]);
+    for (size_t i = 0; i < config.user_sgprs.size(); i++) {
+        const uint32_t value = b.uconst(config.user_sgprs[i]);
+        if (descriptor_sgprs.count(static_cast<uint32_t>(i)))
+            rs.sreg_input[static_cast<int>(i)] = value;
+        else
+            rs.sreg[static_cast<int>(i)] = value;
+    }
 
     rs.vreg[0] = b.localid_comp[0];
     if (config.tidig_comp_cnt >= 1) rs.vreg[1] = b.localid_comp[1];
@@ -5699,6 +6627,7 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
                     // is accepted for all sample paths and handled as its base 2D slice (array index dropped,
                     // #325) — so array-sampling draws recompile+render instead of being skipped.
                     if (i.opcode == 0x20u || i.opcode == 0x27u) return i.mimg_dim == 1u || i.mimg_dim == 2u || i.mimg_dim == 5u;
+                    if (i.opcode == 0x2fu) return i.mimg_dim == 5u; // IMAGE_SAMPLE_C_LZ 2D_ARRAY
                     if (i.opcode == 0x24u || i.opcode == 0x25u || i.opcode == 0x47u) return i.mimg_dim == 1u || i.mimg_dim == 5u;
                     return false;
                 }
@@ -5741,14 +6670,19 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
     // Preserve hardware target locations. MRT0 and MRT1 are backed by real Vulkan attachments; later
     // targets remain unsupported and must never be silently remapped to location 0 (#635).
     uint32_t color_mask = 0;
+    bool has_null_export = false;
     for (const auto& in : ins) {
         if (in.is_end) break;
-        if (in.fmt == Rdna2Format::EXP && in.exp_target < 2)
-            color_mask |= 1u << in.exp_target;
+        if (in.fmt != Rdna2Format::EXP) continue;
+        if (in.exp_target < 2) color_mask |= 1u << in.exp_target;
+        else if (in.exp_target == 9) has_null_export = true;
     }
-    if (!color_mask) {
+    // A NULL export is a real fragment-shader terminator. Depth/stencil-only draws use it after
+    // narrowing EXEC to the surviving samples, so the module intentionally has no color outputs.
+    // Keep other unsupported MRT-only programs fail-visible instead of accepting every no-color PS.
+    if (!color_mask && !has_null_export) {
         if (getenv("PROSPER_DBG") && pcrel_dispatch_target != UINT32_MAX)
-            fprintf(stderr, "[recompile-reject] pcrel target=%u has no color export\n",
+            fprintf(stderr, "[recompile-reject] pcrel target=%u has no supported export\n",
                     pcrel_dispatch_target);
         return {};
     }
@@ -5816,7 +6750,7 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
             if (!eok) return false;
             exported[in.exp_target] = true;
         }
-        return true;   // ignore NULL / additional exports for now
+        return true;   // NULL carries the EXEC/discard effect above; ignore additional exports for now
     };
     // cmpx is now ALLOWED (allow_exec_update=true): a fragment divergent-if (v_cmpx ... s_mov exec,saved)
     // is handled by EXEC predication like compute, and the export is guarded above. Memory ops need a
@@ -5826,7 +6760,7 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords,
             fprintf(stderr, "[recompile-reject] pcrel target=%u body failed\n", pcrel_dispatch_target);
         return {};
     }
-    if (!exported[0] && !exported[1]) {
+    if (!exported[0] && !exported[1] && !has_null_export) {
         if (getenv("PROSPER_DBG") && pcrel_dispatch_target != UINT32_MAX)
             fprintf(stderr, "[recompile-reject] pcrel target=%u emitted no color\n",
                     pcrel_dispatch_target);
@@ -5853,8 +6787,18 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
     for (const auto& in : ins) { if (in.is_end) break;
         if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x10) { ngg = true; break; } }
     uint32_t vidx = b.load_vertex_index();
-    rs.vreg[0] = vidx;                       // VS ABI: v0 = vertex index
-    if (ngg) rs.vreg[5] = vidx;              // NGG VS ABI: v5 = vertex index
+    uint32_t iidx = b.load_instance_index();
+    rs.vreg[0] = vidx;                       // Legacy VS ABI: v0 = vertex index
+    rs.vreg[3] = iidx;                       // Legacy VS ABI: v3 = instance index
+    if (ngg) {
+        // GFX10's merged GS/ES ABI enters the ES prolog with vertex/instance indices in v5/v8 and
+        // merged-wave counts in s3 ([7:0] ES vertices, [15:8] GS primitives). SPIR-V invokes one
+        // vertex at a time, so model one active ES vertex and no GS primitive. Leaving s3 at the
+        // generic zero default makes the prolog's EXEC/descriptor selection collapse real meshes.
+        rs.vreg[5] = vidx;
+        rs.vreg[8] = iidx;
+        rs.sreg[3] = b.uconst(1);
+    }
     bool exported = false;
     auto exp_fn = [&](const Rdna2Inst& in) -> bool {         // EXP POS0..3 -> gl_Position; PARAM -> varyings
         bool eok = true;   // a Special (wave-mask) source has no data value — reject, don't export 0 (#134)

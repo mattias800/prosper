@@ -37,7 +37,7 @@ namespace prosper::gpu {
 namespace {
 
 constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
-constexpr uint32_t kVersion = 14;
+constexpr uint32_t kVersion = 16;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint64_t kMaxFileBytes = 4ull << 30;
 constexpr uint64_t kMaxBlobBytes = 1ull << 30;
@@ -240,7 +240,8 @@ void write_resource(Writer& w, const GpuCapturedResource& c) {
     w.u32(static_cast<uint32_t>(r.cls)); w.u32(static_cast<uint32_t>(r.format));
     w.u32(r.num_components); w.u32(r.binding); w.u64(r.gpu_addr); w.u32(r.size); w.u32(r.stride);
     w.u32(r.srt_offset); w.u32(r.sgpr_base); w.u32(r.fetch_pc); w.u32(r.img_dim);
-    w.u32(r.width); w.u32(r.height); w.u32(r.tile_mode); w.u8(r.srgb); w.u32(r.sampler_sgpr_base);
+    w.u32(r.width); w.u32(r.height);
+    w.u32(r.tile_mode); w.u8(r.srgb); w.u32(r.sampler_sgpr_base);
     w.u32(r.mag_filter); w.u32(r.min_filter); w.u32(r.mip_filter); for (auto v : r.addr_uvw) w.u32(v);
     w.u32(r.border_color_type); w.f32(r.min_lod); w.f32(r.max_lod); w.f32(r.lod_bias);
     w.u32(r.max_aniso_ratio); w.u32(r.depth_compare_func); w.u32(r.unnormalized);
@@ -248,14 +249,17 @@ void write_resource(Writer& w, const GpuCapturedResource& c) {
     w.u32(c.blob_index); w.u64(c.blob_offset);
 }
 
-bool read_resource(Reader& rd, GpuCapturedResource& c) {
+bool read_resource(Reader& rd, GpuCapturedResource& c, uint32_t version) {
     auto& r = c.resource; uint32_t cls, fmt; uint8_t b;
     if (!rd.u32(cls) || cls > static_cast<uint32_t>(ResourceClass::StorageImage) ||
         !rd.u32(fmt) || fmt > static_cast<uint32_t>(DataFormat::Unorm2_10_10_10)) return false;
     r.cls = static_cast<ResourceClass>(cls); r.format = static_cast<DataFormat>(fmt);
     if (!rd.u32(r.num_components) || !rd.u32(r.binding) || !rd.u64(r.gpu_addr) || !rd.u32(r.size) ||
         !rd.u32(r.stride) || !rd.u32(r.srt_offset) || !rd.u32(r.sgpr_base) || !rd.u32(r.fetch_pc) ||
-        !rd.u32(r.img_dim) || !rd.u32(r.width) || !rd.u32(r.height) || !rd.u32(r.tile_mode) || !rd.u8(b)) return false;
+        !rd.u32(r.img_dim) || !rd.u32(r.width) || !rd.u32(r.height)) return false;
+    r.depth = 1;
+    r.depth_compare = false;
+    if (!rd.u32(r.tile_mode) || !rd.u8(b)) return false;
     r.srgb = b != 0;
     if (!rd.u32(r.sampler_sgpr_base) || !rd.u32(r.mag_filter) || !rd.u32(r.min_filter) || !rd.u32(r.mip_filter)) return false;
     for (auto& v : r.addr_uvw) if (!rd.u32(v)) return false;
@@ -270,9 +274,10 @@ void write_table(Writer& w, const GpuCapturedTable& t) {
     for (const auto& r : t.resources) write_resource(w, r);
 }
 
-bool read_table(Reader& r, GpuCapturedTable& t) {
+bool read_table(Reader& r, GpuCapturedTable& t, uint32_t version) {
     uint8_t b; uint32_t n; if (!r.u8(b) || !r.u32(n) || n > kMaxResources) return false;
-    t.present = b != 0; t.resources.resize(n); for (auto& x : t.resources) if (!read_resource(r, x)) return false;
+    t.present = b != 0; t.resources.resize(n);
+    for (auto& x : t.resources) if (!read_resource(r, x, version)) return false;
     if (!t.present && n != 0) { if (r.error) *r.error = "absent resource table has resources"; return false; }
     return true;
 }
@@ -1282,6 +1287,65 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         w.u32(copy.destination_blob_index); w.u64(copy.destination_blob_offset);
         w.u32(copy.source_blob_index); w.u64(copy.source_blob_offset);
     }
+    // v15 records whether an image is declared for depth comparison. Keep this in a deterministic
+    // extension tail, just like the v9 depth and v11/v12 DCC additions, so every older resource
+    // record remains byte-compatible.
+    w.u32(static_cast<uint32_t>(resource_depth_count));
+    auto write_depth_compare = [&](const GpuCapturedTable& table) {
+        for (const auto& captured : table.resources)
+            w.u8(captured.resource.depth_compare);
+    };
+    for (const auto& draw : c.draws) {
+        write_depth_compare(draw.vrt);
+        write_depth_compare(draw.prt);
+    }
+    for (const auto& compute : c.computes) write_depth_compare(compute.resources);
+    // v16 records packed GFX10 mip-tail placement. Tail siblings share one captured allocation block,
+    // so replay must retain both the common base and the selected in-block byte origin.
+    w.u32(static_cast<uint32_t>(resource_depth_count));
+    auto write_mip_tail = [&](const GpuCapturedTable& table, const char* owner,
+                              size_t owner_index) {
+        for (size_t resource_index = 0; resource_index < table.resources.size();
+             ++resource_index) {
+            const auto& captured = table.resources[resource_index];
+            const auto& resource = captured.resource;
+            if ((resource.in_mip_tail &&
+                 (resource.mip_tail_bytes != 4096u && resource.mip_tail_bytes != 65536u)) ||
+                (resource.in_mip_tail && resource.mip_tail_offset >= resource.mip_tail_bytes) ||
+                (!resource.in_mip_tail &&
+                 (resource.mip_tail_offset != 0 || resource.mip_tail_bytes != 0 ||
+                  resource.mip_tail_x != 0 || resource.mip_tail_y != 0))) {
+                char detail[512]{};
+                std::snprintf(detail, sizeof(detail),
+                              "invalid resource mip-tail state: %s[%zu] resource[%zu] "
+                              "class=%u binding=%u addr=0x%llx size=%u enabled=%u "
+                              "offset=%u bytes=%u xy=(%u,%u)",
+                              owner, owner_index, resource_index,
+                              static_cast<unsigned>(resource.cls), resource.binding,
+                              static_cast<unsigned long long>(resource.gpu_addr), resource.size,
+                              resource.in_mip_tail ? 1u : 0u, resource.mip_tail_offset,
+                              resource.mip_tail_bytes, resource.mip_tail_x,
+                              resource.mip_tail_y);
+                error = detail;
+                return false;
+            }
+            w.u8(resource.in_mip_tail);
+            w.u32(resource.mip_tail_offset);
+            w.u32(resource.mip_tail_bytes);
+            w.u32(resource.mip_tail_x);
+            w.u32(resource.mip_tail_y);
+        }
+        return true;
+    };
+    for (size_t draw_index = 0; draw_index < c.draws.size(); ++draw_index) {
+        const auto& draw = c.draws[draw_index];
+        if (!write_mip_tail(draw.vrt, "draw-vs", draw_index) ||
+            !write_mip_tail(draw.prt, "draw-ps", draw_index))
+            return false;
+    }
+    for (size_t compute_index = 0; compute_index < c.computes.size(); ++compute_index)
+        if (!write_mip_tail(c.computes[compute_index].resources, "compute", compute_index))
+            return false;
     if (w.data.size() > kMaxFileBytes) { error = "capture file exceeds 4 GiB"; return false; }
     bytes = std::move(w.data);
     return true;
@@ -1387,8 +1451,8 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
             d.vs = c.shader_versions[vs_index].words;
             d.fs = c.shader_versions[fs_index].words;
         } else if (!r.words(d.vs) || !r.words(d.fs)) return false;
-        if (!read_pipeline(r, d.ps, version) || !read_table(r, d.vrt) ||
-            !read_table(r, d.prt) || !r.u32(d.vertex_count) || !r.words(d.indices) || !r.u64(d.color0_base)) return false;
+        if (!read_pipeline(r, d.ps, version) || !read_table(r, d.vrt, version) ||
+            !read_table(r, d.prt, version) || !r.u32(d.vertex_count) || !r.words(d.indices) || !r.u64(d.color0_base)) return false;
         if (version >= 3 && (!r.u32(d.color0_width) || !r.u32(d.color0_height))) return false;
         if (version >= 5 && (!r.u64(d.draw_index) || !r.u64(d.command_order))) return false;
     }
@@ -1402,7 +1466,7 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                 error = "invalid compute shader-version index"; return false;
             }
             compute.spirv = c.shader_versions[shader_index].words;
-            if (!read_table(r, compute.resources) ||
+            if (!read_table(r, compute.resources, version) ||
                 !r.u32(compute.launch.threads_x) || !r.u32(compute.launch.threads_y) || !r.u32(compute.launch.threads_z) ||
                 !r.u32(compute.launch.local_x) || !r.u32(compute.launch.local_y) || !r.u32(compute.launch.local_z) ||
                 !r.u32(compute.launch.groups_x) || !r.u32(compute.launch.groups_y) || !r.u32(compute.launch.groups_z) ||
@@ -1674,6 +1738,68 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
         }
         if (!validate_dma_copies(c, error)) return false;
     }
+    if (version >= 15) {
+        uint64_t expected_states = 0;
+        for (const auto& draw : c.draws)
+            expected_states += draw.vrt.resources.size() + draw.prt.resources.size();
+        for (const auto& compute : c.computes)
+            expected_states += compute.resources.resources.size();
+        uint32_t state_count = 0;
+        if (!r.u32(state_count) || state_count != expected_states) {
+            error = "invalid resource depth-compare count"; return false;
+        }
+        auto read_depth_compare = [&](GpuCapturedTable& table) {
+            for (auto& captured : table.resources) {
+                uint8_t enabled = 0;
+                if (!r.u8(enabled) || enabled > 1) {
+                    error = "invalid resource depth-compare state"; return false;
+                }
+                captured.resource.depth_compare = enabled != 0;
+            }
+            return true;
+        };
+        for (auto& draw : c.draws)
+            if (!read_depth_compare(draw.vrt) || !read_depth_compare(draw.prt)) return false;
+        for (auto& compute : c.computes)
+            if (!read_depth_compare(compute.resources)) return false;
+    }
+    if (version >= 16) {
+        uint64_t expected_states = 0;
+        for (const auto& draw : c.draws)
+            expected_states += draw.vrt.resources.size() + draw.prt.resources.size();
+        for (const auto& compute : c.computes)
+            expected_states += compute.resources.resources.size();
+        uint32_t state_count = 0;
+        if (!r.u32(state_count) || state_count != expected_states) {
+            error = "invalid resource mip-tail count"; return false;
+        }
+        auto read_mip_tail = [&](GpuCapturedTable& table) {
+            for (auto& captured : table.resources) {
+                auto& resource = captured.resource;
+                uint8_t enabled = 0;
+                if (!r.u8(enabled) || enabled > 1 ||
+                    !r.u32(resource.mip_tail_offset) ||
+                    !r.u32(resource.mip_tail_bytes) ||
+                    !r.u32(resource.mip_tail_x) ||
+                    !r.u32(resource.mip_tail_y) ||
+                    (enabled && resource.mip_tail_bytes != 4096u &&
+                                resource.mip_tail_bytes != 65536u) ||
+                    (enabled && resource.mip_tail_offset >= resource.mip_tail_bytes) ||
+                    (!enabled && (resource.mip_tail_offset != 0 ||
+                                  resource.mip_tail_bytes != 0 ||
+                                  resource.mip_tail_x != 0 ||
+                                  resource.mip_tail_y != 0))) {
+                    error = "invalid resource mip-tail state"; return false;
+                }
+                resource.in_mip_tail = enabled != 0;
+            }
+            return true;
+        };
+        for (auto& draw : c.draws)
+            if (!read_mip_tail(draw.vrt) || !read_mip_tail(draw.prt)) return false;
+        for (auto& compute : c.computes)
+            if (!read_mip_tail(compute.resources)) return false;
+    }
     if (r.left) { error = "capture has trailing data"; return false; }
     return true;
 }
@@ -1865,6 +1991,46 @@ bool read_all_gpu_capture_ds_seeds(std::vector<GpuCaptureDsSeed>& seeds, std::st
     return true;
 }
 
+bool gpu_capture_ds_seed_snapshot_available() {
+    return static_cast<bool>(g_ds_seed_snapshot_reader);
+}
+
+bool capture_referenced_gpu_ds_seeds(GpuCaptureFile& capture, std::string& error) {
+    error.clear();
+    if (!capture.ds_seeds.empty()) {
+        error = "capture already contains DS checkpoints";
+        return false;
+    }
+    const bool metadata_only = std::any_of(
+        capture.metadata.renderer_env.begin(), capture.metadata.renderer_env.end(),
+        [](const auto& entry) {
+            return entry.first == "PROSPER_GPU_CAPTURE_METADATA_ONLY" &&
+                   !entry.second.empty() && entry.second != "0" && entry.second != "off";
+        });
+    if (metadata_only) return true;
+
+    std::vector<GpuCaptureDsSeed> live;
+    if (!read_all_gpu_capture_ds_seeds(live, error)) return false;
+    for (auto& seed : live) {
+        const bool referenced = std::any_of(
+            capture.draws.begin(), capture.draws.end(), [&](const GpuCapturedDraw& draw) {
+                const auto& ps = draw.ps;
+                const bool uses_ds = ps.depth_test_enable || ps.depth_write_enable ||
+                                     ps.depth_clear_enable || ps.stencil_enable ||
+                                     ps.stencil_clear_enable;
+                return uses_ds && draw.color0_width == seed.width &&
+                       draw.color0_height == seed.height &&
+                       ps.depth_read_base == seed.depth_read_base &&
+                       ps.depth_write_base == seed.depth_write_base &&
+                       ps.stencil_read_base == seed.stencil_read_base &&
+                       ps.stencil_write_base == seed.stencil_write_base &&
+                       ps.htile_data_base == seed.htile_data_base;
+            });
+        if (referenced) capture.ds_seeds.push_back(std::move(seed));
+    }
+    return true;
+}
+
 void set_gpu_replay_ds_seed_writer(ReplayDsSeedWriter writer) {
     g_ds_seed_writer = std::move(writer);
 }
@@ -1926,6 +2092,7 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
         "PROSPER_NO_SWIZZLE", "PROSPER_NODETILE",
         "PROSPER_DESCRIPTOR_VALIDATE",
         "PROSPER_PITCH", "PROSPER_RENDER_NOPS", "PROSPER_RENDER_REFVS", "PROSPER_RENDER_TESTPS",
+        "PROSPER_RENDER_TESTPS_MATCH",
         "PROSPER_RTT", "PROSPER_RTT_NOSEED", "PROSPER_RTT_PERTARGET", "PROSPER_RTT_SINGLE_TARGET",
         "PROSPER_DUMP_RTGROUPS", "PROSPER_DUMP_RTGROUPS_RGBA", "PROSPER_DUMP_RTGROUPS_ADDR",
         "PROSPER_DUMP_DRAWSTEPS",

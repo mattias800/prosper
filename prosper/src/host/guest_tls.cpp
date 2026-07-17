@@ -1,4 +1,5 @@
-// guest_tls.cpp — guest initial-exec TLS support (Linux). GATED behind PROSPER_GUEST_FS (default off).
+// guest_tls.cpp — guest initial-exec TLS support. Enabled by default on Linux/Windows (opt out with
+// PROSPER_NO_GUEST_FS); macOS/Rosetta trap emulation remains opt-in with PROSPER_GUEST_FS.
 //
 // The guest (FreeBSD/PS5, x86-64 Variant II TLS) accesses static/initial-exec thread-locals directly via
 // %fs: `mov %fs:0x0,%rax; mov -0xa8(%rax),%rdx`. We normally run guest code on the HOST pthread's %fs (so
@@ -41,8 +42,8 @@ static constexpr uint64_t MAGIC_OFF       = 0x108;   // == GUEST_TCB_MAGIC_OFF i
 static constexpr uint32_t TCB_MAGIC       = 0x50524F53u;  // "PROS" — marks OUR guest TCB (== GUEST_TCB_MAGIC)
 
 void guest_tls_set_templates(const TlsModuleDesc* descs, size_t count) {
-    g_enabled = getenv("PROSPER_GUEST_FS") != nullptr;
 #ifdef __APPLE__
+    g_enabled = getenv("PROSPER_GUEST_FS") != nullptr;
     // Rosetta 2 does not implement rdfsbase/wrfsbase (verified: SIGILL on an M2) and Darwin has no
     // fsbase API, so we cannot give the CPU a real guest %fs base. Instead run in TRAP mode: build
     // the guest TCB, leave the hardware fs base at Rosetta's 0, and emulate each `%fs:`-prefixed
@@ -50,6 +51,11 @@ void guest_tls_set_templates(const TlsModuleDesc* descs, size_t count) {
     // so the real target is guest_TP + fault_addr). Enabled by the same PROSPER_GUEST_FS gate.
     // See exec_image_linux.cpp try_emulate_fs_access and docs/PORTING.md "macOS harness app".
     if (g_enabled) fprintf(stderr, "[guest-tls] macOS TRAP mode: %%fs accesses emulated (no wrfsbase)\n");
+#else
+    // Initial-exec guest accesses must never alias glibc's host TCB. Astro Bot, for example, seeds
+    // its Havok thread-context key to -1 in PT_TLS; reading the same offset from the host TCB yields
+    // zero and later fails a context lookup. Keep an opt-out only for compatibility bisection.
+    g_enabled = getenv("PROSPER_NO_GUEST_FS") == nullptr;
 #endif
     g_mods.assign(descs, descs + count);
     // x86-64 Variant II static-TLS layout (glibc _dl_determine_tlsoffset, TLS_TCB_AT_TP): each
