@@ -2438,6 +2438,21 @@ void for_each_scalar_write(const Rdna2Inst& in, Visitor&& visit) {
 }
 
 void record_scalar_write(RegState& rs, const Rdna2Inst& in) {
+    // VOPC/VOP3 mask destinations live in sreg_bool, but they still overwrite the physical SGPR
+    // pair. Drop any scalar-data value or SRT descriptor tag left by that pair's earlier lifetime;
+    // keeping either would let a later descriptor use observe the pre-overwrite value.
+    auto invalidate_mask_pair = [&](int base) {
+        for (int word = 0; word < 2; ++word) {
+            rs.sreg.erase(base + word);
+            rs.sreg_srt.erase(base + word);
+        }
+    };
+    if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) &&
+        in.dst.kind == OperandKind::SGPR && in.dst.value <= 105)
+        invalidate_mask_pair(in.dst.value);
+    if (in.fmt == Rdna2Format::VOP3 && in.sdst.kind == OperandKind::SGPR)
+        invalidate_mask_pair(in.sdst.value);
+
     for_each_scalar_write(in, [&](int base, uint32_t width) {
         for (uint32_t word = 0; word < width; ++word) {
             const int reg = base + static_cast<int>(word);
@@ -2445,6 +2460,28 @@ void record_scalar_write(RegState& rs, const Rdna2Inst& in) {
             rs.sreg_input.erase(reg);
         }
     });
+}
+
+// Scalar registers that MAY be overwritten while a loop executes. This is deliberately separate
+// from loop_written_regs: mask-pair destinations overwrite physical SGPRs (and therefore descriptor
+// provenance) but their values live in sreg_bool rather than the scalar-data SSA domain.
+void loop_scalar_may_writes(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t hi,
+                            std::set<int>& sregs) {
+    for (const auto& in : ins) {
+        if (in.pc < lo || in.pc >= hi) continue;
+        for_each_scalar_write(in, [&](int base, uint32_t width) {
+            for (uint32_t word = 0; word < width; ++word)
+                sregs.insert(base + static_cast<int>(word));
+        });
+    }
+}
+
+void invalidate_loop_descriptor_provenance(RegState& rs, const std::set<int>& sregs) {
+    for (int reg : sregs) {
+        rs.sreg_written.insert(reg);
+        rs.sreg_input.erase(reg);
+        rs.sreg_srt.erase(reg);
+    }
 }
 
 } // namespace
@@ -6266,9 +6303,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // value is the condition-block value (which dominates the merge), NOT the phi (defect A). SCC/VCC
         // always get a phi so any cross-iteration carry is valid SSA (defect C); they're recomputed each
         // iteration in practice, so the phi is usually dead — harmless.
-        std::set<int> cv, cs, condv, conds;
+        std::set<int> cv, cs, condv, conds, scalar_may_writes;
         loop_written_regs(ins, L.header_pc, L.backedge_pc, cv, cs);
         loop_written_regs(ins, L.header_pc, L.exit_branch_pc, condv, conds);
+        loop_scalar_may_writes(ins, L.header_pc, L.backedge_pc, scalar_may_writes);
         const uint32_t preheader = b.cur_block;
         const uint32_t hdr = b.id(), check = b.id(), body = b.id(), cont = b.id(), merge = b.id();
         b.emit_branch(hdr); b.emit_label(hdr);
@@ -6278,6 +6316,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         for (int r : cs) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, sget(r), preheader, p); rs.sreg[r] = ph; phis.push_back({r, 1, ph, p}); }
         { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.scc, preheader, p); rs.scc = ph; phis.push_back({0, 2, ph, p}); }
         { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.vcc, preheader, p); rs.vcc = ph; phis.push_back({0, 3, ph, p}); }
+        // The header executes again after the back-edge. A direct/SRT descriptor overwritten
+        // anywhere in the loop is therefore not an invariant entry descriptor at header compile
+        // time. An exact descriptor load in the header may establish fresh provenance afterward.
+        invalidate_loop_descriptor_provenance(rs, scalar_may_writes);
         b.emit_loopmerge(merge, cont); b.emit_branch(check); b.emit_label(check);
         // 3. Condition block: emit [header, exit_branch); the SCC exit becomes OpBranchConditional.
         if (!emit_range(L.header_pc, L.exit_branch_pc)) return false;
@@ -6452,9 +6494,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // spirv-val + execution kernels + the live-boot A/B gate it).
         std::function<bool(const DivLoop&)> emit_divloop = [&](const DivLoop& L) -> bool {
             const bool entry_exec_narrowed = rs.exec_narrowed;
-            std::set<int> cv, cs, condv, conds;
+            std::set<int> cv, cs, condv, conds, scalar_may_writes;
             loop_written_regs(ins, L.header_pc, L.backedge_pc, cv, cs);
             loop_written_regs(ins, L.header_pc, L.exit_branch_pc, condv, conds);
+            loop_scalar_may_writes(ins, L.header_pc, L.backedge_pc, scalar_may_writes);
             const uint32_t preheader = b.cur_block;
             const uint32_t hdr = b.id(), chk = b.id(), body = b.id(), cont = b.id(), merge = b.id();
             b.emit_branch(hdr); b.emit_label(hdr);
@@ -6469,6 +6512,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             for (auto& kv : rs.sreg_bool) mask_keys.push_back(kv.first);
             std::sort(mask_keys.begin(), mask_keys.end());     // deterministic emission order
             for (int k : mask_keys) { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.sreg_bool[k], preheader, p); rs.sreg_bool[k] = ph; phis.push_back({k, 5, ph, p}); }
+            invalidate_loop_descriptor_provenance(rs, scalar_may_writes);
             b.emit_loopmerge(merge, cont); b.emit_branch(chk); b.emit_label(chk);
             // An EXEC-governed loop predicates vector writes. A VCC-governed loop branches on this
             // invocation's VCC bit but does not itself change EXEC, matching the hardware loop body.

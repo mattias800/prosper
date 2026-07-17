@@ -217,6 +217,58 @@ int main() {
                          4, 1, &packed_entry_table).empty(),
           "VOP3 carry-out SGPR-pair writes invalidate a direct packed V#");
 
+    // The same pair writes must invalidate an INDIRECT descriptor loaded from the SRT. The physical
+    // SGPR words no longer contain the s_load result, so retaining only its old sreg_srt tag would
+    // bind the pre-overwrite resource even though direct-entry fallback is already disabled.
+    ShaderResourceTable packed_srt_table;
+    { ShaderResource vb{}; vb.cls = ResourceClass::VertexBuffer;
+      vb.format = DataFormat::Unorm2_10_10_10; vb.num_components = 4;
+      vb.binding = 3; vb.stride = 4; vb.srt_offset = 0x40;
+      packed_srt_table.resources.push_back(vb); }
+    const uint32_t vopc_srt_srsrc[] = {
+        0xF4080504u, 0xFA000040u, // s_load_dwordx4 s[20:23], s[8:9], 0x40
+        0x7C0400F9u, 0x06069400u, // v_cmp_eq_f32_sdwa s20, v0, v0
+        0xE00C2000u, 0x80050100u,
+        0xBF810000u,
+    };
+    CHECK(recompile_valu(vopc_srt_srsrc, std::size(vopc_srt_srsrc),
+                         1, 1, &packed_srt_table).empty(),
+          "explicit VOPC SGPR-pair writes invalidate stale SRT descriptor provenance");
+    const uint32_t vop3_srt_srsrc[] = {
+        0xF4080504u, 0xFA000040u,
+        0xD5761401u, 0x040A0100u, // v_mad_u64_u32 carry-out -> s[20:21]
+        0xE00C2000u, 0x80050100u,
+        0xBF810000u,
+    };
+    CHECK(recompile_valu(vop3_srt_srsrc, std::size(vop3_srt_srsrc),
+                         4, 1, &packed_srt_table).empty(),
+          "VOP3 carry-out SGPR-pair writes invalidate stale SRT descriptor provenance");
+
+    // A loop header is compiled once but executes again after every back-edge. If any reachable
+    // body instruction overwrites the header fetch's SRSRC, the entry-time direct V# is valid only
+    // for iteration one and cannot be baked into the generated header. Reject both supported loop
+    // structurizers until a loop-varying descriptor can be represented exactly.
+    const uint32_t counted_header_srsrc[] = {
+        0xBE800380u, 0xBE820382u,                         // s0=0, s2=2
+        0xE00C2000u, 0x80050100u,                         // loop: packed fetch via s[20:23]
+        0xBF0A0200u, 0xBF840003u,                         // s0<s2; exit when false
+        0xBE940380u, 0x80008100u, 0xBF82FFF9u,            // overwrite s20; ++s0; back-edge
+        0xBF810000u,
+    };
+    CHECK(recompile_valu(counted_header_srsrc, std::size(counted_header_srsrc),
+                         1, 1, &packed_entry_table).empty(),
+          "counted-loop header cannot reuse a direct V# overwritten on its back-edge");
+    const uint32_t divergent_header_srsrc[] = {
+        0xBE800380u, 0xBE820382u, 0x7E0A0202u,            // s0=0, s2=2, uniform v5=s2
+        0xE00C2000u, 0x80050100u,                         // loop: packed fetch via s[20:23]
+        0x7D820A00u, 0xBF860003u,                         // uniform vcc=(s0<v5); vccz exit
+        0xBE940380u, 0x80008100u, 0xBF82FFF9u,            // overwrite s20; ++s0; back-edge
+        0xBF810000u,
+    };
+    CHECK(recompile_valu(divergent_header_srsrc, std::size(divergent_header_srsrc),
+                         1, 1, &packed_entry_table).empty(),
+          "divergent-loop header cannot reuse a direct V# overwritten on its back-edge");
+
     // Kernel 5: descriptor-TABLE uses (#294). s[8:9] = a pointer to a host-memory table; the shader
     // s_loads an 8-dword T# (imm 0x40) + a 4-dword S#/V# (imm 0x80), consumes them via image_sample
     // (SRSRC/SSAMP) and s_buffer_load (SBASE). Each use must be reported with the load immediate as
