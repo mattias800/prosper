@@ -5,11 +5,18 @@
 // builders themselves read SysV stack args via __builtin_frame_address, only valid under the loaded
 // game) and asserts run_command_buffer writes the right bytes to the target address.
 #include "../src/gpu/command_processor.hpp"
+#include "../src/gpu/gpu_execute.hpp"
 #include "../src/gpu/mb3_freelist.hpp"
 #include "../src/gpu/pm4_decode.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 using namespace prosper::gpu;
 
@@ -152,6 +159,109 @@ int main() {
         GpuState st;
         size_t n = run_cb(buf, 4, st);    // must not fault / write anywhere
         CHECK(n == 1, "address-less EVENT_WRITE decodes and is a harmless no-op");
+    }
+
+    // #189: an address-backed DMA_DATA packet copies the exact requested byte span at submit.
+    // Use deliberately unaligned byte ranges so this covers the API's byte-count contract rather
+    // than accidentally depending on dword-sized data.
+    {
+        alignas(8) uint8_t source[24] = {};
+        alignas(8) uint8_t target[24];
+        for (uint32_t i = 0; i < sizeof(source); ++i) source[i] = (uint8_t)(0x30u + i);
+        memset(target, 0xCC, sizeof(target));
+        const uint64_t src = (uint64_t)(uintptr_t)(source + 1);
+        const uint64_t dst = (uint64_t)(uintptr_t)(target + 3);
+        uint32_t dma[7] = {};
+        dma[0] = PM4(7, IT_NOP, R_DMA_DATA);
+        dma[1] = (uint32_t)dst; dma[2] = (uint32_t)(dst >> 32);
+        dma[3] = (uint32_t)src; dma[4] = (uint32_t)(src >> 32);
+        dma[5] = 17;
+        dma[6] = 0; // selectors are retained for diagnostics; both endpoints are mapped memory
+
+        uint64_t observed_addr = 0, observed_size = 0;
+        set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+            observed_addr = addr; observed_size = size;
+        });
+        GpuState st; run_cb(dma, 7, st);
+        set_guest_gpu_write_observer({});
+
+        CHECK(memcmp(target + 3, source + 1, 17) == 0,
+              "DMA_DATA copied the exact address-backed byte span");
+        CHECK(target[2] == 0xCC && target[20] == 0xCC,
+              "DMA_DATA did not write before or after the requested byte span");
+        CHECK(observed_addr == dst && observed_size == 17,
+              "DMA_DATA notified renderer caches about the guest-memory write");
+    }
+
+    // A malformed/unmapped address source is not an immediate value merely because the destination
+    // is valid. It must fail closed without touching the target or notifying renderer caches.
+    {
+        uint64_t target = 0x8877665544332211ull;
+        const uint64_t dst = (uint64_t)(uintptr_t)&target;
+        const uint64_t bad_src = 0x00000DEADBEEF000ull;
+        uint32_t dma[7] = {};
+        dma[0] = PM4(7, IT_NOP, R_DMA_DATA);
+        dma[1] = (uint32_t)dst; dma[2] = (uint32_t)(dst >> 32);
+        dma[3] = (uint32_t)bad_src; dma[4] = (uint32_t)(bad_src >> 32);
+        dma[5] = 8;
+        bool notified = false;
+        set_guest_gpu_write_observer([&](uint64_t, uint64_t) { notified = true; });
+        GpuState st; run_cb(dma, 7, st);
+        set_guest_gpu_write_observer({});
+        CHECK(target == 0x8877665544332211ull,
+              "DMA_DATA skips an unmapped address source without modifying the destination");
+        CHECK(!notified, "a skipped DMA_DATA copy does not report a guest-memory write");
+    }
+
+    // A mapped but read-only destination is readable, so source/destination mappedness alone is
+    // insufficient. The executor must reject it before memmove instead of taking a host fault.
+    {
+#ifdef _WIN32
+        SYSTEM_INFO sys{}; GetSystemInfo(&sys);
+        const size_t page_size = sys.dwPageSize;
+        uint8_t* page = (uint8_t*)VirtualAlloc(nullptr, page_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+        const size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+        uint8_t* page = (uint8_t*)mmap(nullptr, page_size, PROT_READ | PROT_WRITE,
+                                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (page == MAP_FAILED) page = nullptr;
+#endif
+        CHECK(page != nullptr, "allocated a page for the read-only DMA destination guard");
+        if (page) {
+            memset(page, 0x5A, page_size);
+#ifdef _WIN32
+            DWORD old_protect = 0;
+            const bool protected_read_only =
+                VirtualProtect(page, page_size, PAGE_READONLY, &old_protect) != 0;
+#else
+            const bool protected_read_only = mprotect(page, page_size, PROT_READ) == 0;
+#endif
+            CHECK(protected_read_only, "made the DMA destination page read-only");
+            if (protected_read_only) {
+                uint64_t source = 0x0123456789ABCDEFull;
+                const uint64_t src = (uint64_t)(uintptr_t)&source;
+                const uint64_t dst = (uint64_t)(uintptr_t)page;
+                uint32_t dma[7] = {};
+                dma[0] = PM4(7, IT_NOP, R_DMA_DATA);
+                dma[1] = (uint32_t)dst; dma[2] = (uint32_t)(dst >> 32);
+                dma[3] = (uint32_t)src; dma[4] = (uint32_t)(src >> 32);
+                dma[5] = sizeof(source);
+                bool notified = false;
+                set_guest_gpu_write_observer([&](uint64_t, uint64_t) { notified = true; });
+                GpuState st; run_cb(dma, 7, st);
+                set_guest_gpu_write_observer({});
+                CHECK(page[0] == 0x5A && page[sizeof(source) - 1] == 0x5A,
+                      "DMA_DATA skips a read-only destination without modifying it");
+                CHECK(!notified, "a read-only DMA destination does not report a guest-memory write");
+            }
+#ifdef _WIN32
+            DWORD ignored = 0; VirtualProtect(page, page_size, PAGE_READWRITE, &ignored);
+            VirtualFree(page, 0, MEM_RELEASE);
+#else
+            mprotect(page, page_size, PROT_READ | PROT_WRITE);
+            munmap(page, page_size);
+#endif
+        }
     }
 
     // #312: learn a per-thread MB3 pool array from pthread TLS and detect a 0x20-byte block in both

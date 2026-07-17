@@ -364,7 +364,8 @@ HLE(agc_cb_nop) {  // (dcb, num_dwords, ...)
 // Custom R_DMA_DATA payload: [1..2]=dst lo/hi, [3..4]=srcOrImm lo/hi, [5]=numBytes, [6]=sels,
 // [7..8]=the destination qword when this exact packet was built (#312 generation identity).
 // CONFIDENCE: HIGH on a4=dst/a1=srcOrImm (malloc-destination callsite + patcher names + protocol);
-// MED on the selector args (recorded raw; the executor only honors the small-immediate form).
+// MED on the selector args (recorded raw; the executor distinguishes the captured 32-bit immediate
+// domain from mapped 64-bit address sources and keeps GDS/unmapped forms fail-closed).
 static uint64_t label_build_pre(uint64_t dst, uint64_t num_bytes) {
     uint64_t pre = 0;
     if (num_bytes <= 8 && dst >= 0x10000 && !(dst & 3) && gpu::guest_readable(dst, sizeof pre))

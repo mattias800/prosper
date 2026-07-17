@@ -32,6 +32,10 @@
 #else
 #include <fcntl.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
 #endif
 
 // Look up a registered AGC shader header by its bound code address (hle_agc.cpp). Layout-compatible
@@ -842,6 +846,67 @@ bool guest_readable(uint64_t a, uint32_t n) {
     return true;
 }
 #endif
+
+bool guest_writable(uint64_t a, uint32_t n) {
+    if (a < 0x1000 || n == 0 || a + n < a) return false;
+    const uint64_t end = a + n;
+#ifdef _WIN32
+    uint64_t cursor = a;
+    while (cursor < end) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery((const void*)(uintptr_t)cursor, &mbi, sizeof(mbi))) return false;
+        if (mbi.State != MEM_COMMIT) {
+            if (!prosper_try_commit_dmem(cursor, end - cursor, 1) ||
+                !VirtualQuery((const void*)(uintptr_t)cursor, &mbi, sizeof(mbi))) return false;
+        }
+        const DWORD blocked = PAGE_NOACCESS | PAGE_GUARD;
+        const DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY |
+                               PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        if (mbi.State != MEM_COMMIT || (mbi.Protect & blocked) || !(mbi.Protect & writable))
+            return false;
+        const uint64_t region_end = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (region_end <= cursor) return false;
+        cursor = std::min(end, region_end);
+    }
+    return true;
+#elif defined(__APPLE__)
+    uint64_t cursor = a;
+    while (cursor < end) {
+        mach_vm_address_t region = cursor;
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info{};
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t object = MACH_PORT_NULL;
+        const kern_return_t result = mach_vm_region(
+            mach_task_self(), &region, &size, VM_REGION_BASIC_INFO_64,
+            reinterpret_cast<vm_region_info_t>(&info), &count, &object);
+        if (object != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object);
+        if (result != KERN_SUCCESS || cursor < region || !(info.protection & VM_PROT_WRITE))
+            return false;
+        if (region > UINT64_MAX - size || region + size <= cursor) return false;
+        cursor = std::min(end, static_cast<uint64_t>(region + size));
+    }
+    return true;
+#else
+    FILE* maps = fopen("/proc/self/maps", "re");
+    if (!maps) return false;
+    uint64_t cursor = a;
+    char line[512];
+    while (cursor < end && fgets(line, sizeof line, maps)) {
+        unsigned long long begin = 0, finish = 0;
+        char perms[5] = {};
+        if (sscanf(line, "%llx-%llx %4s", &begin, &finish, perms) != 3 || finish <= cursor)
+            continue;
+        if (begin > cursor || perms[1] != 'w' || finish <= begin) {
+            fclose(maps);
+            return false;
+        }
+        cursor = std::min(end, static_cast<uint64_t>(finish));
+    }
+    fclose(maps);
+    return cursor == end;
+#endif
+}
 
 // --- Bindless-dynamic vertex-fetch resolution (const-fold the scalar setup) ---------------------------
 // This game's NGG vertex shader loads its vertex-buffer V# from a descriptor table at a RUNTIME-computed

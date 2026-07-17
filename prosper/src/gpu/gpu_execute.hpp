@@ -68,10 +68,14 @@ struct DrawItem {
 // pixels (or {} on failure). Empty list -> {} (nothing to draw).
 using RenderFn = std::function<std::vector<uint8_t>(const std::vector<DrawItem>& items)>;
 
-// Safe guest-address readability probe: write() to /dev/null returns EFAULT for an unmapped source
-// (Linux; always-true on Windows), so callers can test a guest pointer without risking a SIGSEGV.
-// Implemented in gpu_executor.cpp; shared by the executor's const-eval and HLE diagnostic probes.
+// Safe guest-address readability probe: a page-touching pipe probe on Linux/macOS and VirtualQuery
+// on Windows let callers test a guest pointer without risking a host fault. Implemented in
+// gpu_executor.cpp; shared by the executor's const-eval and HLE diagnostic probes.
 bool guest_readable(uint64_t addr, uint32_t bytes);
+// True only when the complete guest range is currently mapped writable. DMA_DATA uses this before
+// copying into a guest-provided destination so a read-only mapping cannot turn a malformed packet
+// into a host fault.
+bool guest_writable(uint64_t addr, uint32_t bytes);
 
 // One resolved bindless-dynamic vertex fetch from the wave-uniform scalar const-fold in
 // gpu_executor.cpp: the exact fetch instruction (pc), its SRSRC SGPR, and the V# live in that SGPR

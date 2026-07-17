@@ -161,7 +161,7 @@ struct Pm4Command {
     // [0..1]=dst lo/hi, [2..3]=srcOrImm lo/hi, [4]=numBytes, [5]=sels (a2 | a3<<8),
     // [6..7]=the destination qword captured at build time (stale-generation identity, #312).
     uint64_t dd_dst = 0;                 // DmaData: destination address
-    uint64_t dd_src = 0;                 // DmaData: source address OR immediate value
+    uint64_t dd_src = 0;                 // DmaData: mapped 64-bit source address OR 32-bit immediate
     uint32_t dd_bytes = 0;               // DmaData: byte count (0 = unrecovered -> not executed)
     uint32_t dd_sels = 0;                // DmaData: raw selector args (a2 | a3<<8)
     bool     dd_valid = false;           // DmaData: payload carried the full operand set
