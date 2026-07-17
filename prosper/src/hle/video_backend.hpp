@@ -11,10 +11,9 @@
 // + hardware decode together, so a backend owns the whole open->demux->decode pipeline and just hands
 // the core the next decoded frame.
 //
-// When NO backend is registered (headless boot_trace / ctest), the core runs a synthetic black-frame
-// lifecycle instead (fires READY/PLAY, delivers blank frames over a short accelerated timeline, then
-// STOP/EOF) so a title's video state machine still completes and the boot advances — with zero decode
-// dependency. Requirement: real backends MUST use hardware decoding.
+// Synthetic playback is an explicit diagnostic selected with PROSPER_AVP_SYNTH_FRAMES. Merely
+// running without a backend must fail source-open truthfully instead of fabricating playback.
+// Requirement: real backends MUST use hardware decoding.
 namespace prosper::video {
 
 struct StreamInfo {
@@ -44,13 +43,14 @@ public:
     virtual ~VideoBackend() = default;
     virtual int  open(const std::string& host_path) = 0;  // returns stream id (>=0), <0 on error; starts demux+HW decode
     virtual bool info(int id, StreamInfo& out) = 0;        // true once stream headers are parsed
+    // Successful pull pointers remain valid until the next pull of that media type for this id.
     virtual bool next_video(int id, VideoFrame& out) = 0;  // false if no frame ready yet
     virtual bool next_audio(int id, AudioFrame& out) = 0;  // false if no audio ready yet
     virtual bool eof(int id) = 0;                          // true once fully played out
     virtual void close(int id) = 0;
 };
 
-// Registered by the app frontend; nullptr (default) selects the core synthetic fallback.
+// Registered by the app frontend. nullptr means no native decoder is available.
 void         set_backend(VideoBackend* b);
 VideoBackend* backend();
 

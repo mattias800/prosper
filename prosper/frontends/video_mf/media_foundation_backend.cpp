@@ -7,6 +7,7 @@
 #include <windows.h>
 #include <codecapi.h>
 #include <combaseapi.h>
+#include <d3d10.h>
 #include <d3d11.h>
 #include <dxgi.h>
 #include <icodecapi.h>
@@ -234,6 +235,14 @@ bool create_d3d_decode_context(IMFAttributes* reader_attributes, D3DDecodeContex
                                    D3D11_SDK_VERSION, d3d.device.put(), &feature_level,
                                    d3d.immediate.put());
     if (FAILED(hr)) return false;
+    // Media Foundation's decoder uses the device on internal threads while this worker copies
+    // decoded surfaces through the immediate context. Microsoft explicitly recommends enabling
+    // D3D multithread protection for this shared decoder-device scenario.
+    ComPtr<ID3D10Multithread> multithread;
+    hr = d3d.device->QueryInterface(IID_ID3D10Multithread,
+                                    reinterpret_cast<void**>(multithread.put()));
+    if (FAILED(hr)) { d3d.immediate.reset(); d3d.device.reset(); return false; }
+    multithread->SetMultithreadProtected(TRUE);
     hr = MFCreateDXGIDeviceManager(&d3d.reset_token, d3d.manager.put());
     if (FAILED(hr)) { d3d.immediate.reset(); d3d.device.reset(); return false; }
     hr = d3d.manager->ResetDevice(d3d.device.get(), d3d.reset_token);
@@ -429,18 +438,11 @@ void finish_initialization(Session& session, bool ok, HRESULT error) {
     session.cv.notify_all();
 }
 
-void decode_session(Session& session) {
-    const HRESULT com_hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    const bool uninitialize_com = SUCCEEDED(com_hr);
-    if (FAILED(com_hr) && com_hr != RPC_E_CHANGED_MODE) {
-        finish_initialization(session, false, com_hr);
-        return;
-    }
-
+void decode_session_com(Session& session) {
+    D3DDecodeContext d3d;
     ComPtr<IMFAttributes> attributes;
     ComPtr<IMFSourceReader> reader;
     ComPtr<IMFTransform> video_decoder;
-    D3DDecodeContext d3d;
     GUID native_video_subtype{};
     bool hardware_url = false;
     bool d3d11_aware = false;
@@ -464,7 +466,6 @@ void decode_session(Session& session) {
     if (FAILED(hr)) {
         log_hresult("open/configure", hr, session.path);
         finish_initialization(session, false, hr);
-        if (uninitialize_com) CoUninitialize();
         return;
     }
 
@@ -579,21 +580,48 @@ void decode_session(Session& session) {
                 session.cv.notify_all();
                 break;
             }
-            std::unique_lock<std::mutex> lock(session.mutex);
-            session.cv.wait(lock, [&] {
-                return session.stopping || session.audio_queue.size() < kAudioQueueCapacity;
-            });
+            std::lock_guard<std::mutex> lock(session.mutex);
             if (session.stopping) break;
+            // A title may render video while routing or disabling audio elsewhere. Do not let an
+            // unconsumed audio queue stall Source Reader before it can produce the next video frame.
+            if (session.audio_queue.size() == kAudioQueueCapacity)
+                session.audio_queue.pop_front();
             session.audio_queue.push_back(std::move(packet));
             session.cv.notify_all();
         }
     }
 
+    if (avp_log()) std::fprintf(stderr, "[avp-mf] decode loop stopped '%s'\n", session.path.c_str());
+    // Release the Source Reader pipeline while its D3D device manager is still alive. Letting the
+    // declaration-order destructors drop D3D first can strand the hardware MFT during shutdown.
+    video_decoder.reset();
+    if (avp_log()) std::fprintf(stderr, "[avp-mf] decoder reference released '%s'\n", session.path.c_str());
+    reader.reset();
+    if (avp_log()) std::fprintf(stderr, "[avp-mf] source reader released '%s'\n", session.path.c_str());
+    attributes.reset();
+    d3d.manager.reset();
+    d3d.immediate.reset();
+    d3d.device.reset();
+}
+
+void decode_session(Session& session) {
+    const HRESULT com_hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool uninitialize_com = SUCCEEDED(com_hr);
+    if (FAILED(com_hr) && com_hr != RPC_E_CHANGED_MODE) {
+        finish_initialization(session, false, com_hr);
+        return;
+    }
+
+    // Keep every Media Foundation/D3D COM object inside the helper's scope. They must be released
+    // before CoUninitialize tears down the worker apartment, or hardware decoder shutdown can hang.
+    decode_session_com(session);
+    if (avp_log()) std::fprintf(stderr, "[avp-mf] decode worker exiting '%s'\n", session.path.c_str());
     if (uninitialize_com) CoUninitialize();
 }
 
 void stop_session(const std::shared_ptr<Session>& session) {
     if (!session) return;
+    if (avp_log()) std::fprintf(stderr, "[avp-mf] stopping decode worker '%s'\n", session->path.c_str());
     {
         std::lock_guard<std::mutex> lock(session->mutex);
         session->stopping = true;
@@ -601,6 +629,7 @@ void stop_session(const std::shared_ptr<Session>& session) {
     }
     session->thread.request_stop();
     if (session->thread.joinable()) session->thread.join();
+    if (avp_log()) std::fprintf(stderr, "[avp-mf] decode worker stopped '%s'\n", session->path.c_str());
 }
 
 } // namespace

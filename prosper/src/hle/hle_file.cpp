@@ -281,6 +281,7 @@ namespace {
 }
 
 void set_app0_root(const std::string& root) { g_app0 = root; }
+std::string resolve_guest_path(const char* guest_path) { return translate(guest_path); }
 
 // Mount / unmount the guest "/savedata0" area onto a host dir named by the save's dirName
 // (sceSaveDataMount3 HLE, hle_service.cpp). create=true makes the host dir (CREATE-mode mount);

@@ -827,6 +827,11 @@ if(WIN32 AND TARGET prosper_core)
   add_executable(test_video_mf frontends/video_mf/test_video_mf.cpp)
   target_link_libraries(test_video_mf PRIVATE prosper_video_mf)
   add_test(NAME video_media_foundation COMMAND test_video_mf)
+
+  if(TARGET boot_trace)
+    target_link_libraries(boot_trace PRIVATE prosper_video_mf)
+    target_compile_definitions(boot_trace PRIVATE PROSPER_VIDEO_MF=1)
+  endif()
 endif()
 
 # --- SDL3 frontends (optional; headless core stays dependency-free) --------------------------
@@ -996,4 +1001,10 @@ if(TARGET prosper-app)
     target_compile_definitions(prosper-app PRIVATE PROSPER_PAD_SDL3=1)
     message(STATUS "prosper-app: controller input enabled")
   endif()
+endif()
+
+if(TARGET prosper-app AND TARGET prosper_video_mf)
+  target_link_libraries(prosper-app PRIVATE prosper_video_mf)
+  target_compile_definitions(prosper-app PRIVATE PROSPER_VIDEO_MF=1)
+  message(STATUS "prosper-app: Media Foundation video enabled")
 endif()
