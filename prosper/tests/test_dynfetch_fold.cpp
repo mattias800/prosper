@@ -243,6 +243,15 @@ int main() {
     CHECK(recompile_valu(vop3_srt_srsrc, std::size(vop3_srt_srsrc),
                          4, 1, &packed_srt_table).empty(),
           "VOP3 carry-out SGPR-pair writes invalidate stale SRT descriptor provenance");
+    const uint32_t vopc_srt_high_srsrc[] = {
+        0xF4080504u, 0xFA000040u,
+        0x7C0400F9u, 0x06069600u, // v_cmp_eq_f32_sdwa s22, v0, v0
+        0xE00C2000u, 0x80050100u,
+        0xBF810000u,
+    };
+    CHECK(recompile_valu(vopc_srt_high_srsrc, std::size(vopc_srt_high_srsrc),
+                         1, 1, &packed_srt_table).empty(),
+          "an upper-half SRSRC write invalidates the complete SRT descriptor tag");
 
     // A loop header is compiled once but executes again after every back-edge. If any reachable
     // body instruction overwrites the header fetch's SRSRC, the entry-time direct V# is valid only
@@ -268,6 +277,18 @@ int main() {
     CHECK(recompile_valu(divergent_header_srsrc, std::size(divergent_header_srsrc),
                          1, 1, &packed_entry_table).empty(),
           "divergent-loop header cannot reuse a direct V# overwritten on its back-edge");
+    const uint32_t counted_header_srt_high_srsrc[] = {
+        0xF4080504u, 0xFA000040u,                         // SRT V# -> s[20:23]
+        0xBE800380u, 0xBE820382u,                         // s0=0, s2=2
+        0xE00C2000u, 0x80050100u,                         // loop: packed fetch via s[20:23]
+        0xBF0A0200u, 0xBF840003u,                         // s0<s2; exit when false
+        0xBE960380u, 0x80008100u, 0xBF82FFF9u,            // overwrite s22; ++s0; back-edge
+        0xBF810000u,
+    };
+    CHECK(recompile_valu(counted_header_srt_high_srsrc,
+                         std::size(counted_header_srt_high_srsrc),
+                         1, 1, &packed_srt_table).empty(),
+          "loop upper-word writes invalidate the complete SRT descriptor tag at the header");
 
     // Kernel 5: descriptor-TABLE uses (#294). s[8:9] = a pointer to a host-memory table; the shader
     // s_loads an 8-dword T# (imm 0x40) + a 4-dword S#/V# (imm 0x80), consumes them via image_sample

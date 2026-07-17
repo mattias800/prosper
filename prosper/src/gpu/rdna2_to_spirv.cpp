@@ -1352,6 +1352,20 @@ inline bool sreg_range_written(const RegState& rs, int base, uint32_t words) {
     return false;
 }
 
+// An SRT tag describes the complete hardware descriptor, not merely its base SGPR. Accept it only
+// while every word still carries the same provenance; any partial overwrite makes the descriptor
+// unrepresentable even when the base word itself was untouched.
+inline bool sreg_srt_range_tag(const RegState& rs, int base, uint32_t words, uint32_t& tag) {
+    auto first = rs.sreg_srt.find(base);
+    if (first == rs.sreg_srt.end()) return false;
+    tag = first->second;
+    for (uint32_t word = 1; word < words; ++word) {
+        auto it = rs.sreg_srt.find(base + static_cast<int>(word));
+        if (it == rs.sreg_srt.end() || it->second != tag) return false;
+    }
+    return true;
+}
+
 // A scalar inline integer used by a B64 mask operation is sign-extended to 64 bits.  Return the bit
 // belonging to this emulated hardware lane without ever issuing an undefined >=32 SPIR-V shift.
 // Astro's reduction tails use 15, 3, and 1 for the final 4/2/1 active lanes.
@@ -4017,8 +4031,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // (or that key collides). Exact per-use provenance must win, as it does for MUBUF/MIMG.
                 res = rt->by_fetch_pc(in.pc);
                 if (res && res->cls != ResourceClass::ConstantBuffer) res = nullptr;
-                auto it = rs.sreg_srt.find(in.src[0].value);
-                if (!res && it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second);
+                uint32_t srt_tag = 0;
+                if (!res && sreg_srt_range_tag(rs, in.src[0].value, 4, srt_tag))
+                    res = rt->by_srt_offset(srt_tag);
                 // A scalar buffer load reads a CONSTANT buffer — resolve the SBASE SGPR to a constant
                 // buffer specifically (the same SGPR may also hold a vertex-buffer V# elsewhere).
                 if (!res && !sreg_range_written(rs, in.src[0].value, 4))
@@ -4185,8 +4200,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     }
                     if (!res && !srsrc_rewritten)
                         res = rt->by_sgpr_base_cls(in.src[1].value, ResourceClass::VertexBuffer);
-                    if (!res) { auto it = rs.sreg_srt.find(in.src[1].value);
-                        if (it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second); }
+                    uint32_t srt_tag = 0;
+                    if (!res && sreg_srt_range_tag(rs, in.src[1].value, 4, srt_tag))
+                        res = rt->by_srt_offset(srt_tag);
                     // DIRECT user-data V# of any class (#273 — DOLL's title post PSes format-fetch
                     // through a V# the metadata labels a CONSTANT buffer sharp at s[24:27]): the class
                     // label doesn't change the descriptor's fields. Only when the SGPR was never
@@ -4198,11 +4214,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 if (!res) {
                     if (getenv("PROSPER_DBG")) {   // which provenance step failed for this format load
-                        auto it = rs.sreg_srt.find(in.src[1].value);
+                        uint32_t srt_tag = 0;
+                        const bool has_srt_tag = sreg_srt_range_tag(
+                            rs, in.src[1].value, 4, srt_tag);
                         fprintf(stderr, "[mubuf-unresolved] pc=%u srsrc=s%d srt_tag=%s0x%x key_res=%s (%zu res)\n",
-                                in.pc, in.src[1].value, it != rs.sreg_srt.end() ? "" : "NONE ",
-                                it != rs.sreg_srt.end() ? it->second : 0u,
-                                it != rs.sreg_srt.end() && rt->by_srt_offset(it->second) ? "yes" : "null",
+                                in.pc, in.src[1].value, has_srt_tag ? "" : "NONE ",
+                                has_srt_tag ? srt_tag : 0u,
+                                has_srt_tag && rt->by_srt_offset(srt_tag) ? "yes" : "null",
                                 rt->resources.size());
                     }
                     ok = false; return true;
@@ -4220,8 +4238,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // Provenance order mirrors the format path: exact fetch pc, then s_load SRT tag
                 // (indirect), then user-data SGPR (direct).
                 const ShaderResource* res = rt->by_fetch_pc(in.pc);
-                if (!res) { auto it = rs.sreg_srt.find(in.src[1].value);
-                    if (it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second); }
+                uint32_t srt_tag = 0;
+                if (!res && sreg_srt_range_tag(rs, in.src[1].value, 4, srt_tag))
+                    res = rt->by_srt_offset(srt_tag);
                 if (!res && !sreg_range_written(rs, in.src[1].value, 4))
                     res = rt->by_sgpr_base(in.src[1].value);
                 if (!res) { ok = false; return true; }   // unresolvable V# -> reject; NEVER default to binding 2
@@ -4485,8 +4504,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             const ShaderResource* res = rt->by_fetch_pc(in.pc);
             if (!res || (res->cls != ResourceClass::Texture && res->cls != ResourceClass::StorageImage)) {
                 res = nullptr;
-                auto it = rs.sreg_srt.find(in.src[1].value);
-                if (it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second);
+                uint32_t srt_tag = 0;
+                if (sreg_srt_range_tag(rs, in.src[1].value, 8, srt_tag))
+                    res = rt->by_srt_offset(srt_tag);
                 if (!res && !sreg_range_written(rs, in.src[1].value, 8))
                     res = rt->by_sgpr_base(in.src[1].value);
             }
@@ -4499,12 +4519,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             if ((!res || (res->cls != ResourceClass::Texture && res->cls != ResourceClass::StorageImage))
                 && getenv("PROSPER_DBG")) {
                 // Resolution-failure diagnostic: which provenance step failed for this image op.
-                auto it = rs.sreg_srt.find(in.src[1].value);
-                const ShaderResource* pk = it != rs.sreg_srt.end() ? rt->by_srt_offset(it->second) : nullptr;
+                uint32_t srt_tag = 0;
+                const bool has_srt_tag = sreg_srt_range_tag(rs, in.src[1].value, 8, srt_tag);
+                const ShaderResource* pk = has_srt_tag ? rt->by_srt_offset(srt_tag) : nullptr;
                 const ShaderResource* pp = rt->by_fetch_pc(in.pc);
                 fprintf(stderr, "[mimg-unresolved] pc=%u srsrc=s%d srt_tag=%s0x%x key_res=%s pc_res=%s (%zu res)\n",
-                        in.pc, in.src[1].value, it != rs.sreg_srt.end() ? "" : "NONE ",
-                        it != rs.sreg_srt.end() ? it->second : 0u,
+                        in.pc, in.src[1].value, has_srt_tag ? "" : "NONE ",
+                        has_srt_tag ? srt_tag : 0u,
                         pk ? (pk->cls == ResourceClass::Texture ? "tex" : "other-cls") : "null",
                         pp ? (pp->cls == ResourceClass::Texture ? "tex" : "other-cls") : "null",
                         rt->resources.size());
