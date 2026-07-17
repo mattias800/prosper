@@ -1138,9 +1138,18 @@ struct DeferItem {
     std::vector<uint32_t> wd_copy;     // owns a WriteData payload (cmd.wd_data repointed into this)
     uint64_t first_blocked_ms = 0;     // barrier only: when it was first found unsatisfied
 };
-struct DeferredStream { std::vector<DeferItem> items; size_t next = 0; };
+struct DeferredStream {
+    std::vector<DeferItem> items;
+    size_t next = 0;
+    // A retained address DMA cannot execute through this legacy queue. Preserve effects before the
+    // rejected copy, but discard every same-stream completion effect appended after it so stale work
+    // cannot later signal success when the wait releases.
+    size_t discard_from = static_cast<size_t>(-1);
+    bool suppress_completion = false;
+};
 std::vector<DeferredStream> g_deferred;   // paused queue tails; guarded by the caller's submit mutex
 bool     g_fold_deferring = false;        // current fold hit an unsatisfied wait
+bool     g_fold_discard_deferred_suffix = false;
 uint64_t g_defer_streams = 0, g_defer_timeouts = 0;
 size_t   g_defer_items = 0;               // total queued items across streams (memory guard)
 // 1000 ms default. The timeout is the CORRUPTION knob, not a perf knob: every timeout is a
@@ -1229,6 +1238,10 @@ bool g_fold_stream_open = false;   // current top-level fold already opened its 
 void defer_push(const Pm4Command& c) {
     if (!g_fold_stream_open) {     // one deferred stream per fold that defers anything
         g_deferred.emplace_back();
+        if (g_fold_discard_deferred_suffix) {
+            g_deferred.back().discard_from = 0;
+            g_deferred.back().suppress_completion = true;
+        }
         g_fold_stream_open = true;
         g_defer_streams++;
     }
@@ -1301,7 +1314,8 @@ bool deferred_pending()   { return !g_deferred.empty(); }
 // CONFIDENCE: HIGH on the hardware contract (ring-ordered interrupt), MED that pulse-on-full-
 // drain (vs per-stream) is the right granularity — it only errs later, the safe direction.
 namespace { uint64_t g_owed_pulses = 0; }
-void submit_completion_pulse() {
+void submit_completion_pulse(bool submit_rejected) {
+    if (submit_rejected) return;
     if (!g_deferred.empty()) { g_owed_pulses++; return; }
     prosper_eq_trigger_eop();
 }
@@ -1319,12 +1333,16 @@ int flush_deferred_streams() {
     // applied here directly. Drain first so a released tail never overtakes its own head — and so
     // a producer fence still sitting in the pend queue is visible to the barrier checks below.
     prosper_gpu_drain_completion_writes();
-    int completed = 0;
+    int completed = 0, signalable_completed = 0;
     for (size_t si = 0; si < g_deferred.size(); ) {
         DeferredStream& s = g_deferred[si];
         bool blocked = false;
         bool force = g_deferred.size() > kDeferMaxStreams || g_defer_items > kDeferMaxItems;
         while (s.next < s.items.size()) {
+            if (s.next >= s.discard_from) {
+                s.next = s.items.size();
+                break;
+            }
             DeferItem& it = s.items[s.next];
             if (it.cmd.kind == Pm4Command::Kind::WaitRegMem) {
                 // The label page can be unmapped by the time we re-check (freed mid-defer):
@@ -1368,6 +1386,7 @@ int flush_deferred_streams() {
         }
         if (blocked) break;   // strict FIFO: the front barrier holds the whole gated tail
         g_defer_items -= s.items.size() < g_defer_items ? s.items.size() : g_defer_items;
+        signalable_completed += !s.suppress_completion;
         g_deferred.erase(g_deferred.begin() + si);
         completed++;
     }
@@ -1383,7 +1402,7 @@ int flush_deferred_streams() {
         // its label still gated (DOLL's "GameThread timed out waiting for RenderThread" wedge).
         uint64_t owed = g_owed_pulses;
         g_owed_pulses = 0;
-        if (!owed && completed > 0) owed = 1;   // deferral began before any pulse was owed
+        if (!owed && signalable_completed > 0) owed = 1; // valid deferral began before pulse was owed
         while (owed--) prosper_eq_trigger_eop();
     }
     return completed;
@@ -1562,6 +1581,12 @@ void GpuState::apply(const Pm4Command& c) {
                     dma_copies.push_back({c.dd_dst, c.dd_src, c.dd_bytes, c.dd_sels,
                                           command_order, pkt_addr(c)});
                     dma_execution_rejected = true;
+                    g_fold_discard_deferred_suffix = true;
+                    if (g_fold_stream_open && !g_deferred.empty()) {
+                        DeferredStream& stream = g_deferred.back();
+                        stream.discard_from = std::min(stream.discard_from, stream.items.size());
+                        stream.suppress_completion = true;
+                    }
                     static std::atomic<int> warned{0};
                     if (warned.fetch_add(1) < 24)
                         fprintf(stderr,
@@ -1752,6 +1777,7 @@ size_t run_command_buffer(const uint32_t* buf, size_t dwords, GpuState& st) {
     // of its labels).
     if (st.jump_depth == 0) {
         g_fold_deferring = false; g_fold_stream_open = false;
+        g_fold_discard_deferred_suffix = false;
         g_fold_seq.fetch_add(1, std::memory_order_relaxed);   // #312 label-history fold id
     }
     std::vector<Pm4Command> ops;

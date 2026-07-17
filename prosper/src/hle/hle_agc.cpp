@@ -1163,7 +1163,7 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
     // stays alive (the naive always-pulse variant let the scan free live labels; the naive
     // never-pulse variant starved the pacer — both measured).
     gpu::flush_deferred_streams();
-    gpu::submit_completion_pulse();
+    gpu::submit_completion_pulse(agc_gpu_state().dma_execution_rejected);
     // Watchdog keys off PENDING streams, not just this fold: streams can outlive their fold (and
     // the Jump-recursion flag reset once hid a deferring fold entirely — the wedge class).
     if (gpu::deferred_pending()) start_defer_watchdog();
@@ -1256,7 +1256,7 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     // #312 EOP visibility contract: pulse only when no gated writes are pending, else owed until
     // the tail drains (see submit_dcb_stream / command_processor.cpp).
     gpu::flush_deferred_streams();
-    gpu::submit_completion_pulse();
+    gpu::submit_completion_pulse(agc_gpu_state().dma_execution_rejected);
     if (gpu::deferred_pending()) start_defer_watchdog();
     if (getenv("PROSPER_GFXLOG")) {
         fprintf(stderr, "[agc] SubmitDcb #%llu: %u dwords -> %zu packets applied (draws so far: %zu, dispatches total: %llu)\n",

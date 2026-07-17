@@ -193,24 +193,25 @@ int main() {
     }
 
     // Address DMA cannot be released through the legacy deferred-effect path: that would drop it
-    // from ordered execution/capture metadata and bypass authoritative renderer source reads.
+    // from ordered execution/capture metadata and bypass authoritative renderer source reads. Its
+    // same-stream completion suffix must also be discarded, never signaling work that was rejected.
     {
         volatile uint64_t cond = 0;
-        uint64_t source = 0x123456789ABCDEF0ull;
-        uint64_t target = 0;
-        uint32_t stream[8 + 7];
+        uint64_t source = 0x123456789ABCDEF0ull, target = 0, completion = 0;
+        uint32_t stream[8 + 7 + 7];
         emit_wait_eq(stream, (uint64_t)(uintptr_t)&cond, 1);
         emit_dma_copy(stream + 8, (uint64_t)(uintptr_t)&target,
                       (uint64_t)(uintptr_t)&source, sizeof(source));
+        emit_release(stream + 15, (uint64_t)(uintptr_t)&completion, 1);
         GpuState st;
-        run_cb(stream, 15, st);
+        run_cb(stream, 22, st);
         CHECK(st.dma_copies.size() == 1 && st.dma_execution_rejected,
               "WAIT_DEFER-gated address DMA remains visible and rejects execution");
         cond = 1;
         flush_deferred_streams();
         execute_nonrender_submit_work(st);
-        CHECK(target == 0,
-              "gated address DMA never escapes through the unordered legacy deferred path");
+        CHECK(target == 0 && completion == 0,
+              "rejected gated DMA discards its deferred completion suffix without signaling");
     }
 
     // A copy also depends on its source. A prior gated producer to S must prevent a later

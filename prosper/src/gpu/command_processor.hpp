@@ -181,7 +181,7 @@ int  flush_deferred_streams();
 // lets the guest's completion scan free label blocks our gated writes then stomp — see the
 // visibility-contract block in command_processor.cpp). Call instead of prosper_eq_trigger_eop
 // from the submit paths, under the submit mutex.
-void submit_completion_pulse();
+void submit_completion_pulse(bool submit_rejected = false);
 
 } // namespace prosper::gpu
 
