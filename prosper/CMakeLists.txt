@@ -15,6 +15,23 @@ if(MINGW OR (WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU"))
   add_link_options(-static -static-libgcc -static-libstdc++)
 endif()
 
+# --- AddressSanitizer for the #707 root-cause hunt (-DPROSPER_ASAN=ON) -----------------------------
+# #707's macOS equeue corruption is an inlined, image-relative __DATA store that macOS/Rosetta tooling
+# cannot attribute (no HW watchpoints, mprotect bypassed by Rosetta, lldb hangs). But the corruptor is
+# almost certainly a prosper HOST out-of-bounds write; ASAN detects the OOB write ITSELF (not the crash),
+# so it should fire on LINUX too — where the same store hits benign memory (latent) but still crosses a
+# global/heap redzone. ASAN's x86-64 shadow gap covers the guest GPU-VA window [4 GiB, 64 GiB), so
+# prosper's own globals (LowMem) are shadowed normally and OOB writes to them are caught with an exact
+# source location. Build on Linux/WSL with -DPROSPER_ASAN=ON and run the B2 route; the first
+# global-buffer-overflow / heap-buffer-overflow report names the writer -> the real root fix.
+# (Guest mappings clobber the reserved shadow-gap; run with ASAN_OPTIONS=protect_shadow_gap=0.)
+option(PROSPER_ASAN "Build with AddressSanitizer (Linux #707 root-cause hunt)" OFF)
+if(PROSPER_ASAN)
+  add_compile_options(-fsanitize=address -fno-omit-frame-pointer -g)
+  add_link_options(-fsanitize=address)
+  message(STATUS "PROSPER_ASAN=ON: AddressSanitizer enabled (run with ASAN_OPTIONS=protect_shadow_gap=0)")
+endif()
+
 # --- macOS Vulkan (MoltenVK) override ------------------------------------
 # prosper on macOS is built x86_64 (to run the guest under Rosetta), but Homebrew's MoltenVK/loader
 # are arm64-only, so find_package(Vulkan) would hand back an unlinkable arm64 lib. Point the build at

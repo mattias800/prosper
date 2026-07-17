@@ -95,9 +95,27 @@ route reaches sustained gameplay. **Caveat:** the corruptor zeroes a *region*, s
 `g_eqs`/the reg vectors (extent unconfirmed), those must be relocated the same way — watch for the crash
 merely moving rather than disappearing.
 
-The only path to a true *root* fix (identifying the writer) is a platform where hardware watchpoints
-work: a real x86-64 Mac or a Linux/x86 VM. A write-watchpoint on `g_eq_mx` there names the writer in one
-run.
+## Root-cause path: AddressSanitizer on Linux (recommended, runs on the existing WSL env)
+
+The corruptor is almost certainly a prosper **host** out-of-bounds write (image-relative, inlined, not
+memset/mmap/mach_vm/GPU). AddressSanitizer detects the OOB write **itself, not the crash** — so it should
+fire on **Linux too**, where the same store hits benign memory (that is exactly why #707 is latent there)
+but still crosses a global/heap redzone. ASAN's x86-64 shadow gap covers the guest GPU-VA window
+`[4 GiB, 64 GiB)`, so prosper's own globals (LowMem) are shadowed normally and an OOB write to them is
+reported with an exact source location. This needs no macOS, Rosetta, reboot, or hardware watchpoints.
+
+```
+cmake -S prosper -B prosper/build-asan -DPROSPER_ASAN=ON -DGAME_DUMP=<PPSA13579 dump>
+cmake --build prosper/build-asan --target boot_trace -j8
+ASAN_OPTIONS=protect_shadow_gap=0:abort_on_error=1 \
+PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
+PROSPER_PAD_SCRIPT=@prosper/scripts/blasphemous2/reach-first-gameplay.pad \
+  ./prosper/build-asan/boot_trace <dump>
+```
+The first `global-buffer-overflow` / `heap-buffer-overflow` report around the asset-load phase names the
+writer — the real root fix. (If ASAN stays silent through a full route, the write is a guest/Rosetta store
+rather than instrumented prosper code, and the mitigation above is the fallback.) A real x86-64 Mac or an
+x86 Linux VM with a `g_eq_mx` write-watchpoint is the other option.
 
 ## Diagnostics on this branch (env-gated, `PROSPER_EQ_*`)
 
