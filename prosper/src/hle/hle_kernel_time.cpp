@@ -881,13 +881,18 @@ namespace {
             // which mach_vm_write and other VM-system writes bypass (they honor max_protection). If the
             // corruptor respects max_prot, this BLOCKS the zeroing (SIGWATCH silent on lo) => a mach_vm
             // family write. If lo is STILL zeroed with max=RO => a physical alias / separate mapping.
+#ifdef __APPLE__
             kern_return_t kr = mach_vm_protect(mach_task_self(), (mach_vm_address_t)(uintptr_t)pg, 4096,
                                                TRUE /*set_maximum*/, VM_PROT_READ);
-            if (kr == KERN_SUCCESS) {
+            bool ok = (kr == KERN_SUCCESS);
+#else
+            bool ok = (mprotect(pg, 4096, PROT_READ) == 0);   // Linux: current-prot RO (mach max-prot is macOS-only)
+#endif
+            if (ok) {
                 g_eq_pageguard_armed.store(true, std::memory_order_release);
-                fprintf(stderr, "[eq-pageguard] armed LO(max=R): page %p (lo0=%p det=%p)\n",
+                fprintf(stderr, "[eq-pageguard] armed LO: page %p (lo0=%p det=%p)\n",
                         pg, (void*)&g_eq_decoy_lo0, (void*)&g_det_clock);
-            } else fprintf(stderr, "[eq-pageguard] mach_vm_protect(%p) FAILED kr=%d\n", pg, (int)kr);
+            } else fprintf(stderr, "[eq-pageguard] LO guard mprotect(%p) FAILED\n", pg);
             return;
         }
         if (strcmp(mode, "ballast") == 0) {
