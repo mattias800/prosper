@@ -423,6 +423,7 @@ void decode_session(Session& session, std::stop_token stop) {
             goto finished;
         }
         result = avcodec_parameters_to_context(pipeline.audio, parameters);
+        if (result >= 0) pipeline.audio->pkt_timebase = audio_time_base;
         if (result < 0 || (result = avcodec_open2(pipeline.audio, codec, nullptr)) < 0) {
             failure = "could not start audio decoder: " + ff_error(result);
             goto finished;
