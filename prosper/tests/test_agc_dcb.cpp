@@ -26,7 +26,7 @@ static uint32_t PM4(uint32_t len, uint32_t op, uint32_t r) {
 }
 constexpr uint32_t IT_NOP = 0x10, IT_NUM_INSTANCES = 0x2F, IT_SET_SH_REG = 0x76,
                    R_DRAW_RESET = 0x05, R_PUSH_MARKER = 0x0b, R_POP_MARKER = 0x0c,
-                   R_CX_REGS_INDIRECT = 0x12;
+                   R_CX_REGS_INDIRECT = 0x12, R_DMA_DATA = 0x19;
 
 struct ShaderRegister { uint32_t offset, value; };
 
@@ -38,8 +38,10 @@ int main() {
     auto setcx  = Hle::lookup("ZvwO9euwYzc");   // GraphicsDcbSetCxRegistersIndirect
     auto p_add  = Hle::lookup("d-6uF9sZDIU");   // SetCxRegIndirectPatchAddRegisters
     auto p_addr = Hle::lookup("vcmNN+AAXnY");   // SetCxRegIndirectPatchSetAddress
-    CHECK(reset && setcx && p_add && p_addr, "AGC Dcb functions registered (override the glog stubs)");
-    if (!(reset && setcx && p_add && p_addr)) { printf("== FAIL ==\n"); return 1; }
+    auto p_dma_src = Hle::lookup("cdDRpqcFGbU"); // DmaDataPatchSetSrcAddressOrOffsetOrImmediate
+    CHECK(reset && setcx && p_add && p_addr && p_dma_src,
+          "AGC Dcb functions registered (override the glog stubs)");
+    if (!(reset && setcx && p_add && p_addr && p_dma_src)) { printf("== FAIL ==\n"); return 1; }
 
     uint32_t buffer[256];
     memset(buffer, 0xEE, sizeof buffer);
@@ -70,6 +72,21 @@ int main() {
     CHECK(cmd[1] == 8, "PatchAddRegisters did cmd[1] += 5 (3 -> 8)");
     p_addr(rc, 0xAABBCCDD00112233ull, 0, 0, 0, 0);
     CHECK(cmd[2] == 0x00112233u && cmd[3] == 0xAABBCCDDu, "PatchSetAddress rewrote cmd[2]/cmd[3]");
+
+    // sceAgcDmaDataPatchSetSrcAddressOrOffsetOrImmediate (#189): patch only the source qword of
+    // a verified DMA_DATA packet. A wrong packet kind must remain untouched.
+    uint32_t dma[9] = {};
+    dma[0] = PM4(9, IT_NOP, R_DMA_DATA);
+    dma[1] = 0x11111111u; dma[2] = 0x22222222u; // destination must survive the source patch
+    p_dma_src((uint64_t)(uintptr_t)dma, 0xAABBCCDD00112233ull, 0, 0, 0, 0);
+    CHECK(dma[1] == 0x11111111u && dma[2] == 0x22222222u,
+          "DmaData source patch leaves the destination address untouched");
+    CHECK(dma[3] == 0x00112233u && dma[4] == 0xAABBCCDDu,
+          "DmaData source patch writes the complete 64-bit source address");
+    uint32_t wrong_packet[5] = {PM4(5, IT_NOP, R_CX_REGS_INDIRECT), 1, 2, 3, 4};
+    p_dma_src((uint64_t)(uintptr_t)wrong_packet, 0xDEADBEEFCAFEBABEull, 0, 0, 0, 0);
+    CHECK(wrong_packet[1] == 1 && wrong_packet[2] == 2 && wrong_packet[3] == 3 && wrong_packet[4] == 4,
+          "DmaData source patch rejects a non-DMA packet without modifying it");
 
     // sceAgcGetDataPacketPayloadAddress (#140): resolves a data packet to its register-bank payload.
     // Type 0 is NOP header + metadata; type 1 is register header + offset. Both payloads start +2.

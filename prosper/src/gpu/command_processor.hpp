@@ -70,6 +70,57 @@ struct GpuState {
         uint64_t command_order = 0;
     };
     std::vector<Dispatch> dispatches;                     // current submit's DispatchDirect packets
+    // Address-backed DMA_DATA memory effects execute in the same ordered backend timeline as
+    // draws/dispatches. Immediate fills retain their established completion-queue behavior until a
+    // general copy appears; effects after that boundary join the ordered timeline and cannot overtake
+    // it (#312/#189).
+    struct DmaCopy {
+        uint64_t dst = 0, src = 0;
+        uint32_t bytes = 0, sels = 0;
+        uint64_t command_order = 0;
+        uint64_t packet_addr = 0;
+    };
+    std::vector<DmaCopy> dma_copies;
+    // Some PM4 consumers (indirect register arrays, waits, and jump/predication memory) are still
+    // folded eagerly. If one follows a retained DMA, or WAIT_DEFER owns either copy dependency,
+    // executing the submit would consume stale bytes. Preserve the DMA record for diagnostics and
+    // capture truthfulness, but reject backend execution of the whole submit.
+    bool dma_execution_rejected = false;
+    // Once a submit retains an address-backed DMA, later modeled memory effects must remain beside
+    // it instead of entering the asynchronous completion FIFO and overtaking it. Own WRITE_DATA's
+    // inline payload because the command buffer may be recycled before ordered execution.
+    struct MemoryEffect {
+        Pm4Command cmd;
+        std::vector<uint32_t> write_data;
+
+        MemoryEffect() = default;
+        MemoryEffect(const Pm4Command& source, uint64_t order) : cmd(source) {
+            cmd.stream_order = order;
+            if (cmd.kind == Pm4Command::Kind::WriteData && cmd.wd_data && cmd.wd_num)
+                write_data.assign(cmd.wd_data, cmd.wd_data + cmd.wd_num);
+            rebind();
+        }
+        MemoryEffect(const MemoryEffect& other) : cmd(other.cmd), write_data(other.write_data) {
+            rebind();
+        }
+        MemoryEffect& operator=(const MemoryEffect& other) {
+            if (this != &other) { cmd = other.cmd; write_data = other.write_data; rebind(); }
+            return *this;
+        }
+        MemoryEffect(MemoryEffect&& other) noexcept
+            : cmd(other.cmd), write_data(std::move(other.write_data)) { rebind(); }
+        MemoryEffect& operator=(MemoryEffect&& other) noexcept {
+            if (this != &other) { cmd = other.cmd; write_data = std::move(other.write_data); rebind(); }
+            return *this;
+        }
+
+    private:
+        void rebind() {
+            if (cmd.kind == Pm4Command::Kind::WriteData)
+                cmd.wd_data = write_data.empty() ? nullptr : write_data.data();
+        }
+    };
+    std::vector<MemoryEffect> ordered_memory_effects;
     uint64_t dispatch_count = 0;                          // process-lifetime DispatchDirect count
     uint64_t command_order = 0;                           // process-lifetime applied PM4 ordinal
 
@@ -97,6 +148,15 @@ private:
     bool state_dirty_ = true;
 };
 
+// Execute one retained address-backed DMA_DATA operation at its ordered submit position.
+// Re-validates the destination and either the raw guest source or a bounded authoritative renderer
+// snapshot immediately before the byte copy, then notifies renderer caches.
+void execute_ordered_dma_copy(const GpuState::DmaCopy& copy,
+                              const uint8_t* authoritative_source = nullptr);
+// Execute a retained post-DMA memory effect through the same mappedness, generation, freelist, and
+// label-wakeup guards as the legacy completion path, then invalidate renderer-owned guest caches.
+void execute_ordered_memory_effect(const GpuState::MemoryEffect& effect);
+
 // Decode `dwords` dwords at `buf` and apply every op to `st`. Returns the number of packets applied.
 size_t run_command_buffer(const uint32_t* buf, size_t dwords, GpuState& st);
 
@@ -121,7 +181,7 @@ int  flush_deferred_streams();
 // lets the guest's completion scan free label blocks our gated writes then stomp — see the
 // visibility-contract block in command_processor.cpp). Call instead of prosper_eq_trigger_eop
 // from the submit paths, under the submit mutex.
-void submit_completion_pulse();
+void submit_completion_pulse(bool submit_rejected = false);
 
 } // namespace prosper::gpu
 

@@ -5,11 +5,18 @@
 // builders themselves read SysV stack args via __builtin_frame_address, only valid under the loaded
 // game) and asserts run_command_buffer writes the right bytes to the target address.
 #include "../src/gpu/command_processor.hpp"
+#include "../src/gpu/gpu_execute.hpp"
 #include "../src/gpu/mb3_freelist.hpp"
 #include "../src/gpu/pm4_decode.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 using namespace prosper::gpu;
 
@@ -31,6 +38,7 @@ static uint32_t PM4(uint32_t len, uint32_t op, uint32_t r) {
 // guest-visible at a drain point — tests assert the guest-visible (post-drain) state.
 static size_t run_cb(const uint32_t* buf, size_t dwords, GpuState& st) {
     size_t n = run_command_buffer(buf, dwords, st);
+    execute_nonrender_submit_work(st);
     prosper_gpu_drain_completion_writes();
     return n;
 }
@@ -152,6 +160,191 @@ int main() {
         GpuState st;
         size_t n = run_cb(buf, 4, st);    // must not fault / write anywhere
         CHECK(n == 1, "address-less EVENT_WRITE decodes and is a harmless no-op");
+    }
+
+    // #189: an address-backed DMA_DATA packet copies the exact requested byte span at submit.
+    // Use deliberately unaligned byte ranges so this covers the API's byte-count contract rather
+    // than accidentally depending on dword-sized data.
+    {
+        alignas(8) uint8_t source[24] = {};
+        alignas(8) uint8_t target[24];
+        for (uint32_t i = 0; i < sizeof(source); ++i) source[i] = (uint8_t)(0x30u + i);
+        memset(target, 0xCC, sizeof(target));
+        const uint64_t src = (uint64_t)(uintptr_t)(source + 1);
+        const uint64_t dst = (uint64_t)(uintptr_t)(target + 3);
+        uint32_t dma[7] = {};
+        dma[0] = PM4(7, IT_NOP, R_DMA_DATA);
+        dma[1] = (uint32_t)dst; dma[2] = (uint32_t)(dst >> 32);
+        dma[3] = (uint32_t)src; dma[4] = (uint32_t)(src >> 32);
+        dma[5] = 17;
+        dma[6] = 0; // selectors are retained for diagnostics; both endpoints are mapped memory
+
+        uint64_t observed_addr = 0, observed_size = 0;
+        set_guest_gpu_write_observer([&](uint64_t addr, uint64_t size) {
+            observed_addr = addr; observed_size = size;
+        });
+        GpuState st; run_cb(dma, 7, st);
+        set_guest_gpu_write_observer({});
+
+        CHECK(st.dma_copies.size() == 1 && st.dma_copies[0].command_order > 0,
+              "address-backed DMA_DATA is retained as an ordered submit operation");
+        CHECK(memcmp(target + 3, source + 1, 17) == 0,
+              "DMA_DATA copied the exact address-backed byte span");
+        CHECK(target[2] == 0xCC && target[20] == 0xCC,
+              "DMA_DATA did not write before or after the requested byte span");
+        CHECK(observed_addr == dst && observed_size == 17,
+              "DMA_DATA notified renderer caches about the guest-memory write");
+    }
+
+    // A queued upload before an address copy is the copy's ordered prefix. The first retained copy
+    // must drain it before execution; otherwise a compute-only/non-render submit can copy stale bytes.
+    {
+        uint32_t source = 0;
+        uint32_t target = 0;
+        const uint64_t src = (uint64_t)(uintptr_t)&source;
+        const uint64_t dst = (uint64_t)(uintptr_t)&target;
+        uint32_t stream[13] = {};
+        stream[0] = PM4(6, IT_NOP, R_WRITE_DATA);
+        stream[1] = 0;
+        stream[2] = (uint32_t)src; stream[3] = (uint32_t)(src >> 32);
+        stream[4] = 1; stream[5] = 0x13579BDFu;
+        stream[6] = PM4(7, IT_NOP, R_DMA_DATA);
+        stream[7] = (uint32_t)dst; stream[8] = (uint32_t)(dst >> 32);
+        stream[9] = (uint32_t)src; stream[10] = (uint32_t)(src >> 32);
+        stream[11] = sizeof(source); stream[12] = 0;
+        bool source_invalidated = false;
+        set_guest_gpu_write_observer([&](uint64_t addr, uint64_t) {
+            if (addr == src) source_invalidated = true;
+        });
+        set_live_target_byte_range_reader(
+            [&](uint64_t addr, uint32_t bytes, std::vector<uint8_t>& output) {
+                if (addr != src || bytes != sizeof(source))
+                    return LiveTargetByteReadResult::NotFound;
+                if (source_invalidated) return LiveTargetByteReadResult::NotFound;
+                const uint32_t stale = 0xAAAAAAAAu;
+                const auto* begin = reinterpret_cast<const uint8_t*>(&stale);
+                output.assign(begin, begin + sizeof(stale));
+                return LiveTargetByteReadResult::Success;
+            });
+        GpuState st; run_cb(stream, 13, st);
+        set_live_target_byte_range_reader({});
+        set_guest_gpu_write_observer({});
+        CHECK(source_invalidated && source == 0x13579BDFu && target == source,
+              "WRITE_DATA prefix invalidates a renderer-owned source before later address DMA");
+    }
+
+    // Guest-memory consumers that are folded eagerly cannot observe a preceding retained DMA.
+    // Preserve the DMA in diagnostics, but reject the entire submit instead of snapshotting stale
+    // indirect registers and then executing a misleading partial timeline.
+    {
+        ShaderReg source_reg{0x44, 0xA1B2C3D4u};
+        ShaderReg target_reg{0x44, 0x11111111u};
+        const uint64_t src = (uint64_t)(uintptr_t)&source_reg;
+        const uint64_t dst = (uint64_t)(uintptr_t)&target_reg;
+        uint32_t stream[11] = {};
+        stream[0] = PM4(7, IT_NOP, R_DMA_DATA);
+        stream[1] = (uint32_t)dst; stream[2] = (uint32_t)(dst >> 32);
+        stream[3] = (uint32_t)src; stream[4] = (uint32_t)(src >> 32);
+        stream[5] = sizeof(source_reg); stream[6] = 0;
+        stream[7] = PM4(4, IT_NOP, R_SH_REGS_INDIRECT);
+        stream[8] = 1; stream[9] = (uint32_t)dst; stream[10] = (uint32_t)(dst >> 32);
+        GpuState st; run_cb(stream, 11, st);
+        CHECK(st.dma_copies.size() == 1 && st.dma_execution_rejected,
+              "DMA before indirect registers is retained and rejected fail-closed");
+        CHECK(target_reg.value == 0x11111111u && st.sh.find(0x44) == st.sh.end(),
+              "rejected DMA/indirect submit executes neither copy nor stale register fold");
+    }
+
+    // Conversely, a later immediate DMA fill must not enter the completion FIFO and overtake an
+    // earlier retained copy. Keeping the suffix in command_order leaves the destination filled.
+    {
+        uint32_t source = 0xA5C31E79u;
+        uint32_t target = 0xFFFFFFFFu;
+        const uint64_t src = (uint64_t)(uintptr_t)&source;
+        const uint64_t dst = (uint64_t)(uintptr_t)&target;
+        uint32_t stream[14] = {};
+        stream[0] = PM4(7, IT_NOP, R_DMA_DATA);
+        stream[1] = (uint32_t)dst; stream[2] = (uint32_t)(dst >> 32);
+        stream[3] = (uint32_t)src; stream[4] = (uint32_t)(src >> 32);
+        stream[5] = sizeof(source); stream[6] = 0;
+        stream[7] = PM4(7, IT_NOP, R_DMA_DATA);
+        stream[8] = (uint32_t)dst; stream[9] = (uint32_t)(dst >> 32);
+        stream[10] = 0; stream[11] = 0;
+        stream[12] = sizeof(target); stream[13] = 0;
+        GpuState st; run_cb(stream, 14, st);
+        CHECK(st.ordered_memory_effects.size() == 1 && target == 0,
+              "immediate DMA suffix executes after an earlier address copy without FIFO reversal");
+    }
+
+    // A malformed/unmapped address source is not an immediate value merely because the destination
+    // is valid. It must fail closed without touching the target or notifying renderer caches.
+    {
+        uint64_t target = 0x8877665544332211ull;
+        const uint64_t dst = (uint64_t)(uintptr_t)&target;
+        const uint64_t bad_src = 0x00000DEADBEEF000ull;
+        uint32_t dma[7] = {};
+        dma[0] = PM4(7, IT_NOP, R_DMA_DATA);
+        dma[1] = (uint32_t)dst; dma[2] = (uint32_t)(dst >> 32);
+        dma[3] = (uint32_t)bad_src; dma[4] = (uint32_t)(bad_src >> 32);
+        dma[5] = 8;
+        bool notified = false;
+        set_guest_gpu_write_observer([&](uint64_t, uint64_t) { notified = true; });
+        GpuState st; run_cb(dma, 7, st);
+        set_guest_gpu_write_observer({});
+        CHECK(target == 0x8877665544332211ull,
+              "DMA_DATA skips an unmapped address source without modifying the destination");
+        CHECK(!notified, "a skipped DMA_DATA copy does not report a guest-memory write");
+    }
+
+    // A mapped but read-only destination is readable, so source/destination mappedness alone is
+    // insufficient. The executor must reject it before memmove instead of taking a host fault.
+    {
+#ifdef _WIN32
+        SYSTEM_INFO sys{}; GetSystemInfo(&sys);
+        const size_t page_size = sys.dwPageSize;
+        uint8_t* page = (uint8_t*)VirtualAlloc(nullptr, page_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+        const size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+        uint8_t* page = (uint8_t*)mmap(nullptr, page_size, PROT_READ | PROT_WRITE,
+                                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (page == MAP_FAILED) page = nullptr;
+#endif
+        CHECK(page != nullptr, "allocated a page for the read-only DMA destination guard");
+        if (page) {
+            memset(page, 0x5A, page_size);
+#ifdef _WIN32
+            DWORD old_protect = 0;
+            const bool protected_read_only =
+                VirtualProtect(page, page_size, PAGE_READONLY, &old_protect) != 0;
+#else
+            const bool protected_read_only = mprotect(page, page_size, PROT_READ) == 0;
+#endif
+            CHECK(protected_read_only, "made the DMA destination page read-only");
+            if (protected_read_only) {
+                uint64_t source = 0x0123456789ABCDEFull;
+                const uint64_t src = (uint64_t)(uintptr_t)&source;
+                const uint64_t dst = (uint64_t)(uintptr_t)page;
+                uint32_t dma[7] = {};
+                dma[0] = PM4(7, IT_NOP, R_DMA_DATA);
+                dma[1] = (uint32_t)dst; dma[2] = (uint32_t)(dst >> 32);
+                dma[3] = (uint32_t)src; dma[4] = (uint32_t)(src >> 32);
+                dma[5] = sizeof(source);
+                bool notified = false;
+                set_guest_gpu_write_observer([&](uint64_t, uint64_t) { notified = true; });
+                GpuState st; run_cb(dma, 7, st);
+                set_guest_gpu_write_observer({});
+                CHECK(page[0] == 0x5A && page[sizeof(source) - 1] == 0x5A,
+                      "DMA_DATA skips a read-only destination without modifying it");
+                CHECK(!notified, "a read-only DMA destination does not report a guest-memory write");
+            }
+#ifdef _WIN32
+            DWORD ignored = 0; VirtualProtect(page, page_size, PAGE_READWRITE, &ignored);
+            VirtualFree(page, 0, MEM_RELEASE);
+#else
+            mprotect(page, page_size, PROT_READ | PROT_WRITE);
+            munmap(page, page_size);
+#endif
+        }
     }
 
     // #312: learn a per-thread MB3 pool array from pthread TLS and detect a 0x20-byte block in both

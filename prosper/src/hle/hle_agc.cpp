@@ -364,7 +364,8 @@ HLE(agc_cb_nop) {  // (dcb, num_dwords, ...)
 // Custom R_DMA_DATA payload: [1..2]=dst lo/hi, [3..4]=srcOrImm lo/hi, [5]=numBytes, [6]=sels,
 // [7..8]=the destination qword when this exact packet was built (#312 generation identity).
 // CONFIDENCE: HIGH on a4=dst/a1=srcOrImm (malloc-destination callsite + patcher names + protocol);
-// MED on the selector args (recorded raw; the executor only honors the small-immediate form).
+// MED on the selector args (recorded raw; the executor distinguishes the captured 32-bit immediate
+// domain from mapped 64-bit address sources and keeps GDS/unmapped forms fail-closed).
 static uint64_t label_build_pre(uint64_t dst, uint64_t num_bytes) {
     uint64_t pre = 0;
     if (num_bytes <= 8 && dst >= 0x10000 && !(dst & 3) && gpu::guest_readable(dst, sizeof pre))
@@ -1081,11 +1082,17 @@ static bool execute_submit_work(gpu::GpuState& st, uint64_t submit_no, unsigned&
         std::chrono::steady_clock::now() - render_sampling_t0).count();
     const unsigned cadence = render_every_for_ms > 0 && sampling_elapsed_ms >= render_every_for_ms
         ? 1u : render_every;
-    const bool render = gpu::have_submit_renderer() && !st.draws.empty() &&
-                        (draw_submits++ % cadence) == 0;
+    // A retained copy may read pixels produced by an earlier draw in this submit. Sampling cadence
+    // cannot discard that producer and then let DMA read the previous cached target version.
+    const bool ordered_dma_requires_render = !st.dma_copies.empty() && !st.draws.empty();
+    bool render = false;
+    if (gpu::have_submit_renderer() && !st.draws.empty()) {
+        const bool cadence_render = (draw_submits++ % cadence) == 0;
+        render = ordered_dma_requires_render || cadence_render;
+    }
     if (!render) {
-        if (gpu::have_submit_compute() && !st.dispatches.empty() &&
-            !gpu::execute_compute_dispatches(st, submit_no) && getenv("PROSPER_COMPUTELOG"))
+        if ((!st.dispatches.empty() || !st.dma_copies.empty()) &&
+            !gpu::execute_nonrender_submit_work(st, submit_no) && getenv("PROSPER_COMPUTELOG"))
             fprintf(stderr, "[compute] submit #%llu produced no executable work\n",
                     (unsigned long long)submit_no);
         return false;
@@ -1139,6 +1146,9 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
     gpu::flush_deferred_streams();
     agc_gpu_state().draws.clear();
     agc_gpu_state().dispatches.clear();
+    agc_gpu_state().dma_copies.clear();
+    agc_gpu_state().dma_execution_rejected = false;
+    agc_gpu_state().ordered_memory_effects.clear();
     gpu::begin_gpu_timeline_submit(g_submit_count + 1);
     size_t applied = gpu::run_command_buffer(addr, walk, agc_gpu_state());
     g_submit_count++;
@@ -1153,7 +1163,7 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
     // stays alive (the naive always-pulse variant let the scan free live labels; the naive
     // never-pulse variant starved the pacer — both measured).
     gpu::flush_deferred_streams();
-    gpu::submit_completion_pulse();
+    gpu::submit_completion_pulse(agc_gpu_state().dma_execution_rejected);
     // Watchdog keys off PENDING streams, not just this fold: streams can outlive their fold (and
     // the Jump-recursion flag reset once hid a deferring fold entirely — the wedge class).
     if (gpu::deferred_pending()) start_defer_watchdog();
@@ -1231,6 +1241,9 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     gpu::flush_deferred_streams();
     agc_gpu_state().draws.clear();
     agc_gpu_state().dispatches.clear();
+    agc_gpu_state().dma_copies.clear();
+    agc_gpu_state().dma_execution_rejected = false;
+    agc_gpu_state().ordered_memory_effects.clear();
     gpu::begin_gpu_timeline_submit(g_submit_count + 1);
     size_t applied = gpu::run_command_buffer(p->addr, p->dw_num, agc_gpu_state());
     g_submit_count++;
@@ -1243,7 +1256,7 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     // #312 EOP visibility contract: pulse only when no gated writes are pending, else owed until
     // the tail drains (see submit_dcb_stream / command_processor.cpp).
     gpu::flush_deferred_streams();
-    gpu::submit_completion_pulse();
+    gpu::submit_completion_pulse(agc_gpu_state().dma_execution_rejected);
     if (gpu::deferred_pending()) start_defer_watchdog();
     if (getenv("PROSPER_GFXLOG")) {
         fprintf(stderr, "[agc] SubmitDcb #%llu: %u dwords -> %zu packets applied (draws so far: %zu, dispatches total: %llu)\n",

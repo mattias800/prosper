@@ -482,8 +482,21 @@ int main(int argc, char** argv) {
     const bool frameTrace = getenv("PROSPER_APP_FRAME_TRACE") != nullptr;
     const char* stallDumpEnv = getenv("PROSPER_APP_STALL_DUMP_MS");
     const int stallDumpMs = stallDumpEnv ? std::max(0, atoi(stallDumpEnv)) : 0;
-    auto lastFrameProgress = std::chrono::steady_clock::now();
+    const char* timedDumpEnv = getenv("PROSPER_APP_GUEST_DUMP_MS");
+    const int timedDumpMs = timedDumpEnv ? std::max(0, atoi(timedDumpEnv)) : 0;
+    const char* timedDumpIntervalEnv = getenv("PROSPER_APP_GUEST_DUMP_INTERVAL_MS");
+    const int timedDumpIntervalMs = timedDumpIntervalEnv ?
+        std::max(0, atoi(timedDumpIntervalEnv)) : 0;
+    const char* timedDumpPath = getenv("PROSPER_APP_GUEST_DUMP_PATH");
+    const char* timedDumpPthreadEnv = getenv("PROSPER_APP_GUEST_DUMP_PTHREAD");
+    const uint64_t timedDumpPthread = timedDumpPthreadEnv ?
+        strtoull(timedDumpPthreadEnv, nullptr, 0) : 0;
+    const auto loopStarted = std::chrono::steady_clock::now();
+    auto lastFrameProgress = loopStarted;
+    auto nextTimedDump = loopStarted + std::chrono::milliseconds(timedDumpMs);
     uint64_t shown = 0, lastFrameSeq = ~0ull, patFrame = 0;
+    unsigned timedDumpCount = 0;
+    bool timedDumpPending = timedDumpMs > 0;
     bool running = true;
     while (running && !prosper_stop_requested()) {
         SDL_Event ev;
@@ -496,6 +509,20 @@ int main(int argc, char** argv) {
 #ifdef PROSPER_HAVE_DIALOG_SDL3
         prosper::sdl_platform_ui_pump();   // run a pending ImeDialog text-entry modal on this (main) thread
 #endif
+        const auto loopNow = std::chrono::steady_clock::now();
+        if (timedDumpPending && loopNow >= nextTimedDump) {
+            ++timedDumpCount;
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                loopNow - loopStarted).count();
+            fprintf(stderr, "[app] timed guest-state dump #%u after %lld ms at frame %llu\n",
+                    timedDumpCount, (long long)elapsed, (unsigned long long)shown);
+            if (timedDumpCount == 1) dump_guest_exception_trace();
+            dump_guest_thread_trace(timedDumpPath, timedDumpPthread);
+            if (timedDumpIntervalMs > 0)
+                nextTimedDump = loopNow + std::chrono::milliseconds(timedDumpIntervalMs);
+            else
+                timedDumpPending = false;
+        }
 
         static const uint32_t kPatW = 1920, kPatH = 1080;
         if (testPattern) feed_test_pattern(kPatW, kPatH, patFrame++);

@@ -344,33 +344,46 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
     reviewer must read the whole review record and perform the same full review.
   - Continue until the reviewer explicitly posts either
     `APPROVED FOR MERGE <head-repo>:<head-ref>@<head-SHA> into <base-repo>:<base-ref>@<base-SHA> with tree <tree-SHA>`
-    or `NOT APPROVED`, with remaining concerns. Any commit or force-push that changes the head—including docs,
-    tests, workflows, fixtures, assets, generated files, or configuration—invalidates approval and requires a
-    complete current-head verdict. A changed head/base repository or ref also invalidates approval. If the base
-    tip moves, the reviewer must inspect the new base delta and prospective integration, re-run affected checks,
-    and approve the new identities, SHAs, and integration tree.
+    or `NOT APPROVED`, with remaining concerns. Approval covers the PR's reviewed authored change. Any later
+    authored change to code, tests, workflows, fixtures, assets, generated files, configuration, docs, or
+    metadata invalidates approval and requires review of the updated change. Re-review is proportional to the
+    delta; do not repeat unrelated inspection or verification when the impact is clearly bounded.
+  - **Synchronizing an approved PR with its target branch does not invalidate approval and does not require an
+    external reviewer.** This includes rebasing onto the target, merging the target into the PR, or integrating
+    a target tip that moved after approval. The PR author owns this synchronization. Fetch both refs directly,
+    resolve conflicts, inspect the target delta and the refreshed PR diff, recompute the prospective integration
+    tree, run `diff --check`, and run any tests that the synchronization or conflict resolution can affect.
+    Record a `BASE SYNC VALIDATION` PR comment with the old/new base and head SHAs, changed/conflicting paths,
+    resulting tree SHA, and checks run. Existing review and CI evidence may be reused; do not rerun unrelated
+    suites or snapshots merely because the target advanced. If synchronization reveals a real bug, fix it and
+    obtain review for that authored fix, but the synchronization itself never needs reviewer re-approval.
   - The final merge must atomically preserve every reviewed input. Prefer a repository merge queue/ruleset that
-    verifies the exact approved head, target, base, and integration. Otherwise, only a same-repository PR may use
-    the direct-push fallback below; cross-repository PRs stop for a capable server-side mechanism or maintainer
-    direction. Once exact approval and separate merge authorization both exist, post the complete approved tuple
-    as a `MERGE TRANSACTION` PR comment. That freezes the approved target for this transaction: agents must not
-    push/retarget it, a later PR UI retarget cannot redirect the hard-coded destination, and only an explicit
+    verifies the reviewed authored change and the author-validated current target/integration. Otherwise, only a
+    same-repository PR may use the direct-push fallback below; cross-repository PRs stop for a capable server-side
+    mechanism or maintainer
+    direction. Once approval, any required base-sync validation, and separate merge authorization exist, post the
+    complete transaction tuple as a `MERGE TRANSACTION` PR comment. That freezes the validated target for this
+    transaction: agents must not push/retarget it, a later PR UI retarget cannot redirect the hard-coded
+    destination, and only an explicit
     maintainer cancellation revokes the authorized transaction. Abort if a head/target change is observed before
-    the push; any new proposal needs its own review.
-  - For the same-repository fallback, create a merge commit whose first parent is the approved base SHA, second
-    parent is the approved head SHA, and tree is the approved integration tree; verify all three locally. In one
-    server-side atomic push, advance both the exact target ref and exact PR head ref to that merge commit with
-    explicit expected-old-OID leases for the approved base and head, for example:
+    the push; repeat author-side base-sync validation for target synchronization, or obtain review for new
+    authored changes, as applicable.
+  - For the same-repository fallback, create a merge commit whose first parent is the validated transaction base
+    SHA, second parent is the current PR head SHA, and tree is the validated integration tree; verify all three
+    locally. In one server-side atomic push, advance both the exact target ref and exact PR head ref to that merge
+    commit with explicit expected-old-OID leases for the validated base and current head, for example:
     `git push --atomic --force-with-lease=<base-ref>:<base-SHA> --force-with-lease=<head-ref>:<head-SHA> origin`
     `<merge-commit>:<base-ref> <merge-commit>:<head-ref>`. The merge object fixes the reviewed content and target;
     the two leases make concurrent base or head movement reject the entire transaction. The head's atomic advance
-    to the approved merge commit is part of the merge and does not invalidate approval. If either lease fails or
+    to the merge commit is part of the merge and does not invalidate approval. If either lease fails or
     the server cannot perform the atomic push, never override/retry it or fall back to a plain merge: fetch the
-    live state and obtain a new review or maintainer direction. A normal `gh pr merge` head-only guard is not
+    live state and repeat base-sync validation or obtain review for new authored changes, as applicable. A normal
+    `gh pr merge` head-only guard is not
     sufficient for this multi-agent repository.
   - Never merge with an unresolved correctness finding; an applicable required check that is absent, pending,
-    or unsuccessful; an unrecorded/overbroad verification exception; approval for different repository/ref/SHA
-    identities or integration tree; or a merge mechanism that cannot atomically preserve all approved inputs.
+    or unsuccessful; an unrecorded/overbroad verification exception; unreviewed authored PR content; an
+    author-unvalidated live base/integration tree; or a merge mechanism that cannot atomically preserve the
+    transaction.
     Reviewer approval satisfies the quality gate but is not permission to merge: the agent may merge only when
     the user/task separately authorizes it.
 
@@ -383,8 +396,9 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   and prospective integration, and record its tree SHA. Run the strongest applicable verification, including
   mandatory snapshot checks. Post every finding, question, test result, disposition, and final verdict on the
   PR, signed with a stable reviewer name; include severity, exact location, concrete failure scenario, required
-  fix, and evidence. Do not approve while any correctness concern or required check remains. After any update,
-  review the complete new head. Post either APPROVED FOR MERGE <head-repo>:<head-ref>@<head-SHA> into
+  fix, and evidence. Do not approve while any correctness concern or required check remains. After any authored
+  update other than target-branch synchronization, review the complete new change. Post either APPROVED FOR MERGE
+  <head-repo>:<head-ref>@<head-SHA> into
   <base-repo>:<base-ref>@<base-SHA> with tree <tree-SHA> or NOT APPROVED. Directly message the author only to say
   that the posted review is complete.
   ```
@@ -397,6 +411,12 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   their code, types, comments, prose, or tests. Re-derive behavior in prosper's own architecture and add
   project-owned evidence/tests. Never weaken behavior demonstrated by a live boot to match a secondary
   reference, and mark unresolved evidence with `CONFIDENCE: HIGH/MED/LOW`.
+- **AMD RDNA 2 shader ISA reference:** ["RDNA 2" Instruction Set Architecture: Reference Guide
+  (document 70648)](https://docs.amd.com/api/khub/documents/Et~wpu9g~Ffl7d9q0QZ~Og/content). Consult it
+  for instruction encodings, operand and condition-code semantics, wave behavior, and memory-instruction
+  details when working on the shader recompiler or GPU diagnostics. Treat it as the primary published RDNA 2
+  architecture reference; PS5-specific extensions, encodings, and AGC behavior still require prosper's live
+  title evidence and focused tests.
 - **PS5 3.20 firmware library reference — the definitive NID↔name database (`../PS5-3.20_Libs/`).**
   A `genstub.py`-generated dump of **all 275 PS5 3.20 system libraries**, one `libSceXxx.c` per library.
   Each file lists **every exported function AND its exact NID**: the loader lines read

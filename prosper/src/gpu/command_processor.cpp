@@ -33,6 +33,9 @@ namespace prosper::gpu {
 // Readability probe (gpu_executor.cpp, declared in gpu_execute.hpp): page-granular check that a
 // guest range is mapped, so the Jump fold below never walks an unmapped segment address.
 bool guest_readable(uint64_t addr, uint32_t bytes);
+bool guest_writable(uint64_t addr, uint32_t bytes);
+// Guest GPU writes invalidate renderer-owned copies of overlapping resources.
+void notify_guest_gpu_write(uint64_t addr, uint64_t size);
 
 // Wake any thread blocked in sync_on_address (a futex) on `addr`. A GPU completion label write only
 // changes memory; a futex waiter does NOT wake on a value change — it needs an explicit FUTEX_WAKE. The
@@ -708,6 +711,7 @@ static void honor_eop_write(const Pm4Command& c) {
     if (getenv("PROSPER_GFXLOG"))
         fprintf(stderr, "[agc]   EOP write [0x%llx] data_sel=%u value=0x%llx\n",
                 (unsigned long long)c.rel_addr, c.rel_data_sel, (unsigned long long)c.rel_value);
+    notify_guest_gpu_write(c.rel_addr, c.rel_data_sel == 1 ? 4 : 8);
     wake_on_label(c.rel_addr);   // wake any sync_on_address futex waiter on this completion label
 }
 
@@ -731,6 +735,7 @@ static void honor_event_write(const Pm4Command& c) {
     }
     uint64_t v = gpu_clock64();
     memcpy((void*)(uintptr_t)c.event_addr, &v, sizeof v);
+    notify_guest_gpu_write(c.event_addr, sizeof v);
     ring_record(c.event_addr, v, 8, 2, pkt_addr(c));
     if (getenv("PROSPER_GFXLOG"))
         fprintf(stderr, "[agc]   EventWrite [0x%llx] event_type=%u -> clock 0x%llx\n",
@@ -744,72 +749,120 @@ static void honor_event_write(const Pm4Command& c) {
 // completion leg is ReleaseMem(label <- 1). We previously DROPPED every DMA_DATA packet, so the
 // LIFO-recycled label kept the previous generation's 1 and the guest's consumption poll freed the
 // label while fences to it were still in flight (full evidence chain: hle_agc agc_dcb_dma_data).
-// Execution is deliberately GATED to the immediate-fill form (srcOrImm is a 32-bit value, PM4
-// CP-DMA src_sel=DATA semantics: the value is replicated across the destination). DOLL uses two
-// instances of it: the 4-byte per-segment label init above, and 64 KiB zero-fills of freshly
-// allocated 64 KiB-aligned command-stream CHUNKS (whose boundary headers hold the label pointers
-// the consumed-marker emitter reads — a recycled chunk with a stale header is the same stomp).
-// General CP-DMA copies (real src addresses / GDS) stay unexecuted with a bounded log, as before.
-// CONFIDENCE: HIGH on the init form (three-callsite ABI + live page-watch protocol capture);
-// MED on the large-fill form (same selectors + src=0 + fresh-buffer destinations).
-static void honor_dma_data(const Pm4Command& c) {
+// DOLL uses two immediate-fill instances: the 4-byte per-segment label init above, and 64 KiB
+// zero-fills of freshly allocated 64 KiB-aligned command-stream chunks. Issue #189 completes the
+// address-backed sibling: a source above the 32-bit immediate domain is copied only when the whole
+// source and destination spans are mapped. Raw selector arguments do not distinguish the forms:
+// the title's captured immediate-zero call passes 3/3, values which overlap the memory/L2 selector
+// vocabulary. Source mappedness plus the established 32-bit immediate ABI is the safe discriminator;
+// GDS offsets and malformed/unmapped endpoints remain fail-closed.
+// CONFIDENCE: HIGH on immediate fill and mapped address-copy behavior; MED on the large-fill form.
+enum class DmaDataForm { Invalid, Immediate, Copy };
+
+static DmaDataForm dma_data_form(const Pm4Command& c, bool source_materialized = false) {
+    constexpr uint32_t kMaxImmediateBytes = 0x1000000;   // existing 16 MiB fill safety bound
+    constexpr uint32_t kMaxCopyBytes = 0x10000000;      // HLE builder's 256 MiB API bound
+    if (!c.dd_valid || !c.dd_bytes || c.dd_bytes > kMaxCopyBytes || c.dd_dst < 0x10000)
+        return DmaDataForm::Invalid;
+    // Preserve the established ABI discriminator: every <=32-bit source is immediate data. Guest
+    // image/heap addresses in prosper are 64-bit, so address copies occupy the other domain.
+    if (c.dd_src <= UINT32_MAX) {
+        // The immediate path peeks one qword for the consumed-marker safety journal.
+        const uint32_t probe_bytes = c.dd_bytes < 8 ? 8 : c.dd_bytes;
+        return c.dd_bytes <= kMaxImmediateBytes && !(c.dd_dst & 3) &&
+                       guest_readable(c.dd_dst, probe_bytes)
+                   ? DmaDataForm::Immediate
+                   : DmaDataForm::Invalid;
+    }
+    return (source_materialized || guest_readable(c.dd_src, c.dd_bytes)) &&
+                   guest_writable(c.dd_dst, c.dd_bytes)
+               ? DmaDataForm::Copy
+               : DmaDataForm::Invalid;
+}
+
+static void report_invalid_dma_data(const Pm4Command& c) {
+    // A skipped immediate init leaves the label pointer-valued. Address-copy failures have no
+    // consumed-marker protocol leg and must not alter those lifecycle counters.
+    if (c.dd_src <= UINT32_MAX) label_hist_dma_skip(c.dd_dst);
+    static std::atomic<int> n{0};
+    if (n.fetch_add(1) < 24)
+        fprintf(stderr, "[agc] DMA_DATA not executed (invalid/unmapped form): dst=0x%llx src=0x%llx bytes=%u sels=0x%x\n",
+                (unsigned long long)c.dd_dst, (unsigned long long)c.dd_src, c.dd_bytes, c.dd_sels);
+}
+
+static void honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 0,
+                           const uint8_t* authoritative_source = nullptr) {
     if (eop_writes_disabled() || !c.dd_valid) return;
-    constexpr uint32_t kMaxFill = 0x1000000;   // 16 MiB — far past any observed fill
-    // dst >= 0x10000: a small dst is a GDS offset (unmodeled), and the PROSPER_NULL_PAGE
-    // read-only zero page would otherwise pass guest_readable() and SEGV the memset.
-    bool imm_form = c.dd_bytes >= 1 && c.dd_bytes <= kMaxFill &&
-                    c.dd_dst >= 0x10000 && !(c.dd_dst & 3) && c.dd_src <= 0xffffffffull;
-    if (!imm_form || !guest_readable(c.dd_dst, c.dd_bytes)) {
-        // Not the immediate-fill form we model (or unmapped dst) — log so the gap stays visible.
-        label_hist_dma_skip(c.dd_dst);   // #312: a skipped init leaves the label pointer-valued
-        static std::atomic<int> n{0};
-        if (n.fetch_add(1) < 24)
-            fprintf(stderr, "[agc] DMA_DATA not executed (unmodeled form): dst=0x%llx src=0x%llx bytes=%u sels=0x%x\n",
-                    (unsigned long long)c.dd_dst, (unsigned long long)c.dd_src, c.dd_bytes, c.dd_sels);
+    const uint64_t packet_addr = retained_packet_addr ? retained_packet_addr : pkt_addr(c);
+    const DmaDataForm form = dma_data_form(c, authoritative_source != nullptr);
+    if (form == DmaDataForm::Invalid) {
+        report_invalid_dma_data(c);
         return;
     }
-    uint32_t v32 = (uint32_t)c.dd_src;
     uint8_t* dst = (uint8_t*)(uintptr_t)c.dd_dst;
-    uint64_t pre_dma = peek_qword(c.dd_dst);   // #312: pre-content for generation/membership checks
-    // The exact consumed-marker initializer is a 4-byte immediate zero. Test allocator membership
-    // BEFORE touching it: memset(0) would erase a free node's NextFreeBlock and make the later fence
-    // indistinguishable from a live initialized label (the session-11 residual).
-    if (mb3_freelist_guard() && c.dd_bytes == 4 && v32 == 0 &&
-        label_is_consumed_marker(c.dd_dst)) {
-        uint64_t build_pre = 0;
-        bool generation_changed = dma_build_pre_changed(c, pre_dma, &build_pre);
-        if (generation_changed) {
-            // Pair a debt with the skipped init so its following ReleaseMem cannot overwrite the
-            // new owner either. This is the allocated/reused sibling of a free-membership hit.
-            label_hist_dma_free(c.dd_dst, 0);
-            stale_dma_change_report(c.dd_dst, build_pre, pre_dma, pkt_addr(c));
-            return;
+    if (form == DmaDataForm::Immediate) {
+        const uint32_t v32 = (uint32_t)c.dd_src;
+        uint64_t pre_dma = peek_qword(c.dd_dst);   // #312: generation/membership pre-content
+        // The exact consumed-marker initializer is a 4-byte immediate zero. Test allocator
+        // membership BEFORE touching it: memset(0) would erase a free node's NextFreeBlock.
+        if (mb3_freelist_guard() && c.dd_bytes == 4 && v32 == 0 &&
+            label_is_consumed_marker(c.dd_dst)) {
+            uint64_t build_pre = 0;
+            bool generation_changed = dma_build_pre_changed(c, pre_dma, &build_pre);
+            if (generation_changed) {
+                label_hist_dma_free(c.dd_dst, 0);
+                stale_dma_change_report(c.dd_dst, build_pre, pre_dma, packet_addr);
+                return;
+            }
+            Mb3FreelistMatch match{};
+            if (mb3_freelist_contains_stable(c.dd_dst, &match)) {
+                label_hist_dma_free(c.dd_dst, match.pool_base);
+                mb3_freelist_report("DMA", c.dd_dst, pre_dma, &match, false);
+                return;
+            }
         }
-        Mb3FreelistMatch match{};
-        if (mb3_freelist_contains_stable(c.dd_dst, &match)) {
-            label_hist_dma_free(c.dd_dst, match.pool_base);
-            mb3_freelist_report("DMA", c.dd_dst, pre_dma, &match, false);
-            return;
+        forge_trip("DMA", c.dd_dst, pre_dma, v32, 4, packet_addr);
+        if (v32 == 0) {
+            memset(dst, 0, c.dd_bytes);
+        } else {
+            uint32_t i = 0;
+            for (; i + 4 <= c.dd_bytes; i += 4) memcpy(dst + i, &v32, 4);
+            if (i < c.dd_bytes) memcpy(dst + i, &v32, c.dd_bytes - i);
         }
-    }
-    forge_trip("DMA", c.dd_dst, pre_dma, v32, 4, pkt_addr(c));   // #312 session-10 tripwire (log-only)
-    if (v32 == 0) {
-        memset(dst, 0, c.dd_bytes);
+        poolshift_check("DMA", c.dd_dst, c.dd_bytes, c.dd_src, packet_addr);
+        if (c.dd_bytes <= 8) label_hist_dma_exec(c.dd_dst, pre_dma);
+        if (getenv("PROSPER_GFXLOG"))
+            fprintf(stderr, "[agc]   DmaData fill [0x%llx] := 0x%x (%u bytes)\n",
+                    (unsigned long long)c.dd_dst, v32, c.dd_bytes);
     } else {
-        uint32_t i = 0;
-        for (; i + 4 <= c.dd_bytes; i += 4) memcpy(dst + i, &v32, 4);
-        if (i < c.dd_bytes) memcpy(dst + i, &v32, c.dd_bytes - i);
+        // memmove is byte-for-byte memcpy behavior for the normal non-overlapping GPU-buffer case,
+        // while remaining deterministic if an unusual packet overlaps its endpoints.
+        memmove(dst, authoritative_source ? authoritative_source
+                                          : (const uint8_t*)(uintptr_t)c.dd_src,
+                c.dd_bytes);
+        if (getenv("PROSPER_GFXLOG"))
+            fprintf(stderr, "[agc]   DmaData copy [0x%llx] <- [0x%llx] (%u bytes)\n",
+                    (unsigned long long)c.dd_dst, (unsigned long long)c.dd_src, c.dd_bytes);
     }
-    ring_record(c.dd_dst, c.dd_src, (uint8_t)(c.dd_bytes > 255 ? 255 : c.dd_bytes), 4, pkt_addr(c));
-    poolshift_check("DMA", c.dd_dst, c.dd_bytes, c.dd_src, pkt_addr(c));
-    if (c.dd_bytes <= 8) label_hist_dma_exec(c.dd_dst, pre_dma);   // #312 protocol history
-    if (getenv("PROSPER_GFXLOG"))
-        fprintf(stderr, "[agc]   DmaData [0x%llx] := 0x%x (%u bytes)\n",
-                (unsigned long long)c.dd_dst, v32, c.dd_bytes);
+    notify_guest_gpu_write(c.dd_dst, c.dd_bytes);
+    ring_record(c.dd_dst, c.dd_src, (uint8_t)(c.dd_bytes > 255 ? 255 : c.dd_bytes), 4, packet_addr);
     if (writer_provenance_enabled() && c.dd_bytes >= 256)
         record_guest_write(GuestWriterKind::DmaData, c.dd_dst, c.dd_bytes,
-                           0, 0, c.stream_order, pkt_addr(c));
+                           0, 0, c.stream_order, packet_addr);
     wake_on_label(c.dd_dst);
+}
+
+void execute_ordered_dma_copy(const GpuState::DmaCopy& copy,
+                              const uint8_t* authoritative_source) {
+    Pm4Command c{};
+    c.kind = Pm4Command::Kind::DmaData;
+    c.dd_dst = copy.dst;
+    c.dd_src = copy.src;
+    c.dd_bytes = copy.bytes;
+    c.dd_sels = copy.sels;
+    c.dd_valid = true;
+    c.stream_order = copy.command_order;
+    honor_dma_data(c, copy.packet_addr, authoritative_source);
 }
 
 // Honor a WRITE_DATA packet: copy the inline dwords to the destination address (same synchronous timing).
@@ -834,6 +887,7 @@ static void honor_write_data(const Pm4Command& c) {
         forge_trip("WDATA", c.wd_addr, pre, c.wd_data[0], 4, pkt_addr(c));   // #312 session-10 tripwire
     }
     memcpy((void*)(uintptr_t)c.wd_addr, c.wd_data, (size_t)c.wd_num * 4);
+    notify_guest_gpu_write(c.wd_addr, static_cast<uint64_t>(c.wd_num) * 4);
     ring_record(c.wd_addr, c.wd_data[0], (uint8_t)(c.wd_num * 4 > 255 ? 255 : c.wd_num * 4), 3, pkt_addr(c));
     poolshift_check("WDATA", c.wd_addr, (uint64_t)c.wd_num * 4, c.wd_num ? c.wd_data[0] : 0, pkt_addr(c));
     if (getenv("PROSPER_GFXLOG"))
@@ -893,7 +947,7 @@ struct PendQueue {
 };
 PendQueue& pend_q() { static PendQueue* p = new PendQueue; return *p; }
 void apply_effect(const Pm4Command& c);   // fwd (defined with the WAIT_DEFER machinery below)
-void apply_deferred_effect(const Pm4Command& c);   // fwd: apply_effect + a guest_readable guard (#449)
+void apply_deferred_effect(const Pm4Command& c);   // fwd: guarded apply (#449)
 // Drain returns only when every pending write has LANDED, and writes land STRICTLY IN QUEUE ORDER.
 //
 // #312 ROOT CAUSE (2026-07-10, label-event-ring attribution): the previous loop popped the NEXT
@@ -1084,9 +1138,18 @@ struct DeferItem {
     std::vector<uint32_t> wd_copy;     // owns a WriteData payload (cmd.wd_data repointed into this)
     uint64_t first_blocked_ms = 0;     // barrier only: when it was first found unsatisfied
 };
-struct DeferredStream { std::vector<DeferItem> items; size_t next = 0; };
+struct DeferredStream {
+    std::vector<DeferItem> items;
+    size_t next = 0;
+    // A retained address DMA cannot execute through this legacy queue. Preserve effects before the
+    // rejected copy, but discard every same-stream completion effect appended after it so stale work
+    // cannot later signal success when the wait releases.
+    size_t discard_from = static_cast<size_t>(-1);
+    bool suppress_completion = false;
+};
 std::vector<DeferredStream> g_deferred;   // paused queue tails; guarded by the caller's submit mutex
 bool     g_fold_deferring = false;        // current fold hit an unsatisfied wait
+bool     g_fold_discard_deferred_suffix = false;
 uint64_t g_defer_streams = 0, g_defer_timeouts = 0;
 size_t   g_defer_items = 0;               // total queued items across streams (memory guard)
 // 1000 ms default. The timeout is the CORRUPTION knob, not a perf knob: every timeout is a
@@ -1175,6 +1238,10 @@ bool g_fold_stream_open = false;   // current top-level fold already opened its 
 void defer_push(const Pm4Command& c) {
     if (!g_fold_stream_open) {     // one deferred stream per fold that defers anything
         g_deferred.emplace_back();
+        if (g_fold_discard_deferred_suffix) {
+            g_deferred.back().discard_from = 0;
+            g_deferred.back().suppress_completion = true;
+        }
         g_fold_stream_open = true;
         g_defer_streams++;
     }
@@ -1226,6 +1293,10 @@ void apply_deferred_effect(const Pm4Command& c) {
 }
 } // namespace
 
+void execute_ordered_memory_effect(const GpuState::MemoryEffect& effect) {
+    apply_deferred_effect(effect.cmd);
+}
+
 bool last_fold_deferred() { return g_fold_deferring; }
 bool deferred_pending()   { return !g_deferred.empty(); }
 
@@ -1243,7 +1314,8 @@ bool deferred_pending()   { return !g_deferred.empty(); }
 // CONFIDENCE: HIGH on the hardware contract (ring-ordered interrupt), MED that pulse-on-full-
 // drain (vs per-stream) is the right granularity — it only errs later, the safe direction.
 namespace { uint64_t g_owed_pulses = 0; }
-void submit_completion_pulse() {
+void submit_completion_pulse(bool submit_rejected) {
+    if (submit_rejected) return;
     if (!g_deferred.empty()) { g_owed_pulses++; return; }
     prosper_eq_trigger_eop();
 }
@@ -1261,12 +1333,16 @@ int flush_deferred_streams() {
     // applied here directly. Drain first so a released tail never overtakes its own head — and so
     // a producer fence still sitting in the pend queue is visible to the barrier checks below.
     prosper_gpu_drain_completion_writes();
-    int completed = 0;
+    int completed = 0, signalable_completed = 0;
     for (size_t si = 0; si < g_deferred.size(); ) {
         DeferredStream& s = g_deferred[si];
         bool blocked = false;
         bool force = g_deferred.size() > kDeferMaxStreams || g_defer_items > kDeferMaxItems;
         while (s.next < s.items.size()) {
+            if (s.next >= s.discard_from) {
+                s.next = s.items.size();
+                break;
+            }
             DeferItem& it = s.items[s.next];
             if (it.cmd.kind == Pm4Command::Kind::WaitRegMem) {
                 // The label page can be unmapped by the time we re-check (freed mid-defer):
@@ -1310,6 +1386,7 @@ int flush_deferred_streams() {
         }
         if (blocked) break;   // strict FIFO: the front barrier holds the whole gated tail
         g_defer_items -= s.items.size() < g_defer_items ? s.items.size() : g_defer_items;
+        signalable_completed += !s.suppress_completion;
         g_deferred.erase(g_deferred.begin() + si);
         completed++;
     }
@@ -1325,7 +1402,7 @@ int flush_deferred_streams() {
         // its label still gated (DOLL's "GameThread timed out waiting for RenderThread" wedge).
         uint64_t owed = g_owed_pulses;
         g_owed_pulses = 0;
-        if (!owed && completed > 0) owed = 1;   // deferral began before any pulse was owed
+        if (!owed && signalable_completed > 0) owed = 1; // valid deferral began before pulse was owed
         while (owed--) prosper_eq_trigger_eop();
     }
     return completed;
@@ -1336,6 +1413,16 @@ void GpuState::apply(const Pm4Command& c) {
     command_order = c.stream_order ? c.stream_order : command_order + 1;
     switch (c.kind) {
         case K::SetRegsIndirect: {
+            if (!dma_copies.empty()) {
+                dma_execution_rejected = true;
+                static std::atomic<int> warned{0};
+                if (warned.fetch_add(1) < 24)
+                    fprintf(stderr,
+                            "[agc] ordered DMA submit rejected: SetRegsIndirect reads guest memory "
+                            "after retained DMA (order=%llu)\n",
+                            (unsigned long long)command_order);
+                break;
+            }
             if (c.regs_vaddr == 0 || c.num_regs == 0 || c.num_regs > kMaxRegsPerPacket) return;
             auto* regs = reinterpret_cast<const ShaderReg*>(static_cast<uintptr_t>(c.regs_vaddr));
             auto& file = (c.reg_class == RegClass::Cx) ? cx
@@ -1459,25 +1546,82 @@ void GpuState::apply(const Pm4Command& c) {
             // what let the game free live label memory. Otherwise it goes through the pipe-drain
             // queue: completion becomes guest-visible only after the submit returns.
             if (defer_gate(c)) { defer_push(c); break; }
+            if (!dma_copies.empty()) {
+                ordered_memory_effects.emplace_back(c, command_order);
+                break;
+            }
             if (eop_write_sync()) honor_eop_write(c); else pend_enqueue(c);
             break;
         case K::WriteData:
             if (defer_gate(c)) { defer_push(c); break; }
+            if (!dma_copies.empty()) {
+                ordered_memory_effects.emplace_back(c, command_order);
+                break;
+            }
             if (eop_write_sync()) honor_write_data(c); else pend_enqueue(c);
             break;
         case K::EventWrite:
             if (defer_gate(c)) { defer_push(c); break; }
+            if (!dma_copies.empty()) {
+                ordered_memory_effects.emplace_back(c, command_order);
+                break;
+            }
             if (eop_write_sync()) honor_event_write(c); else pend_enqueue(c);
             break;
         case K::DmaData:
-            // CP-DMA memory effect (#312: the per-segment fence-label INIT). Rides the same FIFO
-            // as the other guest-visible writes: stream order between a generation's ReleaseMem
-            // (label <- 1) and the NEXT generation's DmaData (label := 0) at the same recycled
-            // address is exactly what the guest's consumption poll depends on.
+            // Address-backed copies are ordinary in-stream producers: retain them beside draws and
+            // dispatches so the ordered executor exposes old bytes to earlier consumers and copied
+            // bytes to later consumers (#189). Immediate fills keep their established completion-
+            // FIFO behavior until a general copy appears; its suffix joins the ordered timeline.
+            if (c.dd_src > UINT32_MAX) {
+                if (!c.dd_valid) { report_invalid_dma_data(c); break; }
+                const bool gated_destination = defer_gate(c);
+                const bool gated_source = !g_deferred.empty() && addr_gated(c.dd_src, c.dd_bytes);
+                if (gated_destination || gated_source) {
+                    dma_copies.push_back({c.dd_dst, c.dd_src, c.dd_bytes, c.dd_sels,
+                                          command_order, pkt_addr(c)});
+                    dma_execution_rejected = true;
+                    g_fold_discard_deferred_suffix = true;
+                    if (g_fold_stream_open && !g_deferred.empty()) {
+                        DeferredStream& stream = g_deferred.back();
+                        stream.discard_from = std::min(stream.discard_from, stream.items.size());
+                        stream.suppress_completion = true;
+                    }
+                    static std::atomic<int> warned{0};
+                    if (warned.fetch_add(1) < 24)
+                        fprintf(stderr,
+                                "[agc] ordered DMA submit rejected: WAIT_DEFER owns %s dependency "
+                                "(src=0x%llx dst=0x%llx bytes=%u order=%llu)\n",
+                                gated_source ? "source" : "destination/stream",
+                                (unsigned long long)c.dd_src, (unsigned long long)c.dd_dst,
+                                c.dd_bytes, (unsigned long long)command_order);
+                    break;
+                }
+                // Everything queued before the first general copy is its ordered prefix. Land that
+                // prefix now; subsequent effects are retained below and cannot overtake the copy.
+                if (dma_copies.empty()) prosper_gpu_drain_completion_writes();
+                dma_copies.push_back({c.dd_dst, c.dd_src, c.dd_bytes, c.dd_sels,
+                                      command_order, pkt_addr(c)});
+                break;
+            }
             if (defer_gate(c)) { defer_push(c); break; }
+            if (!dma_copies.empty()) {
+                ordered_memory_effects.emplace_back(c, command_order);
+                break;
+            }
             if (eop_write_sync()) honor_dma_data(c); else pend_enqueue(c);
             break;
         case K::WaitRegMem:
+            if (!dma_copies.empty()) {
+                dma_execution_rejected = true;
+                static std::atomic<int> warned{0};
+                if (warned.fetch_add(1) < 24)
+                    fprintf(stderr,
+                            "[agc] ordered DMA submit rejected: WAIT_REG_MEM reads guest memory "
+                            "after retained DMA (order=%llu)\n",
+                            (unsigned long long)command_order);
+                break;
+            }
             // Real WAIT_REG_MEM semantics (#312): an unsatisfied wait PAUSES this queue — the
             // stream's remaining memory effects are deferred until the condition holds (flushed
             // at subsequent submits by flush_deferred_streams; loud timeout fallback preserves
@@ -1563,6 +1707,16 @@ void GpuState::apply(const Pm4Command& c) {
             // title frame REQUIRES the composite every frame on real hardware, and the condition
             // memory reads 0 throughout the title steady state, so 0 must mean "execute" here
             // ("skip when non-zero", matching PM4 SET_PREDICATION's draw-discard-on-set model).
+            if (!dma_copies.empty()) {
+                dma_execution_rejected = true;
+                static std::atomic<int> warned{0};
+                if (warned.fetch_add(1) < 24)
+                    fprintf(stderr,
+                            "[agc] ordered DMA submit rejected: Jump reads target/predication "
+                            "memory after retained DMA (order=%llu)\n",
+                            (unsigned long long)command_order);
+                break;
+            }
             if (!c.jump_valid || !c.jump_addr || (c.jump_addr & 3) || !c.jump_dwords) break;
             // PROSPER_NO_JUMP=1: diagnostic A/B — reproduce the pre-#319 behavior (jump ignored).
             static const bool no_jump = [] { const char* e = getenv("PROSPER_NO_JUMP"); return e && e[0] == '1'; }();
@@ -1623,6 +1777,7 @@ size_t run_command_buffer(const uint32_t* buf, size_t dwords, GpuState& st) {
     // of its labels).
     if (st.jump_depth == 0) {
         g_fold_deferring = false; g_fold_stream_open = false;
+        g_fold_discard_deferred_suffix = false;
         g_fold_seq.fetch_add(1, std::memory_order_relaxed);   // #312 label-history fold id
     }
     std::vector<Pm4Command> ops;

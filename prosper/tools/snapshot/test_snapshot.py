@@ -2,7 +2,11 @@
 import importlib.util
 import json
 import os
+import signal
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 
 
@@ -13,6 +17,70 @@ SPEC.loader.exec_module(SNAPSHOT)
 
 
 class SnapshotContentTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform.startswith("linux"), "PR_SET_PDEATHSIG is Linux-specific")
+    def test_snapshot_child_dies_when_harness_is_killed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_path = os.path.join(tmp, "child.pid")
+            harness_script = """
+import importlib.util
+import os
+import subprocess
+import sys
+import time
+
+spec = importlib.util.spec_from_file_location("snapshot_harness", {snapshot_path})
+snapshot = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(snapshot)
+child = snapshot._spawn_snapshot_process(
+    [sys.executable, "-c", "import time; time.sleep(60)"],
+    dict(os.environ), subprocess.DEVNULL)
+with open({pid_path}, "w") as pid_file:
+    pid_file.write(str(child.pid))
+    pid_file.flush()
+while True:
+    time.sleep(1)
+""".format(
+                snapshot_path=json.dumps(os.path.join(HERE, "snapshot.py")),
+                pid_path=json.dumps(pid_path),
+            )
+            harness = subprocess.Popen([sys.executable, "-c", harness_script])
+            child_pid = None
+            try:
+                deadline = time.time() + 10
+                while time.time() < deadline and not os.path.exists(pid_path):
+                    if harness.poll() is not None:
+                        self.fail(f"snapshot harness exited early with code {harness.returncode}")
+                    time.sleep(0.05)
+                self.assertTrue(os.path.exists(pid_path), "snapshot harness did not publish child PID")
+                with open(pid_path) as pid_file:
+                    child_pid = int(pid_file.read())
+                self.assertTrue(self._process_is_running(child_pid))
+
+                os.kill(harness.pid, signal.SIGKILL)
+                harness.wait(timeout=5)
+                deadline = time.time() + 10
+                while time.time() < deadline and self._process_is_running(child_pid):
+                    time.sleep(0.05)
+                self.assertFalse(
+                    self._process_is_running(child_pid),
+                    "snapshot child survived the harness's uncatchable termination",
+                )
+            finally:
+                if harness.poll() is None:
+                    harness.kill()
+                    harness.wait(timeout=5)
+                if child_pid is not None and self._process_is_running(child_pid):
+                    os.kill(child_pid, signal.SIGKILL)
+
+    @staticmethod
+    def _process_is_running(pid):
+        try:
+            with open(f"/proc/{pid}/stat") as stat_file:
+                state = stat_file.read().split()[2]
+            return state != "Z"
+        except FileNotFoundError:
+            return False
+
     def test_content_window_requires_multiple_frames_and_progression(self):
         with tempfile.TemporaryDirectory() as tmp:
             samples = [

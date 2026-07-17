@@ -36,6 +36,17 @@ static volatile LONG nested_wait_ready;
 static volatile LONG nested_wait_release;
 static volatile LONG nested_wait_returned;
 static volatile LONG nested_wait_finish;
+static volatile DWORD registry_tid;
+static volatile LONG registry_done;
+static volatile LONG registry_torn;
+static volatile LONG registry_observations;
+static volatile DWORD pin_boundary_tid;
+static volatile LONG pin_boundary_ready;
+static volatile LONG pin_boundary_transition;
+static volatile LONG pin_boundary_republished;
+static volatile LONG pin_boundary_finish;
+static GuestWaitKind classified_wait_kind = GuestWaitKind::ConditionSequence;
+static uintptr_t classified_wait_source;
 static constexpr uint64_t kGprExpected = 0xd3a5f17c2468be90ull;
 alignas(32) static uint8_t avx_expected[32];
 alignas(32) static uint8_t avx_observed[32];
@@ -97,6 +108,63 @@ static void* cond_worker(void*) {
     pthread_mutex_unlock(&wait_mutex);
     InterlockedExchange(&resumed, 1);
     return nullptr;
+}
+
+static void* classified_cond_worker(void*) {
+    worker_tid = GetCurrentThreadId();
+    pthread_mutex_lock(&wait_mutex);
+    InterlockedExchange(&cond_ready, 1);
+    interruptible_cond_wait(&wait_cond, &wait_mutex,
+                            classified_wait_kind, classified_wait_source);
+    pthread_mutex_unlock(&wait_mutex);
+    InterlockedExchange(&resumed, 1);
+    return nullptr;
+}
+
+static void* registry_worker(void*) {
+    const DWORD native_id = GetCurrentThreadId();
+    InterlockedExchange((volatile LONG*)&registry_tid, (LONG)native_id);
+    constexpr uint64_t pthread_a = 0x1111222233334444ull;
+    constexpr uint64_t pthread_b = 0xaaaabbbbccccddddull;
+    constexpr uintptr_t stack_a = 0x11110000u;
+    constexpr uintptr_t stack_b = 0x22220000u;
+    constexpr size_t size_a = 0x1111u;
+    constexpr size_t size_b = 0x2222u;
+    for (unsigned i = 0; i < 50000; ++i) {
+        trace_guest_thread_lifecycle(true, pthread_a, native_id, (void*)stack_a, size_a);
+        if (i == 0) Sleep(10); // guarantee the observer sees at least one valid published interval
+        if ((i & 31u) == 0) SwitchToThread();
+        trace_guest_thread_lifecycle(false, pthread_a, native_id, (void*)stack_a, size_a);
+        trace_guest_thread_lifecycle(true, pthread_b, native_id, (void*)stack_b, size_b);
+        if ((i & 31u) == 0) SwitchToThread();
+        trace_guest_thread_lifecycle(false, pthread_b, native_id, (void*)stack_b, size_b);
+    }
+    InterlockedExchange(&registry_done, 1);
+    return nullptr;
+}
+
+static void* pin_boundary_worker(void*) {
+    const DWORD native_id = GetCurrentThreadId();
+    InterlockedExchange((volatile LONG*)&pin_boundary_tid, (LONG)native_id);
+    trace_guest_thread_lifecycle(true, 0x1111222233334444ull, native_id,
+                                 (void*)0x11110000u, 0x1111u);
+    InterlockedExchange(&pin_boundary_ready, 1);
+    while (!pin_boundary_transition) Sleep(1);
+    trace_guest_thread_lifecycle(false, 0x1111222233334444ull, native_id,
+                                 (void*)0x11110000u, 0x1111u);
+    trace_guest_thread_lifecycle(true, 0xaaaabbbbccccddddull, native_id,
+                                 (void*)0x22220000u, 0x2222u);
+    InterlockedExchange(&pin_boundary_republished, 1);
+    while (!pin_boundary_finish) Sleep(1);
+    trace_guest_thread_lifecycle(false, 0xaaaabbbbccccddddull, native_id,
+                                 (void*)0x22220000u, 0x2222u);
+    return nullptr;
+}
+
+static void pin_boundary_hook(uint32_t native_id, void*) {
+    if (native_id != pin_boundary_tid) return;
+    InterlockedExchange(&pin_boundary_transition, 1);
+    for (int i = 0; i < 2000 && !pin_boundary_republished; ++i) Sleep(1);
 }
 
 static void* mutex_worker(void*) {
@@ -228,6 +296,74 @@ int main() {
     CHECK(install(0x1e, (uint64_t)(uintptr_t)&guest_exception_handler, 0, 0, 0, 0) == 0,
           "install guest exception handler");
     pthread_t thread = 0;
+
+    registry_tid = 0;
+    registry_done = 0;
+    registry_torn = 0;
+    registry_observations = 0;
+    CHECK(pthread_create(&thread, nullptr, registry_worker, nullptr) == 0,
+          "create lifecycle-registry publication stress thread");
+    for (int i = 0; i < 1000 && !registry_tid; ++i) Sleep(1);
+    while (!registry_done) {
+        GuestThreadSnapshot snapshot{};
+        if (!snapshot_guest_thread_registration(registry_tid, snapshot)) continue;
+        InterlockedIncrement(&registry_observations);
+        const bool generation_a = snapshot.pthread_id == 0x1111222233334444ull &&
+                                  snapshot.stack_base == 0x11110000u &&
+                                  snapshot.stack_size == 0x1111u;
+        const bool generation_b = snapshot.pthread_id == 0xaaaabbbbccccddddull &&
+                                  snapshot.stack_base == 0x22220000u &&
+                                  snapshot.stack_size == 0x2222u;
+        if (!generation_a && !generation_b) InterlockedExchange(&registry_torn, 1);
+    }
+    pthread_join(thread, nullptr);
+    GuestThreadSnapshot retired_snapshot{};
+    CHECK(registry_observations != 0, "lifecycle-registry stress observed published slots");
+    CHECK(registry_torn == 0, "lifecycle-registry snapshots never mix slot generations");
+    CHECK(!snapshot_guest_thread_registration(registry_tid, retired_snapshot),
+          "retired lifecycle slot is no longer visible");
+
+    pin_boundary_tid = 0;
+    pin_boundary_ready = 0;
+    pin_boundary_transition = 0;
+    pin_boundary_republished = 0;
+    pin_boundary_finish = 0;
+    const char* pin_trace_path = "test_win_exception_delivery_pin_boundary.tmp";
+    DeleteFileA(pin_trace_path);
+    pthread_t pin_thread{};
+    const int pin_create = pthread_create(&pin_thread, nullptr, pin_boundary_worker, nullptr);
+    CHECK(pin_create == 0,
+          "create deterministic sampler generation-boundary target");
+    if (pin_create == 0) {
+        for (int i = 0; i < 2000 && !pin_boundary_ready; ++i) Sleep(1);
+        set_guest_thread_trace_test_hook(&pin_boundary_hook);
+        dump_guest_thread_trace(pin_trace_path);
+        set_guest_thread_trace_test_hook(nullptr);
+        CHECK(pin_boundary_republished != 0,
+              "sampler boundary hook retires A and republishes B before suspension");
+        char pin_trace[4096]{};
+        if (FILE* file = std::fopen(pin_trace_path, "rb")) {
+            std::fread(pin_trace, 1, sizeof(pin_trace) - 1, file);
+            std::fclose(file);
+        }
+        CHECK(std::strstr(pin_trace, "unavailable error=1237") != nullptr,
+              "sampler rejects the retired generation after pinning its handle");
+        CHECK(std::strstr(pin_trace, " rip=") == nullptr,
+              "sampler never captures the replacement generation through a stale snapshot");
+        InterlockedExchange(&pin_boundary_finish, 1);
+        pthread_join(pin_thread, nullptr);
+    }
+    DeleteFileA(pin_trace_path);
+
+    void* readwrite_page = VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    void* executable_page = VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READ);
+    CHECK(readwrite_page && !guest_trace_page_executable((uintptr_t)readwrite_page),
+          "thread trace rejects committed non-executable pages");
+    CHECK(executable_page && guest_trace_page_executable((uintptr_t)executable_page),
+          "thread trace accepts committed executable pages");
+    if (readwrite_page) VirtualFree(readwrite_page, 0, MEM_RELEASE);
+    if (executable_page) VirtualFree(executable_page, 0, MEM_RELEASE);
+
     CHECK(pthread_create(&thread, nullptr, worker, nullptr) == 0, "create target thread");
     for (int i = 0; i < 1000 && !worker_tid; ++i) Sleep(1);
     CHECK(worker_tid != 0, "target thread entered blocking HLE futex");
@@ -412,6 +548,12 @@ int main() {
     pthread_mutex_unlock(&wait_mutex);
     CHECK(worker_tid != 0 && cond_ready != 0,
           "cooperative target entered registered wait");
+    GuestWaitSnapshot cooperative_wait{};
+    CHECK(snapshot_guest_wait(worker_tid, cooperative_wait),
+          "cooperative condition wait has a stable registry snapshot");
+    CHECK(cooperative_wait.kind == GuestWaitKind::ConditionSequence &&
+          cooperative_wait.source == (uintptr_t)&wait_cond && cooperative_wait.object != 0,
+          "condition wait snapshot keeps kind, object, and source in one generation");
 
     result = raise((uint64_t)thread, 0x1e, 0, 0, 0, 0);
     CHECK(result == 0, "queue cooperative exception delivery");
@@ -444,14 +586,38 @@ int main() {
     for (int i = 0; i < 1000 && !cond_ready; ++i) Sleep(1);
     pthread_mutex_lock(&wait_mutex);
     pthread_mutex_unlock(&wait_mutex);
+    GuestWaitSnapshot nested_outer_wait{};
+    CHECK(snapshot_guest_wait(worker_tid, nested_outer_wait) &&
+          nested_outer_wait.kind == GuestWaitKind::ConditionSequence &&
+          nested_outer_wait.object != 0,
+          "nested-delivery target begins with one stable outer wait");
     result = raise((uint64_t)thread, 0x1e, 0, 0, 0, 0);
     CHECK(result == 0, "deliver cooperative exception whose handler performs a nested wait");
     for (int i = 0; i < 2000 && !nested_wait_ready; ++i) Sleep(1);
     CHECK(nested_wait_ready != 0, "guest handler entered its nested semaphore-style wait");
+    GuestWaitSnapshot nested_waits[4]{};
+    const size_t nested_wait_count =
+        snapshot_guest_waits(worker_tid, nested_waits, sizeof(nested_waits) / sizeof(nested_waits[0]));
+    bool nested_has_outer = false;
+    bool nested_has_distinct_inner = false;
+    for (size_t i = 0; i < nested_wait_count && i < 4; ++i) {
+        nested_has_outer |= nested_waits[i].object == nested_outer_wait.object;
+        nested_has_distinct_inner |= nested_waits[i].object != 0 &&
+                                     nested_waits[i].object != nested_outer_wait.object;
+    }
+    CHECK(nested_wait_count == 2 && nested_has_outer && nested_has_distinct_inner,
+          "nested snapshot reports both active waits without choosing an arbitrary current slot");
+    GuestWaitSnapshot ambiguous_wait{};
+    CHECK(!snapshot_guest_wait(worker_tid, ambiguous_wait),
+          "singular wait snapshot rejects nested ambiguity");
     InterlockedExchange(&nested_wait_release, 1);
     interruptible_cond_broadcast(&nested_wait_cond);
     for (int i = 0; i < 2000 && !nested_wait_returned; ++i) Sleep(1);
     CHECK(nested_wait_returned != 0, "nested wait returned while handler remains active");
+    GuestWaitSnapshot remaining_outer_wait{};
+    CHECK(snapshot_guest_wait(worker_tid, remaining_outer_wait) &&
+          remaining_outer_wait.object == nested_outer_wait.object,
+          "outer wait remains the sole snapshot after inner wait unregisters");
     CHECK(interrupt_guest_wait((uint64_t)thread),
           "outer wait remains registered after nested wait unregisters");
     InterlockedExchange(&nested_wait_finish, 1);
@@ -550,6 +716,36 @@ int main() {
         CHECK(resumed != 0, "detached worker resumed and exited normally");
         Sleep(20); // allow the detached trampoline to finish its lifetime-bound cleanup
     }
+    auto check_classified_wait = [&](GuestWaitKind kind, uintptr_t source,
+                                     const char* stable_message, const char* wake_message) {
+        reset_delivery_state();
+        classified_wait_kind = kind;
+        classified_wait_source = source;
+        pthread_mutex_lock(&wait_mutex);
+        CHECK(pthread_create(&thread, nullptr, classified_cond_worker, nullptr) == 0,
+              "create classified wait target thread");
+        for (int i = 0; i < 1000 && !worker_tid; ++i) Sleep(1);
+        pthread_mutex_unlock(&wait_mutex);
+        for (int i = 0; i < 1000 && !cond_ready; ++i) Sleep(1);
+        pthread_mutex_lock(&wait_mutex);
+        pthread_mutex_unlock(&wait_mutex);
+        GuestWaitSnapshot wait{};
+        CHECK(snapshot_guest_wait(worker_tid, wait) && wait.kind == kind &&
+              wait.source == source && wait.object != 0, stable_message);
+        CHECK(interrupt_guest_wait((uint64_t)thread), wake_message);
+        for (int i = 0; i < 2000 && !resumed; ++i) Sleep(1);
+        if (!resumed) interruptible_cond_broadcast(&wait_cond);
+        pthread_join(thread, nullptr);
+        CHECK(resumed != 0, "classified wait target resumed after registry wake");
+    };
+    static uint64_t event_source_token;
+    static uint64_t semaphore_source_token;
+    check_classified_wait(GuestWaitKind::EventFlag, (uintptr_t)&event_source_token,
+                          "event-flag wait retains its source classification",
+                          "event-flag wait is interruptible through its sequence");
+    check_classified_wait(GuestWaitKind::Semaphore, (uintptr_t)&semaphore_source_token,
+                          "semaphore wait retains its source classification",
+                          "semaphore wait is interruptible through its sequence");
 
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }
     std::printf("== PASS ==\n");

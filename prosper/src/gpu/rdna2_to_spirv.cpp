@@ -259,18 +259,28 @@ struct SpirvCompute {
     }
     uint32_t sbin(uint32_t op, uint32_t a, uint32_t b) { uint32_t ri = id(); put(code, op, {t_i32, ri, bcs(a), bcs(b)}); return i2u(ri); }
     uint32_t sext2(uint32_t inst, uint32_t a, uint32_t b) { uint32_t ri = id(); putv(code, Op_ExtInst, {t_i32, ri, glsl, inst, bcs(a), bcs(b)}); return i2u(ri); }
-    // v_cvt_i32_f32 SATURATES: NaN -> 0, clamp to [INT_MIN, INT_MAX] (#135). 2147483520.0f
-    // (0x4EFFFFFF) is the largest float < 2^31, so the high clamp is exact in range and inputs
-    // >= 2^31 select INT_MAX; -2^31 is exactly representable, so the low clamp needs no select.
+    // v_cvt_i32_f32 SATURATES: NaN -> 0, clamp to [INT_MIN, INT_MAX] (#135). Do not emit
+    // OpConvertFToS: SPIR-V leaves invalid conversions undefined, and Metal also produces a
+    // backend-specific result near the signed limits even after a float clamp (#686). Convert a
+    // bounded absolute magnitude through the working unsigned path, then restore two's-complement
+    // sign. 2^31 is representable by u32, so every conversion is defined on all backends.
     uint32_t cvt_f2i(uint32_t bits) {
         uint32_t f = bcf(bits);
         uint32_t nan = id();  put(code, Op_FUnordNotEqual, {t_bool, nan, f, f});   // true iff NaN
         uint32_t safe = id(); put(code, Op_Select, {t_f32, safe, nan, fconstf(0.0f), f});
-        uint32_t hi = id();   putv(code, Op_ExtInst, {t_f32, hi, glsl, Glsl_FMin, safe, fconstf(2147483520.0f)});
-        uint32_t cl = id();   putv(code, Op_ExtInst, {t_f32, cl, glsl, Glsl_FMax, hi, fconstf(-2147483648.0f)});
-        uint32_t ri = id();   put(code, Op_ConvertFToS, {t_i32, ri, cl});
+        uint32_t magnitude = id();
+        putv(code, Op_ExtInst, {t_f32, magnitude, glsl, Glsl_FAbs, safe});
+        uint32_t bounded = id();
+        putv(code, Op_ExtInst,
+             {t_f32, bounded, glsl, Glsl_FMin, magnitude, fconstf(2147483648.0f)});
+        uint32_t unsigned_magnitude = id();
+        put(code, Op_ConvertFToU, {t_u32, unsigned_magnitude, bounded});
+        uint32_t negative = id();
+        put(code, Op_FOrdLessThan, {t_bool, negative, f, fconstf(0.0f)});
+        uint32_t negated = ibin(Op_ISub, uconst(0), unsigned_magnitude);
+        uint32_t signed_bits = sel(negative, negated, unsigned_magnitude);
         uint32_t big = id();  put(code, Op_FOrdGreaterThanEqual, {t_bool, big, f, fconstf(2147483648.0f)});
-        return sel(big, uconst(0x7FFFFFFFu), i2u(ri));
+        return sel(big, uconst(0x7FFFFFFFu), signed_bits);
     }
     uint32_t cvt_i2f(uint32_t bits) { uint32_t rf = id(); put(code, Op_ConvertSToF, {t_f32, rf, bcs(bits)}); return bcu(rf); }
     // Integer compares -> bool. scmp treats operands as signed, ucmp as unsigned.

@@ -81,6 +81,10 @@ expected hash. `--allow-mismatch` is for an intentional differential such as `--
 ./build-linux/gpu_replay --dump-failed-shader 0:1 /tmp/failed-fragment.bin /tmp/submit.prgcap
 ```
 
+Selected draw ranges and ordered prefixes write the BMP at the final selected draw target's extent when
+the returned RGBA byte count confirms that native size. Presentation-scaled replays retain the capsule's
+top-level extent, so a recorded native target cannot mislabel a deliberately scaled pixel buffer.
+
 ### Failed operations
 
 Capture v7 and later retain bounded diagnostics for draws and dispatches that semantic PM4 ordering contains but the

@@ -1161,7 +1161,8 @@ HLE(k_ef_wait)    { // (ef, pattern, waitMode, resultPat*, SceKernelUseconds* ti
         timespec dl = abs_deadline_us(usec);
         int rc = 0;
         while (!evf_match(e->bits, a1, (uint32_t)a2) && rc != ETIMEDOUT && !e->deleted)
-            rc = interruptible_cond_timedwait(&e->c, &e->m, &dl);
+            rc = interruptible_cond_timedwait(&e->c, &e->m, &dl,
+                                              GuestWaitKind::EventFlag, (uintptr_t)e);
         timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
         int64_t spent_i = (int64_t)(t1.tv_sec - t0.tv_sec) * 1000000
                         + ((int64_t)t1.tv_nsec - (int64_t)t0.tv_nsec) / 1000;
@@ -1169,7 +1170,8 @@ HLE(k_ef_wait)    { // (ef, pattern, waitMode, resultPat*, SceKernelUseconds* ti
         *(uint32_t*)(uintptr_t)a4 = spent >= usec ? 0u : (uint32_t)(usec - spent);
         if (!e->deleted && !evf_match(e->bits, a1, (uint32_t)a2)) ret = 0x8002003Cull;  // ETIMEDOUT
     } else {
-        while (!evf_match(e->bits, a1, (uint32_t)a2) && !e->deleted) interruptible_cond_wait(&e->c, &e->m);
+        while (!evf_match(e->bits, a1, (uint32_t)a2) && !e->deleted)
+            interruptible_cond_wait(&e->c, &e->m, GuestWaitKind::EventFlag, (uintptr_t)e);
     }
     bool deleted = e->deleted;                     // deleted under us -> EACCES (Kyty EventFlag.cpp)
     if (deleted) ret = 0x8002000Dull;
@@ -1237,7 +1239,8 @@ HLE(k_sema_wait)   { // (sema, need, SceKernelUseconds* timeout) — timeout hon
         timespec dl = abs_deadline_us(usec);
         int rc = 0;
         while (s->count < need && rc != ETIMEDOUT && !s->deleted)
-            rc = interruptible_cond_timedwait(&s->c, &s->m, &dl);
+            rc = interruptible_cond_timedwait(&s->c, &s->m, &dl,
+                                              GuestWaitKind::Semaphore, (uintptr_t)s);
         timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
         int64_t spent_i = (int64_t)(t1.tv_sec - t0.tv_sec) * 1000000
                         + ((int64_t)t1.tv_nsec - (int64_t)t0.tv_nsec) / 1000;
@@ -1245,7 +1248,8 @@ HLE(k_sema_wait)   { // (sema, need, SceKernelUseconds* timeout) — timeout hon
         *(uint32_t*)(uintptr_t)a2 = spent >= usec ? 0u : (uint32_t)(usec - spent);
         if (!s->deleted && s->count < need) ret = 0x8002003Cull;    // KERNEL_ERROR_ETIMEDOUT
     } else {
-        while (s->count < need && !s->deleted) interruptible_cond_wait(&s->c, &s->m);
+        while (s->count < need && !s->deleted)
+            interruptible_cond_wait(&s->c, &s->m, GuestWaitKind::Semaphore, (uintptr_t)s);
     }
     bool deleted = s->deleted;                       // deleted under us -> EACCES
     if (deleted) ret = 0x8002000Dull;
@@ -1510,6 +1514,94 @@ struct WinCoopSlot {
 };
 std::array<WinCoopSlot, 1024> g_win_coop_slots;
 std::atomic<uint32_t> g_win_coop_queued{0};
+
+struct WinGuestThreadSlot {
+    std::atomic<uint64_t> publication{0};
+    uint64_t next_publication = 0; // written only while publication holds the exclusive sentinel
+    std::atomic<uintptr_t> thread_handle{0};
+    std::atomic<uint32_t> native_id{0};
+    std::atomic<uint64_t> pthread_id{0};
+    std::atomic<uintptr_t> stack_base{0};
+    std::atomic<size_t> stack_size{0};
+};
+std::array<WinGuestThreadSlot, 1024> g_win_guest_threads;
+constexpr uint64_t kWinGuestThreadSlotPublishing = UINT64_MAX;
+std::atomic<GuestThreadTraceTestHook> g_guest_thread_trace_test_hook{nullptr};
+std::atomic<void*> g_guest_thread_trace_test_opaque{nullptr};
+
+bool win_guest_thread_snapshot(const WinGuestThreadSlot& slot, GuestThreadSnapshot& snapshot,
+                               uint64_t* generation = nullptr,
+                               HANDLE* registered_handle = nullptr) {
+    if (generation) *generation = 0;
+    if (registered_handle) *registered_handle = nullptr;
+    const uint64_t publication = slot.publication.load(std::memory_order_acquire);
+    if (publication == 0 || publication == kWinGuestThreadSlotPublishing) return false;
+    const HANDLE handle = (HANDLE)slot.thread_handle.load(std::memory_order_relaxed);
+    const uint32_t native_id = slot.native_id.load(std::memory_order_relaxed);
+    const uint64_t pthread_id = slot.pthread_id.load(std::memory_order_relaxed);
+    const uintptr_t stack_base = slot.stack_base.load(std::memory_order_relaxed);
+    const size_t stack_size = slot.stack_size.load(std::memory_order_relaxed);
+    if (slot.publication.load(std::memory_order_acquire) != publication) return false;
+    snapshot = {native_id, pthread_id, stack_base, stack_size};
+    if (generation) *generation = publication;
+    if (registered_handle) *registered_handle = handle;
+    return true;
+}
+
+void win_guest_thread_register(uint64_t pthread_id, uint32_t native_id,
+                               void* stack_base, size_t stack_size) {
+    if (native_id == 0) return;
+    HANDLE thread_handle = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
+                         &thread_handle, 0, FALSE, DUPLICATE_SAME_ACCESS))
+        return;
+    for (WinGuestThreadSlot& slot : g_win_guest_threads) {
+        GuestThreadSnapshot current{};
+        if (win_guest_thread_snapshot(slot, current) && current.native_id == native_id &&
+            current.pthread_id == pthread_id) {
+            CloseHandle(thread_handle);
+            return; // idempotent lifecycle notification
+        }
+        uint64_t publication = 0;
+        if (!slot.publication.compare_exchange_strong(
+                publication, kWinGuestThreadSlotPublishing, std::memory_order_acq_rel))
+            continue;
+        // A unique publication token validates the complete payload and detects unregister/re-register
+        // ABA even when Windows promptly reuses the same native thread id.
+        slot.thread_handle.store((uintptr_t)thread_handle, std::memory_order_relaxed);
+        slot.native_id.store(native_id, std::memory_order_relaxed);
+        slot.pthread_id.store(pthread_id, std::memory_order_relaxed);
+        slot.stack_base.store((uintptr_t)stack_base, std::memory_order_relaxed);
+        slot.stack_size.store(stack_size, std::memory_order_relaxed);
+        uint64_t token;
+        do {
+            token = ++slot.next_publication;
+        } while (token == 0 || token == kWinGuestThreadSlotPublishing);
+        slot.publication.store(token, std::memory_order_release);
+        return;
+    }
+    CloseHandle(thread_handle);
+}
+
+void win_guest_thread_unregister(uint32_t native_id) {
+    for (WinGuestThreadSlot& slot : g_win_guest_threads) {
+        uint64_t publication = slot.publication.load(std::memory_order_acquire);
+        if (publication == 0 || publication == kWinGuestThreadSlotPublishing ||
+            slot.native_id.load(std::memory_order_relaxed) != native_id ||
+            slot.publication.load(std::memory_order_acquire) != publication ||
+            !slot.publication.compare_exchange_strong(
+                publication, kWinGuestThreadSlotPublishing, std::memory_order_acq_rel))
+            continue;
+        HANDLE thread_handle = (HANDLE)slot.thread_handle.exchange(0, std::memory_order_relaxed);
+        slot.native_id.store(0, std::memory_order_relaxed);
+        slot.pthread_id.store(0, std::memory_order_relaxed);
+        slot.stack_base.store(0, std::memory_order_relaxed);
+        slot.stack_size.store(0, std::memory_order_relaxed);
+        slot.publication.store(0, std::memory_order_release);
+        if (thread_handle) CloseHandle(thread_handle);
+        return;
+    }
+}
 
 void win_exc_trace(WinExcTraceKind kind, uint64_t target, uint32_t windows_tid,
                    uint64_t rip, uint64_t rsp, uint64_t extra = 0);
@@ -1940,6 +2032,238 @@ void dump_guest_exception_trace() {
 #endif
 }
 
+void dump_guest_thread_trace(const char* path, uint64_t pthread_filter) {
+#ifdef _WIN32
+    HANDLE output = GetStdHandle(STD_ERROR_HANDLE);
+    bool close_output = false;
+    if (path && *path) {
+        HANDLE file = CreateFileA(path, FILE_APPEND_DATA,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                  nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file != INVALID_HANDLE_VALUE) {
+            output = file;
+            close_output = true;
+        }
+    }
+    auto trace = [output]<typename... Args>(const char* format, Args... args) {
+        char message[512];
+        const int length = std::snprintf(message, sizeof(message), format, args...);
+        if (length <= 0) return;
+        DWORD written = 0;
+        const DWORD bytes = static_cast<DWORD>(
+            length < (int)sizeof(message) ? length : (int)sizeof(message) - 1);
+        WriteFile(output, message, bytes, &written, nullptr);
+    };
+    std::vector<UnwindModuleDesc> modules;
+    {
+        std::lock_guard<std::mutex> lock(g_unwind_mx);
+        modules = g_unwind_mods;
+    }
+    unsigned live = 0;
+    for (const WinGuestThreadSlot& slot : g_win_guest_threads) {
+        GuestThreadSnapshot registered{};
+        live += win_guest_thread_snapshot(slot, registered);
+    }
+    size_t condition_slots_used = 0;
+    size_t condition_slots_capacity = 0;
+    snapshot_guest_wait_registry(condition_slots_used, condition_slots_capacity);
+    trace("[thread-trace] live guest threads=%u condition-slots=%zu/%zu\n", live,
+          condition_slots_used, condition_slots_capacity);
+    for (const WinGuestThreadSlot& slot : g_win_guest_threads) {
+        GuestThreadSnapshot registered{};
+        uint64_t registration_generation = 0;
+        HANDLE registered_handle = nullptr;
+        if (!win_guest_thread_snapshot(
+                slot, registered, &registration_generation, &registered_handle))
+            continue;
+        const uint32_t native_id = registered.native_id;
+        const uint64_t pthread_id = registered.pthread_id;
+        if (pthread_filter && pthread_id != pthread_filter) continue;
+        const uintptr_t stack_base = registered.stack_base;
+        const size_t stack_size = registered.stack_size;
+        HANDLE thread = nullptr;
+        DWORD pin_error = registered_handle ? ERROR_SUCCESS : ERROR_INVALID_HANDLE;
+        if (registered_handle &&
+            !DuplicateHandle(GetCurrentProcess(), registered_handle, GetCurrentProcess(),
+                             &thread, 0, FALSE, DUPLICATE_SAME_ACCESS))
+            pin_error = GetLastError();
+        if (thread && GetThreadId(thread) != native_id)
+            pin_error = ERROR_INVALID_THREAD_ID;
+        if (pin_error == ERROR_SUCCESS && thread) {
+            GuestThreadTraceTestHook hook =
+                g_guest_thread_trace_test_hook.load(std::memory_order_acquire);
+            if (hook)
+                hook(native_id, g_guest_thread_trace_test_opaque.load(std::memory_order_acquire));
+        }
+        if (thread &&
+            slot.publication.load(std::memory_order_acquire) != registration_generation)
+            pin_error = ERROR_RETRY;
+        if (pin_error != ERROR_SUCCESS || !thread) {
+            if (thread) CloseHandle(thread);
+            trace("[thread-trace] tid=%lu pthread=0x%llx unavailable error=%lu\n",
+                  (unsigned long)native_id, (unsigned long long)pthread_id,
+                  (unsigned long)pin_error);
+            continue;
+        }
+        const DWORD prior_suspend = SuspendThread(thread);
+        if (prior_suspend != (DWORD)-1 &&
+            slot.publication.load(std::memory_order_acquire) != registration_generation) {
+            ResumeThread(thread);
+            CloseHandle(thread);
+            trace("[thread-trace] tid=%lu pthread=0x%llx registration-retired\n",
+                  (unsigned long)native_id, (unsigned long long)pthread_id);
+            continue;
+        }
+        CONTEXT context{};
+        context.ContextFlags = CONTEXT_CONTROL;
+        const bool captured = prior_suspend != (DWORD)-1 && GetThreadContext(thread, &context);
+        const DWORD capture_error = captured ? ERROR_SUCCESS : GetLastError();
+        std::array<uint64_t, 2048> stack_words{};
+        SIZE_T stack_bytes = 0;
+        if (captured && context.Rsp >= stack_base &&
+            context.Rsp - stack_base < stack_size) {
+            const size_t available = stack_size - ((uintptr_t)context.Rsp - stack_base);
+            const size_t wanted = std::min(available, sizeof(stack_words));
+            ReadProcessMemory(GetCurrentProcess(), (void*)(uintptr_t)context.Rsp,
+                              stack_words.data(), wanted, &stack_bytes);
+        }
+        std::array<GuestWaitSnapshot, 16> captured_waits{};
+        const size_t captured_wait_count = captured
+            ? snapshot_guest_waits(native_id, captured_waits.data(), captured_waits.size())
+            : 0;
+        if (prior_suspend != (DWORD)-1) ResumeThread(thread);
+        CloseHandle(thread);
+        if (!captured) {
+            trace("[thread-trace] tid=%lu pthread=0x%llx capture-failed error=%lu\n",
+                  (unsigned long)native_id, (unsigned long long)pthread_id,
+                  (unsigned long)capture_error);
+            continue;
+        }
+        const uint64_t rip = context.Rip;
+        const char* module_name = "host";
+        char guest_module_name[32]{};
+        uint64_t offset = rip;
+        for (size_t module_index = 0; module_index < modules.size(); ++module_index) {
+            const UnwindModuleDesc& guest_module = modules[module_index];
+            if (rip < guest_module.lo || rip >= guest_module.hi) continue;
+            std::snprintf(guest_module_name, sizeof(guest_module_name), "guest[%zu]", module_index);
+            module_name = guest_module_name;
+            offset = rip - guest_module.lo;
+            break;
+        }
+        char guest_returns[224] = "-";
+        size_t guest_returns_used = 0;
+        unsigned guest_return_count = 0;
+        for (size_t i = 0; i < stack_bytes / sizeof(uint64_t) && guest_return_count < 8; ++i) {
+            const uint64_t candidate = stack_words[i];
+            if (candidate < 0x400000000ull || candidate >= 0x600000000ull) continue;
+            bool in_guest_module = false;
+            for (const UnwindModuleDesc& guest_module : modules)
+                in_guest_module |= candidate >= guest_module.lo && candidate < guest_module.hi;
+            if (!in_guest_module || !guest_trace_page_executable((uintptr_t)candidate)) continue;
+            bool duplicate = false;
+            for (size_t j = 0; j < i; ++j)
+                duplicate |= stack_words[j] == candidate;
+            if (duplicate) continue;
+            const int appended = std::snprintf(
+                guest_returns + guest_returns_used,
+                sizeof(guest_returns) - guest_returns_used,
+                guest_return_count ? ",0x%llx" : "0x%llx",
+                (unsigned long long)candidate);
+            if (appended <= 0 || (size_t)appended >= sizeof(guest_returns) - guest_returns_used)
+                break;
+            guest_returns_used += (size_t)appended;
+            ++guest_return_count;
+        }
+        char wait_description[256] = "-";
+        if (captured_wait_count) {
+            wait_description[0] = 0;
+            size_t used = 0;
+            const size_t stored_wait_count = std::min(captured_wait_count, captured_waits.size());
+            for (size_t wait_index = 0; wait_index < stored_wait_count; ++wait_index) {
+                const GuestWaitSnapshot& wait = captured_waits[wait_index];
+                const char* kind = wait.kind == GuestWaitKind::Address ? "address" :
+                                   wait.kind == GuestWaitKind::ConditionSequence ? "condition" :
+                                   wait.kind == GuestWaitKind::EventFlag ? "event-flag" :
+                                   wait.kind == GuestWaitKind::Semaphore ? "semaphore" :
+                                   "unknown";
+                const int appended = wait.source
+                    ? std::snprintf(wait_description + used, sizeof(wait_description) - used,
+                                    wait_index ? ";%s@0x%llx(source=0x%llx)" :
+                                                 "%s@0x%llx(source=0x%llx)",
+                                    kind, (unsigned long long)wait.object,
+                                    (unsigned long long)wait.source)
+                    : std::snprintf(wait_description + used, sizeof(wait_description) - used,
+                                    wait_index ? ";%s@0x%llx" : "%s@0x%llx", kind,
+                                    (unsigned long long)wait.object);
+                if (appended <= 0 || (size_t)appended >= sizeof(wait_description) - used) break;
+                used += (size_t)appended;
+            }
+            if (captured_wait_count > captured_waits.size() && used < sizeof(wait_description))
+                std::snprintf(wait_description + used, sizeof(wait_description) - used,
+                              ";+%zu-more", captured_wait_count - captured_waits.size());
+        }
+        trace("[thread-trace] tid=%lu pthread=0x%llx rip=%s+0x%llx "
+              "raw=0x%llx rsp=0x%llx suspend=%lu waits=%s guest-stack=%s\n",
+              (unsigned long)native_id, (unsigned long long)pthread_id, module_name,
+              (unsigned long long)offset, (unsigned long long)rip,
+              (unsigned long long)context.Rsp, (unsigned long)prior_suspend,
+              wait_description, guest_returns);
+    }
+    if (close_output) CloseHandle(output);
+#else
+    (void)path;
+    (void)pthread_filter;
+#endif
+}
+
+bool snapshot_guest_thread_registration(uint32_t native_id, GuestThreadSnapshot& snapshot) {
+    snapshot = {};
+#ifdef _WIN32
+    for (const WinGuestThreadSlot& slot : g_win_guest_threads) {
+        GuestThreadSnapshot candidate{};
+        if (win_guest_thread_snapshot(slot, candidate) && candidate.native_id == native_id) {
+            snapshot = candidate;
+            return true;
+        }
+    }
+#else
+    (void)native_id;
+#endif
+    return false;
+}
+
+bool guest_trace_page_executable(uintptr_t address) {
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION memory{};
+    if (!address || VirtualQuery((const void*)address, &memory, sizeof(memory)) != sizeof(memory) ||
+        memory.State != MEM_COMMIT || (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
+        return false;
+    switch (memory.Protect & 0xffu) {
+        case PAGE_EXECUTE:
+        case PAGE_EXECUTE_READ:
+        case PAGE_EXECUTE_READWRITE:
+        case PAGE_EXECUTE_WRITECOPY:
+            return true;
+        default:
+            return false;
+    }
+#else
+    (void)address;
+    return false;
+#endif
+}
+
+void set_guest_thread_trace_test_hook(GuestThreadTraceTestHook hook, void* opaque) {
+#ifdef _WIN32
+    g_guest_thread_trace_test_opaque.store(opaque, std::memory_order_release);
+    g_guest_thread_trace_test_hook.store(hook, std::memory_order_release);
+#else
+    (void)hook;
+    (void)opaque;
+#endif
+}
+
 void dispatch_pending_guest_exception() {
 #ifdef _WIN32
     if (g_win_coop_queued.load(std::memory_order_acquire) == 0) return;
@@ -2003,6 +2327,10 @@ void trace_guest_stack_query(uint64_t target, bool found, void* base, size_t siz
 void trace_guest_thread_lifecycle(bool starting, uint64_t pthread_id, uint64_t native_id,
                                   void* stack_base, size_t stack_size) {
 #ifdef _WIN32
+    if (starting)
+        win_guest_thread_register(pthread_id, (uint32_t)native_id, stack_base, stack_size);
+    else
+        win_guest_thread_unregister((uint32_t)native_id);
     win_exc_trace(starting ? WinExcTraceKind::ThreadStart : WinExcTraceKind::ThreadExit,
                   pthread_id, (uint32_t)native_id, (uint64_t)(uintptr_t)stack_base,
                   (uint64_t)stack_size);

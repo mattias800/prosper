@@ -488,6 +488,16 @@ if(TARGET prosper_core)
   target_link_libraries(test_gpu_timeline PRIVATE prosper_core)
   add_test(NAME gpu_timeline_roundtrip COMMAND test_gpu_timeline)
 
+  add_executable(test_gpu_timeline_capture_exit tests/test_gpu_timeline_capture_exit.cpp)
+  target_link_libraries(test_gpu_timeline_capture_exit PRIVATE prosper_core)
+  add_test(NAME gpu_timeline_capture_failure_exit COMMAND test_gpu_timeline_capture_exit)
+
+  # gpu_replay output dimensions follow the selected draw/prefix target when its byte count agrees.
+  # Pure/cross-platform so focused replay tooling remains available in CI.
+  add_executable(test_gpu_replay_extent tests/test_gpu_replay_extent.cpp)
+  target_link_libraries(test_gpu_replay_extent PRIVATE prosper_core)
+  add_test(NAME gpu_replay_output_extent COMMAND test_gpu_replay_extent)
+
   add_executable(test_gpu_dependency_graph tests/test_gpu_dependency_graph.cpp)
   target_link_libraries(test_gpu_dependency_graph PRIVATE prosper_core)
   add_test(NAME gpu_dependency_graph COMMAND test_gpu_dependency_graph)

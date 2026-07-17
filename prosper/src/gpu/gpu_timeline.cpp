@@ -36,7 +36,7 @@ namespace {
 
 constexpr uint8_t kFileMagic[8] = {'P', 'R', 'G', 'T', 'L', 'N', '\0', '\0'};
 constexpr uint8_t kRecordMagic[4] = {'T', 'L', 'R', 'C'};
-constexpr uint32_t kVersion = 6;
+constexpr uint32_t kVersion = 7;
 constexpr uint32_t kEndian = 0x01020304u;
 constexpr uint32_t kMaxPayloadBytes = 1u << 20;
 constexpr uint32_t kFlushInterval = 256;
@@ -254,6 +254,7 @@ struct RuntimeDetailRequest {
     bool valid = false;
     std::atomic<bool> claimed{false};
     std::atomic<bool> predecessor_claimed{false};
+    std::atomic<bool> predecessor_failed{false};
     bool bundle_start_reached = false;
 
     RuntimeDetailRequest() {
@@ -843,10 +844,12 @@ bool GpuTimelineWriter::append_submit(const GpuTimelineSubmit& submit, std::stri
     payload.u32(submit.dispatch_count);
     payload.u32(submit.color0_width);
     payload.u32(submit.color0_height);
-    // Keep a metadata-free v6 submit byte-identical to v1-v4 for compatibility fixtures. Any v6
-    // tail carries both collection counts so the depth and target-span sections are unambiguous.
+    // v7 prefixes its optional tail with unsupported-operation metadata. Older versions retain
+    // their historical tail layout in the reader below.
     if (!submit.depth_surfaces.empty() || !submit.target_spans.empty() ||
-        submit.target_spans_truncated) {
+        submit.target_spans_truncated || submit.dma_copy_count || submit.capture_incomplete) {
+        payload.u32(submit.dma_copy_count);
+        payload.u32(submit.capture_incomplete ? 1u : 0u);
         payload.u32(static_cast<uint32_t>(submit.depth_surfaces.size()));
         for (const auto& ds : submit.depth_surfaces) {
             payload.u64(ds.depth_read_base); payload.u64(ds.depth_write_base);
@@ -1062,6 +1065,14 @@ bool read_gpu_timeline(const std::string& path, GpuTimelineFile& timeline, std::
                 return false;
             }
             const bool have_submit_tail = p.left != 0;
+            if (version >= 7 && have_submit_tail) {
+                uint32_t incomplete = 0;
+                if (!p.u32(submit.dma_copy_count) || !p.u32(incomplete) || incomplete > 1) {
+                    error = "invalid timeline unsupported-operation metadata";
+                    return false;
+                }
+                submit.capture_incomplete = incomplete != 0;
+            }
             if (version >= 5 && have_submit_tail) {
                 uint32_t surface_count = 0;
                 if (!p.u32(surface_count) || surface_count > 65536) {
@@ -1334,6 +1345,9 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
     submit.process_command_order = state.command_order;
     submit.draw_count = static_cast<uint32_t>(std::min<size_t>(state.draws.size(), UINT32_MAX));
     submit.dispatch_count = static_cast<uint32_t>(std::min<size_t>(state.dispatches.size(), UINT32_MAX));
+    submit.dma_copy_count = static_cast<uint32_t>(
+        std::min<size_t>(state.dma_copies.size(), UINT32_MAX));
+    submit.capture_incomplete = !state.dma_copies.empty();
     submit.first_command_order = std::numeric_limits<uint64_t>::max();
     const bool log_mrt = select_timeline_mrt_submit(state, submit_no);
     for (size_t draw_index = 0; draw_index < state.draws.size(); ++draw_index) {
@@ -1437,6 +1451,10 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
         submit.first_command_order = std::min(submit.first_command_order, dispatch.command_order);
         submit.last_command_order = std::max(submit.last_command_order, dispatch.command_order);
     }
+    for (const auto& dma : state.dma_copies) {
+        submit.first_command_order = std::min(submit.first_command_order, dma.command_order);
+        submit.last_command_order = std::max(submit.last_command_order, dma.command_order);
+    }
     if (submit.first_command_order == std::numeric_limits<uint64_t>::max())
         submit.first_command_order = submit.last_command_order = 0;
     if (!state.draws.empty()) {
@@ -1525,6 +1543,7 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
         if (!capture_gpustate_submit(state, submit_no, metadata.width, metadata.height,
                                      metadata, predecessor, error) ||
             !write_gpu_capture(request.predecessor_path, predecessor, error)) {
+            request.predecessor_failed.store(true);
             std::fprintf(stderr, "[timeline] predecessor submit %llu capture failed: %s\n",
                          static_cast<unsigned long long>(submit_no), error.c_str());
         } else {
@@ -1690,7 +1709,10 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
                      static_cast<unsigned long long>(submit_no), error.c_str());
         error.clear();
     }
-    bool requested_artifacts_written = true;
+    const bool predecessor_requested = !request.select_target_width &&
+        !request.predecessor_path.empty() && request.submit_no > 1;
+    bool requested_artifacts_written = !predecessor_requested ||
+        (request.predecessor_claimed.load() && !request.predecessor_failed.load());
     if (!request.bundle_path.empty()) {
         RuntimeCaptureBundle& state = runtime_capture_bundle();
         GpuCaptureBundle& bundle = state.bundle;
@@ -1737,11 +1759,13 @@ void record_gpu_timeline_submit(const GpuState& state, uint64_t submit_no) {
     }
     log_capture_detail(detail);
     history.remember(state, submit_no);
-    if (request.exit_after_capture && requested_artifacts_written) {
-        std::fprintf(stderr, "[timeline] selected capture complete; exiting as requested\n");
+    if (request.exit_after_capture) {
+        std::fprintf(stderr, requested_artifacts_written
+            ? "[timeline] selected capture complete; exiting as requested\n"
+            : "[timeline] one or more requested capture artifacts failed; exiting nonzero\n");
         close_gpu_timeline();
         std::fflush(nullptr);
-        std::exit(0);
+        std::exit(requested_artifacts_written ? 0 : 2);
     }
 }
 

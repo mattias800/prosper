@@ -4,6 +4,7 @@
 #include "gpu/gpu_execute.hpp"
 #include "gpu/shader_resources.hpp"
 #include "live_renderer.hpp"
+#include "replay_output_extent.hpp"
 #include "render_runner.h"
 
 #include <algorithm>
@@ -1592,22 +1593,17 @@ int main(int argc, char** argv) {
     }
     const size_t operation_limit = through_operation >= 0
         ? static_cast<size_t>(through_operation) + 1 : selected_operation_limit;
-    std::vector<uint8_t> pixels = execute_frame(
-        replay, draw_first >= 0 && !draw_with_compute_prefix, operation_limit);
-    uint32_t output_width = m.width, output_height = m.height;
-    if (through_operation >= 0) {
-        for (size_t operation_index = 0; operation_index < operation_limit; ++operation_index) {
-            const auto& operation = replay.operations[operation_index];
-            if (!operation.realized ||
-                operation.kind != prosper::gpu::SubmitOperationKind::Draw) continue;
-            const auto item = std::find_if(replay.items.begin(), replay.items.end(),
-                [&](const auto& draw) { return draw.draw_index == operation.source_index; });
-            if (item != replay.items.end() && item->color0_width && item->color0_height) {
-                output_width = item->color0_width;
-                output_height = item->color0_height;
-            }
-        }
-    }
+    const bool selected_draws_only = draw_first >= 0 && !draw_with_compute_prefix;
+    std::vector<uint8_t> pixels = execute_frame(replay, selected_draws_only, operation_limit);
+    const auto extent_mode = selected_draws_only
+        ? prosper::gpu::replay_tool::OutputExtentMode::SelectedDraws
+        : (through_operation >= 0 || (draw_first >= 0 && draw_with_compute_prefix))
+            ? prosper::gpu::replay_tool::OutputExtentMode::OrderedPrefix
+            : prosper::gpu::replay_tool::OutputExtentMode::Capture;
+    const auto output_extent = prosper::gpu::replay_tool::replay_output_extent(
+        replay, extent_mode, pixels.size(), operation_limit);
+    const uint32_t output_width = output_extent.width;
+    const uint32_t output_height = output_extent.height;
     uint64_t hash = prosper::gpu::gpu_capture_hash(pixels);
     std::fprintf(stderr, "[gpureplay] output=%ux%u bytes=%zu hash=%016llx "
                          "expected_bytes=%llu expected_hash=%016llx\n",

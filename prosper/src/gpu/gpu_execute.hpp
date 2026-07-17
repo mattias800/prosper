@@ -69,10 +69,14 @@ struct DrawItem {
 // pixels (or {} on failure). Empty list -> {} (nothing to draw).
 using RenderFn = std::function<std::vector<uint8_t>(const std::vector<DrawItem>& items)>;
 
-// Safe guest-address readability probe: write() to /dev/null returns EFAULT for an unmapped source
-// (Linux; always-true on Windows), so callers can test a guest pointer without risking a SIGSEGV.
-// Implemented in gpu_executor.cpp; shared by the executor's const-eval and HLE diagnostic probes.
+// Safe guest-address readability probe: a page-touching pipe probe on Linux/macOS and VirtualQuery
+// on Windows let callers test a guest pointer without risking a host fault. Implemented in
+// gpu_executor.cpp; shared by the executor's const-eval and HLE diagnostic probes.
 bool guest_readable(uint64_t addr, uint32_t bytes);
+// True only when the complete guest range is currently mapped writable. DMA_DATA uses this before
+// copying into a guest-provided destination so a read-only mapping cannot turn a malformed packet
+// into a host fault.
+bool guest_writable(uint64_t addr, uint32_t bytes);
 
 // One resolved bindless-dynamic vertex fetch from the wave-uniform scalar const-fold in
 // gpu_executor.cpp: the exact fetch instruction (pc), its SRSRC SGPR, and the V# live in that SGPR
@@ -323,10 +327,22 @@ struct LiveTargetSnapshot {
 using LiveTargetReaderFn = std::function<bool(uint64_t gpu_addr, LiveTargetSnapshot& snapshot)>;
 void set_live_target_reader(LiveTargetReaderFn fn);
 bool read_live_render_target(uint64_t gpu_addr, LiveTargetSnapshot& snapshot);
+// Ordered memory producers need the same authoritative storage version as live compute. A source
+// may begin inside a target, so the renderer validates the complete requested byte range instead of
+// exposing an unbounded pointer into its cache.
+enum class LiveTargetByteReadResult : uint8_t { NotFound, Success, InvalidRange };
+using LiveTargetByteRangeReaderFn = std::function<LiveTargetByteReadResult(
+    uint64_t gpu_addr, uint32_t bytes, std::vector<uint8_t>& output)>;
+void set_live_target_byte_range_reader(LiveTargetByteRangeReaderFn fn);
+LiveTargetByteReadResult read_live_render_target_bytes(uint64_t gpu_addr, uint32_t bytes,
+                                                       std::vector<uint8_t>& output);
 std::vector<ComputeItem> realize_compute_dispatches(const GpuState& st,
                                                      uint64_t submit_no = 0,
                                                      std::vector<OperationRealizationFailure>* failures = nullptr);
 bool execute_compute_dispatches(const GpuState& st, uint64_t submit_no = 0);
+// Execute retained dispatches and address-backed DMA copies in PM4 order when graphics rendering is
+// intentionally skipped or unavailable. Draw operations are omitted, but still delimit ordering.
+bool execute_nonrender_submit_work(const GpuState& st, uint64_t submit_no = 0);
 std::vector<SubmitOperation> plan_submit_operations(const GpuState& st);
 
 // PROSPER_PROVENANCE_DIM=WxH: inspect sampled images of that size and report overlapping
@@ -993,6 +1009,14 @@ struct OrderedSubmitResult {
 OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& operations,
                                           const std::vector<DrawItem>& draws,
                                           const std::vector<ComputeItem>& computes,
+                                          const std::vector<GpuState::DmaCopy>& dma_copies,
+                                          const LiveRenderFn& render,
+                                          const LiveComputeFn& compute,
+                                          uint32_t width, uint32_t height);
+// Compatibility overload for capture replay and tests whose timelines contain only draws/dispatches.
+OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& operations,
+                                          const std::vector<DrawItem>& draws,
+                                          const std::vector<ComputeItem>& computes,
                                           const LiveRenderFn& render,
                                           const LiveComputeFn& compute,
                                           uint32_t width, uint32_t height);
@@ -1004,6 +1028,9 @@ bool have_submit_renderer();
 struct LiveRenderPhase {
     bool first_span = true;
     bool final_span = true;
+    // The next ordered operation reads render-target bytes on the CPU. Persistent Vulkan targets
+    // must synchronously read back this span instead of deferring their authoritative pixels.
+    bool authoritative_readback = false;
 };
 LiveRenderPhase live_render_phase();
 
