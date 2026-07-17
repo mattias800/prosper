@@ -38,6 +38,7 @@ static uint32_t PM4(uint32_t len, uint32_t op, uint32_t r) {
 // guest-visible at a drain point — tests assert the guest-visible (post-drain) state.
 static size_t run_cb(const uint32_t* buf, size_t dwords, GpuState& st) {
     size_t n = run_command_buffer(buf, dwords, st);
+    execute_nonrender_submit_work(st);
     prosper_gpu_drain_completion_writes();
     return n;
 }
@@ -185,6 +186,8 @@ int main() {
         GpuState st; run_cb(dma, 7, st);
         set_guest_gpu_write_observer({});
 
+        CHECK(st.dma_copies.size() == 1 && st.dma_copies[0].command_order > 0,
+              "address-backed DMA_DATA is retained as an ordered submit operation");
         CHECK(memcmp(target + 3, source + 1, 17) == 0,
               "DMA_DATA copied the exact address-backed byte span");
         CHECK(target[2] == 0xCC && target[20] == 0xCC,

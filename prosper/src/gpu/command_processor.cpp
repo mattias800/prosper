@@ -787,8 +787,9 @@ static void report_invalid_dma_data(const Pm4Command& c) {
                 (unsigned long long)c.dd_dst, (unsigned long long)c.dd_src, c.dd_bytes, c.dd_sels);
 }
 
-static void honor_dma_data(const Pm4Command& c, bool notify_renderer = true) {
+static void honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 0) {
     if (eop_writes_disabled() || !c.dd_valid) return;
+    const uint64_t packet_addr = retained_packet_addr ? retained_packet_addr : pkt_addr(c);
     const DmaDataForm form = dma_data_form(c);
     if (form == DmaDataForm::Invalid) {
         report_invalid_dma_data(c);
@@ -806,7 +807,7 @@ static void honor_dma_data(const Pm4Command& c, bool notify_renderer = true) {
             bool generation_changed = dma_build_pre_changed(c, pre_dma, &build_pre);
             if (generation_changed) {
                 label_hist_dma_free(c.dd_dst, 0);
-                stale_dma_change_report(c.dd_dst, build_pre, pre_dma, pkt_addr(c));
+                stale_dma_change_report(c.dd_dst, build_pre, pre_dma, packet_addr);
                 return;
             }
             Mb3FreelistMatch match{};
@@ -816,7 +817,7 @@ static void honor_dma_data(const Pm4Command& c, bool notify_renderer = true) {
                 return;
             }
         }
-        forge_trip("DMA", c.dd_dst, pre_dma, v32, 4, pkt_addr(c));
+        forge_trip("DMA", c.dd_dst, pre_dma, v32, 4, packet_addr);
         if (v32 == 0) {
             memset(dst, 0, c.dd_bytes);
         } else {
@@ -824,7 +825,7 @@ static void honor_dma_data(const Pm4Command& c, bool notify_renderer = true) {
             for (; i + 4 <= c.dd_bytes; i += 4) memcpy(dst + i, &v32, 4);
             if (i < c.dd_bytes) memcpy(dst + i, &v32, c.dd_bytes - i);
         }
-        poolshift_check("DMA", c.dd_dst, c.dd_bytes, c.dd_src, pkt_addr(c));
+        poolshift_check("DMA", c.dd_dst, c.dd_bytes, c.dd_src, packet_addr);
         if (c.dd_bytes <= 8) label_hist_dma_exec(c.dd_dst, pre_dma);
         if (getenv("PROSPER_GFXLOG"))
             fprintf(stderr, "[agc]   DmaData fill [0x%llx] := 0x%x (%u bytes)\n",
@@ -833,16 +834,28 @@ static void honor_dma_data(const Pm4Command& c, bool notify_renderer = true) {
         // memmove is byte-for-byte memcpy behavior for the normal non-overlapping GPU-buffer case,
         // while remaining deterministic if an unusual packet overlaps its endpoints.
         memmove(dst, (const void*)(uintptr_t)c.dd_src, c.dd_bytes);
-        if (notify_renderer) notify_guest_gpu_write(c.dd_dst, c.dd_bytes);
+        notify_guest_gpu_write(c.dd_dst, c.dd_bytes);
         if (getenv("PROSPER_GFXLOG"))
             fprintf(stderr, "[agc]   DmaData copy [0x%llx] <- [0x%llx] (%u bytes)\n",
                     (unsigned long long)c.dd_dst, (unsigned long long)c.dd_src, c.dd_bytes);
     }
-    ring_record(c.dd_dst, c.dd_src, (uint8_t)(c.dd_bytes > 255 ? 255 : c.dd_bytes), 4, pkt_addr(c));
+    ring_record(c.dd_dst, c.dd_src, (uint8_t)(c.dd_bytes > 255 ? 255 : c.dd_bytes), 4, packet_addr);
     if (writer_provenance_enabled() && c.dd_bytes >= 256)
         record_guest_write(GuestWriterKind::DmaData, c.dd_dst, c.dd_bytes,
-                           0, 0, c.stream_order, pkt_addr(c));
+                           0, 0, c.stream_order, packet_addr);
     wake_on_label(c.dd_dst);
+}
+
+void execute_ordered_dma_copy(const GpuState::DmaCopy& copy) {
+    Pm4Command c{};
+    c.kind = Pm4Command::Kind::DmaData;
+    c.dd_dst = copy.dst;
+    c.dd_src = copy.src;
+    c.dd_bytes = copy.bytes;
+    c.dd_sels = copy.sels;
+    c.dd_valid = true;
+    c.stream_order = copy.command_order;
+    honor_dma_data(c, copy.packet_addr);
 }
 
 // Honor a WRITE_DATA packet: copy the inline dwords to the destination address (same synchronous timing).
@@ -914,7 +927,6 @@ bool eop_write_sync() {
 struct PendWrite {
     Pm4Command cmd;
     std::vector<uint32_t> wd_copy;     // owns a WriteData payload (cmd.wd_data repointed here)
-    bool dma_observer_handled = false; // address-copy invalidation ran safely on the submit thread
 };
 // IMMORTAL (leaked) worker state — same pattern as the EOP-event worker (hle_kernel_time.cpp):
 // the worker is detached and outlives main; static destructors must never run for it.
@@ -927,7 +939,7 @@ struct PendQueue {
 };
 PendQueue& pend_q() { static PendQueue* p = new PendQueue; return *p; }
 void apply_effect(const Pm4Command& c);   // fwd (defined with the WAIT_DEFER machinery below)
-void apply_deferred_effect(const Pm4Command& c, bool notify_dma = true); // guarded apply (#449)
+void apply_deferred_effect(const Pm4Command& c);   // fwd: guarded apply (#449)
 // Drain returns only when every pending write has LANDED, and writes land STRICTLY IN QUEUE ORDER.
 //
 // #312 ROOT CAUSE (2026-07-10, label-event-ring attribution): the previous loop popped the NEXT
@@ -961,7 +973,7 @@ void pend_drain_locked(PendQueue& p, std::unique_lock<std::mutex>& lk) {
         // the label page (MallocBinned3, #312). apply_deferred_effect probes guest_readable before
         // the raw memcpy — without it an unmapped label SIGSEGVs here, exactly the case the deferred-
         // stream path already survives (this pend path releases asynchronously too, so it needs it).
-        apply_deferred_effect(w.cmd, !w.dma_observer_handled);
+        apply_deferred_effect(w.cmd);
         lk.lock();
         p.inflight--;
         p.cv.notify_all();               // wake both drain waiters and the pend worker
@@ -985,21 +997,6 @@ void pend_enqueue(const Pm4Command& c) {
     if (c.kind == Pm4Command::Kind::WriteData && c.wd_data && c.wd_num) {
         w.wd_copy.assign(c.wd_data, c.wd_data + c.wd_num);   // cb memory may be recycled before drain
         w.cmd.wd_data = w.wd_copy.data();
-    }
-    if (!eop_writes_disabled() && c.kind == Pm4Command::Kind::DmaData &&
-        c.dd_src > UINT32_MAX) {
-        // The live renderer's cache invalidation callback mutates submit-owned caches and is not
-        // worker-thread safe. Validate and notify address copies now, while the submit mutex is
-        // held; the queued memmove still lands in FIFO order before rendering. An invalid span is
-        // frozen invalid so an unrelated mapping appearing during the 1 ms drain window cannot turn
-        // into an unreported write on the worker.
-        w.dma_observer_handled = true;
-        if (dma_data_form(c) == DmaDataForm::Copy)
-            notify_guest_gpu_write(c.dd_dst, c.dd_bytes);
-        else {
-            report_invalid_dma_data(c);
-            w.cmd.dd_valid = false;
-        }
     }
     {
         std::lock_guard<std::mutex> lk(p.mx);
@@ -1261,7 +1258,7 @@ uint64_t effect_target(const Pm4Command& c, uint32_t* bytes) {
         default: *bytes = 0; return 0;
     }
 }
-void apply_deferred_effect(const Pm4Command& c, bool notify_dma) {
+void apply_deferred_effect(const Pm4Command& c) {
     uint32_t bytes = 0;
     uint64_t t = effect_target(c, &bytes);
     if (t && bytes && !guest_readable(t, bytes)) {
@@ -1271,10 +1268,7 @@ void apply_deferred_effect(const Pm4Command& c, bool notify_dma) {
                     (unsigned)c.kind, (unsigned long long)t, bytes);
         return;
     }
-    if (c.kind == Pm4Command::Kind::DmaData)
-        honor_dma_data(c, notify_dma);
-    else
-        apply_effect(c);
+    apply_effect(c);
 }
 } // namespace
 
@@ -1522,11 +1516,17 @@ void GpuState::apply(const Pm4Command& c) {
             if (eop_write_sync()) honor_event_write(c); else pend_enqueue(c);
             break;
         case K::DmaData:
-            // CP-DMA memory effect (#312: the per-segment fence-label INIT). Rides the same FIFO
-            // as the other guest-visible writes: stream order between a generation's ReleaseMem
-            // (label <- 1) and the NEXT generation's DmaData (label := 0) at the same recycled
-            // address is exactly what the guest's consumption poll depends on.
+            // Address-backed copies are ordinary in-stream producers: retain them beside draws and
+            // dispatches so the ordered executor exposes old bytes to earlier consumers and copied
+            // bytes to later consumers (#189). Immediate fills keep their established completion-
+            // FIFO behavior (#312): their observed uses are label init and command-chunk zeroing.
             if (defer_gate(c)) { defer_push(c); break; }
+            if (c.dd_src > UINT32_MAX) {
+                if (!c.dd_valid) { report_invalid_dma_data(c); break; }
+                dma_copies.push_back({c.dd_dst, c.dd_src, c.dd_bytes, c.dd_sels,
+                                      command_order, pkt_addr(c)});
+                break;
+            }
             if (eop_write_sync()) honor_dma_data(c); else pend_enqueue(c);
             break;
         case K::WaitRegMem:

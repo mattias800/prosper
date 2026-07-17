@@ -70,6 +70,16 @@ struct GpuState {
         uint64_t command_order = 0;
     };
     std::vector<Dispatch> dispatches;                     // current submit's DispatchDirect packets
+    // Address-backed DMA_DATA memory effects execute in the same ordered backend timeline as
+    // draws/dispatches. Immediate fills remain completion-queue effects because their established
+    // uses are fence-label initialization and command-chunk zeroing (#312/#189).
+    struct DmaCopy {
+        uint64_t dst = 0, src = 0;
+        uint32_t bytes = 0, sels = 0;
+        uint64_t command_order = 0;
+        uint64_t packet_addr = 0;
+    };
+    std::vector<DmaCopy> dma_copies;
     uint64_t dispatch_count = 0;                          // process-lifetime DispatchDirect count
     uint64_t command_order = 0;                           // process-lifetime applied PM4 ordinal
 
@@ -96,6 +106,10 @@ private:
     std::shared_ptr<const GpuState> last_snapshot_;
     bool state_dirty_ = true;
 };
+
+// Execute one retained address-backed DMA_DATA operation at its ordered submit position.
+// Re-validates both guest spans immediately before the byte copy and notifies renderer caches.
+void execute_ordered_dma_copy(const GpuState::DmaCopy& copy);
 
 // Decode `dwords` dwords at `buf` and apply every op to `st`. Returns the number of packets applied.
 size_t run_command_buffer(const uint32_t* buf, size_t dwords, GpuState& st);

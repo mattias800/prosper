@@ -2381,6 +2381,17 @@ bool execute_compute_dispatches(const GpuState& st, uint64_t submit_no) {
     return !items.empty() && g_compute(items);
 }
 
+bool execute_nonrender_submit_work(const GpuState& st, uint64_t submit_no) {
+    if (st.dma_copies.empty() && (!g_compute || st.dispatches.empty())) return false;
+    GuestReadableSubmitScope guest_readable_scope;
+    std::vector<ComputeItem> computes = g_compute
+        ? realize_compute_dispatches(st, submit_no) : std::vector<ComputeItem>{};
+    const auto operations = plan_submit_operations(st);
+    const OrderedSubmitResult result = execute_ordered_items(
+        operations, {}, computes, st.dma_copies, {}, g_compute, 0, 0);
+    return result.compute_executed || !st.dma_copies.empty();
+}
+
 void diagnose_compute_dispatches(const GpuState& st, uint64_t submit_no) {
     const char* enabled = getenv("PROSPER_COMPUTELOG");
     const char* dim_env = getenv("PROSPER_COMPUTELOG_DIM");
@@ -2660,6 +2671,7 @@ std::vector<SubmitOperation> plan_submit_operations(const GpuState& st) {
 OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& operations,
                                           const std::vector<DrawItem>& draws,
                                           const std::vector<ComputeItem>& computes,
+                                          const std::vector<GpuState::DmaCopy>& dma_copies,
                                           const LiveRenderFn& render,
                                           const LiveComputeFn& compute,
                                           uint32_t width, uint32_t height) {
@@ -2669,22 +2681,34 @@ OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& op
     for (size_t i = 0; i < computes.size(); ++i)
         compute_by_index[static_cast<size_t>(computes[i].dispatch_index)] = i;
 
-    struct ExecutableOperation { SubmitOperationKind kind; size_t item; };
+    enum class ExecutableKind : uint8_t { Draw, Dispatch, DmaCopy };
+    struct ExecutableOperation {
+        ExecutableKind kind;
+        size_t item;
+        uint64_t command_order;
+    };
     std::vector<ExecutableOperation> executable;
     for (const auto& operation : operations) {
         if (operation.kind == SubmitOperationKind::Draw) {
             auto it = draw_by_index.find(operation.index);
-            if (it != draw_by_index.end()) executable.push_back({operation.kind, it->second});
+            if (it != draw_by_index.end())
+                executable.push_back({ExecutableKind::Draw, it->second, operation.command_order});
         } else {
             auto it = compute_by_index.find(operation.index);
-            if (it != compute_by_index.end()) executable.push_back({operation.kind, it->second});
+            if (it != compute_by_index.end())
+                executable.push_back({ExecutableKind::Dispatch, it->second, operation.command_order});
         }
     }
+    for (size_t i = 0; i < dma_copies.size(); ++i)
+        executable.push_back({ExecutableKind::DmaCopy, i, dma_copies[i].command_order});
+    std::stable_sort(executable.begin(), executable.end(), [](const auto& a, const auto& b) {
+        return a.command_order < b.command_order;
+    });
 
     size_t total_spans = 0;
     bool in_draw_span = false;
     for (const auto& operation : executable) {
-        if (operation.kind == SubmitOperationKind::Draw) {
+        if (operation.kind == ExecutableKind::Draw) {
             if (!in_draw_span) ++total_spans;
             in_draw_span = true;
         } else {
@@ -2705,15 +2729,27 @@ OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& op
         ++result.render_spans;
     };
     for (const auto& operation : executable) {
-        if (operation.kind == SubmitOperationKind::Draw) {
+        if (operation.kind == ExecutableKind::Draw) {
             span.push_back(draws[operation.item]);
-        } else {
+        } else if (operation.kind == ExecutableKind::Dispatch) {
             flush_span();
             result.compute_executed |= compute && compute({computes[operation.item]});
+        } else {
+            flush_span();
+            execute_ordered_dma_copy(dma_copies[operation.item]);
         }
     }
     flush_span();
     return result;
+}
+
+OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& operations,
+                                          const std::vector<DrawItem>& draws,
+                                          const std::vector<ComputeItem>& computes,
+                                          const LiveRenderFn& render,
+                                          const LiveComputeFn& compute,
+                                          uint32_t width, uint32_t height) {
+    return execute_ordered_items(operations, draws, computes, {}, render, compute, width, height);
 }
 
 void set_submit_renderer(LiveRenderFn fn) { g_live = std::move(fn); }
@@ -2777,7 +2813,8 @@ bool execute_compute_items(const std::vector<ComputeItem>& items) {
 
 bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t height,
                                  uint64_t submit_no, bool publish) {
-    if ((!g_live && !g_compute) || (st.draws.empty() && st.dispatches.empty())) return false;
+    if ((!g_live && !g_compute && st.dma_copies.empty()) ||
+        (st.draws.empty() && st.dispatches.empty() && st.dma_copies.empty())) return false;
     // Guest allocations referenced by a GPU submit must remain mapped until that submit completes.
     // Reuse positive page/VirtualQuery results only inside this synchronous execution window; the
     // scope is discarded before guest code can submit a later mapping generation.
@@ -2813,10 +2850,19 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
 
     auto operations = plan_submit_operations(st);
     const auto timing_plan_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
-    auto pending_capture = begin_requested_gpu_capture(
-        draws, computes, operations, width, height);
+    // Capture formats through v13 have no DMA operation record. Refuse a partial artifact rather
+    // than silently snapshot pre-copy resources and replay a different submit.
+    std::unique_ptr<PendingGpuCapture> pending_capture;
+    if (st.dma_copies.empty()) {
+        pending_capture = begin_requested_gpu_capture(draws, computes, operations, width, height);
+    } else if (std::getenv("PROSPER_GPU_CAPTURE")) {
+        static std::atomic<int> warned{0};
+        if (warned.fetch_add(1) == 0)
+            std::fprintf(stderr,
+                         "[gpucap] submit capture skipped: ordered DMA_DATA is not represented by capture v13\n");
+    }
     OrderedSubmitResult result = execute_ordered_items(
-        operations, draws, computes, g_live, g_compute, width, height);
+        operations, draws, computes, st.dma_copies, g_live, g_compute, width, height);
     const auto timing_backend_done = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     const std::vector<uint8_t>& px = result.frame.bytes();
 

@@ -139,6 +139,63 @@ int main() {
               "write journal snapshots cannot suppress validation after submit completion");
     }
 
+    // #189: address-backed DMA is an in-stream producer, not a completion write. It must split a
+    // graphics span so an earlier consumer sees old bytes and a later consumer sees copied bytes.
+    {
+        uint8_t source = 0x39;
+        uint8_t target = 0x17;
+        GpuState mixed;
+        GpuState::Draw before, after;
+        before.command_order = 100;
+        after.command_order = 300;
+        mixed.draws = {before, after};
+        mixed.dma_copies.push_back({
+            (uint64_t)(uintptr_t)&target, (uint64_t)(uintptr_t)&source,
+            1, 0, 200, 0});
+        const auto operations = plan_submit_operations(mixed);
+
+        DrawItem first, second;
+        first.draw_index = 0;
+        second.draw_index = 1;
+        std::vector<uint8_t> observed;
+        LiveRenderFn consume = [&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
+            for (size_t i = 0; i < items.size(); ++i) observed.push_back(target);
+            return std::vector<uint8_t>(4, target);
+        };
+        const OrderedSubmitResult result = execute_ordered_items(
+            operations, {first, second}, {}, mixed.dma_copies, consume, {}, 1, 1);
+        CHECK(observed == std::vector<uint8_t>({0x17, 0x39}) && target == source,
+              "ordered DMA exposes old bytes before the copy and new bytes afterward");
+        CHECK(result.render_spans == 2,
+              "an ordered DMA copy splits graphics consumers into two render spans");
+    }
+
+    // A no-draw submit still executes DMA before a later compute consumer. The old completion-FIFO
+    // path left this copy pending because execute_submit_work's compute-only branch never drained it.
+    {
+        uint8_t source = 0xA5;
+        uint8_t target = 0x4C;
+        GpuState compute_only;
+        compute_only.dma_copies.push_back({
+            (uint64_t)(uintptr_t)&target, (uint64_t)(uintptr_t)&source,
+            1, 0, 100, 0});
+        GpuState::Dispatch dispatch;
+        dispatch.command_order = 200;
+        compute_only.dispatches.push_back(dispatch);
+        const auto operations = plan_submit_operations(compute_only);
+        ComputeItem consume;
+        consume.dispatch_index = 0;
+        uint8_t observed = 0;
+        LiveComputeFn compute = [&](const std::vector<ComputeItem>&) {
+            observed = target;
+            return true;
+        };
+        const OrderedSubmitResult result = execute_ordered_items(
+            operations, {}, {consume}, compute_only.dma_copies, {}, compute, 0, 0);
+        CHECK(result.compute_executed && observed == source && target == source,
+              "compute-only timeline executes a preceding DMA copy before its consumer");
+    }
+
     // Overflow or otherwise incomplete write history must fall back to exact validation.
     {
         DrawItem first, second;

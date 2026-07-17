@@ -327,6 +327,9 @@ std::vector<ComputeItem> realize_compute_dispatches(const GpuState& st,
                                                      uint64_t submit_no = 0,
                                                      std::vector<OperationRealizationFailure>* failures = nullptr);
 bool execute_compute_dispatches(const GpuState& st, uint64_t submit_no = 0);
+// Execute retained dispatches and address-backed DMA copies in PM4 order when graphics rendering is
+// intentionally skipped or unavailable. Draw operations are omitted, but still delimit ordering.
+bool execute_nonrender_submit_work(const GpuState& st, uint64_t submit_no = 0);
 std::vector<SubmitOperation> plan_submit_operations(const GpuState& st);
 
 // PROSPER_PROVENANCE_DIM=WxH: inspect sampled images of that size and report overlapping
@@ -971,6 +974,14 @@ struct OrderedSubmitResult {
     size_t render_spans = 0;
     bool compute_executed = false;
 };
+OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& operations,
+                                          const std::vector<DrawItem>& draws,
+                                          const std::vector<ComputeItem>& computes,
+                                          const std::vector<GpuState::DmaCopy>& dma_copies,
+                                          const LiveRenderFn& render,
+                                          const LiveComputeFn& compute,
+                                          uint32_t width, uint32_t height);
+// Compatibility overload for capture replay and tests whose timelines contain only draws/dispatches.
 OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& operations,
                                           const std::vector<DrawItem>& draws,
                                           const std::vector<ComputeItem>& computes,
