@@ -10,6 +10,7 @@
 // tracked values, routing the s_bfe_u64 result into V#.dword3 (desc_v3). All encodings assembled /
 // round-trip verified with llvm-mc -mcpu=gfx1030.
 #include "../src/gpu/gpu_execute.hpp"
+#include "../src/gpu/rdna2_to_spirv.hpp"
 #include <cstdio>
 #include <vector>
 
@@ -136,6 +137,34 @@ int main() {
     CHECK(f4packed.size() == 1 && f4packed[0].desc.format == DataFormat::Unorm2_10_10_10 &&
           !f4packed[0].desc.forbid_unknown_fallback,
           "dynamic identity packed V# reaches the real unpack format instead of Float32");
+
+    // #370 review: entry metadata may legitimately publish an identity packed direct V# while the
+    // shader rewrites only dword 3 before the fetch. If that live selector is unsupported, dynamic
+    // resolution omits it. Recompilation must not then fall back to the stale entry-time identity V#.
+    ShaderResourceTable packed_entry_table;
+    { ShaderResource vb{}; vb.cls = ResourceClass::VertexBuffer;
+      vb.format = DataFormat::Unorm2_10_10_10; vb.num_components = 4;
+      vb.binding = 3; vb.stride = 4; vb.sgpr_base = 20;
+      packed_entry_table.resources.push_back(vb); }
+    const uint32_t rejected_v3[] = {
+        (50u << 12) | 0x977u, // A/B/G/R permutation
+        50u << 12,            // constant-zero selectors
+        (52u << 12) | 0xFACu, // unsupported USCALED conversion
+    };
+    bool rejected_rewrites_stay_closed = true;
+    for (uint32_t v3 : rejected_v3) {
+        const uint32_t code[] = {
+            0xBE9703FFu, v3,           // s_mov_b32 s23, literal (rewrite V#.dword3 only)
+            0xE00C2000u, 0x80050100u, // buffer_load_format_xyzw v[1:4], v0, s[20:23], 0 idxen
+            0xBF810000u,
+        };
+        rejected_rewrites_stay_closed &=
+            resolve_dynamic_fetch(code, sizeof(code)/sizeof(code[0]), packed_identity, 4, 20).empty();
+        rejected_rewrites_stay_closed &=
+            recompile_valu(code, sizeof(code)/sizeof(code[0]), 1, 1, &packed_entry_table).empty();
+    }
+    CHECK(rejected_rewrites_stay_closed,
+          "rejected packed SRSRC rewrites cannot compile through the stale direct identity V#");
 
     // Kernel 5: descriptor-TABLE uses (#294). s[8:9] = a pointer to a host-memory table; the shader
     // s_loads an 8-dword T# (imm 0x40) + a 4-dword S#/V# (imm 0x80), consumes them via image_sample

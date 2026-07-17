@@ -3579,8 +3579,19 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // buffer specifically (that SGPR may hold a constant-buffer V# at other points; the const-
                 // fold-resolved vertex buffer is keyed by this SRSRC SGPR). Fall back to an s_load SRT tag.
                 if (rt) {
+                    // Any write to the four-dword SRSRC range invalidates its entry-time direct V#.
+                    // Exact per-fetch and s_load provenance below may still identify the live descriptor,
+                    // but a missing/rejected dynamic result must never fall back to stale user data.
+                    bool srsrc_rewritten = false;
+                    for (int component = 0; component < 4; ++component) {
+                        if (rs.sreg.find(in.src[1].value + component) != rs.sreg.end()) {
+                            srsrc_rewritten = true;
+                            break;
+                        }
+                    }
                     // PER-FETCH first: a reloaded SRSRC holds a different V# per attribute, so match this
-                    // exact fetch instruction's pc; fall back to the SGPR (direct) then s_load SRT tag.
+                    // exact fetch instruction's pc; fall back to untouched SGPR user data or an s_load
+                    // SRT tag. A rewritten direct descriptor without either provenance stays unresolved.
                     // Only a VERTEX-buffer pc entry implies the vertex-index address model — a pc-keyed
                     // CONSTANT/structured buffer (a PS's per-lane table fetch, #273) keeps the faithful
                     // VADDR*stride+offset address below.
@@ -3594,19 +3605,20 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // those addresses with gl_VertexIndex reads the wrong matrix row and collapses
                     // the whole mesh, so preserve a non-v0 VADDR for untouched direct user data.
                     if (res) {
-                        const bool srsrc_rewritten = rs.sreg.find(in.src[1].value) != rs.sreg.end();
                         dyn_vfetch = res->cls == ResourceClass::VertexBuffer &&
                                      (in.src[0].value == 0 || srsrc_rewritten);
                     }
-                    if (!res) res = rt->by_sgpr_base_cls(in.src[1].value, ResourceClass::VertexBuffer);
+                    if (!res && !srsrc_rewritten)
+                        res = rt->by_sgpr_base_cls(in.src[1].value, ResourceClass::VertexBuffer);
                     if (!res) { auto it = rs.sreg_srt.find(in.src[1].value);
                         if (it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second); }
                     // DIRECT user-data V# of any class (#273 — DOLL's title post PSes format-fetch
                     // through a V# the metadata labels a CONSTANT buffer sharp at s[24:27]): the class
                     // label doesn't change the descriptor's fields. Only when the SGPR was never
-                    // REWRITTEN in-shader (no rs.sreg entry) — a reloaded register no longer holds the
-                    // seed-time sharp, and trusting it would fetch through a stale descriptor.
-                    if (!res && rs.sreg.find(in.src[1].value) == rs.sreg.end())
+                    // REWRITTEN in-shader (no rs.sreg entry in its four-dword range) — a reloaded
+                    // register no longer holds the seed-time sharp, and trusting it would fetch through
+                    // a stale descriptor.
+                    if (!res && !srsrc_rewritten)
                         res = rt->by_sgpr_base(in.src[1].value);
                 }
                 if (!res) {
