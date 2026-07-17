@@ -183,14 +183,31 @@ std::vector<PadScriptEntry> parse_pad_script(const std::string& spec) {
         }
         std::string btns = tok.substr(colon + 1);
         uint32_t mask = 0;
+        uint8_t axis_mask = 0;
+        int left_x = 0, left_y = 0, right_x = 0, right_y = 0;
         size_t j = 0;
-        while (j < btns.size()) {                       // '+'-separated buttons pressed together
+        while (j < btns.size()) {                       // '+'-separated actions held together
             size_t plus = btns.find('+', j);
             std::string one = trim(btns.substr(j, plus == std::string::npos ? std::string::npos : plus - j));
             j = (plus == std::string::npos) ? btns.size() : plus + 1;
             mask |= pad_button_by_name(one);
+            if (one == "left-stick-left")   { axis_mask |= PAD_SCRIPT_LEFT_X;  --left_x; }
+            if (one == "left-stick-right")  { axis_mask |= PAD_SCRIPT_LEFT_X;  ++left_x; }
+            if (one == "left-stick-up")     { axis_mask |= PAD_SCRIPT_LEFT_Y;  --left_y; }
+            if (one == "left-stick-down")   { axis_mask |= PAD_SCRIPT_LEFT_Y;  ++left_y; }
+            if (one == "right-stick-left")  { axis_mask |= PAD_SCRIPT_RIGHT_X; --right_x; }
+            if (one == "right-stick-right") { axis_mask |= PAD_SCRIPT_RIGHT_X; ++right_x; }
+            if (one == "right-stick-up")    { axis_mask |= PAD_SCRIPT_RIGHT_Y; --right_y; }
+            if (one == "right-stick-down")  { axis_mask |= PAD_SCRIPT_RIGHT_Y; ++right_y; }
         }
-        if (mask) v.push_back({start, mask, frame_anchored, end});
+        auto direction = [](int value) -> int8_t { return value < 0 ? -1 : value > 0 ? 1 : 0; };
+        if (mask || axis_mask) {
+            PadScriptEntry entry{start, mask, frame_anchored, end};
+            entry.left_x = direction(left_x); entry.left_y = direction(left_y);
+            entry.right_x = direction(right_x); entry.right_y = direction(right_y);
+            entry.axis_mask = axis_mask;
+            v.push_back(entry);
+        }
     }
     return v;
 }
@@ -213,20 +230,46 @@ std::vector<PadScriptEntry> load_pad_script(const std::string& source, std::stri
     return parse_pad_script(contents.str());
 }
 
-uint32_t pad_script_buttons_at(const std::vector<PadScriptEntry>& script, double elapsed_secs, double hold_secs,
-                               int64_t frame_count, int64_t frame_hold) {
-    uint32_t mask = 0;
+PadScriptState pad_script_state_at(const std::vector<PadScriptEntry>& script, double elapsed_secs,
+                                   double hold_secs, int64_t frame_count, int64_t frame_hold) {
+    PadScriptState state;
+    int left_x = 0, left_y = 0, right_x = 0, right_y = 0;
     for (const auto& e : script) {
+        bool active = false;
         if (e.frame_anchored) {
             int64_t f = (int64_t)e.t_secs;   // frame number lives in t_secs for frame-anchored entries
             int64_t end = e.end > e.t_secs ? (int64_t)e.end : f + frame_hold;
-            if (frame_count >= 0 && frame_count >= f && frame_count < end) mask |= e.button_mask;
+            active = frame_count >= 0 && frame_count >= f && frame_count < end;
         } else {
             double end = e.end > e.t_secs ? e.end : e.t_secs + hold_secs;
-            if (elapsed_secs >= e.t_secs && elapsed_secs < end) mask |= e.button_mask;
+            active = elapsed_secs >= e.t_secs && elapsed_secs < end;
         }
+        if (!active) continue;
+        state.button_mask |= e.button_mask;
+        state.axis_mask |= e.axis_mask;
+        left_x += e.left_x; left_y += e.left_y;
+        right_x += e.right_x; right_y += e.right_y;
     }
-    return mask;
+    auto direction = [](int value) -> int8_t { return value < 0 ? -1 : value > 0 ? 1 : 0; };
+    state.left_x = direction(left_x); state.left_y = direction(left_y);
+    state.right_x = direction(right_x); state.right_y = direction(right_y);
+    return state;
+}
+
+void pad_apply_script_state(HostPadState& target, const PadScriptState& scripted) {
+    target.buttons |= scripted.button_mask;
+    auto axis_value = [](int8_t direction) -> uint8_t {
+        return direction < 0 ? uint8_t{0x00} : direction > 0 ? uint8_t{0xff} : uint8_t{0x80};
+    };
+    if (scripted.axis_mask & PAD_SCRIPT_LEFT_X)  target.left_x = axis_value(scripted.left_x);
+    if (scripted.axis_mask & PAD_SCRIPT_LEFT_Y)  target.left_y = axis_value(scripted.left_y);
+    if (scripted.axis_mask & PAD_SCRIPT_RIGHT_X) target.right_x = axis_value(scripted.right_x);
+    if (scripted.axis_mask & PAD_SCRIPT_RIGHT_Y) target.right_y = axis_value(scripted.right_y);
+}
+
+uint32_t pad_script_buttons_at(const std::vector<PadScriptEntry>& script, double elapsed_secs, double hold_secs,
+                               int64_t frame_count, int64_t frame_hold) {
+    return pad_script_state_at(script, elapsed_secs, hold_secs, frame_count, frame_hold).button_mask;
 }
 
 } // namespace prosper::input

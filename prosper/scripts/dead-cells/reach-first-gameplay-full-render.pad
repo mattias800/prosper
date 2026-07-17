@@ -4,6 +4,10 @@
 # every menu action is held across several polls with a release gap between it
 # and the next action. Circle remains held through the slow full-render parse and skippable opening;
 # it deliberately outlives the current snapshot timeout so host throughput cannot expire the skip.
+# Late Cross windows overlap that hold (the replay backend ORs active entries). They preserve the
+# opening skip while supplying distinct Jump presses when a slow parse exposes that tutorial only
+# after the original menu-confirm windows have ended. A final left-stick hold lets either observed landing
+# position fall to and settle against the same lower boundary before the evidence window.
 40-48:cross
 52-60:cross
 64-72:cross
@@ -12,3 +16,9 @@
 100-108:cross
 112-120:cross
 124-300:circle
+128-136:cross
+140-148:cross
+152-160:cross
+164-172:cross
+176-184:cross
+188-240:left-stick-left

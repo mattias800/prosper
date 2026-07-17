@@ -137,8 +137,8 @@ constexpr uint8_t kPadTriggerButtonThreshold = 0x08;   // ~3% of full travel
 uint32_t pad_trigger_buttons(uint8_t l2, uint8_t r2);
 
 // ---- Scripted input (PROSPER_PAD_SCRIPT) — pure, unit-tested -----------------------------------
-// A timed button sequence lets a headless run drive menus with no host device (issue #163). These
-// three helpers are pure (no env, no clock) so the parse + time-eval logic is verifiable; the HLE
+// A timed controller sequence lets a headless run drive menus and gameplay with no host device
+// (issue #163). These helpers are pure (no env, no clock) so parse + time evaluation is verifiable; the HLE
 // (hle_pad.cpp) supplies getenv + the wall clock and anchors t=0 to the first input poll.
 // t_secs holds a wall-clock time (default) OR, when frame_anchored, a FRAME NUMBER (flips since the
 // first poll). Frame-anchoring is boot-speed-invariant: `f300:cross` fires at the same game state on a
@@ -149,6 +149,27 @@ struct PadScriptEntry {
     uint32_t button_mask;
     bool frame_anchored = false;
     double end = 0.0;  // exclusive explicit range end; 0 uses the configured default hold
+    int8_t left_x = 0;   // -1=left, 0=neutral/unspecified, +1=right
+    int8_t left_y = 0;   // -1=up,   0=neutral/unspecified, +1=down
+    int8_t right_x = 0;
+    int8_t right_y = 0;
+    uint8_t axis_mask = 0;  // distinguishes an explicitly centered opposing pair from no axis input
+};
+
+enum PadScriptAxis : uint8_t {
+    PAD_SCRIPT_LEFT_X  = 1u << 0,
+    PAD_SCRIPT_LEFT_Y  = 1u << 1,
+    PAD_SCRIPT_RIGHT_X = 1u << 2,
+    PAD_SCRIPT_RIGHT_Y = 1u << 3,
+};
+
+struct PadScriptState {
+    uint32_t button_mask = 0;
+    int8_t left_x = 0;
+    int8_t left_y = 0;
+    int8_t right_x = 0;
+    int8_t right_y = 0;
+    uint8_t axis_mask = 0;
 };
 
 // Map a button name ("start"/"options"/"cross"/"x"/"up"/... case as written) to its SCE_PAD_BUTTON_*
@@ -159,15 +180,25 @@ uint32_t pad_button_by_name(const std::string& name);
 // stable order so recorded routes have deterministic text.
 std::string pad_button_names(uint32_t mask);
 
-// Parse ';'- or newline-separated entries. An entry whose time token starts with 'f' is
+// Parse ';'- or newline-separated entries. Actions are '+'-joined button names and/or full-stick
+// directions such as "left-stick-left" and "right-stick-up". An entry whose time token starts with 'f' is
 // FRAME-anchored: "f300:cross" fires at flip 300 since the first poll. Both anchors accept explicit
 // ranges ("3-4.5:cross", "f300-340:cross"); '#' starts a comment. Malformed entries and entries with
-// no recognized button are dropped.
+// no recognized action are dropped.
 std::vector<PadScriptEntry> parse_pad_script(const std::string& spec);
 
 // Parse an inline script, or load and parse one from disk when `source` starts with '@'. Relative
 // paths use the process working directory. Returns an empty vector and describes file I/O errors.
 std::vector<PadScriptEntry> load_pad_script(const std::string& source, std::string* error = nullptr);
+
+// Full scripted controller state now. Active entries combine buttons and full-deflection stick
+// directions; opposing directions on one axis cancel to an explicitly centered axis.
+PadScriptState pad_script_state_at(const std::vector<PadScriptEntry>& script, double elapsed_secs,
+                                   double hold_secs, int64_t frame_count = -1, int64_t frame_hold = 8);
+
+// Overlay a scripted state onto a host snapshot. Buttons combine with the backend; only explicitly
+// active script axes replace their host values.
+void pad_apply_script_state(HostPadState& target, const PadScriptState& scripted);
 
 // Buttons held now: OR of every entry whose window contains the current time. A seconds-anchored entry
 // matches [t, t+hold_secs) against `elapsed_secs`; a frame-anchored entry matches [f, f+frame_hold)

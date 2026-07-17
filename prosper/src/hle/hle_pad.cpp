@@ -64,9 +64,9 @@ uint64_t now_us() {
 }
 
 // --- PROSPER_PAD_SCRIPT: hardware-free timed button sequence -------------------------------------
-// Drives a scripted controller so a headless run can navigate menus (e.g. the title→menu→save→name
-// flow in issue #163) with no host device. Format: a ';'-separated list of "<seconds>:<button>[+..]"
-// entries, e.g. "3:start;9:start;16:cross;24:cross;31:up+cross". Prefix with '@' to load a route
+// Drives a scripted controller so a headless run can navigate menus and gameplay with no host device.
+// Format: a ';'-separated list of "<seconds>:<action>[+..]" entries; actions are buttons or full-stick
+// directions such as "left-stick-left". Prefix with '@' to load a route
 // file; files may use newlines, comments, and explicit ranges such as "f300-340:cross". Time points
 // use PROSPER_PAD_HOLD ms (default 300); flip points use PROSPER_PAD_FRAME_HOLD (default 8). When a
 // script is set the pad reports
@@ -133,10 +133,10 @@ public:
 
     bool configured() const { return !source_.empty(); }
 
-    uint32_t buttons_at(double elapsed, int64_t frame) {
+    PadScriptState state_at(double elapsed, int64_t frame) {
         std::lock_guard<std::mutex> lock(mutex_);
         refresh_locked();
-        return pad_script_buttons_at(script_, elapsed, pad_hold_secs(), frame, pad_frame_hold());
+        return pad_script_state_at(script_, elapsed, pad_hold_secs(), frame, pad_frame_hold());
     }
 
 private:
@@ -250,17 +250,33 @@ bool apply_pad_script(HostPadState& s, int64_t frame) {
         if (g_pad_t0_us.compare_exchange_strong(expect, now)) t0 = now; else t0 = expect;
     }
     double elapsed = (now_us() - t0) / 1e6;
-    const uint32_t scripted = script.buttons_at(elapsed, frame);
+    const PadScriptState scripted = script.state_at(elapsed, frame);
     if (pad_script_log()) {
-        static std::atomic<uint32_t> previous{std::numeric_limits<uint32_t>::max()};
-        const uint32_t observed = previous.exchange(scripted, std::memory_order_relaxed);
-        if (observed != scripted) {
-            const std::string names = pad_button_names(scripted);
-            fprintf(stderr, "[pad-script] elapsed=%.3f frame=%lld buttons=%s\n", elapsed,
-                    (long long)frame, names.empty() ? "neutral" : names.c_str());
+        const auto encoded_direction = [](int8_t value) { return uint64_t(uint8_t(value + 1)); };
+        const uint64_t signature = uint64_t(scripted.button_mask) |
+            (uint64_t(scripted.axis_mask) << 32) | (encoded_direction(scripted.left_x) << 40) |
+            (encoded_direction(scripted.left_y) << 42) | (encoded_direction(scripted.right_x) << 44) |
+            (encoded_direction(scripted.right_y) << 46);
+        static std::atomic<uint64_t> previous{std::numeric_limits<uint64_t>::max()};
+        const uint64_t observed = previous.exchange(signature, std::memory_order_relaxed);
+        if (observed != signature) {
+            const std::string buttons = pad_button_names(scripted.button_mask);
+            std::string axes;
+            auto append_axis = [&](const char* name) { if (!axes.empty()) axes += '+'; axes += name; };
+            if (scripted.axis_mask & PAD_SCRIPT_LEFT_X)
+                append_axis(scripted.left_x < 0 ? "left-stick-left" : scripted.left_x > 0 ? "left-stick-right" : "left-stick-x-center");
+            if (scripted.axis_mask & PAD_SCRIPT_LEFT_Y)
+                append_axis(scripted.left_y < 0 ? "left-stick-up" : scripted.left_y > 0 ? "left-stick-down" : "left-stick-y-center");
+            if (scripted.axis_mask & PAD_SCRIPT_RIGHT_X)
+                append_axis(scripted.right_x < 0 ? "right-stick-left" : scripted.right_x > 0 ? "right-stick-right" : "right-stick-x-center");
+            if (scripted.axis_mask & PAD_SCRIPT_RIGHT_Y)
+                append_axis(scripted.right_y < 0 ? "right-stick-up" : scripted.right_y > 0 ? "right-stick-down" : "right-stick-y-center");
+            fprintf(stderr, "[pad-script] elapsed=%.3f frame=%lld buttons=%s%s%s\n", elapsed,
+                    (long long)frame, buttons.empty() ? "neutral" : buttons.c_str(),
+                    axes.empty() ? "" : " axes=", axes.c_str());
         }
     }
-    s.buttons |= scripted;
+    pad_apply_script_state(s, scripted);
     return true;
 }
 
@@ -313,7 +329,7 @@ void pad_record(int64_t frame, uint32_t buttons) {
 // Snapshot the controller for a given pad handle via the installed backend. With no host frontend
 // installed, prosper_core's default backend reports ONE connected controller with neutral input (a PS5
 // title can gate progression on a pad being present, so dev/testing needs one). PROSPER_PAD_PRESS adds
-// a synthetic CROSS; PROSPER_PAD_SCRIPT adds a timed button sequence — device-independent test drivers.
+// a synthetic CROSS; PROSPER_PAD_SCRIPT adds a timed controller sequence — device-independent test drivers.
 HostPadState snapshot(int /*handle*/, const char* what) {
     HostPadState s;   // filled by the backend below (default: one connected, neutral controller)
     pad_backend()->poll(0, s);
