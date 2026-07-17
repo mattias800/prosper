@@ -78,6 +78,11 @@ bool guest_readable(uint64_t addr, uint32_t bytes);
 // into a host fault.
 bool guest_writable(uint64_t addr, uint32_t bytes);
 
+// Convert the untrusted byte size published by an AGC shader header into the exact instruction
+// span that dynamic descriptor folding may probe and decode. Exposed so the safety/work bound has
+// direct regression coverage instead of being inferred from whether a large guest range is mapped.
+size_t dynamic_fold_shader_dwords(uint32_t shader_size_bytes);
+
 // One resolved bindless-dynamic vertex fetch from the wave-uniform scalar const-fold in
 // gpu_executor.cpp: the exact fetch instruction (pc), its SRSRC SGPR, and the V# live in that SGPR
 // at that instruction. Exposed (with resolve_dynamic_fetch) so the fold's scalar-ALU semantics are

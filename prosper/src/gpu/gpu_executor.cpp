@@ -932,11 +932,13 @@ bool guest_writable(uint64_t a, uint32_t n) {
 // Truncate a non-dword-aligned tail rather than reading one byte beyond the blob, and refuse the bounded
 // span if it is not wholly readable. A zero result safely disables only the optional fold;
 // metadata-described resources remain available to build_stage_table.
-size_t registered_shader_dwords(const AgcShaderHeader& header, uint64_t code_addr) {
+size_t dynamic_fold_shader_dwords(uint32_t shader_size_bytes) {
     constexpr size_t kMaxDynamicFoldDwords = 0x4000;
-    const uint32_t shader_bytes = header.shader_size & ~uint32_t{3};
-    const size_t dwords = std::min<size_t>(shader_bytes / sizeof(uint32_t),
-                                          kMaxDynamicFoldDwords);
+    return std::min<size_t>(shader_size_bytes / sizeof(uint32_t), kMaxDynamicFoldDwords);
+}
+
+size_t registered_shader_dwords(const AgcShaderHeader& header, uint64_t code_addr) {
+    const size_t dwords = dynamic_fold_shader_dwords(header.shader_size);
     const uint32_t bounded_bytes = static_cast<uint32_t>(dwords * sizeof(uint32_t));
     if (!bounded_bytes || !guest_readable(code_addr, bounded_bytes)) return 0;
     return dwords;

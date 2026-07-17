@@ -156,10 +156,17 @@ int main() {
     CHECK(!bounded_table || !bounded_table->by_fetch_pc(7),
           "dynamic fetch walk cannot discover instructions beyond header.shader_size");
 
-    // The declared size is also untrusted work metadata. A nearly-4-GiB size must not make the
-    // resolver probe/commit/decode that range; retain the old 0x4000-dword work ceiling while still
-    // using shader_size as the read ceiling for short blobs. The non-terminating mapped prefix is
-    // followed by a valid fetch just beyond the cap so an accidentally unbounded walk is observable.
+    // The declared size is also untrusted work metadata. Assert the exact production span calculation
+    // directly: the previous implementation would request the whole declared range, while the bounded
+    // implementation truncates partial dwords and retains the old 0x4000-dword work ceiling.
+    CHECK(prosper::gpu::dynamic_fold_shader_dwords(3u) == 0u &&
+          prosper::gpu::dynamic_fold_shader_dwords(7u) == 1u,
+          "dynamic-fold span never probes a partial trailing dword");
+    CHECK(prosper::gpu::dynamic_fold_shader_dwords(0x10000u) == 0x4000u &&
+          prosper::gpu::dynamic_fold_shader_dwords(0xFFFFFFFCu) == 0x4000u,
+          "dynamic-fold probe and decode request is capped at 0x4000 dwords");
+
+    // Keep an integration assertion as well: a valid fetch just beyond that cap must stay hidden.
     std::vector<uint32_t> oversized_fetch(0x4000u + 10u, 0u);
     const size_t tail = 0x4000u;
     oversized_fetch[tail + 0] = 0xBE8803FFu;
