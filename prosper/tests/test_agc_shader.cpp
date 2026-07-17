@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <vector>
 
 using namespace prosper;
 
@@ -155,6 +156,35 @@ int main() {
     CHECK(!bounded_table || !bounded_table->by_fetch_pc(7),
           "dynamic fetch walk cannot discover instructions beyond header.shader_size");
 
+    // The declared size is also untrusted work metadata. A nearly-4-GiB size must not make the
+    // resolver probe/commit/decode that range; retain the old 0x4000-dword work ceiling while still
+    // using shader_size as the read ceiling for short blobs. The non-terminating mapped prefix is
+    // followed by a valid fetch just beyond the cap so an accidentally unbounded walk is observable.
+    std::vector<uint32_t> oversized_fetch(0x4000u + 10u, 0u);
+    const size_t tail = 0x4000u;
+    oversized_fetch[tail + 0] = 0xBE8803FFu;
+    oversized_fetch[tail + 1] = 0x00020000u;
+    oversized_fetch[tail + 2] = 0xBE8903FFu;
+    oversized_fetch[tail + 3] = 0x00100000u;
+    oversized_fetch[tail + 4] = 0xBE8A0380u;
+    oversized_fetch[tail + 5] = 0xBE8B0380u;
+    oversized_fetch[tail + 6] = 0xE0002000u;
+    oversized_fetch[tail + 7] = 0x80020100u;
+    oversized_fetch[tail + 8] = 0xBF810000u;
+    Shader oversized{};
+    oversized.file_header = 0x34333231u;
+    oversized.version = 0x18u;
+    oversized.shader_size = 0xFFFFFFFCu;
+    oversized.type = 2;
+    dst = nullptr;
+    rc = create_shader(reinterpret_cast<uint64_t>(&dst), reinterpret_cast<uint64_t>(&oversized),
+                       reinterpret_cast<uint64_t>(oversized_fetch.data()), 0, 0, 0);
+    CHECK(rc == 0 && dst == &oversized, "oversized shader metadata enters the AGC registry");
+    auto oversized_table = prosper::gpu::build_stage_table(
+        empty_state, reinterpret_cast<uint64_t>(oversized_fetch.data()), false, 7);
+    CHECK(!oversized_table || !oversized_table->by_fetch_pc(static_cast<uint32_t>(tail + 6)),
+          "oversized shader metadata cannot expand dynamic-fold work beyond 64 KiB");
+
     // A zero-record V# has no descriptor-provided byte bound. Size it from this draw instead of the
     // title-screen-specific stride*4 fallback. Unknown format remains a compatibility fallback, but
     // is surfaced and its unstrided record width is derived from the effective Float32x4 shape.
@@ -182,6 +212,37 @@ int main() {
     CHECK(strided_buffer && strided_buffer->format == prosper::gpu::DataFormat::Float32 &&
           strided_buffer->num_components == 4 && strided_buffer->size == 7u * 20u,
           "zero-record strided V# size follows draw vertex count, not four vertices");
+
+    // The same descriptor in a pixel shader is a VADDR-indexed structured/material buffer, not a
+    // gl_VertexIndex-backed vertex attribute. A three-vertex draw therefore cannot shrink its bound
+    // to three records: index 3 still needs the fourth strided record that the old compatibility
+    // allocation exposed.
+    const uint32_t ps_zero_record[] = {
+        0xBE8803FFu, 0x00028000u,   // s_mov_b32 s8, V# base low
+        0xBE8903FFu, 0x00100000u,   // s_mov_b32 s9, stride 16
+        0xBE8A0380u,                // s_mov_b32 s10, 0 records
+        0xBE8B0380u,                // s_mov_b32 s11, unknown format
+        0xE0002000u, 0x80020100u,   // pc=6: buffer_load_format_x v1, v0, s[8:11], 0 idxen
+        0xBF810000u,
+    };
+    Shader ps_zero{};
+    ps_zero.file_header = 0x34333231u;
+    ps_zero.version = 0x18u;
+    ps_zero.shader_size = sizeof(ps_zero_record);
+    ps_zero.type = 1;
+    dst = nullptr;
+    rc = create_shader(reinterpret_cast<uint64_t>(&dst), reinterpret_cast<uint64_t>(&ps_zero),
+                       reinterpret_cast<uint64_t>(ps_zero_record), 0, 0, 0);
+    CHECK(rc == 0 && dst == &ps_zero, "zero-record pixel shader enters the AGC registry");
+    auto ps_zero_table = prosper::gpu::build_stage_table(
+        empty_state, reinterpret_cast<uint64_t>(ps_zero_record), true, 3);
+    const prosper::gpu::ShaderResource* ps_zero_buffer = ps_zero_table
+        ? ps_zero_table->by_fetch_pc(6) : nullptr;
+    CHECK(ps_zero_buffer &&
+          ps_zero_buffer->cls == prosper::gpu::ResourceClass::ConstantBuffer &&
+          ps_zero_buffer->stride == 16u && ps_zero_buffer->size == 4u * 16u &&
+          3u * ps_zero_buffer->stride + sizeof(uint32_t) <= ps_zero_buffer->size,
+          "pixel zero-record V# keeps VADDR index 3 in-bounds on a three-vertex draw");
 
     const uint32_t zero_record_unstrided[] = {
         0xBE8803FFu, 0x00030000u,   // s_mov_b32 s8, V# base low

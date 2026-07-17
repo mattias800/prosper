@@ -927,13 +927,19 @@ bool guest_writable(uint64_t a, uint32_t n) {
 
 // Registered AGC headers publish the shader blob size in bytes. Dynamic descriptor folding used to
 // ignore it and hand the decoder a fixed 0x4000-dword window, allowing the walk to read up to 64 KiB
-// past a short shader. Truncate a non-dword-aligned tail rather than reading one byte beyond the blob,
-// and refuse a declared span that is not wholly readable. A zero result safely disables only the
-// optional fold; metadata-described resources remain available to build_stage_table.
+// past a short shader. Retain that historical 64 KiB ceiling as a WORK bound too: CreateShader accepts
+// guest metadata, so a corrupt multi-gigabyte shader_size must not become a page-probe/decode/OOM budget.
+// Truncate a non-dword-aligned tail rather than reading one byte beyond the blob, and refuse the bounded
+// span if it is not wholly readable. A zero result safely disables only the optional fold;
+// metadata-described resources remain available to build_stage_table.
 size_t registered_shader_dwords(const AgcShaderHeader& header, uint64_t code_addr) {
+    constexpr size_t kMaxDynamicFoldDwords = 0x4000;
     const uint32_t shader_bytes = header.shader_size & ~uint32_t{3};
-    if (!shader_bytes || !guest_readable(code_addr, shader_bytes)) return 0;
-    return shader_bytes / sizeof(uint32_t);
+    const size_t dwords = std::min<size_t>(shader_bytes / sizeof(uint32_t),
+                                          kMaxDynamicFoldDwords);
+    const uint32_t bounded_bytes = static_cast<uint32_t>(dwords * sizeof(uint32_t));
+    if (!bounded_bytes || !guest_readable(code_addr, bounded_bytes)) return 0;
+    return dwords;
 }
 
 // --- Bindless-dynamic vertex-fetch resolution (const-fold the scalar setup) ---------------------------
@@ -1795,6 +1801,13 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
             r.gpu_addr      = d.base;
             if (d.size_bytes) {
                 r.size = d.size_bytes;
+            } else if (is_ps) {
+                // A pixel-stage buffer_load_format_* retains its real VADDR/stride addressing as a
+                // ConstantBuffer. Fragment/material indices are unrelated to submitted vertex count,
+                // so applying the VS draw-derived bound here can truncate an access that the previous
+                // compatibility allocation covered. Keep that allocation for PS until the fold can
+                // prove an access range, and surface the uncertainty below.
+                r.size = d.stride ? d.stride * 4u : 128u;
             } else {
                 const bool packed_word =
                     r.format == DataFormat::Float10_11_11 ||
@@ -1812,6 +1825,17 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
             r.sgpr_base     = kv.srsrc;           // DIRECT provenance = the fetch's SRSRC SGPR (fallback)
             r.fetch_pc      = kv.fetch_pc;        // PER-FETCH provenance = the exact fetch instruction
             r.srt_offset    = 0xFFFFFFFFu;
+            if (!d.size_bytes && is_ps) {
+                static std::mutex zero_ps_mx;
+                static std::set<std::tuple<uint64_t, uint32_t, uint32_t>> zero_ps_seen;
+                std::lock_guard<std::mutex> lk(zero_ps_mx);
+                if (zero_ps_seen.emplace(code_addr, kv.fetch_pc, kv.desc_v3).second)
+                    std::fprintf(stderr,
+                                 "[dynvb] PS code=0x%llx fetch pc=%u has zero-record V#; "
+                                 "VADDR range is not derivable from draw vertices, preserving "
+                                 "compatibility size=%u\n",
+                                 (unsigned long long)code_addr, kv.fetch_pc, r.size);
+            }
             if (d.format == DataFormat::Unknown) {
                 static std::mutex unknown_mx;
                 static std::set<std::tuple<uint64_t, bool, uint32_t, uint32_t>> unknown_seen;
