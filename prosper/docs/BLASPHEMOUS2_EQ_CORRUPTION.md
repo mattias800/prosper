@@ -78,44 +78,81 @@ FMOD, and IoStore paths, and flag any value inside `prosper_fixed_map_hits_host_
 handed pointer is found, the fix is to back that buffer with real guest/heap memory (outside the image)
 instead of a host global, so guest writes cannot reach the equeue cluster.
 
-## Candidate fix (implemented, NOT yet verified)
+## The fix (implemented): relocate every hot mutex out of the corrupted `__DATA` cluster
 
 Since the corruptor cannot be attributed on this platform, the fix mirrors what already keeps Linux
-alive: keep the crash-critical equeue mutex **out of the corrupted `__DATA` range**. On macOS `g_eq_mx`
-is now a trivial `.bss` forwarder to a heap `std::mutex` that is allocated once at static init (never
-`new`/`malloc` on a lock path — the `%fs` SIGSEGV handler also takes this lock, and malloc there
-deadlocks). `.bss` is not touched by the corruptor (round-2 evidence), so the mutex sig survives and
-`vblank_pump` no longer hits `EINVAL`. Linux is unchanged (`std::mutex`, already `.bss`).
+alive: keep the crash-critical mutexes **out of the corrupted `__DATA` range**. On Linux/glibc
+`PTHREAD_MUTEX_INITIALIZER` is all-zero, so a namespace-scope `std::mutex` is `.bss` and untouched —
+that is *why* #707 is latent there. On macOS/libc++ the initializer carries a non-zero `_MUTEX_SIG`,
+so the same `std::mutex` is constant-initialized into `__DATA`, exactly where the corruptor writes.
 
-**Status: compiles cleanly; UNVERIFIED.** During this investigation an earlier (buggy) variant of this
-mitigation deadlocked and left the machine's Rosetta runtime wedged (uninterruptible `U`-state
-processes), so no x86-64 binary can run until the host is **rebooted**. After a reboot, verify by
-running the reproduce recipe below and confirming `g_eq_mx` is no longer reported by SIGWATCH and the
-route reaches sustained gameplay. **Caveat:** the corruptor zeroes a *region*, so if it also reaches
-`g_eqs`/the reg vectors (extent unconfirmed), those must be relocated the same way — watch for the crash
-merely moving rather than disappearing.
+**The confirmed victim set is the equeue cluster's three mutexes** (`hle_kernel_time.cpp`'s
+fault-handler classifier at line ~1043 defines it precisely: `g_det_clock.mutex`, `g_eq_mx`,
+`g_apr_mx`). The Mach-O layout (`nm -n boot_trace`) confirms they cluster at `image+0x179000..0x17bce0`:
 
-## Root-cause path: AddressSanitizer on Linux (recommended, runs on the existing WSL env)
+| symbol            | old `__DATA` addr | hot on default route?                | disposition |
+|-------------------|-------------------|--------------------------------------|-------------|
+| `g_det_clock.mutex` | `image+0x179000` | **no** — locked only under `PROSPER_DET_CLOCK` (default off; `ns_now` early-returns before the lock) | left in place (cold) |
+| `g_eq_mx`         | `image+0x17b7xx`  | **yes** — vblank/flip event delivery | heap-backed |
+| `g_apr_mx`        | `image+0x17bca0`  | **yes** — APR ring-token posting during asset load | heap-backed |
 
-The corruptor is almost certainly a prosper **host** out-of-bounds write (image-relative, inlined, not
-memset/mmap/mach_vm/GPU). AddressSanitizer detects the OOB write **itself, not the crash** — so it should
-fire on **Linux too**, where the same store hits benign memory (that is exactly why #707 is latent there)
-but still crosses a global/heap redzone. ASAN's x86-64 shadow gap covers the guest GPU-VA window
-`[4 GiB, 64 GiB)`, so prosper's own globals (LowMem) are shadowed normally and an OOB write to them is
-reported with an exact source location. This needs no macOS, Rosetta, reboot, or hardware watchpoints.
+The mechanism: `PROSPER_HEAP_MUTEX(name)` (`src/hle/heap_mutex.hpp`) defines the guest-visible mutex as
+a trivially-constructed `.bss` forwarder to a heap `std::mutex` allocated **once, eagerly, at static
+init** (single-threaded, before the guest runs — never `new`/`malloc` on a lock path, because the `%fs`
+SIGSEGV handler also takes these locks and malloc there deadlocks; an earlier lazy-`new`+atomic variant
+did exactly that and wedged the runtime). `.bss` is not touched by the corruptor (round-2 evidence), so
+the sig survives. On non-Apple platforms the macro is a plain `std::mutex` — Linux/Windows unchanged.
 
-```
-cmake -S prosper -B prosper/build-asan -DPROSPER_ASAN=ON -DGAME_DUMP=<PPSA13579 dump>
-cmake --build prosper/build-asan --target boot_trace -j8
-ASAN_OPTIONS=protect_shadow_gap=0:abort_on_error=1 \
-PROSPER_GUEST_FS=1 PROSPER_GUEST_ARGS=-force-gfx-direct \
-PROSPER_PAD_SCRIPT=@prosper/scripts/blasphemous2/reach-first-gameplay.pad \
-  ./prosper/build-asan/boot_trace <dump>
-```
-The first `global-buffer-overflow` / `heap-buffer-overflow` report around the asset-load phase names the
-writer — the real root fix. (If ASAN stays silent through a full route, the write is a guest/Rosetta store
-rather than instrumented prosper code, and the mitigation above is the fallback.) A real x86-64 Mac or an
-x86 Linux VM with a `g_eq_mx` write-watchpoint is the other option.
+**Correct-by-construction result:** after the fix the confirmed corrupted region (`image+0x178000`,
+det/eq/apr) contains only `g_det_clock` (cold), the diagnostic decoys, and the canaries — **no hot
+mutex**. The corruptor can keep zeroing that offset indefinitely; nothing crash-critical lives there
+anymore, so neither `vblank_pump` (`g_eq_mx`) nor the APR path (`g_apr_mx`) can hit `EINVAL`. This
+closes the doc's own earlier caveat that moving `g_eq_mx` alone would merely *relocate* the crash to
+the APR mutex. `hle_file.cpp`'s separate APR-registry `g_apr_mx` (`image+0x16f630`, just below the
+cluster) is also heap-backed as defense-in-depth against the corruptor's run-to-run-variable extent.
+
+**Verification status.** Linux `ctest` is green (regression check on the primary platform; the `#else`
+branch is a plain `std::mutex`). The macOS `__APPLE__` branch **compiles and links** (build-mac-app,
+x86-64) and `nm` confirms both `g_apr_mx` moved to `.bss` (`0x100ab74a0`, `0x100ab8768`). It is **not
+runtime-verified on macOS**: an earlier buggy mitigation attempt deadlocked and wedged this host's
+Rosetta runtime — even a trivial x86-64 hello-world now hangs, so *no* x86-64 binary runs until the
+host is **rebooted**. After a reboot, run the reproduce recipe below and confirm SIGWATCH no longer
+reports `g_eq_mx`/`g_apr_mx` and the route reaches sustained gameplay.
+
+**Residual risk (documented, not fixed).** If the crash *relocates again* rather than disappearing, the
+corruptor's extent reaches beyond the confirmed cluster. The next candidates — other hot `std::mutex`
+globals the linker parks near the cluster in `__DATA`, in *other* TUs — are `g_guard_mx`
+(`hle_libc.cpp`), `g_avp_mx`/`g_savemem_mx` (`hle_service.cpp`), and `g_smx` (`exec_image_*.cpp`), all
+currently one page *above* the confirmed region (`image+0x17c0xx`). Apply `PROSPER_HEAP_MUTEX` to
+whichever SIGWATCH/backtrace then implicates. Removing the diagnostic decoy/ballast/canary arrays would
+shift these closer to the cluster, so keep them until the corruptor is attributed.
+
+## Root-cause path: AddressSanitizer on Linux — attempted, found to be a DEAD END
+
+The idea was: if the corruptor were a prosper **host** OOB store, ASAN would flag the write itself (not
+the crash) on Linux too, naming the source line. This was tried and does not work, for a now-understood
+reason:
+
+1. **The write mechanism cannot occur on Linux.** Evidence point (4) — lowering the victim's *max*
+   protection blocks the write **silently, with no fault in our handler** — is the signature of a
+   `mach_vm_write`-family write (bypasses current page protection, honors `max_protection`, returns
+   `KERN_PROTECTION_FAILURE` to the *caller* rather than faulting). `mach_vm` is macOS-only. On Linux
+   there is no such call, so the write never happens — which is precisely why the taint runs are 3/3
+   clean. ASAN on Linux therefore has nothing to catch. (This also means the write is **not** an
+   instrumented prosper CPU store; ASAN would not see it even on macOS.)
+2. **ASAN's shadow collides with the guest GPU-VA window regardless.** Both the fixed-shadow
+   (`protect_shadow_gap=0`) and dynamic-shadow (`-mllvm -asan-force-dynamic-shadow=1`) layouts leave
+   the `MAP_FIXED_NOREPLACE` image map at the guest base failing ("map failed: mmap image at guest base
+   failed"), because ASAN's shadow reservation overlaps `[4 GiB, 64 GiB)`. A bare `mmap` probe (no
+   ASAN) maps that whole window fine, confirming the conflict is ASAN, not the container/Rosetta VM.
+
+Conclusion: the write is a macOS VM-system write (`mach_vm`-family, from a dylib or the Rosetta
+runtime — prosper's own two `mach_vm` writers are guarded and never fire), not instrumented prosper
+code. Sanitizers cannot attribute it. The genuine attribution paths left are all macOS-side: a
+`DYLD_INTERPOSE`/`mach_override` shim on `mach_vm_write`/`mach_vm_copy`/`vm_write` (catches a dylib
+caller), or a real x86-64 Mac with a hardware write-watchpoint on the cluster (Rosetta has none). Until
+one of those attributes it, the correct-by-construction relocation fix above is the resolution: it makes
+the crash impossible without needing to name the writer.
 
 ## Diagnostics on this branch (env-gated, `PROSPER_EQ_*`)
 

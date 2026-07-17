@@ -2,6 +2,7 @@
 // libkernel stubs the engine needs during init. Cross-platform (chrono + pthread).
 #include "dispatch.hpp"
 #include "nid.hpp"
+#include "heap_mutex.hpp"   // #707: keep hot equeue/APR mutexes off macOS __DATA
 #include <pthread.h>
 #include <chrono>
 #ifndef _WIN32
@@ -494,7 +495,7 @@ namespace {
 #else
     std::mutex g_eq_mx;
 #endif
-    extern std::mutex g_apr_mx;   // defined in the APR block below; sig-watched alongside g_eq_mx
+    PROSPER_HEAP_MUTEX_EXTERN(g_apr_mx);   // defined in the APR block below; #707: heap-backed on macOS (it sits INSIDE the corrupted __DATA cluster at image+0x17bca0)
     volatile uint8_t g_eq_canary_b[128] PROSPER_EQ_CANARY_INIT;   // #707 canary: immediately beside g_eq_mx/g_eqs in declaration order
     std::unordered_map<uint64_t, std::shared_ptr<EqState>> g_eqs;   // guest eq handle -> state
     struct FlipReg { uint64_t eq; int64_t ident; uint64_t udata; };
@@ -1337,7 +1338,11 @@ namespace {
     constexpr int16_t EVFILT_AMPR_MODELED = -24;   // guest never reads filter; distinct on purpose
     struct AprEqReg { uint64_t eq; int64_t id; };
     // Own mutex (NOT g_eq_mx): the post path calls eq_post/eq_find, which lock g_eq_mx themselves.
-    std::mutex g_apr_mx;
+    // #707: this mutex is CONFIRMED to sit inside the corrupted __DATA cluster (image+0x17bca0, i.e.
+    // [g_det_clock .. g_apr_mx+64]) and is HOT during asset load (APR ring-token posting), so leaving
+    // it a plain std::mutex would merely relocate the crash from vblank_pump (g_eq_mx) to the APR
+    // path. Heap-back it on macOS so the corruptor cannot reach its pthread sig. See heap_mutex.hpp.
+    PROSPER_HEAP_MUTEX(g_apr_mx);
     std::vector<AprEqReg> g_apr_eq_regs;               // guarded by g_apr_mx (registration log)
     volatile uint8_t g_eq_canary_d[128] PROSPER_EQ_CANARY_INIT;   // #707 canary (declared beside g_eq_mx above)
     uint64_t g_apr_ring_seq[64] = {};                  // per-ring counters for prosper-issued tokens
@@ -1416,7 +1421,7 @@ void prosper_eq_post_apr_token(uint64_t eq, int64_t id, uint64_t token) {
     unsigned ring = (unsigned)(token >> 58) & 0x3f;
     uint64_t cnt = token & ((1ull << 58) - 1);
     {
-        std::lock_guard<std::mutex> lk(g_apr_mx);
+        std::lock_guard lk(g_apr_mx);
         if (cnt > g_apr_tag_hwm[ring]) g_apr_tag_hwm[ring] = cnt;
     }
     if (evlog()) fprintf(stderr, "[ev] AprTagComplete token=0x%llx (ring=%u) -> eq=0x%llx scheduled\n",
@@ -1425,7 +1430,7 @@ void prosper_eq_post_apr_token(uint64_t eq, int64_t id, uint64_t token) {
         struct timespec ts{ 0, 2000000 };   // 2 ms
         nanosleep(&ts, nullptr);
         uint64_t hwm;
-        { std::lock_guard<std::mutex> lk(g_apr_mx); hwm = g_apr_tag_hwm[ring]; }
+        { std::lock_guard lk(g_apr_mx); hwm = g_apr_tag_hwm[ring]; }
         AprEqReg r{ eq, id };
         apr_post(r, ring, ((uint64_t)ring << 58) | hwm);
     }).detach();
@@ -1435,7 +1440,7 @@ void prosper_eq_post_apr_token(uint64_t eq, int64_t id, uint64_t token) {
 // event is ever posted for these — see the block comment above).
 uint64_t prosper_apr_next_token(unsigned ring) {
     ring &= 0x3f;
-    std::lock_guard<std::mutex> lk(g_apr_mx);
+    std::lock_guard lk(g_apr_mx);
     uint64_t seq = ++g_apr_ring_seq[ring];
     return ((uint64_t)ring << 58) | (seq & ((1ull << 58) - 1));
 }
@@ -1445,7 +1450,7 @@ uint64_t prosper_apr_next_token(unsigned ring) {
 // ctor-seeded per-ring last-processed (see the block comment above; the pre-#208 replay was the
 // root cause of the #180 range-walk fault).
 void prosper_eq_add_apr(uint64_t eq, int64_t id) {
-    std::lock_guard<std::mutex> lk(g_apr_mx);
+    std::lock_guard lk(g_apr_mx);
     for (auto& r : g_apr_eq_regs)
         if (r.eq == eq && r.id == id) return;   // idempotent
     g_apr_eq_regs.push_back({ eq, id });
