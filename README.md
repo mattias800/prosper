@@ -95,7 +95,13 @@ Windows/MinGW), structured logs, and purpose-built tracing tooling — never by 
 ### Linux
 
 Requires a C++20 compiler, CMake, and Ninja. A Vulkan loader is needed for the graphics tests
-(the CI/headless path uses the `llvmpipe` software ICD).
+(the CI/headless path uses the `llvmpipe` software ICD). The native AvPlayer backend uses FFmpeg
+for MP4 demux/audio conversion and VA-API for hardware video decode. On Ubuntu/Debian:
+
+```sh
+sudo apt install ninja-build pkg-config libvulkan-dev libavformat-dev libavcodec-dev \
+  libavutil-dev libswresample-dev libswscale-dev libva-dev
+```
 
 ```sh
 cd prosper
@@ -105,7 +111,10 @@ ctest --test-dir build-linux          # 93 self-checking tests
 ```
 
 Add `-DPROSPER_APP=ON -DPROSPER_AUDIO_SDL3=ON -DPROSPER_PAD_SDL3=ON` to build the windowed frontend
-with audio and controller support. CMake fetches SDL3 when it is not installed.
+with audio and controller support. CMake fetches SDL3 when it is not installed. Video source-open
+requires a working VA-API render device by default; select a non-default node with
+`PROSPER_AVP_VAAPI_DEVICE=/dev/dri/renderD129`. `PROSPER_AVP_ALLOW_SOFTWARE=1` is an explicit
+diagnostic fallback, not normal playback behavior.
 
 ### Windows core
 

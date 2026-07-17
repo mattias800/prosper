@@ -35,6 +35,9 @@
 #ifdef PROSPER_VIDEO_MF
 #include "media_foundation_backend.hpp" // native Windows AvPlayer demux + hardware decode
 #endif
+#ifdef PROSPER_VIDEO_VAAPI
+#include "vaapi_backend.hpp"            // native Linux FFmpeg demux + VA-API hardware decode
+#endif
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
@@ -390,6 +393,16 @@ int main(int argc, char** argv) {
                     fprintf(stderr, "[app] Media Foundation video backend installed.\n");
                 else
                     fprintf(stderr, "[app] Media Foundation video backend unavailable.\n");
+            } else {
+                fprintf(stderr, "[app] native video backend disabled.\n");
+            }
+#endif
+#ifdef PROSPER_VIDEO_VAAPI
+            if (!getenv("PROSPER_APP_DISABLE_VIDEO")) {
+                if (prosper::video::install_vaapi_backend())
+                    fprintf(stderr, "[app] FFmpeg/VA-API video backend installed.\n");
+                else
+                    fprintf(stderr, "[app] FFmpeg/VA-API video backend unavailable.\n");
             } else {
                 fprintf(stderr, "[app] native video backend disabled.\n");
             }
