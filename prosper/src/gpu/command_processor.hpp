@@ -108,8 +108,10 @@ private:
 };
 
 // Execute one retained address-backed DMA_DATA operation at its ordered submit position.
-// Re-validates both guest spans immediately before the byte copy and notifies renderer caches.
-void execute_ordered_dma_copy(const GpuState::DmaCopy& copy);
+// Re-validates the destination and either the raw guest source or a bounded authoritative renderer
+// snapshot immediately before the byte copy, then notifies renderer caches.
+void execute_ordered_dma_copy(const GpuState::DmaCopy& copy,
+                              const uint8_t* authoritative_source = nullptr);
 
 // Decode `dwords` dwords at `buf` and apply every op to `st`. Returns the number of packets applied.
 size_t run_command_buffer(const uint32_t* buf, size_t dwords, GpuState& st);

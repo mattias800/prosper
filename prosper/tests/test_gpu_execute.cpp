@@ -158,8 +158,10 @@ int main() {
         first.draw_index = 0;
         second.draw_index = 1;
         std::vector<uint8_t> observed;
+        std::vector<LiveRenderPhase> dma_phases;
         LiveRenderFn consume = [&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
             for (size_t i = 0; i < items.size(); ++i) observed.push_back(target);
+            dma_phases.push_back(live_render_phase());
             return std::vector<uint8_t>(4, target);
         };
         const OrderedSubmitResult result = execute_ordered_items(
@@ -168,6 +170,49 @@ int main() {
               "ordered DMA exposes old bytes before the copy and new bytes afterward");
         CHECK(result.render_spans == 2,
               "an ordered DMA copy splits graphics consumers into two render spans");
+        CHECK(dma_phases.size() == 2 && dma_phases[0].authoritative_readback &&
+              !dma_phases[1].authoritative_readback,
+              "the graphics span immediately before DMA requests authoritative target readback");
+    }
+
+    // A rendered target's authoritative bytes can live only in the backend cache. Resolve the
+    // requested interior range after the preceding graphics span rather than reading stale/unmapped
+    // guest backing at the target address.
+    {
+        constexpr uint64_t live_base = 0x100000000ull;
+        const std::vector<uint8_t> live_pixels = {0x10, 0x21, 0x32, 0x43, 0x54, 0x65};
+        uint8_t target[3] = {0, 0, 0};
+        bool producer_rendered = false;
+        set_live_target_byte_range_reader(
+            [&](uint64_t addr, uint32_t bytes, std::vector<uint8_t>& output) {
+                if (addr < live_base || addr >= live_base + live_pixels.size())
+                    return LiveTargetByteReadResult::NotFound;
+                const uint64_t offset = addr - live_base;
+                if (!producer_rendered || bytes > live_pixels.size() - offset)
+                    return LiveTargetByteReadResult::InvalidRange;
+                output.assign(live_pixels.begin() + static_cast<size_t>(offset),
+                              live_pixels.begin() + static_cast<size_t>(offset + bytes));
+                return LiveTargetByteReadResult::Success;
+            });
+        GpuState state;
+        GpuState::Draw producer;
+        producer.command_order = 100;
+        state.draws.push_back(producer);
+        state.dma_copies.push_back({
+            (uint64_t)(uintptr_t)target, live_base + 2, sizeof target, 0, 200, 0});
+        DrawItem draw;
+        draw.draw_index = 0;
+        LiveRenderFn render = [&](const std::vector<DrawItem>&, uint32_t, uint32_t) {
+            producer_rendered = true;
+            return std::vector<uint8_t>(4, 0xff);
+        };
+        execute_ordered_items(plan_submit_operations(state), {draw}, {}, state.dma_copies,
+                              render, {}, 1, 1);
+        CHECK(producer_rendered &&
+              std::vector<uint8_t>(target, target + sizeof target) ==
+                  std::vector<uint8_t>({0x32, 0x43, 0x54}),
+              "ordered DMA reads an interior range from the preceding live render target");
+        set_live_target_byte_range_reader({});
     }
 
     // A no-draw submit still executes DMA before a later compute consumer. The old completion-FIFO

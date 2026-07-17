@@ -238,6 +238,31 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
             snapshot.pixels = it->second.rgba;
             return true;
         });
+    prosper::gpu::set_live_target_byte_range_reader(
+        [](uint64_t addr, uint32_t bytes, std::vector<uint8_t>& output) {
+            if (!addr || !bytes) return prosper::gpu::LiveTargetByteReadResult::InvalidRange;
+            for (const auto& [base, surface] : g_rtt) {
+                if (addr < base) continue;
+                if (!surface.w || !surface.h) {
+                    if (addr == base) return prosper::gpu::LiveTargetByteReadResult::InvalidRange;
+                    continue;
+                }
+                const VkFormat format = prosper::test::backend_color_format(surface.format);
+                const uint64_t bpp = prosper::test::backend_color_bytes_per_pixel(format);
+                const uint64_t pixels = static_cast<uint64_t>(surface.w) * surface.h;
+                if (!bpp || pixels > UINT64_MAX / bpp) continue;
+                const uint64_t target_bytes = pixels * bpp;
+                const uint64_t offset = addr - base;
+                if (offset >= target_bytes) continue;
+                if (!surface.rgba || surface.rgba->size() != target_bytes ||
+                    bytes > target_bytes - offset)
+                    return prosper::gpu::LiveTargetByteReadResult::InvalidRange;
+                output.assign(surface.rgba->begin() + static_cast<size_t>(offset),
+                              surface.rgba->begin() + static_cast<size_t>(offset + bytes));
+                return prosper::gpu::LiveTargetByteReadResult::Success;
+            }
+            return prosper::gpu::LiveTargetByteReadResult::NotFound;
+        });
     if (getenv("PROSPER_GPU_CAPTURE") || getenv("PROSPER_GPU_TIMELINE_CAPTURE") ||
         getenv("PROSPER_GPU_REPLAY_EXPORT_DS"))
         prosper::gpu::set_gpu_capture_ds_seed_snapshot_reader(
@@ -1914,10 +1939,14 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps) {
                             inspect(items[later].prt.get());
                         }
                     }
-                    // Defer only a proven graphics-to-graphics intermediate. Scanout, fallback-present,
-                    // size conversion, and same-image feedback retain authoritative CPU pixels.
-                    const bool defer_readback = live_gpu_targets && vo_n > 0 && base && !is_vo &&
-                        base != front_va && sampled_exact_later && !feedback_later;
+                    // A later submit may perform an ordered DMA read of this target, so there is no
+                    // safe point here to discard its authoritative CPU mirror. Keep the candidate
+                    // calculation in place for an eventual on-demand persistent-target readback path.
+                    constexpr bool allow_gpu_only_target_cache = false;
+                    const bool defer_readback = allow_gpu_only_target_cache && live_gpu_targets &&
+                        vo_n > 0 && base && !is_vo &&
+                        base != front_va && sampled_exact_later && !feedback_later &&
+                        !phase.authoritative_readback;
                     prosper::test::BackendColorTarget backend_target{
                         base, seed_rtt, !defer_readback, pass_format};
                     const bool color1_extent_matches = base1 && !render_pass.empty() &&

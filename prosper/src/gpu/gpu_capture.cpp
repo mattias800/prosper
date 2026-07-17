@@ -865,10 +865,18 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
     return true;
 }
 
+static bool reject_unsupported_gpustate_capture(const GpuState& state, std::string& error) {
+    if (state.dma_copies.empty()) return false;
+    error = "GPU capture v13 cannot represent " + std::to_string(state.dma_copies.size()) +
+            " ordered DMA_DATA operation(s); capture would be incomplete (see #833)";
+    return true;
+}
+
 bool capture_gpustate_submit(const GpuState& state, uint64_t submit_no,
                              uint32_t width, uint32_t height,
                              const GpuCaptureMetadata& metadata,
                              GpuCaptureFile& out, std::string& error) {
+    if (reject_unsupported_gpustate_capture(state, error)) return false;
     const bool caplog = std::getenv("PROSPER_GPU_CAPTURE_LOG") != nullptr;
     std::vector<OperationRealizationFailure> failures, compute_failures;
     if (caplog) std::fprintf(stderr, "[cap] realize_gpustate_draws...\n");
@@ -893,6 +901,7 @@ bool capture_gpustate_target_submit(const GpuState& state, uint64_t submit_no,
                                     uint32_t target_width, uint32_t target_height,
                                     const GpuCaptureMetadata& metadata,
                                     GpuCaptureFile& out, std::string& error) {
+    if (reject_unsupported_gpustate_capture(state, error)) return false;
     std::vector<DrawItem> draws = realize_gpustate_draws(state);
     draws.erase(std::remove_if(draws.begin(), draws.end(), [&](const DrawItem& draw) {
         return draw.color0_width != target_width || draw.color0_height != target_height;
@@ -1687,7 +1696,8 @@ bool restore_gpu_replay_ds_seeds(const std::vector<GpuCaptureDsSeed>& seeds, std
 
 std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
     const std::vector<DrawItem>& draws, const std::vector<ComputeItem>& computes,
-    const std::vector<SubmitOperation>& operations, uint32_t width, uint32_t height) {
+    const std::vector<SubmitOperation>& operations, uint32_t width, uint32_t height,
+    bool has_ordered_dma) {
     const char* path = std::getenv("PROSPER_GPU_CAPTURE"); if (!path || !*path) return {};
     static std::atomic<uint64_t> invocation_sequence{0};
     const uint64_t invocation = invocation_sequence.fetch_add(1);
@@ -1702,6 +1712,14 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
     uint64_t current = sequence.fetch_add(1), wanted = 0;
     if (const char* at = std::getenv("PROSPER_GPU_CAPTURE_AT")) wanted = std::strtoull(at, nullptr, 0);
     if (current != wanted || claimed.exchange(true)) return {};
+    if (has_ordered_dma) {
+        std::fprintf(stderr,
+                     "[gpucap] selected match %llu at invocation %llu failed: capture v13 cannot "
+                     "represent ordered DMA_DATA (see #833)\n",
+                     static_cast<unsigned long long>(current),
+                     static_cast<unsigned long long>(invocation));
+        return {};
+    }
     auto pending = std::make_unique<PendingGpuCapture>(); pending->path = path;
     GpuCaptureMetadata m; m.width = width; m.height = height; m.submit_index = current;
 #ifdef PROSPER_GIT_REVISION

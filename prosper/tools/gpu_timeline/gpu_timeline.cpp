@@ -257,6 +257,8 @@ int main(int argc, char** argv) {
                     continue;
                 const std::string signature = "draws=" + std::to_string(submit.draw_count) +
                     " dispatches=" + std::to_string(submit.dispatch_count) +
+                    " dmas=" + std::to_string(submit.dma_copy_count) +
+                    " capture=" + (submit.capture_incomplete ? "incomplete" : "complete") +
                     " targets=" + target_signature(submit);
                 Stats& stats = grouped[signature];
                 ++stats.count;
@@ -317,12 +319,14 @@ int main(int argc, char** argv) {
         return matches ? 0 : 1;
     }
 
-    uint64_t last_ns = 0, draws = 0, dispatches = 0;
+    uint64_t last_ns = 0, draws = 0, dispatches = 0, dmas = 0, incomplete = 0;
     std::map<std::pair<uint32_t, uint32_t>, uint64_t> target_extents;
     for (const auto& submit : timeline.submits) {
         last_ns = std::max(last_ns, submit.elapsed_ns);
         draws += submit.draw_count;
         dispatches += submit.dispatch_count;
+        dmas += submit.dma_copy_count;
+        incomplete += submit.capture_incomplete;
         if (submit.color0_width && submit.color0_height)
             target_extents[{submit.color0_width, submit.color0_height}]++;
     }
@@ -332,10 +336,11 @@ int main(int argc, char** argv) {
                 timeline.version, timeline.metadata.revision.c_str(), timeline.metadata.title_id.c_str(),
                 timeline.metadata.input_route.c_str());
     std::printf("duration=%.3fs submits=%zu presents=%zu details=%zu producers=%zu "
-                "draws=%llu dispatches=%llu truncated_tail=%s\n",
+                "draws=%llu dispatches=%llu dmas=%llu capture_incomplete=%llu truncated_tail=%s\n",
                 seconds, timeline.submits.size(), timeline.presents.size(), timeline.details.size(),
                 timeline.producers.size(),
                 static_cast<unsigned long long>(draws), static_cast<unsigned long long>(dispatches),
+                static_cast<unsigned long long>(dmas), static_cast<unsigned long long>(incomplete),
                 timeline.truncated_tail ? "yes" : "no");
     if (seconds > 0)
         std::printf("rates submits=%.1f/s presents=%.1f/s\n",
@@ -394,10 +399,11 @@ int main(int argc, char** argv) {
             const uint64_t xs = xi < timeline.producers.size() ? timeline.producers[xi].sequence : UINT64_MAX;
             if (ss <= ps && ss <= ds && ss <= xs) {
                 const auto& s = timeline.submits[si++];
-                std::printf("%llu %.6f submit=%llu draws=%u dispatches=%u order=%llu..%llu "
-                            "target=%016llx/%ux%u\n",
+                std::printf("%llu %.6f submit=%llu draws=%u dispatches=%u dmas=%u capture=%s "
+                            "order=%llu..%llu target=%016llx/%ux%u\n",
                             static_cast<unsigned long long>(s.sequence), s.elapsed_ns / 1e9,
                             static_cast<unsigned long long>(s.submit_no), s.draw_count, s.dispatch_count,
+                            s.dma_copy_count, s.capture_incomplete ? "incomplete" : "complete",
                             static_cast<unsigned long long>(s.first_command_order),
                             static_cast<unsigned long long>(s.last_command_order),
                             static_cast<unsigned long long>(s.color0_base),

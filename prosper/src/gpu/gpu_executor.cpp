@@ -2718,10 +2718,11 @@ OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& op
 
     OrderedSubmitResult result;
     std::vector<DrawItem> span;
-    auto flush_span = [&] {
+    auto flush_span = [&](bool authoritative_readback = false) {
         if (span.empty() || !render) return;
         LiveRenderPhase saved = g_live_phase;
-        g_live_phase = {result.render_spans == 0, result.render_spans + 1 == total_spans};
+        g_live_phase = {result.render_spans == 0, result.render_spans + 1 == total_spans,
+                        authoritative_readback};
         RenderedFrame rendered = render(span, width, height);
         g_live_phase = saved;
         if (!rendered.empty()) result.frame = std::move(rendered);
@@ -2735,8 +2736,22 @@ OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& op
             flush_span();
             result.compute_executed |= compute && compute({computes[operation.item]});
         } else {
-            flush_span();
-            execute_ordered_dma_copy(dma_copies[operation.item]);
+            flush_span(true);
+            const GpuState::DmaCopy& copy = dma_copies[operation.item];
+            std::vector<uint8_t> current_source;
+            const LiveTargetByteReadResult source_result = read_live_render_target_bytes(
+                copy.src, copy.bytes, current_source);
+            if (source_result == LiveTargetByteReadResult::InvalidRange) {
+                static std::atomic<int> warned{0};
+                if (warned.fetch_add(1) < 24)
+                    std::fprintf(stderr,
+                                 "[agc] DMA_DATA live-target source range invalid: src=0x%llx bytes=%u\n",
+                                 static_cast<unsigned long long>(copy.src), copy.bytes);
+                continue;
+            }
+            execute_ordered_dma_copy(
+                copy, source_result == LiveTargetByteReadResult::Success
+                          ? current_source.data() : nullptr);
         }
     }
     flush_span();
@@ -2767,6 +2782,17 @@ void set_live_target_reader(LiveTargetReaderFn fn) { g_live_target_reader = std:
 bool read_live_render_target(uint64_t gpu_addr, LiveTargetSnapshot& snapshot) {
     snapshot = {};
     return g_live_target_reader && g_live_target_reader(gpu_addr, snapshot);
+}
+static LiveTargetByteRangeReaderFn g_live_target_byte_range_reader;
+void set_live_target_byte_range_reader(LiveTargetByteRangeReaderFn fn) {
+    g_live_target_byte_range_reader = std::move(fn);
+}
+LiveTargetByteReadResult read_live_render_target_bytes(uint64_t gpu_addr, uint32_t bytes,
+                                                       std::vector<uint8_t>& output) {
+    output.clear();
+    if (!g_live_target_byte_range_reader)
+        return LiveTargetByteReadResult::NotFound;
+    return g_live_target_byte_range_reader(gpu_addr, bytes, output);
 }
 
 void set_guest_gpu_write_observer(GuestGpuWriteObserver observer) {
@@ -2850,17 +2876,11 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
 
     auto operations = plan_submit_operations(st);
     const auto timing_plan_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
-    // Capture formats through v13 have no DMA operation record. Refuse a partial artifact rather
-    // than silently snapshot pre-copy resources and replay a different submit.
-    std::unique_ptr<PendingGpuCapture> pending_capture;
-    if (st.dma_copies.empty()) {
-        pending_capture = begin_requested_gpu_capture(draws, computes, operations, width, height);
-    } else if (std::getenv("PROSPER_GPU_CAPTURE")) {
-        static std::atomic<int> warned{0};
-        if (warned.fetch_add(1) == 0)
-            std::fprintf(stderr,
-                         "[gpucap] submit capture skipped: ordered DMA_DATA is not represented by capture v13\n");
-    }
+    // Capture formats through v13 have no DMA operation record. Pass that fact into selection so a
+    // selected unsupported submit is claimed-and-failed, never silently skipped in favor of a later
+    // match. Direct/timeline capture rejects again at the central GpuState boundary.
+    auto pending_capture = begin_requested_gpu_capture(
+        draws, computes, operations, width, height, !st.dma_copies.empty());
     OrderedSubmitResult result = execute_ordered_items(
         operations, draws, computes, st.dma_copies, g_live, g_compute, width, height);
     const auto timing_backend_done = timing_enabled ? TimingClock::now() : TimingClock::time_point{};

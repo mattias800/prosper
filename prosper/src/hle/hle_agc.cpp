@@ -1082,8 +1082,14 @@ static bool execute_submit_work(gpu::GpuState& st, uint64_t submit_no, unsigned&
         std::chrono::steady_clock::now() - render_sampling_t0).count();
     const unsigned cadence = render_every_for_ms > 0 && sampling_elapsed_ms >= render_every_for_ms
         ? 1u : render_every;
-    const bool render = gpu::have_submit_renderer() && !st.draws.empty() &&
-                        (draw_submits++ % cadence) == 0;
+    // A retained copy may read pixels produced by an earlier draw in this submit. Sampling cadence
+    // cannot discard that producer and then let DMA read the previous cached target version.
+    const bool ordered_dma_requires_render = !st.dma_copies.empty() && !st.draws.empty();
+    bool render = false;
+    if (gpu::have_submit_renderer() && !st.draws.empty()) {
+        const bool cadence_render = (draw_submits++ % cadence) == 0;
+        render = ordered_dma_requires_render || cadence_render;
+    }
     if (!render) {
         if ((!st.dispatches.empty() || !st.dma_copies.empty()) &&
             !gpu::execute_nonrender_submit_work(st, submit_no) && getenv("PROSPER_COMPUTELOG"))

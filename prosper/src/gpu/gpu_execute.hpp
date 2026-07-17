@@ -323,6 +323,15 @@ struct LiveTargetSnapshot {
 using LiveTargetReaderFn = std::function<bool(uint64_t gpu_addr, LiveTargetSnapshot& snapshot)>;
 void set_live_target_reader(LiveTargetReaderFn fn);
 bool read_live_render_target(uint64_t gpu_addr, LiveTargetSnapshot& snapshot);
+// Ordered memory producers need the same authoritative storage version as live compute. A source
+// may begin inside a target, so the renderer validates the complete requested byte range instead of
+// exposing an unbounded pointer into its cache.
+enum class LiveTargetByteReadResult : uint8_t { NotFound, Success, InvalidRange };
+using LiveTargetByteRangeReaderFn = std::function<LiveTargetByteReadResult(
+    uint64_t gpu_addr, uint32_t bytes, std::vector<uint8_t>& output)>;
+void set_live_target_byte_range_reader(LiveTargetByteRangeReaderFn fn);
+LiveTargetByteReadResult read_live_render_target_bytes(uint64_t gpu_addr, uint32_t bytes,
+                                                       std::vector<uint8_t>& output);
 std::vector<ComputeItem> realize_compute_dispatches(const GpuState& st,
                                                      uint64_t submit_no = 0,
                                                      std::vector<OperationRealizationFailure>* failures = nullptr);
@@ -996,6 +1005,9 @@ bool have_submit_renderer();
 struct LiveRenderPhase {
     bool first_span = true;
     bool final_span = true;
+    // The next ordered operation reads render-target bytes on the CPU. Persistent Vulkan targets
+    // must synchronously read back this span instead of deferring their authoritative pixels.
+    bool authoritative_readback = false;
 };
 LiveRenderPhase live_render_phase();
 

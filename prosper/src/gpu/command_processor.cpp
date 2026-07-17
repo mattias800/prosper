@@ -757,7 +757,7 @@ static void honor_event_write(const Pm4Command& c) {
 // CONFIDENCE: HIGH on immediate fill and mapped address-copy behavior; MED on the large-fill form.
 enum class DmaDataForm { Invalid, Immediate, Copy };
 
-static DmaDataForm dma_data_form(const Pm4Command& c) {
+static DmaDataForm dma_data_form(const Pm4Command& c, bool source_materialized = false) {
     constexpr uint32_t kMaxImmediateBytes = 0x1000000;   // existing 16 MiB fill safety bound
     constexpr uint32_t kMaxCopyBytes = 0x10000000;      // HLE builder's 256 MiB API bound
     if (!c.dd_valid || !c.dd_bytes || c.dd_bytes > kMaxCopyBytes || c.dd_dst < 0x10000)
@@ -772,7 +772,8 @@ static DmaDataForm dma_data_form(const Pm4Command& c) {
                    ? DmaDataForm::Immediate
                    : DmaDataForm::Invalid;
     }
-    return guest_readable(c.dd_src, c.dd_bytes) && guest_writable(c.dd_dst, c.dd_bytes)
+    return (source_materialized || guest_readable(c.dd_src, c.dd_bytes)) &&
+                   guest_writable(c.dd_dst, c.dd_bytes)
                ? DmaDataForm::Copy
                : DmaDataForm::Invalid;
 }
@@ -787,10 +788,11 @@ static void report_invalid_dma_data(const Pm4Command& c) {
                 (unsigned long long)c.dd_dst, (unsigned long long)c.dd_src, c.dd_bytes, c.dd_sels);
 }
 
-static void honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 0) {
+static void honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 0,
+                           const uint8_t* authoritative_source = nullptr) {
     if (eop_writes_disabled() || !c.dd_valid) return;
     const uint64_t packet_addr = retained_packet_addr ? retained_packet_addr : pkt_addr(c);
-    const DmaDataForm form = dma_data_form(c);
+    const DmaDataForm form = dma_data_form(c, authoritative_source != nullptr);
     if (form == DmaDataForm::Invalid) {
         report_invalid_dma_data(c);
         return;
@@ -833,7 +835,9 @@ static void honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
     } else {
         // memmove is byte-for-byte memcpy behavior for the normal non-overlapping GPU-buffer case,
         // while remaining deterministic if an unusual packet overlaps its endpoints.
-        memmove(dst, (const void*)(uintptr_t)c.dd_src, c.dd_bytes);
+        memmove(dst, authoritative_source ? authoritative_source
+                                          : (const uint8_t*)(uintptr_t)c.dd_src,
+                c.dd_bytes);
         notify_guest_gpu_write(c.dd_dst, c.dd_bytes);
         if (getenv("PROSPER_GFXLOG"))
             fprintf(stderr, "[agc]   DmaData copy [0x%llx] <- [0x%llx] (%u bytes)\n",
@@ -846,7 +850,8 @@ static void honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
     wake_on_label(c.dd_dst);
 }
 
-void execute_ordered_dma_copy(const GpuState::DmaCopy& copy) {
+void execute_ordered_dma_copy(const GpuState::DmaCopy& copy,
+                              const uint8_t* authoritative_source) {
     Pm4Command c{};
     c.kind = Pm4Command::Kind::DmaData;
     c.dd_dst = copy.dst;
@@ -855,7 +860,7 @@ void execute_ordered_dma_copy(const GpuState::DmaCopy& copy) {
     c.dd_sels = copy.sels;
     c.dd_valid = true;
     c.stream_order = copy.command_order;
-    honor_dma_data(c, copy.packet_addr);
+    honor_dma_data(c, copy.packet_addr, authoritative_source);
 }
 
 // Honor a WRITE_DATA packet: copy the inline dwords to the destination address (same synchronous timing).
