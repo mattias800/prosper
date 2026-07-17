@@ -380,6 +380,38 @@ int main() {
     }
 
     // The live-submit registry path — exactly what agc_driver_submit_dcb drives once a device is wired.
+    // #189: production submit execution must realize an indexed draw only after a preceding DMA
+    // supplies its index buffer. Callback ordering alone is insufficient because realization owns
+    // a copied index vector; the old eager path permanently captured {0,0,0} before DMA ran.
+    {
+        uint16_t copied_indices[3] = {0, 0, 0};
+        uint16_t source_indices[3] = {0, 1, 2};
+        GpuState ordered = st;
+        ordered.index_type = 0;
+        ordered.draws.clear();
+        ordered.dispatches.clear();
+        ordered.dma_copies.clear();
+        ordered.ordered_memory_effects.clear();
+        GpuState::Draw draw;
+        draw.index_count = 3;
+        draw.indexed = true;
+        draw.index_addr = (uint64_t)(uintptr_t)copied_indices;
+        draw.command_order = 200;
+        ordered.draws.push_back(draw);
+        ordered.dma_copies.push_back({
+            (uint64_t)(uintptr_t)copied_indices, (uint64_t)(uintptr_t)source_indices,
+            sizeof(copied_indices), 0, 100, 0});
+        std::vector<uint32_t> submitted_indices;
+        set_submit_renderer([&](const std::vector<DrawItem>& items, uint32_t, uint32_t) {
+            if (!items.empty()) submitted_indices = items.front().indices;
+            return RenderedFrame{};
+        });
+        execute_ordered_and_present(ordered, W, H, 77, /*publish=*/false);
+        set_submit_renderer({});
+        CHECK(submitted_indices == std::vector<uint32_t>({0, 1, 2}),
+              "DMA-backed index buffer is realized after the ordered copy in the production path");
+    }
+
     CHECK(!have_submit_renderer(), "no live renderer registered by default (game path stays inert)");
     CHECK(!execute_and_present(st, W, H), "execute_and_present is a no-op with no renderer registered");
     std::shared_ptr<const std::vector<uint8_t>> live_storage;

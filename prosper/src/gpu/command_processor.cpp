@@ -1277,6 +1277,15 @@ void apply_deferred_effect(const Pm4Command& c) {
 }
 } // namespace
 
+void execute_ordered_memory_effect(const GpuState::MemoryEffect& effect) {
+    apply_deferred_effect(effect.cmd);
+    uint64_t addr = 0, bytes = 0;
+    effect_span(effect.cmd, &addr, &bytes);
+    // Invalidating after a guarded no-op is conservative; retaining a stale renderer-owned image
+    // after a real write would make a later consumer observe the wrong storage version.
+    if (addr && bytes) notify_guest_gpu_write(addr, bytes);
+}
+
 bool last_fold_deferred() { return g_fold_deferring; }
 bool deferred_pending()   { return !g_deferred.empty(); }
 
@@ -1510,26 +1519,45 @@ void GpuState::apply(const Pm4Command& c) {
             // what let the game free live label memory. Otherwise it goes through the pipe-drain
             // queue: completion becomes guest-visible only after the submit returns.
             if (defer_gate(c)) { defer_push(c); break; }
+            if (!dma_copies.empty()) {
+                ordered_memory_effects.emplace_back(c, command_order);
+                break;
+            }
             if (eop_write_sync()) honor_eop_write(c); else pend_enqueue(c);
             break;
         case K::WriteData:
             if (defer_gate(c)) { defer_push(c); break; }
+            if (!dma_copies.empty()) {
+                ordered_memory_effects.emplace_back(c, command_order);
+                break;
+            }
             if (eop_write_sync()) honor_write_data(c); else pend_enqueue(c);
             break;
         case K::EventWrite:
             if (defer_gate(c)) { defer_push(c); break; }
+            if (!dma_copies.empty()) {
+                ordered_memory_effects.emplace_back(c, command_order);
+                break;
+            }
             if (eop_write_sync()) honor_event_write(c); else pend_enqueue(c);
             break;
         case K::DmaData:
             // Address-backed copies are ordinary in-stream producers: retain them beside draws and
             // dispatches so the ordered executor exposes old bytes to earlier consumers and copied
             // bytes to later consumers (#189). Immediate fills keep their established completion-
-            // FIFO behavior (#312): their observed uses are label init and command-chunk zeroing.
+            // FIFO behavior until a general copy appears; its suffix joins the ordered timeline.
             if (defer_gate(c)) { defer_push(c); break; }
             if (c.dd_src > UINT32_MAX) {
                 if (!c.dd_valid) { report_invalid_dma_data(c); break; }
+                // Everything queued before the first general copy is its ordered prefix. Land that
+                // prefix now; subsequent effects are retained below and cannot overtake the copy.
+                if (dma_copies.empty()) prosper_gpu_drain_completion_writes();
                 dma_copies.push_back({c.dd_dst, c.dd_src, c.dd_bytes, c.dd_sels,
                                       command_order, pkt_addr(c)});
+                break;
+            }
+            if (!dma_copies.empty()) {
+                ordered_memory_effects.emplace_back(c, command_order);
                 break;
             }
             if (eop_write_sync()) honor_dma_data(c); else pend_enqueue(c);

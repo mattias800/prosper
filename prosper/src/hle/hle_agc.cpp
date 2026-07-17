@@ -1147,6 +1147,7 @@ static uint64_t submit_dcb_stream(const uint32_t* addr, uint32_t dw_num, const c
     agc_gpu_state().draws.clear();
     agc_gpu_state().dispatches.clear();
     agc_gpu_state().dma_copies.clear();
+    agc_gpu_state().ordered_memory_effects.clear();
     gpu::begin_gpu_timeline_submit(g_submit_count + 1);
     size_t applied = gpu::run_command_buffer(addr, walk, agc_gpu_state());
     g_submit_count++;
@@ -1240,6 +1241,7 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     agc_gpu_state().draws.clear();
     agc_gpu_state().dispatches.clear();
     agc_gpu_state().dma_copies.clear();
+    agc_gpu_state().ordered_memory_effects.clear();
     gpu::begin_gpu_timeline_submit(g_submit_count + 1);
     size_t applied = gpu::run_command_buffer(p->addr, p->dw_num, agc_gpu_state());
     g_submit_count++;

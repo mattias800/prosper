@@ -1697,7 +1697,7 @@ bool restore_gpu_replay_ds_seeds(const std::vector<GpuCaptureDsSeed>& seeds, std
 std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
     const std::vector<DrawItem>& draws, const std::vector<ComputeItem>& computes,
     const std::vector<SubmitOperation>& operations, uint32_t width, uint32_t height,
-    bool has_ordered_dma) {
+    bool has_ordered_dma, uint64_t unsupported_draw_count) {
     const char* path = std::getenv("PROSPER_GPU_CAPTURE"); if (!path || !*path) return {};
     static std::atomic<uint64_t> invocation_sequence{0};
     const uint64_t invocation = invocation_sequence.fetch_add(1);
@@ -1707,7 +1707,9 @@ std::unique_ptr<PendingGpuCapture> begin_requested_gpu_capture(
     uint64_t min_draws = 0, max_draws = std::numeric_limits<uint64_t>::max();
     if (const char* v = std::getenv("PROSPER_GPU_CAPTURE_MIN_DRAWS")) min_draws = std::strtoull(v, nullptr, 0);
     if (const char* v = std::getenv("PROSPER_GPU_CAPTURE_MAX_DRAWS")) max_draws = std::strtoull(v, nullptr, 0);
-    if (draws.size() < min_draws || draws.size() > max_draws) return {};
+    const uint64_t candidate_draw_count = has_ordered_dma && unsupported_draw_count != UINT64_MAX
+        ? unsupported_draw_count : static_cast<uint64_t>(draws.size());
+    if (candidate_draw_count < min_draws || candidate_draw_count > max_draws) return {};
     static std::atomic<uint64_t> sequence{0}; static std::atomic<bool> claimed{false};
     uint64_t current = sequence.fetch_add(1), wanted = 0;
     if (const char* at = std::getenv("PROSPER_GPU_CAPTURE_AT")) wanted = std::strtoull(at, nullptr, 0);

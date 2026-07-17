@@ -71,8 +71,9 @@ struct GpuState {
     };
     std::vector<Dispatch> dispatches;                     // current submit's DispatchDirect packets
     // Address-backed DMA_DATA memory effects execute in the same ordered backend timeline as
-    // draws/dispatches. Immediate fills remain completion-queue effects because their established
-    // uses are fence-label initialization and command-chunk zeroing (#312/#189).
+    // draws/dispatches. Immediate fills retain their established completion-queue behavior until a
+    // general copy appears; effects after that boundary join the ordered timeline and cannot overtake
+    // it (#312/#189).
     struct DmaCopy {
         uint64_t dst = 0, src = 0;
         uint32_t bytes = 0, sels = 0;
@@ -80,6 +81,41 @@ struct GpuState {
         uint64_t packet_addr = 0;
     };
     std::vector<DmaCopy> dma_copies;
+    // Once a submit retains an address-backed DMA, later modeled memory effects must remain beside
+    // it instead of entering the asynchronous completion FIFO and overtaking it. Own WRITE_DATA's
+    // inline payload because the command buffer may be recycled before ordered execution.
+    struct MemoryEffect {
+        Pm4Command cmd;
+        std::vector<uint32_t> write_data;
+
+        MemoryEffect() = default;
+        MemoryEffect(const Pm4Command& source, uint64_t order) : cmd(source) {
+            cmd.stream_order = order;
+            if (cmd.kind == Pm4Command::Kind::WriteData && cmd.wd_data && cmd.wd_num)
+                write_data.assign(cmd.wd_data, cmd.wd_data + cmd.wd_num);
+            rebind();
+        }
+        MemoryEffect(const MemoryEffect& other) : cmd(other.cmd), write_data(other.write_data) {
+            rebind();
+        }
+        MemoryEffect& operator=(const MemoryEffect& other) {
+            if (this != &other) { cmd = other.cmd; write_data = other.write_data; rebind(); }
+            return *this;
+        }
+        MemoryEffect(MemoryEffect&& other) noexcept
+            : cmd(other.cmd), write_data(std::move(other.write_data)) { rebind(); }
+        MemoryEffect& operator=(MemoryEffect&& other) noexcept {
+            if (this != &other) { cmd = other.cmd; write_data = std::move(other.write_data); rebind(); }
+            return *this;
+        }
+
+    private:
+        void rebind() {
+            if (cmd.kind == Pm4Command::Kind::WriteData)
+                cmd.wd_data = write_data.empty() ? nullptr : write_data.data();
+        }
+    };
+    std::vector<MemoryEffect> ordered_memory_effects;
     uint64_t dispatch_count = 0;                          // process-lifetime DispatchDirect count
     uint64_t command_order = 0;                           // process-lifetime applied PM4 ordinal
 
@@ -112,6 +148,9 @@ private:
 // snapshot immediately before the byte copy, then notifies renderer caches.
 void execute_ordered_dma_copy(const GpuState::DmaCopy& copy,
                               const uint8_t* authoritative_source = nullptr);
+// Execute a retained post-DMA memory effect through the same mappedness, generation, freelist, and
+// label-wakeup guards as the legacy completion path, then invalidate renderer-owned guest caches.
+void execute_ordered_memory_effect(const GpuState::MemoryEffect& effect);
 
 // Decode `dwords` dwords at `buf` and apply every op to `st`. Returns the number of packets applied.
 size_t run_command_buffer(const uint32_t* buf, size_t dwords, GpuState& st);

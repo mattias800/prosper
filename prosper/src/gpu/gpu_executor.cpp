@@ -2381,15 +2381,18 @@ bool execute_compute_dispatches(const GpuState& st, uint64_t submit_no) {
     return !items.empty() && g_compute(items);
 }
 
+static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t width,
+                                                     uint32_t height, uint64_t submit_no,
+                                                     const LiveRenderFn& render,
+                                                     const LiveComputeFn& compute);
+
 bool execute_nonrender_submit_work(const GpuState& st, uint64_t submit_no) {
     if (st.dma_copies.empty() && (!g_compute || st.dispatches.empty())) return false;
     GuestReadableSubmitScope guest_readable_scope;
-    std::vector<ComputeItem> computes = g_compute
-        ? realize_compute_dispatches(st, submit_no) : std::vector<ComputeItem>{};
-    const auto operations = plan_submit_operations(st);
-    const OrderedSubmitResult result = execute_ordered_items(
-        operations, {}, computes, st.dma_copies, {}, g_compute, 0, 0);
-    return result.compute_executed || !st.dma_copies.empty();
+    const OrderedSubmitResult result = execute_ordered_gpustate(
+        st, 0, 0, submit_no, {}, g_compute);
+    return result.compute_executed || !st.dma_copies.empty() ||
+           !st.ordered_memory_effects.empty();
 }
 
 void diagnose_compute_dispatches(const GpuState& st, uint64_t submit_no) {
@@ -2767,6 +2770,153 @@ OrderedSubmitResult execute_ordered_items(const std::vector<SubmitOperation>& op
     return execute_ordered_items(operations, draws, computes, {}, render, compute, width, height);
 }
 
+namespace {
+enum class RetainedSubmitKind : uint8_t { Draw, Dispatch, DmaCopy, MemoryEffect };
+struct RetainedSubmitOperation {
+    RetainedSubmitKind kind;
+    size_t index;
+    uint64_t command_order;
+};
+
+bool use_per_draw_policy(const GpuState& st) {
+    static const bool force_perdraw = getenv("PROSPER_PERDRAW") != nullptr;
+    static const bool force_folded = getenv("PROSPER_FOLDED") != nullptr;
+    return force_perdraw || (!force_folded && (st.draws.size() > 1 || !st.dispatches.empty()));
+}
+
+bool retained_draw_selected(const GpuState& st, size_t index) {
+    return use_per_draw_policy(st) || index + 1 == st.draws.size();
+}
+
+bool realize_retained_draw(const GpuState& st, size_t index, float scale_x, float scale_y,
+                           DrawItem& item) {
+    if (index >= st.draws.size() || !retained_draw_selected(st, index)) return false;
+    const bool per_draw = use_per_draw_policy(st);
+    const GpuState& draw_state = per_draw ? st.state_at_draw(index) : st;
+    const GpuState::Draw& draw = st.draws[index];
+    const bool log = getenv("PROSPER_GFXLOG") != nullptr || getenv("PROSPER_EXECLOG") != nullptr;
+    if (!realize_draw_item(draw_state, &draw, draw.index_count, 0x10000, log, item)) return false;
+    item.draw_index = index;
+    item.command_order = draw.command_order;
+    if ((scale_x != 1.0f || scale_y != 1.0f) && item.ps.has_viewport) {
+        item.ps.viewport_x *= scale_x; item.ps.viewport_w *= scale_x;
+        item.ps.viewport_y *= scale_y; item.ps.viewport_h *= scale_y;
+    }
+    return true;
+}
+
+bool realize_retained_compute(const GpuState& st, size_t index, uint64_t submit_no,
+                              ComputeItem& item) {
+    if (index >= st.dispatches.size()) return false;
+    // DMA-bearing submits are uncommon. A one-dispatch state keeps the mature realization path
+    // intact while ensuring it runs only after every preceding ordered producer has landed.
+    GpuState one = st.dispatches[index].state ? *st.dispatches[index].state : st;
+    one.dispatches.clear();
+    one.dispatches.push_back(st.dispatches[index]);
+    std::vector<ComputeItem> realized = realize_compute_dispatches(one, submit_no);
+    if (realized.empty()) return false;
+    item = std::move(realized.front());
+    item.dispatch_index = index;
+    return true;
+}
+} // namespace
+
+static OrderedSubmitResult execute_ordered_gpustate(const GpuState& st, uint32_t width,
+                                                     uint32_t height, uint64_t submit_no,
+                                                     const LiveRenderFn& render,
+                                                     const LiveComputeFn& compute) {
+    GuestGpuWriteSubmitScope guest_gpu_write_scope;
+    std::vector<RetainedSubmitOperation> executable;
+    executable.reserve(st.draws.size() + st.dispatches.size() + st.dma_copies.size() +
+                       st.ordered_memory_effects.size());
+    for (size_t i = 0; i < st.draws.size(); ++i)
+        if (retained_draw_selected(st, i))
+            executable.push_back({RetainedSubmitKind::Draw, i, st.draws[i].command_order});
+    for (size_t i = 0; i < st.dispatches.size(); ++i)
+        executable.push_back({RetainedSubmitKind::Dispatch, i, st.dispatches[i].command_order});
+    for (size_t i = 0; i < st.dma_copies.size(); ++i)
+        executable.push_back({RetainedSubmitKind::DmaCopy, i, st.dma_copies[i].command_order});
+    for (size_t i = 0; i < st.ordered_memory_effects.size(); ++i)
+        executable.push_back({RetainedSubmitKind::MemoryEffect, i,
+                              st.ordered_memory_effects[i].cmd.stream_order});
+    std::stable_sort(executable.begin(), executable.end(), [](const auto& a, const auto& b) {
+        return a.command_order < b.command_order;
+    });
+
+    size_t total_spans = 0;
+    bool in_draw_span = false;
+    for (const auto& operation : executable) {
+        if (render && operation.kind == RetainedSubmitKind::Draw) {
+            if (!in_draw_span) ++total_spans;
+            in_draw_span = true;
+        } else {
+            in_draw_span = false;
+        }
+    }
+
+    uint32_t full_width = present_width(), full_height = present_height();
+    const float scale_x = full_width ? static_cast<float>(width) / full_width : 1.0f;
+    const float scale_y = full_height ? static_cast<float>(height) / full_height : 1.0f;
+    OrderedSubmitResult result;
+    std::vector<DrawItem> span;
+    auto flush_span = [&](bool authoritative_readback = false) {
+        if (span.empty() || !render) return;
+        LiveRenderPhase saved = g_live_phase;
+        g_live_phase = {result.render_spans == 0, result.render_spans + 1 == total_spans,
+                        authoritative_readback};
+        RenderedFrame rendered = render(span, width, height);
+        g_live_phase = saved;
+        if (!rendered.empty()) result.frame = std::move(rendered);
+        span.clear();
+        ++result.render_spans;
+    };
+
+    for (const auto& operation : executable) {
+        switch (operation.kind) {
+            case RetainedSubmitKind::Draw: {
+                if (!render) break;
+                DrawItem item;
+                if (realize_retained_draw(st, operation.index, scale_x, scale_y, item))
+                    span.push_back(std::move(item));
+                break;
+            }
+            case RetainedSubmitKind::Dispatch: {
+                flush_span();
+                if (!compute) break;
+                ComputeItem item;
+                if (realize_retained_compute(st, operation.index, submit_no, item))
+                    result.compute_executed |= compute({std::move(item)});
+                break;
+            }
+            case RetainedSubmitKind::DmaCopy: {
+                flush_span(true);
+                const GpuState::DmaCopy& copy = st.dma_copies[operation.index];
+                std::vector<uint8_t> current_source;
+                const LiveTargetByteReadResult source_result = read_live_render_target_bytes(
+                    copy.src, copy.bytes, current_source);
+                if (source_result == LiveTargetByteReadResult::InvalidRange) {
+                    static std::atomic<int> warned{0};
+                    if (warned.fetch_add(1) < 24)
+                        std::fprintf(stderr,
+                                     "[agc] DMA_DATA live-target source range invalid: src=0x%llx bytes=%u\n",
+                                     static_cast<unsigned long long>(copy.src), copy.bytes);
+                    break;
+                }
+                execute_ordered_dma_copy(
+                    copy, source_result == LiveTargetByteReadResult::Success
+                              ? current_source.data() : nullptr);
+                break;
+            }
+            case RetainedSubmitKind::MemoryEffect:
+                flush_span();
+                execute_ordered_memory_effect(st.ordered_memory_effects[operation.index]);
+                break;
+        }
+    }
+    flush_span();
+    return result;
+}
+
 void set_submit_renderer(LiveRenderFn fn) { g_live = std::move(fn); }
 bool have_submit_renderer()               { return static_cast<bool>(g_live); }
 void set_submit_compute(LiveComputeFn fn) { g_compute = std::move(fn); }
@@ -2859,7 +3009,10 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
     uint32_t fw = present_width(), fh = present_height();
     float sx = fw ? (float)width / (float)fw : 1.0f;
     float sy = fh ? (float)height / (float)fh : 1.0f;
-    std::vector<DrawItem> draws = g_live && width && height
+    const bool has_ordered_dma = !st.dma_copies.empty();
+    // A DMA-bearing submit realizes consumers at their ordered position below. Pre-realizing here
+    // would snapshot old indices/descriptors/shader bytes before the copy updates their backing.
+    std::vector<DrawItem> draws = !has_ordered_dma && g_live && width && height
         ? realize_gpustate_draws(st, 0x10000, sx, sy) : std::vector<DrawItem>{};
     const ShaderRecompileCacheStats shader_after = timing_enabled
         ? shader_recompile_cache_stats() : ShaderRecompileCacheStats{};
@@ -2870,7 +3023,7 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
     const StageTablePhaseStats table_phases_after = timing_enabled
         ? stage_table_phase_stats() : StageTablePhaseStats{};
     const auto timing_draws_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
-    std::vector<ComputeItem> computes = g_compute
+    std::vector<ComputeItem> computes = !has_ordered_dma && g_compute
         ? realize_compute_dispatches(st, submit_no) : std::vector<ComputeItem>{};
     const auto timing_compute_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
 
@@ -2880,9 +3033,11 @@ bool execute_ordered_and_present(const GpuState& st, uint32_t width, uint32_t he
     // selected unsupported submit is claimed-and-failed, never silently skipped in favor of a later
     // match. Direct/timeline capture rejects again at the central GpuState boundary.
     auto pending_capture = begin_requested_gpu_capture(
-        draws, computes, operations, width, height, !st.dma_copies.empty());
-    OrderedSubmitResult result = execute_ordered_items(
-        operations, draws, computes, st.dma_copies, g_live, g_compute, width, height);
+        draws, computes, operations, width, height, has_ordered_dma,
+        static_cast<uint64_t>(st.draws.size()));
+    OrderedSubmitResult result = has_ordered_dma
+        ? execute_ordered_gpustate(st, width, height, submit_no, g_live, g_compute)
+        : execute_ordered_items(operations, draws, computes, g_live, g_compute, width, height);
     const auto timing_backend_done = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     const std::vector<uint8_t>& px = result.frame.bytes();
 

@@ -196,6 +196,48 @@ int main() {
               "DMA_DATA notified renderer caches about the guest-memory write");
     }
 
+    // A queued upload before an address copy is the copy's ordered prefix. The first retained copy
+    // must drain it before execution; otherwise a compute-only/non-render submit can copy stale bytes.
+    {
+        uint32_t source = 0;
+        uint32_t target = 0;
+        const uint64_t src = (uint64_t)(uintptr_t)&source;
+        const uint64_t dst = (uint64_t)(uintptr_t)&target;
+        uint32_t stream[13] = {};
+        stream[0] = PM4(6, IT_NOP, R_WRITE_DATA);
+        stream[1] = 0;
+        stream[2] = (uint32_t)src; stream[3] = (uint32_t)(src >> 32);
+        stream[4] = 1; stream[5] = 0x13579BDFu;
+        stream[6] = PM4(7, IT_NOP, R_DMA_DATA);
+        stream[7] = (uint32_t)dst; stream[8] = (uint32_t)(dst >> 32);
+        stream[9] = (uint32_t)src; stream[10] = (uint32_t)(src >> 32);
+        stream[11] = sizeof(source); stream[12] = 0;
+        GpuState st; run_cb(stream, 13, st);
+        CHECK(source == 0x13579BDFu && target == source,
+              "WRITE_DATA prefix lands before a later address DMA in a non-render submit");
+    }
+
+    // Conversely, a later immediate DMA fill must not enter the completion FIFO and overtake an
+    // earlier retained copy. Keeping the suffix in command_order leaves the destination filled.
+    {
+        uint32_t source = 0xA5C31E79u;
+        uint32_t target = 0xFFFFFFFFu;
+        const uint64_t src = (uint64_t)(uintptr_t)&source;
+        const uint64_t dst = (uint64_t)(uintptr_t)&target;
+        uint32_t stream[14] = {};
+        stream[0] = PM4(7, IT_NOP, R_DMA_DATA);
+        stream[1] = (uint32_t)dst; stream[2] = (uint32_t)(dst >> 32);
+        stream[3] = (uint32_t)src; stream[4] = (uint32_t)(src >> 32);
+        stream[5] = sizeof(source); stream[6] = 0;
+        stream[7] = PM4(7, IT_NOP, R_DMA_DATA);
+        stream[8] = (uint32_t)dst; stream[9] = (uint32_t)(dst >> 32);
+        stream[10] = 0; stream[11] = 0;
+        stream[12] = sizeof(target); stream[13] = 0;
+        GpuState st; run_cb(stream, 14, st);
+        CHECK(st.ordered_memory_effects.size() == 1 && target == 0,
+              "immediate DMA suffix executes after an earlier address copy without FIFO reversal");
+    }
+
     // A malformed/unmapped address source is not an immediate value merely because the destination
     // is valid. It must fail closed without touching the target or notifying renderer caches.
     {
