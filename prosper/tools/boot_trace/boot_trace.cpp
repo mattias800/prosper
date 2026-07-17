@@ -27,6 +27,9 @@ extern "C" int prosper_reserved_range_state(uint64_t);   // memory-HLE mapping c
 #ifdef PROSPER_VIDEO_MF
 #include "media_foundation_backend.hpp"   // native Windows AvPlayer demux + hardware decode
 #endif
+#ifdef PROSPER_VIDEO_VAAPI
+#include "vaapi_backend.hpp"              // native Linux FFmpeg demux + VA-API hardware decode
+#endif
 #ifdef PROSPER_HAVE_VULKAN
 #include "gpu/gpu_execute.hpp"
 #include "gpu/tile.hpp"                   // render-target de-swizzle (detile_surface, tiled_surface_bytes)
@@ -127,6 +130,10 @@ int main(int argc, char** argv) {
 #ifdef PROSPER_VIDEO_MF
         if (!prosper::video::install_media_foundation_backend())
             fprintf(stderr, "[avp] Media Foundation backend unavailable\n");
+#endif
+#ifdef PROSPER_VIDEO_VAAPI
+        if (!prosper::video::install_vaapi_backend())
+            fprintf(stderr, "[avp] FFmpeg/VA-API backend unavailable\n");
 #endif
 #ifdef PROSPER_AUDIO_SDL3
         prosper::install_sdl3_audio_sink();

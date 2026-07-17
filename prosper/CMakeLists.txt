@@ -834,6 +834,35 @@ if(WIN32 AND TARGET prosper_core)
   endif()
 endif()
 
+# Linux native AvPlayer backend (#841): FFmpeg provides MP4 demux/audio conversion and drives a
+# VA-API hardware decoder for video. Keep the dependency outside prosper_core; systems without the
+# development packages retain the headless core but do not advertise a native video backend.
+option(PROSPER_VIDEO_VAAPI "Build the Linux FFmpeg/VA-API AvPlayer backend" ON)
+if(UNIX AND NOT APPLE AND PROSPER_VIDEO_VAAPI AND TARGET prosper_core)
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(PROSPER_FFMPEG QUIET IMPORTED_TARGET
+                      libavformat libavcodec libavutil libswresample libswscale libva)
+  endif()
+  if(PROSPER_FFMPEG_FOUND)
+    add_library(prosper_video_vaapi STATIC
+                frontends/video_vaapi/vaapi_backend.cpp)
+    target_include_directories(prosper_video_vaapi PUBLIC frontends/video_vaapi PRIVATE src)
+    target_link_libraries(prosper_video_vaapi PUBLIC prosper_core PkgConfig::PROSPER_FFMPEG)
+
+    add_executable(test_video_vaapi frontends/video_vaapi/test_video_vaapi.cpp)
+    target_link_libraries(test_video_vaapi PRIVATE prosper_video_vaapi)
+    add_test(NAME video_vaapi COMMAND test_video_vaapi)
+
+    if(TARGET boot_trace)
+      target_link_libraries(boot_trace PRIVATE prosper_video_vaapi)
+      target_compile_definitions(boot_trace PRIVATE PROSPER_VIDEO_VAAPI=1)
+    endif()
+  else()
+    message(WARNING "FFmpeg/libva development packages not found - Linux AvPlayer video disabled")
+  endif()
+endif()
+
 # --- SDL3 frontends (optional; headless core stays dependency-free) --------------------------
 # The sceAudioOut sink (frontends/audio_sdl3) and the libScePad gamepad backend (frontends/pad_sdl3)
 # can both use SDL3. They must share ONE SDL3 build: if each fetched independently, the first fetch's
@@ -1007,4 +1036,10 @@ if(TARGET prosper-app AND TARGET prosper_video_mf)
   target_link_libraries(prosper-app PRIVATE prosper_video_mf)
   target_compile_definitions(prosper-app PRIVATE PROSPER_VIDEO_MF=1)
   message(STATUS "prosper-app: Media Foundation video enabled")
+endif()
+
+if(TARGET prosper-app AND TARGET prosper_video_vaapi)
+  target_link_libraries(prosper-app PRIVATE prosper_video_vaapi)
+  target_compile_definitions(prosper-app PRIVATE PROSPER_VIDEO_VAAPI=1)
+  message(STATUS "prosper-app: FFmpeg/VA-API video enabled")
 endif()

@@ -18,7 +18,8 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build
+          sudo apt-get install -y ninja-build pkg-config libavformat-dev libavcodec-dev \
+            libavutil-dev libswresample-dev libswscale-dev libva-dev
 
       - name: Configure
         run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE
@@ -49,7 +50,8 @@ jobs:
           sudo apt-get install -y ninja-build pkg-config libvulkan-dev \
             libwayland-dev wayland-protocols libxkbcommon-dev libx11-dev \
             libxext-dev libxcursor-dev libxi-dev libxrandr-dev libxfixes-dev \
-            libpulse-dev libasound2-dev
+            libpulse-dev libasound2-dev libavformat-dev libavcodec-dev libavutil-dev \
+            libswresample-dev libswscale-dev libva-dev
 
       - name: Configure
         run: cmake -S prosper -B prosper/build-app -G Ninja -DCMAKE_BUILD_TYPE=Debug -DPROSPER_APP=ON -DPROSPER_AUDIO_SDL3=ON -DPROSPER_PAD_SDL3=ON
