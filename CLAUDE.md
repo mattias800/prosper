@@ -258,7 +258,7 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   So drive **git** (fetch/checkout/commit/push/worktree/status) from **PowerShell**, and use **WSL
   only for cmake/build/run**. Don't mix the two on one repo (it also avoids CRLF/filemode index churn).
 - **Build/run in WSL Ubuntu-24.04 as root.** Build dir `prosper/build-linux` (Linux, primary),
-  `prosper/build-win` (Windows/MinGW, secondary). Game dump at
+  `prosper/build-windows` (Windows/MinGW, secondary). Game dump at
   `/mnt/c/Users/matti/repos/ps5ys/PPSA24651-app0` (gitignored — **never commit it**).
   ```bash
   cd /mnt/c/Users/matti/repos/ps5ys/prosper/build-linux
@@ -296,7 +296,21 @@ Messenger depth, vertex-fetch, geometry, palette, or tiling hypotheses without c
   results. Run the strongest relevant local checks and wait for every applicable required CI check. Before
   merging, synchronize with the live target branch when needed, inspect the resulting diff, run `diff --check`,
   and address every known correctness concern. An agent may merge only when the user or task explicitly
-  authorizes it.
+  authorizes it. The PR author owns verification; prefer `powershell -File prosper/tools/verify-pr.ps1 core` or,
+  for renderer changes, `powershell -File prosper/tools/verify-pr.ps1 renderer -Snapshot <name>`, and post the
+  exact-head results.
+- **Use independent review where risk justifies it.** Complex or high-risk changes—such as shader recompilers and
+  control flow, memory safety, synchronization, ABI-sensitive interfaces, persistent data, or changes whose
+  failure can silently corrupt results—require an independent code review before merge. Routine, well-bounded,
+  low-risk changes do not. The reviewer inspects the code, tests, risks, and author evidence, but does not
+  duplicate the author's builds, tests, snapshots, or CI jobs. Once the author is satisfied and the PR is
+  published, run author verification and any required review; the author posts exact-head evidence and the
+  reviewer posts approval on the corrected head. Address every blocking finding, then merge only after the merge
+  agent separately confirms author verification, reviewer approval where required, and green required CI.
+- **Unpublished desktop-app parity is not a merge requirement.** A Linux-, Windows-, or macOS-specific app
+  improvement may merge without matching work in every other frontend unless the issue explicitly promises
+  parity or a shared public contract requires it. Unaffected platforms must still retain existing behavior and
+  pass their applicable checks; track desirable parity separately rather than blocking the focused change.
 - **Evidence hierarchy and independent implementation.** Trust sources in this order: (1) prosper's
   live captures/traces of the real guest, (2) published platform contracts, firmware symbol data, and
   the guest's own disassembly, (3) agreement among independently written secondary implementations,

@@ -10,6 +10,7 @@
 // tracked values, routing the s_bfe_u64 result into V#.dword3 (desc_v3). All encodings assembled /
 // round-trip verified with llvm-mc -mcpu=gfx1030.
 #include "../src/gpu/gpu_execute.hpp"
+#include "../src/gpu/rdna2_to_spirv.hpp"
 #include <cstdio>
 #include <vector>
 
@@ -104,6 +105,190 @@ int main() {
     };
     std::vector<DynFetch> f4b = resolve_dynamic_fetch(k4b, sizeof(k4b)/sizeof(k4b[0]), seed4, 4, 8);
     CHECK(f4b.empty(), "kernel 4b reloaded SGPR blocks the seed fallback (no fabricated V#)");
+
+    // #370 review: a fully-known dynamic packed V# used to decode its unsupported DST_SEL as Unknown,
+    // then build_stage_table's legacy Unknown->Float32 fallback resurrected it as four raw dwords.
+    // resolve_dynamic_fetch must omit deliberate packed rejections while retaining identity descriptors.
+    const uint32_t k4packed[] = {
+        0xE00C2000u, 0x80020100u,   // buffer_load_format_xyzw v[1:4], v0, s[8:11], 0 idxen
+        0xBF810000u,
+    };
+    const uint32_t packed_permuted[4] = {
+        0x00020000u, 0x00040000u, 64u, (50u << 12) | 0x977u, // A/B/G/R
+    };
+    const uint32_t packed_constant[4] = {
+        0x00020000u, 0x00040000u, 64u, 50u << 12,           // constant-zero selectors
+    };
+    const uint32_t packed_scaled[4] = {
+        0x00020000u, 0x00040000u, 64u, (52u << 12) | 0xFACu, // unsupported USCALED
+    };
+    CHECK(resolve_dynamic_fetch(k4packed, sizeof(k4packed)/sizeof(k4packed[0]),
+                                packed_permuted, 4, 8).empty() &&
+          resolve_dynamic_fetch(k4packed, sizeof(k4packed)/sizeof(k4packed[0]),
+                                packed_constant, 4, 8).empty() &&
+          resolve_dynamic_fetch(k4packed, sizeof(k4packed)/sizeof(k4packed[0]),
+                                packed_scaled, 4, 8).empty(),
+          "dynamic packed permutations/constants/scaled formats cannot reach the Float32 fallback");
+    const uint32_t packed_identity[4] = {
+        0x00020000u, 0x00040000u, 64u, (50u << 12) | 0xFACu,
+    };
+    std::vector<DynFetch> f4packed = resolve_dynamic_fetch(
+        k4packed, sizeof(k4packed)/sizeof(k4packed[0]), packed_identity, 4, 8);
+    CHECK(f4packed.size() == 1 && f4packed[0].desc.format == DataFormat::Unorm2_10_10_10 &&
+          !f4packed[0].desc.forbid_unknown_fallback,
+          "dynamic identity packed V# reaches the real unpack format instead of Float32");
+
+    // #370 review: entry metadata may legitimately publish an identity packed direct V# while the
+    // shader rewrites only dword 3 before the fetch. If that live selector is unsupported, dynamic
+    // resolution omits it. Recompilation must not then fall back to the stale entry-time identity V#.
+    ShaderResourceTable packed_entry_table;
+    { ShaderResource vb{}; vb.cls = ResourceClass::VertexBuffer;
+      vb.format = DataFormat::Unorm2_10_10_10; vb.num_components = 4;
+      vb.binding = 3; vb.stride = 4; vb.sgpr_base = 20;
+      packed_entry_table.resources.push_back(vb); }
+    const uint32_t rejected_v3[] = {
+        (50u << 12) | 0x977u, // A/B/G/R permutation
+        50u << 12,            // constant-zero selectors
+        (52u << 12) | 0xFACu, // unsupported USCALED conversion
+    };
+    bool rejected_rewrites_stay_closed = true;
+    for (uint32_t v3 : rejected_v3) {
+        const uint32_t code[] = {
+            0xBE9703FFu, v3,           // s_mov_b32 s23, literal (rewrite V#.dword3 only)
+            0xE00C2000u, 0x80050100u, // buffer_load_format_xyzw v[1:4], v0, s[20:23], 0 idxen
+            0xBF810000u,
+        };
+        rejected_rewrites_stay_closed &=
+            resolve_dynamic_fetch(code, sizeof(code)/sizeof(code[0]), packed_identity, 4, 20).empty();
+        rejected_rewrites_stay_closed &=
+            recompile_valu(code, sizeof(code)/sizeof(code[0]), 1, 1, &packed_entry_table).empty();
+    }
+    CHECK(rejected_rewrites_stay_closed,
+          "rejected packed SRSRC rewrites cannot compile through the stale direct identity V#");
+
+    // A shader write remains provenance even when its value cannot be represented. This B64 move
+    // reads an untracked pair, so the scalar SSA entries for s[20:21] are erased. The later fetch must
+    // still reject instead of resurrecting the entry-time direct V# merely because the map is empty.
+    // Encoding round-tripped with llvm-mc gfx1030: s_mov_b64 s[20:21], s[50:51].
+    const uint32_t erased_srsrc[] = {
+        0xBE940432u,
+        0xE00C2000u, 0x80050100u, // buffer_load_format_xyzw v[1:4], v0, s[20:23], 0 idxen
+        0xBF810000u,
+    };
+    CHECK(recompile_valu(erased_srsrc, sizeof(erased_srsrc)/sizeof(erased_srsrc[0]),
+                         1, 1, &packed_entry_table).empty(),
+          "unrepresentable SRSRC writes cannot resurrect an entry-time direct V#");
+
+    // The same invalidation is a MAY-write property at structured joins: the untouched else edge
+    // cannot make entry metadata safe on the then edge that erased s[20:21]. Branch offsets and all
+    // instruction encodings were round-tripped with llvm-mc gfx1030.
+    const uint32_t branch_erased_srsrc[] = {
+        0xBF060000u,             // s_cmp_eq_u32 s0, s0
+        0xBF840002u,             // s_cbranch_scc0 else
+        0xBE940432u,             // then: s_mov_b64 s[20:21], s[50:51]
+        0xBF820001u,             // s_branch merge
+        0xBE840380u,             // else: s_mov_b32 s4, 0
+        0xE00C2000u, 0x80050100u,
+        0xBF810000u,
+    };
+    CHECK(recompile_valu(branch_erased_srsrc,
+                         sizeof(branch_erased_srsrc)/sizeof(branch_erased_srsrc[0]),
+                         1, 1, &packed_entry_table).empty(),
+          "structured joins preserve erased SRSRC write provenance from either arm");
+
+    // Vector instructions can also have explicit scalar-pair destinations. Both encodings overwrite
+    // s[20:21], so neither may leave the entry-time packed V# usable by the following format fetch.
+    // Round-tripped with llvm-mc gfx1030.
+    const uint32_t vopc_srsrc[] = {
+        0x7C0400F9u, 0x06069400u, // v_cmp_eq_f32_sdwa s20, v0, v0 (SDST pair)
+        0xE00C2000u, 0x80050100u,
+        0xBF810000u,
+    };
+    CHECK(recompile_valu(vopc_srsrc, sizeof(vopc_srsrc)/sizeof(vopc_srsrc[0]),
+                         1, 1, &packed_entry_table).empty(),
+          "explicit VOPC SGPR-pair writes invalidate a direct packed V#");
+    const uint32_t vop3_carry_srsrc[] = {
+        0xD5761401u, 0x040A0100u, // v_mad_u64_u32 v[1:2], s20, v0, v0, v[2:3]
+        0xE00C2000u, 0x80050100u,
+        0xBF810000u,
+    };
+    CHECK(recompile_valu(vop3_carry_srsrc,
+                         sizeof(vop3_carry_srsrc)/sizeof(vop3_carry_srsrc[0]),
+                         4, 1, &packed_entry_table).empty(),
+          "VOP3 carry-out SGPR-pair writes invalidate a direct packed V#");
+
+    // The same pair writes must invalidate an INDIRECT descriptor loaded from the SRT. The physical
+    // SGPR words no longer contain the s_load result, so retaining only its old sreg_srt tag would
+    // bind the pre-overwrite resource even though direct-entry fallback is already disabled.
+    ShaderResourceTable packed_srt_table;
+    { ShaderResource vb{}; vb.cls = ResourceClass::VertexBuffer;
+      vb.format = DataFormat::Unorm2_10_10_10; vb.num_components = 4;
+      vb.binding = 3; vb.stride = 4; vb.srt_offset = 0x40;
+      packed_srt_table.resources.push_back(vb); }
+    const uint32_t vopc_srt_srsrc[] = {
+        0xF4080504u, 0xFA000040u, // s_load_dwordx4 s[20:23], s[8:9], 0x40
+        0x7C0400F9u, 0x06069400u, // v_cmp_eq_f32_sdwa s20, v0, v0
+        0xE00C2000u, 0x80050100u,
+        0xBF810000u,
+    };
+    CHECK(recompile_valu(vopc_srt_srsrc, std::size(vopc_srt_srsrc),
+                         1, 1, &packed_srt_table).empty(),
+          "explicit VOPC SGPR-pair writes invalidate stale SRT descriptor provenance");
+    const uint32_t vop3_srt_srsrc[] = {
+        0xF4080504u, 0xFA000040u,
+        0xD5761401u, 0x040A0100u, // v_mad_u64_u32 carry-out -> s[20:21]
+        0xE00C2000u, 0x80050100u,
+        0xBF810000u,
+    };
+    CHECK(recompile_valu(vop3_srt_srsrc, std::size(vop3_srt_srsrc),
+                         4, 1, &packed_srt_table).empty(),
+          "VOP3 carry-out SGPR-pair writes invalidate stale SRT descriptor provenance");
+    const uint32_t vopc_srt_high_srsrc[] = {
+        0xF4080504u, 0xFA000040u,
+        0x7C0400F9u, 0x06069600u, // v_cmp_eq_f32_sdwa s22, v0, v0
+        0xE00C2000u, 0x80050100u,
+        0xBF810000u,
+    };
+    CHECK(recompile_valu(vopc_srt_high_srsrc, std::size(vopc_srt_high_srsrc),
+                         1, 1, &packed_srt_table).empty(),
+          "an upper-half SRSRC write invalidates the complete SRT descriptor tag");
+
+    // A loop header is compiled once but executes again after every back-edge. If any reachable
+    // body instruction overwrites the header fetch's SRSRC, the entry-time direct V# is valid only
+    // for iteration one and cannot be baked into the generated header. Reject both supported loop
+    // structurizers until a loop-varying descriptor can be represented exactly.
+    const uint32_t counted_header_srsrc[] = {
+        0xBE800380u, 0xBE820382u,                         // s0=0, s2=2
+        0xE00C2000u, 0x80050100u,                         // loop: packed fetch via s[20:23]
+        0xBF0A0200u, 0xBF840003u,                         // s0<s2; exit when false
+        0xBE940380u, 0x80008100u, 0xBF82FFF9u,            // overwrite s20; ++s0; back-edge
+        0xBF810000u,
+    };
+    CHECK(recompile_valu(counted_header_srsrc, std::size(counted_header_srsrc),
+                         1, 1, &packed_entry_table).empty(),
+          "counted-loop header cannot reuse a direct V# overwritten on its back-edge");
+    const uint32_t divergent_header_srsrc[] = {
+        0xBE800380u, 0xBE820382u, 0x7E0A0202u,            // s0=0, s2=2, uniform v5=s2
+        0xE00C2000u, 0x80050100u,                         // loop: packed fetch via s[20:23]
+        0x7D820A00u, 0xBF860003u,                         // uniform vcc=(s0<v5); vccz exit
+        0xBE940380u, 0x80008100u, 0xBF82FFF9u,            // overwrite s20; ++s0; back-edge
+        0xBF810000u,
+    };
+    CHECK(recompile_valu(divergent_header_srsrc, std::size(divergent_header_srsrc),
+                         1, 1, &packed_entry_table).empty(),
+          "divergent-loop header cannot reuse a direct V# overwritten on its back-edge");
+    const uint32_t counted_header_srt_high_srsrc[] = {
+        0xF4080504u, 0xFA000040u,                         // SRT V# -> s[20:23]
+        0xBE800380u, 0xBE820382u,                         // s0=0, s2=2
+        0xE00C2000u, 0x80050100u,                         // loop: packed fetch via s[20:23]
+        0xBF0A0200u, 0xBF840003u,                         // s0<s2; exit when false
+        0xBE960380u, 0x80008100u, 0xBF82FFF9u,            // overwrite s22; ++s0; back-edge
+        0xBF810000u,
+    };
+    CHECK(recompile_valu(counted_header_srt_high_srsrc,
+                         std::size(counted_header_srt_high_srsrc),
+                         1, 1, &packed_srt_table).empty(),
+          "loop upper-word writes invalidate the complete SRT descriptor tag at the header");
 
     // Kernel 5: descriptor-TABLE uses (#294). s[8:9] = a pointer to a host-memory table; the shader
     // s_loads an 8-dword T# (imm 0x40) + a 4-dword S#/V# (imm 0x80), consumes them via image_sample

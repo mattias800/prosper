@@ -4,6 +4,7 @@
 // base/stride/size/format and assigns provenance (srt_offset) + bindings — the contract the recompiler
 // and pipeline consume. Pure/headless; validates the decode against hand-built descriptors.
 #include "../src/gpu/agc_shader_layout.hpp"
+#include "../src/gpu/rdna2_to_spirv.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -15,13 +16,13 @@ static int fails = 0;
                          else       { printf("  [ok]   %s\n", m); } } while (0)
 
 // Build a 4-dword V# (buffer resource): Base48, 14-bit stride @[16:29] of word1, num_records=word2,
-// RDNA2 combined 7-bit FORMAT @[18:12] of word3 (GFX10/PS5 layout).
+// RDNA2 combined 7-bit FORMAT @[18:12] of word3 and identity DST_SEL X/Y/Z/W in [11:0].
 static void make_vsharp(uint32_t v[4], uint64_t base, uint32_t stride, uint32_t records,
                         uint32_t fmt) {
     v[0] = (uint32_t)(base & 0xffffffffu);
     v[1] = (uint32_t)((base >> 32) & 0xffffu) | ((stride & 0x3fffu) << 16);
     v[2] = records;
-    v[3] = (fmt & 0x7Fu) << 12;
+    v[3] = ((fmt & 0x7Fu) << 12) | 0xFACu;
 }
 
 // Build an 8-dword T# (Gen5 image resource): Base40 (stored >>8), 9-bit IMG_FMT @[28:20] of word1,
@@ -83,6 +84,8 @@ int main() {
         CHECK(!gen5_image_format(0, &fi) && fi.format == DataFormat::Unknown, "IMG_FMT 0 (INVALID) unmapped");
         CHECK(!gen5_image_format(9, &fi), "IMG_FMT 9 (16_USCALED) unmapped -> false");
         CHECK(!gen5_image_format(44, &fi), "IMG_FMT 44 (10_10_10_2) unmapped -> false");
+        CHECK(!gen5_image_format(51, &fi) && !gen5_image_format(54, &fi) && !gen5_image_format(55, &fi),
+              "packed SNORM/UINT/SINT buffer formats remain fail-closed for image upload");
         CHECK(!gen5_image_format(157, &fi), "IMG_FMT 157 (FMASK) unmapped -> false");
         CHECK(!gen5_image_format(511, &fi), "IMG_FMT 511 out-of-table -> false");
         CHECK(image_type_to_dim(8) == 0 && image_type_to_dim(9) == 1 &&
@@ -267,6 +270,36 @@ int main() {
         CHECK(d.num_records == 64, "V# num_records decoded");
         CHECK(d.size_bytes == 64 * 16, "V# size = records*stride");
         CHECK(d.format == DataFormat::Float32 && d.num_components == 4, "fmt77 -> Float32 x4");
+
+        make_vsharp(v, 0x123456780ull, 4, 64, /*fmt*/50);
+        d = decode_buffer_descriptor(v);
+        CHECK(d.format == DataFormat::Unorm2_10_10_10 && d.num_components == 4,
+              "packed V# with identity DST_SEL decodes normally");
+        v[3] = (36u << 12) | 0x3ACu; // R11G11B10_FLOAT canonical SQ_SEL_X/Y/Z/1
+        d = decode_buffer_descriptor(v);
+        CHECK(d.format == DataFormat::Float10_11_11 && d.num_components == 3 &&
+              !d.forbid_unknown_fallback,
+              "packed float V# with canonical X/Y/Z/1 selector decodes normally");
+        v[3] = (36u << 12) | 0x977u;
+        d = decode_buffer_descriptor(v);
+        CHECK(d.format == DataFormat::Unknown && d.num_components == 0 && d.forbid_unknown_fallback,
+              "packed float V# with a component permutation stays fail-closed");
+        v[3] = (50u << 12) | 0x977u; // A/B/G/R permutation: SQ_SEL_W/Z/Y/X
+        d = decode_buffer_descriptor(v);
+        CHECK(d.format == DataFormat::Unknown && d.num_components == 0 && d.forbid_unknown_fallback,
+              "packed V# with a component permutation stays fail-closed");
+        v[3] = (36u << 12);          // all four selectors synthesize constant zero
+        d = decode_buffer_descriptor(v);
+        CHECK(d.format == DataFormat::Unknown && d.num_components == 0 && d.forbid_unknown_fallback,
+              "packed V# with constant selectors stays fail-closed");
+        v[3] = (52u << 12) | 0xFACu;
+        d = decode_buffer_descriptor(v);
+        CHECK(d.format == DataFormat::Unknown && d.num_components == 0 && d.forbid_unknown_fallback,
+              "packed 2_10_10_10 USCALED forbids the dynamic Float32 fallback");
+        v[3] = (77u << 12) | 0x977u;
+        d = decode_buffer_descriptor(v);
+        CHECK(d.format == DataFormat::Float32 && d.num_components == 4 && !d.forbid_unknown_fallback,
+              "non-packed V# selector behavior is unchanged");
     }
     {   // RDNA2 combined-format decode coverage (the four game-observed anchors + a real V# regression).
         DataFormat f; uint32_t n;
@@ -274,7 +307,21 @@ int main() {
         rdna2_buffer_format(64, &f, &n); CHECK(f == DataFormat::Float32 && n == 2, "fmt64 -> Float32 x2 (uvs)");
         rdna2_buffer_format(56, &f, &n); CHECK(f == DataFormat::Unorm8 && n == 4, "fmt56 -> Unorm8 x4 (colors)");
         rdna2_buffer_format(22, &f, &n); CHECK(f == DataFormat::Float32 && n == 1, "fmt22 -> Float32 x1");
-        // The game's real color V# dword3 == 0x38fac: FORMAT field [18:12] == 56 (dst_sel [11:0] ignored).
+        rdna2_buffer_format(36, &f, &n); CHECK(f == DataFormat::Float10_11_11 && n == 3,
+                                               "fmt36 -> packed Float10_11_11 x3");
+        rdna2_buffer_format(50, &f, &n); CHECK(f == DataFormat::Unorm2_10_10_10 && n == 4,
+                                               "fmt50 -> packed Unorm2_10_10_10 x4");
+        rdna2_buffer_format(51, &f, &n); CHECK(f == DataFormat::Snorm2_10_10_10 && n == 4,
+                                               "fmt51 -> packed Snorm2_10_10_10 x4");
+        rdna2_buffer_format(54, &f, &n); CHECK(f == DataFormat::Uint2_10_10_10 && n == 4,
+                                               "fmt54 -> packed Uint2_10_10_10 x4");
+        rdna2_buffer_format(55, &f, &n); CHECK(f == DataFormat::Sint2_10_10_10 && n == 4,
+                                               "fmt55 -> packed Sint2_10_10_10 x4");
+        rdna2_buffer_format(52, &f, &n); CHECK(f == DataFormat::Unknown && n == 0,
+                                               "fmt52 2_10_10_10_USCALED stays fail-closed");
+        rdna2_buffer_format(53, &f, &n); CHECK(f == DataFormat::Unknown && n == 0,
+                                               "fmt53 2_10_10_10_SSCALED stays fail-closed");
+        // The game's real color V# dword3 == 0x38fac: FORMAT [18:12] == 56 and identity DST_SEL == 0xFAC.
         uint32_t real_v3 = 0x38facu;
         rdna2_buffer_format((real_v3 >> 12) & 0x7Fu, &f, &n);
         CHECK(f == DataFormat::Unorm8 && n == 4, "real color V# 0x38fac -> Unorm8 x4");
@@ -427,6 +474,27 @@ int main() {
           "unknown-format user data just below the size cap is not guessed as a direct V#");
     CHECK(t3.by_sgpr_base(4) != nullptr, "constant buffers still present alongside vertex buffers");
     CHECK(t3.by_sgpr_base(99) == nullptr, "unknown sgpr_base -> null");
+
+    make_vsharp(&sgprs[20], 0xC0000000ull, 4, 90, /*fmt*/50);
+    sgprs[23] = (50u << 12) | 0x977u; // non-identity packed selector must be rejected before recompilation
+    ShaderResourceTable packed_permuted = build_shader_resources(shdr, sgprs, 32);
+    CHECK(packed_permuted.by_sgpr_base(20) == nullptr,
+          "direct packed V# permutation is omitted from the runtime resource table");
+    sgprs[23] = 50u << 12;             // constant-zero selectors are likewise unsupported
+    ShaderResourceTable packed_constant = build_shader_resources(shdr, sgprs, 32);
+    CHECK(packed_constant.by_sgpr_base(20) == nullptr,
+          "direct packed V# constants are omitted from the runtime resource table");
+    const uint32_t packed_fetch[] = {
+        0x7e000f00u, 0xe0002000u, 0x80050100u, 0xbf810000u, // format_x v1, v0, s[20:23], 0 idxen
+    };
+    CHECK(recompile_valu(packed_fetch, sizeof(packed_fetch) / 4, 1, 1, &packed_permuted).empty() &&
+          recompile_valu(packed_fetch, sizeof(packed_fetch) / 4, 1, 1, &packed_constant).empty(),
+          "non-identity packed descriptors cannot reach emitted SPIR-V");
+    make_vsharp(&sgprs[20], 0xC0000000ull, 4, 90, /*fmt*/50);
+    ShaderResourceTable packed_identity = build_shader_resources(shdr, sgprs, 32);
+    CHECK(packed_identity.by_sgpr_base(20) != nullptr &&
+          !recompile_valu(packed_fetch, sizeof(packed_fetch) / 4, 1, 1, &packed_identity).empty(),
+          "identity packed descriptor reaches the tested unpacking path");
 
     // --- Dead Cells compute direct resource: type 1 points at an inline V# in user SGPRs (#574). --
     {

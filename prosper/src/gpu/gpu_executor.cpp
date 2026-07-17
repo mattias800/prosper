@@ -1458,6 +1458,19 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                         // it zeros -> a collapsed final vertex).
                         return d;
                     };
+                    auto append_fetch = [&](DecodedBufferDescriptor d, uint32_t desc_v3,
+                                            bool from_seed = false) {
+                        // decode_buffer_descriptor deliberately rejects packed formats whose selector
+                        // or conversion semantics are unsupported. Do not let build_stage_table's
+                        // legacy Unknown->Float32 fallback resurrect that descriptor as four raw dwords.
+                        if (d.forbid_unknown_fallback) {
+                            if (trc) fprintf(stderr,
+                                "[dyntrace]   MUBUF pc=%u packed V# v3=0x%x unsupported -> unresolved\n",
+                                in.pc, desc_v3);
+                            return;
+                        }
+                        out.push_back({ in.pc, srsrc, with_off(d), desc_v3, from_seed });
+                    };
                     if (trc) fprintf(stderr, "[dyntrace] MUBUF fetch pc=%u op=0x%x SRSRC=s%d patched=%d (k=%d%d%d%d v3=0x%x) have_descr=%d off=+0x%x soff_known=%d\n",
                                      in.pc, in.opcode, srsrc, patched, k0, k1, k2, k3,
                                      k3 ? vv[3] : 0, have_descr, fetch_off, (int)soff_known);
@@ -1472,11 +1485,12 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                     // Per-fetch: record THIS fetch's live V# (the SRSRC SGPR is reloaded with a different V#
                     // per vertex attribute — position, uv, color…). Keyed by the fetch's pc so the recompiler
                     // resolves each buffer_load_format to the descriptor as loaded at that instruction.
-                    if (patched)          out.push_back({ in.pc, srsrc, with_off(decode_buffer_descriptor(vv)), vv[3] });
-                    else if (have_descr)
-                        out.push_back({ in.pc, srsrc,
-                                        with_off(decode_buffer_descriptor(descr[(size_t)srsrc].data())),
-                                        descr[(size_t)srsrc][3] });
+                    if (patched) {
+                        append_fetch(decode_buffer_descriptor(vv), vv[3]);
+                    } else if (have_descr) {
+                        append_fetch(decode_buffer_descriptor(descr[(size_t)srsrc].data()),
+                                     descr[(size_t)srsrc][3]);
+                    }
                     else if (srsrc >= (int)user_sgpr_base && srsrc + 4 <= (int)(user_sgpr_base + nsgpr) &&
                              valid_reg(srsrc + 3) && !reloaded.test((size_t)srsrc) &&
                              !reloaded.test((size_t)(srsrc + 1)) &&
@@ -1496,10 +1510,11 @@ resolve_dynamic_fetch(const uint32_t* code, size_t dwords, const uint32_t* user_
                                                  user_sgprs[srsrc - (int)user_sgpr_base + 3] };
                         DecodedBufferDescriptor d = decode_buffer_descriptor(sv);
                         // Plausibility: only emit a real-looking V# (mirrors the direct-resource guard).
-                        if (d.base > 0x10000 && d.size_bytes != 0 && d.size_bytes <= 0x10000000u) {
+                        if (d.base > 0x10000 && d.size_bytes != 0 && d.size_bytes <= 0x10000000u &&
+                            !d.forbid_unknown_fallback) {
                             if (trc) fprintf(stderr, "[dyntrace]   MUBUF pc=%u seed-V# fallback SRSRC=s%d base=0x%llx\n",
                                              in.pc, srsrc, (unsigned long long)d.base);
-                            out.push_back({ in.pc, srsrc, with_off(d), sv[3], /*from_seed=*/true });
+                            append_fetch(d, sv[3], /*from_seed=*/true);
                         }
                     }
                 }
@@ -1740,6 +1755,10 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
         // (a raw 32-bit-per-component fetch, correct for float attributes like positions).
         for (auto& kv : dyn_vb) {
             const auto& d = kv.desc;
+            // Belt-and-suspenders: resolve_dynamic_fetch filters these before emitting DynFetch, but
+            // never allow a deliberately rejected packed descriptor to reach the generic Float32
+            // fallback if another producer constructs a DynFetch in the future.
+            if (d.forbid_unknown_fallback) continue;
             // A SEED-fallback entry must not shadow a metadata-described DIRECT vertex buffer at the
             // same SGPRs (see DynFetch::from_seed): the direct resource resolves the fetch through
             // the faithful address path, which is the correct model for a single un-patched V#.

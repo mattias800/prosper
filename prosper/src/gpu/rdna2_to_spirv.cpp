@@ -368,6 +368,14 @@ struct SpirvCompute {
         uint32_t vec = id(); putv(code, Op_ExtInst, {t_v2f(), vec, glsl, Glsl_UnpackHalf2x16, dword});
         uint32_t f = id(); put(code, Op_CompositeExtract, {t_f32, f, vec, which}); return bcu(f);
     }
+    // GFX10's packed 10/11-bit vertex-float fields use binary16's five-bit exponent and a shortened
+    // mantissa, without a sign bit. Widening the complete field left by 4 (11-bit) or 5 (10-bit)
+    // produces the exact low-half binary16 encoding, including subnormals, infinity, and NaN.
+    uint32_t unpack_ufloat(uint32_t dword, uint32_t bit_off, uint32_t bits) {
+        uint32_t raw = bfe_u(dword, uconst(bit_off), uconst(bits));
+        uint32_t half = ibin(Op_ShiftLeftLogical, raw, uconst(bits == 11 ? 4u : 5u));
+        return unpack_half(half, 0);
+    }
     // Inverse of unpack_norm: pack a float VGPR (bits) into a `bits`-wide UNORM/SNORM integer field:
     // clamp to [0,1] (unsigned) or [-1,1] (signed), scale by `norm`, round-to-nearest-even, mask to width.
     uint32_t pack_norm(uint32_t fbits, uint32_t bits, bool is_signed, float norm) {
@@ -1291,6 +1299,10 @@ struct RegState {
     // descriptor provenance can still distinguish driver input from a shader overwrite, while
     // scalar ALU may read their real bits (Astro copies V#.word2 into M0 as an LDS base).
     std::unordered_map<int, uint32_t> sreg_input;
+    // SGPRs definitely written by shader instructions along at least one path to this point. This
+    // provenance is independent of `sreg`: an unrepresentable write deliberately erases its SSA
+    // value, but must still invalidate an entry-time direct descriptor stored in that register.
+    std::unordered_set<int> sreg_written;
     std::unordered_map<int, uint32_t> sreg_bool;   // SGPR (pairs) holding a saved per-lane mask (bool id)
     std::unordered_map<int, bool> sreg_bool_narrowed;  // was EXEC narrowed when this mask was saved? (restores it)
     std::unordered_map<int, uint32_t> sreg_srt;    // SGPR holding a descriptor -> its user_data/SRT byte offset
@@ -1332,6 +1344,26 @@ inline void predicate_write(SpirvCompute& b, RegState& rs, int idx, uint32_t old
 }
 inline uint32_t vreg_old(SpirvCompute& b, RegState& rs, int idx) {
     auto it = rs.vreg.find(idx); return it == rs.vreg.end() ? b.uconst(0) : it->second;
+}
+
+inline bool sreg_range_written(const RegState& rs, int base, uint32_t words) {
+    for (uint32_t word = 0; word < words; ++word)
+        if (rs.sreg_written.count(base + static_cast<int>(word))) return true;
+    return false;
+}
+
+// An SRT tag describes the complete hardware descriptor, not merely its base SGPR. Accept it only
+// while every word still carries the same provenance; any partial overwrite makes the descriptor
+// unrepresentable even when the base word itself was untouched.
+inline bool sreg_srt_range_tag(const RegState& rs, int base, uint32_t words, uint32_t& tag) {
+    auto first = rs.sreg_srt.find(base);
+    if (first == rs.sreg_srt.end()) return false;
+    tag = first->second;
+    for (uint32_t word = 1; word < words; ++word) {
+        auto it = rs.sreg_srt.find(base + static_cast<int>(word));
+        if (it == rs.sreg_srt.end() || it->second != tag) return false;
+    }
+    return true;
 }
 
 // A scalar inline integer used by a B64 mask operation is sign-extended to 64 bits.  Return the bit
@@ -2368,6 +2400,105 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
     }
     return out;
 }
+
+namespace {
+
+uint32_t scalar_write_width(const Rdna2Inst& in) {
+    switch (in.fmt) {
+        case Rdna2Format::SOP1:
+            if (in.opcode == 0x20) return 0; // s_setpc_b64 reads its decoded "dst" field.
+            switch (in.opcode) {
+                case 0x04: case 0x08: case 0x0a: case 0x1f:
+                case 0x24: case 0x25: case 0x37:
+                    return 2; // B64 data/mask writes
+                default: return 1;
+            }
+        case Rdna2Format::SOP2:
+            switch (in.opcode) {
+                case 0x0b: case 0x0f: case 0x11: case 0x13: case 0x15:
+                case 0x17: case 0x19: case 0x1b: case 0x1d: case 0x25: case 0x29:
+                    return 2; // B64 data/mask writes
+                default: return 1;
+            }
+        case Rdna2Format::SOPK: return 1;
+        case Rdna2Format::SMEM:
+            switch (in.opcode) {
+                case 0x0: case 0x8: return 1;
+                case 0x1: case 0x9: return 2;
+                case 0x2: case 0xa: return 4;
+                case 0x3: case 0xb: return 8;
+                case 0x4: case 0xc: return 16;
+                default: return 0;
+            }
+        case Rdna2Format::VOP1: return in.opcode == 0x02 ? 1u : 0u; // v_readfirstlane
+        case Rdna2Format::VOP3: return in.opcode == 0x360 ? 1u : 0u; // v_readlane
+        default: return 0;
+    }
+}
+
+// Visit every explicit scalar-register write performed by one supported instruction. Most scalar
+// instructions use `dst`, but VOPC SDWAB/e64 compares can write an SGPR mask pair through `dst`, and
+// VOP3B arithmetic writes its carry mask through the independent `sdst` field. Keeping this as the
+// single writer inventory prevents provenance/data-flow users from silently missing secondary dsts.
+template <typename Visitor>
+void for_each_scalar_write(const Rdna2Inst& in, Visitor&& visit) {
+    const uint32_t width = scalar_write_width(in);
+    if (width) visit(in.dst.value, width);
+    if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) &&
+        in.dst.kind == OperandKind::SGPR && in.dst.value <= 105)
+        visit(in.dst.value, 2);
+    if (in.fmt == Rdna2Format::VOP3 && in.sdst.kind == OperandKind::SGPR)
+        visit(in.sdst.value, 2);
+}
+
+void record_scalar_write(RegState& rs, const Rdna2Inst& in) {
+    // VOPC/VOP3 mask destinations live in sreg_bool, but they still overwrite the physical SGPR
+    // pair. Drop any scalar-data value or SRT descriptor tag left by that pair's earlier lifetime;
+    // keeping either would let a later descriptor use observe the pre-overwrite value.
+    auto invalidate_mask_pair = [&](int base) {
+        for (int word = 0; word < 2; ++word) {
+            rs.sreg.erase(base + word);
+            rs.sreg_srt.erase(base + word);
+        }
+    };
+    if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) &&
+        in.dst.kind == OperandKind::SGPR && in.dst.value <= 105)
+        invalidate_mask_pair(in.dst.value);
+    if (in.fmt == Rdna2Format::VOP3 && in.sdst.kind == OperandKind::SGPR)
+        invalidate_mask_pair(in.sdst.value);
+
+    for_each_scalar_write(in, [&](int base, uint32_t width) {
+        for (uint32_t word = 0; word < width; ++word) {
+            const int reg = base + static_cast<int>(word);
+            rs.sreg_written.insert(reg);
+            rs.sreg_input.erase(reg);
+        }
+    });
+}
+
+// Scalar registers that MAY be overwritten while a loop executes. This is deliberately separate
+// from loop_written_regs: mask-pair destinations overwrite physical SGPRs (and therefore descriptor
+// provenance) but their values live in sreg_bool rather than the scalar-data SSA domain.
+void loop_scalar_may_writes(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t hi,
+                            std::set<int>& sregs) {
+    for (const auto& in : ins) {
+        if (in.pc < lo || in.pc >= hi) continue;
+        for_each_scalar_write(in, [&](int base, uint32_t width) {
+            for (uint32_t word = 0; word < width; ++word)
+                sregs.insert(base + static_cast<int>(word));
+        });
+    }
+}
+
+void invalidate_loop_descriptor_provenance(RegState& rs, const std::set<int>& sregs) {
+    for (int reg : sregs) {
+        rs.sreg_written.insert(reg);
+        rs.sreg_input.erase(reg);
+        rs.sreg_srt.erase(reg);
+    }
+}
+
+} // namespace
 
 // Registers WRITTEN in the pc range [lo, hi): candidates for an OpPhi at the loop header. Over-
 // approximation is safe (an extra phi for a non-carried value merges equal values). Mirrors emit_alu's
@@ -3900,11 +4031,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // (or that key collides). Exact per-use provenance must win, as it does for MUBUF/MIMG.
                 res = rt->by_fetch_pc(in.pc);
                 if (res && res->cls != ResourceClass::ConstantBuffer) res = nullptr;
-                auto it = rs.sreg_srt.find(in.src[0].value);
-                if (!res && it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second);
+                uint32_t srt_tag = 0;
+                if (!res && sreg_srt_range_tag(rs, in.src[0].value, 4, srt_tag))
+                    res = rt->by_srt_offset(srt_tag);
                 // A scalar buffer load reads a CONSTANT buffer — resolve the SBASE SGPR to a constant
                 // buffer specifically (the same SGPR may also hold a vertex-buffer V# elsewhere).
-                if (!res) res = rt->by_sgpr_base_cls(in.src[0].value, ResourceClass::ConstantBuffer);
+                if (!res && !sreg_range_written(rs, in.src[0].value, 4))
+                    res = rt->by_sgpr_base_cls(in.src[0].value, ResourceClass::ConstantBuffer);
                 if (res) { binding = res->binding; cbuf_resolved = true; } }
             if (getenv("PROSPER_CBUFLOG"))
                 fprintf(stderr, "[cbuf] pc=%u s_buffer_load x%u src0=s%d off=0x%x(dw%u) dyn=%d -> binding=%u %s\n",
@@ -4042,8 +4175,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // buffer specifically (that SGPR may hold a constant-buffer V# at other points; the const-
                 // fold-resolved vertex buffer is keyed by this SRSRC SGPR). Fall back to an s_load SRT tag.
                 if (rt) {
+                    // Any write to the four-dword SRSRC range invalidates its entry-time direct V#.
+                    // Exact per-fetch and s_load provenance below may still identify the live descriptor,
+                    // but a missing/rejected dynamic result must never fall back to stale user data.
+                    const bool srsrc_rewritten = sreg_range_written(rs, in.src[1].value, 4);
                     // PER-FETCH first: a reloaded SRSRC holds a different V# per attribute, so match this
-                    // exact fetch instruction's pc; fall back to the SGPR (direct) then s_load SRT tag.
+                    // exact fetch instruction's pc; fall back to untouched SGPR user data or an s_load
+                    // SRT tag. A rewritten direct descriptor without either provenance stays unresolved.
                     // Only a VERTEX-buffer pc entry implies the vertex-index address model — a pc-keyed
                     // CONSTANT/structured buffer (a PS's per-lane table fetch, #273) keeps the faithful
                     // VADDR*stride+offset address below.
@@ -4057,28 +4195,32 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // those addresses with gl_VertexIndex reads the wrong matrix row and collapses
                     // the whole mesh, so preserve a non-v0 VADDR for untouched direct user data.
                     if (res) {
-                        const bool srsrc_rewritten = rs.sreg.find(in.src[1].value) != rs.sreg.end();
                         dyn_vfetch = res->cls == ResourceClass::VertexBuffer &&
                                      (in.src[0].value == 0 || srsrc_rewritten);
                     }
-                    if (!res) res = rt->by_sgpr_base_cls(in.src[1].value, ResourceClass::VertexBuffer);
-                    if (!res) { auto it = rs.sreg_srt.find(in.src[1].value);
-                        if (it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second); }
+                    if (!res && !srsrc_rewritten)
+                        res = rt->by_sgpr_base_cls(in.src[1].value, ResourceClass::VertexBuffer);
+                    uint32_t srt_tag = 0;
+                    if (!res && sreg_srt_range_tag(rs, in.src[1].value, 4, srt_tag))
+                        res = rt->by_srt_offset(srt_tag);
                     // DIRECT user-data V# of any class (#273 — DOLL's title post PSes format-fetch
                     // through a V# the metadata labels a CONSTANT buffer sharp at s[24:27]): the class
                     // label doesn't change the descriptor's fields. Only when the SGPR was never
-                    // REWRITTEN in-shader (no rs.sreg entry) — a reloaded register no longer holds the
-                    // seed-time sharp, and trusting it would fetch through a stale descriptor.
-                    if (!res && rs.sreg.find(in.src[1].value) == rs.sreg.end())
+                    // REWRITTEN in-shader (no rs.sreg entry in its four-dword range) — a reloaded
+                    // register no longer holds the seed-time sharp, and trusting it would fetch through
+                    // a stale descriptor.
+                    if (!res && !srsrc_rewritten)
                         res = rt->by_sgpr_base(in.src[1].value);
                 }
                 if (!res) {
                     if (getenv("PROSPER_DBG")) {   // which provenance step failed for this format load
-                        auto it = rs.sreg_srt.find(in.src[1].value);
+                        uint32_t srt_tag = 0;
+                        const bool has_srt_tag = sreg_srt_range_tag(
+                            rs, in.src[1].value, 4, srt_tag);
                         fprintf(stderr, "[mubuf-unresolved] pc=%u srsrc=s%d srt_tag=%s0x%x key_res=%s (%zu res)\n",
-                                in.pc, in.src[1].value, it != rs.sreg_srt.end() ? "" : "NONE ",
-                                it != rs.sreg_srt.end() ? it->second : 0u,
-                                it != rs.sreg_srt.end() && rt->by_srt_offset(it->second) ? "yes" : "null",
+                                in.pc, in.src[1].value, has_srt_tag ? "" : "NONE ",
+                                has_srt_tag ? srt_tag : 0u,
+                                has_srt_tag && rt->by_srt_offset(srt_tag) ? "yes" : "null",
                                 rt->resources.size());
                     }
                     ok = false; return true;
@@ -4096,9 +4238,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // Provenance order mirrors the format path: exact fetch pc, then s_load SRT tag
                 // (indirect), then user-data SGPR (direct).
                 const ShaderResource* res = rt->by_fetch_pc(in.pc);
-                if (!res) { auto it = rs.sreg_srt.find(in.src[1].value);
-                    if (it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second); }
-                if (!res) res = rt->by_sgpr_base(in.src[1].value);
+                uint32_t srt_tag = 0;
+                if (!res && sreg_srt_range_tag(rs, in.src[1].value, 4, srt_tag))
+                    res = rt->by_srt_offset(srt_tag);
+                if (!res && !sreg_range_written(rs, in.src[1].value, 4))
+                    res = rt->by_sgpr_base(in.src[1].value);
                 if (!res) { ok = false; return true; }   // unresolvable V# -> reject; NEVER default to binding 2
                 binding = res->binding;
                 stride  = res->stride;
@@ -4112,20 +4256,28 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // table — the unit-test harness). Keep the legacy single-cbuf convention: binding 2, stride 0.
             // The live graphics path can never reach here table-less: recompile_vertex/recompile_fragment
             // set allow_smem = (rt != nullptr), so MUBUF already rejected above when rt is null there.
+            const bool packed_10_11_11 = fmt == DataFormat::Float10_11_11;
+            const bool packed_2_10_10_10 =
+                fmt == DataFormat::Unorm2_10_10_10 || fmt == DataFormat::Snorm2_10_10_10 ||
+                fmt == DataFormat::Uint2_10_10_10  || fmt == DataFormat::Sint2_10_10_10;
+            const bool packed_word = packed_10_11_11 || packed_2_10_10_10;
             const uint32_t comp_bytes = data_format_bytes(fmt);
-            if (comp_bytes == 0) { ok = false; return true; }   // unknown / unsupported format
+            if (!packed_word && comp_bytes == 0) { ok = false; return true; } // unknown / unsupported
             // Per-component decode. 4-byte formats (Float32/Uint32/Sint32) are a raw dword load — no
             // conversion in our bit model. Sub-dword formats are unpacked: UNORM/SNORM normalize an
             // integer field, Float16 unpacks a packed half. num_components components pack tightly.
-            const bool packed = comp_bytes < 4;
-            bool is_snorm = (fmt == DataFormat::Snorm8 || fmt == DataFormat::Snorm16);
+            const bool packed = packed_word || comp_bytes < 4;
+            bool is_snorm = (fmt == DataFormat::Snorm8 || fmt == DataFormat::Snorm16 ||
+                             fmt == DataFormat::Snorm2_10_10_10);
             bool is_half  = (fmt == DataFormat::Float16);
             // Integer sub-dword formats deliver the raw (un-normalized) INTEGER in the VGPR — the
             // hardware's UINT/SINT format-load contract. DOLL's skinned scene VS fetches its bone
             // indices as Uint8 x4 (stride 8, paired with Unorm8 weights); rejecting them dropped
             // every scene-geometry draw (#273). Zero-/sign-extend the field; no normalization.
-            bool is_uint = (fmt == DataFormat::Uint8 || fmt == DataFormat::Uint16);
-            bool is_sint = (fmt == DataFormat::Sint8 || fmt == DataFormat::Sint16);
+            bool is_uint = (fmt == DataFormat::Uint8 || fmt == DataFormat::Uint16 ||
+                            fmt == DataFormat::Uint2_10_10_10);
+            bool is_sint = (fmt == DataFormat::Sint8 || fmt == DataFormat::Sint16 ||
+                            fmt == DataFormat::Sint2_10_10_10);
             float norm = 0.0f;
             switch (fmt) {
                 case DataFormat::Unorm8:  norm = 255.0f;   break;
@@ -4134,7 +4286,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case DataFormat::Snorm16: norm = 32767.0f; break;
                 default: break;
             }
-            if (packed && !is_half && !is_uint && !is_sint && norm == 0.0f) {
+            if (packed && !packed_word && !is_half && !is_uint && !is_sint && norm == 0.0f) {
                 if (getenv("PROSPER_DBG"))
                     fprintf(stderr, "[mubuf-badfmt] pc=%u fmt=%u comp_bytes=%u stride=%u n=%u\n",
                             in.pc, (unsigned)fmt, comp_bytes, stride, n);
@@ -4176,7 +4328,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // offset (offen). Loads only (the packed store path still rejects sub-dword ints).
                     bool soff_zero = (in.src[2].kind == OperandKind::Special && in.src[2].value == 125) ||
                                      (in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0);
-                    dyn_half = !is_store && n == 1 && comp_bytes == 2 && !offen && !dyn_vfetch &&
+                    dyn_half = !packed_word && !is_store && n == 1 && comp_bytes == 2 && !offen && !dyn_vfetch &&
                                (offset & 1u) == 0 && (!idxen || (stride & 1u) == 0) && soff_zero;
                     if (!dyn_half) {
                         if (getenv("PROSPER_DBG"))
@@ -4224,7 +4376,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             if (is_store) {
                 // Store the VDATA VGPRs (in.dst..+n-1). Integer sub-dword formats (Uint8/Sint8/...) have
                 // no packing path here -> reject rather than mis-store (loads extend them; stores don't pack).
-                if (packed && (is_uint || is_sint)) { ok = false; return true; }
+                if (packed_word || (packed && (is_uint || is_sint))) { ok = false; return true; }
                 auto vread = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
                 if (!packed) {
                     // Raw/Float32/Uint32: one dword per component.
@@ -4255,7 +4407,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
             // Integer-typed format? Its absent-component default for W/A is integer 1, not float 1.0.
             const bool fmt_is_int = (fmt == DataFormat::Uint8  || fmt == DataFormat::Uint16 || fmt == DataFormat::Uint32 ||
-                                     fmt == DataFormat::Sint8  || fmt == DataFormat::Sint16 || fmt == DataFormat::Sint32);
+                                     fmt == DataFormat::Sint8  || fmt == DataFormat::Sint16 || fmt == DataFormat::Sint32 ||
+                                     fmt == DataFormat::Uint2_10_10_10 || fmt == DataFormat::Sint2_10_10_10);
             for (uint32_t k = 0; k < n; k++) {
                 int d = in.dst.value + (int)k;
                 uint32_t old = vreg_old(b, rs, d);
@@ -4294,6 +4447,25 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 } else if (!packed) {
                     uint32_t kidx = k ? b.ibin(Op_IAdd, idx, b.uconst(k)) : idx;
                     value = b.cbuf_load(kidx, binding);                  // raw 32-bit component
+                } else if (packed_word) {
+                    // All requested components share one packed dword. GFX10 names layouts from high
+                    // field to low field, so 2_10_10_10 is logical R/G/B in bits 0/10/20 and A in 30;
+                    // 10_11_11 is R/G/B in bits 0/11/22 with widths 11/11/10.
+                    uint32_t dw = b.cbuf_load(idx, binding);
+                    uint32_t boff = packed_10_11_11 ? (k == 0 ? 0u : k == 1 ? 11u : 22u)
+                                                    : (k == 0 ? 0u : k == 1 ? 10u : k == 2 ? 20u : 30u);
+                    uint32_t bits = packed_10_11_11 ? (k < 2 ? 11u : 10u) : (k < 3 ? 10u : 2u);
+                    if (packed_10_11_11) {
+                        value = b.unpack_ufloat(dw, boff, bits);
+                    } else if (is_uint) {
+                        value = b.bfe_u(dw, b.uconst(boff), b.uconst(bits));
+                    } else if (is_sint) {
+                        value = b.bfe_s(dw, b.uconst(boff), b.uconst(bits));
+                    } else {
+                        float field_norm = is_snorm ? (bits == 2 ? 1.0f : 511.0f)
+                                                    : (bits == 2 ? 3.0f : 1023.0f);
+                        value = b.unpack_norm(dw, boff, bits, is_snorm, field_norm);
+                    }
                 } else if (dyn_half) {
                     // Runtime dword half (n==1, 16-bit element, 2-aligned address): shift the loaded
                     // dword right by (addr&2)*8 and decode the 16-bit field at bit 0.
@@ -4332,9 +4504,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             const ShaderResource* res = rt->by_fetch_pc(in.pc);
             if (!res || (res->cls != ResourceClass::Texture && res->cls != ResourceClass::StorageImage)) {
                 res = nullptr;
-                auto it = rs.sreg_srt.find(in.src[1].value);
-                if (it != rs.sreg_srt.end()) res = rt->by_srt_offset(it->second);
-                if (!res) res = rt->by_sgpr_base(in.src[1].value);
+                uint32_t srt_tag = 0;
+                if (sreg_srt_range_tag(rs, in.src[1].value, 8, srt_tag))
+                    res = rt->by_srt_offset(srt_tag);
+                if (!res && !sreg_range_written(rs, in.src[1].value, 8))
+                    res = rt->by_sgpr_base(in.src[1].value);
             }
             // Exact per-use provenance wins over table keys. A sample and store may consume the same
             // T# through a colliding offset but require different Vulkan descriptor classes.
@@ -4345,12 +4519,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             if ((!res || (res->cls != ResourceClass::Texture && res->cls != ResourceClass::StorageImage))
                 && getenv("PROSPER_DBG")) {
                 // Resolution-failure diagnostic: which provenance step failed for this image op.
-                auto it = rs.sreg_srt.find(in.src[1].value);
-                const ShaderResource* pk = it != rs.sreg_srt.end() ? rt->by_srt_offset(it->second) : nullptr;
+                uint32_t srt_tag = 0;
+                const bool has_srt_tag = sreg_srt_range_tag(rs, in.src[1].value, 8, srt_tag);
+                const ShaderResource* pk = has_srt_tag ? rt->by_srt_offset(srt_tag) : nullptr;
                 const ShaderResource* pp = rt->by_fetch_pc(in.pc);
                 fprintf(stderr, "[mimg-unresolved] pc=%u srsrc=s%d srt_tag=%s0x%x key_res=%s pc_res=%s (%zu res)\n",
-                        in.pc, in.src[1].value, it != rs.sreg_srt.end() ? "" : "NONE ",
-                        it != rs.sreg_srt.end() ? it->second : 0u,
+                        in.pc, in.src[1].value, has_srt_tag ? "" : "NONE ",
+                        has_srt_tag ? srt_tag : 0u,
                         pk ? (pk->cls == ResourceClass::Texture ? "tex" : "other-cls") : "null",
                         pp ? (pp->cls == ResourceClass::Texture ? "tex" : "other-cls") : "null",
                         rt->resources.size());
@@ -4858,34 +5033,16 @@ std::unordered_map<uint32_t, std::vector<uint32_t>> detect_pcrel_tables(
 
 namespace {
 
-uint32_t scalar_write_width(const Rdna2Inst& in) {
-    switch (in.fmt) {
-        case Rdna2Format::SOP1:
-            if (in.opcode == 0x20) return 0; // s_setpc_b64 reads its decoded "dst" field.
-            return (in.opcode == 0x04 || in.opcode == 0x1f) ? 2u : 1u;
-        case Rdna2Format::SOP2: return in.opcode == 0x29 ? 2u : 1u;
-        case Rdna2Format::SOPK: return 1;
-        case Rdna2Format::SMEM:
-            switch (in.opcode) {
-                case 0x0: case 0x8: return 1;
-                case 0x1: case 0x9: return 2;
-                case 0x2: case 0xa: return 4;
-                case 0x3: case 0xb: return 8;
-                case 0x4: case 0xc: return 16;
-                default: return 0;
-            }
-        case Rdna2Format::VOP1: return in.opcode == 0x02 ? 1u : 0u; // v_readfirstlane
-        default: return 0;
-    }
-}
-
 const Rdna2Inst* last_scalar_writer(const std::vector<Rdna2Inst>& ins, uint32_t before_pc,
                                     int reg) {
     const Rdna2Inst* result = nullptr;
     for (const auto& in : ins) {
         if (in.is_end || in.pc >= before_pc) break;
-        const uint32_t width = scalar_write_width(in);
-        if (width && reg >= in.dst.value && reg < in.dst.value + static_cast<int>(width)) result = &in;
+        bool writes_reg = false;
+        for_each_scalar_write(in, [&](int base, uint32_t width) {
+            writes_reg |= reg >= base && reg < base + static_cast<int>(width);
+        });
+        if (writes_reg) result = &in;
     }
     return result;
 }
@@ -5300,6 +5457,72 @@ bool emit_compute_cfg_state_machine(
         }
     }
 
+    // The dispatcher reloads scalar values from Function variables, so map membership cannot say
+    // whether shader code has overwritten an entry-time descriptor. Compute a forward MAY-write set
+    // for every reachable basic-block entry instead. MAY is intentional: if one reachable predecessor
+    // overwrote the descriptor, falling back to entry metadata after the join would be wrong on that
+    // path. Entry-rooted reachability excludes writes in dead blocks, while backedges participate in
+    // the fixed point and prevent stale fallback on later loop iterations.
+    std::vector<std::unordered_set<int>> scalar_writes(starts.size());
+    std::vector<std::vector<uint32_t>> successors(starts.size());
+    for (uint32_t block = 0; block < starts.size(); ++block) {
+        const uint32_t lo = starts[block];
+        const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
+        for (const auto& in : ins) {
+            if (in.pc < lo || in.pc >= hi) continue;
+            for_each_scalar_write(in, [&](int base, uint32_t width) {
+                for (uint32_t word = 0; word < width; ++word)
+                    scalar_writes[block].insert(base + static_cast<int>(word));
+            });
+        }
+
+        const Rdna2Inst* terminator = nullptr;
+        for (const auto& in : ins) {
+            if (in.pc < lo || in.pc >= hi) continue;
+            if (in.is_end || (in.fmt == Rdna2Format::SOPP && in.opcode >= 0x02 &&
+                              in.opcode <= 0x09 && in.opcode != 0x03)) {
+                terminator = &in;
+                break;
+            }
+        }
+        auto add_successor = [&](uint32_t pc) {
+            auto next = block_for_pc.find(pc);
+            if (pc <= end_pc && next != block_for_pc.end())
+                successors[block].push_back(next->second);
+        };
+        if (!terminator) {
+            add_successor(hi);
+        } else if (!terminator->is_end) {
+            add_successor(branch_target(*terminator));
+            if (terminator->opcode != 0x02)
+                add_successor(terminator->pc + terminator->len_dwords);
+        }
+    }
+    std::vector<std::unordered_set<int>> scalar_may_write_in(starts.size());
+    std::vector<bool> scalar_reachable(starts.size(), false);
+    if (!scalar_may_write_in.empty()) {
+        scalar_may_write_in.front() = initial.sreg_written;
+        scalar_reachable.front() = true;
+    }
+    bool provenance_changed = true;
+    while (provenance_changed) {
+        provenance_changed = false;
+        for (uint32_t block = 0; block < starts.size(); ++block) {
+            if (!scalar_reachable[block]) continue;
+            std::unordered_set<int> out = scalar_may_write_in[block];
+            out.insert(scalar_writes[block].begin(), scalar_writes[block].end());
+            for (uint32_t successor : successors[block]) {
+                if (!scalar_reachable[successor]) {
+                    scalar_reachable[successor] = true;
+                    provenance_changed = true;
+                }
+                const size_t before = scalar_may_write_in[successor].size();
+                scalar_may_write_in[successor].insert(out.begin(), out.end());
+                provenance_changed |= scalar_may_write_in[successor].size() != before;
+            }
+        }
+    }
+
     // Saved mask pairs and scalar-spill lane slots have their own value domains.
     std::set<int> mask_keys = static_mask_keys;
     std::set<std::pair<int, int>> lane_slots, mask_lane_slots;
@@ -5503,11 +5726,11 @@ bool emit_compute_cfg_state_machine(
         const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
         b.emit_label(labels[block]);
         RegState state = load_state();
+        state.sreg_written = scalar_may_write_in[block];
+        for (int reg : state.sreg_written) state.sreg_input.erase(reg);
         if (!direct_descriptor_sregs.empty()) {
-            std::set<int> written_vregs, written_sregs;
-            loop_written_regs(ins, 0, lo, written_vregs, written_sregs);
             for (int reg : direct_descriptor_sregs)
-                if (!written_sregs.count(reg)) state.sreg.erase(reg);
+                if (!state.sreg_written.count(reg)) state.sreg.erase(reg);
         }
         const Rdna2Inst* terminator = nullptr;
         const Rdna2Inst* mbcnt = nullptr;
@@ -5538,8 +5761,10 @@ bool emit_compute_cfg_state_machine(
                 continue;
             }
             bool ok = true;
-            if (!emit_alu(b, state, in, ok, allow_exec_update, &safe, allow_smem, rt,
-                          /*allow_wave*/false) || !ok) {
+            const bool handled = emit_alu(b, state, in, ok, allow_exec_update, &safe,
+                                          allow_smem, rt, /*allow_wave*/false);
+            if (handled && ok) record_scalar_write(state, in);
+            if (!handled || !ok) {
                 if (getenv("PROSPER_DBG"))
                     std::fprintf(stderr, "[cfg-recompile-reject] pc=%u fmt=%d op=0x%x\n",
                                  in.pc, static_cast<int>(in.fmt), in.opcode);
@@ -5918,7 +6143,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             if (dead_masks.count(in.pc)) continue;
             if (in.fmt == Rdna2Format::EXP) { if (!exp_fn(in)) return false; continue; }
             bool ok = true;
-            if (!emit_alu(b, rs, in, ok, allow_exec_update, &effective_safe, allow_smem, rt, wave_ok) || !ok) {
+            const bool handled = emit_alu(
+                b, rs, in, ok, allow_exec_update, &effective_safe, allow_smem, rt, wave_ok);
+            if (handled && ok) record_scalar_write(rs, in);
+            if (!handled || !ok) {
                 // PROSPER_DBG (gated, off by default): report the instruction that fails recompilation —
                 // the first unsupported op / unresolved resource that makes a shader return empty.
                 if (getenv("PROSPER_DBG"))
@@ -5970,10 +6198,11 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             bool side_effect_free = true;
             for (const auto& candidate : ins) {
                 if (candidate.pc <= branch.pc || candidate.pc >= target) continue;
-                const uint32_t scalar_width = scalar_write_width(candidate);
-                const bool clobbers_guard_mask = scalar_width &&
-                    candidate.dst.value < saveexec.dst.value + 2 &&
-                    saveexec.dst.value < candidate.dst.value + static_cast<int>(scalar_width);
+                bool clobbers_guard_mask = false;
+                for_each_scalar_write(candidate, [&](int base, uint32_t width) {
+                    clobbers_guard_mask |= base < saveexec.dst.value + 2 &&
+                        saveexec.dst.value < base + static_cast<int>(width);
+                });
                 if (candidate.fmt == Rdna2Format::EXP || candidate.fmt == Rdna2Format::DS ||
                     candidate.fmt == Rdna2Format::MUBUF || candidate.fmt == Rdna2Format::MTBUF ||
                     candidate.fmt == Rdna2Format::MIMG || candidate.fmt == Rdna2Format::FLAT ||
@@ -6047,6 +6276,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             const uint32_t then_scc = rs.scc, then_vcc = rs.vcc, then_exec = rs.exec;
             const bool then_narrowed = rs.exec_narrowed;
             const auto then_bool = rs.sreg_bool;
+            const auto then_written = rs.sreg_written;
             b.emit_branch(merge_label);
 
             rs = before;
@@ -6074,6 +6304,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             if (then_exec != rs.exec)
                 rs.exec = b.emit_phi_2way(b.t_bool, then_exec, then_block, rs.exec, else_block);
             rs.exec_narrowed = then_narrowed || rs.exec_narrowed;
+            rs.sreg_written.insert(then_written.begin(), then_written.end());
+            for (int reg : then_written) rs.sreg_input.erase(reg);
             if (then_bool != rs.sreg_bool) {
                 if (getenv("PROSPER_DBG"))
                     fprintf(stderr, "[recompile-reject] counted-loop prelude changes mask domain\n");
@@ -6092,9 +6324,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // value is the condition-block value (which dominates the merge), NOT the phi (defect A). SCC/VCC
         // always get a phi so any cross-iteration carry is valid SSA (defect C); they're recomputed each
         // iteration in practice, so the phi is usually dead — harmless.
-        std::set<int> cv, cs, condv, conds;
+        std::set<int> cv, cs, condv, conds, scalar_may_writes;
         loop_written_regs(ins, L.header_pc, L.backedge_pc, cv, cs);
         loop_written_regs(ins, L.header_pc, L.exit_branch_pc, condv, conds);
+        loop_scalar_may_writes(ins, L.header_pc, L.backedge_pc, scalar_may_writes);
         const uint32_t preheader = b.cur_block;
         const uint32_t hdr = b.id(), check = b.id(), body = b.id(), cont = b.id(), merge = b.id();
         b.emit_branch(hdr); b.emit_label(hdr);
@@ -6104,6 +6337,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         for (int r : cs) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, sget(r), preheader, p); rs.sreg[r] = ph; phis.push_back({r, 1, ph, p}); }
         { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.scc, preheader, p); rs.scc = ph; phis.push_back({0, 2, ph, p}); }
         { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.vcc, preheader, p); rs.vcc = ph; phis.push_back({0, 3, ph, p}); }
+        // The header executes again after the back-edge. A direct/SRT descriptor overwritten
+        // anywhere in the loop is therefore not an invariant entry descriptor at header compile
+        // time. An exact descriptor load in the header may establish fresh provenance afterward.
+        invalidate_loop_descriptor_provenance(rs, scalar_may_writes);
         b.emit_loopmerge(merge, cont); b.emit_branch(check); b.emit_label(check);
         // 3. Condition block: emit [header, exit_branch); the SCC exit becomes OpBranchConditional.
         if (!emit_range(L.header_pc, L.exit_branch_pc)) return false;
@@ -6278,9 +6515,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // spirv-val + execution kernels + the live-boot A/B gate it).
         std::function<bool(const DivLoop&)> emit_divloop = [&](const DivLoop& L) -> bool {
             const bool entry_exec_narrowed = rs.exec_narrowed;
-            std::set<int> cv, cs, condv, conds;
+            std::set<int> cv, cs, condv, conds, scalar_may_writes;
             loop_written_regs(ins, L.header_pc, L.backedge_pc, cv, cs);
             loop_written_regs(ins, L.header_pc, L.exit_branch_pc, condv, conds);
+            loop_scalar_may_writes(ins, L.header_pc, L.backedge_pc, scalar_may_writes);
             const uint32_t preheader = b.cur_block;
             const uint32_t hdr = b.id(), chk = b.id(), body = b.id(), cont = b.id(), merge = b.id();
             b.emit_branch(hdr); b.emit_label(hdr);
@@ -6295,6 +6533,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             for (auto& kv : rs.sreg_bool) mask_keys.push_back(kv.first);
             std::sort(mask_keys.begin(), mask_keys.end());     // deterministic emission order
             for (int k : mask_keys) { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.sreg_bool[k], preheader, p); rs.sreg_bool[k] = ph; phis.push_back({k, 5, ph, p}); }
+            invalidate_loop_descriptor_provenance(rs, scalar_may_writes);
             b.emit_loopmerge(merge, cont); b.emit_branch(chk); b.emit_label(chk);
             // An EXEC-governed loop predicates vector writes. A VCC-governed loop branches on this
             // invocation's VCC bit but does not itself change EXEC, matching the hardware loop body.
@@ -6439,6 +6678,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     uint32_t then_scc = rs.scc, then_vcc = rs.vcc, then_exec = rs.exec;
                     const bool then_narrowed = rs.exec_narrowed;
                     const std::unordered_map<int,uint32_t> then_bool = rs.sreg_bool;
+                    const auto then_written = rs.sreg_written;
                     b.emit_branch(mergeL);
                     rs = pre;                               // else-arm starts from the pre-branch state
                     b.emit_label(elseL);
@@ -6453,6 +6693,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     if (then_vcc != rs.vcc) rs.vcc = b.emit_phi_2way(b.t_bool, then_vcc, thenEnd, rs.vcc, elseEnd);
                     if (then_exec != rs.exec) rs.exec = b.emit_phi_2way(b.t_bool, then_exec, thenEnd, rs.exec, elseEnd);
                     rs.exec_narrowed = then_narrowed || rs.exec_narrowed;
+                    rs.sreg_written.insert(then_written.begin(), then_written.end());
+                    for (int reg : then_written) rs.sreg_input.erase(reg);
                     // Merge the UNION of mask keys. A mask created in only one arm is false in the
                     // other arm; leaving that arm-local SSA id live after the merge is invalid SPIR-V.
                     std::set<int> bool_keys;
@@ -6605,9 +6847,11 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
         cov.total++;
         if (in.fmt == Rdna2Format::EXP) { cov.exports++; continue; }   // handled by the stage recompilers
         bool ok = true;
-        bool handled = cf_reconstructed(in)
-                     || (emit_alu(b, rs, in, ok, /*allow_exec_update*/true, &safe_branches, /*allow_smem*/true,
-                                  /*rt*/nullptr, /*allow_wave*/true) && ok);
+        const bool emitted = emit_alu(
+            b, rs, in, ok, /*allow_exec_update*/true, &safe_branches,
+            /*allow_smem*/true, /*rt*/nullptr, /*allow_wave*/true);
+        if (emitted && ok) record_scalar_write(rs, in);
+        bool handled = cf_reconstructed(in) || (emitted && ok);
         // Shapes the recompiler handles only in context (a resource table for MIMG sample/load/LOD/store
         // and buffer_load/store_format; a fragment stage for VINTRP). This table-less compute-shell pass
         // rejects them, so count them apart from truly-unsupported (cross-lane, etc.). Instruction-aware
