@@ -29,7 +29,7 @@ window of normal composited screenshots, requires multiple frames to meet `min_c
 require visible pixel changes. Its pass/fail contract uses SSIM and content coverage to catch major
 collapse without rejecting subtle pixel improvements.
 """
-import sys, os, json, time, hashlib, math, struct, subprocess, tempfile, shutil, signal
+import sys, os, json, time, hashlib, math, struct, subprocess, tempfile, shutil, signal, ctypes
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROSPER_ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
@@ -37,6 +37,53 @@ MANIFEST = os.path.join(HERE, "snapshots.json")
 FAIL_DIR = os.path.join(HERE, "failures")
 REVIEW_DIR = os.path.join(HERE, "review")
 GAME_ROOT = os.environ.get("PROSPER_GAME_ROOT", "/mnt/c/Users/matti/repos/ps5ys")
+
+_PR_SET_PDEATHSIG = 1
+_LIBC = ctypes.CDLL(None, use_errno=True) if sys.platform.startswith("linux") else None
+
+
+def _snapshot_child_setup(parent_pid):
+    """Create an isolated process group and die if the snapshot harness disappears."""
+    os.setsid()
+    if _LIBC.prctl(_PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    # The parent can die between fork() and prctl(). Once PR_SET_PDEATHSIG is
+    # installed, this check closes that race without opening a new one.
+    if os.getppid() != parent_pid:
+        os.kill(os.getpid(), signal.SIGKILL)
+
+
+def _spawn_snapshot_process(command, env, logf):
+    kwargs = {
+        "env": env,
+        "stdout": logf,
+        "stderr": subprocess.STDOUT,
+    }
+    if sys.platform.startswith("linux"):
+        parent_pid = os.getpid()
+        kwargs["preexec_fn"] = lambda: _snapshot_child_setup(parent_pid)
+    else:
+        kwargs["start_new_session"] = True
+    return subprocess.Popen(command, **kwargs)
+
+
+def _stop_snapshot_process(proc):
+    if proc is None:
+        return
+    try:
+        if hasattr(os, "killpg"):
+            # setsid() makes the child's PID its process-group ID. Address the
+            # group directly so descendants are killed even if the leader exited.
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            proc.kill()
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def boot_trace_path():
@@ -495,8 +542,7 @@ def capture(entry, run_log=None):
     failed = False
     try:
         logf = open(run_log, "wb") if run_log else subprocess.DEVNULL
-        proc = subprocess.Popen([bt_run, dump], env=env, stdout=logf, stderr=subprocess.STDOUT,
-                                preexec_fn=os.setsid)
+        proc = _spawn_snapshot_process([bt_run, dump], env, logf)
         deadline = time.time() + timeout
         settle = int(entry.get("settle", 0))
         if settle > 0:
@@ -550,11 +596,7 @@ def capture(entry, run_log=None):
         failed = True
         raise
     finally:
-        try:
-            if proc is not None:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except Exception:
-            pass
+        _stop_snapshot_process(proc)
         if run_log and logf is not None:
             logf.close()
         if failed:
@@ -598,8 +640,7 @@ def capture_content(entry, run_log=None):
             "--timeout", str(runner_timeout), "--require-composited-frame",
         ]
         logf = open(run_log, "wb") if run_log else subprocess.DEVNULL
-        proc = subprocess.Popen(command, env=env, stdout=logf, stderr=subprocess.STDOUT,
-                                preexec_fn=os.setsid)
+        proc = _spawn_snapshot_process(command, env, logf)
         deadline = time.time() + runner_timeout + 15
         while time.time() < deadline and proc.poll() is None:
             time.sleep(1.0)
@@ -613,11 +654,7 @@ def capture_content(entry, run_log=None):
         failed = True
         raise
     finally:
-        try:
-            if proc is not None:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except Exception:
-            pass
+        _stop_snapshot_process(proc)
         if run_log and logf is not None:
             logf.close()
         if failed:
