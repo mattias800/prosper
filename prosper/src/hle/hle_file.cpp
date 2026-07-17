@@ -982,6 +982,11 @@ static int apr_cached_fd(const std::string& host) {
 // face). Commit the pages exactly like the fault handler and retry once. CONFIDENCE: HIGH (same
 // policy as the lazy-commit path in exec_image_linux.cpp). Shared by the record-based
 // sceAmprAprCommandBufferReadFile path and the direct vWU-odnS+fU read (issue #115).
+// #707: on macOS boot_trace loads inside the guest GPU-VA window [4 GiB, 64 GiB); a MAP_FIXED commit
+// onto a page of our own image silently zeroes host globals (defined in exec_image_linux.cpp; no-op
+// off macOS / outside the window).
+extern "C" int  prosper_fixed_map_hits_host_image(uint64_t addr, uint64_t len);
+extern "C" void prosper_report_host_image_clobber(uint64_t addr, uint64_t len, const char* site);
 static bool apr_write_guest_dst(uint64_t dst, void* buf, uint64_t size) {
     if (!size) return true;
     struct iovec l { buf, (size_t)size }, r { (void*)(uintptr_t)dst, (size_t)size };
@@ -989,6 +994,12 @@ static bool apr_write_guest_dst(uint64_t dst, void* buf, uint64_t size) {
     bool committed = false;
     for (uint64_t p = dst & ~0xffffull; p < dst + size; p += 0x10000) {
         unsigned char vec;
+        // #707: never lazily commit over our own loaded image (macOS layout collision) — MAP_FIXED
+        // there replaces __TEXT/__DATA with a fresh zero page and corrupts host globals.
+        if (prosper_fixed_map_hits_host_image(p, 0x10000)) {
+            prosper_report_host_image_clobber(p, 0x10000, "apr_write_guest_dst");
+            continue;
+        }
         if (prosper_mincore((void*)(uintptr_t)p, 1, &vec) != 0 &&
             prosper_reserved_range_state(p) == 1 &&
             mmap((void*)(uintptr_t)p, 0x10000, PROT_READ | PROT_WRITE,

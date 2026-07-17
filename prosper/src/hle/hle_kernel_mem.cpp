@@ -219,6 +219,13 @@ namespace {
         return hp;   // p == 0 -> PROT_NONE (no access), NOT read-write
     }
     uint64_t align_up(uint64_t v, uint64_t a) { return a ? (v + a - 1) & ~(a - 1) : v; }
+    // #707: on macOS boot_trace loads inside the guest GPU-VA window [4 GiB, 64 GiB), so a MAP_FIXED
+    // commit onto a hint that overlaps our own image silently zeroes host globals (defined in
+    // exec_image_linux.cpp; a no-op off macOS / outside the window). Refuse rather than corrupt.
+    // The `noreplace` path above already blocks clobbering *tracked* mappings, but our own image is
+    // an untracked host mapping the reservation walker can misjudge, so this is the hard backstop.
+    extern "C" int  prosper_fixed_map_hits_host_image(uint64_t addr, uint64_t len);
+    extern "C" void prosper_report_host_image_clobber(uint64_t addr, uint64_t len, const char* site);
     void* map_at(uint64_t hint, uint64_t len, int prot) {
         if (!hint) {
             void* p = mmap(nullptr, len, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -231,6 +238,10 @@ namespace {
         void* p = prosper_mmap_noreplace((void*)hint, len, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (p != MAP_FAILED) return p;
         if (range_is_free_reservation(hint, len)) {
+            if (prosper_fixed_map_hits_host_image(hint, len)) {
+                prosper_report_host_image_clobber(hint, len, "map_at");
+                return nullptr;
+            }
             p = mmap((void*)hint, len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
             return p == MAP_FAILED ? nullptr : p;
         }
@@ -305,6 +316,10 @@ namespace {
                 void* p = prosper_mmap_noreplace((void*)hint, len, prot, MAP_SHARED, fd, (off_t)phys);
                 if (p != MAP_FAILED) return p;
                 if (range_is_free_reservation(hint, len)) {
+                    if (prosper_fixed_map_hits_host_image(hint, len)) {
+                        prosper_report_host_image_clobber(hint, len, "map_phys_at");
+                        return nullptr;
+                    }
                     p = mmap((void*)hint, len, prot, MAP_SHARED | MAP_FIXED, fd, (off_t)phys);
                     if (p != MAP_FAILED) return p;
                 } else {

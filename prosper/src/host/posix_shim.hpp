@@ -77,6 +77,11 @@ static inline int prosper_mincore(const void* addr, size_t len, unsigned char* v
     return mincore(const_cast<void*>(addr), len, reinterpret_cast<char*>(vec));
 }
 
+// #707: on macOS boot_trace loads inside the guest GPU-VA window [4 GiB, 64 GiB); a write whose
+// destination overlaps our own image must be refused (defined in exec_image_linux.cpp).
+extern "C" int  prosper_fixed_map_hits_host_image(uint64_t addr, uint64_t len);
+extern "C" void prosper_report_host_image_clobber(uint64_t addr, uint64_t len, const char* site);
+
 // ---- fault-safe same-process memory copy (Linux: process_vm_readv/writev) ----------------------
 // The HLE uses these as an EFAULT-safe memcpy against possibly-unmapped guest addresses (pid is
 // always getpid()). mach_vm_read_overwrite/mach_vm_write give the same guarantee on Darwin. The
@@ -87,6 +92,13 @@ static inline ssize_t process_vm_readv(pid_t /*pid: self*/,
                                        const struct iovec* remote, unsigned long riovcnt,
                                        unsigned long /*flags*/) {
     if (liovcnt != 1 || riovcnt != 1 || local->iov_len != remote->iov_len) { errno = EINVAL; return -1; }
+    // #707 probe: mach_vm_read_overwrite WRITES to `local` honoring max_protection. If a caller passes
+    // a host destination that overlaps our own image (e.g. a __DATA staging buffer that overflows into
+    // adjacent globals), this is the corruptor. LOG (with caller backtrace) but don't refuse yet —
+    // readv destinations can legitimately be host buffers.
+    if (prosper_fixed_map_hits_host_image((uint64_t)(uintptr_t)local->iov_base, (uint64_t)local->iov_len))
+        prosper_report_host_image_clobber((uint64_t)(uintptr_t)local->iov_base,
+                                          (uint64_t)local->iov_len, "process_vm_readv");
     mach_vm_size_t got = 0;
     kern_return_t kr = mach_vm_read_overwrite(mach_task_self(),
                                               (mach_vm_address_t)remote->iov_base,
@@ -100,6 +112,17 @@ static inline ssize_t process_vm_writev(pid_t /*pid: self*/,
                                         const struct iovec* remote, unsigned long riovcnt,
                                         unsigned long /*flags*/) {
     if (liovcnt != 1 || riovcnt != 1 || local->iov_len != remote->iov_len) { errno = EINVAL; return -1; }
+    // #707: mach_vm_write goes THROUGH the VM system — it writes per the region's max_protection and
+    // ignores the current mprotect, so it never faults and can silently overwrite a read-only page.
+    // On macOS boot_trace loads inside the guest GPU-VA window, so a `remote` (guest dst) that aliases
+    // our own __TEXT/__DATA corrupts host globals (e.g. g_eq_mx's pthread sig -> EINVAL crash). This is
+    // the choke point every EFAULT-safe guest-memory write funnels through. Writing guest data into
+    // prosper's own image is never legitimate — refuse it. No-op on Linux (image is outside the window).
+    if (prosper_fixed_map_hits_host_image((uint64_t)(uintptr_t)remote->iov_base, (uint64_t)remote->iov_len)) {
+        prosper_report_host_image_clobber((uint64_t)(uintptr_t)remote->iov_base,
+                                          (uint64_t)remote->iov_len, "process_vm_writev");
+        errno = EFAULT; return -1;
+    }
     kern_return_t kr = mach_vm_write(mach_task_self(),
                                      (mach_vm_address_t)remote->iov_base,
                                      (vm_offset_t)local->iov_base,

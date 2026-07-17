@@ -11,6 +11,9 @@
 #include <sys/mman.h>
 #ifdef __APPLE__
 #include <dlfcn.h>
+#include <execinfo.h>
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
 #endif
 #include <signal.h>
 #include <setjmp.h>
@@ -52,6 +55,70 @@ struct f_owner_ex { int type; pid_t pid; };
 #define F_SETOWN_EX -1001
 #endif
 #endif
+
+// ---------------------------------------------------------------------------------------------
+// #707 — host-image collision guard.
+// On macOS, x86-64 Mach-O executables load at 0x100000000 (4 GiB) — exactly GPU_VA_LO, the base of
+// prosper's guest GPU-VA window [4 GiB, 64 GiB). So boot_trace's own __TEXT/__DATA/__LINKEDIT sit
+// INSIDE the guest window. A guest-memory MAP_FIXED (or the fault-handler's lazy backing) that lands
+// on those pages REPLACES the mapping with fresh zero pages — silently (mmap doesn't fault, so no
+// page-guard/watchpoint ever sees it), zeroing host globals such as g_eq_mx's pthread `__sig`
+// (-> pthread_mutex_lock EINVAL -> std::mutex::lock throws -> terminate in vblank_pump). Latent on
+// Linux, where the executable loads below 4 GiB, outside the window, so the same store never targets
+// our image. We compute the running executable's mapped span once at startup (signal-safe read
+// thereafter) and refuse any guest MAP_FIXED that would clobber it.
+namespace {
+    struct HostImageRange {
+        uint64_t lo = 0, hi = 0;
+        HostImageRange() {
+#ifdef __APPLE__
+            const struct mach_header_64* mh = (const struct mach_header_64*)_dyld_get_image_header(0);
+            if (!mh) return;
+            intptr_t slide = _dyld_get_image_vmaddr_slide(0);
+            uint64_t l = UINT64_MAX, h = 0;
+            const uint8_t* p = (const uint8_t*)(mh + 1);
+            for (uint32_t i = 0; i < mh->ncmds; i++) {
+                const struct load_command* lc = (const struct load_command*)p;
+                if (lc->cmd == LC_SEGMENT_64) {
+                    const struct segment_command_64* sg = (const struct segment_command_64*)lc;
+                    if (strcmp(sg->segname, "__PAGEZERO") != 0 && sg->vmsize) {
+                        uint64_t b = sg->vmaddr + (uint64_t)slide, e = b + sg->vmsize;
+                        if (b < l) l = b;
+                        if (e > h) h = e;
+                    }
+                }
+                p += lc->cmdsize;
+            }
+            if (l < h) { lo = l; hi = h; }
+            fprintf(stderr, "[#707] host image range [0x%llx,0x%llx) (GPU-VA window is [0x100000000,0x1000000000))\n",
+                    (unsigned long long)lo, (unsigned long long)hi);
+#endif
+        }
+    };
+    // Global static: constructed at program startup (single-threaded, before any guest mapping),
+    // so the fault handler and the memory HLE only ever READ lo/hi — async-signal-safe.
+    const HostImageRange g_host_image;
+}
+// Signal-safe: does [addr, addr+len) intersect the running executable's own mapped image?
+extern "C" int prosper_fixed_map_hits_host_image(uint64_t addr, uint64_t len) {
+    if (g_host_image.hi <= g_host_image.lo || !len) return 0;
+    uint64_t a0 = addr, a1 = addr + len;
+    return (a0 < g_host_image.hi && a1 > g_host_image.lo) ? 1 : 0;
+}
+// Non-signal context only (guest-memory HLE): log the offending call site + a backtrace so the
+// exact caller that tried to clobber our image is named, then the caller refuses the mapping.
+extern "C" void prosper_report_host_image_clobber(uint64_t addr, uint64_t len, const char* site) {
+    fprintf(stderr,
+            "[#707] write/map over host image: site=%s target=[0x%llx,0x%llx) image=[0x%llx,0x%llx)\n",
+            site ? site : "?", (unsigned long long)addr, (unsigned long long)(addr + len),
+            (unsigned long long)g_host_image.lo, (unsigned long long)g_host_image.hi);
+#ifdef __APPLE__
+    void* bt[32];
+    int n = backtrace(bt, 32);
+    backtrace_symbols_fd(bt, n, 2);
+#endif
+    fflush(stderr);
+}
 
 extern "C" int prosper_eq_pageguard_classify(uint64_t);  // #707 decoy-page guard (hle_kernel_time.cpp)
 extern "C" void prosper_eq_pageguard_record(uint64_t rip, const uint64_t* frames, int n);  // deferred symbolize
@@ -1650,8 +1717,19 @@ namespace {
         if (sig == SIGSEGV && si->si_addr && si->si_code == SEGV_MAPERR) {
             uint64_t a = (uint64_t)si->si_addr;
             uint64_t rip = (uint64_t)PROSPER_GREGS((ucontext_t*)uctx)[REG_RIP];
-            if (a >= GPU_VA_LO && a < GPU_VA_HI && a != rip) {
-                void* page = (void*)(a & ~(uint64_t)0xfff);
+            void* page = (void*)(a & ~(uint64_t)0xfff);
+            // #707: never "back" a page that is our OWN loaded image (macOS loads boot_trace inside
+            // the guest window). MAP_FIXED here would replace our __TEXT/__DATA with a fresh zero
+            // page and corrupt host globals. This is a real bug elsewhere, not an unmapped guest
+            // page — log it and let it fall through to a normal fault report.
+            if (a >= GPU_VA_LO && a < GPU_VA_HI && a != rip &&
+                prosper_fixed_map_hits_host_image((uint64_t)(uintptr_t)page, 0x1000)) {
+                char b[160];
+                int n = snprintf(b, sizeof b,
+                                 "[#707] refused GPU-VA lazy-back over host image page=0x%llx rip=0x%llx\n",
+                                 (unsigned long long)(uint64_t)(uintptr_t)page, (unsigned long long)rip);
+                syscall(SYS_write, 2, b, (size_t)n);
+            } else if (a >= GPU_VA_LO && a < GPU_VA_HI && a != rip) {
                 bool ok = mmap(page, 0x1000, PROT_READ | PROT_WRITE,
                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == page;
                 if (g_faultlog) {

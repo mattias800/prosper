@@ -9,6 +9,10 @@
 #include <sys/syscall.h>
 #include <sys/uio.h>   // process_vm_readv (slot-echo scan, issue #180)
 #include <sys/mman.h>  // mprotect (the #707 decoy page guard, PR #753)
+#ifdef __APPLE__
+#include <mach/mach.h>       // #707: mach_vm_region probe — is the zeroing a store or a remap?
+#include <mach/mach_vm.h>
+#endif
 #endif
 #include <cstdint>
 #include <cstdlib>
@@ -529,6 +533,26 @@ namespace {
     // Linux build watches the stable __kind window instead — the diagnostic compiles and runs
     // everywhere, but its target platform is macOS.
     std::atomic<bool> g_eq_sigwatch_started{false};
+#ifdef __APPLE__
+    // #707: describe the mach VM region covering `addr` — base/size/prot/user_tag/share_mode. If the
+    // corruptor REPLACES the mapping (mmap/vm_allocate MAP_FIXED), the region at det changes (new base
+    // or tag); if it STORES in place, the region is unchanged and only the bytes differ. This settles
+    // store-vs-remap without catching the writer.
+    static void eq_region_desc(uint64_t addr, char* out, size_t cap) {
+        mach_vm_address_t ra = addr; mach_vm_size_t rs = 0;
+        vm_region_basic_info_data_64_t info{}; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        kern_return_t kr = mach_vm_region(mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64,
+                                          (vm_region_info_t)&info, &cnt, &obj);
+        if (kr != KERN_SUCCESS) { snprintf(out, cap, "region: kr=%d (unmapped?)", (int)kr); return; }
+        snprintf(out, cap, "region base=0x%llx size=0x%llx prot=%c%c%c shared=%d resv=%d",
+                 (unsigned long long)ra, (unsigned long long)rs,
+                 (info.protection & VM_PROT_READ) ? 'r' : '-',
+                 (info.protection & VM_PROT_WRITE) ? 'w' : '-',
+                 (info.protection & VM_PROT_EXECUTE) ? 'x' : '-',
+                 (int)info.shared, (int)info.reserved);
+    }
+#endif
     void eq_sigwatch_thread(bool repair, bool taint) {
 #ifdef __APPLE__
         constexpr int kOff = 0, kLen = 16;    // pthread_mutex __sig + head: init-only on Darwin
@@ -568,6 +592,11 @@ namespace {
         fprintf(stderr, "[eq-sigwatch] armed repair=%d taint=%d: decoy=%p eq_mx=%p det=%p apr=%p\n",
                 repair ? 1 : 0, taint ? 1 : 0,
                 (void*)t[6].p, (void*)t[7].p, (void*)t[8].p, (void*)t[9].p);
+#ifdef __APPLE__
+        { char rd[160]; eq_region_desc((uint64_t)(uintptr_t)&g_det_clock, rd, sizeof rd);
+          fprintf(stderr, "[eq-sigwatch] BASELINE det %s\n", rd); }
+        bool region_probed = false;
+#endif
         auto ms = [] { struct timespec ts{}; clock_gettime(CLOCK_MONOTONIC, &ts);
                        return (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)ts.tv_nsec / 1000000ull; };
         uint64_t hits = 0;
@@ -580,6 +609,14 @@ namespace {
                     fprintf(stderr, "[eq-sigwatch] HIT %s off=%d 0x%02x->0x%02x addr=%p t=%llums%s\n",
                             x.name, x.off + i, x.base[i], v, (void*)&x.p[x.off + i], ms(),
                             repair ? " (repaired)" : "");
+#ifdef __APPLE__
+                    if (!region_probed) {
+                        region_probed = true;
+                        char rd[160]; eq_region_desc((uint64_t)(uintptr_t)x.p, rd, sizeof rd);
+                        fprintf(stderr, "[eq-sigwatch] AT-HIT %s %s  (store => region unchanged; remap => new base/prot)\n",
+                                x.name, rd);
+                    }
+#endif
                     if (repair) x.p[x.off + i] = x.base[i];
                     else        x.base[i] = v;   // track the new state so further deltas keep reporting
                     if (++hits >= 512) { fprintf(stderr, "[eq-sigwatch] report cap reached\n"); return; }
@@ -648,6 +685,41 @@ namespace {
         if (eq_in_cluster(d, n)) eq_report_cluster("memmove", d, n);
         return memmove(d, s, n);
     }
+    // #707: catch ANY mmap/munmap that lands on our OWN loaded image — the macOS guest-window
+    // collision (image at [4 GiB, ~4 GiB+11 MB] is inside [GPU_VA_LO, GPU_VA_HI)). A MAP_FIXED over
+    // our __TEXT/__DATA replaces the mapping with fresh zero pages and corrupts host globals with no
+    // page fault, so page-guards/watchpoints never see it. Always on (an overlap never happens
+    // legitimately), non-signal context. Call the real syscall directly: mmap/munmap are not
+    // compiler builtins, so calling mmap() here would re-enter this interposer (recursion).
+    extern "C" int prosper_fixed_map_hits_host_image(uint64_t addr, uint64_t len);
+    void eq_report_img(const char* fn, const void* target, size_t n, int flags) {
+        static std::atomic<int> seen{0};
+        int idx = seen.fetch_add(1); if (idx > 24) return;
+        struct timespec ts{}; clock_gettime(CLOCK_MONOTONIC, &ts);
+        unsigned long long ms = (unsigned long long)ts.tv_sec * 1000ull + ts.tv_nsec / 1000000ull;
+        void* bt[40]; int nb = backtrace(bt, 40);
+        fprintf(stderr, "[#707-img] #%d %s(%p,len=%zu,flags=0x%x) OVER HOST IMAGE t=%llums:\n",
+                idx, fn, target, n, flags, ms);
+        char** syms = backtrace_symbols(bt, nb);
+        for (int i = 0; i < nb; i++) fprintf(stderr, "[#707-img]   %s\n", syms ? syms[i] : "?");
+        free(syms); fflush(stderr);
+    }
+    extern "C" void* prosper_int_mmap(void* a, size_t n, int prot, int flags, int fd, off_t off) {
+        // RTLD_NEXT bypasses the interpose (a function-pointer call skips the rewritten binding),
+        // so this reaches libSystem's real mmap without recursing and without the 32-bit-truncating
+        // deprecated syscall().
+        static auto real = (void* (*)(void*, size_t, int, int, int, off_t))dlsym(RTLD_NEXT, "mmap");
+        void* r = real ? real(a, n, prot, flags, fd, off) : MAP_FAILED;
+        if (r != MAP_FAILED && prosper_fixed_map_hits_host_image((uint64_t)(uintptr_t)r, n))
+            eq_report_img("mmap", r, n, flags);
+        return r;
+    }
+    extern "C" int prosper_int_munmap(void* a, size_t n) {
+        static auto real = (int (*)(void*, size_t))dlsym(RTLD_NEXT, "munmap");
+        if (prosper_fixed_map_hits_host_image((uint64_t)(uintptr_t)a, n))
+            eq_report_img("munmap", a, n, 0);
+        return real ? real(a, n) : -1;
+    }
     #define PROSPER_DYLD_INTERPOSE(_repl,_orig) \
         __attribute__((used)) static struct { const void* r; const void* o; } \
         _interpose_##_orig __attribute__((section("__DATA,__interpose"))) = \
@@ -657,6 +729,8 @@ namespace {
     PROSPER_DYLD_INTERPOSE(prosper_int_memset, memset)
     PROSPER_DYLD_INTERPOSE(prosper_int_bzero, bzero)
     PROSPER_DYLD_INTERPOSE(prosper_int_memmove, memmove)
+    PROSPER_DYLD_INTERPOSE(prosper_int_mmap, mmap)
+    PROSPER_DYLD_INTERPOSE(prosper_int_munmap, munmap)
 #endif
 
     // #707 decoy-page guard arming (PR #753 round 5; no-op unless PROSPER_EQ_PAGEGUARD is set and
@@ -710,7 +784,13 @@ namespace {
     std::atomic<bool> g_eq_guard_relift{false};
     std::atomic<bool> g_eq_guard_step{false};   // det-step: TF single-step co-located writes (zero gap)
     std::atomic<bool> g_eq_guard_ballast{false}; // ballast: guard a pure never-locked page in g_eq_ballast_hi
+    std::atomic<bool> g_eq_guard_lo{false};      // lo: guard the page-aligned lo-decoy page (IN the zeroed set)
     uint64_t eq_guard_page() {
+        if (g_eq_guard_lo.load(std::memory_order_acquire))
+            // g_eq_decoy_lo0 is page-aligned and is the LOWEST address the corruptor zeroes (confirmed by
+            // SIGWATCH). The ballast page (above det) is NOT in the zeroed set, so it never faults; the lo
+            // page IS. Never-locked, so a continuous-from-boot RO guard has no co-located writer to race.
+            return (uint64_t)(uintptr_t)&g_eq_decoy_lo0 & ~4095ull;
         if (g_eq_guard_ballast.load(std::memory_order_acquire)) {
             // First full page-aligned page at/above &g_eq_ballast_hi[0] (fully inside the 11 KiB array,
             // never locked, in the corruptor's zeroed region). Closest full ballast page above det.
@@ -766,6 +846,27 @@ namespace {
         static std::atomic<bool> once{false};
         if (once.exchange(true)) return;
         std::thread(eq_pageguard_reporter).detach();
+        if (strcmp(mode, "lo") == 0) {
+            // LO mode: guard the page-aligned lo-decoy page — the LOWEST address the corruptor zeroes
+            // (SIGWATCH-confirmed) and the one the ballast page (above det) failed to cover. Never-locked
+            // page, armed once from boot, one-shot: the FIRST fault is the corruptor's store. If lo IS
+            // zeroed (SIGWATCH) while this page stays RO and NO fault fires, the store bypasses our
+            // SIGSEGV handler (Rosetta) — a decisive result either way.
+            g_eq_guard_lo.store(true, std::memory_order_release);   // before eq_guard_page()
+            void* pg = (void*)(uintptr_t)eq_guard_page();
+            // Lower the MAX protection to READ (not just current). mprotect() only sets current prot,
+            // which mach_vm_write and other VM-system writes bypass (they honor max_protection). If the
+            // corruptor respects max_prot, this BLOCKS the zeroing (SIGWATCH silent on lo) => a mach_vm
+            // family write. If lo is STILL zeroed with max=RO => a physical alias / separate mapping.
+            kern_return_t kr = mach_vm_protect(mach_task_self(), (mach_vm_address_t)(uintptr_t)pg, 4096,
+                                               TRUE /*set_maximum*/, VM_PROT_READ);
+            if (kr == KERN_SUCCESS) {
+                g_eq_pageguard_armed.store(true, std::memory_order_release);
+                fprintf(stderr, "[eq-pageguard] armed LO(max=R): page %p (lo0=%p det=%p)\n",
+                        pg, (void*)&g_eq_decoy_lo0, (void*)&g_det_clock);
+            } else fprintf(stderr, "[eq-pageguard] mach_vm_protect(%p) FAILED kr=%d\n", pg, (int)kr);
+            return;
+        }
         if (strcmp(mode, "ballast") == 0) {
             // BALLAST mode (round 9): guard a full page INSIDE g_eq_ballast_hi — never-locked mutexes in
             // the corruptor's zeroed region. No legit writer touches it, so arm once from boot and stay
