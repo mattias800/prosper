@@ -1310,8 +1310,12 @@ HLE(agc_driver_submit_acb) {  // sceAgcDriverSubmitAcb(queue, const AcbPacket*, 
     uint64_t stream = 0, count64 = 0;
     memcpy(&stream, (const void*)(uintptr_t)a1, 8);
     memcpy(&count64, (const void*)(uintptr_t)(a1 + 8), 8);
-    if (!stream || count64 == 0 || count64 > 0x400000ull || (a3 && a3 != count64) ||
-        !gpu::guest_readable(stream, sizeof(uint32_t)))
+    if (!stream || count64 == 0 || count64 > 0x400000ull || (a3 && a3 != count64))
+        return kAgcErrInvalidArg;
+    // The decoder consumes every advertised dword.  Checking only the header allowed a stream at
+    // the end of a readable page to fault as soon as decode crossed into the following guard page.
+    const uint64_t stream_bytes = count64 * sizeof(uint32_t);  // bounded above, cannot overflow
+    if (!gpu::guest_readable(stream, (size_t)stream_bytes))
         return kAgcErrInvalidArg;
     uint32_t header = 0; memcpy(&header, (const void*)(uintptr_t)stream, sizeof header);
     if ((header & 0xc0000000u) != 0xc0000000u && header != 0x80000000u)

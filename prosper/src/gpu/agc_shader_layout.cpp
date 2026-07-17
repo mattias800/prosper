@@ -196,12 +196,26 @@ DecodedImageDescriptor decode_image_descriptor(const uint32_t t[8]) {
     d.last_level = (t[3] >> 16) & 0xFu;
     d.max_mip    = (t[5] >> 4) & 0xFu;
     d.type      = (uint8_t)((t[3] >> 28) & 0xFu);                                                  // Type
-    // WORD4.DEPTH is depth-1 for 3D and layer-count-1 for array resources. On
-    // ordinary 1D/2D descriptors the same bits may carry pitch state, so do not
-    // interpret them as a layer count there.
-    const bool depth_or_array = d.type == 10 || d.type == 12 || d.type == 13 || d.type == 15;
-    d.depth      = depth_or_array ? ((t[4] & 0x1FFFu) + 1u) : 1u;
-    d.base_array = (t[4] >> 16) & 0x1FFFu;
+    // WORD4.DEPTH is depth-1 for 3D, but the LAST_ARRAY slice for array resources.  BASE_ARRAY is
+    // the first selected slice, so an array view contains last-first+1 layers (not last+1).
+    const uint32_t depth_or_last = t[4] & 0x1FFFu;
+    const bool is_array = d.type == 11 || d.type == 12 || d.type == 13 || d.type == 15;
+    if (d.type == 10) {
+        // ARRAY_PITCH bit 0 distinguishes a 3D SRV (depth relative to mip 0) from a UAV view,
+        // where BASE_ARRAY/DEPTH are the first/last selected layers.
+        const bool is_uav_view = (t[5] & 1u) != 0;
+        if (is_uav_view) {
+            d.base_array = (t[4] >> 16) & 0x1FFFu;
+            d.depth = depth_or_last >= d.base_array
+                ? depth_or_last - d.base_array + 1u : 0u;
+        } else {
+            d.depth = depth_or_last + 1u;
+        }
+    } else if (is_array) {
+        d.base_array = (t[4] >> 16) & 0x1FFFu;
+        d.depth = depth_or_last >= d.base_array
+            ? depth_or_last - d.base_array + 1u : 0u;
+    }
     d.dst_sel[0] = (uint8_t)((t[3] >> 0) & 0x7u);   // DST_SEL_X (WORD3 [2:0])
     d.dst_sel[1] = (uint8_t)((t[3] >> 3) & 0x7u);   // DST_SEL_Y ([5:3])
     d.dst_sel[2] = (uint8_t)((t[3] >> 6) & 0x7u);   // DST_SEL_Z ([8:6])
@@ -224,6 +238,13 @@ DecodedImageView image_base_level_view(const DecodedImageDescriptor& d,
     view.base = d.base;
     view.width = d.width;
     view.height = d.height;
+    // The selected array slice changes the texel origin.  Until the per-tile-mode slice stride is
+    // modeled, a nonzero BASE_ARRAY must fail closed instead of binding slice zero with the selected
+    // layer count.
+    if (d.base_array != 0 || d.depth == 0) {
+        view.supported = false;
+        return view;
+    }
     // The offset helper models only thin 2D allocations. Cube, 3D, array, and MSAA resources have
     // additional slice/tail rules. Level zero still names their allocation base, but a non-zero view
     // must be rejected until those rules are modeled; returning the base would sample the wrong mip.
@@ -495,7 +516,8 @@ ShaderResourceTable build_shader_resources(const AgcShaderHeader& shdr,
             if (tsrt == 0xFFFFFFFFu) continue;                  // out of block / EUD absent / unreadable
             const bool tex_in_eud = (uint64_t)off + 8 > num_user_sgprs;
             DecodedImageDescriptor d = decode_image_descriptor(tv);
-            if (d.base == 0 || d.width == 0 || d.height == 0 ||
+            if (d.base == 0 || d.width == 0 || d.height == 0 || d.depth == 0 ||
+                d.base_array != 0 ||
                 d.width > 16384 || d.height > 16384) continue;  // skip a garbage/degenerate T#
             // PROSPER_DUMP_TILERAW (issue #282 derivation): dump the raw guest texel bytes of a tiled
             // texture once per address, so its GPU tile swizzle can be reversed offline (coherence

@@ -150,7 +150,10 @@ int32_t font_open_instance(void*, void* source, void** out) {
     if (!rc && face(source)) **reinterpret_cast<FontFace**>(out) = *face(source);
     return rc;
 }
-int32_t font_close(void*) { return 0; }
+int32_t font_close(void* handle) {
+    delete static_cast<FontFace*>(handle);
+    return 0;
+}
 
 int32_t font_bind_renderer(void* handle, void* renderer) {
     if (auto* f = face(handle)) f->renderer = renderer;
@@ -244,6 +247,13 @@ int32_t font_create_string(const FontMemory*, TextSource*, const void*, void** o
     *out = new (std::nothrow) FontString;
     return *out ? 0 : static_cast<int32_t>(0x80540001u);
 }
+int32_t font_destroy_string(void** string) {
+    if (string) {
+        delete static_cast<FontString*>(*string);
+        *string = nullptr;
+    }
+    return 0;
+}
 uint32_t font_string_terminate(void* string) {
     auto* s = static_cast<FontString*>(string);
     return s && s->magic == kStringMagic ? s->terminate_code : 0;
@@ -300,7 +310,7 @@ void register_font_hle() {
     R("n590hj5Oe-k", (HleFn)font_create_library, "sceFontCreateLibraryWithEdition");
     R("WaSFJoRWXaI", (HleFn)font_create_renderer, "sceFontCreateRendererWithEdition");
     R("exAxkyVLt0s", (HleFn)font_destroy_handle, "sceFontDestroyRenderer");
-    R("SSCaczu2aMQ", (HleFn)font_destroy_handle, "sceFontDestroyString");
+    R("SSCaczu2aMQ", (HleFn)font_destroy_string, "sceFontDestroyString");
     R("PEjv7CVDRYs", (HleFn)font_ok, "sceFontDestroyWritingLine");
     R("cKYtVmeSTcw", (HleFn)font_open, "sceFontOpenFontSet");
     R("KXUpebrFk1U", (HleFn)font_open_memory, "sceFontOpenFontMemory");

@@ -7,6 +7,10 @@
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
+#ifdef __linux__
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 using namespace prosper;
 
@@ -47,15 +51,29 @@ int main() {
         register_builtin_hle();
         auto attr_init = Hle::lookup(nid_hash("scePthreadAttrInit"));
         auto attr_ssz  = Hle::lookup(nid_hash("scePthreadAttrSetstacksize"));
+        auto attr_stack = Hle::lookup(nid_hash("scePthreadAttrSetstack"));
+        auto attr_destroy = Hle::lookup(nid_hash("scePthreadAttrDestroy"));
         auto t_create  = Hle::lookup(nid_hash("scePthreadCreate"));
         auto t_join    = Hle::lookup(nid_hash("scePthreadJoin"));
-        CHECK(attr_init && attr_ssz && t_create && t_join, "thread HLE functions registered");
-        struct Probe { size_t sz = 0; bool found = false; };
+        CHECK(attr_init && attr_ssz && attr_stack && attr_destroy && t_create && t_join,
+              "thread HLE functions registered");
+        struct Probe {
+            size_t sz = 0;
+            bool found = false;
+            const void* expected_base = nullptr;
+            size_t expected_size = 0;
+            bool local_on_expected_stack = false;
+        };
         auto entry = +[](void* p) -> void* {
             auto* pr = (Probe*)p;
+            uint8_t local = 0;
             void* b = nullptr; size_t s = 0;
             pr->found = guest_stack_for_current_thread(&b, &s);
             pr->sz = s;
+            const uintptr_t address = (uintptr_t)&local;
+            const uintptr_t first = (uintptr_t)pr->expected_base;
+            pr->local_on_expected_stack = !pr->expected_base ||
+                (address >= first && address < first + pr->expected_size);
             return nullptr;
         };
         auto U = [](const void* p) { return (uint64_t)(uintptr_t)p; };
@@ -70,6 +88,7 @@ int main() {
         CHECK(pr.sz >= 2 * 1024 * 1024 && pr.sz < 3 * 1024 * 1024,
               "attr stacksize honored (~2 MiB, not the old fixed 8 MiB)");
         CHECK(!guest_stack_for_thread(tid, &base, &sz), "entry unregistered after the thread exited");
+        attr_destroy(U(&at), 0, 0, 0, 0, 0);
 
         // Tiny request: floored (our HLE + host libc need headroom the Sony runtime doesn't).
         void* at2 = nullptr; attr_init(U(&at2), 0, 0, 0, 0, 0);
@@ -78,6 +97,28 @@ int main() {
         CHECK(t_create(U(&tid2), U(&at2), U((void*)entry), U(&pr2), 0, 0) == 0, "create with 64 KiB attr");
         t_join(tid2, 0, 0, 0, 0, 0);
         CHECK(pr2.found && pr2.sz >= 1 * 1024 * 1024, "tiny request floored to >= 1 MiB");
+        attr_destroy(U(&at2), 0, 0, 0, 0, 0);
+
+        // An exact caller-owned stack must survive the guest-attr -> local-attr copy. Checking a
+        // local variable proves pthread actually ran on that address range, not merely its size.
+        const size_t exact_size = 2 * 1024 * 1024;
+        void* exact_stack = mmap(nullptr, exact_size, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        CHECK(exact_stack != MAP_FAILED, "allocated caller-owned exact stack");
+        if (exact_stack != MAP_FAILED) {
+            void* at3 = nullptr; attr_init(U(&at3), 0, 0, 0, 0, 0);
+            CHECK(attr_stack(U(&at3), U(exact_stack), exact_size, 0, 0, 0) == 0,
+                  "scePthreadAttrSetstack accepts an exact POSIX stack range");
+            uint64_t tid3 = 0; Probe pr3;
+            pr3.expected_base = exact_stack; pr3.expected_size = exact_size;
+            CHECK(t_create(U(&tid3), U(&at3), U((void*)entry), U(&pr3), 0, 0) == 0,
+                  "create with caller-owned exact stack");
+            t_join(tid3, 0, 0, 0, 0, 0);
+            CHECK(pr3.found && pr3.local_on_expected_stack,
+                  "created thread executes inside the exact requested stack range");
+            attr_destroy(U(&at3), 0, 0, 0, 0, 0);
+            munmap(exact_stack, exact_size);
+        }
     }
 #endif
 

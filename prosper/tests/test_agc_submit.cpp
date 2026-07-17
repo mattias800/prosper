@@ -10,6 +10,15 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 using namespace prosper;
 
@@ -130,6 +139,39 @@ int main() {
               "SubmitAcb returns OK");
         uint64_t after = 0; prosper_agc_submit_stats(&after, &ignored);
         CHECK(after == before + 1, "SubmitAcb folds one async command stream");
+    }
+
+    // A valid header at the last dword of a readable page must not make the decoder walk into the
+    // inaccessible next page when the packet advertises two dwords.
+    {
+#ifdef _WIN32
+        const size_t page_size = 0x1000;
+        auto* pages = static_cast<uint8_t*>(VirtualAlloc(
+            nullptr, page_size * 2, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        DWORD old_protect = 0;
+        const bool protected_second = pages && VirtualProtect(
+            pages + page_size, page_size, PAGE_NOACCESS, &old_protect) != 0;
+#else
+        const size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+        auto* pages = static_cast<uint8_t*>(mmap(
+            nullptr, page_size * 2, PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+        const bool protected_second = pages != MAP_FAILED &&
+            mprotect(pages + page_size, page_size, PROT_NONE) == 0;
+#endif
+        CHECK(protected_second, "created a readable-page/guard-page ACB boundary");
+        if (protected_second) {
+            auto* boundary_stream = reinterpret_cast<uint32_t*>(pages + page_size - 4);
+            *boundary_stream = 0x80000000u;
+            Packet packet{boundary_stream, 2, {0,0,0,0}};
+            CHECK(submit_acb(0x40, (uint64_t)(uintptr_t)&packet, 4, 2, 0, 0) != 0,
+                  "SubmitAcb rejects a stream whose full dword range crosses a guard page");
+        }
+#ifdef _WIN32
+        if (pages) VirtualFree(pages, 0, MEM_RELEASE);
+#else
+        if (pages != MAP_FAILED) munmap(pages, page_size * 2);
+#endif
     }
 
     // Fixed args 7-9 must be real function parameters, not compiler-frame offsets. This is the exact

@@ -1817,7 +1817,8 @@ std::shared_ptr<ShaderResourceTable> build_stage_table(const GpuState& st, uint6
                         fprintf(stderr, "[dynfail] tex use pc=%u key=0x%x base=0x%llx %ux%u fmt=%u tile=%u\n",
                                 u.use_pc, u.key, (unsigned long long)d.base, d.width, d.height,
                                 d.format, d.tile_mode);
-                    if (d.base == 0 || d.width == 0 || d.height == 0 ||
+                    if (d.base == 0 || d.width == 0 || d.height == 0 || d.depth == 0 ||
+                        d.base_array != 0 ||
                         d.width > 16384 || d.height > 16384) continue;       // garbage/degenerate T#
                     // A previous use already produced a resource for this SAME selected view (address +
                     // extent): don't duplicate the binding/upload — give it this use's pc provenance
@@ -2170,7 +2171,8 @@ std::vector<ComputeItem> realize_compute_dispatches(
                     table->resources.push_back(r);
                 } else {                                  // T# — storage image (store) or sampled texture
                     DecodedImageDescriptor d = decode_image_descriptor(u.t8.data());
-                    if (d.base == 0 || d.width == 0 || d.height == 0 ||
+                    if (d.base == 0 || d.width == 0 || d.height == 0 || d.depth == 0 ||
+                        d.base_array != 0 ||
                         d.width > 16384 || d.height > 16384) continue;   // garbage/degenerate T#
                     Gen5ImageFormatInfo fi;
                     const bool mapped_fmt = gen5_image_format(d.format, &fi);

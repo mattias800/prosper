@@ -28,6 +28,16 @@
 #include <unistd.h>
 #endif
 
+// Global-assembly symbol spelling differs between ELF and Mach-O.  Keep the fiber context
+// helpers usable on macOS as well as Linux: Mach-O prefixes C symbols with '_' and rejects
+// ELF's .type directive.
+#ifdef __APPLE__
+#define PROSPER_FIBER_ASM_HEADER(name) ".globl _" #name "\n_" #name ":\n"
+#else
+#define PROSPER_FIBER_ASM_HEADER(name) \
+    ".globl " #name "\n.type " #name ",@function\n" #name ":\n"
+#endif
+
 namespace prosper {
 namespace {
 
@@ -41,9 +51,7 @@ extern "C" [[noreturn]] void prosper_fiber_context_restore(FiberContext*, uint64
 asm(
     ".text\n"
     ".p2align 4\n"
-    ".globl prosper_fiber_context_save\n"
-    ".type prosper_fiber_context_save,@function\n"
-    "prosper_fiber_context_save:\n"
+    PROSPER_FIBER_ASM_HEADER(prosper_fiber_context_save)
     "  movq %rbx,0(%rdi)\n"
     "  movq %rbp,8(%rdi)\n"
     "  movq %r12,16(%rdi)\n"
@@ -57,9 +65,7 @@ asm(
     "  xorl %eax,%eax\n"
     "  ret\n"
     ".p2align 4\n"
-    ".globl prosper_fiber_context_restore\n"
-    ".type prosper_fiber_context_restore,@function\n"
-    "prosper_fiber_context_restore:\n"
+    PROSPER_FIBER_ASM_HEADER(prosper_fiber_context_restore)
     "  movq 0(%rdi),%rbx\n"
     "  movq 8(%rdi),%rbp\n"
     "  movq 16(%rdi),%r12\n"
@@ -236,17 +242,17 @@ void set_windows_root_stack(const ThreadFibers* thread) {
 #endif
 
 #ifndef _WIN32
+#ifndef __APPLE__
 inline uint64_t read_fsbase() { uint64_t v; __asm__ volatile("rdfsbase %0" : "=r"(v)); return v; }
 inline void write_fsbase(uint64_t v) { __asm__ volatile("wrfsbase %0" : : "r"(v)); }
+#endif
 
 extern "C" uint64_t prosper_call_guest_on_stack(uintptr_t stack_top, uint64_t fn,
                                                   uint64_t a0, uint64_t a1);
 asm(
     ".text\n"
     ".p2align 4\n"
-    ".globl prosper_call_guest_on_stack\n"
-    ".type prosper_call_guest_on_stack,@function\n"
-    "prosper_call_guest_on_stack:\n"
+    PROSPER_FIBER_ASM_HEADER(prosper_call_guest_on_stack)
     "  pushq %r12\n"
     "  movq %rsp,%r12\n"
     "  movq %rsi,%r11\n"
@@ -266,7 +272,13 @@ extern "C" uint64_t prosper_call_guest_on_stack(uintptr_t stack_top, uint64_t fn
 
 uint64_t call_fiber_entry(ThreadFibers* thread, FiberRecord* fiber, uint64_t run_arg) {
     uintptr_t stack_top = (uintptr_t)fiber->stack + fiber->stack_size;
-#ifndef _WIN32
+#if defined(__APPLE__)
+    // Rosetta does not expose FSGSBASE and macOS guest TLS is maintained by the import-trap
+    // dispatcher.  Fiber entry therefore leaves the host FS base untouched.
+    (void)thread;
+    return prosper_call_guest_on_stack(stack_top, (uint64_t)(uintptr_t)fiber->entry,
+                                       fiber->initialize_arg, run_arg);
+#elif !defined(_WIN32)
     const uint64_t host_fs = read_fsbase();
     if (thread->guest_fs) write_fsbase(thread->guest_fs);
     uint64_t result = prosper_call_guest_on_stack(stack_top, (uint64_t)(uintptr_t)fiber->entry,
@@ -344,7 +356,9 @@ uint64_t fiber_run_impl(GuestFiber* guest, uint64_t run_arg, uint64_t* return_ar
     if (guest->state == kStateTerminated) return kErrState;
 
     thread->active = true; thread->current = fiber; thread->previous = nullptr;
-#ifndef _WIN32
+#if defined(__APPLE__)
+    thread->guest_fs = guest_tls_tp();
+#elif !defined(_WIN32)
     thread->guest_fs = callback_guest_fs_from_entry_stack(entry_rsp);
 #else
     NT_TIB* tib = (NT_TIB*)NtCurrentTeb();

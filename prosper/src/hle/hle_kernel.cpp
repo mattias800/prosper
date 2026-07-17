@@ -546,16 +546,62 @@ HLE(k_pthread_equal){ return (uint64_t)(a0 == a1); }
 HLE(k_pthread_yield){ sched_yield(); return 0; }
 
 // --- thread attributes ---
-HLE(k_attr_init)        { if (a0) { auto* at = (pthread_attr_t*)calloc(1, sizeof(pthread_attr_t)); pthread_attr_init(at); *(void**)a0 = at; } return 0; }
-HLE(k_attr_destroy)     { if (a0 && *(void**)a0) { pthread_attr_destroy((pthread_attr_t*)*(void**)a0); free(*(void**)a0); *(void**)a0 = nullptr; } return 0; }
-HLE(k_attr_setstacksize){ if (a0 && *(void**)a0 && a1 >= 16384) pthread_attr_setstacksize((pthread_attr_t*)*(void**)a0, a1); return 0; }
+struct GuestPthreadAttr {
+    pthread_attr_t host;
+    void* supplied_stack = nullptr;
+    size_t supplied_stack_size = 0;
+};
+static_assert(offsetof(GuestPthreadAttr, host) == 0);
+HLE(k_attr_init) {
+    if (a0) {
+        auto* at = (GuestPthreadAttr*)calloc(1, sizeof(GuestPthreadAttr));
+        if (!at) return 12;
+        pthread_attr_init(&at->host); *(void**)a0 = at;
+    }
+    return 0;
+}
+HLE(k_attr_destroy) {
+    if (a0 && *(void**)a0) {
+        auto* at = (GuestPthreadAttr*)*(void**)a0;
+        pthread_attr_destroy(&at->host); free(at); *(void**)a0 = nullptr;
+    }
+    return 0;
+}
+HLE(k_attr_setstacksize) {
+    if (a0 && *(void**)a0 && a1 >= 16384) {
+        auto* at = (GuestPthreadAttr*)*(void**)a0;
+        int rc = pthread_attr_setstacksize(&at->host, a1);
+        if (getenv("PROSPER_SYNCLOG"))
+            fprintf(stderr, "[thread] attr setstacksize attr=%p size=0x%llx rc=%d\n",
+                    (void*)at, (unsigned long long)a1, rc);
+        if (rc == 0) {
+            at->supplied_stack = nullptr; at->supplied_stack_size = 0;
+        }
+    }
+    return 0;
+}
 HLE(k_attr_setstack) {
     // Sony and every host backend we support require at least 16 KiB here.  MinGW's winpthreads
     // headers do not consistently expose PTHREAD_STACK_MIN, so keep this check aligned with the
     // setstacksize path above instead of depending on that optional libc macro.
     if (!a0 || !*(void**)(uintptr_t)a0 || !a1 || a2 < 16384) return 0x16;
-    return (uint64_t)(unsigned)pthread_attr_setstack(
-        (pthread_attr_t*)*(void**)(uintptr_t)a0, (void*)(uintptr_t)a1, (size_t)a2);
+#ifdef _WIN32
+    // The host pthread remains on a winpthreads-owned stack, while win_thread_trampoline switches
+    // guest entry to this exact range. Preserve the range explicitly instead of asking CreateThread
+    // to choose an address (which Windows cannot do).
+    auto* at = (GuestPthreadAttr*)*(void**)(uintptr_t)a0;
+    int rc = pthread_attr_setstacksize(&at->host, (size_t)a2);
+    if (!rc) { at->supplied_stack = (void*)(uintptr_t)a1; at->supplied_stack_size = (size_t)a2; }
+    return (uint64_t)(unsigned)rc;
+#else
+    auto* at = (GuestPthreadAttr*)*(void**)(uintptr_t)a0;
+    int rc = pthread_attr_setstack(&at->host, (void*)(uintptr_t)a1, (size_t)a2);
+    if (getenv("PROSPER_SYNCLOG"))
+        fprintf(stderr, "[thread] attr setstack attr=%p base=%p size=0x%llx rc=%d\n",
+                (void*)at, (void*)(uintptr_t)a1, (unsigned long long)a2, rc);
+    if (!rc) { at->supplied_stack = (void*)(uintptr_t)a1; at->supplied_stack_size = (size_t)a2; }
+    return (uint64_t)(unsigned)rc;
+#endif
 }
 HLE(k_attr_noop)        { return 0; }
 
@@ -617,16 +663,18 @@ HLE(k_attr_get) {
 // scePthreadAttrGetstackaddr(attr, void** addr) — Sony reports the stack *base* (low addr).
 HLE(k_attr_getstackaddr) {
     if (a0 && *(void**)a0 && a1) {
-        void* base = nullptr; size_t sz = 0;
-        pthread_attr_getstack((pthread_attr_t*)*(void**)a0, &base, &sz);
+        auto* at = (GuestPthreadAttr*)*(void**)a0;
+        void* base = at->supplied_stack; size_t sz = at->supplied_stack_size;
+        if (!base) pthread_attr_getstack(&at->host, &base, &sz);
         *(void**)(uintptr_t)a1 = base;
     }
     return 0;
 }
 HLE(k_attr_getstacksize) {
     if (a0 && *(void**)a0 && a1) {
-        void* base = nullptr; size_t sz = 0;
-        pthread_attr_getstack((pthread_attr_t*)*(void**)a0, &base, &sz);
+        auto* at = (GuestPthreadAttr*)*(void**)a0;
+        void* base = at->supplied_stack; size_t sz = at->supplied_stack_size;
+        if (!base) pthread_attr_getstack(&at->host, &base, &sz);
         *(size_t*)(uintptr_t)a1 = sz;
     }
     return 0;
@@ -673,21 +721,35 @@ HLE(k_getprio)            { // scePthreadGetprio(thread, int* prio)
 // ids are recycled, so a stale entry would serve the next thread the dead thread's bounds.
 #if defined(__linux__) || defined(__APPLE__)
 namespace {
-struct ThreadStart { void* (*entry)(void*); void* arg; char name[16]; };
+extern "C" uint64_t prosper_call_guest_on_stack(uintptr_t stack_top, uint64_t fn,
+                                                  uint64_t a0, uint64_t a1);
+struct ThreadStart {
+    void* (*entry)(void*);
+    void* arg;
+    void* guest_stack;
+    size_t guest_stack_size;
+    char name[16];
+};
 // Runs first on the new thread: register our own stack (keyed by our tid) BEFORE any guest code,
 // so an early GC_register_my_thread / stack-base query from this thread finds it. Closes a race
 // where a fast-starting worker ran before the parent's post-create registration → "Bad stack base".
 void* thread_trampoline(void* p) {
     auto* ts = (ThreadStart*)p;
+    void* registered_stack = ts->guest_stack;
+    size_t registered_stack_size = ts->guest_stack_size;
     {
         pthread_attr_t sa;
         if (pthread_getattr_np(pthread_self(), &sa) == 0) {
             void* sb = nullptr; size_t ss = 0;
-            if (pthread_attr_getstack(&sa, &sb, &ss) == 0 && sb)
-                register_thread_stack((uint64_t)pthread_self(), sb, ss);
+            if (!registered_stack && pthread_attr_getstack(&sa, &sb, &ss) == 0 && sb) {
+                registered_stack = sb;
+                registered_stack_size = ss;
+            }
             pthread_attr_destroy(&sa);
         }
     }
+    if (registered_stack)
+        register_thread_stack((uint64_t)pthread_self(), registered_stack, registered_stack_size);
     install_sigaltstack();   // so a guest stack overflow on this worker is still catchable
     // Adopt the guest's thread name (scePthreadCreate/pthread_create_name_np arg) as the HOST
     // thread name so debugger/procfs views (gdb, /proc/PID/task/*/comm) show the engine's own
@@ -698,7 +760,9 @@ void* thread_trampoline(void* p) {
 #else
     if (ts->name[0]) pthread_setname_np(pthread_self(), ts->name);
 #endif
-    auto entry = ts->entry; void* arg = ts->arg; free(ts);   // all host libc — MUST run on the host %fs
+    auto entry = ts->entry; void* arg = ts->arg;
+    void* guest_stack = ts->guest_stack; size_t guest_stack_size = ts->guest_stack_size;
+    free(ts);   // all host libc — MUST run on the host %fs
     // gated (PROSPER_GUEST_FS): give this guest worker its own guest TCB + static TLS and switch %fs to it
     // as the LAST host action before entering guest code (so guest initial-exec TLS — incl. libc.prx's
     // allocator arena/tcache — resolves to real guest storage, not the aliased host glibc TCB). The import
@@ -706,7 +770,17 @@ void* thread_trampoline(void* p) {
     // is host glibc (host-TLS tcache) — running it under the guest %fs corrupts the host heap.
     arm_hwbp_this_thread();   // no-op unless PROSPER_HWBP_ALLTHREADS; MUST run on host %fs (host libc calls)
     guest_tls_activate_thread();
-    void* rv = entry ? entry(arg) : nullptr;
+    void* rv = nullptr;
+    if (entry) {
+        // glibc reserves part of a native pthread stack for its static TLS and rejects valid Sony
+        // stacks as small as 32 KiB. Keep the pthread runtime on its host-owned stack, but enter the
+        // guest at the exact caller-supplied base/size.
+        rv = guest_stack
+            ? (void*)(uintptr_t)prosper_call_guest_on_stack(
+                  (uintptr_t)guest_stack + guest_stack_size, (uint64_t)(uintptr_t)entry,
+                  (uint64_t)(uintptr_t)arg, 0)
+            : entry(arg);
+    }
     // Normal-return exit path: purge this thread's __tls_get_addr DTV entries and free the blocks
     // (#68 — glibc recycles pthread ids, so a stale entry would hand the NEXT thread on this id the
     // dead thread's dirty TLS). The guest entry can return with %fs still = the guest TP
@@ -729,8 +803,16 @@ namespace {
 // null-derived pointer; (2) it never ran guest_tls_activate_thread(), so the worker had no guest
 // %fs TCB and its initial-exec TLS was wrong. This trampoline fixes both: activate the guest %fs
 // TCB, then call the guest entry through the SysV marshalling shim, and purge DTV on exit.
-struct WinThreadStart { uint64_t entry; void* arg; char name[64]; };
+struct WinThreadStart {
+    uint64_t entry;
+    void* arg;
+    void* guest_stack;
+    size_t guest_stack_size;
+    char name[64];
+};
 extern "C" uint64_t prosper_call_guest_sysv(uint64_t fn, uint64_t a0, uint64_t a1);
+extern "C" uint64_t prosper_call_guest_on_stack(uintptr_t stack_top, uint64_t fn,
+                                                  uint64_t a0, uint64_t a1);
 
 // PS5 code is compiled for a stack whose entire usable range is writable.  Windows instead
 // initially commits only the top of a reserved thread stack and relies on a moving guard page;
@@ -774,6 +856,7 @@ bool prepare_guest_windows_stack(ULONG_PTR* out_low, ULONG_PTR* out_high) {
 void* win_thread_trampoline(void* p) {
     auto* ts = (WinThreadStart*)p;
     uint64_t entry = ts->entry; void* arg = ts->arg;
+    void* guest_stack = ts->guest_stack; size_t guest_stack_size = ts->guest_stack_size;
     char name[sizeof(ts->name)]; memcpy(name, ts->name, sizeof(name));
     free(ts);   // host libc: run on host %fs (before activate)
     if (name[0]) {
@@ -791,19 +874,32 @@ void* win_thread_trampoline(void* p) {
     ULONG_PTR stk_lo = 0, stk_hi = 0;
     if (!prepare_guest_windows_stack(&stk_lo, &stk_hi))
         GetCurrentThreadStackLimits(&stk_lo, &stk_hi);
-    if (stk_lo && stk_hi > stk_lo) {
-        register_thread_stack((uint64_t)GetCurrentThreadId(), (void*)stk_lo, (uint64_t)(stk_hi - stk_lo));
-        register_thread_stack(guest_thread, (void*)stk_lo, (uint64_t)(stk_hi - stk_lo));
+    void* registered_base = guest_stack ? guest_stack : (void*)stk_lo;
+    size_t registered_size = guest_stack ? guest_stack_size : (size_t)(stk_hi - stk_lo);
+    if (registered_base && registered_size) {
+        register_thread_stack((uint64_t)GetCurrentThreadId(), registered_base, registered_size);
+        register_thread_stack(guest_thread, registered_base, registered_size);
     }
     trace_guest_thread_lifecycle(true, (uint64_t)pthread_self(),
-                                 (uint64_t)GetCurrentThreadId(), (void*)stk_lo,
-                                 (size_t)(stk_hi - stk_lo));
+                                 (uint64_t)GetCurrentThreadId(), registered_base, registered_size);
     guest_tls_activate_thread();   // this worker's guest %fs TCB (FSGSBASE); no-op if the gate is off
-    void* rv = entry ? (void*)(uintptr_t)prosper_call_guest_sysv(entry, (uint64_t)(uintptr_t)arg, 0) : nullptr;
+    void* rv = nullptr;
+    if (entry) {
+        if (guest_stack) {
+            NT_TIB* tib = (NT_TIB*)NtCurrentTeb();
+            void* saved_base = tib->StackBase; void* saved_limit = tib->StackLimit;
+            tib->StackLimit = guest_stack;
+            tib->StackBase = (void*)((uintptr_t)guest_stack + guest_stack_size);
+            rv = (void*)(uintptr_t)prosper_call_guest_on_stack(
+                (uintptr_t)guest_stack + guest_stack_size, entry, (uint64_t)(uintptr_t)arg, 0);
+            tib->StackLimit = saved_limit; tib->StackBase = saved_base;
+        } else {
+            rv = (void*)(uintptr_t)prosper_call_guest_sysv(entry, (uint64_t)(uintptr_t)arg, 0);
+        }
+    }
     tls_dtv_purge_current_thread();
     trace_guest_thread_lifecycle(false, (uint64_t)pthread_self(),
-                                 (uint64_t)GetCurrentThreadId(), (void*)stk_lo,
-                                 (size_t)(stk_hi - stk_lo));
+                                 (uint64_t)GetCurrentThreadId(), registered_base, registered_size);
     unregister_thread_stack((uint64_t)GetCurrentThreadId());   // ids recycle; stale bounds = wrong bounds
     unregister_thread_stack(guest_thread);
     unregister_current_thread_handle(guest_thread);
@@ -825,25 +921,38 @@ HLE(k_pthread_create) {
     // would on the same stack. No attr (or no explicit size) keeps the 8 MiB default.
     constexpr size_t kStackFloor = 1 * 1024 * 1024, kStackDefault = 8 * 1024 * 1024;
     size_t ssz = kStackDefault;
+    void* supplied_stack = nullptr;
+    size_t supplied_stack_size = 0;
     int detach = PTHREAD_CREATE_JOINABLE;
     if (a1 && *(void**)a1) {
-        auto* gat = (pthread_attr_t*)*(void**)a1;
+        auto* guest_attr = (GuestPthreadAttr*)*(void**)a1;
+        auto* gat = &guest_attr->host;
         size_t req = 0;
         if (pthread_attr_getstacksize(gat, &req) == 0 && req)
             ssz = req < kStackFloor ? kStackFloor : req;
+        supplied_stack = guest_attr->supplied_stack;
+        supplied_stack_size = guest_attr->supplied_stack_size;
         pthread_attr_getdetachstate(gat, &detach);
+        if (getenv("PROSPER_SYNCLOG"))
+            fprintf(stderr, "[thread] attr create attr=%p requested=0x%zx supplied=%p+0x%zx detach=%d\n",
+                    (void*)guest_attr, req, supplied_stack, supplied_stack_size, detach);
     }
-    // A local attr with setstackSIZE (not setstack): glibc allocates AND RECLAIMS the stack
-    // (join / detached exit) — the old caller-owned mmap was never freed (#138). Also stops
-    // mutating the guest's own attr object (setstack used to be applied to it in place).
+    // Size-only attrs keep a host-owned/reclaimed stack; an explicit base stays caller-owned and
+    // must be copied exactly into the local attr.
     pthread_attr_t la; pthread_attr_init(&la);
-    pthread_attr_setstacksize(&la, ssz);
+    // The trampoline enters guest code on an explicit Sony stack. The host pthread itself retains a
+    // glibc-owned stack large enough for static TLS and native start/exit bookkeeping.
+    int attr_rc = pthread_attr_setstacksize(&la, supplied_stack ? kStackFloor : ssz);
+    if (attr_rc) { pthread_attr_destroy(&la); return (uint64_t)(unsigned)attr_rc; }
     pthread_attr_setdetachstate(&la, detach);
     auto* ts = (ThreadStart*)malloc(sizeof(ThreadStart));
     if (!ts) { pthread_attr_destroy(&la); return 12; }         // ENOMEM (FreeBSD and host agree)
-    ts->entry = entry; ts->arg = arg; ts->name[0] = 0;
+    ts->entry = entry; ts->arg = arg;
+    ts->guest_stack = supplied_stack; ts->guest_stack_size = supplied_stack_size;
+    ts->name[0] = 0;
     if (a4) { strncpy(ts->name, (const char*)(uintptr_t)a4, sizeof(ts->name) - 1); ts->name[sizeof(ts->name) - 1] = 0; }
     int r = pthread_create(&tid, &la, thread_trampoline, ts);   // trampoline registers the stack first
+    if (getenv("PROSPER_SYNCLOG")) fprintf(stderr, "[thread] pthread_create rc=%d\n", r);
     pthread_attr_destroy(&la);
     if (r) { free(ts); return (uint64_t)r; }
 #else
@@ -852,23 +961,28 @@ HLE(k_pthread_create) {
     // skips TLS activation, crashing the worker on a null-derived pointer.
     constexpr size_t kStackFloor = 1 * 1024 * 1024, kStackDefault = 8 * 1024 * 1024;
     size_t ssz = kStackDefault;
+    void* supplied_stack = nullptr;
+    size_t supplied_stack_size = 0;
     int detach = PTHREAD_CREATE_JOINABLE;
     if (a1 && *(void**)a1) {
-        auto* gat = (pthread_attr_t*)*(void**)a1;
+        auto* guest_attr = (GuestPthreadAttr*)*(void**)a1;
+        auto* gat = &guest_attr->host;
         size_t req = 0;
         if (pthread_attr_getstacksize(gat, &req) == 0 && req)
             ssz = req < kStackFloor ? kStackFloor : req;
+        supplied_stack = guest_attr->supplied_stack;
+        supplied_stack_size = guest_attr->supplied_stack_size;
         pthread_attr_getdetachstate(gat, &detach);
     }
-    // Use a host-owned attr just like Linux: preserve the Sony-requested size/detach state, but
-    // do not pass through a guest-owned stack address to winpthreads.  The trampoline commits
-    // this reservation before guest entry because PS5 code does not contain Windows probes.
+    // Keep winpthreads on a host-owned stack; the trampoline switches guest entry to an explicit
+    // Sony range after preparing the native reservation used by Windows runtime cleanup.
     pthread_attr_t la; pthread_attr_init(&la);
-    pthread_attr_setstacksize(&la, ssz);
+    pthread_attr_setstacksize(&la, supplied_stack ? kStackFloor : ssz);
     pthread_attr_setdetachstate(&la, detach);
     auto* ts = (WinThreadStart*)malloc(sizeof(WinThreadStart));
     if (!ts) { pthread_attr_destroy(&la); return 12; }          // ENOMEM (FreeBSD and host agree)
     ts->entry = (uint64_t)(uintptr_t)entry; ts->arg = arg;
+    ts->guest_stack = supplied_stack; ts->guest_stack_size = supplied_stack_size;
     ts->name[0] = 0;
     if (a4) { strncpy(ts->name, (const char*)(uintptr_t)a4, sizeof(ts->name) - 1); ts->name[sizeof(ts->name) - 1] = 0; }
     int r = pthread_create(&tid, &la, win_thread_trampoline, ts);

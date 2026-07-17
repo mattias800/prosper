@@ -19,7 +19,10 @@ int main() {
     auto text_init = Hle::lookup("oaJ1BpN2FQk");
     auto create_string = Hle::lookup("MO24vDhmS4E");
     auto chars = Hle::lookup("Avv7OApgCJk");
-    CHECK(create && open_set && metrics && text_init && create_string && chars,
+    auto destroy_string = Hle::lookup("SSCaczu2aMQ");
+    auto close_font = Hle::lookup("vzHs3C8lWJk");
+    CHECK(create && open_set && metrics && text_init && create_string && chars &&
+          destroy_string && close_font,
           "Astro Font HLE surface is registered");
 
     uint8_t mem[64]{};
@@ -46,6 +49,10 @@ int main() {
     uint32_t count = 0xdeadbeef;
     CHECK(chars((uint64_t)(uintptr_t)string, (uint64_t)(uintptr_t)&count, 0, 0, 0, 0) == 0 && count == 0,
           "fallback string exposes a safe empty character range");
+    CHECK(destroy_string((uint64_t)(uintptr_t)&string, 0, 0, 0, 0, 0) == 0 && !string,
+          "DestroyString releases and clears the opaque string handle");
+    CHECK(close_font((uint64_t)(uintptr_t)font, 0, 0, 0, 0, 0) == 0,
+          "CloseFont releases the opened face");
 
     std::printf(fails ? "== FAIL: %d ==\n" : "== PASS ==\n", fails);
     return fails ? 1 : 0;

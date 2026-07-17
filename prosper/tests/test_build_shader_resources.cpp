@@ -28,7 +28,8 @@ static void make_vsharp(uint32_t v[4], uint64_t base, uint32_t stride, uint32_t 
 // Width5-1 split over word1[31:30] (lo) + word2[11:0] (hi), Height5-1 @word2[27:14], TileMode
 // @word3[24:20], Type @word3[31:28]. Mirrors decode_image_descriptor / Kyty's Gen5 getters.
 static void make_tsharp(uint32_t t[8], uint64_t base, uint32_t w, uint32_t h, uint32_t fmt,
-                        uint32_t tile_mode, uint32_t type, uint32_t depth = 1) {
+                        uint32_t tile_mode, uint32_t type, uint32_t depth = 1,
+                        uint32_t base_array = 0) {
     memset(t, 0, 8 * sizeof(uint32_t));
     uint64_t b = base >> 8;                       // 256-byte-aligned base, stored >>8
     t[0] = (uint32_t)(b & 0xffffffffu);
@@ -36,6 +37,8 @@ static void make_tsharp(uint32_t t[8], uint64_t base, uint32_t w, uint32_t h, ui
     t[2] = (((w - 1) >> 2) & 0xfffu) | (((h - 1) & 0x3fffu) << 14);
     t[3] = ((tile_mode & 0x1fu) << 20) | ((type & 0xfu) << 28);
     if (type == 10) t[4] = (depth - 1) & 0x1fffu;
+    if (type == 11 || type == 12 || type == 13 || type == 15)
+        t[4] = (base_array << 16) | ((base_array + depth - 1) & 0x1fffu);
 }
 
 int main() {
@@ -97,6 +100,17 @@ int main() {
         const DecodedImageDescriptor d3d = decode_image_descriptor(t3d);
         CHECK(d3d.width == 32 && d3d.height == 16 && d3d.depth == 8,
               "3D T# word4 DEPTH decodes as depth-minus-one");
+
+        uint32_t tarray[8];
+        make_tsharp(tarray, 0x13000000ull, 32, 16, /*fmt*/56, /*tile*/0,
+                    /*type 2D array*/13, /*depth*/4, /*base array*/4);
+        const DecodedImageDescriptor darray = decode_image_descriptor(tarray);
+        CHECK(darray.base_array == 4 && darray.depth == 4,
+              "array T# derives layer count from LAST_ARRAY minus BASE_ARRAY");
+        Gen5ImageFormatInfo array_format;
+        CHECK(gen5_image_format(56, &array_format) &&
+              !image_base_level_view(darray, array_format).supported,
+              "nonzero BASE_ARRAY fails closed until slice-offset layout is modeled");
         CHECK(d3d.compression_enabled && d3d.write_compress_enabled && d3d.meta_pipe_aligned &&
               d3d.alpha_is_on_msb && d3d.color_transform &&
               d3d.max_uncompressed_block_size == 2 && d3d.max_compressed_block_size == 1 &&
