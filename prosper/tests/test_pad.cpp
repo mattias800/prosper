@@ -154,13 +154,41 @@ int main() {
         CHECK(s[0].t_secs == 3.0 && s[0].button_mask == SCE_PAD_BUTTON_OPTIONS, "parse: entry0 t/mask");
         CHECK(s[1].t_secs == 9.5 && s[1].button_mask == SCE_PAD_BUTTON_CROSS,   "parse: fractional time");
         CHECK(s[2].button_mask == (SCE_PAD_BUTTON_UP | SCE_PAD_BUTTON_CROSS),   "parse: '+' combines buttons");
+        const double hold = 0.30;
+
+        auto analog = parse_pad_script(
+            "1-3:circle+left-stick-left;2-4:left-stick-right+right-stick-up");
+        CHECK(analog.size() == 2, "parse: stick directions are recognized actions");
+        CHECK(analog[0].button_mask == SCE_PAD_BUTTON_CIRCLE &&
+              analog[0].axis_mask == PAD_SCRIPT_LEFT_X && analog[0].left_x == -1,
+              "parse: button and left-stick direction share an entry");
+        CHECK(analog[1].axis_mask == (PAD_SCRIPT_LEFT_X | PAD_SCRIPT_RIGHT_Y) &&
+              analog[1].left_x == 1 && analog[1].right_y == -1,
+              "parse: independent stick axes combine");
+        auto analog_state = pad_script_state_at(analog, 1.5, hold);
+        CHECK(analog_state.button_mask == SCE_PAD_BUTTON_CIRCLE && analog_state.left_x == -1 &&
+              analog_state.axis_mask == PAD_SCRIPT_LEFT_X,
+              "eval: active stick direction and button are returned together");
+        analog_state = pad_script_state_at(analog, 2.5, hold);
+        CHECK(analog_state.button_mask == SCE_PAD_BUTTON_CIRCLE && analog_state.left_x == 0 &&
+              analog_state.right_y == -1 &&
+              analog_state.axis_mask == (PAD_SCRIPT_LEFT_X | PAD_SCRIPT_RIGHT_Y),
+              "eval: overlapping opposing directions explicitly center their axis");
+        HostPadState overlaid;
+        overlaid.buttons = SCE_PAD_BUTTON_L1;
+        overlaid.right_x = 0x22;
+        pad_apply_script_state(overlaid, analog_state);
+        CHECK(overlaid.buttons == (SCE_PAD_BUTTON_L1 | SCE_PAD_BUTTON_CIRCLE),
+              "overlay: scripted buttons combine with backend buttons");
+        CHECK(overlaid.left_x == 0x80 && overlaid.left_y == 0x80 &&
+              overlaid.right_x == 0x22 && overlaid.right_y == 0x00,
+              "overlay: active axes map to Sony bytes and unspecified axes remain unchanged");
 
         // Malformed pieces are skipped, not fatal; an all-unknown entry drops out.
         auto s2 = parse_pad_script("nocolon;5:garbagebtn;7:down");
         CHECK(s2.size() == 1 && s2[0].button_mask == SCE_PAD_BUTTON_DOWN, "parse: skips malformed/empty entries");
 
         // Time-eval: a button is held only within [t, t+hold).
-        const double hold = 0.30;
         CHECK(pad_script_buttons_at(s, 2.9, hold) == 0,                       "eval: before window -> none");
         CHECK(pad_script_buttons_at(s, 3.0, hold) == SCE_PAD_BUTTON_OPTIONS,  "eval: at window start -> pressed");
         CHECK(pad_script_buttons_at(s, 3.29, hold) == SCE_PAD_BUTTON_OPTIONS, "eval: within window -> pressed");

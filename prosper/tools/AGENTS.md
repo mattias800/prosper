@@ -50,9 +50,11 @@ programmatic check (ctest exit code, `spirv-val`, a snapshot hash) over eyeballi
 To drive any runner through a longer input route, set
 `PROSPER_PAD_SCRIPT=@scripts/<title>/reach-<state>.pad`. Route files use the same
 seconds/flip syntax as inline scripts, accept one entry per line, `#` comments,
-and explicit ranges such as `f300-340:cross`. See `docs/INPUT_REPLAY.md`.
+and explicit ranges such as `f300-340:cross`. Full-deflection stick actions use names such as
+`left-stick-left` and can be combined with buttons using `+`. See `docs/INPUT_REPLAY.md`.
 Set `PROSPER_PAD_RECORD=<path>` on any runner, or use `prosper-app --record <path>`, to capture the
-final controller stream in that format. Completed button intervals are flushed immediately.
+final button stream in that format. Completed button intervals are flushed immediately; scripted stick
+directions are supported for playback but are not yet emitted by the recorder.
 Set `PROSPER_PAD_SCRIPT_LOG=1` to log each scripted state transition observed at a pad poll.
 For long exploratory runs, add `PROSPER_PAD_SCRIPT_RELOAD=1` to live-reload an `@file` route while
 preserving its original time/flip origin; append only future windows and confirm the reload log.
